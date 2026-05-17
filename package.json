@@ -1,0 +1,48 @@
+{
+  "name": "@alembic/agent",
+  "version": "0.1.0",
+  "description": "Alembic Agent runtime, AI provider, and tool-system package extracted from the Alembic product repository.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:check": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "npm run build:check",
+    "lint": "biome check src scripts test",
+    "lint:fix": "biome check --fix src scripts test",
+    "lint:agent-import-boundary": "node scripts/lint-agent-import-boundary.mjs",
+    "test": "vitest run",
+    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run test"
+  },
+  "dependencies": {
+    "@alembic/core": "file:../AlembicCore"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.6",
+    "@types/node": "^22.19.18",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "keywords": [
+    "alembic",
+    "agent",
+    "ai",
+    "tools",
+    "typescript"
+  ],
+  "license": "MIT"
+}

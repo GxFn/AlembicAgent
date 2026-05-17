@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+coverage/
+
+# Environment and local secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Development scratch
+scratch/
+tmp/
+.cache/
+
+# Editor / OS artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.cursor/
+*.sw[a-p]
