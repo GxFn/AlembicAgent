@@ -14,6 +14,22 @@
       "types": "./dist/agent/index.d.ts",
       "import": "./dist/agent/index.js"
     },
+    "./service": {
+      "types": "./dist/agent/service/index.d.ts",
+      "import": "./dist/agent/service/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/agent/runtime/index.d.ts",
+      "import": "./dist/agent/runtime/index.js"
+    },
+    "./prompts": {
+      "types": "./dist/agent/prompts/index.d.ts",
+      "import": "./dist/agent/prompts/index.js"
+    },
+    "./domain": {
+      "types": "./dist/agent/domain/index.d.ts",
+      "import": "./dist/agent/domain/index.js"
+    },
     "./ai": {
       "types": "./dist/external/ai/index.d.ts",
       "import": "./dist/external/ai/index.js"
@@ -87,8 +103,12 @@
     "alembic",
     "agent",
     "ai",
-    "memory",
     "context",
+    "domain",
+    "memory",
+    "prompts",
+    "runtime",
+    "service",
     "tools",
     "typescript"
   ],
