@@ -9,6 +9,36 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "import": "./dist/agent/index.js"
+    },
+    "./ai": {
+      "types": "./dist/external/ai/index.d.ts",
+      "import": "./dist/external/ai/index.js"
+    }
+  },
+  "imports": {
+    "#agent/*": {
+      "types": "./src/agent/*",
+      "alembic-dev": "./src/agent/*",
+      "default": "./dist/agent/*"
+    },
+    "#external/*": {
+      "types": "./src/external/*",
+      "alembic-dev": "./src/external/*",
+      "default": "./dist/external/*"
+    },
+    "#shared/*": {
+      "types": "./src/shared/*",
+      "alembic-dev": "./src/shared/*",
+      "default": "./dist/shared/*"
+    },
+    "#tools/*": {
+      "types": "./src/tools/*",
+      "alembic-dev": "./src/tools/*",
+      "default": "./dist/tools/*"
     }
   },
   "files": [
@@ -29,10 +59,14 @@
     "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run test"
   },
   "dependencies": {
-    "@alembic/core": "file:../AlembicCore"
+    "@alembic/core": "file:../AlembicCore",
+    "better-sqlite3": "^12.6.2",
+    "drizzle-orm": "^0.45.1",
+    "undici": "^7.22.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.6",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.18",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
