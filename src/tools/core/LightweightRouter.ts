@@ -15,9 +15,13 @@ import type {
   ToolRouterContract,
 } from '#tools/core/ToolContracts.js';
 import type { ToolDecision } from '#tools/core/ToolDecision.js';
-import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import type { ToolResultEnvelope, ToolResultStatus } from '#tools/core/ToolResultEnvelope.js';
 import type { CapabilityCatalog } from '../catalog/CapabilityCatalog.js';
-import type { CapabilityKind } from '../catalog/CapabilityManifest.js';
+import type {
+  CapabilityKind,
+  CapabilitySurface,
+  ToolCapabilityManifest,
+} from '../catalog/CapabilityManifest.js';
 
 export interface LightweightRouterOptions {
   catalog: CapabilityCatalog;
@@ -56,32 +60,59 @@ export class LightweightRouter implements ToolRouterContract {
     try {
       const manifest = this.#catalog.getManifest(request.toolId);
       if (!manifest) {
-        return this.#errorEnvelope(
-          request.toolId,
-          callId,
-          startedAt,
-          startMs,
-          `Unknown tool: ${request.toolId}`
+        return this.#finalizeEnvelope(
+          request,
+          null,
+          this.#errorEnvelope(
+            request.toolId,
+            callId,
+            startedAt,
+            startMs,
+            `Unknown tool: ${request.toolId}`
+          )
+        );
+      }
+
+      const decision = this.#explainWithManifest(request, manifest);
+      if (!decision.allowed) {
+        return this.#finalizeEnvelope(
+          request,
+          manifest,
+          this.#decisionEnvelope(request.toolId, callId, startedAt, startMs, decision)
+        );
+      }
+
+      if (request.abortSignal?.aborted) {
+        return this.#finalizeEnvelope(
+          request,
+          manifest,
+          this.#statusEnvelope(
+            request.toolId,
+            callId,
+            startedAt,
+            startMs,
+            'aborted',
+            'Tool call aborted before execution'
+          )
         );
       }
 
       const adapter = this.#adapters.get(manifest.kind);
       if (!adapter) {
-        return this.#errorEnvelope(
-          request.toolId,
-          callId,
-          startedAt,
-          startMs,
-          `No adapter for kind: ${manifest.kind}`
+        return this.#finalizeEnvelope(
+          request,
+          manifest,
+          this.#errorEnvelope(
+            request.toolId,
+            callId,
+            startedAt,
+            startMs,
+            `No adapter for kind: ${manifest.kind}`
+          )
         );
       }
 
       const context = this.#buildContext(request, callId);
-      const decision: ToolDecision = {
-        allowed: true,
-        stage: 'approve',
-      };
-
       const execReq: ToolExecutionRequest = {
         manifest,
         args: request.args,
@@ -89,10 +120,22 @@ export class LightweightRouter implements ToolRouterContract {
         decision,
       };
 
-      return await adapter.execute(execReq);
+      const envelope = await this.#executeWithControls(adapter, execReq, {
+        toolId: request.toolId,
+        callId,
+        startedAt,
+        startMs,
+        timeoutMs: manifest.execution.timeoutMs,
+        abortSignal: request.abortSignal ?? null,
+      });
+      return this.#finalizeEnvelope(request, manifest, envelope);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      return this.#errorEnvelope(request.toolId, callId, startedAt, startMs, msg);
+      return this.#finalizeEnvelope(
+        request,
+        null,
+        this.#errorEnvelope(request.toolId, callId, startedAt, startMs, msg)
+      );
     }
   }
 
@@ -104,10 +147,196 @@ export class LightweightRouter implements ToolRouterContract {
 
   async explain(request: ToolCallRequest): Promise<ToolDecision> {
     const manifest = this.#catalog.getManifest(request.toolId);
+    if (!manifest) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        reason: `Unknown tool: ${request.toolId}`,
+        resultStatus: 'blocked',
+      };
+    }
+    return this.#explainWithManifest(request, manifest);
+  }
+
+  #explainWithManifest(request: ToolCallRequest, manifest: ToolCapabilityManifest): ToolDecision {
+    if (!this.#isSurfaceAllowed(request.surface, manifest.surfaces)) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        reason: `Tool '${request.toolId}' is not allowed on surface '${request.surface}'`,
+        resultStatus: 'blocked',
+      };
+    }
+
+    const policyCheck = request.runtime?.policyValidator?.validateToolCall(
+      request.toolId,
+      request.args
+    );
+    if (policyCheck && !policyCheck.ok) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        reason: policyCheck.reason || `Tool '${request.toolId}' was blocked by policy`,
+        resultStatus: 'blocked',
+      };
+    }
+
+    const preview = this.#adapters.get(manifest.kind)?.preview?.({
+      manifest,
+      args: request.args,
+      projectRoot: this.#projectRoot,
+    });
+
     return {
-      allowed: !!manifest,
+      allowed: true,
       stage: 'approve',
-      reason: manifest ? undefined : `Unknown tool: ${request.toolId}`,
+      policyProfile: manifest.governance.policyProfile,
+      auditLevel: manifest.governance.auditLevel,
+      ...(preview ? { preview } : {}),
+    };
+  }
+
+  #isSurfaceAllowed(surface: ToolCallRequest['surface'], surfaces: CapabilitySurface[]): boolean {
+    if (surface === 'composer') {
+      return true;
+    }
+    if (surface === 'system') {
+      return true;
+    }
+    return surfaces.includes(surface as CapabilitySurface);
+  }
+
+  async #executeWithControls(
+    adapter: ToolExecutionAdapter,
+    execReq: ToolExecutionRequest,
+    meta: {
+      toolId: string;
+      callId: string;
+      startedAt: string;
+      startMs: number;
+      timeoutMs: number;
+      abortSignal: AbortSignal | null;
+    }
+  ): Promise<ToolResultEnvelope> {
+    const timeoutMs = Math.max(0, Number(meta.timeoutMs) || 0);
+    const execution = adapter.execute(execReq);
+    const guards: Promise<ToolResultEnvelope>[] = [execution];
+    let timeoutId: NodeJS.Timeout | null = null;
+    let abortListener: (() => void) | null = null;
+
+    if (timeoutMs > 0) {
+      guards.push(
+        new Promise<ToolResultEnvelope>((resolve) => {
+          timeoutId = setTimeout(() => {
+            resolve(
+              this.#statusEnvelope(
+                meta.toolId,
+                meta.callId,
+                meta.startedAt,
+                meta.startMs,
+                'timeout',
+                `Tool call timed out after ${timeoutMs}ms`
+              )
+            );
+          }, timeoutMs);
+        })
+      );
+    }
+
+    if (meta.abortSignal) {
+      guards.push(
+        new Promise<ToolResultEnvelope>((resolve) => {
+          abortListener = () => {
+            resolve(
+              this.#statusEnvelope(
+                meta.toolId,
+                meta.callId,
+                meta.startedAt,
+                meta.startMs,
+                'aborted',
+                'Tool call aborted during execution'
+              )
+            );
+          };
+          meta.abortSignal?.addEventListener('abort', abortListener, { once: true });
+        })
+      );
+    }
+
+    try {
+      return await Promise.race(guards);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return this.#errorEnvelope(meta.toolId, meta.callId, meta.startedAt, meta.startMs, msg);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      if (meta.abortSignal && abortListener) {
+        meta.abortSignal.removeEventListener('abort', abortListener);
+      }
+    }
+  }
+
+  #finalizeEnvelope(
+    request: ToolCallRequest,
+    manifest: ToolCapabilityManifest | null,
+    envelope: ToolResultEnvelope
+  ): ToolResultEnvelope {
+    request.runtime?.diagnostics?.recordToolCallEnvelope(envelope, {
+      kind: manifest?.kind,
+      surface: request.surface,
+      source: request.source.name,
+    });
+    return envelope;
+  }
+
+  #decisionEnvelope(
+    toolId: string,
+    callId: string,
+    startedAt: string,
+    startMs: number,
+    decision: ToolDecision
+  ): ToolResultEnvelope {
+    return this.#statusEnvelope(
+      toolId,
+      callId,
+      startedAt,
+      startMs,
+      decision.resultStatus || 'blocked',
+      decision.reason || `Tool '${toolId}' is not allowed`,
+      decision.requiresConfirmation ? decision.confirmationMessage : undefined
+    );
+  }
+
+  #statusEnvelope(
+    toolId: string,
+    callId: string,
+    startedAt: string,
+    startMs: number,
+    status: ToolResultStatus,
+    text: string,
+    nextActionHint?: string
+  ): ToolResultEnvelope {
+    return {
+      ok: false,
+      toolId,
+      callId,
+      startedAt,
+      status,
+      text,
+      durationMs: Date.now() - startMs,
+      diagnostics: this.#defaultDiagnostics(
+        status === 'timeout' ? ['execute'] : [],
+        status === 'blocked' ? [{ tool: toolId, reason: text }] : []
+      ),
+      trust: {
+        source: 'internal',
+        sanitized: false,
+        containsUntrustedText: false,
+        containsSecrets: false,
+      },
+      ...(nextActionHint ? { nextActionHint } : {}),
     };
   }
 
@@ -142,23 +371,30 @@ export class LightweightRouter implements ToolRouterContract {
       status: 'error',
       text: error,
       durationMs: Date.now() - startMs,
-      diagnostics: {
-        degraded: false,
-        fallbackUsed: false,
-        warnings: [],
-        timedOutStages: [],
-        blockedTools: [],
-        truncatedToolCalls: 0,
-        emptyResponses: 0,
-        aiErrorCount: 0,
-        gateFailures: [],
-      },
+      diagnostics: this.#defaultDiagnostics(),
       trust: {
         source: 'internal',
         sanitized: false,
         containsUntrustedText: false,
         containsSecrets: false,
       },
+    };
+  }
+
+  #defaultDiagnostics(
+    timedOutStages: string[] = [],
+    blockedTools: Array<{ tool: string; reason: string }> = []
+  ) {
+    return {
+      degraded: false,
+      fallbackUsed: false,
+      warnings: [],
+      timedOutStages,
+      blockedTools,
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: 0,
+      gateFailures: [],
     };
   }
 }

@@ -17,6 +17,10 @@
     "./ai": {
       "types": "./dist/external/ai/index.d.ts",
       "import": "./dist/external/ai/index.js"
+    },
+    "./tools": {
+      "types": "./dist/tools/index.d.ts",
+      "import": "./dist/tools/index.js"
     }
   },
   "imports": {

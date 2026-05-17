@@ -1,0 +1,348 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  CapabilityCatalog,
+  isToolResultEnvelope,
+  LightweightRouter,
+  presentToolResult,
+  type ToolCallRequest,
+  type ToolCapabilityManifest,
+  type ToolDefinitionV2,
+  type ToolExecutionAdapter,
+  type ToolExecutionRequest,
+  type ToolResultEnvelope,
+  UnifiedToolCatalog,
+} from '../src/index.js';
+
+function createManifest(overrides: Partial<ToolCapabilityManifest> = {}): ToolCapabilityManifest {
+  const manifest: ToolCapabilityManifest = {
+    id: 'demo.echo',
+    title: 'Demo Echo',
+    kind: 'internal-tool',
+    description: 'Echo test input',
+    owner: 'agent',
+    lifecycle: 'active',
+    surfaces: ['runtime'],
+    inputSchema: {
+      type: 'object',
+      properties: {
+        value: { type: 'string' },
+      },
+    },
+    risk: {
+      sideEffect: false,
+      dataAccess: 'none',
+      writeScope: 'none',
+      network: 'none',
+      credentialAccess: 'none',
+      requiresHumanConfirmation: 'never',
+      owaspTags: [],
+    },
+    execution: {
+      adapter: 'internal',
+      timeoutMs: 1000,
+      maxOutputBytes: 4096,
+      abortMode: 'cooperative',
+      cachePolicy: 'none',
+      concurrency: 'parallel-safe',
+      artifactMode: 'inline',
+    },
+    governance: {
+      policyProfile: 'read',
+      auditLevel: 'checkOnly',
+      approvalPolicy: 'auto',
+      allowedRoles: ['developer'],
+      allowInComposer: true,
+      allowInRemoteMcp: false,
+      allowInNonInteractive: true,
+    },
+    evals: {
+      required: false,
+      cases: [],
+    },
+  };
+
+  return {
+    ...manifest,
+    ...overrides,
+    risk: { ...manifest.risk, ...overrides.risk },
+    execution: { ...manifest.execution, ...overrides.execution },
+    governance: { ...manifest.governance, ...overrides.governance },
+    evals: { ...manifest.evals, ...overrides.evals },
+  };
+}
+
+function createRequest(overrides: Partial<ToolCallRequest> = {}): ToolCallRequest {
+  return {
+    toolId: 'demo.echo',
+    args: { value: 'hello' },
+    surface: 'runtime',
+    actor: { role: 'developer', user: 'tester' },
+    source: { kind: 'runtime', name: 'unit-test' },
+    ...overrides,
+  };
+}
+
+function createSuccessEnvelope(
+  request: ToolExecutionRequest,
+  text = 'echo complete'
+): ToolResultEnvelope<{ echo: unknown }> {
+  return {
+    ok: true,
+    toolId: request.manifest.id,
+    callId: request.context.callId,
+    ...(request.context.parentCallId ? { parentCallId: request.context.parentCallId } : {}),
+    startedAt: new Date().toISOString(),
+    durationMs: 1,
+    status: 'success',
+    text,
+    structuredContent: { echo: request.args.value },
+    artifacts: [
+      {
+        id: 'artifact-1',
+        kind: 'stdout',
+        uri: 'memory://stdout/1',
+        mimeType: 'text/plain',
+      },
+    ],
+    diagnostics: {
+      degraded: false,
+      fallbackUsed: false,
+      warnings: [{ code: 'partial', message: 'partial output preserved', stage: 'execute' }],
+      timedOutStages: [],
+      blockedTools: [],
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: 0,
+      gateFailures: [],
+    },
+    trust: {
+      source: 'internal',
+      sanitized: true,
+      containsUntrustedText: false,
+      containsSecrets: false,
+    },
+    nextActionHint: 'continue',
+  };
+}
+
+function createAdapter(
+  execute: (request: ToolExecutionRequest) => Promise<ToolResultEnvelope>
+): ToolExecutionAdapter {
+  return {
+    kind: 'internal-tool',
+    preview: (request) => ({
+      kind: request.manifest.kind,
+      summary: `Run ${request.manifest.id}`,
+      risk: 'low',
+      details: { args: request.args },
+    }),
+    execute,
+  };
+}
+
+describe('UnifiedToolCatalog', () => {
+  it('projects tool schemas and preserves internal handler access', () => {
+    const definition: ToolDefinitionV2 = {
+      id: 'demo.echo',
+      title: 'Demo Echo',
+      description: 'Full echo schema',
+      kind: 'internal-tool',
+      inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+      handler: async (args) => ({ echoed: args.value }),
+      risk: createManifest().risk,
+      governance: createManifest().governance,
+      execution: createManifest().execution,
+      modelOverrides: {
+        'gpt-*': {
+          description: 'Model-specific echo schema',
+          inputSchema: { type: 'object', properties: { compact: { type: 'boolean' } } },
+        },
+      },
+    };
+    const catalog = new UnifiedToolCatalog([definition]);
+
+    expect(catalog.getManifest('demo.echo')).toMatchObject({
+      id: 'demo.echo',
+      kind: 'internal-tool',
+    });
+    expect(catalog.getInternalTool('demo.echo')).toMatchObject({
+      name: 'demo.echo',
+      description: 'Full echo schema',
+    });
+    expect(catalog.toLightweightSchemas()[0]).toMatchObject({
+      name: 'demo.echo',
+      parameters: { type: 'object', properties: {} },
+    });
+
+    catalog.markExpanded('demo.echo');
+
+    expect(catalog.toMixedSchemas(null, 'gpt-5', false)[0]).toMatchObject({
+      description: 'Model-specific echo schema',
+      parameters: { type: 'object', properties: { compact: { type: 'boolean' } } },
+    });
+  });
+});
+
+describe('LightweightRouter', () => {
+  it('routes adapter execution and preserves structured partial outputs', async () => {
+    const catalog = new CapabilityCatalog([createManifest()]);
+    const calls: ToolExecutionRequest[] = [];
+    const adapter = createAdapter(async (request) => {
+      calls.push(request);
+      return createSuccessEnvelope(request);
+    });
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [adapter],
+      projectRoot: '/tmp/project',
+      dataRoot: '/tmp/data',
+    });
+
+    const envelope = await router.execute(createRequest());
+
+    expect(envelope.ok).toBe(true);
+    expect(envelope.structuredContent).toEqual({ echo: 'hello' });
+    expect(envelope.artifacts?.[0]).toMatchObject({ kind: 'stdout', uri: 'memory://stdout/1' });
+    expect(envelope.diagnostics.warnings[0]).toMatchObject({ code: 'partial' });
+    expect(envelope.nextActionHint).toBe('continue');
+    expect(presentToolResult(envelope)).toBe('echo complete');
+    expect(isToolResultEnvelope(envelope)).toBe(true);
+    expect(calls[0].context.projectRoot).toBe('/tmp/project');
+    expect(calls[0].context.dataRoot).toBe('/tmp/data');
+    expect(calls[0].decision.preview).toMatchObject({ kind: 'internal-tool' });
+  });
+
+  it('blocks tool calls denied by runtime policy before adapter execution', async () => {
+    const catalog = new CapabilityCatalog([createManifest()]);
+    let adapterCalled = false;
+    const recorded: ToolResultEnvelope[] = [];
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(async (request) => {
+          adapterCalled = true;
+          return createSuccessEnvelope(request);
+        }),
+      ],
+    });
+    const request = createRequest({
+      runtime: {
+        policyValidator: {
+          validateToolCall: () => ({ ok: false, reason: 'blocked by policy' }),
+        },
+        diagnostics: {
+          recordToolCallEnvelope: (envelope) => {
+            recorded.push(envelope);
+          },
+        },
+      },
+    });
+
+    const explanation = await router.explain(request);
+    const envelope = await router.execute(request);
+
+    expect(explanation).toMatchObject({
+      allowed: false,
+      resultStatus: 'blocked',
+      reason: 'blocked by policy',
+    });
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'blocked',
+      text: 'blocked by policy',
+    });
+    expect(envelope.diagnostics.blockedTools).toEqual([
+      { tool: 'demo.echo', reason: 'blocked by policy' },
+    ]);
+    expect(adapterCalled).toBe(false);
+    expect(recorded).toHaveLength(1);
+  });
+
+  it('blocks tools on unsupported surfaces', async () => {
+    const catalog = new CapabilityCatalog([createManifest({ surfaces: ['runtime'] })]);
+    const router = new LightweightRouter({ catalog });
+
+    const envelope = await router.execute(
+      createRequest({ surface: 'mcp', source: { kind: 'mcp' } })
+    );
+
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'blocked',
+    });
+    expect(envelope.text).toContain("not allowed on surface 'mcp'");
+  });
+
+  it('returns timeout envelopes when adapters exceed execution timeout', async () => {
+    const catalog = new CapabilityCatalog([
+      createManifest({ execution: { timeoutMs: 5, abortMode: 'hardTimeout' } }),
+    ]);
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(
+          () =>
+            new Promise<ToolResultEnvelope>(() => {
+              /* intentionally never resolves */
+            })
+        ),
+      ],
+    });
+
+    const envelope = await router.execute(createRequest());
+
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'timeout',
+      text: 'Tool call timed out after 5ms',
+    });
+    expect(envelope.diagnostics.timedOutStages).toEqual(['execute']);
+  });
+
+  it('returns aborted envelopes without starting adapters when already cancelled', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const catalog = new CapabilityCatalog([createManifest()]);
+    let adapterCalled = false;
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(async (request) => {
+          adapterCalled = true;
+          return createSuccessEnvelope(request);
+        }),
+      ],
+    });
+
+    const envelope = await router.execute(createRequest({ abortSignal: controller.signal }));
+
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'aborted',
+      text: 'Tool call aborted before execution',
+    });
+    expect(adapterCalled).toBe(false);
+  });
+
+  it('normalizes adapter exceptions into error envelopes', async () => {
+    const catalog = new CapabilityCatalog([createManifest()]);
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(async () => {
+          throw new Error('adapter boom');
+        }),
+      ],
+    });
+
+    const envelope = await router.execute(createRequest());
+
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'error',
+      text: 'adapter boom',
+    });
+    expect(isToolResultEnvelope(envelope)).toBe(true);
+  });
+});
