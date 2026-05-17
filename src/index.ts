@@ -6,8 +6,8 @@ export * from './tools/index.js';
 
 export const alembicAgentPackage = Object.freeze({
   packageName: '@alembic/agent',
-  migrationPhase: 'phase-7-tool-v2-contract',
-  implementationStatus: 'tool-v2-contract-exported',
+  migrationPhase: 'phase-8-remaining-host-contract',
+  implementationStatus: 'remaining-host-contract-exported',
 });
 
 export type AlembicAgentPackageInfo = typeof alembicAgentPackage;

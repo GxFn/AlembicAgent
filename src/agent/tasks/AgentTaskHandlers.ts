@@ -8,12 +8,12 @@
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
-interface TaskAiProvider {
+export interface TaskAiProvider {
   chat(prompt: string, opts?: Record<string, unknown>): Promise<string>;
   chatWithStructuredOutput(prompt: string, opts?: Record<string, unknown>): Promise<unknown>;
 }
 
-interface TaskContext {
+export interface TaskContext {
   invokeToolEnvelope(
     toolName: string,
     params: Record<string, unknown>
@@ -23,19 +23,19 @@ interface TaskContext {
   logger?: unknown;
 }
 
-interface CandidateInput {
+export interface CandidateInput {
   title?: string;
   code?: string;
   [key: string]: unknown;
 }
 
-interface DuplicateEntry {
+export interface DuplicateEntry {
   title?: string;
   similarity: number;
   [key: string]: unknown;
 }
 
-interface KnowledgeItem {
+export interface KnowledgeItem {
   id: string;
   title?: string;
   metadata?: {
@@ -47,14 +47,14 @@ interface KnowledgeItem {
   [key: string]: unknown;
 }
 
-interface KnowledgeServiceLike {
+export interface KnowledgeServiceLike {
   list(
     filter: Record<string, unknown>,
     pagination: { page: number; pageSize: number }
   ): Promise<{ items?: KnowledgeItem[]; data?: KnowledgeItem[] }>;
 }
 
-interface GuardViolation {
+export interface GuardViolation {
   severity?: string;
   message?: string;
   ruleName?: string;
