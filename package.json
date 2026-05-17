@@ -21,6 +21,14 @@
     "./tools": {
       "types": "./dist/tools/index.d.ts",
       "import": "./dist/tools/index.js"
+    },
+    "./memory": {
+      "types": "./dist/agent/memory/index.d.ts",
+      "import": "./dist/agent/memory/index.js"
+    },
+    "./context": {
+      "types": "./dist/agent/context/index.d.ts",
+      "import": "./dist/agent/context/index.js"
     }
   },
   "imports": {
@@ -79,6 +87,8 @@
     "alembic",
     "agent",
     "ai",
+    "memory",
+    "context",
     "tools",
     "typescript"
   ],

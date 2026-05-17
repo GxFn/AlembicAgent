@@ -11,9 +11,17 @@
 export { ActiveContext } from './ActiveContext.js';
 export { MemoryConsolidator } from './MemoryConsolidator.js';
 export { MemoryCoordinator } from './MemoryCoordinator.js';
+export { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
 export { MemoryRetriever } from './MemoryRetriever.js';
 
 // PersistentMemory 子模块 — 内部拆分后的独立组件
 export { MemoryStore } from './MemoryStore.js';
+export type {
+  DimensionFlushManifest,
+  DistilledContext,
+} from './memory-flush-contract.js';
+export { extractHighPriorityFindings } from './memory-flush-contract.js';
 export { PersistentMemory } from './PersistentMemory.js';
 export { SessionStore } from './SessionStore.js';
+export type { SessionStoreSerialized } from './session-store-schema.js';
+export { validateSessionStoreShape } from './session-store-schema.js';
