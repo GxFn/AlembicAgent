@@ -38,6 +38,10 @@
       "types": "./dist/tools/index.d.ts",
       "import": "./dist/tools/index.js"
     },
+    "./tools/v2": {
+      "types": "./dist/tools/v2/index.d.ts",
+      "import": "./dist/tools/v2/index.js"
+    },
     "./memory": {
       "types": "./dist/agent/memory/index.d.ts",
       "import": "./dist/agent/memory/index.js"
@@ -110,6 +114,7 @@
     "runtime",
     "service",
     "tools",
+    "tool-v2",
     "typescript"
   ],
   "license": "MIT"

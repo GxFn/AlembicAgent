@@ -10,7 +10,5 @@ export * from './core/ToolResultEnvelope.js';
 export * from './core/ToolResultPresenter.js';
 export * from './core/ToolRoutingServices.js';
 export * from './v2/capabilities/index.js';
-export * from './v2/compressor/strip.js';
-export * from './v2/registry.js';
-export * from './v2/types.js';
+export * from './v2/index.js';
 export * from './workflow/WorkflowRegistry.js';
