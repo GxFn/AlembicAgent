@@ -36,7 +36,17 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: AlembicAgent/package-lock.json
+          cache-dependency-path: |
+            AlembicAgent/package-lock.json
+            AlembicCore/package-lock.json
+
+      - name: Install AlembicCore dependencies
+        working-directory: AlembicCore
+        run: npm ci
+
+      - name: Build AlembicCore sibling
+        working-directory: AlembicCore
+        run: npm run build
 
       - name: Install dependencies
         working-directory: AlembicAgent
