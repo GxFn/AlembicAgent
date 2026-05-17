@@ -9,6 +9,7 @@ export * from './core/ToolDecision.js';
 export * from './core/ToolResultEnvelope.js';
 export * from './core/ToolResultPresenter.js';
 export * from './core/ToolRoutingServices.js';
+export * from './terminal/index.js';
 export * from './v2/capabilities/index.js';
 export * from './v2/index.js';
 export * from './workflow/WorkflowRegistry.js';

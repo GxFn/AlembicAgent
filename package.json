@@ -50,6 +50,10 @@
       "types": "./dist/tools/index.d.ts",
       "import": "./dist/tools/index.js"
     },
+    "./tools/terminal": {
+      "types": "./dist/tools/terminal/index.d.ts",
+      "import": "./dist/tools/terminal/index.js"
+    },
     "./tools/v2": {
       "types": "./dist/tools/v2/index.d.ts",
       "import": "./dist/tools/v2/index.js"
@@ -128,6 +132,7 @@
     "runtime",
     "service",
     "tasks",
+    "terminal",
     "tools",
     "tool-v2",
     "typescript"
