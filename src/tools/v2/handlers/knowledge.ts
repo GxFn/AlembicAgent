@@ -161,7 +161,7 @@ async function handleSubmit(
     };
 
     const result = await gateway.create({
-      source: 'agent-tool',
+      source: AGENT_RUNTIME_SOURCE,
       items: [item],
       options: {
         supersedes: pickString(params.supersedes),
@@ -169,7 +169,7 @@ async function handleSubmit(
         existingTriggers: ctx.runtime?.submittedTriggers ?? undefined,
         existingFingerprints: ctx.runtime?.submittedPatterns ?? undefined,
         systemInjectedFields: isBootstrap ? getSystemInjectedFields() : undefined,
-        userId: 'agent',
+        userId: AGENT_RUNTIME_SOURCE,
         bootstrapDedup: isBootstrap ? ctx.runtime?.bootstrapDedup : undefined,
       },
     });

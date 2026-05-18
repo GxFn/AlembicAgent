@@ -107,6 +107,7 @@ describe('Tool V2 contract exports', () => {
     const createRequests: Array<{
       source: string;
       items: Record<string, unknown>[];
+      options?: Record<string, unknown>;
     }> = [];
     const parsed = router.parseToolCall('knowledge', {
       action: 'submit',
@@ -158,7 +159,8 @@ describe('Tool V2 contract exports', () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(createRequests[0]?.source).toBe('agent-tool');
+    expect(createRequests[0]?.source).toBe('alembic-agent');
+    expect(createRequests[0]?.options?.userId).toBe('alembic-agent');
     expect(createRequests[0]?.items[0]?.source).toBe('alembic-agent');
   });
 
