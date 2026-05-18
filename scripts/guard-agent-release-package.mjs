@@ -46,6 +46,9 @@ if (localDependencies.length === 0) {
   process.stderr.write(
     'Create a staged publish manifest with registry dependencies and record the Core source commit before releasing.\n'
   );
+  process.stderr.write(
+    'Use `npm run release:pack-preview` to build and dry-run the staged publish package.\n'
+  );
   for (const finding of localDependencies) {
     process.stderr.write(`- ${finding}\n`);
   }
