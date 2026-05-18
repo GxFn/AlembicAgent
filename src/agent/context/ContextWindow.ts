@@ -22,8 +22,8 @@
  */
 
 import Logger from '@alembic/core/logging';
-import { estimateTokensFast } from '@alembic/core/shared/token-utils';
 import { getModelRegistry } from '../../external/ai/registry/ModelRegistry.js';
+import { estimateTokensFast } from '../../shared/token-utils.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 

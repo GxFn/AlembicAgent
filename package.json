@@ -103,8 +103,11 @@
     "lint": "biome check src scripts test",
     "lint:fix": "biome check --fix src scripts test",
     "lint:agent-import-boundary": "node scripts/lint-agent-import-boundary.mjs",
+    "lint:public-api-boundary": "node scripts/lint-agent-public-api-boundary.mjs",
+    "lint:core-import-boundary": "node ../AlembicCore/scripts/lint-consumer-core-imports.mjs . --config config/core-import-boundary.json",
+    "smoke:public-imports": "npm run build && node scripts/smoke-agent-public-imports.mjs",
     "test": "vitest run",
-    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run test"
+    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run test"
   },
   "dependencies": {
     "@alembic/core": "file:../AlembicCore",

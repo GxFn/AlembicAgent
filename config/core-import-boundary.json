@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "description": "AlembicAgent Core consumer boundary. Stable @alembic/core facades are preferred; remaining non-stable imports are frozen at current reference counts until Core exposes narrow facades or an explicit adapter contract.",
+  "scanRoots": ["src", "test", "scripts"],
+  "referenceLimits": {
+    "@alembic/core/infrastructure/database/drizzle/schema": 2,
+    "@alembic/core/service/evolution": 1,
+    "@alembic/core/shared/constants": 1,
+    "@alembic/core/shared/similarity": 2
+  }
+}

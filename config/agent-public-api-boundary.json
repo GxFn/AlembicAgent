@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard or deep dist/src imports are allowed.",
+  "expectedCounts": {
+    "stable-public": 15,
+    "provisional-public": 0,
+    "transitional-internal": 0,
+    "forbidden": 0
+  },
+  "stablePublicExports": [
+    ".",
+    "./agent",
+    "./service",
+    "./runtime",
+    "./prompts",
+    "./domain",
+    "./forge",
+    "./tasks",
+    "./profiles",
+    "./ai",
+    "./tools",
+    "./tools/v2",
+    "./tools/terminal",
+    "./memory",
+    "./context"
+  ],
+  "provisionalPublicExports": [],
+  "transitionalInternalExports": [],
+  "forbiddenConsumerSpecifiers": [
+    "@alembic/agent/dist/*",
+    "@alembic/agent/src/*",
+    "@alembic/agent/*/*/*"
+  ]
+}

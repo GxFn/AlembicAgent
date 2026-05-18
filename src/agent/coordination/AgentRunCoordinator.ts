@@ -1,4 +1,4 @@
-import { createLimit } from '@alembic/core/shared/concurrency';
+import { createLimit } from '../../shared/concurrency.js';
 import type {
   AgentConcurrencyPlan,
   AgentProfileOverride,

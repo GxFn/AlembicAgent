@@ -13,7 +13,7 @@
  * @module insight-analyst
  */
 
-import { getDimensionSOP } from '@alembic/core/domain/dimension/DimensionSop';
+import { getDimensionSOP } from '@alembic/core/dimensions';
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义
