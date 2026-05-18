@@ -11,9 +11,9 @@
  * @module MemoryRetriever
  */
 
-import { cosineSimilarity } from '@alembic/core/shared/similarity';
+import { cosineSimilarity } from '@alembic/core/search';
 import type { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
-import type { DeserializedMemory, MemoryRow } from './MemoryStore.js';
+import type { DeserializedMemory } from './MemoryStore.js';
 import { MemoryStore } from './MemoryStore.js';
 
 // ─── 常量 (Generative Agents 三维打分) ────────────────

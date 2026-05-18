@@ -27,7 +27,6 @@ import type { Disposable } from '@alembic/core/events';
 import { timerRegistry } from '@alembic/core/events';
 import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
-import { CACHE } from '@alembic/core/shared/constants';
 import type { SessionStoreSerialized } from './session-store-schema.js';
 import { validateSessionStoreShape } from './session-store-schema.js';
 
@@ -42,10 +41,16 @@ const NON_CACHEABLE = new Set([
   'get_previous_evidence',
 ]);
 
-/** 缓存上限 */
-const MAX_FILE_CACHE = CACHE.MAX_FILE_ENTRIES;
-const MAX_SEARCH_CACHE = CACHE.MAX_SEARCH_ENTRIES;
-const DEFAULT_TTL_MS = CACHE.DEFAULT_TTL_MS;
+/** 缓存上限：Agent runtime 自有策略，避免消费 Core shared/constants 内部路径。 */
+const SESSION_CACHE_DEFAULTS = Object.freeze({
+  maxFileEntries: 200,
+  maxSearchEntries: 500,
+  defaultTtlMs: 30 * 60 * 1000,
+});
+
+const MAX_FILE_CACHE = SESSION_CACHE_DEFAULTS.maxFileEntries;
+const MAX_SEARCH_CACHE = SESSION_CACHE_DEFAULTS.maxSearchEntries;
+const DEFAULT_TTL_MS = SESSION_CACHE_DEFAULTS.defaultTtlMs;
 
 // ── 类型定义 ──
 

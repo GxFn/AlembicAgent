@@ -1,5 +1,5 @@
 /**
- * MemoryStore — 持久化记忆 SQLite 存储层（Drizzle 类型安全版）
+ * MemoryStore — 持久化记忆 SQLite 存储层
  *
  * 从 PersistentMemory.js 提取的 CRUD + SQL 基础设施。
  * 负责:
@@ -11,8 +11,8 @@
  *   - 统计: getStats, clearBootstrapMemories
  *
  * 设计原则:
- *   - 大部分操作通过 Drizzle 类型安全 API
- *   - update() 使用 Drizzle 类型安全 partial update
+ *   - Core facade 负责语义记忆表结构创建
+ *   - Agent 保留同步 raw SQLite adapter，兼容现有调用方
  *   - embedding 已迁移至 MemoryEmbeddingStore (JSON sidecar)
  *   - 数据序列化/反序列化统一在此层处理
  *
@@ -20,13 +20,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { DrizzleDB } from '@alembic/core/database';
-import * as schema from '@alembic/core/infrastructure/database/drizzle/schema';
-import { semanticMemories } from '@alembic/core/infrastructure/database/drizzle/schema';
-import { jaccardSimilarity, tokenizeForSimilarity } from '@alembic/core/shared/similarity';
-import type { Database } from 'better-sqlite3';
-import { and, asc, avg, count, desc, eq, isNull, lt, or, sql } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/better-sqlite3';
+import {
+  ensureSemanticMemorySchema,
+  type SemanticMemorySqliteDatabase,
+} from '@alembic/core/memory';
+import { jaccardSimilarity, tokenizeForSimilarity } from '@alembic/core/search';
 
 // ─── 类型定义 ──────────────────────────────────────────
 
@@ -43,9 +41,6 @@ export interface SqliteStatement {
   get(...params: unknown[]): Record<string, unknown> | undefined;
   all(...params: unknown[]): Record<string, unknown>[];
 }
-
-/** Drizzle row type */
-type DrizzleMemoryRow = typeof semanticMemories.$inferSelect;
 
 /** 数据库行 (raw row from SQLite — 保持向后兼容) */
 export interface MemoryRow {
@@ -125,42 +120,16 @@ const FORGET_DAYS = 90;
 
 export class MemoryStore {
   #db: SqliteDatabase;
-  #drizzle: DrizzleDB;
 
   /** @param db better-sqlite3 实例 (raw) */
   constructor(db: SqliteDatabase) {
     this.#db = db;
-    this.#drizzle = drizzle(db as unknown as Database, { schema });
-    this.#ensureTable();
+    ensureSemanticMemorySchema(db as unknown as SemanticMemorySqliteDatabase);
   }
 
   /** 获取原始 db 引用 (for transaction) */
   get db() {
     return this.#db;
-  }
-
-  /** 确保表存在 (兼容 :memory: 测试 DB) */
-  #ensureTable() {
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS semantic_memories (
-        id                TEXT PRIMARY KEY,
-        type              TEXT NOT NULL DEFAULT 'fact',
-        content           TEXT NOT NULL DEFAULT '',
-        source            TEXT NOT NULL DEFAULT 'bootstrap',
-        importance        REAL NOT NULL DEFAULT 5.0,
-        access_count      INTEGER NOT NULL DEFAULT 0,
-        last_accessed_at  TEXT,
-        created_at        TEXT NOT NULL,
-        updated_at        TEXT NOT NULL,
-        expires_at        TEXT,
-        related_entities  TEXT DEFAULT '[]',
-        related_memories  TEXT DEFAULT '[]',
-        source_dimension  TEXT,
-        source_evidence   TEXT,
-        bootstrap_session TEXT,
-        tags              TEXT DEFAULT '[]'
-      )
-    `);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -180,27 +149,46 @@ export class MemoryStore {
       ? new Date(Date.now() + memory.ttlDays * 86400_000).toISOString()
       : null;
 
-    this.#drizzle
-      .insert(semanticMemories)
-      .values({
+    this.#db
+      .prepare(`
+        INSERT INTO semantic_memories (
+          id,
+          type,
+          content,
+          source,
+          importance,
+          access_count,
+          last_accessed_at,
+          created_at,
+          updated_at,
+          expires_at,
+          related_entities,
+          related_memories,
+          source_dimension,
+          source_evidence,
+          bootstrap_session,
+          tags
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
         id,
-        type: memory.type || 'fact',
+        memory.type || 'fact',
         content,
-        source: memory.source || 'bootstrap',
+        memory.source || 'bootstrap',
         importance,
-        accessCount: 0,
-        lastAccessedAt: now,
-        createdAt: now,
-        updatedAt: now,
+        0,
+        now,
+        now,
+        now,
         expiresAt,
-        relatedEntities: JSON.stringify(memory.relatedEntities || []),
-        relatedMemories: JSON.stringify([]),
-        sourceDimension: memory.sourceDimension || null,
-        sourceEvidence: memory.sourceEvidence || null,
-        bootstrapSession: memory.bootstrapSession || null,
-        tags: JSON.stringify(memory.tags || []),
-      })
-      .run();
+        JSON.stringify(memory.relatedEntities || []),
+        JSON.stringify([]),
+        memory.sourceDimension || null,
+        memory.sourceEvidence || null,
+        memory.bootstrapSession || null,
+        JSON.stringify(memory.tags || [])
+      );
 
     return { id, action: 'ADD' };
   }
@@ -209,62 +197,64 @@ export class MemoryStore {
    * 更新已有记忆
    */
   update(id: string, updates: MemoryUpdates) {
-    const existing = this.#drizzle
-      .select({ id: semanticMemories.id })
-      .from(semanticMemories)
-      .where(eq(semanticMemories.id, id))
-      .get();
+    const existing = this.#db.prepare('SELECT id FROM semantic_memories WHERE id = ?').get(id);
 
     if (!existing) {
       return false;
     }
 
     const now = new Date().toISOString();
-    const setFields: Partial<typeof semanticMemories.$inferInsert> = {};
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
 
     if (updates.content !== undefined) {
-      setFields.content = updates.content.substring(0, 500);
+      setClauses.push('content = ?');
+      params.push(updates.content.substring(0, 500));
     }
     if (updates.importance !== undefined) {
-      setFields.importance = Math.max(1, Math.min(10, updates.importance));
+      setClauses.push('importance = ?');
+      params.push(Math.max(1, Math.min(10, updates.importance)));
     }
     if (updates.accessCount !== undefined) {
-      setFields.accessCount = updates.accessCount;
+      setClauses.push('access_count = ?');
+      params.push(updates.accessCount);
     }
     if (updates.relatedEntities !== undefined) {
-      setFields.relatedEntities = JSON.stringify(updates.relatedEntities);
+      setClauses.push('related_entities = ?');
+      params.push(JSON.stringify(updates.relatedEntities));
     }
     if (updates.relatedMemories !== undefined) {
-      setFields.relatedMemories = JSON.stringify(updates.relatedMemories);
+      setClauses.push('related_memories = ?');
+      params.push(JSON.stringify(updates.relatedMemories));
     }
     if (updates.tags !== undefined) {
-      setFields.tags = JSON.stringify(updates.tags);
+      setClauses.push('tags = ?');
+      params.push(JSON.stringify(updates.tags));
     }
 
-    if (Object.keys(setFields).length === 0) {
+    if (setClauses.length === 0) {
       return false;
     }
 
-    setFields.updatedAt = now;
+    setClauses.push('updated_at = ?');
+    params.push(now, id);
 
-    this.#drizzle.update(semanticMemories).set(setFields).where(eq(semanticMemories.id, id)).run();
-    return true;
+    const result = this.#db
+      .prepare(`UPDATE semantic_memories SET ${setClauses.join(', ')} WHERE id = ?`)
+      .run(...params);
+    return result.changes > 0;
   }
 
   /** 删除一条记忆 */
   delete(id: string) {
-    const result = this.#drizzle.delete(semanticMemories).where(eq(semanticMemories.id, id)).run();
-    return (result.changes ?? 0) > 0;
+    const result = this.#db.prepare('DELETE FROM semantic_memories WHERE id = ?').run(id);
+    return result.changes > 0;
   }
 
   /** 按 ID 获取 */
   get(id: string): DeserializedMemory | null {
-    const row = this.#drizzle
-      .select()
-      .from(semanticMemories)
-      .where(eq(semanticMemories.id, id))
-      .get();
-    return row ? MemoryStore.deserialize(MemoryStore.#toRow(row)) : null;
+    const row = this.#db.prepare('SELECT * FROM semantic_memories WHERE id = ?').get(id);
+    return row ? MemoryStore.deserialize(MemoryStore.#normalizeRow(row)) : null;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -277,64 +267,63 @@ export class MemoryStore {
    */
   getAllActive({ source, type }: { source?: string; type?: string } = {}): MemoryRow[] {
     const now = new Date().toISOString();
-    const notExpired = or(
-      isNull(semanticMemories.expiresAt),
-      sql`${semanticMemories.expiresAt} > ${now}`
-    );
-
-    const conditions = [notExpired];
+    const conditions = ['(expires_at IS NULL OR expires_at > ?)'];
+    const params: unknown[] = [now];
     if (source) {
-      conditions.push(eq(semanticMemories.source, source));
+      conditions.push('source = ?');
+      params.push(source);
     }
     if (type) {
-      conditions.push(eq(semanticMemories.type, type));
+      conditions.push('type = ?');
+      params.push(type);
     }
 
-    const rows = this.#drizzle
-      .select()
-      .from(semanticMemories)
-      .where(and(...conditions))
-      .orderBy(desc(semanticMemories.updatedAt))
-      .all();
+    const rows = this.#db
+      .prepare(`
+        SELECT *
+        FROM semantic_memories
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY updated_at DESC
+      `)
+      .all(...params);
 
-    return rows.map(MemoryStore.#toRow);
+    return rows.map(MemoryStore.#normalizeRow);
   }
 
   /** 获取候选记忆 (用于相似度搜索) */
   getCandidates(type: string | null): MemoryRow[] {
     const now = new Date().toISOString();
-    const notExpired = or(
-      isNull(semanticMemories.expiresAt),
-      sql`${semanticMemories.expiresAt} > ${now}`
-    );
-
-    const conditions = [notExpired];
+    const conditions = ['(expires_at IS NULL OR expires_at > ?)'];
+    const params: unknown[] = [now];
     if (type) {
-      conditions.push(eq(semanticMemories.type, type));
+      conditions.push('type = ?');
+      params.push(type);
     }
 
-    const rows = this.#drizzle
-      .select()
-      .from(semanticMemories)
-      .where(and(...conditions))
-      .orderBy(desc(semanticMemories.updatedAt))
-      .limit(50)
-      .all();
+    const rows = this.#db
+      .prepare(`
+        SELECT *
+        FROM semantic_memories
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY updated_at DESC
+        LIMIT 50
+      `)
+      .all(...params);
 
-    return rows.map(MemoryStore.#toRow);
+    return rows.map(MemoryStore.#normalizeRow);
   }
 
   /** 更新访问计数 */
   touchAccess(id: string) {
     try {
-      this.#drizzle
-        .update(semanticMemories)
-        .set({
-          accessCount: sql`${semanticMemories.accessCount} + 1`,
-          lastAccessedAt: new Date().toISOString(),
-        })
-        .where(eq(semanticMemories.id, id))
-        .run();
+      this.#db
+        .prepare(`
+          UPDATE semantic_memories
+          SET access_count = access_count + 1,
+              last_accessed_at = ?
+          WHERE id = ?
+        `)
+        .run(new Date().toISOString(), id);
     } catch {
       /* non-critical */
     }
@@ -342,13 +331,12 @@ export class MemoryStore {
 
   /** 记忆总数 */
   size({ source }: { source?: string } = {}) {
-    const condition = source ? eq(semanticMemories.source, source) : undefined;
-    const [row] = this.#drizzle
-      .select({ cnt: count() })
-      .from(semanticMemories)
-      .where(condition)
-      .all();
-    return row?.cnt ?? 0;
+    const row = source
+      ? this.#db
+          .prepare('SELECT COUNT(*) AS cnt FROM semantic_memories WHERE source = ?')
+          .get(source)
+      : this.#db.prepare('SELECT COUNT(*) AS cnt FROM semantic_memories').get();
+    return MemoryStore.#countFromRow(row);
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -364,119 +352,106 @@ export class MemoryStore {
     const nowMs = Date.now();
     const stats = { expired: 0, forgotten: 0, archived: 0, remaining: 0 };
 
-    this.#drizzle.transaction((tx) => {
+    const runCompaction = this.#db.transaction(() => {
       // 清除已过期
-      const expiredResult = tx
-        .delete(semanticMemories)
-        .where(
-          and(sql`${semanticMemories.expiresAt} IS NOT NULL`, lt(semanticMemories.expiresAt, now))
-        )
-        .run();
-      stats.expired = expiredResult.changes ?? 0;
+      const expiredResult = this.#db
+        .prepare('DELETE FROM semantic_memories WHERE expires_at IS NOT NULL AND expires_at < ?')
+        .run(now);
+      stats.expired = expiredResult.changes;
 
       // 遗忘：长期未访问且不重要的
       const forgetThreshold = new Date(nowMs - FORGET_DAYS * 86400_000).toISOString();
-      const forgottenResult = tx
-        .delete(semanticMemories)
-        .where(
-          and(
-            lt(semanticMemories.lastAccessedAt, forgetThreshold),
-            lt(semanticMemories.importance, 7)
-          )
-        )
-        .run();
-      stats.forgotten = forgottenResult.changes ?? 0;
+      const forgottenResult = this.#db
+        .prepare(`
+          DELETE FROM semantic_memories
+          WHERE last_accessed_at < ?
+            AND importance < 7
+        `)
+        .run(forgetThreshold);
+      stats.forgotten = forgottenResult.changes;
 
       // 归档：降低重要性
       const archiveThreshold = new Date(nowMs - ARCHIVE_DAYS * 86400_000).toISOString();
-      const archiveResult = tx
-        .update(semanticMemories)
-        .set({
-          importance: sql`MAX(1, ${semanticMemories.importance} - 1)`,
-        })
-        .where(
-          and(
-            lt(semanticMemories.lastAccessedAt, archiveThreshold),
-            lt(semanticMemories.importance, 3)
-          )
-        )
-        .run();
-      stats.archived = archiveResult.changes ?? 0;
+      const archiveResult = this.#db
+        .prepare(`
+          UPDATE semantic_memories
+          SET importance = MAX(1, importance - 1)
+          WHERE last_accessed_at < ?
+            AND importance < 3
+        `)
+        .run(archiveThreshold);
+      stats.archived = archiveResult.changes;
 
-      const [remainRow] = tx.select({ cnt: count() }).from(semanticMemories).all();
-      stats.remaining = remainRow?.cnt ?? 0;
+      stats.remaining = MemoryStore.#countFromRow(
+        this.#db.prepare('SELECT COUNT(*) AS cnt FROM semantic_memories').get()
+      );
     });
+    runCompaction();
 
     return stats;
   }
 
   /** 容量控制 */
   enforceCapacity() {
-    const [row] = this.#drizzle.select({ cnt: count() }).from(semanticMemories).all();
-    const total = row?.cnt ?? 0;
+    const total = MemoryStore.#countFromRow(
+      this.#db.prepare('SELECT COUNT(*) AS cnt FROM semantic_memories').get()
+    );
     if (total <= MAX_MEMORIES) {
       return;
     }
 
     const excess = total - MAX_MEMORIES;
-    this.#drizzle
-      .delete(semanticMemories)
-      .where(
-        sql`${semanticMemories.id} IN (
-          SELECT ${semanticMemories.id} FROM ${semanticMemories}
-          ORDER BY ${semanticMemories.importance} ASC, ${semanticMemories.accessCount} ASC, ${semanticMemories.updatedAt} ASC
-          LIMIT ${excess}
-        )`
-      )
-      .run();
+    this.#db
+      .prepare(`
+        DELETE FROM semantic_memories
+        WHERE id IN (
+          SELECT id
+          FROM semantic_memories
+          ORDER BY importance ASC, access_count ASC, updated_at ASC
+          LIMIT ?
+        )
+      `)
+      .run(excess);
   }
 
   /** 获取统计信息 */
   getStats() {
-    const [totalRow] = this.#drizzle.select({ cnt: count() }).from(semanticMemories).all();
-    const total = totalRow?.cnt ?? 0;
-
-    const byType = this.#drizzle
-      .select({
-        type: semanticMemories.type,
-        cnt: count(),
-      })
-      .from(semanticMemories)
-      .groupBy(semanticMemories.type)
+    const total = MemoryStore.#countFromRow(
+      this.#db.prepare('SELECT COUNT(*) AS cnt FROM semantic_memories').get()
+    );
+    const byType = this.#db
+      .prepare('SELECT type, COUNT(*) AS cnt FROM semantic_memories GROUP BY type')
       .all();
-
-    const bySource = this.#drizzle
-      .select({
-        source: semanticMemories.source,
-        cnt: count(),
-      })
-      .from(semanticMemories)
-      .groupBy(semanticMemories.source)
+    const bySource = this.#db
+      .prepare('SELECT source, COUNT(*) AS cnt FROM semantic_memories GROUP BY source')
       .all();
-
-    const [avgRow] = this.#drizzle
-      .select({
-        avg: avg(semanticMemories.importance),
-      })
-      .from(semanticMemories)
-      .all();
-    const avgImportance = avgRow?.avg ? Number(avgRow.avg) : 0;
+    const avgRow = this.#db.prepare('SELECT AVG(importance) AS avg FROM semantic_memories').get();
+    const avgImportance = MemoryStore.#numberFromField(avgRow, 'avg', 0);
 
     return {
       total,
-      byType: Object.fromEntries(byType.map((r) => [r.type, r.cnt])),
-      bySource: Object.fromEntries(bySource.map((r) => [r.source, r.cnt])),
+      byType: Object.fromEntries(
+        byType.map((row) => [
+          MemoryStore.#stringFromField(row, 'type', 'unknown'),
+          MemoryStore.#numberFromField(row, 'cnt', 0),
+        ])
+      ),
+      bySource: Object.fromEntries(
+        bySource.map((row) => [
+          MemoryStore.#stringFromField(row, 'source', 'unknown'),
+          MemoryStore.#numberFromField(row, 'cnt', 0),
+        ])
+      ),
       avgImportance: Math.round(avgImportance * 10) / 10,
     };
   }
 
   /** 清除所有 bootstrap 来源的记忆 */
   clearBootstrapMemories() {
-    const result = this.#drizzle
-      .delete(semanticMemories)
-      .where(eq(semanticMemories.source, 'bootstrap'))
-      .run();
-    return result.changes ?? 0;
+    const result = this.#db
+      .prepare('DELETE FROM semantic_memories WHERE source = ?')
+      .run('bootstrap');
+    return result.changes;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -566,28 +541,71 @@ export class MemoryStore {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // Private: Drizzle → MemoryRow 映射
+  // Private: raw SQLite row → MemoryRow 映射
   // ═══════════════════════════════════════════════════════════
 
-  /** Drizzle camelCase row → MemoryRow snake_case (保持向后兼容) */
-  static #toRow(row: DrizzleMemoryRow): MemoryRow {
-    return {
-      id: row.id,
-      type: row.type,
-      content: row.content,
-      source: row.source,
-      importance: row.importance,
-      access_count: row.accessCount,
-      last_accessed_at: row.lastAccessedAt,
-      created_at: row.createdAt,
-      updated_at: row.updatedAt,
-      expires_at: row.expiresAt,
-      related_entities: row.relatedEntities ?? '[]',
-      related_memories: row.relatedMemories ?? '[]',
-      source_dimension: row.sourceDimension,
-      source_evidence: row.sourceEvidence,
-      bootstrap_session: row.bootstrapSession,
-      tags: row.tags ?? '[]',
+  /** raw SQLite snake_case row → MemoryRow (保持向后兼容) */
+  static #normalizeRow(row: Record<string, unknown>): MemoryRow {
+    const normalized: MemoryRow = {
+      id: MemoryStore.#stringFromField(row, 'id', ''),
+      type: MemoryStore.#stringFromField(row, 'type', 'fact'),
+      content: MemoryStore.#stringFromField(row, 'content', ''),
+      source: MemoryStore.#stringFromField(row, 'source', 'bootstrap'),
+      importance: MemoryStore.#numberFromField(row, 'importance', 5),
+      access_count: MemoryStore.#numberFromField(row, 'access_count', 0),
+      last_accessed_at: MemoryStore.#nullableStringFromField(row, 'last_accessed_at'),
+      created_at: MemoryStore.#stringFromField(row, 'created_at', ''),
+      updated_at: MemoryStore.#stringFromField(row, 'updated_at', ''),
+      expires_at: MemoryStore.#nullableStringFromField(row, 'expires_at'),
+      related_entities: MemoryStore.#stringFromField(row, 'related_entities', '[]'),
+      related_memories: MemoryStore.#stringFromField(row, 'related_memories', '[]'),
+      source_dimension: MemoryStore.#nullableStringFromField(row, 'source_dimension'),
+      source_evidence: MemoryStore.#nullableStringFromField(row, 'source_evidence'),
+      bootstrap_session: MemoryStore.#nullableStringFromField(row, 'bootstrap_session'),
+      tags: MemoryStore.#stringFromField(row, 'tags', '[]'),
     };
+
+    const similarity = row.similarity;
+    if (typeof similarity === 'number') {
+      normalized.similarity = similarity;
+    }
+    const relatedMemoriesRaw = row.related_memories_raw;
+    if (typeof relatedMemoriesRaw === 'string') {
+      normalized.related_memories_raw = relatedMemoriesRaw;
+    }
+    return normalized;
+  }
+
+  static #countFromRow(row: Record<string, unknown> | undefined): number {
+    return MemoryStore.#numberFromField(row, 'cnt', 0);
+  }
+
+  static #numberFromField(
+    row: Record<string, unknown> | undefined,
+    field: string,
+    fallback: number
+  ): number {
+    const value = row?.[field];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'bigint') {
+      return Number(value);
+    }
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    }
+    return fallback;
+  }
+
+  static #stringFromField(row: Record<string, unknown>, field: string, fallback: string): string {
+    const value = row[field];
+    return typeof value === 'string' ? value : fallback;
+  }
+
+  static #nullableStringFromField(row: Record<string, unknown>, field: string): string | null {
+    const value = row[field];
+    return typeof value === 'string' ? value : null;
   }
 }

@@ -1,4 +1,4 @@
-import type { EvolutionCandidateReason } from '@alembic/core/service/evolution';
+import type { EvolutionCandidateReason } from '@alembic/core/evolution';
 import type { ToolCallEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentService } from '../../service/AgentService.js';
 
