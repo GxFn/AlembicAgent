@@ -10,6 +10,11 @@ const publicExports = [
   ...(Array.isArray(policy.stablePublicExports) ? policy.stablePublicExports : []),
   ...(Array.isArray(policy.provisionalPublicExports) ? policy.provisionalPublicExports : []),
 ].sort();
+const forbiddenSamples = Array.isArray(policy.forbiddenConsumerSpecifierSamples)
+  ? policy.forbiddenConsumerSpecifierSamples.filter(
+      (sample) => sample && typeof sample.specifier === 'string'
+    )
+  : [];
 
 function specifierForExport(exportPath) {
   return exportPath === '.' ? '@alembic/agent' : `@alembic/agent/${exportPath.slice(2)}`;
@@ -29,6 +34,24 @@ for (const exportPath of publicExports) {
   }
 }
 
+for (const sample of forbiddenSamples) {
+  try {
+    await import(sample.specifier);
+    failures.push(`${sample.specifier}: forbidden public import unexpectedly succeeded`);
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error)) {
+      failures.push(`${sample.specifier}: unexpected error shape ${String(error)}`);
+      continue;
+    }
+
+    if (error.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
+      failures.push(
+        `${sample.specifier}: expected ERR_PACKAGE_PATH_NOT_EXPORTED, got ${error.code}`
+      );
+    }
+  }
+}
+
 if (failures.length > 0) {
   process.stderr.write('AlembicAgent public import smoke failed:\n');
   for (const failure of failures) {
@@ -37,6 +60,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   process.stdout.write(
-    `AlembicAgent public import smoke OK: ${publicExports.length} subpaths imported.\n`
+    `AlembicAgent public import smoke OK: ${publicExports.length} subpaths imported, ${forbiddenSamples.length} forbidden subpaths rejected.\n`
   );
 }

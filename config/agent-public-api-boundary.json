@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard or deep dist/src imports are allowed.",
+  "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard, deep dist/src, or host-owned adapter imports are allowed.",
   "expectedCounts": {
     "stable-public": 15,
     "provisional-public": 0,
@@ -30,5 +30,139 @@
     "@alembic/agent/dist/*",
     "@alembic/agent/src/*",
     "@alembic/agent/*/*/*"
+  ],
+  "forbiddenConsumerSpecifierSamples": [
+    {
+      "specifier": "@alembic/agent/dist/index.js",
+      "matches": "@alembic/agent/dist/*",
+      "reason": "Consumers must not import compiled package internals."
+    },
+    {
+      "specifier": "@alembic/agent/src/index.js",
+      "matches": "@alembic/agent/src/*",
+      "reason": "Consumers must not import source internals."
+    },
+    {
+      "specifier": "@alembic/agent/tools/v2/router.js",
+      "matches": "@alembic/agent/*/*/*",
+      "reason": "Only @alembic/agent/tools/v2 is public; router internals stay Agent-owned."
+    },
+    {
+      "specifier": "@alembic/agent/tools/terminal/session/index.js",
+      "matches": "@alembic/agent/*/*/*",
+      "reason": "Only @alembic/agent/tools/terminal is public; terminal session internals stay Agent-owned."
+    },
+    {
+      "specifier": "@alembic/agent/service/internal/foo.js",
+      "matches": "@alembic/agent/*/*/*",
+      "reason": "Service internals and host adapters must not become package subpaths."
+    }
+  ],
+  "publicContractMatrix": [
+    {
+      "export": ".",
+      "specifier": "@alembic/agent",
+      "contract": "Package identity and top-level Agent runtime metadata.",
+      "agentOwned": ["package metadata", "public aggregate entrypoint"],
+      "hostOwnedAdapterBoundary": "Host owns process lifecycle, daemon wiring, CLI/native shell, and product delivery."
+    },
+    {
+      "export": "./agent",
+      "specifier": "@alembic/agent/agent",
+      "contract": "Agent capability, strategy, run, memory, context, and orchestration aggregate.",
+      "agentOwned": ["agent capability registry", "agent run contracts", "strategy wiring"],
+      "hostOwnedAdapterBoundary": "Host owns product routes, daemon API endpoints, and persistence placement."
+    },
+    {
+      "export": "./service",
+      "specifier": "@alembic/agent/service",
+      "contract": "Agent service orchestration and runtime builder APIs.",
+      "agentOwned": ["AgentService", "AgentRuntimeBuilder", "SystemRunContextFactory", "task orchestration contracts"],
+      "hostOwnedAdapterBoundary": "Host owns HTTP/MCP/CLI adapters and injects host services through explicit contexts."
+    },
+    {
+      "export": "./runtime",
+      "specifier": "@alembic/agent/runtime",
+      "contract": "Agent execution loop, event bus, budget, diagnostics, messages, and tool pipeline contracts.",
+      "agentOwned": ["AgentRuntime", "ToolExecutionPipeline", "BudgetController", "diagnostics and message contracts"],
+      "hostOwnedAdapterBoundary": "Host owns process execution, filesystem/network permission gates, and UI/daemon lifecycle adapters."
+    },
+    {
+      "export": "./prompts",
+      "specifier": "@alembic/agent/prompts",
+      "contract": "Prompt builders, insight budget helpers, and pipeline stage prompt contracts.",
+      "agentOwned": ["prompt templates", "budget helpers", "pipeline stage prompt builders"],
+      "hostOwnedAdapterBoundary": "Host owns model selection policy, user-facing prompt invocation, and product-specific prompt routing."
+    },
+    {
+      "export": "./domain",
+      "specifier": "@alembic/agent/domain",
+      "contract": "Agent-side evidence collection, episodic consolidation, and consolidation gate helpers.",
+      "agentOwned": ["EvidenceCollector", "EpisodicConsolidator", "consolidation gate prompt helpers"],
+      "hostOwnedAdapterBoundary": "Host owns durable storage adapters and product-specific evidence ingestion routes."
+    },
+    {
+      "export": "./forge",
+      "specifier": "@alembic/agent/forge",
+      "contract": "Agent-owned tool forge, temporary registry, sandbox runner contract, and requirement analysis.",
+      "agentOwned": ["ToolForge", "DynamicComposer", "SandboxRunner contract", "TemporaryToolRegistry"],
+      "hostOwnedAdapterBoundary": "Host owns concrete sandbox isolation, shell execution, and installed tool lifecycle."
+    },
+    {
+      "export": "./tasks",
+      "specifier": "@alembic/agent/tasks",
+      "contract": "Reusable Agent task handlers consumed by host AI routes.",
+      "agentOwned": ["scan", "enrich", "relation", "quality", "guard task handlers"],
+      "hostOwnedAdapterBoundary": "Host owns route authentication, request shaping, and persistence side effects."
+    },
+    {
+      "export": "./profiles",
+      "specifier": "@alembic/agent/profiles",
+      "contract": "Built-in Agent profile presets, registry, compiler, and strategy resolution.",
+      "agentOwned": ["profile presets", "profile compiler", "stage factory registry"],
+      "hostOwnedAdapterBoundary": "Host owns user/project profile selection, storage, and UI configuration."
+    },
+    {
+      "export": "./ai",
+      "specifier": "@alembic/agent/ai",
+      "contract": "AI provider adapters, model registry, transports, and provider manager.",
+      "agentOwned": ["provider adapters", "model registry", "LLM transport contracts", "rate-limit/error classification"],
+      "hostOwnedAdapterBoundary": "Host owns credential retrieval, account policy, network permission, and provider enablement UI."
+    },
+    {
+      "export": "./tools",
+      "specifier": "@alembic/agent/tools",
+      "contract": "Generic tool catalog, routing, decision, context, envelope, and workflow contracts.",
+      "agentOwned": ["tool manifests", "routing contracts", "decision/envelope types", "workflow registry"],
+      "hostOwnedAdapterBoundary": "Host owns concrete tool service registration, permission prompts, and product execution surfaces."
+    },
+    {
+      "export": "./tools/v2",
+      "specifier": "@alembic/agent/tools/v2",
+      "contract": "Tool V2 router, cache, compressor, parser, capability catalog, and adapter contract.",
+      "agentOwned": ["generic ToolRouterV2", "DeltaCache/SearchCache", "OutputCompressor", "V2ToolRouterAdapter contract"],
+      "hostOwnedAdapterBoundary": "Host owns ToolContextFactory inputs, external executor wiring, sandbox bridge, and UI/daemon call surfaces."
+    },
+    {
+      "export": "./tools/terminal",
+      "specifier": "@alembic/agent/tools/terminal",
+      "contract": "Terminal capability manifests, policy builders/evaluators, session contract, and portable result envelopes.",
+      "agentOwned": ["terminal capability manifests", "terminal policy evaluators", "session plan contract", "result envelopes"],
+      "hostOwnedAdapterBoundary": "Host owns real process/PTY execution, sandbox enforcement, approval UI, and terminal persistence storage."
+    },
+    {
+      "export": "./memory",
+      "specifier": "@alembic/agent/memory",
+      "contract": "Agent memory stores, consolidation, retrieval, active context, and session persistence contracts.",
+      "agentOwned": ["memory coordination", "active context", "session schema", "retrieval/consolidation contracts"],
+      "hostOwnedAdapterBoundary": "Host owns durable database/filesystem placement, migration timing, and product account boundaries."
+    },
+    {
+      "export": "./context",
+      "specifier": "@alembic/agent/context",
+      "contract": "Conversation store, context window, exploration tracker, plan tracker, and nudging contracts.",
+      "agentOwned": ["conversation context assembly", "exploration tracking", "plan tracking", "nudge generation"],
+      "hostOwnedAdapterBoundary": "Host owns conversation transport, UI presentation, and product-specific context injection."
+    }
   ]
 }
