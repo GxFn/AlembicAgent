@@ -1,3 +1,14 @@
+export type {
+  AgentRuntimeBoundaryArea,
+  AgentRuntimeBoundaryEntry,
+  AgentRuntimeBoundaryManifest,
+  AgentRuntimeBoundaryOwner,
+} from './AgentRuntimeBoundary.js';
+export {
+  ALEMBIC_AGENT_RUNTIME_BOUNDARY,
+  getAgentRuntimeBoundaryEntry,
+  supportsAgentRuntimeRoute,
+} from './AgentRuntimeBoundary.js';
 export { AgentEventBus, AgentEvents } from './AgentEventBus.js';
 export { AgentMessage, Channel } from './AgentMessage.js';
 export { AgentRuntime } from './AgentRuntime.js';

@@ -28,6 +28,40 @@ describe('explicit AlembicAgent contract subpaths', () => {
     expect(runtime.MAX_TOOL_CALLS_PER_ITER).toBeGreaterThan(0);
   });
 
+  it('exposes the internal runtime boundary without owning Plugin host-agent routes', () => {
+    expect(runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY).toMatchObject({
+      packageName: '@alembic/agent',
+      runtimeLine: 'alembic-internal-ai',
+      hostAgentRouteSupported: false,
+    });
+    expect(runtime.supportsAgentRuntimeRoute('alembic-internal-ai')).toBe(true);
+    expect(runtime.supportsAgentRuntimeRoute('plugin-host-agent-route')).toBe(false);
+    expect(runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY.unsupportedHostRoutes).toContain(
+      'plugin-host-agent-route'
+    );
+
+    const areas = runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY.entries.map((entry) => entry.area);
+    expect(areas).toEqual([
+      'ai-provider',
+      'tool-execution',
+      'terminal-sandbox',
+      'context-memory',
+      'prompt-runtime',
+      'tool-v2',
+      'host-agent-route',
+    ]);
+
+    expect(runtime.getAgentRuntimeBoundaryEntry('terminal-sandbox')).toMatchObject({
+      owner: 'agent',
+      publicSubpath: '@alembic/agent/tools/terminal',
+      coreContracts: ['@alembic/core/host-agent-workflows'],
+    });
+    expect(runtime.getAgentRuntimeBoundaryEntry('host-agent-route')).toMatchObject({
+      owner: 'host',
+      publicSubpath: null,
+    });
+  });
+
   it('exposes prompt builders and budget helpers', () => {
     expect(typeof prompts.computeAnalystBudget).toBe('function');
     expect(typeof prompts.buildAnalystPrompt).toBe('function');

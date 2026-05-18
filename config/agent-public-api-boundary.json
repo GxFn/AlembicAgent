@@ -84,7 +84,7 @@
       "export": "./runtime",
       "specifier": "@alembic/agent/runtime",
       "contract": "Agent execution loop, event bus, budget, diagnostics, messages, and tool pipeline contracts.",
-      "agentOwned": ["AgentRuntime", "ToolExecutionPipeline", "BudgetController", "diagnostics and message contracts"],
+      "agentOwned": ["AgentRuntime", "ToolExecutionPipeline", "BudgetController", "diagnostics and message contracts", "internal runtime boundary manifest"],
       "hostOwnedAdapterBoundary": "Host owns process execution, filesystem/network permission gates, and UI/daemon lifecycle adapters."
     },
     {
