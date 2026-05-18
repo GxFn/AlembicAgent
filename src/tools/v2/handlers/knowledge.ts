@@ -12,6 +12,9 @@ import { dimensionTags } from '@alembic/core/dimensions';
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
 import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
 
+const AGENT_RUNTIME_SOURCE = 'alembic-agent';
+const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
+
 export async function handle(
   action: string,
   params: Record<string, unknown>,
@@ -151,7 +154,7 @@ async function handleSubmit(
       knowledgeType: effectiveKnowledgeType,
       category: effectiveCategory,
       language: effectiveLanguage,
-      source: isBootstrap ? 'bootstrap' : 'agent',
+      source: isBootstrap ? 'bootstrap' : AGENT_RUNTIME_SOURCE,
       agentNotes: dimMeta
         ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
         : null,
@@ -373,7 +376,8 @@ const VALID_OPERATIONS = new Set<ManageOperation>([
 ]);
 
 type EvolutionProposalSource =
-  | 'ide-agent'
+  | typeof AGENT_RUNTIME_SOURCE
+  | typeof LEGACY_IDE_AGENT_SOURCE
   | 'metabolism'
   | 'decay-scan'
   | 'consolidation'
@@ -403,7 +407,8 @@ interface EvolutionGatewayLike {
 }
 
 const EVOLUTION_SOURCES = new Set<EvolutionProposalSource>([
-  'ide-agent',
+  AGENT_RUNTIME_SOURCE,
+  LEGACY_IDE_AGENT_SOURCE,
   'metabolism',
   'decay-scan',
   'consolidation',
@@ -542,7 +547,7 @@ function resolveEvolutionSource(ctx: ToolContext): EvolutionProposalSource {
   const raw = ctx.runtime?.sharedState?.evolutionProposalSource;
   return typeof raw === 'string' && EVOLUTION_SOURCES.has(raw as EvolutionProposalSource)
     ? (raw as EvolutionProposalSource)
-    : 'ide-agent';
+    : AGENT_RUNTIME_SOURCE;
 }
 
 function defaultEvolutionDescription(operation: 'evolve' | 'deprecate' | 'skip_evolution') {

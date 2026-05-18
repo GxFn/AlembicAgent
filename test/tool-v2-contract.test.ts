@@ -101,4 +101,107 @@ describe('Tool V2 contract exports', () => {
     expect(envelope.text).toContain('[meta]');
     expect(envelope.cache?.policy).toBe('none');
   });
+
+  it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
+    const router = new ToolRouterV2();
+    const createRequests: Array<{
+      source: string;
+      items: Record<string, unknown>[];
+    }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: {
+        title: 'Tool V2 source boundary',
+        description: 'Records the Agent runtime as the default source for new knowledge writes.',
+        content: {
+          markdown:
+            'This candidate documents the Tool V2 source boundary for Agent runtime writes. '.repeat(
+              4
+            ),
+          rationale:
+            'The source value must distinguish Alembic Agent owned writes from legacy IDE agent compatibility inputs.',
+        },
+        kind: 'pattern',
+        trigger: 'Tool V2 source boundary',
+        whenClause: 'When the Agent runtime submits a new knowledge candidate through Tool V2.',
+        doClause: 'Persist alembic-agent as the default source for the submitted candidate.',
+        reasoning: {
+          sources: ['src/tools/v2/handlers/knowledge.ts'],
+          confidence: 0.9,
+        },
+      },
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      recipeGateway: {
+        create: async (request: {
+          source: string;
+          items: Record<string, unknown>[];
+          options?: Record<string, unknown>;
+        }) => {
+          createRequests.push(request);
+          return {
+            created: [{ id: 'candidate-1', title: 'Tool V2 source boundary' }],
+            rejected: [],
+            duplicates: [],
+            merged: [],
+            blocked: [],
+          };
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(createRequests[0]?.source).toBe('agent-tool');
+    expect(createRequests[0]?.items[0]?.source).toBe('alembic-agent');
+  });
+
+  it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {
+    const router = new ToolRouterV2();
+
+    async function captureEvolutionSource(source?: string): Promise<unknown> {
+      const submitted: Array<{ source: unknown }> = [];
+      const result = await router.execute(
+        {
+          tool: 'knowledge',
+          action: 'manage',
+          params: { operation: 'evolve', id: 'recipe-1' },
+        },
+        {
+          ...baseToolContext(),
+          runtime: source ? { sharedState: { evolutionProposalSource: source } } : {},
+          evolutionGateway: {
+            submit: async (decision: {
+              recipeId: string;
+              action: string;
+              source: unknown;
+              confidence: number;
+            }) => {
+              submitted.push(decision);
+              return {
+                recipeId: decision.recipeId,
+                action: decision.action,
+                outcome: 'proposal-created',
+                proposalId: 'proposal-1',
+              };
+            },
+          },
+        }
+      );
+
+      expect(result.ok).toBe(true);
+      return submitted[0]?.source;
+    }
+
+    await expect(captureEvolutionSource()).resolves.toBe('alembic-agent');
+    await expect(captureEvolutionSource('ide-agent')).resolves.toBe('ide-agent');
+    await expect(captureEvolutionSource('file-change')).resolves.toBe('file-change');
+    await expect(captureEvolutionSource('rescan-evolution')).resolves.toBe('rescan-evolution');
+  });
 });
