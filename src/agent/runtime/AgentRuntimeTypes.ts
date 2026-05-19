@@ -83,6 +83,26 @@ export interface StageToolsetDiagnostic {
   source?: string;
 }
 
+export interface AgentEfficiencySummary {
+  toolCalls: number;
+  duplicateToolCalls: number;
+  cacheHits: number;
+  cacheMisses: number;
+  tokenUsage: {
+    input: number;
+    output: number;
+    reasoning: number;
+    cacheHit: number;
+  };
+  maxCompactionLevel: number;
+  totalCompactedItems: number;
+  nudgeCount: number;
+  replanCount: number;
+  emptyRetries: number;
+  forcedSummary: boolean;
+  cancelReason?: string;
+}
+
 export interface AgentDiagnostics {
   degraded: boolean;
   fallbackUsed: boolean;
@@ -95,6 +115,7 @@ export interface AgentDiagnostics {
   gateFailures: Array<{ stage: string; action: string; reason?: string }>;
   toolCalls?: ToolCallDiagnostic[];
   stageToolsets?: StageToolsetDiagnostic[];
+  efficiency?: AgentEfficiencySummary;
 }
 
 /** Tool execution pipeline metadata */
@@ -106,6 +127,9 @@ export interface ToolMetadata {
   dedupMessage?: string;
   isSubmit?: boolean;
   envelope?: import('#tools/core/ToolResultEnvelope.js').ToolResultEnvelope;
+  duplicateShortCircuit?: boolean;
+  cacheEligible?: boolean;
+  cacheMiss?: boolean;
 }
 
 /** File cache entry */

@@ -3,9 +3,31 @@ import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import type {
   AgentDiagnostics,
   AgentDiagnosticWarning,
+  AgentEfficiencySummary,
   StageToolsetDiagnostic,
   ToolCallDiagnostic,
 } from './AgentRuntimeTypes.js';
+
+function emptyEfficiency(): AgentEfficiencySummary {
+  return {
+    toolCalls: 0,
+    duplicateToolCalls: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    tokenUsage: {
+      input: 0,
+      output: 0,
+      reasoning: 0,
+      cacheHit: 0,
+    },
+    maxCompactionLevel: 0,
+    totalCompactedItems: 0,
+    nudgeCount: 0,
+    replanCount: 0,
+    emptyRetries: 0,
+    forcedSummary: false,
+  };
+}
 
 function emptyDiagnostics(): AgentDiagnostics {
   return {
@@ -18,6 +40,7 @@ function emptyDiagnostics(): AgentDiagnostics {
     emptyResponses: 0,
     aiErrorCount: 0,
     gateFailures: [],
+    efficiency: emptyEfficiency(),
   };
 }
 
@@ -74,6 +97,11 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     this.#diagnostics.emptyResponses++;
   }
 
+  recordEmptyRetry() {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.emptyRetries++;
+  }
+
   recordAiError(message: string) {
     this.#diagnostics.aiErrorCount++;
     this.warn({ code: 'ai_error', message });
@@ -126,6 +154,62 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     }
   }
 
+  recordEfficiencyToolCall(
+    input: { cacheHit?: boolean; cacheMiss?: boolean; duplicateShortCircuit?: boolean } = {}
+  ) {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.toolCalls++;
+    if (input.duplicateShortCircuit) {
+      this.#diagnostics.efficiency.duplicateToolCalls++;
+    }
+    if (input.cacheHit) {
+      this.#diagnostics.efficiency.cacheHits++;
+    }
+    if (input.cacheMiss) {
+      this.#diagnostics.efficiency.cacheMisses++;
+    }
+  }
+
+  recordTokenUsage(usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    reasoningTokens?: number;
+    cacheHitTokens?: number;
+  }) {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.tokenUsage.input += usage.inputTokens || 0;
+    this.#diagnostics.efficiency.tokenUsage.output += usage.outputTokens || 0;
+    this.#diagnostics.efficiency.tokenUsage.reasoning += usage.reasoningTokens || 0;
+    this.#diagnostics.efficiency.tokenUsage.cacheHit += usage.cacheHitTokens || 0;
+  }
+
+  recordCompaction(result: { level?: number; removed?: number }) {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    const level = result.level || 0;
+    if (level > this.#diagnostics.efficiency.maxCompactionLevel) {
+      this.#diagnostics.efficiency.maxCompactionLevel = level;
+    }
+    this.#diagnostics.efficiency.totalCompactedItems += result.removed || 0;
+  }
+
+  recordNudge(input: { type?: string; isReplan?: boolean } = {}) {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.nudgeCount++;
+    if (input.isReplan) {
+      this.#diagnostics.efficiency.replanCount++;
+    }
+  }
+
+  recordForcedSummary() {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.forcedSummary = true;
+  }
+
+  recordCancelReason(reason: string) {
+    this.#diagnostics.efficiency ??= emptyEfficiency();
+    this.#diagnostics.efficiency.cancelReason = reason;
+  }
+
   merge(input: unknown) {
     if (!isDiagnostics(input)) {
       return;
@@ -165,9 +249,50 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     for (const toolset of input.stageToolsets || []) {
       this.recordStageToolset(toolset);
     }
+    if (input.efficiency) {
+      const target = (this.#diagnostics.efficiency ??= emptyEfficiency());
+      target.toolCalls += input.efficiency.toolCalls || 0;
+      target.duplicateToolCalls += input.efficiency.duplicateToolCalls || 0;
+      target.cacheHits += input.efficiency.cacheHits || 0;
+      target.cacheMisses += input.efficiency.cacheMisses || 0;
+      target.tokenUsage.input += input.efficiency.tokenUsage?.input || 0;
+      target.tokenUsage.output += input.efficiency.tokenUsage?.output || 0;
+      target.tokenUsage.reasoning += input.efficiency.tokenUsage?.reasoning || 0;
+      target.tokenUsage.cacheHit += input.efficiency.tokenUsage?.cacheHit || 0;
+      target.maxCompactionLevel = Math.max(
+        target.maxCompactionLevel,
+        input.efficiency.maxCompactionLevel || 0
+      );
+      target.totalCompactedItems += input.efficiency.totalCompactedItems || 0;
+      target.nudgeCount += input.efficiency.nudgeCount || 0;
+      target.replanCount += input.efficiency.replanCount || 0;
+      target.emptyRetries += input.efficiency.emptyRetries || 0;
+      target.forcedSummary = target.forcedSummary || input.efficiency.forcedSummary === true;
+      if (input.efficiency.cancelReason) {
+        target.cancelReason = input.efficiency.cancelReason;
+      }
+    }
   }
 
   isEmpty() {
+    const efficiency = this.#diagnostics.efficiency;
+    const efficiencyEmpty =
+      !efficiency ||
+      (efficiency.toolCalls === 0 &&
+        efficiency.duplicateToolCalls === 0 &&
+        efficiency.cacheHits === 0 &&
+        efficiency.cacheMisses === 0 &&
+        efficiency.tokenUsage.input === 0 &&
+        efficiency.tokenUsage.output === 0 &&
+        efficiency.tokenUsage.reasoning === 0 &&
+        efficiency.tokenUsage.cacheHit === 0 &&
+        efficiency.maxCompactionLevel === 0 &&
+        efficiency.totalCompactedItems === 0 &&
+        efficiency.nudgeCount === 0 &&
+        efficiency.replanCount === 0 &&
+        efficiency.emptyRetries === 0 &&
+        !efficiency.forcedSummary &&
+        !efficiency.cancelReason);
     return (
       !this.#diagnostics.degraded &&
       !this.#diagnostics.fallbackUsed &&
@@ -179,11 +304,13 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
       this.#diagnostics.aiErrorCount === 0 &&
       this.#diagnostics.gateFailures.length === 0 &&
       (this.#diagnostics.toolCalls?.length || 0) === 0 &&
-      (this.#diagnostics.stageToolsets?.length || 0) === 0
+      (this.#diagnostics.stageToolsets?.length || 0) === 0 &&
+      efficiencyEmpty
     );
   }
 
   toJSON(): AgentDiagnostics {
+    const efficiency = this.#diagnostics.efficiency ?? emptyEfficiency();
     return {
       degraded: this.#diagnostics.degraded,
       fallbackUsed: this.#diagnostics.fallbackUsed,
@@ -206,6 +333,20 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
             })),
           }
         : {}),
+      efficiency: {
+        toolCalls: efficiency.toolCalls,
+        duplicateToolCalls: efficiency.duplicateToolCalls,
+        cacheHits: efficiency.cacheHits,
+        cacheMisses: efficiency.cacheMisses,
+        tokenUsage: { ...efficiency.tokenUsage },
+        maxCompactionLevel: efficiency.maxCompactionLevel,
+        totalCompactedItems: efficiency.totalCompactedItems,
+        nudgeCount: efficiency.nudgeCount,
+        replanCount: efficiency.replanCount,
+        emptyRetries: efficiency.emptyRetries,
+        forcedSummary: efficiency.forcedSummary,
+        ...(efficiency.cancelReason ? { cancelReason: efficiency.cancelReason } : {}),
+      },
     };
   }
 }

@@ -555,6 +555,9 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] ExitController: ${signal.reason} — ${signal.detail || ''}`
         );
+        if (signal.reason === 'abort_signal') {
+          ctx.diagnostics?.recordCancelReason('abort_signal');
+        }
         ctx.diagnostics?.warn({
           code: signal.reason || 'exit',
           message: signal.detail || signal.reason || 'ExitController stopped the run',
@@ -612,7 +615,7 @@ export class AgentRuntime {
    * @returns }
    */
   #prepareIteration(ctx: LoopContext) {
-    const { tracker, trace, capabilities: _capabilities, messages, prompt } = ctx;
+    const { tracker, trace, capabilities: _capabilities, messages } = ctx;
     const maxIterations = ctx.maxIterations;
 
     this.#emitProgress('thinking', { iteration: ctx.iteration, maxIterations });
@@ -622,6 +625,10 @@ export class AgentRuntime {
       const nudge = tracker.getNudge(trace);
       if (nudge) {
         messages.appendUserNudge(nudge.text);
+        ctx.diagnostics?.recordNudge({
+          type: nudge.type,
+          isReplan: nudge.type === 'planning' && ctx.iteration > 1,
+        });
         this.logger.info(`[AgentRuntime] 💬 injected ${nudge.type} nudge at iter ${ctx.iteration}`);
         const _dim = ctx.sharedState?._dimensionMeta?.id || '';
         if (process.env.ALEMBIC_MCP_MODE !== '1') {
@@ -644,7 +651,6 @@ export class AgentRuntime {
 
     // ── Session token 预算预检 ──
     const preLLMCheck = budgetCtrl.checkBeforeLLMCall(ctx.iteration);
-    const tokenBudgetAction = preLLMCheck.action;
 
     // 动态 toolChoice
     const forceSummaryAt = Math.max(2, Math.ceil(maxIterations * 0.8));
@@ -698,6 +704,9 @@ export class AgentRuntime {
       level: Math.max(compactResult.level, preLLMCheck.compaction.level),
       removed: compactResult.removed + preLLMCheck.compaction.removed,
     };
+    if (mergedCompact.level > 0 || mergedCompact.removed > 0) {
+      ctx.diagnostics?.recordCompaction(mergedCompact);
+    }
 
     return {
       toolChoice,
@@ -849,6 +858,7 @@ export class AgentRuntime {
     if (llmResult.usage) {
       budgetCtrl.recordLLMUsage(llmResult.usage);
       ctx.addTokenUsage(llmResult.usage);
+      ctx.diagnostics?.recordTokenUsage(llmResult.usage);
     }
 
     // ── TurnTelemetry ──
@@ -882,6 +892,7 @@ export class AgentRuntime {
         const phaseRounds = ctx.tracker.metrics?.phaseRounds ?? 0;
         if (phaseRounds < 2) {
           ctx.consecutiveEmptyResponses++;
+          ctx.diagnostics?.recordEmptyRetry();
           this.logger.warn(
             `[AgentRuntime] ⚠ empty response in SUMMARIZE — retrying (grace ${phaseRounds + 1}/2)`
           );
@@ -896,6 +907,7 @@ export class AgentRuntime {
       }
       if (ctx.isSystem && ctx.consecutiveEmptyResponses < 2) {
         ctx.consecutiveEmptyResponses++;
+        ctx.diagnostics?.recordEmptyRetry();
         this.logger.warn(
           `[AgentRuntime] ⚠ empty response — retrying (${ctx.consecutiveEmptyResponses}/2)`
         );
@@ -945,6 +957,7 @@ export class AgentRuntime {
     // AbortError — 外部中止信号已触发，不计入错误计数，立即退出
     if (ctx.abortSignal?.aborted) {
       this.logger.info('[AgentRuntime] ⛔ abortSignal fired during LLM call — exiting');
+      ctx.diagnostics?.recordCancelReason('abort_signal');
       ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal fired during LLM call' });
       return null;
     }
@@ -1019,6 +1032,12 @@ export class AgentRuntime {
 
     // 执行每个工具
     for (const fc of activeCalls) {
+      if (ctx.abortSignal?.aborted) {
+        ctx.diagnostics?.recordCancelReason('abort_signal');
+        this.logger.info('[AgentRuntime] ⛔ abortSignal fired before tool execution — exiting');
+        return true;
+      }
+
       this.#emitProgress('tool_call', { tool: fc.name, args: fc.args });
 
       this.bus.publish(
@@ -1157,6 +1176,7 @@ export class AgentRuntime {
       });
       if (transitionNudge) {
         messages.appendUserNudge(transitionNudge.text);
+        ctx.diagnostics?.recordNudge({ type: transitionNudge.type });
         this.logger.info(
           `[AgentRuntime] 📝 injected ${transitionNudge.type} nudge (${tracker.phase})`
         );
@@ -1221,7 +1241,9 @@ export class AgentRuntime {
         this.tokenUsage.reasoning += summary.usage.reasoningTokens || 0;
         this.tokenUsage.cacheHit += summary.usage.cacheHitTokens || 0;
         ctx.addTokenUsage(summary.usage);
+        ctx.diagnostics?.recordTokenUsage(summary.usage);
       }
+      ctx.diagnostics?.recordForcedSummary();
       ctx.lastReply = cleanFinalAnswer(summary.text || '');
       return true; // 退出
     }
@@ -1265,6 +1287,7 @@ export class AgentRuntime {
         if (digestNudge) {
           messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
           messages.appendUserNudge(digestNudge);
+          ctx.diagnostics?.recordNudge({ type: 'digest' });
           this.logger.info(
             '[AgentRuntime] 📝 metrics-transition to terminal — injecting digest nudge'
           );
@@ -1286,6 +1309,7 @@ export class AgentRuntime {
         messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
+          ctx.diagnostics?.recordNudge({ type: 'digest' });
         }
         this.logger.info('[AgentRuntime] 📝 injected SUMMARIZE nudge (text-triggered transition)');
         const _dimD = ctx.sharedState?._dimensionMeta?.id || '';
@@ -1303,6 +1327,7 @@ export class AgentRuntime {
         messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
+          ctx.diagnostics?.recordNudge({ type: 'continue' });
           const _dimC = ctx.sharedState?._dimensionMeta?.id || '';
           if (process.env.ALEMBIC_MCP_MODE !== '1') {
             process.stderr.write(
@@ -1347,10 +1372,15 @@ export class AgentRuntime {
           tokenUsage: this.tokenUsage,
         });
         ctx.lastReply = forcedResult.reply;
+        ctx.diagnostics?.recordForcedSummary();
         if (forcedResult.tokenUsage) {
           this.tokenUsage.input += forcedResult.tokenUsage.input || 0;
           this.tokenUsage.output += forcedResult.tokenUsage.output || 0;
           ctx.addTokenUsage({
+            inputTokens: forcedResult.tokenUsage.input || 0,
+            outputTokens: forcedResult.tokenUsage.output || 0,
+          });
+          ctx.diagnostics?.recordTokenUsage({
             inputTokens: forcedResult.tokenUsage.input || 0,
             outputTokens: forcedResult.tokenUsage.output || 0,
           });

@@ -17,6 +17,7 @@
  * @module core/ToolExecutionPipeline
  */
 
+import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import { SafetyPolicy } from '../policies/index.js';
 import type { AgentRuntime } from './AgentRuntime.js';
@@ -49,6 +50,10 @@ interface ToolMetadata {
   dedupMessage?: string;
   isSubmit?: boolean;
   envelope?: ToolResultEnvelope;
+  duplicateShortCircuit?: boolean;
+  cacheEligible?: boolean;
+  cacheMiss?: boolean;
+  cacheKey?: string;
 }
 
 /** before 钩子返回值 */
@@ -80,6 +85,179 @@ interface ToolMiddleware {
   ) => void | Promise<void>;
 }
 
+interface CachedToolResult {
+  result: unknown;
+  envelope?: ToolResultEnvelope;
+}
+
+interface ToolEfficiencySharedState {
+  _toolEfficiencyCache?: Map<string, CachedToolResult>;
+  _projectSnapshotId?: unknown;
+  _projectRevision?: unknown;
+  _workspaceRevision?: unknown;
+  _dimensionScopeId?: unknown;
+}
+
+const READ_LIKE_ACTIONS = new Set([
+  'detail',
+  'get_previous_evidence',
+  'inspect',
+  'list',
+  'outline',
+  'overview',
+  'query',
+  'read',
+  'recall',
+  'review',
+  'search',
+  'structure',
+  'tools',
+]);
+
+const SIDE_EFFECT_ACTIONS = new Set([
+  'approve',
+  'create',
+  'delete',
+  'deprecate',
+  'evolve',
+  'manage',
+  'mutate',
+  'note_finding',
+  'publish',
+  'reject',
+  'run',
+  'save',
+  'score',
+  'script',
+  'shell',
+  'skip_evolution',
+  'submit',
+  'update',
+  'validate',
+  'write',
+]);
+
+function getToolAction(call: ToolCall): string {
+  const params =
+    call.args?.params && typeof call.args.params === 'object'
+      ? (call.args.params as Record<string, unknown>)
+      : {};
+  const action = call.args?.action ?? params.action ?? params.operation ?? '';
+  return String(action);
+}
+
+function getToolManifest(runtime: AgentRuntime, toolId: string): ToolCapabilityManifest | null {
+  const registry = runtime.toolRegistry as {
+    getManifest?: (id: string) => ToolCapabilityManifest | null | undefined;
+  };
+  return registry.getManifest?.(toolId) ?? null;
+}
+
+function isReadLikeManifest(manifest: ToolCapabilityManifest | null): boolean {
+  if (!manifest) {
+    return false;
+  }
+  return (
+    !manifest.risk.sideEffect &&
+    manifest.risk.writeScope === 'none' &&
+    manifest.risk.network === 'none' &&
+    manifest.risk.credentialAccess === 'none' &&
+    manifest.governance.policyProfile !== 'write' &&
+    manifest.governance.policyProfile !== 'admin'
+  );
+}
+
+function isDeterministicDuplicateCandidate(call: ToolCall, ctx: ToolExecContext): boolean {
+  const action = getToolAction(call);
+  if (SIDE_EFFECT_ACTIONS.has(action)) {
+    return false;
+  }
+  const manifest = getToolManifest(ctx.runtime, call.name);
+  if (manifest && manifest.execution.concurrency === 'exclusive') {
+    return false;
+  }
+  if (READ_LIKE_ACTIONS.has(action)) {
+    return true;
+  }
+  return isReadLikeManifest(manifest);
+}
+
+function getEfficiencyCache(ctx: ToolExecContext): Map<string, CachedToolResult> {
+  const shared = (ctx.loopCtx.sharedState ??= {}) as ToolEfficiencySharedState;
+  shared._toolEfficiencyCache ??= new Map<string, CachedToolResult>();
+  return shared._toolEfficiencyCache;
+}
+
+function cloneCacheValue<T>(value: T): T {
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  if (value instanceof Set) {
+    return stableStringify([...value].sort());
+  }
+  if (value instanceof Map) {
+    const entries = [...value.entries()].sort(([left], [right]) =>
+      String(left).localeCompare(String(right))
+    );
+    return stableStringify(entries);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+function resolveProjectSnapshotId(ctx: ToolExecContext): string {
+  const shared = (ctx.loopCtx.sharedState || {}) as ToolEfficiencySharedState;
+  const context = ctx.loopCtx.context || {};
+  const explicit =
+    context.projectSnapshotId ??
+    context.snapshotId ??
+    context.projectRevision ??
+    context.workspaceRevision ??
+    shared._projectSnapshotId ??
+    shared._projectRevision ??
+    shared._workspaceRevision ??
+    shared._dimensionScopeId;
+  if (explicit) {
+    return String(explicit);
+  }
+  if (Array.isArray(ctx.runtime.fileCache)) {
+    const paths = ctx.runtime.fileCache
+      .map((file) => `${file.relativePath}:${file.content?.length ?? 0}`)
+      .sort()
+      .join('|');
+    return `file-cache:${ctx.runtime.fileCache.length}:${paths}`;
+  }
+  return 'session';
+}
+
+function buildCacheKey(call: ToolCall, ctx: ToolExecContext): string {
+  const strategyParts = {
+    source: ctx.loopCtx.source,
+    pipelinePhase: ctx.loopCtx.context?.pipelinePhase,
+    pipelineType: ctx.loopCtx.tracker?.pipelineType,
+    preset: ctx.runtime.presetName,
+  };
+  return stableStringify({
+    tool: call.name,
+    action: getToolAction(call),
+    args: call.args,
+    snapshot: resolveProjectSnapshotId(ctx),
+    strategy: strategyParts,
+  });
+}
+
 export class ToolExecutionPipeline {
   #middlewares: ToolMiddleware[] = [];
 
@@ -103,6 +281,7 @@ export class ToolExecutionPipeline {
    */
   async execute(call: ToolCall, context: ToolExecContext) {
     let toolResult: unknown = null;
+    let hasToolResult = false;
     const metadata: ToolMetadata = { cacheHit: false, blocked: false, isNew: false, durationMs: 0 };
 
     // ── before 阶段 ──
@@ -111,12 +290,14 @@ export class ToolExecutionPipeline {
         const verdict = await mw.before(call, context, metadata);
         if (verdict?.blocked) {
           toolResult = verdict.result;
+          hasToolResult = true;
           metadata.blocked = true;
           context.loopCtx.diagnostics?.recordBlockedTool(call.name, diagnosticReason(toolResult));
           break;
         }
         if (verdict?.result !== undefined) {
           toolResult = verdict.result;
+          hasToolResult = true;
           metadata.cacheHit = true;
           break;
         }
@@ -124,7 +305,7 @@ export class ToolExecutionPipeline {
     }
 
     // ── execute 阶段 ──
-    if (toolResult === null) {
+    if (!hasToolResult) {
       const t0 = Date.now();
       try {
         const { runtime, loopCtx } = context;
@@ -184,6 +365,9 @@ export class ToolExecutionPipeline {
         });
         metadata.envelope = envelope;
         metadata.cacheHit = envelope.cache?.hit === true;
+        if (envelope.cache && envelope.cache.policy !== 'none' && envelope.cache.hit !== true) {
+          metadata.cacheMiss = true;
+        }
         if (
           !envelope.ok &&
           ['blocked', 'needs-confirmation', 'aborted', 'timeout'].includes(envelope.status)
@@ -208,6 +392,12 @@ export class ToolExecutionPipeline {
         await mw.after(call, toolResult, context, metadata);
       }
     }
+
+    context.loopCtx.diagnostics?.recordEfficiencyToolCall({
+      cacheHit: metadata.cacheHit,
+      cacheMiss: metadata.cacheMiss,
+      duplicateShortCircuit: metadata.duplicateShortCircuit,
+    });
 
     return { result: toolResult, metadata };
   }
@@ -292,6 +482,54 @@ export const evolutionDecisionGate = {
           'Evolution retry is decision-only. Call knowledge({ action: "manage", params: { operation: "evolve|deprecate|skip_evolution", id, reason, data? } }) for each pending Recipe; search/detail/code/graph are disabled.',
       },
     };
+  },
+};
+
+/**
+ * DeterministicDuplicateGuard — session-level short-circuit for read-like tools.
+ *
+ * The guard only reuses calls that are safe to replay within the same project snapshot and
+ * execution strategy. Submit/mutate/side-effect tools never pass the eligibility check.
+ */
+export const deterministicDuplicateGuard = {
+  name: 'deterministicDuplicateGuard',
+  before(call: ToolCall, ctx: ToolExecContext, meta: ToolMetadata): BeforeVerdict | undefined {
+    if (!isDeterministicDuplicateCandidate(call, ctx)) {
+      return undefined;
+    }
+    meta.cacheEligible = true;
+    const key = buildCacheKey(call, ctx);
+    meta.cacheKey = key;
+    const cached = getEfficiencyCache(ctx).get(key);
+    if (!cached) {
+      return undefined;
+    }
+    meta.cacheHit = true;
+    meta.duplicateShortCircuit = true;
+    if (cached.envelope) {
+      meta.envelope = {
+        ...cloneCacheValue(cached.envelope),
+        durationMs: 0,
+        cache: { hit: true, policy: 'session' },
+      };
+    }
+    return { result: cloneCacheValue(cached.result) };
+  },
+  after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
+    if (!meta.cacheEligible || !meta.cacheKey || meta.blocked || meta.duplicateShortCircuit) {
+      return;
+    }
+    const envelopeOk = meta.envelope ? meta.envelope.ok : true;
+    if (!envelopeOk) {
+      return;
+    }
+    getEfficiencyCache(ctx).set(meta.cacheKey, {
+      result: cloneCacheValue(result),
+      ...(meta.envelope ? { envelope: cloneCacheValue(meta.envelope) } : {}),
+    });
+    if (!meta.cacheHit) {
+      meta.cacheMiss = true;
+    }
   },
 };
 
@@ -490,6 +728,7 @@ export function createToolPipeline() {
   return new ToolExecutionPipeline()
     .use(allowlistGate)
     .use(evolutionDecisionGate)
+    .use(deterministicDuplicateGuard)
     .use(observationRecord)
     .use(trackerSignal)
     .use(traceRecord)

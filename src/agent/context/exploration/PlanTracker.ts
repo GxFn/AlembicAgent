@@ -6,7 +6,7 @@
  *
  * @module PlanTracker
  */
-import { DEFAULT_REPLAN_INTERVAL } from './ExplorationStrategies.js';
+import { DEFAULT_REPLAN_INTERVAL, type PipelineType } from './ExplorationStrategies.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 
@@ -49,9 +49,12 @@ export interface ActiveTrace {
 
 /** checkPlanning 的状态参数 */
 interface PlanCheckState {
+  phase?: string;
   metrics: { iteration: number };
   budget: { maxIterations: number };
   strategy: { replanInterval?: number };
+  pipelineType?: PipelineType;
+  isTerminalPhase?: boolean;
 }
 
 /** 计划进度 */
@@ -70,10 +73,15 @@ interface PlanProgress {
 const DEFAULT_DEVIATION_THRESHOLD = 0.6;
 /** 最少经过 N 轮后才允许再次触发 replan（防止 replan 风暴） */
 const MIN_REPLAN_GAP = 3;
+/** Bootstrap 维度只允许一次真正 replan，避免慢模型重复消耗控制 token。 */
+const MAX_BOOTSTRAP_REPLANS = 1;
+/** 其它探索管线的默认 replan 上限。 */
+const MAX_DEFAULT_REPLANS = 2;
 
 export class PlanTracker {
   /** 等待 AI 输出 replan */
   #pendingReplan = false;
+  #replanCount = 0;
   /** 计划进度 */
   #planProgress: PlanProgress = {
     coveredSteps: 0,
@@ -99,13 +107,21 @@ export class PlanTracker {
   checkPlanning(state: PlanCheckState, trace: ActiveTrace | null) {
     const { metrics, budget: b, strategy } = state;
     const m = metrics;
+    const pipelineType = state.pipelineType || 'bootstrap';
+
+    if (state.isTerminalPhase || state.phase === 'PRODUCE' || state.phase === 'RECORD') {
+      return null;
+    }
 
     // 第 1 轮: plan elicitation
     if (m.iteration === 1) {
       trace?.expectPlan?.();
       return {
         type: 'planning',
-        text: this.#buildPlanElicitationPrompt(b.maxIterations || 30),
+        text:
+          pipelineType === 'bootstrap'
+            ? this.#buildCompactPlanElicitationPrompt(b.maxIterations || 30)
+            : this.#buildPlanElicitationPrompt(b.maxIterations || 30),
       };
     }
 
@@ -129,6 +145,17 @@ export class PlanTracker {
       return null;
     }
 
+    const maxReplans = pipelineType === 'bootstrap' ? MAX_BOOTSTRAP_REPLANS : MAX_DEFAULT_REPLANS;
+    if (this.#replanCount >= maxReplans) {
+      return null;
+    }
+    if (
+      pipelineType === 'bootstrap' &&
+      m.iteration >= Math.max(2, Math.floor(b.maxIterations * 0.65))
+    ) {
+      return null;
+    }
+
     // 冷却间隔
     if (
       progress.lastReplanIteration &&
@@ -139,6 +166,18 @@ export class PlanTracker {
 
     const remaining = b.maxIterations - m.iteration;
     const parts: string[] = [];
+    if (pipelineType === 'bootstrap') {
+      progress.lastReplanIteration = m.iteration;
+      this.#pendingReplan = true;
+      this.#replanCount++;
+      trace?.expectPlan?.();
+      return {
+        type: 'planning',
+        text:
+          `📋 计划偏差检查：剩余 ${remaining} 轮。只保留仍能产出维度候选或 digest 的步骤；` +
+          `已进入提交/总结方向时不要重新搜索。请用 1-3 条更新计划并继续执行。`,
+      };
+    }
     if (deviationTrigger) {
       parts.push(`📋 计划偏差检查 (第 ${m.iteration}/${b.maxIterations} 轮):`);
       if (progress.consecutiveOffPlan >= 3) {
@@ -172,6 +211,7 @@ export class PlanTracker {
 
     progress.lastReplanIteration = m.iteration;
     this.#pendingReplan = true;
+    this.#replanCount++;
     trace?.expectPlan?.();
 
     return { type: 'planning', text: parts.join('\n') };
@@ -320,6 +360,14 @@ export class PlanTracker {
       `5. 总结分析发现`,
       ``,
       `制定计划后请立即开始执行第 1 步（可在同一轮中同时输出计划文本并调用工具）。`,
+    ].join('\n');
+  }
+
+  #buildCompactPlanElicitationPrompt(maxIter: number) {
+    return [
+      `📋 请先给出不超过 3 步的维度探索计划（总轮次 ${maxIter}）。`,
+      `计划必须直接服务于候选提交或 dimensionDigest 输出；避免列出泛泛扫描项。`,
+      `制定计划后立即执行第 1 步。`,
     ].join('\n');
   }
 

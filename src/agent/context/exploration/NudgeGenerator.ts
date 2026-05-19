@@ -61,11 +61,17 @@ const MIN_ITERS_FOR_STALE_REFLECTION = 4;
 const DEFAULT_MIN_EXPLORE_ITERS = 10;
 /** 默认停滞收敛阈值 */
 const DEFAULT_CONVERGENCE_STALE_THRESHOLD = 3;
+/** Bootstrap 每个维度最多注入的常规 nudge 数，避免慢模型长跑时重复控制消息。 */
+const BOOTSTRAP_NUDGE_BUDGET = 4;
+/** Bootstrap 常规 nudge 的最小间隔轮次。 */
+const BOOTSTRAP_NUDGE_TTL_ROUNDS = 2;
 
 export class NudgeGenerator {
   // ── 一次性 flags（生命周期内最多触发一次的 nudge） ──
   #convergenceNudged = false;
   #budgetWarningInjected = false;
+  #bootstrapNudgeCount = 0;
+  #lastBootstrapNudgeIteration = -Infinity;
 
   /**
    * 生成本轮的 Nudge（每轮最多一条）
@@ -99,23 +105,23 @@ export class NudgeGenerator {
     ) {
       this.#convergenceNudged = true;
       if (state.phase === 'PRODUCE') {
-        return {
+        return this.#emitNudge(state, {
           type: 'convergence',
           text:
             `Producer 阶段已连续 ${m.roundsSinceNewInfo} 轮没有有效新提交。` +
             `如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出总结 JSON；` +
             `否则只调用 ${state.submitToolName} 提交尚未提交且不重复的候选。\n` +
             `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
-        };
+        });
       }
-      return {
+      return this.#emitNudge(state, {
         type: 'convergence',
         text:
           `你已经充分探索了项目代码（${m.uniqueFiles.size} 个文件，${m.uniquePatterns.size} 次不同搜索，${m.uniqueQueries.size} 次结构化查询）。` +
           `最近 ${m.roundsSinceNewInfo} 轮没有发现新信息，建议开始撰写分析总结。\n` +
           `如果你确信还有重要方面未覆盖，可以继续探索（剩余 ${b.maxIterations - m.iteration} 轮）；否则请直接输出你的分析发现。\n` +
           `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
-      };
+      });
     }
 
     // 3. 预算警告（75% 消耗，无条件，一次性）
@@ -125,20 +131,20 @@ export class NudgeGenerator {
       m.iteration >= Math.floor(b.maxIterations * 0.75)
     ) {
       this.#budgetWarningInjected = true;
-      return {
+      return this.#emitNudge(state, {
         type: 'budget_warning',
         text:
           `📌 进度提醒：你已使用 ${m.iteration}/${b.maxIterations} 轮次（${Math.round((m.iteration / b.maxIterations) * 100)}%）。` +
           `请确保核心方面已覆盖，开始准备总结。剩余 ${b.maxIterations - m.iteration} 轮，优先填补最重要的分析空白。\n` +
           `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
-      };
+      });
     }
 
     // 4. 反思（周期性 + 停滞）
     if (strategy.enableReflection) {
       const reflectionNudge = this.#checkReflection(state, trace);
       if (reflectionNudge) {
-        return reflectionNudge;
+        return this.#emitNudge(state, reflectionNudge);
       }
     }
 
@@ -230,6 +236,27 @@ export class NudgeGenerator {
 
   // ─── 内部方法 ──────────────────────────────────
 
+  #emitNudge<T extends { type: string; text: string }>(state: NudgeState, nudge: T): T | null {
+    if (state.pipelineType !== 'bootstrap') {
+      return nudge;
+    }
+    if (nudge.type === 'force_exit') {
+      return nudge;
+    }
+    if (state.phase === 'PRODUCE' && nudge.type !== 'convergence') {
+      return null;
+    }
+    if (this.#bootstrapNudgeCount >= BOOTSTRAP_NUDGE_BUDGET) {
+      return null;
+    }
+    if (state.metrics.iteration - this.#lastBootstrapNudgeIteration < BOOTSTRAP_NUDGE_TTL_ROUNDS) {
+      return null;
+    }
+    this.#bootstrapNudgeCount++;
+    this.#lastBootstrapNudgeIteration = state.metrics.iteration;
+    return nudge;
+  }
+
   #generateForceExit(
     m: FullExplorationMetrics,
     b: ExplorationBudget,
@@ -278,10 +305,13 @@ export class NudgeGenerator {
    * @returns |null}
    */
   #checkReflection(state: NudgeState, trace: ExplorationTrace | null) {
-    const { phase, metrics: m, budget: b, strategy, isTerminalPhase } = state;
+    const { phase, metrics: m, budget: b, strategy, isTerminalPhase, pipelineType } = state;
 
     // 终结阶段（SUMMARIZE）不应触发反思 — 此时应输出最终结果而非继续探索
     if (isTerminalPhase) {
+      return null;
+    }
+    if (pipelineType === 'bootstrap' && phase !== 'EXPLORE') {
       return null;
     }
 

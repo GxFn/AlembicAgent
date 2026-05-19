@@ -15,6 +15,7 @@ export {
 export type {
   AgentDiagnostics,
   AgentDiagnosticWarning,
+  AgentEfficiencySummary,
   AgentResult,
   AiError,
   FileCacheEntry,
@@ -73,6 +74,7 @@ export {
 export {
   allowlistGate,
   createToolPipeline,
+  deterministicDuplicateGuard,
   eventBusPublisher,
   evolutionDecisionGate,
   observationRecord,
