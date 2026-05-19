@@ -1,3 +1,6 @@
+export { AgentEventBus, AgentEvents } from './AgentEventBus.js';
+export { AgentMessage, Channel } from './AgentMessage.js';
+export { AgentRuntime } from './AgentRuntime.js';
 export type {
   AgentRuntimeBoundaryArea,
   AgentRuntimeBoundaryEntry,
@@ -9,9 +12,6 @@ export {
   getAgentRuntimeBoundaryEntry,
   supportsAgentRuntimeRoute,
 } from './AgentRuntimeBoundary.js';
-export { AgentEventBus, AgentEvents } from './AgentEventBus.js';
-export { AgentMessage, Channel } from './AgentMessage.js';
-export { AgentRuntime } from './AgentRuntime.js';
 export type {
   AgentDiagnostics,
   AgentDiagnosticWarning,
