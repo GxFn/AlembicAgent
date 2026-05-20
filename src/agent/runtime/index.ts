@@ -79,6 +79,7 @@ export {
   evolutionDecisionGate,
   observationRecord,
   progressEmitter,
+  recordRepairOnlyGate,
   submitDedup,
   ToolExecutionPipeline,
   traceRecord,

@@ -719,17 +719,18 @@ export class AgentRuntime {
 
   #getIterationToolSchemas(ctx: LoopContext, toolChoice: string): Array<Record<string, unknown>> {
     const tracker = ctx.tracker;
+    const recordRepairOnly =
+      ctx.sharedState?._recordRepairOnly === true || ctx.context?.recordRepairOnly === true;
     if (
       toolChoice !== 'none' &&
-      tracker?.pipelineType === 'analyst' &&
-      tracker.phase === 'RECORD'
+      (recordRepairOnly || (tracker?.pipelineType === 'analyst' && tracker.phase === 'RECORD'))
     ) {
       return ctx.toolSchemas
         .filter((schema) => schema.name === 'memory')
         .map((schema) => ({
           ...schema,
           description:
-            'Record exactly one structured key finding. In RECORD phase, call this tool repeatedly until at least 3 findings are recorded; do not output prose.',
+            'Record exactly one structured key finding. In RECORD/record-repair phase, call this tool repeatedly until at least 3 findings are recorded; do not output prose.',
           parameters: {
             type: 'object',
             properties: {

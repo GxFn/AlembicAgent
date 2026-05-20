@@ -20,6 +20,7 @@
 import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
+import { buildRecordRepairPrompt } from '../prompts/insight-gate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
@@ -64,6 +65,11 @@ interface GateConfig {
     strategyContext: Record<string, unknown>
   ) => { action?: string; pass?: boolean; reason?: string; artifact?: unknown };
   maxRetries?: number;
+  maxRecordRepairRetries?: number;
+  recordRepairMinFindings?: number;
+  recordRepairMaxRounds?: number;
+  recordRepairTimeoutMs?: number;
+  recordRepairMaxTokens?: number;
   useCumulativeToolCalls?: boolean;
   minEvidenceLength?: number;
   minFileRefs?: number;
@@ -93,6 +99,10 @@ interface PipelineStage {
   skipOnFail?: boolean;
   submitToolName?: string;
   decisionOnlyOnRetry?: boolean;
+  recordRepairOnly?: boolean;
+  disableTracker?: boolean;
+  toolChoiceOverride?: string;
+  recordRepairEvidencePaths?: string[];
   /** 管线类型标识 — 传递至 ExplorationTracker 用于统一场景判别 */
   pipelineType?: PipelineType;
   source?: string;
@@ -111,6 +121,19 @@ interface PipelineContext {
   diagnostics: DiagnosticsCollector;
   execStageCount: number;
   lastExecutedStageName: string | null;
+}
+
+interface GateEvalResult {
+  action: string;
+  pass: boolean;
+  reason?: string;
+  artifact?: unknown;
+}
+
+interface RecordRepairFinding {
+  finding: string;
+  evidence: string;
+  importance: number;
 }
 
 /** Lightweight ContextWindow subset consumed by pipeline stages */
@@ -180,7 +203,7 @@ export class PipelineStrategy extends Strategy {
         if (ctx.degraded) {
           continue;
         }
-        const gateAction = this.#processGate(stage, i, ctx, bus);
+        const gateAction = await this.#processGate(runtime, message, stage, i, ctx, bus);
         if (gateAction === 'break') {
           break;
         }
@@ -227,58 +250,21 @@ export class PipelineStrategy extends Strategy {
    *
    * @returns break/continue 或 retry 回退索引 (i-1)
    */
-  #processGate(stage: PipelineStage, stageIndex: number, ctx: PipelineContext, bus: AgentEventBus) {
-    const { phaseResults, strategyContext } = ctx;
+  async #processGate(
+    runtime: PipelineRuntime,
+    message: AgentMessage,
+    stage: PipelineStage,
+    stageIndex: number,
+    ctx: PipelineContext,
+    bus: AgentEventBus
+  ) {
+    const { phaseResults } = ctx;
     if (!stage.gate) {
       return 'continue';
     }
     const gate = stage.gate;
-    const sourceName = (stage.source || this.#prevStageName(stage)) as string;
-    const source = phaseResults[sourceName];
-    let gateResult: { action: string; pass: boolean; reason?: string; artifact?: unknown };
-
-    // v3: 自定义评估器 (Bootstrap 用)
-    if (typeof gate.evaluator === 'function') {
-      this.#ensureGateActiveContext(stage, strategyContext, phaseResults, bus, ctx.diagnostics);
-      const gateSource = gate.useCumulativeToolCalls
-        ? this.#withCumulativeToolCalls(source, ctx)
-        : source;
-      gateResult = gate.evaluator(gateSource, phaseResults, strategyContext) as typeof gateResult;
-      if (!gateResult.action) {
-        gateResult.action = gateResult.pass ? 'pass' : 'retry';
-      }
-    } else {
-      // 向后兼容: 阈值评估
-      const legacyResult = this.#evaluateGate(gate, phaseResults, sourceName);
-      gateResult = {
-        action: legacyResult.pass ? 'pass' : 'retry',
-        pass: legacyResult.pass,
-        reason: legacyResult.reason,
-      };
-    }
-
-    bus.publish(AgentEvents.PROGRESS, {
-      type: 'quality_gate',
-      pass: gateResult.action === 'pass',
-      action: gateResult.action,
-      reason: gateResult.reason,
-      stage: stage.name || 'gate',
-    });
-
-    // 存储 gate 结果和产物
-    phaseResults[stage.name || 'gate'] = {
-      pass: gateResult.action === 'pass',
-      action: gateResult.action,
-      reason: gateResult.reason || '',
-      artifact: gateResult.artifact || null,
-    };
-    if (gateResult.artifact) {
-      ctx.gateArtifact = gateResult.artifact;
-    }
-
-    if (gateResult.action !== 'pass') {
-      ctx.diagnostics.recordGateFailure(stage.name || 'gate', gateResult.action, gateResult.reason);
-    }
+    let gateResult = this.#evaluateGateResult(stage, ctx, bus);
+    this.#storeGateResult(stage, gateResult, ctx, bus);
 
     // 三态处理
     if (gateResult.action === 'pass') {
@@ -291,7 +277,53 @@ export class PipelineStrategy extends Strategy {
       return 'break';
     }
 
-    if (gateResult.action === 'retry') {
+    if (gateResult.action === 'record_repair') {
+      const repairKey = `_recordRepairRetries_${stage.name || 'gate'}`;
+      phaseResults[repairKey] = ((phaseResults[repairKey] as number) || 0) + 1;
+      const maxRecordRepairRetries = gate.maxRecordRepairRetries ?? 1;
+
+      if ((phaseResults[repairKey] as number) <= maxRecordRepairRetries) {
+        const repairResult = await this.#runRecordRepairStage(
+          runtime,
+          message,
+          stage,
+          gateResult,
+          ctx,
+          bus
+        );
+        const fallbackResult = this.#applyRecordRepairFallback(
+          repairResult,
+          gateResult.artifact,
+          stage,
+          ctx
+        );
+        if (fallbackResult.accepted > 0 || fallbackResult.rejected > 0) {
+          phaseResults._recordRepairFallback = fallbackResult;
+        }
+
+        gateResult = this.#evaluateGateResult(stage, ctx, bus);
+        this.#storeGateResult(stage, gateResult, ctx, bus);
+        if (gateResult.action === 'pass') {
+          return 'continue';
+        }
+      }
+
+      // 记录补写仍未满足门控时，宁可显式降级也不能让 Producer 基于缺失证据继续提交。
+      const failureReason =
+        gateResult.reason || 'Record repair did not produce enough validated note_finding records';
+      const degradedGate: GateEvalResult = {
+        action: 'degraded_no_findings',
+        pass: false,
+        reason: failureReason,
+        artifact: gateResult.artifact,
+      };
+      this.#storeGateResult(stage, degradedGate, ctx, bus);
+      ctx.degraded = true;
+      ctx.diagnostics.markDegraded();
+      return 'break';
+    }
+
+    if (gateResult.action === 'analysis_retry' || gateResult.action === 'retry') {
       const maxRetries = gate.maxRetries ?? this.#maxRetries;
       const retryKey = `_retries_${stage.name || 'gate'}`;
       phaseResults[retryKey] = ((phaseResults[retryKey] as number) || 0) + 1;
@@ -320,6 +352,373 @@ export class PipelineStrategy extends Strategy {
       return 'break';
     }
     return 'continue';
+  }
+
+  #evaluateGateResult(
+    stage: PipelineStage,
+    ctx: PipelineContext,
+    bus: AgentEventBus
+  ): GateEvalResult {
+    const { phaseResults, strategyContext } = ctx;
+    const gate = stage.gate;
+    if (!gate) {
+      return { action: 'pass', pass: true };
+    }
+    const sourceName = (stage.source || this.#prevStageName(stage)) as string;
+    const source = phaseResults[sourceName];
+
+    if (typeof gate.evaluator === 'function') {
+      this.#ensureGateActiveContext(stage, strategyContext, phaseResults, bus, ctx.diagnostics);
+      const gateSource = gate.useCumulativeToolCalls
+        ? this.#withCumulativeToolCalls(source, ctx)
+        : source;
+      const evaluated = gate.evaluator(gateSource, phaseResults, strategyContext) as GateEvalResult;
+      return {
+        ...evaluated,
+        action: evaluated.action || (evaluated.pass ? 'pass' : 'analysis_retry'),
+      };
+    }
+
+    // 向后兼容: 阈值评估
+    const legacyResult = this.#evaluateGate(gate, phaseResults, sourceName);
+    return {
+      action: legacyResult.pass ? 'pass' : 'analysis_retry',
+      pass: legacyResult.pass,
+      reason: legacyResult.reason,
+    };
+  }
+
+  #storeGateResult(
+    stage: PipelineStage,
+    gateResult: GateEvalResult,
+    ctx: PipelineContext,
+    bus: AgentEventBus
+  ) {
+    bus.publish(AgentEvents.PROGRESS, {
+      type: 'quality_gate',
+      pass: gateResult.action === 'pass',
+      action: gateResult.action,
+      reason: gateResult.reason,
+      stage: stage.name || 'gate',
+    });
+
+    ctx.phaseResults[stage.name || 'gate'] = {
+      pass: gateResult.action === 'pass',
+      action: gateResult.action,
+      reason: gateResult.reason || '',
+      artifact: gateResult.artifact || null,
+    };
+    if (gateResult.artifact) {
+      ctx.gateArtifact = gateResult.artifact;
+    }
+
+    if (gateResult.action !== 'pass') {
+      ctx.diagnostics.recordGateFailure(stage.name || 'gate', gateResult.action, gateResult.reason);
+    }
+  }
+
+  async #runRecordRepairStage(
+    runtime: PipelineRuntime,
+    message: AgentMessage,
+    gateStage: PipelineStage,
+    gateResult: GateEvalResult,
+    ctx: PipelineContext,
+    bus: AgentEventBus
+  ) {
+    const gate = gateStage.gate || {};
+    const minFindings = gate.recordRepairMinFindings ?? 3;
+    const repairStage: PipelineStage = {
+      name: `${gateStage.name || 'quality_gate'}_record_repair`,
+      capabilities: [],
+      additionalTools: ['memory'],
+      budget: {
+        maxIterations: gate.recordRepairMaxRounds ?? 3,
+        timeoutMs: gate.recordRepairTimeoutMs ?? 90_000,
+        maxTokens: gate.recordRepairMaxTokens ?? 2048,
+        temperature: 0.2,
+        maxSessionInputTokens: 12_000,
+        maxSessionTokens: 16_000,
+      },
+      disableTracker: true,
+      recordRepairOnly: true,
+      toolChoiceOverride: 'auto',
+      recordRepairEvidencePaths: this.#extractRecordRepairEvidencePaths(gateResult.artifact),
+      systemPrompt:
+        'You are in a record-only repair stage. Do not explore. Use only memory.note_finding to record already verified findings, or return the documented JSON fallback.',
+      promptBuilder: () =>
+        buildRecordRepairPrompt({
+          reason: gateResult.reason || '',
+          artifact: gateResult.artifact,
+          minFindings,
+        }),
+    };
+
+    return this.#executeStage(runtime, message, repairStage, ctx, bus);
+  }
+
+  #applyRecordRepairFallback(
+    stageResult: StageResult | undefined,
+    artifact: unknown,
+    gateStage: PipelineStage,
+    ctx: PipelineContext
+  ) {
+    const result = { accepted: 0, rejected: 0, skipped: 0 };
+    if (
+      !stageResult?.reply ||
+      stageResult.timedOut ||
+      this.#isAbortRequested(ctx.strategyContext)
+    ) {
+      return result;
+    }
+    if (this.#stageHasNoteFindingCall(stageResult)) {
+      return result;
+    }
+
+    const minFindings = gateStage.gate?.recordRepairMinFindings ?? 3;
+    const currentCount = this.#getActiveMemoryFindingCount(ctx.strategyContext);
+    const missing = Math.max(0, minFindings - currentCount);
+    if (missing === 0) {
+      result.skipped = 1;
+      return result;
+    }
+
+    const evidencePaths = this.#extractRecordRepairEvidencePaths(artifact);
+    const existing = this.#getExistingFindingFingerprints(ctx.strategyContext);
+    const candidates = this.#extractRecordRepairFallbackFindings(stageResult.reply);
+    const memoryCoordinator = ctx.strategyContext.memoryCoordinator as
+      | {
+          noteFinding?: (
+            finding: string,
+            evidence: string,
+            importance: number,
+            round: number,
+            scopeId?: string
+          ) => string;
+        }
+      | null
+      | undefined;
+    const activeContext = ctx.strategyContext.activeContext as
+      | {
+          noteKeyFinding?: (
+            finding: string,
+            evidence: string,
+            importance: number,
+            round: number
+          ) => void;
+        }
+      | null
+      | undefined;
+    const scopeId = this.#resolveDimensionScopeId(ctx.strategyContext);
+
+    for (const candidate of candidates) {
+      if (result.accepted >= missing) {
+        break;
+      }
+      const fingerprint = this.#recordRepairFingerprint(candidate);
+      if (existing.has(fingerprint)) {
+        result.rejected++;
+        continue;
+      }
+      if (!this.#isValidRecordRepairFinding(candidate, evidencePaths)) {
+        result.rejected++;
+        continue;
+      }
+      if (this.#isAbortRequested(ctx.strategyContext)) {
+        break;
+      }
+      if (memoryCoordinator?.noteFinding) {
+        memoryCoordinator.noteFinding(
+          candidate.finding,
+          candidate.evidence,
+          candidate.importance,
+          0,
+          scopeId
+        );
+      } else if (activeContext?.noteKeyFinding) {
+        activeContext.noteKeyFinding(
+          candidate.finding,
+          candidate.evidence,
+          candidate.importance,
+          0
+        );
+      } else {
+        result.rejected++;
+        continue;
+      }
+      existing.add(fingerprint);
+      result.accepted++;
+    }
+
+    return result;
+  }
+
+  #extractRecordRepairFallbackFindings(text: string): RecordRepairFinding[] {
+    const trimmed = text.trim();
+    const jsonCandidates: string[] = [];
+    const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1].trim());
+    jsonCandidates.push(...fenced, trimmed);
+    const objectMatch = trimmed.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      jsonCandidates.push(objectMatch[0]);
+    }
+    const arrayMatch = trimmed.match(/\[[\s\S]*\]/);
+    if (arrayMatch) {
+      jsonCandidates.push(arrayMatch[0]);
+    }
+
+    for (const candidate of jsonCandidates) {
+      try {
+        const parsed = JSON.parse(candidate) as
+          | Record<string, unknown>
+          | Array<Record<string, unknown>>;
+        const rawItems = Array.isArray(parsed)
+          ? parsed
+          : ((parsed.noteFindings || parsed.findings || parsed.items || []) as unknown[]);
+        if (!Array.isArray(rawItems)) {
+          continue;
+        }
+        return rawItems
+          .map((item) => this.#normalizeRecordRepairFinding(item))
+          .filter((item): item is RecordRepairFinding => item != null);
+      } catch {
+        // Try the next candidate.
+      }
+    }
+
+    return [];
+  }
+
+  #normalizeRecordRepairFinding(item: unknown): RecordRepairFinding | null {
+    if (!item || typeof item !== 'object') {
+      return null;
+    }
+    const record = item as Record<string, unknown>;
+    const finding = typeof record.finding === 'string' ? record.finding.trim() : '';
+    const evidence = typeof record.evidence === 'string' ? record.evidence.trim() : '';
+    const rawImportance = Number(record.importance ?? 5);
+    const importance = Number.isFinite(rawImportance)
+      ? Math.max(1, Math.min(10, Math.round(rawImportance)))
+      : 5;
+    if (!finding || !evidence) {
+      return null;
+    }
+    return { finding, evidence, importance };
+  }
+
+  #isValidRecordRepairFinding(finding: RecordRepairFinding, evidencePaths: string[]) {
+    if (finding.finding.length < 12 || finding.finding.length > 800) {
+      return false;
+    }
+    if (finding.evidence.length < 5 || finding.evidence.length > 800) {
+      return false;
+    }
+    if (!/[\w/.-]+\.[A-Za-z0-9]+(?::\d+)?/.test(finding.evidence)) {
+      return false;
+    }
+    if (evidencePaths.length === 0) {
+      return true;
+    }
+    return evidencePaths.some((path) => finding.evidence.includes(path));
+  }
+
+  #stageHasNoteFindingCall(stageResult: StageResult) {
+    return (stageResult.toolCalls || []).some((call) => {
+      const args = (call.args || call.params || {}) as Record<string, unknown>;
+      return (
+        String(call.tool || call.name || '') === 'memory' &&
+        String(args.action || '') === 'note_finding'
+      );
+    });
+  }
+
+  #getActiveMemoryFindingCount(strategyContext: Record<string, unknown>) {
+    const activeContext = strategyContext.activeContext as
+      | { distill?: () => { keyFindings?: unknown[] } }
+      | null
+      | undefined;
+    const findings = activeContext?.distill?.()?.keyFindings;
+    return Array.isArray(findings) ? findings.length : 0;
+  }
+
+  #getExistingFindingFingerprints(strategyContext: Record<string, unknown>) {
+    const activeContext = strategyContext.activeContext as
+      | { distill?: () => { keyFindings?: Array<{ finding?: string; evidence?: unknown }> } }
+      | null
+      | undefined;
+    const findings = activeContext?.distill?.()?.keyFindings || [];
+    return new Set(
+      findings.map((finding) =>
+        this.#recordRepairFingerprint({
+          finding: String(finding.finding || ''),
+          evidence: Array.isArray(finding.evidence)
+            ? finding.evidence.join(', ')
+            : String(finding.evidence || ''),
+          importance: 5,
+        })
+      )
+    );
+  }
+
+  #recordRepairFingerprint(finding: RecordRepairFinding) {
+    return `${finding.finding.trim().toLowerCase()}::${finding.evidence.trim().toLowerCase()}`;
+  }
+
+  #extractRecordRepairEvidencePaths(artifact: unknown) {
+    const paths = new Set<string>();
+    const record = artifact as
+      | {
+          referencedFiles?: unknown;
+          evidenceMap?: unknown;
+          findings?: Array<{ evidence?: unknown }>;
+        }
+      | null
+      | undefined;
+    if (Array.isArray(record?.referencedFiles)) {
+      for (const path of record.referencedFiles) {
+        if (typeof path === 'string' && path.trim()) {
+          paths.add(path.trim());
+        }
+      }
+    }
+    if (record?.evidenceMap instanceof Map) {
+      for (const path of record.evidenceMap.keys()) {
+        if (typeof path === 'string' && path.trim()) {
+          paths.add(path.trim());
+        }
+      }
+    } else if (record?.evidenceMap && typeof record.evidenceMap === 'object') {
+      for (const path of Object.keys(record.evidenceMap)) {
+        paths.add(path);
+      }
+    }
+    if (Array.isArray(record?.findings)) {
+      for (const finding of record.findings) {
+        const evidence =
+          typeof finding.evidence === 'string'
+            ? finding.evidence
+            : Array.isArray(finding.evidence)
+              ? finding.evidence.join(', ')
+              : '';
+        for (const match of evidence.match(/[\w/.-]+\.[A-Za-z0-9]+/g) || []) {
+          paths.add(match);
+        }
+      }
+    }
+    return [...paths];
+  }
+
+  #resolveDimensionScopeId(strategyContext: Record<string, unknown>) {
+    const sharedState = strategyContext.sharedState as Record<string, unknown> | undefined;
+    return typeof sharedState?._dimensionScopeId === 'string'
+      ? (sharedState._dimensionScopeId as string)
+      : typeof strategyContext.scopeId === 'string'
+        ? (strategyContext.scopeId as string)
+        : undefined;
+  }
+
+  #isAbortRequested(strategyContext: Record<string, unknown>) {
+    const abortSignal = strategyContext.abortSignal as AbortSignal | undefined;
+    return abortSignal?.aborted === true;
   }
 
   #ensureGateActiveContext(
@@ -511,6 +910,8 @@ export class PipelineStrategy extends Strategy {
       stage: stage.name,
       iterations: stageResult.iterations,
     });
+
+    return stageResult;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -557,6 +958,10 @@ export class PipelineStrategy extends Strategy {
     strategyContext: Record<string, unknown>,
     effectiveBudget: StageBudget | undefined
   ) {
+    if (stage.disableTracker || stage.recordRepairOnly) {
+      return null;
+    }
+
     let stageTracker = (strategyContext.tracker || null) as ExplorationTracker | null;
     const submitToolName = (stage.submitToolName || strategyContext.submitToolName || undefined) as
       | string
@@ -627,6 +1032,21 @@ export class PipelineStrategy extends Strategy {
         : typeof strategyContext.scopeId === 'string'
           ? strategyContext.scopeId
           : undefined;
+    const baseSharedState = ((strategyContext.sharedState as Record<string, unknown>) ||
+      null) as Record<string, unknown> | null;
+    const stageSharedState = decisionOnly
+      ? {
+          ...(baseSharedState || {}),
+          _evolutionDecisionOnly: true,
+        }
+      : stage.recordRepairOnly
+        ? {
+            ...(baseSharedState || {}),
+            _recordRepairOnly: true,
+            _recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
+            _recordRepairFallbackPolicy: 'validated_json',
+          }
+        : baseSharedState;
 
     const reactPromise = runtime.reactLoop(stagePrompt, {
       history: message.history,
@@ -635,6 +1055,12 @@ export class PipelineStrategy extends Strategy {
         pipelinePhase: stage.name,
         previousPhases: phaseResults,
         toolPolicyHints: strategyContext.toolPolicyHints || null,
+        ...(stage.recordRepairOnly
+          ? {
+              recordRepairOnly: true,
+              recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
+            }
+          : {}),
         ...(dimensionScopeId ? { dimensionScopeId } : {}),
       },
       capabilityOverride: stage.capabilities,
@@ -646,13 +1072,9 @@ export class PipelineStrategy extends Strategy {
       tracker: stageTracker,
       trace: strategyContext.trace || null,
       memoryCoordinator: strategyContext.memoryCoordinator || null,
-      sharedState: decisionOnly
-        ? {
-            ...((strategyContext.sharedState as Record<string, unknown>) || {}),
-            _evolutionDecisionOnly: true,
-          }
-        : strategyContext.sharedState || null,
+      sharedState: stageSharedState,
       source: strategyContext.source || null,
+      toolChoiceOverride: stage.toolChoiceOverride || null,
       abortSignal: abortController.signal,
       diagnostics: strategyContext.diagnostics as DiagnosticsCollector,
     });

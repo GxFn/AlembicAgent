@@ -114,7 +114,7 @@ interface GateOptions {
 interface GateResult {
   pass: boolean;
   reason?: string;
-  action?: 'retry' | 'degrade';
+  action?: 'analysis_retry' | 'record_repair' | 'retry' | 'degrade';
 }
 
 /** 可进行门控评估的分析报告 */
@@ -569,13 +569,17 @@ export function analysisQualityGate(report: GateableReport, options: GateOptions
 
 function applyGateThresholds(qualityReport: QualityReport, options: GateOptions = {}): GateResult {
   const { totalScore } = qualityReport;
+  const { scores } = qualityReport;
   const needsCandidates = options.outputType === 'dual' || options.outputType === 'candidate';
   const threshold = needsCandidates ? 60 : 45;
+  const analysisAdequateForRecordRepair =
+    scores.depthScore >= 40 && scores.breadthScore >= 35 && scores.coherenceScore >= 50;
+  const recordRepairAction = analysisAdequateForRecordRepair ? 'record_repair' : 'analysis_retry';
   if (needsCandidates && qualityReport.suggestions.includes(REQUIRED_MEMORY_FINDING_SUGGESTION)) {
     return {
       pass: false,
       reason: REQUIRED_MEMORY_FINDING_SUGGESTION,
-      action: 'retry',
+      action: recordRepairAction,
     };
   }
   if (
@@ -585,7 +589,7 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
     return {
       pass: false,
       reason: INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION,
-      action: 'retry',
+      action: recordRepairAction,
     };
   }
 
@@ -596,7 +600,7 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
     return {
       pass: false,
       reason: `Quality score ${totalScore}/${threshold}`,
-      action: 'retry',
+      action: 'analysis_retry',
     };
   }
   return {
@@ -612,10 +616,10 @@ function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}
   const minFileRefs = needsCandidates ? 3 : 2;
 
   if (report.analysisText.length < minChars) {
-    return { pass: false, reason: 'Analysis too short', action: 'retry' };
+    return { pass: false, reason: 'Analysis too short', action: 'analysis_retry' };
   }
   if (report.referencedFiles.length < minFileRefs) {
-    return { pass: false, reason: 'Too few file references', action: 'retry' };
+    return { pass: false, reason: 'Too few file references', action: 'analysis_retry' };
   }
 
   const refusalPatterns = [
@@ -634,7 +638,7 @@ function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}
     report.analysisText.length >= 500 ||
     (report.referencedFiles.length >= 3 && report.analysisText.length >= 200);
   if (!hasStructure) {
-    return { pass: false, reason: 'Analysis lacks structure', action: 'retry' };
+    return { pass: false, reason: 'Analysis lacks structure', action: 'analysis_retry' };
   }
 
   return { pass: true };
@@ -663,6 +667,103 @@ export function buildRetryPrompt(reason: string) {
     (hints as Record<string, string>)[reason] ||
     '请更深入地分析代码，引用至少 3 个具体文件，每个发现都要有代码证据。'
   );
+}
+
+function stringifyRecordRepairEvidenceMap(evidenceMap: unknown) {
+  if (!evidenceMap) {
+    return '';
+  }
+  const entries =
+    evidenceMap instanceof Map
+      ? [...evidenceMap.entries()]
+      : Object.entries(evidenceMap as Record<string, unknown>);
+  return entries
+    .slice(0, 12)
+    .map(([filePath, value]) => {
+      const record = value as { summary?: string; codeSnippets?: Array<{ line?: number }> };
+      const lines =
+        Array.isArray(record?.codeSnippets) && record.codeSnippets.length > 0
+          ? record.codeSnippets
+              .slice(0, 3)
+              .map((snippet) =>
+                typeof snippet.line === 'number' ? `${String(filePath)}:${snippet.line}` : null
+              )
+              .filter(Boolean)
+              .join(', ')
+          : String(filePath);
+      return `- ${lines}${record?.summary ? ` — ${record.summary}` : ''}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function getArtifactMemoryFindingCount(artifact: unknown) {
+  const metadata = (artifact as { metadata?: Record<string, unknown> } | null)?.metadata || {};
+  const count = metadata.memoryFindingCount;
+  return typeof count === 'number' && Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+}
+
+/**
+ * 构建 record-only 结构化发现补写提示。
+ *
+ * 该阶段只允许补齐 memory.note_finding，不再读取代码、图谱或终端。
+ * DeepSeek V4 thinking 下 tool_choice 可能被 provider 过滤，因此提示中包含
+ * validated JSON fallback；PipelineStrategy 只会写入能匹配既有证据路径的条目。
+ */
+export function buildRecordRepairPrompt({
+  reason = '',
+  artifact,
+  minFindings = 3,
+}: {
+  reason?: string;
+  artifact?: unknown;
+  minFindings?: number;
+}) {
+  const record = (artifact || {}) as {
+    analysisText?: string;
+    findings?: NormalizedFinding[];
+    referencedFiles?: string[];
+    evidenceMap?: unknown;
+  };
+  const memoryFindingCount = getArtifactMemoryFindingCount(artifact);
+  const missing = Math.max(1, minFindings - memoryFindingCount);
+  const files = Array.isArray(record.referencedFiles) ? record.referencedFiles.slice(0, 30) : [];
+  const existingFindings = Array.isArray(record.findings) ? record.findings.slice(0, 8) : [];
+  const evidenceMapText = stringifyRecordRepairEvidenceMap(record.evidenceMap);
+
+  return `QualityGate 判定上一轮分析已经具备可记录发现，但结构化 memory.note_finding 不足。
+
+失败原因: ${reason || 'missing note_finding records'}
+当前已记录结构化发现: ${memoryFindingCount}
+本阶段至少补写: ${missing} 条
+
+硬性规则:
+- 只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })
+- 每次工具调用只记录一条发现，直到补齐至少 ${minFindings} 条结构化发现
+- evidence 必须来自下面的已验证文件路径或证据摘要，并尽量包含行号
+- 禁止调用 code、graph、terminal、knowledge 或任何探索/提交工具
+- 不要把 Markdown 正文当作完成结果
+
+如果当前 provider 无法稳定发起工具调用，只输出严格 JSON fallback，不要输出其它文字:
+{"noteFindings":[{"finding":"具体、可验证的发现","evidence":"src/file.ts:42","importance":8}]}
+
+已验证文件:
+${files.length > 0 ? files.map((file) => `- ${file}`).join('\n') : '- （无显式文件清单，请只使用分析正文中出现的文件路径）'}
+
+已有发现摘要:
+${
+  existingFindings.length > 0
+    ? existingFindings
+        .map((finding) => `- [${finding.importance}/10] ${finding.finding} — ${finding.evidence}`)
+        .join('\n')
+    : '- （当前没有结构化发现）'
+}
+
+证据摘要:
+${evidenceMapText || '- （无 evidenceMap，使用分析正文中的文件路径和行号）'}
+
+分析正文（只读依据，不要继续探索）:
+${String(record.analysisText || '').slice(0, 8000)}`;
 }
 
 // ──────────────────────────────────────────────────────────────────

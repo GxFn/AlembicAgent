@@ -485,6 +485,36 @@ export const evolutionDecisionGate = {
   },
 };
 
+const RECORD_REPAIR_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_previous_evidence']);
+
+/**
+ * RecordRepairOnlyGate — QualityGate record_repair 阶段的动作级守卫。
+ *
+ * record_repair 只能把既有分析证据补写进 memory，不允许继续探索、
+ * 运行终端、提交知识或写入普通 memory.save。
+ */
+export const recordRepairOnlyGate = {
+  name: 'recordRepairOnlyGate',
+  before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
+    if (ctx.loopCtx.sharedState?._recordRepairOnly !== true) {
+      return undefined;
+    }
+
+    const action = getToolAction(call);
+    if (call.name === 'memory' && RECORD_REPAIR_MEMORY_ACTIONS.has(action)) {
+      return undefined;
+    }
+
+    return {
+      blocked: true,
+      result: {
+        error:
+          'Record repair is memory-only. Use memory({ action: "note_finding", params: { finding, evidence, importance } }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
+      },
+    };
+  },
+};
+
 /**
  * DeterministicDuplicateGuard — session-level short-circuit for read-like tools.
  *
@@ -728,6 +758,7 @@ export function createToolPipeline() {
   return new ToolExecutionPipeline()
     .use(allowlistGate)
     .use(evolutionDecisionGate)
+    .use(recordRepairOnlyGate)
     .use(deterministicDuplicateGuard)
     .use(observationRecord)
     .use(trackerSignal)
