@@ -23,6 +23,7 @@
 
 import Logger from '@alembic/core/logging';
 import { getModelRegistry } from '../../external/ai/registry/ModelRegistry.js';
+import { normalizeToolTranscriptForChatCompletions } from '../../external/ai/tool-transcript.js';
 import { estimateTokensFast } from '../../shared/token-utils.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
@@ -358,9 +359,11 @@ export class ContextWindow {
       prompt: string,
       opts: Record<string, unknown>
     ) => Promise<{ text?: string; usage?: Record<string, unknown> }>;
-  }): Promise<{ level: 4; removed: number; usage?: Record<string, unknown> }> {
+  }): Promise<{ level: 4; removed: number; usage?: Record<string, unknown>; failed?: boolean }> {
     const recentCount = 6;
-    const recentMessages = this.#messages.slice(-recentCount);
+    const oldLen = this.#messages.length;
+    const keepStart = Math.max(1, oldLen - recentCount);
+    const recentMessages = this.#messages.slice(keepStart);
     if (recentMessages.length === 0) {
       return { level: 4, removed: 0 };
     }
@@ -374,27 +377,46 @@ export class ContextWindow {
     ]
       .filter(Boolean)
       .join('\n');
+    const normalized = normalizeToolTranscriptForChatCompletions(
+      recentMessages as unknown as Array<Record<string, unknown>>
+    );
+    const summaryMessages = [
+      ...normalized.messages,
+      { role: 'user', content: summaryPrompt },
+    ] as unknown as ContextMessage[];
+    if (normalized.normalizedCount > 0) {
+      this.#logger.warn(
+        `[ContextWindow] L4 normalized ${normalized.normalizedCount} incomplete tool transcript messages before summary`
+      );
+    }
+    if (keepStart <= 1) {
+      if (normalized.normalizedCount > 0) {
+        this.#messages = [
+          this.#messages[0],
+          ...(normalized.messages as unknown as ContextMessage[]),
+        ];
+        this.#compactionLog.push(
+          `L4: normalized ${normalized.normalizedCount} incomplete tool transcript messages`
+        );
+      }
+      return { level: 4, removed: 0 };
+    }
 
     try {
       const summary = await aiProvider.chatWithTools(summaryPrompt, {
-        messages: recentMessages,
+        messages: summaryMessages,
         toolChoice: 'none',
       });
 
-      const oldLen = this.#messages.length;
-      const spliceEnd = Math.max(1, oldLen - recentCount);
-
-      if (spliceEnd <= 1) {
-        return { level: 4, removed: 0, usage: summary.usage };
-      }
-
-      this.#messages.splice(1, spliceEnd - 1);
-      this.#messages.splice(1, 0, {
-        role: 'user',
-        content: `[L4 Auto-compact summary]\n${summary.text || '[summary generation failed]'}`,
-      });
-
-      const removed = spliceEnd - 1;
+      const removed = keepStart - 1;
+      this.#messages = [
+        this.#messages[0],
+        {
+          role: 'user',
+          content: `[L4 Auto-compact summary]\n${summary.text || '[summary generation failed]'}`,
+        },
+        ...(normalized.messages as unknown as ContextMessage[]),
+      ];
       this.#compactionLog.push(`L4: LLM summary replaced ${removed} messages`);
       this.#logger.info(
         `[ContextWindow] L4 auto-compact: removed ${removed} messages, ` +
@@ -406,7 +428,7 @@ export class ContextWindow {
       this.#logger.warn(
         `[ContextWindow] L4 auto-compact failed: ${err instanceof Error ? err.message : String(err)}`
       );
-      return { level: 4, removed: 0 };
+      return { level: 4, removed: 0, failed: true };
     }
   }
 

@@ -111,6 +111,8 @@ export class BudgetController {
 
   #lastRoundInputTokens = 0;
   #pendingL4 = false;
+  #l4RetryCooldownChecks = 0;
+  #l4RequestBlockedForCurrentCheck = false;
   #consecutiveZeroCacheHits = 0;
 
   // telemetry accumulators
@@ -173,6 +175,13 @@ export class BudgetController {
       return noopResult;
     }
 
+    this.#l4RequestBlockedForCurrentCheck = false;
+    if (this.#l4RetryCooldownChecks > 0) {
+      this.#l4RetryCooldownChecks--;
+      this.#l4RequestBlockedForCurrentCheck = true;
+      this.#logger.warn('[BudgetController] L4 compaction request suppressed during cooldown');
+    }
+
     const usedInputTokens = this.#cumulativeUsage.input;
     const estimated = this.#estimateNextCallTokens(iteration);
     const projected = usedInputTokens + estimated;
@@ -203,7 +212,7 @@ export class BudgetController {
 
     // >90%: 标记 L4 pending 以触发 LLM-based 摘要压缩，释放更多空间
     if (isAggressive && this.#contextWindow && !this.#pendingL4) {
-      this.#pendingL4 = true;
+      this.#requestL4IfReady('aggressive session pressure');
     }
 
     return {
@@ -233,7 +242,7 @@ export class BudgetController {
 
   /** 标记需要 L4 compaction (异步 LLM 摘要) */
   requestL4Compaction(): void {
-    this.#pendingL4 = true;
+    this.#requestL4IfReady('explicit request');
   }
 
   get pendingL4(): boolean {
@@ -262,7 +271,12 @@ export class BudgetController {
       const l4Result = await this.#contextWindow.compactL4(
         aiProvider as Parameters<ContextWindow['compactL4']>[0]
       );
-      if (l4Result.removed > 0) {
+      if (l4Result.failed) {
+        this.#l4RetryCooldownChecks = 1;
+        this.#logger.warn(
+          '[BudgetController] L4 compaction failed; cooling down for one preflight check'
+        );
+      } else if (l4Result.removed > 0) {
         this.#logger.info(
           `[BudgetController] L4 compaction executed: removed ${l4Result.removed} messages`
         );
@@ -279,6 +293,7 @@ export class BudgetController {
       this.#trackCompaction(result);
       return result;
     } catch (err) {
+      this.#l4RetryCooldownChecks = 1;
       this.#logger.warn(`[BudgetController] L4 compaction failed: ${err}`);
       return { level: 0, removed: 0 };
     }
@@ -455,10 +470,21 @@ export class BudgetController {
       );
     }
     if (cw.needsL4Compaction()) {
-      this.#pendingL4 = true;
+      this.#requestL4IfReady('context window threshold');
     }
     this.#trackCompaction(extraCompact);
     return extraCompact;
+  }
+
+  #requestL4IfReady(reason: string): void {
+    if (this.#pendingL4) {
+      return;
+    }
+    if (this.#l4RequestBlockedForCurrentCheck) {
+      this.#logger.warn(`[BudgetController] L4 compaction request skipped (${reason})`);
+      return;
+    }
+    this.#pendingL4 = true;
   }
 
   #trackCompaction(result: CompactionResult): void {

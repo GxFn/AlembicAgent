@@ -9,6 +9,7 @@
  */
 
 import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import { normalizeToolTranscriptForChatCompletions } from '../tool-transcript.js';
 import {
   LLMTransport,
   type TransportConfig,
@@ -69,7 +70,18 @@ export class DeepSeekTransport extends LLMTransport {
     const isV4 = V4_PATTERN.test(request.model);
     const v4Thinking = isV4 && hasTools;
 
-    const messages = this.#buildToolMessages(request.messages, request.systemPrompt, v4Thinking);
+    const projectedMessages = this.#buildToolMessages(
+      request.messages,
+      request.systemPrompt,
+      v4Thinking
+    );
+    const { messages, normalizedCount } =
+      normalizeToolTranscriptForChatCompletions(projectedMessages);
+    if (normalizedCount > 0) {
+      console.warn(
+        `[DeepSeekTransport] normalized ${normalizedCount} incomplete tool transcript messages before request`
+      );
+    }
 
     if (v4Thinking) {
       this.#projectV4Reasoning(messages);

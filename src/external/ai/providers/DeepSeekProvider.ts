@@ -34,6 +34,7 @@ import {
 } from '../AiProvider.js';
 import { ParameterGuard } from '../guard/ParameterGuard.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
+import { normalizeToolTranscriptForChatCompletions } from '../tool-transcript.js';
 
 const DEEPSEEK_BASE = 'https://api.deepseek.com';
 const V4_PATTERN = /deepseek-v4/i;
@@ -123,7 +124,7 @@ export class DeepSeekProvider extends AiProvider {
       const v4 = this.#isV4();
       const v4Thinking = v4 && hasTools;
 
-      const messages: Array<Record<string, unknown>> = [];
+      let messages: Array<Record<string, unknown>> = [];
       if (systemPrompt) {
         messages.push({ role: 'system', content: systemPrompt });
       }
@@ -164,6 +165,14 @@ export class DeepSeekProvider extends AiProvider {
             content: msg.content || '',
           });
         }
+      }
+
+      const normalized = normalizeToolTranscriptForChatCompletions(messages);
+      messages = normalized.messages;
+      if (normalized.normalizedCount > 0) {
+        this.logger?.warn(
+          `[DeepSeek] preflight normalized ${normalized.normalizedCount} incomplete tool transcript messages`
+        );
       }
 
       // V4 预飞检查: 检测可能导致 400 的 reasoning_content 缺失
