@@ -538,6 +538,21 @@ export class AgentRuntime {
       baseSystemPromptLength: baseSystemPrompt.length,
       toolSchemaCount: toolSchemas.length,
       logger: this.logger,
+      abortSignal: ctx.abortSignal,
+      l4MemoryPackageProvider: () => ({
+        goal: ctx.prompt,
+        phase: ctx.tracker?.phase || ctx.context?.pipelinePhase || 'react_loop',
+        stageStatus: ctx.tracker?.isHardExit
+          ? 'hard_exit'
+          : ctx.tracker?.isGracefulExit
+            ? 'graceful_exit'
+            : 'running',
+        activeContext: ctx.trace,
+        diagnostics: ctx.diagnostics?.toJSON(),
+        recentMessages:
+          ctx.messages.toProjectedMessages() as import('../context/l4-memory-package.js').L4MemoryPackageInput['recentMessages'],
+        toolCalls: ctx.toolCalls,
+      }),
     });
 
     return ctx;
@@ -795,10 +810,31 @@ export class AgentRuntime {
     // L4 compaction: session 预算压力下执行 LLM-based 摘要压缩
     const budgetCtrl = ctx.budgetController!;
     if (budgetCtrl.pendingL4) {
-      await budgetCtrl.executeL4IfPending(
+      const l4Result = await budgetCtrl.executeL4IfPending(
         this.aiProvider as unknown as Parameters<typeof budgetCtrl.executeL4IfPending>[0],
         (u) => ctx.addTokenUsage(u)
       );
+      if (l4Result.cancelled || ctx.abortSignal?.aborted) {
+        ctx.diagnostics?.recordCancelReason('abort_signal');
+        ctx.diagnostics?.warn({
+          code: 'l4_compaction_cancelled',
+          message: 'L4 compaction result was discarded because the run was aborted',
+        });
+        return null;
+      }
+      if (l4Result.hardStop) {
+        const reason = l4Result.reason || 'l4_compaction_failed_budget_exhausted';
+        ctx.diagnostics?.markDegraded();
+        ctx.diagnostics?.recordCancelReason(reason);
+        ctx.diagnostics?.recordGateFailure('l4_compaction', 'degrade', reason);
+        ctx.diagnostics?.warn({
+          code: reason,
+          message:
+            'L4 compaction failed while session budget was already over the hard-stop threshold',
+        });
+        ctx.lastReply = `[run stopped: ${reason}] L4 compaction failed while the session budget was already over the safe limit; current dimension was stopped to avoid further token waste.`;
+        return null;
+      }
     }
 
     this.bus.publish(

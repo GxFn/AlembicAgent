@@ -9,3 +9,11 @@ export {
   SEARCH_TOOLS,
   SignalDetector,
 } from './exploration/SignalDetector.js';
+export {
+  buildL4MemoryPackage,
+  formatL4MemorySummary,
+  type L4MemoryPackage,
+  type L4MemoryPackageInput,
+  renderL4MemoryPackage,
+  validateL4Summary,
+} from './l4-memory-package.js';

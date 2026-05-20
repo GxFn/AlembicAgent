@@ -16,6 +16,7 @@
 
 import type { ContextWindow } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
+import type { L4MemoryPackageInput } from '../context/l4-memory-package.js';
 
 /* ── Types ─────────────────────────────────────────────── */
 
@@ -47,6 +48,10 @@ export interface BudgetControllerConfig {
   toolSchemaCount: number;
   /** Logger 实例 */
   logger: BudgetLogger;
+  /** Structured package source for L4 memory compaction */
+  l4MemoryPackageProvider?: () => L4MemoryPackageInput;
+  /** Abort signal used to discard in-flight L4 compaction results */
+  abortSignal?: AbortSignal | null;
 }
 
 export interface BudgetLogger {
@@ -64,6 +69,10 @@ export interface PreLLMCheckResult {
 export interface CompactionResult {
   level: number;
   removed: number;
+  failed?: boolean;
+  cancelled?: boolean;
+  hardStop?: boolean;
+  reason?: string;
 }
 
 export interface ToolBudget {
@@ -97,6 +106,8 @@ const COMPRESS_THRESHOLD = 0.75;
 const AGGRESSIVE_COMPRESS_THRESHOLD = 0.9;
 const DEFAULT_ESTIMATE = 8000;
 const MIN_TOOL_CHARS = 400;
+const L4_HARD_STOP_RATIO = 1.3;
+const L4_REPEAT_FAILURE_HARD_STOP_RATIO = 1.0;
 
 /* ── BudgetController ──────────────────────────────────── */
 
@@ -108,11 +119,15 @@ export class BudgetController {
   readonly #baseSystemPromptLength: number;
   readonly #toolSchemaCount: number;
   readonly #logger: BudgetLogger;
+  readonly #l4MemoryPackageProvider: (() => L4MemoryPackageInput) | null;
+  readonly #abortSignal: AbortSignal | null;
 
   #lastRoundInputTokens = 0;
   #pendingL4 = false;
   #l4RetryCooldownChecks = 0;
   #l4RequestBlockedForCurrentCheck = false;
+  #l4FailureCount = 0;
+  #lastProjectedSessionUsageRatio = 0;
   #consecutiveZeroCacheHits = 0;
 
   // telemetry accumulators
@@ -135,6 +150,8 @@ export class BudgetController {
     this.#baseSystemPromptLength = config.baseSystemPromptLength;
     this.#toolSchemaCount = config.toolSchemaCount;
     this.#logger = config.logger;
+    this.#l4MemoryPackageProvider = config.l4MemoryPackageProvider ?? null;
+    this.#abortSignal = config.abortSignal ?? null;
   }
 
   /* ═══════════════════════════════════════════════════════
@@ -186,6 +203,7 @@ export class BudgetController {
     const estimated = this.#estimateNextCallTokens(iteration);
     const projected = usedInputTokens + estimated;
     const ratio = projected / this.#maxSessionInputTokens;
+    this.#lastProjectedSessionUsageRatio = ratio;
 
     if (this.#contextWindow) {
       this.#contextWindow.setSessionPressure(usedInputTokens / this.#maxSessionInputTokens);
@@ -268,15 +286,29 @@ export class BudgetController {
     this.#pendingL4 = false;
 
     try {
+      if (this.#abortSignal?.aborted) {
+        return { level: 4, removed: 0, cancelled: true, failed: true, reason: 'abort_signal' };
+      }
+
       const l4Result = await this.#contextWindow.compactL4(
-        aiProvider as Parameters<ContextWindow['compactL4']>[0]
+        aiProvider as Parameters<ContextWindow['compactL4']>[0],
+        {
+          ...(this.#l4MemoryPackageProvider
+            ? { memoryPackage: this.#l4MemoryPackageProvider() }
+            : {}),
+          abortSignal: this.#abortSignal,
+        }
       );
-      if (l4Result.failed) {
+      if (l4Result.cancelled) {
+        this.#l4RetryCooldownChecks = 1;
+      } else if (l4Result.failed) {
+        this.#l4FailureCount++;
         this.#l4RetryCooldownChecks = 1;
         this.#logger.warn(
           '[BudgetController] L4 compaction failed; cooling down for one preflight check'
         );
       } else if (l4Result.removed > 0) {
+        this.#l4FailureCount = 0;
         this.#logger.info(
           `[BudgetController] L4 compaction executed: removed ${l4Result.removed} messages`
         );
@@ -289,13 +321,42 @@ export class BudgetController {
         this.#cumulativeUsage.output += outputTokens;
         addLoopTokenUsage?.({ inputTokens, outputTokens });
       }
-      const result = { level: 4, removed: l4Result.removed };
+      const effectivePressure = Math.max(
+        this.sessionUsageRatio,
+        this.#lastProjectedSessionUsageRatio
+      );
+      const hardStop =
+        l4Result.failed &&
+        !l4Result.cancelled &&
+        (effectivePressure >= L4_HARD_STOP_RATIO ||
+          (this.#l4FailureCount >= 2 && effectivePressure >= L4_REPEAT_FAILURE_HARD_STOP_RATIO));
+      if (hardStop) {
+        this.#logger.warn(
+          `[BudgetController] L4 failure under runaway session pressure (${(effectivePressure * 100).toFixed(1)}%); hard-stopping current run`
+        );
+      }
+      const result = {
+        level: 4,
+        removed: l4Result.removed,
+        ...(l4Result.failed ? { failed: true } : {}),
+        ...(l4Result.cancelled ? { cancelled: true, reason: 'abort_signal' } : {}),
+        ...(hardStop ? { hardStop: true, reason: 'l4_compaction_failed_budget_exhausted' } : {}),
+      };
       this.#trackCompaction(result);
       return result;
     } catch (err) {
+      this.#l4FailureCount++;
       this.#l4RetryCooldownChecks = 1;
       this.#logger.warn(`[BudgetController] L4 compaction failed: ${err}`);
-      return { level: 0, removed: 0 };
+      return {
+        level: 0,
+        removed: 0,
+        failed: true,
+        ...(Math.max(this.sessionUsageRatio, this.#lastProjectedSessionUsageRatio) >=
+        L4_HARD_STOP_RATIO
+          ? { hardStop: true, reason: 'l4_compaction_failed_budget_exhausted' }
+          : {}),
+      };
     }
   }
 

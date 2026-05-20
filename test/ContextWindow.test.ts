@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 
 describe('ContextWindow L4 compaction transcript safety', () => {
-  it('normalizes a recent slice that starts with an orphan tool message', async () => {
+  it('builds L4 summary input from a structured memory package, not raw tool messages', async () => {
     const contextWindow = new ContextWindow(10_000);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendAssistantWithToolCalls(null, [
@@ -23,15 +23,19 @@ describe('ContextWindow L4 compaction transcript safety', () => {
 
     const result = await contextWindow.compactL4(aiProvider);
 
-    expect(result).toMatchObject({ level: 4, removed: 1 });
+    expect(result).toMatchObject({ level: 4, removed: 6 });
     expect(aiProvider.chatWithTools).toHaveBeenCalledTimes(1);
-    expect(sentMessages.at(-1)?.content).toContain('请将以下对话历史压缩');
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0].content).toContain('L4 Memory Package v1');
+    expect(sentMessages[0].content).toContain('请将下面的 L4 Memory Package 压缩');
     expect(sentMessages[0].role).not.toBe('tool');
     expect(sentMessages.some((message) => message.role === 'tool')).toBe(false);
     expect(contextWindow.toMessages().some((message) => message.role === 'tool')).toBe(false);
+    expect(contextWindow.toMessages()[1].content).toContain('[[L4 Memory Summary]]');
+    expect(contextWindow.toMessages()[1].metadata).toMatchObject({ kind: 'l4_memory_summary' });
   });
 
-  it('does not preserve assistant tool calls when their tool results were sliced away', async () => {
+  it('projects assistant tool calls as package text before summary', async () => {
     const contextWindow = new ContextWindow(10_000);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
@@ -56,5 +60,76 @@ describe('ContextWindow L4 compaction transcript safety', () => {
     expect(sentMessages.some((message) => Array.isArray(message.toolCalls))).toBe(false);
     expect(sentMessages.some((message) => Array.isArray(message.tool_calls))).toBe(false);
     expect(sentMessages.map((message) => message.role)).not.toContain('tool');
+    expect(String(sentMessages[0].content)).toContain('tool_calls=graph');
+  });
+
+  it('rejects L4 summaries that drop phase or evidence refs', async () => {
+    const contextWindow = new ContextWindow(10_000);
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('older context to compact');
+    const aiProvider = {
+      chatWithTools: vi.fn(async () => ({ text: '只有笼统摘要，没有关键引用。' })),
+    };
+
+    const result = await contextWindow.compactL4(aiProvider, {
+      memoryPackage: {
+        goal: 'analyze architecture',
+        phase: 'VERIFY',
+        activeContext: {
+          distill: () => ({
+            keyFindings: [
+              {
+                finding: 'Host adapter owns platform wiring',
+                evidence: 'src/host.ts:12',
+                importance: 8,
+              },
+            ],
+            toolCallSummary: ['code.read src/host.ts'],
+          }),
+        },
+      },
+    });
+
+    expect(result.failed).toBe(true);
+    expect(result.validationMissing).toEqual(
+      expect.arrayContaining(['phase:VERIFY', 'key_findings', 'evidence_refs'])
+    );
+    expect(contextWindow.toMessages()).toHaveLength(2);
+    expect(String(contextWindow.toMessages()[1].content)).not.toContain('[[L4 Memory Summary]]');
+  });
+
+  it('discards in-flight L4 compaction results after abort', async () => {
+    const contextWindow = new ContextWindow(10_000);
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('older context to compact');
+    const abortController = new AbortController();
+    const aiProvider = {
+      chatWithTools: vi.fn(async () => {
+        abortController.abort();
+        return { text: 'VERIFY Host src/host.ts summary' };
+      }),
+    };
+
+    const result = await contextWindow.compactL4(aiProvider, {
+      abortSignal: abortController.signal,
+      memoryPackage: {
+        phase: 'VERIFY',
+        activeContext: {
+          distill: () => ({
+            keyFindings: [
+              {
+                finding: 'Host adapter owns platform wiring',
+                evidence: 'src/host.ts:12',
+                importance: 8,
+              },
+            ],
+          }),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({ failed: true, cancelled: true, removed: 0 });
+    expect(contextWindow.toMessages()).toHaveLength(2);
+    expect(String(contextWindow.toMessages()[1].content)).not.toContain('[[L4 Memory Summary]]');
   });
 });

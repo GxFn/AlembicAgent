@@ -23,8 +23,15 @@
 
 import Logger from '@alembic/core/logging';
 import { getModelRegistry } from '../../external/ai/registry/ModelRegistry.js';
-import { normalizeToolTranscriptForChatCompletions } from '../../external/ai/tool-transcript.js';
 import { estimateTokensFast } from '../../shared/token-utils.js';
+import {
+  buildL4MemoryPackage,
+  formatL4MemorySummary,
+  type L4MemoryPackage,
+  type L4MemoryPackageInput,
+  renderL4MemoryPackage,
+  validateL4Summary,
+} from './l4-memory-package.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 
@@ -44,6 +51,11 @@ export interface ContextMessage {
   toolCalls?: ToolCallInfo[];
   toolCallId?: string;
   name?: string;
+  metadata?: {
+    kind?: 'l4_memory_summary';
+    source?: string;
+    [key: string]: unknown;
+  };
 }
 
 /** 搜索结果匹配项 */
@@ -354,70 +366,102 @@ export class ContextWindow {
    * Replaces old messages with a summary while preserving the last 2 rounds
    * and key findings extracted from compacted submits.
    */
-  async compactL4(aiProvider: {
-    chatWithTools: (
-      prompt: string,
-      opts: Record<string, unknown>
-    ) => Promise<{ text?: string; usage?: Record<string, unknown> }>;
-  }): Promise<{ level: 4; removed: number; usage?: Record<string, unknown>; failed?: boolean }> {
-    const recentCount = 6;
+  async compactL4(
+    aiProvider: {
+      chatWithTools: (
+        prompt: string,
+        opts: Record<string, unknown>
+      ) => Promise<{ text?: string; usage?: Record<string, unknown> }>;
+    },
+    opts: {
+      memoryPackage?: L4MemoryPackage | L4MemoryPackageInput;
+      abortSignal?: AbortSignal | null;
+    } = {}
+  ): Promise<{
+    level: 4;
+    removed: number;
+    usage?: Record<string, unknown>;
+    failed?: boolean;
+    cancelled?: boolean;
+    validationMissing?: string[];
+  }> {
     const oldLen = this.#messages.length;
-    const keepStart = Math.max(1, oldLen - recentCount);
-    const recentMessages = this.#messages.slice(keepStart);
-    if (recentMessages.length === 0) {
+    if (oldLen <= 1) {
       return { level: 4, removed: 0 };
     }
 
-    const keyFindings = [...this.#compactedSubmits];
+    if (opts.abortSignal?.aborted) {
+      this.#logger.warn('[ContextWindow] L4 compact skipped: abort signal already fired');
+      return { level: 4, removed: 0, failed: true, cancelled: true };
+    }
+
+    const memoryPackage =
+      opts.memoryPackage &&
+      'kind' in opts.memoryPackage &&
+      opts.memoryPackage.kind === 'l4_memory_package'
+        ? opts.memoryPackage
+        : buildL4MemoryPackage({
+            goal: this.#messages[0]?.content || 'unknown',
+            ...(opts.memoryPackage || {}),
+            recentMessages:
+              (opts.memoryPackage as L4MemoryPackageInput | undefined)?.recentMessages ||
+              this.#messages.slice(1),
+          });
+    const renderedPackage = renderL4MemoryPackage(memoryPackage);
     const summaryPrompt = [
-      '请将以下对话历史压缩为一段简洁的摘要。',
-      '保留关键的分析发现、文件路径和工具调用结果。',
-      keyFindings.length > 0 ? `已提交的候选: ${keyFindings.join(', ')}` : '',
-      '用中文输出摘要，不超过 500 字。',
+      '请将下面的 L4 Memory Package 压缩成稳定的运行记忆摘要。',
+      '必须保留 phase、stageStatus、关键 finding、证据路径/行号、失败或降级状态。',
+      '不要新增事实，不要输出工具调用，不要引用原始 Chat Completions 协议消息。',
+      '用中文输出，不超过 500 字；保留包中的英文 phase/status/path 原文。',
     ]
       .filter(Boolean)
       .join('\n');
-    const normalized = normalizeToolTranscriptForChatCompletions(
-      recentMessages as unknown as Array<Record<string, unknown>>
-    );
     const summaryMessages = [
-      ...normalized.messages,
-      { role: 'user', content: summaryPrompt },
+      { role: 'user', content: `${renderedPackage}\n\n${summaryPrompt}` },
     ] as unknown as ContextMessage[];
-    if (normalized.normalizedCount > 0) {
-      this.#logger.warn(
-        `[ContextWindow] L4 normalized ${normalized.normalizedCount} incomplete tool transcript messages before summary`
-      );
-    }
-    if (keepStart <= 1) {
-      if (normalized.normalizedCount > 0) {
-        this.#messages = [
-          this.#messages[0],
-          ...(normalized.messages as unknown as ContextMessage[]),
-        ];
-        this.#compactionLog.push(
-          `L4: normalized ${normalized.normalizedCount} incomplete tool transcript messages`
-        );
-      }
-      return { level: 4, removed: 0 };
-    }
 
     try {
       const summary = await aiProvider.chatWithTools(summaryPrompt, {
         messages: summaryMessages,
         toolChoice: 'none',
+        abortSignal: opts.abortSignal ?? undefined,
       });
+      if (opts.abortSignal?.aborted) {
+        this.#logger.warn('[ContextWindow] L4 compact result discarded after abort');
+        return { level: 4, removed: 0, usage: summary.usage, failed: true, cancelled: true };
+      }
 
-      const removed = keepStart - 1;
+      const validation = validateL4Summary(summary.text, memoryPackage);
+      if (!validation.ok) {
+        this.#logger.warn(
+          `[ContextWindow] L4 memory summary validation failed: ${validation.missing.join(', ')}`
+        );
+        this.#compactionLog.push(
+          `L4: memory summary validation failed (${validation.missing.join(', ')})`
+        );
+        return {
+          level: 4,
+          removed: 0,
+          usage: summary.usage,
+          failed: true,
+          validationMissing: validation.missing,
+        };
+      }
+
+      const removed = Math.max(0, oldLen - 2);
       this.#messages = [
         this.#messages[0],
         {
           role: 'user',
-          content: `[L4 Auto-compact summary]\n${summary.text || '[summary generation failed]'}`,
+          content: formatL4MemorySummary(summary.text || '', memoryPackage),
+          metadata: {
+            kind: 'l4_memory_summary',
+            source: 'l4_memory_package/v1',
+          },
         },
-        ...(normalized.messages as unknown as ContextMessage[]),
       ];
-      this.#compactionLog.push(`L4: LLM summary replaced ${removed} messages`);
+      this.#collapseThreshold = -1;
+      this.#compactionLog.push(`L4: memory package summary replaced ${removed} messages`);
       this.#logger.info(
         `[ContextWindow] L4 auto-compact: removed ${removed} messages, ` +
           `tokens≈${this.estimateTokens()}/${this.#tokenBudget}`

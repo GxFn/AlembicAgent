@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ContextWindow } from '../src/agent/context/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { DiagnosticsCollector } from '../src/agent/runtime/index.js';
 
@@ -86,6 +87,37 @@ describe('agent runtime forced summary suppression', () => {
 
     expect(chatWithTools).not.toHaveBeenCalled();
     expect(result.reply).toContain('degraded_no_findings');
+    expect(result.diagnostics?.degraded).toBe(true);
+    expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
+  });
+
+  it('hard-stops a system run when L4 compaction fails under runaway budget pressure', async () => {
+    const chatWithTools = vi.fn(async () => {
+      throw new Error('l4 failed');
+    });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('oversized context');
+
+    const result = await runtime.reactLoop('analyze', {
+      source: 'system',
+      contextWindow,
+      budgetOverride: {
+        maxIterations: 2,
+        timeoutMs: 1000,
+        maxSessionInputTokens: 10,
+      },
+    });
+
+    expect(chatWithTools).toHaveBeenCalledTimes(1);
+    expect(result.reply).toContain('l4_compaction_failed_budget_exhausted');
     expect(result.diagnostics?.degraded).toBe(true);
     expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
   });
