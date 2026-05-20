@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ExplorationTracker } from '../src/agent/context/index.js';
 import { analysisQualityGate } from '../src/agent/prompts/insight-gate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import { AgentRuntime as AgentRuntimeImpl } from '../src/agent/runtime/AgentRuntime.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -93,6 +95,36 @@ function createStrategy(minFindings = 3) {
       { name: 'produce', capabilities: [], promptBuilder: () => 'produce' },
     ],
   });
+}
+
+function createRuntimeForReactLoop() {
+  const chatWithTools = vi.fn(async () => ({
+    text: 'forced summary should not be called',
+    functionCalls: [],
+    usage: { inputTokens: 1, outputTokens: 1 },
+  }));
+  const toolRouter = { execute: vi.fn() };
+  const runtime = new AgentRuntimeImpl({
+    aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+    toolRegistry: { getManifest: () => null } as never,
+    toolRouter: toolRouter as never,
+    capabilities: [],
+    strategy: { name: 'unused', execute: vi.fn() } as never,
+  });
+  return { runtime, chatWithTools };
+}
+
+function createExitingTracker() {
+  return {
+    phase: 'SUMMARIZE',
+    pipelineType: 'analyst',
+    isGracefulExit: false,
+    isHardExit: true,
+    iteration: 1,
+    totalSubmits: 0,
+    tick: vi.fn(),
+    shouldExit: vi.fn(() => true),
+  };
 }
 
 describe('evidence recording quality gate actions', () => {
@@ -311,5 +343,180 @@ describe('record repair tool guard', () => {
     expect(blockedSave.metadata.blocked).toBe(true);
     expect(allowedFinding.metadata.blocked).toBe(false);
     expect(executeCount).toBe(1);
+  });
+});
+
+describe('analyst phase-chain state gating', () => {
+  it('keeps SCAN as a no-tool briefing phase and immediately moves to EXPLORE', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 12, searchBudget: 8 }
+    );
+
+    expect(tracker).not.toBeNull();
+    expect(tracker?.phase).toBe('SCAN');
+    expect(tracker?.getToolChoice()).toBe('none');
+
+    tracker?.tick();
+    const transition = tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+
+    expect(tracker?.phase).toBe('EXPLORE');
+    expect(transition?.text).toContain('轻量计划阶段已完成');
+  });
+
+  it('blocks generalized exploration during analyst VERIFY while allowing focused evidence checks', async () => {
+    const diagnostics = new DiagnosticsCollector();
+    let executeCount = 0;
+    const runtime = {
+      id: 'analyst-verify-tool-guard-runtime',
+      presetName: 'test',
+      container: null,
+      dataRoot: '/tmp/alembic-agent-test',
+      fileCache: null,
+      lang: null,
+      logger: { info: () => undefined, warn: () => undefined },
+      aiProvider: null,
+      policies: { get: () => null },
+      toolRegistry: { getManifest: () => null },
+      toolRouter: {
+        execute: async (request: { toolId: string }) => {
+          executeCount++;
+          return {
+            ok: true,
+            status: 'success',
+            text: 'ok',
+            structuredContent: { ok: true },
+            durationMs: 1,
+            startedAt: new Date().toISOString(),
+            toolId: request.toolId,
+            callId: `verify-call-${executeCount}`,
+          };
+        },
+      },
+    } as unknown as AgentRuntime;
+    const loopCtx = {
+      allowedToolIds: ['code', 'graph', 'terminal', 'memory'],
+      abortSignal: null,
+      context: { pipelinePhase: 'analyze' },
+      diagnostics,
+      iteration: 1,
+      memoryCoordinator: null,
+      sharedState: {},
+      source: 'system',
+      toolCalls: [],
+      tracker: {
+        pipelineType: 'analyst',
+        phase: 'VERIFY',
+        recordToolCall: () => ({ isNew: false }),
+      },
+      trace: null,
+    } as unknown as LoopContext;
+    const pipeline = createToolPipeline();
+
+    const blockedCodeSearch = await pipeline.execute(
+      { id: 'code-search', name: 'code', args: { action: 'search', params: { pattern: 'Agent' } } },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const blockedGraphSearch = await pipeline.execute(
+      {
+        id: 'graph-search',
+        name: 'graph',
+        args: { action: 'query', params: { type: 'search', entity: 'Agent' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const blockedTerminal = await pipeline.execute(
+      {
+        id: 'terminal-run',
+        name: 'terminal',
+        args: { action: 'exec', params: { cmd: 'rg Agent' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const allowedRead = await pipeline.execute(
+      { id: 'code-read', name: 'code', args: { action: 'read', params: { path: 'src/foo.ts' } } },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const allowedGraph = await pipeline.execute(
+      {
+        id: 'graph-callers',
+        name: 'graph',
+        args: { action: 'query', params: { type: 'callers', entity: 'Foo.run' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const allowedFinding = await pipeline.execute(
+      {
+        id: 'memory-finding',
+        name: 'memory',
+        args: {
+          action: 'note_finding',
+          params: { finding: 'Verified finding', evidence: 'src/foo.ts:10', importance: 8 },
+        },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+
+    expect(blockedCodeSearch.metadata.blocked).toBe(true);
+    expect(blockedGraphSearch.metadata.blocked).toBe(true);
+    expect(blockedTerminal.metadata.blocked).toBe(true);
+    expect(allowedRead.metadata.blocked).toBe(false);
+    expect(allowedGraph.metadata.blocked).toBe(false);
+    expect(allowedFinding.metadata.blocked).toBe(false);
+    expect(executeCount).toBe(3);
+  });
+
+  it('does not call forced summary after abort or stage timeout exits', async () => {
+    const aborted = createRuntimeForReactLoop();
+    const abortController = new AbortController();
+    abortController.abort();
+    const abortResult = await aborted.runtime.reactLoop('analyze', {
+      source: 'system',
+      abortSignal: abortController.signal,
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+
+    expect(aborted.chatWithTools).not.toHaveBeenCalled();
+    expect(abortResult.reply).toContain('abort_signal');
+    expect(abortResult.diagnostics?.efficiency?.forcedSummary).toBe(false);
+    expect(abortResult.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+
+    const timedOut = createRuntimeForReactLoop();
+    const timeoutDiagnostics = new DiagnosticsCollector();
+    timeoutDiagnostics.recordTimedOutStage('analyze');
+    timeoutDiagnostics.recordCancelReason('stage_timeout');
+    const timeoutResult = await timedOut.runtime.reactLoop('analyze', {
+      source: 'system',
+      tracker: createExitingTracker() as never,
+      diagnostics: timeoutDiagnostics,
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+
+    expect(timedOut.chatWithTools).not.toHaveBeenCalled();
+    expect(timeoutResult.reply).toContain('stage_timeout');
+    expect(timeoutResult.diagnostics?.efficiency?.forcedSummary).toBe(false);
+    expect(timeoutResult.diagnostics?.efficiency?.cancelReason).toBe('stage_timeout');
+  });
+
+  it('keeps degraded_no_findings out of normal producer and summary completion paths', async () => {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    const diagnostics = new DiagnosticsCollector();
+    diagnostics.recordGateFailure(
+      'quality_gate',
+      'degraded_no_findings',
+      'Record repair did not produce enough validated note_finding records'
+    );
+
+    const result = await runtime.reactLoop('analyze', {
+      source: 'system',
+      tracker: createExitingTracker() as never,
+      diagnostics,
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(result.reply).toContain('degraded_no_findings');
+    expect(result.diagnostics?.degraded).toBe(true);
+    expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
   });
 });

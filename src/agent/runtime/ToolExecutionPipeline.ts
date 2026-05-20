@@ -486,6 +486,24 @@ export const evolutionDecisionGate = {
 };
 
 const RECORD_REPAIR_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_previous_evidence']);
+const ANALYST_VERIFY_CODE_ACTIONS = new Set(['read', 'outline']);
+const ANALYST_VERIFY_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_previous_evidence']);
+const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
+  'class',
+  'protocol',
+  'hierarchy',
+  'callers',
+  'callees',
+  'overrides',
+  'extensions',
+  'impact',
+]);
+
+function getToolParams(call: ToolCall): Record<string, unknown> {
+  return call.args?.params && typeof call.args.params === 'object'
+    ? (call.args.params as Record<string, unknown>)
+    : {};
+}
 
 /**
  * RecordRepairOnlyGate — QualityGate record_repair 阶段的动作级守卫。
@@ -510,6 +528,53 @@ export const recordRepairOnlyGate = {
       result: {
         error:
           'Record repair is memory-only. Use memory({ action: "note_finding", params: { finding, evidence, importance } }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
+      },
+    };
+  },
+};
+
+/**
+ * AnalystVerifyOnlyGate — analyst VERIFY 阶段的动作级守卫。
+ *
+ * VERIFY 只确认已发现证据的路径/行号/符号/调用关系，不允许重新打开
+ * 泛搜索、终端执行或知识提交面。
+ */
+export const analystVerifyOnlyGate = {
+  name: 'analystVerifyOnlyGate',
+  before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
+    if (
+      ctx.loopCtx.tracker?.pipelineType !== 'analyst' ||
+      ctx.loopCtx.tracker?.phase !== 'VERIFY'
+    ) {
+      return undefined;
+    }
+
+    const action = getToolAction(call);
+    const params = getToolParams(call);
+
+    if (call.name === 'code' && ANALYST_VERIFY_CODE_ACTIONS.has(action)) {
+      return undefined;
+    }
+
+    if (call.name === 'memory' && ANALYST_VERIFY_MEMORY_ACTIONS.has(action)) {
+      return undefined;
+    }
+
+    if (call.name === 'graph' && action === 'query') {
+      const queryType = String(params.type ?? call.args?.type ?? '');
+      const hasFocusedEntity = Boolean(
+        params.entity || params.symbol || params.name || params.path || call.args?.entity
+      );
+      if (ANALYST_VERIFY_GRAPH_QUERY_TYPES.has(queryType) && hasFocusedEntity) {
+        return undefined;
+      }
+    }
+
+    return {
+      blocked: true,
+      result: {
+        error:
+          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity/path), or memory.note_finding/recall/get_previous_evidence; broad search, terminal, knowledge, and writes are disabled.',
       },
     };
   },
@@ -759,6 +824,7 @@ export function createToolPipeline() {
     .use(allowlistGate)
     .use(evolutionDecisionGate)
     .use(recordRepairOnlyGate)
+    .use(analystVerifyOnlyGate)
     .use(deterministicDuplicateGuard)
     .use(observationRecord)
     .use(trackerSignal)

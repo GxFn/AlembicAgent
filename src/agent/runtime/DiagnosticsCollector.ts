@@ -109,7 +109,7 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
 
   recordGateFailure(stage: string, action: string, reason?: string) {
     this.#diagnostics.gateFailures.push({ stage, action, ...(reason ? { reason } : {}) });
-    if (action === 'degrade') {
+    if (action === 'degrade' || action === 'degraded_no_findings') {
       this.markDegraded();
     }
   }

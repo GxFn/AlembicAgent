@@ -163,10 +163,11 @@ export function createBootstrapStrategy(isSkillOnly = false) {
  * 5 阶段: SCAN → EXPLORE → VERIFY → RECORD → SUMMARIZE
  *
  * v2 改进: 支持探索饱和后的自然退出，避免耗尽全部轮次才进入总结：
+ *   - SCAN 是无工具的 briefing/plan seed，不重复 deterministic snapshot 的项目扫描
  *   - EXPLORE 阶段在 40% 预算后从 required 降级为 auto，允许 LLM 自然输出文本
  *   - EXPLORE→VERIFY 新增 onTextResponse=true，文本回复即可触发转换
  *   - EXPLORE→VERIFY 新增 consecutiveIdleRounds 检测（LLM 连续无工具调用=分析完成）
- *   - VERIFY→RECORD 阈值从 80% 降至 75%
+ *   - VERIFY→RECORD 阈值从 80% 降至 75%，VERIFY 只允许证据校验类工具调用
  *   - RECORD 是 required memory-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
  */
 export const STRATEGY_ANALYST = {
@@ -174,8 +175,8 @@ export const STRATEGY_ANALYST = {
   phases: ['SCAN', 'EXPLORE', 'VERIFY', 'RECORD', 'SUMMARIZE'],
   transitions: {
     'SCAN→EXPLORE': {
-      onMetrics: (m: ExplorationMetrics) => m.iteration >= 2,
-      onTextResponse: false,
+      onMetrics: (m: ExplorationMetrics) => m.phaseRounds >= 1 || m.iteration >= 1,
+      onTextResponse: true,
     },
     'EXPLORE→VERIFY': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
@@ -206,7 +207,7 @@ export const STRATEGY_ANALYST = {
       return 'required';
     }
     if (phase === 'SCAN') {
-      return 'required';
+      return 'none';
     }
     if (phase === 'EXPLORE') {
       return m.iteration >= Math.floor(b.maxIterations * 0.4) ? 'auto' : 'required';

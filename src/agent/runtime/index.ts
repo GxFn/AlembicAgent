@@ -73,6 +73,7 @@ export {
 } from './SystemRunContext.js';
 export {
   allowlistGate,
+  analystVerifyOnlyGate,
   createToolPipeline,
   deterministicDuplicateGuard,
   eventBusPublisher,

@@ -203,11 +203,11 @@ export class NudgeGenerator {
     }
 
     if (toPhase === 'EXPLORE' && fromPhase === 'SCAN') {
-      return '全局扫描完成。现在开始定向搜索——根据你发现的项目结构，搜索关键模式和类。';
+      return '轻量计划阶段已完成。现在基于已有项目快照开始定向探索，只搜索当前任务需要验证的关键模式和类。';
     }
 
     if (toPhase === 'VERIFY') {
-      return '搜索阶段信息已饱和。现在进入验证阶段——读取最关键的源文件，确认细节和实现逻辑。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 memory({ action: "note_finding", params: ... })，允许在验证阶段主动提交，不要等到总结阶段。';
+      return '搜索阶段信息已饱和。现在进入证据验证阶段——只校验已发现的文件路径、行号、调用关系和 referencedFiles，不要重新进行泛搜索或扩展探索。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 memory({ action: "note_finding", params: ... })。';
     }
 
     return `阶段切换: ${fromPhase} → ${toPhase}`;
@@ -407,10 +407,10 @@ export class NudgeGenerator {
         return null;
 
       case 'SCAN':
-        return '当前处于全局扫描阶段，请先获取项目概览和目录结构。';
+        return '当前处于轻量计划阶段：基于已注入的项目快照整理分析路线，不要调用工具重复获取项目概览或目录结构。';
 
       case 'VERIFY':
-        return '当前处于验证阶段，请阅读关键源文件确认实现细节。';
+        return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
 
       case 'RECORD':
         return `当前处于结构化记录阶段：不要输出正文，只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })；已记录 ${m.memoryFindingCount}/3 条核心发现。`;

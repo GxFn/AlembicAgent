@@ -111,7 +111,7 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'abort_signal',
-        needsSummary: true,
+        needsSummary: false,
         detail: 'AbortSignal fired before iteration',
       };
     }
@@ -135,7 +135,7 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'stage_timeout',
-        needsSummary: true,
+        needsSummary: false,
         detail: `${this.#effectiveTimeoutMs}ms exceeded (elapsed: ${elapsed}ms)`,
       };
     }

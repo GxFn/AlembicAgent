@@ -558,6 +558,14 @@ export class AgentRuntime {
         if (signal.reason === 'abort_signal') {
           ctx.diagnostics?.recordCancelReason('abort_signal');
         }
+        if (signal.reason === 'stage_timeout') {
+          ctx.diagnostics?.recordCancelReason('stage_timeout');
+          ctx.diagnostics?.recordTimedOutStage(
+            typeof ctx.context?.pipelinePhase === 'string'
+              ? ctx.context.pipelinePhase
+              : ctx.tracker?.phase || 'react_loop'
+          );
+        }
         ctx.diagnostics?.warn({
           code: signal.reason || 'exit',
           message: signal.detail || signal.reason || 'ExitController stopped the run',
@@ -1218,6 +1226,16 @@ export class AgentRuntime {
 
     // 检查预算 (非 tracker 模式)
     if (!tracker && ctx.iteration >= ctx.maxIterations) {
+      const suppression = this.#getForcedSummarySuppression(ctx);
+      if (suppression) {
+        ctx.lastReply = this.#buildSuppressedSummaryReply(suppression);
+        ctx.diagnostics?.warn({
+          code: 'forced_summary_suppressed',
+          message: suppression.message,
+        });
+        return true;
+      }
+
       const summaryMessages =
         messages.toMessages() as import('#external/ai/AiProvider.js').UnifiedMessage[];
       const summary: LLMResult = this.#gateway
@@ -1348,6 +1366,53 @@ export class AgentRuntime {
     return true;
   }
 
+  #getForcedSummarySuppression(ctx: LoopContext): { code: string; message: string } | null {
+    const diagnostics = ctx.diagnostics?.toJSON();
+    const cancelReason = diagnostics?.efficiency?.cancelReason;
+
+    if (ctx.abortSignal?.aborted || cancelReason === 'abort_signal') {
+      return {
+        code: 'abort_signal',
+        message: 'Run was aborted before a normal summary could be produced',
+      };
+    }
+
+    if (cancelReason === 'stage_timeout' || (diagnostics?.timedOutStages?.length ?? 0) > 0) {
+      return {
+        code: 'stage_timeout',
+        message: 'Run reached a stage timeout before a normal summary could be produced',
+      };
+    }
+
+    const noFindingsGate = diagnostics?.gateFailures?.find(
+      (gate) => gate.action === 'degraded_no_findings'
+    );
+    if (noFindingsGate) {
+      return {
+        code: 'degraded_no_findings',
+        message:
+          noFindingsGate.reason ||
+          'Quality gate degraded because required evidence findings were not recorded',
+      };
+    }
+
+    if (
+      (ctx.sharedState?._recordRepairOnly === true || ctx.context?.recordRepairOnly === true) &&
+      diagnostics?.degraded
+    ) {
+      return {
+        code: 'record_repair_incomplete',
+        message: 'Record repair ended degraded before enough validated findings were recorded',
+      };
+    }
+
+    return null;
+  }
+
+  #buildSuppressedSummaryReply(suppression: { code: string; message: string }) {
+    return `[run stopped: ${suppression.code}] ${suppression.message}`;
+  }
+
   /** 循环退出后处理 — 强制摘要 + 构建返回值 */
   async #finalize(ctx: LoopContext) {
     // Scan 管线: 所有结果在 toolCalls 中 (knowledge.submit)，不需要文本回复
@@ -1362,7 +1427,14 @@ export class AgentRuntime {
     // 强制摘要 — 循环结束后无文本回复时，生成摘要
     // 覆盖所有场景: 系统管线、tracker 管线、用户对话(有/无工具调用)
     if (!ctx.lastReply) {
-      if (ctx.toolCalls.length > 0 || ctx.tracker || ctx.isSystem) {
+      const suppression = this.#getForcedSummarySuppression(ctx);
+      if (suppression) {
+        ctx.lastReply = this.#buildSuppressedSummaryReply(suppression);
+        ctx.diagnostics?.warn({
+          code: 'forced_summary_suppressed',
+          message: suppression.message,
+        });
+      } else if (ctx.toolCalls.length > 0 || ctx.tracker || ctx.isSystem) {
         const forcedResult = await produceForcedSummary({
           aiProvider: this.aiProvider,
           source: ctx.source,
