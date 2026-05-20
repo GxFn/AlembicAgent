@@ -717,7 +717,7 @@ export class AgentRuntime {
     }
     if (forceSummary) {
       dynamicParts.push(
-        '[系统提示] 已进入最后阶段，请停止调用探索工具，基于已有信息输出总结。若任务要求结构化记录且尚未记录，只允许使用 memory({ action: "note_finding", params: ... }) 补齐核心发现。'
+        '[系统提示] 已进入最后阶段，请停止调用探索工具，基于已有信息输出总结。若任务要求结构化记录且尚未记录，只允许使用 note_finding({ finding, evidence, importance }) 补齐核心发现。'
       );
     }
     const dynamicContext = dynamicParts.length > 0 ? dynamicParts.join('\n\n') : null;
@@ -748,48 +748,12 @@ export class AgentRuntime {
       toolChoice !== 'none' &&
       (recordRepairOnly || (tracker?.pipelineType === 'analyst' && tracker.phase === 'RECORD'))
     ) {
-      return ctx.toolSchemas
-        .filter((schema) => schema.name === 'memory')
-        .map((schema) => ({
-          ...schema,
-          description:
-            'Record exactly one structured key finding. In RECORD/record-repair phase, call this tool repeatedly until at least 3 findings are recorded; do not output prose.',
-          parameters: {
-            type: 'object',
-            properties: {
-              action: {
-                type: 'string',
-                enum: ['note_finding'],
-                description: 'Must be note_finding in RECORD phase',
-              },
-              params: {
-                type: 'object',
-                properties: {
-                  finding: {
-                    type: 'string',
-                    description: 'Concrete, verifiable finding description',
-                  },
-                  evidence: {
-                    type: 'string',
-                    description: 'Complete relative file path and line number/range',
-                  },
-                  importance: {
-                    type: 'number',
-                    description: 'Importance 1-10',
-                    minimum: 1,
-                    maximum: 10,
-                  },
-                },
-                required: ['finding', 'evidence', 'importance'],
-                additionalProperties: false,
-              },
-            },
-            required: ['action', 'params'],
-            additionalProperties: false,
-          },
-        }));
+      if (!ctx.toolSchemas.some((schema) => schema.name === 'memory')) {
+        return [];
+      }
+      return [buildDirectNoteFindingSchema(true)];
     }
-    return ctx.toolSchemas;
+    return withDirectNoteFindingSchema(ctx.toolSchemas);
   }
 
   /**
@@ -969,7 +933,7 @@ export class AgentRuntime {
 
     // Graceful exit 保护 — toolChoice=none 或 gracefulExit 状态下，
     // 部分 LLM (DeepSeek 等) 可能仍然返回 tool calls，需要忽略。
-    // Analyst 的 RECORD 阶段会暴露 memory-only 补记录窗口，不能在这里丢弃。
+    // Analyst 的 RECORD 阶段会暴露 note_finding-only 补记录窗口，不能在这里丢弃。
     const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE' || ctx.tracker?.phase === 'FINALIZE';
     if (
       (ctx.tracker?.isGracefulExit || toolChoice === 'none') &&
@@ -1063,7 +1027,7 @@ export class AgentRuntime {
     // 追加 assistant 消息（含 DeepSeek V4 reasoningContent 透传）
     messages.appendAssistantWithToolCalls(
       llmResult.text || null,
-      activeCalls,
+      activeCalls.map((call) => ({ ...call, args: { ...call.args } })),
       llmResult.reasoningContent
     );
 
@@ -1432,6 +1396,18 @@ export class AgentRuntime {
       };
     }
 
+    const budgetExhaustedGate = diagnostics?.gateFailures?.find(
+      (gate) => gate.action === 'degraded_budget_exhausted'
+    );
+    if (budgetExhaustedGate) {
+      return {
+        code: 'degraded_budget_exhausted',
+        message:
+          budgetExhaustedGate.reason ||
+          'Quality gate degraded because retry would exceed the session token budget',
+      };
+    }
+
     if (
       (ctx.sharedState?._recordRepairOnly === true || ctx.context?.recordRepairOnly === true) &&
       diagnostics?.degraded
@@ -1689,6 +1665,48 @@ export class AgentRuntime {
     }
     this.bus.publish(AgentEvents.PROGRESS, event, { source: this.id });
   }
+}
+
+function withDirectNoteFindingSchema(
+  schemas: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  if (!schemas.some((schema) => schema.name === 'memory')) {
+    return schemas;
+  }
+  if (schemas.some((schema) => schema.name === 'note_finding')) {
+    return schemas;
+  }
+  return [...schemas, buildDirectNoteFindingSchema(false)];
+}
+
+function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unknown> {
+  return {
+    name: 'note_finding',
+    description: recordOnly
+      ? 'Record one structured, evidence-backed key finding. In RECORD/record-repair phase this is the only valid function; call it once per finding and do not output prose.'
+      : 'Record one structured, evidence-backed key finding for QualityGate. Call it when a finding is verified; do not wait for the final Markdown report.',
+    parameters: {
+      type: 'object',
+      properties: {
+        finding: {
+          type: 'string',
+          description: 'Concrete, verifiable finding description.',
+        },
+        evidence: {
+          type: 'string',
+          description: 'Complete relative file path with line number/range, e.g. src/App.ts:42.',
+        },
+        importance: {
+          type: 'number',
+          description: 'Importance 1-10.',
+          minimum: 1,
+          maximum: 10,
+        },
+      },
+      required: ['finding', 'evidence', 'importance'],
+      additionalProperties: false,
+    },
+  };
 }
 
 export default AgentRuntime;

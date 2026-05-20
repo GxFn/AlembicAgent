@@ -69,6 +69,28 @@ function diagnosticReason(result: unknown) {
   return 'blocked';
 }
 
+function isDirectNoteFindingCall(call: ToolCall) {
+  return call.name === 'note_finding';
+}
+
+function toExecutableToolCall(call: ToolCall): ToolCall {
+  if (!isDirectNoteFindingCall(call)) {
+    return call;
+  }
+  return {
+    ...call,
+    name: 'memory',
+    args: {
+      action: 'note_finding',
+      params: {
+        finding: call.args.finding,
+        evidence: call.args.evidence,
+        importance: call.args.importance,
+      },
+    },
+  };
+}
+
 /** 工具中间件 */
 interface ToolMiddleware {
   name: string;
@@ -309,10 +331,11 @@ export class ToolExecutionPipeline {
       const t0 = Date.now();
       try {
         const { runtime, loopCtx } = context;
+        const executableCall = toExecutableToolCall(call);
         const safetyPolicy = runtime.policies.get?.(SafetyPolicy) || null;
         const envelope = await runtime.toolRouter.execute({
-          toolId: call.name,
-          args: call.args,
+          toolId: executableCall.name,
+          args: executableCall.args,
           surface: 'runtime',
           actor: { role: 'developer', user: runtime.id },
           source: {
@@ -422,6 +445,9 @@ export const allowlistGate = {
   name: 'allowlistGate',
   before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
     const allowedNames = new Set(ctx.loopCtx?.allowedToolIds || []);
+    if (isDirectNoteFindingCall(call) && allowedNames.has('memory')) {
+      return undefined;
+    }
     if (!allowedNames.has(call.name)) {
       const container = ctx.runtime.container as { get?: (name: string) => unknown } | null;
       const toolForge = container?.get?.('toolForge') as ToolForgeLike | undefined;
@@ -519,7 +545,10 @@ export const recordRepairOnlyGate = {
     }
 
     const action = getToolAction(call);
-    if (call.name === 'memory' && RECORD_REPAIR_MEMORY_ACTIONS.has(action)) {
+    if (
+      isDirectNoteFindingCall(call) ||
+      (call.name === 'memory' && RECORD_REPAIR_MEMORY_ACTIONS.has(action))
+    ) {
       return undefined;
     }
 
@@ -527,7 +556,7 @@ export const recordRepairOnlyGate = {
       blocked: true,
       result: {
         error:
-          'Record repair is memory-only. Use memory({ action: "note_finding", params: { finding, evidence, importance } }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
+          'Record repair is note_finding-only. Use note_finding({ finding, evidence, importance }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
       },
     };
   },
@@ -556,7 +585,10 @@ export const analystVerifyOnlyGate = {
       return undefined;
     }
 
-    if (call.name === 'memory' && ANALYST_VERIFY_MEMORY_ACTIONS.has(action)) {
+    if (
+      isDirectNoteFindingCall(call) ||
+      (call.name === 'memory' && ANALYST_VERIFY_MEMORY_ACTIONS.has(action))
+    ) {
       return undefined;
     }
 
@@ -574,7 +606,7 @@ export const analystVerifyOnlyGate = {
       blocked: true,
       result: {
         error:
-          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity/path), or memory.note_finding/recall/get_previous_evidence; broad search, terminal, knowledge, and writes are disabled.',
+          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity/path), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
       },
     };
   },

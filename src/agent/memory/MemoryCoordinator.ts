@@ -77,6 +77,15 @@ export interface DimensionScopeConfig {
   maxRecentRounds?: number;
 }
 
+export interface MemoryNoteFindingResult {
+  recorded: boolean;
+  target: 'activeContext' | 'missing-active-context' | 'error';
+  importance: number;
+  message: string;
+  scratchpadSize?: number;
+  scopeId?: string;
+}
+
 // ── 预算分配策略 (§4.1) ──
 
 const BUDGET_PROFILES: Record<string, BudgetProfile> = Object.freeze({
@@ -373,7 +382,7 @@ export class MemoryCoordinator {
    * 记录关键发现 (从 note_finding handler 调用)
    * @param importance 1-10
    * @param [scopeId] 显式指定 scope (并行安全)
-   * @returns 响应消息
+   * @returns 结构化写入结果；只有 recorded=true 才能被 QualityGate 计入 note_finding
    */
   noteFinding(
     finding: string,
@@ -381,17 +390,36 @@ export class MemoryCoordinator {
     importance: number,
     round: number,
     scopeId?: string
-  ): string {
+  ): MemoryNoteFindingResult {
     try {
       const ac = scopeId ? this.getActiveContext(scopeId) : this.#getCurrentActiveContext();
       if (ac) {
         ac.noteKeyFinding(finding, evidence, importance, round);
-        return `📌 已记录发现 [${importance}/10]: "${finding.substring(0, 80)}" — 当前共 ${ac.scratchpadSize} 条关键发现`;
+        return {
+          recorded: true,
+          target: 'activeContext',
+          importance,
+          message: `📌 已记录发现 [${importance}/10]: "${finding.substring(0, 80)}" — 当前共 ${ac.scratchpadSize} 条关键发现`,
+          scratchpadSize: ac.scratchpadSize,
+          ...(scopeId ? { scopeId } : {}),
+        };
       }
-      return '⚠ 工作记忆未初始化 (仅在 bootstrap 分析期间可用)';
+      return {
+        recorded: false,
+        target: 'missing-active-context',
+        importance,
+        message: '工作记忆未初始化，note_finding 未写入 ActiveContext',
+        ...(scopeId ? { scopeId } : {}),
+      };
     } catch (err: unknown) {
       this.#logger.warn(`[MemoryCoordinator] noteFinding error: ${(err as Error).message}`);
-      return `⚠ 记录发现失败: ${(err as Error).message}`;
+      return {
+        recorded: false,
+        target: 'error',
+        importance,
+        message: `记录发现失败: ${(err as Error).message}`,
+        ...(scopeId ? { scopeId } : {}),
+      };
     }
   }
 

@@ -5,7 +5,14 @@
  * Actions: save, recall, note_finding, get_previous_evidence
  */
 
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
+import {
+  estimateTokens,
+  fail,
+  type MemoryNoteFindingResult,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '../types.js';
 
 export async function handle(
   action: string,
@@ -73,24 +80,42 @@ async function handleNoteFinding(
   const round = (params.round as number) || 0;
 
   if (!ctx.memoryCoordinator) {
-    if (ctx.sessionStore) {
-      ctx.sessionStore.save(`finding:${Date.now()}`, finding, {
-        tags: ['finding'],
-        evidence,
-        importance,
-      });
-      return ok({
-        recorded: true,
-        target: 'sessionStore',
-        importance,
-        message: `📌 Finding recorded (sessionStore fallback): "${finding.substring(0, 80)}"`,
-      });
-    }
-    return fail('Neither memoryCoordinator nor sessionStore available');
+    return fail('memory.note_finding requires an active MemoryCoordinator and ActiveContext');
   }
 
-  const message = ctx.memoryCoordinator.noteFinding(finding, evidence, importance, round);
-  return ok({ recorded: true, target: 'activeContext', importance, message });
+  const scopeId =
+    typeof ctx.runtime?.dimensionScopeId === 'string' && ctx.runtime.dimensionScopeId.trim()
+      ? ctx.runtime.dimensionScopeId
+      : undefined;
+  const result = normalizeNoteFindingResult(
+    ctx.memoryCoordinator.noteFinding(finding, evidence, importance, round, scopeId),
+    importance,
+    scopeId
+  );
+
+  if (!result.recorded || result.target !== 'activeContext') {
+    return fail(result.message);
+  }
+
+  return ok(result);
+}
+
+function normalizeNoteFindingResult(
+  result: MemoryNoteFindingResult | string,
+  importance: number,
+  scopeId?: string
+): MemoryNoteFindingResult {
+  if (typeof result !== 'string') {
+    return result;
+  }
+  const recorded = !result.startsWith('⚠');
+  return {
+    recorded,
+    target: recorded ? 'activeContext' : 'error',
+    importance,
+    message: result,
+    ...(scopeId ? { scopeId } : {}),
+  };
 }
 
 /**

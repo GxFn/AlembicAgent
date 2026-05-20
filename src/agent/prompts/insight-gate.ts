@@ -101,9 +101,8 @@ interface QualityReport {
   suggestions: string[];
 }
 
-const REQUIRED_MEMORY_FINDING_SUGGESTION = 'Required memory action note_finding calls are missing';
-const INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION =
-  'At least 3 memory action note_finding calls are required';
+const REQUIRED_MEMORY_FINDING_SUGGESTION = 'Required note_finding calls are missing';
+const INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION = 'At least 3 note_finding calls are required';
 
 /** 门控选项 */
 interface GateOptions {
@@ -592,7 +591,6 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
       action: recordRepairAction,
     };
   }
-
   if (totalScore >= threshold) {
     return { pass: true };
   }
@@ -658,9 +656,9 @@ export function buildRetryPrompt(reason: string) {
     'Analysis lacks structure':
       '请将分析组织成结构化的段落，使用编号列表或标题来区分不同的发现。每个发现应包含具体的文件路径和代码位置。',
     [REQUIRED_MEMORY_FINDING_SUGGESTION]:
-      '你的分析正文已有发现，但没有写入结构化记忆。请调用统一 memory 工具的 note_finding action，准确格式是 memory({ action: "note_finding", params: { finding, evidence, importance } })，不是 memory.note_finding。请至少记录 3 个核心发现，evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
+      '你的分析正文已有发现，但没有写入结构化证据记录。请调用 note_finding({ finding, evidence, importance })，至少记录 3 个核心发现；evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
     [INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION]:
-      '结构化发现数量不足。请继续只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })，至少补齐到 3 个核心发现；每个 evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
+      '结构化发现数量不足。请继续只调用 note_finding({ finding, evidence, importance })，至少补齐到 3 个核心发现；每个 evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
   };
 
   return (
@@ -706,9 +704,7 @@ function getArtifactMemoryFindingCount(artifact: unknown) {
 /**
  * 构建 record-only 结构化发现补写提示。
  *
- * 该阶段只允许补齐 memory.note_finding，不再读取代码、图谱或终端。
- * DeepSeek V4 thinking 下 tool_choice 可能被 provider 过滤，因此提示中包含
- * validated JSON fallback；PipelineStrategy 只会写入能匹配既有证据路径的条目。
+ * 该阶段只允许补齐 note_finding，不再读取代码、图谱或终端。
  */
 export function buildRecordRepairPrompt({
   reason = '',
@@ -731,21 +727,19 @@ export function buildRecordRepairPrompt({
   const existingFindings = Array.isArray(record.findings) ? record.findings.slice(0, 8) : [];
   const evidenceMapText = stringifyRecordRepairEvidenceMap(record.evidenceMap);
 
-  return `QualityGate 判定上一轮分析已经具备可记录发现，但结构化 memory.note_finding 不足。
+  return `QualityGate 判定上一轮分析已经具备可记录发现，但结构化 note_finding 不足。
 
 失败原因: ${reason || 'missing note_finding records'}
 当前已记录结构化发现: ${memoryFindingCount}
 本阶段至少补写: ${missing} 条
 
 硬性规则:
-- 只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })
+- 只调用 note_finding({ finding, evidence, importance })
 - 每次工具调用只记录一条发现，直到补齐至少 ${minFindings} 条结构化发现
 - evidence 必须来自下面的已验证文件路径或证据摘要，并尽量包含行号
 - 禁止调用 code、graph、terminal、knowledge 或任何探索/提交工具
 - 不要把 Markdown 正文当作完成结果
-
-如果当前 provider 无法稳定发起工具调用，只输出严格 JSON fallback，不要输出其它文字:
-{"noteFindings":[{"finding":"具体、可验证的发现","evidence":"src/file.ts:42","importance":8}]}
+- 如果无法调用 note_finding，本阶段必须失败并回到调用链修复；不要输出 JSON、Markdown 或其它替代格式
 
 已验证文件:
 ${files.length > 0 ? files.map((file) => `- ${file}`).join('\n') : '- （无显式文件清单，请只使用分析正文中出现的文件路径）'}
@@ -803,10 +797,16 @@ export function insightGateEvaluator(
 
   const qr = (artifact as Record<string, unknown>).qualityReport as QualityReport | undefined;
   if (qr?.scores) {
+    const artifactMetadata = (artifact as { metadata?: Record<string, unknown> }).metadata || {};
+    const memoryFindingCount =
+      typeof artifactMetadata.memoryFindingCount === 'number'
+        ? artifactMetadata.memoryFindingCount
+        : 0;
     logger.info(
       `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} ` +
         `total=${qr.totalScore} depth=${qr.scores.depthScore} breadth=${qr.scores.breadthScore} ` +
-        `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore}` +
+        `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore} ` +
+        `memoryFindings=${memoryFindingCount}` +
         (qr.suggestions.length > 0 ? ` suggestions=[${qr.suggestions.join('; ')}]` : '')
     );
   } else {

@@ -4,7 +4,12 @@ import { BudgetController } from '../src/agent/runtime/index.js';
 
 function createBudgetController(
   contextWindow: ContextWindow,
-  opts: { maxSessionInputTokens?: number; input?: number; abortSignal?: AbortSignal } = {}
+  opts: {
+    maxSessionInputTokens?: number;
+    input?: number;
+    abortSignal?: AbortSignal;
+    enableL4Compaction?: boolean;
+  } = {}
 ) {
   return new BudgetController({
     maxSessionInputTokens: opts.maxSessionInputTokens ?? 1000,
@@ -14,11 +19,35 @@ function createBudgetController(
     baseSystemPromptLength: 100,
     toolSchemaCount: 0,
     logger: { info: () => undefined, warn: () => undefined },
+    enableL4Compaction: opts.enableL4Compaction,
     abortSignal: opts.abortSignal,
   });
 }
 
 describe('BudgetController L4 cooldown', () => {
+  it('keeps L4 compaction disabled by default under pressure', async () => {
+    const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('large message');
+    const controller = createBudgetController(contextWindow, {
+      maxSessionInputTokens: 10,
+      input: 100,
+    });
+    const aiProvider = {
+      chatWithTools: vi.fn(async () => ({ text: 'summary' })),
+    };
+
+    controller.requestL4Compaction();
+    expect(controller.pendingL4).toBe(false);
+
+    controller.checkBeforeLLMCall(2);
+    expect(controller.pendingL4).toBe(false);
+
+    const result = await controller.executeL4IfPending(aiProvider);
+    expect(result).toEqual({ level: 0, removed: 0 });
+    expect(aiProvider.chatWithTools).not.toHaveBeenCalled();
+  });
+
   it('does not re-request L4 compaction on the next pressure check after failure', async () => {
     const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
     contextWindow.appendUserMessage('initial prompt');
@@ -26,7 +55,7 @@ describe('BudgetController L4 cooldown', () => {
       contextWindow.appendUserMessage(`large message ${index} ${'x'.repeat(200)}`);
     }
 
-    const controller = createBudgetController(contextWindow);
+    const controller = createBudgetController(contextWindow, { enableL4Compaction: true });
     const aiProvider = {
       chatWithTools: vi.fn(async () => {
         throw new Error('bad transcript');
@@ -54,6 +83,7 @@ describe('BudgetController L4 cooldown', () => {
     const controller = createBudgetController(contextWindow, {
       maxSessionInputTokens: 10,
       input: 100,
+      enableL4Compaction: true,
     });
     const aiProvider = {
       chatWithTools: vi.fn(async () => {
@@ -81,6 +111,7 @@ describe('BudgetController L4 cooldown', () => {
     abortController.abort();
     const controller = createBudgetController(contextWindow, {
       abortSignal: abortController.signal,
+      enableL4Compaction: true,
     });
     const aiProvider = {
       chatWithTools: vi.fn(async () => ({ text: 'summary' })),

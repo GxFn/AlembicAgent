@@ -130,12 +130,6 @@ interface GateEvalResult {
   artifact?: unknown;
 }
 
-interface RecordRepairFinding {
-  finding: string;
-  evidence: string;
-  importance: number;
-}
-
 /** Lightweight ContextWindow subset consumed by pipeline stages */
 interface StageContextWindow {
   resetForNewStage(): void;
@@ -291,15 +285,7 @@ export class PipelineStrategy extends Strategy {
           ctx,
           bus
         );
-        const fallbackResult = this.#applyRecordRepairFallback(
-          repairResult,
-          gateResult.artifact,
-          stage,
-          ctx
-        );
-        if (fallbackResult.accepted > 0 || fallbackResult.rejected > 0) {
-          phaseResults._recordRepairFallback = fallbackResult;
-        }
+        phaseResults._recordRepairToolWritten = this.#stageHasNoteFindingCall(repairResult);
 
         gateResult = this.#evaluateGateResult(stage, ctx, bus);
         this.#storeGateResult(stage, gateResult, ctx, bus);
@@ -332,6 +318,19 @@ export class PipelineStrategy extends Strategy {
         const prevIdx = this.#findPrevExecStageIdx(stageIndex);
         if (prevIdx >= 0) {
           const retryTargetStage = this.#stages[prevIdx];
+          const budgetSuppression = this.#getRetryBudgetSuppression(retryTargetStage, gate, ctx);
+          if (budgetSuppression) {
+            const degradedGate: GateEvalResult = {
+              action: 'degraded_budget_exhausted',
+              pass: false,
+              reason: budgetSuppression.reason,
+              artifact: gateResult.artifact,
+            };
+            this.#storeGateResult(stage, degradedGate, ctx, bus);
+            ctx.degraded = true;
+            ctx.diagnostics.markDegraded();
+            return 'break';
+          }
           phaseResults._retryContext = {
             reason: gateResult.reason,
             artifact: gateResult.artifact,
@@ -352,6 +351,31 @@ export class PipelineStrategy extends Strategy {
       return 'break';
     }
     return 'continue';
+  }
+
+  #getRetryBudgetSuppression(
+    retryTargetStage: PipelineStage,
+    gate: GateConfig,
+    ctx: PipelineContext
+  ): { reason: string } | null {
+    const maxSessionInputTokens =
+      numberFromUnknown(retryTargetStage.retryBudget?.maxSessionInputTokens) ??
+      numberFromUnknown(retryTargetStage.budget?.maxSessionInputTokens);
+    if (!maxSessionInputTokens || maxSessionInputTokens <= 0) {
+      return null;
+    }
+
+    const threshold = numberFromUnknown(gate.retryBudgetExhaustedRatio) ?? 0.9;
+    const ratio = ctx.totalTokenUsage.input / maxSessionInputTokens;
+    if (ratio < threshold) {
+      return null;
+    }
+
+    return {
+      reason: `Analysis retry suppressed because session input budget is exhausted (${Math.round(
+        ratio * 100
+      )}% of maxSessionInputTokens=${maxSessionInputTokens}).`,
+    };
   }
 
   #evaluateGateResult(
@@ -444,7 +468,7 @@ export class PipelineStrategy extends Strategy {
       toolChoiceOverride: 'auto',
       recordRepairEvidencePaths: this.#extractRecordRepairEvidencePaths(gateResult.artifact),
       systemPrompt:
-        'You are in a record-only repair stage. Do not explore. Use only memory.note_finding to record already verified findings, or return the documented JSON fallback.',
+        'You are in a record-only repair stage. Do not explore. Use only note_finding to record already verified findings.',
       promptBuilder: () =>
         buildRecordRepairPrompt({
           reason: gateResult.reason || '',
@@ -456,211 +480,29 @@ export class PipelineStrategy extends Strategy {
     return this.#executeStage(runtime, message, repairStage, ctx, bus);
   }
 
-  #applyRecordRepairFallback(
-    stageResult: StageResult | undefined,
-    artifact: unknown,
-    gateStage: PipelineStage,
-    ctx: PipelineContext
-  ) {
-    const result = { accepted: 0, rejected: 0, skipped: 0 };
-    if (
-      !stageResult?.reply ||
-      stageResult.timedOut ||
-      this.#isAbortRequested(ctx.strategyContext)
-    ) {
-      return result;
-    }
-    if (this.#stageHasNoteFindingCall(stageResult)) {
-      return result;
-    }
-
-    const minFindings = gateStage.gate?.recordRepairMinFindings ?? 3;
-    const currentCount = this.#getActiveMemoryFindingCount(ctx.strategyContext);
-    const missing = Math.max(0, minFindings - currentCount);
-    if (missing === 0) {
-      result.skipped = 1;
-      return result;
-    }
-
-    const evidencePaths = this.#extractRecordRepairEvidencePaths(artifact);
-    const existing = this.#getExistingFindingFingerprints(ctx.strategyContext);
-    const candidates = this.#extractRecordRepairFallbackFindings(stageResult.reply);
-    const memoryCoordinator = ctx.strategyContext.memoryCoordinator as
-      | {
-          noteFinding?: (
-            finding: string,
-            evidence: string,
-            importance: number,
-            round: number,
-            scopeId?: string
-          ) => string;
-        }
-      | null
-      | undefined;
-    const activeContext = ctx.strategyContext.activeContext as
-      | {
-          noteKeyFinding?: (
-            finding: string,
-            evidence: string,
-            importance: number,
-            round: number
-          ) => void;
-        }
-      | null
-      | undefined;
-    const scopeId = this.#resolveDimensionScopeId(ctx.strategyContext);
-
-    for (const candidate of candidates) {
-      if (result.accepted >= missing) {
-        break;
-      }
-      const fingerprint = this.#recordRepairFingerprint(candidate);
-      if (existing.has(fingerprint)) {
-        result.rejected++;
-        continue;
-      }
-      if (!this.#isValidRecordRepairFinding(candidate, evidencePaths)) {
-        result.rejected++;
-        continue;
-      }
-      if (this.#isAbortRequested(ctx.strategyContext)) {
-        break;
-      }
-      if (memoryCoordinator?.noteFinding) {
-        memoryCoordinator.noteFinding(
-          candidate.finding,
-          candidate.evidence,
-          candidate.importance,
-          0,
-          scopeId
-        );
-      } else if (activeContext?.noteKeyFinding) {
-        activeContext.noteKeyFinding(
-          candidate.finding,
-          candidate.evidence,
-          candidate.importance,
-          0
-        );
-      } else {
-        result.rejected++;
-        continue;
-      }
-      existing.add(fingerprint);
-      result.accepted++;
-    }
-
-    return result;
-  }
-
-  #extractRecordRepairFallbackFindings(text: string): RecordRepairFinding[] {
-    const trimmed = text.trim();
-    const jsonCandidates: string[] = [];
-    const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((m) => m[1].trim());
-    jsonCandidates.push(...fenced, trimmed);
-    const objectMatch = trimmed.match(/\{[\s\S]*\}/);
-    if (objectMatch) {
-      jsonCandidates.push(objectMatch[0]);
-    }
-    const arrayMatch = trimmed.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-      jsonCandidates.push(arrayMatch[0]);
-    }
-
-    for (const candidate of jsonCandidates) {
-      try {
-        const parsed = JSON.parse(candidate) as
-          | Record<string, unknown>
-          | Array<Record<string, unknown>>;
-        const rawItems = Array.isArray(parsed)
-          ? parsed
-          : ((parsed.noteFindings || parsed.findings || parsed.items || []) as unknown[]);
-        if (!Array.isArray(rawItems)) {
-          continue;
-        }
-        return rawItems
-          .map((item) => this.#normalizeRecordRepairFinding(item))
-          .filter((item): item is RecordRepairFinding => item != null);
-      } catch {
-        // Try the next candidate.
-      }
-    }
-
-    return [];
-  }
-
-  #normalizeRecordRepairFinding(item: unknown): RecordRepairFinding | null {
-    if (!item || typeof item !== 'object') {
-      return null;
-    }
-    const record = item as Record<string, unknown>;
-    const finding = typeof record.finding === 'string' ? record.finding.trim() : '';
-    const evidence = typeof record.evidence === 'string' ? record.evidence.trim() : '';
-    const rawImportance = Number(record.importance ?? 5);
-    const importance = Number.isFinite(rawImportance)
-      ? Math.max(1, Math.min(10, Math.round(rawImportance)))
-      : 5;
-    if (!finding || !evidence) {
-      return null;
-    }
-    return { finding, evidence, importance };
-  }
-
-  #isValidRecordRepairFinding(finding: RecordRepairFinding, evidencePaths: string[]) {
-    if (finding.finding.length < 12 || finding.finding.length > 800) {
-      return false;
-    }
-    if (finding.evidence.length < 5 || finding.evidence.length > 800) {
-      return false;
-    }
-    if (!/[\w/.-]+\.[A-Za-z0-9]+(?::\d+)?/.test(finding.evidence)) {
-      return false;
-    }
-    if (evidencePaths.length === 0) {
-      return true;
-    }
-    return evidencePaths.some((path) => finding.evidence.includes(path));
-  }
-
   #stageHasNoteFindingCall(stageResult: StageResult) {
     return (stageResult.toolCalls || []).some((call) => {
       const args = (call.args || call.params || {}) as Record<string, unknown>;
-      return (
-        String(call.tool || call.name || '') === 'memory' &&
-        String(args.action || '') === 'note_finding'
-      );
+      const toolName = String(call.tool || call.name || '');
+      const isNoteFinding =
+        toolName === 'note_finding' ||
+        (toolName === 'memory' && String(args.action || '') === 'note_finding');
+      if (!isNoteFinding) {
+        return false;
+      }
+      return this.#isSuccessfulNoteFindingResult(call.result || call.structuredContent);
     });
   }
 
-  #getActiveMemoryFindingCount(strategyContext: Record<string, unknown>) {
-    const activeContext = strategyContext.activeContext as
-      | { distill?: () => { keyFindings?: unknown[] } }
-      | null
-      | undefined;
-    const findings = activeContext?.distill?.()?.keyFindings;
-    return Array.isArray(findings) ? findings.length : 0;
-  }
-
-  #getExistingFindingFingerprints(strategyContext: Record<string, unknown>) {
-    const activeContext = strategyContext.activeContext as
-      | { distill?: () => { keyFindings?: Array<{ finding?: string; evidence?: unknown }> } }
-      | null
-      | undefined;
-    const findings = activeContext?.distill?.()?.keyFindings || [];
-    return new Set(
-      findings.map((finding) =>
-        this.#recordRepairFingerprint({
-          finding: String(finding.finding || ''),
-          evidence: Array.isArray(finding.evidence)
-            ? finding.evidence.join(', ')
-            : String(finding.evidence || ''),
-          importance: 5,
-        })
-      )
-    );
-  }
-
-  #recordRepairFingerprint(finding: RecordRepairFinding) {
-    return `${finding.finding.trim().toLowerCase()}::${finding.evidence.trim().toLowerCase()}`;
+  #isSuccessfulNoteFindingResult(result: unknown) {
+    if (typeof result === 'string') {
+      return !result.startsWith('⚠');
+    }
+    if (!result || typeof result !== 'object') {
+      return false;
+    }
+    const record = result as Record<string, unknown>;
+    return record.recorded === true && record.target === 'activeContext';
   }
 
   #extractRecordRepairEvidencePaths(artifact: unknown) {
@@ -705,20 +547,6 @@ export class PipelineStrategy extends Strategy {
       }
     }
     return [...paths];
-  }
-
-  #resolveDimensionScopeId(strategyContext: Record<string, unknown>) {
-    const sharedState = strategyContext.sharedState as Record<string, unknown> | undefined;
-    return typeof sharedState?._dimensionScopeId === 'string'
-      ? (sharedState._dimensionScopeId as string)
-      : typeof strategyContext.scopeId === 'string'
-        ? (strategyContext.scopeId as string)
-        : undefined;
-  }
-
-  #isAbortRequested(strategyContext: Record<string, unknown>) {
-    const abortSignal = strategyContext.abortSignal as AbortSignal | undefined;
-    return abortSignal?.aborted === true;
   }
 
   #ensureGateActiveContext(
@@ -1044,7 +872,6 @@ export class PipelineStrategy extends Strategy {
             ...(baseSharedState || {}),
             _recordRepairOnly: true,
             _recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
-            _recordRepairFallbackPolicy: 'validated_json',
           }
         : baseSharedState;
 
@@ -1204,3 +1031,7 @@ export class PipelineStrategy extends Strategy {
 
 // 自注册: 避免 strategies.js ↔ PipelineStrategy.js 循环依赖
 StrategyRegistry.register('pipeline', PipelineStrategy);
+
+function numberFromUnknown(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}

@@ -7,8 +7,8 @@ import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 
-const MISSING_FINDINGS = 'Required memory action note_finding calls are missing';
-const INSUFFICIENT_FINDINGS = 'At least 3 memory action note_finding calls are required';
+const MISSING_FINDINGS = 'Required note_finding calls are missing';
+const INSUFFICIENT_FINDINGS = 'At least 3 note_finding calls are required';
 
 function gateableReport(suggestions: string[], scores = {}) {
   return {
@@ -40,7 +40,12 @@ function createPipelineContext(initialFindings: Array<Record<string, unknown>> =
   const memoryCoordinator = {
     noteFinding: (finding: string, evidence: string, importance: number) => {
       findings.push({ finding, evidence, importance });
-      return 'ok';
+      return {
+        recorded: true,
+        target: 'activeContext',
+        importance,
+        scratchpadSize: findings.length,
+      };
     },
   };
 
@@ -159,7 +164,7 @@ describe('evidence recording quality gate actions', () => {
 });
 
 describe('record repair pipeline stage', () => {
-  it('runs a memory-only repair stage, validates fallback JSON, and rechecks the gate', async () => {
+  it('runs a note_finding-only repair stage and rechecks the gate from ActiveContext', async () => {
     const { findings, strategyContext } = createPipelineContext([
       { finding: 'Existing runtime finding', evidence: 'src/foo.ts:10', importance: 7 },
       { finding: 'Existing producer finding', evidence: 'src/bar.ts:20', importance: 7 },
@@ -186,22 +191,19 @@ describe('record repair pipeline stage', () => {
           expect(opts.additionalToolsOverride).toEqual(['memory']);
           expect((opts.sharedState as Record<string, unknown>)._recordRepairOnly).toBe(true);
           expect(opts.toolChoiceOverride).toBe('auto');
+          const args = {
+            finding: 'Repair records the missing verified runtime evidence',
+            evidence: 'src/foo.ts:10',
+            importance: 8,
+          };
+          const result = (
+            strategyContext.memoryCoordinator as {
+              noteFinding: (finding: string, evidence: string, importance: number) => unknown;
+            }
+          ).noteFinding(args.finding, args.evidence, args.importance);
           return {
-            reply: JSON.stringify({
-              noteFindings: [
-                {
-                  finding: 'Repair records the missing verified runtime evidence',
-                  evidence: 'src/foo.ts:10',
-                  importance: 8,
-                },
-                {
-                  finding: 'Repair rejects evidence outside the analysis artifact',
-                  evidence: 'src/outside.ts:1',
-                  importance: 8,
-                },
-              ],
-            }),
-            toolCalls: [],
+            reply: '',
+            toolCalls: [{ name: 'note_finding', args, result }],
             tokenUsage: { input: 1, output: 1 },
             iterations: 1,
           };
@@ -226,10 +228,10 @@ describe('record repair pipeline stage', () => {
       evidence: 'src/foo.ts:10',
     });
     expect(result.degraded).toBe(false);
-    expect(result.phases?._recordRepairFallback).toMatchObject({ accepted: 1, rejected: 0 });
+    expect(result.phases?._recordRepairToolWritten).toBe(true);
   });
 
-  it('does not write fallback findings or continue to produce after repair timeout', async () => {
+  it('does not accept JSON text as a note_finding substitute after repair timeout', async () => {
     const { findings, strategyContext } = createPipelineContext();
     const strategy = createStrategy(1);
     const phases: string[] = [];
@@ -267,12 +269,61 @@ describe('record repair pipeline stage', () => {
     expect(result.degraded).toBe(true);
     expect(result.phases?.quality_gate).toMatchObject({ action: 'degraded_no_findings' });
   });
+
+  it('suppresses full analysis retry when session input budget is already exhausted', async () => {
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze', capabilities: [], budget: { maxSessionInputTokens: 100 } },
+        {
+          name: 'quality_gate',
+          gate: {
+            evaluator: () => ({
+              action: 'analysis_retry',
+              pass: false,
+              reason: MISSING_FINDINGS,
+            }),
+            maxRetries: 1,
+          },
+        },
+        { name: 'produce', capabilities: [], promptBuilder: () => 'produce' },
+      ],
+    });
+    const phases: string[] = [];
+    const runtime = {
+      id: 'budget-suppression-runtime',
+      logger: { info: () => undefined },
+      reactLoop: vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+        const phase = String((opts.context as Record<string, unknown>).pipelinePhase);
+        phases.push(phase);
+        return {
+          reply: 'Too little useful analysis.',
+          toolCalls: [],
+          tokenUsage: { input: 95, output: 1 },
+          iterations: 1,
+        };
+      }),
+    };
+
+    const result = await strategy.execute(runtime, AgentMessage.internal('analyze then produce'), {
+      strategyContext: { diagnostics: new DiagnosticsCollector() },
+    });
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.degraded).toBe(true);
+    expect(result.phases?.quality_gate).toMatchObject({
+      action: 'degraded_budget_exhausted',
+    });
+    expect(result.diagnostics?.gateFailures).toEqual(
+      expect.arrayContaining([expect.objectContaining({ action: 'degraded_budget_exhausted' })])
+    );
+  });
 });
 
 describe('record repair tool guard', () => {
   it('blocks exploration and non-finding memory writes during record repair', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;
+    const executedToolIds: string[] = [];
     const runtime = {
       id: 'record-repair-tool-guard-runtime',
       presetName: 'test',
@@ -285,16 +336,17 @@ describe('record repair tool guard', () => {
       policies: { get: () => null },
       toolRegistry: { getManifest: () => null },
       toolRouter: {
-        execute: async () => {
+        execute: async (request: { toolId: string }) => {
           executeCount++;
+          executedToolIds.push(request.toolId);
           return {
             ok: true,
             status: 'success',
             text: 'ok',
-            structuredContent: { ok: true },
+            structuredContent: { recorded: true, target: 'activeContext' },
             durationMs: 1,
             startedAt: new Date().toISOString(),
-            toolId: 'memory',
+            toolId: request.toolId,
             callId: `call-${executeCount}`,
           };
         },
@@ -338,11 +390,28 @@ describe('record repair tool guard', () => {
       },
       { runtime, loopCtx, iteration: 1 }
     );
+    const directFindingCall = {
+      id: 'memory-3',
+      name: 'note_finding',
+      args: {
+        finding: 'Verified direct finding',
+        evidence: 'src/foo.ts:11',
+        importance: 8,
+      },
+    };
+    const allowedDirectFinding = await pipeline.execute(directFindingCall, {
+      runtime,
+      loopCtx,
+      iteration: 1,
+    });
 
     expect(blockedCode.metadata.blocked).toBe(true);
     expect(blockedSave.metadata.blocked).toBe(true);
     expect(allowedFinding.metadata.blocked).toBe(false);
-    expect(executeCount).toBe(1);
+    expect(allowedDirectFinding.metadata.blocked).toBe(false);
+    expect(directFindingCall.name).toBe('note_finding');
+    expect(executedToolIds).toEqual(['memory', 'memory']);
+    expect(executeCount).toBe(2);
   });
 });
 

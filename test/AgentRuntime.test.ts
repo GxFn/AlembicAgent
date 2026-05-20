@@ -33,6 +33,51 @@ function createExitingTracker() {
 }
 
 describe('agent runtime forced summary suppression', () => {
+  it('exposes a direct note_finding tool schema when memory is available', async () => {
+    const capture: { toolSchemas?: Array<Record<string, unknown>> } = {};
+    const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+      capture.toolSchemas = opts?.toolSchemas as Array<Record<string, unknown>> | undefined;
+      return {
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      };
+    });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      container: {
+        get: (name: string) => {
+          if (name !== 'capabilityCatalog') {
+            return undefined;
+          }
+          return {
+            toToolSchemas: (ids?: readonly string[] | null) =>
+              ids?.includes('memory')
+                ? [{ name: 'memory', description: 'Memory', parameters: { type: 'object' } }]
+                : [],
+          };
+        },
+      } as never,
+      capabilities: [],
+      additionalTools: ['memory'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+
+    await runtime.reactLoop('capture schemas', {
+      source: 'user',
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const directSchema = capture.toolSchemas?.find((schema) => schema.name === 'note_finding');
+    expect(capture.toolSchemas?.some((schema) => schema.name === 'memory')).toBe(true);
+    expect(directSchema).toBeDefined();
+    expect((directSchema?.parameters as { required?: string[] }).required).toEqual(
+      expect.arrayContaining(['finding', 'evidence', 'importance'])
+    );
+  });
+
   it('does not force summary after abort exits', async () => {
     const { runtime, chatWithTools } = createRuntimeForReactLoop();
     const abortController = new AbortController();
@@ -92,33 +137,43 @@ describe('agent runtime forced summary suppression', () => {
   });
 
   it('hard-stops a system run when L4 compaction fails under runaway budget pressure', async () => {
+    const originalEnableL4 = process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION;
+    process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION = '1';
     const chatWithTools = vi.fn(async () => {
       throw new Error('l4 failed');
     });
-    const runtime = new AgentRuntime({
-      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
-      toolRegistry: { getManifest: () => null } as never,
-      toolRouter: { execute: vi.fn() } as never,
-      capabilities: [],
-      strategy: { name: 'unused', execute: vi.fn() } as never,
-    });
-    const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
-    contextWindow.appendUserMessage('initial prompt');
-    contextWindow.appendUserMessage('oversized context');
+    try {
+      const runtime = new AgentRuntime({
+        aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+        toolRegistry: { getManifest: () => null } as never,
+        toolRouter: { execute: vi.fn() } as never,
+        capabilities: [],
+        strategy: { name: 'unused', execute: vi.fn() } as never,
+      });
+      const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
+      contextWindow.appendUserMessage('initial prompt');
+      contextWindow.appendUserMessage('oversized context');
 
-    const result = await runtime.reactLoop('analyze', {
-      source: 'system',
-      contextWindow,
-      budgetOverride: {
-        maxIterations: 2,
-        timeoutMs: 1000,
-        maxSessionInputTokens: 10,
-      },
-    });
+      const result = await runtime.reactLoop('analyze', {
+        source: 'system',
+        contextWindow,
+        budgetOverride: {
+          maxIterations: 2,
+          timeoutMs: 1000,
+          maxSessionInputTokens: 10,
+        },
+      });
 
-    expect(chatWithTools).toHaveBeenCalledTimes(1);
-    expect(result.reply).toContain('l4_compaction_failed_budget_exhausted');
-    expect(result.diagnostics?.degraded).toBe(true);
-    expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
+      expect(chatWithTools).toHaveBeenCalledTimes(1);
+      expect(result.reply).toContain('l4_compaction_failed_budget_exhausted');
+      expect(result.diagnostics?.degraded).toBe(true);
+      expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
+    } finally {
+      if (originalEnableL4 === undefined) {
+        delete process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION;
+      } else {
+        process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION = originalEnableL4;
+      }
+    }
   });
 });

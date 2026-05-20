@@ -170,6 +170,15 @@ export interface CapabilityV2Def {
 /* ------------------------------------------------------------------ */
 
 /** MemoryCoordinator 最小接口 — memory 工具通过此接口桥接 Agent 记忆系统 */
+export interface MemoryNoteFindingResult {
+  recorded: boolean;
+  target: 'activeContext' | 'missing-active-context' | 'error';
+  importance: number;
+  message: string;
+  scratchpadSize?: number;
+  scopeId?: string;
+}
+
 export interface MemoryCoordinatorLike {
   noteFinding(
     finding: string,
@@ -177,7 +186,7 @@ export interface MemoryCoordinatorLike {
     importance: number,
     round: number,
     scopeId?: string
-  ): string;
+  ): MemoryNoteFindingResult | string;
 
   /** 检索前序维度的代码证据 — get_previous_evidence 桥接 */
   searchEvidence?(

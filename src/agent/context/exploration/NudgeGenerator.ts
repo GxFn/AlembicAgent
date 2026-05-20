@@ -164,7 +164,7 @@ export class NudgeGenerator {
     if (toPhase === 'RECORD') {
       return (
         `你已完成分析验证。现在进入结构化记录阶段：请**停止调用 code、graph、terminal 等探索工具**。\n` +
-        `本阶段不要输出自然语言正文，必须只调用 memory({ action: "note_finding", params: { finding, evidence, importance } }) 记录核心发现，至少 3 条；每次工具调用记录 1 条发现。\n` +
+        `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidence, importance }) 记录核心发现，至少 3 条；每次工具调用记录 1 条发现。\n` +
         `note_finding 是 QualityGate 的重要质量依据；evidence 必须包含完整相对路径和行号。缺少或不足会导致 QualityGate retry。\n` +
         `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`
       );
@@ -207,7 +207,7 @@ export class NudgeGenerator {
     }
 
     if (toPhase === 'VERIFY') {
-      return '搜索阶段信息已饱和。现在进入证据验证阶段——只校验已发现的文件路径、行号、调用关系和 referencedFiles，不要重新进行泛搜索或扩展探索。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 memory({ action: "note_finding", params: ... })。';
+      return '搜索阶段信息已饱和。现在进入证据验证阶段——只校验已发现的文件路径、行号、调用关系和 referencedFiles，不要重新进行泛搜索或扩展探索。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 note_finding({ finding, evidence, importance })。';
     }
 
     return `阶段切换: ${fromPhase} → ${toPhase}`;
@@ -413,7 +413,7 @@ export class NudgeGenerator {
         return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
 
       case 'RECORD':
-        return `当前处于结构化记录阶段：不要输出正文，只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })；已记录 ${m.memoryFindingCount}/3 条核心发现。`;
+        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidence, importance })；已记录 ${m.memoryFindingCount}/3 条核心发现。`;
 
       default:
         return null;
@@ -432,7 +432,7 @@ export class NudgeGenerator {
       case 'VERIFY':
         return '验证阶段';
       case 'RECORD':
-        return '记录阶段 — 只允许 memory 工具的 note_finding action';
+        return '记录阶段 — 只允许 note_finding 函数';
       case 'SUMMARIZE':
         return '⚠ 总结阶段 — 请停止工具调用，直接输出分析文本';
       default:

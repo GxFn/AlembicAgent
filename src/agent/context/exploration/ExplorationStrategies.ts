@@ -168,7 +168,7 @@ export function createBootstrapStrategy(isSkillOnly = false) {
  *   - EXPLORE→VERIFY 新增 onTextResponse=true，文本回复即可触发转换
  *   - EXPLORE→VERIFY 新增 consecutiveIdleRounds 检测（LLM 连续无工具调用=分析完成）
  *   - VERIFY→RECORD 阈值从 80% 降至 75%，VERIFY 只允许证据校验类工具调用
- *   - RECORD 是 required memory-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
+ *   - RECORD 是 required note_finding-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
  */
 export const STRATEGY_ANALYST = {
   name: 'analyst',

@@ -50,6 +50,8 @@ export interface BudgetControllerConfig {
   logger: BudgetLogger;
   /** Structured package source for L4 memory compaction */
   l4MemoryPackageProvider?: () => L4MemoryPackageInput;
+  /** 临时止血开关：L4 仍保留实现，但默认不在运行中自动触发。 */
+  enableL4Compaction?: boolean;
   /** Abort signal used to discard in-flight L4 compaction results */
   abortSignal?: AbortSignal | null;
 }
@@ -120,6 +122,7 @@ export class BudgetController {
   readonly #toolSchemaCount: number;
   readonly #logger: BudgetLogger;
   readonly #l4MemoryPackageProvider: (() => L4MemoryPackageInput) | null;
+  readonly #enableL4Compaction: boolean;
   readonly #abortSignal: AbortSignal | null;
 
   #lastRoundInputTokens = 0;
@@ -127,6 +130,7 @@ export class BudgetController {
   #l4RetryCooldownChecks = 0;
   #l4RequestBlockedForCurrentCheck = false;
   #l4FailureCount = 0;
+  #l4DisabledLogged = false;
   #lastProjectedSessionUsageRatio = 0;
   #consecutiveZeroCacheHits = 0;
 
@@ -151,6 +155,8 @@ export class BudgetController {
     this.#toolSchemaCount = config.toolSchemaCount;
     this.#logger = config.logger;
     this.#l4MemoryPackageProvider = config.l4MemoryPackageProvider ?? null;
+    this.#enableL4Compaction =
+      config.enableL4Compaction ?? process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1';
     this.#abortSignal = config.abortSignal ?? null;
   }
 
@@ -260,6 +266,9 @@ export class BudgetController {
 
   /** 标记需要 L4 compaction (异步 LLM 摘要) */
   requestL4Compaction(): void {
+    if (!this.#enableL4Compaction) {
+      return;
+    }
     this.#requestL4IfReady('explicit request');
   }
 
@@ -538,6 +547,13 @@ export class BudgetController {
   }
 
   #requestL4IfReady(reason: string): void {
+    if (!this.#enableL4Compaction) {
+      if (!this.#l4DisabledLogged) {
+        this.#logger.info(`[BudgetController] L4 compaction disabled; skip request (${reason})`);
+        this.#l4DisabledLogged = true;
+      }
+      return;
+    }
     if (this.#pendingL4) {
       return;
     }

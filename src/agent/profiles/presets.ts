@@ -62,6 +62,9 @@ interface PolicyFactoryConfig {
   minToolCalls?: number;
 }
 
+const PRODUCER_TIMEOUT_MS = 900_000;
+const PRODUCER_RETRY_TIMEOUT_MS = 300_000;
+
 /** Tool call record shape used in retry logic */
 interface ToolCallRecord {
   tool?: string;
@@ -239,7 +242,8 @@ export const PRESETS = Object.freeze({
           capabilities: ['knowledge_production'],
           // 透传完整 PRODUCER_BUDGET (searchBudget/maxSubmits/softSubmitLimit/idleRoundsToExit)
           // 供 ExplorationTracker 精确控制 PRODUCE→SUMMARIZE 转换时机
-          budget: { ...PRODUCER_BUDGET, temperature: 0.3, timeoutMs: 360_000 },
+          // DeepSeek Pro 在真实项目候选生产阶段可能很慢；候选已提交前不要过早截断。
+          budget: { ...PRODUCER_BUDGET, temperature: 0.3, timeoutMs: PRODUCER_TIMEOUT_MS },
           systemPrompt: PRODUCER_SYSTEM_PROMPT,
           promptBuilder: (ctx: Record<string, unknown>) =>
             buildProducerPromptV2(
@@ -251,7 +255,7 @@ export const PRESETS = Object.freeze({
               ctx.toolPolicyHints as Parameters<typeof buildProducerPromptV2>[5]
             ),
           // 拒绝率过高时: 缩减预算 + 特定修复 prompt (对齐旧 ProducerAgent 的 rejection retry)
-          retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 120_000 },
+          retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: PRODUCER_RETRY_TIMEOUT_MS },
           retryPromptBuilder: (
             retryCtx: { reason?: string },
             _origPrompt: string,

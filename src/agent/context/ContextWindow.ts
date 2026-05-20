@@ -237,7 +237,8 @@ export class ContextWindow {
     this.#tokenBudget = tokenBudget;
     this.#logger = Logger.getInstance();
     this.#thresholds = compactionConfig?.thresholds ?? DEFAULT_THRESHOLDS;
-    this.#enableL4LLM = compactionConfig?.enableL4LLM ?? true;
+    // L4 仍保留为显式能力；在 note_finding 证据链稳定前，运行时默认不自动触发。
+    this.#enableL4LLM = compactionConfig?.enableL4LLM ?? false;
   }
 
   // ─── 消息添加 API ──────────────────────────────────────

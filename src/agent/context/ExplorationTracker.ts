@@ -332,10 +332,14 @@ export class ExplorationTracker {
         this.#metrics.roundsSinceSubmit = 0;
       }
     }
-    if (toolName === 'memory' && args?.action === 'note_finding') {
+    const isDirectNoteFinding = toolName === 'note_finding';
+    const isMemoryNoteFinding = toolName === 'memory' && args?.action === 'note_finding';
+    if (isDirectNoteFinding || isMemoryNoteFinding) {
       const resultObj = typeof result === 'object' ? (result as Record<string, unknown>) : null;
       const hasError = resultObj?.error !== undefined;
-      if (!hasError) {
+      const recorded = resultObj?.recorded === true;
+      const target = resultObj?.target;
+      if (!hasError && recorded && target === 'activeContext') {
         this.#metrics.memoryFindingCount++;
       }
     }
@@ -460,12 +464,18 @@ export class ExplorationTracker {
     }
 
     if (this.#phase === 'RECORD') {
+      if (m.phaseRounds >= 2) {
+        this.#logger.warn(
+          `[ExplorationTracker] RECORD received text without note_finding for ${m.phaseRounds} rounds; yielding to gate/record repair`
+        );
+        return { isFinalAnswer: true, needsDigestNudge: false, shouldContinue: false, nudge: null };
+      }
       return {
         isFinalAnswer: false,
         needsDigestNudge: false,
         shouldContinue: true,
         nudge:
-          '当前仍处于 RECORD 结构化记录阶段。不要输出自然语言正文；请只调用 memory({ action: "note_finding", params: { finding, evidence, importance } })，直到至少记录 3 条核心发现。note_finding 是 QualityGate 的重要质量依据。',
+          '当前仍处于 RECORD 结构化记录阶段。不要输出自然语言正文；请只调用 note_finding({ finding, evidence, importance })，直到至少记录 3 条核心发现。note_finding 是 QualityGate 的重要质量依据。',
       };
     }
 
