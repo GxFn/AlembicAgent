@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 import { AgentRunCoordinator } from '../coordination/AgentRunCoordinator.js';
 import { AgentProfileCompiler } from '../profiles/AgentProfileCompiler.js';
 import { AgentProfileRegistry } from '../profiles/AgentProfileRegistry.js';
@@ -35,6 +36,7 @@ export class AgentService {
   #runtimeBuilder: AgentRuntimeBuilderLike;
   #profileCompiler: AgentProfileCompiler;
   #runCoordinator: AgentRunCoordinator;
+  #logger = Logger.getInstance();
 
   constructor({ runtimeBuilder, profileCompiler, runCoordinator }: AgentServiceOptions) {
     this.#runtimeBuilder = runtimeBuilder;
@@ -48,12 +50,34 @@ export class AgentService {
       params: input.params,
       context: input.context,
     });
+    const trace = describeRun(input, compiledProfile.id);
+    const startedAt = Date.now();
+    this.#logger.info(`[AgentService] run start ${formatRunTrace(trace)}`, trace);
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
-      const coordinated = await this.#runCoordinator.run(input, compiledProfile, (childInput) =>
-        this.run(childInput)
-      );
-      if (coordinated) {
-        return coordinated;
+      try {
+        this.#logger.info(`[AgentService] coordinated run start ${formatRunTrace(trace)}`, {
+          ...trace,
+          concurrencyMode: compiledProfile.concurrency?.mode || null,
+        });
+        const coordinated = await this.#runCoordinator.run(input, compiledProfile, (childInput) =>
+          this.run(childInput)
+        );
+        if (coordinated) {
+          this.#logger.info(`[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
+            ...trace,
+            durationMs: Date.now() - startedAt,
+            status: coordinated.status,
+            toolCallCount: coordinated.toolCalls.length,
+          });
+          return coordinated;
+        }
+      } catch (err: unknown) {
+        this.#logger.warn(`[AgentService] coordinated run failed ${formatRunTrace(trace)}`, {
+          ...trace,
+          durationMs: Date.now() - startedAt,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
     }
     const runtime = this.#runtimeBuilder.build(compiledProfile, {
@@ -66,12 +90,28 @@ export class AgentService {
     }
     const message = buildAgentMessage(input);
     try {
+      // 冷启动监控依赖这里把“维度 child run 已进入 AgentRuntime”明确打出来。
+      // 仅靠 BootstrapTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
+      this.#logger.info(`[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
+        ...trace,
+        runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
+      });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
+      const status = inferRunStatus(result.reply || '');
+      this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
+        ...trace,
+        durationMs: Date.now() - startedAt,
+        status,
+        iterations: result.iterations || 0,
+        toolCallCount: result.toolCalls?.length || 0,
+        cancelReason: getDiagnosticsCancelReason(result.diagnostics),
+        aiErrorCount: getDiagnosticsAiErrorCount(result.diagnostics),
+      });
       return {
         runId: runtime.id || randomUUID(),
         profileId: compiledProfile.id,
         reply: result.reply || '',
-        status: inferRunStatus(result.reply),
+        status,
         phases: result.phases,
         toolCalls: result.toolCalls || [],
         usage: {
@@ -83,6 +123,12 @@ export class AgentService {
         diagnostics: result.diagnostics || null,
       };
     } catch (err: unknown) {
+      this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
+        ...trace,
+        durationMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+        status: inferErrorStatus(err),
+      });
       return {
         runId: runtime.id || randomUUID(),
         profileId: compiledProfile.id,
@@ -216,10 +262,59 @@ function createDefaultProfileCompiler() {
   });
 }
 
+function describeRun(input: AgentRunInput, profileId: string): Record<string, unknown> {
+  const promptContext = getRecord(input.context.promptContext);
+  const sharedState = getRecord(input.context.sharedState);
+  const dimensionMeta = getRecord(sharedState._dimensionMeta);
+  return {
+    profileId,
+    source: input.context.source,
+    runtimeSource: input.context.runtimeSource || null,
+    sessionId:
+      stringValue(input.message.sessionId) ||
+      stringValue(input.message.metadata?.sessionId) ||
+      stringValue(input.context.actor?.sessionId) ||
+      null,
+    dimension:
+      stringValue(input.params?.dimId) ||
+      stringValue(input.message.metadata?.dimension) ||
+      stringValue(promptContext.dimensionId) ||
+      stringValue(promptContext.dimId) ||
+      stringValue(dimensionMeta.id) ||
+      null,
+    phase: stringValue(input.message.metadata?.phase) || null,
+  };
+}
+
+function formatRunTrace(trace: Record<string, unknown>): string {
+  const parts = [
+    `profile=${trace.profileId || 'unknown'}`,
+    trace.dimension ? `dim=${trace.dimension}` : '',
+    trace.sessionId ? `session=${trace.sessionId}` : '',
+    trace.phase ? `phase=${trace.phase}` : '',
+    trace.source ? `source=${trace.source}` : '',
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
+function getDiagnosticsCancelReason(diagnostics: unknown): string | null {
+  const efficiency = getRecord(getRecord(diagnostics).efficiency);
+  return stringValue(efficiency.cancelReason) || null;
+}
+
+function getDiagnosticsAiErrorCount(diagnostics: unknown): number | null {
+  const value = getRecord(diagnostics).aiErrorCount;
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 function getRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 export default AgentService;

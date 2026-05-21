@@ -810,6 +810,18 @@ export class AgentRuntime {
       { source: this.id }
     );
 
+    const llmTrace = describeLoopCall(ctx, this.#modelRef);
+    const llmStartedAt = Date.now();
+    if (ctx.abortSignal?.aborted) {
+      this.logger.info(`[AgentRuntime] LLM call skipped ${formatLoopTrace(llmTrace)}`, {
+        ...llmTrace,
+        abortReason: stringifyAbortReason(ctx.abortSignal.reason),
+      });
+      ctx.diagnostics?.recordCancelReason('abort_signal');
+      ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal was already aborted' });
+      return null;
+    }
+
     let llmResult: LLMResult;
     try {
       // toolChoice='none' 时是否保留 tool schemas 取决于供应商:
@@ -836,6 +848,20 @@ export class AgentRuntime {
         | import('#external/ai/AiProvider.js').ToolSchema[]
         | undefined;
 
+      // 冷启动链路里第一轮经常最慢；必须先打印“请求已发出”的结构化日志，
+      // 否则 Dashboard 只能看到 filling，不知道是在等模型、走重试还是已经被 abort。
+      this.logger.info(`[AgentRuntime] LLM call start ${formatLoopTrace(llmTrace)}`, {
+        ...llmTrace,
+        route: this.#gateway ? 'gateway' : 'provider',
+        messageCount: unifiedMessages.length,
+        hasDynamicContext: Boolean(dynamicContext),
+        requestedToolChoice: toolChoice,
+        effectiveToolChoice: unifiedTools ? toolChoice : 'none',
+        toolSchemaCount: unifiedTools?.length || 0,
+        timeoutMs: ctx.budget.timeoutMs || null,
+        maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
+      });
+
       if (this.#gateway) {
         llmResult = (await this.#gateway.chatWithTools({
           modelRef: this.#modelRef,
@@ -860,6 +886,13 @@ export class AgentRuntime {
       }
       ctx.consecutiveAiErrors = 0;
     } catch (aiErr: unknown) {
+      this.logger.warn(`[AgentRuntime] LLM call failed ${formatLoopTrace(llmTrace)}`, {
+        ...llmTrace,
+        durationMs: Date.now() - llmStartedAt,
+        error: aiErr instanceof Error ? aiErr.message : String(aiErr),
+        abortSignal: ctx.abortSignal?.aborted === true,
+        abortReason: stringifyAbortReason(ctx.abortSignal?.reason),
+      });
       return this.#handleAiError(ctx, aiErr as AiError);
     }
 
@@ -889,6 +922,16 @@ export class AgentRuntime {
       },
       { source: this.id }
     );
+    this.logger.info(`[AgentRuntime] LLM call complete ${formatLoopTrace(llmTrace)}`, {
+      ...llmTrace,
+      durationMs: Date.now() - llmStartedAt,
+      hasText: Boolean(llmResult.text),
+      textChars: llmResult.text?.length || 0,
+      functionCallCount: llmResult.functionCalls?.length || 0,
+      functionCallNames: (llmResult.functionCalls || []).map((call) => call.name).slice(0, 12),
+      hasReasoningContent: Boolean(llmResult.reasoningContent),
+      usage: llmResult.usage || null,
+    });
 
     // 空响应重试
     if (!llmResult.text && !llmResult.functionCalls?.length) {
@@ -963,9 +1006,13 @@ export class AgentRuntime {
    * @returns continueResult() 或 null (退出)
    */
   async #handleAiError(ctx: LoopContext, aiErr: AiError): Promise<LLMResult | null> {
+    const trace = describeLoopCall(ctx, this.#modelRef);
     // AbortError — 外部中止信号已触发，不计入错误计数，立即退出
     if (ctx.abortSignal?.aborted) {
-      this.logger.info('[AgentRuntime] ⛔ abortSignal fired during LLM call — exiting');
+      this.logger.info(`[AgentRuntime] ⛔ abortSignal fired during LLM call — exiting ${formatLoopTrace(trace)}`, {
+        ...trace,
+        abortReason: stringifyAbortReason(ctx.abortSignal.reason),
+      });
       ctx.diagnostics?.recordCancelReason('abort_signal');
       ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal fired during LLM call' });
       return null;
@@ -974,14 +1021,14 @@ export class AgentRuntime {
     ctx.consecutiveAiErrors++;
     ctx.diagnostics?.recordAiError(aiErr.message);
     this.logger.warn(
-      `[AgentRuntime] AI call failed (attempt ${ctx.consecutiveAiErrors}): ${aiErr.message}`
+      `[AgentRuntime] AI call failed (attempt ${ctx.consecutiveAiErrors}) ${formatLoopTrace(trace)}: ${aiErr.message}`
     );
 
     ctx.tracker?.rollbackTick?.();
 
     // 熔断器感知
     if (aiErr.code === 'CIRCUIT_OPEN') {
-      this.logger.warn('[AgentRuntime] 🛑 circuit breaker OPEN — breaking to summary');
+      this.logger.warn(`[AgentRuntime] 🛑 circuit breaker OPEN — breaking to summary ${formatLoopTrace(trace)}`);
       if (!ctx.isSystem) {
         ctx.lastReply = `抱歉，AI 服务暂时不可用（${aiErr.message}）。请稍后重试，或检查 API 配置。`;
       }
@@ -990,7 +1037,7 @@ export class AgentRuntime {
 
     // 2-strike 策略
     if (ctx.consecutiveAiErrors >= 2) {
-      this.logger.warn('[AgentRuntime] 🛑 2 consecutive AI errors — breaking to summary');
+      this.logger.warn(`[AgentRuntime] 🛑 2 consecutive AI errors — breaking to summary ${formatLoopTrace(trace)}`);
       ctx.messages.resetToPromptOnly();
       if (!ctx.isSystem) {
         ctx.lastReply = `抱歉，AI 服务暂时不可用（${aiErr.message}）。请稍后重试，或检查 API 配置。`;
@@ -1022,6 +1069,18 @@ export class AgentRuntime {
       ctx.diagnostics?.recordTruncatedToolCalls(activeCalls.length - MAX_TOOL_CALLS_PER_ITER);
       truncatedCalls = activeCalls.slice(MAX_TOOL_CALLS_PER_ITER);
       activeCalls = activeCalls.slice(0, MAX_TOOL_CALLS_PER_ITER);
+    }
+
+    if (activeCalls.length > 0) {
+      this.logger.info(
+        `[AgentRuntime] tool calls received ${formatLoopTrace(describeLoopCall(ctx, this.#modelRef))}`,
+        {
+          ...describeLoopCall(ctx, this.#modelRef),
+          count: activeCalls.length,
+          names: activeCalls.map((call) => call.name).slice(0, 16),
+          sources: summarizeFunctionCallSources(activeCalls),
+        }
+      );
     }
 
     for (const fc of activeCalls) {
@@ -1740,6 +1799,65 @@ function isNoteFindingFunctionCall(call: { name?: string; args?: Record<string, 
     call.name === 'note_finding' ||
     (call.name === 'memory' && call.args?.action === 'note_finding')
   );
+}
+
+function describeLoopCall(ctx: LoopContext, modelRef: string): Record<string, unknown> {
+  const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
+  return {
+    modelRef,
+    iteration: ctx.iteration,
+    source: ctx.source,
+    phase: typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : null,
+    dimension:
+      stringValue(dimensionMeta.id) ||
+      stringValue(ctx.context.dimensionId) ||
+      stringValue(ctx.context.dimId) ||
+      null,
+    profile: stringValue(ctx.context.profileId) || null,
+  };
+}
+
+function formatLoopTrace(trace: Record<string, unknown>): string {
+  const parts = [
+    `model=${trace.modelRef || 'unknown'}`,
+    `iter=${trace.iteration ?? '?'}`,
+    trace.dimension ? `dim=${trace.dimension}` : '',
+    trace.phase ? `phase=${trace.phase}` : '',
+    trace.source ? `source=${trace.source}` : '',
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
+function summarizeFunctionCallSources(calls: Array<{ id?: string }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const call of calls) {
+    const source = inferFunctionCallSource(call);
+    counts[source] = (counts[source] || 0) + 1;
+  }
+  return counts;
+}
+
+function stringifyAbortReason(reason: unknown): string | null {
+  if (typeof reason === 'string') {
+    return reason;
+  }
+  if (reason instanceof Error) {
+    return reason.message;
+  }
+  if (reason === undefined || reason === null) {
+    return null;
+  }
+  return String(reason);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 export default AgentRuntime;
