@@ -21,6 +21,58 @@ describe('analyst exploration strategy boundaries', () => {
     expect(transition?.text).toContain('轻量计划阶段已完成');
   });
 
+  it('does not let analyst text-only rounds leave EXPLORE before code evidence exists', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 12, searchBudget: 8 }
+    );
+
+    expect(tracker).not.toBeNull();
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    expect(tracker?.phase).toBe('EXPLORE');
+    expect(tracker?.getToolChoice()).toBe('required');
+
+    for (let i = 0; i < 5; i++) {
+      tracker?.tick();
+      tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+      const textResult = tracker?.onTextResponse();
+
+      expect(tracker?.phase).toBe('EXPLORE');
+      expect(tracker?.getToolChoice()).toBe('required');
+      expect(textResult?.isFinalAnswer).toBe(false);
+      expect(textResult?.shouldContinue).toBe(true);
+      expect(textResult?.nudge).toContain('真实代码证据');
+    }
+  });
+
+  it('allows analyst progress after at least one evidence tool call', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 12, searchBudget: 8 }
+    );
+
+    expect(tracker).not.toBeNull();
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'code',
+      { action: 'search', patterns: ['Repository', 'Manager'] },
+      'Sources/App/Repository.swift:12: final class Repository'
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 0, toolNames: ['code'] });
+
+    for (let i = 0; i < 4; i++) {
+      tracker?.tick();
+      tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    }
+
+    expect(tracker?.phase).toBe('VERIFY');
+  });
+
   it('keeps VERIFY focused on evidence checks instead of broad exploration', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;

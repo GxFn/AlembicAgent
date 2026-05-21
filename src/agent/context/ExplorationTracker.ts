@@ -83,6 +83,7 @@ export class ExplorationTracker {
     uniquePatterns: new Set(),
     uniqueQueries: new Set(),
     totalToolCalls: 0,
+    evidenceToolCallCount: 0,
     submitCount: 0,
     memoryFindingCount: 0,
     roundsSinceNewInfo: 0,
@@ -315,6 +316,9 @@ export class ExplorationTracker {
    */
   recordToolCall(toolName: string, args: Record<string, unknown>, result: unknown) {
     this.#metrics.totalToolCalls++;
+    if (isEvidenceToolCall(toolName, args)) {
+      this.#metrics.evidenceToolCallCount++;
+    }
     const isNew = this.#signalDetector.detect(toolName, args, result);
 
     if (isSearchAction(toolName, args)) {
@@ -455,6 +459,26 @@ export class ExplorationTracker {
     }
 
     // 非终结阶段收到文本
+    if (this.#phase === 'EXPLORE' && m.evidenceToolCallCount === 0) {
+      return {
+        isFinalAnswer: false,
+        needsDigestNudge: false,
+        shouldContinue: true,
+        nudge:
+          '当前还没有真实代码证据。不要输出分析正文；请先调用 code({ action: "structure" }) 获取结构，再用 code({ action: "search" }) 或 graph({ action: "query" }) 定位目标，随后用 code({ action: "read" }) 验证至少 3 个文件后再总结。',
+      };
+    }
+
+    if (this.#phase === 'VERIFY' && m.evidenceToolCallCount < 2 && m.memoryFindingCount === 0) {
+      return {
+        isFinalAnswer: false,
+        needsDigestNudge: false,
+        shouldContinue: true,
+        nudge:
+          '当前证据仍不足。请不要输出最终分析；继续使用 code({ action: "read" }) 或 graph({ action: "query" }) 校验已发现的文件、类和调用关系，确认后立即调用 note_finding({ finding, evidence, importance })。',
+      };
+    }
+
     if (this.#phase === 'PRODUCE' || this.#phase === 'EXPLORE') {
       const nudge =
         this.#phase === 'PRODUCE' && this.#pipelineType !== 'scan'
@@ -543,6 +567,7 @@ export class ExplorationTracker {
       phaseRounds: this.#metrics.phaseRounds,
       submitCount: this.#metrics.submitCount,
       memoryFindingCount: this.#metrics.memoryFindingCount,
+      evidenceToolCallCount: this.#metrics.evidenceToolCallCount,
       uniqueFiles: this.#metrics.uniqueFiles.size,
       uniquePatterns: this.#metrics.uniquePatterns.size,
       uniqueQueries: this.#metrics.uniqueQueries.size,
@@ -678,6 +703,20 @@ export class ExplorationTracker {
       transitionFromPhase: this.#transitionFromPhase,
     };
   }
+}
+
+function isEvidenceToolCall(toolName: string, args: Record<string, unknown>): boolean {
+  const action = typeof args?.action === 'string' ? args.action : '';
+  if (toolName === 'code') {
+    return ['structure', 'search', 'read', 'outline'].includes(action);
+  }
+  if (toolName === 'graph') {
+    return action === 'overview' || action === 'query';
+  }
+  if (toolName === 'terminal') {
+    return action === 'exec';
+  }
+  return false;
 }
 
 export default ExplorationTracker;

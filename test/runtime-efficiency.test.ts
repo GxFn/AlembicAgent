@@ -236,6 +236,7 @@ describe('bootstrap nudge and replan efficiency', () => {
       uniquePatterns: new Set<string>(),
       uniqueQueries: new Set<string>(),
       totalToolCalls: 0,
+      evidenceToolCallCount: 0,
       submitCount: 0,
       memoryFindingCount: 0,
       roundsSinceNewInfo: 0,

@@ -8,7 +8,7 @@
  * 官方参数约束:
  *   - thinking 模式下 temperature / top_p / presence_penalty / frequency_penalty 无效
  *     (accepted for compatibility, no effect)
- *   - thinking 模式下 tool_choice 不支持，由模型内部 reasoner 自主决策
+ *   - thinking 模式支持 tools，但部分兼容路由会拒绝 tool_choice
  *   - reasoning_content 在有 tool_calls 的 assistant 消息中必须回传（否则 400）
  *   - reasoning_content 在纯文本 assistant 消息中不需要回传（会被忽略）
  *
@@ -32,6 +32,7 @@ import {
   type ToolSchema,
   type UnifiedMessage,
 } from '../AiProvider.js';
+import { parseDeepSeekTextToolCalls } from '../deepseek-tool-call-compat.js';
 import { ParameterGuard } from '../guard/ParameterGuard.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
 import { normalizeToolTranscriptForChatCompletions } from '../tool-transcript.js';
@@ -149,7 +150,7 @@ export class DeepSeekProvider extends AiProvider {
           }
 
           if (hasToolCalls) {
-            m.tool_calls = msg.toolCalls!.map(
+            m.tool_calls = msg.toolCalls?.map(
               (tc: { id: string; name: string; args: Record<string, unknown> }) => ({
                 id: tc.id,
                 type: 'function',
@@ -207,7 +208,7 @@ export class DeepSeekProvider extends AiProvider {
       }
 
       if (hasTools) {
-        body.tools = toolSchemas!.map((s: ToolSchema) => ({
+        body.tools = toolSchemas?.map((s: ToolSchema) => ({
           type: 'function',
           function: {
             name: s.name,
@@ -217,7 +218,9 @@ export class DeepSeekProvider extends AiProvider {
         }));
       }
 
-      // 通过 ParameterGuard 决定是否发送 tool_choice
+      // 通过 ParameterGuard 决定是否发送 tool_choice。
+      // DeepSeek V4 thinking 真实 API 兼容路由可能按 reasoner 拒绝 tool_choice，
+      // 所以 tools 保留、tool_choice 由 guard 过滤，避免 400 打断闭环。
       const modelDef = getModelRegistry().resolveOrCreate('deepseek', this.model);
       const guarded = ParameterGuard.guard(modelDef, { toolChoice });
       if (guarded.toolChoice) {
@@ -225,7 +228,7 @@ export class DeepSeekProvider extends AiProvider {
       }
 
       const data = await this.#post(`${this.baseUrl}/chat/completions`, body, opts.abortSignal);
-      const result = this.#parseToolResponse(data);
+      const result = this.#parseToolResponse(data, { toolSchemas, toolChoice });
 
       if (this.#isV4() && result.usage) {
         const u = result.usage;
@@ -356,7 +359,10 @@ export class DeepSeekProvider extends AiProvider {
 
   // ─── 响应解析 ──────────────────────────────────────────
 
-  #parseToolResponse(data: ApiResponse): ChatWithToolsResult {
+  #parseToolResponse(
+    data: ApiResponse,
+    opts: { toolSchemas?: ToolSchema[]; toolChoice?: string } = {}
+  ): ChatWithToolsResult {
     const choice = data?.choices?.[0];
 
     const usage = data?.usage
@@ -404,6 +410,17 @@ export class DeepSeekProvider extends AiProvider {
         );
         return { text, functionCalls, usage, reasoningContent };
       }
+    }
+
+    const compatCalls = parseDeepSeekTextToolCalls(
+      text,
+      opts.toolSchemas?.map((tool) => tool.name)
+    );
+    if (compatCalls.length > 0 && opts.toolChoice && opts.toolChoice !== 'none') {
+      this.logger?.warn(
+        `[DeepSeek] converted ${compatCalls.length} text function call(s) into tool calls`
+      );
+      return { text: null, functionCalls: compatCalls, usage, reasoningContent };
     }
 
     return { text, functionCalls: null, usage, reasoningContent };

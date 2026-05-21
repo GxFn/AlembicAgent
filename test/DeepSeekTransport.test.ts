@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DeepSeekTransport } from '../src/external/ai/transport/DeepSeekTransport.js';
 
-function mockDeepSeekFetch(capture: { body?: Record<string, unknown> }) {
+function mockDeepSeekFetch(
+  capture: { body?: Record<string, unknown> },
+  response: Record<string, unknown> = {
+    choices: [{ message: { content: 'ok' } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }
+) {
   const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     capture.body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
     return {
       ok: true,
-      json: async () => ({
-        choices: [{ message: { content: 'ok' } }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
+      json: async () => response,
       text: async () => '',
     } as Response;
   });
@@ -68,5 +71,98 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     const assistant = sentMessages(capture).find((message) => message.role === 'assistant');
     expect(assistant?.tool_calls).toBeUndefined();
     expect(String(assistant?.content)).toContain('tool calls converted to text');
+  });
+
+  it('omits tool_choice for DeepSeek V4 thinking tool requests', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+
+    await transport.chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'read code' }],
+      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'required',
+      maxTokens: 1024,
+    });
+
+    expect(capture.body?.thinking).toEqual({ type: 'enabled' });
+    expect(capture.body?.tool_choice).toBeUndefined();
+    expect(capture.body?.tools).toHaveLength(1);
+  });
+
+  it('keeps reasoning_content for every complete V4 assistant tool-call round', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+
+    await transport.chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [
+        {
+          role: 'assistant',
+          content: null,
+          reasoningContent: 'first reasoning',
+          toolCalls: [{ id: 'call-1', name: 'code', args: { action: 'structure' } }],
+        },
+        { role: 'tool', toolCallId: 'call-1', name: 'code', content: 'first result' },
+        {
+          role: 'assistant',
+          content: null,
+          reasoningContent: 'second reasoning',
+          toolCalls: [{ id: 'call-2', name: 'graph', args: { action: 'query' } }],
+        },
+        { role: 'tool', toolCallId: 'call-2', name: 'graph', content: 'second result' },
+        { role: 'user', content: 'continue' },
+      ],
+      tools: [
+        { name: 'code', parameters: { type: 'object', properties: {} } },
+        { name: 'graph', parameters: { type: 'object', properties: {} } },
+      ],
+      toolChoice: 'auto',
+      maxTokens: 1024,
+    });
+
+    const assistantMessages = sentMessages(capture).filter(
+      (message) => message.role === 'assistant'
+    );
+    expect(assistantMessages.map((message) => message.reasoning_content)).toEqual([
+      'first reasoning',
+      'second reasoning',
+    ]);
+  });
+
+  it('converts DeepSeek text function calls into executable tool calls for declared tools', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+    mockDeepSeekFetch(capture, {
+      choices: [
+        {
+          message: {
+            content:
+              '<function_calls><invoke name="code"><parameter name="action">structure</parameter><parameter name="path">Sources/App.swift</parameter></invoke></function_calls>',
+            reasoning_content: 'need structure',
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+
+    const result = await transport.chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'inspect project' }],
+      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'required',
+      maxTokens: 1024,
+    });
+
+    expect(result.text).toBeNull();
+    expect(result.functionCalls).toEqual([
+      {
+        id: 'call_deepseek_compat_1',
+        name: 'code',
+        args: { action: 'structure', path: 'Sources/App.swift' },
+      },
+    ]);
   });
 });

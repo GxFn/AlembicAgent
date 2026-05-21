@@ -123,6 +123,21 @@ describe('ParameterGuard', () => {
       'reasoningEffort',
     ]);
   });
+
+  it('filters DeepSeek V4 thinking toolChoice while preserving tools', () => {
+    const deepseekV4 = new ModelRegistry().resolve('deepseek', 'deepseek-v4-pro');
+    if (!deepseekV4) {
+      throw new Error('DeepSeek V4 Pro model definition is missing');
+    }
+
+    const guarded = ParameterGuard.guard(deepseekV4, {
+      toolChoice: 'required',
+      maxTokens: 4096,
+    });
+
+    expect(guarded.toolChoice).toBeUndefined();
+    expect(guarded.filtered.map((item) => item.param)).toContain('toolChoice');
+  });
 });
 
 describe('AiProvider retry and error classification', () => {

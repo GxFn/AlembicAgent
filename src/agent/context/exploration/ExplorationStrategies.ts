@@ -34,6 +34,8 @@ export interface ExplorationMetrics {
   iteration: number;
   submitCount: number;
   memoryFindingCount: number;
+  evidenceToolCallCount: number;
+  totalToolCalls: number;
   searchRoundsInPhase: number;
   phaseRounds: number;
   roundsSinceSubmit: number;
@@ -60,7 +62,6 @@ export interface FullExplorationMetrics extends ExplorationMetrics {
   uniqueFiles: Set<string>;
   uniquePatterns: Set<string>;
   uniqueQueries: Set<string>;
-  totalToolCalls: number;
 }
 
 /** 转换规则 */
@@ -164,8 +165,8 @@ export function createBootstrapStrategy(isSkillOnly = false) {
  *
  * v2 改进: 支持探索饱和后的自然退出，避免耗尽全部轮次才进入总结：
  *   - SCAN 是无工具的 briefing/plan seed，不重复 deterministic snapshot 的项目扫描
- *   - EXPLORE 阶段在 40% 预算后从 required 降级为 auto，允许 LLM 自然输出文本
- *   - EXPLORE→VERIFY 新增 onTextResponse=true，文本回复即可触发转换
+ *   - EXPLORE 阶段只有在已取得真实代码证据后，才允许 40% 预算后降级为 auto
+ *   - EXPLORE→VERIFY 的文本转换必须已有代码证据，避免纯自然语言分析空转
  *   - EXPLORE→VERIFY 新增 consecutiveIdleRounds 检测（LLM 连续无工具调用=分析完成）
  *   - VERIFY→RECORD 阈值从 80% 降至 75%，VERIFY 只允许证据校验类工具调用
  *   - RECORD 是 required note_finding-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
@@ -180,19 +181,22 @@ export const STRATEGY_ANALYST = {
     },
     'EXPLORE→VERIFY': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
-        m.searchRoundsInPhase >= Math.floor(b.maxIterations * 0.6) ||
-        m.roundsSinceNewInfo >= 3 ||
-        (m.iteration >= Math.floor(b.maxIterations * 0.4) && m.roundsSinceNewInfo >= 2) ||
-        m.consecutiveIdleRounds >= 2,
+        m.evidenceToolCallCount > 0 &&
+        (m.searchRoundsInPhase >= Math.floor(b.maxIterations * 0.6) ||
+          m.roundsSinceNewInfo >= 3 ||
+          (m.iteration >= Math.floor(b.maxIterations * 0.4) && m.roundsSinceNewInfo >= 2) ||
+          m.consecutiveIdleRounds >= 2),
       onTextResponse: (m: ExplorationMetrics, b: ExplorationBudget) =>
-        m.iteration >= Math.floor(b.maxIterations * 0.4),
+        m.evidenceToolCallCount > 0 && m.iteration >= Math.floor(b.maxIterations * 0.4),
     },
     'VERIFY→RECORD': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
-        m.iteration >= Math.floor(b.maxIterations * 0.75) ||
-        m.roundsSinceNewInfo >= 2 ||
-        m.consecutiveIdleRounds >= 1,
-      onTextResponse: true,
+        (m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0) &&
+        (m.iteration >= Math.floor(b.maxIterations * 0.75) ||
+          m.roundsSinceNewInfo >= 2 ||
+          m.consecutiveIdleRounds >= 1),
+      onTextResponse: (m: ExplorationMetrics) =>
+        m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0,
     },
     'RECORD→SUMMARIZE': {
       onMetrics: (m: ExplorationMetrics) => m.memoryFindingCount >= 3,
@@ -210,7 +214,13 @@ export const STRATEGY_ANALYST = {
       return 'none';
     }
     if (phase === 'EXPLORE') {
+      if (m.evidenceToolCallCount === 0) {
+        return 'required';
+      }
       return m.iteration >= Math.floor(b.maxIterations * 0.4) ? 'auto' : 'required';
+    }
+    if (phase === 'VERIFY' && m.evidenceToolCallCount < 2 && m.memoryFindingCount === 0) {
+      return 'required';
     }
     return 'auto'; // VERIFY
   },

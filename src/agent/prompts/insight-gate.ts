@@ -656,9 +656,9 @@ export function buildRetryPrompt(reason: string) {
     'Analysis lacks structure':
       '请将分析组织成结构化的段落，使用编号列表或标题来区分不同的发现。每个发现应包含具体的文件路径和代码位置。',
     [REQUIRED_MEMORY_FINDING_SUGGESTION]:
-      '你的分析正文已有发现，但没有写入结构化证据记录。请调用 note_finding({ finding, evidence, importance })，至少记录 3 个核心发现；evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
+      '上一轮没有形成可验收的结构化证据记录。不要直接写总结；先用 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) 定位相关实现，再用 code({ action: "read" }) 验证至少 3 个文件；每确认一个核心发现就调用 note_finding({ finding, evidence, importance })，evidence 必须包含完整相对路径和行号，最后再输出报告。',
     [INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION]:
-      '结构化发现数量不足。请继续只调用 note_finding({ finding, evidence, importance })，至少补齐到 3 个核心发现；每个 evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
+      '结构化发现数量不足。先检查已有证据是否覆盖至少 3 个真实文件；如证据不足，继续用 code({ action: "read" }) 验证关键实现；随后调用 note_finding({ finding, evidence, importance }) 补齐到至少 3 个核心发现，每个 evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
   };
 
   return (

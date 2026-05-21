@@ -3,12 +3,13 @@
  *
  * V4 thinking 模式特殊处理：
  *   - thinking 模式下 temperature/top_p 无效
- *   - thinking 模式下 tool_choice 不支持
+ *   - thinking 模式支持 tools，但部分兼容路由会拒绝 tool_choice
  *   - reasoning_content 在带 tool_calls 的 assistant 消息中必须回传
  *   - max_tokens 自动提升以容纳 reasoning token
  */
 
 import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import { parseDeepSeekTextToolCalls } from '../deepseek-tool-call-compat.js';
 import { normalizeToolTranscriptForChatCompletions } from '../tool-transcript.js';
 import {
   LLMTransport,
@@ -133,7 +134,7 @@ export class DeepSeekTransport extends LLMTransport {
       request.abortSignal
     );
 
-    return this.#parseResponse(data);
+    return this.#parseResponse(data, request);
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -208,44 +209,24 @@ export class DeepSeekTransport extends LLMTransport {
   }
 
   /**
-   * V4 reasoning 投影: 确保消息满足 API 约束，同时剥离旧轮次的 reasoning 以节省 token。
+   * V4 reasoning 投影: 确保消息满足 API 约束。
    *
    * DeepSeek V4 API 规则:
-   *   - 带 tool_calls 的 assistant: reasoning_content 字段必须存在（允许为空字符串）
+   *   - 带 tool_calls 的 assistant: reasoning_content 字段必须回传
    *   - 不带 tool_calls 的 assistant: reasoning_content 会被 API 忽略
-   *
-   * 策略: 只保留最近 2 轮 tool-call assistant 的完整 reasoning，
-   *        更早的 tool-call assistant 设为空字符串，非 tool-call assistant 删除。
    */
   #projectV4Reasoning(messages: Array<Record<string, unknown>>): void {
-    const toolCallIndices: number[] = [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (
-        m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        (m.tool_calls as unknown[]).length > 0
-      ) {
-        toolCallIndices.push(i);
-      }
-    }
-
-    const preserveSet = new Set(toolCallIndices.slice(0, 2));
-
-    for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
+    for (const m of messages) {
       if (m.role !== 'assistant') {
         continue;
       }
 
       const hasToolCalls = Array.isArray(m.tool_calls) && (m.tool_calls as unknown[]).length > 0;
 
-      if (preserveSet.has(i)) {
+      if (hasToolCalls) {
         if (m.reasoning_content == null) {
           m.reasoning_content = '';
         }
-      } else if (hasToolCalls) {
-        m.reasoning_content = '';
       } else {
         delete m.reasoning_content;
       }
@@ -254,7 +235,7 @@ export class DeepSeekTransport extends LLMTransport {
 
   // ─── 响应解析 ──────────────────────────────────────
 
-  #parseResponse(data: Record<string, unknown>): TransportResponse {
+  #parseResponse(data: Record<string, unknown>, request: TransportRequest): TransportResponse {
     const choices = (data?.choices as Array<Record<string, unknown>>) || [];
     const choice = choices[0];
     const rawUsage = data?.usage as Record<string, unknown> | undefined;
@@ -302,6 +283,17 @@ export class DeepSeekTransport extends LLMTransport {
       if (functionCalls.length > 0) {
         return { text, functionCalls, usage, reasoningContent };
       }
+    }
+
+    const compatCalls = parseDeepSeekTextToolCalls(
+      text,
+      request.tools?.map((tool) => tool.name)
+    );
+    if (compatCalls.length > 0 && request.toolChoice && request.toolChoice !== 'none') {
+      console.warn(
+        `[DeepSeekTransport] converted ${compatCalls.length} text function call(s) into tool calls`
+      );
+      return { text: null, functionCalls: compatCalls, usage, reasoningContent };
     }
 
     return { text, functionCalls: null, usage, reasoningContent };
