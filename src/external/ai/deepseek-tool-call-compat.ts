@@ -4,9 +4,13 @@ const INVOKE_RE = /<invoke\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/invoke>/gi;
 const PARAM_RE = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
 
 /**
- * DeepSeek V4 在极少数 tool_choice 场景会把工具调用写成文本。
- * 这里只在调用方已经声明 allowed tools 时，把明确的 `<function_calls>` 文本
- * 转回真实 tool call；未知工具名一律丢弃，避免执行普通分析文本。
+ * DeepSeek V4 有时会把工具调用写成 `<function_calls>` 文本，而不是
+ * Chat Completions 原生 tool_calls。这里是兼容桥，不代表 native tool call
+ * 闭环已经成立；调用方必须通过 call id / 日志把 compat 路径和 native 路径
+ * 区分开，避免再用 memoryFindings 反推真实产出方式。
+ *
+ * 只有调用方已经声明 allowed tools 时才转译；未知工具名一律丢弃，
+ * 避免执行普通分析文本。
  */
 export function parseDeepSeekTextToolCalls(
   text: string | null | undefined,

@@ -73,7 +73,7 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     expect(String(assistant?.content)).toContain('tool calls converted to text');
   });
 
-  it('omits tool_choice for DeepSeek V4 thinking tool requests', async () => {
+  it('omits tool_choice for DeepSeek V4 tool requests even when required is requested', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     mockDeepSeekFetch(capture);
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
@@ -132,7 +132,7 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     ]);
   });
 
-  it('converts DeepSeek text function calls into executable tool calls for declared tools', async () => {
+  it('keeps text function-call parsing as compatibility, independent from required tool_choice', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
     mockDeepSeekFetch(capture, {
@@ -152,7 +152,7 @@ describe('DeepSeekTransport tool transcript preflight', () => {
       model: 'deepseek-v4-pro',
       messages: [{ role: 'user', content: 'inspect project' }],
       tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
-      toolChoice: 'required',
+      toolChoice: 'auto',
       maxTokens: 1024,
     });
 

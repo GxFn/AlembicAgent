@@ -123,7 +123,9 @@ export class DeepSeekTransport extends LLMTransport {
       }));
     }
 
-    if (request.toolChoice && !v4Thinking) {
+    // DeepSeek V4 tools 主路径不发送 tool_choice。公开集成与实测都表明 V4
+    // thinking 兼容路由可能用 reasoner 规则拒绝 required / named tool。
+    if (request.toolChoice && !isV4) {
       body.tool_choice = request.toolChoice;
     }
 

@@ -1024,6 +1024,15 @@ export class AgentRuntime {
       activeCalls = activeCalls.slice(0, MAX_TOOL_CALLS_PER_ITER);
     }
 
+    for (const fc of activeCalls) {
+      if (isNoteFindingFunctionCall(fc)) {
+        this.logger.info(
+          `[AgentRuntime] note_finding call received — source=${inferFunctionCallSource(fc)}, ` +
+            `tool=${fc.name}, callId=${fc.id}, phase=${tracker?.phase || 'unknown'}`
+        );
+      }
+    }
+
     // 追加 assistant 消息（含 DeepSeek V4 reasoningContent 透传）
     messages.appendAssistantWithToolCalls(
       llmResult.text || null,
@@ -1101,6 +1110,15 @@ export class AgentRuntime {
 
       const toolResultObj = toolResult as Record<string, unknown> | null;
       const toolSucceeded = envelope ? envelope.ok : !toolResultObj?.error;
+      if (isNoteFindingFunctionCall(fc)) {
+        const recorded = toolResultObj?.recorded === true;
+        const target = String(toolResultObj?.target || 'unknown');
+        this.logger.info(
+          `[AgentRuntime] note_finding call completed — source=${inferFunctionCallSource(fc)}, ` +
+            `tool=${fc.name}, callId=${fc.id}, phase=${tracker?.phase || 'unknown'}, ` +
+            `ok=${toolSucceeded}, recorded=${recorded}, target=${target}`
+        );
+      }
 
       this.bus.publish(
         AgentEvents.TOOL_CALL_END,
@@ -1707,6 +1725,21 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
       additionalProperties: false,
     },
   };
+}
+
+function inferFunctionCallSource(call: { id?: string }) {
+  // DeepSeek 文本兼容桥会生成 call_deepseek_compat_*。这类调用可以写入
+  // ActiveContext，但不能被当作 provider native tool_calls 证据。
+  return call.id?.startsWith('call_deepseek_compat_')
+    ? 'deepseek_text_compat'
+    : 'native_or_provider_tool_call';
+}
+
+function isNoteFindingFunctionCall(call: { name?: string; args?: Record<string, unknown> }) {
+  return (
+    call.name === 'note_finding' ||
+    (call.name === 'memory' && call.args?.action === 'note_finding')
+  );
 }
 
 export default AgentRuntime;

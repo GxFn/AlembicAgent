@@ -8,6 +8,9 @@ const BASE_DEEPSEEK_CAPS = {
   streaming: true,
 } as const;
 
+const V4_TOOL_CHOICE_REASON =
+  'DeepSeek V4 thinking 真实兼容路由会用 deepseek-reasoner 规则拒绝 tool_choice=required / named tool；主路径必须使用 tools + reasoning_content 回传，不依赖强制 tool_choice。';
+
 export const DEEPSEEK_MODELS: ModelDef[] = [
   // ── V4 (2026-04-24, 1M context, dual thinking/non-thinking) ──
   {
@@ -27,7 +30,7 @@ export const DEEPSEEK_MODELS: ModelDef[] = [
     },
     parameterConstraints: {
       temperature: { allowed: true, min: 0, max: 2 },
-      toolChoice: { allowed: true, disabledWhen: 'thinking' },
+      toolChoice: { allowed: false, reason: V4_TOOL_CHOICE_REASON },
       reasoningEffort: { allowed: true, allowedValues: ['high', 'max'] },
     },
   },
@@ -48,7 +51,7 @@ export const DEEPSEEK_MODELS: ModelDef[] = [
     },
     parameterConstraints: {
       temperature: { allowed: true, min: 0, max: 2 },
-      toolChoice: { allowed: true, disabledWhen: 'thinking' },
+      toolChoice: { allowed: false, reason: V4_TOOL_CHOICE_REASON },
       reasoningEffort: { allowed: true, allowedValues: ['high', 'max'] },
     },
   },

@@ -124,7 +124,7 @@ describe('ParameterGuard', () => {
     ]);
   });
 
-  it('filters DeepSeek V4 thinking toolChoice while preserving tools', () => {
+  it('filters DeepSeek V4 required tool_choice with an explicit protocol reason', () => {
     const deepseekV4 = new ModelRegistry().resolve('deepseek', 'deepseek-v4-pro');
     if (!deepseekV4) {
       throw new Error('DeepSeek V4 Pro model definition is missing');
@@ -137,6 +137,9 @@ describe('ParameterGuard', () => {
 
     expect(guarded.toolChoice).toBeUndefined();
     expect(guarded.filtered.map((item) => item.param)).toContain('toolChoice');
+    expect(guarded.filtered.find((item) => item.param === 'toolChoice')?.reason).toContain(
+      'reasoning_content'
+    );
   });
 });
 

@@ -219,8 +219,8 @@ export class DeepSeekProvider extends AiProvider {
       }
 
       // 通过 ParameterGuard 决定是否发送 tool_choice。
-      // DeepSeek V4 thinking 真实 API 兼容路由可能按 reasoner 拒绝 tool_choice，
-      // 所以 tools 保留、tool_choice 由 guard 过滤，避免 400 打断闭环。
+      // DeepSeek V4 tools 主路径不依赖 required / named tool_choice；
+      // 公开集成与实测都指向 tools + reasoning_content 回传才是稳定闭环。
       const modelDef = getModelRegistry().resolveOrCreate('deepseek', this.model);
       const guarded = ParameterGuard.guard(modelDef, { toolChoice });
       if (guarded.toolChoice) {

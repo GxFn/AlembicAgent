@@ -61,6 +61,8 @@ export interface ParameterConstraints {
 
 export interface ParameterRule<T> {
   allowed: boolean;
+  /** 过滤该参数时写入诊断日志的具体原因 */
+  reason?: string;
   /** 条件禁用 (如 'thinking' = thinking 模式下不允许) */
   disabledWhen?: string;
   defaultValue?: T;

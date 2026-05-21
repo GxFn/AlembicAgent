@@ -533,6 +533,9 @@ function buildQualityScores(
     suggestions.push('Findings lack file-level evidence');
   }
   const memoryFindingCount = options.memoryFindingCount ?? 0;
+  // memoryFindingCount 只代表 note_finding 已写入 ActiveContext 并可被
+  // QualityGate 消费；它不区分 provider native tool_calls 与 DeepSeek
+  // 文本兼容转译。产出方式必须看 AgentRuntime note_finding source 日志。
   if (memoryFindingCount === 0) {
     suggestions.push(REQUIRED_MEMORY_FINDING_SUGGESTION);
   } else if (memoryFindingCount < 3) {

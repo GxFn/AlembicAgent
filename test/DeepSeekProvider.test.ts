@@ -25,7 +25,7 @@ describe('DeepSeekProvider V4 tool calls', () => {
     vi.unstubAllGlobals();
   });
 
-  it('omits tool_choice for V4 thinking tool requests', async () => {
+  it('omits tool_choice for V4 tool requests even when required is requested', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     mockDeepSeekFetch(capture);
     const provider = new DeepSeekProvider({ apiKey: 'test-key', model: 'deepseek-v4-pro' });
@@ -41,7 +41,7 @@ describe('DeepSeekProvider V4 tool calls', () => {
     expect(capture.body?.tool_choice).toBeUndefined();
   });
 
-  it('converts DeepSeek text function calls into executable tool calls for declared tools', async () => {
+  it('keeps text function-call parsing as compatibility, independent from required tool_choice', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     mockDeepSeekFetch(capture, {
       choices: [
@@ -60,7 +60,7 @@ describe('DeepSeekProvider V4 tool calls', () => {
     const result = await provider.chatWithTools('inspect code', {
       messages: [{ role: 'user', content: 'inspect code' }],
       toolSchemas: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
-      toolChoice: 'required',
+      toolChoice: 'auto',
       maxTokens: 1024,
     });
 

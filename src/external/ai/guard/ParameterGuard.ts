@@ -123,7 +123,7 @@ export class ParameterGuard {
     if (!rule?.allowed) {
       out.filtered.push({
         param: 'toolChoice',
-        reason: `${model.displayName} 不支持 tool_choice`,
+        reason: rule?.reason ?? `${model.displayName} 不支持 tool_choice`,
         originalValue: raw.toolChoice,
       });
       return;
@@ -132,7 +132,7 @@ export class ParameterGuard {
     if (rule.disabledWhen === 'thinking' && isThinking) {
       out.filtered.push({
         param: 'toolChoice',
-        reason: `${model.displayName} thinking 模式下不支持 tool_choice`,
+        reason: rule.reason ?? `${model.displayName} thinking 模式下不支持 tool_choice`,
         originalValue: raw.toolChoice,
       });
       return;
