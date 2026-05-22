@@ -3,7 +3,8 @@
  *
  * 替代重型 V1 ToolRouter (含 GovernanceEngine / SchemaValidator / 5 Service 文件)。
  * 仅做: adapter 查找 → 分发执行 → 包装结果。
- * Dashboard / Terminal / Skill / Mac / Workflow / MCP 等平台适配器通过此路由执行。
+ * Dashboard / Terminal / Skill / Mac / Workflow / MCP-like 等宿主注入的 adapter
+ * 可通过此路由执行；具体 Codex MCP/channel/marketplace 交付不在本仓库实现。
  */
 
 import { randomUUID } from 'node:crypto';

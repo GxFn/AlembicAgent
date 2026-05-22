@@ -83,9 +83,15 @@ const BOUNDARY_ENTRIES = [
     area: 'host-agent-route',
     owner: 'host',
     publicSubpath: null,
-    summary: 'Codex MCP, marketplace, channel packaging, and host-agent route remain Plugin-owned.',
+    summary:
+      'Codex MCP server, marketplace, channel packaging, and host-agent route remain Plugin-owned; AlembicAgent only exposes internal runtime contracts.',
     agentOwns: [],
-    hostOwns: ['Codex MCP server', 'marketplace packaging', 'host-agent route policy'],
+    hostOwns: [
+      'Codex MCP server',
+      'marketplace packaging',
+      'channel delivery',
+      'host-agent route policy',
+    ],
   },
 ] as const satisfies readonly AgentRuntimeBoundaryEntry[];
 

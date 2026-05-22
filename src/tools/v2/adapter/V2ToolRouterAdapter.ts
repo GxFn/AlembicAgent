@@ -2,8 +2,8 @@
  * V2ToolRouterAdapter — V2 工具路由器适配到 V1 ToolRouterContract。
  *
  * 职责单一：只处理 V2 工具系统的核心 LLM 工具。
- * Dashboard Operations、MCP 工具、terminal sandbox 等宿主能力由各宿主注入 context，
- * 不在 AlembicAgent 内提供 concrete adapter。
+ * Dashboard Operations、MCP-like 工具、terminal sandbox 等宿主能力由各宿主注入 context，
+ * 不在 AlembicAgent 内提供 concrete adapter；Codex MCP/channel/marketplace 由 Plugin 承载。
  */
 
 import { randomUUID } from 'node:crypto';

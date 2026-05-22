@@ -7,7 +7,10 @@
  *
  *   - HTTP/SSE (Dashboard)  → AgentMessage { channel: 'http', ... }
  *   - CLI (终端)             → AgentMessage { channel: 'cli',  ... }
- *   - MCP (IDE 扩展)         → AgentMessage { channel: 'mcp',  ... }
+ *   - MCP (host adapter)     → AgentMessage { channel: 'mcp',  ... }
+ *
+ * 这里只保留 Agent 内部的消息归一化能力；具体 Codex MCP server、
+ * marketplace/channel 和 host-agent route 由 AlembicPlugin 或其它宿主实现。
  *
  * @module AgentMessage
  */
@@ -85,7 +88,7 @@ interface InternalMessageOptions {
   [key: string]: unknown;
 }
 
-/** MCP request shape */
+/** Normalized MCP-like request shape supplied by a host/plugin adapter. */
 interface McpRequest {
   prompt?: string;
   content?: string;
@@ -235,8 +238,8 @@ export class AgentMessage {
   }
 
   /**
-   * 从 MCP 请求构建
-   * @param mcpReq MCP tool call request
+   * 从宿主注入的 MCP-like 请求构建；不实现 Codex MCP server 或插件路由。
+   * @param mcpReq normalized tool call request
    * @param [replyFn] 回复函数
    */
   static fromMcp(mcpReq: McpRequest, replyFn?: ReplyFn) {
