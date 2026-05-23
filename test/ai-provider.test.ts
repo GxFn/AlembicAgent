@@ -4,11 +4,15 @@ import {
   AiProvider,
   type AiProviderConfig,
   AiProviderManager,
+  ClaudeProvider,
+  DeepSeekProvider,
+  GoogleGeminiProvider,
   getProviderConfig,
   type ManagedAiProvider,
   MockProvider,
   type ModelDef,
   ModelRegistry,
+  OpenAiProvider,
   ParameterGuard,
   PROVIDER_CONFIGS,
   type SwitchResult,
@@ -69,6 +73,60 @@ describe('AI provider public entrypoint', () => {
       provider: 'mock',
       apiModelId: 'dynamic-test',
     });
+  });
+});
+
+describe('AI provider credential guidance', () => {
+  async function captureMissingKeyError(run: () => Promise<unknown>) {
+    try {
+      await run();
+    } catch (err) {
+      return err as Error & {
+        code?: string;
+        provider?: string;
+        envVar?: string;
+        hostAction?: string;
+      };
+    }
+    throw new Error('Expected provider call to fail before network when API key is missing');
+  }
+
+  it('reports missing API keys with host-neutral metadata', async () => {
+    const cases = [
+      {
+        provider: 'openai',
+        envVar: 'ALEMBIC_OPENAI_API_KEY',
+        run: () => new OpenAiProvider({ apiKey: '' }).chat('hello'),
+      },
+      {
+        provider: 'claude',
+        envVar: 'ALEMBIC_CLAUDE_API_KEY',
+        run: () => new ClaudeProvider({ apiKey: '' }).chat('hello'),
+      },
+      {
+        provider: 'deepseek',
+        envVar: 'ALEMBIC_DEEPSEEK_API_KEY',
+        run: () => new DeepSeekProvider({ apiKey: '' }).chat('hello'),
+      },
+      {
+        provider: 'google',
+        envVar: 'ALEMBIC_GOOGLE_API_KEY',
+        run: () => new GoogleGeminiProvider({ apiKey: '' }).chat('hello'),
+      },
+    ];
+
+    for (const c of cases) {
+      const err = await captureMissingKeyError(c.run);
+      expect(err).toMatchObject({
+        code: 'API_KEY_MISSING',
+        provider: c.provider,
+        envVar: c.envVar,
+        hostAction: 'configure-provider-credential',
+      });
+      expect(err.message).toContain(c.envVar);
+      expect(err.message).not.toContain('Dashboard');
+      expect(err.message).not.toContain('AI Settings');
+    }
   });
 });
 

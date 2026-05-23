@@ -15,6 +15,7 @@ import {
   type ChatContext,
   type ChatWithToolsOptions,
   type ChatWithToolsResult,
+  createMissingApiKeyError,
   type StructuredOutputOptions,
   type ToolSchema,
   type UnifiedMessage,
@@ -469,11 +470,7 @@ export class GoogleGeminiProvider extends AiProvider {
     externalSignal?: AbortSignal
   ): Promise<ApiResponse> {
     if (!this.apiKey) {
-      const err = new Error(
-        'Google Gemini API Key 未配置。请在 Alembic Dashboard 的 AI Settings 中设置 API Key。'
-      );
-      (err as Error & { code: string }).code = 'API_KEY_MISSING';
-      throw err;
+      throw createMissingApiKeyError('Google Gemini', 'ALEMBIC_GOOGLE_API_KEY', 'google');
     }
 
     const controller = new AbortController();

@@ -866,13 +866,10 @@ export function limitToolResult(toolName: string, result: unknown, quota: ToolRe
     ) {
       if ((result as SearchResultLike).batchResults) {
         const limited: SearchResultLike = { ...(result as SearchResultLike) };
-        const perKeyChars = Math.floor(maxChars / Object.keys(limited.batchResults!).length);
-        for (const [key, sub] of Object.entries(limited.batchResults!)) {
-          limited.batchResults![key] = limitSearchResultObj(
-            sub,
-            Math.min(maxMatches, 3),
-            perKeyChars
-          );
+        const batchResults = limited.batchResults ?? {};
+        const perKeyChars = Math.floor(maxChars / Object.keys(batchResults).length);
+        for (const [key, sub] of Object.entries(batchResults)) {
+          batchResults[key] = limitSearchResultObj(sub, Math.min(maxMatches, 3), perKeyChars);
         }
         const raw = JSON.stringify(limited);
         return raw.length > maxChars ? `${raw.substring(0, maxChars)}\n... [batch truncated]` : raw;

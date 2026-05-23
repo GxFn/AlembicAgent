@@ -169,7 +169,7 @@ export class EvidenceCollector {
    * @param [round=0] 调用序号
    */
   processToolCall(toolCall: ToolCall, round = 0) {
-    const tool = toolCall.tool || toolCall.name;
+    const tool = toolCall.tool || toolCall.name || 'unknown';
     const rawArgs = toolCall.params || toolCall.args || {};
     // V2 tool calls nest real params under args.params — flatten for uniform access
     const nested =
@@ -207,7 +207,7 @@ export class EvidenceCollector {
     // 所有工具调用都记入探索日志
     this.#explorationLog.push({
       round,
-      tool: tool!,
+      tool,
       intent: this.#inferIntent(tool, args),
       resultSummary: this.#summarizeResult(tool, result),
       effective: hasResult && this.#isEffective(tool, result),
@@ -379,26 +379,6 @@ export class EvidenceCollector {
 
     const summary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${summary}` : summary;
-  }
-
-  /** code.outline — 提取文件级摘要 → evidenceMap */
-  #extractFileSummary(args: ToolCallArgs, result: ToolResult) {
-    const filePath = args.filePath || (typeof result === 'object' && result?.filePath);
-    if (!filePath) {
-      return;
-    }
-
-    const entry = this.#getOrCreateEntry(filePath);
-    const summaryText =
-      typeof result === 'string'
-        ? result.substring(0, 200)
-        : result?.summary
-          ? String(result.summary).substring(0, 200)
-          : null;
-
-    if (summaryText) {
-      entry.summary = entry.summary ? `${entry.summary}; ${summaryText}` : summaryText;
-    }
   }
 
   // ─── 内部辅助 ─────────────────────────────────────────
@@ -583,7 +563,7 @@ export class EvidenceCollector {
         const batchKeys = Object.keys(result.batchResults || {});
         if (batchKeys.length > 0) {
           const total = batchKeys.reduce(
-            (s, k) => s + (result.batchResults![k]?.matches?.length || 0),
+            (s, k) => s + (result.batchResults?.[k]?.matches?.length || 0),
             0
           );
           return `${total} matches across ${batchKeys.length} patterns`;

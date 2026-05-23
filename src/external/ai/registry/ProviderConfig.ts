@@ -2,7 +2,7 @@
  * ProviderConfig — Provider 配置集中定义
  *
  * 替代 LlmConfigModal.tsx 和 ai.ts 中分散的硬编码 provider 列表。
- * Dashboard 和 API 路由直接消费此配置。
+ * Agent runtime、API 路由和具体宿主 UI 可消费此配置；UI 文案由宿主侧渲染。
  */
 
 import type { ProviderConfig } from './model-defs.js';

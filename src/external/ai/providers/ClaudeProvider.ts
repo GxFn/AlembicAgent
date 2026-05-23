@@ -21,6 +21,7 @@ import {
   type ChatContext,
   type ChatWithToolsOptions,
   type ChatWithToolsResult,
+  createMissingApiKeyError,
   type ToolSchema,
   type UnifiedMessage,
 } from '../AiProvider.js';
@@ -327,11 +328,7 @@ export class ClaudeProvider extends AiProvider {
     externalSignal?: AbortSignal
   ): Promise<ApiResponse> {
     if (!this.apiKey) {
-      const err = new Error(
-        'Claude API Key 未配置。请在 Alembic Dashboard 的 AI Settings 中设置 API Key。'
-      ) as Error & { code: string };
-      err.code = 'API_KEY_MISSING';
-      throw err;
+      throw createMissingApiKeyError('Claude', 'ALEMBIC_CLAUDE_API_KEY', 'claude');
     }
 
     const controller = new AbortController();

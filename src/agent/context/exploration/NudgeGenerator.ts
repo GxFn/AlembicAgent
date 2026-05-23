@@ -360,7 +360,7 @@ export class NudgeGenerator {
     // Planning 进度附加
     if (strategy.enablePlanning) {
       const plan = trace?.getPlan?.();
-      if (plan && plan.steps && plan.steps.length > 0) {
+      if (plan?.steps && plan.steps.length > 0) {
         const doneCount = plan.steps.filter((s: { status: string }) => s.status === 'done').length;
         parts.push(`\n📋 计划进度: ${doneCount}/${plan.steps.length} 步骤已完成`);
       }

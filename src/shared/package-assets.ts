@@ -1,12 +1,11 @@
 /**
  * Alembic package asset paths.
  *
- * Core owns generic package-root primitives; this adapter keeps Alembic-owned
- * Agent-owned asset paths anchored to the `@alembic/agent` package.
+ * Core owns generic package-root primitives. AlembicAgent currently only needs
+ * its own package root for local prompt/persona assets such as SOUL.md.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_FOLDER_NAMES } from '@alembic/core/workspace';
 
 const __dirname = import.meta.dirname;
 
@@ -34,24 +33,3 @@ function findAlembicPackageRoot(): string {
 }
 
 export const PACKAGE_ROOT = findAlembicPackageRoot();
-
-export const CONFIG_DIR = path.join(PACKAGE_ROOT, DEFAULT_FOLDER_NAMES.package.config);
-
-export const INTERNAL_SKILLS_DIR = path.join(
-  PACKAGE_ROOT,
-  DEFAULT_FOLDER_NAMES.package.internalSkills
-);
-
-export const INJECTABLE_SKILLS_DIR = path.join(
-  PACKAGE_ROOT,
-  DEFAULT_FOLDER_NAMES.package.injectableSkills
-);
-
-/** @deprecated Use INJECTABLE_SKILLS_DIR for product builtin skills. */
-export const SKILLS_DIR = INJECTABLE_SKILLS_DIR;
-
-export const TEMPLATES_DIR = path.join(PACKAGE_ROOT, DEFAULT_FOLDER_NAMES.package.templates);
-
-export const RESOURCES_DIR = path.join(PACKAGE_ROOT, DEFAULT_FOLDER_NAMES.package.resources);
-
-export const DASHBOARD_DIR = path.join(PACKAGE_ROOT, DEFAULT_FOLDER_NAMES.package.dashboard);

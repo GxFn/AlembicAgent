@@ -26,6 +26,29 @@ export interface AiProviderConfig {
   [key: string]: unknown;
 }
 
+/** Provider 缺 key 统一错误；只给 host-neutral 元数据，具体 UI 指引由宿主渲染。 */
+export interface MissingApiKeyError extends Error {
+  code: 'API_KEY_MISSING';
+  provider: string;
+  envVar: string;
+  hostAction: 'configure-provider-credential';
+}
+
+export function createMissingApiKeyError(
+  label: string,
+  envVar: string,
+  provider: string
+): MissingApiKeyError {
+  const err = new Error(
+    `${label} API Key 未配置。请在宿主环境或 Alembic 运行配置中设置 ${envVar}。`
+  ) as MissingApiKeyError;
+  err.code = 'API_KEY_MISSING';
+  err.provider = provider;
+  err.envVar = envVar;
+  err.hostAction = 'configure-provider-credential';
+  return err;
+}
+
 /** 对话历史条目 */
 export interface ChatHistoryEntry {
   role: 'user' | 'assistant';

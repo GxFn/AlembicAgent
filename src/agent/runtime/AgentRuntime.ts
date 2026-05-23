@@ -664,7 +664,7 @@ export class AgentRuntime {
     }
 
     // 压缩检查 — 委托 BudgetController
-    const budgetCtrl = ctx.budgetController!;
+    const budgetCtrl = requireBudgetController(ctx);
     const compactResult = budgetCtrl.runCompactionCycle();
     if (compactResult.level > 0) {
       this.logger.info(
@@ -772,7 +772,7 @@ export class AgentRuntime {
     compactResult?: { level: number; removed: number }
   ): Promise<LLMResult | null> {
     // L4 compaction: session 预算压力下执行 LLM-based 摘要压缩
-    const budgetCtrl = ctx.budgetController!;
+    const budgetCtrl = requireBudgetController(ctx);
     if (budgetCtrl.pendingL4) {
       const l4Result = await budgetCtrl.executeL4IfPending(
         this.aiProvider as unknown as Parameters<typeof budgetCtrl.executeL4IfPending>[0],
@@ -1009,10 +1009,13 @@ export class AgentRuntime {
     const trace = describeLoopCall(ctx, this.#modelRef);
     // AbortError — 外部中止信号已触发，不计入错误计数，立即退出
     if (ctx.abortSignal?.aborted) {
-      this.logger.info(`[AgentRuntime] ⛔ abortSignal fired during LLM call — exiting ${formatLoopTrace(trace)}`, {
-        ...trace,
-        abortReason: stringifyAbortReason(ctx.abortSignal.reason),
-      });
+      this.logger.info(
+        `[AgentRuntime] ⛔ abortSignal fired during LLM call — exiting ${formatLoopTrace(trace)}`,
+        {
+          ...trace,
+          abortReason: stringifyAbortReason(ctx.abortSignal.reason),
+        }
+      );
       ctx.diagnostics?.recordCancelReason('abort_signal');
       ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal fired during LLM call' });
       return null;
@@ -1028,7 +1031,9 @@ export class AgentRuntime {
 
     // 熔断器感知
     if (aiErr.code === 'CIRCUIT_OPEN') {
-      this.logger.warn(`[AgentRuntime] 🛑 circuit breaker OPEN — breaking to summary ${formatLoopTrace(trace)}`);
+      this.logger.warn(
+        `[AgentRuntime] 🛑 circuit breaker OPEN — breaking to summary ${formatLoopTrace(trace)}`
+      );
       if (!ctx.isSystem) {
         ctx.lastReply = `抱歉，AI 服务暂时不可用（${aiErr.message}）。请稍后重试，或检查 API 配置。`;
       }
@@ -1037,7 +1042,9 @@ export class AgentRuntime {
 
     // 2-strike 策略
     if (ctx.consecutiveAiErrors >= 2) {
-      this.logger.warn(`[AgentRuntime] 🛑 2 consecutive AI errors — breaking to summary ${formatLoopTrace(trace)}`);
+      this.logger.warn(
+        `[AgentRuntime] 🛑 2 consecutive AI errors — breaking to summary ${formatLoopTrace(trace)}`
+      );
       ctx.messages.resetToPromptOnly();
       if (!ctx.isSystem) {
         ctx.lastReply = `抱歉，AI 服务暂时不可用（${aiErr.message}）。请稍后重试，或检查 API 配置。`;
@@ -1104,7 +1111,7 @@ export class AgentRuntime {
     const roundToolNames: string[] = [];
 
     // 并行工具调用共享 token 预算 — 委托 BudgetController
-    const budgetCtrl = ctx.budgetController!;
+    const budgetCtrl = requireBudgetController(ctx);
     const toolBudget = budgetCtrl.getToolBudget(activeCalls.length);
 
     // 执行每个工具
@@ -1796,9 +1803,15 @@ function inferFunctionCallSource(call: { id?: string }) {
 
 function isNoteFindingFunctionCall(call: { name?: string; args?: Record<string, unknown> }) {
   return (
-    call.name === 'note_finding' ||
-    (call.name === 'memory' && call.args?.action === 'note_finding')
+    call.name === 'note_finding' || (call.name === 'memory' && call.args?.action === 'note_finding')
   );
+}
+
+function requireBudgetController(ctx: LoopContext): BudgetController {
+  if (!ctx.budgetController) {
+    throw new Error('[AgentRuntime] BudgetController is missing after loop initialization.');
+  }
+  return ctx.budgetController;
 }
 
 function describeLoopCall(ctx: LoopContext, modelRef: string): Record<string, unknown> {

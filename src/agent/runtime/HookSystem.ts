@@ -56,9 +56,7 @@ export interface HookPayloadMap {
 
 // ── Hook Handler Types ──
 
-export type HookHandler<E extends HookEvent> = (
-  payload: HookPayloadMap[E]
-) => void | undefined | boolean | Promise<void | undefined | boolean>;
+export type HookHandler<E extends HookEvent> = (payload: HookPayloadMap[E]) => unknown;
 
 interface HookEntry<E extends HookEvent = HookEvent> {
   event: E;
@@ -98,10 +96,11 @@ export class HookSystem {
       id,
     };
 
-    if (!this.#hooks.has(event)) {
-      this.#hooks.set(event, []);
+    let list = this.#hooks.get(event);
+    if (!list) {
+      list = [];
+      this.#hooks.set(event, list);
     }
-    const list = this.#hooks.get(event)!;
     list.push(entry as unknown as HookEntry);
     list.sort((a, b) => a.priority - b.priority);
 

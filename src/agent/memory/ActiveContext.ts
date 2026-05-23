@@ -765,8 +765,6 @@ export class ActiveContext {
     const resultStr = typeof result === 'string' ? result : JSON.stringify(result || '');
     meta.resultSize = resultStr.length;
 
-    const resultObj =
-      typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : null;
     const envelope = isToolResultEnvelope(result) ? result : null;
 
     switch (toolName) {

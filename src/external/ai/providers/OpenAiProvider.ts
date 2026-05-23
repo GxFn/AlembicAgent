@@ -13,6 +13,7 @@ import {
   type ChatContext,
   type ChatWithToolsOptions,
   type ChatWithToolsResult,
+  createMissingApiKeyError,
   type StructuredOutputOptions,
   type ToolSchema,
   type UnifiedMessage,
@@ -297,11 +298,7 @@ export class OpenAiProvider extends AiProvider {
     externalSignal?: AbortSignal
   ): Promise<ApiResponse> {
     if (!this.apiKey) {
-      const err = new Error(
-        'OpenAI API Key 未配置。请在 Alembic Dashboard 的 AI Settings 中设置 API Key。'
-      ) as Error & { code: string };
-      err.code = 'API_KEY_MISSING';
-      throw err;
+      throw createMissingApiKeyError('OpenAI', 'ALEMBIC_OPENAI_API_KEY', 'openai');
     }
 
     const controller = new AbortController();

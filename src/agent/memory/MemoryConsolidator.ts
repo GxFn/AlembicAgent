@@ -13,7 +13,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
-import type { MemoryInput } from './MemoryStore.js';
 import { MemoryStore } from './MemoryStore.js';
 
 // ─── 类型定义 ──────────────────────────────────────────

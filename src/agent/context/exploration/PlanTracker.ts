@@ -386,7 +386,7 @@ export class PlanTracker {
 
       // 策略 1: 关键词匹配
       if ((step.keywords?.length ?? 0) > 0) {
-        const matched = step.keywords!.some((kw: string) => argsStr.includes(kw.toLowerCase()));
+        const matched = step.keywords?.some((kw: string) => argsStr.includes(kw.toLowerCase()));
         if (matched) {
           return step;
         }

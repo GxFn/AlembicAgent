@@ -102,7 +102,7 @@ export function autoDetectProvider() {
   }
 
   logger.info(
-    '[AiFactory] 未找到任何 AI API Key，AI 功能已跳过。请在 Alembic Dashboard 的 AI Settings 中配置 API Key。'
+    '[AiFactory] 未找到任何 AI API Key，AI 功能已跳过。请在宿主环境或 Alembic 运行配置中配置对应 provider 的 API Key。'
   );
   return createProvider({ provider: 'mock' });
 }

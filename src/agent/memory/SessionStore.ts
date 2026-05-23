@@ -284,10 +284,12 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   addEvidence(filePath: string, evidence: Omit<Finding, 'timestamp'>) {
-    if (!this.#evidenceStore.has(filePath)) {
-      this.#evidenceStore.set(filePath, []);
+    let evidenceList = this.#evidenceStore.get(filePath);
+    if (!evidenceList) {
+      evidenceList = [];
+      this.#evidenceStore.set(filePath, evidenceList);
     }
-    this.#evidenceStore.get(filePath)!.push({
+    evidenceList.push({
       ...evidence,
       timestamp: Date.now(),
     });
@@ -321,10 +323,12 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   addSubmittedCandidate(dimId: string, candidate: Omit<CandidateSummary, 'dimId'>) {
-    if (!this.#submittedCandidates.has(dimId)) {
-      this.#submittedCandidates.set(dimId, []);
+    let candidates = this.#submittedCandidates.get(dimId);
+    if (!candidates) {
+      candidates = [];
+      this.#submittedCandidates.set(dimId, candidates);
     }
-    this.#submittedCandidates.get(dimId)!.push({
+    candidates.push({
       dimId,
       title: candidate.title || '',
       subTopic: candidate.subTopic || '',

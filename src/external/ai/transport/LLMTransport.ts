@@ -12,7 +12,12 @@
  *   - 业务逻辑 (上下文窗口管理、工具路由等) → AgentRuntime
  */
 
-import type { TokenUsage, ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import {
+  createMissingApiKeyError,
+  type TokenUsage,
+  type ToolSchema,
+  type UnifiedMessage,
+} from '../AiProvider.js';
 import type { ProviderId } from '../registry/model-defs.js';
 
 // ─── Transport Request ──────────────────────────────────
@@ -142,8 +147,24 @@ export abstract class LLMTransport {
 
   protected requireApiKey(label: string): void {
     if (!this.apiKey) {
-      const err = Object.assign(new Error(`${label} API Key 未配置`), { code: 'API_KEY_MISSING' });
-      throw err;
+      throw createMissingApiKeyError(label, providerEnvVar(this.providerId), this.providerId);
     }
+  }
+}
+
+function providerEnvVar(providerId: ProviderId): string {
+  switch (providerId) {
+    case 'openai':
+      return 'ALEMBIC_OPENAI_API_KEY';
+    case 'deepseek':
+      return 'ALEMBIC_DEEPSEEK_API_KEY';
+    case 'claude':
+      return 'ALEMBIC_CLAUDE_API_KEY';
+    case 'google':
+      return 'ALEMBIC_GOOGLE_API_KEY';
+    case 'ollama':
+      return 'ALEMBIC_OLLAMA_API_KEY';
+    case 'mock':
+      return 'ALEMBIC_AI_API_KEY';
   }
 }

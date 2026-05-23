@@ -40,7 +40,7 @@ import {
 import { NudgeGenerator } from './exploration/NudgeGenerator.js';
 import type { ActiveTrace } from './exploration/PlanTracker.js';
 import { PlanTracker } from './exploration/PlanTracker.js';
-import { isSearchAction, SEARCH_TOOLS, SignalDetector } from './exploration/SignalDetector.js';
+import { isSearchAction, SignalDetector } from './exploration/SignalDetector.js';
 
 // ─── 本地类型 ──────────────────────────────────────────
 

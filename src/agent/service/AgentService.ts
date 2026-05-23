@@ -6,8 +6,6 @@ import { AgentProfileRegistry } from '../profiles/AgentProfileRegistry.js';
 import { AgentStageFactoryRegistry } from '../profiles/AgentStageFactoryRegistry.js';
 import { AgentMessage, Channel } from '../runtime/AgentMessage.js';
 import type {
-  AgentProfileOverride,
-  AgentProfileRef,
   AgentRunInput,
   AgentRunResult,
   AgentRunStatus,

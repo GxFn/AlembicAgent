@@ -7,7 +7,7 @@
  * 消费方:
  *   - ContextWindow: 查询上下文窗口
  *   - ParameterGuard: 查询参数约束
- *   - Dashboard/Routes: 查询可用模型列表
+ *   - Host UI / Routes: 查询可用模型列表
  *   - Provider: 查询模型推理能力
  */
 

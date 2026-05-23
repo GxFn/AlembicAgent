@@ -28,6 +28,7 @@ import {
   type ChatContext,
   type ChatWithToolsOptions,
   type ChatWithToolsResult,
+  createMissingApiKeyError,
   type StructuredOutputOptions,
   type ToolSchema,
   type UnifiedMessage,
@@ -449,11 +450,7 @@ export class DeepSeekProvider extends AiProvider {
     externalSignal?: AbortSignal
   ): Promise<ApiResponse> {
     if (!this.apiKey) {
-      const err = new Error(
-        'DeepSeek API Key 未配置。请在 Alembic Dashboard 的 AI Settings 中设置 API Key。'
-      ) as Error & { code: string };
-      err.code = 'API_KEY_MISSING';
-      throw err;
+      throw createMissingApiKeyError('DeepSeek', 'ALEMBIC_DEEPSEEK_API_KEY', 'deepseek');
     }
 
     const controller = new AbortController();
