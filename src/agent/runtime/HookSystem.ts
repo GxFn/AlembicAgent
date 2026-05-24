@@ -14,6 +14,7 @@
  */
 
 import Logger from '@alembic/core/logging';
+import type { AgentProgressProcessEvent } from './AgentRuntimeTypes.js';
 
 // ── Hook Events ──
 
@@ -38,19 +39,35 @@ export interface HookPayloadMap {
   'agent:iteration:after': { iteration: number; hadToolCalls: boolean; hadText: boolean };
   'agent:exit': { reason: string; iteration: number; detail?: string };
   'agent:finalize': { reply: string; iterations: number; toolCallCount: number };
-  'tool:execute:before': { toolId: string; args: Record<string, unknown>; callId: string };
-  'tool:execute:after': { toolId: string; ok: boolean; durationMs: number; callId: string };
+  'tool:execute:before': {
+    toolId: string;
+    args: Record<string, unknown>;
+    callId: string;
+    processEvent?: AgentProgressProcessEvent;
+  };
+  'tool:execute:after': {
+    toolId: string;
+    ok: boolean;
+    durationMs: number;
+    callId: string;
+    processEvent?: AgentProgressProcessEvent;
+  };
   'context:compact:before': { level: number; usage: number };
   'context:compact:after': { level: number; removed: number; usage: number };
   'exploration:phase_transition': { from: string; to: string; iteration: number };
   'exploration:budget_warning': { used: number; total: number; iteration: number };
-  'llm:call:before': { iteration: number; toolChoice: string };
+  'llm:call:before': {
+    iteration: number;
+    toolChoice: string;
+    processEvent?: AgentProgressProcessEvent;
+  };
   'llm:call:after': {
     iteration: number;
     hasToolCalls: boolean;
     hasText: boolean;
     inputTokens?: number;
     outputTokens?: number;
+    processEvent?: AgentProgressProcessEvent;
   };
 }
 
@@ -241,7 +258,12 @@ export function registerDefaultHooks(
   hookSystem.on('llm:call:before', (p) => {
     bus.publish(
       'llm:call:start',
-      { iteration: p.iteration, toolChoice: p.toolChoice },
+      {
+        agentId,
+        iteration: p.iteration,
+        toolChoice: p.toolChoice,
+        ...(p.processEvent ? { processEvent: p.processEvent } : {}),
+      },
       { source: agentId }
     );
   });
@@ -253,6 +275,7 @@ export function registerDefaultHooks(
         hasToolCalls: p.hasToolCalls,
         hasText: p.hasText,
         usage: { inputTokens: p.inputTokens, outputTokens: p.outputTokens },
+        ...(p.processEvent ? { processEvent: p.processEvent } : {}),
       },
       { source: agentId }
     );

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
-import { DiagnosticsCollector } from '../src/agent/runtime/index.js';
+import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
+import type { ToolResultEnvelope } from '../src/tools/core/ToolResultEnvelope.js';
 
 function createRuntimeForReactLoop() {
   const chatWithTools = vi.fn(async () => ({
@@ -32,7 +33,187 @@ function createExitingTracker() {
   };
 }
 
+function createToolEnvelope(
+  toolId: string,
+  text: string,
+  structuredContent?: Record<string, unknown>
+): ToolResultEnvelope {
+  return {
+    ok: true,
+    toolId,
+    callId: 'tool-call-1',
+    startedAt: new Date().toISOString(),
+    durationMs: 3,
+    status: 'success',
+    text,
+    structuredContent,
+    diagnostics: {
+      degraded: false,
+      fallbackUsed: false,
+      warnings: [],
+      timedOutStages: [],
+      blockedTools: [],
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: 0,
+      gateFailures: [],
+    },
+    trust: {
+      source: 'internal',
+      sanitized: true,
+      containsUntrustedText: false,
+      containsSecrets: false,
+    },
+  };
+}
+
 describe('agent runtime forced summary suppression', () => {
+  it('emits developer-safe LLM input and output process payloads', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi.fn(async () => ({
+      text: 'Visible model output with token=visibleOutputSecret12345',
+      functionCalls: [],
+      reasoningContent: 'hidden chain of thought must not appear',
+      usage: { inputTokens: 11, outputTokens: 7 },
+    }));
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      onProgress: (event) => progress.push(event),
+    });
+
+    await runtime.reactLoop('analyze with apiKey=visibleInputSecret12345', {
+      source: 'system',
+      context: {
+        pipelinePhase: 'analyze',
+        dimensionId: 'architecture',
+        targetName: 'Architecture',
+      },
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const processEvents = progress
+      .map((event) => event.processEvent)
+      .filter((event): event is NonNullable<ProgressEvent['processEvent']> => !!event);
+    const llmInput = processEvents.find((event) => event.kind === 'llm.input');
+    const llmOutput = processEvents.find((event) => event.kind === 'llm.output');
+
+    expect(llmInput).toMatchObject({
+      kind: 'llm.input',
+      sourceClass: 'developer-facing',
+      displayPolicy: 'full',
+      retention: 'job-retained',
+      phase: 'analyze',
+      dimensionId: 'architecture',
+      targetName: 'Architecture',
+    });
+    expect(llmInput?.content?.text).toContain('analyze with apiKey=');
+    expect(llmInput?.content?.text).not.toContain('visibleInputSecret12345');
+    expect(llmOutput?.content?.text).toContain('Visible model output');
+    expect(llmOutput?.content?.text).not.toContain('visibleOutputSecret12345');
+    expect(llmOutput?.content?.text).not.toContain('hidden chain of thought');
+    expect(llmOutput?.metadata?.hasHiddenReasoningContent).toBe(true);
+  });
+
+  it('emits developer-safe reflection and tool process payloads', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [
+          {
+            id: 'call_1',
+            name: 'demo_tool',
+            args: { query: 'hello', apiKey: 'visibleToolArgSecret12345' },
+          },
+        ],
+        usage: { inputTokens: 3, outputTokens: 2 },
+      })
+      .mockResolvedValueOnce({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      });
+    const toolRouter = {
+      execute: vi.fn(async () =>
+        createToolEnvelope('demo_tool', 'tool result token=visibleToolResultSecret12345', {
+          ok: true,
+        })
+      ),
+    };
+    const tracker = {
+      phase: 'EXPLORE',
+      pipelineType: 'analyst',
+      isGracefulExit: false,
+      isHardExit: false,
+      iteration: 0,
+      totalSubmits: 0,
+      tick: vi.fn(),
+      shouldExit: vi.fn(() => false),
+      getNudge: vi.fn(() => ({
+        type: 'reflection',
+        text: 'Reflect on current evidence with token=visibleNudgeSecret12345',
+      })),
+      getPhaseContext: vi.fn(() => null),
+      getToolChoice: vi.fn(() => 'auto'),
+      recordToolCall: vi.fn(() => ({ isNew: true })),
+      getMetrics: vi.fn(() => ({ uniqueFiles: 0, uniquePatterns: 0 })),
+      endRound: vi.fn(() => null),
+      onTextResponse: vi.fn(() => ({
+        isFinalAnswer: true,
+        needsDigestNudge: false,
+        shouldContinue: false,
+        nudge: null,
+      })),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: toolRouter as never,
+      container: {
+        get: (name: string) => {
+          if (name !== 'capabilityCatalog') {
+            return undefined;
+          }
+          return {
+            toToolSchemas: () => [
+              { name: 'demo_tool', description: 'Demo', parameters: { type: 'object' } },
+            ],
+          };
+        },
+      } as never,
+      capabilities: [],
+      additionalTools: ['demo_tool'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      onProgress: (event) => progress.push(event),
+    });
+
+    await runtime.reactLoop('call demo tool', {
+      source: 'system',
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+
+    const processEvents = progress
+      .map((event) => event.processEvent)
+      .filter((event): event is NonNullable<ProgressEvent['processEvent']> => !!event);
+    const reflection = processEvents.find((event) => event.kind === 'llm.reflection');
+    const toolEvents = processEvents.filter((event) => event.kind === 'tool');
+
+    expect(reflection?.content?.text).toContain('Reflect on current evidence');
+    expect(reflection?.content?.text).not.toContain('visibleNudgeSecret12345');
+    expect(toolEvents.map((event) => event.title)).toEqual(
+      expect.arrayContaining(['Tool call started: demo_tool', 'Tool call completed: demo_tool'])
+    );
+    expect(toolEvents[0]?.content?.text).not.toContain('visibleToolArgSecret12345');
+    expect(toolEvents[1]?.content?.text).not.toContain('visibleToolResultSecret12345');
+    expect(toolEvents[1]?.severity).toBe('success');
+  });
+
   it('exposes a direct note_finding tool schema when memory is available', async () => {
     const capture: { toolSchemas?: Array<Record<string, unknown>> } = {};
     const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {

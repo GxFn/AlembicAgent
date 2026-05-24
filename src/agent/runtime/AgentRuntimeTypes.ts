@@ -41,6 +41,57 @@ export interface LLMResult {
   reasoningContent?: string | null;
 }
 
+export type AgentProgressProcessEventKind = 'llm.input' | 'llm.reflection' | 'llm.output' | 'tool';
+
+export type AgentProgressProcessEventSourceClass =
+  | 'developer-facing'
+  | 'machine-only'
+  | 'raw-provider'
+  | 'secret'
+  | 'hidden-reasoning';
+
+export type AgentProgressProcessEventDisplayPolicy = 'full' | 'summary-only' | 'hidden';
+
+export type AgentProgressProcessEventRetention = 'transient' | 'job-retained' | 'artifact-retained';
+
+export type AgentProgressProcessEventSeverity = 'info' | 'success' | 'warning' | 'error';
+
+export type AgentProgressProcessEventContentRole =
+  | 'system'
+  | 'developer'
+  | 'user'
+  | 'assistant'
+  | 'tool';
+
+export interface AgentProgressProcessEventContent {
+  data?: unknown;
+  language?: string | null;
+  mimeType?: string | null;
+  role?: AgentProgressProcessEventContentRole | null;
+  text: string | null;
+}
+
+/**
+ * Developer-safe Agent progress payload that hosts can map to Core JobProcessEvent.
+ * The Agent supplies semantic content; the host recorder owns jobId, sequence and storage.
+ */
+export interface AgentProgressProcessEvent {
+  content?: AgentProgressProcessEventContent | null;
+  correlationId?: string | null;
+  createdAt: string;
+  dimensionId?: string | null;
+  displayPolicy: AgentProgressProcessEventDisplayPolicy;
+  kind: AgentProgressProcessEventKind;
+  metadata?: Record<string, unknown>;
+  phase?: string | null;
+  retention: AgentProgressProcessEventRetention;
+  severity: AgentProgressProcessEventSeverity;
+  sourceClass: AgentProgressProcessEventSourceClass;
+  summary?: string | null;
+  targetName?: string | null;
+  title: string;
+}
+
 /** AI error with optional circuit breaker code */
 export interface AiError extends Error {
   code?: string;
@@ -52,6 +103,7 @@ export interface ProgressEvent {
   agentId: string;
   preset: string;
   timestamp: number;
+  processEvent?: AgentProgressProcessEvent;
   [key: string]: unknown;
 }
 

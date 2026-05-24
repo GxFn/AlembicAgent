@@ -39,6 +39,7 @@ import { PolicyEngine } from '../policies/index.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
 import type { AgentMessage } from './AgentMessage.js';
 import {
+  type AgentProgressProcessEvent,
   type AgentResult,
   type AiError,
   type FileCacheEntry,
@@ -67,6 +68,14 @@ import { createToolPipeline } from './ToolExecutionPipeline.js';
 export type {
   AgentDiagnostics,
   AgentDiagnosticWarning,
+  AgentProgressProcessEvent,
+  AgentProgressProcessEventContent,
+  AgentProgressProcessEventContentRole,
+  AgentProgressProcessEventDisplayPolicy,
+  AgentProgressProcessEventKind,
+  AgentProgressProcessEventRetention,
+  AgentProgressProcessEventSeverity,
+  AgentProgressProcessEventSourceClass,
   AgentResult,
   AiError,
   FileCacheEntry,
@@ -652,6 +661,20 @@ export class AgentRuntime {
           type: nudge.type,
           isReplan: nudge.type === 'planning' && ctx.iteration > 1,
         });
+        if (isDeveloperVisibleReflectionNudge(nudge.type)) {
+          this.#emitProcessProgress(
+            buildAgentProcessEvent(ctx, {
+              kind: 'llm.reflection',
+              title: `Agent ${nudge.type} nudge`,
+              summary: `Injected ${nudge.type} nudge before LLM call`,
+              content: {
+                role: 'developer',
+                text: redactDeveloperText(nudge.text),
+              },
+              metadata: { nudgeType: nudge.type },
+            })
+          );
+        }
         this.logger.info(`[AgentRuntime] 💬 injected ${nudge.type} nudge at iter ${ctx.iteration}`);
         const _dim = ctx.sharedState?._dimensionMeta?.id || '';
         if (process.env.ALEMBIC_MCP_MODE !== '1') {
@@ -801,15 +824,6 @@ export class AgentRuntime {
       }
     }
 
-    this.bus.publish(
-      AgentEvents.LLM_CALL_START,
-      {
-        agentId: this.id,
-        iteration: ctx.iteration,
-      },
-      { source: this.id }
-    );
-
     const llmTrace = describeLoopCall(ctx, this.#modelRef);
     const llmStartedAt = Date.now();
     if (ctx.abortSignal?.aborted) {
@@ -847,6 +861,35 @@ export class AgentRuntime {
       const unifiedTools = effectiveToolSchemas as
         | import('#external/ai/AiProvider.js').ToolSchema[]
         | undefined;
+      const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
+        kind: 'llm.input',
+        title: 'LLM input prepared',
+        summary: `Sending ${unifiedMessages.length} message(s) to ${this.#modelRef}`,
+        content: {
+          role: 'developer',
+          text: formatDeveloperVisibleLlmInput({
+            systemPrompt: effectiveSystemPrompt,
+            messages: unifiedMessages,
+            dynamicContext,
+            tools: unifiedTools,
+          }),
+        },
+        metadata: {
+          ...llmTrace,
+          route: this.#gateway ? 'gateway' : 'provider',
+          messageCount: unifiedMessages.length,
+          hasDynamicContext: Boolean(dynamicContext),
+          requestedToolChoice: toolChoice,
+          effectiveToolChoice: unifiedTools ? toolChoice : 'none',
+          toolSchemaNames: (unifiedTools || []).map((schema) => schema.name),
+        },
+      });
+      this.#hookSystem.emitSync('llm:call:before', {
+        iteration: ctx.iteration,
+        toolChoice: unifiedTools ? toolChoice : 'none',
+        processEvent: llmInputProcessEvent,
+      });
+      this.#emitProcessProgress(llmInputProcessEvent);
 
       // 冷启动链路里第一轮经常最慢；必须先打印“请求已发出”的结构化日志，
       // 否则 Dashboard 只能看到 filling，不知道是在等模型、走重试还是已经被 abort。
@@ -912,16 +955,38 @@ export class AgentRuntime {
       });
     }
 
-    this.bus.publish(
-      AgentEvents.LLM_CALL_END,
-      {
-        agentId: this.id,
-        hasToolCalls: !!llmResult.functionCalls?.length,
-        hasText: !!llmResult.text,
-        usage: llmResult.usage,
+    const llmOutputProcessEvent = buildAgentProcessEvent(ctx, {
+      kind: 'llm.output',
+      title: 'LLM output received',
+      summary: llmResult.text?.trim()
+        ? `Received ${llmResult.text.length} visible character(s)`
+        : `Received ${(llmResult.functionCalls || []).length} tool call(s) without visible text`,
+      content: {
+        role: 'assistant',
+        text: redactDeveloperText(
+          llmResult.text || formatFunctionCallsForDeveloperContent(llmResult.functionCalls || [])
+        ),
       },
-      { source: this.id }
-    );
+      metadata: {
+        ...llmTrace,
+        durationMs: Date.now() - llmStartedAt,
+        hasText: Boolean(llmResult.text),
+        textChars: llmResult.text?.length || 0,
+        functionCallCount: llmResult.functionCalls?.length || 0,
+        functionCallNames: (llmResult.functionCalls || []).map((call) => call.name).slice(0, 12),
+        hasHiddenReasoningContent: Boolean(llmResult.reasoningContent),
+        usage: llmResult.usage || null,
+      },
+    });
+    this.#hookSystem.emitSync('llm:call:after', {
+      iteration: ctx.iteration,
+      hasToolCalls: !!llmResult.functionCalls?.length,
+      hasText: !!llmResult.text,
+      inputTokens: llmResult.usage?.inputTokens,
+      outputTokens: llmResult.usage?.outputTokens,
+      processEvent: llmOutputProcessEvent,
+    });
+    this.#emitProcessProgress(llmOutputProcessEvent);
     this.logger.info(`[AgentRuntime] LLM call complete ${formatLoopTrace(llmTrace)}`, {
       ...llmTrace,
       durationMs: Date.now() - llmStartedAt,
@@ -1122,13 +1187,34 @@ export class AgentRuntime {
         return true;
       }
 
-      this.#emitProgress('tool_call', { tool: fc.name, args: fc.args });
+      const toolStartProcessEvent = buildAgentProcessEvent(ctx, {
+        kind: 'tool',
+        title: `Tool call started: ${fc.name}`,
+        summary: `Calling tool ${fc.name}`,
+        content: {
+          role: 'developer',
+          text: formatToolCallForDeveloperContent(fc.name, fc.args),
+        },
+        correlationId: fc.id,
+        metadata: {
+          toolName: fc.name,
+          callId: fc.id,
+          source: inferFunctionCallSource(fc),
+          status: 'started',
+        },
+      });
+      this.#emitProgress('tool_call', {
+        tool: fc.name,
+        args: fc.args,
+        processEvent: toolStartProcessEvent,
+      });
 
       this.bus.publish(
         AgentEvents.TOOL_CALL_START,
         {
           agentId: this.id,
           tool: fc.name,
+          processEvent: toolStartProcessEvent,
         },
         { source: this.id }
       );
@@ -1138,6 +1224,7 @@ export class AgentRuntime {
         toolId: fc.name,
         args: fc.args,
         callId: fc.id,
+        processEvent: toolStartProcessEvent,
       });
 
       // 通过 Pipeline 执行 (safety → cache → execute → observe → track → trace → dedup)
@@ -1186,25 +1273,6 @@ export class AgentRuntime {
         );
       }
 
-      this.bus.publish(
-        AgentEvents.TOOL_CALL_END,
-        {
-          agentId: this.id,
-          tool: fc.name,
-          durationMs,
-          success: toolSucceeded,
-        },
-        { source: this.id }
-      );
-
-      // HookSystem: tool:execute:after
-      this.#hookSystem.emitSync('tool:execute:after', {
-        toolId: fc.name,
-        ok: toolSucceeded,
-        durationMs,
-        callId: fc.id,
-      });
-
       // 工具结果格式化 — 使用 BudgetController 分摊配额
       const remaining = budgetCtrl.getRemainingToolBudget();
       const toolQuota = {
@@ -1228,6 +1296,28 @@ export class AgentRuntime {
         roundSubmitCount++;
       }
 
+      const toolEndProcessEvent = buildAgentProcessEvent(ctx, {
+        kind: 'tool',
+        title: `Tool call ${toolSucceeded ? 'completed' : 'failed'}: ${fc.name}`,
+        summary: `${fc.name} ${toolSucceeded ? 'completed' : 'failed'} in ${durationMs}ms`,
+        content: {
+          role: 'tool',
+          text: redactDeveloperText(resultStr),
+        },
+        correlationId: fc.id,
+        severity: toolSucceeded ? 'success' : 'error',
+        metadata: {
+          toolName: fc.name,
+          callId: fc.id,
+          status: toolSucceeded ? 'ok' : 'error',
+          durationMs,
+          resultSize: resultStr.length,
+          cacheHit: metadata.cacheHit,
+          cacheMiss: (metadata as ToolMetadata).cacheMiss === true,
+          source: inferFunctionCallSource(fc),
+        },
+      });
+
       // 进度回调 (tool_end 需要 resultStr.length)
       this.#emitProgress('tool_end', {
         tool: fc.name,
@@ -1238,6 +1328,28 @@ export class AgentRuntime {
             ? envelope.text
             : (toolResultObj?.error as string | undefined) || undefined,
         resultSize: resultStr.length,
+        processEvent: toolEndProcessEvent,
+      });
+
+      this.bus.publish(
+        AgentEvents.TOOL_CALL_END,
+        {
+          agentId: this.id,
+          tool: fc.name,
+          durationMs,
+          success: toolSucceeded,
+          processEvent: toolEndProcessEvent,
+        },
+        { source: this.id }
+      );
+
+      // HookSystem: tool:execute:after
+      this.#hookSystem.emitSync('tool:execute:after', {
+        toolId: fc.name,
+        ok: toolSucceeded,
+        durationMs,
+        callId: fc.id,
+        processEvent: toolEndProcessEvent,
       });
 
       // 追加 tool result
@@ -1749,6 +1861,11 @@ export class AgentRuntime {
     }
     this.bus.publish(AgentEvents.PROGRESS, event, { source: this.id });
   }
+
+  /** 发送可被 Alembic recorder 消费的 developer-safe 过程事件。 */
+  #emitProcessProgress(processEvent: AgentProgressProcessEvent) {
+    this.#emitProgress('agent_process_event', { processEvent });
+  }
 }
 
 function withDirectNoteFindingSchema(
@@ -1791,6 +1908,154 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
       additionalProperties: false,
     },
   };
+}
+
+function buildAgentProcessEvent(
+  ctx: LoopContext,
+  input: {
+    kind: AgentProgressProcessEvent['kind'];
+    title: string;
+    summary?: string | null;
+    content?: AgentProgressProcessEvent['content'];
+    correlationId?: string | null;
+    metadata?: Record<string, unknown>;
+    phase?: string | null;
+    retention?: AgentProgressProcessEvent['retention'];
+    severity?: AgentProgressProcessEvent['severity'];
+    sourceClass?: AgentProgressProcessEvent['sourceClass'];
+    displayPolicy?: AgentProgressProcessEvent['displayPolicy'];
+  }
+): AgentProgressProcessEvent {
+  const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
+  const phase =
+    input.phase ??
+    stringValue(ctx.context?.pipelinePhase) ??
+    (typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : null);
+  return {
+    content: input.content ?? null,
+    correlationId: input.correlationId ?? null,
+    createdAt: new Date().toISOString(),
+    dimensionId:
+      stringValue(dimensionMeta.id) ||
+      stringValue(ctx.context?.dimensionId) ||
+      stringValue(ctx.context?.dimId) ||
+      null,
+    displayPolicy: input.displayPolicy ?? 'full',
+    kind: input.kind,
+    metadata: sanitizeDeveloperData({
+      iteration: ctx.iteration,
+      source: ctx.source,
+      ...(input.metadata || {}),
+    }) as Record<string, unknown>,
+    phase,
+    retention: input.retention ?? 'job-retained',
+    severity: input.severity ?? 'info',
+    sourceClass: input.sourceClass ?? 'developer-facing',
+    summary: input.summary ?? null,
+    targetName:
+      stringValue(dimensionMeta.label) ||
+      stringValue(dimensionMeta.targetName) ||
+      stringValue(ctx.context?.targetName) ||
+      null,
+    title: input.title,
+  };
+}
+
+function formatDeveloperVisibleLlmInput({
+  systemPrompt,
+  messages,
+  dynamicContext,
+  tools,
+}: {
+  systemPrompt: string;
+  messages: import('#external/ai/AiProvider.js').UnifiedMessage[];
+  dynamicContext: string | null;
+  tools?: import('#external/ai/AiProvider.js').ToolSchema[];
+}): string {
+  const sections = [`## System prompt\n${redactDeveloperText(systemPrompt)}`];
+  if (dynamicContext) {
+    sections.push(`## Dynamic context\n${redactDeveloperText(dynamicContext)}`);
+  }
+  sections.push(
+    [
+      '## Messages',
+      ...messages.map((message, index) => formatDeveloperVisibleMessage(message, index)),
+    ].join('\n\n')
+  );
+  if (tools?.length) {
+    sections.push(
+      [
+        '## Available tools',
+        ...tools.map((tool) =>
+          [
+            `### ${tool.name}`,
+            tool.description ? redactDeveloperText(tool.description) : null,
+            tool.parameters ? `parameters:\n${stringifyDeveloperData(tool.parameters)}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n')
+        ),
+      ].join('\n\n')
+    );
+  }
+  return sections.join('\n\n');
+}
+
+function formatDeveloperVisibleMessage(
+  message: import('#external/ai/AiProvider.js').UnifiedMessage,
+  index: number
+): string {
+  const lines = [`### ${index + 1}. ${message.role}${message.name ? ` (${message.name})` : ''}`];
+  if (message.content) {
+    lines.push(redactDeveloperText(message.content));
+  }
+  if (message.toolCalls?.length) {
+    lines.push(
+      [
+        'tool calls:',
+        ...message.toolCalls.map(
+          (call) => `- ${call.name} (${call.id}): ${stringifyDeveloperData(call.args)}`
+        ),
+      ].join('\n')
+    );
+  }
+  if (message.toolCallId) {
+    lines.push(`toolCallId: ${message.toolCallId}`);
+  }
+  if (message.reasoningContent) {
+    lines.push('[hidden reasoning omitted]');
+  }
+  return lines.join('\n');
+}
+
+function formatFunctionCallsForDeveloperContent(
+  calls: Array<{ id?: string; name?: string; args?: Record<string, unknown> }>
+): string {
+  if (calls.length === 0) {
+    return '';
+  }
+  return [
+    'LLM requested tool calls:',
+    ...calls.map(
+      (call) =>
+        `- ${call.name || 'unknown'} (${call.id || 'no-id'}): ${stringifyDeveloperData(call.args || {})}`
+    ),
+  ].join('\n');
+}
+
+function formatToolCallForDeveloperContent(toolName: string, args: Record<string, unknown>) {
+  return [`tool: ${toolName}`, 'args:', stringifyDeveloperData(args)].join('\n');
+}
+
+function isDeveloperVisibleReflectionNudge(type: string): boolean {
+  return (
+    type === 'reflection' ||
+    type === 'planning' ||
+    type === 'replan' ||
+    type === 'convergence' ||
+    type === 'digest' ||
+    type === 'continue'
+  );
 }
 
 function inferFunctionCallSource(call: { id?: string }) {
@@ -1861,6 +2126,54 @@ function stringifyAbortReason(reason: unknown): string | null {
     return null;
   }
   return String(reason);
+}
+
+function stringifyDeveloperData(value: unknown): string {
+  try {
+    if (value === undefined) {
+      return 'undefined';
+    }
+    return JSON.stringify(sanitizeDeveloperData(value), null, 2);
+  } catch {
+    return redactDeveloperText(String(value));
+  }
+}
+
+function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === 'string') {
+    return redactDeveloperText(value);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (seen.has(value)) {
+    return '[Circular]';
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeDeveloperData(item, seen));
+  }
+  const record = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(record)) {
+    output[key] = isSecretLikeKey(key) ? '[redacted]' : sanitizeDeveloperData(child, seen);
+  }
+  return output;
+}
+
+function redactDeveloperText(text: string): string {
+  return text
+    .replace(/sk-(?:proj-)?[A-Za-z0-9_-]{12,}/g, '[redacted-api-key]')
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-google-api-key]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[redacted-token]')
+    .replace(
+      /((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*["']?)[^\s"',}]{8,}/gi,
+      '$1[redacted]'
+    );
+}
+
+function isSecretLikeKey(key: string): boolean {
+  return /api[_-]?key|token|secret|password|authorization|credential/i.test(key);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
