@@ -39,6 +39,8 @@ export interface LLMResult {
   };
   /** DeepSeek V4 thinking 推理内容，需原样回传 */
   reasoningContent?: string | null;
+  /** Provider stop reason，例如 DeepSeek/OpenAI finish_reason */
+  finishReason?: string | null;
 }
 
 export type AgentProgressProcessEventKind = 'llm.input' | 'llm.reflection' | 'llm.output' | 'tool';

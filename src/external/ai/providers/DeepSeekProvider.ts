@@ -384,6 +384,7 @@ export class DeepSeekProvider extends AiProvider {
     }
 
     const message = choice.message;
+    const finishReason = typeof choice.finish_reason === 'string' ? choice.finish_reason : null;
     const text = message?.content || null;
     // 保留原始值: 空字符串也是合法的 reasoning_content，不能转成 null
     const reasoningContent = message?.reasoning_content ?? null;
@@ -409,7 +410,7 @@ export class DeepSeekProvider extends AiProvider {
         this.logger?.debug(
           `[DeepSeek] native function calls: ${functionCalls.map((fc: { name: string }) => fc.name).join(', ')}`
         );
-        return { text, functionCalls, usage, reasoningContent };
+        return { text, functionCalls, usage, reasoningContent, finishReason };
       }
     }
 
@@ -421,10 +422,10 @@ export class DeepSeekProvider extends AiProvider {
       this.logger?.warn(
         `[DeepSeek] converted ${compatCalls.length} text function call(s) into tool calls`
       );
-      return { text: null, functionCalls: compatCalls, usage, reasoningContent };
+      return { text: null, functionCalls: compatCalls, usage, reasoningContent, finishReason };
     }
 
-    return { text, functionCalls: null, usage, reasoningContent };
+    return { text, functionCalls: null, usage, reasoningContent, finishReason };
   }
 
   #emitUsage(data: ApiResponse) {

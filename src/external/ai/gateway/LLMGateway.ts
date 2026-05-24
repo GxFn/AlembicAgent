@@ -323,6 +323,7 @@ export class LLMGateway {
       functionCalls,
       usage,
       reasoningContent: response.reasoningContent ?? undefined,
+      finishReason: response.finishReason ?? undefined,
     };
   }
 }

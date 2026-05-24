@@ -52,6 +52,8 @@ export interface TransportResponse {
   functionCalls: TransportFunctionCall[] | null;
   usage: TokenUsage | null;
   reasoningContent?: string | null;
+  /** Provider stop reason，例如 Chat Completions choice.finish_reason */
+  finishReason?: string | null;
 }
 
 // ─── Transport Config ───────────────────────────────────

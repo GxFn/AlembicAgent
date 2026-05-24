@@ -46,6 +46,7 @@ describe('DeepSeekProvider V4 tool calls', () => {
     mockDeepSeekFetch(capture, {
       choices: [
         {
+          finish_reason: 'length',
           message: {
             content:
               '<function_calls><invoke name="code"><parameter name="action">read</parameter><parameter name="path">Sources/App.swift</parameter></invoke></function_calls>',
@@ -65,6 +66,7 @@ describe('DeepSeekProvider V4 tool calls', () => {
     });
 
     expect(result.text).toBeNull();
+    expect(result.finishReason).toBe('length');
     expect(result.functionCalls).toEqual([
       {
         id: 'call_deepseek_compat_1',

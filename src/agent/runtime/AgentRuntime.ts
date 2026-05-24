@@ -944,27 +944,25 @@ export class AgentRuntime {
       });
     }
 
+    const llmOutputDeveloperText = redactDeveloperText(
+      llmResult.text || formatFunctionCallsForDeveloperContent(llmResult.functionCalls || [])
+    );
+    const llmOutputCompleteness = buildLlmOutputCompletenessMetadata(
+      llmResult,
+      llmOutputDeveloperText
+    );
     const llmOutputProcessEvent = buildAgentProcessEvent(ctx, {
       kind: 'llm.output',
       title: 'LLM output received',
-      summary: llmResult.text?.trim()
-        ? `Received ${llmResult.text.length} visible character(s)`
-        : `Received ${(llmResult.functionCalls || []).length} tool call(s) without visible text`,
+      summary: formatLlmOutputSummary(llmResult, llmOutputCompleteness),
       content: {
         role: 'assistant',
-        text: redactDeveloperText(
-          llmResult.text || formatFunctionCallsForDeveloperContent(llmResult.functionCalls || [])
-        ),
+        text: llmOutputDeveloperText,
       },
       metadata: {
         ...llmTrace,
         durationMs: Date.now() - llmStartedAt,
-        hasText: Boolean(llmResult.text),
-        textChars: llmResult.text?.length || 0,
-        functionCallCount: llmResult.functionCalls?.length || 0,
-        functionCallNames: (llmResult.functionCalls || []).map((call) => call.name).slice(0, 12),
-        hasHiddenReasoningContent: Boolean(llmResult.reasoningContent),
-        usage: llmResult.usage || null,
+        ...llmOutputCompleteness,
       },
     });
     this.#hookSystem.emitSync('llm:call:after', {
@@ -979,12 +977,7 @@ export class AgentRuntime {
     this.logger.info(`[AgentRuntime] LLM call complete ${formatLoopTrace(llmTrace)}`, {
       ...llmTrace,
       durationMs: Date.now() - llmStartedAt,
-      hasText: Boolean(llmResult.text),
-      textChars: llmResult.text?.length || 0,
-      functionCallCount: llmResult.functionCalls?.length || 0,
-      functionCallNames: (llmResult.functionCalls || []).map((call) => call.name).slice(0, 12),
-      hasReasoningContent: Boolean(llmResult.reasoningContent),
-      usage: llmResult.usage || null,
+      ...llmOutputCompleteness,
     });
 
     // 空响应重试
@@ -1971,6 +1964,103 @@ function buildAgentProcessEvent(
   };
 }
 
+type LlmOutputCompletenessStatus =
+  | 'visible_text_complete'
+  | 'provider_truncated'
+  | 'tool_call_only'
+  | 'empty';
+
+interface LlmOutputCompletenessMetadata extends Record<string, unknown> {
+  agentOutputTruncated: false;
+  developerContentChars: number;
+  finishReason: string | null;
+  functionCallCount: number;
+  functionCallNames: string[];
+  hasHiddenReasoningContent: boolean;
+  hasText: boolean;
+  outputCompleteness: LlmOutputCompletenessStatus;
+  providerOutputTruncated: boolean;
+  reasoningContentChars: number;
+  reasoningContentOmitted: boolean;
+  reasoningTokens: number;
+  textChars: number;
+  usage: LLMResult['usage'] | null;
+  visibleTextChars: number;
+}
+
+function buildLlmOutputCompletenessMetadata(
+  result: LLMResult,
+  developerContentText: string
+): LlmOutputCompletenessMetadata {
+  const visibleTextChars = result.text?.length || 0;
+  const functionCalls = result.functionCalls || [];
+  const functionCallCount = functionCalls.length;
+  const reasoningContentChars = result.reasoningContent?.length || 0;
+  const reasoningTokens = result.usage?.reasoningTokens || 0;
+  const finishReason = normalizeFinishReason(result.finishReason);
+  const providerOutputTruncated = isProviderOutputTruncated(finishReason);
+  const reasoningContentOmitted = reasoningContentChars > 0 || reasoningTokens > 0;
+
+  return {
+    agentOutputTruncated: false,
+    developerContentChars: developerContentText.length,
+    finishReason,
+    functionCallCount,
+    functionCallNames: functionCalls.map((call) => call.name).slice(0, 12),
+    hasHiddenReasoningContent: reasoningContentOmitted,
+    hasText: visibleTextChars > 0,
+    outputCompleteness: providerOutputTruncated
+      ? 'provider_truncated'
+      : visibleTextChars > 0
+        ? 'visible_text_complete'
+        : functionCallCount > 0
+          ? 'tool_call_only'
+          : 'empty',
+    providerOutputTruncated,
+    reasoningContentChars,
+    reasoningContentOmitted,
+    reasoningTokens,
+    textChars: visibleTextChars,
+    usage: result.usage || null,
+    visibleTextChars,
+  };
+}
+
+function formatLlmOutputSummary(
+  result: LLMResult,
+  metadata: LlmOutputCompletenessMetadata
+): string {
+  if (metadata.visibleTextChars > 0) {
+    const suffixes: string[] = [];
+    if (metadata.providerOutputTruncated) {
+      suffixes.push(`provider stopped with finishReason=${metadata.finishReason}`);
+    }
+    if (metadata.reasoningContentOmitted) {
+      suffixes.push('hidden reasoning omitted');
+    }
+    return [`Received ${metadata.visibleTextChars} visible character(s)`, ...suffixes].join('; ');
+  }
+  if (metadata.functionCallCount > 0) {
+    return `Received ${metadata.functionCallCount} tool call(s) without visible text`;
+  }
+  if (metadata.providerOutputTruncated) {
+    return `Received empty LLM output; provider stopped with finishReason=${metadata.finishReason}`;
+  }
+  return `Received empty LLM output from provider${result.finishReason ? ` (finishReason=${result.finishReason})` : ''}`;
+}
+
+function normalizeFinishReason(finishReason: string | null | undefined): string | null {
+  const normalized = finishReason?.trim();
+  return normalized ? normalized : null;
+}
+
+function isProviderOutputTruncated(finishReason: string | null): boolean {
+  if (!finishReason) {
+    return false;
+  }
+  return new Set(['length', 'max_tokens', 'max_output_tokens']).has(finishReason.toLowerCase());
+}
+
 function buildSemanticNudgeProcessEvent(
   ctx: LoopContext,
   nudge: { type: string; text: string },
@@ -2282,7 +2372,10 @@ function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): un
   const record = value as Record<string, unknown>;
   const output: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(record)) {
-    output[key] = isSecretLikeKey(key) ? '[redacted]' : sanitizeDeveloperData(child, seen);
+    output[key] =
+      isSecretLikeKey(key) && !isSafeNumericTokenMetric(key, child)
+        ? '[redacted]'
+        : sanitizeDeveloperData(child, seen);
   }
   return output;
 }
@@ -2300,6 +2393,14 @@ function redactDeveloperText(text: string): string {
 
 function isSecretLikeKey(key: string): boolean {
   return /api[_-]?key|token|secret|password|authorization|credential/i.test(key);
+}
+
+function isSafeNumericTokenMetric(key: string, value: unknown): boolean {
+  // token 计数是 developer-safe 观测指标；真实 token / key 字段仍按 isSecretLikeKey 脱敏。
+  return (
+    typeof value === 'number' &&
+    /^(inputTokens|outputTokens|totalTokens|reasoningTokens|cacheHitTokens)$/.test(key)
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

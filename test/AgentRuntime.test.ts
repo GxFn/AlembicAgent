@@ -70,11 +70,14 @@ function createToolEnvelope(
 describe('agent runtime forced summary suppression', () => {
   it('emits developer-safe LLM input and output process payloads', async () => {
     const progress: ProgressEvent[] = [];
+    const visibleText = `${'Visible model output '.repeat(350)}token=visibleOutputSecret12345`;
+    const reasoningContent = 'hidden chain of thought must not appear';
     const chatWithTools = vi.fn(async () => ({
-      text: 'Visible model output with token=visibleOutputSecret12345',
+      text: visibleText,
       functionCalls: [],
-      reasoningContent: 'hidden chain of thought must not appear',
-      usage: { inputTokens: 11, outputTokens: 7 },
+      reasoningContent,
+      finishReason: 'length',
+      usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 3 },
     }));
     const runtime = new AgentRuntime({
       aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
@@ -113,9 +116,22 @@ describe('agent runtime forced summary suppression', () => {
     expect(llmInput?.content?.text).toContain('analyze with apiKey=');
     expect(llmInput?.content?.text).not.toContain('visibleInputSecret12345');
     expect(llmOutput?.content?.text).toContain('Visible model output');
+    expect(llmOutput?.content?.text?.length).toBeGreaterThan(6000);
     expect(llmOutput?.content?.text).not.toContain('visibleOutputSecret12345');
     expect(llmOutput?.content?.text).not.toContain('hidden chain of thought');
-    expect(llmOutput?.metadata?.hasHiddenReasoningContent).toBe(true);
+    expect(llmOutput?.summary).toContain('provider stopped with finishReason=length');
+    expect(llmOutput?.metadata).toMatchObject({
+      agentOutputTruncated: false,
+      finishReason: 'length',
+      hasHiddenReasoningContent: true,
+      outputCompleteness: 'provider_truncated',
+      providerOutputTruncated: true,
+      reasoningContentChars: reasoningContent.length,
+      reasoningContentOmitted: true,
+      reasoningTokens: 3,
+      textChars: visibleText.length,
+      visibleTextChars: visibleText.length,
+    });
   });
 
   it('emits developer-safe reflection and tool process payloads', async () => {

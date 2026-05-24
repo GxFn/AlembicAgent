@@ -113,6 +113,8 @@ export interface ChatWithToolsResult {
   usage?: TokenUsage | null;
   /** DeepSeek V4 thinking 模式返回的推理内容 */
   reasoningContent?: string | null;
+  /** Provider stop reason，例如 DeepSeek/OpenAI finish_reason */
+  finishReason?: string | null;
 }
 
 /** Token 用量 */

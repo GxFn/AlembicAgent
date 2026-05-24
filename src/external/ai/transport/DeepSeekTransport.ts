@@ -261,6 +261,7 @@ export class DeepSeekTransport extends LLMTransport {
     }
 
     const message = choice.message as Record<string, unknown>;
+    const finishReason = typeof choice.finish_reason === 'string' ? choice.finish_reason : null;
     const text = (message?.content as string) || null;
     const reasoningContent = (message?.reasoning_content as string) ?? null;
 
@@ -283,7 +284,7 @@ export class DeepSeekTransport extends LLMTransport {
         }));
 
       if (functionCalls.length > 0) {
-        return { text, functionCalls, usage, reasoningContent };
+        return { text, functionCalls, usage, reasoningContent, finishReason };
       }
     }
 
@@ -295,10 +296,10 @@ export class DeepSeekTransport extends LLMTransport {
       console.warn(
         `[DeepSeekTransport] converted ${compatCalls.length} text function call(s) into tool calls`
       );
-      return { text: null, functionCalls: compatCalls, usage, reasoningContent };
+      return { text: null, functionCalls: compatCalls, usage, reasoningContent, finishReason };
     }
 
-    return { text, functionCalls: null, usage, reasoningContent };
+    return { text, functionCalls: null, usage, reasoningContent, finishReason };
   }
 
   #headers(): Record<string, string> {
