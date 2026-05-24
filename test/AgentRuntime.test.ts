@@ -145,6 +145,14 @@ describe('agent runtime forced summary suppression', () => {
         })
       ),
     };
+    const endRound = vi.fn(() =>
+      endRound.mock.calls.length === 1
+        ? {
+            type: 'transition',
+            text: '阶段切换: EXPLORE → SUMMARIZE',
+          }
+        : null
+    );
     const tracker = {
       phase: 'EXPLORE',
       pipelineType: 'analyst',
@@ -162,7 +170,7 @@ describe('agent runtime forced summary suppression', () => {
       getToolChoice: vi.fn(() => 'auto'),
       recordToolCall: vi.fn(() => ({ isNew: true })),
       getMetrics: vi.fn(() => ({ uniqueFiles: 0, uniquePatterns: 0 })),
-      endRound: vi.fn(() => null),
+      endRound,
       onTextResponse: vi.fn(() => ({
         isFinalAnswer: true,
         needsDigestNudge: false,
@@ -202,16 +210,143 @@ describe('agent runtime forced summary suppression', () => {
       .map((event) => event.processEvent)
       .filter((event): event is NonNullable<ProgressEvent['processEvent']> => !!event);
     const reflection = processEvents.find((event) => event.kind === 'llm.reflection');
+    const transition = processEvents.find(
+      (event) => event.metadata?.semanticKind === 'transition-nudge'
+    );
     const toolEvents = processEvents.filter((event) => event.kind === 'tool');
 
     expect(reflection?.content?.text).toContain('Reflect on current evidence');
     expect(reflection?.content?.text).not.toContain('visibleNudgeSecret12345');
+    expect(reflection?.metadata).toMatchObject({
+      nudgeType: 'reflection',
+      pipelineType: 'analyst',
+      semanticKind: 'reflection-nudge',
+    });
+    expect(transition?.title).toContain('阶段转换');
+    expect(transition?.content?.text).toContain('阶段切换');
+    expect(transition?.metadata).toMatchObject({
+      nudgeType: 'transition',
+      phase: 'EXPLORE',
+      pipelineType: 'analyst',
+      semanticKind: 'transition-nudge',
+    });
     expect(toolEvents.map((event) => event.title)).toEqual(
       expect.arrayContaining(['Tool call started: demo_tool', 'Tool call completed: demo_tool'])
     );
     expect(toolEvents[0]?.content?.text).not.toContain('visibleToolArgSecret12345');
     expect(toolEvents[1]?.content?.text).not.toContain('visibleToolResultSecret12345');
     expect(toolEvents[1]?.severity).toBe('success');
+  });
+
+  it('emits semantic digest and continue nudge process payloads', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: 'partial answer',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'needs one more pass',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'final answer',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      });
+    let textResponseCount = 0;
+    const tracker = {
+      phase: 'SUMMARIZE',
+      pipelineType: 'bootstrap',
+      isGracefulExit: false,
+      isHardExit: false,
+      iteration: 0,
+      totalSubmits: 0,
+      tick: vi.fn(),
+      shouldExit: vi.fn(() => false),
+      getNudge: vi.fn(() => null),
+      getPhaseContext: vi.fn(() => null),
+      getToolChoice: vi.fn(() => 'none'),
+      getMetrics: vi.fn(() => ({ uniqueFiles: 0, uniquePatterns: 0 })),
+      endRound: vi.fn(() => null),
+      onTextResponse: vi.fn(() => {
+        textResponseCount += 1;
+        if (textResponseCount === 1) {
+          return {
+            isFinalAnswer: false,
+            needsDigestNudge: true,
+            shouldContinue: false,
+            nudge:
+              '请输出 dimensionDigest JSON，包含 keyFindings，并忽略 apiKey=visibleDigestSecret12345',
+          };
+        }
+        if (textResponseCount === 2) {
+          return {
+            isFinalAnswer: false,
+            needsDigestNudge: false,
+            shouldContinue: true,
+            nudge: '继续验证剩余信号 token=visibleContinueSecret12345',
+          };
+        }
+        return {
+          isFinalAnswer: true,
+          needsDigestNudge: false,
+          shouldContinue: false,
+          nudge: null,
+        };
+      }),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      onProgress: (event) => progress.push(event),
+    });
+
+    await runtime.reactLoop('summarize semantic nudges', {
+      source: 'system',
+      context: {
+        dimensionId: 'domain',
+        targetName: 'Domain',
+      },
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+    });
+
+    const processEvents = progress
+      .map((event) => event.processEvent)
+      .filter((event): event is NonNullable<ProgressEvent['processEvent']> => !!event);
+    const digest = processEvents.find((event) => event.metadata?.semanticKind === 'digest-nudge');
+    const continueNudge = processEvents.find(
+      (event) => event.metadata?.semanticKind === 'continue-nudge'
+    );
+
+    expect(digest).toMatchObject({
+      kind: 'llm.reflection',
+      title: 'Agent 总结 Nudge',
+      dimensionId: 'domain',
+      targetName: 'Domain',
+    });
+    expect(digest?.content?.text).toContain('dimensionDigest');
+    expect(digest?.content?.text).not.toContain('visibleDigestSecret12345');
+    expect(digest?.metadata).toMatchObject({
+      nudgeType: 'digest',
+      pipelineType: 'bootstrap',
+      semanticKind: 'digest-nudge',
+    });
+    expect(continueNudge?.title).toBe('Agent 继续执行 Nudge');
+    expect(continueNudge?.content?.text).toContain('继续验证剩余信号');
+    expect(continueNudge?.content?.text).not.toContain('visibleContinueSecret12345');
+    expect(continueNudge?.metadata).toMatchObject({
+      nudgeType: 'continue',
+      pipelineType: 'bootstrap',
+      semanticKind: 'continue-nudge',
+    });
   });
 
   it('exposes a direct note_finding tool schema when memory is available', async () => {

@@ -662,18 +662,7 @@ export class AgentRuntime {
           isReplan: nudge.type === 'planning' && ctx.iteration > 1,
         });
         if (isDeveloperVisibleReflectionNudge(nudge.type)) {
-          this.#emitProcessProgress(
-            buildAgentProcessEvent(ctx, {
-              kind: 'llm.reflection',
-              title: `Agent ${nudge.type} nudge`,
-              summary: `Injected ${nudge.type} nudge before LLM call`,
-              content: {
-                role: 'developer',
-                text: redactDeveloperText(nudge.text),
-              },
-              metadata: { nudgeType: nudge.type },
-            })
-          );
+          this.#emitProcessProgress(buildSemanticNudgeProcessEvent(ctx, nudge));
         }
         this.logger.info(`[AgentRuntime] 💬 injected ${nudge.type} nudge at iter ${ctx.iteration}`);
         const _dim = ctx.sharedState?._dimensionMeta?.id || '';
@@ -1385,6 +1374,12 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] 📝 injected ${transitionNudge.type} nudge (${tracker.phase})`
         );
+        this.#emitProcessProgress(
+          buildSemanticNudgeProcessEvent(ctx, transitionNudge, {
+            phase: tracker.phase,
+            semanticKind: 'transition-nudge',
+          })
+        );
         const _dimT = ctx.sharedState?._dimensionMeta?.id || '';
         if (process.env.ALEMBIC_MCP_MODE !== '1') {
           process.stderr.write(
@@ -1503,6 +1498,9 @@ export class AgentRuntime {
           messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
           messages.appendUserNudge(digestNudge);
           ctx.diagnostics?.recordNudge({ type: 'digest' });
+          this.#emitProcessProgress(
+            buildSemanticNudgeProcessEvent(ctx, { type: 'digest', text: digestNudge })
+          );
           this.logger.info(
             '[AgentRuntime] 📝 metrics-transition to terminal — injecting digest nudge'
           );
@@ -1525,6 +1523,12 @@ export class AgentRuntime {
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
           ctx.diagnostics?.recordNudge({ type: 'digest' });
+          this.#emitProcessProgress(
+            buildSemanticNudgeProcessEvent(ctx, {
+              type: 'digest',
+              text: textResult.nudge,
+            })
+          );
         }
         this.logger.info('[AgentRuntime] 📝 injected SUMMARIZE nudge (text-triggered transition)');
         const _dimD = ctx.sharedState?._dimensionMeta?.id || '';
@@ -1543,6 +1547,12 @@ export class AgentRuntime {
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
           ctx.diagnostics?.recordNudge({ type: 'continue' });
+          this.#emitProcessProgress(
+            buildSemanticNudgeProcessEvent(ctx, {
+              type: 'continue',
+              text: textResult.nudge,
+            })
+          );
           const _dimC = ctx.sharedState?._dimensionMeta?.id || '';
           if (process.env.ALEMBIC_MCP_MODE !== '1') {
             process.stderr.write(
@@ -1959,6 +1969,122 @@ function buildAgentProcessEvent(
       null,
     title: input.title,
   };
+}
+
+function buildSemanticNudgeProcessEvent(
+  ctx: LoopContext,
+  nudge: { type: string; text: string },
+  options: {
+    phase?: string | null;
+    semanticKind?: string;
+  } = {}
+): AgentProgressProcessEvent {
+  const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
+  const dimensionId =
+    stringValue(dimensionMeta.id) ||
+    stringValue(ctx.context?.dimensionId) ||
+    stringValue(ctx.context?.dimId) ||
+    null;
+  const targetName =
+    stringValue(dimensionMeta.label) ||
+    stringValue(dimensionMeta.targetName) ||
+    stringValue(ctx.context?.targetName) ||
+    null;
+  const trackerPhase = typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : null;
+  const phase = options.phase ?? stringValue(ctx.context?.pipelinePhase) ?? trackerPhase ?? null;
+  const pipelineType =
+    typeof ctx.tracker?.pipelineType === 'string' ? ctx.tracker.pipelineType : null;
+  const semanticKind = options.semanticKind ?? classifySemanticNudgeKind(nudge.type);
+  const title = formatSemanticNudgeTitle(nudge, semanticKind, phase);
+  return buildAgentProcessEvent(ctx, {
+    kind: 'llm.reflection',
+    title,
+    summary: formatSemanticNudgeSummary(nudge, semanticKind, phase),
+    phase,
+    content: {
+      role: 'developer',
+      text: redactDeveloperText(nudge.text),
+    },
+    metadata: {
+      dimensionId,
+      nudgeType: nudge.type,
+      phase,
+      pipelineType,
+      semanticKind,
+      source: ctx.source,
+      targetName,
+    },
+  });
+}
+
+function classifySemanticNudgeKind(type: string): string {
+  switch (type) {
+    case 'transition':
+      return 'transition-nudge';
+    case 'digest':
+      return 'digest-nudge';
+    case 'continue':
+      return 'continue-nudge';
+    case 'planning':
+    case 'replan':
+      return 'planning-nudge';
+    case 'convergence':
+      return 'convergence-nudge';
+    default:
+      return 'reflection-nudge';
+  }
+}
+
+function formatSemanticNudgeTitle(
+  nudge: { type: string; text: string },
+  semanticKind: string,
+  phase: string | null
+): string {
+  if (semanticKind === 'transition-nudge') {
+    return phase ? `Agent 阶段转换 Nudge: ${phase}` : 'Agent 阶段转换 Nudge';
+  }
+  if (semanticKind === 'digest-nudge') {
+    return 'Agent 总结 Nudge';
+  }
+  if (semanticKind === 'continue-nudge') {
+    return 'Agent 继续执行 Nudge';
+  }
+  if (semanticKind === 'planning-nudge') {
+    return nudge.type === 'replan' ? 'Agent 重新计划 Nudge' : 'Agent 计划检查 Nudge';
+  }
+  if (semanticKind === 'convergence-nudge') {
+    return 'Agent 收敛检查 Nudge';
+  }
+  if (nudge.text.includes('停滞反思')) {
+    return 'Agent 停滞反思';
+  }
+  if (nudge.text.includes('中期反思')) {
+    return 'Agent 中期反思';
+  }
+  return 'Agent 反思 Nudge';
+}
+
+function formatSemanticNudgeSummary(
+  nudge: { type: string; text: string },
+  semanticKind: string,
+  phase: string | null
+): string {
+  if (semanticKind === 'transition-nudge') {
+    return phase ? `阶段机切换后注入 ${phase} 阶段指令。` : '阶段机切换后注入下一阶段指令。';
+  }
+  if (semanticKind === 'digest-nudge') {
+    return '要求 Agent 停止探索并产出 dimensionDigest 或最终分析摘要。';
+  }
+  if (semanticKind === 'continue-nudge') {
+    return '要求 Agent 基于当前回复继续推进，而不是结束本轮执行。';
+  }
+  if (nudge.text.includes('停滞反思')) {
+    return '检测到连续无新信息，注入停滞反思。';
+  }
+  if (nudge.text.includes('中期反思')) {
+    return '达到中期预算节点，注入阶段性反思。';
+  }
+  return `Injected ${nudge.type} semantic nudge before the next LLM step.`;
 }
 
 function formatDeveloperVisibleLlmInput({
