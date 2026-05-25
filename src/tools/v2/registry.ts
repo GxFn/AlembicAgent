@@ -48,17 +48,25 @@ const CODE_SPEC: ToolSpec = {
       maxOutputTokens: 3000,
     },
     read: {
-      summary: 'Read file content (adaptive: full/outline/delta)',
+      summary: 'Read file content (single path or batch filePaths)',
       description:
-        'Read file with adaptive strategy: ≤500 lines returns full text, >500 lines returns AST outline. Supports line ranges. Delta cache returns "[unchanged]" for re-reads.',
+        'Read one file with path or up to 5 files with filePaths. Uses adaptive strategy: ranges/maxLines return numbered slices, ≤500 lines returns full text, >500 lines returns AST outline. Delta cache returns "[unchanged]" for re-reads. Batch reads return per-file results and tolerate partial failure.',
       params: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'File path relative to project root' },
+          filePaths: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Batch file paths relative to project root (max 5)',
+          },
           startLine: { type: 'number', description: '1-based start line (inclusive)' },
           endLine: { type: 'number', description: '1-based end line (inclusive)' },
+          maxLines: {
+            type: 'number',
+            description: 'Maximum lines to return per file when no explicit endLine is set',
+          },
         },
-        required: ['path'],
       },
       handler: async (p, ctx) => handleCode('read', p, ctx),
       cache: 'delta',

@@ -18,8 +18,8 @@ export class CodeAnalysis extends Capability {
 | 输出总结 | 停止工具调用，输出分析 |
 
 关键规则:
-- 批量搜索: code({ action: "search", patterns: [...] })
-- 批量读文件: code({ action: "read", filePaths: [...] })
+- 批量搜索: code({ action: "search", params: { patterns: [...] } })
+- 批量读文件: code({ action: "read", params: { filePaths: [...] } })
 - 不要重复搜索相同关键词
 - 调用关系优先用 graph，不要用文本搜索猜测调用链
 - 输出时包含具体文件路径和代码位置`;

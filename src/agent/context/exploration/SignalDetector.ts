@@ -125,14 +125,18 @@ export class SignalDetector {
     return foundNew;
   }
 
-  /** code.read / code.outline / code.write — params.path 信号 */
+  /** code.read / code.outline / code.write — params.path / params.filePaths 信号 */
   #detectFileSignal(args: Record<string, unknown>): boolean {
-    const fp = (args?.path as string) || '';
-    if (fp && !this.#metrics.uniqueFiles.has(fp)) {
-      this.#metrics.uniqueFiles.add(fp);
-      return true;
+    const filePaths = Array.isArray(args?.filePaths) ? args.filePaths : [args?.path];
+    let foundNew = false;
+    for (const item of filePaths) {
+      const fp = typeof item === 'string' ? item : '';
+      if (fp && !this.#metrics.uniqueFiles.has(fp)) {
+        this.#metrics.uniqueFiles.add(fp);
+        foundNew = true;
+      }
     }
-    return false;
+    return foundNew;
   }
 
   /** code.structure — params.directory 信号 */

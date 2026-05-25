@@ -313,60 +313,207 @@ function formatSearchOutput(matches: SearchMatch[], total: number): string {
 /*  code.read                                                          */
 /* ================================================================== */
 
+const MAX_BATCH_READ_FILES = 5;
+
 async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-  const filePath = params.path as string;
-  if (!filePath) {
-    return fail('code.read requires path');
+  const filePath = normalizeOptionalString(params.path);
+  const filePathsResult = normalizeFilePaths(params.filePaths);
+  if (!filePathsResult.ok) {
+    return fail(filePathsResult.error);
+  }
+  const filePaths = filePathsResult.value;
+
+  if (filePath && filePaths.length > 0) {
+    return fail('code.read accepts either path or filePaths, not both');
   }
 
+  if (filePaths.length > 0) {
+    return handleBatchRead(filePaths, params, ctx);
+  }
+
+  if (!filePath) {
+    return fail('code.read requires path or filePaths[]');
+  }
+
+  const result = await readSingleFile(filePath, params, ctx);
+  if (!result.ok) {
+    return fail(result.error);
+  }
+  return ok(result.content, { tokensEstimate: result.tokensEstimate });
+}
+
+interface ReadSingleSuccess {
+  ok: true;
+  path: string;
+  content: string;
+  lineCount: number;
+  tokensEstimate: number;
+  startLine?: number;
+  endLine?: number;
+  mode: 'full' | 'range' | 'outline' | 'delta' | 'unchanged';
+}
+
+interface ReadSingleFailure {
+  ok: false;
+  path: string;
+  error: string;
+}
+
+type ReadSingleResult = ReadSingleSuccess | ReadSingleFailure;
+
+async function handleBatchRead(
+  filePaths: string[],
+  params: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (filePaths.length > MAX_BATCH_READ_FILES) {
+    return fail(`code.read filePaths supports at most ${MAX_BATCH_READ_FILES} files per call`);
+  }
+
+  const maxOutputTokens = Math.max(1000, Math.min(ctx.tokenBudget || 5000, 5000));
+  const perFileTokenBudget = Math.max(200, Math.floor((maxOutputTokens - 250) / filePaths.length));
+  const files: Array<
+    | (ReadSingleSuccess & { truncated?: boolean; originalTokensEstimate?: number })
+    | ReadSingleFailure
+  > = [];
+
+  for (const batchPath of filePaths) {
+    if (ctx.abortSignal?.aborted) {
+      files.push({ ok: false, path: batchPath, error: 'Read aborted' });
+      continue;
+    }
+    const result = await readSingleFile(batchPath, params, ctx);
+    if (!result.ok) {
+      files.push(result);
+      continue;
+    }
+    files.push(clampReadResult(result, perFileTokenBudget));
+  }
+
+  const succeeded = files.filter((file) => file.ok).length;
+  const failed = files.length - succeeded;
+  const data = {
+    mode: 'batch',
+    files,
+    summary: {
+      requested: filePaths.length,
+      succeeded,
+      failed,
+      partialFailure: succeeded > 0 && failed > 0,
+      maxFiles: MAX_BATCH_READ_FILES,
+      maxOutputTokens,
+      perFileTokenBudget,
+    },
+  };
+  const tokensEstimate = estimateTokens(JSON.stringify(data));
+
+  if (succeeded === 0) {
+    return {
+      ok: false,
+      data,
+      error: `code.read batch failed: ${failed}/${filePaths.length} files failed`,
+      _meta: { cached: false, durationMs: 0, tokensEstimate },
+    };
+  }
+
+  return ok(data, { tokensEstimate });
+}
+
+async function readSingleFile(
+  filePath: string,
+  params: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ReadSingleResult> {
   const startLine = params.startLine as number | undefined;
   const endLine = params.endLine as number | undefined;
+  const maxLines = normalizePositiveInteger(params.maxLines);
 
-  const absPath = path.resolve(ctx.projectRoot, filePath);
-  if (!absPath.startsWith(ctx.projectRoot)) {
-    return fail('Access denied: path is outside project root');
+  const resolved = resolveProjectFilePath(filePath, ctx.projectRoot);
+  if (!resolved.ok) {
+    return { ok: false, path: filePath, error: resolved.error };
   }
 
   let content: string;
   try {
-    content = await fs.readFile(absPath, 'utf-8');
+    content = await fs.readFile(resolved.absPath, 'utf-8');
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    return fail(`Cannot read file: ${msg}`);
+    return { ok: false, path: resolved.relPath, error: `Cannot read file: ${msg}` };
   }
 
   const lines = content.split('\n');
   const lineCount = lines.length;
 
   if (ctx.deltaCache) {
-    const delta = ctx.deltaCache.check(filePath, content);
+    const delta = ctx.deltaCache.check(resolved.relPath, content);
     if (delta.mode === 'unchanged') {
-      return ok(delta.content, { tokensEstimate: 5 });
+      return {
+        ok: true,
+        path: resolved.relPath,
+        content: delta.content,
+        lineCount,
+        tokensEstimate: 5,
+        mode: 'unchanged',
+      };
     }
-    if (delta.mode === 'delta' && !startLine && !endLine) {
-      return ok(delta.content, { tokensEstimate: estimateTokens(delta.content) });
+    if (delta.mode === 'delta' && !startLine && !endLine && !maxLines) {
+      return {
+        ok: true,
+        path: resolved.relPath,
+        content: delta.content,
+        lineCount,
+        tokensEstimate: estimateTokens(delta.content),
+        mode: 'delta',
+      };
     }
   }
 
-  if (startLine || endLine) {
+  if (startLine || endLine || maxLines) {
     const start = Math.max(1, startLine ?? 1);
-    const end = Math.min(lineCount, endLine ?? lineCount);
+    const maxLineEnd = maxLines ? start + maxLines - 1 : lineCount;
+    const end = Math.min(lineCount, endLine ?? maxLineEnd);
     const slice = lines
       .slice(start - 1, end)
       .map((l, i) => `${start + i}|${l}`)
       .join('\n');
-    return ok(slice, { tokensEstimate: estimateTokens(slice) });
+    const suffix =
+      end < lineCount && maxLines && !endLine
+        ? `\n... [${lineCount - end} lines omitted; use startLine/endLine for more]`
+        : '';
+    const contentSlice = `${slice}${suffix}`;
+    return {
+      ok: true,
+      path: resolved.relPath,
+      content: contentSlice,
+      lineCount,
+      tokensEstimate: estimateTokens(contentSlice),
+      startLine: start,
+      endLine: end,
+      mode: 'range',
+    };
   }
 
   if (lineCount <= 500) {
     const numbered = lines.map((l, i) => `${i + 1}|${l}`).join('\n');
-    return ok(numbered, { tokensEstimate: estimateTokens(numbered) });
+    return {
+      ok: true,
+      path: resolved.relPath,
+      content: numbered,
+      lineCount,
+      tokensEstimate: estimateTokens(numbered),
+      mode: 'full',
+    };
   }
 
-  const outline = await generateOutlineForRead(absPath, filePath, lineCount, ctx);
-  return ok(outline, {
+  const outline = await generateOutlineForRead(resolved.absPath, resolved.relPath, lineCount, ctx);
+  return {
+    ok: true,
+    path: resolved.relPath,
+    content: outline,
+    lineCount,
     tokensEstimate: estimateTokens(outline),
-  });
+    mode: 'outline',
+  };
 }
 
 async function generateOutlineForRead(
@@ -424,18 +571,18 @@ async function handleOutline(
     return fail('code.outline requires path');
   }
 
-  const absPath = path.resolve(ctx.projectRoot, filePath);
-  if (!absPath.startsWith(ctx.projectRoot)) {
-    return fail('Access denied: path is outside project root');
+  const resolved = resolveProjectFilePath(filePath, ctx.projectRoot);
+  if (!resolved.ok) {
+    return fail(resolved.error);
   }
 
   try {
-    await fs.access(absPath);
+    await fs.access(resolved.absPath);
   } catch {
     return fail(`File not found: ${filePath}`);
   }
 
-  const outline = await buildAstOutline(absPath, filePath, ctx);
+  const outline = await buildAstOutline(resolved.absPath, resolved.relPath, ctx);
   if (outline) {
     return ok(outline, { tokensEstimate: estimateTokens(outline) });
   }
@@ -512,7 +659,7 @@ async function handleStructure(
   const depth = Math.min((params.depth as number) || 3, 5);
 
   const absDir = path.resolve(ctx.projectRoot, directory);
-  if (!absDir.startsWith(ctx.projectRoot)) {
+  if (!isPathInsideProject(absDir, ctx.projectRoot)) {
     return fail('Access denied: path is outside project root');
   }
 
@@ -615,22 +762,22 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
     return fail('code.write requires path and content');
   }
 
-  const absPath = path.resolve(ctx.projectRoot, filePath);
-  if (!absPath.startsWith(ctx.projectRoot)) {
-    return fail('Access denied: path is outside project root');
+  const resolved = resolveProjectFilePath(filePath, ctx.projectRoot);
+  if (!resolved.ok) {
+    return fail(resolved.error);
   }
 
   for (const p of PROTECTED_PATHS) {
-    if (filePath.startsWith(p) || filePath.includes(`/${p}/`)) {
+    if (resolved.relPath === p || resolved.relPath.startsWith(`${p}/`)) {
       return fail(`Write denied: ${p} is a protected path`);
     }
   }
 
   try {
     if (createDirs) {
-      await fs.mkdir(path.dirname(absPath), { recursive: true });
+      await fs.mkdir(path.dirname(resolved.absPath), { recursive: true });
     }
-    await fs.writeFile(absPath, content, 'utf-8');
+    await fs.writeFile(resolved.absPath, content, 'utf-8');
     return ok({ written: filePath, bytes: Buffer.byteLength(content) });
   } catch (err: unknown) {
     return fail(`Write failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -666,6 +813,83 @@ function detectLanguage(filePath: string): string {
     '.cs': 'C#',
   };
   return MAP[ext] ?? ext.slice(1) ?? 'Unknown';
+}
+
+function normalizeOptionalString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeFilePaths(
+  value: unknown
+): { ok: true; value: string[] } | { ok: false; error: string } {
+  if (value === undefined || value === null) {
+    return { ok: true, value: [] };
+  }
+  if (!Array.isArray(value)) {
+    return { ok: false, error: 'code.read filePaths must be an array of strings' };
+  }
+  const paths: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item.trim().length === 0) {
+      return { ok: false, error: 'code.read filePaths must contain only non-empty strings' };
+    }
+    paths.push(item.trim());
+  }
+  if (paths.length === 0) {
+    return { ok: false, error: 'code.read filePaths must contain at least one path' };
+  }
+  return { ok: true, value: paths };
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const n = Math.floor(value);
+  return n > 0 ? n : undefined;
+}
+
+function resolveProjectFilePath(
+  filePath: string,
+  projectRoot: string
+): { ok: true; absPath: string; relPath: string } | { ok: false; error: string } {
+  const absPath = path.resolve(projectRoot, filePath);
+  if (!isPathInsideProject(absPath, projectRoot)) {
+    return { ok: false, error: 'Access denied: path is outside project root' };
+  }
+  return {
+    ok: true,
+    absPath,
+    relPath: path.relative(projectRoot, absPath) || path.basename(absPath),
+  };
+}
+
+function isPathInsideProject(absPath: string, projectRoot: string): boolean {
+  const rel = path.relative(projectRoot, absPath);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function clampReadResult(
+  result: ReadSingleSuccess,
+  tokenBudget: number
+): ReadSingleSuccess & { truncated?: boolean; originalTokensEstimate?: number } {
+  if (result.tokensEstimate <= tokenBudget) {
+    return result;
+  }
+  const maxChars = tokenBudget * 4;
+  const headChars = Math.floor(maxChars * 0.8);
+  const tailChars = Math.floor(maxChars * 0.15);
+  const head = result.content.slice(0, headChars);
+  const tail = result.content.slice(-tailChars);
+  const omitted = result.content.length - headChars - tailChars;
+  const content = `${head}\n\n... [${omitted} chars truncated for batch read budget] ...\n\n${tail}`;
+  return {
+    ...result,
+    content,
+    tokensEstimate: estimateTokens(content),
+    truncated: true,
+    originalTokensEstimate: result.tokensEstimate,
+  };
 }
 
 async function collectFiles(cwd: string, glob?: string): Promise<string[]> {

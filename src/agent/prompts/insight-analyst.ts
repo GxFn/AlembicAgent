@@ -67,7 +67,10 @@ interface SemanticMemoryLike {
 
 /** CodeEntityGraph 最小接口 */
 interface CodeEntityGraphLike {
-  generateContextForAgent(opts: { maxEntities: number; maxEdges: number }): string | null;
+  generateContextForAgent(opts: {
+    maxEntities: number;
+    maxEdges: number;
+  }): Promise<string | null> | string | null;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -397,7 +400,10 @@ note_finding({ finding: "发现描述", evidence: "完整相对路径:行号", i
   // §9: 代码实体图谱 (Phase E)
   if (codeEntityGraph) {
     try {
-      const graphCtx = codeEntityGraph.generateContextForAgent({ maxEntities: 20, maxEdges: 40 });
+      const graphCtx = await codeEntityGraph.generateContextForAgent({
+        maxEntities: 20,
+        maxEdges: 40,
+      });
       if (graphCtx) {
         parts.push(graphCtx);
         parts.push('使用 graph({ action: "query" }) 工具可以查询更详细的继承链、影响分析等。');
