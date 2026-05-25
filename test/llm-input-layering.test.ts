@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
+import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { PRODUCER_SYSTEM_PROMPT } from '../src/agent/prompts/insight-producer.js';
 import {
   AgentRuntime,
@@ -129,6 +130,119 @@ describe('LLM input layering', () => {
     expect(inputText).toContain('## Dynamic context');
     expect(inputText).toContain('analyze with apiKey=');
     expect(inputText).not.toContain('visibleInputSecret12345');
+    expect(llmInput?.metadata).toMatchObject({
+      inputLayerAppended: true,
+      inputStageProfile: 'analyze',
+    });
+  });
+
+  it('injects observation ledger dynamic context without raw tool envelope fields', async () => {
+    const progress: ProgressEvent[] = [];
+    const capture: { messages?: Array<{ role: string; content?: string }> } = {};
+    const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+      capture.messages = opts?.messages as Array<{ role: string; content?: string }>;
+      return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    const runtime = createRuntime({
+      chatWithTools,
+      onProgress: (event) => progress.push(event),
+    });
+    const memoryCoordinator = new MemoryCoordinator();
+    const activeContext = memoryCoordinator.createDimensionScope('architecture:analyst', {
+      maxRecentRounds: 1,
+    });
+    activeContext.recordToolCall(
+      'code',
+      { action: 'read', path: 'src/agent/memory/ActiveContext.ts' },
+      {
+        ok: true,
+        toolId: 'code',
+        callId: 'raw-call-id',
+        startedAt: '2026-05-25T00:00:00.000Z',
+        durationMs: 12,
+        status: 'success',
+        text: '{"callId":"raw-call-id","startedAt":"2026-05-25","durationMs":12}',
+        structuredContent: {
+          path: 'src/agent/memory/ActiveContext.ts',
+          content: 'class ActiveContext {}',
+        },
+        diagnostics: {
+          degraded: false,
+          fallbackUsed: false,
+          warnings: [],
+          timedOutStages: [],
+          blockedTools: [],
+          truncatedToolCalls: 0,
+          emptyResponses: 0,
+          aiErrorCount: 0,
+          gateFailures: [],
+        },
+        trust: {
+          source: 'internal',
+          sanitized: true,
+          containsUntrustedText: false,
+          containsSecrets: false,
+        },
+      },
+      true
+    );
+    activeContext.recordToolCall(
+      'code',
+      { action: 'search', pattern: 'ActiveContext', glob: 'src/**' },
+      {
+        ok: true,
+        toolId: 'code',
+        callId: 'raw-search-call-id',
+        startedAt: '2026-05-25T00:00:01.000Z',
+        durationMs: 8,
+        status: 'success',
+        text: '1 matches (showing 1)\n\nsrc/agent/memory/ActiveContext.ts:1: ActiveContext',
+        diagnostics: {
+          degraded: false,
+          fallbackUsed: false,
+          warnings: [],
+          timedOutStages: [],
+          blockedTools: [],
+          truncatedToolCalls: 0,
+          emptyResponses: 0,
+          aiErrorCount: 0,
+          gateFailures: [],
+        },
+        trust: {
+          source: 'internal',
+          sanitized: true,
+          containsUntrustedText: false,
+          containsSecrets: false,
+        },
+      },
+      true
+    );
+    const tracker = createTracker({ phase: 'SCAN' });
+
+    await runtime.reactLoop('analyze active context ledger', {
+      source: 'system',
+      context: {
+        pipelinePhase: 'analyze',
+        dimensionId: 'architecture',
+        dimensionScopeId: 'architecture:analyst',
+      },
+      memoryCoordinator,
+      systemPromptOverride: 'Analyst identity prompt',
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const providerLayer = capture.messages?.at(-1)?.content || '';
+    const llmInput = getLlmInput(progress);
+
+    expect(providerLayer).toContain('## Dynamic context');
+    expect(providerLayer).toContain('## Observation Ledger');
+    expect(providerLayer).toContain('### readSet');
+    expect(providerLayer).toContain('src/agent/memory/ActiveContext.ts');
+    expect(providerLayer).not.toContain('之前的探索摘要');
+    expect(providerLayer).not.toContain('callId');
+    expect(providerLayer).not.toContain('startedAt');
+    expect(providerLayer).not.toContain('durationMs');
     expect(llmInput?.metadata).toMatchObject({
       inputLayerAppended: true,
       inputStageProfile: 'analyze',

@@ -199,15 +199,27 @@ interface Plan {
 
 interface Observation {
   toolName: string;
+  args?: Record<string, unknown>;
   result: unknown;
   round: number;
   timestamp: number;
+}
+
+type ObservationLedgerCategory = 'evidence' | 'readSet' | 'searchSet' | 'failureSet' | 'nextHints';
+
+interface ObservationLedgerItem {
+  category: ObservationLedgerCategory;
+  key: string;
+  text: string;
+  round: number;
+  toolName: string;
 }
 
 interface CompressedObservation {
   toolName: string;
   round: number;
   summary: string;
+  ledgerItems: ObservationLedgerItem[];
 }
 
 interface ActiveContextJSON {
@@ -216,6 +228,33 @@ interface ActiveContextJSON {
   totalObservations?: number;
   plan?: Plan;
 }
+
+const OBSERVATION_LEDGER_CATEGORIES: ObservationLedgerCategory[] = [
+  'evidence',
+  'readSet',
+  'searchSet',
+  'failureSet',
+  'nextHints',
+];
+
+const OBSERVATION_LEDGER_LIMITS: Record<ObservationLedgerCategory, number> = {
+  evidence: 8,
+  readSet: 10,
+  searchSet: 8,
+  failureSet: 6,
+  nextHints: 6,
+};
+
+const PROVIDER_DEBUG_KEYS = new Set([
+  'callId',
+  'parentCallId',
+  'startedAt',
+  'durationMs',
+  'timestamp',
+  'diagnostics',
+  'structuredContent',
+  '_meta',
+]);
 
 export class ActiveContext {
   // ── 子区 1: Scratchpad (从 WorkingMemory 继承, 不可压缩) ──
@@ -320,6 +359,7 @@ export class ActiveContext {
       this.#totalObservations++;
       this.#recentObservations.push({
         toolName,
+        args,
         result,
         round,
         timestamp: Date.now(),
@@ -539,26 +579,11 @@ export class ActiveContext {
       }
     }
 
-    // §2: 压缩后的旧观察摘要 (中等优先级)
+    // §2: Observation Ledger (中等优先级)
     if (this.#compressedObservations.length > 0 && remaining > 100) {
-      const obsLines = ['## 📂 之前的探索摘要'];
-      const maxItems = Math.min(15, this.#compressedObservations.length);
-      const recent = this.#compressedObservations.slice(-maxItems);
-
-      for (const s of recent) {
-        const line = `- [R${s.round}|${s.toolName}] ${s.summary.substring(0, 200)}`;
-        const lineTokens = this.#estimateTokens(line);
-        if (lineTokens > remaining) {
-          break;
-        }
-        obsLines.push(line);
-        remaining -= lineTokens;
-      }
-      if (this.#compressedObservations.length > maxItems) {
-        obsLines.push(`  …(还有 ${this.#compressedObservations.length - maxItems} 条更早的观察)`);
-      }
-      if (obsLines.length > 1) {
-        parts.push(obsLines.join('\n'));
+      const ledgerSection = this.#buildObservationLedgerSection(remaining);
+      if (ledgerSection) {
+        parts.push(ledgerSection);
       }
     }
 
@@ -887,6 +912,190 @@ export class ActiveContext {
       toolName: observation.toolName,
       round: observation.round,
       summary,
+      ledgerItems: this.#extractObservationLedgerItems(observation, summary),
+    };
+  }
+
+  #buildObservationLedgerSection(tokenBudget: number): string | null {
+    const ledger = new Map<ObservationLedgerCategory, ObservationLedgerItem[]>();
+    for (const observation of this.#compressedObservations) {
+      const items =
+        observation.ledgerItems.length > 0
+          ? observation.ledgerItems
+          : [
+              {
+                category: 'evidence' as const,
+                key: `${observation.toolName}:${normalizeLedgerKey(observation.summary)}`,
+                text: `${observation.toolName} observed ${sanitizeLedgerText(observation.summary, 180)}`,
+                round: observation.round,
+                toolName: observation.toolName,
+              },
+            ];
+      for (const item of items) {
+        const bucket = ledger.get(item.category) || [];
+        if (!bucket.some((existing) => existing.key === item.key)) {
+          bucket.push(item);
+          ledger.set(item.category, bucket);
+        }
+      }
+    }
+
+    const lines = ['## Observation Ledger'];
+    let remaining = tokenBudget - this.#estimateTokens(lines[0]);
+    for (const category of OBSERVATION_LEDGER_CATEGORIES) {
+      const items = (ledger.get(category) || []).slice(-OBSERVATION_LEDGER_LIMITS[category]);
+      if (items.length === 0 || remaining <= 0) {
+        continue;
+      }
+      const categoryLines = [`### ${category}`];
+      for (const item of items) {
+        const line = `- [R${item.round}|${item.toolName}] ${item.text}`;
+        const lineTokens = this.#estimateTokens(line);
+        if (lineTokens > remaining) {
+          break;
+        }
+        categoryLines.push(line);
+        remaining -= lineTokens;
+      }
+      if (categoryLines.length > 1) {
+        lines.push(categoryLines.join('\n'));
+      }
+    }
+
+    return lines.length > 1 ? lines.join('\n') : null;
+  }
+
+  #extractObservationLedgerItems(
+    observation: Observation,
+    summary: string
+  ): ObservationLedgerItem[] {
+    const envelope = isToolResultEnvelope(observation.result) ? observation.result : null;
+    const structured = envelope?.structuredContent ?? observation.result;
+    const args = observation.args || {};
+    const action = stringFrom(args.action);
+    const items: ObservationLedgerItem[] = [];
+    const ok = envelope ? envelope.ok && envelope.status === 'success' : true;
+
+    if (!ok) {
+      const failureText = sanitizeLedgerText(envelope?.text || summary || 'tool call failed', 180);
+      items.push(
+        this.#ledgerItem(
+          'failureSet',
+          `${observation.toolName}:${action}:${failureText}`,
+          `${formatToolAction(observation.toolName, action)} failed: ${failureText}`,
+          observation
+        )
+      );
+    }
+
+    if (envelope?.nextActionHint) {
+      items.push(
+        this.#ledgerItem(
+          'nextHints',
+          `${observation.toolName}:${action}:${envelope.nextActionHint}`,
+          sanitizeLedgerText(envelope.nextActionHint, 180),
+          observation
+        )
+      );
+    } else if (!ok) {
+      items.push(
+        this.#ledgerItem(
+          'nextHints',
+          `${observation.toolName}:${action}:retry`,
+          `Retry or verify ${formatToolAction(observation.toolName, action)} with narrower inputs.`,
+          observation
+        )
+      );
+    }
+
+    if (observation.toolName === 'code') {
+      if (action === 'read') {
+        const paths = extractReadPaths(args, structured);
+        for (const filePath of paths) {
+          items.push(
+            this.#ledgerItem('readSet', `read:${filePath}`, filePath, observation),
+            this.#ledgerItem(
+              'evidence',
+              `read:${filePath}`,
+              `${ok ? 'Read' : 'Attempted read'} ${filePath}`,
+              observation
+            )
+          );
+        }
+      } else if (action === 'search') {
+        const searches = extractSearches(args, structured, envelope?.text);
+        for (const search of searches) {
+          items.push(
+            this.#ledgerItem('searchSet', `search:${search}`, search, observation),
+            this.#ledgerItem('evidence', `search:${search}`, `Searched ${search}`, observation)
+          );
+        }
+      } else if (action) {
+        const target = sanitizeLedgerText(
+          stringFrom(args.path) || stringFrom(args.directory) || action,
+          120
+        );
+        items.push(
+          this.#ledgerItem(
+            ok ? 'evidence' : 'failureSet',
+            `code:${action}:${target}`,
+            `${ok ? 'Ran' : 'Failed'} code.${action} ${target}`,
+            observation
+          )
+        );
+      }
+    } else if (observation.toolName === 'graph') {
+      const graphTarget = [
+        action || 'query',
+        stringFrom(args.type),
+        stringFrom(args.entity) || stringFrom(args.className) || stringFrom(args.protocolName),
+      ]
+        .filter(Boolean)
+        .join(':');
+      items.push(
+        this.#ledgerItem(
+          ok ? 'evidence' : 'failureSet',
+          `graph:${graphTarget || summary}`,
+          `${ok ? 'Queried' : 'Failed'} graph ${sanitizeLedgerText(graphTarget || summary, 160)}`,
+          observation
+        )
+      );
+    } else if (observation.toolName === 'terminal') {
+      const command = sanitizeLedgerText(stringFrom(args.command) || summary, 160);
+      items.push(
+        this.#ledgerItem(
+          ok ? 'evidence' : 'failureSet',
+          `terminal:${command}`,
+          `${ok ? 'Ran' : 'Failed'} terminal command: ${command}`,
+          observation
+        )
+      );
+    } else if (observation.toolName !== 'memory' && observation.toolName !== 'note_finding') {
+      items.push(
+        this.#ledgerItem(
+          ok ? 'evidence' : 'failureSet',
+          `${observation.toolName}:${action}:${summary}`,
+          `${ok ? 'Observed' : 'Failed'} ${formatToolAction(observation.toolName, action)}: ${sanitizeLedgerText(summary, 180)}`,
+          observation
+        )
+      );
+    }
+
+    return items;
+  }
+
+  #ledgerItem(
+    category: ObservationLedgerCategory,
+    key: string,
+    text: string,
+    observation: Observation
+  ): ObservationLedgerItem {
+    return {
+      category,
+      key: normalizeLedgerKey(key),
+      text: sanitizeLedgerText(text, 220),
+      round: observation.round,
+      toolName: observation.toolName,
     };
   }
 
@@ -1020,6 +1229,150 @@ function isToolResultEnvelope(value: unknown): value is ToolResultEnvelope {
     typeof (value as ToolResultEnvelope).callId === 'string' &&
     typeof (value as ToolResultEnvelope).status === 'string'
   );
+}
+
+function extractReadPaths(args: Record<string, unknown>, structured: unknown): string[] {
+  const paths = new Set<string>();
+  addString(paths, args.path);
+  addStringList(paths, args.filePaths);
+
+  const structuredObj = objectFrom(structured);
+  addString(paths, structuredObj?.path);
+  const files = Array.isArray(structuredObj?.files) ? structuredObj.files : [];
+  for (const file of files) {
+    const fileObj = objectFrom(file);
+    addString(paths, fileObj?.path);
+  }
+
+  return [...paths].map((p) => sanitizeLedgerText(p, 180)).filter(Boolean);
+}
+
+function extractSearches(
+  args: Record<string, unknown>,
+  structured: unknown,
+  text?: string
+): string[] {
+  const searches = new Set<string>();
+  const glob = stringFrom(args.glob);
+  const patterns = stringListFrom(args.patterns);
+  const pattern = stringFrom(args.pattern);
+  for (const p of patterns.length > 0 ? patterns : [pattern].filter(Boolean)) {
+    searches.add(`${p}${glob ? ` in ${glob}` : ''}`);
+  }
+
+  const structuredObj = objectFrom(structured);
+  const total = typeof structuredObj?.total === 'number' ? structuredObj.total : null;
+  const matches = Array.isArray(structuredObj?.matches) ? structuredObj.matches : [];
+  for (const match of matches.slice(0, 5)) {
+    const matchObj = objectFrom(match);
+    const file = stringFrom(matchObj?.file);
+    const line = typeof matchObj?.line === 'number' ? matchObj.line : null;
+    if (file) {
+      searches.add(`${file}${line ? `:${line}` : ''}`);
+    }
+  }
+  if (total === 0 && searches.size > 0) {
+    searches.add('no matches returned');
+  }
+
+  const firstLine = text?.split('\n').find((line) => line.trim());
+  if (firstLine && /^\d+ matches\b/.test(firstLine.trim())) {
+    searches.add(firstLine.trim());
+  }
+
+  return [...searches].map((entry) => sanitizeLedgerText(entry, 180)).filter(Boolean);
+}
+
+function sanitizeLedgerText(value: unknown, maxChars = 220): string {
+  const raw = String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const jsonLike = compactJsonForLedger(raw);
+  if (jsonLike) {
+    return limitLedgerText(jsonLike, maxChars);
+  }
+  const withoutJsonDebugFields = raw.replace(
+    /"?(?:callId|parentCallId|startedAt|durationMs|timestamp|diagnostics|structuredContent|_meta)"?\s*:\s*(?:"[^"]*"|[\d.]+|true|false|null|\{[^}]*\}|\[[^\]]*\]),?/gi,
+    ''
+  );
+  const withoutDebugWords = withoutJsonDebugFields.replace(
+    /\b(callId|parentCallId|startedAt|durationMs|timestamp|diagnostics|structuredContent|_meta)\b/gi,
+    'metadata'
+  );
+  const compact = withoutDebugWords.replace(/\s+/g, ' ').trim();
+  return limitLedgerText(compact, maxChars);
+}
+
+function compactJsonForLedger(raw: string): string | null {
+  if (!raw.startsWith('{') && !raw.startsWith('[')) {
+    return null;
+  }
+  try {
+    return compactLedgerValue(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function compactLedgerValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 6)
+      .map((item) => compactLedgerValue(item))
+      .filter(Boolean)
+      .join('; ');
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !PROVIDER_DEBUG_KEYS.has(key))
+      .map(([key, item]) => `${key}: ${compactLedgerValue(item)}`)
+      .filter((entry) => entry.trim() !== '')
+      .join('; ');
+  }
+  return String(value ?? '').trim();
+}
+
+function limitLedgerText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}…`;
+}
+
+function normalizeLedgerKey(value: unknown): string {
+  return sanitizeLedgerText(value, 260).toLowerCase();
+}
+
+function formatToolAction(toolName: string, action: string): string {
+  return action ? `${toolName}.${action}` : toolName;
+}
+
+function objectFrom(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+function stringFrom(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function stringListFrom(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => stringFrom(item)).filter(Boolean);
+}
+
+function addString(target: Set<string>, value: unknown) {
+  const text = stringFrom(value);
+  if (text) {
+    target.add(text);
+  }
+}
+
+function addStringList(target: Set<string>, value: unknown) {
+  for (const item of stringListFrom(value)) {
+    target.add(item);
+  }
 }
 
 export default ActiveContext;
