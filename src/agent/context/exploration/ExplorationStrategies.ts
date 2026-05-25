@@ -26,8 +26,9 @@ export const DEFAULT_REPLAN_INTERVAL = 8;
  *   - scan:      scanKnowledge 管线（extract / summarize），纯文本总结，跳过 SUMMARIZE 阶段
  *   - bootstrap:  冷启动维度管线，输出 dimensionDigest JSON，经历完整阶段序列
  *   - analyst:    纯代码分析管线（无 produce），输出 Markdown 分析报告
+ *   - producer:   候选生产管线，消费 Analyst 结果，只做格式化、补读和提交
  */
-export type PipelineType = 'scan' | 'bootstrap' | 'analyst';
+export type PipelineType = 'scan' | 'bootstrap' | 'analyst' | 'producer';
 
 /** 探索指标数据 */
 export interface ExplorationMetrics {

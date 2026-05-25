@@ -58,6 +58,14 @@ export { cleanFinalAnswer } from './final-answer.js';
 export { produceForcedSummary } from './forced-summary.js';
 export type { HookEvent, HookHandler, HookPayloadMap } from './HookSystem.js';
 export { HookSystem, registerDefaultHooks } from './HookSystem.js';
+export type {
+  BuildLlmInputAssemblyOptions,
+  LLMInputAssembly,
+  LLMInputSection,
+  LLMInputSectionId,
+  LLMInputStageProfile,
+} from './LLMInputAssembly.js';
+export { buildLlmInputAssembly, resolveLlmInputStageProfile } from './LLMInputAssembly.js';
 export { continueResult, LLMResultType } from './LLMResultType.js';
 export { LoopContext } from './LoopContext.js';
 export {

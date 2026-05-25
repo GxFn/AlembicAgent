@@ -194,6 +194,14 @@ export class NudgeGenerator {
           `⚠️ 不要再调用任何工具，直接输出文本。`
         );
       }
+      // Producer: 候选生产总结，不产出 bootstrap dimensionDigest
+      if (pipelineType === 'producer') {
+        return (
+          `你已完成候选生产阶段。请**停止调用工具**，直接输出生产总结（Markdown 格式）。\n` +
+          `说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充证据。\n` +
+          `⚠️ 不要再调用任何工具，直接输出文本。`
+        );
+      }
       // Bootstrap: 使用 dimensionDigest JSON (供维度编排消费)
       return (
         `你已完成分析探索。请在回复中直接输出 dimensionDigest JSON（用 \`\`\`json 包裹），包含以下字段：\n` +

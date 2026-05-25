@@ -143,6 +143,30 @@ export class SystemPromptBuilder {
     }
 
     const maxIter = budget?.maxIterations || 24;
+    const pipelineType = getTrackerString(tracker, 'pipelineType');
+    const phase = getTrackerString(tracker, 'phase')?.toUpperCase();
+
+    if (pipelineType === 'producer' || phase === 'PRODUCE') {
+      return (
+        prompt +
+        `\n\n## Producer 轮次预算\n- 总轮次: **${maxIter} 轮**\n` +
+        `- 候选提交阶段: 优先把 Analyst 已确认发现转成 knowledge 提交\n` +
+        `- 证据补齐阶段: 只读取 Analyst 已引用的文件片段，禁止新增搜索、结构化探索或终端验证\n` +
+        `- 总结阶段: 停止工具调用，输出提交结果和未提交原因\n\n` +
+        `Producer 不继承 Analyst 的探索/验证预算；不要启动新的项目扫描。`
+      );
+    }
+
+    if (phase === 'RECORD') {
+      return (
+        prompt +
+        `\n\n## 结构化记录轮次预算\n- 总轮次: **${maxIter} 轮**\n` +
+        `- 本阶段只补齐已确认发现的 note_finding 记录\n` +
+        `- 不新增探索、搜索、图谱查询或终端验证\n` +
+        `- 达到记录要求后立即进入总结或交由门控判断`
+      );
+    }
+
     const exploreEnd = Math.floor(maxIter * 0.6);
     const verifyEnd = Math.floor(maxIter * 0.8);
 
@@ -155,4 +179,12 @@ export class SystemPromptBuilder {
       `到达第 ${verifyEnd} 轮时你必须开始输出总结，不要继续搜索。`
     );
   }
+}
+
+function getTrackerString(tracker: unknown, key: string): string | null {
+  if (!tracker || typeof tracker !== 'object') {
+    return null;
+  }
+  const value = (tracker as Record<string, unknown>)[key];
+  return typeof value === 'string' && value.trim() ? value : null;
 }

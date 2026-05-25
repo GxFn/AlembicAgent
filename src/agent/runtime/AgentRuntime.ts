@@ -58,6 +58,7 @@ import { createExitController } from './ExitController.js';
 import { cleanFinalAnswer } from './final-answer.js';
 import { produceForcedSummary } from './forced-summary.js';
 import { HookSystem, registerDefaultHooks } from './HookSystem.js';
+import { buildLlmInputAssembly, type LLMInputAssembly } from './LLMInputAssembly.js';
 import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
@@ -841,27 +842,31 @@ export class AgentRuntime {
             ? toolSchemas
             : undefined;
 
-      // 构建 LLM 输入消息 — projected messages + ephemeral dynamic context
+      // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
       const projected =
         ctx.messages.toProjectedMessages() as import('#external/ai/AiProvider.js').UnifiedMessage[];
-      const unifiedMessages = dynamicContext
-        ? [...projected, { role: 'user' as const, content: dynamicContext }]
-        : projected;
       const unifiedTools = effectiveToolSchemas as
         | import('#external/ai/AiProvider.js').ToolSchema[]
         | undefined;
+      const effectiveToolChoice = unifiedTools ? toolChoice : 'none';
+      const llmInputAssembly = buildLlmInputAssembly({
+        ctx,
+        dynamicContext,
+        effectiveToolChoice,
+        messages: projected,
+        modelRef: this.#modelRef,
+        requestedToolChoice: toolChoice,
+        systemPrompt: effectiveSystemPrompt,
+        tools: unifiedTools,
+      });
+      const unifiedMessages = llmInputAssembly.providerMessages;
       const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
         kind: 'llm.input',
         title: 'LLM input prepared',
         summary: `Sending ${unifiedMessages.length} message(s) to ${this.#modelRef}`,
         content: {
           role: 'developer',
-          text: formatDeveloperVisibleLlmInput({
-            systemPrompt: effectiveSystemPrompt,
-            messages: unifiedMessages,
-            dynamicContext,
-            tools: unifiedTools,
-          }),
+          text: formatDeveloperVisibleLlmInput(llmInputAssembly),
         },
         metadata: {
           ...llmTrace,
@@ -869,13 +874,14 @@ export class AgentRuntime {
           messageCount: unifiedMessages.length,
           hasDynamicContext: Boolean(dynamicContext),
           requestedToolChoice: toolChoice,
-          effectiveToolChoice: unifiedTools ? toolChoice : 'none',
+          effectiveToolChoice,
           toolSchemaNames: (unifiedTools || []).map((schema) => schema.name),
+          ...llmInputAssembly.metadata,
         },
       });
       this.#hookSystem.emitSync('llm:call:before', {
         iteration: ctx.iteration,
-        toolChoice: unifiedTools ? toolChoice : 'none',
+        toolChoice: effectiveToolChoice,
         processEvent: llmInputProcessEvent,
       });
       this.#emitProcessProgress(llmInputProcessEvent);
@@ -888,7 +894,7 @@ export class AgentRuntime {
         messageCount: unifiedMessages.length,
         hasDynamicContext: Boolean(dynamicContext),
         requestedToolChoice: toolChoice,
-        effectiveToolChoice: unifiedTools ? toolChoice : 'none',
+        effectiveToolChoice,
         toolSchemaCount: unifiedTools?.length || 0,
         timeoutMs: ctx.budget.timeoutMs || null,
         maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
@@ -2177,32 +2183,27 @@ function formatSemanticNudgeSummary(
   return `Injected ${nudge.type} semantic nudge before the next LLM step.`;
 }
 
-function formatDeveloperVisibleLlmInput({
-  systemPrompt,
-  messages,
-  dynamicContext,
-  tools,
-}: {
-  systemPrompt: string;
-  messages: import('#external/ai/AiProvider.js').UnifiedMessage[];
-  dynamicContext: string | null;
-  tools?: import('#external/ai/AiProvider.js').ToolSchema[];
-}): string {
-  const sections = [`## System prompt\n${redactDeveloperText(systemPrompt)}`];
-  if (dynamicContext) {
-    sections.push(`## Dynamic context\n${redactDeveloperText(dynamicContext)}`);
-  }
+function formatDeveloperVisibleLlmInput(assembly: LLMInputAssembly): string {
+  const sections = assembly.sections.map((section) => {
+    const suffix = section.staticCacheable ? ' (static)' : '';
+    return `## ${section.title}${suffix}\n${redactDeveloperText(section.content)}`;
+  });
   sections.push(
     [
       '## Messages',
-      ...messages.map((message, index) => formatDeveloperVisibleMessage(message, index)),
+      ...assembly.messages.map((message, index) => formatDeveloperVisibleMessage(message, index)),
     ].join('\n\n')
   );
-  if (tools?.length) {
+  if (assembly.inputLayerMessage) {
+    sections.push(
+      `## Provider runtime layer\n${redactDeveloperText(assembly.inputLayerMessage.content || '')}`
+    );
+  }
+  if (assembly.tools?.length) {
     sections.push(
       [
         '## Available tools',
-        ...tools.map((tool) =>
+        ...assembly.tools.map((tool) =>
           [
             `### ${tool.name}`,
             tool.description ? redactDeveloperText(tool.description) : null,
