@@ -74,6 +74,26 @@ export {
   MessageAdapter,
   SimpleArrayAdapter,
 } from './MessageAdapter.js';
+export type {
+  PcvNodeAcceptedFindingRef,
+  PcvNodeEvidenceProcessMetadata,
+  PcvNodeEvidenceSummary,
+  PcvNodeInputAssemblyEvidence,
+  PcvNodeLedgerRef,
+  PcvNodeQualityGateEvidence,
+  PcvNodeRejectedFindingRef,
+  PcvNodeRepairEvidence,
+  PcvNodeStageIdentity,
+} from './PcvNodeEvidence.js';
+export {
+  buildPcvNodeEvidenceProcessMetadata,
+  buildPcvNodeEvidenceSummary,
+  buildPcvQualityGateEvidence,
+  createPcvNodeEvidence,
+  extractSourceRefsFromValue,
+  recordPcvInputAssembly,
+  recordPcvToolResult,
+} from './PcvNodeEvidence.js';
 export { SystemPromptBuilder } from './SystemPromptBuilder.js';
 export type {
   BuildSystemRunContextOptions,

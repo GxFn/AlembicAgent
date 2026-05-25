@@ -21,6 +21,7 @@ import {
   type EvidenceCollectorResult,
   type ToolCall,
 } from '../domain/EvidenceCollector.js';
+import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidence.js';
 
 const logger = Logger.getInstance();
 
@@ -797,6 +798,19 @@ export function insightGateEvaluator(
   const gate = analysisQualityGate(artifact, {
     outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
   });
+  const pcvNodeEvidence = buildPcvQualityGateEvidence({
+    artifact,
+    dimId: dimId || null,
+    gate,
+    source,
+  });
+  (artifact as Record<string, unknown>).pcvNodeEvidence = pcvNodeEvidence;
+  (artifact as { metadata?: Record<string, unknown> }).metadata = {
+    ...((artifact as { metadata?: Record<string, unknown> }).metadata || {}),
+    pcvNodeEvidenceRef: pcvNodeEvidence.nodeId,
+    pcvNodeEvidenceMissingLinks: pcvNodeEvidence.missingLinkReasons,
+    pcvQualityGateStatus: pcvNodeEvidence.qualityGate?.status || null,
+  };
 
   const qr = (artifact as Record<string, unknown>).qualityReport as QualityReport | undefined;
   if (qr?.scores) {

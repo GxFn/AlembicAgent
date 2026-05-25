@@ -21,6 +21,11 @@ import type { BudgetController } from './BudgetController.js';
 import type { DiagnosticsCollector } from './DiagnosticsCollector.js';
 import type { ExitController } from './ExitController.js';
 import type { MessageAdapter } from './MessageAdapter.js';
+import {
+  buildPcvNodeEvidenceSummary,
+  createPcvNodeEvidence,
+  type PcvNodeEvidenceSummary,
+} from './PcvNodeEvidence.js';
 
 /** Tool call hook type */
 type ToolCallHook = (name: string, params: Record<string, unknown>, result: unknown) => void;
@@ -169,6 +174,9 @@ export class LoopContext {
   /** BudgetController — 预算决策 + 压缩触发 + 遥测 */
   budgetController: BudgetController | null = null;
 
+  /** PCVM N9 node-local evidence — 供宿主 trace/artifact/metrics 承接 */
+  pcvNodeEvidence: PcvNodeEvidenceSummary;
+
   constructor(config: LoopContextConfig) {
     this.messages = config.messages;
     this.tracker = (config.tracker || null) as ExplorationTracker | null;
@@ -190,6 +198,7 @@ export class LoopContext {
     this.diagnostics = config.diagnostics || null;
     this.exitController = config.exitController || null;
     this.loopStartTime = Date.now();
+    this.pcvNodeEvidence = createPcvNodeEvidence(this);
   }
 
   // ─── 计算属性 ───
@@ -232,6 +241,7 @@ export class LoopContext {
       toolCalls: [...this.toolCalls],
       tokenUsage: { ...this.tokenUsage },
       iterations: this.iteration,
+      pcvNodeEvidence: buildPcvNodeEvidenceSummary(this.pcvNodeEvidence),
       ...(this.diagnostics ? { diagnostics: this.diagnostics.toJSON() } : {}),
     };
   }

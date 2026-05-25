@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
-import { analysisQualityGate } from '../src/agent/prompts/insight-gate.js';
+import { analysisQualityGate, insightGateEvaluator } from '../src/agent/prompts/insight-gate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime as AgentRuntimeImpl } from '../src/agent/runtime/AgentRuntime.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
@@ -159,6 +159,158 @@ describe('evidence recording quality gate actions', () => {
       pass: false,
       action: 'analysis_retry',
       reason: MISSING_FINDINGS,
+    });
+  });
+
+  it('attaches PCVM N9 quality evidence with runtime input, ledger and finding refs', () => {
+    const source = {
+      reply:
+        '## Runtime boundary\nsrc/foo.ts:10 proves the runtime path.\n\n## Producer boundary\nsrc/bar.ts:20 validates the producer handoff.\n\n## Dashboard boundary\nsrc/baz.ts:30 keeps UI consumption separate.',
+      toolCalls: [
+        {
+          tool: 'code',
+          args: { action: 'read', params: { path: 'src/foo.ts' } },
+          result: {
+            path: 'src/foo.ts',
+            content: 'export function runtimeBoundary() { return true; }',
+            startLine: 10,
+          },
+        },
+        {
+          tool: 'code',
+          args: { action: 'read', params: { path: 'src/bar.ts' } },
+          result: {
+            path: 'src/bar.ts',
+            content: 'export function producerBoundary() { return true; }',
+            startLine: 20,
+          },
+        },
+        {
+          tool: 'code',
+          args: { action: 'read', params: { path: 'src/baz.ts' } },
+          result: {
+            path: 'src/baz.ts',
+            content: 'export function dashboardBoundary() { return true; }',
+            startLine: 30,
+          },
+        },
+      ],
+      tokenUsage: { input: 1, output: 1 },
+      pcvNodeEvidence: {
+        chainNodeId: 'agent:analyze:dim-agent',
+        correlation: {
+          dimensionId: 'architecture',
+          dimensionScopeId: 'dim-agent',
+          iteration: 1,
+          modelRef: 'unit:model',
+          runId: 'job-1',
+          source: 'system',
+          targetName: 'Architecture',
+        },
+        findingRefs: {
+          accepted: [
+            {
+              callId: 'call-1',
+              evidence: ['src/foo.ts:10'],
+              findingSummary: 'Runtime boundary was recorded',
+              importance: 8,
+              origin: 'note_finding',
+              ref: 'finding:runtime',
+              sourceRefs: ['src/foo.ts:10'],
+              toolName: 'note_finding',
+            },
+          ],
+          rejected: [],
+        },
+        inputAssembly: {
+          effectiveToolChoice: 'auto',
+          inputLayerAppended: true,
+          inputSectionIds: ['identity', 'stagePolicy', 'toolContract'],
+          messageCount: 1,
+          modelRef: 'unit:model',
+          providerMessageCount: 2,
+          providerVisibleSectionIds: ['identity', 'stagePolicy', 'toolContract'],
+          ref: 'llm-input:test',
+          requestedToolChoice: 'auto',
+          stageProfile: 'analyze',
+          staticSectionIds: ['identity'],
+          toolSchemaNames: ['code', 'note_finding'],
+        },
+        ledgerRefs: [
+          {
+            kind: 'observation-ledger',
+            ref: 'active-context:dim-agent',
+            source: 'ActiveContext',
+            stats: { rounds: 1 },
+          },
+        ],
+        missingLinkReasons: [],
+        nodeId: 'agent:analyze:dim-agent',
+        qualityGate: null,
+        repair: { attempted: false, evidencePaths: [], reason: null, status: null },
+        schemaVersion: 1,
+        sourceRefs: ['src/foo.ts:10'],
+        stageIdentity: {
+          dimensionId: 'architecture',
+          nodeKind: 'agent-runtime-node',
+          pipelinePhase: 'analyze',
+          pipelineType: 'analyst',
+          stageProfile: 'analyze',
+          targetName: 'Architecture',
+          trackerPhase: 'SCAN',
+        },
+      },
+    };
+    const activeContext = {
+      distill: () => ({
+        keyFindings: [
+          { finding: 'Runtime boundary verified', evidence: 'src/foo.ts:10', importance: 8 },
+          { finding: 'Producer boundary verified', evidence: 'src/bar.ts:20', importance: 8 },
+          { finding: 'Dashboard boundary verified', evidence: 'src/baz.ts:30', importance: 7 },
+        ],
+        toolCallSummary: [],
+      }),
+    };
+
+    const result = insightGateEvaluator(
+      source,
+      {},
+      {
+        activeContext,
+        dimId: 'architecture',
+        needsCandidates: true,
+      }
+    );
+    const artifact = result.artifact as Record<string, unknown>;
+    const pcvEvidence = artifact.pcvNodeEvidence as Record<string, unknown>;
+    const findingRefs = pcvEvidence.findingRefs as {
+      accepted: Array<Record<string, unknown>>;
+      rejected: Array<Record<string, unknown>>;
+    };
+
+    expect(pcvEvidence).toMatchObject({
+      inputAssembly: { ref: 'llm-input:test', stageProfile: 'analyze' },
+      ledgerRefs: [{ ref: 'active-context:dim-agent' }],
+      nodeId: 'agent:analyze:dim-agent',
+      qualityGate: {
+        pass: true,
+        stage: 'quality_gate',
+        status: 'pass',
+      },
+    });
+    expect(findingRefs.accepted.map((finding) => finding.ref)).toEqual(
+      expect.arrayContaining(['finding:runtime'])
+    );
+    expect(findingRefs.accepted.some((finding) => finding.origin === 'quality_artifact')).toBe(
+      true
+    );
+    expect(pcvEvidence.sourceRefs).toEqual(
+      expect.arrayContaining(['src/foo.ts:10', 'src/bar.ts:20', 'src/baz.ts:30'])
+    );
+    expect(pcvEvidence.missingLinkReasons).not.toContain('missing-quality-gate-status');
+    expect(artifact.metadata).toMatchObject({
+      pcvNodeEvidenceRef: 'agent:analyze:dim-agent',
+      pcvQualityGateStatus: 'pass',
     });
   });
 });

@@ -104,7 +104,7 @@ describe('LLM input layering', () => {
       phaseContext: 'SCAN briefing: produce a small plan before tools.',
     });
 
-    await runtime.reactLoop('analyze with apiKey=visibleInputSecret12345', {
+    const result = await runtime.reactLoop('analyze with apiKey=visibleInputSecret12345', {
       source: 'system',
       context: { pipelinePhase: 'analyze', dimensionId: 'architecture' },
       systemPromptOverride: 'Analyst identity prompt',
@@ -133,6 +133,20 @@ describe('LLM input layering', () => {
     expect(llmInput?.metadata).toMatchObject({
       inputLayerAppended: true,
       inputStageProfile: 'analyze',
+      pcvNodeEvidence: {
+        inputAssemblyRef: expect.stringMatching(/^llm-input:/),
+        stageIdentity: { stageProfile: 'analyze' },
+      },
+    });
+    expect(JSON.stringify(llmInput?.metadata?.pcvNodeEvidence)).not.toContain(
+      'visibleInputSecret12345'
+    );
+    expect(result.pcvNodeEvidence).toMatchObject({
+      inputAssembly: {
+        ref: expect.stringMatching(/^llm-input:/),
+        stageProfile: 'analyze',
+      },
+      stageIdentity: { pipelinePhase: 'analyze', stageProfile: 'analyze' },
     });
   });
 
@@ -227,6 +241,7 @@ describe('LLM input layering', () => {
         dimensionScopeId: 'architecture:analyst',
       },
       memoryCoordinator,
+      trace: activeContext as never,
       systemPromptOverride: 'Analyst identity prompt',
       tracker: tracker as never,
       budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
@@ -246,6 +261,10 @@ describe('LLM input layering', () => {
     expect(llmInput?.metadata).toMatchObject({
       inputLayerAppended: true,
       inputStageProfile: 'analyze',
+      pcvNodeEvidence: {
+        inputAssemblyRef: expect.stringMatching(/^llm-input:/),
+        ledgerRefs: ['active-context:architecture:analyst'],
+      },
     });
   });
 

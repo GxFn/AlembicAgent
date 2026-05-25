@@ -62,6 +62,11 @@ import { buildLlmInputAssembly, type LLMInputAssembly } from './LLMInputAssembly
 import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
+import {
+  buildPcvNodeEvidenceProcessMetadata,
+  recordPcvInputAssembly,
+  recordPcvToolResult,
+} from './PcvNodeEvidence.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
 
@@ -859,6 +864,12 @@ export class AgentRuntime {
         systemPrompt: effectiveSystemPrompt,
         tools: unifiedTools,
       });
+      recordPcvInputAssembly(ctx.pcvNodeEvidence, llmInputAssembly, {
+        effectiveToolChoice,
+        iteration: ctx.iteration,
+        modelRef: this.#modelRef,
+        requestedToolChoice: toolChoice,
+      });
       const unifiedMessages = llmInputAssembly.providerMessages;
       const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
         kind: 'llm.input',
@@ -1251,6 +1262,7 @@ export class AgentRuntime {
 
       const toolResultObj = toolResult as Record<string, unknown> | null;
       const toolSucceeded = envelope ? envelope.ok : !toolResultObj?.error;
+      recordPcvToolResult(ctx.pcvNodeEvidence, fc, toolResult, envelope, { toolSucceeded });
       if (isNoteFindingFunctionCall(fc)) {
         const recorded = toolResultObj?.recorded === true;
         const target = String(toolResultObj?.target || 'unknown');
@@ -1954,6 +1966,7 @@ function buildAgentProcessEvent(
     metadata: sanitizeDeveloperData({
       iteration: ctx.iteration,
       source: ctx.source,
+      pcvNodeEvidence: buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence),
       ...(input.metadata || {}),
     }) as Record<string, unknown>,
     phase,

@@ -252,6 +252,14 @@ describe('agent runtime forced summary suppression', () => {
     expect(toolEvents[0]?.content?.text).not.toContain('visibleToolArgSecret12345');
     expect(toolEvents[1]?.content?.text).not.toContain('visibleToolResultSecret12345');
     expect(toolEvents[1]?.severity).toBe('success');
+    expect(toolEvents[1]?.metadata?.pcvNodeEvidence).toMatchObject({
+      inputAssemblyRef: expect.stringMatching(/^llm-input:/),
+      nodeId: expect.any(String),
+      sourceRefs: [],
+    });
+    expect(JSON.stringify(toolEvents[1]?.metadata?.pcvNodeEvidence)).not.toContain(
+      'visibleToolResultSecret12345'
+    );
   });
 
   it('emits semantic digest and continue nudge process payloads', async () => {
@@ -408,6 +416,93 @@ describe('agent runtime forced summary suppression', () => {
     expect((directSchema?.parameters as { required?: string[] }).required).toEqual(
       expect.arrayContaining(['finding', 'evidence', 'importance'])
     );
+  });
+
+  it('records accepted note_finding refs in PCVM node evidence', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [
+          {
+            id: 'finding-call-1',
+            name: 'note_finding',
+            args: {
+              evidence: 'src/foo.ts:10',
+              finding: 'Runtime evidence was verified',
+              importance: 8,
+            },
+          },
+        ],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const toolRouter = {
+      execute: vi.fn(async () =>
+        createToolEnvelope('memory', 'recorded', {
+          importance: 8,
+          message: 'recorded',
+          recorded: true,
+          target: 'activeContext',
+        })
+      ),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: toolRouter as never,
+      container: {
+        get: (name: string) => {
+          if (name !== 'capabilityCatalog') {
+            return undefined;
+          }
+          return {
+            toToolSchemas: (ids?: readonly string[] | null) =>
+              ids?.includes('memory')
+                ? [{ name: 'memory', description: 'Memory', parameters: { type: 'object' } }]
+                : [],
+          };
+        },
+      } as never,
+      capabilities: [],
+      additionalTools: ['memory'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      onProgress: (event) => progress.push(event),
+    });
+
+    const result = await runtime.reactLoop('record one verified finding', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze', dimensionId: 'architecture' },
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+    const toolEnd = progress
+      .map((event) => event.processEvent)
+      .find((event) => event?.title === 'Tool call completed: note_finding');
+    const pcvEvidence = result.pcvNodeEvidence as {
+      findingRefs: { accepted: Array<{ ref: string; sourceRefs: string[] }> };
+    };
+    const accepted = pcvEvidence.findingRefs.accepted[0];
+
+    expect(toolRouter.execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        args: expect.objectContaining({
+          action: 'note_finding',
+        }),
+        toolId: 'memory',
+      })
+    );
+    expect(accepted).toMatchObject({
+      sourceRefs: ['src/foo.ts:10'],
+    });
+    expect(toolEnd?.metadata?.pcvNodeEvidence).toMatchObject({
+      acceptedFindingRefs: [accepted.ref],
+      sourceRefs: ['src/foo.ts:10'],
+    });
   });
 
   it('does not force summary after abort exits', async () => {
