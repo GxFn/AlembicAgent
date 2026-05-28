@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ToolContext } from '../src/tools/v2/index.js';
 import {
@@ -162,6 +165,93 @@ describe('Tool V2 contract exports', () => {
     expect(createRequests[0]?.source).toBe('alembic-agent');
     expect(createRequests[0]?.options?.userId).toBe('alembic-agent');
     expect(createRequests[0]?.items[0]?.source).toBe('alembic-agent');
+  });
+
+  it('grounds knowledge sourceRefs against project files and trusted analysis refs', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-source-ref-'));
+    fs.mkdirSync(path.join(projectRoot, 'src/verified'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'src/verified/Existing.ts'), 'export const ok = true;');
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: {
+        title: 'SourceRef grounding boundary',
+        description: 'Records sourceRef grounding without hiding invalid producer references.',
+        content: {
+          markdown:
+            'This candidate documents sourceRef grounding for producer-owned knowledge submissions. '.repeat(
+              4
+            ),
+          rationale:
+            'The handler should normalize references only when project files or trusted analysis refs prove the path.',
+        },
+        kind: 'pattern',
+        trigger: 'SourceRef grounding boundary',
+        whenClause: 'When the producer submits sourceRefs collected from analysis evidence.',
+        doClause: 'Prefer verified relative paths and preserve unverified refs for N11 scorecard.',
+        reasoning: {
+          sources: ['Existing.ts:4', 'Invented.swift'],
+          confidence: 0.9,
+        },
+        sourceRefs: ['Existing.ts:4', 'Invented.swift'],
+      },
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      runtime: {
+        sharedState: {
+          _producerReferencedFiles: ['src/verified/Existing.ts'],
+        },
+      },
+      recipeGateway: {
+        create: async (request: { items: Record<string, unknown>[] }) => {
+          createRequests.push(request);
+          return {
+            created: [{ id: 'candidate-1', title: 'SourceRef grounding boundary' }],
+            rejected: [],
+            duplicates: [],
+            merged: [],
+            blocked: [],
+          };
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    const item = createRequests[0]?.items[0] as {
+      agentNotes?: { sourceRefGrounding?: Record<string, unknown> };
+      reasoning?: { sources?: string[] };
+      sourceRefs?: string[];
+    };
+    expect(item.sourceRefs).toEqual(['src/verified/Existing.ts:4', 'Invented.swift']);
+    expect(item.reasoning?.sources).toEqual(['src/verified/Existing.ts:4', 'Invented.swift']);
+    expect(item.agentNotes?.sourceRefGrounding).toMatchObject({
+      sourceRefs: {
+        normalized: [
+          {
+            from: 'Existing.ts:4',
+            to: 'src/verified/Existing.ts:4',
+            reason: 'unique-trusted-basename-match',
+          },
+        ],
+        warnings: [
+          {
+            ref: 'Invented.swift',
+            reason:
+              'sourceRef was not found in projectRoot or trusted analysis refs; preserved for downstream N11 scorecard',
+          },
+        ],
+      },
+    });
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {

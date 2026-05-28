@@ -7,6 +7,7 @@
  * 后端: SearchEngine (BM25 + 向量), RecipeProductionGateway, KnowledgeRepository
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
@@ -104,8 +105,13 @@ async function handleSubmit(
 
     const content = params.content as Record<string, unknown>;
     const reasoning = params.reasoning as Record<string, unknown> | undefined;
-    const normalizedSources = normalizeStringArray(
-      reasoning?.sources ?? params.sourceRefs ?? params.filePaths
+    const normalizedSources = groundSourceRefs(
+      normalizeStringArray(reasoning?.sources ?? params.sourceRefs ?? params.filePaths),
+      ctx
+    );
+    const normalizedSourceRefs = groundSourceRefs(
+      normalizeStringArray(params.sourceRefs ?? params.filePaths ?? normalizedSources.refs),
+      ctx
     );
     const dimMeta = (ctx.runtime?.dimensionMeta as DimensionMetaLike | null | undefined) ?? null;
     const effectiveDimensionId =
@@ -125,7 +131,7 @@ async function handleSubmit(
     const itemReasoning = {
       ...reasoning,
       whyStandard: pickString(reasoning?.whyStandard) ?? rationale ?? description,
-      sources: normalizedSources,
+      sources: normalizedSources.refs,
       confidence:
         typeof reasoning?.confidence === 'number'
           ? reasoning.confidence
@@ -149,15 +155,13 @@ async function handleSubmit(
       usageGuide: pickString(params.usageGuide) ?? buildDefaultUsageGuide(params),
       tags,
       reasoning: itemReasoning,
-      sourceRefs: normalizeStringArray(params.sourceRefs ?? params.filePaths ?? normalizedSources),
+      sourceRefs: normalizedSourceRefs.refs,
       dimensionId: effectiveDimensionId,
       knowledgeType: effectiveKnowledgeType,
       category: effectiveCategory,
       language: effectiveLanguage,
       source: isBootstrap ? 'bootstrap' : AGENT_RUNTIME_SOURCE,
-      agentNotes: dimMeta
-        ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
-        : null,
+      agentNotes: buildAgentNotes(dimMeta, normalizedSources, normalizedSourceRefs),
     };
 
     const result = await gateway.create({
@@ -255,6 +259,173 @@ function normalizeStringArray(value: unknown): string[] {
     return [];
   }
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+interface SourceRefGrounding {
+  originalRefs: string[];
+  refs: string[];
+  normalized: Array<{ from: string; to: string; reason: string }>;
+  warnings: Array<{ ref: string; reason: string }>;
+}
+
+function buildAgentNotes(
+  dimMeta: DimensionMetaLike | null,
+  normalizedSources: SourceRefGrounding,
+  normalizedSourceRefs: SourceRefGrounding
+): Record<string, unknown> | null {
+  const grounding = {
+    reasoningSources: compactGroundingNotes(normalizedSources),
+    sourceRefs: compactGroundingNotes(normalizedSourceRefs),
+  };
+  const hasGroundingNotes =
+    grounding.reasoningSources.normalized.length > 0 ||
+    grounding.reasoningSources.warnings.length > 0 ||
+    grounding.sourceRefs.normalized.length > 0 ||
+    grounding.sourceRefs.warnings.length > 0;
+  const base = dimMeta
+    ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
+    : null;
+  if (!hasGroundingNotes) {
+    return base;
+  }
+  return {
+    ...(base ?? {}),
+    sourceRefGrounding: grounding,
+  };
+}
+
+function compactGroundingNotes(grounding: SourceRefGrounding) {
+  return {
+    originalRefs: grounding.originalRefs,
+    normalized: grounding.normalized,
+    warnings: grounding.warnings,
+  };
+}
+
+function groundSourceRefs(refs: string[], ctx: ToolContext): SourceRefGrounding {
+  const trustedRefs = collectTrustedSourceRefs(ctx);
+  const normalized: SourceRefGrounding['normalized'] = [];
+  const warnings: SourceRefGrounding['warnings'] = [];
+  const grounded = refs.map((ref) => {
+    const result = groundSingleSourceRef(ref, ctx.projectRoot, trustedRefs);
+    if (result.normalizedFrom) {
+      normalized.push({ from: result.normalizedFrom, to: result.ref, reason: result.reason });
+    }
+    if (result.warning) {
+      warnings.push({ ref: result.ref, reason: result.warning });
+    }
+    return result.ref;
+  });
+  return {
+    originalRefs: refs,
+    refs: uniqueStrings(grounded),
+    normalized,
+    warnings,
+  };
+}
+
+function collectTrustedSourceRefs(ctx: ToolContext): string[] {
+  const sharedState =
+    ctx.runtime?.sharedState && typeof ctx.runtime.sharedState === 'object'
+      ? ctx.runtime.sharedState
+      : {};
+  return uniqueStrings([
+    ...normalizeStringArray(sharedState._recordRepairEvidencePaths),
+    ...normalizeStringArray(sharedState._producerReferencedFiles),
+    ...normalizeStringArray(sharedState._referencedFiles),
+    ...normalizeStringArray(sharedState.referencedFiles),
+  ]).map((ref) => stripSourceRefLine(ref).pathOnly);
+}
+
+function groundSingleSourceRef(
+  ref: string,
+  projectRoot: string,
+  trustedRefs: string[]
+): { ref: string; normalizedFrom?: string; reason: string; warning?: string } {
+  const trimmed = normalizePathText(ref);
+  const { pathOnly, suffix } = stripSourceRefLine(trimmed);
+  const projectRelative = normalizeProjectRelativePath(pathOnly, projectRoot);
+  const withSuffix = (base: string) => `${base}${suffix}`;
+
+  if (projectRelative && fileExists(projectRoot, projectRelative)) {
+    const grounded = withSuffix(projectRelative);
+    return {
+      ref: grounded,
+      normalizedFrom: grounded === trimmed ? undefined : ref,
+      reason: 'project-file-exists',
+    };
+  }
+
+  const exactTrusted = trustedRefs.find((candidate) => candidate === projectRelative);
+  if (exactTrusted) {
+    return {
+      ref: withSuffix(exactTrusted),
+      normalizedFrom: withSuffix(exactTrusted) === trimmed ? undefined : ref,
+      reason: 'trusted-analysis-ref',
+    };
+  }
+
+  const basename = path.posix.basename(projectRelative || pathOnly);
+  const basenameMatches = trustedRefs.filter(
+    (candidate) => path.posix.basename(candidate) === basename
+  );
+  if (basename && basenameMatches.length === 1) {
+    return {
+      ref: withSuffix(basenameMatches[0]),
+      normalizedFrom: ref,
+      reason: 'unique-trusted-basename-match',
+    };
+  }
+
+  return {
+    ref: trimmed,
+    reason: 'unverified-preserved',
+    warning:
+      trustedRefs.length > 0
+        ? 'sourceRef was not found in projectRoot or trusted analysis refs; preserved for downstream N11 scorecard'
+        : 'no trusted analysis refs were available; sourceRef preserved for downstream N11 scorecard',
+  };
+}
+
+function normalizePathText(ref: string): string {
+  return ref.trim().replaceAll('\\', '/').replace(/^\.\//, '');
+}
+
+function stripSourceRefLine(ref: string): { pathOnly: string; suffix: string } {
+  const match = ref.match(/(?<path>.*?)(?<suffix>:\d+(?:-\d+)?)?$/);
+  return {
+    pathOnly: normalizePathText(match?.groups?.path ?? ref),
+    suffix: match?.groups?.suffix ?? '',
+  };
+}
+
+function normalizeProjectRelativePath(ref: string, projectRoot: string): string {
+  if (!ref) {
+    return ref;
+  }
+  if (!path.isAbsolute(ref)) {
+    return normalizePathText(ref);
+  }
+  const relative = path.relative(projectRoot, ref);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    return normalizePathText(ref);
+  }
+  return normalizePathText(relative);
+}
+
+function fileExists(projectRoot: string, ref: string): boolean {
+  if (!projectRoot || !ref || path.isAbsolute(ref)) {
+    return false;
+  }
+  try {
+    return fs.existsSync(path.join(projectRoot, ref));
+  } catch {
+    return false;
+  }
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
 function buildDefaultUsageGuide(params: Record<string, unknown>) {

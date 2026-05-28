@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
-import { PRODUCER_SYSTEM_PROMPT } from '../src/agent/prompts/insight-producer.js';
+import {
+  buildProducerPromptV2,
+  PRODUCER_SYSTEM_PROMPT,
+} from '../src/agent/prompts/insight-producer.js';
 import {
   AgentRuntime,
   type ProgressEvent,
@@ -88,6 +91,40 @@ function getLlmInput(progress: ProgressEvent[]) {
 }
 
 describe('LLM input layering', () => {
+  it('adds producer sourceRef grounding guidance from verified analysis refs', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: 'Verified behavior comes from Sources/App/Feature.swift:12.',
+        evidenceMap: new Map([
+          [
+            'Sources/App/Feature.swift',
+            {
+              codeSnippets: [
+                {
+                  content: 'struct Feature {}',
+                  endLine: 12,
+                  startLine: 12,
+                },
+              ],
+              filePath: 'Sources/App/Feature.swift',
+              summary: 'Feature source file',
+            },
+          ],
+        ]),
+        findings: [{ finding: 'Feature boundary', importance: 8 }],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'architecture', label: 'Architecture' },
+      { name: 'Demo' }
+    );
+
+    expect(prompt).toContain('SourceRef grounding policy');
+    expect(prompt).toContain('Sources/App/Feature.swift');
+    expect(prompt).toContain('不要只写文件名、模块名、目录别名');
+    expect(prompt).toContain('不要在 sourceRefs 中编造路径');
+  });
+
   it('projects explicit input sections into both provider messages and developer-visible llm.input', async () => {
     const progress: ProgressEvent[] = [];
     const capture: { messages?: Array<{ role: string; content?: string }> } = {};
