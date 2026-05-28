@@ -166,7 +166,5 @@ function providerEnvVar(providerId: ProviderId): string {
       return 'ALEMBIC_GOOGLE_API_KEY';
     case 'ollama':
       return 'ALEMBIC_OLLAMA_API_KEY';
-    case 'mock':
-      return 'ALEMBIC_AI_API_KEY';
   }
 }

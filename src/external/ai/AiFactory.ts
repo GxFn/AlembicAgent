@@ -4,14 +4,13 @@
  * 根据配置/环境变量创建对应的 AI Provider 实例。
  * 每个 AI 厂商都有独立的 Provider 类，互不继承。
  *
- * 支持: google-gemini, openai, deepseek, claude, ollama, mock
+ * 支持: google-gemini, openai, deepseek, claude, ollama
  */
 
 import Logger from '@alembic/core/logging';
 import { ClaudeProvider } from './providers/ClaudeProvider.js';
 import { DeepSeekProvider } from './providers/DeepSeekProvider.js';
 import { GoogleGeminiProvider } from './providers/GoogleGeminiProvider.js';
-import { MockProvider } from './providers/MockProvider.js';
 import { OllamaProvider } from './providers/OllamaProvider.js';
 import { OpenAiProvider } from './providers/OpenAiProvider.js';
 
@@ -24,7 +23,6 @@ const PROVIDER_MAP = {
   claude: ClaudeProvider,
   anthropic: ClaudeProvider,
   ollama: OllamaProvider,
-  mock: MockProvider,
 };
 
 type ProviderClass =
@@ -32,8 +30,7 @@ type ProviderClass =
   | typeof OpenAiProvider
   | typeof DeepSeekProvider
   | typeof ClaudeProvider
-  | typeof OllamaProvider
-  | typeof MockProvider;
+  | typeof OllamaProvider;
 
 /**
  * 创建 AI Provider 实例
@@ -70,7 +67,6 @@ export function autoDetectProvider() {
       claude: 'ALEMBIC_CLAUDE_API_KEY',
       anthropic: 'ALEMBIC_CLAUDE_API_KEY',
       ollama: null,
-      mock: null,
     };
     const requiredKeyEnv = keyEnvMap[explicit.toLowerCase()];
     if (requiredKeyEnv && !process.env[requiredKeyEnv]) {
@@ -104,7 +100,7 @@ export function autoDetectProvider() {
   logger.info(
     '[AiFactory] 未找到任何 AI API Key，AI 功能已跳过。请在宿主环境或 Alembic 运行配置中配置对应 provider 的 API Key。'
   );
-  return createProvider({ provider: 'mock' });
+  return null;
 }
 
 // ─── Fallback 机制 ──────────────────────────────────────────
@@ -246,7 +242,6 @@ export { AiProvider } from './AiProvider.js';
 export { ClaudeProvider } from './providers/ClaudeProvider.js';
 export { DeepSeekProvider } from './providers/DeepSeekProvider.js';
 export { GoogleGeminiProvider } from './providers/GoogleGeminiProvider.js';
-export { MockProvider } from './providers/MockProvider.js';
 export { OllamaProvider } from './providers/OllamaProvider.js';
 export { OpenAiProvider } from './providers/OpenAiProvider.js';
 

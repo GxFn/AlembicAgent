@@ -100,8 +100,8 @@ export async function produceForcedSummary({
 
   let finalReply: string | undefined;
 
-  // 如果熔断器已打开，跳过 AI 调用直接合成摘要
-  const isCircuitOpen = aiProvider._circuitState === 'OPEN' || aiProvider.name === 'mock';
+  // 如果熔断器已打开，跳过 AI 调用直接合成摘要；缺少真实 provider 的场景由上游显式标记不可用。
+  const isCircuitOpen = aiProvider._circuitState === 'OPEN';
   if (isCircuitOpen) {
     const outputType = isAnalyst ? 'analysis' : isSystem ? 'digest' : 'summary';
     logger.warn(

@@ -4,12 +4,13 @@ import {
   AiProvider,
   type AiProviderConfig,
   AiProviderManager,
+  autoDetectProvider,
   ClaudeProvider,
+  createProvider,
   DeepSeekProvider,
   GoogleGeminiProvider,
   getProviderConfig,
   type ManagedAiProvider,
-  MockProvider,
   type ModelDef,
   ModelRegistry,
   OpenAiProvider,
@@ -17,6 +18,14 @@ import {
   PROVIDER_CONFIGS,
   type SwitchResult,
 } from '../src/index.js';
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
+}
 
 class RetryHarnessProvider extends AiProvider {
   constructor(config: AiProviderConfig = {}) {
@@ -30,11 +39,59 @@ class RetryHarnessProvider extends AiProvider {
   }
 }
 
+class TestLocalFakeProvider extends AiProvider {
+  #calls: Array<{ method: string }> = [];
+  #chatResponse: string;
+
+  constructor(config: AiProviderConfig = {}) {
+    super(config);
+    this.name = 'test-local-fake';
+    this.model = 'test-local-model';
+    this.#chatResponse = String(config.responses?.chat ?? 'test response');
+  }
+
+  async chat(): Promise<string> {
+    this.#calls.push({ method: 'chat' });
+    return this.#chatResponse;
+  }
+
+  async chatWithTools(): Promise<{
+    text: null;
+    functionCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+  }> {
+    this.#calls.push({ method: 'chatWithTools' });
+    return {
+      text: null,
+      functionCalls: [
+        {
+          id: 'test-fake-call',
+          name: 'classify_intent',
+          args: { type: 'general', confidence: 0.9 },
+        },
+      ],
+    };
+  }
+
+  async embed(text: string | string[]): Promise<number[] | number[][]> {
+    this.#calls.push({ method: 'embed' });
+    const values = Array.isArray(text) ? text : [text];
+    const vectors = values.map((value) => {
+      const seed = [...value].reduce((acc, char) => acc + char.charCodeAt(0), 0);
+      return Array.from({ length: 8 }, (_, index) => ((seed + index) % 17) / 17);
+    });
+    return Array.isArray(text) ? vectors : vectors[0];
+  }
+
+  getCalls(): Array<{ method: string }> {
+    return this.#calls;
+  }
+}
+
 function createThinkingModel(): ModelDef {
   return {
-    id: 'mock:test-thinking',
-    displayName: 'Mock Thinking Model',
-    provider: 'mock',
+    id: 'openai:test-thinking',
+    displayName: 'Test Thinking Model',
+    provider: 'openai',
     apiModelId: 'test-thinking',
     contextWindow: 4096,
     maxOutputTokens: 1024,
@@ -68,11 +125,37 @@ describe('AI provider public entrypoint', () => {
       defaultModelId: 'openai:gpt-5.5',
       keyEnvVar: 'ALEMBIC_OPENAI_API_KEY',
     });
-    expect(new ModelRegistry().resolveOrCreate('mock', 'dynamic-test')).toMatchObject({
-      id: 'mock:dynamic-test',
-      provider: 'mock',
+    expect(new ModelRegistry().resolveOrCreate('openai', 'dynamic-test')).toMatchObject({
+      id: 'openai:dynamic-test',
+      provider: 'openai',
       apiModelId: 'dynamic-test',
     });
+  });
+
+  it('does not expose a product test provider or fallback when credentials are absent', () => {
+    const saved = {
+      provider: process.env.ALEMBIC_AI_PROVIDER,
+      google: process.env.ALEMBIC_GOOGLE_API_KEY,
+      openai: process.env.ALEMBIC_OPENAI_API_KEY,
+      claude: process.env.ALEMBIC_CLAUDE_API_KEY,
+      deepseek: process.env.ALEMBIC_DEEPSEEK_API_KEY,
+    };
+    delete process.env.ALEMBIC_AI_PROVIDER;
+    delete process.env.ALEMBIC_GOOGLE_API_KEY;
+    delete process.env.ALEMBIC_OPENAI_API_KEY;
+    delete process.env.ALEMBIC_CLAUDE_API_KEY;
+    delete process.env.ALEMBIC_DEEPSEEK_API_KEY;
+
+    try {
+      expect(autoDetectProvider()).toBeNull();
+      expect(() => createProvider({ provider: `${'mo'}${'ck'}` })).toThrow(/Unknown AI provider/);
+    } finally {
+      restoreEnv('ALEMBIC_AI_PROVIDER', saved.provider);
+      restoreEnv('ALEMBIC_GOOGLE_API_KEY', saved.google);
+      restoreEnv('ALEMBIC_OPENAI_API_KEY', saved.openai);
+      restoreEnv('ALEMBIC_CLAUDE_API_KEY', saved.claude);
+      restoreEnv('ALEMBIC_DEEPSEEK_API_KEY', saved.deepseek);
+    }
   });
 });
 
@@ -130,9 +213,9 @@ describe('AI provider credential guidance', () => {
   });
 });
 
-describe('MockProvider', () => {
-  it('returns deterministic mock chat, tool, and embedding results', async () => {
-    const provider = new MockProvider({ responses: { chat: 'fixed response' } });
+describe('TestLocalFakeProvider', () => {
+  it('returns deterministic chat, tool, and embedding results inside the test boundary', async () => {
+    const provider = new TestLocalFakeProvider({ responses: { chat: 'fixed response' } });
 
     await expect(provider.chat('hello')).resolves.toBe('fixed response');
 
@@ -148,7 +231,7 @@ describe('MockProvider', () => {
 
     const embeddings = (await provider.embed(['alpha', 'alpha'])) as number[][];
     expect(embeddings).toHaveLength(2);
-    expect(embeddings[0]).toHaveLength(768);
+    expect(embeddings[0]).toHaveLength(8);
     expect(embeddings[1]).toEqual(embeddings[0]);
     expect(provider.getCalls().map((entry) => entry.method)).toEqual([
       'chat',
@@ -249,8 +332,8 @@ describe('AiProvider retry and error classification', () => {
 describe('AiProviderManager', () => {
   it('rewires token tracking and emits switch events when routing providers', () => {
     const initialProvider: ManagedAiProvider = {
-      name: 'mock',
-      model: 'mock-smart',
+      name: 'test-local-fake',
+      model: 'test-local-model',
       supportsEmbedding: () => true,
     };
     const nextProvider: ManagedAiProvider = {
@@ -292,15 +375,15 @@ describe('AiProviderManager', () => {
       source: 'tools',
     });
 
-    expect(result.previous).toMatchObject({ name: 'mock', isMock: true });
+    expect(result.previous).toMatchObject({ name: 'test-local-fake', isMock: false });
     expect(result.current).toMatchObject({ name: 'openai', model: 'gpt-test', isMock: false });
     expect(manager.isMock).toBe(false);
     expect(switches).toHaveLength(1);
     expect(tokenRecords).toEqual([
       {
         source: 'chat',
-        provider: 'mock',
-        model: 'mock-smart',
+        provider: 'test-local-fake',
+        model: 'test-local-model',
         inputTokens: 2,
         outputTokens: 3,
       },

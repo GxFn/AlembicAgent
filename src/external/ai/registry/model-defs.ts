@@ -6,7 +6,7 @@
  * 统一从 ModelRegistry 查询，而非各自硬编码。
  */
 
-export type ProviderId = 'openai' | 'deepseek' | 'claude' | 'google' | 'ollama' | 'mock';
+export type ProviderId = 'openai' | 'deepseek' | 'claude' | 'google' | 'ollama';
 
 export interface ModelDef {
   /** 唯一标识: provider:apiModelId */
