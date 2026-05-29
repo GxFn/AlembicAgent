@@ -881,6 +881,7 @@ export class PipelineStrategy extends Strategy {
         ...((message.metadata.context as Record<string, unknown>) || {}),
         pipelinePhase: stage.name,
         previousPhases: phaseResults,
+        evidenceStarters: strategyContext.evidenceStarters || null,
         toolPolicyHints: strategyContext.toolPolicyHints || null,
         ...(stage.recordRepairOnly
           ? {

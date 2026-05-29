@@ -505,6 +505,204 @@ describe('agent runtime forced summary suppression', () => {
     });
   });
 
+  it('blocks DeepSeek V4 analyze text-only first burn without evidence grounding', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: 'I can already conclude the architecture shape from general context.',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'Planning-only: use deterministic evidence src/known.ts:10 to decide the next read before asserting facts.',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      });
+    const tracker = {
+      phase: 'SCAN',
+      pipelineType: 'analyst',
+      isGracefulExit: false,
+      isHardExit: false,
+      iteration: 0,
+      totalSubmits: 0,
+      tick: vi.fn(),
+      rollbackTick: vi.fn(),
+      shouldExit: vi.fn(() => false),
+      getNudge: vi.fn(() => null),
+      getPhaseContext: vi.fn(() => null),
+      getToolChoice: vi.fn(() => 'none'),
+      getMetrics: vi.fn(() => ({
+        evidenceToolCallCount: 0,
+        memoryFindingCount: 0,
+        uniqueFiles: 0,
+        uniquePatterns: 0,
+      })),
+      endRound: vi.fn(() => null),
+      onTextResponse: vi.fn(() => ({
+        isFinalAnswer: true,
+        needsDigestNudge: false,
+        shouldContinue: false,
+        nudge: null,
+      })),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'deepseek', model: 'deepseek-v4-flash', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      modelRef: 'deepseek:deepseek-v4-flash',
+      onProgress: (event) => progress.push(event),
+    });
+
+    const result = await runtime.reactLoop('analyze first burn', {
+      source: 'system',
+      context: {
+        evidenceStarters: {
+          entry: { hint: 'src/known.ts:10 is a deterministic starter.' },
+        },
+        pipelinePhase: 'analyze',
+      },
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+    });
+
+    const ledger = result.pcvNodeEvidence.groundingLedger;
+    const nudge = progress
+      .map((event) => event.processEvent)
+      .find((event) => event?.metadata?.semanticKind === 'evidence-grounding-nudge');
+
+    expect(chatWithTools).toHaveBeenCalledTimes(2);
+    expect(tracker.rollbackTick).toHaveBeenCalledTimes(1);
+    expect(tracker.endRound).toHaveBeenCalledTimes(1);
+    expect(ledger.map((entry) => entry.classification)).toEqual([
+      'invalid-no-evidence',
+      'planning-only',
+    ]);
+    expect(ledger[1]?.consumedEvidenceRefs).toEqual(['src/known.ts:10']);
+    expect(nudge?.content?.text).toContain('不能推进阶段');
+  });
+
+  it('keeps DeepSeek V4 analyze evidence tools visible without forcing required', async () => {
+    const captures: Array<Record<string, unknown> | undefined> = [];
+    const chatWithTools = vi
+      .fn()
+      .mockImplementationOnce(async (_prompt: string, opts?: Record<string, unknown>) => {
+        captures.push(opts);
+        return {
+          text: null,
+          functionCalls: [
+            {
+              id: 'call_code_1',
+              name: 'code',
+              args: { action: 'read', params: { filePaths: ['src/known.ts'] } },
+            },
+          ],
+          usage: { inputTokens: 2, outputTokens: 1 },
+        };
+      })
+      .mockImplementationOnce(async (_prompt: string, opts?: Record<string, unknown>) => {
+        captures.push(opts);
+        return {
+          text: 'final after tool evidence',
+          functionCalls: [],
+          usage: { inputTokens: 2, outputTokens: 1 },
+        };
+      });
+    let evidenceToolCalls = 0;
+    const tracker = {
+      phase: 'SCAN',
+      pipelineType: 'analyst',
+      isGracefulExit: false,
+      isHardExit: false,
+      iteration: 0,
+      totalSubmits: 0,
+      tick: vi.fn(),
+      rollbackTick: vi.fn(),
+      shouldExit: vi.fn(() => false),
+      getNudge: vi.fn(() => null),
+      getPhaseContext: vi.fn(() => null),
+      getToolChoice: vi.fn(() => 'none'),
+      recordToolCall: vi.fn(() => {
+        evidenceToolCalls += 1;
+        return { isNew: true };
+      }),
+      getMetrics: vi.fn(() => ({
+        evidenceToolCallCount: evidenceToolCalls,
+        memoryFindingCount: 0,
+        uniqueFiles: evidenceToolCalls,
+        uniquePatterns: 0,
+      })),
+      endRound: vi.fn(() => {
+        tracker.phase = 'EXPLORE';
+        return null;
+      }),
+      onTextResponse: vi.fn(() => ({
+        isFinalAnswer: true,
+        needsDigestNudge: false,
+        shouldContinue: false,
+        nudge: null,
+      })),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'deepseek', model: 'deepseek-v4-flash', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: {
+        execute: vi.fn(async () =>
+          createToolEnvelope('code', 'src/known.ts:10 contains verified code', {
+            path: 'src/known.ts',
+            sourceRefs: ['src/known.ts:10'],
+          })
+        ),
+      } as never,
+      container: {
+        get: (name: string) => {
+          if (name !== 'capabilityCatalog') {
+            return undefined;
+          }
+          return {
+            toToolSchemas: () => [
+              {
+                name: 'code',
+                description: 'Code evidence tool',
+                parameters: { type: 'object' },
+              },
+            ],
+          };
+        },
+      } as never,
+      capabilities: [],
+      additionalTools: ['code'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      modelRef: 'deepseek:deepseek-v4-flash',
+    });
+
+    const result = await runtime.reactLoop('analyze with tools visible', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze' },
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+    });
+    const firstCall = captures[0] || {};
+    const firstSchemas = firstCall.toolSchemas as Array<Record<string, unknown>> | undefined;
+    const firstBurn = result.pcvNodeEvidence.groundingLedger[0];
+
+    expect(firstSchemas?.map((schema) => schema.name)).toContain('code');
+    expect(firstCall.toolChoice).toBe('auto');
+    expect(firstCall.toolChoice).not.toBe('required');
+    expect(firstBurn).toMatchObject({
+      classification: 'evidence-produced',
+      deepseekV4ToolChoiceMode: 'tools-visible-no-forced-tool-choice',
+      effectiveToolChoice: 'auto',
+      requestedToolChoice: 'none',
+      toolChoiceSent: false,
+      toolChoiceSupported: false,
+      toolSchemasVisible: true,
+    });
+    expect(firstBurn?.sourceRefDelta).toBeGreaterThan(0);
+  });
+
   it('does not force summary after abort exits', async () => {
     const { runtime, chatWithTools } = createRuntimeForReactLoop();
     const abortController = new AbortController();

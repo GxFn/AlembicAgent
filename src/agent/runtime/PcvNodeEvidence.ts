@@ -30,6 +30,43 @@ export interface PcvNodeInputAssemblyEvidence {
   toolSchemaNames: string[];
 }
 
+export type PcvBurnGroundingClassification =
+  | 'deterministic-evidence-consumed'
+  | 'evidence-produced'
+  | 'verification-only'
+  | 'record-only'
+  | 'planning-only'
+  | 'invalid-no-evidence'
+  | 'summary-only';
+
+export interface PcvBurnGroundingLedgerEntry {
+  acceptedFindingDelta: number;
+  classification: PcvBurnGroundingClassification;
+  consumedEvidenceRefs: string[];
+  deepseekV4ToolChoiceMode?: string | null;
+  deterministicEvidenceRefs: string[];
+  effectiveToolChoice: string | null;
+  evidenceStarterRefs: string[];
+  evidenceToolCallDelta: number;
+  functionCallNames: string[];
+  iteration: number;
+  outputSourceRefs: string[];
+  pipelineType: string | null;
+  reasoningTokens: number;
+  ref: string;
+  rejectedFindingDelta: number;
+  requestedToolChoice: string | null;
+  sourceRefDelta: number;
+  stageProfile: string;
+  textOutputChars: number;
+  toolCallDelta: number;
+  toolChoiceSent?: boolean;
+  toolChoiceSupported?: boolean;
+  toolSchemaNames: string[];
+  toolSchemasVisible?: boolean;
+  trackerPhase: string | null;
+}
+
 export interface PcvNodeLedgerRef {
   kind: 'observation-ledger';
   ref: string;
@@ -96,6 +133,7 @@ export interface PcvNodeEvidenceSummary {
     accepted: PcvNodeAcceptedFindingRef[];
     rejected: PcvNodeRejectedFindingRef[];
   };
+  groundingLedger: PcvBurnGroundingLedgerEntry[];
   inputAssembly: PcvNodeInputAssemblyEvidence | null;
   ledgerRefs: PcvNodeLedgerRef[];
   missingLinkReasons: string[];
@@ -112,6 +150,7 @@ export interface PcvNodeEvidenceProcessMetadata {
   chainNodeId: string;
   correlation: PcvNodeEvidenceSummary['correlation'];
   inputAssemblyRef: string | null;
+  groundingLedger: PcvBurnGroundingLedgerEntry[];
   ledgerRefs: string[];
   missingLinkReasons: string[];
   nodeId: string;
@@ -146,6 +185,8 @@ const FILE_REF_RE =
 
 const MAX_SOURCE_REFS = 80;
 const MAX_EVENT_SOURCE_REFS = 24;
+const MAX_GROUNDING_LEDGER = 32;
+const MAX_EVENT_GROUNDING_LEDGER = 8;
 
 export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary {
   const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
@@ -203,6 +244,7 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
       accepted: [],
       rejected: [],
     },
+    groundingLedger: [],
     inputAssembly: null,
     ledgerRefs: buildLedgerRefs(ctx, dimensionScopeId),
     missingLinkReasons: [],
@@ -244,6 +286,10 @@ export function recordPcvInputAssembly(
   const inputSectionIds = stringArray(assembly.metadata.inputSectionIds);
   const providerVisibleSectionIds = stringArray(assembly.metadata.providerVisibleSectionIds);
   const staticSectionIds = stringArray(assembly.metadata.staticSectionIds);
+  const deterministicEvidenceRefs = stringArray(assembly.metadata.deterministicEvidenceRefs);
+  const evidenceStarterRefs = stringArray(assembly.metadata.evidenceStarterRefs);
+  const trackerPhase = stringValue(assembly.metadata.trackerPhase);
+  const pipelineType = stringValue(assembly.metadata.pipelineType);
   const modelRef = options.modelRef || null;
   const ref = `llm-input:${shortHash({
     chainNodeId: evidence.chainNodeId,
@@ -274,6 +320,107 @@ export function recordPcvInputAssembly(
     staticSectionIds,
     toolSchemaNames,
   };
+  const isDeepSeekV4 = /deepseek.*v4|deepseek-v4/i.test(modelRef || '');
+  upsertGroundingLedgerEntry(evidence, {
+    acceptedFindingDelta: 0,
+    classification: assembly.stageProfile === 'summarize' ? 'summary-only' : 'planning-only',
+    consumedEvidenceRefs: [],
+    deepseekV4ToolChoiceMode: isDeepSeekV4
+      ? buildDeepSeekV4ToolChoiceMode(options.requestedToolChoice, options.effectiveToolChoice)
+      : null,
+    deterministicEvidenceRefs,
+    effectiveToolChoice: options.effectiveToolChoice || null,
+    evidenceStarterRefs,
+    evidenceToolCallDelta: 0,
+    functionCallNames: [],
+    iteration: options.iteration ?? evidence.correlation.iteration,
+    outputSourceRefs: [],
+    pipelineType,
+    reasoningTokens: 0,
+    ref,
+    rejectedFindingDelta: 0,
+    requestedToolChoice: options.requestedToolChoice || null,
+    sourceRefDelta: 0,
+    stageProfile: assembly.stageProfile,
+    textOutputChars: 0,
+    toolCallDelta: 0,
+    toolChoiceSent: isDeepSeekV4 ? false : Boolean(options.effectiveToolChoice),
+    toolChoiceSupported: isDeepSeekV4 ? false : undefined,
+    toolSchemaNames,
+    toolSchemasVisible: isDeepSeekV4 ? toolSchemaNames.length > 0 : undefined,
+    trackerPhase,
+  });
+}
+
+export function recordPcvLlmOutput(
+  evidence: PcvNodeEvidenceSummary,
+  options: {
+    functionCalls?: FunctionCallLike[] | null;
+    reasoningTokens?: number | null;
+    text?: string | null;
+  }
+): PcvBurnGroundingLedgerEntry | null {
+  const entry = getLatestGroundingEntry(evidence);
+  if (!entry) {
+    return null;
+  }
+  const text = options.text || '';
+  const outputSourceRefs = extractSourceRefsFromValue(text);
+  const consumedEvidenceRefs = collectConsumedEvidenceRefs(text, [
+    ...entry.deterministicEvidenceRefs,
+    ...entry.evidenceStarterRefs,
+  ]);
+  const functionCalls = options.functionCalls || [];
+  const functionCallNames = functionCalls
+    .map((call) => stringValue(call.name))
+    .filter((name): name is string => Boolean(name));
+  const evidenceFunctionCallCount = functionCalls.filter((call) =>
+    isEvidenceFunctionCall(call.name || '', call.args || {})
+  ).length;
+
+  entry.textOutputChars = text.length;
+  entry.reasoningTokens = Math.max(0, Number(options.reasoningTokens || 0));
+  entry.outputSourceRefs = uniqueStrings(outputSourceRefs).slice(0, MAX_SOURCE_REFS);
+  entry.consumedEvidenceRefs = uniqueStrings(consumedEvidenceRefs).slice(0, MAX_SOURCE_REFS);
+  entry.functionCallNames = uniqueStrings(functionCallNames).slice(0, 24);
+  entry.sourceRefDelta = entry.outputSourceRefs.length;
+  entry.classification = classifyGroundingEntry(entry, {
+    evidenceFunctionCallCount,
+    hasFunctionCalls: functionCalls.length > 0,
+  });
+  return entry;
+}
+
+export function recordPcvToolRoundOutcome(
+  evidence: PcvNodeEvidenceSummary,
+  options: {
+    acceptedFindingDelta?: number;
+    evidenceToolCallDelta?: number;
+    rejectedFindingDelta?: number;
+    sourceRefDelta?: number;
+    toolCallDelta?: number;
+  }
+): PcvBurnGroundingLedgerEntry | null {
+  const entry = getLatestGroundingEntry(evidence);
+  if (!entry) {
+    return null;
+  }
+  entry.toolCallDelta += options.toolCallDelta || 0;
+  entry.evidenceToolCallDelta += options.evidenceToolCallDelta || 0;
+  entry.sourceRefDelta += options.sourceRefDelta || 0;
+  entry.acceptedFindingDelta += options.acceptedFindingDelta || 0;
+  entry.rejectedFindingDelta += options.rejectedFindingDelta || 0;
+  entry.classification = classifyGroundingEntry(entry, {
+    evidenceFunctionCallCount: entry.evidenceToolCallDelta,
+    hasFunctionCalls: entry.toolCallDelta > 0 || entry.functionCallNames.length > 0,
+  });
+  return entry;
+}
+
+export function getLatestPcvBurnGrounding(
+  evidence: PcvNodeEvidenceSummary
+): PcvBurnGroundingLedgerEntry | null {
+  return getLatestGroundingEntry(evidence);
 }
 
 export function recordPcvToolResult(
@@ -357,6 +504,9 @@ export function buildPcvNodeEvidenceSummary(
   const summary = cloneEvidence(evidence);
   summary.sourceRefs = uniqueStrings(summary.sourceRefs).slice(0, MAX_SOURCE_REFS);
   summary.ledgerRefs = dedupeBy(summary.ledgerRefs, (item) => item.ref);
+  summary.groundingLedger = dedupeBy(summary.groundingLedger || [], (item) => item.ref).slice(
+    -MAX_GROUNDING_LEDGER
+  );
   summary.findingRefs.accepted = dedupeBy(summary.findingRefs.accepted, (item) => item.ref);
   summary.findingRefs.rejected = dedupeBy(summary.findingRefs.rejected, (item) => item.ref);
   summary.missingLinkReasons = buildMissingLinkReasons(summary, options);
@@ -371,6 +521,7 @@ export function buildPcvNodeEvidenceProcessMetadata(
     acceptedFindingRefs: summary.findingRefs.accepted.map((finding) => finding.ref),
     chainNodeId: summary.chainNodeId,
     correlation: summary.correlation,
+    groundingLedger: summary.groundingLedger.slice(-MAX_EVENT_GROUNDING_LEDGER),
     inputAssemblyRef: summary.inputAssembly?.ref || null,
     ledgerRefs: summary.ledgerRefs.map((ledger) => ledger.ref),
     missingLinkReasons: summary.missingLinkReasons,
@@ -506,6 +657,7 @@ function createFallbackQualityGateEvidence(
       targetName: null,
     },
     findingRefs: { accepted: [], rejected: [] },
+    groundingLedger: [],
     inputAssembly: null,
     ledgerRefs: [],
     missingLinkReasons: [],
@@ -598,6 +750,102 @@ function pushUniqueRejectedFinding(
 
 function addSourceRefs(evidence: PcvNodeEvidenceSummary, refs: string[]): void {
   evidence.sourceRefs = uniqueStrings([...evidence.sourceRefs, ...refs]).slice(0, MAX_SOURCE_REFS);
+}
+
+function upsertGroundingLedgerEntry(
+  evidence: PcvNodeEvidenceSummary,
+  entry: PcvBurnGroundingLedgerEntry
+): void {
+  const index = evidence.groundingLedger.findIndex((item) => item.ref === entry.ref);
+  if (index >= 0) {
+    evidence.groundingLedger[index] = entry;
+  } else {
+    evidence.groundingLedger.push(entry);
+  }
+  if (evidence.groundingLedger.length > MAX_GROUNDING_LEDGER) {
+    evidence.groundingLedger.splice(0, evidence.groundingLedger.length - MAX_GROUNDING_LEDGER);
+  }
+}
+
+function getLatestGroundingEntry(
+  evidence: PcvNodeEvidenceSummary
+): PcvBurnGroundingLedgerEntry | null {
+  return evidence.groundingLedger[evidence.groundingLedger.length - 1] || null;
+}
+
+function buildDeepSeekV4ToolChoiceMode(
+  requestedToolChoice: string | null | undefined,
+  effectiveToolChoice: string | null | undefined
+): string {
+  if (effectiveToolChoice === 'auto' && requestedToolChoice === 'none') {
+    return 'tools-visible-no-forced-tool-choice';
+  }
+  if (effectiveToolChoice === 'none') {
+    return 'schemas-hidden-no-tool-choice';
+  }
+  return 'tool-choice-filtered-by-provider-guard';
+}
+
+function classifyGroundingEntry(
+  entry: PcvBurnGroundingLedgerEntry,
+  options: { evidenceFunctionCallCount: number; hasFunctionCalls: boolean }
+): PcvBurnGroundingClassification {
+  const phase = (entry.trackerPhase || '').toUpperCase();
+  if (entry.stageProfile === 'summarize') {
+    return 'summary-only';
+  }
+  if (entry.acceptedFindingDelta > 0 || entry.rejectedFindingDelta > 0 || phase === 'RECORD') {
+    return entry.acceptedFindingDelta > 0 || entry.rejectedFindingDelta > 0
+      ? 'record-only'
+      : 'invalid-no-evidence';
+  }
+  if (
+    entry.evidenceToolCallDelta > 0 ||
+    options.evidenceFunctionCallCount > 0 ||
+    entry.toolCallDelta > 0
+  ) {
+    return 'evidence-produced';
+  }
+  if (entry.consumedEvidenceRefs.length > 0) {
+    if (phase === 'SCAN') {
+      return 'planning-only';
+    }
+    if (phase === 'VERIFY') {
+      return 'verification-only';
+    }
+    return 'deterministic-evidence-consumed';
+  }
+  if (entry.stageProfile === 'analyze') {
+    return 'invalid-no-evidence';
+  }
+  return options.hasFunctionCalls ? 'evidence-produced' : 'summary-only';
+}
+
+function collectConsumedEvidenceRefs(text: string, refs: string[]): string[] {
+  if (!text || refs.length === 0) {
+    return [];
+  }
+  const normalizedText = text.toLowerCase();
+  return uniqueStrings(refs).filter((ref) => {
+    const clean = ref.trim();
+    if (!clean) {
+      return false;
+    }
+    const lower = clean.toLowerCase();
+    const pathOnly = lower.replace(/:\d+(?:-\d+)?$/u, '');
+    return normalizedText.includes(lower) || normalizedText.includes(pathOnly);
+  });
+}
+
+function isEvidenceFunctionCall(toolName: string, args: JsonRecord): boolean {
+  const action = stringValue(args.action) || stringValue(asRecord(args.params).action);
+  if (toolName === 'code') {
+    return ['structure', 'search', 'read', 'outline'].includes(action || '');
+  }
+  if (toolName === 'graph') {
+    return ['overview', 'query'].includes(action || '');
+  }
+  return toolName === 'terminal';
 }
 
 function collectSourceRefs(
@@ -716,6 +964,15 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
       accepted: evidence.findingRefs.accepted.map((finding) => ({ ...finding })),
       rejected: evidence.findingRefs.rejected.map((finding) => ({ ...finding })),
     },
+    groundingLedger: (evidence.groundingLedger || []).map((entry) => ({
+      ...entry,
+      consumedEvidenceRefs: [...entry.consumedEvidenceRefs],
+      deterministicEvidenceRefs: [...entry.deterministicEvidenceRefs],
+      evidenceStarterRefs: [...entry.evidenceStarterRefs],
+      functionCallNames: [...entry.functionCallNames],
+      outputSourceRefs: [...entry.outputSourceRefs],
+      toolSchemaNames: [...entry.toolSchemaNames],
+    })),
     inputAssembly: evidence.inputAssembly ? { ...evidence.inputAssembly } : null,
     ledgerRefs: evidence.ledgerRefs.map((ledger) => ({
       ...ledger,

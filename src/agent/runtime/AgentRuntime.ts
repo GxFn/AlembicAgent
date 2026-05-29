@@ -63,8 +63,11 @@ import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
 import {
   buildPcvNodeEvidenceProcessMetadata,
+  getLatestPcvBurnGrounding,
   recordPcvInputAssembly,
+  recordPcvLlmOutput,
   recordPcvToolResult,
+  recordPcvToolRoundOutcome,
 } from './PcvNodeEvidence.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
@@ -837,8 +840,16 @@ export class AgentRuntime {
       // 策略: DeepSeek V4 和 Gemini 移除 schemas，其他保留以获得 cache 收益
       const isToolSchemaHarmful =
         /deepseek-v4/i.test(this.#modelRef) || /gemini/i.test(this.#modelRef);
-      const effectiveToolSchemas =
-        toolChoice === 'none' && isToolSchemaHarmful
+      const deepSeekV4Grounding = buildDeepSeekV4AnalyzeGroundingPolicy(
+        ctx,
+        this.#modelRef,
+        toolChoice
+      );
+      const effectiveToolSchemas = deepSeekV4Grounding.keepToolSchemasVisible
+        ? toolSchemas.length > 0
+          ? toolSchemas
+          : undefined
+        : toolChoice === 'none' && isToolSchemaHarmful
           ? undefined
           : toolSchemas.length > 0
             ? toolSchemas
@@ -850,7 +861,11 @@ export class AgentRuntime {
       const unifiedTools = effectiveToolSchemas as
         | import('#ai/AiProvider.js').ToolSchema[]
         | undefined;
-      const effectiveToolChoice = unifiedTools ? toolChoice : 'none';
+      const effectiveToolChoice = deepSeekV4Grounding.keepToolSchemasVisible
+        ? 'auto'
+        : unifiedTools
+          ? toolChoice
+          : 'none';
       const llmInputAssembly = buildLlmInputAssembly({
         ctx,
         dynamicContext,
@@ -899,6 +914,7 @@ export class AgentRuntime {
         ...llmTrace,
         messageCount: unifiedMessages.length,
         hasDynamicContext: Boolean(dynamicContext),
+        deepseekV4ToolChoiceMode: deepSeekV4Grounding.mode,
         requestedToolChoice: toolChoice,
         effectiveToolChoice,
         toolSchemaCount: unifiedTools?.length || 0,
@@ -911,7 +927,7 @@ export class AgentRuntime {
       llmResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
         messages: unifiedMessages,
         toolSchemas: unifiedTools,
-        toolChoice: unifiedTools ? toolChoice : undefined,
+        toolChoice: unifiedTools ? effectiveToolChoice : undefined,
         systemPrompt: effectiveSystemPrompt,
         temperature: ctx.budget.temperature ?? (ctx.isSystem ? 0.3 : 0.7),
         maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
@@ -935,6 +951,11 @@ export class AgentRuntime {
       ctx.addTokenUsage(llmResult.usage);
       ctx.diagnostics?.recordTokenUsage(llmResult.usage);
     }
+    recordPcvLlmOutput(ctx.pcvNodeEvidence, {
+      functionCalls: llmResult.functionCalls || [],
+      reasoningTokens: llmResult.usage?.reasoningTokens || 0,
+      text: llmResult.text || '',
+    });
 
     // ── TurnTelemetry ──
     if (llmResult.usage && ctx.isSystem) {
@@ -1026,8 +1047,12 @@ export class AgentRuntime {
     // 部分 LLM (DeepSeek 等) 可能仍然返回 tool calls，需要忽略。
     // Analyst 的 RECORD 阶段会暴露 note_finding-only 补记录窗口，不能在这里丢弃。
     const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE' || ctx.tracker?.phase === 'FINALIZE';
+    const groundingBurn = getLatestPcvBurnGrounding(ctx.pcvNodeEvidence);
+    const allowDeepSeekV4GroundingToolCalls =
+      groundingBurn?.deepseekV4ToolChoiceMode === 'tools-visible-no-forced-tool-choice';
     if (
-      (ctx.tracker?.isGracefulExit || toolChoice === 'none') &&
+      (ctx.tracker?.isGracefulExit ||
+        (toolChoice === 'none' && !allowDeepSeekV4GroundingToolCalls)) &&
       llmResult.functionCalls?.length &&
       llmResult.functionCalls.length > 0
     ) {
@@ -1157,6 +1182,11 @@ export class AgentRuntime {
     let roundSubmitCount = 0;
     let roundHasNewInfo = false;
     const roundToolNames: string[] = [];
+    const pcvBefore = {
+      acceptedFindingCount: ctx.pcvNodeEvidence.findingRefs.accepted.length,
+      rejectedFindingCount: ctx.pcvNodeEvidence.findingRefs.rejected.length,
+      sourceRefCount: ctx.pcvNodeEvidence.sourceRefs.length,
+    };
 
     // 并行工具调用共享 token 预算 — 委托 BudgetController
     const budgetCtrl = requireBudgetController(ctx);
@@ -1340,6 +1370,18 @@ export class AgentRuntime {
       messages.appendToolResult(fc.id, fc.name, resultStr);
     }
 
+    recordPcvToolRoundOutcome(ctx.pcvNodeEvidence, {
+      acceptedFindingDelta:
+        ctx.pcvNodeEvidence.findingRefs.accepted.length - pcvBefore.acceptedFindingCount,
+      evidenceToolCallDelta: activeCalls.filter((call) =>
+        isEvidenceGroundingToolCall(call.name, call.args)
+      ).length,
+      rejectedFindingDelta:
+        ctx.pcvNodeEvidence.findingRefs.rejected.length - pcvBefore.rejectedFindingCount,
+      sourceRefDelta: ctx.pcvNodeEvidence.sourceRefs.length - pcvBefore.sourceRefCount,
+      toolCallDelta: activeCalls.length,
+    });
+
     if (truncatedCalls.length > 0) {
       const truncatedNames = truncatedCalls
         .map((call) => call.name)
@@ -1457,6 +1499,32 @@ export class AgentRuntime {
     const { tracker, trace, messages } = ctx;
 
     if (tracker) {
+      const groundingGate = this.#evaluateAnalyzeTextGroundingGate(ctx);
+      if (groundingGate.block) {
+        messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
+        messages.appendUserNudge(groundingGate.nudge);
+        tracker.rollbackTick?.();
+        ctx.diagnostics?.warn({
+          code: 'invalid_no_evidence_burn',
+          message: groundingGate.reason,
+          stage: ctx.context?.pipelinePhase as string | undefined,
+        });
+        this.logger.warn(
+          `[AgentRuntime] invalid-no-evidence analyze burn blocked: ${groundingGate.reason}`
+        );
+        this.#emitProcessProgress(
+          buildSemanticNudgeProcessEvent(
+            ctx,
+            { type: 'evidence_grounding', text: groundingGate.nudge },
+            {
+              phase: tracker.phase,
+              semanticKind: 'evidence-grounding-nudge',
+            }
+          )
+        );
+        trace?.endRound?.();
+        return false;
+      }
       // 文本轮次也需要更新 tracker 指标 — 否则 roundsSinceNewInfo / consecutiveIdleRounds
       // 不递增，metrics 驱动的阶段转换永远不触发（根因: 工具路径 endRound 被调用但文本路径被跳过）
       const phaseBefore = tracker.phase;
@@ -1556,6 +1624,33 @@ export class AgentRuntime {
     ctx.lastReply = cleanFinalAnswer(llmResult.text || '');
     trace?.endRound?.();
     return true;
+  }
+
+  #evaluateAnalyzeTextGroundingGate(ctx: LoopContext): {
+    block: boolean;
+    nudge: string;
+    reason: string;
+  } {
+    const burn = getLatestPcvBurnGrounding(ctx.pcvNodeEvidence);
+    if (!burn || !isDeepSeekV4AnalyzeFirstGroundingBurn(ctx, this.#modelRef)) {
+      return { block: false, nudge: '', reason: '' };
+    }
+    if (burn.classification !== 'invalid-no-evidence') {
+      return { block: false, nudge: '', reason: '' };
+    }
+    const deterministicRefs = burn.deterministicEvidenceRefs.slice(0, 8);
+    const refsHint =
+      deterministicRefs.length > 0
+        ? `请明确引用并消费这些 deterministicEvidenceRefs 中的相关项：${deterministicRefs.join(', ')}。`
+        : '当前没有足够的 deterministicEvidenceRefs；请调用 code / graph / terminal 取得可复核代码证据。';
+    return {
+      block: true,
+      reason:
+        'DeepSeek V4 analyze burn returned text without deterministic evidence consumption, evidence tool calls, sourceRef delta, or finding delta.',
+      nudge:
+        '本轮 analyze 文本没有可观测证据 grounding，不能推进阶段。' +
+        `${refsHint} 如果只是规划下一步，只输出取证计划并绑定 evidence refs；如果要推进事实结论，必须先产生或消费可复核证据。`,
+    };
   }
 
   #getForcedSummarySuppression(ctx: LoopContext): { code: string; message: string } | null {
@@ -1956,6 +2051,62 @@ function buildAgentProcessEvent(
       null,
     title: input.title,
   };
+}
+
+function buildDeepSeekV4AnalyzeGroundingPolicy(
+  ctx: LoopContext,
+  modelRef: string,
+  requestedToolChoice: string
+): { keepToolSchemasVisible: boolean; mode: string | null } {
+  if (!isDeepSeekV4AnalyzeFirstGroundingBurn(ctx, modelRef)) {
+    return { keepToolSchemasVisible: false, mode: null };
+  }
+  if (requestedToolChoice !== 'none') {
+    return { keepToolSchemasVisible: false, mode: 'tool-choice-filtered-by-provider-guard' };
+  }
+  return {
+    keepToolSchemasVisible: true,
+    mode: 'tools-visible-no-forced-tool-choice',
+  };
+}
+
+function isDeepSeekV4AnalyzeFirstGroundingBurn(ctx: LoopContext, modelRef: string): boolean {
+  if (!/deepseek.*v4|deepseek-v4/i.test(modelRef)) {
+    return false;
+  }
+  const trackerPhase = typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : '';
+  const pipelineType =
+    typeof ctx.tracker?.pipelineType === 'string' ? ctx.tracker.pipelineType : '';
+  const pipelinePhase = stringValue(ctx.context?.pipelinePhase) || '';
+  if (pipelineType !== 'analyst' && pipelinePhase !== 'analyze') {
+    return false;
+  }
+  if (trackerPhase === 'SCAN') {
+    return true;
+  }
+  const metrics = safeCall<Record<string, unknown>>(() => ctx.tracker?.getMetrics?.());
+  const evidenceToolCallCount = Number(metrics?.evidenceToolCallCount || 0);
+  const memoryFindingCount = Number(metrics?.memoryFindingCount || 0);
+  return trackerPhase === 'EXPLORE' && evidenceToolCallCount === 0 && memoryFindingCount === 0;
+}
+
+function isEvidenceGroundingToolCall(toolName: string, args: Record<string, unknown>): boolean {
+  const action = stringValue(args.action) || stringValue(asRecord(args.params).action);
+  if (toolName === 'code') {
+    return ['structure', 'search', 'read', 'outline'].includes(action || '');
+  }
+  if (toolName === 'graph') {
+    return ['overview', 'query'].includes(action || '');
+  }
+  return toolName === 'terminal';
+}
+
+function safeCall<T>(fn: () => T | null | undefined): T | null {
+  try {
+    return fn() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 type LlmOutputCompletenessStatus =

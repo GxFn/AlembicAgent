@@ -1,5 +1,6 @@
 import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
 import type { LoopContext } from './LoopContext.js';
+import { extractSourceRefsFromValue } from './PcvNodeEvidence.js';
 
 export type LLMInputSectionId =
   | 'identity'
@@ -53,11 +54,12 @@ export function buildLlmInputAssembly({
   tools,
 }: BuildLlmInputAssemblyOptions): LLMInputAssembly {
   const stageProfile = resolveLlmInputStageProfile(ctx, requestedToolChoice, effectiveToolChoice);
+  const groundingContext = buildGroundingContext(ctx, modelRef);
   const inputLayerSections = [
     buildStagePolicySection(stageProfile, ctx),
     buildToolContractSection(stageProfile, requestedToolChoice, effectiveToolChoice, tools),
     buildTaskContextSection(ctx, modelRef),
-    buildEvidenceContextSection(ctx),
+    buildEvidenceContextSection(ctx, groundingContext),
     buildDynamicContextSection(dynamicContext),
   ].filter((section): section is LLMInputSection => Boolean(section?.content.trim()));
 
@@ -85,12 +87,17 @@ export function buildLlmInputAssembly({
       inputSectionIds: sections.map((section) => section.id),
       inputStageProfile: stageProfile,
       inputLayerAppended: Boolean(inputLayerMessage),
+      deterministicEvidenceRefs: groundingContext.deterministicEvidenceRefs,
+      evidenceStarterRefs: groundingContext.evidenceStarterRefs,
+      groundingPolicy: groundingContext.policy,
       staticSectionIds: sections
         .filter((section) => section.staticCacheable)
         .map((section) => section.id),
       providerVisibleSectionIds: sections
         .filter((section) => section.providerVisible)
         .map((section) => section.id),
+      trackerPhase: stringValue(valueAt(ctx.tracker, 'phase')),
+      pipelineType: stringValue(valueAt(ctx.tracker, 'pipelineType')),
     },
     providerMessages: inputLayerMessage ? [...messages, inputLayerMessage] : messages,
     sections,
@@ -242,7 +249,10 @@ function buildTaskContextSection(ctx: LoopContext, modelRef: string): LLMInputSe
   };
 }
 
-function buildEvidenceContextSection(ctx: LoopContext): LLMInputSection {
+function buildEvidenceContextSection(
+  ctx: LoopContext,
+  groundingContext: GroundingContext
+): LLMInputSection {
   const lines: string[] = [];
   const metrics = safeCall<Record<string, unknown>>(() => ctx.tracker?.getMetrics?.());
   const traceStats = safeCall<Record<string, unknown>>(() => ctx.trace?.getStats?.());
@@ -266,6 +276,17 @@ function buildEvidenceContextSection(ctx: LoopContext): LLMInputSection {
   if (evidencePaths?.length) {
     lines.push(`recordRepairEvidencePaths: ${evidencePaths.map(String).join(', ')}`);
   }
+  if (groundingContext.deterministicEvidenceRefs.length > 0) {
+    lines.push(
+      `deterministicEvidenceRefs: ${groundingContext.deterministicEvidenceRefs.join(', ')}`
+    );
+  }
+  if (groundingContext.evidenceStarterRefs.length > 0) {
+    lines.push(`evidenceStarterRefs: ${groundingContext.evidenceStarterRefs.join(', ')}`);
+  }
+  if (groundingContext.policy) {
+    lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
+  }
 
   return {
     id: 'evidenceContext',
@@ -274,6 +295,45 @@ function buildEvidenceContextSection(ctx: LoopContext): LLMInputSection {
     providerVisible: true,
     staticCacheable: false,
   };
+}
+
+interface GroundingContext {
+  deterministicEvidenceRefs: string[];
+  evidenceStarterRefs: string[];
+  policy: string | null;
+}
+
+function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingContext {
+  const evidenceStarters = ctx.context?.evidenceStarters ?? ctx.sharedState?._evidenceStarters;
+  const evidenceStarterRefs = uniqueStrings(extractSourceRefsFromValue(evidenceStarters)).slice(
+    0,
+    24
+  );
+  const deterministicEvidenceRefs = uniqueStrings([
+    ...evidenceStarterRefs,
+    ...extractSourceRefsFromValue([
+      ctx.context?.deterministicEvidenceRefs,
+      ctx.context?.referencedFiles,
+      ctx.context?.recordRepairEvidencePaths,
+      ctx.sharedState?._deterministicEvidenceRefs,
+      ctx.sharedState?._referencedFiles,
+      ctx.sharedState?._producerReferencedFiles,
+      ctx.sharedState?._recordRepairEvidencePaths,
+      ctx.sharedState?.referencedFiles,
+    ]),
+  ]).slice(0, 32);
+  const policy =
+    resolveLlmInputStageProfile(ctx) === 'analyze'
+      ? buildAnalyzeGroundingPolicy(modelRef, deterministicEvidenceRefs.length)
+      : null;
+  return { deterministicEvidenceRefs, evidenceStarterRefs, policy };
+}
+
+function buildAnalyzeGroundingPolicy(modelRef: string, deterministicRefCount: number): string {
+  const deepseekMode = /deepseek.*v4|deepseek-v4/i.test(modelRef)
+    ? ' DeepSeek V4 cannot rely on forced tool_choice; use visible tools or cited deterministic refs.'
+    : '';
+  return `Every analyze burn that advances a conclusion must consume cited deterministic evidence refs or produce new tool evidence. Planning-only text may choose the next evidence frontier but must not assert verified facts.${deterministicRefCount > 0 ? ' Cite the relevant deterministicEvidenceRefs when using injected evidence.' : ''}${deepseekMode}`;
 }
 
 function buildDynamicContextSection(dynamicContext: string | null): LLMInputSection | null {
@@ -340,4 +400,8 @@ function lowerString(value: unknown): string {
 
 function upperString(value: unknown): string {
   return stringValue(value)?.toUpperCase() || '';
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }

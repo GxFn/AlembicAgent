@@ -75,6 +75,8 @@ export {
   SimpleArrayAdapter,
 } from './MessageAdapter.js';
 export type {
+  PcvBurnGroundingClassification,
+  PcvBurnGroundingLedgerEntry,
   PcvNodeAcceptedFindingRef,
   PcvNodeEvidenceProcessMetadata,
   PcvNodeEvidenceSummary,
@@ -91,8 +93,11 @@ export {
   buildPcvQualityGateEvidence,
   createPcvNodeEvidence,
   extractSourceRefsFromValue,
+  getLatestPcvBurnGrounding,
   recordPcvInputAssembly,
+  recordPcvLlmOutput,
   recordPcvToolResult,
+  recordPcvToolRoundOutcome,
 } from './PcvNodeEvidence.js';
 export { SystemPromptBuilder } from './SystemPromptBuilder.js';
 export type {
