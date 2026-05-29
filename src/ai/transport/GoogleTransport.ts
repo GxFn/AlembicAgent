@@ -47,7 +47,13 @@ export class GoogleTransport extends LLMTransport {
       body.systemInstruction = { parts: [{ text: request.systemPrompt }] };
     }
     if (request.responseFormat === 'json') {
-      (body.generationConfig as Record<string, unknown>).responseMimeType = 'application/json';
+      const gc = body.generationConfig as Record<string, unknown>;
+      gc.responseMimeType = 'application/json';
+      // Gemini 原生结构化输出：传入清理后的 JSON Schema 做服务端校验，
+      // 等价于 GoogleGeminiProvider.chatWithStructuredOutput 的 responseSchema 行为。
+      if (request.schema) {
+        gc.responseSchema = this.#sanitizeSchema(request.schema);
+      }
     }
 
     const url = `${this.baseUrl}/models/${request.model}:generateContent?key=${this.apiKey}`;

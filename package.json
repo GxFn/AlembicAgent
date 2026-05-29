@@ -43,8 +43,8 @@
       "import": "./dist/agent/profiles/index.js"
     },
     "./ai": {
-      "types": "./dist/external/ai/index.d.ts",
-      "import": "./dist/external/ai/index.js"
+      "types": "./dist/ai/index.d.ts",
+      "import": "./dist/ai/index.js"
     },
     "./tools": {
       "types": "./dist/tools/index.d.ts",
@@ -73,10 +73,10 @@
       "alembic-dev": "./src/agent/*",
       "default": "./dist/agent/*"
     },
-    "#external/*": {
-      "types": "./src/external/*",
-      "alembic-dev": "./src/external/*",
-      "default": "./dist/external/*"
+    "#ai/*": {
+      "types": "./src/ai/*",
+      "alembic-dev": "./src/ai/*",
+      "default": "./dist/ai/*"
     },
     "#shared/*": {
       "types": "./src/shared/*",

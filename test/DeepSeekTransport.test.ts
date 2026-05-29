@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DeepSeekTransport } from '../src/external/ai/transport/DeepSeekTransport.js';
+import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 
 function mockDeepSeekFetch(
   capture: { body?: Record<string, unknown> },

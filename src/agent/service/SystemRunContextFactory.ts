@@ -1,4 +1,4 @@
-import type { AiProvider } from '#external/ai/AiProvider.js';
+import type { AiProvider } from '#ai/AiProvider.js';
 import { ContextWindow } from '../context/ContextWindow.js';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import { MemoryCoordinator } from '../memory/MemoryCoordinator.js';

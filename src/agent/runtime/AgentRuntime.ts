@@ -30,7 +30,6 @@
 
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
-import type { LLMGateway } from '#external/ai/gateway/LLMGateway.js';
 import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
 import { isToolResultEnvelope } from '#tools/core/ToolResultPresenter.js';
 import { Capability, CapabilityRegistry } from '../capabilities/index.js';
@@ -122,8 +121,7 @@ export class AgentRuntime {
   #additionalTools: string[] = [];
   #toolPipeline;
   #promptBuilder;
-  /** 可选 Gateway — 启用后走 Gateway 路径替代 aiProvider 直接调用 */
-  #gateway: LLMGateway | null;
+  /** 模型引用（provider:model），用于日志 / trace / 工具裁剪等运行期判断 */
   #modelRef: string;
   /** 统一事件钩子系统 */
   #hookSystem: HookSystem;
@@ -166,7 +164,6 @@ export class AgentRuntime {
     this.#projectRoot = config.projectRoot || process.cwd();
     this.#dataRoot = config.dataRoot || this.#projectRoot;
     this.#additionalTools = config.additionalTools || [];
-    this.#gateway = config.gateway || null;
     this.#modelRef =
       config.modelRef ||
       `${config.aiProvider.name}:${(config.aiProvider as { model?: string }).model || 'unknown'}`;
@@ -849,9 +846,9 @@ export class AgentRuntime {
 
       // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
       const projected =
-        ctx.messages.toProjectedMessages() as import('#external/ai/AiProvider.js').UnifiedMessage[];
+        ctx.messages.toProjectedMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
       const unifiedTools = effectiveToolSchemas as
-        | import('#external/ai/AiProvider.js').ToolSchema[]
+        | import('#ai/AiProvider.js').ToolSchema[]
         | undefined;
       const effectiveToolChoice = unifiedTools ? toolChoice : 'none';
       const llmInputAssembly = buildLlmInputAssembly({
@@ -881,7 +878,6 @@ export class AgentRuntime {
         },
         metadata: {
           ...llmTrace,
-          route: this.#gateway ? 'gateway' : 'provider',
           messageCount: unifiedMessages.length,
           hasDynamicContext: Boolean(dynamicContext),
           requestedToolChoice: toolChoice,
@@ -901,7 +897,6 @@ export class AgentRuntime {
       // 否则 Dashboard 只能看到 filling，不知道是在等模型、走重试还是已经被 abort。
       this.logger.info(`[AgentRuntime] LLM call start ${formatLoopTrace(llmTrace)}`, {
         ...llmTrace,
-        route: this.#gateway ? 'gateway' : 'provider',
         messageCount: unifiedMessages.length,
         hasDynamicContext: Boolean(dynamicContext),
         requestedToolChoice: toolChoice,
@@ -911,28 +906,17 @@ export class AgentRuntime {
         maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
       });
 
-      if (this.#gateway) {
-        llmResult = (await this.#gateway.chatWithTools({
-          modelRef: this.#modelRef,
-          messages: unifiedMessages,
-          tools: unifiedTools,
-          toolChoice: unifiedTools ? toolChoice : undefined,
-          systemPrompt: effectiveSystemPrompt,
-          temperature: ctx.budget.temperature ?? (ctx.isSystem ? 0.3 : 0.7),
-          maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
-          abortSignal: ctx.abortSignal ?? undefined,
-        })) as LLMResult;
-      } else {
-        llmResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
-          messages: unifiedMessages,
-          toolSchemas: unifiedTools,
-          toolChoice: unifiedTools ? toolChoice : undefined,
-          systemPrompt: effectiveSystemPrompt,
-          temperature: ctx.budget.temperature ?? (ctx.isSystem ? 0.3 : 0.7),
-          maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
-          abortSignal: ctx.abortSignal ?? undefined,
-        })) as LLMResult;
-      }
+      // 方案①：统一经 aiProvider.chatWithTools 调用；provider 内部已委托 LLMGateway + Transport，
+      // 不再保留 runtime 级 gateway/provider 双分支（横切能力由 provider 背后的 gateway 统一承担）。
+      llmResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
+        messages: unifiedMessages,
+        toolSchemas: unifiedTools,
+        toolChoice: unifiedTools ? toolChoice : undefined,
+        systemPrompt: effectiveSystemPrompt,
+        temperature: ctx.budget.temperature ?? (ctx.isSystem ? 0.3 : 0.7),
+        maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
+        abortSignal: ctx.abortSignal ?? undefined,
+      })) as LLMResult;
       ctx.consecutiveAiErrors = 0;
     } catch (aiErr: unknown) {
       this.logger.warn(`[AgentRuntime] LLM call failed ${formatLoopTrace(llmTrace)}`, {
@@ -1438,24 +1422,15 @@ export class AgentRuntime {
         return true;
       }
 
-      const summaryMessages =
-        messages.toMessages() as import('#external/ai/AiProvider.js').UnifiedMessage[];
-      const summary: LLMResult = this.#gateway
-        ? ((await this.#gateway.chatWithTools({
-            modelRef: this.#modelRef,
-            messages: summaryMessages,
-            systemPrompt: effectiveSystemPrompt,
-            toolChoice: 'none',
-            temperature: ctx.budget.temperature ?? 0.7,
-            maxTokens: ctx.budget.maxTokens ?? 4096,
-          })) as LLMResult)
-        : ((await this.aiProvider.chatWithTools(ctx.prompt, {
-            messages: summaryMessages,
-            systemPrompt: effectiveSystemPrompt,
-            toolChoice: 'none',
-            temperature: ctx.budget.temperature ?? 0.7,
-            maxTokens: ctx.budget.maxTokens ?? 4096,
-          })) as LLMResult);
+      const summaryMessages = messages.toMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
+      // 方案①：强制摘要也统一走 aiProvider.chatWithTools（provider 内部委托 gateway）
+      const summary: LLMResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
+        messages: summaryMessages,
+        systemPrompt: effectiveSystemPrompt,
+        toolChoice: 'none',
+        temperature: ctx.budget.temperature ?? 0.7,
+        maxTokens: ctx.budget.maxTokens ?? 4096,
+      })) as LLMResult;
       if (summary.usage) {
         this.tokenUsage.input += summary.usage.inputTokens || 0;
         this.tokenUsage.output += summary.usage.outputTokens || 0;
@@ -2232,7 +2207,7 @@ function formatDeveloperVisibleLlmInput(assembly: LLMInputAssembly): string {
 }
 
 function formatDeveloperVisibleMessage(
-  message: import('#external/ai/AiProvider.js').UnifiedMessage,
+  message: import('#ai/AiProvider.js').UnifiedMessage,
   index: number
 ): string {
   const lines = [`### ${index + 1}. ${message.role}${message.name ? ` (${message.name})` : ''}`];

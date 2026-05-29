@@ -8,7 +8,7 @@ export default defineConfig({
     conditions: ['alembic-dev'],
     alias: [
       { find: /^#agent\/(.*)$/u, replacement: `${projectRoot}src/agent/$1` },
-      { find: /^#external\/(.*)$/u, replacement: `${projectRoot}src/external/$1` },
+      { find: /^#ai\/(.*)$/u, replacement: `${projectRoot}src/ai/$1` },
       { find: /^#shared\/(.*)$/u, replacement: `${projectRoot}src/shared/$1` },
       { find: /^#tools\/(.*)$/u, replacement: `${projectRoot}src/tools/$1` },
     ],

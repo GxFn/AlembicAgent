@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DeepSeekProvider } from '../src/external/ai/providers/DeepSeekProvider.js';
+import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
 
 function mockDeepSeekFetch(
   capture: { body?: Record<string, unknown> },

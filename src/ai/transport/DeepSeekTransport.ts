@@ -292,7 +292,14 @@ export class DeepSeekTransport extends LLMTransport {
       text,
       request.tools?.map((tool) => tool.name)
     );
-    if (compatCalls.length > 0 && request.toolChoice && request.toolChoice !== 'none') {
+    // 文本工具调用兼容：只要声明了 tools 且未显式禁用（toolChoice !== 'none'）就尝试解析。
+    // 不依赖发送给 API 的 tool_choice——V4 thinking 路径会过滤/省略 tool_choice，
+    // 但模型仍可能以 <function_calls> 文本形式返回工具调用，需照常归一化。
+    if (
+      compatCalls.length > 0 &&
+      (request.tools?.length ?? 0) > 0 &&
+      request.toolChoice !== 'none'
+    ) {
       console.warn(
         `[DeepSeekTransport] converted ${compatCalls.length} text function call(s) into tool calls`
       );

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OpenAiProvider } from '../src/external/ai/providers/OpenAiProvider.js';
+import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
 
 /**
  * Mock 全局 fetch，捕获请求 url + body，返回指定响应。

@@ -22,7 +22,7 @@
  */
 
 import Logger from '@alembic/core/logging';
-import { getModelRegistry } from '../../external/ai/registry/ModelRegistry.js';
+import { getModelRegistry } from '#ai/registry/ModelRegistry.js';
 import { estimateTokensFast } from '../../shared/token-utils.js';
 import {
   buildL4MemoryPackage,

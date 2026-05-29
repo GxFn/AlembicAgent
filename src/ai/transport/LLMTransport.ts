@@ -20,6 +20,32 @@ import {
 } from '../AiProvider.js';
 import type { ProviderId } from '../registry/model-defs.js';
 
+// ─── 代理 dispatcher 缓存 ────────────────────────────────
+//
+// undici ProxyAgent 内部维护连接池，必须按 proxyUrl 复用，否则在长驻 daemon 里
+// 每次请求都 new 一个会泄漏 socket / 文件句柄，且无 keep-alive 复用。
+// 用 null 缓存“已尝试但 undici 不可用 / 代理初始化失败”的结果，避免重复 import。
+const proxyDispatcherCache = new Map<string, unknown | null>();
+
+/**
+ * 解析（并缓存）指定 proxyUrl 对应的 undici ProxyAgent dispatcher。
+ * undici 不可用或构造失败时返回 null（缓存，后续直连）。
+ */
+async function getProxyDispatcher(proxyUrl: string): Promise<unknown | null> {
+  if (proxyDispatcherCache.has(proxyUrl)) {
+    return proxyDispatcherCache.get(proxyUrl) ?? null;
+  }
+  try {
+    const undici = await import('undici');
+    const dispatcher = new undici.ProxyAgent(proxyUrl);
+    proxyDispatcherCache.set(proxyUrl, dispatcher);
+    return dispatcher;
+  } catch {
+    proxyDispatcherCache.set(proxyUrl, null);
+    return null;
+  }
+}
+
 // ─── Transport Request ──────────────────────────────────
 
 export interface TransportRequest {
@@ -35,6 +61,8 @@ export interface TransportRequest {
   reasoningEffort?: string;
 
   responseFormat?: 'text' | 'json';
+  /** JSON Schema — 供原生结构化输出（如 Gemini responseSchema）做服务端校验。 */
+  schema?: Record<string, unknown>;
   abortSignal?: AbortSignal;
 }
 
@@ -105,6 +133,40 @@ export abstract class LLMTransport {
 
   // ─── Shared HTTP utilities ──────────────────────────────
 
+  /**
+   * 解析当前 provider 应使用的代理 URL。
+   *
+   * 历史背景：薄壳化前，代理感知逻辑位于 `AiProvider._resolveProxyUrl` / `_fetch`；
+   * 请求统一改走 Transport 后，必须在此处保留同等的代理解析，否则依赖
+   * `HTTPS_PROXY` 等环境变量访问境外 API 的部署会直连失败（功能回归）。
+   *
+   * 优先级：provider 专属变量（ALEMBIC_<PROVIDER>_PROXY_HTTPS/HTTP）
+   *   ＞ 通用 ALEMBIC_AI_PROXY ＞ 标准 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY。
+   *
+   * providerId 与环境变量 tag 映射：openai→OPENAI、deepseek→DEEPSEEK、
+   *   claude→CLAUDE、google→GOOGLE、ollama→OLLAMA。
+   */
+  protected resolveProxyUrl(): string {
+    const tag = (this.providerId || '').toUpperCase();
+    if (tag) {
+      const specific =
+        process.env[`ALEMBIC_${tag}_PROXY_HTTPS`] || process.env[`ALEMBIC_${tag}_PROXY_HTTP`];
+      if (specific) {
+        return specific;
+      }
+    }
+    return (
+      process.env.ALEMBIC_AI_PROXY ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      process.env.ALL_PROXY ||
+      process.env.all_proxy ||
+      ''
+    );
+  }
+
   protected async post(
     url: string,
     body: Record<string, unknown>,
@@ -117,7 +179,7 @@ export abstract class LLMTransport {
     externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
     try {
-      const res = await fetch(url, {
+      const res = await this.#fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(body),
@@ -145,6 +207,26 @@ export abstract class LLMTransport {
       clearTimeout(timer);
       externalSignal?.removeEventListener('abort', onExternalAbort);
     }
+  }
+
+  /**
+   * 代理感知的 fetch — 检测到代理时通过 dispatcher 走 undici ProxyAgent，否则直连。
+   *
+   * 关键点：始终调用全局 `fetch`（Node >=22 的全局 fetch 即 undici 实现，
+   * 原生支持 `dispatcher` 选项）。这样既能让代理生效，又不会绕过测试里
+   * `vi.stubGlobal('fetch')` 的桩——避免“环境带 HTTPS_PROXY 时单测被绕过”的回归。
+   * ProxyAgent 按 proxyUrl 缓存复用，避免每请求新建导致的 socket 泄漏。
+   */
+  async #fetch(url: string, options: Record<string, unknown> = {}): Promise<Response> {
+    const proxyUrl = this.resolveProxyUrl();
+    if (proxyUrl) {
+      const dispatcher = await getProxyDispatcher(proxyUrl);
+      if (dispatcher) {
+        // dispatcher 不在标准 RequestInit 类型里，但全局 fetch（undici）运行时识别。
+        return fetch(url, { ...options, dispatcher } as RequestInit);
+      }
+    }
+    return fetch(url, options as RequestInit);
   }
 
   protected requireApiKey(label: string): void {

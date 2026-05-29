@@ -24,9 +24,11 @@ const bannedImportRules = [
   {
     reason: 'MCP handlers and schemas stay in host/plugin adapters',
     test: (specifier) =>
-      specifier.startsWith('#external/mcp') ||
-      specifier.includes('/external/mcp') ||
-      specifier.includes('\\external\\mcp'),
+      specifier === '#mcp' ||
+      specifier.startsWith('#mcp/') ||
+      specifier.startsWith('@modelcontextprotocol/') ||
+      specifier.includes('/mcp/') ||
+      specifier.includes('\\mcp\\'),
   },
   {
     reason: 'Plugin channels and marketplace delivery stay outside AlembicAgent',
@@ -55,7 +57,7 @@ const bannedPathRules = [
   },
   {
     reason: 'MCP delivery directories belong to host/plugin adapters',
-    test: (relativePath) => /(^|\/)external\/mcp(\/|$)/u.test(relativePath),
+    test: (relativePath) => /(^|\/)mcp(\/|$)/u.test(relativePath),
   },
   {
     reason: 'Skill delivery directories belong to AlembicPlugin',

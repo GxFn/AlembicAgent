@@ -4,6 +4,9 @@
  */
 
 import { LanguageService } from '@alembic/core/project-intelligence';
+import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
+import { classifyLlmError } from './shared/error-classify.js';
+import { extractJSON as sharedExtractJSON } from './shared/structured-output.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /** Loose JSON record for external API responses (inherently untyped) */
@@ -208,6 +211,15 @@ export class AiProvider {
    */
   _onTokenUsage: ((usage: TokenUsage & { source?: string }) => void) | null = null;
 
+  /** 协议下沉 transport 后，本 provider 专属的 LLMGateway 实例（lazy 构造）。 */
+  #gateway: LLMGateway | null = null;
+
+  /**
+   * Provider 特有的 transport 扩展配置（如 apiStyle / reasoningEffort / embedModel）。
+   * 子类在 super() 之后设置，透传给 gateway → transport，供下沉后的协议层消费。
+   */
+  _transportExtras: Record<string, unknown> = {};
+
   constructor(config: AiProviderConfig = {}) {
     this.model = config.model || '';
     this.apiKey = config.apiKey || '';
@@ -402,6 +414,121 @@ export class AiProvider {
     const openChar = opts.openChar || '{';
     const closeChar = opts.closeChar || '}';
     return this.extractJSON(response, openChar, closeChar);
+  }
+
+  // ─── Gateway 委托（方案①：协议下沉 transport，横切收敛 gateway）─────────────
+
+  /** provider 级 modelRef（'name:model'），用于 gateway 路由。 */
+  get _modelRef(): string {
+    return `${this.name}:${this.model}`;
+  }
+
+  /**
+   * lazy 构造 provider 专属 LLMGateway。
+   *
+   * 方案①核心：HTTP body 拼装与响应解析只保留在 transport 层；重试 / 熔断 / 并发闸门 /
+   * 用量上报等横切能力由 gateway 的 ReliabilityController 统一提供，不再在各 Provider 重复实现。
+   * onUsage 桥接回 this._emitTokenUsage，保持原 token 计量链路（DI 注入的 _onTokenUsage）不变。
+   */
+  async _getGateway(): Promise<LLMGateway> {
+    if (this.#gateway) {
+      return this.#gateway;
+    }
+    // 动态 import 打破 AiProvider ↔ LLMGateway/transport 的模块循环依赖（顶层仅保留 type import）。
+    // 首次 chat 时所有模块已加载完毕，动态加载不会触发初始化死锁。
+    const { LLMGateway } = await import('./gateway/LLMGateway.js');
+    // this.name 即 ProviderId（openai/claude/deepseek/google/ollama）。
+    const providers = {
+      [this.name]: {
+        apiKey: this.apiKey,
+        baseUrl: this.baseUrl,
+        timeout: this.timeout,
+        ...this._transportExtras,
+      },
+    } as GatewayConfig['providers'];
+    this.#gateway = new LLMGateway({
+      providers,
+      timeout: this.timeout,
+      maxRetries: this.maxRetries,
+      circuitThreshold: this._circuitThreshold,
+      maxConcurrency: this._maxConcurrency,
+      onUsage: (usage) => this._emitTokenUsage(usage, usage.source),
+    });
+    return this.#gateway;
+  }
+
+  /** 委托 gateway 的文本对话（支持历史消息）；横切能力由 gateway 统一处理。 */
+  async _gatewayChat(prompt: string, context: ChatContext = {}): Promise<string> {
+    const history = (context.history || []).map((h) => ({
+      role: h.role,
+      content: h.content || '',
+    })) as UnifiedMessage[];
+    const messages: UnifiedMessage[] = [...history, { role: 'user', content: prompt }];
+    // gateway.chat 仅接受单 prompt，故经 chatWithTools（无 tools）以承载历史消息，再取 text。
+    const result = await (await this._getGateway()).chatWithTools({
+      modelRef: this._modelRef,
+      messages,
+      systemPrompt: context.systemPrompt,
+      temperature: context.temperature ?? 0.7,
+      maxTokens: context.maxTokens ?? 4096,
+      usageSource: 'chat',
+    });
+    return result.text || '';
+  }
+
+  /** 委托 gateway 的工具调用对话（原生 functionCall）。 */
+  async _gatewayChatWithTools(
+    prompt: string,
+    opts: ChatWithToolsOptions = {}
+  ): Promise<ChatWithToolsResult> {
+    const messages: UnifiedMessage[] =
+      opts.messages && opts.messages.length > 0
+        ? opts.messages
+        : [{ role: 'user', content: prompt }];
+    return (await this._getGateway()).chatWithTools({
+      modelRef: this._modelRef,
+      messages,
+      tools: opts.toolSchemas,
+      // 默认 'auto' 与各 Provider 原实现一致；DeepSeek 文本工具调用兼容解析依赖该值非空非 'none'。
+      toolChoice: opts.toolChoice ?? 'auto',
+      systemPrompt: opts.systemPrompt,
+      temperature: opts.temperature ?? 0.7,
+      maxTokens: opts.maxTokens ?? 4096,
+      abortSignal: opts.abortSignal,
+      usageSource: 'tools',
+    });
+  }
+
+  /** 委托 gateway 的结构化 JSON 输出（gateway 内部 chat(json)+extractJSON，支持原生 schema）。 */
+  async _gatewayChatWithStructuredOutput(
+    prompt: string,
+    opts: StructuredOutputOptions = {}
+  ): Promise<unknown> {
+    return (await this._getGateway()).chatStructured({
+      modelRef: this._modelRef,
+      prompt,
+      systemPrompt: opts.systemPrompt,
+      temperature: opts.temperature ?? 0.3,
+      maxTokens: opts.maxTokens ?? 32768,
+      schema: opts.schema,
+      openChar: opts.openChar,
+      closeChar: opts.closeChar,
+      usageSource: 'structured',
+    });
+  }
+
+  /** 委托 gateway 的向量嵌入；transport 依据 _transportExtras.embedModel 选择 embed 模型。 */
+  async _gatewayEmbed(text: string | string[]): Promise<number[] | number[][]> {
+    const isArray = Array.isArray(text);
+    const texts = isArray ? (text as string[]) : [text as string];
+    try {
+      const embeddings = await (await this._getGateway()).embed(this._modelRef, texts);
+      return isArray ? embeddings : embeddings[0] || [];
+    } catch (err) {
+      // embed 失败不应中断主流程：返回空向量，由上层决定降级策略（与原 Provider 行为一致）。
+      this._log('warn', `[${this.name}] embed failed: ${(err as Error).message}`);
+      return isArray ? [] : [];
+    }
   }
 
   /** 内部日志辅助（子类可通过 this.logger 覆盖） */
@@ -702,207 +829,17 @@ ${this._buildLangInstruction(options.lang)}
 ${items}`;
   }
 
-  // ─── 网络 / 代理 ────────────────────────────
-
-  /**
-   * 解析当前 Provider 应使用的代理 URL。
-   * 优先级（从高到低）:
-   *   1. Provider 专属: ALEMBIC_{PROVIDER}_PROXY_HTTPS / ALEMBIC_{PROVIDER}_PROXY_HTTP
-   *   2. 全局 ASD 专属: ALEMBIC_AI_PROXY
-   *   3. 系统通用: HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
-   *
-   * Provider 名称映射: google-gemini → GOOGLE, openai → OPENAI, claude → CLAUDE, deepseek → DEEPSEEK
-   */
-  _resolveProxyUrl() {
-    // Provider-specific vars: ALEMBIC_GOOGLE_PROXY_HTTPS, ALEMBIC_OPENAI_PROXY_HTTPS, etc.
-    const tag = (this.name || '')
-      .replace(/-gemini$/, '') // google-gemini → google
-      .replace(/-/g, '_') // 其他连字符 → 下划线
-      .toUpperCase(); // google → GOOGLE
-
-    if (tag) {
-      const specific =
-        process.env[`ALEMBIC_${tag}_PROXY_HTTPS`] || process.env[`ALEMBIC_${tag}_PROXY_HTTP`];
-      if (specific) {
-        return specific;
-      }
-    }
-
-    return (
-      process.env.ALEMBIC_AI_PROXY ||
-      process.env.HTTPS_PROXY ||
-      process.env.https_proxy ||
-      process.env.HTTP_PROXY ||
-      process.env.http_proxy ||
-      process.env.ALL_PROXY ||
-      process.env.all_proxy ||
-      ''
-    );
-  }
-
-  /**
-   * 代理感知的 fetch — 自动检测代理并使用 undici ProxyAgent。
-   * 子类的 _post() 应调用此方法替代全局 fetch()。
-   */
-  async _fetch(url: string, options: Record<string, unknown> = {}) {
-    const proxyUrl = this._resolveProxyUrl();
-
-    if (proxyUrl) {
-      try {
-        const undici = await import('undici');
-        options.dispatcher = new undici.ProxyAgent(proxyUrl);
-        return await undici.fetch(url, options);
-      } catch {
-        // undici 不可用，fallback 到全局 fetch
-      }
-    }
-    return globalThis.fetch(url, options);
-  }
-
   // ─── 工具方法 ─────────────────────────────
 
   /**
-   * 从 LLM 响应提取 JSON (extractJSON kept below)
-   * 支持截断修复：当 AI 输出被 token 限制截断时，尝试关闭未完成的 JSON 结构
+   * 从 LLM 响应提取 JSON。
+   * 实现已抽到厂商无关的 shared/structured-output（供 Provider 与 Gateway 共用），
+   * 这里仅委派并桥接实例 logger，保持既有调用方行为不变。
    */
   extractJSON(text: string, openChar = '{', closeChar = '}') {
-    if (!text) {
-      return null;
-    }
-    // 去除 markdown 代码块
-    const cleaned = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '');
-    const start = cleaned.indexOf(openChar);
-    if (start === -1) {
-      return null;
-    }
-    const end = cleaned.lastIndexOf(closeChar);
-
-    // 1. 常规路径：找到完整的 JSON 边界
-    if (end > start) {
-      try {
-        let jsonStr = cleaned.slice(start, end + 1);
-        jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
-        return JSON.parse(jsonStr);
-      } catch {
-        // 常规解析失败，尝试截断修复
-      }
-    }
-
-    // 2. 截断修复：AI 输出被 token 限制截断，尝试回收已完成的条目
-    if (openChar === '[') {
-      return this._repairTruncatedArray(cleaned.slice(start));
-    }
-    return null;
-  }
-
-  /**
-   * 修复被截断的 JSON 数组 — 回收已完成的对象
-   * 策略 1（主路径）: 字符级解析找到最后一个完整的顶层 {...} 对象
-   * 策略 2（回退路径）: 正则 + 渐进 JSON.parse 尝试（应对代码段中未转义引号导致 inString 追踪失效）
-   */
-  _repairTruncatedArray(text: string) {
-    // ── 策略 1：字符级深度追踪 ──
-    const charResult = this._repairByCharTracking(text);
-    if (charResult) {
-      return charResult;
-    }
-
-    // ── 策略 2：正则回退 — 找所有 "}," 或 "}\n" 位置，从后向前逐一尝试 JSON.parse ──
-    const regexResult = this._repairByRegexFallback(text);
-    if (regexResult) {
-      return regexResult;
-    }
-
-    return null;
-  }
-
-  /** 字符级深度追踪修复（原逻辑，处理标准 JSON） */
-  _repairByCharTracking(text: string) {
-    let depth = 0;
-    let inString = false;
-    let isEscaped = false;
-    let lastCompleteObjEnd = -1;
-
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      if (isEscaped) {
-        isEscaped = false;
-        continue;
-      }
-      if (ch === '\\' && inString) {
-        isEscaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) {
-        continue;
-      }
-
-      if (ch === '{' || ch === '[') {
-        depth++;
-      } else if (ch === '}' || ch === ']') {
-        depth--;
-        // depth === 1 表示回到数组顶层，刚关闭了一个完整对象
-        if (depth === 1 && ch === '}') {
-          lastCompleteObjEnd = i;
-        }
-      }
-    }
-
-    if (lastCompleteObjEnd === -1) {
-      return null;
-    }
-    return this._tryRepairAt(text, lastCompleteObjEnd);
-  }
-
-  /**
-   * 正则回退修复 — 不依赖 inString 追踪
-   * 寻找所有 "},\s*{" 或 "}\s*]" 边界，从后往前尝试 JSON.parse
-   */
-  _repairByRegexFallback(text: string) {
-    // 收集所有 "}" 后跟 "," 或空白的位置（可能是对象边界）
-    const candidates: number[] = [];
-    const re = /\}[\s,]*(?=\s*[[{]|$)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      candidates.push(m.index); // "}" 的位置
-    }
-
-    // 从后往前尝试
-    for (let i = candidates.length - 1; i >= 0; i--) {
-      const result = this._tryRepairAt(text, candidates[i]);
-      if (result) {
-        return result;
-      }
-    }
-    return null;
-  }
-
-  /** 在指定位置截断并尝试闭合 JSON 数组 */
-  _tryRepairAt(text: string, endPos: number) {
-    let repaired = text.slice(0, endPos + 1);
-    // 去掉尾逗号
-    repaired = repaired.replace(/,\s*$/, '');
-    repaired += ']';
-    // 修复尾逗号（对象/数组末尾多余逗号）
-    repaired = repaired.replace(/,\s*([}\]])/g, '$1');
-
-    try {
-      const result = JSON.parse(repaired);
-      if (Array.isArray(result) && result.length > 0) {
-        this._log(
-          'warn',
-          `[extractJSON] Repaired truncated JSON array: recovered ${result.length} items from truncated response`
-        );
-        return result;
-      }
-    } catch {
-      /* this position didn't work, try next */
-    }
-    return null;
+    return sharedExtractJSON(text, openChar, closeChar, (level, message) =>
+      this._log(level, message)
+    );
   }
 
   /**
@@ -955,32 +892,15 @@ ${items}`;
           cause?: { code?: string; message?: string; name?: string };
         };
 
+        // 错误分类已抽到 shared/error-classify（供 Provider 与 Gateway 共用），
+        // 这里只消费分类结果做重试 / 熔断决策，避免两套实现漂移。
+        const { isAbort, isNetworkError, isRetryable, isServerError, causeCode } =
+          classifyLlmError(e);
+
         // AbortError — 外部主动中止（如 PipelineStrategy hard timeout），不重试直接抛出
-        if (e.name === 'AbortError' || e.cause?.name === 'AbortError') {
+        if (isAbort) {
           throw e;
         }
-
-        // ── 综合判断是否为可重试的网络/服务端错误 ──
-        const causeCode = e.cause?.code || '';
-        // 网络级错误：无 HTTP status，底层连接失败
-        const isNetworkError =
-          !e.status &&
-          (e.message === 'fetch failed' ||
-            e.code === 'ECONNRESET' ||
-            causeCode === 'ECONNRESET' ||
-            e.code === 'ECONNREFUSED' ||
-            causeCode === 'ECONNREFUSED' ||
-            e.code === 'ENOTFOUND' ||
-            causeCode === 'ENOTFOUND' ||
-            e.code === 'ECONNABORTED' ||
-            causeCode === 'ECONNABORTED' ||
-            e.code === 'ETIMEDOUT' ||
-            causeCode === 'ETIMEDOUT' ||
-            e.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-            causeCode === 'UND_ERR_CONNECT_TIMEOUT' ||
-            e.code === 'UND_ERR_SOCKET' ||
-            causeCode === 'UND_ERR_SOCKET');
-        const isRetryable = e.status === 429 || (e.status ?? 0) >= 500 || isNetworkError;
 
         // 429：触发 provider 级冷却窗，抑制并发重试风暴
         if (e.status === 429) {
@@ -1003,8 +923,6 @@ ${items}`;
         if (attempt >= retries || !isRetryable) {
           // 只有服务端错误 / 网络错误才累计熔断计数
           // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题
-          const isServerError =
-            isNetworkError || e.status === 429 || (e.status ?? 0) >= 500 || !e.status;
           if (isServerError) {
             this._circuitFailures = (this._circuitFailures || 0) + 1;
             if (this._circuitFailures >= (this._circuitThreshold || 5)) {

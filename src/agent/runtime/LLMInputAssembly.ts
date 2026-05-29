@@ -1,4 +1,4 @@
-import type { ToolSchema, UnifiedMessage } from '#external/ai/AiProvider.js';
+import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
 import type { LoopContext } from './LoopContext.js';
 
 export type LLMInputSectionId =
