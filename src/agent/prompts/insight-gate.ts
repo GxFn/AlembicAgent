@@ -798,11 +798,17 @@ export function insightGateEvaluator(
   const gate = analysisQualityGate(artifact, {
     outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
   });
+  const sharedState =
+    strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
+      ? (strategyContext.sharedState as Record<string, unknown>)
+      : null;
   const pcvNodeEvidence = buildPcvQualityGateEvidence({
     artifact,
     dimId: dimId || null,
     gate,
+    sharedState,
     source,
+    stageNodeContext: strategyContext,
   });
   (artifact as Record<string, unknown>).pcvNodeEvidence = pcvNodeEvidence;
   (artifact as { metadata?: Record<string, unknown> }).metadata = {

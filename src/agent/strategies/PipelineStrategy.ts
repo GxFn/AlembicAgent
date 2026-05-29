@@ -862,6 +862,25 @@ export class PipelineStrategy extends Strategy {
           : undefined;
     const baseSharedState = ((strategyContext.sharedState as Record<string, unknown>) ||
       null) as Record<string, unknown> | null;
+    const messageContext = ((message.metadata.context as Record<string, unknown>) ||
+      null) as Record<string, unknown> | null;
+    const pcvStageNodeMap =
+      messageContext?.pcvStageNodeMap ??
+      strategyContext.pcvStageNodeMap ??
+      baseSharedState?._pcvStageNodeMap ??
+      baseSharedState?.pcvStageNodeMap ??
+      null;
+    const pcvChainNodes =
+      messageContext?.pcvChainNodes ??
+      strategyContext.pcvChainNodes ??
+      baseSharedState?._pcvChainNodes ??
+      baseSharedState?.pcvChainNodes ??
+      null;
+    const stageNodeMap =
+      messageContext?.stageNodeMap ??
+      strategyContext.stageNodeMap ??
+      baseSharedState?.stageNodeMap ??
+      null;
     const stageSharedState = decisionOnly
       ? {
           ...(baseSharedState || {}),
@@ -878,7 +897,10 @@ export class PipelineStrategy extends Strategy {
     const reactPromise = runtime.reactLoop(stagePrompt, {
       history: message.history,
       context: {
-        ...((message.metadata.context as Record<string, unknown>) || {}),
+        ...(messageContext || {}),
+        ...(pcvStageNodeMap !== null ? { pcvStageNodeMap } : {}),
+        ...(pcvChainNodes !== null ? { pcvChainNodes } : {}),
+        ...(stageNodeMap !== null ? { stageNodeMap } : {}),
         pipelinePhase: stage.name,
         previousPhases: phaseResults,
         evidenceStarters: strategyContext.evidenceStarters || null,

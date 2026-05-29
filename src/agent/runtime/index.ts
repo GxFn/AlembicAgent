@@ -86,6 +86,9 @@ export type {
   PcvNodeRejectedFindingRef,
   PcvNodeRepairEvidence,
   PcvNodeStageIdentity,
+  PcvStageNodeIdentity,
+  PcvStageNodeMap,
+  ResolvedPcvStageNodeIdentity,
 } from './PcvNodeEvidence.js';
 export {
   buildPcvNodeEvidenceProcessMetadata,
@@ -98,6 +101,7 @@ export {
   recordPcvLlmOutput,
   recordPcvToolResult,
   recordPcvToolRoundOutcome,
+  resolvePcvStageNodeIdentity,
 } from './PcvNodeEvidence.js';
 export { SystemPromptBuilder } from './SystemPromptBuilder.js';
 export type {

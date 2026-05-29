@@ -15,6 +15,20 @@ export interface PcvNodeStageIdentity {
   trackerPhase: string | null;
 }
 
+export interface PcvStageNodeIdentity {
+  chainNodeId?: string | null;
+  nodeId?: string | null;
+  pcvNodeId?: string | null;
+  stageNodeId?: string | null;
+}
+
+export type PcvStageNodeMap = Record<string, PcvStageNodeIdentity | string | null | undefined>;
+
+export interface ResolvedPcvStageNodeIdentity {
+  chainNodeId: string;
+  nodeId: string;
+}
+
 export interface PcvNodeInputAssemblyEvidence {
   effectiveToolChoice: string | null;
   inputLayerAppended: boolean;
@@ -212,14 +226,24 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
     stringValue(ctx.context?.jobId) ||
     stringValue(ctx.context?.sessionId) ||
     null;
+  const mappedIdentity = resolvePcvStageNodeIdentity({
+    context: ctx.context,
+    pipelinePhase,
+    pipelineType,
+    sharedState: ctx.sharedState,
+    stageProfile: null,
+    trackerPhase,
+  });
   const stageSlug = pipelinePhase || trackerPhase || 'runtime';
   const scopeSlug = dimensionScopeId || dimensionId || targetName || 'unknown';
   const nodeId =
+    mappedIdentity?.nodeId ||
     stringValue(ctx.context?.pcvNodeId) ||
     stringValue(ctx.context?.nodeId) ||
     stringValue(ctx.context?.stageNodeId) ||
     `agent:${stageSlug}:${scopeSlug}`;
-  const chainNodeId = stringValue(ctx.context?.chainNodeId) || nodeId;
+  const chainNodeId =
+    mappedIdentity?.chainNodeId || stringValue(ctx.context?.chainNodeId) || nodeId;
   const repairEvidencePaths = extractSourceRefsFromValue([
     ctx.context?.recordRepairEvidencePaths,
     ctx.sharedState?._recordRepairEvidencePaths,
@@ -546,18 +570,31 @@ export function buildPcvQualityGateEvidence({
   artifact,
   dimId,
   gate,
+  sharedState,
   source,
+  stageNodeContext,
 }: {
   artifact: unknown;
   dimId?: string | null;
   gate: GateLike;
+  sharedState?: JsonRecord | null;
   source: unknown;
+  stageNodeContext?: JsonRecord | null;
 }): PcvNodeEvidenceSummary {
   const artifactRecord = asRecord(artifact);
   const sourceEvidence = getPcvNodeEvidence(source);
   const evidence = sourceEvidence
     ? cloneEvidence(sourceEvidence)
     : createFallbackQualityGateEvidence(artifactRecord, dimId || null);
+  const qualityGateIdentity = resolvePcvStageNodeIdentity({
+    context: stageNodeContext || artifactRecord,
+    pipelinePhase: 'quality_gate',
+    pipelineType: evidence.stageIdentity.pipelineType,
+    sharedState,
+    stageProfile: 'analyze',
+    trackerPhase: null,
+  });
+  applyResolvedStageNodeIdentity(evidence, qualityGateIdentity);
   const referencedFiles = stringArray(artifactRecord.referencedFiles);
   addSourceRefs(evidence, referencedFiles);
   const findings = Array.isArray(artifactRecord.findings) ? artifactRecord.findings : [];
@@ -621,6 +658,175 @@ export function extractSourceRefsFromValue(value: unknown): string[] {
   const refs = new Set<string>();
   collectSourceRefs(value, refs, new WeakSet<object>(), 0);
   return [...refs].slice(0, MAX_SOURCE_REFS);
+}
+
+export function resolvePcvStageNodeIdentity({
+  context,
+  pipelinePhase,
+  pipelineType,
+  sharedState,
+  stageProfile,
+  trackerPhase,
+}: {
+  context?: JsonRecord | null;
+  pipelinePhase?: string | null;
+  pipelineType?: string | null;
+  sharedState?: JsonRecord | null;
+  stageProfile?: string | null;
+  trackerPhase?: string | null;
+}): ResolvedPcvStageNodeIdentity | null {
+  const aliases = buildStageNodeAliases({
+    pipelinePhase,
+    pipelineType,
+    stageProfile,
+    trackerPhase,
+  });
+  if (aliases.length === 0) {
+    return null;
+  }
+
+  // canonical stage identity 由上游编排方注入；Agent 只消费并贯穿，缺失时保留 fallback。
+  const mapCandidates = [
+    context?.pcvStageNodeMap,
+    context?.pcvChainNodes,
+    context?.stageNodeMap,
+    sharedState?._pcvStageNodeMap,
+    sharedState?._pcvChainNodes,
+    sharedState?.pcvStageNodeMap,
+    sharedState?.pcvChainNodes,
+  ];
+  for (const mapCandidate of mapCandidates) {
+    const mapRecord = asRecord(mapCandidate);
+    if (Object.keys(mapRecord).length === 0) {
+      continue;
+    }
+    const normalized = new Map<string, unknown>();
+    for (const [key, value] of Object.entries(mapRecord)) {
+      normalized.set(normalizeStageKey(key), value);
+    }
+    for (const alias of aliases) {
+      const resolved = normalizePcvStageNodeMapValue(normalized.get(alias));
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  return null;
+}
+
+function applyResolvedStageNodeIdentity(
+  evidence: PcvNodeEvidenceSummary,
+  identity: ResolvedPcvStageNodeIdentity | null
+): void {
+  if (!identity) {
+    return;
+  }
+  evidence.nodeId = identity.nodeId;
+  evidence.chainNodeId = identity.chainNodeId;
+}
+
+function buildStageNodeAliases({
+  pipelinePhase,
+  pipelineType,
+  stageProfile,
+  trackerPhase,
+}: {
+  pipelinePhase?: string | null;
+  pipelineType?: string | null;
+  stageProfile?: string | null;
+  trackerPhase?: string | null;
+}): string[] {
+  const rawAliases = [
+    pipelinePhase,
+    normalizePipelinePhaseAlias(pipelinePhase),
+    stageProfile,
+    normalizeStageProfileAlias(stageProfile),
+    trackerPhase,
+    normalizeTrackerPhaseAlias(trackerPhase),
+    pipelineType,
+  ];
+  return uniqueStrings(rawAliases.map((alias) => normalizeStageKey(alias)).filter(Boolean));
+}
+
+function normalizePipelinePhaseAlias(value?: string | null): string | null {
+  const normalized = normalizeStageKey(value);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.includes('record_repair')) {
+    return 'record_repair';
+  }
+  if (normalized.includes('quality')) {
+    return 'quality_gate';
+  }
+  if (normalized === 'producer') {
+    return 'produce';
+  }
+  return normalized;
+}
+
+function normalizeStageProfileAlias(value?: string | null): string | null {
+  const normalized = normalizeStageKey(value);
+  if (normalized === 'record') {
+    return 'record_repair';
+  }
+  if (normalized === 'producer') {
+    return 'produce';
+  }
+  return normalized || null;
+}
+
+function normalizeTrackerPhaseAlias(value?: string | null): string | null {
+  const normalized = normalizeStageKey(value);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === 'produce') {
+    return 'produce';
+  }
+  if (normalized === 'record') {
+    return 'record';
+  }
+  if (['scan', 'explore', 'verify', 'summarize'].includes(normalized)) {
+    return 'analyze';
+  }
+  return normalized;
+}
+
+function normalizeStageKey(value?: string | null): string {
+  const stageKey = stringValue(value);
+  if (!stageKey) {
+    return '';
+  }
+  return stageKey
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/^stage_/, '');
+}
+
+function normalizePcvStageNodeMapValue(value: unknown): ResolvedPcvStageNodeIdentity | null {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const nodeId = value.trim();
+    return { chainNodeId: nodeId, nodeId };
+  }
+
+  const record = asRecord(value);
+  const nodeId =
+    stringValue(record.pcvNodeId) ||
+    stringValue(record.nodeId) ||
+    stringValue(record.stageNodeId) ||
+    stringValue(record.canonicalNodeId) ||
+    stringValue(record.id);
+  if (!nodeId) {
+    return null;
+  }
+  const chainNodeId =
+    stringValue(record.chainNodeId) ||
+    stringValue(record.canonicalChainNodeId) ||
+    stringValue(record.chainId) ||
+    nodeId;
+  return { chainNodeId, nodeId };
 }
 
 function buildLedgerRefs(ctx: LoopContext, dimensionScopeId: string | null): PcvNodeLedgerRef[] {

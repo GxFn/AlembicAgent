@@ -162,7 +162,7 @@ describe('evidence recording quality gate actions', () => {
     });
   });
 
-  it('attaches PCVM N9 quality evidence with runtime input, ledger and finding refs', () => {
+  it('attaches PCVM N9 quality evidence with canonical quality gate node identity', () => {
     const source = {
       reply:
         '## Runtime boundary\nsrc/foo.ts:10 proves the runtime path.\n\n## Producer boundary\nsrc/bar.ts:20 validates the producer handoff.\n\n## Dashboard boundary\nsrc/baz.ts:30 keeps UI consumption separate.',
@@ -279,6 +279,12 @@ describe('evidence recording quality gate actions', () => {
         activeContext,
         dimId: 'architecture',
         needsCandidates: true,
+        pcvStageNodeMap: {
+          quality_gate: {
+            chainNodeId: 'pcvm:cold-start:n9:quality',
+            pcvNodeId: 'pcvm:n9:quality_gate',
+          },
+        },
       }
     );
     const artifact = result.artifact as Record<string, unknown>;
@@ -291,7 +297,8 @@ describe('evidence recording quality gate actions', () => {
     expect(pcvEvidence).toMatchObject({
       inputAssembly: { ref: 'llm-input:test', stageProfile: 'analyze' },
       ledgerRefs: [{ ref: 'active-context:dim-agent' }],
-      nodeId: 'agent:analyze:dim-agent',
+      chainNodeId: 'pcvm:cold-start:n9:quality',
+      nodeId: 'pcvm:n9:quality_gate',
       qualityGate: {
         pass: true,
         stage: 'quality_gate',
@@ -309,7 +316,7 @@ describe('evidence recording quality gate actions', () => {
     );
     expect(pcvEvidence.missingLinkReasons).not.toContain('missing-quality-gate-status');
     expect(artifact.metadata).toMatchObject({
-      pcvNodeEvidenceRef: 'agent:analyze:dim-agent',
+      pcvNodeEvidenceRef: 'pcvm:n9:quality_gate',
       pcvQualityGateStatus: 'pass',
     });
   });
@@ -321,6 +328,21 @@ describe('record repair pipeline stage', () => {
       { finding: 'Existing runtime finding', evidence: 'src/foo.ts:10', importance: 7 },
       { finding: 'Existing producer finding', evidence: 'src/bar.ts:20', importance: 7 },
     ]);
+    const pcvStageNodeMap = {
+      analyze: {
+        chainNodeId: 'pcvm:cold-start:n9:analyze',
+        pcvNodeId: 'pcvm:n9:analyze',
+      },
+      produce: {
+        chainNodeId: 'pcvm:cold-start:n11',
+        pcvNodeId: 'pcvm:n11:produce',
+      },
+      record_repair: {
+        chainNodeId: 'pcvm:cold-start:n9:repair',
+        pcvNodeId: 'pcvm:n9:record_repair',
+      },
+    };
+    (strategyContext as Record<string, unknown>).pcvStageNodeMap = pcvStageNodeMap;
     const strategy = createStrategy(3);
     const phases: string[] = [];
     const runtime = {
@@ -330,6 +352,7 @@ describe('record repair pipeline stage', () => {
         const context = opts.context as Record<string, unknown>;
         const phase = String(context.pipelinePhase);
         phases.push(phase);
+        expect(context.pcvStageNodeMap).toBe(pcvStageNodeMap);
         if (phase === 'analyze') {
           return {
             reply: 'Analysis references src/foo.ts:10 and src/bar.ts:20.',

@@ -187,6 +187,53 @@ describe('LLM input layering', () => {
     });
   });
 
+  it('uses canonical stage node identity in llm input process metadata', async () => {
+    const progress: ProgressEvent[] = [];
+    const chatWithTools = vi.fn(async () => ({
+      text: 'done',
+      functionCalls: [],
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    const runtime = createRuntime({
+      chatWithTools,
+      onProgress: (event) => progress.push(event),
+    });
+    const tracker = createTracker({ phase: 'SCAN' });
+
+    const result = await runtime.reactLoop('analyze canonical node identity', {
+      source: 'system',
+      context: {
+        dimensionId: 'architecture',
+        pcvStageNodeMap: {
+          analyze: {
+            chainNodeId: 'pcvm:cold-start:n9',
+            pcvNodeId: 'pcvm:n9:analyze',
+          },
+        },
+        pipelinePhase: 'analyze',
+      },
+      systemPromptOverride: 'Analyst identity prompt',
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const llmInput = getLlmInput(progress);
+
+    expect(llmInput?.metadata).toMatchObject({
+      pcvNodeEvidence: {
+        chainNodeId: 'pcvm:cold-start:n9',
+        inputAssemblyRef: expect.stringMatching(/^llm-input:/),
+        nodeId: 'pcvm:n9:analyze',
+      },
+    });
+    expect(result.pcvNodeEvidence).toMatchObject({
+      chainNodeId: 'pcvm:cold-start:n9',
+      inputAssembly: { ref: expect.stringMatching(/^llm-input:/) },
+      nodeId: 'pcvm:n9:analyze',
+      stageIdentity: { pipelinePhase: 'analyze', stageProfile: 'analyze' },
+    });
+  });
+
   it('injects observation ledger dynamic context without raw tool envelope fields', async () => {
     const progress: ProgressEvent[] = [];
     const capture: { messages?: Array<{ role: string; content?: string }> } = {};
@@ -376,7 +423,15 @@ describe('LLM input layering', () => {
     await runtime.reactLoop('produce knowledge candidates', {
       source: 'system',
       additionalToolsOverride: ['code', 'knowledge'],
-      context: { pipelinePhase: 'produce' },
+      context: {
+        pcvStageNodeMap: {
+          produce: {
+            chainNodeId: 'pcvm:cold-start:n11',
+            pcvNodeId: 'pcvm:n11:produce',
+          },
+        },
+        pipelinePhase: 'produce',
+      },
       systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
       tracker: tracker as never,
       budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
@@ -391,7 +446,13 @@ describe('LLM input layering', () => {
     expect(providerLayer).toContain('stageProfile: produce');
     expect(providerLayer).toContain('Producer phase');
     expect(providerLayer).not.toContain('graph({ action');
-    expect(llmInput?.metadata).toMatchObject({ inputStageProfile: 'produce' });
+    expect(llmInput?.metadata).toMatchObject({
+      inputStageProfile: 'produce',
+      pcvNodeEvidence: {
+        chainNodeId: 'pcvm:cold-start:n11',
+        nodeId: 'pcvm:n11:produce',
+      },
+    });
   });
 
   it('renders producer budget directly from SystemPromptBuilder without Analyst search phases', () => {
