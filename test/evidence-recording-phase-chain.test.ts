@@ -343,6 +343,10 @@ describe('record repair pipeline stage', () => {
       },
     };
     (strategyContext as Record<string, unknown>).pcvStageNodeMap = pcvStageNodeMap;
+    (strategyContext.sharedState as Record<string, unknown>)._dimensionMeta = {
+      id: 'design-patterns',
+      outputType: 'candidate',
+    };
     const strategy = createStrategy(3);
     const phases: string[] = [];
     const runtime = {
@@ -382,6 +386,17 @@ describe('record repair pipeline stage', () => {
             tokenUsage: { input: 1, output: 1 },
             iterations: 1,
           };
+        }
+        if (phase === 'produce') {
+          expect(opts.sharedState).toMatchObject({
+            _producerReferencedFiles: expect.arrayContaining(['src/foo.ts', 'src/bar.ts']),
+            _sourceRefPolicy: {
+              allowEntityOnlyRefs: false,
+              allowGuessedPaths: false,
+              mode: 'strict',
+              sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
+            },
+          });
         }
         return {
           reply: 'produced',

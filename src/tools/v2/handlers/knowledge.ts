@@ -103,20 +103,31 @@ async function handleSubmit(
       params.title = stripProjectNamePrefix(String(params.title), ctx.projectRoot);
     }
 
-    const content = params.content as Record<string, unknown>;
-    const reasoning = params.reasoning as Record<string, unknown> | undefined;
-    const normalizedSources = groundSourceRefs(
-      normalizeStringArray(reasoning?.sources ?? params.sourceRefs ?? params.filePaths),
-      ctx
-    );
-    const normalizedSourceRefs = groundSourceRefs(
-      normalizeStringArray(params.sourceRefs ?? params.filePaths ?? normalizedSources.refs),
-      ctx
-    );
     const dimMeta = (ctx.runtime?.dimensionMeta as DimensionMetaLike | null | undefined) ?? null;
     const effectiveDimensionId =
       dimMeta?.id ?? pickString(params.dimensionId) ?? pickString(ctx.runtime?.dimensionScopeId);
     const isBootstrap = !!dimMeta;
+    const content = params.content as Record<string, unknown>;
+    const reasoning = params.reasoning as Record<string, unknown> | undefined;
+    const sourceRefPolicy = resolveSourceRefPolicy(ctx);
+    const normalizedSources = groundSourceRefs(
+      normalizeStringArray(reasoning?.sources ?? params.sourceRefs ?? params.filePaths),
+      ctx,
+      sourceRefPolicy
+    );
+    const normalizedSourceRefs = groundSourceRefs(
+      normalizeStringArray(params.sourceRefs ?? params.filePaths ?? normalizedSources.refs),
+      ctx,
+      sourceRefPolicy
+    );
+    const sourceRefValidation = buildSourceRefValidation(
+      sourceRefPolicy,
+      normalizedSources,
+      normalizedSourceRefs
+    );
+    if (sourceRefPolicy.mode === 'strict' && sourceRefValidation.rejectedSourceRefs.length > 0) {
+      return failSourceRefValidation(sourceRefValidation);
+    }
     const allowedKnowledgeType = normalizeStringArray(dimMeta?.allowedKnowledgeTypes)[0];
     const effectiveKnowledgeType =
       allowedKnowledgeType ?? pickString(params.knowledgeType) ?? 'code-pattern';
@@ -161,6 +172,7 @@ async function handleSubmit(
       category: effectiveCategory,
       language: effectiveLanguage,
       source: isBootstrap ? 'bootstrap' : AGENT_RUNTIME_SOURCE,
+      sourceRefValidation,
       agentNotes: buildAgentNotes(dimMeta, normalizedSources, normalizedSourceRefs),
     };
 
@@ -265,6 +277,40 @@ interface SourceRefGrounding {
   originalRefs: string[];
   refs: string[];
   normalized: Array<{ from: string; to: string; reason: string }>;
+  rejected: SourceRefRejected[];
+  warnings: Array<{ ref: string; reason: string }>;
+}
+
+type SourceRefValidationStatus = 'valid' | 'repaired' | 'rejected' | 'invalid';
+
+type SourceRefRejectReason =
+  | 'ambiguous-basename'
+  | 'entity-not-file'
+  | 'file-not-found'
+  | 'outside-project-root'
+  | 'package-path-mismatch';
+
+interface SourceRefRejected {
+  candidates?: string[];
+  reason: SourceRefRejectReason;
+  ref: string;
+  suggestedRef?: string;
+}
+
+interface SourceRefPolicy {
+  allowEntityOnlyRefs: boolean;
+  allowGuessedPaths: boolean;
+  mode: 'compat' | 'strict';
+  sourceRefsMustComeFrom: 'project-files-or-canonical-source-ref-index';
+}
+
+interface SourceRefValidationSummary {
+  invalidSourceRefCount: number;
+  mode: SourceRefPolicy['mode'];
+  policy: SourceRefPolicy;
+  rejectedSourceRefs: SourceRefRejected[];
+  repairedSourceRefs: Array<{ from: string; reason: string; to: string }>;
+  status: SourceRefValidationStatus;
   warnings: Array<{ ref: string; reason: string }>;
 }
 
@@ -280,8 +326,10 @@ function buildAgentNotes(
   const hasGroundingNotes =
     grounding.reasoningSources.normalized.length > 0 ||
     grounding.reasoningSources.warnings.length > 0 ||
+    grounding.reasoningSources.rejected.length > 0 ||
     grounding.sourceRefs.normalized.length > 0 ||
-    grounding.sourceRefs.warnings.length > 0;
+    grounding.sourceRefs.warnings.length > 0 ||
+    grounding.sourceRefs.rejected.length > 0;
   const base = dimMeta
     ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
     : null;
@@ -298,28 +346,42 @@ function compactGroundingNotes(grounding: SourceRefGrounding) {
   return {
     originalRefs: grounding.originalRefs,
     normalized: grounding.normalized,
+    rejected: grounding.rejected,
     warnings: grounding.warnings,
   };
 }
 
-function groundSourceRefs(refs: string[], ctx: ToolContext): SourceRefGrounding {
+function groundSourceRefs(
+  refs: string[],
+  ctx: ToolContext,
+  policy: SourceRefPolicy
+): SourceRefGrounding {
   const trustedRefs = collectTrustedSourceRefs(ctx);
   const normalized: SourceRefGrounding['normalized'] = [];
+  const rejected: SourceRefGrounding['rejected'] = [];
   const warnings: SourceRefGrounding['warnings'] = [];
-  const grounded = refs.map((ref) => {
+  const grounded: string[] = [];
+  for (const ref of refs) {
     const result = groundSingleSourceRef(ref, ctx.projectRoot, trustedRefs);
     if (result.normalizedFrom) {
       normalized.push({ from: result.normalizedFrom, to: result.ref, reason: result.reason });
     }
+    if (result.rejected) {
+      if (policy.mode === 'strict') {
+        rejected.push(result.rejected);
+        continue;
+      }
+    }
     if (result.warning) {
       warnings.push({ ref: result.ref, reason: result.warning });
     }
-    return result.ref;
-  });
+    grounded.push(result.ref);
+  }
   return {
     originalRefs: refs,
     refs: uniqueStrings(grounded),
     normalized,
+    rejected,
     warnings,
   };
 }
@@ -330,6 +392,8 @@ function collectTrustedSourceRefs(ctx: ToolContext): string[] {
       ? ctx.runtime.sharedState
       : {};
   return uniqueStrings([
+    ...normalizeSourceRefIndex(sharedState._canonicalSourceRefIndex),
+    ...normalizeSourceRefIndex(sharedState.canonicalSourceRefIndex),
     ...normalizeStringArray(sharedState._recordRepairEvidencePaths),
     ...normalizeStringArray(sharedState._producerReferencedFiles),
     ...normalizeStringArray(sharedState._referencedFiles),
@@ -337,13 +401,48 @@ function collectTrustedSourceRefs(ctx: ToolContext): string[] {
   ]).map((ref) => stripSourceRefLine(ref).pathOnly);
 }
 
+function normalizeSourceRefIndex(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const refs: string[] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      refs.push(item);
+      continue;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const ref = pickString(record.path) ?? pickString(record.filePath) ?? pickString(record.ref);
+    if (ref) {
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
+
 function groundSingleSourceRef(
   ref: string,
   projectRoot: string,
   trustedRefs: string[]
-): { ref: string; normalizedFrom?: string; reason: string; warning?: string } {
+): {
+  ref: string;
+  normalizedFrom?: string;
+  reason: string;
+  rejected?: SourceRefRejected;
+  warning?: string;
+} {
   const trimmed = normalizePathText(ref);
   const { pathOnly, suffix } = stripSourceRefLine(trimmed);
+  if (isOutsideProjectRef(pathOnly, projectRoot)) {
+    return {
+      ref: trimmed,
+      reason: 'outside-project-root',
+      rejected: { ref: trimmed, reason: 'outside-project-root' },
+    };
+  }
   const projectRelative = normalizeProjectRelativePath(pathOnly, projectRoot);
   const withSuffix = (base: string) => `${base}${suffix}`;
 
@@ -369,17 +468,67 @@ function groundSingleSourceRef(
   const basenameMatches = trustedRefs.filter(
     (candidate) => path.posix.basename(candidate) === basename
   );
+  const hasDirectory = pathOnly.includes('/');
+  if (basename && basenameMatches.length > 1) {
+    return {
+      ref: trimmed,
+      reason: 'ambiguous-basename',
+      rejected: {
+        candidates: basenameMatches.slice(0, 8),
+        ref: trimmed,
+        reason: 'ambiguous-basename',
+      },
+    };
+  }
   if (basename && basenameMatches.length === 1) {
+    if (hasDirectory && basenameMatches[0] !== projectRelative) {
+      return {
+        ref: trimmed,
+        reason: 'package-path-mismatch',
+        rejected: {
+          ref: trimmed,
+          reason: 'package-path-mismatch',
+          suggestedRef: withSuffix(basenameMatches[0]),
+        },
+      };
+    }
     return {
       ref: withSuffix(basenameMatches[0]),
       normalizedFrom: ref,
-      reason: 'unique-trusted-basename-match',
+      reason: 'missing-prefix-unique-basename',
     };
   }
 
+  const wrongExtensionMatches = findWrongExtensionMatches(
+    projectRoot,
+    projectRelative,
+    trustedRefs
+  );
+  if (wrongExtensionMatches.length === 1) {
+    return {
+      ref: withSuffix(wrongExtensionMatches[0]),
+      normalizedFrom: ref,
+      reason: 'wrong-extension-unique-sibling',
+    };
+  }
+  if (wrongExtensionMatches.length > 1) {
+    return {
+      ref: trimmed,
+      reason: 'ambiguous-basename',
+      rejected: {
+        candidates: wrongExtensionMatches.slice(0, 8),
+        ref: trimmed,
+        reason: 'ambiguous-basename',
+      },
+    };
+  }
+
+  const rejectReason: SourceRefRejectReason =
+    !hasDirectory && path.posix.extname(basename) ? 'entity-not-file' : 'file-not-found';
   return {
     ref: trimmed,
-    reason: 'unverified-preserved',
+    reason: rejectReason,
+    rejected: { ref: trimmed, reason: rejectReason },
     warning:
       trustedRefs.length > 0
         ? 'sourceRef was not found in projectRoot or trusted analysis refs; preserved for downstream N11 scorecard'
@@ -387,8 +536,143 @@ function groundSingleSourceRef(
   };
 }
 
+function resolveSourceRefPolicy(ctx: ToolContext): SourceRefPolicy {
+  const sharedState =
+    ctx.runtime?.sharedState && typeof ctx.runtime.sharedState === 'object'
+      ? ctx.runtime.sharedState
+      : {};
+  const policy =
+    sharedState._sourceRefPolicy && typeof sharedState._sourceRefPolicy === 'object'
+      ? (sharedState._sourceRefPolicy as Record<string, unknown>)
+      : sharedState.sourceRefPolicy && typeof sharedState.sourceRefPolicy === 'object'
+        ? (sharedState.sourceRefPolicy as Record<string, unknown>)
+        : {};
+  const mode =
+    pickString(policy.mode) === 'strict' ||
+    sharedState._strictSourceRefs === true ||
+    sharedState.strictSourceRefs === true
+      ? 'strict'
+      : 'compat';
+  return {
+    allowEntityOnlyRefs: policy.allowEntityOnlyRefs === true,
+    allowGuessedPaths: policy.allowGuessedPaths === true,
+    mode,
+    sourceRefsMustComeFrom: 'project-files-or-canonical-source-ref-index',
+  };
+}
+
+function buildSourceRefValidation(
+  policy: SourceRefPolicy,
+  normalizedSources: SourceRefGrounding,
+  normalizedSourceRefs: SourceRefGrounding
+): SourceRefValidationSummary {
+  const repairedSourceRefs = dedupeRepairs([
+    ...normalizedSources.normalized,
+    ...normalizedSourceRefs.normalized,
+  ]);
+  const rejectedSourceRefs = dedupeRejected([
+    ...normalizedSources.rejected,
+    ...normalizedSourceRefs.rejected,
+  ]);
+  const warnings = dedupeWarnings([
+    ...normalizedSources.warnings,
+    ...normalizedSourceRefs.warnings,
+  ]);
+  const status: SourceRefValidationStatus =
+    rejectedSourceRefs.length > 0
+      ? 'rejected'
+      : warnings.length > 0
+        ? 'invalid'
+        : repairedSourceRefs.length > 0
+          ? 'repaired'
+          : 'valid';
+  return {
+    invalidSourceRefCount: rejectedSourceRefs.length + warnings.length,
+    mode: policy.mode,
+    policy,
+    rejectedSourceRefs,
+    repairedSourceRefs,
+    status,
+    warnings,
+  };
+}
+
+function failSourceRefValidation(validation: SourceRefValidationSummary): ToolResult {
+  const reasonText = validation.rejectedSourceRefs
+    .map((entry) =>
+      [
+        `${entry.ref}: ${entry.reason}`,
+        entry.suggestedRef ? `suggested=${entry.suggestedRef}` : null,
+        entry.candidates?.length ? `candidates=${entry.candidates.join(',')}` : null,
+      ]
+        .filter(Boolean)
+        .join(' ')
+    )
+    .join('; ');
+  return {
+    ok: false,
+    data: {
+      sourceRefValidation: validation,
+      status: 'source_ref_validation_failed',
+    },
+    error: `sourceRef strict validation failed: ${reasonText}`,
+  };
+}
+
+function dedupeRepairs(
+  repairs: Array<{ from: string; reason: string; to: string }>
+): Array<{ from: string; reason: string; to: string }> {
+  const seen = new Set<string>();
+  return repairs.filter((repair) => {
+    const key = `${repair.from}\0${repair.to}\0${repair.reason}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeRejected(rejected: SourceRefRejected[]): SourceRefRejected[] {
+  const seen = new Set<string>();
+  return rejected.filter((entry) => {
+    const key = `${entry.ref}\0${entry.reason}\0${entry.suggestedRef || ''}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeWarnings(
+  warnings: Array<{ ref: string; reason: string }>
+): Array<{ ref: string; reason: string }> {
+  const seen = new Set<string>();
+  return warnings.filter((warning) => {
+    const key = `${warning.ref}\0${warning.reason}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
 function normalizePathText(ref: string): string {
   return ref.trim().replaceAll('\\', '/').replace(/^\.\//, '');
+}
+
+function isOutsideProjectRef(ref: string, projectRoot: string): boolean {
+  if (!ref) {
+    return false;
+  }
+  if (path.isAbsolute(ref)) {
+    const relative = path.relative(projectRoot, ref);
+    return relative.startsWith('..') || path.isAbsolute(relative);
+  }
+  const normalized = path.posix.normalize(normalizePathText(ref));
+  return normalized === '..' || normalized.startsWith('../');
 }
 
 function stripSourceRefLine(ref: string): { pathOnly: string; suffix: string } {
@@ -411,6 +695,47 @@ function normalizeProjectRelativePath(ref: string, projectRoot: string): string 
     return normalizePathText(ref);
   }
   return normalizePathText(relative);
+}
+
+function findWrongExtensionMatches(
+  projectRoot: string,
+  ref: string,
+  trustedRefs: string[]
+): string[] {
+  const parsed = path.posix.parse(ref);
+  if (!parsed.ext || !parsed.name) {
+    return [];
+  }
+  const trustedMatches = trustedRefs.filter((candidate) => {
+    const parsedCandidate = path.posix.parse(candidate);
+    return parsedCandidate.dir === parsed.dir && parsedCandidate.name === parsed.name;
+  });
+  const siblingMatches = listSiblingFiles(projectRoot, parsed.dir).filter((candidate) => {
+    const parsedCandidate = path.posix.parse(candidate);
+    return parsedCandidate.name === parsed.name;
+  });
+  return uniqueStrings([...trustedMatches, ...siblingMatches]).filter(
+    (candidate) => candidate !== ref
+  );
+}
+
+function listSiblingFiles(projectRoot: string, dir: string): string[] {
+  if (!projectRoot) {
+    return [];
+  }
+  const relativeDir = dir && dir !== '.' ? dir : '';
+  if (isOutsideProjectRef(relativeDir || '.', projectRoot)) {
+    return [];
+  }
+  const absoluteDir = path.join(projectRoot, relativeDir);
+  try {
+    return fs
+      .readdirSync(absoluteDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => normalizePathText(path.posix.join(relativeDir, entry.name)));
+  } catch {
+    return [];
+  }
 }
 
 function fileExists(projectRoot: string, ref: string): boolean {

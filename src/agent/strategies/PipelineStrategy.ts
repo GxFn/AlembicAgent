@@ -881,18 +881,46 @@ export class PipelineStrategy extends Strategy {
       strategyContext.stageNodeMap ??
       baseSharedState?.stageNodeMap ??
       null;
+    const isBootstrapProducerStage =
+      (stage.name === 'produce' || stage.name === 'producer') &&
+      Boolean(baseSharedState?._dimensionMeta);
+    const producerReferencedFiles = isBootstrapProducerStage
+      ? uniqueStageStrings([
+          ...normalizeStageStringArray(baseSharedState?._producerReferencedFiles),
+          ...this.#extractRecordRepairEvidencePaths(
+            (phaseResults.quality_gate as { artifact?: unknown } | undefined)?.artifact
+          ),
+        ])
+      : [];
+    const producerSourceRefState = isBootstrapProducerStage
+      ? {
+          _canonicalSourceRefIndex: buildCanonicalSourceRefIndex(producerReferencedFiles),
+          _producerReferencedFiles: producerReferencedFiles,
+          _sourceRefPolicy: {
+            allowEntityOnlyRefs: false,
+            allowGuessedPaths: false,
+            mode: 'strict',
+            sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
+          },
+        }
+      : {};
     const stageSharedState = decisionOnly
       ? {
           ...(baseSharedState || {}),
+          ...producerSourceRefState,
           _evolutionDecisionOnly: true,
         }
       : stage.recordRepairOnly
         ? {
             ...(baseSharedState || {}),
+            ...producerSourceRefState,
             _recordRepairOnly: true,
             _recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
           }
-        : baseSharedState;
+        : {
+            ...(baseSharedState || {}),
+            ...producerSourceRefState,
+          };
 
     const reactPromise = runtime.reactLoop(stagePrompt, {
       history: message.history,
@@ -1057,4 +1085,28 @@ StrategyRegistry.register('pipeline', PipelineStrategy);
 
 function numberFromUnknown(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function buildCanonicalSourceRefIndex(paths: string[]) {
+  return uniqueStageStrings(paths.map(stripStageSourceRefLine)).map((sourcePath, index) => ({
+    aliases: [sourcePath.split('/').pop() || sourcePath],
+    basename: sourcePath.split('/').pop() || sourcePath,
+    id: `file:${String(index + 1).padStart(3, '0')}`,
+    path: sourcePath,
+  }));
+}
+
+function normalizeStageStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+}
+
+function stripStageSourceRefLine(ref: string): string {
+  return ref.trim().replace(/:\d+(?:-\d+)?$/, '');
+}
+
+function uniqueStageStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }

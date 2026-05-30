@@ -287,6 +287,19 @@ function buildEvidenceContextSection(
   if (groundingContext.policy) {
     lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
   }
+  if (groundingContext.sourceRefPolicy === 'strict') {
+    lines.push(
+      'sourceRefPolicy: strict; sourceRefs and reasoning.sources must use canonical repo-relative paths from canonicalSourceRefIndex. Invalid guessed paths, entity names, ambiguous basenames, and outside-root paths are rejected by knowledge.submit.'
+    );
+    if (groundingContext.canonicalSourceRefIndex.length > 0) {
+      lines.push(
+        `canonicalSourceRefIndex: ${groundingContext.canonicalSourceRefIndex
+          .slice(0, 24)
+          .map((entry) => `${entry.id}=${entry.path}`)
+          .join(', ')}`
+      );
+    }
+  }
 
   return {
     id: 'evidenceContext',
@@ -298,13 +311,16 @@ function buildEvidenceContextSection(
 }
 
 interface GroundingContext {
+  canonicalSourceRefIndex: Array<{ aliases: string[]; basename: string; id: string; path: string }>;
   deterministicEvidenceRefs: string[];
   evidenceStarterRefs: string[];
   policy: string | null;
+  sourceRefPolicy: string | null;
 }
 
 function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingContext {
   const evidenceStarters = ctx.context?.evidenceStarters ?? ctx.sharedState?._evidenceStarters;
+  const canonicalSourceRefIndex = collectCanonicalSourceRefIndex(ctx);
   const evidenceStarterRefs = uniqueStrings(extractSourceRefsFromValue(evidenceStarters)).slice(
     0,
     24
@@ -320,13 +336,97 @@ function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingCon
       ctx.sharedState?._producerReferencedFiles,
       ctx.sharedState?._recordRepairEvidencePaths,
       ctx.sharedState?.referencedFiles,
+      canonicalSourceRefIndex.map((entry) => entry.path),
     ]),
   ]).slice(0, 32);
+  const sourceRefPolicy = resolveSourceRefPolicyMode(ctx);
   const policy =
     resolveLlmInputStageProfile(ctx) === 'analyze'
       ? buildAnalyzeGroundingPolicy(modelRef, deterministicEvidenceRefs.length)
       : null;
-  return { deterministicEvidenceRefs, evidenceStarterRefs, policy };
+  return {
+    canonicalSourceRefIndex,
+    deterministicEvidenceRefs,
+    evidenceStarterRefs,
+    policy,
+    sourceRefPolicy,
+  };
+}
+
+function collectCanonicalSourceRefIndex(
+  ctx: LoopContext
+): Array<{ aliases: string[]; basename: string; id: string; path: string }> {
+  const explicitIndex = normalizeSourceRefIndex(
+    ctx.sharedState?._canonicalSourceRefIndex ?? ctx.sharedState?.canonicalSourceRefIndex
+  );
+  if (explicitIndex.length > 0) {
+    return explicitIndex;
+  }
+  return uniqueStrings(
+    extractSourceRefsFromValue([
+      ctx.context?.referencedFiles,
+      ctx.sharedState?._producerReferencedFiles,
+      ctx.sharedState?._referencedFiles,
+      ctx.sharedState?.referencedFiles,
+    ])
+  )
+    .slice(0, 24)
+    .map((sourcePath, index) => buildSourceRefIndexEntry(sourcePath, index));
+}
+
+function normalizeSourceRefIndex(
+  value: unknown
+): Array<{ aliases: string[]; basename: string; id: string; path: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries: Array<{ aliases: string[]; basename: string; id: string; path: string }> = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      entries.push(buildSourceRefIndexEntry(item, entries.length));
+      continue;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const sourcePath = stringValue(record.path) || stringValue(record.filePath);
+    if (!sourcePath) {
+      continue;
+    }
+    const basename = stringValue(record.basename) || sourcePath.split('/').pop() || sourcePath;
+    entries.push({
+      aliases: Array.isArray(record.aliases)
+        ? record.aliases.filter(
+            (alias): alias is string => typeof alias === 'string' && alias.trim().length > 0
+          )
+        : [basename],
+      basename,
+      id: stringValue(record.id) || `file:${String(entries.length + 1).padStart(3, '0')}`,
+      path: sourcePath,
+    });
+  }
+  return entries;
+}
+
+function buildSourceRefIndexEntry(sourcePath: string, index: number) {
+  const pathOnly = sourcePath.trim().replace(/:\d+(?:-\d+)?$/, '');
+  const basename = pathOnly.split('/').pop() || pathOnly;
+  return {
+    aliases: [basename],
+    basename,
+    id: `file:${String(index + 1).padStart(3, '0')}`,
+    path: pathOnly,
+  };
+}
+
+function resolveSourceRefPolicyMode(ctx: LoopContext): string | null {
+  const policy =
+    valueAt(ctx.sharedState?._sourceRefPolicy, 'mode') ||
+    valueAt(ctx.sharedState?.sourceRefPolicy, 'mode');
+  return stringValue(policy) === 'strict' || ctx.sharedState?._strictSourceRefs === true
+    ? 'strict'
+    : null;
 }
 
 function buildAnalyzeGroundingPolicy(modelRef: string, deterministicRefCount: number): string {

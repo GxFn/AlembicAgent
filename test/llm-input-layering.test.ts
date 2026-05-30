@@ -119,10 +119,11 @@ describe('LLM input layering', () => {
       { name: 'Demo' }
     );
 
-    expect(prompt).toContain('SourceRef grounding policy');
+    expect(prompt).toContain('SourceRef strict contract');
+    expect(prompt).toContain('canonicalSourceRefIndex');
     expect(prompt).toContain('Sources/App/Feature.swift');
-    expect(prompt).toContain('不要只写文件名、模块名、目录别名');
-    expect(prompt).toContain('不要在 sourceRefs 中编造路径');
+    expect(prompt).toContain('wrong: Feature.swift；right: Sources/App/Feature.swift');
+    expect(prompt).toContain('会被 reject');
   });
 
   it('projects explicit input sections into both provider messages and developer-visible llm.input', async () => {
@@ -399,12 +400,17 @@ describe('LLM input layering', () => {
 
   it('gives Producer its own profile and budget instead of Analyst exploration policy', async () => {
     const progress: ProgressEvent[] = [];
-    const capture: { systemPrompt?: string; messageBatches: Array<Array<{ content?: string }>> } = {
+    const capture: {
+      messageBatches: Array<Array<{ content?: string }>>;
+      systemPrompt?: string;
+      toolSchemas?: Array<Record<string, unknown>>;
+    } = {
       messageBatches: [],
     };
     const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
       capture.systemPrompt = opts?.systemPrompt as string;
       capture.messageBatches.push((opts?.messages as Array<{ content?: string }>) || []);
+      capture.toolSchemas = opts?.toolSchemas as Array<Record<string, unknown>>;
       return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
     });
     const runtime = createRuntime({
@@ -413,6 +419,7 @@ describe('LLM input layering', () => {
       toolSchemas: [
         { name: 'code', description: 'Code', parameters: { type: 'object' } },
         { name: 'knowledge', description: 'Knowledge', parameters: { type: 'object' } },
+        { name: 'terminal', description: 'Terminal', parameters: { type: 'object' } },
       ],
     });
     const tracker = ExplorationTracker.resolve(
@@ -432,6 +439,22 @@ describe('LLM input layering', () => {
         },
         pipelinePhase: 'produce',
       },
+      sharedState: {
+        _canonicalSourceRefIndex: [
+          {
+            aliases: ['Feature.swift'],
+            basename: 'Feature.swift',
+            id: 'file:001',
+            path: 'Sources/App/Feature.swift',
+          },
+        ],
+        _sourceRefPolicy: {
+          allowEntityOnlyRefs: false,
+          allowGuessedPaths: false,
+          mode: 'strict',
+          sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
+        },
+      },
       systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
       tracker: tracker as never,
       budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
@@ -445,7 +468,10 @@ describe('LLM input layering', () => {
     expect(capture.systemPrompt).not.toContain('结构化查询');
     expect(providerLayer).toContain('stageProfile: produce');
     expect(providerLayer).toContain('Producer phase');
+    expect(providerLayer).toContain('sourceRefPolicy: strict');
+    expect(providerLayer).toContain('canonicalSourceRefIndex: file:001=Sources/App/Feature.swift');
     expect(providerLayer).not.toContain('graph({ action');
+    expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['code', 'knowledge']);
     expect(llmInput?.metadata).toMatchObject({
       inputStageProfile: 'produce',
       pcvNodeEvidence: {

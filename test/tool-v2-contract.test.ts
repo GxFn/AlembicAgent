@@ -20,6 +20,70 @@ function baseToolContext(): ToolContext {
   };
 }
 
+function strictKnowledgeSubmitParams(sourceRefs: string[]) {
+  return {
+    title: 'Strict SourceRef contract',
+    description: 'Records strict sourceRef validation before producer knowledge acceptance.',
+    content: {
+      markdown:
+        'This candidate documents strict sourceRef producer validation for bootstrap knowledge submissions. '.repeat(
+          4
+        ),
+      rationale:
+        'The producer must only submit canonical project-relative source references that can be deterministically validated or safely repaired.',
+    },
+    kind: 'pattern',
+    trigger: 'Strict SourceRef contract',
+    whenClause: 'When bootstrap producer submits knowledge candidates with sourceRefs.',
+    doClause: 'Validate sourceRefs against canonical project-relative paths before acceptance.',
+    reasoning: {
+      sources: sourceRefs,
+      confidence: 0.9,
+    },
+    sourceRefs,
+  };
+}
+
+function strictProducerRuntime(canonicalRefs: string[]) {
+  return {
+    dimensionMeta: {
+      allowedKnowledgeTypes: ['code-pattern'],
+      id: 'design-patterns',
+      outputType: 'candidate',
+    },
+    sharedState: {
+      _canonicalSourceRefIndex: canonicalRefs.map((sourcePath, index) => ({
+        aliases: [path.posix.basename(sourcePath)],
+        basename: path.posix.basename(sourcePath),
+        id: `file:${String(index + 1).padStart(3, '0')}`,
+        path: sourcePath,
+      })),
+      _producerReferencedFiles: canonicalRefs,
+      _sourceRefPolicy: {
+        allowEntityOnlyRefs: false,
+        allowGuessedPaths: false,
+        mode: 'strict',
+        sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
+      },
+    },
+  };
+}
+
+function captureRecipeGateway(createRequests: Array<{ items: Record<string, unknown>[] }>) {
+  return {
+    create: async (request: { items: Record<string, unknown>[] }) => {
+      createRequests.push(request);
+      return {
+        blocked: [],
+        created: [{ id: 'candidate-1', title: 'Strict SourceRef contract' }],
+        duplicates: [],
+        merged: [],
+        rejected: [],
+      };
+    },
+  };
+}
+
 describe('Tool V2 contract exports', () => {
   it('exports capability catalog projections from the V2 registry', () => {
     const catalog = new V2CapabilityCatalog();
@@ -240,7 +304,7 @@ describe('Tool V2 contract exports', () => {
           {
             from: 'Existing.ts:4',
             to: 'src/verified/Existing.ts:4',
-            reason: 'unique-trusted-basename-match',
+            reason: 'missing-prefix-unique-basename',
           },
         ],
         warnings: [
@@ -252,6 +316,120 @@ describe('Tool V2 contract exports', () => {
         ],
       },
     });
+  });
+
+  it('repairs strict bootstrap producer sourceRefs before knowledge acceptance', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-strict-repair-'));
+    fs.mkdirSync(path.join(projectRoot, 'Sources/Infrastructure/Account'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'README.md'), '# Demo');
+    fs.writeFileSync(
+      path.join(projectRoot, 'Sources/Infrastructure/Account/CookieManager.swift'),
+      'final class CookieManager {}'
+    );
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams(['README.m', 'CookieManager.swift']),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime([
+        'README.md',
+        'Sources/Infrastructure/Account/CookieManager.swift',
+      ]),
+    });
+
+    expect(result.ok).toBe(true);
+    const item = createRequests[0]?.items[0] as {
+      sourceRefValidation?: {
+        repairedSourceRefs?: Array<{ from: string; reason: string; to: string }>;
+        status?: string;
+      };
+      sourceRefs?: string[];
+    };
+    expect(item.sourceRefs).toEqual([
+      'README.md',
+      'Sources/Infrastructure/Account/CookieManager.swift',
+    ]);
+    expect(item.sourceRefValidation).toMatchObject({
+      repairedSourceRefs: expect.arrayContaining([
+        { from: 'README.m', reason: 'wrong-extension-unique-sibling', to: 'README.md' },
+        {
+          from: 'CookieManager.swift',
+          reason: 'missing-prefix-unique-basename',
+          to: 'Sources/Infrastructure/Account/CookieManager.swift',
+        },
+      ]),
+      status: 'repaired',
+    });
+  });
+
+  it('rejects strict bootstrap producer sourceRefs with typed reasons', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-strict-reject-'));
+    const canonicalRefs = [
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/Network/NetworkMonitor.swift',
+      'Sources/Feature/Duplicate.swift',
+      'Tests/Feature/Duplicate.swift',
+    ];
+    for (const ref of canonicalRefs) {
+      fs.mkdirSync(path.dirname(path.join(projectRoot, ref)), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ref), `// ${ref}`);
+    }
+    const outsideFile = path.join(os.tmpdir(), `outside-${Date.now()}.swift`);
+    fs.writeFileSync(outsideFile, '// outside project root');
+
+    const cases = [
+      {
+        ref: 'Sources/Infrastructure/Networking/NetworkMonitor.swift',
+        reason: 'package-path-mismatch',
+      },
+      { ref: 'ClosureCookieProvider.swift', reason: 'entity-not-file' },
+      { ref: outsideFile, reason: 'outside-project-root' },
+      { ref: 'Duplicate.swift', reason: 'ambiguous-basename' },
+    ];
+
+    for (const testCase of cases) {
+      const router = new ToolRouterV2();
+      const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+      const parsed = router.parseToolCall('knowledge', {
+        action: 'submit',
+        params: strictKnowledgeSubmitParams([testCase.ref]),
+      });
+
+      expect('error' in parsed).toBe(false);
+      if ('error' in parsed) {
+        throw new Error(parsed.error);
+      }
+
+      const result = await router.execute(parsed, {
+        ...baseToolContext(),
+        projectRoot,
+        recipeGateway: captureRecipeGateway(createRequests),
+        runtime: strictProducerRuntime(canonicalRefs),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain(testCase.reason);
+      expect(createRequests).toHaveLength(0);
+      expect(result.data).toMatchObject({
+        sourceRefValidation: {
+          rejectedSourceRefs: expect.arrayContaining([
+            expect.objectContaining({ reason: testCase.reason, ref: testCase.ref }),
+          ]),
+          status: 'rejected',
+        },
+      });
+    }
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {
