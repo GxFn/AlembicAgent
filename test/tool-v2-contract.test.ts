@@ -445,6 +445,85 @@ describe('Tool V2 contract exports', () => {
     );
   });
 
+  it('repairs P12 basename line refs embedded in accepted candidate markdown', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-p12-content-repair-'));
+    const canonicalRefs = [
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift',
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/Middleware/RouteMiddleware.swift',
+      'BiliDili/AppCoordinator.swift',
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/AppModule.swift',
+    ];
+    for (const ref of canonicalRefs) {
+      fs.mkdirSync(path.dirname(path.join(projectRoot, ref)), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ref), `// ${ref}`);
+    }
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams([canonicalRefs[0] as string], {
+        markdown: `${'This candidate documents canonical content source label repair for P12 examples. '.repeat(
+          3
+        )}Use \`ServiceRegistry.swift:49\`, \`RouteMiddleware.swift:36\`, \`AppCoordinator.swift:62\`, and \`AppModule.swift:9\` as source labels.`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(canonicalRefs),
+    });
+
+    expect(result.ok).toBe(true);
+    const item = createRequests[0]?.items[0] as {
+      content?: { markdown?: string };
+      sourceRefValidation?: {
+        repairedSourceRefs?: Array<{ from: string; location?: string; to: string }>;
+      };
+    };
+    expect(item.content?.markdown).toContain(
+      '`Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift:49`'
+    );
+    expect(item.content?.markdown).toContain(
+      '`Packages/AOXFoundationKit/Sources/AOXFoundationKit/Middleware/RouteMiddleware.swift:36`'
+    );
+    expect(item.content?.markdown).toContain('`BiliDili/AppCoordinator.swift:62`');
+    expect(item.content?.markdown).toContain(
+      '`Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/AppModule.swift:9`'
+    );
+    expect(item.sourceRefValidation?.repairedSourceRefs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          from: 'ServiceRegistry.swift:49',
+          location: 'content.markdown',
+          to: 'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift:49',
+        }),
+        expect.objectContaining({
+          from: 'RouteMiddleware.swift:36',
+          location: 'content.markdown',
+          to: 'Packages/AOXFoundationKit/Sources/AOXFoundationKit/Middleware/RouteMiddleware.swift:36',
+        }),
+        expect.objectContaining({
+          from: 'AppCoordinator.swift:62',
+          location: 'content.markdown',
+          to: 'BiliDili/AppCoordinator.swift:62',
+        }),
+        expect.objectContaining({
+          from: 'AppModule.swift:9',
+          location: 'content.markdown',
+          to: 'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/AppModule.swift:9',
+        }),
+      ])
+    );
+  });
+
   it('accepts canonical strict bootstrap producer content source citations', async () => {
     const projectRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), 'alembic-agent-strict-content-valid-')
@@ -489,6 +568,127 @@ describe('Tool V2 contract exports', () => {
     };
     expect(item.content?.markdown).toContain('(来源: Sources/Feature/Feature.swift:12)');
     expect(item.sourceRefValidation?.status).toBe('valid');
+  });
+
+  it('rejects ambiguous P12 content source labels with candidate payload', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-p12-content-reject-'));
+    const canonicalRefs = [
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/Middleware/Middleware.swift',
+      'Sources/Legacy/Middleware.swift',
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift',
+    ];
+    for (const ref of canonicalRefs) {
+      fs.mkdirSync(path.dirname(path.join(projectRoot, ref)), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ref), `// ${ref}`);
+    }
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams([canonicalRefs[2] as string], {
+        contentExtras: {
+          sourceLabels: ['Middleware.swift:44'],
+        },
+        markdown: `${'This candidate documents ambiguous content source label rejection for P12 examples. '.repeat(
+          3
+        )}The middleware source label is \`Middleware.swift:27\`.`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(canonicalRefs),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(createRequests).toHaveLength(0);
+    expect(result.data).toMatchObject({
+      sourceRefValidation: {
+        rejectedSourceRefs: expect.arrayContaining([
+          expect.objectContaining({
+            candidateId: null,
+            candidateIndex: 0,
+            candidateTitle: 'Strict SourceRef contract',
+            contentFieldPath: 'content.markdown',
+            invalidRef: 'Middleware.swift:27',
+            reason: 'ambiguous-basename',
+            ref: 'Middleware.swift:27',
+          }),
+          expect.objectContaining({
+            candidateId: null,
+            candidateIndex: 0,
+            candidateTitle: 'Strict SourceRef contract',
+            contentFieldPath: 'content.sourceLabels[0]',
+            invalidRef: 'Middleware.swift:44',
+            reason: 'ambiguous-basename',
+            ref: 'Middleware.swift:44',
+          }),
+        ]),
+        status: 'rejected',
+      },
+    });
+  });
+
+  it('rejects mismatched content source labels with a suggested canonical path', async () => {
+    const projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'alembic-agent-p12-content-suggest-')
+    );
+    const canonicalRefs = [
+      'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift',
+    ];
+    for (const ref of canonicalRefs) {
+      fs.mkdirSync(path.dirname(path.join(projectRoot, ref)), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ref), `// ${ref}`);
+    }
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams([canonicalRefs[0] as string], {
+        markdown: `${'This candidate documents package path mismatch rejection with a suggested canonical path. '.repeat(
+          3
+        )}(来源: Sources/Core/ServiceRegistry.swift:49)`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(canonicalRefs),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(createRequests).toHaveLength(0);
+    expect(result.data).toMatchObject({
+      sourceRefValidation: {
+        rejectedSourceRefs: expect.arrayContaining([
+          expect.objectContaining({
+            contentFieldPath: 'content.markdown/source-label',
+            invalidRef: 'Sources/Core/ServiceRegistry.swift:49',
+            reason: 'package-path-mismatch',
+            ref: 'Sources/Core/ServiceRegistry.swift:49',
+            suggestedRef:
+              'Packages/AOXFoundationKit/Sources/AOXFoundationKit/ModuleKit/ServiceRegistry.swift:49',
+          }),
+        ]),
+        status: 'rejected',
+      },
+    });
   });
 
   it('rejects strict bootstrap producer sourceRefs with typed reasons', async () => {
@@ -586,11 +786,11 @@ describe('Tool V2 contract exports', () => {
     expect(result.data).toMatchObject({
       sourceRefValidation: {
         rejectedSourceRefs: expect.arrayContaining([
-          {
+          expect.objectContaining({
             location: 'content.markdown/source-label',
             reason: 'entity-not-file',
             ref: 'AppCoordinator.swift:14',
-          },
+          }),
         ]),
         status: 'rejected',
       },

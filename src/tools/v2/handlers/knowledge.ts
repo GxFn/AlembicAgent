@@ -120,7 +120,11 @@ async function handleSubmit(
       ctx,
       sourceRefPolicy
     );
-    const contentSourceRefs = groundContentSourceCitations(rawContent, ctx, sourceRefPolicy);
+    const contentSourceRefs = groundContentSourceCitations(rawContent, ctx, sourceRefPolicy, {
+      candidateId: pickString(params.id) ?? null,
+      candidateIndex: typeof params.index === 'number' ? params.index : 0,
+      candidateTitle: pickString(params.title) ?? 'unknown',
+    });
     const content = contentSourceRefs.content;
     const sourceRefValidation = buildSourceRefValidation(
       sourceRefPolicy,
@@ -284,6 +288,9 @@ function normalizeStringArray(value: unknown): string[] {
 }
 
 interface SourceRefInput {
+  candidateId?: string | null;
+  candidateIndex?: number;
+  candidateTitle?: string;
   location?: string;
   ref: string;
 }
@@ -324,6 +331,11 @@ type SourceRefRejectReason =
 
 interface SourceRefRejected {
   candidates?: string[];
+  candidateId?: string | null;
+  candidateIndex?: number;
+  candidateTitle?: string;
+  contentFieldPath?: string;
+  invalidRef?: string;
   location?: string;
   reason: SourceRefRejectReason;
   ref: string;
@@ -426,6 +438,10 @@ function groundSourceRefInputs(
       if (policy.mode === 'strict') {
         rejected.push({
           ...result.rejected,
+          ...(input.candidateId !== undefined ? { candidateId: input.candidateId } : {}),
+          ...(input.candidateIndex !== undefined ? { candidateIndex: input.candidateIndex } : {}),
+          ...(input.candidateTitle ? { candidateTitle: input.candidateTitle } : {}),
+          ...(input.location ? { contentFieldPath: input.location, invalidRef: ref } : {}),
           ...(input.location ? { location: input.location } : {}),
         });
         continue;
@@ -456,12 +472,19 @@ const SOURCE_FILE_TOKEN_PATTERN =
   /(?:[A-Za-z0-9_@.+-]+\/)*[A-Za-z0-9_@.+-]+\.(?:bash|c|cc|cpp|css|go|gradle|graphql|h|hpp|html|java|js|jsx|json|kt|kts|less|m|md|mm|php|proto|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|vue|xml|yaml|yml|zsh)(?::\d+(?:-\d+)?)?/gi;
 const SOURCE_ENTITY_TOKEN_PATTERN = /^[A-Z][A-Za-z0-9_.$-]{2,}$/;
 
+interface SourceRefCandidateContext {
+  candidateId?: string | null;
+  candidateIndex?: number;
+  candidateTitle?: string;
+}
+
 function groundContentSourceCitations(
   content: Record<string, unknown>,
   ctx: ToolContext,
-  policy: SourceRefPolicy
+  policy: SourceRefPolicy,
+  candidateContext: SourceRefCandidateContext
 ): ContentSourceRefGrounding {
-  const inputs = extractContentSourceCitationInputs(content);
+  const inputs = extractContentSourceCitationInputs(content, candidateContext);
   const grounding = groundSourceRefInputs(inputs, ctx, policy);
   const repairedContent =
     grounding.normalized.length > 0
@@ -473,19 +496,48 @@ function groundContentSourceCitations(
   };
 }
 
-function extractContentSourceCitationInputs(content: Record<string, unknown>): SourceRefInput[] {
+function extractContentSourceCitationInputs(
+  content: Record<string, unknown>,
+  candidateContext: SourceRefCandidateContext
+): SourceRefInput[] {
   const inputs: SourceRefInput[] = [];
   const markdown = pickString(content.markdown);
   if (markdown) {
-    inputs.push(...extractSourceLabelInputsFromText(markdown, 'content.markdown/source-label'));
+    inputs.push(
+      ...withCandidateContext(
+        [
+          ...extractSourceLabelInputsFromText(markdown, 'content.markdown/source-label'),
+          ...extractEmbeddedSourceRefInputsFromText(
+            stripSourceLabelBodies(markdown),
+            'content.markdown'
+          ),
+        ],
+        candidateContext
+      )
+    );
   }
   for (const [key, value] of Object.entries(content)) {
     if (key === 'markdown' || !SOURCE_FIELD_PATTERN.test(key)) {
       continue;
     }
-    inputs.push(...extractSourceLabelInputsFromValue(value, `content.${key}`));
+    inputs.push(
+      ...withCandidateContext(
+        extractSourceLabelInputsFromValue(value, `content.${key}`),
+        candidateContext
+      )
+    );
   }
   return dedupeSourceRefInputs(inputs);
+}
+
+function withCandidateContext(
+  inputs: SourceRefInput[],
+  candidateContext: SourceRefCandidateContext
+): SourceRefInput[] {
+  return inputs.map((input) => ({
+    ...candidateContext,
+    ...input,
+  }));
 }
 
 function extractSourceLabelInputsFromValue(value: unknown, location: string): SourceRefInput[] {
@@ -518,10 +570,14 @@ function extractSourceLabelInputsFromText(text: string, location: string): Sourc
   return inputs;
 }
 
+function extractEmbeddedSourceRefInputsFromText(text: string, location: string): SourceRefInput[] {
+  return extractSourceFileRefsFromText(text).map((ref) => ({ location, ref }));
+}
+
 function extractSourceRefsFromLabelBody(labelBody: string): string[] {
   const refs = new Set<string>();
-  for (const match of labelBody.matchAll(SOURCE_FILE_TOKEN_PATTERN)) {
-    refs.add(match[0].trim());
+  for (const ref of extractSourceFileRefsFromText(labelBody)) {
+    refs.add(ref);
   }
   const withoutFileRefs = labelBody.replace(SOURCE_FILE_TOKEN_PATTERN, ' ');
   for (const token of withoutFileRefs.split(/[,\s，、;；]+/)) {
@@ -531,6 +587,18 @@ function extractSourceRefsFromLabelBody(labelBody: string): string[] {
     }
   }
   return [...refs];
+}
+
+function extractSourceFileRefsFromText(text: string): string[] {
+  const refs = new Set<string>();
+  for (const match of text.matchAll(SOURCE_FILE_TOKEN_PATTERN)) {
+    refs.add(match[0].trim());
+  }
+  return [...refs];
+}
+
+function stripSourceLabelBodies(text: string): string {
+  return text.replace(SOURCE_LABEL_PATTERN, ' ');
 }
 
 function applySourceRefRepairsToContent(
