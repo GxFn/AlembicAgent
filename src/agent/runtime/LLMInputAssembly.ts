@@ -289,7 +289,7 @@ function buildEvidenceContextSection(
   }
   if (groundingContext.sourceRefPolicy === 'strict') {
     lines.push(
-      'sourceRefPolicy: strict; sourceRefs and reasoning.sources must use canonical repo-relative paths from canonicalSourceRefIndex. Invalid guessed paths, entity names, ambiguous basenames, and outside-root paths are rejected by knowledge.submit.'
+      'sourceRefPolicy: strict; sourceRefs, reasoning.sources, content.markdown source labels, and other content source labels must use canonical repo-relative paths from canonicalSourceRefIndex. Invalid guessed paths, entity names, ambiguous basenames, and outside-root paths are rejected by knowledge.submit.'
     );
     if (groundingContext.canonicalSourceRefIndex.length > 0) {
       lines.push(

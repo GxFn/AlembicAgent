@@ -107,7 +107,7 @@ async function handleSubmit(
     const effectiveDimensionId =
       dimMeta?.id ?? pickString(params.dimensionId) ?? pickString(ctx.runtime?.dimensionScopeId);
     const isBootstrap = !!dimMeta;
-    const content = params.content as Record<string, unknown>;
+    const rawContent = params.content as Record<string, unknown>;
     const reasoning = params.reasoning as Record<string, unknown> | undefined;
     const sourceRefPolicy = resolveSourceRefPolicy(ctx);
     const normalizedSources = groundSourceRefs(
@@ -120,10 +120,13 @@ async function handleSubmit(
       ctx,
       sourceRefPolicy
     );
+    const contentSourceRefs = groundContentSourceCitations(rawContent, ctx, sourceRefPolicy);
+    const content = contentSourceRefs.content;
     const sourceRefValidation = buildSourceRefValidation(
       sourceRefPolicy,
       normalizedSources,
-      normalizedSourceRefs
+      normalizedSourceRefs,
+      contentSourceRefs
     );
     if (sourceRefPolicy.mode === 'strict' && sourceRefValidation.rejectedSourceRefs.length > 0) {
       return failSourceRefValidation(sourceRefValidation);
@@ -173,7 +176,12 @@ async function handleSubmit(
       language: effectiveLanguage,
       source: isBootstrap ? 'bootstrap' : AGENT_RUNTIME_SOURCE,
       sourceRefValidation,
-      agentNotes: buildAgentNotes(dimMeta, normalizedSources, normalizedSourceRefs),
+      agentNotes: buildAgentNotes(
+        dimMeta,
+        normalizedSources,
+        normalizedSourceRefs,
+        contentSourceRefs
+      ),
     };
 
     const result = await gateway.create({
@@ -201,6 +209,7 @@ async function handleSubmit(
       return ok({
         status: 'created',
         id: result.created[0].id,
+        sourceRefValidation,
         title: result.created[0].title,
       });
     }
@@ -208,6 +217,7 @@ async function handleSubmit(
     if (result.duplicates.length > 0) {
       return ok({
         status: 'duplicate_blocked',
+        sourceRefValidation,
         similar: result.duplicates.map((d) => ({
           title: d.title,
           similarity: d.score ?? d.similarTo?.[0]?.similarity ?? 0,
@@ -234,7 +244,7 @@ async function handleSubmit(
       );
     }
 
-    return ok({ status: 'processed', result });
+    return ok({ status: 'processed', result, sourceRefValidation });
   } catch (err: unknown) {
     return fail(`Submit failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -273,12 +283,34 @@ function normalizeStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
 }
 
+interface SourceRefInput {
+  location?: string;
+  ref: string;
+}
+
+interface SourceRefRepair {
+  from: string;
+  location?: string;
+  reason: string;
+  to: string;
+}
+
+interface SourceRefWarning {
+  location?: string;
+  reason: string;
+  ref: string;
+}
+
 interface SourceRefGrounding {
   originalRefs: string[];
   refs: string[];
-  normalized: Array<{ from: string; to: string; reason: string }>;
+  normalized: SourceRefRepair[];
   rejected: SourceRefRejected[];
-  warnings: Array<{ ref: string; reason: string }>;
+  warnings: SourceRefWarning[];
+}
+
+interface ContentSourceRefGrounding extends SourceRefGrounding {
+  content: Record<string, unknown>;
 }
 
 type SourceRefValidationStatus = 'valid' | 'repaired' | 'rejected' | 'invalid';
@@ -292,6 +324,7 @@ type SourceRefRejectReason =
 
 interface SourceRefRejected {
   candidates?: string[];
+  location?: string;
   reason: SourceRefRejectReason;
   ref: string;
   suggestedRef?: string;
@@ -309,21 +342,26 @@ interface SourceRefValidationSummary {
   mode: SourceRefPolicy['mode'];
   policy: SourceRefPolicy;
   rejectedSourceRefs: SourceRefRejected[];
-  repairedSourceRefs: Array<{ from: string; reason: string; to: string }>;
+  repairedSourceRefs: SourceRefRepair[];
   status: SourceRefValidationStatus;
-  warnings: Array<{ ref: string; reason: string }>;
+  warnings: SourceRefWarning[];
 }
 
 function buildAgentNotes(
   dimMeta: DimensionMetaLike | null,
   normalizedSources: SourceRefGrounding,
-  normalizedSourceRefs: SourceRefGrounding
+  normalizedSourceRefs: SourceRefGrounding,
+  contentSourceRefs: SourceRefGrounding
 ): Record<string, unknown> | null {
   const grounding = {
+    contentCitations: compactGroundingNotes(contentSourceRefs),
     reasoningSources: compactGroundingNotes(normalizedSources),
     sourceRefs: compactGroundingNotes(normalizedSourceRefs),
   };
   const hasGroundingNotes =
+    grounding.contentCitations.normalized.length > 0 ||
+    grounding.contentCitations.warnings.length > 0 ||
+    grounding.contentCitations.rejected.length > 0 ||
     grounding.reasoningSources.normalized.length > 0 ||
     grounding.reasoningSources.warnings.length > 0 ||
     grounding.reasoningSources.rejected.length > 0 ||
@@ -356,34 +394,209 @@ function groundSourceRefs(
   ctx: ToolContext,
   policy: SourceRefPolicy
 ): SourceRefGrounding {
+  return groundSourceRefInputs(
+    refs.map((ref) => ({ ref })),
+    ctx,
+    policy
+  );
+}
+
+function groundSourceRefInputs(
+  inputs: SourceRefInput[],
+  ctx: ToolContext,
+  policy: SourceRefPolicy
+): SourceRefGrounding {
   const trustedRefs = collectTrustedSourceRefs(ctx);
   const normalized: SourceRefGrounding['normalized'] = [];
   const rejected: SourceRefGrounding['rejected'] = [];
   const warnings: SourceRefGrounding['warnings'] = [];
   const grounded: string[] = [];
-  for (const ref of refs) {
+  for (const input of inputs) {
+    const ref = input.ref;
     const result = groundSingleSourceRef(ref, ctx.projectRoot, trustedRefs);
     if (result.normalizedFrom) {
-      normalized.push({ from: result.normalizedFrom, to: result.ref, reason: result.reason });
+      normalized.push({
+        from: result.normalizedFrom,
+        ...(input.location ? { location: input.location } : {}),
+        reason: result.reason,
+        to: result.ref,
+      });
     }
     if (result.rejected) {
       if (policy.mode === 'strict') {
-        rejected.push(result.rejected);
+        rejected.push({
+          ...result.rejected,
+          ...(input.location ? { location: input.location } : {}),
+        });
         continue;
       }
     }
     if (result.warning) {
-      warnings.push({ ref: result.ref, reason: result.warning });
+      warnings.push({
+        ...(input.location ? { location: input.location } : {}),
+        ref: result.ref,
+        reason: result.warning,
+      });
     }
     grounded.push(result.ref);
   }
   return {
-    originalRefs: refs,
+    originalRefs: inputs.map((input) => input.ref),
     refs: uniqueStrings(grounded),
     normalized,
     rejected,
     warnings,
   };
+}
+
+const SOURCE_LABEL_PATTERN =
+  /(?:来源|出处|引用|sourceRefs?|sources?|references?|citations?)\s*[:：]\s*([^\n)\]]+)/gi;
+const SOURCE_FIELD_PATTERN = /(?:source|sources|sourceRef|sourceRefs|reference|citation|label)/i;
+const SOURCE_FILE_TOKEN_PATTERN =
+  /(?:[A-Za-z0-9_@.+-]+\/)*[A-Za-z0-9_@.+-]+\.(?:bash|c|cc|cpp|css|go|gradle|graphql|h|hpp|html|java|js|jsx|json|kt|kts|less|m|md|mm|php|proto|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|vue|xml|yaml|yml|zsh)(?::\d+(?:-\d+)?)?/gi;
+const SOURCE_ENTITY_TOKEN_PATTERN = /^[A-Z][A-Za-z0-9_.$-]{2,}$/;
+
+function groundContentSourceCitations(
+  content: Record<string, unknown>,
+  ctx: ToolContext,
+  policy: SourceRefPolicy
+): ContentSourceRefGrounding {
+  const inputs = extractContentSourceCitationInputs(content);
+  const grounding = groundSourceRefInputs(inputs, ctx, policy);
+  const repairedContent =
+    grounding.normalized.length > 0
+      ? applySourceRefRepairsToContent(content, grounding.normalized)
+      : content;
+  return {
+    ...grounding,
+    content: repairedContent,
+  };
+}
+
+function extractContentSourceCitationInputs(content: Record<string, unknown>): SourceRefInput[] {
+  const inputs: SourceRefInput[] = [];
+  const markdown = pickString(content.markdown);
+  if (markdown) {
+    inputs.push(...extractSourceLabelInputsFromText(markdown, 'content.markdown/source-label'));
+  }
+  for (const [key, value] of Object.entries(content)) {
+    if (key === 'markdown' || !SOURCE_FIELD_PATTERN.test(key)) {
+      continue;
+    }
+    inputs.push(...extractSourceLabelInputsFromValue(value, `content.${key}`));
+  }
+  return dedupeSourceRefInputs(inputs);
+}
+
+function extractSourceLabelInputsFromValue(value: unknown, location: string): SourceRefInput[] {
+  if (typeof value === 'string') {
+    return extractSourceRefsFromLabelBody(value).map((ref) => ({ location, ref }));
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) =>
+      extractSourceLabelInputsFromValue(item, `${location}[${index}]`)
+    );
+  }
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, item]) =>
+    SOURCE_FIELD_PATTERN.test(key)
+      ? extractSourceLabelInputsFromValue(item, `${location}.${key}`)
+      : []
+  );
+}
+
+function extractSourceLabelInputsFromText(text: string, location: string): SourceRefInput[] {
+  const inputs: SourceRefInput[] = [];
+  for (const match of text.matchAll(SOURCE_LABEL_PATTERN)) {
+    const labelBody = match[1] ?? '';
+    for (const ref of extractSourceRefsFromLabelBody(labelBody)) {
+      inputs.push({ location, ref });
+    }
+  }
+  return inputs;
+}
+
+function extractSourceRefsFromLabelBody(labelBody: string): string[] {
+  const refs = new Set<string>();
+  for (const match of labelBody.matchAll(SOURCE_FILE_TOKEN_PATTERN)) {
+    refs.add(match[0].trim());
+  }
+  const withoutFileRefs = labelBody.replace(SOURCE_FILE_TOKEN_PATTERN, ' ');
+  for (const token of withoutFileRefs.split(/[,\s，、;；]+/)) {
+    const cleaned = token.trim().replace(/^[`"'“”‘’([{]+|[`"'“”‘’)\]}。.!?]+$/g, '');
+    if (SOURCE_ENTITY_TOKEN_PATTERN.test(cleaned)) {
+      refs.add(cleaned);
+    }
+  }
+  return [...refs];
+}
+
+function applySourceRefRepairsToContent(
+  content: Record<string, unknown>,
+  repairs: SourceRefRepair[]
+): Record<string, unknown> {
+  const next = { ...content };
+  if (typeof next.markdown === 'string') {
+    next.markdown = replaceSourceRefsInText(
+      next.markdown,
+      repairs.filter((repair) => repair.location?.startsWith('content.markdown'))
+    );
+  }
+  for (const [key, value] of Object.entries(next)) {
+    if (key === 'markdown' || !SOURCE_FIELD_PATTERN.test(key)) {
+      continue;
+    }
+    next[key] = replaceSourceRefsInValue(
+      value,
+      repairs.filter((repair) => repair.location?.startsWith(`content.${key}`))
+    );
+  }
+  return next;
+}
+
+function replaceSourceRefsInValue(value: unknown, repairs: SourceRefRepair[]): unknown {
+  if (repairs.length === 0) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return replaceSourceRefsInText(value, repairs);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceSourceRefsInValue(item, repairs));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      replaceSourceRefsInValue(item, repairs),
+    ])
+  );
+}
+
+function replaceSourceRefsInText(text: string, repairs: SourceRefRepair[]): string {
+  return repairs
+    .slice()
+    .sort((left, right) => right.from.length - left.from.length)
+    .reduce(
+      (current, repair) => current.replace(new RegExp(escapeRegExp(repair.from), 'g'), repair.to),
+      text
+    );
+}
+
+function dedupeSourceRefInputs(inputs: SourceRefInput[]): SourceRefInput[] {
+  const seen = new Set<string>();
+  return inputs.filter((input) => {
+    const key = `${input.location ?? ''}\0${input.ref}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function collectTrustedSourceRefs(ctx: ToolContext): string[] {
@@ -524,7 +737,9 @@ function groundSingleSourceRef(
   }
 
   const rejectReason: SourceRefRejectReason =
-    !hasDirectory && path.posix.extname(basename) ? 'entity-not-file' : 'file-not-found';
+    !hasDirectory && (path.posix.extname(basename) || SOURCE_ENTITY_TOKEN_PATTERN.test(basename))
+      ? 'entity-not-file'
+      : 'file-not-found';
   return {
     ref: trimmed,
     reason: rejectReason,
@@ -564,19 +779,23 @@ function resolveSourceRefPolicy(ctx: ToolContext): SourceRefPolicy {
 function buildSourceRefValidation(
   policy: SourceRefPolicy,
   normalizedSources: SourceRefGrounding,
-  normalizedSourceRefs: SourceRefGrounding
+  normalizedSourceRefs: SourceRefGrounding,
+  contentSourceRefs: SourceRefGrounding
 ): SourceRefValidationSummary {
   const repairedSourceRefs = dedupeRepairs([
     ...normalizedSources.normalized,
     ...normalizedSourceRefs.normalized,
+    ...contentSourceRefs.normalized,
   ]);
   const rejectedSourceRefs = dedupeRejected([
     ...normalizedSources.rejected,
     ...normalizedSourceRefs.rejected,
+    ...contentSourceRefs.rejected,
   ]);
   const warnings = dedupeWarnings([
     ...normalizedSources.warnings,
     ...normalizedSourceRefs.warnings,
+    ...contentSourceRefs.warnings,
   ]);
   const status: SourceRefValidationStatus =
     rejectedSourceRefs.length > 0
@@ -601,7 +820,7 @@ function failSourceRefValidation(validation: SourceRefValidationSummary): ToolRe
   const reasonText = validation.rejectedSourceRefs
     .map((entry) =>
       [
-        `${entry.ref}: ${entry.reason}`,
+        `${entry.location ? `${entry.location} ` : ''}${entry.ref}: ${entry.reason}`,
         entry.suggestedRef ? `suggested=${entry.suggestedRef}` : null,
         entry.candidates?.length ? `candidates=${entry.candidates.join(',')}` : null,
       ]
@@ -619,12 +838,10 @@ function failSourceRefValidation(validation: SourceRefValidationSummary): ToolRe
   };
 }
 
-function dedupeRepairs(
-  repairs: Array<{ from: string; reason: string; to: string }>
-): Array<{ from: string; reason: string; to: string }> {
+function dedupeRepairs(repairs: SourceRefRepair[]): SourceRefRepair[] {
   const seen = new Set<string>();
   return repairs.filter((repair) => {
-    const key = `${repair.from}\0${repair.to}\0${repair.reason}`;
+    const key = `${repair.location || ''}\0${repair.from}\0${repair.to}\0${repair.reason}`;
     if (seen.has(key)) {
       return false;
     }
@@ -636,7 +853,7 @@ function dedupeRepairs(
 function dedupeRejected(rejected: SourceRefRejected[]): SourceRefRejected[] {
   const seen = new Set<string>();
   return rejected.filter((entry) => {
-    const key = `${entry.ref}\0${entry.reason}\0${entry.suggestedRef || ''}`;
+    const key = `${entry.location || ''}\0${entry.ref}\0${entry.reason}\0${entry.suggestedRef || ''}`;
     if (seen.has(key)) {
       return false;
     }
@@ -645,12 +862,10 @@ function dedupeRejected(rejected: SourceRefRejected[]): SourceRefRejected[] {
   });
 }
 
-function dedupeWarnings(
-  warnings: Array<{ ref: string; reason: string }>
-): Array<{ ref: string; reason: string }> {
+function dedupeWarnings(warnings: SourceRefWarning[]): SourceRefWarning[] {
   const seen = new Set<string>();
   return warnings.filter((warning) => {
-    const key = `${warning.ref}\0${warning.reason}`;
+    const key = `${warning.location || ''}\0${warning.ref}\0${warning.reason}`;
     if (seen.has(key)) {
       return false;
     }
@@ -751,6 +966,10 @@ function fileExists(projectRoot: string, ref: string): boolean {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildDefaultUsageGuide(params: Record<string, unknown>) {

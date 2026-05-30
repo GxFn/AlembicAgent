@@ -20,17 +20,22 @@ function baseToolContext(): ToolContext {
   };
 }
 
-function strictKnowledgeSubmitParams(sourceRefs: string[]) {
+function strictKnowledgeSubmitParams(
+  sourceRefs: string[],
+  options?: { contentExtras?: Record<string, unknown>; markdown?: string }
+) {
   return {
     title: 'Strict SourceRef contract',
     description: 'Records strict sourceRef validation before producer knowledge acceptance.',
     content: {
       markdown:
+        options?.markdown ??
         'This candidate documents strict sourceRef producer validation for bootstrap knowledge submissions. '.repeat(
           4
         ),
       rationale:
         'The producer must only submit canonical project-relative source references that can be deterministically validated or safely repaired.',
+      ...(options?.contentExtras ?? {}),
     },
     kind: 'pattern',
     trigger: 'Strict SourceRef contract',
@@ -374,6 +379,118 @@ describe('Tool V2 contract exports', () => {
     });
   });
 
+  it('repairs strict bootstrap producer content source citations before knowledge acceptance', async () => {
+    const projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'alembic-agent-strict-content-repair-')
+    );
+    fs.mkdirSync(path.join(projectRoot, 'Sources/Feature'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'Sources/Feature/Feature.swift'), 'struct Feature {}');
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams(['Sources/Feature/Feature.swift'], {
+        contentExtras: {
+          sourceLabels: ['Feature.swift:12'],
+        },
+        markdown: `${'This candidate documents strict content citation repair for bootstrap producer knowledge submissions. '.repeat(
+          3
+        )}(来源: Feature.swift:12)`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(['Sources/Feature/Feature.swift']),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      sourceRefValidation: {
+        repairedSourceRefs: expect.arrayContaining([
+          {
+            from: 'Feature.swift:12',
+            location: 'content.markdown/source-label',
+            reason: 'missing-prefix-unique-basename',
+            to: 'Sources/Feature/Feature.swift:12',
+          },
+          {
+            from: 'Feature.swift:12',
+            location: 'content.sourceLabels[0]',
+            reason: 'missing-prefix-unique-basename',
+            to: 'Sources/Feature/Feature.swift:12',
+          },
+        ]),
+        status: 'repaired',
+      },
+    });
+    const item = createRequests[0]?.items[0] as {
+      content?: { markdown?: string; sourceLabels?: string[] };
+      sourceRefValidation?: { repairedSourceRefs?: Array<{ location?: string }> };
+    };
+    expect(item.content?.markdown).toContain('(来源: Sources/Feature/Feature.swift:12)');
+    expect(item.content?.sourceLabels).toEqual(['Sources/Feature/Feature.swift:12']);
+    expect(item.sourceRefValidation?.repairedSourceRefs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ location: 'content.markdown/source-label' }),
+      ])
+    );
+  });
+
+  it('accepts canonical strict bootstrap producer content source citations', async () => {
+    const projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'alembic-agent-strict-content-valid-')
+    );
+    fs.mkdirSync(path.join(projectRoot, 'Sources/Feature'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'Sources/Feature/Feature.swift'), 'struct Feature {}');
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams(['Sources/Feature/Feature.swift'], {
+        markdown: `${'This candidate documents strict content citation validation for canonical source labels. '.repeat(
+          3
+        )}(来源: Sources/Feature/Feature.swift:12)`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(['Sources/Feature/Feature.swift']),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      sourceRefValidation: {
+        rejectedSourceRefs: [],
+        repairedSourceRefs: [],
+        status: 'valid',
+      },
+    });
+    const item = createRequests[0]?.items[0] as {
+      content?: { markdown?: string };
+      sourceRefValidation?: { status?: string };
+    };
+    expect(item.content?.markdown).toContain('(来源: Sources/Feature/Feature.swift:12)');
+    expect(item.sourceRefValidation?.status).toBe('valid');
+  });
+
   it('rejects strict bootstrap producer sourceRefs with typed reasons', async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-strict-reject-'));
     const canonicalRefs = [
@@ -430,6 +547,54 @@ describe('Tool V2 contract exports', () => {
         },
       });
     }
+  });
+
+  it('rejects strict bootstrap producer invalid content source citations with location', async () => {
+    const projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'alembic-agent-strict-content-reject-')
+    );
+    fs.mkdirSync(path.join(projectRoot, 'Sources/Feature'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'Sources/Feature/Feature.swift'), 'struct Feature {}');
+
+    const router = new ToolRouterV2();
+    const createRequests: Array<{ items: Record<string, unknown>[] }> = [];
+    const parsed = router.parseToolCall('knowledge', {
+      action: 'submit',
+      params: strictKnowledgeSubmitParams(['Sources/Feature/Feature.swift'], {
+        markdown: `${'This candidate documents strict content citation rejection before candidate creation. '.repeat(
+          3
+        )}(来源: AppCoordinator.swift:14)`,
+      }),
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      projectRoot,
+      recipeGateway: captureRecipeGateway(createRequests),
+      runtime: strictProducerRuntime(['Sources/Feature/Feature.swift']),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('content.markdown/source-label AppCoordinator.swift:14');
+    expect(result.error).toContain('entity-not-file');
+    expect(createRequests).toHaveLength(0);
+    expect(result.data).toMatchObject({
+      sourceRefValidation: {
+        rejectedSourceRefs: expect.arrayContaining([
+          {
+            location: 'content.markdown/source-label',
+            reason: 'entity-not-file',
+            ref: 'AppCoordinator.swift:14',
+          },
+        ]),
+        status: 'rejected',
+      },
+    });
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {

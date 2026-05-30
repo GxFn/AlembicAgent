@@ -121,6 +121,7 @@ describe('LLM input layering', () => {
 
     expect(prompt).toContain('SourceRef strict contract');
     expect(prompt).toContain('canonicalSourceRefIndex');
+    expect(prompt).toContain('content.markdown 来源标注');
     expect(prompt).toContain('Sources/App/Feature.swift');
     expect(prompt).toContain('wrong: Feature.swift；right: Sources/App/Feature.swift');
     expect(prompt).toContain('会被 reject');
@@ -469,6 +470,7 @@ describe('LLM input layering', () => {
     expect(providerLayer).toContain('stageProfile: produce');
     expect(providerLayer).toContain('Producer phase');
     expect(providerLayer).toContain('sourceRefPolicy: strict');
+    expect(providerLayer).toContain('content.markdown source labels');
     expect(providerLayer).toContain('canonicalSourceRefIndex: file:001=Sources/App/Feature.swift');
     expect(providerLayer).not.toContain('graph({ action');
     expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['code', 'knowledge']);
