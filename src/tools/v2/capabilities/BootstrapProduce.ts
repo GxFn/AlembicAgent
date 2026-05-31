@@ -14,7 +14,6 @@ export class BootstrapProduce extends CapabilityV2 {
 
   get allowedTools() {
     return {
-      code: ['read'],
       knowledge: ['submit'],
       memory: ['recall'],
       meta: ['review'],
@@ -36,13 +35,13 @@ export class BootstrapProduce extends CapabilityV2 {
 
 工作流:
 1. memory.recall 获取分析阶段的发现
-2. code.read 获取需要的代码片段
+2. 使用 Analyst 已记录的 evidence、代码片段和路径生成候选
 3. knowledge.submit 逐个提交知识候选 (内含自动查重)
 4. meta.review 最后做轻量自检
 
 关键规则:
 - 不使用终端工具
-- 不做新的代码探索
+- 不做新的代码探索或补读；缺少证据时记录为阻塞，不要在 Producer 阶段扫描源码
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 - 每个独立模式/发现单独提交
 - 提交前自检 title / description / content.markdown / content.rationale / reasoning.sources 非空

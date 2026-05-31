@@ -190,7 +190,7 @@ function buildStagePolicySection(
     summarize:
       'Summary-only phase. Stop tool use and produce a concise final answer from recorded note_finding items only for confirmed/core sections. Prior messages may provide wording and evidence context, but unrecorded signals must be downgraded to unstructured/pending notes; do not replay full evidence text or introduce Markdown-only candidate themes.',
     produce:
-      'Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. Do not start new exploration; only read Analyst-referenced files when a submission needs an exact snippet. Final text: submit counts and blockers only; do not restate submitted candidate content.',
+      'Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. Do not start new exploration or read source files; use Analyst evidence/snippets as the source of truth. Final text: submit counts and blockers only; do not restate submitted candidate content.',
     generic: 'Follow the current task prompt and runtime tool contract.',
   };
 
@@ -223,7 +223,7 @@ function buildToolContractSection(
       'Only note_finding is valid in this stage. If no note_finding schema is available, explain that structured recording is blocked.',
     summarize: 'No tool calls are valid. Ignore any retained tool schemas and return text only.',
     produce:
-      'Use submission tools for candidate creation. code.read is limited to cited files from the Analyst input; search, graph, terminal, and broad exploration are out of scope.',
+      'Use submission tools for candidate creation. code.read, search, graph, terminal, and broad exploration are out of scope for Producer.',
     generic: 'Use only the tools exposed in this call.',
   };
 

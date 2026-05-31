@@ -556,6 +556,42 @@ function actionParamsDescription(spec: ToolSpec, actionNames: string[]) {
   return lines.length > 0 ? lines.join('; ') : undefined;
 }
 
+function cloneJsonSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+}
+
+function actionScopedDescription(spec: ToolSpec, actionNames: string[], restricted: boolean) {
+  if (!restricted) {
+    return spec.description;
+  }
+  const summaries = actionNames
+    .map((actionName) => {
+      const action = spec.actions[actionName];
+      return action ? `${actionName}: ${action.summary}` : null;
+    })
+    .filter((summary): summary is string => Boolean(summary));
+  return summaries.length > 0 ? `${spec.name} actions: ${summaries.join('; ')}` : spec.description;
+}
+
+function actionScopedParamsSchema(spec: ToolSpec, actionNames: string[]): Record<string, unknown> {
+  if (actionNames.length === 1) {
+    const action = spec.actions[actionNames[0]];
+    if (action) {
+      const params = cloneJsonSchema(action.params);
+      if (!('description' in params)) {
+        params.description = action.description;
+      }
+      return params;
+    }
+  }
+
+  const paramsDescription = actionParamsDescription(spec, actionNames);
+  return {
+    type: 'object',
+    ...(paramsDescription ? { description: paramsDescription } : {}),
+  };
+}
+
 /** 生成轻量 schema（首轮发给 LLM） */
 export function generateLightweightSchemas(
   allowedTools?: Record<string, string[]>
@@ -570,19 +606,16 @@ export function generateLightweightSchemas(
     }
 
     const actionEnum = allowedActions ?? Object.keys(spec.actions);
-    const paramsDescription = actionParamsDescription(spec, actionEnum);
+    const restricted = Boolean(allowedTools && allowedActions);
 
     schemas.push({
       name: spec.name,
-      description: spec.description,
+      description: actionScopedDescription(spec, actionEnum, restricted),
       parameters: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: actionEnum },
-          params: {
-            type: 'object',
-            ...(paramsDescription ? { description: paramsDescription } : {}),
-          },
+          params: actionScopedParamsSchema(spec, actionEnum),
         },
         required: ['action', 'params'],
       },

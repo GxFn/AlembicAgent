@@ -43,17 +43,31 @@ describe('Tool V2 contract exports', () => {
     const knowledge = schemas.find((schema) => schema.name === 'knowledge');
     const meta = schemas.find((schema) => schema.name === 'meta');
     const knowledgeParams = knowledge?.parameters as {
-      properties?: { action?: { enum?: string[] }; params?: { description?: string } };
+      properties?: {
+        action?: { enum?: string[] };
+        params?: { required?: string[]; properties?: Record<string, unknown> };
+      };
     };
     const metaParams = meta?.parameters as {
       properties?: { action?: { enum?: string[] } };
     };
 
+    expect(knowledge?.description).not.toContain('detail');
+    expect(knowledge?.description).not.toContain('manage');
     expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
-    expect(knowledgeParams.properties?.params?.description).toContain(
-      'submit required params: title, description, content, content.markdown, content.rationale, kind, trigger, whenClause, doClause, reasoning, reasoning.sources'
-    );
-    expect(knowledgeParams.properties?.params?.description).not.toContain('detail required params');
+    expect(knowledgeParams.properties?.params?.required).toEqual([
+      'title',
+      'description',
+      'content',
+      'kind',
+      'trigger',
+      'whenClause',
+      'doClause',
+      'reasoning',
+    ]);
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('description');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('content');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('reasoning');
     expect(metaParams.properties?.action?.enum).toEqual(['review']);
   });
 

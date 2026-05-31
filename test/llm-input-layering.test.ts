@@ -245,7 +245,7 @@ describe('LLM input layering', () => {
     );
 
     expect(prompt).toContain('Analyst evidence refs (bounded)');
-    expect(prompt).toContain('不要为相同证据重复 code.read');
+    expect(prompt).toContain('不要为相同证据重复读取源码');
     expect(prompt).toContain('Sources/App/Feature.swift [L12-12]');
     expect(prompt).not.toContain('final class FeatureCoordinator {}');
     expect(prompt).not.toContain('Analyst 已读取的代码');
@@ -342,16 +342,28 @@ describe('LLM input layering', () => {
     const schemas = generateLightweightSchemas({ knowledge: ['submit'] });
     const knowledge = schemas.find((schema) => schema.name === 'knowledge');
     const properties = knowledge?.parameters.properties as
-      | Record<string, { description?: string }>
+      | Record<
+          string,
+          { description?: string; required?: string[]; properties?: Record<string, unknown> }
+        >
       | undefined;
-    const description = properties?.params?.description || '';
+    const submitParams = properties?.params;
 
-    expect(description).toContain('submit required params');
-    expect(description).toContain('title');
-    expect(description).toContain('description');
-    expect(description).toContain('content.markdown');
-    expect(description).toContain('content.rationale');
-    expect(description).toContain('reasoning.sources');
+    expect(knowledge?.description).not.toContain('detail');
+    expect(submitParams?.required).toEqual([
+      'title',
+      'description',
+      'content',
+      'kind',
+      'trigger',
+      'whenClause',
+      'doClause',
+      'reasoning',
+    ]);
+    expect(submitParams?.properties).toHaveProperty('title');
+    expect(submitParams?.properties).toHaveProperty('description');
+    expect(submitParams?.properties).toHaveProperty('content');
+    expect(submitParams?.properties).toHaveProperty('reasoning');
   });
 
   it('keeps Analyst final Markdown aligned to recorded note_finding facts', () => {
@@ -782,7 +794,10 @@ describe('LLM input layering', () => {
 
     const byName = new Map(capture.toolSchemas?.map((schema) => [schema.name, schema]) || []);
     const knowledgeParams = byName.get('knowledge')?.parameters as {
-      properties?: { action?: { enum?: string[] }; params?: { description?: string } };
+      properties?: {
+        action?: { enum?: string[] };
+        params?: { required?: string[]; properties?: Record<string, unknown> };
+      };
     };
     const metaParams = byName.get('meta')?.parameters as {
       properties?: { action?: { enum?: string[] } };
@@ -792,11 +807,24 @@ describe('LLM input layering', () => {
     };
 
     expect(capture.toolSchemas?.map((schema) => schema.name)).not.toContain('note_finding');
+    expect(capture.toolSchemas?.map((schema) => schema.name)).not.toContain('code');
+    expect(byName.get('knowledge')?.description).not.toContain('detail');
+    expect(byName.get('meta')?.description).not.toContain('tools');
+    expect(byName.get('meta')?.description).not.toContain('planning');
     expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
-    expect(knowledgeParams.properties?.params?.description).toContain(
-      'submit required params: title'
-    );
-    expect(knowledgeParams.properties?.params?.description).not.toContain('detail required params');
+    expect(knowledgeParams.properties?.params?.required).toEqual([
+      'title',
+      'description',
+      'content',
+      'kind',
+      'trigger',
+      'whenClause',
+      'doClause',
+      'reasoning',
+    ]);
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('description');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('content');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('reasoning');
     expect(metaParams.properties?.action?.enum).toEqual(['review']);
     expect(memoryParams.properties?.action?.enum).toEqual(['recall']);
   });

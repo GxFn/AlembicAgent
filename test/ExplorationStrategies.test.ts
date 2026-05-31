@@ -325,6 +325,34 @@ describe('analyst exploration strategy boundaries', () => {
     expect(textResult?.nudge).toBeNull();
   });
 
+  it('recognizes Package U all-structured-findings wording as terminal', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer', targetSubmits: 6 }
+    );
+
+    expect(tracker).not.toBeNull();
+    for (let i = 1; i <= 6; i++) {
+      tracker?.tick();
+      tracker?.recordToolCall(
+        'knowledge',
+        { action: 'submit' },
+        { id: `candidate-${i}`, status: 'accepted' }
+      );
+      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+    }
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      '所有 6 个结构化发现已全部提交完毕，无需继续。提交数: 6/6，未提交: 0，阻塞: 无。'
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
+  });
+
   it('keeps VERIFY focused on evidence checks instead of broad exploration', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;
