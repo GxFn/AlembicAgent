@@ -882,6 +882,96 @@ describe('LLM input layering', () => {
     expect(providerLayer).toContain('do not infer missing fields from compacted provider history');
   });
 
+  it('summarizes Producer submit history instead of replaying compacted tool payloads', () => {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('produce knowledge candidates');
+    messages.appendAssistantWithToolCalls(null, [
+      {
+        id: 'call-missing',
+        name: 'knowledge',
+        args: {
+          action: 'submit',
+          params: {
+            kind: 'pattern',
+            title: 'RouteMiddleware 洋葱中间件模型',
+            trigger: '@route-middleware-onion',
+          },
+          payloadSummary: {
+            contentOmittedForProviderHistory: true,
+            requiredFieldsComplete: false,
+            sourceCount: 0,
+          },
+          providerHistoryCompacted: true,
+        },
+      },
+    ]);
+    messages.appendToolResult(
+      'call-missing',
+      'knowledge',
+      'Missing required param "description" for knowledge.submit'
+    );
+    messages.appendAssistantWithToolCalls(null, [
+      {
+        id: 'call-created',
+        name: 'knowledge',
+        args: {
+          action: 'submit',
+          params: {
+            kind: 'pattern',
+            title: 'RouteMiddleware 洋葱中间件模型',
+            trigger: '@route-middleware-onion',
+          },
+          payloadSummary: {
+            contentOmittedForProviderHistory: true,
+            requiredFieldsComplete: true,
+            sourceCount: 2,
+          },
+          providerHistoryCompacted: true,
+        },
+      },
+    ]);
+    messages.appendToolResult(
+      'call-created',
+      'knowledge',
+      '{"status":"created","id":"candidate-1","title":"RouteMiddleware 洋葱中间件模型"}'
+    );
+
+    const tracker = createTracker({
+      phase: 'PRODUCE',
+      pipelineType: 'producer',
+      toolChoice: 'auto',
+    });
+    const ctx = new LoopContext({
+      allowedToolIds: ['knowledge'],
+      baseSystemPrompt: PRODUCER_SYSTEM_PROMPT,
+      budget: { maxIterations: 6 },
+      capabilities: [],
+      context: { dimensionId: 'design-patterns', pipelinePhase: 'produce' },
+      messages,
+      prompt: 'produce knowledge candidates',
+      toolSchemas: [{ name: 'knowledge', parameters: { type: 'object' } }],
+      tracker: tracker as never,
+    });
+
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toProjectedMessages() as never,
+      modelRef: 'unit',
+      requestedToolChoice: 'auto',
+      systemPrompt: PRODUCER_SYSTEM_PROMPT,
+      tools: [{ name: 'knowledge', parameters: { type: 'object' } }],
+    });
+
+    const providerHistory = JSON.stringify(assembly.messages);
+    expect(providerHistory).toContain('Producer submit history');
+    expect(providerHistory).toContain('not a valid knowledge.submit payload');
+    expect(providerHistory).toContain('Missing required param');
+    expect(providerHistory).not.toContain('providerHistoryCompacted');
+    expect(assembly.messages.some((message) => message.role === 'tool')).toBe(false);
+  });
+
   it('renders producer budget directly from SystemPromptBuilder without Analyst search phases', () => {
     const prompt = SystemPromptBuilder.injectBudget('Producer identity', {
       source: 'system',

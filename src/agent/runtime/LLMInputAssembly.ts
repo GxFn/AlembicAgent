@@ -62,11 +62,12 @@ export function buildLlmInputAssembly({
   tools,
 }: BuildLlmInputAssemblyOptions): LLMInputAssembly {
   const stageProfile = resolveLlmInputStageProfile(ctx, requestedToolChoice, effectiveToolChoice);
+  const providerHistoryMessages = projectMessagesForStage(messages, stageProfile);
   const groundingContext = buildGroundingContext(ctx, modelRef);
   const rawInputLayerSections = [
     buildStagePolicySection(stageProfile, ctx),
     buildToolContractSection(stageProfile, requestedToolChoice, effectiveToolChoice, tools),
-    buildTaskContextSection(ctx, modelRef, messages),
+    buildTaskContextSection(ctx, modelRef, providerHistoryMessages),
     buildEvidenceContextSection(ctx, groundingContext),
     buildDynamicContextSection(dynamicContext),
   ].filter((section): section is LLMInputSection => Boolean(section?.content.trim()));
@@ -92,7 +93,7 @@ export function buildLlmInputAssembly({
   return {
     dynamicContext,
     inputLayerMessage,
-    messages,
+    messages: providerHistoryMessages,
     metadata: {
       inputSectionIds: sections.map((section) => section.id),
       inputStageProfile: stageProfile,
@@ -114,12 +115,123 @@ export function buildLlmInputAssembly({
       },
       inputProjection: inputProjection || null,
     },
-    providerMessages: inputLayerMessage ? [...messages, inputLayerMessage] : messages,
+    providerMessages: inputLayerMessage
+      ? [...providerHistoryMessages, inputLayerMessage]
+      : providerHistoryMessages,
     sections,
     stageProfile,
     systemPrompt,
     tools,
   };
+}
+
+function projectMessagesForStage(
+  messages: UnifiedMessage[],
+  stageProfile: LLMInputStageProfile
+): UnifiedMessage[] {
+  if (stageProfile !== 'produce') {
+    return messages;
+  }
+  return collapseProducerSubmitToolRounds(messages);
+}
+
+function collapseProducerSubmitToolRounds(messages: UnifiedMessage[]): UnifiedMessage[] {
+  const projected: UnifiedMessage[] = [];
+  for (let i = 0; i < messages.length; ) {
+    const message = messages[i];
+    const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+    const submitCalls = toolCalls.filter(isKnowledgeSubmitCall);
+    if (
+      message.role === 'assistant' &&
+      toolCalls.length > 0 &&
+      submitCalls.length === toolCalls.length
+    ) {
+      const toolCallIds = new Set(submitCalls.map((call) => call.id));
+      const toolResults: UnifiedMessage[] = [];
+      let next = i + 1;
+      while (
+        next < messages.length &&
+        messages[next]?.role === 'tool' &&
+        toolCallIds.has(String(messages[next]?.toolCallId || ''))
+      ) {
+        toolResults.push(messages[next]);
+        next++;
+      }
+
+      if (toolResults.length === submitCalls.length) {
+        projected.push({
+          role: 'user',
+          content: formatProducerSubmitHistorySummary(submitCalls, toolResults),
+        });
+        i = next;
+        continue;
+      }
+    }
+
+    projected.push(message);
+    i++;
+  }
+  return mergeAdjacentProducerSubmitSummaries(projected);
+}
+
+function mergeAdjacentProducerSubmitSummaries(messages: UnifiedMessage[]): UnifiedMessage[] {
+  const merged: UnifiedMessage[] = [];
+  for (const message of messages) {
+    const previous = merged[merged.length - 1];
+    if (
+      previous?.role === 'user' &&
+      message.role === 'user' &&
+      String(previous.content || '').startsWith('[[Producer submit history]]') &&
+      String(message.content || '').startsWith('[[Producer submit history]]')
+    ) {
+      previous.content = `${previous.content}\n${String(message.content || '')
+        .split('\n')
+        .slice(2)
+        .join('\n')}`;
+      continue;
+    }
+    merged.push(message);
+  }
+  return merged;
+}
+
+function isKnowledgeSubmitCall(call: { name?: string; args?: Record<string, unknown> }): boolean {
+  const args = isRecord(call.args) ? call.args : {};
+  return call.name === 'knowledge' && stringValue(args.action) === 'submit';
+}
+
+function formatProducerSubmitHistorySummary(
+  toolCalls: Array<{ id: string; args?: Record<string, unknown> }>,
+  toolResults: UnifiedMessage[]
+): string {
+  const lines = [
+    '[[Producer submit history]]',
+    'Historical knowledge.submit tool rounds are summarized here. This is not a valid knowledge.submit payload; never copy compacted params. New submit calls must include the full required params from the current tool schema.',
+  ];
+
+  for (const call of toolCalls) {
+    const args = isRecord(call.args) ? call.args : {};
+    const params = isRecord(args.params) ? args.params : args;
+    const summary = isRecord(args.payloadSummary) ? args.payloadSummary : {};
+    const result = toolResults.find((item) => item.toolCallId === call.id);
+    const resultText = String(result?.content || '').trim();
+    const status = /"status"\s*:\s*"created"/.test(resultText)
+      ? 'created'
+      : /Missing required param/i.test(resultText)
+        ? 'rejected'
+        : resultText
+          ? 'result'
+          : 'unknown';
+    lines.push(
+      `- ${status}: title=${JSON.stringify(stringValue(params.title) || 'unknown')}` +
+        `${stringValue(params.trigger) ? ` trigger=${JSON.stringify(stringValue(params.trigger))}` : ''}` +
+        ` requiredFieldsComplete=${String(valueAt(summary, 'requiredFieldsComplete') ?? 'unknown')}` +
+        ` sourceCount=${String(valueAt(summary, 'sourceCount') ?? 'unknown')}` +
+        `${resultText ? ` result=${JSON.stringify(limitText(resultText, 160))}` : ''}`
+    );
+  }
+
+  return lines.join('\n');
 }
 
 export function resolveLlmInputStageProfile(
@@ -573,6 +685,10 @@ function valueAt(value: unknown, key: string): unknown {
     return null;
   }
   return (value as Record<string, unknown>)[key];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
 function stringValue(value: unknown): string | null {

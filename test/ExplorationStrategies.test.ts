@@ -353,6 +353,39 @@ describe('analyst exploration strategy boundaries', () => {
     expect(textResult?.nudge).toBeNull();
   });
 
+  it('recognizes Package W Analyst-confirmed completion summary as terminal', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer', targetSubmits: 6 }
+    );
+
+    expect(tracker).not.toBeNull();
+    for (let i = 1; i <= 6; i++) {
+      tracker?.tick();
+      tracker?.recordToolCall(
+        'knowledge',
+        { action: 'submit' },
+        { id: `candidate-${i}`, status: 'accepted' }
+      );
+      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+    }
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      [
+        '所有 6 个 Analyst 已确认结构化发现均已提交，无重复、无遗漏。',
+        '```json',
+        '{"phase":"PRODUCE","status":"complete","totalSubmitted":6,"blockers":[],"unsubmittedFindings":[]}',
+        '```',
+      ].join('\n')
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
+  });
+
   it('keeps VERIFY focused on evidence checks instead of broad exploration', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;

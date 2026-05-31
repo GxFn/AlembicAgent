@@ -739,11 +739,11 @@ function isProducerCompletionText(text: string) {
     return false;
   }
   const hasCompletion =
-    /已完成|完成转化|生产总结|提交总结|提交完成报告|已提交候选|已成功提交|提交完毕|全部\s*\d+\s*个候选|所有\s*\d+\s*个知识候选|所有\s*\d+\s*个结构化发现.*(提交|覆盖)|所有\s*\d+\s*条.*已提交|候选生产总结|successfully submitted|all\s+\d+\s+structured\s+analyst\s+findings|all\s+\d+.*findings.*submitted|提交候选数\s*[:：]?\s*\d+\s*\/\s*\d+|no unsubmitted/i.test(
+    /已完成|完成转化|生产总结|提交总结|提交完成报告|已提交候选|已成功提交|提交完毕|全部\s*\d+\s*个候选|所有\s*\d+\s*个知识候选|所有\s*\d+\s*个结构化发现.*(提交|覆盖)|所有\s*\d+\s*个.*结构化发现.*(提交|覆盖)|所有\s*\d+\s*条.*已提交|候选生产总结|totalSubmitted\s*["']?\s*[:：]\s*\d+|successfully submitted|all\s+\d+\s+structured\s+analyst\s+findings|all\s+\d+.*findings.*submitted|提交候选数\s*[:：]?\s*\d+\s*\/\s*\d+|no unsubmitted/i.test(
       normalized
     );
   const hasNoRemaining =
-    /无未提交|没有未提交|未提交\s*[:：]?\s*(0|零|无)|未提交原因\s*[:：]?\s*无|阻塞项\s*[:：]?\s*无|无遗漏|无阻断|无阻塞|无需继续|无需追加|无需使用|不需要\s*Analyst|无需\s*Analyst|不需要.*补充|无需.*补充|no remaining|no blockers|0\s+unsubmitted|unsubmitted\s*[:：]?\s*0/i.test(
+    /无未提交|没有未提交|未提交\s*[:：]?\s*(0|零|无)|未提交原因\s*[:：]?\s*无|阻塞项\s*[:：]?\s*无|无遗漏|无阻断|无阻塞|无需继续|无需追加|无需使用|不需要\s*Analyst|无需\s*Analyst|不需要.*补充|无需.*补充|blockers\s*["']?\s*[:：]\s*\[\s*\]|unsubmittedFindings\s*["']?\s*[:：]\s*\[\s*\]|no remaining|no blockers|0\s+unsubmitted|unsubmitted\s*[:：]?\s*0/i.test(
       normalized
     );
   return hasCompletion && hasNoRemaining;
