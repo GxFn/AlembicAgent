@@ -9,7 +9,7 @@ export class BootstrapProduce extends CapabilityV2 {
     return 'knowledge_production';
   }
   get description() {
-    return 'Knowledge production: submit, validate, review candidates';
+    return 'Knowledge production: submit and validate candidates';
   }
 
   get allowedTools() {
@@ -37,7 +37,7 @@ export class BootstrapProduce extends CapabilityV2 {
 1. memory.recall 获取分析阶段的发现
 2. 使用 Analyst 已记录的 evidence、代码片段和路径生成候选
 3. knowledge.submit 逐个提交知识候选 (内含自动查重)
-4. meta.review 最后做轻量自检
+4. 目标候选提交完成后直接总结；只有工具错误或证据不确定时才用 meta.review 自检
 
 关键规则:
 - 不使用终端工具
@@ -45,6 +45,7 @@ export class BootstrapProduce extends CapabilityV2 {
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 - 每个独立模式/发现单独提交
 - 提交前自检 title / description / content.markdown / content.rationale / reasoning.sources 非空
+- Analyst 结构化发现已全部提交后，不再调用 meta.review，直接输出最终总结
 
 ${super.promptFragment}`;
   }

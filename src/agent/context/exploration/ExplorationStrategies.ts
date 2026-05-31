@@ -94,7 +94,7 @@ export interface ExplorationStrategy {
 }
 
 export function targetMemoryFindingCount(m: Pick<ExplorationMetrics, 'evidenceToolCallCount'>) {
-  return Math.min(6, Math.max(3, Math.ceil(m.evidenceToolCallCount / 4)));
+  return Math.max(3, Math.ceil(m.evidenceToolCallCount / 2));
 }
 
 export function targetProducerSubmitCount(
@@ -110,6 +110,11 @@ export function targetProducerSubmitCount(
 function hasRemainingProducerSubmits(m: ExplorationMetrics, b: ExplorationBudget) {
   const target = targetProducerSubmitCount(b);
   return target > 0 && m.submitCount < target;
+}
+
+function hasCoveredProducerSubmitTarget(m: ExplorationMetrics, b: ExplorationBudget) {
+  const target = targetProducerSubmitCount(b);
+  return target > 0 && m.submitCount >= target;
 }
 
 /** 追踪 trace 接口（ActiveContext 子集） */
@@ -264,6 +269,7 @@ export const STRATEGY_PRODUCER = {
   transitions: {
     'PRODUCE→SUMMARIZE': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
+        hasCoveredProducerSubmitTarget(m, b) ||
         m.submitCount >= b.maxSubmits ||
         (!hasRemainingProducerSubmits(m, b) &&
           m.submitCount > 0 &&

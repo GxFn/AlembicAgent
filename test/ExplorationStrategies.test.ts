@@ -104,7 +104,7 @@ describe('analyst exploration strategy boundaries', () => {
     expect(STRATEGY_ANALYST.transitions['VERIFY→RECORD'].onMetrics(metrics, budget)).toBe(true);
   });
 
-  it('requires broader structured findings when the evidence surface is broad', () => {
+  it('does not cap structured findings at six when the evidence surface is broad', () => {
     const budget = {
       idleRoundsToExit: 3,
       maxIterations: 20,
@@ -125,11 +125,11 @@ describe('analyst exploration strategy boundaries', () => {
       totalToolCalls: 24,
     };
 
-    expect(targetMemoryFindingCount(metrics)).toBe(5);
+    expect(targetMemoryFindingCount(metrics)).toBe(10);
     expect(STRATEGY_ANALYST.transitions['RECORD→SUMMARIZE'].onMetrics(metrics, budget)).toBe(false);
     expect(
       STRATEGY_ANALYST.transitions['RECORD→SUMMARIZE'].onMetrics(
-        { ...metrics, memoryFindingCount: 5 },
+        { ...metrics, memoryFindingCount: 10 },
         budget
       )
     ).toBe(true);
@@ -164,7 +164,7 @@ describe('analyst exploration strategy boundaries', () => {
     );
     expect(
       STRATEGY_PRODUCER.transitions['PRODUCE→SUMMARIZE'].onMetrics?.(
-        { ...metrics, submitCount: 6 },
+        { ...metrics, submitCount: 6, roundsSinceSubmit: 0 },
         budget
       )
     ).toBe(true);
