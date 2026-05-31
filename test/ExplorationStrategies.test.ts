@@ -185,6 +185,65 @@ describe('analyst exploration strategy boundaries', () => {
     expect(textResult?.nudge).toBeNull();
   });
 
+  it('recognizes Package M submitted/unsubmitted table as terminal', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer' }
+    );
+
+    expect(tracker).not.toBeNull();
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { id: 'candidate-1', status: 'accepted' }
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      '## 提交完成报告\n\n**已提交候选**: 5\n**未提交**: 0\n\n覆盖情况：结构化发现已完成候选提交。'
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
+  });
+
+  it('recognizes Package O mixed English completion summary as terminal', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer' }
+    );
+
+    expect(tracker).not.toBeNull();
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { id: 'candidate-1', status: 'accepted' }
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      [
+        'All 7 structured Analyst findings have been successfully submitted.',
+        '',
+        '## 提交总结',
+        '- **提交候选数**: 7/7',
+        '- **覆盖率**: 100%',
+        '- **阻塞项**: 无',
+      ].join('\n')
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
+  });
+
   it('keeps VERIFY focused on evidence checks instead of broad exploration', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;

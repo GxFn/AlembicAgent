@@ -51,6 +51,54 @@ describe('ContextWindow L4 compaction transcript safety', () => {
     expect(JSON.stringify(projected)).toContain('Feature7.swift');
   });
 
+  it('compacts knowledge.submit tool-call args before they enter provider history', () => {
+    const contextWindow = new ContextWindow(48_000);
+    contextWindow.appendUserMessage('produce candidates');
+    contextWindow.appendAssistantWithToolCalls(null, [
+      {
+        id: 'submit-1',
+        name: 'knowledge',
+        args: {
+          action: 'submit',
+          params: {
+            category: 'architecture',
+            content: {
+              markdown: 'large candidate body '.repeat(200),
+            },
+            coreCode: 'final class FeatureCoordinator {}'.repeat(80),
+            dimensionId: 'design-patterns',
+            kind: 'pattern',
+            knowledgeType: 'recipe',
+            reasoning: {
+              sources: ['Sources/App/Feature.swift'],
+              detail: 'large reasoning body '.repeat(200),
+            },
+            title: 'Feature coordinator ownership',
+            trigger: 'FeatureCoordinator',
+          },
+        },
+      },
+    ]);
+
+    const storedArgs = contextWindow.toMessages()[1]?.toolCalls?.[0]?.args;
+
+    expect(storedArgs).toEqual({
+      action: 'submit',
+      params: {
+        category: 'architecture',
+        dimensionId: 'design-patterns',
+        kind: 'pattern',
+        knowledgeType: 'recipe',
+        title: 'Feature coordinator ownership',
+        trigger: 'FeatureCoordinator',
+      },
+      providerHistoryCompacted: true,
+    });
+    expect(JSON.stringify(storedArgs)).not.toContain('large candidate body');
+    expect(JSON.stringify(storedArgs)).not.toContain('final class FeatureCoordinator');
+    expect(JSON.stringify(storedArgs)).not.toContain('large reasoning body');
+  });
+
   it('builds L4 summary input from a structured memory package, not raw tool messages', async () => {
     const contextWindow = new ContextWindow(10_000);
     contextWindow.appendUserMessage('initial prompt');

@@ -1580,7 +1580,7 @@ export class AgentRuntime {
       if (metricsTransitionedToTerminal && textResult.isFinalAnswer) {
         const digestNudge =
           tracker.pipelineType === 'analyst'
-            ? `请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式，包含具体文件路径、类名和代码模式，至少涵盖 3 个核心发现。\n\n` +
+            ? `请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式；核心已确认章节只能来自已记录的 note_finding，未调用 note_finding 的信号只能放入「待探索」或「未结构化记录」。\n\n` +
               `**现在开始输出你的分析报告。**\n` +
               `⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。`
             : null;

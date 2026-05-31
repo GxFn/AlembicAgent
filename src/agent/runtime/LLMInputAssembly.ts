@@ -188,7 +188,7 @@ function buildStagePolicySection(
     record:
       'Record-only phase. Do not perform additional exploration or emit prose. Use note_finding for already verified findings, one finding per call.',
     summarize:
-      'Summary-only phase. Stop tool use and produce a concise final answer from existing evidence, recorded findings, and prior messages; do not replay full evidence text.',
+      'Summary-only phase. Stop tool use and produce a concise final answer from recorded note_finding items only for confirmed/core sections. Prior messages may provide wording and evidence context, but unrecorded signals must be downgraded to unstructured/pending notes; do not replay full evidence text or introduce Markdown-only candidate themes.',
     produce:
       'Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. Do not start new exploration; only read Analyst-referenced files when a submission needs an exact snippet. Final text: submit counts and blockers only; do not restate submitted candidate content.',
     generic: 'Follow the current task prompt and runtime tool contract.',

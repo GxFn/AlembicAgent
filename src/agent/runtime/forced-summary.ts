@@ -137,12 +137,11 @@ ${toolContextSummary}
 
 要求：
 - 使用二级/三级标题组织内容（## 和 ###）
-- 包含具体的代码文件路径、类名、模式名称等细节
-- 每个关键发现都要给出证据（文件路径 + 代码片段或行为描述）
-- 至少涵盖 3 个核心发现
-- 如有未覆盖的方面，在末尾用「## 待探索」章节列出`;
+- 核心「已确认」章节只能来自已记录的 note_finding 工具调用
+- 每个核心发现都要给出证据（文件路径 + 代码片段或行为描述）
+- 未调用 note_finding 的信号只能在末尾用「## 待探索」或「## 未结构化记录」章节列出`;
       systemPrompt =
-        '你是项目代码分析专家。请用纯 Markdown 格式输出结构清晰的分析报告，包含具体文件路径和代码模式。不要输出 JSON 格式。';
+        '你是项目代码分析专家。请用纯 Markdown 格式输出结构清晰的分析报告。核心已确认发现只能来自 note_finding 结构化记录；未结构化信号只能列为待探索。不要输出 JSON 格式。';
     } else if (isSystem) {
       // Bootstrap 管线 (source=system): dimensionDigest JSON
       summaryPrompt = `你已完成 ${iterations} 轮工具调用（共 ${toolCalls.length} 次），提交了 ${candidateCount} 个候选。

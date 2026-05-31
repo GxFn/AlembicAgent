@@ -294,7 +294,7 @@ export class ContextWindow {
     const msg: ContextMessage = {
       role: 'assistant',
       content: text || null,
-      toolCalls,
+      toolCalls: toolCalls.map(compactToolCallForProviderHistory),
       // V4 要求: 带 tool_calls 的 assistant 消息的 reasoning_content 必须保留
       // 始终存储此字段（即使为空），确保后续 API 调用不会丢失
       reasoningContent: reasoningContent ?? '',
@@ -629,7 +629,7 @@ export class ContextWindow {
       if (msg.role === 'assistant' && msg.toolCalls) {
         for (const tc of msg.toolCalls) {
           if (tc.name === 'knowledge') {
-            const key = `${tc.name}:${tc.args?.title || ''}`;
+            const key = `${tc.name}:${getKnowledgeToolCallLabel(tc.args)}`;
             if (seen.has(key)) {
               const tcIndex = msg.toolCalls.indexOf(tc);
               if (tcIndex >= 0 && msg.toolCalls.length > 1) {
@@ -881,7 +881,7 @@ export class ContextWindow {
       if (m.role === 'assistant' && m.toolCalls) {
         for (const tc of m.toolCalls) {
           if (tc.name === 'knowledge') {
-            this.#compactedSubmits.add(tc.args?.title || tc.args?.category || 'untitled');
+            this.#compactedSubmits.add(getKnowledgeToolCallLabel(tc.args));
           }
         }
       }
@@ -919,6 +919,67 @@ export class ContextWindow {
     }
     return starts;
   }
+}
+
+function compactToolCallForProviderHistory(call: ToolCallInfo): ToolCallInfo {
+  if (call.name !== 'knowledge') {
+    return call;
+  }
+  return {
+    ...call,
+    args: compactKnowledgeArgsForProviderHistory(call.args),
+  };
+}
+
+function compactKnowledgeArgsForProviderHistory(
+  args: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (!args) {
+    return args;
+  }
+  const action = typeof args.action === 'string' ? args.action : null;
+  if (action !== 'submit') {
+    return args;
+  }
+  const params = isRecord(args.params) ? args.params : args;
+  const compactParams = pickDefined({
+    category: params.category,
+    dimensionId: params.dimensionId,
+    kind: params.kind,
+    knowledgeType: params.knowledgeType,
+    source: params.source,
+    supersedes: params.supersedes,
+    title: params.title,
+    trigger: params.trigger,
+  });
+  return {
+    action,
+    params: compactParams,
+    providerHistoryCompacted: true,
+  };
+}
+
+function getKnowledgeToolCallLabel(args: Record<string, unknown> | undefined): string {
+  if (!args) {
+    return 'untitled';
+  }
+  const params = isRecord(args.params) ? args.params : args;
+  const value = params.title || params.category || params.trigger || 'untitled';
+  return typeof value === 'string' && value.trim() ? value.trim() : 'untitled';
+}
+
+function pickDefined(values: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined && value !== null && value !== '') {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 // ─── ToolResultLimiter ──────────────────────────────────

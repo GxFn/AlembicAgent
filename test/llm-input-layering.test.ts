@@ -203,6 +203,47 @@ describe('LLM input layering', () => {
     expect(prompt.match(new RegExp(repeatedEvidence, 'g'))?.length).toBe(1);
   });
 
+  it('uses refs-first Producer evidence packets without replaying Analyst code bodies', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: 'FeatureCoordinator owns navigation state and must be submitted.',
+        evidenceMap: new Map([
+          [
+            'Sources/App/Feature.swift',
+            {
+              codeSnippets: [
+                {
+                  content: 'final class FeatureCoordinator {}',
+                  endLine: 12,
+                  startLine: 12,
+                },
+              ],
+              filePath: 'Sources/App/Feature.swift',
+              summary: 'FeatureCoordinator owns navigation state.',
+            },
+          ],
+        ]),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+
+    expect(prompt).toContain('Analyst evidence refs (bounded)');
+    expect(prompt).toContain('不要为相同证据重复 code.read');
+    expect(prompt).toContain('Sources/App/Feature.swift [L12-12]');
+    expect(prompt).not.toContain('final class FeatureCoordinator {}');
+    expect(prompt).not.toContain('Analyst 已读取的代码');
+  });
+
   it('uses a compact Producer analysis digest instead of replaying full analysis text', () => {
     const repeatedBody =
       'This long narrative paragraph is useful for Analyst reasoning but should not be replayed wholesale into Producer context. ';
@@ -260,6 +301,30 @@ describe('LLM input layering', () => {
 
     expect(prompt).toContain('结构化发现是唯一候选义务');
     expect(prompt).toContain('不要从摘要里新增候选主题');
+  });
+
+  it('surfaces description as a pre-submit required field in Producer prompts', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: 'FeatureCoordinator owns navigation state.',
+        evidenceMap: new Map(),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+
+    expect(PRODUCER_SYSTEM_PROMPT).toContain('提供中文 description');
+    expect(PRODUCER_SYSTEM_PROMPT).toContain('params.description 非空');
+    expect(prompt).toContain('description 中文简述');
   });
 
   it('keeps Analyst final Markdown aligned to recorded note_finding facts', () => {
