@@ -436,7 +436,10 @@ describe('analyst exploration strategy boundaries', () => {
             ok: true,
             status: 'success',
             text: 'ok',
-            structuredContent: { ok: true },
+            structuredContent:
+              request.toolId === 'knowledge'
+                ? { id: 'recipe-1', status: 'created', title: 'FeatureCoordinator' }
+                : { ok: true },
             durationMs: 1,
             startedAt: new Date().toISOString(),
             toolId: request.toolId,
@@ -452,7 +455,11 @@ describe('analyst exploration strategy boundaries', () => {
       diagnostics,
       iteration: 1,
       memoryCoordinator: null,
-      sharedState: {},
+      sharedState: {
+        submittedPatterns: new Set(),
+        submittedTitles: new Set(),
+        submittedTriggers: new Set(),
+      },
       source: 'system',
       toolCalls: [],
       tracker: {
@@ -488,7 +495,22 @@ describe('analyst exploration strategy boundaries', () => {
       {
         id: 'knowledge-submit',
         name: 'knowledge',
-        args: { action: 'submit', params: { title: 'FeatureCoordinator' } },
+        args: {
+          action: 'submit',
+          params: {
+            content: {
+              markdown: 'Feature coordinator routes navigation ownership.',
+              rationale: 'The recipe captures the source-grounded coordinator pattern.',
+            },
+            description: 'Feature coordinator recipe.',
+            doClause: 'Use the coordinator to own navigation transitions.',
+            kind: 'pattern',
+            reasoning: { sources: ['Sources/App/FeatureCoordinator.swift'] },
+            title: 'FeatureCoordinator',
+            trigger: 'FeatureCoordinator',
+            whenClause: 'When a feature owns navigation transitions.',
+          },
+        },
       },
       { runtime, loopCtx, iteration: 1 }
     );
@@ -502,6 +524,18 @@ describe('analyst exploration strategy boundaries', () => {
     expect(blockedTerminal.metadata.blocked).toBe(true);
     expect(allowedSubmit.metadata.blocked).toBe(false);
     expect(allowedReview.metadata.blocked).toBe(false);
+    expect(loopCtx.sharedState?._producerSubmitLedger).toMatchObject({
+      createdCount: 1,
+      entries: [
+        {
+          payloadStored: true,
+          requiredFieldsComplete: true,
+          sourceCount: 1,
+          status: 'created',
+          title: 'FeatureCoordinator',
+        },
+      ],
+    });
     expect(executeCount).toBe(2);
   });
 });

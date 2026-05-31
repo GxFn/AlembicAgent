@@ -955,8 +955,53 @@ function compactKnowledgeArgsForProviderHistory(
   return {
     action,
     params: compactParams,
+    payloadSummary: buildSubmitPayloadSummary(params),
     providerHistoryCompacted: true,
   };
+}
+
+function buildSubmitPayloadSummary(params: Record<string, unknown>): Record<string, unknown> {
+  return {
+    contentOmittedForProviderHistory: true,
+    omittedFields: [
+      'description',
+      'content',
+      'whenClause',
+      'doClause',
+      'dontClause',
+      'coreCode',
+      'reasoning',
+    ],
+    requiredFieldsComplete: hasCompleteSubmitPayload(params),
+    sourceCount: submitSourceCount(params),
+  };
+}
+
+function hasCompleteSubmitPayload(params: Record<string, unknown>): boolean {
+  const content = isRecord(params.content) ? params.content : {};
+  const reasoning = isRecord(params.reasoning) ? params.reasoning : {};
+  const sources = Array.isArray(reasoning.sources) ? reasoning.sources : [];
+  return Boolean(
+    stringValue(params.title) &&
+      stringValue(params.description) &&
+      stringValue(params.kind) &&
+      stringValue(params.trigger) &&
+      stringValue(params.whenClause) &&
+      stringValue(params.doClause) &&
+      stringValue(content.markdown) &&
+      stringValue(content.rationale) &&
+      sources.some((source) => typeof source === 'string' && source.trim())
+  );
+}
+
+function submitSourceCount(params: Record<string, unknown>): number {
+  const reasoning = isRecord(params.reasoning) ? params.reasoning : {};
+  const sources = Array.isArray(reasoning.sources) ? reasoning.sources : [];
+  return sources.filter((source) => typeof source === 'string' && source.trim()).length;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function getKnowledgeToolCallLabel(args: Record<string, unknown> | undefined): string {

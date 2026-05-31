@@ -114,10 +114,27 @@ interface CachedToolResult {
 
 interface ToolEfficiencySharedState {
   _toolEfficiencyCache?: Map<string, CachedToolResult>;
+  _producerSubmitLedger?: ProducerSubmitLedger;
   _projectSnapshotId?: unknown;
   _projectRevision?: unknown;
   _workspaceRevision?: unknown;
   _dimensionScopeId?: unknown;
+}
+
+interface ProducerSubmitLedgerEntry {
+  id?: string;
+  payloadStored: boolean;
+  requiredFieldsComplete: boolean;
+  sourceCount: number;
+  status: string;
+  title: string;
+  trigger?: string;
+}
+
+interface ProducerSubmitLedger {
+  createdCount: number;
+  entries: ProducerSubmitLedgerEntry[];
+  targetSubmits?: number;
 }
 
 const READ_LIKE_ACTIONS = new Set([
@@ -445,7 +462,7 @@ export const allowlistGate = {
   name: 'allowlistGate',
   before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
     const allowedNames = new Set(ctx.loopCtx?.allowedToolIds || []);
-    if (isDirectNoteFindingCall(call) && allowedNames.has('memory')) {
+    if (isDirectNoteFindingCall(call) && isActionAllowed(ctx.loopCtx, 'memory', 'note_finding')) {
       return undefined;
     }
     if (!allowedNames.has(call.name)) {
@@ -474,9 +491,28 @@ export const allowlistGate = {
         },
       };
     }
+    const action = getToolAction(call);
+    if (action && !isActionAllowed(ctx.loopCtx, call.name, action)) {
+      const allowedActions = ctx.loopCtx.allowedToolActions?.[call.name] || [];
+      return {
+        blocked: true,
+        result: {
+          error: `Action "${call.name}.${action}" is not available in the current stage. Allowed actions for "${call.name}": ${allowedActions.join(', ')}`,
+        },
+      };
+    }
     return undefined;
   },
 };
+
+function isActionAllowed(loopCtx: LoopContext, toolName: string, actionName: string): boolean {
+  const allowedNames = new Set(loopCtx?.allowedToolIds || []);
+  if (!allowedNames.has(toolName)) {
+    return false;
+  }
+  const allowedActions = loopCtx.allowedToolActions?.[toolName];
+  return !allowedActions || allowedActions.includes(actionName);
+}
 
 /**
  * EvolutionDecisionGate — Evolution retry 决策补写阶段的动作级守卫。
@@ -777,11 +813,6 @@ export const submitDedup = {
     if (call.name !== 'knowledge') {
       return;
     }
-    const { sharedState } = ctx.loopCtx;
-    if (!sharedState?.submittedTitles) {
-      return;
-    }
-
     const action = String(call.args?.action || '');
     if (action !== 'submit') {
       return;
@@ -798,6 +829,12 @@ export const submitDedup = {
     const title = String(params.title || params.category || '');
     const normalizedTitle = title.toLowerCase().trim();
     if (!normalizedTitle) {
+      return;
+    }
+    recordProducerSubmitLedger(call, resultObj || {}, ctx);
+    const { sharedState } = ctx.loopCtx;
+    if (!sharedState?.submittedTitles) {
+      meta.isSubmit = true;
       return;
     }
 
@@ -827,6 +864,87 @@ export const submitDedup = {
     meta.isSubmit = true;
   },
 };
+
+function recordProducerSubmitLedger(
+  call: ToolCall,
+  result: Record<string, unknown>,
+  ctx: ToolExecContext
+) {
+  if (!isProducerLoop(ctx.loopCtx)) {
+    return;
+  }
+  const shared = (ctx.loopCtx.sharedState ??= {}) as ToolEfficiencySharedState;
+  const targetSubmits = numberValue(ctx.loopCtx.budget?.targetSubmits);
+  const ledger = (shared._producerSubmitLedger ??= {
+    createdCount: 0,
+    entries: [] as ProducerSubmitLedgerEntry[],
+    ...(targetSubmits != null ? { targetSubmits } : {}),
+  });
+  const params = (call.args?.params as Record<string, unknown>) ?? call.args ?? {};
+  const title = String(result.title || params.title || params.category || '').trim();
+  if (!title) {
+    return;
+  }
+  const entry: ProducerSubmitLedgerEntry = {
+    ...(typeof result.id === 'string' ? { id: result.id } : {}),
+    payloadStored: true,
+    requiredFieldsComplete: hasCompleteSubmitPayload(params),
+    sourceCount: submitSourceCount(params),
+    status: String(result.status || 'created'),
+    title,
+    ...(typeof params.trigger === 'string' && params.trigger.trim()
+      ? { trigger: params.trigger.trim() }
+      : {}),
+  };
+  const existingIndex = ledger.entries.findIndex(
+    (item) => item.title.toLowerCase().trim() === title.toLowerCase()
+  );
+  if (existingIndex >= 0) {
+    ledger.entries[existingIndex] = entry;
+  } else {
+    ledger.entries.push(entry);
+  }
+  ledger.createdCount = ledger.entries.filter((entry) => entry.status === 'created').length;
+}
+
+function isProducerLoop(loopCtx: LoopContext): boolean {
+  return (
+    loopCtx.tracker?.pipelineType === 'producer' ||
+    loopCtx.context?.pipelinePhase === 'produce' ||
+    loopCtx.context?.pipelinePhase === 'producer'
+  );
+}
+
+function hasCompleteSubmitPayload(params: Record<string, unknown>): boolean {
+  const content = params.content as Record<string, unknown> | undefined;
+  const reasoning = params.reasoning as Record<string, unknown> | undefined;
+  const sources = Array.isArray(reasoning?.sources) ? reasoning.sources : [];
+  return Boolean(
+    stringValue(params.title) &&
+      stringValue(params.description) &&
+      stringValue(params.kind) &&
+      stringValue(params.trigger) &&
+      stringValue(params.whenClause) &&
+      stringValue(params.doClause) &&
+      stringValue(content?.markdown) &&
+      stringValue(content?.rationale) &&
+      sources.some((source) => typeof source === 'string' && source.trim())
+  );
+}
+
+function submitSourceCount(params: Record<string, unknown>): number {
+  const reasoning = params.reasoning as Record<string, unknown> | undefined;
+  const sources = Array.isArray(reasoning?.sources) ? reasoning.sources : [];
+  return sources.filter((source) => typeof source === 'string' && source.trim()).length;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
 
 /**
  * ProgressEmitter — 进度回调 (可选，需 runtime.emitProgress 为 public)

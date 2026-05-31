@@ -120,6 +120,16 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
       stage: toolset.stage,
       capabilities: [...toolset.capabilities],
       allowedToolIds: [...toolset.allowedToolIds],
+      ...(toolset.allowedToolActions
+        ? {
+            allowedToolActions: Object.fromEntries(
+              Object.entries(toolset.allowedToolActions).map(([tool, actions]) => [
+                tool,
+                [...actions],
+              ])
+            ),
+          }
+        : {}),
       toolSchemaCount: toolset.toolSchemaCount,
       ...(toolset.source ? { source: toolset.source } : {}),
     });
@@ -330,6 +340,16 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
               ...toolset,
               capabilities: [...toolset.capabilities],
               allowedToolIds: [...toolset.allowedToolIds],
+              ...(toolset.allowedToolActions
+                ? {
+                    allowedToolActions: Object.fromEntries(
+                      Object.entries(toolset.allowedToolActions).map(([tool, actions]) => [
+                        tool,
+                        [...actions],
+                      ])
+                    ),
+                  }
+                : {}),
             })),
           }
         : {}),

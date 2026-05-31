@@ -17,13 +17,16 @@ import {
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
+import { V2CapabilityCatalog } from '../src/tools/v2/index.js';
 import { generateLightweightSchemas } from '../src/tools/v2/registry.js';
 
 function createRuntime({
   chatWithTools,
   onProgress,
+  capabilityCatalog,
   toolSchemas = [],
 }: {
+  capabilityCatalog?: unknown;
   chatWithTools: ReturnType<typeof vi.fn>;
   onProgress?: (event: ProgressEvent) => void;
   toolSchemas?: Array<Record<string, unknown>>;
@@ -36,6 +39,9 @@ function createRuntime({
       get: (name: string) => {
         if (name !== 'capabilityCatalog') {
           return undefined;
+        }
+        if (capabilityCatalog) {
+          return capabilityCatalog;
         }
         return {
           toToolSchemas: (ids?: readonly string[] | null) =>
@@ -746,6 +752,106 @@ describe('LLM input layering', () => {
         nodeId: 'pcvm:n11:produce',
       },
     });
+  });
+
+  it('projects Producer capability actions instead of broad tool actions', async () => {
+    const capture: {
+      toolSchemas?: Array<Record<string, unknown>>;
+    } = {};
+    const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+      capture.toolSchemas = opts?.toolSchemas as Array<Record<string, unknown>>;
+      return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    const runtime = createRuntime({
+      capabilityCatalog: new V2CapabilityCatalog(),
+      chatWithTools,
+    });
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 1, pipelineType: 'producer' }
+    );
+
+    await runtime.reactLoop('produce knowledge candidates', {
+      source: 'system',
+      capabilityOverride: ['knowledge_production'],
+      context: { pipelinePhase: 'produce' },
+      systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const byName = new Map(capture.toolSchemas?.map((schema) => [schema.name, schema]) || []);
+    const knowledgeParams = byName.get('knowledge')?.parameters as {
+      properties?: { action?: { enum?: string[] }; params?: { description?: string } };
+    };
+    const metaParams = byName.get('meta')?.parameters as {
+      properties?: { action?: { enum?: string[] } };
+    };
+    const memoryParams = byName.get('memory')?.parameters as {
+      properties?: { action?: { enum?: string[] } };
+    };
+
+    expect(capture.toolSchemas?.map((schema) => schema.name)).not.toContain('note_finding');
+    expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
+    expect(knowledgeParams.properties?.params?.description).toContain(
+      'submit required params: title'
+    );
+    expect(knowledgeParams.properties?.params?.description).not.toContain('detail required params');
+    expect(metaParams.properties?.action?.enum).toEqual(['review']);
+    expect(memoryParams.properties?.action?.enum).toEqual(['recall']);
+  });
+
+  it('injects the Producer submit ledger as final-summary source of truth', async () => {
+    const capture: {
+      messageBatches: Array<Array<{ content?: string }>>;
+    } = {
+      messageBatches: [],
+    };
+    const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+      capture.messageBatches.push((opts?.messages as Array<{ content?: string }>) || []);
+      return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    const runtime = createRuntime({
+      chatWithTools,
+      toolSchemas: [
+        { name: 'knowledge', description: 'Knowledge', parameters: { type: 'object' } },
+      ],
+    });
+    const tracker = createTracker({
+      phase: 'SUMMARIZE',
+      pipelineType: 'producer',
+      toolChoice: 'none',
+    });
+
+    await runtime.reactLoop('summarize production', {
+      source: 'system',
+      context: { pipelinePhase: 'produce' },
+      sharedState: {
+        _producerSubmitLedger: {
+          createdCount: 1,
+          entries: [
+            {
+              payloadStored: true,
+              requiredFieldsComplete: true,
+              sourceCount: 2,
+              status: 'created',
+              title: 'Feature coordinator ownership',
+              trigger: 'FeatureCoordinator',
+            },
+          ],
+          targetSubmits: 1,
+        },
+      },
+      systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const providerLayer = capture.messageBatches[0]?.at(-1)?.content || '';
+    expect(providerLayer).toContain('producerSubmitLedger');
+    expect(providerLayer).toContain('"requiredFieldsComplete":true');
+    expect(providerLayer).toContain('"payloadStored":true');
+    expect(providerLayer).toContain('do not infer missing fields from compacted provider history');
   });
 
   it('renders producer budget directly from SystemPromptBuilder without Analyst search phases', () => {

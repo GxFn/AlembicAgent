@@ -33,6 +33,30 @@ describe('Tool V2 contract exports', () => {
     expect(catalog.expandedCount).toBe(1);
   });
 
+  it('projects action-level allowlists into provider-visible schemas', () => {
+    const catalog = new V2CapabilityCatalog();
+    const schemas = catalog.toToolSchemasForActions({
+      knowledge: ['submit'],
+      meta: ['review'],
+    });
+
+    const knowledge = schemas.find((schema) => schema.name === 'knowledge');
+    const meta = schemas.find((schema) => schema.name === 'meta');
+    const knowledgeParams = knowledge?.parameters as {
+      properties?: { action?: { enum?: string[] }; params?: { description?: string } };
+    };
+    const metaParams = meta?.parameters as {
+      properties?: { action?: { enum?: string[] } };
+    };
+
+    expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
+    expect(knowledgeParams.properties?.params?.description).toContain(
+      'submit required params: title, description, content, content.markdown, content.rationale, kind, trigger, whenClause, doClause, reasoning, reasoning.sources'
+    );
+    expect(knowledgeParams.properties?.params?.description).not.toContain('detail required params');
+    expect(metaParams.properties?.action?.enum).toEqual(['review']);
+  });
+
   it('exports generic delta and search cache contracts', () => {
     const deltaCache = new DeltaCache(1);
     const first = deltaCache.check('a.ts', 'one\ntwo');

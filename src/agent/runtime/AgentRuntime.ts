@@ -118,6 +118,14 @@ function resolveProviderInputBudget(stageProfile: LLMInputStageProfile) {
   }
 }
 
+type RuntimeToolActionAllowlist = Record<string, string[] | null>;
+
+interface RuntimeToolContract {
+  actions: RuntimeToolActionAllowlist;
+  ids: string[];
+  restrictedActions: Record<string, string[]>;
+}
+
 export class AgentRuntime {
   onToolCall: ToolCallHook | null;
   id;
@@ -487,12 +495,14 @@ export class AgentRuntime {
     let baseSystemPrompt = systemPromptOverride || this.#promptBuilder.build(caps, context);
 
     // 收集工具 (空列表是明确无工具，不再隐式展开为全量工具)
-    const allowedToolIds = this.#collectTools(caps, additionalToolsOverride).map(String);
-    const toolSchemas = this.#getToolSchemas(allowedToolIds, this.#modelRef);
+    const toolContract = this.#collectToolContract(caps, additionalToolsOverride);
+    const allowedToolIds = toolContract.ids;
+    const toolSchemas = this.#getToolSchemas(toolContract, this.#modelRef);
     diagnosticsCollector.recordStageToolset({
       stage: typeof context.pipelinePhase === 'string' ? context.pipelinePhase : 'react_loop',
       capabilities: caps.map((c: Capability) => c.name),
       allowedToolIds,
+      allowedToolActions: toolContract.restrictedActions,
       toolSchemaCount: toolSchemas.length,
       ...(source ? { source } : {}),
     });
@@ -550,6 +560,7 @@ export class AgentRuntime {
       capabilities: caps,
       baseSystemPrompt,
       allowedToolIds,
+      allowedToolActions: toolContract.restrictedActions,
       toolSchemas,
       prompt,
       onToolCall: onToolCall || null,
@@ -786,12 +797,15 @@ export class AgentRuntime {
       toolChoice !== 'none' &&
       (recordRepairOnly || (tracker?.pipelineType === 'analyst' && tracker.phase === 'RECORD'))
     ) {
-      if (!ctx.toolSchemas.some((schema) => schema.name === 'memory')) {
+      if (
+        !ctx.toolSchemas.some((schema) => schema.name === 'memory') ||
+        !canUseDirectNoteFinding(ctx)
+      ) {
         return [];
       }
       return [buildDirectNoteFindingSchema(true)];
     }
-    return withDirectNoteFindingSchema(ctx.toolSchemas);
+    return withDirectNoteFindingSchema(ctx.toolSchemas, canUseDirectNoteFinding(ctx));
   }
 
   /**
@@ -1886,34 +1900,74 @@ export class AgentRuntime {
    * 收集所有 Agent Skill 的工具白名单。
    * 空 tools 表示该技能不开放工具；全量工具必须通过显式 action space 表达。
    */
-  #collectTools(caps: Capability[], additionalToolsOverride?: string[]) {
-    const toolSet = new Set();
+  #collectToolContract(
+    caps: Capability[],
+    additionalToolsOverride?: string[]
+  ): RuntimeToolContract {
+    const actionMap = new Map<string, Set<string> | null>();
+    const allowAllActions = (tool: string) => {
+      actionMap.set(tool, null);
+    };
+    const allowActions = (tool: string, actions: string[]) => {
+      if (actionMap.get(tool) === null) {
+        return;
+      }
+      const set = actionMap.get(tool) ?? new Set<string>();
+      for (const action of actions) {
+        if (action) {
+          set.add(action);
+        }
+      }
+      actionMap.set(tool, set);
+    };
+
     for (const cap of caps) {
-      const tools = cap.tools;
-      if (!tools || tools.length === 0) {
+      const allowedTools = (cap as { allowedTools?: unknown }).allowedTools;
+      if (isActionAllowlist(allowedTools)) {
+        for (const [tool, actions] of Object.entries(allowedTools)) {
+          allowActions(tool, actions);
+        }
         continue;
       }
-      for (const t of tools) {
-        toolSet.add(t);
+
+      for (const tool of cap.tools || []) {
+        allowAllActions(String(tool));
       }
     }
     // 合并调用方按需注入的额外工具 (不经 Capability，避免污染共享能力)
     for (const t of this.#additionalTools) {
-      toolSet.add(t);
+      allowAllActions(String(t));
     }
     for (const t of additionalToolsOverride || []) {
-      toolSet.add(t);
+      allowAllActions(String(t));
     }
-    return [...toolSet];
+
+    const ids = [...actionMap.keys()];
+    const actions: RuntimeToolActionAllowlist = {};
+    const restrictedActions: Record<string, string[]> = {};
+    for (const [tool, set] of actionMap.entries()) {
+      if (set === null) {
+        actions[tool] = null;
+        continue;
+      }
+      const values = [...set];
+      actions[tool] = values;
+      restrictedActions[tool] = values;
+    }
+    return { actions, ids, restrictedActions };
   }
 
-  #getToolSchemas(allowedTools: unknown[], model?: string): ToolSchemaProjection[] {
-    const ids = allowedTools.map(String);
+  #getToolSchemas(toolContract: RuntimeToolContract, model?: string): ToolSchemaProjection[] {
+    const ids = toolContract.ids.map(String);
     const catalog = (this.container as { get?: (name: string) => unknown } | null)?.get?.(
       'capabilityCatalog'
     ) as
       | {
           toToolSchemas(ids?: readonly string[] | null): ToolSchemaProjection[];
+          toToolSchemasForActions?(
+            allowedTools?: RuntimeToolActionAllowlist | null,
+            model?: string
+          ): ToolSchemaProjection[];
           toToolSchemasForModel?(
             ids?: readonly string[] | null,
             model?: string
@@ -1923,10 +1977,22 @@ export class AgentRuntime {
             model?: string,
             firstRound?: boolean
           ): ToolSchemaProjection[];
+          toMixedSchemasForActions?(
+            allowedTools?: RuntimeToolActionAllowlist | null,
+            model?: string,
+            firstRound?: boolean
+          ): ToolSchemaProjection[];
         }
       | undefined;
     // Lazy Loading: use mixed schemas (lightweight for unused tools)
     // firstRound = true when no tools have been expanded yet (first stage or fresh session)
+    if (catalog?.toMixedSchemasForActions) {
+      const expandedCount = (catalog as { expandedCount?: number }).expandedCount ?? 0;
+      return catalog.toMixedSchemasForActions(toolContract.actions, model, expandedCount === 0);
+    }
+    if (catalog?.toToolSchemasForActions) {
+      return catalog.toToolSchemasForActions(toolContract.actions, model);
+    }
     if (catalog?.toMixedSchemas) {
       const expandedCount = (catalog as { expandedCount?: number }).expandedCount ?? 0;
       return catalog.toMixedSchemas(ids, model, expandedCount === 0);
@@ -1996,8 +2062,12 @@ export class AgentRuntime {
 }
 
 function withDirectNoteFindingSchema(
-  schemas: Array<Record<string, unknown>>
+  schemas: Array<Record<string, unknown>>,
+  allowed: boolean
 ): Array<Record<string, unknown>> {
+  if (!allowed) {
+    return schemas;
+  }
   if (!schemas.some((schema) => schema.name === 'memory')) {
     return schemas;
   }
@@ -2005,6 +2075,14 @@ function withDirectNoteFindingSchema(
     return schemas;
   }
   return [...schemas, buildDirectNoteFindingSchema(false)];
+}
+
+function canUseDirectNoteFinding(ctx: LoopContext): boolean {
+  if (!ctx.allowedToolIds.includes('memory')) {
+    return false;
+  }
+  const memoryActions = ctx.allowedToolActions.memory;
+  return !memoryActions || memoryActions.includes('note_finding');
 }
 
 function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unknown> {
@@ -2035,6 +2113,15 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
       additionalProperties: false,
     },
   };
+}
+
+function isActionAllowlist(value: unknown): value is Record<string, string[]> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  return Object.values(value).every(
+    (actions) => Array.isArray(actions) && actions.every((action) => typeof action === 'string')
+  );
 }
 
 function buildAgentProcessEvent(

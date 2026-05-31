@@ -302,6 +302,7 @@ function buildEvidenceContextSection(
     : Array.isArray(ctx.sharedState?._recordRepairEvidencePaths)
       ? ctx.sharedState._recordRepairEvidencePaths
       : null;
+  const producerSubmitLedger = compactProducerSubmitLedger(ctx.sharedState?._producerSubmitLedger);
 
   lines.push(`toolCallsSoFar: ${ctx.toolCalls.length}`);
   if (metrics) {
@@ -327,6 +328,12 @@ function buildEvidenceContextSection(
   if (groundingContext.policy) {
     lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
   }
+  if (producerSubmitLedger) {
+    lines.push(`producerSubmitLedger: ${safeJson(producerSubmitLedger)}`);
+    lines.push(
+      'producerSubmitLedgerPolicy: treat payloadStored and requiredFieldsComplete as authoritative runtime facts; do not infer missing fields from compacted provider history.'
+    );
+  }
 
   return {
     id: 'evidenceContext',
@@ -335,6 +342,43 @@ function buildEvidenceContextSection(
     providerVisible: true,
     staticCacheable: false,
   };
+}
+
+function compactProducerSubmitLedger(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const ledger = value as {
+    createdCount?: unknown;
+    entries?: unknown;
+    targetSubmits?: unknown;
+  };
+  const entries = Array.isArray(ledger.entries)
+    ? ledger.entries
+        .filter(
+          (entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object'
+        )
+        .slice(0, 20)
+        .map((entry) =>
+          pickDefined({
+            id: entry.id,
+            payloadStored: entry.payloadStored,
+            requiredFieldsComplete: entry.requiredFieldsComplete,
+            sourceCount: entry.sourceCount,
+            status: entry.status,
+            title: entry.title,
+            trigger: entry.trigger,
+          })
+        )
+    : [];
+  if (entries.length === 0) {
+    return null;
+  }
+  return pickDefined({
+    createdCount: ledger.createdCount,
+    entries,
+    targetSubmits: ledger.targetSubmits,
+  });
 }
 
 interface GroundingContext {
@@ -505,6 +549,16 @@ function safeJson(value: unknown): string {
   } catch {
     return '"[unserializable]"';
   }
+}
+
+function pickDefined(values: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined && value !== null && value !== '') {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 function limitText(text: string, maxChars: number): string {

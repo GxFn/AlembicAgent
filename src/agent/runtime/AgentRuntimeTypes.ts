@@ -133,6 +133,7 @@ export interface StageToolsetDiagnostic {
   stage: string;
   capabilities: string[];
   allowedToolIds: string[];
+  allowedToolActions?: Record<string, string[]>;
   toolSchemaCount: number;
   source?: string;
 }

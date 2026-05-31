@@ -92,6 +92,20 @@ describe('ContextWindow L4 compaction transcript safety', () => {
         title: 'Feature coordinator ownership',
         trigger: 'FeatureCoordinator',
       },
+      payloadSummary: {
+        contentOmittedForProviderHistory: true,
+        omittedFields: [
+          'description',
+          'content',
+          'whenClause',
+          'doClause',
+          'dontClause',
+          'coreCode',
+          'reasoning',
+        ],
+        requiredFieldsComplete: false,
+        sourceCount: 1,
+      },
       providerHistoryCompacted: true,
     });
     expect(JSON.stringify(storedArgs)).not.toContain('large candidate body');
