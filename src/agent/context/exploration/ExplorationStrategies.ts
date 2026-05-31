@@ -53,6 +53,7 @@ export interface ExplorationBudget {
   searchBudgetGrace: number;
   softSubmitLimit: number;
   maxIterations: number;
+  targetSubmits?: number;
 }
 
 /** 探索阶段 */
@@ -94,6 +95,21 @@ export interface ExplorationStrategy {
 
 export function targetMemoryFindingCount(m: Pick<ExplorationMetrics, 'evidenceToolCallCount'>) {
   return Math.min(6, Math.max(3, Math.ceil(m.evidenceToolCallCount / 4)));
+}
+
+export function targetProducerSubmitCount(
+  b: Pick<ExplorationBudget, 'maxSubmits' | 'targetSubmits'>
+) {
+  const target = Number.isFinite(b.targetSubmits) ? Number(b.targetSubmits) : 0;
+  if (target <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.min(b.maxSubmits, Math.floor(target)));
+}
+
+function hasRemainingProducerSubmits(m: ExplorationMetrics, b: ExplorationBudget) {
+  const target = targetProducerSubmitCount(b);
+  return target > 0 && m.submitCount < target;
 }
 
 /** 追踪 trace 接口（ActiveContext 子集） */
@@ -249,10 +265,12 @@ export const STRATEGY_PRODUCER = {
     'PRODUCE→SUMMARIZE': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
         m.submitCount >= b.maxSubmits ||
-        (m.submitCount > 0 && m.roundsSinceSubmit >= b.idleRoundsToExit) ||
+        (!hasRemainingProducerSubmits(m, b) &&
+          m.submitCount > 0 &&
+          m.roundsSinceSubmit >= b.idleRoundsToExit) ||
         (m.consecutiveIdleRounds >= b.searchBudgetGrace && m.submitCount === 0),
       onTextResponse: (m: ExplorationMetrics, b: ExplorationBudget) =>
-        m.submitCount >= b.softSubmitLimit,
+        m.submitCount >= b.softSubmitLimit && !hasRemainingProducerSubmits(m, b),
     },
   },
   getToolChoice: (phase: ExplorationPhase) => (phase === 'SUMMARIZE' ? 'none' : 'auto'),

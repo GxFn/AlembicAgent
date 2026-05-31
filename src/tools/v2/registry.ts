@@ -520,6 +520,42 @@ export function getActionNames(tool: string): string[] {
   return spec ? Object.keys(spec.actions) : [];
 }
 
+function nestedRequiredParamPaths(schema: Record<string, unknown>, prefix = ''): string[] {
+  const required = Array.isArray(schema.required) ? schema.required.map(String) : [];
+  const rawProperties = schema.properties;
+  const properties =
+    rawProperties && typeof rawProperties === 'object' && !Array.isArray(rawProperties)
+      ? (rawProperties as Record<string, unknown>)
+      : {};
+  const paths: string[] = [];
+
+  for (const field of required) {
+    const path = `${prefix}${field}`;
+    paths.push(path);
+    const child = properties[field];
+    if (child && typeof child === 'object' && !Array.isArray(child)) {
+      paths.push(...nestedRequiredParamPaths(child as Record<string, unknown>, `${path}.`));
+    }
+  }
+
+  return paths;
+}
+
+function actionParamsDescription(spec: ToolSpec, actionNames: string[]) {
+  const lines = actionNames
+    .map((actionName) => {
+      const action = spec.actions[actionName];
+      if (!action) {
+        return null;
+      }
+      const required = nestedRequiredParamPaths(action.params);
+      return required.length > 0 ? `${actionName} required params: ${required.join(', ')}` : null;
+    })
+    .filter((line): line is string => Boolean(line));
+
+  return lines.length > 0 ? lines.join('; ') : undefined;
+}
+
 /** 生成轻量 schema（首轮发给 LLM） */
 export function generateLightweightSchemas(
   allowedTools?: Record<string, string[]>
@@ -534,6 +570,7 @@ export function generateLightweightSchemas(
     }
 
     const actionEnum = allowedActions ?? Object.keys(spec.actions);
+    const paramsDescription = actionParamsDescription(spec, actionEnum);
 
     schemas.push({
       name: spec.name,
@@ -542,7 +579,10 @@ export function generateLightweightSchemas(
         type: 'object',
         properties: {
           action: { type: 'string', enum: actionEnum },
-          params: { type: 'object' },
+          params: {
+            type: 'object',
+            ...(paramsDescription ? { description: paramsDescription } : {}),
+          },
         },
         required: ['action', 'params'],
       },

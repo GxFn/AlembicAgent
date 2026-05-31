@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   STRATEGY_ANALYST,
+  STRATEGY_PRODUCER,
   targetMemoryFindingCount,
+  targetProducerSubmitCount,
 } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
@@ -131,6 +133,85 @@ describe('analyst exploration strategy boundaries', () => {
         budget
       )
     ).toBe(true);
+  });
+
+  it('keeps producer in PRODUCE until structured finding submit target is covered', () => {
+    const budget = {
+      idleRoundsToExit: 3,
+      maxIterations: 24,
+      maxSubmits: 10,
+      searchBudget: 4,
+      searchBudgetGrace: 3,
+      softSubmitLimit: 10,
+      targetSubmits: 6,
+    };
+    const metrics = {
+      consecutiveIdleRounds: 0,
+      evidenceToolCallCount: 0,
+      iteration: 8,
+      memoryFindingCount: 0,
+      phaseRounds: 6,
+      roundsSinceNewInfo: 3,
+      searchRoundsInPhase: 0,
+      submitCount: 1,
+      totalToolCalls: 8,
+      roundsSinceSubmit: 3,
+    };
+
+    expect(targetProducerSubmitCount(budget)).toBe(6);
+    expect(STRATEGY_PRODUCER.transitions['PRODUCE→SUMMARIZE'].onMetrics?.(metrics, budget)).toBe(
+      false
+    );
+    expect(
+      STRATEGY_PRODUCER.transitions['PRODUCE→SUMMARIZE'].onMetrics?.(
+        { ...metrics, submitCount: 6 },
+        budget
+      )
+    ).toBe(true);
+  });
+
+  it('does not accept producer completion text before target submits are reached', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer', targetSubmits: 6 }
+    );
+
+    expect(tracker).not.toBeNull();
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { id: 'candidate-1', status: 'accepted' }
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const earlyText = tracker?.onTextResponse(
+      '所有 6 个知识候选已成功提交，覆盖了 Analyst 分析中的全部 6 项发现。无未提交发现，无阻断。'
+    );
+
+    expect(earlyText?.isFinalAnswer).toBe(false);
+    expect(earlyText?.shouldContinue).toBe(true);
+
+    for (let i = 2; i <= 6; i++) {
+      tracker?.tick();
+      tracker?.recordToolCall(
+        'knowledge',
+        { action: 'submit' },
+        { id: `candidate-${i}`, status: 'accepted' }
+      );
+      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+    }
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const completeText = tracker?.onTextResponse(
+      '所有 6 个知识候选已成功提交，覆盖了 Analyst 分析中的全部 6 项发现。无未提交发现，无阻断。'
+    );
+
+    expect(completeText?.isFinalAnswer).toBe(true);
+    expect(completeText?.shouldContinue).toBe(false);
   });
 
   it('lets producer final completion text stop after successful submissions', () => {
@@ -331,6 +412,96 @@ describe('analyst exploration strategy boundaries', () => {
     expect(blockedTerminal.metadata.blocked).toBe(true);
     expect(allowedRead.metadata.blocked).toBe(false);
     expect(allowedGraph.metadata.blocked).toBe(false);
+    expect(executeCount).toBe(2);
+  });
+
+  it('keeps Producer focused on submit coverage instead of detail/tools exploration', async () => {
+    const diagnostics = new DiagnosticsCollector();
+    let executeCount = 0;
+    const runtime = {
+      id: 'producer-submit-boundary-runtime',
+      presetName: 'test',
+      container: null,
+      dataRoot: '/tmp/alembic-agent-test',
+      fileCache: null,
+      lang: null,
+      logger: { info: () => undefined, warn: () => undefined },
+      aiProvider: null,
+      policies: { get: () => null },
+      toolRegistry: { getManifest: () => null },
+      toolRouter: {
+        execute: async (request: { toolId: string }) => {
+          executeCount++;
+          return {
+            ok: true,
+            status: 'success',
+            text: 'ok',
+            structuredContent: { ok: true },
+            durationMs: 1,
+            startedAt: new Date().toISOString(),
+            toolId: request.toolId,
+            callId: `producer-boundary-call-${executeCount}`,
+          };
+        },
+      },
+    } as unknown as AgentRuntime;
+    const loopCtx = {
+      allowedToolIds: ['code', 'graph', 'terminal', 'memory', 'knowledge', 'meta'],
+      abortSignal: null,
+      context: { pipelinePhase: 'produce' },
+      diagnostics,
+      iteration: 1,
+      memoryCoordinator: null,
+      sharedState: {},
+      source: 'system',
+      toolCalls: [],
+      tracker: {
+        pipelineType: 'producer',
+        phase: 'PRODUCE',
+        recordToolCall: () => ({ isNew: false }),
+      },
+      trace: null,
+    } as unknown as LoopContext;
+    const pipeline = createToolPipeline();
+
+    const blockedDetail = await pipeline.execute(
+      {
+        id: 'knowledge-detail',
+        name: 'knowledge',
+        args: { action: 'detail', params: { id: 'r1' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const blockedMetaTools = await pipeline.execute(
+      { id: 'meta-tools', name: 'meta', args: { action: 'tools', params: { tool: 'knowledge' } } },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const blockedTerminal = await pipeline.execute(
+      {
+        id: 'terminal-run',
+        name: 'terminal',
+        args: { action: 'exec', params: { cmd: 'rg Producer' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const allowedSubmit = await pipeline.execute(
+      {
+        id: 'knowledge-submit',
+        name: 'knowledge',
+        args: { action: 'submit', params: { title: 'FeatureCoordinator' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    const allowedReview = await pipeline.execute(
+      { id: 'meta-review', name: 'meta', args: { action: 'review', params: {} } },
+      { runtime, loopCtx, iteration: 1 }
+    );
+
+    expect(blockedDetail.metadata.blocked).toBe(true);
+    expect(blockedMetaTools.metadata.blocked).toBe(true);
+    expect(blockedTerminal.metadata.blocked).toBe(true);
+    expect(allowedSubmit.metadata.blocked).toBe(false);
+    expect(allowedReview.metadata.blocked).toBe(false);
     expect(executeCount).toBe(2);
   });
 });

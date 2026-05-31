@@ -25,7 +25,11 @@ import type {
   FullExplorationMetrics,
   PipelineType,
 } from './ExplorationStrategies.js';
-import { DEFAULT_REFLECTION_INTERVAL, targetMemoryFindingCount } from './ExplorationStrategies.js';
+import {
+  DEFAULT_REFLECTION_INTERVAL,
+  targetMemoryFindingCount,
+  targetProducerSubmitCount,
+} from './ExplorationStrategies.js';
 
 // ─── 本地类型 ──────────────────────────────────────────
 
@@ -404,6 +408,12 @@ export class NudgeGenerator {
       case 'PRODUCE':
         if (m.submitCount === 0 && m.phaseRounds >= 1) {
           return `⚠️ 探索阶段已结束。你已收集了足够的项目信息，请 **立即** 调用 ${submitToolName} 提交候选。不要继续搜索，直接提交。`;
+        }
+        if (pipelineType === 'producer') {
+          const target = targetProducerSubmitCount(b);
+          if (target > 0 && m.submitCount > 0 && m.submitCount < target) {
+            return `已提交 ${m.submitCount}/${target} 个结构化发现候选。请继续调用 ${submitToolName}({ action: "submit" }) 提交剩余结构化发现；不要调用 detail、tools、plan 或重新探索。`;
+          }
         }
         if (m.submitCount >= b.softSubmitLimit && b.softSubmitLimit > 0) {
           const remaining = b.maxSubmits - m.submitCount;

@@ -285,7 +285,8 @@ export const PRESETS = Object.freeze({
 3. content.rationale 必填 — 设计原理说明（为什么这样设计）
 4. 包含来源标注 (来源: FileName.m:行号)
 5. 标题使用项目真实类名，不以项目名开头
-6. 必填: trigger (@kebab-case)、kind (rule/pattern/fact)、doClause (英文祈使句)`;
+6. description 中文简述 ≤80 字，引用真实类名
+7. 必填: title、description、trigger (@kebab-case)、kind (rule/pattern/fact)、doClause (英文祈使句)、reasoning.sources`;
           },
           skipOnDegrade: true,
         },

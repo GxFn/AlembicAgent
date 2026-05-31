@@ -130,6 +130,29 @@ interface GateEvalResult {
   artifact?: unknown;
 }
 
+function producerStructuredFindingTarget(artifact: unknown): number {
+  if (!artifact || typeof artifact !== 'object') {
+    return 0;
+  }
+  const findings = (artifact as { findings?: unknown }).findings;
+  return Array.isArray(findings) ? findings.length : 0;
+}
+
+function withProducerCoverageBudget(
+  stage: PipelineStage,
+  budget: StageBudget | undefined,
+  gateArtifact: unknown
+): StageBudget | undefined {
+  if (stage.name !== 'produce' && stage.name !== 'producer') {
+    return budget;
+  }
+  const targetSubmits = producerStructuredFindingTarget(gateArtifact);
+  if (targetSubmits <= 0) {
+    return budget;
+  }
+  return { ...(budget || {}), targetSubmits };
+}
+
 /** Lightweight ContextWindow subset consumed by pipeline stages */
 interface StageContextWindow {
   resetForNewStage(): void;
@@ -618,10 +641,11 @@ export class PipelineStrategy extends Strategy {
     const isRetry = !!phaseResults[`_was_retry_${stage.name}`];
     const decisionOnly = isRetry && stage.decisionOnlyOnRetry === true;
     const computedBudget = (strategyContext._computedBudget || null) as StageBudget | null;
-    const effectiveBudget =
+    let effectiveBudget =
       isRetry && stage.retryBudget
         ? stage.retryBudget
         : stage.budget || computedBudget || undefined;
+    effectiveBudget = withProducerCoverageBudget(stage, effectiveBudget, ctx.gateArtifact);
     delete phaseResults[`_was_retry_${stage.name}`];
 
     // 阶段隔离 (ContextWindow + ExplorationTracker)

@@ -524,6 +524,10 @@ const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
   'extensions',
   'impact',
 ]);
+const PRODUCER_CODE_ACTIONS = new Set(['read']);
+const PRODUCER_KNOWLEDGE_ACTIONS = new Set(['submit']);
+const PRODUCER_MEMORY_ACTIONS = new Set(['recall']);
+const PRODUCER_META_ACTIONS = new Set(['review']);
 
 function getToolParams(call: ToolCall): Record<string, unknown> {
   return call.args?.params && typeof call.args.params === 'object'
@@ -607,6 +611,59 @@ export const analystVerifyOnlyGate = {
       result: {
         error:
           'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity/path), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
+      },
+    };
+  },
+};
+
+/**
+ * ProducerSubmitOnlyGate — Producer 阶段只允许推进候选覆盖率的动作。
+ *
+ * Package Q 暴露了一个失败路径：成功提交 1 个候选后，模型继续调用
+ * knowledge.detail / meta.tools 消耗轮次，触发 idle 退出并丢失剩余结构化发现。
+ */
+export const producerSubmitOnlyGate = {
+  name: 'producerSubmitOnlyGate',
+  before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
+    if (ctx.loopCtx.tracker?.pipelineType !== 'producer') {
+      return undefined;
+    }
+
+    const phase = ctx.loopCtx.tracker?.phase;
+    const action = getToolAction(call);
+
+    if (phase === 'SUMMARIZE') {
+      return {
+        blocked: true,
+        result: {
+          error:
+            'Producer is already in SUMMARIZE. Tool calls are disabled; output the production summary only.',
+        },
+      };
+    }
+
+    if (phase !== 'PRODUCE') {
+      return undefined;
+    }
+
+    if (call.name === 'knowledge' && PRODUCER_KNOWLEDGE_ACTIONS.has(action)) {
+      return undefined;
+    }
+    if (call.name === 'code' && PRODUCER_CODE_ACTIONS.has(action)) {
+      return undefined;
+    }
+    if (call.name === 'memory' && PRODUCER_MEMORY_ACTIONS.has(action)) {
+      return undefined;
+    }
+    if (call.name === 'meta' && PRODUCER_META_ACTIONS.has(action)) {
+      return undefined;
+    }
+
+    return {
+      blocked: true,
+      result: {
+        error:
+          'Producer phase is submit-first. Allowed actions: knowledge.submit, code.read for missing short snippets, memory.recall, and meta.review. Do not call knowledge.detail, meta.tools, meta.plan, search, graph, terminal, or broad exploration; continue submitting remaining structured findings.',
       },
     };
   },
@@ -857,6 +914,7 @@ export function createToolPipeline() {
     .use(evolutionDecisionGate)
     .use(recordRepairOnlyGate)
     .use(analystVerifyOnlyGate)
+    .use(producerSubmitOnlyGate)
     .use(deterministicDuplicateGuard)
     .use(observationRecord)
     .use(trackerSignal)

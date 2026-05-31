@@ -36,6 +36,7 @@ import {
   createBootstrapStrategy,
   STRATEGY_ANALYST,
   STRATEGY_PRODUCER,
+  targetProducerSubmitCount,
 } from './exploration/ExplorationStrategies.js';
 import { NudgeGenerator } from './exploration/NudgeGenerator.js';
 import type { ActiveTrace } from './exploration/PlanTracker.js';
@@ -488,7 +489,11 @@ export class ExplorationTracker {
     }
 
     if (this.#phase === 'PRODUCE') {
-      if (m.submitCount > 0 && isProducerCompletionText(text || '')) {
+      if (
+        m.submitCount > 0 &&
+        !this.#hasRemainingProducerSubmits() &&
+        isProducerCompletionText(text || '')
+      ) {
         return { isFinalAnswer: true, needsDigestNudge: false, shouldContinue: false, nudge: null };
       }
       const nudge =
@@ -702,6 +707,14 @@ export class ExplorationTracker {
 
   #getTerminalPhase() {
     return this.#strategy.phases[this.#strategy.phases.length - 1];
+  }
+
+  #hasRemainingProducerSubmits() {
+    if (this.#pipelineType !== 'producer') {
+      return false;
+    }
+    const target = targetProducerSubmitCount(this.#budget);
+    return target > 0 && this.#metrics.submitCount < target;
   }
 
   /** 构建 NudgeState 供 NudgeGenerator / PlanTracker 使用 */

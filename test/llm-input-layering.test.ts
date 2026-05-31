@@ -17,6 +17,7 @@ import {
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
+import { generateLightweightSchemas } from '../src/tools/v2/registry.js';
 
 function createRuntime({
   chatWithTools,
@@ -303,7 +304,7 @@ describe('LLM input layering', () => {
     expect(prompt).toContain('不要从摘要里新增候选主题');
   });
 
-  it('surfaces description as a pre-submit required field in Producer prompts', () => {
+  it('surfaces submit required fields in Producer prompts', () => {
     const prompt = buildProducerPromptV2(
       {
         analysisText: 'FeatureCoordinator owns navigation state.',
@@ -323,8 +324,28 @@ describe('LLM input layering', () => {
     );
 
     expect(PRODUCER_SYSTEM_PROMPT).toContain('提供中文 description');
-    expect(PRODUCER_SYSTEM_PROMPT).toContain('params.description 非空');
+    expect(PRODUCER_SYSTEM_PROMPT).toContain('params.title、params.description');
+    expect(PRODUCER_SYSTEM_PROMPT).toContain('reasoning.sources 非空');
+    expect(prompt).toContain('title: 中文标题');
     expect(prompt).toContain('description 中文简述');
+    expect(prompt).toContain('content.markdown');
+    expect(prompt).toContain('reasoning.sources');
+  });
+
+  it('surfaces action-specific knowledge.submit required params in lightweight schemas', () => {
+    const schemas = generateLightweightSchemas({ knowledge: ['submit'] });
+    const knowledge = schemas.find((schema) => schema.name === 'knowledge');
+    const properties = knowledge?.parameters.properties as
+      | Record<string, { description?: string }>
+      | undefined;
+    const description = properties?.params?.description || '';
+
+    expect(description).toContain('submit required params');
+    expect(description).toContain('title');
+    expect(description).toContain('description');
+    expect(description).toContain('content.markdown');
+    expect(description).toContain('content.rationale');
+    expect(description).toContain('reasoning.sources');
   });
 
   it('keeps Analyst final Markdown aligned to recorded note_finding facts', () => {
