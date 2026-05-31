@@ -388,15 +388,8 @@ describe('record repair pipeline stage', () => {
           };
         }
         if (phase === 'produce') {
-          expect(opts.sharedState).toMatchObject({
-            _producerReferencedFiles: expect.arrayContaining(['src/foo.ts', 'src/bar.ts']),
-            _sourceRefPolicy: {
-              allowEntityOnlyRefs: false,
-              allowGuessedPaths: false,
-              mode: 'strict',
-              sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
-            },
-          });
+          expect(opts.sharedState).not.toHaveProperty('_sourceRefPolicy');
+          expect(opts.sharedState).not.toHaveProperty('_canonicalSourceRefIndex');
         }
         return {
           reply: 'produced',

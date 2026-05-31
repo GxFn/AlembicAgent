@@ -119,12 +119,10 @@ describe('LLM input layering', () => {
       { name: 'Demo' }
     );
 
-    expect(prompt).toContain('SourceRef strict contract');
-    expect(prompt).toContain('canonicalSourceRefIndex');
-    expect(prompt).toContain('content.markdown 来源标注');
+    expect(prompt).not.toContain('SourceRef strict contract');
+    expect(prompt).not.toContain('canonicalSourceRefIndex');
     expect(prompt).toContain('Sources/App/Feature.swift');
-    expect(prompt).toContain('wrong: Feature.swift；right: Sources/App/Feature.swift');
-    expect(prompt).toContain('会被 reject');
+    expect(prompt).not.toContain('会被 reject');
   });
 
   it('projects explicit input sections into both provider messages and developer-visible llm.input', async () => {
@@ -440,22 +438,6 @@ describe('LLM input layering', () => {
         },
         pipelinePhase: 'produce',
       },
-      sharedState: {
-        _canonicalSourceRefIndex: [
-          {
-            aliases: ['Feature.swift'],
-            basename: 'Feature.swift',
-            id: 'file:001',
-            path: 'Sources/App/Feature.swift',
-          },
-        ],
-        _sourceRefPolicy: {
-          allowEntityOnlyRefs: false,
-          allowGuessedPaths: false,
-          mode: 'strict',
-          sourceRefsMustComeFrom: 'canonicalSourceRefIndex',
-        },
-      },
       systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
       tracker: tracker as never,
       budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
@@ -469,9 +451,8 @@ describe('LLM input layering', () => {
     expect(capture.systemPrompt).not.toContain('结构化查询');
     expect(providerLayer).toContain('stageProfile: produce');
     expect(providerLayer).toContain('Producer phase');
-    expect(providerLayer).toContain('sourceRefPolicy: strict');
-    expect(providerLayer).toContain('content.markdown source labels');
-    expect(providerLayer).toContain('canonicalSourceRefIndex: file:001=Sources/App/Feature.swift');
+    expect(providerLayer).not.toContain('sourceRefPolicy: strict');
+    expect(providerLayer).not.toContain('canonicalSourceRefIndex');
     expect(providerLayer).not.toContain('graph({ action');
     expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['code', 'knowledge']);
     expect(llmInput?.metadata).toMatchObject({

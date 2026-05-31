@@ -70,7 +70,6 @@ export interface PcvBurnGroundingLedgerEntry {
   ref: string;
   rejectedFindingDelta: number;
   requestedToolChoice: string | null;
-  sourceRefDelta: number;
   stageProfile: string;
   textOutputChars: number;
   toolCallDelta: number;
@@ -364,7 +363,6 @@ export function recordPcvInputAssembly(
     ref,
     rejectedFindingDelta: 0,
     requestedToolChoice: options.requestedToolChoice || null,
-    sourceRefDelta: 0,
     stageProfile: assembly.stageProfile,
     textOutputChars: 0,
     toolCallDelta: 0,
@@ -407,7 +405,8 @@ export function recordPcvLlmOutput(
   entry.outputSourceRefs = uniqueStrings(outputSourceRefs).slice(0, MAX_SOURCE_REFS);
   entry.consumedEvidenceRefs = uniqueStrings(consumedEvidenceRefs).slice(0, MAX_SOURCE_REFS);
   entry.functionCallNames = uniqueStrings(functionCallNames).slice(0, 24);
-  entry.sourceRefDelta = entry.outputSourceRefs.length;
+  // outputSourceRefs 只作为后续审计材料，不作为 grounding 成功指标。
+  // 之前 AI 把 sourceRefDelta 当成阶段进展，导致 sourceRef 伪指标反复扩张和重大资源浪费。
   entry.classification = classifyGroundingEntry(entry, {
     evidenceFunctionCallCount,
     hasFunctionCalls: functionCalls.length > 0,
@@ -421,7 +420,6 @@ export function recordPcvToolRoundOutcome(
     acceptedFindingDelta?: number;
     evidenceToolCallDelta?: number;
     rejectedFindingDelta?: number;
-    sourceRefDelta?: number;
     toolCallDelta?: number;
   }
 ): PcvBurnGroundingLedgerEntry | null {
@@ -431,7 +429,6 @@ export function recordPcvToolRoundOutcome(
   }
   entry.toolCallDelta += options.toolCallDelta || 0;
   entry.evidenceToolCallDelta += options.evidenceToolCallDelta || 0;
-  entry.sourceRefDelta += options.sourceRefDelta || 0;
   entry.acceptedFindingDelta += options.acceptedFindingDelta || 0;
   entry.rejectedFindingDelta += options.rejectedFindingDelta || 0;
   entry.classification = classifyGroundingEntry(entry, {

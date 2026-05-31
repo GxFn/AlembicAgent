@@ -700,7 +700,8 @@ describe('agent runtime forced summary suppression', () => {
       toolChoiceSupported: false,
       toolSchemasVisible: true,
     });
-    expect(firstBurn?.sourceRefDelta).toBeGreaterThan(0);
+    expect(firstBurn).not.toHaveProperty('sourceRefDelta');
+    expect(firstBurn?.outputSourceRefs).toEqual([]);
   });
 
   it('does not force summary after abort exits', async () => {

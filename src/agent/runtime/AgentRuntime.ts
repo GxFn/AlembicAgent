@@ -1185,7 +1185,6 @@ export class AgentRuntime {
     const pcvBefore = {
       acceptedFindingCount: ctx.pcvNodeEvidence.findingRefs.accepted.length,
       rejectedFindingCount: ctx.pcvNodeEvidence.findingRefs.rejected.length,
-      sourceRefCount: ctx.pcvNodeEvidence.sourceRefs.length,
     };
 
     // 并行工具调用共享 token 预算 — 委托 BudgetController
@@ -1378,7 +1377,6 @@ export class AgentRuntime {
       ).length,
       rejectedFindingDelta:
         ctx.pcvNodeEvidence.findingRefs.rejected.length - pcvBefore.rejectedFindingCount,
-      sourceRefDelta: ctx.pcvNodeEvidence.sourceRefs.length - pcvBefore.sourceRefCount,
       toolCallDelta: activeCalls.length,
     });
 
@@ -1646,7 +1644,7 @@ export class AgentRuntime {
     return {
       block: true,
       reason:
-        'DeepSeek V4 analyze burn returned text without deterministic evidence consumption, evidence tool calls, sourceRef delta, or finding delta.',
+        'DeepSeek V4 analyze burn returned text without deterministic evidence consumption, evidence tool calls, or finding delta.',
       nudge:
         '本轮 analyze 文本没有可观测证据 grounding，不能推进阶段。' +
         `${refsHint} 如果只是规划下一步，只输出取证计划并绑定 evidence refs；如果要推进事实结论，必须先产生或消费可复核证据。`,
