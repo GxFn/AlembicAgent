@@ -424,7 +424,7 @@ export class ExplorationTracker {
    * 处理 AI 返回纯文本响应（无工具调用）
    * @returns }
    */
-  onTextResponse() {
+  onTextResponse(text = '') {
     const m = this.#metrics;
     const transitioned = this.#checkTextTransition();
     if (transitioned) {
@@ -487,12 +487,19 @@ export class ExplorationTracker {
       };
     }
 
-    if (this.#phase === 'PRODUCE' || this.#phase === 'EXPLORE') {
+    if (this.#phase === 'PRODUCE') {
+      if (m.submitCount > 0 && isProducerCompletionText(text || '')) {
+        return { isFinalAnswer: true, needsDigestNudge: false, shouldContinue: false, nudge: null };
+      }
       const nudge =
-        this.#phase === 'PRODUCE' && this.#pipelineType !== 'scan'
-          ? `你的分析很好。请继续调用 ${this.#submitToolName} 提交你发现的知识候选，每个值得记录的模式/实践都应该提交。`
+        this.#pipelineType !== 'scan'
+          ? `请继续调用 ${this.#submitToolName} 提交结构化发现对应的知识候选。候选义务只来自 Analyst note_finding 结构化发现；不要从最终 Markdown 摘要里新增候选主题。`
           : null;
       return { isFinalAnswer: false, needsDigestNudge: false, shouldContinue: true, nudge };
+    }
+
+    if (this.#phase === 'EXPLORE') {
+      return { isFinalAnswer: false, needsDigestNudge: false, shouldContinue: true, nudge: null };
     }
 
     if (this.#phase === 'RECORD') {
@@ -711,6 +718,22 @@ export class ExplorationTracker {
       transitionFromPhase: this.#transitionFromPhase,
     };
   }
+}
+
+function isProducerCompletionText(text: string) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return false;
+  }
+  const hasCompletion =
+    /已完成|完成转化|生产总结|提交总结|已提交候选|已成功提交|全部\s*\d+\s*个候选|所有\s*\d+\s*个知识候选|候选生产总结|no unsubmitted/i.test(
+      normalized
+    );
+  const hasNoRemaining =
+    /无未提交|没有未提交|无遗漏|无阻断|无阻塞|不需要\s*Analyst|无需\s*Analyst|不需要.*补充|无需.*补充|no remaining|no blockers/i.test(
+      normalized
+    );
+  return hasCompletion && hasNoRemaining;
 }
 
 function isEvidenceToolCall(toolName: string, args: Record<string, unknown>): boolean {

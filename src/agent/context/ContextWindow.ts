@@ -52,7 +52,7 @@ export interface ContextMessage {
   toolCallId?: string;
   name?: string;
   metadata?: {
-    kind?: 'l4_memory_summary';
+    kind?: 'l4_memory_summary' | 'runtime_nudge';
     source?: string;
     [key: string]: unknown;
   };
@@ -103,6 +103,23 @@ export interface CompactionConfig {
   thresholds?: [number, number, number, number, number];
   /** Whether to enable L4 LLM-based summary (scan pipelines may disable) */
   enableL4LLM?: boolean;
+}
+
+export interface ProviderInputBudgetOptions {
+  maxProjectedMessages?: number;
+  maxProjectedTokens?: number;
+  reason?: string;
+  stageProfile?: string;
+}
+
+export interface ProviderInputBudgetResult {
+  afterMessageCount: number;
+  afterProjectedTokens: number;
+  beforeMessageCount: number;
+  beforeProjectedTokens: number;
+  level: number;
+  reason: string | null;
+  removed: number;
 }
 
 const DEFAULT_THRESHOLDS: [number, number, number, number, number] = [0.4, 0.55, 0.7, 0.82, 0.92];
@@ -254,7 +271,13 @@ export class ContextWindow {
    * 独立命名以便审计和搜索。
    */
   appendUserNudge(content: string) {
-    this.#messages.push({ role: 'user', content });
+    this.#messages = this.#messages.filter((message, index) => {
+      if (index === 0) {
+        return true;
+      }
+      return message.metadata?.kind !== 'runtime_nudge';
+    });
+    this.#messages.push({ role: 'user', content, metadata: { kind: 'runtime_nudge' } });
   }
 
   /**
@@ -350,6 +373,67 @@ export class ContextWindow {
     // L3: Collapse (set threshold for read-time projection)
     const l3 = this.#compactL3Collapse();
     return { level: Math.max(result.level, l3.level), removed: result.removed + l3.removed };
+  }
+
+  /**
+   * Provider-input budget projection — independent of the model's giant context window.
+   *
+   * DeepSeek/Gemini-scale contexts can delay normal ratio-based L3 collapse until after many
+   * expensive turns. PCVM Package F needs a stage-level pressure signal that caps what the
+   * provider sees, while preserving recent tool rounds and recorded finding refs.
+   */
+  compactForProviderInputBudget(
+    options: ProviderInputBudgetOptions = {}
+  ): ProviderInputBudgetResult {
+    const maxProjectedMessages = options.maxProjectedMessages ?? 44;
+    const maxProjectedTokens = options.maxProjectedTokens ?? 16_000;
+    const beforeMessageCount = this.toProjectedMessages().length;
+    const beforeProjectedTokens = this.estimateProjectedTokens();
+    const shouldCompact =
+      beforeMessageCount > maxProjectedMessages || beforeProjectedTokens > maxProjectedTokens;
+
+    if (!shouldCompact || this.#messages.length <= 4) {
+      return {
+        afterMessageCount: beforeMessageCount,
+        afterProjectedTokens: beforeProjectedTokens,
+        beforeMessageCount,
+        beforeProjectedTokens,
+        level: 0,
+        reason: null,
+        removed: 0,
+      };
+    }
+
+    const l1 = this.#compactL1();
+    const l2 = this.#compactL2Merge();
+    const l3 = this.#compactL3Collapse();
+    const afterMessageCount = this.toProjectedMessages().length;
+    const afterProjectedTokens = this.estimateProjectedTokens();
+    const level = Math.max(l1.level, l2.level, l3.level);
+    const reason =
+      options.reason ||
+      `provider-input-budget:${options.stageProfile || 'generic'} messages=${beforeMessageCount}/${maxProjectedMessages} tokens=${beforeProjectedTokens}/${maxProjectedTokens}`;
+
+    if (level > 0) {
+      this.#compactionLog.push(
+        `provider-input-budget: ${reason}; projected ${beforeProjectedTokens}->${afterProjectedTokens} tokens, ${beforeMessageCount}->${afterMessageCount} messages`
+      );
+      this.#logger.info(
+        `[ContextWindow] provider input budget compact: ${reason} | ` +
+          `tokens≈${beforeProjectedTokens}->${afterProjectedTokens}, ` +
+          `messages=${beforeMessageCount}->${afterMessageCount}`
+      );
+    }
+
+    return {
+      afterMessageCount,
+      afterProjectedTokens,
+      beforeMessageCount,
+      beforeProjectedTokens,
+      level,
+      reason,
+      removed: l1.removed + l2.removed + l3.removed,
+    };
   }
 
   /**
@@ -633,6 +717,10 @@ export class ContextWindow {
     ];
   }
 
+  estimateProjectedTokens(): number {
+    return this.#estimateMessagesTokens(this.toProjectedMessages());
+  }
+
   /** 获取消息数量 */
   get length() {
     return this.#messages.length;
@@ -659,10 +747,14 @@ export class ContextWindow {
    * 因为 Transport 层会在发送前剥离更早的 reasoning。
    */
   estimateTokens() {
-    const recentToolCallIndices = this.#findRecentToolCallIndices(2);
+    return this.#estimateMessagesTokens(this.#messages);
+  }
+
+  #estimateMessagesTokens(messages: ContextMessage[]) {
+    const recentToolCallIndices = this.#findRecentToolCallIndicesIn(messages, 2);
     let total = 0;
-    for (let i = 0; i < this.#messages.length; i++) {
-      const m = this.#messages[i];
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
       if (m.content) {
         total += estimateTokensFast(m.content);
       }
@@ -676,11 +768,10 @@ export class ContextWindow {
     return total;
   }
 
-  /** 找到最近 N 轮 assistant(toolCalls) 的索引集合 */
-  #findRecentToolCallIndices(n: number): Set<number> {
+  #findRecentToolCallIndicesIn(messages: ContextMessage[], n: number): Set<number> {
     const indices = new Set<number>();
-    for (let i = this.#messages.length - 1; i >= 0 && indices.size < n; i--) {
-      const m = this.#messages[i];
+    for (let i = messages.length - 1; i >= 0 && indices.size < n; i--) {
+      const m = messages[i];
       if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
         indices.add(i);
       }

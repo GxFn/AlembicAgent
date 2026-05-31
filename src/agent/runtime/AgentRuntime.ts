@@ -57,7 +57,13 @@ import { createExitController } from './ExitController.js';
 import { cleanFinalAnswer } from './final-answer.js';
 import { produceForcedSummary } from './forced-summary.js';
 import { HookSystem, registerDefaultHooks } from './HookSystem.js';
-import { buildLlmInputAssembly, type LLMInputAssembly } from './LLMInputAssembly.js';
+import {
+  buildLlmInputAssembly,
+  type LLMInputAssembly,
+  type LLMInputStageProfile,
+  resolveLlmInputStageProfile,
+} from './LLMInputAssembly.js';
+import { measureLlmInputAssembly } from './LLMInputMeasurement.js';
 import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
@@ -97,6 +103,20 @@ export type {
   ToolMetadata,
 } from './AgentRuntimeTypes.js';
 export { MAX_TOOL_CALLS_PER_ITER } from './AgentRuntimeTypes.js';
+
+function resolveProviderInputBudget(stageProfile: LLMInputStageProfile) {
+  switch (stageProfile) {
+    case 'record':
+      return { maxProjectedMessages: 40, maxProjectedTokens: 14_000 };
+    case 'produce':
+      return { maxProjectedMessages: 20, maxProjectedTokens: 12_000 };
+    case 'analyze':
+    case 'summarize':
+      return { maxProjectedMessages: 44, maxProjectedTokens: 16_000 };
+    default:
+      return null;
+  }
+}
 
 export class AgentRuntime {
   onToolCall: ToolCallHook | null;
@@ -854,10 +874,6 @@ export class AgentRuntime {
           : toolSchemas.length > 0
             ? toolSchemas
             : undefined;
-
-      // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
-      const projected =
-        ctx.messages.toProjectedMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
       const unifiedTools = effectiveToolSchemas as
         | import('#ai/AiProvider.js').ToolSchema[]
         | undefined;
@@ -866,10 +882,24 @@ export class AgentRuntime {
         : unifiedTools
           ? toolChoice
           : 'none';
+
+      const inputStageProfile = resolveLlmInputStageProfile(ctx, toolChoice, effectiveToolChoice);
+      const providerInputBudget = resolveProviderInputBudget(inputStageProfile);
+      const inputProjection = providerInputBudget
+        ? ctx.messages.compactForProviderInputBudget({
+            ...providerInputBudget,
+            stageProfile: inputStageProfile,
+          })
+        : null;
+
+      // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
+      const projected =
+        ctx.messages.toProjectedMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
       const llmInputAssembly = buildLlmInputAssembly({
         ctx,
         dynamicContext,
         effectiveToolChoice,
+        inputProjection: inputProjection ? { ...inputProjection } : null,
         messages: projected,
         modelRef: this.#modelRef,
         requestedToolChoice: toolChoice,
@@ -882,6 +912,7 @@ export class AgentRuntime {
         modelRef: this.#modelRef,
         requestedToolChoice: toolChoice,
       });
+      const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
       const unifiedMessages = llmInputAssembly.providerMessages;
       const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
         kind: 'llm.input',
@@ -897,6 +928,13 @@ export class AgentRuntime {
           hasDynamicContext: Boolean(dynamicContext),
           requestedToolChoice: toolChoice,
           effectiveToolChoice,
+          inputSizeEstimate: {
+            inputLayer: llmInputMeasurement.inputLayerEstimatedTokens,
+            providerHistory: llmInputMeasurement.providerHistoryEstimatedTokens,
+            providerMessages: llmInputMeasurement.providerMessageEstimatedTokens,
+            systemPrompt: llmInputMeasurement.systemPromptEstimatedTokens,
+            toolSchemas: llmInputMeasurement.toolSchemaEstimatedTokens,
+          },
           toolSchemaNames: (unifiedTools || []).map((schema) => schema.name),
           ...llmInputAssembly.metadata,
         },
@@ -1535,7 +1573,7 @@ export class AgentRuntime {
         phaseBefore !== tracker.phase &&
         (tracker.phase === 'SUMMARIZE' || tracker.phase === 'FINALIZE');
 
-      const textResult = tracker.onTextResponse();
+      const textResult = tracker.onTextResponse(llmResult.text || '');
 
       // 如果 endRound 的 metrics 转换刚推进到终结阶段，则强制走 needsDigestNudge 路径，
       // 给 Agent 一轮机会输出完整总结，而不是把当前文本当作最终回复

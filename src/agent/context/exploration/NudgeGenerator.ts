@@ -25,7 +25,7 @@ import type {
   FullExplorationMetrics,
   PipelineType,
 } from './ExplorationStrategies.js';
-import { DEFAULT_REFLECTION_INTERVAL } from './ExplorationStrategies.js';
+import { DEFAULT_REFLECTION_INTERVAL, targetMemoryFindingCount } from './ExplorationStrategies.js';
 
 // ─── 本地类型 ──────────────────────────────────────────
 
@@ -162,9 +162,10 @@ export class NudgeGenerator {
     }
 
     if (toPhase === 'RECORD') {
+      const targetFindingCount = targetMemoryFindingCount(m);
       return (
         `你已完成分析验证。现在进入结构化记录阶段：请**停止调用 code、graph、terminal 等探索工具**。\n` +
-        `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidence, importance }) 记录核心发现，至少 3 条；每次工具调用记录 1 条发现。\n` +
+        `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidence, importance }) 记录核心发现；按当前证据量至少记录 ${targetFindingCount} 条，每次工具调用记录 1 条发现。\n` +
         `note_finding 是 QualityGate 的重要质量依据；evidence 必须包含完整相对路径和行号。缺少或不足会导致 QualityGate retry。\n` +
         `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`
       );
@@ -198,7 +199,8 @@ export class NudgeGenerator {
       if (pipelineType === 'producer') {
         return (
           `你已完成候选生产阶段。请**停止调用工具**，直接输出生产总结（Markdown 格式）。\n` +
-          `说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充证据。\n` +
+          `说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充结构化发现。\n` +
+          `不要从 Analyst 最终 Markdown 摘要里新增候选主题；未结构化记录的主题只能列为 Analyst 输入缺口。\n` +
           `⚠️ 不要再调用任何工具，直接输出文本。`
         );
       }
@@ -410,6 +412,9 @@ export class NudgeGenerator {
           if (pipelineType === 'scan') {
             return `已提交 ${m.submitCount} 个候选（上限 ${b.maxSubmits}）。${remaining > 0 ? `还可提交 ${remaining} 个。` : ''}如果还有值得记录的发现可以继续提交，否则请输出分析总结。`;
           }
+          if (pipelineType === 'producer') {
+            return `已提交 ${m.submitCount} 个候选（上限 ${b.maxSubmits}）。如果结构化发现已全部覆盖，请直接输出生产总结；不要从最终 Markdown 摘要里新增候选主题。`;
+          }
           return `已提交 ${m.submitCount} 个候选（上限 ${b.maxSubmits}）。${remaining > 0 ? `还可提交 ${remaining} 个。` : ''}如果还有值得记录的发现可以继续提交，否则请产出 dimensionDigest 总结。\n⚠️ 如果还有未处理的信号，请在 dimensionDigest 的 remainingTasks 字段中标记，下次运行时会续传。`;
         }
         return null;
@@ -421,7 +426,7 @@ export class NudgeGenerator {
         return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
 
       case 'RECORD':
-        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidence, importance })；已记录 ${m.memoryFindingCount}/3 条核心发现。`;
+        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidence, importance })；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，已记录 ${m.memoryFindingCount} 条。`;
 
       default:
         return null;

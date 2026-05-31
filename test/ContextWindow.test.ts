@@ -2,6 +2,55 @@ import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 
 describe('ContextWindow L4 compaction transcript safety', () => {
+  it('keeps runtime nudges ephemeral instead of accumulating repeated user messages', () => {
+    const contextWindow = new ContextWindow(48_000);
+    contextWindow.appendUserMessage('initial analyze prompt');
+    contextWindow.appendUserNudge('first progress nudge');
+    contextWindow.appendAssistantText('assistant response after first nudge');
+    contextWindow.appendUserNudge('second progress nudge');
+
+    const messages = contextWindow.toMessages();
+    const rendered = JSON.stringify(messages);
+
+    expect(messages).toHaveLength(3);
+    expect(rendered).not.toContain('first progress nudge');
+    expect(rendered).toContain('second progress nudge');
+    expect(messages.at(-1)?.metadata).toMatchObject({ kind: 'runtime_nudge' });
+  });
+
+  it('applies a provider-input budget before the global model-context budget is high', () => {
+    const contextWindow = new ContextWindow(48_000);
+    contextWindow.appendUserMessage('initial analyze prompt');
+    for (let index = 0; index < 8; index++) {
+      contextWindow.appendAssistantWithToolCalls(null, [
+        { id: `call-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      contextWindow.appendToolResult(
+        `call-${index}`,
+        'code',
+        `Sources/App/Feature${index}.swift:1\n${'verified evidence line '.repeat(220)}`
+      );
+    }
+
+    const beforeMessages = contextWindow.toProjectedMessages().length;
+    const beforeTokens = contextWindow.estimateProjectedTokens();
+    const result = contextWindow.compactForProviderInputBudget({
+      maxProjectedMessages: 12,
+      maxProjectedTokens: 2_000,
+      stageProfile: 'analyze',
+    });
+    const projected = contextWindow.toProjectedMessages();
+
+    expect(beforeMessages).toBeGreaterThan(12);
+    expect(beforeTokens).toBeGreaterThan(2_000);
+    expect(result.level).toBe(3);
+    expect(result.beforeMessageCount).toBe(beforeMessages);
+    expect(result.afterMessageCount).toBeLessThan(beforeMessages);
+    expect(result.afterProjectedTokens).toBeLessThan(result.beforeProjectedTokens);
+    expect(String(projected[1]?.content)).toContain('[Collapsed:');
+    expect(JSON.stringify(projected)).toContain('Feature7.swift');
+  });
+
   it('builds L4 summary input from a structured memory package, not raw tool messages', async () => {
     const contextWindow = new ContextWindow(10_000);
     contextWindow.appendUserMessage('initial prompt');

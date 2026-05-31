@@ -66,6 +66,17 @@ export type {
   LLMInputStageProfile,
 } from './LLMInputAssembly.js';
 export { buildLlmInputAssembly, resolveLlmInputStageProfile } from './LLMInputAssembly.js';
+export type {
+  DuplicatePromptBlock,
+  LLMInputAssemblyMeasurement,
+  PromptSectionMeasurement,
+  PromptTextMeasurement,
+} from './LLMInputMeasurement.js';
+export {
+  estimatePromptTokens,
+  measureLlmInputAssembly,
+  measurePromptText,
+} from './LLMInputMeasurement.js';
 export { continueResult, LLMResultType } from './LLMResultType.js';
 export { LoopContext } from './LoopContext.js';
 export {

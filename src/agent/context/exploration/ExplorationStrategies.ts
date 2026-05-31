@@ -92,6 +92,10 @@ export interface ExplorationStrategy {
   replanInterval: number;
 }
 
+export function targetMemoryFindingCount(m: Pick<ExplorationMetrics, 'evidenceToolCallCount'>) {
+  return Math.min(6, Math.max(3, Math.ceil(m.evidenceToolCallCount / 4)));
+}
+
 /** 追踪 trace 接口（ActiveContext 子集） */
 export interface ExplorationTrace {
   getRecentSummary?(
@@ -169,7 +173,7 @@ export function createBootstrapStrategy(isSkillOnly = false) {
  *   - EXPLORE 阶段只有在已取得真实代码证据后，才允许 40% 预算后降级为 auto
  *   - EXPLORE→VERIFY 的文本转换必须已有代码证据，避免纯自然语言分析空转
  *   - EXPLORE→VERIFY 新增 consecutiveIdleRounds 检测（LLM 连续无工具调用=分析完成）
- *   - VERIFY→RECORD 阈值从 80% 降至 75%，VERIFY 只允许证据校验类工具调用
+ *   - VERIFY→RECORD 阈值从 80% 降至 75%，已记录 3 条发现后可提前收束；VERIFY 只允许证据校验类工具调用
  *   - RECORD 是 required note_finding-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
  */
 export const STRATEGY_ANALYST = {
@@ -184,6 +188,7 @@ export const STRATEGY_ANALYST = {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
         m.evidenceToolCallCount > 0 &&
         (m.searchRoundsInPhase >= Math.floor(b.maxIterations * 0.6) ||
+          (m.memoryFindingCount >= 3 && m.evidenceToolCallCount >= 2) ||
           m.roundsSinceNewInfo >= 3 ||
           (m.iteration >= Math.floor(b.maxIterations * 0.4) && m.roundsSinceNewInfo >= 2) ||
           m.consecutiveIdleRounds >= 2),
@@ -193,15 +198,17 @@ export const STRATEGY_ANALYST = {
     'VERIFY→RECORD': {
       onMetrics: (m: ExplorationMetrics, b: ExplorationBudget) =>
         (m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0) &&
-        (m.iteration >= Math.floor(b.maxIterations * 0.75) ||
+        (m.memoryFindingCount >= 3 ||
+          m.iteration >= Math.floor(b.maxIterations * 0.75) ||
           m.roundsSinceNewInfo >= 2 ||
           m.consecutiveIdleRounds >= 1),
       onTextResponse: (m: ExplorationMetrics) =>
         m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0,
     },
     'RECORD→SUMMARIZE': {
-      onMetrics: (m: ExplorationMetrics) => m.memoryFindingCount >= 3,
-      onTextResponse: (m: ExplorationMetrics) => m.memoryFindingCount >= 3,
+      onMetrics: (m: ExplorationMetrics) => m.memoryFindingCount >= targetMemoryFindingCount(m),
+      onTextResponse: (m: ExplorationMetrics) =>
+        m.memoryFindingCount >= targetMemoryFindingCount(m),
     },
   },
   getToolChoice: (phase: ExplorationPhase, m: ExplorationMetrics, b: ExplorationBudget) => {

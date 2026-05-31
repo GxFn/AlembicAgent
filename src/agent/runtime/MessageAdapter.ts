@@ -15,6 +15,16 @@ import { isToolResultEnvelope } from '#tools/core/ToolResultPresenter.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import { limitToolResult } from '../context/ContextWindow.js';
 
+export interface ProviderInputBudgetProjection {
+  afterMessageCount: number;
+  afterProjectedTokens: number;
+  beforeMessageCount: number;
+  beforeProjectedTokens: number;
+  level: number;
+  reason: string | null;
+  removed: number;
+}
+
 /** 工具调用记录 */
 interface ToolCallRecord {
   id: string;
@@ -108,6 +118,23 @@ export class MessageAdapter {
     throw new Error('not implemented');
   }
 
+  compactForProviderInputBudget(_opts?: {
+    maxProjectedMessages?: number;
+    maxProjectedTokens?: number;
+    reason?: string;
+    stageProfile?: string;
+  }): ProviderInputBudgetProjection {
+    return {
+      afterMessageCount: this.toProjectedMessages().length,
+      afterProjectedTokens: 0,
+      beforeMessageCount: this.toProjectedMessages().length,
+      beforeProjectedTokens: 0,
+      level: 0,
+      reason: null,
+      removed: 0,
+    };
+  }
+
   /**
    * 格式化工具结果字符串 (统一 limitToolResult 调用)
    * @param rawResult 工具原始返回值
@@ -186,6 +213,15 @@ export class ContextWindowAdapter extends MessageAdapter {
 
   compactIfNeeded() {
     return this.#ctxWin.compactIfNeeded();
+  }
+
+  compactForProviderInputBudget(opts?: {
+    maxProjectedMessages?: number;
+    maxProjectedTokens?: number;
+    reason?: string;
+    stageProfile?: string;
+  }) {
+    return this.#ctxWin.compactForProviderInputBudget(opts);
   }
 }
 

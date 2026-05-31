@@ -32,10 +32,17 @@ export interface LLMInputAssembly {
   tools?: ToolSchema[];
 }
 
+interface LLMInputCompactionResult {
+  budgetedSectionIds: LLMInputSectionId[];
+  dedupedSectionIds: LLMInputSectionId[];
+  sections: LLMInputSection[];
+}
+
 export interface BuildLlmInputAssemblyOptions {
   ctx: LoopContext;
   dynamicContext: string | null;
   effectiveToolChoice: string;
+  inputProjection?: Record<string, unknown> | null;
   messages: UnifiedMessage[];
   modelRef: string;
   requestedToolChoice: string;
@@ -47,6 +54,7 @@ export function buildLlmInputAssembly({
   ctx,
   dynamicContext,
   effectiveToolChoice,
+  inputProjection,
   messages,
   modelRef,
   requestedToolChoice,
@@ -55,13 +63,15 @@ export function buildLlmInputAssembly({
 }: BuildLlmInputAssemblyOptions): LLMInputAssembly {
   const stageProfile = resolveLlmInputStageProfile(ctx, requestedToolChoice, effectiveToolChoice);
   const groundingContext = buildGroundingContext(ctx, modelRef);
-  const inputLayerSections = [
+  const rawInputLayerSections = [
     buildStagePolicySection(stageProfile, ctx),
     buildToolContractSection(stageProfile, requestedToolChoice, effectiveToolChoice, tools),
-    buildTaskContextSection(ctx, modelRef),
+    buildTaskContextSection(ctx, modelRef, messages),
     buildEvidenceContextSection(ctx, groundingContext),
     buildDynamicContextSection(dynamicContext),
   ].filter((section): section is LLMInputSection => Boolean(section?.content.trim()));
+  const inputCompaction = compactInputLayerSections(rawInputLayerSections, stageProfile);
+  const inputLayerSections = inputCompaction.sections;
 
   const sections: LLMInputSection[] = [
     {
@@ -98,6 +108,11 @@ export function buildLlmInputAssembly({
         .map((section) => section.id),
       trackerPhase: stringValue(valueAt(ctx.tracker, 'phase')),
       pipelineType: stringValue(valueAt(ctx.tracker, 'pipelineType')),
+      inputCompaction: {
+        budgetedSectionIds: inputCompaction.budgetedSectionIds,
+        dedupedSectionIds: inputCompaction.dedupedSectionIds,
+      },
+      inputProjection: inputProjection || null,
     },
     providerMessages: inputLayerMessage ? [...messages, inputLayerMessage] : messages,
     sections,
@@ -169,13 +184,13 @@ function buildStagePolicySection(
 
   const bodyByProfile: Record<LLMInputStageProfile, string> = {
     analyze:
-      'Analyze real project evidence. Use discovery tools only to gather or verify facts, then record confirmed findings with note_finding before the final report.',
+      'Analyze real project evidence with discovery tools, then record confirmed findings with note_finding. Final text must summarize recorded note_finding items only: verified finding ids or next evidence action; do not introduce Markdown-only candidate themes, source context, code, or injected evidence.',
     record:
       'Record-only phase. Do not perform additional exploration or emit prose. Use note_finding for already verified findings, one finding per call.',
     summarize:
-      'Summary-only phase. Stop tool use and produce the final answer from existing evidence, recorded findings, and prior messages.',
+      'Summary-only phase. Stop tool use and produce a concise final answer from existing evidence, recorded findings, and prior messages; do not replay full evidence text.',
     produce:
-      'Producer phase. Transform verified analysis into knowledge submissions. Do not start new exploration; only read Analyst-referenced files when a submission needs an exact snippet.',
+      'Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. Do not start new exploration; only read Analyst-referenced files when a submission needs an exact snippet. Final text: submit counts and blockers only; do not restate submitted candidate content.',
     generic: 'Follow the current task prompt and runtime tool contract.',
   };
 
@@ -221,7 +236,12 @@ function buildToolContractSection(
   };
 }
 
-function buildTaskContextSection(ctx: LoopContext, modelRef: string): LLMInputSection {
+function buildTaskContextSection(
+  ctx: LoopContext,
+  modelRef: string,
+  messages: UnifiedMessage[]
+): LLMInputSection {
+  const promptInHistory = hasPromptInMessageHistory(ctx.prompt, messages);
   const contextLines = [
     `modelRef: ${modelRef}`,
     `source: ${ctx.source}`,
@@ -236,8 +256,8 @@ function buildTaskContextSection(ctx: LoopContext, modelRef: string): LLMInputSe
     stringValue(ctx.context?.targetName)
       ? `targetName: ${stringValue(ctx.context.targetName)}`
       : null,
-    'prompt:',
-    limitText(ctx.prompt, 1600),
+    promptInHistory ? 'promptRef: initial-user-message' : 'prompt:',
+    promptInHistory ? null : limitText(ctx.prompt, 1600),
   ];
 
   return {
@@ -247,6 +267,26 @@ function buildTaskContextSection(ctx: LoopContext, modelRef: string): LLMInputSe
     providerVisible: true,
     staticCacheable: false,
   };
+}
+
+function hasPromptInMessageHistory(prompt: string, messages: UnifiedMessage[]): boolean {
+  const normalizedPrompt = normalizePromptPresence(prompt);
+  if (!normalizedPrompt) {
+    return false;
+  }
+  return messages.some((message) => {
+    if (message.role !== 'user' || !message.content) {
+      return false;
+    }
+    const normalizedContent = normalizePromptPresence(message.content);
+    return normalizedContent.includes(normalizedPrompt);
+  });
+}
+
+function normalizePromptPresence(text: string | null | undefined): string {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function buildEvidenceContextSection(
@@ -349,6 +389,95 @@ function buildDynamicContextSection(dynamicContext: string | null): LLMInputSect
     providerVisible: true,
     staticCacheable: false,
   };
+}
+
+function compactInputLayerSections(
+  sections: LLMInputSection[],
+  stageProfile: LLMInputStageProfile
+): LLMInputCompactionResult {
+  const seenBlocks = new Set<string>();
+  const dedupedSectionIds: LLMInputSectionId[] = [];
+  const budgetedSectionIds: LLMInputSectionId[] = [];
+  const compacted = sections.map((section) => {
+    const content = compactRepeatedBlocks(section.content, seenBlocks);
+    let nextContent = content;
+    const maxChars = sectionBudgetFor(stageProfile, section.id);
+    if (nextContent.length > maxChars) {
+      nextContent = limitText(nextContent, maxChars);
+      budgetedSectionIds.push(section.id);
+    }
+    if (nextContent !== section.content) {
+      dedupedSectionIds.push(section.id);
+    }
+    return { ...section, content: nextContent };
+  });
+  return { budgetedSectionIds, dedupedSectionIds, sections: compacted };
+}
+
+function sectionBudgetFor(
+  stageProfile: LLMInputStageProfile,
+  sectionId: LLMInputSectionId
+): number {
+  const defaultBudgets: Partial<Record<LLMInputSectionId, number>> = {
+    dynamicContext: 1600,
+    evidenceContext: 1400,
+    taskContext: 1400,
+  };
+  if (stageProfile === 'produce') {
+    const produceBudgets: Partial<Record<LLMInputSectionId, number>> = {
+      dynamicContext: 1000,
+      evidenceContext: 1000,
+      taskContext: 1100,
+    };
+    return produceBudgets[sectionId] ?? 2400;
+  }
+  return defaultBudgets[sectionId] ?? 2400;
+}
+
+function compactRepeatedBlocks(text: string, seenBlocks: Set<string>): string {
+  const paragraphs = text.split(/\n{2,}/);
+  const compactedParagraphs: string[] = [];
+  for (const paragraph of paragraphs) {
+    const lines = paragraph.split('\n');
+    const compactedLines: string[] = [];
+    let paragraphDropped = false;
+    for (const line of lines) {
+      const key = normalizeCompactionBlock(line);
+      if (key && hasSeenCompactionBlock(key, seenBlocks)) {
+        paragraphDropped = lines.length === 1;
+        continue;
+      }
+      compactedLines.push(line);
+      if (key) {
+        seenBlocks.add(key);
+      }
+    }
+    if (!paragraphDropped && compactedLines.join('\n').trim()) {
+      compactedParagraphs.push(compactedLines.join('\n'));
+    }
+  }
+  return compactedParagraphs.join('\n\n');
+}
+
+function hasSeenCompactionBlock(key: string, seenBlocks: Set<string>): boolean {
+  if (seenBlocks.has(key)) {
+    return true;
+  }
+  for (const seen of seenBlocks) {
+    if (key.includes(seen) || seen.includes(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeCompactionBlock(text: string): string | null {
+  const normalized = text
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n+/g, '\n')
+    .trim()
+    .toLowerCase();
+  return normalized.length >= 48 ? normalized : null;
 }
 
 function formatProviderInputLayer(sections: LLMInputSection[]): string | null {

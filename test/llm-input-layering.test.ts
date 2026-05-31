@@ -2,12 +2,18 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
+import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insight-analyst.js';
 import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insight-producer.js';
 import {
   AgentRuntime,
+  buildLlmInputAssembly,
+  createMessageAdapter,
+  LoopContext,
+  measureLlmInputAssembly,
+  measurePromptText,
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
@@ -91,6 +97,177 @@ function getLlmInput(progress: ProgressEvent[]) {
 }
 
 describe('LLM input layering', () => {
+  it('compacts repeated analyze input blocks without provider calls', () => {
+    const repeatedFact =
+      'Shared project fact: Sources/App/Feature.swift owns the feature boundary and should be cited exactly once in the analyze context.';
+    const uncompactedBaseline = measurePromptText(`${repeatedFact}\n\n${repeatedFact}`);
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Analyze architecture for the design-patterns dimension.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: 'Analyst identity prompt',
+      budget: { maxIterations: 1 },
+      capabilities: [],
+      context: {
+        deterministicEvidenceRefs: ['Sources/App/Feature.swift:12'],
+        dimensionId: 'design-patterns',
+        pipelinePhase: 'analyze',
+        targetName: 'Demo',
+      },
+      messages,
+      prompt: `${repeatedFact}\n\nUse the cited source to verify the finding.`,
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker: createTracker({ phase: 'SCAN', pipelineType: 'analyst' }) as never,
+    });
+
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: `${repeatedFact}\n\nObservation ledger: Sources/App/Feature.swift was read.`,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: 'Analyst identity prompt',
+      tools: [{ name: 'code', description: 'Read source files' }],
+    });
+    const measurement = measureLlmInputAssembly(assembly);
+    const dynamicContextSection = assembly.sections.find(
+      (section) => section.id === 'dynamicContext'
+    );
+
+    expect(measurement.stageProfile).toBe('analyze');
+    expect(measurement.estimatedTokens).toBeGreaterThan(0);
+    expect(measurement.providerHistoryEstimatedTokens).toBeGreaterThan(0);
+    expect(measurement.inputLayerEstimatedTokens).toBeGreaterThan(0);
+    expect(measurement.providerMessageEstimatedTokens).toBeGreaterThan(0);
+    expect(measurement.providerMessageEstimatedTokens).toBeGreaterThan(
+      measurement.providerHistoryEstimatedTokens
+    );
+    expect(measurement.systemPromptEstimatedTokens).toBeGreaterThan(0);
+    expect(measurement.toolSchemaEstimatedTokens).toBeGreaterThan(0);
+    expect(measurement.sectionMeasurements.map((section) => section.id)).toEqual([
+      'identity',
+      'stagePolicy',
+      'toolContract',
+      'taskContext',
+      'evidenceContext',
+      'dynamicContext',
+    ]);
+    expect(uncompactedBaseline.duplicateBlockRatio).toBeGreaterThan(0);
+    expect(measurement.duplicateBlockRatio).toBeLessThan(uncompactedBaseline.duplicateBlockRatio);
+    expect(dynamicContextSection?.content).not.toContain(repeatedFact);
+    expect(assembly.metadata.inputCompaction).toMatchObject({
+      dedupedSectionIds: ['dynamicContext'],
+    });
+  });
+
+  it('compacts Producer v2 repeated blocks as a deterministic source-unit candidate', () => {
+    const repeatedEvidence =
+      'Sources/App/Feature.swift:12 shows FeatureCoordinator owns navigation state for the design-patterns dimension.';
+    const uncompactedBaseline = measurePromptText(
+      `${repeatedEvidence}\n\n${repeatedEvidence}\n\n${repeatedEvidence}`
+    );
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: `${repeatedEvidence}\n\n${repeatedEvidence}`,
+        evidenceMap: new Map([
+          [
+            'Sources/App/Feature.swift',
+            {
+              codeSnippets: [
+                {
+                  content: 'final class FeatureCoordinator {}',
+                  endLine: 12,
+                  startLine: 12,
+                },
+              ],
+              filePath: 'Sources/App/Feature.swift',
+              summary: repeatedEvidence,
+            },
+          ],
+        ]),
+        findings: [{ evidence: repeatedEvidence, finding: repeatedEvidence, importance: 9 }],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+    const measurement = measurePromptText(prompt);
+
+    expect(measurement.charCount).toBe(prompt.length);
+    expect(measurement.estimatedTokens).toBeGreaterThan(0);
+    expect(uncompactedBaseline.duplicateBlockRatio).toBeGreaterThan(0);
+    expect(measurement.duplicateBlockRatio).toBeLessThan(uncompactedBaseline.duplicateBlockRatio);
+    expect(prompt.match(new RegExp(repeatedEvidence, 'g'))?.length).toBe(1);
+  });
+
+  it('uses a compact Producer analysis digest instead of replaying full analysis text', () => {
+    const repeatedBody =
+      'This long narrative paragraph is useful for Analyst reasoning but should not be replayed wholesale into Producer context. ';
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: [
+          '# Pattern analysis',
+          'Sources/App/Feature.swift:12 owns the FeatureCoordinator boundary.',
+          repeatedBody.repeat(40),
+          'Sources/App/Other.swift:22 contains a supporting adapter.',
+        ].join('\n'),
+        evidenceMap: new Map(),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+
+    expect(prompt).toContain('## Analyst 分析摘要 (已压缩)');
+    expect(prompt).toContain('Sources/App/Feature.swift:12');
+    expect(prompt).toContain('FeatureCoordinator owns navigation state');
+    expect(prompt).not.toContain(repeatedBody.repeat(8));
+  });
+
+  it('states that Producer obligations come only from structured Analyst findings', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: [
+          '# Pattern analysis',
+          '## Markdown-only Pattern',
+          'This heading is explanatory background and must not become an extra obligation.',
+        ].join('\n'),
+        evidenceMap: new Map(),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+
+    expect(prompt).toContain('结构化发现是唯一候选义务');
+    expect(prompt).toContain('不要从摘要里新增候选主题');
+  });
+
+  it('keeps Analyst final Markdown aligned to recorded note_finding facts', () => {
+    expect(ANALYST_SYSTEM_PROMPT).toContain('Producer 只消费 note_finding 结构化发现');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('最终 Markdown 只能总结已记录的 note_finding');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('不得新增未结构化记录的模式家族');
+  });
+
   it('adds producer sourceRef grounding guidance from verified analysis refs', () => {
     const prompt = buildProducerPromptV2(
       {
@@ -155,8 +332,12 @@ describe('LLM input layering', () => {
 
     expect(providerLayer).toContain('# LLM input runtime layer');
     expect(providerLayer).toContain('## Stage policy');
+    expect(providerLayer).toContain('Final text must summarize recorded note_finding items only');
+    expect(providerLayer).toContain('do not introduce Markdown-only candidate themes');
     expect(providerLayer).toContain('## Tool contract');
     expect(providerLayer).toContain('## Task context');
+    expect(providerLayer).toContain('promptRef: initial-user-message');
+    expect(providerLayer).not.toContain('prompt:\nanalyze with apiKey=');
     expect(providerLayer).toContain('## Evidence context');
     expect(providerLayer).toContain('## Dynamic context');
     expect(inputText).toContain('## Identity (static)');
@@ -168,8 +349,18 @@ describe('LLM input layering', () => {
     expect(inputText).toContain('analyze with apiKey=');
     expect(inputText).not.toContain('visibleInputSecret12345');
     expect(llmInput?.metadata).toMatchObject({
+      inputSizeEstimate: {
+        inputLayer: expect.any(Number),
+        providerHistory: expect.any(Number),
+        providerMessages: expect.any(Number),
+        systemPrompt: expect.any(Number),
+        toolSchemas: expect.any(Number),
+      },
       inputLayerAppended: true,
       inputStageProfile: 'analyze',
+      inputProjection: {
+        level: 0,
+      },
       pcvNodeEvidence: {
         inputAssemblyRef: expect.stringMatching(/^llm-input:/),
         stageIdentity: { stageProfile: 'analyze' },
@@ -451,12 +642,19 @@ describe('LLM input layering', () => {
     expect(capture.systemPrompt).not.toContain('结构化查询');
     expect(providerLayer).toContain('stageProfile: produce');
     expect(providerLayer).toContain('Producer phase');
+    expect(providerLayer).toContain('Structured findings are the only candidate obligations');
+    expect(providerLayer).toContain('do not mine final Markdown for new themes');
+    expect(providerLayer).toContain('Final text: submit counts and blockers only');
+    expect(providerLayer).toContain('do not restate submitted candidate content');
     expect(providerLayer).not.toContain('sourceRefPolicy: strict');
     expect(providerLayer).not.toContain('canonicalSourceRefIndex');
     expect(providerLayer).not.toContain('graph({ action');
     expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['code', 'knowledge']);
     expect(llmInput?.metadata).toMatchObject({
       inputStageProfile: 'produce',
+      inputProjection: {
+        level: 0,
+      },
       pcvNodeEvidence: {
         chainNodeId: 'pcvm:cold-start:n11',
         nodeId: 'pcvm:n11:produce',

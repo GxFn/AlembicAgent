@@ -1,4 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import {
+  STRATEGY_ANALYST,
+  targetMemoryFindingCount,
+} from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
@@ -71,6 +75,114 @@ describe('analyst exploration strategy boundaries', () => {
     }
 
     expect(tracker?.phase).toBe('VERIFY');
+  });
+
+  it('lets analyst phases converge once enough evidence-backed findings are recorded', () => {
+    const budget = {
+      idleRoundsToExit: 3,
+      maxIterations: 20,
+      maxSubmits: 10,
+      searchBudget: 12,
+      searchBudgetGrace: 3,
+      softSubmitLimit: 10,
+    };
+    const metrics = {
+      consecutiveIdleRounds: 0,
+      evidenceToolCallCount: 2,
+      iteration: 8,
+      memoryFindingCount: 3,
+      phaseRounds: 2,
+      roundsSinceNewInfo: 0,
+      searchRoundsInPhase: 2,
+      submitCount: 0,
+      totalToolCalls: 6,
+    };
+
+    expect(STRATEGY_ANALYST.transitions['EXPLORE→VERIFY'].onMetrics(metrics, budget)).toBe(true);
+    expect(STRATEGY_ANALYST.transitions['VERIFY→RECORD'].onMetrics(metrics, budget)).toBe(true);
+  });
+
+  it('requires broader structured findings when the evidence surface is broad', () => {
+    const budget = {
+      idleRoundsToExit: 3,
+      maxIterations: 20,
+      maxSubmits: 10,
+      searchBudget: 12,
+      searchBudgetGrace: 3,
+      softSubmitLimit: 10,
+    };
+    const metrics = {
+      consecutiveIdleRounds: 0,
+      evidenceToolCallCount: 19,
+      iteration: 8,
+      memoryFindingCount: 3,
+      phaseRounds: 2,
+      roundsSinceNewInfo: 0,
+      searchRoundsInPhase: 2,
+      submitCount: 0,
+      totalToolCalls: 24,
+    };
+
+    expect(targetMemoryFindingCount(metrics)).toBe(5);
+    expect(STRATEGY_ANALYST.transitions['RECORD→SUMMARIZE'].onMetrics(metrics, budget)).toBe(false);
+    expect(
+      STRATEGY_ANALYST.transitions['RECORD→SUMMARIZE'].onMetrics(
+        { ...metrics, memoryFindingCount: 5 },
+        budget
+      )
+    ).toBe(true);
+  });
+
+  it('lets producer final completion text stop after successful submissions', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer' }
+    );
+
+    expect(tracker).not.toBeNull();
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { id: 'candidate-1', status: 'accepted' }
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      '## 候选生产总结\n已完成 1 个候选提交。无未提交发现，不需要 Analyst 补证。'
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
+  });
+
+  it('recognizes Package K producer completion wording as terminal', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer' }
+    );
+
+    expect(tracker).not.toBeNull();
+    tracker?.tick();
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { id: 'candidate-1', status: 'accepted' }
+    );
+    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const textResult = tracker?.onTextResponse(
+      '所有 6 个知识候选已成功提交，覆盖了 Analyst 分析中的全部 6 项发现。无未提交发现，无阻断。'
+    );
+
+    expect(textResult?.isFinalAnswer).toBe(true);
+    expect(textResult?.shouldContinue).toBe(false);
+    expect(textResult?.nudge).toBeNull();
   });
 
   it('keeps VERIFY focused on evidence checks instead of broad exploration', async () => {
