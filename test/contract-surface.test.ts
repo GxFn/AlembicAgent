@@ -31,10 +31,11 @@ describe('explicit AlembicAgent contract subpaths', () => {
   it('exposes the internal runtime boundary without owning Plugin host-agent routes', () => {
     expect(runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY).toMatchObject({
       packageName: '@alembic/agent',
-      runtimeLine: 'alembic-internal-ai',
+      runtimeLine: 'alembic-api-ai',
       hostAgentRouteSupported: false,
     });
-    expect(runtime.supportsAgentRuntimeRoute('alembic-internal-ai')).toBe(true);
+    expect(runtime.supportsAgentRuntimeRoute('alembic-api-ai')).toBe(true);
+    expect(runtime.supportsAgentRuntimeRoute('alembic-internal-ai')).toBe(false);
     expect(runtime.supportsAgentRuntimeRoute('plugin-host-agent-route')).toBe(false);
     expect(runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY.unsupportedHostRoutes).toContain(
       'plugin-host-agent-route'

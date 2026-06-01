@@ -21,7 +21,7 @@ export interface AgentRuntimeBoundaryEntry {
 
 export interface AgentRuntimeBoundaryManifest {
   readonly packageName: '@alembic/agent';
-  readonly runtimeLine: 'alembic-internal-ai';
+  readonly runtimeLine: 'alembic-api-ai';
   readonly hostAgentRouteSupported: false;
   readonly entries: readonly AgentRuntimeBoundaryEntry[];
   readonly unsupportedHostRoutes: readonly string[];
@@ -97,7 +97,7 @@ const BOUNDARY_ENTRIES = [
 
 export const ALEMBIC_AGENT_RUNTIME_BOUNDARY = Object.freeze({
   packageName: '@alembic/agent',
-  runtimeLine: 'alembic-internal-ai',
+  runtimeLine: 'alembic-api-ai',
   hostAgentRouteSupported: false,
   entries: BOUNDARY_ENTRIES,
   unsupportedHostRoutes: ['codex-mcp', 'codex-marketplace', 'plugin-host-agent-route'],
