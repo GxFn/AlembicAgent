@@ -512,7 +512,7 @@ describe('agent runtime forced summary suppression', () => {
       createCanonicalSourceIdentity({
         folderDisplayName: 'Alembic',
         projectScopeId: 'workspace',
-        sourcePath: 'api-server.ts',
+        sourcePath: 'bin/api-server.ts',
       }),
       createCanonicalSourceIdentity({
         folderDisplayName: 'AlembicCore',
@@ -534,7 +534,8 @@ describe('agent runtime forced summary suppression', () => {
             id: 'finding-call-1',
             name: 'note_finding',
             args: {
-              evidence: 'api-server.ts:10 is verified; index.ts:3 is ambiguous.',
+              evidence:
+                'api-server.ts:10 is verified; index.ts:3 is ambiguous; AlembicCore/src/core/database.ts is missing.',
               finding: 'Runtime evidence was verified',
               importance: 8,
             },
@@ -549,12 +550,16 @@ describe('agent runtime forced summary suppression', () => {
       });
     const toolRouter = {
       execute: vi.fn(async () =>
-        createToolEnvelope('memory', 'recorded api-server.ts:10 and index.ts:3', {
-          importance: 8,
-          message: 'recorded',
-          recorded: true,
-          target: 'activeContext',
-        })
+        createToolEnvelope(
+          'memory',
+          'recorded api-server.ts:10, index.ts:3, and AlembicCore/src/core/database.ts',
+          {
+            importance: 8,
+            message: 'recorded',
+            recorded: true,
+            target: 'activeContext',
+          }
+        )
       ),
     };
     const runtime = new AgentRuntime({
@@ -599,18 +604,31 @@ describe('agent runtime forced summary suppression', () => {
       sourceRefs: string[];
     };
 
-    expect(pcvEvidence.sourceRefs).toEqual(['Alembic/api-server.ts:10']);
-    expect(pcvEvidence.findingRefs.accepted[0]?.sourceRefs).toEqual(['Alembic/api-server.ts:10']);
+    expect(pcvEvidence.sourceRefs).toEqual(['Alembic/bin/api-server.ts:10']);
+    expect(pcvEvidence.findingRefs.accepted[0]?.sourceRefs).toEqual([
+      'Alembic/bin/api-server.ts:10',
+    ]);
     expect(pcvEvidence.sourceRefDiagnostics).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ input: 'index.ts:3', status: 'ambiguous' }),
+        expect.objectContaining({
+          input: 'AlembicCore/src/core/database.ts',
+          status: 'missing',
+        }),
       ])
     );
     expect(pcvEvidence.missingLinkReasons).toContain('ambiguous-source-ref:index.ts:3');
+    expect(pcvEvidence.missingLinkReasons).toContain(
+      'missing-source-ref:AlembicCore/src/core/database.ts'
+    );
     expect(toolEnd?.metadata?.pcvNodeEvidence).toMatchObject({
-      sourceRefs: ['Alembic/api-server.ts:10'],
+      sourceRefs: ['Alembic/bin/api-server.ts:10'],
       sourceRefDiagnostics: expect.arrayContaining([
         expect.objectContaining({ input: 'index.ts:3', status: 'ambiguous' }),
+        expect.objectContaining({
+          input: 'AlembicCore/src/core/database.ts',
+          status: 'missing',
+        }),
       ]),
     });
   });

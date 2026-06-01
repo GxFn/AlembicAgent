@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import {
   buildProjectScopeSourceRefIndex,
   type CanonicalSourceIdentity,
+  normalizeProjectScopeSourceRef,
   type ProjectScopeSourceRefIndex,
-  resolveProjectScopeSourceRef,
 } from '@alembic/core';
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
@@ -1095,15 +1095,15 @@ function normalizeSourceRefsForEvidence(
     if (!parsed.path) {
       continue;
     }
-    const resolution = resolveProjectScopeSourceRef(parsed.path, index);
-    if (resolution.status === 'resolved' && resolution.identity) {
-      normalizedRefs.push(`${resolution.identity.qualifiedPath}${parsed.lineSuffix}`);
+    const normalized = normalizeProjectScopeSourceRef(parsed.path, index);
+    if (normalized.status === 'active' && normalized.normalizedRef) {
+      normalizedRefs.push(`${normalized.normalizedRef}${parsed.lineSuffix}`);
       continue;
     }
     recordSourceRefDiagnostic(evidence, {
       input: ref,
-      reason: resolution.reason,
-      status: resolution.status === 'ambiguous' ? 'ambiguous' : 'missing',
+      reason: normalized.reason,
+      status: normalized.status === 'ambiguous' ? 'ambiguous' : 'missing',
     });
   }
   return uniqueStrings(normalizedRefs).slice(0, MAX_SOURCE_REFS);
