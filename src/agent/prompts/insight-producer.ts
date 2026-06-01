@@ -15,10 +15,7 @@
  * @module insight-producer
  */
 
-import {
-  buildProducerStyleGuide,
-  SUBMIT_REQUIREMENTS,
-} from '@alembic/core/domain/knowledge/StyleGuide';
+import { buildProducerStyleGuide, SUBMIT_REQUIREMENTS } from '@alembic/core/knowledge';
 import type { EvidenceEntry } from '../domain/EvidenceCollector.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -130,7 +127,7 @@ export const PRODUCER_BUDGET = {
 };
 
 // ──────────────────────────────────────────────────────────────────
-// 项目特写风格指南 (从共享 StyleGuide.js 获取)
+// 项目特写风格指南 (从 Core knowledge stable facade 获取)
 // ──────────────────────────────────────────────────────────────────
 
 const STYLE_GUIDE = buildProducerStyleGuide();
