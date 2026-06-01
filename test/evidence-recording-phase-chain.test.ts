@@ -1,10 +1,15 @@
+import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { analysisQualityGate, insightGateEvaluator } from '../src/agent/prompts/insight-gate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime as AgentRuntimeImpl } from '../src/agent/runtime/AgentRuntime.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
-import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
+import {
+  buildPcvQualityGateEvidence,
+  createToolPipeline,
+  DiagnosticsCollector,
+} from '../src/agent/runtime/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 
 const MISSING_FINDINGS = 'Required note_finding calls are missing';
@@ -319,6 +324,66 @@ describe('evidence recording quality gate actions', () => {
       pcvNodeEvidenceRef: 'pcvm:n9:quality_gate',
       pcvQualityGateStatus: 'pass',
     });
+  });
+
+  it('normalizes quality gate source refs and records ambiguous refs as diagnostics', () => {
+    const sourceIdentities = [
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'Alembic',
+        projectScopeId: 'workspace',
+        sourcePath: 'lib/bootstrap.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicCore',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicPlugin',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+    ];
+    const evidence = buildPcvQualityGateEvidence({
+      artifact: {
+        findings: [
+          {
+            evidence: 'lib/bootstrap.ts:12 verifies bootstrap while index.ts:4 is ambiguous.',
+            finding: 'Bootstrap source identity verified',
+            importance: 8,
+          },
+        ],
+        metadata: { memoryFindingCount: 1 },
+        referencedFiles: ['lib/bootstrap.ts', 'index.ts'],
+      },
+      dimId: 'architecture',
+      gate: { action: 'pass', pass: true },
+      sharedState: { _sourceIdentities: sourceIdentities },
+      source: {},
+      stageNodeContext: {
+        pcvStageNodeMap: {
+          quality_gate: {
+            chainNodeId: 'pcvm:cold-start:n9:quality',
+            pcvNodeId: 'pcvm:n9:quality_gate',
+          },
+        },
+      },
+    });
+
+    expect(evidence.sourceRefs).toEqual(
+      expect.arrayContaining(['Alembic/lib/bootstrap.ts', 'Alembic/lib/bootstrap.ts:12'])
+    );
+    expect(evidence.sourceRefs).not.toContain('index.ts');
+    expect(evidence.findingRefs.accepted[0]?.sourceRefs).toEqual(['Alembic/lib/bootstrap.ts:12']);
+    expect(evidence.sourceRefDiagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ input: 'index.ts', status: 'ambiguous' }),
+        expect.objectContaining({ input: 'index.ts:4', status: 'ambiguous' }),
+      ])
+    );
+    expect(evidence.missingLinkReasons).toEqual(
+      expect.arrayContaining(['ambiguous-source-ref:index.ts'])
+    );
   });
 });
 

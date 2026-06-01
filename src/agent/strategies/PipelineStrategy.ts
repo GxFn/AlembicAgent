@@ -905,18 +905,35 @@ export class PipelineStrategy extends Strategy {
       strategyContext.stageNodeMap ??
       baseSharedState?.stageNodeMap ??
       null;
+    const sourceIdentities =
+      messageContext?.sourceIdentities ??
+      messageContext?.projectScopeSourceIdentities ??
+      strategyContext.sourceIdentities ??
+      strategyContext.projectScopeSourceIdentities ??
+      baseSharedState?._sourceIdentities ??
+      baseSharedState?._projectScopeSourceIdentities ??
+      baseSharedState?.sourceIdentities ??
+      baseSharedState?.projectScopeSourceIdentities ??
+      null;
     const stageSharedState = decisionOnly
       ? {
           ...(baseSharedState || {}),
           _evolutionDecisionOnly: true,
+          ...(sourceIdentities !== null ? { _sourceIdentities: sourceIdentities } : {}),
         }
       : stage.recordRepairOnly
         ? {
             ...(baseSharedState || {}),
             _recordRepairOnly: true,
             _recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
+            ...(sourceIdentities !== null ? { _sourceIdentities: sourceIdentities } : {}),
           }
-        : baseSharedState;
+        : sourceIdentities !== null
+          ? {
+              ...(baseSharedState || {}),
+              _sourceIdentities: sourceIdentities,
+            }
+          : baseSharedState;
 
     const reactPromise = runtime.reactLoop(stagePrompt, {
       history: message.history,
@@ -925,6 +942,7 @@ export class PipelineStrategy extends Strategy {
         ...(pcvStageNodeMap !== null ? { pcvStageNodeMap } : {}),
         ...(pcvChainNodes !== null ? { pcvChainNodes } : {}),
         ...(stageNodeMap !== null ? { stageNodeMap } : {}),
+        ...(sourceIdentities !== null ? { sourceIdentities } : {}),
         pipelinePhase: stage.name,
         previousPhases: phaseResults,
         evidenceStarters: strategyContext.evidenceStarters || null,

@@ -1,4 +1,10 @@
 import { createHash } from 'node:crypto';
+import {
+  buildProjectScopeSourceRefIndex,
+  type CanonicalSourceIdentity,
+  type ProjectScopeSourceRefIndex,
+  resolveProjectScopeSourceRef,
+} from '@alembic/core';
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
@@ -109,6 +115,12 @@ export interface PcvNodeRejectedFindingRef {
   toolName: string;
 }
 
+export interface PcvSourceRefDiagnostic {
+  input: string;
+  reason: string;
+  status: 'ambiguous' | 'missing';
+}
+
 export interface PcvNodeQualityGateEvidence {
   action: string;
   derivedFindingCount?: number;
@@ -154,6 +166,7 @@ export interface PcvNodeEvidenceSummary {
   qualityGate: PcvNodeQualityGateEvidence | null;
   repair: PcvNodeRepairEvidence;
   schemaVersion: 1;
+  sourceRefDiagnostics: PcvSourceRefDiagnostic[];
   sourceRefs: string[];
   stageIdentity: PcvNodeStageIdentity;
 }
@@ -171,6 +184,7 @@ export interface PcvNodeEvidenceProcessMetadata {
   rejectedFindingRefs: string[];
   repair: PcvNodeRepairEvidence;
   schemaVersion: 1;
+  sourceRefDiagnostics: PcvSourceRefDiagnostic[];
   sourceRefs: string[];
   stageIdentity: PcvNodeStageIdentity;
 }
@@ -200,6 +214,7 @@ const MAX_SOURCE_REFS = 80;
 const MAX_EVENT_SOURCE_REFS = 24;
 const MAX_GROUNDING_LEDGER = 32;
 const MAX_EVENT_GROUNDING_LEDGER = 8;
+const PCV_SOURCE_REF_INDEX = new WeakMap<PcvNodeEvidenceSummary, ProjectScopeSourceRefIndex>();
 
 export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary {
   const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
@@ -243,7 +258,7 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
     `agent:${stageSlug}:${scopeSlug}`;
   const chainNodeId =
     mappedIdentity?.chainNodeId || stringValue(ctx.context?.chainNodeId) || nodeId;
-  const repairEvidencePaths = extractSourceRefsFromValue([
+  const rawRepairEvidencePaths = extractSourceRefsFromValue([
     ctx.context?.recordRepairEvidencePaths,
     ctx.sharedState?._recordRepairEvidencePaths,
   ]);
@@ -252,7 +267,7 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
     ctx.context?.recordRepairOnly === true ||
     Boolean(pipelinePhase?.includes('record_repair'));
 
-  return {
+  const evidence: PcvNodeEvidenceSummary = {
     chainNodeId,
     correlation: {
       dimensionId,
@@ -275,11 +290,12 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
     qualityGate: null,
     repair: {
       attempted: repairAttempted,
-      evidencePaths: repairEvidencePaths,
+      evidencePaths: [],
       reason: stringValue(ctx.context?.recordRepairReason) || null,
       status: repairAttempted ? 'pending' : null,
     },
     schemaVersion: 1,
+    sourceRefDiagnostics: [],
     sourceRefs: [],
     stageIdentity: {
       dimensionId,
@@ -291,6 +307,9 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
       trackerPhase,
     },
   };
+  attachPcvSourceRefIndex(evidence, ctx.context, ctx.sharedState);
+  evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(evidence, rawRepairEvidencePaths);
+  return evidence;
 }
 
 export function recordPcvInputAssembly(
@@ -402,7 +421,9 @@ export function recordPcvLlmOutput(
 
   entry.textOutputChars = text.length;
   entry.reasoningTokens = Math.max(0, Number(options.reasoningTokens || 0));
-  entry.outputSourceRefs = uniqueStrings(outputSourceRefs).slice(0, MAX_SOURCE_REFS);
+  entry.outputSourceRefs = uniqueStrings(
+    normalizeSourceRefsForEvidence(evidence, outputSourceRefs)
+  ).slice(0, MAX_SOURCE_REFS);
   entry.consumedEvidenceRefs = uniqueStrings(consumedEvidenceRefs).slice(0, MAX_SOURCE_REFS);
   entry.functionCallNames = uniqueStrings(functionCallNames).slice(0, 24);
   // outputSourceRefs 只作为后续审计材料，不作为 grounding 成功指标。
@@ -453,14 +474,17 @@ export function recordPcvToolResult(
 ): void {
   const toolName = call.name || 'unknown';
   const callId = call.id || null;
-  const sourceRefs = extractSourceRefsFromValue([
-    call.args,
-    result,
-    envelope?.structuredContent,
-    envelope?.artifacts,
-    envelope?.resources,
-    envelope?.text,
-  ]);
+  const sourceRefs = normalizeSourceRefsForEvidence(
+    evidence,
+    extractSourceRefsFromValue([
+      call.args,
+      result,
+      envelope?.structuredContent,
+      envelope?.artifacts,
+      envelope?.resources,
+      envelope?.text,
+    ])
+  );
   addSourceRefs(evidence, sourceRefs);
 
   if (!isNoteFindingCall(call)) {
@@ -477,7 +501,10 @@ export function recordPcvToolResult(
   const recorded = toolSucceeded && resultRecord.recorded === true;
   const target = stringValue(resultRecord.target);
   const accepted = recorded && target === 'activeContext';
-  const findingSourceRefs = extractSourceRefsFromValue([evidenceText, params, resultRecord]);
+  const findingSourceRefs = normalizeSourceRefsForEvidence(
+    evidence,
+    extractSourceRefsFromValue([evidenceText, params, resultRecord])
+  );
   addSourceRefs(evidence, findingSourceRefs);
 
   if (accepted) {
@@ -523,6 +550,7 @@ export function buildPcvNodeEvidenceSummary(
   options: { requireQualityGate?: boolean } = {}
 ): PcvNodeEvidenceSummary {
   const summary = cloneEvidence(evidence);
+  normalizePcvEvidenceSourceRefs(summary);
   summary.sourceRefs = uniqueStrings(summary.sourceRefs).slice(0, MAX_SOURCE_REFS);
   summary.ledgerRefs = dedupeBy(summary.ledgerRefs, (item) => item.ref);
   summary.groundingLedger = dedupeBy(summary.groundingLedger || [], (item) => item.ref).slice(
@@ -558,6 +586,7 @@ export function buildPcvNodeEvidenceProcessMetadata(
     rejectedFindingRefs: summary.findingRefs.rejected.map((finding) => finding.ref),
     repair: summary.repair,
     schemaVersion: 1,
+    sourceRefDiagnostics: summary.sourceRefDiagnostics,
     sourceRefs: summary.sourceRefs.slice(0, MAX_EVENT_SOURCE_REFS),
     stageIdentity: summary.stageIdentity,
   };
@@ -583,6 +612,7 @@ export function buildPcvQualityGateEvidence({
   const evidence = sourceEvidence
     ? cloneEvidence(sourceEvidence)
     : createFallbackQualityGateEvidence(artifactRecord, dimId || null);
+  attachPcvSourceRefIndex(evidence, stageNodeContext, sharedState, artifactRecord, source);
   const qualityGateIdentity = resolvePcvStageNodeIdentity({
     context: stageNodeContext || artifactRecord,
     pipelinePhase: 'quality_gate',
@@ -592,14 +622,20 @@ export function buildPcvQualityGateEvidence({
     trackerPhase: null,
   });
   applyResolvedStageNodeIdentity(evidence, qualityGateIdentity);
-  const referencedFiles = stringArray(artifactRecord.referencedFiles);
+  const referencedFiles = normalizeSourceRefsForEvidence(
+    evidence,
+    stringArray(artifactRecord.referencedFiles)
+  );
   addSourceRefs(evidence, referencedFiles);
   const findings = Array.isArray(artifactRecord.findings) ? artifactRecord.findings : [];
   for (const finding of findings) {
     const findingRecord = asRecord(finding);
     const findingText = stringValue(findingRecord.finding) || '';
     const evidenceText = stringValue(findingRecord.evidence) || '';
-    const findingSourceRefs = extractSourceRefsFromValue([evidenceText, findingRecord]);
+    const findingSourceRefs = normalizeSourceRefsForEvidence(
+      evidence,
+      extractSourceRefsFromValue([evidenceText, findingRecord])
+    );
     addSourceRefs(evidence, findingSourceRefs);
     pushUniqueAcceptedFinding(evidence, {
       evidence: evidenceText ? [evidenceText] : [],
@@ -868,6 +904,7 @@ function createFallbackQualityGateEvidence(
     qualityGate: null,
     repair: { attempted: false, evidencePaths: [], reason: null, status: null },
     schemaVersion: 1,
+    sourceRefDiagnostics: [],
     sourceRefs: [],
     stageIdentity: {
       dimensionId,
@@ -952,7 +989,189 @@ function pushUniqueRejectedFinding(
 }
 
 function addSourceRefs(evidence: PcvNodeEvidenceSummary, refs: string[]): void {
-  evidence.sourceRefs = uniqueStrings([...evidence.sourceRefs, ...refs]).slice(0, MAX_SOURCE_REFS);
+  evidence.sourceRefs = uniqueStrings([
+    ...evidence.sourceRefs,
+    ...normalizeSourceRefsForEvidence(evidence, refs),
+  ]).slice(0, MAX_SOURCE_REFS);
+}
+
+function attachPcvSourceRefIndex(evidence: PcvNodeEvidenceSummary, ...sources: unknown[]): void {
+  if (PCV_SOURCE_REF_INDEX.has(evidence)) {
+    return;
+  }
+  const index = resolvePcvSourceRefIndex(...sources);
+  if (index) {
+    PCV_SOURCE_REF_INDEX.set(evidence, index);
+  }
+}
+
+function resolvePcvSourceRefIndex(...sources: unknown[]): ProjectScopeSourceRefIndex | null {
+  for (const source of sources) {
+    const directIndex = findProjectScopeSourceRefIndex(source);
+    if (directIndex) {
+      return directIndex;
+    }
+  }
+
+  const identities = sources.flatMap((source) => collectCanonicalSourceIdentities(source));
+  return identities.length > 0 ? buildProjectScopeSourceRefIndex(identities) : null;
+}
+
+function findProjectScopeSourceRefIndex(source: unknown): ProjectScopeSourceRefIndex | null {
+  const record = asRecord(source);
+  const candidates = [
+    record.sourceRefIndex,
+    record.projectScopeSourceRefIndex,
+    record._sourceRefIndex,
+    record._projectScopeSourceRefIndex,
+  ];
+  return candidates.find(isProjectScopeSourceRefIndex) ?? null;
+}
+
+function collectCanonicalSourceIdentities(source: unknown): CanonicalSourceIdentity[] {
+  const record = asRecord(source);
+  const candidates = [
+    source,
+    record.sourceIdentities,
+    record.projectScopeSourceIdentities,
+    record.canonicalSourceIdentities,
+    record.sourceRefIdentities,
+    record._sourceIdentities,
+    record._projectScopeSourceIdentities,
+    record._canonicalSourceIdentities,
+    asRecord(record.projectScope).sourceIdentities,
+    asRecord(record.projectScopeAnalysis).sourceIdentities,
+    asRecord(record.projectIntelligence).sourceIdentities,
+  ];
+  return candidates.flatMap((candidate) => {
+    if (!Array.isArray(candidate)) {
+      const identity = normalizeCanonicalSourceIdentity(candidate);
+      return identity ? [identity] : [];
+    }
+    return candidate
+      .map((item) => normalizeCanonicalSourceIdentity(item))
+      .filter((item): item is CanonicalSourceIdentity => Boolean(item));
+  });
+}
+
+function normalizeCanonicalSourceIdentity(value: unknown): CanonicalSourceIdentity | null {
+  const record = asRecord(value);
+  const identityRecord =
+    Object.keys(asRecord(record.sourceIdentity)).length > 0
+      ? asRecord(record.sourceIdentity)
+      : record;
+  const legacyPath =
+    stringValue(identityRecord.legacyPath) || stringValue(identityRecord.relativePath);
+  const qualifiedPath = stringValue(identityRecord.qualifiedPath);
+  const relativePath = stringValue(identityRecord.relativePath) || legacyPath;
+  if (!legacyPath || !qualifiedPath || !relativePath) {
+    return null;
+  }
+  return {
+    absolutePath: stringValue(identityRecord.absolutePath),
+    folderDisplayName: stringValue(identityRecord.folderDisplayName),
+    folderId: stringValue(identityRecord.folderId),
+    folderPath: stringValue(identityRecord.folderPath),
+    folderRelativeRoot: stringValue(identityRecord.folderRelativeRoot),
+    legacyPath,
+    projectScopeId: stringValue(identityRecord.projectScopeId),
+    qualifiedPath,
+    relativePath,
+  };
+}
+
+function normalizeSourceRefsForEvidence(
+  evidence: PcvNodeEvidenceSummary,
+  refs: readonly string[]
+): string[] {
+  const index = PCV_SOURCE_REF_INDEX.get(evidence);
+  if (!index) {
+    return uniqueStrings([...refs]);
+  }
+
+  const normalizedRefs: string[] = [];
+  for (const ref of refs) {
+    const parsed = splitSourceRefLineSuffix(ref);
+    if (!parsed.path) {
+      continue;
+    }
+    const resolution = resolveProjectScopeSourceRef(parsed.path, index);
+    if (resolution.status === 'resolved' && resolution.identity) {
+      normalizedRefs.push(`${resolution.identity.qualifiedPath}${parsed.lineSuffix}`);
+      continue;
+    }
+    recordSourceRefDiagnostic(evidence, {
+      input: ref,
+      reason: resolution.reason,
+      status: resolution.status === 'ambiguous' ? 'ambiguous' : 'missing',
+    });
+  }
+  return uniqueStrings(normalizedRefs).slice(0, MAX_SOURCE_REFS);
+}
+
+function normalizePcvEvidenceSourceRefs(evidence: PcvNodeEvidenceSummary): void {
+  evidence.sourceRefs = normalizeSourceRefsForEvidence(evidence, evidence.sourceRefs);
+  evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(
+    evidence,
+    evidence.repair.evidencePaths
+  );
+  for (const finding of evidence.findingRefs.accepted) {
+    finding.sourceRefs = normalizeSourceRefsForEvidence(evidence, finding.sourceRefs);
+  }
+  for (const finding of evidence.findingRefs.rejected) {
+    finding.sourceRefs = normalizeSourceRefsForEvidence(evidence, finding.sourceRefs || []);
+  }
+  for (const entry of evidence.groundingLedger) {
+    entry.outputSourceRefs = normalizeSourceRefsForEvidence(evidence, entry.outputSourceRefs);
+  }
+}
+
+function splitSourceRefLineSuffix(ref: string): { lineSuffix: string; path: string } {
+  const clean = ref.trim();
+  const match = clean.match(/^(.*?)(:\d+(?:-\d+)?)?$/u);
+  return {
+    lineSuffix: match?.[2] ?? '',
+    path: (match?.[1] ?? clean).trim(),
+  };
+}
+
+function recordSourceRefDiagnostic(
+  evidence: PcvNodeEvidenceSummary,
+  diagnostic: PcvSourceRefDiagnostic
+): void {
+  if (
+    evidence.sourceRefDiagnostics.some(
+      (item) =>
+        item.input === diagnostic.input &&
+        item.reason === diagnostic.reason &&
+        item.status === diagnostic.status
+    )
+  ) {
+    return;
+  }
+  evidence.sourceRefDiagnostics.push(diagnostic);
+  evidence.missingLinkReasons = uniqueStrings([
+    ...evidence.missingLinkReasons,
+    `${diagnostic.status}-source-ref:${diagnostic.input}`,
+  ]);
+}
+
+function isProjectScopeSourceRefIndex(value: unknown): value is ProjectScopeSourceRefIndex {
+  const record = value as Partial<ProjectScopeSourceRefIndex> | null;
+  return (
+    Boolean(record) &&
+    hasMapGet(record?.byLegacyPath) &&
+    hasMapGet(record?.byQualifiedPath) &&
+    hasSetHas(record?.ambiguousLegacyPaths)
+  );
+}
+
+function hasMapGet(value: unknown): value is Pick<ReadonlyMap<string, unknown>, 'get'> {
+  return typeof (value as { get?: unknown } | null)?.get === 'function';
+}
+
+function hasSetHas(value: unknown): value is Pick<ReadonlySet<string>, 'has'> {
+  return typeof (value as { has?: unknown } | null)?.has === 'function';
 }
 
 function upsertGroundingLedgerEntry(
@@ -1160,7 +1379,7 @@ function simpleValue(value: unknown): unknown {
 }
 
 function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary {
-  return {
+  const cloned = {
     ...evidence,
     correlation: { ...evidence.correlation },
     findingRefs: {
@@ -1181,7 +1400,7 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
       ...ledger,
       ...(ledger.stats ? { stats: { ...ledger.stats } } : {}),
     })),
-    missingLinkReasons: [...evidence.missingLinkReasons],
+    missingLinkReasons: [...(evidence.missingLinkReasons || [])],
     qualityGate: evidence.qualityGate
       ? {
           ...evidence.qualityGate,
@@ -1192,9 +1411,15 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
         }
       : null,
     repair: { ...evidence.repair, evidencePaths: [...evidence.repair.evidencePaths] },
+    sourceRefDiagnostics: [...(evidence.sourceRefDiagnostics || [])],
     sourceRefs: [...evidence.sourceRefs],
     stageIdentity: { ...evidence.stageIdentity },
   };
+  const sourceRefIndex = PCV_SOURCE_REF_INDEX.get(evidence);
+  if (sourceRefIndex) {
+    PCV_SOURCE_REF_INDEX.set(cloned, sourceRefIndex);
+  }
+  return cloned;
 }
 
 function shortHash(value: unknown): string {

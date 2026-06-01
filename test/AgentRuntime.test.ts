@@ -1,3 +1,4 @@
+import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
@@ -502,6 +503,115 @@ describe('agent runtime forced summary suppression', () => {
     expect(toolEnd?.metadata?.pcvNodeEvidence).toMatchObject({
       acceptedFindingRefs: [accepted.ref],
       sourceRefs: ['src/foo.ts:10'],
+    });
+  });
+
+  it('normalizes PCV note_finding refs with ProjectScope identities and drops ambiguous refs', async () => {
+    const progress: ProgressEvent[] = [];
+    const sourceIdentities = [
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'Alembic',
+        projectScopeId: 'workspace',
+        sourcePath: 'api-server.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicCore',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicPlugin',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+    ];
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [
+          {
+            id: 'finding-call-1',
+            name: 'note_finding',
+            args: {
+              evidence: 'api-server.ts:10 is verified; index.ts:3 is ambiguous.',
+              finding: 'Runtime evidence was verified',
+              importance: 8,
+            },
+          },
+        ],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const toolRouter = {
+      execute: vi.fn(async () =>
+        createToolEnvelope('memory', 'recorded api-server.ts:10 and index.ts:3', {
+          importance: 8,
+          message: 'recorded',
+          recorded: true,
+          target: 'activeContext',
+        })
+      ),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: toolRouter as never,
+      container: {
+        get: (name: string) => {
+          if (name !== 'capabilityCatalog') {
+            return undefined;
+          }
+          return {
+            toToolSchemas: (ids?: readonly string[] | null) =>
+              ids?.includes('memory')
+                ? [{ name: 'memory', description: 'Memory', parameters: { type: 'object' } }]
+                : [],
+          };
+        },
+      } as never,
+      capabilities: [],
+      additionalTools: ['memory'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      onProgress: (event) => progress.push(event),
+    });
+
+    const result = await runtime.reactLoop('record one verified finding', {
+      source: 'system',
+      context: {
+        dimensionId: 'architecture',
+        pipelinePhase: 'analyze',
+        sourceIdentities,
+      },
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+    const toolEnd = progress
+      .map((event) => event.processEvent)
+      .find((event) => event?.title === 'Tool call completed: note_finding');
+    const pcvEvidence = result.pcvNodeEvidence as {
+      findingRefs: { accepted: Array<{ sourceRefs: string[] }> };
+      missingLinkReasons: string[];
+      sourceRefDiagnostics: Array<{ input: string; status: string }>;
+      sourceRefs: string[];
+    };
+
+    expect(pcvEvidence.sourceRefs).toEqual(['Alembic/api-server.ts:10']);
+    expect(pcvEvidence.findingRefs.accepted[0]?.sourceRefs).toEqual(['Alembic/api-server.ts:10']);
+    expect(pcvEvidence.sourceRefDiagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ input: 'index.ts:3', status: 'ambiguous' }),
+      ])
+    );
+    expect(pcvEvidence.missingLinkReasons).toContain('ambiguous-source-ref:index.ts:3');
+    expect(toolEnd?.metadata?.pcvNodeEvidence).toMatchObject({
+      sourceRefs: ['Alembic/api-server.ts:10'],
+      sourceRefDiagnostics: expect.arrayContaining([
+        expect.objectContaining({ input: 'index.ts:3', status: 'ambiguous' }),
+      ]),
     });
   });
 

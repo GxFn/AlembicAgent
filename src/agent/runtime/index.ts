@@ -97,6 +97,7 @@ export type {
   PcvNodeRejectedFindingRef,
   PcvNodeRepairEvidence,
   PcvNodeStageIdentity,
+  PcvSourceRefDiagnostic,
   PcvStageNodeIdentity,
   PcvStageNodeMap,
   ResolvedPcvStageNodeIdentity,
