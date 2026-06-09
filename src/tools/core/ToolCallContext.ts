@@ -1,4 +1,5 @@
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import type { ToolDecisionResultStatus } from './ToolDecision.js';
 
 export type ToolSurface = 'runtime' | 'http' | 'mcp' | 'dashboard' | 'composer' | 'system';
 
@@ -61,11 +62,17 @@ export interface ToolServiceContracts {
   quality?: ToolQualityServiceContract;
 }
 
+export interface ToolPolicyDecision {
+  ok: boolean;
+  reason?: string;
+  resultStatus?: ToolDecisionResultStatus;
+  requiresConfirmation?: boolean;
+  confirmationMessage?: string;
+  requestId?: string;
+}
+
 export interface ToolPolicyValidator {
-  validateToolCall(
-    toolName: string,
-    args: Record<string, unknown>
-  ): { ok: boolean; reason?: string };
+  validateToolCall(toolName: string, args: Record<string, unknown>): ToolPolicyDecision;
 }
 
 export interface ToolResultCacheProvider {

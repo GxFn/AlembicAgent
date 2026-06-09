@@ -66,6 +66,7 @@ export { AgentEventBus, AgentEvents } from './runtime/AgentEventBus.js';
 export {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
+  AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   getAgentInterfaceContractBranch,
   validateAgentInterfaceContract,

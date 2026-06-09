@@ -174,11 +174,18 @@ export class LightweightRouter implements ToolRouterContract {
       request.args
     );
     if (policyCheck && !policyCheck.ok) {
+      const resultStatus =
+        policyCheck.resultStatus ??
+        (policyCheck.requiresConfirmation ? 'needs-confirmation' : 'blocked');
       return {
         allowed: false,
         stage: 'approve',
         reason: policyCheck.reason || `Tool '${request.toolId}' was blocked by policy`,
-        resultStatus: 'blocked',
+        resultStatus,
+        requiresConfirmation:
+          policyCheck.requiresConfirmation || resultStatus === 'needs-confirmation',
+        confirmationMessage: policyCheck.confirmationMessage,
+        requestId: policyCheck.requestId,
       };
     }
 
@@ -299,6 +306,11 @@ export class LightweightRouter implements ToolRouterContract {
     startMs: number,
     decision: ToolDecision
   ): ToolResultEnvelope {
+    const nextActionHint =
+      decision.requiresConfirmation || decision.resultStatus === 'needs-confirmation'
+        ? decision.confirmationMessage || 'Await host confirmation before executing this tool call'
+        : undefined;
+
     return this.#statusEnvelope(
       toolId,
       callId,
@@ -306,7 +318,7 @@ export class LightweightRouter implements ToolRouterContract {
       startMs,
       decision.resultStatus || 'blocked',
       decision.reason || `Tool '${toolId}' is not allowed`,
-      decision.requiresConfirmation ? decision.confirmationMessage : undefined
+      nextActionHint
     );
   }
 
@@ -329,7 +341,10 @@ export class LightweightRouter implements ToolRouterContract {
       durationMs: Date.now() - startMs,
       diagnostics: this.#defaultDiagnostics(
         status === 'timeout' ? ['execute'] : [],
-        status === 'blocked' ? [{ tool: toolId, reason: text }] : []
+        status === 'blocked' ? [{ tool: toolId, reason: text }] : [],
+        status === 'needs-confirmation'
+          ? [{ stage: 'approve', action: 'needs-confirmation', reason: text }]
+          : []
       ),
       trust: {
         source: 'internal',
@@ -384,7 +399,8 @@ export class LightweightRouter implements ToolRouterContract {
 
   #defaultDiagnostics(
     timedOutStages: string[] = [],
-    blockedTools: Array<{ tool: string; reason: string }> = []
+    blockedTools: Array<{ tool: string; reason: string }> = [],
+    gateFailures: Array<{ stage: string; action: string; reason?: string }> = []
   ) {
     return {
       degraded: false,
@@ -395,7 +411,7 @@ export class LightweightRouter implements ToolRouterContract {
       truncatedToolCalls: 0,
       emptyResponses: 0,
       aiErrorCount: 0,
-      gateFailures: [],
+      gateFailures,
     };
   }
 }

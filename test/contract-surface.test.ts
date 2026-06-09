@@ -32,8 +32,10 @@ describe('explicit AlembicAgent contract subpaths', () => {
       'cancellation',
       'timeout',
       'permission-denial',
+      'needs-confirmation',
       'partial-result',
       'provider-error',
+      'host-failure',
       'host-adapter',
     ]);
     expect(runtime.MAX_TOOL_CALLS_PER_ITER).toBeGreaterThan(0);

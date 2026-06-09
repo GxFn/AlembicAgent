@@ -282,6 +282,67 @@ describe('LightweightRouter', () => {
     expect(recorded).toHaveLength(1);
   });
 
+  it('returns needs-confirmation envelopes from runtime policy before adapter execution', async () => {
+    const catalog = new CapabilityCatalog([createManifest()]);
+    let adapterCalled = false;
+    const recorded: ToolResultEnvelope[] = [];
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(async (request) => {
+          adapterCalled = true;
+          return createSuccessEnvelope(request);
+        }),
+      ],
+    });
+    const request = createRequest({
+      runtime: {
+        policyValidator: {
+          validateToolCall: () => ({
+            ok: false,
+            reason: 'requires host approval before write',
+            resultStatus: 'needs-confirmation',
+            requiresConfirmation: true,
+            confirmationMessage: 'Approve demo.echo for unit test',
+            requestId: 'approval-1',
+          }),
+        },
+        diagnostics: {
+          recordToolCallEnvelope: (envelope) => {
+            recorded.push(envelope);
+          },
+        },
+      },
+    });
+
+    const explanation = await router.explain(request);
+    const envelope = await router.execute(request);
+
+    expect(explanation).toMatchObject({
+      allowed: false,
+      resultStatus: 'needs-confirmation',
+      requiresConfirmation: true,
+      confirmationMessage: 'Approve demo.echo for unit test',
+      requestId: 'approval-1',
+    });
+    expect(envelope).toMatchObject({
+      ok: false,
+      status: 'needs-confirmation',
+      text: 'requires host approval before write',
+      nextActionHint: 'Approve demo.echo for unit test',
+    });
+    expect(envelope.diagnostics.blockedTools).toEqual([]);
+    expect(envelope.diagnostics.gateFailures).toEqual([
+      {
+        stage: 'approve',
+        action: 'needs-confirmation',
+        reason: 'requires host approval before write',
+      },
+    ]);
+    expect(adapterCalled).toBe(false);
+    expect(recorded).toHaveLength(1);
+  });
+
   it('blocks tools on unsupported surfaces', async () => {
     const catalog = new CapabilityCatalog([createManifest({ surfaces: ['runtime'] })]);
     const router = new LightweightRouter({ catalog });

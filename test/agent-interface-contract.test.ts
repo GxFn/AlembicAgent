@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
+  AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,
   getAgentInterfaceContractBranch,
@@ -41,11 +42,14 @@ function createPartialEnvelope(): ToolResultEnvelope<{ completed: number; failed
   };
 }
 
-describe('AlembicAgent D5 interface contract', () => {
-  it('covers every D1 Agent-owned row and D5 result branch', () => {
+describe('AlembicAgent D10 interface contract rewrite', () => {
+  it('covers every D1 Agent-owned row and D10 result branch', () => {
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.rows).toEqual(AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS);
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((fixture) => fixture.branch)).toEqual(
       AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES
+    );
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.activeRewriteDemandKey).toBe(
+      'alembic-interface-contract-d10-agent-runtime-legacy-rewrite-2026-06-10'
     );
     expect(validateAgentInterfaceContract()).toEqual([]);
   });
@@ -77,6 +81,87 @@ describe('AlembicAgent D5 interface contract', () => {
     expect(envelope.ok).toBe(true);
     expect(envelope.status).toBe('partial');
     expect(envelope.structuredContent).toEqual({ completed: 1, failed: 1 });
+  });
+
+  it('keeps confirmation requests and host failures as distinct non-success branches', () => {
+    const confirmation = getAgentInterfaceContractBranch('needs-confirmation');
+    const hostFailure = getAgentInterfaceContractBranch('host-failure');
+
+    expect(confirmation).toMatchObject({
+      toolStatus: 'needs-confirmation',
+      ok: false,
+      errorKind: 'confirmation-required',
+      hostAdapterPath: 'approval-ui-required',
+    });
+    expect(confirmation?.providerPublicFields).toEqual(
+      expect.arrayContaining(['confirmationMessage', 'requestId'])
+    );
+    expect(confirmation?.hiddenProviderFields).toEqual(
+      expect.arrayContaining(['rawPolicyContext', 'hostCredential', 'threadId'])
+    );
+
+    expect(hostFailure).toMatchObject({
+      boundaryArea: 'host-agent-route',
+      toolStatus: 'error',
+      ok: false,
+      errorKind: 'host-failure',
+      hostAdapterPath: 'host-adapter-exception',
+    });
+    expect(hostFailure?.providerPublicFields).toEqual(
+      expect.arrayContaining(['hostAction', 'errorClass'])
+    );
+    expect(hostFailure?.hiddenProviderFields).toEqual(
+      expect.arrayContaining(['threadId', 'hostCredential', 'rawHostError'])
+    );
+  });
+
+  it('documents D10 legacy rewrite candidates without making old fields ordinary output', () => {
+    const publicFixtureFields = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.flatMap((fixture) => [
+      ...fixture.providerPublicFields,
+      ...fixture.observabilityKeys,
+    ]);
+
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.forbiddenOrdinaryOutputFields).toEqual(
+      AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS
+    );
+    for (const field of AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
+      expect(publicFixtureFields).not.toContain(field);
+    }
+
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates.map((item) => item.id)).toEqual(
+      ['D10-A01', 'D10-A02', 'D10-A03', 'D10-A04']
+    );
+    for (const candidate of ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates) {
+      expect(candidate.cleanupTrigger.length).toBeGreaterThan(20);
+      expect(candidate.fieldDispositions.length).toBeGreaterThan(0);
+      expect(candidate.validationRefs.length).toBeGreaterThan(0);
+    }
+
+    const publicDispositions = ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates.flatMap(
+      (candidate) => candidate.fieldDispositions.filter((rule) => rule.publicSurface)
+    );
+    expect(publicDispositions.map((rule) => rule.field)).toEqual(
+      expect.arrayContaining(['errorClass', 'reasoningContentOmitted'])
+    );
+    expect(publicDispositions.map((rule) => rule.field)).not.toContain('rawProviderResponse');
+  });
+
+  it('records Alembic consumer impact notes while leaving consumer edits downstream', () => {
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerImpactNotes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          consumer: 'Alembic',
+          seam: '@alembic/agent/runtime',
+          invalidLegacyShape: expect.stringContaining('success'),
+          downstreamAction: expect.stringContaining('D10 does not edit Alembic'),
+        }),
+        expect.objectContaining({
+          consumer: 'Alembic',
+          seam: '@alembic/agent/ai',
+          invalidLegacyShape: expect.stringContaining('rawProviderResponse'),
+        }),
+      ])
+    );
   });
 
   it('maps host adapter paths to runtime boundary ownership instead of Plugin routes', () => {
