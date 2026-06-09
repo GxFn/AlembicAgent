@@ -213,6 +213,29 @@ describe('LightweightRouter', () => {
     expect(calls[0].decision.preview).toMatchObject({ kind: 'internal-tool' });
   });
 
+  it('allows adapters to return partial result envelopes as explicit partial success', async () => {
+    const catalog = new CapabilityCatalog([createManifest()]);
+    const router = new LightweightRouter({
+      catalog,
+      adapters: [
+        createAdapter(async (request) => ({
+          ...createSuccessEnvelope(request, 'partial output available'),
+          status: 'partial',
+          structuredContent: { completed: 1, failed: 1 },
+        })),
+      ],
+    });
+
+    const envelope = await router.execute(createRequest());
+
+    expect(envelope).toMatchObject({
+      ok: true,
+      status: 'partial',
+      structuredContent: { completed: 1, failed: 1 },
+    });
+    expect(isToolResultEnvelope(envelope)).toBe(true);
+  });
+
   it('blocks tool calls denied by runtime policy before adapter execution', async () => {
     const catalog = new CapabilityCatalog([createManifest()]);
     let adapterCalled = false;

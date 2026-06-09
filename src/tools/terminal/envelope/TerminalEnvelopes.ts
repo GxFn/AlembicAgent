@@ -58,7 +58,7 @@ export function envelopeForTerminalResult(
   structuredContent: Record<string, unknown>,
   artifacts: ToolArtifactRef[] = []
 ): ToolResultEnvelope {
-  const ok = status === 'success';
+  const ok = status === 'success' || status === 'partial';
   const text = ok
     ? `Terminal command completed: ${String(structuredContent.bin)}`
     : `Terminal command failed: ${String(structuredContent.bin)}`;

@@ -1,4 +1,18 @@
 export { AgentEventBus, AgentEvents } from './AgentEventBus.js';
+export type {
+  AgentInterfaceContractBranch,
+  AgentInterfaceContractBranchFixture,
+  AgentInterfaceContractErrorKind,
+  AgentInterfaceContractManifest,
+  AgentInterfaceContractRowId,
+} from './AgentInterfaceContract.js';
+export {
+  AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
+  AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
+  ALEMBIC_AGENT_INTERFACE_CONTRACT,
+  getAgentInterfaceContractBranch,
+  validateAgentInterfaceContract,
+} from './AgentInterfaceContract.js';
 export { AgentMessage, Channel } from './AgentMessage.js';
 export { AgentRuntime } from './AgentRuntime.js';
 export type {

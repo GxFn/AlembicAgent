@@ -22,9 +22,20 @@ describe('explicit AlembicAgent contract subpaths', () => {
     expect(typeof runtime.ToolExecutionPipeline).toBe('function');
     expect(typeof runtime.BudgetController).toBe('function');
     expect(typeof runtime.DiagnosticsCollector).toBe('function');
+    expect(typeof runtime.validateAgentInterfaceContract).toBe('function');
     expect(typeof runtime.createSystemRunContext).toBe('function');
     expect(typeof runtime.cleanFinalAnswer).toBe('function');
     expect(typeof runtime.produceForcedSummary).toBe('function');
+    expect(runtime.ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((item) => item.branch)).toEqual([
+      'success',
+      'failure',
+      'cancellation',
+      'timeout',
+      'permission-denial',
+      'partial-result',
+      'provider-error',
+      'host-adapter',
+    ]);
     expect(runtime.MAX_TOOL_CALLS_PER_ITER).toBeGreaterThan(0);
   });
 

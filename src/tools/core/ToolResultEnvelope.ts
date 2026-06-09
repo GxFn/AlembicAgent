@@ -1,5 +1,6 @@
 export type ToolResultStatus =
   | 'success'
+  | 'partial'
   | 'error'
   | 'blocked'
   | 'aborted'

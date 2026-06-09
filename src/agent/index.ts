@@ -63,9 +63,21 @@ export {
 // ── Presets ──
 export { getPreset, PRESETS, resolveStrategy } from './profiles/presets.js';
 export { AgentEventBus, AgentEvents } from './runtime/AgentEventBus.js';
+export {
+  AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
+  AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
+  ALEMBIC_AGENT_INTERFACE_CONTRACT,
+  getAgentInterfaceContractBranch,
+  validateAgentInterfaceContract,
+} from './runtime/AgentInterfaceContract.js';
 export { AgentMessage, Channel } from './runtime/AgentMessage.js';
 // ── Core ──
 export { AgentRuntime } from './runtime/AgentRuntime.js';
+export {
+  ALEMBIC_AGENT_RUNTIME_BOUNDARY,
+  getAgentRuntimeBoundaryEntry,
+  supportsAgentRuntimeRoute,
+} from './runtime/AgentRuntimeBoundary.js';
 // ── Infrastructure ──
 export { AgentPhase, AgentState } from './runtime/AgentState.js';
 export { AgentRouter, PresetName } from './service/AgentRouter.js';
