@@ -18,7 +18,12 @@
  */
 
 import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
-import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import type { ToolCallRequest } from '#tools/core/ToolContracts.js';
+import {
+  projectToolResultOrdinaryOutput,
+  type ToolResultEnvelope,
+  type ToolResultStatus,
+} from '#tools/core/ToolResultEnvelope.js';
 import { SafetyPolicy } from '../policies/index.js';
 import type { AgentRuntime } from './AgentRuntime.js';
 import type { LoopContext } from './LoopContext.js';
@@ -69,6 +74,13 @@ function diagnosticReason(result: unknown) {
   return 'blocked';
 }
 
+function projectPipelineToolResult(envelope: ToolResultEnvelope): unknown {
+  if (envelope.structuredContent !== undefined) {
+    return envelope.structuredContent;
+  }
+  return projectToolResultOrdinaryOutput(envelope);
+}
+
 function isDirectNoteFindingCall(call: ToolCall) {
   return call.name === 'note_finding';
 }
@@ -110,6 +122,11 @@ interface ToolMiddleware {
 interface CachedToolResult {
   result: unknown;
   envelope?: ToolResultEnvelope;
+}
+
+interface ToolPipelineResultState {
+  result: unknown;
+  hasResult: boolean;
 }
 
 interface ToolEfficiencySharedState {
@@ -174,6 +191,13 @@ const SIDE_EFFECT_ACTIONS = new Set([
   'update',
   'validate',
   'write',
+]);
+
+const BLOCKING_ENVELOPE_STATUSES = new Set<ToolResultStatus>([
+  'blocked',
+  'needs-confirmation',
+  'aborted',
+  'timeout',
 ]);
 
 function getToolAction(call: ToolCall): string {
@@ -297,6 +321,157 @@ function buildCacheKey(call: ToolCall, ctx: ToolExecContext): string {
   });
 }
 
+async function runBeforeMiddlewares(
+  middlewares: readonly ToolMiddleware[],
+  call: ToolCall,
+  context: ToolExecContext,
+  metadata: ToolMetadata
+): Promise<ToolPipelineResultState> {
+  for (const mw of middlewares) {
+    if (!mw.before) {
+      continue;
+    }
+    const verdict = await mw.before(call, context, metadata);
+    if (verdict?.blocked) {
+      metadata.blocked = true;
+      context.loopCtx.diagnostics?.recordBlockedTool(call.name, diagnosticReason(verdict.result));
+      return { result: verdict.result, hasResult: true };
+    }
+    if (verdict?.result !== undefined) {
+      metadata.cacheHit = true;
+      return { result: verdict.result, hasResult: true };
+    }
+  }
+
+  return { result: null, hasResult: false };
+}
+
+async function executeRuntimeToolCall(
+  call: ToolCall,
+  context: ToolExecContext,
+  metadata: ToolMetadata
+): Promise<unknown> {
+  const t0 = Date.now();
+  try {
+    const envelope = await context.runtime.toolRouter.execute(
+      buildRuntimeToolCallRequest(call, context)
+    );
+    recordExecutedEnvelope(call, context, metadata, envelope);
+    return projectPipelineToolResult(envelope);
+  } catch (err: unknown) {
+    return { error: (err as Error).message };
+  } finally {
+    metadata.durationMs = Date.now() - t0;
+  }
+}
+
+function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): ToolCallRequest {
+  const { runtime, loopCtx } = context;
+  const executableCall = toExecutableToolCall(call);
+  const safetyPolicy = runtime.policies.get?.(SafetyPolicy) || null;
+
+  return {
+    toolId: executableCall.name,
+    args: executableCall.args,
+    surface: 'runtime',
+    actor: { role: 'developer', user: runtime.id },
+    source: {
+      kind: 'runtime',
+      name: resolvePipelineSourceName(context),
+    },
+    abortSignal: loopCtx.abortSignal || null,
+    runtime: {
+      agentId: runtime.id,
+      presetName: runtime.presetName,
+      iteration: loopCtx.iteration || 0,
+      policyValidator: runtime.policies,
+      cache: loopCtx.memoryCoordinator || null,
+      diagnostics: loopCtx.diagnostics || null,
+      safetyPolicy,
+      fileCache: runtime.fileCache,
+      dataRoot: runtime.dataRoot,
+      lang: runtime.lang,
+      logger: runtime.logger || null,
+      aiProvider: runtime.aiProvider || null,
+      sharedState: loopCtx.sharedState || null,
+      dimensionMeta: loopCtx.sharedState?._dimensionMeta || null,
+      projectLanguage: resolveProjectLanguage(loopCtx),
+      submittedTitles: loopCtx.sharedState?.submittedTitles || null,
+      submittedPatterns: loopCtx.sharedState?.submittedPatterns || null,
+      submittedTriggers: loopCtx.sharedState?.submittedTriggers || null,
+      sessionToolCalls: projectSessionToolCalls(loopCtx),
+      bootstrapDedup: loopCtx.sharedState?._bootstrapDedup || null,
+      memoryCoordinator: loopCtx.memoryCoordinator || null,
+      dimensionScopeId: resolveDimensionScopeId(loopCtx),
+      currentRound: loopCtx.iteration || 0,
+    },
+  };
+}
+
+function resolvePipelineSourceName({ runtime, loopCtx }: ToolExecContext): string {
+  if (typeof loopCtx.context?.pipelinePhase === 'string') {
+    return loopCtx.context.pipelinePhase;
+  }
+  return loopCtx.source || runtime.presetName;
+}
+
+function resolveProjectLanguage(loopCtx: LoopContext): string | null {
+  const language = loopCtx.sharedState?._projectLanguage;
+  return typeof language === 'string' ? language : null;
+}
+
+function resolveDimensionScopeId(loopCtx: LoopContext): string | null {
+  const scopeId = loopCtx.sharedState?._dimensionScopeId;
+  return typeof scopeId === 'string' ? scopeId : null;
+}
+
+function projectSessionToolCalls(
+  loopCtx: LoopContext
+): Array<{ tool: string; params?: Record<string, unknown> }> | null {
+  if (!Array.isArray(loopCtx.toolCalls)) {
+    return null;
+  }
+
+  return loopCtx.toolCalls.map((entry: { tool?: string; args?: unknown }) => ({
+    tool: String(entry.tool || ''),
+    params:
+      entry.args && typeof entry.args === 'object'
+        ? (entry.args as Record<string, unknown>)
+        : undefined,
+  }));
+}
+
+function recordExecutedEnvelope(
+  call: ToolCall,
+  context: ToolExecContext,
+  metadata: ToolMetadata,
+  envelope: ToolResultEnvelope
+): void {
+  metadata.envelope = envelope;
+  metadata.cacheHit = envelope.cache?.hit === true;
+  if (envelope.cache && envelope.cache.policy !== 'none' && envelope.cache.hit !== true) {
+    metadata.cacheMiss = true;
+  }
+  if (!envelope.ok && BLOCKING_ENVELOPE_STATUSES.has(envelope.status)) {
+    metadata.blocked = true;
+    context.loopCtx.diagnostics?.recordBlockedTool(call.name, envelope.text);
+  }
+}
+
+async function runAfterMiddlewares(
+  middlewares: readonly ToolMiddleware[],
+  call: ToolCall,
+  result: unknown,
+  context: ToolExecContext,
+  metadata: ToolMetadata
+): Promise<void> {
+  for (const mw of middlewares) {
+    if (mw.after) {
+      await mw.after(call, result, context, metadata);
+    }
+  }
+}
+
 export class ToolExecutionPipeline {
   #middlewares: ToolMiddleware[] = [];
 
@@ -319,119 +494,14 @@ export class ToolExecutionPipeline {
    * @returns >}
    */
   async execute(call: ToolCall, context: ToolExecContext) {
-    let toolResult: unknown = null;
-    let hasToolResult = false;
     const metadata: ToolMetadata = { cacheHit: false, blocked: false, isNew: false, durationMs: 0 };
 
-    // ── before 阶段 ──
-    for (const mw of this.#middlewares) {
-      if (mw.before) {
-        const verdict = await mw.before(call, context, metadata);
-        if (verdict?.blocked) {
-          toolResult = verdict.result;
-          hasToolResult = true;
-          metadata.blocked = true;
-          context.loopCtx.diagnostics?.recordBlockedTool(call.name, diagnosticReason(toolResult));
-          break;
-        }
-        if (verdict?.result !== undefined) {
-          toolResult = verdict.result;
-          hasToolResult = true;
-          metadata.cacheHit = true;
-          break;
-        }
-      }
-    }
+    const beforeState = await runBeforeMiddlewares(this.#middlewares, call, context, metadata);
+    const toolResult = beforeState.hasResult
+      ? beforeState.result
+      : await executeRuntimeToolCall(call, context, metadata);
 
-    // ── execute 阶段 ──
-    if (!hasToolResult) {
-      const t0 = Date.now();
-      try {
-        const { runtime, loopCtx } = context;
-        const executableCall = toExecutableToolCall(call);
-        const safetyPolicy = runtime.policies.get?.(SafetyPolicy) || null;
-        const envelope = await runtime.toolRouter.execute({
-          toolId: executableCall.name,
-          args: executableCall.args,
-          surface: 'runtime',
-          actor: { role: 'developer', user: runtime.id },
-          source: {
-            kind: 'runtime',
-            name:
-              typeof loopCtx.context?.pipelinePhase === 'string'
-                ? loopCtx.context.pipelinePhase
-                : loopCtx.source || runtime.presetName,
-          },
-          abortSignal: loopCtx.abortSignal || null,
-          runtime: {
-            agentId: runtime.id,
-            presetName: runtime.presetName,
-            iteration: loopCtx.iteration || 0,
-            policyValidator: runtime.policies,
-            cache: loopCtx.memoryCoordinator || null,
-            diagnostics: loopCtx.diagnostics || null,
-            safetyPolicy,
-            fileCache: runtime.fileCache,
-            dataRoot: runtime.dataRoot,
-            lang: runtime.lang,
-            logger: runtime.logger || null,
-            aiProvider: runtime.aiProvider || null,
-            sharedState: loopCtx.sharedState || null,
-            dimensionMeta: loopCtx.sharedState?._dimensionMeta || null,
-            projectLanguage:
-              typeof loopCtx.sharedState?._projectLanguage === 'string'
-                ? loopCtx.sharedState._projectLanguage
-                : null,
-            submittedTitles: loopCtx.sharedState?.submittedTitles || null,
-            submittedPatterns: loopCtx.sharedState?.submittedPatterns || null,
-            submittedTriggers: loopCtx.sharedState?.submittedTriggers || null,
-            sessionToolCalls: Array.isArray(loopCtx.toolCalls)
-              ? loopCtx.toolCalls.map((entry: { tool?: string; args?: unknown }) => ({
-                  tool: String(entry.tool || ''),
-                  params:
-                    entry.args && typeof entry.args === 'object'
-                      ? (entry.args as Record<string, unknown>)
-                      : undefined,
-                }))
-              : null,
-            bootstrapDedup: loopCtx.sharedState?._bootstrapDedup || null,
-            memoryCoordinator: loopCtx.memoryCoordinator || null,
-            dimensionScopeId:
-              typeof loopCtx.sharedState?._dimensionScopeId === 'string'
-                ? loopCtx.sharedState._dimensionScopeId
-                : null,
-            currentRound: loopCtx.iteration || 0,
-          },
-        });
-        metadata.envelope = envelope;
-        metadata.cacheHit = envelope.cache?.hit === true;
-        if (envelope.cache && envelope.cache.policy !== 'none' && envelope.cache.hit !== true) {
-          metadata.cacheMiss = true;
-        }
-        if (
-          !envelope.ok &&
-          ['blocked', 'needs-confirmation', 'aborted', 'timeout'].includes(envelope.status)
-        ) {
-          metadata.blocked = true;
-          loopCtx.diagnostics?.recordBlockedTool(call.name, envelope.text);
-        }
-        toolResult = !envelope.ok
-          ? { error: envelope.text }
-          : envelope.structuredContent !== undefined
-            ? envelope.structuredContent
-            : { success: true, message: envelope.text };
-      } catch (err: unknown) {
-        toolResult = { error: (err as Error).message };
-      }
-      metadata.durationMs = Date.now() - t0;
-    }
-
-    // ── after 阶段 ──
-    for (const mw of this.#middlewares) {
-      if (mw.after) {
-        await mw.after(call, toolResult, context, metadata);
-      }
-    }
+    await runAfterMiddlewares(this.#middlewares, call, toolResult, context, metadata);
 
     context.loopCtx.diagnostics?.recordEfficiencyToolCall({
       cacheHit: metadata.cacheHit,

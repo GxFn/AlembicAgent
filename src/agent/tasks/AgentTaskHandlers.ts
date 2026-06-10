@@ -5,7 +5,10 @@
  * calls and, for relation discovery, delegate to AgentService.run().
  */
 
-import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import {
+  projectToolResultOrdinaryOutput,
+  type ToolResultEnvelope,
+} from '#tools/core/ToolResultEnvelope.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
 export interface TaskAiProvider {
@@ -287,5 +290,5 @@ function projectTaskToolEnvelope(envelope: ToolResultEnvelope): unknown {
   if (envelope.structuredContent !== undefined) {
     return envelope.structuredContent;
   }
-  return envelope.ok ? { success: true, message: envelope.text } : { error: envelope.text };
+  return projectToolResultOrdinaryOutput(envelope);
 }

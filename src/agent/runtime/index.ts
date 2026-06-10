@@ -1,6 +1,5 @@
 export { AgentEventBus, AgentEvents } from './AgentEventBus.js';
 export type {
-  AgentInterfaceConsumerImpactNote,
   AgentInterfaceContractBranch,
   AgentInterfaceContractBranchFixture,
   AgentInterfaceContractErrorKind,
@@ -9,10 +8,6 @@ export type {
   AgentInterfaceContractRowId,
   AgentInterfaceFailureTaxonomyEntry,
   AgentInterfaceFailureTaxonomyPolicy,
-  AgentInterfaceFieldDisposition,
-  AgentInterfaceFieldDispositionRule,
-  AgentInterfaceLegacyCandidateId,
-  AgentInterfaceLegacyRewriteCandidate,
   AgentInterfaceOrdinaryOutputPolicy,
 } from './AgentInterfaceContract.js';
 export {

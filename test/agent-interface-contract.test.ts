@@ -45,14 +45,11 @@ function createPartialEnvelope(): ToolResultEnvelope<{ completed: number; failed
   };
 }
 
-describe('AlembicAgent D10 interface contract rewrite', () => {
-  it('covers every D1 Agent-owned row and D10 result branch', () => {
+describe('AlembicAgent public interface contract', () => {
+  it('covers every D1 Agent-owned row and canonical result branch', () => {
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.rows).toEqual(AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS);
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((fixture) => fixture.branch)).toEqual(
       AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES
-    );
-    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.activeRewriteDemandKey).toBe(
-      'alembic-interface-contract-d10-agent-runtime-legacy-rewrite-2026-06-10'
     );
     expect(validateAgentInterfaceContract()).toEqual([]);
   });
@@ -118,7 +115,7 @@ describe('AlembicAgent D10 interface contract rewrite', () => {
     );
   });
 
-  it('documents D10 legacy rewrite candidates without making old fields ordinary output', () => {
+  it('keeps legacy compatibility audit fields out of the public contract', () => {
     const publicFixtureFields = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.flatMap((fixture) => [
       ...fixture.providerPublicFields,
       ...fixture.observabilityKeys,
@@ -131,22 +128,9 @@ describe('AlembicAgent D10 interface contract rewrite', () => {
       expect(publicFixtureFields).not.toContain(field);
     }
 
-    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates.map((item) => item.id)).toEqual(
-      ['D10-A01', 'D10-A02', 'D10-A03', 'D10-A04']
-    );
-    for (const candidate of ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates) {
-      expect(candidate.cleanupTrigger.length).toBeGreaterThan(20);
-      expect(candidate.fieldDispositions.length).toBeGreaterThan(0);
-      expect(candidate.validationRefs.length).toBeGreaterThan(0);
-    }
-
-    const publicDispositions = ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates.flatMap(
-      (candidate) => candidate.fieldDispositions.filter((rule) => rule.publicSurface)
-    );
-    expect(publicDispositions.map((rule) => rule.field)).toEqual(
-      expect.arrayContaining(['errorClass', 'reasoningContentOmitted'])
-    );
-    expect(publicDispositions.map((rule) => rule.field)).not.toContain('rawProviderResponse');
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT).not.toHaveProperty('activeRewriteDemandKey');
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT).not.toHaveProperty('legacyRewriteCandidates');
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT).not.toHaveProperty('alembicConsumerImpactNotes');
   });
 
   it('exposes the D23 ordinary output policy for diagnostic cleanup', () => {
@@ -260,24 +244,6 @@ describe('AlembicAgent D10 interface contract rewrite', () => {
         problemClass: 'host-problem',
       },
     });
-  });
-
-  it('records Alembic consumer impact notes while leaving consumer edits downstream', () => {
-    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerImpactNotes).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          consumer: 'Alembic',
-          seam: '@alembic/agent/runtime',
-          invalidLegacyShape: expect.stringContaining('success'),
-          downstreamAction: expect.stringContaining('D10 does not edit Alembic'),
-        }),
-        expect.objectContaining({
-          consumer: 'Alembic',
-          seam: '@alembic/agent/ai',
-          invalidLegacyShape: expect.stringContaining('rawProviderResponse'),
-        }),
-      ])
-    );
   });
 
   it('maps host adapter paths to runtime boundary ownership instead of Plugin routes', () => {

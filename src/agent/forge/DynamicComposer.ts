@@ -11,6 +11,7 @@
 
 import Logger from '@alembic/core/logging';
 import type { ToolRouterContract } from '#tools/core/ToolContracts.js';
+import { projectToolResultOrdinaryOutput } from '#tools/core/ToolResultEnvelope.js';
 import { resolveToolRouterFromContext } from '#tools/core/ToolRoutingServices.js';
 import type { WorkflowHandler, WorkflowHandlerContext } from '#tools/workflow/WorkflowRegistry.js';
 
@@ -214,18 +215,10 @@ async function executeCompositionStep(
     runtime: parentContext.runtime,
   });
 
-  if (envelope.ok) {
-    return envelope.structuredContent !== undefined
-      ? envelope.structuredContent
-      : { success: true, message: envelope.text };
+  if (envelope.structuredContent !== undefined) {
+    return envelope.structuredContent;
   }
-
-  return {
-    error: envelope.text,
-    status: envelope.status,
-    tool,
-    envelope,
-  };
+  return projectToolResultOrdinaryOutput(envelope);
 }
 
 function resolveToolRouter(context: WorkflowHandlerContext): ToolRouterContract | null {

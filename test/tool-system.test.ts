@@ -325,6 +325,31 @@ describe('LightweightRouter', () => {
     }
   });
 
+  it('projects text-only envelopes as canonical ordinary output', () => {
+    const envelope: ToolResultEnvelope = { ...createEnvelopeForStatus('success') };
+    delete envelope.structuredContent;
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected).toMatchObject({
+      ok: true,
+      toolId: 'demo.success',
+      callId: 'call-success',
+      status: 'success',
+      text: 'branch success',
+      diagnosticSummary: {
+        degraded: false,
+        warningCodes: ['success-warning'],
+        redactedFieldCount: 0,
+      },
+    });
+    expect(projected).not.toHaveProperty('structuredContent');
+    expect(projected).not.toHaveProperty('success');
+    expect(projected).not.toHaveProperty('message');
+    expect(projected).not.toHaveProperty('error');
+    expect(projected).not.toHaveProperty('errorCode');
+  });
+
   it('projects D25 failure taxonomy as stable ordinary output metadata', () => {
     const fixture = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.find(
       (item) => item.branch === 'provider-error'

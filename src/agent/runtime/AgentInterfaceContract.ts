@@ -43,42 +43,6 @@ export type AgentInterfaceContractErrorKind =
 
 export type AgentInterfaceContractFailureKind = CoreFieldFailureKind | 'none';
 
-export type AgentInterfaceLegacyCandidateId = 'D10-A01' | 'D10-A02' | 'D10-A03' | 'D10-A04';
-
-export type AgentInterfaceFieldDisposition =
-  | 'public-contract'
-  | 'diagnostic-only'
-  | 'provider-private'
-  | 'compatibility-private'
-  | 'artifact-ref-only'
-  | 'preserve-with-cleanup-trigger';
-
-export interface AgentInterfaceFieldDispositionRule {
-  readonly field: string;
-  readonly disposition: AgentInterfaceFieldDisposition;
-  readonly publicSurface: boolean;
-  readonly reason: string;
-}
-
-export interface AgentInterfaceLegacyRewriteCandidate {
-  readonly id: AgentInterfaceLegacyCandidateId;
-  readonly oldEntrypoint: string;
-  readonly currentCompatibilityOwner: string;
-  readonly replacementContract: string;
-  readonly fieldDispositions: readonly AgentInterfaceFieldDispositionRule[];
-  readonly validationRefs: readonly string[];
-  readonly cleanupTrigger: string;
-}
-
-export interface AgentInterfaceConsumerImpactNote {
-  readonly consumer: 'Alembic';
-  readonly seam: string;
-  readonly expects: string;
-  readonly invalidLegacyShape: string;
-  readonly agentEvidence: string;
-  readonly downstreamAction: string;
-}
-
 export interface AgentInterfaceOrdinaryOutputPolicy {
   readonly demandKey: 'alembic-interface-contract-d23-agent-result-diagnostic-content-cleanup-2026-06-10';
   readonly forbiddenFields: readonly string[];
@@ -126,15 +90,12 @@ export interface AgentInterfaceContractBranchFixture {
 export interface AgentInterfaceContractManifest {
   readonly contractId: 'alembic-agent-d5-runtime-tools';
   readonly demandKey: 'alembic-interface-contract-d5-agent-runtime-tools-2026-06-09';
-  readonly activeRewriteDemandKey: 'alembic-interface-contract-d10-agent-runtime-legacy-rewrite-2026-06-10';
   readonly rows: readonly AgentInterfaceContractRowId[];
   readonly branches: readonly AgentInterfaceContractBranchFixture[];
   readonly alembicConsumerSeams: readonly string[];
   readonly forbiddenOrdinaryOutputFields: readonly string[];
   readonly ordinaryOutputPolicy: AgentInterfaceOrdinaryOutputPolicy;
   readonly failureTaxonomyPolicy: AgentInterfaceFailureTaxonomyPolicy;
-  readonly legacyRewriteCandidates: readonly AgentInterfaceLegacyRewriteCandidate[];
-  readonly alembicConsumerImpactNotes: readonly AgentInterfaceConsumerImpactNote[];
 }
 
 export const AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES = Object.freeze([
@@ -365,148 +326,9 @@ const BRANCH_FIXTURES = [
   },
 ] as const satisfies readonly AgentInterfaceContractBranchFixture[];
 
-const LEGACY_REWRITE_CANDIDATES = [
-  {
-    id: 'D10-A01',
-    oldEntrypoint: 'AiProvider.ApiResponse raw provider response bag',
-    currentCompatibilityOwner: 'provider-private adapters and transports',
-    replacementContract:
-      'Provider public output exposes text, functionCalls, usage, finishReason, provider/model usageSource, and stable errorClass only.',
-    fieldDispositions: [
-      {
-        field: 'rawProviderRequest',
-        disposition: 'provider-private',
-        publicSurface: false,
-        reason: 'Request payloads may contain credentials, prompts, or provider-private options.',
-      },
-      {
-        field: 'rawProviderResponse',
-        disposition: 'provider-private',
-        publicSurface: false,
-        reason: 'Provider payloads stay behind adapter boundaries and are never ordinary output.',
-      },
-      {
-        field: 'errorClass',
-        disposition: 'public-contract',
-        publicSurface: true,
-        reason: 'Consumers need stable failure classification without provider internals.',
-      },
-    ],
-    validationRefs: ['test/agent-interface-contract.test.ts', 'test/ai-provider.test.ts'],
-    cleanupTrigger:
-      'Delete raw-bag propagation only after provider adapters no longer require private transport payload retention.',
-  },
-  {
-    id: 'D10-A02',
-    oldEntrypoint: 'DeepSeek text <function_calls> compatibility parser',
-    currentCompatibilityOwner: 'DeepSeek provider compatibility branch',
-    replacementContract:
-      'Native tool calls and compat text tool calls remain distinguishable by call id prefix and allowed-tool filtering.',
-    fieldDispositions: [
-      {
-        field: 'call_deepseek_compat_*',
-        disposition: 'compatibility-private',
-        publicSurface: false,
-        reason:
-          'Compat call ids identify parser-originated calls and must not be reported as native support.',
-      },
-      {
-        field: '<function_calls>',
-        disposition: 'compatibility-private',
-        publicSurface: false,
-        reason: 'Provider text markup is a compatibility input, not ordinary result output.',
-      },
-    ],
-    validationRefs: ['test/DeepSeekTransport.test.ts', 'test/DeepSeekProvider.test.ts'],
-    cleanupTrigger:
-      'Remove when DeepSeek no longer emits supported text tool-call markup for current Agent transports.',
-  },
-  {
-    id: 'D10-A03',
-    oldEntrypoint: 'UnifiedToolCatalog compatibility stores',
-    currentCompatibilityOwner: 'Agent runtime tool discovery and internal handler execution',
-    replacementContract:
-      'Public ToolCapabilityManifest discovery is first-class; handler stores remain internal compatibility routes with current consumers.',
-    fieldDispositions: [
-      {
-        field: 'InternalToolHandlerStore',
-        disposition: 'preserve-with-cleanup-trigger',
-        publicSurface: false,
-        reason: 'Runtime handler lookup still consumes this internal store shape.',
-      },
-      {
-        field: 'ForgedInternalToolStore',
-        disposition: 'preserve-with-cleanup-trigger',
-        publicSurface: false,
-        reason: 'Temporary tool forge still needs an internal projection route.',
-      },
-    ],
-    validationRefs: ['test/tool-system.test.ts', 'test/contract-surface.test.ts'],
-    cleanupTrigger:
-      'Delete only after runtime tool discovery and forged-tool execution use a replacement public manifest route.',
-  },
-  {
-    id: 'D10-A04',
-    oldEntrypoint: 'Hidden reasoning round-trip fields',
-    currentCompatibilityOwner: 'DeepSeek transport round-trip and runtime diagnostic metadata',
-    replacementContract:
-      'Hidden reasoning is retained only for provider round-trip or diagnostic counts; public output exposes omission metadata, not raw reasoning.',
-    fieldDispositions: [
-      {
-        field: 'reasoningContent',
-        disposition: 'provider-private',
-        publicSurface: false,
-        reason:
-          'Reasoning content may be required for provider round-trip but must not enter public output text.',
-      },
-      {
-        field: 'reasoning_content',
-        disposition: 'provider-private',
-        publicSurface: false,
-        reason: 'Provider-native reasoning field is transport-private.',
-      },
-      {
-        field: 'reasoningContentOmitted',
-        disposition: 'diagnostic-only',
-        publicSurface: true,
-        reason: 'Consumers can observe omission without receiving hidden reasoning text.',
-      },
-    ],
-    validationRefs: ['test/AgentRuntime.test.ts', 'test/DeepSeekTransport.test.ts'],
-    cleanupTrigger:
-      'Preserve provider round-trip fields while DeepSeek V4 requires them for complete tool-call rounds.',
-  },
-] as const satisfies readonly AgentInterfaceLegacyRewriteCandidate[];
-
-const ALEMBIC_CONSUMER_IMPACT_NOTES = [
-  {
-    consumer: 'Alembic',
-    seam: '@alembic/agent/runtime',
-    expects:
-      'ToolResultEnvelope.status distinguishes success, partial, error, blocked, aborted, timeout, and needs-confirmation.',
-    invalidLegacyShape: '{ success, errorCode, message, data: { result } }',
-    agentEvidence:
-      'AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES and tool-system tests cover non-success envelopes without collapsing them into generic errors.',
-    downstreamAction:
-      'D11/D14 may replay Alembic provider consumers against these statuses; D10 does not edit Alembic consumer code.',
-  },
-  {
-    consumer: 'Alembic',
-    seam: '@alembic/agent/ai',
-    expects:
-      'Provider outputs expose public fields and stable errorClass while private payloads remain adapter-local.',
-    invalidLegacyShape: '{ rawProviderResponse, reasoningContent, apiKey }',
-    agentEvidence:
-      'D10 legacy rewrite candidates classify raw provider bags and hidden reasoning as private or diagnostic-only.',
-    downstreamAction:
-      'Alembic-side provider route cleanup remains downstream and must prove no consumer still expects legacy raw fields.',
-  },
-] as const satisfies readonly AgentInterfaceConsumerImpactNote[];
-
 export const ALEMBIC_AGENT_INTERFACE_CONTRACT = Object.freeze({
   contractId: 'alembic-agent-d5-runtime-tools',
   demandKey: 'alembic-interface-contract-d5-agent-runtime-tools-2026-06-09',
-  activeRewriteDemandKey: 'alembic-interface-contract-d10-agent-runtime-legacy-rewrite-2026-06-10',
   rows: AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
   branches: BRANCH_FIXTURES,
   alembicConsumerSeams: [
@@ -520,8 +342,6 @@ export const ALEMBIC_AGENT_INTERFACE_CONTRACT = Object.freeze({
   forbiddenOrdinaryOutputFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ordinaryOutputPolicy: AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
   failureTaxonomyPolicy: AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY,
-  legacyRewriteCandidates: LEGACY_REWRITE_CANDIDATES,
-  alembicConsumerImpactNotes: ALEMBIC_CONSUMER_IMPACT_NOTES,
 }) satisfies AgentInterfaceContractManifest;
 
 export function getAgentInterfaceFailureTaxonomyEntry(
@@ -546,8 +366,6 @@ export function validateAgentInterfaceContract(): string[] {
   validateBranchFixtures(failures);
   validateOrdinaryOutputPolicy(failures);
   validateFailureTaxonomyPolicy(failures);
-  validateLegacyCandidates(failures);
-  validateConsumerImpactNotes(failures);
   return failures;
 }
 
@@ -708,31 +526,5 @@ function validateOrdinaryOutputPolicy(failures: string[]): void {
     !ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.refFields.includes('resources')
   ) {
     failures.push('ordinary output policy must preserve artifact and resource refs');
-  }
-}
-
-function validateLegacyCandidates(failures: string[]): void {
-  for (const candidate of ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates) {
-    const fieldDispositions: readonly AgentInterfaceFieldDispositionRule[] =
-      candidate.fieldDispositions;
-    const validationRefs: readonly string[] = candidate.validationRefs;
-
-    if (fieldDispositions.length === 0) {
-      failures.push(`legacy candidate ${candidate.id} has no field dispositions`);
-    }
-    if (validationRefs.length === 0) {
-      failures.push(`legacy candidate ${candidate.id} has no validation refs`);
-    }
-    if (candidate.cleanupTrigger.trim().length === 0) {
-      failures.push(`legacy candidate ${candidate.id} has no cleanup trigger`);
-    }
-  }
-}
-
-function validateConsumerImpactNotes(failures: string[]): void {
-  for (const note of ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerImpactNotes) {
-    if (!ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerSeams.includes(note.seam)) {
-      failures.push(`Alembic consumer impact note references unknown seam: ${note.seam}`);
-    }
   }
 }
