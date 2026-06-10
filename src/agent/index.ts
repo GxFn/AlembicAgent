@@ -67,9 +67,11 @@ export {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
   AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
+  AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY,
   AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   getAgentInterfaceContractBranch,
+  getAgentInterfaceFailureTaxonomyEntry,
   validateAgentInterfaceContract,
 } from './runtime/AgentInterfaceContract.js';
 export { AgentMessage, Channel } from './runtime/AgentMessage.js';

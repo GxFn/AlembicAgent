@@ -4,8 +4,11 @@ export type {
   AgentInterfaceContractBranch,
   AgentInterfaceContractBranchFixture,
   AgentInterfaceContractErrorKind,
+  AgentInterfaceContractFailureKind,
   AgentInterfaceContractManifest,
   AgentInterfaceContractRowId,
+  AgentInterfaceFailureTaxonomyEntry,
+  AgentInterfaceFailureTaxonomyPolicy,
   AgentInterfaceFieldDisposition,
   AgentInterfaceFieldDispositionRule,
   AgentInterfaceLegacyCandidateId,
@@ -16,9 +19,11 @@ export {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
   AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
+  AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY,
   AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   getAgentInterfaceContractBranch,
+  getAgentInterfaceFailureTaxonomyEntry,
   validateAgentInterfaceContract,
 } from './AgentInterfaceContract.js';
 export { AgentMessage, Channel } from './AgentMessage.js';

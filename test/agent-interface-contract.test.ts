@@ -4,10 +4,12 @@ import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
   AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
+  AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY,
   AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,
   getAgentInterfaceContractBranch,
+  getAgentInterfaceFailureTaxonomyEntry,
   supportsAgentRuntimeRoute,
   type ToolResultEnvelope,
   validateAgentInterfaceContract,
@@ -166,6 +168,98 @@ describe('AlembicAgent D10 interface contract rewrite', () => {
         'redactedFieldCount',
       ])
     );
+  });
+
+  it('exposes the D25 Core-derived failure taxonomy policy', () => {
+    const requiredKinds = [
+      'invalid-input',
+      'not-found',
+      'conflict',
+      'permission-denied',
+      'timeout',
+      'cancelled',
+      'unavailable',
+      'degraded',
+      'partial',
+      'capability-mismatch',
+      'needs-confirmation',
+      'provider-error',
+      'host-failure',
+      'internal-error',
+    ];
+
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.failureTaxonomyPolicy).toBe(
+      AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY
+    );
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.failureTaxonomyPolicy).toMatchObject({
+      demandKey: 'alembic-interface-contract-d25-error-problem-taxonomy-2026-06-10',
+      coreTaxonomyVersion: 1,
+      ordinaryOutputField: 'failureTaxonomy',
+      privateDataSafe: true,
+    });
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.failureTaxonomyPolicy.requiredFailureKinds).toEqual(
+      requiredKinds
+    );
+
+    const policyKinds = ALEMBIC_AGENT_INTERFACE_CONTRACT.failureTaxonomyPolicy.entries.map(
+      (entry) => entry.kind
+    );
+    expect(policyKinds).toEqual(expect.arrayContaining(requiredKinds));
+    for (const kind of requiredKinds) {
+      const entry = getAgentInterfaceFailureTaxonomyEntry(kind);
+      expect(entry).toMatchObject({
+        kind,
+        stableId: `core.failure.${kind}`,
+        privateDataSafe: true,
+      });
+      expect(entry?.toolStatus).not.toBeNull();
+    }
+  });
+
+  it('maps key Agent branches to stable D25 failure taxonomy without collapsing them', () => {
+    expect(getAgentInterfaceContractBranch('success')).toMatchObject({
+      failureKind: 'none',
+      failureTaxonomy: null,
+    });
+    expect(getAgentInterfaceContractBranch('partial-result')).toMatchObject({
+      toolStatus: 'partial',
+      failureKind: 'partial',
+      failureTaxonomy: {
+        stableId: 'core.failure.partial',
+        agentBranch: 'partial-result',
+        problemClass: 'partial-result',
+      },
+    });
+    expect(getAgentInterfaceContractBranch('needs-confirmation')).toMatchObject({
+      toolStatus: 'needs-confirmation',
+      errorKind: 'confirmation-required',
+      failureKind: 'needs-confirmation',
+      failureTaxonomy: {
+        stableId: 'core.failure.needs-confirmation',
+        agentBranch: 'needs-confirmation',
+        problemClass: 'confirmation-required',
+      },
+    });
+    expect(getAgentInterfaceContractBranch('provider-error')).toMatchObject({
+      toolStatus: 'error',
+      errorKind: 'internal-provider-error',
+      failureKind: 'provider-error',
+      failureTaxonomy: {
+        stableId: 'core.failure.provider-error',
+        agentBranch: 'provider-error',
+        problemClass: 'provider-problem',
+      },
+    });
+    expect(getAgentInterfaceContractBranch('host-failure')).toMatchObject({
+      toolStatus: 'error',
+      errorKind: 'host-failure',
+      failureKind: 'host-failure',
+      failureTaxonomy: {
+        stableId: 'core.failure.host-failure',
+        agentBranch: 'host-failure',
+        problemClass: 'host-problem',
+      },
+    });
   });
 
   it('records Alembic consumer impact notes while leaving consumer edits downstream', () => {

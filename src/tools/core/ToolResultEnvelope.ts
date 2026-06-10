@@ -115,6 +115,18 @@ export interface ToolResultDiagnosticSummary {
   redactedFields: string[];
 }
 
+export interface ToolResultFailureTaxonomy {
+  agentBranch: string;
+  kind: string;
+  privateDataSafe: true;
+  problemClass: string;
+  refPolicy: string;
+  retryPolicy: string;
+  retryable: boolean;
+  stableId: `core.failure.${string}`;
+  status: string;
+}
+
 export interface ToolResultOrdinaryOutput<T = unknown> {
   ok: boolean;
   toolId: string;
@@ -129,11 +141,13 @@ export interface ToolResultOrdinaryOutput<T = unknown> {
   resources?: ToolResourceRef[];
   cache?: ToolResultCacheInfo;
   nextActionHint?: string;
+  failureTaxonomy?: ToolResultFailureTaxonomy;
   diagnosticSummary: ToolResultDiagnosticSummary;
 }
 
 export interface ToolResultOrdinaryOutputProjectionOptions {
   forbiddenFields?: readonly string[];
+  failureTaxonomy?: ToolResultFailureTaxonomy | null;
 }
 
 interface SanitizedValue {
@@ -147,6 +161,7 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
 ): ToolResultOrdinaryOutput {
   const forbiddenFields = options.forbiddenFields ?? TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS;
   const sanitized = sanitizeOrdinaryValue(envelope.structuredContent, forbiddenFields);
+  const failureTaxonomy = options.failureTaxonomy ?? undefined;
   const output: ToolResultOrdinaryOutput = {
     ok: envelope.ok,
     toolId: envelope.toolId,
@@ -165,6 +180,7 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
       : {}),
     ...(envelope.cache ? { cache: envelope.cache } : {}),
     ...(envelope.nextActionHint ? { nextActionHint: envelope.nextActionHint } : {}),
+    ...(failureTaxonomy ? { failureTaxonomy } : {}),
     diagnosticSummary: summarizeToolResultDiagnostics(
       envelope.diagnostics,
       sanitized.redactedFields

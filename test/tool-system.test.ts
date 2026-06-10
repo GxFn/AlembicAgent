@@ -325,6 +325,33 @@ describe('LightweightRouter', () => {
     }
   });
 
+  it('projects D25 failure taxonomy as stable ordinary output metadata', () => {
+    const fixture = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.find(
+      (item) => item.branch === 'provider-error'
+    );
+    const envelope = createEnvelopeForStatus('error');
+    const projected = projectToolResultOrdinaryOutput(envelope, {
+      failureTaxonomy: fixture?.failureTaxonomy,
+    });
+    const projectedKeys = new Set(collectObjectKeys(projected));
+
+    expect(projected.failureTaxonomy).toMatchObject({
+      kind: 'provider-error',
+      stableId: 'core.failure.provider-error',
+      agentBranch: 'provider-error',
+      problemClass: 'provider-problem',
+      privateDataSafe: true,
+    });
+    expect(projected).not.toHaveProperty('diagnostics');
+    expect(projected.structuredContent).toMatchObject({
+      branch: 'error',
+      publicValue: 'kept',
+    });
+    for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
+      expect(projectedKeys.has(field)).toBe(false);
+    }
+  });
+
   it('projects every Agent contract branch without collapsing result status semantics', () => {
     const projectedStatuses = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((fixture) => {
       const status = fixture.toolStatus ?? 'error';
