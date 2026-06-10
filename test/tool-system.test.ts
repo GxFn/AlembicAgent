@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  ALEMBIC_AGENT_INTERFACE_CONTRACT,
   CapabilityCatalog,
   isToolResultEnvelope,
   LightweightRouter,
   presentToolResult,
+  projectToolResultOrdinaryOutput,
+  TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   type ToolCallRequest,
   type ToolCapabilityManifest,
   type ToolDefinitionV2,
@@ -141,6 +144,62 @@ function createAdapter(
   };
 }
 
+function collectObjectKeys(value: unknown, prefix: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectObjectKeys(item, prefix));
+  }
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+
+  return Object.entries(value).flatMap(([key, child]) => {
+    const path = [...prefix, key];
+    return [key, path.join('.'), ...collectObjectKeys(child, path)];
+  });
+}
+
+function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResultEnvelope {
+  const ok = status === 'success' || status === 'partial';
+  return {
+    ok,
+    toolId: `demo.${status}`,
+    callId: `call-${status}`,
+    startedAt: '2026-06-10T00:00:00.000Z',
+    durationMs: 3,
+    status,
+    text: `branch ${status}`,
+    structuredContent: {
+      branch: status,
+      publicValue: 'kept',
+      rawProviderResponse: { token: 'hidden' },
+      data: { result: { rawProviderRequest: { prompt: 'hidden' } }, kept: true },
+      nested: { threadId: 'host-thread', visible: true },
+    },
+    artifacts: [{ id: `artifact-${status}`, kind: 'log', uri: `memory://artifact/${status}` }],
+    resources: [{ uri: `memory://resource/${status}`, title: `${status} resource` }],
+    diagnostics: {
+      degraded: !ok,
+      fallbackUsed: false,
+      warnings: [{ code: `${status}-warning`, message: 'raw warning kept out of projection' }],
+      timedOutStages: status === 'timeout' ? ['execute'] : [],
+      blockedTools: status === 'blocked' ? [{ tool: `demo.${status}`, reason: 'policy' }] : [],
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: status === 'error' ? 1 : 0,
+      gateFailures:
+        status === 'needs-confirmation'
+          ? [{ stage: 'approve', action: 'needs-confirmation', reason: 'approval' }]
+          : [],
+    },
+    trust: {
+      source: 'internal',
+      sanitized: true,
+      containsUntrustedText: false,
+      containsSecrets: false,
+    },
+  };
+}
+
 describe('UnifiedToolCatalog', () => {
   it('projects tool schemas and preserves internal handler access', () => {
     const definition: ToolDefinitionV2 = {
@@ -234,6 +293,65 @@ describe('LightweightRouter', () => {
       structuredContent: { completed: 1, failed: 1 },
     });
     expect(isToolResultEnvelope(envelope)).toBe(true);
+  });
+
+  it('projects ordinary result output without diagnostics or forbidden private fields', () => {
+    const envelope = createEnvelopeForStatus('success');
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    const projectedKeys = new Set(collectObjectKeys(projected));
+
+    expect(projected).toMatchObject({
+      ok: true,
+      status: 'success',
+      text: 'branch success',
+      structuredContent: {
+        branch: 'success',
+        publicValue: 'kept',
+        data: { kept: true },
+        nested: { visible: true },
+      },
+      artifacts: [{ id: 'artifact-success', kind: 'log', uri: 'memory://artifact/success' }],
+      resources: [{ uri: 'memory://resource/success', title: 'success resource' }],
+      diagnosticSummary: {
+        degraded: false,
+        warningCount: 1,
+        warningCodes: ['success-warning'],
+        redactedFieldCount: 3,
+      },
+    });
+    expect(projected).not.toHaveProperty('diagnostics');
+    for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
+      expect(projectedKeys.has(field)).toBe(false);
+    }
+  });
+
+  it('projects every Agent contract branch without collapsing result status semantics', () => {
+    const projectedStatuses = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((fixture) => {
+      const status = fixture.toolStatus ?? 'error';
+      const projected = projectToolResultOrdinaryOutput(createEnvelopeForStatus(status));
+      const projectedKeys = new Set(collectObjectKeys(projected));
+
+      for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
+        expect(projectedKeys.has(field)).toBe(false);
+      }
+      expect(projected.diagnosticSummary.warningCodes).toEqual([`${status}-warning`]);
+      expect(projected.diagnosticSummary.redactedFieldCount).toBeGreaterThan(0);
+
+      return [fixture.branch, projected.status] as const;
+    });
+
+    expect(projectedStatuses).toEqual([
+      ['success', 'success'],
+      ['failure', 'error'],
+      ['cancellation', 'aborted'],
+      ['timeout', 'timeout'],
+      ['permission-denial', 'blocked'],
+      ['needs-confirmation', 'needs-confirmation'],
+      ['partial-result', 'partial'],
+      ['provider-error', 'error'],
+      ['host-failure', 'error'],
+      ['host-adapter', 'error'],
+    ]);
   });
 
   it('blocks tool calls denied by runtime policy before adapter execution', async () => {

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
+  AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
   AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,
@@ -144,6 +145,27 @@ describe('AlembicAgent D10 interface contract rewrite', () => {
       expect.arrayContaining(['errorClass', 'reasoningContentOmitted'])
     );
     expect(publicDispositions.map((rule) => rule.field)).not.toContain('rawProviderResponse');
+  });
+
+  it('exposes the D23 ordinary output policy for diagnostic cleanup', () => {
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy).toBe(
+      AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY
+    );
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy).toMatchObject({
+      demandKey:
+        'alembic-interface-contract-d23-agent-result-diagnostic-content-cleanup-2026-06-10',
+      forbiddenFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
+      refFields: ['artifacts', 'resources'],
+    });
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.diagnosticSummaryKeys).toEqual(
+      expect.arrayContaining([
+        'warningCodes',
+        'timedOutStages',
+        'blockedToolIds',
+        'gateFailureStages',
+        'redactedFieldCount',
+      ])
+    );
   });
 
   it('records Alembic consumer impact notes while leaving consumer edits downstream', () => {

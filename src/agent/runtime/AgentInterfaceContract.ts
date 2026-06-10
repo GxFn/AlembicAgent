@@ -1,4 +1,8 @@
-import type { ToolResultStatus } from '#tools/core/ToolResultEnvelope.js';
+import {
+  TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
+  type ToolResultDiagnosticSummary,
+  type ToolResultStatus,
+} from '#tools/core/ToolResultEnvelope.js';
 import type { AgentRuntimeBoundaryArea } from './AgentRuntimeBoundary.js';
 
 export type AgentInterfaceContractRowId = 'I02' | 'I16' | 'I17' | 'I18';
@@ -65,6 +69,13 @@ export interface AgentInterfaceConsumerImpactNote {
   readonly downstreamAction: string;
 }
 
+export interface AgentInterfaceOrdinaryOutputPolicy {
+  readonly demandKey: 'alembic-interface-contract-d23-agent-result-diagnostic-content-cleanup-2026-06-10';
+  readonly forbiddenFields: readonly string[];
+  readonly diagnosticSummaryKeys: readonly (keyof ToolResultDiagnosticSummary)[];
+  readonly refFields: readonly string[];
+}
+
 export interface AgentInterfaceContractBranchFixture {
   readonly branch: AgentInterfaceContractBranch;
   readonly title: string;
@@ -88,6 +99,7 @@ export interface AgentInterfaceContractManifest {
   readonly branches: readonly AgentInterfaceContractBranchFixture[];
   readonly alembicConsumerSeams: readonly string[];
   readonly forbiddenOrdinaryOutputFields: readonly string[];
+  readonly ordinaryOutputPolicy: AgentInterfaceOrdinaryOutputPolicy;
   readonly legacyRewriteCandidates: readonly AgentInterfaceLegacyRewriteCandidate[];
   readonly alembicConsumerImpactNotes: readonly AgentInterfaceConsumerImpactNote[];
 }
@@ -112,22 +124,31 @@ export const AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS = Object.freeze([
   'I18',
 ] as const satisfies readonly AgentInterfaceContractRowId[]);
 
-export const AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS = Object.freeze([
-  'success',
-  'errorCode',
-  'message',
-  'data.result',
-  'legacyCompatibility',
-  'rawProviderRequest',
-  'rawProviderResponse',
-  'reasoningContent',
-  'reasoning_content',
-  'thoughtSignature',
-  'hiddenReasoning',
-  'apiKey',
-  'hostCredential',
-  'threadId',
-] as const satisfies readonly string[]);
+export const AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS =
+  TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS;
+
+export const AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY = Object.freeze({
+  demandKey: 'alembic-interface-contract-d23-agent-result-diagnostic-content-cleanup-2026-06-10',
+  forbiddenFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
+  diagnosticSummaryKeys: [
+    'degraded',
+    'fallbackUsed',
+    'warningCount',
+    'warningCodes',
+    'timedOutStages',
+    'blockedToolCount',
+    'blockedToolIds',
+    'gateFailureCount',
+    'gateFailureStages',
+    'aiErrorCount',
+    'truncatedToolCalls',
+    'emptyResponses',
+    'toolCallCount',
+    'redactedFieldCount',
+    'redactedFields',
+  ],
+  refFields: ['artifacts', 'resources'],
+} as const satisfies AgentInterfaceOrdinaryOutputPolicy);
 
 const BRANCH_FIXTURES = [
   {
@@ -430,6 +451,7 @@ export const ALEMBIC_AGENT_INTERFACE_CONTRACT = Object.freeze({
     '@alembic/agent/tools/terminal',
   ],
   forbiddenOrdinaryOutputFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
+  ordinaryOutputPolicy: AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY,
   legacyRewriteCandidates: LEGACY_REWRITE_CANDIDATES,
   alembicConsumerImpactNotes: ALEMBIC_CONSUMER_IMPACT_NOTES,
 }) satisfies AgentInterfaceContractManifest;
@@ -442,6 +464,15 @@ export function getAgentInterfaceContractBranch(
 
 export function validateAgentInterfaceContract(): string[] {
   const failures: string[] = [];
+  validateRequiredCoverage(failures);
+  validateBranchFixtures(failures);
+  validateOrdinaryOutputPolicy(failures);
+  validateLegacyCandidates(failures);
+  validateConsumerImpactNotes(failures);
+  return failures;
+}
+
+function validateRequiredCoverage(failures: string[]): void {
   const branchSet = new Set(ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((item) => item.branch));
   const rowSet = new Set(ALEMBIC_AGENT_INTERFACE_CONTRACT.rows);
 
@@ -456,7 +487,9 @@ export function validateAgentInterfaceContract(): string[] {
       failures.push(`missing required D1 row: ${row}`);
     }
   }
+}
 
+function validateBranchFixtures(failures: string[]): void {
   for (const fixture of ALEMBIC_AGENT_INTERFACE_CONTRACT.branches) {
     const providerPublicFields: readonly string[] = fixture.providerPublicFields;
     const hiddenProviderFields: readonly string[] = fixture.hiddenProviderFields;
@@ -485,7 +518,29 @@ export function validateAgentInterfaceContract(): string[] {
       failures.push(`branch ${fixture.branch} has no evidence kind`);
     }
   }
+}
 
+function validateOrdinaryOutputPolicy(failures: string[]): void {
+  if (
+    ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.forbiddenFields !==
+    ALEMBIC_AGENT_INTERFACE_CONTRACT.forbiddenOrdinaryOutputFields
+  ) {
+    failures.push('ordinary output policy must use the contract forbidden field list');
+  }
+  const diagnosticSummaryKeys: readonly (keyof ToolResultDiagnosticSummary)[] =
+    ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.diagnosticSummaryKeys;
+  if (diagnosticSummaryKeys.length === 0) {
+    failures.push('ordinary output policy must name diagnostic summary keys');
+  }
+  if (
+    !ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.refFields.includes('artifacts') ||
+    !ALEMBIC_AGENT_INTERFACE_CONTRACT.ordinaryOutputPolicy.refFields.includes('resources')
+  ) {
+    failures.push('ordinary output policy must preserve artifact and resource refs');
+  }
+}
+
+function validateLegacyCandidates(failures: string[]): void {
   for (const candidate of ALEMBIC_AGENT_INTERFACE_CONTRACT.legacyRewriteCandidates) {
     const fieldDispositions: readonly AgentInterfaceFieldDispositionRule[] =
       candidate.fieldDispositions;
@@ -501,12 +556,12 @@ export function validateAgentInterfaceContract(): string[] {
       failures.push(`legacy candidate ${candidate.id} has no cleanup trigger`);
     }
   }
+}
 
+function validateConsumerImpactNotes(failures: string[]): void {
   for (const note of ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerImpactNotes) {
     if (!ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerSeams.includes(note.seam)) {
       failures.push(`Alembic consumer impact note references unknown seam: ${note.seam}`);
     }
   }
-
-  return failures;
 }

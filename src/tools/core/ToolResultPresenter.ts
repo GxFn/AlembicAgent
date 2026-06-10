@@ -1,7 +1,10 @@
-import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import {
+  projectToolResultOrdinaryOutput,
+  type ToolResultEnvelope,
+} from '#tools/core/ToolResultEnvelope.js';
 
 export function presentToolResult(envelope: ToolResultEnvelope) {
-  return envelope.text;
+  return projectToolResultOrdinaryOutput(envelope).text;
 }
 
 export function isToolResultEnvelope(value: unknown): value is ToolResultEnvelope {
