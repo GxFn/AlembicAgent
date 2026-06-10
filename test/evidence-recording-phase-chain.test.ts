@@ -348,13 +348,14 @@ describe('evidence recording quality gate actions', () => {
       artifact: {
         findings: [
           {
-            evidence: 'lib/bootstrap.ts:12 verifies bootstrap while index.ts:4 is ambiguous.',
+            evidence:
+              'Alembic/lib/bootstrap.ts:12 verifies bootstrap while index.ts:4 is ambiguous.',
             finding: 'Bootstrap source identity verified',
             importance: 8,
           },
         ],
         metadata: { memoryFindingCount: 1 },
-        referencedFiles: ['lib/bootstrap.ts', 'index.ts'],
+        referencedFiles: ['Alembic/lib/bootstrap.ts', 'index.ts'],
       },
       dimId: 'architecture',
       gate: { action: 'pass', pass: true },

@@ -1,10 +1,4 @@
 import { createHash } from 'node:crypto';
-import {
-  buildProjectScopeSourceRefIndex,
-  type CanonicalSourceIdentity,
-  normalizeProjectScopeSourceRef,
-  type ProjectScopeSourceRefIndex,
-} from '@alembic/core';
 import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
@@ -207,6 +201,29 @@ interface QualityReportLike {
   totalScore?: unknown;
 }
 
+interface PcvCanonicalSourceIdentity {
+  absolutePath: string | null;
+  folderDisplayName: string | null;
+  folderId: string | null;
+  folderPath: string | null;
+  folderRelativeRoot: string | null;
+  projectScopeId: string | null;
+  qualifiedPath: string;
+  relativePath: string | null;
+}
+
+interface PcvProjectScopeSourceRefIndex {
+  ambiguousBasenames: ReadonlySet<string>;
+  byBasename: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
+  byQualifiedPath: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
+}
+
+interface PcvNormalizedProjectScopeSourceRef {
+  normalizedRef: string | null;
+  reason: 'ambiguous-basename' | 'not-found' | 'qualified-path' | 'unique-basename';
+  status: 'active' | 'ambiguous' | 'missing';
+}
+
 const FILE_REF_RE =
   /[\w/.-]+\.(?:go|mod|sum|py|pyi|java|kt|kts|js|jsx|ts|tsx|mjs|cjs|swift|m|h|c|cpp|cc|hpp|cs|rb|rs|sql|json|yaml|yml|toml|xml|html|css|scss|less|sh|md|txt|gradle|properties|proto|vue|svelte|graphql|cfg|conf|ini|env|lock|rst)(?::\d+(?:-\d+)?)?\b/gi;
 
@@ -214,32 +231,29 @@ const MAX_SOURCE_REFS = 80;
 const MAX_EVENT_SOURCE_REFS = 24;
 const MAX_GROUNDING_LEDGER = 32;
 const MAX_EVENT_GROUNDING_LEDGER = 8;
-const PCV_SOURCE_REF_INDEX = new WeakMap<PcvNodeEvidenceSummary, ProjectScopeSourceRefIndex>();
+const PCV_SOURCE_REF_INDEX = new WeakMap<PcvNodeEvidenceSummary, PcvProjectScopeSourceRefIndex>();
 
 export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary {
   const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
-  const dimensionId =
-    stringValue(dimensionMeta.id) ||
-    stringValue(ctx.context?.dimensionId) ||
-    stringValue(ctx.context?.dimId) ||
-    null;
-  const targetName =
-    stringValue(dimensionMeta.label) ||
-    stringValue(dimensionMeta.targetName) ||
-    stringValue(ctx.context?.targetName) ||
-    null;
-  const dimensionScopeId =
-    stringValue(ctx.context?.dimensionScopeId) ||
-    stringValue(ctx.sharedState?._dimensionScopeId) ||
-    dimensionId;
+  const dimensionId = firstStringValue(
+    dimensionMeta.id,
+    ctx.context?.dimensionId,
+    ctx.context?.dimId
+  );
+  const targetName = firstStringValue(
+    dimensionMeta.label,
+    dimensionMeta.targetName,
+    ctx.context?.targetName
+  );
+  const dimensionScopeId = firstStringValue(
+    ctx.context?.dimensionScopeId,
+    ctx.sharedState?._dimensionScopeId,
+    dimensionId
+  );
   const pipelinePhase = stringValue(ctx.context?.pipelinePhase) || null;
   const trackerPhase = typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : null;
   const pipelineType = stringValue(valueAt(ctx.tracker, 'pipelineType')) || null;
-  const runId =
-    stringValue(ctx.context?.runId) ||
-    stringValue(ctx.context?.jobId) ||
-    stringValue(ctx.context?.sessionId) ||
-    null;
+  const runId = firstStringValue(ctx.context?.runId, ctx.context?.jobId, ctx.context?.sessionId);
   const mappedIdentity = resolvePcvStageNodeIdentity({
     context: ctx.context,
     pipelinePhase,
@@ -251,21 +265,19 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
   const stageSlug = pipelinePhase || trackerPhase || 'runtime';
   const scopeSlug = dimensionScopeId || dimensionId || targetName || 'unknown';
   const nodeId =
-    mappedIdentity?.nodeId ||
-    stringValue(ctx.context?.pcvNodeId) ||
-    stringValue(ctx.context?.nodeId) ||
-    stringValue(ctx.context?.stageNodeId) ||
-    `agent:${stageSlug}:${scopeSlug}`;
+    firstStringValue(
+      mappedIdentity?.nodeId,
+      ctx.context?.pcvNodeId,
+      ctx.context?.nodeId,
+      ctx.context?.stageNodeId
+    ) || `agent:${stageSlug}:${scopeSlug}`;
   const chainNodeId =
-    mappedIdentity?.chainNodeId || stringValue(ctx.context?.chainNodeId) || nodeId;
+    firstStringValue(mappedIdentity?.chainNodeId, ctx.context?.chainNodeId) || nodeId;
   const rawRepairEvidencePaths = extractSourceRefsFromValue([
     ctx.context?.recordRepairEvidencePaths,
     ctx.sharedState?._recordRepairEvidencePaths,
   ]);
-  const repairAttempted =
-    ctx.sharedState?._recordRepairOnly === true ||
-    ctx.context?.recordRepairOnly === true ||
-    Boolean(pipelinePhase?.includes('record_repair'));
+  const repairAttempted = isPcvRepairAttempted(ctx, pipelinePhase);
 
   const evidence: PcvNodeEvidenceSummary = {
     chainNodeId,
@@ -310,6 +322,14 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
   attachPcvSourceRefIndex(evidence, ctx.context, ctx.sharedState);
   evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(evidence, rawRepairEvidencePaths);
   return evidence;
+}
+
+function isPcvRepairAttempted(ctx: LoopContext, pipelinePhase: string | null): boolean {
+  return (
+    ctx.sharedState?._recordRepairOnly === true ||
+    ctx.context?.recordRepairOnly === true ||
+    Boolean(pipelinePhase?.includes('record_repair'))
+  );
 }
 
 export function recordPcvInputAssembly(
@@ -608,10 +628,7 @@ export function buildPcvQualityGateEvidence({
   stageNodeContext?: JsonRecord | null;
 }): PcvNodeEvidenceSummary {
   const artifactRecord = asRecord(artifact);
-  const sourceEvidence = getPcvNodeEvidence(source);
-  const evidence = sourceEvidence
-    ? cloneEvidence(sourceEvidence)
-    : createFallbackQualityGateEvidence(artifactRecord, dimId || null);
+  const evidence = createQualityGateEvidenceBase(artifactRecord, dimId || null, source);
   attachPcvSourceRefIndex(evidence, stageNodeContext, sharedState, artifactRecord, source);
   const qualityGateIdentity = resolvePcvStageNodeIdentity({
     context: stageNodeContext || artifactRecord,
@@ -622,12 +639,51 @@ export function buildPcvQualityGateEvidence({
     trackerPhase: null,
   });
   applyResolvedStageNodeIdentity(evidence, qualityGateIdentity);
+  const referencedFiles = recordQualityGateReferencedFiles(evidence, artifactRecord);
+  const findings = qualityGateFindings(artifactRecord);
+  recordQualityGateFindings(evidence, findings);
+  applyQualityGateResult(evidence, {
+    artifactRecord,
+    findingCount: findings.length,
+    gate,
+    referencedFileCount: referencedFiles.length,
+  });
+  updateQualityGateStageIdentity(evidence, artifactRecord, dimId || null);
+  updateQualityGateRepairState(evidence);
+  return buildPcvNodeEvidenceSummary(evidence, { requireQualityGate: true });
+}
+
+function createQualityGateEvidenceBase(
+  artifactRecord: JsonRecord,
+  dimId: string | null,
+  source: unknown
+): PcvNodeEvidenceSummary {
+  const sourceEvidence = getPcvNodeEvidence(source);
+  return sourceEvidence
+    ? cloneEvidence(sourceEvidence)
+    : createFallbackQualityGateEvidence(artifactRecord, dimId);
+}
+
+function recordQualityGateReferencedFiles(
+  evidence: PcvNodeEvidenceSummary,
+  artifactRecord: JsonRecord
+): string[] {
   const referencedFiles = normalizeSourceRefsForEvidence(
     evidence,
     stringArray(artifactRecord.referencedFiles)
   );
   addSourceRefs(evidence, referencedFiles);
-  const findings = Array.isArray(artifactRecord.findings) ? artifactRecord.findings : [];
+  return referencedFiles;
+}
+
+function qualityGateFindings(artifactRecord: JsonRecord): unknown[] {
+  return Array.isArray(artifactRecord.findings) ? artifactRecord.findings : [];
+}
+
+function recordQualityGateFindings(
+  evidence: PcvNodeEvidenceSummary,
+  findings: readonly unknown[]
+): void {
   for (const finding of findings) {
     const findingRecord = asRecord(finding);
     const findingText = stringValue(findingRecord.finding) || '';
@@ -647,7 +703,22 @@ export function buildPcvQualityGateEvidence({
       toolName: 'quality_gate',
     });
   }
+}
 
+function applyQualityGateResult(
+  evidence: PcvNodeEvidenceSummary,
+  {
+    artifactRecord,
+    findingCount,
+    gate,
+    referencedFileCount,
+  }: {
+    artifactRecord: JsonRecord;
+    findingCount: number;
+    gate: GateLike;
+    referencedFileCount: number;
+  }
+): void {
   const qualityReport = asQualityReport(artifactRecord.qualityReport);
   const metadata = asRecord(artifactRecord.metadata);
   const pass = gate.pass === true;
@@ -656,35 +727,47 @@ export function buildPcvQualityGateEvidence({
   evidence.qualityGate = {
     action,
     derivedFindingCount: numberValue(metadata.derivedFindingCount) ?? undefined,
-    findingCount: findings.length,
+    findingCount,
     memoryFindingCount: numberValue(metadata.memoryFindingCount) ?? undefined,
     pass,
     reason,
-    referencedFileCount: referencedFiles.length,
+    referencedFileCount,
     scores: qualityReport?.scores,
     stage: 'quality_gate',
     status: pass ? 'pass' : action,
     suggestions: qualityReport?.suggestions,
     totalScore: qualityReport?.totalScore,
   };
+}
+
+function updateQualityGateStageIdentity(
+  evidence: PcvNodeEvidenceSummary,
+  artifactRecord: JsonRecord,
+  dimId: string | null
+): void {
   evidence.stageIdentity.pipelinePhase = 'quality_gate';
   evidence.stageIdentity.stageProfile = evidence.stageIdentity.stageProfile || 'analyze';
   evidence.stageIdentity.dimensionId =
-    evidence.stageIdentity.dimensionId || stringValue(artifactRecord.dimensionId) || dimId || null;
+    evidence.stageIdentity.dimensionId || stringValue(artifactRecord.dimensionId) || dimId;
   evidence.correlation.dimensionId =
     evidence.correlation.dimensionId || evidence.stageIdentity.dimensionId;
-  if (!pass) {
-    evidence.repair.reason = reason;
-    if (action === 'record_repair') {
-      evidence.repair.attempted = true;
-      evidence.repair.status = 'required';
-    } else if (action === 'analysis_retry') {
-      evidence.repair.status = 'analysis-retry-required';
-    } else if (action === 'degrade') {
-      evidence.repair.status = 'rejected';
-    }
+}
+
+function updateQualityGateRepairState(evidence: PcvNodeEvidenceSummary): void {
+  const qualityGate = evidence.qualityGate;
+  if (!qualityGate || qualityGate.pass) {
+    return;
   }
-  return buildPcvNodeEvidenceSummary(evidence, { requireQualityGate: true });
+
+  evidence.repair.reason = qualityGate.reason;
+  if (qualityGate.action === 'record_repair') {
+    evidence.repair.attempted = true;
+    evidence.repair.status = 'required';
+  } else if (qualityGate.action === 'analysis_retry') {
+    evidence.repair.status = 'analysis-retry-required';
+  } else if (qualityGate.action === 'degrade') {
+    evidence.repair.status = 'rejected';
+  }
 }
 
 export function extractSourceRefsFromValue(value: unknown): string[] {
@@ -1005,7 +1088,7 @@ function attachPcvSourceRefIndex(evidence: PcvNodeEvidenceSummary, ...sources: u
   }
 }
 
-function resolvePcvSourceRefIndex(...sources: unknown[]): ProjectScopeSourceRefIndex | null {
+function resolvePcvSourceRefIndex(...sources: unknown[]): PcvProjectScopeSourceRefIndex | null {
   for (const source of sources) {
     const directIndex = findProjectScopeSourceRefIndex(source);
     if (directIndex) {
@@ -1014,10 +1097,10 @@ function resolvePcvSourceRefIndex(...sources: unknown[]): ProjectScopeSourceRefI
   }
 
   const identities = sources.flatMap((source) => collectCanonicalSourceIdentities(source));
-  return identities.length > 0 ? buildProjectScopeSourceRefIndex(identities) : null;
+  return identities.length > 0 ? buildPcvProjectScopeSourceRefIndex(identities) : null;
 }
 
-function findProjectScopeSourceRefIndex(source: unknown): ProjectScopeSourceRefIndex | null {
+function findProjectScopeSourceRefIndex(source: unknown): PcvProjectScopeSourceRefIndex | null {
   const record = asRecord(source);
   const candidates = [
     record.sourceRefIndex,
@@ -1028,7 +1111,7 @@ function findProjectScopeSourceRefIndex(source: unknown): ProjectScopeSourceRefI
   return candidates.find(isProjectScopeSourceRefIndex) ?? null;
 }
 
-function collectCanonicalSourceIdentities(source: unknown): CanonicalSourceIdentity[] {
+function collectCanonicalSourceIdentities(source: unknown): PcvCanonicalSourceIdentity[] {
   const record = asRecord(source);
   const candidates = [
     source,
@@ -1050,21 +1133,18 @@ function collectCanonicalSourceIdentities(source: unknown): CanonicalSourceIdent
     }
     return candidate
       .map((item) => normalizeCanonicalSourceIdentity(item))
-      .filter((item): item is CanonicalSourceIdentity => Boolean(item));
+      .filter((item): item is PcvCanonicalSourceIdentity => Boolean(item));
   });
 }
 
-function normalizeCanonicalSourceIdentity(value: unknown): CanonicalSourceIdentity | null {
+function normalizeCanonicalSourceIdentity(value: unknown): PcvCanonicalSourceIdentity | null {
   const record = asRecord(value);
   const identityRecord =
     Object.keys(asRecord(record.sourceIdentity)).length > 0
       ? asRecord(record.sourceIdentity)
       : record;
-  const legacyPath =
-    stringValue(identityRecord.legacyPath) || stringValue(identityRecord.relativePath);
   const qualifiedPath = stringValue(identityRecord.qualifiedPath);
-  const relativePath = stringValue(identityRecord.relativePath) || legacyPath;
-  if (!legacyPath || !qualifiedPath || !relativePath) {
+  if (!qualifiedPath) {
     return null;
   }
   return {
@@ -1073,11 +1153,83 @@ function normalizeCanonicalSourceIdentity(value: unknown): CanonicalSourceIdenti
     folderId: stringValue(identityRecord.folderId),
     folderPath: stringValue(identityRecord.folderPath),
     folderRelativeRoot: stringValue(identityRecord.folderRelativeRoot),
-    legacyPath,
     projectScopeId: stringValue(identityRecord.projectScopeId),
     qualifiedPath,
-    relativePath,
+    relativePath: stringValue(identityRecord.relativePath),
   };
+}
+
+function buildPcvProjectScopeSourceRefIndex(
+  identities: readonly PcvCanonicalSourceIdentity[]
+): PcvProjectScopeSourceRefIndex {
+  const byQualifiedPath = new Map<string, PcvCanonicalSourceIdentity>();
+  const basenameBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
+
+  for (const identity of identities) {
+    byQualifiedPath.set(normalizePcvSourcePath(identity.qualifiedPath), identity);
+    const basename = sourceRefBasename(identity.qualifiedPath);
+    if (basename) {
+      basenameBuckets.set(basename, [...(basenameBuckets.get(basename) ?? []), identity]);
+    }
+  }
+
+  const byBasename = new Map<string, PcvCanonicalSourceIdentity>();
+  const ambiguousBasenames = new Set<string>();
+  for (const [basename, entries] of basenameBuckets) {
+    const distinctQualifiedPaths = new Set(entries.map((entry) => entry.qualifiedPath));
+    if (distinctQualifiedPaths.size === 1 && entries[0]) {
+      byBasename.set(basename, entries[0]);
+    } else {
+      ambiguousBasenames.add(basename);
+    }
+  }
+
+  return { ambiguousBasenames, byBasename, byQualifiedPath };
+}
+
+function normalizePcvProjectScopeSourceRef(
+  sourceRef: string,
+  index: PcvProjectScopeSourceRefIndex
+): PcvNormalizedProjectScopeSourceRef {
+  const normalized = normalizePcvSourcePath(sourceRef);
+  const qualified = index.byQualifiedPath.get(normalized);
+  if (qualified) {
+    return {
+      normalizedRef: qualified.qualifiedPath,
+      reason: 'qualified-path',
+      status: 'active',
+    };
+  }
+
+  if (!normalized.includes('/')) {
+    if (index.ambiguousBasenames.has(normalized)) {
+      return { normalizedRef: null, reason: 'ambiguous-basename', status: 'ambiguous' };
+    }
+    const basename = index.byBasename.get(normalized);
+    if (basename) {
+      return {
+        normalizedRef: basename.qualifiedPath,
+        reason: 'unique-basename',
+        status: 'active',
+      };
+    }
+  }
+
+  return { normalizedRef: null, reason: 'not-found', status: 'missing' };
+}
+
+function normalizePcvSourcePath(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/gu, '/')
+    .replace(/^\.\/+/u, '')
+    .replace(/\/+/gu, '/');
+}
+
+function sourceRefBasename(value: string): string | null {
+  const normalized = normalizePcvSourcePath(value);
+  const basename = normalized.split('/').filter(Boolean).pop();
+  return basename || null;
 }
 
 function normalizeSourceRefsForEvidence(
@@ -1095,7 +1247,7 @@ function normalizeSourceRefsForEvidence(
     if (!parsed.path) {
       continue;
     }
-    const normalized = normalizeProjectScopeSourceRef(parsed.path, index);
+    const normalized = normalizePcvProjectScopeSourceRef(parsed.path, index);
     if (normalized.status === 'active' && normalized.normalizedRef) {
       normalizedRefs.push(`${normalized.normalizedRef}${parsed.lineSuffix}`);
       continue;
@@ -1156,13 +1308,13 @@ function recordSourceRefDiagnostic(
   ]);
 }
 
-function isProjectScopeSourceRefIndex(value: unknown): value is ProjectScopeSourceRefIndex {
-  const record = value as Partial<ProjectScopeSourceRefIndex> | null;
+function isProjectScopeSourceRefIndex(value: unknown): value is PcvProjectScopeSourceRefIndex {
+  const record = value as Partial<PcvProjectScopeSourceRefIndex> | null;
   return (
     Boolean(record) &&
-    hasMapGet(record?.byLegacyPath) &&
     hasMapGet(record?.byQualifiedPath) &&
-    hasSetHas(record?.ambiguousLegacyPaths)
+    hasMapGet(record?.byBasename) &&
+    hasSetHas(record?.ambiguousBasenames)
   );
 }
 
@@ -1472,6 +1624,16 @@ function uniqueStrings(values: unknown[]): string[] {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? uniqueStrings(value) : [];
+}
+
+function firstStringValue(...values: unknown[]): string | null {
+  for (const value of values) {
+    const clean = stringValue(value);
+    if (clean) {
+      return clean;
+    }
+  }
+  return null;
 }
 
 function safeCall<T>(fn: () => T | null | undefined): T | null {
