@@ -25,3 +25,4 @@ Thumbs.db
 .vscode/
 .cursor/
 *.sw[a-p]
+.claude/settings.local.json
