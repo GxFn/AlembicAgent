@@ -199,6 +199,9 @@ const BLOCKING_ENVELOPE_STATUSES = new Set<ToolResultStatus>([
   'aborted',
   'timeout',
 ]);
+const MAX_TOOL_ARG_BYTES = 256_000;
+const TOOL_ARGS_INVALID_CODE = 'TOOL_ARGS_INVALID';
+const TOOL_ARGS_TOO_LARGE_CODE = 'TOOL_ARGS_TOO_LARGE';
 
 function getToolAction(call: ToolCall): string {
   const params =
@@ -278,6 +281,15 @@ function stableStringify(value: unknown): string {
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
   return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+function measureToolArgBytes(call: ToolCall): { ok: true; bytes: number } | { ok: false } {
+  try {
+    const serialized = String(stableStringify(call.args) ?? '');
+    return { ok: true, bytes: new TextEncoder().encode(serialized).length };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function resolveProjectSnapshotId(ctx: ToolExecContext): string {
@@ -572,6 +584,44 @@ export const allowlistGate = {
       };
     }
     return undefined;
+  },
+};
+
+/** ToolArgumentBoundsGate — reject oversized or unserializable model-provided tool args. */
+export const toolArgumentBoundsGate = {
+  name: 'toolArgumentBoundsGate',
+  before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
+    const measurement = measureToolArgBytes(call);
+    if (!measurement.ok) {
+      ctx.loopCtx.diagnostics?.warn({
+        code: TOOL_ARGS_INVALID_CODE,
+        message: `Tool ${call.name} arguments could not be serialized for validation`,
+      });
+      return {
+        blocked: true,
+        result: {
+          error: 'Tool arguments could not be serialized',
+          code: TOOL_ARGS_INVALID_CODE,
+          maxBytes: MAX_TOOL_ARG_BYTES,
+        },
+      };
+    }
+    if (measurement.bytes <= MAX_TOOL_ARG_BYTES) {
+      return undefined;
+    }
+    ctx.loopCtx.diagnostics?.warn({
+      code: TOOL_ARGS_TOO_LARGE_CODE,
+      message: `Tool ${call.name} arguments exceed ${MAX_TOOL_ARG_BYTES} bytes`,
+    });
+    return {
+      blocked: true,
+      result: {
+        error: `Tool arguments exceed ${MAX_TOOL_ARG_BYTES} bytes`,
+        code: TOOL_ARGS_TOO_LARGE_CODE,
+        sizeBytes: measurement.bytes,
+        maxBytes: MAX_TOOL_ARG_BYTES,
+      },
+    };
   },
 };
 
@@ -1099,6 +1149,7 @@ export const eventBusPublisher = {
 export function createToolPipeline() {
   return new ToolExecutionPipeline()
     .use(allowlistGate)
+    .use(toolArgumentBoundsGate)
     .use(evolutionDecisionGate)
     .use(recordRepairOnlyGate)
     .use(analystVerifyOnlyGate)

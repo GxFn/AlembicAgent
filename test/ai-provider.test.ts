@@ -311,6 +311,42 @@ describe('AiProvider retry and error classification', () => {
     });
   });
 
+  it('transfers legacy provider concurrency slots without overselling the cap', async () => {
+    const provider = new RetryHarnessProvider({ maxConcurrency: 1 });
+
+    await provider._acquireRequestSlot();
+    const queued = provider._acquireRequestSlot();
+
+    provider._releaseRequestSlot();
+    const lateArrival = provider._acquireRequestSlot();
+
+    await queued;
+    expect(provider._activeRequests).toBe(1);
+
+    provider._releaseRequestSlot();
+    await lateArrival;
+    expect(provider._activeRequests).toBe(1);
+
+    provider._releaseRequestSlot();
+    expect(provider._activeRequests).toBe(0);
+  });
+
+  it('opens the legacy provider circuit once under concurrent failures', async () => {
+    const provider = new RetryHarnessProvider({
+      circuitThreshold: 1,
+      maxConcurrency: 2,
+    });
+    const timeoutError = () => Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
+
+    await Promise.allSettled([
+      provider.runWithRetry(() => Promise.reject(timeoutError())),
+      provider.runWithRetry(() => Promise.reject(timeoutError())),
+    ]);
+
+    expect(provider._circuitState).toBe('OPEN');
+    expect(provider._circuitCooldownMs).toBe(60_000);
+  });
+
   it('treats AbortError cancellation as non-retryable without circuit state changes', async () => {
     const provider = new RetryHarnessProvider({ circuitThreshold: 1 });
     const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });

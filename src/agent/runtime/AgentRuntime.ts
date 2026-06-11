@@ -63,7 +63,10 @@ import {
   type LLMInputStageProfile,
   resolveLlmInputStageProfile,
 } from './LLMInputAssembly.js';
-import { measureLlmInputAssembly } from './LLMInputMeasurement.js';
+import {
+  type LLMInputAssemblyMeasurement,
+  measureLlmInputAssembly,
+} from './LLMInputMeasurement.js';
 import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
@@ -618,6 +621,10 @@ export class AgentRuntime {
         );
         if (signal.reason === 'abort_signal') {
           ctx.diagnostics?.recordCancelReason('abort_signal');
+          recordAbortRecoveryDiagnostic(
+            ctx,
+            signal.detail || 'ExitController observed abort signal'
+          );
         }
         if (signal.reason === 'stage_timeout') {
           ctx.diagnostics?.recordCancelReason('stage_timeout');
@@ -861,7 +868,7 @@ export class AgentRuntime {
         abortReason: stringifyAbortReason(ctx.abortSignal.reason),
       });
       ctx.diagnostics?.recordCancelReason('abort_signal');
-      ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal was already aborted' });
+      recordAbortRecoveryDiagnostic(ctx, 'AbortSignal was already aborted');
       return null;
     }
 
@@ -927,6 +934,26 @@ export class AgentRuntime {
         requestedToolChoice: toolChoice,
       });
       const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
+      const llmInputValidation = validateLlmInputSize(ctx, llmInputMeasurement);
+      if (!llmInputValidation.ok) {
+        ctx.diagnostics?.warn({
+          code: llmInputValidation.code,
+          message: llmInputValidation.message,
+        });
+        this.logger.warn(
+          `[AgentRuntime] LLM input rejected ${formatLoopTrace(llmTrace)}: ${llmInputValidation.message}`,
+          {
+            ...llmTrace,
+            code: llmInputValidation.code,
+            estimatedTokens: llmInputValidation.estimatedTokens,
+            maxTokens: llmInputValidation.maxTokens,
+          }
+        );
+        if (!ctx.isSystem) {
+          ctx.lastReply = `抱歉，当前请求输入过长（${llmInputValidation.estimatedTokens}/${llmInputValidation.maxTokens} tokens）。请缩短输入后重试。`;
+        }
+        return null;
+      }
       const unifiedMessages = llmInputAssembly.providerMessages;
       const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
         kind: 'llm.input',
@@ -1142,7 +1169,7 @@ export class AgentRuntime {
         }
       );
       ctx.diagnostics?.recordCancelReason('abort_signal');
-      ctx.diagnostics?.warn({ code: 'aborted', message: 'AbortSignal fired during LLM call' });
+      recordAbortRecoveryDiagnostic(ctx, 'AbortSignal fired during LLM call');
       return null;
     }
 
@@ -1247,6 +1274,7 @@ export class AgentRuntime {
     for (const fc of activeCalls) {
       if (ctx.abortSignal?.aborted) {
         ctx.diagnostics?.recordCancelReason('abort_signal');
+        recordAbortRecoveryDiagnostic(ctx, 'AbortSignal fired before tool execution');
         this.logger.info('[AgentRuntime] ⛔ abortSignal fired before tool execution — exiting');
         return true;
       }
@@ -2443,6 +2471,57 @@ function formatSemanticNudgeSummary(
     return '达到中期预算节点，注入阶段性反思。';
   }
   return `Injected ${nudge.type} semantic nudge before the next LLM step.`;
+}
+
+const DEFAULT_LLM_INPUT_TOKEN_LIMIT = 128_000;
+const LLM_INPUT_TOO_LARGE_CODE = 'LLM_INPUT_TOO_LARGE';
+
+function validateLlmInputSize(
+  ctx: LoopContext,
+  measurement: LLMInputAssemblyMeasurement
+):
+  | { ok: true }
+  | {
+      ok: false;
+      code: typeof LLM_INPUT_TOO_LARGE_CODE;
+      estimatedTokens: number;
+      maxTokens: number;
+      message: string;
+    } {
+  const maxTokens = resolveLlmInputTokenLimit(ctx);
+  if (measurement.estimatedTokens <= maxTokens) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    code: LLM_INPUT_TOO_LARGE_CODE,
+    estimatedTokens: measurement.estimatedTokens,
+    maxTokens,
+    message: `LLM input exceeds provider input budget (${measurement.estimatedTokens}/${maxTokens} tokens)`,
+  };
+}
+
+function resolveLlmInputTokenLimit(ctx: LoopContext): number {
+  const budget = ctx.budget || {};
+  const explicit = readPositiveBudgetNumber(
+    budget.maxProviderInputTokens ?? budget.maxInputTokens ?? budget.contextWindowTokens
+  );
+  return explicit ?? DEFAULT_LLM_INPUT_TOKEN_LIMIT;
+}
+
+function readPositiveBudgetNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  return Math.floor(numeric);
+}
+
+function recordAbortRecoveryDiagnostic(ctx: LoopContext, message: string): void {
+  ctx.diagnostics?.warn({
+    code: 'ABORT_RECOVERY_RECORDED',
+    message,
+  });
 }
 
 function formatDeveloperVisibleLlmInput(assembly: LLMInputAssembly): string {

@@ -151,8 +151,10 @@ export class LLMGateway {
       abortSignal: request.abortSignal,
     };
 
-    const response = await this.#runWithReliability(providerId, () =>
-      transport.chatWithTools(transportReq)
+    const response = await this.#runWithReliability(
+      providerId,
+      () => transport.chatWithTools(transportReq),
+      request.abortSignal
     );
     this.#emitUsage(response.usage, providerId, apiModelId, request.usageSource ?? 'chatWithTools');
     return this.#normalizeResponse(response);
@@ -172,19 +174,22 @@ export class LLMGateway {
     const transport = this.#getTransport(providerId);
     const wasFiltered = (param: string) => guarded.filtered.some((f) => f.param === param);
 
-    return this.#runWithReliability(providerId, () =>
-      transport.chat({
-        model: apiModelId,
-        messages: [{ role: 'user', content: request.prompt }],
-        systemPrompt: request.systemPrompt,
-        temperature: wasFiltered('temperature')
-          ? undefined
-          : (guarded.temperature ?? request.temperature),
-        maxTokens: guarded.maxTokens ?? request.maxTokens,
-        responseFormat: request.responseFormat,
-        schema: request.schema,
-        abortSignal: request.abortSignal,
-      })
+    return this.#runWithReliability(
+      providerId,
+      () =>
+        transport.chat({
+          model: apiModelId,
+          messages: [{ role: 'user', content: request.prompt }],
+          systemPrompt: request.systemPrompt,
+          temperature: wasFiltered('temperature')
+            ? undefined
+            : (guarded.temperature ?? request.temperature),
+          maxTokens: guarded.maxTokens ?? request.maxTokens,
+          responseFormat: request.responseFormat,
+          schema: request.schema,
+          abortSignal: request.abortSignal,
+        }),
+      request.abortSignal
     );
   }
 
@@ -334,8 +339,12 @@ export class LLMGateway {
   }
 
   /** 在 provider 级可靠性包裹（重试 / 熔断 / 并发 / 限流）下执行 Transport 调用。 */
-  #runWithReliability<T>(providerId: ProviderId, fn: () => Promise<T>): Promise<T> {
-    return this.#getController(providerId).run(fn);
+  #runWithReliability<T>(
+    providerId: ProviderId,
+    fn: () => Promise<T>,
+    abortSignal?: AbortSignal | null
+  ): Promise<T> {
+    return this.#getController(providerId).run(fn, undefined, undefined, { abortSignal });
   }
 
   /** 触发 token 用量回调，驱动全局预算 / 成本统计。回调异常不影响主流程。 */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
+import { __testingProxyDispatcherCache } from '../src/ai/transport/LLMTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 
 // 薄壳化后代理感知从 AiProvider 下沉到 LLMTransport。
@@ -90,6 +90,7 @@ describe('LLMTransport proxy fetch wiring', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    __testingProxyDispatcherCache.clear();
     for (const key of PROXY_ENV_KEYS) {
       if (saved[key] === undefined) {
         delete process.env[key];
@@ -148,5 +149,19 @@ describe('LLMTransport proxy fetch wiring', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(capturedInit?.dispatcher).toBeUndefined();
     expect(text).toBe('direct');
+  });
+
+  it('evicts the oldest proxy dispatcher when the cache exceeds its bound', () => {
+    const closed: string[] = [];
+    for (let index = 0; index < __testingProxyDispatcherCache.maxSize + 1; index++) {
+      const key = `http://proxy-${index}:8080`;
+      __testingProxyDispatcherCache.set(key, {
+        close: () => closed.push(key),
+      });
+    }
+
+    expect(__testingProxyDispatcherCache.size()).toBe(__testingProxyDispatcherCache.maxSize);
+    expect(__testingProxyDispatcherCache.keys()[0]).toBe('http://proxy-1:8080');
+    expect(closed).toEqual(['http://proxy-0:8080']);
   });
 });

@@ -26,6 +26,23 @@ describe('ReliabilityController retry & circuit breaker', () => {
     });
   });
 
+  it('opens the circuit once when concurrent failures cross the threshold', async () => {
+    const c = new ReliabilityController({
+      maxConcurrency: 2,
+      maxRetries: 0,
+      circuitThreshold: 1,
+    });
+    const timeoutError = () => Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
+
+    await Promise.allSettled([
+      c.run(() => Promise.reject(timeoutError()), 0, 1),
+      c.run(() => Promise.reject(timeoutError()), 0, 1),
+    ]);
+
+    expect(c.circuitState).toBe('OPEN');
+    expect(c.circuitCooldownMs).toBe(60_000);
+  });
+
   it('treats AbortError as non-retryable without circuit changes', async () => {
     const c = new ReliabilityController({ maxRetries: 2, circuitThreshold: 1 });
     const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });
@@ -84,5 +101,40 @@ describe('ReliabilityController retry & circuit breaker', () => {
       );
     await Promise.all([task(), task(), task(), task(), task()]);
     expect(peak).toBeLessThanOrEqual(2);
+  });
+
+  it('transfers a released slot atomically to the oldest queued request', async () => {
+    const c = new ReliabilityController({ maxConcurrency: 1, maxRetries: 0 });
+
+    await c.acquireSlot();
+    const queued = c.acquireSlot();
+
+    c.releaseSlot();
+    const lateArrival = c.acquireSlot();
+
+    await queued;
+    expect(c.activeRequests).toBe(1);
+
+    c.releaseSlot();
+    await lateArrival;
+    expect(c.activeRequests).toBe(1);
+
+    c.releaseSlot();
+    expect(c.activeRequests).toBe(0);
+  });
+
+  it('removes aborted queued requests without leaking a concurrency slot', async () => {
+    const c = new ReliabilityController({ maxConcurrency: 1, maxRetries: 0 });
+    const abortController = new AbortController();
+
+    await c.acquireSlot();
+    const queued = c.acquireSlot(abortController.signal);
+    abortController.abort('cancel queued request');
+
+    await expect(queued).rejects.toMatchObject({ name: 'AbortError' });
+    expect(c.activeRequests).toBe(1);
+
+    c.releaseSlot();
+    expect(c.activeRequests).toBe(0);
   });
 });

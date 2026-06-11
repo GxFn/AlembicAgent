@@ -86,6 +86,33 @@ export interface MemoryNoteFindingResult {
   scopeId?: string;
 }
 
+export interface MemoryEvidenceSearchHit {
+  filePath: string;
+  evidence: { dimId?: string; importance?: number; finding: string };
+}
+
+export interface MemoryEvidenceSearchDiagnostic {
+  code: 'MEMORY_EVIDENCE_STORE_MISSING' | 'MEMORY_EVIDENCE_SEARCH_FAILED';
+  reason: 'session-store-missing' | 'memory-evidence-search-failed';
+  message: string;
+  query: string;
+  dimId?: string;
+}
+
+export interface MemoryEvidenceSearchResult {
+  ok: boolean;
+  degraded: boolean;
+  reason: 'session-store-missing' | 'memory-evidence-search-failed' | null;
+  results: MemoryEvidenceSearchHit[];
+  diagnostics: MemoryEvidenceSearchDiagnostic[];
+}
+
+export interface MemoryWriteFailureDiagnostic {
+  code: 'MEMORY_STORE_WRITE_FAILED' | 'MEMORY_COORDINATOR_WRITE_FAILED';
+  message: string;
+  operation: 'persistentMemory.append';
+}
+
 // ── 预算分配策略 (§4.1) ──
 
 const BUDGET_PROFILES: Record<string, BudgetProfile> = Object.freeze({
@@ -162,6 +189,7 @@ export class MemoryCoordinator {
 
   #logger: ReturnType<typeof Logger.getInstance>;
   #completedScopes: Set<string>;
+  #writeFailures: MemoryWriteFailureDiagnostic[] = [];
 
   /**
    * @param [config.persistentMemory] PersistentMemory 实例
@@ -478,8 +506,8 @@ export class MemoryCoordinator {
           }
         }
       }
-    } catch {
-      /* memory write failure is non-critical */
+    } catch (err: unknown) {
+      this.#recordMemoryWriteFailure(err, 'persistentMemory.append');
     }
   }
 
@@ -602,20 +630,57 @@ export class MemoryCoordinator {
   }
 
   /** 检索前序维度的代码证据 — V2 memory.get_previous_evidence 桥接 */
-  searchEvidence(
-    query: string,
-    dimId?: string
-  ): Array<{
-    filePath: string;
-    evidence: { dimId?: string; importance?: number; finding: string };
-  }> {
+  searchEvidence(query: string, dimId?: string): MemoryEvidenceSearchHit[] {
+    return this.searchEvidenceWithDiagnostics(query, dimId).results;
+  }
+
+  /** 检索前序维度代码证据，并在读路径降级时返回稳定诊断。 */
+  searchEvidenceWithDiagnostics(query: string, dimId?: string): MemoryEvidenceSearchResult {
     if (!this.#sessionStore) {
-      return [];
+      return {
+        ok: true,
+        degraded: true,
+        reason: 'session-store-missing',
+        results: [],
+        diagnostics: [
+          {
+            code: 'MEMORY_EVIDENCE_STORE_MISSING',
+            reason: 'session-store-missing',
+            message: 'SessionStore is not configured; previous evidence search is degraded.',
+            query,
+            ...(dimId ? { dimId } : {}),
+          },
+        ],
+      };
     }
     try {
-      return this.#sessionStore.searchEvidence(query, dimId);
-    } catch {
-      return [];
+      return {
+        ok: true,
+        degraded: false,
+        reason: null,
+        results: this.#sessionStore.searchEvidence(query, dimId),
+        diagnostics: [],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.#logger.warn(
+        `[MemoryCoordinator] searchEvidence degraded (MEMORY_EVIDENCE_SEARCH_FAILED): ${message}`
+      );
+      return {
+        ok: false,
+        degraded: true,
+        reason: 'memory-evidence-search-failed',
+        results: [],
+        diagnostics: [
+          {
+            code: 'MEMORY_EVIDENCE_SEARCH_FAILED',
+            reason: 'memory-evidence-search-failed',
+            message,
+            query,
+            ...(dimId ? { dimId } : {}),
+          },
+        ],
+      };
     }
   }
 
@@ -627,6 +692,10 @@ export class MemoryCoordinator {
   /** 获取 ConversationLog / ConversationStore */
   getConversationLog() {
     return this.#conversationLog || null;
+  }
+
+  getDiagnostics(): { writeFailures: MemoryWriteFailureDiagnostic[] } {
+    return { writeFailures: this.#writeFailures.map((entry) => ({ ...entry })) };
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -704,6 +773,23 @@ export class MemoryCoordinator {
       return null;
     }
     return this.#activeContexts.get(this.#currentScopeId) || null;
+  }
+
+  #recordMemoryWriteFailure(err: unknown, operation: 'persistentMemory.append'): void {
+    const diagnostic: MemoryWriteFailureDiagnostic = {
+      code:
+        typeof err === 'object' &&
+        err !== null &&
+        (err as { code?: unknown }).code === 'MEMORY_STORE_WRITE_FAILED'
+          ? 'MEMORY_STORE_WRITE_FAILED'
+          : 'MEMORY_COORDINATOR_WRITE_FAILED',
+      message: err instanceof Error ? err.message : String(err),
+      operation,
+    };
+    this.#writeFailures.push(diagnostic);
+    this.#logger.warn(
+      `[MemoryCoordinator] ${operation} failed (${diagnostic.code}): ${diagnostic.message}`
+    );
   }
 
   /** 构建 PersistentMemory section */

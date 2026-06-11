@@ -8,8 +8,10 @@ import {
   ConversationStore,
   MEMORY_STORE_REQUIRED_COLUMNS,
   MEMORY_STORE_SEMANTIC_TABLE,
+  MemoryCoordinator,
   MemoryEmbeddingStore,
   MemoryStore,
+  MemoryStoreWriteError,
   SessionStore,
 } from '../src/index.js';
 
@@ -94,6 +96,101 @@ describe('MemoryStore', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('wraps SQLite write failures in a typed MemoryStore write error', () => {
+    const db = new Database(':memory:');
+    const store = new MemoryStore(db);
+    db.close();
+
+    expect(() =>
+      store.add({
+        content: 'write should fail after db close',
+        source: 'test',
+      })
+    ).toThrow(MemoryStoreWriteError);
+
+    try {
+      store.add({ content: 'write should fail after db close', source: 'test' });
+      throw new Error('expected MemoryStoreWriteError');
+    } catch (err: unknown) {
+      expect(err).toMatchObject({
+        name: 'MemoryStoreWriteError',
+        code: 'MEMORY_STORE_WRITE_FAILED',
+        operation: 'add',
+      });
+    }
+  });
+});
+
+describe('MemoryCoordinator', () => {
+  it('returns visible degraded diagnostics when evidence search fails', () => {
+    const coordinator = new MemoryCoordinator({
+      sessionStore: {
+        searchEvidence() {
+          throw new Error('sqlite disk I/O');
+        },
+      } as unknown as SessionStore,
+    });
+
+    const result = coordinator.searchEvidenceWithDiagnostics('Agent boundary', 'api');
+
+    expect(result).toMatchObject({
+      ok: false,
+      degraded: true,
+      reason: 'memory-evidence-search-failed',
+      results: [],
+      diagnostics: [
+        {
+          code: 'MEMORY_EVIDENCE_SEARCH_FAILED',
+          reason: 'memory-evidence-search-failed',
+          message: 'sqlite disk I/O',
+          query: 'Agent boundary',
+          dimId: 'api',
+        },
+      ],
+    });
+    expect(coordinator.searchEvidence('Agent boundary', 'api')).toEqual([]);
+  });
+
+  it('marks missing SessionStore evidence search as degraded instead of silently empty', () => {
+    const coordinator = new MemoryCoordinator();
+    const result = coordinator.searchEvidenceWithDiagnostics('Agent boundary');
+
+    expect(result).toMatchObject({
+      ok: true,
+      degraded: true,
+      reason: 'session-store-missing',
+      results: [],
+      diagnostics: [
+        {
+          code: 'MEMORY_EVIDENCE_STORE_MISSING',
+          reason: 'session-store-missing',
+          query: 'Agent boundary',
+        },
+      ],
+    });
+  });
+
+  it('handles typed persistent memory write failures with coordinator diagnostics', () => {
+    const coordinator = new MemoryCoordinator({
+      persistentMemory: {
+        toPromptSection: () => '',
+        append() {
+          throw new MemoryStoreWriteError('add', new Error('disk full'));
+        },
+      },
+    });
+
+    coordinator.extractFromConversation('记住以后记录 Agent boundary', '', 'user');
+
+    expect(coordinator.getDiagnostics().writeFailures).toEqual([
+      expect.objectContaining({
+        code: 'MEMORY_STORE_WRITE_FAILED',
+        message: 'MemoryStore add failed: disk full',
+        operation: 'persistentMemory.append',
+      }),
+    ]);
   });
 });
 

@@ -69,6 +69,21 @@ function createToolEnvelope(
 }
 
 describe('agent runtime forced summary suppression', () => {
+  it('rejects oversized LLM input before calling the provider', async () => {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+
+    const result = await runtime.reactLoop('input too large', {
+      source: 'user',
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000, maxProviderInputTokens: 1 },
+    });
+
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(result.reply).toContain('输入过长');
+    expect(result.diagnostics?.warnings).toContainEqual(
+      expect.objectContaining({ code: 'LLM_INPUT_TOO_LARGE' })
+    );
+  });
+
   it('emits developer-safe LLM input and output process payloads', async () => {
     const progress: ProgressEvent[] = [];
     const visibleText = `${'Visible model output '.repeat(350)}token=visibleOutputSecret12345`;
@@ -847,6 +862,9 @@ describe('agent runtime forced summary suppression', () => {
     expect(result.reply).toContain('abort_signal');
     expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
     expect(result.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+    expect(result.diagnostics?.warnings).toContainEqual(
+      expect.objectContaining({ code: 'ABORT_RECOVERY_RECORDED' })
+    );
   });
 
   it('does not force summary after stage timeout exits', async () => {

@@ -78,7 +78,7 @@ export type { ExitControllerConfig, ExitReason, ExitSignal } from './ExitControl
 export { createExitController, ExitController } from './ExitController.js';
 export { cleanFinalAnswer } from './final-answer.js';
 export { produceForcedSummary } from './forced-summary.js';
-export type { HookEvent, HookHandler, HookPayloadMap } from './HookSystem.js';
+export type { HookErrorDiagnostic, HookEvent, HookHandler, HookPayloadMap } from './HookSystem.js';
 export { HookSystem, registerDefaultHooks } from './HookSystem.js';
 export type {
   BuildLlmInputAssemblyOptions,

@@ -127,6 +127,37 @@ function createLoopContext(diagnostics: DiagnosticsCollector): LoopContext {
 }
 
 describe('runtime efficiency diagnostics', () => {
+  it('blocks oversized tool arguments before execution or cache admission', async () => {
+    const manifest = createManifest();
+    let executeCount = 0;
+    const runtime = createRuntime(manifest, async (request) => {
+      executeCount += 1;
+      return createEnvelope(request, executeCount);
+    });
+    const diagnostics = new DiagnosticsCollector();
+    const loopCtx = createLoopContext(diagnostics);
+    const pipeline = createToolPipeline();
+
+    const result = await pipeline.execute(
+      {
+        id: 'large-args',
+        name: 'code',
+        args: { action: 'read', payload: 'x'.repeat(260_000) },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+
+    expect(executeCount).toBe(0);
+    expect(result.metadata.blocked).toBe(true);
+    expect(result.result).toMatchObject({
+      code: 'TOOL_ARGS_TOO_LARGE',
+      maxBytes: 256_000,
+    });
+    expect(diagnostics.toJSON().blockedTools).toEqual([
+      { tool: 'code', reason: 'Tool arguments exceed 256000 bytes' },
+    ]);
+  });
+
   it('short-circuits duplicate deterministic tool calls within a session snapshot', async () => {
     const diagnostics = new DiagnosticsCollector();
     const manifest = createManifest({ id: 'code' });

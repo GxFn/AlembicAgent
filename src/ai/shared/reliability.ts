@@ -20,6 +20,12 @@ import { classifyLlmError } from './error-classify.js';
 /** 日志回调，level 与现有 logger 对齐（info/warn/error）。 */
 export type ReliabilityLogFn = (level: string, message: string) => void;
 
+/** 单次可靠性调用选项。 */
+export interface ReliabilityRunOptions {
+  /** 外部主动中止信号；排队、冷却窗等待与重试等待都必须可取消。 */
+  abortSignal?: AbortSignal | null;
+}
+
 /** 控制器构造选项。 */
 export interface ReliabilityOptions {
   /** 最大重试次数（不含首次尝试），默认 3。 */
@@ -41,6 +47,29 @@ function makeCircuitOpenError(message: string): Error & { code: string } {
   return err;
 }
 
+function makeAbortError(reason?: unknown): Error & { code?: string } {
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const err = new Error(typeof reason === 'string' ? reason : 'Operation aborted') as Error & {
+    code?: string;
+  };
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  return err;
+}
+
+function isCircuitOpen(state: ReliabilityController['circuitState']): boolean {
+  return state === 'OPEN';
+}
+
+interface QueuedRequestSlot {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  abortSignal: AbortSignal | null;
+  onAbort: (() => void) | null;
+}
+
 export class ReliabilityController {
   readonly maxRetries: number;
   readonly label: string;
@@ -55,7 +84,7 @@ export class ReliabilityController {
   // ── 并发闸门 + 429 冷却窗 ──
   readonly maxConcurrency: number;
   activeRequests = 0;
-  private requestQueue: Array<() => void> = [];
+  private requestQueue: QueuedRequestSlot[] = [];
   rateLimitedUntil = 0;
 
   private readonly onLog?: ReliabilityLogFn;
@@ -75,28 +104,80 @@ export class ReliabilityController {
     this.onLog?.(level, message);
   }
 
-  async acquireSlot(): Promise<void> {
+  async acquireSlot(abortSignal: AbortSignal | null = null): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw makeAbortError(abortSignal.reason);
+    }
     if (this.activeRequests < this.maxConcurrency) {
       this.activeRequests += 1;
       return;
     }
-    await new Promise<void>((resolve) => this.requestQueue.push(resolve));
-    this.activeRequests += 1;
+
+    await new Promise<void>((resolve, reject) => {
+      const queued: QueuedRequestSlot = {
+        resolve,
+        reject,
+        abortSignal,
+        onAbort: null,
+      };
+      queued.onAbort = () => {
+        const index = this.requestQueue.indexOf(queued);
+        if (index >= 0) {
+          this.requestQueue.splice(index, 1);
+        }
+        reject(makeAbortError(abortSignal?.reason));
+      };
+      abortSignal?.addEventListener('abort', queued.onAbort, { once: true });
+      this.requestQueue.push(queued);
+    });
   }
 
   releaseSlot(): void {
-    this.activeRequests = Math.max(0, this.activeRequests - 1);
     const next = this.requestQueue.shift();
     if (next) {
-      next();
+      if (next.onAbort) {
+        next.abortSignal?.removeEventListener('abort', next.onAbort);
+      }
+      if (next.abortSignal?.aborted) {
+        next.reject(makeAbortError(next.abortSignal.reason));
+        this.releaseSlot();
+        return;
+      }
+      next.resolve();
+      return;
+    }
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+  }
+
+  async waitForRateLimitWindow(abortSignal: AbortSignal | null = null): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw makeAbortError(abortSignal.reason);
+    }
+    const waitMs = this.rateLimitedUntil - Date.now();
+    if (waitMs > 0) {
+      await this.abortableDelay(waitMs, abortSignal);
     }
   }
 
-  async waitForRateLimitWindow(): Promise<void> {
-    const waitMs = this.rateLimitedUntil - Date.now();
-    if (waitMs > 0) {
-      await new Promise((r) => setTimeout(r, waitMs));
+  private abortableDelay(waitMs: number, abortSignal: AbortSignal | null): Promise<void> {
+    if (!abortSignal) {
+      return new Promise((resolve) => setTimeout(resolve, waitMs));
     }
+    if (abortSignal.aborted) {
+      return Promise.reject(makeAbortError(abortSignal.reason));
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        abortSignal.removeEventListener('abort', onAbort);
+        resolve();
+      }, waitMs);
+      const onAbort = () => {
+        clearTimeout(timeout);
+        abortSignal.removeEventListener('abort', onAbort);
+        reject(makeAbortError(abortSignal.reason));
+      };
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   setRateLimitWindow(waitMs: number): void {
@@ -118,7 +199,13 @@ export class ReliabilityController {
    * @param retries 本次重试上限（默认控制器配置）
    * @param baseDelay 退避基数毫秒（默认 2000）
    */
-  async run<T>(fn: () => Promise<T>, retries = this.maxRetries, baseDelay = 2000): Promise<T> {
+  async run<T>(
+    fn: () => Promise<T>,
+    retries = this.maxRetries,
+    baseDelay = 2000,
+    opts: ReliabilityRunOptions = {}
+  ): Promise<T> {
+    const abortSignal = opts.abortSignal || null;
     // ── 熔断器检查 ──
     if (this.circuitState === 'OPEN') {
       const elapsed = Date.now() - this.circuitOpenedAt;
@@ -133,8 +220,8 @@ export class ReliabilityController {
     for (let attempt = 0; attempt <= retries; attempt++) {
       let slotAcquired = false;
       try {
-        await this.waitForRateLimitWindow();
-        await this.acquireSlot();
+        await this.waitForRateLimitWindow(abortSignal);
+        await this.acquireSlot(abortSignal);
         slotAcquired = true;
 
         const result = await fn();
@@ -150,6 +237,7 @@ export class ReliabilityController {
 
         // AbortError — 外部主动中止，不重试直接抛出
         if (isAbort) {
+          this.log('warn', `[reliability] ${this.label} aborted: ${e.message}`);
           throw e;
         }
 
@@ -175,7 +263,10 @@ export class ReliabilityController {
           // 只有服务端 / 网络错误才累计熔断计数；客户端错误 (4xx 非 429) 不触发熔断
           if (isServerError) {
             this.circuitFailures += 1;
-            if (this.circuitFailures >= this.circuitThreshold) {
+            if (
+              this.circuitFailures >= this.circuitThreshold &&
+              !isCircuitOpen(this.circuitState)
+            ) {
               this.circuitState = 'OPEN';
               this.circuitOpenedAt = Date.now();
               const cooldown = this.circuitCooldownMs;
@@ -194,7 +285,7 @@ export class ReliabilityController {
           'info',
           `[reliability] attempt ${attempt + 1} failed (${e.message}), retrying in ${Math.round(delay / 1000)}s…`
         );
-        await new Promise((r) => setTimeout(r, delay));
+        await this.abortableDelay(delay, abortSignal);
       } finally {
         if (slotAcquired) {
           this.releaseSlot();

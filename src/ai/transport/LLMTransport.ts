@@ -26,6 +26,60 @@ import type { ProviderId } from '../registry/model-defs.js';
 // 每次请求都 new 一个会泄漏 socket / 文件句柄，且无 keep-alive 复用。
 // 用 null 缓存“已尝试但 undici 不可用 / 代理初始化失败”的结果，避免重复 import。
 const proxyDispatcherCache = new Map<string, unknown | null>();
+const MAX_PROXY_DISPATCHER_CACHE_SIZE = 8;
+
+function closeProxyDispatcher(dispatcher: unknown | null): void {
+  if (!dispatcher || typeof dispatcher !== 'object') {
+    return;
+  }
+  const disposable = dispatcher as { close?: () => unknown; destroy?: () => unknown };
+  try {
+    if (typeof disposable.close === 'function') {
+      disposable.close();
+      return;
+    }
+    disposable.destroy?.();
+  } catch {
+    /* best effort cache eviction */
+  }
+}
+
+function setProxyDispatcherCache(proxyUrl: string, dispatcher: unknown | null): void {
+  if (proxyDispatcherCache.has(proxyUrl)) {
+    closeProxyDispatcher(proxyDispatcherCache.get(proxyUrl) ?? null);
+    proxyDispatcherCache.delete(proxyUrl);
+  }
+  proxyDispatcherCache.set(proxyUrl, dispatcher);
+  while (proxyDispatcherCache.size > MAX_PROXY_DISPATCHER_CACHE_SIZE) {
+    const oldest = proxyDispatcherCache.entries().next().value as
+      | [string, unknown | null]
+      | undefined;
+    if (!oldest) {
+      break;
+    }
+    proxyDispatcherCache.delete(oldest[0]);
+    closeProxyDispatcher(oldest[1]);
+  }
+}
+
+export const __testingProxyDispatcherCache = {
+  maxSize: MAX_PROXY_DISPATCHER_CACHE_SIZE,
+  clear(): void {
+    for (const dispatcher of proxyDispatcherCache.values()) {
+      closeProxyDispatcher(dispatcher);
+    }
+    proxyDispatcherCache.clear();
+  },
+  keys(): string[] {
+    return [...proxyDispatcherCache.keys()];
+  },
+  set(proxyUrl: string, dispatcher: unknown | null): void {
+    setProxyDispatcherCache(proxyUrl, dispatcher);
+  },
+  size(): number {
+    return proxyDispatcherCache.size;
+  },
+};
 
 /**
  * 解析（并缓存）指定 proxyUrl 对应的 undici ProxyAgent dispatcher。
@@ -33,15 +87,18 @@ const proxyDispatcherCache = new Map<string, unknown | null>();
  */
 async function getProxyDispatcher(proxyUrl: string): Promise<unknown | null> {
   if (proxyDispatcherCache.has(proxyUrl)) {
-    return proxyDispatcherCache.get(proxyUrl) ?? null;
+    const cached = proxyDispatcherCache.get(proxyUrl) ?? null;
+    proxyDispatcherCache.delete(proxyUrl);
+    proxyDispatcherCache.set(proxyUrl, cached);
+    return cached;
   }
   try {
     const undici = await import('undici');
     const dispatcher = new undici.ProxyAgent(proxyUrl);
-    proxyDispatcherCache.set(proxyUrl, dispatcher);
+    setProxyDispatcherCache(proxyUrl, dispatcher);
     return dispatcher;
   } catch {
-    proxyDispatcherCache.set(proxyUrl, null);
+    setProxyDispatcherCache(proxyUrl, null);
     return null;
   }
 }

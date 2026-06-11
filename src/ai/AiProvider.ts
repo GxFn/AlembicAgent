@@ -29,6 +29,10 @@ export interface AiProviderConfig {
   [key: string]: unknown;
 }
 
+function isProviderCircuitOpen(state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'): boolean {
+  return state === 'OPEN';
+}
+
 /** Provider 缺 key 统一错误；只给 host-neutral 元数据，具体 UI 指引由宿主渲染。 */
 export interface MissingApiKeyError extends Error {
   code: 'API_KEY_MISSING';
@@ -251,15 +255,15 @@ export class AiProvider {
       return;
     }
     await new Promise<void>((resolve) => this._requestQueue.push(() => resolve()));
-    this._activeRequests += 1;
   }
 
   _releaseRequestSlot() {
-    this._activeRequests = Math.max(0, this._activeRequests - 1);
     const next = this._requestQueue.shift();
     if (next) {
       next();
+      return;
     }
+    this._activeRequests = Math.max(0, this._activeRequests - 1);
   }
 
   async _waitForRateLimitWindow() {
@@ -925,7 +929,10 @@ ${items}`;
           // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题
           if (isServerError) {
             this._circuitFailures = (this._circuitFailures || 0) + 1;
-            if (this._circuitFailures >= (this._circuitThreshold || 5)) {
+            if (
+              this._circuitFailures >= (this._circuitThreshold || 5) &&
+              !isProviderCircuitOpen(this._circuitState)
+            ) {
               this._circuitState = 'OPEN';
               this._circuitOpenedAt = Date.now();
               // 先用当前冷却值，再递增给下次: 30s → 60s → 120s（最大 5 分钟）

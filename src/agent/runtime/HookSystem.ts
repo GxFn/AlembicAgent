@@ -75,6 +75,14 @@ export interface HookPayloadMap {
 
 export type HookHandler<E extends HookEvent> = (payload: HookPayloadMap[E]) => unknown;
 
+export interface HookErrorDiagnostic {
+  code: 'HOOK_HANDLER_FAILED';
+  event: HookEvent;
+  hookId: string;
+  message: string;
+  mode: 'async' | 'sync';
+}
+
 interface HookEntry<E extends HookEvent = HookEvent> {
   event: E;
   handler: HookHandler<E>;
@@ -89,6 +97,7 @@ let _hookCounter = 0;
 
 export class HookSystem {
   readonly #hooks = new Map<HookEvent, HookEntry[]>();
+  readonly #hookErrors: HookErrorDiagnostic[] = [];
   readonly #logger = Logger;
 
   /**
@@ -160,9 +169,7 @@ export class HookSystem {
           blocked = true;
         }
       } catch (err) {
-        this.#logger.warn(
-          `[HookSystem] hook error on ${event} (${entry.id}): ${err instanceof Error ? err.message : String(err)}`
-        );
+        this.#recordHookError(event, entry, err, 'async', payload);
       }
 
       if (entry.once) {
@@ -197,9 +204,7 @@ export class HookSystem {
       try {
         entry.handler(payload as never);
       } catch (err) {
-        this.#logger.warn(
-          `[HookSystem] hook error on ${event} (${entry.id}): ${err instanceof Error ? err.message : String(err)}`
-        );
+        this.#recordHookError(event, entry, err, 'sync', payload);
       }
     }
 
@@ -233,6 +238,50 @@ export class HookSystem {
     }
     return total;
   }
+
+  getDiagnostics(): { hookErrors: HookErrorDiagnostic[] } {
+    return { hookErrors: this.#hookErrors.map((entry) => ({ ...entry })) };
+  }
+
+  clearDiagnostics(): void {
+    this.#hookErrors.splice(0);
+  }
+
+  #recordHookError<E extends HookEvent>(
+    event: E,
+    entry: HookEntry,
+    err: unknown,
+    mode: 'async' | 'sync',
+    payload: HookPayloadMap[E]
+  ): void {
+    const diagnostic: HookErrorDiagnostic = {
+      code: 'HOOK_HANDLER_FAILED',
+      event,
+      hookId: entry.id,
+      message: err instanceof Error ? err.message : String(err),
+      mode,
+    };
+    this.#hookErrors.push(diagnostic);
+    attachHookDiagnosticToProcessEvent(payload, diagnostic);
+    this.#logger.warn(`[HookSystem] hook error on ${event} (${entry.id}): ${diagnostic.message}`);
+  }
+}
+
+function attachHookDiagnosticToProcessEvent(
+  payload: unknown,
+  diagnostic: HookErrorDiagnostic
+): void {
+  const processEvent = (payload as { processEvent?: AgentProgressProcessEvent } | null)
+    ?.processEvent;
+  if (!processEvent || typeof processEvent !== 'object') {
+    return;
+  }
+  const metadata = (processEvent.metadata ??= {}) as Record<string, unknown>;
+  const hookErrors = Array.isArray(metadata.hookErrors)
+    ? (metadata.hookErrors as HookErrorDiagnostic[])
+    : [];
+  hookErrors.push({ ...diagnostic });
+  metadata.hookErrors = hookErrors;
 }
 
 // ── Default hooks registration ──

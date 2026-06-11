@@ -10,6 +10,12 @@
 
 export { ActiveContext } from './ActiveContext.js';
 export { MemoryConsolidator } from './MemoryConsolidator.js';
+export type {
+  MemoryEvidenceSearchDiagnostic,
+  MemoryEvidenceSearchHit,
+  MemoryEvidenceSearchResult,
+  MemoryWriteFailureDiagnostic,
+} from './MemoryCoordinator.js';
 export { MemoryCoordinator } from './MemoryCoordinator.js';
 export { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
 export { MemoryRetriever } from './MemoryRetriever.js';
@@ -20,6 +26,7 @@ export {
   MEMORY_STORE_REQUIRED_COLUMNS,
   MEMORY_STORE_SEMANTIC_TABLE,
   MemoryStore,
+  MemoryStoreWriteError,
 } from './MemoryStore.js';
 export type {
   DimensionFlushManifest,

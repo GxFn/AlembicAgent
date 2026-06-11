@@ -139,6 +139,23 @@ export interface MemoryUpdates {
   tags?: string[];
 }
 
+export class MemoryStoreWriteError extends Error {
+  readonly code = 'MEMORY_STORE_WRITE_FAILED';
+  readonly operation: 'add';
+  readonly cause: unknown;
+
+  constructor(operation: 'add', cause: unknown) {
+    const message =
+      cause instanceof Error && cause.message
+        ? `MemoryStore ${operation} failed: ${cause.message}`
+        : `MemoryStore ${operation} failed`;
+    super(message);
+    this.name = 'MemoryStoreWriteError';
+    this.operation = operation;
+    this.cause = cause;
+  }
+}
+
 // ─── 常量 ──────────────────────────────────────────────
 
 /** 最大记忆条数 (防止无限膨胀) */
@@ -183,46 +200,50 @@ export class MemoryStore {
       ? new Date(Date.now() + memory.ttlDays * 86400_000).toISOString()
       : null;
 
-    this.#db
-      .prepare(`
-        INSERT INTO semantic_memories (
+    try {
+      this.#db
+        .prepare(`
+          INSERT INTO semantic_memories (
+            id,
+            type,
+            content,
+            source,
+            importance,
+            access_count,
+            last_accessed_at,
+            created_at,
+            updated_at,
+            expires_at,
+            related_entities,
+            related_memories,
+            source_dimension,
+            source_evidence,
+            bootstrap_session,
+            tags
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
           id,
-          type,
+          memory.type || 'fact',
           content,
-          source,
+          memory.source || 'bootstrap',
           importance,
-          access_count,
-          last_accessed_at,
-          created_at,
-          updated_at,
-          expires_at,
-          related_entities,
-          related_memories,
-          source_dimension,
-          source_evidence,
-          bootstrap_session,
-          tags
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        id,
-        memory.type || 'fact',
-        content,
-        memory.source || 'bootstrap',
-        importance,
-        0,
-        now,
-        now,
-        now,
-        expiresAt,
-        JSON.stringify(memory.relatedEntities || []),
-        JSON.stringify([]),
-        memory.sourceDimension || null,
-        memory.sourceEvidence || null,
-        memory.bootstrapSession || null,
-        JSON.stringify(memory.tags || [])
-      );
+          0,
+          now,
+          now,
+          now,
+          expiresAt,
+          JSON.stringify(memory.relatedEntities || []),
+          JSON.stringify([]),
+          memory.sourceDimension || null,
+          memory.sourceEvidence || null,
+          memory.bootstrapSession || null,
+          JSON.stringify(memory.tags || [])
+        );
+    } catch (err: unknown) {
+      throw new MemoryStoreWriteError('add', err);
+    }
 
     return { id, action: 'ADD' };
   }
