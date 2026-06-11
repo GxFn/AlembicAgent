@@ -74,6 +74,27 @@ export interface MemoryRow {
   related_memories_raw?: string;
 }
 
+export const MEMORY_STORE_SEMANTIC_TABLE = 'semantic_memories';
+
+export const MEMORY_STORE_REQUIRED_COLUMNS = Object.freeze([
+  'id',
+  'type',
+  'content',
+  'source',
+  'importance',
+  'access_count',
+  'last_accessed_at',
+  'created_at',
+  'updated_at',
+  'expires_at',
+  'related_entities',
+  'related_memories',
+  'source_dimension',
+  'source_evidence',
+  'bootstrap_session',
+  'tags',
+] as const satisfies readonly (keyof MemoryRow)[]);
+
 /** 反序列化后的记忆对象 */
 export interface DeserializedMemory {
   id: string;
@@ -133,7 +154,11 @@ export class MemoryStore {
   /** @param db better-sqlite3 实例 (raw) */
   constructor(db: SqliteDatabase) {
     this.#db = db;
+    if (hasMemoryStoreSemanticTable(db)) {
+      assertMemoryStoreSchemaShape(db);
+    }
     ensureSemanticMemorySchema(db as unknown as SemanticMemorySqliteDatabase);
+    assertMemoryStoreSchemaShape(db);
   }
 
   /** 获取原始 db 引用 (for transaction) */
@@ -617,4 +642,24 @@ export class MemoryStore {
     const value = row[field];
     return typeof value === 'string' ? value : null;
   }
+}
+
+export function assertMemoryStoreSchemaShape(db: SqliteDatabase): void {
+  const rows = db.prepare(`PRAGMA table_info(${MEMORY_STORE_SEMANTIC_TABLE})`).all();
+  const columns = new Set(rows.map((row) => String(row.name || '')));
+  const missing = MEMORY_STORE_REQUIRED_COLUMNS.filter((column) => !columns.has(column));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `MemoryStore schema tripwire: ${MEMORY_STORE_SEMANTIC_TABLE} missing columns: ${missing.join(', ')}`
+    );
+  }
+}
+
+function hasMemoryStoreSemanticTable(db: SqliteDatabase): boolean {
+  return Boolean(
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(MEMORY_STORE_SEMANTIC_TABLE)
+  );
 }

@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   ConversationStore,
+  MEMORY_STORE_REQUIRED_COLUMNS,
+  MEMORY_STORE_SEMANTIC_TABLE,
   MemoryEmbeddingStore,
   MemoryStore,
   SessionStore,
@@ -27,10 +29,31 @@ afterEach(() => {
 });
 
 describe('MemoryStore', () => {
+  it('fails fast when the Core semantic memory schema shape drifts', () => {
+    const db = new Database(':memory:');
+    try {
+      db.exec(`CREATE TABLE ${MEMORY_STORE_SEMANTIC_TABLE} (id TEXT PRIMARY KEY)`);
+
+      expect(() => new MemoryStore(db)).toThrow(
+        'MemoryStore schema tripwire: semantic_memories missing columns: type'
+      );
+    } finally {
+      db.close();
+    }
+  });
+
   it('persists semantic memories in SQLite and deserializes structured fields', () => {
     const db = new Database(':memory:');
     try {
       const store = new MemoryStore(db);
+      const columns = new Set(
+        db
+          .prepare(`PRAGMA table_info(${MEMORY_STORE_SEMANTIC_TABLE})`)
+          .all()
+          .map((row) => String(row.name || ''))
+      );
+
+      expect(MEMORY_STORE_REQUIRED_COLUMNS.every((column) => columns.has(column))).toBe(true);
       const { id } = store.add({
         type: 'insight',
         content: 'Agent memory owns semantic recall and prompt retrieval.',

@@ -76,6 +76,52 @@ describe('explicit AlembicAgent contract subpaths', () => {
     });
   });
 
+  it('records AG2 runtime responsibility semantics without changing package subpaths', () => {
+    const responsibility = runtime.ALEMBIC_AGENT_RUNTIME_BOUNDARY.responsibility;
+
+    expect(responsibility.decompositionSeams.map((seam) => seam.id)).toEqual([
+      'event-bus',
+      'diagnostics',
+      'budget',
+      'llm-input-assembly',
+      'tool-execution',
+      'memory-context',
+      'phase-state',
+    ]);
+    expect(responsibility.decompositionSeams.every((seam) => !seam.behaviorChangeAllowed)).toBe(
+      true
+    );
+    expect(responsibility.semanticGlossary.map((entry) => entry.term).sort()).toEqual([
+      'agent',
+      'memory',
+      'session',
+      'tool',
+    ]);
+    expect(responsibility.featureFlags.map((flag) => flag.name)).toEqual([
+      'ALEMBIC_AI_PROVIDER',
+      'ALEMBIC_AI_MODEL',
+      'ALEMBIC_AI_MAX_CONCURRENCY',
+      'ALEMBIC_EMBED_PROVIDER',
+      'ALEMBIC_DEEPSEEK_REASONING_EFFORT',
+    ]);
+    expect(
+      responsibility.featureFlags.find((flag) => flag.name === 'ALEMBIC_AI_MAX_CONCURRENCY')
+    ).toMatchObject({
+      defaultValue: '4',
+      owner: 'agent-ai-boundary',
+      productionRelevant: true,
+    });
+    expect(responsibility.modelRegistryBoundary).toMatchObject({
+      owner: 'agent-ai-boundary',
+      forbiddenOwner: 'tool-system',
+    });
+    expect(responsibility.apiResponseBoundary).toMatchObject({
+      owner: 'transport-private',
+      forbiddenOwner: 'agent-runtime',
+      allowedAccessRefs: ['src/ai/AiProvider.ts'],
+    });
+  });
+
   it('exposes prompt builders and budget helpers', () => {
     expect(typeof prompts.computeAnalystBudget).toBe('function');
     expect(typeof prompts.buildAnalystPrompt).toBe('function');

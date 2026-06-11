@@ -15,7 +15,12 @@ export { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
 export { MemoryRetriever } from './MemoryRetriever.js';
 
 // PersistentMemory 子模块 — 内部拆分后的独立组件
-export { MemoryStore } from './MemoryStore.js';
+export {
+  assertMemoryStoreSchemaShape,
+  MEMORY_STORE_REQUIRED_COLUMNS,
+  MEMORY_STORE_SEMANTIC_TABLE,
+  MemoryStore,
+} from './MemoryStore.js';
 export type {
   DimensionFlushManifest,
   DistilledContext,

@@ -1,3 +1,6 @@
+import type { AgentRuntimeResponsibilityManifest } from './AgentRuntimeResponsibility.js';
+import { ALEMBIC_AGENT_RUNTIME_RESPONSIBILITY } from './AgentRuntimeResponsibility.js';
+
 export type AgentRuntimeBoundaryArea =
   | 'ai-provider'
   | 'tool-execution'
@@ -24,6 +27,7 @@ export interface AgentRuntimeBoundaryManifest {
   readonly runtimeLine: 'alembic-api-ai';
   readonly hostAgentRouteSupported: false;
   readonly entries: readonly AgentRuntimeBoundaryEntry[];
+  readonly responsibility: AgentRuntimeResponsibilityManifest;
   readonly unsupportedHostRoutes: readonly string[];
 }
 
@@ -100,6 +104,7 @@ export const ALEMBIC_AGENT_RUNTIME_BOUNDARY = Object.freeze({
   runtimeLine: 'alembic-api-ai',
   hostAgentRouteSupported: false,
   entries: BOUNDARY_ENTRIES,
+  responsibility: ALEMBIC_AGENT_RUNTIME_RESPONSIBILITY,
   unsupportedHostRoutes: ['codex-mcp', 'codex-marketplace', 'plugin-host-agent-route'],
 }) satisfies AgentRuntimeBoundaryManifest;
 
