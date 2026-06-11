@@ -11,6 +11,7 @@ import {
   buildTerminalSessionPlan,
   buildTerminalShellPolicyInput,
   envelopeForPolicyBlock,
+  envelopeForSessionResult,
   envelopeForTerminalResult,
   evaluateTerminalCommandPolicy,
   evaluateTerminalPtyPolicy,
@@ -183,6 +184,68 @@ describe('terminal tool contract exports', () => {
     expect(manager.get('missing')).toBeNull();
   });
 
+  it('leases persistent terminal sessions for execution and releases portable records', () => {
+    const sessionPlan = buildTerminalSessionPlan({
+      mode: 'persistent',
+      id: 'session-1',
+      envPersistence: 'explicit',
+    });
+    if (!sessionPlan.ok) {
+      throw new Error(sessionPlan.error);
+    }
+    const records = new Map([
+      [
+        'session-1',
+        {
+          id: 'session-1',
+          status: 'idle' as const,
+          createdAt: '2026-05-17T00:00:00.000Z',
+          updatedAt: '2026-05-17T00:00:00.000Z',
+          cwd: projectRoot,
+          envKeys: ['PATH'],
+        },
+      ],
+    ]);
+    const manager: TerminalSessionManager = {
+      acquire(request) {
+        const current = records.get(request.plan.id || '');
+        if (!current) {
+          throw new Error('missing session');
+        }
+        const busy = { ...current, status: 'busy' as const };
+        records.set(current.id, busy);
+        return {
+          record: busy,
+          release(update = {}) {
+            records.set(current.id, {
+              ...busy,
+              ...update,
+              status: update.status ?? 'idle',
+              updatedAt: '2026-05-17T00:00:01.000Z',
+            });
+          },
+        };
+      },
+      cleanup: () => [],
+      close: (id) => records.get(id) ?? null,
+      get: (id) => records.get(id) ?? null,
+      list: () => [...records.values()],
+    };
+
+    const lease = manager.acquire({
+      plan: sessionPlan.session,
+      cwd: projectRoot,
+      envKeys: ['PATH'],
+    });
+    expect(lease.record).toMatchObject({ id: 'session-1', status: 'busy' });
+    lease.release({ cwd: `${projectRoot}/src` });
+    expect(manager.get('session-1')).toMatchObject({
+      id: 'session-1',
+      status: 'idle',
+      cwd: `${projectRoot}/src`,
+    });
+  });
+
   it('normalizes portable terminal result envelopes', () => {
     const request = terminalRequest();
     const startedAt = new Date('2026-05-17T00:00:00.000Z');
@@ -212,6 +275,45 @@ describe('terminal tool contract exports', () => {
         source: 'terminal',
         sanitized: true,
       },
+    });
+  });
+
+  it('normalizes terminal cancellation and session-status envelopes without host internals', () => {
+    const request = terminalRequest();
+    const startedAt = new Date('2026-05-17T00:00:00.000Z');
+    const startedMs = Date.now();
+    const cancelled = envelopeForTerminalResult(request, startedAt, startedMs, 'aborted', {
+      bin: 'node',
+      exitCode: 137,
+      stdout: 'partial output',
+      cancelled: true,
+    });
+    const session = envelopeForSessionResult(request, startedAt, startedMs, {
+      action: 'status',
+      sessionRecord: {
+        id: 'session-1',
+        status: 'closed',
+        createdAt: '2026-05-17T00:00:00.000Z',
+        updatedAt: '2026-05-17T00:00:02.000Z',
+        cwd: projectRoot,
+        envKeys: [],
+      },
+    });
+
+    expect(cancelled).toMatchObject({
+      ok: false,
+      status: 'aborted',
+      structuredContent: { exitCode: 137, cancelled: true },
+      trust: { source: 'terminal', sanitized: true },
+    });
+    expect(cancelled.diagnostics?.warnings[0]).toMatchObject({
+      code: 'terminal_command_failed',
+    });
+    expect(session).toMatchObject({
+      ok: true,
+      status: 'success',
+      text: 'Terminal session status completed',
+      structuredContent: { action: 'status', sessionRecord: { id: 'session-1' } },
     });
   });
 });

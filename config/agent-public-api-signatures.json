@@ -1,0 +1,2366 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-12",
+  "description": "AG4 stable public API signature smoke snapshot. Runtime smoke imports each stable package export and compares exact exported names plus runtime kind values.",
+  "stablePublicExports": [
+    ".",
+    "./agent",
+    "./service",
+    "./runtime",
+    "./prompts",
+    "./domain",
+    "./forge",
+    "./tasks",
+    "./profiles",
+    "./ai",
+    "./tools",
+    "./tools/v2",
+    "./tools/terminal",
+    "./memory",
+    "./context"
+  ],
+  "provisionalPublicExports": [],
+  "provisionalTierPolicy": {
+    "description": "No provisional public exports are active. Any future provisional export must be listed here and in agent-public-api-boundary.json before consumers use it; provisional exports may change only with an explicit boundary-matrix update and must never be silently promoted to stable.",
+    "rules": [
+      "Stable exports require exact name and runtime kind compatibility.",
+      "Provisional exports require an owner, consumer, removal or stabilization condition, and matrix entry.",
+      "Unlisted package subpaths remain forbidden even if dist files exist."
+    ]
+  },
+  "packageExportCount": 15,
+  "stableExportSignatures": {
+    ".": {
+      "exportPath": ".",
+      "specifier": "@alembic/agent",
+      "exportCount": 184,
+      "signatureHash": "0c7d5a9e4f9bf9d8b4c5c46a60d0244d77ad6141a31365976b55566ba0afe40d",
+      "entries": [
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS",
+          "kind": "array"
+        },
+        {
+          "name": "ALEMBIC_AGENT_INTERFACE_CONTRACT",
+          "kind": "object"
+        },
+        {
+          "name": "ALEMBIC_AGENT_RUNTIME_BOUNDARY",
+          "kind": "object"
+        },
+        {
+          "name": "ActiveContext",
+          "kind": "class"
+        },
+        {
+          "name": "AdaptiveStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "AgentEventBus",
+          "kind": "class"
+        },
+        {
+          "name": "AgentEvents",
+          "kind": "object"
+        },
+        {
+          "name": "AgentMessage",
+          "kind": "class"
+        },
+        {
+          "name": "AgentPhase",
+          "kind": "object"
+        },
+        {
+          "name": "AgentProfileCompiler",
+          "kind": "class"
+        },
+        {
+          "name": "AgentProfileRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRouter",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRunCoordinator",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRuntime",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRuntimeBuilder",
+          "kind": "class"
+        },
+        {
+          "name": "AgentService",
+          "kind": "class"
+        },
+        {
+          "name": "AgentStageFactoryRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentState",
+          "kind": "class"
+        },
+        {
+          "name": "AiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "AiProviderManager",
+          "kind": "class"
+        },
+        {
+          "name": "BootstrapAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "BootstrapProduce",
+          "kind": "class"
+        },
+        {
+          "name": "BudgetPolicy",
+          "kind": "class"
+        },
+        {
+          "name": "Capability",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityRegistry",
+          "kind": "object"
+        },
+        {
+          "name": "CapabilityV2",
+          "kind": "class"
+        },
+        {
+          "name": "Channel",
+          "kind": "object"
+        },
+        {
+          "name": "ClaudeProvider",
+          "kind": "class"
+        },
+        {
+          "name": "ClaudeTransport",
+          "kind": "class"
+        },
+        {
+          "name": "CodeAnalysis",
+          "kind": "class"
+        },
+        {
+          "name": "ContextWindow",
+          "kind": "class"
+        },
+        {
+          "name": "Conversation",
+          "kind": "class"
+        },
+        {
+          "name": "ConversationStore",
+          "kind": "class"
+        },
+        {
+          "name": "ConversationV2",
+          "kind": "class"
+        },
+        {
+          "name": "DEFAULT_REFLECTION_INTERVAL",
+          "kind": "number"
+        },
+        {
+          "name": "DEFAULT_REPLAN_INTERVAL",
+          "kind": "number"
+        },
+        {
+          "name": "DeepSeekProvider",
+          "kind": "class"
+        },
+        {
+          "name": "DeepSeekTransport",
+          "kind": "class"
+        },
+        {
+          "name": "DeltaCache",
+          "kind": "class"
+        },
+        {
+          "name": "Evolution",
+          "kind": "class"
+        },
+        {
+          "name": "ExplorationTracker",
+          "kind": "class"
+        },
+        {
+          "name": "FanOutStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "GoogleGeminiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "GoogleTransport",
+          "kind": "class"
+        },
+        {
+          "name": "KnowledgeProduction",
+          "kind": "class"
+        },
+        {
+          "name": "LLMGateway",
+          "kind": "class"
+        },
+        {
+          "name": "LLMTransport",
+          "kind": "class"
+        },
+        {
+          "name": "LightweightRouter",
+          "kind": "class"
+        },
+        {
+          "name": "MEMORY_STORE_REQUIRED_COLUMNS",
+          "kind": "array"
+        },
+        {
+          "name": "MEMORY_STORE_SEMANTIC_TABLE",
+          "kind": "string"
+        },
+        {
+          "name": "MemoryConsolidator",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryCoordinator",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryEmbeddingStore",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryRetriever",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryStore",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryStoreWriteError",
+          "kind": "class"
+        },
+        {
+          "name": "ModelRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "NudgeGenerator",
+          "kind": "class"
+        },
+        {
+          "name": "OllamaProvider",
+          "kind": "class"
+        },
+        {
+          "name": "OpenAiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "OpenAiTransport",
+          "kind": "class"
+        },
+        {
+          "name": "OutputCompressor",
+          "kind": "class"
+        },
+        {
+          "name": "PRESETS",
+          "kind": "object"
+        },
+        {
+          "name": "PROVIDER_CONFIGS",
+          "kind": "array"
+        },
+        {
+          "name": "ParameterGuard",
+          "kind": "class"
+        },
+        {
+          "name": "PersistentMemory",
+          "kind": "class"
+        },
+        {
+          "name": "PipelineStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "PlanTracker",
+          "kind": "class"
+        },
+        {
+          "name": "Policy",
+          "kind": "class"
+        },
+        {
+          "name": "PolicyEngine",
+          "kind": "class"
+        },
+        {
+          "name": "PresetName",
+          "kind": "object"
+        },
+        {
+          "name": "QualityGatePolicy",
+          "kind": "class"
+        },
+        {
+          "name": "SEARCH_TOOLS",
+          "kind": "object"
+        },
+        {
+          "name": "STRATEGY_ANALYST",
+          "kind": "object"
+        },
+        {
+          "name": "STRATEGY_PRODUCER",
+          "kind": "object"
+        },
+        {
+          "name": "SafetyPolicy",
+          "kind": "class"
+        },
+        {
+          "name": "ScanAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "ScanProduce",
+          "kind": "class"
+        },
+        {
+          "name": "SearchCache",
+          "kind": "class"
+        },
+        {
+          "name": "SessionStore",
+          "kind": "class"
+        },
+        {
+          "name": "SignalDetector",
+          "kind": "class"
+        },
+        {
+          "name": "SingleStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "Strategy",
+          "kind": "class"
+        },
+        {
+          "name": "StrategyRegistry",
+          "kind": "object"
+        },
+        {
+          "name": "SystemInteraction",
+          "kind": "class"
+        },
+        {
+          "name": "SystemRunContextFactory",
+          "kind": "class"
+        },
+        {
+          "name": "SystemV2",
+          "kind": "class"
+        },
+        {
+          "name": "TERMINAL_CAPABILITY_MANIFESTS",
+          "kind": "array"
+        },
+        {
+          "name": "TERMINAL_PTY_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_RUN_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SCRIPT_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLEANUP_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLOSE_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_STATUS_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SHELL_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TOOL_REGISTRY",
+          "kind": "object"
+        },
+        {
+          "name": "TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS",
+          "kind": "array"
+        },
+        {
+          "name": "ToolRouterV2",
+          "kind": "class"
+        },
+        {
+          "name": "UnifiedToolCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "V2CapabilityCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "V2ToolRouterAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "WorkflowRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "alembicAgentPackage",
+          "kind": "object"
+        },
+        {
+          "name": "allowToolDecision",
+          "kind": "function"
+        },
+        {
+          "name": "assertMemoryStoreSchemaShape",
+          "kind": "function"
+        },
+        {
+          "name": "autoDetectProvider",
+          "kind": "function"
+        },
+        {
+          "name": "buildL4MemoryPackage",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalCommandPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalPtyPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalScriptPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalSessionPlan",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalShellPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "cleanOutput",
+          "kind": "function"
+        },
+        {
+          "name": "contextFromToolCall",
+          "kind": "function"
+        },
+        {
+          "name": "createBootstrapStrategy",
+          "kind": "function"
+        },
+        {
+          "name": "createEmbedProvider",
+          "kind": "function"
+        },
+        {
+          "name": "createMissingApiKeyError",
+          "kind": "function"
+        },
+        {
+          "name": "createProvider",
+          "kind": "function"
+        },
+        {
+          "name": "createToolRoutingServiceContract",
+          "kind": "function"
+        },
+        {
+          "name": "denyToolDecision",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForError",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForPolicyBlock",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForSessionResult",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForTerminalResult",
+          "kind": "function"
+        },
+        {
+          "name": "estimateTokens",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalCommandPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalPtyPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalScriptPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalShellPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "extractHighPriorityFindings",
+          "kind": "function"
+        },
+        {
+          "name": "fail",
+          "kind": "function"
+        },
+        {
+          "name": "formatL4MemorySummary",
+          "kind": "function"
+        },
+        {
+          "name": "generateLightweightSchemas",
+          "kind": "function"
+        },
+        {
+          "name": "getActionNames",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentInterfaceContractBranch",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentInterfaceFailureTaxonomyEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentRuntimeBoundaryEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getAiConfigInfo",
+          "kind": "function"
+        },
+        {
+          "name": "getAvailableFallbacks",
+          "kind": "function"
+        },
+        {
+          "name": "getLLMGateway",
+          "kind": "function"
+        },
+        {
+          "name": "getModelRegistry",
+          "kind": "function"
+        },
+        {
+          "name": "getPreset",
+          "kind": "function"
+        },
+        {
+          "name": "getProviderConfig",
+          "kind": "function"
+        },
+        {
+          "name": "getProviderWithFallback",
+          "kind": "function"
+        },
+        {
+          "name": "getToolNames",
+          "kind": "function"
+        },
+        {
+          "name": "isGeoOrProviderError",
+          "kind": "function"
+        },
+        {
+          "name": "isSearchAction",
+          "kind": "function"
+        },
+        {
+          "name": "isToolResultEnvelope",
+          "kind": "function"
+        },
+        {
+          "name": "limitToolResult",
+          "kind": "function"
+        },
+        {
+          "name": "ok",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitDiffOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitLogOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitStatusOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGrepOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseLintOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parsePackageOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTestOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTreeOutput",
+          "kind": "function"
+        },
+        {
+          "name": "presentToolResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectEvolutionAuditResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectRelationDiscoveryResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectScanRunResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectToolResultOrdinaryOutput",
+          "kind": "function"
+        },
+        {
+          "name": "renderL4MemoryPackage",
+          "kind": "function"
+        },
+        {
+          "name": "resetLLMGateway",
+          "kind": "function"
+        },
+        {
+          "name": "resolveStrategy",
+          "kind": "function"
+        },
+        {
+          "name": "resolveToolRouterFromContext",
+          "kind": "function"
+        },
+        {
+          "name": "runEvolutionAudit",
+          "kind": "function"
+        },
+        {
+          "name": "runRelationDiscovery",
+          "kind": "function"
+        },
+        {
+          "name": "runScanAgentTask",
+          "kind": "function"
+        },
+        {
+          "name": "runTranslationJson",
+          "kind": "function"
+        },
+        {
+          "name": "supportsAgentRuntimeRoute",
+          "kind": "function"
+        },
+        {
+          "name": "targetMemoryFindingCount",
+          "kind": "function"
+        },
+        {
+          "name": "targetProducerSubmitCount",
+          "kind": "function"
+        },
+        {
+          "name": "toScanFileCache",
+          "kind": "function"
+        },
+        {
+          "name": "truncateOutput",
+          "kind": "function"
+        },
+        {
+          "name": "validateAgentInterfaceContract",
+          "kind": "function"
+        },
+        {
+          "name": "validateL4Summary",
+          "kind": "function"
+        },
+        {
+          "name": "validateSessionStoreShape",
+          "kind": "function"
+        }
+      ]
+    },
+    "./agent": {
+      "exportPath": "./agent",
+      "specifier": "@alembic/agent/agent",
+      "exportCount": 56,
+      "signatureHash": "2f3707220ee7127a8ce0976be351cb76f06bcd5aa433b0cbe1a7bcd87026c9e6",
+      "entries": [
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS",
+          "kind": "array"
+        },
+        {
+          "name": "ALEMBIC_AGENT_INTERFACE_CONTRACT",
+          "kind": "object"
+        },
+        {
+          "name": "ALEMBIC_AGENT_RUNTIME_BOUNDARY",
+          "kind": "object"
+        },
+        {
+          "name": "AdaptiveStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "AgentEventBus",
+          "kind": "class"
+        },
+        {
+          "name": "AgentEvents",
+          "kind": "object"
+        },
+        {
+          "name": "AgentMessage",
+          "kind": "class"
+        },
+        {
+          "name": "AgentPhase",
+          "kind": "object"
+        },
+        {
+          "name": "AgentProfileCompiler",
+          "kind": "class"
+        },
+        {
+          "name": "AgentProfileRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRouter",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRunCoordinator",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRuntime",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRuntimeBuilder",
+          "kind": "class"
+        },
+        {
+          "name": "AgentService",
+          "kind": "class"
+        },
+        {
+          "name": "AgentStageFactoryRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentState",
+          "kind": "class"
+        },
+        {
+          "name": "BudgetPolicy",
+          "kind": "class"
+        },
+        {
+          "name": "Capability",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityRegistry",
+          "kind": "object"
+        },
+        {
+          "name": "Channel",
+          "kind": "object"
+        },
+        {
+          "name": "CodeAnalysis",
+          "kind": "class"
+        },
+        {
+          "name": "Conversation",
+          "kind": "class"
+        },
+        {
+          "name": "FanOutStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "KnowledgeProduction",
+          "kind": "class"
+        },
+        {
+          "name": "PRESETS",
+          "kind": "object"
+        },
+        {
+          "name": "PipelineStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "Policy",
+          "kind": "class"
+        },
+        {
+          "name": "PolicyEngine",
+          "kind": "class"
+        },
+        {
+          "name": "PresetName",
+          "kind": "object"
+        },
+        {
+          "name": "QualityGatePolicy",
+          "kind": "class"
+        },
+        {
+          "name": "SafetyPolicy",
+          "kind": "class"
+        },
+        {
+          "name": "SingleStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "Strategy",
+          "kind": "class"
+        },
+        {
+          "name": "StrategyRegistry",
+          "kind": "object"
+        },
+        {
+          "name": "SystemInteraction",
+          "kind": "class"
+        },
+        {
+          "name": "SystemRunContextFactory",
+          "kind": "class"
+        },
+        {
+          "name": "getAgentInterfaceContractBranch",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentInterfaceFailureTaxonomyEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentRuntimeBoundaryEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getPreset",
+          "kind": "function"
+        },
+        {
+          "name": "projectEvolutionAuditResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectRelationDiscoveryResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectScanRunResult",
+          "kind": "function"
+        },
+        {
+          "name": "resolveStrategy",
+          "kind": "function"
+        },
+        {
+          "name": "runEvolutionAudit",
+          "kind": "function"
+        },
+        {
+          "name": "runRelationDiscovery",
+          "kind": "function"
+        },
+        {
+          "name": "runScanAgentTask",
+          "kind": "function"
+        },
+        {
+          "name": "runTranslationJson",
+          "kind": "function"
+        },
+        {
+          "name": "supportsAgentRuntimeRoute",
+          "kind": "function"
+        },
+        {
+          "name": "toScanFileCache",
+          "kind": "function"
+        },
+        {
+          "name": "validateAgentInterfaceContract",
+          "kind": "function"
+        }
+      ]
+    },
+    "./service": {
+      "exportPath": "./service",
+      "specifier": "@alembic/agent/service",
+      "exportCount": 15,
+      "signatureHash": "1f25798ce16aed681e2863188fa5a137387bc04540775f35d7dd566eafff7eff",
+      "entries": [
+        {
+          "name": "AgentProfileCompiler",
+          "kind": "class"
+        },
+        {
+          "name": "AgentProfileRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRunCoordinator",
+          "kind": "class"
+        },
+        {
+          "name": "AgentRuntimeBuilder",
+          "kind": "class"
+        },
+        {
+          "name": "AgentService",
+          "kind": "class"
+        },
+        {
+          "name": "AgentStageFactoryRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "SystemRunContextFactory",
+          "kind": "class"
+        },
+        {
+          "name": "projectEvolutionAuditResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectRelationDiscoveryResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectScanRunResult",
+          "kind": "function"
+        },
+        {
+          "name": "runEvolutionAudit",
+          "kind": "function"
+        },
+        {
+          "name": "runRelationDiscovery",
+          "kind": "function"
+        },
+        {
+          "name": "runScanAgentTask",
+          "kind": "function"
+        },
+        {
+          "name": "runTranslationJson",
+          "kind": "function"
+        },
+        {
+          "name": "toScanFileCache",
+          "kind": "function"
+        }
+      ]
+    },
+    "./runtime": {
+      "exportPath": "./runtime",
+      "specifier": "@alembic/agent/runtime",
+      "exportCount": 69,
+      "signatureHash": "977b1b95fda6d2893389d70c104c125a00aa30a5e113c598b83809b3b5cd5d6a",
+      "entries": [
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS",
+          "kind": "array"
+        },
+        {
+          "name": "AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY",
+          "kind": "object"
+        },
+        {
+          "name": "AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS",
+          "kind": "array"
+        },
+        {
+          "name": "ALEMBIC_AGENT_INTERFACE_CONTRACT",
+          "kind": "object"
+        },
+        {
+          "name": "ALEMBIC_AGENT_RUNTIME_BOUNDARY",
+          "kind": "object"
+        },
+        {
+          "name": "AgentEventBus",
+          "kind": "class"
+        },
+        {
+          "name": "AgentEvents",
+          "kind": "object"
+        },
+        {
+          "name": "AgentMessage",
+          "kind": "class"
+        },
+        {
+          "name": "AgentPhase",
+          "kind": "object"
+        },
+        {
+          "name": "AgentRuntime",
+          "kind": "class"
+        },
+        {
+          "name": "AgentState",
+          "kind": "class"
+        },
+        {
+          "name": "BudgetController",
+          "kind": "class"
+        },
+        {
+          "name": "Channel",
+          "kind": "object"
+        },
+        {
+          "name": "ContextWindowAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "DiagnosticsCollector",
+          "kind": "class"
+        },
+        {
+          "name": "ExitController",
+          "kind": "class"
+        },
+        {
+          "name": "HookSystem",
+          "kind": "class"
+        },
+        {
+          "name": "LLMResultType",
+          "kind": "object"
+        },
+        {
+          "name": "LoopContext",
+          "kind": "class"
+        },
+        {
+          "name": "MAX_TOOL_CALLS_PER_ITER",
+          "kind": "number"
+        },
+        {
+          "name": "MessageAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "SimpleArrayAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "SystemPromptBuilder",
+          "kind": "class"
+        },
+        {
+          "name": "ToolExecutionPipeline",
+          "kind": "class"
+        },
+        {
+          "name": "allowlistGate",
+          "kind": "object"
+        },
+        {
+          "name": "analystVerifyOnlyGate",
+          "kind": "object"
+        },
+        {
+          "name": "buildLlmInputAssembly",
+          "kind": "function"
+        },
+        {
+          "name": "buildPcvNodeEvidenceProcessMetadata",
+          "kind": "function"
+        },
+        {
+          "name": "buildPcvNodeEvidenceSummary",
+          "kind": "function"
+        },
+        {
+          "name": "buildPcvQualityGateEvidence",
+          "kind": "function"
+        },
+        {
+          "name": "cleanFinalAnswer",
+          "kind": "function"
+        },
+        {
+          "name": "continueResult",
+          "kind": "function"
+        },
+        {
+          "name": "createExitController",
+          "kind": "function"
+        },
+        {
+          "name": "createMessageAdapter",
+          "kind": "function"
+        },
+        {
+          "name": "createPcvNodeEvidence",
+          "kind": "function"
+        },
+        {
+          "name": "createSystemRunContext",
+          "kind": "function"
+        },
+        {
+          "name": "createToolPipeline",
+          "kind": "function"
+        },
+        {
+          "name": "deterministicDuplicateGuard",
+          "kind": "object"
+        },
+        {
+          "name": "estimatePromptTokens",
+          "kind": "function"
+        },
+        {
+          "name": "eventBusPublisher",
+          "kind": "object"
+        },
+        {
+          "name": "evolutionDecisionGate",
+          "kind": "object"
+        },
+        {
+          "name": "expandSystemRunContext",
+          "kind": "function"
+        },
+        {
+          "name": "extractSourceRefsFromValue",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentInterfaceContractBranch",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentInterfaceFailureTaxonomyEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getAgentRuntimeBoundaryEntry",
+          "kind": "function"
+        },
+        {
+          "name": "getLatestPcvBurnGrounding",
+          "kind": "function"
+        },
+        {
+          "name": "isSystemRunContext",
+          "kind": "function"
+        },
+        {
+          "name": "measureLlmInputAssembly",
+          "kind": "function"
+        },
+        {
+          "name": "measurePromptText",
+          "kind": "function"
+        },
+        {
+          "name": "observationRecord",
+          "kind": "object"
+        },
+        {
+          "name": "produceForcedSummary",
+          "kind": "function"
+        },
+        {
+          "name": "progressEmitter",
+          "kind": "object"
+        },
+        {
+          "name": "projectSystemRunContext",
+          "kind": "function"
+        },
+        {
+          "name": "recordPcvInputAssembly",
+          "kind": "function"
+        },
+        {
+          "name": "recordPcvLlmOutput",
+          "kind": "function"
+        },
+        {
+          "name": "recordPcvToolResult",
+          "kind": "function"
+        },
+        {
+          "name": "recordPcvToolRoundOutcome",
+          "kind": "function"
+        },
+        {
+          "name": "recordRepairOnlyGate",
+          "kind": "object"
+        },
+        {
+          "name": "registerDefaultHooks",
+          "kind": "function"
+        },
+        {
+          "name": "resolveLlmInputStageProfile",
+          "kind": "function"
+        },
+        {
+          "name": "resolvePcvStageNodeIdentity",
+          "kind": "function"
+        },
+        {
+          "name": "submitDedup",
+          "kind": "object"
+        },
+        {
+          "name": "supportsAgentRuntimeRoute",
+          "kind": "function"
+        },
+        {
+          "name": "traceRecord",
+          "kind": "object"
+        },
+        {
+          "name": "trackerSignal",
+          "kind": "object"
+        },
+        {
+          "name": "validateAgentInterfaceContract",
+          "kind": "function"
+        }
+      ]
+    },
+    "./prompts": {
+      "exportPath": "./prompts",
+      "specifier": "@alembic/agent/prompts",
+      "exportCount": 27,
+      "signatureHash": "9e7e4ac3ed25c92430b3bbb843b30cacb78e04daa4147378da78ead0b6cc1284",
+      "entries": [
+        {
+          "name": "ANALYST_BUDGET",
+          "kind": "object"
+        },
+        {
+          "name": "ANALYST_SYSTEM_PROMPT",
+          "kind": "string"
+        },
+        {
+          "name": "ANALYST_TOOLS",
+          "kind": "array"
+        },
+        {
+          "name": "EVOLVER_BUDGET",
+          "kind": "object"
+        },
+        {
+          "name": "EVOLVER_SYSTEM_PROMPT",
+          "kind": "string"
+        },
+        {
+          "name": "EVOLVER_TOOLS",
+          "kind": "array"
+        },
+        {
+          "name": "PRODUCER_BUDGET",
+          "kind": "object"
+        },
+        {
+          "name": "PRODUCER_SYSTEM_PROMPT",
+          "kind": "string"
+        },
+        {
+          "name": "PRODUCER_TOOLS",
+          "kind": "array"
+        },
+        {
+          "name": "SCAN_TASK_CONFIGS",
+          "kind": "object"
+        },
+        {
+          "name": "analysisQualityGate",
+          "kind": "function"
+        },
+        {
+          "name": "buildAnalysisArtifact",
+          "kind": "function"
+        },
+        {
+          "name": "buildAnalysisReport",
+          "kind": "function"
+        },
+        {
+          "name": "buildAnalystPrompt",
+          "kind": "function"
+        },
+        {
+          "name": "buildCodeContextSection",
+          "kind": "function"
+        },
+        {
+          "name": "buildEvolverPrompt",
+          "kind": "function"
+        },
+        {
+          "name": "buildProducerPrompt",
+          "kind": "function"
+        },
+        {
+          "name": "buildProducerPromptV2",
+          "kind": "function"
+        },
+        {
+          "name": "buildRecordRepairPrompt",
+          "kind": "function"
+        },
+        {
+          "name": "buildRelationsPipelineStages",
+          "kind": "function"
+        },
+        {
+          "name": "buildRetryPrompt",
+          "kind": "function"
+        },
+        {
+          "name": "buildScanPipelineStages",
+          "kind": "function"
+        },
+        {
+          "name": "computeAnalystBudget",
+          "kind": "function"
+        },
+        {
+          "name": "evolutionGateEvaluator",
+          "kind": "function"
+        },
+        {
+          "name": "insightGateEvaluator",
+          "kind": "function"
+        },
+        {
+          "name": "producerRejectionGateEvaluator",
+          "kind": "function"
+        },
+        {
+          "name": "sanitizeAnalysisText",
+          "kind": "function"
+        }
+      ]
+    },
+    "./domain": {
+      "exportPath": "./domain",
+      "specifier": "@alembic/agent/domain",
+      "exportCount": 6,
+      "signatureHash": "80516633d5d2a8d7e6bdd79c05b9b08286aa91545db196e19d609d8eb889fb20",
+      "entries": [
+        {
+          "name": "CONSOLIDATION_GATE_BUDGET",
+          "kind": "object"
+        },
+        {
+          "name": "CONSOLIDATION_GATE_SYSTEM_PROMPT",
+          "kind": "string"
+        },
+        {
+          "name": "CONSOLIDATION_GATE_TOOLS",
+          "kind": "array"
+        },
+        {
+          "name": "EpisodicConsolidator",
+          "kind": "class"
+        },
+        {
+          "name": "EvidenceCollector",
+          "kind": "class"
+        },
+        {
+          "name": "buildConsolidationGatePrompt",
+          "kind": "function"
+        }
+      ]
+    },
+    "./forge": {
+      "exportPath": "./forge",
+      "specifier": "@alembic/agent/forge",
+      "exportCount": 5,
+      "signatureHash": "290ed4e0ef57a115e24d2fe55592a1955cd7c648aa9091ced7105d260efe104e",
+      "entries": [
+        {
+          "name": "DynamicComposer",
+          "kind": "class"
+        },
+        {
+          "name": "SandboxRunner",
+          "kind": "class"
+        },
+        {
+          "name": "TemporaryToolRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "ToolForge",
+          "kind": "class"
+        },
+        {
+          "name": "ToolRequirementAnalyzer",
+          "kind": "class"
+        }
+      ]
+    },
+    "./tasks": {
+      "exportPath": "./tasks",
+      "specifier": "@alembic/agent/tasks",
+      "exportCount": 5,
+      "signatureHash": "bd7000fae7f0b7c8a00243b7a376628089e3cabb22c3fc6dec5295cc39e0be83",
+      "entries": [
+        {
+          "name": "taskCheckAndSubmit",
+          "kind": "function"
+        },
+        {
+          "name": "taskDiscoverAllRelations",
+          "kind": "function"
+        },
+        {
+          "name": "taskFullEnrich",
+          "kind": "function"
+        },
+        {
+          "name": "taskGuardFullScan",
+          "kind": "function"
+        },
+        {
+          "name": "taskQualityAudit",
+          "kind": "function"
+        }
+      ]
+    },
+    "./profiles": {
+      "exportPath": "./profiles",
+      "specifier": "@alembic/agent/profiles",
+      "exportCount": 7,
+      "signatureHash": "9a9002c9205acdc7a211a2c7a9777c87239cdb5dfd31a38eed34ead5094eb609",
+      "entries": [
+        {
+          "name": "AgentProfileCompiler",
+          "kind": "class"
+        },
+        {
+          "name": "AgentProfileRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "AgentStageFactoryRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "BUILTIN_PROFILES",
+          "kind": "array"
+        },
+        {
+          "name": "PRESETS",
+          "kind": "object"
+        },
+        {
+          "name": "getPreset",
+          "kind": "function"
+        },
+        {
+          "name": "resolveStrategy",
+          "kind": "function"
+        }
+      ]
+    },
+    "./ai": {
+      "exportPath": "./ai",
+      "specifier": "@alembic/agent/ai",
+      "exportCount": 28,
+      "signatureHash": "f02f8f3e1a64892c6ef42a413722b9f077ac7a9c076286567116ed112fadaf12",
+      "entries": [
+        {
+          "name": "AiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "AiProviderManager",
+          "kind": "class"
+        },
+        {
+          "name": "ClaudeProvider",
+          "kind": "class"
+        },
+        {
+          "name": "ClaudeTransport",
+          "kind": "class"
+        },
+        {
+          "name": "DeepSeekProvider",
+          "kind": "class"
+        },
+        {
+          "name": "DeepSeekTransport",
+          "kind": "class"
+        },
+        {
+          "name": "GoogleGeminiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "GoogleTransport",
+          "kind": "class"
+        },
+        {
+          "name": "LLMGateway",
+          "kind": "class"
+        },
+        {
+          "name": "LLMTransport",
+          "kind": "class"
+        },
+        {
+          "name": "ModelRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "OllamaProvider",
+          "kind": "class"
+        },
+        {
+          "name": "OpenAiProvider",
+          "kind": "class"
+        },
+        {
+          "name": "OpenAiTransport",
+          "kind": "class"
+        },
+        {
+          "name": "PROVIDER_CONFIGS",
+          "kind": "array"
+        },
+        {
+          "name": "ParameterGuard",
+          "kind": "class"
+        },
+        {
+          "name": "autoDetectProvider",
+          "kind": "function"
+        },
+        {
+          "name": "createEmbedProvider",
+          "kind": "function"
+        },
+        {
+          "name": "createMissingApiKeyError",
+          "kind": "function"
+        },
+        {
+          "name": "createProvider",
+          "kind": "function"
+        },
+        {
+          "name": "getAiConfigInfo",
+          "kind": "function"
+        },
+        {
+          "name": "getAvailableFallbacks",
+          "kind": "function"
+        },
+        {
+          "name": "getLLMGateway",
+          "kind": "function"
+        },
+        {
+          "name": "getModelRegistry",
+          "kind": "function"
+        },
+        {
+          "name": "getProviderConfig",
+          "kind": "function"
+        },
+        {
+          "name": "getProviderWithFallback",
+          "kind": "function"
+        },
+        {
+          "name": "isGeoOrProviderError",
+          "kind": "function"
+        },
+        {
+          "name": "resetLLMGateway",
+          "kind": "function"
+        }
+      ]
+    },
+    "./tools": {
+      "exportPath": "./tools",
+      "specifier": "@alembic/agent/tools",
+      "exportCount": 65,
+      "signatureHash": "db81ea371fe1cdf7b9a0b7e2f305c03e8803b67d281552ed9f960d8b8c32e4ef",
+      "entries": [
+        {
+          "name": "BootstrapAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "BootstrapProduce",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityV2",
+          "kind": "class"
+        },
+        {
+          "name": "ConversationV2",
+          "kind": "class"
+        },
+        {
+          "name": "DeltaCache",
+          "kind": "class"
+        },
+        {
+          "name": "Evolution",
+          "kind": "class"
+        },
+        {
+          "name": "LightweightRouter",
+          "kind": "class"
+        },
+        {
+          "name": "OutputCompressor",
+          "kind": "class"
+        },
+        {
+          "name": "ScanAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "ScanProduce",
+          "kind": "class"
+        },
+        {
+          "name": "SearchCache",
+          "kind": "class"
+        },
+        {
+          "name": "SystemV2",
+          "kind": "class"
+        },
+        {
+          "name": "TERMINAL_CAPABILITY_MANIFESTS",
+          "kind": "array"
+        },
+        {
+          "name": "TERMINAL_PTY_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_RUN_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SCRIPT_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLEANUP_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLOSE_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_STATUS_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SHELL_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TOOL_REGISTRY",
+          "kind": "object"
+        },
+        {
+          "name": "TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS",
+          "kind": "array"
+        },
+        {
+          "name": "ToolRouterV2",
+          "kind": "class"
+        },
+        {
+          "name": "UnifiedToolCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "V2CapabilityCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "V2ToolRouterAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "WorkflowRegistry",
+          "kind": "class"
+        },
+        {
+          "name": "allowToolDecision",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalCommandPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalPtyPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalScriptPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalSessionPlan",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalShellPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "cleanOutput",
+          "kind": "function"
+        },
+        {
+          "name": "contextFromToolCall",
+          "kind": "function"
+        },
+        {
+          "name": "createToolRoutingServiceContract",
+          "kind": "function"
+        },
+        {
+          "name": "denyToolDecision",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForError",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForPolicyBlock",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForSessionResult",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForTerminalResult",
+          "kind": "function"
+        },
+        {
+          "name": "estimateTokens",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalCommandPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalPtyPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalScriptPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalShellPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "fail",
+          "kind": "function"
+        },
+        {
+          "name": "generateLightweightSchemas",
+          "kind": "function"
+        },
+        {
+          "name": "getActionNames",
+          "kind": "function"
+        },
+        {
+          "name": "getToolNames",
+          "kind": "function"
+        },
+        {
+          "name": "isToolResultEnvelope",
+          "kind": "function"
+        },
+        {
+          "name": "ok",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitDiffOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitLogOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitStatusOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGrepOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseLintOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parsePackageOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTestOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTreeOutput",
+          "kind": "function"
+        },
+        {
+          "name": "presentToolResult",
+          "kind": "function"
+        },
+        {
+          "name": "projectToolResultOrdinaryOutput",
+          "kind": "function"
+        },
+        {
+          "name": "resolveToolRouterFromContext",
+          "kind": "function"
+        },
+        {
+          "name": "truncateOutput",
+          "kind": "function"
+        }
+      ]
+    },
+    "./tools/v2": {
+      "exportPath": "./tools/v2",
+      "specifier": "@alembic/agent/tools/v2",
+      "exportCount": 31,
+      "signatureHash": "8d3d5feb89f6fefab071a76054f42a20b6745143493d8fa2a7dc9134717b8a94",
+      "entries": [
+        {
+          "name": "BootstrapAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "BootstrapProduce",
+          "kind": "class"
+        },
+        {
+          "name": "CapabilityV2",
+          "kind": "class"
+        },
+        {
+          "name": "ConversationV2",
+          "kind": "class"
+        },
+        {
+          "name": "DeltaCache",
+          "kind": "class"
+        },
+        {
+          "name": "Evolution",
+          "kind": "class"
+        },
+        {
+          "name": "OutputCompressor",
+          "kind": "class"
+        },
+        {
+          "name": "ScanAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "ScanProduce",
+          "kind": "class"
+        },
+        {
+          "name": "SearchCache",
+          "kind": "class"
+        },
+        {
+          "name": "SystemV2",
+          "kind": "class"
+        },
+        {
+          "name": "TOOL_REGISTRY",
+          "kind": "object"
+        },
+        {
+          "name": "ToolRouterV2",
+          "kind": "class"
+        },
+        {
+          "name": "V2CapabilityCatalog",
+          "kind": "class"
+        },
+        {
+          "name": "V2ToolRouterAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "cleanOutput",
+          "kind": "function"
+        },
+        {
+          "name": "estimateTokens",
+          "kind": "function"
+        },
+        {
+          "name": "fail",
+          "kind": "function"
+        },
+        {
+          "name": "generateLightweightSchemas",
+          "kind": "function"
+        },
+        {
+          "name": "getActionNames",
+          "kind": "function"
+        },
+        {
+          "name": "getToolNames",
+          "kind": "function"
+        },
+        {
+          "name": "ok",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitDiffOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitLogOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGitStatusOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseGrepOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseLintOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parsePackageOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTestOutput",
+          "kind": "function"
+        },
+        {
+          "name": "parseTreeOutput",
+          "kind": "function"
+        },
+        {
+          "name": "truncateOutput",
+          "kind": "function"
+        }
+      ]
+    },
+    "./tools/terminal": {
+      "exportPath": "./tools/terminal",
+      "specifier": "@alembic/agent/tools/terminal",
+      "exportCount": 21,
+      "signatureHash": "8e82b16be5de7dbecb8a5159b8316d48e87ef441fb5d31e9fb7abb3581c4dcbb",
+      "entries": [
+        {
+          "name": "TERMINAL_CAPABILITY_MANIFESTS",
+          "kind": "array"
+        },
+        {
+          "name": "TERMINAL_PTY_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_RUN_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SCRIPT_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLEANUP_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_CLOSE_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SESSION_STATUS_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "TERMINAL_SHELL_CAPABILITY",
+          "kind": "object"
+        },
+        {
+          "name": "buildTerminalCommandPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalPtyPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalScriptPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalSessionPlan",
+          "kind": "function"
+        },
+        {
+          "name": "buildTerminalShellPolicyInput",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForError",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForPolicyBlock",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForSessionResult",
+          "kind": "function"
+        },
+        {
+          "name": "envelopeForTerminalResult",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalCommandPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalPtyPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalScriptPolicy",
+          "kind": "function"
+        },
+        {
+          "name": "evaluateTerminalShellPolicy",
+          "kind": "function"
+        }
+      ]
+    },
+    "./memory": {
+      "exportPath": "./memory",
+      "specifier": "@alembic/agent/memory",
+      "exportCount": 14,
+      "signatureHash": "1f1dacd0e846c9dcb41be7a4b278528ab45455b3802a76560ac0f4b06920b66f",
+      "entries": [
+        {
+          "name": "ActiveContext",
+          "kind": "class"
+        },
+        {
+          "name": "MEMORY_STORE_REQUIRED_COLUMNS",
+          "kind": "array"
+        },
+        {
+          "name": "MEMORY_STORE_SEMANTIC_TABLE",
+          "kind": "string"
+        },
+        {
+          "name": "MemoryConsolidator",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryCoordinator",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryEmbeddingStore",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryRetriever",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryStore",
+          "kind": "class"
+        },
+        {
+          "name": "MemoryStoreWriteError",
+          "kind": "class"
+        },
+        {
+          "name": "PersistentMemory",
+          "kind": "class"
+        },
+        {
+          "name": "SessionStore",
+          "kind": "class"
+        },
+        {
+          "name": "assertMemoryStoreSchemaShape",
+          "kind": "function"
+        },
+        {
+          "name": "extractHighPriorityFindings",
+          "kind": "function"
+        },
+        {
+          "name": "validateSessionStoreShape",
+          "kind": "function"
+        }
+      ]
+    },
+    "./context": {
+      "exportPath": "./context",
+      "specifier": "@alembic/agent/context",
+      "exportCount": 20,
+      "signatureHash": "66c6c9f329c57c087d722aa98adc312c87e080a9b6e45b893272747319d2105d",
+      "entries": [
+        {
+          "name": "ContextWindow",
+          "kind": "class"
+        },
+        {
+          "name": "ConversationStore",
+          "kind": "class"
+        },
+        {
+          "name": "DEFAULT_REFLECTION_INTERVAL",
+          "kind": "number"
+        },
+        {
+          "name": "DEFAULT_REPLAN_INTERVAL",
+          "kind": "number"
+        },
+        {
+          "name": "ExplorationTracker",
+          "kind": "class"
+        },
+        {
+          "name": "NudgeGenerator",
+          "kind": "class"
+        },
+        {
+          "name": "PlanTracker",
+          "kind": "class"
+        },
+        {
+          "name": "SEARCH_TOOLS",
+          "kind": "object"
+        },
+        {
+          "name": "STRATEGY_ANALYST",
+          "kind": "object"
+        },
+        {
+          "name": "STRATEGY_PRODUCER",
+          "kind": "object"
+        },
+        {
+          "name": "SignalDetector",
+          "kind": "class"
+        },
+        {
+          "name": "buildL4MemoryPackage",
+          "kind": "function"
+        },
+        {
+          "name": "createBootstrapStrategy",
+          "kind": "function"
+        },
+        {
+          "name": "formatL4MemorySummary",
+          "kind": "function"
+        },
+        {
+          "name": "isSearchAction",
+          "kind": "function"
+        },
+        {
+          "name": "limitToolResult",
+          "kind": "function"
+        },
+        {
+          "name": "renderL4MemoryPackage",
+          "kind": "function"
+        },
+        {
+          "name": "targetMemoryFindingCount",
+          "kind": "function"
+        },
+        {
+          "name": "targetProducerSubmitCount",
+          "kind": "function"
+        },
+        {
+          "name": "validateL4Summary",
+          "kind": "function"
+        }
+      ]
+    }
+  }
+}

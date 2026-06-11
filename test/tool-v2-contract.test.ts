@@ -140,6 +140,69 @@ describe('Tool V2 contract exports', () => {
     expect(envelope.cache?.policy).toBe('none');
   });
 
+  it('binds V2 terminal exec calls to the injected sandbox executor', async () => {
+    const router = new ToolRouterV2();
+    const parsed = router.parseToolCall('terminal', {
+      action: 'exec',
+      params: { command: 'node -v', timeout: 1000 },
+    });
+    const calls: Array<{ command: string; cwd: string; timeout: number }> = [];
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      sandboxExecutor: {
+        exec: async (
+          command: string,
+          opts: { cwd: string; projectRoot: string; timeout: number; signal?: AbortSignal }
+        ) => {
+          calls.push({ command, cwd: opts.cwd, timeout: opts.timeout });
+          return { stdout: 'v22.0.0\n', stderr: '', exitCode: 0 };
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toBe('v22.0.0');
+    expect(calls).toEqual([
+      { command: 'node -v', cwd: baseToolContext().projectRoot, timeout: 1000 },
+    ]);
+  });
+
+  it('routes V2 terminal cancellation as a structured partial timeout result', async () => {
+    const router = new ToolRouterV2();
+    const abortController = new AbortController();
+    abortController.abort();
+    const parsed = router.parseToolCall('terminal', {
+      action: 'exec',
+      params: { command: 'node -e "setTimeout(() => {}, 1000)"' },
+    });
+
+    expect('error' in parsed).toBe(false);
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+
+    const result = await router.execute(parsed, {
+      ...baseToolContext(),
+      abortSignal: abortController.signal,
+      sandboxExecutor: {
+        exec: async (_command: string, opts: { signal?: AbortSignal }) => {
+          expect(opts.signal?.aborted).toBe(true);
+          return { stdout: 'partial output\n', stderr: '', exitCode: 137 };
+        },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(String(result.data)).toContain('[timeout] partial output');
+    expect(String(result.data)).toContain('partial output');
+  });
+
   it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
     const router = new ToolRouterV2();
     const createRequests: Array<{

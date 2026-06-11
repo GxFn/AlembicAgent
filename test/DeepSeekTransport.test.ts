@@ -167,4 +167,49 @@ describe('DeepSeekTransport tool transcript preflight', () => {
       },
     ]);
   });
+
+  it('treats malformed provider bodies as empty text without fabricating tool calls', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+    mockDeepSeekFetch(capture, {
+      choices: [{ not_a_message: true }],
+      usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 },
+    });
+
+    const result = await transport.chatWithTools({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'call a tool only if valid' }],
+      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'auto',
+      maxTokens: 1024,
+    });
+
+    expect(result).toMatchObject({
+      text: null,
+      functionCalls: null,
+      usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 },
+    });
+  });
+
+  it('surfaces mid-stream JSON body drops instead of returning a false success', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => {
+          throw new Error('provider body stream terminated');
+        },
+        text: async () => '',
+      })) as unknown as typeof fetch
+    );
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+
+    await expect(
+      transport.chat({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: 'hello' }],
+        maxTokens: 64,
+      })
+    ).rejects.toThrow('provider body stream terminated');
+  });
 });

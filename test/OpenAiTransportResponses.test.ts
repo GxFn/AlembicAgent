@@ -101,4 +101,33 @@ describe('OpenAiTransport apiStyle=responses', () => {
     });
     expect(capture.body?.text).toEqual({ format: { type: 'json_object' } });
   });
+
+  it('propagates streaming abort signals through the provider fetch path', async () => {
+    const abortController = new AbortController();
+    let requestSignal: AbortSignal | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async (_url: string | URL | Request, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            requestSignal = init?.signal ?? null;
+            requestSignal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted by caller'), { name: 'AbortError' }));
+            });
+          })
+      )
+    );
+    const transport = new OpenAiTransport({ apiKey: 'k', apiStyle: 'responses' });
+    const pending = transport.chat({
+      model: 'gpt-5.1',
+      messages: [{ role: 'user', content: 'cancel this' }],
+      maxTokens: 64,
+      abortSignal: abortController.signal,
+    });
+
+    abortController.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(requestSignal?.aborted).toBe(true);
+  });
 });

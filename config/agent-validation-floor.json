@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-12",
+  "description": "AG4 validation-floor snapshot. Floors may only shrink with a controller-reviewed boundary decision; test counts should grow with new source surfaces, stable export count is exact, Core reference baseline is exact through core-import-boundary, and pack entries must not fall below this source-package preview floor.",
+  "rules": {
+    "tests": "minimumDeclaredTestCases and minimumTestFiles are floors; increases are allowed and should update this snapshot when intentional.",
+    "publicExports": "stablePublicExportCount is exact and must match agent-public-api-boundary.json plus package.json exports.",
+    "coreReferences": "coreReferenceLimitTotal is exact from positive config/core-import-boundary.json referenceLimits; actual forbidden/deep imports remain enforced by lint:core-import-boundary.",
+    "packEntries": "minimumPackEntries is a floor from npm pack --dry-run --ignore-scripts; decreases require release-boundary review."
+  },
+  "minimumTestFiles": 31,
+  "minimumDeclaredTestCases": 235,
+  "stablePublicExportCount": 15,
+  "coreReferenceLimitTotal": 51,
+  "minimumPackEntries": 434,
+  "requiredCoverageSuites": [
+    {
+      "name": "forge",
+      "pattern": "describe('forge public contracts'"
+    },
+    {
+      "name": "tasks",
+      "pattern": "describe('task handler public contracts'"
+    },
+    {
+      "name": "policies",
+      "pattern": "describe('policy public contracts'"
+    },
+    {
+      "name": "profiles",
+      "pattern": "describe('profile public contracts'"
+    },
+    {
+      "name": "coordination",
+      "pattern": "describe('coordination public contracts'"
+    },
+    {
+      "name": "v2 terminal execution",
+      "pattern": "binds V2 terminal exec calls to the injected sandbox executor"
+    },
+    {
+      "name": "v2 terminal cancellation",
+      "pattern": "routes V2 terminal cancellation as a structured partial timeout result"
+    },
+    {
+      "name": "terminal session execution",
+      "pattern": "leases persistent terminal sessions for execution and releases portable records"
+    },
+    {
+      "name": "provider malformed body",
+      "pattern": "treats malformed provider bodies as empty text without fabricating tool calls"
+    },
+    {
+      "name": "provider mid-stream drop",
+      "pattern": "surfaces mid-stream JSON body drops instead of returning a false success"
+    },
+    {
+      "name": "provider streaming abort",
+      "pattern": "propagates streaming abort signals through the provider fetch path"
+    }
+  ]
+}
