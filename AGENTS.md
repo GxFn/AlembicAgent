@@ -137,6 +137,28 @@ This section is maintained by the Wakeflow runtime installer. It records this wi
 - 不要把 API key、token、用户路径或本机绝对路径写入长期文档、fixture 或提交。
 - 不要回退其他窗口或用户已有改动；如果工作区已有无关变更，只处理当前任务需要的文件。
 
+## 工具系统 V1 退役登记（2026-06-11）
+
+本节是退役意向登记，不是删除授权；登记本身不改变任何代码。
+
+- V2（`src/tools/v2/`）是本仓库的主工具系统（primary tool system）。
+- V1 表面（`src/tools/core/`：InternalToolHandler、LightweightRouter、ToolCallContext、
+  ToolContracts、ToolDecision、ToolResultEnvelope、ToolResultPresenter、
+  ToolRoutingServices）与 `V2ToolRouterAdapter`（`src/tools/v2/adapter/`）仅作
+  兼容层保留（compatibility-only），不得在其上扩展新能力。
+- 当前消费方（2026-06-11 扫描）：
+  - `src/tools/v2/adapter/V2ToolRouterAdapter.ts` 通过 V1 `ToolRouterContract` /
+    `ToolDecision` / `ToolResultEnvelope` 适配 V2 路由；
+  - `src/agent/runtime/AgentRuntimeBoundary.ts` 在 runtime boundary manifest 中
+    引用 `V2ToolRouterAdapter`；
+  - 此外 V1 的 contract 类型（`ToolContracts` / `ToolResultEnvelope` /
+    `ToolCallContext` / `InternalToolHandler`）仍是 runtime、catalog、terminal、
+    workflow、forge、tasks 等模块共享的类型词汇（约 15 个 src 文件 type-import）。
+- 退役条件：V1 表面与 adapter 的删除/结构收敛属于 RC6 SD-3 决策
+  （demand 序列 `alembic-redundancy-stale-logic-cleanup`）；在 SD-3 决策落地并给出
+  替代 contract 入口、消费方迁移路径和验证证据之前，不得删除 V1 或合并两套系统。
+- 登记 owner：AlembicAgent 窗口；触发复查时机：RC6 SD-3 决策记录产生时。
+
 ## 长期维护规则
 
 - 改 Agent/tool 前先确认 Core contract、宿主边界和真实调用链。

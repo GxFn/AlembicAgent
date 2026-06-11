@@ -16,6 +16,15 @@
  *   - embedding 已迁移至 MemoryEmbeddingStore (JSON sidecar)
  *   - 数据序列化/反序列化统一在此层处理
  *
+ * 边界说明（2026-06-11）:
+ *   - `semantic_memories` 表的 schema 所有权在 Core（`@alembic/core/memory`）：
+ *     schema.ts 定义表结构，migration 001 负责建表，MemoryRepository.ts 是 Core 侧
+ *     仓储实现。本文件只通过 ensureSemanticMemorySchema 消费该 schema，
+ *     不得在 Agent 侧另行定义或迁移该表结构。
+ *   - 本 raw-SQL 同步 adapter 的长期归属（留在 Agent 还是下沉 Core）待 RC6 SD-4
+ *     决策（demand 序列 `alembic-redundancy-stale-logic-cleanup`）；
+ *     SD-4 决策落地前不做任何代码搬移。
+ *
  * @module MemoryStore
  */
 

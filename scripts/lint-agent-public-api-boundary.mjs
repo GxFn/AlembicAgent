@@ -181,27 +181,50 @@ if (packageJson.name !== '@alembic/agent') {
 const exportedPaths = Object.keys(packageJson.exports ?? {}).sort();
 const publicSpecifiers = new Set(exportedPaths.map((exportPath) => specifierForExport(exportPath)));
 const classifiedPaths = [];
-const counts = {
-  'stable-public': 0,
-  'provisional-public': 0,
-  'transitional-internal': 0,
-  forbidden: 0,
-};
+const statusByExport = new Map();
 
 for (const [status, key] of statuses) {
   const values = asArray(policy[key]);
   assertUnique(key, values);
-  counts[status] = values.length;
   classifiedPaths.push(...values);
+  for (const value of values) {
+    statusByExport.set(value, status);
+  }
+}
+
+// Counts are computed mechanically from package.json exports (classified through the
+// reviewed policy arrays), never trusted from hand-written numbers. expectedCounts in
+// the config stays the reviewed source of intent and must match the computed reality.
+const computedCounts = {
+  'stable-public': 0,
+  'provisional-public': 0,
+  'transitional-internal': 0,
+};
+
+for (const exportPath of exportedPaths) {
+  const status = statusByExport.get(exportPath);
+  if (status) {
+    computedCounts[status] += 1;
+  }
+  // Exports missing from every policy array are reported by compareSets below.
 }
 
 const expectedCounts = policy.expectedCounts ?? {};
-for (const [status, count] of Object.entries(counts)) {
-  if (expectedCounts[status] !== count) {
-    violations.push(
-      `expectedCounts["${status}"] is ${expectedCounts[status]}, actual policy count is ${count}`
+const countDiffLines = [];
+for (const [status, computed] of Object.entries(computedCounts)) {
+  if (expectedCounts[status] !== computed) {
+    countDiffLines.push(
+      `    ${status}: expected ${expectedCounts[status] ?? '<missing>'}, actual ${computed}`
     );
   }
+}
+if (countDiffLines.length > 0) {
+  violations.push(
+    [
+      'expectedCounts does not match counts computed from package.json exports:',
+      ...countDiffLines,
+    ].join('\n')
+  );
 }
 
 compareSets('package exports', exportedPaths, classifiedPaths);
@@ -222,8 +245,6 @@ for (const exportPath of exportedPaths) {
   }
 }
 
-const forbiddenConsumerSpecifiers = asArray(policy.forbiddenConsumerSpecifiers);
-counts.forbidden = forbiddenConsumerSpecifiers.length;
 if (expectedCounts.forbidden !== 0) {
   violations.push(
     'expectedCounts["forbidden"] must stay 0; forbidden patterns are rules, not exports'
