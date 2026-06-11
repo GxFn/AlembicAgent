@@ -7,13 +7,14 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { ToolCallRequest, ToolRouterContract } from '#tools/core/ToolContracts.js';
-import type { ToolDecision } from '#tools/core/ToolDecision.js';
 import type {
+  ToolCallRequest,
+  ToolDecision,
   ToolResultDiagnostics,
   ToolResultEnvelope,
   ToolResultTrust,
-} from '#tools/core/ToolResultEnvelope.js';
+  ToolRouterContract,
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import { ToolRouterV2 } from '../router.js';
 import type { CapabilityV2Def, ToolContext, ToolResult } from '../types.js';
 

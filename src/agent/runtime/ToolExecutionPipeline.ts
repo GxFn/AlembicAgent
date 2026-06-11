@@ -18,12 +18,12 @@
  */
 
 import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
-import type { ToolCallRequest } from '#tools/core/ToolContracts.js';
 import {
   projectToolResultOrdinaryOutput,
+  type ToolCallRequest,
   type ToolResultEnvelope,
   type ToolResultStatus,
-} from '#tools/core/ToolResultEnvelope.js';
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import { SafetyPolicy } from '../policies/index.js';
 import type { AgentRuntime } from './AgentRuntime.js';
 import type { LoopContext } from './LoopContext.js';

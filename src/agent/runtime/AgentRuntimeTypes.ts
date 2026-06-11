@@ -7,13 +7,15 @@
  * @module AgentRuntimeTypes
  */
 
+import type { ToolResultEnvelope, ToolRouterContract } from '#tools/runtime/ToolRuntimeBridge.js';
+
 /** Tool call entry recorded during execution */
 export interface ToolCallEntry {
   tool: string;
   name?: string;
   args: Record<string, unknown>;
   result: unknown;
-  envelope?: import('#tools/core/ToolResultEnvelope.js').ToolResultEnvelope;
+  envelope?: ToolResultEnvelope;
   durationMs: number;
 }
 
@@ -181,7 +183,7 @@ export interface ToolMetadata {
   durationMs: number;
   dedupMessage?: string;
   isSubmit?: boolean;
-  envelope?: import('#tools/core/ToolResultEnvelope.js').ToolResultEnvelope;
+  envelope?: ToolResultEnvelope;
   duplicateShortCircuit?: boolean;
   cacheEligible?: boolean;
   cacheMiss?: boolean;
@@ -199,7 +201,7 @@ export interface RuntimeConfig {
   presetName?: string;
   aiProvider: import('#ai/AiProvider.js').AiProvider;
   toolRegistry: import('#tools/catalog/UnifiedToolCatalog.js').UnifiedToolCatalog;
-  toolRouter?: import('#tools/core/ToolContracts.js').ToolRouterContract | null;
+  toolRouter?: ToolRouterContract | null;
   container?: Record<string, unknown> | null;
   capabilities?: import('../capabilities/index.js').Capability[];
   strategy: import('../strategies/index.js').Strategy;

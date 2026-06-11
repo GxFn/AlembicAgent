@@ -1,5 +1,5 @@
 import Logger from '@alembic/core/logging';
-import type { ToolRouterContract } from '#tools/core/ToolContracts.js';
+import type { ToolRouterContract } from '#tools/runtime/ToolRuntimeBridge.js';
 import { CapabilityRegistry } from '../capabilities/index.js';
 import { type Policy, PolicyEngine } from '../policies/index.js';
 import { getPreset } from '../profiles/presets.js';

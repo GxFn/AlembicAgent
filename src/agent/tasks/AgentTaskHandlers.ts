@@ -8,7 +8,7 @@
 import {
   projectToolResultOrdinaryOutput,
   type ToolResultEnvelope,
-} from '#tools/core/ToolResultEnvelope.js';
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
 export interface TaskAiProvider {

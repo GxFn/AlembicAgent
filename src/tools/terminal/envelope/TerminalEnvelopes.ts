@@ -1,9 +1,9 @@
-import type { ToolExecutionRequest } from '#tools/core/ToolContracts.js';
 import type {
   ToolArtifactRef,
+  ToolExecutionRequest,
   ToolResultEnvelope,
   ToolResultStatus,
-} from '#tools/core/ToolResultEnvelope.js';
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import type { TerminalSessionRecord } from '../session/TerminalSessionManager.js';
 
 export type TerminalPolicyLike = {

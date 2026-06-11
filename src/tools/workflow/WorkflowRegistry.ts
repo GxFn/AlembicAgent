@@ -1,5 +1,4 @@
-import type { ToolCallContext } from '#tools/core/ToolCallContext.js';
-import type { ToolRouterContract } from '#tools/core/ToolContracts.js';
+import type { ToolCallContext, ToolRouterContract } from '#tools/runtime/ToolRuntimeBridge.js';
 
 export interface WorkflowHandlerContext {
   toolCallContext: ToolCallContext;

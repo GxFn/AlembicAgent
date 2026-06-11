@@ -4,6 +4,8 @@
  * V2 工具系统核心类型定义 — 所有 handler、router、capability 的类型基础。
  */
 
+import type { ToolRuntimeCallContext } from '#tools/runtime/ToolRuntimeBridge.js';
+
 /** JSON Schema 类型简化定义，避免外部依赖 */
 export type JSONSchema4 = Record<string, unknown>;
 
@@ -144,7 +146,7 @@ export interface ToolContext {
   memoryCoordinator?: MemoryCoordinatorLike;
 
   /** Runtime metadata from AgentRuntime, used by write tools to inject system-owned fields. */
-  runtime?: import('#tools/core/ToolCallContext.js').ToolRuntimeCallContext;
+  runtime?: ToolRuntimeCallContext;
 }
 
 /** action handler 函数签名 */

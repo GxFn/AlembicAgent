@@ -16,7 +16,7 @@ import Logger from '@alembic/core/logging';
 import type {
   ForgedInternalToolStore,
   InternalToolHandler,
-} from '#tools/core/InternalToolHandler.js';
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import type { WorkflowHandler } from '#tools/workflow/WorkflowRegistry.js';
 
 /* ────────────────────── Types ────────────────────── */

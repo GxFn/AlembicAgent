@@ -10,9 +10,11 @@
  */
 
 import Logger from '@alembic/core/logging';
-import type { ToolRouterContract } from '#tools/core/ToolContracts.js';
-import { projectToolResultOrdinaryOutput } from '#tools/core/ToolResultEnvelope.js';
-import { resolveToolRouterFromContext } from '#tools/core/ToolRoutingServices.js';
+import {
+  projectToolResultOrdinaryOutput,
+  resolveToolRouterFromContext,
+  type ToolRouterContract,
+} from '#tools/runtime/ToolRuntimeBridge.js';
 import type { WorkflowHandler, WorkflowHandlerContext } from '#tools/workflow/WorkflowRegistry.js';
 
 /* ────────────────────── Types ────────────────────── */

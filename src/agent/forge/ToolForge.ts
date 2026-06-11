@@ -13,7 +13,7 @@ import type { SignalBus } from '@alembic/core/events';
 import Logger from '@alembic/core/logging';
 import type { CapabilityCatalog } from '#tools/catalog/CapabilityCatalog.js';
 import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
-import type { ForgedInternalToolStore } from '#tools/core/InternalToolHandler.js';
+import type { ForgedInternalToolStore } from '#tools/runtime/ToolRuntimeBridge.js';
 import type { WorkflowHandler, WorkflowRegistry } from '#tools/workflow/WorkflowRegistry.js';
 import type { CompositionSpec } from './DynamicComposer.js';
 import { DynamicComposer } from './DynamicComposer.js';

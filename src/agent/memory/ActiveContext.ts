@@ -21,7 +21,7 @@
  */
 
 import Logger from '@alembic/core/logging';
-import type { ToolResultEnvelope } from '#tools/core/ToolResultEnvelope.js';
+import type { ToolResultEnvelope } from '#tools/runtime/ToolRuntimeBridge.js';
 import type { DistilledContext } from './memory-flush-contract.js';
 
 // ═══════════════════════════════════════════════════════════

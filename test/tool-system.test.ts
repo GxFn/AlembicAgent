@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -16,6 +18,18 @@ import {
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
+
+function walkSource(dir: string, acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const filePath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkSource(filePath, acc);
+    } else if (entry.name.endsWith('.ts')) {
+      acc.push(filePath);
+    }
+  }
+  return acc;
+}
 
 function createManifest(overrides: Partial<ToolCapabilityManifest> = {}): ToolCapabilityManifest {
   const manifest: ToolCapabilityManifest = {
@@ -199,6 +213,44 @@ function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResu
     },
   };
 }
+
+describe('ToolRuntimeBridge', () => {
+  it('keeps V1/core package-alias imports behind the runtime bridge outside core', () => {
+    const sourceFiles = walkSource(path.join(process.cwd(), 'src'));
+    const directCoreImporters = sourceFiles
+      .map((filePath) => ({
+        file: path.relative(process.cwd(), filePath),
+        text: readFileSync(filePath, 'utf8'),
+      }))
+      .filter(({ text }) => text.includes('#tools/core'));
+
+    const nonCoreImporters = directCoreImporters
+      .filter(({ file }) => !file.startsWith('src/tools/core/'))
+      .map(({ file }) => file)
+      .sort();
+
+    expect(nonCoreImporters).toEqual(['src/tools/runtime/ToolRuntimeBridge.ts']);
+  });
+
+  it('keeps the public ./tools V1 re-export surface explicit until downstream migration', () => {
+    const toolsIndex = readFileSync(path.join(process.cwd(), 'src/tools/index.ts'), 'utf8');
+    const coreReexports = toolsIndex
+      .split('\n')
+      .filter((line) => line.startsWith("export * from './core/"))
+      .map((line) => line.trim());
+
+    expect(coreReexports).toEqual([
+      "export * from './core/InternalToolHandler.js';",
+      "export * from './core/LightweightRouter.js';",
+      "export * from './core/ToolCallContext.js';",
+      "export * from './core/ToolContracts.js';",
+      "export * from './core/ToolDecision.js';",
+      "export * from './core/ToolResultEnvelope.js';",
+      "export * from './core/ToolResultPresenter.js';",
+      "export * from './core/ToolRoutingServices.js';",
+    ]);
+  });
+});
 
 describe('UnifiedToolCatalog', () => {
   it('projects tool schemas and preserves internal handler access', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
-import type { ToolResultEnvelope } from '../src/tools/core/ToolResultEnvelope.js';
+import type { ToolResultEnvelope } from '../src/tools/runtime/ToolRuntimeBridge.js';
 
 function envelope(
   overrides: Partial<ToolResultEnvelope> & {

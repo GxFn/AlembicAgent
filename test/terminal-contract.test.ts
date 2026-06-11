@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ToolExecutionRequest } from '../src/tools/core/ToolContracts.js';
-import { allowToolDecision } from '../src/tools/core/ToolDecision.js';
+import {
+  allowToolDecision,
+  type ToolExecutionRequest,
+} from '../src/tools/runtime/ToolRuntimeBridge.js';
 import {
   buildTerminalCommandPolicyInput,
   buildTerminalPtyPolicyInput,
