@@ -43,7 +43,9 @@ const BOUNDARY_ENTRIES = [
   {
     area: 'tool-execution',
     owner: 'agent',
-    publicSubpath: '@alembic/agent/tools',
+    // Train B IC3 retired the ./tools aggregate subpath; generic tool contracts
+    // stay public through the root facade, which re-exports the tools barrel.
+    publicSubpath: '@alembic/agent',
     summary: 'Generic tool call contracts, routing envelopes, decisions, and workflow registry.',
     agentOwns: ['tool routing contracts', 'tool result envelopes', 'tool decision contracts'],
     hostOwns: ['concrete service injection', 'approval UI', 'process lifecycle'],

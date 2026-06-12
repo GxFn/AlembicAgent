@@ -145,26 +145,10 @@ export interface StructuredOutputOptions {
   systemPrompt?: string;
 }
 
-/** enrichCandidates 选项 */
-export interface EnrichOptions {
-  lang?: string;
-}
-
-/** enrichCandidates 候选条目 */
-export interface EnrichCandidate {
-  code?: string;
-  language?: string;
-  title?: string;
-  description?: string;
-  rationale?: string;
-  knowledgeType?: string;
-  complexity?: string;
-  scope?: string;
-  steps?: unknown[];
-  constraints?: { preconditions?: unknown[]; boundaries?: unknown[]; sideEffects?: unknown[] };
-  summary?: string;
-  category?: string;
-}
+// AiProvider.enrichCandidates (with its EnrichOptions/EnrichCandidate types and
+// prompt builders) was deleted under the Train B DCR default-delete lineage: its
+// last caller, the Alembic resident alembic_enrich_candidates surface, was
+// removed in the pB1 DCR commit and a fresh five-repo scan found zero consumers.
 
 /** 文件内容条目（用于语言检测） */
 export interface FileContentEntry {
@@ -547,44 +531,6 @@ export class AiProvider {
     }
   }
 
-  /**
-   * 根据用户语言偏好生成输出语言指令
-   * @param [lang] 语言代码，如 'zh', 'en'
-   * @returns 语言指令段落（为空则返回空字符串）
-   */
-  _buildLangInstruction(lang: string | undefined) {
-    if (!lang || lang === 'en') {
-      return '';
-    }
-    if (lang === 'zh') {
-      return `
-# 输出语言要求
-用户使用中文，请用**中文**书写以下字段的内容：
-- title（标题）
-- description（描述）
-- doClause（做什么）
-- dontClause（不要做什么）
-- whenClause（适用场景）
-- topicHint（分组标签）
-- content.markdown（使用指南）
-- content.rationale（设计原因）
-- reasoning.whyStandard（为什么是最佳实践）
-- aiInsight（核心洞察）
-- constraints 中的 preconditions / sideEffects / boundaries
-
-以下字段保持英文或代码原文，不要翻译：
-- trigger（@快捷方式）
-- content.pattern（源代码）
-- coreCode（代码骨架）
-- headers（import 语句）
-- tags（搜索关键词，可中英混合）
-- kind / knowledgeType / complexity / scope / category / language
-`;
-    }
-    // 其他语言通用指令
-    return `\n# Output Language\nThe user's preferred language is "${lang}". Write all human-readable text fields (title, description, doClause, dontClause, whenClause, topicHint, content.markdown, content.rationale, reasoning.whyStandard, aiInsight, constraints text) in "${lang}". Keep code fields (trigger, content.pattern, coreCode, headers, tags) in their original language.\n`;
-  }
-
   /** 根据文件扩展名检测语言特征，返回提示词适配参数 */
   _detectLanguageProfile(filesContent: FileContentEntry[]): LanguageProfile {
     const extCounts: Record<string, number> = {};
@@ -744,93 +690,6 @@ export class AiProvider {
 - Data processing pipeline`,
       categories: 'Service | Utility | Model | Handler | Config | Component | Pipeline',
     };
-  }
-
-  /**
-   * AI 语义字段补全 — 分析候选代码，填补缺失的语义字段
-   * @param candidates 候选对象数组，每项至少含 {code, language, title?}
-   * @returns enriched 候选数组（仅含补全的字段）
-   */
-  async enrichCandidates(candidates: EnrichCandidate[], options: EnrichOptions = {}) {
-    const prompt = this._buildEnrichPrompt(candidates, options);
-    const parsed = await this.chatWithStructuredOutput(prompt, {
-      openChar: '[',
-      closeChar: ']',
-      temperature: 0.3,
-    });
-    return Array.isArray(parsed) ? parsed : [];
-  }
-
-  /** 构建 enrichCandidates 提示词 */
-  _buildEnrichPrompt(candidates: EnrichCandidate[], options: EnrichOptions = {}) {
-    const items = candidates
-      .map((c: EnrichCandidate, i: number) => {
-        const existing: string[] = [];
-        if (c.rationale) {
-          existing.push(`rationale: ${c.rationale}`);
-        }
-        if (c.knowledgeType) {
-          existing.push(`knowledgeType: ${c.knowledgeType}`);
-        }
-        if (c.complexity) {
-          existing.push(`complexity: ${c.complexity}`);
-        }
-        if (c.scope) {
-          existing.push(`scope: ${c.scope}`);
-        }
-        if (c.steps?.length) {
-          existing.push(`steps: [${c.steps.length} steps already]`);
-        }
-        if (c.constraints?.preconditions?.length) {
-          existing.push(`preconditions: [${c.constraints.preconditions.length} items]`);
-        }
-        const existingStr =
-          existing.length > 0
-            ? `\nAlready filled: ${existing.join(', ')}`
-            : '\nNo semantic fields filled yet.';
-
-        return `--- CANDIDATE #${i + 1} ---
-Title: ${c.title || '(untitled)'}
-Language: ${c.language || 'unknown'}
-Category: ${c.category || ''}
-Description: ${c.description || c.summary || ''}
-${existingStr}
-Code:
-${(c.code || '').substring(0, 2000)}`;
-      })
-      .join('\n\n');
-
-    return `# Role
-You are a Senior Software Architect performing deep semantic analysis on code candidates.
-
-# Goal
-For each candidate below, analyze the code and fill in MISSING semantic fields only.
-Do NOT overwrite fields that are already filled (listed under "Already filled").
-
-# Fields to Fill (only if missing)
-
-1. **rationale** (string): Why this pattern exists; what design intent or problem it solves. 2-3 sentences.
-2. **knowledgeType** (string): One of: "code-standard", "code-pattern", "architecture", "best-practice", "code-relation", "inheritance", "call-chain", "data-flow", "module-dependency", "boundary-constraint", "code-style", "solution", "anti-pattern".
-3. **complexity** (string): "beginner" | "intermediate" | "advanced". Evaluate usage difficulty.
-4. **scope** (string): "universal" (reusable anywhere) | "project-specific" (specific to this project) | "target-specific" (specific to one module/target).
-5. **steps** (array): Implementation steps. Each: { "title": "Step N title", "description": "What to do", "code": "optional code" }.
-6. **constraints** (object): { "preconditions": ["iOS 15+", "需先配置 X", ...], "boundaries": ["Cannot be used with Y"], "sideEffects": ["Modifies global state"] }.
-
-# Output Schema
-Return a JSON array with one object per candidate. Each object contains ONLY the fields that were missing and you have now filled.
-Include an "index" field (0-based) to match each result to its candidate.
-
-Example:
-[
-  { "index": 0, "rationale": "...", "steps": [...], "constraints": { "preconditions": [...] } },
-  { "index": 1, "knowledgeType": "architecture", "complexity": "advanced" }
-]
-
-Return ONLY a JSON array. No markdown, no explanation.
-${this._buildLangInstruction(options.lang)}
-# Candidates
-
-${items}`;
   }
 
   // ─── 工具方法 ─────────────────────────────

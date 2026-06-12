@@ -335,7 +335,6 @@ export const ALEMBIC_AGENT_INTERFACE_CONTRACT = Object.freeze({
     '@alembic/agent',
     '@alembic/agent/runtime',
     '@alembic/agent/ai',
-    '@alembic/agent/tools',
     '@alembic/agent/tools/v2',
     '@alembic/agent/tools/terminal',
   ],

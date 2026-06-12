@@ -8,9 +8,9 @@
     "coreReferences": "coreReferenceLimitTotal is exact from positive config/core-import-boundary.json referenceLimits; actual forbidden/deep imports remain enforced by lint:core-import-boundary.",
     "packEntries": "minimumPackEntries is a floor from npm pack --dry-run --ignore-scripts; decreases require release-boundary review."
   },
-  "minimumTestFiles": 31,
-  "minimumDeclaredTestCases": 235,
-  "stablePublicExportCount": 15,
+  "minimumTestFiles": 32,
+  "minimumDeclaredTestCases": 239,
+  "stablePublicExportCount": 14,
   "coreReferenceLimitTotal": 51,
   "minimumPackEntries": 434,
   "requiredCoverageSuites": [

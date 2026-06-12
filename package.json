@@ -46,10 +46,6 @@
       "types": "./dist/ai/index.d.ts",
       "import": "./dist/ai/index.js"
     },
-    "./tools": {
-      "types": "./dist/tools/index.d.ts",
-      "import": "./dist/tools/index.js"
-    },
     "./tools/terminal": {
       "types": "./dist/tools/terminal/index.d.ts",
       "import": "./dist/tools/terminal/index.js"

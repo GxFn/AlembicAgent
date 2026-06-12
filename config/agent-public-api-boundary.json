@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard, deep dist/src, or host-owned adapter imports are allowed.",
   "expectedCounts": {
-    "stable-public": 15,
+    "stable-public": 14,
     "provisional-public": 0,
     "transitional-internal": 0,
     "forbidden": 0
@@ -18,7 +18,6 @@
     "./tasks",
     "./profiles",
     "./ai",
-    "./tools",
     "./tools/v2",
     "./tools/terminal",
     "./memory",
@@ -29,9 +28,15 @@
   "forbiddenConsumerSpecifiers": [
     "@alembic/agent/dist/*",
     "@alembic/agent/src/*",
-    "@alembic/agent/*/*/*"
+    "@alembic/agent/*/*/*",
+    "@alembic/agent/tools"
   ],
   "forbiddenConsumerSpecifierSamples": [
+    {
+      "specifier": "@alembic/agent/tools",
+      "matches": "@alembic/agent/tools",
+      "reason": "Aggregate tools subpath was retired in Train B IC3 after all consumers migrated to the @alembic/agent root facade; use the root facade or the fine-grained ./tools/v2 and ./tools/terminal exports."
+    },
     {
       "specifier": "@alembic/agent/dist/index.js",
       "matches": "@alembic/agent/dist/*",
@@ -128,13 +133,6 @@
       "contract": "AI provider adapters, model registry, transports, and provider manager.",
       "agentOwned": ["provider adapters", "model registry", "LLM transport contracts", "rate-limit/error classification"],
       "hostOwnedAdapterBoundary": "Host owns credential retrieval, account policy, network permission, and provider enablement UI."
-    },
-    {
-      "export": "./tools",
-      "specifier": "@alembic/agent/tools",
-      "contract": "Generic tool catalog, routing, decision, context, envelope, and workflow contracts.",
-      "agentOwned": ["tool manifests", "routing contracts", "decision/envelope types", "workflow registry"],
-      "hostOwnedAdapterBoundary": "Host owns concrete tool service registration, permission prompts, and product execution surfaces."
     },
     {
       "export": "./tools/v2",

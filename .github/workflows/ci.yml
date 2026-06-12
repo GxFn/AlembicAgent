@@ -84,7 +84,6 @@ jobs:
             '@alembic/agent/prompts',
             '@alembic/agent/domain',
             '@alembic/agent/ai',
-            '@alembic/agent/tools',
             '@alembic/agent/tools/v2',
             '@alembic/agent/memory',
             '@alembic/agent/context',
