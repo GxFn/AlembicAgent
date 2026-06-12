@@ -16,7 +16,7 @@
 
 import type { ContextWindow } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
-import type { L4MemoryPackageInput } from '../context/l4-memory-package.js';
+import type { L4MemoryPackageInput } from '../context/l4MemoryPackage.js';
 
 /* ── Types ─────────────────────────────────────────────── */
 

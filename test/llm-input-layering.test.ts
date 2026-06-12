@@ -2,11 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
-import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insight-analyst.js';
+import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insightAnalyst.js';
 import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
-} from '../src/agent/prompts/insight-producer.js';
+} from '../src/agent/prompts/insightProducer.js';
 import {
   AgentRuntime,
   buildLlmInputAssembly,

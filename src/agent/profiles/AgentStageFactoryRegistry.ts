@@ -8,7 +8,7 @@ import {
   buildRelationsPipelineStages,
   buildScanPipelineStages,
   SCAN_TASK_CONFIGS,
-} from '../prompts/scan-prompts.js';
+} from '../prompts/scanPrompts.js';
 
 export type AgentStageFactoryInput = {
   params: Record<string, unknown>;

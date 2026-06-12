@@ -9,8 +9,8 @@
  */
 
 import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
-import { parseDeepSeekTextToolCalls } from '../deepseek-tool-call-compat.js';
-import { normalizeToolTranscriptForChatCompletions } from '../tool-transcript.js';
+import { parseDeepSeekTextToolCalls } from '../deepseekToolCallCompat.js';
+import { normalizeToolTranscriptForChatCompletions } from '../toolTranscript.js';
 import {
   LLMTransport,
   type TransportConfig,

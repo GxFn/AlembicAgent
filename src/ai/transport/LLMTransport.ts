@@ -18,7 +18,7 @@ import {
   type ToolSchema,
   type UnifiedMessage,
 } from '../AiProvider.js';
-import type { ProviderId } from '../registry/model-defs.js';
+import type { ProviderId } from '../registry/ModelDefs.js';
 
 // ─── 代理 dispatcher 缓存 ────────────────────────────────
 //

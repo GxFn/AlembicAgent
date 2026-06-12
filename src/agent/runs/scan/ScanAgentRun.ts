@@ -1,4 +1,4 @@
-import { SCAN_TASK_CONFIGS } from '../../prompts/scan-prompts.js';
+import { SCAN_TASK_CONFIGS } from '../../prompts/scanPrompts.js';
 import type { FileCacheEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentRunInput, AgentRunSource } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';

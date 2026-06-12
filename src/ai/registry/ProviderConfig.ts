@@ -5,7 +5,7 @@
  * Agent runtime、API 路由和具体宿主 UI 可消费此配置；UI 文案由宿主侧渲染。
  */
 
-import type { ProviderConfig } from './model-defs.js';
+import type { ProviderConfig } from './ModelDefs.js';
 
 export const PROVIDER_CONFIGS: ProviderConfig[] = [
   {

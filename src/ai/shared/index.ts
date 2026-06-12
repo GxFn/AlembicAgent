@@ -11,7 +11,7 @@ export {
   type ClassifiableError,
   classifyLlmError,
   type ErrorClassification,
-} from './error-classify.js';
+} from './errorClassify.js';
 export {
   ReliabilityController,
   type ReliabilityLogFn,
@@ -21,5 +21,5 @@ export {
   extractJSON,
   repairTruncatedArray,
   type StructuredLogFn,
-} from './structured-output.js';
+} from './structuredOutput.js';
 export { normalizeRawUsage, type RawUsage } from './usage.js';

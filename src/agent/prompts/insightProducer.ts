@@ -1,5 +1,5 @@
 /**
- * insight-producer.js — Insight Producer 领域函数
+ * insightProducer.ts — Insight Producer 领域函数
  *
  * 从旧 ProducerAgent.js 提取的纯领域逻辑:
  * - Producer System Prompt
@@ -12,7 +12,7 @@
  * 被 PipelineStrategy 的 bootstrap preset 直接引用。
  * 不再包含任何 Agent 类 — Agent 由 AgentRuntime + PipelineStrategy 驱动。
  *
- * @module insight-producer
+ * @module insightProducer
  */
 
 import { buildProducerStyleGuide, SUBMIT_REQUIREMENTS } from '@alembic/core/knowledge';

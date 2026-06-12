@@ -5,8 +5,8 @@
 
 import { LanguageService } from '@alembic/core/project-intelligence';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
-import { classifyLlmError } from './shared/error-classify.js';
-import { extractJSON as sharedExtractJSON } from './shared/structured-output.js';
+import { classifyLlmError } from './shared/errorClassify.js';
+import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /** Loose JSON record for external API responses (inherently untyped) */
@@ -740,7 +740,7 @@ export class AiProvider {
 
   /**
    * 从 LLM 响应提取 JSON。
-   * 实现已抽到厂商无关的 shared/structured-output（供 Provider 与 Gateway 共用），
+   * 实现已抽到厂商无关的 shared/structuredOutput（供 Provider 与 Gateway 共用），
    * 这里仅委派并桥接实例 logger，保持既有调用方行为不变。
    */
   extractJSON(text: string, openChar = '{', closeChar = '}') {
@@ -799,7 +799,7 @@ export class AiProvider {
           cause?: { code?: string; message?: string; name?: string };
         };
 
-        // 错误分类已抽到 shared/error-classify（供 Provider 与 Gateway 共用），
+        // 错误分类已抽到 shared/errorClassify（供 Provider 与 Gateway 共用），
         // 这里只消费分类结果做重试 / 熔断决策，避免两套实现漂移。
         const { isAbort, isNetworkError, isRetryable, isServerError, causeCode } =
           classifyLlmError(e);

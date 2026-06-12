@@ -1,4 +1,4 @@
-import type { ModelDef } from '../model-defs.js';
+import type { ModelDef } from '../ModelDefs.js';
 
 const BASE_OPENAI_CAPS = {
   toolCalling: true,

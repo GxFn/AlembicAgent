@@ -16,4 +16,4 @@ export {
   type L4MemoryPackageInput,
   renderL4MemoryPackage,
   validateL4Summary,
-} from './l4-memory-package.js';
+} from './l4MemoryPackage.js';

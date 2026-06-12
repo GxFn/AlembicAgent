@@ -27,8 +27,8 @@ import type { Disposable } from '@alembic/core/events';
 import { timerRegistry } from '@alembic/core/events';
 import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
-import type { SessionStoreSerialized } from './session-store-schema.js';
-import { validateSessionStoreShape } from './session-store-schema.js';
+import type { SessionStoreSerialized } from './SessionStoreSchema.js';
+import { validateSessionStoreShape } from './SessionStoreSchema.js';
 
 // ── 类型定义 ──
 

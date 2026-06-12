@@ -1,5 +1,5 @@
 /**
- * insight-gate.js — Insight 质量门控领域函数
+ * insightGate.ts — Insight 质量门控领域函数
  *
  * 从旧 HandoffProtocol.js 完整迁移的纯函数模块:
  * - 分析文本清洗 (sanitizeAnalysisText)
@@ -12,7 +12,7 @@
  *
  * 被 PipelineStrategy 的 bootstrap preset 直接引用。
  *
- * @module insight-gate
+ * @module insightGate
  */
 
 import Logger from '@alembic/core/logging';

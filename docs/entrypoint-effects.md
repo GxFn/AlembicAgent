@@ -45,7 +45,7 @@ must-never knowledge persistence / HTTP surface; declared SD-4 exception):
 
 - **No orphan capability**: all 14 exports map to charter "owns" lines —
   ai/transports/classification (`./ai`: providers, transports, registry,
-  gateway, error-classify), tool runtime (`./tools/v2`, `./tools/terminal`,
+  gateway, errorClassify), tool runtime (`./tools/v2`, `./tools/terminal`,
   root tools barrel), agent orchestration over them (`./agent ./service
   ./runtime ./prompts ./domain ./forge ./tasks ./profiles ./memory
   ./context` + root facade).

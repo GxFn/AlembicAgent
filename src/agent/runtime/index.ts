@@ -76,8 +76,8 @@ export { BudgetController } from './BudgetController.js';
 export { DiagnosticsCollector } from './DiagnosticsCollector.js';
 export type { ExitControllerConfig, ExitReason, ExitSignal } from './ExitController.js';
 export { createExitController, ExitController } from './ExitController.js';
-export { cleanFinalAnswer } from './final-answer.js';
-export { produceForcedSummary } from './forced-summary.js';
+export { cleanFinalAnswer } from './finalAnswer.js';
+export { produceForcedSummary } from './forcedSummary.js';
 export type { HookErrorDiagnostic, HookEvent, HookHandler, HookPayloadMap } from './HookSystem.js';
 export { HookSystem, registerDefaultHooks } from './HookSystem.js';
 export type {

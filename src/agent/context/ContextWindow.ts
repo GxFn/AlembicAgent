@@ -23,7 +23,7 @@
 
 import Logger from '@alembic/core/logging';
 import { getModelRegistry } from '#ai/registry/ModelRegistry.js';
-import { estimateTokensFast } from '../../shared/token-utils.js';
+import { estimateTokensFast } from '../../shared/tokenUtils.js';
 import {
   buildL4MemoryPackage,
   formatL4MemorySummary,
@@ -31,7 +31,7 @@ import {
   type L4MemoryPackageInput,
   renderL4MemoryPackage,
   validateL4Summary,
-} from './l4-memory-package.js';
+} from './l4MemoryPackage.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 

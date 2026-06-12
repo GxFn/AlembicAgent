@@ -1,5 +1,5 @@
 /**
- * forced-summary.js — 强制退出后的摘要生成
+ * forcedSummary.ts — 强制退出后的摘要生成
  *
  * 强制退出后的摘要生成独立模块，
  * 供 AgentRuntime.reactLoop() 在循环退出后调用。
@@ -9,12 +9,12 @@
  *   - system + bootstrap: 输出 dimensionDigest JSON (供维度编排消费)
  *   - user: 输出人类可读的 Markdown 结构化总结 (前端 AI Chat 展示)
  *
- * @module forced-summary
+ * @module forcedSummary
  */
 
 import Logger from '@alembic/core/logging';
 import type { AiProvider, ChatWithToolsResult } from '#ai/AiProvider.js';
-import { cleanFinalAnswer } from './final-answer.js';
+import { cleanFinalAnswer } from './finalAnswer.js';
 
 /* ── Local types ────────────────────────────────────────── */
 

@@ -1,5 +1,5 @@
 /**
- * insight-analyst.js — Insight Analyst 领域函数
+ * insightAnalyst.ts — Insight Analyst 领域函数
  *
  * 从旧 AnalystAgent.js 提取的纯领域逻辑:
  * - Analyst System Prompt
@@ -10,7 +10,7 @@
  * 被 PipelineStrategy 的 bootstrap preset 直接引用。
  * 不再包含任何 Agent 类 — Agent 由 AgentRuntime + PipelineStrategy 驱动。
  *
- * @module insight-analyst
+ * @module insightAnalyst
  */
 
 import { getDimensionSOP } from '@alembic/core/dimensions';

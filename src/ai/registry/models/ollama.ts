@@ -1,4 +1,4 @@
-import type { ModelDef } from '../model-defs.js';
+import type { ModelDef } from '../ModelDefs.js';
 
 /**
  * Ollama 模型是动态的（用户本地安装），这里只定义常见模型的合理默认值。

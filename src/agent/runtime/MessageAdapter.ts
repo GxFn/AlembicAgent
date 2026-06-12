@@ -166,7 +166,7 @@ export class ContextWindowAdapter extends MessageAdapter {
     this.#ctxWin = ctxWin;
   }
 
-  /** 获取底层 ContextWindow 实例 (供 forced-summary 等外部逻辑使用) */
+  /** 获取底层 ContextWindow 实例 (供 forcedSummary 等外部逻辑使用) */
   get contextWindow() {
     return this.#ctxWin;
   }

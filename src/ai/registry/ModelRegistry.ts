@@ -11,7 +11,7 @@
  *   - Provider: 查询模型推理能力
  */
 
-import type { ModelDef, ProviderId } from './model-defs.js';
+import type { ModelDef, ProviderId } from './ModelDefs.js';
 import { CLAUDE_MODELS } from './models/claude.js';
 import { DEEPSEEK_MODELS } from './models/deepseek.js';
 import { GOOGLE_MODELS } from './models/google.js';

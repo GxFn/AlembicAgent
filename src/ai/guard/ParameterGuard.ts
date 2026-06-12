@@ -7,7 +7,7 @@
  *   - DeepSeekProvider: if (v4Thinking) 不传 tool_choice
  */
 
-import type { ModelDef, ParameterConstraints } from '../registry/model-defs.js';
+import type { ModelDef, ParameterConstraints } from '../registry/ModelDefs.js';
 
 export interface GuardedParams {
   temperature?: number;

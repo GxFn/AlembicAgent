@@ -1,5 +1,5 @@
 /**
- * scan-prompts.js — scanKnowledge 任务配置 + 统一管线工厂 + 关系发现管线
+ * scanPrompts.ts — scanKnowledge 任务配置 + 统一管线工厂 + 关系发现管线
  *
  * scan pipeline (extract/summarize):
  *   共享 Insight Pipeline (Analyze → QualityGate → Produce → RejectionGate)，
@@ -10,12 +10,12 @@
  *   知识图谱关系发现: Explore → Synthesize 两阶段，
  *   通过查询知识库 + 读取源码发现条目间语义关系。
  *
- * @module scan-prompts
+ * @module scanPrompts
  */
 
-import { ANALYST_SYSTEM_PROMPT } from './insight-analyst.js';
-import { buildRetryPrompt, insightGateEvaluator } from './insight-gate.js';
-import { buildCodeContextSection, producerRejectionGateEvaluator } from './insight-producer.js';
+import { ANALYST_SYSTEM_PROMPT } from './insightAnalyst.js';
+import { buildRetryPrompt, insightGateEvaluator } from './insightGate.js';
+import { buildCodeContextSection, producerRejectionGateEvaluator } from './insightProducer.js';
 
 // ── Local Type Definitions ──
 

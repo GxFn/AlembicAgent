@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { classifyLlmError } from '../src/ai/shared/error-classify.js';
-import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structured-output.js';
+import { classifyLlmError } from '../src/ai/shared/errorClassify.js';
+import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structuredOutput.js';
 import { normalizeRawUsage } from '../src/ai/shared/usage.js';
 
-describe('shared/structured-output extractJSON', () => {
+describe('shared/structuredOutput extractJSON', () => {
   it('parses a clean JSON object', () => {
     expect(extractJSON('{"a":1}')).toEqual({ a: 1 });
   });
@@ -40,7 +40,7 @@ describe('shared/structured-output extractJSON', () => {
   });
 });
 
-describe('shared/error-classify classifyLlmError', () => {
+describe('shared/errorClassify classifyLlmError', () => {
   it('flags AbortError as abort and non-retryable', () => {
     const c = classifyLlmError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
     expect(c.isAbort).toBe(true);

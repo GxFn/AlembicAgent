@@ -1,5 +1,5 @@
 /**
- * error-classify — LLM 调用错误分类（纯函数）
+ * errorClassify — LLM 调用错误分类（纯函数）
  *
  * 背景：重试 / 熔断的决策依赖「这个错误是否可重试」「是否网络级错误」「是否服务端错误」
  * 「是否外部主动 abort」。这套判断历史上内联在 AiProvider._withRetry 里，Gateway 层

@@ -54,8 +54,8 @@ import { AgentState } from './AgentState.js';
 import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
 import { createExitController } from './ExitController.js';
-import { cleanFinalAnswer } from './final-answer.js';
-import { produceForcedSummary } from './forced-summary.js';
+import { cleanFinalAnswer } from './finalAnswer.js';
+import { produceForcedSummary } from './forcedSummary.js';
 import { HookSystem, registerDefaultHooks } from './HookSystem.js';
 import {
   buildLlmInputAssembly,
@@ -599,7 +599,7 @@ export class AgentRuntime {
         activeContext: ctx.trace,
         diagnostics: ctx.diagnostics?.toJSON(),
         recentMessages:
-          ctx.messages.toProjectedMessages() as import('../context/l4-memory-package.js').L4MemoryPackageInput['recentMessages'],
+          ctx.messages.toProjectedMessages() as import('../context/l4MemoryPackage.js').L4MemoryPackageInput['recentMessages'],
         toolCalls: ctx.toolCalls,
       }),
     });

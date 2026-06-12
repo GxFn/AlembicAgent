@@ -22,10 +22,10 @@ import type {
   UnifiedMessage,
 } from '../AiProvider.js';
 import { ParameterGuard } from '../guard/ParameterGuard.js';
+import type { ModelDef, ProviderId } from '../registry/ModelDefs.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
-import type { ModelDef, ProviderId } from '../registry/model-defs.js';
 import { ReliabilityController } from '../shared/reliability.js';
-import { extractJSON } from '../shared/structured-output.js';
+import { extractJSON } from '../shared/structuredOutput.js';
 import { ClaudeTransport } from '../transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../transport/GoogleTransport.js';

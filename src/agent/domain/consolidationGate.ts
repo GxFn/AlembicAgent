@@ -1,10 +1,10 @@
 /**
- * consolidation-gate.ts — 候选融合门控 Agent 领域函数
+ * consolidationGate.ts — 候选融合门控 Agent 领域函数
  *
  * Pipeline 内置的 ConsolidationGate Stage，在 Produce → RejectionGate 之间执行。
  * Agent 对 Producer 产出的候选逐条做语义融合判断：create / merge / reject。
  *
- * @module consolidation-gate
+ * @module consolidationGate
  */
 
 // ──────────────────────────────────────────────────────────────────

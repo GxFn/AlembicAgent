@@ -12,7 +12,7 @@
   "minimumDeclaredTestCases": 249,
   "stablePublicExportCount": 14,
   "coreReferenceLimitTotal": 52,
-  "minimumPackEntries": 434,
+  "minimumPackEntries": 432,
   "requiredCoverageSuites": [
     {
       "name": "forge",

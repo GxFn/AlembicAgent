@@ -8,7 +8,7 @@ export { DeepSeekProvider } from './providers/DeepSeekProvider.js';
 export { GoogleGeminiProvider } from './providers/GoogleGeminiProvider.js';
 export { OllamaProvider } from './providers/OllamaProvider.js';
 export { OpenAiProvider } from './providers/OpenAiProvider.js';
+export * from './registry/ModelDefs.js';
 export * from './registry/ModelRegistry.js';
-export * from './registry/model-defs.js';
 export { getProviderConfig, PROVIDER_CONFIGS } from './registry/ProviderConfig.js';
 export * from './transport/index.js';

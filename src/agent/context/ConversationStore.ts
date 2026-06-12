@@ -24,7 +24,7 @@ import path from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
 import { pathGuard } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
-import { estimateTokens as _estimateTokens } from '../../shared/token-utils.js';
+import { estimateTokens as _estimateTokens } from '../../shared/tokenUtils.js';
 
 /** 对话索引中的条目 */
 interface ConversationEntry {
@@ -332,7 +332,7 @@ export class ConversationStore {
     return { deleted };
   }
 
-  /** 估算 token 数 — 委托给共享 token-utils（CJK 感知） */
+  /** 估算 token 数 — 委托给共享 tokenUtils（CJK 感知） */
   estimateTokens(text: string) {
     return _estimateTokens(text);
   }

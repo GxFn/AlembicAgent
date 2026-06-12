@@ -22,7 +22,7 @@
 
 import Logger from '@alembic/core/logging';
 import type { ToolResultEnvelope } from '#tools/runtime/ToolRuntimeBridge.js';
-import type { DistilledContext } from './memory-flush-contract.js';
+import type { DistilledContext } from './MemoryFlushContract.js';
 
 // ═══════════════════════════════════════════════════════════
 // §1: 工具压缩策略 (从 WorkingMemory 迁入)

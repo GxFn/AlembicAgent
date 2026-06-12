@@ -41,10 +41,10 @@ consumers, both with paired clear on dispose
 | Id | Item | Site | Disposition |
 | --- | --- | --- | --- |
 | I1 | `const _pipelineLogger = Logger.getInstance()` at module scope | `src/agent/strategies/PipelineStrategy.ts:163` | REMEDIATED this leg — lazy accessor; the Core logger singleton now materializes on first use, not at import. Restart semantics unchanged (same process-lifetime singleton; lazy first-touch). |
-| I2 | `const logger = Logger.getInstance()` at module scope | `src/agent/runtime/forced-summary.ts:65` | REMEDIATED this leg — same lazy accessor conversion. |
-| I3 | `const logger = Logger.getInstance()` at module scope | `src/agent/prompts/insight-gate.ts:26` | REMEDIATED this leg — same lazy accessor conversion. |
+| I2 | `const logger = Logger.getInstance()` at module scope | `src/agent/runtime/forcedSummary.ts:65` | REMEDIATED this leg — same lazy accessor conversion. |
+| I3 | `const logger = Logger.getInstance()` at module scope | `src/agent/prompts/insightGate.ts:26` | REMEDIATED this leg — same lazy accessor conversion. |
 | I4 | `const logger = Logger.getInstance()` at module scope | `src/ai/gateway/LLMGateway.ts:40` | REMEDIATED this leg — same lazy accessor conversion. |
-| I5 | `const STYLE_GUIDE = buildProducerStyleGuide()` | `src/agent/prompts/insight-producer.ts:133` | HEALTHY — pure deterministic string composition over Core constants (verified in `@alembic/core` `domain/knowledge/StyleGuide.ts`); no IO, no env, no mutable capture. Same class as frozen constants. |
+| I5 | `const STYLE_GUIDE = buildProducerStyleGuide()` | `src/agent/prompts/insightProducer.ts:133` | HEALTHY — pure deterministic string composition over Core constants (verified in `@alembic/core` `domain/knowledge/StyleGuide.ts`); no IO, no env, no mutable capture. Same class as frozen constants. |
 | I6 | `const execAsync = promisify(exec)` and `Object.freeze(...)` defaults | `src/tools/v2/handlers/terminal.ts:19`, `src/agent/memory/SessionStore.ts:45` | HEALTHY — pure wrapper construction. |
 
 Constructor-scoped `Logger.getInstance()` acquisitions (e.g.

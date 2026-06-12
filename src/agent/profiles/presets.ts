@@ -23,24 +23,24 @@ import {
   ANALYST_BUDGET,
   ANALYST_SYSTEM_PROMPT,
   buildAnalystPrompt,
-} from '../prompts/insight-analyst.js';
+} from '../prompts/insightAnalyst.js';
 import {
   buildEvolverPrompt,
   EVOLVER_BUDGET,
   EVOLVER_SYSTEM_PROMPT,
   type EvolutionContext,
-} from '../prompts/insight-evolver.js';
+} from '../prompts/insightEvolver.js';
 import {
   buildRetryPrompt,
   evolutionGateEvaluator,
   insightGateEvaluator,
-} from '../prompts/insight-gate.js';
+} from '../prompts/insightGate.js';
 import {
   buildProducerPromptV2,
   PRODUCER_BUDGET,
   PRODUCER_SYSTEM_PROMPT,
   producerRejectionGateEvaluator,
-} from '../prompts/insight-producer.js';
+} from '../prompts/insightProducer.js';
 import {
   AdaptiveStrategy,
   FanOutStrategy,

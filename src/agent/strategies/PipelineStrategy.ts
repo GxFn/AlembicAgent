@@ -20,7 +20,7 @@
 import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
-import { buildRecordRepairPrompt } from '../prompts/insight-gate.js';
+import { buildRecordRepairPrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';

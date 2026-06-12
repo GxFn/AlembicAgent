@@ -1,5 +1,5 @@
 /**
- * insight-evolver.ts — Evolution Agent 领域函数
+ * insightEvolver.ts — Evolution Agent 领域函数
  *
  * Evolution Agent 是管线中的专职进化角色：
  *   - 接收当前维度的**全部**现有 Recipe（不仅是衰退的）
@@ -10,7 +10,7 @@
  * 被 PipelineStrategy 的 evolution preset 引用。
  * 按维度隔离：每个维度的 Evolve Stage 只处理属于该维度的 Recipe。
  *
- * @module insight-evolver
+ * @module insightEvolver
  */
 
 // ──────────────────────────────────────────────────────────────────

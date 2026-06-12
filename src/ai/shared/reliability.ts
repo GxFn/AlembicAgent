@@ -6,7 +6,7 @@
  * Provider 与 Gateway 都可持有一个实例复用，新增厂商不必重复实现。
  *
  * 行为与 AiProvider._withRetry / _acquireRequestSlot / _setRateLimitWindow 对齐：
- *   - 指数退避重试，错误分类复用 shared/error-classify
+ *   - 指数退避重试，错误分类复用 shared/errorClassify
  *   - 熔断器三态 CLOSED / OPEN / HALF_OPEN，连续服务端失败达阈值后快速失败
  *   - Provider 级并发闸门（信号量）
  *   - 429 自适应冷却窗，抑制并发重试风暴
@@ -15,7 +15,7 @@
  * Transport 调用外层包裹可靠性逻辑。
  */
 
-import { classifyLlmError } from './error-classify.js';
+import { classifyLlmError } from './errorClassify.js';
 
 /** 日志回调，level 与现有 logger 对齐（info/warn/error）。 */
 export type ReliabilityLogFn = (level: string, message: string) => void;

@@ -1,5 +1,5 @@
 import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
-import { estimateTokens } from '#shared/token-utils.js';
+import { estimateTokens } from '#shared/tokenUtils.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 
 export interface PromptSectionMeasurement {

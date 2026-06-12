@@ -18,8 +18,12 @@ export type {
 } from './MemoryCoordinator.js';
 export { MemoryCoordinator } from './MemoryCoordinator.js';
 export { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
+export type {
+  DimensionFlushManifest,
+  DistilledContext,
+} from './MemoryFlushContract.js';
+export { extractHighPriorityFindings } from './MemoryFlushContract.js';
 export { MemoryRetriever } from './MemoryRetriever.js';
-
 // PersistentMemory 子模块 — 内部拆分后的独立组件
 export {
   assertMemoryStoreSchemaShape,
@@ -28,12 +32,7 @@ export {
   MemoryStore,
   MemoryStoreWriteError,
 } from './MemoryStore.js';
-export type {
-  DimensionFlushManifest,
-  DistilledContext,
-} from './memory-flush-contract.js';
-export { extractHighPriorityFindings } from './memory-flush-contract.js';
 export { PersistentMemory } from './PersistentMemory.js';
 export { SessionStore } from './SessionStore.js';
-export type { SessionStoreSerialized } from './session-store-schema.js';
-export { validateSessionStoreShape } from './session-store-schema.js';
+export type { SessionStoreSerialized } from './SessionStoreSchema.js';
+export { validateSessionStoreShape } from './SessionStoreSchema.js';

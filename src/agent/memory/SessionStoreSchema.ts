@@ -3,7 +3,7 @@
  *
  * `SessionStore.fromJSON()` 的反序列化入口，对边界数据做轻量类型校验。
  *
- * @module agent/memory/session-store-schema
+ * @module agent/memory/SessionStoreSchema
  */
 
 import type {

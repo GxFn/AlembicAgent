@@ -1,5 +1,5 @@
 /**
- * structured-output — LLM 结构化输出（JSON）提取与截断修复（纯函数）
+ * structuredOutput — LLM 结构化输出（JSON）提取与截断修复（纯函数）
  *
  * 背景：Provider 层（AiProvider）与 Gateway 层（LLMGateway）都需要从模型自由文本里
  * 稳健地抠出 JSON；历史上这套逻辑只存在于 AiProvider 内部，Gateway 的
