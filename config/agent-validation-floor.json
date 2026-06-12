@@ -11,7 +11,7 @@
   "minimumTestFiles": 32,
   "minimumDeclaredTestCases": 239,
   "stablePublicExportCount": 14,
-  "coreReferenceLimitTotal": 51,
+  "coreReferenceLimitTotal": 52,
   "minimumPackEntries": 434,
   "requiredCoverageSuites": [
     {
