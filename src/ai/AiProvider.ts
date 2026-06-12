@@ -145,6 +145,27 @@ export interface StructuredOutputOptions {
   systemPrompt?: string;
 }
 
+/** AD5 embedding 容量提示的取值来源 */
+export type EmbeddingCapacityHintSource =
+  | 'provider-config'
+  | 'environment'
+  | 'conservative-default';
+
+/**
+ * AD5 embedding 容量提示（只读）。
+ * Agent transport 层向外部批处理消费者（Core BatchEmbedder 经注入的
+ * provider 对象读取）暴露本 provider 实例的真实请求闸门；
+ * 只暴露信息，不改变任何节流行为。
+ */
+export interface EmbeddingCapacityHint {
+  /** Provider 名称（如 'openai' / 'google'） */
+  provider: string;
+  /** 建议的最大并发 embedding 请求数 = 本实例的并发闸门值 */
+  maxInFlightEmbeddings: number;
+  /** 取值来源 */
+  source: EmbeddingCapacityHintSource;
+}
+
 // AiProvider.enrichCandidates (with its EnrichOptions/EnrichCandidate types and
 // prompt builders) was deleted under the Train B DCR default-delete lineage: its
 // last caller, the Alembic resident alembic_enrich_candidates surface, was
@@ -182,6 +203,7 @@ export class AiProvider {
   _circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
   _circuitThreshold: number;
   _maxConcurrency: number;
+  _maxConcurrencySource: EmbeddingCapacityHintSource;
   _rateLimitedUntil: number;
   _requestQueue: Array<(value?: unknown) => void>;
   apiKey: string;
@@ -228,6 +250,12 @@ export class AiProvider {
       1,
       Number(config.maxConcurrency || process.env.ALEMBIC_AI_MAX_CONCURRENCY || 4)
     );
+    // AD5: 与上面的取值链并行记录来源（不改变取值计算本身），供容量提示溯源。
+    this._maxConcurrencySource = config.maxConcurrency
+      ? 'provider-config'
+      : process.env.ALEMBIC_AI_MAX_CONCURRENCY
+        ? 'environment'
+        : 'conservative-default';
     this._activeRequests = 0;
     this._requestQueue = [];
     this._rateLimitedUntil = 0;
@@ -321,6 +349,22 @@ export class AiProvider {
   /** 检查是否支持 embedding */
   supportsEmbedding(): boolean {
     return true;
+  }
+
+  /**
+   * AD5 embedding 容量提示（只读）— 暴露本实例的真实请求闸门，供 Core
+   * BatchEmbedder 等外部批处理消费者替代硬编码并发值；不改变节流行为。
+   * 各 provider 提示值与来源：基类链 config.maxConcurrency（provider-config）
+   * → ALEMBIC_AI_MAX_CONCURRENCY（environment）→ 保守默认 4
+   * （conservative-default）；GoogleGeminiProvider 默认 2（规避 Google 配额，
+   * 见其构造器注释），可被 ALEMBIC_GEMINI_MAX_CONCURRENCY 或显式配置覆盖。
+   */
+  getEmbeddingCapacityHint(): EmbeddingCapacityHint {
+    return Object.freeze({
+      provider: this.name,
+      maxInFlightEmbeddings: this._maxConcurrency,
+      source: this._maxConcurrencySource,
+    });
   }
 
   /**

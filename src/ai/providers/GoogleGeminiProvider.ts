@@ -36,6 +36,13 @@ export class GoogleGeminiProvider extends AiProvider {
         ),
     });
     this.name = 'google';
+    // AD5: 上面预先折叠的 maxConcurrency 到达基类时一律呈现为 config 值，
+    // 这里用原始输入重推真实来源（Gemini 专属 env 链），保证提示溯源诚实。
+    this._maxConcurrencySource = config.maxConcurrency
+      ? 'provider-config'
+      : process.env.ALEMBIC_GEMINI_MAX_CONCURRENCY || process.env.ALEMBIC_AI_MAX_CONCURRENCY
+        ? 'environment'
+        : 'conservative-default';
     this.model = config.model || 'gemini-3-flash-preview';
     this.apiKey = config.apiKey || process.env.ALEMBIC_GOOGLE_API_KEY || '';
     this.logger = Logger.getInstance() as unknown as AiLogger;
