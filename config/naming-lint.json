@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "description": "SN2 naming lint config (AlembicAgent, ported from the SN1 Dashboard shape). Codifies the SN0 §1 dominant conventions as per-artifact-type filename patterns: src code modules camelCase (helpers/toolkits) or PascalCase (class/contract/model positions) with kebab/snake forbidden; index.ts barrels allowed everywhere (dominant idiom); scripts and configs kebab-case. The repo's codified DELIBERATE family is x.profile.ts (SN0 §1 exempt family, encoded in the src namePattern); ambient .d.ts declarations are allowed. test/ filenames are outside the SN0 §2 Agent census (mixed PascalCase/kebab as-found) and stay unscoped until an SN wave censuses them. Exceptions require {file, owner, reason}; entries missing a field do not exempt.",
+  "rules": [
+    {
+      "scope": "src",
+      "filePattern": "\\.ts$",
+      "namePattern": "^[a-zA-Z][A-Za-z0-9]*(\\.profile)?(\\.d)?\\.ts$",
+      "label": "src modules are camelCase or PascalCase (no kebab/snake); x.profile.ts is the codified deliberate family"
+    },
+    {
+      "scope": "scripts",
+      "filePattern": "\\.(mjs|cjs|js)$",
+      "namePattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.(mjs|cjs|js)$",
+      "label": "scripts are kebab-case"
+    },
+    {
+      "scope": "config",
+      "filePattern": "\\.json$",
+      "namePattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.json$",
+      "label": "configs are kebab-case"
+    }
+  ],
+  "barrelNames": ["index.ts"],
+  "exemptScopes": [],
+  "exceptions": []
+}
