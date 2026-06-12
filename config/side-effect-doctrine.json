@@ -62,6 +62,26 @@
       "agentUsage": "2 consumers, both with paired clear on dispose (TemporaryToolRegistry, SessionStore)."
     }
   ],
+  "lintExemptions": [
+    {
+      "file": "src/tools/v2/compressor/OutputCompressor.ts",
+      "binding": "parsersLoaded",
+      "entry": "OutputCompressor parser loader",
+      "reason": "Write-once idempotent lazy-init flag (AD4 M2); boolean, so the null-slot idiom does not apply."
+    },
+    {
+      "file": "src/agent/runtime/HookSystem.ts",
+      "binding": "_hookCounter",
+      "entry": "HookSystem id counter",
+      "reason": "Monotonic uniqueness-only id counter (AD4 M3); behavioral hook state is instance-scoped."
+    },
+    {
+      "file": "src/ai/transport/LLMTransport.ts",
+      "binding": "proxyDispatcherCache",
+      "entry": "proxyDispatcherCache",
+      "reason": "Bounded cache with close-on-evict policy (AD4 M1, cap 8); deliberately module-scoped for daemon-wide undici connection-pool reuse."
+    }
+  ],
   "standingExceptionsOutOfScope": [
     {
       "name": "SD-4 raw-SQL semantic_memories read adapter",
