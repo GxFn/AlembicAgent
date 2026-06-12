@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "description": "AlembicAgent side-effect doctrine record (P2 AD4, layer-contract config idiom). Doctrine (AD0 standing rule, user-adopted): no import-time work, no module-scope mutable state, no direct singleton reach-through in new/changed code; effects flow through injected ports. This file is the EXHAUSTIVE Agent-side blessed exception set; everything not listed is remediation scope. Human census: docs/side-effect-doctrine-census.md — edit both together.",
+  "doctrineRef": "wakeflow-ledger/requirement-designs/alembic-portfolio-execution-plan/p0-unified-fact-freeze-2026-06-12.md (AD0 side-effect doctrine standing rule + whitelist draft, AD4 confirms)",
+  "blessedSingletons": [
+    {
+      "name": "ModelRegistry",
+      "file": "src/ai/registry/ModelRegistry.ts",
+      "accessor": "getModelRegistry()",
+      "owner": "AlembicAgent window",
+      "reason": "Named in the AD0 whitelist draft as 'ModelRegistry (Agent)'; lazy module singleton over declarative model definitions, no import-time work, no reset needed (stateless lookup tables)."
+    },
+    {
+      "name": "LLMGateway",
+      "file": "src/ai/gateway/LLMGateway.ts",
+      "accessor": "getLLMGateway(config?) / resetLLMGateway()",
+      "owner": "AlembicAgent window",
+      "reason": "Public ./ai facade singleton with an explicit reset hook and documented config-rebuild semantics (explicit config rebuilds the instance so later configs are never silently ignored). Container-managing it would change the public API — a STOP-class behavior change outside this behavior-preserving leg."
+    },
+    {
+      "name": "AgentEventBus",
+      "file": "src/agent/runtime/AgentEventBus.ts",
+      "accessor": "AgentEventBus.getInstance() / resetInstance()",
+      "owner": "AlembicAgent window",
+      "reason": "Cross-strategy broadcast seam on the public runtime surface; resetInstance() removes all listeners and clears subscription state; max-listener bound declared (100). Agent-internal code only publishes; persistent subscriptions are host-owned lifecycles."
+    }
+  ],
+  "managedModuleState": [
+    {
+      "name": "proxyDispatcherCache",
+      "file": "src/ai/transport/LLMTransport.ts",
+      "policy": "Bounded Map (cap 8) with close/destroy on eviction and null-caching of failed initialization; rationale documented in-file (undici proxy connection-pool reuse in the resident daemon).",
+      "owner": "AlembicAgent window"
+    },
+    {
+      "name": "OutputCompressor parser loader",
+      "file": "src/tools/v2/compressor/OutputCompressor.ts",
+      "policy": "Write-once idempotent lazy-init flag (parsersLoaded) explicitly designed to avoid import-time parser module loading.",
+      "owner": "AlembicAgent window"
+    },
+    {
+      "name": "HookSystem id counter",
+      "file": "src/agent/runtime/HookSystem.ts",
+      "policy": "Monotonic uniqueness-only counter; all behavioral hook state is instance-scoped and dies with the per-run AgentRuntime.",
+      "owner": "AlembicAgent window"
+    }
+  ],
+  "outOfRepoSingletons": [
+    {
+      "name": "Logger",
+      "home": "@alembic/core/logging",
+      "agentUsage": "30 reach-through call sites across 28 files, constructor/function-scoped after the AD4 I1-I4 lazy conversions; injected-port end state is Core-leg / future-wave scope."
+    },
+    {
+      "name": "pathGuard",
+      "home": "@alembic/core/io",
+      "agentUsage": "1 site (src/agent/context/ConversationStore.ts)."
+    },
+    {
+      "name": "timerRegistry",
+      "home": "@alembic/core/events",
+      "agentUsage": "2 consumers, both with paired clear on dispose (TemporaryToolRegistry, SessionStore)."
+    }
+  ],
+  "standingExceptionsOutOfScope": [
+    {
+      "name": "SD-4 raw-SQL semantic_memories read adapter",
+      "file": "src/agent/memory/MemoryStore.ts",
+      "rule": "Standing declared exception per the AD2-confirmed charter; Option-C end-state trigger is a user register row. Not AD4 scope."
+    },
+    {
+      "name": "CapabilityV2 -> Capability inheritance reach-up",
+      "file": "src/tools/v2/capabilities/CapabilityV2.ts",
+      "rule": "Placement-class register item (B5), owned by the layer-contract blessing in config/layer-contract.json. Not AD4 scope."
+    }
+  ]
+}
