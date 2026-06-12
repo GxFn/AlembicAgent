@@ -62,7 +62,9 @@ interface ForcedSummaryOpts {
   tokenUsage?: TokenUsage;
 }
 
-const logger = Logger.getInstance();
+// AD4: lazy logger accessor — the Core logger singleton materializes on first
+// use instead of at module import (no import-time work; same singleton).
+const logger = () => Logger.getInstance();
 
 /**
  * 生成强制摘要
@@ -92,7 +94,7 @@ export async function produceForcedSummary({
   const isAnalyst = pipelineType === 'analyst';
   const resultTokenUsage = { input: 0, output: 0 };
 
-  logger.info(
+  logger().info(
     `[ForcedSummary] ⚠ producing forced summary (${iterations} iters, ${toolCalls.length} calls, source=${source}, pipeline=${pipelineType})`
   );
 
@@ -104,7 +106,7 @@ export async function produceForcedSummary({
   const isCircuitOpen = aiProvider._circuitState === 'OPEN';
   if (isCircuitOpen) {
     const outputType = isAnalyst ? 'analysis' : isSystem ? 'digest' : 'summary';
-    logger.warn(
+    logger().warn(
       `[ForcedSummary] circuit breaker is OPEN — skipping AI summary, using synthetic ${outputType}`
     );
   }
@@ -204,7 +206,7 @@ ${toolContextSummary}
         ? (summaryResult.text || '').trim()
         : cleanFinalAnswer(summaryResult.text || '');
   } catch (err: unknown) {
-    logger.warn(`[ForcedSummary] AI call failed: ${(err as Error).message}`);
+    logger().warn(`[ForcedSummary] AI call failed: ${(err as Error).message}`);
 
     if (isSystem && isAnalyst) {
       // Analyst 管线兜底: 从工具调用记录合成 Markdown 分析报告
@@ -311,11 +313,11 @@ ${toolContextSummary}
 
   // 兜底: 确保 finalReply 始终非空
   if (!finalReply) {
-    logger.warn('[ForcedSummary] ⚠ finalReply is empty after all paths — using fallback');
+    logger().warn('[ForcedSummary] ⚠ finalReply is empty after all paths — using fallback');
     finalReply = `## 分析总结\n\n通过 **${toolCalls.length} 次工具调用**探索了项目代码，但未能生成完整分析。请重试或缩小分析范围。`;
   }
 
-  logger.info(`[ForcedSummary] ✅ forced summary — ${finalReply.length} chars`);
+  logger().info(`[ForcedSummary] ✅ forced summary — ${finalReply.length} chars`);
   return { reply: finalReply, tokenUsage: resultTokenUsage };
 }
 

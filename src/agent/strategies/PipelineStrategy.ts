@@ -160,7 +160,9 @@ interface StageContextWindow {
   [key: string]: unknown;
 }
 
-const _pipelineLogger = Logger.getInstance();
+// AD4: lazy logger accessor — the Core logger singleton materializes on first
+// use instead of at module import (no import-time work; same singleton).
+const _pipelineLogger = () => Logger.getInstance();
 
 export class PipelineStrategy extends Strategy {
   #stages: PipelineStage[];
@@ -654,7 +656,7 @@ export class PipelineStrategy extends Strategy {
     if (ctxWin && ctx.execStageCount > 0 && isNewStage) {
       ctxWin.resetForNewStage();
     } else if (ctxWin && ctx.execStageCount > 0 && !isNewStage) {
-      _pipelineLogger.info(
+      _pipelineLogger().info(
         `[PipelineStrategy] ♻️ Retry stage "${stage.name}" — preserving ContextWindow (${ctxWin.tokenCount || 0} tokens)`
       );
     }
@@ -668,7 +670,7 @@ export class PipelineStrategy extends Strategy {
     const submitToolName = (stage.submitToolName || strategyContext.submitToolName || undefined) as
       | string
       | undefined;
-    _pipelineLogger.info(
+    _pipelineLogger().info(
       `[PipelineStrategy] ▶ Stage "${stage.name}"${isRetry ? ' (retry)' : ''} — ` +
         `budget: ${effectiveBudget?.maxIterations || '∞'} iters, ` +
         `timeout: ${effectiveBudget?.timeoutMs ? `${effectiveBudget.timeoutMs / 1000}s` : '∞'}, ` +
@@ -696,7 +698,7 @@ export class PipelineStrategy extends Strategy {
     // 如果有 retryBudget 且本次非 retry，立即以降级预算重跑一次，
     // 跳过 gate 往返，争取在更短时限内拿到输出。
     if (stageResult.timedOut && !stageResult.toolCalls?.length && !isRetry && stage.retryBudget) {
-      _pipelineLogger.info(
+      _pipelineLogger().info(
         `[PipelineStrategy] ♻️ Stage "${stage.name}" timed out with 0 tool calls — fast-retrying with retryBudget`
       );
       bus.publish(AgentEvents.PROGRESS, {
@@ -751,7 +753,7 @@ export class PipelineStrategy extends Strategy {
       ctx.totalTokenUsage.output += stageResult.tokenUsage.output || 0;
     }
 
-    _pipelineLogger.info(
+    _pipelineLogger().info(
       `[PipelineStrategy] ✅ Stage "${stage.name}" done — ` +
         `${stageResult.iterations || 0} iters, ${stageResult.toolCalls?.length || 0} tool calls, ` +
         `reply: ${stageResult.reply?.length || 0} chars${stageResult.timedOut ? ' (TIMED OUT)' : ''}`

@@ -23,7 +23,9 @@ import {
 } from '../domain/EvidenceCollector.js';
 import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidence.js';
 
-const logger = Logger.getInstance();
+// AD4: lazy logger accessor — the Core logger singleton materializes on first
+// use instead of at module import (no import-time work; same singleton).
+const logger = () => Logger.getInstance();
 
 // ──────────────────────────────────────────────────────────────────
 // 类型定义
@@ -825,7 +827,7 @@ export function insightGateEvaluator(
       typeof artifactMetadata.memoryFindingCount === 'number'
         ? artifactMetadata.memoryFindingCount
         : 0;
-    logger.info(
+    logger().info(
       `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} ` +
         `total=${qr.totalScore} depth=${qr.scores.depthScore} breadth=${qr.scores.breadthScore} ` +
         `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore} ` +
@@ -833,7 +835,7 @@ export function insightGateEvaluator(
         (qr.suggestions.length > 0 ? ` suggestions=[${qr.suggestions.join('; ')}]` : '')
     );
   } else {
-    logger.info(
+    logger().info(
       `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} reason="${gate.reason || 'v1-rules'}" (v1 fallback)`
     );
   }

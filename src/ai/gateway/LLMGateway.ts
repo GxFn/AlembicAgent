@@ -37,7 +37,9 @@ import type {
 } from '../transport/LLMTransport.js';
 import { OpenAiTransport } from '../transport/OpenAiTransport.js';
 
-const logger = Logger.getInstance();
+// AD4: lazy logger accessor — the Core logger singleton materializes on first
+// use instead of at module import (no import-time work; same singleton).
+const logger = () => Logger.getInstance();
 
 // ─── Gateway Request ────────────────────────────────────
 
@@ -125,7 +127,7 @@ export class LLMGateway {
     });
 
     if (guarded.filtered.length > 0) {
-      logger.debug(
+      logger().debug(
         `[LLMGateway] ${modelDef.displayName} filtered params: ${guarded.filtered.map((f) => `${f.param}(${f.reason})`).join(', ')}`
       );
     }
@@ -315,9 +317,9 @@ export class LLMGateway {
 
   /** 桥接 core Logger（控制器 / 结构化提取的日志回调）。 */
   #log(level: string, message: string): void {
-    const fn = (logger as unknown as Record<string, (msg: string) => void>)[level];
+    const fn = (logger() as unknown as Record<string, (msg: string) => void>)[level];
     if (typeof fn === 'function') {
-      fn.call(logger, message);
+      fn.call(logger(), message);
     }
   }
 
@@ -399,7 +401,7 @@ export class LLMGateway {
           baseUrl: config.baseUrl || 'http://127.0.0.1:11434/v1',
         });
       default:
-        logger.warn(
+        logger().warn(
           `[LLMGateway] Unknown provider '${providerId}', falling back to OpenAI transport`
         );
         return new OpenAiTransport(config);
