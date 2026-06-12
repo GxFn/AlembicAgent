@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "description": "Machine-readable AlembicAgent internal layer contract (P2 AD3, Core CO2 pattern, accepted Alembic-leg method). Codifies the AS-IS src/ cross-area runtime import graph derived on 2026-06-12 via scripts/lint-layer-contract.mjs --report at baseline 6bf266e (44 runtime edges, 18 type-only bridges) — the contract records reality; redesigns go through controller-decided waves. Enforced by scripts/lint-layer-contract.mjs as a blocking step in npm run check. Imports resolve through both relative specifiers and the package.json '#alias/*' subpath map (#agent/#ai/#shared/#tools).",
+  "typeOnlyImportsExempt": true,
+  "typeOnlyNote": "import type / export type imports are type bridges and do not create runtime coupling; runtime imports must follow allowedRuntimeImports.",
+  "layerRationale": [
+    "Base leaves (import nothing cross-area): shared (vendor-neutral helpers: structured-output, language service), ai (provider adapters, transports, registry, gateway — consumes shared code only via its own copies and @alembic/core externally), types (ambient .d.ts declarations only; no runtime edges by construction since the lint scans no .d.ts).",
+    "Mid: tools (generic tool system: contracts, catalog, router, V2, terminal) sits over shared; its single runtime reach-up into agent (CapabilityV2 extends the agent-side Capability base class) is the recorded agent<->tools cycle minority, blessed below with a placement cleanup trigger.",
+    "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, forge, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
+    "root (src/index.ts) is the package facade composition entry with a wildcard: it re-exports agent, ai, and tools wholesale (the post-IC3 public surface).",
+    "AD2 charter cross-check 2026-06-12: the SD-4 declared exception (raw-SQL semantic_memories read adapter) lives wholly inside agent/memory/MemoryStore.ts and imports only node:crypto plus @alembic/core externals — it crosses NO internal area, so it consistently needs no entry in this contract; external package edges are owned by the space-edge and core-import gates, not this lint."
+  ],
+  "areas": ["agent", "ai", "root", "shared", "tools", "types"],
+  "allowedRuntimeImports": {
+    "agent": ["ai", "shared", "tools"],
+    "ai": [],
+    "root": ["*"],
+    "shared": [],
+    "tools": ["shared"],
+    "types": []
+  },
+  "blessedImports": [
+    {
+      "file": "src/tools/v2/capabilities/CapabilityV2.ts",
+      "to": "agent",
+      "reason": "Minority side of the agent<->tools cycle (agent->tools x25 is the layering; this single edge is the inversion): CapabilityV2 extends the agent-owned Capability base class — runtime inheritance reach-up, not a service-locator pattern.",
+      "owner": "AlembicAgent window",
+      "cleanupTrigger": "Controller-decided base-contract placement wave: move the Capability base contract into a leaf area (shared/ or a tools-owned contract) so V2 capabilities subclass downward. Recorded for the AD placement register; explicitly NOT AD4 service-locator/side-effect class."
+    }
+  ],
+  "cycleFindings": [
+    {
+      "cycle": "agent <-> tools",
+      "majority": "agent -> tools (25 edges: runtime tool pipeline, AG1 bridge, service and capability wiring consume the generic tool system)",
+      "minority": "tools -> agent (1 edge: CapabilityV2 extends Capability, blessed above)",
+      "status": "recorded 2026-06-12; resolution owned by a controller-decided base-contract placement wave (AD placement register), not AD4 locator remediation"
+    }
+  ]
+}
