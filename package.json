@@ -101,6 +101,7 @@
     "lint:agent-import-boundary": "node scripts/lint-agent-import-boundary.mjs",
     "lint:public-api-boundary": "node scripts/lint-agent-public-api-boundary.mjs",
     "lint:core-import-boundary": "node ../AlembicCore/scripts/lint-consumer-core-imports.mjs . --config config/core-import-boundary.json",
+    "lint:space-edges": "node scripts/check-agent-space-edges.mjs",
     "release:stage": "npm run build && node scripts/stage-agent-publish-package.mjs",
     "release:pack-preview": "npm run release:stage && npm --cache tmp/npm-cache pack --dry-run --json tmp/release/@alembic-agent",
     "release:package-guard": "node scripts/guard-agent-release-package.mjs",
@@ -109,7 +110,7 @@
     "smoke:public-signatures": "npm run build && node scripts/smoke-agent-public-signatures.mjs",
     "verify:validation-floor": "node scripts/verify-agent-validation-floor.mjs",
     "test": "vitest run",
-    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run smoke:public-signatures && npm run verify:validation-floor && npm run test"
+    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run lint:space-edges && npm run smoke:public-signatures && npm run verify:validation-floor && npm run test"
   },
   "dependencies": {
     "@alembic/core": "file:../AlembicCore",
