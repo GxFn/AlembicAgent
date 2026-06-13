@@ -64,13 +64,13 @@ jobs:
         working-directory: AlembicAgent
         run: npm run lint:agent-import-boundary
 
-      - name: Test
-        working-directory: AlembicAgent
-        run: npm run test
-
       - name: Build
         working-directory: AlembicAgent
         run: npm run build
+
+      - name: Test
+        working-directory: AlembicAgent
+        run: npm run test
 
       - name: Package export smoke
         working-directory: AlembicAgent
