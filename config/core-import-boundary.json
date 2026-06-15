@@ -7,7 +7,7 @@
     "stableFacadeEntries": "Entries for stable facades record the frozen baseline counts. The Core lint always allows stable facades and skips them in the limit check today; the counts become enforced ratchets automatically if Core ever demotes a facade from stable.",
     "zeroLimitEntries": "Entries with limit 0 are enforced deny rules: these Core internal subpaths must never be imported by Agent code. Any occurrence fails the lint with 'Reference limit exceeded: N found, baseline allows 0'.",
     "newImports": "A new non-stable @alembic/core subpath import fails by default. If a legitimate import must be added, record it here with a reason instead of loosening the gate to empty.",
-    "sharedTaxonomyAdoption": "Calibrated 2026-06-12 (P3 plugin train): @alembic/core/shared limit 0->1. The single consumer is src/agent/runtime/AgentInterfaceContract.ts:1-7, a multi-line import of CORE_FAILURE_TAXONOMY / CORE_D25_REQUIRED_FAILURE_KINDS / CORE_FAILURE_TAXONOMY_VERSION and their types — the IC4 taxonomy adoption surface, intended usage. The previous 0 was calibrated against the blind multi-line-invisible scanner. Facade preference (root facade vs ./shared subpath) is deferred to P2 AD as an open note, not a migration."
+    "sharedTaxonomyAdoption": "Calibrated 2026-06-12 (P3 plugin train): @alembic/core/shared limit 0->1. The original consumer is src/agent/runtime/AgentInterfaceContract.ts:1-7, a multi-line import of CORE_FAILURE_TAXONOMY / CORE_D25_REQUIRED_FAILURE_KINDS / CORE_FAILURE_TAXONOMY_VERSION and their types — the IC4 taxonomy adoption surface, intended usage. PCI-5 cleanup on 2026-06-15 moves src/ai/AiProvider.ts LanguageService from retired @alembic/core/project-intelligence to the surviving generic shared route, so @alembic/core/shared is now intentionally 2 while @alembic/core/project-intelligence is ratcheted to 0."
   },
   "referenceLimits": {
     "@alembic/core": 2,
@@ -17,7 +17,7 @@
     "@alembic/core/io": 5,
     "@alembic/core/knowledge": 2,
     "@alembic/core/logging": 29,
-    "@alembic/core/project-intelligence": 1,
+    "@alembic/core/project-intelligence": 0,
     "@alembic/core/search": 3,
     "@alembic/core/infrastructure/database": 0,
     "@alembic/core/infrastructure/database/drizzle": 0,
@@ -25,7 +25,7 @@
     "@alembic/core/repository": 0,
     "@alembic/core/repository/memory": 0,
     "@alembic/core/service": 0,
-    "@alembic/core/shared": 1,
+    "@alembic/core/shared": 2,
     "@alembic/core/workflows": 0
   }
 }

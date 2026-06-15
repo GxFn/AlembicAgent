@@ -3,7 +3,7 @@
  * 所有具体 Provider 必须实现这3个方法
  */
 
-import { LanguageService } from '@alembic/core/project-intelligence';
+import { LanguageService } from '@alembic/core/shared';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
 import { classifyLlmError } from './shared/errorClassify.js';
 import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
