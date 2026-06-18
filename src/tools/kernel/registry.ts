@@ -50,7 +50,7 @@ export type ToolRegistry = Record<string, ToolSpec>;
 /* ------------------------------------------------------------------ */
 
 /** LLM 发出的工具调用（router 解析后） */
-export interface ToolCallV2 {
+export interface ParsedToolCall {
   tool: string;
   action: string;
   params: Record<string, unknown>;
@@ -162,7 +162,7 @@ export type ActionHandler = (
 /* ------------------------------------------------------------------ */
 
 /** Capability 定义 — tool → 允许的 action 列表 */
-export interface CapabilityV2Def {
+export interface CapabilityDef {
   name: string;
   description: string;
   promptFragment?: string;

@@ -2,9 +2,9 @@
  * 系统交互 — Agent 的全功能模式（代码探索 + 终端 + 写入）。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class SystemV2 extends CapabilityV2 {
+export class System extends RuntimeCapability {
   get name() {
     return 'system_interaction';
   }

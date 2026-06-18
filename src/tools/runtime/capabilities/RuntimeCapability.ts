@@ -1,16 +1,16 @@
 /**
- * @module tools/runtime/capabilities/CapabilityV2
+ * @module tools/runtime/capabilities/RuntimeCapability
  *
- * V2 Capability 基类 — 直接继承 V1 Capability，声明式定义场景级工具集。
+ * Capability 基类 — 继承 Agent Capability，声明式定义场景级工具集。
  * 每个 Capability 声明 allowedTools (tool → action[])，
  * promptFragment 从注册表自动生成。
  */
 
 import { Capability } from '#agent/capabilities/Capability.js';
-import type { CapabilityV2Def } from '#tools/kernel/registry.js';
+import type { CapabilityDef } from '#tools/kernel/registry.js';
 import { TOOL_REGISTRY } from '../registry.js';
 
-export abstract class CapabilityV2 extends Capability {
+export abstract class RuntimeCapability extends Capability {
   abstract get description(): string;
   abstract get allowedTools(): Record<string, string[]>;
 
@@ -22,7 +22,7 @@ export abstract class CapabilityV2 extends Capability {
     return generatePromptFragment(this.allowedTools);
   }
 
-  toDef(): CapabilityV2Def {
+  toDef(): CapabilityDef {
     return {
       name: this.name,
       description: this.description,

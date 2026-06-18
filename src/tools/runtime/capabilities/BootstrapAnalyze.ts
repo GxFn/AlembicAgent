@@ -2,9 +2,9 @@
  * 冷启动.分析 — Agent 分析项目源码，提取结构化发现。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class BootstrapAnalyze extends CapabilityV2 {
+export class BootstrapAnalyze extends RuntimeCapability {
   get name() {
     return 'code_analysis';
   }

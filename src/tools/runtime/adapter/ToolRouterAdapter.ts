@@ -1,7 +1,7 @@
 /**
- * V2ToolRouterAdapter — V2 工具路由器适配到 V1 ToolRouterContract。
+ * ToolRouterAdapter — 工具路由器适配到 ToolRouterContract。
  *
- * 职责单一：只处理 V2 工具系统的核心 LLM 工具。
+ * 职责单一：只处理工具系统的核心 LLM 工具。
  * Dashboard Operations、MCP-like 工具、terminal sandbox 等宿主能力由各宿主注入 context，
  * 不在 AlembicAgent 内提供 concrete adapter；Codex MCP/channel/marketplace 由 Plugin 承载。
  */
@@ -15,14 +15,14 @@ import type {
   ToolResultTrust,
   ToolRouterContract,
 } from '#tools/kernel/index.js';
-import type { CapabilityV2Def, ToolContext, ToolResult } from '#tools/kernel/registry.js';
-import { ToolRouterV2 } from '../router.js';
+import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
+import { ToolRouter } from '../router.js';
 
-export interface V2ToolContextFactory {
+export interface ToolContextFactoryContract {
   create(request: ToolCallRequest): ToolContext;
 }
 
-export type V2ToolContextProvider = V2ToolContextFactory;
+export type ToolContextProviderContract = ToolContextFactoryContract;
 
 const EMPTY_DIAGNOSTICS: ToolResultDiagnostics = {
   degraded: false,
@@ -43,16 +43,16 @@ const DEFAULT_TRUST: ToolResultTrust = {
   containsSecrets: false,
 };
 
-export class V2ToolRouterAdapter implements ToolRouterContract {
-  readonly router: ToolRouterV2;
-  readonly #contextFactory: V2ToolContextFactory;
+export class ToolRouterAdapter implements ToolRouterContract {
+  readonly router: ToolRouter;
+  readonly #contextFactory: ToolContextFactoryContract;
 
   constructor(opts: {
-    capability?: CapabilityV2Def;
-    contextFactory: V2ToolContextFactory;
-    router?: ToolRouterV2;
+    capability?: CapabilityDef;
+    contextFactory: ToolContextFactoryContract;
+    router?: ToolRouter;
   }) {
-    this.router = opts.router ?? new ToolRouterV2({ capability: opts.capability });
+    this.router = opts.router ?? new ToolRouter({ capability: opts.capability });
     this.#contextFactory = opts.contextFactory;
   }
 
@@ -67,9 +67,9 @@ export class V2ToolRouterAdapter implements ToolRouterContract {
         return this.#errorEnvelope(request.toolId, callId, startedAt, parsed.error);
       }
 
-      const v2CacheHint =
+      const cacheHint =
         this.router.getToolSpec(parsed.tool)?.actions[parsed.action]?.cache ?? 'none';
-      const cachePolicy = v2CacheHint === 'delta' ? 'session' : v2CacheHint;
+      const cachePolicy = cacheHint === 'delta' ? 'session' : cacheHint;
 
       const ctx = this.#contextFactory.create(request);
       const result = await this.router.execute(parsed, ctx);

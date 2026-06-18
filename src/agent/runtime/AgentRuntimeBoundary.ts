@@ -82,7 +82,7 @@ const BOUNDARY_ENTRIES = [
     owner: 'agent',
     publicSubpath: '@alembic/agent/tools/runtime',
     summary: 'Tool V2 router, capability catalog, cache, compressor, adapter, and handlers.',
-    agentOwns: ['ToolRouterV2', 'V2ToolRouterAdapter', 'tool cache and compressor contracts'],
+    agentOwns: ['ToolRouter', 'ToolRouterAdapter', 'tool cache and compressor contracts'],
     hostOwns: ['ToolContextFactory inputs', 'external executor wiring', 'UI or daemon surfaces'],
   },
   {

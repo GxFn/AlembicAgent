@@ -4,10 +4,10 @@ import {
   DeltaCache,
   OutputCompressor,
   parseGitStatusOutput,
+  RuntimeCapabilityCatalog,
   SearchCache,
-  ToolRouterV2,
-  V2CapabilityCatalog,
-  V2ToolRouterAdapter,
+  ToolRouter,
+  ToolRouterAdapter,
 } from '../src/tools/runtime/index.js';
 
 function baseToolContext(): ToolContext {
@@ -19,7 +19,7 @@ function baseToolContext(): ToolContext {
 
 describe('Tool V2 contract exports', () => {
   it('exports capability catalog projections from the V2 registry', () => {
-    const catalog = new V2CapabilityCatalog();
+    const catalog = new RuntimeCapabilityCatalog();
     const schemas = catalog.toToolSchemas(['meta']);
 
     expect(catalog.has('meta')).toBe(true);
@@ -34,7 +34,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('projects action-level allowlists into provider-visible schemas', () => {
-    const catalog = new V2CapabilityCatalog();
+    const catalog = new RuntimeCapabilityCatalog();
     const schemas = catalog.toToolSchemasForActions({
       knowledge: ['submit'],
       meta: ['review'],
@@ -107,7 +107,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('routes V2 calls through generic router and adapter contracts', async () => {
-    const router = new ToolRouterV2();
+    const router = new ToolRouter();
     const parsed = router.parseToolCall('meta', {
       action: 'tools',
       params: { name: 'meta' },
@@ -122,7 +122,7 @@ describe('Tool V2 contract exports', () => {
     expect(result.ok).toBe(true);
     expect(String(result.data)).toContain('[meta]');
 
-    const adapter = new V2ToolRouterAdapter({
+    const adapter = new ToolRouterAdapter({
       contextFactory: {
         create: () => baseToolContext(),
       },
@@ -141,7 +141,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('binds V2 terminal exec calls to the injected sandbox executor', async () => {
-    const router = new ToolRouterV2();
+    const router = new ToolRouter();
     const parsed = router.parseToolCall('terminal', {
       action: 'exec',
       params: { command: 'node -v', timeout: 1000 },
@@ -174,7 +174,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('routes V2 terminal cancellation as a structured partial timeout result', async () => {
-    const router = new ToolRouterV2();
+    const router = new ToolRouter();
     const abortController = new AbortController();
     abortController.abort();
     const parsed = router.parseToolCall('terminal', {
@@ -204,7 +204,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
-    const router = new ToolRouterV2();
+    const router = new ToolRouter();
     const createRequests: Array<{
       source: string;
       items: Record<string, unknown>[];
@@ -266,7 +266,7 @@ describe('Tool V2 contract exports', () => {
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {
-    const router = new ToolRouterV2();
+    const router = new ToolRouter();
 
     async function captureEvolutionSource(source?: string): Promise<unknown> {
       const submitted: Array<{ source: unknown }> = [];

@@ -2,9 +2,9 @@
  * 增量扫描.生产 — Agent 将扫描发现转化为知识候选。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class ScanProduce extends CapabilityV2 {
+export class ScanProduce extends RuntimeCapability {
   get name() {
     return 'scan_production';
   }

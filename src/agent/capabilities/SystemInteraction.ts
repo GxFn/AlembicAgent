@@ -20,7 +20,7 @@ export class SystemInteraction extends Capability {
     return `## 系统交互能力
 你可以在本地环境中执行结构化终端命令、写入文件、探索项目，并读取受治理的本机 macOS 状态。
 
-V2 工具系统（资源导向，6 个核心工具）:
+工具系统（资源导向，6 个核心工具）:
 1. **code** — 代码读写搜索: code({ action: "read/search/write/outline/structure" })
 2. **terminal** — 命令执行: terminal({ action: "exec", command: "..." })
 3. **knowledge** — 知识提交/搜索: knowledge({ action: "submit/search" })

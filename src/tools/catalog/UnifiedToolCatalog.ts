@@ -4,7 +4,7 @@
  * 合并 `CapabilityCatalog`（manifest 查询）和 `ToolRegistry`（handler 查询）。
  * 继承 `CapabilityCatalog` 以保持对 `ToolRouter` 的兼容。
  *
- * 内部存储 `ToolDefinitionV2`，对外暴露：
+ * 内部存储 `ToolDefinition`，对外暴露：
  *   - getManifest(id) — 返回 ToolCapabilityManifest（兼容 GovernanceEngine）
  *   - getHandler(id) — 返回 handler function
  *   - getInternalTool(id) — 兼容 InternalToolHandlerStore
@@ -29,14 +29,14 @@ import type {
   ToolRouterContract,
 } from '#tools/kernel/index.js';
 
-// ── Types inlined from deleted ToolDefinitionV2.ts ──
+// ── Types inlined from deleted ToolDefinition.ts ──
 
 export type ToolHandler = (
   args: Record<string, unknown>,
   context: Record<string, unknown>
 ) => unknown | Promise<unknown>;
 
-export interface ToolDefinitionV2 {
+export interface ToolDefinition {
   id: string;
   title: string;
   description: string;
@@ -56,7 +56,7 @@ export interface ToolDefinitionV2 {
   >;
 }
 
-function v2ToManifest(def: ToolDefinitionV2): ToolCapabilityManifest {
+function definitionToManifest(def: ToolDefinition): ToolCapabilityManifest {
   const surfaces: Array<'runtime' | 'http' | 'mcp' | 'dashboard' | 'skill' | 'internal'> = [
     'runtime',
   ];
@@ -87,7 +87,7 @@ function v2ToManifest(def: ToolDefinitionV2): ToolCapabilityManifest {
   };
 }
 
-function v2ToSchemaProjection(def: ToolDefinitionV2, model?: string): ToolSchemaProjection {
+function definitionToSchemaProjection(def: ToolDefinition, model?: string): ToolSchemaProjection {
   const override = model ? matchModelOverride(def, model) : undefined;
   return {
     name: def.id,
@@ -97,7 +97,7 @@ function v2ToSchemaProjection(def: ToolDefinitionV2, model?: string): ToolSchema
 }
 
 function matchModelOverride(
-  def: ToolDefinitionV2,
+  def: ToolDefinition,
   model: string
 ): { description?: string; inputSchema?: Record<string, unknown> } | undefined {
   if (!def.modelOverrides) {
@@ -129,12 +129,12 @@ function matchGlob(value: string, pattern: string): boolean {
 }
 
 export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToolHandlerStore {
-  readonly #defs = new Map<string, ToolDefinitionV2>();
+  readonly #defs = new Map<string, ToolDefinition>();
   #router: ToolRouterContract | null = null;
 
-  constructor(defs: ToolDefinitionV2[] = []) {
+  constructor(defs: ToolDefinition[] = []) {
     super([]);
-    this.registerV2All(defs);
+    this.registerDefinitions(defs);
   }
 
   // ── Router binding (replaces ToolRegistry.setRouter/getRouter) ──
@@ -147,20 +147,20 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     return this.#router;
   }
 
-  // ── V2 Registration ──
+  // ── Registration ──
 
-  registerV2(def: ToolDefinitionV2): void {
+  registerDefinition(def: ToolDefinition): void {
     if (this.#defs.has(def.id)) {
       throw new Error(`Tool '${def.id}' already registered in UnifiedToolCatalog`);
     }
     this.#defs.set(def.id, def);
     // Also register as CapabilityManifest for backward compatibility
-    super.register(v2ToManifest(def));
+    super.register(definitionToManifest(def));
   }
 
-  registerV2All(defs: ToolDefinitionV2[]): void {
+  registerDefinitions(defs: ToolDefinition[]): void {
     for (const def of defs) {
-      this.registerV2(def);
+      this.registerDefinition(def);
     }
   }
 
@@ -170,7 +170,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     return this.#defs.get(id)?.handler ?? null;
   }
 
-  getDefinitionV2(id: string): ToolDefinitionV2 | null {
+  getDefinition(id: string): ToolDefinition | null {
     return this.#defs.get(id) ?? null;
   }
 
@@ -208,7 +208,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     return manifests.map((manifest) => {
       const def = this.#defs.get(manifest.id);
       if (def && model) {
-        return v2ToSchemaProjection(def, model);
+        return definitionToSchemaProjection(def, model);
       }
       return {
         name: manifest.id,
@@ -278,7 +278,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
       if (this.#expandedToolIds.has(manifest.id)) {
         const def = this.#defs.get(manifest.id);
         if (def && model) {
-          return v2ToSchemaProjection(def, model);
+          return definitionToSchemaProjection(def, model);
         }
         return {
           name: manifest.id,
@@ -296,7 +296,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
 
   // ── Inspection ──
 
-  get v2Size(): number {
+  get definitionCount(): number {
     return this.#defs.size;
   }
 
@@ -304,7 +304,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     return this.#expandedToolIds.size;
   }
 
-  listV2Ids(): string[] {
+  listDefinitionIds(): string[] {
     return [...this.#defs.keys()];
   }
 }

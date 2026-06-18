@@ -31,8 +31,8 @@
     ".": {
       "exportPath": ".",
       "specifier": "@alembic/agent",
-      "exportCount": 184,
-      "signatureHash": "0c7d5a9e4f9bf9d8b4c5c46a60d0244d77ad6141a31365976b55566ba0afe40d",
+      "exportCount": 183,
+      "signatureHash": "86dffa0e926a89c054e435f51957792fca1a8510b3dba90705a1856d1b14607a",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -155,7 +155,7 @@
           "kind": "object"
         },
         {
-          "name": "CapabilityV2",
+          "name": "RuntimeCapability",
           "kind": "class"
         },
         {
@@ -184,10 +184,6 @@
         },
         {
           "name": "ConversationStore",
-          "kind": "class"
-        },
-        {
-          "name": "ConversationV2",
           "kind": "class"
         },
         {
@@ -399,7 +395,7 @@
           "kind": "class"
         },
         {
-          "name": "SystemV2",
+          "name": "System",
           "kind": "class"
         },
         {
@@ -443,7 +439,7 @@
           "kind": "array"
         },
         {
-          "name": "ToolRouterV2",
+          "name": "ToolRouter",
           "kind": "class"
         },
         {
@@ -451,11 +447,11 @@
           "kind": "class"
         },
         {
-          "name": "V2CapabilityCatalog",
+          "name": "RuntimeCapabilityCatalog",
           "kind": "class"
         },
         {
-          "name": "V2ToolRouterAdapter",
+          "name": "ToolRouterAdapter",
           "kind": "class"
         },
         {
@@ -1692,7 +1688,7 @@
       "exportPath": "./tools/runtime",
       "specifier": "@alembic/agent/tools/runtime",
       "exportCount": 31,
-      "signatureHash": "8d3d5feb89f6fefab071a76054f42a20b6745143493d8fa2a7dc9134717b8a94",
+      "signatureHash": "1869adfdb67f6d11c3d5fb001242e8e8c533d040f92610decbaba84d2ae73d0b",
       "entries": [
         {
           "name": "BootstrapAnalyze",
@@ -1703,11 +1699,11 @@
           "kind": "class"
         },
         {
-          "name": "CapabilityV2",
+          "name": "RuntimeCapability",
           "kind": "class"
         },
         {
-          "name": "ConversationV2",
+          "name": "Conversation",
           "kind": "class"
         },
         {
@@ -1735,7 +1731,7 @@
           "kind": "class"
         },
         {
-          "name": "SystemV2",
+          "name": "System",
           "kind": "class"
         },
         {
@@ -1743,15 +1739,15 @@
           "kind": "object"
         },
         {
-          "name": "ToolRouterV2",
+          "name": "ToolRouter",
           "kind": "class"
         },
         {
-          "name": "V2CapabilityCatalog",
+          "name": "RuntimeCapabilityCatalog",
           "kind": "class"
         },
         {
-          "name": "V2ToolRouterAdapter",
+          "name": "ToolRouterAdapter",
           "kind": "class"
         },
         {

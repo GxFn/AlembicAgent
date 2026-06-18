@@ -17,7 +17,7 @@ import {
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
-import { V2CapabilityCatalog } from '../src/tools/runtime/index.js';
+import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 
 function createRuntime({
@@ -775,7 +775,7 @@ describe('LLM input layering', () => {
       return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
     });
     const runtime = createRuntime({
-      capabilityCatalog: new V2CapabilityCatalog(),
+      capabilityCatalog: new RuntimeCapabilityCatalog(),
       chatWithTools,
     });
     const tracker = ExplorationTracker.resolve(

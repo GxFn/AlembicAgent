@@ -130,7 +130,7 @@
       "export": "./tools/runtime",
       "specifier": "@alembic/agent/tools/runtime",
       "contract": "Tool V2 router, cache, compressor, parser, capability catalog, and adapter contract.",
-      "agentOwned": ["generic ToolRouterV2", "DeltaCache/SearchCache", "OutputCompressor", "V2ToolRouterAdapter contract"],
+      "agentOwned": ["generic ToolRouter", "DeltaCache/SearchCache", "OutputCompressor", "ToolRouterAdapter contract"],
       "hostOwnedAdapterBoundary": "Host owns ToolContextFactory inputs, external executor wiring, sandbox bridge, and UI/daemon call surfaces."
     },
     {

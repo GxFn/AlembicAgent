@@ -1,13 +1,13 @@
 /**
  * @module tools/runtime/capabilities
- * Barrel export for all V2 capabilities.
+ * Barrel export for all capabilities.
  */
 
 export { BootstrapAnalyze } from './BootstrapAnalyze.js';
 export { BootstrapProduce } from './BootstrapProduce.js';
-export { CapabilityV2 } from './CapabilityV2.js';
-export { ConversationV2 } from './ConversationV2.js';
+export { Conversation } from './Conversation.js';
 export { Evolution } from './Evolution.js';
+export { RuntimeCapability } from './RuntimeCapability.js';
 export { ScanAnalyze } from './ScanAnalyze.js';
 export { ScanProduce } from './ScanProduce.js';
-export { SystemV2 } from './SystemV2.js';
+export { System } from './System.js';

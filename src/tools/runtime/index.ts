@@ -1,14 +1,14 @@
 export type {
   ActionHandler,
-  CapabilityV2Def,
+  CapabilityDef,
   CompressOpts,
   DeltaCacheLike,
   MemoryCoordinatorLike,
   OutputCompressorLike,
+  ParsedToolCall,
   SearchCacheLike,
   SessionStoreLike,
   ToolAction,
-  ToolCallV2,
   ToolContext,
   ToolRegistry,
   ToolResult,
@@ -21,12 +21,12 @@ export * from './cache/index.js';
 export {
   BootstrapAnalyze,
   BootstrapProduce,
-  CapabilityV2,
-  ConversationV2,
+  Conversation,
   Evolution,
+  RuntimeCapability,
   ScanAnalyze,
   ScanProduce,
-  SystemV2,
+  System,
 } from './capabilities/index.js';
 export * from './compressor/index.js';
 export {
@@ -36,4 +36,4 @@ export {
   TOOL_REGISTRY,
 } from './registry.js';
 export type { RouterConfig } from './router.js';
-export { ToolRouterV2 } from './router.js';
+export { ToolRouter } from './router.js';

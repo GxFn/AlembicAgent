@@ -5,7 +5,7 @@
   "typeOnlyNote": "import type / export type imports are type bridges and do not create runtime coupling; runtime imports must follow allowedRuntimeImports.",
   "layerRationale": [
     "Base leaves (import nothing cross-area): shared (vendor-neutral helpers: structuredOutput, language service), ai (provider adapters, transports, registry, gateway — consumes shared code only via its own copies and @alembic/core externally), types (ambient .d.ts declarations only; no runtime edges by construction since the lint scans no .d.ts).",
-    "Mid: tools (generic tool system: contracts, catalog, router, V2, terminal) sits over shared; its single runtime reach-up into agent (CapabilityV2 extends the agent-side Capability base class) is the recorded agent<->tools cycle minority, blessed below with a placement cleanup trigger.",
+    "Mid: tools (generic tool system: contracts, catalog, router, V2, terminal) sits over shared; its single runtime reach-up into agent (RuntimeCapability extends the agent-side Capability base class) is the recorded agent<->tools cycle minority, blessed below with a placement cleanup trigger.",
     "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
     "root (src/index.ts) is the package facade composition entry with a wildcard: it re-exports agent, ai, and tools wholesale (the post-IC3 public surface).",
     "AD2 charter cross-check 2026-06-12: the SD-4 declared exception (raw-SQL semantic_memories read adapter) lives wholly inside agent/memory/MemoryStore.ts and imports only node:crypto plus @alembic/core externals — it crosses NO internal area, so it consistently needs no entry in this contract; external package edges are owned by the space-edge and core-import gates, not this lint."
@@ -21,9 +21,9 @@
   },
   "blessedImports": [
     {
-      "file": "src/tools/runtime/capabilities/CapabilityV2.ts",
+      "file": "src/tools/runtime/capabilities/RuntimeCapability.ts",
       "to": "agent",
-      "reason": "Minority side of the agent<->tools cycle (agent->tools x25 is the layering; this single edge is the inversion): CapabilityV2 extends the agent-owned Capability base class — runtime inheritance reach-up, not a service-locator pattern.",
+      "reason": "Minority side of the agent<->tools cycle (agent->tools x25 is the layering; this single edge is the inversion): RuntimeCapability extends the agent-owned Capability base class — runtime inheritance reach-up, not a service-locator pattern.",
       "owner": "AlembicAgent window",
       "cleanupTrigger": "Controller-decided base-contract placement wave: move the Capability base contract into a leaf area (shared/ or a tools-owned contract) so V2 capabilities subclass downward. Recorded for the AD placement register; explicitly NOT AD4 service-locator/side-effect class."
     }
@@ -32,7 +32,7 @@
     {
       "cycle": "agent <-> tools",
       "majority": "agent -> tools (25 edges: runtime tool pipeline, AG1 bridge, service and capability wiring consume the generic tool system)",
-      "minority": "tools -> agent (1 edge: CapabilityV2 extends Capability, blessed above)",
+      "minority": "tools -> agent (1 edge: RuntimeCapability extends Capability, blessed above)",
       "status": "recorded 2026-06-12; resolution owned by a controller-decided base-contract placement wave (AD placement register), not AD4 locator remediation"
     }
   ]

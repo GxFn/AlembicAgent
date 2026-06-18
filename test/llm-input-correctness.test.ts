@@ -8,7 +8,7 @@ import {
   DeltaCache,
   TOOL_REGISTRY,
   type ToolContext,
-  ToolRouterV2,
+  ToolRouter,
 } from '../src/tools/runtime/index.js';
 
 interface BatchReadFile {
@@ -91,7 +91,7 @@ describe('LLM input correctness fixture', () => {
 
   it('keeps code.read path compatible while enabling batch filePaths partial failure', async () => {
     await withCodeFixture(async (root) => {
-      const router = new ToolRouterV2();
+      const router = new ToolRouter();
 
       const single = await router.execute(
         { tool: 'code', action: 'read', params: { path: 'src/a.ts', maxLines: 1 } },
@@ -132,7 +132,7 @@ describe('LLM input correctness fixture', () => {
 
   it('applies delta cache per file and caps batch output by token budget', async () => {
     await withCodeFixture(async (root) => {
-      const router = new ToolRouterV2();
+      const router = new ToolRouter();
       const deltaCache = new DeltaCache(10);
 
       const first = await router.execute(

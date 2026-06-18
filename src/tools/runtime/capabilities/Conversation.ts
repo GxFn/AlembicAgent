@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PACKAGE_ROOT } from '../../../shared/packageAssets.js';
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
 interface ConversationOpts {
   memoryCoordinator?: MemoryCoordinator | null;
@@ -30,7 +30,7 @@ interface StepResult {
   [key: string]: unknown;
 }
 
-export class ConversationV2 extends CapabilityV2 {
+export class Conversation extends RuntimeCapability {
   #memoryCoordinator: MemoryCoordinator | null;
   #soulContent: string | null;
   #projectBriefing: string | null;

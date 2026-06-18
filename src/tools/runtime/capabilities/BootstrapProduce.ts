@@ -2,9 +2,9 @@
  * 冷启动.生产 — Agent 将分析结果转化为知识候选。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class BootstrapProduce extends CapabilityV2 {
+export class BootstrapProduce extends RuntimeCapability {
   get name() {
     return 'knowledge_production';
   }

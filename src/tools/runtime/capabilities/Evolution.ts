@@ -2,9 +2,9 @@
  * 知识进化 — Agent 验证现有 Recipe 准确性并提出进化/废弃。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class Evolution extends CapabilityV2 {
+export class Evolution extends RuntimeCapability {
   get name() {
     return 'evolution_analysis';
   }

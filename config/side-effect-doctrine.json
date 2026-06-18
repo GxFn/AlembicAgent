@@ -89,8 +89,8 @@
       "rule": "Standing declared exception per the AD2-confirmed charter; Option-C end-state trigger is a user register row. Not AD4 scope."
     },
     {
-      "name": "CapabilityV2 -> Capability inheritance reach-up",
-      "file": "src/tools/runtime/capabilities/CapabilityV2.ts",
+      "name": "RuntimeCapability -> Capability inheritance reach-up",
+      "file": "src/tools/runtime/capabilities/RuntimeCapability.ts",
       "rule": "Placement-class register item (B5), owned by the layer-contract blessing in config/layer-contract.json. Not AD4 scope."
     }
   ]

@@ -2,9 +2,9 @@
  * 增量扫描.分析 — Agent 分析变更文件，发现新知识点。
  */
 
-import { CapabilityV2 } from './CapabilityV2.js';
+import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class ScanAnalyze extends CapabilityV2 {
+export class ScanAnalyze extends RuntimeCapability {
   get name() {
     return 'scan_analyze';
   }

@@ -1,15 +1,15 @@
 /**
  * @module tools/runtime/router
  *
- * V2 ToolRouter — 工具调用的统一入口。
+ * ToolRouter — 工具调用的统一入口。
  *
  * 流程: 参数解析 → Schema 校验 → Capability 权限检查 → 并发控制 → Handler 分发 → 输出截断
  */
 
 import type {
-  CapabilityV2Def,
+  CapabilityDef,
+  ParsedToolCall,
   ToolAction,
-  ToolCallV2,
   ToolContext,
   ToolResult,
   ToolSpec,
@@ -18,10 +18,10 @@ import { estimateTokens, fail } from '#tools/kernel/registry.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
 
 export interface RouterConfig {
-  capability?: CapabilityV2Def;
+  capability?: CapabilityDef;
 }
 
-export class ToolRouterV2 {
+export class ToolRouter {
   readonly #config: RouterConfig;
   readonly #toolLocks = new Map<string, Promise<void>>();
   #globalLock: Promise<void> | null = null;
@@ -36,7 +36,7 @@ export class ToolRouterV2 {
    *
    * 完整流程: 参数校验 → Capability 检查 → 并发控制 → handler → 输出截断
    */
-  async execute(call: ToolCallV2, ctx: ToolContext): Promise<ToolResult> {
+  async execute(call: ParsedToolCall, ctx: ToolContext): Promise<ToolResult> {
     const startMs = Date.now();
 
     try {
@@ -96,7 +96,7 @@ export class ToolRouterV2 {
   /**
    * 并行执行多个工具调用，按均分策略分配 token budget。
    */
-  async executeParallel(calls: ToolCallV2[], ctx: ToolContext): Promise<ToolResult[]> {
+  async executeParallel(calls: ParsedToolCall[], ctx: ToolContext): Promise<ToolResult[]> {
     if (calls.length === 0) {
       return [];
     }
@@ -110,17 +110,17 @@ export class ToolRouterV2 {
   }
 
   /**
-   * 从 LLM 的原始 function call 参数解析 ToolCallV2。
+   * 从 LLM 的原始 function call 参数解析 ParsedToolCall。
    *
    * LLM 返回: { name: "code", arguments: '{"action":"search","params":{...}}' }
    * 解析为:  { tool: "code", action: "search", params: {...} }
    *
-   * 验证层级: 解析 → action 存在性检查 → 返回强类型 ToolCallV2
+   * 验证层级: 解析 → action 存在性检查 → 返回强类型 ParsedToolCall
    */
   parseToolCall(
     name: string,
     rawArguments: string | Record<string, unknown>
-  ): ToolCallV2 | { error: string } {
+  ): ParsedToolCall | { error: string } {
     try {
       const args = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
       const action = args.action as string;
@@ -235,7 +235,7 @@ export class ToolRouterV2 {
 /*  参数 Schema 校验 — 轻量内联，不依赖 ajv                             */
 /* ------------------------------------------------------------------ */
 
-function validateParams(call: ToolCallV2, action: ToolAction): string | null {
+function validateParams(call: ParsedToolCall, action: ToolAction): string | null {
   const schema = action.params as {
     required?: string[];
     properties?: Record<string, { type?: string; enum?: unknown[] }>;
