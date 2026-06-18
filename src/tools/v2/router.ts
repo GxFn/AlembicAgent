@@ -6,7 +6,6 @@
  * 流程: 参数解析 → Schema 校验 → Capability 权限检查 → 并发控制 → Handler 分发 → 输出截断
  */
 
-import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
 import type {
   CapabilityV2Def,
   ToolAction,
@@ -14,8 +13,9 @@ import type {
   ToolContext,
   ToolResult,
   ToolSpec,
-} from './types.js';
-import { estimateTokens, fail } from './types.js';
+} from '#tools/kernel/registry.js';
+import { estimateTokens, fail } from '#tools/kernel/registry.js';
+import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
 
 export interface RouterConfig {
   capability?: CapabilityV2Def;

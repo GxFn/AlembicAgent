@@ -8,7 +8,13 @@
  * Actions: query (class/protocol/hierarchy/call-graph/category)
  */
 
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
+import {
+  estimateTokens,
+  fail,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '#tools/kernel/registry.js';
 
 export async function handle(
   action: string,

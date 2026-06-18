@@ -13,8 +13,14 @@
 import { exec } from 'node:child_process';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import {
+  estimateTokens,
+  fail,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '#tools/kernel/registry.js';
 import { stripAnsi } from '../compressor/strip.js';
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
 
 const execAsync = promisify(exec);
 

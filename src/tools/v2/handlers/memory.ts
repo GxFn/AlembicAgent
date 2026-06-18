@@ -12,7 +12,7 @@ import {
   ok,
   type ToolContext,
   type ToolResult,
-} from '../types.js';
+} from '#tools/kernel/registry.js';
 
 export async function handle(
   action: string,

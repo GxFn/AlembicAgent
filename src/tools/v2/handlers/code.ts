@@ -10,7 +10,13 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
+import {
+  estimateTokens,
+  fail,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '#tools/kernel/registry.js';
 
 export async function handle(
   action: string,

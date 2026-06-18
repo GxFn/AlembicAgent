@@ -10,7 +10,13 @@
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
+import {
+  estimateTokens,
+  fail,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '#tools/kernel/registry.js';
 
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';

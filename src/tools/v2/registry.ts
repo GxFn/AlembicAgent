@@ -6,13 +6,13 @@
  * 新增工具/action 只需在此文件加一行。
  */
 
+import type { ToolRegistry, ToolSpec } from '#tools/kernel/registry.js';
 import { handle as handleCode } from './handlers/code.js';
 import { handle as handleGraph } from './handlers/graph.js';
 import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
 import { handle as handleMeta } from './handlers/meta.js';
 import { handle as handleTerminal } from './handlers/terminal.js';
-import type { ToolRegistry, ToolSpec } from './types.js';
 
 /* ================================================================== */
 /*  code — 代码智能                                                    */

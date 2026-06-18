@@ -1,3 +1,21 @@
+export type {
+  ActionHandler,
+  CapabilityV2Def,
+  CompressOpts,
+  DeltaCacheLike,
+  MemoryCoordinatorLike,
+  OutputCompressorLike,
+  SearchCacheLike,
+  SessionStoreLike,
+  ToolAction,
+  ToolCallV2,
+  ToolContext,
+  ToolRegistry,
+  ToolResult,
+  ToolResultMeta,
+  ToolSpec,
+} from '#tools/kernel/registry.js';
+export { estimateTokens, fail, ok } from '#tools/kernel/registry.js';
 export * from './adapter/index.js';
 export * from './cache/index.js';
 export {
@@ -19,21 +37,3 @@ export {
 } from './registry.js';
 export type { RouterConfig } from './router.js';
 export { ToolRouterV2 } from './router.js';
-export type {
-  ActionHandler,
-  CapabilityV2Def,
-  CompressOpts,
-  DeltaCacheLike,
-  MemoryCoordinatorLike,
-  OutputCompressorLike,
-  SearchCacheLike,
-  SessionStoreLike,
-  ToolAction,
-  ToolCallV2,
-  ToolContext,
-  ToolRegistry,
-  ToolResult,
-  ToolResultMeta,
-  ToolSpec,
-} from './types.js';
-export { estimateTokens, fail, ok } from './types.js';

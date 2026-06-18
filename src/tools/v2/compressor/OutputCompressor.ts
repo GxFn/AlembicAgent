@@ -7,7 +7,7 @@
  * 流水线: ANSI strip → 重复行折叠 → 专用解析器 / 通用截断
  */
 
-import type { CompressOpts } from '../types.js';
+import type { CompressOpts } from '#tools/kernel/registry.js';
 import { cleanOutput, truncateOutput } from './strip.js';
 
 type Parser = (raw: string) => string | null;

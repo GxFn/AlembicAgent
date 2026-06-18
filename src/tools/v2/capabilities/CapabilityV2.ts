@@ -7,8 +7,8 @@
  */
 
 import { Capability } from '#agent/capabilities/Capability.js';
+import type { CapabilityV2Def } from '#tools/kernel/registry.js';
 import { TOOL_REGISTRY } from '../registry.js';
-import type { CapabilityV2Def } from '../types.js';
 
 export abstract class CapabilityV2 extends Capability {
   abstract get description(): string;

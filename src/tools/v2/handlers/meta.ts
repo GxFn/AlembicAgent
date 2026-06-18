@@ -5,7 +5,13 @@
  * Actions: tools, plan, review
  */
 
-import { estimateTokens, fail, ok, type ToolContext, type ToolResult } from '../types.js';
+import {
+  estimateTokens,
+  fail,
+  ok,
+  type ToolContext,
+  type ToolResult,
+} from '#tools/kernel/registry.js';
 
 export async function handle(
   action: string,

@@ -15,8 +15,8 @@ import type {
   ToolResultTrust,
   ToolRouterContract,
 } from '#tools/kernel/index.js';
+import type { CapabilityV2Def, ToolContext, ToolResult } from '#tools/kernel/registry.js';
 import { ToolRouterV2 } from '../router.js';
-import type { CapabilityV2Def, ToolContext, ToolResult } from '../types.js';
 
 export interface V2ToolContextFactory {
   create(request: ToolCallRequest): ToolContext;
