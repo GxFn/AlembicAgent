@@ -1,20 +1,7 @@
-import {
-  projectToolResultOrdinaryOutput,
-  type ToolResultEnvelope,
-} from '#tools/core/ToolResultEnvelope.js';
+/**
+ * Compatibility shim — the tool result presenter helpers now live in the
+ * canonical home `src/tools/kernel/presenter.ts`. Removed once all importers are
+ * repointed to `#tools/kernel`.
+ */
 
-export function presentToolResult(envelope: ToolResultEnvelope) {
-  return projectToolResultOrdinaryOutput(envelope).text;
-}
-
-export function isToolResultEnvelope(value: unknown): value is ToolResultEnvelope {
-  return (
-    !!value &&
-    typeof value === 'object' &&
-    'toolId' in value &&
-    'callId' in value &&
-    'status' in value &&
-    'text' in value &&
-    'trust' in value
-  );
-}
+export * from '#tools/kernel/presenter.js';

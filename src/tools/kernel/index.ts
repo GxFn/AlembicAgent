@@ -11,4 +11,10 @@
  * consumer is repointed to `#tools/kernel`.
  */
 
+export * from './context.js';
+export * from './decision.js';
+export * from './handler.js';
+export * from './presenter.js';
+export * from './request.js';
 export * from './result.js';
+export * from './routing.js';
