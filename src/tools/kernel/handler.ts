@@ -1,11 +1,7 @@
 /**
  * Internal tool handler contract — handler signature, handler context, and the
- * handler/forged-tool stores. Canonical home (formerly
+ * internal tool handler store. Canonical home (formerly
  * src/tools/core/InternalToolHandler.ts).
- *
- * Note: the ForgedInternalTool* store types are dead after the ToolForge
- * removal and are scheduled for deletion in a dedicated cleanup once the
- * remaining consumer (UnifiedToolCatalog) is detached.
  */
 
 import type { ToolCallContext, ToolServiceContracts, ToolServiceLocator } from './context.js';
@@ -63,20 +59,6 @@ export interface InternalToolHandlerEntry {
 
 export interface InternalToolHandlerStore {
   getInternalTool(name: string): InternalToolHandlerEntry | null;
-}
-
-export interface ForgedInternalToolDefinition {
-  name: string;
-  description: string;
-  parameters?: Record<string, unknown>;
-  forgeMode: 'generate';
-  handler: InternalToolHandler;
-}
-
-export interface ForgedInternalToolStore {
-  hasInternalTool(name: string): boolean;
-  projectForgedTool(tool: ForgedInternalToolDefinition): void;
-  revokeForgedTool(name: string): boolean;
 }
 
 export function contextFromToolCall(requestContext: ToolCallContext): InternalToolHandlerContext {

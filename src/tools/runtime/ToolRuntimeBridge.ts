@@ -6,8 +6,6 @@
  */
 
 export type {
-  ForgedInternalToolDefinition,
-  ForgedInternalToolStore,
   InternalToolHandler,
   InternalToolHandlerEntry,
   InternalToolHandlerStore,
