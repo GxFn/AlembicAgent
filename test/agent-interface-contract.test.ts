@@ -166,7 +166,6 @@ describe('AlembicAgent public interface contract', () => {
       'degraded',
       'partial',
       'capability-mismatch',
-      'needs-confirmation',
       'provider-error',
       'host-failure',
       'internal-error',
