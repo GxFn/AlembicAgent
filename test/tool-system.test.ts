@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -214,41 +214,59 @@ function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResu
   };
 }
 
-describe('ToolRuntimeBridge', () => {
-  it('keeps V1/core package-alias imports behind the runtime bridge outside core', () => {
-    const sourceFiles = walkSource(path.join(process.cwd(), 'src'));
-    const directCoreImporters = sourceFiles
+describe('tool kernel contract', () => {
+  it('removes the V1 core-contract shims and the runtime bridge from source', () => {
+    const removed = [
+      'src/tools/core/InternalToolHandler.ts',
+      'src/tools/core/ToolCallContext.ts',
+      'src/tools/core/ToolContracts.ts',
+      'src/tools/core/ToolDecision.ts',
+      'src/tools/core/ToolResultEnvelope.ts',
+      'src/tools/core/ToolResultPresenter.ts',
+      'src/tools/core/ToolRoutingServices.ts',
+      'src/tools/runtime/ToolRuntimeBridge.ts',
+    ];
+    for (const rel of removed) {
+      expect(existsSync(path.join(process.cwd(), rel))).toBe(false);
+    }
+
+    const stragglers = walkSource(path.join(process.cwd(), 'src'))
       .map((filePath) => ({
         file: path.relative(process.cwd(), filePath),
         text: readFileSync(filePath, 'utf8'),
       }))
-      .filter(({ text }) => text.includes('#tools/core'));
-
-    const nonCoreImporters = directCoreImporters
-      .filter(({ file }) => !file.startsWith('src/tools/core/'))
+      .filter(
+        ({ text }) =>
+          text.includes('#tools/runtime/ToolRuntimeBridge') ||
+          /#tools\/core\/(InternalToolHandler|ToolCallContext|ToolContracts|ToolDecision|ToolResultEnvelope|ToolResultPresenter|ToolRoutingServices)\.js/.test(
+            text
+          )
+      )
       .map(({ file }) => file)
       .sort();
 
-    expect(nonCoreImporters).toEqual(['src/tools/runtime/ToolRuntimeBridge.ts']);
+    expect(stragglers).toEqual([]);
   });
 
-  it('keeps the public ./tools V1 re-export surface explicit until downstream migration', () => {
+  it('re-exports the tool contract from the kernel on the public ./tools surface', () => {
     const toolsIndex = readFileSync(path.join(process.cwd(), 'src/tools/index.ts'), 'utf8');
-    const coreReexports = toolsIndex
+    const kernelReexports = toolsIndex
       .split('\n')
-      .filter((line) => line.startsWith("export * from './core/"))
-      .map((line) => line.trim());
+      .filter((line) => line.startsWith("export * from './kernel/"))
+      .map((line) => line.trim())
+      .sort();
 
-    expect(coreReexports).toEqual([
-      "export * from './core/InternalToolHandler.js';",
-      "export * from './core/LightweightRouter.js';",
-      "export * from './core/ToolCallContext.js';",
-      "export * from './core/ToolContracts.js';",
-      "export * from './core/ToolDecision.js';",
-      "export * from './core/ToolResultEnvelope.js';",
-      "export * from './core/ToolResultPresenter.js';",
-      "export * from './core/ToolRoutingServices.js';",
+    expect(kernelReexports).toEqual([
+      "export * from './kernel/context.js';",
+      "export * from './kernel/decision.js';",
+      "export * from './kernel/handler.js';",
+      "export * from './kernel/presenter.js';",
+      "export * from './kernel/request.js';",
+      "export * from './kernel/result.js';",
+      "export * from './kernel/routing.js';",
     ]);
+    // LightweightRouter (host-surface router) stays under core until the P3 host migration.
+    expect(toolsIndex).toContain("export * from './core/LightweightRouter.js';");
   });
 });
 

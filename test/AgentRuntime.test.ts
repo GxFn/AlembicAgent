@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
-import type { ToolResultEnvelope } from '../src/tools/runtime/ToolRuntimeBridge.js';
+import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 
 function createRuntimeForReactLoop() {
   const chatWithTools = vi.fn(async () => ({

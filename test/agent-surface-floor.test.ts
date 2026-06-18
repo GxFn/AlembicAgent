@@ -18,7 +18,7 @@ import {
   taskGuardFullScan,
   taskQualityAudit,
 } from '../src/agent/tasks/index.js';
-import type { ToolResultEnvelope } from '../src/tools/runtime/ToolRuntimeBridge.js';
+import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 
 const projectRoot = '/tmp/alembic-agent-surface-floor';
 

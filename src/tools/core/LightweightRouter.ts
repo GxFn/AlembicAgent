@@ -8,15 +8,15 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { ToolCallContext, ToolServiceLocator } from '#tools/core/ToolCallContext.js';
+import type { ToolCallContext, ToolServiceLocator } from '#tools/kernel/context.js';
+import type { ToolDecision } from '#tools/kernel/decision.js';
 import type {
   ToolCallRequest,
   ToolExecutionAdapter,
   ToolExecutionRequest,
   ToolRouterContract,
-} from '#tools/core/ToolContracts.js';
-import type { ToolDecision } from '#tools/core/ToolDecision.js';
-import type { ToolResultEnvelope, ToolResultStatus } from '#tools/core/ToolResultEnvelope.js';
+} from '#tools/kernel/request.js';
+import type { ToolResultEnvelope, ToolResultStatus } from '#tools/kernel/result.js';
 import type { CapabilityCatalog } from '../catalog/CapabilityCatalog.js';
 import type {
   CapabilityKind,

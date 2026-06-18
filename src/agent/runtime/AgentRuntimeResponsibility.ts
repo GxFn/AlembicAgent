@@ -85,13 +85,10 @@ const DECOMPOSITION_SEAMS = [
   {
     id: 'tool-execution',
     owner: 'tool-boundary',
-    implementationRefs: [
-      'src/agent/runtime/ToolExecutionPipeline.ts',
-      'src/tools/runtime/ToolRuntimeBridge.ts',
-    ],
+    implementationRefs: ['src/agent/runtime/ToolExecutionPipeline.ts', 'src/tools/kernel/index.ts'],
     behaviorChangeAllowed: false,
     summary:
-      'Tool calls cross the AG1 bridge and pipeline; V1/core usage remains compatibility-only.',
+      'Tool calls cross the unified kernel contract and pipeline; the single tool contract lives in src/tools/kernel.',
   },
   {
     id: 'memory-context',
@@ -127,7 +124,7 @@ const SEMANTIC_GLOSSARY = [
     owner: 'tool-system',
     definition: 'A typed capability invoked through Agent tool contracts and normalized envelopes.',
     nonGoals: ['Host UI action', 'Dashboard operation without Agent contract'],
-    sourceRefs: ['src/tools/v2/router.ts', 'src/tools/runtime/ToolRuntimeBridge.ts'],
+    sourceRefs: ['src/tools/v2/router.ts', 'src/tools/kernel/index.ts'],
   },
   {
     term: 'session',
