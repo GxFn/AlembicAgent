@@ -5,10 +5,7 @@
  * calls and, for relation discovery, delegate to AgentService.run().
  */
 
-import {
-  projectToolResultOrdinaryOutput,
-  type ToolResultEnvelope,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+import { projectToolResultOrdinaryOutput, type ToolResultEnvelope } from '#tools/kernel/index.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
 export interface TaskAiProvider {

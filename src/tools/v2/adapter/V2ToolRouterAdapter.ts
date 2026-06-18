@@ -14,7 +14,7 @@ import type {
   ToolResultEnvelope,
   ToolResultTrust,
   ToolRouterContract,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+} from '#tools/kernel/index.js';
 import { ToolRouterV2 } from '../router.js';
 import type { CapabilityV2Def, ToolContext, ToolResult } from '../types.js';
 

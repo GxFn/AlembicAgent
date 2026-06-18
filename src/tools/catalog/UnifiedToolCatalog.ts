@@ -27,7 +27,7 @@ import type {
   InternalToolHandlerEntry,
   InternalToolHandlerStore,
   ToolRouterContract,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+} from '#tools/kernel/index.js';
 
 // ── Types inlined from deleted ToolDefinitionV2.ts ──
 

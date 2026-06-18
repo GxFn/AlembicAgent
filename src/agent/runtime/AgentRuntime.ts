@@ -31,7 +31,7 @@
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
-import { isToolResultEnvelope } from '#tools/runtime/ToolRuntimeBridge.js';
+import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import { Capability, CapabilityRegistry } from '../capabilities/index.js';
 import { limitToolResult } from '../context/ContextWindow.js';
 import { PolicyEngine } from '../policies/index.js';

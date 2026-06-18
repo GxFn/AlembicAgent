@@ -7,7 +7,7 @@
  * @module AgentRuntimeTypes
  */
 
-import type { ToolResultEnvelope, ToolRouterContract } from '#tools/runtime/ToolRuntimeBridge.js';
+import type { ToolResultEnvelope, ToolRouterContract } from '#tools/kernel/index.js';
 
 /** Tool call entry recorded during execution */
 export interface ToolCallEntry {

@@ -11,7 +11,7 @@
  * @module core/MessageAdapter
  */
 
-import { isToolResultEnvelope } from '#tools/runtime/ToolRuntimeBridge.js';
+import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import { limitToolResult } from '../context/ContextWindow.js';
 

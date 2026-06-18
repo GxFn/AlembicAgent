@@ -1,7 +1,4 @@
-import type {
-  ToolDiagnosticsRecorder,
-  ToolResultEnvelope,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+import type { ToolDiagnosticsRecorder, ToolResultEnvelope } from '#tools/kernel/index.js';
 import type {
   AgentDiagnostics,
   AgentDiagnosticWarning,

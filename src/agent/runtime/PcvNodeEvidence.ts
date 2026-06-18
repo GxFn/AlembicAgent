@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ToolResultEnvelope } from '#tools/runtime/ToolRuntimeBridge.js';
+import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
 

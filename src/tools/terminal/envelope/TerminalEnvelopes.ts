@@ -3,7 +3,7 @@ import type {
   ToolExecutionRequest,
   ToolResultEnvelope,
   ToolResultStatus,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+} from '#tools/kernel/index.js';
 import type { TerminalSessionRecord } from '../session/TerminalSessionManager.js';
 
 export type TerminalPolicyLike = {

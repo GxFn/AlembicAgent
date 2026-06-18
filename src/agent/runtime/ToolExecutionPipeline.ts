@@ -23,7 +23,7 @@ import {
   type ToolCallRequest,
   type ToolResultEnvelope,
   type ToolResultStatus,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+} from '#tools/kernel/index.js';
 import { SafetyPolicy } from '../policies/index.js';
 import type { AgentRuntime } from './AgentRuntime.js';
 import type { LoopContext } from './LoopContext.js';

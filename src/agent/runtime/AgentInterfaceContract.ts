@@ -10,7 +10,7 @@ import {
   type ToolResultDiagnosticSummary,
   type ToolResultFailureTaxonomy,
   type ToolResultStatus,
-} from '#tools/runtime/ToolRuntimeBridge.js';
+} from '#tools/kernel/index.js';
 import type { AgentRuntimeBoundaryArea } from './AgentRuntimeBoundary.js';
 
 export type AgentInterfaceContractRowId = 'I02' | 'I16' | 'I17' | 'I18';
