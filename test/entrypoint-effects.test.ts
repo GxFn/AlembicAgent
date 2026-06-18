@@ -23,7 +23,7 @@ import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// The 14 exact public exports (G5 boundary) as dist entry files.
+// The 13 exact public exports (G5 boundary) as dist entry files.
 const FACADE_DIST_FILES = [
   'dist/index.js',
   'dist/agent/index.js',
@@ -31,7 +31,6 @@ const FACADE_DIST_FILES = [
   'dist/agent/runtime/index.js',
   'dist/agent/prompts/index.js',
   'dist/agent/domain/index.js',
-  'dist/agent/forge/index.js',
   'dist/agent/tasks/index.js',
   'dist/agent/profiles/index.js',
   'dist/ai/index.js',

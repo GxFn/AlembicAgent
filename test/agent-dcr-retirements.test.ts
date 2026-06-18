@@ -39,8 +39,8 @@ describe('retired tools aggregate export (Train B IC3)', () => {
     expect(boundaryStable).not.toContain(retiredAggregateExport);
     expect(signatureStable).not.toContain(retiredAggregateExport);
     expect(Object.keys(signatureEntries)).not.toContain(retiredAggregateExport);
-    expect(expectedCounts['stable-public']).toBe(14);
-    expect(signatures.packageExportCount).toBe(14);
+    expect(expectedCounts['stable-public']).toBe(13);
+    expect(signatures.packageExportCount).toBe(13);
     expect(boundary.forbiddenConsumerSpecifiers as string[]).toContain(retiredAggregateSpecifier);
   });
 

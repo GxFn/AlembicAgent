@@ -42,10 +42,6 @@ interface ToolExecContext {
   iteration: number;
 }
 
-interface ToolForgeLike {
-  temporaryRegistry?: { isTemporary(name: string): boolean };
-}
-
 /** 工具执行元数据 */
 interface ToolMetadata {
   cacheHit: boolean;
@@ -536,9 +532,7 @@ export class ToolExecutionPipeline {
  * 从 LoopContext.allowedToolIds 中提取允许的工具名列表，
  * 拒绝不在列表中的调用（返回 error 提示）。空数组表示严格禁用所有 capability 工具。
  *
- * Forge 集成：不在白名单的工具如果已由 ToolForge 锻造（存在于 ToolRegistry），则放行。
- *
- * before: 如果工具不在白名单中且非锻造工具则短路返回 error
+ * before: 如果工具不在白名单中则短路返回 error
  */
 export const allowlistGate = {
   name: 'allowlistGate',
@@ -548,17 +542,6 @@ export const allowlistGate = {
       return undefined;
     }
     if (!allowedNames.has(call.name)) {
-      const container = ctx.runtime.container as { get?: (name: string) => unknown } | null;
-      const toolForge = container?.get?.('toolForge') as ToolForgeLike | undefined;
-      const isTemporaryTool = toolForge?.temporaryRegistry?.isTemporary(call.name) === true;
-      // Forge fallback: 仅允许确认为 TemporaryToolRegistry 管理的动态工具放行。
-      if (isTemporaryTool) {
-        ctx.runtime.logger.info(
-          `[ToolPipeline] Tool "${call.name}" not in allowlist but is a temporary forged tool — allowed`
-        );
-        return undefined;
-      }
-
       ctx.runtime.logger.warn(
         `[ToolPipeline] ⛔ Tool "${call.name}" not in allowlist — blocked (hallucinated call)`
       );

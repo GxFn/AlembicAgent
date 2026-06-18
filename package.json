@@ -30,10 +30,6 @@
       "types": "./dist/agent/domain/index.d.ts",
       "import": "./dist/agent/domain/index.js"
     },
-    "./forge": {
-      "types": "./dist/agent/forge/index.d.ts",
-      "import": "./dist/agent/forge/index.js"
-    },
     "./tasks": {
       "types": "./dist/agent/tasks/index.d.ts",
       "import": "./dist/agent/tasks/index.js"
@@ -134,7 +130,6 @@
     "ai",
     "context",
     "domain",
-    "forge",
     "memory",
     "profiles",
     "prompts",

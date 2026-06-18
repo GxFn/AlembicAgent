@@ -6,7 +6,7 @@
   "layerRationale": [
     "Base leaves (import nothing cross-area): shared (vendor-neutral helpers: structuredOutput, language service), ai (provider adapters, transports, registry, gateway — consumes shared code only via its own copies and @alembic/core externally), types (ambient .d.ts declarations only; no runtime edges by construction since the lint scans no .d.ts).",
     "Mid: tools (generic tool system: contracts, catalog, router, V2, terminal) sits over shared; its single runtime reach-up into agent (CapabilityV2 extends the agent-side Capability base class) is the recorded agent<->tools cycle minority, blessed below with a placement cleanup trigger.",
-    "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, forge, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
+    "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
     "root (src/index.ts) is the package facade composition entry with a wildcard: it re-exports agent, ai, and tools wholesale (the post-IC3 public surface).",
     "AD2 charter cross-check 2026-06-12: the SD-4 declared exception (raw-SQL semantic_memories read adapter) lives wholly inside agent/memory/MemoryStore.ts and imports only node:crypto plus @alembic/core externals — it crosses NO internal area, so it consistently needs no entry in this contract; external package edges are owned by the space-edge and core-import gates, not this lint."
   ],

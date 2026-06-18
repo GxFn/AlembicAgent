@@ -1,9 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import {
-  SandboxRunner,
-  TemporaryToolRegistry,
-  ToolRequirementAnalyzer,
-} from '../src/agent/forge/index.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import {
   AgentProfileCompiler,
@@ -23,11 +18,7 @@ import {
   taskGuardFullScan,
   taskQualityAudit,
 } from '../src/agent/tasks/index.js';
-import type {
-  ForgedInternalToolDefinition,
-  ForgedInternalToolStore,
-  ToolResultEnvelope,
-} from '../src/tools/runtime/ToolRuntimeBridge.js';
+import type { ToolResultEnvelope } from '../src/tools/runtime/ToolRuntimeBridge.js';
 
 const projectRoot = '/tmp/alembic-agent-surface-floor';
 
@@ -127,93 +118,6 @@ function childResult(input: AgentRunInput): AgentRunResult {
     diagnostics: null,
   };
 }
-
-describe('forge public contracts', () => {
-  it('classifies reuse, composition, and generation requirements without host services', () => {
-    const directory = {
-      has: (name: string) => name === 'read_file',
-      list: () => ['read_file', 'search_code', 'check_schema', 'parse_json'],
-    };
-    const analyzer = new ToolRequirementAnalyzer(directory);
-
-    expect(
-      analyzer.analyze({
-        intent: 'read one file',
-        action: 'read',
-        target: 'file',
-      })
-    ).toMatchObject({ mode: 'reuse', matchedTool: 'read_file' });
-    expect(
-      analyzer.analyze({
-        intent: 'validate code with search and parsing',
-        action: 'validate',
-        target: 'code',
-      })
-    ).toMatchObject({ mode: 'compose', composableTools: ['check_schema', 'search_code'] });
-    expect(
-      analyzer.analyze({
-        intent: 'summarize a remote queue',
-        action: 'summarize',
-        target: 'queue',
-      })
-    ).toMatchObject({ mode: 'generate' });
-  });
-
-  it('registers generated temporary tools, projects them once, and revokes cleanly', () => {
-    const projected = new Map<string, ForgedInternalToolDefinition>();
-    const store: ForgedInternalToolStore = {
-      hasInternalTool: (name) => projected.has(name),
-      projectForgedTool: (tool) => {
-        projected.set(tool.name, tool);
-      },
-      revokeForgedTool: (name) => projected.delete(name),
-    };
-    const registry = new TemporaryToolRegistry(store);
-
-    registry.registerTemporary(
-      {
-        name: 'forge.double',
-        description: 'double a number',
-        forgeMode: 'generate',
-        parameters: { type: 'object' },
-        handler: async (params) => Number(params.value) * 2,
-      },
-      10_000
-    );
-
-    expect(registry.size).toBe(1);
-    expect(registry.list()[0]).toMatchObject({
-      name: 'forge.double',
-      forgeMode: 'generate',
-      projectedIntoInternalToolStore: true,
-    });
-    expect(projected.has('forge.double')).toBe(true);
-    expect(registry.revoke('forge.double')).toBe(true);
-    expect(projected.has('forge.double')).toBe(false);
-
-    registry.dispose();
-  });
-
-  it('rejects unsafe forged code before executing test cases', () => {
-    const runner = new SandboxRunner();
-    const unsafe = runner.run('function toolHandler() { return process.env; }', []);
-    const safe = runner.run(
-      'function toolHandler(params) { return { doubled: params.value * 2 }; }',
-      [
-        {
-          description: 'doubles numeric input',
-          input: { value: 4 },
-          expectedOutput: { doubled: 8 },
-        },
-      ]
-    );
-
-    expect(unsafe.success).toBe(false);
-    expect(unsafe.safetyCheck.violations.join('\n')).toContain('process');
-    expect(safe.success).toBe(true);
-    expect(safe.testResults[0]).toMatchObject({ passed: true });
-  });
-});
 
 describe('task handler public contracts', () => {
   it('checks duplicate candidates and keeps AI verdict optional', async () => {

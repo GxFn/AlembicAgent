@@ -9,15 +9,11 @@
     "packEntries": "minimumPackEntries is a floor from npm pack --dry-run --ignore-scripts; decreases require release-boundary review."
   },
   "minimumTestFiles": 34,
-  "minimumDeclaredTestCases": 249,
-  "stablePublicExportCount": 14,
+  "minimumDeclaredTestCases": 245,
+  "stablePublicExportCount": 13,
   "coreReferenceLimitTotal": 52,
   "minimumPackEntries": 432,
   "requiredCoverageSuites": [
-    {
-      "name": "forge",
-      "pattern": "describe('forge public contracts'"
-    },
     {
       "name": "tasks",
       "pattern": "describe('task handler public contracts'"

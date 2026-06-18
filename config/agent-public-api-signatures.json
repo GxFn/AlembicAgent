@@ -9,7 +9,6 @@
     "./runtime",
     "./prompts",
     "./domain",
-    "./forge",
     "./tasks",
     "./profiles",
     "./ai",
@@ -27,7 +26,7 @@
       "Unlisted package subpaths remain forbidden even if dist files exist."
     ]
   },
-  "packageExportCount": 14,
+  "packageExportCount": 13,
   "stableExportSignatures": {
     ".": {
       "exportPath": ".",
@@ -1502,34 +1501,6 @@
         {
           "name": "buildConsolidationGatePrompt",
           "kind": "function"
-        }
-      ]
-    },
-    "./forge": {
-      "exportPath": "./forge",
-      "specifier": "@alembic/agent/forge",
-      "exportCount": 5,
-      "signatureHash": "290ed4e0ef57a115e24d2fe55592a1955cd7c648aa9091ced7105d260efe104e",
-      "entries": [
-        {
-          "name": "DynamicComposer",
-          "kind": "class"
-        },
-        {
-          "name": "SandboxRunner",
-          "kind": "class"
-        },
-        {
-          "name": "TemporaryToolRegistry",
-          "kind": "class"
-        },
-        {
-          "name": "ToolForge",
-          "kind": "class"
-        },
-        {
-          "name": "ToolRequirementAnalyzer",
-          "kind": "class"
         }
       ]
     },

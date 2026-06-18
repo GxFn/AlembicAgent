@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard, deep dist/src, or host-owned adapter imports are allowed.",
   "expectedCounts": {
-    "stable-public": 14,
+    "stable-public": 13,
     "provisional-public": 0,
     "transitional-internal": 0,
     "forbidden": 0
@@ -14,7 +14,6 @@
     "./runtime",
     "./prompts",
     "./domain",
-    "./forge",
     "./tasks",
     "./profiles",
     "./ai",
@@ -105,13 +104,6 @@
       "contract": "Agent-side evidence collection, episodic consolidation, and consolidation gate helpers.",
       "agentOwned": ["EvidenceCollector", "EpisodicConsolidator", "consolidation gate prompt helpers"],
       "hostOwnedAdapterBoundary": "Host owns durable storage adapters and product-specific evidence ingestion routes."
-    },
-    {
-      "export": "./forge",
-      "specifier": "@alembic/agent/forge",
-      "contract": "Agent-owned tool forge, temporary registry, sandbox runner contract, and requirement analysis.",
-      "agentOwned": ["ToolForge", "DynamicComposer", "SandboxRunner contract", "TemporaryToolRegistry"],
-      "hostOwnedAdapterBoundary": "Host owns concrete sandbox isolation, shell execution, and installed tool lifecycle."
     },
     {
       "export": "./tasks",
