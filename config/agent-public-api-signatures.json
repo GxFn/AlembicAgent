@@ -12,7 +12,7 @@
     "./tasks",
     "./profiles",
     "./ai",
-    "./tools/v2",
+    "./tools/runtime",
     "./tools/terminal",
     "./memory",
     "./context"
@@ -1688,9 +1688,9 @@
         }
       ]
     },
-    "./tools/v2": {
-      "exportPath": "./tools/v2",
-      "specifier": "@alembic/agent/tools/v2",
+    "./tools/runtime": {
+      "exportPath": "./tools/runtime",
+      "specifier": "@alembic/agent/tools/runtime",
       "exportCount": 31,
       "signatureHash": "8d3d5feb89f6fefab071a76054f42a20b6745143493d8fa2a7dc9134717b8a94",
       "entries": [

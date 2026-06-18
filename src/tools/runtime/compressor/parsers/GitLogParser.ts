@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/GitLogParser
+ * @module tools/runtime/compressor/parsers/GitLogParser
  * 解析 git log 命令输出为紧凑结构化格式。
  */
 

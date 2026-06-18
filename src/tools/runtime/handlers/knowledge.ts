@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/knowledge
+ * @module tools/runtime/handlers/knowledge
  *
  * 知识管理工具 — Agent 与 Alembic 知识库交互的统一入口。
  * Actions: search, submit, detail, manage

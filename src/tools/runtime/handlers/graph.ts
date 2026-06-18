@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/graph
+ * @module tools/runtime/handlers/graph
  *
  * 代码图谱查询工具 — 查询项目 AST 结构图谱和代码实体关系。
  * Actions: overview, query

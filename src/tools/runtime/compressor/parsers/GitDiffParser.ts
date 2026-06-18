@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/GitDiffParser
+ * @module tools/runtime/compressor/parsers/GitDiffParser
  * 解析 git diff 命令输出为紧凑结构化格式。
  */
 

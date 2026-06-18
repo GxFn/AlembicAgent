@@ -34,7 +34,7 @@ const FACADE_DIST_FILES = [
   'dist/agent/tasks/index.js',
   'dist/agent/profiles/index.js',
   'dist/ai/index.js',
-  'dist/tools/v2/index.js',
+  'dist/tools/runtime/index.js',
   'dist/tools/terminal/index.js',
   'dist/agent/memory/index.js',
   'dist/agent/context/index.js',

@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/memory
+ * @module tools/runtime/handlers/memory
  *
  * Agent 工作记忆 — 跨轮次的发现记录和召回。
  * Actions: save, recall, note_finding, get_previous_evidence

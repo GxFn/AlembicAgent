@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/registry
+ * @module tools/runtime/registry
  *
  * V2 工具注册表 — 单一真相源。
  * 所有工具 metadata、action 参数 schema、handler 函数在此声明式定义。

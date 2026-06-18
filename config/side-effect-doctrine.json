@@ -34,7 +34,7 @@
     },
     {
       "name": "OutputCompressor parser loader",
-      "file": "src/tools/v2/compressor/OutputCompressor.ts",
+      "file": "src/tools/runtime/compressor/OutputCompressor.ts",
       "policy": "Write-once idempotent lazy-init flag (parsersLoaded) explicitly designed to avoid import-time parser module loading.",
       "owner": "AlembicAgent window"
     },
@@ -64,7 +64,7 @@
   ],
   "lintExemptions": [
     {
-      "file": "src/tools/v2/compressor/OutputCompressor.ts",
+      "file": "src/tools/runtime/compressor/OutputCompressor.ts",
       "binding": "parsersLoaded",
       "entry": "OutputCompressor parser loader",
       "reason": "Write-once idempotent lazy-init flag (AD4 M2); boolean, so the null-slot idiom does not apply."
@@ -90,7 +90,7 @@
     },
     {
       "name": "CapabilityV2 -> Capability inheritance reach-up",
-      "file": "src/tools/v2/capabilities/CapabilityV2.ts",
+      "file": "src/tools/runtime/capabilities/CapabilityV2.ts",
       "rule": "Placement-class register item (B5), owned by the layer-contract blessing in config/layer-contract.json. Not AD4 scope."
     }
   ]

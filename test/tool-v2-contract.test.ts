@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ToolContext } from '../src/tools/v2/index.js';
+import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   OutputCompressor,
@@ -8,7 +8,7 @@ import {
   ToolRouterV2,
   V2CapabilityCatalog,
   V2ToolRouterAdapter,
-} from '../src/tools/v2/index.js';
+} from '../src/tools/runtime/index.js';
 
 function baseToolContext(): ToolContext {
   return {
@@ -228,7 +228,7 @@ describe('Tool V2 contract exports', () => {
         whenClause: 'When the Agent runtime submits a new knowledge candidate through Tool V2.',
         doClause: 'Persist alembic-agent as the default source for the submitted candidate.',
         reasoning: {
-          sources: ['src/tools/v2/handlers/knowledge.ts'],
+          sources: ['src/tools/runtime/handlers/knowledge.ts'],
           confidence: 0.9,
         },
       },

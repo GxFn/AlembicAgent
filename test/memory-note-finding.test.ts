@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
-import { handle as handleMemory } from '../src/tools/v2/handlers/memory.js';
-import type { ToolContext } from '../src/tools/v2/types.js';
+import type { ToolContext } from '../src/tools/kernel/registry.js';
+import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 
 function createBaseContext(overrides: Partial<ToolContext> = {}): ToolContext {
   return {

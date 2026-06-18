@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/strip
+ * @module tools/runtime/compressor/strip
  *
  * 文本清理工具: ANSI 控制字符去除 + 连续重复行折叠。
  * 用于终端输出的预处理，节省 10-30% 无用 token。

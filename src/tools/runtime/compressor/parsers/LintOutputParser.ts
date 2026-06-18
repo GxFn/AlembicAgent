@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/LintOutputParser
+ * @module tools/runtime/compressor/parsers/LintOutputParser
  * 解析 eslint/biome/tsc 输出为紧凑结构化格式。
  */
 

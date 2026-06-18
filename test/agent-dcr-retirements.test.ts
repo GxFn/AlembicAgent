@@ -23,7 +23,7 @@ describe('retired tools aggregate export (Train B IC3)', () => {
     const exportPaths = Object.keys(packageJson.exports as Record<string, unknown>);
 
     expect(exportPaths).not.toContain(retiredAggregateExport);
-    expect(exportPaths).toContain('./tools/v2');
+    expect(exportPaths).toContain('./tools/runtime');
     expect(exportPaths).toContain('./tools/terminal');
     expect(exportPaths).toContain('.');
   });

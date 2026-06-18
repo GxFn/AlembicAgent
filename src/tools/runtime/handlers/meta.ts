@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/meta
+ * @module tools/runtime/handlers/meta
  *
  * Agent 元工具 — 自省（查询工具 schema）、规划、自检。
  * Actions: tools, plan, review

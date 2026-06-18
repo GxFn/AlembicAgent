@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/TestOutputParser
+ * @module tools/runtime/compressor/parsers/TestOutputParser
  * 解析 vitest/jest/mocha/pytest 测试输出为紧凑结构化格式。
  */
 

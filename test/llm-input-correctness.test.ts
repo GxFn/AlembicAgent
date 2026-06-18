@@ -9,7 +9,7 @@ import {
   TOOL_REGISTRY,
   type ToolContext,
   ToolRouterV2,
-} from '../src/tools/v2/index.js';
+} from '../src/tools/runtime/index.js';
 
 interface BatchReadFile {
   ok: boolean;

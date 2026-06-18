@@ -21,7 +21,7 @@
   },
   "blessedImports": [
     {
-      "file": "src/tools/v2/capabilities/CapabilityV2.ts",
+      "file": "src/tools/runtime/capabilities/CapabilityV2.ts",
       "to": "agent",
       "reason": "Minority side of the agent<->tools cycle (agent->tools x25 is the layering; this single edge is the inversion): CapabilityV2 extends the agent-owned Capability base class — runtime inheritance reach-up, not a service-locator pattern.",
       "owner": "AlembicAgent window",

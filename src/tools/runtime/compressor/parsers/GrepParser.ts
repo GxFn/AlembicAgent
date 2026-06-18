@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/GrepParser
+ * @module tools/runtime/compressor/parsers/GrepParser
  * 解析 rg/grep 输出为紧凑结构化格式。
  */
 

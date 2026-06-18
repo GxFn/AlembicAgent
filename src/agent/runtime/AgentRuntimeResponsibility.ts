@@ -124,7 +124,7 @@ const SEMANTIC_GLOSSARY = [
     owner: 'tool-system',
     definition: 'A typed capability invoked through Agent tool contracts and normalized envelopes.',
     nonGoals: ['Host UI action', 'Dashboard operation without Agent contract'],
-    sourceRefs: ['src/tools/v2/router.ts', 'src/tools/kernel/index.ts'],
+    sourceRefs: ['src/tools/runtime/router.ts', 'src/tools/kernel/index.ts'],
   },
   {
     term: 'session',

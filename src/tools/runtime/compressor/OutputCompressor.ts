@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/OutputCompressor
+ * @module tools/runtime/compressor/OutputCompressor
  *
  * 终端输出压缩器 — 根据命令模式匹配专用解析器，
  * 将原始 stdout/stderr 转换为 LLM 友好的紧凑结构化文本。

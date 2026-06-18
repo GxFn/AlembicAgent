@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/capabilities/CapabilityV2
+ * @module tools/runtime/capabilities/CapabilityV2
  *
  * V2 Capability 基类 — 直接继承 V1 Capability，声明式定义场景级工具集。
  * 每个 Capability 声明 allowedTools (tool → action[])，

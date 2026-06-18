@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/code
+ * @module tools/runtime/handlers/code
  *
  * 代码智能工具 — Agent 与项目源码交互的统一入口。
  * Actions: search, read, outline, structure, write

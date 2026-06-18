@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/capabilities
+ * @module tools/runtime/capabilities
  * Barrel export for all V2 capabilities.
  */
 

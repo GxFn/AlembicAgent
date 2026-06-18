@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/cache/DeltaCache
+ * @module tools/runtime/cache/DeltaCache
  *
  * 文件读取增量缓存。同一会话中再次读取已读文件时:
  *   - 内容未变 → 返回 "[unchanged since last read]"（节省 99.7% token）

@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/PackageParser
+ * @module tools/runtime/compressor/parsers/PackageParser
  * 解析 npm/pnpm/yarn install 输出为紧凑结构化格式。
  */
 

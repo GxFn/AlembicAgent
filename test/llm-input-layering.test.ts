@@ -17,8 +17,8 @@ import {
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
-import { V2CapabilityCatalog } from '../src/tools/v2/index.js';
-import { generateLightweightSchemas } from '../src/tools/v2/registry.js';
+import { V2CapabilityCatalog } from '../src/tools/runtime/index.js';
+import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 
 function createRuntime({
   chatWithTools,

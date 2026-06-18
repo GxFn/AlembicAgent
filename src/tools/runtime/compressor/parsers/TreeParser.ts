@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/TreeParser
+ * @module tools/runtime/compressor/parsers/TreeParser
  * 解析 ls -R / find / tree 命令输出为紧凑缩进目录树格式。
  */
 

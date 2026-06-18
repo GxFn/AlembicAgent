@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/router
+ * @module tools/runtime/router
  *
  * V2 ToolRouter — 工具调用的统一入口。
  *

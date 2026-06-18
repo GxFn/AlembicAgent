@@ -17,7 +17,7 @@
     "./tasks",
     "./profiles",
     "./ai",
-    "./tools/v2",
+    "./tools/runtime",
     "./tools/terminal",
     "./memory",
     "./context"
@@ -34,7 +34,7 @@
     {
       "specifier": "@alembic/agent/tools",
       "matches": "@alembic/agent/tools",
-      "reason": "Aggregate tools subpath was retired in Train B IC3 after all consumers migrated to the @alembic/agent root facade; use the root facade or the fine-grained ./tools/v2 and ./tools/terminal exports."
+      "reason": "Aggregate tools subpath was retired in Train B IC3 after all consumers migrated to the @alembic/agent root facade; use the root facade or the fine-grained ./tools/runtime and ./tools/terminal exports."
     },
     {
       "specifier": "@alembic/agent/dist/index.js",
@@ -47,9 +47,9 @@
       "reason": "Consumers must not import source internals."
     },
     {
-      "specifier": "@alembic/agent/tools/v2/router.js",
+      "specifier": "@alembic/agent/tools/runtime/router.js",
       "matches": "@alembic/agent/*/*/*",
-      "reason": "Only @alembic/agent/tools/v2 is public; router internals stay Agent-owned."
+      "reason": "Only @alembic/agent/tools/runtime is public; router internals stay Agent-owned."
     },
     {
       "specifier": "@alembic/agent/tools/terminal/session/index.js",
@@ -127,8 +127,8 @@
       "hostOwnedAdapterBoundary": "Host owns credential retrieval, account policy, network permission, and provider enablement UI."
     },
     {
-      "export": "./tools/v2",
-      "specifier": "@alembic/agent/tools/v2",
+      "export": "./tools/runtime",
+      "specifier": "@alembic/agent/tools/runtime",
       "contract": "Tool V2 router, cache, compressor, parser, capability catalog, and adapter contract.",
       "agentOwned": ["generic ToolRouterV2", "DeltaCache/SearchCache", "OutputCompressor", "V2ToolRouterAdapter contract"],
       "hostOwnedAdapterBoundary": "Host owns ToolContextFactory inputs, external executor wiring, sandbox bridge, and UI/daemon call surfaces."

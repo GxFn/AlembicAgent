@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/cache/SearchCache
+ * @module tools/runtime/cache/SearchCache
  *
  * 搜索结果 LRU 缓存。避免同一会话中重复搜索相同 pattern。
  */

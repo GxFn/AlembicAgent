@@ -335,7 +335,7 @@ export const ALEMBIC_AGENT_INTERFACE_CONTRACT = Object.freeze({
     '@alembic/agent',
     '@alembic/agent/runtime',
     '@alembic/agent/ai',
-    '@alembic/agent/tools/v2',
+    '@alembic/agent/tools/runtime',
     '@alembic/agent/tools/terminal',
   ],
   forbiddenOrdinaryOutputFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,

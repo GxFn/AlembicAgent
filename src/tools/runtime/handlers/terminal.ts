@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/handlers/terminal
+ * @module tools/runtime/handlers/terminal
  *
  * 终端执行工具 — 在 Seatbelt 沙箱中执行命令，返回结构化压缩输出。
  * Actions: exec

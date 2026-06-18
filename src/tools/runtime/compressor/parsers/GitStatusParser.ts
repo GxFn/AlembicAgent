@@ -1,5 +1,5 @@
 /**
- * @module tools/v2/compressor/parsers/GitStatusParser
+ * @module tools/runtime/compressor/parsers/GitStatusParser
  * 解析 git status 命令输出为紧凑结构化格式。
  */
 
