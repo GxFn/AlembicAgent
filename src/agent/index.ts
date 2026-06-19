@@ -84,7 +84,6 @@ export {
 } from './runtime/AgentRuntimeBoundary.js';
 // ── Infrastructure ──
 export { AgentPhase, AgentState } from './runtime/AgentState.js';
-export { AgentRouter, PresetName } from './service/AgentRouter.js';
 export * from './service/index.js';
 // ── Strategies ──
 export {
