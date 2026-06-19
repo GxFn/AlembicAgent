@@ -1455,21 +1455,9 @@
     "./domain": {
       "exportPath": "./domain",
       "specifier": "@alembic/agent/domain",
-      "exportCount": 6,
-      "signatureHash": "80516633d5d2a8d7e6bdd79c05b9b08286aa91545db196e19d609d8eb889fb20",
+      "exportCount": 2,
+      "signatureHash": "8eba8cdb7331e2968327cc3be2ef603abcb21c5e382f4d2bffdad84c61ff2559",
       "entries": [
-        {
-          "name": "CONSOLIDATION_GATE_BUDGET",
-          "kind": "object"
-        },
-        {
-          "name": "CONSOLIDATION_GATE_SYSTEM_PROMPT",
-          "kind": "string"
-        },
-        {
-          "name": "CONSOLIDATION_GATE_TOOLS",
-          "kind": "array"
-        },
         {
           "name": "EpisodicConsolidator",
           "kind": "class"
@@ -1477,10 +1465,6 @@
         {
           "name": "EvidenceCollector",
           "kind": "class"
-        },
-        {
-          "name": "buildConsolidationGatePrompt",
-          "kind": "function"
         }
       ]
     },
