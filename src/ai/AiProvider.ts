@@ -192,7 +192,6 @@ export interface AiLogger {
 }
 
 export class AiProvider {
-  _circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
   _circuitThreshold: number;
   _maxConcurrency: number;
   _maxConcurrencySource: EmbeddingCapacityHintSource;
@@ -228,12 +227,9 @@ export class AiProvider {
     this.maxRetries = config.maxRetries || 3;
     this.name = 'abstract';
 
-    // The live circuit breaker now lives in the gateway's ReliabilityController.
-    // _circuitState is retained (stays CLOSED here) only because forcedSummary
-    // still reads it; rewiring that to the gateway circuit is a follow-up (AAO2).
-    this._circuitState = 'CLOSED';
-    // circuitThreshold/maxConcurrency are forwarded to the gateway's
-    // ReliabilityController (retry/circuit/concurrency live there now).
+    // The live circuit breaker now lives in the gateway's ReliabilityController;
+    // circuitThreshold/maxConcurrency are forwarded there (retry/circuit/
+    // concurrency all live in the gateway now).
     this._circuitThreshold = config.circuitThreshold || 5;
 
     // ── Provider 级并发上限（透传 gateway + 嵌入容量提示溯源）──
