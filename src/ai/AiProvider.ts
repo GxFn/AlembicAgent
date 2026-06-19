@@ -29,10 +29,6 @@ export interface AiProviderConfig {
   [key: string]: unknown;
 }
 
-function isProviderCircuitOpen(state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'): boolean {
-  return state === 'OPEN';
-}
-
 /** Provider 缺 key 统一错误；只给 host-neutral 元数据，具体 UI 指引由宿主渲染。 */
 export interface MissingApiKeyError extends Error {
   code: 'API_KEY_MISSING';
@@ -196,16 +192,10 @@ export interface AiLogger {
 }
 
 export class AiProvider {
-  _activeRequests: number;
-  _circuitCooldownMs: number;
-  _circuitFailures: number;
-  _circuitOpenedAt: number;
   _circuitState: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
   _circuitThreshold: number;
   _maxConcurrency: number;
   _maxConcurrencySource: EmbeddingCapacityHintSource;
-  _rateLimitedUntil: number;
-  _requestQueue: Array<(value?: unknown) => void>;
   apiKey: string;
   baseUrl: string;
   logger: AiLogger | null = null;
@@ -238,14 +228,15 @@ export class AiProvider {
     this.maxRetries = config.maxRetries || 3;
     this.name = 'abstract';
 
-    // ── CircuitBreaker 状态 ──
-    this._circuitState = 'CLOSED'; // 'CLOSED' | 'OPEN' | 'HALF_OPEN'
-    this._circuitFailures = 0; // 连续失败计数
-    this._circuitThreshold = config.circuitThreshold || 5; // 触发熔断的连续失败次数
-    this._circuitOpenedAt = 0; // 熔断打开时间
-    this._circuitCooldownMs = 30_000; // 初始冷却 30 秒
+    // The live circuit breaker now lives in the gateway's ReliabilityController.
+    // _circuitState is retained (stays CLOSED here) only because forcedSummary
+    // still reads it; rewiring that to the gateway circuit is a follow-up (AAO2).
+    this._circuitState = 'CLOSED';
+    // circuitThreshold/maxConcurrency are forwarded to the gateway's
+    // ReliabilityController (retry/circuit/concurrency live there now).
+    this._circuitThreshold = config.circuitThreshold || 5;
 
-    // ── Provider 级全局并发闸门 + 429 冷却窗 ──
+    // ── Provider 级并发上限（透传 gateway + 嵌入容量提示溯源）──
     this._maxConcurrency = Math.max(
       1,
       Number(config.maxConcurrency || process.env.ALEMBIC_AI_MAX_CONCURRENCY || 4)
@@ -256,48 +247,6 @@ export class AiProvider {
       : process.env.ALEMBIC_AI_MAX_CONCURRENCY
         ? 'environment'
         : 'conservative-default';
-    this._activeRequests = 0;
-    this._requestQueue = [];
-    this._rateLimitedUntil = 0;
-  }
-
-  async _acquireRequestSlot() {
-    if (this._activeRequests < this._maxConcurrency) {
-      this._activeRequests += 1;
-      return;
-    }
-    await new Promise<void>((resolve) => this._requestQueue.push(() => resolve()));
-  }
-
-  _releaseRequestSlot() {
-    const next = this._requestQueue.shift();
-    if (next) {
-      next();
-      return;
-    }
-    this._activeRequests = Math.max(0, this._activeRequests - 1);
-  }
-
-  async _waitForRateLimitWindow() {
-    const waitMs = (this._rateLimitedUntil || 0) - Date.now();
-    if (waitMs > 0) {
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-  }
-
-  _setRateLimitWindow(waitMs: number) {
-    const safeWait = Math.max(0, Number(waitMs) || 0);
-    if (safeWait <= 0) {
-      return;
-    }
-    const until = Date.now() + safeWait;
-    if (until > (this._rateLimitedUntil || 0)) {
-      this._rateLimitedUntil = until;
-      this._log?.(
-        'warn',
-        `[RateLimit] ${this.name} enters cooldown ${Math.round(safeWait / 1000)}s (global)`
-      );
-    }
   }
 
   /**
@@ -747,122 +696,6 @@ export class AiProvider {
     return sharedExtractJSON(text, openChar, closeChar, (level, message) =>
       this._log(level, message)
     );
-  }
-
-  /**
-   * 指数退避重试 + 熔断器（受 Cline 三级错误恢复启发）
-   *
-   * 熔断器三态:
-   *   CLOSED  — 正常工作，计数连续失败
-   *   OPEN    — 连续 N 次失败，直接拒绝请求（快速失败），持续 cooldownMs
-   *   HALF_OPEN — 冷却期后尝试一次，成功则恢复，失败则重新 OPEN
-   *
-   * 这避免了 AI 服务宕机时无意义的重试风暴。
-   */
-  async _withRetry<T>(
-    fn: () => Promise<T>,
-    retries = this.maxRetries,
-    baseDelay = 2000
-  ): Promise<T> {
-    // ── 熔断器检查 ──
-    if (this._circuitState === 'OPEN') {
-      const elapsed = Date.now() - (this._circuitOpenedAt || 0);
-      if (elapsed < (this._circuitCooldownMs || 30000)) {
-        const err = new Error(
-          `AI 服务熔断中 (连续 ${this._circuitFailures} 次失败)，${Math.ceil(((this._circuitCooldownMs || 30000) - elapsed) / 1000)}s 后恢复`
-        ) as Error & { code: string };
-        err.code = 'CIRCUIT_OPEN';
-        throw err;
-      }
-      // 冷却期结束 → HALF_OPEN
-      this._circuitState = 'HALF_OPEN';
-    }
-
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      let slotAcquired = false;
-      try {
-        await this._waitForRateLimitWindow();
-        await this._acquireRequestSlot();
-        slotAcquired = true;
-
-        const result = await fn();
-        // 成功 → 完全重置熔断器（包括冷却时间）
-        this._circuitFailures = 0;
-        this._circuitState = 'CLOSED';
-        this._circuitCooldownMs = 30_000; // 重置冷却时间
-        return result;
-      } catch (err: unknown) {
-        const e = err as Error & {
-          status?: number;
-          code?: string;
-          retryAfterMs?: number;
-          cause?: { code?: string; message?: string; name?: string };
-        };
-
-        // 错误分类已抽到 shared/errorClassify（供 Provider 与 Gateway 共用），
-        // 这里只消费分类结果做重试 / 熔断决策，避免两套实现漂移。
-        const { isAbort, isNetworkError, isRetryable, isServerError, causeCode } =
-          classifyLlmError(e);
-
-        // AbortError — 外部主动中止（如 PipelineStrategy hard timeout），不重试直接抛出
-        if (isAbort) {
-          throw e;
-        }
-
-        // 429：触发 provider 级冷却窗，抑制并发重试风暴
-        if (e.status === 429) {
-          const retryAfterMs = Number(e.retryAfterMs || 0);
-          const adaptiveCooldown = Math.max(
-            retryAfterMs,
-            Math.round(baseDelay * 2 ** attempt * 1.5 + Math.random() * 1000)
-          );
-          this._setRateLimitWindow(adaptiveCooldown);
-        }
-
-        // 首次失败记录详细诊断（含 cause）
-        if (attempt === 0 && (isNetworkError || e.cause)) {
-          this._log?.(
-            'warn',
-            `[_withRetry] ${e.message} — cause: ${e.cause?.message || causeCode || 'unknown'}`
-          );
-        }
-
-        if (attempt >= retries || !isRetryable) {
-          // 只有服务端错误 / 网络错误才累计熔断计数
-          // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题
-          if (isServerError) {
-            this._circuitFailures = (this._circuitFailures || 0) + 1;
-            if (
-              this._circuitFailures >= (this._circuitThreshold || 5) &&
-              !isProviderCircuitOpen(this._circuitState)
-            ) {
-              this._circuitState = 'OPEN';
-              this._circuitOpenedAt = Date.now();
-              // 先用当前冷却值，再递增给下次: 30s → 60s → 120s（最大 5 分钟）
-              const cooldown = this._circuitCooldownMs || 30_000;
-              this._log?.(
-                'warn',
-                `[CircuitBreaker] OPEN — ${this._circuitFailures} consecutive failures, cooldown ${cooldown / 1000}s`
-              );
-              this._circuitCooldownMs = Math.min(cooldown * 2, 300_000);
-            }
-          }
-          throw e;
-        }
-        const delay = baseDelay * 2 ** attempt + Math.random() * 1000;
-        this._log?.(
-          'info',
-          `[_withRetry] attempt ${attempt + 1} failed (${e.message}), retrying in ${Math.round(delay / 1000)}s…`
-        );
-        await new Promise((r) => setTimeout(r, delay));
-      } finally {
-        if (slotAcquired) {
-          this._releaseRequestSlot();
-        }
-      }
-    }
-    // Should never reach here — last iteration either returns or throws
-    throw new Error('_withRetry: unexpected exhaustion');
   }
 }
 
