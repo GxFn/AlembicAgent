@@ -271,9 +271,24 @@ export class AiProvider {
     }
   }
 
-  /** 摘要 - 对代码/文档生成结构化摘要 */
+  /** summarize 的 maxTokens 预算；子类可覆写（如 Gemini 用更大的 8192）。 */
+  protected get summarizeMaxTokens(): number {
+    return 4096;
+  }
+
+  /**
+   * 摘要 - 对代码生成结构化摘要 JSON {title, description, language, patterns, keyAPIs}。
+   * 实现对所有 provider 相同（仅 maxTokens 预算可经 summarizeMaxTokens 调整），
+   * 故收敛到基类，子类不再各自复制。
+   */
   async summarize(code: string): Promise<unknown> {
-    throw new Error(`${this.name}.summarize() not implemented`);
+    const prompt = `请对以下代码生成结构化摘要，返回 JSON 格式 {title, description, language, patterns: [], keyAPIs: []}:\n\n${code}`;
+    return (
+      (await this.chatWithStructuredOutput(prompt, {
+        temperature: 0.3,
+        maxTokens: this.summarizeMaxTokens,
+      })) || { title: '', description: '' }
+    );
   }
 
   /** 向量嵌入 - 返回浮点数组 */

@@ -60,14 +60,4 @@ export class ClaudeProvider extends AiProvider {
   async embed(_text: string | string[]) {
     return [];
   }
-
-  async summarize(code: string) {
-    const prompt = `请对以下代码生成结构化摘要，返回 JSON 格式 {title, description, language, patterns: [], keyAPIs: []}:\n\n${code}`;
-    return (
-      (await this.chatWithStructuredOutput(prompt, {
-        temperature: 0.3,
-        maxTokens: 4096,
-      })) || { title: '', description: '' }
-    );
-  }
 }
