@@ -1,11 +1,11 @@
 import { BootstrapAnalyze } from '#tools/runtime/capabilities/BootstrapAnalyze.js';
 import { BootstrapProduce } from '#tools/runtime/capabilities/BootstrapProduce.js';
+import type { Capability } from '#tools/runtime/capabilities/Capability.js';
 import { Conversation } from '#tools/runtime/capabilities/Conversation.js';
 import { Evolution } from '#tools/runtime/capabilities/Evolution.js';
 import { ScanAnalyze } from '#tools/runtime/capabilities/ScanAnalyze.js';
 import { ScanProduce } from '#tools/runtime/capabilities/ScanProduce.js';
 import { System } from '#tools/runtime/capabilities/System.js';
-import type { Capability } from './Capability.js';
 
 type CapabilityConstructor = new (opts?: Record<string, unknown>) => Capability;
 

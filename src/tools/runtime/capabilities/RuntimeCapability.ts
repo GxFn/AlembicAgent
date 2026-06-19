@@ -1,14 +1,14 @@
 /**
  * @module tools/runtime/capabilities/RuntimeCapability
  *
- * Capability 基类 — 继承 Agent Capability，声明式定义场景级工具集。
+ * Capability 基类 — 继承本地 Capability 叶子基类，声明式定义场景级工具集。
  * 每个 Capability 声明 allowedTools (tool → action[])，
  * promptFragment 从注册表自动生成。
  */
 
-import { Capability } from '#agent/capabilities/Capability.js';
 import type { CapabilityDef } from '#tools/kernel/registry.js';
 import { TOOL_REGISTRY } from '../registry.js';
+import { Capability } from './Capability.js';
 
 export abstract class RuntimeCapability extends Capability {
   abstract get description(): string;
