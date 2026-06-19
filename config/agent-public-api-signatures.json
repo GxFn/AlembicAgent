@@ -31,8 +31,8 @@
     ".": {
       "exportPath": ".",
       "specifier": "@alembic/agent",
-      "exportCount": 181,
-      "signatureHash": "b94f72f45be0d47d501a8b4a7094158a4157a5b0092f70628afc1dee1a8a6b6e",
+      "exportCount": 180,
+      "signatureHash": "206f94160629627ba34a9da1d876b3c9f33dc21110e9b85818aae5d78affcccd",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -373,10 +373,6 @@
         {
           "name": "Strategy",
           "kind": "class"
-        },
-        {
-          "name": "StrategyRegistry",
-          "kind": "object"
         },
         {
           "name": "SystemInteraction",
@@ -763,8 +759,8 @@
     "./agent": {
       "exportPath": "./agent",
       "specifier": "@alembic/agent/agent",
-      "exportCount": 54,
-      "signatureHash": "e9ba9f058b7c590676d6a8e9cf166de2115935d471fd76d32431d07416dd514e",
+      "exportCount": 53,
+      "signatureHash": "44a730edeefaa9edea93254ff5f8e3e35558696c04183e19d99dc8180317375a",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -909,10 +905,6 @@
         {
           "name": "Strategy",
           "kind": "class"
-        },
-        {
-          "name": "StrategyRegistry",
-          "kind": "object"
         },
         {
           "name": "SystemInteraction",

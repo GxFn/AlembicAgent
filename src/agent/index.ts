@@ -91,6 +91,5 @@ export {
   FanOutStrategy,
   SingleStrategy,
   Strategy,
-  StrategyRegistry,
 } from './strategies/index.js';
 export { PipelineStrategy } from './strategies/PipelineStrategy.js';
