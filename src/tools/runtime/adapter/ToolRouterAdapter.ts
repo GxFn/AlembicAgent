@@ -43,6 +43,21 @@ const DEFAULT_TRUST: ToolResultTrust = {
   containsSecrets: false,
 };
 
+/**
+ * Lift the handler-set degrade/fallback meta onto the per-call envelope diagnostics.
+ * A single ToolResult has no notion of the loop-level fields (blockedTools, gateFailures,
+ * …) — those are recorded directly into the DiagnosticsCollector by the pipeline — so only
+ * degraded/fallbackUsed can be known here. Returns the shared empty constant for clean calls.
+ */
+function diagnosticsFromResult(result: ToolResult): ToolResultDiagnostics {
+  const degraded = result._meta?.degraded === true;
+  const fallbackUsed = result._meta?.fallbackUsed === true;
+  if (!degraded && !fallbackUsed) {
+    return EMPTY_DIAGNOSTICS;
+  }
+  return { ...EMPTY_DIAGNOSTICS, degraded, fallbackUsed };
+}
+
 export class ToolRouterAdapter implements ToolRouterContract {
   readonly router: ToolRouter;
   readonly #contextFactory: ToolContextFactoryContract;
@@ -142,7 +157,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
         hit: result._meta?.cached ?? false,
         policy: cachePolicy,
       },
-      diagnostics: EMPTY_DIAGNOSTICS,
+      diagnostics: diagnosticsFromResult(result),
       trust: result.ok ? DEFAULT_TRUST : { ...DEFAULT_TRUST, containsUntrustedText: true },
     };
   }

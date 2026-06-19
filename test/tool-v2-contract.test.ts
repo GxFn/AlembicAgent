@@ -240,6 +240,59 @@ describe('Tool V2 contract exports', () => {
     expect(String(result.data)).toContain('partial output');
   });
 
+  it('surfaces a degraded handler result on the per-call envelope diagnostics', async () => {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({
+          ...baseToolContext(),
+          sandboxExecutor: {
+            exec: async () => ({ stdout: 'half done', stderr: '', exitCode: 137 }),
+          },
+        }),
+      },
+    });
+
+    const envelope = await adapter.execute({
+      toolId: 'terminal',
+      args: { action: 'exec', params: { command: 'sleep 99' } },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'vitest' },
+    });
+
+    // terminal.exec marks a SIGKILL/timeout partial as degraded; the adapter must
+    // lift that onto the envelope diagnostics (which feeds the ordinary-output summary).
+    expect(envelope.ok).toBe(true);
+    expect(envelope.text).toContain('[timeout] partial output');
+    expect(envelope.diagnostics?.degraded).toBe(true);
+    expect(envelope.diagnostics?.fallbackUsed).toBe(false);
+  });
+
+  it('reports clean diagnostics for a normal handler result', async () => {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({
+          ...baseToolContext(),
+          sandboxExecutor: {
+            exec: async () => ({ stdout: 'v22.0.0', stderr: '', exitCode: 0 }),
+          },
+        }),
+      },
+    });
+
+    const envelope = await adapter.execute({
+      toolId: 'terminal',
+      args: { action: 'exec', params: { command: 'node -v' } },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'vitest' },
+    });
+
+    expect(envelope.ok).toBe(true);
+    expect(envelope.diagnostics?.degraded).toBe(false);
+    expect(envelope.diagnostics?.fallbackUsed).toBe(false);
+  });
+
   it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
     const router = new ToolRouter();
     const createRequests: Array<{
