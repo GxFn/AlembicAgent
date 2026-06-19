@@ -5,7 +5,6 @@
 
 import { LanguageService } from '@alembic/core/shared';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
-import { classifyLlmError } from './shared/errorClassify.js';
 import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

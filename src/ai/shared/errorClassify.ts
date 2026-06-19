@@ -69,8 +69,18 @@ export function classifyLlmError(err: unknown): ErrorClassification {
 
   const isRetryable = status === 429 || status >= 500 || isNetworkError;
 
-  // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题
-  const isServerError = isNetworkError || status === 429 || status >= 500 || !e.status;
+  // 程序员错误（TypeError/ReferenceError/SyntaxError/RangeError）是代码 bug，不是服务端
+  // 故障，绝不能计入熔断 — 否则一个确定性 bug 连续抛出会把熔断器打开、伪装成「AI 服务中断」。
+  const isProgrammerError =
+    e.name === 'TypeError' ||
+    e.name === 'ReferenceError' ||
+    e.name === 'SyntaxError' ||
+    e.name === 'RangeError';
+
+  // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题。无 status 的错误默认按服务端
+  // 故障兜底（保留对未知网络错误的检测），但排除上面的程序员错误类型。
+  const isServerError =
+    isNetworkError || status === 429 || status >= 500 || (!e.status && !isProgrammerError);
 
   return { isAbort, isNetworkError, isRetryable, isServerError, status, causeCode };
 }
