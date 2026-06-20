@@ -336,6 +336,7 @@ export function recordPcvInputAssembly(
   evidence: PcvNodeEvidenceSummary,
   assembly: LLMInputAssembly,
   options: {
+    deepseekV4ToolChoiceMode?: string | null;
     effectiveToolChoice?: string | null;
     iteration?: number;
     modelRef?: string | null;
@@ -387,9 +388,8 @@ export function recordPcvInputAssembly(
     acceptedFindingDelta: 0,
     classification: assembly.stageProfile === 'summarize' ? 'summary-only' : 'planning-only',
     consumedEvidenceRefs: [],
-    deepseekV4ToolChoiceMode: isDeepSeekV4
-      ? buildDeepSeekV4ToolChoiceMode(options.requestedToolChoice, options.effectiveToolChoice)
-      : null,
+    // observe-only：mode 由 ProviderToolChoicePolicy 计算并传入，证据层只记录其结果（AP-1 消除 R4 往返）。
+    deepseekV4ToolChoiceMode: options.deepseekV4ToolChoiceMode ?? null,
     deterministicEvidenceRefs,
     effectiveToolChoice: options.effectiveToolChoice || null,
     evidenceStarterRefs,
@@ -1345,19 +1345,6 @@ function getLatestGroundingEntry(
   evidence: PcvNodeEvidenceSummary
 ): PcvBurnGroundingLedgerEntry | null {
   return evidence.groundingLedger[evidence.groundingLedger.length - 1] || null;
-}
-
-function buildDeepSeekV4ToolChoiceMode(
-  requestedToolChoice: string | null | undefined,
-  effectiveToolChoice: string | null | undefined
-): string {
-  if (effectiveToolChoice === 'auto' && requestedToolChoice === 'none') {
-    return 'tools-visible-no-forced-tool-choice';
-  }
-  if (effectiveToolChoice === 'none') {
-    return 'schemas-hidden-no-tool-choice';
-  }
-  return 'tool-choice-filtered-by-provider-guard';
 }
 
 function classifyGroundingEntry(
