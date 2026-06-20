@@ -152,6 +152,13 @@ export interface PcvNodeEvidenceSummary {
     accepted: PcvNodeAcceptedFindingRef[];
     rejected: PcvNodeRejectedFindingRef[];
   };
+  /**
+   * AP-4 additive enforcement-mode 标记：本次运行的 grounding enforcement 有效值（`'off'`=PCV observe-only，
+   * `'guard'`=AnalyzeGroundingGuard 生效）。**纯观察、不驱动控流**——供消费方（主体 ai-execution / PCVM）把
+   * groundingLedger（classification 等）解读为审计材料而非质量判定：observe-only 下增多的 invalid-no-evidence
+   * 是预期、不应误判为回归（R6）。纯 additive：老消费者忽略此字段不受影响（schemaVersion 不变）。
+   */
+  groundingEnforcement: 'off' | 'guard';
   groundingLedger: PcvBurnGroundingLedgerEntry[];
   inputAssembly: PcvNodeInputAssemblyEvidence | null;
   ledgerRefs: PcvNodeLedgerRef[];
@@ -294,6 +301,8 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
       accepted: [],
       rejected: [],
     },
+    // AP-4：记录本次运行 grounding enforcement 有效值（AP-3 已解析并挂 LoopContext）作 observe-only 审计标记。
+    groundingEnforcement: ctx.groundingEnforcement,
     groundingLedger: [],
     inputAssembly: null,
     ledgerRefs: buildLedgerRefs(ctx, dimensionScopeId),
@@ -979,6 +988,8 @@ function createFallbackQualityGateEvidence(
       targetName: null,
     },
     findingRefs: { accepted: [], rejected: [] },
+    // AP-4：质量门 fallback 证据非 guard 运行，标记 observe-only。
+    groundingEnforcement: 'off',
     groundingLedger: [],
     inputAssembly: null,
     ledgerRefs: [],

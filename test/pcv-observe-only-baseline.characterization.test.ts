@@ -520,4 +520,32 @@ describe('PCV observe-only characterization — AP-3 两模式（默认 off / gu
       expect(nudge?.content?.text).toContain('不能推进阶段');
     });
   });
+
+  describe('AP-4 enforcement-mode 标记 + 证据纯化 (PcvNodeEvidenceSummary, 生产者侧)', () => {
+    it('默认 off：summary.groundingEnforcement 标记为 off（observe-only）；additive 不破既有字段/schemaVersion', async () => {
+      const { result } = await runDeepSeekAnalyzeNoEvidence();
+      const summary = result.pcvNodeEvidence;
+      expect(summary.groundingEnforcement).toBe('off');
+      // 纯 additive：既有跨仓消费字段与 schemaVersion 不变（老消费者不受影响）。
+      expect(summary.schemaVersion).toBe(1);
+      expect(Array.isArray(summary.groundingLedger)).toBe(true);
+      expect(summary.correlation).toBeDefined();
+    });
+
+    it('guard override：summary.groundingEnforcement 标记为 guard（区分两模式语义，供 AP-6 审计判读）', async () => {
+      const { result } = await runDeepSeekAnalyzeNoEvidence('guard');
+      expect(result.pcvNodeEvidence.groundingEnforcement).toBe('guard');
+    });
+
+    it('纯观察 / 关 metadata 主流程不变：off 下 invalid-no-evidence 分类仍被记录为审计材料，但不驱动控流（loop 照常终结、不阻断/不回退）', async () => {
+      const { result, chatWithTools, tracker } = await runDeepSeekAnalyzeNoEvidence();
+      const ledger = result.pcvNodeEvidence.groundingLedger;
+      // 证据层照常观察 classification（审计材料）——R6：consumer 据 groundingEnforcement='off' 判读为审计而非回归。
+      expect(ledger.map((entry) => entry.classification)).toEqual(['invalid-no-evidence']);
+      expect(result.pcvNodeEvidence.groundingEnforcement).toBe('off');
+      // 主循环控制（终结/阻断/回退）完全不受该 metadata 影响 —— PCV 纯观察、无残留控流耦合。
+      expect(chatWithTools).toHaveBeenCalledTimes(1);
+      expect(tracker.rollbackTick).not.toHaveBeenCalled();
+    });
+  });
 });
