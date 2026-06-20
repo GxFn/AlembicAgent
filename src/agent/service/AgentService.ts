@@ -198,6 +198,7 @@ function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
     systemRunContext: input.context.systemRunContext,
     budgetOverride: input.execution?.budgetOverride,
     toolChoiceOverride: input.execution?.toolChoiceOverride,
+    groundingEnforcement: input.execution?.groundingEnforcement,
     contextWindow: input.context.contextWindow,
     trace: input.context.trace,
     memoryCoordinator: input.context.memoryCoordinator,

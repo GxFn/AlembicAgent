@@ -648,7 +648,8 @@ describe('agent runtime forced summary suppression', () => {
     });
   });
 
-  it('blocks DeepSeek V4 analyze text-only first burn without evidence grounding', async () => {
+  // AP-3：grounding enforcement 默认 off（PCV observe-only）；analyze 阻断现为显式 guard 行为。
+  it('blocks DeepSeek V4 analyze text-only first burn without evidence grounding (groundingEnforcement=guard)', async () => {
     const progress: ProgressEvent[] = [];
     const chatWithTools = vi
       .fn()
@@ -707,6 +708,7 @@ describe('agent runtime forced summary suppression', () => {
         },
         pipelinePhase: 'analyze',
       },
+      groundingEnforcement: 'guard',
       tracker: tracker as never,
       budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
     });

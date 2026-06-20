@@ -521,8 +521,11 @@ function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingCon
       ctx.sharedState?.referencedFiles,
     ]),
   ]).slice(0, 32);
+  // CP1 grounding-policy 注入仅在 grounding enforcement = 'guard' 时生效（AP-3 切默认）；
+  // 默认 'off' 下 analyze 全路径都不注入政策文本（PCV observe-only）。
+  // PD5：deterministicEvidenceRefs / evidenceStarterRefs 注入不随此开关，始终保留为默认 analyze 上下文。
   const policy =
-    resolveLlmInputStageProfile(ctx) === 'analyze'
+    ctx.groundingEnforcement === 'guard' && resolveLlmInputStageProfile(ctx) === 'analyze'
       ? buildAnalyzeGroundingPolicy(modelRef, deterministicEvidenceRefs.length)
       : null;
   return { deterministicEvidenceRefs, evidenceStarterRefs, policy };

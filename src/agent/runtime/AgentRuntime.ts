@@ -42,6 +42,7 @@ import {
   type AgentResult,
   type AiError,
   type FileCacheEntry,
+  type GroundingEnforcement,
   type LLMResult,
   MAX_TOOL_CALLS_PER_ITER,
   type ReactLoopOpts,
@@ -162,6 +163,10 @@ export class AgentRuntime {
   #promptBuilder;
   /** 模型引用（provider:model），用于日志 / trace / 工具裁剪等运行期判断 */
   #modelRef: string;
+  /** grounding enforcement 全局默认（来自 RuntimeConfig，AP-3；默认 `'off'`=PCV observe-only）。 */
+  #groundingEnforcementDefault: GroundingEnforcement;
+  /** 本次运行 effective grounding enforcement（execute() 解析 per-run override ?? 全局默认）。 */
+  #groundingEnforcement: GroundingEnforcement;
   /** 统一事件钩子系统 */
   #hookSystem: HookSystem;
 
@@ -206,6 +211,9 @@ export class AgentRuntime {
     this.#modelRef =
       config.modelRef ||
       `${config.aiProvider.name}:${(config.aiProvider as { model?: string }).model || 'unknown'}`;
+    // AP-3：grounding enforcement 全局默认 off（PCV observe-only）；per-run 可在 execute()/reactLoop() 覆盖。
+    this.#groundingEnforcementDefault = config.groundingEnforcement ?? 'off';
+    this.#groundingEnforcement = this.#groundingEnforcementDefault;
     this.#toolPipeline = createToolPipeline();
     this.#hookSystem = (config as { hookSystem?: HookSystem }).hookSystem ?? new HookSystem();
     registerDefaultHooks(this.#hookSystem, this.id, this.bus);
@@ -245,6 +253,15 @@ export class AgentRuntime {
     this.iterationCount = 0;
     this.toolCallHistory = [];
     this.tokenUsage = { input: 0, output: 0, reasoning: 0, cacheHit: 0 };
+    // AP-3：解析本次运行 effective grounding enforcement = per-run override（AgentRunExecutionOptions
+    // → buildRuntimeOptions → execute opts）?? 全局默认。PipelineStrategy 不透传任意 opts 到 reactLoop，
+    // 故经实例字段桥接到 #initLoop（与 startTime/tokenUsage 等 per-run 实例状态同模式）。每次 execute 重置。
+    this.#groundingEnforcement =
+      opts.groundingEnforcement === 'guard'
+        ? 'guard'
+        : opts.groundingEnforcement === 'off'
+          ? 'off'
+          : this.#groundingEnforcementDefault;
 
     const diagnostics = DiagnosticsCollector.from(opts.diagnostics);
 
@@ -489,6 +506,7 @@ export class AgentRuntime {
       sharedState,
       source,
       toolChoiceOverride,
+      groundingEnforcement,
       abortSignal,
       diagnostics,
     } = opts;
@@ -575,6 +593,8 @@ export class AgentRuntime {
       context: context || {},
       contextWindow: contextWindow || null,
       toolChoiceOverride: toolChoiceOverride || null,
+      // AP-3：reactLoop 直调 opts 覆盖优先，否则回退本次运行 effective（execute 解析）/全局默认。
+      groundingEnforcement: groundingEnforcement ?? this.#groundingEnforcement,
       abortSignal: (abortSignal as AbortSignal) || null,
       diagnostics: diagnosticsCollector,
     });
@@ -1586,7 +1606,12 @@ export class AgentRuntime {
     const { tracker, trace, messages } = ctx;
 
     if (tracker) {
-      const groundingGate = evaluateAnalyzeTextGroundingGate(ctx, this.#modelRef);
+      // AP-3：CP4 analyze 文本轮阻断仅在 grounding enforcement = 'guard' 时生效（调用点短路）。
+      // 默认 'off' 下不调用 guard、不读决策、不阻断/不 nudge/不 rollback（PCV observe-only）；guard 内部逻辑不变。
+      const groundingGate =
+        ctx.groundingEnforcement === 'guard'
+          ? evaluateAnalyzeTextGroundingGate(ctx, this.#modelRef)
+          : { block: false, nudge: '', reason: '' };
       if (groundingGate.block) {
         messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
         messages.appendUserNudge(groundingGate.nudge);

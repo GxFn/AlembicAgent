@@ -80,6 +80,7 @@ interface LoopContextConfig {
   context?: Record<string, unknown>;
   contextWindow?: ContextWindow | null;
   toolChoiceOverride?: string | null;
+  groundingEnforcement?: 'off' | 'guard';
   abortSignal?: AbortSignal | null;
   diagnostics?: DiagnosticsCollector | null;
   exitController?: ExitController | null;
@@ -166,6 +167,13 @@ export class LoopContext {
   /** 首轮 toolChoice 覆盖 ('required'/'auto'/'none') */
   toolChoiceOverride: string | null;
 
+  /**
+   * 本轮 grounding enforcement effective 值（AP-3；默认 `'off'`=PCV observe-only）。
+   * AgentRuntime 在 #initLoop 解析（per-run override ?? 全局默认）后注入；
+   * CP1 政策文本注入（LLMInputAssembly）与 CP4 analyze 阻断（AgentRuntime 调用点）仅在 `'guard'` 时生效。
+   */
+  groundingEnforcement: 'off' | 'guard';
+
   /** 外部中止信号 — hard timeout 时取消进行中的 LLM 调用 */
   abortSignal: AbortSignal | null;
 
@@ -199,6 +207,7 @@ export class LoopContext {
     this.context = config.context || {};
     this.contextWindow = config.contextWindow || null;
     this.toolChoiceOverride = config.toolChoiceOverride || null;
+    this.groundingEnforcement = config.groundingEnforcement ?? 'off';
     this.abortSignal = (config.abortSignal || null) as AbortSignal | null;
     this.diagnostics = config.diagnostics || null;
     this.exitController = config.exitController || null;

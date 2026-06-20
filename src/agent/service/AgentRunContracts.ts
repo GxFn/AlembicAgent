@@ -173,6 +173,8 @@ export interface AgentRunExecutionOptions {
   shouldAbort?: () => boolean | Promise<boolean>;
   budgetOverride?: Record<string, unknown>;
   toolChoiceOverride?: 'auto' | 'required' | 'none';
+  /** per-run grounding enforcement 覆盖（AP-3）；不设则回退 runtime 全局默认（默认 observe-only `'off'`）。 */
+  groundingEnforcement?: 'off' | 'guard';
   diagnostics?: unknown;
   onProgress?: ((event: ProgressEvent) => void) | null;
   onToolCall?:
@@ -221,6 +223,8 @@ export interface AgentRuntimeRunOptions {
   systemRunContext?: SystemRunContext;
   budgetOverride?: Record<string, unknown>;
   toolChoiceOverride?: 'auto' | 'required' | 'none';
+  /** per-run grounding enforcement 覆盖（AP-3）；透传至 runtime.execute → reactLoop。 */
+  groundingEnforcement?: 'off' | 'guard';
   contextWindow?: unknown;
   trace?: unknown;
   memoryCoordinator?: unknown;

@@ -196,6 +196,14 @@ export interface FileCacheEntry {
   name?: string;
 }
 
+/**
+ * grounding enforcement 模式（AP-3 切默认）。
+ * - `'off'`（默认）：PCV 旁路 observe-only — 主循环不注入 grounding-policy 文本、analyze 文本轮不被阻断。
+ * - `'guard'`：显式开启 AnalyzeGroundingGuard — 恢复 CP1 政策注入 + CP4 阻断/nudge。
+ * provider tool-choice（ProviderToolChoicePolicy）不受此开关控制（PD1）。
+ */
+export type GroundingEnforcement = 'off' | 'guard';
+
 export interface RuntimeConfig {
   id?: string;
   presetName?: string;
@@ -216,6 +224,8 @@ export interface RuntimeConfig {
   additionalTools?: string[];
   /** 模型引用 (provider:model)，用于日志 / trace / 工具裁剪；不设则从 aiProvider 推导 */
   modelRef?: string;
+  /** grounding enforcement 全局默认（AP-3）；不设等同 `'off'`（PCV observe-only）。per-run 可经 ReactLoopOpts 覆盖。 */
+  groundingEnforcement?: GroundingEnforcement;
 }
 
 export type ToolCallHook = (
@@ -253,6 +263,8 @@ export interface ReactLoopOpts {
   sharedState?: Record<string, unknown>;
   source?: string;
   toolChoiceOverride?: string | null;
+  /** per-run/per-invocation grounding enforcement 覆盖（AP-3）；不设则回退 runtime 全局默认。 */
+  groundingEnforcement?: GroundingEnforcement;
   /** 外部中止信号 — PipelineStrategy hard timeout 时取消进行中的 LLM 调用 */
   abortSignal?: AbortSignal;
   diagnostics?: unknown;

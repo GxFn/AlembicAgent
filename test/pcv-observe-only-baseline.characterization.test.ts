@@ -1,22 +1,22 @@
 /**
- * AP-0 PCV observe-only 边界收敛 — 四控制点 characterization / baseline 测试。
+ * PCV observe-only 边界收敛 — 四控制点 characterization 测试（AP-3 切默认后＝两模式）。
  *
- * 目的：锁定 grounding-on 默认下的「现行」行为，作为后续阶段的对照锚点：
- *   - AP-1 抽 `ProviderToolChoicePolicy`（DeepSeek V4 toolChoice，行为对等、默认仍生效）；
- *   - AP-2 抽 `AnalyzeGroundingGuard`（analyze 阻断/nudge + grounding-policy 文本注入，行为对等）；
- *   - AP-3 引 `groundingEnforcement` 默认 off（这些断言届时改由显式 guard 运行复现）。
+ * AP-0 锁定 grounding-on 现行行为；AP-1 抽 `ProviderToolChoicePolicy`；AP-2 抽 `AnalyzeGroundingGuard`
+ * （行为对等）。AP-3 引入 `groundingEnforcement`（全局默认 `'off'` + per-run 覆盖），把 grounding
+ * enforcement 默认关闭 —— 这些断言因此改为**两模式**：
+ *   - 默认 off：主循环行为 ==「无 PCV 控制」（observe-only）—— analyze 不注入 grounding-policy 文本、
+ *     analyze 文本轮不被阻断；PCV 仍纯观察记录 classification。
+ *   - guard 开启（per-run override='guard'）：恢复 CP1 注入 + CP4 阻断+nudge+rollback（= AP-0 旧行为）。
+ *   - CP2/CP3（DeepSeek V4 provider）：**不随开关**（PD1）—— 两模式 provider tool-choice 行为一致、不回归。
  *
- * 断言落在「可观察的集成 seam」——assembled LLM input 的内容 / provider 实际收到的
- * toolChoice 与 schema / 工具调用是否被抑制 / analyze 阻断+nudge+rollback——而不是将在
- * AP-1/2 被迁走或改名的私有 helper，使锚点在抽取后仍然成立（只需替换实现、不需重写断言）。
+ * 断言落在「可观察的集成 seam」——assembled LLM input 的内容 / provider 实际收到的 toolChoice 与
+ * schema / 工具调用是否被抑制 / analyze 阻断+nudge+rollback——而非内部私有 helper。
  *
- * 控制点（需求设计 Code Facts，基线 HEAD 95b5d6d）：
- *   CP1 grounding-policy 指令文本注入       LLMInputAssembly.ts:440-442 + buildAnalyzeGroundingPolicy:530-535（analyze always-on，按 modelRef/refCount 参数化）
- *   CP2 DeepSeek V4 toolChoice 改写         AgentRuntime.ts:884-905 + helper:2207-2241（首轮 none→auto、schema 可见）
- *   CP3 工具调用抑制的 DeepSeek V4 例外      AgentRuntime.ts:1129-1151（读 groundingBurn.deepseekV4ToolChoiceMode）
- *   CP4 analyze invalid-no-evidence 阻断     AgentRuntime.ts:1576-1605 + gate:1707-1732（阻断 + nudge + rollback tick）
- *
- * 仅 capture 现行行为，不改任何运行时逻辑（抽取=AP-1/2、切默认=AP-3）。
+ * 控制点：
+ *   CP1 grounding-policy 指令文本注入       LLMInputAssembly.buildGroundingContext（guard 时 analyze always-on，按 modelRef/refCount 参数化）
+ *   CP2 DeepSeek V4 toolChoice 改写         AgentRuntime + ProviderToolChoicePolicy（首轮 none→auto、schema 可见；provider 不受 grounding 开关）
+ *   CP3 工具调用抑制的 DeepSeek V4 例外      AgentRuntime（读 deepseekV4ToolChoiceMode；provider 不受 grounding 开关）
+ *   CP4 analyze invalid-no-evidence 阻断     AgentRuntime 调用点（guard 时阻断+nudge+rollback；off 时短路）
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -62,10 +62,12 @@ function createStageTracker(phase: string, pipelineType: string) {
 }
 
 // CP1 用：装配一次 LLM 输入，返回 assembly（不触发任何 provider 调用）。
+// groundingEnforcement 默认 'off'（AP-3 切默认）；传 'guard' 复现旧 grounding-on 注入行为。
 function assembleLlmInput(
   modelRef: string,
   stage: { phase: string; pipelineType: string; pipelinePhase: string },
-  deterministicRefs: string[]
+  deterministicRefs: string[],
+  groundingEnforcement: 'off' | 'guard' = 'off'
 ) {
   const messages = createMessageAdapter(null);
   messages.appendUserMessage('Analyze the architecture for the design-patterns dimension.');
@@ -80,6 +82,7 @@ function assembleLlmInput(
       pipelinePhase: stage.pipelinePhase,
       targetName: 'Demo',
     },
+    groundingEnforcement,
     messages,
     prompt: 'Use the cited source to verify the finding.',
     source: 'system',
@@ -133,7 +136,10 @@ function createToolEnvelope(
 }
 
 // CP2/CP3 共享：DeepSeek V4 analyze 首轮（SCAN→EXPLORE）返回 code 工具调用并执行其证据。
-async function runDeepSeekAnalyzeFirstBurnWithToolEvidence() {
+// groundingEnforcement 不影响 provider tool-choice（PD1）；参数仅用于证明两模式一致。
+async function runDeepSeekAnalyzeFirstBurnWithToolEvidence(
+  groundingEnforcement: 'off' | 'guard' = 'off'
+) {
   const captures: Array<Record<string, unknown> | undefined> = [];
   const chatWithTools = vi
     .fn()
@@ -224,59 +230,168 @@ async function runDeepSeekAnalyzeFirstBurnWithToolEvidence() {
   const result = await runtime.reactLoop('analyze with tools visible', {
     source: 'system',
     context: { pipelinePhase: 'analyze' },
+    groundingEnforcement,
     tracker: tracker as never,
     budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
   });
   return { result, captures, executeSpy };
 }
 
-describe('AP-0 PCV observe-only baseline characterization', () => {
-  describe('CP1 grounding-policy 指令文本注入 (LLMInputAssembly, analyze always-on)', () => {
-    it('analyze 阶段向 evidenceContext 注入 evidenceGroundingPolicy 文本（与具体 model 无关）', () => {
-      const assembly = assembleLlmInput(
-        'unit-model',
-        { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
-        ['Sources/App/Feature.swift:12']
-      );
-      expect(assembly.stageProfile).toBe('analyze');
-      const policy = assembly.metadata.groundingPolicy as string | null;
-      expect(typeof policy).toBe('string');
-      expect(policy).toContain(
-        'Every analyze burn that advances a conclusion must consume cited deterministic evidence refs'
-      );
-      // refCount>0 → 追加 deterministicEvidenceRefs 引用提示（参数化）。
-      expect(policy).toContain('Cite the relevant deterministicEvidenceRefs');
-      // 非 DeepSeek 模型不含 provider 子句。
-      expect(policy).not.toContain('DeepSeek V4 cannot rely');
-      const evidenceSection = assembly.sections.find((section) => section.id === 'evidenceContext');
-      expect(evidenceSection?.content).toContain('evidenceGroundingPolicy:');
+// CP4 共享：DeepSeek V4 analyze 首轮文本无证据 grounding（首轮无证据结论文本，次轮 planning-only）。
+// groundingEnforcement='guard' → 阻断+nudge+rollback（两轮）；'off' → 不阻断、首轮即终结。
+async function runDeepSeekAnalyzeNoEvidence(groundingEnforcement: 'off' | 'guard' = 'off') {
+  const progress: ProgressEvent[] = [];
+  const chatWithTools = vi
+    .fn()
+    .mockResolvedValueOnce({
+      text: 'I can already conclude the architecture shape from general context.',
+      functionCalls: [],
+      usage: { inputTokens: 2, outputTokens: 1 },
+    })
+    .mockResolvedValueOnce({
+      text: 'Planning-only: use deterministic evidence src/known.ts:10 to decide the next read before asserting facts.',
+      functionCalls: [],
+      usage: { inputTokens: 2, outputTokens: 1 },
+    });
+  const tracker = {
+    phase: 'SCAN',
+    pipelineType: 'analyst',
+    isGracefulExit: false,
+    isHardExit: false,
+    iteration: 0,
+    totalSubmits: 0,
+    tick: vi.fn(),
+    rollbackTick: vi.fn(),
+    shouldExit: vi.fn(() => false),
+    getNudge: vi.fn(() => null),
+    getPhaseContext: vi.fn(() => null),
+    getToolChoice: vi.fn(() => 'none'),
+    getMetrics: vi.fn(() => ({
+      evidenceToolCallCount: 0,
+      memoryFindingCount: 0,
+      uniqueFiles: 0,
+      uniquePatterns: 0,
+    })),
+    endRound: vi.fn(() => null),
+    onTextResponse: vi.fn(() => ({
+      isFinalAnswer: true,
+      needsDigestNudge: false,
+      shouldContinue: false,
+      nudge: null,
+    })),
+  };
+  const runtime = new AgentRuntime({
+    aiProvider: { name: 'deepseek', model: 'deepseek-v4-flash', chatWithTools } as never,
+    toolRegistry: { getManifest: () => null } as never,
+    toolRouter: { execute: vi.fn() } as never,
+    capabilities: [],
+    strategy: { name: 'unused', execute: vi.fn() } as never,
+    modelRef: 'deepseek:deepseek-v4-flash',
+    onProgress: (event) => progress.push(event),
+  });
+  const result = await runtime.reactLoop('analyze first burn', {
+    source: 'system',
+    context: {
+      evidenceStarters: { entry: { hint: 'src/known.ts:10 is a deterministic starter.' } },
+      pipelinePhase: 'analyze',
+    },
+    groundingEnforcement,
+    tracker: tracker as never,
+    budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+  });
+  return { result, progress, chatWithTools, tracker };
+}
+
+describe('PCV observe-only characterization — AP-3 两模式（默认 off / guard 开启）', () => {
+  describe('CP1 grounding-policy 指令文本注入 (LLMInputAssembly)', () => {
+    describe('默认 off：analyze 不注入 grounding policy（PCV observe-only）', () => {
+      it('analyze 阶段默认不注入 evidenceGroundingPolicy（groundingPolicy=null）', () => {
+        const assembly = assembleLlmInput(
+          'unit-model',
+          { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
+          ['Sources/App/Feature.swift:12']
+        );
+        expect(assembly.stageProfile).toBe('analyze');
+        expect(assembly.metadata.groundingPolicy).toBeNull();
+        const evidenceSection = assembly.sections.find(
+          (section) => section.id === 'evidenceContext'
+        );
+        expect(evidenceSection?.content ?? '').not.toContain('evidenceGroundingPolicy:');
+      });
+
+      it('PD5：默认 off 下证据 ref 列表仍注入（deterministicEvidenceRefs 不随开关）', () => {
+        const assembly = assembleLlmInput(
+          'unit-model',
+          { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
+          ['Sources/App/Feature.swift:12']
+        );
+        const evidenceSection = assembly.sections.find(
+          (section) => section.id === 'evidenceContext'
+        );
+        expect(evidenceSection?.content).toContain('deterministicEvidenceRefs:');
+        expect(evidenceSection?.content).toContain('Sources/App/Feature.swift:12');
+      });
     });
 
-    it('DeepSeek V4 modelRef 追加 provider 专属子句（按 modelRef 参数化）', () => {
-      const assembly = assembleLlmInput(
-        'deepseek-v4-flash',
-        { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
-        ['Sources/App/Feature.swift:12']
-      );
-      const policy = assembly.metadata.groundingPolicy as string | null;
-      expect(policy).toContain('DeepSeek V4 cannot rely on forced tool_choice');
+    describe('guard 开启（per-run override）：恢复 grounding policy 注入（= AP-0 旧行为）', () => {
+      it('analyze + guard 注入 evidenceGroundingPolicy 文本（与具体 model 无关、按 refCount 参数化）', () => {
+        const assembly = assembleLlmInput(
+          'unit-model',
+          { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
+          ['Sources/App/Feature.swift:12'],
+          'guard'
+        );
+        expect(assembly.stageProfile).toBe('analyze');
+        const policy = assembly.metadata.groundingPolicy as string | null;
+        expect(typeof policy).toBe('string');
+        expect(policy).toContain(
+          'Every analyze burn that advances a conclusion must consume cited deterministic evidence refs'
+        );
+        // refCount>0 → 追加 deterministicEvidenceRefs 引用提示（参数化）。
+        expect(policy).toContain('Cite the relevant deterministicEvidenceRefs');
+        // 非 DeepSeek 模型不含 provider 子句。
+        expect(policy).not.toContain('DeepSeek V4 cannot rely');
+        const evidenceSection = assembly.sections.find(
+          (section) => section.id === 'evidenceContext'
+        );
+        expect(evidenceSection?.content).toContain('evidenceGroundingPolicy:');
+      });
+
+      it('guard + DeepSeek V4 modelRef 追加 provider 专属子句（按 modelRef 参数化）', () => {
+        const assembly = assembleLlmInput(
+          'deepseek-v4-flash',
+          { phase: 'SCAN', pipelineType: 'analyst', pipelinePhase: 'analyze' },
+          ['Sources/App/Feature.swift:12'],
+          'guard'
+        );
+        const policy = assembly.metadata.groundingPolicy as string | null;
+        expect(policy).toContain('DeepSeek V4 cannot rely on forced tool_choice');
+      });
     });
 
-    it('非 analyze 阶段（produce）不注入 grounding policy', () => {
-      const assembly = assembleLlmInput(
+    it('非 analyze 阶段（produce）任何模式都不注入 grounding policy', () => {
+      const off = assembleLlmInput(
         'unit-model',
         { phase: 'PRODUCE', pipelineType: 'producer', pipelinePhase: 'produce' },
         ['Sources/App/Feature.swift:12']
       );
-      expect(assembly.stageProfile).toBe('produce');
-      expect(assembly.metadata.groundingPolicy).toBeNull();
-      const evidenceSection = assembly.sections.find((section) => section.id === 'evidenceContext');
+      expect(off.stageProfile).toBe('produce');
+      expect(off.metadata.groundingPolicy).toBeNull();
+      // produce 阶段永不注入，即便显式 guard。
+      const guard = assembleLlmInput(
+        'unit-model',
+        { phase: 'PRODUCE', pipelineType: 'producer', pipelinePhase: 'produce' },
+        ['Sources/App/Feature.swift:12'],
+        'guard'
+      );
+      expect(guard.metadata.groundingPolicy).toBeNull();
+      const evidenceSection = guard.sections.find((section) => section.id === 'evidenceContext');
       expect(evidenceSection?.content ?? '').not.toContain('evidenceGroundingPolicy:');
     });
   });
 
-  describe('CP2 DeepSeek V4 analyze toolChoice 改写 (AgentRuntime)', () => {
-    it('首轮把 requestedToolChoice=none 改写为 auto 且保留 tool schema 可见', async () => {
+  describe('CP2 DeepSeek V4 analyze toolChoice 改写 (AgentRuntime, provider 不随 grounding 开关)', () => {
+    it('默认 off：首轮把 requestedToolChoice=none 改写为 auto 且保留 tool schema 可见（provider 不受 observe-only 影响）', async () => {
       const { result, captures } = await runDeepSeekAnalyzeFirstBurnWithToolEvidence();
       const firstCall = captures[0] || {};
       const firstSchemas = firstCall.toolSchemas as Array<Record<string, unknown>> | undefined;
@@ -291,10 +406,25 @@ describe('AP-0 PCV observe-only baseline characterization', () => {
         toolSchemasVisible: true,
       });
     });
+
+    it('guard 开启：provider toolChoice 行为与 off 完全一致（PD1 — provider 与 grounding 解耦）', async () => {
+      const { result, captures } = await runDeepSeekAnalyzeFirstBurnWithToolEvidence('guard');
+      const firstCall = captures[0] || {};
+      const firstSchemas = firstCall.toolSchemas as Array<Record<string, unknown>> | undefined;
+      expect(firstSchemas?.map((schema) => schema.name)).toContain('code');
+      expect(firstCall.toolChoice).toBe('auto');
+      const firstBurn = result.pcvNodeEvidence.groundingLedger[0];
+      expect(firstBurn).toMatchObject({
+        deepseekV4ToolChoiceMode: 'tools-visible-no-forced-tool-choice',
+        effectiveToolChoice: 'auto',
+        requestedToolChoice: 'none',
+        toolSchemasVisible: true,
+      });
+    });
   });
 
-  describe('CP3 工具调用抑制的 DeepSeek V4 例外 (AgentRuntime)', () => {
-    it('deepseekV4ToolChoiceMode=tools-visible-no-forced-tool-choice 时不抑制工具调用（实际执行）', async () => {
+  describe('CP3 工具调用抑制的 DeepSeek V4 例外 (AgentRuntime, provider 不随 grounding 开关)', () => {
+    it('deepseekV4ToolChoiceMode=tools-visible-no-forced-tool-choice 时不抑制工具调用（实际执行；默认 off 下 provider 不受影响）', async () => {
       const { result, executeSpy } = await runDeepSeekAnalyzeFirstBurnWithToolEvidence();
       // 首轮在 requestedToolChoice=none 下返回的工具调用未被 graceful-exit/none 抑制分支吞掉 → 实际执行。
       expect(executeSpy).toHaveBeenCalled();
@@ -360,65 +490,23 @@ describe('AP-0 PCV observe-only baseline characterization', () => {
   });
 
   describe('CP4 analyze invalid-no-evidence 阻断 + nudge + rollback (AgentRuntime)', () => {
-    it('DeepSeek V4 analyze 首轮文本无证据 grounding → 阻断 + 追加 nudge + rollbackTick', async () => {
-      const progress: ProgressEvent[] = [];
-      const chatWithTools = vi
-        .fn()
-        .mockResolvedValueOnce({
-          text: 'I can already conclude the architecture shape from general context.',
-          functionCalls: [],
-          usage: { inputTokens: 2, outputTokens: 1 },
-        })
-        .mockResolvedValueOnce({
-          text: 'Planning-only: use deterministic evidence src/known.ts:10 to decide the next read before asserting facts.',
-          functionCalls: [],
-          usage: { inputTokens: 2, outputTokens: 1 },
-        });
-      const tracker = {
-        phase: 'SCAN',
-        pipelineType: 'analyst',
-        isGracefulExit: false,
-        isHardExit: false,
-        iteration: 0,
-        totalSubmits: 0,
-        tick: vi.fn(),
-        rollbackTick: vi.fn(),
-        shouldExit: vi.fn(() => false),
-        getNudge: vi.fn(() => null),
-        getPhaseContext: vi.fn(() => null),
-        getToolChoice: vi.fn(() => 'none'),
-        getMetrics: vi.fn(() => ({
-          evidenceToolCallCount: 0,
-          memoryFindingCount: 0,
-          uniqueFiles: 0,
-          uniquePatterns: 0,
-        })),
-        endRound: vi.fn(() => null),
-        onTextResponse: vi.fn(() => ({
-          isFinalAnswer: true,
-          needsDigestNudge: false,
-          shouldContinue: false,
-          nudge: null,
-        })),
-      };
-      const runtime = new AgentRuntime({
-        aiProvider: { name: 'deepseek', model: 'deepseek-v4-flash', chatWithTools } as never,
-        toolRegistry: { getManifest: () => null } as never,
-        toolRouter: { execute: vi.fn() } as never,
-        capabilities: [],
-        strategy: { name: 'unused', execute: vi.fn() } as never,
-        modelRef: 'deepseek:deepseek-v4-flash',
-        onProgress: (event) => progress.push(event),
-      });
-      const result = await runtime.reactLoop('analyze first burn', {
-        source: 'system',
-        context: {
-          evidenceStarters: { entry: { hint: 'src/known.ts:10 is a deterministic starter.' } },
-          pipelinePhase: 'analyze',
-        },
-        tracker: tracker as never,
-        budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
-      });
+    it('默认 off：DeepSeek V4 analyze 首轮无证据文本 NOT 阻断（observe-only — 分类仍被观察记录、不推进控制）', async () => {
+      const { result, progress, chatWithTools, tracker } = await runDeepSeekAnalyzeNoEvidence();
+      const ledger = result.pcvNodeEvidence.groundingLedger;
+      const nudge = progress
+        .map((event) => event.processEvent)
+        .find((event) => event?.metadata?.semanticKind === 'evidence-grounding-nudge');
+      // 未阻断 → 首轮文本即被当作最终答复，循环结束（不进入第二轮）。
+      expect(chatWithTools).toHaveBeenCalledTimes(1);
+      expect(tracker.rollbackTick).not.toHaveBeenCalled();
+      // PCV 仍纯观察：首轮 classification 照常记录为 invalid-no-evidence，但不触发阻断。
+      expect(ledger.map((entry) => entry.classification)).toEqual(['invalid-no-evidence']);
+      expect(nudge).toBeUndefined();
+    });
+
+    it('guard 开启（per-run override）：恢复阻断 + 追加 nudge + rollbackTick（= AP-0 旧行为）', async () => {
+      const { result, progress, chatWithTools, tracker } =
+        await runDeepSeekAnalyzeNoEvidence('guard');
       const ledger = result.pcvNodeEvidence.groundingLedger;
       const nudge = progress
         .map((event) => event.processEvent)
