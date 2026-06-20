@@ -74,24 +74,4 @@ jobs:
 
       - name: Package export smoke
         working-directory: AlembicAgent
-        run: |
-          node --input-type=module <<'NODE'
-          const specs = [
-            '@alembic/agent',
-            '@alembic/agent/agent',
-            '@alembic/agent/service',
-            '@alembic/agent/runtime',
-            '@alembic/agent/prompts',
-            '@alembic/agent/domain',
-            '@alembic/agent/ai',
-            '@alembic/agent/tools/v2',
-            '@alembic/agent/memory',
-            '@alembic/agent/context',
-          ];
-
-          const loaded = {};
-          for (const spec of specs) {
-            loaded[spec] = Object.keys(await import(spec)).length;
-          }
-          console.log(JSON.stringify(loaded, null, 2));
-          NODE
+        run: npm run smoke:public-imports
