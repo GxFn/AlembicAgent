@@ -51,6 +51,7 @@ import {
   type ToolMetadata,
 } from './AgentRuntimeTypes.js';
 import { AgentState } from './AgentState.js';
+import { evaluateAnalyzeTextGroundingGate } from './AnalyzeGroundingGuard.js';
 import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
 import { createExitController } from './ExitController.js';
@@ -72,7 +73,6 @@ import { LoopContext } from './LoopContext.js';
 import { createMessageAdapter } from './MessageAdapter.js';
 import {
   buildPcvNodeEvidenceProcessMetadata,
-  getLatestPcvBurnGrounding,
   recordPcvInputAssembly,
   recordPcvLlmOutput,
   recordPcvToolResult,
@@ -80,7 +80,6 @@ import {
 } from './PcvNodeEvidence.js';
 import {
   allowsDeepSeekV4ToolCalls,
-  isDeepSeekV4AnalyzeFirstBurn,
   observeDeepSeekV4ToolChoiceMode,
   resolveProviderToolChoice,
 } from './ProviderToolChoicePolicy.js';
@@ -1587,7 +1586,7 @@ export class AgentRuntime {
     const { tracker, trace, messages } = ctx;
 
     if (tracker) {
-      const groundingGate = this.#evaluateAnalyzeTextGroundingGate(ctx);
+      const groundingGate = evaluateAnalyzeTextGroundingGate(ctx, this.#modelRef);
       if (groundingGate.block) {
         messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
         messages.appendUserNudge(groundingGate.nudge);
@@ -1712,33 +1711,6 @@ export class AgentRuntime {
     ctx.lastReply = cleanFinalAnswer(llmResult.text || '');
     trace?.endRound?.();
     return true;
-  }
-
-  #evaluateAnalyzeTextGroundingGate(ctx: LoopContext): {
-    block: boolean;
-    nudge: string;
-    reason: string;
-  } {
-    const burn = getLatestPcvBurnGrounding(ctx.pcvNodeEvidence);
-    if (!burn || !isDeepSeekV4AnalyzeFirstBurn(ctx, this.#modelRef)) {
-      return { block: false, nudge: '', reason: '' };
-    }
-    if (burn.classification !== 'invalid-no-evidence') {
-      return { block: false, nudge: '', reason: '' };
-    }
-    const deterministicRefs = burn.deterministicEvidenceRefs.slice(0, 8);
-    const refsHint =
-      deterministicRefs.length > 0
-        ? `请明确引用并消费这些 deterministicEvidenceRefs 中的相关项：${deterministicRefs.join(', ')}。`
-        : '当前没有足够的 deterministicEvidenceRefs；请调用 code / graph / terminal 取得可复核代码证据。';
-    return {
-      block: true,
-      reason:
-        'DeepSeek V4 analyze burn returned text without deterministic evidence consumption, evidence tool calls, or finding delta.',
-      nudge:
-        '本轮 analyze 文本没有可观测证据 grounding，不能推进阶段。' +
-        `${refsHint} 如果只是规划下一步，只输出取证计划并绑定 evidence refs；如果要推进事实结论，必须先产生或消费可复核证据。`,
-    };
   }
 
   #getForcedSummarySuppression(ctx: LoopContext): { code: string; message: string } | null {

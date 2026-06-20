@@ -1,4 +1,5 @@
 import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
+import { buildAnalyzeGroundingPolicy } from './AnalyzeGroundingGuard.js';
 import type { LoopContext } from './LoopContext.js';
 import { extractSourceRefsFromValue } from './PcvNodeEvidence.js';
 
@@ -525,13 +526,6 @@ function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingCon
       ? buildAnalyzeGroundingPolicy(modelRef, deterministicEvidenceRefs.length)
       : null;
   return { deterministicEvidenceRefs, evidenceStarterRefs, policy };
-}
-
-function buildAnalyzeGroundingPolicy(modelRef: string, deterministicRefCount: number): string {
-  const deepseekMode = /deepseek.*v4|deepseek-v4/i.test(modelRef)
-    ? ' DeepSeek V4 cannot rely on forced tool_choice; use visible tools or cited deterministic refs.'
-    : '';
-  return `Every analyze burn that advances a conclusion must consume cited deterministic evidence refs or produce new tool evidence. Planning-only text may choose the next evidence frontier but must not assert verified facts.${deterministicRefCount > 0 ? ' Cite the relevant deterministicEvidenceRefs when using injected evidence.' : ''}${deepseekMode}`;
 }
 
 function buildDynamicContextSection(dynamicContext: string | null): LLMInputSection | null {
