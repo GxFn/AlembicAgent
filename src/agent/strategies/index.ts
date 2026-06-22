@@ -8,12 +8,10 @@ export {
   type StrategyResult,
   type StrategyRuntime,
 } from './Strategy.js';
-export { StrategyRegistry } from './StrategyRegistry.js';
 
 import { AdaptiveStrategy } from './AdaptiveStrategy.js';
 import { FanOutStrategy } from './FanOutStrategy.js';
 import { SingleStrategy } from './SingleStrategy.js';
 import { Strategy } from './Strategy.js';
-import { StrategyRegistry } from './StrategyRegistry.js';
 
-export default { Strategy, SingleStrategy, FanOutStrategy, AdaptiveStrategy, StrategyRegistry };
+export default { Strategy, SingleStrategy, FanOutStrategy, AdaptiveStrategy };

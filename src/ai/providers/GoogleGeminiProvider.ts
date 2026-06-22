@@ -79,13 +79,8 @@ export class GoogleGeminiProvider extends AiProvider {
     return this._gatewayEmbed(text);
   }
 
-  async summarize(code: string) {
-    const prompt = `请对以下代码生成结构化摘要，返回 JSON 格式 {title, description, language, patterns: [], keyAPIs: []}:\n\n${code}`;
-    return (
-      (await this.chatWithStructuredOutput(prompt, {
-        temperature: 0.3,
-        maxTokens: 8192,
-      })) || { title: '', description: '' }
-    );
+  /** Gemini 处理更大的代码摘要预算。 */
+  protected get summarizeMaxTokens(): number {
+    return 8192;
   }
 }

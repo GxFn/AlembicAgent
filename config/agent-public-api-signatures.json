@@ -31,8 +31,8 @@
     ".": {
       "exportPath": ".",
       "specifier": "@alembic/agent",
-      "exportCount": 183,
-      "signatureHash": "86dffa0e926a89c054e435f51957792fca1a8510b3dba90705a1856d1b14607a",
+      "exportCount": 180,
+      "signatureHash": "206f94160629627ba34a9da1d876b3c9f33dc21110e9b85818aae5d78affcccd",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -92,10 +92,6 @@
         },
         {
           "name": "AgentProfileRegistry",
-          "kind": "class"
-        },
-        {
-          "name": "AgentRouter",
           "kind": "class"
         },
         {
@@ -331,10 +327,6 @@
           "kind": "class"
         },
         {
-          "name": "PresetName",
-          "kind": "object"
-        },
-        {
           "name": "QualityGatePolicy",
           "kind": "class"
         },
@@ -381,10 +373,6 @@
         {
           "name": "Strategy",
           "kind": "class"
-        },
-        {
-          "name": "StrategyRegistry",
-          "kind": "object"
         },
         {
           "name": "SystemInteraction",
@@ -771,8 +759,8 @@
     "./agent": {
       "exportPath": "./agent",
       "specifier": "@alembic/agent/agent",
-      "exportCount": 56,
-      "signatureHash": "2f3707220ee7127a8ce0976be351cb76f06bcd5aa433b0cbe1a7bcd87026c9e6",
+      "exportCount": 53,
+      "signatureHash": "44a730edeefaa9edea93254ff5f8e3e35558696c04183e19d99dc8180317375a",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -828,10 +816,6 @@
         },
         {
           "name": "AgentProfileRegistry",
-          "kind": "class"
-        },
-        {
-          "name": "AgentRouter",
           "kind": "class"
         },
         {
@@ -907,10 +891,6 @@
           "kind": "class"
         },
         {
-          "name": "PresetName",
-          "kind": "object"
-        },
-        {
           "name": "QualityGatePolicy",
           "kind": "class"
         },
@@ -925,10 +905,6 @@
         {
           "name": "Strategy",
           "kind": "class"
-        },
-        {
-          "name": "StrategyRegistry",
-          "kind": "object"
         },
         {
           "name": "SystemInteraction",
@@ -1471,21 +1447,9 @@
     "./domain": {
       "exportPath": "./domain",
       "specifier": "@alembic/agent/domain",
-      "exportCount": 6,
-      "signatureHash": "80516633d5d2a8d7e6bdd79c05b9b08286aa91545db196e19d609d8eb889fb20",
+      "exportCount": 2,
+      "signatureHash": "8eba8cdb7331e2968327cc3be2ef603abcb21c5e382f4d2bffdad84c61ff2559",
       "entries": [
-        {
-          "name": "CONSOLIDATION_GATE_BUDGET",
-          "kind": "object"
-        },
-        {
-          "name": "CONSOLIDATION_GATE_SYSTEM_PROMPT",
-          "kind": "string"
-        },
-        {
-          "name": "CONSOLIDATION_GATE_TOOLS",
-          "kind": "array"
-        },
         {
           "name": "EpisodicConsolidator",
           "kind": "class"
@@ -1493,10 +1457,6 @@
         {
           "name": "EvidenceCollector",
           "kind": "class"
-        },
-        {
-          "name": "buildConsolidationGatePrompt",
-          "kind": "function"
         }
       ]
     },

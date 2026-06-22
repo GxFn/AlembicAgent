@@ -134,7 +134,5 @@ describe('explicit AlembicAgent contract subpaths', () => {
   it('exposes domain consolidation helpers', () => {
     expect(typeof domain.EpisodicConsolidator).toBe('function');
     expect(typeof domain.EvidenceCollector).toBe('function');
-    expect(typeof domain.buildConsolidationGatePrompt).toBe('function');
-    expect(domain.CONSOLIDATION_GATE_TOOLS.length).toBeGreaterThan(0);
   });
 });

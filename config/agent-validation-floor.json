@@ -9,7 +9,7 @@
     "packEntries": "minimumPackEntries is a floor from npm pack --dry-run --ignore-scripts; decreases require release-boundary review."
   },
   "minimumTestFiles": 34,
-  "minimumDeclaredTestCases": 245,
+  "minimumDeclaredTestCases": 241,
   "stablePublicExportCount": 13,
   "coreReferenceLimitTotal": 52,
   "minimumPackEntries": 432,

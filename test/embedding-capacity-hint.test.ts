@@ -95,7 +95,6 @@ describe('AD5 embedding capacity hint', () => {
 
     expect(Object.isFrozen(hint)).toBe(true);
     expect(hint.maxInFlightEmbeddings).toBe(provider._maxConcurrency);
-    expect(provider._activeRequests).toBe(0);
     expect(provider.getEmbeddingCapacityHint()).toEqual(hint);
   });
 

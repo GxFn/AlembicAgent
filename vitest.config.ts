@@ -18,5 +18,19 @@ export default defineConfig({
     testTimeout: 30000,
     hookTimeout: 30000,
     teardownTimeout: 10000,
+    coverage: {
+      provider: 'v8',
+      // Ratchet floor, pinned just below the 2026-06-19 baseline measured over the
+      // files the suite imports (statements 52.89 / branches 43.21 / functions 57.3
+      // / lines 52.94). Coverage may only climb from here: raise these as suites are
+      // added, and never lower a threshold without a recorded reason. Enable with
+      // `vitest run --coverage` (requires the @vitest/coverage-v8 devDep).
+      thresholds: {
+        statements: 52,
+        branches: 42,
+        functions: 56,
+        lines: 52,
+      },
+    },
   },
 });

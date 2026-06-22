@@ -71,6 +71,7 @@ async function handleSearch(
   const allMatches: SearchMatch[] = [];
   const startMs = Date.now();
   let totalCount = 0;
+  let fellBack = false;
 
   for (const pattern of patterns) {
     if (ctx.abortSignal?.aborted) {
@@ -97,6 +98,9 @@ async function handleSearch(
       totalCount += result.total;
       ctx.searchCache?.set(cacheKey, { matches: result.matches, total: result.total });
     } catch {
+      // Primary ripgrep failed (binary missing / spawn error) — fall back to an
+      // in-process regex scan and mark the result as fallback-produced.
+      fellBack = true;
       const result = await fallbackRegexSearch(pattern, ctx.projectRoot, {
         glob,
         maxResults,
@@ -114,6 +118,7 @@ async function handleSearch(
   return ok(output, {
     tokensEstimate: estimateTokens(output),
     durationMs: Date.now() - startMs,
+    ...(fellBack ? { fallbackUsed: true } : {}),
   });
 }
 

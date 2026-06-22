@@ -27,18 +27,6 @@ function restoreEnv(name: string, value: string | undefined): void {
   process.env[name] = value;
 }
 
-class RetryHarnessProvider extends AiProvider {
-  constructor(config: AiProviderConfig = {}) {
-    super({ maxConcurrency: 1, maxRetries: 0, ...config });
-    this.name = 'retry-harness';
-    this.model = 'retry-test';
-  }
-
-  runWithRetry<T>(fn: () => Promise<T>, retries = 0, baseDelay = 1): Promise<T> {
-    return this._withRetry(fn, retries, baseDelay);
-  }
-}
-
 class TestLocalFakeProvider extends AiProvider {
   #calls: Array<{ method: string }> = [];
   #chatResponse: string;
@@ -281,87 +269,6 @@ describe('ParameterGuard', () => {
     expect(guarded.filtered.find((item) => item.param === 'toolChoice')?.reason).toContain(
       'reasoning_content'
     );
-  });
-});
-
-describe('AiProvider retry and error classification', () => {
-  it('does not trip the circuit breaker for non-retryable client errors', async () => {
-    const provider = new RetryHarnessProvider({ circuitThreshold: 1 });
-    const clientError = Object.assign(new Error('bad request'), { status: 400 });
-
-    await expect(provider.runWithRetry(() => Promise.reject(clientError))).rejects.toMatchObject({
-      status: 400,
-    });
-    expect(provider._circuitFailures).toBe(0);
-    expect(provider._circuitState).toBe('CLOSED');
-  });
-
-  it('classifies timeout failures as retryable and opens the circuit', async () => {
-    const provider = new RetryHarnessProvider({ circuitThreshold: 1 });
-    const timeoutError = Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
-
-    await expect(provider.runWithRetry(() => Promise.reject(timeoutError))).rejects.toMatchObject({
-      code: 'ETIMEDOUT',
-    });
-    expect(provider._circuitFailures).toBe(1);
-    expect(provider._circuitState).toBe('OPEN');
-
-    await expect(provider.runWithRetry(() => Promise.resolve('ok'))).rejects.toMatchObject({
-      code: 'CIRCUIT_OPEN',
-    });
-  });
-
-  it('transfers legacy provider concurrency slots without overselling the cap', async () => {
-    const provider = new RetryHarnessProvider({ maxConcurrency: 1 });
-
-    await provider._acquireRequestSlot();
-    const queued = provider._acquireRequestSlot();
-
-    provider._releaseRequestSlot();
-    const lateArrival = provider._acquireRequestSlot();
-
-    await queued;
-    expect(provider._activeRequests).toBe(1);
-
-    provider._releaseRequestSlot();
-    await lateArrival;
-    expect(provider._activeRequests).toBe(1);
-
-    provider._releaseRequestSlot();
-    expect(provider._activeRequests).toBe(0);
-  });
-
-  it('opens the legacy provider circuit once under concurrent failures', async () => {
-    const provider = new RetryHarnessProvider({
-      circuitThreshold: 1,
-      maxConcurrency: 2,
-    });
-    const timeoutError = () => Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
-
-    await Promise.allSettled([
-      provider.runWithRetry(() => Promise.reject(timeoutError())),
-      provider.runWithRetry(() => Promise.reject(timeoutError())),
-    ]);
-
-    expect(provider._circuitState).toBe('OPEN');
-    expect(provider._circuitCooldownMs).toBe(60_000);
-  });
-
-  it('treats AbortError cancellation as non-retryable without circuit state changes', async () => {
-    const provider = new RetryHarnessProvider({ circuitThreshold: 1 });
-    const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });
-    let attempts = 0;
-
-    await expect(
-      provider.runWithRetry(() => {
-        attempts += 1;
-        return Promise.reject(abortError);
-      }, 2)
-    ).rejects.toMatchObject({ name: 'AbortError' });
-
-    expect(attempts).toBe(1);
-    expect(provider._circuitFailures).toBe(0);
-    expect(provider._circuitState).toBe('CLOSED');
   });
 });
 

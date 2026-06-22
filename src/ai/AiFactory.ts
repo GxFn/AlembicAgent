@@ -53,19 +53,26 @@ export function createProvider(options: Record<string, unknown> = {}) {
  * 从环境变量自动探测并创建 Provider
  * 优先级: ALEMBIC_AI_PROVIDER 指定 > 有 key 的第一个
  */
+// Single source of truth: canonical provider id -> its API-key env var. Both the
+// alias map below and the fallback enumeration derive from this — no re-listing.
+const PROVIDER_KEY_ENV = {
+  google: 'ALEMBIC_GOOGLE_API_KEY',
+  openai: 'ALEMBIC_OPENAI_API_KEY',
+  deepseek: 'ALEMBIC_DEEPSEEK_API_KEY',
+  claude: 'ALEMBIC_CLAUDE_API_KEY',
+} as const;
+
 export function autoDetectProvider() {
   const logger = Logger.getInstance();
   const explicit = process.env.ALEMBIC_AI_PROVIDER;
 
   if (explicit && explicit.toLowerCase() !== 'auto') {
+    // Aliases resolve to the canonical provider's key env; ollama needs no key.
     const keyEnvMap: Record<string, string | null> = {
-      google: 'ALEMBIC_GOOGLE_API_KEY',
-      'google-gemini': 'ALEMBIC_GOOGLE_API_KEY',
-      gemini: 'ALEMBIC_GOOGLE_API_KEY',
-      openai: 'ALEMBIC_OPENAI_API_KEY',
-      deepseek: 'ALEMBIC_DEEPSEEK_API_KEY',
-      claude: 'ALEMBIC_CLAUDE_API_KEY',
-      anthropic: 'ALEMBIC_CLAUDE_API_KEY',
+      ...PROVIDER_KEY_ENV,
+      'google-gemini': PROVIDER_KEY_ENV.google,
+      gemini: PROVIDER_KEY_ENV.google,
+      anthropic: PROVIDER_KEY_ENV.claude,
       ollama: null,
     };
     const requiredKeyEnv = keyEnvMap[explicit.toLowerCase()];
@@ -105,17 +112,10 @@ export function autoDetectProvider() {
 
 // ─── Fallback 机制 ──────────────────────────────────────────
 
-const PROVIDER_KEY_MAP = {
-  google: 'ALEMBIC_GOOGLE_API_KEY',
-  openai: 'ALEMBIC_OPENAI_API_KEY',
-  deepseek: 'ALEMBIC_DEEPSEEK_API_KEY',
-  claude: 'ALEMBIC_CLAUDE_API_KEY',
-};
-
 /** 获取可用的 fallback provider 列表（排除当前 provider） */
 export function getAvailableFallbacks(currentProvider: string) {
   const fallbacks: string[] = [];
-  for (const [name, envKey] of Object.entries(PROVIDER_KEY_MAP)) {
+  for (const [name, envKey] of Object.entries(PROVIDER_KEY_ENV)) {
     if (name === currentProvider) {
       continue;
     }

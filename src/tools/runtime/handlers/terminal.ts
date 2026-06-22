@@ -103,7 +103,8 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
       const text = partial
         ? `[timeout] partial output:\n${partial}`
         : '[command timed out or aborted]';
-      return ok(text, { durationMs, tokensEstimate: estimateTokens(text) });
+      // SIGKILL/timeout — the command was cut off, so this output is partial.
+      return ok(text, { durationMs, tokensEstimate: estimateTokens(text), degraded: true });
     }
 
     const text = exitCode === 0 ? compressed : `[exit ${exitCode}]\n${compressed}`;

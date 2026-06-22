@@ -20,7 +20,7 @@
  *   - ExplorationTracker: 阶段状态机 + 信号收集 + Nudge + Graceful exit (可选注入)
  *   - AI 错误恢复: consecutiveAiErrors 2-strike → context reset → forced summary
  *   - 空响应重试: consecutiveEmptyResponses + rollback (system 场景)
- *   - 熔断器感知: _circuitState === 'OPEN' → 直接合成摘要
+ *   - 熔断器感知: gateway ReliabilityController 熔断 → chatWithTools 抛 CIRCUIT_OPEN → 合成摘要兜底
  *   - 工具调用数量限制: MAX_TOOL_CALLS_PER_ITER = 8
  *   - 提交去重: submittedTitles / submittedPatterns
  *   - cleanFinalAnswer: 去除 nudge 噪声

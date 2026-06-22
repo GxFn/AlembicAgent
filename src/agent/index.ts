@@ -84,7 +84,6 @@ export {
 } from './runtime/AgentRuntimeBoundary.js';
 // ── Infrastructure ──
 export { AgentPhase, AgentState } from './runtime/AgentState.js';
-export { AgentRouter, PresetName } from './service/AgentRouter.js';
 export * from './service/index.js';
 // ── Strategies ──
 export {
@@ -92,6 +91,5 @@ export {
   FanOutStrategy,
   SingleStrategy,
   Strategy,
-  StrategyRegistry,
 } from './strategies/index.js';
 export { PipelineStrategy } from './strategies/PipelineStrategy.js';

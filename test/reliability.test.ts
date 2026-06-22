@@ -13,6 +13,16 @@ describe('ReliabilityController retry & circuit breaker', () => {
     expect(c.circuitState).toBe('CLOSED');
   });
 
+  it('does not trip the circuit for programmer errors (code bugs, no status)', async () => {
+    const c = new ReliabilityController({ maxRetries: 0, circuitThreshold: 1 });
+    // A TypeError is a deterministic bug, not a service outage; it must not count
+    // toward the breaker even though it carries no HTTP status.
+    const bug = new TypeError("Cannot read properties of undefined (reading 'x')");
+    await expect(c.run(() => Promise.reject(bug), 0, 1)).rejects.toBeInstanceOf(TypeError);
+    expect(c.circuitFailures).toBe(0);
+    expect(c.circuitState).toBe('CLOSED');
+  });
+
   it('classifies timeout as retryable and opens the circuit', async () => {
     const c = new ReliabilityController({ maxRetries: 0, circuitThreshold: 1 });
     const timeoutError = Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });

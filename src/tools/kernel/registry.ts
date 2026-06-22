@@ -62,6 +62,17 @@ export interface ToolResultMeta {
   compression?: { parser: string; ratio: number };
   tokensEstimate: number;
   durationMs: number;
+  /**
+   * The handler produced a degraded / partial result rather than a full one — e.g.
+   * a timeout-killed command's partial output. The adapter surfaces this on the
+   * per-call envelope diagnostics so the ordinary-output diagnosticSummary is honest.
+   */
+  degraded?: boolean;
+  /**
+   * The handler fell back to a secondary path to produce this result — e.g. a regex
+   * scan after the primary ripgrep search failed. Surfaced like {@link degraded}.
+   */
+  fallbackUsed?: boolean;
 }
 
 /** 工具返回值统一结构 */

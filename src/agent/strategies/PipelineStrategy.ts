@@ -26,7 +26,6 @@ import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
 import { Strategy } from './Strategy.js';
-import { StrategyRegistry } from './StrategyRegistry.js';
 
 // ───── Local Types for PipelineStrategy ──────────────────
 
@@ -1095,9 +1094,6 @@ export class PipelineStrategy extends Strategy {
     return null;
   }
 }
-
-// 自注册: 避免 strategies.js ↔ PipelineStrategy.js 循环依赖
-StrategyRegistry.register('pipeline', PipelineStrategy);
 
 function numberFromUnknown(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
