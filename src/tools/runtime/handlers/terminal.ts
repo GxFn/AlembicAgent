@@ -155,7 +155,10 @@ async function execInSandboxOrDirect(
     });
     return {
       ...result,
-      diagnostics: { sandboxed: true, fallbackUsed: false },
+      diagnostics: normalizeTerminalDiagnostics(result.diagnostics, {
+        sandboxed: true,
+        fallbackUsed: false,
+      }),
     };
   }
 
@@ -200,7 +203,12 @@ interface SandboxExecutorLike {
   exec(
     command: string,
     opts: { cwd: string; projectRoot: string; timeout: number; signal?: AbortSignal }
-  ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  ): Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    diagnostics?: Partial<TerminalExecutionDiagnostics>;
+  }>;
 }
 
 function combineOutput(stdout: string, stderr: string): string {
@@ -255,7 +263,30 @@ function withTerminalDiagnostics(text: string, diagnostics: TerminalExecutionDia
   if (!diagnostics.fallbackUsed && diagnostics.sandboxed) {
     return text;
   }
-  return `${text}\n\n[terminal diagnostic] ${formatTerminalDiagnostic(diagnostics)}`;
+  const reason = diagnostics.degradeReason ?? 'unknown';
+  return `${text}\n\n[unsandboxed:${reason}] ${formatTerminalDiagnostic(diagnostics)}`;
+}
+
+function normalizeTerminalDiagnostics(
+  diagnostics: Partial<TerminalExecutionDiagnostics> | undefined,
+  fallback: TerminalExecutionDiagnostics
+): TerminalExecutionDiagnostics {
+  if (!diagnostics) {
+    return fallback;
+  }
+  return {
+    sandboxed:
+      typeof diagnostics.sandboxed === 'boolean' ? diagnostics.sandboxed : fallback.sandboxed,
+    fallbackUsed:
+      typeof diagnostics.fallbackUsed === 'boolean'
+        ? diagnostics.fallbackUsed
+        : fallback.fallbackUsed,
+    ...(typeof diagnostics.degradeReason === 'string'
+      ? { degradeReason: diagnostics.degradeReason }
+      : fallback.degradeReason
+        ? { degradeReason: fallback.degradeReason }
+        : {}),
+  };
 }
 
 function formatTerminalDiagnostic(diagnostics: TerminalExecutionDiagnostics): string {

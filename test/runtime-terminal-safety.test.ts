@@ -227,6 +227,40 @@ describe('runtime terminal.exec safety', () => {
     expect(result.data).toBe('ok');
   });
 
+  it('preserves sandbox executor degradation diagnostics in the tool result', async () => {
+    const result = await runTerminalExec(
+      'pwd',
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async () => ({
+            stdout: 'ok\n',
+            stderr: '',
+            exitCode: 0,
+            diagnostics: {
+              sandboxed: false,
+              fallbackUsed: true,
+              degradeReason: 'seatbelt_unavailable',
+            },
+          }),
+        },
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    expect(String(result.data)).toContain('ok');
+    expect(String(result.data)).toContain('[unsandboxed:seatbelt_unavailable]');
+    expect(String(result.data)).toContain('sandboxed=false');
+    expect(String(result.data)).toContain('fallbackUsed=true');
+    expect(String(result.data)).toContain('degradeReason=seatbelt_unavailable');
+    expect(result._meta?.fallbackUsed).toBe(true);
+    expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+      code: 'terminal_sandbox_fallback',
+      message: 'sandboxed=false fallbackUsed=true degradeReason=seatbelt_unavailable',
+      stage: 'terminal.exec',
+      tool: 'terminal',
+    });
+  });
+
   it('surfaces sandbox fallback diagnostics when no sandbox executor is injected', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-terminal-safety-'));
     try {
@@ -237,6 +271,7 @@ describe('runtime terminal.exec safety', () => {
 
       expect(result.ok).toBe(true);
       expect(String(result.data)).toContain('ok');
+      expect(String(result.data)).toContain('[unsandboxed:missing_sandbox_executor]');
       expect(String(result.data)).toContain('sandboxed=false');
       expect(String(result.data)).toContain('fallbackUsed=true');
       expect(String(result.data)).toContain('degradeReason=missing_sandbox_executor');
