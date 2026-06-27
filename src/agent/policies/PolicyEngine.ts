@@ -76,7 +76,7 @@ export class PolicyEngine {
     }
 
     if (toolName === 'terminal' && typeof args?.bin === 'string') {
-      const check = safety.checkCommand(formatTerminalRunForSafetyPolicy(args));
+      const check = safety.checkCommand(formatTerminalExecForSafetyPolicy(args));
       if (!check.safe) {
         return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
       }
@@ -122,7 +122,7 @@ export class PolicyEngine {
   }
 }
 
-function formatTerminalRunForSafetyPolicy(args: Record<string, unknown>) {
+function formatTerminalExecForSafetyPolicy(args: Record<string, unknown>) {
   const commandArgs = Array.isArray(args.args)
     ? args.args.filter((arg): arg is string => typeof arg === 'string')
     : [];

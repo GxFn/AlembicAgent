@@ -53,11 +53,10 @@ const BOUNDARY_ENTRIES = [
   {
     area: 'terminal-sandbox',
     owner: 'agent',
-    publicSubpath: '@alembic/agent/tools/terminal',
-    summary:
-      'Terminal capability manifests, policy input builders, policy evaluators, and sessions.',
-    agentOwns: ['terminal capability manifests', 'policy evaluators', 'session plan contracts'],
-    hostOwns: ['real process or PTY execution', 'sandbox enforcement', 'terminal persistence'],
+    publicSubpath: '@alembic/agent/tools/runtime',
+    summary: 'Live terminal.exec runtime handler, sandbox diagnostics, and audit envelope.',
+    agentOwns: ['terminal.exec handler contract', 'sandbox diagnostics', 'audit metadata'],
+    hostOwns: ['real process execution', 'sandbox enforcement', 'approval UI'],
     coreContracts: ['@alembic/core/host-agent-workflows'],
   },
   {

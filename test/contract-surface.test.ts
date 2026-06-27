@@ -69,7 +69,7 @@ describe('explicit AlembicAgent contract subpaths', () => {
 
     expect(runtime.getAgentRuntimeBoundaryEntry('terminal-sandbox')).toMatchObject({
       owner: 'agent',
-      publicSubpath: '@alembic/agent/tools/terminal',
+      publicSubpath: '@alembic/agent/tools/runtime',
       coreContracts: ['@alembic/core/host-agent-workflows'],
     });
     expect(runtime.getAgentRuntimeBoundaryEntry('host-agent-route')).toMatchObject({

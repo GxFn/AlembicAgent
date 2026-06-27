@@ -1,7 +1,6 @@
 export * from './catalog/CapabilityCatalog.js';
 export * from './catalog/CapabilityManifest.js';
 export * from './catalog/UnifiedToolCatalog.js';
-export * from './core/LightweightRouter.js';
 export * from './kernel/context.js';
 export * from './kernel/decision.js';
 export * from './kernel/handler.js';
@@ -11,5 +10,4 @@ export * from './kernel/result.js';
 export * from './kernel/routing.js';
 export * from './runtime/capabilities/index.js';
 export * from './runtime/index.js';
-export * from './terminal/index.js';
 export * from './workflow/WorkflowRegistry.js';

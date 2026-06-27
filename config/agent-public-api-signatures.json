@@ -13,7 +13,6 @@
     "./profiles",
     "./ai",
     "./tools/runtime",
-    "./tools/terminal",
     "./memory",
     "./context"
   ],
@@ -26,12 +25,12 @@
       "Unlisted package subpaths remain forbidden even if dist files exist."
     ]
   },
-  "packageExportCount": 13,
+  "packageExportCount": 12,
   "stableExportSignatures": {
     ".": {
       "exportPath": ".",
-      "exportCount": 182,
-      "signatureHash": "25866f09e4004166f6ecf3cb9fc051936620a92b0735387f94afed5cab1aff2f",
+      "exportCount": 160,
+      "signatureHash": "7dcc10b0e1ead4f004cc641218d655568d20adfef77b24db75ecf579d372a2ce",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -230,10 +229,6 @@
           "kind": "class"
         },
         {
-          "name": "LightweightRouter",
-          "kind": "class"
-        },
-        {
           "name": "MEMORY_STORE_REQUIRED_COLUMNS",
           "kind": "array"
         },
@@ -390,38 +385,6 @@
           "kind": "class"
         },
         {
-          "name": "TERMINAL_CAPABILITY_MANIFESTS",
-          "kind": "array"
-        },
-        {
-          "name": "TERMINAL_PTY_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_RUN_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SCRIPT_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_CLEANUP_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_CLOSE_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_STATUS_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SHELL_CAPABILITY",
-          "kind": "object"
-        },
-        {
           "name": "TOOL_REGISTRY",
           "kind": "object"
         },
@@ -466,26 +429,6 @@
           "kind": "function"
         },
         {
-          "name": "buildTerminalCommandPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalPtyPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalScriptPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalSessionPlan",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalShellPolicyInput",
-          "kind": "function"
-        },
-        {
           "name": "cleanOutput",
           "kind": "function"
         },
@@ -518,39 +461,7 @@
           "kind": "function"
         },
         {
-          "name": "envelopeForError",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForPolicyBlock",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForSessionResult",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForTerminalResult",
-          "kind": "function"
-        },
-        {
           "name": "estimateTokens",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalCommandPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalPtyPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalScriptPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalShellPolicy",
           "kind": "function"
         },
         {
@@ -1786,97 +1697,6 @@
         },
         {
           "name": "truncateOutput",
-          "kind": "function"
-        }
-      ]
-    },
-    "./tools/terminal": {
-      "exportPath": "./tools/terminal",
-      "exportCount": 21,
-      "signatureHash": "8e82b16be5de7dbecb8a5159b8316d48e87ef441fb5d31e9fb7abb3581c4dcbb",
-      "entries": [
-        {
-          "name": "TERMINAL_CAPABILITY_MANIFESTS",
-          "kind": "array"
-        },
-        {
-          "name": "TERMINAL_PTY_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_RUN_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SCRIPT_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_CLEANUP_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_CLOSE_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SESSION_STATUS_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "TERMINAL_SHELL_CAPABILITY",
-          "kind": "object"
-        },
-        {
-          "name": "buildTerminalCommandPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalPtyPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalScriptPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalSessionPlan",
-          "kind": "function"
-        },
-        {
-          "name": "buildTerminalShellPolicyInput",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForError",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForPolicyBlock",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForSessionResult",
-          "kind": "function"
-        },
-        {
-          "name": "envelopeForTerminalResult",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalCommandPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalPtyPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalScriptPolicy",
-          "kind": "function"
-        },
-        {
-          "name": "evaluateTerminalShellPolicy",
           "kind": "function"
         }
       ]

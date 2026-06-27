@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard, deep dist/src, or host-owned adapter imports are allowed.",
   "expectedCounts": {
-    "stable-public": 13,
+    "stable-public": 12,
     "provisional-public": 0,
     "transitional-internal": 0,
     "forbidden": 0
@@ -18,7 +18,6 @@
     "./profiles",
     "./ai",
     "./tools/runtime",
-    "./tools/terminal",
     "./memory",
     "./context"
   ],
@@ -28,13 +27,14 @@
     "@alembic/agent/dist/*",
     "@alembic/agent/src/*",
     "@alembic/agent/*/*/*",
-    "@alembic/agent/tools"
+    "@alembic/agent/tools",
+    "@alembic/agent/tools/terminal"
   ],
   "forbiddenConsumerSpecifierSamples": [
     {
       "specifier": "@alembic/agent/tools",
       "matches": "@alembic/agent/tools",
-      "reason": "Aggregate tools subpath was retired in Train B IC3 after all consumers migrated to the @alembic/agent root facade; use the root facade or the fine-grained ./tools/runtime and ./tools/terminal exports."
+      "reason": "Aggregate tools subpath was retired in Train B IC3 after all consumers migrated to the @alembic/agent root facade; use the root facade or the fine-grained ./tools/runtime export."
     },
     {
       "specifier": "@alembic/agent/dist/index.js",
@@ -54,7 +54,12 @@
     {
       "specifier": "@alembic/agent/tools/terminal/session/index.js",
       "matches": "@alembic/agent/*/*/*",
-      "reason": "Only @alembic/agent/tools/terminal is public; terminal session internals stay Agent-owned."
+      "reason": "Terminal session internals were retired with the terminal public subpath; use @alembic/agent/tools/runtime for live terminal.exec."
+    },
+    {
+      "specifier": "@alembic/agent/tools/terminal",
+      "matches": "@alembic/agent/tools/terminal",
+      "reason": "Terminal capability/session/policy contracts were retired in E-3; live terminal.exec remains public through @alembic/agent/tools/runtime."
     },
     {
       "specifier": "@alembic/agent/service/internal/foo.js",
@@ -132,13 +137,6 @@
       "contract": "Tool V2 router, cache, compressor, parser, capability catalog, and adapter contract.",
       "agentOwned": ["generic ToolRouter", "DeltaCache/SearchCache", "OutputCompressor", "ToolRouterAdapter contract"],
       "hostOwnedAdapterBoundary": "Host owns ToolContextFactory inputs, external executor wiring, sandbox bridge, and UI/daemon call surfaces."
-    },
-    {
-      "export": "./tools/terminal",
-      "specifier": "@alembic/agent/tools/terminal",
-      "contract": "Terminal capability manifests, policy builders/evaluators, session contract, and portable result envelopes.",
-      "agentOwned": ["terminal capability manifests", "terminal policy evaluators", "session plan contract", "result envelopes"],
-      "hostOwnedAdapterBoundary": "Host owns real process/PTY execution, sandbox enforcement, approval UI, and terminal persistence storage."
     },
     {
       "export": "./memory",

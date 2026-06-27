@@ -238,7 +238,7 @@ export function buildEvolverPrompt(
       `- 当前终端能力档位: ${String(terminalCapability.toolset || 'terminal-exec')}；终端只用于验证工程命令事实`
     );
     parts.push('- 使用 terminal({ action: "exec" }) 执行验证命令');
-    parts.push('- Evolution 阶段默认不使用 terminal_pty');
+    parts.push('- Evolution 阶段仅提供 exec-only 终端能力');
     parts.push('- 禁止 install、网络操作、写项目文件、删除、sudo、后台 daemon');
     parts.push('');
   }

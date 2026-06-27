@@ -9,6 +9,8 @@ import { AiProvider } from '../src/ai/AiProvider.js';
 // keep returning zero hits outside deletion notes and policy entries.
 const retiredAggregateExport = ['./to', 'ols'].join('');
 const retiredAggregateSpecifier = ['@alembic/agent/to', 'ols'].join('');
+const retiredTerminalExport = ['./tools', '/terminal'].join('');
+const retiredTerminalSpecifier = ['@alembic/agent/tools', '/terminal'].join('');
 const removedEnrichMember = ['enrich', 'Candidates'].join('');
 const removedEnrichPromptBuilder = ['_buildEnrich', 'Prompt'].join('');
 const removedLangInstructionBuilder = ['_buildLang', 'Instruction'].join('');
@@ -17,18 +19,18 @@ function readRepoJson(relativePath: string): Record<string, unknown> {
   return JSON.parse(readFileSync(new URL(`../${relativePath}`, import.meta.url), 'utf8'));
 }
 
-describe('retired tools aggregate export (Train B IC3)', () => {
-  it('keeps the aggregate subpath out of package exports while fine-grained facades stay', () => {
+describe('retired tool package exports', () => {
+  it('keeps retired aggregate and terminal subpaths out of package exports', () => {
     const packageJson = readRepoJson('package.json');
     const exportPaths = Object.keys(packageJson.exports as Record<string, unknown>);
 
     expect(exportPaths).not.toContain(retiredAggregateExport);
+    expect(exportPaths).not.toContain(retiredTerminalExport);
     expect(exportPaths).toContain('./tools/runtime');
-    expect(exportPaths).toContain('./tools/terminal');
     expect(exportPaths).toContain('.');
   });
 
-  it('keeps the aggregate subpath out of the boundary policy and signature snapshot', () => {
+  it('keeps retired subpaths out of the boundary policy and signature snapshot', () => {
     const boundary = readRepoJson('config/agent-public-api-boundary.json');
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const boundaryStable = boundary.stablePublicExports as string[];
@@ -37,11 +39,15 @@ describe('retired tools aggregate export (Train B IC3)', () => {
     const expectedCounts = boundary.expectedCounts as Record<string, number>;
 
     expect(boundaryStable).not.toContain(retiredAggregateExport);
+    expect(boundaryStable).not.toContain(retiredTerminalExport);
     expect(signatureStable).not.toContain(retiredAggregateExport);
+    expect(signatureStable).not.toContain(retiredTerminalExport);
     expect(Object.keys(signatureEntries)).not.toContain(retiredAggregateExport);
-    expect(expectedCounts['stable-public']).toBe(13);
-    expect(signatures.packageExportCount).toBe(13);
+    expect(Object.keys(signatureEntries)).not.toContain(retiredTerminalExport);
+    expect(expectedCounts['stable-public']).toBe(12);
+    expect(signatures.packageExportCount).toBe(12);
     expect(boundary.forbiddenConsumerSpecifiers as string[]).toContain(retiredAggregateSpecifier);
+    expect(boundary.forbiddenConsumerSpecifiers as string[]).toContain(retiredTerminalSpecifier);
   });
 
   it('routes the tool-execution boundary and consumer seams through the root facade', () => {
@@ -53,6 +59,14 @@ describe('retired tools aggregate export (Train B IC3)', () => {
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerSeams).not.toContain(
       retiredAggregateSpecifier
     );
+    expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerSeams).not.toContain(
+      retiredTerminalSpecifier
+    );
+    expect(
+      ALEMBIC_AGENT_RUNTIME_BOUNDARY.entries.find((entry) => entry.area === 'terminal-sandbox')
+    ).toMatchObject({
+      publicSubpath: '@alembic/agent/tools/runtime',
+    });
     expect(ALEMBIC_AGENT_INTERFACE_CONTRACT.alembicConsumerSeams).toContain('@alembic/agent');
   });
 });

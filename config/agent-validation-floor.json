@@ -10,7 +10,7 @@
   },
   "minimumTestFiles": 34,
   "minimumDeclaredTestCases": 241,
-  "stablePublicExportCount": 13,
+  "stablePublicExportCount": 12,
   "coreReferenceLimitTotal": 52,
   "minimumPackEntries": 432,
   "requiredCoverageSuites": [
@@ -37,10 +37,6 @@
     {
       "name": "v2 terminal cancellation",
       "pattern": "routes V2 terminal cancellation as a structured partial timeout result"
-    },
-    {
-      "name": "terminal session execution",
-      "pattern": "leases persistent terminal sessions for execution and releases portable records"
     },
     {
       "name": "provider malformed body",

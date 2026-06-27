@@ -23,7 +23,7 @@ import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// The 13 exact public exports (G5 boundary) as dist entry files.
+// The 12 exact public exports (G5 boundary) as dist entry files.
 const FACADE_DIST_FILES = [
   'dist/index.js',
   'dist/agent/index.js',
@@ -35,7 +35,6 @@ const FACADE_DIST_FILES = [
   'dist/agent/profiles/index.js',
   'dist/ai/index.js',
   'dist/tools/runtime/index.js',
-  'dist/tools/terminal/index.js',
   'dist/agent/memory/index.js',
   'dist/agent/context/index.js',
 ];
@@ -59,7 +58,7 @@ describe('entrypoint effects (AD6 inflow/outflow audit)', () => {
     vi.unstubAllGlobals();
   });
 
-  it('importing all 14 package facades performs zero filesystem work in cwd', () => {
+  it('importing all 12 package facades performs zero filesystem work in cwd', () => {
     const distRoot = path.join(repoRoot, FACADE_DIST_FILES[0]);
     if (!fs.existsSync(distRoot)) {
       throw new Error('dist/ missing — run npm run build first (npm run check builds it)');

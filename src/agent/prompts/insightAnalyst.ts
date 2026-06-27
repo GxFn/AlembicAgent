@@ -489,7 +489,7 @@ note_finding({ finding: "发现描述", evidence: "完整相对路径:行号", i
 - 终端是可选的代码分析证据工具，不是必调工具
 - 默认先用全景数据、graph({ action: "query" })、code({ action: "search" })、code({ action: "read" })
 - 需要确认工程事实时优先 terminal({ action: "exec" })
-- 只有命令依赖 TTY transcript 时才用 terminal_pty
+- 当前仅提供 exec-only 终端能力，不提供 shell 或 PTY 工具
 - 禁止 install、网络操作、写项目文件、删除、chmod/chown、sudo、后台 daemon`);
   }
 
