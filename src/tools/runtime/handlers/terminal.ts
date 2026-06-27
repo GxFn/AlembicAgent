@@ -18,7 +18,7 @@ import {
   estimateTokens,
   fail,
   ok,
-  type ToolAuditEvent,
+  type ToolAuditEntry,
   type ToolContext,
   type ToolResult,
   type ToolResultMeta,
@@ -41,22 +41,25 @@ export async function handle(
 }
 
 async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-  const command = params.command as string;
-  if (!command || typeof command !== 'string') {
-    return fail('terminal.exec requires command');
-  }
+  const command = typeof params.command === 'string' ? params.command : '';
 
   const startMs = Date.now();
   const commandHash = hashCommand(command);
-  const finish = async (result: ToolResult, auditResult: ToolAuditEvent['result']) => {
-    await recordTerminalAudit(ctx, {
-      action: 'terminal.exec',
-      result: auditResult,
-      durationMs: result._meta?.durationMs ?? Date.now() - startMs,
-      commandHash,
-    });
+  const finish = async (result: ToolResult, auditResult: ToolAuditEntry['result']) => {
+    await recordTerminalAudit(
+      ctx,
+      buildTerminalAuditEntry(ctx, {
+        result: auditResult,
+        duration: result._meta?.durationMs ?? Date.now() - startMs,
+        commandHash,
+      })
+    );
     return result;
   };
+
+  if (!command) {
+    return finish(fail('terminal.exec requires command'), 'failure');
+  }
 
   const cwdResult = resolveTerminalCwd(params.cwd, ctx.projectRoot);
   if (!cwdResult.ok) {
@@ -263,13 +266,37 @@ function formatTerminalDiagnostic(diagnostics: TerminalExecutionDiagnostics): st
   ].join(' ');
 }
 
-async function recordTerminalAudit(ctx: ToolContext, event: ToolAuditEvent): Promise<void> {
+function buildTerminalAuditEntry(
+  ctx: ToolContext,
+  input: Pick<ToolAuditEntry, 'result' | 'duration'> & { commandHash: string }
+): ToolAuditEntry {
+  return {
+    requestId: `terminal.exec:${input.commandHash.slice(0, 12)}`,
+    actor: typeof ctx.runtime?.agentId === 'string' ? ctx.runtime.agentId : 'alembic-agent',
+    action: 'terminal.exec',
+    resource: 'terminal.exec',
+    result: input.result,
+    ...(input.result === 'failure' ? { error: 'terminal.exec failed' } : {}),
+    duration: input.duration,
+    data: { commandHash: input.commandHash },
+    context: {
+      surface: 'runtime',
+      source: 'alembic-agent',
+      ...(typeof ctx.runtime?.presetName === 'string'
+        ? { presetName: ctx.runtime.presetName }
+        : {}),
+      ...(typeof ctx.runtime?.iteration === 'number' ? { iteration: ctx.runtime.iteration } : {}),
+    },
+  };
+}
+
+async function recordTerminalAudit(ctx: ToolContext, entry: ToolAuditEntry): Promise<void> {
   const sink = ctx.auditSink;
-  if (!sink || typeof sink.record !== 'function') {
+  if (!sink || typeof sink.log !== 'function') {
     return;
   }
   try {
-    await Promise.resolve(sink.record(event));
+    await Promise.resolve(sink.log(entry));
   } catch {
     // Audit failures must not alter the terminal tool result.
   }

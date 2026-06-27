@@ -132,7 +132,7 @@ export interface ToolContext {
   /** Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入，未注入时降级为 plain exec */
   sandboxExecutor?: unknown;
 
-  /** Optional audit sink. Handlers use the small duck-typed record() surface only. */
+  /** Optional audit sink. Mirrors the host AuditLogger.log(entry) duck type. */
   auditSink?: ToolAuditSinkLike;
 
   // ── 轻量级工具组件 (通过 DI 接口约束) ──
@@ -174,15 +174,20 @@ export interface ToolDiagnosticWarning {
   tool?: string;
 }
 
-export interface ToolAuditEvent {
+export interface ToolAuditEntry {
+  requestId: string;
+  actor: string;
   action: string;
+  resource: string;
   result: 'success' | 'failure';
-  durationMs: number;
-  commandHash: string;
+  error?: string;
+  duration: number;
+  data: { commandHash: string };
+  context: Record<string, unknown>;
 }
 
 export interface ToolAuditSinkLike {
-  record(event: ToolAuditEvent): void | Promise<void>;
+  log(entry: ToolAuditEntry): void | Promise<void>;
 }
 
 /** action handler 函数签名 */

@@ -9,7 +9,7 @@ export type {
   SearchCacheLike,
   SessionStoreLike,
   ToolAction,
-  ToolAuditEvent,
+  ToolAuditEntry,
   ToolAuditSinkLike,
   ToolContext,
   ToolDiagnosticWarning,

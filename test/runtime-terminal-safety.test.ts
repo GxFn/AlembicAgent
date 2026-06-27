@@ -41,12 +41,12 @@ describe('runtime terminal.exec safety', () => {
     const commands = ['sudo\twhoami', '"sudo" whoami', "'sudo' whoami", '/usr/bin/sudo whoami'];
 
     for (const command of commands) {
-      const auditEvents: unknown[] = [];
+      const auditEntries: unknown[] = [];
       let executorCalls = 0;
       const result = await runTerminalExec(
         command,
         baseToolContext({
-          auditSink: { record: (event) => auditEvents.push(event) },
+          auditSink: { log: (entry) => auditEntries.push(entry) },
           sandboxExecutor: {
             exec: async () => {
               executorCalls++;
@@ -59,13 +59,14 @@ describe('runtime terminal.exec safety', () => {
       expect(result.ok).toBe(false);
       expect(result.error).toContain('Command blocked');
       expect(executorCalls).toBe(0);
-      expect(auditEvents).toHaveLength(1);
-      expect(auditEvents[0]).toMatchObject({
+      expect(auditEntries).toHaveLength(1);
+      expect(auditEntries[0]).toMatchObject({
         action: 'terminal.exec',
+        resource: 'terminal.exec',
         result: 'failure',
-        commandHash: sha256(command),
+        data: { commandHash: sha256(command) },
       });
-      expect(JSON.stringify(auditEvents[0])).not.toContain(command);
+      expect(JSON.stringify(auditEntries[0])).not.toContain(command);
     }
   });
 
@@ -112,11 +113,13 @@ describe('runtime terminal.exec safety', () => {
   });
 
   it('rejects cwd siblings instead of trusting string prefixes', async () => {
+    const auditEntries: unknown[] = [];
     let executorCalls = 0;
     const result = await runTerminalExec(
       'pwd',
       baseToolContext({
         projectRoot: '/tmp/alembic-agent-terminal-root',
+        auditSink: { log: (entry) => auditEntries.push(entry) },
         sandboxExecutor: {
           exec: async () => {
             executorCalls++;
@@ -130,15 +133,21 @@ describe('runtime terminal.exec safety', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toContain('cwd must be within project root');
     expect(executorCalls).toBe(0);
+    expect(auditEntries).toHaveLength(1);
+    expect(auditEntries[0]).toMatchObject({
+      action: 'terminal.exec',
+      result: 'failure',
+      data: { commandHash: sha256('pwd') },
+    });
   });
 
   it('audits terminal.exec with a sha256 hash and no raw command text', async () => {
     const command = 'pwd';
-    const auditEvents: unknown[] = [];
+    const auditEntries: unknown[] = [];
     const result = await runTerminalExec(
       command,
       baseToolContext({
-        auditSink: { record: (event) => auditEvents.push(event) },
+        auditSink: { log: (entry) => auditEntries.push(entry) },
         sandboxExecutor: {
           exec: async () => ({ stdout: 'ok\n', stderr: '', exitCode: 0 }),
         },
@@ -146,19 +155,29 @@ describe('runtime terminal.exec safety', () => {
     );
 
     expect(result.ok).toBe(true);
-    expect(auditEvents).toHaveLength(1);
-    expect(Object.keys(auditEvents[0] as Record<string, unknown>).sort()).toEqual([
+    expect(auditEntries).toHaveLength(1);
+    expect(Object.keys(auditEntries[0] as Record<string, unknown>).sort()).toEqual([
       'action',
-      'commandHash',
-      'durationMs',
+      'actor',
+      'context',
+      'data',
+      'duration',
+      'requestId',
+      'resource',
       'result',
     ]);
-    expect(auditEvents[0]).toMatchObject({
+    expect(auditEntries[0]).toMatchObject({
       action: 'terminal.exec',
+      resource: 'terminal.exec',
       result: 'success',
-      commandHash: sha256(command),
+      data: { commandHash: sha256(command) },
+      context: {
+        surface: 'runtime',
+        source: 'alembic-agent',
+      },
     });
-    expect(JSON.stringify(auditEvents[0])).not.toContain(command);
+    expect((auditEntries[0] as { data?: unknown }).data).toEqual({ commandHash: sha256(command) });
+    expect(JSON.stringify(auditEntries[0])).not.toContain(command);
   });
 
   it('keeps audit sink failures non-fatal', async () => {
@@ -166,7 +185,7 @@ describe('runtime terminal.exec safety', () => {
       'pwd',
       baseToolContext({
         auditSink: {
-          record: () => {
+          log: () => {
             throw new Error('audit unavailable');
           },
         },
