@@ -14,6 +14,7 @@ describe('explicit AlembicAgent contract subpaths', () => {
     expect(typeof service.AgentProfileCompiler).toBe('function');
     expect(typeof service.AgentProfileRegistry).toBe('function');
     expect(typeof service.AgentStageFactoryRegistry).toBe('function');
+    expect(typeof service.runPlanAgent).toBe('function');
     expect(typeof service.runScanAgentTask).toBe('function');
   });
 

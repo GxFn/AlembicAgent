@@ -7,6 +7,7 @@ export {
   projectRelationDiscoveryResult,
   projectScanRunResult,
   runEvolutionAudit,
+  runPlanAgent,
   runRelationDiscovery,
   runScanAgentTask,
   runTranslationJson,

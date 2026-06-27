@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-06-12",
+  "generatedAt": "2026-06-27",
   "description": "AG4 stable public API signature smoke snapshot. Runtime smoke imports each stable package export and compares exact exported names plus runtime kind values.",
   "stablePublicExports": [
     ".",
@@ -31,8 +31,8 @@
     ".": {
       "exportPath": ".",
       "specifier": "@alembic/agent",
-      "exportCount": 180,
-      "signatureHash": "206f94160629627ba34a9da1d876b3c9f33dc21110e9b85818aae5d78affcccd",
+      "exportCount": 181,
+      "signatureHash": "79ebc49e9f440febbe505a383297990468a560f275c55f5d43013d0b3e970d7a",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -149,10 +149,6 @@
         {
           "name": "CapabilityRegistry",
           "kind": "object"
-        },
-        {
-          "name": "RuntimeCapability",
-          "kind": "class"
         },
         {
           "name": "Channel",
@@ -331,6 +327,14 @@
           "kind": "class"
         },
         {
+          "name": "RuntimeCapability",
+          "kind": "class"
+        },
+        {
+          "name": "RuntimeCapabilityCatalog",
+          "kind": "class"
+        },
+        {
           "name": "SEARCH_TOOLS",
           "kind": "object"
         },
@@ -375,15 +379,15 @@
           "kind": "class"
         },
         {
+          "name": "System",
+          "kind": "class"
+        },
+        {
           "name": "SystemInteraction",
           "kind": "class"
         },
         {
           "name": "SystemRunContextFactory",
-          "kind": "class"
-        },
-        {
-          "name": "System",
           "kind": "class"
         },
         {
@@ -431,15 +435,11 @@
           "kind": "class"
         },
         {
-          "name": "UnifiedToolCatalog",
-          "kind": "class"
-        },
-        {
-          "name": "RuntimeCapabilityCatalog",
-          "kind": "class"
-        },
-        {
           "name": "ToolRouterAdapter",
+          "kind": "class"
+        },
+        {
+          "name": "UnifiedToolCatalog",
           "kind": "class"
         },
         {
@@ -711,6 +711,10 @@
           "kind": "function"
         },
         {
+          "name": "runPlanAgent",
+          "kind": "function"
+        },
+        {
           "name": "runRelationDiscovery",
           "kind": "function"
         },
@@ -759,8 +763,8 @@
     "./agent": {
       "exportPath": "./agent",
       "specifier": "@alembic/agent/agent",
-      "exportCount": 53,
-      "signatureHash": "44a730edeefaa9edea93254ff5f8e3e35558696c04183e19d99dc8180317375a",
+      "exportCount": 54,
+      "signatureHash": "c782d8c8acd5db62d184f0068337ac7a56c3a28c57b68c9177ee38d5063f16f6",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -951,6 +955,10 @@
           "kind": "function"
         },
         {
+          "name": "runPlanAgent",
+          "kind": "function"
+        },
+        {
           "name": "runRelationDiscovery",
           "kind": "function"
         },
@@ -979,8 +987,8 @@
     "./service": {
       "exportPath": "./service",
       "specifier": "@alembic/agent/service",
-      "exportCount": 15,
-      "signatureHash": "1f25798ce16aed681e2863188fa5a137387bc04540775f35d7dd566eafff7eff",
+      "exportCount": 16,
+      "signatureHash": "b9f3cf7d3079a63fb6ecd103a91e3a7ff6abb60a75272037de3cbbdef063bc66",
       "entries": [
         {
           "name": "AgentProfileCompiler",
@@ -1024,6 +1032,10 @@
         },
         {
           "name": "runEvolutionAudit",
+          "kind": "function"
+        },
+        {
+          "name": "runPlanAgent",
           "kind": "function"
         },
         {
@@ -1659,10 +1671,6 @@
           "kind": "class"
         },
         {
-          "name": "RuntimeCapability",
-          "kind": "class"
-        },
-        {
           "name": "Conversation",
           "kind": "class"
         },
@@ -1676,6 +1684,14 @@
         },
         {
           "name": "OutputCompressor",
+          "kind": "class"
+        },
+        {
+          "name": "RuntimeCapability",
+          "kind": "class"
+        },
+        {
+          "name": "RuntimeCapabilityCatalog",
           "kind": "class"
         },
         {
@@ -1700,10 +1716,6 @@
         },
         {
           "name": "ToolRouter",
-          "kind": "class"
-        },
-        {
-          "name": "RuntimeCapabilityCatalog",
           "kind": "class"
         },
         {
