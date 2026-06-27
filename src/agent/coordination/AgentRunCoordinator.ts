@@ -25,6 +25,8 @@ export class AgentRunCoordinator {
   constructor() {
     this.registerPartitioner('bootstrapSessionDimensions', partitionBootstrapSessionDimensions);
     this.registerMerger('bootstrapSessionResults', mergeBootstrapSessionResults);
+    this.registerPartitioner('projectContextModules', partitionProjectContextModules);
+    this.registerMerger('moduleMiningResults', mergeModuleMiningResults);
   }
 
   registerPartitioner(name: string, partitioner: Partitioner) {
@@ -369,6 +371,103 @@ function partitionBootstrapSessionDimensions(
   });
 }
 
+function partitionProjectContextModules(
+  input: AgentRunInput,
+  profile: CompiledAgentProfile
+): AgentRunInput[] {
+  const modules = Array.isArray(input.params?.modules) ? input.params.modules : [];
+  if (modules.length === 0) {
+    throw new Error('moduleMining fan-out requires non-empty params.modules');
+  }
+  const baseParams = omitKeys(input.params || {}, [
+    'modules',
+    'dimensions',
+    'children',
+    'moduleSeeds',
+  ]);
+  const basePromptContext = omitKeys(input.context.promptContext || {}, [
+    'dimensions',
+    'dimensionId',
+    'dimId',
+  ]);
+  const baseMetadata = omitKeys(input.message.metadata || {}, [
+    'dimension',
+    'dimensionId',
+    'dimId',
+  ]);
+  const childProfileId = profile.concurrency?.childProfile || 'module-mining-dimension';
+  return modules.map((rawModule, index) => {
+    const moduleRecord = toRecord(rawModule);
+    const moduleId =
+      stringValue(moduleRecord.moduleId) ||
+      stringValue(moduleRecord.id) ||
+      stringValue(moduleRecord.modulePath) ||
+      stringValue(moduleRecord.path) ||
+      `module-${index}`;
+    const moduleName =
+      stringValue(moduleRecord.moduleName) ||
+      stringValue(moduleRecord.name) ||
+      stringValue(moduleRecord.label) ||
+      moduleId;
+    const ownedFiles =
+      stringArrayValue(moduleRecord.ownedFiles) ||
+      stringArrayValue(moduleRecord.files) ||
+      stringArrayValue(moduleRecord.paths) ||
+      [];
+    const childContext = input.context.childContexts?.[moduleId] || {};
+    const childMessage = toRecord(moduleRecord.message);
+    const childMetadata = toRecord(moduleRecord.metadata);
+    const childParams = toRecord(moduleRecord.params);
+    const tier = numberValue(moduleRecord.tier);
+    const profileRef = toProfileRef(moduleRecord.profile) || { id: childProfileId };
+    const promptContext = {
+      ...basePromptContext,
+      ...(childContext.promptContext || {}),
+      ...toRecord(moduleRecord.promptContext),
+      moduleId,
+      moduleName,
+      ownedFiles,
+    };
+    return {
+      profile: profileRef,
+      params: stripUndefined({
+        ...baseParams,
+        ...childParams,
+        moduleId,
+        moduleName,
+        ownedFiles,
+        ...(tier !== undefined ? { tier } : {}),
+      }),
+      message: {
+        role: (childMessage.role as AgentRunInput['message']['role']) || 'internal',
+        content:
+          stringValue(childMessage.content) ||
+          stringValue(moduleRecord.prompt) ||
+          `Module mining: ${moduleName}`,
+        history: Array.isArray(childMessage.history) ? childMessage.history : input.message.history,
+        metadata: stripUndefined({
+          ...baseMetadata,
+          ...childMetadata,
+          ...(tier !== undefined ? { tier } : {}),
+          moduleId,
+          moduleName,
+          phase: 'module-mining-child',
+        }),
+        sessionId: stringValue(childMessage.sessionId) || input.message.sessionId,
+      },
+      context: stripUndefined({
+        ...input.context,
+        ...childContext,
+        childContexts: undefined,
+        childInputFactories: undefined,
+        promptContext,
+      }) as unknown as AgentRunContext,
+      execution: input.execution,
+      presentation: input.presentation,
+    };
+  });
+}
+
 function mergeBootstrapSessionResults(
   results: AgentRunResult[],
   input: AgentRunInput,
@@ -385,6 +484,33 @@ function mergeBootstrapSessionResults(
       childResults: results,
       dimensionResults: Object.fromEntries(
         results.map((result, index) => [dimensionIds[index] || `dimension-${index}`, result])
+      ),
+    },
+  };
+}
+
+function mergeModuleMiningResults(
+  results: AgentRunResult[],
+  input: AgentRunInput,
+  profile: CompiledAgentProfile
+): AgentRunResult {
+  const modules = Array.isArray(input.params?.modules) ? input.params.modules : [];
+  const moduleIds = modules.map((moduleInput, index) => {
+    const moduleRecord = toRecord(moduleInput);
+    return (
+      stringValue(moduleRecord.moduleId) ||
+      stringValue(moduleRecord.id) ||
+      stringValue(moduleRecord.modulePath) ||
+      stringValue(moduleRecord.path) ||
+      `module-${index}`
+    );
+  });
+  return {
+    ...defaultMerge(results, profile),
+    phases: {
+      childResults: results,
+      moduleResults: Object.fromEntries(
+        results.map((result, index) => [moduleIds[index] || `module-${index}`, result])
       ),
     },
   };
@@ -418,6 +544,15 @@ function stringValue(value: unknown) {
 
 function numberValue(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function stringArrayValue(value: unknown) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.filter(
+    (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0
+  );
 }
 
 function omitKeys(input: Record<string, unknown>, keys: string[]) {

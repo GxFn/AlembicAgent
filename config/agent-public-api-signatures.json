@@ -30,9 +30,8 @@
   "stableExportSignatures": {
     ".": {
       "exportPath": ".",
-      "specifier": "@alembic/agent",
-      "exportCount": 181,
-      "signatureHash": "79ebc49e9f440febbe505a383297990468a560f275c55f5d43013d0b3e970d7a",
+      "exportCount": 182,
+      "signatureHash": "25866f09e4004166f6ecf3cb9fc051936620a92b0735387f94afed5cab1aff2f",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -711,6 +710,10 @@
           "kind": "function"
         },
         {
+          "name": "runModuleMining",
+          "kind": "function"
+        },
+        {
           "name": "runPlanAgent",
           "kind": "function"
         },
@@ -762,9 +765,8 @@
     },
     "./agent": {
       "exportPath": "./agent",
-      "specifier": "@alembic/agent/agent",
-      "exportCount": 54,
-      "signatureHash": "c782d8c8acd5db62d184f0068337ac7a56c3a28c57b68c9177ee38d5063f16f6",
+      "exportCount": 55,
+      "signatureHash": "582891528297c07d52ab3370f8e7ff2181ee7fa9747a1b3d292d243e8861d11d",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -955,6 +957,10 @@
           "kind": "function"
         },
         {
+          "name": "runModuleMining",
+          "kind": "function"
+        },
+        {
           "name": "runPlanAgent",
           "kind": "function"
         },
@@ -986,9 +992,8 @@
     },
     "./service": {
       "exportPath": "./service",
-      "specifier": "@alembic/agent/service",
-      "exportCount": 16,
-      "signatureHash": "b9f3cf7d3079a63fb6ecd103a91e3a7ff6abb60a75272037de3cbbdef063bc66",
+      "exportCount": 17,
+      "signatureHash": "84bae44a518c232c2de9c1453a4be3eb211da017c637bd64f3c3e672dc00acdb",
       "entries": [
         {
           "name": "AgentProfileCompiler",
@@ -1035,6 +1040,10 @@
           "kind": "function"
         },
         {
+          "name": "runModuleMining",
+          "kind": "function"
+        },
+        {
           "name": "runPlanAgent",
           "kind": "function"
         },
@@ -1058,7 +1067,6 @@
     },
     "./runtime": {
       "exportPath": "./runtime",
-      "specifier": "@alembic/agent/runtime",
       "exportCount": 69,
       "signatureHash": "977b1b95fda6d2893389d70c104c125a00aa30a5e113c598b83809b3b5cd5d6a",
       "entries": [
@@ -1342,7 +1350,6 @@
     },
     "./prompts": {
       "exportPath": "./prompts",
-      "specifier": "@alembic/agent/prompts",
       "exportCount": 27,
       "signatureHash": "9e7e4ac3ed25c92430b3bbb843b30cacb78e04daa4147378da78ead0b6cc1284",
       "entries": [
@@ -1458,7 +1465,6 @@
     },
     "./domain": {
       "exportPath": "./domain",
-      "specifier": "@alembic/agent/domain",
       "exportCount": 2,
       "signatureHash": "8eba8cdb7331e2968327cc3be2ef603abcb21c5e382f4d2bffdad84c61ff2559",
       "entries": [
@@ -1474,7 +1480,6 @@
     },
     "./tasks": {
       "exportPath": "./tasks",
-      "specifier": "@alembic/agent/tasks",
       "exportCount": 5,
       "signatureHash": "bd7000fae7f0b7c8a00243b7a376628089e3cabb22c3fc6dec5295cc39e0be83",
       "entries": [
@@ -1502,7 +1507,6 @@
     },
     "./profiles": {
       "exportPath": "./profiles",
-      "specifier": "@alembic/agent/profiles",
       "exportCount": 7,
       "signatureHash": "9a9002c9205acdc7a211a2c7a9777c87239cdb5dfd31a38eed34ead5094eb609",
       "entries": [
@@ -1538,7 +1542,6 @@
     },
     "./ai": {
       "exportPath": "./ai",
-      "specifier": "@alembic/agent/ai",
       "exportCount": 28,
       "signatureHash": "f02f8f3e1a64892c6ef42a413722b9f077ac7a9c076286567116ed112fadaf12",
       "entries": [
@@ -1658,7 +1661,6 @@
     },
     "./tools/runtime": {
       "exportPath": "./tools/runtime",
-      "specifier": "@alembic/agent/tools/runtime",
       "exportCount": 31,
       "signatureHash": "1869adfdb67f6d11c3d5fb001242e8e8c533d040f92610decbaba84d2ae73d0b",
       "entries": [
@@ -1790,7 +1792,6 @@
     },
     "./tools/terminal": {
       "exportPath": "./tools/terminal",
-      "specifier": "@alembic/agent/tools/terminal",
       "exportCount": 21,
       "signatureHash": "8e82b16be5de7dbecb8a5159b8316d48e87ef441fb5d31e9fb7abb3581c4dcbb",
       "entries": [
@@ -1882,7 +1883,6 @@
     },
     "./memory": {
       "exportPath": "./memory",
-      "specifier": "@alembic/agent/memory",
       "exportCount": 14,
       "signatureHash": "1f1dacd0e846c9dcb41be7a4b278528ab45455b3802a76560ac0f4b06920b66f",
       "entries": [
@@ -1946,7 +1946,6 @@
     },
     "./context": {
       "exportPath": "./context",
-      "specifier": "@alembic/agent/context",
       "exportCount": 20,
       "signatureHash": "66c6c9f329c57c087d722aa98adc312c87e080a9b6e45b893272747319d2105d",
       "entries": [
