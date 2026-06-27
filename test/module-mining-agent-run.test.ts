@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
 import { runModuleMining } from '../src/agent/runs/module/ModuleMiningAgentRun.js';
 import type {
@@ -7,6 +7,7 @@ import type {
   AgentRuntimeRunOptions,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 
 type RuntimeExecution = {
@@ -92,6 +93,46 @@ describe('runModuleMining', () => {
       expect(execution.options?.budgetOverride).toBe(budget);
       expect(execution.options?.sharedState).toBeUndefined();
     }
+  });
+
+  it('builds real module child pipeline prompts from moduleName-only ProjectContext payloads', async () => {
+    const providerPrompts: string[] = [];
+    const chatWithTools = vi.fn(async (prompt: string) => {
+      providerPrompts.push(prompt);
+      return {
+        text: 'module analyst summary',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      };
+    });
+    const agentService = new AgentService({
+      runtimeBuilder: new AgentRuntimeBuilder({
+        aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+        container: {},
+        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+      }),
+    });
+
+    const result = await runModuleMining({
+      agentService,
+      modules: [
+        {
+          moduleId: 'target:App:Sources/App',
+          moduleName: 'App',
+          modulePath: 'Sources/App',
+          ownedFiles: ['Sources/App/App.swift'],
+        },
+      ],
+      projectFacts: { project: 'BiliDili', fileCount: 42, lang: 'Swift' },
+      budget: { totalRecipeBudget: 1 },
+      scaleCap: 1,
+    });
+
+    expect(result.status).toBe('success');
+    expect(chatWithTools).toHaveBeenCalled();
+    expect(providerPrompts[0]).toContain('分析项目 BiliDili');
+    expect(providerPrompts[0]).toContain('模块 App');
+    expect(providerPrompts[0]).toContain('Sources/App/App.swift');
   });
 
   it('rejects empty module input before silent zero-fanout', async () => {

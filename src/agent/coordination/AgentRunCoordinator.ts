@@ -409,6 +409,7 @@ function partitionProjectContextModules(
       stringValue(moduleRecord.name) ||
       stringValue(moduleRecord.label) ||
       moduleId;
+    const modulePath = stringValue(moduleRecord.modulePath) || stringValue(moduleRecord.path);
     const ownedFiles =
       stringArrayValue(moduleRecord.ownedFiles) ||
       stringArrayValue(moduleRecord.files) ||
@@ -420,13 +421,38 @@ function partitionProjectContextModules(
     const childParams = toRecord(moduleRecord.params);
     const tier = numberValue(moduleRecord.tier);
     const profileRef = toProfileRef(moduleRecord.profile) || { id: childProfileId };
+    const projectInfo = buildModuleMiningProjectInfo(input.params?.projectFacts, ownedFiles);
+    const dimConfig = buildModuleMiningDimConfig(moduleRecord, {
+      moduleId,
+      moduleName,
+      modulePath,
+      ownedFiles,
+    });
+    const strategyContext = stripUndefined({
+      ...toRecord(input.context.strategyContext),
+      ...toRecord(childContext.strategyContext),
+      ...toRecord(moduleRecord.strategyContext),
+      projectFacts: input.params?.projectFacts,
+      projectInfo,
+      dimConfig,
+      moduleContext: stripUndefined({
+        moduleId,
+        moduleName,
+        modulePath,
+        ownedFiles,
+        module: moduleRecord,
+      }),
+    });
     const promptContext = {
       ...basePromptContext,
       ...(childContext.promptContext || {}),
       ...toRecord(moduleRecord.promptContext),
       moduleId,
       moduleName,
+      ...(modulePath ? { modulePath } : {}),
       ownedFiles,
+      projectInfo,
+      dimConfig,
     };
     return {
       profile: profileRef,
@@ -435,6 +461,7 @@ function partitionProjectContextModules(
         ...childParams,
         moduleId,
         moduleName,
+        modulePath,
         ownedFiles,
         ...(tier !== undefined ? { tier } : {}),
       }),
@@ -461,6 +488,7 @@ function partitionProjectContextModules(
         childContexts: undefined,
         childInputFactories: undefined,
         promptContext,
+        strategyContext,
       }) as unknown as AgentRunContext,
       execution: input.execution,
       presentation: input.presentation,
@@ -514,6 +542,77 @@ function mergeModuleMiningResults(
       ),
     },
   };
+}
+
+function buildModuleMiningProjectInfo(projectFacts: unknown, ownedFiles: string[]) {
+  const facts = toRecord(projectFacts);
+  const explicitProjectInfo = toRecord(facts.projectInfo);
+  const name =
+    stringValue(explicitProjectInfo.name) ||
+    stringValue(facts.project) ||
+    stringValue(facts.name) ||
+    stringValue(facts.projectName) ||
+    'ProjectContext';
+  const lang =
+    stringValue(explicitProjectInfo.lang) ||
+    stringValue(explicitProjectInfo.language) ||
+    stringValue(facts.lang) ||
+    stringValue(facts.language) ||
+    'unknown';
+  const fileCount =
+    numberValue(explicitProjectInfo.fileCount) ?? numberValue(facts.fileCount) ?? ownedFiles.length;
+
+  return {
+    ...explicitProjectInfo,
+    name,
+    lang,
+    fileCount,
+  };
+}
+
+function buildModuleMiningDimConfig(
+  moduleRecord: Record<string, unknown>,
+  {
+    moduleId,
+    moduleName,
+    modulePath,
+    ownedFiles,
+  }: {
+    moduleId: string;
+    moduleName: string;
+    modulePath?: string;
+    ownedFiles: string[];
+  }
+) {
+  const dimensions =
+    stringArrayValue(moduleRecord.dimensions) || stringArrayValue(moduleRecord.dimensionIds) || [];
+  const id =
+    stringValue(moduleRecord.dimensionId) ||
+    stringValue(moduleRecord.dimId) ||
+    dimensions[0] ||
+    `module:${moduleId}`;
+  const focusKeywords = [moduleName, modulePath, ...dimensions, ...ownedFiles.slice(0, 8)].filter(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0
+  );
+  const guideParts = [
+    `只分析 ProjectContext module "${moduleName}"。`,
+    `moduleId: ${moduleId}`,
+    modulePath ? `modulePath: ${modulePath}` : '',
+    ownedFiles.length > 0 ? `ownedFiles:\n${ownedFiles.map((file) => `- ${file}`).join('\n')}` : '',
+  ].filter(Boolean);
+
+  return stripUndefined({
+    id,
+    label: `模块 ${moduleName}`,
+    guide: guideParts.join('\n'),
+    focusKeywords,
+    outputType: stringValue(moduleRecord.outputType) || 'dual',
+    allowedKnowledgeTypes: stringArrayValue(moduleRecord.allowedKnowledgeTypes) || [
+      'rule',
+      'pattern',
+      'fact',
+    ],
+  });
 }
 
 function toProfileRef(value: unknown): AgentProfileRef | AgentProfileOverride | null {

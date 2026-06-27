@@ -84,7 +84,33 @@ function selectModulesForRun(modules: ModuleMiningModule[], scaleCap?: number) {
   if (selected.length === 0) {
     throw new Error('runModuleMining scaleCap selected zero ProjectContext modules');
   }
-  return selected;
+  return selected.map((moduleInput, index) => normalizeModuleInput(moduleInput, index));
+}
+
+function normalizeModuleInput(moduleInput: ModuleMiningModule, index: number) {
+  const moduleName =
+    readString(moduleInput.moduleName) ||
+    readString(moduleInput.name) ||
+    readString(moduleInput.modulePath) ||
+    readString(moduleInput.id) ||
+    readString(moduleInput.moduleId) ||
+    `module-${index}`;
+  const moduleId =
+    readString(moduleInput.moduleId) ||
+    readString(moduleInput.id) ||
+    readString(moduleInput.modulePath) ||
+    moduleName;
+  const ownedFiles = readStringArray(moduleInput.ownedFiles) || readStringArray(moduleInput.files);
+
+  return stripUndefined({
+    ...moduleInput,
+    moduleId,
+    id: readString(moduleInput.id) || moduleId,
+    moduleName,
+    name: moduleName,
+    ownedFiles,
+    files: readStringArray(moduleInput.files) || ownedFiles,
+  });
 }
 
 function buildModuleMiningPrompt({
@@ -109,4 +135,17 @@ function buildModuleMiningPrompt({
 
 function stripUndefined<T extends Record<string, unknown>>(input: T) {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
+
+function readString(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.filter(
+    (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0
+  );
 }
