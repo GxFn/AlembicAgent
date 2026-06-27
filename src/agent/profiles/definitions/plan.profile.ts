@@ -10,7 +10,7 @@ export const PLAN_PROFILES: AgentProfileDefinition[] = [
     defaults: {
       skills: [],
       policies: [
-        { type: 'budget', maxIterations: 1, maxTokens: 4096, temperature: 0.1, timeoutMs: 120_000 },
+        { type: 'budget', maxIterations: 2, maxTokens: 4096, temperature: 0.1, timeoutMs: 120_000 },
       ],
       persona: {
         description: [

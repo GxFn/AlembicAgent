@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AgentProfileRegistry } from '../src/agent/profiles/AgentProfileRegistry.js';
 import { parsePlanSelection, runPlanAgent } from '../src/agent/runs/plan/PlanAgentRun.js';
 import type { AgentRunInput, AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
+import { AgentService } from '../src/agent/service/AgentService.js';
 
 function agentRunResult(
   reply: string,
@@ -39,7 +41,7 @@ describe('plan-selection Agent profile', () => {
     expect(profile.defaults?.skills).toEqual([]);
     expect(profile.projection).toBe('json-object');
     expect(profile.defaults?.policies).toContainEqual(
-      expect.objectContaining({ type: 'budget', maxIterations: 1 })
+      expect.objectContaining({ type: 'budget', maxIterations: 2 })
     );
   });
 });
@@ -84,6 +86,37 @@ describe('runPlanAgent', () => {
     expect(calls[0]?.context).not.toHaveProperty('sharedState');
   });
 
+  it('performs one real no-tool LLM call before returning PlanSelection JSON', async () => {
+    const providerCalls: Array<{ prompt: string; opts?: Record<string, unknown> }> = [];
+    const chatWithTools = vi.fn(async (prompt: string, opts?: Record<string, unknown>) => {
+      providerCalls.push({ prompt, opts });
+      return {
+        text: selectionJson(['api']),
+        functionCalls: [],
+        usage: { inputTokens: 12, outputTokens: 8 },
+      };
+    });
+    const agentService = new AgentService({
+      runtimeBuilder: new AgentRuntimeBuilder({
+        aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+        container: {},
+        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+      }),
+    });
+
+    const result = await runPlanAgent({
+      agentService,
+      generationStage: 'coldStart',
+      projectContextFacts: { project: 'fixture', dimensions: ['api', 'domain'] },
+    });
+
+    expect(result.dimensions).toEqual(['api']);
+    expect(chatWithTools).toHaveBeenCalledTimes(1);
+    expect(providerCalls[0]?.prompt).toContain('generationStage=coldStart');
+    expect(providerCalls[0]?.opts?.toolChoice).toBeUndefined();
+    expect(providerCalls[0]?.opts?.toolSchemas).toBeUndefined();
+  });
+
   it('throws when the Agent run status is not success', async () => {
     const agentService = {
       run: async (_input: AgentRunInput) => agentRunResult('provider unavailable', 'error'),
@@ -100,6 +133,7 @@ describe('runPlanAgent', () => {
 
   it('throws on invalid JSON and invalid PlanSelection shape', () => {
     expect(() => parsePlanSelection('not json')).toThrow(/invalid JSON/u);
+    expect(() => parsePlanSelection('plain text before forced summary')).toThrow(/invalid JSON/u);
     expect(() =>
       parsePlanSelection(
         JSON.stringify({

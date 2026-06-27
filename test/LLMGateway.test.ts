@@ -41,6 +41,36 @@ describe('LLMGateway horizontal capabilities', () => {
     });
   });
 
+  it('preserves provider-prefixed model ids after the first colon', async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [{ message: { content: 'done' } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+          text: async () => '',
+        } as Response;
+      })
+    );
+
+    const gateway = new LLMGateway({
+      providers: { ollama: { apiKey: 'ollama', baseUrl: 'http://127.0.0.1:11434/v1' } },
+    });
+
+    await gateway.chatWithTools({
+      modelRef: 'ollama:gemma3:4b',
+      messages: [{ role: 'user', content: 'hi' }],
+      maxTokens: 64,
+    });
+
+    expect(requestBodies[0]?.model).toBe('gemma3:4b');
+  });
+
   it('chatStructured robustly extracts JSON wrapped in markdown fences', async () => {
     stubFetch({
       choices: [{ message: { content: '```json\n{"value": 42}\n```' } }],

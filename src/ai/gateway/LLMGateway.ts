@@ -269,8 +269,10 @@ export class LLMGateway {
   } {
     const registry = getModelRegistry();
 
-    if (modelRef.includes(':')) {
-      const [provider, model] = modelRef.split(':', 2);
+    const providerSeparator = modelRef.indexOf(':');
+    if (providerSeparator > 0) {
+      const provider = modelRef.slice(0, providerSeparator);
+      const model = modelRef.slice(providerSeparator + 1);
       const modelDef = registry.resolveOrCreate(provider as ProviderId, model);
       return {
         modelDef,
