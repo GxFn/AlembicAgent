@@ -73,6 +73,8 @@ export interface ToolResultMeta {
    * scan after the primary ripgrep search failed. Surfaced like {@link degraded}.
    */
   fallbackUsed?: boolean;
+  /** Optional warning diagnostics lifted by host adapters. */
+  diagnosticWarnings?: ToolDiagnosticWarning[];
 }
 
 /** 工具返回值统一结构 */
@@ -130,6 +132,9 @@ export interface ToolContext {
   /** Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入，未注入时降级为 plain exec */
   sandboxExecutor?: unknown;
 
+  /** Optional audit sink. Handlers use the small duck-typed record() surface only. */
+  auditSink?: ToolAuditSinkLike;
+
   // ── 轻量级工具组件 (通过 DI 接口约束) ──
 
   /** 文件读取增量缓存 */
@@ -160,6 +165,24 @@ export interface ToolContext {
 
   /** Runtime metadata from AgentRuntime, used by write tools to inject system-owned fields. */
   runtime?: ToolRuntimeCallContext;
+}
+
+export interface ToolDiagnosticWarning {
+  code: string;
+  message: string;
+  stage?: string;
+  tool?: string;
+}
+
+export interface ToolAuditEvent {
+  action: string;
+  result: 'success' | 'failure';
+  durationMs: number;
+  commandHash: string;
+}
+
+export interface ToolAuditSinkLike {
+  record(event: ToolAuditEvent): void | Promise<void>;
 }
 
 /** action handler 函数签名 */

@@ -52,10 +52,11 @@ const DEFAULT_TRUST: ToolResultTrust = {
 function diagnosticsFromResult(result: ToolResult): ToolResultDiagnostics {
   const degraded = result._meta?.degraded === true;
   const fallbackUsed = result._meta?.fallbackUsed === true;
-  if (!degraded && !fallbackUsed) {
+  const warnings = result._meta?.diagnosticWarnings ?? [];
+  if (!degraded && !fallbackUsed && warnings.length === 0) {
     return EMPTY_DIAGNOSTICS;
   }
-  return { ...EMPTY_DIAGNOSTICS, degraded, fallbackUsed };
+  return { ...EMPTY_DIAGNOSTICS, degraded, fallbackUsed, warnings };
 }
 
 export class ToolRouterAdapter implements ToolRouterContract {
