@@ -6,13 +6,17 @@
  * promptFragment 从注册表自动生成。
  */
 
-import type { CapabilityDef } from '#tools/kernel/registry.js';
+import type { CapabilityDef, TerminalCommandAllowlist } from '#tools/kernel/registry.js';
 import { TOOL_REGISTRY } from '../registry.js';
 import { Capability } from './Capability.js';
 
 export abstract class RuntimeCapability extends Capability {
   abstract get description(): string;
   abstract get allowedTools(): Record<string, string[]>;
+
+  get commandAllowlist(): TerminalCommandAllowlist | undefined {
+    return undefined;
+  }
 
   get tools(): string[] {
     return Object.keys(this.allowedTools);
@@ -23,11 +27,13 @@ export abstract class RuntimeCapability extends Capability {
   }
 
   toDef(): CapabilityDef {
+    const commandAllowlist = this.commandAllowlist;
     return {
       name: this.name,
       description: this.description,
       promptFragment: this.promptFragment,
       allowedTools: this.allowedTools,
+      ...(commandAllowlist ? { commandAllowlist } : {}),
     };
   }
 }

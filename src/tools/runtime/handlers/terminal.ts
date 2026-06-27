@@ -24,7 +24,7 @@ import {
   type ToolResultMeta,
 } from '#tools/kernel/registry.js';
 import { stripAnsi } from '../compressor/strip.js';
-import { checkTerminalCommandSafety } from './terminalSafety.js';
+import { checkTerminalCommandAllowlist, checkTerminalCommandSafety } from './terminalSafety.js';
 
 const execAsync = promisify(exec);
 const SANDBOX_FALLBACK_REASON = 'missing_sandbox_executor';
@@ -73,6 +73,18 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
   if (!securityCheck.safe) {
     return finish(
       fail(`Command blocked: ${securityCheck.block.reason} (${securityCheck.block.rule})`),
+      'failure'
+    );
+  }
+
+  const allowlistCheck = ctx.commandAllowlist
+    ? checkTerminalCommandAllowlist(command, ctx.commandAllowlist.bins)
+    : { safe: true as const };
+  if (!allowlistCheck.safe) {
+    return finish(
+      fail(
+        `Command blocked by allowlist: ${allowlistCheck.block.reason} (${allowlistCheck.block.rule})`
+      ),
       'failure'
     );
   }

@@ -65,10 +65,16 @@ export class ToolRouter {
         await this.#acquireToolLock(call.tool);
       }
 
-      ctx.toolRegistry = TOOL_REGISTRY;
+      const handlerCtx: ToolContext = {
+        ...ctx,
+        toolRegistry: TOOL_REGISTRY,
+        ...(this.#config.capability
+          ? { commandAllowlist: this.#config.capability.commandAllowlist }
+          : {}),
+      };
 
       try {
-        const result = await action.handler(call.params, ctx);
+        const result = await action.handler(call.params, handlerCtx);
 
         if (result._meta) {
           result._meta.durationMs = Date.now() - startMs;

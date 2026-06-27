@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
+  Evolution,
   OutputCompressor,
   parseGitStatusOutput,
   RuntimeCapabilityCatalog,
@@ -69,6 +70,32 @@ describe('Tool V2 contract exports', () => {
     expect(knowledgeParams.properties?.params?.properties).toHaveProperty('content');
     expect(knowledgeParams.properties?.params?.properties).toHaveProperty('reasoning');
     expect(metaParams.properties?.action?.enum).toEqual(['review']);
+  });
+
+  it('projects Evolution terminal access with a read-only command allowlist', () => {
+    const capability = new Evolution().toDef();
+    const router = new ToolRouter({ capability });
+    const schemas = router.getSchemas();
+    const terminal = schemas.find((schema) => schema.name === 'terminal');
+    const terminalParams = terminal?.parameters as {
+      properties?: { action?: { enum?: string[] } };
+    };
+
+    expect(capability.allowedTools.terminal).toEqual(['exec']);
+    expect(capability.commandAllowlist?.bins).toContain('git');
+    expect(capability.commandAllowlist?.bins).toContain('grep');
+    expect(capability.commandAllowlist?.bins).toContain('npm');
+    expect(capability.commandAllowlist?.bins).not.toContain('rm');
+    expect(capability.commandAllowlist?.intent).toEqual({
+      network: 'none',
+      filesystem: 'read-only',
+    });
+    expect(terminalParams.properties?.action?.enum).toEqual(['exec']);
+    expect(capability.promptFragment).toContain('git log');
+    expect(capability.promptFragment).toContain('grep');
+    expect(capability.promptFragment).toContain('npm test');
+    expect(capability.promptFragment).toContain('不提交新知识');
+    expect(capability.promptFragment).not.toContain('不使用终端工具');
   });
 
   it('exports generic delta and search cache contracts', () => {

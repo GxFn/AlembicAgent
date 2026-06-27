@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { ToolContext } from '../src/tools/runtime/index.js';
-import { ToolRouter } from '../src/tools/runtime/index.js';
+import { Evolution, ToolRouter } from '../src/tools/runtime/index.js';
 
 const projectRoot = '/tmp/alembic-agent-live-terminal-safety-root';
 
@@ -20,9 +20,9 @@ function baseToolContext(overrides: Partial<ToolContext> = {}): ToolContext {
 async function runTerminalExec(
   command: string,
   ctx: ToolContext,
-  params: Record<string, unknown> = {}
+  params: Record<string, unknown> = {},
+  router = new ToolRouter()
 ) {
-  const router = new ToolRouter();
   const parsed = router.parseToolCall('terminal', {
     action: 'exec',
     params: { command, ...params },
@@ -110,6 +110,92 @@ describe('runtime terminal.exec safety', () => {
     expect(result.ok).toBe(true);
     expect(result.data).toBe('ok');
     expect(calls).toEqual([{ command: 'pwd', cwd: projectRoot }]);
+  });
+
+  it('allows Evolution read-only terminal commands through the capability allowlist', async () => {
+    const router = new ToolRouter({ capability: new Evolution().toDef() });
+    const commands = [
+      'git log -n3',
+      'rg Recipe src',
+      'npm test -- test/example.test.ts',
+      'tsc --noEmit',
+    ];
+    const calls: string[] = [];
+
+    for (const command of commands) {
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async (seenCommand: string) => {
+              calls.push(seenCommand);
+              return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        router
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+    }
+
+    expect(calls).toEqual(commands);
+  });
+
+  it('blocks Evolution write, install, fix, and shell-meta commands before execution', async () => {
+    const commands = [
+      'sed -i s/a/b/g file.ts',
+      'echo ok > out.txt',
+      'git checkout main',
+      'git status && git log',
+      'grep Recipe src | tee out.txt',
+      'npm install',
+      'npm run lint:fix',
+      'node -e "console.log(1)"',
+      'find . -delete',
+    ];
+
+    for (const command of commands) {
+      let executorCalls = 0;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        new ToolRouter({ capability: new Evolution().toDef() })
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('Command blocked');
+      expect(executorCalls).toBe(0);
+    }
+  });
+
+  it('leaves terminal.exec behavior unchanged when no command allowlist is present', async () => {
+    const calls: string[] = [];
+    const result = await runTerminalExec(
+      'sed -i s/a/b/g file.ts',
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async (command: string) => {
+            calls.push(command);
+            return { stdout: 'legacy-ok\n', stderr: '', exitCode: 0 };
+          },
+        },
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toBe('legacy-ok');
+    expect(calls).toEqual(['sed -i s/a/b/g file.ts']);
   });
 
   it('rejects cwd siblings instead of trusting string prefixes', async () => {

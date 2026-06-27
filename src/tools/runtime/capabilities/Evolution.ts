@@ -2,7 +2,32 @@
  * 知识进化 — Agent 验证现有 Recipe 准确性并提出进化/废弃。
  */
 
+import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
 import { RuntimeCapability } from './RuntimeCapability.js';
+
+const EVOLUTION_READONLY_TERMINAL_ALLOWLIST: TerminalCommandAllowlist = {
+  bins: [
+    'git',
+    'npm',
+    'pnpm',
+    'yarn',
+    'tsc',
+    'node',
+    'eslint',
+    'biome',
+    'grep',
+    'rg',
+    'cat',
+    'ls',
+    'find',
+    'vitest',
+    'jest',
+    'head',
+    'tail',
+    'wc',
+  ],
+  intent: { network: 'none', filesystem: 'read-only' },
+};
 
 export class Evolution extends RuntimeCapability {
   get name() {
@@ -15,9 +40,14 @@ export class Evolution extends RuntimeCapability {
   get allowedTools() {
     return {
       code: ['search', 'read'],
+      terminal: ['exec'],
       knowledge: ['search', 'detail', 'manage'],
       graph: ['query'],
     };
+  }
+
+  get commandAllowlist() {
+    return EVOLUTION_READONLY_TERMINAL_ALLOWLIST;
   }
 
   get promptFragment() {
@@ -32,7 +62,8 @@ export class Evolution extends RuntimeCapability {
 
 关键规则:
 - 优先 skip_evolution，只有证据明确时才 evolve 或 deprecate
-- 不使用终端工具
+- 允许使用 terminal.exec 的只读 allowlist 命令取证，例如 git log/blame/diff/status、grep/rg、npm test、vitest run、tsc --noEmit、eslint/biome check
+- 使用终端证据时先验证 Recipe 是否仍符合代码与近期历史，再决定 evolve / deprecate / skip_evolution
 - 不提交新知识
 
 ${super.promptFragment}`;

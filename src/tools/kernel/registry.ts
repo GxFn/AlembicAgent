@@ -135,6 +135,9 @@ export interface ToolContext {
   /** Optional audit sink. Mirrors the host AuditLogger.log(entry) duck type. */
   auditSink?: ToolAuditSinkLike;
 
+  /** Optional positive command allowlist for read-mostly terminal capabilities. */
+  commandAllowlist?: TerminalCommandAllowlist;
+
   // ── 轻量级工具组件 (通过 DI 接口约束) ──
 
   /** 文件读取增量缓存 */
@@ -206,6 +209,15 @@ export interface CapabilityDef {
   description: string;
   promptFragment?: string;
   allowedTools: Record<string, string[]>;
+  commandAllowlist?: TerminalCommandAllowlist;
+}
+
+export interface TerminalCommandAllowlist {
+  bins: readonly string[];
+  intent?: {
+    network?: 'none';
+    filesystem?: 'read-only';
+  };
 }
 
 /* ------------------------------------------------------------------ */
