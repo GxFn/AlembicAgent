@@ -162,7 +162,6 @@ describe('runtime terminal.exec safety', () => {
       'context',
       'data',
       'duration',
-      'requestId',
       'resource',
       'result',
     ]);
@@ -177,7 +176,36 @@ describe('runtime terminal.exec safety', () => {
       },
     });
     expect((auditEntries[0] as { data?: unknown }).data).toEqual({ commandHash: sha256(command) });
+    expect(auditEntries[0]).not.toHaveProperty('requestId');
     expect(JSON.stringify(auditEntries[0])).not.toContain(command);
+  });
+
+  it('does not reuse command-hash request ids for repeated identical audits', async () => {
+    const command = 'pwd';
+    const auditEntries: Array<{ requestId?: string; data?: { commandHash?: string } }> = [];
+    const ctx = baseToolContext({
+      auditSink: { log: (entry) => auditEntries.push(entry) },
+      sandboxExecutor: {
+        exec: async () => ({ stdout: 'ok\n', stderr: '', exitCode: 0 }),
+      },
+    });
+
+    const first = await runTerminalExec(command, ctx);
+    const second = await runTerminalExec(command, ctx);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(auditEntries).toHaveLength(2);
+    expect(auditEntries.map((entry) => entry.data)).toEqual([
+      { commandHash: sha256(command) },
+      { commandHash: sha256(command) },
+    ]);
+    expect(auditEntries.map((entry) => entry.requestId)).toEqual([undefined, undefined]);
+    const persistenceIds = auditEntries.map(
+      (entry, index) => entry.requestId ?? `audit-logger-generated-${index}`
+    );
+    expect(new Set(persistenceIds).size).toBe(2);
+    expect(JSON.stringify(auditEntries)).not.toContain(command);
   });
 
   it('keeps audit sink failures non-fatal', async () => {

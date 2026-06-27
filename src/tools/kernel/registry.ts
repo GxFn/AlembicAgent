@@ -175,7 +175,7 @@ export interface ToolDiagnosticWarning {
 }
 
 export interface ToolAuditEntry {
-  requestId: string;
+  requestId?: string;
   actor: string;
   action: string;
   resource: string;

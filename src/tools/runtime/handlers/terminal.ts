@@ -271,7 +271,6 @@ function buildTerminalAuditEntry(
   input: Pick<ToolAuditEntry, 'result' | 'duration'> & { commandHash: string }
 ): ToolAuditEntry {
   return {
-    requestId: `terminal.exec:${input.commandHash.slice(0, 12)}`,
     actor: typeof ctx.runtime?.agentId === 'string' ? ctx.runtime.agentId : 'alembic-agent',
     action: 'terminal.exec',
     resource: 'terminal.exec',
