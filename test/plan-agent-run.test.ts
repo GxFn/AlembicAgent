@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import type { PlanModuleBinding, PlanStageId } from '@alembic/core/plans';
 import { describe, expect, it, vi } from 'vitest';
 import { AgentProfileRegistry } from '../src/agent/profiles/AgentProfileRegistry.js';
 import { parsePlanSelection, runPlanAgent } from '../src/agent/runs/plan/PlanAgentRun.js';
@@ -21,12 +22,29 @@ function agentRunResult(
   };
 }
 
-function selectionJson(dimensions: string[]) {
+const validModuleBinding: PlanModuleBinding = {
+  dimensions: ['api'],
+  moduleId: 'target:App:Sources/App',
+  moduleName: 'App',
+  modulePath: 'Sources/App',
+  priority: 1,
+  targetRecipes: 3,
+};
+
+function selectionJson({
+  dimensions,
+  generationStage = 'coldStart',
+  moduleBindings = [],
+}: {
+  dimensions: string[];
+  generationStage?: PlanStageId;
+  moduleBindings?: PlanModuleBinding[];
+}) {
   return JSON.stringify({
-    generationStage: 'coldStart',
+    generationStage,
     dimensions,
     scale: { totalRecipeBudget: 4, maxFiles: 120, contentMaxLines: 80 },
-    moduleBindings: [],
+    moduleBindings,
   });
 }
 
@@ -43,6 +61,10 @@ describe('plan-selection Agent profile', () => {
     expect(profile.defaults?.policies).toContainEqual(
       expect.objectContaining({ type: 'budget', maxIterations: 2 })
     );
+    expect(profile.defaults?.persona?.description).toContain(
+      'deepMining 和 moduleMining 必须输出真实 moduleBindings'
+    );
+    expect(profile.defaults?.persona?.description).not.toContain('"moduleBindings": []');
   });
 });
 
@@ -52,7 +74,7 @@ describe('runPlanAgent', () => {
     const agentService = {
       run: async (input: AgentRunInput) => {
         calls.push(input);
-        return agentRunResult(selectionJson(['api']));
+        return agentRunResult(selectionJson({ dimensions: ['api'] }));
       },
     };
 
@@ -91,7 +113,7 @@ describe('runPlanAgent', () => {
     const chatWithTools = vi.fn(async (prompt: string, opts?: Record<string, unknown>) => {
       providerCalls.push({ prompt, opts });
       return {
-        text: selectionJson(['api']),
+        text: selectionJson({ dimensions: ['api'] }),
         functionCalls: [],
         usage: { inputTokens: 12, outputTokens: 8 },
       };
@@ -115,6 +137,86 @@ describe('runPlanAgent', () => {
     expect(providerCalls[0]?.prompt).toContain('generationStage=coldStart');
     expect(providerCalls[0]?.opts?.toolChoice).toBeUndefined();
     expect(providerCalls[0]?.opts?.toolSchemas).toBeUndefined();
+  });
+
+  it('guides deepMining to bind selected dimensions to real ProjectContext modules', async () => {
+    const calls: AgentRunInput[] = [];
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult(
+          selectionJson({
+            dimensions: ['api'],
+            generationStage: 'deepMining',
+            moduleBindings: [validModuleBinding],
+          })
+        );
+      },
+    };
+
+    const projectContextFacts = {
+      dimensions: [{ id: 'api' }, { id: 'domain' }],
+      projectMapModules: [
+        {
+          moduleId: 'target:App:Sources/App',
+          moduleName: 'App',
+          modulePath: 'Sources/App',
+          ownedFiles: ['Sources/App/App.swift'],
+        },
+      ],
+    };
+
+    await expect(
+      runPlanAgent({
+        agentService,
+        generationStage: 'deepMining',
+        projectContextFacts,
+      })
+    ).resolves.toMatchObject({
+      generationStage: 'deepMining',
+      dimensions: ['api'],
+      moduleBindings: [validModuleBinding],
+    });
+
+    expect(calls[0]?.message.content).toContain('deepMining 阶段要求 moduleBindings 非空');
+    expect(calls[0]?.message.content).toContain('"modulePath": "Sources/App"');
+    expect(calls[0]?.message.content).toContain('"source": "projectMapModules"');
+  });
+
+  it('rejects deepMining and moduleMining selections without module bindings', async () => {
+    const agentService = {
+      run: async (_input: AgentRunInput) =>
+        agentRunResult(selectionJson({ dimensions: ['api'], generationStage: 'deepMining' })),
+    };
+
+    await expect(
+      runPlanAgent({
+        agentService,
+        generationStage: 'deepMining',
+        projectContextFacts: {
+          projectMapModules: [{ modulePath: 'Sources/App', moduleName: 'App' }],
+        },
+      })
+    ).rejects.toThrow(/deepMining requires moduleBindings/u);
+
+    expect(() =>
+      parsePlanSelection(selectionJson({ dimensions: ['api'], generationStage: 'moduleMining' }), {
+        expectedStage: 'moduleMining',
+      })
+    ).toThrow(/moduleMining requires moduleBindings/u);
+  });
+
+  it('rejects module bindings that reference dimensions outside the selected plan', () => {
+    expect(() =>
+      parsePlanSelection(
+        selectionJson({
+          dimensions: ['api'],
+          generationStage: 'deepMining',
+          moduleBindings: [{ ...validModuleBinding, dimensions: ['security'] }],
+        }),
+        { expectedStage: 'deepMining' }
+      )
+    ).toThrow(/unknown dimension security/u);
   });
 
   it('throws when the Agent run status is not success', async () => {
@@ -146,9 +248,14 @@ describe('runPlanAgent', () => {
     ).toThrow(/Invalid PlanSelection/u);
   });
 
-  it('allows one selected dimension and rejects an empty dimension list', () => {
-    expect(parsePlanSelection(selectionJson(['api'])).dimensions).toEqual(['api']);
-    expect(() => parsePlanSelection(selectionJson([]))).toThrow(/dimensions must be non-empty/u);
+  it('allows coldStart without module bindings and rejects an empty dimension list', () => {
+    expect(
+      parsePlanSelection(selectionJson({ dimensions: ['api'] }), { expectedStage: 'coldStart' })
+        .dimensions
+    ).toEqual(['api']);
+    expect(() =>
+      parsePlanSelection(selectionJson({ dimensions: [] }), { expectedStage: 'coldStart' })
+    ).toThrow(/dimensions must be non-empty/u);
   });
 
   it('does not import persistence or tool-action surfaces', () => {
