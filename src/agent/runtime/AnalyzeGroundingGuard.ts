@@ -16,7 +16,8 @@ import { isDeepSeekV4AnalyzeFirstBurn } from './ProviderToolChoicePolicy.js';
  *   evidenceStarterRefs）**不属本 guard**，保留为默认 analyze 上下文（有用 grounding 材料、非强制控制）。
  * - 依赖方向：guard 单向读 `ProviderToolChoicePolicy.isDeepSeekV4AnalyzeFirstBurn`（guard→provider 下行），
  *   provider 不依赖 guard（无反向 / 循环）。
- * - 行为对等：AP-2 仅迁移、不改行为；groundingEnforcement 默认开关是 AP-3，本阶段**暂仍开启**。
+ * - 行为对等：AP-2 仅迁移、不改行为；AP-3 已将 groundingEnforcement 默认切为 `'off'`。
+ *   本 guard 只在 runtime 默认或 per-run override 显式 opt-in 为 `'guard'` 时注入政策文本并触发阻断。
  *
  * block/nudge/rollback 的**应用**（appendUserNudge / rollbackTick / 诊断 / 进度事件）仍由 AgentRuntime
  * 主循环执行；本 guard 只产出决策。

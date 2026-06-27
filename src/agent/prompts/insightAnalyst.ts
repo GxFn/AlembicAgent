@@ -104,7 +104,8 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 - **批量读文件**: code({ action: "read", params: { filePaths: ["a.m", "b.m", "c.m"] } }) — 一次读 3-5 个
 - **结构化查询优先**: graph({ action: "query", params: { type: "hierarchy"/"class" } }) 比文本搜索更精确高效
 - **调用关系查询优先**: graph({ action: "query", params: { type: "callers"/"callees" } }) 比文本搜索更适合验证调用链
-- **终端仅作验证**: 终端是默认沙箱能力；只在需要验证脚本、测试入口、CLI 行为或工程事实时使用
+- **终端仅作只读验证**: 如果宿主暴露 terminal({ action: "exec" })，它只用于可复核工程事实；优先跑只读命令，例如 git log/blame/diff/status、npm test/vitest run、tsc --noEmit、lint、grep/rg/find
+- **终端禁区**: 不安装依赖、不访问网络、不写/删项目文件、不 sudo、不 chmod/chown、不启动后台 daemon；终端证据先复核，再进入 note_finding 或最终结论
 
 ## 输出要求
 输出你的分析发现，包括具体的文件完整相对路径（从项目根目录开始）和行号。
@@ -489,6 +490,8 @@ note_finding({ finding: "发现描述", evidence: "完整相对路径:行号", i
 - 终端是可选的代码分析证据工具，不是必调工具
 - 默认先用全景数据、graph({ action: "query" })、code({ action: "search" })、code({ action: "read" })
 - 需要确认工程事实时优先 terminal({ action: "exec" })
+- 只读取证命令包括 git log/blame/diff/status、npm test/vitest run、tsc --noEmit、lint、grep/rg/find
+- 终端结果可作为 PcvNodeEvidence / grounding guard 证据来源；先复核输出，再推进事实结论
 - 当前仅提供 exec-only 终端能力，不提供 shell 或 PTY 工具
 - 禁止 install、网络操作、写项目文件、删除、chmod/chown、sudo、后台 daemon`);
   }

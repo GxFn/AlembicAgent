@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
-import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insightAnalyst.js';
+import { ANALYST_SYSTEM_PROMPT, buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
 import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
@@ -370,6 +370,46 @@ describe('LLM input layering', () => {
     expect(ANALYST_SYSTEM_PROMPT).toContain('Producer 只消费 note_finding 结构化发现');
     expect(ANALYST_SYSTEM_PROMPT).toContain('最终 Markdown 只能总结已记录的 note_finding');
     expect(ANALYST_SYSTEM_PROMPT).toContain('不得新增未结构化记录的模式家族');
+  });
+
+  it('guides Analyst terminal grounding through read-only exec evidence only', async () => {
+    const retiredShellTool = ['terminal', 'shell'].join('_');
+    const retiredPtyTool = ['terminal', 'pty'].join('_');
+    const retiredRunTool = ['terminal', 'run'].join('_');
+
+    expect(ANALYST_SYSTEM_PROMPT).toContain('terminal({ action: "exec" })');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('git log/blame/diff/status');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('npm test/vitest run');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('tsc --noEmit');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('grep/rg/find');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('不安装依赖');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('不访问网络');
+    expect(ANALYST_SYSTEM_PROMPT).toContain('不写/删项目文件');
+    expect(ANALYST_SYSTEM_PROMPT).not.toContain(retiredShellTool);
+    expect(ANALYST_SYSTEM_PROMPT).not.toContain(retiredPtyTool);
+    expect(ANALYST_SYSTEM_PROMPT).not.toContain(retiredRunTool);
+
+    const prompt = await buildAnalystPrompt(
+      { id: 'architecture', label: 'Architecture' },
+      { name: 'FixtureProject', lang: 'typescript', fileCount: 2 },
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      { terminalCapability: { enabled: true, toolset: 'terminal-exec' } }
+    );
+
+    expect(prompt).toContain('terminal({ action: "exec" })');
+    expect(prompt).toContain('git log/blame/diff/status');
+    expect(prompt).toContain('PcvNodeEvidence');
+    expect(prompt).toContain('禁止 install、网络操作、写项目文件、删除');
+    expect(prompt).not.toContain(retiredShellTool);
+    expect(prompt).not.toContain(retiredPtyTool);
+    expect(prompt).not.toContain(retiredRunTool);
   });
 
   it('adds producer sourceRef grounding guidance from verified analysis refs', () => {
