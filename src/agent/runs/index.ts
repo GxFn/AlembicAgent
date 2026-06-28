@@ -1,5 +1,5 @@
 export { projectEvolutionAuditResult, runEvolutionAudit } from './evolution/EvolutionAgentRun.js';
-export { runModuleMining } from './module/ModuleMiningAgentRun.js';
+export { runModuleMining } from './module-mining/ProjectIndexModuleMiningAgentRun.js';
 export { runPlanAgent } from './plan/PlanAgentRun.js';
 export {
   projectRelationDiscoveryResult,

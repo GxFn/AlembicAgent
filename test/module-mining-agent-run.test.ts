@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
-import { runModuleMining } from '../src/agent/runs/module/ModuleMiningAgentRun.js';
+import { MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module.profile.js';
+import { PROJECT_INDEX_MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module-mining/ProjectIndexModuleMiningProfile.js';
+import { runModuleMining as runModuleMiningFromIndex } from '../src/agent/runs/index.js';
+import { runModuleMining as runModuleMiningCompat } from '../src/agent/runs/module/ModuleMiningAgentRun.js';
+import {
+  runModuleMining,
+  runProjectIndexScopedModuleMining,
+} from '../src/agent/runs/module-mining/ProjectIndexModuleMiningAgentRun.js';
 import type {
   AgentRuntimeBuildOptions,
   AgentRuntimeLike,
@@ -18,6 +25,13 @@ type RuntimeExecution = {
 };
 
 describe('module mining profiles', () => {
+  it('keeps R1 profile and run exports wired to the ProjectIndex module-mining namespace', () => {
+    expect(runModuleMiningCompat).toBe(runProjectIndexScopedModuleMining);
+    expect(runModuleMiningFromIndex).toBe(runProjectIndexScopedModuleMining);
+    expect(runModuleMining).toBe(runProjectIndexScopedModuleMining);
+    expect(MODULE_MINING_PROFILES).toBe(PROJECT_INDEX_MODULE_MINING_PROFILES);
+  });
+
   it('registers fanout session and child profiles with module partitioning', () => {
     const session = BUILTIN_PROFILES.find((profile) => profile.id === 'module-mining-session');
     const child = BUILTIN_PROFILES.find((profile) => profile.id === 'module-mining-dimension');

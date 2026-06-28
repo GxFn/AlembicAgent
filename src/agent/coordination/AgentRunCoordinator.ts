@@ -25,8 +25,8 @@ export class AgentRunCoordinator {
   constructor() {
     this.registerPartitioner('bootstrapSessionDimensions', partitionBootstrapSessionDimensions);
     this.registerMerger('bootstrapSessionResults', mergeBootstrapSessionResults);
-    this.registerPartitioner('projectContextModules', partitionProjectContextModules);
-    this.registerMerger('moduleMiningResults', mergeModuleMiningResults);
+    this.registerPartitioner('projectContextModules', partitionProjectIndexScopedModules);
+    this.registerMerger('moduleMiningResults', mergeProjectIndexScopedModuleResults);
   }
 
   registerPartitioner(name: string, partitioner: Partitioner) {
@@ -371,7 +371,7 @@ function partitionBootstrapSessionDimensions(
   });
 }
 
-function partitionProjectContextModules(
+function partitionProjectIndexScopedModules(
   input: AgentRunInput,
   profile: CompiledAgentProfile
 ): AgentRunInput[] {
@@ -421,8 +421,8 @@ function partitionProjectContextModules(
     const childParams = toRecord(moduleRecord.params);
     const tier = numberValue(moduleRecord.tier);
     const profileRef = toProfileRef(moduleRecord.profile) || { id: childProfileId };
-    const projectInfo = buildModuleMiningProjectInfo(input.params?.projectFacts, ownedFiles);
-    const dimConfig = buildModuleMiningDimConfig(moduleRecord, {
+    const projectInfo = buildProjectIndexModuleInfo(input.params?.projectFacts, ownedFiles);
+    const dimConfig = buildScopedIndexModuleDimConfig(moduleRecord, {
       moduleId,
       moduleName,
       modulePath,
@@ -517,7 +517,7 @@ function mergeBootstrapSessionResults(
   };
 }
 
-function mergeModuleMiningResults(
+function mergeProjectIndexScopedModuleResults(
   results: AgentRunResult[],
   input: AgentRunInput,
   profile: CompiledAgentProfile
@@ -544,7 +544,7 @@ function mergeModuleMiningResults(
   };
 }
 
-function buildModuleMiningProjectInfo(projectFacts: unknown, ownedFiles: string[]) {
+function buildProjectIndexModuleInfo(projectFacts: unknown, ownedFiles: string[]) {
   const facts = toRecord(projectFacts);
   const explicitProjectInfo = toRecord(facts.projectInfo);
   const name =
@@ -570,7 +570,7 @@ function buildModuleMiningProjectInfo(projectFacts: unknown, ownedFiles: string[
   };
 }
 
-function buildModuleMiningDimConfig(
+function buildScopedIndexModuleDimConfig(
   moduleRecord: Record<string, unknown>,
   {
     moduleId,
