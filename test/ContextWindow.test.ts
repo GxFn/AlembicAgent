@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ContextWindow } from '../src/agent/context/index.js';
+import { ContextWindow, limitToolResult } from '../src/agent/context/index.js';
 
 describe('ContextWindow L4 compaction transcript safety', () => {
   it('keeps runtime nudges ephemeral instead of accumulating repeated user messages', () => {
@@ -242,5 +242,100 @@ describe('ContextWindow L4 compaction transcript safety', () => {
     expect(result).toMatchObject({ failed: true, cancelled: true, removed: 0 });
     expect(contextWindow.toMessages()).toHaveLength(2);
     expect(String(contextWindow.toMessages()[1].content)).not.toContain('[[L4 Memory Summary]]');
+  });
+});
+
+// ─── A-1 #compactL1 首+尾保留（独立验收，§8 Phase 1）──────────────────────────
+// 设计硬规则：「L1 done」不得计为「limit done」—— A-1 与下方 A-1b 各自独立断言。
+describe('A-1 #compactL1 head+tail retention', () => {
+  function buildWindow(): { cw: ContextWindow; tailMark: string; headMark: string } {
+    const cw = new ContextWindow(48_000);
+    cw.appendUserMessage('analyze prompt');
+    const headMark = 'HEAD_SIGNAL_TOKEN';
+    // 对抗修正#3（FOLD）：tailMark 收到 ≤24 字，覆盖最坏 safeTail（~45），固化用例。
+    const tailMark = 'TAIL_errs=3_total=42'; // 20 字
+    const body = 'x'.repeat(4000);
+    cw.appendAssistantWithToolCalls(null, [{ id: 'old', name: 'code', args: {} }]);
+    cw.appendToolResult('old', 'code', `${headMark}\n${body}\n${tailMark}`);
+    cw.appendAssistantWithToolCalls(null, [{ id: 'new', name: 'code', args: {} }]);
+    cw.appendToolResult('new', 'code', 'short recent result');
+    return { cw, tailMark, headMark };
+  }
+
+  it('keeps head AND tail of an old oversized tool result', () => {
+    const { cw, tailMark, headMark } = buildWindow();
+    cw.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const out = cw.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(out).toContain(headMark);
+    expect(out).toContain(tailMark); // 旧实现会丢
+  });
+
+  it('uses a marker distinct from the read-entry (clampReadResult) marker', () => {
+    const { cw } = buildWindow();
+    cw.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const out = cw.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(out).toContain('compaction snip');
+    expect(out).not.toContain('batch read budget');
+  });
+
+  it('is idempotent across >=3 compaction cycles (tail survives, no re-truncation)', () => {
+    const { cw, tailMark } = buildWindow();
+    cw.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const afterFirst = cw.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(afterFirst.length).toBeLessThanOrEqual(500);
+    for (let cycle = 0; cycle < 2; cycle++) {
+      cw.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    }
+    const afterThird = cw.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(afterThird).toBe(afterFirst);
+    expect(afterThird).toContain(tailMark.slice(-10));
+  });
+
+  it('does not add or remove messages (atomic pairing / messages[0] pin intact)', () => {
+    const { cw } = buildWindow();
+    const before = cw.toMessages().length;
+    cw.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    expect(cw.toMessages().length).toBe(before);
+    expect(cw.toMessages()[0]?.content).toBe('analyze prompt');
+  });
+});
+
+// ─── A-1b limit* 系列首+尾保留（独立验收，§8 Phase 1b）────────────────────────
+// 独立于 A-1：直接对导出符号 limitToolResult 断言，marker=tool-result snip 且 ≠ 另两层。
+describe('A-1b limitToolResult/limitFileContent head+tail', () => {
+  it('keeps tail of a generic oversized string result', () => {
+    const big = `START_HEAD${'y'.repeat(5000)}END_TAIL_match_count=17`;
+    const out = limitToolResult('shell', big, { maxChars: 500 });
+    expect(out).toContain('START_HEAD');
+    expect(out).toContain('END_TAIL_match_count=17');
+    expect(out).toContain('tool-result snip');
+    expect(out).not.toContain('compaction snip');
+    expect(out).not.toContain('batch read budget');
+  });
+
+  it('keeps tail of a code batch-truncated result', () => {
+    // 对抗修正#1（FOLD）：原规格断言 toContain('k49') 为假阳——尾窗只剩值片段，键 token
+    // 落在省略区。改断尾部值片段（c49）+ marker，不断键名。
+    const padded = {
+      batchResults: Object.fromEntries(
+        Array.from({ length: 50 }, (_, i) => [`k${i}`, { content: `c${i}`.repeat(40) }])
+      ),
+    };
+    const out = limitToolResult('code', padded, { maxChars: 400, maxMatches: 3 });
+    expect(out.length).toBeLessThanOrEqual(500);
+    expect(out).toContain('tool-result snip');
+    expect(out).toContain('c49'); // 尾部值片段存活（旧纯头实现会丢）
+  });
+
+  it('keeps tail of file content (last lines survive)', () => {
+    const content = [
+      'IMPORTS_HEADER',
+      ...Array.from({ length: 400 }, (_, i) => `line${i}`),
+      'EXPORTS_FOOTER',
+    ].join('\n');
+    const out = limitToolResult('code', { content }, { maxChars: 600 });
+    expect(out).toContain('IMPORTS_HEADER');
+    expect(out).toContain('EXPORTS_FOOTER'); // 尾整行存活
+    expect(out).toContain('tool-result snip');
   });
 });

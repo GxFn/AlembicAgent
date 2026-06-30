@@ -580,7 +580,9 @@ export class ContextWindow {
     for (let i = 1; i < lastRoundStart; i++) {
       const msg = this.#messages[i];
       if (msg.role === 'tool' && msg.content && msg.content.length > TRUNCATE_THRESHOLD) {
-        msg.content = `${msg.content.substring(0, TRUNCATE_TO)}\n... [truncated from ${msg.content.length} chars]`;
+        // A-1：纯头截断 → 首+尾保留，保住扫描类 result 尾部的错误汇总 / match 计数 /
+        // 结尾结构；snipHeadTail 内部保证 head+marker+tail ≤ TRUNCATE_TO，跨周期幂等。
+        msg.content = snipHeadTail(msg.content, TRUNCATE_TO, L1_SNIP_MARKER_TAG);
         truncated++;
       }
     }
@@ -1027,6 +1029,57 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+// ─── 首+尾截断公共逻辑（A-1 / A-1b 共用）────────────────
+// 1. 与 read 入口 clampReadResult(code.ts) 首+尾思路一致，但 marker 文本必须不同
+//    （compaction snip / tool-result snip ≠ batch read budget），使两层有损截断可区分。
+// 2. 幂等硬约束：budget=TRUNCATE_TO(500) 时 keepHead+marker.length+safeTail ≤ budget，
+//    使重写结果落回 TRUNCATE_THRESHOLD(2000) 之下，跨周期不二次截断、不吃刚保留的尾部。
+// 3. 比例按 budget 切（CG-2：80%/15% of 500），不按原文长度切。
+
+/** L1 压缩层 marker 词根 —— 与 read 入口 / limit 层均不同 */
+const L1_SNIP_MARKER_TAG = 'compaction snip';
+/** limit 层 marker 词根 —— 与 read 入口 / L1 层均不同 */
+const LIMIT_SNIP_MARKER_TAG = 'tool-result snip';
+
+/**
+ * 把长字符串截断为 head + 独立 marker + tail，并保证幂等：
+ * keepHead + marker.length + safeTail ≤ budget。
+ *
+ * 对抗修正#2（FOLD）：原规格注释把不变量写成"任意原文长度恒成立"，实测仅在
+ * budget ≳ 340 成立——小 budget 下 keepHead(0.8·budget)+marker 已超界、safeTail
+ * 夹 0 仍超。此处采用更稳实现：overflow 优先收缩 safeTail，仍超则继续收缩 keepHead，
+ * 使界在任意 budget 下真正无条件成立（不依赖外部 MIN_TOOL_CHARS floor）。
+ *
+ * 注：keepTail 改用 const（规格示例为 let，但本仓 biome useConst=error 且 keepTail 从不重赋值，
+ * 仅 keepHead/safeTail/overflow 重赋值保留 let），行为与规格逐字一致。
+ */
+function snipHeadTail(text: string, budget: number, tag: string): string {
+  let keepHead = Math.floor(budget * 0.8); // CG-2：头 80%
+  const keepTail = Math.floor(budget * 0.15); // CG-2：尾 15%
+  const omitted = text.length - keepHead - keepTail;
+  // marker 含原文长度与省略数（便于审计），用真实 marker.length 入预算。
+  const marker = `\n... [${tag}: ${omitted} of ${text.length} chars omitted] ...\n`;
+  // 幂等守卫：先收缩 safeTail；若 keepHead+marker 仍超 budget，再收缩 keepHead，
+  // 保证 keepHead+marker.length+safeTail ≤ budget 在任意 budget 下成立。
+  let safeTail = keepTail;
+  let overflow = keepHead + marker.length + safeTail - budget;
+  if (overflow > 0) {
+    const tailCut = Math.min(safeTail, overflow);
+    safeTail -= tailCut;
+    overflow -= tailCut;
+  }
+  if (overflow > 0) {
+    keepHead = Math.max(0, keepHead - overflow);
+  }
+  // 若保留量已覆盖原文，不做截断（避免把短串放大）。
+  if (keepHead + safeTail >= text.length) {
+    return text;
+  }
+  const head = text.slice(0, keepHead);
+  const tail = safeTail > 0 ? text.slice(-safeTail) : '';
+  return `${head}${marker}${tail}`;
+}
+
 // ─── ToolResultLimiter ──────────────────────────────────
 
 /**
@@ -1043,15 +1096,17 @@ export function limitToolResult(toolName: string, result: unknown, quota: ToolRe
   // knowledge (submit) 结果很短，不截断
   if (toolName === 'knowledge') {
     const raw = typeof result === 'string' ? result : JSON.stringify(result);
+    // 刻意保持纯头：knowledge.submit 回显短、尾部无高信号，500 字硬上限只为防超长回显（A-1b 不改此处）。
     return raw.length > 500 ? raw.substring(0, 500) : raw;
   }
 
   // code 工具: 区分搜索结果、文件内容、其他操作
   if (toolName === 'code') {
-    // V2 纯文本搜索结果: "N matches (showing M)\n\n..."
+    // V2 纯文本搜索结果: "N matches (showing M)\n\n..."（尾部常含 "showing M of N" 汇总）
     if (typeof result === 'string' && /^\d+ matches/.test(result)) {
+      // A-1b：纯头 → 首+尾，保住搜索结果尾部的汇总行；marker=LIMIT_SNIP_MARKER_TAG。
       return result.length > maxChars
-        ? `${result.substring(0, maxChars)}\n... [search truncated]`
+        ? snipHeadTail(result, maxChars, LIMIT_SNIP_MARKER_TAG)
         : result;
     }
 
@@ -1069,7 +1124,8 @@ export function limitToolResult(toolName: string, result: unknown, quota: ToolRe
           batchResults[key] = limitSearchResultObj(sub, Math.min(maxMatches, 3), perKeyChars);
         }
         const raw = JSON.stringify(limited);
-        return raw.length > maxChars ? `${raw.substring(0, maxChars)}\n... [batch truncated]` : raw;
+        // A-1b：V1 batch 搜索纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
+        return raw.length > maxChars ? snipHeadTail(raw, maxChars, LIMIT_SNIP_MARKER_TAG) : raw;
       }
       return limitSearchResult(result, maxMatches, maxChars);
     }
@@ -1077,7 +1133,8 @@ export function limitToolResult(toolName: string, result: unknown, quota: ToolRe
     // 文件内容 (read/write/outline/structure)
     if (typeof result === 'object' && result !== null && (result as FileResultLike).batchResults) {
       const raw = JSON.stringify(result);
-      return raw.length > maxChars ? `${raw.substring(0, maxChars)}\n... [batch truncated]` : raw;
+      // A-1b：文件内容 batch 纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
+      return raw.length > maxChars ? snipHeadTail(raw, maxChars, LIMIT_SNIP_MARKER_TAG) : raw;
     }
     return limitFileContent(result, maxChars);
   }
@@ -1085,7 +1142,8 @@ export function limitToolResult(toolName: string, result: unknown, quota: ToolRe
   // 通用: 按字符限制
   const raw = typeof result === 'string' ? result : JSON.stringify(result);
   if (raw.length > maxChars) {
-    return `${raw.substring(0, maxChars)}\n... [truncated, ${raw.length} total chars]`;
+    // A-1b：通用字符串纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
+    return snipHeadTail(raw, maxChars, LIMIT_SNIP_MARKER_TAG);
   }
   return raw;
 }
@@ -1181,10 +1239,12 @@ function limitSearchResultObj(
   return limited;
 }
 
-/** 限制文件内容 — 截断 content 字段 */
+/** 限制文件内容 — 截断 content 字段（A-1b：纯头 → 首+尾，整行边界保住 imports/exports/收尾结构） */
 function limitFileContent(result: unknown, maxChars: number) {
   if (typeof result === 'string') {
-    return result.length > maxChars ? `${result.substring(0, maxChars)}\n... [truncated]` : result;
+    return result.length > maxChars
+      ? snipHeadTail(result, maxChars, LIMIT_SNIP_MARKER_TAG)
+      : result;
   }
 
   if (!result || typeof result !== 'object') {
@@ -1194,15 +1254,28 @@ function limitFileContent(result: unknown, maxChars: number) {
   const src = result as FileResultLike;
   const limited: FileResultLike = { ...src };
   if (limited.content && limited.content.length > maxChars) {
+    // A-1b：文件内容保留尾部整行（尾部常是 imports/exports/收尾结构），头 80% / 尾 15% 字符预算。
+    // 刻意不复用 snipHeadTail：在整行边界切，保 JSON-内嵌源码可读性；marker tag 与 limit 层一致。
+    const headBudget = Math.floor(maxChars * 0.8);
+    const tailBudget = Math.floor(maxChars * 0.15);
     const lines = limited.content.split('\n');
-    let truncated = '';
+    let head = '';
     for (const line of lines) {
-      if (truncated.length + line.length + 1 > maxChars) {
+      if (head.length + line.length + 1 > headBudget) {
         break;
       }
-      truncated += `${line}\n`;
+      head += `${line}\n`;
     }
-    limited.content = `${truncated}... [truncated at ${maxChars} chars, total ${src.content?.length}]`;
+    let tail = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (tail.length + line.length + 1 > tailBudget) {
+        break;
+      }
+      tail = `${line}\n${tail}`;
+    }
+    const omitted = src.content?.length ?? 0;
+    limited.content = `${head}... [${LIMIT_SNIP_MARKER_TAG}: file content truncated, total ${omitted} chars] ...\n${tail}`;
   }
 
   return JSON.stringify(limited);
