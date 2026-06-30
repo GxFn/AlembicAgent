@@ -17,6 +17,10 @@ import {
   type ToolContext,
   type ToolResult,
 } from '#tools/kernel/registry.js';
+import {
+  formatRecipeAuthoringViolations,
+  runInProcessRecipeAuthoringGate,
+} from './recipeAuthoringGate.js';
 
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
@@ -171,6 +175,21 @@ async function handleSubmit(
         ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
         : null,
     };
+
+    // P1.4b in-process flatten (CG-4)：在 gateway.create（Core stage-3）之前，把 in-process 提交
+    // 接到与 host-agent 路径同一套权威门禁 validateAgainst。档位由 resolveAuthoringProfile 从上下文
+    // 解析：携带 bootstrap dimension 的冷启动提交 → cold-start（完整门禁，含 3-file 证据下限）；
+    // 运行期机会式 in-process AI 开发（无 session / 无 dimension）→ opportunistic（保留全部内容门禁
+    // + 廉价 fs 来源接地，但不强制 3-file 下限与 session-scope）。上面的 validateSubmitParams 仅作
+    // 廉价 presence/length fast-fail，本门禁是被其 supersede 的权威裁决；命中即按既有 in-process 拒绝
+    // 信封形状（fail 字符串）返回，门禁输出字节不变、只改 in-process AI 看到的门槛。
+    const gateViolations = runInProcessRecipeAuthoringGate(item, {
+      projectRoot: ctx.projectRoot,
+      dimensionId: effectiveDimensionId,
+    });
+    if (gateViolations.length > 0) {
+      return fail(`Validation failed: ${formatRecipeAuthoringViolations(gateViolations)}`);
+    }
 
     const result = await gateway.create({
       source: AGENT_RUNTIME_SOURCE,

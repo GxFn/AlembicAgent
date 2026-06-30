@@ -332,7 +332,10 @@ describe('LLM input layering', () => {
     expect(PRODUCER_SYSTEM_PROMPT).toContain('提供中文 description');
     expect(PRODUCER_SYSTEM_PROMPT).toContain('params.title、params.description');
     expect(PRODUCER_SYSTEM_PROMPT).toContain('reasoning.sources 非空');
-    expect(prompt).toContain('title: 中文标题');
+    // P1.4b：必填字段清单改由 Core spec 的 describeSubmitToolFields 渲染（spec-sourced），仍逐项surface
+    // 必填字段；门禁规则文本由 renderGuidance('in-process') 提供（producer-prompt-first 详见专门套件）。
+    expect(prompt).toContain('knowledge.submit 必填字段');
+    expect(prompt).toContain('- title:');
     expect(prompt).toContain('description 中文简述');
     expect(prompt).toContain('content.markdown');
     expect(prompt).toContain('reasoning.sources');

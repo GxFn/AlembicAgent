@@ -327,25 +327,32 @@ describe('Tool V2 contract exports', () => {
       items: Record<string, unknown>[];
       options?: Record<string, unknown>;
     }> = [];
+    // P1.4b：in-process 提交现在过权威 validateAgainst（opportunistic）门禁，候选必须 gate-clean
+    // （祈使 doClause/dontClause、✅❌ 对比、可解析的 source-ref）。projectRoot 指向真实仓库根，
+    // 引用真实文件 package.json:1-3 以通过廉价 fs 来源接地；本用例验证的是 source 缺省，不是门禁。
     const parsed = router.parseToolCall('knowledge', {
       action: 'submit',
       params: {
         title: 'Tool V2 source boundary',
         description: 'Records the Agent runtime as the default source for new knowledge writes.',
         content: {
-          markdown:
-            'This candidate documents the Tool V2 source boundary for Agent runtime writes. '.repeat(
-              4
-            ),
+          markdown: [
+            '## Tool V2 source boundary',
+            'The Agent runtime keeps alembic-agent as the default source for new knowledge writes,',
+            'separate from legacy ide-agent compatibility inputs (来源: package.json:1).',
+            '✅ Record alembic-agent as the source for Agent runtime writes.',
+            '❌ Do not reuse the legacy ide-agent source for new candidates.',
+          ].join('\n'),
           rationale:
             'The source value must distinguish Alembic Agent owned writes from legacy IDE agent compatibility inputs.',
         },
         kind: 'pattern',
         trigger: 'Tool V2 source boundary',
         whenClause: 'When the Agent runtime submits a new knowledge candidate through Tool V2.',
-        doClause: 'Persist alembic-agent as the default source for the submitted candidate.',
+        doClause: 'Record alembic-agent as the default source for the submitted candidate.',
+        dontClause: 'Do not reuse the legacy ide-agent source for new Agent writes.',
         reasoning: {
-          sources: ['src/tools/runtime/handlers/knowledge.ts'],
+          sources: ['package.json:1-3'],
           confidence: 0.9,
         },
       },
@@ -358,6 +365,7 @@ describe('Tool V2 contract exports', () => {
 
     const result = await router.execute(parsed, {
       ...baseToolContext(),
+      projectRoot: process.cwd(),
       recipeGateway: {
         create: async (request: {
           source: string;

@@ -15,7 +15,11 @@
  * @module insightProducer
  */
 
-import { buildProducerStyleGuide, SUBMIT_REQUIREMENTS } from '@alembic/core/knowledge';
+import {
+  describeSubmitToolFields,
+  renderGuidance,
+  SUBMIT_REQUIREMENTS,
+} from '@alembic/core/knowledge';
 import type { EvidenceEntry } from '../domain/EvidenceCollector.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -127,19 +131,43 @@ export const PRODUCER_BUDGET = {
 };
 
 // ──────────────────────────────────────────────────────────────────
-// 项目特写风格指南 (从 Core knowledge stable facade 获取)
+// 项目特写写作指南 + 提交门禁规则 (从 Core RecipeAuthoringSpec 权威渲染)
 // ──────────────────────────────────────────────────────────────────
 
-const STYLE_GUIDE = buildProducerStyleGuide();
+// P1.4b producer-prompt-first：in-process 提交此前只过 length-only 门槛，Producer 从不知道 stage-1/2
+// 的真实门禁；在 in-process gate（validateAgainst）上线之前，必须先让 Producer 看到与门禁同源的权威
+// 规则，否则它只能反向猜测门禁、白白浪费提交轮次。STYLE_GUIDE 改由 renderGuidance('in-process') 渲染：
+// 它读取与 validateAgainst 完全相同的 gateRules() 表（guidance==gate 的结构性保证），一次性给出项目
+// 特写写作要求 + 全部 stage 门禁规则 + 45/12 祈使动词白名单 + 证据下限。Producer 运行于 bootstrap 冷启动
+// 语境（提交携带 dimensionId → resolveAuthoringProfile=cold-start），故按 cold-start 渲染，呈现完整
+// 规则上界（含 3-file 证据下限），与它实际面对的门禁一致。
+const STYLE_GUIDE = renderGuidance('in-process', undefined, 'cold-start').text;
 
-const PRODUCER_SUBMIT_FIELD_CONTRACT = `## knowledge.submit 必填字段
-- title: 中文标题，使用项目真实类名/模块名，不以项目名开头
-- description: 中文简述 ≤80 字，引用真实类名
-- content.markdown: 项目特写正文，包含代码块和完整相对路径+行号来源标注
-- content.rationale: 设计原理说明
-- kind: rule / pattern / fact
-- trigger、whenClause、doClause、dontClause、coreCode: 插件交付字段
-- reasoning.sources: 非空数组，填写完整相对路径，不只写文件名`;
+// 必填字段清单同样取自 Core spec 的 describeSubmitToolFields（FieldSpec 唯一来源），不再手写，避免
+// 字段语义随时间与门禁 / FieldSpec 漂移。
+const PRODUCER_SUBMIT_FIELD_CONTRACT = buildProducerSubmitFieldContract();
+
+/** 从 Core spec 的字段描述表渲染 Producer 必填字段清单（spec-sourced，零手写漂移）。 */
+function buildProducerSubmitFieldContract(): string {
+  const fields = describeSubmitToolFields();
+  const keys = [
+    'title',
+    'description',
+    'content.markdown',
+    'content.rationale',
+    'kind',
+    'trigger',
+    'whenClause',
+    'doClause',
+    'dontClause',
+    'coreCode',
+    'reasoning.sources',
+  ];
+  return [
+    '## knowledge.submit 必填字段（字段说明取自 Core RecipeAuthoringSpec，避免与门禁漂移）',
+    ...keys.map((key) => `- ${key}: ${fields[key] ?? ''}`),
+  ].join('\n');
+}
 
 // ──────────────────────────────────────────────────────────────────
 // Prompt 构建
