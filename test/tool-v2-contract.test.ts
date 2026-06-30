@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
@@ -431,5 +434,198 @@ describe('Tool V2 contract exports', () => {
     await expect(captureEvolutionSource('ide-agent')).resolves.toBe('ide-agent');
     await expect(captureEvolutionSource('file-change')).resolves.toBe('file-change');
     await expect(captureEvolutionSource('rescan-evolution')).resolves.toBe('rescan-evolution');
+  });
+});
+
+// ─── B-1 写前新鲜度门（read-before-write / TOCTOU），§8 Phase 3 ──────────────────
+// 复用 llm-input-correctness.test.ts:49 的 toolContext(root, deltaCache?) 模式构造共享同一
+// deltaCache 实例的 ctx；驱动用 router.execute({tool:'code',action:'read'|'write'}, ctx)（真路由
+// 路径，非直调 handleWrite）；mkdtemp 离线。注：case 7 的"共享实例守卫"只证门逻辑，
+// 不替代 §真跑 instanceId HARD GATE —— 生产宿主工厂是否在 run 级共享 deltaCache 须真 run 证明。
+function freshnessCtx(root: string, deltaCache?: DeltaCache): ToolContext {
+  return {
+    projectRoot: root,
+    tokenBudget: 4000,
+    ...(deltaCache ? { deltaCache } : {}),
+  };
+}
+
+async function withWriteFixture(run: (root: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'agent-b1-freshness-'));
+  try {
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src/a.ts'), 'export const a = 1;\n', 'utf-8');
+    await run(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe('B-1 write-freshness gate (read-before-write / TOCTOU)', () => {
+  it('state 4: writes a brand-new (disk-absent) file without requiring a prior read', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      const res = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/new.ts', content: 'export const n = 1;\n' },
+        },
+        ctx
+      );
+      expect(res.ok).toBe(true);
+      expect((res.data as { written?: string }).written).toBe('src/new.ts');
+      expect(await readFile(join(root, 'src/new.ts'), 'utf-8')).toBe('export const n = 1;\n');
+    });
+  });
+
+  it('state 1: rejects a write to a disk-existing file that was NOT read this run', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      // 预置磁盘文件，但不经 code.read（cache 无指纹）。
+      await writeFile(join(root, 'src/unread.ts'), 'export const u = 1;\n', 'utf-8');
+      const res = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/unread.ts', content: 'export const u = 2;\n' },
+        },
+        ctx
+      );
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain('exists on disk but was not read');
+      expect(res.error).toContain('Re-read the file with code.read');
+      // 与态 4 区分：磁盘内容未被覆盖。
+      expect(await readFile(join(root, 'src/unread.ts'), 'utf-8')).toBe('export const u = 1;\n');
+    });
+  });
+
+  it('state 3: allows a write after a consistent read (same ctx, disk unchanged)', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      const read = await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'src/a.ts' } },
+        ctx
+      );
+      expect(read.ok).toBe(true);
+      const res = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 99;\n' },
+        },
+        ctx
+      );
+      expect(res.ok).toBe(true);
+      expect(await readFile(join(root, 'src/a.ts'), 'utf-8')).toBe('export const a = 99;\n');
+    });
+  });
+
+  it('state 2 (CG-3): rejects a write when the file changed externally since last read', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      await router.execute({ tool: 'code', action: 'read', params: { path: 'src/a.ts' } }, ctx);
+      // 带外修改磁盘（模拟并发 host rescan/job 或上一轮产物）。
+      await writeFile(join(root, 'src/a.ts'), 'export const a = 7;\n// external edit\n', 'utf-8');
+      const res = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 99;\n' },
+        },
+        ctx
+      );
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain('changed externally since last read');
+      expect(res.error).toContain('Re-read the file with code.read');
+      // 硬拒：磁盘仍是带外内容，未被静默覆盖。
+      expect(await readFile(join(root, 'src/a.ts'), 'utf-8')).toBe(
+        'export const a = 7;\n// external edit\n'
+      );
+    });
+  });
+
+  it('state 3 + baseline update: an immediate same-ctx re-write is allowed (set() updated fingerprint)', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      await router.execute({ tool: 'code', action: 'read', params: { path: 'src/a.ts' } }, ctx);
+      const first = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 2;\n' },
+        },
+        ctx
+      );
+      expect(first.ok).toBe(true);
+      // 无带外改，立即再写：写后若未更新基线指纹会被误判态 2，故此处证 set() 生效。
+      const second = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 3;\n' },
+        },
+        ctx
+      );
+      expect(second.ok).toBe(true);
+      expect(await readFile(join(root, 'src/a.ts'), 'utf-8')).toBe('export const a = 3;\n');
+    });
+  });
+
+  it('passthrough: with no deltaCache injected the gate does not false-reject a disk-existing write', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root); // no deltaCache
+      const res = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 5;\n' },
+        },
+        ctx
+      );
+      expect(res.ok).toBe(true);
+      expect(await readFile(join(root, 'src/a.ts'), 'utf-8')).toBe('export const a = 5;\n');
+    });
+  });
+
+  it('shared-instance contract guard (logic-only — NOT a substitute for the real-run instanceId HARD GATE)', async () => {
+    await withWriteFixture(async (root) => {
+      const router = new ToolRouter();
+      const shared = new DeltaCache(50);
+      // 同一 deltaCache 跨 read/write → 命中态 3 放行。
+      await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'src/a.ts' } },
+        freshnessCtx(root, shared)
+      );
+      const allowed = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 8;\n' },
+        },
+        freshnessCtx(root, shared)
+      );
+      expect(allowed.ok).toBe(true);
+
+      // 换全新 deltaCache 传给 write（模拟工厂 per-create 新建、未 run 级共享）→ 命中态 1 被拒。
+      // 这正是真跑 instanceId HARD GATE 要排除的失败模式：宿主工厂不共享 → 合法重写被误拒。
+      const fresh = new DeltaCache(50);
+      const rejected = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'src/a.ts', content: 'export const a = 9;\n' },
+        },
+        freshnessCtx(root, fresh)
+      );
+      expect(rejected.ok).toBe(false);
+      expect(rejected.error).toContain('exists on disk but was not read');
+    });
   });
 });

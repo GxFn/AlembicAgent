@@ -8,6 +8,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -764,6 +765,17 @@ async function buildDirectoryTree(
 
 const PROTECTED_PATHS = ['.git', 'node_modules', '.env'];
 
+// 写前新鲜度门：与 deltaCache.check() 内部一致的内容指纹（node:crypto md5），
+// 使"写时磁盘内容"与"读时缓存指纹"可比。DeltaCache 算法将来变更须同步本 helper
+// （已核验 DeltaCache.ts 用 createHash('md5')，与此对齐）。
+function freshnessFingerprint(content: string): string {
+  return createHash('md5').update(content).digest('hex');
+}
+
+// CG-3 硬拒 + 重读引导文案，稳定可被验收 harness grep，不得随意改写。
+const REREAD_GUIDANCE =
+  'Re-read the file with code.read before writing, then retry code.write with content based on the current version.';
+
 async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const filePath = params.path as string;
   const content = params.content as string;
@@ -784,15 +796,73 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
     }
   }
 
+  // ── B-1 写前新鲜度门（read-before-write, TOCTOU）──────────────────────
+  // 新文件判定 key 在"写时磁盘是否存在"，非"cache 是否有记录"：磁盘已存在但本 run 未读的
+  // 文件（上一轮产物或并发 host rescan/job 写的）必须走"已存在"分支，否则被当新文件放行
+  // → 重开 TOCTOU 洞。deltaCache 未注入时门降级透传，由 PROTECTED_PATHS 兜底。
+  const freshness = await checkWriteFreshness(resolved.absPath, resolved.relPath, ctx);
+  if (!freshness.ok) {
+    return fail(freshness.error);
+  }
+  // ────────────────────────────────────────────────────────────────────
+
   try {
     if (createDirs) {
       await fs.mkdir(path.dirname(resolved.absPath), { recursive: true });
     }
     await fs.writeFile(resolved.absPath, content, 'utf-8');
+    // 写成功后更新读时指纹，使后续 read/write 以新内容为基线（指纹一致态）。
+    ctx.deltaCache?.set(resolved.relPath, freshnessFingerprint(content), content);
     return ok({ written: filePath, bytes: Buffer.byteLength(content) });
   } catch (err: unknown) {
     return fail(`Write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * 写前新鲜度判定（四态，CG-3 硬拒 + CG-4 复用 deltaCache 哈希）：
+ *   1. 磁盘存在 ∧ 无指纹（本 run 未读）        → 拒：must read first
+ *   2. 磁盘存在 ∧ 已读 ∧ 当前磁盘指纹 ≠ 读时指纹 → 拒：changed externally
+ *   3. 磁盘存在 ∧ 已读 ∧ 指纹一致              → 准
+ *   4. 磁盘不存在                              → 准（新文件）
+ * deltaCache 未注入：透传（不误拒合法写，安全退回 PROTECTED_PATHS）。key 用 relPath（与 :459 一致）。
+ */
+async function checkWriteFreshness(
+  absPath: string,
+  relPath: string,
+  ctx: ToolContext
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  // 态 4：以磁盘存在性为准 —— 堵 TOCTOU 洞的关键。
+  let diskContent: string;
+  try {
+    diskContent = await fs.readFile(absPath, 'utf-8');
+  } catch {
+    // ENOENT → 新文件放行；其它读错误（权限等）不在新鲜度门职责内，透传给写盘报错。
+    return { ok: true };
+  }
+
+  if (!ctx.deltaCache) {
+    return { ok: true }; // 门不可用：透传，避免误拒合法写。
+  }
+
+  const cached = ctx.deltaCache.get(relPath);
+  if (!cached) {
+    // 态 1：磁盘已存在但本 run 未读 → 硬拒，要求先读。
+    return {
+      ok: false,
+      error: `code.write rejected: ${relPath} exists on disk but was not read in this run. ${REREAD_GUIDANCE}`,
+    };
+  }
+
+  const diskFingerprint = freshnessFingerprint(diskContent);
+  if (cached.hash !== diskFingerprint) {
+    // 态 2 / CG-3：硬拒 + 重读引导，不静默覆盖、不仅记日志。
+    return {
+      ok: false,
+      error: `code.write rejected: ${relPath} changed externally since last read. ${REREAD_GUIDANCE}`,
+    };
+  }
+  return { ok: true }; // 态 3：一致 → 准。
 }
 
 /* ================================================================== */
