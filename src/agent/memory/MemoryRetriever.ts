@@ -29,6 +29,11 @@ const RECENCY_HALF_LIFE_DAYS = 7;
 /** 相似度阈值 (用于 append 去重) */
 const SIMILARITY_UPDATE = 0.85;
 
+/** 召回记忆陈旧度阈值（天）。CG-1：>7 天加软前缀；≤7 天不加任何前缀（零噪声）。 */
+const STALE_MEMORY_DAYS = 7;
+/** 陈旧软提示前缀（render-only，不改任何持久化字段/Core schema），作确定性验收 grep marker。 */
+const STALE_MEMORY_PREFIX = '⏳[可能陈旧] ';
+
 /** 带评分的记忆检索结果 */
 export interface ScoredMemory extends DeserializedMemory {
   _score: number;
@@ -227,9 +232,12 @@ export class MemoryRetriever {
       return '';
     }
 
+    const now = Date.now();
     const lines = memories.map((m) => {
       const badge = m.importance >= 8 ? '⚠️' : m.importance >= 5 ? '📌' : '💡';
-      return `- ${badge} [${m.type}] ${m.content}`;
+      // CG-1：>7 天召回记忆加软前缀，提示对照当前源码核实；新鲜记忆不加噪。
+      const stale = MemoryRetriever.#stalenessPrefix(m, now);
+      return `- ${badge} ${stale}[${m.type}] ${m.content}`;
     });
 
     return `\n## 项目记忆 (${memories.length} 条最相关)\n${lines.join('\n')}\n`;
@@ -357,6 +365,26 @@ export class MemoryRetriever {
     } catch {
       return null;
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Private: 召回记忆陈旧度（render-only，CG-1）
+  // ═══════════════════════════════════════════════════════════
+
+  /**
+   * 单条召回记忆陈旧软前缀（render-only，CG-1）。
+   * 陷阱钉死：age 从 camelCase m.updatedAt（回退 m.lastAccessedAt）算 —— builder 喂入的是
+   * DeserializedMemory，绝不能用 raw row snake_case（那会 undefined → NaN）。
+   * 无效/缺失时间戳 → 显式 return ''（unknown-age 不标注，不把 NaN 当"很旧"，不抛错）。
+   */
+  static #stalenessPrefix(m: DeserializedMemory, now: number): string {
+    const stamp = m.updatedAt || m.lastAccessedAt || m.updatedAt; // 优先 updatedAt，空才看 lastAccessedAt
+    const ts = stamp ? new Date(stamp).getTime() : Number.NaN;
+    if (Number.isNaN(ts)) {
+      return ''; // unknown-age：不标注
+    }
+    const ageDays = (now - ts) / 86400_000;
+    return ageDays > STALE_MEMORY_DAYS ? STALE_MEMORY_PREFIX : '';
   }
 
   // ═══════════════════════════════════════════════════════════

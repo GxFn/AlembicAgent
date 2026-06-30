@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-
+// MemoryRetriever 未从 src/index.ts barrel 导出 → 必须走直接路径（barrel 路径会编译失败）。
+import { MemoryRetriever } from '../src/agent/memory/MemoryRetriever.js';
 import {
   ConversationStore,
   MEMORY_STORE_REQUIRED_COLUMNS,
@@ -323,5 +324,78 @@ describe('ConversationStore', () => {
 
     expect(store.list({ category: 'user' })).toEqual([]);
     expect(store.load(conversationId)).toEqual([]);
+  });
+});
+
+// ─── A-2 召回记忆陈旧度标注（render-only，§8 Phase 2 / CG-1）────────────────────
+// fixture 硬约束：经真 store.add → getAllActive/deserialize 路径构造（不手搓 camelCase 字面量，
+// 使大小写漂移直接红）；用 raw-row UPDATE 改 updated_at/last_accessed_at 造"旧"记忆。
+describe('MemoryRetriever staleness annotation (A-2)', () => {
+  function makeRetrieverWith(rows: Array<{ content: string; ageDays: number | null }>) {
+    const db = new Database(':memory:');
+    const store = new MemoryStore(db);
+    for (const r of rows) {
+      const { id } = store.add({ content: r.content, source: 'bootstrap', importance: 6 });
+      if (r.ageDays === null) {
+        db.prepare(
+          'UPDATE semantic_memories SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+        ).run('', null, id);
+      } else {
+        const stamp = new Date(Date.now() - r.ageDays * 86400_000).toISOString();
+        db.prepare(
+          'UPDATE semantic_memories SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+        ).run(stamp, null, id);
+      }
+    }
+    return { store, db, retriever: new MemoryRetriever(store) };
+  }
+
+  it('annotates memories older than 7 days with the stale prefix', async () => {
+    const { db, retriever } = makeRetrieverWith([{ content: 'STALE_ITEM', ageDays: 30 }]);
+    try {
+      const out = await retriever.toPromptSection({ source: 'bootstrap' });
+      expect(out).toContain('STALE_ITEM');
+      expect(out).toMatch(/⏳\[可能陈旧\] \[.*\] STALE_ITEM/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('does NOT annotate fresh memories (<=7 days)', async () => {
+    const { db, retriever } = makeRetrieverWith([{ content: 'FRESH_ITEM', ageDays: 1 }]);
+    try {
+      const out = await retriever.toPromptSection({ source: 'bootstrap' });
+      expect(out).toContain('FRESH_ITEM');
+      expect(out).not.toContain('⏳[可能陈旧]');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('treats missing/invalid timestamp as unknown-age (NaN guard, no annotation)', async () => {
+    const { db, retriever } = makeRetrieverWith([{ content: 'NAN_ITEM', ageDays: null }]);
+    try {
+      const out = await retriever.toPromptSection({ source: 'bootstrap' });
+      expect(out).toContain('NAN_ITEM');
+      expect(out).not.toContain('⏳[可能陈旧]');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('falls back to lastAccessedAt when updatedAt empty, via real deserialize', async () => {
+    const db = new Database(':memory:');
+    const store = new MemoryStore(db);
+    try {
+      const { id } = store.add({ content: 'FALLBACK_ITEM', source: 'bootstrap', importance: 6 });
+      const oldStamp = new Date(Date.now() - 30 * 86400_000).toISOString();
+      db.prepare(
+        'UPDATE semantic_memories SET updated_at = ?, last_accessed_at = ? WHERE id = ?'
+      ).run('', oldStamp, id);
+      const out = await new MemoryRetriever(store).toPromptSection({ source: 'bootstrap' });
+      expect(out).toMatch(/⏳\[可能陈旧\] \[.*\] FALLBACK_ITEM/);
+    } finally {
+      db.close();
+    }
   });
 });
