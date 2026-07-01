@@ -409,6 +409,92 @@ describe('R1 锚点驱动证据补齐（真机根因：头部窗口盖不住 fin
   });
 });
 
+describe('F1/F2 证据源约束（md 是线索不是证据）+ 路径截断修复', () => {
+  it('F1c: groundFindingRefs 跳过 .md 锚点（文档行不是代码接地）', () => {
+    const collector = new EvidenceCollector();
+    collector.groundFindingRefs(
+      [
+        {
+          finding: '文档锚点不补',
+          evidence: '设计详见 wakeflow-ledger/designs/arch-findings.md:23',
+          importance: 9,
+        },
+        { finding: '代码锚点照补', evidence: '实现见 src/alpha.ts:15-16', importance: 9 },
+      ],
+      (filePath, startLine, endLine) => {
+        if (filePath === 'src/alpha.ts') {
+          return { content: fileLines('alpha', startLine, Math.min(endLine, 20)), endLine };
+        }
+        // md 若被请求，端口也能返回——用于证明「没请求」而不是「读不到」。
+        return { content: '- **doc line**', endLine: startLine };
+      }
+    );
+    const { evidenceMap } = collector.build();
+    expect(evidenceMap.has('wakeflow-ledger/designs/arch-findings.md')).toBe(false);
+    expect(evidenceMap.get('src/alpha.ts')?.codeSnippets[0]?.startLine).toBe(15);
+  });
+
+  it('F1b: md 文件的 evidence entry 渲染为背景文件，绝不进可复制 ref 列表', () => {
+    const section =
+      buildCodeContextSection(
+        new Map([
+          [
+            'wakeflow-ledger/designs/arch-findings.md',
+            {
+              filePath: 'wakeflow-ledger/designs/arch-findings.md',
+              summary: '架构审计结论文档',
+              codeSnippets: [{ startLine: 23, endLine: 23, content: '- **audit finding**' }],
+            },
+          ],
+          evidenceEntryForFidelity('alpha', 2, 4),
+        ])
+      ) ?? '';
+    // md 有 snippet 也降级背景；代码文件正常渲染。
+    expect(section).toContain('背景文件');
+    expect(section).toContain('wakeflow-ledger/designs/arch-findings.md');
+    expect(section).not.toContain('arch-findings.md:23-23');
+    expect(section).not.toContain('audit finding');
+    expect(section).toContain('src/alpha.ts:2-4');
+  });
+
+  it('F2: search 结果里的 .md 路径完整提取进 referencedFiles（不再截成 .m）', () => {
+    const artifact = buildAnalysisArtifact(
+      {
+        reply: 'Architecture analysis referencing design docs and code.',
+        toolCalls: [
+          {
+            tool: 'code',
+            args: { action: 'search', pattern: 'architecture' },
+            result:
+              '2 matches (showing 2)\n\nwakeflow-ledger/designs/space-seam-findings-2026-06-12.md:120: some doc line\nsrc/alpha.ts:3: export const alpha2 = 2;',
+          },
+        ],
+      },
+      'architecture'
+    );
+    const refs = artifact.referencedFiles as string[];
+    expect(refs).toContain('wakeflow-ledger/designs/space-seam-findings-2026-06-12.md');
+    expect(refs.some((r) => r.endsWith('.m'))).toBe(false);
+  });
+});
+
+/** 便捷构造：与临时项目一致的代码文件 entry */
+function evidenceEntryForFidelity(
+  name: 'alpha' | 'beta' | 'gamma',
+  startLine: number,
+  endLine: number
+): [string, { filePath: string; codeSnippets: object[]; summary: string }] {
+  const filePath = `src/${name}.ts`;
+  return [
+    filePath,
+    {
+      filePath,
+      summary: `${name} 常量导出`,
+      codeSnippets: [{ startLine, endLine, content: fileLines(name, startLine, endLine) }],
+    },
+  ];
+}
+
 describe('R2 graph 证据流（关系声明不再被迫在阉割表述与编造 ref 间二选一）', () => {
   it('Analyst 真实 graph 调用物化为 graphEvidence，Producer 渲染可复制 graphRefs 段', () => {
     const collector = new EvidenceCollector();

@@ -323,8 +323,10 @@ export function buildAnalysisReport(
             searchQueries.push(pat as string);
           }
           if (typeof result === 'string') {
+            // 扩展名组后必须收 \b：否则 alternation 里 `m` 排在 `md` 前，`findings.md:120`
+            // 会被截成 `findings.m`（真机 SOURCE_REF_NOT_FOUND ×8 的来源——模型照抄了截断路径）。
             const fileMatches = result.match(
-              /(?:^|\n)([\w/.-]+\.(?:go|mod|sum|py|pyi|java|kt|kts|js|ts|jsx|tsx|mjs|cjs|swift|m|h|c|cpp|cc|hpp|cs|rb|rs|sql|json|yaml|yml|toml|xml|html|css|scss|less|sh|md|txt|gradle|properties|proto|vue|svelte|graphql|cfg|conf|ini|env|lock|rst))(?::\d+)?/gi
+              /(?:^|\n)([\w/.-]+\.(?:go|mod|sum|py|pyi|java|kt|kts|js|ts|jsx|tsx|mjs|cjs|swift|m|h|c|cpp|cc|hpp|cs|rb|rs|sql|json|yaml|yml|toml|xml|html|css|scss|less|sh|md|txt|gradle|properties|proto|vue|svelte|graphql|cfg|conf|ini|env|lock|rst)\b)(?::\d+)?/gi
             );
             if (fileMatches) {
               for (const m of fileMatches) {

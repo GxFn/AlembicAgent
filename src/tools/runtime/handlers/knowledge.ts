@@ -198,7 +198,34 @@ async function handleSubmit(
       Logger.getInstance().warn(
         `[knowledge.submit] rejected "${String((item as { title?: unknown }).title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${detail}`
       );
-      return fail(`Validation failed: ${detail}`);
+      // F3 拒绝止损：真机 ts-js-module 曾因「拒绝→重试」循环烧穿 produce 阶段 900s（stage_timeout
+      // 连坐 session abort 下游 8 维度）。在 runtime 上维护连续/累计拒绝计数，按档位在拒绝消息里
+      // 附加 STOP 指令，让模型跳过修不动的候选、及时收束——预算换覆盖，而不是死磕单条。
+      const runtimeState = ctx.runtime as Record<string, unknown> | undefined;
+      let stopDirective = '';
+      if (runtimeState) {
+        const streak = (Number(runtimeState._gateRejectStreak) || 0) + 1;
+        const total = (Number(runtimeState._gateRejectTotal) || 0) + 1;
+        runtimeState._gateRejectStreak = streak;
+        runtimeState._gateRejectTotal = total;
+        if (total >= 12) {
+          stopDirective =
+            ' 🛑 STOP: 本会话门禁拒绝已达预算上限——禁止再调用 knowledge submit，立即输出最终总结，把未通过的候选列为 blocker（这不算失败）。';
+        } else if (streak >= 3) {
+          stopDirective =
+            ' 🛑 STOP: 已连续多次被拒——立即放弃当前候选（不要再改写重试它），换下一条【不同】候选继续提交；若没有其他候选，直接输出最终总结并把本条列为 blocker。';
+        }
+        if (stopDirective) {
+          Logger.getInstance().warn(
+            `[knowledge.submit] reject stop-loss engaged (dim=${String(effectiveDimensionId ?? '')}): streak=${streak}, total=${total}`
+          );
+        }
+      }
+      return fail(`Validation failed: ${detail}${stopDirective}`);
+    }
+    // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
+    if (ctx.runtime) {
+      (ctx.runtime as Record<string, unknown>)._gateRejectStreak = 0;
     }
 
     const result = await gateway.create({

@@ -101,6 +101,18 @@ const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
 /** finding.evidence 里的 `path:start(-end)` 锚点引用（路径需带扩展名，避免误抓散文） */
 const FINDING_REF_RE = /([\w@][\w@\-./]*\.[A-Za-z][\w]*):(\d+)(?:-(\d+))?/g;
 
+/**
+ * 文档类扩展名：协作/设计/总结 markdown 是二手描述，不算代码接地——锚点补齐跳过它们
+ * （真机上 Analyst 曾把 wakeflow-ledger 的 *.md 当证据主源，候选全被 SNIPPET/GRAPH 拒）。
+ * Producer 渲染端同样把 md 条目降级为背景文件，两端一致收紧。
+ */
+const DOC_FILE_RE = /\.(?:md|markdown|rst|txt)$/i;
+
+/** 是否为文档类路径（不可作代码证据的照抄来源） */
+export function isDocEvidencePath(filePath: string): boolean {
+  return DOC_FILE_RE.test(filePath);
+}
+
 /** 单行锚点补读时向下扩展的行数（含锚点行；给 coreCode 留可复制的上下文） */
 const ANCHOR_CONTEXT_LINES = 8;
 
@@ -375,6 +387,10 @@ export class EvidenceCollector {
         const filePath = match[1] ?? '';
         const startLine = Number(match[2]);
         if (!filePath || !Number.isFinite(startLine) || startLine < 1) {
+          continue;
+        }
+        // 文档锚点不补：md 行不是代码证据，补了只会诱导 Producer 引用二手描述。
+        if (isDocEvidencePath(filePath)) {
           continue;
         }
         // 带范围的锚点用原范围（cap 单片段行数上限）；单行锚点向下扩展少量上下文，
