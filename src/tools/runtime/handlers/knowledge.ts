@@ -34,6 +34,69 @@ const SNIPPET_REPAIR_MAX_LINES = 12;
 const FIRST_FENCED_RE = /(```[a-zA-Z0-9_-]*\s*\n)([\s\S]*?)(```)/;
 
 /**
+ * 读取 sourceRefs 中第一个可解析 ref 的真实行范围原文（越界行号 clamp 进文件）。
+ * F4b 修复提示与 F4d 自动对齐共用。只读、projectRoot 内限定、失败返回 null。
+ */
+function readRefRangeCode(
+  sourceRefs: unknown,
+  projectRoot: string | undefined
+): {
+  code: string;
+  refText: string;
+  outOfRange: boolean;
+  rawStart: number;
+  fileLines: number;
+} | null {
+  if (!projectRoot || !Array.isArray(sourceRefs)) {
+    return null;
+  }
+  for (const ref of sourceRefs) {
+    if (typeof ref !== 'string') {
+      continue;
+    }
+    const m = ref.match(/^(.+?):(\d+)(?:-(\d+))?$/);
+    if (!m?.[1]) {
+      continue;
+    }
+    try {
+      const normalized = path.posix.normalize(m[1].replaceAll('\\', '/'));
+      if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
+        continue;
+      }
+      const absPath = path.join(projectRoot, normalized);
+      if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+        continue;
+      }
+      const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
+      const rawStart = Number(m[2]);
+      if (!Number.isFinite(rawStart) || rawStart < 1) {
+        continue;
+      }
+      const outOfRange = rawStart > lines.length;
+      const start = outOfRange
+        ? Math.max(1, lines.length - SNIPPET_REPAIR_MAX_LINES + 1)
+        : rawStart;
+      const requestedEnd = m[3] ? Number(m[3]) : start + SNIPPET_REPAIR_MAX_LINES - 1;
+      const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1, lines.length);
+      const code = lines.slice(start - 1, end).join('\n');
+      if (!code.trim()) {
+        continue;
+      }
+      return {
+        code,
+        refText: `${normalized}:${start}-${end}`,
+        outOfRange,
+        rawStart,
+        fileLines: lines.length,
+      };
+    } catch {
+      // 只读失败换下一个 ref：宁缺毋错。
+    }
+  }
+  return null;
+}
+
+/**
  * F4c 内部规范化重验：门禁的代码证据取三处（coreCode / content.pattern / markdown 首个
  * fenced block），三处都须逐字匹配 cited range。真机 DeepSeek 反复只抄对其中一处、另一处
  * 坚持自写「示意代码」——同一候选换标题重试三轮全卡 SNIPPET_MISMATCH，烧轮次不收敛。
@@ -74,9 +137,27 @@ function tryNormalizeSnippetEvidence(
     });
     // 方向 2：markdown fenced 为真 → coreCode 同步为 fenced。
     variants.push({ direction: 'coreCode ← markdown-fenced', item: { ...item, coreCode: fenced } });
-  } else if (coreCode && !fenced) {
-    // 无 fenced：仅 coreCode 不匹配无从规范化；有 pattern 的情形并入方向 2 的语义。
-    return null;
+  }
+
+  // 方向 3（F4d 自动对齐）：coreCode / fenced 都不匹配（或缺失）时，用模型【自己引用】的
+  // sourceRef 范围原文替换全部代码位。四轮真机(21 提交 0 过)证明 DeepSeek 不执行「逐字照抄」
+  // 动作——所有教育路线(证据/锚点/答案反馈)到顶后，这是把候选诚实化的确定性收敛：ref 是模型
+  // 声称的知识来源；候选进入待人审 candidates，语义一致性由 Dashboard 审核兜底。
+  const refRange = readRefRangeCode(item.sourceRefs, opts.projectRoot);
+  if (refRange) {
+    const alignedMarkdown = markdown.match(FIRST_FENCED_RE)
+      ? markdown.replace(FIRST_FENCED_RE, (_m, open, _body, close) =>
+          [open, refRange.code, '\n', close].join('')
+        )
+      : markdown;
+    variants.push({
+      direction: `all ← sourceRef(${refRange.refText})`,
+      item: {
+        ...item,
+        coreCode: refRange.code,
+        content: { ...content, markdown: alignedMarkdown },
+      },
+    });
   }
 
   for (const variant of variants) {
@@ -99,52 +180,14 @@ function tryNormalizeSnippetEvidence(
  * snippet-match（判据 = 去空白子串包含）。只读、projectRoot 内限定、失败静默返回空串。
  */
 function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undefined): string {
-  if (!projectRoot || !Array.isArray(sourceRefs)) {
+  const range = readRefRangeCode(sourceRefs, projectRoot);
+  if (!range) {
     return '';
   }
-  for (const ref of sourceRefs) {
-    if (typeof ref !== 'string') {
-      continue;
-    }
-    const m = ref.match(/^(.+?):(\d+)(?:-(\d+))?$/);
-    if (!m?.[1]) {
-      continue;
-    }
-    try {
-      const normalized = path.posix.normalize(m[1].replaceAll('\\', '/'));
-      if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
-        continue;
-      }
-      const absPath = path.join(projectRoot, normalized);
-      if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
-        continue;
-      }
-      const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
-      const rawStart = Number(m[2]);
-      if (!Number.isFinite(rawStart) || rawStart < 1) {
-        continue;
-      }
-      // 行号越界（SOURCE_REF_LINE_OUT_OF_RANGE 的成因）不跳过：clamp 进文件并明示真实行数，
-      // 让第一次拒绝就带可照抄的答案。
-      const outOfRange = rawStart > lines.length;
-      const start = outOfRange
-        ? Math.max(1, lines.length - SNIPPET_REPAIR_MAX_LINES + 1)
-        : rawStart;
-      const requestedEnd = m[3] ? Number(m[3]) : start + SNIPPET_REPAIR_MAX_LINES - 1;
-      const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1, lines.length);
-      const code = lines.slice(start - 1, end).join('\n');
-      if (!code.trim()) {
-        continue;
-      }
-      const rangeNote = outOfRange
-        ? `你引用的行号 ${rawStart} 超出该文件（共 ${lines.length} 行）。请改用 ${normalized}:${start}-${end}，`
-        : `引用范围 ${normalized}:${start}-${end} `;
-      return ` 📎 修复提示：${rangeNote}其真实代码如下，请把 sourceRefs、coreCode 与 markdown 代码块【逐字替换】为它（或其中的连续片段），不要改写:\n${code}`;
-    } catch {
-      // 只读修复提示失败时静默跳过：宁缺毋错。
-    }
-  }
-  return '';
+  const rangeNote = range.outOfRange
+    ? `你引用的行号 ${range.rawStart} 超出该文件（共 ${range.fileLines} 行）。请改用 ${range.refText}，`
+    : `引用范围 ${range.refText} `;
+  return ` 📎 修复提示：${rangeNote}其真实代码如下。请【先按此答案重试本条一次】（把 sourceRefs、coreCode 与 markdown 代码块逐字替换为它，不要改写），带答案的拒绝不算连续失败；重试后仍被拒才换下一条:\n${range.code}`;
 }
 
 export async function handle(
@@ -334,9 +377,11 @@ async function handleSubmit(
       // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
       // 模型下一轮逐字照抄即可通过 snippet-match（去空白子串包含）。这把照抄链从
       // 「预先给对证据」升级为「错了就给正确答案」，不依赖第一轮依从性。
-      // OUT_OF_RANGE 也给答案（否则第一拒无提示、第二拒才有、第三次已被止损——答案永远晚一步）。
-      const snippetRepair = gateViolations.some(
-        (v) => v.code === 'SNIPPET_MISMATCH' || v.code === 'SOURCE_REF_LINE_OUT_OF_RANGE'
+      // 代码/引用类违规都给答案（否则第一拒无提示、第二拒才有、第三次已被止损——答案永远晚一步）。
+      const snippetRepair = gateViolations.some((v) =>
+        ['SNIPPET_MISMATCH', 'SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING'].includes(
+          v.code
+        )
       )
         ? buildSnippetRepairHint(item.sourceRefs, ctx.projectRoot)
         : '';
