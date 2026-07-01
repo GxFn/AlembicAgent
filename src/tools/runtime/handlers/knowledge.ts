@@ -10,7 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
-import { getSystemInjectedFields } from '@alembic/core/knowledge';
+import { getSystemInjectedFields, type RecipeAuthoringViolation } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import {
   estimateTokens,
@@ -44,7 +44,11 @@ const FIRST_FENCED_RE = /(```[a-zA-Z0-9_-]*\s*\n)([\s\S]*?)(```)/;
 function tryNormalizeSnippetEvidence(
   item: Record<string, unknown>,
   opts: { projectRoot: string | undefined; dimensionId: string | undefined }
-): { item: Record<string, unknown>; direction: string } | null {
+): {
+  item: Record<string, unknown>;
+  direction: string;
+  violations: RecipeAuthoringViolation[];
+} | null {
   if (!opts.projectRoot) {
     return null;
   }
@@ -80,8 +84,10 @@ function tryNormalizeSnippetEvidence(
       projectRoot: opts.projectRoot,
       dimensionId: opts.dimensionId,
     });
-    if (violations.length === 0) {
-      return variant;
+    // 采纳条件：SNIPPET_MISMATCH 消失即可（不要求零违规）——真机拒绝常与 GRAPH/DO_CLAUSE
+    // 复合，若强求全过则规范化几乎永不生效。剩余文本层违规交回模型修（那是它能修的）。
+    if (!violations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+      return { ...variant, violations };
     }
   }
   return null;
@@ -114,17 +120,26 @@ function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undef
         continue;
       }
       const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
-      const start = Number(m[2]);
-      if (!Number.isFinite(start) || start < 1 || start > lines.length) {
+      const rawStart = Number(m[2]);
+      if (!Number.isFinite(rawStart) || rawStart < 1) {
         continue;
       }
+      // 行号越界（SOURCE_REF_LINE_OUT_OF_RANGE 的成因）不跳过：clamp 进文件并明示真实行数，
+      // 让第一次拒绝就带可照抄的答案。
+      const outOfRange = rawStart > lines.length;
+      const start = outOfRange
+        ? Math.max(1, lines.length - SNIPPET_REPAIR_MAX_LINES + 1)
+        : rawStart;
       const requestedEnd = m[3] ? Number(m[3]) : start + SNIPPET_REPAIR_MAX_LINES - 1;
       const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1, lines.length);
       const code = lines.slice(start - 1, end).join('\n');
       if (!code.trim()) {
         continue;
       }
-      return ` 📎 修复提示：引用范围 ${normalized}:${start}-${end} 的真实代码如下，请把 coreCode 与 markdown 代码块【逐字替换】为它（或其中的连续片段），不要改写:\n${code}`;
+      const rangeNote = outOfRange
+        ? `你引用的行号 ${rawStart} 超出该文件（共 ${lines.length} 行）。请改用 ${normalized}:${start}-${end}，`
+        : `引用范围 ${normalized}:${start}-${end} `;
+      return ` 📎 修复提示：${rangeNote}其真实代码如下，请把 sourceRefs、coreCode 与 markdown 代码块【逐字替换】为它（或其中的连续片段），不要改写:\n${code}`;
     } catch {
       // 只读修复提示失败时静默跳过：宁缺毋错。
     }
@@ -307,10 +322,11 @@ async function handleSubmit(
       });
       if (normalized) {
         Logger.getInstance().info(
-          `[knowledge.submit] snippet evidence normalized (${normalized.direction}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+          `[knowledge.submit] snippet evidence normalized (${normalized.direction}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${normalized.violations.length}`
         );
         effectiveItem = normalized.item;
-        gateViolations = [];
+        // 剩余文本层违规（graph/doClause 等）照常走拒绝反馈——但 snippet 维度已确定性消化。
+        gateViolations = normalized.violations;
       }
     }
     if (gateViolations.length > 0) {
@@ -318,7 +334,10 @@ async function handleSubmit(
       // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
       // 模型下一轮逐字照抄即可通过 snippet-match（去空白子串包含）。这把照抄链从
       // 「预先给对证据」升级为「错了就给正确答案」，不依赖第一轮依从性。
-      const snippetRepair = gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')
+      // OUT_OF_RANGE 也给答案（否则第一拒无提示、第二拒才有、第三次已被止损——答案永远晚一步）。
+      const snippetRepair = gateViolations.some(
+        (v) => v.code === 'SNIPPET_MISMATCH' || v.code === 'SOURCE_REF_LINE_OUT_OF_RANGE'
+      )
         ? buildSnippetRepairHint(item.sourceRefs, ctx.projectRoot)
         : '';
       // 可见化:门禁拒绝是冷启动候选不落库的最可能真因(如冷启动档位的 3-file 证据下限、祈使动词、
