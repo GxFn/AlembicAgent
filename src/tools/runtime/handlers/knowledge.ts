@@ -7,6 +7,7 @@
  * 后端: SearchEngine (BM25 + 向量), RecipeProductionGateway, KnowledgeRepository
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
@@ -25,6 +26,54 @@ import {
 
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
+
+/** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
+const SNIPPET_REPAIR_MAX_LINES = 12;
+
+/**
+ * F4b：SNIPPET_MISMATCH 拒绝时，读取第一个可解析 sourceRef 的真实行范围，把逐字代码
+ * 附进拒绝消息——模型下一轮把 coreCode / markdown 代码块替换为该内容即可通过
+ * snippet-match（判据 = 去空白子串包含）。只读、projectRoot 内限定、失败静默返回空串。
+ */
+function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undefined): string {
+  if (!projectRoot || !Array.isArray(sourceRefs)) {
+    return '';
+  }
+  for (const ref of sourceRefs) {
+    if (typeof ref !== 'string') {
+      continue;
+    }
+    const m = ref.match(/^(.+?):(\d+)(?:-(\d+))?$/);
+    if (!m?.[1]) {
+      continue;
+    }
+    try {
+      const normalized = path.posix.normalize(m[1].replaceAll('\\', '/'));
+      if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
+        continue;
+      }
+      const absPath = path.join(projectRoot, normalized);
+      if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+        continue;
+      }
+      const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
+      const start = Number(m[2]);
+      if (!Number.isFinite(start) || start < 1 || start > lines.length) {
+        continue;
+      }
+      const requestedEnd = m[3] ? Number(m[3]) : start + SNIPPET_REPAIR_MAX_LINES - 1;
+      const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1, lines.length);
+      const code = lines.slice(start - 1, end).join('\n');
+      if (!code.trim()) {
+        continue;
+      }
+      return ` 📎 修复提示：引用范围 ${normalized}:${start}-${end} 的真实代码如下，请把 coreCode 与 markdown 代码块【逐字替换】为它（或其中的连续片段），不要改写:\n${code}`;
+    } catch {
+      // 只读修复提示失败时静默跳过：宁缺毋错。
+    }
+  }
+  return '';
+}
 
 export async function handle(
   action: string,
@@ -193,6 +242,12 @@ async function handleSubmit(
     });
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);
+      // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
+      // 模型下一轮逐字照抄即可通过 snippet-match（去空白子串包含）。这把照抄链从
+      // 「预先给对证据」升级为「错了就给正确答案」，不依赖第一轮依从性。
+      const snippetRepair = gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')
+        ? buildSnippetRepairHint(item.sourceRefs, ctx.projectRoot)
+        : '';
       // 可见化:门禁拒绝是冷启动候选不落库的最可能真因(如冷启动档位的 3-file 证据下限、祈使动词、
       // snippet 匹配、source-ref 接地)。打日志带标题+违规明细，便于定位是 DeepSeek 候选质量还是门禁校准。
       Logger.getInstance().warn(
@@ -221,7 +276,7 @@ async function handleSubmit(
           );
         }
       }
-      return fail(`Validation failed: ${detail}${stopDirective}`);
+      return fail(`Validation failed: ${detail}${snippetRepair}${stopDirective}`);
     }
     // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
     if (ctx.runtime) {

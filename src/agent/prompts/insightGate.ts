@@ -432,6 +432,15 @@ function createFsSnippetRangeReader(projectRoot: string): SnippetRangeReader {
   };
 }
 
+/** 统计 collector 当前片段总数（锚点补齐前后对照用） */
+function countSnippets(collector: EvidenceCollector): number {
+  let total = 0;
+  for (const entry of collector.build().evidenceMap.values()) {
+    total += entry.codeSnippets.length;
+  }
+  return total;
+}
+
 export function buildAnalysisArtifact(
   analystResult: AnalystResult,
   dimensionId: string,
@@ -474,7 +483,17 @@ export function buildAnalysisArtifact(
   // R1 锚点驱动证据补齐：findings 引用的 path:line 锚点若不在已采片段覆盖内（典型：全文读
   // 只留头 30 行窗口，锚点在窗口外），从磁盘补读精确片段——每条发现都有可照抄的逐字证据。
   if (opts.projectRoot) {
+    const beforeSnippets = countSnippets(collector);
     collector.groundFindingRefs(findings, createFsSnippetRangeReader(opts.projectRoot));
+    const afterSnippets = countSnippets(collector);
+    const anchoredFindings = findings.filter(
+      (f) => typeof f.evidence === 'string' && /\.[A-Za-z]\w*:\d+/.test(f.evidence)
+    ).length;
+    // 残余根因分辨日志：anchored=0 → Analyst 没写行号锚（依从性缺口在上游）；
+    // anchored>0 且 grounded=0 → 锚点路径解析失败；grounded>0 仍被拒 → Producer 没照抄。
+    logger().info(
+      `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, groundedSnippets=+${afterSnippets - beforeSnippets} (dim=${dimensionId})`
+    );
   }
 
   const evidence = collector.build();
