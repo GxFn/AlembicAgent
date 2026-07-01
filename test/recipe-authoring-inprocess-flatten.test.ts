@@ -25,7 +25,12 @@ import {
   validateAgainst,
 } from '@alembic/core/knowledge';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { buildProducerPromptV2 } from '../src/agent/prompts/insightProducer.js';
+import type { EvidenceEntry } from '../src/agent/domain/EvidenceCollector.js';
+import {
+  buildCodeContextSection,
+  buildProducerPromptV2,
+  PRODUCER_SYSTEM_PROMPT,
+} from '../src/agent/prompts/insightProducer.js';
 import {
   createInProcessSourceRefResolver,
   formatRecipeAuthoringViolations,
@@ -359,5 +364,140 @@ describe('P1.4b host-vs-in-process parity (§12.5 standing tripwire)', () => {
     const opportunistic = runPath('in-process', 'opportunistic');
     // cold-start 至少多出证据下限类裁决，证明 parity 不是「两档恒等」的平凡通过。
     expect(cold).not.toEqual(opportunistic);
+  });
+});
+
+describe('冷启动候选拒绝修复：copy-ready 证据 → cold-start 门禁可过 (options 2+3)', () => {
+  /**
+   * 修复背景（2026-07-02 真机冷启动 16 条候选全拒）：
+   *  - SOURCE_REF_LINE_MISSING(27)：旧 evidence 段渲染 `path [L42-58]`，与门禁 SOURCE_REF_RE
+   *    (`path:42-58`) 不符，DeepSeek 复制时丢行号 → option 2a 改为渲染可逐字复制的 `path:起-止`。
+   *  - SNIPPET_MISMATCH(16)：refs-first 只给 ref 不给代码，Producer 凭空写 coreCode → option 2b
+   *    注入「可复制 coreCode」真实片段（无截断标记的源码逐字前缀）。
+   *  - DO_CLAUSE/INSUFFICIENT_EVIDENCE/GRAPH_REF：option 3 在 PRODUCER_SYSTEM_PROMPT 增加
+   *    🚨 过门禁硬约束块（逐字复制 refs/code、3 文件下限、祈使动词、关系词规避）。
+   * 本块给出确定性证明：按注入证据逐字构造的候选在 cold-start（完整门禁）下零违规 ——
+   * 即「模型只要照抄提示里给的证据就能过门禁」，剩余风险只在模型是否照抄（提示硬约束负责收敛）。
+   */
+
+  /** 与 beforeAll 写入临时项目逐字一致的行范围原文（行 n 的文本 = `export const <name><n-1> = <n-1>;`）。 */
+  function fileLines(name: 'alpha' | 'beta' | 'gamma', startLine: number, endLine: number): string {
+    return Array.from(
+      { length: endLine - startLine + 1 },
+      (_, i) => `export const ${name}${startLine - 1 + i} = ${startLine - 1 + i};`
+    ).join('\n');
+  }
+
+  function evidenceEntry(
+    name: 'alpha' | 'beta' | 'gamma',
+    startLine: number,
+    endLine: number,
+    summary: string
+  ): [string, EvidenceEntry] {
+    const filePath = `src/${name}.ts`;
+    return [
+      filePath,
+      {
+        filePath,
+        summary,
+        codeSnippets: [{ startLine, endLine, content: fileLines(name, startLine, endLine) }],
+      },
+    ];
+  }
+
+  it('evidence 段渲染门禁格式 path:起-止（旧 [L..] 格式已死）+ 可复制 coreCode 逐字在场', () => {
+    const section = buildCodeContextSection(
+      new Map([
+        evidenceEntry('alpha', 2, 4, 'Alpha 常量导出模式'),
+        evidenceEntry('beta', 1, 3, 'Beta 常量导出模式'),
+        evidenceEntry('gamma', 5, 7, 'Gamma 常量导出模式'),
+      ])
+    );
+    expect(section).not.toBeNull();
+    const text = section ?? '';
+    // 门禁可逐字复制的 ref 形态；旧 `path [L42-58]` 渲染绝迹。
+    expect(text).toContain('src/alpha.ts:2-4');
+    expect(text).toContain('src/beta.ts:1-3');
+    expect(text).toContain('src/gamma.ts:5-7');
+    expect(text).not.toMatch(/\[L\d+/);
+    // 可复制 coreCode：真实源码逐字在场（snippet-match 判据 = 去空白子串包含）。
+    expect(text).toContain('可复制 coreCode(来源 src/alpha.ts:2-4)');
+    expect(text).toContain(fileLines('alpha', 2, 4));
+  });
+
+  it('超预算代码截断仍是源码逐字前缀，绝不追加截断标记（否则照抄反而必挂 SNIPPET_MISMATCH）', () => {
+    const fullContent = fileLines('alpha', 1, 20); // ~500 字符 > 220 上限，必触发截断
+    const section = buildCodeContextSection(
+      new Map([
+        [
+          'src/alpha.ts',
+          {
+            filePath: 'src/alpha.ts',
+            summary: 'Alpha 全文件',
+            codeSnippets: [{ startLine: 1, endLine: 20, content: fullContent }],
+          },
+        ],
+      ])
+    );
+    const text = section ?? '';
+    expect(text).not.toContain('truncated');
+    const marker = '可复制 coreCode(来源 src/alpha.ts:1-20): ';
+    const markerIndex = text.indexOf(marker);
+    expect(markerIndex).toBeGreaterThan(-1);
+    const injected = text.slice(markerIndex + marker.length);
+    // 注入代码是原始范围的逐字前缀 → 复制后 normalizedCode 子串包含成立，门禁必过。
+    expect(injected.length).toBeGreaterThan(0);
+    expect(fullContent.startsWith(injected)).toBe(true);
+  });
+
+  it('按提示契约逐字构造的候选（refs 照抄 + coreCode 照抄）过 cold-start 完整门禁零违规', () => {
+    // cleanRecipe 的 sourceRefs 已是 evidence 段渲染的 `src/*.ts:1-3` 逐字形态（3 文件下限满足）；
+    // coreCode = 「可复制 coreCode」注入的 src/alpha.ts:1-3 范围原文。dimensionId 强制 cold-start。
+    const violations = runInProcessRecipeAuthoringGate(
+      cleanRecipe({ coreCode: fileLines('alpha', 1, 3) }),
+      { projectRoot, dimensionId: 'architecture' }
+    );
+    expect(formatRecipeAuthoringViolations(violations)).toBe('');
+    expect(violations).toEqual([]);
+  });
+
+  it('凭空编写的 coreCode 在 cold-start 仍被 SNIPPET_MISMATCH 拒绝（门禁未被放松，修复只是喂对证据）', () => {
+    const violations = runInProcessRecipeAuthoringGate(
+      cleanRecipe({ coreCode: 'const fabricatedHelper = buildSomethingNotInTheCitedRange();' }),
+      { projectRoot, dimensionId: 'architecture' }
+    );
+    expect(codesOf(violations)).toContain('SNIPPET_MISMATCH');
+  });
+
+  it('evidence 段随 buildProducerPromptV2 真正进入 Producer 提示（不是孤立辅助函数）', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: 'Alpha module exports constants in a fixed pattern.',
+        evidenceMap: new Map([
+          evidenceEntry('alpha', 2, 4, 'Alpha 常量导出模式'),
+          evidenceEntry('beta', 1, 3, 'Beta 常量导出模式'),
+        ]),
+        findings: [{ finding: 'Alpha export pattern', importance: 8 }],
+        negativeSignals: [],
+        referencedFiles: ['src/alpha.ts'],
+      },
+      { id: 'architecture', label: 'Architecture' },
+      { name: 'Demo' }
+    );
+    expect(prompt).toContain('src/alpha.ts:2-4');
+    expect(prompt).toContain('可复制 coreCode');
+  });
+
+  it('系统提示携带过门禁硬约束块（option 3：逐字复制 refs/code + 3 文件下限 + 祈使动词 + 关系词规避）', () => {
+    expect(PRODUCER_SYSTEM_PROMPT).toContain('过门禁硬约束');
+    for (const code of [
+      'SOURCE_REF_LINE_MISSING',
+      'INSUFFICIENT_EVIDENCE',
+      'SNIPPET_MISMATCH',
+      'DO_CLAUSE_NON_IMPERATIVE',
+      'GRAPH_REF_INVALID',
+    ]) {
+      expect(PRODUCER_SYSTEM_PROMPT).toContain(code);
+    }
   });
 });

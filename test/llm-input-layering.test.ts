@@ -210,7 +210,7 @@ describe('LLM input layering', () => {
     expect(prompt.match(new RegExp(repeatedEvidence, 'g'))?.length).toBe(1);
   });
 
-  it('uses refs-first Producer evidence packets without replaying Analyst code bodies', () => {
+  it('uses copy-ready bounded Producer evidence packets (refs + short verbatim snippet, no full replay section)', () => {
     const prompt = buildProducerPromptV2(
       {
         analysisText: 'FeatureCoordinator owns navigation state and must be submitted.',
@@ -245,9 +245,14 @@ describe('LLM input layering', () => {
     );
 
     expect(prompt).toContain('Analyst evidence refs (bounded)');
-    expect(prompt).toContain('不要为相同证据重复读取源码');
-    expect(prompt).toContain('Sources/App/Feature.swift [L12-12]');
-    expect(prompt).not.toContain('final class FeatureCoordinator {}');
+    // 2026-07-02 冷启动修复：ref 渲染为门禁可逐字复制的 path:起-止（旧 `path [L12-12]` 让 DeepSeek
+    // 复制时丢行号，SOURCE_REF_LINE_MISSING 是真机 16 条候选全拒的首因）。
+    expect(prompt).toContain('Sources/App/Feature.swift:12-12');
+    expect(prompt).not.toContain('[L12-12]');
+    // 短片段随 ref 有界注入（每条 ≤220 字符、总预算 1600），供 coreCode 逐字复制过 snippet-match；
+    // 这不是旧「Analyst 已读取的代码」整段重放 —— 该区块保持死亡，refs-first 的预算不变量仍然成立。
+    expect(prompt).toContain('可复制 coreCode(来源 Sources/App/Feature.swift:12-12)');
+    expect(prompt).toContain('final class FeatureCoordinator {}');
     expect(prompt).not.toContain('Analyst 已读取的代码');
   });
 
