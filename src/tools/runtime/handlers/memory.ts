@@ -5,6 +5,7 @@
  * Actions: save, recall, note_finding, get_previous_evidence
  */
 
+import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
 import {
   estimateTokens,
   fail,
@@ -13,6 +14,29 @@ import {
   type ToolContext,
   type ToolResult,
 } from '#tools/kernel/registry.js';
+
+/**
+ * P4/C10: 把 note_finding 的可选结构化深度槽(designIntent/boundaries/failureModes/tradeoffs)序列化成
+ * `## <label>` markdown 分节，标签取自 Core DEPTH_DIMENSIONS(单源)。深度随 finding 的 evidence 一并进
+ * ActiveContext.#scratchpad，Producer 消费 note_finding 时即可见「为何这样设计 / 边界 / 越界会怎样 / 权衡」。
+ *
+ * 刻意用 `## <label>` 而非自定义标记：这正是 Core `reviewRecipeDepth` 的输入格式，使 in-process 深度 retry
+ * 门(C9)能把 findings 的 evidence 直接喂给同一 Core 裁判做接地判定，零自定义解析、与 host 侧字节同源。
+ * 仅收非空槽；不做任何补写或校验(接地判定由 Core reviewRecipeDepth 在 gate/retry 侧统一负责)。
+ */
+function buildDepthBlock(params: Record<string, unknown>): string {
+  const sections: string[] = [];
+  for (const dim of DEPTH_DIMENSIONS) {
+    if (dim.key === 'multiSourceCorroboration') {
+      continue;
+    }
+    const value = params[dim.key];
+    if (typeof value === 'string' && value.trim()) {
+      sections.push(`## ${dim.label}\n${value.trim()}`);
+    }
+  }
+  return sections.length > 0 ? sections.join('\n') : '';
+}
 
 export async function handle(
   action: string,
@@ -83,12 +107,20 @@ async function handleNoteFinding(
     return fail('memory.note_finding requires an active MemoryCoordinator and ActiveContext');
   }
 
+  // P4/C10: 结构化深度槽并入 evidence，让深度随发现一并进 ActiveContext 并流向 Producer。
+  const depthBlock = buildDepthBlock(params);
+  const evidenceWithDepth = depthBlock
+    ? evidence
+      ? `${evidence}\n${depthBlock}`
+      : depthBlock
+    : evidence;
+
   const scopeId =
     typeof ctx.runtime?.dimensionScopeId === 'string' && ctx.runtime.dimensionScopeId.trim()
       ? ctx.runtime.dimensionScopeId
       : undefined;
   const result = normalizeNoteFindingResult(
-    ctx.memoryCoordinator.noteFinding(finding, evidence, importance, round, scopeId),
+    ctx.memoryCoordinator.noteFinding(finding, evidenceWithDepth, importance, round, scopeId),
     importance,
     scopeId
   );

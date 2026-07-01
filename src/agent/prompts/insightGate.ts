@@ -15,6 +15,11 @@
  * @module insightGate
  */
 
+import {
+  DEPTH_DIMENSIONS,
+  type DepthReviewResult,
+  reviewRecipeDepth,
+} from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import {
   EvidenceCollector,
@@ -26,6 +31,20 @@ import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidence.js';
 // AD4: lazy logger accessor — the Core logger singleton materializes on first
 // use instead of at module import (no import-time work; same singleton).
 const logger = () => Logger.getInstance();
+
+// ──────────────────────────────────────────────────────────────────
+// P4/C9: in-process 深度接地 retry 常量
+// ──────────────────────────────────────────────────────────────────
+
+/**
+ * 深度 retry 的接地维度下限：分析已充分且深度已被尝试(填了 note_finding 深度槽)但接地核心维度少于此数时，
+ * 回炉重挖。保守取 2——一条分析只要接地 ≥2 个深度维度即放行，把 retry 只压在「尝试了深度却基本没接地」的
+ * 情形，避免给没尝试深度的旧式分析制造回归(P6 真机可上调)。
+ */
+const DEPTH_RETRY_MIN_GROUNDED_DIMS = 2;
+
+/** 深度缺口 retry 的 reason 前缀(buildRetryPrompt 据此路由到深度重挖分支，后接缺口维度名)。 */
+const DEPTH_GAP_REASON = 'Depth dimensions lack grounded evidence';
 
 // ──────────────────────────────────────────────────────────────────
 // 类型定义
@@ -654,6 +673,19 @@ function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}
  * @param reason Gate 失败原因
  */
 export function buildRetryPrompt(reason: string) {
+  // P4/C9: 深度缺口分支——回炉到有代码工具的 Analyst 段重挖，绝不提示补写具体内容(防诱导编造)。
+  if (reason.startsWith(DEPTH_GAP_REASON)) {
+    const missing = reason
+      .slice(DEPTH_GAP_REASON.length)
+      .replace(/^[:：]\s*/, '')
+      .trim();
+    return (
+      `以下深度维度缺少真实代码接地${missing ? `：${missing}` : ''}。` +
+      '不要凭空补写、不要改措辞充数——回到分析(Analyst)段，用 code({ action: "read" }) / graph({ action: "query" }) ' +
+      '回到相关实现，为缺接地的维度找到真实 file:line 证据；确认后用 note_finding 的深度槽' +
+      '(designIntent/boundaries/failureModes/tradeoffs)记录，每条必须挂真实 file:line。读不到真实证据的维度就留空。'
+    );
+  }
   const hints = {
     'Analysis too short':
       '你的分析不够深入。请使用更多工具（graph({ action: "query" })、code({ action: "read" })、code({ action: "search" })）查看实际代码，输出至少 500 字的分析。',
@@ -781,6 +813,62 @@ ${String(record.analysisText || '').slice(0, 8000)}`;
  * @param strategyContext orchestrator 注入的运行时上下文
  * @returns }
  */
+/**
+ * P4/C9: 对一次分析产物做「深度接地」审查(复用 Core reviewRecipeDepth，与 host 提交侧 depthGaps 字节同源)。
+ * in-process 的接地集 = analyst 真读过/引用过的文件(artifact.referencedFiles)——「引用了你真读过的文件」
+ * 即接地，与 host 侧「resolver 解析成功」同义。深度文本 = 分析正文 + 各 note_finding 的 evidence(C10 已把
+ * 深度槽序列化成 `## <label>` 分节，reviewRecipeDepth 直接识别，无需自定义解析)。
+ */
+function reviewInsightDepth(artifact: Record<string, unknown>): DepthReviewResult {
+  const findings = Array.isArray(artifact.findings)
+    ? (artifact.findings as Array<{ evidence?: unknown }>)
+    : [];
+  const evidenceText = findings
+    .map((f) => (typeof f.evidence === 'string' ? f.evidence : ''))
+    .join('\n');
+  const analysisText = typeof artifact.analysisText === 'string' ? artifact.analysisText : '';
+  const validSourcePaths = Array.isArray(artifact.referencedFiles)
+    ? (artifact.referencedFiles as unknown[]).filter((p): p is string => typeof p === 'string')
+    : [];
+  return reviewRecipeDepth({ markdown: `${analysisText}\n${evidenceText}` }, { validSourcePaths });
+}
+
+/**
+ * P4/C9: 深度接地 retry 门。仅在候选生成(needsCandidates)且分析已充分(baseGate.pass)时启动——不影响纯分析
+ * 或已失败的分析。核心口径：只有当深度确被「尝试」(analyst 填了 note_finding 深度槽 → 有 `## <label>` 分节
+ * 或未接地论述)却接地核心维度不足 DEPTH_RETRY_MIN_GROUNDED_DIMS 时，才回炉重挖；没尝试深度的旧式分析
+ * (attempted=false)不触发，避免回归。retry 只报缺口维度名 + 回 Analyst 段重挖，绝不提示补写具体内容(防编造)。
+ * 无论是否 retry 都把接地维度写进 metadata 供观测。retry 次数由 pipeline 上限兜底，不会无限循环。
+ */
+export function applyDepthRetryGate(
+  baseGate: GateResult,
+  artifact: Record<string, unknown>,
+  needsCandidates: boolean
+): GateResult {
+  if (!needsCandidates || !baseGate.pass) {
+    return baseGate;
+  }
+  const depthReview = reviewInsightDepth(artifact);
+  const groundedCore = depthReview.grounded.filter((k) => k !== 'multiSourceCorroboration');
+  const attempted = depthReview.ungroundedClaims.length > 0 || groundedCore.length > 0;
+  (artifact as { metadata?: Record<string, unknown> }).metadata = {
+    ...((artifact.metadata as Record<string, unknown>) || {}),
+    depthGroundedDims: groundedCore,
+    depthGroundedFileCount: depthReview.groundedFileCount,
+  };
+  if (attempted && groundedCore.length < DEPTH_RETRY_MIN_GROUNDED_DIMS) {
+    const missingLabels = depthReview.missing
+      .filter((k) => k !== 'multiSourceCorroboration')
+      .map((k) => DEPTH_DIMENSIONS.find((d) => d.key === k)?.label ?? k);
+    return {
+      pass: false,
+      action: 'analysis_retry',
+      reason: `${DEPTH_GAP_REASON}: ${missingLabels.join(' / ')}`,
+    };
+  }
+  return baseGate;
+}
+
 export function insightGateEvaluator(
   source: unknown,
   phaseResults: Record<string, unknown>,
@@ -797,9 +885,14 @@ export function insightGateEvaluator(
     ? buildAnalysisArtifact(source as AnalystResult, dimId as string, projectGraph, activeContext)
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
-  const gate = analysisQualityGate(artifact, {
-    outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
-  });
+  // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。
+  const gate = applyDepthRetryGate(
+    analysisQualityGate(artifact, {
+      outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
+    }),
+    artifact as Record<string, unknown>,
+    Boolean(needsCandidates)
+  );
   const sharedState =
     strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
       ? (strategyContext.sharedState as Record<string, unknown>)

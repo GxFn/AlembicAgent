@@ -6,6 +6,7 @@
  * 新增工具/action 只需在此文件加一行。
  */
 
+import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
 import type { ToolRegistry, ToolSpec } from '#tools/kernel/registry.js';
 import { handle as handleCode } from './handlers/code.js';
 import { handle as handleGraph } from './handlers/graph.js';
@@ -13,6 +14,23 @@ import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
 import { handle as handleMeta } from './handlers/meta.js';
 import { handle as handleTerminal } from './handlers/terminal.js';
+
+/**
+ * P4/C10: note_finding 的结构化深度槽，从 Core DEPTH_DIMENSIONS 单源渲染(与深度契约/裁判/评分/指引同源)。
+ * 跳过 multiSourceCorroboration——它是「跨多条发现」的综合判定，不属于单条 note_finding。Analyst 确认核心
+ * 发现时可同步填这些可选槽(各挂真实 file:line)，让 Producer 拿到「为何这样设计 / 越界会怎样」而非只有
+ * 「是什么」。可选、非硬性：读不到真实证据的那一维留空即可(绝不诱导编造)。
+ */
+const DEPTH_SLOT_PROPS: Record<string, { type: 'string'; description: string }> =
+  Object.fromEntries(
+    DEPTH_DIMENSIONS.filter((d) => d.key !== 'multiSourceCorroboration').map((d) => [
+      d.key,
+      {
+        type: 'string' as const,
+        description: `${d.label}(可选)：${d.question} 必须挂真实 file:line；读不到真实证据就留空。`,
+      },
+    ])
+  );
 
 /* ================================================================== */
 /*  code — 代码智能                                                    */
@@ -392,7 +410,7 @@ const MEMORY_SPEC: ToolSpec = {
     note_finding: {
       summary: 'Record a structured key finding to ActiveContext scratchpad',
       description:
-        'Record an important discovery with evidence and importance rating. These findings feed into QualityGate evaluation (evidenceScore) and are preserved across context compression.',
+        'Record an important discovery with evidence and importance rating. These findings feed into QualityGate evaluation (evidenceScore) and are preserved across context compression. Optionally capture the finding\'s depth (design intent / boundaries / failure modes / trade-offs), each grounded to a real file:line, so the recipe carries "why & when", not just "what".',
       params: {
         type: 'object',
         properties: {
@@ -405,6 +423,8 @@ const MEMORY_SPEC: ToolSpec = {
             type: 'number',
             description: 'Importance rating 1-10 (default 5)',
           },
+          // P4/C10: 可选结构化深度槽，从 Core DEPTH_DIMENSIONS 单源渲染。
+          ...DEPTH_SLOT_PROPS,
         },
         required: ['finding'],
       },

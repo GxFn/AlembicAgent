@@ -14,6 +14,21 @@
  */
 
 import { getDimensionSOP } from '@alembic/core/dimensions';
+import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
+
+/**
+ * P4/C10: 深度捕获指令——从 Core DEPTH_DIMENSIONS 单源渲染(与契约/裁判/评分/指引同源)。取四个深度维度
+ * (跳过 multiSourceCorroboration，它是跨发现的综合判定，不属单条 note_finding)。让 Analyst 在确认核心发现
+ * 时同步用 note_finding 的深度槽结构化记录「为何这样设计 / 边界 / 越界会怎样 / 权衡」，各挂真实 file:line。
+ * Producer 被禁补读源码，深度只能在有代码工具的 Analyst 段产生，故指令挂在 Analyst 系统提示里。
+ */
+const DEPTH_CAPTURE_INSTRUCTION = `- **深度捕获（强价值要求，非硬门槛）**: 确认核心发现时，同步用 note_finding 的深度槽记录该发现的 ${DEPTH_DIMENSIONS.filter(
+  (d) => d.key !== 'multiSourceCorroboration'
+)
+  .map((d) => d.label)
+  .join(
+    ' / '
+  )}（各挂真实 file:line）。这几问要回代码真读——例如「越界会怎样」必须回到真实失败路径，而非格式化措辞；读不到真实证据的那一维就留空，绝不凭空补写。深度槽让 Producer 拿到「为何/边界/越界/权衡」，而非只有「是什么」。`;
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义
@@ -98,6 +113,7 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 - 优先使用注入的 panorama / projectInfo / codeEntityGraph / sessionStore，再用工具验证关键事实
 - **note_finding 是硬性质量依据**: 一旦在扫描、探索或验证阶段确认核心发现，允许并且应该立即调用 note_finding({ finding, evidence, importance })；最终至少提交 3 条结构化发现；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止，缺失或不足会导致 QualityGate retry
 - **单一事实源**: Producer 只消费 note_finding 结构化发现。最终 Markdown 只能总结已记录的 note_finding，不得新增未结构化记录的模式家族、候选主题或可提交发现。
+${DEPTH_CAPTURE_INSTRUCTION}
 
 ## 工具效率
 - **批量搜索**: code({ action: "search", params: { patterns: ["keywordA", "keywordB", "keywordC"] } }) — 一次搜 3-5 个
