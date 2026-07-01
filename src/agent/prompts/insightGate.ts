@@ -969,6 +969,13 @@ export function insightGateEvaluator(
     strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
       ? (strategyContext.sharedState as Record<string, unknown>)
       : null;
+  // F4e：把 Analyst 真实 graph 查询的可复制 refs 经 sharedState 传给 submit handler——
+  // GRAPH_REF_INVALID 拒绝时 handler 自动注入（替模型完成「复制」动作；graphEvidence
+  // 为空则无背书可注入，保持拒绝，绝不编造）。与 pcv 数据走 sharedState 同一先例模式。
+  const artifactGraphEvidence = (artifact as { graphEvidence?: string[] }).graphEvidence;
+  if (sharedState && Array.isArray(artifactGraphEvidence) && artifactGraphEvidence.length > 0) {
+    sharedState._analystGraphEvidence = artifactGraphEvidence;
+  }
   const pcvNodeEvidence = buildPcvQualityGateEvidence({
     artifact,
     dimId: dimId || null,

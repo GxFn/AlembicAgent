@@ -372,6 +372,34 @@ async function handleSubmit(
         gateViolations = normalized.violations;
       }
     }
+    // F4e：GRAPH_REF_INVALID 且 Analyst 真有 graph 查询证据时，自动注入 reasoning.graphRefs
+    // （替模型完成「复制」动作——graphEvidence 来自真实 graph 调用，非编造；为空则保持拒绝）。
+    if (gateViolations.some((v) => v.code === 'GRAPH_REF_INVALID')) {
+      const sharedState = (ctx.runtime?.sharedState ?? null) as Record<string, unknown> | null;
+      const analystGraphEvidence = Array.isArray(sharedState?._analystGraphEvidence)
+        ? (sharedState._analystGraphEvidence as unknown[]).filter(
+            (r): r is string => typeof r === 'string' && r.length > 0
+          )
+        : [];
+      if (analystGraphEvidence.length > 0) {
+        const reasoning = (effectiveItem.reasoning ?? {}) as Record<string, unknown>;
+        const withGraphRefs = {
+          ...effectiveItem,
+          reasoning: { ...reasoning, graphRefs: analystGraphEvidence },
+        };
+        const reVerified = runInProcessRecipeAuthoringGate(withGraphRefs, {
+          projectRoot: ctx.projectRoot,
+          dimensionId: effectiveDimensionId,
+        });
+        if (!reVerified.some((v) => v.code === 'GRAPH_REF_INVALID')) {
+          Logger.getInstance().info(
+            `[knowledge.submit] graph refs injected from analyst evidence (${analystGraphEvidence.length} refs) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
+          );
+          effectiveItem = withGraphRefs;
+          gateViolations = reVerified;
+        }
+      }
+    }
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);
       // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
