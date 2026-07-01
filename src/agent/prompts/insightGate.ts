@@ -976,6 +976,25 @@ export function insightGateEvaluator(
   if (sharedState && Array.isArray(artifactGraphEvidence) && artifactGraphEvidence.length > 0) {
     sharedState._analystGraphEvidence = artifactGraphEvidence;
   }
+  // F4f：evidenceMap 的接地行范围精简投影 → submit handler。模型提交裸路径 sourceRefs
+  // （无行号）时，handler 用该文件 Analyst 真实读过/补齐过的范围把 ref 规范化——语义关联
+  // 最强的行号来源，非任意指派。
+  const artifactEvidenceMap = (artifact as { evidenceMap?: Map<string, unknown> }).evidenceMap;
+  if (sharedState && artifactEvidenceMap instanceof Map && artifactEvidenceMap.size > 0) {
+    const groundedRanges: Record<string, Array<{ start: number; end: number }>> = {};
+    for (const [filePath, entry] of artifactEvidenceMap) {
+      const snippets = (entry as { codeSnippets?: Array<{ startLine: number; endLine: number }> })
+        .codeSnippets;
+      if (Array.isArray(snippets) && snippets.length > 0) {
+        groundedRanges[filePath] = snippets
+          .slice(0, 3)
+          .map((s) => ({ start: s.startLine, end: s.endLine }));
+      }
+    }
+    if (Object.keys(groundedRanges).length > 0) {
+      sharedState._analystGroundedRanges = groundedRanges;
+    }
+  }
   const pcvNodeEvidence = buildPcvQualityGateEvidence({
     artifact,
     dimId: dimId || null,

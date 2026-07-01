@@ -97,6 +97,48 @@ function readRefRangeCode(
 }
 
 /**
+ * F4f：裸路径 sourceRefs（无 `:行号`）用 Analyst 接地范围规范化为 `path:start-end`。
+ * 范围投影经 sharedState._analystGroundedRanges 注入（insightGateEvaluator 写入），来自
+ * evidenceMap 真实片段——裸路径候选由此获得 F4b/F4d 可用的行号锚，非任意指派。
+ */
+function normalizeBareSourceRefs(
+  item: Record<string, unknown>,
+  sharedState: Record<string, unknown> | null
+): Record<string, unknown> {
+  const ranges = sharedState?._analystGroundedRanges as
+    | Record<string, Array<{ start: number; end: number }>>
+    | undefined;
+  if (!ranges || !Array.isArray(item.sourceRefs)) {
+    return item;
+  }
+  let changed = false;
+  const normalizeRef = (ref: unknown): unknown => {
+    if (typeof ref !== 'string' || /:\d+/.test(ref)) {
+      return ref;
+    }
+    const filePath = path.posix.normalize(ref.replaceAll('\\', '/'));
+    const fileRanges = ranges[filePath];
+    if (!fileRanges?.[0]) {
+      return ref;
+    }
+    changed = true;
+    return `${filePath}:${fileRanges[0].start}-${fileRanges[0].end}`;
+  };
+  const sourceRefs = (item.sourceRefs as unknown[]).map(normalizeRef);
+  const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
+  const sources = Array.isArray(reasoning.sources)
+    ? (reasoning.sources as unknown[]).map(normalizeRef)
+    : reasoning.sources;
+  if (!changed) {
+    return item;
+  }
+  Logger.getInstance().info(
+    `[knowledge.submit] bare source refs normalized from analyst grounded ranges for "${String(item.title ?? '')}"`
+  );
+  return { ...item, sourceRefs, reasoning: { ...reasoning, sources } };
+}
+
+/**
  * F4c 内部规范化重验：门禁的代码证据取三处（coreCode / content.pattern / markdown 首个
  * fenced block），三处都须逐字匹配 cited range。真机 DeepSeek 反复只抄对其中一处、另一处
  * 坚持自写「示意代码」——同一候选换标题重试三轮全卡 SNIPPET_MISMATCH，烧轮次不收敛。
@@ -351,15 +393,21 @@ async function handleSubmit(
     // + 廉价 fs 来源接地，但不强制 3-file 下限与 session-scope）。上面的 validateSubmitParams 仅作
     // 廉价 presence/length fast-fail，本门禁是被其 supersede 的权威裁决；命中即按既有 in-process 拒绝
     // 信封形状（fail 字符串）返回，门禁输出字节不变、只改 in-process AI 看到的门槛。
-    let effectiveItem: Record<string, unknown> = item;
-    let gateViolations = runInProcessRecipeAuthoringGate(item, {
+    // F4f 预处理：裸路径 sourceRefs（无行号）用 Analyst 真实接地范围规范化——裸路径候选
+    // 此前没有任何自动化通路（F4b/F4d 都需要可解析行号）。范围来自 evidenceMap 投影
+    // （sharedState._analystGroundedRanges），即 Analyst 真实读过/锚点补齐过的行，非任意指派。
+    let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
+      item,
+      (ctx.runtime?.sharedState ?? null) as Record<string, unknown> | null
+    );
+    let gateViolations = runInProcessRecipeAuthoringGate(effectiveItem, {
       projectRoot: ctx.projectRoot,
       dimensionId: effectiveDimensionId,
     });
     // F4c：SNIPPET_MISMATCH 先尝试 handler 内规范化重验（三处代码位对齐到已验证的真实代码），
     // 成功则零轮次消化形式不一致；失败才走拒绝反馈路径。
     if (gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-      const normalized = tryNormalizeSnippetEvidence(item, {
+      const normalized = tryNormalizeSnippetEvidence(effectiveItem, {
         projectRoot: ctx.projectRoot,
         dimensionId: effectiveDimensionId,
       });
@@ -411,7 +459,7 @@ async function handleSubmit(
           v.code
         )
       )
-        ? buildSnippetRepairHint(item.sourceRefs, ctx.projectRoot)
+        ? buildSnippetRepairHint(effectiveItem.sourceRefs, ctx.projectRoot)
         : '';
       // 可见化:门禁拒绝是冷启动候选不落库的最可能真因(如冷启动档位的 3-file 证据下限、祈使动词、
       // snippet 匹配、source-ref 接地)。打日志带标题+违规明细，便于定位是 DeepSeek 候选质量还是门禁校准。
