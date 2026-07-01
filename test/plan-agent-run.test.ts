@@ -183,6 +183,48 @@ describe('runPlanAgent', () => {
     expect(calls[0]?.message.content).toContain('"source": "projectMapModules"');
   });
 
+  it('reads module candidates from the Core slim projection projectInfoTree.children (U3 主体 re-point)', async () => {
+    const calls: AgentRunInput[] = [];
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult(
+          selectionJson({
+            dimensions: ['api'],
+            generationStage: 'deepMining',
+            moduleBindings: [validModuleBinding],
+          })
+        );
+      },
+    };
+
+    // 主体 in-process plan gate 现喂 Core 精简投影（buildPlanFactsProjection 产出）：projectInfoTree.children
+    // 是 module 节点（带 path + children 文件节点），不带 presenterInput/moduleSeeds/projectMapModules。
+    const projectContextFacts = {
+      projectInfoTree: {
+        children: [
+          {
+            path: 'Sources/App',
+            children: [{ path: 'Sources/App/App.swift' }, { path: 'Sources/App/Main.swift' }],
+          },
+        ],
+      },
+      candidateDimensions: [{ id: 'api' }],
+    };
+
+    await expect(
+      runPlanAgent({ agentService, generationStage: 'deepMining', projectContextFacts })
+    ).resolves.toMatchObject({
+      generationStage: 'deepMining',
+      moduleBindings: [validModuleBinding],
+    });
+
+    // 新读取器从精简投影提取模块候选（modulePath + ownedFiles + source=projectInfoTree）。
+    expect(calls[0]?.message.content).toContain('"modulePath": "Sources/App"');
+    expect(calls[0]?.message.content).toContain('"source": "projectInfoTree"');
+    expect(calls[0]?.message.content).toContain('"Sources/App/App.swift"');
+  });
+
   it('rejects deepMining and moduleMining selections without module bindings', async () => {
     const agentService = {
       run: async (_input: AgentRunInput) =>

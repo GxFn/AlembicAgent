@@ -146,6 +146,13 @@ function selectProjectContextModuleCandidates(
   const presenterInput = readRecord(facts.presenterInput);
   const presenterMap = readRecord(presenterInput.map);
   const candidates = [
+    // U3：主体 in-process plan gate 现喂 Core 精简投影（buildPlanFactsProjection），模块候选从
+    // projectInfoTree.children 读（每个 module node 带 path + children 文件）；下方旧读取器保留，
+    // 兼容 host-agent 全量 facts（presenterInput / moduleSeeds / projectMapModules）形态。
+    ...readProjectInfoTreeModuleCandidates(
+      readArray(readRecord(facts.projectInfoTree).children),
+      'projectInfoTree'
+    ),
     ...readFlatModuleCandidates(readArray(facts.projectMapModules), 'projectMapModules'),
     ...readFlatModuleCandidates(readArray(facts.moduleSeeds), 'moduleSeeds'),
     ...readPresenterModuleCandidates(readArray(presenterInput.modules), 'presenterInput.modules'),
@@ -185,6 +192,32 @@ function readFlatModuleCandidates(
       return [];
     }
     return [stripUndefined({ moduleId, moduleName, modulePath, ownedFiles, source })];
+  });
+}
+
+// U3：从 Core 精简投影的 projectInfoTree.children 读模块候选。每个 ProjectInfoModuleNode 带 path
+// 与 children(文件节点)，映射成 { modulePath, ownedFiles }；无 moduleId/moduleName（精简树不带）。
+function readProjectInfoTreeModuleCandidates(
+  values: readonly unknown[],
+  source: string
+): ProjectContextModuleCandidate[] {
+  return values.flatMap((value) => {
+    const record = readRecord(value);
+    const modulePath = readString(record.path);
+    if (!modulePath) {
+      return [];
+    }
+    const ownedFiles = readArray(record.children).flatMap((child) => {
+      const filePath = readString(readRecord(child).path);
+      return filePath ? [filePath] : [];
+    });
+    return [
+      stripUndefined({
+        modulePath,
+        ownedFiles: ownedFiles.length > 0 ? ownedFiles : undefined,
+        source,
+      }),
+    ];
   });
 }
 
