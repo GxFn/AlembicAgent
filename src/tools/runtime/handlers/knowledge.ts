@@ -30,6 +30,63 @@ const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
 /** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
 const SNIPPET_REPAIR_MAX_LINES = 12;
 
+/** markdown 首个 fenced code block（与 Core collectCodeEvidence 的判据同形） */
+const FIRST_FENCED_RE = /(```[a-zA-Z0-9_-]*\s*\n)([\s\S]*?)(```)/;
+
+/**
+ * F4c 内部规范化重验：门禁的代码证据取三处（coreCode / content.pattern / markdown 首个
+ * fenced block），三处都须逐字匹配 cited range。真机 DeepSeek 反复只抄对其中一处、另一处
+ * 坚持自写「示意代码」——同一候选换标题重试三轮全卡 SNIPPET_MISMATCH，烧轮次不收敛。
+ * 这里在 handler 内做确定性消化：只要有一处代码与引用范围逐字匹配（即真实接地成立），
+ * 就把其余代码位同步为该真实代码并重跑完整门禁；任一变体全过即用它提交。
+ * 这是规范化而非编造——被同步的代码本身已通过 snippet-match 验证为源文件原文。
+ */
+function tryNormalizeSnippetEvidence(
+  item: Record<string, unknown>,
+  opts: { projectRoot: string | undefined; dimensionId: string | undefined }
+): { item: Record<string, unknown>; direction: string } | null {
+  if (!opts.projectRoot) {
+    return null;
+  }
+  const content = (item.content ?? {}) as Record<string, unknown>;
+  const markdown = typeof content.markdown === 'string' ? content.markdown : '';
+  const coreCode = typeof item.coreCode === 'string' ? item.coreCode.trim() : '';
+  const fenced = markdown.match(FIRST_FENCED_RE)?.[2]?.trim() ?? '';
+
+  const variants: Array<{ direction: string; item: Record<string, unknown> }> = [];
+  // 方向 1：coreCode 为真 → markdown fenced 同步为 coreCode。
+  if (coreCode && fenced && coreCode !== fenced) {
+    variants.push({
+      direction: 'markdown-fenced ← coreCode',
+      item: {
+        ...item,
+        content: {
+          ...content,
+          markdown: markdown.replace(FIRST_FENCED_RE, (_m, open, _body, close) =>
+            [open, coreCode, '\n', close].join('')
+          ),
+        },
+      },
+    });
+    // 方向 2：markdown fenced 为真 → coreCode 同步为 fenced。
+    variants.push({ direction: 'coreCode ← markdown-fenced', item: { ...item, coreCode: fenced } });
+  } else if (coreCode && !fenced) {
+    // 无 fenced：仅 coreCode 不匹配无从规范化；有 pattern 的情形并入方向 2 的语义。
+    return null;
+  }
+
+  for (const variant of variants) {
+    const violations = runInProcessRecipeAuthoringGate(variant.item, {
+      projectRoot: opts.projectRoot,
+      dimensionId: opts.dimensionId,
+    });
+    if (violations.length === 0) {
+      return variant;
+    }
+  }
+  return null;
+}
+
 /**
  * F4b：SNIPPET_MISMATCH 拒绝时，读取第一个可解析 sourceRef 的真实行范围，把逐字代码
  * 附进拒绝消息——模型下一轮把 coreCode / markdown 代码块替换为该内容即可通过
@@ -236,10 +293,26 @@ async function handleSubmit(
     // + 廉价 fs 来源接地，但不强制 3-file 下限与 session-scope）。上面的 validateSubmitParams 仅作
     // 廉价 presence/length fast-fail，本门禁是被其 supersede 的权威裁决；命中即按既有 in-process 拒绝
     // 信封形状（fail 字符串）返回，门禁输出字节不变、只改 in-process AI 看到的门槛。
-    const gateViolations = runInProcessRecipeAuthoringGate(item, {
+    let effectiveItem: Record<string, unknown> = item;
+    let gateViolations = runInProcessRecipeAuthoringGate(item, {
       projectRoot: ctx.projectRoot,
       dimensionId: effectiveDimensionId,
     });
+    // F4c：SNIPPET_MISMATCH 先尝试 handler 内规范化重验（三处代码位对齐到已验证的真实代码），
+    // 成功则零轮次消化形式不一致；失败才走拒绝反馈路径。
+    if (gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+      const normalized = tryNormalizeSnippetEvidence(item, {
+        projectRoot: ctx.projectRoot,
+        dimensionId: effectiveDimensionId,
+      });
+      if (normalized) {
+        Logger.getInstance().info(
+          `[knowledge.submit] snippet evidence normalized (${normalized.direction}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+        );
+        effectiveItem = normalized.item;
+        gateViolations = [];
+      }
+    }
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);
       // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
@@ -285,7 +358,7 @@ async function handleSubmit(
 
     const result = await gateway.create({
       source: AGENT_RUNTIME_SOURCE,
-      items: [item],
+      items: [effectiveItem],
       options: {
         supersedes: pickString(params.supersedes),
         existingTitles: ctx.runtime?.submittedTitles ?? undefined,
