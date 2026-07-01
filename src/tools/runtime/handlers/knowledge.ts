@@ -10,6 +10,7 @@
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
 import {
   estimateTokens,
   fail,
@@ -99,6 +100,9 @@ async function handleSubmit(
 ): Promise<ToolResult> {
   const gateway = ctx.recipeGateway as RecipeGatewayLike | undefined;
   if (!gateway) {
+    // 可见化:提交失败经 fail(...) 折叠成 null 结果，记账侧看不到原因；这里显式打日志，使冷启动
+    // 「候选一条没落库」的真因(gateway 未接线)能在 combined.log 里被定位。
+    Logger.getInstance().warn('[knowledge.submit] rejected: Recipe gateway not available');
     return fail('Recipe gateway not available');
   }
 
@@ -188,7 +192,13 @@ async function handleSubmit(
       dimensionId: effectiveDimensionId,
     });
     if (gateViolations.length > 0) {
-      return fail(`Validation failed: ${formatRecipeAuthoringViolations(gateViolations)}`);
+      const detail = formatRecipeAuthoringViolations(gateViolations);
+      // 可见化:门禁拒绝是冷启动候选不落库的最可能真因(如冷启动档位的 3-file 证据下限、祈使动词、
+      // snippet 匹配、source-ref 接地)。打日志带标题+违规明细，便于定位是 DeepSeek 候选质量还是门禁校准。
+      Logger.getInstance().warn(
+        `[knowledge.submit] rejected "${String((item as { title?: unknown }).title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${detail}`
+      );
+      return fail(`Validation failed: ${detail}`);
     }
 
     const result = await gateway.create({
