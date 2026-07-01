@@ -15,6 +15,8 @@
  * @module insightGate
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   DEPTH_DIMENSIONS,
   type DepthReviewResult,
@@ -24,6 +26,7 @@ import Logger from '@alembic/core/logging';
 import {
   EvidenceCollector,
   type EvidenceCollectorResult,
+  type SnippetRangeReader,
   type ToolCall,
 } from '../domain/EvidenceCollector.js';
 import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidence.js';
@@ -152,6 +155,8 @@ interface InsightGateStrategyContext {
   dimId?: string;
   outputType?: string;
   needsCandidates?: boolean;
+  /** R1: 宿主注入的项目根，启用 findings 锚点的磁盘补齐（只读、根内限定） */
+  projectRoot?: string;
   [key: string]: unknown;
 }
 
@@ -395,11 +400,42 @@ export function buildAnalysisReport(
  * @param [projectGraph] ProjectGraph 实例
  * @param [activeContext] ActiveContext 实例
  */
+/**
+ * projectRoot 内的只读行范围端口（R1 锚点补齐用）。逐字读取 [startLine, endLine] 源码，
+ * endLine 超文件末尾时收缩为实际末行；相对路径逃逸 / 绝对路径 / 文件缺失返回 null——
+ * 绝不让补齐流程读到项目外内容或编造证据。
+ */
+function createFsSnippetRangeReader(projectRoot: string): SnippetRangeReader {
+  return (filePath, startLine, endLine) => {
+    try {
+      const normalized = path.posix.normalize(String(filePath).replaceAll('\\', '/'));
+      if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
+        return null;
+      }
+      const absPath = path.join(projectRoot, normalized);
+      if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+        return null;
+      }
+      const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
+      if (startLine < 1 || startLine > lines.length) {
+        return null;
+      }
+      const effectiveEnd = Math.min(endLine, lines.length);
+      const content = lines.slice(startLine - 1, effectiveEnd).join('\n');
+      return content.trim() ? { content, endLine: effectiveEnd } : null;
+    } catch {
+      // 只读补齐失败静默跳过：证据缺失优于错误证据。
+      return null;
+    }
+  };
+}
+
 export function buildAnalysisArtifact(
   analystResult: AnalystResult,
   dimensionId: string,
   projectGraph: ProjectGraphLike | null = null,
-  activeContext: ActiveContextLike | null = null
+  activeContext: ActiveContextLike | null = null,
+  opts: { projectRoot?: string } = {}
 ) {
   const toolCalls = analystResult.toolCalls || [];
 
@@ -408,12 +444,6 @@ export function buildAnalysisArtifact(
   const collector = new EvidenceCollector();
   for (let i = 0; i < toolCalls.length; i++) {
     collector.processToolCall(toolCalls[i], i);
-  }
-  const evidence = collector.build();
-
-  const allFiles = new Set(baseReport.referencedFiles);
-  for (const filePath of evidence.evidenceMap.keys()) {
-    allFiles.add(filePath);
   }
 
   const distilled = activeContext?.distill() || { keyFindings: [], toolCallSummary: [] };
@@ -432,8 +462,24 @@ export function buildAnalysisArtifact(
     importance: f.importance,
   }));
   if (findings.length === 0) {
-    findings = deriveFindingsFromAnalysisText(baseReport.analysisText, [...allFiles]);
+    // 降级路径基于 referencedFiles 派生（evidenceMap keys 在此场景与其同源，见下方 allFiles 合并）。
+    findings = deriveFindingsFromAnalysisText(baseReport.analysisText, [
+      ...new Set(baseReport.referencedFiles),
+    ]);
     derivedFindingCount = findings.length;
+  }
+
+  // R1 锚点驱动证据补齐：findings 引用的 path:line 锚点若不在已采片段覆盖内（典型：全文读
+  // 只留头 30 行窗口，锚点在窗口外），从磁盘补读精确片段——每条发现都有可照抄的逐字证据。
+  if (opts.projectRoot) {
+    collector.groundFindingRefs(findings, createFsSnippetRangeReader(opts.projectRoot));
+  }
+
+  const evidence = collector.build();
+
+  const allFiles = new Set(baseReport.referencedFiles);
+  for (const filePath of evidence.evidenceMap.keys()) {
+    allFiles.add(filePath);
   }
 
   const qualityReport = buildQualityScores(baseReport.analysisText, findings, evidence, {
@@ -452,6 +498,8 @@ export function buildAnalysisArtifact(
     evidenceMap: evidence.evidenceMap,
     explorationLog: evidence.explorationLog,
     negativeSignals: evidence.negativeSignals,
+    // R2: Analyst 真实 graph 查询的可复制 refs（Producer 渲染，供关系声明过 GRAPH_REF 门禁）
+    graphEvidence: evidence.graphEvidence,
 
     // Layer 3: Raw
     fullToolTrace: toolCalls,
@@ -878,11 +926,14 @@ export function insightGateEvaluator(
     return { action: 'degrade', reason: 'No analysis output', artifact: null };
   }
 
-  const { projectGraph, activeContext, dimId, outputType, needsCandidates } =
+  const { projectGraph, activeContext, dimId, outputType, needsCandidates, projectRoot } =
     strategyContext as InsightGateStrategyContext;
 
   const artifact = activeContext
-    ? buildAnalysisArtifact(source as AnalystResult, dimId as string, projectGraph, activeContext)
+    ? buildAnalysisArtifact(source as AnalystResult, dimId as string, projectGraph, activeContext, {
+        // R1: 宿主注入 projectRoot 才启用锚点补齐；缺失时保持旧行为（不读盘、不编造）。
+        ...(typeof projectRoot === 'string' && projectRoot ? { projectRoot } : {}),
+      })
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
   // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。

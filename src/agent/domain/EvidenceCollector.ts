@@ -89,6 +89,38 @@ function sanitizeReadSnippet(raw: string): SanitizedReadSnippet | null {
 /** code.search 字符串输出的匹配行：`path:42: content`（formatSearchOutput 契约） */
 const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
 
+// ── 锚点驱动证据补齐（groundFindingRefs） ────────────────────────
+//
+// 真机根因（2026-07-02 architecture 维度 10 提交 9 拒，SNIPPET_MISMATCH ×26）：全文读只在
+// evidenceMap 留下「头 MAX_SNIPPET_LINES 行」窗口片段，而 note_finding 的锚点（如
+// package.json 的 exports、layer-contract.json 的 layers 数组）常在窗口之外——Producer 的
+// 「可复制 coreCode」覆盖不到锚点行，模型只能凭记忆重构代码，重试也无解。这里按 findings
+// 实际引用的 path:line 锚点，经注入的只读端口从磁盘补读精确片段，让每条发现都有可照抄的
+// 逐字证据。端口注入保持本模块零 node:fs（与 Core §C.11 resolver 端口同风格）。
+
+/** finding.evidence 里的 `path:start(-end)` 锚点引用（路径需带扩展名，避免误抓散文） */
+const FINDING_REF_RE = /([\w@][\w@\-./]*\.[A-Za-z][\w]*):(\d+)(?:-(\d+))?/g;
+
+/** 单行锚点补读时向下扩展的行数（含锚点行；给 coreCode 留可复制的上下文） */
+const ANCHOR_CONTEXT_LINES = 8;
+
+/**
+ * 只读行范围端口：返回 [startLine, endLine] 的逐字源码与实际截止行（endLine 超文件末尾时
+ * 收缩），路径越界 / 文件缺失 / 空范围返回 null。由调用方（insightGate）注入 fs 实现。
+ */
+export type SnippetRangeReader = (
+  filePath: string,
+  startLine: number,
+  endLine: number
+) => { content: string; endLine: number } | null;
+
+/** groundFindingRefs 的输入形状（与 AnalysisArtifact.findings 对齐） */
+export interface FindingRefLike {
+  finding: string;
+  evidence?: string;
+  importance?: number;
+}
+
 /**
  * 解析 code.search 的字符串输出（`N matches (showing M)\n\npath:line: content`...）。
  * search handler 最终 ok() 的 data 就是这个格式化字符串（不是 {matches} 对象），
@@ -144,6 +176,7 @@ export interface EvidenceCollectorResult {
   evidenceMap: Map<string, EvidenceEntry>;
   explorationLog: ExplorationEntry[];
   negativeSignals: NegativeSignal[];
+  graphEvidence: string[];
 }
 
 /** 工具调用参数 */
@@ -233,6 +266,14 @@ export class EvidenceCollector {
   /** 负空间信号 */
   #negativeSignals: NegativeSignal[] = [];
 
+  /**
+   * graph 证据（R2）：Analyst 每次真实 graph 工具调用物化一条可复制 ref。门禁对关系声明
+   * （依赖/调用链/上游下游等词）要求非空 graphRefs；架构维度知识本质就是关系，「规避关系词」
+   * 是阉割价值。这里只物化真实发生过的 graph 查询——Producer 把它们渲染成可逐字复制的
+   * graphRefs，模型没有 graph 证据时仍须改述，绝不教模型编造 ref 绕门禁。
+   */
+  #graphEvidence: string[] = [];
+
   /** 代码片段总字符预算 */
   #snippetBudget;
 
@@ -312,7 +353,57 @@ export class EvidenceCollector {
       evidenceMap: this.#evidenceMap,
       explorationLog: this.#explorationLog,
       negativeSignals: this.#negativeSignals,
+      graphEvidence: this.#graphEvidence,
     };
+  }
+
+  /**
+   * 锚点驱动证据补齐：把 findings 引用的 `path:line` 锚点补成可照抄的精确片段。
+   *
+   * 对每条 finding.evidence 中的锚点引用，若 evidenceMap 尚无覆盖该行的片段，经注入的
+   * 只读端口从磁盘读取该范围的逐字源码入库（行号与内容天然对齐）。端口返回 null（路径
+   * 越界 / 文件缺失 / 行号超界）时静默跳过——绝不编造证据；预算与每文件片段数沿用
+   * #addCodeSnippet 的既有约束。
+   */
+  groundFindingRefs(findings: FindingRefLike[], readRange: SnippetRangeReader) {
+    for (const finding of findings) {
+      const evidence = typeof finding?.evidence === 'string' ? finding.evidence : '';
+      if (!evidence) {
+        continue;
+      }
+      for (const match of evidence.matchAll(FINDING_REF_RE)) {
+        const filePath = match[1] ?? '';
+        const startLine = Number(match[2]);
+        if (!filePath || !Number.isFinite(startLine) || startLine < 1) {
+          continue;
+        }
+        // 带范围的锚点用原范围（cap 单片段行数上限）；单行锚点向下扩展少量上下文，
+        // 让「可复制 coreCode」不至于薄到一行。
+        const requestedEnd = match[3]
+          ? Math.min(Number(match[3]), startLine + MAX_SNIPPET_LINES - 1)
+          : startLine + ANCHOR_CONTEXT_LINES - 1;
+        if (requestedEnd < startLine) {
+          continue;
+        }
+        if (this.#hasSnippetCovering(filePath, startLine)) {
+          continue;
+        }
+        const range = readRange(filePath, startLine, requestedEnd);
+        if (!range?.content?.trim()) {
+          continue;
+        }
+        this.#addCodeSnippet(filePath, range.content, startLine);
+      }
+    }
+  }
+
+  /** evidenceMap 中是否已有片段覆盖该文件的指定行 */
+  #hasSnippetCovering(filePath: string, line: number): boolean {
+    const entry = this.#evidenceMap.get(filePath);
+    if (!entry) {
+      return false;
+    }
+    return entry.codeSnippets.some((s) => s.startLine <= line && line <= s.endLine);
   }
 
   // ─── 工具特化提取 ─────────────────────────────────────
@@ -473,6 +564,10 @@ export class EvidenceCollector {
 
     const classSummary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${classSummary}` : classSummary;
+    // 物化为可复制 graph ref：真实 graph 查询的结构结论（fresh，供关系声明引用）。
+    this.#addGraphEvidence(
+      `graph:class ${className} (${filePath}) — ${classSummary.replaceAll('|', '·')}`
+    );
   }
 
   /** get_protocol_info — 提取协议结构 → evidenceMap */
@@ -500,9 +595,23 @@ export class EvidenceCollector {
 
     const summary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${summary}` : summary;
+    this.#addGraphEvidence(
+      `graph:protocol ${protocolName} (${filePath}) — ${summary.replaceAll('|', '·')}`
+    );
   }
 
   // ─── 内部辅助 ─────────────────────────────────────────
+
+  /** 追加 graph 证据（去重 + 上限，防 prompt 膨胀） */
+  #addGraphEvidence(ref: string) {
+    if (!ref || this.#graphEvidence.includes(ref)) {
+      return;
+    }
+    if (this.#graphEvidence.length >= 8) {
+      return;
+    }
+    this.#graphEvidence.push(ref);
+  }
 
   /** 获取或创建 evidence entry */
   #getOrCreateEntry(filePath: string) {
