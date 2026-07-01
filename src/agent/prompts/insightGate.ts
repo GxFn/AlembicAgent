@@ -938,6 +938,45 @@ export function applyDepthRetryGate(
   return baseGate;
 }
 
+/**
+ * 与 Core gateRules 的 RELATIONSHIP_*_RE 对齐的关系词表（词表稳定，本地同形副本）。
+ * 命中即意味着候选大概率触发 GRAPH_REF 门禁的关系声明判定。
+ */
+const GRAPH_RELATIONSHIP_CN_RE = /调用链|调用方|被调用|依赖|影响路径|关系|上游|下游/;
+
+/** graph-retry 的 reason（buildRetryPrompt 会把它呈给 Analyst 作为重挖指令） */
+const GRAPH_GAP_REASON =
+  'Relationship claims lack graph backing: run ONE graph({ action: "query" }) on the core classes/modules you already identified, then re-summarize. Do not add new topics.';
+
+/**
+ * F4g graph-retry 门（与 depth-retry 同模式）：候选生成维度的分析含关系词（依赖/分层/调用），
+ * 但本会话没有任何真实 graph 查询（graphEvidence 空）时，回炉一次补 graph——它是关系声明过
+ * GRAPH_REF 门禁的唯一诚实背书（F4e 只注入真实查询产物，绝不合成）。七轮真机证明动机提示
+ * 不足以让 DeepSeek 主动调 graph；把它变成 QualityGate 判据后 retry 指令单一明确。
+ * retry 次数由 pipeline 上限兜底，不会无限循环。
+ */
+export function applyGraphRetryGate(
+  baseGate: GateResult,
+  artifact: Record<string, unknown>,
+  needsCandidates: boolean
+): GateResult {
+  if (!needsCandidates || !baseGate.pass) {
+    return baseGate;
+  }
+  const graphEvidence = (artifact as { graphEvidence?: string[] }).graphEvidence;
+  if (Array.isArray(graphEvidence) && graphEvidence.length > 0) {
+    return baseGate;
+  }
+  const analysisText = typeof artifact.analysisText === 'string' ? artifact.analysisText : '';
+  const findingsText = Array.isArray(artifact.findings)
+    ? (artifact.findings as Array<{ finding?: string }>).map((f) => f?.finding ?? '').join(' ')
+    : '';
+  if (!GRAPH_RELATIONSHIP_CN_RE.test(`${analysisText} ${findingsText}`)) {
+    return baseGate;
+  }
+  return { pass: false, action: 'analysis_retry', reason: GRAPH_GAP_REASON };
+}
+
 export function insightGateEvaluator(
   source: unknown,
   phaseResults: Record<string, unknown>,
@@ -958,10 +997,15 @@ export function insightGateEvaluator(
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
   // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。
-  const gate = applyDepthRetryGate(
-    analysisQualityGate(artifact, {
-      outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
-    }),
+  // F4g：depth-retry 之上叠 graph-retry——关系型分析无 graph 背书时回炉一次补真实查询。
+  const gate = applyGraphRetryGate(
+    applyDepthRetryGate(
+      analysisQualityGate(artifact, {
+        outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
+      }),
+      artifact as Record<string, unknown>,
+      Boolean(needsCandidates)
+    ),
     artifact as Record<string, unknown>,
     Boolean(needsCandidates)
   );
