@@ -273,6 +273,11 @@ export function buildProducerPromptV2(
     findingLines.push(
       '☝️ 上述结构化发现是唯一候选义务；最终 Markdown 摘要只作背景，不要从摘要里新增候选主题。'
     );
+    // 深度四要素随 evidence 字符串完整到达这里（note_finding 深度槽 → ## 小节 markdown），
+    // 但没有映射义务时模型会把它当纯证据引用丢弃——深度才是候选的核心价值，必须显式要求落字段。
+    findingLines.push(
+      '📐 发现证据里若含 ## 设计意图 / ## 边界与约束 / ## 失败模式 / ## 权衡 小节，它们是该候选的核心价值：必须把这些小节原样归纳进 content.markdown（保留小节结构与 file:line 接地），并把关键理由写进 content.rationale，不得丢弃或泛化成一句空话。'
+    );
     parts.push(findingLines.join('\n'));
   }
 
@@ -483,6 +488,10 @@ export function buildCodeContextSection(
     .filter((e) => e.filePath || e.summary || e.codeSnippets.length > 0)
     .sort((a, b) => b.codeSnippets.length - a.codeSnippets.length);
 
+  // 无行号片段的条目不能混进「可逐字复制」列表：裸路径被照抄进 sourceRefs 必触发
+  // SOURCE_REF_LINE_MISSING。降级为背景文件，显式告知不可用作 sourceRefs。
+  const backgroundFiles: string[] = [];
+
   for (const entry of sortedEntries) {
     if (totalChars >= BUDGET) {
       break;
@@ -495,7 +504,11 @@ export function buildCodeContextSection(
     const groundedRefs = entry.codeSnippets
       .slice(0, 3)
       .map((snippet) => `${entry.filePath}:${snippet.startLine}-${snippet.endLine}`);
-    const refText = groundedRefs.length > 0 ? groundedRefs.join(', ') : entry.filePath;
+    if (groundedRefs.length === 0) {
+      backgroundFiles.push(entry.filePath);
+      continue;
+    }
+    const refText = groundedRefs.join(', ');
     const summary = entry.summary ? ` — ${limitText(entry.summary, 140)}` : '';
     const line = `- ${refText}${entry.role ? ` (${entry.role})` : ''}${summary}`;
     parts.push(line);
@@ -508,6 +521,12 @@ export function buildCodeContextSection(
       parts.push(codeLine);
       totalChars += codeLine.length;
     }
+  }
+
+  if (backgroundFiles.length > 0) {
+    parts.push(
+      `背景文件(无行号证据，绝不可用作 sourceRefs/(来源:)): ${backgroundFiles.slice(0, 8).join(', ')}`
+    );
   }
 
   return parts.length > 1 ? parts.join('\n') : null;

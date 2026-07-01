@@ -29,6 +29,82 @@ const MAX_SEARCH_MATCHES = 5;
 /** 默认代码片段总字符预算 */
 const DEFAULT_SNIPPET_BUDGET = 32_000;
 
+// ── 读取内容净化（证据保真核心） ─────────────────────────────────
+//
+// evidenceMap 的片段会被 Producer 渲染成「可逐字复制的 coreCode」，其内容必须与源文件的
+// 引用行范围逐字对照（Core snippet-match 门禁判据 = 去空白子串包含）。而 code.read 的返回
+// 是「给模型看的展示态」，含三类非源码杂质，直接入库会毒化整条照抄链路：
+//   1. 范围读每行带 `42|` 行号前缀（code.ts readSingleFile 的 slice 渲染）；
+//   2. 范围读省略后缀 `... [N lines omitted; use startLine/endLine for more]`；
+//   3. batch clamp 截断标记 `... [N chars truncated for batch read budget] ...`，且标记后
+//      的 tail 与 head 不连续，绝不能拼进同一片段。
+// 这里在采集端一次性还原为纯源码，并用行号前缀校准 startLine（范围读的返回体不带
+// startLine 字段，前缀是唯一可靠行号来源）。
+
+/** 范围读行号前缀：`42|code` */
+const READ_LINE_PREFIX_RE = /^(\d+)\|/;
+
+/** 范围读省略后缀标记行 */
+const READ_OMITTED_SUFFIX_RE =
+  /\n?\.\.\. \[\d+ lines omitted; use startLine\/endLine for more\]\s*$/;
+
+/** batch clamp 截断标记（其后的 tail 与 head 不连续，只保留 head） */
+const READ_CLAMP_MARKER_RE =
+  /\n*\.\.\. \[\d+ chars truncated for batch read budget\] \.\.\.[\s\S]*$/;
+
+/** 净化结果：纯源码内容 + 从行号前缀校准出的起始行（无前缀时为 null） */
+interface SanitizedReadSnippet {
+  content: string;
+  startLineFromPrefix: number | null;
+}
+
+/**
+ * 把 code.read 的展示态内容还原为可与源文件逐字对照的纯代码。
+ * 返回 null 表示内容不可保真采集（净化后为空）。
+ */
+function sanitizeReadSnippet(raw: string): SanitizedReadSnippet | null {
+  let text = String(raw);
+  // clamp 头尾拼接：只保留 head（源文件逐字前缀），丢弃标记与不连续的 tail。
+  text = text.replace(READ_CLAMP_MARKER_RE, '');
+  // 范围读省略后缀：剔除标记行本身。
+  text = text.replace(READ_OMITTED_SUFFIX_RE, '');
+  if (!text.trim()) {
+    return null;
+  }
+
+  const lines = text.split('\n');
+  const firstMatch = lines[0]?.match(READ_LINE_PREFIX_RE);
+  if (!firstMatch) {
+    return { content: text, startLineFromPrefix: null };
+  }
+  // 首行带行号前缀 → 视为范围读渲染，逐行剥前缀并用首行行号校准 startLine。
+  // 个别行（空行等）可能无前缀，原样保留。
+  const stripped = lines.map((line) => line.replace(READ_LINE_PREFIX_RE, ''));
+  return {
+    content: stripped.join('\n'),
+    startLineFromPrefix: Number(firstMatch[1]),
+  };
+}
+
+/** code.search 字符串输出的匹配行：`path:42: content`（formatSearchOutput 契约） */
+const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
+
+/**
+ * 解析 code.search 的字符串输出（`N matches (showing M)\n\npath:line: content`...）。
+ * search handler 最终 ok() 的 data 就是这个格式化字符串（不是 {matches} 对象），
+ * 不解析它 search 证据就 100% 进不了 evidenceMap。契约由 evidence-collector 测试钉住。
+ */
+function parseSearchOutputText(text: string): SearchMatch[] {
+  const matches: SearchMatch[] = [];
+  for (const line of text.split('\n')) {
+    const m = line.match(SEARCH_OUTPUT_LINE_RE);
+    if (m?.[1] && m[2]) {
+      matches.push({ file: m[1], line: Number(m[2]), content: m[3] ?? '' });
+    }
+  }
+  return matches;
+}
+
 // ── 类型定义 ──────────────────────────────────────────────────────
 
 /** 代码片段 */
@@ -98,10 +174,11 @@ export interface ToolCall {
   result?: ToolResult;
 }
 
-/** 搜索匹配条目 */
+/** 搜索匹配条目（code.search 实际产出字段是 content；context 为历史别名兼容） */
 interface SearchMatch {
   file?: string;
   line?: number;
+  content?: string;
   context?: string;
 }
 
@@ -112,11 +189,18 @@ interface EvidenceCollectorOptions {
 
 /** 工具结果对象 (所有可能的结果属性联合) */
 interface ToolResultObject {
-  files?: Array<{ path?: string; filePath?: string; content?: string; startLine?: number }>;
+  files?: Array<{
+    path?: string;
+    filePath?: string;
+    content?: string;
+    startLine?: number;
+    mode?: string;
+  }>;
   path?: string;
   filePath?: string;
   content?: string;
   startLine?: number;
+  mode?: string;
   matches?: SearchMatch[];
   batchResults?: Record<string, { matches?: SearchMatch[] }>;
   className?: string;
@@ -233,7 +317,7 @@ export class EvidenceCollector {
 
   // ─── 工具特化提取 ─────────────────────────────────────
 
-  /** code.read — 提取代码片段（批量 result.files / 单文件 result.content） */
+  /** code.read — 提取代码片段（批量 result.files / 单文件 result.content），入库前统一净化保真 */
   #extractFileEvidence(args: ToolCallArgs, result: ToolResult) {
     const argPath = args.path || args.filePath;
 
@@ -243,7 +327,7 @@ export class EvidenceCollector {
         return;
       }
       if (argPath) {
-        this.#addCodeSnippet(argPath, result, args.startLine || 1);
+        this.#addSanitizedSnippet(argPath, result, args.startLine || 1);
       }
       return;
     }
@@ -256,21 +340,43 @@ export class EvidenceCollector {
     if (Array.isArray(result.files)) {
       for (const f of result.files) {
         const filePath = f.path || f.filePath;
-        if (filePath && f.content) {
-          this.#addCodeSnippet(filePath, f.content, f.startLine || 1);
+        if (filePath && f.content && !this.#isNonSourceReadMode(f.mode)) {
+          this.#addSanitizedSnippet(filePath, f.content, f.startLine || 1);
         }
       }
       return;
     }
 
-    // 单文件: result.content
+    // 单文件: result.content。deltaCache 的 unchanged/delta 模式返回占位/差分文本而非
+    // 完整源码，行号也无从对齐，跳过采集（该文件首次全文读时已采）。
+    if (this.#isNonSourceReadMode(result.mode)) {
+      return;
+    }
     const filePath = result.path || result.filePath || argPath;
     if (filePath && result.content) {
-      this.#addCodeSnippet(filePath, result.content, result.startLine || args.startLine || 1);
+      this.#addSanitizedSnippet(filePath, result.content, result.startLine || args.startLine || 1);
     }
   }
 
-  /** code.search — 提取匹配 + 负空间信号（批量 batchResults / 单模式 matches） */
+  /** deltaCache 命中的读取模式：内容不是完整源码，不可作照抄证据 */
+  #isNonSourceReadMode(mode: unknown): boolean {
+    return mode === 'unchanged' || mode === 'delta';
+  }
+
+  /** 净化 code.read 展示态内容后入库；行号前缀存在时以前缀校准 startLine（比参数更可靠） */
+  #addSanitizedSnippet(filePath: string, rawContent: string, fallbackStartLine: number) {
+    const sanitized = sanitizeReadSnippet(rawContent);
+    if (!sanitized) {
+      return;
+    }
+    this.#addCodeSnippet(
+      filePath,
+      sanitized.content,
+      sanitized.startLineFromPrefix ?? fallbackStartLine
+    );
+  }
+
+  /** code.search — 提取匹配 + 负空间信号（字符串输出 / 批量 batchResults / 单模式 matches） */
   #extractSearchEvidence(args: ToolCallArgs, result: ToolResult) {
     const patterns = this.#extractSearchPatterns(args);
 
@@ -279,6 +385,21 @@ export class EvidenceCollector {
         for (const p of patterns) {
           this.#addNegativeSignal(p);
         }
+        return;
+      }
+      // search handler 的 data 是 formatSearchOutput 字符串（`path:line: content` 行）——
+      // 旧实现对正常字符串直接 return，search 命中的行号证据从不进 evidenceMap，是
+      // 冷启动候选 INSUFFICIENT_EVIDENCE / 裸路径 sourceRefs 的采集端根因。
+      const parsed = parseSearchOutputText(result);
+      if (parsed.length === 0) {
+        for (const p of patterns) {
+          this.#addNegativeSignal(p);
+        }
+        return;
+      }
+      const searchNote = patterns[0] || '?';
+      for (const m of parsed.slice(0, MAX_SEARCH_MATCHES)) {
+        this.#addSearchMatch(m, searchNote);
       }
       return;
     }
@@ -433,10 +554,15 @@ export class EvidenceCollector {
       return;
     }
 
-    const entry = this.#getOrCreateEntry(match.file);
-    if (!match.line || !match.context) {
+    // 实际产出字段是 content（`path:line: content` 的匹配行文本）；context 为历史别名。
+    // 注意先取内容再建 entry：内容缺失时不能留下「有 filePath 无 snippet」的空壳 entry，
+    // 否则 Producer 会把它渲染成无行号的裸路径引用，误导模型触发 SOURCE_REF_LINE_MISSING。
+    const matchText = match.content ?? match.context;
+    if (!match.line || !matchText) {
       return;
     }
+
+    const entry = this.#getOrCreateEntry(match.file);
     if (entry.codeSnippets.length >= MAX_SNIPPETS_PER_FILE) {
       return;
     }
@@ -446,11 +572,17 @@ export class EvidenceCollector {
       return;
     }
 
-    const ctx = String(match.context).substring(0, 500);
+    // 单行语义：match.line 精确对应匹配行本身，startLine=endLine 保证行号与内容逐字对齐
+    // （旧实现用 context 行数外推 endLine，多行上下文与起始行错位会毒化照抄链）。
+    // cap 500 字符仍是该行的逐字前缀，snippet-match（去空白子串包含）依然成立。
+    const singleLine = String(matchText).split('\n')[0]?.substring(0, 500) ?? '';
+    if (!singleLine.trim()) {
+      return;
+    }
     entry.codeSnippets.push({
       startLine: match.line,
-      endLine: match.line + (ctx.split('\n').length - 1),
-      content: ctx,
+      endLine: match.line,
+      content: singleLine,
       analystNote: `search: "${searchNote}"`,
     });
   }
