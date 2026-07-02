@@ -1,7 +1,7 @@
 import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
 import { buildAnalyzeGroundingPolicy } from './AnalyzeGroundingGuard.js';
 import type { LoopContext } from './LoopContext.js';
-import { extractSourceRefsFromValue } from './PcvNodeEvidence.js';
+import { extractSourceRefsFromValue } from './PcvNodeEvidenceRecorder.js';
 
 export type LLMInputSectionId =
   | 'identity'

@@ -78,7 +78,7 @@ import {
   recordPcvLlmOutput,
   recordPcvToolResult,
   recordPcvToolRoundOutcome,
-} from './PcvNodeEvidence.js';
+} from './PcvNodeEvidenceRecorder.js';
 import {
   allowsDeepSeekV4ToolCalls,
   observeDeepSeekV4ToolChoiceMode,

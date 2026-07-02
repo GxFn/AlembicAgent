@@ -25,7 +25,7 @@ import {
   buildPcvNodeEvidenceSummary,
   createPcvNodeEvidence,
   type PcvNodeEvidenceSummary,
-} from './PcvNodeEvidence.js';
+} from './PcvNodeEvidenceRecorder.js';
 
 /** Tool call hook type */
 type ToolCallHook = (name: string, params: Record<string, unknown>, result: unknown) => void;

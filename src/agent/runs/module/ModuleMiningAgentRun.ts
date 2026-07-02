@@ -1,8 +1,8 @@
 export type {
   ModuleMiningModule,
-  ScopedMiningModule,
   RunModuleMiningInput,
   RunScopedModuleMiningInput,
+  ScopedMiningModule,
 } from '../module-mining/ScopedModuleMiningAgentRun.js';
 export {
   runModuleMining,

@@ -123,7 +123,7 @@ export type {
   PcvStageNodeIdentity,
   PcvStageNodeMap,
   ResolvedPcvStageNodeIdentity,
-} from './PcvNodeEvidence.js';
+} from './PcvNodeEvidenceRecorder.js';
 export {
   buildPcvNodeEvidenceProcessMetadata,
   buildPcvNodeEvidenceSummary,
@@ -136,7 +136,7 @@ export {
   recordPcvToolResult,
   recordPcvToolRoundOutcome,
   resolvePcvStageNodeIdentity,
-} from './PcvNodeEvidence.js';
+} from './PcvNodeEvidenceRecorder.js';
 export { SystemPromptBuilder } from './SystemPromptBuilder.js';
 export type {
   BuildSystemRunContextOptions,
