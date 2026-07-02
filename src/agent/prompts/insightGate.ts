@@ -939,10 +939,11 @@ export function applyDepthRetryGate(
 }
 
 /**
- * 与 Core gateRules 的 RELATIONSHIP_*_RE 对齐的关系词表（词表稳定，本地同形副本）。
- * 命中即意味着候选大概率触发 GRAPH_REF 门禁的关系声明判定。
+ * 与 Core gateRules 的 RELATIONSHIP_*_RE 对齐的关系词表（本地同形副本）。
+ * 2026-07-02 随 Core 收窄同步：只保留具体调用链断言词；架构描述词（依赖/上下游等）不再
+ * 触发 GRAPH_REF 门禁（Core 20dae5e）。
  */
-const GRAPH_RELATIONSHIP_CN_RE = /调用链|调用方|被调用|依赖|影响路径|关系|上游|下游/;
+const GRAPH_RELATIONSHIP_CN_RE = /调用链|调用方|被调用/;
 
 /** graph-retry 的 reason（buildRetryPrompt 会把它呈给 Analyst 作为重挖指令） */
 const GRAPH_GAP_REASON =

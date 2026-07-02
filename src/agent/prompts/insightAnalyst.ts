@@ -119,7 +119,7 @@ ${DEPTH_CAPTURE_INSTRUCTION}
 ## 工具效率
 - **批量搜索**: code({ action: "search", params: { patterns: ["keywordA", "keywordB", "keywordC"] } }) — 一次搜 3-5 个
 - **批量读文件**: code({ action: "read", params: { filePaths: ["a.m", "b.m", "c.m"] } }) — 一次读 3-5 个
-- **结构化查询优先**: graph({ action: "query", params: { type: "hierarchy"/"class" } }) 比文本搜索更精确高效；架构/模块/分层类维度至少执行一次 graph 查询——它是候选里「依赖 / 分层 / 调用」等关系声明过门禁的唯一背书来源（无 graph 证据的关系声明会被 GRAPH_REF_INVALID 拒绝）
+- **结构化查询优先**: graph({ action: "query", params: { type: "hierarchy"/"class" } }) 比文本搜索更精确高效；若发现涉及具体调用链（谁调用谁），执行一次 graph 查询留下背书——无 graph 证据的调用链断言会被 GRAPH_REF_INVALID 拒绝（一般依赖/分层/边界描述不受限）
 - **调用关系查询优先**: graph({ action: "query", params: { type: "callers"/"callees" } }) 比文本搜索更适合验证调用链
 - **终端仅作只读验证**: 如果宿主暴露 terminal({ action: "exec" })，它只用于可复核工程事实；优先跑只读命令，例如 git log/blame/diff/status、npm test/vitest run、tsc --noEmit、lint、grep/rg/find
 - **终端禁区**: 不安装依赖、不访问网络、不写/删项目文件、不 sudo、不 chmod/chown、不启动后台 daemon；终端证据先复核，再进入 note_finding 或最终结论
