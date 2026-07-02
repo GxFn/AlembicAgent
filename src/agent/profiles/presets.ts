@@ -252,7 +252,9 @@ export const PRESETS = Object.freeze({
               ctx.projectInfo as Parameters<typeof buildProducerPromptV2>[2],
               ctx.rescanContext as Parameters<typeof buildProducerPromptV2>[3],
               ctx.panorama as Parameters<typeof buildProducerPromptV2>[4],
-              ctx.toolPolicyHints as Parameters<typeof buildProducerPromptV2>[5]
+              ctx.toolPolicyHints as Parameters<typeof buildProducerPromptV2>[5],
+              // G3: 冷启动预计算统计(bootstrapStrategyFields.evidenceStarters)——量化「为什么这样选」
+              ctx.evidenceStarters as Parameters<typeof buildProducerPromptV2>[6]
             ),
           // 拒绝率过高时: 缩减预算 + 特定修复 prompt (对齐旧 ProducerAgent 的 rejection retry)
           retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: PRODUCER_RETRY_TIMEOUT_MS },

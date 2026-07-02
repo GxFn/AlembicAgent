@@ -47,6 +47,8 @@ interface DimConfig {
   label: string;
   allowedKnowledgeTypes?: string[];
   outputType?: string;
+  /** G2: plan 按项目规模折算的本维度候选数量建议（引导非硬限，宿主注入） */
+  suggestedCandidateRange?: { min: number; max: number };
 }
 
 /** 项目基本信息 */
@@ -253,7 +255,9 @@ export function buildProducerPromptV2(
   projectInfo: ProjectInfo,
   rescanContext?: ProducerRescanContext | null,
   panorama?: ProducerPanoramaContext | null,
-  toolPolicyHints?: Record<string, unknown> | null
+  toolPolicyHints?: Record<string, unknown> | null,
+  /** G3: 冷启动预计算的加权统计/结构证据（命名前缀占比、继承热点等），供「为什么这样选」引用 */
+  evidenceStarters?: ReadonlyArray<{ hint: string; data: unknown; strength?: number }> | null
 ) {
   const parts: string[] = [];
 
@@ -278,10 +282,10 @@ export function buildProducerPromptV2(
     findingLines.push(
       '☝️ 上述结构化发现是唯一候选义务；最终 Markdown 摘要只作背景，不要从摘要里新增候选主题。'
     );
-    // 深度四要素随 evidence 字符串完整到达这里（note_finding 深度槽 → ## 小节 markdown），
+    // 深度洞察随 evidence 字符串完整到达这里（note_finding 的深挖叙述/可选深度槽 → markdown），
     // 但没有映射义务时模型会把它当纯证据引用丢弃——深度才是候选的核心价值，必须显式要求落字段。
     findingLines.push(
-      '📐 发现证据里若含 ## 设计意图 / ## 边界与约束 / ## 失败模式 / ## 权衡 小节，它们是该候选的核心价值：必须把这些小节原样归纳进 content.markdown（保留小节结构与 file:line 接地），并把关键理由写进 content.rationale，不得丢弃或泛化成一句空话。'
+      '📐 发现证据里的深度洞察（为何这样选 / 违反后果 / 例外对照 / 代价取舍，含 ## 小节或叙述句）是该候选的核心价值：必须把它们完整承载进 content.markdown（保留 file:line 接地，组织形式随你），并把关键理由写进 content.rationale，不得丢弃或泛化成一句空话。'
     );
     parts.push(findingLines.join('\n'));
   }
@@ -306,6 +310,30 @@ export function buildProducerPromptV2(
     parts.push(graphLines.join('\n'));
   }
 
+  // §4c 项目统计与结构证据（G3）：EvidenceStarters 在冷启动已算好命名前缀占比/类型分布/
+  // 继承热点/耦合热点等量化事实——STYLE_GUIDE 要求写「为什么这样选(统计分布、占比)」，此前
+  // 素材备好却从未端给 Producer，模型只能泛泛而谈。渲染 top-6 加权证据供直接引用。
+  if (Array.isArray(evidenceStarters) && evidenceStarters.length > 0) {
+    const statLines = ['## 📊 项目统计与结构证据（写「为什么这样选」时可直接引用这些量化事实）'];
+    const sorted = [...evidenceStarters]
+      .filter(
+        (s): s is { hint: string; data: unknown; strength?: number } =>
+          !!s && typeof (s as { hint?: unknown }).hint === 'string'
+      )
+      .sort((a, b) => (b.strength ?? 0) - (a.strength ?? 0))
+      .slice(0, 6);
+    for (const starter of sorted) {
+      const dataText =
+        starter.data === undefined || starter.data === null
+          ? ''
+          : `: ${limitText(JSON.stringify(starter.data), 220)}`;
+      statLines.push(`- ${starter.hint}${dataText}`);
+    }
+    if (statLines.length > 1) {
+      parts.push(statLines.join('\n'));
+    }
+  }
+
   // §5 负空间信号
   if (artifact.negativeSignals?.length > 0) {
     const nsLines = ['## ⛔ 不存在的模式 (不要猜测)'];
@@ -320,12 +348,15 @@ export function buildProducerPromptV2(
     parts.push(`分析中引用的关键文件: ${artifact.referencedFiles.slice(0, 15).join(', ')}`);
   }
 
-  // §7 维度约束
+  // §7 维度约束（含 G2：plan 按项目规模折算的数量建议——引导非硬限，条数由模型按发现质量自判）
+  const rangeHint = dimConfig.suggestedCandidateRange
+    ? `\n- 数量建议: plan 按项目规模为本维度建议约 ${dimConfig.suggestedCandidateRange.min}-${dimConfig.suggestedCandidateRange.max} 条。宁深勿多——只有挖到足够深的知识点才提交，不为凑数灌水；发现确实多于建议时也可以超出，由你按发现质量自判`
+    : '';
   parts.push(`维度约束:
 - dimensionId: ${dimConfig.id}
 - 允许的 knowledgeType: ${(dimConfig.allowedKnowledgeTypes || []).join(', ') || '(all)'}
 - category: 只能填写业务/组件分类（View/Service/Tool/Model/Network/Storage/UI/Utility），不要填写维度 ID
-- 提交时必须让 knowledge 工具携带 dimensionId=${dimConfig.id}；不要用 category 或 knowledgeType 表示维度归属`);
+- 提交时必须让 knowledge 工具携带 dimensionId=${dimConfig.id}；不要用 category 或 knowledgeType 表示维度归属${rangeHint}`);
 
   // §8 写作指南 + 提交要求
   parts.push(STYLE_GUIDE);

@@ -22,13 +22,16 @@ import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
  * 时同步用 note_finding 的深度槽结构化记录「为何这样设计 / 边界 / 越界会怎样 / 权衡」，各挂真实 file:line。
  * Producer 被禁补读源码，深度只能在有代码工具的 Analyst 段产生，故指令挂在 Analyst 系统提示里。
  */
-const DEPTH_CAPTURE_INSTRUCTION = `- **深度捕获（强价值要求，非硬门槛）**: 确认核心发现时，同步用 note_finding 的深度槽记录该发现的 ${DEPTH_DIMENSIONS.filter(
+// 2026-07-02 重设计(用户决策)：深度捕获从「逐槽填四维」改为「自选角度真挖」——固定四问会把
+// 深度退化成填表式格式化措辞。深度槽(designIntent/boundaries/failureModes/tradeoffs)保留为
+// 可选的结构化载体：挖到哪个角度就填哪个槽，没挖到的留空。
+const DEPTH_CAPTURE_INSTRUCTION = `- **深度捕获（强价值要求，非硬门槛）**: 确认核心发现后，对它做一轮真深挖——从「这个设计最反直觉之处 / 违反它最先坏什么(真实失败路径) / 项目内的例外与对照 / 它替代了什么、代价是什么」里挑你**真的读到代码证据**的角度想透，把洞察写进 note_finding 的 evidence（关键句挂真实 file:line）；挖到的角度恰好对应深度槽（${DEPTH_DIMENSIONS.filter(
   (d) => d.key !== 'multiSourceCorroboration'
 )
   .map((d) => d.label)
   .join(
     ' / '
-  )}（各挂真实 file:line）。这几问要回代码真读——例如「越界会怎样」必须回到真实失败路径，而非格式化措辞；读不到真实证据的那一维就留空，绝不凭空补写。深度槽让 Producer 拿到「为何/边界/越界/权衡」，而非只有「是什么」。`;
+  )}）就顺手填槽，没挖到的留空——绝不为凑维度写格式化措辞。深度让 Producer 拿到「为何/边界/后果/代价」，而非只有「是什么」。`;
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义

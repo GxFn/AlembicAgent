@@ -919,20 +919,35 @@ export function applyDepthRetryGate(
   }
   const depthReview = reviewInsightDepth(artifact);
   const groundedCore = depthReview.grounded.filter((k) => k !== 'multiSourceCorroboration');
-  const attempted = depthReview.ungroundedClaims.length > 0 || groundedCore.length > 0;
+  // 双轨(2026-07-02 用户决策)：自由叙述里的接地深度断言(groundedSignalCount)与小节维度
+  // 覆盖取较高者——深挖写作不再被迫用 `## 四问小节` 组织。
+  const groundedSignals =
+    typeof (depthReview as { groundedSignalCount?: number }).groundedSignalCount === 'number'
+      ? (depthReview as { groundedSignalCount: number }).groundedSignalCount
+      : 0;
+  const depthUnits = Math.max(groundedCore.length, groundedSignals);
+  const attempted =
+    depthReview.ungroundedClaims.length > 0 || groundedCore.length > 0 || groundedSignals > 0;
   (artifact as { metadata?: Record<string, unknown> }).metadata = {
     ...((artifact.metadata as Record<string, unknown>) || {}),
     depthGroundedDims: groundedCore,
+    depthGroundedSignals: groundedSignals,
     depthGroundedFileCount: depthReview.groundedFileCount,
   };
-  if (attempted && groundedCore.length < DEPTH_RETRY_MIN_GROUNDED_DIMS) {
+  if (attempted && depthUnits < DEPTH_RETRY_MIN_GROUNDED_DIMS) {
     const missingLabels = depthReview.missing
       .filter((k) => k !== 'multiSourceCorroboration')
       .map((k) => DEPTH_DIMENSIONS.find((d) => d.key === k)?.label ?? k);
+    // 自由叙述模式下缺口不再按维度名报(那会把作者推回四问模板)，改报通用深挖指令；
+    // 仅当作者本就在用小节组织(groundedCore>0)时才报维度名帮助定位。
+    const gapHint =
+      groundedCore.length > 0
+        ? missingLabels.join(' / ')
+        : 'add grounded depth claims (cause/cost/exception/contrast, each with a real (来源: file:line))';
     return {
       pass: false,
       action: 'analysis_retry',
-      reason: `${DEPTH_GAP_REASON}: ${missingLabels.join(' / ')}`,
+      reason: `${DEPTH_GAP_REASON}: ${gapHint}`,
     };
   }
   return baseGate;
