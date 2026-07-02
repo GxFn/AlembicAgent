@@ -56,7 +56,7 @@ describe('module mining profiles', () => {
       default: 2,
     });
     expect(child).toMatchObject({
-      strategy: { type: 'pipeline', factory: 'bootstrapDimensionPipeline' },
+      strategy: { type: 'pipeline', factory: 'generateDimensionPipeline' },
       projection: 'agent-result',
     });
   });

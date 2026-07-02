@@ -23,8 +23,8 @@ export class AgentRunCoordinator {
   #mergers = new Map<string, Merger>();
 
   constructor() {
-    this.registerPartitioner('bootstrapSessionDimensions', partitionBootstrapSessionDimensions);
-    this.registerMerger('bootstrapSessionResults', mergeBootstrapSessionResults);
+    this.registerPartitioner('generateSessionDimensions', partitionBootstrapSessionDimensions);
+    this.registerMerger('generateSessionResults', mergeBootstrapSessionResults);
     this.registerPartitioner('projectContextModules', partitionProjectIndexScopedModules);
     this.registerMerger('moduleMiningResults', mergeProjectIndexScopedModuleResults);
   }
@@ -316,7 +316,7 @@ function partitionBootstrapSessionDimensions(
 ): AgentRunInput[] {
   const dimensions = Array.isArray(input.params?.dimensions) ? input.params.dimensions : [];
   const baseParams = omitKeys(input.params || {}, ['dimensions', 'children']);
-  const childProfileId = profile.concurrency?.childProfile || 'bootstrap-dimension';
+  const childProfileId = profile.concurrency?.childProfile || 'generate-dimension';
   return dimensions.map((rawDimension, index) => {
     const dimension = toRecord(rawDimension);
     const dimId = stringValue(dimension.dimId) || stringValue(dimension.id) || `dimension-${index}`;

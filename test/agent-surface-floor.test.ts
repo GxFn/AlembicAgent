@@ -366,8 +366,8 @@ describe('coordination public contracts', () => {
       concurrency: {
         mode: 'tiered',
         concurrency: 1,
-        partitioner: 'bootstrapSessionDimensions',
-        merge: 'bootstrapSessionResults',
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
         childProfile: 'child-profile',
       },
     };
@@ -415,8 +415,8 @@ describe('coordination public contracts', () => {
       concurrency: {
         mode: 'tiered',
         concurrency: 1,
-        partitioner: 'bootstrapSessionDimensions',
-        merge: 'bootstrapSessionResults',
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
         childProfile: 'child-profile',
       },
     };

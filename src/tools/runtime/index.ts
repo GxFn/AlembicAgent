@@ -22,8 +22,8 @@ export { estimateTokens, fail, ok } from '#tools/kernel/registry.js';
 export * from './adapter/index.js';
 export * from './cache/index.js';
 export {
-  BootstrapAnalyze,
-  BootstrapProduce,
+  GenerateAnalyze,
+  GenerateProduce,
   Conversation,
   Evolution,
   RuntimeCapability,

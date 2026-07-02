@@ -4,7 +4,7 @@
 
 import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class BootstrapAnalyze extends RuntimeCapability {
+export class GenerateAnalyze extends RuntimeCapability {
   get name() {
     return 'code_analysis';
   }

@@ -1,5 +1,5 @@
-import { BootstrapAnalyze } from '#tools/runtime/capabilities/BootstrapAnalyze.js';
-import { BootstrapProduce } from '#tools/runtime/capabilities/BootstrapProduce.js';
+import { GenerateAnalyze } from '#tools/runtime/capabilities/GenerateAnalyze.js';
+import { GenerateProduce } from '#tools/runtime/capabilities/GenerateProduce.js';
 import type { Capability } from '#tools/runtime/capabilities/Capability.js';
 import { Conversation } from '#tools/runtime/capabilities/Conversation.js';
 import { Evolution } from '#tools/runtime/capabilities/Evolution.js';
@@ -12,8 +12,8 @@ type CapabilityConstructor = new (opts?: Record<string, unknown>) => Capability;
 export const CapabilityRegistry = {
   _registry: new Map<string, CapabilityConstructor>([
     ['conversation', Conversation as CapabilityConstructor],
-    ['code_analysis', BootstrapAnalyze as CapabilityConstructor],
-    ['knowledge_production', BootstrapProduce as CapabilityConstructor],
+    ['code_analysis', GenerateAnalyze as CapabilityConstructor],
+    ['knowledge_production', GenerateProduce as CapabilityConstructor],
     ['scan_production', ScanProduce as CapabilityConstructor],
     ['scan_analyze', ScanAnalyze as CapabilityConstructor],
     ['system_interaction', System as CapabilityConstructor],

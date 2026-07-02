@@ -1,7 +1,7 @@
 import {
-  buildBootstrapTerminalPolicyHints,
-  getBootstrapStageTerminalTools,
-  resolveBootstrapTerminalToolset,
+  buildGenerateTerminalPolicyHints,
+  getGenerateStageTerminalTools,
+  resolveGenerateTerminalToolset,
 } from '@alembic/core/host-agent-workflows';
 import { PRESETS } from '../profiles/presets.js';
 import {
@@ -66,14 +66,14 @@ export class AgentStageFactoryRegistry {
     });
 
     this.register('relationsPipeline', () => buildRelationsPipelineStages());
-    this.register('bootstrapDimensionPipeline', ({ params, context }) => {
+    this.register('generateDimensionPipeline', ({ params, context }) => {
       const presetStages = PRESETS.insight.strategy.stages;
       const evolutionPresetStages = PRESETS.evolution.strategy.stages;
       const needsCandidates = params.needsCandidates !== false;
       const hasExistingRecipes = params.hasExistingRecipes === true;
       const prescreenDone = params.prescreenDone === true;
-      const terminalCapability = resolveBootstrapTerminalToolset();
-      const terminalPolicyHints = buildBootstrapTerminalPolicyHints(terminalCapability);
+      const terminalCapability = resolveGenerateTerminalToolset();
+      const terminalPolicyHints = buildGenerateTerminalPolicyHints(terminalCapability);
       const memoryCoordinator = context?.memoryCoordinator as
         | { allocateBudget?: (role: string) => void }
         | undefined;
@@ -126,7 +126,7 @@ export class AgentStageFactoryRegistry {
               },
             }
           : {}),
-        additionalTools: getBootstrapStageTerminalTools('analyze', terminalCapability),
+        additionalTools: getGenerateStageTerminalTools('analyze', terminalCapability),
         promptBuilder: (ctx: Record<string, unknown>) =>
           presetStages[0].promptBuilder?.(withTerminalPromptContext(ctx)),
       };
@@ -155,7 +155,7 @@ export class AgentStageFactoryRegistry {
         return [
           {
             ...evolutionPresetStages[0],
-            additionalTools: getBootstrapStageTerminalTools(
+            additionalTools: getGenerateStageTerminalTools(
               evolutionPresetStages[0].name || 'evolve',
               terminalCapability
             ),

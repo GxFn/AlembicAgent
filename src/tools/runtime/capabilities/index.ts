@@ -3,8 +3,8 @@
  * Barrel export for all capabilities.
  */
 
-export { BootstrapAnalyze } from './BootstrapAnalyze.js';
-export { BootstrapProduce } from './BootstrapProduce.js';
+export { GenerateAnalyze } from './GenerateAnalyze.js';
+export { GenerateProduce } from './GenerateProduce.js';
 export { Conversation } from './Conversation.js';
 export { Evolution } from './Evolution.js';
 export { RuntimeCapability } from './RuntimeCapability.js';

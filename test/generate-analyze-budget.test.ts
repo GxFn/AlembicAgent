@@ -14,7 +14,7 @@ import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFacto
 describe('bootstrapDimensionPipeline analyze budget wiring', () => {
   it('merges strategyContext._computedBudget over the static analyze preset budget', () => {
     const registry = new AgentStageFactoryRegistry();
-    const stages = registry.build('bootstrapDimensionPipeline', {
+    const stages = registry.build('generateDimensionPipeline', {
       params: { needsCandidates: true },
       context: {
         strategyContext: {
@@ -43,7 +43,7 @@ describe('bootstrapDimensionPipeline analyze budget wiring', () => {
     const registry = new AgentStageFactoryRegistry();
     const buildWith = (strategyContext: Record<string, unknown> | undefined) =>
       (
-        registry.build('bootstrapDimensionPipeline', {
+        registry.build('generateDimensionPipeline', {
           params: { needsCandidates: true },
           context: strategyContext ? { strategyContext } : {},
         }) as Array<{ name: string; budget?: Record<string, unknown> }>
@@ -61,7 +61,7 @@ describe('bootstrapDimensionPipeline analyze budget wiring', () => {
 
   it('does not leak the analyze dynamic budget into the produce stage', () => {
     const registry = new AgentStageFactoryRegistry();
-    const stages = registry.build('bootstrapDimensionPipeline', {
+    const stages = registry.build('generateDimensionPipeline', {
       params: { needsCandidates: true },
       context: {
         strategyContext: {

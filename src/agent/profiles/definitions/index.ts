@@ -1,5 +1,5 @@
 import type { AgentProfileDefinition } from '../../service/AgentRunContracts.js';
-import { BOOTSTRAP_PROFILES } from './bootstrap.profile.js';
+import { GENERATE_PROFILES } from './generate.profile.js';
 import { CHAT_PROFILES } from './chat.profile.js';
 import { EVOLUTION_PROFILES } from './evolution.profile.js';
 import { PROJECT_INDEX_MODULE_MINING_PROFILES } from './module-mining/ProjectIndexModuleMiningProfile.js';
@@ -18,5 +18,5 @@ export const BUILTIN_PROFILES: AgentProfileDefinition[] = [
   ...PROJECT_INDEX_MODULE_MINING_PROFILES,
   ...TRANSLATION_PROFILES,
   ...SIGNAL_PROFILES,
-  ...BOOTSTRAP_PROFILES,
+  ...GENERATE_PROFILES,
 ];

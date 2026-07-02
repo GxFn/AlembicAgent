@@ -4,7 +4,7 @@
 
 import { RuntimeCapability } from './RuntimeCapability.js';
 
-export class BootstrapProduce extends RuntimeCapability {
+export class GenerateProduce extends RuntimeCapability {
   get name() {
     return 'knowledge_production';
   }

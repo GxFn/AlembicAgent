@@ -1,8 +1,8 @@
 import type { AgentProfileDefinition } from '../../service/AgentRunContracts.js';
 
-export const BOOTSTRAP_PROFILES: AgentProfileDefinition[] = [
+export const GENERATE_PROFILES: AgentProfileDefinition[] = [
   {
-    id: 'bootstrap-session',
+    id: 'generate-session',
     title: 'Bootstrap Session',
     serviceKind: 'system-analysis',
     lifecycle: 'experimental',
@@ -12,22 +12,22 @@ export const BOOTSTRAP_PROFILES: AgentProfileDefinition[] = [
     },
     strategy: {
       type: 'fanout',
-      childProfile: 'bootstrap-dimension',
-      partitioner: 'bootstrapSessionDimensions',
-      merge: 'bootstrapSessionResults',
+      childProfile: 'generate-dimension',
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
     },
     concurrency: {
       mode: 'tiered',
       concurrency: { env: 'ALEMBIC_BOOTSTRAP_CONCURRENCY', default: 2 },
-      partitioner: 'bootstrapSessionDimensions',
-      childProfile: 'bootstrap-dimension',
-      merge: 'bootstrapSessionResults',
+      partitioner: 'generateSessionDimensions',
+      childProfile: 'generate-dimension',
+      merge: 'generateSessionResults',
       abortPolicy: 'finish-tier',
     },
     projection: 'agent-result',
   },
   {
-    id: 'bootstrap-dimension',
+    id: 'generate-dimension',
     title: 'Bootstrap Dimension',
     serviceKind: 'system-analysis',
     lifecycle: 'experimental',
@@ -35,7 +35,7 @@ export const BOOTSTRAP_PROFILES: AgentProfileDefinition[] = [
     defaults: {
       actionSpace: { mode: 'none' },
     },
-    strategy: { type: 'pipeline', factory: 'bootstrapDimensionPipeline' },
+    strategy: { type: 'pipeline', factory: 'generateDimensionPipeline' },
     projection: 'agent-result',
   },
 ];

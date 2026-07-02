@@ -89,7 +89,7 @@ export class AgentService {
     const message = buildAgentMessage(input);
     try {
       // 冷启动监控依赖这里把“维度 child run 已进入 AgentRuntime”明确打出来。
-      // 仅靠 BootstrapTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
+      // 仅靠 GenerateTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
       this.#logger.info(`[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
         ...trace,
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),

@@ -33,7 +33,7 @@ import type {
   PipelineType,
 } from './exploration/ExplorationStrategies.js';
 import {
-  createBootstrapStrategy,
+  createGenerateStrategy,
   STRATEGY_ANALYST,
   STRATEGY_PRODUCER,
   targetProducerSubmitCount,
@@ -174,7 +174,7 @@ export class ExplorationTracker {
       resolvedStrategy = STRATEGY_PRODUCER;
     } else {
       const isSkillOnly = dimensionMeta?.outputType === 'skill';
-      resolvedStrategy = createBootstrapStrategy(isSkillOnly);
+      resolvedStrategy = createGenerateStrategy(isSkillOnly);
     }
 
     return new ExplorationTracker(resolvedStrategy, budget);

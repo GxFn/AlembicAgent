@@ -45,7 +45,7 @@ export const PROJECT_INDEX_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
           '你是单模块分析 child。只使用 promptContext.moduleId/moduleName/ownedFiles 与 projectFacts，产出该 ProjectIndex scoped module 的候选 recipe 证据；不得写 repository、ledger 或共享状态。',
       },
     },
-    strategy: { type: 'pipeline', factory: 'bootstrapDimensionPipeline' },
+    strategy: { type: 'pipeline', factory: 'generateDimensionPipeline' },
     projection: 'agent-result',
   },
 ];

@@ -140,7 +140,7 @@ export interface ExplorationTrace {
  * @param isSkillOnly skill-only 维度跳过 PRODUCE 阶段
  * @returns 策略配置
  */
-export function createBootstrapStrategy(isSkillOnly = false) {
+export function createGenerateStrategy(isSkillOnly = false) {
   return {
     name: 'bootstrap',
     phases: isSkillOnly ? ['EXPLORE', 'SUMMARIZE'] : ['EXPLORE', 'PRODUCE', 'SUMMARIZE'],
