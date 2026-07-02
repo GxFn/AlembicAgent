@@ -27,6 +27,74 @@ import {
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
 
+/**
+ * 门禁软硬分级(软规则一次申辩制的判定基础)。
+ * 软=写作风格判断，LLM 可带 waiverJustification 申辩放行(随 reasoning.styleWaiver 落库送人审)：
+ *   祈使动词白名单/英文要求(后缀匹配 DO_CLAUSE_*、DONT_*)、对比示例、标题泛化、
+ *   markdown 长度与代码引用组织、coreCode 完整性。
+ * 硬=事实与接地(不在下方集合即硬)：伪造/失配锚点(SNIPPET_MISMATCH、SOURCE_REF_*、
+ *   PLACEHOLDER_EVIDENCE)、graph 背书(GRAPH_REF_INVALID、STALE_GRAPH)、证据密度
+ *   (INSUFFICIENT_EVIDENCE)、必填结构(*_REQUIRED、CONTENT_MARKDOWN_REQUIRED)——放行即污染知识库。
+ */
+const SOFT_VIOLATION_CODES = new Set([
+  'CONTENT_CONTRAST_MISSING',
+  'STAGE3_MARKDOWN_TOO_SHORT',
+  'STAGE3_MARKDOWN_NEEDS_CODE_OR_FILEREF',
+  'STAGE3_CORECODE_INCOMPLETE',
+  'STAGE3_TITLE_TOO_GENERIC',
+]);
+const SOFT_VIOLATION_SUFFIXES = ['_NON_ENGLISH', '_NON_IMPERATIVE'];
+
+export function isSoftAuthoringViolation(code: string): boolean {
+  return (
+    SOFT_VIOLATION_CODES.has(code) ||
+    SOFT_VIOLATION_SUFFIXES.some((suffix) => code.endsWith(suffix))
+  );
+}
+
+/** 每会话软规则 waiver 放行上限(防「万能理由」刷通过；超限后照常拒绝)。 */
+const STYLE_WAIVER_SESSION_LIMIT = 5;
+/** 申辩理由最短长度(过短理由视同无理由)。 */
+const STYLE_WAIVER_MIN_JUSTIFICATION = 20;
+
+/**
+ * 软规则一次申辩判定(纯函数，供 handler 与测试共用)。
+ * 放行条件全部满足：违规全为软规则、理由 ≥20 字、会话 waiver 未超限。
+ * 放行时把 {codes, justification} 写进 reasoning.styleWaiver 随候选落库，人工审核终裁。
+ */
+export function applyStyleWaiver(input: {
+  violations: Array<{ code: string }>;
+  justification: string | undefined;
+  sessionWaiverTotal: number;
+  item: Record<string, unknown>;
+}): { waived: boolean; item: Record<string, unknown>; waivedCodes: string[] } {
+  const justification = (input.justification ?? '').trim();
+  const soft = input.violations.filter((v) => isSoftAuthoringViolation(v.code));
+  const hard = input.violations.filter((v) => !isSoftAuthoringViolation(v.code));
+  if (
+    input.violations.length === 0 ||
+    hard.length > 0 ||
+    soft.length === 0 ||
+    justification.length < STYLE_WAIVER_MIN_JUSTIFICATION ||
+    input.sessionWaiverTotal >= STYLE_WAIVER_SESSION_LIMIT
+  ) {
+    return { waived: false, item: input.item, waivedCodes: [] };
+  }
+  const waivedCodes = soft.map((v) => v.code);
+  const reasoningBase = (input.item.reasoning ?? {}) as Record<string, unknown>;
+  return {
+    waived: true,
+    waivedCodes,
+    item: {
+      ...input.item,
+      reasoning: {
+        ...reasoningBase,
+        styleWaiver: { codes: waivedCodes, justification },
+      },
+    },
+  };
+}
+
 /** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
 const SNIPPET_REPAIR_MAX_LINES = 12;
 
@@ -439,6 +507,32 @@ async function handleSubmit(
         }
       }
     }
+    // 软规则一次申辩制(2026-07-02 用户决策)：门禁规则分两性——硬规则是事实与接地
+    // (伪造锚点/重复/必填结构，放行即污染知识库，不可申辩)；软规则是写作风格判断
+    // (祈使动词白名单/对比示例/标题泛化/长度)，LLM 可能有正当理由(如项目惯用语)。
+    // 软规则全拒时反复猜措辞是最长的提交回合尾巴；改为：LLM 带 ≥20 字 waiverJustification
+    // 重新提交即放行，理由随 reasoning.styleWaiver 落库，由 Dashboard 人工审核终裁。
+    // 每会话 waiver 上限 5 次防滥用；混有硬违规时申辩无效(先修事实错误)。
+    if (gateViolations.length > 0) {
+      const waiverState = ctx.runtime as Record<string, unknown> | undefined;
+      const waiverTotal = Number(waiverState?._styleWaiverTotal) || 0;
+      const waiver = applyStyleWaiver({
+        violations: gateViolations,
+        justification: pickString(params.waiverJustification),
+        sessionWaiverTotal: waiverTotal,
+        item: effectiveItem,
+      });
+      if (waiver.waived) {
+        effectiveItem = waiver.item;
+        if (waiverState) {
+          waiverState._styleWaiverTotal = waiverTotal + 1;
+        }
+        Logger.getInstance().warn(
+          `[knowledge.submit] style waiver accepted (${waiver.waivedCodes.join(', ')}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), session waivers=${waiverTotal + 1}/${STYLE_WAIVER_SESSION_LIMIT} — pending human review`
+        );
+        gateViolations = [];
+      }
+    }
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);
       // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
@@ -451,6 +545,12 @@ async function handleSubmit(
         )
       )
         ? buildSnippetRepairHint(effectiveItem.sourceRefs, ctx.projectRoot)
+        : '';
+      // 申辩指引：全部违规都是软规则时告知申辩通道(硬违规在场时先修事实错误，不提申辩)。
+      const appealEligible =
+        gateViolations.length > 0 && gateViolations.every((v) => isSoftAuthoringViolation(v.code));
+      const appealHint = appealEligible
+        ? ' ↺ 以上均为风格类软规则：若你有正当理由坚持当前写法(如项目惯用语)，可原样重新提交并附 waiverJustification(≥20 字理由)——将放行并连同理由交人工审核。证据接地/重复/必填结构类硬规则不适用。'
         : '';
       // 可见化:门禁拒绝是冷启动候选不落库的最可能真因(如冷启动档位的 3-file 证据下限、祈使动词、
       // snippet 匹配、source-ref 接地)。打日志带标题+违规明细，便于定位是 DeepSeek 候选质量还是门禁校准。
@@ -480,7 +580,7 @@ async function handleSubmit(
           );
         }
       }
-      return fail(`Validation failed: ${detail}${snippetRepair}${stopDirective}`);
+      return fail(`Validation failed: ${detail}${snippetRepair}${appealHint}${stopDirective}`);
     }
     // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
     if (ctx.runtime) {

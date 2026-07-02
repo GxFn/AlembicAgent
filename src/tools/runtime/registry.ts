@@ -247,6 +247,11 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             },
             required: ['sources'],
           },
+          waiverJustification: {
+            type: 'string',
+            description:
+              'Style-rule appeal only: if a submit was rejected purely by soft style rules (imperative-verb whitelist, contrast example, title genericity, markdown length) and you have a legitimate reason to keep your wording, resubmit unchanged with a >=20-char justification here. It passes with your reason attached for human review. Never applicable to evidence/duplicate/required-structure rejections.',
+          },
         },
         required: [
           'title',

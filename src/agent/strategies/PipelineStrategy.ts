@@ -20,7 +20,7 @@
 import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
-import { buildRecordRepairPrompt } from '../prompts/insightGate.js';
+import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
@@ -69,6 +69,10 @@ interface GateConfig {
   recordRepairMaxRounds?: number;
   recordRepairTimeoutMs?: number;
   recordRepairMaxTokens?: number;
+  /** summary_rewrite(纯写作重组)配置：与 record_repair 同一微阶段范式 */
+  maxSummaryRewriteRetries?: number;
+  summaryRewriteTimeoutMs?: number;
+  summaryRewriteMaxTokens?: number;
   useCumulativeToolCalls?: boolean;
   minEvidenceLength?: number;
   minFileRefs?: number;
@@ -350,6 +354,51 @@ export class PipelineStrategy extends Strategy {
       return 'break';
     }
 
+    if (gateResult.action === 'summary_rewrite') {
+      // 写作类失败(文本短/缺结构/缺接地深度断言)且证据面已达标：不重跑整段 analyze
+      // (最贵路径)，改用零工具单调用把 memory 里的已验证发现重组成合格分析文本。
+      // 产出只替换 reply——toolCalls 等证据面保持原样(重写不产生新证据)。
+      const rewriteKey = `_summaryRewriteRetries_${stage.name || 'gate'}`;
+      phaseResults[rewriteKey] = ((phaseResults[rewriteKey] as number) || 0) + 1;
+      const maxRewrites = gate.maxSummaryRewriteRetries ?? 1;
+
+      if ((phaseResults[rewriteKey] as number) <= maxRewrites) {
+        const sourceName = (stage.source || this.#prevStageName(stage)) as string;
+        const source = phaseResults[sourceName] as Record<string, unknown> | undefined;
+        const rewriteResult = await this.#runSummaryRewriteStage(
+          runtime,
+          message,
+          stage,
+          gateResult,
+          ctx,
+          bus
+        );
+        const newReply = typeof rewriteResult?.reply === 'string' ? rewriteResult.reply.trim() : '';
+        if (source && newReply.length > 0) {
+          phaseResults[sourceName] = { ...source, reply: newReply };
+          gateResult = this.#evaluateGateResult(stage, ctx, bus);
+          this.#storeGateResult(stage, gateResult, ctx, bus);
+          if (gateResult.action === 'pass') {
+            return 'continue';
+          }
+          if (gateResult.action === 'degrade') {
+            ctx.degraded = true;
+            ctx.diagnostics.markDegraded();
+            return 'break';
+          }
+        } else {
+          _pipelineLogger().info(
+            `[PipelineStrategy] summary_rewrite produced no usable text for "${stage.name}" — falling back to analysis_retry`
+          );
+        }
+      }
+      // 重写没有救回来(或产出为空/再次判 rewrite)：转整段重挖路径，与 analysis_retry
+      // 共享次数上限与预算压制判断，绝不在 rewrite 里无限打转。
+      if (gateResult.action === 'summary_rewrite') {
+        gateResult = { ...gateResult, action: 'analysis_retry' };
+      }
+    }
+
     if (gateResult.action === 'analysis_retry' || gateResult.action === 'retry') {
       const maxRetries = gate.maxRetries ?? this.#maxRetries;
       const retryKey = `_retries_${stage.name || 'gate'}`;
@@ -519,6 +568,45 @@ export class PipelineStrategy extends Strategy {
     };
 
     return this.#executeStage(runtime, message, repairStage, ctx, bus);
+  }
+
+  /**
+   * summary_rewrite 微阶段：与 record_repair 同一范式(小预算、disableTracker、inline 重评)，
+   * 但更进一步——零工具纯写作。LLM 拿着 artifact 里的已验证发现重组分析文本，
+   * 产出经调用方写回 analyze 阶段的 reply 后重评。成本≈一次 chat 调用。
+   */
+  async #runSummaryRewriteStage(
+    runtime: PipelineRuntime,
+    message: AgentMessage,
+    gateStage: PipelineStage,
+    gateResult: GateEvalResult,
+    ctx: PipelineContext,
+    bus: AgentEventBus
+  ) {
+    const gate = gateStage.gate || {};
+    const rewriteStage: PipelineStage = {
+      name: `${gateStage.name || 'quality_gate'}_summary_rewrite`,
+      capabilities: [],
+      additionalTools: [],
+      budget: {
+        maxIterations: 1,
+        timeoutMs: (gate.summaryRewriteTimeoutMs as number | undefined) ?? 120_000,
+        maxTokens: (gate.summaryRewriteMaxTokens as number | undefined) ?? 4096,
+        temperature: 0.3,
+        maxSessionInputTokens: 24_000,
+        maxSessionTokens: 30_000,
+      },
+      disableTracker: true,
+      systemPrompt:
+        'You are in a summary-rewrite stage. Do not explore or call tools. Rewrite the analysis text using only the verified findings provided in the prompt.',
+      promptBuilder: () =>
+        buildSummaryRewritePrompt({
+          reason: gateResult.reason || '',
+          artifact: gateResult.artifact as Record<string, unknown> | null,
+        }),
+    };
+
+    return this.#executeStage(runtime, message, rewriteStage, ctx, bus);
   }
 
   #stageHasNoteFindingCall(stageResult: StageResult) {
