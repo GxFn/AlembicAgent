@@ -10,7 +10,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
-import { getSystemInjectedFields, type RecipeAuthoringViolation } from '@alembic/core/knowledge';
+import {
+  applyStyleWaiver,
+  getSystemInjectedFields,
+  isSoftAuthoringViolation,
+  type RecipeAuthoringViolation,
+  STYLE_WAIVER_SESSION_LIMIT,
+} from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import {
   estimateTokens,
@@ -27,73 +33,10 @@ import {
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
 
-/**
- * 门禁软硬分级(软规则一次申辩制的判定基础)。
- * 软=写作风格判断，LLM 可带 waiverJustification 申辩放行(随 reasoning.styleWaiver 落库送人审)：
- *   祈使动词白名单/英文要求(后缀匹配 DO_CLAUSE_*、DONT_*)、对比示例、标题泛化、
- *   markdown 长度与代码引用组织、coreCode 完整性。
- * 硬=事实与接地(不在下方集合即硬)：伪造/失配锚点(SNIPPET_MISMATCH、SOURCE_REF_*、
- *   PLACEHOLDER_EVIDENCE)、graph 背书(GRAPH_REF_INVALID、STALE_GRAPH)、证据密度
- *   (INSUFFICIENT_EVIDENCE)、必填结构(*_REQUIRED、CONTENT_MARKDOWN_REQUIRED)——放行即污染知识库。
- */
-const SOFT_VIOLATION_CODES = new Set([
-  'CONTENT_CONTRAST_MISSING',
-  'STAGE3_MARKDOWN_TOO_SHORT',
-  'STAGE3_MARKDOWN_NEEDS_CODE_OR_FILEREF',
-  'STAGE3_CORECODE_INCOMPLETE',
-  'STAGE3_TITLE_TOO_GENERIC',
-]);
-const SOFT_VIOLATION_SUFFIXES = ['_NON_ENGLISH', '_NON_IMPERATIVE'];
-
-export function isSoftAuthoringViolation(code: string): boolean {
-  return (
-    SOFT_VIOLATION_CODES.has(code) ||
-    SOFT_VIOLATION_SUFFIXES.some((suffix) => code.endsWith(suffix))
-  );
-}
-
-/** 每会话软规则 waiver 放行上限(防「万能理由」刷通过；超限后照常拒绝)。 */
-const STYLE_WAIVER_SESSION_LIMIT = 5;
-/** 申辩理由最短长度(过短理由视同无理由)。 */
-const STYLE_WAIVER_MIN_JUSTIFICATION = 20;
-
-/**
- * 软规则一次申辩判定(纯函数，供 handler 与测试共用)。
- * 放行条件全部满足：违规全为软规则、理由 ≥20 字、会话 waiver 未超限。
- * 放行时把 {codes, justification} 写进 reasoning.styleWaiver 随候选落库，人工审核终裁。
- */
-export function applyStyleWaiver(input: {
-  violations: Array<{ code: string }>;
-  justification: string | undefined;
-  sessionWaiverTotal: number;
-  item: Record<string, unknown>;
-}): { waived: boolean; item: Record<string, unknown>; waivedCodes: string[] } {
-  const justification = (input.justification ?? '').trim();
-  const soft = input.violations.filter((v) => isSoftAuthoringViolation(v.code));
-  const hard = input.violations.filter((v) => !isSoftAuthoringViolation(v.code));
-  if (
-    input.violations.length === 0 ||
-    hard.length > 0 ||
-    soft.length === 0 ||
-    justification.length < STYLE_WAIVER_MIN_JUSTIFICATION ||
-    input.sessionWaiverTotal >= STYLE_WAIVER_SESSION_LIMIT
-  ) {
-    return { waived: false, item: input.item, waivedCodes: [] };
-  }
-  const waivedCodes = soft.map((v) => v.code);
-  const reasoningBase = (input.item.reasoning ?? {}) as Record<string, unknown>;
-  return {
-    waived: true,
-    waivedCodes,
-    item: {
-      ...input.item,
-      reasoning: {
-        ...reasoningBase,
-        styleWaiver: { codes: waivedCodes, justification },
-      },
-    },
-  };
-}
+// C-6(2026-07-02 统一重构)：软硬分级与 waiver 判定下沉 Core styleWaiver 单源——
+// 宿主 alembic_submit_knowledge evidence gate 与本 handler 共用同一分级表与申辩语义。
+// 本文件仅保留 re-export 供既有测试/消费方引用。
+export { applyStyleWaiver, isSoftAuthoringViolation };
 
 /** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
 const SNIPPET_REPAIR_MAX_LINES = 12;
