@@ -1,10 +1,10 @@
 export type {
   ModuleMiningModule,
-  ProjectIndexScopedModule,
+  ScopedMiningModule,
   RunModuleMiningInput,
-  RunProjectIndexScopedModuleMiningInput,
-} from '../module-mining/ProjectIndexModuleMiningAgentRun.js';
+  RunScopedModuleMiningInput,
+} from '../module-mining/ScopedModuleMiningAgentRun.js';
 export {
   runModuleMining,
-  runProjectIndexScopedModuleMining,
-} from '../module-mining/ProjectIndexModuleMiningAgentRun.js';
+  runScopedModuleMining,
+} from '../module-mining/ScopedModuleMiningAgentRun.js';

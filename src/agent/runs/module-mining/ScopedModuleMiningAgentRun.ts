@@ -1,7 +1,7 @@
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 
-export interface ProjectIndexScopedModule {
+export interface ScopedMiningModule {
   moduleId?: string;
   id?: string;
   moduleName?: string;
@@ -11,23 +11,23 @@ export interface ProjectIndexScopedModule {
   [key: string]: unknown;
 }
 
-export interface RunProjectIndexScopedModuleMiningInput {
+export interface RunScopedModuleMiningInput {
   agentService: Pick<AgentService, 'run'>;
-  modules: ProjectIndexScopedModule[];
+  modules: ScopedMiningModule[];
   projectFacts: unknown;
   budget?: Record<string, unknown>;
   scaleCap?: number;
   concurrency?: number;
 }
 
-export async function runProjectIndexScopedModuleMining({
+export async function runScopedModuleMining({
   agentService,
   modules,
   projectFacts,
   budget,
   scaleCap,
   concurrency,
-}: RunProjectIndexScopedModuleMiningInput): Promise<AgentRunResult> {
+}: RunScopedModuleMiningInput): Promise<AgentRunResult> {
   const selectedModules = selectScopedIndexModulesForRun(modules, scaleCap);
   const result = await agentService.run({
     profile: { id: 'module-mining-session' },
@@ -78,7 +78,7 @@ export async function runProjectIndexScopedModuleMining({
   return result;
 }
 
-function selectScopedIndexModulesForRun(modules: ProjectIndexScopedModule[], scaleCap?: number) {
+function selectScopedIndexModulesForRun(modules: ScopedMiningModule[], scaleCap?: number) {
   if (!Array.isArray(modules) || modules.length === 0) {
     throw new Error('runModuleMining requires at least one ProjectContext module');
   }
@@ -93,7 +93,7 @@ function selectScopedIndexModulesForRun(modules: ProjectIndexScopedModule[], sca
   return selected.map((moduleInput, index) => normalizeScopedIndexModule(moduleInput, index));
 }
 
-function normalizeScopedIndexModule(moduleInput: ProjectIndexScopedModule, index: number) {
+function normalizeScopedIndexModule(moduleInput: ScopedMiningModule, index: number) {
   const moduleName =
     readString(moduleInput.moduleName) ||
     readString(moduleInput.name) ||
@@ -124,7 +124,7 @@ function buildProjectIndexScopedModulePrompt({
   projectFacts,
   budget,
 }: {
-  modules: ProjectIndexScopedModule[];
+  modules: ScopedMiningModule[];
   projectFacts: unknown;
   budget?: Record<string, unknown>;
 }) {
@@ -156,6 +156,6 @@ function readStringArray(value: unknown) {
   );
 }
 
-export type ModuleMiningModule = ProjectIndexScopedModule;
-export type RunModuleMiningInput = RunProjectIndexScopedModuleMiningInput;
-export const runModuleMining = runProjectIndexScopedModuleMining;
+export type ModuleMiningModule = ScopedMiningModule;
+export type RunModuleMiningInput = RunScopedModuleMiningInput;
+export const runModuleMining = runScopedModuleMining;

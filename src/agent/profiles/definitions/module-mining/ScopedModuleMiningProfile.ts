@@ -1,6 +1,6 @@
 import type { AgentProfileDefinition } from '../../../service/AgentRunContracts.js';
 
-export const PROJECT_INDEX_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
+export const SCOPED_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
   {
     id: 'module-mining-session',
     title: 'Project Index Scoped Module Mining Session',
@@ -50,4 +50,4 @@ export const PROJECT_INDEX_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
   },
 ];
 
-export const MODULE_MINING_PROFILES = PROJECT_INDEX_MODULE_MINING_PROFILES;
+export const MODULE_MINING_PROFILES = SCOPED_MODULE_MINING_PROFILES;
