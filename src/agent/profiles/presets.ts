@@ -42,12 +42,7 @@ import {
   PRODUCER_SYSTEM_PROMPT,
   producerRejectionGateEvaluator,
 } from '../prompts/insightProducer.js';
-import {
-  AdaptiveStrategy,
-  FanOutStrategy,
-  SingleStrategy,
-  type Strategy,
-} from '../strategies/index.js';
+import { FanOutStrategy, SingleStrategy, type Strategy } from '../strategies/index.js';
 import { PipelineStrategy } from '../strategies/PipelineStrategy.js';
 
 // ─── Types ─────────────────────────────────────
@@ -395,7 +390,7 @@ export const PRESETS = Object.freeze({
 /**
  * 将 Preset 配置中的 strategy 声明式配置转换为实际 Strategy 实例
  *
- * @param strategyConfig { type: 'single'|'pipeline'|'fan_out'|'adaptive', ...opts }
+ * @param strategyConfig { type: 'single'|'pipeline'|'fan_out', ...opts }
  */
 export function resolveStrategy(strategyConfig: StrategyConfig | null | undefined): Strategy {
   if (!strategyConfig) {
@@ -422,13 +417,6 @@ export function resolveStrategy(strategyConfig: StrategyConfig | null | undefine
         merge: strategyConfig.merge,
       });
     }
-
-    case 'adaptive':
-      return new AdaptiveStrategy({
-        single: strategyConfig.single ? resolveStrategy(strategyConfig.single) : undefined,
-        pipeline: strategyConfig.pipeline ? resolveStrategy(strategyConfig.pipeline) : undefined,
-        fanOut: strategyConfig.fanOut ? resolveStrategy(strategyConfig.fanOut) : undefined,
-      });
 
     default:
       throw new Error(`Unknown strategy type: ${strategyConfig.type}`);

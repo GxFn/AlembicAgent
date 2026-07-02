@@ -87,7 +87,6 @@ export { AgentPhase, AgentState } from './runtime/AgentState.js';
 export * from './service/index.js';
 // ── Strategies ──
 export {
-  AdaptiveStrategy,
   FanOutStrategy,
   SingleStrategy,
   Strategy,
