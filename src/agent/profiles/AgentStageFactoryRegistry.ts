@@ -94,8 +94,38 @@ export class AgentStageFactoryRegistry {
         toolPolicyHints: terminalPolicyHints,
       });
 
+      // 动态 Analyst 预算接线：宿主用 computeAnalystBudget(fileCount, contextWindowBudget)
+      // 算出的规模化预算放在 strategyContext._computedBudget。此前 PipelineStrategy 的
+      // 回退顺序是 stage.budget || computedBudget——insight preset 的 analyze stage 自带
+      // 静态兜底 budget(24 轮/480s/345.6k input)，动态值被永久遮蔽；大项目(如 2000+ 文件、
+      // plan 给高候选预算)在 analyze 阶段撞 stage_timeout 且 retry 被输入预算压制。
+      // 这里按 preset 注释声明的原始意图，把动态字段显式合并覆盖静态兜底(仅 analyze 阶段；
+      // produce/gate 各有自己的预算语义，不受影响)。
+      const computedBudget = (context?.strategyContext as Record<string, unknown> | undefined)
+        ?._computedBudget as Record<string, unknown> | null | undefined;
+      const dynamicAnalyzeBudget: Record<string, unknown> = {};
+      for (const key of [
+        'maxIterations',
+        'timeoutMs',
+        'maxSessionTokens',
+        'maxSessionInputTokens',
+      ]) {
+        const value = computedBudget?.[key];
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+          dynamicAnalyzeBudget[key] = value;
+        }
+      }
+
       const analyzeStage = {
         ...presetStages[0],
+        ...(Object.keys(dynamicAnalyzeBudget).length > 0
+          ? {
+              budget: {
+                ...((presetStages[0].budget as Record<string, unknown> | undefined) || {}),
+                ...dynamicAnalyzeBudget,
+              },
+            }
+          : {}),
         additionalTools: getBootstrapStageTerminalTools('analyze', terminalCapability),
         promptBuilder: (ctx: Record<string, unknown>) =>
           presetStages[0].promptBuilder?.(withTerminalPromptContext(ctx)),
