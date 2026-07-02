@@ -30,9 +30,6 @@ const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
 /** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
 const SNIPPET_REPAIR_MAX_LINES = 12;
 
-/** markdown 首个 fenced code block（与 Core collectCodeEvidence 的判据同形） */
-const FIRST_FENCED_RE = /(```[a-zA-Z0-9_-]*\s*\n)([\s\S]*?)(```)/;
-
 /**
  * 读取 sourceRefs 中第一个可解析 ref 的真实行范围原文（越界行号 clamp 进文件）。
  * F4b 修复提示与 F4d 自动对齐共用。只读、projectRoot 内限定、失败返回 null。
@@ -139,12 +136,11 @@ function normalizeBareSourceRefs(
 }
 
 /**
- * F4c 内部规范化重验：门禁的代码证据取三处（coreCode / content.pattern / markdown 首个
- * fenced block），三处都须逐字匹配 cited range。真机 DeepSeek 反复只抄对其中一处、另一处
- * 坚持自写「示意代码」——同一候选换标题重试三轮全卡 SNIPPET_MISMATCH，烧轮次不收敛。
- * 这里在 handler 内做确定性消化：只要有一处代码与引用范围逐字匹配（即真实接地成立），
- * 就把其余代码位同步为该真实代码并重跑完整门禁；任一变体全过即用它提交。
- * 这是规范化而非编造——被同步的代码本身已通过 snippet-match 验证为源文件原文。
+ * F4c/F4d 规范化（2026-07-02 收敛）：门禁逐字校验只剩 coreCode / content.pattern 证据位
+ * （Core 已把 markdown 代码块豁免——特写模板是提炼物，归模型创作，handler **绝不碰
+ * markdown**；此前把 fenced 替换为 ref 原文的做法摧毁了特写的范式意义，用户验收否决）。
+ * 剩余唯一确定性对齐：coreCode 不匹配时，用模型【自己引用】的 sourceRef 范围原文替换
+ * coreCode——ref 是它声称的证据来源，候选仍进待人审 candidates。
  */
 function tryNormalizeSnippetEvidence(
   item: Record<string, unknown>,
@@ -157,61 +153,21 @@ function tryNormalizeSnippetEvidence(
   if (!opts.projectRoot) {
     return null;
   }
-  const content = (item.content ?? {}) as Record<string, unknown>;
-  const markdown = typeof content.markdown === 'string' ? content.markdown : '';
-  const coreCode = typeof item.coreCode === 'string' ? item.coreCode.trim() : '';
-  const fenced = markdown.match(FIRST_FENCED_RE)?.[2]?.trim() ?? '';
-
-  const variants: Array<{ direction: string; item: Record<string, unknown> }> = [];
-  // 方向 1：coreCode 为真 → markdown fenced 同步为 coreCode。
-  if (coreCode && fenced && coreCode !== fenced) {
-    variants.push({
-      direction: 'markdown-fenced ← coreCode',
-      item: {
-        ...item,
-        content: {
-          ...content,
-          markdown: markdown.replace(FIRST_FENCED_RE, (_m, open, _body, close) =>
-            [open, coreCode, '\n', close].join('')
-          ),
-        },
-      },
-    });
-    // 方向 2：markdown fenced 为真 → coreCode 同步为 fenced。
-    variants.push({ direction: 'coreCode ← markdown-fenced', item: { ...item, coreCode: fenced } });
-  }
-
-  // 方向 3（F4d 自动对齐）：coreCode / fenced 都不匹配（或缺失）时，用模型【自己引用】的
-  // sourceRef 范围原文替换全部代码位。四轮真机(21 提交 0 过)证明 DeepSeek 不执行「逐字照抄」
-  // 动作——所有教育路线(证据/锚点/答案反馈)到顶后，这是把候选诚实化的确定性收敛：ref 是模型
-  // 声称的知识来源；候选进入待人审 candidates，语义一致性由 Dashboard 审核兜底。
   const refRange = readRefRangeCode(item.sourceRefs, opts.projectRoot);
-  if (refRange) {
-    const alignedMarkdown = markdown.match(FIRST_FENCED_RE)
-      ? markdown.replace(FIRST_FENCED_RE, (_m, open, _body, close) =>
-          [open, refRange.code, '\n', close].join('')
-        )
-      : markdown;
-    variants.push({
-      direction: `all ← sourceRef(${refRange.refText})`,
-      item: {
-        ...item,
-        coreCode: refRange.code,
-        content: { ...content, markdown: alignedMarkdown },
-      },
-    });
+  if (!refRange) {
+    return null;
   }
-
-  for (const variant of variants) {
-    const violations = runInProcessRecipeAuthoringGate(variant.item, {
-      projectRoot: opts.projectRoot,
-      dimensionId: opts.dimensionId,
-    });
-    // 采纳条件：SNIPPET_MISMATCH 消失即可（不要求零违规）——真机拒绝常与 GRAPH/DO_CLAUSE
-    // 复合，若强求全过则规范化几乎永不生效。剩余文本层违规交回模型修（那是它能修的）。
-    if (!violations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-      return { ...variant, violations };
-    }
+  const variant = {
+    direction: `coreCode ← sourceRef(${refRange.refText})`,
+    item: { ...item, coreCode: refRange.code },
+  };
+  const violations = runInProcessRecipeAuthoringGate(variant.item, {
+    projectRoot: opts.projectRoot,
+    dimensionId: opts.dimensionId,
+  });
+  // 采纳条件：SNIPPET_MISMATCH 消失即可（不要求零违规）——剩余文本层违规交回模型修。
+  if (!violations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+    return { ...variant, violations };
   }
   return null;
 }
@@ -229,7 +185,7 @@ function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undef
   const rangeNote = range.outOfRange
     ? `你引用的行号 ${range.rawStart} 超出该文件（共 ${range.fileLines} 行）。请改用 ${range.refText}，`
     : `引用范围 ${range.refText} `;
-  return ` 📎 修复提示：${rangeNote}其真实代码如下。请【先按此答案重试本条一次】（把 sourceRefs、coreCode 与 markdown 代码块逐字替换为它，不要改写），带答案的拒绝不算连续失败；重试后仍被拒才换下一条:\n${range.code}`;
+  return ` 📎 修复提示：${rangeNote}其真实代码如下。请【先按此答案重试本条一次】——sourceRefs 与 coreCode 逐字替换为它（markdown 特写正文与模板代码保持你自己的提炼创作，不要改成粘贴），带答案的拒绝不算连续失败；重试后仍被拒才换下一条:\n${range.code}`;
 }
 
 export async function handle(
