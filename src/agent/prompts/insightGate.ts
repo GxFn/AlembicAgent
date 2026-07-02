@@ -1012,19 +1012,15 @@ export function insightGateEvaluator(
     strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
       ? (strategyContext.sharedState as Record<string, unknown>)
       : null;
-  // F4g：depth-retry 之上叠 graph-retry——关系型分析无 graph 背书时回炉一次补真实查询
-  // （sharedState 计数保证只 retry 一次，未果放行，不烧 pipeline 配额）。
-  const gate = applyGraphRetryGate(
-    applyDepthRetryGate(
-      analysisQualityGate(artifact, {
-        outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
-      }),
-      artifact as Record<string, unknown>,
-      Boolean(needsCandidates)
-    ),
+  // F4g graph-retry 已停用（保留函数供未来模型再评估）：沙箱第 8/9 轮实测 DeepSeek 对明确
+  // retry 指令仍不调 graph，retry 只会把维度拖成 error（比 GRAPH 拒绝更糟）。关系声明的
+  // graph 背书走 F4e 注入（Analyst 恰好调了 graph 时），否则由 submit 拒绝反馈改述。
+  const gate = applyDepthRetryGate(
+    analysisQualityGate(artifact, {
+      outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
+    }),
     artifact as Record<string, unknown>,
-    Boolean(needsCandidates),
-    sharedState
+    Boolean(needsCandidates)
   );
   // F4e：把 Analyst 真实 graph 查询的可复制 refs 经 sharedState 传给 submit handler——
   // GRAPH_REF_INVALID 拒绝时 handler 自动注入（替模型完成「复制」动作；graphEvidence
