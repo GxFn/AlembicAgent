@@ -8,6 +8,6 @@ export * from './kernel/presenter.js';
 export * from './kernel/request.js';
 export * from './kernel/result.js';
 export * from './kernel/routing.js';
-export * from './runtime/capabilities/index.js';
 export * from './runtime/index.js';
+export * from './runtime/toolsets/index.js';
 export * from './workflow/WorkflowRegistry.js';

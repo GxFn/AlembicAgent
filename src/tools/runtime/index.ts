@@ -21,16 +21,6 @@ export type {
 export { estimateTokens, fail, ok } from '#tools/kernel/registry.js';
 export * from './adapter/index.js';
 export * from './cache/index.js';
-export {
-  Conversation,
-  Evolution,
-  GenerateAnalyze,
-  GenerateProduce,
-  RuntimeCapability,
-  ScanAnalyze,
-  ScanProduce,
-  System,
-} from './capabilities/index.js';
 export * from './compressor/index.js';
 export {
   generateLightweightSchemas,
@@ -40,3 +30,13 @@ export {
 } from './registry.js';
 export type { RouterConfig } from './router.js';
 export { ToolRouter } from './router.js';
+export {
+  Conversation,
+  Evolution,
+  GenerateAnalyze,
+  GenerateProduce,
+  RuntimeCapability,
+  ScanAnalyze,
+  ScanProduce,
+  System,
+} from './toolsets/index.js';

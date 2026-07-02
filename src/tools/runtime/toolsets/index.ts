@@ -1,5 +1,5 @@
 /**
- * @module tools/runtime/capabilities
+ * @module tools/runtime/toolsets
  * Barrel export for all capabilities.
  */
 

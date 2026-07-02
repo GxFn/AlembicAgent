@@ -1,5 +1,5 @@
 /**
- * @module tools/runtime/capabilities/RuntimeCapability
+ * @module tools/runtime/toolsets/RuntimeCapability
  *
  * Capability 基类 — 继承本地 Capability 叶子基类，声明式定义场景级工具集。
  * 每个 Capability 声明 allowedTools (tool → action[])，
