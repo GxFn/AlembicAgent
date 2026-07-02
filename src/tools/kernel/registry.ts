@@ -121,7 +121,7 @@ export interface ToolContext {
   knowledgeRepo?: unknown;
 
   /** 进化决策网关 — knowledge.manage(evolve/deprecate/skip_evolution) 的唯一写入口 */
-  evolutionGateway?: unknown;
+  proposalGateway?: unknown;
 
   /** AST 分析器 — code handler 内部 cast 为 AstAnalyzerLike */
   astAnalyzer?: unknown;

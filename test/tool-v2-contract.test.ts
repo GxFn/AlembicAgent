@@ -407,7 +407,7 @@ describe('Tool V2 contract exports', () => {
         {
           ...baseToolContext(),
           runtime: source ? { sharedState: { evolutionProposalSource: source } } : {},
-          evolutionGateway: {
+          proposalGateway: {
             submit: async (decision: {
               recipeId: string;
               action: string;

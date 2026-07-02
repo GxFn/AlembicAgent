@@ -761,7 +761,7 @@ type EvolutionProposalSource =
 
 type EvolutionAction = 'update' | 'deprecate' | 'valid';
 
-interface EvolutionGatewayLike {
+interface ProposalGatewayLike {
   submit(decision: {
     recipeId: string;
     action: EvolutionAction;
@@ -865,7 +865,7 @@ async function handleEvolutionManage(
   params: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const gateway = ctx.evolutionGateway as EvolutionGatewayLike | undefined;
+  const gateway = ctx.proposalGateway as ProposalGatewayLike | undefined;
   if (!gateway?.submit) {
     return fail('Evolution gateway not available');
   }

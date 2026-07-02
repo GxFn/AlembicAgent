@@ -43,7 +43,7 @@ export interface ToolGuardServiceContract {
 export interface ToolLifecycleServiceContract {
   getKnowledgeLifecycleService(): unknown | null;
   getProposalRepository(): unknown | null;
-  getEvolutionGateway(): unknown | null;
+  getProposalGateway(): unknown | null;
   getConsolidationAdvisor(): unknown | null;
 }
 
