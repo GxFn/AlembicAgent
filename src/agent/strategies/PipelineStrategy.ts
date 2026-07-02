@@ -543,6 +543,8 @@ export class PipelineStrategy extends Strategy {
     const gate = gateStage.gate || {};
     // C-3：record_repair 的 findings 底线与两宿主完成阈值同源(Core 单源)。
     const minFindings = gate.recordRepairMinFindings ?? DIMENSION_COMPLETION_FLOOR.minKeyFindings;
+    // 与 summary_rewrite 同型:微阶段不干扰外层 stage 隔离判定(快照恢复)。
+    const lastStageSnapshot = ctx.lastExecutedStageName;
     const repairStage: PipelineStage = {
       name: `${gateStage.name || 'quality_gate'}_record_repair`,
       capabilities: [],
@@ -569,7 +571,11 @@ export class PipelineStrategy extends Strategy {
         }),
     };
 
-    return this.#executeStage(runtime, message, repairStage, ctx, bus);
+    try {
+      return await this.#executeStage(runtime, message, repairStage, ctx, bus);
+    } finally {
+      ctx.lastExecutedStageName = lastStageSnapshot;
+    }
   }
 
   /**
@@ -586,6 +592,11 @@ export class PipelineStrategy extends Strategy {
     bus: AgentEventBus
   ) {
     const gate = gateStage.gate || {};
+    // 微阶段对「阶段隔离」透明:#executeStage 会把 ctx.lastExecutedStageName 写成微阶段名,
+    // 若之后 rewrite 失败转 analysis_retry,analyze 重跑会被误判 isNewStage 而 reset
+    // ContextWindow——旧 retry 路径的「♻️ preserving」保留机制被击穿(审计缺陷①)。
+    // 快照恢复使微阶段不干扰外层 stage 的隔离判定;record_repair 同型处理。
+    const lastStageSnapshot = ctx.lastExecutedStageName;
     const rewriteStage: PipelineStage = {
       name: `${gateStage.name || 'quality_gate'}_summary_rewrite`,
       capabilities: [],
@@ -608,7 +619,11 @@ export class PipelineStrategy extends Strategy {
         }),
     };
 
-    return this.#executeStage(runtime, message, rewriteStage, ctx, bus);
+    try {
+      return await this.#executeStage(runtime, message, rewriteStage, ctx, bus);
+    } finally {
+      ctx.lastExecutedStageName = lastStageSnapshot;
+    }
   }
 
   #stageHasNoteFindingCall(stageResult: StageResult) {
