@@ -17,6 +17,7 @@
  * @module PipelineStrategy
  */
 
+import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
@@ -540,7 +541,8 @@ export class PipelineStrategy extends Strategy {
     bus: AgentEventBus
   ) {
     const gate = gateStage.gate || {};
-    const minFindings = gate.recordRepairMinFindings ?? 3;
+    // C-3：record_repair 的 findings 底线与两宿主完成阈值同源(Core 单源)。
+    const minFindings = gate.recordRepairMinFindings ?? DIMENSION_COMPLETION_FLOOR.minKeyFindings;
     const repairStage: PipelineStage = {
       name: `${gateStage.name || 'quality_gate'}_record_repair`,
       capabilities: [],

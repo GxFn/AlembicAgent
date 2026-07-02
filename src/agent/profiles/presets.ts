@@ -17,6 +17,7 @@
  * @module presets
  */
 
+import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import { BudgetPolicy, QualityGatePolicy } from '../policies/index.js';
 // v3.0: 导入 Insight prompt/strategy templates
 import {
@@ -316,8 +317,12 @@ export const PRESETS = Object.freeze({
         }),
       (config?: PolicyFactoryConfig) =>
         new QualityGatePolicy({
-          minEvidenceLength: config?.minEvidenceLength ?? 500,
-          minFileRefs: config?.minFileRefs ?? 3,
+          // C-3(2026-07-02 统一重构)：默认阈值改用 Core DIMENSION_COMPLETION_FLOOR 单源
+          // (与宿主 dimension_complete evidence gate 同一组数字)。minToolCalls 是
+          // pipeline 专属维度(宿主无工具循环),保持本地。
+          minEvidenceLength:
+            config?.minEvidenceLength ?? DIMENSION_COMPLETION_FLOOR.minAnalysisChars,
+          minFileRefs: config?.minFileRefs ?? DIMENSION_COMPLETION_FLOOR.minFileRefs,
           minToolCalls: config?.minToolCalls ?? 3,
         }),
     ],

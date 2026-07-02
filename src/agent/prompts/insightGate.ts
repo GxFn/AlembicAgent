@@ -20,6 +20,7 @@ import path from 'node:path';
 import {
   DEPTH_DIMENSIONS,
   type DepthReviewResult,
+  DIMENSION_COMPLETION_FLOOR,
   RELATIONSHIP_CN_RE,
   reviewRecipeDepth,
 } from '@alembic/core/knowledge';
@@ -673,8 +674,8 @@ export function analysisQualityGate(report: GateableReport, options: GateOptions
   return analysisQualityGateV1(report, enriched);
 }
 
-/** summary_rewrite 分流的最低 findings 数：与 record_repair 的 minFindings 缺省一致。 */
-const SUMMARY_REWRITE_MIN_FINDINGS = 3;
+/** summary_rewrite 分流的最低 findings 数：C-3 起与两宿主完成阈值同源(Core 单源)。 */
+const SUMMARY_REWRITE_MIN_FINDINGS = DIMENSION_COMPLETION_FLOOR.minKeyFindings;
 
 function applyGateThresholds(qualityReport: QualityReport, options: GateOptions = {}): GateResult {
   const { totalScore } = qualityReport;
