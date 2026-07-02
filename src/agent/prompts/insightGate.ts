@@ -958,7 +958,8 @@ const GRAPH_GAP_REASON =
 export function applyGraphRetryGate(
   baseGate: GateResult,
   artifact: Record<string, unknown>,
-  needsCandidates: boolean
+  needsCandidates: boolean,
+  sharedState: Record<string, unknown> | null = null
 ): GateResult {
   if (!needsCandidates || !baseGate.pass) {
     return baseGate;
@@ -967,12 +968,22 @@ export function applyGraphRetryGate(
   if (Array.isArray(graphEvidence) && graphEvidence.length > 0) {
     return baseGate;
   }
+  // 单次尝试后放行：第 8 轮真机证明 DeepSeek 对明确 retry 指令仍不调 graph——反复 retry 只会
+  // 烧穿配额把维度整体卡成 error（比 GRAPH 拒绝更糟）。补挖一次未果就放行 produce，关系类
+  // 候选交由 submit 拒绝反馈（改述指导），非关系类候选照常通过。
+  const retried = Number(sharedState?._graphRetryCount) || 0;
+  if (retried >= 1) {
+    return baseGate;
+  }
   const analysisText = typeof artifact.analysisText === 'string' ? artifact.analysisText : '';
   const findingsText = Array.isArray(artifact.findings)
     ? (artifact.findings as Array<{ finding?: string }>).map((f) => f?.finding ?? '').join(' ')
     : '';
   if (!GRAPH_RELATIONSHIP_CN_RE.test(`${analysisText} ${findingsText}`)) {
     return baseGate;
+  }
+  if (sharedState) {
+    sharedState._graphRetryCount = retried + 1;
   }
   return { pass: false, action: 'analysis_retry', reason: GRAPH_GAP_REASON };
 }
@@ -997,7 +1008,12 @@ export function insightGateEvaluator(
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
   // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。
-  // F4g：depth-retry 之上叠 graph-retry——关系型分析无 graph 背书时回炉一次补真实查询。
+  const sharedState =
+    strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
+      ? (strategyContext.sharedState as Record<string, unknown>)
+      : null;
+  // F4g：depth-retry 之上叠 graph-retry——关系型分析无 graph 背书时回炉一次补真实查询
+  // （sharedState 计数保证只 retry 一次，未果放行，不烧 pipeline 配额）。
   const gate = applyGraphRetryGate(
     applyDepthRetryGate(
       analysisQualityGate(artifact, {
@@ -1007,12 +1023,9 @@ export function insightGateEvaluator(
       Boolean(needsCandidates)
     ),
     artifact as Record<string, unknown>,
-    Boolean(needsCandidates)
+    Boolean(needsCandidates),
+    sharedState
   );
-  const sharedState =
-    strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
-      ? (strategyContext.sharedState as Record<string, unknown>)
-      : null;
   // F4e：把 Analyst 真实 graph 查询的可复制 refs 经 sharedState 传给 submit handler——
   // GRAPH_REF_INVALID 拒绝时 handler 自动注入（替模型完成「复制」动作；graphEvidence
   // 为空则无背书可注入，保持拒绝，绝不编造）。与 pcv 数据走 sharedState 同一先例模式。
