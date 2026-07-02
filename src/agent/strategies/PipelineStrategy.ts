@@ -152,10 +152,20 @@ function withProducerCoverageBudget(
   // H3(2026-07-02 数量专项)：maxSubmits 随 findings 放大——静态 10 会把丰富维度硬顶
   // (真机 findings=24 只能提 10)。放大到 findings+4(拒绝重试余量)，原值作下限。
   const baseMaxSubmits = Number((budget as { maxSubmits?: unknown } | undefined)?.maxSubmits) || 10;
+  const scaledMaxSubmits = Math.max(baseMaxSubmits, targetSubmits + 4);
+  // P-5：produce 时间预算随目标提交数放大——真机 DeepSeek 每轮提交(长 reasoning+payload)
+  // 60-90s，静态 900s 只够约 10 轮；目标更高时时间不放大等于数量白给。90s/轮估算，
+  // 下限保持原值、上限 1800s 防失控。
+  const baseTimeoutMs = Number((budget as { timeoutMs?: unknown } | undefined)?.timeoutMs) || 0;
+  const scaledTimeoutMs =
+    baseTimeoutMs > 0
+      ? Math.min(1_800_000, Math.max(baseTimeoutMs, scaledMaxSubmits * 90_000))
+      : baseTimeoutMs;
   return {
     ...(budget || {}),
     targetSubmits,
-    maxSubmits: Math.max(baseMaxSubmits, targetSubmits + 4),
+    maxSubmits: scaledMaxSubmits,
+    ...(scaledTimeoutMs > 0 ? { timeoutMs: scaledTimeoutMs } : {}),
   };
 }
 
