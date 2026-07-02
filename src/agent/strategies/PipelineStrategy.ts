@@ -149,7 +149,14 @@ function withProducerCoverageBudget(
   if (targetSubmits <= 0) {
     return budget;
   }
-  return { ...(budget || {}), targetSubmits };
+  // H3(2026-07-02 数量专项)：maxSubmits 随 findings 放大——静态 10 会把丰富维度硬顶
+  // (真机 findings=24 只能提 10)。放大到 findings+4(拒绝重试余量)，原值作下限。
+  const baseMaxSubmits = Number((budget as { maxSubmits?: unknown } | undefined)?.maxSubmits) || 10;
+  return {
+    ...(budget || {}),
+    targetSubmits,
+    maxSubmits: Math.max(baseMaxSubmits, targetSubmits + 4),
+  };
 }
 
 /** Lightweight ContextWindow subset consumed by pipeline stages */

@@ -100,12 +100,13 @@ function readRefRangeCode(
  */
 function normalizeBareSourceRefs(
   item: Record<string, unknown>,
-  sharedState: Record<string, unknown> | null
+  sharedState: Record<string, unknown> | null,
+  projectRoot?: string
 ): Record<string, unknown> {
   const ranges = sharedState?._analystGroundedRanges as
     | Record<string, Array<{ start: number; end: number }>>
     | undefined;
-  if (!ranges || !Array.isArray(item.sourceRefs)) {
+  if (!Array.isArray(item.sourceRefs)) {
     return item;
   }
   let changed = false;
@@ -114,12 +115,23 @@ function normalizeBareSourceRefs(
       return ref;
     }
     const filePath = path.posix.normalize(ref.replaceAll('\\', '/'));
-    const fileRanges = ranges[filePath];
-    if (!fileRanges?.[0]) {
-      return ref;
+    const fileRanges = ranges?.[filePath];
+    if (fileRanges?.[0]) {
+      changed = true;
+      return `${filePath}:${fileRanges[0].start}-${fileRanges[0].end}`;
     }
-    changed = true;
-    return `${filePath}:${fileRanges[0].start}-${fileRanges[0].end}`;
+    // H2(2026-07-02 数量专项)：接地范围没有该文件时 fallback 到文件头 1-12 行——约定类知识
+    // (如「相对导入强制 .js 扩展名」)的证据天然散布多文件、常在 import 区(=文件头)，强制
+    // 行号对它形成结构性摩擦(真机同一候选因 LINE_MISSING 反复被拒 6 次)。只补真实存在且
+    // 根内的文件，读到空内容不补。
+    if (projectRoot) {
+      const headRange = readRefRangeCode([`${filePath}:1-12`], projectRoot);
+      if (headRange) {
+        changed = true;
+        return headRange.refText;
+      }
+    }
+    return ref;
   };
   const sourceRefs = (item.sourceRefs as unknown[]).map(normalizeRef);
   const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
@@ -352,9 +364,32 @@ async function handleSubmit(
     // F4f 预处理：裸路径 sourceRefs（无行号）用 Analyst 真实接地范围规范化——裸路径候选
     // 此前没有任何自动化通路（F4b/F4d 都需要可解析行号）。范围来自 evidenceMap 投影
     // （sharedState._analystGroundedRanges），即 Analyst 真实读过/锚点补齐过的行，非任意指派。
+    // H1(2026-07-02 数量专项)：同题硬止损——真机同一候选被拒后模型无视 STOP 软指令连提 6 次,
+    // 烧掉 60% 提交名额。同 title 第 3 次尝试起直接 terminal 拒绝(不跑门禁不给修复提示)。
+    const sharedStateForSubmit = (ctx.runtime?.sharedState ?? null) as Record<
+      string,
+      unknown
+    > | null;
+    const titleKey = String(item.title ?? '').trim();
+    if (sharedStateForSubmit && titleKey) {
+      const attempts = (sharedStateForSubmit._submitTitleAttempts ?? {}) as Record<string, number>;
+      const tried = attempts[titleKey] ?? 0;
+      if (tried >= 3) {
+        Logger.getInstance().warn(
+          `[knowledge.submit] hard stop-loss: "${titleKey}" already attempted ${tried} times (dim=${String(effectiveDimensionId ?? '')})`
+        );
+        return fail(
+          `🛑 候选 "${titleKey}" 已尝试 ${tried} 次未通过——本会话禁止再提交该标题。立即换一个【不同的】发现提交，或输出最终总结并把它列为 blocker。`
+        );
+      }
+      attempts[titleKey] = tried + 1;
+      sharedStateForSubmit._submitTitleAttempts = attempts;
+    }
+
     let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
       item,
-      (ctx.runtime?.sharedState ?? null) as Record<string, unknown> | null
+      sharedStateForSubmit,
+      ctx.projectRoot
     );
     let gateViolations = runInProcessRecipeAuthoringGate(effectiveItem, {
       projectRoot: ctx.projectRoot,
