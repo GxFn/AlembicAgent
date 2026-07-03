@@ -9,7 +9,8 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { applyDepthRetryGate, buildRetryPrompt } from '../src/agent/prompts/insightGate.js';
+import { applyDepthRetryGate } from '../src/agent/evaluation/qualityGates.js';
+import { buildRetryPrompt } from '../src/agent/prompts/insightGate.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 
 const PASS = { pass: true } as const;

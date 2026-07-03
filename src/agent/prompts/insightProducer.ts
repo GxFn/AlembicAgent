@@ -7,7 +7,10 @@
  * - 预算常量
  * - Prompt 构建器 (v1 + v2)
  * - 代码上下文注入 (evidenceMap → prompt section)
- * - 拒绝率门控 (producerRejectionGateEvaluator)
+ *
+ * W6-d(A1)拆分:拒绝率门控 producerRejectionGateEvaluator(拆前 :655)及其
+ * 私有类型 ReactLoopResult/ToolCallRecord/GateStrategyContext(拆前 :59-75)
+ * 已迁往 ../evaluation/gateEvaluators.ts。
  *
  * 被 PipelineStrategy 的 bootstrap preset 直接引用。
  * 不再包含任何 Agent 类 — Agent 由 AgentRuntime + PipelineStrategy 驱动。
@@ -54,24 +57,6 @@ interface DimConfig {
 /** 项目基本信息 */
 interface ProjectInfo {
   name: string;
-}
-
-/** reactLoop 返回值 (门控评估用) */
-interface ReactLoopResult {
-  toolCalls?: ToolCallRecord[];
-}
-
-/** 工具调用记录 */
-interface ToolCallRecord {
-  tool?: string;
-  name?: string;
-  result?: string | { status?: string; reason?: string };
-}
-
-/** 门控策略上下文 */
-interface GateStrategyContext {
-  submitToolNames?: string[];
-  [key: string]: unknown;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -638,50 +623,4 @@ function normalizePromptLineForCompaction(line: string): string | null {
     .trim()
     .toLowerCase();
   return normalized.length >= 48 ? normalized : null;
-}
-
-// ──────────────────────────────────────────────────────────────────
-// PipelineStrategy gate.evaluator — 拒绝率门控
-// ──────────────────────────────────────────────────────────────────
-
-/**
- * Producer 拒绝率门控 — 面向 PipelineStrategy gate.evaluator
- *
- * 当 produce 阶段的提交拒绝率过高时触发 retry。
- *
- * @param source produce 阶段的 reactLoop 返回值
- * @returns }
- */
-export function producerRejectionGateEvaluator(
-  source: ReactLoopResult | null | undefined,
-  _phaseResults: unknown,
-  _strategyContext: GateStrategyContext = {}
-) {
-  if (!source?.toolCalls) {
-    return { action: 'pass', reason: '' };
-  }
-
-  // 可配置的提交工具名 — V2 统一为 knowledge，scan 用 knowledge
-  const submitToolNames = _strategyContext.submitToolNames || ['knowledge'];
-  const submitCalls = (source.toolCalls || []).filter((tc: ToolCallRecord) =>
-    submitToolNames.includes(tc.tool || tc.name || '')
-  );
-  const rejected = submitCalls.filter((tc: ToolCallRecord) => {
-    const res = tc.result;
-    if (!res) {
-      return false;
-    }
-    if (typeof res === 'string') {
-      return res.includes('rejected') || res.includes('error');
-    }
-    return (
-      res.status === 'rejected' || res.status === 'error' || res.reason === 'validation_failed'
-    );
-  }).length;
-  const success = submitCalls.length - rejected;
-
-  if (rejected > success && rejected >= 2) {
-    return { action: 'retry', reason: `${rejected} rejections vs ${success} successes` };
-  }
-  return { action: 'pass', reason: '' };
 }

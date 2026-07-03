@@ -20,11 +20,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
   EvidenceCollector,
   type SnippetRangeReader,
 } from '../src/agent/evidence/EvidenceCollector.js';
-import { buildAnalysisArtifact } from '../src/agent/prompts/insightGate.js';
 import {
   buildCodeContextSection,
   buildProducerPromptV2,

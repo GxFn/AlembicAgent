@@ -3,12 +3,13 @@ import {
   getGenerateStageTerminalTools,
   resolveGenerateTerminalToolset,
 } from '@alembic/core/host-agent-workflows';
-import { PRESETS } from '../profiles/presets.js';
+// W6-d(A1):两个 stage builder 已从 prompts/scanPrompts 迁往 evaluation/stageBuilders
 import {
   buildRelationsPipelineStages,
   buildScanPipelineStages,
-  SCAN_TASK_CONFIGS,
-} from '../prompts/scanPrompts.js';
+} from '../evaluation/stageBuilders.js';
+import { PRESETS } from '../profiles/presets.js';
+import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
 
 export type AgentStageFactoryInput = {
   params: Record<string, unknown>;

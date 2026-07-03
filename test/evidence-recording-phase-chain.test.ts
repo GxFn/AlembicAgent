@@ -1,7 +1,7 @@
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
-import { analysisQualityGate, insightGateEvaluator } from '../src/agent/prompts/insightGate.js';
+import { analysisQualityGate, insightGateEvaluator } from '../src/agent/evaluation/index.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime as AgentRuntimeImpl } from '../src/agent/runtime/AgentRuntime.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';

@@ -18,6 +18,12 @@
  */
 
 import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
+// W6-d(A1):三个 gate evaluator 已从 prompts/ 迁往 evaluation/gateEvaluators
+import {
+  evolutionGateEvaluator,
+  insightGateEvaluator,
+  producerRejectionGateEvaluator,
+} from '../evaluation/gateEvaluators.js';
 import { BudgetPolicy, QualityGatePolicy } from '../policies/index.js';
 // v3.0: 导入 Insight prompt/strategy templates
 import {
@@ -31,16 +37,11 @@ import {
   EVOLVER_SYSTEM_PROMPT,
   type EvolutionContext,
 } from '../prompts/insightEvolver.js';
-import {
-  buildRetryPrompt,
-  evolutionGateEvaluator,
-  insightGateEvaluator,
-} from '../prompts/insightGate.js';
+import { buildRetryPrompt } from '../prompts/insightGate.js';
 import {
   buildProducerPromptV2,
   PRODUCER_BUDGET,
   PRODUCER_SYSTEM_PROMPT,
-  producerRejectionGateEvaluator,
 } from '../prompts/insightProducer.js';
 import { FanOutStrategy, SingleStrategy, type Strategy } from '../strategies/index.js';
 import { PipelineStrategy } from '../strategies/PipelineStrategy.js';

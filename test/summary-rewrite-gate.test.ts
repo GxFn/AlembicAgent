@@ -8,11 +8,8 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import {
-  analysisQualityGate,
-  applyDepthRetryGate,
-  buildSummaryRewritePrompt,
-} from '../src/agent/prompts/insightGate.js';
+import { analysisQualityGate, applyDepthRetryGate } from '../src/agent/evaluation/qualityGates.js';
+import { buildSummaryRewritePrompt } from '../src/agent/prompts/insightGate.js';
 
 const PASS = { pass: true } as const;
 
