@@ -125,6 +125,141 @@ export function expandEvidenceRefsForSubmit(
   };
 }
 
+export interface SubmissionSanitizeResult {
+  item: Record<string, unknown>;
+  corrected: string[];
+  dropped: string[];
+  scopedNarrow: boolean;
+}
+
+function ledgerDistinctFiles(ledger: EvidenceLedgerLike): string[] {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of ledger.listRecent(ledger.stats().entries)) {
+    if (entry.file && !seen.has(entry.file)) {
+      seen.add(entry.file);
+      files.push(entry.file);
+    }
+  }
+  return files;
+}
+
+function basenameOf(filePath: string): string {
+  const parts = filePath.split('/');
+  return parts[parts.length - 1] ?? filePath;
+}
+
+/**
+ * E7（接受率治理，2026-07-04 用户目标=100%）：提交前对手写引用做确定性净化 + 证据驱动
+ * scope 收窄。E6 真机显示残余拒因全是「模型自由度」失误，非证据缺失：
+ * - 路径自动矫正：手写 source 的文件在 projectRoot 解析失败时，用台账 distinct 文件做
+ *   basename 唯一匹配改写（多仓前缀陷阱的机械解——台账路径就是采集时的真实形态）；
+ *   无法唯一匹配的坏引用在「仍有其它可解析引用」时丢弃（否则保留，交门禁给权威拒绝）。
+ * - scope 收窄：rule/pattern 且 distinct 引用文件 <3 且未声明 narrow 时自动 scope='narrow'
+ *   ——作用域由证据广度推导，比模型断言的全项目范围更诚实；门禁语义不动
+ *   （narrow 本就是 EVIDENCE_FLOOR 的合法通道，gateRules requiresMultiFileEvidence 读 item.scope）。
+ */
+export function sanitizeSubmissionEvidence(
+  item: Record<string, unknown>,
+  options: { ledger: EvidenceLedgerLike | null | undefined; projectRoot: string }
+): SubmissionSanitizeResult {
+  const ledger = options.ledger;
+  if (!ledger) {
+    return { item, corrected: [], dropped: [], scopedNarrow: false };
+  }
+  const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
+  const files = ledgerDistinctFiles(ledger);
+  const byBasename = new Map<string, string[]>();
+  for (const file of files) {
+    const key = basenameOf(file).toLowerCase();
+    byBasename.set(key, [...(byBasename.get(key) ?? []), file]);
+  }
+
+  const corrected: string[] = [];
+  const dropped: string[] = [];
+  const sanitizeList = (raw: unknown): string[] => {
+    const list = Array.isArray(raw)
+      ? raw.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      : [];
+    const kept: string[] = [];
+    for (const source of list) {
+      const match = /^(.*?)(:\d+(?:-\d+)?)?$/.exec(source.trim());
+      const filePart = match?.[1] ?? source;
+      const rangePart = match?.[2] ?? '';
+      if (!filePart || existsSync(join(options.projectRoot, filePart))) {
+        kept.push(source);
+        continue;
+      }
+      const candidates = byBasename.get(basenameOf(filePart).toLowerCase()) ?? [];
+      if (candidates.length === 1) {
+        // 台账唯一背书：同名不同前缀→改写为台账真实形态；完全同路径→保留
+        // （磁盘上暂不可见交由门禁/新鲜度裁决，台账证明它在采集时真实存在）
+        kept.push(`${candidates[0]}${rangePart}`);
+        if (candidates[0] !== filePart) {
+          corrected.push(`${source}→${candidates[0]}${rangePart}`);
+        }
+      } else {
+        dropped.push(source);
+      }
+    }
+    // 全部被丢时保留原列表——不能让净化把候选清成零证据（门禁的拒绝信息更权威）
+    return kept.length > 0 ? kept : list;
+  };
+
+  const sources = sanitizeList(reasoning.sources);
+  const sourceRefs = sanitizeList(item.sourceRefs);
+
+  // 证据驱动 scope 收窄（仅在未显式声明时）
+  const kind = typeof item.kind === 'string' ? item.kind.toLowerCase() : '';
+  const distinct = new Set(sources.map((s) => /^(.*?)(?::\d+(?:-\d+)?)?$/.exec(s)?.[1] ?? s));
+  const scopeValue = typeof item.scope === 'string' ? item.scope : '';
+  const needsNarrow =
+    (kind === 'rule' || kind === 'pattern') &&
+    distinct.size > 0 &&
+    distinct.size < 3 &&
+    !/\b(single-file|file-local|local-only|narrow)\b/i.test(scopeValue);
+
+  return {
+    corrected,
+    dropped,
+    scopedNarrow: needsNarrow,
+    item: {
+      ...item,
+      ...(needsNarrow ? { scope: 'narrow' } : {}),
+      sourceRefs,
+      reasoning: { ...reasoning, sources },
+    },
+  };
+}
+
+/**
+ * E7 逐违规修复模板：风格/措辞类拒绝附「照抄即过」的具体形态——E6 二跑显示纯文字指引
+ * 不足以驱动 DeepSeek 修复（waiver 采用 0）；模板把修复动作压缩成填空。
+ */
+export function buildViolationRepairTemplates(
+  violations: Array<{ code: string }>,
+  allowlist: { positive: string[]; negative: string[] }
+): string {
+  const codes = new Set(violations.map((v) => v.code));
+  const parts: string[] = [];
+  if (codes.has('DO_CLAUSE_NON_IMPERATIVE')) {
+    parts.push(
+      `修复模板[doClause]: 保留原意，改为以下列动词之一开头：${allowlist.positive.slice(0, 12).join('/')}（否定式：${allowlist.negative.slice(0, 6).join('/')}）`
+    );
+  }
+  if (codes.has('CONTENT_CONTRAST_MISSING')) {
+    parts.push(
+      '修复模板[content.markdown]: 在正文追加对比块——"✅ 正确：<一行真实做法> (来源: 引用文件:行号)\\n❌ 错误：<一行反例做法>\\n违反后果：<一句具体后果>"'
+    );
+  }
+  if (codes.has('GRAPH_REF_INVALID')) {
+    parts.push(
+      '修复模板[措辞]: 把"调用链/callers/callees/invokes"类断言改写为静态描述（导入/依赖/组合），或删除该句——无 graph 查询证据时不要做调用链断言'
+    );
+  }
+  return parts.length > 0 ? ` 🔧 ${parts.join(' ｜ ')}` : '';
+}
+
 /**
  * INSUFFICIENT_EVIDENCE 拒绝反馈增强（E5）：告诉模型台账里真实可引用的 distinct 文件
  * （此前只说 "add 3 distinct files" 不说去哪找——修不动的拒绝即无效拒绝）。

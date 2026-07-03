@@ -12,6 +12,7 @@ import path from 'node:path';
 import { dimensionTags } from '@alembic/core/dimensions';
 import {
   applyStyleWaiver,
+  getImperativeVerbAllowlist,
   getSystemInjectedFields,
   isSoftAuthoringViolation,
   type RecipeAuthoringViolation,
@@ -31,7 +32,9 @@ import {
 } from './recipeAuthoringGate.js';
 import {
   buildEvidenceCandidatesHint,
+  buildViolationRepairTemplates,
   expandEvidenceRefsForSubmit,
+  sanitizeSubmissionEvidence,
 } from './submitEvidenceExpansion.js';
 
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
@@ -420,8 +423,20 @@ async function handleSubmit(
       );
     }
 
+    // E7（接受率治理）：手写路径自动矫正（basename 唯一匹配台账真实形态，多仓前缀陷阱机械解）
+    // + 证据驱动 scope 收窄（rule/pattern 证据 <3 文件自动 narrow——门禁本就接受该通道）。
+    const sanitized = sanitizeSubmissionEvidence(expansion.item, {
+      ledger: ctx.runtime?.evidenceLedger,
+      projectRoot: ctx.projectRoot,
+    });
+    if (sanitized.corrected.length > 0 || sanitized.dropped.length > 0 || sanitized.scopedNarrow) {
+      Logger.getInstance().info(
+        `[knowledge.submit] evidence sanitized for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): corrected=[${sanitized.corrected.join(', ')}] dropped=[${sanitized.dropped.join(', ')}] scopedNarrow=${sanitized.scopedNarrow}`
+      );
+    }
+
     let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
-      expansion.item,
+      sanitized.item,
       sharedStateForSubmit,
       ctx.projectRoot
     );
@@ -554,8 +569,13 @@ async function handleSubmit(
           );
         }
       }
+      // E7：风格/措辞类违规附「照抄即过」修复模板（动词白名单来自 Core 单源）
+      const repairTemplates = buildViolationRepairTemplates(
+        gateViolations,
+        getImperativeVerbAllowlist()
+      );
       return fail(
-        `Validation failed: ${detail}${snippetRepair}${evidenceHint}${appealHint}${stopDirective}`
+        `Validation failed: ${detail}${snippetRepair}${evidenceHint}${repairTemplates}${appealHint}${stopDirective}`
       );
     }
     // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
