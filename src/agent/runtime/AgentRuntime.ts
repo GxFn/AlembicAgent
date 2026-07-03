@@ -35,6 +35,7 @@ import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { limitToolResult } from '../context/ContextWindow.js';
+import { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
@@ -157,6 +158,8 @@ export class AgentRuntime {
   logger: Pick<Console, 'info' | 'warn'>;
   #projectRoot;
   #dataRoot;
+  /** 证据台账目录键（Wave A E2）：宿主 jobId 或按实例生成的稳定回退；同实例多次 reactLoop 共享 */
+  #evidenceJobId: string;
   /** 文件缓存 (bootstrap 场景注入) */
   #fileCache: FileCacheEntry[] | null = null;
   /** 额外工具白名单 (调用方按需注入，不经 Capability) */
@@ -209,6 +212,7 @@ export class AgentRuntime {
     this.bus = AgentEventBus.getInstance();
     this.#projectRoot = config.projectRoot || process.cwd();
     this.#dataRoot = config.dataRoot || this.#projectRoot;
+    this.#evidenceJobId = config.jobId || `run-${Date.now()}`;
     this.#additionalTools = config.additionalTools || [];
     this.#modelRef =
       config.modelRef ||
@@ -577,12 +581,22 @@ export class AgentRuntime {
       { source: this.id }
     );
 
+    // 证据台账（Wave A E2）：dataRoot+维度身份齐备才创建；缺任一=null（非维度场景零影响面）
+    const evidenceLedger = buildEvidenceLedgerForLoop({
+      dataRoot: this.#dataRoot,
+      jobId: this.#evidenceJobId,
+      sessionId: this.id,
+      sharedState: (sharedState as Record<string, unknown> | null | undefined) ?? null,
+      logger: this.logger,
+    });
+
     const ctx = new LoopContext({
       messages,
       tracker: tracker || null,
       trace: trace || null,
       memoryCoordinator: memoryCoordinator || null,
       sharedState: sharedState || null,
+      evidenceLedger,
       source: source || 'user',
       budget,
       capabilities: caps,
@@ -2684,6 +2698,49 @@ function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): un
         : sanitizeDeveloperData(child, seen);
   }
   return output;
+}
+
+/**
+ * 证据台账构造（Wave A E2）：dataRoot + 维度身份齐备才创建；缺任一返回 null——
+ * 非维度场景（对话/翻译等）零行为。维度 id 优先取 sharedState._dimensionMeta.id，
+ * 回退 _dimensionScopeId 冒号前段（形如 'ts-js-module:analyst'）。
+ * 同一 runtime 实例内 analyst→producer 两次 reactLoop 命中同一 JSONL 文件，
+ * producer 经 hydrate 复用 analyst 台账（E5 机械展开的粮草由此而来）。
+ */
+function buildEvidenceLedgerForLoop(options: {
+  dataRoot: string;
+  jobId: string;
+  sessionId: string;
+  sharedState: Record<string, unknown> | null;
+  logger: Pick<Console, 'warn'>;
+}): EvidenceLedgerStore | null {
+  const shared = options.sharedState;
+  const metaId = (shared?._dimensionMeta as { id?: unknown } | undefined)?.id;
+  const scopeId = shared?._dimensionScopeId;
+  const dimensionId =
+    typeof metaId === 'string' && metaId
+      ? metaId
+      : typeof scopeId === 'string' && scopeId
+        ? scopeId.split(':')[0]
+        : null;
+  if (!dimensionId) {
+    return null;
+  }
+  try {
+    return new EvidenceLedgerStore({
+      dataRoot: options.dataRoot,
+      jobId: options.jobId,
+      sessionId: options.sessionId,
+      dimensionId,
+      redactor: redactDeveloperText,
+    });
+  } catch (err: unknown) {
+    // 台账初始化失败不阻断主循环——降级为无台账（等价改造前行为），降级必须可观测
+    options.logger.warn('[EvidenceLedger] init failed; continuing without ledger', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 function isSecretLikeKey(key: string): boolean {

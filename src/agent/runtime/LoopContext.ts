@@ -15,6 +15,7 @@
 import type { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
+import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
 import type { ActiveContext } from '../memory/ActiveContext.js';
 import type { MemoryCoordinator } from '../memory/MemoryCoordinator.js';
 import type { BudgetController } from './BudgetController.js';
@@ -68,6 +69,8 @@ interface LoopContextConfig {
   trace?: ActiveContext | Record<string, unknown> | null;
   memoryCoordinator?: MemoryCoordinator | Record<string, unknown> | null;
   sharedState?: SharedState | Record<string, unknown> | null;
+  /** 证据台账（Wave A E2）；null=非维度场景，采集/引用校验全部零行为 */
+  evidenceLedger?: EvidenceLedgerStore | null;
   source?: string;
   budget: BudgetConfig;
   capabilities: Capability[];
@@ -189,11 +192,15 @@ export class LoopContext {
   /** PCVM N9 node-local evidence — 供宿主 trace/artifact/metrics 承接 */
   pcvNodeEvidence: PcvNodeEvidenceSummary;
 
+  /** 证据台账（Wave A E2）——采集中间件写、note_finding 校验与 evidence 工具读；null=零行为 */
+  evidenceLedger: EvidenceLedgerStore | null;
+
   constructor(config: LoopContextConfig) {
     this.messages = config.messages;
     this.tracker = (config.tracker || null) as ExplorationTracker | null;
     this.trace = (config.trace || null) as ActiveContext | null;
     this.memoryCoordinator = (config.memoryCoordinator || null) as MemoryCoordinator | null;
+    this.evidenceLedger = config.evidenceLedger ?? null;
     this.sharedState = (config.sharedState || null) as SharedState | null;
     this.source = config.source || 'user';
     this.budget = config.budget;

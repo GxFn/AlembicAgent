@@ -24,6 +24,10 @@ import {
   type ToolResultEnvelope,
   type ToolResultStatus,
 } from '#tools/kernel/index.js';
+import {
+  appendEvidenceAnnotation,
+  captureEvidenceFromEnvelope,
+} from '../evidence/EvidenceCapture.js';
 import { SafetyPolicy } from '../policies/index.js';
 import type { AgentRuntime } from './AgentRuntime.js';
 import type { LoopContext } from './LoopContext.js';
@@ -857,6 +861,37 @@ export const deterministicDuplicateGuard = {
 };
 
 /**
+ * EvidenceCapture — 证据台账采集（Wave A E2）
+ *
+ * after（必须排在 observationRecord/traceRecord 之前）：证据类工具成功返回时自动落台账，
+ * 并把 `[evidence] E-x=file:range` 标注追加进 envelope.text——模型看到的文本、记忆观察、
+ * 推理链留痕三者一致，模型从第一眼即以条目 ID 认知证据。
+ * loopCtx.evidenceLedger 缺席（非维度场景）或采集失败时零行为——采集是旁路，绝不阻断工具链。
+ */
+export const evidenceCapture = {
+  name: 'evidenceCapture',
+  after(call: ToolCall, _result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
+    const ledger = ctx.loopCtx.evidenceLedger;
+    const envelope = meta.envelope;
+    if (!ledger || !envelope || !envelope.ok) {
+      return;
+    }
+    try {
+      const entries = captureEvidenceFromEnvelope(ledger, call, envelope);
+      if (entries.length > 0) {
+        envelope.text = appendEvidenceAnnotation(envelope.text, entries);
+      }
+    } catch (err: unknown) {
+      // 采集异常降级为不落账（等价改造前行为），但降级必须可观测
+      ctx.loopCtx.diagnostics?.warn({
+        code: 'EVIDENCE_CAPTURE_FAILED',
+        message: `${call.name}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  },
+};
+
+/**
  * ObservationRecord — MemoryCoordinator 观察记录
  *
  * after: 记录工具执行观察
@@ -1138,6 +1173,7 @@ export function createToolPipeline() {
     .use(analystVerifyOnlyGate)
     .use(producerSubmitOnlyGate)
     .use(deterministicDuplicateGuard)
+    .use(evidenceCapture)
     .use(observationRecord)
     .use(trackerSignal)
     .use(traceRecord)
