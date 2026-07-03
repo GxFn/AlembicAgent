@@ -156,6 +156,6 @@ function readStringArray(value: unknown) {
   );
 }
 
-export type ModuleMiningModule = ScopedMiningModule;
-export type RunModuleMiningInput = RunScopedModuleMiningInput;
+// W6-b:runs/module shim 与 module.profile shim 已删;runModuleMining 是主体 wire 符号
+// (ModuleMiningWorkflow 动态 import+vi.mock 钉名)保留;两 type 别名零消费已清。
 export const runModuleMining = runScopedModuleMining;

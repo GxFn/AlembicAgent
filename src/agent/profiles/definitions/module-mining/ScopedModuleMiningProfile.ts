@@ -50,4 +50,3 @@ export const SCOPED_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
   },
 ];
 
-export const MODULE_MINING_PROFILES = SCOPED_MODULE_MINING_PROFILES;

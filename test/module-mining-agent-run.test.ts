@@ -1,9 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
-import { MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module.profile.js';
 import { SCOPED_MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module-mining/ScopedModuleMiningProfile.js';
 import { runModuleMining as runModuleMiningFromIndex } from '../src/agent/runs/index.js';
-import { runModuleMining as runModuleMiningCompat } from '../src/agent/runs/module/ModuleMiningAgentRun.js';
 import {
   runModuleMining,
   runScopedModuleMining,
@@ -25,11 +23,10 @@ type RuntimeExecution = {
 };
 
 describe('module mining profiles', () => {
-  it('keeps R1 profile and run exports wired to the ProjectIndex module-mining namespace', () => {
-    expect(runModuleMiningCompat).toBe(runScopedModuleMining);
+  it('keeps the module-mining run export wired through runs/index (W6-b: compat shims removed)', () => {
     expect(runModuleMiningFromIndex).toBe(runScopedModuleMining);
     expect(runModuleMining).toBe(runScopedModuleMining);
-    expect(MODULE_MINING_PROFILES).toBe(SCOPED_MODULE_MINING_PROFILES);
+    expect(SCOPED_MODULE_MINING_PROFILES.length).toBeGreaterThan(0);
   });
 
   it('registers fanout session and child profiles with module partitioning', () => {
