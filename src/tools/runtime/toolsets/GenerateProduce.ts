@@ -33,8 +33,10 @@ export class GenerateProduce extends RuntimeCapability {
 4. 设计原理说明 (content.rationale)
 5. 正确的 kind (rule / pattern / fact)
 6. 完整的 Cursor 交付字段 (trigger, whenClause, doClause)
-7. reasoning.evidenceRefs 引用 Analyst 发现携带的台账条目 id（如 ["E-12"]）——sources 与
-   coreCode 将由台账机械展开并做新鲜度校验；确无条目 id 可引时才手填 reasoning.sources 完整相对路径
+7. reasoning.evidenceRefs 必填优先：直接照抄对应 finding 证据串里的 E-x id
+   （证据串形如 "E-3=lib/a.ts:5-7" → evidenceRefs: ["E-3"]）——sources 与 coreCode 由台账
+   机械展开并做新鲜度校验。多仓工作区手写路径极易漏仓库前缀被拒；只有确无条目 id 可引时
+   才手填 reasoning.sources（必须含仓库前缀的完整相对路径）
 
 工作流:
 1. memory.recall 获取分析阶段的发现
@@ -46,6 +48,8 @@ export class GenerateProduce extends RuntimeCapability {
 - 不使用终端工具
 - 不做新的代码探索或补读；缺少证据时记录为阻塞，不要在 Producer 阶段扫描源码
 - evidence.get/search 是查已采证据（不算探索）：被拒时先取台账 verbatim 原文修正引用，不要凭记忆改写
+- 拒绝信息带 📎 提示时，立即改用其中列出的台账文件/条目 id 重新提交，不要再手写路径
+- doClause 必须以祈使动词开头（使用/统一/禁止/避免…）；确要坚持项目惯用语时，原样重提交并附 waiverJustification（≥20 字理由）即可放行进人工审核
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 - 每个独立模式/发现单独提交
 - 提交前自检 title / description / content.markdown / content.rationale / reasoning.sources 非空

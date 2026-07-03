@@ -151,5 +151,5 @@ export function buildEvidenceCandidatesHint(ledger: EvidenceLedgerLike | null | 
   if (files.length === 0) {
     return '';
   }
-  return ` 📎 台账内可引用的 distinct 文件(共 ${stats.distinctFiles} 个): ${files.join(', ')} —— 用 evidence.search 查条目 id 并以 reasoning.evidenceRefs 引用。`;
+  return ` 📎 台账内可引用的 distinct 文件(共 ${stats.distinctFiles} 个): ${files.join(', ')} —— 用 evidence.search 查条目 id 并以 reasoning.evidenceRefs 引用（多仓工作区路径必须含仓库前缀，台账条目已是正确形态，引用 id 最稳，不要凭记忆手写路径）。`;
 }

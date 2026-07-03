@@ -512,9 +512,12 @@ async function handleSubmit(
       )
         ? buildSnippetRepairHint(effectiveItem.sourceRefs, ctx.projectRoot)
         : '';
-      // E5 反馈增强：INSUFFICIENT_EVIDENCE 附台账内真实可引用的 distinct 文件——
-      // 此前只说 "add 3 distinct files" 不说去哪找，修不动的拒绝即无效拒绝。
-      const evidenceHint = gateViolations.some((v) => v.code === 'INSUFFICIENT_EVIDENCE')
+      // E5/E6-F1 反馈增强：INSUFFICIENT_EVIDENCE 与 SOURCE_REF_NOT_FOUND 都附台账内真实
+      // 可引用的 distinct 文件——E6 真机显示 NOT_FOUND 全部来自 producer 手写路径
+      // （多仓前缀陷阱），台账条目本身就是正确形态，引导改用 evidenceRefs。
+      const evidenceHint = gateViolations.some(
+        (v) => v.code === 'INSUFFICIENT_EVIDENCE' || v.code === 'SOURCE_REF_NOT_FOUND'
+      )
         ? buildEvidenceCandidatesHint(ctx.runtime?.evidenceLedger)
         : '';
       // 申辩指引：全部违规都是软规则时告知申辩通道(硬违规在场时先修事实错误，不提申辩)。
