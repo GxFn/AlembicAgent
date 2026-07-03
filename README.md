@@ -107,16 +107,15 @@ become partial results instead of aborting the batch.
 | --------- | -------------- |
 | `src/agent/service/` | `AgentService` entrypoint, `AgentRuntimeBuilder` DI assembly, run contracts, system-run context factory |
 | `src/agent/runtime/` | `AgentRuntime` ReAct kernel, `LoopContext`, `ExitController`, `BudgetController`, `ToolExecutionPipeline`, LLM input assembly/measurement, hooks/events/diagnostics, frozen interface contracts, PCV node evidence (observe-only) |
-| `src/agent/profiles/` | Presets, serializable profile definitions, `AgentProfileCompiler`, registries |
+| `src/agent/profiles/` | Serializable profile definitions, `AgentProfileCompiler`, registries; `presets/` holds the runtime base blocks (chat/insight/evolution — Capability+Strategy+Policy compositions that stay out of serializable profiles by design) |
 | `src/agent/strategies/` | `Single` / `FanOut` / `Adaptive` / `Pipeline` orchestration |
 | `src/agent/policies/` | `PolicyEngine` with Budget / Safety / QualityGate policies |
-| `src/agent/capabilities/` | Capability registry (skill + tool-allowlist composition) |
-| `src/agent/memory/` + `src/agent/domain/` | Three-tier memory (`ActiveContext` working / `SessionStore` session / `PersistentMemory` SQLite semantic) coordinated by `MemoryCoordinator`; evidence collection and episodic consolidation |
+| `src/agent/memory/` + `src/agent/evidence/` | Three-tier memory (`ActiveContext` working / `SessionStore` session / `PersistentMemory` SQLite semantic) coordinated by `MemoryCoordinator`, plus `EpisodicConsolidator`; `evidence/EvidenceCollector` supplies grounded evidence (`domain/` is now a thin re-export shell) |
 | `src/agent/context/` | `ContextWindow` (staged progressive compression), `ExplorationTracker`, plan tracking, nudges |
-| `src/agent/prompts/` | Insight prompt suite (analyst → producer → gate → evolver) and scan prompts |
+| `src/agent/prompts/` + `src/agent/evaluation/` | `prompts/` holds persona/prompt text and retry/repair copy only; `evaluation/` holds the quality gates, analysis-artifact builders, gate evaluators, and pipeline stage builders split out of the old insightGate |
 | `src/agent/runs/` + `coordination/` + `tasks/` | Domain runs, fan-out coordination, host task handlers |
 | `src/ai/` | `AiProvider` abstraction, `LLMGateway`, per-vendor transports, `ModelRegistry`, reliability, `ParameterGuard`, structured output |
-| `src/tools/` | Kernel contracts, `UnifiedToolCatalog`, runtime registry/router, handlers, terminal safety, output compressor + CLI parsers, `DeltaCache` |
+| `src/tools/` | Kernel contracts, `UnifiedToolCatalog`, runtime registry/router, handlers, terminal safety, output compressor + CLI parsers, `DeltaCache`; `runtime/toolsets/` packages scenario toolsets plus the `CapabilityRegistry` (key → toolset constructor) |
 
 ## Package exports
 
