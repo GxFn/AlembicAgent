@@ -120,6 +120,8 @@ export interface EvidenceLedgerLike {
   }>;
   listRecent(limit?: number): Array<{ id: string; file?: string }>;
   stats(): { entries: number; distinctFiles: number };
+  /** E5 新鲜度终检：同区间重切+同截断+同脱敏后比对采集哈希；无法复核的条目返回 'unknown' */
+  checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown';
 }
 
 export interface ToolRuntimeCallContext {

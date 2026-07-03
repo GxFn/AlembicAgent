@@ -244,6 +244,14 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             properties: {
               whyStandard: { type: 'string' },
               sources: { type: 'array', items: { type: 'string' } },
+              // E5（证据保真）：优先以台账条目 id 提交——sources/coreCode 由程序机械展开并做
+              // 新鲜度终检；手填 sources 仍被接受（由门禁 fs 校验兜底）。
+              evidenceRefs: {
+                type: 'array',
+                items: { type: 'string' },
+                description:
+                  'Evidence ledger entry ids from [evidence] annotations (e.g. ["E-3","E-7@5-12"]). sources/coreCode are mechanically expanded and freshness-checked from these; preferred over hand-written sources.',
+              },
               confidence: { type: 'number' },
             },
             required: ['sources'],

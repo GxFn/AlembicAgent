@@ -29,6 +29,10 @@ import {
   formatRecipeAuthoringViolations,
   runInProcessRecipeAuthoringGate,
 } from './recipeAuthoringGate.js';
+import {
+  buildEvidenceCandidatesHint,
+  expandEvidenceRefsForSubmit,
+} from './submitEvidenceExpansion.js';
 
 const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
@@ -397,8 +401,27 @@ async function handleSubmit(
       sharedStateForSubmit._submitTitleAttempts = attempts;
     }
 
+    // E5（证据保真）：reasoning.evidenceRefs 台账机械展开——sources/coreCode 由程序从台账
+    // 条目生成/回填（模型不再手写 file:line），并做新鲜度终检（run 中途文件变更→EVIDENCE_STALE
+    // 拒并提示重采）。发生在权威门禁之前的 Agent 层；Core gateRules 与九拒因语义不动。
+    const expansion = expandEvidenceRefsForSubmit(item, {
+      ledger: ctx.runtime?.evidenceLedger,
+      projectRoot: ctx.projectRoot,
+    });
+    if (!expansion.ok) {
+      Logger.getInstance().warn(
+        `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${expansion.error}`
+      );
+      return fail(expansion.error);
+    }
+    if (expansion.expandedSources.length > 0) {
+      Logger.getInstance().info(
+        `[knowledge.submit] evidence refs expanded (${expansion.expandedSources.length} sources) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+      );
+    }
+
     let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
-      item,
+      expansion.item,
       sharedStateForSubmit,
       ctx.projectRoot
     );
@@ -489,6 +512,11 @@ async function handleSubmit(
       )
         ? buildSnippetRepairHint(effectiveItem.sourceRefs, ctx.projectRoot)
         : '';
+      // E5 反馈增强：INSUFFICIENT_EVIDENCE 附台账内真实可引用的 distinct 文件——
+      // 此前只说 "add 3 distinct files" 不说去哪找，修不动的拒绝即无效拒绝。
+      const evidenceHint = gateViolations.some((v) => v.code === 'INSUFFICIENT_EVIDENCE')
+        ? buildEvidenceCandidatesHint(ctx.runtime?.evidenceLedger)
+        : '';
       // 申辩指引：全部违规都是软规则时告知申辩通道(硬违规在场时先修事实错误，不提申辩)。
       const appealEligible =
         gateViolations.length > 0 && gateViolations.every((v) => isSoftAuthoringViolation(v.code));
@@ -523,7 +551,9 @@ async function handleSubmit(
           );
         }
       }
-      return fail(`Validation failed: ${detail}${snippetRepair}${appealHint}${stopDirective}`);
+      return fail(
+        `Validation failed: ${detail}${snippetRepair}${evidenceHint}${appealHint}${stopDirective}`
+      );
     }
     // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
     if (ctx.runtime) {

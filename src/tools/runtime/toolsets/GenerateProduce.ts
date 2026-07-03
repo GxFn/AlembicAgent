@@ -33,17 +33,19 @@ export class GenerateProduce extends RuntimeCapability {
 4. 设计原理说明 (content.rationale)
 5. 正确的 kind (rule / pattern / fact)
 6. 完整的 Cursor 交付字段 (trigger, whenClause, doClause)
-7. reasoning.sources 非空，填写完整相对路径
+7. reasoning.evidenceRefs 引用 Analyst 发现携带的台账条目 id（如 ["E-12"]）——sources 与
+   coreCode 将由台账机械展开并做新鲜度校验；确无条目 id 可引时才手填 reasoning.sources 完整相对路径
 
 工作流:
 1. memory.recall 获取分析阶段的发现
-2. 使用 Analyst 已记录的 evidence、代码片段和路径生成候选
+2. 使用 Analyst 已记录的 findings（含 evidenceRefs 条目 id）生成候选；需要 verbatim 原文时用 evidence.get 取回
 3. knowledge.submit 逐个提交知识候选 (内含自动查重)
 4. 目标候选提交完成后直接总结；只有工具错误或证据不确定时才用 meta.review 自检
 
 关键规则:
 - 不使用终端工具
 - 不做新的代码探索或补读；缺少证据时记录为阻塞，不要在 Producer 阶段扫描源码
+- evidence.get/search 是查已采证据（不算探索）：被拒时先取台账 verbatim 原文修正引用，不要凭记忆改写
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 - 每个独立模式/发现单独提交
 - 提交前自检 title / description / content.markdown / content.rationale / reasoning.sources 非空

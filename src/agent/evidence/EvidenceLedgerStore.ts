@@ -118,11 +118,7 @@ export class EvidenceLedgerStore {
 
   /** 采集侧唯一写入口（E2 在工具结果收口处调用）；返回带 id 的完整条目 */
   append(draft: EvidenceEntryDraft): EvidenceEntry {
-    const redacted = this.#redactor(draft.content);
-    const capped =
-      redacted.length > EVIDENCE_ENTRY_MAX_CHARS
-        ? `${redacted.slice(0, EVIDENCE_ENTRY_MAX_CHARS - EVIDENCE_TRUNCATION_MARKER.length - 1)}\n${EVIDENCE_TRUNCATION_MARKER}`
-        : redacted;
+    const capped = this.#redactAndCap(draft.content);
     const entry: EvidenceEntry = {
       id: makeEvidenceId(++this.#seq),
       sessionId: this.#sessionId,
@@ -155,6 +151,37 @@ export class EvidenceLedgerStore {
 
   has(id: string): boolean {
     return this.#entries.has(id);
+  }
+
+  /**
+   * E5 新鲜度终检：对底层条目按「同区间重切 + 同截断 + 同脱敏」重算哈希与采集时比对。
+   * 只有 file+range 条目可复核（read 类采集）；search 分组/terminal 等无法重构切片 →
+   * 'unknown'（提交侧放行，最终仍由门禁的 fs verbatim 校验兜底）。区间越界（文件变短）
+   * 直接 'stale'。
+   */
+  checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown' {
+    const parsed = parseEvidenceRef(ref);
+    if (!parsed) {
+      return 'unknown';
+    }
+    const entry = this.#entries.get(parsed.id);
+    if (!entry || !entry.file || !entry.range) {
+      return 'unknown';
+    }
+    const lines = currentFileContent.split('\n');
+    if (entry.range.end > lines.length) {
+      return 'stale';
+    }
+    const slice = lines.slice(entry.range.start - 1, entry.range.end).join('\n');
+    return hashEvidenceContent(this.#redactAndCap(slice)) === entry.contentHash ? 'fresh' : 'stale';
+  }
+
+  /** 落盘内容统一管线：脱敏→上限截断（append 与 checkFreshness 共用同一把尺） */
+  #redactAndCap(content: string): string {
+    const redacted = this.#redactor(content);
+    return redacted.length > EVIDENCE_ENTRY_MAX_CHARS
+      ? `${redacted.slice(0, EVIDENCE_ENTRY_MAX_CHARS - EVIDENCE_TRUNCATION_MARKER.length - 1)}\n${EVIDENCE_TRUNCATION_MARKER}`
+      : redacted;
   }
 
   /** 按文件路径片段检索（E3 近似候选提示 / E5 producer 展开用），按采集序返回 */
