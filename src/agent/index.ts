@@ -57,7 +57,7 @@ export {
   SafetyPolicy,
 } from './policies/index.js';
 // ── Presets ──
-export { getPreset, PRESETS, resolveStrategy } from './profiles/presets.js';
+export { getPreset, PRESETS, resolveStrategy } from './profiles/presets/index.js';
 export { AgentEventBus, AgentEvents } from './runtime/AgentEventBus.js';
 export {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,

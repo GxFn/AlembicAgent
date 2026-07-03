@@ -8,7 +8,7 @@ import {
   buildRelationsPipelineStages,
   buildScanPipelineStages,
 } from '../evaluation/stageBuilders.js';
-import { PRESETS } from '../profiles/presets.js';
+import { PRESETS } from '../profiles/presets/index.js';
 import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
 
 export type AgentStageFactoryInput = {

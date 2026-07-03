@@ -2,7 +2,7 @@ import Logger from '@alembic/core/logging';
 import type { ToolRouterContract } from '#tools/kernel/index.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { type Policy, PolicyEngine } from '../policies/index.js';
-import { getPreset } from '../profiles/presets.js';
+import { getPreset } from '../profiles/presets/index.js';
 import { AgentRuntime } from '../runtime/AgentRuntime.js';
 import type { Strategy } from '../strategies/index.js';
 import type {
