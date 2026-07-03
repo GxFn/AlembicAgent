@@ -36,6 +36,7 @@ import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { limitToolResult } from '../context/ContextWindow.js';
 import { PolicyEngine } from '../policies/index.js';
+import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
 import type { AgentMessage } from './AgentMessage.js';
 import {
@@ -2683,17 +2684,6 @@ function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): un
         : sanitizeDeveloperData(child, seen);
   }
   return output;
-}
-
-function redactDeveloperText(text: string): string {
-  return text
-    .replace(/sk-(?:proj-)?[A-Za-z0-9_-]{12,}/g, '[redacted-api-key]')
-    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-google-api-key]')
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[redacted-token]')
-    .replace(
-      /((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*["']?)[^\s"',}]{8,}/gi,
-      '$1[redacted]'
-    );
 }
 
 function isSecretLikeKey(key: string): boolean {

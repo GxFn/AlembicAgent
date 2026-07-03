@@ -12,11 +12,11 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
-import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import {
   STRATEGY_ANALYST,
   targetMemoryFindingCount,
 } from '../src/agent/context/exploration/ExplorationStrategies.js';
+import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 
 const baseline = JSON.parse(
