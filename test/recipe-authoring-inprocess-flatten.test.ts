@@ -25,7 +25,7 @@ import {
   validateAgainst,
 } from '@alembic/core/knowledge';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { EvidenceEntry } from '../src/agent/domain/EvidenceCollector.js';
+import type { EvidenceEntry } from '../src/agent/evidence/EvidenceCollector.js';
 import {
   buildCodeContextSection,
   buildProducerPromptV2,

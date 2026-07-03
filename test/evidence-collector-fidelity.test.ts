@@ -23,7 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   EvidenceCollector,
   type SnippetRangeReader,
-} from '../src/agent/domain/EvidenceCollector.js';
+} from '../src/agent/evidence/EvidenceCollector.js';
 import { buildAnalysisArtifact } from '../src/agent/prompts/insightGate.js';
 import {
   buildCodeContextSection,

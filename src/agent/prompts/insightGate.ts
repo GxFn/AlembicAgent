@@ -30,7 +30,7 @@ import {
   type EvidenceCollectorResult,
   type SnippetRangeReader,
   type ToolCall,
-} from '../domain/EvidenceCollector.js';
+} from '../evidence/EvidenceCollector.js';
 import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidenceRecorder.js';
 
 // AD4: lazy logger accessor — the Core logger singleton materializes on first

@@ -45,7 +45,7 @@ interface PhaseResult {
 interface GateArtifact {
   analysisText?: string;
   findings?: Array<{ finding: string; importance?: number; evidence?: string }>;
-  evidenceMap?: Map<string, import('../domain/EvidenceCollector.js').EvidenceEntry>;
+  evidenceMap?: Map<string, import('../evidence/EvidenceCollector.js').EvidenceEntry>;
   negativeSignals?: Array<{ searchPattern: string; implication: string }>;
   referencedFiles?: string[];
 }

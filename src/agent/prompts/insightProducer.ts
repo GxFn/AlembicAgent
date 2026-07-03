@@ -20,7 +20,7 @@ import {
   renderGuidance,
   SUBMIT_REQUIREMENTS,
 } from '@alembic/core/knowledge';
-import { type EvidenceEntry, isDocEvidencePath } from '../domain/EvidenceCollector.js';
+import { type EvidenceEntry, isDocEvidencePath } from '../evidence/EvidenceCollector.js';
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义

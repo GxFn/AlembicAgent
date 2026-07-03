@@ -4,7 +4,7 @@
  * Bootstrap 质量门控核心组件: 将 Analyst 阶段的 toolCall 序列转化为
  * 类型化的证据地图、探索日志和负空间信号，供 Producer 阶段直接引用。
  *
- * 被 bootstrap-gate.js (buildAnalysisArtifact) 调用。
+ * 被 evaluation 质量门(原 insightGate) (buildAnalysisArtifact) 调用。
  *
  * 设计原则:
  * - 不保留原始工具返回值 (体积过大)
