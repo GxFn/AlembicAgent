@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-06-27",
+  "generatedAt": "2026-07-03",
   "description": "AG4 stable public API signature smoke snapshot. Runtime smoke imports each stable package export and compares exact exported names plus runtime kind values.",
   "stablePublicExports": [
     ".",
@@ -28,9 +28,8 @@
   "packageExportCount": 12,
   "stableExportSignatures": {
     ".": {
-      "exportPath": ".",
-      "exportCount": 160,
-      "signatureHash": "7dcc10b0e1ead4f004cc641218d655568d20adfef77b24db75ecf579d372a2ce",
+      "exportCount": 159,
+      "signatureHash": "c177bbfdc3e58541c114291ab6e8e2c0c12644ac85c5646608cd2cbf3affc662",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -62,10 +61,6 @@
         },
         {
           "name": "ActiveContext",
-          "kind": "class"
-        },
-        {
-          "name": "AdaptiveStrategy",
           "kind": "class"
         },
         {
@@ -122,14 +117,6 @@
         },
         {
           "name": "AiProviderManager",
-          "kind": "class"
-        },
-        {
-          "name": "BootstrapAnalyze",
-          "kind": "class"
-        },
-        {
-          "name": "BootstrapProduce",
           "kind": "class"
         },
         {
@@ -206,6 +193,14 @@
         },
         {
           "name": "FanOutStrategy",
+          "kind": "class"
+        },
+        {
+          "name": "GenerateAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "GenerateProduce",
           "kind": "class"
         },
         {
@@ -437,11 +432,11 @@
           "kind": "function"
         },
         {
-          "name": "createBootstrapStrategy",
+          "name": "createEmbedProvider",
           "kind": "function"
         },
         {
-          "name": "createEmbedProvider",
+          "name": "createGenerateStrategy",
           "kind": "function"
         },
         {
@@ -675,9 +670,8 @@
       ]
     },
     "./agent": {
-      "exportPath": "./agent",
-      "exportCount": 55,
-      "signatureHash": "582891528297c07d52ab3370f8e7ff2181ee7fa9747a1b3d292d243e8861d11d",
+      "exportCount": 54,
+      "signatureHash": "9fa5961e019737f146b3435065f7b8d74252b77d0b777e0ec409c6dcbc59361b",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -706,10 +700,6 @@
         {
           "name": "ALEMBIC_AGENT_RUNTIME_BOUNDARY",
           "kind": "object"
-        },
-        {
-          "name": "AdaptiveStrategy",
-          "kind": "class"
         },
         {
           "name": "AgentEventBus",
@@ -902,7 +892,6 @@
       ]
     },
     "./service": {
-      "exportPath": "./service",
       "exportCount": 17,
       "signatureHash": "84bae44a518c232c2de9c1453a4be3eb211da017c637bd64f3c3e672dc00acdb",
       "entries": [
@@ -977,7 +966,6 @@
       ]
     },
     "./runtime": {
-      "exportPath": "./runtime",
       "exportCount": 69,
       "signatureHash": "977b1b95fda6d2893389d70c104c125a00aa30a5e113c598b83809b3b5cd5d6a",
       "entries": [
@@ -1260,9 +1248,8 @@
       ]
     },
     "./prompts": {
-      "exportPath": "./prompts",
-      "exportCount": 27,
-      "signatureHash": "9e7e4ac3ed25c92430b3bbb843b30cacb78e04daa4147378da78ead0b6cc1284",
+      "exportCount": 30,
+      "signatureHash": "31166f68ef6742b90560d7dead0c06052ad29952d6d812795aae0f3a59f491af",
       "entries": [
         {
           "name": "ANALYST_BUDGET",
@@ -1306,6 +1293,14 @@
         },
         {
           "name": "analysisQualityGate",
+          "kind": "function"
+        },
+        {
+          "name": "applyDepthRetryGate",
+          "kind": "function"
+        },
+        {
+          "name": "applyGraphRetryGate",
           "kind": "function"
         },
         {
@@ -1353,6 +1348,10 @@
           "kind": "function"
         },
         {
+          "name": "buildSummaryRewritePrompt",
+          "kind": "function"
+        },
+        {
           "name": "computeAnalystBudget",
           "kind": "function"
         },
@@ -1375,7 +1374,6 @@
       ]
     },
     "./domain": {
-      "exportPath": "./domain",
       "exportCount": 2,
       "signatureHash": "8eba8cdb7331e2968327cc3be2ef603abcb21c5e382f4d2bffdad84c61ff2559",
       "entries": [
@@ -1390,7 +1388,6 @@
       ]
     },
     "./tasks": {
-      "exportPath": "./tasks",
       "exportCount": 5,
       "signatureHash": "bd7000fae7f0b7c8a00243b7a376628089e3cabb22c3fc6dec5295cc39e0be83",
       "entries": [
@@ -1417,7 +1414,6 @@
       ]
     },
     "./profiles": {
-      "exportPath": "./profiles",
       "exportCount": 7,
       "signatureHash": "9a9002c9205acdc7a211a2c7a9777c87239cdb5dfd31a38eed34ead5094eb609",
       "entries": [
@@ -1452,7 +1448,6 @@
       ]
     },
     "./ai": {
-      "exportPath": "./ai",
       "exportCount": 28,
       "signatureHash": "f02f8f3e1a64892c6ef42a413722b9f077ac7a9c076286567116ed112fadaf12",
       "entries": [
@@ -1571,18 +1566,9 @@
       ]
     },
     "./tools/runtime": {
-      "exportPath": "./tools/runtime",
       "exportCount": 31,
-      "signatureHash": "1869adfdb67f6d11c3d5fb001242e8e8c533d040f92610decbaba84d2ae73d0b",
+      "signatureHash": "a3791855c428fa2f21092a0f7d15afc4ff198be8b2b81c28582442f999004f97",
       "entries": [
-        {
-          "name": "BootstrapAnalyze",
-          "kind": "class"
-        },
-        {
-          "name": "BootstrapProduce",
-          "kind": "class"
-        },
         {
           "name": "Conversation",
           "kind": "class"
@@ -1593,6 +1579,14 @@
         },
         {
           "name": "Evolution",
+          "kind": "class"
+        },
+        {
+          "name": "GenerateAnalyze",
+          "kind": "class"
+        },
+        {
+          "name": "GenerateProduce",
           "kind": "class"
         },
         {
@@ -1702,7 +1696,6 @@
       ]
     },
     "./memory": {
-      "exportPath": "./memory",
       "exportCount": 14,
       "signatureHash": "1f1dacd0e846c9dcb41be7a4b278528ab45455b3802a76560ac0f4b06920b66f",
       "entries": [
@@ -1765,9 +1758,8 @@
       ]
     },
     "./context": {
-      "exportPath": "./context",
       "exportCount": 20,
-      "signatureHash": "66c6c9f329c57c087d722aa98adc312c87e080a9b6e45b893272747319d2105d",
+      "signatureHash": "5032a9807331b221c63ee8daa04960ce7ecea4d2c93ba6bab68741f6952cb963",
       "entries": [
         {
           "name": "ContextWindow",
@@ -1818,7 +1810,7 @@
           "kind": "function"
         },
         {
-          "name": "createBootstrapStrategy",
+          "name": "createGenerateStrategy",
           "kind": "function"
         },
         {

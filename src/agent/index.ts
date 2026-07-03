@@ -35,12 +35,12 @@
  *   │ Action Layer: ToolRouter        │  ← 执行动作，不选择 Agent profile
  *   └────────────────────────────────┘
  *
- * Preset 配置表:
- *   | Preset       | Capabilities         | Strategy    | Policies         |
- *   |--------------|----------------------|-------------|------------------|
- *   | chat         | Conv + Analysis      | Single      | Budget(8轮)      |
- *   | bootstrap    | Analysis + Knowledge | FanOut+Pipe | Budget+Quality   |
- *   | scan         | Analysis + Knowledge | Pipeline    | Budget+Quality   |
+ * Preset 配置表(W6-0 校准,真集=chat/insight/evolution):
+ *   | Preset       | Capabilities             | Strategy    | Policies         |
+ *   |--------------|--------------------------|-------------|------------------|
+ *   | chat         | Conv + Analysis          | Single      | Budget(8轮)      |
+ *   | insight      | Analysis + Knowledge     | Pipeline    | Budget+Quality   |
+ *   | evolution    | Evolution analysis       | Pipeline    | Budget+Quality   |
  */
 
 // ── Capabilities ──
