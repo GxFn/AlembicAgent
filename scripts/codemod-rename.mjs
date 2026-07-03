@@ -195,8 +195,6 @@ for (const filePath of allFiles.filter((file) => TEXT_SCAN_EXTENSIONS.test(file)
     }
   }
 }
-for (const { from, to } of renames) {
-}
 for (const [filePath, plans] of [...filePlans.entries()].sort()) {
   const _relative = path.relative(root, filePath).replaceAll(path.sep, '/');
   for (const _plan of plans) {

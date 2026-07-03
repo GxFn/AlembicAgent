@@ -49,4 +49,3 @@ export const SCOPED_MODULE_MINING_PROFILES: AgentProfileDefinition[] = [
     projection: 'agent-result',
   },
 ];
-

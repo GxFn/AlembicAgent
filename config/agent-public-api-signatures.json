@@ -28,8 +28,8 @@
   "packageExportCount": 12,
   "stableExportSignatures": {
     ".": {
-      "exportCount": 159,
-      "signatureHash": "c177bbfdc3e58541c114291ab6e8e2c0c12644ac85c5646608cd2cbf3affc662",
+      "exportCount": 156,
+      "signatureHash": "ed9a4a6bf4f9136fb5780275e36c654479f0445c656ff9d9b79309d5f1b22ca5",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -148,10 +148,6 @@
           "kind": "class"
         },
         {
-          "name": "CodeAnalysis",
-          "kind": "class"
-        },
-        {
           "name": "ContextWindow",
           "kind": "class"
         },
@@ -209,10 +205,6 @@
         },
         {
           "name": "GoogleTransport",
-          "kind": "class"
-        },
-        {
-          "name": "KnowledgeProduction",
           "kind": "class"
         },
         {
@@ -369,10 +361,6 @@
         },
         {
           "name": "System",
-          "kind": "class"
-        },
-        {
-          "name": "SystemInteraction",
           "kind": "class"
         },
         {
@@ -670,8 +658,8 @@
       ]
     },
     "./agent": {
-      "exportCount": 54,
-      "signatureHash": "9fa5961e019737f146b3435065f7b8d74252b77d0b777e0ec409c6dcbc59361b",
+      "exportCount": 51,
+      "signatureHash": "8ca58cb3405afec85dea717366c317d414d5f0feaf3a23ee337e3742d79d27ae",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -766,19 +754,11 @@
           "kind": "object"
         },
         {
-          "name": "CodeAnalysis",
-          "kind": "class"
-        },
-        {
           "name": "Conversation",
           "kind": "class"
         },
         {
           "name": "FanOutStrategy",
-          "kind": "class"
-        },
-        {
-          "name": "KnowledgeProduction",
           "kind": "class"
         },
         {
@@ -811,10 +791,6 @@
         },
         {
           "name": "Strategy",
-          "kind": "class"
-        },
-        {
-          "name": "SystemInteraction",
           "kind": "class"
         },
         {

@@ -12,7 +12,7 @@
  * @module core/LoopContext
  */
 
-import type { Capability } from '../capabilities/index.js';
+import type { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { ActiveContext } from '../memory/ActiveContext.js';

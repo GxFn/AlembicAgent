@@ -1,11 +1,11 @@
-import type { Capability } from '#tools/runtime/toolsets/Capability.js';
-import { Conversation } from '#tools/runtime/toolsets/Conversation.js';
-import { Evolution } from '#tools/runtime/toolsets/Evolution.js';
-import { GenerateAnalyze } from '#tools/runtime/toolsets/GenerateAnalyze.js';
-import { GenerateProduce } from '#tools/runtime/toolsets/GenerateProduce.js';
-import { ScanAnalyze } from '#tools/runtime/toolsets/ScanAnalyze.js';
-import { ScanProduce } from '#tools/runtime/toolsets/ScanProduce.js';
-import { System } from '#tools/runtime/toolsets/System.js';
+import type { Capability } from './Capability.js';
+import { Conversation } from './Conversation.js';
+import { Evolution } from './Evolution.js';
+import { GenerateAnalyze } from './GenerateAnalyze.js';
+import { GenerateProduce } from './GenerateProduce.js';
+import { ScanAnalyze } from './ScanAnalyze.js';
+import { ScanProduce } from './ScanProduce.js';
+import { System } from './System.js';
 
 type CapabilityConstructor = new (opts?: Record<string, unknown>) => Capability;
 

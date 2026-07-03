@@ -5,7 +5,7 @@
   "typeOnlyNote": "import type / export type imports are type bridges and do not create runtime coupling; runtime imports must follow allowedRuntimeImports.",
   "layerRationale": [
     "Base leaves (import nothing cross-area): shared (vendor-neutral helpers: structuredOutput, language service), ai (provider adapters, transports, registry, gateway — consumes shared code only via its own copies and @alembic/core externally), types (ambient .d.ts declarations only; no runtime edges by construction since the lint scans no .d.ts).",
-    "Mid: tools (generic tool system: contracts, catalog, router, capabilities, terminal) sits over shared and imports nothing from agent. The Capability base contract lives in the tools leaf (tools/runtime/capabilities/Capability.ts) so capabilities subclass downward — the former agent<->tools cycle was resolved 2026-06-19 (AAO6).",
+    "Mid: tools (generic tool system: contracts, catalog, router, capabilities, terminal) sits over shared and imports nothing from agent. The Capability base contract lives in the tools leaf (tools/runtime/toolsets/Capability.ts) so capabilities subclass downward — the former agent<->tools cycle was resolved 2026-06-19 (AAO6).",
     "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
     "root (src/index.ts) is the package facade composition entry with a wildcard: it re-exports agent, ai, and tools wholesale (the post-IC3 public surface).",
     "AD2 charter cross-check 2026-06-12: the SD-4 declared exception (raw-SQL semantic_memories read adapter) lives wholly inside agent/memory/MemoryStore.ts and imports only node:crypto plus @alembic/core externals — it crosses NO internal area, so it consistently needs no entry in this contract; external package edges are owned by the space-edge and core-import gates, not this lint."
@@ -25,7 +25,7 @@
       "cycle": "agent -> tools (acyclic)",
       "majority": "agent -> tools (runtime tool pipeline, service and capability wiring consume the generic tool system)",
       "minority": "none — the former tools -> agent inversion was removed",
-      "status": "RESOLVED 2026-06-19 (AAO6): the Capability base contract moved into the tools leaf (src/tools/runtime/capabilities/Capability.ts), so RuntimeCapability subclasses downward and tools imports nothing from agent. agent <-> tools is no longer a cycle."
+      "status": "RESOLVED 2026-06-19 (AAO6): the Capability base contract moved into the tools leaf (src/tools/runtime/toolsets/Capability.ts), so RuntimeCapability subclasses downward and tools imports nothing from agent. agent <-> tools is no longer a cycle."
     }
   ]
 }

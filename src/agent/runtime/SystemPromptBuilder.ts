@@ -12,7 +12,7 @@
  * @module SystemPromptBuilder
  */
 
-import type { Capability } from '../capabilities/index.js';
+import type { Capability } from '../../tools/runtime/toolsets/Capability.js';
 
 /** File cache entry shape */
 interface FileCacheEntry {

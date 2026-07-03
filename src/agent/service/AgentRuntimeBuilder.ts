@@ -1,6 +1,6 @@
 import Logger from '@alembic/core/logging';
 import type { ToolRouterContract } from '#tools/kernel/index.js';
-import { CapabilityRegistry } from '../capabilities/index.js';
+import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { type Policy, PolicyEngine } from '../policies/index.js';
 import { getPreset } from '../profiles/presets.js';
 import { AgentRuntime } from '../runtime/AgentRuntime.js';

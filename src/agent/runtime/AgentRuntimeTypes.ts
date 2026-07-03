@@ -211,7 +211,7 @@ export interface RuntimeConfig {
   toolRegistry: import('#tools/catalog/UnifiedToolCatalog.js').UnifiedToolCatalog;
   toolRouter?: ToolRouterContract | null;
   container?: Record<string, unknown> | null;
-  capabilities?: import('../capabilities/index.js').Capability[];
+  capabilities?: import('../../tools/runtime/toolsets/Capability.js').Capability[];
   strategy: import('../strategies/index.js').Strategy;
   policies?: import('../policies/index.js').PolicyEngine;
   persona?: Record<string, unknown>;
