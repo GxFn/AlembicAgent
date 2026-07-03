@@ -21,7 +21,7 @@ describe('memory.note_finding ActiveContext contract', () => {
 
     const result = await handleMemory(
       'note_finding',
-      { finding: 'Verified boundary', evidence: 'src/foo.ts:10', importance: 8 },
+      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8 },
       createBaseContext({ sessionStore })
     );
 
@@ -42,7 +42,7 @@ describe('memory.note_finding ActiveContext contract', () => {
 
     const result = await handleMemory(
       'note_finding',
-      { finding: 'Verified boundary', evidence: 'src/foo.ts:10', importance: 8, round: 3 },
+      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8, round: 3 },
       createBaseContext({
         memoryCoordinator: { noteFinding },
         runtime: { dimensionScopeId: 'architecture:analyst' } as never,
@@ -50,12 +50,14 @@ describe('memory.note_finding ActiveContext contract', () => {
     );
 
     expect(result.ok).toBe(true);
+    // E3：无台账 ctx 走降级直存分支（unverified 标注），refs 作第 6 参透传
     expect(noteFinding).toHaveBeenCalledWith(
       'Verified boundary',
-      'src/foo.ts:10',
+      'E-1 (unverified: no evidence ledger in this run)',
       8,
       3,
-      'architecture:analyst'
+      'architecture:analyst',
+      ['E-1']
     );
     expect(result.data).toMatchObject({
       recorded: true,
@@ -69,7 +71,7 @@ describe('memory.note_finding ActiveContext contract', () => {
 
     const result = await handleMemory(
       'note_finding',
-      { finding: 'Verified boundary', evidence: 'src/foo.ts:10', importance: 8 },
+      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8 },
       createBaseContext({ memoryCoordinator: coordinator })
     );
 
@@ -83,7 +85,7 @@ describe('memory.note_finding ActiveContext contract', () => {
 
     const result = await handleMemory(
       'note_finding',
-      { finding: 'Verified boundary', evidence: 'src/foo.ts:10', importance: 8, round: 2 },
+      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8, round: 2 },
       createBaseContext({
         memoryCoordinator: coordinator,
         runtime: { dimensionScopeId: 'architecture:analyst' } as never,

@@ -240,7 +240,8 @@ export interface MemoryCoordinatorLike {
     evidence: string,
     importance: number,
     round: number,
-    scopeId?: string
+    scopeId?: string,
+    evidenceRefs?: string[]
   ): MemoryNoteFindingResult | string;
 
   /** 检索前序维度的代码证据 — get_previous_evidence 桥接 */

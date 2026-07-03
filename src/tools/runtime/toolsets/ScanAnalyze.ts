@@ -28,9 +28,9 @@ export class ScanAnalyze extends RuntimeCapability {
 
 关键规则:
 - note_finding 是 QualityGate 的重要质量依据，也是后续生产知识候选的结构化输入。
-- 一旦在搜索、阅读、调用链验证或终端验证中确认核心发现，允许并且必须主动调用 note_finding({ finding: "...", evidence: "文件路径:行号", importance: 8 })。
+- 一旦在搜索、阅读、调用链验证或终端验证中确认核心发现，允许并且必须主动调用 note_finding({ finding: "...", evidenceRefs: ["E-12"], importance: 8 })。
 - 不要把 note_finding 留到最终 Markdown 报告里替代；最终至少提交 3 条结构化发现，不足会影响 QualityGate 评分并触发 retry。
-- evidence 必须包含完整相对路径和行号。
+- evidenceRefs 只能引用工具返回尾部 [evidence] 标注的台账条目 id（如 ["E-3","E-7@5-12"]）；手写 file:line 会被拒收。
 
 ${super.promptFragment}`;
   }

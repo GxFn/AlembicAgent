@@ -28,15 +28,11 @@ const baseline = JSON.parse(
 };
 
 describe('E0 冷启动证据保真基线表征', () => {
-  test('1) note_finding 现状零校验：捏造 file:line 引用录入即成功', () => {
+  test('1) ActiveContext 存储层保持宽容（引用校验已上移 memory handler——E3 反转见 NoteFindingEvidenceRefs 测试）', () => {
     const ctx = new ActiveContext();
-    // 真机事故中的真实捏造样本：该路径在仓库与 git 历史中从未存在
-    ctx.noteKeyFinding(
-      '类型导入使用 import type 严格隔离',
-      'Alembic/lib/types/agent.ts:1-7（import type { ... } from ...）',
-      8
-    );
-    // 现状＝录入成功；E3 落地后该行为反转（无有效 evidenceRefs 即拒收，本测试同步改写）
+    // E3 后契约：拒收捏造引用发生在 handleNoteFinding（录入校验+近期候选提示）；
+    // 存储层是内部信任层，保持宽容（handler 校验通过后写入的是台账机械展开的标签）。
+    ctx.noteKeyFinding('类型导入使用 import type 严格隔离', 'E-1=lib/types/agent.d.ts:1-7', 8);
     expect(ctx.scratchpadSize).toBe(1);
   });
 

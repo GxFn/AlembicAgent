@@ -417,12 +417,13 @@ export class MemoryCoordinator {
     evidence: string,
     importance: number,
     round: number,
-    scopeId?: string
+    scopeId?: string,
+    evidenceRefs?: string[]
   ): MemoryNoteFindingResult {
     try {
       const ac = scopeId ? this.getActiveContext(scopeId) : this.#getCurrentActiveContext();
       if (ac) {
-        ac.noteKeyFinding(finding, evidence, importance, round);
+        ac.noteKeyFinding(finding, evidence, importance, round, evidenceRefs);
         return {
           recorded: true,
           target: 'activeContext',

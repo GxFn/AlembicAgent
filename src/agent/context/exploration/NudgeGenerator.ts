@@ -169,8 +169,8 @@ export class NudgeGenerator {
       const targetFindingCount = targetMemoryFindingCount(m);
       return (
         `你已完成分析验证。现在进入结构化记录阶段：请**停止调用 code、graph、terminal 等探索工具**。\n` +
-        `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidence, importance }) 记录核心发现；按当前证据量至少记录 ${targetFindingCount} 条，每次工具调用记录 1 条发现。\n` +
-        `note_finding 是 QualityGate 的重要质量依据；evidence 必须包含完整相对路径和行号。缺少或不足会导致 QualityGate retry。\n` +
+        `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidenceRefs, importance }) 记录核心发现；按当前证据量至少记录 ${targetFindingCount} 条，每次工具调用记录 1 条发现。\n` +
+        `note_finding 是 QualityGate 的重要质量依据；evidenceRefs 只能引用工具返回尾部 [evidence] 标注的台账条目 id（如 ["E-3","E-7@5-12"]），手写 file:line 会被拒收。缺少或不足会导致 QualityGate retry。\n` +
         `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`
       );
     }
@@ -220,7 +220,7 @@ export class NudgeGenerator {
     }
 
     if (toPhase === 'VERIFY') {
-      return '搜索阶段信息已饱和。现在进入证据验证阶段——只校验已发现的文件路径、行号、调用关系和 referencedFiles，不要重新进行泛搜索或扩展探索。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 note_finding({ finding, evidence, importance })。';
+      return '搜索阶段信息已饱和。现在进入证据验证阶段——只校验已发现的文件路径、行号、调用关系和 referencedFiles，不要重新进行泛搜索或扩展探索。note_finding 是 QualityGate 的重要质量依据；请在确认每个核心发现后立即调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id。';
     }
 
     return `阶段切换: ${fromPhase} → ${toPhase}`;
@@ -434,7 +434,7 @@ export class NudgeGenerator {
         return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
 
       case 'RECORD':
-        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidence, importance })；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，已记录 ${m.memoryFindingCount} 条。`;
+        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，已记录 ${m.memoryFindingCount} 条。`;
 
       default:
         return null;

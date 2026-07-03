@@ -121,7 +121,7 @@ describe('note_finding 深度槽序列化 (C10)', () => {
       'note_finding',
       {
         finding: 'UserService 用 @Injectable',
-        evidence: 'src/services/UserService.ts:5',
+        evidenceRefs: ['E-5'],
         importance: 8,
         designIntent: '显式标注而非扫描，见 src/services/UserService.ts:5。',
         failureModes: '缺失即启动期抛错，见 src/services/UserService.ts:5。',

@@ -182,6 +182,12 @@ export class EvidenceLedgerStore {
     return { entries: this.#entries.size, distinctFiles: files.size };
   }
 
+  /** 近期条目（按采集序尾部）——note_finding 引用解析失败时的真实候选提示（E3） */
+  listRecent(limit = 5): EvidenceEntry[] {
+    const all = [...this.#entries.values()];
+    return all.slice(Math.max(0, all.length - limit));
+  }
+
   #hydrate(): void {
     if (!existsSync(this.filePath)) {
       return;

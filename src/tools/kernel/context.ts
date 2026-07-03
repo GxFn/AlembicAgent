@@ -97,10 +97,26 @@ export interface ToolDiagnosticsRecorder {
   ): void;
 }
 
+/**
+ * 证据台账只读端口（Wave A E3）——结构化 LIKE 型，避免 kernel→agent 反向依赖
+ * （同 MemoryCoordinatorLike 先例）。note_finding 录入校验与近似候选提示用。
+ */
+export interface EvidenceLedgerLike {
+  get(ref: string): {
+    id: string;
+    file?: string;
+    range?: { start: number; end: number };
+  } | null;
+  listRecent(limit?: number): Array<{ id: string; file?: string }>;
+  stats(): { entries: number; distinctFiles: number };
+}
+
 export interface ToolRuntimeCallContext {
   agentId?: string;
   presetName?: string;
   iteration?: number;
+  /** 证据台账（Wave A E3）；缺席=非维度场景，note_finding 降级为不校验直存 */
+  evidenceLedger?: EvidenceLedgerLike | null;
   policyValidator?: ToolPolicyValidator | null;
   cache?: ToolResultCacheProvider | null;
   diagnostics?: ToolDiagnosticsRecorder | null;

@@ -148,6 +148,8 @@ interface ScratchpadEntry {
   evidence: string;
   importance: number;
   round: number;
+  /** 证据台账条目 id（Wave A E3）——E5 producer 机械展开的程序化消费面 */
+  evidenceRefs?: string[];
 }
 
 interface RoundAction {
@@ -430,7 +432,13 @@ export class ActiveContext {
    * @param [importance=5] 重要性 1-10
    * @param [round=0] 当前轮次
    */
-  noteKeyFinding(finding: string, evidence: unknown = '', importance = 5, round = 0) {
+  noteKeyFinding(
+    finding: string,
+    evidence: unknown = '',
+    importance = 5,
+    round = 0,
+    evidenceRefs?: string[]
+  ) {
     // P0 Fix: 防御性保证 evidence 是 string (AI 可能传入 array/object)
     const safeEvidence =
       typeof evidence === 'string'
@@ -445,6 +453,7 @@ export class ActiveContext {
       evidence: safeEvidence,
       importance: Math.min(10, Math.max(1, importance)),
       round,
+      ...(evidenceRefs?.length ? { evidenceRefs: [...evidenceRefs] } : {}),
     });
 
     this.#logger.debug(
@@ -604,6 +613,7 @@ export class ActiveContext {
         finding: f.finding,
         evidence: f.evidence,
         importance: f.importance,
+        ...(f.evidenceRefs?.length ? { evidenceRefs: [...f.evidenceRefs] } : {}),
       })),
       toolCallSummary: this.#compressedObservations.map(
         (s) => `[${s.toolName}] ${s.summary.substring(0, 150)}`

@@ -415,14 +415,23 @@ const MEMORY_SPEC: ToolSpec = {
     note_finding: {
       summary: 'Record a structured key finding to ActiveContext scratchpad',
       description:
-        'Record an important discovery with evidence and importance rating. These findings feed into QualityGate evaluation (evidenceScore) and are preserved across context compression. Optionally capture the finding\'s depth (design intent / boundaries / failure modes / trade-offs), each grounded to a real file:line, so the recipe carries "why & when", not just "what".',
+        'Record an important discovery citing evidence-ledger entry ids. These findings feed into QualityGate evaluation (evidenceScore) and are preserved across context compression. Optionally capture the finding\'s depth (design intent / boundaries / failure modes / trade-offs), each grounded to cited evidence, so the recipe carries "why & when", not just "what".',
       params: {
         type: 'object',
         properties: {
           finding: { type: 'string', description: 'Key finding description' },
-          evidence: {
+          // E3（证据保真）：引用只能是台账条目 id——来自工具返回尾部的 [evidence] 标注；
+          // 手写 file:line 无法通过录入校验（捏造引用在语法层不可表达）。
+          evidenceRefs: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: 1,
+            description:
+              'Evidence ledger entry ids cited from [evidence] annotations in tool results, e.g. ["E-3", "E-7@5-12"]. Hand-written file:line strings are rejected.',
+          },
+          excerpt: {
             type: 'string',
-            description: 'Evidence reference (file path:line, e.g. "src/App.tsx:42")',
+            description: 'Optional short verbatim excerpt from the cited evidence entries',
           },
           importance: {
             type: 'number',
@@ -431,7 +440,7 @@ const MEMORY_SPEC: ToolSpec = {
           // P4/C10: 可选结构化深度槽，从 Core DEPTH_DIMENSIONS 单源渲染。
           ...DEPTH_SLOT_PROPS,
         },
-        required: ['finding'],
+        required: ['finding', 'evidenceRefs'],
       },
       handler: async (p, ctx) => handleMemory('note_finding', p, ctx),
       concurrency: 'parallel',

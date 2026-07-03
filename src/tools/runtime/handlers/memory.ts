@@ -99,7 +99,22 @@ async function handleNoteFinding(
     return fail('memory action note_finding requires "finding" param');
   }
 
-  const evidence = (params.evidence as string) || '';
+  // E3（证据保真硬切）：引用契约=台账条目 id 数组（evidenceRefs）。旧 evidence 自由文本被拒——
+  // 模型手写 file:line 是真机捏造事故的直接通道（设计 §15.E3；E0 表征钉 1 的反转点）。
+  const refsRaw = params.evidenceRefs;
+  const refs = Array.isArray(refsRaw)
+    ? refsRaw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  if (refs.length === 0) {
+    const legacyHint =
+      typeof params.evidence === 'string' && params.evidence
+        ? '（收到旧版 "evidence" 自由文本参数——该形态已退役）'
+        : '';
+    return fail(
+      `note_finding 需要 "evidenceRefs"：引用工具返回尾部 [evidence] 标注过的台账条目 id（如 ["E-3","E-7@5-12"]）${legacyHint}。手写 file:line 不再被接受。`
+    );
+  }
+
   const importance = Math.min(10, Math.max(1, (params.importance as number) || 5));
   const round = (params.round as number) || 0;
 
@@ -107,20 +122,51 @@ async function handleNoteFinding(
     return fail('memory.note_finding requires an active MemoryCoordinator and ActiveContext');
   }
 
+  // 录入即校验（纯台账查询，零 fs 成本）：任一 ref 无效→整条拒收并附近期真实条目提示，
+  // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存，降级显式标注。
+  const ledger = ctx.runtime?.evidenceLedger;
+  let resolvedLabels: string;
+  if (ledger) {
+    const labels: string[] = [];
+    for (const ref of refs) {
+      const entry = ledger.get(ref);
+      if (!entry) {
+        const recent = ledger
+          .listRecent(3)
+          .map((item) => (item.file ? `${item.id}=${item.file}` : item.id))
+          .join('; ');
+        return fail(
+          `evidenceRefs 无法解析: "${ref}" 不在证据台账（只能引用工具返回里 [evidence] 标注的条目 id）。近期条目: ${recent || '(台账为空——先用 code/graph 工具采集证据)'}`
+        );
+      }
+      labels.push(
+        entry.file
+          ? entry.range
+            ? `${entry.id}=${entry.file}:${entry.range.start}-${entry.range.end}`
+            : `${entry.id}=${entry.file}`
+          : entry.id
+      );
+    }
+    // evidence 字符串由台账机械展开生成（模型不再手写 file:line）——下游投影零改动即携带准确引用
+    resolvedLabels = labels.join('; ');
+  } else {
+    resolvedLabels = `${refs.join('; ')} (unverified: no evidence ledger in this run)`;
+  }
+
+  const excerpt =
+    typeof params.excerpt === 'string' && params.excerpt.trim() ? params.excerpt.trim() : '';
+  const evidence = excerpt ? `${resolvedLabels} — ${excerpt}` : resolvedLabels;
+
   // P4/C10: 结构化深度槽并入 evidence，让深度随发现一并进 ActiveContext 并流向 Producer。
   const depthBlock = buildDepthBlock(params);
-  const evidenceWithDepth = depthBlock
-    ? evidence
-      ? `${evidence}\n${depthBlock}`
-      : depthBlock
-    : evidence;
+  const evidenceWithDepth = depthBlock ? `${evidence}\n${depthBlock}` : evidence;
 
   const scopeId =
     typeof ctx.runtime?.dimensionScopeId === 'string' && ctx.runtime.dimensionScopeId.trim()
       ? ctx.runtime.dimensionScopeId
       : undefined;
   const result = normalizeNoteFindingResult(
-    ctx.memoryCoordinator.noteFinding(finding, evidenceWithDepth, importance, round, scopeId),
+    ctx.memoryCoordinator.noteFinding(finding, evidenceWithDepth, importance, round, scopeId, refs),
     importance,
     scopeId
   );

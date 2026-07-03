@@ -96,6 +96,10 @@ function toExecutableToolCall(call: ToolCall): ToolCall {
       action: 'note_finding',
       params: {
         finding: call.args.finding,
+        // E3：引用契约=台账 ID 数组；excerpt 为可选短摘。旧 evidence 字符串一并透传，
+        // 由 handler 统一给出迁移拒绝提示（不在改写层静默吞掉）。
+        evidenceRefs: call.args.evidenceRefs,
+        excerpt: call.args.excerpt,
         evidence: call.args.evidence,
         importance: call.args.importance,
       },
@@ -414,6 +418,7 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       sessionToolCalls: projectSessionToolCalls(loopCtx),
       bootstrapDedup: loopCtx.sharedState?._bootstrapDedup || null,
       memoryCoordinator: loopCtx.memoryCoordinator || null,
+      evidenceLedger: loopCtx.evidenceLedger || null,
       dimensionScopeId: resolveDimensionScopeId(loopCtx),
       currentRound: loopCtx.iteration || 0,
     },

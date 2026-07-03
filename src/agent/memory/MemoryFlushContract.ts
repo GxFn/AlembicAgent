@@ -13,7 +13,13 @@ import type { Finding } from './SessionStore.js';
 
 /** ActiveContext.distill() 的结构化返回类型 */
 export interface DistilledContext {
-  keyFindings: Array<{ finding: string; evidence: string; importance: number }>;
+  keyFindings: Array<{
+    finding: string;
+    evidence: string;
+    importance: number;
+    /** 证据台账条目 id（Wave A E3）——随发现流向 Producer/评估器的程序化引用 */
+    evidenceRefs?: string[];
+  }>;
   toolCallSummary: string[];
   stats: {
     totalRounds: number;
