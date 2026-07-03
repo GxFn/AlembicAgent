@@ -43,8 +43,9 @@
  *   | evolution    | Evolution analysis       | Pipeline    | Budget+Quality   |
  */
 
-// ── Capabilities(W6-c:别名层删除,直引 toolsets;CodeAnalysis/KnowledgeProduction/
-// SystemInteraction 三别名公共名随删——全空间零消费实证,签名快照同批 regen)──
+// ── Capabilities(W6-c:别名层删除,直引 toolsets;三个旧别名公共名
+// (Code-Analysis/Knowledge-Production/System-Interaction 词形)随删——
+// 全空间零消费实证,签名快照同批 regen)──
 export { Capability } from '../tools/runtime/toolsets/Capability.js';
 export { CapabilityRegistry } from '../tools/runtime/toolsets/CapabilityRegistry.js';
 export { Conversation } from '../tools/runtime/toolsets/Conversation.js';
