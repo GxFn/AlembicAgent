@@ -188,6 +188,24 @@ export class EvidenceLedgerStore {
     return all.slice(Math.max(0, all.length - limit));
   }
 
+  /** 台账内检索（E4 evidence.search）：路径片段或内容关键词，大小写不敏感，按采集序返回 */
+  search(query: string, limit = 8): EvidenceEntry[] {
+    const needle = query.toLowerCase();
+    const hits: EvidenceEntry[] = [];
+    for (const entry of this.#entries.values()) {
+      if (
+        entry.file?.toLowerCase().includes(needle) ||
+        entry.content.toLowerCase().includes(needle)
+      ) {
+        hits.push(entry);
+        if (hits.length >= limit) {
+          break;
+        }
+      }
+    }
+    return hits;
+  }
+
   #hydrate(): void {
     if (!existsSync(this.filePath)) {
       return;

@@ -98,15 +98,26 @@ export interface ToolDiagnosticsRecorder {
 }
 
 /**
- * 证据台账只读端口（Wave A E3）——结构化 LIKE 型，避免 kernel→agent 反向依赖
- * （同 MemoryCoordinatorLike 先例）。note_finding 录入校验与近似候选提示用。
+ * 证据台账只读端口（Wave A E3/E4）——结构化 LIKE 型，避免 kernel→agent 反向依赖
+ * （同 MemoryCoordinatorLike 先例）。note_finding 录入校验、近似候选提示与
+ * evidence.get/search 只读取回共用。
  */
 export interface EvidenceLedgerLike {
   get(ref: string): {
     id: string;
     file?: string;
     range?: { start: number; end: number };
+    content: string;
   } | null;
+  search(
+    query: string,
+    limit?: number
+  ): Array<{
+    id: string;
+    file?: string;
+    range?: { start: number; end: number };
+    content: string;
+  }>;
   listRecent(limit?: number): Array<{ id: string; file?: string }>;
   stats(): { entries: number; distinctFiles: number };
 }

@@ -814,7 +814,7 @@ export class AgentRuntime {
     }
     if (forceSummary) {
       dynamicParts.push(
-        '[系统提示] 已进入最后阶段，请停止调用探索工具，基于已有信息输出总结。若任务要求结构化记录且尚未记录，只允许使用 note_finding({ finding, evidence, importance }) 补齐核心发现。'
+        '[系统提示] 已进入最后阶段，请停止调用探索工具，基于已有信息输出总结。若任务要求结构化记录且尚未记录，只允许使用 note_finding({ finding, evidenceRefs, importance }) 补齐核心发现（evidenceRefs 引用工具返回 [evidence] 标注的条目 id）。'
       );
     }
     const dynamicContext = dynamicParts.length > 0 ? dynamicParts.join('\n\n') : null;
@@ -2140,7 +2140,7 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
   return {
     name: 'note_finding',
     description: recordOnly
-      ? 'Record one structured, evidence-backed key finding. In RECORD/record-repair phase this is the only valid function; call it once per finding and do not output prose.'
+      ? 'Record one structured, evidence-backed key finding. In RECORD/record-repair phase this is the primary function; call it once per finding and do not output prose.'
       : 'Record one structured, evidence-backed key finding for QualityGate. Call it when a finding is verified; do not wait for the final Markdown report.',
     parameters: {
       type: 'object',
@@ -2149,9 +2149,18 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
           type: 'string',
           description: 'Concrete, verifiable finding description.',
         },
-        evidence: {
+        // E3/E4（证据保真）：直呼型 schema 与 memory.note_finding 同契约——引用只能是
+        // 工具返回尾部 [evidence] 标注的台账条目 id；手写 file:line 会被录入校验拒收。
+        evidenceRefs: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          description:
+            'Evidence ledger entry ids cited from [evidence] annotations in tool results, e.g. ["E-3", "E-7@5-12"]. Hand-written file:line strings are rejected.',
+        },
+        excerpt: {
           type: 'string',
-          description: 'Complete relative file path with line number/range, e.g. src/App.ts:42.',
+          description: 'Optional short verbatim excerpt from the cited evidence entries.',
         },
         importance: {
           type: 'number',
@@ -2160,7 +2169,7 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
           maximum: 10,
         },
       },
-      required: ['finding', 'evidence', 'importance'],
+      required: ['finding', 'evidenceRefs', 'importance'],
       additionalProperties: false,
     },
   };

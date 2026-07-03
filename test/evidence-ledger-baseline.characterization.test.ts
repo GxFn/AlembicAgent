@@ -36,11 +36,11 @@ describe('E0 冷启动证据保真基线表征', () => {
     expect(ctx.scratchpadSize).toBe(1);
   });
 
-  test('2) produce 工具面现状无 code/evidence 自救通道', () => {
+  test('2) produce 工具面已含 evidence 只读自救通道（E4 反转：被拒后可取 verbatim 修正引用）', () => {
     const tools = new GenerateProduce().allowedTools;
-    expect(Object.keys(tools).sort()).toEqual(['knowledge', 'memory', 'meta']);
+    expect(Object.keys(tools).sort()).toEqual(['evidence', 'knowledge', 'memory', 'meta']);
     expect(tools.knowledge).toEqual(['submit']);
-    expect(tools.memory).toEqual(['recall']);
+    expect(tools.evidence).toEqual(['get', 'search']);
   });
 
   test('3) RECORD 配额公式与真实证据支撑量脱钩', () => {

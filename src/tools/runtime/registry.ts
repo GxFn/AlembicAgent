@@ -9,6 +9,7 @@
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
 import type { ToolRegistry, ToolSpec } from '#tools/kernel/registry.js';
 import { handle as handleCode } from './handlers/code.js';
+import { handle as handleEvidence } from './handlers/evidence.js';
 import { handle as handleGraph } from './handlers/graph.js';
 import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
@@ -531,6 +532,58 @@ const META_SPEC: ToolSpec = {
 };
 
 /* ================================================================== */
+/*  evidence — 证据台账只读查询（Wave A E4）                             */
+/* ================================================================== */
+
+const EVIDENCE_SPEC: ToolSpec = {
+  name: 'evidence',
+  description:
+    'Evidence ledger (read-only): retrieve verbatim captured evidence by id, or search captured entries. Reading captured evidence is NOT exploration — allowed in RECORD/VERIFY/produce phases.',
+  actions: {
+    get: {
+      summary: 'Retrieve a captured evidence entry verbatim by id',
+      description:
+        'Read back the verbatim content of an evidence-ledger entry cited from [evidence] annotations in tool results. Accepts "E-3" or a sub-range "E-3@5-12". Read-only; never touches the file system.',
+      params: {
+        type: 'object',
+        properties: {
+          ref: {
+            type: 'string',
+            description: 'Entry id, optionally with 1-indexed sub-range: "E-3" / "E-3@5-12"',
+          },
+        },
+        required: ['ref'],
+      },
+      handler: async (p, ctx) => handleEvidence('get', p, ctx),
+      concurrency: 'parallel',
+      risk: 'read-only',
+    },
+    search: {
+      summary: 'Search captured evidence entries by path fragment or content keyword',
+      description:
+        'Search the evidence ledger (already-captured tool results) by file path fragment or content keyword. Returns entry ids with previews; use evidence.get to read full content.',
+      params: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'File path fragment or content keyword',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (1-8, default 8)',
+          },
+        },
+        required: ['query'],
+      },
+      handler: async (p, ctx) => handleEvidence('search', p, ctx),
+      concurrency: 'parallel',
+      risk: 'read-only',
+    },
+  },
+};
+
+/* ================================================================== */
 /*  Registry export                                                    */
 /* ================================================================== */
 
@@ -541,6 +594,7 @@ export const TOOL_REGISTRY: ToolRegistry = {
   graph: GRAPH_SPEC,
   memory: MEMORY_SPEC,
   meta: META_SPEC,
+  evidence: EVIDENCE_SPEC,
 };
 
 /** 获取所有已注册的工具名 */

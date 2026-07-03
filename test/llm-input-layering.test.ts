@@ -736,7 +736,8 @@ describe('LLM input layering', () => {
     expect(providerLayer).not.toContain('code({ action');
     expect(providerLayer).not.toContain('graph({ action');
     expect(inputText).toContain('## Stage policy');
-    expect(inputText).toContain('Only note_finding is valid');
+    // E4：RECORD 相放行只读 evidence.get/search（查已采证据不是探索）
+    expect(inputText).toContain('Only note_finding and read-only evidence.get/search are valid');
     expect(llmInput?.metadata).toMatchObject({ inputStageProfile: 'record' });
   });
 

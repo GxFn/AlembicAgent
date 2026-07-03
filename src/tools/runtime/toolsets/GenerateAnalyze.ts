@@ -18,6 +18,8 @@ export class GenerateAnalyze extends RuntimeCapability {
       terminal: ['exec'],
       graph: ['overview', 'query'],
       memory: ['save', 'recall', 'note_finding', 'get_previous_evidence'],
+      // E4：证据台账只读取回——查已采证据不是探索，RECORD 相仍可用
+      evidence: ['get', 'search'],
       meta: ['plan'],
     };
   }

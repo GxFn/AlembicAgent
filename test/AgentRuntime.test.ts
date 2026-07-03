@@ -429,8 +429,9 @@ describe('agent runtime forced summary suppression', () => {
     const directSchema = capture.toolSchemas?.find((schema) => schema.name === 'note_finding');
     expect(capture.toolSchemas?.some((schema) => schema.name === 'memory')).toBe(true);
     expect(directSchema).toBeDefined();
+    // E3/E4：直呼型 schema 与 memory.note_finding 同契约——引用只能是台账条目 id
     expect((directSchema?.parameters as { required?: string[] }).required).toEqual(
-      expect.arrayContaining(['finding', 'evidence', 'importance'])
+      expect.arrayContaining(['finding', 'evidenceRefs', 'importance'])
     );
   });
 

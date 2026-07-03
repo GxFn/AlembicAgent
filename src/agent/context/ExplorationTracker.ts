@@ -95,6 +95,15 @@ export class ExplorationTracker {
     consecutiveIdleRounds: 0,
   };
 
+  /**
+   * 证据台账统计刷新（Wave A E4）——RECORD 配额钳制的数据源。
+   * 由 evidenceCapture 中间件在每次落账后调用；非维度运行（无台账）从不调用，
+   * ledgerDistinctFiles 缺席时配额回退原公式（行为等价改造前）。
+   */
+  noteLedgerStats(stats: { distinctFiles: number }): void {
+    this.#metrics.ledgerDistinctFiles = stats.distinctFiles;
+  }
+
   // ── 阶段控制 ──
   /** 是否刚完成阶段转换（用于 pending nudge） */
   #justTransitioned = false;

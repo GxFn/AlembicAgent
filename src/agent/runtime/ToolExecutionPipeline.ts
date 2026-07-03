@@ -662,6 +662,8 @@ export const evolutionDecisionGate = {
 const RECORD_REPAIR_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_previous_evidence']);
 const ANALYST_VERIFY_CODE_ACTIONS = new Set(['read', 'outline']);
 const ANALYST_VERIFY_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_previous_evidence']);
+/** E4：证据台账只读 action——查已采证据不是探索，RECORD/VERIFY 相放行 */
+const EVIDENCE_READ_ACTIONS = new Set(['get', 'search']);
 const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
   'class',
   'protocol',
@@ -699,7 +701,8 @@ export const recordRepairOnlyGate = {
     const action = getToolAction(call);
     if (
       isDirectNoteFindingCall(call) ||
-      (call.name === 'memory' && RECORD_REPAIR_MEMORY_ACTIONS.has(action))
+      (call.name === 'memory' && RECORD_REPAIR_MEMORY_ACTIONS.has(action)) ||
+      (call.name === 'evidence' && EVIDENCE_READ_ACTIONS.has(action))
     ) {
       return undefined;
     }
@@ -708,7 +711,7 @@ export const recordRepairOnlyGate = {
       blocked: true,
       result: {
         error:
-          'Record repair is note_finding-only. Use note_finding({ finding, evidence, importance }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
+          'Record repair is note_finding-only (plus read-only evidence.get/search). Use note_finding({ finding, evidenceRefs, importance }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
       },
     };
   },
@@ -734,6 +737,10 @@ export const analystVerifyOnlyGate = {
     const params = getToolParams(call);
 
     if (call.name === 'code' && ANALYST_VERIFY_CODE_ACTIONS.has(action)) {
+      return undefined;
+    }
+
+    if (call.name === 'evidence' && EVIDENCE_READ_ACTIONS.has(action)) {
       return undefined;
     }
 
@@ -885,6 +892,8 @@ export const evidenceCapture = {
       const entries = captureEvidenceFromEnvelope(ledger, call, envelope);
       if (entries.length > 0) {
         envelope.text = appendEvidenceAnnotation(envelope.text, entries);
+        // E4：刷新 tracker 的台账统计——RECORD 配额受真实证据支撑量钳制（P4 收口）
+        ctx.loopCtx.tracker?.noteLedgerStats(ledger.stats());
       }
     } catch (err: unknown) {
       // 采集异常降级为不落账（等价改造前行为），但降级必须可观测

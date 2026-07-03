@@ -299,7 +299,7 @@ function buildStagePolicySection(
     analyze:
       'Analyze real project evidence with discovery tools, then record confirmed findings with note_finding. Final text must summarize recorded note_finding items only: verified finding ids or next evidence action; do not introduce Markdown-only candidate themes, source context, code, or injected evidence.',
     record:
-      'Record-only phase. Do not perform additional exploration or emit prose. Use note_finding for already verified findings, one finding per call.',
+      'Record-only phase. Do not perform additional exploration or emit prose. Use note_finding for already verified findings, one finding per call, citing evidenceRefs from [evidence] annotations. Read-only evidence.get/search may be used to re-check captured evidence before recording.',
     summarize:
       'Summary-only phase. Stop tool use and produce a concise final answer from recorded note_finding items only for confirmed/core sections. Prior messages may provide wording and evidence context, but unrecorded signals must be downgraded to unstructured/pending notes; do not replay full evidence text or introduce Markdown-only candidate themes.',
     produce:
@@ -333,7 +333,7 @@ function buildToolContractSection(
     analyze:
       'Allowed tools must support evidence gathering, verification, or structured finding capture. Avoid repeated searches and prefer batch reads for known files.',
     record:
-      'Only note_finding is valid in this stage. If no note_finding schema is available, explain that structured recording is blocked.',
+      'Only note_finding and read-only evidence.get/search are valid in this stage. If no note_finding schema is available, explain that structured recording is blocked.',
     summarize: 'No tool calls are valid. Ignore any retained tool schemas and return text only.',
     produce:
       'Use submission tools for candidate creation. code.read, search, graph, terminal, and broad exploration are out of scope for Producer.',

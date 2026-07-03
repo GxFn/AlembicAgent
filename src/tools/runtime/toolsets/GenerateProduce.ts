@@ -16,6 +16,8 @@ export class GenerateProduce extends RuntimeCapability {
     return {
       knowledge: ['submit'],
       memory: ['recall'],
+      // E4：证据台账只读取回——producer 被拒后可取 verbatim 原文修正引用（自救通道）
+      evidence: ['get', 'search'],
       meta: ['review'],
     };
   }

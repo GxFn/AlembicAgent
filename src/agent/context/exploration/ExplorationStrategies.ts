@@ -43,6 +43,8 @@ export interface ExplorationMetrics {
   roundsSinceNewInfo: number;
   /** 连续无任何工具调用的轮次数（用于 grace exit 判定） */
   consecutiveIdleRounds: number;
+  /** 证据台账 distinct 文件数（Wave A E4）——缺席=无台账运行，配额回退原公式 */
+  ledgerDistinctFiles?: number;
 }
 
 /** 探索预算配置 */
@@ -93,8 +95,17 @@ export interface ExplorationStrategy {
   replanInterval: number;
 }
 
-export function targetMemoryFindingCount(m: Pick<ExplorationMetrics, 'evidenceToolCallCount'>) {
-  return Math.max(3, Math.ceil(m.evidenceToolCallCount / 2));
+export function targetMemoryFindingCount(
+  m: Pick<ExplorationMetrics, 'evidenceToolCallCount' | 'ledgerDistinctFiles'>
+) {
+  const base = Math.max(3, Math.ceil(m.evidenceToolCallCount / 2));
+  // E4（P4 收口）：配额受台账真实证据支撑量钳制（distinctFiles×2），
+  // 防止"逼模型超出已验证证据编发现"——真机事故的配额压力放大器。
+  // ledgerDistinctFiles 缺席（无台账运行）回退原公式，行为等价改造前。
+  if (typeof m.ledgerDistinctFiles === 'number' && m.ledgerDistinctFiles >= 0) {
+    return Math.min(base, Math.max(3, m.ledgerDistinctFiles * 2));
+  }
+  return base;
 }
 
 export function targetProducerSubmitCount(
