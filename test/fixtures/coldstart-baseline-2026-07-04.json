@@ -1,0 +1,15 @@
+{
+  "capturedAt": "2026-07-04",
+  "job": "bootstrap_mr5ckv5p_211536ea",
+  "workspace": "ecf32806",
+  "model": "deepseek:deepseek-v4-pro",
+  "tsJsModule": { "submitted": 15, "accepted": 1 },
+  "architecture": { "submitted": 8, "accepted": 2 },
+  "cacheHitRatio": 0.64,
+  "rejectionTop": [
+    "SOURCE_REF_NOT_FOUND",
+    "INSUFFICIENT_EVIDENCE",
+    "STAGE3_CORECODE_INCOMPLETE",
+    "SNIPPET_MISMATCH"
+  ]
+}
