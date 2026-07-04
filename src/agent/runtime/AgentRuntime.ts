@@ -593,6 +593,12 @@ export class AgentRuntime {
       sharedState: (sharedState as Record<string, unknown> | null | undefined) ?? null,
       logger: this.logger,
     });
+    if (evidenceLedger) {
+      // M1a 观测留痕（run-9 残余①）：没有这行就无法区分"变体没生效"与"provider 弱执行嵌套 required"
+      this.logger.info(
+        '[AgentRuntime] dimension submit schema variant active (evidenceRefs required, per-iteration)'
+      );
+    }
 
     const ctx = new LoopContext({
       messages,

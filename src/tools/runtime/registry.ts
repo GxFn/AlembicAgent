@@ -718,6 +718,9 @@ export function applyDimensionSubmitSchemaVariant(
       return schema;
     }
     reasoning.required = ['evidenceRefs'];
+    // run-9 残余①：provider（DeepSeek）对深层嵌套 required 执行弱——把要求同时上提到
+    // 工具 description 顶层观感位，双通道强化（schema 结构面 + 描述面）。
+    clone.description = `${String(clone.description ?? '')} [REQUIRED every submit: params.reasoning.evidenceRefs — cite [evidence] E-x ids from tool results]`;
     const reasoningProps = reasoning.properties as Record<string, unknown> | undefined;
     const sources = reasoningProps?.sources as Record<string, unknown> | undefined;
     if (sources) {

@@ -715,7 +715,9 @@ export class ExplorationTracker {
     this.#justTransitioned = true;
     this.#logger.info(
       `[ExplorationTracker] ${oldPhase} → ${newPhase} (iter=${this.#metrics.iteration}, submits=${this.#metrics.submitCount}, ` +
-        `dwellMs=${dwellMs}, files=${this.#metrics.uniqueFiles.size}, patterns=${this.#metrics.uniquePatterns.size})`
+        `dwellMs=${dwellMs}, files=${this.#metrics.uniqueFiles.size}, patterns=${this.#metrics.uniquePatterns.size}, ` +
+        // M1 收尾：深度槽观测面——findings/depthSlotted 是 CG-D 加权调参的唯一测量入口
+        `findings=${this.#metrics.memoryFindingCount}, depthSlotted=${this.#metrics.depthSlottedFindingCount ?? 0})`
     );
 
     // Phase 3: 发射阶段转换信号
