@@ -223,3 +223,32 @@ describe('buildViolationRepairTemplates（E7）', () => {
     expect(buildViolationRepairTemplates([{ code: 'SNIPPET_MISMATCH' }], allowlist)).toBe('');
   });
 });
+
+describe('replaceCoreCodeFromSources（E7-D SNIPPET 确定性替换）', () => {
+  test('首个可解析带区间 source 的真实内容覆盖 coreCode；无区间/越界返回 null', async () => {
+    const { replaceCoreCodeFromSources } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'corecode-'));
+    fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'lib/a.ts'), 'L1\nconst real = 1;\nL3', 'utf8');
+    const replaced = replaceCoreCodeFromSources(
+      {
+        coreCode: 'model-paraphrased',
+        content: { pattern: 'stale', rationale: 'r' },
+        reasoning: { sources: ['lib/a.ts:2-2'] },
+      },
+      projectRoot
+    );
+    expect(replaced?.coreCode).toBe('const real = 1;');
+    expect((replaced?.content as { pattern: string }).pattern).toBe('const real = 1;');
+    expect((replaced?.content as { rationale: string }).rationale).toBe('r');
+
+    expect(
+      replaceCoreCodeFromSources({ reasoning: { sources: ['lib/a.ts'] } }, projectRoot)
+    ).toBeNull();
+    expect(
+      replaceCoreCodeFromSources({ reasoning: { sources: ['lib/a.ts:99-100'] } }, projectRoot)
+    ).toBeNull();
+  });
+});

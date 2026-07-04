@@ -36,6 +36,7 @@ import {
   expandEvidenceRefsForSubmit,
   isStyleRepairable,
   repairStyleViolations,
+  replaceCoreCodeFromSources,
   sanitizeSubmissionEvidence,
 } from './submitEvidenceExpansion.js';
 
@@ -462,6 +463,24 @@ async function handleSubmit(
         gateViolations = normalized.violations;
       }
     }
+    // E7-D：F4c 未消化的 SNIPPET_MISMATCH→程序直接用首个可解析 source 区间的真实文件内容
+    // 覆盖 coreCode 后重验（引用区间本就是候选声明的证据位置，其真实内容天然逐字匹配）。
+    if (gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+      const replaced = replaceCoreCodeFromSources(effectiveItem, ctx.projectRoot);
+      if (replaced) {
+        const reVerified = runInProcessRecipeAuthoringGate(replaced, {
+          projectRoot: ctx.projectRoot,
+          dimensionId: effectiveDimensionId,
+        });
+        if (!reVerified.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+          Logger.getInstance().info(
+            `[knowledge.submit] coreCode deterministically replaced from source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
+          );
+          effectiveItem = replaced;
+          gateViolations = reVerified;
+        }
+      }
+    }
     // F4e：GRAPH_REF_INVALID 且 Analyst 真有 graph 查询证据时，自动注入 reasoning.graphRefs
     // （替模型完成「复制」动作——graphEvidence 来自真实 graph 调用，非编造；为空则保持拒绝）。
     if (gateViolations.some((v) => v.code === 'GRAPH_REF_INVALID')) {
@@ -521,7 +540,7 @@ async function handleSubmit(
     if (gateViolations.length > 0 && isStyleRepairable(gateViolations)) {
       const repairState = ctx.runtime as Record<string, unknown> | undefined;
       const repairAttempts = (repairState?._styleRepairAttempts ?? {}) as Record<string, number>;
-      if ((repairAttempts[titleKey] ?? 0) < 1) {
+      if ((repairAttempts[titleKey] ?? 0) < 2) {
         repairAttempts[titleKey] = (repairAttempts[titleKey] ?? 0) + 1;
         if (repairState) {
           repairState._styleRepairAttempts = repairAttempts;
@@ -543,6 +562,11 @@ async function handleSubmit(
             );
             effectiveItem = repaired;
             gateViolations = reVerified;
+          } else {
+            // 降级必须可观测：修复产物未减少违规（run-5 静默分支补钉）
+            Logger.getInstance().warn(
+              `[style-repair] no improvement for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${gateViolations.length}→${reVerified.length}`
+            );
           }
         }
       }
