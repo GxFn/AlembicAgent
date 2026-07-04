@@ -426,6 +426,19 @@ async function handleSubmit(
       );
     }
 
+    // 核心保证（2026-07-04 用户裁定）：维度运行的 Recipe 必须经关键证据产出——
+    // 台账在场时 reasoning.evidenceRefs 为必填（引用 analyst findings 携带的 [E-x] 条目）；
+    // 纯手写 sources 不再被接受为唯一证据（那正是捏造通道）。非维度运行（无台账）不受此限。
+    if (ctx.runtime?.evidenceLedger && expansion.expandedSources.length === 0) {
+      const hint = buildEvidenceCandidatesHint(ctx.runtime.evidenceLedger);
+      Logger.getInstance().warn(
+        `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): EVIDENCE_REFS_REQUIRED`
+      );
+      return fail(
+        `Validation failed: EVIDENCE_REFS_REQUIRED: 维度运行的候选必须以 reasoning.evidenceRefs 引用台账条目 id（来自 analyst findings 的 [E-x] 标注）——手写 sources 不能作为唯一证据。${hint}`
+      );
+    }
+
     // E7（接受率治理）：手写路径自动矫正（basename 唯一匹配台账真实形态，多仓前缀陷阱机械解）
     // + 证据驱动 scope 收窄（rule/pattern 证据 <3 文件自动 narrow——门禁本就接受该通道）。
     const sanitized = sanitizeSubmissionEvidence(expansion.item, {
@@ -570,6 +583,26 @@ async function handleSubmit(
           }
         }
       }
+    }
+    // 门禁分层（2026-07-04 用户裁定：要证据/价值/深度，不强制格式）：
+    // 硬门=证据接地类（伪造/引用/逐字/重复/必填结构）→ 拒绝，力度不减；
+    // 软门=写作风格类（祈使动词/对比示例/标题泛化/长度）→ 不再阻断——一次修复子调用尝试
+    // 真修后，剩余软违规降为 style advisory 随候选入库（reasoning.styleAdvisories，
+    // Dashboard 人工复核），价值/深度由既有 C4 深度裁判+C8 质量评分继续评判。
+    if (
+      gateViolations.length > 0 &&
+      gateViolations.every((v) => isSoftAuthoringViolation(v.code))
+    ) {
+      const advisories = gateViolations.map((v) => `${v.code}: ${v.message}`);
+      const reasoningObj = (effectiveItem.reasoning ?? {}) as Record<string, unknown>;
+      effectiveItem = {
+        ...effectiveItem,
+        reasoning: { ...reasoningObj, styleAdvisories: advisories },
+      };
+      Logger.getInstance().info(
+        `[knowledge.submit] style advisories attached (non-blocking) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${gateViolations.map((v) => v.code).join(', ')}`
+      );
+      gateViolations = [];
     }
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);

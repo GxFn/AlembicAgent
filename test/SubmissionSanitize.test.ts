@@ -252,3 +252,110 @@ describe('replaceCoreCodeFromSources（E7-D SNIPPET 确定性替换）', () => {
     ).toBeNull();
   });
 });
+
+describe('门禁分层 v2（2026-07-04 用户裁定：证据硬门+风格 advisory 不阻断）', () => {
+  async function submitFixture(overrides: Record<string, unknown>) {
+    const { handle: handleKnowledge } = await import('../src/tools/runtime/handlers/knowledge.js');
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-tier-'));
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-tier-data-'));
+    fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectRoot, 'lib/a.ts'),
+      "import type { X } from './x.js';\nexport const a = 1;\nexport const b = 2;",
+      'utf8'
+    );
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'j1',
+      sessionId: 's1',
+      dimensionId: 'ts-js-module',
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'c1',
+      file: 'lib/a.ts',
+      range: { start: 1, end: 3 },
+      content: "import type { X } from './x.js';\nexport const a = 1;\nexport const b = 2;",
+    });
+    const created: Record<string, unknown>[] = [];
+    const gateway = {
+      create: async (req: { items: Record<string, unknown>[] }) => {
+        created.push(req.items[0]);
+        return {
+          created: [{ id: 'id-1', title: String(req.items[0].title) }],
+          duplicates: [],
+          rejected: [],
+          blocked: [],
+        };
+      },
+    };
+    const params = {
+      title: '类型导入使用 ImportType 严格隔离',
+      description: '模块使用 import type 声明类型级导入，编译后擦除。',
+      content: {
+        markdown:
+          "## 类型导入隔离\n\n模块统一使用 import type 声明类型级导入，TypeScript 编译后完全擦除，不产生任何运行时引用。这样做保证了类型安全与打包体积解耦，消费方不会因为引用类型而意外引入运行时依赖，打包器也能对纯类型模块做彻底的摇树优化。项目中所有仅消费类型的模块都遵循这一约定，形成一致的导入风格与可审计的依赖关系。\n\n```typescript\nimport type { X } from './x.js';\n```\n(来源: lib/a.ts:1-3)\n\n适用于所有仅类型消费场景；运行时需要值时改用普通 import 并显式声明依赖。违反该约定会让类型依赖悄悄变成运行时依赖，增大产物体积并引入不必要的模块加载开销。",
+        rationale:
+          '类型与运行时依赖解耦：import type 编译期完全擦除保证零运行时引用，打包体积可控，且消费方的依赖关系清晰可审计、便于长期维护。',
+      },
+      kind: 'fact',
+      trigger: 'typescript type import',
+      whenClause: '当模块只消费类型不消费运行时值时',
+      doClause: '所有类型级导入都应该用 import type 声明',
+      dontClause: '不要在仅类型消费场景用普通 import 引入类型',
+      reasoning: {
+        whyStandard: '类型导入不产生运行时引用。',
+        sources: ['lib/a.ts:1-3'],
+        confidence: 0.9,
+        evidenceRefs: ['E-1'],
+      },
+      ...overrides,
+    };
+    const ctx = {
+      recipeGateway: gateway,
+      projectRoot,
+      runtime: { evidenceLedger: ledger },
+      sessionStore: null,
+    } as unknown as Parameters<typeof handleKnowledge>[2];
+    const result = await handleKnowledge('submit', params, ctx);
+    return { result, created };
+  }
+
+  test('软违规（非祈使 doClause）不再阻断：advisory 随候选入库', async () => {
+    const { result, created } = await submitFixture({});
+    expect(result.ok).toBe(true);
+    expect(created).toHaveLength(1);
+    const reasoning = created[0].reasoning as { styleAdvisories?: string[] };
+    // 修复子调用无 provider（ctx.runtime.aiProvider 缺席）→ 直接降级 advisory
+    expect(reasoning.styleAdvisories?.length).toBeGreaterThan(0);
+    // 中文 doClause → DO_CLAUSE_NON_ENGLISH（软）；对比块缺失 CONTENT_CONTRAST_MISSING（软）
+    expect(reasoning.styleAdvisories?.join(' ')).toContain('DO_CLAUSE_NON_ENGLISH');
+  });
+
+  test('维度运行缺 evidenceRefs：EVIDENCE_REFS_REQUIRED 硬拒（核心保证）', async () => {
+    const { result, created } = await submitFixture({
+      reasoning: {
+        whyStandard: 'w',
+        sources: ['lib/a.ts:1-3'],
+        confidence: 0.9,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('EVIDENCE_REFS_REQUIRED');
+    expect(created).toHaveLength(0);
+  });
+
+  test('硬违规（捏造引用）仍全力度拒绝', async () => {
+    const { result, created } = await submitFixture({
+      reasoning: {
+        whyStandard: 'w',
+        sources: ['lib/a.ts:1-3'],
+        confidence: 0.9,
+        evidenceRefs: ['E-99'],
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('无法解析');
+    expect(created).toHaveLength(0);
+  });
+});
