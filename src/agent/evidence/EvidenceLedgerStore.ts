@@ -15,7 +15,7 @@
  *   seq 续接最大序号不重号。
  */
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   EVIDENCE_ENTRY_MAX_CHARS,
@@ -268,4 +268,66 @@ export class EvidenceLedgerStore {
     }
     appendFileSync(this.filePath, `${stableStringifyEntry(entry)}\n`, 'utf8');
   }
+}
+
+/**
+ * M4（跨维综合）：把同一 job 目录下兄弟维度的台账条目 seed 进本维度 store——
+ * 合成维度由此获得全部维度的证据视野（get/search/note_finding/展开全链复用，零新类）。
+ * 条目经 append 重编号（E-1..E-n 连续 id 空间，parseEvidenceRef 语法不变）、重脱敏重截断
+ * （内容已是脱敏后形态，二次处理幂等）；callId 带来源维度前缀保留溯源。
+ * 任何单文件读取失败只跳过该文件（合成宁可少证据不可断跑）。
+ */
+export function seedLedgerFromJobSiblings(
+  store: EvidenceLedgerStore,
+  options: {
+    dataRoot: string;
+    jobId: string;
+    selfDimensionId: string;
+    logger?: Pick<Console, 'warn'>;
+  }
+): number {
+  const dir = join(options.dataRoot, '.asd', 'evidence-ledger', options.jobId);
+  if (!existsSync(dir)) {
+    return 0;
+  }
+  let seeded = 0;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.jsonl') || name === `${options.selfDimensionId}.jsonl`) {
+      continue;
+    }
+    const sourceDim = name.slice(0, -'.jsonl'.length);
+    try {
+      const lines = readFileSync(join(dir, name), 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) {
+          continue;
+        }
+        const entry = JSON.parse(line) as {
+          id?: string;
+          tool?: string;
+          callId?: string;
+          file?: string;
+          range?: { start: number; end: number };
+          content?: string;
+        };
+        if (!entry.tool || typeof entry.content !== 'string') {
+          continue;
+        }
+        store.append({
+          // 兄弟文件由同版本 store 写出，tool 必属合法枚举；此处断言仅为跨文件反序列化收窄
+          tool: entry.tool as EvidenceToolId,
+          callId: `seed:${sourceDim}:${entry.id ?? entry.callId ?? 'unknown'}`,
+          ...(entry.file ? { file: entry.file } : {}),
+          ...(entry.range ? { range: entry.range } : {}),
+          content: entry.content,
+        });
+        seeded += 1;
+      }
+    } catch (err: unknown) {
+      options.logger?.warn(
+        `[EvidenceLedger] seed skip ${name}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+  return seeded;
 }

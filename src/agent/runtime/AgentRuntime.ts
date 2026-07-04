@@ -39,7 +39,7 @@ import {
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { limitToolResult } from '../context/ContextWindow.js';
-import { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
+import { EvidenceLedgerStore, seedLedgerFromJobSiblings } from '../evidence/EvidenceLedgerStore.js';
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
@@ -586,9 +586,16 @@ export class AgentRuntime {
     );
 
     // 证据台账（Wave A E2）：dataRoot+维度身份齐备才创建；缺任一=null（非维度场景零影响面）
+    // M4 前置：宿主经 sharedState 传 bootstrap 会话 id——同会话全部维度共享台账目录，
+    // 跨维综合 pass 才能 seed 兄弟维度证据；缺席回退实例级 fallback（行为等价旧版）。
+    const sharedSessionKey = (sharedState as Record<string, unknown> | null | undefined)
+      ?._bootstrapSessionId;
     const evidenceLedger = buildEvidenceLedgerForLoop({
       dataRoot: this.#dataRoot,
-      jobId: this.#evidenceJobId,
+      jobId:
+        typeof sharedSessionKey === 'string' && sharedSessionKey
+          ? sharedSessionKey
+          : this.#evidenceJobId,
       sessionId: this.id,
       sharedState: (sharedState as Record<string, unknown> | null | undefined) ?? null,
       logger: this.logger,
@@ -2754,13 +2761,27 @@ function buildEvidenceLedgerForLoop(options: {
     return null;
   }
   try {
-    return new EvidenceLedgerStore({
+    const store = new EvidenceLedgerStore({
       dataRoot: options.dataRoot,
       jobId: options.jobId,
       sessionId: options.sessionId,
       dimensionId,
       redactor: redactDeveloperText,
     });
+    // M4（跨维综合）：合成维度冷启动时 seed 同 job 兄弟维度的全部台账证据——
+    // 仅在本维文件为空时执行（producer 二次 reactLoop hydrate 到非空文件即跳过，防重复 seed）。
+    if (dimensionId === 'cross-dimension-synthesis' && store.stats().entries === 0) {
+      const seeded = seedLedgerFromJobSiblings(store, {
+        dataRoot: options.dataRoot,
+        jobId: options.jobId,
+        selfDimensionId: dimensionId,
+        logger: options.logger,
+      });
+      (options.logger as Pick<Console, 'warn'> & { info?: (msg: string) => void }).info?.(
+        `[EvidenceLedger] synthesis seeded ${seeded} sibling entries (job=${options.jobId})`
+      );
+    }
+    return store;
   } catch (err: unknown) {
     // 台账初始化失败不阻断主循环——降级为无台账（等价改造前行为），降级必须可观测
     options.logger.warn('[EvidenceLedger] init failed; continuing without ledger', {
