@@ -359,3 +359,48 @@ describe('门禁分层 v2（2026-07-04 用户裁定：证据硬门+风格 adviso
     expect(created).toHaveLength(0);
   });
 });
+
+describe('EVIDENCE_REFS_REQUIRED 以 resolvedRefs 判定（run-6 无 file 条目误杀回归钉）', () => {
+  test('引用有效但全为无 file 条目（search 类）：不触发 EVIDENCE_REFS_REQUIRED，手写 sources 走门禁', async () => {
+    const { expandEvidenceRefsForSubmit } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'labelless-'));
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'j2',
+      sessionId: 's2',
+      dimensionId: 'ts-js-module',
+    });
+    // 模拟 run-6 实况：code.search 采集条目无 file/range（原样多文件命中文本）
+    ledger.append({
+      tool: 'code.search',
+      callId: 'c-search',
+      content: '3 matches\nlib/a.ts:1: import type { X }\nlib/b.ts:2: export const y',
+    });
+    const expansion = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { evidenceRefs: ['E-1'], sources: ['lib/a.ts:1-1'] } },
+      { ledger, projectRoot: '/nonexistent-root-not-touched' }
+    );
+    expect(expansion.ok).toBe(true);
+    if (expansion.ok) {
+      // 关键分离：引用解析成功（证据在场）但展不出 file:line 标签
+      expect(expansion.resolvedRefs).toBe(1);
+      expect(expansion.expandedSources).toHaveLength(0);
+    }
+  });
+
+  test('refs 缺席时 resolvedRefs=0（EVIDENCE_REFS_REQUIRED 仍拦截该形态）', async () => {
+    const { expandEvidenceRefsForSubmit } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const expansion = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { sources: ['lib/a.ts:1-1'] } },
+      { ledger: null, projectRoot: '/tmp' }
+    );
+    expect(expansion.ok).toBe(true);
+    if (expansion.ok) {
+      expect(expansion.resolvedRefs).toBe(0);
+    }
+  });
+});

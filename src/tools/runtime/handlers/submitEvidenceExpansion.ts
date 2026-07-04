@@ -19,7 +19,10 @@ import Logger from '@alembic/core/logging';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
 
 export type SubmitExpansionResult =
-  | { ok: true; item: Record<string, unknown>; expandedSources: string[] }
+  // resolvedRefs=成功解析的台账引用数（含无 file 的 search/structure/terminal 条目）；
+  // expandedSources 只含带区间条目产出的 file:start-end 标签。二者分离是 EVIDENCE_REFS_REQUIRED
+  // 判定的关键：引用了真实台账证据但全为无标签条目 ≠ 没给证据（run-6 误杀教训）。
+  | { ok: true; item: Record<string, unknown>; expandedSources: string[]; resolvedRefs: number }
   | { ok: false; error: string };
 
 function uniqueMerge(base: unknown, extra: string[]): string[] {
@@ -54,7 +57,7 @@ export function expandEvidenceRefsForSubmit(
     : [];
   if (refs.length === 0) {
     // 未用新契约提交：路径完全不变（additive——手填 reasoning.sources 仍由门禁 fs 校验兜底）
-    return { ok: true, item, expandedSources: [] };
+    return { ok: true, item, expandedSources: [], resolvedRefs: 0 };
   }
   const ledger = options.ledger;
   if (!ledger) {
@@ -67,6 +70,7 @@ export function expandEvidenceRefsForSubmit(
 
   const labels: string[] = [];
   let firstRangedContent: string | null = null;
+  let resolvedRefs = 0;
   for (const ref of refs) {
     const entry = ledger.get(ref);
     if (!entry) {
@@ -79,6 +83,7 @@ export function expandEvidenceRefsForSubmit(
         error: `Validation failed: reasoning.evidenceRefs 无法解析 "${ref}"（只能引用工具返回 [evidence] 标注的台账条目 id）。近期条目: ${recent || '(台账为空——先用 code/graph 工具采集证据)'}`,
       };
     }
+    resolvedRefs += 1;
     if (entry.file && entry.range) {
       // 新鲜度终检：文件缺失/不可读与哈希不一致同判 stale——引用的采集内容已不再代表当前源码
       const absolute = join(options.projectRoot, entry.file);
@@ -117,6 +122,7 @@ export function expandEvidenceRefsForSubmit(
   return {
     ok: true,
     expandedSources: labels,
+    resolvedRefs,
     item: {
       ...item,
       coreCode,
@@ -447,19 +453,31 @@ export function buildEvidenceCandidatesHint(ledger: EvidenceLedgerLike | null | 
   if (stats.distinctFiles === 0) {
     return '';
   }
+  // 优先展示带文件区间的条目（可直接照抄 id 且能机械展开出 sources）；无区间条目只作文件名兜底。
+  const ranged: string[] = [];
   const files: string[] = [];
   const seen = new Set<string>();
   for (const candidate of ledger.listRecent(50)) {
-    if (candidate.file && !seen.has(candidate.file)) {
-      seen.add(candidate.file);
+    if (!candidate.file || seen.has(candidate.file)) {
+      continue;
+    }
+    seen.add(candidate.file);
+    if (candidate.range && ranged.length < 5) {
+      ranged.push(
+        `${candidate.id}=${candidate.file}:${candidate.range.start}-${candidate.range.end}`
+      );
+    } else if (files.length < 5) {
       files.push(candidate.file);
-      if (files.length >= 5) {
-        break;
-      }
+    }
+    if (ranged.length >= 5) {
+      break;
     }
   }
-  if (files.length === 0) {
+  if (ranged.length === 0 && files.length === 0) {
     return '';
   }
-  return ` 📎 台账内可引用的 distinct 文件(共 ${stats.distinctFiles} 个): ${files.join(', ')} —— 用 evidence.search 查条目 id 并以 reasoning.evidenceRefs 引用（多仓工作区路径必须含仓库前缀，台账条目已是正确形态，引用 id 最稳，不要凭记忆手写路径）。`;
+  const rangedPart = ranged.length > 0 ? ` 可直接引用的带区间条目: ${ranged.join('; ')}。` : '';
+  const filesPart =
+    files.length > 0 ? ` 其余可引用文件(共 ${stats.distinctFiles} 个): ${files.join(', ')}。` : '';
+  return ` 📎${rangedPart}${filesPart} 用 memory.recall 查看 findings 携带的 [E-x] 或 evidence.search 查条目 id，以 reasoning.evidenceRefs 引用（优先带文件区间的条目；引用 id 最稳，不要凭记忆手写路径）。`;
 }

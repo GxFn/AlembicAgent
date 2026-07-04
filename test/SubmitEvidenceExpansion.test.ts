@@ -68,7 +68,7 @@ describe('expandEvidenceRefsForSubmit（E5 机械展开）', () => {
     const { projectRoot, ledger } = makeProject();
     const item = { title: 'T', reasoning: { sources: ['a.ts:1'] } };
     const result = expandEvidenceRefsForSubmit(item, { ledger, projectRoot });
-    expect(result).toEqual({ ok: true, item, expandedSources: [] });
+    expect(result).toEqual({ ok: true, item, expandedSources: [], resolvedRefs: 0 });
   });
 
   test('无台账：显式拒绝提示改填 sources', () => {

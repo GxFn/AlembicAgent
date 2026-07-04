@@ -429,13 +429,27 @@ async function handleSubmit(
     // 核心保证（2026-07-04 用户裁定）：维度运行的 Recipe 必须经关键证据产出——
     // 台账在场时 reasoning.evidenceRefs 为必填（引用 analyst findings 携带的 [E-x] 条目）；
     // 纯手写 sources 不再被接受为唯一证据（那正是捏造通道）。非维度运行（无台账）不受此限。
-    if (ctx.runtime?.evidenceLedger && expansion.expandedSources.length === 0) {
+    // 判定用 resolvedRefs 而非 expandedSources：search/structure/terminal 类条目无 file 字段、
+    // 展不出 file:line 标签，但它们是真实采集证据——run-6 曾按 expandedSources=0 误杀这类
+    // 忠实引用（重试三连拒到止损）。source 数量下限仍由下游 INSUFFICIENT_EVIDENCE 把守。
+    if (ctx.runtime?.evidenceLedger && expansion.resolvedRefs === 0) {
       const hint = buildEvidenceCandidatesHint(ctx.runtime.evidenceLedger);
       Logger.getInstance().warn(
         `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): EVIDENCE_REFS_REQUIRED`
       );
       return fail(
-        `Validation failed: EVIDENCE_REFS_REQUIRED: 维度运行的候选必须以 reasoning.evidenceRefs 引用台账条目 id（来自 analyst findings 的 [E-x] 标注）——手写 sources 不能作为唯一证据。${hint}`
+        `Validation failed: EVIDENCE_REFS_REQUIRED: 维度运行的候选必须以 reasoning.evidenceRefs 引用台账条目 id（先 memory.recall 查看 findings 携带的 [E-x] 标注，优先引用带文件区间的条目）——手写 sources 不能作为唯一证据。${hint}`
+      );
+    }
+    if (
+      ctx.runtime?.evidenceLedger &&
+      expansion.resolvedRefs > 0 &&
+      expansion.expandedSources.length === 0
+    ) {
+      // 引用全为无 file 条目（search/terminal 类）：证据在场但机械展开不出 sources——
+      // 放行进门禁，手写 sources 照常走 fs 校验+自动矫正；留痕以便真机复盘该形态占比。
+      Logger.getInstance().info(
+        `[knowledge.submit] evidence refs valid but label-less (${expansion.resolvedRefs} refs, search/terminal 类) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
       );
     }
 

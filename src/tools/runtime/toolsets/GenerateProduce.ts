@@ -29,7 +29,9 @@ export class GenerateProduce extends RuntimeCapability {
 【必须——硬性，缺失即拒】
 1. 每个候选对应一个已确认 finding；reasoning.evidenceRefs 必填——直接照抄该 finding 证据串里的
    E-x id（证据串 "E-3=lib/a.ts:5-7" → evidenceRefs: ["E-3"]）。sources 与 coreCode 由台账机械
-   展开并做新鲜度校验；维度运行中没有 evidenceRefs 的提交会被直接拒绝
+   展开并做新鲜度校验；维度运行中没有 evidenceRefs 的提交会被直接拒绝。**优先引用带文件区间的
+   条目**（形如 E-x=file:5-12，能机械展开出 sources）；若引用只有 search/terminal 类条目（无
+   文件区间），必须同时在 reasoning.sources 手填该证据里出现的真实 file:line（仍会被逐条校验）
 2. 事实只能来自 findings/台账证据：不得引入证据之外的断言；无 graph 查询证据不做调用链断言
 3. 必填字段齐全：title、description（中文 ≤80 字引用真实类名）、content.markdown、
    content.rationale、kind（rule/pattern/fact）、trigger、whenClause、doClause
