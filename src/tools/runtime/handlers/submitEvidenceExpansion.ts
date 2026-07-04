@@ -213,8 +213,52 @@ export function sanitizeSubmissionEvidence(
     return kept.length > 0 ? kept : list;
   };
 
-  const sources = sanitizeList(reasoning.sources);
-  const sourceRefs = sanitizeList(item.sourceRefs);
+  // 行号机械回填（run-7 M2）：无标签引用（search 类）放行后，手写 source 常缺 :line 触发
+  // SOURCE_REF_LINE_MISSING。引用条目里其实有真实行号——ranged 条目同文件用其区间；
+  // search 类条目 content 的 `path:NN:` 命中行用首个命中。回填只用被引用条目的采集内容
+  // （机械真值，不是模型猜测），无法回填的保持原样交门禁给权威拒绝。
+  const refs = Array.isArray(reasoning.evidenceRefs)
+    ? (reasoning.evidenceRefs as unknown[]).filter(
+        (ref): ref is string => typeof ref === 'string' && ref.trim().length > 0
+      )
+    : [];
+  const backfillLine = (source: string): string => {
+    if (/:\d+(?:-\d+)?$/.test(source.trim())) {
+      return source;
+    }
+    const filePart = source.trim();
+    for (const ref of refs) {
+      const entry = ledger.get(ref);
+      if (!entry) {
+        continue;
+      }
+      if (entry.file && entry.range) {
+        if (entry.file === filePart || entry.file.endsWith(`/${filePart}`)) {
+          corrected.push(`${source}→${entry.file}:${entry.range.start}-${entry.range.end}`);
+          return `${entry.file}:${entry.range.start}-${entry.range.end}`;
+        }
+        continue;
+      }
+      if (!entry.file) {
+        // search 输出形态 `path:NN: text`——按行扫描找该文件的首个命中行，采集路径形态优先
+        for (const line of entry.content.split('\n')) {
+          const hit = /^(.+?):(\d+):/.exec(line);
+          if (!hit) {
+            continue;
+          }
+          const hitPath = hit[1].trim();
+          if (hitPath === filePart || hitPath.endsWith(`/${filePart}`)) {
+            corrected.push(`${source}→${hitPath}:${hit[2]}-${hit[2]}`);
+            return `${hitPath}:${hit[2]}-${hit[2]}`;
+          }
+        }
+      }
+    }
+    return source;
+  };
+
+  const sources = sanitizeList(reasoning.sources).map(backfillLine);
+  const sourceRefs = sanitizeList(item.sourceRefs).map(backfillLine);
 
   // 证据驱动 scope 收窄（仅在未显式声明时）
   const kind = typeof item.kind === 'string' ? item.kind.toLowerCase() : '';

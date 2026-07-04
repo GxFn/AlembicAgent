@@ -390,6 +390,51 @@ describe('EVIDENCE_REFS_REQUIRED 以 resolvedRefs 判定（run-6 无 file 条目
     }
   });
 
+  test('行号机械回填（run-7 M2）：缺 :line 的手写 source 从引用条目回填真实行号', async () => {
+    const { sanitizeSubmissionEvidence } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-'));
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-root-'));
+    for (const rel of ['src/tools/index.ts', 'src/agent/index.ts', 'src/other.ts']) {
+      fs.mkdirSync(path.dirname(path.join(projectRoot, rel)), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, rel), 'export {};\n', 'utf8');
+    }
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'j3',
+      sessionId: 's3',
+      dimensionId: 'ts-js-module',
+    });
+    ledger.append({
+      tool: 'code.search',
+      callId: 'c-s',
+      content: '2 matches\nsrc/tools/index.ts:37: export * from "./kernel.js"\nsrc/other.ts:5: x',
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'c-r',
+      file: 'src/agent/index.ts',
+      range: { start: 10, end: 20 },
+      content: 'ranged content',
+    });
+    const out = sanitizeSubmissionEvidence(
+      {
+        title: 't',
+        reasoning: {
+          evidenceRefs: ['E-1', 'E-2'],
+          // 三形态：search 命中回填 / ranged 条目同文件回填 / 已带行号不动
+          sources: ['src/tools/index.ts', 'src/agent/index.ts', 'src/other.ts:5-5'],
+        },
+      },
+      { ledger, projectRoot }
+    );
+    const sources = (out.item.reasoning as { sources: string[] }).sources;
+    expect(sources).toContain('src/tools/index.ts:37-37');
+    expect(sources).toContain('src/agent/index.ts:10-20');
+    expect(sources).toContain('src/other.ts:5-5');
+  });
+
   test('refs 缺席时 resolvedRefs=0（EVIDENCE_REFS_REQUIRED 仍拦截该形态）', async () => {
     const { expandEvidenceRefsForSubmit } = await import(
       '../src/tools/runtime/handlers/submitEvidenceExpansion.js'

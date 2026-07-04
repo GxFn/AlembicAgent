@@ -54,6 +54,8 @@ export class GenerateProduce extends RuntimeCapability {
 关键规则:
 - 不使用终端工具；不做新的代码探索（evidence.get/search 是查已采证据，不算探索）
 - 每个独立发现单独提交，不要把多个 finding 揉进一个候选
+- 候选必须对应 finding 或台账证据：想提交 findings 之外的综合断言时，先用 evidence.search
+  找到支撑条目并引用；找不到证据的断言直接放弃。被拒后改标题重提同一断言无效
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 
 ${super.promptFragment}`;
