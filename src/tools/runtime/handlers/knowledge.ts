@@ -716,7 +716,15 @@ async function handleSubmit(
       });
     }
 
+    // gateway 层三类非 created 结果统一留痕（run-8 复盘缺口：查重/拒绝/blocked 全静默，
+    // 报告 rejected 计数与日志拒因对不上号——饱和 KB 下 duplicate 是主要暗拒来源）。
     if (result.duplicates.length > 0) {
+      Logger.getInstance().warn(
+        `[knowledge.submit] gateway duplicate for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): similar to ${result.duplicates
+          .map((d) => `"${d.title}"`)
+          .slice(0, 3)
+          .join(', ')}`
+      );
       return ok({
         status: 'duplicate_blocked',
         similar: result.duplicates.map((d) => ({
@@ -729,6 +737,9 @@ async function handleSubmit(
 
     if (result.rejected.length > 0) {
       const rejected = result.rejected[0];
+      Logger.getInstance().warn(
+        `[knowledge.submit] gateway rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${String(rejected.reason ?? '')}`
+      );
       const details = [
         `Rejected: ${rejected.reason}`,
         ...(Array.isArray(rejected.errors) ? rejected.errors : []),
@@ -740,6 +751,9 @@ async function handleSubmit(
     }
 
     if (result.blocked.length > 0) {
+      Logger.getInstance().warn(
+        `[knowledge.submit] gateway blocked by consolidation "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+      );
       return fail(
         `Blocked by consolidation: ${(result.blocked[0] as { title?: string }).title ?? 'unknown'}`
       );
