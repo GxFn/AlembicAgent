@@ -153,12 +153,27 @@ function normalizeDrafts(
     }
   }
 
-  const file =
+  let file =
     typeof call.args?.path === 'string'
       ? call.args.path
       : typeof call.args?.file === 'string'
         ? call.args.file
         : undefined;
+  // M2/P1c：terminal.exec 归属——命令 argv 里首个"看起来是仓内相对路径"的 token 作为 file
+  // （cat/head/sed/ls 目标）。只做词法判定不触磁盘（capture 在热路径）；错误归属由提交侧
+  // fs 校验兜底。绝对路径/URL/选项不取。
+  if (!file && typeof call.args?.command === 'string') {
+    for (const token of call.args.command.split(/\s+/).slice(1)) {
+      if (
+        /^[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+$/.test(token) &&
+        !token.startsWith('/') &&
+        !token.includes('://')
+      ) {
+        file = token;
+        break;
+      }
+    }
+  }
   const content =
     envelope.text ||
     (envelope.structuredContent !== undefined

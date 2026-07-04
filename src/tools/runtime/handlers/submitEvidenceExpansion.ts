@@ -107,7 +107,24 @@ export function expandEvidenceRefsForSubmit(
       }
       labels.push(`${entry.file}:${entry.range.start}-${entry.range.end}`);
     } else if (entry.file) {
-      labels.push(entry.file);
+      // M2/P1b：file-有-range-无（per-file search 条目，content 每行 "NN: text" 是采集真值）——
+      // 机械派生首 K=2 个命中行为 file:NN-NN 标签，search 证据升为一等公民（可直接过 LINE 门）。
+      // 无行号前缀的 file-only 条目保持旧行为（裸文件标签，交下游门禁裁决）。
+      const hitLines: string[] = [];
+      for (const line of entry.content.split('\n')) {
+        const hit = /^(\d+):/.exec(line.trim());
+        if (hit) {
+          hitLines.push(`${entry.file}:${hit[1]}-${hit[1]}`);
+          if (hitLines.length >= 2) {
+            break;
+          }
+        }
+      }
+      if (hitLines.length > 0) {
+        labels.push(...hitLines);
+      } else {
+        labels.push(entry.file);
+      }
     }
     // 无 file 条目（graph/terminal）：合法引用但不产出 source 标签——门禁的证据下限由带文件条目满足
   }

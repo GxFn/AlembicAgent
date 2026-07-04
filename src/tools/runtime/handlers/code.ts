@@ -114,10 +114,18 @@ async function handleSearch(
   }
 
   const deduped = deduplicateMatches(allMatches).slice(0, maxResults);
-  const output = formatSearchOutput(deduped, totalCount);
 
-  return ok(output, {
-    tokensEstimate: estimateTokens(output),
+  // M2/P1a（挖掘产出升级）：结构化返回 matches——EvidenceCapture 的 per-file 分组分支
+  // 读 structuredContent.matches（EvidenceCapture.ts:138-154），此前只返回格式化字符串导致
+  // 分支永不触发、search 证据全部落成无 file 台账条目（run-6 误杀链的采集端根因）。
+  // 模型可见文本随 adapter 约定变为 JSON（与 code.read batch 同一约定，字段本就更可解析）。
+  const data = {
+    total: totalCount,
+    shown: deduped.length,
+    matches: deduped,
+  };
+  return ok(data, {
+    tokensEstimate: estimateTokens(JSON.stringify(data)),
     durationMs: Date.now() - startMs,
     ...(fellBack ? { fallbackUsed: true } : {}),
   });
@@ -314,11 +322,6 @@ function deduplicateMatches(matches: SearchMatch[]): SearchMatch[] {
     seen.add(key);
     return true;
   });
-}
-
-function formatSearchOutput(matches: SearchMatch[], total: number): string {
-  const lines = matches.map((m) => `${m.file}:${m.line}: ${m.content}`);
-  return `${total} matches (showing ${matches.length})\n\n${lines.join('\n')}`;
 }
 
 /* ================================================================== */

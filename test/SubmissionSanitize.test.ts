@@ -449,3 +449,69 @@ describe('EVIDENCE_REFS_REQUIRED 以 resolvedRefs 判定（run-6 无 file 条目
     }
   });
 });
+
+describe('M2 采集形态（search 一等公民 + terminal 归属）', () => {
+  test('P1b：file-有-range-无的 search 条目派生首 2 命中行标签', async () => {
+    const { expandEvidenceRefsForSubmit } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'm2-derive-'));
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'j4',
+      sessionId: 's4',
+      dimensionId: 'ts-js-module',
+    });
+    // per-file search 采集形态：file 在场、无 range、content 行首 "NN: text"
+    ledger.append({
+      tool: 'code.search',
+      callId: 'c-pf',
+      file: 'lib/a.ts',
+      content: '3: export const a = 1;\n17: export const b = 2;\n29: export const c = 3;',
+    });
+    const out = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { evidenceRefs: ['E-1'] } },
+      { ledger, projectRoot: '/no-fs-touch' }
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.expandedSources).toEqual(['lib/a.ts:3-3', 'lib/a.ts:17-17']);
+      expect(out.resolvedRefs).toBe(1);
+    }
+  });
+
+  test('P1c：terminal.exec 命令内仓相对路径 token 归属为 file', async () => {
+    const { captureEvidenceFromEnvelope } = await import(
+      '../src/agent/evidence/EvidenceCapture.js'
+    );
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'm2-term-'));
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'j5',
+      sessionId: 's5',
+      dimensionId: 'architecture',
+    });
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      {
+        id: 'c-t',
+        name: 'terminal',
+        args: { action: 'exec', command: 'cat config/layer-contract.json' },
+      } as never,
+      { ok: true, text: '{ "layers": [] }' } as never
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0].file).toBe('config/layer-contract.json');
+    // 绝对路径/URL 不归属
+    const none = captureEvidenceFromEnvelope(
+      ledger,
+      {
+        id: 'c-t2',
+        name: 'terminal',
+        args: { action: 'exec', command: 'curl https://x.dev/a.ts' },
+      } as never,
+      { ok: true, text: 'ok' } as never
+    );
+    expect(none[0]?.file).toBeUndefined();
+  });
+});
