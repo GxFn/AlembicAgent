@@ -37,6 +37,8 @@ export interface ExplorationMetrics {
   memoryFindingCount: number;
   /** M1c：带非空深度槽的发现数（可选——旧快照/测试夹具缺席时按 0 处理） */
   depthSlottedFindingCount?: number;
+  /** M3：至少一个引用带文件区间的发现数（可选——缺席时按 memoryFindingCount 处理，行为等价旧版） */
+  verifiedFindingCount?: number;
   evidenceToolCallCount: number;
   totalToolCalls: number;
   searchRoundsInPhase: number;
@@ -116,10 +118,16 @@ export function targetMemoryFindingCount(
  * 加权部分以 memoryFindingCount 为上限（防御历史快照字段漂移）。
  */
 export function effectiveMemoryFindingCount(
-  m: Pick<ExplorationMetrics, 'memoryFindingCount' | 'depthSlottedFindingCount'>
+  m: Pick<
+    ExplorationMetrics,
+    'memoryFindingCount' | 'depthSlottedFindingCount' | 'verifiedFindingCount'
+  >
 ) {
-  const slotted = Math.min(m.depthSlottedFindingCount ?? 0, m.memoryFindingCount);
-  return m.memoryFindingCount + 0.5 * slotted;
+  // M3：配额基数只认 verified（引用带文件区间）——未核实线索不抵配额，逼 VERIFY 补采。
+  // verifiedFindingCount 缺席（旧快照/夹具/无台账运行）回退 memoryFindingCount（行为等价）。
+  const base = Math.min(m.verifiedFindingCount ?? m.memoryFindingCount, m.memoryFindingCount);
+  const slotted = Math.min(m.depthSlottedFindingCount ?? 0, base);
+  return base + 0.5 * slotted;
 }
 
 export function targetProducerSubmitCount(

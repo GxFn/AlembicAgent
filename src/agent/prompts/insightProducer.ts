@@ -259,15 +259,31 @@ export function buildProducerPromptV2(
   }
 
   // §3 结构化发现
+  // M3（VERIFY 机械化）："已确认"只渲染 verified 发现（evidence 串带 [unverified:] 标记的
+  // 是引用无文件区间的未核实线索——单列低信区，禁止作为候选唯一证据）。
   if (artifact.findings?.length > 0) {
+    const isUnverified = (f: { evidence?: string }) =>
+      typeof f.evidence === 'string' && f.evidence.includes('[unverified:');
+    const verifiedFindings = artifact.findings.filter((f) => !isUnverified(f));
+    const unverifiedFindings = artifact.findings.filter(isUnverified);
     const findingLines = ['## 关键发现 (Analyst 已确认)'];
-    const sorted = [...artifact.findings].sort((a, b) => b.importance - a.importance);
+    const sorted = [...verifiedFindings].sort((a, b) => b.importance - a.importance);
     for (const f of sorted) {
       const badge = f.importance >= 8 ? '⚠️' : '📋';
       findingLines.push(`${badge} **[${f.importance}/10]** ${f.finding}`);
       if (f.evidence) {
         findingLines.push(`  证据: ${f.evidence}`);
       }
+    }
+    if (unverifiedFindings.length > 0) {
+      findingLines.push('');
+      findingLines.push('### ⚠️ 未核实线索（引用无文件区间——不得作为候选的唯一证据）');
+      for (const f of unverifiedFindings) {
+        findingLines.push(`- [${f.importance}/10] ${f.finding}`);
+      }
+      findingLines.push(
+        '如需基于以上线索提交候选：先用 evidence.search 找到带文件区间的支撑条目并引用，否则放弃该线索。'
+      );
     }
     findingLines.push('');
     findingLines.push(

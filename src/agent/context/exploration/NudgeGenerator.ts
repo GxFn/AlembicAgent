@@ -432,8 +432,17 @@ export class NudgeGenerator {
       case 'SCAN':
         return '当前处于轻量计划阶段：基于已注入的项目快照整理分析路线，不要调用工具重复获取项目概览或目录结构。';
 
-      case 'VERIFY':
-        return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
+      case 'VERIFY': {
+        // M3：未核实发现（引用全无文件区间）在本相补采——code.read 关键文件后用带区间的
+        // 新 [E-x] 重新 note_finding；未核实线索不计配额、producer 不作"已确认"消费。
+        const unverifiedCount =
+          m.memoryFindingCount - (m.verifiedFindingCount ?? m.memoryFindingCount);
+        const unverifiedHint =
+          unverifiedCount > 0
+            ? `已有 ${unverifiedCount} 条发现未核实（引用无文件区间）：先 code.read 其声称的关键文件，再用带区间的新 [E-x] 重新 note_finding——未核实线索不计配额。`
+            : '';
+        return `当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。${unverifiedHint}`;
+      }
 
       case 'RECORD':
         return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，当前进度 ${effectiveMemoryFindingCount(m)}（已记 ${m.memoryFindingCount} 条，含深度槽 ${m.depthSlottedFindingCount ?? 0} 条计 1.5）。importance ≥7 必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs），内容须与证据一致。`;

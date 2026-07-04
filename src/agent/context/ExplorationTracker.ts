@@ -89,6 +89,7 @@ export class ExplorationTracker {
     submitCount: 0,
     memoryFindingCount: 0,
     depthSlottedFindingCount: 0,
+    verifiedFindingCount: 0,
     roundsSinceNewInfo: 0,
     roundsSinceSubmit: 0,
     iteration: 0,
@@ -362,6 +363,11 @@ export class ExplorationTracker {
       const target = resultObj?.target;
       if (!hasError && recorded && target === 'activeContext') {
         this.#metrics.memoryFindingCount++;
+        // M3（VERIFY 机械化）：verified=handler 判定"至少一个引用带文件区间"。
+        // verified!==false 计入（true 或 undefined=无台账运行，保持旧行为等价）。
+        if (resultObj?.verified !== false) {
+          this.#metrics.verifiedFindingCount = (this.#metrics.verifiedFindingCount ?? 0) + 1;
+        }
         // M1c（挖掘产出升级）：深度槽计数——带任一非空深度槽的发现享受配额加权（CG-D 1.5）。
         // args 形态：直呼型 note_finding 平铺；memory 工具嵌在 params 内。
         const slotCarrier = (
@@ -614,6 +620,7 @@ export class ExplorationTracker {
       submitCount: this.#metrics.submitCount,
       memoryFindingCount: this.#metrics.memoryFindingCount,
       depthSlottedFindingCount: this.#metrics.depthSlottedFindingCount,
+      verifiedFindingCount: this.#metrics.verifiedFindingCount,
       evidenceToolCallCount: this.#metrics.evidenceToolCallCount,
       uniqueFiles: this.#metrics.uniqueFiles.size,
       uniquePatterns: this.#metrics.uniquePatterns.size,
@@ -717,7 +724,7 @@ export class ExplorationTracker {
       `[ExplorationTracker] ${oldPhase} → ${newPhase} (iter=${this.#metrics.iteration}, submits=${this.#metrics.submitCount}, ` +
         `dwellMs=${dwellMs}, files=${this.#metrics.uniqueFiles.size}, patterns=${this.#metrics.uniquePatterns.size}, ` +
         // M1 收尾：深度槽观测面——findings/depthSlotted 是 CG-D 加权调参的唯一测量入口
-        `findings=${this.#metrics.memoryFindingCount}, depthSlotted=${this.#metrics.depthSlottedFindingCount ?? 0})`
+        `findings=${this.#metrics.memoryFindingCount}, verified=${this.#metrics.verifiedFindingCount ?? 0}, depthSlotted=${this.#metrics.depthSlottedFindingCount ?? 0})`
     );
 
     // Phase 3: 发射阶段转换信号

@@ -126,7 +126,12 @@ async function handleNoteFinding(
   // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存，降级显式标注。
   const ledger = ctx.runtime?.evidenceLedger;
   let resolvedLabels: string;
+  // M3（VERIFY 机械化）：verified=至少一个引用解析到带 file+range 的条目（read 类采集）。
+  // 全为 search/structure/terminal 类引用的发现是"未核实线索"——配额不计、producer 不作
+  // "已确认"渲染；VERIFY 相 nudge 引导 code.read 补采后重记。无台账运行保持 undefined（不参与判定）。
+  let verified: boolean | undefined;
   if (ledger) {
+    verified = false;
     const labels: string[] = [];
     for (const ref of refs) {
       const entry = ledger.get(ref);
@@ -139,6 +144,9 @@ async function handleNoteFinding(
           `evidenceRefs 无法解析: "${ref}" 不在证据台账（只能引用工具返回里 [evidence] 标注的条目 id）。近期条目: ${recent || '(台账为空——先用 code/graph 工具采集证据)'}`
         );
       }
+      if (entry.file && entry.range) {
+        verified = true;
+      }
       labels.push(
         entry.file
           ? entry.range
@@ -148,7 +156,9 @@ async function handleNoteFinding(
       );
     }
     // evidence 字符串由台账机械展开生成（模型不再手写 file:line）——下游投影零改动即携带准确引用
-    resolvedLabels = labels.join('; ');
+    resolvedLabels = verified
+      ? labels.join('; ')
+      : `${labels.join('; ')} [unverified: 证据均无文件区间——用 code.read 补采关键文件后重记]`;
   } else {
     resolvedLabels = `${refs.join('; ')} (unverified: no evidence ledger in this run)`;
   }
@@ -175,7 +185,8 @@ async function handleNoteFinding(
     return fail(result.message);
   }
 
-  return ok(result);
+  // M3：verified 随结果外露——tracker 据此计 verifiedFindingCount（配额只认核实过的发现）
+  return ok(verified === undefined ? result : { ...result, verified });
 }
 
 function normalizeNoteFindingResult(
