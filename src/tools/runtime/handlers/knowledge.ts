@@ -34,6 +34,8 @@ import {
   buildEvidenceCandidatesHint,
   buildViolationRepairTemplates,
   expandEvidenceRefsForSubmit,
+  isStyleRepairable,
+  repairStyleViolations,
   sanitizeSubmissionEvidence,
 } from './submitEvidenceExpansion.js';
 
@@ -512,6 +514,37 @@ async function handleSubmit(
           `[knowledge.submit] style waiver accepted (${waiver.waivedCodes.join(', ')}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), session waivers=${waiverTotal + 1}/${STYLE_WAIVER_SESSION_LIMIT} — pending human review`
         );
         gateViolations = [];
+      }
+    }
+    // E7-R（接受率 100% 最后一级）：纯风格类拒绝→一次 schema 收窄的修复子调用后重跑门禁
+    // （每 title 限 1 次；任何失败零影响走原拒绝路径）。证据类违规不修——那是事实问题不是写法问题。
+    if (gateViolations.length > 0 && isStyleRepairable(gateViolations)) {
+      const repairState = ctx.runtime as Record<string, unknown> | undefined;
+      const repairAttempts = (repairState?._styleRepairAttempts ?? {}) as Record<string, number>;
+      if ((repairAttempts[titleKey] ?? 0) < 1) {
+        repairAttempts[titleKey] = (repairAttempts[titleKey] ?? 0) + 1;
+        if (repairState) {
+          repairState._styleRepairAttempts = repairAttempts;
+        }
+        const repaired = await repairStyleViolations(
+          effectiveItem,
+          gateViolations,
+          ctx.runtime?.aiProvider,
+          getImperativeVerbAllowlist()
+        );
+        if (repaired) {
+          const reVerified = runInProcessRecipeAuthoringGate(repaired, {
+            projectRoot: ctx.projectRoot,
+            dimensionId: effectiveDimensionId,
+          });
+          if (reVerified.length < gateViolations.length) {
+            Logger.getInstance().info(
+              `[knowledge.submit] style repair sub-call fixed "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): violations ${gateViolations.length}→${reVerified.length}`
+            );
+            effectiveItem = repaired;
+            gateViolations = reVerified;
+          }
+        }
       }
     }
     if (gateViolations.length > 0) {

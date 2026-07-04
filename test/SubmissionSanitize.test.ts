@@ -133,6 +133,78 @@ describe('sanitizeSubmissionEvidence（E7）', () => {
   });
 });
 
+describe('repairStyleViolations（E7-R 修复子调用）', () => {
+  const allowlist = { positive: ['使用', '统一'], negative: ['避免'] };
+  const item = {
+    title: 'T',
+    doClause: '所有类型导入必须 import type',
+    content: { markdown: '正文', rationale: 'r' },
+  };
+
+  test('provider 返回窄 JSON→仅合并给定字段', async () => {
+    const { repairStyleViolations } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const provider = {
+      chat: async () => '前置说明 {"doClause":"使用 import type 隔离类型导入"} 后缀',
+    };
+    const repaired = await repairStyleViolations(
+      item,
+      [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }],
+      provider,
+      allowlist
+    );
+    expect(repaired?.doClause).toBe('使用 import type 隔离类型导入');
+    expect(repaired?.title).toBe('T');
+    expect((repaired?.content as { rationale: string }).rationale).toBe('r');
+  });
+
+  test('provider 缺席/返回垃圾/抛错→null（零影响原拒绝路径）', async () => {
+    const { repairStyleViolations } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    expect(
+      await repairStyleViolations(item, [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }], null, allowlist)
+    ).toBeNull();
+    expect(
+      await repairStyleViolations(
+        item,
+        [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }],
+        { chat: async () => 'no json here' },
+        allowlist
+      )
+    ).toBeNull();
+    expect(
+      await repairStyleViolations(
+        item,
+        [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }],
+        {
+          chat: async () => {
+            throw new Error('boom');
+          },
+        },
+        allowlist
+      )
+    ).toBeNull();
+  });
+
+  test('isStyleRepairable：纯风格类 true，混证据类 false', async () => {
+    const { isStyleRepairable } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    expect(
+      isStyleRepairable([
+        { code: 'DO_CLAUSE_NON_IMPERATIVE' },
+        { code: 'CONTENT_CONTRAST_MISSING' },
+      ])
+    ).toBe(true);
+    expect(
+      isStyleRepairable([{ code: 'DO_CLAUSE_NON_IMPERATIVE' }, { code: 'SOURCE_REF_NOT_FOUND' }])
+    ).toBe(false);
+    expect(isStyleRepairable([])).toBe(false);
+  });
+});
+
 describe('buildViolationRepairTemplates（E7）', () => {
   test('风格/措辞类违规给出照抄即过模板；无命中返回空串', () => {
     const allowlist = { positive: ['使用', '统一', '禁止'], negative: ['避免', '不要'] };

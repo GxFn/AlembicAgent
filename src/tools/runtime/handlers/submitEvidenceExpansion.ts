@@ -260,6 +260,115 @@ export function buildViolationRepairTemplates(
   return parts.length > 0 ? ` 🔧 ${parts.join(' ｜ ')}` : '';
 }
 
+/** 可由修复子调用处理的纯风格/措辞类拒因（证据类不在内——那是事实问题不是写法问题） */
+const REPAIRABLE_STYLE_CODES = new Set([
+  'DO_CLAUSE_NON_IMPERATIVE',
+  'CONTENT_CONTRAST_MISSING',
+  'GRAPH_REF_INVALID',
+  'STAGE3_TITLE_TOO_GENERIC',
+  'STAGE3_MARKDOWN_TOO_SHORT',
+]);
+
+export function isStyleRepairable(violations: Array<{ code: string }>): boolean {
+  return violations.length > 0 && violations.every((v) => REPAIRABLE_STYLE_CODES.has(v.code));
+}
+
+function extractFirstJsonObject(text: string): Record<string, unknown> | null {
+  const start = text.indexOf('{');
+  if (start < 0) {
+    return null;
+  }
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === '{') {
+      depth++;
+    } else if (text[i] === '}') {
+      depth--;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(text.slice(start, i + 1)) as unknown;
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * E7-R 修复子调用（接受率 100% 的最后一级）：纯风格类拒绝时发起一次 schema 收窄的 LLM
+ * 修复——只返回需要修改的字段 JSON，其余字段程序保留原值，修复后由调用方重跑权威门禁。
+ * E6 三跑证明拒绝反馈+模板都无法稳定驱动 DeepSeek 自修（DO_CLAUSE 连续三跑最高频）；
+ * 把「重写整个候选」压缩为「填 2 个字段」后服从面大幅收窄。任何失败返回 null（绝不阻断原拒绝路径）。
+ */
+export async function repairStyleViolations(
+  item: Record<string, unknown>,
+  violations: Array<{ code: string; message?: string }>,
+  provider: unknown,
+  allowlist: { positive: string[]; negative: string[] }
+): Promise<Record<string, unknown> | null> {
+  const chat = (
+    provider as
+      | { chat?: (prompt: string, context?: Record<string, unknown>) => Promise<string> }
+      | null
+      | undefined
+  )?.chat;
+  if (typeof chat !== 'function') {
+    return null;
+  }
+  const content = (item.content ?? {}) as Record<string, unknown>;
+  const markdown = typeof content.markdown === 'string' ? content.markdown : '';
+  const prompt = [
+    '你是候选修复器。以下知识候选被写作风格门禁拒绝，修复它——只改被拒字段，保留全部事实与引用。',
+    `违规: ${violations.map((v) => `${v.code}${v.message ? `(${v.message.slice(0, 80)})` : ''}`).join('; ')}`,
+    `候选字段: ${JSON.stringify(
+      {
+        title: item.title,
+        doClause: item.doClause,
+        dontClause: item.dontClause,
+        markdown: markdown.slice(0, 1800),
+      },
+      null,
+      0
+    )}`,
+    `修复要求: doClause 必须以下列动词之一开头(${allowlist.positive.slice(0, 12).join('/')}；否定式 ${allowlist.negative.slice(0, 6).join('/')})；`,
+    'CONTENT_CONTRAST_MISSING→在 markdown 追加"✅ 正确：<真实做法> (来源: 沿用原文引用)\\n❌ 错误：<反例>\\n违反后果：<一句>"；',
+    'GRAPH_REF_INVALID→把调用链断言(callers/invokes/调用链)改写为静态描述(导入/依赖/组合)或删除该句；',
+    '只返回一个 JSON 对象，仅含需要修改的字段(可选键: title, doClause, dontClause, markdown)，不要任何其它文字。',
+  ].join('\n');
+  try {
+    const raw = await chat(prompt, { maxTokens: 1600, temperature: 0 });
+    const fixed = extractFirstJsonObject(String(raw ?? ''));
+    if (!fixed) {
+      return null;
+    }
+    const pick = (key: string): string | null =>
+      typeof fixed[key] === 'string' && (fixed[key] as string).trim()
+        ? (fixed[key] as string)
+        : null;
+    const nextTitle = pick('title');
+    const nextDo = pick('doClause');
+    const nextDont = pick('dontClause');
+    const nextMarkdown = pick('markdown');
+    if (!nextTitle && !nextDo && !nextDont && !nextMarkdown) {
+      return null;
+    }
+    return {
+      ...item,
+      ...(nextTitle ? { title: nextTitle } : {}),
+      ...(nextDo ? { doClause: nextDo } : {}),
+      ...(nextDont ? { dontClause: nextDont } : {}),
+      ...(nextMarkdown ? { content: { ...content, markdown: nextMarkdown } } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * INSUFFICIENT_EVIDENCE 拒绝反馈增强（E5）：告诉模型台账里真实可引用的 distinct 文件
  * （此前只说 "add 3 distinct files" 不说去哪找——修不动的拒绝即无效拒绝）。
