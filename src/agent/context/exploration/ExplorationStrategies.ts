@@ -35,6 +35,8 @@ export interface ExplorationMetrics {
   iteration: number;
   submitCount: number;
   memoryFindingCount: number;
+  /** M1c：带非空深度槽的发现数（可选——旧快照/测试夹具缺席时按 0 处理） */
+  depthSlottedFindingCount?: number;
   evidenceToolCallCount: number;
   totalToolCalls: number;
   searchRoundsInPhase: number;
@@ -106,6 +108,18 @@ export function targetMemoryFindingCount(
     return Math.min(base, Math.max(3, m.ledgerDistinctFiles * 2));
   }
   return base;
+}
+
+/**
+ * M1c（挖掘产出升级，CG-D=1.5）：深度加权发现数——带深度槽（designIntent/boundaries/
+ * failureModes/tradeoffs 任一非空）的发现计 1.5，激励「为什么/边界/越界后果」而非凑数量。
+ * 加权部分以 memoryFindingCount 为上限（防御历史快照字段漂移）。
+ */
+export function effectiveMemoryFindingCount(
+  m: Pick<ExplorationMetrics, 'memoryFindingCount' | 'depthSlottedFindingCount'>
+) {
+  const slotted = Math.min(m.depthSlottedFindingCount ?? 0, m.memoryFindingCount);
+  return m.memoryFindingCount + 0.5 * slotted;
 }
 
 export function targetProducerSubmitCount(
@@ -238,9 +252,10 @@ export const STRATEGY_ANALYST = {
         m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0,
     },
     'RECORD→SUMMARIZE': {
-      onMetrics: (m: ExplorationMetrics) => m.memoryFindingCount >= targetMemoryFindingCount(m),
+      onMetrics: (m: ExplorationMetrics) =>
+        effectiveMemoryFindingCount(m) >= targetMemoryFindingCount(m),
       onTextResponse: (m: ExplorationMetrics) =>
-        m.memoryFindingCount >= targetMemoryFindingCount(m),
+        effectiveMemoryFindingCount(m) >= targetMemoryFindingCount(m),
     },
   },
   getToolChoice: (phase: ExplorationPhase, m: ExplorationMetrics, b: ExplorationBudget) => {

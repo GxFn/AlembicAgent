@@ -242,7 +242,13 @@ export function buildProducerPromptV2(
   panorama?: ProducerPanoramaContext | null,
   toolPolicyHints?: Record<string, unknown> | null,
   /** G3: 冷启动预计算的加权统计/结构证据（命名前缀占比、继承热点等），供「为什么这样选」引用 */
-  evidenceStarters?: ReadonlyArray<{ hint: string; data: unknown; strength?: number }> | null
+  evidenceStarters?: ReadonlyArray<{ hint: string; data: unknown; strength?: number }> | null,
+  /** M1b（挖掘产出升级 P5a）：本维度已入库知识标题——查重视野，模式中性（bootstrap 饱和库/rescan 皆可） */
+  existingDimensionTitles?: ReadonlyArray<{
+    id?: string;
+    title: string;
+    trigger?: string;
+  }> | null
 ) {
   const parts: string[] = [];
 
@@ -417,6 +423,29 @@ export function buildProducerPromptV2(
     dLines.push('注意: supersedes 提交会创建观察窗口（72h），不是立即替换。');
     dLines.push('替换的新 Recipe 必须基于当前代码，不要复制旧 Recipe 内容。');
     parts.push(dLines.join('\n'));
+  }
+
+  // §9c（M1b 挖掘产出升级）：已入库知识查重视野——模式中性（不带 rescan 预算语义）。
+  // 饱和库上 producer 此前对已有知识全盲，盲写→gateway 静默拒重烧整回合；rescan 模式
+  // 已有 §9a 渲染同类信息时跳过本节避免重复。
+  if (
+    (!rescanContext || !(rescanContext.existingRecipes?.length > 0)) &&
+    existingDimensionTitles &&
+    existingDimensionTitles.length > 0
+  ) {
+    const kLines = [
+      '## 📚 本维度已入库知识（查重视野）',
+      '以下标题已存在，实质相同的发现不要重复提交（会被查重拒绝，浪费提交回合）：',
+    ];
+    for (const r of existingDimensionTitles.slice(0, 15)) {
+      kLines.push(
+        `- ${r.id ? `[${r.id}] ` : ''}"${r.title}"${r.trigger ? `（trigger: ${r.trigger}）` : ''}`
+      );
+    }
+    kLines.push(
+      '仅当你的证据明显更全/更新且确有增量时，才带 supersedes:<已有条目 id> 提交升级版；否则跳过换下一个发现。'
+    );
+    parts.push(kLines.join('\n'));
   }
 
   return compactProducerPromptParts(parts).join('\n\n');

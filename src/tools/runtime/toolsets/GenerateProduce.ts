@@ -37,7 +37,9 @@ export class GenerateProduce extends RuntimeCapability {
    content.rationale、kind（rule/pattern/fact）、trigger、whenClause、doClause
 
 【价值与深度——这是候选的价值所在，由深度裁判与质量评分评判】
-4. 讲清「为什么这样设计 / 越界会发生什么 / 放弃了什么换来什么」，每个深度断言挂真实引用
+4. 讲清「为什么这样设计 / 越界会发生什么 / 放弃了什么换来什么」，每个深度断言挂真实引用；
+   finding 若携带深度槽（designIntent/boundaries/failureModes/tradeoffs），把槽位内容展开成
+   正文小节，不要丢弃
 5. 项目特写风格正文（真实类名/模块名/数据流），不写通用教科书内容
 
 【建议——不阻断提交；缺失会作为 style advisory 随候选记录，供人工复核】
@@ -56,6 +58,8 @@ export class GenerateProduce extends RuntimeCapability {
 - 每个独立发现单独提交，不要把多个 finding 揉进一个候选
 - 候选必须对应 finding 或台账证据：想提交 findings 之外的综合断言时，先用 evidence.search
   找到支撑条目并引用；找不到证据的断言直接放弃。被拒后改标题重提同一断言无效
+- 提交返回 duplicate_blocked 时按 similar 列表路由：与已有知识实质相同→跳过换下一个 finding；
+  你的证据更全/更新且确有增量→带 supersedes:<已有条目 id> 重提一次，否则不要反复提交
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 
 ${super.promptFragment}`;

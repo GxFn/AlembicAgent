@@ -24,6 +24,7 @@
 
 import type { SignalBus } from '@alembic/core/events';
 import Logger from '@alembic/core/logging';
+import { DEPTH_SLOT_KEYS } from '../../tools/runtime/registry.js';
 import type {
   ExplorationBudget,
   ExplorationPhase,
@@ -87,6 +88,7 @@ export class ExplorationTracker {
     evidenceToolCallCount: 0,
     submitCount: 0,
     memoryFindingCount: 0,
+    depthSlottedFindingCount: 0,
     roundsSinceNewInfo: 0,
     roundsSinceSubmit: 0,
     iteration: 0,
@@ -360,6 +362,21 @@ export class ExplorationTracker {
       const target = resultObj?.target;
       if (!hasError && recorded && target === 'activeContext') {
         this.#metrics.memoryFindingCount++;
+        // M1c（挖掘产出升级）：深度槽计数——带任一非空深度槽的发现享受配额加权（CG-D 1.5）。
+        // args 形态：直呼型 note_finding 平铺；memory 工具嵌在 params 内。
+        const slotCarrier = (
+          isDirectNoteFinding ? args : (args?.params as Record<string, unknown> | undefined)
+        ) as Record<string, unknown> | undefined;
+        if (
+          slotCarrier &&
+          DEPTH_SLOT_KEYS.some((key) => {
+            const value = slotCarrier[key];
+            return typeof value === 'string' && value.trim().length > 0;
+          })
+        ) {
+          this.#metrics.depthSlottedFindingCount =
+            (this.#metrics.depthSlottedFindingCount ?? 0) + 1;
+        }
       }
     }
 
@@ -596,6 +613,7 @@ export class ExplorationTracker {
       phaseRounds: this.#metrics.phaseRounds,
       submitCount: this.#metrics.submitCount,
       memoryFindingCount: this.#metrics.memoryFindingCount,
+      depthSlottedFindingCount: this.#metrics.depthSlottedFindingCount,
       evidenceToolCallCount: this.#metrics.evidenceToolCallCount,
       uniqueFiles: this.#metrics.uniqueFiles.size,
       uniquePatterns: this.#metrics.uniquePatterns.size,

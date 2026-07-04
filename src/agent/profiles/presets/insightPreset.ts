@@ -110,7 +110,9 @@ export const INSIGHT_PRESET = {
             ctx.panorama as Parameters<typeof buildProducerPromptV2>[4],
             ctx.toolPolicyHints as Parameters<typeof buildProducerPromptV2>[5],
             // G3: 冷启动预计算统计(bootstrapStrategyFields.evidenceStarters)——量化「为什么这样选」
-            ctx.evidenceStarters as Parameters<typeof buildProducerPromptV2>[6]
+            ctx.evidenceStarters as Parameters<typeof buildProducerPromptV2>[6],
+            // M1b(P5a)：本维度已入库标题——查重视野（主仓 bootstrap dedup seed / rescan 皆可携带）
+            ctx.existingDimensionTitles as Parameters<typeof buildProducerPromptV2>[7]
           ),
         // 拒绝率过高时: 缩减预算 + 特定修复 prompt (对齐旧 ProducerAgent 的 rejection retry)
         retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: PRODUCER_RETRY_TIMEOUT_MS },

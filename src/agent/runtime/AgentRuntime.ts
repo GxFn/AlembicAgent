@@ -32,6 +32,10 @@ import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
 import { isToolResultEnvelope } from '#tools/kernel/index.js';
+import {
+  applyDimensionSubmitSchemaVariant,
+  DEPTH_SLOT_PROPS,
+} from '../../tools/runtime/registry.js';
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { limitToolResult } from '../context/ContextWindow.js';
@@ -853,7 +857,12 @@ export class AgentRuntime {
       }
       return [buildDirectNoteFindingSchema(true)];
     }
-    return withDirectNoteFindingSchema(ctx.toolSchemas, canUseDirectNoteFinding(ctx));
+    // M1a：维度运行（证据台账在场）时对 knowledge.submit 施加契约面变体——
+    // evidenceRefs 必填、sources 降述、scope 自声明；广告面与运行时闸一致（E4/run-6 双教训钉）。
+    const base = ctx.evidenceLedger
+      ? applyDimensionSubmitSchemaVariant(ctx.toolSchemas)
+      : ctx.toolSchemas;
+    return withDirectNoteFindingSchema(base, canUseDirectNoteFinding(ctx));
   }
 
   /**
@@ -2168,6 +2177,9 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
           minimum: 1,
           maximum: 10,
         },
+        // M1c（挖掘产出升级）：直呼型 schema 补齐深度槽——此前只有 registry 面声明，
+        // RECORD 相走本 schema 且 additionalProperties:false，模型物理上无法传槽位（0 使用率根因）。
+        ...DEPTH_SLOT_PROPS,
       },
       required: ['finding', 'evidenceRefs', 'importance'],
       additionalProperties: false,

@@ -42,6 +42,7 @@ export class GenerateAnalyze extends RuntimeCapability {
 - 不要重复搜索相同关键词
 - 调用关系优先用 graph.query(type: "callers")
 - 每发现重要模式/问题，立即调用 note_finding({ finding: "...", evidenceRefs: ["E-12"], importance: 8 })——evidenceRefs 引用工具返回尾部 [evidence] 标注的台账条目 id，手写 file:line 会被拒收；优先引用带文件区间的条目（read 类采集，search 命中后先 read 关键文件再记录）；允许在全局扫描、结构化探索、深度验证阶段就主动提交，不要等到总结阶段
+- importance ≥7 的发现必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs——为什么这样设计/边界在哪/越界会怎样/换来了什么），内容与引用证据一致，按 1.5 条计入配额；读不到真实证据的槽位留空
 - 输出最终报告前，必须确认核心发现已经通过 note_finding 写入；最终 Markdown 不能替代该工具调用；缺少或不足会直接影响 QualityGate 评分并触发 retry；RECORD 阶段只允许补写 note_finding，SUMMARIZE 阶段会停止所有工具
 - 搜索前先用 memory({ action: "get_previous_evidence", params: { query: "类名/文件名" } }) 检查前序维度是否已有发现
 

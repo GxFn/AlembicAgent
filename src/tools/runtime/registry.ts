@@ -22,7 +22,7 @@ import { handle as handleTerminal } from './handlers/terminal.js';
  * 发现时可同步填这些可选槽(各挂真实 file:line)，让 Producer 拿到「为何这样设计 / 越界会怎样」而非只有
  * 「是什么」。可选、非硬性：读不到真实证据的那一维留空即可(绝不诱导编造)。
  */
-const DEPTH_SLOT_PROPS: Record<string, { type: 'string'; description: string }> =
+export const DEPTH_SLOT_PROPS: Record<string, { type: 'string'; description: string }> =
   Object.fromEntries(
     DEPTH_DIMENSIONS.filter((d) => d.key !== 'multiSourceCorroboration').map((d) => [
       d.key,
@@ -686,6 +686,52 @@ function actionScopedParamsSchema(spec: ToolSpec, actionNames: string[]): Record
     type: 'object',
     ...(paramsDescription ? { description: paramsDescription } : {}),
   };
+}
+
+/** M1c：深度槽键名单源（tracker 计数与 schema 面共用）。 */
+export const DEPTH_SLOT_KEYS: string[] = Object.keys(DEPTH_SLOT_PROPS);
+
+/**
+ * M1a（挖掘产出升级）：维度运行的 knowledge.submit schema 变体——契约面=校验面。
+ * run-8 首拒的结构性根源：schema required:['sources'] 与运行时闸（EVIDENCE_REFS_REQUIRED
+ * 要求 evidenceRefs）相反，schema 在主动逼模型手写 sources。变体深拷贝后改写：
+ * reasoning.required=['evidenceRefs']、sources 降述为自动展开、新增 scope 自声明枚举。
+ * 绝不修改注册表静态原件——lightweight schema 按引用直达 provider。
+ * 仅匹配单动作 submit 展开形态（params.properties.reasoning 在场）；多动作摘要形态原样返回。
+ */
+export function applyDimensionSubmitSchemaVariant(
+  schemas: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  return schemas.map((schema) => {
+    if (schema.name !== 'knowledge') {
+      return schema;
+    }
+    const clone = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+    const params = (
+      (clone.parameters as Record<string, unknown> | undefined)?.properties as
+        | Record<string, unknown>
+        | undefined
+    )?.params as Record<string, unknown> | undefined;
+    const props = params?.properties as Record<string, unknown> | undefined;
+    const reasoning = props?.reasoning as Record<string, unknown> | undefined;
+    if (!props || !reasoning) {
+      return schema;
+    }
+    reasoning.required = ['evidenceRefs'];
+    const reasoningProps = reasoning.properties as Record<string, unknown> | undefined;
+    const sources = reasoningProps?.sources as Record<string, unknown> | undefined;
+    if (sources) {
+      sources.description =
+        'Auto-expanded from evidenceRefs by the ledger — do NOT hand-write. Only fill real file:line when citing search/terminal-class evidence entries that carry no file range.';
+    }
+    props.scope = {
+      type: 'string',
+      enum: ['narrow', 'module', 'project'],
+      description:
+        'Evidence-breadth self-declaration. Use "narrow" when evidence spans <3 distinct files (single-file/local rule).',
+    };
+    return clone;
+  });
 }
 
 /** 生成轻量 schema（首轮发给 LLM） */

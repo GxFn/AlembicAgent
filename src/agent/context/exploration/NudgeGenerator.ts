@@ -27,6 +27,7 @@ import type {
 } from './ExplorationStrategies.js';
 import {
   DEFAULT_REFLECTION_INTERVAL,
+  effectiveMemoryFindingCount,
   targetMemoryFindingCount,
   targetProducerSubmitCount,
 } from './ExplorationStrategies.js';
@@ -171,6 +172,7 @@ export class NudgeGenerator {
         `你已完成分析验证。现在进入结构化记录阶段：请**停止调用 code、graph、terminal 等探索工具**。\n` +
         `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidenceRefs, importance }) 记录核心发现；按当前证据量至少记录 ${targetFindingCount} 条，每次工具调用记录 1 条发现。\n` +
         `note_finding 是 QualityGate 的重要质量依据；evidenceRefs 只能引用工具返回尾部 [evidence] 标注的台账条目 id（如 ["E-3","E-7@5-12"]），手写 file:line 会被拒收。缺少或不足会导致 QualityGate retry。\n` +
+        `importance ≥7 的发现必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs——为什么这样设计/边界在哪/越界会怎样/换来了什么），内容须与引用证据一致；带深度槽的发现按 1.5 条计入配额，读不到真实证据的槽位留空。\n` +
         `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`
       );
     }
@@ -434,7 +436,7 @@ export class NudgeGenerator {
         return '当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。';
 
       case 'RECORD':
-        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，已记录 ${m.memoryFindingCount} 条。`;
+        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，当前进度 ${effectiveMemoryFindingCount(m)}（已记 ${m.memoryFindingCount} 条，含深度槽 ${m.depthSlottedFindingCount ?? 0} 条计 1.5）。importance ≥7 必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs），内容须与证据一致。`;
 
       default:
         return null;
