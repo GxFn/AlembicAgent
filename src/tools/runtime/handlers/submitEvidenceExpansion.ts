@@ -15,6 +15,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import Logger from '@alembic/core/logging';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
 
 export type SubmitExpansionResult =
@@ -311,15 +312,16 @@ export async function repairStyleViolations(
   provider: unknown,
   allowlist: { positive: string[]; negative: string[] }
 ): Promise<Record<string, unknown> | null> {
-  const chat = (
-    provider as
-      | { chat?: (prompt: string, context?: Record<string, unknown>) => Promise<string> }
-      | null
-      | undefined
-  )?.chat;
-  if (typeof chat !== 'function') {
+  const providerLike = provider as {
+    chat?: (prompt: string, context?: Record<string, unknown>) => Promise<string>;
+  } | null;
+  if (typeof providerLike?.chat !== 'function') {
+    // 降级必须可观测：provider 缺 chat 面时修复层等于不存在
+    Logger.getInstance().warn('[style-repair] skipped: provider has no chat() surface');
     return null;
   }
+  // 必须 bind——解引用后裸调用会丢 this，provider 实现内部一用 this 即抛 TypeError（run-4 零触发根因）
+  const chat = providerLike.chat.bind(providerLike);
   const content = (item.content ?? {}) as Record<string, unknown>;
   const markdown = typeof content.markdown === 'string' ? content.markdown : '';
   const prompt = [
@@ -344,6 +346,9 @@ export async function repairStyleViolations(
     const raw = await chat(prompt, { maxTokens: 1600, temperature: 0 });
     const fixed = extractFirstJsonObject(String(raw ?? ''));
     if (!fixed) {
+      Logger.getInstance().warn(
+        `[style-repair] unparseable response head: ${String(raw ?? '').slice(0, 120)}`
+      );
       return null;
     }
     const pick = (key: string): string | null =>
@@ -364,7 +369,11 @@ export async function repairStyleViolations(
       ...(nextDont ? { dontClause: nextDont } : {}),
       ...(nextMarkdown ? { content: { ...content, markdown: nextMarkdown } } : {}),
     };
-  } catch {
+  } catch (err: unknown) {
+    // 降级必须可观测：修复子调用失败原样走拒绝路径，但失败原因必须留痕
+    Logger.getInstance().warn(
+      `[style-repair] chat failed: ${err instanceof Error ? err.message : String(err)}`
+    );
     return null;
   }
 }
