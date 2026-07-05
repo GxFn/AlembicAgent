@@ -157,7 +157,7 @@ describe('EvidenceCapture（E2 采集即落盘）', () => {
       { envelope } as unknown as AfterParams[3]
     );
     expect(ledger.stats().entries).toBe(1);
-    expect(envelope.text).toBe('file content here\n\n[evidence] E-1=lib/mw.ts:1-1');
+    expect(envelope.text).toBe('file content here\n\n[evidence] E-1=lib/mw.ts');
 
     // 无台账（非维度场景）：零行为
     const envelope2 = makeEnvelope({ text: 'plain' });
@@ -168,5 +168,88 @@ describe('EvidenceCapture（E2 采集即落盘）', () => {
       { envelope: envelope2 } as unknown as AfterParams[3]
     );
     expect(envelope2.text).toBe('plain');
+  });
+});
+
+describe('run-13 EVIDENCE_STALE 事故回归钉（判据×形态交叉）', () => {
+  test('带 N| 前缀的 full 模式 batch 项：原文入账+range{1..lineCount}+freshness=fresh', () => {
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-pin-'));
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'jp',
+      sessionId: 'sp',
+      dimensionId: 'architecture',
+    });
+    const rawFile = '{\n  "name": "x",\n  "type": "module"\n}';
+    const numbered = rawFile
+      .split('\n')
+      .map((l, i) => `${i + 1}|${l}`)
+      .join('\n');
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      { id: 'c-b', name: 'code', args: { action: 'read', filePaths: ['pkg.json'] } } as never,
+      {
+        ok: true,
+        text: 'batch summary',
+        structuredContent: {
+          mode: 'batch',
+          files: [{ ok: true, path: 'pkg.json', content: numbered, lineCount: 4, mode: 'full' }],
+        },
+      } as never
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0].range).toEqual({ start: 1, end: 4 });
+    // 台账存原文（剥显示前缀）——freshness 原文重切与存储哈希同尺，永不假 stale
+    expect(entries[0].content).toBe(rawFile);
+    expect(ledger.checkFreshness(entries[0].id, rawFile)).toBe('fresh');
+    // range 模式：坐标取项自带 startLine/endLine，omitted 尾行剥除
+    const ranged = captureEvidenceFromEnvelope(
+      ledger,
+      { id: 'c-r', name: 'code', args: { action: 'read', filePaths: ['pkg.json'] } } as never,
+      {
+        ok: true,
+        text: 't',
+        structuredContent: {
+          mode: 'batch',
+          files: [
+            {
+              ok: true,
+              path: 'pkg.json',
+              content:
+                '2|  "name": "x",\n3|  "type": "module"\n... [1 lines omitted; use startLine/endLine for more]',
+              lineCount: 4,
+              mode: 'range',
+              startLine: 2,
+              endLine: 3,
+            },
+          ],
+        },
+      } as never
+    );
+    expect(ranged[0].range).toEqual({ start: 2, end: 3 });
+    expect(ledger.checkFreshness(ranged[0].id, rawFile)).toBe('fresh');
+    // outline/delta 派生视图：诚实降级 file-only（不参与 freshness）
+    const outline = captureEvidenceFromEnvelope(
+      ledger,
+      { id: 'c-o', name: 'code', args: { action: 'read', filePaths: ['big.ts'] } } as never,
+      {
+        ok: true,
+        text: 't',
+        structuredContent: {
+          mode: 'batch',
+          files: [
+            {
+              ok: true,
+              path: 'big.ts',
+              content: '## Outline\n- fn a()',
+              lineCount: 900,
+              mode: 'outline',
+            },
+          ],
+        },
+      } as never
+    );
+    expect(outline[0].file).toBe('big.ts');
+    expect(outline[0].range).toBeUndefined();
   });
 });

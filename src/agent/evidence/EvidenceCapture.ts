@@ -58,6 +58,10 @@ function extractRequestedRange(args: Record<string, unknown>): EvidenceRange | u
 interface FileItem {
   path: string;
   content: string;
+  mode?: string;
+  startLine?: number;
+  endLine?: number;
+  lineCount?: number;
 }
 
 function asFileList(value: unknown): FileItem[] {
@@ -76,6 +80,31 @@ function asFileList(value: unknown): FileItem[] {
     }
   }
   return files;
+}
+
+/**
+ * read 工具 content 是模型显示形态（`N|` 行号前缀，range 模式还带 '... [omitted]' 尾行）。
+ * 台账存 verbatim 原文——freshness 重切用原文切片比哈希，存显示形态会天生 stale
+ * （run-13 EVIDENCE_STALE ×11 事故根因）。仅当每个非空行都带前缀才剥（防误伤原文里的竖线）。
+ */
+function stripReadDisplayDecorations(content: string): string | null {
+  const lines = content.split('\n');
+  const body =
+    lines.length > 0 && /^\.\.\. \[\d+ lines omitted/.test(lines[lines.length - 1] ?? '')
+      ? lines.slice(0, -1)
+      : lines;
+  if (body.length === 0) {
+    return null;
+  }
+  const stripped: string[] = [];
+  for (const line of body) {
+    const m = /^(\d+)\|(.*)$/.exec(line);
+    if (!m) {
+      return null;
+    }
+    stripped.push(m[2]);
+  }
+  return stripped.join('\n');
 }
 
 interface MatchItem {
@@ -124,21 +153,28 @@ function normalizeDrafts(
   if (tool === 'code.read') {
     const files = asFileList(data?.files);
     if (files.length > 0) {
-      const range = extractRequestedRange(call.args);
+      const requestedRange = extractRequestedRange(call.args);
       return files.map((file) => {
-        // 采集回归修复（2026-07-04 用户 run 4/0 复盘）：batch read 无请求区间，条目落成
-        // file-only → M3 判 unverified → producer"已确认"区清零级联全拒。batch 项按内容
-        // 行数补全文区间（content 是采集真值，{1..n} 是它的真实坐标），使 read 条目恒为
-        // 一等 ranged 证据（展开/新鲜度/verified 全链直接可用）。
-        const effectiveRange = range ?? {
-          start: 1,
-          end: Math.max(1, file.content.split('\n').length),
-        };
+        // run-13 EVIDENCE_STALE 事故根修：台账存 verbatim 原文（剥 `N|` 显示前缀与 omitted
+        // 尾行），range 取工具项自带坐标（range 模式 startLine/endLine；full 模式 1..lineCount）
+        // ——freshness 原文重切与存储哈希由此同尺。outline/delta/unchanged 是派生视图非切片，
+        // 诚实降级 file-only（不参与 freshness，verified 判据按 file 在场已放行）。
+        const raw = stripReadDisplayDecorations(file.content);
+        const mode = file.mode ?? '';
+        if (raw !== null && (mode === 'range' || mode === 'full' || mode === '')) {
+          const range =
+            mode === 'range' && file.startLine && file.endLine
+              ? { start: file.startLine, end: file.endLine }
+              : mode === 'full' && file.lineCount
+                ? { start: 1, end: file.lineCount }
+                : (requestedRange ?? { start: 1, end: raw.split('\n').length });
+          return { tool, callId: call.id, file: file.path, range, content: raw };
+        }
         return {
           tool,
           callId: call.id,
           file: file.path,
-          range: effectiveRange,
+          ...(requestedRange ? { range: requestedRange } : {}),
           content: file.content,
         };
       });
