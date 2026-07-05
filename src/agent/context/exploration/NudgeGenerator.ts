@@ -433,13 +433,13 @@ export class NudgeGenerator {
         return '当前处于轻量计划阶段：基于已注入的项目快照整理分析路线，不要调用工具重复获取项目概览或目录结构。';
 
       case 'VERIFY': {
-        // M3：未核实发现（引用全无文件区间）在本相补采——code.read 关键文件后用带区间的
+        // M3：未核实发现（引用全无文件归属）在本相补采——code.read 关键文件后用带文件的
         // 新 [E-x] 重新 note_finding；未核实线索不计配额、producer 不作"已确认"消费。
         const unverifiedCount =
           m.memoryFindingCount - (m.verifiedFindingCount ?? m.memoryFindingCount);
         const unverifiedHint =
           unverifiedCount > 0
-            ? `已有 ${unverifiedCount} 条发现未核实（引用无文件区间）：先 code.read 其声称的关键文件，再用带区间的新 [E-x] 重新 note_finding——未核实线索不计配额。`
+            ? `已有 ${unverifiedCount} 条发现未核实（引用无文件归属）：先 code.read 其声称的关键文件，再用新 [E-x] 重新 note_finding——未核实线索不计配额。`
             : '';
         return `当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。${unverifiedHint}`;
       }

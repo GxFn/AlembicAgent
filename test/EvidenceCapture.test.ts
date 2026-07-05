@@ -157,7 +157,7 @@ describe('EvidenceCapture（E2 采集即落盘）', () => {
       { envelope } as unknown as AfterParams[3]
     );
     expect(ledger.stats().entries).toBe(1);
-    expect(envelope.text).toBe('file content here\n\n[evidence] E-1=lib/mw.ts');
+    expect(envelope.text).toBe('file content here\n\n[evidence] E-1=lib/mw.ts:1-1');
 
     // 无台账（非维度场景）：零行为
     const envelope2 = makeEnvelope({ text: 'plain' });

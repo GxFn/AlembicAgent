@@ -125,13 +125,23 @@ function normalizeDrafts(
     const files = asFileList(data?.files);
     if (files.length > 0) {
       const range = extractRequestedRange(call.args);
-      return files.map((file) => ({
-        tool,
-        callId: call.id,
-        file: file.path,
-        ...(range ? { range } : {}),
-        content: file.content,
-      }));
+      return files.map((file) => {
+        // 采集回归修复（2026-07-04 用户 run 4/0 复盘）：batch read 无请求区间，条目落成
+        // file-only → M3 判 unverified → producer"已确认"区清零级联全拒。batch 项按内容
+        // 行数补全文区间（content 是采集真值，{1..n} 是它的真实坐标），使 read 条目恒为
+        // 一等 ranged 证据（展开/新鲜度/verified 全链直接可用）。
+        const effectiveRange = range ?? {
+          start: 1,
+          end: Math.max(1, file.content.split('\n').length),
+        };
+        return {
+          tool,
+          callId: call.id,
+          file: file.path,
+          range: effectiveRange,
+          content: file.content,
+        };
+      });
     }
   }
 

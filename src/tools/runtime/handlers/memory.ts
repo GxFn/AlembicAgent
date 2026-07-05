@@ -144,7 +144,12 @@ async function handleNoteFinding(
           `evidenceRefs 无法解析: "${ref}" 不在证据台账（只能引用工具返回里 [evidence] 标注的条目 id）。近期条目: ${recent || '(台账为空——先用 code/graph 工具采集证据)'}`
         );
       }
-      if (entry.file && entry.range) {
+      // 4/0 复盘放宽（2026-07-04）：file 在场即 verified——per-file search 条目（行号前缀
+      // content，P1b 可机械展开精确行）与 read 条目都是可定位可复核证据；原 file+range 判据
+      // 在"全 batch read+per-file search"的真实台账上把 findings 全判 unverified，级联
+      // producer 已确认区清零→候选义务归零→全拒。真正 unverified=无 file 条目
+      // （structure/graph/terminal 无路径）。
+      if (entry.file) {
         verified = true;
       }
       labels.push(
@@ -158,7 +163,7 @@ async function handleNoteFinding(
     // evidence 字符串由台账机械展开生成（模型不再手写 file:line）——下游投影零改动即携带准确引用
     resolvedLabels = verified
       ? labels.join('; ')
-      : `${labels.join('; ')} [unverified: 证据均无文件区间——用 code.read 补采关键文件后重记]`;
+      : `${labels.join('; ')} [unverified: 证据均无文件归属——用 code.read 补采关键文件后重记]`;
   } else {
     resolvedLabels = `${refs.join('; ')} (unverified: no evidence ledger in this run)`;
   }
