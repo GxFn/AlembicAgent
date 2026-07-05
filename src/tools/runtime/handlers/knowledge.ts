@@ -493,6 +493,20 @@ async function handleSubmit(
       );
     }
 
+    // 拒收治理（run-17 复盘）：coreCode 缺失是 gateway 必填而 Agent 门不查的判据缝——
+    // 候选引了真实带行号证据却因这个可机械填的字段被拒（advisory 已附仍死在 gateway）。
+    // 用候选自己引用的 source 区间真实代码确定性回填（fs 真值，非模型发明）；无可解析
+    // 区间时保持原样交 gateway 权威裁决。
+    if (typeof sanitized.item.coreCode !== 'string' || !sanitized.item.coreCode.trim()) {
+      const filled = replaceCoreCodeFromSources(sanitized.item, ctx.projectRoot ?? '');
+      if (filled) {
+        sanitized.item = filled;
+        Logger.getInstance().info(
+          `[knowledge.submit] coreCode deterministically backfilled from cited source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+        );
+      }
+    }
+
     let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
       sanitized.item,
       sharedStateForSubmit,
