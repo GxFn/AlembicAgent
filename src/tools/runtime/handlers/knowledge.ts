@@ -765,8 +765,9 @@ async function handleSubmit(
 
     if (result.rejected.length > 0) {
       const rejected = result.rejected[0];
+      const firstErrors = Array.isArray(rejected.errors) ? rejected.errors.slice(0, 2) : [];
       Logger.getInstance().warn(
-        `[knowledge.submit] gateway rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${String(rejected.reason ?? '')}`
+        `[knowledge.submit] gateway rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${String(rejected.reason ?? '')}${firstErrors.length > 0 ? ` — ${firstErrors.join(' | ').slice(0, 220)}` : ''}`
       );
       const details = [
         `Rejected: ${rejected.reason}`,
@@ -885,12 +886,17 @@ function validateSubmitParams(params: Record<string, unknown>): string | null {
     errors.push('doClause is required');
   }
   const sources = reasoning?.sources;
-  if (
-    !reasoning ||
-    !Array.isArray(sources) ||
-    sources.filter((source) => typeof source === 'string' && source.trim().length > 0).length === 0
-  ) {
-    errors.push('reasoning.sources must be a non-empty array');
+  const evidenceRefs = reasoning?.evidenceRefs;
+  const hasSources =
+    Array.isArray(sources) &&
+    sources.filter((source) => typeof source === 'string' && source.trim().length > 0).length > 0;
+  // run-15 时序修复：M1a 契约下模型只给 evidenceRefs 不手写 sources（sources 由展开在
+  // 前检**之后**机械生成）——refs 在场即满足证据要求，缺席时才要求手写 sources。
+  const hasRefs =
+    Array.isArray(evidenceRefs) &&
+    evidenceRefs.filter((ref) => typeof ref === 'string' && ref.trim().length > 0).length > 0;
+  if (!reasoning || (!hasSources && !hasRefs)) {
+    errors.push('reasoning.sources or reasoning.evidenceRefs must be a non-empty array');
   }
 
   return errors.length > 0 ? errors.join('; ') : null;
