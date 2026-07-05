@@ -121,6 +121,11 @@ export interface EvidenceLedgerLike {
   listRecent(
     limit?: number
   ): Array<{ id: string; file?: string; range?: { start: number; end: number } }>;
+  /** 按文件路径片段检索（refs 机械自推断用）；可选——旧实现缺席时推断静默跳过 */
+  searchByFile?(
+    fragment: string,
+    limit?: number
+  ): Array<{ id: string; file?: string; range?: { start: number; end: number } }>;
   stats(): { entries: number; distinctFiles: number };
   /** E5 新鲜度终检：同区间重切+同截断+同脱敏后比对采集哈希；无法复核的条目返回 'unknown' */
   checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown';

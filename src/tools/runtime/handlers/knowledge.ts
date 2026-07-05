@@ -34,6 +34,7 @@ import {
   buildEvidenceCandidatesHint,
   buildViolationRepairTemplates,
   expandEvidenceRefsForSubmit,
+  inferEvidenceRefsFromSources,
   isStyleRepairable,
   repairStyleViolations,
   replaceCoreCodeFromSources,
@@ -303,6 +304,10 @@ async function handleSubmit(
 
   const validationError = validateSubmitParams(params);
   if (validationError) {
+    // run-14 复盘：本路径此前静默——报告计拒但日志零迹，复盘不可归因
+    Logger.getInstance().warn(
+      `[knowledge.submit] rejected "${String(params.title ?? '')}" (pre-check): ${validationError}`
+    );
     return fail(`Validation failed: ${validationError}`);
   }
 
@@ -348,7 +353,8 @@ async function handleSubmit(
     };
     const baseTags = normalizeStringArray(params.tags);
     const tags = isBootstrap ? dimensionTags(effectiveDimensionId, baseTags) : baseTags;
-    const item = {
+    // 拒收治理：refs 机械自推断需在展开前改写 reasoning——item 为可重绑定
+    let item = {
       ...params,
       title: params.title as string,
       description,
@@ -410,10 +416,32 @@ async function handleSubmit(
     // E5（证据保真）：reasoning.evidenceRefs 台账机械展开——sources/coreCode 由程序从台账
     // 条目生成/回填（模型不再手写 file:line），并做新鲜度终检（run 中途文件变更→EVIDENCE_STALE
     // 拒并提示重采）。发生在权威门禁之前的 Agent 层；Core gateRules 与九拒因语义不动。
-    const expansion = expandEvidenceRefsForSubmit(item, {
+    let expansion = expandEvidenceRefsForSubmit(item, {
       ledger: ctx.runtime?.evidenceLedger,
       projectRoot: ctx.projectRoot,
     });
+    // 拒收治理（2026-07-05）：refs 缺席但手写 sources 命中台账同文件条目→机械回填后重展开。
+    // 只映射真实条目（事实面零发明）；回填后照走新鲜度/标签全链，失败仍按原语义拒。
+    if (expansion.ok && expansion.resolvedRefs === 0 && ctx.runtime?.evidenceLedger) {
+      const inferred = inferEvidenceRefsFromSources(item, ctx.runtime.evidenceLedger);
+      if (inferred.length > 0) {
+        Logger.getInstance().info(
+          `[knowledge.submit] evidenceRefs auto-inferred from cited sources (${inferred.length} refs) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+        );
+        const reasoningObj = (item.reasoning ?? {}) as Record<string, unknown>;
+        item = {
+          ...item,
+          reasoning: {
+            ...reasoningObj,
+            evidenceRefs: inferred,
+          } as unknown as typeof item.reasoning,
+        };
+        expansion = expandEvidenceRefsForSubmit(item, {
+          ledger: ctx.runtime?.evidenceLedger,
+          projectRoot: ctx.projectRoot,
+        });
+      }
+    }
     if (!expansion.ok) {
       Logger.getInstance().warn(
         `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${expansion.error}`
@@ -761,6 +789,9 @@ async function handleSubmit(
 
     return ok({ status: 'processed', result });
   } catch (err: unknown) {
+    Logger.getInstance().warn(
+      `[knowledge.submit] rejected "${String(params.title ?? '')}" (exception): ${err instanceof Error ? err.message : String(err)}`
+    );
     return fail(`Submit failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -820,35 +851,38 @@ function validateSubmitParams(params: Record<string, unknown>): string | null {
   const doClause = params.doClause as string | undefined;
   const reasoning = params.reasoning as Record<string, unknown> | undefined;
 
-  if (!title || title.length < 3 || title.length > 200) {
-    errors.push('title must be 3-200 characters');
+  // 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：长度阈值属风格类——权威门禁已把
+  // 长度类violation 分层为 advisory，本廉价前检若先硬拒即旁路分层（run-14 四拒全为此路径
+  // 且静默）。前检只留存在性与结构性；上限保护防垃圾输入。
+  if (!title || !title.trim() || title.length > 200) {
+    errors.push('title is required (≤200 characters)');
   }
-  if (!description || description.length < 10) {
-    errors.push('description must be ≥10 characters');
+  if (!description || !description.trim()) {
+    errors.push('description is required');
   }
   if (!content || typeof content !== 'object') {
     errors.push('content must be an object');
   } else {
     const md = content.markdown as string | undefined;
-    if (!md || md.length < 200) {
-      errors.push('content.markdown must be ≥200 characters');
+    if (!md || !md.trim()) {
+      errors.push('content.markdown is required');
     }
     const rat = content.rationale as string | undefined;
-    if (!rat || rat.length < 50) {
-      errors.push('content.rationale must be ≥50 characters');
+    if (!rat || !rat.trim()) {
+      errors.push('content.rationale is required');
     }
   }
   if (!kind || !['rule', 'pattern', 'fact'].includes(kind)) {
     errors.push('kind must be rule/pattern/fact');
   }
-  if (!trigger || trigger.length < 3) {
-    errors.push('trigger is required (≥3 chars)');
+  if (!trigger || !trigger.trim()) {
+    errors.push('trigger is required');
   }
-  if (!whenClause || whenClause.length < 10) {
-    errors.push('whenClause is required (≥10 chars)');
+  if (!whenClause || !whenClause.trim()) {
+    errors.push('whenClause is required');
   }
-  if (!doClause || doClause.length < 10) {
-    errors.push('doClause is required (≥10 chars)');
+  if (!doClause || !doClause.trim()) {
+    errors.push('doClause is required');
   }
   const sources = reasoning?.sources;
   if (

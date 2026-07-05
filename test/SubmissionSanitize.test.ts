@@ -332,11 +332,24 @@ describe('门禁分层 v2（2026-07-04 用户裁定：证据硬门+风格 adviso
     expect(reasoning.styleAdvisories?.join(' ')).toContain('DO_CLAUSE_NON_ENGLISH');
   });
 
-  test('维度运行缺 evidenceRefs：EVIDENCE_REFS_REQUIRED 硬拒（核心保证）', async () => {
+  test('refs 缺席但 sources 命中台账文件：机械自推断回填后收录（2026-07-05 拒收治理）', async () => {
     const { result, created } = await submitFixture({
       reasoning: {
         whyStandard: 'w',
         sources: ['lib/a.ts:1-3'],
+        confidence: 0.9,
+      },
+    });
+    // 引用了真实采集过的文件——推断只映射真实条目，事实面零发明，应收录而非硬拒
+    expect(result.ok).toBe(true);
+    expect(created).toHaveLength(1);
+  });
+
+  test('维度运行缺 evidenceRefs 且 sources 均不在台账：EVIDENCE_REFS_REQUIRED 硬拒（核心保证）', async () => {
+    const { result, created } = await submitFixture({
+      reasoning: {
+        whyStandard: 'w',
+        sources: ['lib/zzz-not-captured.ts:1-3'],
         confidence: 0.9,
       },
     });

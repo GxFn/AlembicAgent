@@ -506,6 +506,43 @@ export async function repairStyleViolations(
  * INSUFFICIENT_EVIDENCE 拒绝反馈增强（E5）：告诉模型台账里真实可引用的 distinct 文件
  * （此前只说 "add 3 distinct files" 不说去哪找——修不动的拒绝即无效拒绝）。
  */
+/**
+ * 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：refs 缺席但手写 sources 命中台账
+ * 同文件条目时，机械回填 evidenceRefs——模型引用了真实采集过的文件却忘（或不会）抄 E-id，
+ * 此前直接 EVIDENCE_REFS_REQUIRED 硬拒烧一回合再自救。推断只映射到真实条目
+ * （exact file 匹配，每文件取首条，上限 5），事实面零发明；回填后仍走展开+新鲜度全链。
+ */
+export function inferEvidenceRefsFromSources(
+  item: Record<string, unknown>,
+  ledger: EvidenceLedgerLike | null | undefined
+): string[] {
+  if (!ledger?.searchByFile) {
+    return [];
+  }
+  const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
+  const sources = Array.isArray(reasoning.sources) ? reasoning.sources : [];
+  const inferred: string[] = [];
+  const seenFiles = new Set<string>();
+  for (const raw of sources) {
+    if (typeof raw !== 'string' || !raw.trim()) {
+      continue;
+    }
+    const filePart = (/^(.*?)(?::\d+(?:-\d+)?)?$/.exec(raw.trim())?.[1] ?? '').trim();
+    if (!filePart || seenFiles.has(filePart)) {
+      continue;
+    }
+    seenFiles.add(filePart);
+    const hit = ledger.searchByFile(filePart, 5).find((entry) => entry.file === filePart);
+    if (hit) {
+      inferred.push(hit.id);
+      if (inferred.length >= 5) {
+        break;
+      }
+    }
+  }
+  return inferred;
+}
+
 export function buildEvidenceCandidatesHint(ledger: EvidenceLedgerLike | null | undefined): string {
   if (!ledger) {
     return '';
