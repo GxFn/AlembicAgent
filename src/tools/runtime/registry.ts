@@ -314,9 +314,9 @@ const KNOWLEDGE_SPEC: ToolSpec = {
       risk: 'read-only',
     },
     manage: {
-      summary: 'Lifecycle operations (approve/reject/publish/deprecate/evolve/...)',
+      summary: 'Lifecycle operations (approve/reject/publish/deprecate/evolve/review/review-queue)',
       description:
-        'Perform lifecycle management on recipes. Evolution decisions use operation=evolve|deprecate|skip_evolution with the canonical recipe id field named id.',
+        'Perform lifecycle management on recipes. Evolution decisions use operation=evolve|deprecate|skip_evolution with the canonical recipe id field named id. Staging review: operation=review-queue (no id) lists staging entries awaiting assertion-vs-source review with their doClause/dontClause/coreCode + reasoning sources; operation=review (with id + outcome) records the pass/fail verdict.',
       params: {
         type: 'object',
         properties: {
@@ -333,9 +333,10 @@ const KNOWLEDGE_SPEC: ToolSpec = {
               'evolve',
               'skip_evolution',
               'review',
+              'review-queue',
             ],
           },
-          id: { type: 'string' },
+          id: { type: 'string', description: 'canonical recipe id (required for all ops except review-queue)' },
           reason: { type: 'string' },
           data: { type: 'object' },
           outcome: {
@@ -344,8 +345,9 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             description: 'review only: staging assertion-vs-source review outcome',
           },
           reviewer: { type: 'string', description: 'review only: reviewer identity' },
+          limit: { type: 'number', description: 'review-queue only: cap entries returned (oldest-first)' },
         },
-        required: ['operation', 'id'],
+        required: ['operation'],
       },
       handler: async (p, ctx) => handleKnowledge('manage', p, ctx),
       concurrency: 'single',

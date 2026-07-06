@@ -1056,7 +1056,8 @@ type ManageOperation =
   | 'validate'
   | 'evolve'
   | 'skip_evolution'
-  | 'review';
+  | 'review'
+  | 'review-queue';
 
 const VALID_OPERATIONS = new Set<ManageOperation>([
   'approve',
@@ -1069,6 +1070,7 @@ const VALID_OPERATIONS = new Set<ManageOperation>([
   'evolve',
   'skip_evolution',
   'review',
+  'review-queue',
 ]);
 
 type EvolutionProposalSource =
@@ -1123,6 +1125,37 @@ async function handleManage(
   if (!operation || !VALID_OPERATIONS.has(operation as ManageOperation)) {
     return fail(`Invalid operation: ${operation}. Valid: ${[...VALID_OPERATIONS].join(', ')}`);
   }
+
+  // staging 复核队列（Option A：宿主 LLM 按需复核的只读读面）。列表操作，无需 id——须在下方
+  // id 必填校验之前处理。返回 staging 中待复核条目及其「断言 vs 源码」所需内容（断言四要素 +
+  // reasoning.sources 引用位置）；宿主据此读源码对比，再经 operation='review' 写回结论。
+  if (operation === 'review-queue') {
+    const stagingManager = ctx.stagingManager as {
+      listReviewQueue?(limit?: number): Promise<
+        Array<{
+          id: string;
+          title: string;
+          whenClause: string;
+          doClause: string;
+          dontClause: string;
+          coreCode: string;
+          sources: string[];
+          stagingDeadline: number;
+        }>
+      >;
+    } | null;
+    if (!stagingManager || typeof stagingManager.listReviewQueue !== 'function') {
+      return fail('Staging manager not available');
+    }
+    const limitRaw = params.limit;
+    const limit =
+      typeof limitRaw === 'number' && Number.isFinite(limitRaw) && limitRaw > 0
+        ? Math.floor(limitRaw)
+        : undefined;
+    const queue = await stagingManager.listReviewQueue(limit);
+    return ok({ queue, count: queue.length });
+  }
+
   if (!id) {
     return fail('knowledge.manage requires id');
   }
