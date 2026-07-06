@@ -336,7 +336,10 @@ const KNOWLEDGE_SPEC: ToolSpec = {
               'review-queue',
             ],
           },
-          id: { type: 'string', description: 'canonical recipe id (required for all ops except review-queue)' },
+          id: {
+            type: 'string',
+            description: 'canonical recipe id (required for all ops except review-queue)',
+          },
           reason: { type: 'string' },
           data: { type: 'object' },
           outcome: {
@@ -345,7 +348,10 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             description: 'review only: staging assertion-vs-source review outcome',
           },
           reviewer: { type: 'string', description: 'review only: reviewer identity' },
-          limit: { type: 'number', description: 'review-queue only: cap entries returned (oldest-first)' },
+          limit: {
+            type: 'number',
+            description: 'review-queue only: cap entries returned (oldest-first)',
+          },
         },
         required: ['operation'],
       },
