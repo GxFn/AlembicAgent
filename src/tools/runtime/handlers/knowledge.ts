@@ -1055,7 +1055,8 @@ type ManageOperation =
   | 'score'
   | 'validate'
   | 'evolve'
-  | 'skip_evolution';
+  | 'skip_evolution'
+  | 'review';
 
 const VALID_OPERATIONS = new Set<ManageOperation>([
   'approve',
@@ -1067,6 +1068,7 @@ const VALID_OPERATIONS = new Set<ManageOperation>([
   'validate',
   'evolve',
   'skip_evolution',
+  'review',
 ]);
 
 type EvolutionProposalSource =
@@ -1130,6 +1132,33 @@ async function handleManage(
 
   if (operation === 'evolve' || operation === 'deprecate' || operation === 'skip_evolution') {
     return handleEvolutionManage(operation, id, reason, data, params, ctx);
+  }
+
+  // staging 复核通道（2026-07-06 复核期落地）：AI/程序化复核者把"断言 vs 源码"
+  // 结论写回 StagingManager（fail=到期回滚不晋级；pass/缺失=现状晋级）。
+  if (operation === 'review') {
+    const stagingManager = ctx.stagingManager as {
+      recordReview(
+        entryId: string,
+        review: { outcome: 'pass' | 'fail'; reviewer?: string; notes?: string }
+      ): Promise<boolean>;
+    } | null;
+    if (!stagingManager || typeof stagingManager.recordReview !== 'function') {
+      return fail('Staging manager not available');
+    }
+    const outcome = stringValue(params.outcome);
+    if (outcome !== 'pass' && outcome !== 'fail') {
+      return fail("knowledge.manage review requires outcome: 'pass' | 'fail'");
+    }
+    const recorded = await stagingManager.recordReview(id, {
+      outcome,
+      reviewer: stringValue(params.reviewer) ?? 'in-process-agent',
+      ...(reason ? { notes: reason } : {}),
+    });
+    if (!recorded) {
+      return fail(`Staging review rejected: entry ${id} is not in staging`);
+    }
+    return ok({ id, outcome, recorded: true });
   }
 
   const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;

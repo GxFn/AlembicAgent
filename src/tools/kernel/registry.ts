@@ -120,6 +120,9 @@ export interface ToolContext {
   /** 知识仓库 — knowledge handler 内部 cast 为 KnowledgeRepoLike */
   knowledgeRepo?: unknown;
 
+  /** staging 复核通道 — knowledge.manage(review) cast 为 StagingManagerLike（recordReview）。 */
+  stagingManager?: unknown;
+
   /** 进化决策网关 — knowledge.manage(evolve/deprecate/skip_evolution) 的唯一写入口 */
   proposalGateway?: unknown;
 
