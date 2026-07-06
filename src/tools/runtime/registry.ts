@@ -193,6 +193,28 @@ const KNOWLEDGE_SPEC: ToolSpec = {
   name: 'knowledge',
   description: 'Knowledge management: search, submit, detail, manage',
   actions: {
+    prime: {
+      summary: 'Prime task-relevant project knowledge before coding',
+      description:
+        'Fetch existing Recipe knowledge relevant to a coding task (titles, do/dont conventions, source anchors). Answers "what conventions already exist for this task" — call BEFORE analysis/submission to avoid duplicating existing knowledge or missing established patterns.',
+      params: {
+        type: 'object',
+        properties: {
+          taskGoal: { type: 'string', description: 'Concrete coding task goal to prime for' },
+          keywords: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional keyword hints (max 8)',
+          },
+          limit: { type: 'number', description: 'Max knowledge items (default 5, cap 10)' },
+        },
+        required: ['taskGoal'],
+      },
+      handler: async (p, ctx) => handleKnowledge('prime', p, ctx),
+      cache: 'session',
+      concurrency: 'parallel',
+      risk: 'read-only',
+    },
     search: {
       summary: 'Search knowledge base (recipes & candidates)',
       description: 'Search existing recipes and candidates using BM25 + optional vector search.',
