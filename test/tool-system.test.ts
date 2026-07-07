@@ -9,7 +9,7 @@ import {
   projectToolResultOrdinaryOutput,
   TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
   type ToolCapabilityManifest,
-  type ToolDefinitionV2,
+  type ToolDefinition,
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
@@ -198,7 +198,7 @@ describe('tool kernel contract', () => {
 
 describe('UnifiedToolCatalog', () => {
   it('projects tool schemas and preserves internal handler access', () => {
-    const definition: ToolDefinitionV2 = {
+    const definition: ToolDefinition = {
       id: 'demo.echo',
       title: 'Demo Echo',
       description: 'Full echo schema',

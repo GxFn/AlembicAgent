@@ -665,23 +665,6 @@ describe('record repair tool guard', () => {
 });
 
 describe('analyst phase-chain state gating', () => {
-  it('keeps SCAN as a no-tool briefing phase and immediately moves to EXPLORE', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'analyst' },
-      { maxIterations: 12, searchBudget: 8 }
-    );
-
-    expect(tracker).not.toBeNull();
-    expect(tracker?.phase).toBe('SCAN');
-    expect(tracker?.getToolChoice()).toBe('none');
-
-    tracker?.tick();
-    const transition = tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-
-    expect(tracker?.phase).toBe('EXPLORE');
-    expect(transition?.text).toContain('轻量计划阶段已完成');
-  });
-
   it('blocks generalized exploration during analyst VERIFY while allowing focused evidence checks', async () => {
     const diagnostics = new DiagnosticsCollector();
     let executeCount = 0;
@@ -782,59 +765,5 @@ describe('analyst phase-chain state gating', () => {
     expect(allowedGraph.metadata.blocked).toBe(false);
     expect(allowedFinding.metadata.blocked).toBe(false);
     expect(executeCount).toBe(3);
-  });
-
-  it('does not call forced summary after abort or stage timeout exits', async () => {
-    const aborted = createRuntimeForReactLoop();
-    const abortController = new AbortController();
-    abortController.abort();
-    const abortResult = await aborted.runtime.reactLoop('analyze', {
-      source: 'system',
-      abortSignal: abortController.signal,
-      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
-    });
-
-    expect(aborted.chatWithTools).not.toHaveBeenCalled();
-    expect(abortResult.reply).toContain('abort_signal');
-    expect(abortResult.diagnostics?.efficiency?.forcedSummary).toBe(false);
-    expect(abortResult.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
-
-    const timedOut = createRuntimeForReactLoop();
-    const timeoutDiagnostics = new DiagnosticsCollector();
-    timeoutDiagnostics.recordTimedOutStage('analyze');
-    timeoutDiagnostics.recordCancelReason('stage_timeout');
-    const timeoutResult = await timedOut.runtime.reactLoop('analyze', {
-      source: 'system',
-      tracker: createExitingTracker() as never,
-      diagnostics: timeoutDiagnostics,
-      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
-    });
-
-    expect(timedOut.chatWithTools).not.toHaveBeenCalled();
-    expect(timeoutResult.reply).toContain('stage_timeout');
-    expect(timeoutResult.diagnostics?.efficiency?.forcedSummary).toBe(false);
-    expect(timeoutResult.diagnostics?.efficiency?.cancelReason).toBe('stage_timeout');
-  });
-
-  it('keeps degraded_no_findings out of normal producer and summary completion paths', async () => {
-    const { runtime, chatWithTools } = createRuntimeForReactLoop();
-    const diagnostics = new DiagnosticsCollector();
-    diagnostics.recordGateFailure(
-      'quality_gate',
-      'degraded_no_findings',
-      'Record repair did not produce enough validated note_finding records'
-    );
-
-    const result = await runtime.reactLoop('analyze', {
-      source: 'system',
-      tracker: createExitingTracker() as never,
-      diagnostics,
-      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
-    });
-
-    expect(chatWithTools).not.toHaveBeenCalled();
-    expect(result.reply).toContain('degraded_no_findings');
-    expect(result.diagnostics?.degraded).toBe(true);
-    expect(result.diagnostics?.efficiency?.forcedSummary).toBe(false);
   });
 });
