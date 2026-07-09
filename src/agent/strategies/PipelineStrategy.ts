@@ -125,6 +125,13 @@ interface PipelineContext {
   diagnostics: DiagnosticsCollector;
   execStageCount: number;
   lastExecutedStageName: string | null;
+  /**
+   * P0-4(挖掘质量升级)：degrade 的一等化信息。此前 degrade 只置布尔+日志，弱维度
+   * 静默产 0 候选，父 run/调用方拿不到"哪个门、什么动作、什么原因"——这里在
+   * #storeGateResult 单点捕获首个 degrade 类动作(degrade / degraded_no_findings /
+   * degraded_budget_exhausted，均为终态)，最终投影进 phases._pipelineOutcome。
+   */
+  abandonInfo: { stage: string; action: string; reason: string } | null;
 }
 
 interface GateEvalResult {
@@ -172,6 +179,22 @@ function withProducerCoverageBudget(
     maxSubmits: scaledMaxSubmits,
     ...(scaledTimeoutMs > 0 ? { timeoutMs: scaledTimeoutMs } : {}),
   };
+}
+
+/**
+ * P0-4：读取 knowledge.submit 修复层的会话命中计数。计数由 handler 挂在 runtime 对象上
+ * (`_submitRepairStats`，与 `_styleWaiverTotal`/`_gateRejectStreak` 同款模式)；这里只做
+ * 防御性读取——形状不对/为空一律返回 null(不投影)，绝不让观测面影响执行。
+ */
+function readSubmitRepairStats(runtime: PipelineRuntime): Record<string, number> | null {
+  const raw = (runtime as unknown as Record<string, unknown>)._submitRepairStats;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const entries = Object.entries(raw as Record<string, unknown>).filter(
+    (entry): entry is [string, number] => typeof entry[1] === 'number' && entry[1] > 0
+  );
+  return entries.length > 0 ? Object.fromEntries(entries) : null;
 }
 
 /** Lightweight ContextWindow subset consumed by pipeline stages */
@@ -233,6 +256,7 @@ export class PipelineStrategy extends Strategy {
       diagnostics,
       execStageCount: 0,
       lastExecutedStageName: null,
+      abandonInfo: null,
     };
 
     for (let i = 0; i < this.#stages.length; i++) {
@@ -270,6 +294,18 @@ export class PipelineStrategy extends Strategy {
       .filter((r): r is StageResult => r != null && typeof r === 'object' && 'reply' in r)
       .pop();
 
+    // P0-4：管线结局一等化。phases 会原样穿透 AgentRuntime.execute → AgentRunResult.phases
+    // → coordinator child result → merger，因此 _pipelineOutcome 是父 run 聚合
+    // abandonedModules 的唯一读取面(下划线内部键与 _retries_/_retryContext 同一先例)。
+    // submitRepairs 是 knowledge.submit 各确定性修复层的会话命中计数(挂在 runtime 上，
+    // 与 _styleWaiverTotal 同款挂载)——在此投影，评估 harness 据此算 repair-hit-rate。
+    const submitRepairs = readSubmitRepairStats(runtime);
+    ctx.phaseResults._pipelineOutcome = {
+      outcome: ctx.degraded ? 'abandoned' : 'completed',
+      ...(ctx.degraded && ctx.abandonInfo ? ctx.abandonInfo : {}),
+      ...(submitRepairs ? { submitRepairs } : {}),
+    };
+
     return {
       reply: lastStage?.reply || '',
       toolCalls: ctx.totalToolCalls,
@@ -277,6 +313,7 @@ export class PipelineStrategy extends Strategy {
       iterations: ctx.totalIterations,
       phases: ctx.phaseResults,
       degraded: ctx.degraded,
+      outcome: ctx.degraded ? 'abandoned' : 'completed',
       diagnostics: ctx.diagnostics.toJSON(),
     };
   }
@@ -529,6 +566,20 @@ export class PipelineStrategy extends Strategy {
 
     if (gateResult.action !== 'pass') {
       ctx.diagnostics.recordGateFailure(stage.name || 'gate', gateResult.action, gateResult.reason);
+    }
+
+    // P0-4：degrade 类动作(degrade / degraded_no_findings / degraded_budget_exhausted)都是
+    // 终态(存储后必然 ctx.degraded=true + break)，在此单点捕获首个即可覆盖全部 4 个降级点，
+    // 不必在每个分支重复。只记首个：后续不会再有(终态)，防御性保留 first-wins 语义。
+    if (
+      !ctx.abandonInfo &&
+      (gateResult.action === 'degrade' || gateResult.action.startsWith('degraded_'))
+    ) {
+      ctx.abandonInfo = {
+        stage: stage.name || 'gate',
+        action: gateResult.action,
+        reason: gateResult.reason || '',
+      };
     }
   }
 

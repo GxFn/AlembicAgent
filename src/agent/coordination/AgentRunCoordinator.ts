@@ -496,6 +496,33 @@ function partitionProjectIndexScopedModules(
   });
 }
 
+/**
+ * P0-4(挖掘质量升级)：从 child 结果里收集被质量门放弃(degrade)的单元。
+ * 读取面是 PipelineStrategy 投影的 phases._pipelineOutcome(outcome==='abandoned')——
+ * 此前弱维度 degrade 后静默产 0 候选、只留日志；聚合成一等字段后，父 run 的消费方
+ * (module-mining 回填、评估 harness 的 abandonment rate)能直接看到"哪个单元、哪个门、
+ * 什么原因被放弃"。error/aborted 不在此列(它们已由 child status 表达)。
+ */
+function collectAbandonedUnits(
+  results: AgentRunResult[],
+  unitIds: string[]
+): Array<{ unitId: string; stage: string; action: string; reason: string }> {
+  const abandoned: Array<{ unitId: string; stage: string; action: string; reason: string }> = [];
+  results.forEach((result, index) => {
+    const outcome = toRecord(toRecord(result.phases)._pipelineOutcome);
+    if (stringValue(outcome.outcome) !== 'abandoned') {
+      return;
+    }
+    abandoned.push({
+      unitId: unitIds[index] || `unit-${index}`,
+      stage: stringValue(outcome.stage) || 'unknown',
+      action: stringValue(outcome.action) || 'degrade',
+      reason: stringValue(outcome.reason) || '',
+    });
+  });
+  return abandoned;
+}
+
 function mergeBootstrapSessionResults(
   results: AgentRunResult[],
   input: AgentRunInput,
@@ -506,6 +533,7 @@ function mergeBootstrapSessionResults(
     const record = toRecord(dimension);
     return stringValue(record.dimId) || stringValue(record.id) || `dimension-${index}`;
   });
+  const abandonedDimensions = collectAbandonedUnits(results, dimensionIds);
   return {
     ...defaultMerge(results, profile),
     phases: {
@@ -513,6 +541,7 @@ function mergeBootstrapSessionResults(
       dimensionResults: Object.fromEntries(
         results.map((result, index) => [dimensionIds[index] || `dimension-${index}`, result])
       ),
+      ...(abandonedDimensions.length > 0 ? { abandonedDimensions } : {}),
     },
   };
 }
@@ -533,6 +562,7 @@ function mergeProjectIndexScopedModuleResults(
       `module-${index}`
     );
   });
+  const abandonedModules = collectAbandonedUnits(results, moduleIds);
   return {
     ...defaultMerge(results, profile),
     phases: {
@@ -540,6 +570,7 @@ function mergeProjectIndexScopedModuleResults(
       moduleResults: Object.fromEntries(
         results.map((result, index) => [moduleIds[index] || `module-${index}`, result])
       ),
+      ...(abandonedModules.length > 0 ? { abandonedModules } : {}),
     },
   };
 }

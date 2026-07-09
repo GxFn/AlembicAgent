@@ -516,6 +516,7 @@ async function handleSubmit(
     if (expansion.ok && expansion.resolvedRefs === 0 && ctx.runtime?.evidenceLedger) {
       const inferred = inferEvidenceRefsFromSources(item, ctx.runtime.evidenceLedger);
       if (inferred.length > 0) {
+        bumpSubmitRepairStat(ctx.runtime, 'evidence_refs_inferred');
         Logger.getInstance().info(
           `[knowledge.submit] evidenceRefs auto-inferred from cited sources (${inferred.length} refs) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
         );
@@ -579,6 +580,7 @@ async function handleSubmit(
       projectRoot: ctx.projectRoot,
     });
     if (sanitized.corrected.length > 0 || sanitized.dropped.length > 0 || sanitized.scopedNarrow) {
+      bumpSubmitRepairStat(ctx.runtime, 'evidence_sanitized');
       Logger.getInstance().info(
         `[knowledge.submit] evidence sanitized for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): corrected=[${sanitized.corrected.join(', ')}] dropped=[${sanitized.dropped.join(', ')}] scopedNarrow=${sanitized.scopedNarrow}`
       );
@@ -598,6 +600,7 @@ async function handleSubmit(
       const filled = replaceCoreCodeFromSources(effectiveItem, ctx.projectRoot ?? '');
       if (filled) {
         effectiveItem = filled;
+        bumpSubmitRepairStat(ctx.runtime, 'core_code_backfilled');
         Logger.getInstance().info(
           `[knowledge.submit] coreCode deterministically backfilled from cited source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
         );
@@ -619,6 +622,7 @@ async function handleSubmit(
         dimensionId: effectiveDimensionId,
       });
       if (normalized) {
+        bumpSubmitRepairStat(ctx.runtime, 'snippet_normalized');
         Logger.getInstance().info(
           `[knowledge.submit] snippet evidence normalized (${normalized.direction}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${normalized.violations.length}`
         );
@@ -637,6 +641,7 @@ async function handleSubmit(
           dimensionId: effectiveDimensionId,
         });
         if (!reVerified.some((v) => v.code === 'SNIPPET_MISMATCH')) {
+          bumpSubmitRepairStat(ctx.runtime, 'core_code_replaced');
           Logger.getInstance().info(
             `[knowledge.submit] coreCode deterministically replaced from source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
           );
@@ -665,6 +670,7 @@ async function handleSubmit(
           dimensionId: effectiveDimensionId,
         });
         if (!reVerified.some((v) => v.code === 'GRAPH_REF_INVALID')) {
+          bumpSubmitRepairStat(ctx.runtime, 'graph_refs_injected');
           Logger.getInstance().info(
             `[knowledge.submit] graph refs injected from analyst evidence (${analystGraphEvidence.length} refs) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
           );
@@ -690,6 +696,7 @@ async function handleSubmit(
       });
       if (waiver.waived) {
         effectiveItem = waiver.item;
+        bumpSubmitRepairStat(ctx.runtime, 'style_waiver');
         if (waiverState) {
           waiverState._styleWaiverTotal = waiverTotal + 1;
         }
@@ -721,6 +728,7 @@ async function handleSubmit(
             dimensionId: effectiveDimensionId,
           });
           if (reVerified.length < gateViolations.length) {
+            bumpSubmitRepairStat(ctx.runtime, 'style_repair_subcall');
             Logger.getInstance().info(
               `[knowledge.submit] style repair sub-call fixed "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): violations ${gateViolations.length}→${reVerified.length}`
             );
@@ -750,6 +758,7 @@ async function handleSubmit(
         ...effectiveItem,
         reasoning: { ...reasoningObj, styleAdvisories: advisories },
       };
+      bumpSubmitRepairStat(ctx.runtime, 'style_advisories');
       Logger.getInstance().info(
         `[knowledge.submit] style advisories attached (non-blocking) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${gateViolations.map((v) => v.code).join(', ')}`
       );
@@ -908,6 +917,27 @@ async function handleSubmit(
 
 function pickString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * P0-4(挖掘质量升级)：submit 修复层命中计数。submit 周围有多层"模型输出不合格→程序
+ * 确定性代修"的修复路径(refs 回推/证据矫正/coreCode 回填/snippet 规范化/graph refs 注入/
+ * style waiver/风格修复子调用/advisory 降级)——此前只有日志，无法回答"哪些修复层在真实
+ * 承重、哪些是死枝"。计数挂在 runtime 上(与 _styleWaiverTotal 同款会话级挂载)，由
+ * PipelineStrategy 在管线收口时投影进 phases._pipelineOutcome.submitRepairs，评估 harness
+ * 据此算 repair-hit-rate；P2 契约收紧时按计量裁撤而非盲删。计数失败静默(观测不影响执行)。
+ */
+function bumpSubmitRepairStat(runtime: unknown, key: string): void {
+  if (!runtime || typeof runtime !== 'object') {
+    return;
+  }
+  const state = runtime as Record<string, unknown>;
+  const stats =
+    state._submitRepairStats && typeof state._submitRepairStats === 'object'
+      ? (state._submitRepairStats as Record<string, number>)
+      : {};
+  stats[key] = (Number(stats[key]) || 0) + 1;
+  state._submitRepairStats = stats;
 }
 
 interface DimensionMetaLike {
