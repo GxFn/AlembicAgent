@@ -1,3 +1,4 @@
+import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { LoopContext } from './LoopContext.js';
 import { getLatestPcvBurnGrounding } from './PcvNodeEvidenceRecorder.js';
 import { isDeepSeekV4AnalyzeFirstBurn } from './ProviderToolChoicePolicy.js';
@@ -31,9 +32,8 @@ export function buildAnalyzeGroundingPolicy(
   modelRef: string,
   deterministicRefCount: number
 ): string {
-  const deepseekMode = /deepseek.*v4|deepseek-v4/i.test(modelRef)
-    ? ' DeepSeek V4 cannot rely on forced tool_choice; use visible tools or cited deterministic refs.'
-    : '';
+  // P1-B-3：provider 附加句由 ModelQuirks 声明(字面量移入 src/ai)。
+  const deepseekMode = resolveModelQuirks(modelRef).groundingPolicyProviderNote ?? '';
   return `Every analyze burn that advances a conclusion must consume cited deterministic evidence refs or produce new tool evidence. Planning-only text may choose the next evidence frontier but must not assert verified facts.${deterministicRefCount > 0 ? ' Cite the relevant deterministicEvidenceRefs when using injected evidence.' : ''}${deepseekMode}`;
 }
 

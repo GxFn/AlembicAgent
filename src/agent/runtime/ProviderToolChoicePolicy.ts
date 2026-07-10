@@ -1,3 +1,4 @@
+import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { LoopContext } from './LoopContext.js';
 
 /**
@@ -54,7 +55,8 @@ export function observeDeepSeekV4ToolChoiceMode(
   requestedToolChoice: string | null | undefined,
   effectiveToolChoice: string | null | undefined
 ): string | null {
-  if (!/deepseek.*v4|deepseek-v4/i.test(modelRef || '')) {
+  // P1-B-3：provider 判定收敛到 ModelQuirks(内核零 provider 名分支)。
+  if (!resolveModelQuirks(modelRef).forcedToolChoiceUnsupported) {
     return null;
   }
   if (effectiveToolChoice === 'auto' && requestedToolChoice === 'none') {
@@ -80,7 +82,8 @@ export function allowsDeepSeekV4ToolCalls(mode: string | null | undefined): bool
  * analyze grounding gate（AP-2 领地）亦复用此首轮判定。
  */
 export function isDeepSeekV4AnalyzeFirstBurn(ctx: LoopContext, modelRef: string): boolean {
-  if (!/deepseek.*v4|deepseek-v4/i.test(modelRef)) {
+  // P1-B-3：guard 适格由 ModelQuirks 声明(V4 家族)；phase 判定是 provider 中立的内核逻辑,保留。
+  if (!resolveModelQuirks(modelRef).analyzeGroundingGuardEligible) {
     return false;
   }
   const trackerPhase = typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : '';

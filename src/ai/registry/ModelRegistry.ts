@@ -40,6 +40,16 @@ export class ModelRegistry {
     return this.#models.get(modelRef);
   }
 
+  /** 裸 apiModelId 查找(P1-B-3 quirk 解析用): 'deepseek-reasoner' → 首个匹配的 ModelDef。 */
+  findByApiModelId(apiModelId: string): ModelDef | undefined {
+    for (const m of this.#models.values()) {
+      if (m.apiModelId === apiModelId) {
+        return m;
+      }
+    }
+    return undefined;
+  }
+
   /** 模糊查找: (provider='openai', apiModelId='gpt-5.5') → ModelDef */
   resolve(provider: string, apiModelId: string): ModelDef | undefined {
     // 先尝试直接组合
