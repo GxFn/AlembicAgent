@@ -13,6 +13,7 @@
  *   npm run build && npm run eval:mining                          # 默认 golden + auto provider
  *   npm run eval:mining -- --judge                                # 叠加 judge 语义判定
  *   npm run eval:mining -- --provider deepseek --judge-provider ollama
+ *   npm run eval:mining -- --provider deepseek --model deepseek-chat   # 评指定模型档(G-D:非仅 autoDetect 默认档)
  *   npm run eval:mining -- --budget-tokens 500000 --out <dir>
  *
  * key 来源：ALEMBIC_DEEPSEEK_API_KEY(或 autoDetectProvider 支持的其它 env)；ollama 免 key。
@@ -83,7 +84,24 @@ const outDir = path.resolve(
   args.out || path.join('test-reports', 'mining-eval', startedAt.slice(0, 19).replaceAll(':', '-'))
 );
 
-const provider = args.provider ? createProvider({ provider: args.provider }) : autoDetectProvider();
+// --model 必须伴随显式 --provider:autoDetect/env 默认的 provider 与用户想评的模型档
+// 可能不同家(有 DeepSeek key 时默认档≠google),静默组合会评错对象。judge 侧同规则。
+if (typeof args.model === 'string' && typeof args.provider !== 'string') {
+  console.error(
+    '[eval:mining] --model requires an explicit --provider (评哪个 provider 的哪个模型档必须显式成对)。'
+  );
+  process.exit(1);
+}
+if (typeof args['judge-model'] === 'string' && typeof args['judge-provider'] !== 'string') {
+  console.error('[eval:mining] --judge-model requires an explicit --judge-provider.');
+  process.exit(1);
+}
+const provider = args.provider
+  ? createProvider({
+      provider: args.provider,
+      ...(typeof args.model === 'string' ? { model: args.model } : {}),
+    })
+  : autoDetectProvider();
 if (!provider) {
   console.error(
     '[eval:mining] no AI provider available — set ALEMBIC_DEEPSEEK_API_KEY (or pass --provider ollama with a local ollama).'
@@ -93,7 +111,10 @@ if (!provider) {
 const judgeEnabled = args.judge === true || typeof args['judge-provider'] === 'string';
 const judgeProvider = judgeEnabled
   ? args['judge-provider']
-    ? createProvider({ provider: args['judge-provider'] })
+    ? createProvider({
+        provider: args['judge-provider'],
+        ...(typeof args['judge-model'] === 'string' ? { model: args['judge-model'] } : {}),
+      })
     : provider
   : null;
 
