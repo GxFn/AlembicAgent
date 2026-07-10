@@ -90,7 +90,9 @@ export function scoreFixture({ fixture, candidates, judgeVerdicts = null }) {
 
   let judgePrecision = null;
   if (Array.isArray(judgeVerdicts) && judgeVerdicts.length === candidates.length) {
-    const judged = judgeVerdicts.filter((verdict) => verdict?.verdict);
+    // invalidCitation=无效裁决(judge 引用未过区间机械校验),不计入分母——与
+    // computeJudgeCalibration 同口径。门0 真跑曾在 5/5 全 void 下仍算出 40%(误导)。
+    const judged = judgeVerdicts.filter((verdict) => verdict?.verdict && !verdict.invalidCitation);
     judgePrecision =
       judged.length > 0
         ? judged.filter((verdict) => verdict.verdict === 'uphold').length / judged.length

@@ -74,9 +74,9 @@ export function buildJudgePrompt(candidate, slices) {
     '',
     'Final verdict: uphold (entailed + non-trivial + actionable) / narrow (true but over-scoped) / trivial / reject.',
     '',
-    'You MUST cite the slice lines that ground your verdict as "file:line" entries in citedLines — citations outside the provided slices invalidate your verdict.',
+    'You MUST cite the slice lines that ground your verdict as "file:line" or "file:start-end" entries in citedLines — every cited line must fall inside the provided slices; citations outside them invalidate your verdict.',
     '',
-    'Respond with ONLY a JSON object: {"entailment":"entailed|partial|not_entailed","trivial":bool,"actionable":bool,"scopeCorrect":bool,"verdict":"uphold|narrow|trivial|reject","citedLines":["file:line"],"reason":"<=60 words"}',
+    'Respond with ONLY a JSON object: {"entailment":"entailed|partial|not_entailed","trivial":bool,"actionable":bool,"scopeCorrect":bool,"verdict":"uphold|narrow|trivial|reject","citedLines":["file:line" | "file:start-end"],"reason":"<=60 words"}',
     '',
     '=== CANDIDATE ===',
     `title: ${String(candidate?.title ?? '')}`,
@@ -125,8 +125,10 @@ export function parseJudgeVerdict(text) {
 }
 
 /**
- * judge 引用机械校验(缓解③)：每条 citedLines("file:line")必须落在提供切片的区间内。
- * 与提交侧同一哲学——引用不被信任，被校验。
+ * judge 引用机械校验(缓解③)：每条 citedLines("file:line" 或 "file:start-end")必须
+ * 完整落在某一提供切片的区间内。与提交侧同一哲学——引用不被信任，被校验。
+ * 门0 真跑教训：切片头本身就以 "file:start-end" 展示,judge 自然照抄区间格式——
+ * 只认单行的旧正则把 5/5 条实质正确的引用全判无效(校验器与自己的展示格式打架)。
  */
 export function verifyJudgeCitations(verdict, slices) {
   if (!verdict) {
@@ -136,13 +138,17 @@ export function verifyJudgeCitations(verdict, slices) {
     return false;
   }
   return verdict.citedLines.every((cited) => {
-    const match = /^(.+?):(\d+)$/.exec(cited.trim());
+    const match = /^(.+?):(\d+)(?:-(\d+))?$/.exec(cited.trim());
     if (!match) {
       return false;
     }
-    const [, file, lineRaw] = match;
-    const line = Number(lineRaw);
-    return slices.some((slice) => slice.file === file && line >= slice.start && line <= slice.end);
+    const [, file, startRaw, endRaw] = match;
+    const start = Number(startRaw);
+    const end = endRaw ? Number(endRaw) : start;
+    if (end < start) {
+      return false;
+    }
+    return slices.some((slice) => slice.file === file && start >= slice.start && end <= slice.end);
   });
 }
 

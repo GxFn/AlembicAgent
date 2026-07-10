@@ -191,6 +191,44 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     expect(verifyJudgeCitations({ citedLines: [] }, slices)).toBe(false);
   });
 
+  it('verifyJudgeCitations：区间引用 "file:start-end"(切片头同款格式,门0 真跑主形态)', () => {
+    const slices = [{ file: 'file.ts', start: 2, end: 8, body: '' }];
+    // 完整落在切片内 → 有效。
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:3-6'] }, slices)).toBe(true);
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:2-8'] }, slices)).toBe(true);
+    // 跨出切片边界(哪怕部分越界)→ 无效。
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:6-12'] }, slices)).toBe(false);
+    // 倒置区间/畸形 → 无效。
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:6-3'] }, slices)).toBe(false);
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:3-'] }, slices)).toBe(false);
+    // 混合列表:一条无效即整体无效(every 语义)。
+    expect(verifyJudgeCitations({ citedLines: ['file.ts:3-6', 'file.ts:9-12'] }, slices)).toBe(
+      false
+    );
+  });
+
+  it('scoreFixture：invalidCitation 裁决不计入 judgePrecision 分母(与校准同口径)', () => {
+    const fixture = { id: 'fx2', expected: [], notExpected: [] };
+    // 3 条:有效 uphold + 无效 uphold(void) + 有效 reject → precision = 1/2。
+    const score = scoreFixture({
+      fixture,
+      candidates: [{ title: 'a' }, { title: 'b' }, { title: 'c' }],
+      judgeVerdicts: [
+        { verdict: 'uphold' },
+        { verdict: 'uphold', invalidCitation: true },
+        { verdict: 'reject' },
+      ],
+    });
+    expect(score.judgePrecision).toBe(0.5);
+    // 全部无效 → 无有效裁决,precision=null(而非误导性百分比——门0 真跑 5/5 void 曾算出 40%)。
+    const allVoid = scoreFixture({
+      fixture,
+      candidates: [{ title: 'a' }],
+      judgeVerdicts: [{ verdict: 'uphold', invalidCitation: true }],
+    });
+    expect(allVoid.judgePrecision).toBeNull();
+  });
+
   it('computeJudgeCalibration：一致率/过度泛化子集自偏签名/晋级判定', () => {
     const uphold = { verdict: 'uphold' };
     const reject = { verdict: 'reject' };
