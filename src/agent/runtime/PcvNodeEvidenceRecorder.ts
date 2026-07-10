@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
@@ -57,7 +58,7 @@ export interface PcvBurnGroundingLedgerEntry {
   acceptedFindingDelta: number;
   classification: PcvBurnGroundingClassification;
   consumedEvidenceRefs: string[];
-  deepseekV4ToolChoiceMode?: string | null;
+  deepseekV4ToolChoiceMode?: string | null; // provider-name-ok: recorded evidence field key
   deterministicEvidenceRefs: string[];
   effectiveToolChoice: string | null;
   evidenceStarterRefs: string[];
@@ -345,7 +346,7 @@ export function recordPcvInputAssembly(
   evidence: PcvNodeEvidenceSummary,
   assembly: LLMInputAssembly,
   options: {
-    deepseekV4ToolChoiceMode?: string | null;
+    deepseekV4ToolChoiceMode?: string | null; // provider-name-ok: recorded evidence field key
     effectiveToolChoice?: string | null;
     iteration?: number;
     modelRef?: string | null;
@@ -392,13 +393,15 @@ export function recordPcvInputAssembly(
     staticSectionIds,
     toolSchemaNames,
   };
-  const isDeepSeekV4 = /deepseek.*v4|deepseek-v4/i.test(modelRef || '');
+  // P1-B-3：provider 判定收敛到 ModelQuirks；记录字段名 deepseekV4ToolChoiceMode 是既有
+  // 证据形状(下游投影按名消费),保名不改。 provider-name-ok: recorded evidence shape
+  const forcedToolChoiceQuirk = resolveModelQuirks(modelRef).forcedToolChoiceUnsupported;
   upsertGroundingLedgerEntry(evidence, {
     acceptedFindingDelta: 0,
     classification: assembly.stageProfile === 'summarize' ? 'summary-only' : 'planning-only',
     consumedEvidenceRefs: [],
     // observe-only：mode 由 ProviderToolChoicePolicy 计算并传入，证据层只记录其结果（AP-1 消除 R4 往返）。
-    deepseekV4ToolChoiceMode: options.deepseekV4ToolChoiceMode ?? null,
+    deepseekV4ToolChoiceMode: options.deepseekV4ToolChoiceMode ?? null, // provider-name-ok: recorded evidence field key
     deterministicEvidenceRefs,
     effectiveToolChoice: options.effectiveToolChoice || null,
     evidenceStarterRefs,
@@ -414,10 +417,10 @@ export function recordPcvInputAssembly(
     stageProfile: assembly.stageProfile,
     textOutputChars: 0,
     toolCallDelta: 0,
-    toolChoiceSent: isDeepSeekV4 ? false : Boolean(options.effectiveToolChoice),
-    toolChoiceSupported: isDeepSeekV4 ? false : undefined,
+    toolChoiceSent: forcedToolChoiceQuirk ? false : Boolean(options.effectiveToolChoice),
+    toolChoiceSupported: forcedToolChoiceQuirk ? false : undefined,
     toolSchemaNames,
-    toolSchemasVisible: isDeepSeekV4 ? toolSchemaNames.length > 0 : undefined,
+    toolSchemasVisible: forcedToolChoiceQuirk ? toolSchemaNames.length > 0 : undefined,
     trackerPhase,
   });
 }

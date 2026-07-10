@@ -33,7 +33,7 @@ export function resolveProviderToolChoice(
   modelRef: string,
   requestedToolChoice: string
 ): ProviderToolChoiceDecision {
-  if (!isDeepSeekV4AnalyzeFirstBurn(ctx, modelRef)) {
+  if (!isAnalyzeFirstBurnGuardEligible(ctx, modelRef)) {
     return { keepToolSchemasVisible: false, mode: null };
   }
   if (requestedToolChoice !== 'none') {
@@ -50,7 +50,7 @@ export function resolveProviderToolChoice(
  * 行为对等迁出自 `PcvNodeEvidence.buildDeepSeekV4ToolChoiceMode`（含 isDeepSeekV4 门控，非 DeepSeek V4 → null）。
  * 计算源迁到本 provider 模块；`PcvNodeEvidence` 仅记录其结果，主循环抑制例外直接读本地结果（不回读 PCV burn）。
  */
-export function observeDeepSeekV4ToolChoiceMode(
+export function observeForcedToolChoiceMode(
   modelRef: string | null | undefined,
   requestedToolChoice: string | null | undefined,
   effectiveToolChoice: string | null | undefined
@@ -72,7 +72,7 @@ export function observeDeepSeekV4ToolChoiceMode(
  * 工具调用抑制的 DeepSeek V4 例外：当 provider policy 选择「首轮保留工具可见、不强制 tool_choice」时，
  * 即使 requestedToolChoice=none 也不抑制模型返回的工具调用（provider 正确性，避免误吞首轮取证调用）。
  */
-export function allowsDeepSeekV4ToolCalls(mode: string | null | undefined): boolean {
+export function allowsToolCallsUnderForcedNone(mode: string | null | undefined): boolean {
   return mode === 'tools-visible-no-forced-tool-choice';
 }
 
@@ -81,7 +81,7 @@ export function allowsDeepSeekV4ToolCalls(mode: string | null | undefined): bool
  * 行为对等迁出自 `AgentRuntime.isDeepSeekV4AnalyzeFirstGroundingBurn`；
  * analyze grounding gate（AP-2 领地）亦复用此首轮判定。
  */
-export function isDeepSeekV4AnalyzeFirstBurn(ctx: LoopContext, modelRef: string): boolean {
+export function isAnalyzeFirstBurnGuardEligible(ctx: LoopContext, modelRef: string): boolean {
   // P1-B-3：guard 适格由 ModelQuirks 声明(V4 家族)；phase 判定是 provider 中立的内核逻辑,保留。
   if (!resolveModelQuirks(modelRef).analyzeGroundingGuardEligible) {
     return false;

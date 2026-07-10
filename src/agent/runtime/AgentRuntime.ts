@@ -30,6 +30,12 @@
 
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
+import {
+  isTextCompatToolCallId,
+  NATIVE_TOOL_CALL_SOURCE,
+  resolveModelQuirks,
+  TEXT_COMPAT_CALL_SOURCE,
+} from '#ai/registry/ModelQuirks.js';
 import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
 import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import {
@@ -87,8 +93,8 @@ import {
   recordPcvToolRoundOutcome,
 } from './PcvNodeEvidenceRecorder.js';
 import {
-  allowsDeepSeekV4ToolCalls,
-  observeDeepSeekV4ToolChoiceMode,
+  allowsToolCallsUnderForcedNone,
+  observeForcedToolChoiceMode,
   resolveProviderToolChoice,
 } from './ProviderToolChoicePolicy.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
@@ -954,17 +960,19 @@ export class AgentRuntime {
     let llmResult: LLMResult;
     // provider tool-choice mode（observe-only）：在 try 内随 effectiveToolChoice 计算一次，
     // 跨 try/catch 携带到工具抑制判定，替代「写入 PCV burn 再读回」的 R4 往返。
-    let deepSeekV4ToolChoiceMode: string | null = null;
+    let providerToolChoiceMode: string | null = null;
     try {
       // toolChoice='none' 时是否保留 tool schemas 取决于供应商:
       //   - 保留: 维持 prefix cache (system prompt + tool schemas 不变 → cache hit)
       //   - 移除: DeepSeek V4 会因 hasTools=true 启用 thinking mode（增加 token 成本）;
       //           Gemini 在禁止调用但看到定义时可能返回空内容
       // 策略: DeepSeek V4 和 Gemini 移除 schemas，其他保留以获得 cache 收益
-      const isToolSchemaHarmful =
-        /deepseek-v4/i.test(this.#modelRef) || /gemini/i.test(this.#modelRef);
-      const deepSeekV4Grounding = resolveProviderToolChoice(ctx, this.#modelRef, toolChoice);
-      const effectiveToolSchemas = deepSeekV4Grounding.keepToolSchemasVisible
+      // P1-B-3：provider 判定收敛到 ModelQuirks(内核零 provider 名分支)。
+      const isToolSchemaHarmful = resolveModelQuirks(
+        this.#modelRef
+      ).dropToolSchemasWhenToolChoiceNone;
+      const providerToolChoice = resolveProviderToolChoice(ctx, this.#modelRef, toolChoice);
+      const effectiveToolSchemas = providerToolChoice.keepToolSchemasVisible
         ? toolSchemas.length > 0
           ? toolSchemas
           : undefined
@@ -976,13 +984,13 @@ export class AgentRuntime {
       const unifiedTools = effectiveToolSchemas as
         | import('#ai/AiProvider.js').ToolSchema[]
         | undefined;
-      const effectiveToolChoice = deepSeekV4Grounding.keepToolSchemasVisible
+      const effectiveToolChoice = providerToolChoice.keepToolSchemasVisible
         ? 'auto'
         : unifiedTools
           ? toolChoice
           : 'none';
       // PCV 仅观察该 mode（effective vs requested）；主循环抑制例外读本地结果，不回读 PCV burn。
-      deepSeekV4ToolChoiceMode = observeDeepSeekV4ToolChoiceMode(
+      providerToolChoiceMode = observeForcedToolChoiceMode(
         this.#modelRef,
         toolChoice,
         effectiveToolChoice
@@ -1012,7 +1020,7 @@ export class AgentRuntime {
         tools: unifiedTools,
       });
       recordPcvInputAssembly(ctx.pcvNodeEvidence, llmInputAssembly, {
-        deepseekV4ToolChoiceMode: deepSeekV4ToolChoiceMode,
+        deepseekV4ToolChoiceMode: providerToolChoiceMode, // provider-name-ok: recorded evidence field key
         effectiveToolChoice,
         iteration: ctx.iteration,
         modelRef: this.#modelRef,
@@ -1078,7 +1086,7 @@ export class AgentRuntime {
         ...llmTrace,
         messageCount: unifiedMessages.length,
         hasDynamicContext: Boolean(dynamicContext),
-        deepseekV4ToolChoiceMode: deepSeekV4Grounding.mode,
+        deepseekV4ToolChoiceMode: providerToolChoice.mode, // provider-name-ok: recorded evidence field key
         requestedToolChoice: toolChoice,
         effectiveToolChoice,
         toolSchemaCount: unifiedTools?.length || 0,
@@ -1211,10 +1219,9 @@ export class AgentRuntime {
     // 部分 LLM (DeepSeek 等) 可能仍然返回 tool calls，需要忽略。
     // Analyst 的 RECORD 阶段会暴露 note_finding-only 补记录窗口，不能在这里丢弃。
     const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE' || ctx.tracker?.phase === 'FINALIZE';
-    const allowDeepSeekV4GroundingToolCalls = allowsDeepSeekV4ToolCalls(deepSeekV4ToolChoiceMode);
+    const allowToolCallsUnderForcedNone = allowsToolCallsUnderForcedNone(providerToolChoiceMode);
     if (
-      (ctx.tracker?.isGracefulExit ||
-        (toolChoice === 'none' && !allowDeepSeekV4GroundingToolCalls)) &&
+      (ctx.tracker?.isGracefulExit || (toolChoice === 'none' && !allowToolCallsUnderForcedNone)) &&
       llmResult.functionCalls?.length &&
       llmResult.functionCalls.length > 0
     ) {
@@ -2647,9 +2654,7 @@ function isDeveloperVisibleReflectionNudge(type: string): boolean {
 function inferFunctionCallSource(call: { id?: string }) {
   // DeepSeek 文本兼容桥会生成 call_deepseek_compat_*。这类调用可以写入
   // ActiveContext，但不能被当作 provider native tool_calls 证据。
-  return call.id?.startsWith('call_deepseek_compat_')
-    ? 'deepseek_text_compat'
-    : 'native_or_provider_tool_call';
+  return isTextCompatToolCallId(call.id) ? TEXT_COMPAT_CALL_SOURCE : NATIVE_TOOL_CALL_SOURCE;
 }
 
 function isNoteFindingFunctionCall(call: { name?: string; args?: Record<string, unknown> }) {

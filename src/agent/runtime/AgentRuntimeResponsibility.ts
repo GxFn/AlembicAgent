@@ -174,12 +174,12 @@ const FEATURE_FLAGS = [
     sourceRefs: ['src/ai/AiFactory.ts'],
   },
   {
-    name: 'ALEMBIC_DEEPSEEK_REASONING_EFFORT',
+    name: 'ALEMBIC_DEEPSEEK_REASONING_EFFORT', // provider-name-ok: env manifest record, owner=provider-adapter
     owner: 'provider-adapter',
     defaultValue: 'high',
     productionRelevant: true,
     allowedValues: ['low', 'medium', 'high'],
-    sourceRefs: ['src/ai/providers/DeepSeekProvider.ts'],
+    sourceRefs: ['src/ai/providers/DeepSeekProvider.ts'], // provider-name-ok: env manifest record, owner=provider-adapter
   },
 ] as const satisfies readonly AgentRuntimeFeatureFlag[];
 

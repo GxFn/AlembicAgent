@@ -1,7 +1,7 @@
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { LoopContext } from './LoopContext.js';
 import { getLatestPcvBurnGrounding } from './PcvNodeEvidenceRecorder.js';
-import { isDeepSeekV4AnalyzeFirstBurn } from './ProviderToolChoicePolicy.js';
+import { isAnalyzeFirstBurnGuardEligible } from './ProviderToolChoicePolicy.js';
 
 /**
  * AnalyzeGroundingGuard — analyze grounding enforcement（runtime 质量门层）。
@@ -15,7 +15,7 @@ import { isDeepSeekV4AnalyzeFirstBurn } from './ProviderToolChoicePolicy.js';
  * - 命名归位：不带 `Pcv*` 前缀，与证据记录层分离。
  * - PD5：guard **仅含**「政策文本 + nudge + 阻断」；证据 ref 列表注入（deterministicEvidenceRefs /
  *   evidenceStarterRefs）**不属本 guard**，保留为默认 analyze 上下文（有用 grounding 材料、非强制控制）。
- * - 依赖方向：guard 单向读 `ProviderToolChoicePolicy.isDeepSeekV4AnalyzeFirstBurn`（guard→provider 下行），
+ * - 依赖方向：guard 单向读 `ProviderToolChoicePolicy.isAnalyzeFirstBurnGuardEligible`（guard→provider 下行），
  *   provider 不依赖 guard（无反向 / 循环）。
  * - 行为对等：AP-2 仅迁移、不改行为；AP-3 已将 groundingEnforcement 默认切为 `'off'`。
  *   本 guard 只在 runtime 默认或 per-run override 显式 opt-in 为 `'guard'` 时注入政策文本并触发阻断。
@@ -33,8 +33,8 @@ export function buildAnalyzeGroundingPolicy(
   deterministicRefCount: number
 ): string {
   // P1-B-3：provider 附加句由 ModelQuirks 声明(字面量移入 src/ai)。
-  const deepseekMode = resolveModelQuirks(modelRef).groundingPolicyProviderNote ?? '';
-  return `Every analyze burn that advances a conclusion must consume cited deterministic evidence refs or produce new tool evidence. Planning-only text may choose the next evidence frontier but must not assert verified facts.${deterministicRefCount > 0 ? ' Cite the relevant deterministicEvidenceRefs when using injected evidence.' : ''}${deepseekMode}`;
+  const providerNote = resolveModelQuirks(modelRef).groundingPolicyProviderNote ?? '';
+  return `Every analyze burn that advances a conclusion must consume cited deterministic evidence refs or produce new tool evidence. Planning-only text may choose the next evidence frontier but must not assert verified facts.${deterministicRefCount > 0 ? ' Cite the relevant deterministicEvidenceRefs when using injected evidence.' : ''}${providerNote}`;
 }
 
 /**
@@ -47,7 +47,7 @@ export function evaluateAnalyzeTextGroundingGate(
   modelRef: string
 ): { block: boolean; nudge: string; reason: string } {
   const burn = getLatestPcvBurnGrounding(ctx.pcvNodeEvidence);
-  if (!burn || !isDeepSeekV4AnalyzeFirstBurn(ctx, modelRef)) {
+  if (!burn || !isAnalyzeFirstBurnGuardEligible(ctx, modelRef)) {
     return { block: false, nudge: '', reason: '' };
   }
   if (burn.classification !== 'invalid-no-evidence') {
@@ -61,7 +61,7 @@ export function evaluateAnalyzeTextGroundingGate(
   return {
     block: true,
     reason:
-      'DeepSeek V4 analyze burn returned text without deterministic evidence consumption, evidence tool calls, or finding delta.',
+      'Analyze burn returned text without deterministic evidence consumption, evidence tool calls, or finding delta.',
     nudge:
       '本轮 analyze 文本没有可观测证据 grounding，不能推进阶段。' +
       `${refsHint} 如果只是规划下一步，只输出取证计划并绑定 evidence refs；如果要推进事实结论，必须先产生或消费可复核证据。`,
