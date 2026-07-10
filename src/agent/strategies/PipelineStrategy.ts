@@ -188,12 +188,21 @@ function withProducerCoverageBudget(
 }
 
 /**
- * P0-4：读取 knowledge.submit 修复层的会话命中计数。计数由 handler 挂在 runtime 对象上
- * (`_submitRepairStats`，与 `_styleWaiverTotal`/`_gateRejectStreak` 同款模式)；这里只做
- * 防御性读取——形状不对/为空一律返回 null(不投影)，绝不让观测面影响执行。
+ * P0-4：读取 knowledge.submit 修复层的会话命中计数。计数宿主是 sharedState._sessionCounters
+ * 嵌套盒(handler 侧 sessionCounterBox 写入)——不能挂 runtime：ToolExecutionPipeline 给
+ * handler 的 ctx.runtime 是每次调用现造的一次性投影,写上去即弃(门0 真跑实测假零后根修)；
+ * 嵌套盒同时对阶段级 sharedState 浅拷贝免疫(拷贝保留盒引用)。这里只做防御性读取——
+ * 形状不对/为空一律返回 null(不投影)，绝不让观测面影响执行。
  */
-function readSubmitRepairStats(runtime: PipelineRuntime): Record<string, number> | null {
-  const raw = (runtime as unknown as Record<string, unknown>)._submitRepairStats;
+function readSubmitRepairStats(sharedState: unknown): Record<string, number> | null {
+  if (!sharedState || typeof sharedState !== 'object') {
+    return null;
+  }
+  const box = (sharedState as Record<string, unknown>)._sessionCounters;
+  if (!box || typeof box !== 'object' || Array.isArray(box)) {
+    return null;
+  }
+  const raw = (box as Record<string, unknown>).submitRepairStats;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return null;
   }
@@ -266,6 +275,22 @@ export class PipelineStrategy extends Strategy {
       retryExhausted: false,
     };
 
+    // 会话计数盒预建：必须在任何阶段对 sharedState 做浅拷贝之前把嵌套盒挂上——
+    // handler 侧经 ToolExecutionPipeline 每次调用一次性 runtime 投影里的 sharedState 引用
+    // 写入同一个盒(修复层计量/waiver 上限/拒绝止损三族计数)，收尾投影从盒读取。
+    // 无 sharedState 的宿主保持原静默不计语义。
+    const baseSharedStateForCounters = ctx.strategyContext.sharedState as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (
+      baseSharedStateForCounters &&
+      typeof baseSharedStateForCounters === 'object' &&
+      !baseSharedStateForCounters._sessionCounters
+    ) {
+      baseSharedStateForCounters._sessionCounters = {};
+    }
+
     for (let i = 0; i < this.#stages.length; i++) {
       const stage = this.#stages[i];
 
@@ -304,9 +329,10 @@ export class PipelineStrategy extends Strategy {
     // P0-4：管线结局一等化。phases 会原样穿透 AgentRuntime.execute → AgentRunResult.phases
     // → coordinator child result → merger，因此 _pipelineOutcome 是父 run 聚合
     // abandonedModules 的唯一读取面(下划线内部键与 _retries_/_retryContext 同一先例)。
-    // submitRepairs 是 knowledge.submit 各确定性修复层的会话命中计数(挂在 runtime 上，
-    // 与 _styleWaiverTotal 同款挂载)——在此投影，评估 harness 据此算 repair-hit-rate。
-    const submitRepairs = readSubmitRepairStats(runtime);
+    // submitRepairs 是 knowledge.submit 各确定性修复层的会话命中计数(宿主=sharedState 的
+    // _sessionCounters 嵌套盒,见 readSubmitRepairStats 注释)——在此投影，
+    // 评估 harness 据此算 repair-hit-rate。
+    const submitRepairs = readSubmitRepairStats(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
     const abandoned = ctx.degraded || ctx.retryExhausted;
     ctx.phaseResults._pipelineOutcome = {

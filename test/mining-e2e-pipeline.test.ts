@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
+import { runModuleMining } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import type { FunctionCall, LLMResult } from '../src/agent/runtime/AgentRuntimeTypes.js';
 import { createSystemRunContext } from '../src/agent/runtime/SystemRunContext.js';
 import type { AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
@@ -202,12 +203,15 @@ class ScriptedMiningProvider {
   readonly model = 'deepseek-chat';
   behavior: 'healthy' | 'no-findings';
   onProducerFirstCall: (() => void) | null = null;
+  /** true 时 producer 提交 file-only sources(无区间)——确定性触发 evidence_sanitized 修复层。 */
+  #bareSources: boolean;
   #analystRound = 0;
   #submitted = false;
   #refsByFile = new Map<string, string>();
 
-  constructor(behavior: 'healthy' | 'no-findings') {
+  constructor(behavior: 'healthy' | 'no-findings', opts: { bareSources?: boolean } = {}) {
     this.behavior = behavior;
+    this.#bareSources = opts.bareSources === true;
   }
 
   async chatWithTools(_prompt: string, opts: Record<string, unknown>): Promise<LLMResult> {
@@ -257,11 +261,13 @@ class ScriptedMiningProvider {
                     'All three existing handlers (user/order/billing) wrap their bodies with wrapResult, so consumers pattern-match on Result instead of catching exceptions; a handler that throws raw errors outward breaks that contract.',
                 },
                 reasoning: {
-                  sources: [
-                    'src/handlers/user-handler.ts:11-19',
-                    'src/handlers/order-handler.ts:11-19',
-                    'src/handlers/billing-handler.ts:13-21',
-                  ],
+                  sources: this.#bareSources
+                    ? [...HANDLER_FILES]
+                    : [
+                        'src/handlers/user-handler.ts:11-19',
+                        'src/handlers/order-handler.ts:11-19',
+                        'src/handlers/billing-handler.ts:13-21',
+                      ],
                   evidenceRefs: refs,
                 },
               },
@@ -462,6 +468,43 @@ describe('mining E2E — 真实组合链路(fixture 仓 + 脚本化 provider)', 
     // 5) 台账真实工作过：analyst 的 read 走了证据采集(工具调用里有 code.read + note_finding)。
     const toolDump = JSON.stringify(result.toolCalls ?? []);
     expect(toolDump).toContain('note_finding');
+  });
+
+  it('生产入口 runScopedModuleMining：修复层计数(evidence_sanitized)跨调用累计并投影到 child _pipelineOutcome.submitRepairs', {
+    timeout: E2E_TIMEOUT,
+  }, async () => {
+    const fixtureRoot = materializeFixture();
+    // bareSources：producer 提交 file-only sources → sanitizeSubmissionEvidence 确定性矫正
+    // 为 file:1-N 并 bump evidence_sanitized(门0 真跑同款形态)。走生产入口而非直呼 profile：
+    // 计数假零正是入口差异+一次性 runtime 投影叠加暴露的,本用例锁定整条真实链。
+    const provider = new ScriptedMiningProvider('healthy', { bareSources: true });
+    const { agentService, runInput, created } = assembleMiningRun({
+      provider,
+      fixtureRoot,
+      moduleId: 'mod-repair-flow',
+    });
+
+    const result = await runModuleMining({
+      agentService: {
+        run: (request) =>
+          agentService.run({
+            ...request,
+            context: {
+              ...((request as { context?: Record<string, unknown> }).context || {}),
+              childContexts: runInput.context.childContexts,
+            },
+          } as never),
+      },
+      modules: runInput.params.modules,
+      projectFacts: runInput.params.projectFacts,
+    });
+
+    expect(result.status).toBe('success');
+    expect(created).toHaveLength(1);
+    const outcome = childOutcome(result, 'mod-repair-flow');
+    expect(outcome.outcome).toBe('completed');
+    const repairs = (outcome.submitRepairs ?? {}) as Record<string, number>;
+    expect(repairs.evidence_sanitized).toBeGreaterThanOrEqual(1);
   });
 
   it('EVIDENCE_STALE 负例：produce 首调前改写被引用文件 → 新鲜度重哈希拒绝，零候选', {

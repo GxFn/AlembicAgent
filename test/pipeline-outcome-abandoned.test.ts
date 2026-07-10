@@ -4,7 +4,9 @@
  * 背景：弱维度被质量门 degrade 后此前静默产 0 候选(只留日志)，父 run/评估 harness 拿不到
  * "哪个单元、哪个门、什么原因被放弃"。本测试锁定三段新契约：
  *   1) PipelineStrategy 在 phases._pipelineOutcome 投影 {outcome, stage, action, reason}；
- *   2) runtime 上的 knowledge.submit 修复层计数(_submitRepairStats)随 outcome 投影(submitRepairs)；
+ *   2) sharedState._sessionCounters 盒里的 submit 修复层计数随 outcome 投影(submitRepairs)——
+ *      宿主必须是 sharedState 嵌套盒而非 runtime：handler 拿到的 ctx.runtime 是
+ *      ToolExecutionPipeline 每次调用现造的一次性投影(门0 真跑实测假零的根因)；
  *   3) fan-out merger 把 abandoned child 聚合为父结果 phases.abandonedModules(一等字段)。
  */
 import { describe, expect, it } from 'vitest';
@@ -128,21 +130,62 @@ describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
     expect(calls).toHaveLength(2); // analyze + produce
   });
 
-  it('runtime 上的 _submitRepairStats 投影为 submitRepairs(repair-hit-rate 观测面)', async () => {
+  it('sharedState._sessionCounters 盒里的修复计数投影为 submitRepairs(repair-hit-rate 观测面)', async () => {
     const { runtime } = createFakeRuntime();
-    (runtime as unknown as Record<string, unknown>)._submitRepairStats = {
-      core_code_backfilled: 2,
-      style_waiver: 1,
-      // 形状防御：非正数不投影。
-      bogus: 0,
+    const sharedState: Record<string, unknown> = {
+      _sessionCounters: {
+        submitRepairStats: {
+          core_code_backfilled: 2,
+          style_waiver: 1,
+          // 形状防御：非正数不投影。
+          bogus: 0,
+        },
+      },
     };
     const strategy = new PipelineStrategy({ stages: [{ name: 'produce' }] });
 
-    const result = await strategy.execute(runtime, new AgentMessage({ content: 'submit' }));
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'submit' }), {
+      strategyContext: { sharedState },
+    });
 
     expect(pipelineOutcome(result)).toEqual({
       outcome: 'completed',
       submitRepairs: { core_code_backfilled: 2, style_waiver: 1 },
+    });
+  });
+
+  it('execute 入口预建计数盒；运行中经"每调用一次性 runtime 投影"写入的计数被收尾投影读到', async () => {
+    // 模拟 handler 真实数据流：ToolExecutionPipeline 每次工具调用现造投影对象
+    // {sharedState: loopCtx.sharedState}——写在投影对象自身的字段即弃，写进
+    // sharedState._sessionCounters 嵌套盒才跨调用存活(本测试锁定该契约)。
+    const sharedState: Record<string, unknown> = {};
+    const runtime = {
+      id: 'fake-runtime',
+      async reactLoop() {
+        const perCallProjection: Record<string, unknown> = { sharedState };
+        const shared = perCallProjection.sharedState as Record<string, unknown>;
+        const box = shared._sessionCounters as Record<string, unknown>;
+        const stats = (box.submitRepairStats as Record<string, number> | undefined) ?? {};
+        stats.evidence_sanitized = (Number(stats.evidence_sanitized) || 0) + 1;
+        box.submitRepairStats = stats;
+        return {
+          reply: 'stage output long enough to be a reply',
+          toolCalls: [],
+          tokenUsage: { input: 10, output: 10 },
+          iterations: 1,
+        };
+      },
+    };
+    const strategy = new PipelineStrategy({ stages: [{ name: 'analyze' }, { name: 'produce' }] });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'submit' }), {
+      strategyContext: { sharedState },
+    });
+
+    // 两个阶段各 bump 一次 → 累计 2(跨调用单调累计,不是每调用归零)。
+    expect(pipelineOutcome(result)).toEqual({
+      outcome: 'completed',
+      submitRepairs: { evidence_sanitized: 2 },
     });
   });
 });

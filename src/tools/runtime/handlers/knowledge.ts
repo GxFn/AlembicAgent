@@ -686,8 +686,10 @@ async function handleSubmit(
     // 重新提交即放行，理由随 reasoning.styleWaiver 落库，由 Dashboard 人工审核终裁。
     // 每会话 waiver 上限 5 次防滥用；混有硬违规时申辩无效(先修事实错误)。
     if (gateViolations.length > 0) {
-      const waiverState = ctx.runtime as Record<string, unknown> | undefined;
-      const waiverTotal = Number(waiverState?._styleWaiverTotal) || 0;
+      // waiver 每会话上限的累计宿主必须跨调用稳定(sessionCounterBox)——挂 ctx.runtime 时
+      // 每次调用都从 0 起算,上限 5 形同虚设(与修复层计数同因,门0 真跑后根修)。
+      const waiverBox = sessionCounterBox(ctx.runtime);
+      const waiverTotal = Number(waiverBox?.styleWaiverTotal) || 0;
       const waiver = applyStyleWaiver({
         violations: gateViolations,
         justification: pickString(params.waiverJustification),
@@ -697,8 +699,8 @@ async function handleSubmit(
       if (waiver.waived) {
         effectiveItem = waiver.item;
         bumpSubmitRepairStat(ctx.runtime, 'style_waiver');
-        if (waiverState) {
-          waiverState._styleWaiverTotal = waiverTotal + 1;
+        if (waiverBox) {
+          waiverBox.styleWaiverTotal = waiverTotal + 1;
         }
         Logger.getInstance().warn(
           `[knowledge.submit] style waiver accepted (${waiver.waivedCodes.join(', ')}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), session waivers=${waiverTotal + 1}/${STYLE_WAIVER_SESSION_LIMIT} — pending human review`
@@ -799,13 +801,15 @@ async function handleSubmit(
       // F3 拒绝止损：真机 ts-js-module 曾因「拒绝→重试」循环烧穿 produce 阶段 900s（stage_timeout
       // 连坐 session abort 下游 8 维度）。在 runtime 上维护连续/累计拒绝计数，按档位在拒绝消息里
       // 附加 STOP 指令，让模型跳过修不动的候选、及时收束——预算换覆盖，而不是死磕单条。
-      const runtimeState = ctx.runtime as Record<string, unknown> | undefined;
+      // 止损计数宿主同 waiver:必须用 sessionCounterBox——此前挂 ctx.runtime(每调用一次性
+      // 投影对象),streak/total 每次从 0 起算,3/12 档位从未触发,900s 烧穿护栏实际失效。
+      const stopLossBox = sessionCounterBox(ctx.runtime);
       let stopDirective = '';
-      if (runtimeState) {
-        const streak = (Number(runtimeState._gateRejectStreak) || 0) + 1;
-        const total = (Number(runtimeState._gateRejectTotal) || 0) + 1;
-        runtimeState._gateRejectStreak = streak;
-        runtimeState._gateRejectTotal = total;
+      if (stopLossBox) {
+        const streak = (Number(stopLossBox.gateRejectStreak) || 0) + 1;
+        const total = (Number(stopLossBox.gateRejectTotal) || 0) + 1;
+        stopLossBox.gateRejectStreak = streak;
+        stopLossBox.gateRejectTotal = total;
         if (total >= 12) {
           stopDirective =
             ' 🛑 STOP: 本会话门禁拒绝已达预算上限——禁止再调用 knowledge submit，立即输出最终总结，把未通过的候选列为 blocker（这不算失败）。';
@@ -829,8 +833,11 @@ async function handleSubmit(
       );
     }
     // 门禁通过即中断连续拒绝计数（提交成败由下游 gateway 判定，与门禁止损无关）。
-    if (ctx.runtime) {
-      (ctx.runtime as Record<string, unknown>)._gateRejectStreak = 0;
+    {
+      const passBox = sessionCounterBox(ctx.runtime);
+      if (passBox) {
+        passBox.gateRejectStreak = 0;
+      }
     }
 
     const result = await gateway.create({
@@ -920,24 +927,53 @@ function pickString(value: unknown): string | undefined {
 }
 
 /**
+ * 会话级计数盒(修复层计量/waiver 上限/拒绝止损三族共用宿主)。
+ *
+ * 为什么不能挂 ctx.runtime：ToolExecutionPipeline.buildRuntimeToolCallRequest 对每次工具
+ * 调用现造一个一次性 runtime 投影对象——直接写在 ctx.runtime 上的字段随调用即弃(门0 真跑
+ * 实测：修复层日志触发而计数恒空；waiver 上限与拒绝止损同因失效,streak 永远到不了阈值)。
+ * 为什么是嵌套盒而非 sharedState 顶层字段：PipelineStrategy 的 decisionOnly/recordRepair
+ * 阶段会对 sharedState 做浅拷贝,顶层字段写在拷贝上会丢；浅拷贝保留嵌套对象引用,盒内
+ * 计数在整个维度会话内单调累计。盒由 PipelineStrategy.execute 入口预建(先于任何阶段拷贝)；
+ * 此处兜底自建覆盖非管线宿主。无 sharedState 时返回 null → 计数静默跳过(观测不影响执行)。
+ */
+function sessionCounterBox(runtime: unknown): Record<string, unknown> | null {
+  if (!runtime || typeof runtime !== 'object') {
+    return null;
+  }
+  const shared = (runtime as Record<string, unknown>).sharedState;
+  if (!shared || typeof shared !== 'object' || Array.isArray(shared)) {
+    return null;
+  }
+  const state = shared as Record<string, unknown>;
+  const existing = state._sessionCounters;
+  if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+    return existing as Record<string, unknown>;
+  }
+  const box: Record<string, unknown> = {};
+  state._sessionCounters = box;
+  return box;
+}
+
+/**
  * P0-4(挖掘质量升级)：submit 修复层命中计数。submit 周围有多层"模型输出不合格→程序
  * 确定性代修"的修复路径(refs 回推/证据矫正/coreCode 回填/snippet 规范化/graph refs 注入/
  * style waiver/风格修复子调用/advisory 降级)——此前只有日志，无法回答"哪些修复层在真实
- * 承重、哪些是死枝"。计数挂在 runtime 上(与 _styleWaiverTotal 同款会话级挂载)，由
- * PipelineStrategy 在管线收口时投影进 phases._pipelineOutcome.submitRepairs，评估 harness
- * 据此算 repair-hit-rate；P2 契约收紧时按计量裁撤而非盲删。计数失败静默(观测不影响执行)。
+ * 承重、哪些是死枝"。计数挂在 sessionCounterBox(见上,跨调用稳定)，由 PipelineStrategy
+ * 在管线收口时投影进 phases._pipelineOutcome.submitRepairs，评估 harness 据此算
+ * repair-hit-rate；P2 契约收紧时按计量裁撤而非盲删。计数失败静默(观测不影响执行)。
  */
 function bumpSubmitRepairStat(runtime: unknown, key: string): void {
-  if (!runtime || typeof runtime !== 'object') {
+  const box = sessionCounterBox(runtime);
+  if (!box) {
     return;
   }
-  const state = runtime as Record<string, unknown>;
   const stats =
-    state._submitRepairStats && typeof state._submitRepairStats === 'object'
-      ? (state._submitRepairStats as Record<string, number>)
+    box.submitRepairStats && typeof box.submitRepairStats === 'object'
+      ? (box.submitRepairStats as Record<string, number>)
       : {};
   stats[key] = (Number(stats[key]) || 0) + 1;
-  state._submitRepairStats = stats;
+  box.submitRepairStats = stats;
 }
 
 interface DimensionMetaLike {
