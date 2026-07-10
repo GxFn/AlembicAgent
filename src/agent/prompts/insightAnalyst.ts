@@ -201,6 +201,40 @@ export function computeAnalystBudget(
 
   // Session token 预算: 基于 ContextWindow budget 动态计算
   // 每轮 input token ≈ contextWindowBudget × avgUsageRatio
+  return analystBudgetForIterations(maxIter, contextWindowBudget);
+}
+
+/**
+ * P1-B-2(挖掘质量升级)：模块作用域的 Analyst 预算。
+ * computeAnalystBudget 以【全项目 fileCount】为基准——module-mining child 只负责一个模块，
+ * 500 文件项目里 3 文件小模块拿全项目档位(过配)、fan-out 后大小模块又同配(欠配)。
+ * 这里以【模块 ownedFiles 数】为基准分档(阈值为可调默认)；session 数学与项目档单源共享。
+ */
+export function computeModuleAnalystBudget(
+  moduleFileCount: number,
+  contextWindowBudget?: number
+): typeof ANALYST_BUDGET & { timeoutMs: number } {
+  const clamped = Math.max(0, moduleFileCount);
+  let maxIter: number;
+  if (clamped <= 10) {
+    maxIter = 18;
+  } else if (clamped <= 30) {
+    maxIter = 26;
+  } else if (clamped <= 60) {
+    maxIter = 34;
+  } else {
+    maxIter = 40;
+  }
+  return analystBudgetForIterations(maxIter, contextWindowBudget);
+}
+
+/** 迭代数 → 完整预算的共享数学(session token 估算/timeout 缩放,项目档与模块档单源)。 */
+function analystBudgetForIterations(
+  maxIter: number,
+  contextWindowBudget?: number
+): typeof ANALYST_BUDGET & { timeoutMs: number } {
+  // Session token 预算: 基于 ContextWindow budget 动态计算
+  // 每轮 input token ≈ contextWindowBudget × avgUsageRatio
   // 早期轮次 usage 较低(~40%), 后期接近上限(~70%), 取加权平均 ~60%
   const cwBudget = contextWindowBudget || 15_000;
   const avgInputPerRound = Math.ceil(cwBudget * 0.6);

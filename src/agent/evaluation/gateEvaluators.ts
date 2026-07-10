@@ -58,6 +58,65 @@ interface InsightGateStrategyContext {
  * @param strategyContext orchestrator 注入的运行时上下文
  * @returns }
  */
+/**
+ * P1-B-4(挖掘质量升级)：provider 中立的模块覆盖度门——applyGraphRetryGate 的替代者。
+ * 旧门"命令模型调 graph"(DeepSeek 实测不从,已删)；本门判据是确定性事实：
+ * artifact.referencedFiles=Analyst 真实读过/接地过的文件。模块 ownedFiles 够多(≥minModuleFiles)
+ * 而其中被接地的 <minGroundedOwnedFiles 时,把 pass 改为 analysis_retry 并点名未读文件——
+ * 定向补读,不重挖已达标部分。仅在基础门 pass 后叠加(不干扰更优先的 record_repair 等动作)；
+ * retry 次数由外层 gate.maxRetries 统一约束,耗尽走 retry_exhausted 一等出口。
+ */
+export function applyModuleCoverageGate<
+  T extends { pass: boolean; action?: string; reason?: string },
+>(
+  gate: T,
+  artifact: Record<string, unknown>,
+  strategyContext: Record<string, unknown> = {},
+  { minModuleFiles = 8, minGroundedOwnedFiles = 3 } = {}
+): T {
+  if (!gate.pass) {
+    return gate;
+  }
+  const moduleContext =
+    strategyContext.moduleContext && typeof strategyContext.moduleContext === 'object'
+      ? (strategyContext.moduleContext as { ownedFiles?: unknown })
+      : null;
+  const ownedFiles = Array.isArray(moduleContext?.ownedFiles)
+    ? (moduleContext.ownedFiles as unknown[]).filter(
+        (file): file is string => typeof file === 'string'
+      )
+    : [];
+  if (ownedFiles.length < minModuleFiles) {
+    return gate;
+  }
+  const referenced = Array.isArray(artifact.referencedFiles)
+    ? (artifact.referencedFiles as unknown[]).filter(
+        (file): file is string => typeof file === 'string'
+      )
+    : [];
+  // 路径形态宽容匹配(referencedFiles 可能带仓根前缀或相对形态)。
+  const grounded = ownedFiles.filter((owned) =>
+    referenced.some(
+      (ref) => ref === owned || ref.endsWith(`/${owned}`) || owned.endsWith(`/${ref}`)
+    )
+  );
+  if (grounded.length >= minGroundedOwnedFiles) {
+    return gate;
+  }
+  const unread = ownedFiles
+    .filter((owned) => !grounded.includes(owned))
+    .slice(0, 5)
+    .join(', ');
+  return {
+    ...gate,
+    pass: false,
+    action: 'analysis_retry',
+    reason:
+      `Module coverage too thin: only ${grounded.length}/${ownedFiles.length} owned files grounded. ` +
+      `Read these key files with code.read before concluding: ${unread}`,
+  };
+}
+
 export function insightGateEvaluator(
   source: unknown,
   phaseResults: Record<string, unknown>,
@@ -82,16 +141,19 @@ export function insightGateEvaluator(
     strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
       ? (strategyContext.sharedState as Record<string, unknown>)
       : null;
-  // F4g graph-retry 已停用（保留函数供未来模型再评估）：沙箱第 8/9 轮实测 DeepSeek 对明确
-  // retry 指令仍不调 graph，retry 只会把维度拖成 error（比 GRAPH 拒绝更糟）。关系声明的
-  // graph 背书走 F4e 注入（Analyst 恰好调了 graph 时），否则由 submit 拒绝反馈改述。
-  const gate = applyDepthRetryGate(
+  // F4g graph-retry 已删除(P1-B-4)：它靠"命令模型调 graph"，DeepSeek 实测不从(retry 只把
+  // 维度拖成 error)。替代者是下方 applyModuleCoverageGate——判据来自确定性事实(实读/接地
+  // 了哪些文件)，与 provider 意愿无关。关系声明的 graph 背书仍走 F4e 注入/submit 拒绝反馈。
+  let gate = applyDepthRetryGate(
     analysisQualityGate(artifact, {
       outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
     }),
     artifact as Record<string, unknown>,
     Boolean(needsCandidates)
   );
+  // P1-B-4：provider 中立覆盖度门。模块够大而 Analyst 接地的 owned 文件过少 → 定向 retry
+  // (点名未读文件)。retry 耗尽走 F2 retry_exhausted 一等出口，不会死循环。
+  gate = applyModuleCoverageGate(gate, artifact as Record<string, unknown>, strategyContext);
   // F4e：把 Analyst 真实 graph 查询的可复制 refs 经 sharedState 传给 submit handler——
   // GRAPH_REF_INVALID 拒绝时 handler 自动注入（替模型完成「复制」动作；graphEvidence
   // 为空则无背书可注入，保持拒绝，绝不编造）。与 pcv 数据走 sharedState 同一先例模式。

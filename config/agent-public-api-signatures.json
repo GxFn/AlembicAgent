@@ -1229,7 +1229,7 @@
     },
     "./prompts": {
       "exportCount": 30,
-      "signatureHash": "31166f68ef6742b90560d7dead0c06052ad29952d6d812795aae0f3a59f491af",
+      "signatureHash": "d83031b7388e262c32e9b58995a31bfee797a98eb8c5bf152368f3abb7e6c3c9",
       "entries": [
         {
           "name": "ANALYST_BUDGET",
@@ -1277,10 +1277,6 @@
         },
         {
           "name": "applyDepthRetryGate",
-          "kind": "function"
-        },
-        {
-          "name": "applyGraphRetryGate",
           "kind": "function"
         },
         {
@@ -1333,6 +1329,10 @@
         },
         {
           "name": "computeAnalystBudget",
+          "kind": "function"
+        },
+        {
+          "name": "computeModuleAnalystBudget",
           "kind": "function"
         },
         {

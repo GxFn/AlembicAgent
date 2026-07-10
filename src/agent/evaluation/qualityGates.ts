@@ -11,7 +11,7 @@
  *   applyGateThresholds(原 :680)、analysisQualityGateV1(原 :737)
  * - getArtifactMemoryFindingCount(原 :842;门与 repair prompt 共用,改由本文件单源导出)
  * - reviewInsightDepth(原 :981)、applyDepthRetryGate(原 :1002)、
- *   applyGraphRetryGate(原 :1069,F4g 停用零消费,注释明示保留待模型再评估——随迁不删)
+ *   applyGraphRetryGate 已删除(P1-B-4)：由 gateEvaluators.applyModuleCoverageGate 替代(确定性覆盖度判据,与 provider 意愿无关)
  *
  * ⚠️ 跨段路由常量契约:DEPTH_GAP_REASON 与两条 suggestion 常量既是本文件门控产出的
  * reason/suggestion 字面,也是 prompts/insightGate.ts buildRetryPrompt 的路由键
@@ -422,43 +422,3 @@ const GRAPH_RELATIONSHIP_CN_RE = RELATIONSHIP_CN_RE;
 /** graph-retry 的 reason（buildRetryPrompt 会把它呈给 Analyst 作为重挖指令） */
 const GRAPH_GAP_REASON =
   'Relationship claims lack graph backing: run ONE graph({ action: "query" }) on the core classes/modules you already identified, then re-summarize. Do not add new topics.';
-
-/**
- * F4g graph-retry 门（与 depth-retry 同模式）：候选生成维度的分析含关系词（依赖/分层/调用），
- * 但本会话没有任何真实 graph 查询（graphEvidence 空）时，回炉一次补 graph——它是关系声明过
- * GRAPH_REF 门禁的唯一诚实背书（F4e 只注入真实查询产物，绝不合成）。七轮真机证明动机提示
- * 不足以让 DeepSeek 主动调 graph；把它变成 QualityGate 判据后 retry 指令单一明确。
- * retry 次数由 pipeline 上限兜底，不会无限循环。
- */
-export function applyGraphRetryGate(
-  baseGate: GateResult,
-  artifact: Record<string, unknown>,
-  needsCandidates: boolean,
-  sharedState: Record<string, unknown> | null = null
-): GateResult {
-  if (!needsCandidates || !baseGate.pass) {
-    return baseGate;
-  }
-  const graphEvidence = (artifact as { graphEvidence?: string[] }).graphEvidence;
-  if (Array.isArray(graphEvidence) && graphEvidence.length > 0) {
-    return baseGate;
-  }
-  // 单次尝试后放行：第 8 轮真机证明 DeepSeek 对明确 retry 指令仍不调 graph——反复 retry 只会
-  // 烧穿配额把维度整体卡成 error（比 GRAPH 拒绝更糟）。补挖一次未果就放行 produce，关系类
-  // 候选交由 submit 拒绝反馈（改述指导），非关系类候选照常通过。
-  const retried = Number(sharedState?._graphRetryCount) || 0;
-  if (retried >= 1) {
-    return baseGate;
-  }
-  const analysisText = typeof artifact.analysisText === 'string' ? artifact.analysisText : '';
-  const findingsText = Array.isArray(artifact.findings)
-    ? (artifact.findings as Array<{ finding?: string }>).map((f) => f?.finding ?? '').join(' ')
-    : '';
-  if (!GRAPH_RELATIONSHIP_CN_RE.test(`${analysisText} ${findingsText}`)) {
-    return baseGate;
-  }
-  if (sharedState) {
-    sharedState._graphRetryCount = retried + 1;
-  }
-  return { pass: false, action: 'analysis_retry', reason: GRAPH_GAP_REASON };
-}

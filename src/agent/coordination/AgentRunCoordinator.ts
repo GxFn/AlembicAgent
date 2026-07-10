@@ -630,6 +630,9 @@ function buildScopedIndexModuleDimConfig(
     `moduleId: ${moduleId}`,
     modulePath ? `modulePath: ${modulePath}` : '',
     ownedFiles.length > 0 ? `ownedFiles:\n${ownedFiles.map((file) => `- ${file}`).join('\n')}` : '',
+    // P1-B-1：run 入口静态装配的模块图谱(ModuleContextAssembler)——Analyst 首轮即见
+    // 目录骨架/兄弟模块/可选依赖,graph 调用退为精化手段(不再是骨架的唯一来源)。
+    stringValue(moduleRecord.contextMap) || '',
   ].filter(Boolean);
 
   return stripUndefined({

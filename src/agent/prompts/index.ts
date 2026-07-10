@@ -6,7 +6,6 @@
 export {
   analysisQualityGate,
   applyDepthRetryGate,
-  applyGraphRetryGate,
   buildAnalysisArtifact,
   buildAnalysisReport,
   buildRelationsPipelineStages,

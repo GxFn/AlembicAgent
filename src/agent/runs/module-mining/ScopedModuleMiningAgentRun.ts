@@ -1,5 +1,11 @@
+import { computeModuleAnalystBudget } from '../../prompts/insightAnalyst.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
+import {
+  buildModuleContextMap,
+  type ModuleLikeRecord,
+  splitOversizedModule,
+} from './ModuleContextAssembler.js';
 
 export interface ScopedMiningModule {
   moduleId?: string;
@@ -90,7 +96,38 @@ function selectScopedIndexModulesForRun(modules: ScopedMiningModule[], scaleCap?
   if (selected.length === 0) {
     throw new Error('runModuleMining scaleCap selected zero ProjectContext modules');
   }
-  return selected.map((moduleInput, index) => normalizeScopedIndexModule(moduleInput, index));
+  const normalized = selected.map((moduleInput, index) =>
+    normalizeScopedIndexModule(moduleInput, index)
+  );
+  // P1-B-2：超大模块按顶层子目录拆分成真实 module 条目——在 run 入口拆(scaleCap 之后)，
+  // partitioner/merger 的按下标 1:1 契约零改动。
+  const expanded = normalized.flatMap((moduleRecord) =>
+    splitOversizedModule(moduleRecord as ModuleLikeRecord)
+  );
+  // P1-B-1/2：为每个(拆分后)模块确定性附着——
+  //   contextMap：静态模块图谱(coordinator 拼进 dimConfig.guide,Analyst 首轮即见骨架，
+  //   不再求 LLM 自觉调 graph 才能定位)；
+  //   strategyContext._computedBudget：按模块规模的 Analyst 预算(partitioner 展开
+  //   moduleRecord.strategyContext → 工厂既有动态预算合并逻辑直接生效)。
+  return expanded.map((moduleRecord) => {
+    const record = moduleRecord as ModuleLikeRecord & { strategyContext?: Record<string, unknown> };
+    const ownedCount = Array.isArray(record.ownedFiles) ? record.ownedFiles.length : 0;
+    const existingStrategyContext =
+      record.strategyContext && typeof record.strategyContext === 'object'
+        ? record.strategyContext
+        : {};
+    return {
+      ...record,
+      contextMap: buildModuleContextMap(record, expanded as ModuleLikeRecord[]),
+      strategyContext: {
+        ...existingStrategyContext,
+        // 宿主显式给过 _computedBudget 则尊重(不覆盖)。
+        ...(existingStrategyContext._computedBudget
+          ? {}
+          : { _computedBudget: computeModuleAnalystBudget(ownedCount) }),
+      },
+    };
+  });
 }
 
 function normalizeScopedIndexModule(moduleInput: ScopedMiningModule, index: number) {

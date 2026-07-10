@@ -5,7 +5,7 @@
  * - 工件构建(sanitizeAnalysisText/buildAnalysisReport/buildAnalysisArtifact 等)
  *   → ../evaluation/analysisArtifact.ts
  * - 质量评估器(buildQualityScores/analysisQualityGate/applyDepthRetryGate/
- *   applyGraphRetryGate 等) → ../evaluation/qualityGates.ts
+ *   applyDepthRetryGate 等) → ../evaluation/qualityGates.ts
  * - gate.evaluator 适配器(insightGateEvaluator/evolutionGateEvaluator)
  *   → ../evaluation/gateEvaluators.ts
  * 本文件只保留纯 prompt 文本构建:
