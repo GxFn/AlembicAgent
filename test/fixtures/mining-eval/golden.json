@@ -1,0 +1,47 @@
+{
+  "$comment": "P0-2 挖掘质量评估 golden set。fixturePath 相对本文件；expected=该 fixture 上应被挖出的知识(启发式匹配用 keywords+mustCiteFiles，--judge 模式再叠加语义判定)；notExpected=不应产出的平凡事实(命中即计 triviality)。标注来源遵循 D2+：优先复用进化环人工标记，空白新增交 Judge 先判。",
+  "fixtures": [
+    {
+      "id": "wrapresult-convention",
+      "fixturePath": "../mining-e2e",
+      "projectFacts": { "project": "mining-eval-fixture", "lang": "TypeScript", "fileCount": 4 },
+      "modules": [
+        {
+          "moduleId": "handlers",
+          "moduleName": "handlers",
+          "ownedFiles": [
+            "src/handlers/user-handler.ts",
+            "src/handlers/order-handler.ts",
+            "src/handlers/billing-handler.ts",
+            "src/shared/result.ts"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "key": "wrapresult-envelope-rule",
+          "kind": "rule",
+          "claim": "所有 handler 返回值必须经 wrapResult 包装为 Result 信封，不得向外抛裸错误",
+          "keywords": ["wrapResult", "Result", "handler"],
+          "mustCiteFiles": [
+            "src/handlers/user-handler.ts",
+            "src/handlers/order-handler.ts",
+            "src/handlers/billing-handler.ts"
+          ]
+        }
+      ],
+      "notExpected": [
+        {
+          "key": "trivial-import-fact",
+          "claim": "handler 文件 import 了 shared/result(平凡事实，不应成为候选)",
+          "keywords": ["import", "../shared/result"]
+        },
+        {
+          "key": "trivial-map-storage",
+          "claim": "handler 用 Map 存数据(样例仓实现细节，非可复用知识)",
+          "keywords": ["Map", "存储"]
+        }
+      ]
+    }
+  ]
+}

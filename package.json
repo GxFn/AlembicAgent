@@ -107,7 +107,9 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run lint:space-edges && npm run lint:layer-contract && npm run lint:doctrine && npm run lint:naming && npm run smoke:public-signatures && npm run verify:validation-floor && npm run test && npm run lint:retired-symbols",
-    "lint:retired-symbols": "node ../AlembicCore/scripts/lint-retired-symbols.mjs . --dirs=src,test"
+    "lint:retired-symbols": "node ../AlembicCore/scripts/lint-retired-symbols.mjs . --dirs=src,test",
+    "eval:mining": "node scripts/eval-mining.mjs",
+    "eval:judge-calibration": "node scripts/eval-judge-calibration.mjs"
   },
   "dependencies": {
     "@alembic/core": "file:../AlembicCore",
