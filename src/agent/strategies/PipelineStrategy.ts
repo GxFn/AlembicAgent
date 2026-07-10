@@ -132,6 +132,12 @@ interface PipelineContext {
    * degraded_budget_exhausted，均为终态)，最终投影进 phases._pipelineOutcome。
    */
   abandonInfo: { stage: string; action: string; reason: string } | null;
+  /**
+   * P1-A F2：第三种静默归零形态——analysis_retry 耗尽后 break(不设 degraded)此前产出
+   * `completed + 0 候选`且无原因留痕。此标记让 outcome 如实报 abandoned(action='retry_exhausted')，
+   * 而 degraded 布尔保持原语义不动(不触发 skipOnDegrade 等既有分支)。
+   */
+  retryExhausted: boolean;
 }
 
 interface GateEvalResult {
@@ -257,6 +263,7 @@ export class PipelineStrategy extends Strategy {
       execStageCount: 0,
       lastExecutedStageName: null,
       abandonInfo: null,
+      retryExhausted: false,
     };
 
     for (let i = 0; i < this.#stages.length; i++) {
@@ -300,9 +307,11 @@ export class PipelineStrategy extends Strategy {
     // submitRepairs 是 knowledge.submit 各确定性修复层的会话命中计数(挂在 runtime 上，
     // 与 _styleWaiverTotal 同款挂载)——在此投影，评估 harness 据此算 repair-hit-rate。
     const submitRepairs = readSubmitRepairStats(runtime);
+    // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
+    const abandoned = ctx.degraded || ctx.retryExhausted;
     ctx.phaseResults._pipelineOutcome = {
-      outcome: ctx.degraded ? 'abandoned' : 'completed',
-      ...(ctx.degraded && ctx.abandonInfo ? ctx.abandonInfo : {}),
+      outcome: abandoned ? 'abandoned' : 'completed',
+      ...(abandoned && ctx.abandonInfo ? ctx.abandonInfo : {}),
       ...(submitRepairs ? { submitRepairs } : {}),
     };
 
@@ -313,7 +322,7 @@ export class PipelineStrategy extends Strategy {
       iterations: ctx.totalIterations,
       phases: ctx.phaseResults,
       degraded: ctx.degraded,
-      outcome: ctx.degraded ? 'abandoned' : 'completed',
+      outcome: abandoned ? 'abandoned' : 'completed',
       diagnostics: ctx.diagnostics.toJSON(),
     };
   }
@@ -467,7 +476,17 @@ export class PipelineStrategy extends Strategy {
           return prevIdx - 1; // 循环 i++ 后回到 prevIdx
         }
       }
-      // 重试次数耗尽
+      // 重试次数耗尽 —— P1-A F2：此前静默 break(completed + 0 候选，无原因)；现在如实
+      // 记为第三种放弃形态。不设 ctx.degraded(保持 skipOnDegrade 等既有分支语义不变)，
+      // 只让 outcome/abandonedModules 观测面如实报 retry_exhausted。
+      ctx.retryExhausted = true;
+      if (!ctx.abandonInfo) {
+        ctx.abandonInfo = {
+          stage: stage.name || 'gate',
+          action: 'retry_exhausted',
+          reason: gateResult.reason || 'gate retries exhausted',
+        };
+      }
       if (stage.skipOnFail !== false) {
         return 'break';
       }

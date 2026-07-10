@@ -1090,7 +1090,32 @@ function snipHeadTail(text: string, budget: number, tag: string): string {
  * @param quota 动态配额
  * @returns 压缩后的结果字符串
  */
+/**
+ * P1-A F1(挖掘质量升级)：证据尾注抗截断。
+ * `[evidence] E-n=file:range` 尾注是模型引用台账的唯一投递通道；此前它随正文一起被
+ * head+tail/纯头截断——窗口压力 ≥0.95 档 per-tool 配额塌到 400 字时尾注整段被吞，
+ * 模型引用不到台账 → findings 全 unverified → 产出坍缩(E2E 首跑实证的生产级隐患)。
+ * 修法：截断前摘下尾注，正文按剩余预算走原截断逻辑，尾注原样重挂(封顶 800 字防病态)。
+ * 尾注只有 ~200 字，任何配额档都保得起；确定性修复，全 provider 生效。
+ */
+const EVIDENCE_TAIL_RE = /\n\n\[evidence\] [^\n]*$/;
+
 export function limitToolResult(toolName: string, result: unknown, quota: ToolResultQuota) {
+  if (typeof result === 'string') {
+    const tailMatch = result.match(EVIDENCE_TAIL_RE);
+    if (tailMatch) {
+      const annotation =
+        tailMatch[0].length > 800 ? `${tailMatch[0].slice(0, 800)}…` : tailMatch[0];
+      const body = result.slice(0, result.length - tailMatch[0].length);
+      const bodyQuota = Math.max(200, (quota.maxChars ?? 4000) - annotation.length);
+      const limitedBody = limitToolResultBody(toolName, body, { ...quota, maxChars: bodyQuota });
+      return `${typeof limitedBody === 'string' ? limitedBody : JSON.stringify(limitedBody)}${annotation}`;
+    }
+  }
+  return limitToolResultBody(toolName, result, quota);
+}
+
+function limitToolResultBody(toolName: string, result: unknown, quota: ToolResultQuota) {
   const { maxChars = 4000, maxMatches = 10 } = quota;
 
   // knowledge (submit) 结果很短，不截断

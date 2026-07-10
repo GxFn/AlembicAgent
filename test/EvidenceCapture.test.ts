@@ -253,3 +253,32 @@ describe('run-13 EVIDENCE_STALE 事故回归钉（判据×形态交叉）', () =
     expect(outline[0].range).toBeUndefined();
   });
 });
+
+// ─── P1-A F3：单 path read 的 file 归属(此前兜底只查 args.path，运行时形态是 args.params.path) ───
+describe('P1-A F3 单 path read 采集', () => {
+  test('args.params.path + N| 文本 → 带 file+range 的 verbatim 条目(不再 unverified 折价)', () => {
+    const ledger = makeLedger();
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      { name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } }, id: 'call_sp' },
+      makeEnvelope({ text: '1|const a = 1;\n2|export default a;\n' })
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0].file).toBe('src/a.ts');
+    expect(entries[0].range).toEqual({ start: 1, end: 2 });
+    // verbatim 原文(剥 N| 前缀)——freshness 重切同尺。
+    expect(entries[0].content).toBe('const a = 1;\nexport default a;');
+  });
+
+  test('派生视图(非 N| 形态)诚实降级 file-only(仍带 file，verified 判据放行)', () => {
+    const ledger = makeLedger();
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      { name: 'code', args: { action: 'read', params: { path: 'src/big.ts' } }, id: 'call_ol' },
+      makeEnvelope({ text: '[outline] 12 functions, 3 classes' })
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0].file).toBe('src/big.ts');
+    expect(entries[0].range).toBeUndefined();
+  });
+});

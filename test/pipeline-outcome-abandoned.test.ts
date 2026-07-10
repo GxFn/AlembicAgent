@@ -226,3 +226,39 @@ describe('AgentRunCoordinator merger — abandonedModules 一等聚合', () => {
     ]);
   });
 });
+
+// ─── P1-A F2：第三种静默归零形态 retry_exhausted 一等化 ───
+describe('PipelineStrategy — retry 耗尽的一等结局(F2)', () => {
+  it('analysis_retry 耗尽 → outcome=abandoned(action=retry_exhausted)，degraded 保持 false', async () => {
+    const { runtime } = createFakeRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: {
+            evaluator: () => ({
+              action: 'analysis_retry',
+              pass: false,
+              reason: 'score below threshold',
+            }),
+            maxRetries: 1,
+          },
+        },
+        { name: 'produce' },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'mine module' }));
+
+    // degraded 布尔语义不变(不触发 skipOnDegrade 分支)，但结局如实为放弃。
+    expect(result.degraded).toBe(false);
+    expect(result.outcome).toBe('abandoned');
+    expect(pipelineOutcome(result)).toMatchObject({
+      outcome: 'abandoned',
+      stage: 'quality_gate',
+      action: 'retry_exhausted',
+      reason: 'score below threshold',
+    });
+  });
+});

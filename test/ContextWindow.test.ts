@@ -339,3 +339,31 @@ describe('A-1b limitToolResult/limitFileContent head+tail', () => {
     expect(out).toContain('tool-result snip');
   });
 });
+
+// ─── P1-A F1：证据尾注抗截断(压力档 400 字配额下尾注曾被 head+tail 截断整段吞掉) ───
+describe('P1-A F1 limitToolResult 证据尾注抗截断', () => {
+  const annotation = '\n\n[evidence] E-1=src/a.ts:1-20; E-2=src/b.ts:5-30; E-3=src/c.ts:2-9';
+
+  it('压力档小配额下尾注完整存活，正文按剩余预算截断', () => {
+    const body = 'x'.repeat(5000);
+    const out = limitToolResult('code', `${body}${annotation}`, { maxChars: 400 });
+    expect(out.endsWith(annotation)).toBe(true);
+    // 正文被截(远小于原文)，总长受控(正文预算下限 200 + 尾注)。
+    expect(out.length).toBeLessThan(1200);
+    expect(out).toContain('x');
+  });
+
+  it('无尾注时行为与原实现一致(纯透传原逻辑)', () => {
+    const body = 'y'.repeat(5000);
+    const out = limitToolResult('code', body, { maxChars: 400 });
+    expect(out.includes('[evidence]')).toBe(false);
+    expect(out.length).toBeLessThan(1000);
+  });
+
+  it('病态超长尾注被封顶(800 字)而非吃光配额', () => {
+    const hugeAnnotation = `\n\n[evidence] ${'E-1=src/a.ts:1-2; '.repeat(200)}`.trimEnd();
+    const out = limitToolResult('code', `${'z'.repeat(1000)}${hugeAnnotation}`, { maxChars: 400 });
+    expect(out).toContain('[evidence]');
+    expect(out.length).toBeLessThan(1300);
+  });
+});

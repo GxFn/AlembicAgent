@@ -179,6 +179,34 @@ function normalizeDrafts(
         };
       });
     }
+    // P1-A F3：单 path read 返回纯文本(无 structuredContent.files)——此前落入通用兜底，
+    // 而兜底只查 call.args.path(真实调用形态是 args.params.path)→ 落成无 file 条目 →
+    // note_finding 判 unverified、不计配额,产出被无声折价。这里按批量同规格处理：
+    // 剥显示前缀存 verbatim(freshness 同尺)、file 取请求 path、range 取请求区间或全文行数。
+    const singleParams = (call.args?.params ?? call.args) as Record<string, unknown> | undefined;
+    const singlePath = typeof singleParams?.path === 'string' ? singleParams.path : undefined;
+    if (singlePath) {
+      const requestedRange = extractRequestedRange(call.args);
+      const textContent = typeof envelope.text === 'string' ? envelope.text : '';
+      // 尾随换行会产生空末行、让全行 N| 校验失败——剥掉再判(不影响 verbatim 语义)。
+      const raw = textContent ? stripReadDisplayDecorations(textContent.replace(/\n+$/, '')) : null;
+      if (raw !== null && raw.length > 0) {
+        const range = requestedRange ?? { start: 1, end: raw.split('\n').length };
+        return [{ tool, callId: call.id, file: singlePath, range, content: raw }];
+      }
+      if (textContent) {
+        // outline/delta 等派生视图：诚实降级 file-only(不参与 freshness，verified 按 file 在场放行)。
+        return [
+          {
+            tool,
+            callId: call.id,
+            file: singlePath,
+            ...(requestedRange ? { range: requestedRange } : {}),
+            content: textContent,
+          },
+        ];
+      }
+    }
   }
 
   if (tool === 'code.search') {
@@ -199,17 +227,31 @@ function normalizeDrafts(
     }
   }
 
+  // P1-A F3 附带修：运行时调用形态是 args.params.{path,file}(kernel parseToolCall 规格)，
+  // 兜底此前只查 args 顶层——嵌套形态全部落空。params 优先，顶层作兼容保留。
+  const fallbackParams = (call.args?.params ?? null) as Record<string, unknown> | null;
   let file =
-    typeof call.args?.path === 'string'
-      ? call.args.path
-      : typeof call.args?.file === 'string'
-        ? call.args.file
-        : undefined;
+    typeof fallbackParams?.path === 'string'
+      ? fallbackParams.path
+      : typeof fallbackParams?.file === 'string'
+        ? fallbackParams.file
+        : typeof call.args?.path === 'string'
+          ? call.args.path
+          : typeof call.args?.file === 'string'
+            ? call.args.file
+            : undefined;
   // M2/P1c：terminal.exec 归属——命令 argv 里首个"看起来是仓内相对路径"的 token 作为 file
   // （cat/head/sed/ls 目标）。只做词法判定不触磁盘（capture 在热路径）；错误归属由提交侧
   // fs 校验兜底。绝对路径/URL/选项不取。
-  if (!file && typeof call.args?.command === 'string') {
-    for (const token of call.args.command.split(/\s+/).slice(1)) {
+  // 同 F3：command 也补 params 嵌套形态(运行时 terminal.exec 的 command 在 args.params 下)。
+  const commandRaw =
+    typeof fallbackParams?.command === 'string'
+      ? fallbackParams.command
+      : typeof call.args?.command === 'string'
+        ? call.args.command
+        : undefined;
+  if (!file && commandRaw) {
+    for (const token of commandRaw.split(/\s+/).slice(1)) {
       if (
         /^[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+$/.test(token) &&
         !token.startsWith('/') &&

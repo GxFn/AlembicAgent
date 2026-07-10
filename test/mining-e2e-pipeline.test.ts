@@ -339,6 +339,8 @@ function assembleMiningRun(input: {
   provider: ScriptedMiningProvider;
   fixtureRoot: string;
   moduleId: string;
+  /** P1-A F4 测试用：故意不接 capabilityCatalog，复现宿主接线错误形态。 */
+  omitCatalog?: boolean;
 }) {
   const { gateway, created } = createFakeGateway();
   const memoryCoordinator = new MemoryCoordinator();
@@ -363,9 +365,11 @@ function assembleMiningRun(input: {
   const agentService = new AgentService({
     runtimeBuilder: new AgentRuntimeBuilder({
       aiProvider: input.provider as never,
-      container: {
-        get: (name: string) => (name === 'capabilityCatalog' ? capabilityCatalog : undefined),
-      },
+      container: input.omitCatalog
+        ? {}
+        : {
+            get: (name: string) => (name === 'capabilityCatalog' ? capabilityCatalog : undefined),
+          },
       projectRoot: input.fixtureRoot,
       dataRoot,
       toolRegistry: {
@@ -514,5 +518,29 @@ describe('mining E2E — 真实组合链路(fixture 仓 + 脚本化 provider)', 
       unitId: 'mod-weak',
       action: expect.stringMatching(/^degraded_|^degrade$/),
     });
+  });
+});
+
+// ─── P1-A F4：装配契约显性化(capabilityCatalog 缺席不再静默) ───
+describe('装配诊断 — capabilityCatalog 缺席', () => {
+  it('工具面静默失效时 child diagnostics 带 tool_schema_projection_empty(宿主可定位接线错误)', {
+    timeout: E2E_TIMEOUT,
+  }, async () => {
+    const fixtureRoot = materializeFixture();
+    const provider = new ScriptedMiningProvider('no-findings');
+    const { agentService, runInput } = assembleMiningRun({
+      provider,
+      fixtureRoot,
+      moduleId: 'mod-miswired',
+      omitCatalog: true,
+    });
+
+    const result = await agentService.run(runInput);
+
+    const phases = (result.phases ?? {}) as Record<string, unknown>;
+    const child = ((phases.moduleResults ?? {}) as Record<string, Record<string, unknown>>)[
+      'mod-miswired'
+    ];
+    expect(JSON.stringify(child?.diagnostics ?? {})).toContain('tool_schema_projection_empty');
   });
 });

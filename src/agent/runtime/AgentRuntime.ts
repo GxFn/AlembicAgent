@@ -542,6 +542,22 @@ export class AgentRuntime {
       toolSchemaCount: toolSchemas.length,
       ...(source ? { source } : {}),
     });
+    // P1-A F4：装配契约显性化。capabilities 解析出了工具 id 但 schema 投影为空，唯一常见
+    // 原因是宿主 container 没接 capabilityCatalog(#getToolSchemas 经 container.get 解析)——
+    // 此前表现为 toolChoice=none、工具面整体静默死亡、零诊断(E2E 装配首跑实证)。
+    // 只留痕不改行为：宿主一眼能定位接线错误，而不是面对一个"会说话不干活"的 agent。
+    if (caps.length > 0 && allowedToolIds.length > 0 && toolSchemas.length === 0) {
+      this.logger.warn(
+        '[AgentRuntime] tool schema projection is EMPTY while capabilities resolved tool ids — ' +
+          'capabilityCatalog is likely missing from the container; tools will be invisible to the model',
+        { capabilities: caps.map((c: Capability) => c.name), allowedToolIds }
+      );
+      diagnosticsCollector.warn({
+        code: 'tool_schema_projection_empty',
+        message:
+          'capabilities resolved tool ids but schema projection is empty (container capabilityCatalog missing/miswired?)',
+      });
+    }
 
     // 创建统一消息适配器 (消除 useCtxWin 双模式)
     const messages = createMessageAdapter(contextWindow);
