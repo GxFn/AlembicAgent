@@ -40,6 +40,7 @@ for (const required of [
   'dist/tools/runtime/adapter/ToolRouterAdapter.js',
   'dist/tools/runtime/adapter/RuntimeCapabilityCatalog.js',
   'dist/ai/AiFactory.js',
+  'dist/agent/runs/module-mining/ScopedModuleMiningAgentRun.js',
 ]) {
   try {
     readFileSync(path.join(repoRoot, required));
@@ -67,6 +68,9 @@ const { RuntimeCapabilityCatalog } = await import(
 );
 const { createProvider, autoDetectProvider } = await import(
   path.join(repoRoot, 'dist/ai/AiFactory.js')
+);
+const { runScopedModuleMining } = await import(
+  path.join(repoRoot, 'dist/agent/runs/module-mining/ScopedModuleMiningAgentRun.js')
 );
 
 const args = parseArgs(process.argv.slice(2));
@@ -214,20 +218,21 @@ async function runFixture(fixture) {
   }
   const budget = fixture.budget || { analystTokens: 12_000, totalRecipeBudget: 6 };
 
-  const runResult = await agentService.run({
-    profile: { id: 'module-mining-session' },
-    params: {
-      modules: fixture.modules,
-      projectFacts: fixture.projectFacts || { project: fixture.id },
-      budget,
+  // 走生产入口 runScopedModuleMining 而非直呼 module-mining-session profile：
+  // 生产链(coldstart/rescan)在该入口做 normalize/超大模块拆分/contextMap/预算附着，
+  // 直呼 profile 会绕过它们——harness 量到的就不是真实链路(门0 实测发现的覆盖缺陷)。
+  // shim 只把 harness 的隔离 childContexts 补进请求，其余请求形状由生产入口构造。
+  const runResult = await runScopedModuleMining({
+    agentService: {
+      run: (request) =>
+        agentService.run({
+          ...request,
+          context: { ...(request.context || {}), childContexts },
+        }),
     },
-    message: {
-      role: 'internal',
-      content: `Mine fixture ${fixture.id} for real, reusable project knowledge.`,
-      metadata: { task: 'module-mining' },
-    },
-    execution: { budgetOverride: budget },
-    context: { source: 'system-workflow', runtimeSource: 'system', childContexts },
+    modules: fixture.modules,
+    projectFacts: fixture.projectFacts || { project: fixture.id },
+    budget,
   });
 
   const observations = collectRunObservations(runResult);
