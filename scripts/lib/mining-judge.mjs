@@ -156,31 +156,59 @@ export function verifyJudgeCitations(verdict, slices) {
  * 校准计算(P0-3 晋级门)：judge 裁决 vs 人工(staging 复核/evolution 决策)标记。
  * records: [{ humanDecision: 'uphold'|'narrow'|'trivial'|'reject', judgeVerdict: {...}|null,
  *            overgeneralized?: boolean }]
- * - agreementRate：二元保留一致率(双方都 uphold 或都非 uphold)——晋级门 ≥0.8 的口径；
+ * - agreementRate：二元保留一致率(双方都 uphold 或都非 uphold)——≥0.8 口径的业界锚点是
+ *   MT-Bench(judge-人一致 >80% ≈ 人-人水平)；
+ * - kappa(Cohen)：机会一致校正——percent agreement 在类不均衡下虚高(有实测 judge
+ *   TPR>96% 而 TNR<25% 仍能过 80% 门,"全判通过"陷阱)，kappa≥0.6 取业界部署线；
+ * - negativeRecall(负类召回/TNR)：人工判"不保留"的子集里 judge 也判不保留的比例——
+ *   直接检测 agreeableness bias；语料须含 ≥minNegatives 条人工负例才有校准资格
+ *   (全正语料测不出判别力，视为语料不合格而非 judge 合格)；
  * - exactRate：四值全等(辅助观察)；
  * - overgenSubset：人工因过度泛化收窄/拒绝的子集——judge 若系统性 uphold 该子集即
  *   同源自偏签名(selfBiasSignal=true → 按 D1 走 Ollama 回退，不得晋级)；
  * - invalidCitation/null 裁决不计入分母(judge 无效裁决=无裁决，保守)。
  */
-export function computeJudgeCalibration(records, { promotionFloor = 0.8 } = {}) {
+export function computeJudgeCalibration(
+  records,
+  { promotionFloor = 0.8, kappaFloor = 0.6, negativeRecallFloor = 0.6, minNegatives = 5 } = {}
+) {
   const judged = records.filter(
     (record) => record.judgeVerdict?.verdict && !record.judgeVerdict.invalidCitation
   );
-  const binaryAgree = (record) => {
-    const humanKeep = record.humanDecision === 'uphold';
-    const judgeKeep = record.judgeVerdict.verdict === 'uphold';
-    return humanKeep === judgeKeep;
-  };
+  const humanKeep = (record) => record.humanDecision === 'uphold';
+  const judgeKeep = (record) => record.judgeVerdict.verdict === 'uphold';
+  const binaryAgree = (record) => humanKeep(record) === judgeKeep(record);
   const agreed = judged.filter(binaryAgree);
   const exact = judged.filter((record) => record.humanDecision === record.judgeVerdict.verdict);
   const overgen = judged.filter((record) => record.overgeneralized === true);
   const overgenAgreed = overgen.filter((record) => record.judgeVerdict.verdict !== 'uphold');
   const agreementRate = judged.length > 0 ? agreed.length / judged.length : null;
   const overgenRate = overgen.length > 0 ? overgenAgreed.length / overgen.length : null;
+
+  // Cohen's kappa：po=观察一致率,pe=按边际分布的机会一致率;双方全同类(pe=1)为退化,记 null。
+  let kappa = null;
+  if (judged.length > 0) {
+    const pKeepHuman = judged.filter(humanKeep).length / judged.length;
+    const pKeepJudge = judged.filter(judgeKeep).length / judged.length;
+    const pe = pKeepHuman * pKeepJudge + (1 - pKeepHuman) * (1 - pKeepJudge);
+    kappa = pe === 1 ? null : (agreementRate - pe) / (1 - pe);
+  }
+
+  // 负类召回：人工不保留 ∧ judge 也不保留 / 人工不保留。
+  const negatives = judged.filter((record) => !humanKeep(record));
+  const negativesCaught = negatives.filter((record) => !judgeKeep(record));
+  const negativeRecall = negatives.length > 0 ? negativesCaught.length / negatives.length : null;
+
   return {
     total: records.length,
     judged: judged.length,
     agreementRate,
+    kappa,
+    negativeSubset: {
+      total: negatives.length,
+      caught: negativesCaught.length,
+      recall: negativeRecall,
+    },
     exactRate: judged.length > 0 ? exact.length / judged.length : null,
     overgenSubset: { total: overgen.length, agreed: overgenAgreed.length, rate: overgenRate },
     selfBiasSignal: overgenRate !== null && overgenRate < promotionFloor,
@@ -188,6 +216,11 @@ export function computeJudgeCalibration(records, { promotionFloor = 0.8 } = {}) 
       agreementRate !== null &&
       agreementRate >= promotionFloor &&
       judged.length >= 30 &&
+      kappa !== null &&
+      kappa >= kappaFloor &&
+      negatives.length >= minNegatives &&
+      negativeRecall !== null &&
+      negativeRecall >= negativeRecallFloor &&
       !(overgenRate !== null && overgenRate < promotionFloor),
   };
 }

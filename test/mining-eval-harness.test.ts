@@ -253,13 +253,45 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     // 一致率 87.5%≥80% 且样本≥30，但自偏签名命中 → 不得晋级
     expect(calibration.promotionEligible).toBe(false);
 
-    // 修正自偏(过度泛化子集全拒)→ 晋级
+    // 修正自偏(过度泛化子集全拒)→ 晋级(平衡口径同时达标:kappa≈0.93,负类召回 11/11)
     const fixed = records.map((record) =>
       record.overgeneralized ? { ...record, judgeVerdict: reject } : record
     );
     const calibration2 = computeJudgeCalibration(fixed);
     expect(calibration2.selfBiasSignal).toBe(false);
+    expect(calibration2.kappa).toBeGreaterThan(0.9);
+    expect(calibration2.negativeSubset).toMatchObject({ total: 11, caught: 11, recall: 1 });
     expect(calibration2.promotionEligible).toBe(true);
+  });
+
+  it('computeJudgeCalibration：类不均衡下"全判通过"的 judge 被平衡口径拦截(agreeableness 陷阱)', () => {
+    const uphold = { verdict: 'uphold' };
+    // 28 人工 uphold + 4 人工 reject,judge 全部放行:
+    // 裸一致率 28/32=87.5% ≥80% 且样本 ≥30——旧门会放行;
+    // 新门:kappa=0(不高于机会一致)、负类召回 0/4、负例 4<minNegatives → 三重拦截。
+    const records = [
+      ...Array.from({ length: 28 }, () => ({ humanDecision: 'uphold', judgeVerdict: uphold })),
+      ...Array.from({ length: 4 }, () => ({ humanDecision: 'reject', judgeVerdict: uphold })),
+    ];
+    const calibration = computeJudgeCalibration(records);
+    expect(calibration.agreementRate).toBeCloseTo(28 / 32, 5);
+    expect(calibration.kappa).toBeCloseTo(0, 5);
+    expect(calibration.negativeSubset).toMatchObject({ total: 4, caught: 0, recall: 0 });
+    expect(calibration.promotionEligible).toBe(false);
+  });
+
+  it('computeJudgeCalibration：全正语料(双方全 uphold)是退化态——kappa=null,不具校准资格', () => {
+    const uphold = { verdict: 'uphold' };
+    const records = Array.from({ length: 30 }, () => ({
+      humanDecision: 'uphold',
+      judgeVerdict: uphold,
+    }));
+    const calibration = computeJudgeCalibration(records);
+    expect(calibration.agreementRate).toBe(1);
+    expect(calibration.kappa).toBeNull();
+    expect(calibration.negativeSubset.total).toBe(0);
+    // 语料测不出判别力 → 不是 judge 合格,是语料不合格。
+    expect(calibration.promotionEligible).toBe(false);
   });
 
   it('judgeCandidate：注入 chat；越界引用 → invalidCitation 标记(裁决按无效处理)', async () => {

@@ -2,11 +2,12 @@
 /**
  * eval:judge-calibration — Judge 校准(P0-3 晋级门 + 自偏检测)。
  *
- * 口径(需求 §P0-3 / D2+)：ground truth 复用进化环既有人工标记——staging 复核结论
- * (uphold/narrow/reject/trivial)与 evolution 决策；judge 对同一批候选独立裁决，
- * 计二元保留一致率(≥0.8 且样本 ≥30 才允许 P2 critic 进管线)；"人工因过度泛化收窄/拒绝"
- * 子集单列——judge 系统性 uphold 该子集=同源自偏签名(selfBiasSignal)，按 D1 走 Ollama
- * 回退，不得晋级。
+ * 口径(需求 §P0-3 / D2+,G-B 修订)：ground truth 复用进化环既有人工标记——staging 复核结论
+ * (uphold/narrow/reject/trivial)与 evolution 决策；judge 对同一批候选独立裁决。
+ * 晋级门 = 二元保留一致率 ≥0.8 ∧ 样本 ≥30 ∧ Cohen's kappa ≥0.6 ∧ 负类召回 ≥0.6
+ * (人工负例 ≥5 条,否则语料不具校准资格) ∧ 无自偏签名。kappa/负类口径防"全判通过"
+ * 在类不均衡下靠裸一致率过门(agreeableness 陷阱);"人工因过度泛化收窄/拒绝"子集单列——
+ * judge 系统性 uphold 该子集=同源自偏签名(selfBiasSignal)，按 D1 走 Ollama 回退，不得晋级。
  *
  * 输入(--input)：人工标记导出 JSON——
  *   [{ "candidate": {title,kind,doClause,content,reasoning:{sources:[...]}},
