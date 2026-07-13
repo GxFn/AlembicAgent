@@ -325,6 +325,42 @@ async function handlePrime(params: Record<string, unknown>, ctx: ToolContext): P
 /*  knowledge.submit                                                   */
 /* ================================================================== */
 
+const PERSISTED_RECIPE_REVIEW_FIELDS = [
+  'description',
+  'language',
+  'category',
+  'tags',
+  'kind',
+  'knowledgeType',
+  'scope',
+  'complexity',
+  'difficulty',
+  'trigger',
+  'topicHint',
+  'whenClause',
+  'doClause',
+  'dontClause',
+  'coreCode',
+  'usageGuide',
+  'headers',
+  'headerPaths',
+  'moduleName',
+  'source',
+] as const;
+
+// 只投影 reviewer 首屏所需的有界字段；身份与摘要都来自 gateway 返回的同一份 persisted raw，
+// 避免为了扫描结果再读库、再次创建，或把模型原始候选误当成已持久化 Recipe。
+function projectPersistedRecipeReview(raw: Record<string, unknown>): Record<string, unknown> {
+  const review: Record<string, unknown> = {};
+  for (const field of PERSISTED_RECIPE_REVIEW_FIELDS) {
+    const value = raw[field];
+    if (value !== undefined) {
+      review[field] = Array.isArray(value) ? [...value] : value;
+    }
+  }
+  return review;
+}
+
 async function handleSubmit(
   params: Record<string, unknown>,
   ctx: ToolContext
@@ -804,8 +840,10 @@ async function handleSubmit(
         );
       }
       return ok({
+        ...projectPersistedRecipeReview(created.raw),
         status: 'created',
         id: created.id,
+        candidateId: created.id,
         title: created.title,
         lifecycle: created.lifecycle,
         production: result.production,

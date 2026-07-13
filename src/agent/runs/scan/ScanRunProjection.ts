@@ -2,6 +2,10 @@ import type { AgentDiagnostics, ToolCallEntry } from '../../runtime/AgentRuntime
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 
 export interface ScanRecipe extends Record<string, unknown> {
+  id: string;
+  candidateId: string;
+  status: 'created';
+  lifecycle: 'pending' | 'staging';
   title?: string;
   description?: string;
   summary?: string;
@@ -42,12 +46,14 @@ export function projectScanRunResult({
   fallback,
   onParseError,
 }: ScanProjectionOptions): ScanKnowledgeProjection {
-  const recipes = extractCollectedRecipes(result.toolCalls || []);
+  const toolCalls = result.toolCalls || [];
+  const recipes = extractCreatedRecipes(toolCalls);
   if (recipes.length > 0) {
     const diagnostics = buildScanDiagnostics({ label, task, result, recipesFound: recipes.length });
     if (task === 'summarize') {
       const first = recipes[0];
       return {
+        ...first,
         title: first.title || '',
         summary: first.description || first.summary || '',
         usageGuide: first.usageGuide || '',
@@ -65,35 +71,55 @@ export function projectScanRunResult({
 
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
   const produceReply = phases?.produce?.reply || result.reply;
-  const parsed = parseJsonResponseWithDiagnostics(
-    produceReply,
-    fallback(label || ''),
-    onParseError
-  );
+  const fallbackValue = fallback(label || '');
+  const parsed = parseJsonResponseWithDiagnostics(produceReply, fallbackValue, onParseError);
+  const hadSubmitAttempt = toolCalls.some(isKnowledgeSubmitCall);
+  // 一旦本轮尝试过持久化，provider 文本就不再具有 Recipe 身份权威；无 submit 的显式
+  // preview 调用仍保留旧 JSON 投影，并通过 diagnostics 区分两条路径。
+  const ignoreUnpersistedOutput = hadSubmitAttempt && !parsed.usedFallback;
   return {
-    ...parsed.value,
+    ...(hadSubmitAttempt ? fallbackValue : parsed.value),
     diagnostics: buildScanDiagnostics({
       label,
       task,
       result,
       recipesFound: 0,
-      usedFallback: parsed.usedFallback,
+      usedFallback: hadSubmitAttempt || parsed.usedFallback,
       parseError: parsed.error || null,
+      ignoredUnpersistedOutput: ignoreUnpersistedOutput,
     }),
   };
 }
 
-export function extractCollectedRecipes(toolCalls: ToolCallEntry[]): ScanRecipe[] {
+export function extractCreatedRecipes(toolCalls: ToolCallEntry[]): ScanRecipe[] {
   return toolCalls
-    .filter((tc) => (tc.tool || tc.name) === 'knowledge')
+    .filter(isKnowledgeSubmitCall)
     .map((tc) => {
       const res = tc.result as Record<string, unknown> | null;
-      if (res && typeof res === 'object' && res.status === 'collected' && res.recipe) {
-        return res.recipe as ScanRecipe;
+      if (!res || typeof res !== 'object' || res.status !== 'created') {
+        return null;
       }
-      return null;
+      const id = typeof res.id === 'string' ? res.id.trim() : '';
+      const lifecycle = res.lifecycle;
+      if (!id || (lifecycle !== 'pending' && lifecycle !== 'staging')) {
+        return null;
+      }
+      return {
+        ...res,
+        id,
+        candidateId: id,
+        status: 'created' as const,
+        lifecycle,
+      };
     })
     .filter((recipe): recipe is ScanRecipe => Boolean(recipe));
+}
+
+function isKnowledgeSubmitCall(toolCall: ToolCallEntry): boolean {
+  return (
+    (toolCall.tool || toolCall.name) === 'knowledge' &&
+    String(toolCall.args?.action || '') === 'submit'
+  );
 }
 
 function parseJsonResponseWithDiagnostics(
@@ -131,6 +157,7 @@ function buildScanDiagnostics({
   recipesFound,
   usedFallback = false,
   parseError = null,
+  ignoredUnpersistedOutput = false,
 }: {
   label?: string;
   task: 'extract' | 'summarize';
@@ -138,6 +165,7 @@ function buildScanDiagnostics({
   recipesFound: number;
   usedFallback?: boolean;
   parseError?: string | null;
+  ignoredUnpersistedOutput?: boolean;
 }) {
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
   const toolCalls = result.toolCalls || [];
@@ -147,6 +175,7 @@ function buildScanDiagnostics({
     task,
     recipesFound,
     usedFallback,
+    ignoredUnpersistedOutput,
     parseError,
     toolCallCount: toolCalls.length,
     collectScanRecipeCallCount: collectCalls.length,
