@@ -2,6 +2,7 @@
  * 冷启动.生产 — Agent 将分析结果转化为知识候选。
  */
 
+import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../recipeProductionContract.js';
 import { RuntimeCapability } from './RuntimeCapability.js';
 
 export class GenerateProduce extends RuntimeCapability {
@@ -28,8 +29,8 @@ export class GenerateProduce extends RuntimeCapability {
 
 【必须——硬性，缺失即拒】
 1. 每个候选对应一个已确认 finding；reasoning.evidenceRefs 必填——直接照抄该 finding 证据串里的
-   E-x id（证据串 "E-3=lib/a.ts:5-7" → evidenceRefs: ["E-3"]）。sources 与 coreCode 由台账机械
-   展开并做新鲜度校验；维度运行中没有 evidenceRefs 的提交会被直接拒绝。**优先引用带文件区间的
+   E-x id（证据串 "E-3=lib/a.ts:5-7" → evidenceRefs: ["E-3"]）。sources 由台账机械
+   展开并做新鲜度校验；coreCode 只能显式提交且必须逐字匹配 bounded range。维度运行中没有 evidenceRefs 的提交会被直接拒绝。**优先引用带文件区间的
    条目**（形如 E-x=file:5-12，能机械展开出 sources）；若引用只有 search/terminal 类条目（无
    文件区间），必须同时在 reasoning.sources 手填该证据里出现的真实 file:line（仍会被逐条校验）
 2. 事实只能来自 findings/台账证据：不得引入证据之外的断言；无 graph 查询证据不做调用链断言
@@ -61,6 +62,8 @@ export class GenerateProduce extends RuntimeCapability {
 - 提交返回 duplicate_blocked 时按 similar 列表路由：与已有知识实质相同→跳过换下一个 finding；
   你的证据更全/更新且确有增量→带 supersedes:<已有条目 id> 重提一次，否则不要反复提交
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
+
+${RECIPE_PRODUCTION_PROFILE_PROMPT}
 
 ${super.promptFragment}`;
   }

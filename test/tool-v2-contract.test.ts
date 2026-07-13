@@ -326,9 +326,8 @@ describe('Tool V2 contract exports', () => {
   it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
     const router = new ToolRouter();
     const createRequests: Array<{
-      source: string;
-      items: Record<string, unknown>[];
-      options?: Record<string, unknown>;
+      input: { items: Record<string, unknown>[]; options?: Record<string, unknown> };
+      context: { source: string; userId: string; capability: string };
     }> = [];
     // P1.4b：in-process 提交现在过权威 validateAgainst（opportunistic）门禁，候选必须 gate-clean
     // （祈使 doClause/dontClause、✅❌ 对比、可解析的 source-ref）。projectRoot 指向真实仓库根，
@@ -370,27 +369,46 @@ describe('Tool V2 contract exports', () => {
       ...baseToolContext(),
       projectRoot: process.cwd(),
       recipeGateway: {
-        create: async (request: {
-          source: string;
-          items: Record<string, unknown>[];
-          options?: Record<string, unknown>;
-        }) => {
-          createRequests.push(request);
+        createOrStage: async (
+          input: { items: Record<string, unknown>[]; options?: Record<string, unknown> },
+          context: { source: string; userId: string; capability: string }
+        ) => {
+          createRequests.push({ input, context });
           return {
-            created: [{ id: 'candidate-1', title: 'Tool V2 source boundary' }],
+            created: [
+              {
+                id: 'candidate-1',
+                title: 'Tool V2 source boundary',
+                lifecycle: 'pending',
+                raw: input.items[0],
+              },
+            ],
             rejected: [],
             duplicates: [],
             merged: [],
             blocked: [],
+            supersedeProposal: null,
+            production: { capability: 'knowledge-submit', source: 'alembic-agent' },
           };
         },
+        evaluateReadiness: async () => ({
+          ready: false,
+          schemaVersion: '1',
+          profileHash: null,
+          documentSetHash: null,
+          violations: [{ code: 'retrieval.profile.missing', message: 'profile missing' }],
+          warnings: [],
+        }),
       },
     });
 
     expect(result.ok).toBe(true);
-    expect(createRequests[0]?.source).toBe('alembic-agent');
-    expect(createRequests[0]?.options?.userId).toBe('alembic-agent');
-    expect(createRequests[0]?.items[0]?.source).toBe('alembic-agent');
+    expect(createRequests[0]?.context).toEqual({
+      source: 'alembic-agent',
+      userId: 'alembic-agent',
+      capability: 'knowledge-submit',
+    });
+    expect(createRequests[0]?.input.items[0]?.source).toBe('alembic-agent');
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {

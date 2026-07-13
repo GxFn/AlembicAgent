@@ -7,6 +7,7 @@ import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
+import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import {
   AgentRuntime,
   buildLlmInputAssembly,
@@ -19,6 +20,7 @@ import {
 } from '../src/agent/runtime/index.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
+import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
 
 function createRuntime({
   chatWithTools,
@@ -372,6 +374,39 @@ describe('LLM input layering', () => {
     expect(submitParams?.properties).toHaveProperty('description');
     expect(submitParams?.properties).toHaveProperty('content');
     expect(submitParams?.properties).toHaveProperty('reasoning');
+    expect(submitParams?.properties).toHaveProperty('retrievalProfile');
+  });
+
+  it('keeps cold-start, incremental scan, and conversation producers on one retrieval-profile contract', () => {
+    const coldStart = buildProducerPromptV2(
+      {
+        analysisText: 'FeatureCoordinator owns navigation state.',
+        evidenceMap: new Map(),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+    const incremental = `${SCAN_TASK_CONFIGS.extract.producePrompt}\n${SCAN_TASK_CONFIGS.summarize.producePrompt}`;
+    const conversation = new Conversation().buildContext({}) ?? '';
+
+    for (const prompt of [coldStart, incremental, conversation]) {
+      expect(prompt).toContain('params.retrievalProfile');
+      expect(prompt).toContain('summary.technicalEnglish');
+      expect(prompt).toContain('frozen queries');
+      expect(prompt).toContain('expected IDs');
+      expect(prompt).toContain('global synonyms');
+      expect(prompt).toContain('provider/vector');
+      expect(prompt).toContain('non-whole-file bounded range');
+    }
   });
 
   it('keeps Analyst final Markdown aligned to recorded note_finding facts', () => {

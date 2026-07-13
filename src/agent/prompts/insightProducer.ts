@@ -23,6 +23,7 @@ import {
   renderGuidance,
   SUBMIT_REQUIREMENTS,
 } from '@alembic/core/knowledge';
+import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
 import { type EvidenceEntry, isDocEvidencePath } from '../evidence/EvidenceCollector.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -201,6 +202,7 @@ export function buildProducerPrompt(
   parts.push(STYLE_GUIDE);
   parts.push(PRODUCER_SUBMIT_FIELD_CONTRACT);
   parts.push(SUBMIT_REQUIREMENTS);
+  parts.push(RECIPE_PRODUCTION_PROFILE_PROMPT);
 
   return compactProducerPromptParts(parts).join('\n\n');
 }
@@ -369,6 +371,7 @@ export function buildProducerPromptV2(
   parts.push(STYLE_GUIDE);
   parts.push(PRODUCER_SUBMIT_FIELD_CONTRACT);
   parts.push(SUBMIT_REQUIREMENTS);
+  parts.push(RECIPE_PRODUCTION_PROFILE_PROMPT);
   parts.push(`## Producer 工具边界
 - 不使用终端工具，即使当前冷启动启用了终端能力档位
 - 不新增搜索探索或源码补读；优先使用 Analyst evidence refs 和已给出的短代码片段

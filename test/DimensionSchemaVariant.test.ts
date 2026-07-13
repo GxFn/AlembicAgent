@@ -39,10 +39,25 @@ describe('M1a 维度 submit schema 变体（契约面=校验面）', () => {
     expect(String(((vReasoning.properties as R).sources as R).description)).toContain(
       'Auto-expanded'
     );
+    const profile = vProps.retrievalProfile as R;
+    const profileProps = profile.properties as R;
+    expect(profile.required).toEqual([
+      'primaryLanguage',
+      'summary',
+      'concepts',
+      'scenarios',
+      'exclusions',
+      'provenance',
+    ]);
+    expect((profileProps.summary as R).required).toEqual(['primary', 'technicalEnglish']);
+    expect(profileProps).not.toHaveProperty('queries');
+    expect(profileProps).not.toHaveProperty('expectedIds');
+    expect(profileProps).not.toHaveProperty('synonyms');
 
     // 原件（同一次 generate 的 base 数组元素）不被变体污染——schema 按引用直达 provider
     const bReasoning = (submitParamsOf(knowledgeBase).properties as R).reasoning as R;
     expect(bReasoning.required).toEqual(['sources']);
+    expect((submitParamsOf(knowledgeBase).properties as R).retrievalProfile).toEqual(profile);
     expect((submitParamsOf(knowledgeBase).properties as R).scope).toBeUndefined();
     // 非 knowledge 工具原样透传（同引用即可）
     expect(variant.find((s) => s.name === 'memory')).toBe(

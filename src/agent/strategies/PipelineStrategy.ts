@@ -212,6 +212,25 @@ function readSubmitRepairStats(sharedState: unknown): Record<string, number> | n
   return entries.length > 0 ? Object.fromEntries(entries) : null;
 }
 
+function readRecipeReadinessReports(sharedState: unknown): Array<Record<string, unknown>> | null {
+  if (!sharedState || typeof sharedState !== 'object') {
+    return null;
+  }
+  const box = (sharedState as Record<string, unknown>)._sessionCounters;
+  if (!box || typeof box !== 'object' || Array.isArray(box)) {
+    return null;
+  }
+  const reports = (box as Record<string, unknown>).recipeReadinessReports;
+  if (!Array.isArray(reports)) {
+    return null;
+  }
+  const valid = reports.filter(
+    (report): report is Record<string, unknown> =>
+      !!report && typeof report === 'object' && !Array.isArray(report)
+  );
+  return valid.length > 0 ? valid : null;
+}
+
 /** Lightweight ContextWindow subset consumed by pipeline stages */
 interface StageContextWindow {
   resetForNewStage(): void;
@@ -333,12 +352,14 @@ export class PipelineStrategy extends Strategy {
     // _sessionCounters 嵌套盒,见 readSubmitRepairStats 注释)——在此投影，
     // 评估 harness 据此算 repair-hit-rate。
     const submitRepairs = readSubmitRepairStats(ctx.strategyContext.sharedState);
+    const recipeReadiness = readRecipeReadinessReports(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
     const abandoned = ctx.degraded || ctx.retryExhausted;
     ctx.phaseResults._pipelineOutcome = {
       outcome: abandoned ? 'abandoned' : 'completed',
       ...(abandoned && ctx.abandonInfo ? ctx.abandonInfo : {}),
       ...(submitRepairs ? { submitRepairs } : {}),
+      ...(recipeReadiness ? { recipeReadiness } : {}),
     };
 
     return {

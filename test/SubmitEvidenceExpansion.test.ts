@@ -2,7 +2,7 @@
  * 提交侧证据展开与新鲜度终检测试（Wave A E5）。
  * 覆盖：checkFreshness（fresh/变更 stale/文件变短 stale/无区间 unknown）、
  * expandEvidenceRefsForSubmit（无 refs 直通、无台账拒、无效引用附候选、机械展开合并去重、
- * coreCode 仅空时回填、文件变更 EVIDENCE_STALE）、INSUFFICIENT_EVIDENCE 候选提示、
+ * coreCode 永不回填、文件变更 EVIDENCE_STALE）、INSUFFICIENT_EVIDENCE 候选提示、
  * producer 提示词含 evidenceRefs 指引。
  */
 import fs from 'node:fs';
@@ -91,7 +91,7 @@ describe('expandEvidenceRefsForSubmit（E5 机械展开）', () => {
     }
   });
 
-  test('新鲜引用：sources/sourceRefs 程序化合并去重，coreCode 仅空时回填台账 verbatim', () => {
+  test('新鲜引用：sources/sourceRefs 程序化合并去重，coreCode 永不从首条证据机械回填', () => {
     const { projectRoot, ledger } = makeProject();
     const result = expandEvidenceRefsForSubmit(baseItem, { ledger, projectRoot });
     expect(result.ok).toBe(true);
@@ -99,11 +99,11 @@ describe('expandEvidenceRefsForSubmit（E5 机械展开）', () => {
       const reasoning = result.item.reasoning as { sources: string[] };
       expect(reasoning.sources).toEqual(['lib/manual.ts:1-2', 'lib/a.ts:3-4']);
       expect(result.item.sourceRefs).toEqual(['lib/manual.ts:1-2', 'lib/a.ts:3-4']);
-      expect(result.item.coreCode).toBe('const x = 1;\nconst y = 2;'); // 台账 verbatim 回填
+      expect(result.item.coreCode).toBe('');
       expect(result.expandedSources).toEqual(['lib/a.ts:3-4']);
     }
 
-    // coreCode 非空时不覆盖（形式不一致由既有 F4c 管线消化）
+    // coreCode 非空时也不覆盖；production adapter 会独立验证 bounded match。
     const withCode = { ...baseItem, coreCode: 'model-written' };
     const kept = expandEvidenceRefsForSubmit(withCode, { ledger, projectRoot });
     expect(kept.ok && kept.item.coreCode).toBe('model-written');

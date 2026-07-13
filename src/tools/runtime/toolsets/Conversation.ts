@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PACKAGE_ROOT } from '../../../shared/packageAssets.js';
+import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../recipeProductionContract.js';
 import { RuntimeCapability } from './RuntimeCapability.js';
 
 interface ConversationOpts {
@@ -69,6 +70,8 @@ export class Conversation extends RuntimeCapability {
 
   buildContext(context: ContextInput) {
     const parts: string[] = [];
+
+    parts.push(RECIPE_PRODUCTION_PROFILE_PROMPT);
 
     if (this.#soulContent) {
       parts.push(this.#soulContent);

@@ -144,7 +144,15 @@ interface ToolEfficiencySharedState {
 
 interface ProducerSubmitLedgerEntry {
   id?: string;
+  lifecycle?: string;
   payloadStored: boolean;
+  production?: { capability?: string; source?: string };
+  readiness?: {
+    ready: boolean;
+    violationCodes: string[];
+    warningCodes: string[];
+  };
+  retrievalProfilePresent: boolean;
   requiredFieldsComplete: boolean;
   sourceCount: number;
   status: string;
@@ -1033,13 +1041,47 @@ function recordProducerSubmitLedger(
     ...(targetSubmits != null ? { targetSubmits } : {}),
   });
   const params = (call.args?.params as Record<string, unknown>) ?? call.args ?? {};
+  const readiness =
+    result.readiness && typeof result.readiness === 'object'
+      ? (result.readiness as Record<string, unknown>)
+      : null;
+  const violations = Array.isArray(readiness?.violations) ? readiness.violations : [];
+  const warnings = Array.isArray(readiness?.warnings) ? readiness.warnings : [];
+  const production =
+    result.production && typeof result.production === 'object'
+      ? (result.production as Record<string, unknown>)
+      : null;
   const title = String(result.title || params.title || params.category || '').trim();
   if (!title) {
     return;
   }
   const entry: ProducerSubmitLedgerEntry = {
     ...(typeof result.id === 'string' ? { id: result.id } : {}),
+    ...(typeof result.lifecycle === 'string' ? { lifecycle: result.lifecycle } : {}),
     payloadStored: true,
+    ...(production
+      ? {
+          production: {
+            capability: stringValue(production.capability) || undefined,
+            source: stringValue(production.source) || undefined,
+          },
+        }
+      : {}),
+    ...(readiness
+      ? {
+          readiness: {
+            ready: readiness.ready === true,
+            violationCodes: violations
+              .map((entry) => stringValue((entry as Record<string, unknown>)?.code))
+              .filter(Boolean),
+            warningCodes: warnings
+              .map((entry) => stringValue((entry as Record<string, unknown>)?.code))
+              .filter(Boolean),
+          },
+        }
+      : {}),
+    retrievalProfilePresent:
+      !!params.retrievalProfile && typeof params.retrievalProfile === 'object',
     requiredFieldsComplete: hasCompleteSubmitPayload(params),
     sourceCount: submitSourceCount(params),
     status: String(result.status || 'created'),
@@ -1071,6 +1113,7 @@ function hasCompleteSubmitPayload(params: Record<string, unknown>): boolean {
   const content = params.content as Record<string, unknown> | undefined;
   const reasoning = params.reasoning as Record<string, unknown> | undefined;
   const sources = Array.isArray(reasoning?.sources) ? reasoning.sources : [];
+  const evidenceRefs = Array.isArray(reasoning?.evidenceRefs) ? reasoning.evidenceRefs : [];
   return Boolean(
     stringValue(params.title) &&
       stringValue(params.description) &&
@@ -1080,14 +1123,16 @@ function hasCompleteSubmitPayload(params: Record<string, unknown>): boolean {
       stringValue(params.doClause) &&
       stringValue(content?.markdown) &&
       stringValue(content?.rationale) &&
-      sources.some((source) => typeof source === 'string' && source.trim())
+      [...sources, ...evidenceRefs].some((source) => typeof source === 'string' && source.trim())
   );
 }
 
 function submitSourceCount(params: Record<string, unknown>): number {
   const reasoning = params.reasoning as Record<string, unknown> | undefined;
   const sources = Array.isArray(reasoning?.sources) ? reasoning.sources : [];
-  return sources.filter((source) => typeof source === 'string' && source.trim()).length;
+  const evidenceRefs = Array.isArray(reasoning?.evidenceRefs) ? reasoning.evidenceRefs : [];
+  const refs = sources.length > 0 ? sources : evidenceRefs;
+  return refs.filter((source) => typeof source === 'string' && source.trim()).length;
 }
 
 function stringValue(value: unknown): string {

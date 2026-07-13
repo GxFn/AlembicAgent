@@ -61,22 +61,37 @@ interface RecordedCreate {
   items: Array<Record<string, unknown>>;
 }
 
-/** 内存 fake gateway：记录 items、全部 created。Core gateway 语义由 Core 自测；本测试聚焦 Agent 链。 */
+/** 内存 fake production port：记录 items、全部 staged。Core 真实持久化另有适配器集成测试。 */
 function createFakeGateway() {
   const created: RecordedCreate[] = [];
   return {
     created,
     gateway: {
-      async create(input: { items: Array<Record<string, unknown>> }) {
+      async createOrStage(input: { items: Array<Record<string, unknown>> }) {
         created.push({ items: input.items });
         return {
           created: input.items.map((item, index) => ({
             id: `e2e-recipe-${created.length}-${index}`,
             title: String(item.title ?? ''),
+            lifecycle: 'pending',
+            raw: item,
           })),
           duplicates: [],
           rejected: [],
+          merged: [],
           blocked: [],
+          supersedeProposal: null,
+          production: { capability: 'knowledge-submit', source: 'alembic-agent' },
+        };
+      },
+      async evaluateReadiness() {
+        return {
+          ready: false,
+          schemaVersion: '1',
+          profileHash: null,
+          documentSetHash: null,
+          violations: [{ code: 'retrieval.profile.missing', message: 'profile missing' }],
+          warnings: [],
         };
       },
     },
@@ -460,10 +475,19 @@ describe('mining E2E — 真实组合链路(fixture 仓 + 脚本化 provider)', 
     expect((reasoning.evidenceRefs as string[]).length).toBeGreaterThanOrEqual(3);
     const sources = (reasoning.sources ?? []) as string[];
     expect(sources.some((s) => s.includes('user-handler.ts'))).toBe(true);
-    // 3) coreCode 由确定性回填为引用区间的真实文件内容(逐字，含约定标识符)。
-    expect(String(item.coreCode ?? '')).toContain('wrapResult');
+    // 3) producer 没有显式提交 bounded snippet 时 coreCode 保持空，绝不从首条证据机械回填。
+    expect(item.coreCode).toBe('');
+    expect(item.retrievalProfile ?? null).toBeNull();
     // 4) 管线结局一等化：completed；父结果无 abandonedModules。
-    expect(childOutcome(result, 'mod-healthy').outcome).toBe('completed');
+    const outcome = childOutcome(result, 'mod-healthy');
+    expect(outcome.outcome).toBe('completed');
+    expect(outcome.recipeReadiness).toEqual([
+      expect.objectContaining({
+        lifecycle: 'pending',
+        ready: false,
+        violationCodes: ['retrieval.profile.missing'],
+      }),
+    ]);
     expect((result.phases as Record<string, unknown>).abandonedModules).toBeUndefined();
     // 5) 台账真实工作过：analyst 的 read 走了证据采集(工具调用里有 code.read + note_finding)。
     const toolDump = JSON.stringify(result.toolCalls ?? []);

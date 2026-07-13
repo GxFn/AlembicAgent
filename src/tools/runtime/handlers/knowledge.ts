@@ -9,13 +9,13 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import type { RecipeProductionPort } from '@alembic/core';
 import { dimensionTags } from '@alembic/core/dimensions';
 import {
   applyStyleWaiver,
   getImperativeVerbAllowlist,
   getSystemInjectedFields,
   isSoftAuthoringViolation,
-  type RecipeAuthoringViolation,
   STYLE_WAIVER_SESSION_LIMIT,
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
@@ -30,6 +30,7 @@ import {
   formatRecipeAuthoringViolations,
   runInProcessRecipeAuthoringGate,
 } from './recipeAuthoringGate.js';
+import { prepareRecipeProductionItem } from './recipeProductionAdapter.js';
 import {
   buildEvidenceCandidatesHint,
   buildViolationRepairTemplates,
@@ -37,7 +38,6 @@ import {
   inferEvidenceRefsFromSources,
   isStyleRepairable,
   repairStyleViolations,
-  replaceCoreCodeFromSources,
   sanitizeSubmissionEvidence,
 } from './submitEvidenceExpansion.js';
 
@@ -49,12 +49,12 @@ const LEGACY_IDE_AGENT_SOURCE = 'ide-agent';
 // 本文件仅保留 re-export 供既有测试/消费方引用。
 export { applyStyleWaiver, isSoftAuthoringViolation };
 
-/** F4b 自愈反馈里附带的真实代码行数上限（足够 coreCode 照抄，不炸拒绝消息体积） */
+/** F4b 反馈里附带的已声明 bounded range 行数上限。只提示，不改写候选。 */
 const SNIPPET_REPAIR_MAX_LINES = 12;
 
 /**
- * 读取 sourceRefs 中第一个可解析 ref 的真实行范围原文（越界行号 clamp 进文件）。
- * F4b 修复提示与 F4d 自动对齐共用。只读、projectRoot 内限定、失败返回 null。
+ * 严格读取 sourceRefs 中第一个可解析的真实行范围。越界不 clamp、裸路径不猜范围；
+ * 仅用于拒绝提示，production adapter 另行决定 coreCode 是否可保留。
  */
 function readRefRangeCode(
   sourceRefs: unknown,
@@ -62,9 +62,6 @@ function readRefRangeCode(
 ): {
   code: string;
   refText: string;
-  outOfRange: boolean;
-  rawStart: number;
-  fileLines: number;
 } | null {
   if (!projectRoot || !Array.isArray(sourceRefs)) {
     return null;
@@ -91,12 +88,15 @@ function readRefRangeCode(
       if (!Number.isFinite(rawStart) || rawStart < 1) {
         continue;
       }
-      const outOfRange = rawStart > lines.length;
-      const start = outOfRange
-        ? Math.max(1, lines.length - SNIPPET_REPAIR_MAX_LINES + 1)
-        : rawStart;
+      if (rawStart > lines.length) {
+        continue;
+      }
+      const start = rawStart;
       const requestedEnd = m[3] ? Number(m[3]) : start + SNIPPET_REPAIR_MAX_LINES - 1;
-      const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1, lines.length);
+      if (!Number.isFinite(requestedEnd) || requestedEnd < start || requestedEnd > lines.length) {
+        continue;
+      }
+      const end = Math.min(requestedEnd, start + SNIPPET_REPAIR_MAX_LINES - 1);
       const code = lines.slice(start - 1, end).join('\n');
       if (!code.trim()) {
         continue;
@@ -104,9 +104,6 @@ function readRefRangeCode(
       return {
         code,
         refText: `${normalized}:${start}-${end}`,
-        outOfRange,
-        rawStart,
-        fileLines: lines.length,
       };
     } catch {
       // 只读失败换下一个 ref：宁缺毋错。
@@ -122,8 +119,7 @@ function readRefRangeCode(
  */
 function normalizeBareSourceRefs(
   item: Record<string, unknown>,
-  sharedState: Record<string, unknown> | null,
-  projectRoot?: string
+  sharedState: Record<string, unknown> | null
 ): Record<string, unknown> {
   const ranges = sharedState?._analystGroundedRanges as
     | Record<string, Array<{ start: number; end: number }>>
@@ -142,17 +138,6 @@ function normalizeBareSourceRefs(
       changed = true;
       return `${filePath}:${fileRanges[0].start}-${fileRanges[0].end}`;
     }
-    // H2(2026-07-02 数量专项)：接地范围没有该文件时 fallback 到文件头 1-12 行——约定类知识
-    // (如「相对导入强制 .js 扩展名」)的证据天然散布多文件、常在 import 区(=文件头)，强制
-    // 行号对它形成结构性摩擦(真机同一候选因 LINE_MISSING 反复被拒 6 次)。只补真实存在且
-    // 根内的文件，读到空内容不补。
-    if (projectRoot) {
-      const headRange = readRefRangeCode([`${filePath}:1-12`], projectRoot);
-      if (headRange) {
-        changed = true;
-        return headRange.refText;
-      }
-    }
     return ref;
   };
   const sourceRefs = (item.sourceRefs as unknown[]).map(normalizeRef);
@@ -170,56 +155,15 @@ function normalizeBareSourceRefs(
 }
 
 /**
- * F4c/F4d 规范化（2026-07-02 收敛）：门禁逐字校验只剩 coreCode / content.pattern 证据位
- * （Core 已把 markdown 代码块豁免——特写模板是提炼物，归模型创作，handler **绝不碰
- * markdown**；此前把 fenced 替换为 ref 原文的做法摧毁了特写的范式意义，用户验收否决）。
- * 剩余唯一确定性对齐：coreCode 不匹配时，用模型【自己引用】的 sourceRef 范围原文替换
- * coreCode——ref 是它声称的证据来源，候选仍进待人审 candidates。
- */
-function tryNormalizeSnippetEvidence(
-  item: Record<string, unknown>,
-  opts: { projectRoot: string | undefined; dimensionId: string | undefined }
-): {
-  item: Record<string, unknown>;
-  direction: string;
-  violations: RecipeAuthoringViolation[];
-} | null {
-  if (!opts.projectRoot) {
-    return null;
-  }
-  const refRange = readRefRangeCode(item.sourceRefs, opts.projectRoot);
-  if (!refRange) {
-    return null;
-  }
-  const variant = {
-    direction: `coreCode ← sourceRef(${refRange.refText})`,
-    item: { ...item, coreCode: refRange.code },
-  };
-  const violations = runInProcessRecipeAuthoringGate(variant.item, {
-    projectRoot: opts.projectRoot,
-    dimensionId: opts.dimensionId,
-  });
-  // 采纳条件：SNIPPET_MISMATCH 消失即可（不要求零违规）——剩余文本层违规交回模型修。
-  if (!violations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-    return { ...variant, violations };
-  }
-  return null;
-}
-
-/**
- * F4b：SNIPPET_MISMATCH 拒绝时，读取第一个可解析 sourceRef 的真实行范围，把逐字代码
- * 附进拒绝消息——模型下一轮把 coreCode / markdown 代码块替换为该内容即可通过
- * snippet-match（判据 = 去空白子串包含）。只读、projectRoot 内限定、失败静默返回空串。
+ * F4b：代码/引用门禁拒绝时，读取第一个可解析 sourceRef 的真实 bounded range 作为诊断提示。
+ * 该提示不会修改候选，也不把首个来源或整文件视为 coreCode 答案；失败时静默返回空串。
  */
 function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undefined): string {
   const range = readRefRangeCode(sourceRefs, projectRoot);
   if (!range) {
     return '';
   }
-  const rangeNote = range.outOfRange
-    ? `你引用的行号 ${range.rawStart} 超出该文件（共 ${range.fileLines} 行）。请改用 ${range.refText}，`
-    : `引用范围 ${range.refText} `;
-  return ` 📎 修复提示：${rangeNote}其真实代码如下。请【先按此答案重试本条一次】——sourceRefs 与 coreCode 逐字替换为它（markdown 特写正文与模板代码保持你自己的提炼创作，不要改成粘贴），带答案的拒绝不算连续失败；重试后仍被拒才换下一条:\n${range.code}`;
+  return ` 📎 修复提示：引用范围 ${range.refText} 的真实代码如下。仅当它确实是本候选需要表达的 bounded snippet 时，才逐字重提 coreCode；不得把首个来源或整文件当作自动答案。markdown 特写正文与模板代码保持你自己的提炼创作：\n${range.code}`;
 }
 
 export async function handle(
@@ -455,7 +399,7 @@ async function handleSubmit(
       whenClause: params.whenClause as string,
       doClause: params.doClause as string,
       dontClause: params.dontClause as string | undefined,
-      coreCode: pickString(params.coreCode) ?? pickString(content.pattern) ?? '',
+      coreCode: pickString(params.coreCode) ?? '',
       topicHint: pickString(params.topicHint) ?? effectiveCategory,
       headers: normalizeStringArray(params.headers),
       usageGuide: pickString(params.usageGuide) ?? buildDefaultUsageGuide(params),
@@ -472,7 +416,7 @@ async function handleSubmit(
         : null,
     };
 
-    // P1.4b in-process flatten (CG-4)：在 gateway.create（Core stage-3）之前，把 in-process 提交
+    // P1.4b in-process flatten (CG-4)：在 Core production port 之前，把 in-process 提交
     // 接到与 host-agent 路径同一套权威门禁 validateAgainst。档位由 resolveAuthoringProfile 从上下文
     // 解析：携带 bootstrap dimension 的冷启动提交 → cold-start（完整门禁，含 3-file 证据下限）；
     // 运行期机会式 in-process AI 开发（无 session / 无 dimension）→ opportunistic（保留全部内容门禁
@@ -504,8 +448,8 @@ async function handleSubmit(
       sharedStateForSubmit._submitTitleAttempts = attempts;
     }
 
-    // E5（证据保真）：reasoning.evidenceRefs 台账机械展开——sources/coreCode 由程序从台账
-    // 条目生成/回填（模型不再手写 file:line），并做新鲜度终检（run 中途文件变更→EVIDENCE_STALE
+    // E5（证据保真）：reasoning.evidenceRefs 台账机械展开——sources 由程序从台账
+    // 条目生成（模型不再手写 file:line），并做新鲜度终检（run 中途文件变更→EVIDENCE_STALE
     // 拒并提示重采）。发生在权威门禁之前的 Agent 层；Core gateRules 与九拒因语义不动。
     let expansion = expandEvidenceRefsForSubmit(item, {
       ledger: ctx.runtime?.evidenceLedger,
@@ -588,67 +532,31 @@ async function handleSubmit(
 
     let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
       sanitized.item,
-      sharedStateForSubmit,
-      ctx.projectRoot
+      sharedStateForSubmit
     );
-
-    // 拒收治理（run-17→全量 run 复盘二修）：coreCode 缺失是 gateway 必填而 Agent 门不查的
-    // 判据缝。回填必须在 normalizeBareSourceRefs 之后——裸路径此刻才获得 Analyst 接地区间，
-    // 首跑时回填因"无可解析带区间 source"静默 miss（全量 run 17 拒的直接根因，首拒后靠
-    // 第二次尝试的 F4c 才救回）。miss 也留痕，不再有无迹拒绝路径。
-    if (typeof effectiveItem.coreCode !== 'string' || !effectiveItem.coreCode.trim()) {
-      const filled = replaceCoreCodeFromSources(effectiveItem, ctx.projectRoot ?? '');
-      if (filled) {
-        effectiveItem = filled;
-        bumpSubmitRepairStat(ctx.runtime, 'core_code_backfilled');
-        Logger.getInstance().info(
-          `[knowledge.submit] coreCode deterministically backfilled from cited source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
-        );
-      } else {
-        Logger.getInstance().info(
-          `[knowledge.submit] coreCode backfill skipped (no parsable ranged source) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
-        );
-      }
+    const preparedProduction = prepareRecipeProductionItem(effectiveItem, ctx.projectRoot);
+    effectiveItem = preparedProduction.item as Record<string, unknown>;
+    if (!preparedProduction.codeEvidence.accepted) {
+      bumpSubmitRepairStat(ctx.runtime, 'unsafe_core_code_removed');
+      Logger.getInstance().warn(
+        `[knowledge.submit] unsafe coreCode removed; candidate will remain readiness-blocked until repaired for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+      );
     }
     let gateViolations = runInProcessRecipeAuthoringGate(effectiveItem, {
       projectRoot: ctx.projectRoot,
       dimensionId: effectiveDimensionId,
     });
-    // F4c：SNIPPET_MISMATCH 先尝试 handler 内规范化重验（三处代码位对齐到已验证的真实代码），
-    // 成功则零轮次消化形式不一致；失败才走拒绝反馈路径。
-    if (gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-      const normalized = tryNormalizeSnippetEvidence(effectiveItem, {
-        projectRoot: ctx.projectRoot,
-        dimensionId: effectiveDimensionId,
-      });
-      if (normalized) {
-        bumpSubmitRepairStat(ctx.runtime, 'snippet_normalized');
-        Logger.getInstance().info(
-          `[knowledge.submit] snippet evidence normalized (${normalized.direction}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${normalized.violations.length}`
-        );
-        effectiveItem = normalized.item;
-        // 剩余文本层违规（graph/doClause 等）照常走拒绝反馈——但 snippet 维度已确定性消化。
-        gateViolations = normalized.violations;
-      }
-    }
-    // E7-D：F4c 未消化的 SNIPPET_MISMATCH→程序直接用首个可解析 source 区间的真实文件内容
-    // 覆盖 coreCode 后重验（引用区间本就是候选声明的证据位置，其真实内容天然逐字匹配）。
-    if (gateViolations.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-      const replaced = replaceCoreCodeFromSources(effectiveItem, ctx.projectRoot);
-      if (replaced) {
-        const reVerified = runInProcessRecipeAuthoringGate(replaced, {
-          projectRoot: ctx.projectRoot,
-          dimensionId: effectiveDimensionId,
-        });
-        if (!reVerified.some((v) => v.code === 'SNIPPET_MISMATCH')) {
-          bumpSubmitRepairStat(ctx.runtime, 'core_code_replaced');
-          Logger.getInstance().info(
-            `[knowledge.submit] coreCode deterministically replaced from source range for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
-          );
-          effectiveItem = replaced;
-          gateViolations = reVerified;
-        }
-      }
+    if (!preparedProduction.codeEvidence.accepted) {
+      const repairablePendingCodes = new Set([
+        'SNIPPET_MISMATCH',
+        'SOURCE_REF_INVALID',
+        'SOURCE_REF_LINE_MISSING',
+        'SOURCE_REF_LINE_OUT_OF_RANGE',
+        'SOURCE_REF_NOT_FOUND',
+      ]);
+      gateViolations = gateViolations.filter(
+        (violation) => !repairablePendingCodes.has(violation.code)
+      );
     }
     // F4e：GRAPH_REF_INVALID 且 Analyst 真有 graph 查询证据时，自动注入 reasoning.graphRefs
     // （替模型完成「复制」动作——graphEvidence 来自真实 graph 调用，非编造；为空则保持拒绝）。
@@ -768,10 +676,8 @@ async function handleSubmit(
     }
     if (gateViolations.length > 0) {
       const detail = formatRecipeAuthoringViolations(gateViolations);
-      // F4b 自愈反馈：SNIPPET_MISMATCH 时把「引用范围的真实代码」直接附进拒绝消息——
-      // 模型下一轮逐字照抄即可通过 snippet-match（去空白子串包含）。这把照抄链从
-      // 「预先给对证据」升级为「错了就给正确答案」，不依赖第一轮依从性。
-      // 代码/引用类违规都给答案（否则第一拒无提示、第二拒才有、第三次已被止损——答案永远晚一步）。
+      // F4b 诊断反馈：代码/引用类违规可附一个真实 bounded range，帮助模型判断引用是否相关。
+      // 提示不会修改候选，也不会把首个来源、无界范围或整文件自动提升为 coreCode。
       const snippetRepair = gateViolations.some((v) =>
         ['SNIPPET_MISMATCH', 'SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING'].includes(
           v.code
@@ -840,32 +746,69 @@ async function handleSubmit(
       }
     }
 
-    const result = await gateway.create({
-      source: AGENT_RUNTIME_SOURCE,
-      items: [effectiveItem],
-      options: {
-        supersedes: pickString(params.supersedes),
-        existingTitles: ctx.runtime?.submittedTitles ?? undefined,
-        existingTriggers: ctx.runtime?.submittedTriggers ?? undefined,
-        existingFingerprints: ctx.runtime?.submittedPatterns ?? undefined,
-        systemInjectedFields: isBootstrap ? getSystemInjectedFields() : undefined,
-        userId: AGENT_RUNTIME_SOURCE,
-        bootstrapDedup: isBootstrap ? ctx.runtime?.bootstrapDedup : undefined,
+    const result = await gateway.createOrStage(
+      {
+        items: [effectiveItem],
+        options: {
+          supersedes: pickString(params.supersedes),
+          existingTitles: ctx.runtime?.submittedTitles ?? undefined,
+          existingTriggers: ctx.runtime?.submittedTriggers ?? undefined,
+          existingFingerprints: ctx.runtime?.submittedPatterns ?? undefined,
+          systemInjectedFields: uniqueStrings([
+            ...(isBootstrap ? getSystemInjectedFields() : []),
+            'coreCode',
+          ]),
+          bootstrapDedup: isBootstrap ? (ctx.runtime?.bootstrapDedup as never) : undefined,
+        },
       },
-    });
+      {
+        source: AGENT_RUNTIME_SOURCE,
+        userId: AGENT_RUNTIME_SOURCE,
+        capability: 'knowledge-submit',
+      }
+    );
 
     if (result.created.length > 0) {
+      const created = result.created[0];
+      const readiness = await gateway.evaluateReadiness(created.id);
+      const readinessEvidence = {
+        id: created.id,
+        lifecycle: created.lifecycle,
+        ready: readiness.ready,
+        violationCodes: readiness.violations.map((violation) => violation.code),
+      };
+      const readinessBox = sessionCounterBox(ctx.runtime);
+      if (readinessBox) {
+        const reports = Array.isArray(readinessBox.recipeReadinessReports)
+          ? readinessBox.recipeReadinessReports
+          : [];
+        readinessBox.recipeReadinessReports = [...reports, readinessEvidence];
+      }
+      if (!readiness.ready) {
+        Logger.getInstance().warn(
+          `[knowledge.submit] candidate persisted as ${created.lifecycle} with Core readiness violations for "${String(item.title ?? '')}": ${readiness.violations.map((violation) => violation.code).join(', ')}`
+        );
+      }
       if (ctx.sessionStore) {
         ctx.sessionStore.save(
           `submit:${item.title}`,
-          JSON.stringify({ title: item.title, kind: item.kind }),
+          JSON.stringify({
+            title: item.title,
+            kind: item.kind,
+            lifecycle: created.lifecycle,
+            production: result.production,
+            readiness,
+          }),
           { tags: ['submission'] }
         );
       }
       return ok({
         status: 'created',
-        id: result.created[0].id,
-        title: result.created[0].title,
+        id: created.id,
+        title: created.title,
+        lifecycle: created.lifecycle,
+        production: result.production,
+        readiness,
       });
     }
 
@@ -882,7 +825,7 @@ async function handleSubmit(
         status: 'duplicate_blocked',
         similar: result.duplicates.map((d) => ({
           title: d.title,
-          similarity: d.score ?? d.similarTo?.[0]?.similarity ?? 0,
+          similarity: d.similarTo?.[0]?.similarity ?? 0,
           similarTo: d.similarTo ?? [],
         })),
       });
@@ -1026,6 +969,7 @@ function validateSubmitParams(params: Record<string, unknown>): string | null {
   const whenClause = params.whenClause as string | undefined;
   const doClause = params.doClause as string | undefined;
   const reasoning = params.reasoning as Record<string, unknown> | undefined;
+  const retrievalProfile = params.retrievalProfile;
 
   // 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：长度阈值属风格类——权威门禁已把
   // 长度类violation 分层为 advisory，本廉价前检若先硬拒即旁路分层（run-14 四拒全为此路径
@@ -1072,6 +1016,12 @@ function validateSubmitParams(params: Record<string, unknown>): string | null {
     evidenceRefs.filter((ref) => typeof ref === 'string' && ref.trim().length > 0).length > 0;
   if (!reasoning || (!hasSources && !hasRefs)) {
     errors.push('reasoning.sources or reasoning.evidenceRefs must be a non-empty array');
+  }
+  if (
+    retrievalProfile !== undefined &&
+    (!retrievalProfile || typeof retrievalProfile !== 'object' || Array.isArray(retrievalProfile))
+  ) {
+    errors.push('retrievalProfile must be an object when provided');
   }
 
   return errors.length > 0 ? errors.join('; ') : null;
@@ -1477,23 +1427,7 @@ interface SearchEngineLike {
   ): Promise<SearchResult[]>;
 }
 
-interface RecipeGatewayLike {
-  create(request: {
-    source: string;
-    items: Record<string, unknown>[];
-    options?: Record<string, unknown>;
-  }): Promise<{
-    created: Array<{ id: string; title: string }>;
-    rejected: Array<{ reason: string; errors?: string[]; warnings?: string[] }>;
-    duplicates: Array<{
-      title: string;
-      score?: number;
-      similarTo?: Array<{ title: string; similarity: number; file?: string }>;
-    }>;
-    merged: unknown[];
-    blocked: unknown[];
-  }>;
-}
+type RecipeGatewayLike = RecipeProductionPort;
 
 interface KnowledgeRepoLike {
   getById(id: string): Promise<Record<string, unknown> | null>;

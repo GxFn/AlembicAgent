@@ -10,6 +10,8 @@
  * @module scanPrompts
  */
 
+import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
+
 /**
  * task → Produce 阶段配置 (extract + summarize)
  *
@@ -59,7 +61,9 @@ content.markdown 字段必须是「项目特写」：
 - 如果 code({ action: "read" }) 返回"文件不存在"或错误，不要重试同一文件的其他路径变体
 - 文件读取失败时，直接使用分析文本中已有的代码和描述来提交候选
 - 永远不要因为文件读取失败而跳过知识点 — 分析文本已经包含足够信息
-- 先提交候选，再考虑是否需要读取更多代码（提交优先于验证）`,
+- 先提交候选，再考虑是否需要读取更多代码（提交优先于验证）
+
+${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
   },
 
@@ -92,7 +96,9 @@ content.markdown 字段必须是「项目特写」：
 - reasoning.sources 必须是非空数组，填写源文件路径
 - kind 选择: 优先 pattern（代码模式）或 fact（技术事实）
 - 必填: trigger (@kebab-case)、doClause (英文祈使句)、content.rationale
-- content.markdown 必须包含代码块，展示核心实现`,
+- content.markdown 必须包含代码块，展示核心实现
+
+${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
   },
 };

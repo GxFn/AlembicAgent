@@ -33,6 +33,74 @@ export const DEPTH_SLOT_PROPS: Record<string, { type: 'string'; description: str
     ])
   );
 
+const RETRIEVAL_FACT_SCHEMA = {
+  type: 'object',
+  properties: {
+    text: { type: 'string' },
+    language: { type: 'string' },
+    provenanceRefs: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'References to an existing field:<name> or the exact bounded file:start-end evidence used for this fact.',
+    },
+  },
+  required: ['text', 'language', 'provenanceRefs'],
+  additionalProperties: false,
+} as const;
+
+const RETRIEVAL_PROFILE_INPUT_SCHEMA = {
+  type: 'object',
+  description:
+    'Evidence-grounded retrieval meaning only. Never include frozen queries, expected IDs, global synonyms, provider/vector/rank facts, or invented facts. Agent deterministically supplies schemaVersion, source evidence, source-content hash, and generator.',
+  properties: {
+    primaryLanguage: { type: 'string' },
+    summary: {
+      type: 'object',
+      properties: {
+        primary: { type: 'string', description: 'Project-primary-language summary.' },
+        technicalEnglish: {
+          type: 'string',
+          description:
+            'Grounded technical English retrieval expression only; do not add facts absent from cited evidence.',
+        },
+      },
+      required: ['primary', 'technicalEnglish'],
+      additionalProperties: false,
+    },
+    concepts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          term: { type: 'string' },
+          language: { type: 'string' },
+          provenanceRefs: RETRIEVAL_FACT_SCHEMA.properties.provenanceRefs,
+        },
+        required: ['term', 'language', 'provenanceRefs'],
+        additionalProperties: false,
+      },
+    },
+    scenarios: { type: 'array', items: RETRIEVAL_FACT_SCHEMA },
+    exclusions: { type: 'array', items: RETRIEVAL_FACT_SCHEMA },
+    provenance: {
+      type: 'object',
+      properties: {
+        sourceFieldRefs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Existing Recipe field references used by profile facts, such as field:description or field:whenClause.',
+        },
+      },
+      required: ['sourceFieldRefs'],
+      additionalProperties: false,
+    },
+  },
+  required: ['primaryLanguage', 'summary', 'concepts', 'scenarios', 'exclusions', 'provenance'],
+  additionalProperties: false,
+} as const;
+
 /* ================================================================== */
 /*  code — 代码智能                                                    */
 /* ================================================================== */
@@ -261,23 +329,29 @@ const KNOWLEDGE_SPEC: ToolSpec = {
           doClause: { type: 'string' },
           dontClause: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
+          coreCode: {
+            type: 'string',
+            description:
+              'Optional verbatim code snippet. Supply only when it matches an explicit bounded, project-local, non-document file:start-end citation. Never paste a whole file.',
+          },
           reasoning: {
             type: 'object',
             properties: {
               whyStandard: { type: 'string' },
               sources: { type: 'array', items: { type: 'string' } },
-              // E5（证据保真）：优先以台账条目 id 提交——sources/coreCode 由程序机械展开并做
-              // 新鲜度终检；手填 sources 仍被接受（由门禁 fs 校验兜底）。
+              // E5（证据保真）：优先以台账条目 id 提交——sources 由程序机械展开并做
+              // 新鲜度终检；coreCode 只接受显式 bounded match。
               evidenceRefs: {
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                  'Evidence ledger entry ids from [evidence] annotations (e.g. ["E-3","E-7@5-12"]). sources/coreCode are mechanically expanded and freshness-checked from these; preferred over hand-written sources.',
+                  'Evidence ledger entry ids from [evidence] annotations (e.g. ["E-3","E-7@5-12"]). sources are mechanically expanded and freshness-checked; coreCode is never backfilled and must match a bounded citation.',
               },
               confidence: { type: 'number' },
             },
             required: ['sources'],
           },
+          retrievalProfile: RETRIEVAL_PROFILE_INPUT_SCHEMA,
           waiverJustification: {
             type: 'string',
             description:

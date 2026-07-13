@@ -224,15 +224,15 @@ describe('buildViolationRepairTemplates（E7）', () => {
   });
 });
 
-describe('replaceCoreCodeFromSources（E7-D SNIPPET 确定性替换）', () => {
-  test('首个可解析带区间 source 的真实内容覆盖 coreCode；无区间/越界返回 null', async () => {
-    const { replaceCoreCodeFromSources } = await import(
-      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+describe('Recipe production adapter（bounded code only）', () => {
+  test('只保留逐字匹配的 bounded snippet，绝不以首个 source 内容覆盖模型代码', async () => {
+    const { prepareRecipeProductionItem } = await import(
+      '../src/tools/runtime/handlers/recipeProductionAdapter.js'
     );
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'corecode-'));
     fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
     fs.writeFileSync(path.join(projectRoot, 'lib/a.ts'), 'L1\nconst real = 1;\nL3', 'utf8');
-    const replaced = replaceCoreCodeFromSources(
+    const rejected = prepareRecipeProductionItem(
       {
         coreCode: 'model-paraphrased',
         content: { pattern: 'stale', rationale: 'r' },
@@ -240,16 +240,19 @@ describe('replaceCoreCodeFromSources（E7-D SNIPPET 确定性替换）', () => {
       },
       projectRoot
     );
-    expect(replaced?.coreCode).toBe('const real = 1;');
-    expect((replaced?.content as { pattern: string }).pattern).toBe('const real = 1;');
-    expect((replaced?.content as { rationale: string }).rationale).toBe('r');
+    expect(rejected.item.coreCode).toBe('');
+    expect((rejected.item.content as { pattern: string }).pattern).toBe('stale');
+    expect(rejected.codeEvidence.accepted).toBe(false);
 
-    expect(
-      replaceCoreCodeFromSources({ reasoning: { sources: ['lib/a.ts'] } }, projectRoot)
-    ).toBeNull();
-    expect(
-      replaceCoreCodeFromSources({ reasoning: { sources: ['lib/a.ts:99-100'] } }, projectRoot)
-    ).toBeNull();
+    const accepted = prepareRecipeProductionItem(
+      { coreCode: 'const real = 1;', reasoning: { sources: ['lib/a.ts:2-2'] } },
+      projectRoot
+    );
+    expect(accepted.item.coreCode).toBe('const real = 1;');
+    expect(accepted.codeEvidence).toMatchObject({
+      accepted: true,
+      provenanceRef: 'lib/a.ts:2-2',
+    });
   });
 });
 
@@ -279,15 +282,33 @@ describe('门禁分层 v2（2026-07-04 用户裁定：证据硬门+风格 adviso
     });
     const created: Record<string, unknown>[] = [];
     const gateway = {
-      create: async (req: { items: Record<string, unknown>[] }) => {
+      createOrStage: async (req: { items: Record<string, unknown>[] }) => {
         created.push(req.items[0]);
         return {
-          created: [{ id: 'id-1', title: String(req.items[0].title) }],
+          created: [
+            {
+              id: 'id-1',
+              title: String(req.items[0].title),
+              lifecycle: 'pending',
+              raw: req.items[0],
+            },
+          ],
           duplicates: [],
           rejected: [],
+          merged: [],
           blocked: [],
+          supersedeProposal: null,
+          production: { capability: 'knowledge-submit', source: 'alembic-agent' },
         };
       },
+      evaluateReadiness: async () => ({
+        ready: false,
+        schemaVersion: '1',
+        profileHash: null,
+        documentSetHash: null,
+        violations: [{ code: 'retrieval.profile.missing', message: 'profile missing' }],
+        warnings: [],
+      }),
     };
     const params = {
       title: '类型导入使用 ImportType 严格隔离',

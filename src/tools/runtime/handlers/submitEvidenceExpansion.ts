@@ -5,8 +5,7 @@
  *
  * producer 以 `reasoning.evidenceRefs`（台账条目 id）提交时：
  * - sources / sourceRefs 由程序从台账条目机械展开为 `file:start-end`（模型不再手写引用）；
- * - coreCode 为空时以首个带区间条目的 verbatim 内容回填（非空时不覆盖——形式不一致仍由
- *   既有 F4c 对齐管线消化）；
+ * - coreCode 永不从台账机械回填；production adapter 只验证模型显式提交的 bounded snippet；
  * - 新鲜度终检：带 file+range 的条目按「同区间重切+同截断+同脱敏」重算哈希与采集时比对，
  *   run 中途文件变更 → 拒并提示 evidence.search/code.read 重采（EVIDENCE_STALE）。
  *
@@ -69,7 +68,6 @@ export function expandEvidenceRefsForSubmit(
   }
 
   const labels: string[] = [];
-  let firstRangedContent: string | null = null;
   let resolvedRefs = 0;
   for (const ref of refs) {
     const entry = ledger.get(ref);
@@ -102,9 +100,6 @@ export function expandEvidenceRefsForSubmit(
           error: `Validation failed: EVIDENCE_STALE (${entry.file}): 引用条目 ${entry.id} 采集后该文件已变更或不可读——先用 evidence.search/code.read 重采，再以新条目 id 提交。`,
         };
       }
-      if (firstRangedContent === null) {
-        firstRangedContent = entry.content;
-      }
       labels.push(`${entry.file}:${entry.range.start}-${entry.range.end}`);
     } else if (entry.file) {
       // M2/P1b：file-有-range-无（per-file search 条目，content 每行 "NN: text" 是采集真值）——
@@ -131,18 +126,12 @@ export function expandEvidenceRefsForSubmit(
 
   const mergedSources = uniqueMerge(reasoning.sources, labels);
   const mergedSourceRefs = uniqueMerge(item.sourceRefs, labels);
-  const coreCode =
-    typeof item.coreCode === 'string' && item.coreCode.trim()
-      ? item.coreCode
-      : (firstRangedContent ?? item.coreCode);
-
   return {
     ok: true,
     expandedSources: labels,
     resolvedRefs,
     item: {
       ...item,
-      coreCode,
       sourceRefs: mergedSourceRefs,
       reasoning: { ...reasoning, sources: mergedSources },
     },
@@ -326,63 +315,6 @@ export function buildViolationRepairTemplates(
     );
   }
   return parts.length > 0 ? ` 🔧 ${parts.join(' ｜ ')}` : '';
-}
-
-/**
- * SNIPPET_MISMATCH 确定性替换（E7-D）：用首个可解析 source 区间的真实文件内容直接覆盖
- * coreCode（与 content.pattern，若存在）——F4b 的「附真实代码让模型抄」升级为「程序直接替它抄」。
- * 引用的行区间本就是候选声明的证据位置，其真实内容天然满足逐字匹配；无可解析带区间
- * source 时返回 null 走原拒绝路径。
- */
-export function replaceCoreCodeFromSources(
-  item: Record<string, unknown>,
-  projectRoot: string
-): Record<string, unknown> | null {
-  const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
-  const candidates: string[] = [];
-  for (const raw of [reasoning.sources, item.sourceRefs]) {
-    if (Array.isArray(raw)) {
-      for (const value of raw) {
-        if (typeof value === 'string' && value.trim()) {
-          candidates.push(value.trim());
-        }
-      }
-    }
-  }
-  for (const source of candidates) {
-    const match = /^(.*?):(\d+)(?:-(\d+))?$/.exec(source);
-    if (!match) {
-      continue;
-    }
-    const file = match[1];
-    const start = Number(match[2]);
-    const end = match[3] ? Number(match[3]) : start;
-    const absolute = join(projectRoot, file);
-    if (start < 1 || end < start || !existsSync(absolute)) {
-      continue;
-    }
-    try {
-      const lines = readFileSync(absolute, 'utf8').split('\n');
-      if (end > lines.length) {
-        continue;
-      }
-      const content = lines.slice(start - 1, end).join('\n');
-      if (!content.trim()) {
-        continue;
-      }
-      const contentObj = (item.content ?? {}) as Record<string, unknown>;
-      return {
-        ...item,
-        coreCode: content,
-        ...(typeof contentObj.pattern === 'string'
-          ? { content: { ...contentObj, pattern: content } }
-          : {}),
-      };
-    } catch {
-      // 单个 source 读取失败换下一个候选
-    }
-  }
-  return null;
 }
 
 /** 可由修复子调用处理的纯风格/措辞类拒因（证据类不在内——那是事实问题不是写法问题） */
