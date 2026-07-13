@@ -15,9 +15,11 @@ const MAX_EVIDENCE_RANGE_LINES = 160;
 const DOCUMENT_EXTENSIONS = new Set(['.md', '.mdx', '.rst', '.txt']);
 const DOCUMENT_DIRECTORIES = new Set(['design', 'docs', 'wakeflow-ledger']);
 
-interface BoundedSourceEvidence {
+interface ProjectSourceEvidence {
   ref: string;
   content: string;
+  documentation: boolean;
+  wholeFile: boolean;
 }
 
 export interface PreparedRecipeProductionItem {
@@ -77,7 +79,7 @@ function isDocumentationPath(file: string): boolean {
   );
 }
 
-function readBoundedSourceEvidence(ref: string, projectRoot: string): BoundedSourceEvidence | null {
+function readProjectSourceEvidence(ref: string, projectRoot: string): ProjectSourceEvidence | null {
   const match = /^(.+?):(\d+)(?:-(\d+))?$/.exec(ref.trim());
   if (!match) {
     return null;
@@ -87,8 +89,7 @@ function readBoundedSourceEvidence(ref: string, projectRoot: string): BoundedSou
     !relative ||
     path.posix.isAbsolute(relative) ||
     relative === '..' ||
-    relative.startsWith('../') ||
-    isDocumentationPath(relative)
+    relative.startsWith('../')
   ) {
     return null;
   }
@@ -118,11 +119,18 @@ function readBoundedSourceEvidence(ref: string, projectRoot: string): BoundedSou
       return null;
     }
     const lines = logicalLines(fs.readFileSync(realFile, 'utf8'));
-    if (end > lines.length || (start === 1 && end === lines.length)) {
+    if (end > lines.length) {
       return null;
     }
     const content = lines.slice(start - 1, end).join('\n');
-    return content.trim() ? { ref: `${relative}:${start}-${end}`, content } : null;
+    return content.trim()
+      ? {
+          ref: `${relative}:${start}-${end}`,
+          content,
+          documentation: isDocumentationPath(relative),
+          wholeFile: start === 1 && end === lines.length,
+        }
+      : null;
   } catch {
     return null;
   }
@@ -181,10 +189,11 @@ function buildRetrievalProfile(
 }
 
 /**
- * Convert the Agent-authored profile draft into Core's public wire contract and
- * admit coreCode only when an explicit, project-local, non-document, non-whole-file
- * bounded range contains the submitted snippet. No source snippet is ever copied
- * into the candidate by this adapter.
+ * Convert the Agent-authored profile draft into Core's public wire contract. Profile
+ * provenance accepts valid project-local bounded evidence (including documentation)
+ * independently from coreCode, while code admission additionally requires a
+ * non-document, non-whole-file range containing the submitted snippet. No source
+ * snippet is ever copied into the candidate by this adapter.
  */
 export function prepareRecipeProductionItem(
   rawItem: Record<string, unknown>,
@@ -192,15 +201,16 @@ export function prepareRecipeProductionItem(
 ): PreparedRecipeProductionItem {
   const authoredProfile = record(rawItem.retrievalProfile);
   const requestedCoreCode = text(rawItem.coreCode);
-  const boundedEvidence = sourceRefsFromItem(rawItem as CreateRecipeItem)
-    .map((ref) => readBoundedSourceEvidence(ref, projectRoot))
-    .filter((entry): entry is BoundedSourceEvidence => entry !== null);
+  const profileEvidence = sourceRefsFromItem(rawItem as CreateRecipeItem)
+    .map((ref) => readProjectSourceEvidence(ref, projectRoot))
+    .filter((entry): entry is ProjectSourceEvidence => entry !== null);
+  const codeEvidence = profileEvidence.filter((entry) => !entry.documentation && !entry.wholeFile);
 
   const codeFitsBudget =
     requestedCoreCode.length <= MAX_CORE_CODE_CHARS &&
     logicalLines(requestedCoreCode).length <= MAX_CORE_CODE_LINES;
   const matchingEvidence = requestedCoreCode
-    ? boundedEvidence.find((entry) => entry.content.includes(requestedCoreCode))
+    ? codeEvidence.find((entry) => entry.content.includes(requestedCoreCode))
     : undefined;
   const codeAccepted = !requestedCoreCode || (codeFitsBudget && matchingEvidence !== undefined);
   const item: CreateRecipeItem = {
@@ -208,11 +218,11 @@ export function prepareRecipeProductionItem(
     coreCode: codeAccepted ? requestedCoreCode : '',
     retrievalProfile: null,
   };
-  if (authoredProfile && boundedEvidence.length > 0 && codeAccepted) {
+  if (authoredProfile) {
     item.retrievalProfile = buildRetrievalProfile(
       authoredProfile,
       item,
-      distinctSorted(boundedEvidence.map((entry) => entry.ref))
+      distinctSorted(profileEvidence.map((entry) => entry.ref))
     );
   }
 

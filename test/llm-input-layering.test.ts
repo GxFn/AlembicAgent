@@ -339,13 +339,21 @@ describe('LLM input layering', () => {
     expect(PRODUCER_SYSTEM_PROMPT).toContain('提供中文 description');
     expect(PRODUCER_SYSTEM_PROMPT).toContain('params.title、params.description');
     expect(PRODUCER_SYSTEM_PROMPT).toContain('reasoning.sources 非空');
-    // P1.4b：必填字段清单改由 Core spec 的 describeSubmitToolFields 渲染（spec-sourced），仍逐项surface
-    // 必填字段；门禁规则文本由 renderGuidance('in-process') 提供（producer-prompt-first 详见专门套件）。
+    // P1.4b：字段清单改由 Core spec 的 describeSubmitToolFields 渲染（spec-sourced），并明确
+    // 区分必填与可选字段；门禁规则文本由 renderGuidance('in-process') 提供。
     expect(prompt).toContain('knowledge.submit 必填字段');
+    expect(prompt).toContain('knowledge.submit 可选字段');
     expect(prompt).toContain('- title:');
     expect(prompt).toContain('description 中文简述');
     expect(prompt).toContain('content.markdown');
     expect(prompt).toContain('reasoning.sources');
+    expect(prompt).toContain('- coreCode:');
+    expect(prompt.indexOf('knowledge.submit 可选字段')).toBeLessThan(prompt.indexOf('- coreCode:'));
+    expect(prompt).not.toContain('coreCode（代码骨架）均为必填');
+    expect(prompt).not.toContain('omit coreCode/profile');
+    expect(prompt).toContain('Documentation may ground retrieval-profile facts');
+    expect(prompt).toContain('Documentation is never eligible for coreCode');
+    expect(PRODUCER_SYSTEM_PROMPT).not.toContain('绝不可作为候选证据来源');
   });
 
   it('surfaces action-specific knowledge.submit required params in lightweight schemas', () => {

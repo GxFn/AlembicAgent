@@ -539,7 +539,7 @@ async function handleSubmit(
     if (!preparedProduction.codeEvidence.accepted) {
       bumpSubmitRepairStat(ctx.runtime, 'unsafe_core_code_removed');
       Logger.getInstance().warn(
-        `[knowledge.submit] unsafe coreCode removed; candidate will remain readiness-blocked until repaired for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
+        `[knowledge.submit] unsafe coreCode removed with diagnostic=${preparedProduction.codeEvidence.reason}; retrieval profile remains independently evaluated for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
       );
     }
     let gateViolations = runInProcessRecipeAuthoringGate(effectiveItem, {
@@ -797,6 +797,7 @@ async function handleSubmit(
             kind: item.kind,
             lifecycle: created.lifecycle,
             production: result.production,
+            codeEvidence: preparedProduction.codeEvidence,
             readiness,
           }),
           { tags: ['submission'] }
@@ -808,6 +809,7 @@ async function handleSubmit(
         title: created.title,
         lifecycle: created.lifecycle,
         production: result.production,
+        codeEvidence: preparedProduction.codeEvidence,
         readiness,
       });
     }
@@ -823,6 +825,7 @@ async function handleSubmit(
       );
       return ok({
         status: 'duplicate_blocked',
+        codeEvidence: preparedProduction.codeEvidence,
         similar: result.duplicates.map((d) => ({
           title: d.title,
           similarity: d.similarTo?.[0]?.similarity ?? 0,
@@ -844,19 +847,40 @@ async function handleSubmit(
           ? rejected.warnings.map((warning) => `warning: ${warning}`)
           : []),
       ].join('\n');
-      return fail(details);
+      return preparedProduction.codeEvidence.accepted
+        ? fail(details)
+        : {
+            ok: false,
+            data: {
+              status: 'rejected',
+              reason: 'unsafe-core-code-removed',
+              message: details,
+              codeEvidence: preparedProduction.codeEvidence,
+            },
+            error: details,
+          };
     }
 
     if (result.blocked.length > 0) {
       Logger.getInstance().warn(
         `[knowledge.submit] gateway blocked by consolidation "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
       );
-      return fail(
-        `Blocked by consolidation: ${(result.blocked[0] as { title?: string }).title ?? 'unknown'}`
-      );
+      const message = `Blocked by consolidation: ${(result.blocked[0] as { title?: string }).title ?? 'unknown'}`;
+      return preparedProduction.codeEvidence.accepted
+        ? fail(message)
+        : {
+            ok: false,
+            data: {
+              status: 'consolidation-blocked',
+              reason: 'unsafe-core-code-removed',
+              message,
+              codeEvidence: preparedProduction.codeEvidence,
+            },
+            error: message,
+          };
     }
 
-    return ok({ status: 'processed', result });
+    return ok({ status: 'processed', result, codeEvidence: preparedProduction.codeEvidence });
   } catch (err: unknown) {
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String(params.title ?? '')}" (exception): ${err instanceof Error ? err.message : String(err)}`
@@ -1131,6 +1155,71 @@ const EVOLUTION_SOURCES = new Set<EvolutionProposalSource>([
   'rescan-evolution',
 ]);
 
+async function handleActiveTransition(
+  operation: 'approve' | 'publish',
+  id: string,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  const gateway = ctx.recipeGateway as RecipeGatewayLike | undefined;
+  if (!gateway) {
+    return fail('Recipe production port not available for active transition');
+  }
+
+  try {
+    // Core readiness is both exposed as structured tool evidence here and rechecked by
+    // RecipeProductionPort.publish at the authoritative mutation boundary.
+    const readiness = await gateway.evaluateReadiness(id);
+    if (!readiness.ready) {
+      const message = `Core readiness blocked knowledge.manage(${operation})`;
+      return {
+        ok: false,
+        data: {
+          operation,
+          id,
+          status: 'readiness-blocked',
+          lifecycle: 'unchanged',
+          reason: 'core-readiness-blocked',
+          message,
+          readiness,
+        },
+        error: message,
+      };
+    }
+
+    const published = await gateway.publish(id, {
+      userId: pickString(ctx.runtime?.agentId) ?? AGENT_RUNTIME_SOURCE,
+    });
+    return ok({
+      operation,
+      id,
+      status: operation === 'approve' ? 'approved' : 'published',
+      lifecycle: published.lifecycle,
+      record: published,
+      readiness,
+    });
+  } catch (err: unknown) {
+    const errorRecord = recordValue(err);
+    const details = recordValue(errorRecord?.details);
+    const readiness = recordValue(details?.readiness);
+    const readinessBlocked = readiness?.ready === false;
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      data: {
+        operation,
+        id,
+        status: readinessBlocked ? 'readiness-blocked' : 'publish-failed',
+        lifecycle: 'unchanged',
+        reason: readinessBlocked ? 'core-readiness-blocked' : 'core-publish-failed',
+        message,
+        ...(typeof errorRecord?.code === 'string' ? { code: errorRecord.code } : {}),
+        ...(readiness ? { readiness } : {}),
+      },
+      error: `Manage(${operation}) failed through Core production port: ${message}`,
+    };
+  }
+}
+
 async function handleManage(
   params: Record<string, unknown>,
   ctx: ToolContext
@@ -1210,6 +1299,10 @@ async function handleManage(
     return ok({ id, outcome, recorded: true });
   }
 
+  if (operation === 'approve' || operation === 'publish') {
+    return handleActiveTransition(operation, id, ctx);
+  }
+
   const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;
   if (!repo) {
     return fail('Knowledge repository not available');
@@ -1217,17 +1310,9 @@ async function handleManage(
 
   try {
     switch (operation) {
-      case 'approve':
-        await repo.approve(id, reason);
-        return ok({ operation, id, status: 'approved' });
-
       case 'reject':
         await repo.reject(id, reason ?? 'Rejected by agent');
         return ok({ operation, id, status: 'rejected' });
-
-      case 'publish':
-        await repo.publish(id);
-        return ok({ operation, id, status: 'published' });
 
       case 'update':
         if (!data) {
@@ -1431,9 +1516,7 @@ type RecipeGatewayLike = RecipeProductionPort;
 
 interface KnowledgeRepoLike {
   getById(id: string): Promise<Record<string, unknown> | null>;
-  approve(id: string, reason?: string): Promise<void>;
   reject(id: string, reason: string): Promise<void>;
-  publish(id: string): Promise<void>;
   update(id: string, data: Record<string, unknown>): Promise<void>;
   score(id: string, score: number): Promise<void>;
   validate(id: string): Promise<unknown>;

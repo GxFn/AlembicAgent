@@ -17,8 +17,9 @@ import {
   parseKnowledgeMarkdown,
   RecipeProductionGateway,
 } from '@alembic/core/knowledge';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
+import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 
 function makeProject() {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-recipe-profile-'));
@@ -79,6 +80,13 @@ function authoredProfile() {
   };
 }
 
+function documentationGroundedProfile() {
+  const profile = authoredProfile();
+  profile.concepts[0].provenanceRefs = ['docs/design.md:1-3'];
+  profile.provenance.sourceFieldRefs = ['field:whenClause', 'field:dontClause'];
+  return profile;
+}
+
 function submitParams(overrides: Record<string, unknown> = {}) {
   return {
     title: 'ImportType keeps type-only dependencies out of runtime output',
@@ -117,6 +125,25 @@ function submitParams(overrides: Record<string, unknown> = {}) {
     },
     retrievalProfile: authoredProfile(),
     ...overrides,
+  };
+}
+
+function directProductionParams(overrides: Record<string, unknown> = {}) {
+  const base = submitParams();
+  const overrideReasoning = (overrides.reasoning ?? {}) as Record<string, unknown>;
+  const { reasoning: _reasoning, ...restOverrides } = overrides;
+  return {
+    ...base,
+    category: 'Utility',
+    headers: [],
+    knowledgeType: 'code-pattern',
+    language: 'typescript',
+    usageGuide: '### Usage\nApply this rule to type-only TypeScript imports.',
+    ...restOverrides,
+    reasoning: {
+      ...(base.reasoning as Record<string, unknown>),
+      ...overrideReasoning,
+    },
   };
 }
 
@@ -170,6 +197,160 @@ const readyReport: RetrievalReadinessReport = {
 };
 
 describe('Agent Recipe production profile adapter', () => {
+  test.each([
+    'approve',
+    'publish',
+  ])('%s active transition uses Core readiness and publish only', async (operation) => {
+    const projectRoot = makeProject();
+    const repository = {
+      approve: vi.fn(async () => {}),
+      publish: vi.fn(async () => {}),
+    };
+    const port = {
+      evaluateReadiness: vi.fn(async () => readyReport),
+      publish: vi.fn(async () => ({
+        id: 'recipe-active',
+        title: 'Active recipe',
+        lifecycle: 'active',
+      })),
+    };
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation, id: 'recipe-active', reason: 'reviewed' },
+      {
+        projectRoot,
+        knowledgeRepo: repository,
+        recipeGateway: port,
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    expect(port.evaluateReadiness).toHaveBeenCalledWith('recipe-active');
+    expect(port.publish).toHaveBeenCalledWith('recipe-active', { userId: 'alembic-agent' });
+    expect(repository.approve).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+    expect(result.data).toMatchObject({
+      operation,
+      id: 'recipe-active',
+      lifecycle: 'active',
+      readiness: { ready: true },
+    });
+  });
+
+  test('invalid Core readiness blocks publish with structured evidence and no lifecycle mutation', async () => {
+    const projectRoot = makeProject();
+    const blockedReadiness: RetrievalReadinessReport = {
+      ...readyReport,
+      ready: false,
+      profileHash: null,
+      documentSetHash: null,
+      violations: [
+        {
+          code: 'retrieval.profile.fact-ungrounded',
+          field: 'retrievalProfile.concepts.0',
+          message: 'The fact is not grounded.',
+        },
+      ],
+    };
+    const repository = {
+      approve: vi.fn(async () => {}),
+      publish: vi.fn(async () => {}),
+    };
+    const port = {
+      evaluateReadiness: vi.fn(async () => blockedReadiness),
+      publish: vi.fn(async () => ({
+        id: 'recipe-pending',
+        title: 'Pending recipe',
+        lifecycle: 'active',
+      })),
+    };
+
+    const result = await handleKnowledge('manage', { operation: 'publish', id: 'recipe-pending' }, {
+      projectRoot,
+      knowledgeRepo: repository,
+      recipeGateway: port,
+    } as never);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Core readiness');
+    expect(result.data).toMatchObject({
+      operation: 'publish',
+      id: 'recipe-pending',
+      status: 'readiness-blocked',
+      lifecycle: 'unchanged',
+      readiness: {
+        ready: false,
+        violations: [{ code: 'retrieval.profile.fact-ungrounded' }],
+      },
+    });
+    expect(port.publish).not.toHaveBeenCalled();
+    expect(repository.approve).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
+  test('active transition fails closed when the Core production port is unavailable', async () => {
+    const projectRoot = makeProject();
+    const repository = {
+      approve: vi.fn(async () => {}),
+      publish: vi.fn(async () => {}),
+    };
+
+    const result = await handleKnowledge('manage', { operation: 'publish', id: 'recipe-pending' }, {
+      projectRoot,
+      knowledgeRepo: repository,
+    } as never);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Recipe production port not available');
+    expect(repository.approve).not.toHaveBeenCalled();
+    expect(repository.publish).not.toHaveBeenCalled();
+  });
+
+  test('Core publish exceptions retain structured readiness evidence', async () => {
+    const projectRoot = makeProject();
+    const changedReadiness = {
+      ...readyReport,
+      ready: false,
+      profileHash: null,
+      documentSetHash: null,
+      violations: [
+        {
+          code: 'retrieval.profile.changed',
+          field: 'retrievalProfile',
+          message: 'Profile changed after the preflight check.',
+        },
+      ],
+    } satisfies RetrievalReadinessReport;
+    const publishError = Object.assign(new Error('readiness changed before publish'), {
+      code: 'VALIDATION_ERROR',
+      details: { readiness: changedReadiness },
+    });
+    const port = {
+      evaluateReadiness: vi.fn(async () => readyReport),
+      publish: vi.fn(async () => {
+        throw publishError;
+      }),
+    };
+
+    const result = await handleKnowledge('manage', { operation: 'publish', id: 'recipe-staging' }, {
+      projectRoot,
+      recipeGateway: port,
+    } as never);
+
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      status: 'readiness-blocked',
+      lifecycle: 'unchanged',
+      reason: 'core-readiness-blocked',
+      code: 'VALIDATION_ERROR',
+      readiness: {
+        ready: false,
+        violations: [{ code: 'retrieval.profile.changed' }],
+      },
+    });
+  });
+
   test.each([
     ['opportunistic', {}],
     ['session-bound', { runtime: { dimensionScopeId: 'session-scope' } }],
@@ -286,6 +467,167 @@ describe('Agent Recipe production profile adapter', () => {
     }
   });
 
+  test.each([
+    {
+      name: 'field-only grounding',
+      overrides: {
+        coreCode: '',
+        reasoning: { sources: ['src/a.ts:2-3'] },
+      },
+      expectedEvidenceRefs: ['src/a.ts:2-3'],
+      codeAccepted: true,
+    },
+    {
+      name: 'documentation grounding',
+      overrides: {
+        coreCode: '',
+        reasoning: { sources: ['docs/design.md:1-3'] },
+        retrievalProfile: documentationGroundedProfile(),
+      },
+      expectedEvidenceRefs: ['docs/design.md:1-3'],
+      codeAccepted: true,
+    },
+    {
+      name: 'rejected documentation coreCode',
+      overrides: {
+        coreCode: '# Design\nUse import type for type-only dependencies.',
+        reasoning: { sources: ['docs/design.md:1-3'] },
+        retrievalProfile: documentationGroundedProfile(),
+      },
+      expectedEvidenceRefs: ['docs/design.md:1-3'],
+      codeAccepted: false,
+    },
+  ])('real Core port persists and evaluates $name independently from code admission', async ({
+    overrides,
+    expectedEvidenceRefs,
+    codeAccepted,
+  }) => {
+    const projectRoot = makeProject();
+    const previousQuiet = process.env.ALEMBIC_QUIET;
+    process.env.ALEMBIC_QUIET = '1';
+    pathGuard.configure({ projectRoot, knowledgeBaseDir: 'Alembic' });
+    const connection = new DatabaseConnection({ path: '.asd/alembic.db' });
+    try {
+      await connection.connect();
+      await connection.runMigrations();
+      const repository = new KnowledgeRepositoryImpl(connection);
+      const service = new KnowledgeService(repository, { log: async () => {} }, null, null, {
+        fileWriter: new KnowledgeFileWriter(projectRoot),
+      });
+      const port = new RecipeProductionGateway({ knowledgeService: service, projectRoot });
+      const prepared = prepareRecipeProductionItem(directProductionParams(overrides), projectRoot);
+      const production = await port.createOrStage(
+        {
+          items: [prepared.item],
+          options: { systemInjectedFields: ['coreCode'] },
+        },
+        {
+          source: 'alembic-agent',
+          userId: 'alembic-agent',
+          capability: 'knowledge-submit',
+        }
+      );
+      const created = production.created[0];
+      if (!created) {
+        throw new Error(
+          `Core production port did not persist the prepared Agent candidate: ${JSON.stringify(production)}`
+        );
+      }
+
+      const readiness = await port.evaluateReadiness(created.id);
+      const persisted = await repository.findById(created.id);
+      expect(readiness.ready).toBe(true);
+      expect(prepared.codeEvidence.accepted).toBe(codeAccepted);
+      expect(prepared.item.coreCode).toBe('');
+      expect(persisted?.retrievalProfile?.provenance.evidenceRefs).toEqual(expectedEvidenceRefs);
+      expect(persisted?.retrievalProfile).toEqual(prepared.item.retrievalProfile);
+      expect(readiness.violations.map((violation) => violation.code)).not.toContain(
+        'retrieval.profile.missing'
+      );
+      const candidatePath = path.join(projectRoot, persisted?.sourceFile ?? '');
+      expect(
+        parseKnowledgeMarkdown(fs.readFileSync(candidatePath, 'utf8')).retrievalProfile
+      ).toEqual(persisted?.retrievalProfile);
+    } finally {
+      connection.close();
+      if (previousQuiet === undefined) {
+        delete process.env.ALEMBIC_QUIET;
+      } else {
+        process.env.ALEMBIC_QUIET = previousQuiet;
+      }
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('real Core readiness block leaves persisted lifecycle unchanged through knowledge.manage', async () => {
+    const projectRoot = makeProject();
+    const previousQuiet = process.env.ALEMBIC_QUIET;
+    process.env.ALEMBIC_QUIET = '1';
+    pathGuard.configure({ projectRoot, knowledgeBaseDir: 'Alembic' });
+    const connection = new DatabaseConnection({ path: '.asd/alembic.db' });
+    try {
+      await connection.connect();
+      await connection.runMigrations();
+      const repository = new KnowledgeRepositoryImpl(connection);
+      const service = new KnowledgeService(repository, { log: async () => {} }, null, null, {
+        fileWriter: new KnowledgeFileWriter(projectRoot),
+      });
+      const port = new RecipeProductionGateway({ knowledgeService: service, projectRoot });
+      const prepared = prepareRecipeProductionItem(
+        directProductionParams({ coreCode: '', retrievalProfile: undefined }),
+        projectRoot
+      );
+      const production = await port.createOrStage(
+        {
+          items: [prepared.item],
+          options: { systemInjectedFields: ['coreCode'] },
+        },
+        {
+          source: 'alembic-agent',
+          userId: 'alembic-agent',
+          capability: 'knowledge-submit',
+        }
+      );
+      const created = production.created[0];
+      if (!created) {
+        throw new Error(
+          `Core production port did not persist the invalid candidate: ${JSON.stringify(production)}`
+        );
+      }
+      const before = await repository.findById(created.id);
+      const legacyRepository = {
+        approve: vi.fn(async () => {}),
+        publish: vi.fn(async () => {}),
+      };
+
+      const result = await handleKnowledge('manage', { operation: 'publish', id: created.id }, {
+        projectRoot,
+        recipeGateway: port,
+        knowledgeRepo: legacyRepository,
+      } as never);
+      const after = await repository.findById(created.id);
+
+      expect(result.ok).toBe(false);
+      expect(result.data).toMatchObject({
+        status: 'readiness-blocked',
+        lifecycle: 'unchanged',
+        readiness: { ready: false },
+      });
+      expect(after?.lifecycle).toBe(before?.lifecycle);
+      expect(after?.lifecycle).not.toBe('active');
+      expect(legacyRepository.approve).not.toHaveBeenCalled();
+      expect(legacyRepository.publish).not.toHaveBeenCalled();
+    } finally {
+      connection.close();
+      if (previousQuiet === undefined) {
+        delete process.env.ALEMBIC_QUIET;
+      } else {
+        process.env.ALEMBIC_QUIET = previousQuiet;
+      }
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('surfaces Core readiness violations structurally while the candidate remains pending', async () => {
     const projectRoot = makeProject();
     const readiness: RetrievalReadinessReport = {
@@ -386,21 +728,9 @@ describe('Agent Recipe production profile adapter', () => {
         coreCode: 'export const count = 1;',
       },
     ],
-  ])('%s cannot inject code or retain an activatable profile', async (_name, override) => {
+  ])('%s cannot inject code but preserves an independently grounded profile', async (_name, override) => {
     const projectRoot = makeProject();
-    const fake = fakePort({
-      ...readyReport,
-      ready: false,
-      profileHash: null,
-      documentSetHash: null,
-      violations: [
-        {
-          code: 'retrieval.profile.missing',
-          field: 'retrievalProfile',
-          message: 'A native retrieval profile is required before active publish.',
-        },
-      ],
-    });
+    const fake = fakePort(readyReport);
     const resolvedOverride =
       override.coreCode === '__WHOLE_FILE__'
         ? {
@@ -417,15 +747,45 @@ describe('Agent Recipe production profile adapter', () => {
     expect(result.ok).toBe(true);
     const item = fake.calls[0].input.items[0];
     expect(item.coreCode).toBe('');
-    expect(item.retrievalProfile ?? null).toBeNull();
+    expect(item.retrievalProfile).toBeTruthy();
     expect(result.data).toMatchObject({
-      lifecycle: 'pending',
-      readiness: {
-        ready: false,
-        violations: [{ code: 'retrieval.profile.missing' }],
-      },
+      lifecycle: 'staging',
+      codeEvidence: { accepted: false, reason: 'unbounded-or-unrelated' },
+      readiness: { ready: true },
     });
     expect(fake.publishCalls).toBe(0);
+  });
+
+  test.each([
+    ['field-only profile', { coreCode: '', reasoning: { sources: [] } }, []],
+    [
+      'documentation-grounded profile',
+      { coreCode: '', reasoning: { sources: ['docs/design.md:1-3'] } },
+      ['docs/design.md:1-3'],
+    ],
+    [
+      'profile with rejected document coreCode',
+      {
+        coreCode: '# Design\nUse import type for type-only dependencies.',
+        reasoning: { sources: ['docs/design.md:1-3'] },
+      },
+      ['docs/design.md:1-3'],
+    ],
+  ])('%s survives profile preparation independently from code admission', (_name, override, evidenceRefs) => {
+    const projectRoot = makeProject();
+    const prepared = prepareRecipeProductionItem(submitParams(override), projectRoot);
+
+    expect(prepared.item.retrievalProfile).toBeTruthy();
+    expect(prepared.item.retrievalProfile?.provenance.evidenceRefs).toEqual(evidenceRefs);
+    expect(prepared.item.coreCode).toBe('');
+    if (String(override.coreCode ?? '')) {
+      expect(prepared.codeEvidence).toEqual({
+        accepted: false,
+        reason: 'unbounded-or-unrelated',
+      });
+    } else {
+      expect(prepared.codeEvidence).toEqual({ accepted: true, reason: 'absent' });
+    }
   });
 
   test('root-escape and absolute citations cannot read or inject code', async () => {
@@ -438,9 +798,6 @@ describe('Agent Recipe production profile adapter', () => {
       'utf8'
     );
     fs.symlinkSync(outsidePath, path.join(projectRoot, 'src/outside-link.ts'));
-    const { prepareRecipeProductionItem } = await import(
-      '../src/tools/runtime/handlers/recipeProductionAdapter.js'
-    );
     try {
       for (const source of [
         `../${outsideName}:1-1`,
@@ -456,7 +813,7 @@ describe('Agent Recipe production profile adapter', () => {
           projectRoot
         );
         expect(prepared.item.coreCode).toBe('');
-        expect(prepared.item.retrievalProfile ?? null).toBeNull();
+        expect(prepared.item.retrievalProfile).toBeTruthy();
         expect(prepared.codeEvidence.accepted).toBe(false);
       }
     } finally {

@@ -143,6 +143,11 @@ interface ToolEfficiencySharedState {
 }
 
 interface ProducerSubmitLedgerEntry {
+  codeEvidence?: {
+    accepted: boolean;
+    provenanceRef?: string;
+    reason: string;
+  };
   id?: string;
   lifecycle?: string;
   payloadStored: boolean;
@@ -1051,6 +1056,11 @@ function recordProducerSubmitLedger(
     result.production && typeof result.production === 'object'
       ? (result.production as Record<string, unknown>)
       : null;
+  const codeEvidence =
+    result.codeEvidence && typeof result.codeEvidence === 'object'
+      ? (result.codeEvidence as Record<string, unknown>)
+      : null;
+  const codeEvidenceProvenanceRef = stringValue(codeEvidence?.provenanceRef);
   const title = String(result.title || params.title || params.category || '').trim();
   if (!title) {
     return;
@@ -1059,6 +1069,15 @@ function recordProducerSubmitLedger(
     ...(typeof result.id === 'string' ? { id: result.id } : {}),
     ...(typeof result.lifecycle === 'string' ? { lifecycle: result.lifecycle } : {}),
     payloadStored: true,
+    ...(codeEvidence
+      ? {
+          codeEvidence: {
+            accepted: codeEvidence.accepted === true,
+            reason: stringValue(codeEvidence.reason) || 'unknown',
+            ...(codeEvidenceProvenanceRef ? { provenanceRef: codeEvidenceProvenanceRef } : {}),
+          },
+        }
+      : {}),
     ...(production
       ? {
           production: {
