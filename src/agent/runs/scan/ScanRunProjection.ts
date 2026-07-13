@@ -28,12 +28,6 @@ export interface ScanKnowledgeProjection extends Record<string, unknown> {
   error?: string;
 }
 
-interface ParseJsonWithDiagnosticsResult {
-  value: Record<string, unknown>;
-  usedFallback: boolean;
-  error?: string;
-}
-
 interface PhaseSummary {
   reply?: string;
   toolCalls?: ToolCallEntry[];
@@ -44,7 +38,6 @@ export function projectScanRunResult({
   task,
   result,
   fallback,
-  onParseError,
 }: ScanProjectionOptions): ScanKnowledgeProjection {
   const toolCalls = result.toolCalls || [];
   const recipes = extractCreatedRecipes(toolCalls);
@@ -72,21 +65,18 @@ export function projectScanRunResult({
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
   const produceReply = phases?.produce?.reply || result.reply;
   const fallbackValue = fallback(label || '');
-  const parsed = parseJsonResponseWithDiagnostics(produceReply, fallbackValue, onParseError);
-  const hadSubmitAttempt = toolCalls.some(isKnowledgeSubmitCall);
-  // 一旦本轮尝试过持久化，provider 文本就不再具有 Recipe 身份权威；无 submit 的显式
-  // preview 调用仍保留旧 JSON 投影，并通过 diagnostics 区分两条路径。
-  const ignoreUnpersistedOutput = hadSubmitAttempt && !parsed.usedFallback;
+  // 生产扫描的 Recipe 身份只能来自 knowledge.submit 的 persisted created envelope。
+  // provider 回复仅保留为 runtime 诊断来源，零 submit 与失败 submit 都不能把它投影为 Recipe。
+  const ignoredUnpersistedOutput = Boolean(produceReply?.trim());
   return {
-    ...(hadSubmitAttempt ? fallbackValue : parsed.value),
+    ...fallbackValue,
     diagnostics: buildScanDiagnostics({
       label,
       task,
       result,
       recipesFound: 0,
-      usedFallback: hadSubmitAttempt || parsed.usedFallback,
-      parseError: parsed.error || null,
-      ignoredUnpersistedOutput: ignoreUnpersistedOutput,
+      usedFallback: true,
+      ignoredUnpersistedOutput,
     }),
   };
 }
@@ -122,34 +112,6 @@ function isKnowledgeSubmitCall(toolCall: ToolCallEntry): boolean {
   );
 }
 
-function parseJsonResponseWithDiagnostics(
-  text: string | null | undefined,
-  fallback: Record<string, unknown>,
-  onParseError?: (err: unknown) => void
-): ParseJsonWithDiagnosticsResult {
-  if (!text) {
-    return { value: fallback, usedFallback: true, error: 'empty_response' };
-  }
-  try {
-    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlockMatch) {
-      return { value: JSON.parse(codeBlockMatch[1].trim()), usedFallback: false };
-    }
-    const objMatch = text.match(/(\{[\s\S]*\})/);
-    if (objMatch) {
-      return { value: JSON.parse(objMatch[1].trim()), usedFallback: false };
-    }
-    return { value: JSON.parse(text.trim()), usedFallback: false };
-  } catch (err: unknown) {
-    onParseError?.(err);
-    return {
-      value: fallback,
-      usedFallback: true,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
 function buildScanDiagnostics({
   label,
   task,
@@ -170,15 +132,25 @@ function buildScanDiagnostics({
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
   const toolCalls = result.toolCalls || [];
   const collectCalls = toolCalls.filter((tc) => (tc.tool || tc.name) === 'knowledge');
+  const submitCalls = toolCalls.filter(isKnowledgeSubmitCall);
+  const persistenceOutcome =
+    recipesFound > 0
+      ? 'created'
+      : submitCalls.length > 0
+        ? 'submit-without-created-recipe'
+        : 'no-submit-attempt';
   return {
     label: label || '',
     task,
     recipesFound,
+    persistenceOutcome,
+    projectionAuthority: 'persisted-knowledge-submit-results-only',
     usedFallback,
     ignoredUnpersistedOutput,
     parseError,
     toolCallCount: toolCalls.length,
     collectScanRecipeCallCount: collectCalls.length,
+    knowledgeSubmitCallCount: submitCalls.length,
     iterations: result.usage.iterations || 0,
     durationMs: result.usage.durationMs || 0,
     runtimeDiagnostics: (result.diagnostics as AgentDiagnostics | null) || null,

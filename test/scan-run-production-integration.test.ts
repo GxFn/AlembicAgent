@@ -103,6 +103,51 @@ function submitParams() {
 }
 
 describe('scan run production projection', () => {
+  test('rejects provider-only Recipes when the production runner makes no submit call', async () => {
+    const agentService = new AgentService({
+      runtimeBuilder: {
+        build(): AgentRuntimeLike {
+          return {
+            id: 'scan-no-submit-runtime',
+            async execute() {
+              return {
+                reply: JSON.stringify({
+                  targetName: 'NoSubmitModule',
+                  extracted: 1,
+                  recipes: [{ title: 'Provider-only Recipe' }],
+                }),
+                toolCalls: [],
+                tokenUsage: { input: 1, output: 1 },
+                iterations: 1,
+                durationMs: 1,
+              };
+            },
+          };
+        },
+      },
+    });
+
+    const projection = await runScanAgentTask({
+      agentService,
+      systemRunContextFactory: new SystemRunContextFactory(),
+      label: 'NoSubmitModule',
+      files: [{ relativePath: 'src/a.ts', content: 'export const count = 1;' }],
+      task: 'extract',
+    });
+
+    expect(projection).toMatchObject({
+      targetName: 'NoSubmitModule',
+      extracted: 0,
+      recipes: [],
+      diagnostics: {
+        persistenceOutcome: 'no-submit-attempt',
+        projectionAuthority: 'persisted-knowledge-submit-results-only',
+        knowledgeSubmitCallCount: 0,
+        ignoredUnpersistedOutput: true,
+      },
+    });
+  });
+
   test('projects the persisted pending Recipe through the real handler and Core gateway seam', async () => {
     const projectRoot = makeProject();
     const previousQuiet = process.env.ALEMBIC_QUIET;

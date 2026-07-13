@@ -106,26 +106,32 @@ describe('ScanRunProjection persisted Recipe identity', () => {
     });
   });
 
-  test('preserves the explicit no-submit preview mode for scan callers that do not persist', () => {
+  test('returns no Recipes when the production scan never submits provider output', () => {
     const result = runResult([]);
     result.reply = JSON.stringify({
-      targetName: 'PreviewModule',
+      targetName: 'UnpersistedModule',
       extracted: 1,
-      recipes: [{ title: 'Preview-only candidate' }],
+      recipes: [{ title: 'Provider-only candidate without a persisted ID' }],
     });
 
     const projection = projectScanRunResult({
-      label: 'PreviewModule',
+      label: 'UnpersistedModule',
       task: 'extract',
       result,
       fallback: (label) => ({ targetName: label, extracted: 0, recipes: [] }),
     });
 
     expect(projection).toMatchObject({
-      targetName: 'PreviewModule',
-      extracted: 1,
-      recipes: [{ title: 'Preview-only candidate' }],
-      diagnostics: { ignoredUnpersistedOutput: false, usedFallback: false },
+      targetName: 'UnpersistedModule',
+      extracted: 0,
+      recipes: [],
+      diagnostics: {
+        persistenceOutcome: 'no-submit-attempt',
+        projectionAuthority: 'persisted-knowledge-submit-results-only',
+        knowledgeSubmitCallCount: 0,
+        ignoredUnpersistedOutput: true,
+        usedFallback: true,
+      },
     });
   });
 
@@ -151,6 +157,13 @@ describe('ScanRunProjection persisted Recipe identity', () => {
       targetName: 'RejectedModule',
       extracted: 0,
       recipes: [],
+      diagnostics: {
+        persistenceOutcome: 'submit-without-created-recipe',
+        projectionAuthority: 'persisted-knowledge-submit-results-only',
+        knowledgeSubmitCallCount: 2,
+        ignoredUnpersistedOutput: true,
+        usedFallback: true,
+      },
     });
   });
 
