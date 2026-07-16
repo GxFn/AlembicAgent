@@ -22,6 +22,10 @@
 
 import Logger from '@alembic/core/logging';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
+import {
+  createStrictAnalysisContextProjectionV1,
+  type StrictAnalysisContextProjectionV1,
+} from '../production/StrictProductionPipeline.js';
 import type { DistilledContext } from './MemoryFlushContract.js';
 
 // ═══════════════════════════════════════════════════════════
@@ -229,6 +233,7 @@ interface ActiveContextJSON {
   scratchpad?: ScratchpadEntry[];
   totalObservations?: number;
   plan?: Plan;
+  strictAnalysisContext?: StrictAnalysisContextProjectionV1;
 }
 
 const OBSERVATION_LEDGER_CATEGORIES: ObservationLedgerCategory[] = [
@@ -275,6 +280,9 @@ export class ActiveContext {
   #planHistory: Plan[] = [];
   /** 是否期待下一次响应包含计划 (由 ExplorationTracker 设置) */
   #expectingPlan = false;
+
+  // ── 严格生产链：只保存 Core 证据台账/PC-F 收据的不可变语义投影 ──
+  #strictAnalysisContext: StrictAnalysisContextProjectionV1 | null = null;
 
   // ── 配置 ──
   /** 保留最近 N 轮原始观察 */
@@ -622,7 +630,23 @@ export class ActiveContext {
       plan: this.getPlan(),
       totalObservations: this.#totalObservations,
       compressedCount: this.#compressedObservations.length,
+      ...(this.#strictAnalysisContext
+        ? { strictAnalysisContext: this.#strictAnalysisContext }
+        : {}),
     };
+  }
+
+  /** 绑定并重新校验严格上下文，防止序列化恢复时注入未哈希字段。 */
+  bindStrictAnalysisContext(context: StrictAnalysisContextProjectionV1): void {
+    const { schemaVersion, contextHash, ...input } = context;
+    if (schemaVersion !== 1) {
+      throw new Error('STRICT_CONTEXT_SCHEMA_UNSUPPORTED');
+    }
+    const normalized = createStrictAnalysisContextProjectionV1(input);
+    if (normalized.contextHash !== contextHash) {
+      throw new Error('STRICT_CONTEXT_HASH_MISMATCH');
+    }
+    this.#strictAnalysisContext = normalized;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -721,6 +745,9 @@ export class ActiveContext {
       scratchpad: this.#scratchpad.map((f) => ({ ...f })),
       compressedObservations: this.#compressedObservations.length,
       totalObservations: this.#totalObservations,
+      ...(this.#strictAnalysisContext
+        ? { strictAnalysisContext: this.#strictAnalysisContext }
+        : {}),
       ...(this.#plan
         ? {
             plan: {
@@ -758,6 +785,9 @@ export class ActiveContext {
         lastUpdatedAtIteration: json.plan.lastUpdatedAtIteration,
       };
     }
+    if (json.strictAnalysisContext) {
+      ctx.bindStrictAnalysisContext(json.strictAnalysisContext);
+    }
     return ctx;
   }
 
@@ -771,6 +801,7 @@ export class ActiveContext {
     this.#plan = null;
     this.#planHistory.length = 0;
     this.#totalObservations = 0;
+    this.#strictAnalysisContext = null;
   }
 
   // ═══════════════════════════════════════════════════════

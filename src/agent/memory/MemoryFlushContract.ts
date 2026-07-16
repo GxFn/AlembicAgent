@@ -5,6 +5,7 @@
  * 确保 distill() 的结果在 ActiveContext.clear() 之前完整提取。
  */
 
+import type { StrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
 import type { Finding } from './SessionStore.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -37,6 +38,8 @@ export interface DistilledContext {
   } | null;
   totalObservations: number;
   compressedCount: number;
+  /** 严格冷启动只投影 Core 不可变收据/ID；不是可变证据副本。 */
+  strictAnalysisContext?: StrictAnalysisContextProjectionV1;
 }
 
 // ──────────────────────────────────────────────────────────────────

@@ -7,5 +7,7 @@
  */
 export * from './analysisArtifact.js';
 export * from './gateEvaluators.js';
+export * from './IndependentValueReviewer.js';
+export * from './InvestigatedEmptyReviewer.js';
 export * from './qualityGates.js';
 export * from './stageBuilders.js';

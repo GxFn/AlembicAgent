@@ -8,6 +8,7 @@ import {
   buildRelationsPipelineStages,
   buildScanPipelineStages,
 } from '../evaluation/stageBuilders.js';
+import { buildStrictProductionPipelineStagesV1 } from '../production/StrictProductionStages.js';
 import { PRESETS } from '../profiles/presets/index.js';
 import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
 
@@ -68,6 +69,16 @@ export class AgentStageFactoryRegistry {
 
     this.register('relationsPipeline', () => buildRelationsPipelineStages());
     this.register('generateDimensionPipeline', ({ params, context }) => {
+      const strategyContext = context?.strategyContext as Record<string, unknown> | undefined;
+      const strictProduction = strategyContext?.strictProduction;
+      if (
+        strictProduction &&
+        typeof strictProduction === 'object' &&
+        !Array.isArray(strictProduction) &&
+        (strictProduction as Record<string, unknown>).enabled === true
+      ) {
+        return buildStrictProductionPipelineStagesV1() as Record<string, unknown>[];
+      }
       const presetStages = PRESETS.insight.strategy.stages;
       const evolutionPresetStages = PRESETS.evolution.strategy.stages;
       const needsCandidates = params.needsCandidates !== false;
@@ -78,8 +89,10 @@ export class AgentStageFactoryRegistry {
       const memoryCoordinator = context?.memoryCoordinator as
         | { allocateBudget?: (role: string) => void }
         | undefined;
-      const rescanContext = (context?.strategyContext as Record<string, unknown> | undefined)
-        ?.rescanContext as { gap?: number; createBudget?: number } | null | undefined;
+      const rescanContext = strategyContext?.rescanContext as
+        | { gap?: number; createBudget?: number }
+        | null
+        | undefined;
       const rescanGap =
         typeof rescanContext?.gap === 'number' && Number.isFinite(rescanContext.gap)
           ? Math.max(0, Math.floor(rescanContext.gap))

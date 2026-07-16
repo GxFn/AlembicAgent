@@ -24,6 +24,7 @@ import {
   type SnippetRangeReader,
   type ToolCall,
 } from '../evidence/EvidenceCollector.js';
+import type { StrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
 import { buildQualityScores, type NormalizedFinding } from './qualityGates.js';
 
 // AD4: lazy logger accessor — the Core logger singleton materializes on first
@@ -53,6 +54,7 @@ export interface ActiveContextLike {
   distill(): {
     keyFindings: RawFinding[];
     toolCallSummary: unknown[];
+    strictAnalysisContext?: StrictAnalysisContextProjectionV1;
   };
 }
 
@@ -371,11 +373,16 @@ export function buildAnalysisArtifact(
   dimensionId: string,
   projectGraph: ProjectGraphLike | null = null,
   activeContext: ActiveContextLike | null = null,
-  opts: { projectRoot?: string } = {}
+  opts: { projectRoot?: string; strictColdStart?: boolean } = {}
 ) {
-  const toolCalls = analystResult.toolCalls || [];
+  // 严格路径的语义只来自 Core 投影；legacy reply/tool trace 不得变成第二证据面。
+  const toolCalls = opts.strictColdStart ? [] : analystResult.toolCalls || [];
 
-  const baseReport = buildAnalysisReport(analystResult, dimensionId, projectGraph);
+  const baseReport = buildAnalysisReport(
+    opts.strictColdStart ? { ...analystResult, reply: '', toolCalls: [] } : analystResult,
+    dimensionId,
+    projectGraph
+  );
 
   const collector = new EvidenceCollector();
   for (let i = 0; i < toolCalls.length; i++) {
@@ -383,21 +390,27 @@ export function buildAnalysisArtifact(
   }
 
   const distilled = activeContext?.distill() || { keyFindings: [], toolCallSummary: [] };
-  const memoryFindingCount = distilled.keyFindings.length;
+  const strictAnalysisContext = distilled.strictAnalysisContext;
+  if (opts.strictColdStart && !strictAnalysisContext) {
+    throw new Error('STRICT_ANALYSIS_CONTEXT_REQUIRED');
+  }
+  const memoryFindingCount = opts.strictColdStart ? 0 : distilled.keyFindings.length;
   let derivedFindingCount = 0;
-  let findings = distilled.keyFindings.map((f: RawFinding) => ({
-    finding: f.finding,
-    evidence:
-      typeof f.evidence === 'string'
-        ? f.evidence
-        : Array.isArray(f.evidence)
-          ? f.evidence.join(', ')
-          : f.evidence
-            ? String(f.evidence)
-            : '',
-    importance: f.importance,
-  }));
-  if (findings.length === 0) {
+  let findings = opts.strictColdStart
+    ? []
+    : distilled.keyFindings.map((f: RawFinding) => ({
+        finding: f.finding,
+        evidence:
+          typeof f.evidence === 'string'
+            ? f.evidence
+            : Array.isArray(f.evidence)
+              ? f.evidence.join(', ')
+              : f.evidence
+                ? String(f.evidence)
+                : '',
+        importance: f.importance,
+      }));
+  if (!opts.strictColdStart && findings.length === 0) {
     // 降级路径基于 referencedFiles 派生（evidenceMap keys 在此场景与其同源，见下方 allFiles 合并）。
     findings = deriveFindingsFromAnalysisText(baseReport.analysisText, [
       ...new Set(baseReport.referencedFiles),
@@ -407,10 +420,12 @@ export function buildAnalysisArtifact(
 
   // R1 锚点驱动证据补齐：findings 引用的 path:line 锚点若不在已采片段覆盖内（典型：全文读
   // 只留头 30 行窗口，锚点在窗口外），从磁盘补读精确片段——每条发现都有可照抄的逐字证据。
-  if (opts.projectRoot) {
+  let postHocLiveReadCount = 0;
+  if (!opts.strictColdStart && opts.projectRoot) {
     const beforeSnippets = countSnippets(collector);
     collector.groundFindingRefs(findings, createFsSnippetRangeReader(opts.projectRoot));
     const afterSnippets = countSnippets(collector);
+    postHocLiveReadCount = Math.max(0, afterSnippets - beforeSnippets);
     const anchoredFindings = findings.filter(
       (f) => typeof f.evidence === 'string' && /\.[A-Za-z]\w*:\d+/.test(f.evidence)
     ).length;
@@ -459,7 +474,10 @@ export function buildAnalysisArtifact(
       artifactVersion: 2,
       memoryFindingCount,
       derivedFindingCount,
+      postHocLiveReadCount,
     },
+
+    ...(strictAnalysisContext ? { strictAnalysisContext } : {}),
 
     // v1 backward compat
     searchQueries: baseReport.searchQueries,

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "coreCommit": "6b6341f05332a1d15f79c19a0251d41b962b71d1",
+    "coreTree": "84c094ee01052c91df5c9e94a50862dc61652f15",
+    "pcfBaselineReceiptHash": "ee67374be793953728d391eee3dc7710380ccb40708ece8a02c9636525959af6"
+  },
+  "cases": [
+    {
+      "id": "alembic-workspace-normal",
+      "project": "AlembicWorkspace",
+      "sourceRevisionVectorHash": "golden-alembic-source-vector-v1",
+      "scopeCount": 25,
+      "expectedProposalCardinality": 1,
+      "expectedReviewVerdict": "pass"
+    },
+    {
+      "id": "bilidili-investigated-empty",
+      "project": "BiliDili",
+      "sourceRevisionVectorHash": "golden-bilidili-source-vector-v1",
+      "scopeCount": 9,
+      "expectedProposalCardinality": 0,
+      "expectedReviewVerdict": "pass"
+    }
+  ]
+}

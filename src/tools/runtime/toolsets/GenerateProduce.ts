@@ -6,6 +6,13 @@ import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../recipeProductionContract.js
 import { RuntimeCapability } from './RuntimeCapability.js';
 
 export class GenerateProduce extends RuntimeCapability {
+  readonly #strictColdStart: boolean;
+
+  constructor(options: { readonly strictColdStart?: boolean } = {}) {
+    super();
+    this.#strictColdStart = options.strictColdStart === true;
+  }
+
   get name() {
     return 'knowledge_production';
   }
@@ -13,7 +20,10 @@ export class GenerateProduce extends RuntimeCapability {
     return 'Knowledge production: submit and validate candidates';
   }
 
-  get allowedTools() {
+  get allowedTools(): Record<string, string[]> {
+    if (this.#strictColdStart) {
+      return {};
+    }
     return {
       knowledge: ['submit'],
       memory: ['recall'],
@@ -24,6 +34,11 @@ export class GenerateProduce extends RuntimeCapability {
   }
 
   get promptFragment() {
+    if (this.#strictColdStart) {
+      return `## Strict knowledge proposal authoring
+Author typed 0/1/N proposal expressions from survived or narrowed hypotheses only.
+You have no tools and no persistence, admission, query, or review authority. Return proposals to the independent reviewer.`;
+    }
     return `## 知识生产能力
 你是知识管理专家，把 Analyst 已确认的发现转化为**有证据、有价值、有深度**的知识候选。
 

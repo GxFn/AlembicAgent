@@ -21,6 +21,11 @@ import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
+import {
+  createStrictTypedGateReturnV1,
+  type StrictAnalysisContextProjectionV1,
+  validateStrictStageToolCallsV1,
+} from '../production/StrictProductionPipeline.js';
 import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
@@ -63,7 +68,9 @@ interface GateConfig {
     source: unknown,
     phaseResults: Record<string, unknown>,
     strategyContext: Record<string, unknown>
-  ) => { action?: string; pass?: boolean; reason?: string; artifact?: unknown };
+  ) =>
+    | { action?: string; pass?: boolean; reason?: string; artifact?: unknown }
+    | Promise<{ action?: string; pass?: boolean; reason?: string; artifact?: unknown }>;
   maxRetries?: number;
   maxRecordRepairRetries?: number;
   recordRepairMinFindings?: number;
@@ -79,6 +86,16 @@ interface GateConfig {
   minFileRefs?: number;
   minToolCalls?: number;
   custom?: (source: Record<string, unknown>) => { pass: boolean; reason?: string };
+  /** 严格链非通过时的 Core typed return 所需 owner/resume 边界。 */
+  strictGate?: {
+    gate: 'G1' | 'ADMISSION' | 'G2' | 'G3' | 'G4' | 'DURABLE' | 'PUBLIC';
+    reasonCode: string;
+    owner: string;
+    resumePoint: string;
+    permittedMutation: string;
+    semanticRepairDepth?: number;
+    passReasonCode?: string;
+  };
   [key: string]: unknown;
 }
 
@@ -138,6 +155,8 @@ interface PipelineContext {
    * 而 degraded 布尔保持原语义不动(不触发 skipOnDegrade 等既有分支)。
    */
   retryExhausted: boolean;
+  /** 严格链失败不是可降级成功，也不沿用 legacy abandoned 语义。 */
+  strictFailed: boolean;
 }
 
 interface GateEvalResult {
@@ -158,9 +177,13 @@ function producerStructuredFindingTarget(artifact: unknown): number {
 function withProducerCoverageBudget(
   stage: PipelineStage,
   budget: StageBudget | undefined,
-  gateArtifact: unknown
+  gateArtifact: unknown,
+  strictProduction: boolean
 ): StageBudget | undefined {
   if (stage.name !== 'produce' && stage.name !== 'producer') {
+    return budget;
+  }
+  if (strictProduction) {
     return budget;
   }
   const targetSubmits = producerStructuredFindingTarget(gateArtifact);
@@ -292,6 +315,7 @@ export class PipelineStrategy extends Strategy {
       lastExecutedStageName: null,
       abandonInfo: null,
       retryExhausted: false,
+      strictFailed: false,
     };
 
     // 会话计数盒预建：必须在任何阶段对 sharedState 做浅拷贝之前把嵌套盒挂上——
@@ -355,8 +379,9 @@ export class PipelineStrategy extends Strategy {
     const recipeReadiness = readRecipeReadinessReports(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
     const abandoned = ctx.degraded || ctx.retryExhausted;
+    const outcome = ctx.strictFailed ? 'failed' : abandoned ? 'abandoned' : 'completed';
     ctx.phaseResults._pipelineOutcome = {
-      outcome: abandoned ? 'abandoned' : 'completed',
+      outcome,
       ...(abandoned && ctx.abandonInfo ? ctx.abandonInfo : {}),
       ...(submitRepairs ? { submitRepairs } : {}),
       ...(recipeReadiness ? { recipeReadiness } : {}),
@@ -369,7 +394,7 @@ export class PipelineStrategy extends Strategy {
       iterations: ctx.totalIterations,
       phases: ctx.phaseResults,
       degraded: ctx.degraded,
-      outcome: abandoned ? 'abandoned' : 'completed',
+      outcome,
       diagnostics: ctx.diagnostics.toJSON(),
     };
   }
@@ -396,12 +421,40 @@ export class PipelineStrategy extends Strategy {
       return 'continue';
     }
     const gate = stage.gate;
-    let gateResult = this.#evaluateGateResult(stage, ctx, bus);
+    let gateResult = await this.#evaluateGateResult(stage, ctx, bus);
     this.#storeGateResult(stage, gateResult, ctx, bus);
 
     // 三态处理
     if (gateResult.action === 'pass') {
+      const strictContext = this.#strictProductionContext(ctx);
+      if (strictContext && gate.strictGate?.passReasonCode) {
+        this.#appendStrictGateReturn(
+          ctx,
+          createStrictTypedGateReturnV1({
+            gate: gate.strictGate.gate,
+            verdict: 'pass',
+            reasonCode: gate.strictGate.passReasonCode,
+          })
+        );
+      }
       return 'continue';
+    }
+
+    // 严格冷启动在第一个非通过门立即失败关闭。legacy repair/degrade/skip 逻辑均不得接管，
+    // 否则 Producer 会消费未达到 fixpoint 或已漂移的结果。
+    if (this.#strictProductionContext(ctx)) {
+      const strictGate = gate.strictGate;
+      if (!strictGate) {
+        throw new Error(`STRICT_GATE_CONFIG_REQUIRED: ${stage.name || 'gate'}`);
+      }
+      const { passReasonCode: _passReasonCode, ...failureGate } = strictGate;
+      const typedReturn = createStrictTypedGateReturnV1({
+        ...failureGate,
+        verdict: 'failed',
+      });
+      this.#appendStrictGateReturn(ctx, typedReturn);
+      ctx.strictFailed = true;
+      return 'break';
     }
 
     if (gateResult.action === 'degrade') {
@@ -426,7 +479,7 @@ export class PipelineStrategy extends Strategy {
         );
         phaseResults._recordRepairToolWritten = this.#stageHasNoteFindingCall(repairResult);
 
-        gateResult = this.#evaluateGateResult(stage, ctx, bus);
+        gateResult = await this.#evaluateGateResult(stage, ctx, bus);
         this.#storeGateResult(stage, gateResult, ctx, bus);
         if (gateResult.action === 'pass') {
           return 'continue';
@@ -470,7 +523,7 @@ export class PipelineStrategy extends Strategy {
         const newReply = typeof rewriteResult?.reply === 'string' ? rewriteResult.reply.trim() : '';
         if (source && newReply.length > 0) {
           phaseResults[sourceName] = { ...source, reply: newReply };
-          gateResult = this.#evaluateGateResult(stage, ctx, bus);
+          gateResult = await this.#evaluateGateResult(stage, ctx, bus);
           this.#storeGateResult(stage, gateResult, ctx, bus);
           if (gateResult.action === 'pass') {
             return 'continue';
@@ -572,11 +625,11 @@ export class PipelineStrategy extends Strategy {
     };
   }
 
-  #evaluateGateResult(
+  async #evaluateGateResult(
     stage: PipelineStage,
     ctx: PipelineContext,
     bus: AgentEventBus
-  ): GateEvalResult {
+  ): Promise<GateEvalResult> {
     const { phaseResults, strategyContext } = ctx;
     const gate = stage.gate;
     if (!gate) {
@@ -590,7 +643,11 @@ export class PipelineStrategy extends Strategy {
       const gateSource = gate.useCumulativeToolCalls
         ? this.#withCumulativeToolCalls(source, ctx)
         : source;
-      const evaluated = gate.evaluator(gateSource, phaseResults, strategyContext) as GateEvalResult;
+      const evaluated = (await gate.evaluator(
+        gateSource,
+        phaseResults,
+        strategyContext
+      )) as GateEvalResult;
       return {
         ...evaluated,
         action: evaluated.action || (evaluated.pass ? 'pass' : 'analysis_retry'),
@@ -885,7 +942,13 @@ export class PipelineStrategy extends Strategy {
       isRetry && stage.retryBudget
         ? stage.retryBudget
         : stage.budget || computedBudget || undefined;
-    effectiveBudget = withProducerCoverageBudget(stage, effectiveBudget, ctx.gateArtifact);
+    const strictProduction = Boolean(this.#strictProductionContext(ctx));
+    effectiveBudget = withProducerCoverageBudget(
+      stage,
+      effectiveBudget,
+      ctx.gateArtifact,
+      strictProduction
+    );
     delete phaseResults[`_was_retry_${stage.name}`];
 
     // 阶段隔离 (ContextWindow + ExplorationTracker)
@@ -935,7 +998,13 @@ export class PipelineStrategy extends Strategy {
     // 当阶段 hard timeout 且 0 tool calls（LLM 完全卡住），
     // 如果有 retryBudget 且本次非 retry，立即以降级预算重跑一次，
     // 跳过 gate 往返，争取在更短时限内拿到输出。
-    if (stageResult.timedOut && !stageResult.toolCalls?.length && !isRetry && stage.retryBudget) {
+    if (
+      !strictProduction &&
+      stageResult.timedOut &&
+      !stageResult.toolCalls?.length &&
+      !isRetry &&
+      stage.retryBudget
+    ) {
       _pipelineLogger().info(
         `[PipelineStrategy] ♻️ Stage "${stage.name}" timed out with 0 tool calls — fast-retrying with retryBudget`
       );
@@ -979,6 +1048,15 @@ export class PipelineStrategy extends Strategy {
         phaseResults,
         decisionOnly,
         bus
+      );
+    }
+
+    if (strictProduction) {
+      const strictContext = this.#strictProductionContext(ctx);
+      validateStrictStageToolCallsV1(
+        stage.name,
+        stageResult.toolCalls || [],
+        strictContext?.factQueryObligationIds || []
       );
     }
 
@@ -1050,6 +1128,9 @@ export class PipelineStrategy extends Strategy {
     strategyContext: Record<string, unknown>,
     effectiveBudget: StageBudget | undefined
   ) {
+    if (this.#strictProductionContext(ctx)) {
+      return null;
+    }
     if (stage.disableTracker || stage.recordRepairOnly) {
       return null;
     }
@@ -1087,6 +1168,42 @@ export class PipelineStrategy extends Strategy {
     }
 
     return stageTracker;
+  }
+
+  #strictProductionContext(ctx: PipelineContext): StrictAnalysisContextProjectionV1 | null {
+    const strictProduction = ctx.strategyContext.strictProduction;
+    if (
+      !strictProduction ||
+      typeof strictProduction !== 'object' ||
+      Array.isArray(strictProduction)
+    ) {
+      return null;
+    }
+    const record = strictProduction as Record<string, unknown>;
+    if (record.enabled !== true) {
+      return null;
+    }
+    const context = record.context;
+    if (!context || typeof context !== 'object' || Array.isArray(context)) {
+      throw new Error('STRICT_ANALYSIS_CONTEXT_REQUIRED');
+    }
+    const typed = context as StrictAnalysisContextProjectionV1;
+    if (
+      typed.schemaVersion !== 1 ||
+      typed.derivedFindingCount !== 0 ||
+      typeof typed.contextHash !== 'string' ||
+      typed.contextHash.length === 0
+    ) {
+      throw new Error('STRICT_ANALYSIS_CONTEXT_INVALID');
+    }
+    return typed;
+  }
+
+  #appendStrictGateReturn(ctx: PipelineContext, typedReturn: unknown): void {
+    const previous = Array.isArray(ctx.phaseResults._strictGateReturns)
+      ? ctx.phaseResults._strictGateReturns
+      : [];
+    ctx.phaseResults._strictGateReturns = [...previous, typedReturn];
   }
 
   /** 执行 reactLoop 并添加硬超时保护 */

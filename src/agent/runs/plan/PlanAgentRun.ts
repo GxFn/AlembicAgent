@@ -1,9 +1,137 @@
+import { createHash } from 'node:crypto';
 import {
   assertPlanSelectionStageRequirements,
+  hashStrictPlanIntentV1,
+  type PlanCognitionInvocationV1,
+  type PlanCognitionReceiptV1,
   type PlanSelection,
   type PlanStageId,
+  type StrictPlanIntentV1,
 } from '@alembic/core/plans';
 import type { AgentService } from '../../service/AgentService.js';
+
+export interface PlanContextProjectionV1 {
+  readonly schemaVersion: 1;
+  readonly generationStage: PlanStageId;
+  readonly factsHash: string;
+  readonly catalogHash: string;
+  readonly sourceRevisionVectorHash: string;
+  readonly sourceArtifactHash: string;
+  readonly modelHash: string;
+  readonly promptHash: string;
+  readonly projectContextFacts: unknown;
+  readonly frozenCapabilityIds: readonly string[];
+  readonly frozenQueryFamilyIds: readonly string[];
+  readonly hardCaps: {
+    readonly semanticRepairLimit: number;
+  };
+}
+
+export interface RunStrictPlanAgentInput {
+  readonly agentService: Pick<AgentService, 'run'>;
+  readonly contextProjection: PlanContextProjectionV1;
+  readonly validateReceipt: (receipt: PlanCognitionReceiptV1) => void | Promise<void>;
+}
+
+/**
+ * 复用既有 Plan profile，但严格路径传完整 ProjectContext、禁用工具，并把语义修复记录成
+ * 单一因果链。验证失败最多回送两次；第三次必须显式拒绝，不能静默缩小范围。
+ */
+export async function runStrictPlanAgent({
+  agentService,
+  contextProjection,
+  validateReceipt,
+}: RunStrictPlanAgentInput): Promise<PlanCognitionReceiptV1> {
+  validateStrictPlanContext(contextProjection);
+  const semanticRepairLimit = Math.min(contextProjection.hardCaps.semanticRepairLimit, 2);
+  let initial: PlanCognitionInvocationV1 | null = null;
+  const repairs: PlanCognitionInvocationV1[] = [];
+  let repairReason: string | null = null;
+
+  for (let attempt = 0; attempt <= semanticRepairLimit; attempt += 1) {
+    const prompt = buildStrictPlanPrompt(contextProjection, {
+      repairReason,
+      parentInvocationId: repairs.at(-1)?.invocationId ?? initial?.invocationId ?? null,
+    });
+    const result = await agentService.run({
+      profile: { id: 'plan-selection' },
+      params: { generationStage: contextProjection.generationStage },
+      message: {
+        role: 'internal',
+        content: prompt,
+        metadata: {
+          task: 'strict-plan-cognition',
+          generationStage: contextProjection.generationStage,
+          semanticRepairAttempt: attempt,
+        },
+      },
+      context: {
+        source: 'system-workflow',
+        runtimeSource: 'system',
+        promptContext: { strictPlanContext: contextProjection },
+      },
+      execution: { toolChoiceOverride: 'none' },
+      presentation: { responseShape: 'system-task-result' },
+    });
+    if (result.status !== 'success') {
+      throw new Error(`STRICT_PLAN_RUN_FAILED: ${result.status}: ${result.reply || 'empty reply'}`);
+    }
+    if (result.toolCalls.length > 0) {
+      throw new Error('PLAN_TOOL_FORBIDDEN');
+    }
+    const intent = parseStrictPlanIntent(result.reply, contextProjection);
+    const outputHash = hashStrictPlanIntentV1(intent);
+    const invocationBase = {
+      invocationId: `plan-cognition-${attempt}-${hashText(`${result.runId}:${hashText(prompt)}:${outputHash}`).slice(0, 16)}`,
+      inputHash: hashText(prompt),
+      outputHash,
+      modelHash: contextProjection.modelHash,
+      promptHash: contextProjection.promptHash,
+    };
+    if (attempt === 0) {
+      initial = invocationBase;
+    } else {
+      const parentInvocationId = repairs.at(-1)?.invocationId ?? initial?.invocationId;
+      if (!parentInvocationId || !repairReason) {
+        throw new Error('PLAN_LINEAGE_BROKEN: repair without causal parent');
+      }
+      repairs.push({ ...invocationBase, parentInvocationId, reason: repairReason });
+    }
+    if (!initial) {
+      throw new Error('PLAN_LINEAGE_BROKEN: initial invocation missing');
+    }
+    const semantic = {
+      schemaVersion: 1 as const,
+      factsHash: contextProjection.factsHash,
+      catalogHash: contextProjection.catalogHash,
+      intent,
+      lineage: {
+        schemaVersion: 1 as const,
+        initial,
+        repairs: [...repairs],
+        transportRetryCount: 0,
+      },
+      validatorVerdict: 'accepted' as const,
+    };
+    const receipt: PlanCognitionReceiptV1 = {
+      ...semantic,
+      receiptId: `plan-cognition-receipt-${hashCanonical(semantic)}`,
+    };
+    try {
+      await validateReceipt(receipt);
+      return receipt;
+    } catch (error: unknown) {
+      repairReason = error instanceof Error ? error.message : String(error);
+      if (!/^PLAN_[A-Z0-9_]+/u.test(repairReason)) {
+        throw error;
+      }
+      if (attempt >= semanticRepairLimit) {
+        throw new Error(`PLAN_SEMANTIC_REPAIR_LIMIT: ${repairReason}`);
+      }
+    }
+  }
+  throw new Error('PLAN_SEMANTIC_REPAIR_LIMIT');
+}
 
 export interface RunPlanAgentInput {
   agentService: Pick<AgentService, 'run'>;
@@ -129,6 +257,106 @@ function parseJson(text: string): unknown {
       `Plan agent returned invalid JSON: ${err instanceof Error ? err.message : err}`
     );
   }
+}
+
+function buildStrictPlanPrompt(
+  context: PlanContextProjectionV1,
+  repair: { readonly repairReason: string | null; readonly parentInvocationId: string | null }
+): string {
+  return [
+    `为 generationStage=${context.generationStage} 生成 StrictPlanIntentV1。`,
+    '只输出纯 JSON object；不要调用任何工具，不要写状态。',
+    '对下面完整、冻结的 ProjectContext 做问题 DAG 分解；严禁 top-N/top-20/固定数量、补数、地板或延后范围。',
+    '每个问题与 plannedNextAction 必须携带 anatomyLensIds、subjectRefs、analysisScales、冻结 capabilityId/queryFamilyId、support/counterevidence、priority、stop/escalation 和 cap 内预算。',
+    '选择必须可执行；后续 Analyst 只能执行本 Plan 或经登记 expansion port 接纳的查询。',
+    `Frozen capability IDs: ${JSON.stringify(context.frozenCapabilityIds)}`,
+    `Frozen query family IDs: ${JSON.stringify(context.frozenQueryFamilyIds)}`,
+    `Source artifact hash: ${context.sourceArtifactHash}`,
+    `Source revision vector hash: ${context.sourceRevisionVectorHash}`,
+    ...(repair.repairReason
+      ? [
+          `这是父调用 ${repair.parentInvocationId ?? '<missing>'} 的因果语义修复。`,
+          `验证器拒绝原因：${repair.repairReason}`,
+          '保持原始完整范围和冻结 ID，只修复验证器指出的语义缺口。',
+        ]
+      : []),
+    '完整 ProjectContext facts（不得截断）：',
+    JSON.stringify(context.projectContextFacts, null, 2),
+  ].join('\n');
+}
+
+function parseStrictPlanIntent(
+  reply: string | null | undefined,
+  context: PlanContextProjectionV1
+): StrictPlanIntentV1 {
+  if (!reply || reply.trim().length === 0) {
+    throw new Error('STRICT_PLAN_EMPTY_REPLY');
+  }
+  const intent = parseJsonObjectFromReply(reply) as StrictPlanIntentV1;
+  const record = readRecord(intent);
+  if (
+    record.generationStage !== context.generationStage ||
+    !Array.isArray(record.plannedNextActions) ||
+    !Array.isArray(record.dimensions) ||
+    !Array.isArray(record.moduleBindings) ||
+    !Array.isArray(record.evidenceRefs) ||
+    !readRecord(record.investigationDecomposition).questions ||
+    !readRecord(record.budgetStrategy).schemaVersion
+  ) {
+    throw new Error('STRICT_PLAN_INTENT_SHAPE_INVALID');
+  }
+  const frozenCapabilities = new Set(context.frozenCapabilityIds);
+  const frozenFamilies = new Set(context.frozenQueryFamilyIds);
+  for (const raw of record.plannedNextActions) {
+    const action = readRecord(raw);
+    if (
+      !frozenCapabilities.has(String(action.capabilityId ?? '')) ||
+      !frozenFamilies.has(String(action.queryFamilyId ?? ''))
+    ) {
+      throw new Error('PLAN_UNKNOWN_FROZEN_QUERY');
+    }
+  }
+  return intent;
+}
+
+function validateStrictPlanContext(context: PlanContextProjectionV1): void {
+  if (
+    context.schemaVersion !== 1 ||
+    !context.factsHash.trim() ||
+    !context.catalogHash.trim() ||
+    !context.sourceArtifactHash.trim() ||
+    !context.sourceRevisionVectorHash.trim() ||
+    !context.modelHash.trim() ||
+    !context.promptHash.trim() ||
+    context.frozenCapabilityIds.length === 0 ||
+    context.frozenQueryFamilyIds.length === 0 ||
+    !Number.isSafeInteger(context.hardCaps.semanticRepairLimit) ||
+    context.hardCaps.semanticRepairLimit < 0
+  ) {
+    throw new Error('STRICT_PLAN_CONTEXT_INVALID');
+  }
+}
+
+function hashText(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function hashCanonical(value: unknown): string {
+  return hashText(JSON.stringify(sortCanonical(value)));
+}
+
+function sortCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortCanonical);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, sortCanonical(child)])
+  );
 }
 
 interface ProjectContextModuleCandidate {

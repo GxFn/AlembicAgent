@@ -1,6 +1,10 @@
 export { projectEvolutionAuditResult, runEvolutionAudit } from './evolution/EvolutionAgentRun.js';
 export { runModuleMining } from './module-mining/ScopedModuleMiningAgentRun.js';
-export { runPlanAgent } from './plan/PlanAgentRun.js';
+export {
+  type PlanContextProjectionV1,
+  runPlanAgent,
+  runStrictPlanAgent,
+} from './plan/PlanAgentRun.js';
 export {
   projectRelationDiscoveryResult,
   runRelationDiscovery,
