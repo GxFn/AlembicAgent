@@ -1,0 +1,542 @@
+[
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/alembic-workspace-single-file",
+    "candidate": {
+      "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+      "kind": "rule",
+      "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+      "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+      "content": {
+        "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+        "rationale": "The source binds strict role identity and the no-tool boundary in one production factory."
+      },
+      "reasoning": {
+        "sources": ["src/agent/production/StrictProductionStages.ts:30-91"]
+      }
+    },
+    "humanDecision": "uphold",
+    "overgeneralized": false
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  },
+  {
+    "projectRoot": "projects/bilidili-three-file",
+    "candidate": {
+      "title": "Treat Xcode asset metadata as a project-specific implementation rule",
+      "kind": "rule",
+      "doClause": "Preserve every idiom and scale metadata row as an Alembic architecture convention",
+      "dontClause": "Do not change generic asset catalog metadata",
+      "content": {
+        "markdown": "Generic asset catalog fields are claimed as project-specific architecture.",
+        "rationale": "This deliberately overgeneralized negative must be rejected."
+      },
+      "reasoning": {
+        "sources": ["BiliDili/Assets.xcassets/Contents.json:1-7"]
+      }
+    },
+    "humanDecision": "reject",
+    "overgeneralized": true
+  }
+]

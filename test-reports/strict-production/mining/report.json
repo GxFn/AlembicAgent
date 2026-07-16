@@ -1,0 +1,199 @@
+{
+  "kind": "MiningEvalReport",
+  "version": 1,
+  "startedAt": "2026-07-16T00:00:00.000Z",
+  "provider": "frozen-fixture/strict-production-fixture-v1",
+  "judgeProvider": "frozen-fixture/strict-production-fixture-v1",
+  "totals": {
+    "candidates": 1,
+    "inputTokens": 4,
+    "outputTokens": 4,
+    "abandoned": 0
+  },
+  "fixtures": [
+    {
+      "fixtureId": "alembic-workspace-single-file-value",
+      "expectedCandidateCount": 1,
+      "score": {
+        "fixtureId": "alembic-workspace-single-file-value",
+        "candidateCount": 1,
+        "expectedHits": [
+          {
+            "key": "strict-role-no-tool-route",
+            "matchedBy": [
+              0
+            ]
+          }
+        ],
+        "trivialHits": [],
+        "recall": 1,
+        "heuristicPrecision": 1,
+        "judgePrecision": 1,
+        "trivialityRate": 0
+      },
+      "candidates": [
+        {
+          "title": "Route strict Analyst and Producer calls through marked no-tool stages",
+          "kind": "rule",
+          "doClause": "Use strictRoleSurface markers and empty capabilities on strict Analyst and Producer stages",
+          "dontClause": "Do not route a strict run through the legacy Analyst or Producer stage surface",
+          "content": {
+            "markdown": "The strict stage factory marks both cognition roles and removes tool authority before PipelineStrategy execution.",
+            "rationale": "AlembicWorkspace binds strict role identity and the no-tool boundary in one production factory."
+          },
+          "reasoning": {
+            "sources": [
+              "src/agent/production/StrictProductionStages.ts:30-91"
+            ],
+            "evidenceRefs": [
+              "fixture-evidence-1-49c91bb16119"
+            ]
+          }
+        }
+      ],
+      "judgeVerdicts": [
+        {
+          "entailment": "entailed",
+          "trivial": false,
+          "actionable": true,
+          "scopeCorrect": true,
+          "verdict": "uphold",
+          "citedLines": [
+            "src/agent/production/StrictProductionStages.ts:30"
+          ],
+          "reason": "The source slice binds strict role markers to no-tool stage definitions."
+        }
+      ],
+      "observations": {
+        "status": "success",
+        "abandonedModules": [],
+        "submitRepairs": {},
+        "toolDistribution": {},
+        "usage": {
+          "inputTokens": 2,
+          "outputTokens": 2,
+          "iterations": 2,
+          "durationMs": 15
+        }
+      },
+      "sourceEvidence": {
+        "sourceRevisionVectorHash": "sha256:949c082d1ba93a482db0628441a42da5c3972a3e3efddce4ed4759da34604377",
+        "providerIdentity": {
+          "provider": "frozen-fixture",
+          "model": "strict-production-fixture-v1"
+        },
+        "loadedSources": [
+          {
+            "path": "src/agent/production/StrictProductionStages.ts",
+            "originRelativePath": "AlembicAgent/src/agent/production/StrictProductionStages.ts",
+            "sha256": "49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1",
+            "lineCount": 139
+          }
+        ],
+        "routeReceipts": [
+          {
+            "kind": "StrictRoleRouteReceiptV1",
+            "strictAnalystCalls": 1,
+            "strictProducerCalls": 1,
+            "legacyAnalystCalls": 0,
+            "legacyProducerCalls": 0
+          }
+        ]
+      }
+    },
+    {
+      "fixtureId": "bilidili-three-file-generic",
+      "expectedCandidateCount": 0,
+      "score": {
+        "fixtureId": "bilidili-three-file-generic",
+        "candidateCount": 0,
+        "expectedHits": [],
+        "trivialHits": [],
+        "recall": null,
+        "heuristicPrecision": null,
+        "judgePrecision": null,
+        "trivialityRate": null
+      },
+      "candidates": [],
+      "judgeVerdicts": null,
+      "observations": {
+        "status": "success",
+        "abandonedModules": [],
+        "submitRepairs": {},
+        "toolDistribution": {},
+        "usage": {
+          "inputTokens": 2,
+          "outputTokens": 2,
+          "iterations": 2,
+          "durationMs": 6
+        }
+      },
+      "sourceEvidence": {
+        "sourceRevisionVectorHash": "sha256:59e899715350357dbd75a49590396213c0e6cd6eabca91064e86a89394f7c13d",
+        "providerIdentity": {
+          "provider": "frozen-fixture",
+          "model": "strict-production-fixture-v1"
+        },
+        "loadedSources": [
+          {
+            "path": "BiliDili/Assets.xcassets/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/Contents.json",
+            "sha256": "0fd49ba3c3585c709678e0046a821c3c60685ec7063720d30d3a3448be3a208b",
+            "lineCount": 7
+          },
+          {
+            "path": "BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+            "sha256": "9af65086fa30b49252fae1a1225731691de794f7775af74d71befeb507d12b7c",
+            "lineCount": 12
+          },
+          {
+            "path": "BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+            "sha256": "666d8e2b908c9d43a18e9243acb0d6d9793609591661a8c964d39290052ee2ea",
+            "lineCount": 68
+          }
+        ],
+        "routeReceipts": [
+          {
+            "kind": "StrictRoleRouteReceiptV1",
+            "strictAnalystCalls": 1,
+            "strictProducerCalls": 1,
+            "legacyAnalystCalls": 0,
+            "legacyProducerCalls": 0
+          }
+        ]
+      }
+    }
+  ],
+  "notes": [
+    "precision/recall(heuristic) 是关键词+引用文件的方向性判据，非语义判定；--judge 的 precision(judge) 才是语义口径。",
+    "LLM 有方差：结论看多次运行的区间，不看单点。"
+  ],
+  "judgeModelLoadReceipt": {
+    "kind": "FrozenJudgeModelLoadReceiptV1",
+    "schemaVersion": 1,
+    "selectionMode": "explicit",
+    "requestedProvider": "frozen-fixture",
+    "requestedModel": "strict-production-fixture-v1",
+    "resolvedProvider": "frozen-fixture",
+    "resolvedModel": "strict-production-fixture-v1",
+    "temperature": 0,
+    "maxTokens": 800,
+    "implementationModuleSha256": "64a4c071bae9be6cdc2f6b650b7f9b87a8304ed0816c9e6d91513c7757a8db0a",
+    "receiptHash": "sha256:b4ffb28c4c481feb0234428e88a2a69f7d48d27573d9164ab3cccc750ac1bcae"
+  },
+  "evaluationReceipts": {
+    "goldenSha256": "90329055f7792e8ac7cb5252ee218a0cec0d1ca93686fa789623ebefeb421bac",
+    "configSha256": "5c39f852cd2d5e15143f7120f43cb490e3eed1076268b31166459814ea2f422e",
+    "providerSha256": "9654a9b5645d66f705a2c3ab010f430753b9a3529fcd079768b116ea002728fe",
+    "judgeProviderSha256": "9654a9b5645d66f705a2c3ab010f430753b9a3529fcd079768b116ea002728fe",
+    "negativeResults": [
+      {
+        "fixtureId": "bilidili-three-file-generic",
+        "candidateCount": 0,
+        "passed": true
+      }
+    ]
+  }
+}

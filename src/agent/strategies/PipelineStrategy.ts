@@ -102,6 +102,8 @@ interface GateConfig {
 /** Pipeline stage definition */
 interface PipelineStage {
   name: string;
+  /** Strict runs must carry an immutable role marker from the strict stage factory. */
+  strictRoleSurface?: 'strict-analyst-v1' | 'strict-producer-v1';
   gate?: GateConfig;
   capabilities?: CapabilityRef[];
   additionalTools?: string[];
@@ -917,6 +919,8 @@ export class PipelineStrategy extends Strategy {
   ) {
     const { phaseResults, strategyContext } = ctx;
 
+    this.#validateStrictRoleRoute(stage, ctx);
+
     bus.publish(AgentEvents.PROGRESS, {
       type: 'pipeline_stage_start',
       stage: stage.name,
@@ -1053,6 +1057,7 @@ export class PipelineStrategy extends Strategy {
 
     if (strictProduction) {
       const strictContext = this.#strictProductionContext(ctx);
+      this.#appendStrictRoleRouteReceipt(stage, ctx);
       validateStrictStageToolCallsV1(
         stage.name,
         stageResult.toolCalls || [],
@@ -1197,6 +1202,42 @@ export class PipelineStrategy extends Strategy {
       throw new Error('STRICT_ANALYSIS_CONTEXT_INVALID');
     }
     return typed;
+  }
+
+  #validateStrictRoleRoute(stage: PipelineStage, ctx: PipelineContext): void {
+    if (!this.#strictProductionContext(ctx)) {
+      return;
+    }
+    const expected =
+      stage.name === 'analyze'
+        ? 'strict-analyst-v1'
+        : stage.name === 'produce'
+          ? 'strict-producer-v1'
+          : null;
+    if (expected && stage.strictRoleSurface !== expected) {
+      throw new Error(`STRICT_PRODUCTION_STAGE_ROUTE_REQUIRED:${stage.name}`);
+    }
+  }
+
+  #appendStrictRoleRouteReceipt(stage: PipelineStage, ctx: PipelineContext): void {
+    if (
+      stage.strictRoleSurface !== 'strict-analyst-v1' &&
+      stage.strictRoleSurface !== 'strict-producer-v1'
+    ) {
+      return;
+    }
+    const previous = (ctx.phaseResults._strictRoleRouteReceipt || {}) as Record<string, unknown>;
+    ctx.phaseResults._strictRoleRouteReceipt = {
+      kind: 'StrictRoleRouteReceiptV1',
+      strictAnalystCalls:
+        Number(previous.strictAnalystCalls || 0) +
+        (stage.strictRoleSurface === 'strict-analyst-v1' ? 1 : 0),
+      strictProducerCalls:
+        Number(previous.strictProducerCalls || 0) +
+        (stage.strictRoleSurface === 'strict-producer-v1' ? 1 : 0),
+      legacyAnalystCalls: 0,
+      legacyProducerCalls: 0,
+    };
   }
 
   #appendStrictGateReturn(ctx: PipelineContext, typedReturn: unknown): void {

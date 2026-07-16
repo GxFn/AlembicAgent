@@ -1,5 +1,6 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "$comment": "Executable strict-production golden. Every case names copied source bytes, their repository origin, expected semantic disposition, mining modules, and positive/negative scoring. Evaluation must hash-verify and read these files; project names alone are not evidence.",
   "upstream": {
     "coreCommit": "6b6341f05332a1d15f79c19a0251d41b962b71d1",
     "coreTree": "84c094ee01052c91df5c9e94a50862dc61652f15",
@@ -7,20 +8,93 @@
   },
   "cases": [
     {
-      "id": "alembic-workspace-normal",
+      "id": "alembic-workspace-single-file-value",
       "project": "AlembicWorkspace",
-      "sourceRevisionVectorHash": "golden-alembic-source-vector-v1",
-      "scopeCount": 25,
+      "fixturePath": "projects/alembic-workspace-single-file",
+      "expectedDisposition": "single-file-value",
+      "sourceFiles": [
+        {
+          "path": "src/agent/production/StrictProductionStages.ts",
+          "originRelativePath": "AlembicAgent/src/agent/production/StrictProductionStages.ts",
+          "sha256": "49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1"
+        }
+      ],
+      "projectFacts": {
+        "project": "AlembicWorkspace",
+        "fixtureKind": "single-file-value",
+        "fileCount": 1
+      },
+      "modules": [
+        {
+          "moduleId": "strict-production-stage-factory",
+          "moduleName": "strict-production-stage-factory",
+          "ownedFiles": ["src/agent/production/StrictProductionStages.ts"]
+        }
+      ],
       "expectedProposalCardinality": 1,
-      "expectedReviewVerdict": "pass"
+      "expectedReviewVerdict": "pass",
+      "expected": [
+        {
+          "key": "strict-role-no-tool-route",
+          "kind": "rule",
+          "keywords": ["strictRoleSurface", "strict Analyst", "strict Producer", "capabilities"],
+          "mustCiteFiles": ["src/agent/production/StrictProductionStages.ts"]
+        }
+      ],
+      "notExpected": [
+        {
+          "key": "filename-only",
+          "keywords": ["file is named", "imports strictproductionpipeline"]
+        }
+      ]
     },
     {
-      "id": "bilidili-investigated-empty",
+      "id": "bilidili-three-file-generic",
       "project": "BiliDili",
-      "sourceRevisionVectorHash": "golden-bilidili-source-vector-v1",
-      "scopeCount": 9,
+      "fixturePath": "projects/bilidili-three-file",
+      "expectedDisposition": "three-file-generic",
+      "sourceFiles": [
+        {
+          "path": "BiliDili/Assets.xcassets/Contents.json",
+          "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/Contents.json",
+          "sha256": "0fd49ba3c3585c709678e0046a821c3c60685ec7063720d30d3a3448be3a208b"
+        },
+        {
+          "path": "BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+          "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+          "sha256": "9af65086fa30b49252fae1a1225731691de794f7775af74d71befeb507d12b7c"
+        },
+        {
+          "path": "BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+          "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+          "sha256": "666d8e2b908c9d43a18e9243acb0d6d9793609591661a8c964d39290052ee2ea"
+        }
+      ],
+      "projectFacts": {
+        "project": "BiliDili",
+        "fixtureKind": "three-file-generic",
+        "fileCount": 3
+      },
+      "modules": [
+        {
+          "moduleId": "asset-catalog-metadata",
+          "moduleName": "asset-catalog-metadata",
+          "ownedFiles": [
+            "BiliDili/Assets.xcassets/Contents.json",
+            "BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+            "BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json"
+          ]
+        }
+      ],
       "expectedProposalCardinality": 0,
-      "expectedReviewVerdict": "pass"
+      "expectedReviewVerdict": "pass",
+      "expected": [],
+      "notExpected": [
+        {
+          "key": "generic-xcode-metadata",
+          "keywords": ["xcode", "idiom", "scale"]
+        }
+      ]
     }
   ]
 }

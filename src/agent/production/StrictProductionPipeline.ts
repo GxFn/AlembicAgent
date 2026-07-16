@@ -455,12 +455,151 @@ export function createStrictAnalysisFixpointV1(
   });
 }
 
+export interface StrictProducerEvidenceProjectionV1 {
+  readonly schemaVersion: 1;
+  readonly sourceRevisionVectorHash: string;
+  readonly entries: readonly {
+    readonly evidenceEntryId: string;
+    readonly relativePath: string;
+    readonly blobHash: string;
+    readonly contentHash: string;
+    readonly startLine: number;
+    readonly endLine: number;
+    readonly content: string;
+  }[];
+  readonly projectionHash: string;
+}
+
+/**
+ * Producer 的输入不是一组可由调用者重填的字符串，而是从已验证 epoch、Core fixpoint 和
+ * 冻结证据投影派生的不可变 receipt。后续表达修复只能复用同一 receipt。
+ */
+export interface StrictProducerLineageReceiptV1 {
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly planCognitionHash: string;
+  readonly sourceRevisionVectorHash: string;
+  readonly epochHash: string;
+  readonly populationHash: string;
+  readonly clusterSetHash: string;
+  readonly clusterId: string;
+  readonly inductionReceiptHash: string;
+  readonly hypothesis: ProducerEligibleHypothesisV1;
+  readonly hypothesisHash: string;
+  readonly analysisFixpointHash: string;
+  readonly evidenceProjectionHash: string;
+  readonly evidenceEntryIds: readonly string[];
+  readonly knowledgeRootId: string;
+  readonly lineageHash: string;
+}
+
+export interface CreateStrictProducerLineageReceiptInputV1 {
+  readonly context: StrictAnalysisContextProjectionV1;
+  readonly epoch: StrictAnalystEpochV1;
+  readonly analysisFixpoint: AnalysisFixpointReceiptV1;
+  readonly hypothesisId: string;
+  readonly evidence: StrictProducerEvidenceProjectionV1;
+}
+
+export function createStrictProducerLineageReceiptV1(
+  input: CreateStrictProducerLineageReceiptInputV1
+): StrictProducerLineageReceiptV1 {
+  assertStrictContextIntegrity(input.context);
+  assertStrictAnalystEpochIntegrity(input.epoch);
+  assertAnalysisFixpointIntegrity(input.analysisFixpoint);
+  assertEvidenceProjectionIntegrity(input.evidence);
+  requireText(input.hypothesisId, 'STRICT_PRODUCER_LINEAGE_HYPOTHESIS_REQUIRED');
+
+  const hypothesis = input.epoch.producerEligibleHypotheses.find(
+    (candidate) => candidate.hypothesisId === input.hypothesisId
+  );
+  if (!hypothesis) {
+    fail('STRICT_PRODUCER_LINEAGE_HYPOTHESIS_NOT_ELIGIBLE', input.hypothesisId);
+  }
+  const matchingInductions = input.epoch.inductions.filter((receipt) =>
+    receipt.hypotheses.some((candidate) => candidate.hypothesisId === input.hypothesisId)
+  );
+  if (matchingInductions.length !== 1) {
+    fail('STRICT_PRODUCER_LINEAGE_INDUCTION_AMBIGUOUS', input.hypothesisId);
+  }
+  const induction = matchingInductions[0];
+  const cluster = input.epoch.clusterSet.clusters.find(
+    (candidate) => candidate.clusterId === induction?.clusterId
+  );
+  if (!induction || !cluster) {
+    fail('STRICT_PRODUCER_LINEAGE_CLUSTER_MISSING', input.hypothesisId);
+  }
+  if (
+    !input.analysisFixpoint.clusterSetHashes.includes(input.epoch.clusterSet.clusterSetHash) ||
+    !input.analysisFixpoint.inductionReceiptHashes.includes(induction.receiptHash) ||
+    input.context.analysisFixpointHash !== input.analysisFixpoint.fixpointHash ||
+    input.context.sourceRevisionVectorHash !== input.evidence.sourceRevisionVectorHash
+  ) {
+    fail('STRICT_PRODUCER_LINEAGE_FIXPOINT_BINDING_MISMATCH');
+  }
+  assertSameIds(
+    input.context.evidenceEntryIds,
+    input.evidence.entries.map((entry) => entry.evidenceEntryId),
+    'STRICT_PRODUCER_LINEAGE_EVIDENCE_BINDING_MISMATCH'
+  );
+  for (const [actual, expected, code] of [
+    [input.context.populationHashes, [input.epoch.population.populationHash], 'POPULATION'],
+    [input.context.clusterSetHashes, [input.epoch.clusterSet.clusterSetHash], 'CLUSTER_SET'],
+    [input.context.inductionReceiptHashes, [induction.receiptHash], 'INDUCTION'],
+    [input.context.hypothesisIds, [hypothesis.hypothesisId], 'HYPOTHESIS'],
+  ] as const) {
+    assertContainsIds(actual, expected, `STRICT_PRODUCER_LINEAGE_${code}_BINDING_MISMATCH`);
+  }
+
+  const hypothesisHash = hashCanonical(hypothesis);
+  const knowledgeRootId = hashCanonical({
+    schemaVersion: 1,
+    runId: input.context.runId,
+    planCognitionHash: input.context.planCognitionHash,
+    sourceRevisionVectorHash: input.context.sourceRevisionVectorHash,
+    epochHash: input.epoch.epochHash,
+    populationHash: input.epoch.population.populationHash,
+    clusterSetHash: input.epoch.clusterSet.clusterSetHash,
+    clusterId: cluster.clusterId,
+    inductionReceiptHash: induction.receiptHash,
+    hypothesisHash,
+    analysisFixpointHash: input.analysisFixpoint.fixpointHash,
+    evidenceProjectionHash: input.evidence.projectionHash,
+    evidenceEntryIds: normalizeIds(
+      input.evidence.entries.map((entry) => entry.evidenceEntryId),
+      'producerRootEvidenceEntryIds'
+    ),
+  });
+  const semantic = {
+    schemaVersion: 1 as const,
+    runId: input.context.runId,
+    planCognitionHash: input.context.planCognitionHash,
+    sourceRevisionVectorHash: input.context.sourceRevisionVectorHash,
+    epochHash: input.epoch.epochHash,
+    populationHash: input.epoch.population.populationHash,
+    clusterSetHash: input.epoch.clusterSet.clusterSetHash,
+    clusterId: cluster.clusterId,
+    inductionReceiptHash: induction.receiptHash,
+    hypothesis,
+    hypothesisHash,
+    analysisFixpointHash: input.analysisFixpoint.fixpointHash,
+    evidenceProjectionHash: input.evidence.projectionHash,
+    evidenceEntryIds: normalizeIds(
+      input.evidence.entries.map((entry) => entry.evidenceEntryId),
+      'producerLineageEvidenceEntryIds'
+    ),
+    knowledgeRootId,
+  };
+  return freeze({ ...semantic, lineageHash: hashCanonical(semantic) });
+}
+
 export interface CausalRepairNodeV1 {
   readonly schemaVersion: 1;
   readonly nodeId: string;
   readonly rootIds: readonly string[];
   readonly parentNodeIds: readonly string[];
   readonly stage: 'analyst' | 'producer' | 'reviewer';
+  readonly lineageHash: string;
   readonly inputHash: string;
   readonly outputHash: string;
   readonly evidenceHash: string;
@@ -471,8 +610,7 @@ export interface CausalRepairNodeV1 {
 }
 
 export interface CreateCausalRepairNodeInputV1 {
-  readonly nodeId: string;
-  readonly rootIds: readonly string[];
+  readonly lineage: StrictProducerLineageReceiptV1;
   readonly parents: readonly CausalRepairNodeV1[];
   readonly stage: CausalRepairNodeV1['stage'];
   readonly inputHash: string;
@@ -483,8 +621,11 @@ export interface CreateCausalRepairNodeInputV1 {
 }
 
 export function createCausalRepairNodeV1(input: CreateCausalRepairNodeInputV1): CausalRepairNodeV1 {
+  assertStrictProducerLineageIntegrity(input.lineage);
+  for (const parent of input.parents) {
+    assertCausalRepairNodeIntegrity(parent);
+  }
   for (const [field, value] of Object.entries({
-    nodeId: input.nodeId,
     inputHash: input.inputHash,
     outputHash: input.outputHash,
     evidenceHash: input.evidenceHash,
@@ -493,14 +634,13 @@ export function createCausalRepairNodeV1(input: CreateCausalRepairNodeInputV1): 
   })) {
     requireText(value, `STRICT_CAUSAL_${field.toUpperCase()}_REQUIRED`);
   }
-  const rootIds = normalizeIds(input.rootIds, 'rootIds');
-  const parentRoots = normalizeIds(
-    input.parents.flatMap((parent) => parent.rootIds),
-    'parentRootIds'
-  );
-  if (input.parents.length > 0 && JSON.stringify(rootIds) !== JSON.stringify(parentRoots)) {
-    fail('STRICT_CAUSAL_ROOT_SET_CHANGED');
-  }
+  const rootIds =
+    input.parents.length === 0
+      ? [input.lineage.knowledgeRootId]
+      : normalizeIds(
+          input.parents.flatMap((parent) => parent.rootIds),
+          'parentRootIds'
+        );
   const semanticRepairDepth =
     input.parents.length === 0
       ? 0
@@ -508,15 +648,26 @@ export function createCausalRepairNodeV1(input: CreateCausalRepairNodeInputV1): 
   if (semanticRepairDepth > 2) {
     fail('STRICT_CAUSAL_REPAIR_LIMIT');
   }
+  const parentNodeIds = normalizeIds(
+    input.parents.map((parent) => parent.nodeId),
+    'parentNodeIds'
+  );
+  const nodeId = hashCanonical({
+    kind: 'strict-causal-repair-node-v1',
+    rootIds,
+    parentNodeIds,
+    stage: input.stage,
+    lineageHash: input.lineage.lineageHash,
+    inputHash: input.inputHash,
+    outputHash: input.outputHash,
+  });
   const semantic = {
     schemaVersion: 1 as const,
-    nodeId: input.nodeId,
+    nodeId,
     rootIds,
-    parentNodeIds: normalizeIds(
-      input.parents.map((parent) => parent.nodeId),
-      'parentNodeIds'
-    ),
+    parentNodeIds,
     stage: input.stage,
+    lineageHash: input.lineage.lineageHash,
     inputHash: input.inputHash,
     outputHash: input.outputHash,
     evidenceHash: input.evidenceHash,
@@ -553,6 +704,7 @@ export interface StrictProducerProposalV1 {
 export interface StrictProducerExpressionSetV1 {
   readonly schemaVersion: 1;
   readonly setId: string;
+  readonly lineage: StrictProducerLineageReceiptV1;
   readonly hypothesis: ProducerEligibleHypothesisV1;
   readonly analysisFixpointHash: string;
   readonly version: number;
@@ -564,30 +716,50 @@ export interface StrictProducerExpressionSetV1 {
     readonly reviewerReceiptId: string;
   } | null;
   readonly cardinality: number;
+  readonly authoredFingerprintHash: string;
   readonly repairNode: CausalRepairNodeV1;
   readonly setHash: string;
 }
 
-export interface CreateStrictProducerExpressionSetInputV1
-  extends Omit<StrictProducerExpressionSetV1, 'schemaVersion' | 'cardinality' | 'setHash'> {}
+export interface CreateStrictProducerExpressionSetInputV1 {
+  readonly lineage: StrictProducerLineageReceiptV1;
+  readonly parentSet: StrictProducerExpressionSetV1 | null;
+  readonly proposals: readonly StrictProducerProposalV1[];
+  readonly zeroDisposition: StrictProducerExpressionSetV1['zeroDisposition'];
+  readonly modelHash: string;
+  readonly reasonHash: string;
+}
 
 export function createStrictProducerExpressionSetV1(
   input: CreateStrictProducerExpressionSetInputV1
 ): StrictProducerExpressionSetV1 {
-  requireText(input.setId, 'STRICT_PRODUCER_SET_ID_REQUIRED');
-  requireText(input.analysisFixpointHash, 'STRICT_PRODUCER_FIXPOINT_REQUIRED');
-  if (!['survived', 'narrowed'].includes(input.hypothesis.status)) {
-    fail('STRICT_PRODUCER_HYPOTHESIS_NOT_ELIGIBLE');
+  for (const forbiddenField of [
+    'setId',
+    'version',
+    'parentSetId',
+    'hypothesis',
+    'analysisFixpointHash',
+    'authoredFingerprintHash',
+    'repairNode',
+  ]) {
+    if (Object.hasOwn(input, forbiddenField)) {
+      fail('STRICT_PRODUCER_CALLER_LINEAGE_FIELD_FORBIDDEN', forbiddenField);
+    }
   }
-  if (!Number.isSafeInteger(input.version) || input.version < 1) {
-    fail('STRICT_PRODUCER_SET_VERSION_INVALID');
+  assertStrictProducerLineageIntegrity(input.lineage);
+  requireText(input.modelHash, 'STRICT_PRODUCER_MODEL_HASH_REQUIRED');
+  requireText(input.reasonHash, 'STRICT_PRODUCER_REASON_HASH_REQUIRED');
+  if (input.parentSet) {
+    assertStrictProducerExpressionSetIntegrity(input.parentSet);
+    if (input.parentSet.lineage.lineageHash !== input.lineage.lineageHash) {
+      fail('STRICT_PRODUCER_PREDECESSOR_BINDING_CHANGED');
+    }
   }
-  if ((input.version === 1) !== (input.parentSetId === null)) {
-    fail('STRICT_PRODUCER_SET_PARENT_INVALID');
+  const version = (input.parentSet?.version ?? 0) + 1;
+  if (version > 3) {
+    fail('STRICT_CAUSAL_REPAIR_LIMIT');
   }
-  if (input.version > 3 || input.repairNode.semanticRepairDepth !== input.version - 1) {
-    fail('STRICT_PRODUCER_REPAIR_LINEAGE_INVALID');
-  }
+  const parentSetId = input.parentSet?.setId ?? null;
   if (input.proposals.length === 0 && !input.zeroDisposition) {
     fail('STRICT_PRODUCER_ZERO_DISPOSITION_REQUIRED');
   }
@@ -615,13 +787,45 @@ export function createStrictProducerExpressionSetV1(
     requireText(input.zeroDisposition.reviewerReceiptId, 'STRICT_PRODUCER_ZERO_REVIEW_REQUIRED');
     validateAuthoredProjection(input.zeroDisposition.authored);
   }
+  const proposals = [...input.proposals].sort((left, right) =>
+    left.expressionId.localeCompare(right.expressionId)
+  );
+  const authoredFingerprintHash = hashCanonical({
+    proposals,
+    zeroDisposition: input.zeroDisposition,
+  });
+  const repairNode = createCausalRepairNodeV1({
+    lineage: input.lineage,
+    parents: input.parentSet ? [input.parentSet.repairNode] : [],
+    stage: 'producer',
+    inputHash: input.lineage.lineageHash,
+    outputHash: authoredFingerprintHash,
+    evidenceHash: input.lineage.evidenceProjectionHash,
+    modelHash: input.modelHash,
+    reasonHash: input.reasonHash,
+  });
+  if (repairNode.semanticRepairDepth !== version - 1) {
+    fail('STRICT_PRODUCER_REPAIR_LINEAGE_INVALID');
+  }
+  const setId = hashCanonical({
+    kind: 'strict-producer-expression-set-v1',
+    knowledgeRootId: input.lineage.knowledgeRootId,
+    version,
+    parentSetId,
+  });
   const semantic = {
     schemaVersion: 1 as const,
-    ...input,
-    proposals: [...input.proposals].sort((left, right) =>
-      left.expressionId.localeCompare(right.expressionId)
-    ),
-    cardinality: input.proposals.length,
+    setId,
+    lineage: input.lineage,
+    hypothesis: input.lineage.hypothesis,
+    analysisFixpointHash: input.lineage.analysisFixpointHash,
+    version,
+    parentSetId,
+    proposals,
+    zeroDisposition: input.zeroDisposition,
+    cardinality: proposals.length,
+    authoredFingerprintHash,
+    repairNode,
   };
   return freeze({ ...semantic, setHash: hashCanonical(semantic) });
 }
@@ -661,6 +865,202 @@ export function validateStrictStageToolCallsV1(
         fail('STRICT_ANALYSIS_QUERY_UNENROLLED', obligationId || 'missing');
       }
     }
+  }
+}
+
+function assertStrictContextIntegrity(context: StrictAnalysisContextProjectionV1): void {
+  const { schemaVersion, contextHash, ...input } = context;
+  if (schemaVersion !== 1) {
+    fail('STRICT_PRODUCER_LINEAGE_CONTEXT_VERSION_MISMATCH');
+  }
+  const rebuilt = createStrictAnalysisContextProjectionV1(input);
+  if (rebuilt.contextHash !== contextHash) {
+    fail('STRICT_PRODUCER_LINEAGE_CONTEXT_HASH_MISMATCH');
+  }
+}
+
+function assertStrictAnalystEpochIntegrity(epoch: StrictAnalystEpochV1): void {
+  const { epochHash, ...semantic } = epoch;
+  if (epoch.schemaVersion !== 1 || hashCanonical(semantic) !== epochHash) {
+    fail('STRICT_PRODUCER_LINEAGE_EPOCH_HASH_MISMATCH');
+  }
+}
+
+function assertAnalysisFixpointIntegrity(fixpoint: AnalysisFixpointReceiptV1): void {
+  const { fixpointHash, ...semantic } = fixpoint;
+  if (fixpoint.schemaVersion !== 1 || hashCoreCanonical(semantic) !== fixpointHash) {
+    fail('STRICT_PRODUCER_LINEAGE_FIXPOINT_HASH_MISMATCH');
+  }
+}
+
+function assertEvidenceProjectionIntegrity(evidence: StrictProducerEvidenceProjectionV1): void {
+  if (evidence.schemaVersion !== 1) {
+    fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_VERSION_MISMATCH');
+  }
+  requireText(
+    evidence.sourceRevisionVectorHash,
+    'STRICT_PRODUCER_LINEAGE_EVIDENCE_SOURCE_REQUIRED'
+  );
+  const entries = [...evidence.entries].sort((left, right) =>
+    left.evidenceEntryId.localeCompare(right.evidenceEntryId)
+  );
+  for (const entry of entries) {
+    for (const [field, value] of Object.entries({
+      evidenceEntryId: entry.evidenceEntryId,
+      relativePath: entry.relativePath,
+      blobHash: entry.blobHash,
+      contentHash: entry.contentHash,
+    })) {
+      requireText(value, `STRICT_PRODUCER_LINEAGE_EVIDENCE_${field.toUpperCase()}_REQUIRED`);
+    }
+    const contentHash = createHash('sha256').update(entry.content).digest('hex');
+    if (contentHash !== entry.contentHash) {
+      fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_CONTENT_HASH_MISMATCH', entry.evidenceEntryId);
+    }
+    if (
+      !Number.isSafeInteger(entry.startLine) ||
+      !Number.isSafeInteger(entry.endLine) ||
+      entry.startLine < 1 ||
+      entry.endLine < entry.startLine ||
+      entry.content.split('\n').length !== entry.endLine - entry.startLine + 1
+    ) {
+      fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID', entry.evidenceEntryId);
+    }
+  }
+  if (new Set(entries.map((entry) => entry.evidenceEntryId)).size !== entries.length) {
+    fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_ID_DUPLICATE');
+  }
+  const semantic = {
+    schemaVersion: 1 as const,
+    sourceRevisionVectorHash: evidence.sourceRevisionVectorHash,
+    entries,
+  };
+  if (hashCanonical(semantic) !== evidence.projectionHash) {
+    fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_PROJECTION_HASH_MISMATCH');
+  }
+}
+
+function assertStrictProducerLineageIntegrity(lineage: StrictProducerLineageReceiptV1): void {
+  if (lineage.schemaVersion !== 1) {
+    fail('STRICT_PRODUCER_LINEAGE_VERSION_MISMATCH');
+  }
+  for (const [field, value] of Object.entries({
+    runId: lineage.runId,
+    planCognitionHash: lineage.planCognitionHash,
+    sourceRevisionVectorHash: lineage.sourceRevisionVectorHash,
+    epochHash: lineage.epochHash,
+    populationHash: lineage.populationHash,
+    clusterSetHash: lineage.clusterSetHash,
+    clusterId: lineage.clusterId,
+    inductionReceiptHash: lineage.inductionReceiptHash,
+    hypothesisHash: lineage.hypothesisHash,
+    analysisFixpointHash: lineage.analysisFixpointHash,
+    evidenceProjectionHash: lineage.evidenceProjectionHash,
+    knowledgeRootId: lineage.knowledgeRootId,
+    lineageHash: lineage.lineageHash,
+  })) {
+    requireText(value, `STRICT_PRODUCER_LINEAGE_${field.toUpperCase()}_REQUIRED`);
+  }
+  if (hashCanonical(lineage.hypothesis) !== lineage.hypothesisHash) {
+    fail('STRICT_PRODUCER_LINEAGE_HYPOTHESIS_HASH_MISMATCH');
+  }
+  const expectedRootId = hashCanonical({
+    schemaVersion: 1,
+    runId: lineage.runId,
+    planCognitionHash: lineage.planCognitionHash,
+    sourceRevisionVectorHash: lineage.sourceRevisionVectorHash,
+    epochHash: lineage.epochHash,
+    populationHash: lineage.populationHash,
+    clusterSetHash: lineage.clusterSetHash,
+    clusterId: lineage.clusterId,
+    inductionReceiptHash: lineage.inductionReceiptHash,
+    hypothesisHash: lineage.hypothesisHash,
+    analysisFixpointHash: lineage.analysisFixpointHash,
+    evidenceProjectionHash: lineage.evidenceProjectionHash,
+    evidenceEntryIds: normalizeIds(lineage.evidenceEntryIds, 'producerRootEvidenceEntryIds'),
+  });
+  if (expectedRootId !== lineage.knowledgeRootId) {
+    fail('STRICT_PRODUCER_LINEAGE_KNOWLEDGE_ROOT_MISMATCH');
+  }
+  const { lineageHash, ...semantic } = lineage;
+  if (hashCanonical(semantic) !== lineageHash) {
+    fail('STRICT_PRODUCER_LINEAGE_HASH_MISMATCH');
+  }
+}
+
+function assertCausalRepairNodeIntegrity(node: CausalRepairNodeV1): void {
+  const { nodeHash, ...semantic } = node;
+  if (node.schemaVersion !== 1 || hashCanonical(semantic) !== nodeHash) {
+    fail('STRICT_CAUSAL_NODE_HASH_MISMATCH');
+  }
+  normalizeIds(node.rootIds, 'causalRootIds');
+  normalizeIds(node.parentNodeIds, 'causalParentNodeIds');
+  if (!Number.isSafeInteger(node.semanticRepairDepth) || node.semanticRepairDepth < 0) {
+    fail('STRICT_CAUSAL_REPAIR_DEPTH_INVALID');
+  }
+}
+
+function assertStrictProducerExpressionSetIntegrity(set: StrictProducerExpressionSetV1): void {
+  const { setHash, ...semantic } = set;
+  if (set.schemaVersion !== 1 || hashCanonical(semantic) !== setHash) {
+    fail('STRICT_PRODUCER_PARENT_SET_HASH_MISMATCH');
+  }
+  assertStrictProducerLineageIntegrity(set.lineage);
+  assertCausalRepairNodeIntegrity(set.repairNode);
+  const authoredFingerprintHash = hashCanonical({
+    proposals: set.proposals,
+    zeroDisposition: set.zeroDisposition,
+  });
+  if (
+    authoredFingerprintHash !== set.authoredFingerprintHash ||
+    set.repairNode.outputHash !== set.authoredFingerprintHash
+  ) {
+    fail('STRICT_PRODUCER_PARENT_SET_FINGERPRINT_MISMATCH');
+  }
+  if (
+    set.repairNode.lineageHash !== set.lineage.lineageHash ||
+    set.repairNode.inputHash !== set.lineage.lineageHash ||
+    set.repairNode.evidenceHash !== set.lineage.evidenceProjectionHash ||
+    set.analysisFixpointHash !== set.lineage.analysisFixpointHash ||
+    hashCanonical(set.hypothesis) !== set.lineage.hypothesisHash
+  ) {
+    fail('STRICT_PRODUCER_PARENT_SET_LINEAGE_MISMATCH');
+  }
+  const expectedSetId = hashCanonical({
+    kind: 'strict-producer-expression-set-v1',
+    knowledgeRootId: set.lineage.knowledgeRootId,
+    version: set.version,
+    parentSetId: set.parentSetId,
+  });
+  if (expectedSetId !== set.setId) {
+    fail('STRICT_PRODUCER_PARENT_SET_ID_MISMATCH');
+  }
+  if (
+    set.version < 1 ||
+    set.version > 3 ||
+    set.repairNode.semanticRepairDepth !== set.version - 1 ||
+    (set.version === 1) !== (set.parentSetId === null)
+  ) {
+    fail('STRICT_PRODUCER_PARENT_SET_DEPTH_MISMATCH');
+  }
+}
+
+function assertSameIds(actual: readonly string[], expected: readonly string[], code: string): void {
+  const left = normalizeIds(actual, `${code}:actual`);
+  const right = normalizeIds(expected, `${code}:expected`);
+  if (JSON.stringify(left) !== JSON.stringify(right)) {
+    fail(code);
+  }
+}
+
+function assertContainsIds(
+  actual: readonly string[],
+  expected: readonly string[],
+  code: string
+): void {
+  const available = new Set(normalizeIds(actual, `${code}:actual`));
+  if (normalizeIds(expected, `${code}:expected`).some((value) => !available.has(value))) {
+    fail(code);
   }
 }
 
@@ -722,6 +1122,10 @@ function hashCanonical(value: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(sortCanonical(value)))
     .digest('hex');
+}
+
+function hashCoreCanonical(value: unknown): string {
+  return `sha256:${hashCanonical(value)}`;
 }
 
 function sortCanonical(value: unknown): unknown {

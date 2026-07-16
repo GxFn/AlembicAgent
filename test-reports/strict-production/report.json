@@ -16,7 +16,7 @@
     "providerHash": "sha256:597ceb57e20cdded49d2ad4a40fded279a4a1d0dcfd68f1ced441452dd239ca1",
     "reviewerHash": "sha256:e539f52e8224430c574042cd975655c6f2f9bdc9f16952ef0890d5093fa02033",
     "configHash": "sha256:7cfc4e690f0e8df14507acbd02f7303942b4d10e9f0170aaa7021628067e2c61",
-    "goldenHash": "sha256:e475894de083ae65553294b7c5938fcaff4573adf29dfc7faa6607f40e4a706d"
+    "goldenHash": "sha256:90329055f7792e8ac7cb5252ee218a0cec0d1ca93686fa789623ebefeb421bac"
   },
   "loadedContracts": {
     "upstream": {
@@ -27,11 +27,11 @@
     "loadedCoreModuleSha256": "sha256:97aaf362365d12d06b063d9ca78f9173baaf818fcfc1587cd35e28fd6ed13441",
     "loadedAgentModuleSha256": {
       "plan": "sha256:000d67022956d0b4350f5448ce9006e37fa9818650fc378008aa3319c6b3eab2",
-      "pipeline": "sha256:1efe228cdf15a9c925d0ac8ce7f5005e29f5249e685c5a662b511adce0b97fcf",
-      "production": "sha256:a0a0e1d158296e8126cd7c5657e1f18b2450c831bc2b035c434f7536f10ecce3",
-      "productionStages": "sha256:69858dacb3e4f587c76911bf8991845d9c5c8ed0f6b6a722ce5bd6a7e2d2d668",
+      "pipeline": "sha256:bd13ba532baea53e6afecf34d22408939557acb19f9d45b01e9a2fd8d670f0c1",
+      "production": "sha256:d987e9584ece40531f6d6a2d72f65ae40db3504358da1642f702c7995e869ea2",
+      "productionStages": "sha256:423ede6cc51e381ef1f45b400699403dd4ac4d9ca101a5af6a5c1176021dc6be",
       "productionPrompts": "sha256:2674cf8851ec4ff7643bea84ccfceffc4c3429cb217ca00cce1471f4b792fbb0",
-      "reviewer": "sha256:e42c2d40266fb192b509889c94e13e771915e1988e473d4acf6ed7fc91b12d53"
+      "reviewer": "sha256:59046c7c6a6034ee524e70bc0a502dca618edb44edd1b3a363ae9d42fabd338b"
     },
     "agentEntrypoints": [
       "runStrictPlanAgent",
@@ -75,7 +75,7 @@
   },
   "cases": [
     {
-      "fixtureId": "alembic-workspace-normal",
+      "fixtureId": "alembic-workspace-single-file-value",
       "project": "AlembicWorkspace",
       "expectedProposalCardinality": 1,
       "expectedReviewVerdict": "pass",
@@ -86,33 +86,33 @@
         "Independent Reviewer"
       ],
       "plan": {
-        "receiptId": "plan-cognition-receipt-33a4feb59839759e044067f487f69f14763f019cf8ddb17d1261c1fd72e44bee",
-        "receiptHash": "sha256:96547bd4a22a86c06abac13a88f58f902ee5c4daed5c98097a7a407ed1dbf048",
+        "receiptId": "plan-cognition-receipt-e44103268182da1b0d7f1c9144cc4b0b0ebf082b9efa84267fab263abe91ffc3",
+        "receiptHash": "sha256:f036dfe85a1d638f162ec3cf5696cd6b6e3832ede1c9ee1699e99154cfafede6",
         "invocationCount": 2,
         "semanticRepairCount": 1,
         "toolCallCount": 0,
-        "fullScopeCount": 25
+        "fullScopeCount": 1
       },
       "analyst": {
         "expansionReceiptHashes": [
           "sha256:e824507fd168fa6cd2012cbf57336bf360a62053508e34d8bb01a89ff476ba30"
         ],
-        "populationHash": "sha256:90f35007a11c4193a84a70e2b5b73891185593400e44ee224baf58ad8ef28a0b",
-        "clusterSetHash": "sha256:8b23f524a95764f2e0327a96a6dc0d4c188d060ca6e7a4afb76f375b6ffcd66c",
+        "populationHash": "sha256:d3fe3063f8a45ba90b725863680b44ec00eb7ad4218b354785f2e38e12263c09",
+        "clusterSetHash": "sha256:3dfd574435ab07671d4506db9ad4a36a21b741b2ac7cb0aa3040ea2af9a43a07",
         "inductionReceiptHashes": [
-          "sha256:13db84b6b3e77999e47fed986f4588b587b18f7a082c4f3ab3b1251e56ce0510"
+          "sha256:9b4489d3d86c16e9fcf56b96840577484bcc023e1ed1a7799df3fe55ff36bff7"
         ],
         "falsificationReceiptHashes": [
-          "sha256:33cba16a04fb7830e562ed2b79065c185fc0856cd228217c468af730f49f6b6b"
+          "sha256:4bb82feef35343557492391a98390ba9cab60938ac5ed53b381e4d5c9790f2f3"
         ],
-        "fixpointHash": "sha256:aa9dccacae676f628c8bee4002754428d9f5e953fe6f37a69252ab861db4ae13",
+        "fixpointHash": "sha256:01a919ca58ee4a214e54e6e7f38c5166e1771712716bb0bbd95b12b44e1117c6",
         "producerEligibleHypothesisIds": [
-          "hypothesis-alembic-workspace-normal"
+          "hypothesis-alembic-workspace-single-file-value"
         ]
       },
       "producer": {
         "cardinality": 1,
-        "setHash": "72af41e054f8718cc7d3566b005ce7d5f221887c5aabe3e6e82179ab66d735d9",
+        "setHash": "60aa880c41be2953f4548ca77814552d6f865ae5c76f30689bc6cc596a33e9a7",
         "disposition": "proposal-only",
         "toolCallCount": 0,
         "persistenceCallCount": 0,
@@ -121,12 +121,23 @@
       "reviewer": {
         "verdict": "pass",
         "reasonCode": "all-value-axes-pass",
-        "decisionHash": "11773bd54bfe7796fa5de43e07ca56811fd9f9dce3005fe7c31f41bffff45b55",
-        "sourceRevisionVectorHash": "golden-alembic-source-vector-v1"
+        "decisionHash": "19dae67cc9f13a6c0bde0776d721e410e006eb9ffe29b97c86dfc572af9c6440",
+        "sourceRevisionVectorHash": "sha256:2daf7a2cdf7dd8ce082978cc72385269567dbd22c0337f3c946acc67466ace53"
+      },
+      "sourceEvidence": {
+        "sourceRevisionVectorHash": "sha256:2daf7a2cdf7dd8ce082978cc72385269567dbd22c0337f3c946acc67466ace53",
+        "loadedSources": [
+          {
+            "path": "src/agent/production/StrictProductionStages.ts",
+            "originRelativePath": "AlembicAgent/src/agent/production/StrictProductionStages.ts",
+            "sha256": "49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1",
+            "lineCount": 139
+          }
+        ]
       }
     },
     {
-      "fixtureId": "bilidili-investigated-empty",
+      "fixtureId": "bilidili-three-file-generic",
       "project": "BiliDili",
       "expectedProposalCardinality": 0,
       "expectedReviewVerdict": "pass",
@@ -137,22 +148,22 @@
         "Independent Reviewer"
       ],
       "plan": {
-        "receiptId": "plan-cognition-receipt-2e733d9f47887d9a7c75c568a03ff43f05d7d33826ea7b3397975ee8412f0ee6",
-        "receiptHash": "sha256:b240fa68a2f8d1de8988555d4d78dd2ebfcc10d8d321881b861ec7a7d48796aa",
+        "receiptId": "plan-cognition-receipt-4abbf6b6b79426411e326de496561b4eae676cc6c6b4d59984c886daf892ce7d",
+        "receiptHash": "sha256:3d9be2b9d3df6466c3a682bab6948b9e157ef5b211dc5ae2fe3793ffedcbec9b",
         "invocationCount": 1,
         "semanticRepairCount": 0,
         "toolCallCount": 0,
-        "fullScopeCount": 9
+        "fullScopeCount": 3
       },
       "analyst": {
         "expansionReceiptHashes": [],
-        "populationHash": "sha256:13ee50f70eb307cf51ff419ecd7cffadc61e45ff2aaf4dafd3ed1b65c3efdba9",
-        "clusterSetHash": "sha256:b1d30a8a257ad5f4a02246d657161927d03067ae804eb4478636b634bab7db00",
+        "populationHash": "sha256:7c5d31fb527ce8529eff4a58c83f93ff1aba01715a7cd77998308dd94beb5b23",
+        "clusterSetHash": "sha256:ab1c4d1eaa40f227569b549ffc738d78c6f4a5a84702ccfca248978a44841024",
         "inductionReceiptHashes": [
-          "sha256:ac5f43ede44e679fbf5e004fccc3f4e82b1af30d282f11980b674e25d3fd2d0b"
+          "sha256:9902e8b2a033a33a03d5fe9ee6c22ed885ce226dc482b9a3f213fae54e009e7c"
         ],
         "falsificationReceiptHashes": [],
-        "fixpointHash": "sha256:6859e3f3987e5e40f4b13d20e0db7c38b56cf16c76479faaf28ea59224c7a0dc",
+        "fixpointHash": "sha256:73089899511dbe2e65f72633b99c02a828c34416e9b3aa55cfec7d7d6c0a2ee8",
         "producerEligibleHypothesisIds": []
       },
       "producer": {
@@ -167,10 +178,33 @@
         "verdict": "pass",
         "reasonCode": "complete-denominator-investigated-empty",
         "decisionHash": "0ed6ce89f397a08185f78cf9a94270815d124eb1da096a81b337b9fa57c10114",
-        "sourceRevisionVectorHash": "golden-bilidili-source-vector-v1"
+        "sourceRevisionVectorHash": "sha256:98a5c01eeedd0e603ebee2fee59091d2756e17a15c8c9686e9f8912dda94adff"
+      },
+      "sourceEvidence": {
+        "sourceRevisionVectorHash": "sha256:98a5c01eeedd0e603ebee2fee59091d2756e17a15c8c9686e9f8912dda94adff",
+        "loadedSources": [
+          {
+            "path": "BiliDili/Assets.xcassets/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/Contents.json",
+            "sha256": "0fd49ba3c3585c709678e0046a821c3c60685ec7063720d30d3a3448be3a208b",
+            "lineCount": 7
+          },
+          {
+            "path": "BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/AccentColor.colorset/Contents.json",
+            "sha256": "9af65086fa30b49252fae1a1225731691de794f7775af74d71befeb507d12b7c",
+            "lineCount": 12
+          },
+          {
+            "path": "BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+            "originRelativePath": "BiliDili/BiliDili/Assets.xcassets/LaunchScreenImage.imageset/Contents.json",
+            "sha256": "666d8e2b908c9d43a18e9243acb0d6d9793609591661a8c964d39290052ee2ea",
+            "lineCount": 68
+          }
+        ]
       }
     }
   ],
   "passed": true,
-  "reportHash": "sha256:838fcc38156e0253bc66480d83402f5cf15f95e1a99367088700ec591a6c3353"
+  "reportHash": "sha256:28cb0b6a6e10c40d574cff4eb8a8afa3eb69b9f732b29e1de3a3cdf7a8698a58"
 }

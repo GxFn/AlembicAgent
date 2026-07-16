@@ -35,10 +35,11 @@ const { runStrictPlanAgent } = await import(
   path.join(root, 'dist/agent/runs/plan/PlanAgentRun.js')
 );
 const {
-  createCausalRepairNodeV1,
+  createStrictAnalysisContextProjectionV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
   createStrictProducerExpressionSetV1,
+  createStrictProducerLineageReceiptV1,
   validateStrictAnalystEpochV1,
 } = await import(path.join(root, 'dist/agent/production/StrictProductionPipeline.js'));
 const { IndependentValueReviewer, computeJudgeCalibration, createFrozenEvidenceProjection } =
@@ -66,7 +67,7 @@ const config = {
 
 const cases = [];
 for (const fixture of golden.cases) {
-  cases.push(await runFixture(fixture));
+  cases.push(await runFixture(loadSourceFixture(fixture)));
 }
 
 const calibrationRecords = [
@@ -293,6 +294,10 @@ async function runFixture(fixture) {
       decisionHash: reviewer.decisionHash,
       sourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
     },
+    sourceEvidence: {
+      sourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
+      loadedSources: fixture.loadedSources.map(({ content: _content, ...source }) => source),
+    },
   };
 }
 
@@ -501,49 +506,77 @@ function emptyEpoch(fixture, port) {
 }
 
 function produceNormal(fixture, epoch, fixpoint) {
-  const rootNode = createCausalRepairNodeV1({
-    nodeId: `producer-root-${fixture.id}`,
-    rootIds: [`hypothesis-${fixture.id}`],
-    parents: [],
-    stage: 'producer',
-    inputHash: fixpoint.fixpointHash,
-    outputHash: `output-${fixture.id}`,
-    evidenceHash: `evidence-${fixture.id}`,
-    modelHash: hash(providerIdentity),
-    reasonHash: 'initial-authoring',
+  const evidence = createFrozenEvidenceProjection({
+    sourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
+    entries: fixture.loadedSources.map((source, index) => ({
+      evidenceEntryId: `E-${index + 1}`,
+      relativePath: source.path,
+      blobHash: source.sha256,
+      contentHash: sha256(source.content),
+      startLine: 1,
+      endLine: source.lineCount,
+      content: source.content,
+    })),
   });
-  return createStrictProducerExpressionSetV1({
-    setId: `expression-set-${fixture.id}`,
-    hypothesis: epoch.producerEligibleHypotheses[0],
+  const strictContext = createStrictAnalysisContextProjectionV1({
+    runId: `strict-eval-${fixture.id}`,
+    journalId: `strict-eval-journal-${fixture.id}`,
+    manifestHash: hash({ fixture: fixture.id, sources: fixture.loadedSources }),
+    planCognitionHash: hash({ fixture: fixture.id, cognition: 'frozen' }),
+    planHash: hash({ fixture: fixture.id, plan: 'frozen' }),
+    requiredUniverseHash: hash(fixture.loadedSources.map((source) => source.path)),
+    baselineScheduleHash: `baseline-${fixture.id}`,
+    expansionHeadHash: null,
+    currentExpandedScheduleHash: fixpoint.finalExpandedScheduleHash,
+    finalExpandedScheduleHash: fixpoint.finalExpandedScheduleHash,
     analysisFixpointHash: fixpoint.fixpointHash,
-    version: 1,
-    parentSetId: null,
+    privateCorpusRevision: null,
+    hypothesisExpressionSetHash: null,
+    lensBindingsHash: hash({ fixture: fixture.id, lens: 'structure-and-boundary' }),
+    sourceArtifactHash: hash({ fixture: fixture.id, artifact: fixture.loadedSources }),
+    sourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
+    questionIds: ['q-root'],
+    factQueryObligationIds: fixpoint.terminalObligations.map((row) => row.obligationId),
+    analysisUnitIds: epoch.population.observations.map((row) => row.observationId),
+    factIds: epoch.population.observations.flatMap((row) => row.factIds),
+    witnessIds: epoch.population.observations.map((row) => `witness-${row.observationId}`),
+    populationHashes: [epoch.population.populationHash],
+    clusterSetHashes: [epoch.clusterSet.clusterSetHash],
+    inductionReceiptHashes: epoch.inductions.map((row) => row.receiptHash),
+    hypothesisIds: epoch.producerEligibleHypotheses.map((row) => row.hypothesisId),
+    falsificationReceiptHashes: epoch.falsifications.map((row) => row.receiptHash),
+    dispositionReviewIds: epoch.hypothesisDispositions.map((row) => row.reviewerReceiptId),
+    evidenceEntryIds: evidence.entries.map((row) => row.evidenceEntryId),
+    derivedFindingCount: 0,
+  });
+  const lineage = createStrictProducerLineageReceiptV1({
+    context: strictContext,
+    epoch,
+    analysisFixpoint: fixpoint,
+    hypothesisId: epoch.producerEligibleHypotheses[0].hypothesisId,
+    evidence,
+  });
+  const expressionSet = createStrictProducerExpressionSetV1({
+    lineage,
+    parentSet: null,
     proposals: [
       {
         expressionId: `expression-${fixture.id}`,
         kind: 'draft',
-        authored: authoredProjection(fixture),
+        authored: authoredProjection(
+          fixture,
+          evidence.entries.map((row) => row.evidenceEntryId)
+        ),
       },
     ],
     zeroDisposition: null,
-    repairNode: rootNode,
+    modelHash: hash(providerIdentity),
+    reasonHash: hash({ reason: 'initial-authoring' }),
   });
+  return { ...expressionSet, expressionSet, evidence };
 }
 
 async function reviewNormal(fixture, producer) {
-  const content = '1|export function boundary() {\n2|  return projectSpecificContract();\n3|}';
-  const evidence = createFrozenEvidenceProjection({
-    sourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
-    entries: ['E-1', 'E-2'].map((evidenceEntryId, index) => ({
-      evidenceEntryId,
-      relativePath: `src/boundary-${index + 1}.ts`,
-      blobHash: `blob-${fixture.id}-${index + 1}`,
-      contentHash: sha256(content),
-      startLine: 1,
-      endLine: 3,
-      content,
-    })),
-  });
   const reviewer = new IndependentValueReviewer({
     identity: reviewerIdentity,
     chat: async () =>
@@ -560,16 +593,16 @@ async function reviewNormal(fixture, producer) {
           verdict: 'pass',
           score: 2,
           reasonCode: 'golden-supported',
-          evidenceEntryIds: ['E-1', 'E-2'],
+          evidenceEntryIds: producer.evidence.entries.map((row) => row.evidenceEntryId),
         })),
         noveltyDecision: 'novel-project-specific',
         duplicateDecision: 'no-match',
-        citedLines: ['src/boundary-1.ts:2', 'src/boundary-2.ts:2'],
+        citedLines: producer.evidence.entries.map((row) => `${row.relativePath}:1`),
       }),
   });
   return reviewer.review({
     authored: producer.proposals[0].authored,
-    evidence,
+    evidence: producer.evidence,
     expectedSourceRevisionVectorHash: fixture.sourceRevisionVectorHash,
     producerIdentity: `${providerIdentity.provider}/${providerIdentity.model}`,
     admissionReceiptId: `admission-${fixture.id}`,
@@ -578,7 +611,7 @@ async function reviewNormal(fixture, producer) {
   });
 }
 
-function authoredProjection(fixture) {
+function authoredProjection(fixture, evidenceEntryIds) {
   return {
     title: `${fixture.project} preserves a project-specific boundary`,
     kind: 'rule',
@@ -589,7 +622,29 @@ function authoredProjection(fixture) {
     retrievalProfile: { intents: ['project production boundary'] },
     negativeIntent: ['generic language syntax'],
     scope: { moduleIds: ['production'], dimensionIds: ['architecture'] },
-    evidenceEntryIds: ['E-1', 'E-2'],
+    evidenceEntryIds,
+  };
+}
+
+function loadSourceFixture(fixture) {
+  const fixtureRoot = path.resolve(path.dirname(goldenPath), fixture.fixturePath);
+  const loadedSources = fixture.sourceFiles.map((source) => {
+    const content = readFileSync(path.join(fixtureRoot, source.path), 'utf8');
+    const actualSha256 = sha256(content);
+    if (actualSha256 !== source.sha256) {
+      throw new Error(`STRICT_FIXTURE_SOURCE_HASH_MISMATCH:${source.path}`);
+    }
+    return {
+      ...source,
+      content,
+      lineCount: content.split('\n').length,
+    };
+  });
+  return {
+    ...fixture,
+    loadedSources,
+    scopeCount: loadedSources.length,
+    sourceRevisionVectorHash: hash(loadedSources.map(({ content: _content, ...source }) => source)),
   };
 }
 

@@ -2,7 +2,7 @@
  * P0-2/P0-3(挖掘质量升级)：eval harness 确定性核心 + Judge 机械面的单测。
  * LLM 调用不在此测(judge.chat 注入 fake)；真实 Tier-B 由 `npm run eval:mining` 手动跑。
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -15,15 +15,20 @@ import {
   renderReportMarkdown,
   scoreFixture,
 } from '../scripts/lib/mining-eval-core.mjs';
-// @ts-expect-error — 同上。
 import {
+  assertFrozenJudgeModelLoadReceiptV1,
   buildJudgePrompt,
   computeJudgeCalibration,
+  createFrozenJudgeModelLoadReceiptV1,
   judgeCandidate,
   parseJudgeVerdict,
   sliceEvidenceForJudge,
   verifyJudgeCitations,
-} from '../scripts/lib/mining-judge.mjs';
+} from '../src/agent/evaluation/MiningJudge.js';
+import {
+  createStrictProductionSourceFixtureRuntimeV1,
+  FrozenStrictProductionEvaluationProviderV1,
+} from '../src/agent/evaluation/StrictProductionFixtureEvaluation.js';
 
 const tempRoots: string[] = [];
 afterAll(() => {
@@ -312,5 +317,93 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
         '{"entailment":"entailed","trivial":false,"actionable":true,"scopeCorrect":true,"verdict":"uphold","citedLines":["file.ts:99"],"reason":"fabricated line"}',
     });
     expect(bad).toMatchObject({ verdict: 'uphold', invalidCitation: true });
+  });
+
+  it('freezes and verifies an explicit judge model load receipt', () => {
+    const input = {
+      selectionMode: 'explicit' as const,
+      requestedProvider: 'frozen-provider',
+      requestedModel: 'frozen-judge-v1',
+      resolvedProvider: 'frozen-provider',
+      resolvedModel: 'frozen-judge-v1',
+      temperature: 0,
+      maxTokens: 800,
+      implementationModuleSha256: 'a'.repeat(64),
+    };
+    const receipt = createFrozenJudgeModelLoadReceiptV1(input);
+    expect(receipt.receiptHash).toMatch(/^sha256:[a-f0-9]{64}$/u);
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(createFrozenJudgeModelLoadReceiptV1(input)).toEqual(receipt);
+    expect(() =>
+      assertFrozenJudgeModelLoadReceiptV1(receipt, {
+        resolvedProvider: 'frozen-provider',
+        resolvedModel: 'drifted-model',
+      })
+    ).toThrow(/JUDGE_MODEL_SELECTION_DRIFT/u);
+    expect(() =>
+      createFrozenJudgeModelLoadReceiptV1({
+        ...input,
+        requestedModel: 'requested-model',
+      })
+    ).toThrow(/JUDGE_MODEL_EXPLICIT_RESOLUTION_MISMATCH/u);
+  });
+
+  it('routes both evaluator scripts through the built production judge module', () => {
+    for (const relativePath of ['scripts/eval-mining.mjs', 'scripts/eval-judge-calibration.mjs']) {
+      const source = readFileSync(join(process.cwd(), relativePath), 'utf8');
+      expect(source).toContain('dist/agent/evaluation/MiningJudge.js');
+      expect(source).not.toContain("from './lib/mining-judge.mjs'");
+    }
+    expect(
+      readFileSync(join(process.cwd(), 'scripts/eval-judge-calibration.mjs'), 'utf8')
+    ).toContain("args['judge-model']");
+  });
+
+  it('hash-verifies executable source fixtures before the frozen strict runtime can emit', async () => {
+    const fixtureRoot = join(
+      process.cwd(),
+      'test/fixtures/strict-production/projects/alembic-workspace-single-file'
+    );
+    const fixture = {
+      id: 'single-file-value',
+      project: 'AlembicWorkspace',
+      expectedDisposition: 'single-file-value' as const,
+      sourceFiles: [
+        {
+          path: 'src/agent/production/StrictProductionStages.ts',
+          originRelativePath: 'AlembicAgent/src/agent/production/StrictProductionStages.ts',
+          sha256: '49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1',
+        },
+      ],
+    };
+    const provider = new FrozenStrictProductionEvaluationProviderV1();
+    const evaluation = createStrictProductionSourceFixtureRuntimeV1({
+      fixture,
+      projectRoot: fixtureRoot,
+      provider,
+    });
+    const analyst = await provider.chatWithTools(
+      `strict cold-start Analyst\n${readFileSync(join(fixtureRoot, fixture.sourceFiles[0].path), 'utf8')}`
+    );
+    evaluation.runtimePort.validateAnalystResult({ reply: analyst.text });
+    const producer = await provider.chatWithTools(
+      'strict cold-start Producer\n{"disposition":"single-file-value"}'
+    );
+    evaluation.runtimePort.reviewProducerResult({ reply: producer.text });
+    expect(evaluation.capturedCandidates).toHaveLength(1);
+    expect(evaluation.loadedSources[0]?.sha256).toBe(fixture.sourceFiles[0]?.sha256);
+    expect(provider.networkRequestCount).toBe(0);
+    expect(provider.apiKeyReadCount).toBe(0);
+
+    expect(() =>
+      createStrictProductionSourceFixtureRuntimeV1({
+        fixture: {
+          ...fixture,
+          sourceFiles: [{ ...fixture.sourceFiles[0], sha256: '0'.repeat(64) }],
+        },
+        projectRoot: fixtureRoot,
+        provider,
+      })
+    ).toThrow(/STRICT_FIXTURE_SOURCE_HASH_MISMATCH/u);
   });
 });

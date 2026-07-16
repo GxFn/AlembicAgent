@@ -18,6 +18,7 @@
  *
  * key 来源：ALEMBIC_DEEPSEEK_API_KEY(或 autoDetectProvider 支持的其它 env)；ollama 免 key。
  */
+import { createHash } from 'node:crypto';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -28,7 +29,6 @@ import {
   renderReportMarkdown,
   scoreFixture,
 } from './lib/mining-eval-core.mjs';
-import { judgeCandidate } from './lib/mining-judge.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -42,6 +42,8 @@ for (const required of [
   'dist/tools/runtime/adapter/RuntimeCapabilityCatalog.js',
   'dist/ai/AiFactory.js',
   'dist/agent/runs/module-mining/ScopedModuleMiningAgentRun.js',
+  'dist/agent/evaluation/MiningJudge.js',
+  'dist/agent/evaluation/StrictProductionFixtureEvaluation.js',
 ]) {
   try {
     readFileSync(path.join(repoRoot, required));
@@ -73,12 +75,20 @@ const { createProvider, autoDetectProvider } = await import(
 const { runScopedModuleMining } = await import(
   path.join(repoRoot, 'dist/agent/runs/module-mining/ScopedModuleMiningAgentRun.js')
 );
+const { assertFrozenJudgeModelLoadReceiptV1, createFrozenJudgeModelLoadReceiptV1, judgeCandidate } =
+  await import(path.join(repoRoot, 'dist/agent/evaluation/MiningJudge.js'));
+const { FrozenStrictProductionEvaluationProviderV1, createStrictProductionSourceFixtureRuntimeV1 } =
+  await import(path.join(repoRoot, 'dist/agent/evaluation/StrictProductionFixtureEvaluation.js'));
 
 const args = parseArgs(process.argv.slice(2));
 const goldenPath = path.resolve(repoRoot, args.golden || 'test/fixtures/mining-eval/golden.json');
-const golden = JSON.parse(readFileSync(goldenPath, 'utf8'));
+const goldenBytes = readFileSync(goldenPath);
+const golden = JSON.parse(goldenBytes.toString('utf8'));
 const budgetTokens = Number(args['budget-tokens'] || 2_000_000);
-const startedAt = new Date().toISOString();
+const startedAt =
+  typeof args['frozen-started-at'] === 'string'
+    ? args['frozen-started-at']
+    : new Date().toISOString();
 const outDir = path.resolve(
   repoRoot,
   args.out || path.join('test-reports', 'mining-eval', startedAt.slice(0, 19).replaceAll(':', '-'))
@@ -96,12 +106,15 @@ if (typeof args['judge-model'] === 'string' && typeof args['judge-provider'] !==
   console.error('[eval:mining] --judge-model requires an explicit --judge-provider.');
   process.exit(1);
 }
-const provider = args.provider
-  ? createProvider({
-      provider: args.provider,
-      ...(typeof args.model === 'string' ? { model: args.model } : {}),
-    })
-  : autoDetectProvider();
+const provider =
+  args.provider === 'frozen-fixture'
+    ? new FrozenStrictProductionEvaluationProviderV1()
+    : args.provider
+      ? createProvider({
+          provider: args.provider,
+          ...(typeof args.model === 'string' ? { model: args.model } : {}),
+        })
+      : autoDetectProvider();
 if (!provider) {
   console.error(
     '[eval:mining] no AI provider available — set ALEMBIC_DEEPSEEK_API_KEY (or pass --provider ollama with a local ollama).'
@@ -110,17 +123,48 @@ if (!provider) {
 }
 const judgeEnabled = args.judge === true || typeof args['judge-provider'] === 'string';
 const judgeProvider = judgeEnabled
-  ? args['judge-provider']
-    ? createProvider({
-        provider: args['judge-provider'],
-        ...(typeof args['judge-model'] === 'string' ? { model: args['judge-model'] } : {}),
-      })
-    : provider
+  ? args['judge-provider'] === 'frozen-fixture'
+    ? new FrozenStrictProductionEvaluationProviderV1()
+    : args['judge-provider']
+      ? createProvider({
+          provider: args['judge-provider'],
+          ...(typeof args['judge-model'] === 'string' ? { model: args['judge-model'] } : {}),
+        })
+      : provider
+  : null;
+const judgeImplementationModuleSha256 = sha256(
+  readFileSync(path.join(repoRoot, 'dist/agent/evaluation/MiningJudge.js'))
+);
+const judgeModelLoadReceipt = judgeEnabled
+  ? createFrozenJudgeModelLoadReceiptV1({
+      selectionMode:
+        typeof args['judge-provider'] === 'string' && typeof args['judge-model'] === 'string'
+          ? 'explicit'
+          : typeof args['judge-provider'] === 'string'
+            ? 'auto-detected'
+            : 'producer-reuse',
+      requestedProvider:
+        typeof args['judge-provider'] === 'string' ? args['judge-provider'] : provider.name,
+      requestedModel:
+        typeof args['judge-model'] === 'string'
+          ? args['judge-model']
+          : typeof args['judge-provider'] === 'string'
+            ? null
+            : provider.model,
+      resolvedProvider: judgeProvider.name,
+      resolvedModel: judgeProvider.model,
+      temperature: 0,
+      maxTokens: 800,
+      implementationModuleSha256: judgeImplementationModuleSha256,
+    })
   : null;
 
 console.log(
   `[eval:mining] provider=${provider.name}/${provider.model}${judgeEnabled ? ` judge=${judgeProvider.name}/${judgeProvider.model}` : ''} budgetTokens=${budgetTokens}`
 );
+if (judgeModelLoadReceipt) {
+  console.log(`[eval:mining] judgeModelLoadReceipt=${judgeModelLoadReceipt.receiptHash}`);
+}
 
 const tempRoots = [];
 const fixtureResults = [];
@@ -131,7 +175,7 @@ const notes = [
 let usedTokens = 0;
 
 try {
-  for (const fixture of golden.fixtures) {
+  for (const fixture of golden.fixtures || golden.cases || []) {
     if (usedTokens >= budgetTokens) {
       notes.push(
         `budget-tokens 用尽(${usedTokens}/${budgetTokens})，fixture "${fixture.id}" 及之后被跳过。`
@@ -151,13 +195,39 @@ try {
   }
 }
 
-const report = buildReport({
-  startedAt,
-  provider: `${provider.name}/${provider.model}`,
-  judgeProvider: judgeEnabled ? `${judgeProvider.name}/${judgeProvider.model}` : null,
-  fixtureResults,
-  notes,
-});
+if (judgeModelLoadReceipt) {
+  assertFrozenJudgeModelLoadReceiptV1(judgeModelLoadReceipt, {
+    resolvedProvider: judgeProvider.name,
+    resolvedModel: judgeProvider.model,
+  });
+}
+const report = {
+  ...buildReport({
+    startedAt,
+    provider: `${provider.name}/${provider.model}`,
+    judgeProvider: judgeEnabled ? `${judgeProvider.name}/${judgeProvider.model}` : null,
+    fixtureResults,
+    notes,
+  }),
+  judgeModelLoadReceipt,
+  evaluationReceipts: {
+    goldenSha256: sha256(goldenBytes),
+    configSha256: sha256(
+      JSON.stringify({ budgetTokens, judgeEnabled, startedAt, fixtureCount: fixtureResults.length })
+    ),
+    providerSha256: sha256(JSON.stringify({ provider: provider.name, model: provider.model })),
+    judgeProviderSha256: judgeProvider
+      ? sha256(JSON.stringify({ provider: judgeProvider.name, model: judgeProvider.model }))
+      : null,
+    negativeResults: fixtureResults
+      .filter((entry) => entry.expectedCandidateCount === 0)
+      .map((entry) => ({
+        fixtureId: entry.fixtureId,
+        candidateCount: entry.score.candidateCount,
+        passed: entry.score.candidateCount === 0,
+      })),
+  },
+};
 mkdirSync(outDir, { recursive: true });
 writeFileSync(path.join(outDir, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
 writeFileSync(path.join(outDir, 'report.md'), `${renderReportMarkdown(report)}\n`);
@@ -178,6 +248,14 @@ async function runFixture(fixture) {
   });
   const dataRoot = mkdtempSync(path.join(tmpdir(), `mining-eval-data-${fixture.id}-`));
   tempRoots.push(dataRoot);
+
+  const strictEvaluation = fixture.expectedDisposition
+    ? createStrictProductionSourceFixtureRuntimeV1({
+        fixture,
+        projectRoot: fixtureRoot,
+        provider,
+      })
+    : null;
 
   const created = [];
   const gateway = {
@@ -234,7 +312,18 @@ async function runFixture(fixture) {
   });
 
   const childContexts = {};
-  for (const moduleInput of fixture.modules) {
+  const modules = fixture.modules.map((moduleInput) =>
+    strictEvaluation
+      ? {
+          ...moduleInput,
+          strategyContext: {
+            ...(moduleInput.strategyContext || {}),
+            strictProduction: strictEvaluation.runtimePort,
+          },
+        }
+      : moduleInput
+  );
+  for (const moduleInput of modules) {
     childContexts[moduleInput.moduleId] = { systemRunContext };
   }
   const budget = fixture.budget || { analystTokens: 12_000, totalRecipeBudget: 6 };
@@ -251,12 +340,15 @@ async function runFixture(fixture) {
           context: { ...(request.context || {}), childContexts },
         }),
     },
-    modules: fixture.modules,
+    modules,
     projectFacts: fixture.projectFacts || { project: fixture.id },
     budget,
   });
 
   const observations = collectRunObservations(runResult);
+  if (strictEvaluation) {
+    created.push(...strictEvaluation.capturedCandidates);
+  }
   let judgeVerdicts = null;
   if (judgeEnabled && created.length > 0) {
     judgeVerdicts = [];
@@ -285,10 +377,23 @@ async function runFixture(fixture) {
 
   return {
     fixtureId: fixture.id,
+    expectedCandidateCount: strictEvaluation?.expectedCandidateCount ?? null,
     score: scoreFixture({ fixture, candidates: created, judgeVerdicts }),
     candidates: created,
     judgeVerdicts,
     observations,
+    sourceEvidence: strictEvaluation
+      ? {
+          sourceRevisionVectorHash: strictEvaluation.sourceRevisionVectorHash,
+          providerIdentity: strictEvaluation.providerIdentity,
+          loadedSources: strictEvaluation.loadedSources.map(
+            ({ content: _content, evidenceEntryId: _evidenceEntryId, ...source }) => source
+          ),
+          routeReceipts: Object.values(runResult.phases?.moduleResults || {}).map(
+            (child) => child?.phases?._strictRoleRouteReceipt || null
+          ),
+        }
+      : null,
   };
 }
 
@@ -313,4 +418,8 @@ function parseArgs(argv) {
 
 function pct(value) {
   return value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`;
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
 }

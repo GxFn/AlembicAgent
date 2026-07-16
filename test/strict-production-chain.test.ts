@@ -10,11 +10,9 @@ import {
 import { InvestigatedEmptyReviewer } from '../src/agent/evaluation/InvestigatedEmptyReviewer.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import {
-  createCausalRepairNodeV1,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
-  createStrictProducerExpressionSetV1,
   validateStrictAnalystEpochV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
 import {
@@ -426,114 +424,21 @@ const authored = {
 };
 
 describe('strict Producer and causal repair', () => {
-  it('supports typed 0/1/N proposals and refuses a third content-changing repair', () => {
-    const root = createCausalRepairNodeV1({
-      nodeId: 'root',
-      rootIds: ['knowledge-root'],
-      parents: [],
-      stage: 'producer',
-      inputHash: 'i0',
-      outputHash: 'o0',
-      evidenceHash: 'e0',
-      modelHash: 'm0',
-      reasonHash: 'r0',
-    });
-    const repair1 = createCausalRepairNodeV1({
-      nodeId: 'repair-1',
-      rootIds: ['knowledge-root'],
-      parents: [root],
-      stage: 'producer',
-      inputHash: 'i1',
-      outputHash: 'o1',
-      evidenceHash: 'e1',
-      modelHash: 'm1',
-      reasonHash: 'r1',
-    });
-    const repair2 = createCausalRepairNodeV1({
-      nodeId: 'repair-2',
-      rootIds: ['knowledge-root'],
-      parents: [repair1],
-      stage: 'producer',
-      inputHash: 'i2',
-      outputHash: 'o2',
-      evidenceHash: 'e2',
-      modelHash: 'm2',
-      reasonHash: 'r2',
-    });
-    expect(repair2.semanticRepairDepth).toBe(2);
-    expect(() =>
-      createCausalRepairNodeV1({
-        nodeId: 'repair-3',
-        rootIds: ['knowledge-root'],
-        parents: [repair2],
-        stage: 'producer',
-        inputHash: 'i3',
-        outputHash: 'o3',
-        evidenceHash: 'e3',
-        modelHash: 'm3',
-        reasonHash: 'r3',
-      })
-    ).toThrow(/STRICT_CAUSAL_REPAIR_LIMIT/u);
-
-    const one = createStrictProducerExpressionSetV1({
-      setId: 'set-1',
-      hypothesis: {
-        hypothesisId: 'hypothesis-1',
-        statement: 's',
-        premiseFactIds: ['fact-a'],
-        status: 'survived',
-        reviewerReceiptId: 'review-1',
-      },
-      analysisFixpointHash: 'fixpoint-1',
-      version: 1,
-      parentSetId: null,
-      proposals: [{ expressionId: 'expression-1', kind: 'draft', authored }],
-      zeroDisposition: null,
-      repairNode: root,
-    });
-    const zero = createStrictProducerExpressionSetV1({
-      setId: 'set-zero',
-      hypothesis: {
-        hypothesisId: 'hypothesis-zero',
-        statement: 's0',
-        premiseFactIds: ['fact-b'],
-        status: 'narrowed',
-        reviewerReceiptId: 'review-2',
-        causalParentHypothesisId: 'hypothesis-old',
-      },
-      analysisFixpointHash: 'fixpoint-1',
-      version: 1,
-      parentSetId: null,
-      proposals: [],
-      zeroDisposition: {
-        reasonCode: 'not-actionable-as-recipe',
-        authored,
-        reviewerReceiptId: 'review-zero',
-      },
-      repairNode: root,
-    });
-    expect(one.cardinality).toBe(1);
-    expect(zero.cardinality).toBe(0);
-
-    const many = createStrictProducerExpressionSetV1({
-      ...one,
-      setId: 'set-many',
-      proposals: [
-        { expressionId: 'expression-1', kind: 'draft', authored },
-        { expressionId: 'expression-2', kind: 'draft', authored },
-      ],
-    });
-    expect(many.cardinality).toBe(2);
-
+  it('keeps strict Producer proposal-only and removes every floor/filler tool path', () => {
     expect(new GenerateProduce({ strictColdStart: true }).allowedTools).toEqual({});
     expect(new ScanProduce({ strictColdStart: true }).allowedTools).toEqual({});
-    expect(buildStrictProducerPrompt(one)).not.toMatch(
+    const expressionSet = {
+      hypothesis: { hypothesisId: 'hypothesis-1' },
+      proposals: [{ expressionId: 'expression-1', kind: 'draft', authored }],
+      zeroDisposition: null,
+    };
+    expect(buildStrictProducerPrompt(expressionSet)).not.toMatch(
       /knowledge\.submit|targetRecipes|min(?:imum)?\s*3/iu
     );
     expect(buildStrictAnalystPrompt({ context: strictContext, populations: [] })).toContain(
       'counterquery'
     );
-    const strictPrompts = `${buildStrictProducerPrompt(one)}\n${buildStrictAnalystPrompt({ context: strictContext, populations: [] })}`;
+    const strictPrompts = `${buildStrictProducerPrompt(expressionSet)}\n${buildStrictAnalystPrompt({ context: strictContext, populations: [] })}`;
     expect(strictPrompts).toMatch(/no candidate floor.*filler|do not add filler/isu);
     expect(strictPrompts).not.toMatch(/at least\s+\d+\s+(?:candidate|proposal)|targetRecipes/iu);
   });
@@ -547,7 +452,9 @@ describe('strict PipelineStrategy', () => {
   } as AgentMessage;
 
   it('blocks Producer submit/review/persist tools at the existing production strategy boundary', async () => {
-    const strategy = new PipelineStrategy({ stages: [{ name: 'produce' }] });
+    const strategy = new PipelineStrategy({
+      stages: [{ name: 'produce', strictRoleSurface: 'strict-producer-v1' }],
+    });
     const runtime = {
       id: 'strict-runtime',
       reactLoop: async () => ({
@@ -567,7 +474,7 @@ describe('strict PipelineStrategy', () => {
   it('turns a strict non-pass into a typed failed owner/resume return and never degrades to success', async () => {
     const strategy = new PipelineStrategy({
       stages: [
-        { name: 'analyze' },
+        { name: 'analyze', strictRoleSurface: 'strict-analyst-v1' },
         {
           name: 'quality_gate',
           source: 'analyze',
@@ -582,7 +489,7 @@ describe('strict PipelineStrategy', () => {
             },
           },
         },
-        { name: 'produce' },
+        { name: 'produce', strictRoleSurface: 'strict-producer-v1' },
       ],
     });
     let calls = 0;
@@ -609,7 +516,9 @@ describe('strict PipelineStrategy', () => {
   });
 
   it('rejects an Analyst query that did not pass the expansion enrollment port', async () => {
-    const strategy = new PipelineStrategy({ stages: [{ name: 'analyze' }] });
+    const strategy = new PipelineStrategy({
+      stages: [{ name: 'analyze', strictRoleSurface: 'strict-analyst-v1' }],
+    });
     const runtime = {
       id: 'strict-runtime',
       reactLoop: async () => ({
@@ -632,6 +541,29 @@ describe('strict PipelineStrategy', () => {
         strategyContext: { strictProduction: { enabled: true, context: strictContext } },
       })
     ).rejects.toThrow(/STRICT_ANALYSIS_QUERY_UNENROLLED/u);
+  });
+
+  it('fails before any model call when a strict run receives a legacy role stage', async () => {
+    let calls = 0;
+    const strategy = new PipelineStrategy({ stages: [{ name: 'analyze' }] });
+    const runtime = {
+      id: 'legacy-runtime',
+      reactLoop: async () => {
+        calls += 1;
+        return {
+          reply: 'legacy analyst reply',
+          toolCalls: [],
+          tokenUsage: { input: 1, output: 1 },
+          iterations: 1,
+        };
+      },
+    };
+    await expect(
+      strategy.execute(runtime, message, {
+        strategyContext: { strictProduction: { enabled: true, context: strictContext } },
+      })
+    ).rejects.toThrow(/STRICT_PRODUCTION_STAGE_ROUTE_REQUIRED:analyze/u);
+    expect(calls).toBe(0);
   });
 
   it('routes the real generateDimensionPipeline factory through the existing strict stage chain', async () => {
@@ -668,6 +600,10 @@ describe('strict PipelineStrategy', () => {
     expect(
       stages.filter((stage) => !stage.gate).every((stage) => stage.capabilities?.length === 0)
     ).toBe(true);
+    expect(stages.filter((stage) => !stage.gate).map((stage) => stage.strictRoleSurface)).toEqual([
+      'strict-analyst-v1',
+      'strict-producer-v1',
+    ]);
 
     const strategy = new PipelineStrategy({ stages });
     const runtime = {
@@ -690,6 +626,13 @@ describe('strict PipelineStrategy', () => {
       expect.objectContaining({ gate: 'G1', verdict: 'pass' }),
       expect.objectContaining({ gate: 'G2', verdict: 'pass' }),
     ]);
+    expect(output.phases._strictRoleRouteReceipt).toEqual({
+      kind: 'StrictRoleRouteReceiptV1',
+      strictAnalystCalls: 1,
+      strictProducerCalls: 1,
+      legacyAnalystCalls: 0,
+      legacyProducerCalls: 0,
+    });
     expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain('counterquery');
     expect(prompts[1]).toContain('proposal expressions');

@@ -5,6 +5,7 @@
       "src/**",
       "scripts/**",
       "test/**",
+      "!!test/fixtures/strict-production/projects/**",
       "*.js",
       "*.mjs",
       "*.cjs",

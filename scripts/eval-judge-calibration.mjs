@@ -17,12 +17,12 @@
  * 导出来源：staging 复核队列(Core/Agent/主体 HTTP 三读面之一)人工决策 + 快照当时的候选原文。
  *
  * 用法：
- *   npm run build && node scripts/eval-judge-calibration.mjs --input <export.json> [--judge-provider deepseek|ollama] [--out <dir>]
+ *   npm run build && node scripts/eval-judge-calibration.mjs --input <export.json> [--judge-provider deepseek|ollama --judge-model <model>] [--out <dir>]
  */
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { computeJudgeCalibration, judgeCandidate } from './lib/mining-judge.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const args = parseArgs(process.argv.slice(2));
@@ -32,21 +32,68 @@ if (!args.input) {
   );
   process.exit(1);
 }
+if (typeof args['judge-model'] === 'string' && typeof args['judge-provider'] !== 'string') {
+  console.error('[judge-calibration] --judge-model requires an explicit --judge-provider.');
+  process.exit(1);
+}
+for (const required of [
+  'dist/ai/AiFactory.js',
+  'dist/agent/evaluation/MiningJudge.js',
+  'dist/agent/evaluation/StrictProductionFixtureEvaluation.js',
+]) {
+  try {
+    readFileSync(path.join(repoRoot, required));
+  } catch {
+    console.error(`[judge-calibration] missing ${required} — run \`npm run build\` first.`);
+    process.exit(1);
+  }
+}
 const { createProvider, autoDetectProvider } = await import(
   path.join(repoRoot, 'dist/ai/AiFactory.js')
 );
-const judgeProvider = args['judge-provider']
-  ? createProvider({ provider: args['judge-provider'] })
-  : autoDetectProvider();
+const {
+  assertFrozenJudgeModelLoadReceiptV1,
+  computeJudgeCalibration,
+  createFrozenJudgeModelLoadReceiptV1,
+  judgeCandidate,
+} = await import(path.join(repoRoot, 'dist/agent/evaluation/MiningJudge.js'));
+const { FrozenStrictProductionEvaluationProviderV1 } = await import(
+  path.join(repoRoot, 'dist/agent/evaluation/StrictProductionFixtureEvaluation.js')
+);
+const judgeProvider =
+  args['judge-provider'] === 'frozen-fixture'
+    ? new FrozenStrictProductionEvaluationProviderV1()
+    : args['judge-provider']
+      ? createProvider({
+          provider: args['judge-provider'],
+          ...(typeof args['judge-model'] === 'string' ? { model: args['judge-model'] } : {}),
+        })
+      : autoDetectProvider();
 if (!judgeProvider) {
   console.error(
     '[judge-calibration] no judge provider — set ALEMBIC_DEEPSEEK_API_KEY or pass --judge-provider ollama.'
   );
   process.exit(1);
 }
+const judgeModelLoadReceipt = createFrozenJudgeModelLoadReceiptV1({
+  selectionMode:
+    typeof args['judge-provider'] === 'string' && typeof args['judge-model'] === 'string'
+      ? 'explicit'
+      : 'auto-detected',
+  requestedProvider: typeof args['judge-provider'] === 'string' ? args['judge-provider'] : null,
+  requestedModel: typeof args['judge-model'] === 'string' ? args['judge-model'] : null,
+  resolvedProvider: judgeProvider.name,
+  resolvedModel: judgeProvider.model,
+  temperature: 0,
+  maxTokens: 800,
+  implementationModuleSha256: createHash('sha256')
+    .update(readFileSync(path.join(repoRoot, 'dist/agent/evaluation/MiningJudge.js')))
+    .digest('hex'),
+});
 
 const inputPath = path.resolve(args.input);
-const exported = JSON.parse(readFileSync(inputPath, 'utf8'));
+const inputBytes = readFileSync(inputPath);
+const exported = JSON.parse(inputBytes.toString('utf8'));
 if (!Array.isArray(exported) || exported.length === 0) {
   console.error('[judge-calibration] input 为空或不是数组。');
   process.exit(1);
@@ -54,6 +101,7 @@ if (!Array.isArray(exported) || exported.length === 0) {
 console.log(
   `[judge-calibration] samples=${exported.length} judge=${judgeProvider.name}/${judgeProvider.model}`
 );
+console.log(`[judge-calibration] judgeModelLoadReceipt=${judgeModelLoadReceipt.receiptHash}`);
 
 const records = [];
 for (const [index, sample] of exported.entries()) {
@@ -87,7 +135,14 @@ for (const [index, sample] of exported.entries()) {
 }
 
 const calibration = computeJudgeCalibration(records);
-const startedAt = new Date().toISOString();
+assertFrozenJudgeModelLoadReceiptV1(judgeModelLoadReceipt, {
+  resolvedProvider: judgeProvider.name,
+  resolvedModel: judgeProvider.model,
+});
+const startedAt =
+  typeof args['frozen-started-at'] === 'string'
+    ? args['frozen-started-at']
+    : new Date().toISOString();
 const outDir = path.resolve(
   repoRoot,
   args.out ||
@@ -96,7 +151,50 @@ const outDir = path.resolve(
 mkdirSync(outDir, { recursive: true });
 writeFileSync(
   path.join(outDir, 'calibration.json'),
-  `${JSON.stringify({ kind: 'JudgeCalibrationReport', version: 1, startedAt, judge: `${judgeProvider.name}/${judgeProvider.model}`, calibration, records: records.map((record) => ({ humanDecision: record.humanDecision, overgeneralized: record.overgeneralized, judgeVerdict: record.judgeVerdict?.verdict ?? null, invalidCitation: record.judgeVerdict?.invalidCitation === true })) }, null, 2)}\n`
+  `${JSON.stringify(
+    {
+      kind: 'JudgeCalibrationReport',
+      version: 1,
+      startedAt,
+      judge: `${judgeProvider.name}/${judgeProvider.model}`,
+      judgeModelLoadReceipt,
+      evaluationReceipts: {
+        inputSha256: sha256(inputBytes),
+        configSha256: sha256(
+          JSON.stringify({
+            sampleCount: exported.length,
+            startedAt,
+            temperature: 0,
+            maxTokens: 800,
+          })
+        ),
+        providerSha256: sha256(
+          JSON.stringify({ provider: judgeProvider.name, model: judgeProvider.model })
+        ),
+        sourceFiles: collectSourceFileReceipts(exported, inputPath),
+        apiKeyReadCount: Number(judgeProvider.apiKeyReadCount || 0),
+        networkRequestCount: Number(judgeProvider.networkRequestCount || 0),
+        negativeResults: records
+          .map((record, index) => ({ record, index }))
+          .filter(({ record }) => record.humanDecision !== 'uphold')
+          .map(({ record, index }) => ({
+            index,
+            humanDecision: record.humanDecision,
+            judgeVerdict: record.judgeVerdict?.verdict ?? null,
+            passed: record.judgeVerdict?.verdict === record.humanDecision,
+          })),
+      },
+      calibration,
+      records: records.map((record) => ({
+        humanDecision: record.humanDecision,
+        overgeneralized: record.overgeneralized,
+        judgeVerdict: record.judgeVerdict?.verdict ?? null,
+        invalidCitation: record.judgeVerdict?.invalidCitation === true,
+      })),
+    },
+    null,
+    2
+  )}\n`
 );
 console.log(
   `[judge-calibration] agreement=${fmt(calibration.agreementRate)} exact=${fmt(calibration.exactRate)} overgen-subset=${fmt(calibration.overgenSubset.rate)}(${calibration.overgenSubset.agreed}/${calibration.overgenSubset.total}) judged=${calibration.judged}/${calibration.total}`
@@ -129,4 +227,36 @@ function parseArgs(argv) {
 
 function fmt(value) {
   return value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`;
+}
+
+function collectSourceFileReceipts(samples, sourceInputPath) {
+  const rows = new Map();
+  for (const sample of samples) {
+    const projectRoot = path.resolve(path.dirname(sourceInputPath), sample.projectRoot || '.');
+    const sources = Array.isArray(sample.candidate?.reasoning?.sources)
+      ? sample.candidate.reasoning.sources
+      : [];
+    for (const source of sources) {
+      const match = /^(.+?):\d+-\d+$/u.exec(String(source));
+      if (!match) {
+        continue;
+      }
+      const relativePath = match[1];
+      const absolutePath = path.resolve(projectRoot, relativePath);
+      rows.set(`${sample.projectRoot || '.'}/${relativePath}`, {
+        projectRoot: sample.projectRoot || '.',
+        relativePath,
+        sha256: sha256(readFileSync(absolutePath)),
+      });
+    }
+  }
+  return [...rows.values()].sort((left, right) =>
+    `${left.projectRoot}/${left.relativePath}`.localeCompare(
+      `${right.projectRoot}/${right.relativePath}`
+    )
+  );
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
 }

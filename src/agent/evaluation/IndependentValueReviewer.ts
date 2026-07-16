@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { FullAuthoredProjectionV1 } from '../production/StrictProductionPipeline.js';
 
+export type { JudgeCalibrationRecordV1 } from './MiningJudge.js';
+export { computeJudgeCalibration } from './MiningJudge.js';
+
 export interface FrozenEvidenceEntryV1 {
   readonly evidenceEntryId: string;
   readonly relativePath: string;
@@ -352,73 +355,6 @@ function verifyReviewCitations(
       );
     })
   );
-}
-
-export interface JudgeCalibrationRecordV1 {
-  readonly humanDecision: 'uphold' | 'narrow' | 'trivial' | 'reject';
-  readonly judgeVerdict: { readonly verdict: string; readonly invalidCitation?: boolean } | null;
-  readonly overgeneralized?: boolean;
-}
-
-/** 生产模块拥有的校准门；legacy eval wrapper 保持同口径兼容。 */
-export function computeJudgeCalibration(
-  records: readonly JudgeCalibrationRecordV1[],
-  options: {
-    readonly promotionFloor?: number;
-    readonly kappaFloor?: number;
-    readonly negativeRecallFloor?: number;
-    readonly minNegatives?: number;
-  } = {}
-) {
-  const promotionFloor = options.promotionFloor ?? 0.8;
-  const kappaFloor = options.kappaFloor ?? 0.6;
-  const negativeRecallFloor = options.negativeRecallFloor ?? 0.6;
-  const minNegatives = options.minNegatives ?? 5;
-  const judged = records.filter(
-    (record) => record.judgeVerdict?.verdict && !record.judgeVerdict.invalidCitation
-  ) as readonly (JudgeCalibrationRecordV1 & { judgeVerdict: { verdict: string } })[];
-  const humanKeep = (record: JudgeCalibrationRecordV1) => record.humanDecision === 'uphold';
-  const judgeKeep = (record: (typeof judged)[number]) => record.judgeVerdict.verdict === 'uphold';
-  const agreed = judged.filter((record) => humanKeep(record) === judgeKeep(record));
-  const exact = judged.filter((record) => record.humanDecision === record.judgeVerdict.verdict);
-  const overgen = judged.filter((record) => record.overgeneralized === true);
-  const overgenAgreed = overgen.filter((record) => !judgeKeep(record));
-  const agreementRate = judged.length > 0 ? agreed.length / judged.length : null;
-  const overgenRate = overgen.length > 0 ? overgenAgreed.length / overgen.length : null;
-  let kappa: number | null = null;
-  if (agreementRate !== null) {
-    const pKeepHuman = judged.filter(humanKeep).length / judged.length;
-    const pKeepJudge = judged.filter(judgeKeep).length / judged.length;
-    const chance = pKeepHuman * pKeepJudge + (1 - pKeepHuman) * (1 - pKeepJudge);
-    kappa = chance === 1 ? null : (agreementRate - chance) / (1 - chance);
-  }
-  const negatives = judged.filter((record) => !humanKeep(record));
-  const negativesCaught = negatives.filter((record) => !judgeKeep(record));
-  const negativeRecall = negatives.length > 0 ? negativesCaught.length / negatives.length : null;
-  return freeze({
-    total: records.length,
-    judged: judged.length,
-    agreementRate,
-    kappa,
-    negativeSubset: {
-      total: negatives.length,
-      caught: negativesCaught.length,
-      recall: negativeRecall,
-    },
-    exactRate: judged.length > 0 ? exact.length / judged.length : null,
-    overgenSubset: { total: overgen.length, agreed: overgenAgreed.length, rate: overgenRate },
-    selfBiasSignal: overgenRate !== null && overgenRate < promotionFloor,
-    promotionEligible:
-      agreementRate !== null &&
-      agreementRate >= promotionFloor &&
-      judged.length >= 30 &&
-      kappa !== null &&
-      kappa >= kappaFloor &&
-      negatives.length >= minNegatives &&
-      negativeRecall !== null &&
-      negativeRecall >= negativeRecallFloor &&
-      !(overgenRate !== null && overgenRate < promotionFloor),
-  });
 }
 
 function validateIdentity(identity: ReviewerIdentityV1): void {

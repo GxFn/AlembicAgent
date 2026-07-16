@@ -1,0 +1,301 @@
+{
+  "kind": "JudgeCalibrationReport",
+  "version": 1,
+  "startedAt": "2026-07-16T00:00:00.000Z",
+  "judge": "frozen-fixture/strict-production-fixture-v1",
+  "judgeModelLoadReceipt": {
+    "kind": "FrozenJudgeModelLoadReceiptV1",
+    "schemaVersion": 1,
+    "selectionMode": "explicit",
+    "requestedProvider": "frozen-fixture",
+    "requestedModel": "strict-production-fixture-v1",
+    "resolvedProvider": "frozen-fixture",
+    "resolvedModel": "strict-production-fixture-v1",
+    "temperature": 0,
+    "maxTokens": 800,
+    "implementationModuleSha256": "64a4c071bae9be6cdc2f6b650b7f9b87a8304ed0816c9e6d91513c7757a8db0a",
+    "receiptHash": "sha256:b4ffb28c4c481feb0234428e88a2a69f7d48d27573d9164ab3cccc750ac1bcae"
+  },
+  "evaluationReceipts": {
+    "inputSha256": "253cb66b92cf9ad81db0a8b1919575727c3a2d57e6b2a75bb6bc1825c558c851",
+    "configSha256": "5ff1c4f976180a1203a6c510061e9e561fd116ef089272bb941b268446f2e336",
+    "providerSha256": "9654a9b5645d66f705a2c3ab010f430753b9a3529fcd079768b116ea002728fe",
+    "sourceFiles": [
+      {
+        "projectRoot": "projects/alembic-workspace-single-file",
+        "relativePath": "src/agent/production/StrictProductionStages.ts",
+        "sha256": "49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1"
+      },
+      {
+        "projectRoot": "projects/bilidili-three-file",
+        "relativePath": "BiliDili/Assets.xcassets/Contents.json",
+        "sha256": "0fd49ba3c3585c709678e0046a821c3c60685ec7063720d30d3a3448be3a208b"
+      }
+    ],
+    "apiKeyReadCount": 0,
+    "networkRequestCount": 0,
+    "negativeResults": [
+      {
+        "index": 20,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 21,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 22,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 23,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 24,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 25,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 26,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 27,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 28,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      },
+      {
+        "index": 29,
+        "humanDecision": "reject",
+        "judgeVerdict": "reject",
+        "passed": true
+      }
+    ]
+  },
+  "calibration": {
+    "total": 30,
+    "judged": 30,
+    "agreementRate": 1,
+    "kappa": 1,
+    "negativeSubset": {
+      "total": 10,
+      "caught": 10,
+      "recall": 1
+    },
+    "exactRate": 1,
+    "overgenSubset": {
+      "total": 10,
+      "agreed": 10,
+      "rate": 1
+    },
+    "selfBiasSignal": false,
+    "promotionEligible": true
+  },
+  "records": [
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "uphold",
+      "overgeneralized": false,
+      "judgeVerdict": "uphold",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    },
+    {
+      "humanDecision": "reject",
+      "overgeneralized": true,
+      "judgeVerdict": "reject",
+      "invalidCitation": false
+    }
+  ]
+}
