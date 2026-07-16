@@ -53,6 +53,18 @@
     "./context": {
       "types": "./dist/agent/context/index.d.ts",
       "import": "./dist/agent/context/index.js"
+    },
+    "./runs": {
+      "types": "./dist/runs.d.ts",
+      "import": "./dist/runs.js"
+    },
+    "./production": {
+      "types": "./dist/production.d.ts",
+      "import": "./dist/production.js"
+    },
+    "./evaluation": {
+      "types": "./dist/evaluation.d.ts",
+      "import": "./dist/evaluation.js"
     }
   },
   "imports": {
@@ -103,10 +115,11 @@
     "prepack": "node scripts/guard-agent-release-package.mjs",
     "smoke:public-imports": "npm run build && node scripts/smoke-agent-public-imports.mjs",
     "smoke:public-signatures": "npm run build && node scripts/smoke-agent-public-signatures.mjs",
+    "smoke:strict-consumer": "npm run build && node scripts/probe-agent-public-strict-consumer.mjs",
     "verify:validation-floor": "node scripts/verify-agent-validation-floor.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run lint:space-edges && npm run lint:layer-contract && npm run lint:doctrine && npm run lint:naming && npm run lint:provider-neutral-kernel && npm run smoke:public-signatures && npm run verify:validation-floor && npm run test && npm run lint:retired-symbols",
+    "check": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run lint:space-edges && npm run lint:layer-contract && npm run lint:doctrine && npm run lint:naming && npm run lint:provider-neutral-kernel && npm run smoke:public-signatures && npm run smoke:strict-consumer && npm run verify:validation-floor && npm run test && npm run lint:retired-symbols",
     "lint:retired-symbols": "node ../AlembicCore/scripts/lint-retired-symbols.mjs . --dirs=src,test",
     "eval:mining": "npm run build && node scripts/eval-mining.mjs",
     "eval:strict-production": "npm run build && node scripts/eval-strict-production.mjs",

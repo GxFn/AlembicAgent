@@ -44,8 +44,8 @@ describe('retired tool package exports', () => {
     expect(signatureStable).not.toContain(retiredTerminalExport);
     expect(Object.keys(signatureEntries)).not.toContain(retiredAggregateExport);
     expect(Object.keys(signatureEntries)).not.toContain(retiredTerminalExport);
-    expect(expectedCounts['stable-public']).toBe(12);
-    expect(signatures.packageExportCount).toBe(12);
+    expect(expectedCounts['stable-public']).toBe(15);
+    expect(signatures.packageExportCount).toBe(15);
     expect(boundary.forbiddenConsumerSpecifiers as string[]).toContain(retiredAggregateSpecifier);
     expect(boundary.forbiddenConsumerSpecifiers as string[]).toContain(retiredTerminalSpecifier);
   });

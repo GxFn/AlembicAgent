@@ -6,16 +6,17 @@ representative calls with temp roots and stubbed transports — no real provider
 calls). Effects not listed here are undeclared — finding one is a doctrine
 violation to report, not to absorb.
 
-## Family 1 — package facades (the 12 exact exports)
+## Family 1 — package facades (the 15 exact exports)
 
 `@alembic/agent` root plus `./agent ./service ./runtime ./prompts ./domain
-./tasks ./profiles ./ai ./tools/runtime ./memory ./context` (G5 boundary;
+./tasks ./profiles ./ai ./tools/runtime ./memory ./context ./runs ./production
+./evaluation` (G5 boundary;
 consumed by Alembic per the space-edge config).
 
 - **Importing performs NO work** (post-AD4): no filesystem, no network, no
   env reads at import — env/config reads happen at construction; the Core
   logger is acquired lazily on first use (AD4 I1-I4). Proven by the
-  clean-child-process import snapshot across all 12 facades.
+  clean-child-process import snapshot across all 15 facades.
 - **Network happens ONLY via injected/configured provider transports**:
   every outbound call flows AiProvider → LLMGateway → transport `fetch`
   (OpenAI/DeepSeek/Google/Ollama endpoints from provider config or env);
@@ -43,11 +44,13 @@ Against the AD2-confirmed Agent charter (owns LLM provider/tool runtime — V2
 catalog, transports, classification; consumes `@alembic/core` only;
 must-never knowledge persistence / HTTP surface; declared SD-4 exception):
 
-- **No orphan capability**: all 12 exports map to charter "owns" lines —
+- **No orphan capability**: all 15 exports map to charter "owns" lines —
   ai/transports/classification (`./ai`: providers, transports, registry,
   gateway, errorClassify), live tool runtime (`./tools/runtime`, root tools
   barrel), agent orchestration over them (`./agent ./service ./runtime
-  ./prompts ./domain ./tasks ./profiles ./memory ./context` + root facade).
+  ./prompts ./domain ./tasks ./profiles ./memory ./context`, strict Plan run
+  (`./runs`), strict analysis/Producer contracts (`./production`), and
+  independent review (`./evaluation`) + root facade).
 - **No charter line without code**: provider adapters, V2 catalog, live
   terminal.exec handling, and error classification all exist and are gate-pinned.
 - **Must-never holds**: no HTTP SERVER surface exists (transports are

@@ -14,7 +14,10 @@
     "./ai",
     "./tools/runtime",
     "./memory",
-    "./context"
+    "./context",
+    "./runs",
+    "./production",
+    "./evaluation"
   ],
   "provisionalPublicExports": [],
   "provisionalTierPolicy": {
@@ -25,7 +28,7 @@
       "Unlisted package subpaths remain forbidden even if dist files exist."
     ]
   },
-  "packageExportCount": 12,
+  "packageExportCount": 15,
   "stableExportSignatures": {
     ".": {
       "exportCount": 157,
@@ -1823,6 +1826,64 @@
         },
         {
           "name": "validateL4Summary",
+          "kind": "function"
+        }
+      ]
+    },
+    "./runs": {
+      "exportCount": 1,
+      "signatureHash": "3b22e47bf0a34042732e021d8e613b8ee666f49d64068e2e11e080c3107d28fe",
+      "entries": [
+        {
+          "name": "runStrictPlanAgent",
+          "kind": "function"
+        }
+      ]
+    },
+    "./production": {
+      "exportCount": 6,
+      "signatureHash": "daba3114177c785585504a7b252f7f499d8b6312554fb4d45bad6890f0658234",
+      "entries": [
+        {
+          "name": "createStrictAnalysisContextProjectionV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictAnalysisExpansionPortV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictAnalysisFixpointV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictProducerExpressionSetV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictProducerLineageReceiptV1",
+          "kind": "function"
+        },
+        {
+          "name": "validateStrictAnalystEpochV1",
+          "kind": "function"
+        }
+      ]
+    },
+    "./evaluation": {
+      "exportCount": 3,
+      "signatureHash": "d40a8d77d1d35bb931a3d5d29379c5a02b2ffd8bd424843e789a3f57a4a1b4e5",
+      "entries": [
+        {
+          "name": "IndependentValueReviewer",
+          "kind": "class"
+        },
+        {
+          "name": "InvestigatedEmptyReviewer",
+          "kind": "class"
+        },
+        {
+          "name": "createFrozenEvidenceProjection",
           "kind": "function"
         }
       ]

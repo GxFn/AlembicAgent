@@ -121,7 +121,10 @@ become partial results instead of aborting the batch.
 
 Subpath entrypoints (see `exports` in `package.json`): `.`, `./agent`,
 `./service`, `./runtime`, `./prompts`, `./domain`, `./tasks`, `./profiles`,
-`./ai`, `./tools/runtime`, `./memory`, `./context`.
+`./ai`, `./tools/runtime`, `./memory`, `./context`, `./runs`, `./production`,
+`./evaluation`. The last three are curated strict-production facades; internal
+run families, prompts, stage/gate authority, judge calibration, fixtures, and
+provider runners remain private.
 
 Internal imports use the `#agent/*`, `#ai/*`, `#shared/*`, `#tools/*` aliases
 (resolved to `src/` under the `alembic-dev` condition, `dist/` otherwise).
@@ -176,6 +179,7 @@ boundary/contract gates —
 | ---- | -------- |
 | `lint:agent-import-boundary` / `lint:core-import-boundary` | package-entry imports only; no reaching into Core internals |
 | `lint:public-api-boundary` + `smoke:public-signatures` | frozen public API surface and signatures |
+| `smoke:strict-consumer` | plain-Node runtime and NodeNext type imports from the linked Alembic checkout; strict deep paths remain blocked |
 | `lint:layer-contract` / `lint:space-edges` | layering and module-edge rules |
 | `lint:doctrine` | side-effect doctrine — no import-time work, effects flow through injected ports (see `docs/side-effect-doctrine-census.md`) |
 | `lint:naming` / `lint:retired-symbols` | naming rules; retired symbols stay dead |

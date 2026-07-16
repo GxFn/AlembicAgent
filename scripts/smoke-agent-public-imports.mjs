@@ -15,6 +15,22 @@ const forbiddenSamples = Array.isArray(policy.forbiddenConsumerSpecifierSamples)
       (sample) => sample && typeof sample.specifier === 'string'
     )
   : [];
+const requiredRuntimeBindings = {
+  './runs': ['runStrictPlanAgent'],
+  './production': [
+    'createStrictAnalysisContextProjectionV1',
+    'createStrictAnalysisExpansionPortV1',
+    'createStrictAnalysisFixpointV1',
+    'createStrictProducerExpressionSetV1',
+    'createStrictProducerLineageReceiptV1',
+    'validateStrictAnalystEpochV1',
+  ],
+  './evaluation': [
+    'IndependentValueReviewer',
+    'InvestigatedEmptyReviewer',
+    'createFrozenEvidenceProjection',
+  ],
+};
 
 function specifierForExport(exportPath) {
   return exportPath === '.' ? '@alembic/agent' : `@alembic/agent/${exportPath.slice(2)}`;
@@ -28,6 +44,11 @@ for (const exportPath of publicExports) {
     const imported = await import(specifier);
     if (!imported || typeof imported !== 'object') {
       failures.push(`${specifier}: import returned ${typeof imported}`);
+    }
+    for (const binding of requiredRuntimeBindings[exportPath] ?? []) {
+      if (typeof imported[binding] !== 'function') {
+        failures.push(`${specifier}: ${binding} returned ${typeof imported[binding]}`);
+      }
     }
   } catch (error) {
     failures.push(`${specifier}: ${error instanceof Error ? error.message : String(error)}`);

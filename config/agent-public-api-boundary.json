@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "description": "AlembicAgent public API boundary policy. Exact package exports are the only supported consumer entrypoints; no wildcard, deep dist/src, or host-owned adapter imports are allowed.",
   "expectedCounts": {
-    "stable-public": 12,
+    "stable-public": 15,
     "provisional-public": 0,
     "transitional-internal": 0,
     "forbidden": 0
@@ -19,7 +19,10 @@
     "./ai",
     "./tools/runtime",
     "./memory",
-    "./context"
+    "./context",
+    "./runs",
+    "./production",
+    "./evaluation"
   ],
   "provisionalPublicExports": [],
   "transitionalInternalExports": [],
@@ -27,6 +30,9 @@
     "@alembic/agent/dist/*",
     "@alembic/agent/src/*",
     "@alembic/agent/*/*/*",
+    "@alembic/agent/runs/*",
+    "@alembic/agent/production/*",
+    "@alembic/agent/evaluation/*",
     "@alembic/agent/tools",
     "@alembic/agent/tools/terminal"
   ],
@@ -65,6 +71,26 @@
       "specifier": "@alembic/agent/service/internal/foo.js",
       "matches": "@alembic/agent/*/*/*",
       "reason": "Service internals and host adapters must not become package subpaths."
+    },
+    {
+      "specifier": "@alembic/agent/runs/plan/PlanAgentRun.js",
+      "matches": "@alembic/agent/runs/*",
+      "reason": "Consumers use the curated strict Plan facade, not run-family or implementation paths."
+    },
+    {
+      "specifier": "@alembic/agent/production/StrictProductionPipeline.js",
+      "matches": "@alembic/agent/production/*",
+      "reason": "Strict implementation, repair authority, stage builders, and prompt internals remain Agent-owned behind the curated production facade."
+    },
+    {
+      "specifier": "@alembic/agent/evaluation/MiningJudge.js",
+      "matches": "@alembic/agent/evaluation/*",
+      "reason": "Judge calibration and evaluator implementation internals are not Main consumer contracts."
+    },
+    {
+      "specifier": "@alembic/agent/evaluation/StrictProductionFixtureEvaluation.js",
+      "matches": "@alembic/agent/evaluation/*",
+      "reason": "Frozen fixture runners and provider internals stay private to Agent evaluation."
     }
   ],
   "publicContractMatrix": [
@@ -151,6 +177,27 @@
       "contract": "Conversation store, context window, exploration tracker, plan tracker, and nudging contracts.",
       "agentOwned": ["conversation context assembly", "exploration tracking", "plan tracking", "nudge generation"],
       "hostOwnedAdapterBoundary": "Host owns conversation transport, UI presentation, and product-specific context injection."
+    },
+    {
+      "export": "./runs",
+      "specifier": "@alembic/agent/runs",
+      "contract": "Curated strict Plan cognition run entrypoint and its caller input/context types.",
+      "agentOwned": ["strict Plan cognition invocation", "bounded semantic repair", "Plan run validation boundary"],
+      "hostOwnedAdapterBoundary": "Host owns orchestration timing and supplies the AgentService plus validated immutable context."
+    },
+    {
+      "export": "./production",
+      "specifier": "@alembic/agent/production",
+      "contract": "Curated strict analysis projection, expansion, Analyst epoch/fixpoint, Producer lineage/expression-set, repair, gate, and stage-port contracts.",
+      "agentOwned": ["strict analysis validation", "Producer lineage and expression-set construction", "strict runtime port contract"],
+      "hostOwnedAdapterBoundary": "Host owns Main orchestration and injects accepted Core receipts through the strict runtime port; internal stage, gate, prompt, and repair authority stays Agent-owned."
+    },
+    {
+      "export": "./evaluation",
+      "specifier": "@alembic/agent/evaluation",
+      "contract": "Curated independent value and investigated-empty reviewer entrypoints with frozen-evidence input and decision types.",
+      "agentOwned": ["frozen evidence projection", "independent value review", "investigated-empty review"],
+      "hostOwnedAdapterBoundary": "Host owns reviewer model injection and admission policy; judge calibration, fixtures, and provider runners remain Agent-owned."
     }
   ]
 }
