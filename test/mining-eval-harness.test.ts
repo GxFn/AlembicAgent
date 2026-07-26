@@ -385,7 +385,10 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     const analyst = await provider.chatWithTools(
       `strict cold-start Analyst\n${readFileSync(join(fixtureRoot, fixture.sourceFiles[0].path), 'utf8')}`
     );
-    evaluation.runtimePort.validateAnalystResult({ reply: analyst.text });
+    evaluation.runtimePort.validateAnalystResult(
+      { reply: analyst.text },
+      evaluation.runtimePort.readAnalysisEpoch()
+    );
     const producer = await provider.chatWithTools(
       'strict cold-start Producer\n{"disposition":"single-file-value"}'
     );

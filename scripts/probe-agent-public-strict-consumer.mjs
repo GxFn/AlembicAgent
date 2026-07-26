@@ -18,7 +18,10 @@ const runtimeProbe = `
 import { runStrictPlanAgent } from '@alembic/agent/runs';
 import {
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
+  createStrictAnalysisGateOutcomeV1,
+  validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
   createStrictProducerLineageReceiptV1,
@@ -33,7 +36,10 @@ import {
 const bindings = {
   runStrictPlanAgent,
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
+  createStrictAnalysisGateOutcomeV1,
+  validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
   createStrictProducerLineageReceiptV1,

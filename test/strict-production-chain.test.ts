@@ -11,8 +11,10 @@ import { InvestigatedEmptyReviewer } from '../src/agent/evaluation/InvestigatedE
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import {
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
+  createStrictAnalysisGateOutcomeV1,
   validateStrictAnalystEpochV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
 import {
@@ -188,6 +190,15 @@ describe('strict Plan cognition', () => {
   });
 });
 
+const strictStaticSchedulePort = createStrictAnalysisExpansionPortV1({
+  baselineScheduleHash: 'schedule-1',
+  baselineObligationIds: ['base-1', 'counter-1'],
+  knownFactFamilies: [],
+  knownSubjectRefs: [],
+  obligationCap: 2,
+});
+const strictFinalSchedule = strictStaticSchedulePort.seal();
+
 const strictContext = createStrictAnalysisContextProjectionV1({
   runId: 'run-1',
   journalId: 'journal-1',
@@ -198,7 +209,7 @@ const strictContext = createStrictAnalysisContextProjectionV1({
   baselineScheduleHash: 'schedule-1',
   expansionHeadHash: null,
   currentExpandedScheduleHash: 'schedule-1',
-  finalExpandedScheduleHash: 'final-schedule-1',
+  finalExpandedScheduleHash: strictFinalSchedule.finalExpandedScheduleHash,
   analysisFixpointHash: 'fixpoint-1',
   privateCorpusRevision: null,
   hypothesisExpressionSetHash: null,
@@ -219,6 +230,48 @@ const strictContext = createStrictAnalysisContextProjectionV1({
   evidenceEntryIds: ['E-1', 'E-2'],
   derivedFindingCount: 0,
 });
+
+const strictAnalysisEpoch = createStrictAnalysisEpochSnapshotV1({
+  epoch: 1,
+  context: strictContext,
+  populations: [{ populationHash: 'population-1' }],
+  terminalObligationIds: strictContext.factQueryObligationIds,
+  outstandingObligationIds: [],
+});
+
+function strictRuntimePort() {
+  return {
+    enabled: true as const,
+    analysisLimits: {
+      maxEpochs: 1,
+      maxObligations: strictContext.factQueryObligationIds.length,
+    },
+    expansionPort: createStrictAnalysisExpansionPortV1({
+      baselineScheduleHash: strictContext.baselineScheduleHash,
+      baselineObligationIds: strictContext.factQueryObligationIds,
+      knownFactFamilies: [],
+      knownSubjectRefs: [],
+      obligationCap: strictContext.factQueryObligationIds.length,
+    }),
+    readAnalysisEpoch: () => strictAnalysisEpoch,
+    buildProducerInput: () => ({
+      analysisFixpointHash: 'fixpoint-1',
+      producerEligibleHypothesisIds: ['hypothesis-1'],
+    }),
+    validateAnalystResult: (_source: unknown, observedEpoch: typeof strictAnalysisEpoch) =>
+      createStrictAnalysisGateOutcomeV1({
+        action: 'pass',
+        reasonCode: 'strict-analysis-fixpoint-stable',
+        observedEpochHash: observedEpoch.snapshotHash,
+        artifact: { analysisFixpointHash: 'fixpoint-1' },
+      }),
+    reviewProducerResult: () => ({
+      action: 'pass',
+      pass: true,
+      artifact: { verdict: 'pass', decisionHash: 'review-decision-1' },
+    }),
+  };
+}
 
 describe('strict context and analysis artifact', () => {
   it('round-trips the entire whitelist and forbids Markdown/live-read derivation', () => {
@@ -435,10 +488,16 @@ describe('strict Producer and causal repair', () => {
     expect(buildStrictProducerPrompt(expressionSet)).not.toMatch(
       /knowledge\.submit|targetRecipes|min(?:imum)?\s*3/iu
     );
-    expect(buildStrictAnalystPrompt({ context: strictContext, populations: [] })).toContain(
-      'counterquery'
-    );
-    const strictPrompts = `${buildStrictProducerPrompt(expressionSet)}\n${buildStrictAnalystPrompt({ context: strictContext, populations: [] })}`;
+    expect(
+      buildStrictAnalystPrompt({
+        epoch: strictAnalysisEpoch,
+        limits: { maxEpochs: 1, maxObligations: 2 },
+      })
+    ).toContain('counterquery');
+    const strictPrompts = `${buildStrictProducerPrompt(expressionSet)}\n${buildStrictAnalystPrompt({
+      epoch: strictAnalysisEpoch,
+      limits: { maxEpochs: 1, maxObligations: 2 },
+    })}`;
     expect(strictPrompts).toMatch(/no candidate floor.*filler|do not add filler/isu);
     expect(strictPrompts).not.toMatch(/at least\s+\d+\s+(?:candidate|proposal)|targetRecipes/iu);
   });
@@ -466,7 +525,7 @@ describe('strict PipelineStrategy', () => {
     };
     await expect(
       strategy.execute(runtime, message, {
-        strategyContext: { strictProduction: { enabled: true, context: strictContext } },
+        strategyContext: { strictProduction: strictRuntimePort() },
       })
     ).rejects.toThrow(/STRICT_PRODUCER_TOOL_FORBIDDEN/u);
   });
@@ -506,7 +565,7 @@ describe('strict PipelineStrategy', () => {
       },
     };
     const output = await strategy.execute(runtime, message, {
-      strategyContext: { strictProduction: { enabled: true, context: strictContext } },
+      strategyContext: { strictProduction: strictRuntimePort() },
     });
     expect(output.outcome).toBe('failed');
     expect(calls).toBe(1);
@@ -538,7 +597,7 @@ describe('strict PipelineStrategy', () => {
     };
     await expect(
       strategy.execute(runtime, message, {
-        strategyContext: { strictProduction: { enabled: true, context: strictContext } },
+        strategyContext: { strictProduction: strictRuntimePort() },
       })
     ).rejects.toThrow(/STRICT_ANALYSIS_QUERY_UNENROLLED/u);
   });
@@ -560,7 +619,7 @@ describe('strict PipelineStrategy', () => {
     };
     await expect(
       strategy.execute(runtime, message, {
-        strategyContext: { strictProduction: { enabled: true, context: strictContext } },
+        strategyContext: { strictProduction: strictRuntimePort() },
       })
     ).rejects.toThrow(/STRICT_PRODUCTION_STAGE_ROUTE_REQUIRED:analyze/u);
     expect(calls).toBe(0);
@@ -568,25 +627,7 @@ describe('strict PipelineStrategy', () => {
 
   it('routes the real generateDimensionPipeline factory through the existing strict stage chain', async () => {
     const prompts: string[] = [];
-    const runtimePort = {
-      enabled: true as const,
-      context: strictContext,
-      populations: [{ populationHash: 'population-1' }],
-      buildProducerInput: () => ({
-        analysisFixpointHash: 'fixpoint-1',
-        producerEligibleHypothesisIds: ['hypothesis-1'],
-      }),
-      validateAnalystResult: () => ({
-        action: 'pass',
-        pass: true,
-        artifact: { analysisFixpointHash: 'fixpoint-1' },
-      }),
-      reviewProducerResult: () => ({
-        action: 'pass',
-        pass: true,
-        artifact: { verdict: 'pass', decisionHash: 'review-decision-1' },
-      }),
-    };
+    const runtimePort = strictRuntimePort();
     const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
       params: { needsCandidates: true },
       context: { strategyContext: { strictProduction: runtimePort } },

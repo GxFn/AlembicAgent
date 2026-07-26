@@ -22,8 +22,10 @@ import Logger from '@alembic/core/logging';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
 import {
+  createStrictAnalysisEpochSnapshotV1,
   createStrictTypedGateReturnV1,
   type StrictAnalysisContextProjectionV1,
+  type StrictAnalysisEpochTransitionV1,
   validateStrictStageToolCallsV1,
 } from '../production/StrictProductionPipeline.js';
 import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
@@ -95,6 +97,7 @@ interface GateConfig {
     permittedMutation: string;
     semanticRepairDepth?: number;
     passReasonCode?: string;
+    retryMode?: 'strict-analysis-epoch';
   };
   [key: string]: unknown;
 }
@@ -425,10 +428,19 @@ export class PipelineStrategy extends Strategy {
     const gate = stage.gate;
     let gateResult = await this.#evaluateGateResult(stage, ctx, bus);
     this.#storeGateResult(stage, gateResult, ctx, bus);
+    const strictContext = this.#strictProductionContext(ctx);
+    const strictAnalysisRetryEnabled =
+      Boolean(strictContext) && gate.strictGate?.retryMode === 'strict-analysis-epoch';
 
     // 三态处理
     if (gateResult.action === 'pass') {
-      const strictContext = this.#strictProductionContext(ctx);
+      if (strictAnalysisRetryEnabled) {
+        const transition = this.#readStrictAnalysisTransition(gateResult, 'pass');
+        this.#appendStrictAnalysisLoopReceipt(ctx, transition);
+        // Gate artifact 保留 transition 供审计；Producer 仍消费既有 analysisArtifact 语义，
+        // 避免把控制回执误当成 authored input。
+        ctx.gateArtifact = transition.resultArtifact;
+      }
       if (strictContext && gate.strictGate?.passReasonCode) {
         this.#appendStrictGateReturn(
           ctx,
@@ -444,12 +456,44 @@ export class PipelineStrategy extends Strategy {
 
     // 严格冷启动在第一个非通过门立即失败关闭。legacy repair/degrade/skip 逻辑均不得接管，
     // 否则 Producer 会消费未达到 fixpoint 或已漂移的结果。
-    if (this.#strictProductionContext(ctx)) {
+    if (strictContext) {
       const strictGate = gate.strictGate;
       if (!strictGate) {
         throw new Error(`STRICT_GATE_CONFIG_REQUIRED: ${stage.name || 'gate'}`);
       }
-      const { passReasonCode: _passReasonCode, ...failureGate } = strictGate;
+      if (gateResult.action === 'analysis_retry' && strictAnalysisRetryEnabled) {
+        const transition = this.#readStrictAnalysisTransition(gateResult, 'analysis_retry');
+        this.#appendStrictAnalysisLoopReceipt(ctx, transition);
+        const previousStageIndex = this.#findPrevExecStageIdx(stageIndex);
+        const retryStage = this.#stages[previousStageIndex];
+        if (
+          previousStageIndex < 0 ||
+          retryStage?.name !== 'analyze' ||
+          retryStage.strictRoleSurface !== 'strict-analyst-v1'
+        ) {
+          throw new Error('STRICT_ANALYSIS_RETRY_TARGET_INVALID');
+        }
+        phaseResults._retryContext = {
+          reason: gateResult.reason,
+          artifact: transition,
+        };
+        phaseResults._strictAnalysisRetryCount =
+          Number(phaseResults._strictAnalysisRetryCount || 0) + 1;
+        phaseResults[`_was_retry_${retryStage.name}`] = true;
+        return previousStageIndex - 1;
+      }
+      if (
+        gateResult.artifact &&
+        typeof gateResult.artifact === 'object' &&
+        !Array.isArray(gateResult.artifact) &&
+        (gateResult.artifact as { kind?: unknown }).kind === 'StrictAnalysisEpochTransitionV1'
+      ) {
+        this.#appendStrictAnalysisLoopReceipt(
+          ctx,
+          gateResult.artifact as StrictAnalysisEpochTransitionV1
+        );
+      }
+      const { passReasonCode: _passReasonCode, retryMode: _retryMode, ...failureGate } = strictGate;
       const typedReturn = createStrictTypedGateReturnV1({
         ...failureGate,
         verdict: 'failed',
@@ -1188,20 +1232,27 @@ export class PipelineStrategy extends Strategy {
     if (record.enabled !== true) {
       return null;
     }
-    const context = record.context;
-    if (!context || typeof context !== 'object' || Array.isArray(context)) {
-      throw new Error('STRICT_ANALYSIS_CONTEXT_REQUIRED');
+    const readAnalysisEpoch = record.readAnalysisEpoch;
+    if (typeof readAnalysisEpoch !== 'function') {
+      throw new Error('STRICT_ANALYSIS_EPOCH_READER_REQUIRED');
     }
-    const typed = context as StrictAnalysisContextProjectionV1;
+    const snapshot = readAnalysisEpoch.call(record) as ReturnType<
+      typeof createStrictAnalysisEpochSnapshotV1
+    > | null;
     if (
-      typed.schemaVersion !== 1 ||
-      typed.derivedFindingCount !== 0 ||
-      typeof typed.contextHash !== 'string' ||
-      typed.contextHash.length === 0
+      !snapshot ||
+      typeof snapshot !== 'object' ||
+      Array.isArray(snapshot) ||
+      snapshot.schemaVersion !== 1
     ) {
-      throw new Error('STRICT_ANALYSIS_CONTEXT_INVALID');
+      throw new Error('STRICT_ANALYSIS_EPOCH_INVALID');
     }
-    return typed;
+    const { schemaVersion: _schemaVersion, snapshotHash, ...snapshotInput } = snapshot;
+    const normalized = createStrictAnalysisEpochSnapshotV1(snapshotInput);
+    if (normalized.snapshotHash !== snapshotHash) {
+      throw new Error('STRICT_ANALYSIS_EPOCH_HASH_MISMATCH');
+    }
+    return normalized.context;
   }
 
   #validateStrictRoleRoute(stage: PipelineStage, ctx: PipelineContext): void {
@@ -1245,6 +1296,60 @@ export class PipelineStrategy extends Strategy {
       ? ctx.phaseResults._strictGateReturns
       : [];
     ctx.phaseResults._strictGateReturns = [...previous, typedReturn];
+  }
+
+  #readStrictAnalysisTransition(
+    gateResult: GateEvalResult,
+    expectedAction: 'pass' | 'analysis_retry'
+  ): StrictAnalysisEpochTransitionV1 {
+    const transition = gateResult.artifact as Partial<StrictAnalysisEpochTransitionV1> | null;
+    if (
+      !transition ||
+      transition.kind !== 'StrictAnalysisEpochTransitionV1' ||
+      transition.schemaVersion !== 1 ||
+      transition.action !== expectedAction ||
+      typeof transition.transitionHash !== 'string' ||
+      transition.transitionHash.length === 0
+    ) {
+      throw new Error('STRICT_ANALYSIS_RETRY_TRANSITION_REQUIRED');
+    }
+    return transition as StrictAnalysisEpochTransitionV1;
+  }
+
+  #appendStrictAnalysisLoopReceipt(
+    ctx: PipelineContext,
+    transition: StrictAnalysisEpochTransitionV1
+  ): void {
+    const previous =
+      ctx.phaseResults._strictAnalysisLoopReceipt &&
+      typeof ctx.phaseResults._strictAnalysisLoopReceipt === 'object' &&
+      !Array.isArray(ctx.phaseResults._strictAnalysisLoopReceipt)
+        ? (ctx.phaseResults._strictAnalysisLoopReceipt as Record<string, unknown>)
+        : null;
+    const epochs = Array.isArray(previous?.epochs) ? previous.epochs : [];
+    ctx.phaseResults._strictAnalysisLoopReceipt = {
+      kind: 'StrictAnalysisLoopReceiptV1',
+      limits: transition.limits,
+      epochs: [
+        ...epochs,
+        {
+          epoch: transition.before.epoch,
+          nextEpoch: transition.after.epoch,
+          action: transition.action,
+          reasonCode: transition.reasonCode,
+          beforeSnapshotHash: transition.before.snapshotHash,
+          afterSnapshotHash: transition.after.snapshotHash,
+          currentExpandedScheduleHash: transition.after.currentExpandedScheduleHash,
+          terminalObligationIds: transition.after.terminalObligationIds,
+          outstandingObligationIds: transition.after.outstandingObligationIds,
+          enrolledObligationIds: transition.enrolledObligationIds,
+          executedObligationIds: transition.executedObligationIds,
+          transitionHash: transition.transitionHash,
+        },
+      ],
+      terminalAction: transition.action === 'analysis_retry' ? null : transition.action,
+      finalEpoch: transition.after.epoch,
+    };
   }
 
   /** 执行 reactLoop 并添加硬超时保护 */

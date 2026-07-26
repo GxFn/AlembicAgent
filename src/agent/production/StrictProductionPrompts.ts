@@ -1,12 +1,13 @@
 import type {
-  StrictAnalysisContextProjectionV1,
+  StrictAnalysisEpochSnapshotV1,
+  StrictAnalysisLoopLimitsV1,
   StrictProducerExpressionSetV1,
 } from './StrictProductionPipeline.js';
 
 /** 严格 Analyst 不接收数量目标；它消费冻结语义投影与完整 population，并通过登记端口扩展。 */
 export function buildStrictAnalystPrompt(input: {
-  readonly context: StrictAnalysisContextProjectionV1;
-  readonly populations: readonly unknown[];
+  readonly epoch: StrictAnalysisEpochSnapshotV1;
+  readonly limits: StrictAnalysisLoopLimitsV1;
 }): string {
   return [
     'You are the strict cold-start Analyst operating on immutable Core receipts.',
@@ -15,8 +16,12 @@ export function buildStrictAnalystPrompt(input: {
     'Exploration and every counterquery must be enrolled through the validated analysis expansion port before execution.',
     'Advance append-only epochs to a fixpoint. At fixpoint every observation and hypothesis needs a terminal disposition with owner/resume data for non-pass gates.',
     'There is no candidate floor, filler, top-N shortcut, fixed count, skip-on-fail, or degrade-to-success path.',
-    `Strict context: ${JSON.stringify(input.context)}`,
-    `Complete populations: ${JSON.stringify(input.populations)}`,
+    `Analysis epoch: ${input.epoch.epoch} of ${input.limits.maxEpochs}`,
+    `Obligation bound: ${input.epoch.context.factQueryObligationIds.length} of ${input.limits.maxObligations}`,
+    `Terminal obligations: ${JSON.stringify(input.epoch.terminalObligationIds)}`,
+    `Outstanding obligations: ${JSON.stringify(input.epoch.outstandingObligationIds)}`,
+    `Strict context: ${JSON.stringify(input.epoch.context)}`,
+    `Complete populations: ${JSON.stringify(input.epoch.populations)}`,
   ].join('\n');
 }
 

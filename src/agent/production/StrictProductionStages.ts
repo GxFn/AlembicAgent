@@ -1,6 +1,10 @@
 import {
-  createStrictAnalysisContextProjectionV1,
-  type StrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
+  type StrictAnalysisEpochSnapshotV1,
+  type StrictAnalysisExpansionPortV1,
+  type StrictAnalysisGateOutcomeV1,
+  type StrictAnalysisLoopLimitsV1,
+  validateStrictAnalysisEpochTransitionV1,
 } from './StrictProductionPipeline.js';
 import { buildStrictAnalystPrompt, buildStrictProducerPrompt } from './StrictProductionPrompts.js';
 
@@ -13,12 +17,14 @@ export interface StrictProductionGateResultV1 {
 
 export interface StrictProductionRuntimePortV1 {
   readonly enabled: true;
-  readonly context: StrictAnalysisContextProjectionV1;
-  readonly populations: readonly unknown[];
+  readonly analysisLimits: StrictAnalysisLoopLimitsV1;
+  readonly expansionPort: StrictAnalysisExpansionPortV1;
+  readonly readAnalysisEpoch: () => StrictAnalysisEpochSnapshotV1;
   readonly buildProducerInput: (analysisArtifact: unknown) => Readonly<Record<string, unknown>>;
   readonly validateAnalystResult: (
-    source: unknown
-  ) => StrictProductionGateResultV1 | Promise<StrictProductionGateResultV1>;
+    source: unknown,
+    observedEpoch: StrictAnalysisEpochSnapshotV1
+  ) => StrictAnalysisGateOutcomeV1 | Promise<StrictAnalysisGateOutcomeV1>;
   readonly reviewProducerResult: (
     source: unknown
   ) => StrictProductionGateResultV1 | Promise<StrictProductionGateResultV1>;
@@ -40,8 +46,8 @@ export function buildStrictProductionPipelineStagesV1() {
       promptBuilder: (ctx: Record<string, unknown>) => {
         const strict = readStrictPort(ctx);
         return buildStrictAnalystPrompt({
-          context: strict.context,
-          populations: strict.populations,
+          epoch: readStrictAnalysisEpoch(strict),
+          limits: strict.analysisLimits,
         });
       },
     },
@@ -52,7 +58,7 @@ export function buildStrictProductionPipelineStagesV1() {
           source: unknown,
           _phaseResults: Record<string, unknown>,
           strategyContext: Record<string, unknown>
-        ) => invokeGatePort(() => readStrictPort(strategyContext).validateAnalystResult(source)),
+        ) => invokeStrictAnalysisGate(source, strategyContext),
         strictGate: {
           gate: 'G1',
           reasonCode: 'analyst-fixpoint-failed',
@@ -60,6 +66,7 @@ export function buildStrictProductionPipelineStagesV1() {
           resumePoint: 'analysis-fixpoint',
           permittedMutation: 'append-enrolled-analysis-epoch',
           passReasonCode: 'analyst-fixpoint-passed',
+          retryMode: 'strict-analysis-epoch',
         },
       },
     },
@@ -110,6 +117,51 @@ async function invokeGatePort(
   }
 }
 
+async function invokeStrictAnalysisGate(
+  source: unknown,
+  strategyContext: Record<string, unknown>
+): Promise<StrictProductionGateResultV1> {
+  try {
+    const strict = readStrictPort(strategyContext);
+    const before = readStrictAnalysisEpoch(strict);
+    const rawOutcome = await strict.validateAnalystResult(source, before);
+    if (rawOutcome?.kind !== 'StrictAnalysisGateOutcomeV1' || rawOutcome.schemaVersion !== 1) {
+      throw new Error('STRICT_ANALYSIS_GATE_OUTCOME_UNTYPED');
+    }
+    const after = readStrictAnalysisEpoch(strict, false);
+    for (const obligationId of rawOutcome.enrolledObligationIds) {
+      strict.expansionPort.assertExecutionAllowed(obligationId);
+    }
+    if (rawOutcome.action === 'analysis_retry' && strict.expansionPort.finalSchedule) {
+      throw new Error('STRICT_ANALYSIS_RETRY_AFTER_SCHEDULE_SEAL');
+    }
+    if (rawOutcome.action === 'pass') {
+      const finalSchedule = strict.expansionPort.seal();
+      if (after.context.finalExpandedScheduleHash !== finalSchedule.finalExpandedScheduleHash) {
+        throw new Error('STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH');
+      }
+    }
+    const transition = validateStrictAnalysisEpochTransitionV1({
+      before,
+      after,
+      outcome: rawOutcome,
+      limits: strict.analysisLimits,
+    });
+    return {
+      action: transition.action,
+      pass: transition.action === 'pass',
+      reason: transition.reasonCode,
+      artifact: transition,
+    };
+  } catch (error: unknown) {
+    return {
+      action: 'reject',
+      pass: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function readStrictPort(context: Record<string, unknown>): StrictProductionRuntimePortV1 {
   const value = context.strictProduction;
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -118,21 +170,45 @@ function readStrictPort(context: Record<string, unknown>): StrictProductionRunti
   const port = value as Partial<StrictProductionRuntimePortV1>;
   if (
     port.enabled !== true ||
-    !port.context ||
-    !Array.isArray(port.populations) ||
+    !port.analysisLimits ||
+    !Number.isSafeInteger(port.analysisLimits.maxEpochs) ||
+    port.analysisLimits.maxEpochs < 1 ||
+    !Number.isSafeInteger(port.analysisLimits.maxObligations) ||
+    port.analysisLimits.maxObligations < 1 ||
+    !port.expansionPort ||
+    typeof port.expansionPort.assertExecutionAllowed !== 'function' ||
+    typeof port.readAnalysisEpoch !== 'function' ||
     typeof port.buildProducerInput !== 'function' ||
     typeof port.validateAnalystResult !== 'function' ||
     typeof port.reviewProducerResult !== 'function'
   ) {
     throw new Error('STRICT_PRODUCTION_RUNTIME_PORT_INVALID');
   }
-  const { schemaVersion, contextHash, ...contextInput } = port.context;
+  return port as StrictProductionRuntimePortV1;
+}
+
+function readStrictAnalysisEpoch(
+  port: StrictProductionRuntimePortV1,
+  enforceEntryLimits = true
+): StrictAnalysisEpochSnapshotV1 {
+  const snapshot = port.readAnalysisEpoch();
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    throw new Error('STRICT_ANALYSIS_EPOCH_REQUIRED');
+  }
+  const { schemaVersion, snapshotHash, ...input } = snapshot;
   if (schemaVersion !== 1) {
-    throw new Error('STRICT_ANALYSIS_CONTEXT_INVALID');
+    throw new Error('STRICT_ANALYSIS_EPOCH_VERSION_MISMATCH');
   }
-  const normalizedContext = createStrictAnalysisContextProjectionV1(contextInput);
-  if (normalizedContext.contextHash !== contextHash) {
-    throw new Error('STRICT_ANALYSIS_CONTEXT_HASH_MISMATCH');
+  const normalized = createStrictAnalysisEpochSnapshotV1(input);
+  if (normalized.snapshotHash !== snapshotHash) {
+    throw new Error('STRICT_ANALYSIS_EPOCH_HASH_MISMATCH');
   }
-  return { ...port, context: normalizedContext } as StrictProductionRuntimePortV1;
+  if (
+    enforceEntryLimits &&
+    (normalized.epoch > port.analysisLimits.maxEpochs ||
+      normalized.context.factQueryObligationIds.length > port.analysisLimits.maxObligations)
+  ) {
+    throw new Error('STRICT_ANALYSIS_LOOP_LIMIT_INVALID_AT_ENTRY');
+  }
+  return normalized;
 }

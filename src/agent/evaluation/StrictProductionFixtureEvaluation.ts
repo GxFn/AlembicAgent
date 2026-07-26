@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createStrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
+import {
+  createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
+  createStrictAnalysisExpansionPortV1,
+  createStrictAnalysisGateOutcomeV1,
+} from '../production/StrictProductionPipeline.js';
 import type { StrictProductionRuntimePortV1 } from '../production/StrictProductionStages.js';
 import type { LLMResult } from '../runtime/AgentRuntimeTypes.js';
 
@@ -129,6 +134,16 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
       ? buildValueCandidate(input.fixture, loadedSources)
       : null;
   const capturedCandidates: StrictProductionEvaluationCandidateV1[] = [];
+  const baselineScheduleHash = hashCanonical({ fixture: input.fixture.id, schedule: 'baseline' });
+  const factQueryObligationIds = sourceManifest.map((source) => `inspect:${source.sha256}`);
+  const expansionPort = createStrictAnalysisExpansionPortV1({
+    baselineScheduleHash,
+    baselineObligationIds: factQueryObligationIds,
+    knownFactFamilies: [],
+    knownSubjectRefs: [],
+    obligationCap: Math.max(1, factQueryObligationIds.length),
+  });
+  const finalExpandedScheduleHash = expansionPort.seal().finalExpandedScheduleHash;
   const context = createStrictAnalysisContextProjectionV1({
     runId: `fixture-run-${input.fixture.id}`,
     journalId: `fixture-journal-${input.fixture.id}`,
@@ -140,10 +155,10 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     }),
     planHash: hashCanonical({ fixture: input.fixture.id, phase: 'plan' }),
     requiredUniverseHash: hashCanonical(sourceManifest.map((source) => source.path)),
-    baselineScheduleHash: hashCanonical({ fixture: input.fixture.id, schedule: 'baseline' }),
+    baselineScheduleHash,
     expansionHeadHash: null,
     currentExpandedScheduleHash: hashCanonical({ fixture: input.fixture.id, schedule: 'current' }),
-    finalExpandedScheduleHash: hashCanonical({ fixture: input.fixture.id, schedule: 'final' }),
+    finalExpandedScheduleHash,
     analysisFixpointHash: hashCanonical({ fixture: input.fixture.id, fixpoint: sourceManifest }),
     privateCorpusRevision: null,
     hypothesisExpressionSetHash: null,
@@ -151,7 +166,7 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     sourceArtifactHash: hashCanonical({ fixture: input.fixture.id, sourceManifest }),
     sourceRevisionVectorHash,
     questionIds: [`fixture-question-${input.fixture.id}`],
-    factQueryObligationIds: sourceManifest.map((source) => `inspect:${source.sha256}`),
+    factQueryObligationIds,
     analysisUnitIds: sourceManifest.map((source) => `unit:${source.sha256}`),
     factIds: sourceManifest.map((source) => `fact:${source.sha256}`),
     witnessIds: sourceManifest.map((source) => `witness:${source.sha256}`),
@@ -164,62 +179,22 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     evidenceEntryIds: loadedSources.map((source) => source.evidenceEntryId),
     derivedFindingCount: 0,
   });
-  let analystValidated = false;
-  const runtimePort: StrictProductionRuntimePortV1 = {
-    enabled: true,
+  const analysisEpoch = createStrictAnalysisEpochSnapshotV1({
+    epoch: 1,
     context,
-    populations: [
-      {
-        kind: 'FrozenSourcePopulationV1',
-        sourceRevisionVectorHash,
-        observations: loadedSources.map((source) => ({
-          evidenceEntryId: source.evidenceEntryId,
-          relativePath: source.path,
-          contentHash: source.sha256,
-          lineCount: source.lineCount,
-          content: source.content,
-        })),
-      },
-    ],
-    buildProducerInput: (analysisArtifact) => ({
-      kind: 'StrictSourceProducerInputV1',
-      analysisArtifact,
-      sourceRevisionVectorHash,
-    }),
-    validateAnalystResult: (source) => {
-      assertFrozenStageReply(source, 'analyst', sourceDisposition);
-      analystValidated = true;
-      return {
-        action: 'pass',
-        pass: true,
-        artifact: {
-          kind: 'StrictSourceAnalysisArtifactV1',
-          sourceRevisionVectorHash,
-          sourceManifest,
-          disposition: sourceDisposition,
-        },
-      };
-    },
-    reviewProducerResult: (source) => {
-      if (!analystValidated) {
-        throw new Error('STRICT_FIXTURE_ANALYST_NOT_VALIDATED');
-      }
-      assertFrozenStageReply(source, 'producer', sourceDisposition);
-      if (candidate) {
-        capturedCandidates.push(candidate);
-      }
-      return {
-        action: 'pass',
-        pass: true,
-        artifact: {
-          kind: 'StrictSourceReviewDecisionV1',
-          verdict: candidate ? 'uphold' : 'investigated-empty',
-          candidateCount: candidate ? 1 : 0,
-          sourceRevisionVectorHash,
-        },
-      };
-    },
-  };
+    populations: createFrozenSourcePopulations(sourceRevisionVectorHash, loadedSources),
+    terminalObligationIds: context.factQueryObligationIds,
+    outstandingObligationIds: [],
+  });
+  const runtimePort = createFrozenFixtureRuntimePort({
+    analysisEpoch,
+    expansionPort,
+    sourceDisposition,
+    sourceRevisionVectorHash,
+    sourceManifest,
+    candidate,
+    capturedCandidates,
+  });
   return Object.freeze({
     runtimePort,
     loadedSources,
@@ -228,6 +203,85 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     capturedCandidates,
     expectedCandidateCount: candidate ? 1 : 0,
   });
+}
+
+function createFrozenSourcePopulations(
+  sourceRevisionVectorHash: string,
+  sources: readonly (LoadedStrictProductionSourceV1 & { readonly evidenceEntryId: string })[]
+) {
+  return [
+    {
+      kind: 'FrozenSourcePopulationV1',
+      sourceRevisionVectorHash,
+      observations: sources.map((source) => ({
+        evidenceEntryId: source.evidenceEntryId,
+        relativePath: source.path,
+        contentHash: source.sha256,
+        lineCount: source.lineCount,
+        content: source.content,
+      })),
+    },
+  ];
+}
+
+function createFrozenFixtureRuntimePort(input: {
+  readonly analysisEpoch: ReturnType<typeof createStrictAnalysisEpochSnapshotV1>;
+  readonly expansionPort: ReturnType<typeof createStrictAnalysisExpansionPortV1>;
+  readonly sourceDisposition: StrictProductionSourceFixtureV1['expectedDisposition'];
+  readonly sourceRevisionVectorHash: string;
+  readonly sourceManifest: readonly unknown[];
+  readonly candidate: StrictProductionEvaluationCandidateV1 | null;
+  readonly capturedCandidates: StrictProductionEvaluationCandidateV1[];
+}): StrictProductionRuntimePortV1 {
+  let analystValidated = false;
+  return {
+    enabled: true,
+    analysisLimits: {
+      maxEpochs: 1,
+      maxObligations: input.analysisEpoch.context.factQueryObligationIds.length,
+    },
+    expansionPort: input.expansionPort,
+    readAnalysisEpoch: () => input.analysisEpoch,
+    buildProducerInput: (analysisArtifact) => ({
+      kind: 'StrictSourceProducerInputV1',
+      analysisArtifact,
+      sourceRevisionVectorHash: input.sourceRevisionVectorHash,
+    }),
+    validateAnalystResult: (source, observedEpoch) => {
+      assertFrozenStageReply(source, 'analyst', input.sourceDisposition);
+      analystValidated = true;
+      return createStrictAnalysisGateOutcomeV1({
+        action: 'pass',
+        reasonCode: 'frozen-fixture-fixpoint-stable',
+        observedEpochHash: observedEpoch.snapshotHash,
+        artifact: {
+          kind: 'StrictSourceAnalysisArtifactV1',
+          sourceRevisionVectorHash: input.sourceRevisionVectorHash,
+          sourceManifest: input.sourceManifest,
+          disposition: input.sourceDisposition,
+        },
+      });
+    },
+    reviewProducerResult: (source) => {
+      if (!analystValidated) {
+        throw new Error('STRICT_FIXTURE_ANALYST_NOT_VALIDATED');
+      }
+      assertFrozenStageReply(source, 'producer', input.sourceDisposition);
+      if (input.candidate) {
+        input.capturedCandidates.push(input.candidate);
+      }
+      return {
+        action: 'pass',
+        pass: true,
+        artifact: {
+          kind: 'StrictSourceReviewDecisionV1',
+          verdict: input.candidate ? 'uphold' : 'investigated-empty',
+          candidateCount: input.candidate ? 1 : 0,
+          sourceRevisionVectorHash: input.sourceRevisionVectorHash,
+        },
+      };
+    },
+  };
 }
 
 function buildValueCandidate(

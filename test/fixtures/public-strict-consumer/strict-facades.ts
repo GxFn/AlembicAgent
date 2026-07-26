@@ -20,16 +20,24 @@ import {
   type CreateStrictProducerExpressionSetInputV1,
   type CreateStrictProducerLineageReceiptInputV1,
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
+  createStrictAnalysisGateOutcomeV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
   type FullAuthoredProjectionV1,
   type ProducerEligibleHypothesisV1,
   type StrictAnalysisContextInputV1,
   type StrictAnalysisContextProjectionV1,
+  type StrictAnalysisEpochSnapshotInputV1,
+  type StrictAnalysisEpochSnapshotV1,
+  type StrictAnalysisEpochTransitionV1,
   type StrictAnalysisExpansionPortInputV1,
   type StrictAnalysisExpansionPortV1,
+  type StrictAnalysisGateOutcomeInputV1,
+  type StrictAnalysisGateOutcomeV1,
+  type StrictAnalysisLoopLimitsV1,
   type StrictAnalystEpochInputV1,
   type StrictAnalystEpochV1,
   type StrictFalsificationInputV1,
@@ -41,6 +49,7 @@ import {
   type StrictProducerProposalV1,
   type StrictProductionGateResultV1,
   type StrictProductionRuntimePortV1,
+  validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
 } from '@alembic/agent/production';
 import type * as RunsFacade from '@alembic/agent/runs';
@@ -72,7 +81,10 @@ export interface StrictFacadePrivateSurfaceAssertions {
 export const strictRuntimeBindings = {
   runStrictPlanAgent,
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
+  createStrictAnalysisGateOutcomeV1,
+  validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
   createStrictProducerLineageReceiptV1,
@@ -87,6 +99,12 @@ export interface StrictFacadeConsumerTypes {
   readonly planInput: RunStrictPlanAgentInput;
   readonly analysisContextInput: StrictAnalysisContextInputV1;
   readonly analysisContext: StrictAnalysisContextProjectionV1;
+  readonly analysisLoopLimits: StrictAnalysisLoopLimitsV1;
+  readonly epochSnapshotInput: StrictAnalysisEpochSnapshotInputV1;
+  readonly epochSnapshot: StrictAnalysisEpochSnapshotV1;
+  readonly gateOutcomeInput: StrictAnalysisGateOutcomeInputV1;
+  readonly gateOutcome: StrictAnalysisGateOutcomeV1;
+  readonly epochTransition: StrictAnalysisEpochTransitionV1;
   readonly expansionInput: StrictAnalysisExpansionPortInputV1;
   readonly expansionPort: StrictAnalysisExpansionPortV1;
   readonly induction: StrictInductionInputV1;

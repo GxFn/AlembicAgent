@@ -188,7 +188,7 @@
     {
       "export": "./production",
       "specifier": "@alembic/agent/production",
-      "contract": "Curated strict analysis projection, expansion, Analyst epoch/fixpoint, Producer lineage/expression-set, repair, gate, and stage-port contracts.",
+      "contract": "Curated strict analysis projection, append-only epoch snapshot/transition, typed fixpoint retry, expansion, Analyst fixpoint, Producer lineage/expression-set, repair, gate, and stage-port contracts.",
       "agentOwned": ["strict analysis validation", "Producer lineage and expression-set construction", "strict runtime port contract"],
       "hostOwnedAdapterBoundary": "Host owns Main orchestration and injects accepted Core receipts through the strict runtime port; internal stage, gate, prompt, and repair authority stays Agent-owned."
     },

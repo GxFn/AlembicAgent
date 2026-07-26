@@ -27,10 +27,13 @@ const STRICT_FACADES = {
     types: './dist/production.d.ts',
     runtime: [
       { name: 'createStrictAnalysisContextProjectionV1', kind: 'function' },
+      { name: 'createStrictAnalysisEpochSnapshotV1', kind: 'function' },
       { name: 'createStrictAnalysisExpansionPortV1', kind: 'function' },
       { name: 'createStrictAnalysisFixpointV1', kind: 'function' },
+      { name: 'createStrictAnalysisGateOutcomeV1', kind: 'function' },
       { name: 'createStrictProducerExpressionSetV1', kind: 'function' },
       { name: 'createStrictProducerLineageReceiptV1', kind: 'function' },
+      { name: 'validateStrictAnalysisEpochTransitionV1', kind: 'function' },
       { name: 'validateStrictAnalystEpochV1', kind: 'function' },
     ],
   },

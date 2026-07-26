@@ -1841,11 +1841,15 @@
       ]
     },
     "./production": {
-      "exportCount": 6,
-      "signatureHash": "daba3114177c785585504a7b252f7f499d8b6312554fb4d45bad6890f0658234",
+      "exportCount": 9,
+      "signatureHash": "9875ef055732348f38671523464e51fa83eb092578a247d168b68b0376f59943",
       "entries": [
         {
           "name": "createStrictAnalysisContextProjectionV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictAnalysisEpochSnapshotV1",
           "kind": "function"
         },
         {
@@ -1857,11 +1861,19 @@
           "kind": "function"
         },
         {
+          "name": "createStrictAnalysisGateOutcomeV1",
+          "kind": "function"
+        },
+        {
           "name": "createStrictProducerExpressionSetV1",
           "kind": "function"
         },
         {
           "name": "createStrictProducerLineageReceiptV1",
+          "kind": "function"
+        },
+        {
+          "name": "validateStrictAnalysisEpochTransitionV1",
           "kind": "function"
         },
         {

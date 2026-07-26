@@ -19,10 +19,13 @@ const requiredRuntimeBindings = {
   './runs': ['runStrictPlanAgent'],
   './production': [
     'createStrictAnalysisContextProjectionV1',
+    'createStrictAnalysisEpochSnapshotV1',
     'createStrictAnalysisExpansionPortV1',
     'createStrictAnalysisFixpointV1',
+    'createStrictAnalysisGateOutcomeV1',
     'createStrictProducerExpressionSetV1',
     'createStrictProducerLineageReceiptV1',
+    'validateStrictAnalysisEpochTransitionV1',
     'validateStrictAnalystEpochV1',
   ],
   './evaluation': [
