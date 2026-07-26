@@ -1175,6 +1175,24 @@ function validateStrictAnalysisRetryTransition(input: {
     input.after.terminalObligationIds,
     'STRICT_ANALYSIS_TERMINAL_OBLIGATIONS_NOT_APPEND_ONLY'
   );
+  assertSameIds(
+    getAddedIds(
+      input.before.context.factQueryObligationIds,
+      input.after.context.factQueryObligationIds
+    ),
+    input.outcome.enrolledObligationIds,
+    'STRICT_ANALYSIS_RETRY_ENROLLMENT_DIFF_MISMATCH'
+  );
+  assertSameIds(
+    getAddedIds(input.before.terminalObligationIds, input.after.terminalObligationIds),
+    input.outcome.executedObligationIds,
+    'STRICT_ANALYSIS_RETRY_TERMINAL_DIFF_MISMATCH'
+  );
+  assertSameIds(
+    input.before.outstandingObligationIds,
+    input.after.outstandingObligationIds,
+    'STRICT_ANALYSIS_RETRY_OUTSTANDING_MUTATED'
+  );
   for (const obligationId of input.outcome.enrolledObligationIds) {
     if (
       input.before.context.factQueryObligationIds.includes(obligationId) ||
@@ -1257,6 +1275,11 @@ function assertAppendOnlyIds(
   if (before.some((value) => !afterSet.has(value))) {
     fail(code);
   }
+}
+
+function getAddedIds(before: readonly string[], after: readonly string[]): string[] {
+  const beforeSet = new Set(before);
+  return after.filter((value) => !beforeSet.has(value));
 }
 
 function assertStrictContextIntegrity(context: StrictAnalysisContextProjectionV1): void {

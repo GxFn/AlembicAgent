@@ -88,6 +88,28 @@ function nextContext(
   });
 }
 
+function sealFixpointEpoch(
+  observedEpoch: StrictAnalysisEpochSnapshotV1,
+  expansionPort: ReturnType<typeof createStrictAnalysisExpansionPortV1>
+): StrictAnalysisEpochSnapshotV1 {
+  const {
+    schemaVersion: _schemaVersion,
+    contextHash: _contextHash,
+    ...contextInput
+  } = observedEpoch.context;
+  return createStrictAnalysisEpochSnapshotV1({
+    epoch: observedEpoch.epoch,
+    context: createStrictAnalysisContextProjectionV1({
+      ...contextInput,
+      finalExpandedScheduleHash: expansionPort.seal().finalExpandedScheduleHash,
+      analysisFixpointHash: `analysis-fixpoint-${observedEpoch.epoch}`,
+    }),
+    populations: observedEpoch.populations,
+    terminalObligationIds: observedEpoch.terminalObligationIds,
+    outstandingObligationIds: observedEpoch.outstandingObligationIds,
+  });
+}
+
 function buildRuntimePort(input: {
   readAnalysisEpoch: () => StrictAnalysisEpochSnapshotV1;
   validateAnalystResult: StrictProductionRuntimePortV1['validateAnalystResult'];
@@ -266,6 +288,299 @@ describe('strict iterative Analyst epochs', () => {
         { epoch: 2, action: 'pass' },
       ],
     });
+  });
+
+  it('rejects a pre-authorized shadow obligation omitted from the typed retry outcome', async () => {
+    const expansionPort = createStrictAnalysisExpansionPortV1({
+      baselineScheduleHash: 'schedule-baseline',
+      baselineObligationIds: ['base-1'],
+      knownFactFamilies: [
+        {
+          id: 'syntax-patterns',
+          capabilityId: 'facts.syntax',
+          supportedScales: ['file'],
+        },
+      ],
+      knownSubjectRefs: ['file:counter', 'file:shadow'],
+      obligationCap: 3,
+    });
+    let currentEpoch = createInitialEpoch();
+    let gateCalls = 0;
+    const prompts: string[] = [];
+    const output = await executeStrict(
+      buildRuntimePort({
+        expansionPort,
+        maxObligations: 3,
+        readAnalysisEpoch: () => currentEpoch,
+        validateAnalystResult: (_source, observedEpoch) => {
+          gateCalls += 1;
+          if (gateCalls === 1) {
+            expansionPort.enroll({
+              obligationId: 'counter-1',
+              purpose: 'counterexample',
+              factFamilyId: 'syntax-patterns',
+              capabilityId: 'facts.syntax',
+              canonicalSubjectRef: 'file:counter',
+              analysisScale: 'file',
+              reasonCode: 'declared-counterexample',
+            });
+            const shadowEnrollment = expansionPort.enroll({
+              obligationId: 'shadow-1',
+              purpose: 'exploration',
+              factFamilyId: 'syntax-patterns',
+              capabilityId: 'facts.syntax',
+              canonicalSubjectRef: 'file:shadow',
+              analysisScale: 'file',
+              reasonCode: 'hidden-shadow-query',
+            });
+            const {
+              schemaVersion: _schemaVersion,
+              contextHash: _contextHash,
+              ...contextInput
+            } = observedEpoch.context;
+            currentEpoch = createStrictAnalysisEpochSnapshotV1({
+              epoch: 2,
+              context: createStrictAnalysisContextProjectionV1({
+                ...contextInput,
+                expansionHeadHash: shadowEnrollment.receiptHash,
+                currentExpandedScheduleHash: shadowEnrollment.receiptHash,
+                factQueryObligationIds: [
+                  ...observedEpoch.context.factQueryObligationIds,
+                  'counter-1',
+                  'shadow-1',
+                ],
+                factIds: [...observedEpoch.context.factIds, 'fact-counter', 'fact-shadow'],
+                witnessIds: [
+                  ...observedEpoch.context.witnessIds,
+                  'witness-counter',
+                  'witness-shadow',
+                ],
+                populationHashes: [...observedEpoch.context.populationHashes, 'population-2'],
+              }),
+              populations: [
+                {
+                  populationId: 'population-main',
+                  revision: 2,
+                  factIds: ['fact-base', 'fact-counter', 'fact-shadow'],
+                },
+              ],
+              terminalObligationIds: ['base-1', 'counter-1', 'shadow-1'],
+              outstandingObligationIds: [],
+            });
+            return createStrictAnalysisGateOutcomeV1({
+              action: 'analysis_retry',
+              reasonCode: 'declares-only-one-of-two-appended-obligations',
+              observedEpochHash: observedEpoch.snapshotHash,
+              enrolledObligationIds: ['counter-1'],
+              executedObligationIds: ['counter-1'],
+            });
+          }
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          return createStrictAnalysisGateOutcomeV1({
+            action: 'pass',
+            reasonCode: 'shadow-obligation-was-not-detected',
+            observedEpochHash: observedEpoch.snapshotHash,
+          });
+        },
+      }),
+      prompts
+    );
+
+    expect(output.outcome).toBe('failed');
+    expect(gateCalls).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(output.phases.analyst_fixpoint_gate).toMatchObject({
+      action: 'reject',
+      reason: expect.stringContaining('STRICT_ANALYSIS_RETRY_ENROLLMENT_DIFF_MISMATCH'),
+    });
+    expect(output.phases).not.toHaveProperty('produce');
+  });
+
+  it('authorizes every appended obligation instead of trusting the typed declaration subset', async () => {
+    const expansionPort = createStrictAnalysisExpansionPortV1({
+      baselineScheduleHash: 'schedule-baseline',
+      baselineObligationIds: ['base-1'],
+      knownFactFamilies: [
+        {
+          id: 'syntax-patterns',
+          capabilityId: 'facts.syntax',
+          supportedScales: ['file'],
+        },
+      ],
+      knownSubjectRefs: ['file:counter', 'file:shadow'],
+      obligationCap: 3,
+    });
+    let currentEpoch = createInitialEpoch();
+    let gateCalls = 0;
+    const prompts: string[] = [];
+    const output = await executeStrict(
+      buildRuntimePort({
+        expansionPort,
+        maxObligations: 3,
+        readAnalysisEpoch: () => currentEpoch,
+        validateAnalystResult: (_source, observedEpoch) => {
+          gateCalls += 1;
+          if (gateCalls === 1) {
+            const enrollment = expansionPort.enroll({
+              obligationId: 'counter-1',
+              purpose: 'counterexample',
+              factFamilyId: 'syntax-patterns',
+              capabilityId: 'facts.syntax',
+              canonicalSubjectRef: 'file:counter',
+              analysisScale: 'file',
+              reasonCode: 'declared-counterexample',
+            });
+            const {
+              schemaVersion: _schemaVersion,
+              contextHash: _contextHash,
+              ...contextInput
+            } = observedEpoch.context;
+            currentEpoch = createStrictAnalysisEpochSnapshotV1({
+              epoch: 2,
+              context: createStrictAnalysisContextProjectionV1({
+                ...contextInput,
+                expansionHeadHash: enrollment.receiptHash,
+                currentExpandedScheduleHash: enrollment.receiptHash,
+                factQueryObligationIds: [
+                  ...observedEpoch.context.factQueryObligationIds,
+                  'counter-1',
+                  'shadow-1',
+                ],
+                factIds: [...observedEpoch.context.factIds, 'fact-counter', 'fact-shadow'],
+                witnessIds: [
+                  ...observedEpoch.context.witnessIds,
+                  'witness-counter',
+                  'witness-shadow',
+                ],
+                populationHashes: [...observedEpoch.context.populationHashes, 'population-2'],
+              }),
+              populations: [
+                {
+                  populationId: 'population-main',
+                  revision: 2,
+                  factIds: ['fact-base', 'fact-counter', 'fact-shadow'],
+                },
+              ],
+              terminalObligationIds: ['base-1', 'counter-1', 'shadow-1'],
+              outstandingObligationIds: [],
+            });
+            return createStrictAnalysisGateOutcomeV1({
+              action: 'analysis_retry',
+              reasonCode: 'hidden-query-never-enrolled',
+              observedEpochHash: observedEpoch.snapshotHash,
+              enrolledObligationIds: ['counter-1'],
+              executedObligationIds: ['counter-1'],
+            });
+          }
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          return createStrictAnalysisGateOutcomeV1({
+            action: 'pass',
+            reasonCode: 'unenrolled-shadow-was-not-detected',
+            observedEpochHash: observedEpoch.snapshotHash,
+          });
+        },
+      }),
+      prompts
+    );
+
+    expect(output.outcome).toBe('failed');
+    expect(gateCalls).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(output.phases.analyst_fixpoint_gate).toMatchObject({
+      action: 'reject',
+      reason: expect.stringContaining('STRICT_ANALYSIS_QUERY_UNENROLLED: shadow-1'),
+    });
+    expect(output.phases).not.toHaveProperty('produce');
+  });
+
+  it('rejects an undeclared terminal transition that resolves prior outstanding work in parallel', async () => {
+    const expansionPort = createStrictAnalysisExpansionPortV1({
+      baselineScheduleHash: 'schedule-baseline',
+      baselineObligationIds: ['base-1', 'pending-1'],
+      knownFactFamilies: [
+        {
+          id: 'syntax-patterns',
+          capabilityId: 'facts.syntax',
+          supportedScales: ['file'],
+        },
+      ],
+      knownSubjectRefs: ['file:counter'],
+      obligationCap: 3,
+    });
+    let currentEpoch = createStrictAnalysisEpochSnapshotV1({
+      epoch: 1,
+      context: createContext({
+        factQueryObligationIds: ['base-1', 'pending-1'],
+      }),
+      populations: [{ populationId: 'population-main', revision: 1, factIds: ['fact-base'] }],
+      terminalObligationIds: ['base-1'],
+      outstandingObligationIds: ['pending-1'],
+    });
+    let gateCalls = 0;
+    const prompts: string[] = [];
+    const output = await executeStrict(
+      buildRuntimePort({
+        expansionPort,
+        maxObligations: 3,
+        readAnalysisEpoch: () => currentEpoch,
+        validateAnalystResult: (_source, observedEpoch) => {
+          gateCalls += 1;
+          if (gateCalls === 1) {
+            const enrollment = expansionPort.enroll({
+              obligationId: 'counter-1',
+              purpose: 'counterexample',
+              factFamilyId: 'syntax-patterns',
+              capabilityId: 'facts.syntax',
+              canonicalSubjectRef: 'file:counter',
+              analysisScale: 'file',
+              reasonCode: 'declared-counterexample',
+            });
+            currentEpoch = createStrictAnalysisEpochSnapshotV1({
+              epoch: 2,
+              context: nextContext(observedEpoch.context, {
+                expansionHeadHash: enrollment.receiptHash,
+                obligationId: 'counter-1',
+                factId: 'fact-counter',
+                witnessId: 'witness-counter',
+                populationHash: 'population-2',
+              }),
+              populations: [
+                {
+                  populationId: 'population-main',
+                  revision: 2,
+                  factIds: ['fact-base', 'fact-counter'],
+                },
+              ],
+              terminalObligationIds: ['base-1', 'counter-1', 'pending-1'],
+              outstandingObligationIds: [],
+            });
+            return createStrictAnalysisGateOutcomeV1({
+              action: 'analysis_retry',
+              reasonCode: 'also-resolved-prior-outstanding-work',
+              observedEpochHash: observedEpoch.snapshotHash,
+              enrolledObligationIds: ['counter-1'],
+              executedObligationIds: ['counter-1'],
+            });
+          }
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          return createStrictAnalysisGateOutcomeV1({
+            action: 'pass',
+            reasonCode: 'parallel-terminal-mutation-was-not-detected',
+            observedEpochHash: observedEpoch.snapshotHash,
+          });
+        },
+      }),
+      prompts
+    );
+
+    expect(output.outcome).toBe('failed');
+    expect(gateCalls).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(output.phases.analyst_fixpoint_gate).toMatchObject({
+      action: 'reject',
+      reason: expect.stringContaining('STRICT_ANALYSIS_RETRY_TERMINAL_DIFF_MISMATCH'),
+    });
+    expect(output.phases).not.toHaveProperty('produce');
   });
 
   it('fails closed when a retry does not advance the append-only epoch state', async () => {

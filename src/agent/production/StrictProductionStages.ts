@@ -129,7 +129,9 @@ async function invokeStrictAnalysisGate(
       throw new Error('STRICT_ANALYSIS_GATE_OUTCOME_UNTYPED');
     }
     const after = readStrictAnalysisEpoch(strict, false);
-    for (const obligationId of rawOutcome.enrolledObligationIds) {
+    // 授权检查必须来自真实 epoch 差集，而不是模型声明的子集；否则影子 obligation
+    // 可以写进 context/terminal 集合却绕过 expansion port。
+    for (const obligationId of getAppendedAnalysisObligationIds(before, after)) {
       strict.expansionPort.assertExecutionAllowed(obligationId);
     }
     if (rawOutcome.action === 'analysis_retry' && strict.expansionPort.finalSchedule) {
@@ -160,6 +162,16 @@ async function invokeStrictAnalysisGate(
       reason: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function getAppendedAnalysisObligationIds(
+  before: StrictAnalysisEpochSnapshotV1,
+  after: StrictAnalysisEpochSnapshotV1
+): string[] {
+  const beforeIds = new Set(before.context.factQueryObligationIds);
+  return after.context.factQueryObligationIds.filter(
+    (obligationId) => !beforeIds.has(obligationId)
+  );
 }
 
 function readStrictPort(context: Record<string, unknown>): StrictProductionRuntimePortV1 {
