@@ -14,82 +14,12 @@ if (linkedAgentRoot !== repoRoot) {
   throw new Error(`ALEMBIC_AGENT_LINK_MISMATCH: expected ${repoRoot}, got ${linkedAgentRoot}`);
 }
 
-const runtimeProbe = `
-import { runStrictPlanAgent } from '@alembic/agent/runs';
-import {
-  createStrictAnalysisContextProjectionV1,
-  createStrictAnalysisEpochSnapshotV1,
-  createStrictAnalysisExpansionPortV1,
-  createStrictAnalysisGateOutcomeV1,
-  createStrictHypothesisExpressionSetReceiptV1,
-  validateStrictAnalysisEpochTransitionV1,
-  validateStrictAnalystEpochV1,
-  createStrictAnalysisFixpointV1,
-  createStrictProducerLineageReceiptV1,
-  createStrictProducerExpressionSetV1,
-} from '@alembic/agent/production';
-import {
-  createFrozenEvidenceProjection,
-  IndependentValueReviewer,
-  InvestigatedEmptyReviewer,
-} from '@alembic/agent/evaluation';
-
-const bindings = {
-  runStrictPlanAgent,
-  createStrictAnalysisContextProjectionV1,
-  createStrictAnalysisEpochSnapshotV1,
-  createStrictAnalysisExpansionPortV1,
-  createStrictAnalysisGateOutcomeV1,
-  createStrictHypothesisExpressionSetReceiptV1,
-  validateStrictAnalysisEpochTransitionV1,
-  validateStrictAnalystEpochV1,
-  createStrictAnalysisFixpointV1,
-  createStrictProducerLineageReceiptV1,
-  createStrictProducerExpressionSetV1,
-  createFrozenEvidenceProjection,
-  IndependentValueReviewer,
-  InvestigatedEmptyReviewer,
-};
-for (const [name, value] of Object.entries(bindings)) {
-  if (typeof value !== 'function') {
-    throw new Error('STRICT_PUBLIC_BINDING_INVALID: ' + name + '=' + typeof value);
-  }
-}
-
-for (const specifier of [
-  '@alembic/agent',
-  '@alembic/agent/service',
-  '@alembic/agent/runtime',
-  '@alembic/agent/prompts',
-]) {
-  const imported = await import(specifier);
-  if (!imported || typeof imported !== 'object') {
-    throw new Error('LEGACY_PUBLIC_IMPORT_INVALID: ' + specifier);
-  }
-}
-
-const forbidden = [
-  '@alembic/agent/src/index.js',
-  '@alembic/agent/dist/index.js',
-  '@alembic/agent/runs/plan/PlanAgentRun.js',
-  '@alembic/agent/production/StrictProductionPipeline.js',
-  '@alembic/agent/production/internal/escape.js',
-  '@alembic/agent/evaluation/MiningJudge.js',
-  '@alembic/agent/evaluation/StrictProductionFixtureEvaluation.js',
-];
-for (const specifier of forbidden) {
-  try {
-    await import(specifier);
-    throw new Error('FORBIDDEN_IMPORT_SUCCEEDED: ' + specifier);
-  } catch (error) {
-    if (error?.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-      throw error;
-    }
-  }
-}
-
-console.log(JSON.stringify({ runtimeBindingCount: Object.keys(bindings).length, forbiddenCount: forbidden.length }));
-`;
+// 运行体作为源码资产维护，但用 --eval 在 Main cwd 的 fresh process 中启动，确保所有
+// bare specifier 都从真实公共 consumer 环境解析，而不是从 Agent 仓库内部路径解析。
+const runtimeProbe = fs.readFileSync(
+  path.join(repoRoot, 'scripts', 'fixtures', 'strict-public-connected-probe.mjs'),
+  'utf8'
+);
 
 const runtime = spawnSync(process.execPath, ['--input-type=module', '--eval', runtimeProbe], {
   cwd: mainRoot,
@@ -100,32 +30,16 @@ if (runtime.status !== 0) {
   process.exit(runtime.status ?? 1);
 }
 
-// 复用 Core 自己的 public-facade real-executor probe；它从临时 project.json 经过真实
-// fact executor/canonical constructors 生成 authority JSON，避免 Agent probe 手工拼 hash 自证。
-const coreProbePath = path.resolve(
-  repoRoot,
-  '..',
-  'AlembicCore',
-  'scripts',
-  'strict-production-authority-probe.mjs'
-);
-const coreRuntime = spawnSync(process.execPath, [coreProbePath], {
-  cwd: mainRoot,
-  encoding: 'utf8',
-});
-if (coreRuntime.status !== 0) {
-  process.stderr.write(coreRuntime.stderr || coreRuntime.stdout);
-  process.exit(coreRuntime.status ?? 1);
-}
-const coreAuthorityProof = JSON.parse(coreRuntime.stdout);
+const runtimeReceipt = JSON.parse(runtime.stdout.trim());
 if (
-  coreAuthorityProof?.executor?.realExecutor !== true ||
-  coreAuthorityProof?.publicSubpaths?.includes('@alembic/core/production') !== true ||
-  !coreAuthorityProof?.authorityHash ||
-  !coreAuthorityProof?.analysisReviewContextHash ||
-  coreAuthorityProof?.faults?.some((fault) => fault.rejected !== true)
+  runtimeReceipt?.continuityVerified !== true ||
+  runtimeReceipt?.connectedChain?.executor?.realExecutor !== true ||
+  runtimeReceipt?.connectedChain?.population?.completion !== 'complete' ||
+  runtimeReceipt?.connectedChain?.terminal?.terminalClosure !== 'expressed' ||
+  runtimeReceipt?.faults?.length !== 11 ||
+  runtimeReceipt.faults.some((fault) => fault.rejected !== true)
 ) {
-  throw new Error('STRICT_CORE_PUBLIC_AUTHORITY_PROOF_INVALID');
+  throw new Error('STRICT_AGENT_PUBLIC_CONNECTED_AUTHORITY_PROOF_INVALID');
 }
 
 const fixturePath = path.join(
@@ -173,24 +87,17 @@ if (diagnostics.length > 0) {
   process.exit(1);
 }
 
-const runtimeReceipt = JSON.parse(runtime.stdout.trim());
 process.stdout.write(
   `${JSON.stringify({
-    schemaVersion: 1,
-    probe: 'alembic-agent-strict-public-facade-fresh-process',
+    schemaVersion: 2,
+    probe: runtimeReceipt.probe,
     runtimeBindings: runtimeReceipt.runtimeBindingCount,
     forbiddenImportsRejected: runtimeReceipt.forbiddenCount,
     types: 'resolved',
-    publicSubpaths: ['@alembic/agent/production', '@alembic/core/production'],
-    coreSemanticAuthority: {
-      realExecutor: coreAuthorityProof.executor.realExecutor,
-      executionReceiptHash: coreAuthorityProof.executor.receiptHash,
-      executionOutputHash: coreAuthorityProof.executor.outputHash,
-      analysisReviewContextHash: coreAuthorityProof.analysisReviewContextHash,
-      authorityHash: coreAuthorityProof.authorityHash,
-      resourceConservation: coreAuthorityProof.resourceConservation,
-      faultCount: coreAuthorityProof.faults.length,
-      reportHash: coreAuthorityProof.reportHash,
-    },
+    publicSubpaths: runtimeReceipt.publicSubpaths,
+    continuityVerified: runtimeReceipt.continuityVerified,
+    connectedChain: runtimeReceipt.connectedChain,
+    faults: runtimeReceipt.faults,
+    reportHash: runtimeReceipt.reportHash,
   })}\n`
 );
