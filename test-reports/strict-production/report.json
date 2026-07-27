@@ -16,32 +16,33 @@
     "providerHash": "sha256:597ceb57e20cdded49d2ad4a40fded279a4a1d0dcfd68f1ced441452dd239ca1",
     "reviewerHash": "sha256:e539f52e8224430c574042cd975655c6f2f9bdc9f16952ef0890d5093fa02033",
     "configHash": "sha256:7cfc4e690f0e8df14507acbd02f7303942b4d10e9f0170aaa7021628067e2c61",
-    "goldenHash": "sha256:90329055f7792e8ac7cb5252ee218a0cec0d1ca93686fa789623ebefeb421bac"
+    "goldenHash": "sha256:62148dea7515bb17dfa9c6d2a23146e3afed281e32b0fe4873f9029958bc366e"
   },
   "loadedContracts": {
     "upstream": {
-      "coreCommit": "6b6341f05332a1d15f79c19a0251d41b962b71d1",
-      "coreTree": "84c094ee01052c91df5c9e94a50862dc61652f15",
+      "coreCommit": "96655b9bbd56f22381ffa7f48a6cd52cabc5a1da",
+      "coreTree": "9dd82ee8eb10e8f63e3e6a72d18fd23ed2a61301",
       "pcfBaselineReceiptHash": "ee67374be793953728d391eee3dc7710380ccb40708ece8a02c9636525959af6"
     },
-    "loadedCoreModuleSha256": "sha256:97aaf362365d12d06b063d9ca78f9173baaf818fcfc1587cd35e28fd6ed13441",
+    "loadedCoreModuleSha256": "sha256:852feb9f4c4194dff631257a2b407abc7d950a137bd2d00748e72647f92cb8c2",
     "loadedAgentModuleSha256": {
       "plan": "sha256:000d67022956d0b4350f5448ce9006e37fa9818650fc378008aa3319c6b3eab2",
-      "pipeline": "sha256:bd13ba532baea53e6afecf34d22408939557acb19f9d45b01e9a2fd8d670f0c1",
-      "production": "sha256:d987e9584ece40531f6d6a2d72f65ae40db3504358da1642f702c7995e869ea2",
-      "productionStages": "sha256:423ede6cc51e381ef1f45b400699403dd4ac4d9ca101a5af6a5c1176021dc6be",
-      "productionPrompts": "sha256:2674cf8851ec4ff7643bea84ccfceffc4c3429cb217ca00cce1471f4b792fbb0",
+      "pipeline": "sha256:80c900ca7c64424bca57aafa0d5d7ad1da093c9001829384d505503031d379ff",
+      "production": "sha256:a1a9172dbac1e7bc1985a2957503af0d2aa9ef3211a21aa2865c017aa1f71572",
+      "productionStages": "sha256:62c9f6a3833f58e926f04b4c0b1e3428d8dfa8d9ca09a798034afdb043cd901f",
+      "productionPrompts": "sha256:ea04500f02adeec81980089afc0f171445f0d4e1333e6ad36b9d744bc99ce818",
       "reviewer": "sha256:59046c7c6a6034ee524e70bc0a502dca618edb44edd1b3a363ae9d42fabd338b"
     },
     "agentEntrypoints": [
       "runStrictPlanAgent",
       "validateStrictAnalystEpochV1",
       "createStrictAnalysisFixpointV1",
+      "createStrictHypothesisExpressionSetReceiptV1",
       "createStrictProducerExpressionSetV1",
       "IndependentValueReviewer",
       "InvestigatedEmptyReviewer"
     ],
-    "coreModule": "@alembic/core/host-agent-workflows",
+    "coreModule": "@alembic/core/production",
     "coreContractConsumption": [
       "AnalysisScheduleExpansionReceiptV1",
       "ObservationPopulationV1",
@@ -49,6 +50,8 @@
       "InductionReceiptV1",
       "FalsificationReceiptV1",
       "AnalysisFixpointReceiptV1",
+      "KnowledgeDispositionReviewV1",
+      "HypothesisExpressionSetReceiptV1",
       "TypedGateReturnV1"
     ]
   },
@@ -94,26 +97,25 @@
         "fullScopeCount": 1
       },
       "analyst": {
-        "expansionReceiptHashes": [
-          "sha256:e824507fd168fa6cd2012cbf57336bf360a62053508e34d8bb01a89ff476ba30"
-        ],
-        "populationHash": "sha256:d3fe3063f8a45ba90b725863680b44ec00eb7ad4218b354785f2e38e12263c09",
-        "clusterSetHash": "sha256:3dfd574435ab07671d4506db9ad4a36a21b741b2ac7cb0aa3040ea2af9a43a07",
+        "expansionReceiptHashes": [],
+        "populationHash": "sha256:6816f5276dafdb302f1d7a6886328fdcf07e915f2922324577fe953c4861c5c9",
+        "clusterSetHash": "sha256:354db1db61ca1304a108d7e0ae6d66e2c5b3eb12d3d036c375a2186899146a10",
         "inductionReceiptHashes": [
-          "sha256:9b4489d3d86c16e9fcf56b96840577484bcc023e1ed1a7799df3fe55ff36bff7"
+          "sha256:49434e274d28ceff7e80d3b991d70a687a60dd9fdafacd1cbf46dd1e06107c4d"
         ],
         "falsificationReceiptHashes": [
-          "sha256:4bb82feef35343557492391a98390ba9cab60938ac5ed53b381e4d5c9790f2f3"
+          "sha256:01b1652a1a0a29e13decc307c8a1c860638635c81fa3658c9612da9500a1c4a9"
         ],
-        "fixpointHash": "sha256:01a919ca58ee4a214e54e6e7f38c5166e1771712716bb0bbd95b12b44e1117c6",
+        "fixpointHash": "sha256:e93ff9a34db8d8cf32cd8d76e0ec99ceba836a99046530362dbe5a48b7dd65e5",
         "producerEligibleHypothesisIds": [
           "hypothesis-alembic-workspace-single-file-value"
         ]
       },
       "producer": {
         "cardinality": 1,
-        "setHash": "60aa880c41be2953f4548ca77814552d6f865ae5c76f30689bc6cc596a33e9a7",
+        "setHash": "9492e99ac8e466e7d7a537dc9dab28f443eeaaa10c2474d8e43429c192fe1a6c",
         "disposition": "proposal-only",
+        "terminalClosure": "expressed",
         "toolCallCount": 0,
         "persistenceCallCount": 0,
         "selfReviewCallCount": 0
@@ -157,27 +159,26 @@
       },
       "analyst": {
         "expansionReceiptHashes": [],
-        "populationHash": "sha256:7c5d31fb527ce8529eff4a58c83f93ff1aba01715a7cd77998308dd94beb5b23",
-        "clusterSetHash": "sha256:ab1c4d1eaa40f227569b549ffc738d78c6f4a5a84702ccfca248978a44841024",
-        "inductionReceiptHashes": [
-          "sha256:9902e8b2a033a33a03d5fe9ee6c22ed885ce226dc482b9a3f213fae54e009e7c"
-        ],
+        "populationHash": "sha256:87325ef1e1367b63ac78120746e0b744719bf1b842bbf5c8a0af1580fb2023c6",
+        "clusterSetHash": "sha256:a9074b20d92ab7a43273fdbb7d434d20f61f680632c57992b29a512c0eaf4830",
+        "inductionReceiptHashes": [],
         "falsificationReceiptHashes": [],
-        "fixpointHash": "sha256:73089899511dbe2e65f72633b99c02a828c34416e9b3aa55cfec7d7d6c0a2ee8",
+        "fixpointHash": "sha256:c47d7b4833f94a477dac798eaadba189245d536a77f112cdd69a079d0bfb6966",
         "producerEligibleHypothesisIds": []
       },
       "producer": {
         "cardinality": 0,
         "setHash": null,
         "disposition": "investigated-empty",
+        "terminalClosure": "reviewed-non-draft",
         "toolCallCount": 0,
         "persistenceCallCount": 0,
         "selfReviewCallCount": 0
       },
       "reviewer": {
         "verdict": "pass",
-        "reasonCode": "complete-denominator-investigated-empty",
-        "decisionHash": "0ed6ce89f397a08185f78cf9a94270815d124eb1da096a81b337b9fa57c10114",
+        "reasonCode": "COMPLETE_DENOMINATOR_INVESTIGATED_EMPTY",
+        "decisionHash": "sha256:6d3574269c179a5d22aa86d744444359fa21db8cd97bfed545b1897fc88e88f6",
         "sourceRevisionVectorHash": "sha256:98a5c01eeedd0e603ebee2fee59091d2756e17a15c8c9686e9f8912dda94adff"
       },
       "sourceEvidence": {
@@ -206,5 +207,5 @@
     }
   ],
   "passed": true,
-  "reportHash": "sha256:28cb0b6a6e10c40d574cff4eb8a8afa3eb69b9f732b29e1de3a3cdf7a8698a58"
+  "reportHash": "sha256:4da42ad7278af37f4260b2013a1f9617b6da7595d32240d70cf5804b221accb9"
 }

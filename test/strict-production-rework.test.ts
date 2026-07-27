@@ -1,15 +1,21 @@
 import { createHash } from 'node:crypto';
+import { hashKnowledgeClusterV1 } from '@alembic/core/production';
 import { describe, expect, it } from 'vitest';
 import { createFrozenEvidenceProjection } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import {
   createStrictAnalysisContextProjectionV1,
-  createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
+  createStrictHypothesisExpressionSetReceiptV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
   type StrictProducerLineageReceiptV1,
   validateStrictAnalystEpochV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
+import {
+  createReview,
+  createSingleHypothesisEpochFixture,
+  STRICT_SOURCE_REVISION,
+} from './fixtures/strict-semantic-authority.js';
 
 const authored = {
   title: 'Preserve typed Result envelopes',
@@ -29,85 +35,11 @@ function sha256(value: string): string {
 }
 
 function createLineageFixture() {
-  const expansion = createStrictAnalysisExpansionPortV1({
-    baselineScheduleHash: 'schedule-1',
-    baselineObligationIds: ['base-1'],
-    knownFactFamilies: [
-      { id: 'syntax-patterns', capabilityId: 'facts.syntax', supportedScales: ['file'] },
-    ],
-    knownSubjectRefs: ['file:handler'],
-    obligationCap: 2,
-  });
-  const epoch = validateStrictAnalystEpochV1({
-    knownFactIds: ['fact-handler'],
-    enrolledObligationIds: expansion.seal().obligationIds,
-    population: {
-      populationId: 'population-handler',
-      revision: 1,
-      parentPopulationHash: null,
-      sourceRevisionVectorHash: 'vector-1',
-      denominator: {
-        kind: 'frozen-complete-subjects',
-        expectedObservationIds: ['observation-handler'],
-      },
-      observations: [
-        {
-          observationId: 'observation-handler',
-          factIds: ['fact-handler'],
-          mechanismKey: 'typed-result-envelope',
-          canonicalSubjectRefs: ['file:handler'],
-        },
-      ],
-      duplicateObservations: [],
-      excludedObservations: [],
-      errorObservations: [],
-    },
-    clusterInputs: [
-      {
-        mechanismKey: 'typed-result-envelope',
-        observationIds: ['observation-handler'],
-        anatomyLensIds: ['error-recovery-concurrency'],
-      },
-    ],
-    nonClusteredDispositions: [],
-    inductionInputs: [
-      {
-        mechanismKey: 'typed-result-envelope',
-        mode: 'bounded-singleton',
-        hypotheses: [
-          {
-            hypothesisId: 'hypothesis-handler',
-            statement: 'Handlers preserve the typed Result envelope',
-            premiseFactIds: ['fact-handler'],
-          },
-        ],
-      },
-    ],
-    falsificationInputs: [
-      {
-        hypothesisId: 'hypothesis-handler',
-        enrolledCounterqueryIds: [],
-        executions: [],
-        counterqueryApplicability: {
-          status: 'not-required',
-          reasonCode: 'bounded-api-contract',
-          reviewerReceiptId: 'counterquery-review-1',
-        },
-      },
-    ],
-    hypothesisDispositions: [
-      {
-        hypothesisId: 'hypothesis-handler',
-        status: 'survived',
-        reviewerReceiptId: 'hypothesis-review-1',
-      },
-    ],
-  });
+  const semantic = createSingleHypothesisEpochFixture();
+  const epoch = validateStrictAnalystEpochV1(semantic.epochInput);
   const analysisFixpoint = createStrictAnalysisFixpointV1({
-    finalExpandedSchedule: expansion.seal(),
-    terminalObligations: [
-      { obligationId: 'base-1', disposition: 'matched', terminalReceiptId: 'terminal-base-1' },
-    ],
+    finalExpandedSchedule: semantic.finalExpandedSchedule,
+    terminalObligations: semantic.terminalObligations,
     epochs: [epoch],
   });
   const context = createStrictAnalysisContextProjectionV1({
@@ -117,18 +49,18 @@ function createLineageFixture() {
     planCognitionHash: 'plan-cognition-1',
     planHash: 'plan-1',
     requiredUniverseHash: 'universe-1',
-    baselineScheduleHash: 'schedule-1',
+    baselineScheduleHash: semantic.finalExpandedSchedule.baselineScheduleHash,
     expansionHeadHash: null,
-    currentExpandedScheduleHash: expansion.seal().finalExpandedScheduleHash,
-    finalExpandedScheduleHash: expansion.seal().finalExpandedScheduleHash,
+    currentExpandedScheduleHash: semantic.finalExpandedSchedule.finalExpandedScheduleHash,
+    finalExpandedScheduleHash: semantic.finalExpandedSchedule.finalExpandedScheduleHash,
     analysisFixpointHash: analysisFixpoint.fixpointHash,
     privateCorpusRevision: null,
     hypothesisExpressionSetHash: null,
     lensBindingsHash: 'lens-1',
     sourceArtifactHash: 'artifact-1',
-    sourceRevisionVectorHash: 'vector-1',
+    sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
     questionIds: ['question-1'],
-    factQueryObligationIds: ['base-1'],
+    factQueryObligationIds: [semantic.executionReceipt.obligationId],
     analysisUnitIds: ['unit-1'],
     factIds: ['fact-handler'],
     witnessIds: ['witness-handler'],
@@ -137,13 +69,13 @@ function createLineageFixture() {
     inductionReceiptHashes: epoch.inductions.map((receipt) => receipt.receiptHash),
     hypothesisIds: ['hypothesis-handler'],
     falsificationReceiptHashes: epoch.falsifications.map((receipt) => receipt.receiptHash),
-    dispositionReviewIds: ['hypothesis-review-1'],
+    dispositionReviewIds: [semantic.dispositionReview.reviewReceiptId],
     evidenceEntryIds: ['E-1'],
     derivedFindingCount: 0,
   });
   const content = 'export function handle(): Result<void> { return Result.ok(); }';
   const evidence = createFrozenEvidenceProjection({
-    sourceRevisionVectorHash: 'vector-1',
+    sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
     entries: [
       {
         evidenceEntryId: 'E-1',
@@ -163,7 +95,7 @@ function createLineageFixture() {
     hypothesisId: 'hypothesis-handler',
     evidence,
   });
-  return { lineage };
+  return { analysisFixpoint, lineage, semantic };
 }
 
 function createSet(
@@ -189,7 +121,7 @@ function createSet(
 
 describe('strict producer predecessor-bound causal lineage', () => {
   it('derives immutable roots from semantic receipts and cannot reset the repair depth', () => {
-    const { lineage } = createLineageFixture();
+    const { analysisFixpoint, lineage, semantic } = createLineageFixture();
     const initial = createSet(lineage, null, 'initial');
     const repair1 = createSet(lineage, initial, 'repair-1');
     const repair2 = createSet(lineage, repair1, 'repair-2');
@@ -201,6 +133,24 @@ describe('strict producer predecessor-bound causal lineage', () => {
     expect(repair2.repairNode.rootIds).toEqual(initial.repairNode.rootIds);
     expect(() => createSet(lineage, repair2, 'repair-3')).toThrow(/STRICT_CAUSAL_REPAIR_LIMIT/u);
 
+    const zeroReview = createReview({
+      reviewKind: 'producer-non-draft',
+      currentAnalysisFixpointHash: analysisFixpoint.fixpointHash,
+      populationHash: semantic.population.populationHash,
+      proposal: {
+        reviewKind: 'producer-non-draft',
+        populationHash: semantic.population.populationHash,
+        hypothesisId: 'hypothesis-handler',
+        expression: null,
+        zeroDisposition: {
+          reasonCode: 'not-actionable-as-recipe',
+          terminalFate: 'reviewed-non-draft',
+        },
+      },
+      executionReceipts: [semantic.executionReceipt],
+      finalExpandedSchedule: semantic.finalExpandedSchedule,
+      terminalObligations: semantic.terminalObligations,
+    });
     const zero = createStrictProducerExpressionSetV1({
       lineage,
       parentSet: null,
@@ -208,7 +158,7 @@ describe('strict producer predecessor-bound causal lineage', () => {
       zeroDisposition: {
         reasonCode: 'not-actionable-as-recipe',
         authored,
-        reviewerReceiptId: 'zero-review-1',
+        dispositionReview: zeroReview,
       },
       modelHash: 'producer-model-v1',
       reasonHash: 'zero-expression',
@@ -230,6 +180,169 @@ describe('strict producer predecessor-bound causal lineage', () => {
     });
     expect(zero.cardinality).toBe(0);
     expect(many.cardinality).toBe(2);
+    expect(
+      createStrictHypothesisExpressionSetReceiptV1({
+        expressionSet: zero,
+        parentReceipt: null,
+        privateCorpusRevision: 'revision:producer-zero',
+        terminalHead: true,
+        terminalResolutions: [],
+      })
+    ).toMatchObject({
+      conservation: { authored: 0, terminal: 0, unresolved: 0 },
+      terminalClosure: 'reviewed-non-draft',
+    });
+    expect(
+      createStrictHypothesisExpressionSetReceiptV1({
+        expressionSet: initial,
+        parentReceipt: null,
+        privateCorpusRevision: 'revision:producer-one',
+        terminalHead: true,
+        terminalResolutions: [
+          {
+            expressionId: 'expression-initial',
+            terminalFate: 'content-ready',
+            terminalReceiptId: 'g2:expression-initial',
+            terminalReceiptHash: `sha256:${'9'.repeat(64)}`,
+          },
+        ],
+      })
+    ).toMatchObject({
+      conservation: { authored: 1, terminal: 1, unresolved: 0 },
+      terminalClosure: 'expressed',
+    });
+    expect(
+      createStrictHypothesisExpressionSetReceiptV1({
+        expressionSet: many,
+        parentReceipt: null,
+        privateCorpusRevision: 'revision:producer-many',
+        terminalHead: true,
+        terminalResolutions: many.proposals.map((proposal) => ({
+          expressionId: proposal.expressionId,
+          terminalFate: 'content-ready' as const,
+          terminalReceiptId: `g2:${proposal.expressionId}`,
+          terminalReceiptHash: `sha256:${proposal.expressionId.endsWith('a') ? 'a' : 'b'}`.padEnd(
+            71,
+            proposal.expressionId.endsWith('a') ? 'a' : 'b'
+          ),
+        })),
+      })
+    ).toMatchObject({
+      conservation: { authored: 2, terminal: 2, unresolved: 0 },
+      terminalClosure: 'expressed',
+    });
+    expect(() =>
+      createStrictHypothesisExpressionSetReceiptV1({
+        expressionSet: many,
+        parentReceipt: null,
+        privateCorpusRevision: 'revision:producer-many',
+        terminalHead: true,
+        terminalResolutions: [],
+      })
+    ).toThrow(/STRICT_EXPRESSION_TERMINAL_RESOLUTION_CONSERVATION/u);
+  });
+
+  it('fails partial populations, string authority, and orphan disposition reviews closed', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        population: {
+          ...semantic.epochInput.population,
+          denominator: {
+            ...semantic.epochInput.population.denominator,
+            complete: false,
+          },
+        },
+      })
+    ).toThrow(/STRICT_ANALYST_POPULATION_INCOMPLETE/u);
+
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        hypothesisDispositions: [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'survived',
+            reviewerReceiptId: semantic.dispositionReview.reviewReceiptId,
+          },
+        ],
+      } as never)
+    ).toThrow(/STRICT_ANALYST_STRING_REVIEW_AUTHORITY_FORBIDDEN/u);
+
+    const orphanReview = createReview({
+      reviewKind: 'producer-non-draft',
+      currentAnalysisFixpointHash: semantic.currentAnalysisFixpointHash,
+      populationHash: semantic.population.populationHash,
+      proposal: {
+        reviewKind: 'producer-non-draft',
+        populationHash: semantic.population.populationHash,
+        hypothesisId: 'hypothesis-handler',
+        expression: null,
+        zeroDisposition: {
+          reasonCode: 'orphan-must-not-authorize',
+          terminalFate: 'reviewed-non-draft',
+        },
+      },
+      executionReceipts: [semantic.executionReceipt],
+      finalExpandedSchedule: semantic.finalExpandedSchedule,
+      terminalObligations: semantic.terminalObligations,
+    });
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        dispositionReviews: [semantic.dispositionReview, orphanReview],
+      })
+    ).toThrow(/STRICT_ANALYST_DISPOSITION_REVIEW_CONSERVATION/u);
+  });
+
+  it('uses the exact Core cluster hash and rejects review-context rebound at seal', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(semantic.epochInput);
+    const cluster = epoch.clusterSet.clusters[0];
+    const falsificationInput = semantic.epochInput.falsificationInputs[0];
+    if (!cluster || !falsificationInput) {
+      throw new Error('TEST_STRICT_SEMANTIC_FIXTURE_INCOMPLETE');
+    }
+    expect(epoch.inductions[0]?.clusterHash).toBe(hashKnowledgeClusterV1(cluster));
+    const reboundContextHash = `sha256:${'f'.repeat(64)}`;
+    const reboundReview = createReview({
+      reviewKind: 'falsification',
+      currentAnalysisFixpointHash: reboundContextHash,
+      populationHash: semantic.population.populationHash,
+      proposal: {
+        reviewKind: 'falsification',
+        populationHash: semantic.population.populationHash,
+        hypothesisId: 'hypothesis-handler',
+        enrolledCounterqueryIds: [],
+        executions: [],
+        counterqueryApplicability: {
+          status: 'not-required',
+          reasonCode: 'bounded-api-contract',
+        },
+      },
+      executionReceipts: [semantic.executionReceipt],
+      finalExpandedSchedule: semantic.finalExpandedSchedule,
+      terminalObligations: semantic.terminalObligations,
+    });
+    const reboundEpoch = validateStrictAnalystEpochV1({
+      ...semantic.epochInput,
+      currentAnalysisFixpointHash: reboundContextHash,
+      falsificationInputs: [
+        {
+          ...falsificationInput,
+          dispositionReview: reboundReview,
+        },
+      ],
+      dispositionReviews: [reboundReview],
+    });
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [reboundEpoch],
+      })
+    ).toThrow(/STRICT_ANALYSIS_FIXPOINT_REVIEW_CONTEXT_MISMATCH/u);
   });
 
   it.each([
@@ -256,6 +369,20 @@ describe('strict producer predecessor-bound causal lineage', () => {
       (lineage: StrictProducerLineageReceiptV1) => ({
         ...lineage,
         analysisFixpointHash: 'fixpoint-replaced',
+      }),
+    ],
+    [
+      'falsification receipt',
+      (lineage: StrictProducerLineageReceiptV1) => ({
+        ...lineage,
+        falsificationReceiptHash: 'falsification-replaced',
+      }),
+    ],
+    [
+      'disposition review',
+      (lineage: StrictProducerLineageReceiptV1) => ({
+        ...lineage,
+        dispositionReviewReceiptId: 'review-replaced',
       }),
     ],
     [

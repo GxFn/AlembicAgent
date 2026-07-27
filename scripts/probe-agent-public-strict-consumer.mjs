@@ -21,6 +21,7 @@ import {
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisGateOutcomeV1,
+  createStrictHypothesisExpressionSetReceiptV1,
   validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
@@ -39,6 +40,7 @@ const bindings = {
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisGateOutcomeV1,
+  createStrictHypothesisExpressionSetReceiptV1,
   validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
@@ -98,6 +100,34 @@ if (runtime.status !== 0) {
   process.exit(runtime.status ?? 1);
 }
 
+// 复用 Core 自己的 public-facade real-executor probe；它从临时 project.json 经过真实
+// fact executor/canonical constructors 生成 authority JSON，避免 Agent probe 手工拼 hash 自证。
+const coreProbePath = path.resolve(
+  repoRoot,
+  '..',
+  'AlembicCore',
+  'scripts',
+  'strict-production-authority-probe.mjs'
+);
+const coreRuntime = spawnSync(process.execPath, [coreProbePath], {
+  cwd: mainRoot,
+  encoding: 'utf8',
+});
+if (coreRuntime.status !== 0) {
+  process.stderr.write(coreRuntime.stderr || coreRuntime.stdout);
+  process.exit(coreRuntime.status ?? 1);
+}
+const coreAuthorityProof = JSON.parse(coreRuntime.stdout);
+if (
+  coreAuthorityProof?.executor?.realExecutor !== true ||
+  coreAuthorityProof?.publicSubpaths?.includes('@alembic/core/production') !== true ||
+  !coreAuthorityProof?.authorityHash ||
+  !coreAuthorityProof?.analysisReviewContextHash ||
+  coreAuthorityProof?.faults?.some((fault) => fault.rejected !== true)
+) {
+  throw new Error('STRICT_CORE_PUBLIC_AUTHORITY_PROOF_INVALID');
+}
+
 const fixturePath = path.join(
   repoRoot,
   'test',
@@ -145,5 +175,22 @@ if (diagnostics.length > 0) {
 
 const runtimeReceipt = JSON.parse(runtime.stdout.trim());
 process.stdout.write(
-  `Alembic strict facade consumer probe OK: runtimeBindings=${runtimeReceipt.runtimeBindingCount} forbidden=${runtimeReceipt.forbiddenCount} types=resolved\n`
+  `${JSON.stringify({
+    schemaVersion: 1,
+    probe: 'alembic-agent-strict-public-facade-fresh-process',
+    runtimeBindings: runtimeReceipt.runtimeBindingCount,
+    forbiddenImportsRejected: runtimeReceipt.forbiddenCount,
+    types: 'resolved',
+    publicSubpaths: ['@alembic/agent/production', '@alembic/core/production'],
+    coreSemanticAuthority: {
+      realExecutor: coreAuthorityProof.executor.realExecutor,
+      executionReceiptHash: coreAuthorityProof.executor.receiptHash,
+      executionOutputHash: coreAuthorityProof.executor.outputHash,
+      analysisReviewContextHash: coreAuthorityProof.analysisReviewContextHash,
+      authorityHash: coreAuthorityProof.authorityHash,
+      resourceConservation: coreAuthorityProof.resourceConservation,
+      faultCount: coreAuthorityProof.faults.length,
+      reportHash: coreAuthorityProof.reportHash,
+    },
+  })}\n`
 );

@@ -17,6 +17,7 @@ import type * as ProductionFacade from '@alembic/agent/production';
 import {
   type CausalRepairNodeV1,
   type CreateStrictAnalysisFixpointInputV1,
+  type CreateStrictHypothesisExpressionSetReceiptInputV1,
   type CreateStrictProducerExpressionSetInputV1,
   type CreateStrictProducerLineageReceiptInputV1,
   createStrictAnalysisContextProjectionV1,
@@ -24,6 +25,7 @@ import {
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
   createStrictAnalysisGateOutcomeV1,
+  createStrictHypothesisExpressionSetReceiptV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
   type FullAuthoredProjectionV1,
@@ -40,6 +42,7 @@ import {
   type StrictAnalysisLoopLimitsV1,
   type StrictAnalystEpochInputV1,
   type StrictAnalystEpochV1,
+  type StrictExpressionTerminalResolutionV1,
   type StrictFalsificationInputV1,
   type StrictHypothesisDispositionV1,
   type StrictInductionInputV1,
@@ -84,6 +87,7 @@ export const strictRuntimeBindings = {
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisGateOutcomeV1,
+  createStrictHypothesisExpressionSetReceiptV1,
   validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
   createStrictAnalysisFixpointV1,
@@ -122,6 +126,8 @@ export interface StrictFacadeConsumerTypes {
   readonly proposal: StrictProducerProposalV1;
   readonly expressionInput: CreateStrictProducerExpressionSetInputV1;
   readonly expressionSet: StrictProducerExpressionSetV1;
+  readonly expressionTerminalResolution: StrictExpressionTerminalResolutionV1;
+  readonly coreExpressionInput: CreateStrictHypothesisExpressionSetReceiptInputV1;
   readonly stageGate: StrictProductionGateResultV1;
   readonly runtimePort: StrictProductionRuntimePortV1;
   readonly frozenEvidenceEntry: FrozenEvidenceEntryV1;

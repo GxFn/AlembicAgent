@@ -23,6 +23,7 @@ const requiredRuntimeBindings = {
     'createStrictAnalysisExpansionPortV1',
     'createStrictAnalysisFixpointV1',
     'createStrictAnalysisGateOutcomeV1',
+    'createStrictHypothesisExpressionSetReceiptV1',
     'createStrictProducerExpressionSetV1',
     'createStrictProducerLineageReceiptV1',
     'validateStrictAnalysisEpochTransitionV1',

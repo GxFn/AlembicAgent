@@ -1841,8 +1841,8 @@
       ]
     },
     "./production": {
-      "exportCount": 9,
-      "signatureHash": "9875ef055732348f38671523464e51fa83eb092578a247d168b68b0376f59943",
+      "exportCount": 10,
+      "signatureHash": "d710fb7a7ba6dc4cfe8a65ae366cd5cb2c4e386f5c4814bcb0b92ba1087b08dd",
       "entries": [
         {
           "name": "createStrictAnalysisContextProjectionV1",
@@ -1862,6 +1862,10 @@
         },
         {
           "name": "createStrictAnalysisGateOutcomeV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictHypothesisExpressionSetReceiptV1",
           "kind": "function"
         },
         {

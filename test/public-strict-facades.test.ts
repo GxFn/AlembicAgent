@@ -31,6 +31,7 @@ const STRICT_FACADES = {
       { name: 'createStrictAnalysisExpansionPortV1', kind: 'function' },
       { name: 'createStrictAnalysisFixpointV1', kind: 'function' },
       { name: 'createStrictAnalysisGateOutcomeV1', kind: 'function' },
+      { name: 'createStrictHypothesisExpressionSetReceiptV1', kind: 'function' },
       { name: 'createStrictProducerExpressionSetV1', kind: 'function' },
       { name: 'createStrictProducerLineageReceiptV1', kind: 'function' },
       { name: 'validateStrictAnalysisEpochTransitionV1', kind: 'function' },

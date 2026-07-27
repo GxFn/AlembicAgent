@@ -1,4 +1,11 @@
 import { createHash } from 'node:crypto';
+import {
+  canonicalizeKnowledgeClustersV1,
+  canonicalizeObservationPopulationV1,
+  createAnalysisReviewContextHashV1,
+  createFinalExpandedMiningScheduleReceiptV1,
+  hashKnowledgeClusterV1,
+} from '@alembic/core/production';
 import { describe, expect, it } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
@@ -31,6 +38,11 @@ import type { AgentRunInput, AgentRunResult } from '../src/agent/service/AgentRu
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
+import {
+  createExecutionReceipt,
+  createReview,
+  STRICT_SOURCE_REVISION,
+} from './fixtures/strict-semantic-authority.js';
 
 function result(reply: string): AgentRunResult {
   return {
@@ -307,25 +319,45 @@ describe('strict context and analysis artifact', () => {
 
 describe('strict Analyst expansion, clustering, induction, and falsification', () => {
   it('enrolls counterqueries before execution and preserves variants/outliers', () => {
+    const receiptA = createExecutionReceipt({ name: 'a', emittedFactIds: ['fact-a'] });
+    const receiptB = createExecutionReceipt({ name: 'b', emittedFactIds: ['fact-b'] });
+    const outlierReceipt = createExecutionReceipt({
+      name: 'outlier',
+      emittedFactIds: ['fact-outlier'],
+    });
+    const counterReceipt = createExecutionReceipt({
+      name: 'counter',
+      emittedFactIds: [],
+      disposition: 'inspected-no-pattern',
+    });
     const port = createStrictAnalysisExpansionPortV1({
-      baselineScheduleHash: 'schedule-1',
-      baselineObligationIds: ['base-1'],
+      baselineScheduleHash: `sha256:${'a'.repeat(64)}`,
+      baselineObligationIds: [
+        receiptA.obligationId,
+        receiptB.obligationId,
+        outlierReceipt.obligationId,
+      ],
       knownFactFamilies: [
         { id: 'syntax-patterns', capabilityId: 'facts.syntax', supportedScales: ['file'] },
       ],
-      knownSubjectRefs: ['file:a', 'file:b', 'file:outlier'],
+      knownSubjectRefs: [
+        receiptA.canonicalSubjectRef,
+        receiptB.canonicalSubjectRef,
+        outlierReceipt.canonicalSubjectRef,
+        counterReceipt.canonicalSubjectRef,
+      ],
       obligationCap: 4,
     });
     port.enroll({
-      obligationId: 'counter-1',
+      obligationId: counterReceipt.obligationId,
       purpose: 'counterexample',
       factFamilyId: 'syntax-patterns',
       capabilityId: 'facts.syntax',
-      canonicalSubjectRef: 'file:outlier',
+      canonicalSubjectRef: counterReceipt.canonicalSubjectRef,
       analysisScale: 'file',
       reasonCode: 'claim-applicable-counterexample',
     });
-    expect(port.assertExecutionAllowed('counter-1').purpose).toBe('counterexample');
+    expect(port.assertExecutionAllowed(counterReceipt.obligationId).purpose).toBe('counterexample');
     expect(() => port.assertExecutionAllowed('not-enrolled')).toThrow(
       /STRICT_ANALYSIS_QUERY_UNENROLLED/u
     );
@@ -342,54 +374,173 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       })
     ).toThrow(/STRICT_ANALYSIS_SCHEDULE_ALREADY_FINAL/u);
 
-    const epoch = validateStrictAnalystEpochV1({
-      knownFactIds: ['fact-a', 'fact-b', 'fact-outlier'],
-      enrolledObligationIds: port.seal().obligationIds,
-      population: {
-        populationId: 'population-1',
-        revision: 1,
-        parentPopulationHash: null,
-        sourceRevisionVectorHash: 'vector-1',
-        denominator: {
-          kind: 'frozen-complete-subjects',
-          expectedObservationIds: ['obs-a', 'obs-b', 'obs-outlier'],
-        },
-        observations: [
-          {
-            observationId: 'obs-a',
-            factIds: ['fact-a'],
-            mechanismKey: 'wrap-result-envelope',
-            canonicalSubjectRefs: ['file:a'],
-          },
-          {
-            observationId: 'obs-b',
-            factIds: ['fact-b'],
-            mechanismKey: 'wrap-result-envelope',
-            canonicalSubjectRefs: ['file:b'],
-          },
-          {
-            observationId: 'obs-outlier',
-            factIds: ['fact-outlier'],
-            mechanismKey: 'outlier-preserved',
-            canonicalSubjectRefs: ['file:outlier'],
-          },
+    const populationInput = {
+      populationId: 'population-1',
+      revision: 1,
+      parentPopulationHash: null,
+      sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
+      denominator: {
+        kind: 'frozen-complete-subjects' as const,
+        expectedObservationIds: ['obs-a', 'obs-b', 'obs-outlier'],
+        expectedObligationIds: [
+          receiptA.obligationId,
+          receiptB.obligationId,
+          outlierReceipt.obligationId,
         ],
-        duplicateObservations: [],
-        excludedObservations: [],
-        errorObservations: [],
+        executionReceiptHashes: [
+          receiptA.receiptHash,
+          receiptB.receiptHash,
+          outlierReceipt.receiptHash,
+        ],
+        outputHashes: [receiptA.outputHash, receiptB.outputHash, outlierReceipt.outputHash],
+        denominatorHashes: [
+          receiptA.denominatorHash,
+          receiptB.denominatorHash,
+          outlierReceipt.denominatorHash,
+        ],
+        complete: true,
+        truncated: false,
+        continuation: null,
+        omittedObservationIds: [],
       },
-      clusterInputs: [
+      executionReceipts: [receiptA, receiptB, outlierReceipt],
+      observations: [
         {
+          observationId: 'obs-a',
+          factIds: ['fact-a'],
+          obligationIds: [receiptA.obligationId],
           mechanismKey: 'wrap-result-envelope',
-          observationIds: ['obs-a', 'obs-b'],
-          anatomyLensIds: ['error-recovery-concurrency'],
+          canonicalSubjectRefs: [receiptA.canonicalSubjectRef],
+          parentSubjectRefs: ['repo:repo'],
+          variantKeys: ['async'],
+          outlierReasonCodes: [],
+          negativeControl: false,
         },
         {
+          observationId: 'obs-b',
+          factIds: ['fact-b'],
+          obligationIds: [receiptB.obligationId],
+          mechanismKey: 'wrap-result-envelope',
+          canonicalSubjectRefs: [receiptB.canonicalSubjectRef],
+          parentSubjectRefs: ['repo:repo'],
+          variantKeys: ['sync'],
+          outlierReasonCodes: [],
+          negativeControl: false,
+        },
+        {
+          observationId: 'obs-outlier',
+          factIds: ['fact-outlier'],
+          obligationIds: [outlierReceipt.obligationId],
           mechanismKey: 'outlier-preserved',
-          observationIds: ['obs-outlier'],
-          anatomyLensIds: ['error-recovery-concurrency'],
+          canonicalSubjectRefs: [outlierReceipt.canonicalSubjectRef],
+          parentSubjectRefs: ['repo:repo'],
+          variantKeys: ['outlier'],
+          outlierReasonCodes: ['bounded-singleton'],
+          negativeControl: false,
         },
       ],
+      duplicateObservations: [],
+      excludedObservations: [],
+      errorObservations: [],
+      inspectedNoPatternObservations: [],
+    };
+    const clusterInputs = [
+      {
+        mechanismKey: 'wrap-result-envelope',
+        mechanism: { invariant: 'handlers wrap typed result envelopes' },
+        observationIds: ['obs-a', 'obs-b'],
+        mechanismEvidenceFactIds: ['fact-a', 'fact-b'],
+        anatomyLensIds: ['error-recovery-concurrency'] as const,
+      },
+      {
+        mechanismKey: 'outlier-preserved',
+        mechanism: { invariant: 'bounded outliers remain explicit' },
+        observationIds: ['obs-outlier'],
+        mechanismEvidenceFactIds: ['fact-outlier'],
+        anatomyLensIds: ['error-recovery-concurrency'] as const,
+      },
+    ];
+    const population = canonicalizeObservationPopulationV1(populationInput);
+    const clusterSet = canonicalizeKnowledgeClustersV1(population, {
+      clusters: clusterInputs,
+      nonClusteredDispositions: [],
+    });
+    const terminalObligations = [
+      ...[receiptA, receiptB, outlierReceipt, counterReceipt].map((receipt) => ({
+        obligationId: receipt.obligationId,
+        disposition: receipt.disposition,
+        terminalReceiptId: receipt.terminalReceiptId,
+      })),
+    ];
+    const currentAnalysisFixpointHash = createAnalysisReviewContextHashV1({
+      finalExpandedScheduleHash: port.seal().finalExpandedScheduleHash,
+      terminalObligations,
+      populationHashes: [population.populationHash],
+      clusterSetHashes: [clusterSet.clusterSetHash],
+    });
+    const outlierCluster = clusterSet.clusters.find(
+      (cluster) => cluster.mechanismKey === 'outlier-preserved'
+    );
+    if (!outlierCluster) {
+      throw new Error('TEST_OUTLIER_CLUSTER_MISSING');
+    }
+    const zeroReview = createReview({
+      reviewKind: 'zero-hypothesis',
+      currentAnalysisFixpointHash,
+      populationHash: population.populationHash,
+      proposal: {
+        reviewKind: 'zero-hypothesis',
+        populationHash: population.populationHash,
+        clusterHash: hashKnowledgeClusterV1(outlierCluster),
+        clusterId: outlierCluster.clusterId,
+        observationIds: outlierCluster.observationIds,
+        mode: 'bounded-singleton',
+        zeroHypothesisReason: 'insufficient-evidence',
+      },
+      executionReceipts: [outlierReceipt],
+      finalExpandedSchedule: port.seal(),
+      terminalObligations,
+    });
+    const execution = {
+      counterqueryId: counterReceipt.obligationId,
+      obligationId: counterReceipt.obligationId,
+      executionReceipt: counterReceipt,
+      counterexampleFactIds: [],
+    };
+    const falsificationReview = createReview({
+      reviewKind: 'falsification',
+      currentAnalysisFixpointHash,
+      populationHash: population.populationHash,
+      proposal: {
+        reviewKind: 'falsification',
+        populationHash: population.populationHash,
+        hypothesisId: 'hypothesis-1',
+        enrolledCounterqueryIds: [counterReceipt.obligationId],
+        executions: [
+          {
+            counterqueryId: counterReceipt.obligationId,
+            obligationId: counterReceipt.obligationId,
+            executionReceiptHash: counterReceipt.receiptHash,
+            executionOutputHash: counterReceipt.outputHash,
+            denominatorHash: counterReceipt.denominatorHash,
+            counterexampleFactIds: [],
+          },
+        ],
+        counterqueryApplicability: {
+          status: 'required',
+          reasonCode: 'recurring-claim-requires-counterexample',
+        },
+      },
+      executionReceipts: [counterReceipt],
+      finalExpandedSchedule: port.seal(),
+      terminalObligations,
+    });
+    const epoch = validateStrictAnalystEpochV1({
+      currentAnalysisFixpointHash,
+      knownFactIds: ['fact-a', 'fact-b', 'fact-outlier'],
+      enrolledObligationIds: port.seal().obligationIds,
+      population: populationInput,
+      clusterInputs,
       nonClusteredDispositions: [],
       inductionInputs: [
         {
@@ -408,32 +559,23 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
           mode: 'bounded-singleton',
           hypotheses: [],
           zeroHypothesisReason: 'insufficient-evidence',
-          zeroHypothesisReviewReceiptId: 'review-zero-outlier',
+          zeroHypothesisDispositionReview: zeroReview,
         },
       ],
       falsificationInputs: [
         {
           hypothesisId: 'hypothesis-1',
-          enrolledCounterqueryIds: ['counter-1'],
-          executions: [
-            {
-              counterqueryId: 'counter-1',
-              backendStatus: 'complete',
-              denominatorComplete: true,
-              truncated: false,
-              counterexampleFactIds: [],
-            },
-          ],
+          enrolledCounterqueryIds: [counterReceipt.obligationId],
+          executions: [execution],
           counterqueryApplicability: {
             status: 'required',
             reasonCode: 'recurring-claim-requires-counterexample',
-            reviewerReceiptId: null,
           },
+          dispositionReview: falsificationReview,
         },
       ],
-      hypothesisDispositions: [
-        { hypothesisId: 'hypothesis-1', status: 'survived', reviewerReceiptId: 'review-1' },
-      ],
+      hypothesisDispositions: [{ hypothesisId: 'hypothesis-1', status: 'survived' }],
+      dispositionReviews: [zeroReview, falsificationReview],
     });
 
     expect(epoch.population.conservation).toEqual({
@@ -442,6 +584,8 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       duplicate: 0,
       excluded: 0,
       error: 0,
+      inspectedNoPattern: 0,
+      omitted: 0,
     });
     expect(epoch.clusterSet.clusters).toHaveLength(2);
     expect(epoch.producerEligibleHypotheses.map((row) => row.hypothesisId)).toEqual([
@@ -449,14 +593,7 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
     ]);
     const fixpoint = createStrictAnalysisFixpointV1({
       finalExpandedSchedule: port.seal(),
-      terminalObligations: [
-        { obligationId: 'base-1', disposition: 'matched', terminalReceiptId: 'terminal-base' },
-        {
-          obligationId: 'counter-1',
-          disposition: 'inspected-no-pattern',
-          terminalReceiptId: 'terminal-counter',
-        },
-      ],
+      terminalObligations,
       epochs: [epoch],
     });
     expect(fixpoint.finalExpandedScheduleHash).toBe(port.seal().finalExpandedScheduleHash);
@@ -759,49 +896,79 @@ describe('production independent reviewers', () => {
     expect(drifted).toMatchObject({ verdict: 'reject', reasonCode: 'source-drift' });
   });
 
-  it('keeps investigated-empty on a separate complete-denominator rubric', async () => {
+  it('keeps investigated-empty on a separate complete-denominator rubric', () => {
+    const executionReceipt = createExecutionReceipt({
+      name: 'empty',
+      emittedFactIds: [],
+      disposition: 'inspected-no-pattern',
+    });
+    const finalExpandedSchedule = createFinalExpandedMiningScheduleReceiptV1({
+      baselineScheduleHash: `sha256:${'a'.repeat(64)}`,
+      baselineObligationIds: [executionReceipt.obligationId],
+      expansionReceipts: [],
+    });
+    const terminalObligations = [
+      {
+        obligationId: executionReceipt.obligationId,
+        disposition: executionReceipt.disposition,
+        terminalReceiptId: executionReceipt.terminalReceiptId,
+      },
+    ];
+    const currentAnalysisFixpointHash = `sha256:${'2'.repeat(64)}`;
+    const populationHash = `sha256:${'3'.repeat(64)}`;
+    const proposal = {
+      reviewKind: 'investigated-empty' as const,
+      populationHash,
+      sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
+      finalExpandedScheduleHash: finalExpandedSchedule.finalExpandedScheduleHash,
+      currentAnalysisFixpointHash,
+      expectedObligationIds: [executionReceipt.obligationId],
+      executionBindings: [
+        {
+          obligationId: executionReceipt.obligationId,
+          executionReceiptHash: executionReceipt.receiptHash,
+          executionOutputHash: executionReceipt.outputHash,
+          denominatorHash: executionReceipt.denominatorHash,
+          disposition: executionReceipt.disposition,
+          terminalReceiptId: executionReceipt.terminalReceiptId,
+        },
+      ],
+      evidenceEntryIds: ['E-1'],
+    };
+    const dispositionReview = createReview({
+      reviewKind: 'investigated-empty',
+      currentAnalysisFixpointHash,
+      populationHash,
+      proposal,
+      executionReceipts: [executionReceipt],
+      finalExpandedSchedule,
+      terminalObligations,
+    });
     const reviewer = new InvestigatedEmptyReviewer({
       identity: { provider: 'frozen', model: 'empty-reviewer-v1', method: 'investigated-empty-v1' },
     });
     expect(
       reviewer.review({
-        sourceRevisionVectorHash: 'vector-1',
-        finalExpandedScheduleHash: 'final-schedule-1',
-        expectedObligationIds: ['base-1', 'counter-1'],
-        terminalObligations: [
-          {
-            obligationId: 'base-1',
-            disposition: 'inspected-no-pattern',
-            terminalReceiptId: 'terminal-1',
-          },
-          {
-            obligationId: 'counter-1',
-            disposition: 'inspected-no-pattern',
-            terminalReceiptId: 'terminal-2',
-          },
-        ],
-        unresolvedHypothesisIds: [],
-        suppressedExpressionIds: [],
+        sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
+        finalExpandedScheduleHash: finalExpandedSchedule.finalExpandedScheduleHash,
+        currentAnalysisFixpointHash,
+        expectedObligationIds: [executionReceipt.obligationId],
+        executionReceipts: [executionReceipt],
+        dispositionReview,
         evidenceEntryIds: ['E-1'],
       })
     ).toMatchObject({ verdict: 'pass' });
     expect(
       reviewer.review({
-        sourceRevisionVectorHash: 'vector-1',
-        finalExpandedScheduleHash: 'final-schedule-1',
-        expectedObligationIds: ['base-1'],
-        terminalObligations: [
-          {
-            obligationId: 'base-1',
-            disposition: 'inspected-no-pattern',
-            terminalReceiptId: 'terminal-1',
-          },
-        ],
-        unresolvedHypothesisIds: ['hypothesis-open'],
-        suppressedExpressionIds: [],
+        sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
+        finalExpandedScheduleHash: finalExpandedSchedule.finalExpandedScheduleHash,
+        currentAnalysisFixpointHash,
+        expectedObligationIds: [],
+        executionReceipts: [],
+        dispositionReview,
         evidenceEntryIds: ['E-1'],
       })
-    ).toMatchObject({ verdict: 'reject', reasonCode: 'empty-review-unresolved-hypothesis' });
+    ).toMatchObject({ verdict: 'unknown', reasonCode: 'EMPTY_DENOMINATOR_REQUIRED' });
   });
 
   it('retains the calibrated agreement/kappa/negative-recall deployment gate', () => {
