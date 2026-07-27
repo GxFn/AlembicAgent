@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,6 +12,7 @@ import {
   InvestigatedEmptyReviewer,
 } from '@alembic/agent/evaluation';
 import {
+  createProductionEvidenceLedgerAuthority,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
@@ -36,7 +38,6 @@ import {
   createProductionActorIdentityV1,
   createStrictAcceptedCorpusInspectionV1,
   createStrictAdmissionReceiptV1,
-  createStrictEvidenceLedgerSnapshotV1,
   createStrictFactBackendRegistryV1,
   createStrictFactDirectWitnessBindingV1,
   createStrictFactSubjectBindingV1,
@@ -56,7 +57,6 @@ import {
   captureCertifiedProjectFactsV2,
   createProjectContextFileRef,
   createProjectContextRequestAuditPlansV2,
-  hashBytes,
   hashCanonicalJson,
   readCertifiedProjectFactsFrozenFile,
 } from '@alembic/core/project-context-foundation';
@@ -89,6 +89,7 @@ async function verifyPublicSurface() {
   const bindings = {
     runStrictPlanAgent,
     createStrictAnalysisContextProjectionV1,
+    createProductionEvidenceLedgerAuthority,
     createStrictAnalysisEpochSnapshotV1,
     createStrictAnalysisExpansionPortV1,
     createStrictAnalysisGateOutcomeV1,
@@ -304,7 +305,6 @@ async function executeDurableReviewRuntimeProbe({
   witnessBinding,
   reviewerModelLoadReceipt,
 }) {
-  const ledgerEntries = real.witness.bindings.map((binding) => binding.evidenceEntry);
   let providerCallCount = 0;
   let witnessLoadCount = 0;
   let compiledPrompt = null;
@@ -333,14 +333,7 @@ async function executeDurableReviewRuntimeProbe({
       createInvocationId: () => 'invocation:agent-public-independent-reviewer',
     },
     evidence: {
-      ledger: {
-        get: (reference) => ledgerEntries.find((entry) => entry.id === reference) ?? null,
-        listStrictSnapshotEntries: () => ledgerEntries,
-      },
-      evidenceStoreId: 'evidence-store:agent-public-probe',
-      evidenceStoreConfigHash: hashCanonicalJson({
-        kind: 'agent-public-evidence-store-config',
-      }),
+      ledger: real.ledgerAuthority.read,
       witnessAuthority: {
         resolve: async (lookup) => {
           witnessLoadCount += 1;
@@ -377,10 +370,19 @@ async function executeDurableReviewRuntimeProbe({
     attestation: serializedAttestation,
     expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
   });
+  const freshProcess = verifyFreshProcessLedgerReopen({
+    coordinates: real.ledgerCoordinates,
+    expectedIdentity: real.ledgerAuthority.identity,
+    expectedSnapshotHash: real.witness.evidenceLedgerSnapshot.snapshotHash,
+    expectedEvidenceEntryIds: real.witness.bindings.map((binding) => binding.evidenceEntryId),
+    attestation: serializedAttestation,
+    expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+  });
   if (
     providerCallCount !== 1 ||
     witnessLoadCount !== 1 ||
-    compiledPrompt !== attestation.execution.request.compiledPrompt
+    compiledPrompt !== attestation.execution.request.compiledPrompt ||
+    freshProcess.reopened !== true
   ) {
     throw new Error('STRICT_AGENT_PUBLIC_DURABLE_REVIEW_RUNTIME_MISMATCH');
   }
@@ -391,11 +393,61 @@ async function executeDurableReviewRuntimeProbe({
     exactCompiledPrompt: true,
     serializedAttestationVerified: true,
     publicConsumerFreshProcess: true,
+    freshProcessReopenVerified: true,
+    evidenceStoreId: real.ledgerAuthority.identity.storeId,
+    evidenceStoreConfigHash: real.ledgerAuthority.identity.storeConfigHash,
+    evidenceLedgerSnapshotHash: real.witness.evidenceLedgerSnapshot.snapshotHash,
     requestHash: semanticRequest.requestHash,
     executionHash: attestation.execution.executionHash,
     attestationHash: attestation.attestationHash,
     trustPolicyHash: runtime.trustPolicy.policyHash,
   };
+}
+
+function verifyFreshProcessLedgerReopen(input) {
+  const payloadPath = path.join(input.coordinates.dataRoot, 'fresh-ledger-reopen-proof.json');
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({
+      expectedIdentity: input.expectedIdentity,
+      expectedSnapshotHash: input.expectedSnapshotHash,
+      expectedEvidenceEntryIds: input.expectedEvidenceEntryIds,
+      attestation: input.attestation,
+      expectedTrustPolicy: input.expectedTrustPolicy,
+    }),
+    'utf8'
+  );
+  const output = execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      [
+        "import fs from 'node:fs';",
+        "import { createProductionEvidenceLedgerAuthority } from '@alembic/agent/production';",
+        "import { assertSemanticDispositionReviewDurableAttestationV3 } from '@alembic/core/production';",
+        "const payload = JSON.parse(fs.readFileSync(process.env.ALEMBIC_LEDGER_REOPEN_PAYLOAD, 'utf8'));",
+        'const coordinates = JSON.parse(process.env.ALEMBIC_LEDGER_REOPEN_COORDINATES);',
+        'const authority = createProductionEvidenceLedgerAuthority(coordinates);',
+        'const snapshot = authority.read.strictSnapshot();',
+        "if (JSON.stringify(authority.identity) !== JSON.stringify(payload.expectedIdentity)) throw new Error('FRESH_LEDGER_IDENTITY_MISMATCH');",
+        "if (snapshot.snapshotHash !== payload.expectedSnapshotHash) throw new Error('FRESH_LEDGER_SNAPSHOT_MISMATCH');",
+        "if (payload.expectedEvidenceEntryIds.some((id) => !authority.read.get(id))) throw new Error('FRESH_LEDGER_EVIDENCE_MISSING');",
+        'assertSemanticDispositionReviewDurableAttestationV3({ attestation: payload.attestation, expectedTrustPolicy: payload.expectedTrustPolicy });',
+        'process.stdout.write(JSON.stringify({ reopened: true, storeId: authority.identity.storeId, snapshotHash: snapshot.snapshotHash }));',
+      ].join('\n'),
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALEMBIC_LEDGER_REOPEN_COORDINATES: JSON.stringify(input.coordinates),
+        ALEMBIC_LEDGER_REOPEN_PAYLOAD: payloadPath,
+      },
+    }
+  );
+  return JSON.parse(output);
 }
 
 function createPassingDurableReviewDecision(compiledPrompt, evidenceEntryId) {
@@ -436,6 +488,13 @@ function createPassingDurableReviewDecision(compiledPrompt, evidenceEntryId) {
 }
 
 async function createRealExecutorFixture(root) {
+  const ledgerCoordinates = Object.freeze({
+    dataRoot: root,
+    jobId: 'job:agent-public-connected-probe',
+    sessionId: 'session:agent-public-connected-probe',
+    dimensionId: 'dimension:strict-fact-execution',
+  });
+  const ledgerAuthority = createProductionEvidenceLedgerAuthority(ledgerCoordinates);
   const artifact = await createStrictArtifact(root);
   const planningFacts = createPlanningFacts(artifact);
   const family = createConfigFactQueryFamilyV1({
@@ -449,7 +508,7 @@ async function createRealExecutorFixture(root) {
     planningFacts,
     selector: { kind: 'repository', repoId: 'core' },
   });
-  const witness = createWitnessMaterial(artifact);
+  const witness = createWitnessMaterial(artifact, ledgerAuthority);
   const registry = createStrictFactBackendRegistryV1([
     createConfigFactQueryBackendV1({ family, parser: 'nx-project-json' }),
   ]);
@@ -476,6 +535,8 @@ async function createRealExecutorFixture(root) {
     throw new Error('STRICT_AGENT_PUBLIC_REAL_EXECUTOR_FAILED');
   }
   return {
+    ledgerAuthority,
+    ledgerCoordinates,
     artifact,
     family,
     catalog,
@@ -1463,24 +1524,19 @@ function createPlanningFacts(artifact) {
   };
 }
 
-function createWitnessMaterial(artifact) {
+function createWitnessMaterial(artifact, ledgerAuthority) {
   const entries = artifact.facts.inventory.files.map((file, index) => {
     const content = Buffer.from(readCertifiedProjectFactsFrozenFile(artifact, file)).toString(
       'utf8'
     );
-    return {
-      id: `E-${index + 1}`,
-      sessionId: 'agent-public-connected-probe',
-      dimensionId: 'strict-fact-execution',
+    return ledgerAuthority.capture.capture({
       tool: 'code.read',
       callId: `call-${index + 1}`,
       file: file.relativePath,
       content,
-      contentHash: hashBytes(Buffer.from(content)),
-      capturedAt: index + 1,
-    };
+    });
   });
-  const evidenceLedgerSnapshot = createStrictEvidenceLedgerSnapshotV1(entries);
+  const evidenceLedgerSnapshot = ledgerAuthority.read.strictSnapshot();
   const projectContextRefs = artifact.facts.inventory.files.map((file) =>
     createProjectContextFileRef({
       projectRoot: '/certified/agent-public-connected-probe',

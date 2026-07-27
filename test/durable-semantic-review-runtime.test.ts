@@ -7,6 +7,7 @@ import {
   createStrictEvidenceLedgerSnapshotV1,
   type StrictFactDirectWitnessBindingV1,
 } from '@alembic/core/host-agent-workflows';
+import type { EvidenceEntry } from '@alembic/core/knowledge';
 import {
   assertSemanticDispositionReviewDurableAttestationV3,
   canonicalizeObservationPopulationV1,
@@ -25,8 +26,11 @@ import {
   type SemanticReviewWitnessAuthorityBundleV1,
   type SemanticReviewWitnessAuthorityLookupV1,
 } from '../src/agent/evaluation/DurableSemanticReviewRuntime.js';
-import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
+import {
+  createProductionEvidenceLedgerAuthority,
+  type ProductionEvidenceLedgerAuthorityV1,
+} from '../src/production.js';
 import {
   createExecutionReceipt,
   STRICT_SOURCE_REVISION,
@@ -44,7 +48,6 @@ const REVIEWER_AXES = [
 const REVIEW_CONTENT =
   'Frozen evidence: the complete source subject was inspected without an eligible mechanism.';
 const REVIEW_BLOB_HASH = shaText('durable-semantic-review-source');
-const EVIDENCE_STORE_CONFIG_HASH = shaText('agent-evidence-ledger-store-config');
 const REVIEWER_RUNTIME_CONFIG_HASH = shaText('reviewer-runtime-config');
 const WORKFLOW_RUN_ID = 'strict-workflow:agent-durable-semantic-review';
 const EVALUATOR_RUN_ID = 'agent-evaluator:durable-semantic-review';
@@ -61,7 +64,7 @@ afterEach(() => {
 describe('DurableSemanticReviewRuntime', () => {
   it('loads the authoritative Agent ledger, invokes the provider with Core prompt, and emits a fresh-process durable attestation', async () => {
     const fixture = createFixture();
-    fixture.ledger.append({
+    fixture.ledgerAuthority.capture.capture({
       tool: 'code.read',
       callId: 'call:post-fact-ledger-append',
       file: 'src/later.ts',
@@ -87,9 +90,7 @@ describe('DurableSemanticReviewRuntime', () => {
         createInvocationId: () => 'reviewer-invocation:durable-semantic-review:1',
       },
       evidence: {
-        ledger: fixture.ledger,
-        evidenceStoreId: 'evidence-store:agent-ledger',
-        evidenceStoreConfigHash: EVIDENCE_STORE_CONFIG_HASH,
+        ledger: fixture.ledgerAuthority.read,
         witnessAuthority: { resolve },
       },
       timeoutMs: 1_000,
@@ -177,6 +178,11 @@ describe('DurableSemanticReviewRuntime', () => {
         trustPolicy: runtime.trustPolicy,
         reviewerHost: { invoke: async () => ({}) },
         evidenceStore: { load: async () => ({}) },
+        dataRoot: '/caller/store',
+        jobId: 'job:caller',
+        sessionId: 'session:caller',
+        dimensionId: 'dimension:caller',
+        evidenceStoreId: 'evidence-store:caller',
         evaluatorRunId: 'caller-evaluator',
         attestation: {},
       } as never)
@@ -187,18 +193,41 @@ describe('DurableSemanticReviewRuntime', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it('rejects a caller-provided structural replacement for the production read facet', async () => {
+    const fixture = createFixture();
+    const fakeLedger = {
+      identity: fixture.ledgerAuthority.identity,
+      get: fixture.ledgerAuthority.read.get,
+      strictSnapshot: fixture.ledgerAuthority.read.strictSnapshot,
+    };
+
+    await expect(createRuntime(fixture, { ledger: fakeLedger })).rejects.toMatchObject({
+      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_BOOTSTRAP_INVALID',
+    });
+    await expect(
+      createRuntime(fixture, {
+        evidenceExtras: {
+          evidenceStoreId: 'evidence-store:caller',
+          evidenceStoreConfigHash: shaText('caller-config'),
+        },
+      })
+    ).rejects.toMatchObject({
+      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_BOOTSTRAP_INVALID',
+    });
+  });
+
   it.each([
     {
       name: 'missing authoritative evidence',
       setup: (fixture: Fixture) => {
-        const emptyLedger = createLedger();
-        emptyLedger.append({
+        const unrelatedAuthority = createLedgerAuthority();
+        unrelatedAuthority.capture.capture({
           tool: 'code.read',
           callId: 'call:unrelated-evidence',
           file: 'src/unrelated.ts',
           content: 'export const unrelated = true;',
         });
-        return createRuntime({ ...fixture, ledger: emptyLedger }, {});
+        return createRuntime({ ...fixture, ledgerAuthority: unrelatedAuthority }, {});
       },
       expected: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_NOT_FOUND',
     },
@@ -448,9 +477,9 @@ describe('DurableSemanticReviewRuntime', () => {
 });
 
 interface Fixture {
-  readonly ledger: EvidenceLedgerStore;
-  readonly evidenceEntries: readonly NonNullable<ReturnType<EvidenceLedgerStore['get']>>[];
-  readonly evidenceEntry: NonNullable<ReturnType<EvidenceLedgerStore['get']>>;
+  readonly ledgerAuthority: ProductionEvidenceLedgerAuthorityV1;
+  readonly evidenceEntries: readonly EvidenceEntry[];
+  readonly evidenceEntry: EvidenceEntry;
   readonly evidenceLedgerSnapshot: ReturnType<typeof createStrictEvidenceLedgerSnapshotV1>;
   readonly witnessBindings: readonly StrictFactDirectWitnessBindingV1[];
   readonly witnessBinding: StrictFactDirectWitnessBindingV1;
@@ -492,11 +521,11 @@ function createFixtureSubjects(includeSecondEvidence: boolean): readonly Fixture
 }
 
 function createFixtureEvidenceAuthority(
-  ledger: EvidenceLedgerStore,
+  ledgerAuthority: ProductionEvidenceLedgerAuthorityV1,
   subjects: readonly FixtureSubject[]
 ) {
   const evidenceEntries = subjects.map((subject, index) =>
-    ledger.append({
+    ledgerAuthority.capture.capture({
       tool: 'code.read',
       callId: `call:durable-semantic-review-source:${index + 1}`,
       file: subject.relativePath,
@@ -561,7 +590,7 @@ function createFixtureEvidenceAuthority(
 
 function createInvestigatedEmptyLineage(
   executionReceipts: readonly ReturnType<typeof createExecutionReceipt>[],
-  evidenceEntries: readonly NonNullable<ReturnType<EvidenceLedgerStore['get']>>[]
+  evidenceEntries: readonly EvidenceEntry[]
 ) {
   const finalExpandedSchedule = createFinalExpandedMiningScheduleReceiptV1({
     baselineScheduleHash: shaText('durable-semantic-review-baseline-schedule'),
@@ -651,14 +680,14 @@ function createFixture(
     readonly reboundRequestReceipt?: boolean;
   } = {}
 ): Fixture {
-  const ledger = createLedger();
+  const ledgerAuthority = createLedgerAuthority();
   const subjects = createFixtureSubjects(input.includeSecondEvidence ?? false);
   const {
     evidenceEntries,
     evidenceLedgerSnapshot,
     witnessBindings,
     executionReceipts: authorityExecutionReceipts,
-  } = createFixtureEvidenceAuthority(ledger, subjects);
+  } = createFixtureEvidenceAuthority(ledgerAuthority, subjects);
   const executionReceipts = input.reboundRequestReceipt
     ? subjects.map((subject, index) =>
         createExecutionReceipt({
@@ -748,7 +777,7 @@ function createFixture(
     },
   });
   return {
-    ledger,
+    ledgerAuthority,
     evidenceEntries,
     evidenceEntry,
     evidenceLedgerSnapshot,
@@ -772,10 +801,10 @@ function requireAt<T>(values: readonly T[], index: number, label: string): T {
   return value;
 }
 
-function createLedger(): EvidenceLedgerStore {
+function createLedgerAuthority(): ProductionEvidenceLedgerAuthorityV1 {
   const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-durable-review-'));
   temporaryRoots.add(dataRoot);
-  return new EvidenceLedgerStore({
+  return createProductionEvidenceLedgerAuthority({
     dataRoot,
     jobId: 'job:durable-semantic-review',
     sessionId: 'session:semantic-review',
@@ -813,6 +842,8 @@ async function createRuntime(
     readonly finishReason?: string;
     readonly trustRootId?: string;
     readonly keyId?: string;
+    readonly ledger?: unknown;
+    readonly evidenceExtras?: Record<string, unknown>;
   }
 ) {
   const { privateKey } = generateKeyPairSync('ed25519');
@@ -839,9 +870,7 @@ async function createRuntime(
         options.createInvocationId ?? (() => 'reviewer-invocation:durable-semantic-review:1'),
     },
     evidence: {
-      ledger: fixture.ledger,
-      evidenceStoreId: 'evidence-store:agent-ledger',
-      evidenceStoreConfigHash: EVIDENCE_STORE_CONFIG_HASH,
+      ledger: (options.ledger ?? fixture.ledgerAuthority.read) as never,
       witnessAuthority: {
         resolve:
           options.resolve ??
@@ -852,6 +881,7 @@ async function createRuntime(
               ? authorityBundleFor(fixture, lookup.evidenceEntryId)
               : null),
       },
+      ...options.evidenceExtras,
     },
     timeoutMs: options.timeoutMs ?? 1_000,
     diagnostics: fixture.diagnostics,

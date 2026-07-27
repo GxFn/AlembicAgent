@@ -1841,9 +1841,13 @@
       ]
     },
     "./production": {
-      "exportCount": 10,
-      "signatureHash": "d710fb7a7ba6dc4cfe8a65ae366cd5cb2c4e386f5c4814bcb0b92ba1087b08dd",
+      "exportCount": 11,
+      "signatureHash": "5fc48cb942cd58e0fabfe8bc754f0b8ac2ff8aa745136a0a2e5b077b27271af4",
       "entries": [
+        {
+          "name": "createProductionEvidenceLedgerAuthority",
+          "kind": "function"
+        },
         {
           "name": "createStrictAnalysisContextProjectionV1",
           "kind": "function"

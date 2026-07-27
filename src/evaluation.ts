@@ -5,7 +5,6 @@ export {
   DurableSemanticReviewRuntimeError,
   type DurableSemanticReviewRuntimeErrorCode,
   type DurableSemanticReviewRuntimeV1,
-  type SemanticReviewEvidenceLedgerPortV1,
   type SemanticReviewProviderV1,
   type SemanticReviewSigningKeyProviderV1,
   type SemanticReviewWitnessAuthorityBundleV1,

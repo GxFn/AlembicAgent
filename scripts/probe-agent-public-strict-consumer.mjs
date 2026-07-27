@@ -40,6 +40,7 @@ if (
   runtimeReceipt?.durableSemanticReview?.exactCompiledPrompt !== true ||
   runtimeReceipt?.durableSemanticReview?.serializedAttestationVerified !== true ||
   runtimeReceipt?.durableSemanticReview?.publicConsumerFreshProcess !== true ||
+  runtimeReceipt?.durableSemanticReview?.freshProcessReopenVerified !== true ||
   runtimeReceipt?.connectedChain?.population?.completion !== 'complete' ||
   runtimeReceipt?.connectedChain?.terminal?.terminalClosure !== 'expressed' ||
   runtimeReceipt?.faults?.length !== 11 ||

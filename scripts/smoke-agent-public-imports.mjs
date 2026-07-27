@@ -18,6 +18,7 @@ const forbiddenSamples = Array.isArray(policy.forbiddenConsumerSpecifierSamples)
 const requiredRuntimeBindings = {
   './runs': ['runStrictPlanAgent'],
   './production': [
+    'createProductionEvidenceLedgerAuthority',
     'createStrictAnalysisContextProjectionV1',
     'createStrictAnalysisEpochSnapshotV1',
     'createStrictAnalysisExpansionPortV1',

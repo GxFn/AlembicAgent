@@ -246,6 +246,18 @@ export class EvidenceLedgerStore {
     return Object.freeze([...this.#entries.values()].map(freezeEvidenceEntry));
   }
 
+  /**
+   * production authority 打开阶段的 fail-closed 闸门。新建空台账合法，但已有 JSONL 的任何
+   * hydrate 污染都必须在交给 capture/read facet 或 AgentRuntime 前失败。
+   */
+  assertProductionAuthorityHealthy(): void {
+    if (this.#hydrateIntegrityIssues.length > 0) {
+      throw new Error(
+        `EVIDENCE_LEDGER_PRODUCTION_AUTHORITY_INVALID:${this.#hydrateIntegrityIssues.join(',')}`
+      );
+    }
+  }
+
   /** 台账内检索（E4 evidence.search）：路径片段或内容关键词，大小写不敏感，按采集序返回 */
   search(query: string, limit = 8): EvidenceEntry[] {
     const needle = query.toLowerCase();
@@ -306,6 +318,13 @@ export class EvidenceLedgerStore {
         continue;
       }
       this.#entries.set(parsed.id, freezeEvidenceEntry(parsed));
+    }
+    // append-only authority 的 id 必须从 E-1 连续到磁盘最大序号；中间行被删除时不能把剩余
+    // 条目误报成 complete snapshot。尾部截断若留下半行则由上面的 JSON 校验拒绝。
+    for (let sequence = 1; sequence <= this.#seq; sequence += 1) {
+      if (!this.#entries.has(makeEvidenceId(sequence))) {
+        this.#hydrateIntegrityIssues.push(`missing-id:E-${sequence}`);
+      }
     }
     this.#dirReady = true;
   }

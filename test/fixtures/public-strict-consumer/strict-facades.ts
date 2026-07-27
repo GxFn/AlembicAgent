@@ -17,7 +17,6 @@ import {
   InvestigatedEmptyReviewer,
   type InvestigatedEmptyReviewInputV1,
   type ReviewerIdentityV1,
-  type SemanticReviewEvidenceLedgerPortV1,
   type SemanticReviewProviderV1,
   type SemanticReviewSigningKeyProviderV1,
   type SemanticReviewWitnessAuthorityBundleV1,
@@ -31,6 +30,7 @@ import {
   type CreateStrictHypothesisExpressionSetReceiptInputV1,
   type CreateStrictProducerExpressionSetInputV1,
   type CreateStrictProducerLineageReceiptInputV1,
+  createProductionEvidenceLedgerAuthority,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisExpansionPortV1,
@@ -41,6 +41,9 @@ import {
   createStrictProducerLineageReceiptV1,
   type FullAuthoredProjectionV1,
   type ProducerEligibleHypothesisV1,
+  type ProductionEvidenceLedgerAuthorityV1,
+  type ProductionEvidenceLedgerCoordinatesV1,
+  type ProductionEvidenceLedgerReadFacetV1,
   type StrictAnalysisContextInputV1,
   type StrictAnalysisContextProjectionV1,
   type StrictAnalysisEpochSnapshotInputV1,
@@ -92,6 +95,8 @@ export interface StrictFacadePrivateSurfaceAssertions {
   readonly fixtureProvider: typeof EvaluationFacade.FrozenStrictProductionEvaluationProviderV1;
   // @ts-expect-error Runtime implementation and Core mint gateway stay behind the trusted factory.
   readonly durableRuntimeImplementation: typeof EvaluationFacade.DurableSemanticReviewRuntime;
+  // @ts-expect-error 私有 EvidenceLedgerStore 不能从 production facade 导出。
+  readonly privateLedgerStore: typeof ProductionFacade.EvidenceLedgerStore;
 }
 
 export const strictRuntimeBindings = {
@@ -106,6 +111,7 @@ export const strictRuntimeBindings = {
   createStrictAnalysisFixpointV1,
   createStrictProducerLineageReceiptV1,
   createStrictProducerExpressionSetV1,
+  createProductionEvidenceLedgerAuthority,
   createFrozenEvidenceProjection,
   createDurableSemanticReviewRuntime,
   DurableSemanticReviewRuntimeError,
@@ -150,7 +156,9 @@ export interface StrictFacadeConsumerTypes {
   readonly durableReviewBootstrap: DurableSemanticReviewRuntimeBootstrapV1;
   readonly durableReviewExecuteInput: DurableSemanticReviewExecuteInputV1;
   readonly durableReviewRuntime: DurableSemanticReviewRuntimeV1;
-  readonly durableReviewLedger: SemanticReviewEvidenceLedgerPortV1;
+  readonly productionLedgerCoordinates: ProductionEvidenceLedgerCoordinatesV1;
+  readonly productionLedgerAuthority: ProductionEvidenceLedgerAuthorityV1;
+  readonly durableReviewLedger: ProductionEvidenceLedgerReadFacetV1;
   readonly durableReviewProvider: SemanticReviewProviderV1;
   readonly durableReviewSigningKey: SemanticReviewSigningKeyProviderV1;
   readonly durableReviewWitnessBundle: SemanticReviewWitnessAuthorityBundleV1;

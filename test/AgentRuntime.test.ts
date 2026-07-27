@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
@@ -69,6 +72,36 @@ function createToolEnvelope(
 }
 
 describe('agent runtime forced summary suppression', () => {
+  it('uses the production ledger authority coordinate gate for dimension runs', async () => {
+    const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-ledger-'));
+    const chatWithTools = vi.fn();
+    const runtime = new AgentRuntime({
+      id: 'session:agent-runtime-ledger',
+      dataRoot,
+      jobId: 'job:agent-runtime-ledger',
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    try {
+      await expect(
+        runtime.reactLoop('reject escaped ledger dimension', {
+          source: 'system',
+          sharedState: {
+            _bootstrapSessionId: 'job:agent-runtime-ledger',
+            _dimensionMeta: { id: '../escaped-dimension' },
+          },
+          budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+        })
+      ).rejects.toThrow('ALEMBIC_AGENT_EVIDENCE_LEDGER_COORDINATES_INVALID');
+      expect(chatWithTools).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dataRoot, { force: true, recursive: true });
+    }
+  });
+
   it('rejects oversized LLM input before calling the provider', async () => {
     const { runtime, chatWithTools } = createRuntimeForReactLoop();
 

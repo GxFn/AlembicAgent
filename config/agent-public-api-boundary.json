@@ -188,16 +188,16 @@
     {
       "export": "./production",
       "specifier": "@alembic/agent/production",
-      "contract": "Curated strict analysis projection, append-only epoch snapshot/transition, typed fixpoint retry, expansion, Analyst fixpoint, Producer lineage/expression-set, repair, gate, and stage-port contracts.",
-      "agentOwned": ["strict analysis validation", "Producer lineage and expression-set construction", "strict runtime port contract"],
-      "hostOwnedAdapterBoundary": "Host owns Main orchestration and injects accepted Core receipts through the strict runtime port; internal stage, gate, prompt, and repair authority stays Agent-owned."
+      "contract": "Curated strict analysis projection, append-only epoch snapshot/transition, typed fixpoint retry, expansion, Analyst fixpoint, Producer lineage/expression-set, repair, gate, stage-port contracts, and the opaque persisted Evidence Ledger production authority.",
+      "agentOwned": ["strict analysis validation", "Producer lineage and expression-set construction", "strict runtime port contract", "real Evidence Ledger construction, redaction, capture/read facets, and persisted store identity"],
+      "hostOwnedAdapterBoundary": "Host owns Main orchestration, chooses trusted dataRoot/job/session/dimension coordinates, and injects accepted Core receipts through the strict runtime port; internal EvidenceLedgerStore, stage, gate, prompt, and repair authority stay Agent-owned."
     },
     {
       "export": "./evaluation",
       "specifier": "@alembic/agent/evaluation",
       "contract": "Curated independent reviewers plus a trusted-bootstrap durable semantic-review runtime that mints Core-verifiable V3 attestations from frozen Evidence Ledger and direct-witness authority.",
       "agentOwned": ["frozen evidence projection", "independent value and investigated-empty review", "signing-key custody abstraction", "exact compiled-prompt provider execution", "EvidenceLedgerStore snapshot plus witness/receipt authority loading", "cancellation and error classification", "durable attestation minting"],
-      "hostOwnedAdapterBoundary": "Host owns trusted bootstrap provisioning of the key provider, reviewer/model-load receipt, EvidenceLedgerStore, and witness/receipt authority. Per-request callers and Main cannot inject those authorities; Main owns policy persistence and independent attestation verification. Judge calibration, fixtures, and provider runners remain Agent-owned."
+      "hostOwnedAdapterBoundary": "Host owns trusted bootstrap provisioning of the key provider, reviewer/model-load receipt, public Agent production Evidence Ledger read facet, and witness/receipt authority. Per-request callers and Main cannot inject replacement ledger adapters or those authorities; Main owns stable key/public-policy persistence and independent attestation verification. Judge calibration, fixtures, and provider runners remain Agent-owned."
     }
   ]
 }

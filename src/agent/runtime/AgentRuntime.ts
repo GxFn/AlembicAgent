@@ -45,7 +45,14 @@ import {
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { limitToolResult } from '../context/ContextWindow.js';
-import { EvidenceLedgerStore, seedLedgerFromJobSiblings } from '../evidence/EvidenceLedgerStore.js';
+import {
+  type EvidenceLedgerStore,
+  seedLedgerFromJobSiblings,
+} from '../evidence/EvidenceLedgerStore.js';
+import {
+  createProductionEvidenceLedgerAuthority,
+  resolveProductionEvidenceLedgerStore,
+} from '../evidence/ProductionEvidenceLedgerAuthority.js';
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
@@ -2782,13 +2789,13 @@ function buildEvidenceLedgerForLoop(options: {
     return null;
   }
   try {
-    const store = new EvidenceLedgerStore({
+    const authority = createProductionEvidenceLedgerAuthority({
       dataRoot: options.dataRoot,
       jobId: options.jobId,
       sessionId: options.sessionId,
       dimensionId,
-      redactor: redactDeveloperText,
     });
+    const store = resolveProductionEvidenceLedgerStore(authority);
     // M4（跨维综合）：合成维度冷启动时 seed 同 job 兄弟维度的全部台账证据——
     // 仅在本维文件为空时执行（producer 二次 reactLoop hydrate 到非空文件即跳过，防重复 seed）。
     if (dimensionId === 'cross-dimension-synthesis' && store.stats().entries === 0) {
@@ -2804,11 +2811,11 @@ function buildEvidenceLedgerForLoop(options: {
     }
     return store;
   } catch (err: unknown) {
-    // 台账初始化失败不阻断主循环——降级为无台账（等价改造前行为），降级必须可观测
-    options.logger.warn('[EvidenceLedger] init failed; continuing without ledger', {
+    // production ledger 坐标或持久化初始化失败时必须关闭本次维度运行，不能悄悄退回无台账。
+    options.logger.warn('[EvidenceLedger] production authority initialization failed', {
       error: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    throw err instanceof Error ? err : new Error(String(err));
   }
 }
 

@@ -1,4 +1,13 @@
 export {
+  createProductionEvidenceLedgerAuthority,
+  type ProductionEvidenceCaptureInputV1,
+  type ProductionEvidenceLedgerAuthorityV1,
+  type ProductionEvidenceLedgerCaptureFacetV1,
+  type ProductionEvidenceLedgerCoordinatesV1,
+  type ProductionEvidenceLedgerIdentityV1,
+  type ProductionEvidenceLedgerReadFacetV1,
+} from './agent/evidence/ProductionEvidenceLedgerAuthority.js';
+export {
   type CausalRepairNodeV1,
   type CreateStrictAnalysisFixpointInputV1,
   type CreateStrictHypothesisExpressionSetReceiptInputV1,

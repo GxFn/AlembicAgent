@@ -19,6 +19,10 @@ import {
   type SemanticDispositionReviewTrustPolicyV3,
 } from '@alembic/core/production';
 import type { AiProvider, ChatWithToolsResult } from '../../ai/AiProvider.js';
+import {
+  type ProductionEvidenceLedgerReadFacetV1,
+  resolveProductionEvidenceLedgerReadBinding,
+} from '../evidence/ProductionEvidenceLedgerAuthority.js';
 import type { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 
 const RUNTIME_STAGE = 'durable-semantic-review';
@@ -69,16 +73,11 @@ export interface SemanticReviewSigningKeyProviderV1 {
 export type SemanticReviewProviderV1 = Pick<AiProvider, 'name' | 'model' | 'chatWithTools'>;
 
 /**
- * Durable review 只消费 EvidenceLedgerStore 的只读 authority 面。
+ * Durable review 只消费 Agent production factory 生成的不可伪造只读 facet。
  *
- * 结构端口让宿主可注入既有 store adapter，而不把 Agent 私有持久化类升级成公共构造器；
- * production wiring 仍应传入真实 EvidenceLedgerStore。
+ * EvidenceLedgerStore 仍是私有实现；调用方不能以结构相同的 adapter 替换真实持久化
+ * authority，也不能自行指定 Core trust policy 中的 store id/config hash。
  */
-export interface SemanticReviewEvidenceLedgerPortV1 {
-  get(reference: string): EvidenceEntry | null;
-  listStrictSnapshotEntries(): readonly EvidenceEntry[];
-}
-
 export interface SemanticReviewWitnessAuthorityLookupV1 {
   readonly evidenceEntryId: string;
   readonly evidenceSessionId: string;
@@ -116,9 +115,7 @@ export interface DurableSemanticReviewRuntimeBootstrapV1 {
     readonly maxTokens?: number;
   };
   readonly evidence: {
-    readonly ledger: SemanticReviewEvidenceLedgerPortV1;
-    readonly evidenceStoreId: string;
-    readonly evidenceStoreConfigHash: string;
+    readonly ledger: ProductionEvidenceLedgerReadFacetV1;
     readonly witnessAuthority: SemanticReviewWitnessAuthorityPortV1;
   };
   readonly timeoutMs: number;
@@ -199,9 +196,16 @@ class DurableSemanticReviewRuntimeService implements DurableSemanticReviewRuntim
     const cancellation = createCancellation(input.abortSignal, this.#timeoutMs);
     let authoritativeLedgerEntries: ReadonlyMap<string, EvidenceEntry>;
     try {
-      const currentSnapshot = createStrictEvidenceLedgerSnapshotV1(
-        this.#state.evidence.ledger.listStrictSnapshotEntries()
-      );
+      const currentSnapshot = this.#state.evidence.ledger.strictSnapshot();
+      const rebuiltSnapshot = createStrictEvidenceLedgerSnapshotV1(currentSnapshot.entries);
+      if (
+        currentSnapshot.complete !== true ||
+        currentSnapshot.truncated !== false ||
+        currentSnapshot.continuation !== null ||
+        currentSnapshot.snapshotHash !== rebuiltSnapshot.snapshotHash
+      ) {
+        throw new Error('ALEMBIC_AGENT_EVIDENCE_LEDGER_SNAPSHOT_REBOUND');
+      }
       authoritativeLedgerEntries = new Map(
         currentSnapshot.entries.map((entry) => [evidenceKey(entry), entry])
       );
@@ -209,7 +213,7 @@ class DurableSemanticReviewRuntimeService implements DurableSemanticReviewRuntim
       cancellation.cleanup();
       throw runtimeError(
         'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_SNAPSHOT_INVALID',
-        'The authoritative EvidenceLedgerStore cannot produce a complete strict snapshot.',
+        'The production Evidence Ledger authority cannot produce a complete strict snapshot.',
         err
       );
     }
@@ -242,6 +246,13 @@ export async function createDurableSemanticReviewRuntime(
   input: DurableSemanticReviewRuntimeBootstrapV1
 ): Promise<DurableSemanticReviewRuntimeV1> {
   validateBootstrap(input);
+  const ledgerBinding = resolveProductionEvidenceLedgerReadBinding(input.evidence.ledger);
+  if (!ledgerBinding) {
+    throw runtimeError(
+      'ALEMBIC_AGENT_SEMANTIC_REVIEW_BOOTSTRAP_INVALID',
+      'Evidence Ledger read authority was not created by the Agent production factory.'
+    );
+  }
   let privateKey: KeyObject;
   try {
     privateKey = await input.signingKey.loadPrivateKey();
@@ -273,8 +284,8 @@ export async function createDurableSemanticReviewRuntime(
         invoke: async (call) => invokeReviewer(state, call),
       },
       evidenceStore: {
-        evidenceStoreId: input.evidence.evidenceStoreId,
-        evidenceStoreConfigHash: input.evidence.evidenceStoreConfigHash,
+        evidenceStoreId: ledgerBinding.identity.storeId,
+        evidenceStoreConfigHash: ledgerBinding.identity.storeConfigHash,
         load: async (call) => loadEvidenceAuthority(state, call),
       },
     });
@@ -349,7 +360,7 @@ async function loadEvidenceAuthority(
   if (!evidenceEntry || !evidenceEntryMatches(evidenceEntry, call.evidence)) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_NOT_FOUND',
-      `EvidenceLedgerStore does not contain exact ${call.evidence.evidenceSessionId}/${call.evidence.evidenceEntryId}.`
+      `Production Evidence Ledger does not contain exact ${call.evidence.evidenceSessionId}/${call.evidence.evidenceEntryId}.`
     );
   }
   const selected = selectExactExecution(call.semanticRequest, call.evidence);
@@ -652,12 +663,11 @@ function isValidReviewerBootstrap(
 function isValidEvidenceBootstrap(
   input: DurableSemanticReviewRuntimeBootstrapV1['evidence'] | undefined
 ): boolean {
+  const binding = resolveProductionEvidenceLedgerReadBinding(input?.ledger);
   return (
-    typeof input?.ledger?.get === 'function' &&
-    typeof input?.ledger?.listStrictSnapshotEntries === 'function' &&
-    isNonEmptyString(input?.evidenceStoreId) &&
-    typeof input?.evidenceStoreConfigHash === 'string' &&
-    /^sha256:[0-9a-f]{64}$/u.test(input.evidenceStoreConfigHash) &&
+    binding !== null &&
+    input?.ledger.identity === binding.identity &&
+    Object.keys(input).sort().join(',') === 'ledger,witnessAuthority' &&
     typeof input?.witnessAuthority?.resolve === 'function'
   );
 }
