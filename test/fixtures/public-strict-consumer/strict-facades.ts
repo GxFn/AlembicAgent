@@ -1,6 +1,11 @@
 import type * as EvaluationFacade from '@alembic/agent/evaluation';
 import {
+  createDurableSemanticReviewRuntime,
   createFrozenEvidenceProjection,
+  type DurableSemanticReviewExecuteInputV1,
+  type DurableSemanticReviewRuntimeBootstrapV1,
+  DurableSemanticReviewRuntimeError,
+  type DurableSemanticReviewRuntimeV1,
   type FrozenEvidenceEntryV1,
   type FrozenEvidenceProjectionV1,
   type IndependentReviewAxisV1,
@@ -12,6 +17,12 @@ import {
   InvestigatedEmptyReviewer,
   type InvestigatedEmptyReviewInputV1,
   type ReviewerIdentityV1,
+  type SemanticReviewEvidenceLedgerPortV1,
+  type SemanticReviewProviderV1,
+  type SemanticReviewSigningKeyProviderV1,
+  type SemanticReviewWitnessAuthorityBundleV1,
+  type SemanticReviewWitnessAuthorityLookupV1,
+  type SemanticReviewWitnessAuthorityPortV1,
 } from '@alembic/agent/evaluation';
 import type * as ProductionFacade from '@alembic/agent/production';
 import {
@@ -79,6 +90,8 @@ export interface StrictFacadePrivateSurfaceAssertions {
   readonly judgeCalibration: typeof EvaluationFacade.computeJudgeCalibration;
   // @ts-expect-error Frozen fixture providers are test/evaluation internals.
   readonly fixtureProvider: typeof EvaluationFacade.FrozenStrictProductionEvaluationProviderV1;
+  // @ts-expect-error Runtime implementation and Core mint gateway stay behind the trusted factory.
+  readonly durableRuntimeImplementation: typeof EvaluationFacade.DurableSemanticReviewRuntime;
 }
 
 export const strictRuntimeBindings = {
@@ -94,6 +107,8 @@ export const strictRuntimeBindings = {
   createStrictProducerLineageReceiptV1,
   createStrictProducerExpressionSetV1,
   createFrozenEvidenceProjection,
+  createDurableSemanticReviewRuntime,
+  DurableSemanticReviewRuntimeError,
   IndependentValueReviewer,
   InvestigatedEmptyReviewer,
 };
@@ -132,6 +147,15 @@ export interface StrictFacadeConsumerTypes {
   readonly runtimePort: StrictProductionRuntimePortV1;
   readonly frozenEvidenceEntry: FrozenEvidenceEntryV1;
   readonly frozenEvidence: FrozenEvidenceProjectionV1;
+  readonly durableReviewBootstrap: DurableSemanticReviewRuntimeBootstrapV1;
+  readonly durableReviewExecuteInput: DurableSemanticReviewExecuteInputV1;
+  readonly durableReviewRuntime: DurableSemanticReviewRuntimeV1;
+  readonly durableReviewLedger: SemanticReviewEvidenceLedgerPortV1;
+  readonly durableReviewProvider: SemanticReviewProviderV1;
+  readonly durableReviewSigningKey: SemanticReviewSigningKeyProviderV1;
+  readonly durableReviewWitnessBundle: SemanticReviewWitnessAuthorityBundleV1;
+  readonly durableReviewWitnessLookup: SemanticReviewWitnessAuthorityLookupV1;
+  readonly durableReviewWitnessAuthority: SemanticReviewWitnessAuthorityPortV1;
   readonly reviewerIdentity: ReviewerIdentityV1;
   readonly reviewAxis: IndependentReviewAxisV1;
   readonly reviewerOptions: IndependentValueReviewerOptionsV1;

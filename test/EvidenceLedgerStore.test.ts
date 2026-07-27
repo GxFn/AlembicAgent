@@ -3,6 +3,7 @@
  * 覆盖：写读回、JSONL 落盘形态（确定性序列化）、子区间切片（绝对行号/内容相对两型）、
  * 检索与统计、截断上限、脱敏注入、回读续接（hydrate/resume）、非法引用。
  */
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -49,6 +50,9 @@ describe('EvidenceLedgerStore', () => {
     expect(store.get('E-1')?.file).toBe('lib/types/graph-shared.ts');
     expect(store.get('E-1')?.content).toContain('graph-shared-types');
     expect(store.get('E-1')?.contentHash).toBe(hashEvidenceContent(first.content));
+    expect(first.contentHash).toBe(
+      `sha256:${createHash('sha256').update(first.content).digest('hex')}`
+    );
 
     const lines = fs.readFileSync(store.filePath, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(2);
@@ -140,6 +144,114 @@ describe('EvidenceLedgerStore', () => {
       content: 'c',
     });
     expect(third.id).toBe('E-3');
+  });
+
+  test('strict snapshot 在 fresh store 重载后保持全量、冻结且可由 Core authority 消费', () => {
+    const { dataRoot, store } = makeStore();
+    const first = store.append({
+      tool: 'code.read',
+      callId: 'c1',
+      file: 'lib/a.ts',
+      content: 'a',
+    });
+    const second = store.append({
+      tool: 'code.read',
+      callId: 'c2',
+      file: 'lib/b.ts',
+      content: 'b',
+    });
+
+    const resumed = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'bootstrap_test_1',
+      sessionId: 'bs_test_1',
+      dimensionId: 'ts-js-module',
+    });
+    const snapshotEntries = resumed.listStrictSnapshotEntries();
+    expect(snapshotEntries).toEqual([first, second]);
+    expect(Object.isFrozen(snapshotEntries)).toBe(true);
+    expect(snapshotEntries.every(Object.isFrozen)).toBe(true);
+  });
+
+  test.each([
+    {
+      name: 'malformed JSON',
+      corrupt: (entry: Record<string, unknown>) => '{not-json',
+    },
+    {
+      name: 'legacy content hash',
+      retainsForCompatibility: true,
+      corrupt: (entry: Record<string, unknown>) =>
+        JSON.stringify({
+          ...entry,
+          id: 'E-2',
+          contentHash: createHash('sha256')
+            .update(`evidence-ledger:v1:${String(entry.content)}`)
+            .digest('hex'),
+        }),
+    },
+    {
+      name: 'foreign session',
+      corrupt: (entry: Record<string, unknown>) =>
+        JSON.stringify({ ...entry, id: 'E-2', sessionId: 'bs_foreign' }),
+    },
+    {
+      name: 'duplicate id',
+      corrupt: (entry: Record<string, unknown>) => JSON.stringify(entry),
+    },
+  ])('strict snapshot 对 $name hydrate 污染失败关闭', ({ corrupt, retainsForCompatibility }) => {
+    const { dataRoot, store } = makeStore();
+    store.append({ tool: 'code.read', callId: 'c1', file: 'lib/a.ts', content: 'a' });
+    const entry = JSON.parse(fs.readFileSync(store.filePath, 'utf8').trim()) as Record<
+      string,
+      unknown
+    >;
+    fs.appendFileSync(store.filePath, `${corrupt(entry)}\n`, 'utf8');
+
+    const resumed = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'bootstrap_test_1',
+      sessionId: 'bs_test_1',
+      dimensionId: 'ts-js-module',
+    });
+    expect(resumed.get('E-1')?.content).toBe('a');
+    if (retainsForCompatibility) {
+      expect(resumed.get('E-2')?.content).toBe('a');
+    }
+    expect(() => resumed.listStrictSnapshotEntries()).toThrow(
+      'EVIDENCE_LEDGER_STRICT_SNAPSHOT_INVALID'
+    );
+  });
+
+  test('hydrate 污染行仍占用其磁盘序号，后续 append 不复用 authority ID', () => {
+    const { dataRoot, store } = makeStore();
+    store.append({ tool: 'code.read', callId: 'c1', file: 'lib/a.ts', content: 'a' });
+    const entry = JSON.parse(fs.readFileSync(store.filePath, 'utf8').trim()) as Record<
+      string,
+      unknown
+    >;
+    fs.appendFileSync(
+      store.filePath,
+      `${JSON.stringify({ ...entry, id: 'E-9', sessionId: 'bs_foreign' })}\n`,
+      'utf8'
+    );
+
+    const resumed = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'bootstrap_test_1',
+      sessionId: 'bs_test_1',
+      dimensionId: 'ts-js-module',
+    });
+    const next = resumed.append({
+      tool: 'code.read',
+      callId: 'c10',
+      file: 'lib/next.ts',
+      content: 'next',
+    });
+    expect(next.id).toBe('E-10');
+    expect(() => resumed.listStrictSnapshotEntries()).toThrow(
+      'EVIDENCE_LEDGER_STRICT_SNAPSHOT_INVALID'
+    );
   });
 
   test('非法引用一律 null：file:line 形态（捏造典型）/未知 id/坏区间', () => {

@@ -1,4 +1,18 @@
 export {
+  createDurableSemanticReviewRuntime,
+  type DurableSemanticReviewExecuteInputV1,
+  type DurableSemanticReviewRuntimeBootstrapV1,
+  DurableSemanticReviewRuntimeError,
+  type DurableSemanticReviewRuntimeErrorCode,
+  type DurableSemanticReviewRuntimeV1,
+  type SemanticReviewEvidenceLedgerPortV1,
+  type SemanticReviewProviderV1,
+  type SemanticReviewSigningKeyProviderV1,
+  type SemanticReviewWitnessAuthorityBundleV1,
+  type SemanticReviewWitnessAuthorityLookupV1,
+  type SemanticReviewWitnessAuthorityPortV1,
+} from './agent/evaluation/DurableSemanticReviewRuntime.js';
+export {
   createFrozenEvidenceProjection,
   type FrozenEvidenceEntryV1,
   type FrozenEvidenceProjectionV1,

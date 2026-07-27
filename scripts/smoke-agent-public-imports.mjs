@@ -30,8 +30,10 @@ const requiredRuntimeBindings = {
     'validateStrictAnalystEpochV1',
   ],
   './evaluation': [
+    'DurableSemanticReviewRuntimeError',
     'IndependentValueReviewer',
     'InvestigatedEmptyReviewer',
+    'createDurableSemanticReviewRuntime',
     'createFrozenEvidenceProjection',
   ],
 };

@@ -1887,9 +1887,13 @@
       ]
     },
     "./evaluation": {
-      "exportCount": 3,
-      "signatureHash": "d40a8d77d1d35bb931a3d5d29379c5a02b2ffd8bd424843e789a3f57a4a1b4e5",
+      "exportCount": 5,
+      "signatureHash": "6bb0c8780de89647281426cfbfcde7c42a6b31bb435df38872b95a2d65ae9286",
       "entries": [
+        {
+          "name": "DurableSemanticReviewRuntimeError",
+          "kind": "class"
+        },
         {
           "name": "IndependentValueReviewer",
           "kind": "class"
@@ -1897,6 +1901,10 @@
         {
           "name": "InvestigatedEmptyReviewer",
           "kind": "class"
+        },
+        {
+          "name": "createDurableSemanticReviewRuntime",
+          "kind": "function"
         },
         {
           "name": "createFrozenEvidenceProjection",

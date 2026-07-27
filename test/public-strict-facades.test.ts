@@ -42,8 +42,10 @@ const STRICT_FACADES = {
     import: './dist/evaluation.js',
     types: './dist/evaluation.d.ts',
     runtime: [
+      { name: 'DurableSemanticReviewRuntimeError', kind: 'class' },
       { name: 'IndependentValueReviewer', kind: 'class' },
       { name: 'InvestigatedEmptyReviewer', kind: 'class' },
+      { name: 'createDurableSemanticReviewRuntime', kind: 'function' },
       { name: 'createFrozenEvidenceProjection', kind: 'function' },
     ],
   },

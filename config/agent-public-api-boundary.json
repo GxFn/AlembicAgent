@@ -195,9 +195,9 @@
     {
       "export": "./evaluation",
       "specifier": "@alembic/agent/evaluation",
-      "contract": "Curated independent value and investigated-empty reviewer entrypoints with frozen-evidence input and decision types.",
-      "agentOwned": ["frozen evidence projection", "independent value review", "investigated-empty review"],
-      "hostOwnedAdapterBoundary": "Host owns reviewer model injection and admission policy; judge calibration, fixtures, and provider runners remain Agent-owned."
+      "contract": "Curated independent reviewers plus a trusted-bootstrap durable semantic-review runtime that mints Core-verifiable V3 attestations from frozen Evidence Ledger and direct-witness authority.",
+      "agentOwned": ["frozen evidence projection", "independent value and investigated-empty review", "signing-key custody abstraction", "exact compiled-prompt provider execution", "EvidenceLedgerStore snapshot plus witness/receipt authority loading", "cancellation and error classification", "durable attestation minting"],
+      "hostOwnedAdapterBoundary": "Host owns trusted bootstrap provisioning of the key provider, reviewer/model-load receipt, EvidenceLedgerStore, and witness/receipt authority. Per-request callers and Main cannot inject those authorities; Main owns policy persistence and independent attestation verification. Judge calibration, fixtures, and provider runners remain Agent-owned."
     }
   ]
 }

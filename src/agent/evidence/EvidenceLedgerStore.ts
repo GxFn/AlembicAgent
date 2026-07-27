@@ -46,8 +46,18 @@ export interface EvidenceEntryDraft {
 
 export const EVIDENCE_TRUNCATION_MARKER = '…[evidence truncated at entry cap]';
 
-/** 域标签内容哈希——条目完整性与 E5 新鲜度终检共用一把尺 */
+/**
+ * EvidenceEntry 的 canonical 内容哈希。
+ *
+ * Core strict fact / semantic-review authority 对 EvidenceEntry 使用原始 UTF-8 bytes 的
+ * `sha256:<hex>`；这里必须与它保持同一把尺，不能再使用历史 domain-separated 裸 hex，
+ * 否则真实 ledger 条目无法进入冻结 snapshot / direct-witness authority。
+ */
 export function hashEvidenceContent(content: string): string {
+  return `sha256:${createHash('sha256').update(content).digest('hex')}`;
+}
+
+function hashLegacyEvidenceContent(content: string): string {
   return createHash('sha256').update(`evidence-ledger:v1:${content}`).digest('hex');
 }
 
@@ -99,6 +109,7 @@ export class EvidenceLedgerStore {
   readonly #dimensionId: string;
   readonly #redactor: (text: string) => string;
   readonly #entries = new Map<string, EvidenceEntry>();
+  readonly #hydrateIntegrityIssues: string[] = [];
   #seq = 0;
   #dirReady = false;
 
@@ -131,9 +142,10 @@ export class EvidenceLedgerStore {
       contentHash: hashEvidenceContent(capped),
       capturedAt: Date.now(),
     };
-    this.#writeLine(entry);
-    this.#entries.set(entry.id, entry);
-    return entry;
+    const frozen = freezeEvidenceEntry(entry);
+    this.#writeLine(frozen);
+    this.#entries.set(frozen.id, frozen);
+    return cloneEvidenceEntry(frozen);
   }
 
   /** 只读取回：接受 `E-12` 或 `E-12@5-20`；子区间返回派生副本（content 为切片） */
@@ -144,7 +156,7 @@ export class EvidenceLedgerStore {
     }
     const entry = this.#entries.get(parsed.id) ?? null;
     if (!entry || !parsed.range) {
-      return entry;
+      return entry ? cloneEvidenceEntry(entry) : null;
     }
     return sliceEntry(entry, parsed.range);
   }
@@ -190,7 +202,7 @@ export class EvidenceLedgerStore {
     const hits: EvidenceEntry[] = [];
     for (const entry of this.#entries.values()) {
       if (entry.file?.toLowerCase().includes(needle)) {
-        hits.push(entry);
+        hits.push(cloneEvidenceEntry(entry));
         if (hits.length >= limit) {
           break;
         }
@@ -212,7 +224,26 @@ export class EvidenceLedgerStore {
   /** 近期条目（按采集序尾部）——note_finding 引用解析失败时的真实候选提示（E3） */
   listRecent(limit = 5): EvidenceEntry[] {
     const all = [...this.#entries.values()];
-    return all.slice(Math.max(0, all.length - limit));
+    return all.slice(Math.max(0, all.length - limit)).map(cloneEvidenceEntry);
+  }
+
+  /**
+   * Strict production 的全量 frozen snapshot 输入。
+   *
+   * 普通 get/search 可容忍历史 JSONL 中坏行并继续提供剩余证据；durable semantic review
+   * 不能把这种部分 hydrate 宣称为 complete snapshot，所以任何坏行、旧 hash、重复 ID 或
+   * foreign session/dimension 都会在这里 fail closed。
+   */
+  listStrictSnapshotEntries(): readonly EvidenceEntry[] {
+    if (this.#hydrateIntegrityIssues.length > 0) {
+      throw new Error(
+        `EVIDENCE_LEDGER_STRICT_SNAPSHOT_INVALID:${this.#hydrateIntegrityIssues.join(',')}`
+      );
+    }
+    if (this.#entries.size === 0) {
+      throw new Error('EVIDENCE_LEDGER_STRICT_SNAPSHOT_EMPTY');
+    }
+    return Object.freeze([...this.#entries.values()].map(freezeEvidenceEntry));
   }
 
   /** 台账内检索（E4 evidence.search）：路径片段或内容关键词，大小写不敏感，按采集序返回 */
@@ -224,7 +255,7 @@ export class EvidenceLedgerStore {
         entry.file?.toLowerCase().includes(needle) ||
         entry.content.toLowerCase().includes(needle)
       ) {
-        hits.push(entry);
+        hits.push(cloneEvidenceEntry(entry));
         if (hits.length >= limit) {
           break;
         }
@@ -238,7 +269,7 @@ export class EvidenceLedgerStore {
       return;
     }
     const lines = readFileSync(this.filePath, 'utf8').split('\n');
-    for (const line of lines) {
+    for (const [lineIndex, line] of lines.entries()) {
       const trimmed = line.trim();
       if (!trimmed) {
         continue;
@@ -247,16 +278,34 @@ export class EvidenceLedgerStore {
       try {
         parsed = JSON.parse(trimmed);
       } catch {
+        this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:json`);
         continue;
       }
       if (!isValidEvidenceEntry(parsed)) {
+        this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:shape`);
         continue;
       }
-      this.#entries.set(parsed.id, parsed);
+      // 即便该条记录随后因 authority/hash 污染被 strict 路径拒绝，也必须保留磁盘已占用的
+      // 最大序号；否则普通兼容读回后继续 append 会复用已有 E-n，制造第二个歧义 authority。
       const seq = Number(parsed.id.slice(2));
       if (Number.isFinite(seq) && seq > this.#seq) {
         this.#seq = seq;
       }
+      if (parsed.sessionId !== this.#sessionId || parsed.dimensionId !== this.#dimensionId) {
+        this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:authority`);
+        continue;
+      }
+      if (parsed.contentHash !== hashEvidenceContent(parsed.content)) {
+        this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:authority`);
+        if (parsed.contentHash !== hashLegacyEvidenceContent(parsed.content)) {
+          continue;
+        }
+      }
+      if (this.#entries.has(parsed.id)) {
+        this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:duplicate-id`);
+        continue;
+      }
+      this.#entries.set(parsed.id, freezeEvidenceEntry(parsed));
     }
     this.#dirReady = true;
   }
@@ -268,6 +317,21 @@ export class EvidenceLedgerStore {
     }
     appendFileSync(this.filePath, `${stableStringifyEntry(entry)}\n`, 'utf8');
   }
+}
+
+function cloneEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
+  return {
+    ...entry,
+    ...(entry.range ? { range: { ...entry.range } } : {}),
+  };
+}
+
+function freezeEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
+  const frozen = cloneEvidenceEntry(entry);
+  if (frozen.range) {
+    Object.freeze(frozen.range);
+  }
+  return Object.freeze(frozen);
 }
 
 /**

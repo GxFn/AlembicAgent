@@ -6,6 +6,7 @@
  * 对外仍只经 @alembic/agent/prompts 既有 barrel 面世(名集恒等 re-export)。
  */
 export * from './analysisArtifact.js';
+export * from './DurableSemanticReviewRuntime.js';
 export * from './gateEvaluators.js';
 export * from './IndependentValueReviewer.js';
 export * from './InvestigatedEmptyReviewer.js';

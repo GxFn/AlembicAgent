@@ -1,10 +1,12 @@
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
+  createDurableSemanticReviewRuntime,
   createFrozenEvidenceProjection,
+  DurableSemanticReviewRuntimeError,
   IndependentValueReviewer,
   InvestigatedEmptyReviewer,
 } from '@alembic/agent/evaluation';
@@ -22,9 +24,11 @@ import {
 } from '@alembic/agent/production';
 import { runStrictPlanAgent } from '@alembic/agent/runs';
 import {
+  assertSemanticDispositionReviewDurableAttestationV3,
   buildFactQueryCatalogSnapshot,
   canonicalizeKnowledgeClustersV1,
   canonicalizeObservationPopulationV1,
+  createAgentSemanticDispositionReviewRequestV1,
   createAnalysisReviewContextHashV1,
   createConfigFactQueryBackendV1,
   createConfigFactQueryFamilyV1,
@@ -74,10 +78,11 @@ async function runProbe(root) {
   const real = await createRealExecutorFixture(root);
   const semantic = createAgentSemanticFixture(real);
   const producer = createAgentProducerFixture(real, semantic);
+  const durableReview = await createDurableReviewProbe(real, semantic, producer);
   const orphanReview = createOrphanReviewFixture(real, semantic);
   const reboundReview = createReboundReviewFixture(real, semantic);
   const faults = await runFaultMatrix(real, semantic, producer, orphanReview, reboundReview);
-  writeReport({ surface, real, semantic, producer, faults });
+  writeReport({ surface, real, semantic, producer, durableReview, faults });
 }
 
 async function verifyPublicSurface() {
@@ -94,6 +99,8 @@ async function verifyPublicSurface() {
     createStrictProducerLineageReceiptV1,
     createStrictProducerExpressionSetV1,
     createFrozenEvidenceProjection,
+    createDurableSemanticReviewRuntime,
+    DurableSemanticReviewRuntimeError,
     IndependentValueReviewer,
     InvestigatedEmptyReviewer,
   };
@@ -142,6 +149,290 @@ async function verifyPublicSurface() {
     runtimeBindingCount: Object.keys(bindings).length,
     forbiddenCount: forbidden.length,
   };
+}
+
+async function createDurableReviewProbe(real, semantic, producer) {
+  const executionReceipt = real.executionReceipt;
+  const fileExecution = executionReceipt.fileExecutions[0];
+  const witnessBinding = real.witness.bindings[0];
+  const induction = semantic.epoch.inductions[0];
+  const falsification = semantic.epoch.falsifications[0];
+  if (!fileExecution || !witnessBinding || !induction || !falsification) {
+    throw new Error('STRICT_AGENT_PUBLIC_DURABLE_REVIEW_INPUT_INCOMPLETE');
+  }
+  const reviewerModelLoadReceipt = createPublicReviewerModelLoadReceipt();
+  const semanticRequest = createDurableSemanticReviewRequest({
+    real,
+    semantic,
+    producer,
+    executionReceipt,
+    fileExecution,
+    witnessBinding,
+    induction,
+    falsification,
+    reviewerModelLoadReceipt,
+  });
+  return executeDurableReviewRuntimeProbe({
+    real,
+    semanticRequest,
+    witnessBinding,
+    reviewerModelLoadReceipt,
+  });
+}
+
+function createPublicReviewerModelLoadReceipt() {
+  const semantic = {
+    schemaVersion: 1,
+    providerId: 'provider:agent-public-independent-reviewer',
+    modelId: 'model:agent-public-independent-reviewer',
+    modelVersion: '2026-07-28',
+    methodId: 'semantic-disposition-review',
+    methodVersion: 'v3',
+    runtimeConfigHash: hashCanonicalJson({ runtime: 'agent-public-durable-review' }),
+    credentialLocationSymbol: 'runtime-config:agent-public-reviewer',
+  };
+  return {
+    ...semantic,
+    loadReceiptHash: hashCanonicalJson(semantic),
+  };
+}
+
+function createDurableSemanticReviewRequest({
+  real,
+  semantic,
+  producer,
+  executionReceipt,
+  fileExecution,
+  witnessBinding,
+  induction,
+  falsification,
+  reviewerModelLoadReceipt,
+}) {
+  const proposal = {
+    reviewKind: 'producer-non-draft',
+    populationHash: semantic.epoch.population.populationHash,
+    hypothesisId: semantic.hypothesisId,
+    expression: null,
+    zeroDisposition: {
+      reasonCode: 'NO_ELIGIBLE_EXPRESSION_AFTER_PRODUCER',
+      terminalFate: 'reviewed-non-draft',
+    },
+  };
+  const proposedDispositionHash = hashKnowledgeDispositionProposalV1(proposal);
+  return createAgentSemanticDispositionReviewRequestV1({
+    strictWorkflowRunId: runId,
+    sourceRevisionVectorHash: real.artifact.sourceVectorHash,
+    currentAnalysisFixpointHash: semantic.analysisFixpoint.fixpointHash,
+    populationHash: semantic.epoch.population.populationHash,
+    proposedDispositionHash,
+    finalExpandedSchedule: semantic.finalSchedule,
+    executionReceipts: [executionReceipt],
+    evidence: [
+      {
+        evidenceEntryId: witnessBinding.evidenceEntryId,
+        evidenceSessionId: witnessBinding.evidenceSessionId,
+        sourceRevisionVectorHash: real.artifact.sourceVectorHash,
+        canonicalSubjectRef: executionReceipt.canonicalSubjectRef,
+        relativePath: fileExecution.relativePath,
+        blobHash: fileExecution.blobHash,
+        content: witnessBinding.evidenceEntry.content,
+        contentHash: witnessBinding.evidenceEntry.contentHash,
+        semanticRole: 'candidate-admission-target-comparison',
+      },
+    ],
+    calibration: {
+      providerId: reviewerModelLoadReceipt.providerId,
+      modelId: reviewerModelLoadReceipt.modelId,
+      modelVersion: reviewerModelLoadReceipt.modelVersion,
+      methodId: reviewerModelLoadReceipt.methodId,
+      methodVersion: reviewerModelLoadReceipt.methodVersion,
+      reviewerModelLoadReceipt,
+      calibrationReceiptHash: hashCanonicalJson({
+        kind: 'agent-public-durable-review-calibration',
+      }),
+      rubricVersion: 'semantic-disposition-rubric-v1',
+      axes: [
+        'admission-comparison-completeness',
+        'fixpoint-population-execution-lineage',
+        'frozen-semantic-evidence-grounding',
+        'hypothesis-falsification-context',
+        'reviewer-independence',
+        'target-disposition-consistency',
+        'verdict-sufficiency',
+      ].map((axisId) => ({
+        axisId,
+        minimumScore: 0.8,
+        calibrationEvidenceHash: hashCanonicalJson({ axisId }),
+      })),
+    },
+    producer: createProductionActorIdentityV1({
+      providerId: 'provider:agent-public-producer',
+      modelId: 'model:agent-public-producer',
+      modelVersion: '2026-07-28',
+      promptHash: hashCanonicalJson({ kind: 'agent-public-producer-prompt' }),
+      runId,
+      invocationId: 'invocation:agent-public-producer',
+      loadReceiptHash: hashCanonicalJson({ kind: 'agent-public-producer-load' }),
+      outputHash: proposedDispositionHash,
+    }),
+    context: {
+      reviewKind: 'producer-non-draft',
+      privateCorpusRevision,
+      analysisFixpoint: semantic.analysisFixpoint,
+      population: semantic.epoch.population,
+      induction,
+      falsification,
+      proposal,
+      expressionSetReceiptId: producer.coreExpressionSet.receiptId,
+      g1Receipt: producer.contentReadyTerminal.g1Receipt,
+      admissionReceipt: producer.contentReadyTerminal.admissionReceipt,
+      target: {
+        expressionId: null,
+        authoredFingerprint: producer.expressionSet.proposals[0].authoredFingerprint,
+        terminalFate: 'reviewed-non-draft',
+        targetRecipeId: null,
+        targetFingerprint: null,
+        targetReadyProofHash: null,
+      },
+    },
+  });
+}
+
+async function executeDurableReviewRuntimeProbe({
+  real,
+  semanticRequest,
+  witnessBinding,
+  reviewerModelLoadReceipt,
+}) {
+  const ledgerEntries = real.witness.bindings.map((binding) => binding.evidenceEntry);
+  let providerCallCount = 0;
+  let witnessLoadCount = 0;
+  let compiledPrompt = null;
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const runtime = await createDurableSemanticReviewRuntime({
+    signingKey: {
+      trustRootId: 'semantic-review-trust:agent-public-probe',
+      keyId: 'semantic-review-key:agent-public-probe',
+      loadPrivateKey: async () => privateKey,
+    },
+    reviewer: {
+      provider: {
+        name: reviewerModelLoadReceipt.providerId,
+        model: reviewerModelLoadReceipt.modelId,
+        chatWithTools: async (prompt) => {
+          providerCallCount += 1;
+          compiledPrompt = prompt;
+          return {
+            text: createPassingDurableReviewDecision(prompt, witnessBinding.evidenceEntryId),
+            functionCalls: null,
+          };
+        },
+      },
+      modelLoadReceipt: reviewerModelLoadReceipt,
+      evaluatorRunId: 'run:agent-public-independent-reviewer',
+      createInvocationId: () => 'invocation:agent-public-independent-reviewer',
+    },
+    evidence: {
+      ledger: {
+        get: (reference) => ledgerEntries.find((entry) => entry.id === reference) ?? null,
+        listStrictSnapshotEntries: () => ledgerEntries,
+      },
+      evidenceStoreId: 'evidence-store:agent-public-probe',
+      evidenceStoreConfigHash: hashCanonicalJson({
+        kind: 'agent-public-evidence-store-config',
+      }),
+      witnessAuthority: {
+        resolve: async (lookup) => {
+          witnessLoadCount += 1;
+          const witnessBinding =
+            real.witness.bindings.find(
+              (binding) =>
+                binding.bindingHash === lookup.witnessBindingHash &&
+                binding.evidenceEntryId === lookup.evidenceEntryId
+            ) ?? null;
+          const fileExecution = real.executionReceipt.fileExecutions.find(
+            (execution) => execution.executionHash === lookup.fileExecutionHash
+          );
+          if (
+            !witnessBinding ||
+            !fileExecution ||
+            real.executionReceipt.receiptHash !== lookup.executionReceiptHash
+          ) {
+            return null;
+          }
+          return {
+            evidenceLedgerSnapshot: real.witness.evidenceLedgerSnapshot,
+            witnessBinding,
+            executionReceipt: real.executionReceipt,
+            fileExecutionHash: fileExecution.executionHash,
+          };
+        },
+      },
+    },
+    timeoutMs: 1_000,
+  });
+  const attestation = await runtime.execute({ semanticRequest });
+  const serializedAttestation = JSON.parse(JSON.stringify(attestation));
+  assertSemanticDispositionReviewDurableAttestationV3({
+    attestation: serializedAttestation,
+    expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+  });
+  if (
+    providerCallCount !== 1 ||
+    witnessLoadCount !== 1 ||
+    compiledPrompt !== attestation.execution.request.compiledPrompt
+  ) {
+    throw new Error('STRICT_AGENT_PUBLIC_DURABLE_REVIEW_RUNTIME_MISMATCH');
+  }
+  return {
+    serviceEntrypoint: true,
+    providerCallCount,
+    witnessLoadCount,
+    exactCompiledPrompt: true,
+    serializedAttestationVerified: true,
+    publicConsumerFreshProcess: true,
+    requestHash: semanticRequest.requestHash,
+    executionHash: attestation.execution.executionHash,
+    attestationHash: attestation.attestationHash,
+    trustPolicyHash: runtime.trustPolicy.policyHash,
+  };
+}
+
+function createPassingDurableReviewDecision(compiledPrompt, evidenceEntryId) {
+  const parsed = JSON.parse(compiledPrompt);
+  const compiledPromptHash = `sha256:${sha256(compiledPrompt)}`;
+  const requestHash = hashCanonicalJson({
+    ...parsed.payload,
+    compiledPrompt,
+    compiledPromptHash,
+  });
+  const semanticRequest = parsed.payload.semanticRequest;
+  return JSON.stringify({
+    schemaVersion: 2,
+    requestHash,
+    compiledPromptHash,
+    semanticRequestHash: semanticRequest.requestHash,
+    contextHash: semanticRequest.contextHash,
+    reviewKind: semanticRequest.reviewKind,
+    proposedDispositionHash: semanticRequest.proposedDispositionHash,
+    verdict: 'pass',
+    reasonCode: 'SEMANTIC_DISPOSITION_CONFIRMED',
+    axisDecisions: semanticRequest.calibration.axes.map(({ axisId }) => ({
+      axisId,
+      verdict: 'pass',
+      score: 0.95,
+      reasonCode: `PASS:${axisId}`,
+      evidenceEntryIds: [evidenceEntryId],
+    })),
+    evidenceFindings: [
+      {
+        evidenceEntryId,
+        axisIds: semanticRequest.calibration.axes.map(({ axisId }) => axisId),
+        finding: 'The frozen evidence and disposition lineage are complete.',
+        supportsVerdict: true,
+      },
+    ],
+  });
 }
 
 async function createRealExecutorFixture(root) {
@@ -790,7 +1081,7 @@ async function faultCard(mutation, stage, expectedCode, action) {
   };
 }
 
-function writeReport({ surface, real, semantic, producer, faults }) {
+function writeReport({ surface, real, semantic, producer, durableReview, faults }) {
   if (faults.length !== 11 || faults.some((fault) => fault.rejected !== true)) {
     throw new Error('STRICT_AGENT_PUBLIC_FAULT_MATRIX_INCOMPLETE');
   }
@@ -807,11 +1098,13 @@ function writeReport({ surface, real, semantic, producer, faults }) {
     runtimeBindingCount: surface.runtimeBindingCount,
     forbiddenCount: surface.forbiddenCount,
     publicSubpaths: [
+      '@alembic/agent/evaluation',
       '@alembic/agent/production',
       '@alembic/core/production',
       '@alembic/core/project-context-foundation',
     ],
     continuityVerified: true,
+    durableSemanticReview: durableReview,
     connectedChain: {
       executor: {
         realExecutor: true,
@@ -1207,6 +1500,7 @@ function createWitnessMaterial(artifact) {
     })
   );
   return {
+    evidenceLedgerSnapshot,
     bindings,
     authority: createStrictFactWitnessAuthorityV1({
       artifact,
