@@ -18,6 +18,8 @@ const CAPTURE_MISSING_FIELD_REASONS = {
   callId: 'MISSING_CALL_ID',
   content: 'MISSING_CONTENT',
 } as const;
+// 每次 capture 的私有 token 只认证本次调用内部生成的错误；旧错误或 caller trap 无法复用理由。
+const captureValidationErrorTokens = new WeakMap<object, object>();
 
 export interface ProductionEvidenceLedgerCoordinatesV1 {
   /**
@@ -140,55 +142,59 @@ export function resolveProductionEvidenceLedgerStore(
  * 已被擦除。必须先复制并冻结一份通过白名单校验的值，再允许 store 分配 E-n 或 append。
  */
 function validateCaptureInput(input: unknown): EvidenceEntryDraft {
+  const validationToken = Object.freeze({});
   try {
-    return validateCaptureInputUnchecked(input);
+    return validateCaptureInputUnchecked(input, validationToken);
   } catch (err: unknown) {
-    if (err instanceof Error && err.message.startsWith(CAPTURE_ERROR_PREFIX)) {
+    if (isCurrentCaptureValidationError(err, validationToken)) {
       throw err;
     }
-    throwCaptureError('UNREADABLE_INPUT');
+    throwCaptureError('UNREADABLE_INPUT', validationToken);
   }
 }
 
-function validateCaptureInputUnchecked(input: unknown): EvidenceEntryDraft {
+function validateCaptureInputUnchecked(
+  input: unknown,
+  validationToken: object
+): EvidenceEntryDraft {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    throwCaptureError('DRAFT_NOT_OBJECT');
+    throwCaptureError('DRAFT_NOT_OBJECT', validationToken);
   }
   const record = input as Record<string, unknown>;
   for (const key of Reflect.ownKeys(record)) {
     if (typeof key !== 'string' || !CAPTURE_ALLOWED_FIELDS.has(key)) {
-      throwCaptureError('EXTRA_FIELD');
+      throwCaptureError('EXTRA_FIELD', validationToken);
     }
   }
   for (const field of CAPTURE_REQUIRED_FIELDS) {
     if (!Object.hasOwn(record, field)) {
-      throwCaptureError(CAPTURE_MISSING_FIELD_REASONS[field]);
+      throwCaptureError(CAPTURE_MISSING_FIELD_REASONS[field], validationToken);
     }
   }
   const tool = record.tool;
   const callId = record.callId;
   const content = record.content;
   if (typeof tool !== 'string' || !isEvidenceToolId(tool)) {
-    throwCaptureError('TOOL');
+    throwCaptureError('TOOL', validationToken);
   }
   if (typeof callId !== 'string') {
-    throwCaptureError('CALL_ID');
+    throwCaptureError('CALL_ID', validationToken);
   }
   if (typeof content !== 'string') {
-    throwCaptureError('CONTENT');
+    throwCaptureError('CONTENT', validationToken);
   }
 
   let file: string | undefined;
   if (Object.hasOwn(record, 'file')) {
     const candidateFile = record.file;
     if (typeof candidateFile !== 'string' || candidateFile.length === 0) {
-      throwCaptureError('FILE');
+      throwCaptureError('FILE', validationToken);
     }
     file = candidateFile;
   }
   const hasRange = Object.hasOwn(record, 'range');
   const candidateRange = hasRange ? record.range : undefined;
-  const range = hasRange ? validateCaptureRange(candidateRange) : undefined;
+  const range = hasRange ? validateCaptureRange(candidateRange, validationToken) : undefined;
   return Object.freeze({
     tool,
     callId,
@@ -198,9 +204,9 @@ function validateCaptureInputUnchecked(input: unknown): EvidenceEntryDraft {
   });
 }
 
-function validateCaptureRange(value: unknown): EvidenceRange {
+function validateCaptureRange(value: unknown, validationToken: object): EvidenceRange {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throwCaptureError('RANGE');
+    throwCaptureError('RANGE', validationToken);
   }
   const record = value as Record<string, unknown>;
   const keys = Reflect.ownKeys(record);
@@ -216,7 +222,7 @@ function validateCaptureRange(value: unknown): EvidenceRange {
     (start as number) < 1 ||
     (end as number) < (start as number)
   ) {
-    throwCaptureError('RANGE');
+    throwCaptureError('RANGE', validationToken);
   }
   return Object.freeze({
     start: start as number,
@@ -319,6 +325,16 @@ function throwCoordinateError(message: string): never {
   throw new Error(`ALEMBIC_AGENT_EVIDENCE_LEDGER_COORDINATES_INVALID: ${message}`);
 }
 
-function throwCaptureError(reason: string): never {
-  throw new Error(`${CAPTURE_ERROR_PREFIX}:${reason}`);
+function throwCaptureError(reason: string, validationToken: object): never {
+  const error = new Error(`${CAPTURE_ERROR_PREFIX}:${reason}`);
+  captureValidationErrorTokens.set(error, validationToken);
+  throw error;
+}
+
+function isCurrentCaptureValidationError(value: unknown, validationToken: object): value is Error {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    captureValidationErrorTokens.get(value) === validationToken
+  );
 }

@@ -63,6 +63,7 @@ import {
 
 const runId = 'run:agent-public-connected-probe';
 const privateCorpusRevision = 'revision:agent-public-connected-probe';
+const captureErrorPrefix = 'ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID';
 const controlRoot = fs.realpathSync(
   fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-public-connected-probe-'))
 );
@@ -701,40 +702,54 @@ function provePublicCaptureValidation(authority, coordinates) {
     ],
   ];
 
-  const cases = invalidDrafts.map(([mutation, draft]) => {
-    const fileExistedBefore = fs.existsSync(filePath);
-    const bytesBefore = fileExistedBefore ? fs.readFileSync(filePath) : null;
-    const snapshotBefore = captureLedgerSnapshotState(authority);
-    let error = null;
-    try {
-      authority.capture.capture(draft);
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    }
-    const fileExistsAfter = fs.existsSync(filePath);
-    const bytesAfter = fileExistsAfter ? fs.readFileSync(filePath) : null;
-    const snapshotAfter = captureLedgerSnapshotState(authority);
-    const fileUnchanged =
-      fileExistedBefore === fileExistsAfter &&
-      (bytesBefore === null ? bytesAfter === null : bytesBefore.equals(bytesAfter));
-    const snapshotUnchanged = JSON.stringify(snapshotBefore) === JSON.stringify(snapshotAfter);
-    if (
-      !error?.startsWith('ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID:') ||
-      !fileUnchanged ||
-      !snapshotUnchanged
-    ) {
-      throw new Error(
-        `STRICT_AGENT_PUBLIC_CAPTURE_VALIDATION_FAILED:${mutation}:${error ?? 'no-error'}`
-      );
-    }
-    return {
+  const cases = invalidDrafts.map(([mutation, draft]) =>
+    proveCaptureRejectedWithoutMutation({
+      authority,
+      filePath,
       mutation,
-      error,
-      rejected: true,
-      fileUnchanged,
-      snapshotUnchanged,
-    };
+      draft,
+      expectedErrorPrefix: `${captureErrorPrefix}:`,
+    })
+  );
+  const callerSpoofError = `${captureErrorPrefix}:CALLER_SPOOF`;
+  const expectedUnreadableError = `${captureErrorPrefix}:UNREADABLE_INPUT`;
+  const getterDraft = {
+    tool: 'code.read',
+    callId: 'call:caller-spoof:getter',
+  };
+  Object.defineProperty(getterDraft, 'content', {
+    enumerable: true,
+    get() {
+      throw new Error(callerSpoofError);
+    },
   });
+  const spoofDrafts = [
+    [
+      'proxy-own-keys-caller-prefix-spoof',
+      new Proxy(
+        {
+          tool: 'code.read',
+          callId: 'call:caller-spoof:own-keys',
+          content: 'invalid',
+        },
+        {
+          ownKeys() {
+            throw new Error(callerSpoofError);
+          },
+        }
+      ),
+    ],
+    ['property-getter-caller-prefix-spoof', getterDraft],
+  ];
+  const spoofCases = spoofDrafts.map(([mutation, draft]) =>
+    proveCaptureRejectedWithoutMutation({
+      authority,
+      filePath,
+      mutation,
+      draft,
+      expectedError: expectedUnreadableError,
+    })
+  );
 
   if (fs.existsSync(filePath)) {
     throw new Error('STRICT_AGENT_PUBLIC_CAPTURE_REJECTION_CREATED_LEDGER');
@@ -742,11 +757,70 @@ function provePublicCaptureValidation(authority, coordinates) {
   return Object.freeze({
     publicPackageEntrypoint: true,
     invalidCaseCount: cases.length,
+    spoofCaseCount: spoofCases.length,
     rejectedWithoutMutation: cases.every(
       (item) => item.rejected && item.fileUnchanged && item.snapshotUnchanged
     ),
+    spoofRejectedWithoutMutation: spoofCases.every(
+      (item) =>
+        item.rejected &&
+        item.error === expectedUnreadableError &&
+        item.fileUnchanged &&
+        item.snapshotUnchanged
+    ),
     ledgerFileAbsentAfterRejections: true,
     cases: Object.freeze(cases),
+    spoofCases: Object.freeze(spoofCases),
+  });
+}
+
+function proveCaptureRejectedWithoutMutation({
+  authority,
+  filePath,
+  mutation,
+  draft,
+  expectedError,
+  expectedErrorPrefix,
+}) {
+  const before = captureLedgerMutationState(authority, filePath);
+  let error = null;
+  try {
+    authority.capture.capture(draft);
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+  const after = captureLedgerMutationState(authority, filePath);
+  const fileUnchanged = JSON.stringify(before.file) === JSON.stringify(after.file);
+  const snapshotUnchanged = JSON.stringify(before.snapshot) === JSON.stringify(after.snapshot);
+  const expectedErrorMatched = expectedError
+    ? error === expectedError
+    : error?.startsWith(expectedErrorPrefix) === true;
+  if (!expectedErrorMatched || !fileUnchanged || !snapshotUnchanged) {
+    throw new Error(
+      `STRICT_AGENT_PUBLIC_CAPTURE_VALIDATION_FAILED:${mutation}:${error ?? 'no-error'}`
+    );
+  }
+  return Object.freeze({
+    mutation,
+    error,
+    rejected: true,
+    fileUnchanged,
+    snapshotUnchanged,
+    before,
+    after,
+  });
+}
+
+function captureLedgerMutationState(authority, filePath) {
+  const exists = fs.existsSync(filePath);
+  const bytes = exists ? fs.readFileSync(filePath) : null;
+  return Object.freeze({
+    file: Object.freeze({
+      exists,
+      byteLength: bytes?.byteLength ?? 0,
+      sha256: bytes ? createHash('sha256').update(bytes).digest('hex') : null,
+    }),
+    snapshot: Object.freeze(captureLedgerSnapshotState(authority)),
   });
 }
 

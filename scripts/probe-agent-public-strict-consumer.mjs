@@ -31,12 +31,23 @@ if (runtime.status !== 0) {
 }
 
 const runtimeReceipt = JSON.parse(runtime.stdout.trim());
+const expectedUnreadableCaptureError =
+  'ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID:UNREADABLE_INPUT';
 if (
   runtimeReceipt?.continuityVerified !== true ||
   runtimeReceipt?.connectedChain?.executor?.realExecutor !== true ||
   runtimeReceipt?.captureValidation?.publicPackageEntrypoint !== true ||
   runtimeReceipt?.captureValidation?.invalidCaseCount !== 26 ||
+  runtimeReceipt?.captureValidation?.spoofCaseCount !== 2 ||
   runtimeReceipt?.captureValidation?.rejectedWithoutMutation !== true ||
+  runtimeReceipt?.captureValidation?.spoofRejectedWithoutMutation !== true ||
+  runtimeReceipt?.captureValidation?.spoofCases?.some(
+    (item) =>
+      item.error !== expectedUnreadableCaptureError ||
+      item.fileUnchanged !== true ||
+      item.snapshotUnchanged !== true ||
+      JSON.stringify(item.before) !== JSON.stringify(item.after)
+  ) ||
   runtimeReceipt?.captureValidation?.ledgerFileAbsentAfterRejections !== true ||
   runtimeReceipt?.captureValidation?.nextValidEvidenceEntryId !== 'E-1' ||
   runtimeReceipt?.captureValidation?.unconsumedSequencePreserved !== true ||

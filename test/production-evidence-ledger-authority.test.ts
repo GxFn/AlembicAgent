@@ -61,6 +61,9 @@ describe('production Evidence Ledger authority', () => {
   });
 
   it('rejects every malformed public capture draft before file, store, or sequence mutation', () => {
+    const captureErrorPrefix = 'ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID';
+    const callerSpoofError = `${captureErrorPrefix}:CALLER_SPOOF`;
+    const expectedUnreadableError = `${captureErrorPrefix}:UNREADABLE_INPUT`;
     const coordinates = {
       dataRoot: createRoot(),
       jobId: 'job:production-ledger',
@@ -77,7 +80,21 @@ describe('production Evidence Ledger authority', () => {
       coordinates.jobId,
       `${coordinates.dimensionId}.jsonl`
     );
-    const invalidDrafts: ReadonlyArray<{ readonly name: string; readonly input: unknown }> = [
+    const getterDraft = {
+      tool: 'code.read',
+      callId: 'call:caller-spoof:getter',
+    };
+    Object.defineProperty(getterDraft, 'content', {
+      enumerable: true,
+      get() {
+        throw new Error(callerSpoofError);
+      },
+    });
+    const invalidDrafts: ReadonlyArray<{
+      readonly name: string;
+      readonly input: unknown;
+      readonly expectedError?: string;
+    }> = [
       {
         name: 'unknown tool',
         input: { tool: 'caller.fake', callId: 'call:invalid', content: 'invalid' },
@@ -252,6 +269,27 @@ describe('production Evidence Ledger authority', () => {
           content: 'invalid',
         },
       },
+      {
+        name: 'Proxy ownKeys caller-prefix spoof',
+        input: new Proxy(
+          {
+            tool: 'code.read',
+            callId: 'call:caller-spoof:own-keys',
+            content: 'invalid',
+          },
+          {
+            ownKeys() {
+              throw new Error(callerSpoofError);
+            },
+          }
+        ),
+        expectedError: expectedUnreadableError,
+      },
+      {
+        name: 'property getter caller-prefix spoof',
+        input: getterDraft,
+        expectedError: expectedUnreadableError,
+      },
     ];
 
     for (const invalid of invalidDrafts) {
@@ -260,9 +298,12 @@ describe('production Evidence Ledger authority', () => {
       const statsBefore = store.stats();
       const snapshotErrorBefore = captureError(() => authority.read.strictSnapshot());
 
-      expect(() => captureRuntime(invalid.input), invalid.name).toThrow(
-        'ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID'
-      );
+      const captureFailure = captureError(() => captureRuntime(invalid.input));
+      if (invalid.expectedError) {
+        expect(captureFailure, invalid.name).toBe(invalid.expectedError);
+      } else {
+        expect(captureFailure, invalid.name).toContain(captureErrorPrefix);
+      }
       expect(existsSync(filePath), invalid.name).toBe(fileExistedBefore);
       expect(fileExistedBefore ? readFileSync(filePath) : null, invalid.name).toEqual(bytesBefore);
       expect(store.stats(), invalid.name).toEqual(statsBefore);
