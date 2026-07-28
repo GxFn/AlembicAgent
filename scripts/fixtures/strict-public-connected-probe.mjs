@@ -5,13 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  createDurableSemanticReviewRuntime,
   createFrozenEvidenceProjection,
-  DurableSemanticReviewRuntimeError,
   IndependentValueReviewer,
   InvestigatedEmptyReviewer,
 } from '@alembic/agent/evaluation';
 import {
+  createDurableSemanticReviewRuntime,
   createProductionEvidenceLedgerAuthority,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
@@ -21,15 +20,17 @@ import {
   createStrictHypothesisExpressionSetReceiptV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
+  DurableSemanticReviewRuntimeError,
   validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
 } from '@alembic/agent/production';
 import { runStrictPlanAgent } from '@alembic/agent/runs';
 import {
-  assertSemanticDispositionReviewDurableAttestationV3,
+  assertSemanticDispositionReviewDurableAttestationV4,
   buildFactQueryCatalogSnapshot,
   canonicalizeKnowledgeClustersV1,
   canonicalizeObservationPopulationV1,
+  consumeMainSemanticDispositionReviewDurableAttestationV4,
   createAgentSemanticDispositionReviewRequestV1,
   createAnalysisReviewContextHashV1,
   createConfigFactQueryBackendV1,
@@ -154,7 +155,8 @@ async function verifyPublicSurface() {
 }
 
 async function createDurableReviewProbe(real, semantic, producer) {
-  const executionReceipt = real.executionReceipt;
+  const executionReceipts = real.executionReceipts;
+  const executionReceipt = executionReceipts[0];
   const fileExecution = executionReceipt.fileExecutions[0];
   const witnessBinding = real.witness.bindings[0];
   const induction = semantic.epoch.inductions[0];
@@ -167,6 +169,7 @@ async function createDurableReviewProbe(real, semantic, producer) {
     real,
     semantic,
     producer,
+    executionReceipts,
     executionReceipt,
     fileExecution,
     witnessBinding,
@@ -203,6 +206,7 @@ function createDurableSemanticReviewRequest({
   real,
   semantic,
   producer,
+  executionReceipts,
   executionReceipt,
   fileExecution,
   witnessBinding,
@@ -228,7 +232,7 @@ function createDurableSemanticReviewRequest({
     populationHash: semantic.epoch.population.populationHash,
     proposedDispositionHash,
     finalExpandedSchedule: semantic.finalSchedule,
-    executionReceipts: [executionReceipt],
+    executionReceipts,
     evidence: [
       {
         evidenceEntryId: witnessBinding.evidenceEntryId,
@@ -306,9 +310,11 @@ async function executeDurableReviewRuntimeProbe({
   witnessBinding,
   reviewerModelLoadReceipt,
 }) {
-  let providerCallCount = 0;
-  let witnessLoadCount = 0;
-  let compiledPrompt = null;
+  const calls = {
+    provider: 0,
+    witnessLoad: 0,
+    compiledPrompt: null,
+  };
   const { privateKey } = generateKeyPairSync('ed25519');
   const runtime = await createDurableSemanticReviewRuntime({
     signingKey: {
@@ -321,8 +327,8 @@ async function executeDurableReviewRuntimeProbe({
         name: reviewerModelLoadReceipt.providerId,
         model: reviewerModelLoadReceipt.modelId,
         chatWithTools: async (prompt) => {
-          providerCallCount += 1;
-          compiledPrompt = prompt;
+          calls.provider += 1;
+          calls.compiledPrompt = prompt;
           return {
             text: createPassingDurableReviewDecision(prompt, witnessBinding.evidenceEntryId),
             functionCalls: null,
@@ -335,40 +341,19 @@ async function executeDurableReviewRuntimeProbe({
     },
     evidence: {
       ledger: real.ledgerAuthority.read,
-      witnessAuthority: {
-        resolve: async (lookup) => {
-          witnessLoadCount += 1;
-          const witnessBinding =
-            real.witness.bindings.find(
-              (binding) =>
-                binding.bindingHash === lookup.witnessBindingHash &&
-                binding.evidenceEntryId === lookup.evidenceEntryId
-            ) ?? null;
-          const fileExecution = real.executionReceipt.fileExecutions.find(
-            (execution) => execution.executionHash === lookup.fileExecutionHash
-          );
-          if (
-            !witnessBinding ||
-            !fileExecution ||
-            real.executionReceipt.receiptHash !== lookup.executionReceiptHash
-          ) {
-            return null;
-          }
-          return {
-            evidenceLedgerSnapshot: real.witness.evidenceLedgerSnapshot,
-            witnessBinding,
-            executionReceipt: real.executionReceipt,
-            fileExecutionHash: fileExecution.executionHash,
-          };
-        },
-      },
+      witnessAuthority: createPublicProbeWitnessAuthority(real, calls),
     },
     timeoutMs: 1_000,
   });
   const attestation = await runtime.execute({ semanticRequest });
   const serializedAttestation = JSON.parse(JSON.stringify(attestation));
-  assertSemanticDispositionReviewDurableAttestationV3({
+  assertSemanticDispositionReviewDurableAttestationV4({
     attestation: serializedAttestation,
+    expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+  });
+  consumeMainSemanticDispositionReviewDurableAttestationV4({
+    attestation: serializedAttestation,
+    expectedSemanticRequest: JSON.parse(JSON.stringify(semanticRequest)),
     expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
   });
   const freshProcess = verifyFreshProcessLedgerReopen({
@@ -377,22 +362,32 @@ async function executeDurableReviewRuntimeProbe({
     expectedSnapshotHash: real.witness.evidenceLedgerSnapshot.snapshotHash,
     expectedEvidenceEntryIds: real.witness.bindings.map((binding) => binding.evidenceEntryId),
     attestation: serializedAttestation,
+    expectedSemanticRequest: JSON.parse(JSON.stringify(semanticRequest)),
     expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
   });
   if (
-    providerCallCount !== 1 ||
-    witnessLoadCount !== 1 ||
-    compiledPrompt !== attestation.execution.request.compiledPrompt ||
+    calls.provider !== 1 ||
+    calls.witnessLoad !== 1 ||
+    calls.compiledPrompt !== attestation.execution.request.compiledPrompt ||
     freshProcess.reopened !== true
   ) {
     throw new Error('STRICT_AGENT_PUBLIC_DURABLE_REVIEW_RUNTIME_MISMATCH');
   }
   return {
     serviceEntrypoint: true,
-    providerCallCount,
-    witnessLoadCount,
+    providerCallCount: calls.provider,
+    witnessLoadCount: calls.witnessLoad,
     exactCompiledPrompt: true,
     serializedAttestationVerified: true,
+    attestationSchemaVersion: attestation.schemaVersion,
+    executionReceiptBindingCount:
+      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings.length ?? 0,
+    sharedHarvestKey:
+      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.harvestKey ?? null,
+    sharedHarvestReceiptHash:
+      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.harvestReceiptHash ?? null,
+    sharedFileExecutionHash:
+      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.fileExecutionHash ?? null,
     publicConsumerFreshProcess: true,
     freshProcessReopenVerified: true,
     evidenceStoreId: real.ledgerAuthority.identity.storeId,
@@ -405,6 +400,59 @@ async function executeDurableReviewRuntimeProbe({
   };
 }
 
+function createPublicProbeWitnessAuthority(real, calls) {
+  return {
+    resolve: async (lookup) => {
+      calls.witnessLoad += 1;
+      const witnessBinding =
+        real.witness.bindings.find(
+          (binding) =>
+            binding.bindingHash === lookup.witnessBindingHash &&
+            binding.evidenceEntryId === lookup.evidenceEntryId
+        ) ?? null;
+      const exactBindingSet =
+        lookup.expectedExecutionReceiptBindings.length === real.executionReceipts.length &&
+        lookup.expectedExecutionReceiptBindings.every(
+          (binding, index) =>
+            JSON.stringify(binding) ===
+            JSON.stringify(createExpectedPublicProbeBinding(real.executionReceipts[index]))
+        );
+      const fileExecution = real.executionReceipt.fileExecutions.find(
+        (execution) => execution.executionHash === lookup.fileExecutionHash
+      );
+      if (!witnessBinding || !fileExecution || !exactBindingSet) {
+        return null;
+      }
+      return {
+        evidenceLedgerSnapshot: real.witness.evidenceLedgerSnapshot,
+        witnessBinding,
+      };
+    },
+  };
+}
+
+function createExpectedPublicProbeBinding(receipt) {
+  const fileExecution = receipt?.fileExecutions[0];
+  if (!receipt || !fileExecution) {
+    return null;
+  }
+  const semantic = {
+    schemaVersion: 3,
+    obligationId: receipt.obligationId,
+    analysisScale: receipt.analysisScale,
+    executionReceiptHash: receipt.receiptHash,
+    harvestKey: receipt.harvestKey,
+    harvestReceiptHash: receipt.harvestReceiptHash,
+    sourceRevisionVectorHash: receipt.sourceRevisionVectorHash,
+    canonicalSubjectRef: receipt.canonicalSubjectRef,
+    fileExecutionHash: fileExecution.executionHash,
+  };
+  return {
+    ...semantic,
+    bindingHash: hashCanonicalJson(semantic),
+  };
+}
+
 function verifyFreshProcessLedgerReopen(input) {
   const payloadPath = path.join(input.coordinates.dataRoot, 'fresh-ledger-reopen-proof.json');
   fs.writeFileSync(
@@ -414,6 +462,7 @@ function verifyFreshProcessLedgerReopen(input) {
       expectedSnapshotHash: input.expectedSnapshotHash,
       expectedEvidenceEntryIds: input.expectedEvidenceEntryIds,
       attestation: input.attestation,
+      expectedSemanticRequest: input.expectedSemanticRequest,
       expectedTrustPolicy: input.expectedTrustPolicy,
     }),
     'utf8'
@@ -426,7 +475,7 @@ function verifyFreshProcessLedgerReopen(input) {
       [
         "import fs from 'node:fs';",
         "import { createProductionEvidenceLedgerAuthority } from '@alembic/agent/production';",
-        "import { assertSemanticDispositionReviewDurableAttestationV3 } from '@alembic/core/production';",
+        "import { assertSemanticDispositionReviewDurableAttestationV4, consumeMainSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
         "const payload = JSON.parse(fs.readFileSync(process.env.ALEMBIC_LEDGER_REOPEN_PAYLOAD, 'utf8'));",
         'const coordinates = JSON.parse(process.env.ALEMBIC_LEDGER_REOPEN_COORDINATES);',
         'const authority = createProductionEvidenceLedgerAuthority(coordinates);',
@@ -434,7 +483,9 @@ function verifyFreshProcessLedgerReopen(input) {
         "if (JSON.stringify(authority.identity) !== JSON.stringify(payload.expectedIdentity)) throw new Error('FRESH_LEDGER_IDENTITY_MISMATCH');",
         "if (snapshot.snapshotHash !== payload.expectedSnapshotHash) throw new Error('FRESH_LEDGER_SNAPSHOT_MISMATCH');",
         "if (payload.expectedEvidenceEntryIds.some((id) => !authority.read.get(id))) throw new Error('FRESH_LEDGER_EVIDENCE_MISSING');",
-        'assertSemanticDispositionReviewDurableAttestationV3({ attestation: payload.attestation, expectedTrustPolicy: payload.expectedTrustPolicy });',
+        'const verification = { attestation: payload.attestation, expectedSemanticRequest: payload.expectedSemanticRequest, expectedTrustPolicy: payload.expectedTrustPolicy };',
+        'assertSemanticDispositionReviewDurableAttestationV4(verification);',
+        'consumeMainSemanticDispositionReviewDurableAttestationV4(verification);',
         'process.stdout.write(JSON.stringify({ reopened: true, storeId: authority.identity.storeId, snapshotHash: snapshot.snapshotHash }));',
       ].join('\n'),
     ],
@@ -461,7 +512,7 @@ function createPassingDurableReviewDecision(compiledPrompt, evidenceEntryId) {
   });
   const semanticRequest = parsed.payload.semanticRequest;
   return JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     requestHash,
     compiledPromptHash,
     semanticRequestHash: semanticRequest.requestHash,
@@ -501,7 +552,7 @@ async function createRealExecutorFixture(root) {
   const planningFacts = createPlanningFacts(artifact);
   const family = createConfigFactQueryFamilyV1({
     familyId: 'config-declaration',
-    supportedScales: ['file'],
+    supportedScales: ['file', 'repository'],
     parser: 'nx-project-json',
   });
   const catalog = buildFactQueryCatalogSnapshot([family]);
@@ -536,11 +587,25 @@ async function createRealExecutorFixture(root) {
     witnessAuthority: witness.authority,
     registry,
   });
-  const executionReceipt = factExecution.receipts[0];
+  const executionReceipts = [...factExecution.receipts].sort((left, right) =>
+    left.obligationId.localeCompare(right.obligationId)
+  );
+  const executionReceipt = executionReceipts[0];
+  const sharedFileExecutionHashes = new Set(
+    executionReceipts.flatMap((receipt) =>
+      receipt.fileExecutions.map((execution) => execution.executionHash)
+    )
+  );
   if (
     factExecution.manifest.verdict !== 'passed' ||
     factExecution.facts.length === 0 ||
     !executionReceipt ||
+    executionReceipts.length !== 2 ||
+    new Set(executionReceipts.map((receipt) => receipt.receiptHash)).size !== 2 ||
+    new Set(executionReceipts.map((receipt) => receipt.obligationId)).size !== 2 ||
+    new Set(executionReceipts.map((receipt) => receipt.harvestKey)).size !== 1 ||
+    new Set(executionReceipts.map((receipt) => receipt.harvestReceiptHash)).size !== 1 ||
+    sharedFileExecutionHashes.size !== 1 ||
     executionReceipt.disposition !== 'matched' ||
     executionReceipt.expectedFileCount !== 1 ||
     executionReceipt.inspectedFileCount !== 1
@@ -559,6 +624,7 @@ async function createRealExecutorFixture(root) {
     registry,
     schedule,
     factExecution,
+    executionReceipts,
     executionReceipt,
   };
 }
@@ -571,7 +637,56 @@ function provePublicCaptureValidation(authority, coordinates) {
     coordinates.jobId,
     `${coordinates.dimensionId}.jsonl`
   );
-  const invalidDrafts = [
+  const cases = createInvalidCaptureDrafts().map(([mutation, draft]) =>
+    proveCaptureRejectedWithoutMutation({
+      authority,
+      filePath,
+      mutation,
+      draft,
+      expectedErrorPrefix: `${captureErrorPrefix}:`,
+    })
+  );
+  const expectedUnreadableError = `${captureErrorPrefix}:UNREADABLE_INPUT`;
+  const spoofCases = createCaptureSpoofDrafts(`${captureErrorPrefix}:CALLER_SPOOF`).map(
+    ([mutation, draft]) =>
+      proveCaptureRejectedWithoutMutation({
+        authority,
+        filePath,
+        mutation,
+        draft,
+        expectedError: expectedUnreadableError,
+      })
+  );
+
+  if (fs.existsSync(filePath)) {
+    throw new Error('STRICT_AGENT_PUBLIC_CAPTURE_REJECTION_CREATED_LEDGER');
+  }
+  return Object.freeze({
+    publicPackageEntrypoint: true,
+    invalidCaseCount: cases.length,
+    spoofCaseCount: spoofCases.length,
+    rejectedWithoutMutation: cases.every(
+      (item) => item.rejected && item.fileUnchanged && item.snapshotUnchanged
+    ),
+    spoofRejectedWithoutMutation: spoofCases.every(
+      (item) =>
+        item.rejected &&
+        item.error === expectedUnreadableError &&
+        item.fileUnchanged &&
+        item.snapshotUnchanged
+    ),
+    ledgerFileAbsentAfterRejections: true,
+    cases: Object.freeze(cases),
+    spoofCases: Object.freeze(spoofCases),
+  });
+}
+
+function createInvalidCaptureDrafts() {
+  return [...createInvalidCaptureShapeDrafts(), ...createInvalidCaptureRangeDrafts()];
+}
+
+function createInvalidCaptureShapeDrafts() {
+  return [
     ['unknown-tool', { tool: 'caller.fake', callId: 'call:invalid', content: 'invalid' }],
     ['null-draft', null],
     ['array-draft', []],
@@ -597,6 +712,11 @@ function provePublicCaptureValidation(authority, coordinates) {
       { tool: 'code.read', callId: 'call:invalid', file: undefined, content: 'invalid' },
     ],
     ['null-range', { tool: 'code.read', callId: 'call:invalid', range: null, content: 'invalid' }],
+  ];
+}
+
+function createInvalidCaptureRangeDrafts() {
+  return [
     [
       'present-undefined-range',
       {
@@ -701,18 +821,9 @@ function provePublicCaptureValidation(authority, coordinates) {
       },
     ],
   ];
+}
 
-  const cases = invalidDrafts.map(([mutation, draft]) =>
-    proveCaptureRejectedWithoutMutation({
-      authority,
-      filePath,
-      mutation,
-      draft,
-      expectedErrorPrefix: `${captureErrorPrefix}:`,
-    })
-  );
-  const callerSpoofError = `${captureErrorPrefix}:CALLER_SPOOF`;
-  const expectedUnreadableError = `${captureErrorPrefix}:UNREADABLE_INPUT`;
+function createCaptureSpoofDrafts(callerSpoofError) {
   const getterDraft = {
     tool: 'code.read',
     callId: 'call:caller-spoof:getter',
@@ -723,7 +834,7 @@ function provePublicCaptureValidation(authority, coordinates) {
       throw new Error(callerSpoofError);
     },
   });
-  const spoofDrafts = [
+  return [
     [
       'proxy-own-keys-caller-prefix-spoof',
       new Proxy(
@@ -741,37 +852,6 @@ function provePublicCaptureValidation(authority, coordinates) {
     ],
     ['property-getter-caller-prefix-spoof', getterDraft],
   ];
-  const spoofCases = spoofDrafts.map(([mutation, draft]) =>
-    proveCaptureRejectedWithoutMutation({
-      authority,
-      filePath,
-      mutation,
-      draft,
-      expectedError: expectedUnreadableError,
-    })
-  );
-
-  if (fs.existsSync(filePath)) {
-    throw new Error('STRICT_AGENT_PUBLIC_CAPTURE_REJECTION_CREATED_LEDGER');
-  }
-  return Object.freeze({
-    publicPackageEntrypoint: true,
-    invalidCaseCount: cases.length,
-    spoofCaseCount: spoofCases.length,
-    rejectedWithoutMutation: cases.every(
-      (item) => item.rejected && item.fileUnchanged && item.snapshotUnchanged
-    ),
-    spoofRejectedWithoutMutation: spoofCases.every(
-      (item) =>
-        item.rejected &&
-        item.error === expectedUnreadableError &&
-        item.fileUnchanged &&
-        item.snapshotUnchanged
-    ),
-    ledgerFileAbsentAfterRejections: true,
-    cases: Object.freeze(cases),
-    spoofCases: Object.freeze(spoofCases),
-  });
 }
 
 function proveCaptureRejectedWithoutMutation({
@@ -860,7 +940,7 @@ function createAgentSemanticFixture(real) {
 }
 
 function createPopulationPreview(real) {
-  const { artifact, factExecution, executionReceipt } = real;
+  const { artifact, factExecution, executionReceipt, executionReceipts } = real;
   const observationId = 'observation:agent-public-config';
   const populationInput = {
     populationId: 'population:agent-public-connected-probe',
@@ -870,21 +950,21 @@ function createPopulationPreview(real) {
     denominator: {
       kind: 'frozen-complete-subjects',
       expectedObservationIds: [observationId],
-      expectedObligationIds: [executionReceipt.obligationId],
-      executionReceiptHashes: [executionReceipt.receiptHash],
-      outputHashes: [executionReceipt.outputHash],
-      denominatorHashes: [executionReceipt.denominatorHash],
+      expectedObligationIds: executionReceipts.map((receipt) => receipt.obligationId),
+      executionReceiptHashes: executionReceipts.map((receipt) => receipt.receiptHash),
+      outputHashes: executionReceipts.map((receipt) => receipt.outputHash),
+      denominatorHashes: [...new Set(executionReceipts.map((receipt) => receipt.denominatorHash))],
       complete: true,
       truncated: false,
       continuation: null,
       omittedObservationIds: [],
     },
-    executionReceipts: [executionReceipt],
+    executionReceipts,
     observations: [
       {
         observationId,
         factIds: factExecution.facts.map((fact) => fact.factId),
-        obligationIds: [executionReceipt.obligationId],
+        obligationIds: executionReceipts.map((receipt) => receipt.obligationId),
         canonicalSubjectRefs: [executionReceipt.canonicalSubjectRef],
         parentSubjectRefs: ['repo:core'],
         variantKeys: ['nx-project-json'],
@@ -925,11 +1005,11 @@ function createPopulationPreview(real) {
 }
 
 function createAnalysisReviewFixture(real, population) {
-  const { family, executionReceipt, schedule, catalog, registry } = real;
+  const { family, executionReceipt, executionReceipts, schedule, catalog, registry } = real;
   const { previewPopulation, previewClusterSet } = population;
   const expansionPort = createStrictAnalysisExpansionPortV1({
     baselineScheduleHash: schedule.baselineScheduleHash,
-    baselineObligationIds: [executionReceipt.obligationId],
+    baselineObligationIds: executionReceipts.map((receipt) => receipt.obligationId),
     knownFactFamilies: [
       {
         id: family.id,
@@ -938,16 +1018,14 @@ function createAnalysisReviewFixture(real, population) {
       },
     ],
     knownSubjectRefs: [executionReceipt.canonicalSubjectRef],
-    obligationCap: 1,
+    obligationCap: executionReceipts.length,
   });
   const finalSchedule = expansionPort.seal();
-  const terminalObligations = [
-    {
-      obligationId: executionReceipt.obligationId,
-      disposition: executionReceipt.disposition,
-      terminalReceiptId: executionReceipt.terminalReceiptId,
-    },
-  ];
+  const terminalObligations = executionReceipts.map((receipt) => ({
+    obligationId: receipt.obligationId,
+    disposition: receipt.disposition,
+    terminalReceiptId: receipt.terminalReceiptId,
+  }));
   const analysisReviewContextHash = createAnalysisReviewContextHashV1({
     finalExpandedScheduleHash: finalSchedule.finalExpandedScheduleHash,
     terminalObligations,
@@ -982,7 +1060,7 @@ function createAnalysisReviewFixture(real, population) {
     currentAnalysisFixpointHash: analysisReviewContextHash,
     populationHash: previewPopulation.populationHash,
     proposedDispositionHash: proposalHash,
-    executionReceipts: [executionReceipt],
+    executionReceipts,
     finalExpandedSchedule: finalSchedule,
     terminalObligations,
     producer: actors.producer,
@@ -1216,7 +1294,7 @@ function createOrphanReviewFixture(real, semantic) {
     currentAnalysisFixpointHash: analysisReviewContextHash,
     populationHash: epoch.population.populationHash,
     proposedDispositionHash: proposalHash,
-    executionReceipts: [real.executionReceipt],
+    executionReceipts: real.executionReceipts,
     finalExpandedSchedule: finalSchedule,
     terminalObligations,
     producer: actors.producer,
@@ -1243,7 +1321,7 @@ function createReboundReviewFixture(real, semantic) {
     currentAnalysisFixpointHash: reboundContextHash,
     populationHash: semantic.epoch.population.populationHash,
     proposedDispositionHash: semantic.proposalHash,
-    executionReceipts: [real.executionReceipt],
+    executionReceipts: real.executionReceipts,
     finalExpandedSchedule: semantic.finalSchedule,
     terminalObligations: semantic.terminalObligations,
     producer: actors.producer,
@@ -1565,18 +1643,31 @@ function assertExecutorPopulationBindings(real, semantic) {
     .sort();
   const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);
   if (
-    !equal(semantic.epoch.population.denominator.executionReceiptHashes, [
-      real.executionReceipt.receiptHash,
-    ]) ||
-    !equal(semantic.epoch.population.denominator.outputHashes, [
-      real.executionReceipt.outputHash,
-    ]) ||
+    !equal(
+      semantic.epoch.population.denominator.executionReceiptHashes,
+      real.executionReceipts.map((receipt) => receipt.receiptHash).sort()
+    ) ||
+    !equal(
+      semantic.epoch.population.denominator.outputHashes,
+      real.executionReceipts.map((receipt) => receipt.outputHash).sort()
+    ) ||
     !equal(semantic.epoch.population.denominator.denominatorHashes, [
       real.executionReceipt.denominatorHash,
     ]) ||
     !equal(observedFactIds, expectedFactIds)
   ) {
-    throw new Error('STRICT_AGENT_PUBLIC_EXECUTOR_POPULATION_BINDING_MISMATCH');
+    throw new Error(
+      `STRICT_AGENT_PUBLIC_EXECUTOR_POPULATION_BINDING_MISMATCH:${JSON.stringify({
+        actualReceipts: semantic.epoch.population.denominator.executionReceiptHashes,
+        expectedReceipts: real.executionReceipts.map((receipt) => receipt.receiptHash).sort(),
+        actualOutputs: semantic.epoch.population.denominator.outputHashes,
+        expectedOutputs: real.executionReceipts.map((receipt) => receipt.outputHash).sort(),
+        actualDenominators: semantic.epoch.population.denominator.denominatorHashes,
+        expectedDenominators: [real.executionReceipt.denominatorHash],
+        observedFactIds,
+        expectedFactIds,
+      })}`
+    );
   }
 }
 
@@ -1759,20 +1850,20 @@ function createActors(real, proposalHash, decision) {
 }
 
 function createSchedule(family, canonicalSubjectRef) {
-  const obligationSemantic = {
-    factFamilyId: family.id,
-    capabilityId: family.capabilityId,
-    canonicalSubjectRef,
-    analysisScale: 'file',
-    denominator: 'complete-frozen-subject',
-  };
-  const factHarvestObligations = [
-    {
+  const factHarvestObligations = ['file', 'repository'].map((analysisScale) => {
+    const obligationSemantic = {
+      factFamilyId: family.id,
+      capabilityId: family.capabilityId,
+      canonicalSubjectRef,
+      analysisScale,
+      denominator: 'complete-frozen-subject',
+    };
+    return {
       obligationId: `fact:${hashCanonicalJson(obligationSemantic).slice(7, 31)}`,
       ...obligationSemantic,
       source: 'required-universe',
-    },
-  ];
+    };
+  });
   const factHarvestScheduleHash = hashCanonicalJson(factHarvestObligations);
   const lensBindings = [];
   const lensBindingsHash = hashCanonicalJson(lensBindings);

@@ -9,8 +9,9 @@ import {
 } from '@alembic/core/host-agent-workflows';
 import type { EvidenceEntry } from '@alembic/core/knowledge';
 import {
-  assertSemanticDispositionReviewDurableAttestationV3,
+  assertSemanticDispositionReviewDurableAttestationV4,
   canonicalizeObservationPopulationV1,
+  consumeMainSemanticDispositionReviewDurableAttestationV4,
   createAgentSemanticDispositionReviewRequestV1,
   createAnalysisFixpointReceiptV1,
   createFinalExpandedMiningScheduleReceiptV1,
@@ -21,12 +22,13 @@ import {
 } from '@alembic/core/production';
 import { createProjectContextFileRef } from '@alembic/core/project-context-foundation';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
 import {
   createDurableSemanticReviewRuntime,
+  type DurableSemanticReviewExecuteInputV1,
   type SemanticReviewWitnessAuthorityBundleV1,
   type SemanticReviewWitnessAuthorityLookupV1,
-} from '../src/agent/evaluation/DurableSemanticReviewRuntime.js';
-import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
+} from '../src/evaluation.js';
 import {
   createProductionEvidenceLedgerAuthority,
   type ProductionEvidenceLedgerAuthorityV1,
@@ -62,7 +64,7 @@ afterEach(() => {
 });
 
 describe('DurableSemanticReviewRuntime', () => {
-  it('loads the authoritative Agent ledger, invokes the provider with Core prompt, and emits a fresh-process durable attestation', async () => {
+  it('loads the authoritative Agent ledger, invokes the provider with Core prompt, and emits a fresh-process V4 durable attestation', async () => {
     const fixture = createFixture();
     fixture.ledgerAuthority.capture.capture({
       tool: 'code.read',
@@ -118,9 +120,9 @@ describe('DurableSemanticReviewRuntime', () => {
         '--eval',
         [
           "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV3 } from '@alembic/core/production';",
+          "import { assertSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
           "const input = JSON.parse(readFileSync(process.env.ALEMBIC_DURABLE_REVIEW_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV3(input);',
+          'assertSemanticDispositionReviewDurableAttestationV4(input);',
           "process.stdout.write('fresh-process-verified');",
         ].join('\n'),
       ],
@@ -148,12 +150,16 @@ describe('DurableSemanticReviewRuntime', () => {
       evidenceSessionId: fixture.evidenceEntry.sessionId,
       evidenceLedgerSnapshotHash: fixture.evidenceLedgerSnapshot.snapshotHash,
       witnessBindingHash: fixture.witnessBinding.bindingHash,
-      executionReceiptHash: fixture.executionReceipt.receiptHash,
-      fileExecutionHash: fixture.executionReceipt.fileExecutions[0]?.executionHash,
       blobHash: REVIEW_BLOB_HASH,
     });
+    expect(attestation.evidenceLoadReceipts[0]?.executionReceiptBindings).toEqual([
+      expect.objectContaining({
+        executionReceiptHash: fixture.executionReceipt.receiptHash,
+        fileExecutionHash: fixture.executionReceipt.fileExecutions[0]?.executionHash,
+      }),
+    ]);
     expect(() =>
-      assertSemanticDispositionReviewDurableAttestationV3({
+      assertSemanticDispositionReviewDurableAttestationV4({
         attestation: rehydrated,
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
       })
@@ -163,6 +169,312 @@ describe('DurableSemanticReviewRuntime', () => {
       fallbackUsed: false,
       aiErrorCount: 0,
     });
+  });
+
+  it('loads one production evidence authority for the exact Core V4 shared-harvest binding set', async () => {
+    const fixture = createFixture({
+      sharedHarvestAnalysisScales: ['file', 'repository'],
+    });
+    const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
+    const runtime = await createRuntime(fixture, { invoke, resolve });
+
+    const attestation = await runtime.execute({ semanticRequest: fixture.semanticRequest });
+    const expectedReceiptHashes = fixture.executionReceipts
+      .map((receipt) => receipt.receiptHash)
+      .sort();
+    const loadReceipt = requireAt(
+      attestation.evidenceLoadReceipts,
+      0,
+      'shared-harvest evidence load receipt'
+    ) as (typeof attestation.evidenceLoadReceipts)[number] & {
+      readonly executionReceiptBindings: readonly {
+        readonly executionReceiptHash: string;
+      }[];
+    };
+    const lookup = requireAt(resolve.mock.calls, 0, 'shared-harvest witness lookup')[0] as
+      | (SemanticReviewWitnessAuthorityLookupV1 & {
+          readonly expectedExecutionReceiptBindings: readonly {
+            readonly executionReceiptHash: string;
+          }[];
+        })
+      | undefined;
+    if (!lookup) {
+      throw new Error('TEST_FIXTURE_MISSING:shared-harvest witness lookup');
+    }
+
+    expect(new Set(fixture.executionReceipts.map((receipt) => receipt.obligationId)).size).toBe(2);
+    expect(new Set(fixture.executionReceipts.map((receipt) => receipt.receiptHash)).size).toBe(2);
+    expect(new Set(fixture.executionReceipts.map((receipt) => receipt.harvestKey)).size).toBe(1);
+    expect(
+      new Set(fixture.executionReceipts.map((receipt) => receipt.harvestReceiptHash)).size
+    ).toBe(1);
+    expect(
+      new Set(
+        fixture.executionReceipts.flatMap((receipt) =>
+          receipt.fileExecutions.map((execution) => execution.executionHash)
+        )
+      ).size
+    ).toBe(1);
+    expect(attestation.schemaVersion).toBe(4);
+    expect(attestation.evidenceLoadReceipts).toHaveLength(1);
+    expect(
+      loadReceipt.executionReceiptBindings.map((binding) => binding.executionReceiptHash).sort()
+    ).toEqual(expectedReceiptHashes);
+    expect(
+      lookup.expectedExecutionReceiptBindings.map((binding) => binding.executionReceiptHash).sort()
+    ).toEqual(expectedReceiptHashes);
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledOnce();
+
+    const verificationRoot = mkdtempSync(
+      path.join(tmpdir(), 'alembic-agent-shared-harvest-v4-verification-')
+    );
+    temporaryRoots.add(verificationRoot);
+    const verificationInputPath = path.join(verificationRoot, 'attestation.json');
+    writeFileSync(
+      verificationInputPath,
+      JSON.stringify({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    );
+    const verifierOutput = execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        [
+          "import { readFileSync } from 'node:fs';",
+          "import { assertSemanticDispositionReviewDurableAttestationV4, consumeMainSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
+          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_SHARED_HARVEST_V4_FIXTURE, 'utf8'));",
+          'assertSemanticDispositionReviewDurableAttestationV4(input);',
+          'consumeMainSemanticDispositionReviewDurableAttestationV4(input);',
+          "process.stdout.write('fresh-process-v4-verified');",
+        ].join('\n'),
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALEMBIC_SHARED_HARVEST_V4_FIXTURE: verificationInputPath,
+        },
+      }
+    );
+    expect(verifierOutput).toBe('fresh-process-v4-verified');
+    expect(() =>
+      assertSemanticDispositionReviewDurableAttestationV4({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    ).not.toThrow();
+    expect(() =>
+      consumeMainSemanticDispositionReviewDurableAttestationV4({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    ).not.toThrow();
+  });
+
+  it('rejects caller attempts to remove, add, duplicate, reorder, or truncate the Core binding universe', async () => {
+    const fixture = createFixture({
+      sharedHarvestAnalysisScales: ['file', 'repository'],
+    });
+    const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
+    const runtime = await createRuntime(fixture, { invoke, resolve });
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
+    const attempts: readonly {
+      readonly name: string;
+      readonly mutate: (request: MutableJson<SemanticDispositionReviewRequestV1>) => void;
+    }[] = [
+      {
+        name: 'missing',
+        mutate: (request) => {
+          request.executionReceipts.pop();
+        },
+      },
+      {
+        name: 'extra',
+        mutate: (request) => {
+          request.executionReceipts.push({ ...requireAt(request.executionReceipts, 0, 'receipt') });
+        },
+      },
+      {
+        name: 'duplicate',
+        mutate: (request) => {
+          request.executionReceipts[1] = {
+            ...requireAt(request.executionReceipts, 0, 'receipt'),
+          };
+        },
+      },
+      {
+        name: 'reordered',
+        mutate: (request) => {
+          request.executionReceipts.reverse();
+        },
+      },
+      {
+        name: 'partial',
+        mutate: (request) => {
+          requireAt(
+            requireAt(request.executionReceipts, 0, 'receipt').fileExecutions,
+            0,
+            'file execution'
+          ).status = 'partial' as never;
+        },
+      },
+      {
+        name: 'truncated',
+        mutate: (request) => {
+          requireAt(
+            requireAt(request.executionReceipts, 0, 'receipt').fileExecutions,
+            0,
+            'file execution'
+          ).truncated = true as never;
+        },
+      },
+    ];
+
+    for (const attempt of attempts) {
+      const semanticRequest = JSON.parse(
+        JSON.stringify(fixture.semanticRequest)
+      ) as MutableJson<SemanticDispositionReviewRequestV1>;
+      attempt.mutate(semanticRequest);
+      await expect(
+        runtime.execute({ semanticRequest } as DurableSemanticReviewExecuteInputV1)
+      ).rejects.toMatchObject({
+        code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_REQUEST_INVALID',
+      });
+    }
+    expect(resolve).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
+  });
+
+  it('rejects serialized V4 binding, harvest, file, witness, blob, source and ledger rebound', async () => {
+    const fixture = createFixture({
+      sharedHarvestAnalysisScales: ['file', 'repository'],
+    });
+    const runtime = await createRuntime(fixture, {});
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
+    const attestation = await runtime.execute({ semanticRequest: fixture.semanticRequest });
+    const tamperCases: readonly {
+      readonly name: string;
+      readonly mutate: (candidate: MutableJson<typeof attestation>) => void;
+    }[] = [
+      {
+        name: 'missing binding',
+        mutate: (candidate) => {
+          requireAt(
+            candidate.evidenceLoadReceipts,
+            0,
+            'load receipt'
+          ).executionReceiptBindings.pop();
+        },
+      },
+      {
+        name: 'extra duplicate binding',
+        mutate: (candidate) => {
+          const bindings = requireAt(
+            candidate.evidenceLoadReceipts,
+            0,
+            'load receipt'
+          ).executionReceiptBindings;
+          bindings.push({ ...requireAt(bindings, 0, 'binding') });
+        },
+      },
+      {
+        name: 'reordered bindings',
+        mutate: (candidate) => {
+          requireAt(
+            candidate.evidenceLoadReceipts,
+            0,
+            'load receipt'
+          ).executionReceiptBindings.reverse();
+        },
+      },
+      {
+        name: 'mixed harvest',
+        mutate: (candidate) => {
+          requireAt(
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
+            1,
+            'binding'
+          ).harvestKey = shaText('rebound-harvest');
+        },
+      },
+      {
+        name: 'mixed file execution',
+        mutate: (candidate) => {
+          requireAt(
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
+            1,
+            'binding'
+          ).fileExecutionHash = shaText('rebound-file-execution');
+        },
+      },
+      {
+        name: 'mixed source revision',
+        mutate: (candidate) => {
+          requireAt(
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
+            1,
+            'binding'
+          ).sourceRevisionVectorHash = shaText('rebound-source-revision');
+        },
+      },
+      {
+        name: 'witness rebound',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').witnessBindingHash =
+            shaText('rebound-witness');
+        },
+      },
+      {
+        name: 'blob rebound',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').blobHash =
+            shaText('rebound-blob');
+        },
+      },
+      {
+        name: 'ledger snapshot rebound',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').evidenceLedgerSnapshotHash =
+            shaText('rebound-ledger-snapshot');
+        },
+      },
+      {
+        name: 'ledger entry rebound',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').evidenceEntryHash =
+            shaText('rebound-ledger-entry');
+        },
+      },
+    ];
+
+    for (const tamperCase of tamperCases) {
+      const candidate = JSON.parse(JSON.stringify(attestation)) as MutableJson<typeof attestation>;
+      tamperCase.mutate(candidate);
+      expect(() =>
+        assertSemanticDispositionReviewDurableAttestationV4({
+          attestation: candidate,
+          expectedTrustPolicy: runtime.trustPolicy,
+        })
+      ).toThrow();
+      expect(() =>
+        consumeMainSemanticDispositionReviewDurableAttestationV4({
+          attestation: candidate,
+          expectedSemanticRequest: fixture.semanticRequest,
+          expectedTrustPolicy: runtime.trustPolicy,
+        })
+      ).toThrow();
+    }
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
   });
 
   it('rejects caller injection before evidence or provider execution', async () => {
@@ -296,6 +608,7 @@ describe('DurableSemanticReviewRuntime', () => {
     },
   ])('fails closed for $name without a fallback review', async ({ setup, expected }) => {
     const fixture = createFixture();
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
     const runtime = await setup(fixture);
 
     await expect(
@@ -303,9 +616,10 @@ describe('DurableSemanticReviewRuntime', () => {
     ).rejects.toMatchObject({
       code: expected,
     });
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
   });
 
-  it('rejects wrong session, caller-built evidence, rebound receipt and partial evidence load', async () => {
+  it('rejects wrong session, caller-built evidence and partial evidence load', async () => {
     const wrongSessionFixture = createFixture({
       requestEvidenceSessionId: 'session:caller-rebound',
     });
@@ -344,18 +658,6 @@ describe('DurableSemanticReviewRuntime', () => {
       });
     }
 
-    const reboundFixture = createFixture({ reboundRequestReceipt: true });
-    const reboundInvoke = vi.fn(async (prompt: string) =>
-      passingDecisionFromCompiledPrompt(prompt)
-    );
-    const reboundRuntime = await createRuntime(reboundFixture, { invoke: reboundInvoke });
-    await expect(
-      reboundRuntime.execute({ semanticRequest: reboundFixture.semanticRequest })
-    ).rejects.toMatchObject({
-      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_AUTHORITY_INVALID',
-    });
-    expect(reboundInvoke).not.toHaveBeenCalled();
-
     const partialFixture = createFixture({ includeSecondEvidence: true });
     const partialInvoke = vi.fn(async (prompt: string) =>
       passingDecisionFromCompiledPrompt(prompt)
@@ -383,6 +685,7 @@ describe('DurableSemanticReviewRuntime', () => {
 
   it('propagates cancellation and timeout without emitting a partial attestation', async () => {
     const cancelledFixture = createFixture();
+    const cancelledSnapshot = cancelledFixture.ledgerAuthority.read.strictSnapshot();
     const cancelledController = new AbortController();
     cancelledController.abort(new Error('cancel requested'));
     const cancelledRuntime = await createRuntime(cancelledFixture, {});
@@ -393,8 +696,10 @@ describe('DurableSemanticReviewRuntime', () => {
         abortSignal: cancelledController.signal,
       })
     ).rejects.toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_CANCELLED' });
+    expect(cancelledFixture.ledgerAuthority.read.strictSnapshot()).toEqual(cancelledSnapshot);
 
     const timedFixture = createFixture();
+    const timedSnapshot = timedFixture.ledgerAuthority.read.strictSnapshot();
     const timedRuntime = await createRuntime(timedFixture, {
       timeoutMs: 5,
       invoke: () => new Promise<string>(() => undefined),
@@ -403,6 +708,7 @@ describe('DurableSemanticReviewRuntime', () => {
       timedRuntime.execute({ semanticRequest: timedFixture.semanticRequest })
     ).rejects.toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_TIMEOUT' });
     expect(timedFixture.diagnostics.toJSON().timedOutStages).toContain('durable-semantic-review');
+    expect(timedFixture.ledgerAuthority.read.strictSnapshot()).toEqual(timedSnapshot);
   });
 
   it('rejects a caller-selected reviewer load and producer self-review', async () => {
@@ -454,7 +760,7 @@ describe('DurableSemanticReviewRuntime', () => {
       semanticRequest: alternateFixture.semanticRequest,
     });
     expect(() =>
-      assertSemanticDispositionReviewDurableAttestationV3({
+      assertSemanticDispositionReviewDurableAttestationV4({
         attestation: JSON.parse(JSON.stringify(alternateAttestation)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(pinnedRuntime.trustPolicy)),
       })
@@ -463,6 +769,7 @@ describe('DurableSemanticReviewRuntime', () => {
 
   it('rejects reused reviewer invocation/output on the same trusted runtime', async () => {
     const fixture = createFixture();
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
     const runtime = await createRuntime(fixture, {
       createInvocationId: () => 'reviewer-invocation:reused',
     });
@@ -473,8 +780,43 @@ describe('DurableSemanticReviewRuntime', () => {
     ).rejects.toMatchObject({
       code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_EXECUTION_REUSED',
     });
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
+  });
+
+  it('rejects a concurrent execution of the same request without a second authority load', async () => {
+    const fixture = createFixture();
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
+    let releaseReviewer: (() => void) | undefined;
+    const invoke = vi.fn(
+      (prompt: string) =>
+        new Promise<string>((resolve) => {
+          releaseReviewer = () => resolve(passingDecisionFromCompiledPrompt(prompt));
+        })
+    );
+    const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
+    const runtime = await createRuntime(fixture, { invoke, resolve });
+
+    const activeExecution = runtime.execute({ semanticRequest: fixture.semanticRequest });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+    await expect(
+      runtime.execute({ semanticRequest: fixture.semanticRequest })
+    ).rejects.toMatchObject({
+      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_REQUEST_CONCURRENT',
+    });
+    releaseReviewer?.();
+    await activeExecution;
+
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
   });
 });
+
+type MutableJson<T> = T extends readonly (infer Item)[]
+  ? MutableJson<Item>[]
+  : T extends object
+    ? { -readonly [Key in keyof T]: MutableJson<T[Key]> }
+    : T;
 
 interface Fixture {
   readonly ledgerAuthority: ProductionEvidenceLedgerAuthorityV1;
@@ -522,7 +864,10 @@ function createFixtureSubjects(includeSecondEvidence: boolean): readonly Fixture
 
 function createFixtureEvidenceAuthority(
   ledgerAuthority: ProductionEvidenceLedgerAuthorityV1,
-  subjects: readonly FixtureSubject[]
+  subjects: readonly FixtureSubject[],
+  sharedHarvestAnalysisScales?: readonly ReturnType<
+    typeof createExecutionReceipt
+  >['analysisScale'][]
 ) {
   const evidenceEntries = subjects.map((subject, index) =>
     ledgerAuthority.capture.capture({
@@ -568,18 +913,32 @@ function createFixtureEvidenceAuthority(
       };
     }
   );
-  const executionReceipts = subjects.map((subject, index) =>
-    createExecutionReceipt({
-      name: subject.name,
-      emittedFactIds: [],
-      disposition: 'inspected-no-pattern',
-      relativePath: subject.relativePath,
-      blobHash: subject.blobHash,
-      evidenceEntryId: requireAt(evidenceEntries, index, 'evidence entry').id,
-      projectContextRefId: requireAt(projectContextRefs, index, 'ProjectContext ref').id,
-      witnessBindingHash: requireAt(witnessBindings, index, 'witness binding').bindingHash,
-    })
-  );
+  const receiptSubjects = sharedHarvestAnalysisScales
+    ? sharedHarvestAnalysisScales.map((analysisScale) => ({
+        analysisScale,
+        subject: requireAt(subjects, 0, 'shared-harvest subject'),
+        subjectIndex: 0,
+      }))
+    : subjects.map((subject, subjectIndex) => ({
+        analysisScale: 'file' as const,
+        subject,
+        subjectIndex,
+      }));
+  const executionReceipts = receiptSubjects
+    .map(({ analysisScale, subject, subjectIndex }) =>
+      createExecutionReceipt({
+        name: `${subject.name}:${analysisScale}`,
+        emittedFactIds: [],
+        disposition: 'inspected-no-pattern',
+        relativePath: subject.relativePath,
+        blobHash: subject.blobHash,
+        evidenceEntryId: requireAt(evidenceEntries, subjectIndex, 'evidence entry').id,
+        projectContextRefId: requireAt(projectContextRefs, subjectIndex, 'ProjectContext ref').id,
+        witnessBindingHash: requireAt(witnessBindings, subjectIndex, 'witness binding').bindingHash,
+        analysisScale,
+      })
+    )
+    .sort((left, right) => left.obligationId.localeCompare(right.obligationId));
   return {
     evidenceEntries,
     evidenceLedgerSnapshot,
@@ -611,7 +970,7 @@ function createInvestigatedEmptyLineage(
       expectedObligationIds: executionReceipts.map((receipt) => receipt.obligationId),
       executionReceiptHashes: executionReceipts.map((receipt) => receipt.receiptHash),
       outputHashes: executionReceipts.map((receipt) => receipt.outputHash),
-      denominatorHashes: executionReceipts.map((receipt) => receipt.denominatorHash),
+      denominatorHashes: [...new Set(executionReceipts.map((receipt) => receipt.denominatorHash))],
       complete: true,
       truncated: false,
       continuation: null,
@@ -677,7 +1036,9 @@ function createFixture(
     readonly modelLoadReceipt?: SemanticDispositionReviewerModelLoadReceiptV1;
     readonly includeSecondEvidence?: boolean;
     readonly requestEvidenceSessionId?: string;
-    readonly reboundRequestReceipt?: boolean;
+    readonly sharedHarvestAnalysisScales?: readonly ReturnType<
+      typeof createExecutionReceipt
+    >['analysisScale'][];
   } = {}
 ): Fixture {
   const ledgerAuthority = createLedgerAuthority();
@@ -687,23 +1048,8 @@ function createFixture(
     evidenceLedgerSnapshot,
     witnessBindings,
     executionReceipts: authorityExecutionReceipts,
-  } = createFixtureEvidenceAuthority(ledgerAuthority, subjects);
-  const executionReceipts = input.reboundRequestReceipt
-    ? subjects.map((subject, index) =>
-        createExecutionReceipt({
-          name: subject.name,
-          emittedFactIds: [],
-          disposition: 'inspected-no-pattern',
-          relativePath: subject.relativePath,
-          blobHash: subject.blobHash,
-          evidenceEntryId: requireAt(evidenceEntries, index, 'evidence entry').id,
-          projectContextRefId: requireAt(witnessBindings, index, 'witness binding')
-            .projectContextRefId,
-          witnessBindingHash: requireAt(witnessBindings, index, 'witness binding').bindingHash,
-          backendProducer: 'loaded:caller-rebound',
-        })
-      )
-    : authorityExecutionReceipts;
+  } = createFixtureEvidenceAuthority(ledgerAuthority, subjects, input.sharedHarvestAnalysisScales);
+  const executionReceipts = authorityExecutionReceipts;
   const evidenceEntry = requireAt(evidenceEntries, 0, 'primary evidence entry');
   const witnessBinding = requireAt(witnessBindings, 0, 'primary witness binding');
   const authorityExecutionReceipt = requireAt(
@@ -898,17 +1244,9 @@ function authorityBundleFor(
   );
   const witnessBinding =
     witnessOverride ?? requireAt(fixture.witnessBindings, index, 'authority witness binding');
-  const executionReceipt = requireAt(
-    fixture.authorityExecutionReceipts,
-    index,
-    'authority execution receipt'
-  );
-  const fileExecution = requireAt(executionReceipt.fileExecutions, 0, 'authority file execution');
   return {
     evidenceLedgerSnapshot: fixture.evidenceLedgerSnapshot,
     witnessBinding,
-    executionReceipt,
-    fileExecutionHash: fileExecution.executionHash,
   };
 }
 
@@ -917,7 +1255,7 @@ function passingDecisionFromCompiledPrompt(compiledPrompt: string): string {
     readonly payload: {
       readonly semanticRequest: SemanticDispositionReviewRequestV1;
       readonly evidenceAuthorities: readonly unknown[];
-      readonly schemaVersion: 2;
+      readonly schemaVersion: 3;
       readonly producerRoute: string;
       readonly consumerRoute: string;
     };
@@ -930,7 +1268,7 @@ function passingDecisionFromCompiledPrompt(compiledPrompt: string): string {
   });
   const semanticRequest = parsed.payload.semanticRequest;
   return JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     requestHash,
     compiledPromptHash,
     semanticRequestHash: semanticRequest.requestHash,

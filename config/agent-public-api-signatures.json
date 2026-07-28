@@ -1841,9 +1841,17 @@
       ]
     },
     "./production": {
-      "exportCount": 11,
-      "signatureHash": "5fc48cb942cd58e0fabfe8bc754f0b8ac2ff8aa745136a0a2e5b077b27271af4",
+      "exportCount": 13,
+      "signatureHash": "8901434ceb4e072ce234a7777b91a1d32bcbc1cb394b77143dc4eae9f3d800af",
       "entries": [
+        {
+          "name": "DurableSemanticReviewRuntimeError",
+          "kind": "class"
+        },
+        {
+          "name": "createDurableSemanticReviewRuntime",
+          "kind": "function"
+        },
         {
           "name": "createProductionEvidenceLedgerAuthority",
           "kind": "function"

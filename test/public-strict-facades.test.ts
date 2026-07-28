@@ -26,6 +26,8 @@ const STRICT_FACADES = {
     import: './dist/production.js',
     types: './dist/production.d.ts',
     runtime: [
+      { name: 'DurableSemanticReviewRuntimeError', kind: 'class' },
+      { name: 'createDurableSemanticReviewRuntime', kind: 'function' },
       { name: 'createProductionEvidenceLedgerAuthority', kind: 'function' },
       { name: 'createStrictAnalysisContextProjectionV1', kind: 'function' },
       { name: 'createStrictAnalysisEpochSnapshotV1', kind: 'function' },

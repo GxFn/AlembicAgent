@@ -56,6 +56,11 @@ if (
   runtimeReceipt?.durableSemanticReview?.witnessLoadCount !== 1 ||
   runtimeReceipt?.durableSemanticReview?.exactCompiledPrompt !== true ||
   runtimeReceipt?.durableSemanticReview?.serializedAttestationVerified !== true ||
+  runtimeReceipt?.durableSemanticReview?.attestationSchemaVersion !== 4 ||
+  runtimeReceipt?.durableSemanticReview?.executionReceiptBindingCount !== 2 ||
+  typeof runtimeReceipt?.durableSemanticReview?.sharedHarvestKey !== 'string' ||
+  typeof runtimeReceipt?.durableSemanticReview?.sharedHarvestReceiptHash !== 'string' ||
+  typeof runtimeReceipt?.durableSemanticReview?.sharedFileExecutionHash !== 'string' ||
   runtimeReceipt?.durableSemanticReview?.publicConsumerFreshProcess !== true ||
   runtimeReceipt?.durableSemanticReview?.freshProcessReopenVerified !== true ||
   runtimeReceipt?.connectedChain?.population?.completion !== 'complete' ||

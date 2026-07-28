@@ -1,9 +1,10 @@
 import { type KeyObject, randomUUID } from 'node:crypto';
 import {
-  createAgentSemanticDispositionReviewDurableGatewayV3,
+  createAgentSemanticDispositionReviewDurableGatewayV4,
   createStrictEvidenceLedgerSnapshotV1,
-  type SemanticDispositionReviewDurableGatewayV3,
-  type SemanticDispositionReviewEvidenceStoreLoadCallV3,
+  type SemanticDispositionReviewAgentReviewerHostAdapterV4,
+  type SemanticDispositionReviewDurableGatewayV4,
+  type SemanticDispositionReviewEvidenceStoreLoadCallV4,
   type StrictEvidenceLedgerSnapshotV1,
   type StrictFactDirectWitnessBindingV1,
 } from '@alembic/core/host-agent-workflows';
@@ -11,10 +12,10 @@ import type { EvidenceEntry } from '@alembic/core/knowledge';
 import {
   assertSemanticDispositionReviewRequestV1,
   type FactQueryExecutionReceiptV1,
-  type SemanticDispositionReviewDurableAttestationV3,
+  type SemanticDispositionReviewDurableAttestationV4,
   type SemanticDispositionReviewEvidenceV1,
+  type SemanticDispositionReviewExecutionReceiptBindingV3,
   type SemanticDispositionReviewerModelLoadReceiptV1,
-  type SemanticDispositionReviewHostCallV2,
   type SemanticDispositionReviewRequestV1,
   type SemanticDispositionReviewTrustPolicyV3,
 } from '@alembic/core/production';
@@ -81,7 +82,9 @@ export type SemanticReviewProviderV1 = Pick<AiProvider, 'name' | 'model' | 'chat
 export interface SemanticReviewWitnessAuthorityLookupV1 {
   readonly evidenceEntryId: string;
   readonly evidenceSessionId: string;
-  readonly executionReceiptHash: string;
+  readonly expectedExecutionReceiptBindings: readonly SemanticDispositionReviewExecutionReceiptBindingV3[];
+  readonly harvestKey: string;
+  readonly harvestReceiptHash: string;
   readonly fileExecutionHash: string;
   readonly witnessBindingHash: string;
   readonly projectContextRefId: string;
@@ -95,8 +98,6 @@ export interface SemanticReviewWitnessAuthorityLookupV1 {
 export interface SemanticReviewWitnessAuthorityBundleV1 {
   readonly evidenceLedgerSnapshot: StrictEvidenceLedgerSnapshotV1;
   readonly witnessBinding: StrictFactDirectWitnessBindingV1;
-  readonly executionReceipt: FactQueryExecutionReceiptV1;
-  readonly fileExecutionHash: string;
 }
 
 export interface SemanticReviewWitnessAuthorityPortV1 {
@@ -147,7 +148,7 @@ export interface DurableSemanticReviewRuntimeV1 {
   readonly trustPolicy: SemanticDispositionReviewTrustPolicyV3;
   execute(
     input: DurableSemanticReviewExecuteInputV1
-  ): Promise<SemanticDispositionReviewDurableAttestationV3>;
+  ): Promise<SemanticDispositionReviewDurableAttestationV4>;
 }
 
 /**
@@ -157,12 +158,12 @@ export interface DurableSemanticReviewRuntimeV1 {
  */
 class DurableSemanticReviewRuntimeService implements DurableSemanticReviewRuntimeV1 {
   readonly trustPolicy: SemanticDispositionReviewTrustPolicyV3;
-  readonly #gateway: SemanticDispositionReviewDurableGatewayV3;
+  readonly #gateway: SemanticDispositionReviewDurableGatewayV4;
   readonly #state: RuntimeState;
   readonly #timeoutMs: number;
 
   constructor(input: {
-    readonly gateway: SemanticDispositionReviewDurableGatewayV3;
+    readonly gateway: SemanticDispositionReviewDurableGatewayV4;
     readonly state: RuntimeState;
     readonly timeoutMs: number;
   }) {
@@ -174,7 +175,7 @@ class DurableSemanticReviewRuntimeService implements DurableSemanticReviewRuntim
 
   async execute(
     input: DurableSemanticReviewExecuteInputV1
-  ): Promise<SemanticDispositionReviewDurableAttestationV3> {
+  ): Promise<SemanticDispositionReviewDurableAttestationV4> {
     assertExecuteInput(input);
     try {
       assertSemanticDispositionReviewRequestV1(input.semanticRequest);
@@ -273,9 +274,9 @@ export async function createDurableSemanticReviewRuntime(
     evidence: input.evidence,
     ...(input.diagnostics ? { diagnostics: input.diagnostics } : {}),
   };
-  let gateway: SemanticDispositionReviewDurableGatewayV3;
+  let gateway: SemanticDispositionReviewDurableGatewayV4;
   try {
-    gateway = createAgentSemanticDispositionReviewDurableGatewayV3({
+    gateway = createAgentSemanticDispositionReviewDurableGatewayV4({
       trustRootId: input.signingKey.trustRootId,
       keyId: input.signingKey.keyId,
       privateKey,
@@ -303,7 +304,10 @@ export async function createDurableSemanticReviewRuntime(
   });
 }
 
-async function invokeReviewer(state: RuntimeState, call: SemanticDispositionReviewHostCallV2) {
+async function invokeReviewer(
+  state: RuntimeState,
+  call: Parameters<SemanticDispositionReviewAgentReviewerHostAdapterV4['invoke']>[0]
+) {
   const context = requireExecutionContext(state, call.request.semanticRequest);
   throwIfAborted(context);
   let result: ChatWithToolsResult;
@@ -352,7 +356,7 @@ async function invokeReviewer(state: RuntimeState, call: SemanticDispositionRevi
 
 async function loadEvidenceAuthority(
   state: RuntimeState,
-  call: SemanticDispositionReviewEvidenceStoreLoadCallV3
+  call: SemanticDispositionReviewEvidenceStoreLoadCallV4
 ) {
   const context = requireExecutionContext(state, call.semanticRequest);
   throwIfAborted(context);
@@ -363,9 +367,9 @@ async function loadEvidenceAuthority(
       `Production Evidence Ledger does not contain exact ${call.evidence.evidenceSessionId}/${call.evidence.evidenceEntryId}.`
     );
   }
-  const selected = selectExactExecution(call.semanticRequest, call.evidence);
-  const witnessBindingHash = selected.fileExecution.witnessBindingHash;
-  const projectContextRefId = selected.fileExecution.projectContextRefId;
+  const bindingSet = validateExpectedExecutionReceiptBindings(call);
+  const witnessBindingHash = bindingSet.fileExecution.witnessBindingHash;
+  const projectContextRefId = bindingSet.fileExecution.projectContextRefId;
   if (!witnessBindingHash || !projectContextRefId) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_EXECUTION_MISMATCH',
@@ -378,14 +382,16 @@ async function loadEvidenceAuthority(
       state.evidence.witnessAuthority.resolve({
         evidenceEntryId: evidenceEntry.id,
         evidenceSessionId: evidenceEntry.sessionId,
-        executionReceiptHash: selected.executionReceipt.receiptHash,
-        fileExecutionHash: selected.fileExecution.executionHash,
+        expectedExecutionReceiptBindings: call.expectedExecutionReceiptBindings,
+        harvestKey: bindingSet.harvestKey,
+        harvestReceiptHash: bindingSet.harvestReceiptHash,
+        fileExecutionHash: bindingSet.fileExecution.executionHash,
         witnessBindingHash,
         projectContextRefId,
-        sourceRevisionVectorHash: selected.executionReceipt.sourceRevisionVectorHash,
-        canonicalSubjectRef: selected.executionReceipt.canonicalSubjectRef,
-        relativePath: selected.fileExecution.relativePath,
-        blobHash: selected.fileExecution.blobHash,
+        sourceRevisionVectorHash: bindingSet.sourceRevisionVectorHash,
+        canonicalSubjectRef: bindingSet.canonicalSubjectRef,
+        relativePath: bindingSet.fileExecution.relativePath,
+        blobHash: bindingSet.fileExecution.blobHash,
         abortSignal: context.abortSignal,
       }),
       context.abortSignal
@@ -410,7 +416,7 @@ async function loadEvidenceAuthority(
     witnessAuthority,
     context.authoritativeLedgerEntries,
     evidenceEntry,
-    selected
+    bindingSet
   );
   const witnessBinding = witnessAuthority.witnessBinding;
   if (
@@ -419,10 +425,9 @@ async function loadEvidenceAuthority(
     witnessBinding.evidenceSessionId !== evidenceEntry.sessionId ||
     witnessBinding.evidenceLedgerSnapshotHash !== evidenceLedgerSnapshot.snapshotHash ||
     witnessBinding.projectContextRefId !== projectContextRefId ||
-    witnessBinding.sourceRevisionVectorHash !==
-      selected.executionReceipt.sourceRevisionVectorHash ||
-    witnessBinding.relativePath !== selected.fileExecution.relativePath ||
-    witnessBinding.blobHash !== selected.fileExecution.blobHash
+    witnessBinding.sourceRevisionVectorHash !== bindingSet.sourceRevisionVectorHash ||
+    witnessBinding.relativePath !== bindingSet.fileExecution.relativePath ||
+    witnessBinding.blobHash !== bindingSet.fileExecution.blobHash
   ) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_AUTHORITY_INVALID',
@@ -435,8 +440,6 @@ async function loadEvidenceAuthority(
     evidenceEntry,
     evidenceLedgerSnapshot,
     witnessBinding,
-    executionReceipt: witnessAuthority.executionReceipt,
-    fileExecutionHash: witnessAuthority.fileExecutionHash,
     semanticRole: call.evidence.semanticRole,
   };
 }
@@ -445,19 +448,13 @@ function validateWitnessAuthorityBundle(
   bundle: SemanticReviewWitnessAuthorityBundleV1,
   authoritativeLedgerEntries: ReadonlyMap<string, EvidenceEntry>,
   evidenceEntry: EvidenceEntry,
-  selected: {
-    readonly executionReceipt: FactQueryExecutionReceiptV1;
+  bindingSet: {
     readonly fileExecution: FactQueryExecutionReceiptV1['fileExecutions'][number];
+    readonly sourceRevisionVectorHash: string;
   }
 ): StrictEvidenceLedgerSnapshotV1 {
   const untrustedBundle = bundle as Partial<SemanticReviewWitnessAuthorityBundleV1>;
-  if (
-    !untrustedBundle.evidenceLedgerSnapshot ||
-    !untrustedBundle.witnessBinding ||
-    !untrustedBundle.executionReceipt ||
-    typeof untrustedBundle.executionReceipt.receiptHash !== 'string' ||
-    typeof untrustedBundle.fileExecutionHash !== 'string'
-  ) {
+  if (!untrustedBundle.evidenceLedgerSnapshot || !untrustedBundle.witnessBinding) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_AUTHORITY_INVALID',
       'Trusted witness authority returned an incomplete authority bundle.'
@@ -483,8 +480,9 @@ function validateWitnessAuthorityBundle(
       return !current || !sameEvidenceEntry(current, entry);
     }) ||
     !rebuiltSnapshot.entries.some((entry) => sameEvidenceEntry(entry, evidenceEntry)) ||
-    bundle.executionReceipt.receiptHash !== selected.executionReceipt.receiptHash ||
-    bundle.fileExecutionHash !== selected.fileExecution.executionHash
+    bundle.witnessBinding.sourceRevisionVectorHash !== bindingSet.sourceRevisionVectorHash ||
+    bundle.witnessBinding.relativePath !== bindingSet.fileExecution.relativePath ||
+    bundle.witnessBinding.blobHash !== bindingSet.fileExecution.blobHash
   ) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_AUTHORITY_INVALID',
@@ -514,36 +512,142 @@ function sameEvidenceEntry(left: EvidenceEntry, right: EvidenceEntry): boolean {
   );
 }
 
-function selectExactExecution(
-  semanticRequest: SemanticDispositionReviewRequestV1,
-  evidence: SemanticDispositionReviewEvidenceV1
-): {
-  readonly executionReceipt: FactQueryExecutionReceiptV1;
+interface ValidatedExecutionReceiptBindingSet {
+  readonly harvestKey: string;
+  readonly harvestReceiptHash: string;
+  readonly sourceRevisionVectorHash: string;
+  readonly canonicalSubjectRef: string;
   readonly fileExecution: FactQueryExecutionReceiptV1['fileExecutions'][number];
-} {
-  const matches = semanticRequest.executionReceipts.flatMap((executionReceipt) =>
-    executionReceipt.sourceRevisionVectorHash === semanticRequest.sourceRevisionVectorHash &&
-    executionReceipt.canonicalSubjectRef === evidence.canonicalSubjectRef
-      ? executionReceipt.fileExecutions
-          .filter(
-            (fileExecution) =>
-              fileExecution.evidenceEntryId === evidence.evidenceEntryId &&
-              fileExecution.relativePath === evidence.relativePath &&
-              fileExecution.blobHash === evidence.blobHash &&
-              fileExecution.status === 'complete' &&
-              fileExecution.truncated === false &&
-              fileExecution.continuation === null
-          )
-          .map((fileExecution) => ({ executionReceipt, fileExecution }))
-      : []
+}
+
+interface ResolvedExecutionReceiptBinding {
+  readonly binding: SemanticDispositionReviewExecutionReceiptBindingV3;
+  readonly fileExecution: FactQueryExecutionReceiptV1['fileExecutions'][number];
+}
+
+function validateExpectedExecutionReceiptBindings(
+  call: SemanticDispositionReviewEvidenceStoreLoadCallV4
+): ValidatedExecutionReceiptBindingSet {
+  const bindings = call.expectedExecutionReceiptBindings;
+  assertCanonicalExpectedBindingSet(bindings);
+  const receiptsByHash = new Map(
+    call.semanticRequest.executionReceipts.map((receipt) => [receipt.receiptHash, receipt] as const)
   );
-  if (matches.length !== 1) {
+  const resolved = bindings.map((binding) =>
+    resolveExpectedExecutionReceiptBinding(binding, call.evidence, receiptsByHash)
+  );
+  const reference = requireSharedHarvestAuthority(resolved);
+  return {
+    harvestKey: reference.binding.harvestKey,
+    harvestReceiptHash: reference.binding.harvestReceiptHash,
+    sourceRevisionVectorHash: reference.binding.sourceRevisionVectorHash,
+    canonicalSubjectRef: reference.binding.canonicalSubjectRef,
+    fileExecution: reference.fileExecution,
+  };
+}
+
+function assertCanonicalExpectedBindingSet(
+  bindings: readonly SemanticDispositionReviewExecutionReceiptBindingV3[]
+): void {
+  const canonicalBindingOrder = [...bindings].sort(
+    (left, right) =>
+      left.obligationId.localeCompare(right.obligationId) ||
+      left.executionReceiptHash.localeCompare(right.executionReceiptHash)
+  );
+  if (
+    bindings.length === 0 ||
+    new Set(bindings.map((binding) => binding.obligationId)).size !== bindings.length ||
+    new Set(bindings.map((binding) => binding.executionReceiptHash)).size !== bindings.length ||
+    bindings.some((binding, index) => binding !== canonicalBindingOrder[index])
+  ) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_EXECUTION_MISMATCH',
-      `Expected exactly one accepted file execution for ${evidence.evidenceEntryId}; found ${matches.length}.`
+      'Core supplied an empty, duplicate, or non-canonical expected receipt-binding set.'
     );
   }
-  return matches[0];
+}
+
+function resolveExpectedExecutionReceiptBinding(
+  binding: SemanticDispositionReviewExecutionReceiptBindingV3,
+  evidence: SemanticDispositionReviewEvidenceV1,
+  receiptsByHash: ReadonlyMap<string, FactQueryExecutionReceiptV1>
+): ResolvedExecutionReceiptBinding {
+  const executionReceipt = receiptsByHash.get(binding.executionReceiptHash);
+  const fileExecutions =
+    executionReceipt?.fileExecutions.filter((fileExecution) =>
+      fileExecutionMatchesEvidenceBinding(fileExecution, binding, evidence)
+    ) ?? [];
+  if (
+    !executionReceipt ||
+    fileExecutions.length !== 1 ||
+    !executionReceiptMatchesBinding(executionReceipt, binding, evidence)
+  ) {
+    throw runtimeError(
+      'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_EXECUTION_MISMATCH',
+      'Core expected receipt binding does not map to one complete accepted file execution.'
+    );
+  }
+  return { binding, fileExecution: fileExecutions[0] };
+}
+
+function fileExecutionMatchesEvidenceBinding(
+  fileExecution: FactQueryExecutionReceiptV1['fileExecutions'][number],
+  binding: SemanticDispositionReviewExecutionReceiptBindingV3,
+  evidence: SemanticDispositionReviewEvidenceV1
+): boolean {
+  return (
+    fileExecution.executionHash === binding.fileExecutionHash &&
+    fileExecution.evidenceEntryId === evidence.evidenceEntryId &&
+    fileExecution.relativePath === evidence.relativePath &&
+    fileExecution.blobHash === evidence.blobHash &&
+    fileExecution.status === 'complete' &&
+    fileExecution.truncated === false &&
+    fileExecution.continuation === null
+  );
+}
+
+function executionReceiptMatchesBinding(
+  executionReceipt: FactQueryExecutionReceiptV1,
+  binding: SemanticDispositionReviewExecutionReceiptBindingV3,
+  evidence: SemanticDispositionReviewEvidenceV1
+): boolean {
+  return (
+    executionReceipt.obligationId === binding.obligationId &&
+    executionReceipt.analysisScale === binding.analysisScale &&
+    executionReceipt.harvestKey === binding.harvestKey &&
+    executionReceipt.harvestReceiptHash === binding.harvestReceiptHash &&
+    executionReceipt.sourceRevisionVectorHash === binding.sourceRevisionVectorHash &&
+    executionReceipt.canonicalSubjectRef === binding.canonicalSubjectRef &&
+    binding.sourceRevisionVectorHash === evidence.sourceRevisionVectorHash &&
+    binding.canonicalSubjectRef === evidence.canonicalSubjectRef
+  );
+}
+
+function requireSharedHarvestAuthority(
+  resolved: readonly ResolvedExecutionReceiptBinding[]
+): ResolvedExecutionReceiptBinding {
+  const reference = resolved[0];
+  if (
+    !reference ||
+    resolved.some(
+      ({ binding, fileExecution }) =>
+        binding.harvestKey !== reference.binding.harvestKey ||
+        binding.harvestReceiptHash !== reference.binding.harvestReceiptHash ||
+        binding.sourceRevisionVectorHash !== reference.binding.sourceRevisionVectorHash ||
+        binding.canonicalSubjectRef !== reference.binding.canonicalSubjectRef ||
+        binding.fileExecutionHash !== reference.binding.fileExecutionHash ||
+        fileExecution.witnessBindingHash !== reference.fileExecution.witnessBindingHash ||
+        fileExecution.projectContextRefId !== reference.fileExecution.projectContextRefId ||
+        fileExecution.relativePath !== reference.fileExecution.relativePath ||
+        fileExecution.blobHash !== reference.fileExecution.blobHash
+    )
+  ) {
+    throw runtimeError(
+      'ALEMBIC_AGENT_SEMANTIC_REVIEW_EVIDENCE_EXECUTION_MISMATCH',
+      'Core expected receipt bindings do not share one harvest/file/witness authority.'
+    );
+  }
+  return reference;
 }
 
 function evidenceEntryMatches(

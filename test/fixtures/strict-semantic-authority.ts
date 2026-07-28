@@ -25,6 +25,7 @@ export function createExecutionReceipt(input: {
   readonly projectContextRefId?: string;
   readonly witnessBindingHash?: string;
   readonly backendProducer?: string;
+  readonly analysisScale?: FactQueryExecutionReceiptV1['analysisScale'];
 }): FactQueryExecutionReceiptV1 {
   const disposition = input.disposition ?? 'matched';
   const relativePath = input.relativePath ?? `src/${input.name}.ts`;
@@ -37,7 +38,7 @@ export function createExecutionReceipt(input: {
     factFamilyId: 'syntax-idiom',
     capabilityId: 'tree-sitter-query',
     canonicalSubjectRef,
-    analysisScale: 'file' as const,
+    analysisScale: input.analysisScale ?? ('file' as const),
     denominator: 'complete-frozen-subject' as const,
   };
   const obligationId = `fact:${hashCanonical(obligationSemantic).slice(7, 31)}`;
