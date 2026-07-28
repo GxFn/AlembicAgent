@@ -9,9 +9,9 @@ import {
 } from '@alembic/core/host-agent-workflows';
 import type { EvidenceEntry } from '@alembic/core/knowledge';
 import {
-  assertSemanticDispositionReviewDurableAttestationV4,
+  assertSemanticDispositionReviewDurableAttestationV5,
   canonicalizeObservationPopulationV1,
-  consumeMainSemanticDispositionReviewDurableAttestationV4,
+  consumeMainSemanticDispositionReviewDurableAttestationV5,
   createAgentSemanticDispositionReviewRequestV1,
   createAnalysisFixpointReceiptV1,
   createFinalExpandedMiningScheduleReceiptV1,
@@ -64,7 +64,7 @@ afterEach(() => {
 });
 
 describe('DurableSemanticReviewRuntime', () => {
-  it('loads the authoritative Agent ledger, invokes the provider with Core prompt, and emits a fresh-process V4 durable attestation', async () => {
+  it('loads the authoritative Agent ledger, invokes the provider with Core prompt, and emits a fresh-process V5 durable attestation', async () => {
     const fixture = createFixture();
     fixture.ledgerAuthority.capture.capture({
       tool: 'code.read',
@@ -120,9 +120,9 @@ describe('DurableSemanticReviewRuntime', () => {
         '--eval',
         [
           "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
+          "import { assertSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
           "const input = JSON.parse(readFileSync(process.env.ALEMBIC_DURABLE_REVIEW_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV4(input);',
+          'assertSemanticDispositionReviewDurableAttestationV5(input);',
           "process.stdout.write('fresh-process-verified');",
         ].join('\n'),
       ],
@@ -152,14 +152,16 @@ describe('DurableSemanticReviewRuntime', () => {
       witnessBindingHash: fixture.witnessBinding.bindingHash,
       blobHash: REVIEW_BLOB_HASH,
     });
-    expect(attestation.evidenceLoadReceipts[0]?.executionReceiptBindings).toEqual([
-      expect.objectContaining({
-        executionReceiptHash: fixture.executionReceipt.receiptHash,
-        fileExecutionHash: fixture.executionReceipt.fileExecutions[0]?.executionHash,
-      }),
-    ]);
+    expect(attestation.evidenceLoadReceipts[0]?.harvestGroups[0]?.executionReceiptBindings).toEqual(
+      [
+        expect.objectContaining({
+          executionReceiptHash: fixture.executionReceipt.receiptHash,
+          fileExecutionHash: fixture.executionReceipt.fileExecutions[0]?.executionHash,
+        }),
+      ]
+    );
     expect(() =>
-      assertSemanticDispositionReviewDurableAttestationV4({
+      assertSemanticDispositionReviewDurableAttestationV5({
         attestation: rehydrated,
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
       })
@@ -171,7 +173,7 @@ describe('DurableSemanticReviewRuntime', () => {
     });
   });
 
-  it('loads one production evidence authority for the exact Core V4 shared-harvest binding set', async () => {
+  it('preserves the exact Core shared-harvest binding set as one V5 compatibility group', async () => {
     const fixture = createFixture({
       sharedHarvestAnalysisScales: ['file', 'repository'],
     });
@@ -188,14 +190,18 @@ describe('DurableSemanticReviewRuntime', () => {
       0,
       'shared-harvest evidence load receipt'
     ) as (typeof attestation.evidenceLoadReceipts)[number] & {
-      readonly executionReceiptBindings: readonly {
-        readonly executionReceiptHash: string;
+      readonly harvestGroups: readonly {
+        readonly executionReceiptBindings: readonly {
+          readonly executionReceiptHash: string;
+        }[];
       }[];
     };
     const lookup = requireAt(resolve.mock.calls, 0, 'shared-harvest witness lookup')[0] as
       | (SemanticReviewWitnessAuthorityLookupV1 & {
-          readonly expectedExecutionReceiptBindings: readonly {
-            readonly executionReceiptHash: string;
+          readonly expectedHarvestGroups: readonly {
+            readonly executionReceiptBindings: readonly {
+              readonly executionReceiptHash: string;
+            }[];
           }[];
         })
       | undefined;
@@ -216,13 +222,22 @@ describe('DurableSemanticReviewRuntime', () => {
         )
       ).size
     ).toBe(1);
-    expect(attestation.schemaVersion).toBe(4);
+    expect(attestation.schemaVersion).toBe(5);
     expect(attestation.evidenceLoadReceipts).toHaveLength(1);
+    expect(loadReceipt.harvestGroups).toHaveLength(1);
     expect(
-      loadReceipt.executionReceiptBindings.map((binding) => binding.executionReceiptHash).sort()
+      loadReceipt.harvestGroups
+        .flatMap((group) =>
+          group.executionReceiptBindings.map((binding) => binding.executionReceiptHash)
+        )
+        .sort()
     ).toEqual(expectedReceiptHashes);
     expect(
-      lookup.expectedExecutionReceiptBindings.map((binding) => binding.executionReceiptHash).sort()
+      lookup.expectedHarvestGroups
+        .flatMap((group) =>
+          group.executionReceiptBindings.map((binding) => binding.executionReceiptHash)
+        )
+        .sort()
     ).toEqual(expectedReceiptHashes);
     expect(resolve).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledOnce();
@@ -247,11 +262,11 @@ describe('DurableSemanticReviewRuntime', () => {
         '--eval',
         [
           "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV4, consumeMainSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
-          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_SHARED_HARVEST_V4_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV4(input);',
-          'consumeMainSemanticDispositionReviewDurableAttestationV4(input);',
-          "process.stdout.write('fresh-process-v4-verified');",
+          "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
+          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_SHARED_HARVEST_V5_FIXTURE, 'utf8'));",
+          'assertSemanticDispositionReviewDurableAttestationV5(input);',
+          'consumeMainSemanticDispositionReviewDurableAttestationV5(input);',
+          "process.stdout.write('fresh-process-v5-verified');",
         ].join('\n'),
       ],
       {
@@ -259,19 +274,147 @@ describe('DurableSemanticReviewRuntime', () => {
         encoding: 'utf8',
         env: {
           ...process.env,
-          ALEMBIC_SHARED_HARVEST_V4_FIXTURE: verificationInputPath,
+          ALEMBIC_SHARED_HARVEST_V5_FIXTURE: verificationInputPath,
         },
       }
     );
-    expect(verifierOutput).toBe('fresh-process-v4-verified');
+    expect(verifierOutput).toBe('fresh-process-v5-verified');
     expect(() =>
-      assertSemanticDispositionReviewDurableAttestationV4({
+      assertSemanticDispositionReviewDurableAttestationV5({
         attestation: JSON.parse(JSON.stringify(attestation)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
       })
     ).not.toThrow();
     expect(() =>
-      consumeMainSemanticDispositionReviewDurableAttestationV4({
+      consumeMainSemanticDispositionReviewDurableAttestationV5({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    ).not.toThrow();
+  });
+
+  it('loads one physical production evidence root once for the complete Core V5 cross-harvest groups', async () => {
+    const fixture = createFixture({
+      crossHarvestAnalysisGroups: [
+        {
+          harvestKey: shaText('cross-harvest:syntax'),
+          harvestReceiptHash: shaText('cross-harvest:syntax:receipt'),
+          analysisScales: ['file', 'repository'],
+        },
+        {
+          harvestKey: shaText('cross-harvest:configuration'),
+          harvestReceiptHash: shaText('cross-harvest:configuration:receipt'),
+          analysisScales: ['module'],
+        },
+      ],
+    });
+    const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
+    const runtime = await createRuntime(fixture, { invoke, resolve });
+
+    const attestation = await runtime.execute({ semanticRequest: fixture.semanticRequest });
+    const expectedReceiptHashes = fixture.executionReceipts
+      .map((receipt) => receipt.receiptHash)
+      .sort();
+    const authority = requireAt(
+      attestation.execution.request.evidenceAuthorities,
+      0,
+      'cross-harvest evidence authority'
+    );
+    const loadReceipt = requireAt(
+      attestation.evidenceLoadReceipts,
+      0,
+      'cross-harvest evidence load receipt'
+    );
+    const lookup = requireAt(resolve.mock.calls, 0, 'cross-harvest witness lookup')[0] as
+      | (SemanticReviewWitnessAuthorityLookupV1 & {
+          readonly expectedHarvestGroups: readonly {
+            readonly executionReceiptBindings: readonly {
+              readonly executionReceiptHash: string;
+            }[];
+          }[];
+        })
+      | undefined;
+    if (!lookup) {
+      throw new Error('TEST_FIXTURE_MISSING:cross-harvest witness lookup');
+    }
+
+    expect(fixture.evidenceEntries).toHaveLength(1);
+    expect(fixture.executionReceipts).toHaveLength(3);
+    expect(new Set(fixture.executionReceipts.map((receipt) => receipt.harvestKey)).size).toBe(2);
+    expect(attestation.schemaVersion).toBe(5);
+    expect(attestation.evidenceLoadReceipts).toHaveLength(1);
+    expect(authority.harvestGroups).toHaveLength(2);
+    expect(
+      authority.harvestGroups
+        .flatMap((group) =>
+          group.executionReceiptBindings.map((binding) => binding.executionReceiptHash)
+        )
+        .sort()
+    ).toEqual(expectedReceiptHashes);
+    expect(loadReceipt.harvestGroups).toEqual(authority.harvestGroups);
+    expect(
+      lookup.expectedHarvestGroups
+        .flatMap((group) =>
+          group.executionReceiptBindings.map((binding) => binding.executionReceiptHash)
+        )
+        .sort()
+    ).toEqual(expectedReceiptHashes);
+    expect(
+      authority.harvestGroups.some(
+        (group) =>
+          new Set(group.executionReceiptBindings.map((binding) => binding.analysisScale)).size === 2
+      )
+    ).toBe(true);
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledOnce();
+
+    const verificationRoot = mkdtempSync(
+      path.join(tmpdir(), 'alembic-agent-cross-harvest-v5-verification-')
+    );
+    temporaryRoots.add(verificationRoot);
+    const verificationInputPath = path.join(verificationRoot, 'attestation.json');
+    writeFileSync(
+      verificationInputPath,
+      JSON.stringify({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    );
+    const verifierOutput = execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        [
+          "import { readFileSync } from 'node:fs';",
+          "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
+          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_CROSS_HARVEST_V5_FIXTURE, 'utf8'));",
+          'assertSemanticDispositionReviewDurableAttestationV5(input);',
+          'consumeMainSemanticDispositionReviewDurableAttestationV5(input);',
+          "process.stdout.write('fresh-process-v5-verified');",
+        ].join('\n'),
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALEMBIC_CROSS_HARVEST_V5_FIXTURE: verificationInputPath,
+        },
+      }
+    );
+    expect(verifierOutput).toBe('fresh-process-v5-verified');
+    expect(() =>
+      assertSemanticDispositionReviewDurableAttestationV5({
+        attestation: JSON.parse(JSON.stringify(attestation)),
+        expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
+      })
+    ).not.toThrow();
+    expect(() =>
+      consumeMainSemanticDispositionReviewDurableAttestationV5({
         attestation: JSON.parse(JSON.stringify(attestation)),
         expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
@@ -281,7 +424,18 @@ describe('DurableSemanticReviewRuntime', () => {
 
   it('rejects caller attempts to remove, add, duplicate, reorder, or truncate the Core binding universe', async () => {
     const fixture = createFixture({
-      sharedHarvestAnalysisScales: ['file', 'repository'],
+      crossHarvestAnalysisGroups: [
+        {
+          harvestKey: shaText('request-mutation:syntax'),
+          harvestReceiptHash: shaText('request-mutation:syntax:receipt'),
+          analysisScales: ['file', 'repository'],
+        },
+        {
+          harvestKey: shaText('request-mutation:configuration'),
+          harvestReceiptHash: shaText('request-mutation:configuration:receipt'),
+          analysisScales: ['module'],
+        },
+      ],
     });
     const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
     const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
@@ -355,9 +509,20 @@ describe('DurableSemanticReviewRuntime', () => {
     expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
   });
 
-  it('rejects serialized V4 binding, harvest, file, witness, blob, source and ledger rebound', async () => {
+  it('rejects serialized V5 group, binding, harvest, file, witness, path, blob, source and ledger rebound', async () => {
     const fixture = createFixture({
-      sharedHarvestAnalysisScales: ['file', 'repository'],
+      crossHarvestAnalysisGroups: [
+        {
+          harvestKey: shaText('attestation-tamper:syntax'),
+          harvestReceiptHash: shaText('attestation-tamper:syntax:receipt'),
+          analysisScales: ['file', 'repository'],
+        },
+        {
+          harvestKey: shaText('attestation-tamper:configuration'),
+          harvestReceiptHash: shaText('attestation-tamper:configuration:receipt'),
+          analysisScales: ['module'],
+        },
+      ],
     });
     const runtime = await createRuntime(fixture, {});
     const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
@@ -367,53 +532,87 @@ describe('DurableSemanticReviewRuntime', () => {
       readonly mutate: (candidate: MutableJson<typeof attestation>) => void;
     }[] = [
       {
+        name: 'missing group',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups.pop();
+        },
+      },
+      {
+        name: 'extra duplicate group',
+        mutate: (candidate) => {
+          const groups = requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups;
+          groups.push({ ...requireAt(groups, 0, 'group') });
+        },
+      },
+      {
+        name: 'reordered groups',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups.reverse();
+        },
+      },
+      {
         name: 'missing binding',
         mutate: (candidate) => {
-          requireAt(
+          const group = requireAt(
             candidate.evidenceLoadReceipts,
             0,
             'load receipt'
-          ).executionReceiptBindings.pop();
+          ).harvestGroups.find((row) => row.executionReceiptBindings.length > 1);
+          if (!group) {
+            throw new Error('TEST_FIXTURE_MISSING:multi-binding group');
+          }
+          group.executionReceiptBindings.pop();
         },
       },
       {
         name: 'extra duplicate binding',
         mutate: (candidate) => {
-          const bindings = requireAt(
+          const group = requireAt(
             candidate.evidenceLoadReceipts,
             0,
             'load receipt'
-          ).executionReceiptBindings;
-          bindings.push({ ...requireAt(bindings, 0, 'binding') });
+          ).harvestGroups.find((row) => row.executionReceiptBindings.length > 1);
+          if (!group) {
+            throw new Error('TEST_FIXTURE_MISSING:multi-binding group');
+          }
+          group.executionReceiptBindings.push({
+            ...requireAt(group.executionReceiptBindings, 0, 'binding'),
+          });
         },
       },
       {
         name: 'reordered bindings',
         mutate: (candidate) => {
-          requireAt(
+          const group = requireAt(
             candidate.evidenceLoadReceipts,
             0,
             'load receipt'
-          ).executionReceiptBindings.reverse();
+          ).harvestGroups.find((row) => row.executionReceiptBindings.length > 1);
+          if (!group) {
+            throw new Error('TEST_FIXTURE_MISSING:multi-binding group');
+          }
+          group.executionReceiptBindings.reverse();
         },
       },
       {
         name: 'mixed harvest',
         mutate: (candidate) => {
-          requireAt(
-            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
-            1,
-            'binding'
-          ).harvestKey = shaText('rebound-harvest');
+          const group = requireAt(
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups,
+            0,
+            'group'
+          );
+          requireAt(group.executionReceiptBindings, 0, 'binding').harvestKey =
+            shaText('rebound-harvest');
         },
       },
       {
         name: 'mixed file execution',
         mutate: (candidate) => {
           requireAt(
-            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
-            1,
-            'binding'
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups,
+            0,
+            'group'
           ).fileExecutionHash = shaText('rebound-file-execution');
         },
       },
@@ -421,10 +620,20 @@ describe('DurableSemanticReviewRuntime', () => {
         name: 'mixed source revision',
         mutate: (candidate) => {
           requireAt(
-            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').executionReceiptBindings,
-            1,
-            'binding'
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups,
+            0,
+            'group'
           ).sourceRevisionVectorHash = shaText('rebound-source-revision');
+        },
+      },
+      {
+        name: 'mixed canonical subject',
+        mutate: (candidate) => {
+          requireAt(
+            requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').harvestGroups,
+            0,
+            'group'
+          ).canonicalSubjectRef = 'file:repo:src/rebound.ts';
         },
       },
       {
@@ -432,6 +641,13 @@ describe('DurableSemanticReviewRuntime', () => {
         mutate: (candidate) => {
           requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').witnessBindingHash =
             shaText('rebound-witness');
+        },
+      },
+      {
+        name: 'path rebound',
+        mutate: (candidate) => {
+          requireAt(candidate.evidenceLoadReceipts, 0, 'load receipt').relativePath =
+            'src/rebound.ts';
         },
       },
       {
@@ -461,13 +677,13 @@ describe('DurableSemanticReviewRuntime', () => {
       const candidate = JSON.parse(JSON.stringify(attestation)) as MutableJson<typeof attestation>;
       tamperCase.mutate(candidate);
       expect(() =>
-        assertSemanticDispositionReviewDurableAttestationV4({
+        assertSemanticDispositionReviewDurableAttestationV5({
           attestation: candidate,
           expectedTrustPolicy: runtime.trustPolicy,
         })
       ).toThrow();
       expect(() =>
-        consumeMainSemanticDispositionReviewDurableAttestationV4({
+        consumeMainSemanticDispositionReviewDurableAttestationV5({
           attestation: candidate,
           expectedSemanticRequest: fixture.semanticRequest,
           expectedTrustPolicy: runtime.trustPolicy,
@@ -760,7 +976,7 @@ describe('DurableSemanticReviewRuntime', () => {
       semanticRequest: alternateFixture.semanticRequest,
     });
     expect(() =>
-      assertSemanticDispositionReviewDurableAttestationV4({
+      assertSemanticDispositionReviewDurableAttestationV5({
         attestation: JSON.parse(JSON.stringify(alternateAttestation)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(pinnedRuntime.trustPolicy)),
       })
@@ -865,9 +1081,18 @@ function createFixtureSubjects(includeSecondEvidence: boolean): readonly Fixture
 function createFixtureEvidenceAuthority(
   ledgerAuthority: ProductionEvidenceLedgerAuthorityV1,
   subjects: readonly FixtureSubject[],
-  sharedHarvestAnalysisScales?: readonly ReturnType<
-    typeof createExecutionReceipt
-  >['analysisScale'][]
+  input: {
+    readonly sharedHarvestAnalysisScales?: readonly ReturnType<
+      typeof createExecutionReceipt
+    >['analysisScale'][];
+    readonly crossHarvestAnalysisGroups?: readonly {
+      readonly harvestKey: string;
+      readonly harvestReceiptHash: string;
+      readonly analysisScales: readonly ReturnType<
+        typeof createExecutionReceipt
+      >['analysisScale'][];
+    }[];
+  } = {}
 ) {
   const evidenceEntries = subjects.map((subject, index) =>
     ledgerAuthority.capture.capture({
@@ -913,19 +1138,33 @@ function createFixtureEvidenceAuthority(
       };
     }
   );
-  const receiptSubjects = sharedHarvestAnalysisScales
-    ? sharedHarvestAnalysisScales.map((analysisScale) => ({
-        analysisScale,
-        subject: requireAt(subjects, 0, 'shared-harvest subject'),
-        subjectIndex: 0,
-      }))
-    : subjects.map((subject, subjectIndex) => ({
-        analysisScale: 'file' as const,
-        subject,
-        subjectIndex,
-      }));
+  const receiptSubjects = input.crossHarvestAnalysisGroups
+    ? input.crossHarvestAnalysisGroups.flatMap((group) =>
+        group.analysisScales.map((analysisScale) => ({
+          analysisScale,
+          subject: requireAt(subjects, 0, 'cross-harvest subject'),
+          subjectIndex: 0,
+          harvestKey: group.harvestKey,
+          harvestReceiptHash: group.harvestReceiptHash,
+        }))
+      )
+    : input.sharedHarvestAnalysisScales
+      ? input.sharedHarvestAnalysisScales.map((analysisScale) => ({
+          analysisScale,
+          subject: requireAt(subjects, 0, 'shared-harvest subject'),
+          subjectIndex: 0,
+          harvestKey: undefined,
+          harvestReceiptHash: undefined,
+        }))
+      : subjects.map((subject, subjectIndex) => ({
+          analysisScale: 'file' as const,
+          subject,
+          subjectIndex,
+          harvestKey: undefined,
+          harvestReceiptHash: undefined,
+        }));
   const executionReceipts = receiptSubjects
-    .map(({ analysisScale, subject, subjectIndex }) =>
+    .map(({ analysisScale, subject, subjectIndex, harvestKey, harvestReceiptHash }) =>
       createExecutionReceipt({
         name: `${subject.name}:${analysisScale}`,
         emittedFactIds: [],
@@ -936,6 +1175,8 @@ function createFixtureEvidenceAuthority(
         projectContextRefId: requireAt(projectContextRefs, subjectIndex, 'ProjectContext ref').id,
         witnessBindingHash: requireAt(witnessBindings, subjectIndex, 'witness binding').bindingHash,
         analysisScale,
+        ...(harvestKey ? { harvestKey } : {}),
+        ...(harvestReceiptHash ? { harvestReceiptHash } : {}),
       })
     )
     .sort((left, right) => left.obligationId.localeCompare(right.obligationId));
@@ -1039,6 +1280,13 @@ function createFixture(
     readonly sharedHarvestAnalysisScales?: readonly ReturnType<
       typeof createExecutionReceipt
     >['analysisScale'][];
+    readonly crossHarvestAnalysisGroups?: readonly {
+      readonly harvestKey: string;
+      readonly harvestReceiptHash: string;
+      readonly analysisScales: readonly ReturnType<
+        typeof createExecutionReceipt
+      >['analysisScale'][];
+    }[];
   } = {}
 ): Fixture {
   const ledgerAuthority = createLedgerAuthority();
@@ -1048,7 +1296,14 @@ function createFixture(
     evidenceLedgerSnapshot,
     witnessBindings,
     executionReceipts: authorityExecutionReceipts,
-  } = createFixtureEvidenceAuthority(ledgerAuthority, subjects, input.sharedHarvestAnalysisScales);
+  } = createFixtureEvidenceAuthority(ledgerAuthority, subjects, {
+    ...(input.sharedHarvestAnalysisScales
+      ? { sharedHarvestAnalysisScales: input.sharedHarvestAnalysisScales }
+      : {}),
+    ...(input.crossHarvestAnalysisGroups
+      ? { crossHarvestAnalysisGroups: input.crossHarvestAnalysisGroups }
+      : {}),
+  });
   const executionReceipts = authorityExecutionReceipts;
   const evidenceEntry = requireAt(evidenceEntries, 0, 'primary evidence entry');
   const witnessBinding = requireAt(witnessBindings, 0, 'primary witness binding');
@@ -1255,7 +1510,7 @@ function passingDecisionFromCompiledPrompt(compiledPrompt: string): string {
     readonly payload: {
       readonly semanticRequest: SemanticDispositionReviewRequestV1;
       readonly evidenceAuthorities: readonly unknown[];
-      readonly schemaVersion: 3;
+      readonly schemaVersion: 3 | 4;
       readonly producerRoute: string;
       readonly consumerRoute: string;
     };
@@ -1268,7 +1523,7 @@ function passingDecisionFromCompiledPrompt(compiledPrompt: string): string {
   });
   const semanticRequest = parsed.payload.semanticRequest;
   return JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: parsed.payload.schemaVersion,
     requestHash,
     compiledPromptHash,
     semanticRequestHash: semanticRequest.requestHash,

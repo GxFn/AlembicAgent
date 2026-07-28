@@ -26,6 +26,8 @@ export function createExecutionReceipt(input: {
   readonly witnessBindingHash?: string;
   readonly backendProducer?: string;
   readonly analysisScale?: FactQueryExecutionReceiptV1['analysisScale'];
+  readonly harvestKey?: string;
+  readonly harvestReceiptHash?: string;
 }): FactQueryExecutionReceiptV1 {
   const disposition = input.disposition ?? 'matched';
   const relativePath = input.relativePath ?? `src/${input.name}.ts`;
@@ -82,8 +84,8 @@ export function createExecutionReceipt(input: {
     backendManifestHash: `sha256:${'b'.repeat(64)}`,
     backendLoadReceiptHash: `sha256:${'c'.repeat(64)}`,
     queryPackHash: `sha256:${'d'.repeat(64)}`,
-    harvestKey: `sha256:${'e'.repeat(64)}`,
-    harvestReceiptHash: `sha256:${'f'.repeat(64)}`,
+    harvestKey: input.harvestKey ?? `sha256:${'e'.repeat(64)}`,
+    harvestReceiptHash: input.harvestReceiptHash ?? `sha256:${'f'.repeat(64)}`,
     expectedFileCount: 1,
     inspectedFileCount: 1,
     denominatorFileIds,

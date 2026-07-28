@@ -26,11 +26,11 @@ import {
 } from '@alembic/agent/production';
 import { runStrictPlanAgent } from '@alembic/agent/runs';
 import {
-  assertSemanticDispositionReviewDurableAttestationV4,
+  assertSemanticDispositionReviewDurableAttestationV5,
   buildFactQueryCatalogSnapshot,
   canonicalizeKnowledgeClustersV1,
   canonicalizeObservationPopulationV1,
-  consumeMainSemanticDispositionReviewDurableAttestationV4,
+  consumeMainSemanticDispositionReviewDurableAttestationV5,
   createAgentSemanticDispositionReviewRequestV1,
   createAnalysisReviewContextHashV1,
   createConfigFactQueryBackendV1,
@@ -347,11 +347,11 @@ async function executeDurableReviewRuntimeProbe({
   });
   const attestation = await runtime.execute({ semanticRequest });
   const serializedAttestation = JSON.parse(JSON.stringify(attestation));
-  assertSemanticDispositionReviewDurableAttestationV4({
+  assertSemanticDispositionReviewDurableAttestationV5({
     attestation: serializedAttestation,
     expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
   });
-  consumeMainSemanticDispositionReviewDurableAttestationV4({
+  consumeMainSemanticDispositionReviewDurableAttestationV5({
     attestation: serializedAttestation,
     expectedSemanticRequest: JSON.parse(JSON.stringify(semanticRequest)),
     expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
@@ -380,14 +380,25 @@ async function executeDurableReviewRuntimeProbe({
     exactCompiledPrompt: true,
     serializedAttestationVerified: true,
     attestationSchemaVersion: attestation.schemaVersion,
+    harvestGroupCount: attestation.evidenceLoadReceipts[0]?.harvestGroups.length ?? 0,
     executionReceiptBindingCount:
-      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings.length ?? 0,
-    sharedHarvestKey:
-      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.harvestKey ?? null,
-    sharedHarvestReceiptHash:
-      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.harvestReceiptHash ?? null,
-    sharedFileExecutionHash:
-      attestation.evidenceLoadReceipts[0]?.executionReceiptBindings[0]?.fileExecutionHash ?? null,
+      attestation.evidenceLoadReceipts[0]?.harvestGroups.reduce(
+        (count, group) => count + group.executionReceiptBindings.length,
+        0
+      ) ?? 0,
+    multiScaleHarvestGroup:
+      attestation.evidenceLoadReceipts[0]?.harvestGroups.some(
+        (group) =>
+          new Set(group.executionReceiptBindings.map((binding) => binding.analysisScale)).size > 1
+      ) ?? false,
+    completeCrossHarvestUnion:
+      JSON.stringify(
+        attestation.evidenceLoadReceipts[0]?.harvestGroups
+          .flatMap((group) =>
+            group.executionReceiptBindings.map((binding) => binding.executionReceiptHash)
+          )
+          .sort()
+      ) === JSON.stringify(real.executionReceipts.map((receipt) => receipt.receiptHash).sort()),
     publicConsumerFreshProcess: true,
     freshProcessReopenVerified: true,
     evidenceStoreId: real.ledgerAuthority.identity.storeId,
@@ -410,46 +421,55 @@ function createPublicProbeWitnessAuthority(real, calls) {
             binding.bindingHash === lookup.witnessBindingHash &&
             binding.evidenceEntryId === lookup.evidenceEntryId
         ) ?? null;
-      const exactBindingSet =
-        lookup.expectedExecutionReceiptBindings.length === real.executionReceipts.length &&
-        lookup.expectedExecutionReceiptBindings.every(
-          (binding, index) =>
-            JSON.stringify(binding) ===
-            JSON.stringify(createExpectedPublicProbeBinding(real.executionReceipts[index]))
-        );
-      const fileExecution = real.executionReceipt.fileExecutions.find(
-        (execution) => execution.executionHash === lookup.fileExecutionHash
+      const expectedReceiptHashes = real.executionReceipts
+        .map((receipt) => receipt.receiptHash)
+        .sort();
+      const actualBindings = lookup.expectedHarvestGroups.flatMap(
+        (group) => group.executionReceiptBindings
       );
-      if (!witnessBinding || !fileExecution || !exactBindingSet) {
-        return null;
+      const actualReceiptHashes = actualBindings
+        .map((binding) => binding.executionReceiptHash)
+        .sort();
+      const exactGroupSet =
+        lookup.expectedHarvestGroups.length === 2 &&
+        actualBindings.length === 3 &&
+        new Set(lookup.expectedHarvestGroups.map((group) => group.harvestKey)).size === 2 &&
+        lookup.expectedHarvestGroups.some(
+          (group) =>
+            new Set(group.executionReceiptBindings.map((binding) => binding.analysisScale)).size > 1
+        ) &&
+        JSON.stringify(actualReceiptHashes) === JSON.stringify(expectedReceiptHashes);
+      const availableFileExecutionHashes = new Set(
+        real.executionReceipts.flatMap((receipt) =>
+          receipt.fileExecutions.map((execution) => execution.executionHash)
+        )
+      );
+      const exactFileExecutionSet = lookup.expectedHarvestGroups.every((group) =>
+        availableFileExecutionHashes.has(group.fileExecutionHash)
+      );
+      if (!witnessBinding || !exactFileExecutionSet || !exactGroupSet) {
+        throw new Error(
+          `STRICT_AGENT_PUBLIC_WITNESS_AUTHORITY_MISMATCH:${JSON.stringify({
+            witnessBinding: Boolean(witnessBinding),
+            exactFileExecutionSet,
+            exactGroupSet,
+            groupCount: lookup.expectedHarvestGroups.length,
+            bindingCount: actualBindings.length,
+            harvestCount: new Set(lookup.expectedHarvestGroups.map((group) => group.harvestKey))
+              .size,
+            analysisScales: lookup.expectedHarvestGroups.map((group) =>
+              group.executionReceiptBindings.map((binding) => binding.analysisScale)
+            ),
+            actualReceiptHashes,
+            expectedReceiptHashes,
+          })}`
+        );
       }
       return {
         evidenceLedgerSnapshot: real.witness.evidenceLedgerSnapshot,
         witnessBinding,
       };
     },
-  };
-}
-
-function createExpectedPublicProbeBinding(receipt) {
-  const fileExecution = receipt?.fileExecutions[0];
-  if (!receipt || !fileExecution) {
-    return null;
-  }
-  const semantic = {
-    schemaVersion: 3,
-    obligationId: receipt.obligationId,
-    analysisScale: receipt.analysisScale,
-    executionReceiptHash: receipt.receiptHash,
-    harvestKey: receipt.harvestKey,
-    harvestReceiptHash: receipt.harvestReceiptHash,
-    sourceRevisionVectorHash: receipt.sourceRevisionVectorHash,
-    canonicalSubjectRef: receipt.canonicalSubjectRef,
-    fileExecutionHash: fileExecution.executionHash,
-  };
-  return {
-    ...semantic,
-    bindingHash: hashCanonicalJson(semantic),
   };
 }
 
@@ -475,7 +495,7 @@ function verifyFreshProcessLedgerReopen(input) {
       [
         "import fs from 'node:fs';",
         "import { createProductionEvidenceLedgerAuthority } from '@alembic/agent/production';",
-        "import { assertSemanticDispositionReviewDurableAttestationV4, consumeMainSemanticDispositionReviewDurableAttestationV4 } from '@alembic/core/production';",
+        "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
         "const payload = JSON.parse(fs.readFileSync(process.env.ALEMBIC_LEDGER_REOPEN_PAYLOAD, 'utf8'));",
         'const coordinates = JSON.parse(process.env.ALEMBIC_LEDGER_REOPEN_COORDINATES);',
         'const authority = createProductionEvidenceLedgerAuthority(coordinates);',
@@ -484,8 +504,8 @@ function verifyFreshProcessLedgerReopen(input) {
         "if (snapshot.snapshotHash !== payload.expectedSnapshotHash) throw new Error('FRESH_LEDGER_SNAPSHOT_MISMATCH');",
         "if (payload.expectedEvidenceEntryIds.some((id) => !authority.read.get(id))) throw new Error('FRESH_LEDGER_EVIDENCE_MISSING');",
         'const verification = { attestation: payload.attestation, expectedSemanticRequest: payload.expectedSemanticRequest, expectedTrustPolicy: payload.expectedTrustPolicy };',
-        'assertSemanticDispositionReviewDurableAttestationV4(verification);',
-        'consumeMainSemanticDispositionReviewDurableAttestationV4(verification);',
+        'assertSemanticDispositionReviewDurableAttestationV5(verification);',
+        'consumeMainSemanticDispositionReviewDurableAttestationV5(verification);',
         'process.stdout.write(JSON.stringify({ reopened: true, storeId: authority.identity.storeId, snapshotHash: snapshot.snapshotHash }));',
       ].join('\n'),
     ],
@@ -512,7 +532,7 @@ function createPassingDurableReviewDecision(compiledPrompt, evidenceEntryId) {
   });
   const semanticRequest = parsed.payload.semanticRequest;
   return JSON.stringify({
-    schemaVersion: 3,
+    schemaVersion: parsed.payload.schemaVersion,
     requestHash,
     compiledPromptHash,
     semanticRequestHash: semanticRequest.requestHash,
@@ -555,7 +575,12 @@ async function createRealExecutorFixture(root) {
     supportedScales: ['file', 'repository'],
     parser: 'nx-project-json',
   });
-  const catalog = buildFactQueryCatalogSnapshot([family]);
+  const crossHarvestFamily = createConfigFactQueryFamilyV1({
+    familyId: 'config-declaration-cross-harvest',
+    supportedScales: ['file'],
+    parser: 'nx-project-json',
+  });
+  const catalog = buildFactQueryCatalogSnapshot([family, crossHarvestFamily]);
   const subjectBinding = createStrictFactSubjectBindingV1({
     artifact,
     planningFacts,
@@ -575,6 +600,10 @@ async function createRealExecutorFixture(root) {
   });
   const registry = createStrictFactBackendRegistryV1([
     createConfigFactQueryBackendV1({ family, parser: 'nx-project-json' }),
+    createConfigFactQueryBackendV1({
+      family: crossHarvestFamily,
+      parser: 'nx-project-json',
+    }),
   ]);
   const schedule = createSchedule(family, subjectBinding.canonicalSubjectRef);
   const factExecution = await executeStrictFactScheduleV1({
@@ -587,11 +616,64 @@ async function createRealExecutorFixture(root) {
     witnessAuthority: witness.authority,
     registry,
   });
-  const executionReceipts = [...factExecution.receipts].sort((left, right) =>
-    left.obligationId.localeCompare(right.obligationId)
+  // 第二次真实 executor harvest 复用同一 frozen artifact、witness 与物理 EvidenceEntry，
+  // 但具有独立 schedule/harvest authority；这正是 V5 必须完整保留的跨 harvest union。
+  const crossHarvestSchedule = createSchedule(
+    crossHarvestFamily,
+    subjectBinding.canonicalSubjectRef,
+    ['file']
+  );
+  const crossHarvestFactExecution = await executeStrictFactScheduleV1({
+    artifact,
+    planningFacts,
+    catalog,
+    schedule: crossHarvestSchedule,
+    subjectBindings: [subjectBinding],
+    witnessBindings: witness.bindings,
+    witnessAuthority: witness.authority,
+    registry,
+  });
+  const executionReceipts = [...factExecution.receipts, ...crossHarvestFactExecution.receipts].sort(
+    (left, right) => left.obligationId.localeCompare(right.obligationId)
+  );
+  const executionFacts = [...factExecution.facts, ...crossHarvestFactExecution.facts].sort(
+    (left, right) => left.factId.localeCompare(right.factId)
   );
   const executionReceipt = executionReceipts[0];
-  const sharedFileExecutionHashes = new Set(
+  assertRealExecutorFixture({
+    factExecution,
+    crossHarvestFactExecution,
+    executionReceipts,
+    executionReceipt,
+  });
+  return {
+    ledgerAuthority,
+    ledgerCoordinates,
+    captureValidation,
+    artifact,
+    family,
+    crossHarvestFamily,
+    catalog,
+    subjectBinding,
+    witness,
+    registry,
+    schedule,
+    factExecution,
+    crossHarvestSchedule,
+    crossHarvestFactExecution,
+    executionFacts,
+    executionReceipts,
+    executionReceipt,
+  };
+}
+
+function assertRealExecutorFixture({
+  factExecution,
+  crossHarvestFactExecution,
+  executionReceipts,
+  executionReceipt,
+}) {
+  const distinctFileExecutionHashes = new Set(
     executionReceipts.flatMap((receipt) =>
       receipt.fileExecutions.map((execution) => execution.executionHash)
     )
@@ -600,33 +682,34 @@ async function createRealExecutorFixture(root) {
     factExecution.manifest.verdict !== 'passed' ||
     factExecution.facts.length === 0 ||
     !executionReceipt ||
-    executionReceipts.length !== 2 ||
-    new Set(executionReceipts.map((receipt) => receipt.receiptHash)).size !== 2 ||
-    new Set(executionReceipts.map((receipt) => receipt.obligationId)).size !== 2 ||
-    new Set(executionReceipts.map((receipt) => receipt.harvestKey)).size !== 1 ||
-    new Set(executionReceipts.map((receipt) => receipt.harvestReceiptHash)).size !== 1 ||
-    sharedFileExecutionHashes.size !== 1 ||
+    crossHarvestFactExecution.manifest.verdict !== 'passed' ||
+    executionReceipts.length !== 3 ||
+    new Set(executionReceipts.map((receipt) => receipt.receiptHash)).size !== 3 ||
+    new Set(executionReceipts.map((receipt) => receipt.obligationId)).size !== 3 ||
+    new Set(executionReceipts.map((receipt) => receipt.harvestKey)).size !== 2 ||
+    new Set(executionReceipts.map((receipt) => receipt.harvestReceiptHash)).size !== 2 ||
+    distinctFileExecutionHashes.size !== 2 ||
     executionReceipt.disposition !== 'matched' ||
     executionReceipt.expectedFileCount !== 1 ||
     executionReceipt.inspectedFileCount !== 1
   ) {
-    throw new Error('STRICT_AGENT_PUBLIC_REAL_EXECUTOR_FAILED');
+    throw new Error(
+      `STRICT_AGENT_PUBLIC_REAL_EXECUTOR_FAILED:${JSON.stringify({
+        primaryVerdict: factExecution.manifest.verdict,
+        crossHarvestVerdict: crossHarvestFactExecution.manifest.verdict,
+        receiptCount: executionReceipts.length,
+        receiptHashCount: new Set(executionReceipts.map((receipt) => receipt.receiptHash)).size,
+        obligationCount: new Set(executionReceipts.map((receipt) => receipt.obligationId)).size,
+        harvestCount: new Set(executionReceipts.map((receipt) => receipt.harvestKey)).size,
+        harvestReceiptCount: new Set(executionReceipts.map((receipt) => receipt.harvestReceiptHash))
+          .size,
+        fileExecutionCount: distinctFileExecutionHashes.size,
+        disposition: executionReceipt?.disposition ?? null,
+        expectedFileCount: executionReceipt?.expectedFileCount ?? null,
+        inspectedFileCount: executionReceipt?.inspectedFileCount ?? null,
+      })}`
+    );
   }
-  return {
-    ledgerAuthority,
-    ledgerCoordinates,
-    captureValidation,
-    artifact,
-    family,
-    catalog,
-    subjectBinding,
-    witness,
-    registry,
-    schedule,
-    factExecution,
-    executionReceipts,
-    executionReceipt,
-  };
 }
 
 function provePublicCaptureValidation(authority, coordinates) {
@@ -940,7 +1023,7 @@ function createAgentSemanticFixture(real) {
 }
 
 function createPopulationPreview(real) {
-  const { artifact, factExecution, executionReceipt, executionReceipts } = real;
+  const { artifact, executionFacts, executionReceipt, executionReceipts } = real;
   const observationId = 'observation:agent-public-config';
   const populationInput = {
     populationId: 'population:agent-public-connected-probe',
@@ -963,7 +1046,7 @@ function createPopulationPreview(real) {
     observations: [
       {
         observationId,
-        factIds: factExecution.facts.map((fact) => fact.factId),
+        factIds: executionFacts.map((fact) => fact.factId),
         obligationIds: executionReceipts.map((receipt) => receipt.obligationId),
         canonicalSubjectRefs: [executionReceipt.canonicalSubjectRef],
         parentSubjectRefs: ['repo:core'],
@@ -985,7 +1068,7 @@ function createPopulationPreview(real) {
         invariant: 'frozen config declarations are parser-derived',
       },
       observationIds: [observationId],
-      mechanismEvidenceFactIds: factExecution.facts.map((fact) => fact.factId),
+      mechanismEvidenceFactIds: executionFacts.map((fact) => fact.factId),
       anatomyLensIds: ['entrypoint-and-contract'],
     },
   ];
@@ -1082,7 +1165,7 @@ function createAnalysisReviewFixture(real, population) {
 }
 
 function createAgentEpochInput(real, population, review) {
-  const { factExecution } = real;
+  const { executionFacts } = real;
   const { populationInput, clusterInputs } = population;
   const {
     analysisReviewContextHash,
@@ -1093,7 +1176,7 @@ function createAgentEpochInput(real, population, review) {
   } = review;
   const epochInput = {
     currentAnalysisFixpointHash: analysisReviewContextHash,
-    knownFactIds: factExecution.facts.map((fact) => fact.factId),
+    knownFactIds: executionFacts.map((fact) => fact.factId),
     enrolledObligationIds: finalSchedule.obligationIds,
     population: populationInput,
     clusterInputs,
@@ -1106,7 +1189,7 @@ function createAgentEpochInput(real, population, review) {
           {
             hypothesisId,
             statement: 'The frozen config parser produces a deterministic declaration fact.',
-            premiseFactIds: factExecution.facts.map((fact) => fact.factId),
+            premiseFactIds: executionFacts.map((fact) => fact.factId),
           },
         ],
       },
@@ -1213,7 +1296,7 @@ function createProducerEvidence(real) {
 }
 
 function createProducerContext(real, semantic, evidence) {
-  const { artifact, factExecution, schedule } = real;
+  const { artifact, executionFacts, factExecution, schedule } = real;
   const { epoch, analysisFixpoint, hypothesisId } = semantic;
   return createStrictAnalysisContextProjectionV1({
     runId,
@@ -1235,7 +1318,7 @@ function createProducerContext(real, semantic, evidence) {
     questionIds: ['question:agent-public-config-authority'],
     factQueryObligationIds: analysisFixpoint.terminalObligations.map((row) => row.obligationId),
     analysisUnitIds: epoch.population.observations.map((row) => row.observationId),
-    factIds: factExecution.facts.map((fact) => fact.factId),
+    factIds: executionFacts.map((fact) => fact.factId),
     witnessIds: real.witness.bindings.map((binding) => binding.evidenceEntryId),
     populationHashes: [epoch.population.populationHash],
     clusterSetHashes: [epoch.clusterSet.clusterSetHash],
@@ -1550,7 +1633,7 @@ function writeReport({ surface, real, semantic, producer, durableReview, faults 
         outputHash: real.executionReceipt.outputHash,
         denominatorHash: real.executionReceipt.denominatorHash,
         terminalReceiptId: real.executionReceipt.terminalReceiptId,
-        factIds: real.factExecution.facts.map((fact) => fact.factId),
+        factIds: real.executionFacts.map((fact) => fact.factId),
       },
       population: {
         populationHash: semantic.epoch.population.populationHash,
@@ -1637,7 +1720,7 @@ function assertConnectedChainBindings({
 }
 
 function assertExecutorPopulationBindings(real, semantic) {
-  const expectedFactIds = real.factExecution.facts.map((fact) => fact.factId).sort();
+  const expectedFactIds = real.executionFacts.map((fact) => fact.factId).sort();
   const observedFactIds = semantic.epoch.population.observations
     .flatMap((observation) => observation.factIds)
     .sort();
@@ -1849,8 +1932,8 @@ function createActors(real, proposalHash, decision) {
   return { producer: create('producer'), reviewer: create('reviewer') };
 }
 
-function createSchedule(family, canonicalSubjectRef) {
-  const factHarvestObligations = ['file', 'repository'].map((analysisScale) => {
+function createSchedule(family, canonicalSubjectRef, analysisScales = ['file', 'repository']) {
+  const factHarvestObligations = analysisScales.map((analysisScale) => {
     const obligationSemantic = {
       factFamilyId: family.id,
       capabilityId: family.capabilityId,
