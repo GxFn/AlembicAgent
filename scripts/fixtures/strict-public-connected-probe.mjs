@@ -495,6 +495,7 @@ async function createRealExecutorFixture(root) {
     dimensionId: 'dimension:strict-fact-execution',
   });
   const ledgerAuthority = createProductionEvidenceLedgerAuthority(ledgerCoordinates);
+  const captureValidationBefore = provePublicCaptureValidation(ledgerAuthority, ledgerCoordinates);
   const artifact = await createStrictArtifact(root);
   const planningFacts = createPlanningFacts(artifact);
   const family = createConfigFactQueryFamilyV1({
@@ -509,6 +510,17 @@ async function createRealExecutorFixture(root) {
     selector: { kind: 'repository', repoId: 'core' },
   });
   const witness = createWitnessMaterial(artifact, ledgerAuthority);
+  const nextValidEvidenceEntryId = witness.bindings[0]?.evidenceEntryId ?? null;
+  if (nextValidEvidenceEntryId !== 'E-1') {
+    throw new Error(
+      `STRICT_AGENT_PUBLIC_CAPTURE_SEQUENCE_CONSUMED:${nextValidEvidenceEntryId ?? 'missing'}`
+    );
+  }
+  const captureValidation = Object.freeze({
+    ...captureValidationBefore,
+    nextValidEvidenceEntryId,
+    unconsumedSequencePreserved: true,
+  });
   const registry = createStrictFactBackendRegistryV1([
     createConfigFactQueryBackendV1({ family, parser: 'nx-project-json' }),
   ]);
@@ -537,6 +549,7 @@ async function createRealExecutorFixture(root) {
   return {
     ledgerAuthority,
     ledgerCoordinates,
+    captureValidation,
     artifact,
     family,
     catalog,
@@ -547,6 +560,210 @@ async function createRealExecutorFixture(root) {
     factExecution,
     executionReceipt,
   };
+}
+
+function provePublicCaptureValidation(authority, coordinates) {
+  const filePath = path.join(
+    coordinates.dataRoot,
+    '.asd',
+    'evidence-ledger',
+    coordinates.jobId,
+    `${coordinates.dimensionId}.jsonl`
+  );
+  const invalidDrafts = [
+    ['unknown-tool', { tool: 'caller.fake', callId: 'call:invalid', content: 'invalid' }],
+    ['null-draft', null],
+    ['array-draft', []],
+    ['missing-tool', { callId: 'call:invalid', content: 'invalid' }],
+    ['missing-call-id', { tool: 'code.read', content: 'invalid' }],
+    ['missing-content', { tool: 'code.read', callId: 'call:invalid' }],
+    [
+      'extra-top-level-field',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        content: 'invalid',
+        callerTruth: true,
+      },
+    ],
+    ['non-string-tool', { tool: 7, callId: 'call:invalid', content: 'invalid' }],
+    ['non-string-call-id', { tool: 'code.read', callId: 7, content: 'invalid' }],
+    ['non-string-content', { tool: 'code.read', callId: 'call:invalid', content: 7 }],
+    ['non-string-file', { tool: 'code.read', callId: 'call:invalid', file: 7, content: 'invalid' }],
+    ['empty-file', { tool: 'code.read', callId: 'call:invalid', file: '', content: 'invalid' }],
+    [
+      'present-undefined-file',
+      { tool: 'code.read', callId: 'call:invalid', file: undefined, content: 'invalid' },
+    ],
+    ['null-range', { tool: 'code.read', callId: 'call:invalid', range: null, content: 'invalid' }],
+    [
+      'present-undefined-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: undefined,
+        content: 'invalid',
+      },
+    ],
+    [
+      'array-range',
+      { tool: 'code.read', callId: 'call:invalid', range: [1, 2], content: 'invalid' },
+    ],
+    [
+      'missing-range-start',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { end: 2 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'missing-range-end',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 1 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'extra-range-field',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 1, end: 2, zeroBased: true },
+        content: 'invalid',
+      },
+    ],
+    [
+      'zero-range-start',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 0, end: 1 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'negative-range-end',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 1, end: -1 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'descending-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 2, end: 1 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'fractional-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 1.5, end: 2 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'nan-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: Number.NaN, end: 2 },
+        content: 'invalid',
+      },
+    ],
+    [
+      'infinite-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: 1, end: Number.POSITIVE_INFINITY },
+        content: 'invalid',
+      },
+    ],
+    [
+      'string-range',
+      {
+        tool: 'code.read',
+        callId: 'call:invalid',
+        range: { start: '1', end: '2' },
+        content: 'invalid',
+      },
+    ],
+  ];
+
+  const cases = invalidDrafts.map(([mutation, draft]) => {
+    const fileExistedBefore = fs.existsSync(filePath);
+    const bytesBefore = fileExistedBefore ? fs.readFileSync(filePath) : null;
+    const snapshotBefore = captureLedgerSnapshotState(authority);
+    let error = null;
+    try {
+      authority.capture.capture(draft);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    const fileExistsAfter = fs.existsSync(filePath);
+    const bytesAfter = fileExistsAfter ? fs.readFileSync(filePath) : null;
+    const snapshotAfter = captureLedgerSnapshotState(authority);
+    const fileUnchanged =
+      fileExistedBefore === fileExistsAfter &&
+      (bytesBefore === null ? bytesAfter === null : bytesBefore.equals(bytesAfter));
+    const snapshotUnchanged = JSON.stringify(snapshotBefore) === JSON.stringify(snapshotAfter);
+    if (
+      !error?.startsWith('ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID:') ||
+      !fileUnchanged ||
+      !snapshotUnchanged
+    ) {
+      throw new Error(
+        `STRICT_AGENT_PUBLIC_CAPTURE_VALIDATION_FAILED:${mutation}:${error ?? 'no-error'}`
+      );
+    }
+    return {
+      mutation,
+      error,
+      rejected: true,
+      fileUnchanged,
+      snapshotUnchanged,
+    };
+  });
+
+  if (fs.existsSync(filePath)) {
+    throw new Error('STRICT_AGENT_PUBLIC_CAPTURE_REJECTION_CREATED_LEDGER');
+  }
+  return Object.freeze({
+    publicPackageEntrypoint: true,
+    invalidCaseCount: cases.length,
+    rejectedWithoutMutation: cases.every(
+      (item) => item.rejected && item.fileUnchanged && item.snapshotUnchanged
+    ),
+    ledgerFileAbsentAfterRejections: true,
+    cases: Object.freeze(cases),
+  });
+}
+
+function captureLedgerSnapshotState(authority) {
+  try {
+    const snapshot = authority.read.strictSnapshot();
+    return {
+      status: 'snapshot',
+      snapshotHash: snapshot.snapshotHash,
+      evidenceEntryIds: snapshot.entries.map((entry) => entry.id),
+    };
+  } catch (err) {
+    return {
+      status: 'error',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 function createAgentSemanticFixture(real) {
@@ -1165,6 +1382,7 @@ function writeReport({ surface, real, semantic, producer, durableReview, faults 
       '@alembic/core/project-context-foundation',
     ],
     continuityVerified: true,
+    captureValidation: real.captureValidation,
     durableSemanticReview: durableReview,
     connectedChain: {
       executor: {

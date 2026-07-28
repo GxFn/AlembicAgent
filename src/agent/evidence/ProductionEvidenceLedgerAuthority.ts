@@ -4,12 +4,20 @@ import {
   createStrictEvidenceLedgerSnapshotV1,
   type StrictEvidenceLedgerSnapshotV1,
 } from '@alembic/core/host-agent-workflows';
-import type { EvidenceEntry } from '@alembic/core/knowledge';
+import { type EvidenceEntry, type EvidenceRange, isEvidenceToolId } from '@alembic/core/knowledge';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { type EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
 
 const AUTHORITY_KIND = 'alembic-agent-production-evidence-ledger-v1';
 const COORDINATE_MAX_LENGTH = 512;
+const CAPTURE_ERROR_PREFIX = 'ALEMBIC_AGENT_EVIDENCE_LEDGER_CAPTURE_INVALID';
+const CAPTURE_ALLOWED_FIELDS = new Set(['tool', 'callId', 'file', 'range', 'content']);
+const CAPTURE_REQUIRED_FIELDS = ['tool', 'callId', 'content'] as const;
+const CAPTURE_MISSING_FIELD_REASONS = {
+  tool: 'MISSING_TOOL',
+  callId: 'MISSING_CALL_ID',
+  content: 'MISSING_CONTENT',
+} as const;
 
 export interface ProductionEvidenceLedgerCoordinatesV1 {
   /**
@@ -78,7 +86,8 @@ export function createProductionEvidenceLedgerAuthority(
   const binding: AuthorityBinding = { identity, store };
   const capture = Object.freeze({
     identity,
-    capture: (draft: ProductionEvidenceCaptureInputV1) => freezeEvidenceEntry(store.append(draft)),
+    capture: (draft: ProductionEvidenceCaptureInputV1) =>
+      freezeEvidenceEntry(store.append(validateCaptureInput(draft))),
   }) satisfies ProductionEvidenceLedgerCaptureFacetV1;
   const read = Object.freeze({
     identity,
@@ -124,6 +133,95 @@ export function resolveProductionEvidenceLedgerStore(
     throw new Error('ALEMBIC_AGENT_EVIDENCE_LEDGER_AUTHORITY_INVALID');
   }
   return binding.store;
+}
+
+/**
+ * Production facade 会被 JavaScript、JSON 和跨进程调用；TypeScript 的 draft 类型在运行时
+ * 已被擦除。必须先复制并冻结一份通过白名单校验的值，再允许 store 分配 E-n 或 append。
+ */
+function validateCaptureInput(input: unknown): EvidenceEntryDraft {
+  try {
+    return validateCaptureInputUnchecked(input);
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith(CAPTURE_ERROR_PREFIX)) {
+      throw err;
+    }
+    throwCaptureError('UNREADABLE_INPUT');
+  }
+}
+
+function validateCaptureInputUnchecked(input: unknown): EvidenceEntryDraft {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throwCaptureError('DRAFT_NOT_OBJECT');
+  }
+  const record = input as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(record)) {
+    if (typeof key !== 'string' || !CAPTURE_ALLOWED_FIELDS.has(key)) {
+      throwCaptureError('EXTRA_FIELD');
+    }
+  }
+  for (const field of CAPTURE_REQUIRED_FIELDS) {
+    if (!Object.hasOwn(record, field)) {
+      throwCaptureError(CAPTURE_MISSING_FIELD_REASONS[field]);
+    }
+  }
+  const tool = record.tool;
+  const callId = record.callId;
+  const content = record.content;
+  if (typeof tool !== 'string' || !isEvidenceToolId(tool)) {
+    throwCaptureError('TOOL');
+  }
+  if (typeof callId !== 'string') {
+    throwCaptureError('CALL_ID');
+  }
+  if (typeof content !== 'string') {
+    throwCaptureError('CONTENT');
+  }
+
+  let file: string | undefined;
+  if (Object.hasOwn(record, 'file')) {
+    const candidateFile = record.file;
+    if (typeof candidateFile !== 'string' || candidateFile.length === 0) {
+      throwCaptureError('FILE');
+    }
+    file = candidateFile;
+  }
+  const hasRange = Object.hasOwn(record, 'range');
+  const candidateRange = hasRange ? record.range : undefined;
+  const range = hasRange ? validateCaptureRange(candidateRange) : undefined;
+  return Object.freeze({
+    tool,
+    callId,
+    ...(file ? { file } : {}),
+    ...(range ? { range } : {}),
+    content,
+  });
+}
+
+function validateCaptureRange(value: unknown): EvidenceRange {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throwCaptureError('RANGE');
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Reflect.ownKeys(record);
+  const start = record.start;
+  const end = record.end;
+  if (
+    keys.length !== 2 ||
+    keys.some((key) => key !== 'start' && key !== 'end') ||
+    !Object.hasOwn(record, 'start') ||
+    !Object.hasOwn(record, 'end') ||
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    (start as number) < 1 ||
+    (end as number) < (start as number)
+  ) {
+    throwCaptureError('RANGE');
+  }
+  return Object.freeze({
+    start: start as number,
+    end: end as number,
+  });
 }
 
 function normalizeCoordinates(
@@ -219,4 +317,8 @@ function freezeEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
 
 function throwCoordinateError(message: string): never {
   throw new Error(`ALEMBIC_AGENT_EVIDENCE_LEDGER_COORDINATES_INVALID: ${message}`);
+}
+
+function throwCaptureError(reason: string): never {
+  throw new Error(`${CAPTURE_ERROR_PREFIX}:${reason}`);
 }

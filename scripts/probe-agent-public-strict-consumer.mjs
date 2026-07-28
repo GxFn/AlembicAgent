@@ -34,6 +34,12 @@ const runtimeReceipt = JSON.parse(runtime.stdout.trim());
 if (
   runtimeReceipt?.continuityVerified !== true ||
   runtimeReceipt?.connectedChain?.executor?.realExecutor !== true ||
+  runtimeReceipt?.captureValidation?.publicPackageEntrypoint !== true ||
+  runtimeReceipt?.captureValidation?.invalidCaseCount !== 26 ||
+  runtimeReceipt?.captureValidation?.rejectedWithoutMutation !== true ||
+  runtimeReceipt?.captureValidation?.ledgerFileAbsentAfterRejections !== true ||
+  runtimeReceipt?.captureValidation?.nextValidEvidenceEntryId !== 'E-1' ||
+  runtimeReceipt?.captureValidation?.unconsumedSequencePreserved !== true ||
   runtimeReceipt?.durableSemanticReview?.serviceEntrypoint !== true ||
   runtimeReceipt?.durableSemanticReview?.providerCallCount !== 1 ||
   runtimeReceipt?.durableSemanticReview?.witnessLoadCount !== 1 ||
@@ -103,6 +109,7 @@ process.stdout.write(
     types: 'resolved',
     publicSubpaths: runtimeReceipt.publicSubpaths,
     continuityVerified: runtimeReceipt.continuityVerified,
+    captureValidation: runtimeReceipt.captureValidation,
     durableSemanticReview: runtimeReceipt.durableSemanticReview,
     connectedChain: runtimeReceipt.connectedChain,
     faults: runtimeReceipt.faults,
