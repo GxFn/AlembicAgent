@@ -15,11 +15,17 @@ import {
 } from '@alembic/agent/evaluation';
 import type * as ProductionFacade from '@alembic/agent/production';
 import {
+  assertStrictTestDimensionAgentAuthorityV1,
+  assertStrictTestDimensionAgentExecutionReceiptV1,
+  assertStrictTestDimensionProductionRuntimePortBindingV1,
+  bindStrictTestDimensionProductionRuntimePortV1,
   type CausalRepairNodeV1,
   type CreateStrictAnalysisFixpointInputV1,
   type CreateStrictHypothesisExpressionSetReceiptInputV1,
   type CreateStrictProducerExpressionSetInputV1,
   type CreateStrictProducerLineageReceiptInputV1,
+  type CreateStrictTestDimensionAgentAuthorityInputV1,
+  type CreateStrictTestDimensionAgentExecutionReceiptInputV1,
   createDurableSemanticReviewRuntime,
   createProductionEvidenceLedgerAuthority,
   createStrictAnalysisContextProjectionV1,
@@ -30,6 +36,8 @@ import {
   createStrictHypothesisExpressionSetReceiptV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
+  createStrictTestDimensionAgentAuthorityV1,
+  createStrictTestDimensionAgentExecutionReceiptV1,
   type DurableSemanticReviewExecuteInputV1,
   type DurableSemanticReviewRuntimeBootstrapV1,
   DurableSemanticReviewRuntimeError,
@@ -66,6 +74,14 @@ import {
   type StrictProducerProposalV1,
   type StrictProductionGateResultV1,
   type StrictProductionRuntimePortV1,
+  type StrictTestDimensionAgentAnalysisLineageV1,
+  type StrictTestDimensionAgentAuthorityV1,
+  type StrictTestDimensionAgentCellDispositionInputV1,
+  type StrictTestDimensionAgentCellDispositionV1,
+  type StrictTestDimensionAgentExecutionReceiptV1,
+  type StrictTestDimensionAgentTerminalDispositionV1,
+  type StrictTestDimensionEligibleCellV1,
+  type StrictTestDimensionProductionRuntimePortV1,
   validateStrictAnalysisEpochTransitionV1,
   validateStrictAnalystEpochV1,
 } from '@alembic/agent/production';
@@ -111,6 +127,12 @@ export const strictRuntimeBindings = {
   createStrictAnalysisFixpointV1,
   createStrictProducerLineageReceiptV1,
   createStrictProducerExpressionSetV1,
+  createStrictTestDimensionAgentAuthorityV1,
+  assertStrictTestDimensionAgentAuthorityV1,
+  bindStrictTestDimensionProductionRuntimePortV1,
+  assertStrictTestDimensionProductionRuntimePortBindingV1,
+  createStrictTestDimensionAgentExecutionReceiptV1,
+  assertStrictTestDimensionAgentExecutionReceiptV1,
   createProductionEvidenceLedgerAuthority,
   createFrozenEvidenceProjection,
   createDurableSemanticReviewRuntime,
@@ -151,6 +173,16 @@ export interface StrictFacadeConsumerTypes {
   readonly coreExpressionInput: CreateStrictHypothesisExpressionSetReceiptInputV1;
   readonly stageGate: StrictProductionGateResultV1;
   readonly runtimePort: StrictProductionRuntimePortV1;
+  readonly strictTestAuthorityInput: CreateStrictTestDimensionAgentAuthorityInputV1;
+  readonly strictTestAuthority: StrictTestDimensionAgentAuthorityV1;
+  readonly strictTestCell: StrictTestDimensionEligibleCellV1;
+  readonly strictTestRuntimePort: StrictTestDimensionProductionRuntimePortV1;
+  readonly strictTestAnalysis: StrictTestDimensionAgentAnalysisLineageV1;
+  readonly strictTestDisposition: StrictTestDimensionAgentTerminalDispositionV1;
+  readonly strictTestCellInput: StrictTestDimensionAgentCellDispositionInputV1;
+  readonly strictTestCellReceipt: StrictTestDimensionAgentCellDispositionV1;
+  readonly strictTestExecutionInput: CreateStrictTestDimensionAgentExecutionReceiptInputV1;
+  readonly strictTestExecutionReceipt: StrictTestDimensionAgentExecutionReceiptV1;
   readonly frozenEvidenceEntry: FrozenEvidenceEntryV1;
   readonly frozenEvidence: FrozenEvidenceProjectionV1;
   readonly durableReviewBootstrap: DurableSemanticReviewRuntimeBootstrapV1;

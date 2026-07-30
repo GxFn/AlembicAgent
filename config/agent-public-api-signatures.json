@@ -1841,12 +1841,28 @@
       ]
     },
     "./production": {
-      "exportCount": 13,
-      "signatureHash": "8901434ceb4e072ce234a7777b91a1d32bcbc1cb394b77143dc4eae9f3d800af",
+      "exportCount": 19,
+      "signatureHash": "a63e575ec1f963f5e57c1f27de6059d04674004652c182e65f8674e5bbfb0486",
       "entries": [
         {
           "name": "DurableSemanticReviewRuntimeError",
           "kind": "class"
+        },
+        {
+          "name": "assertStrictTestDimensionAgentAuthorityV1",
+          "kind": "function"
+        },
+        {
+          "name": "assertStrictTestDimensionAgentExecutionReceiptV1",
+          "kind": "function"
+        },
+        {
+          "name": "assertStrictTestDimensionProductionRuntimePortBindingV1",
+          "kind": "function"
+        },
+        {
+          "name": "bindStrictTestDimensionProductionRuntimePortV1",
+          "kind": "function"
         },
         {
           "name": "createDurableSemanticReviewRuntime",
@@ -1886,6 +1902,14 @@
         },
         {
           "name": "createStrictProducerLineageReceiptV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictTestDimensionAgentAuthorityV1",
+          "kind": "function"
+        },
+        {
+          "name": "createStrictTestDimensionAgentExecutionReceiptV1",
           "kind": "function"
         },
         {

@@ -123,6 +123,7 @@
     "lint:retired-symbols": "node ../AlembicCore/scripts/lint-retired-symbols.mjs . --dirs=src,test",
     "eval:mining": "npm run build && node scripts/eval-mining.mjs",
     "eval:strict-production": "npm run build && node scripts/eval-strict-production.mjs",
+    "probe:strict-test-dimension-agent": "npm run build && node scripts/probe-strict-test-dimension-agent.mjs",
     "eval:judge-calibration": "npm run build && node scripts/eval-judge-calibration.mjs",
     "lint:provider-neutral-kernel": "node scripts/lint-provider-neutral-kernel.mjs"
   },
