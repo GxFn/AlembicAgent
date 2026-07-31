@@ -20,6 +20,7 @@ import {
 } from '@alembic/core/production';
 import { hashCanonicalJson } from '@alembic/core/project-context-foundation';
 import { describe, expect, it } from 'vitest';
+import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
 import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import {
   createStrictAnalysisContextProjectionV1,
@@ -37,6 +38,9 @@ import {
   createStrictTestDimensionAgentExecutionReceiptV1,
   createStrictTestDimensionAgentPipelineExecutionV1,
 } from '../src/agent/production/StrictTestDimensionAgentContract.js';
+import { AgentProfileCompiler } from '../src/agent/profiles/AgentProfileCompiler.js';
+import { AgentProfileRegistry } from '../src/agent/profiles/AgentProfileRegistry.js';
+import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type {
   AgentRuntimeLike,
@@ -820,6 +824,177 @@ describe('strict-test automatic-selection Agent contract', () => {
     expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_PROFILE_INVALID');
     expect(result.strictTestExecutionReceipt).toBeUndefined();
     expect(runtimeBuildCount).toBe(0);
+  });
+
+  it('rejects a coordinated parent route before a bound strict-test runtime can be bypassed', async () => {
+    const chain = automaticSelectionChain();
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictRuntimePort(chain.authority),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    const input = strictAgentInput(runtimePort);
+    const compiled = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry(),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    }).compile(input.profile, { params: input.params, context: input.context });
+    let runtimeBuildCount = 0;
+
+    const result = await agentServiceWithExecution(
+      async () => {
+        throw new Error('STRICT_TEST_COORDINATOR_BYPASS_RUNTIME_MUST_NOT_BUILD');
+      },
+      () => {
+        runtimeBuildCount += 1;
+      }
+    ).run({
+      ...input,
+      profile: {
+        ...compiled,
+        concurrency: {
+          mode: 'parallel',
+          concurrency: 1,
+          partitioner: 'generateSessionDimensions',
+          childProfile: 'generate-dimension',
+        },
+      },
+    });
+
+    expect(result.status).toBe('blocked');
+    expect(result.runId).toBe(chain.authority.runId);
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_PROFILE_CONCURRENCY_FORBIDDEN');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+    expect(runtimeBuildCount).toBe(0);
+  });
+
+  it('rejects an unsolicited strict-test receipt on an ordinary non-strict run', async () => {
+    const result = await agentServiceWithExecution(async () => ({
+      reply: 'ordinary runtime reply with forged strict authority',
+      toolCalls: [],
+      tokenUsage: { input: 1, output: 1 },
+      iterations: 1,
+      strictTestExecutionReceipt: {
+        kind: 'not-validated',
+        runId: 'spoofed-strict-run',
+      } as never,
+    })).run({
+      profile: { id: 'chat' },
+      message: { role: 'user', content: 'ordinary chat' },
+      context: { source: 'http-chat' },
+    });
+
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_UNSOLICITED');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+  });
+
+  it('rejects an unsolicited strict-test receipt from the ordinary coordination exit', async () => {
+    const coordinator = new AgentRunCoordinator()
+      .registerPartitioner('strictReceiptProbePartitioner', () => [])
+      .registerMerger('strictReceiptProbeMerger', (_results, _input, profile) => ({
+        runId: `${profile.id}:parent`,
+        profileId: profile.id,
+        reply: 'ordinary coordinated reply with forged strict authority',
+        status: 'success',
+        phases: { childResults: [] },
+        toolCalls: [],
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          iterations: 0,
+          durationMs: 0,
+        },
+        diagnostics: null,
+        strictTestExecutionReceipt: {
+          kind: 'not-validated',
+          runId: 'spoofed-coordinated-strict-run',
+        } as never,
+      }));
+    const profile = {
+      ...new AgentProfileCompiler({
+        profileRegistry: new AgentProfileRegistry(),
+        stageFactoryRegistry: new AgentStageFactoryRegistry(),
+      }).compile({ id: 'chat' }),
+      concurrency: {
+        mode: 'parallel' as const,
+        concurrency: 1,
+        partitioner: 'strictReceiptProbePartitioner',
+        merge: 'strictReceiptProbeMerger',
+      },
+    } satisfies CompiledAgentProfile;
+    const service = new AgentService({
+      runCoordinator: coordinator,
+      runtimeBuilder: {
+        build() {
+          throw new Error('ORDINARY_COORDINATION_EXIT_MUST_NOT_BUILD_RUNTIME');
+        },
+      },
+    });
+
+    const result = await service.run({
+      profile,
+      message: { role: 'user', content: 'ordinary coordinated chat' },
+      context: { source: 'http-chat' },
+    });
+
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_UNSOLICITED');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+  });
+
+  it('preserves an ordinary coordinated result when no strict-test receipt is present', async () => {
+    const coordinator = new AgentRunCoordinator()
+      .registerPartitioner('ordinaryProbePartitioner', () => [])
+      .registerMerger('ordinaryProbeMerger', (_results, _input, profile) => ({
+        runId: `${profile.id}:parent`,
+        profileId: profile.id,
+        reply: 'ordinary coordinated reply',
+        status: 'success',
+        phases: { childResults: [] },
+        toolCalls: [],
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          iterations: 0,
+          durationMs: 0,
+        },
+        diagnostics: null,
+      }));
+    const profile = {
+      ...new AgentProfileCompiler({
+        profileRegistry: new AgentProfileRegistry(),
+        stageFactoryRegistry: new AgentStageFactoryRegistry(),
+      }).compile({ id: 'chat' }),
+      concurrency: {
+        mode: 'parallel' as const,
+        concurrency: 1,
+        partitioner: 'ordinaryProbePartitioner',
+        merge: 'ordinaryProbeMerger',
+      },
+    } satisfies CompiledAgentProfile;
+    const service = new AgentService({
+      runCoordinator: coordinator,
+      runtimeBuilder: {
+        build() {
+          throw new Error('ORDINARY_COORDINATION_EXIT_MUST_NOT_BUILD_RUNTIME');
+        },
+      },
+    });
+
+    const result = await service.run({
+      profile,
+      message: { role: 'user', content: 'ordinary coordinated chat' },
+      context: { source: 'http-chat' },
+    });
+
+    expect(result).toMatchObject({
+      runId: 'chat:parent',
+      profileId: 'chat',
+      reply: 'ordinary coordinated reply',
+      status: 'success',
+      phases: { childResults: [] },
+    });
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
   });
 
   it('seals analyst and producer results before strict gates can mutate either gate argument', async () => {

@@ -66,7 +66,10 @@ export class AgentService {
         durationMs: Date.now() - startedAt,
         error: err instanceof Error ? err.message : String(err),
       });
-      return failedRunResult(compiledProfile.id, readStrictTestRunIdCandidate(input), err);
+      return settleAgentServiceResult(null, {
+        origin: 'failure',
+        result: failedRunResult(compiledProfile.id, readStrictTestRunIdCandidate(input), err),
+      });
     }
     const strictTestRunId = strictTestBinding?.strictTestAuthority.runId;
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
@@ -79,13 +82,19 @@ export class AgentService {
           this.run(childInput)
         );
         if (coordinated) {
+          const settled = settleAgentServiceResult(strictTestBinding, {
+            origin: 'coordinator',
+            result: coordinated,
+          });
           this.#logger.info(`[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
             ...trace,
             durationMs: Date.now() - startedAt,
-            status: coordinated.status,
-            toolCallCount: coordinated.toolCalls.length,
+            status: settled.status,
+            toolCallCount: settled.toolCalls.length,
+            authorityDisposition: strictTestBinding ? 'strict-bound' : 'ordinary',
+            error: settled.status === 'success' ? null : settled.reply,
           });
-          return coordinated;
+          return settled;
         }
       } catch (err: unknown) {
         this.#logger.warn(`[AgentService] coordinated run failed ${formatRunTrace(trace)}`, {
@@ -117,37 +126,41 @@ export class AgentService {
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
-      const strictTestExecutionReceipt = strictTestBinding
-        ? assertStrictTestSuccessfulResult(strictTestBinding, runtime, result)
-        : result.strictTestExecutionReceipt;
-      const status = strictTestBinding
-        ? ('success' as const)
-        : inferRunStatus(result.reply || '', result.outcome);
+      const settled = settleAgentServiceResult(strictTestBinding, {
+        origin: 'runtime',
+        runtime,
+        execution: result,
+        result: {
+          runId: runtime.id || randomUUID(),
+          profileId: compiledProfile.id,
+          reply: result.reply || '',
+          status: inferRunStatus(result.reply || '', result.outcome),
+          phases: result.phases,
+          toolCalls: result.toolCalls || [],
+          usage: {
+            inputTokens: result.tokenUsage?.input || 0,
+            outputTokens: result.tokenUsage?.output || 0,
+            iterations: result.iterations || 0,
+            durationMs: result.durationMs || 0,
+          },
+          diagnostics: result.diagnostics || null,
+          ...(result.strictTestExecutionReceipt !== undefined
+            ? { strictTestExecutionReceipt: result.strictTestExecutionReceipt }
+            : {}),
+        },
+      });
       this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
-        status,
+        status: settled.status,
         iterations: result.iterations || 0,
         toolCallCount: result.toolCalls?.length || 0,
         cancelReason: getDiagnosticsCancelReason(result.diagnostics),
         aiErrorCount: getDiagnosticsAiErrorCount(result.diagnostics),
+        authorityDisposition: strictTestBinding ? 'strict-bound' : 'ordinary',
+        error: settled.status === 'success' ? null : settled.reply,
       });
-      return {
-        runId: runtime.id || randomUUID(),
-        profileId: compiledProfile.id,
-        reply: result.reply || '',
-        status,
-        phases: result.phases,
-        toolCalls: result.toolCalls || [],
-        usage: {
-          inputTokens: result.tokenUsage?.input || 0,
-          outputTokens: result.tokenUsage?.output || 0,
-          iterations: result.iterations || 0,
-          durationMs: result.durationMs || 0,
-        },
-        diagnostics: result.diagnostics || null,
-        ...(strictTestExecutionReceipt ? { strictTestExecutionReceipt } : {}),
-      };
+      return settled;
     } catch (err: unknown) {
       this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
         ...trace,
@@ -155,25 +168,72 @@ export class AgentService {
         error: err instanceof Error ? err.message : String(err),
         status: inferErrorStatus(err),
       });
-      return {
-        runId: runtime.id || randomUUID(),
-        profileId: compiledProfile.id,
-        reply: err instanceof Error ? err.message : String(err),
-        status: inferErrorStatus(err),
-        toolCalls: [],
-        usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          iterations: 0,
-          durationMs: 0,
-        },
-        diagnostics: null,
-      };
+      return settleAgentServiceResult(strictTestBinding, {
+        origin: 'failure',
+        result: failedRunResult(compiledProfile.id, runtime.id || randomUUID(), err),
+      });
     }
   }
 }
 
 type AgentRuntimeExecutionResult = Awaited<ReturnType<AgentRuntimeLike['execute']>>;
+
+type AgentServiceResultCandidate =
+  | { readonly origin: 'failure'; readonly result: AgentRunResult }
+  | { readonly origin: 'coordinator'; readonly result: AgentRunResult }
+  | {
+      readonly origin: 'runtime';
+      readonly result: AgentRunResult;
+      readonly runtime: AgentRuntimeLike;
+      readonly execution: AgentRuntimeExecutionResult;
+    };
+
+/**
+ * AgentService 的所有正常结果出口共用这一个 authority disposition：strict binding 只能由
+ * 本次 runtime/PipelineStrategy 的原始执行证据授权 receipt；普通调用则不能夹带 strict 权威。
+ */
+function settleAgentServiceResult(
+  binding: StrictTestDimensionProductionRuntimePortV1 | null,
+  candidate: AgentServiceResultCandidate
+): AgentRunResult {
+  try {
+    if (!binding) {
+      if (candidate.result.strictTestExecutionReceipt !== undefined) {
+        throw new Error('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_UNSOLICITED');
+      }
+      return candidate.result;
+    }
+    if (candidate.origin === 'failure') {
+      if (
+        candidate.result.status === 'success' ||
+        candidate.result.strictTestExecutionReceipt !== undefined
+      ) {
+        throw new Error('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
+      }
+      return candidate.result;
+    }
+    if (candidate.origin !== 'runtime') {
+      throw new Error('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
+    }
+    const receipt = assertStrictTestSuccessfulResult(
+      binding,
+      candidate.runtime,
+      candidate.execution
+    );
+    return {
+      ...candidate.result,
+      runId: binding.strictTestAuthority.runId,
+      status: 'success',
+      strictTestExecutionReceipt: receipt,
+    };
+  } catch (err: unknown) {
+    return failedRunResult(
+      candidate.result.profileId,
+      binding?.strictTestAuthority.runId || candidate.result.runId,
+      err
+    );
+  }
+}
 
 /**
  * 完整 strict-test binding 是 AgentService 的成功判定边界；普通 strictProduction hints
@@ -226,6 +286,9 @@ function assertStrictTestCompiledProfile(compiledProfile: CompiledAgentProfile):
     stages.length !== expectedStages.length
   ) {
     throw new Error('STRICT_TEST_DIMENSION_AGENT_PROFILE_INVALID');
+  }
+  if (compiledProfile.concurrency && compiledProfile.concurrency.mode !== 'none') {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_PROFILE_CONCURRENCY_FORBIDDEN');
   }
   for (let index = 0; index < expectedStages.length; index += 1) {
     const stage = getRecord(stages[index]);
