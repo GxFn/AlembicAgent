@@ -20,7 +20,7 @@ import {
 } from '@alembic/core/production';
 import { hashCanonicalJson } from '@alembic/core/project-context-foundation';
 import { describe, expect, it } from 'vitest';
-
+import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import {
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
@@ -37,6 +37,7 @@ import {
   createStrictTestDimensionAgentExecutionReceiptV1,
   createStrictTestDimensionAgentPipelineExecutionV1,
 } from '../src/agent/production/StrictTestDimensionAgentContract.js';
+import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type {
   AgentRuntimeLike,
   CompiledAgentProfile,
@@ -365,7 +366,11 @@ function strictStageResultHash(value: unknown) {
 
 function agentService(
   modelCalls: string[],
-  chainCalls?: { runtimeBuildCount: number; pipelineExecuteCount: number }
+  chainCalls?: { runtimeBuildCount: number; pipelineExecuteCount: number },
+  transformStages: (
+    stages: readonly Record<string, unknown>[]
+  ) => readonly Record<string, unknown>[] = (stages) => stages,
+  stageObservations?: Array<{ result: Record<string, unknown>; hashBeforeGate: string }>
 ) {
   return new AgentService({
     runtimeBuilder: {
@@ -378,7 +383,7 @@ function agentService(
           readonly stages: readonly Record<string, unknown>[];
         };
         const strategy = new PipelineStrategy({
-          stages: strategyConfig.stages as Record<string, unknown>[],
+          stages: transformStages(strategyConfig.stages) as Record<string, unknown>[],
         });
         const runtimeId = options?.runId ?? 'strict-test-runtime';
         return {
@@ -392,7 +397,7 @@ function agentService(
                 id: runtimeId,
                 reactLoop: async (prompt: string) => {
                   modelCalls.push(prompt);
-                  return {
+                  const stageResult = {
                     reply:
                       modelCalls.length === 1
                         ? 'analyst terminal result'
@@ -401,12 +406,31 @@ function agentService(
                     tokenUsage: { input: 1, output: 1 },
                     iterations: 1,
                   };
+                  stageObservations?.push({
+                    result: stageResult,
+                    hashBeforeGate: strictStageResultHash(stageResult),
+                  });
+                  return stageResult;
                 },
               },
               message,
               options
             );
           },
+        };
+      },
+    },
+  });
+}
+
+function agentServiceWithExecution(execute: AgentRuntimeLike['execute'], onBuild?: () => void) {
+  return new AgentService({
+    runtimeBuilder: {
+      build(_profile, options): AgentRuntimeLike {
+        onBuild?.();
+        return {
+          id: options?.runId ?? 'agent-service-execution-probe',
+          execute,
         };
       },
     },
@@ -635,6 +659,302 @@ describe('strict-test automatic-selection Agent contract', () => {
         cellDispositions: reviewGate.artifact?.cellDispositions,
       },
     });
+  });
+
+  it('fails closed when a real AgentRuntime policy rejects before the strict pipeline', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    let pipelineExecuteCount = 0;
+    let providerCallCount = 0;
+    const service = new AgentService({
+      runtimeBuilder: {
+        build(profile, options) {
+          const compiled = profile as CompiledAgentProfile;
+          const strategyConfig = compiled.runtimeOverrides.strategy as {
+            readonly stages: readonly Record<string, unknown>[];
+          };
+          const pipeline = new PipelineStrategy({
+            stages: strategyConfig.stages as Record<string, unknown>[],
+          });
+          return new AgentRuntime({
+            id: options?.runId,
+            aiProvider: {
+              name: 'strict-policy-reject-probe',
+              model: 'unused',
+              chatWithTools: async () => {
+                providerCallCount += 1;
+                throw new Error('STRICT_POLICY_REJECT_PROBE_PROVIDER_MUST_NOT_RUN');
+              },
+            } as never,
+            toolRegistry: { getManifest: () => null } as never,
+            toolRouter: {
+              execute: async () => {
+                throw new Error('STRICT_POLICY_REJECT_PROBE_TOOL_MUST_NOT_RUN');
+              },
+            } as never,
+            capabilities: [],
+            strategy: {
+              name: pipeline.name,
+              execute: async (...args: Parameters<PipelineStrategy['execute']>) => {
+                pipelineExecuteCount += 1;
+                return pipeline.execute(...args);
+              },
+            } as never,
+            policies: new PolicyEngine([
+              new SafetyPolicy({ allowedSenders: ['strict-policy-approved-only'] }),
+            ]),
+          });
+        },
+      },
+    });
+
+    const result = await service.run(strictAgentInput(runtimePort));
+
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+    expect(pipelineExecuteCount).toBe(0);
+    expect(providerCallCount).toBe(0);
+  });
+
+  it.each([
+    {
+      name: 'early runtime return',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED',
+      execution: {
+        reply: 'runtime returned before PipelineStrategy',
+        toolCalls: [],
+        tokenUsage: { input: 0, output: 0 },
+        iterations: 0,
+      },
+    },
+    {
+      name: 'completed pipeline without receipt',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_REQUIRED',
+      execution: {
+        reply: 'pipeline claimed completion without a receipt',
+        toolCalls: [],
+        tokenUsage: { input: 1, output: 1 },
+        iterations: 1,
+        outcome: 'completed',
+        phases: { _pipelineOutcome: { outcome: 'completed' } },
+      },
+    },
+  ])('rejects $name as strict-test success', async ({ execution, expectedError }) => {
+    const chain = automaticSelectionChain();
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictRuntimePort(chain.authority),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    const result = await agentServiceWithExecution(async () => execution).run(
+      strictAgentInput(runtimePort)
+    );
+
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe(expectedError);
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+  });
+
+  it('rejects every canonical receipt identity field that differs from the request authority', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    const canonicalResult = await agentService([]).run(strictAgentInput(runtimePort));
+    const canonicalReceipt = canonicalResult.strictTestExecutionReceipt;
+    if (!canonicalReceipt) {
+      throw new Error('STRICT_TEST_FIXTURE_CANONICAL_RECEIPT_REQUIRED');
+    }
+    const mismatchedReceipts = [
+      { ...canonicalReceipt, runId: 'another-run' },
+      { ...canonicalReceipt, authorityHash: sha('mismatched-service-authority') },
+      { ...canonicalReceipt, selectedCellSetHash: sha('mismatched-service-cell-set') },
+    ] as readonly (typeof canonicalReceipt)[];
+    for (const mismatchedReceipt of mismatchedReceipts) {
+      const result = await agentServiceWithExecution(async () => ({
+        reply: 'mismatched receipt must not become success',
+        toolCalls: [],
+        tokenUsage: { input: 1, output: 1 },
+        iterations: 1,
+        outcome: 'completed',
+        phases: { _pipelineOutcome: { outcome: 'completed' } },
+        strictTestExecutionReceipt: mismatchedReceipt,
+      })).run(strictAgentInput(runtimePort));
+
+      expect(result.status).toBe('error');
+      expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_IDENTITY_MISMATCH');
+      expect(result.strictTestExecutionReceipt).toBeUndefined();
+    }
+  });
+
+  it('rejects a complete strict-test binding under a non-canonical profile before runtime build', async () => {
+    const chain = automaticSelectionChain();
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictRuntimePort(chain.authority),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    let runtimeBuildCount = 0;
+    const result = await agentServiceWithExecution(
+      async () => ({
+        reply: 'wrong profile must not execute',
+        toolCalls: [],
+        tokenUsage: { input: 0, output: 0 },
+        iterations: 0,
+      }),
+      () => {
+        runtimeBuildCount += 1;
+      }
+    ).run({ ...strictAgentInput(runtimePort), profile: { id: 'chat' } });
+
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_PROFILE_INVALID');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+    expect(runtimeBuildCount).toBe(0);
+  });
+
+  it('seals analyst and producer results before strict gates can mutate either gate argument', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+    const stageObservations: Array<{
+      result: Record<string, unknown>;
+      hashBeforeGate: string;
+    }> = [];
+    const mutationObservations: Array<{
+      sourceName: string;
+      sourceWasRawModelResult: boolean;
+      sourceFrozen: boolean;
+      sourceMutationSucceeded: boolean;
+      phaseMutationSucceeded: boolean;
+    }> = [];
+    const transformStages = (stages: readonly Record<string, unknown>[]) =>
+      stages.map((stage) => {
+        const gate =
+          stage.gate && typeof stage.gate === 'object' && !Array.isArray(stage.gate)
+            ? (stage.gate as Record<string, unknown>)
+            : null;
+        if (!gate || typeof gate.evaluator !== 'function') {
+          return stage;
+        }
+        const evaluator = gate.evaluator as (
+          source: unknown,
+          phaseResults: Record<string, unknown>,
+          strategyContext: Record<string, unknown>
+        ) => unknown;
+        const sourceName =
+          typeof stage.source === 'string'
+            ? stage.source
+            : stage.name === 'analyst_fixpoint_gate'
+              ? 'analyze'
+              : stage.name === 'independent_review_gate'
+                ? 'produce'
+                : '';
+        return {
+          ...stage,
+          gate: {
+            ...gate,
+            evaluator: async (
+              source: unknown,
+              phaseResults: Record<string, unknown>,
+              strategyContext: Record<string, unknown>
+            ) => {
+              const sourceRecord =
+                source && typeof source === 'object'
+                  ? (source as Record<string, unknown>)
+                  : Object.create(null);
+              const sourceMutationSucceeded = Reflect.set(
+                sourceRecord,
+                'reply',
+                'mutated-after-model'
+              );
+              const phaseMutationSucceeded = Reflect.set(phaseResults, sourceName, {
+                ...sourceRecord,
+                reply: 'replaced-through-phase-results',
+              });
+              mutationObservations.push({
+                sourceName,
+                sourceWasRawModelResult: stageObservations.some(
+                  (observation) => observation.result === source
+                ),
+                sourceFrozen:
+                  Object.isFrozen(sourceRecord) &&
+                  Object.isFrozen(sourceRecord.toolCalls) &&
+                  Object.isFrozen(sourceRecord.tokenUsage),
+                sourceMutationSucceeded,
+                phaseMutationSucceeded,
+              });
+              return evaluator(source, phaseResults, strategyContext);
+            },
+          },
+        };
+      });
+    const result = await agentService([], undefined, transformStages, stageObservations).run(
+      strictAgentInput(runtimePort)
+    );
+
+    expect(result.status).toBe('success');
+    expect(mutationObservations).toEqual([
+      {
+        sourceName: 'analyze',
+        sourceWasRawModelResult: false,
+        sourceFrozen: true,
+        sourceMutationSucceeded: false,
+        phaseMutationSucceeded: false,
+      },
+      {
+        sourceName: 'produce',
+        sourceWasRawModelResult: false,
+        sourceFrozen: true,
+        sourceMutationSucceeded: false,
+        phaseMutationSucceeded: false,
+      },
+    ]);
+    expect(result.phases?.analyze).not.toBe(stageObservations[0]?.result);
+    expect(result.phases?.produce).not.toBe(stageObservations[1]?.result);
+    expect(result.phases?.analyze).toMatchObject({ reply: 'analyst terminal result' });
+    expect(result.phases?.produce).toMatchObject({ reply: 'producer terminal result' });
+    expect(result.strictTestExecutionReceipt?.pipelineExecution).toMatchObject({
+      analysisStageEvidence: {
+        analystStageResultHash: stageObservations[0]?.hashBeforeGate,
+      },
+      reviewStageEvidence: {
+        producerStageResultHash: stageObservations[1]?.hashBeforeGate,
+      },
+    });
+  });
+
+  it.each([
+    { outcome: undefined, name: 'no pipeline outcome' },
+    { outcome: 'abandoned', name: 'an abandoned pipeline outcome' },
+  ])('preserves ordinary non-strict success with $name', async ({ outcome }) => {
+    const result = await agentServiceWithExecution(async () => ({
+      reply: 'ordinary runtime reply',
+      toolCalls: [],
+      tokenUsage: { input: 1, output: 1 },
+      iterations: 1,
+      ...(outcome ? { outcome } : {}),
+    })).run({
+      profile: { id: 'chat' },
+      message: { role: 'user', content: 'ordinary chat' },
+      context: { source: 'http-chat' },
+    });
+
+    expect(result.status).toBe('success');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
   });
 
   it.each([
@@ -1321,7 +1641,11 @@ function runtimeCells(authority: ReturnType<typeof createStrictTestDimensionAgen
 }
 
 async function runStrictAgent(modelCalls: string[], strictProduction: Record<string, unknown>) {
-  return agentService(modelCalls).run({
+  return agentService(modelCalls).run(strictAgentInput(strictProduction));
+}
+
+function strictAgentInput(strictProduction: Record<string, unknown>) {
+  return {
     profile: { id: 'generate-dimension' },
     params: { needsCandidates: true },
     message: {
@@ -1332,7 +1656,7 @@ async function runStrictAgent(modelCalls: string[], strictProduction: Record<str
       source: 'system-workflow',
       strategyContext: { strictProduction },
     },
-  });
+  } as const;
 }
 
 function rehashAuthority(

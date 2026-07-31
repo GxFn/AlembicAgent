@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import { AgentRunCoordinator } from '../coordination/AgentRunCoordinator.js';
+import {
+  assertStrictTestDimensionAgentExecutionReceiptV1,
+  assertStrictTestDimensionProductionRuntimePortBindingV1,
+  type StrictTestDimensionAgentExecutionReceiptV1,
+  type StrictTestDimensionProductionRuntimePortV1,
+} from '../production/StrictTestDimensionAgentContract.js';
 import { AgentProfileCompiler } from '../profiles/AgentProfileCompiler.js';
 import { AgentProfileRegistry } from '../profiles/AgentProfileRegistry.js';
 import { AgentStageFactoryRegistry } from '../profiles/AgentStageFactoryRegistry.js';
@@ -50,8 +56,19 @@ export class AgentService {
     });
     const trace = describeRun(input, compiledProfile.id);
     const startedAt = Date.now();
-    const strictTestRunId = readStrictTestRunId(input);
     this.#logger.info(`[AgentService] run start ${formatRunTrace(trace)}`, trace);
+    let strictTestBinding: StrictTestDimensionProductionRuntimePortV1 | null;
+    try {
+      strictTestBinding = readStrictTestBinding(input, compiledProfile);
+    } catch (err: unknown) {
+      this.#logger.warn(`[AgentService] strict-test binding rejected ${formatRunTrace(trace)}`, {
+        ...trace,
+        durationMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return failedRunResult(compiledProfile.id, readStrictTestRunIdCandidate(input), err);
+    }
+    const strictTestRunId = strictTestBinding?.strictTestAuthority.runId;
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
       try {
         this.#logger.info(`[AgentService] coordinated run start ${formatRunTrace(trace)}`, {
@@ -100,7 +117,12 @@ export class AgentService {
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
-      const status = inferRunStatus(result.reply || '', result.outcome);
+      const strictTestExecutionReceipt = strictTestBinding
+        ? assertStrictTestSuccessfulResult(strictTestBinding, runtime, result)
+        : result.strictTestExecutionReceipt;
+      const status = strictTestBinding
+        ? ('success' as const)
+        : inferRunStatus(result.reply || '', result.outcome);
       this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
@@ -124,9 +146,7 @@ export class AgentService {
           durationMs: result.durationMs || 0,
         },
         diagnostics: result.diagnostics || null,
-        ...(result.strictTestExecutionReceipt
-          ? { strictTestExecutionReceipt: result.strictTestExecutionReceipt }
-          : {}),
+        ...(strictTestExecutionReceipt ? { strictTestExecutionReceipt } : {}),
       };
     } catch (err: unknown) {
       this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
@@ -151,6 +171,149 @@ export class AgentService {
       };
     }
   }
+}
+
+type AgentRuntimeExecutionResult = Awaited<ReturnType<AgentRuntimeLike['execute']>>;
+
+/**
+ * 完整 strict-test binding 是 AgentService 的成功判定边界；普通 strictProduction hints
+ * 保持既有语义，不会被误提升成 automatic-selection authority。
+ */
+function readStrictTestBinding(
+  input: AgentRunInput,
+  compiledProfile: CompiledAgentProfile
+): StrictTestDimensionProductionRuntimePortV1 | null {
+  const strictProductionValue = input.context.strategyContext?.strictProduction;
+  if (
+    !strictProductionValue ||
+    typeof strictProductionValue !== 'object' ||
+    Array.isArray(strictProductionValue)
+  ) {
+    return null;
+  }
+  const strictProduction = strictProductionValue as Record<string, unknown>;
+  const hasAuthority = Object.hasOwn(strictProduction, 'strictTestAuthority');
+  const hasEligibleCells = Object.hasOwn(strictProduction, 'eligibleCells');
+  if (!hasAuthority && !hasEligibleCells) {
+    return null;
+  }
+  if (!hasAuthority || !hasEligibleCells) {
+    throw new Error('STRICT_TEST_DIMENSION_RUNTIME_BINDING_INCOMPLETE');
+  }
+  assertStrictTestDimensionProductionRuntimePortBindingV1(
+    strictProduction as unknown as StrictTestDimensionProductionRuntimePortV1
+  );
+  assertStrictTestCompiledProfile(compiledProfile);
+  return strictProduction as unknown as StrictTestDimensionProductionRuntimePortV1;
+}
+
+/** strict authority 只能走 registry 编译出的 canonical generate-dimension 四段主链。 */
+function assertStrictTestCompiledProfile(compiledProfile: CompiledAgentProfile): void {
+  const strategy = getRecord(compiledProfile.runtimeOverrides.strategy);
+  const stages = Array.isArray(strategy.stages) ? strategy.stages : [];
+  const expectedStages = [
+    { name: 'analyze', strictRoleSurface: 'strict-analyst-v1', gate: null },
+    { name: 'analyst_fixpoint_gate', strictRoleSurface: null, gate: 'G1' },
+    { name: 'produce', strictRoleSurface: 'strict-producer-v1', gate: null },
+    { name: 'independent_review_gate', strictRoleSurface: null, gate: 'G2' },
+  ] as const;
+  if (
+    compiledProfile.id !== 'generate-dimension' ||
+    compiledProfile.basePreset !== 'insight' ||
+    compiledProfile.projection !== 'agent-result' ||
+    compiledProfile.actionSpace.mode !== 'none' ||
+    strategy.type !== 'pipeline' ||
+    stages.length !== expectedStages.length
+  ) {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_PROFILE_INVALID');
+  }
+  for (let index = 0; index < expectedStages.length; index += 1) {
+    const stage = getRecord(stages[index]);
+    const expected = expectedStages[index];
+    const gate = getRecord(stage.gate);
+    const strictGate = getRecord(gate.strictGate);
+    if (
+      !expected ||
+      stage.name !== expected.name ||
+      (expected.strictRoleSurface
+        ? stage.strictRoleSurface !== expected.strictRoleSurface || Object.hasOwn(stage, 'gate')
+        : typeof gate.evaluator !== 'function' ||
+          gate.useCumulativeToolCalls === true ||
+          strictGate.gate !== expected.gate)
+    ) {
+      throw new Error('STRICT_TEST_DIMENSION_AGENT_PROFILE_INVALID');
+    }
+  }
+}
+
+/**
+ * strict-test 的非空 reply 不是成功证据。只有同 run completed pipeline 与 canonical receipt
+ * 同时满足 request authority 身份，AgentService 才能投影 success。
+ */
+function assertStrictTestSuccessfulResult(
+  binding: StrictTestDimensionProductionRuntimePortV1,
+  runtime: AgentRuntimeLike,
+  result: AgentRuntimeExecutionResult
+): StrictTestDimensionAgentExecutionReceiptV1 {
+  const authority = binding.strictTestAuthority;
+  const pipelineOutcome = getRecord(result.phases?._pipelineOutcome);
+  if (
+    runtime.id !== authority.runId ||
+    result.outcome !== 'completed' ||
+    pipelineOutcome.outcome !== 'completed'
+  ) {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
+  }
+  const receipt = result.strictTestExecutionReceipt;
+  if (!receipt) {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_REQUIRED');
+  }
+  const pipelineExecution = receipt.pipelineExecution;
+  if (
+    receipt.runId !== authority.runId ||
+    receipt.authorityHash !== authority.authorityHash ||
+    receipt.selectedCellSetHash !== authority.selectedCellSetHash ||
+    !sameStrings(receipt.selectedCellIds, authority.selectedCellIds) ||
+    receipt.authority.authorityHash !== authority.authorityHash ||
+    pipelineExecution?.runId !== authority.runId ||
+    pipelineExecution.authorityHash !== authority.authorityHash ||
+    pipelineExecution.selectedCellSetHash !== authority.selectedCellSetHash
+  ) {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_EXECUTION_RECEIPT_IDENTITY_MISMATCH');
+  }
+  if (receipt.segmentStatus !== 'completed') {
+    throw new Error('STRICT_TEST_DIMENSION_AGENT_EXECUTION_NOT_COMPLETED');
+  }
+  assertStrictTestDimensionAgentExecutionReceiptV1(
+    receipt,
+    pipelineExecution.reviewStageEvidence.expectedTrustPolicies
+  );
+  return receipt;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function failedRunResult(
+  profileId: string,
+  runId: string | undefined,
+  err: unknown
+): AgentRunResult {
+  return {
+    runId: runId || randomUUID(),
+    profileId,
+    reply: err instanceof Error ? err.message : String(err),
+    status: inferErrorStatus(err),
+    toolCalls: [],
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      iterations: 0,
+      durationMs: 0,
+    },
+    diagnostics: null,
+  };
 }
 
 function validateRunInput(input: AgentRunInput) {
@@ -327,7 +490,7 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
-function readStrictTestRunId(input: AgentRunInput): string | undefined {
+function readStrictTestRunIdCandidate(input: AgentRunInput): string | undefined {
   const strictProduction = getRecord(input.context.strategyContext?.strictProduction);
   const authority = getRecord(strictProduction.strictTestAuthority);
   return stringValue(authority.runId);

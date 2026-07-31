@@ -31,7 +31,10 @@ import {
 import {
   assertStrictTestDimensionProductionRuntimePortBindingV1,
   createStrictTestDimensionAgentExecutionReceiptFromPipelineV1,
+  type StrictTestDimensionAgentStageNameV1,
+  type StrictTestDimensionAgentStageSealV1,
   type StrictTestDimensionProductionRuntimePortV1,
+  sealStrictTestDimensionAgentStageResultV1,
 } from '../production/StrictTestDimensionAgentContract.js';
 import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
@@ -51,12 +54,11 @@ interface PipelineRuntime {
 
 /** Result of a single stage execution */
 interface StageResult {
-  reply: string;
-  toolCalls: Array<Record<string, unknown>>;
-  tokenUsage: { input: number; output: number };
-  iterations: number;
-  timedOut?: boolean;
-  [key: string]: unknown;
+  readonly reply: string;
+  readonly toolCalls: readonly Record<string, unknown>[];
+  readonly tokenUsage: Readonly<{ input: number; output: number }>;
+  readonly iterations: number;
+  readonly timedOut?: boolean;
 }
 
 /** Budget configuration for a pipeline stage */
@@ -92,7 +94,7 @@ interface GateConfig {
   minEvidenceLength?: number;
   minFileRefs?: number;
   minToolCalls?: number;
-  custom?: (source: Record<string, unknown>) => { pass: boolean; reason?: string };
+  custom?: (source: StageResult) => { pass: boolean; reason?: string };
   /** 严格链非通过时的 Core typed return 所需 owner/resume 边界。 */
   strictGate?: {
     gate: 'G1' | 'ADMISSION' | 'G2' | 'G3' | 'G4' | 'DURABLE' | 'PUBLIC';
@@ -143,6 +145,8 @@ interface PipelineStage {
 /** Pipeline execution context (internal mutable state passed between stages) */
 interface PipelineContext {
   phaseResults: Record<string, unknown>;
+  /** strict-test stage 输出在任何 gate 可见之前形成的私有 canonical seals。 */
+  strictStageSeals: Map<StrictTestDimensionAgentStageNameV1, StrictTestDimensionAgentStageSealV1>;
   strategyContext: Record<string, unknown>;
   totalToolCalls: Array<Record<string, unknown>>;
   totalTokenUsage: { input: number; output: number };
@@ -310,6 +314,7 @@ export class PipelineStrategy extends Strategy {
     );
     const ctx: PipelineContext = {
       phaseResults: {} as Record<string, unknown>,
+      strictStageSeals: new Map(),
       strategyContext: {
         ...incomingStrategyContext,
         ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
@@ -402,6 +407,7 @@ export class PipelineStrategy extends Strategy {
           runtimeId: runtime.id,
           authority: strictTestPort.strictTestAuthority,
           phases: ctx.phaseResults,
+          stageSeals: this.#strictStageSealsForReceipt(ctx),
         })
       : null;
     if (strictTestExecutionReceipt) {
@@ -706,16 +712,19 @@ export class PipelineStrategy extends Strategy {
       return { action: 'pass', pass: true };
     }
     const sourceName = (stage.source || this.#prevStageName(stage)) as string;
-    const source = phaseResults[sourceName];
 
     if (typeof gate.evaluator === 'function') {
       this.#ensureGateActiveContext(stage, strategyContext, phaseResults, bus, ctx.diagnostics);
+      const evaluatorPhaseResults = this.#strictTestRuntimePort(ctx)
+        ? this.#strictGatePhaseView(ctx)
+        : phaseResults;
+      const source = evaluatorPhaseResults[sourceName];
       const gateSource = gate.useCumulativeToolCalls
         ? this.#withCumulativeToolCalls(source, ctx)
         : source;
       const evaluated = (await gate.evaluator(
         gateSource,
-        phaseResults,
+        evaluatorPhaseResults,
         strategyContext
       )) as GateEvalResult;
       return {
@@ -1131,6 +1140,27 @@ export class PipelineStrategy extends Strategy {
         stageResult.toolCalls || [],
         strictContext?.factQueryObligationIds || []
       );
+      const strictTestPort = this.#strictTestRuntimePort(ctx);
+      if (strictTestPort) {
+        if (stage.name !== 'analyze' && stage.name !== 'produce') {
+          throw new Error(`STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_NAME_INVALID:${stage.name}`);
+        }
+        const stageSeal = sealStrictTestDimensionAgentStageResultV1({
+          authority: strictTestPort.strictTestAuthority,
+          stageName: stage.name,
+          stageResult,
+        });
+        ctx.strictStageSeals.set(stage.name, stageSeal);
+        stageResult = stageSeal.stageResult;
+        _pipelineLogger().info('[PipelineStrategy] strict-test stage result sealed', {
+          runId: stageSeal.runId,
+          authorityHash: stageSeal.authorityHash,
+          selectedCellSetHash: stageSeal.selectedCellSetHash,
+          stage: stageSeal.stageName,
+          stageResultHash: stageSeal.stageResultHash,
+          stageSealHash: stageSeal.stageSealHash,
+        });
+      }
     }
 
     // 累计结果
@@ -1293,6 +1323,26 @@ export class PipelineStrategy extends Strategy {
     }
     assertStrictTestDimensionProductionRuntimePortBindingV1(candidate);
     return candidate;
+  }
+
+  /** gate 只收到 phase map 的冻结视图，不能替换真实 stage snapshot。 */
+  #strictGatePhaseView(ctx: PipelineContext): Readonly<Record<string, unknown>> {
+    const phaseView: Record<string, unknown> = { ...ctx.phaseResults };
+    for (const [stageName, stageSeal] of ctx.strictStageSeals) {
+      phaseView[stageName] = stageSeal.stageResult;
+    }
+    return Object.freeze(phaseView);
+  }
+
+  #strictStageSealsForReceipt(
+    ctx: PipelineContext
+  ): readonly StrictTestDimensionAgentStageSealV1[] {
+    const analyze = ctx.strictStageSeals.get('analyze');
+    const produce = ctx.strictStageSeals.get('produce');
+    if (!analyze || !produce) {
+      throw new Error('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_SET_INVALID');
+    }
+    return [analyze, produce];
   }
 
   #validateStrictRoleRoute(stage: PipelineStage, ctx: PipelineContext): void {
