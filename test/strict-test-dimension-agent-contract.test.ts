@@ -32,15 +32,22 @@ import {
   assertStrictTestDimensionProductionRuntimePortBindingV1,
   bindStrictTestDimensionProductionRuntimePortV1,
   createStrictTestDimensionAgentAuthorityV1,
+  createStrictTestDimensionAgentCellAnalysisEvidenceV1,
+  createStrictTestDimensionAgentCellStageEvidenceV1,
   createStrictTestDimensionAgentExecutionReceiptV1,
+  createStrictTestDimensionAgentPipelineExecutionV1,
 } from '../src/agent/production/StrictTestDimensionAgentContract.js';
 import type {
   AgentRuntimeLike,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
-import { STRICT_SOURCE_REVISION } from './fixtures/strict-semantic-authority.js';
+import {
+  createExecutionReceipt,
+  STRICT_SOURCE_REVISION,
+} from './fixtures/strict-semantic-authority.js';
 import {
   createStrictTestDurableReviewEvidence,
   type PreparedStrictTestDurableEvidence,
@@ -175,10 +182,197 @@ function strictRuntimePort(
   };
 }
 
-function agentService(modelCalls: string[]) {
+type SameRunReviewArtifact = ReturnType<typeof createSameRunReviewArtifact>;
+type SameRunAnalysisArtifact = ReturnType<typeof createSameRunAnalysisArtifact>;
+
+function strictSameRunRuntimePort(
+  authority: ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>,
+  executionReceipts: readonly FactQueryExecutionReceiptV1[],
+  mutateReviewArtifact: (artifact: SameRunReviewArtifact) => SameRunReviewArtifact = (artifact) =>
+    artifact,
+  mutateAnalysisArtifact: (artifact: SameRunAnalysisArtifact) => SameRunAnalysisArtifact = (
+    artifact
+  ) => artifact
+) {
+  const base = strictRuntimePort(authority);
+  const factExecution = factExecutionFor(authority, executionReceipts);
+  const analysis = analysisLineageFor(authority, executionReceipts);
+  let analysisStageEvidence: ReturnType<typeof createSameRunAnalysisArtifact> | null = null;
+  return {
+    ...base,
+    buildProducerInput: () => ({
+      analysisFixpointHash: analysis.analysisFixpoint.fixpointHash,
+      producerEligibleHypothesisIds: [],
+      analysisStageEvidenceHash: analysisStageEvidence?.analysisStageEvidenceHash ?? null,
+    }),
+    validateAnalystResult: (
+      source: unknown,
+      observedEpoch: ReturnType<typeof base.readAnalysisEpoch>
+    ) => {
+      analysisStageEvidence = mutateAnalysisArtifact(
+        createSameRunAnalysisArtifact({
+          authority,
+          source,
+          factExecution,
+          analysis,
+          executionReceipts,
+        })
+      );
+      return createStrictAnalysisGateOutcomeV1({
+        action: 'pass',
+        reasonCode: 'strict-analysis-fixpoint-stable',
+        observedEpochHash: observedEpoch.snapshotHash,
+        artifact: analysisStageEvidence,
+      });
+    },
+    reviewProducerResult: (source: unknown) => {
+      if (!analysisStageEvidence) {
+        throw new Error('STRICT_TEST_FIXTURE_ANALYSIS_STAGE_REQUIRED');
+      }
+      return {
+        action: 'pass',
+        pass: true,
+        artifact: mutateReviewArtifact(
+          createSameRunReviewArtifact({
+            authority,
+            source,
+            analysisStageEvidence,
+            executionReceipts,
+          })
+        ),
+      };
+    },
+  };
+}
+
+function createSameRunAnalysisArtifact(input: {
+  authority: ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>;
+  source: unknown;
+  factExecution: ReturnType<typeof factExecutionFor>;
+  analysis: ReturnType<typeof analysisLineageFor>;
+  executionReceipts: readonly FactQueryExecutionReceiptV1[];
+}) {
+  const cells = input.authority.selectedCellIds.map((cellId, index) => {
+    const receipt = executionReceiptForCell(input.executionReceipts, cellId, index);
+    return createStrictTestDimensionAgentCellAnalysisEvidenceV1({
+      cellId,
+      factReceiptHashes: [receipt.receiptHash],
+      analysis: input.analysis,
+    });
+  });
+  const semantic = {
+    kind: 'StrictTestDimensionAgentAnalysisStageEvidenceV1' as const,
+    schemaVersion: 1 as const,
+    runId: input.authority.runId,
+    authorityHash: input.authority.authorityHash,
+    selectedCellIds: input.authority.selectedCellIds,
+    selectedCellSetHash: input.authority.selectedCellSetHash,
+    analystStageResultHash: strictStageResultHash(input.source),
+    factExecution: input.factExecution,
+    analysis: input.analysis,
+    cells,
+  };
+  return { ...semantic, analysisStageEvidenceHash: hashCanonicalJson(semantic) };
+}
+
+function createSameRunReviewArtifact(input: {
+  authority: ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>;
+  source: unknown;
+  analysisStageEvidence: ReturnType<typeof createSameRunAnalysisArtifact>;
+  executionReceipts: readonly FactQueryExecutionReceiptV1[];
+}) {
+  const producerStageResultHash = strictStageResultHash(input.source);
+  const cellDispositions = input.authority.selectedCellIds.map((cellId, index) => {
+    const analysisCell = requiredTestRow(
+      input.analysisStageEvidence.cells,
+      index,
+      `analysis cell ${cellId}`
+    );
+    const disposition = {
+      cellId,
+      disposition: 'rejected' as const,
+      expressionSetReceipts: [],
+      semanticReviewAttestations: [],
+      dispositionReviewAttestations: [],
+      reasonCode: 'independent-review-rejected',
+      evidenceRefs: [`evidence:${cellId}`],
+    };
+    return {
+      ...disposition,
+      stageEvidence: createStrictTestDimensionAgentCellStageEvidenceV1({
+        authority: input.authority,
+        analysisCellEvidence: analysisCell,
+        producerStageResultHash,
+        disposition,
+      }),
+    };
+  });
+  const semantic = {
+    kind: 'StrictTestDimensionAgentReviewStageEvidenceV1' as const,
+    schemaVersion: 1 as const,
+    runId: input.authority.runId,
+    authorityHash: input.authority.authorityHash,
+    selectedCellIds: input.authority.selectedCellIds,
+    selectedCellSetHash: input.authority.selectedCellSetHash,
+    analysisStageEvidenceHash: input.analysisStageEvidence.analysisStageEvidenceHash,
+    producerStageResultHash,
+    cellDispositions,
+    expectedTrustPolicies: [],
+    completedAt: '2026-07-30T06:04:00.000Z',
+  };
+  return { ...semantic, reviewStageEvidenceHash: hashCanonicalJson(semantic) };
+}
+
+function rehashReviewArtifact(artifact: SameRunReviewArtifact): SameRunReviewArtifact {
+  const { reviewStageEvidenceHash: _reviewStageEvidenceHash, ...semantic } = artifact;
+  return { ...semantic, reviewStageEvidenceHash: hashCanonicalJson(semantic) };
+}
+
+function rehashAnalysisArtifact(
+  artifact: SameRunAnalysisArtifact,
+  cells: SameRunAnalysisArtifact['cells']
+): SameRunAnalysisArtifact {
+  const { analysisStageEvidenceHash: _analysisStageEvidenceHash, ...existing } = artifact;
+  const semantic = { ...existing, cells };
+  return { ...semantic, analysisStageEvidenceHash: hashCanonicalJson(semantic) };
+}
+
+function rehashCellStageEvidence<T extends SameRunReviewArtifact['cellDispositions'][number]>(
+  row: T,
+  patch: Partial<T['stageEvidence']>
+): T['stageEvidence'] {
+  const { cellStageEvidenceHash: _cellStageEvidenceHash, ...existing } = row.stageEvidence;
+  const semantic = { ...existing, ...patch };
+  return { ...semantic, cellStageEvidenceHash: hashCanonicalJson(semantic) };
+}
+
+function strictStageResultHash(value: unknown) {
+  const result = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const tokenUsage = (
+    result.tokenUsage && typeof result.tokenUsage === 'object' ? result.tokenUsage : {}
+  ) as Record<string, unknown>;
+  return hashCanonicalJson({
+    reply: typeof result.reply === 'string' ? result.reply : '',
+    toolCalls: Array.isArray(result.toolCalls) ? result.toolCalls : [],
+    tokenUsage: {
+      input: typeof tokenUsage.input === 'number' ? tokenUsage.input : 0,
+      output: typeof tokenUsage.output === 'number' ? tokenUsage.output : 0,
+    },
+    iterations: typeof result.iterations === 'number' ? result.iterations : 0,
+    timedOut: result.timedOut === true,
+  });
+}
+
+function agentService(
+  modelCalls: string[],
+  chainCalls?: { runtimeBuildCount: number; pipelineExecuteCount: number }
+) {
   return new AgentService({
     runtimeBuilder: {
-      build(profile): AgentRuntimeLike {
+      build(profile, options): AgentRuntimeLike {
+        if (chainCalls) {
+          chainCalls.runtimeBuildCount += 1;
+        }
         const compiled = profile as CompiledAgentProfile;
         const strategyConfig = compiled.runtimeOverrides.strategy as {
           readonly stages: readonly Record<string, unknown>[];
@@ -186,12 +380,16 @@ function agentService(modelCalls: string[]) {
         const strategy = new PipelineStrategy({
           stages: strategyConfig.stages as Record<string, unknown>[],
         });
+        const runtimeId = options?.runId ?? 'strict-test-runtime';
         return {
-          id: 'strict-test-runtime',
-          execute: async (message, options) =>
-            strategy.execute(
+          id: runtimeId,
+          execute: async (message, options) => {
+            if (chainCalls) {
+              chainCalls.pipelineExecuteCount += 1;
+            }
+            return strategy.execute(
               {
-                id: 'strict-test-model',
+                id: runtimeId,
                 reactLoop: async (prompt: string) => {
                   modelCalls.push(prompt);
                   return {
@@ -207,7 +405,8 @@ function agentService(modelCalls: string[]) {
               },
               message,
               options
-            ),
+            );
+          },
         };
       },
     },
@@ -216,9 +415,10 @@ function agentService(modelCalls: string[]) {
 
 function automaticSelectionChain(
   executionReceipts: readonly FactQueryExecutionReceiptV1[] = [],
-  excludedCellIds: readonly string[] = []
+  excludedCellIds: readonly string[] = [],
+  moduleScopeOverrides: Readonly<Record<string, string>> = {}
 ) {
-  const compiledPlan = createCompiledPlan(executionReceipts, excludedCellIds);
+  const compiledPlan = createCompiledPlan(executionReceipts, excludedCellIds, moduleScopeOverrides);
   const currentBindings = createPreflightBindings();
   const preflight = validateStrictTestPreflightV1(compiledPlan, currentBindings);
   const automaticSelection = createStrictTestAutomaticSelectionReceiptV1({
@@ -242,19 +442,111 @@ function automaticSelectionChain(
   return { compiledPlan, currentBindings, preflight, automaticSelection, projection, authority };
 }
 
+type ExecutionReceiptInput = Parameters<typeof createStrictTestDimensionAgentExecutionReceiptV1>[0];
+
+function pipelineExecutionFixture(input: {
+  readonly authority: ExecutionReceiptInput['authority'];
+  readonly factExecution: ExecutionReceiptInput['factExecution'];
+  readonly analysis: NonNullable<ExecutionReceiptInput['analysis']>;
+  readonly cellDispositions: ExecutionReceiptInput['cellDispositions'];
+  readonly expectedTrustPolicies: ExecutionReceiptInput['expectedTrustPolicies'];
+}) {
+  const analystStageResult = {
+    reply: 'fixture analyst result',
+    toolCalls: [],
+    tokenUsage: { input: 1, output: 1 },
+    iterations: 1,
+  };
+  const producerStageResult = {
+    reply: 'fixture producer result',
+    toolCalls: [],
+    tokenUsage: { input: 1, output: 1 },
+    iterations: 1,
+  };
+  const analysisStageEvidence = createSameRunAnalysisArtifact({
+    authority: input.authority,
+    source: analystStageResult,
+    factExecution: input.factExecution,
+    analysis: input.analysis,
+    executionReceipts: input.factExecution.receipts,
+  });
+  const producerStageResultHash = strictStageResultHash(producerStageResult);
+  const cellDispositions = input.cellDispositions.map((disposition, index) => {
+    const analysisCell = requiredTestRow(
+      analysisStageEvidence.cells,
+      index,
+      `pipeline analysis cell ${disposition.cellId}`
+    );
+    return {
+      ...disposition,
+      stageEvidence: createStrictTestDimensionAgentCellStageEvidenceV1({
+        authority: input.authority,
+        analysisCellEvidence: analysisCell,
+        producerStageResultHash,
+        disposition,
+      }),
+    };
+  });
+  const reviewSemantic = {
+    kind: 'StrictTestDimensionAgentReviewStageEvidenceV1' as const,
+    schemaVersion: 1 as const,
+    runId: input.authority.runId,
+    authorityHash: input.authority.authorityHash,
+    selectedCellIds: input.authority.selectedCellIds,
+    selectedCellSetHash: input.authority.selectedCellSetHash,
+    analysisStageEvidenceHash: analysisStageEvidence.analysisStageEvidenceHash,
+    producerStageResultHash,
+    cellDispositions,
+    expectedTrustPolicies: input.expectedTrustPolicies,
+    completedAt: '2026-07-30T06:04:00.000Z',
+  };
+  const reviewStageEvidence = {
+    ...reviewSemantic,
+    reviewStageEvidenceHash: hashCanonicalJson(reviewSemantic),
+  };
+  return createStrictTestDimensionAgentPipelineExecutionV1({
+    authority: input.authority,
+    analystStageResult,
+    analysisStageEvidence,
+    producerStageResult,
+    reviewStageEvidence,
+  });
+}
+
 describe('strict-test automatic-selection Agent contract', () => {
-  it('runs the complete automatically selected multi-module cell set through AgentService', async () => {
-    const chain = automaticSelectionChain();
+  it('binds authority runId through the production AgentRuntimeBuilder', () => {
+    const unusedToolRoute = async () => {
+      throw new Error('STRICT_TEST_BUILDER_PROBE_TOOL_ROUTE_UNUSED');
+    };
+    const runtime = new AgentRuntimeBuilder({
+      container: {},
+      toolRegistry: {
+        getRouter: () => ({
+          execute: unusedToolRoute,
+          executeChildCall: unusedToolRoute,
+          explain: unusedToolRoute,
+        }),
+      },
+      aiProvider: {},
+    }).build({ id: 'chat' }, { runId: 'strict-test-builder-run' });
+
+    expect(runtime.id).toBe('strict-test-builder-run');
+  });
+
+  it('returns one same-run canonical receipt from the existing multi-module AgentService chain', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
     const modelCalls: string[] = [];
+    const chainCalls = { runtimeBuildCount: 0, pipelineExecuteCount: 0 };
     const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
       authority: chain.authority,
-      runtimePort: strictRuntimePort(chain.authority),
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts),
       eligibleCells: chain.authority.selectedCellIds.map((cellId) => {
         const [moduleId, dimensionId] = cellId.split('::');
         return { cellId, moduleId: moduleId ?? '', dimensionId: dimensionId ?? '' };
       }),
     });
-    const result = await agentService(modelCalls).run({
+    const result = await agentService(modelCalls, chainCalls).run({
       profile: { id: 'generate-dimension' },
       params: { needsCandidates: true },
       message: {
@@ -268,6 +560,8 @@ describe('strict-test automatic-selection Agent contract', () => {
     });
 
     expect(result.status).toBe('success');
+    expect(result.runId).toBe(chain.authority.runId);
+    expect(chainCalls).toEqual({ runtimeBuildCount: 1, pipelineExecuteCount: 1 });
     expect(modelCalls).toHaveLength(2);
     expect(chain.authority.selectedDimensionId).toBe('architecture');
     expect(chain.authority.selectedCellIds).toEqual([
@@ -280,6 +574,246 @@ describe('strict-test automatic-selection Agent contract', () => {
     expect(chain.authority.publicRouteChanged).toBe(false);
     expect(modelCalls.every((prompt) => prompt.includes(chain.authority.authorityHash))).toBe(true);
     expect(modelCalls.every((prompt) => prompt.includes('module-b::architecture'))).toBe(true);
+    expect(Object.keys(result.phases ?? {})).toEqual([
+      '_strictRoleRouteReceipt',
+      'analyze',
+      'analyst_fixpoint_gate',
+      '_strictAnalysisLoopReceipt',
+      '_strictGateReturns',
+      'produce',
+      'independent_review_gate',
+      '_pipelineOutcome',
+    ]);
+    expect(result.phases?._strictRoleRouteReceipt).toEqual({
+      kind: 'StrictRoleRouteReceiptV1',
+      strictAnalystCalls: 1,
+      strictProducerCalls: 1,
+      legacyAnalystCalls: 0,
+      legacyProducerCalls: 0,
+    });
+
+    const receipt = (
+      result as typeof result & {
+        readonly strictTestExecutionReceipt?: ReturnType<
+          typeof createStrictTestDimensionAgentExecutionReceiptV1
+        >;
+      }
+    ).strictTestExecutionReceipt;
+    expect(receipt).toBeDefined();
+    expect(receipt).toMatchObject({
+      runId: result.runId,
+      authorityHash: chain.authority.authorityHash,
+      selectedCellIds: chain.authority.selectedCellIds,
+      selectedCellSetHash: chain.authority.selectedCellSetHash,
+      attemptedCount: 2,
+      rejectedCount: 2,
+      segmentStatus: 'completed',
+    });
+    const analyze = result.phases?.analyze as Record<string, unknown>;
+    const analysisGate = result.phases?.analyst_fixpoint_gate as {
+      artifact?: { resultArtifact?: { analysisStageEvidenceHash?: string } };
+    };
+    const produce = result.phases?.produce as Record<string, unknown>;
+    const reviewGate = result.phases?.independent_review_gate as {
+      artifact?: {
+        reviewStageEvidenceHash?: string;
+        cellDispositions?: SameRunReviewArtifact['cellDispositions'];
+      };
+    };
+    expect(receipt?.pipelineExecution).toMatchObject({
+      kind: 'StrictTestDimensionAgentPipelineExecutionV1',
+      runId: result.runId,
+      authorityHash: chain.authority.authorityHash,
+      selectedCellSetHash: chain.authority.selectedCellSetHash,
+      analysisStageEvidence: {
+        analystStageResultHash: strictStageResultHash(analyze),
+        analysisStageEvidenceHash: analysisGate.artifact?.resultArtifact?.analysisStageEvidenceHash,
+      },
+      reviewStageEvidence: {
+        producerStageResultHash: strictStageResultHash(produce),
+        reviewStageEvidenceHash: reviewGate.artifact?.reviewStageEvidenceHash,
+        cellDispositions: reviewGate.artifact?.cellDispositions,
+      },
+    });
+  });
+
+  it.each([
+    {
+      name: 'missing terminal cell',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) =>
+        rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: artifact.cellDispositions.slice(0, 1),
+        }),
+    },
+    {
+      name: 'extra unselected terminal cell',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) => {
+        const first = requiredTestRow(artifact.cellDispositions, 0, 'extra terminal cell');
+        return rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: [
+            ...artifact.cellDispositions,
+            {
+              ...first,
+              cellId: 'module-a::api-protocol',
+              stageEvidence: rehashCellStageEvidence(first, {
+                cellId: 'module-a::api-protocol',
+              }),
+            },
+          ],
+        });
+      },
+    },
+    {
+      name: 'duplicate terminal cell',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) => {
+        const first = requiredTestRow(artifact.cellDispositions, 0, 'duplicate terminal cell');
+        return rehashReviewArtifact({ ...artifact, cellDispositions: [first, first] });
+      },
+    },
+    {
+      name: 'reordered terminal cells',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) =>
+        rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: [...artifact.cellDispositions].reverse(),
+        }),
+    },
+    {
+      name: 'cross-run terminal artifact',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_STAGE_LINEAGE_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) =>
+        rehashReviewArtifact({ ...artifact, runId: 'another-run' }),
+    },
+    {
+      name: 'unselected terminal cell replacement',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) => {
+        const first = requiredTestRow(artifact.cellDispositions, 0, 'selected terminal cell');
+        const second = requiredTestRow(artifact.cellDispositions, 1, 'unselected replacement');
+        return rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: [
+            first,
+            {
+              ...second,
+              cellId: 'module-b::api-protocol',
+              stageEvidence: rehashCellStageEvidence(second, {
+                cellId: 'module-b::api-protocol',
+              }),
+            },
+          ],
+        });
+      },
+    },
+    {
+      name: 'cross-cell stage evidence swap',
+      expectedError: 'STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_LINEAGE_MISMATCH',
+      mutate: (artifact: SameRunReviewArtifact) => {
+        const first = requiredTestRow(artifact.cellDispositions, 0, 'first stage evidence');
+        const second = requiredTestRow(artifact.cellDispositions, 1, 'second stage evidence');
+        return rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: [
+            { ...first, stageEvidence: second.stageEvidence },
+            { ...second, stageEvidence: first.stageEvidence },
+          ],
+        });
+      },
+    },
+  ])('rejects $name before terminal success', async ({ mutate, expectedError }) => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const modelCalls: string[] = [];
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts, mutate),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+
+    const result = await runStrictAgent(modelCalls, runtimePort);
+
+    expect(modelCalls).toHaveLength(2);
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe(expectedError);
+    expect(
+      (
+        result as typeof result & {
+          readonly strictTestExecutionReceipt?: unknown;
+        }
+      ).strictTestExecutionReceipt
+    ).toBeUndefined();
+  });
+
+  it('rejects coherently rehashed arbitrary per-cell producer and review evidence', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const modelCalls: string[] = [];
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(chain.authority, executionReceipts, (artifact) =>
+        rehashReviewArtifact({
+          ...artifact,
+          cellDispositions: artifact.cellDispositions.map((row) => {
+            const stageEvidence = rehashCellStageEvidence(row, {
+              producerEvidenceHash: sha(`arbitrary-producer:${row.cellId}`),
+              reviewEvidenceHash: sha(`arbitrary-review:${row.cellId}`),
+            });
+            return { ...row, stageEvidence };
+          }),
+        })
+      ),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+
+    const result = await runStrictAgent(modelCalls, runtimePort);
+
+    expect(modelCalls).toHaveLength(2);
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_OUTPUT_MISMATCH');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
+  });
+
+  it('rejects a coherently rehashed cross-cell fact assignment', async () => {
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const modelCalls: string[] = [];
+    const runtimePort = bindStrictTestDimensionProductionRuntimePortV1({
+      authority: chain.authority,
+      runtimePort: strictSameRunRuntimePort(
+        chain.authority,
+        executionReceipts,
+        (artifact) => artifact,
+        (artifact) => {
+          const reversed = [...artifact.cells].reverse();
+          const cells = artifact.cells.map((row, index) =>
+            createStrictTestDimensionAgentCellAnalysisEvidenceV1({
+              cellId: row.cellId,
+              factReceiptHashes: requiredTestRow(
+                reversed,
+                index,
+                `coherent cross-cell fact assignment ${row.cellId}`
+              ).factReceiptHashes,
+              analysis: artifact.analysis,
+            })
+          );
+          return rehashAnalysisArtifact(artifact, cells);
+        }
+      ),
+      eligibleCells: runtimeCells(chain.authority),
+    });
+
+    const result = await runStrictAgent(modelCalls, runtimePort);
+
+    expect(modelCalls).toHaveLength(2);
+    expect(result.status).toBe('error');
+    expect(result.reply).toBe('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACT_SCOPE_MISMATCH');
+    expect(result.strictTestExecutionReceipt).toBeUndefined();
   });
 
   it('rejects a forged automatic-selection authority before the first model call', async () => {
@@ -529,9 +1063,10 @@ describe('strict-test automatic-selection Agent contract', () => {
   });
 
   it('derives completed, partial, and failed receipt counts without caller-supplied status', () => {
-    const chain = automaticSelectionChain();
-    const factExecution = emptyFactExecution(chain.authority);
-    const analysis = emptyAnalysisLineage(chain.authority);
+    const executionReceipts = sameRunExecutionReceipts();
+    const chain = automaticSelectionChain(executionReceipts);
+    const factExecution = factExecutionFor(chain.authority, executionReceipts);
+    const analysis = analysisLineageFor(chain.authority, executionReceipts);
     const rejectedRows = chain.authority.selectedCellIds.map((cellId, index) => ({
       cellId,
       disposition: 'rejected' as const,
@@ -541,10 +1076,28 @@ describe('strict-test automatic-selection Agent contract', () => {
       reasonCode: `g2-rejected-${index + 1}`,
       evidenceRefs: [`evidence:${cellId}`],
     }));
+    expect(() =>
+      createStrictTestDimensionAgentExecutionReceiptV1({
+        authority: chain.authority,
+        factExecution,
+        analysis,
+        pipelineExecution: null,
+        cellDispositions: rejectedRows,
+        expectedTrustPolicies: [],
+        completedAt: '2026-07-30T06:03:00.000Z',
+      })
+    ).toThrow(/COMPLETED_STAGE_RECEIPTS_REQUIRED/u);
     const completed = createStrictTestDimensionAgentExecutionReceiptV1({
       authority: chain.authority,
       factExecution,
       analysis,
+      pipelineExecution: pipelineExecutionFixture({
+        authority: chain.authority,
+        factExecution,
+        analysis,
+        cellDispositions: rejectedRows,
+        expectedTrustPolicies: [],
+      }),
       cellDispositions: rejectedRows,
       expectedTrustPolicies: [],
       completedAt: '2026-07-30T06:03:00.000Z',
@@ -565,6 +1118,7 @@ describe('strict-test automatic-selection Agent contract', () => {
       authority: chain.authority,
       factExecution,
       analysis: null,
+      pipelineExecution: null,
       cellDispositions: [
         requiredTestRow(rejectedRows, 0, 'partial rejected row'),
         {
@@ -586,6 +1140,7 @@ describe('strict-test automatic-selection Agent contract', () => {
       authority: chain.authority,
       factExecution,
       analysis: null,
+      pipelineExecution: null,
       cellDispositions: rejectedRows.map((row) => ({
         ...row,
         disposition: 'failed' as const,
@@ -605,6 +1160,7 @@ describe('strict-test automatic-selection Agent contract', () => {
         authority: chain.authority,
         factExecution,
         analysis: emptyAnalysisLineage(chain.authority),
+        pipelineExecution: null,
         cellDispositions: chain.authority.selectedCellIds.map((cellId) => ({
           cellId,
           disposition: 'accepted' as const,
@@ -623,6 +1179,7 @@ describe('strict-test automatic-selection Agent contract', () => {
       authority: chain.authority,
       factExecution,
       analysis: null,
+      pipelineExecution: null,
       cellDispositions: chain.authority.selectedCellIds.map((cellId) => ({
         cellId,
         disposition: 'failed' as const,
@@ -645,27 +1202,38 @@ describe('strict-test automatic-selection Agent contract', () => {
     try {
       const chain = automaticSelectionChain(
         [prepared.executionReceipt],
-        ['module-b::architecture']
+        ['module-b::architecture'],
+        { 'module-a': prepared.executionReceipt.canonicalSubjectRef }
       );
       const durable = await createStrictTestDurableReviewEvidence(prepared, chain.authority);
       if (!durable.expressionSet) {
         throw new Error('STRICT_TEST_ACCEPTED_EXPRESSION_FIXTURE_REQUIRED');
       }
+      const factExecution = durableFactExecution(prepared, chain.authority);
+      const analysis = durableAnalysisLineage(chain.authority, durable);
+      const cellDispositions = [
+        {
+          cellId: 'module-a::architecture',
+          disposition: 'accepted' as const,
+          expressionSetReceipts: [durable.expressionSet],
+          semanticReviewAttestations: [durable.attestation],
+          dispositionReviewAttestations: [],
+          reasonCode: null,
+          evidenceRefs: [prepared.evidenceEntry.id],
+        },
+      ];
       const receipt = createStrictTestDimensionAgentExecutionReceiptV1({
         authority: chain.authority,
-        factExecution: durableFactExecution(prepared, chain.authority),
-        analysis: durableAnalysisLineage(chain.authority, durable),
-        cellDispositions: [
-          {
-            cellId: 'module-a::architecture',
-            disposition: 'accepted',
-            expressionSetReceipts: [durable.expressionSet],
-            semanticReviewAttestations: [durable.attestation],
-            dispositionReviewAttestations: [],
-            reasonCode: null,
-            evidenceRefs: [prepared.evidenceEntry.id],
-          },
-        ],
+        factExecution,
+        analysis,
+        pipelineExecution: pipelineExecutionFixture({
+          authority: chain.authority,
+          factExecution,
+          analysis,
+          cellDispositions,
+          expectedTrustPolicies: [durable.trustPolicy],
+        }),
+        cellDispositions,
         expectedTrustPolicies: [durable.trustPolicy],
         completedAt: '2026-07-30T06:04:00.000Z',
       });
@@ -695,24 +1263,35 @@ describe('strict-test automatic-selection Agent contract', () => {
     try {
       const chain = automaticSelectionChain(
         [prepared.executionReceipt],
-        ['module-b::architecture']
+        ['module-b::architecture'],
+        { 'module-a': prepared.executionReceipt.canonicalSubjectRef }
       );
       const durable = await createStrictTestDurableReviewEvidence(prepared, chain.authority);
+      const factExecution = durableFactExecution(prepared, chain.authority);
+      const analysis = durableAnalysisLineage(chain.authority, durable);
+      const cellDispositions = [
+        {
+          cellId: 'module-a::architecture',
+          disposition: 'investigated-empty' as const,
+          expressionSetReceipts: [],
+          semanticReviewAttestations: [],
+          dispositionReviewAttestations: [durable.attestation],
+          reasonCode: null,
+          evidenceRefs: [prepared.evidenceEntry.id],
+        },
+      ];
       const receipt = createStrictTestDimensionAgentExecutionReceiptV1({
         authority: chain.authority,
-        factExecution: durableFactExecution(prepared, chain.authority),
-        analysis: durableAnalysisLineage(chain.authority, durable),
-        cellDispositions: [
-          {
-            cellId: 'module-a::architecture',
-            disposition: 'investigated-empty',
-            expressionSetReceipts: [],
-            semanticReviewAttestations: [],
-            dispositionReviewAttestations: [durable.attestation],
-            reasonCode: null,
-            evidenceRefs: [prepared.evidenceEntry.id],
-          },
-        ],
+        factExecution,
+        analysis,
+        pipelineExecution: pipelineExecutionFixture({
+          authority: chain.authority,
+          factExecution,
+          analysis,
+          cellDispositions,
+          expectedTrustPolicies: [durable.trustPolicy],
+        }),
+        cellDispositions,
         expectedTrustPolicies: [durable.trustPolicy],
         completedAt: '2026-07-30T06:04:00.000Z',
       });
@@ -764,6 +1343,122 @@ function rehashAuthority(
     ...semantic,
     authorityHash: hashCanonicalJson(semantic),
   } as unknown as ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>;
+}
+
+function sameRunExecutionReceipts(): readonly FactQueryExecutionReceiptV1[] {
+  return ['module-a', 'module-b']
+    .map((moduleId) =>
+      createExecutionReceipt({
+        name: `strict-test-${moduleId}`,
+        emittedFactIds: [],
+        canonicalSubjectRef: `repo:${moduleId}`,
+        disposition: 'inspected-no-pattern',
+        relativePath: `src/${moduleId}/index.ts`,
+        blobHash: sha(`blob:${moduleId}`),
+        evidenceEntryId: `evidence:${moduleId}:fact`,
+        projectContextRefId: `file:repo:src/${moduleId}/index.ts`,
+        witnessBindingHash: sha(`witness:${moduleId}`),
+        harvestKey: sha(`harvest-key:${moduleId}`),
+        harvestReceiptHash: sha(`harvest-receipt:${moduleId}`),
+      })
+    )
+    .sort((left, right) => left.obligationId.localeCompare(right.obligationId));
+}
+
+function executionReceiptForCell(
+  receipts: readonly FactQueryExecutionReceiptV1[],
+  cellId: string,
+  expectedIndex?: number
+): FactQueryExecutionReceiptV1 {
+  const moduleId = cellId.split('::')[0];
+  const receipt = receipts.find((candidate) =>
+    candidate.fileExecutions.some((row) => row.relativePath.includes(`/${moduleId}/`))
+  );
+  if (receipt) {
+    return receipt;
+  }
+  if (expectedIndex !== undefined && receipts.length > expectedIndex) {
+    return requiredTestRow(receipts, expectedIndex, `fallback fact receipt ${cellId}`);
+  }
+  throw new Error(`STRICT_TEST_FIXTURE_CELL_FACT_RECEIPT_REQUIRED:${cellId}`);
+}
+
+function factExecutionFor(
+  authority: ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>,
+  receipts: readonly FactQueryExecutionReceiptV1[]
+) {
+  const terminalReceiptIds = receipts.map((receipt) => receipt.terminalReceiptId);
+  const terminalReceiptHashes = receipts.map((receipt) => receipt.receiptHash);
+  const harvestReceiptHashes = [
+    ...new Set(receipts.map((receipt) => receipt.harvestReceiptHash)),
+  ].sort();
+  const denominatorHashes = [...new Set(receipts.map((receipt) => receipt.denominatorHash))].sort();
+  const manifestSemantic = {
+    schemaVersion: 1 as const,
+    sourceArtifactId: 'artifact:strict-test-same-run',
+    sourceRevisionVectorHash: authority.sourceRevisionVectorHash,
+    factQueryCatalogHash: authority.fullFactQueryCatalogHash,
+    factHarvestScheduleHash: authority.compiledPlan.schedule.factHarvestScheduleHash,
+    backendRegistryHash: sha('same-run-backend-registry'),
+    obligationCount: receipts.length,
+    terminalReceiptIds,
+    terminalReceiptHashes,
+    terminalReceiptSetHash: hashCanonicalJson(terminalReceiptHashes),
+    harvestReceiptHashes,
+    harvestCount: harvestReceiptHashes.length,
+    denominatorHashes,
+    witnessBindingSetHash: hashCanonicalJson(
+      receipts.map((receipt) => receipt.witnessBindingHash).sort()
+    ),
+    factIds: [] as string[],
+    factCount: 0,
+    unexecutableCatalogFamilyIds: [] as string[],
+    unregisteredBackendFamilyIds: [] as string[],
+    failedObligationIds: [] as string[],
+    unknownObligationIds: [] as string[],
+    verdict: 'passed' as const,
+  };
+  return {
+    facts: [],
+    receipts,
+    manifest: {
+      ...manifestSemantic,
+      manifestHash: hashCanonicalJson(manifestSemantic),
+    },
+  };
+}
+
+function analysisLineageFor(
+  authority: ReturnType<typeof createStrictTestDimensionAgentAuthorityV1>,
+  receipts: readonly FactQueryExecutionReceiptV1[]
+) {
+  const baselineObligationIds = authority.compiledPlan.schedule.factHarvestObligations.map(
+    (row) => row.obligationId
+  );
+  const finalExpandedSchedule = createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash: authority.fullBaselineScheduleHash,
+    baselineObligationIds,
+    expansionReceipts: [],
+  });
+  return {
+    baselineObligationIds,
+    expansionReceipts: [],
+    finalExpandedSchedule,
+    finalFactSchedule: authority.compiledPlan.schedule,
+    analysisFixpoint: createAnalysisFixpointReceiptV1({
+      finalExpandedSchedule,
+      terminalObligations: receipts.map((receipt) => ({
+        obligationId: receipt.obligationId,
+        disposition: receipt.disposition,
+        terminalReceiptId: receipt.terminalReceiptId,
+      })),
+      populationHashes: [],
+      clusterSets: [],
+      inductionReceiptHashes: [],
+      falsificationReceiptHashes: [],
+    }),
+    clusterSets: [],
+  };
 }
 
 function emptyFactExecution(
@@ -892,7 +1587,8 @@ function requiredTestRow<T>(rows: readonly T[], index: number, label: string): T
 
 function createCompiledPlan(
   executionReceipts: readonly FactQueryExecutionReceiptV1[] = [],
-  excludedCellIds: readonly string[] = []
+  excludedCellIds: readonly string[] = [],
+  moduleScopeOverrides: Readonly<Record<string, string>> = {}
 ): CompiledColdStartPlanV2 {
   const catalog = buildDimensionCatalogSnapshot();
   const anatomy = buildAnatomyLensCatalogSnapshot();
@@ -901,7 +1597,7 @@ function createCompiledPlan(
     anatomy,
     FACT_QUERY_CATALOG
   );
-  const cells = fixtureCells(catalog, excludedCellIds);
+  const cells = fixtureCells(catalog, excludedCellIds, moduleScopeOverrides);
   const eligible = cells.filter((cell) => cell.status === 'eligible');
   const excluded = cells.filter((cell) => cell.status === 'excluded');
   const universe = {
@@ -1003,7 +1699,8 @@ function createCompiledPlan(
 
 function fixtureCells(
   catalog: DimensionCatalogSnapshotV1,
-  excludedCellIds: readonly string[]
+  excludedCellIds: readonly string[],
+  moduleScopeOverrides: Readonly<Record<string, string>> = {}
 ): PlanCellV1[] {
   const excluded = new Set(excludedCellIds);
   return MODULES.flatMap((module) =>
@@ -1013,7 +1710,7 @@ function fixtureCells(
       return {
         cellId,
         moduleId: module.moduleId,
-        scopeId: module.scopeId,
+        scopeId: moduleScopeOverrides[module.moduleId] ?? module.scopeId,
         dimensionId: dimension.id,
         criticality: 'standard' as const,
         status: isExcluded ? ('excluded' as const) : ('eligible' as const),

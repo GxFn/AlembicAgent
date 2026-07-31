@@ -37,12 +37,16 @@ import {
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
   createStrictTestDimensionAgentAuthorityV1,
+  createStrictTestDimensionAgentCellAnalysisEvidenceV1,
+  createStrictTestDimensionAgentCellStageEvidenceV1,
   createStrictTestDimensionAgentExecutionReceiptV1,
+  createStrictTestDimensionAgentPipelineExecutionV1,
   type DurableSemanticReviewExecuteInputV1,
   type DurableSemanticReviewRuntimeBootstrapV1,
   DurableSemanticReviewRuntimeError,
   type DurableSemanticReviewRuntimeV1,
   type FullAuthoredProjectionV1,
+  hashStrictTestDimensionAgentStageResultV1,
   type ProducerEligibleHypothesisV1,
   type ProductionEvidenceLedgerAuthorityV1,
   type ProductionEvidenceLedgerCoordinatesV1,
@@ -75,10 +79,16 @@ import {
   type StrictProductionGateResultV1,
   type StrictProductionRuntimePortV1,
   type StrictTestDimensionAgentAnalysisLineageV1,
+  type StrictTestDimensionAgentAnalysisStageEvidenceV1,
   type StrictTestDimensionAgentAuthorityV1,
+  type StrictTestDimensionAgentCellAnalysisEvidenceV1,
   type StrictTestDimensionAgentCellDispositionInputV1,
   type StrictTestDimensionAgentCellDispositionV1,
+  type StrictTestDimensionAgentCellStageEvidenceV1,
   type StrictTestDimensionAgentExecutionReceiptV1,
+  type StrictTestDimensionAgentPipelineExecutionV1,
+  type StrictTestDimensionAgentReviewCellDispositionV1,
+  type StrictTestDimensionAgentReviewStageEvidenceV1,
   type StrictTestDimensionAgentTerminalDispositionV1,
   type StrictTestDimensionEligibleCellV1,
   type StrictTestDimensionProductionRuntimePortV1,
@@ -128,10 +138,14 @@ export const strictRuntimeBindings = {
   createStrictProducerLineageReceiptV1,
   createStrictProducerExpressionSetV1,
   createStrictTestDimensionAgentAuthorityV1,
+  createStrictTestDimensionAgentCellAnalysisEvidenceV1,
+  createStrictTestDimensionAgentCellStageEvidenceV1,
   assertStrictTestDimensionAgentAuthorityV1,
   bindStrictTestDimensionProductionRuntimePortV1,
   assertStrictTestDimensionProductionRuntimePortBindingV1,
   createStrictTestDimensionAgentExecutionReceiptV1,
+  createStrictTestDimensionAgentPipelineExecutionV1,
+  hashStrictTestDimensionAgentStageResultV1,
   assertStrictTestDimensionAgentExecutionReceiptV1,
   createProductionEvidenceLedgerAuthority,
   createFrozenEvidenceProjection,
@@ -178,9 +192,15 @@ export interface StrictFacadeConsumerTypes {
   readonly strictTestCell: StrictTestDimensionEligibleCellV1;
   readonly strictTestRuntimePort: StrictTestDimensionProductionRuntimePortV1;
   readonly strictTestAnalysis: StrictTestDimensionAgentAnalysisLineageV1;
+  readonly strictTestAnalysisCellEvidence: StrictTestDimensionAgentCellAnalysisEvidenceV1;
+  readonly strictTestAnalysisStageEvidence: StrictTestDimensionAgentAnalysisStageEvidenceV1;
   readonly strictTestDisposition: StrictTestDimensionAgentTerminalDispositionV1;
   readonly strictTestCellInput: StrictTestDimensionAgentCellDispositionInputV1;
   readonly strictTestCellReceipt: StrictTestDimensionAgentCellDispositionV1;
+  readonly strictTestCellStageEvidence: StrictTestDimensionAgentCellStageEvidenceV1;
+  readonly strictTestReviewCell: StrictTestDimensionAgentReviewCellDispositionV1;
+  readonly strictTestReviewStageEvidence: StrictTestDimensionAgentReviewStageEvidenceV1;
+  readonly strictTestPipelineExecution: StrictTestDimensionAgentPipelineExecutionV1;
   readonly strictTestExecutionInput: CreateStrictTestDimensionAgentExecutionReceiptInputV1;
   readonly strictTestExecutionReceipt: StrictTestDimensionAgentExecutionReceiptV1;
   readonly frozenEvidenceEntry: FrozenEvidenceEntryV1;

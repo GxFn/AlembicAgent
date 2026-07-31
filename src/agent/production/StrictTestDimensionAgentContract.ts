@@ -105,6 +105,7 @@ const EXECUTION_RECEIPT_INPUT_KEYS = [
   'completedAt',
   'expectedTrustPolicies',
   'factExecution',
+  'pipelineExecution',
 ] as const;
 const ANALYSIS_LINEAGE_KEYS = [
   'analysisFixpoint',
@@ -122,6 +123,76 @@ const CELL_DISPOSITION_INPUT_KEYS = [
   'expressionSetReceipts',
   'reasonCode',
   'semanticReviewAttestations',
+] as const;
+const CELL_ANALYSIS_EVIDENCE_KEYS = [
+  'analysisEvidenceRefs',
+  'cellAnalysisEvidenceHash',
+  'cellId',
+  'factReceiptHashes',
+] as const;
+const ANALYSIS_STAGE_EVIDENCE_KEYS = [
+  'analysis',
+  'analysisStageEvidenceHash',
+  'analystStageResultHash',
+  'authorityHash',
+  'cells',
+  'factExecution',
+  'kind',
+  'runId',
+  'schemaVersion',
+  'selectedCellIds',
+  'selectedCellSetHash',
+] as const;
+const CELL_STAGE_EVIDENCE_KEYS = [
+  'analysisCellEvidenceHash',
+  'authorityHash',
+  'cellId',
+  'cellStageEvidenceHash',
+  'factReceiptHashes',
+  'producerEvidenceHash',
+  'reviewEvidenceHash',
+  'runId',
+  'selectedCellSetHash',
+  'terminalDisposition',
+] as const;
+const REVIEW_CELL_DISPOSITION_KEYS = [...CELL_DISPOSITION_INPUT_KEYS, 'stageEvidence'] as const;
+const REVIEW_STAGE_EVIDENCE_KEYS = [
+  'analysisStageEvidenceHash',
+  'authorityHash',
+  'cellDispositions',
+  'completedAt',
+  'expectedTrustPolicies',
+  'kind',
+  'producerStageResultHash',
+  'reviewStageEvidenceHash',
+  'runId',
+  'schemaVersion',
+  'selectedCellIds',
+  'selectedCellSetHash',
+] as const;
+const PIPELINE_EXECUTION_KEYS = [
+  'analysisStageEvidence',
+  'authorityHash',
+  'kind',
+  'pipelineExecutionHash',
+  'reviewStageEvidence',
+  'runId',
+  'schemaVersion',
+  'selectedCellSetHash',
+] as const;
+const PIPELINE_EXECUTION_INPUT_KEYS = [
+  'analysisStageEvidence',
+  'analystStageResult',
+  'authority',
+  'producerStageResult',
+  'reviewStageEvidence',
+] as const;
+const CELL_ANALYSIS_INPUT_KEYS = ['analysis', 'cellId', 'factReceiptHashes'] as const;
+const CELL_STAGE_INPUT_KEYS = [
+  'analysisCellEvidence',
+  'authority',
+  'disposition',
+  'producerStageResultHash',
 ] as const;
 const BASE_RUNTIME_PORT_KEYS = [
   'analysisLimits',
@@ -169,6 +240,7 @@ const EXECUTION_RECEIPT_KEYS = [
   'factExecutionManifestHash',
   'factHarvestScheduleHash',
   'analysis',
+  'pipelineExecution',
   'finalExpandedScheduleHash',
   'analysisFixpointHash',
   'producerExpressionSetReceiptHashes',
@@ -289,6 +361,77 @@ export interface StrictTestDimensionAgentAnalysisLineageV1 {
   readonly clusterSets: readonly KnowledgeClusterSetV1[];
 }
 
+export interface StrictTestDimensionAgentCellAnalysisEvidenceV1 {
+  readonly cellId: string;
+  readonly factReceiptHashes: readonly CanonicalSha256[];
+  readonly analysisEvidenceRefs: readonly string[];
+  readonly cellAnalysisEvidenceHash: CanonicalSha256;
+}
+
+/**
+ * G1 的实际输出证据。它保存 fact/analysis 权威对象，并把每个 selected cell 精确绑定到
+ * 本次 Analyst stage 的规范化结果；PipelineStrategy 只消费该既有 gate artifact，不另跑
+ * 第二条分析链。
+ */
+export interface StrictTestDimensionAgentAnalysisStageEvidenceV1 {
+  readonly kind: 'StrictTestDimensionAgentAnalysisStageEvidenceV1';
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly authorityHash: CanonicalSha256;
+  readonly selectedCellIds: readonly string[];
+  readonly selectedCellSetHash: CanonicalSha256;
+  readonly analystStageResultHash: CanonicalSha256;
+  readonly factExecution: StrictFactScheduleExecutionResultV1;
+  readonly analysis: StrictTestDimensionAgentAnalysisLineageV1;
+  readonly cells: readonly StrictTestDimensionAgentCellAnalysisEvidenceV1[];
+  readonly analysisStageEvidenceHash: CanonicalSha256;
+}
+
+export interface StrictTestDimensionAgentCellStageEvidenceV1 {
+  readonly runId: string;
+  readonly authorityHash: CanonicalSha256;
+  readonly selectedCellSetHash: CanonicalSha256;
+  readonly cellId: string;
+  readonly factReceiptHashes: readonly CanonicalSha256[];
+  readonly analysisCellEvidenceHash: CanonicalSha256;
+  readonly producerEvidenceHash: CanonicalSha256;
+  readonly reviewEvidenceHash: CanonicalSha256;
+  readonly terminalDisposition: StrictTestDimensionAgentTerminalDispositionV1;
+  readonly cellStageEvidenceHash: CanonicalSha256;
+}
+
+export interface StrictTestDimensionAgentReviewCellDispositionV1
+  extends StrictTestDimensionAgentCellDispositionInputV1 {
+  readonly stageEvidence: StrictTestDimensionAgentCellStageEvidenceV1;
+}
+
+/** G2 实际输出证据；cell rows 是唯一允许进入最终 canonical receipt 的终态切片。 */
+export interface StrictTestDimensionAgentReviewStageEvidenceV1 {
+  readonly kind: 'StrictTestDimensionAgentReviewStageEvidenceV1';
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly authorityHash: CanonicalSha256;
+  readonly selectedCellIds: readonly string[];
+  readonly selectedCellSetHash: CanonicalSha256;
+  readonly analysisStageEvidenceHash: CanonicalSha256;
+  readonly producerStageResultHash: CanonicalSha256;
+  readonly cellDispositions: readonly StrictTestDimensionAgentReviewCellDispositionV1[];
+  readonly expectedTrustPolicies: readonly SemanticDispositionReviewTrustPolicyV3[];
+  readonly completedAt: string;
+  readonly reviewStageEvidenceHash: CanonicalSha256;
+}
+
+export interface StrictTestDimensionAgentPipelineExecutionV1 {
+  readonly kind: 'StrictTestDimensionAgentPipelineExecutionV1';
+  readonly schemaVersion: 1;
+  readonly runId: string;
+  readonly authorityHash: CanonicalSha256;
+  readonly selectedCellSetHash: CanonicalSha256;
+  readonly analysisStageEvidence: StrictTestDimensionAgentAnalysisStageEvidenceV1;
+  readonly reviewStageEvidence: StrictTestDimensionAgentReviewStageEvidenceV1;
+  readonly pipelineExecutionHash: CanonicalSha256;
+}
+
 export interface CreateStrictTestDimensionAgentExecutionReceiptInputV1 {
   readonly authority: StrictTestDimensionAgentAuthorityV1;
   readonly factExecution: StrictFactScheduleExecutionResultV1;
@@ -296,6 +439,7 @@ export interface CreateStrictTestDimensionAgentExecutionReceiptInputV1 {
   readonly cellDispositions: readonly StrictTestDimensionAgentCellDispositionInputV1[];
   readonly expectedTrustPolicies: readonly SemanticDispositionReviewTrustPolicyV3[];
   readonly completedAt: string;
+  readonly pipelineExecution: StrictTestDimensionAgentPipelineExecutionV1 | null;
 }
 
 export interface StrictTestDimensionAgentExecutionReceiptV1 {
@@ -329,6 +473,7 @@ export interface StrictTestDimensionAgentExecutionReceiptV1 {
   readonly factExecutionManifestHash: CanonicalSha256;
   readonly factHarvestScheduleHash: CanonicalSha256;
   readonly analysis: StrictTestDimensionAgentAnalysisLineageV1 | null;
+  readonly pipelineExecution: StrictTestDimensionAgentPipelineExecutionV1 | null;
   readonly finalExpandedScheduleHash: CanonicalSha256 | null;
   readonly analysisFixpointHash: CanonicalSha256 | null;
   readonly producerExpressionSetReceiptHashes: readonly string[];
@@ -509,6 +654,14 @@ export function createStrictTestDimensionAgentExecutionReceiptV1(
     input.expectedTrustPolicies,
     input.cellDispositions
   );
+  const pipelineExecution = normalizePipelineExecution(
+    input.authority,
+    input.factExecution,
+    analysis,
+    input.cellDispositions,
+    input.expectedTrustPolicies,
+    input.pipelineExecution
+  );
   const counts = countCellDispositions(cellDispositions);
   const segmentStatus =
     counts.failedCount === 0
@@ -518,7 +671,9 @@ export function createStrictTestDimensionAgentExecutionReceiptV1(
         : ('partial' as const);
   if (
     segmentStatus === 'completed' &&
-    (input.factExecution.manifest.verdict !== 'passed' || analysis === null)
+    (input.factExecution.manifest.verdict !== 'passed' ||
+      analysis === null ||
+      pipelineExecution === null)
   ) {
     fail('STRICT_TEST_DIMENSION_AGENT_COMPLETED_STAGE_RECEIPTS_REQUIRED');
   }
@@ -554,6 +709,7 @@ export function createStrictTestDimensionAgentExecutionReceiptV1(
     factHarvestScheduleHash: input.factExecution.manifest
       .factHarvestScheduleHash as CanonicalSha256,
     analysis,
+    pipelineExecution,
     finalExpandedScheduleHash:
       (analysis?.finalExpandedSchedule.finalExpandedScheduleHash as CanonicalSha256 | undefined) ??
       null,
@@ -606,6 +762,7 @@ export function assertStrictTestDimensionAgentExecutionReceiptV1(
     authority: receipt.authority,
     factExecution: receipt.factExecution,
     analysis: receipt.analysis,
+    pipelineExecution: receipt.pipelineExecution,
     expectedTrustPolicies,
     cellDispositions: receipt.cellDispositions.map((row) => ({
       cellId: row.cellId,
@@ -621,6 +778,514 @@ export function assertStrictTestDimensionAgentExecutionReceiptV1(
   if (canonicalJsonStringify(recreated) !== canonicalJsonStringify(receipt)) {
     fail('STRICT_TEST_DIMENSION_AGENT_EXECUTION_LINEAGE_MISMATCH');
   }
+}
+
+/**
+ * 只哈希 PipelineStrategy 已经取得的真实 stage 结果固定投影。未知 provider 字段不会成为
+ * 语义权威，reply/toolCalls/usage/iteration/timeout 则全部进入同 run 证据。
+ */
+export function hashStrictTestDimensionAgentStageResultV1(value: unknown): CanonicalSha256 {
+  const result = requireRecord(value, 'STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID');
+  const tokenUsage = requireRecord(
+    result.tokenUsage,
+    'STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID'
+  );
+  if (
+    typeof result.reply !== 'string' ||
+    !Array.isArray(result.toolCalls) ||
+    typeof tokenUsage.input !== 'number' ||
+    !Number.isFinite(tokenUsage.input) ||
+    typeof tokenUsage.output !== 'number' ||
+    !Number.isFinite(tokenUsage.output) ||
+    typeof result.iterations !== 'number' ||
+    !Number.isFinite(result.iterations)
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID');
+  }
+  return hashCanonicalJson({
+    reply: result.reply,
+    toolCalls: result.toolCalls,
+    tokenUsage: { input: tokenUsage.input, output: tokenUsage.output },
+    iterations: result.iterations,
+    timedOut: result.timedOut === true,
+  });
+}
+
+/** G1 以实际 terminal fact receipts 与同次 fixpoint 生成唯一 cell 分析证据。 */
+export function createStrictTestDimensionAgentCellAnalysisEvidenceV1(input: {
+  readonly cellId: string;
+  readonly factReceiptHashes: readonly CanonicalSha256[];
+  readonly analysis: StrictTestDimensionAgentAnalysisLineageV1;
+}): StrictTestDimensionAgentCellAnalysisEvidenceV1 {
+  assertExactKeys(
+    input,
+    CELL_ANALYSIS_INPUT_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_INPUT_INVALID'
+  );
+  requireText(input.cellId, 'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_INPUT_INVALID');
+  const factReceiptHashes = normalizeCanonicalHashes(
+    input.factReceiptHashes,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACTS_INVALID'
+  );
+  if (factReceiptHashes.length === 0) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACTS_INVALID');
+  }
+  const semantic = {
+    cellId: input.cellId,
+    factReceiptHashes,
+    analysisEvidenceRefs: analysisEvidenceRefsFor(factReceiptHashes, input.analysis),
+  };
+  return freezeDeep({ ...semantic, cellAnalysisEvidenceHash: hashCanonicalJson(semantic) });
+}
+
+/** G2 cell 终态的 producer/review hashes 由真实 stage hash 与完整 disposition 固定派生。 */
+export function createStrictTestDimensionAgentCellStageEvidenceV1(input: {
+  readonly authority: StrictTestDimensionAgentAuthorityV1;
+  readonly analysisCellEvidence: StrictTestDimensionAgentCellAnalysisEvidenceV1;
+  readonly producerStageResultHash: CanonicalSha256;
+  readonly disposition: StrictTestDimensionAgentCellDispositionInputV1;
+}): StrictTestDimensionAgentCellStageEvidenceV1 {
+  assertExactKeys(
+    input,
+    CELL_STAGE_INPUT_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_INPUT_INVALID'
+  );
+  assertStrictTestDimensionAgentAuthorityV1(input.authority);
+  assertExactKeys(
+    input.analysisCellEvidence,
+    CELL_ANALYSIS_EVIDENCE_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FIELDS_INVALID'
+  );
+  assertExactKeys(
+    input.disposition,
+    CELL_DISPOSITION_INPUT_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_CELL_FIELDS_INVALID'
+  );
+  requireSha256(
+    input.producerStageResultHash,
+    'STRICT_TEST_DIMENSION_AGENT_PRODUCER_STAGE_HASH_INVALID'
+  );
+  if (
+    input.disposition.cellId !== input.analysisCellEvidence.cellId ||
+    !input.authority.selectedCellIds.includes(input.disposition.cellId)
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_LINEAGE_MISMATCH');
+  }
+  const analysisSemantic = {
+    cellId: input.analysisCellEvidence.cellId,
+    factReceiptHashes: input.analysisCellEvidence.factReceiptHashes,
+    analysisEvidenceRefs: input.analysisCellEvidence.analysisEvidenceRefs,
+  };
+  if (hashCanonicalJson(analysisSemantic) !== input.analysisCellEvidence.cellAnalysisEvidenceHash) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_HASH_MISMATCH');
+  }
+  const producerEvidenceHash = producerCellEvidenceHash(
+    input.authority,
+    input.analysisCellEvidence,
+    input.producerStageResultHash,
+    input.disposition
+  );
+  const reviewEvidenceHash = reviewCellEvidenceHash(
+    input.authority,
+    input.disposition,
+    producerEvidenceHash
+  );
+  const semantic = {
+    runId: input.authority.runId,
+    authorityHash: input.authority.authorityHash,
+    selectedCellSetHash: input.authority.selectedCellSetHash,
+    cellId: input.disposition.cellId,
+    factReceiptHashes: input.analysisCellEvidence.factReceiptHashes,
+    analysisCellEvidenceHash: input.analysisCellEvidence.cellAnalysisEvidenceHash,
+    producerEvidenceHash,
+    reviewEvidenceHash,
+    terminalDisposition: input.disposition.disposition,
+  };
+  return freezeDeep({ ...semantic, cellStageEvidenceHash: hashCanonicalJson(semantic) });
+}
+
+/** 把同一 PipelineStrategy 的原始 stage 结果和 G1/G2 artifacts 封成可回放管线证据。 */
+export function createStrictTestDimensionAgentPipelineExecutionV1(input: {
+  readonly authority: StrictTestDimensionAgentAuthorityV1;
+  readonly analystStageResult: unknown;
+  readonly analysisStageEvidence: StrictTestDimensionAgentAnalysisStageEvidenceV1;
+  readonly producerStageResult: unknown;
+  readonly reviewStageEvidence: StrictTestDimensionAgentReviewStageEvidenceV1;
+}): StrictTestDimensionAgentPipelineExecutionV1 {
+  assertExactKeys(
+    input,
+    PIPELINE_EXECUTION_INPUT_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_PIPELINE_EXECUTION_INPUT_INVALID'
+  );
+  assertStrictTestDimensionAgentAuthorityV1(input.authority);
+  const analysisStageEvidence = validateAnalysisStageEvidence(
+    input.authority,
+    input.analystStageResult,
+    input.analysisStageEvidence
+  );
+  const reviewStageEvidence = validateReviewStageEvidence(
+    input.authority,
+    input.producerStageResult,
+    analysisStageEvidence,
+    input.reviewStageEvidence
+  );
+  const semantic = {
+    kind: 'StrictTestDimensionAgentPipelineExecutionV1' as const,
+    schemaVersion: 1 as const,
+    runId: input.authority.runId,
+    authorityHash: input.authority.authorityHash,
+    selectedCellSetHash: input.authority.selectedCellSetHash,
+    analysisStageEvidence,
+    reviewStageEvidence,
+  };
+  return freezeDeep({ ...semantic, pipelineExecutionHash: hashCanonicalJson(semantic) });
+}
+
+/**
+ * PipelineStrategy 的唯一终态接线。该函数只接受同一次既有 pipeline 的 phases，并从真实
+ * G1/G2 artifact 读取 canonical 输入；它不执行模型、不补造 facts，也不启动第二条链。
+ */
+export function createStrictTestDimensionAgentExecutionReceiptFromPipelineV1(input: {
+  readonly runtimeId: string;
+  readonly authority: StrictTestDimensionAgentAuthorityV1;
+  readonly phases: Record<string, unknown>;
+}): StrictTestDimensionAgentExecutionReceiptV1 {
+  assertExactKeys(
+    input,
+    ['authority', 'phases', 'runtimeId'],
+    'STRICT_TEST_DIMENSION_AGENT_PIPELINE_INPUT_INVALID'
+  );
+  assertStrictTestDimensionAgentAuthorityV1(input.authority);
+  if (input.runtimeId !== input.authority.runId) {
+    fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_RUN_MISMATCH');
+  }
+  const pipelineOutcome = requireRecord(
+    input.phases._pipelineOutcome,
+    'STRICT_TEST_DIMENSION_AGENT_PIPELINE_OUTCOME_REQUIRED'
+  );
+  if (pipelineOutcome.outcome !== 'completed') {
+    fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
+  }
+
+  const analystResult = requireRecord(
+    input.phases.analyze,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYST_RESULT_REQUIRED'
+  );
+  const analysisGate = requirePassedGate(
+    input.phases.analyst_fixpoint_gate,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_GATE_REQUIRED'
+  );
+  const transition = requireRecord(
+    analysisGate.artifact,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_TRANSITION_REQUIRED'
+  );
+  if (transition.kind !== 'StrictAnalysisEpochTransitionV1' || transition.action !== 'pass') {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_TRANSITION_REQUIRED');
+  }
+  const analysisStageEvidence = validateAnalysisStageEvidence(
+    input.authority,
+    analystResult,
+    transition.resultArtifact
+  );
+
+  const producerResult = requireRecord(
+    input.phases.produce,
+    'STRICT_TEST_DIMENSION_AGENT_PRODUCER_RESULT_REQUIRED'
+  );
+  const reviewGate = requirePassedGate(
+    input.phases.independent_review_gate,
+    'STRICT_TEST_DIMENSION_AGENT_REVIEW_GATE_REQUIRED'
+  );
+  const reviewStageEvidence = validateReviewStageEvidence(
+    input.authority,
+    producerResult,
+    analysisStageEvidence,
+    reviewGate.artifact
+  );
+  const pipelineExecution = createStrictTestDimensionAgentPipelineExecutionV1({
+    authority: input.authority,
+    analystStageResult: analystResult,
+    analysisStageEvidence,
+    producerStageResult: producerResult,
+    reviewStageEvidence,
+  });
+  const receipt = createStrictTestDimensionAgentExecutionReceiptV1({
+    authority: input.authority,
+    factExecution: analysisStageEvidence.factExecution,
+    analysis: analysisStageEvidence.analysis,
+    cellDispositions: reviewStageEvidence.cellDispositions.map(stripCellStageEvidence),
+    expectedTrustPolicies: reviewStageEvidence.expectedTrustPolicies,
+    completedAt: reviewStageEvidence.completedAt,
+    pipelineExecution,
+  });
+  assertStrictTestDimensionAgentExecutionReceiptV1(
+    receipt,
+    reviewStageEvidence.expectedTrustPolicies
+  );
+  return receipt;
+}
+
+function validateAnalysisStageEvidence(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  analystResult: unknown,
+  value: unknown
+): StrictTestDimensionAgentAnalysisStageEvidenceV1 {
+  const evidence = requireRecord(
+    value,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_STAGE_EVIDENCE_REQUIRED'
+  ) as unknown as StrictTestDimensionAgentAnalysisStageEvidenceV1;
+  assertExactKeys(
+    evidence,
+    ANALYSIS_STAGE_EVIDENCE_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_STAGE_EVIDENCE_FIELDS_INVALID'
+  );
+  if (
+    evidence.kind !== 'StrictTestDimensionAgentAnalysisStageEvidenceV1' ||
+    evidence.schemaVersion !== 1 ||
+    evidence.runId !== authority.runId ||
+    evidence.authorityHash !== authority.authorityHash ||
+    evidence.selectedCellSetHash !== authority.selectedCellSetHash ||
+    !sameOrderedStrings(evidence.selectedCellIds, authority.selectedCellIds) ||
+    evidence.analystStageResultHash !== expectedStageResultHash(analystResult)
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_STAGE_LINEAGE_MISMATCH');
+  }
+  validateFactExecutionLineage(authority, evidence.factExecution);
+  const analysis = validateAnalysisLineage(authority, evidence.factExecution, evidence.analysis);
+  if (analysis === null) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_STAGE_LINEAGE_MISMATCH');
+  }
+  const factReceiptHashes = new Set(
+    evidence.factExecution.receipts.map((receipt) => receipt.receiptHash)
+  );
+  if (
+    !Array.isArray(evidence.cells) ||
+    evidence.cells.length !== authority.selectedCellIds.length ||
+    !sameOrderedStrings(
+      evidence.cells.map((row) => row.cellId),
+      authority.selectedCellIds
+    )
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_SET_MISMATCH');
+  }
+  const usedFactReceiptHashes: string[] = [];
+  for (const row of evidence.cells) {
+    assertExactKeys(
+      row,
+      CELL_ANALYSIS_EVIDENCE_KEYS,
+      'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FIELDS_INVALID'
+    );
+    const factHashes = normalizeCanonicalHashes(
+      row.factReceiptHashes,
+      'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACTS_INVALID'
+    );
+    const analysisRefs = normalizeNonEmptyStrings(
+      row.analysisEvidenceRefs,
+      'STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_REFS_INVALID'
+    );
+    const expectedCellFactHashes = expectedCellFactReceiptHashes(
+      authority,
+      evidence.factExecution,
+      row.cellId
+    );
+    if (!sameOrderedStrings(factHashes, expectedCellFactHashes)) {
+      fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACT_SCOPE_MISMATCH');
+    }
+    const expectedAnalysisRefs = analysisEvidenceRefsFor(factHashes, analysis);
+    if (
+      factHashes.length === 0 ||
+      factHashes.some((hash) => !factReceiptHashes.has(hash)) ||
+      !sameOrderedStrings(factHashes, row.factReceiptHashes) ||
+      !sameOrderedStrings(analysisRefs, row.analysisEvidenceRefs) ||
+      !sameOrderedStrings(analysisRefs, expectedAnalysisRefs)
+    ) {
+      fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_LINEAGE_MISMATCH');
+    }
+    const semantic = {
+      cellId: row.cellId,
+      factReceiptHashes: row.factReceiptHashes,
+      analysisEvidenceRefs: row.analysisEvidenceRefs,
+    };
+    if (hashCanonicalJson(semantic) !== row.cellAnalysisEvidenceHash) {
+      fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_HASH_MISMATCH');
+    }
+    usedFactReceiptHashes.push(...factHashes);
+  }
+  if (
+    new Set(usedFactReceiptHashes).size !== usedFactReceiptHashes.length ||
+    !sameStringSet(usedFactReceiptHashes, [...factReceiptHashes])
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_CONSERVATION_MISMATCH');
+  }
+  const { analysisStageEvidenceHash, ...semantic } = evidence;
+  if (hashCanonicalJson(semantic) !== analysisStageEvidenceHash) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_STAGE_HASH_MISMATCH');
+  }
+  return freezeDeep({ ...evidence, analysis });
+}
+
+/**
+ * Core 的 schedule 以 canonicalSubjectRef 绑定 module scope；selected dimension 对每个
+ * module 只保留一个 eligible cell。因此 G1 cell slice 必须精确消费该 scope 的全部终态
+ * fact receipts，不能只做全局集合守恒后允许跨 module 重新分桶。
+ */
+function expectedCellFactReceiptHashes(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  factExecution: StrictFactScheduleExecutionResultV1,
+  cellId: string
+): CanonicalSha256[] {
+  const planCell = authority.compiledPlan.universe.cells.find((cell) => cell.cellId === cellId);
+  if (
+    !planCell ||
+    planCell.status !== 'eligible' ||
+    planCell.dimensionId !== authority.selectedDimensionId
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_ANALYSIS_CELL_FACT_SCOPE_MISMATCH');
+  }
+  return factExecution.receipts
+    .filter((receipt) => receipt.canonicalSubjectRef === planCell.scopeId)
+    .map((receipt) => receipt.receiptHash)
+    .sort((left, right) => left.localeCompare(right)) as CanonicalSha256[];
+}
+
+function validateReviewStageEvidence(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  producerResult: unknown,
+  analysisStageEvidence: StrictTestDimensionAgentAnalysisStageEvidenceV1,
+  value: unknown
+): StrictTestDimensionAgentReviewStageEvidenceV1 {
+  const evidence = requireRecord(
+    value,
+    'STRICT_TEST_DIMENSION_AGENT_REVIEW_STAGE_EVIDENCE_REQUIRED'
+  ) as unknown as StrictTestDimensionAgentReviewStageEvidenceV1;
+  assertExactKeys(
+    evidence,
+    REVIEW_STAGE_EVIDENCE_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_REVIEW_STAGE_EVIDENCE_FIELDS_INVALID'
+  );
+  requireTimestamp(evidence.completedAt, 'STRICT_TEST_DIMENSION_AGENT_EXECUTION_TIME_INVALID');
+  if (
+    evidence.kind !== 'StrictTestDimensionAgentReviewStageEvidenceV1' ||
+    evidence.schemaVersion !== 1 ||
+    evidence.runId !== authority.runId ||
+    evidence.authorityHash !== authority.authorityHash ||
+    evidence.selectedCellSetHash !== authority.selectedCellSetHash ||
+    !sameOrderedStrings(evidence.selectedCellIds, authority.selectedCellIds) ||
+    evidence.analysisStageEvidenceHash !== analysisStageEvidence.analysisStageEvidenceHash ||
+    evidence.producerStageResultHash !== expectedStageResultHash(producerResult) ||
+    Date.parse(evidence.completedAt) < Date.parse(authority.projectedAt)
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_REVIEW_STAGE_LINEAGE_MISMATCH');
+  }
+  if (
+    !Array.isArray(evidence.cellDispositions) ||
+    evidence.cellDispositions.length !== authority.selectedCellIds.length ||
+    !sameOrderedStrings(
+      evidence.cellDispositions.map((row) => row.cellId),
+      authority.selectedCellIds
+    )
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_SET_MISMATCH');
+  }
+  const analysisCells = new Map(
+    analysisStageEvidence.cells.map((row) => [row.cellId, row] as const)
+  );
+  const cellStageEvidenceHashes: string[] = [];
+  const producerEvidenceHashes: string[] = [];
+  const reviewEvidenceHashes: string[] = [];
+  for (const row of evidence.cellDispositions) {
+    assertExactKeys(
+      row,
+      REVIEW_CELL_DISPOSITION_KEYS,
+      'STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_FIELDS_INVALID'
+    );
+    const analysisCell = analysisCells.get(row.cellId);
+    if (!analysisCell) {
+      fail('STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_LINEAGE_MISMATCH');
+    }
+    const stageEvidence = row.stageEvidence;
+    assertExactKeys(
+      stageEvidence,
+      CELL_STAGE_EVIDENCE_KEYS,
+      'STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_EVIDENCE_FIELDS_INVALID'
+    );
+    for (const hash of [
+      stageEvidence.authorityHash,
+      stageEvidence.selectedCellSetHash,
+      stageEvidence.analysisCellEvidenceHash,
+      stageEvidence.producerEvidenceHash,
+      stageEvidence.reviewEvidenceHash,
+      stageEvidence.cellStageEvidenceHash,
+    ]) {
+      requireSha256(hash, 'STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_EVIDENCE_HASH_INVALID');
+    }
+    const factHashes = normalizeCanonicalHashes(
+      stageEvidence.factReceiptHashes,
+      'STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_FACTS_INVALID'
+    );
+    if (
+      stageEvidence.runId !== authority.runId ||
+      stageEvidence.authorityHash !== authority.authorityHash ||
+      stageEvidence.selectedCellSetHash !== authority.selectedCellSetHash ||
+      stageEvidence.cellId !== row.cellId ||
+      stageEvidence.terminalDisposition !== row.disposition ||
+      stageEvidence.analysisCellEvidenceHash !== analysisCell.cellAnalysisEvidenceHash ||
+      !sameOrderedStrings(factHashes, analysisCell.factReceiptHashes)
+    ) {
+      fail('STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_LINEAGE_MISMATCH');
+    }
+    const expectedProducerEvidenceHash = producerCellEvidenceHash(
+      authority,
+      analysisCell,
+      evidence.producerStageResultHash,
+      row
+    );
+    const expectedReviewEvidenceHash = reviewCellEvidenceHash(
+      authority,
+      row,
+      expectedProducerEvidenceHash
+    );
+    if (
+      stageEvidence.producerEvidenceHash !== expectedProducerEvidenceHash ||
+      stageEvidence.reviewEvidenceHash !== expectedReviewEvidenceHash
+    ) {
+      fail('STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_OUTPUT_MISMATCH');
+    }
+    const { cellStageEvidenceHash, ...cellSemantic } = stageEvidence;
+    if (hashCanonicalJson(cellSemantic) !== cellStageEvidenceHash) {
+      fail('STRICT_TEST_DIMENSION_AGENT_CELL_STAGE_HASH_MISMATCH');
+    }
+    cellStageEvidenceHashes.push(cellStageEvidenceHash);
+    producerEvidenceHashes.push(stageEvidence.producerEvidenceHash);
+    reviewEvidenceHashes.push(stageEvidence.reviewEvidenceHash);
+  }
+  if (
+    new Set(cellStageEvidenceHashes).size !== cellStageEvidenceHashes.length ||
+    new Set(producerEvidenceHashes).size !== producerEvidenceHashes.length ||
+    new Set(reviewEvidenceHashes).size !== reviewEvidenceHashes.length
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_REVIEW_CELL_EVIDENCE_REUSED');
+  }
+  const { reviewStageEvidenceHash, ...semantic } = evidence;
+  if (hashCanonicalJson(semantic) !== reviewStageEvidenceHash) {
+    fail('STRICT_TEST_DIMENSION_AGENT_REVIEW_STAGE_HASH_MISMATCH');
+  }
+  return freezeDeep(evidence);
+}
+
+function stripCellStageEvidence(
+  row: StrictTestDimensionAgentReviewCellDispositionV1
+): StrictTestDimensionAgentCellDispositionInputV1 {
+  const { stageEvidence: _stageEvidence, ...disposition } = row;
+  return disposition;
+}
+
+function requirePassedGate(value: unknown, errorCode: string): Record<string, unknown> {
+  const gate = requireRecord(value, errorCode);
+  if (gate.pass !== true || gate.action !== 'pass') {
+    fail(errorCode);
+  }
+  return gate;
 }
 
 function validateFactExecutionLineage(
@@ -799,6 +1464,76 @@ function normalizeCellDispositions(
     fail('STRICT_TEST_DIMENSION_AGENT_ATTESTATION_REUSED');
   }
   return freezeDeep(normalized);
+}
+
+function normalizePipelineExecution(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  factExecution: StrictFactScheduleExecutionResultV1,
+  analysis: StrictTestDimensionAgentAnalysisLineageV1 | null,
+  cellDispositions: readonly StrictTestDimensionAgentCellDispositionInputV1[],
+  expectedTrustPolicies: readonly SemanticDispositionReviewTrustPolicyV3[],
+  pipelineExecution: StrictTestDimensionAgentPipelineExecutionV1 | null
+): StrictTestDimensionAgentPipelineExecutionV1 | null {
+  if (pipelineExecution === null) {
+    return null;
+  }
+  assertExactKeys(
+    pipelineExecution,
+    PIPELINE_EXECUTION_KEYS,
+    'STRICT_TEST_DIMENSION_AGENT_PIPELINE_EXECUTION_FIELDS_INVALID'
+  );
+  requireSha256(
+    pipelineExecution.pipelineExecutionHash,
+    'STRICT_TEST_DIMENSION_AGENT_PIPELINE_EXECUTION_HASH_INVALID'
+  );
+  if (
+    pipelineExecution.kind !== 'StrictTestDimensionAgentPipelineExecutionV1' ||
+    pipelineExecution.schemaVersion !== 1 ||
+    pipelineExecution.runId !== authority.runId ||
+    pipelineExecution.authorityHash !== authority.authorityHash ||
+    pipelineExecution.selectedCellSetHash !== authority.selectedCellSetHash
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_EXECUTION_LINEAGE_MISMATCH');
+  }
+  const analysisStageEvidence = validateAnalysisStageEvidence(
+    authority,
+    pipelineExecution.analysisStageEvidence.analystStageResultHash,
+    pipelineExecution.analysisStageEvidence
+  );
+  const reviewStageEvidence = validateReviewStageEvidence(
+    authority,
+    pipelineExecution.reviewStageEvidence.producerStageResultHash,
+    analysisStageEvidence,
+    pipelineExecution.reviewStageEvidence
+  );
+  if (
+    analysis === null ||
+    canonicalJsonStringify(analysisStageEvidence.factExecution) !==
+      canonicalJsonStringify(factExecution) ||
+    canonicalJsonStringify(analysisStageEvidence.analysis) !== canonicalJsonStringify(analysis) ||
+    canonicalJsonStringify(reviewStageEvidence.expectedTrustPolicies) !==
+      canonicalJsonStringify(expectedTrustPolicies) ||
+    canonicalJsonStringify(reviewStageEvidence.cellDispositions.map(stripCellStageEvidence)) !==
+      canonicalJsonStringify(cellDispositions)
+  ) {
+    fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_RECEIPT_LINEAGE_MISMATCH');
+  }
+  const semantic = {
+    kind: 'StrictTestDimensionAgentPipelineExecutionV1' as const,
+    schemaVersion: 1 as const,
+    runId: authority.runId,
+    authorityHash: authority.authorityHash,
+    selectedCellSetHash: authority.selectedCellSetHash,
+    analysisStageEvidence,
+    reviewStageEvidence,
+  };
+  if (hashCanonicalJson(semantic) !== pipelineExecution.pipelineExecutionHash) {
+    fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_EXECUTION_HASH_MISMATCH');
+  }
+  return freezeDeep({
+    ...semantic,
+    pipelineExecutionHash: pipelineExecution.pipelineExecutionHash,
+  });
 }
 
 function normalizeCellDisposition(
@@ -1272,6 +2007,100 @@ function requireSha256(value: unknown, errorCode: string): asserts value is Cano
   if (typeof value !== 'string' || !SHA256_PATTERN.test(value)) {
     fail(errorCode);
   }
+}
+
+function expectedStageResultHash(value: unknown): CanonicalSha256 {
+  if (typeof value === 'string') {
+    requireSha256(value, 'STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_HASH_INVALID');
+    return value;
+  }
+  return hashStrictTestDimensionAgentStageResultV1(value);
+}
+
+function analysisEvidenceRefsFor(
+  factReceiptHashes: readonly CanonicalSha256[],
+  analysis: StrictTestDimensionAgentAnalysisLineageV1
+): string[] {
+  return [
+    `analysis-fixpoint:${analysis.analysisFixpoint.fixpointHash}`,
+    ...factReceiptHashes.map((hash) => `fact-receipt:${hash}`),
+  ].sort((left, right) => left.localeCompare(right));
+}
+
+function producerCellEvidenceHash(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  analysisCell: StrictTestDimensionAgentCellAnalysisEvidenceV1,
+  producerStageResultHash: CanonicalSha256,
+  disposition: StrictTestDimensionAgentCellDispositionInputV1
+): CanonicalSha256 {
+  return hashCanonicalJson({
+    kind: 'StrictTestDimensionAgentCellProducerEvidenceV1',
+    schemaVersion: 1,
+    runId: authority.runId,
+    authorityHash: authority.authorityHash,
+    selectedCellSetHash: authority.selectedCellSetHash,
+    cellId: disposition.cellId,
+    producerStageResultHash,
+    analysisCellEvidenceHash: analysisCell.cellAnalysisEvidenceHash,
+    factReceiptHashes: analysisCell.factReceiptHashes,
+    expressionSetReceipts: disposition.expressionSetReceipts,
+  });
+}
+
+function reviewCellEvidenceHash(
+  authority: StrictTestDimensionAgentAuthorityV1,
+  disposition: StrictTestDimensionAgentCellDispositionInputV1,
+  producerEvidenceHash: CanonicalSha256
+): CanonicalSha256 {
+  return hashCanonicalJson({
+    kind: 'StrictTestDimensionAgentCellReviewEvidenceV1',
+    schemaVersion: 1,
+    runId: authority.runId,
+    authorityHash: authority.authorityHash,
+    selectedCellSetHash: authority.selectedCellSetHash,
+    cellId: disposition.cellId,
+    producerEvidenceHash,
+    disposition: disposition.disposition,
+    semanticReviewAttestations: disposition.semanticReviewAttestations,
+    dispositionReviewAttestations: disposition.dispositionReviewAttestations,
+    reasonCode: disposition.reasonCode,
+    evidenceRefs: disposition.evidenceRefs,
+  });
+}
+
+function requireRecord(value: unknown, errorCode: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(errorCode);
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeCanonicalHashes(values: readonly string[], errorCode: string): CanonicalSha256[] {
+  if (!Array.isArray(values)) {
+    fail(errorCode);
+  }
+  for (const value of values) {
+    requireSha256(value, errorCode);
+  }
+  const normalized = uniqueSorted(values) as CanonicalSha256[];
+  if (normalized.length !== values.length) {
+    fail(errorCode);
+  }
+  return normalized;
+}
+
+function normalizeNonEmptyStrings(values: readonly string[], errorCode: string): string[] {
+  if (!Array.isArray(values)) {
+    fail(errorCode);
+  }
+  for (const value of values) {
+    requireText(value, errorCode);
+  }
+  const normalized = uniqueSorted(values);
+  if (normalized.length !== values.length) {
+    fail(errorCode);
+  }
+  return normalized;
 }
 
 function sameOrderedStrings(left: readonly string[], right: readonly string[]): boolean {

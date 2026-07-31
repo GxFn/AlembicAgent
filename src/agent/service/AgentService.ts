@@ -50,6 +50,7 @@ export class AgentService {
     });
     const trace = describeRun(input, compiledProfile.id);
     const startedAt = Date.now();
+    const strictTestRunId = readStrictTestRunId(input);
     this.#logger.info(`[AgentService] run start ${formatRunTrace(trace)}`, trace);
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
       try {
@@ -79,6 +80,7 @@ export class AgentService {
       }
     }
     const runtime = this.#runtimeBuilder.build(compiledProfile, {
+      ...(strictTestRunId ? { runId: strictTestRunId } : {}),
       lang: input.context.lang || null,
       onProgress: input.execution?.onProgress || null,
       onToolCall: input.execution?.onToolCall || null,
@@ -88,6 +90,9 @@ export class AgentService {
     }
     const message = buildAgentMessage(input);
     try {
+      if (strictTestRunId && runtime.id !== strictTestRunId) {
+        throw new Error('STRICT_TEST_DIMENSION_AGENT_RUNTIME_RUN_MISMATCH');
+      }
       // 冷启动监控依赖这里把“维度 child run 已进入 AgentRuntime”明确打出来。
       // 仅靠 GenerateTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
       this.#logger.info(`[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
@@ -95,7 +100,7 @@ export class AgentService {
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
-      const status = inferRunStatus(result.reply || '');
+      const status = inferRunStatus(result.reply || '', result.outcome);
       this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
@@ -119,6 +124,9 @@ export class AgentService {
           durationMs: result.durationMs || 0,
         },
         diagnostics: result.diagnostics || null,
+        ...(result.strictTestExecutionReceipt
+          ? { strictTestExecutionReceipt: result.strictTestExecutionReceipt }
+          : {}),
       };
     } catch (err: unknown) {
       this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
@@ -236,7 +244,10 @@ function toChannel(source: AgentRunInput['context']['source']) {
   return Channel.HTTP;
 }
 
-function inferRunStatus(reply: string): AgentRunStatus {
+function inferRunStatus(reply: string, pipelineOutcome?: string): AgentRunStatus {
+  if (pipelineOutcome === 'failed') {
+    return 'error';
+  }
   return reply ? 'success' : 'error';
 }
 
@@ -314,6 +325,12 @@ function getRecord(value: unknown): Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readStrictTestRunId(input: AgentRunInput): string | undefined {
+  const strictProduction = getRecord(input.context.strategyContext?.strictProduction);
+  const authority = getRecord(strictProduction.strictTestAuthority);
+  return stringValue(authority.runId);
 }
 
 export default AgentService;

@@ -28,6 +28,11 @@ import {
   type StrictAnalysisEpochTransitionV1,
   validateStrictStageToolCallsV1,
 } from '../production/StrictProductionPipeline.js';
+import {
+  assertStrictTestDimensionProductionRuntimePortBindingV1,
+  createStrictTestDimensionAgentExecutionReceiptFromPipelineV1,
+  type StrictTestDimensionProductionRuntimePortV1,
+} from '../production/StrictTestDimensionAgentContract.js';
 import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
@@ -391,6 +396,24 @@ export class PipelineStrategy extends Strategy {
       ...(submitRepairs ? { submitRepairs } : {}),
       ...(recipeReadiness ? { recipeReadiness } : {}),
     };
+    const strictTestPort = this.#strictTestRuntimePort(ctx);
+    const strictTestExecutionReceipt = strictTestPort
+      ? createStrictTestDimensionAgentExecutionReceiptFromPipelineV1({
+          runtimeId: runtime.id,
+          authority: strictTestPort.strictTestAuthority,
+          phases: ctx.phaseResults,
+        })
+      : null;
+    if (strictTestExecutionReceipt) {
+      _pipelineLogger().info('[PipelineStrategy] strict-test execution receipt sealed', {
+        runId: strictTestExecutionReceipt.runId,
+        authorityHash: strictTestExecutionReceipt.authorityHash,
+        selectedCellSetHash: strictTestExecutionReceipt.selectedCellSetHash,
+        receiptHash: strictTestExecutionReceipt.receiptHash,
+        attemptedCount: strictTestExecutionReceipt.attemptedCount,
+        segmentStatus: strictTestExecutionReceipt.segmentStatus,
+      });
+    }
 
     return {
       reply: lastStage?.reply || '',
@@ -401,6 +424,7 @@ export class PipelineStrategy extends Strategy {
       degraded: ctx.degraded,
       outcome,
       diagnostics: ctx.diagnostics.toJSON(),
+      ...(strictTestExecutionReceipt ? { strictTestExecutionReceipt } : {}),
     };
   }
 
@@ -1253,6 +1277,22 @@ export class PipelineStrategy extends Strategy {
       throw new Error('STRICT_ANALYSIS_EPOCH_HASH_MISMATCH');
     }
     return normalized.context;
+  }
+
+  #strictTestRuntimePort(ctx: PipelineContext): StrictTestDimensionProductionRuntimePortV1 | null {
+    const value = ctx.strategyContext.strictProduction;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+    const candidate = value as StrictTestDimensionProductionRuntimePortV1;
+    if (
+      !Object.hasOwn(candidate, 'strictTestAuthority') &&
+      !Object.hasOwn(candidate, 'eligibleCells')
+    ) {
+      return null;
+    }
+    assertStrictTestDimensionProductionRuntimePortBindingV1(candidate);
+    return candidate;
   }
 
   #validateStrictRoleRoute(stage: PipelineStage, ctx: PipelineContext): void {
