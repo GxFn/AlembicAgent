@@ -27,13 +27,6 @@ const STRICT_FACADES = {
     types: './dist/production.d.ts',
     runtime: [
       { name: 'DurableSemanticReviewRuntimeError', kind: 'class' },
-      { name: 'assertStrictTestDimensionAgentAuthorityV1', kind: 'function' },
-      { name: 'assertStrictTestDimensionAgentExecutionReceiptV1', kind: 'function' },
-      {
-        name: 'assertStrictTestDimensionProductionRuntimePortBindingV1',
-        kind: 'function',
-      },
-      { name: 'bindStrictTestDimensionProductionRuntimePortV1', kind: 'function' },
       { name: 'createDurableSemanticReviewRuntime', kind: 'function' },
       { name: 'createProductionEvidenceLedgerAuthority', kind: 'function' },
       { name: 'createStrictAnalysisContextProjectionV1', kind: 'function' },
@@ -44,8 +37,6 @@ const STRICT_FACADES = {
       { name: 'createStrictHypothesisExpressionSetReceiptV1', kind: 'function' },
       { name: 'createStrictProducerExpressionSetV1', kind: 'function' },
       { name: 'createStrictProducerLineageReceiptV1', kind: 'function' },
-      { name: 'createStrictTestDimensionAgentAuthorityV1', kind: 'function' },
-      { name: 'createStrictTestDimensionAgentExecutionReceiptV1', kind: 'function' },
       { name: 'validateStrictAnalysisEpochTransitionV1', kind: 'function' },
       { name: 'validateStrictAnalystEpochV1', kind: 'function' },
     ],

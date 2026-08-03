@@ -65,21 +65,3 @@ export type {
   StrictProductionGateResultV1,
   StrictProductionRuntimePortV1,
 } from './agent/production/StrictProductionStages.js';
-export {
-  assertStrictTestDimensionAgentAuthorityV1,
-  assertStrictTestDimensionAgentExecutionReceiptV1,
-  assertStrictTestDimensionProductionRuntimePortBindingV1,
-  bindStrictTestDimensionProductionRuntimePortV1,
-  type CreateStrictTestDimensionAgentAuthorityInputV1,
-  type CreateStrictTestDimensionAgentExecutionReceiptInputV1,
-  createStrictTestDimensionAgentAuthorityV1,
-  createStrictTestDimensionAgentExecutionReceiptV1,
-  type StrictTestDimensionAgentAnalysisLineageV1,
-  type StrictTestDimensionAgentAuthorityV1,
-  type StrictTestDimensionAgentCellDispositionInputV1,
-  type StrictTestDimensionAgentCellDispositionV1,
-  type StrictTestDimensionAgentExecutionReceiptV1,
-  type StrictTestDimensionAgentTerminalDispositionV1,
-  type StrictTestDimensionEligibleCellV1,
-  type StrictTestDimensionProductionRuntimePortV1,
-} from './agent/production/StrictTestDimensionAgentContract.js';

@@ -7,10 +7,6 @@ import {
   validateStrictAnalysisEpochTransitionV1,
 } from './StrictProductionPipeline.js';
 import { buildStrictAnalystPrompt, buildStrictProducerPrompt } from './StrictProductionPrompts.js';
-import {
-  assertStrictTestDimensionProductionRuntimePortBindingV1,
-  type StrictTestDimensionProductionRuntimePortV1,
-} from './StrictTestDimensionAgentContract.js';
 
 export interface StrictProductionGateResultV1 {
   readonly action?: string;
@@ -49,11 +45,10 @@ export function buildStrictProductionPipelineStagesV1() {
       toolChoiceOverride: 'none',
       promptBuilder: (ctx: Record<string, unknown>) => {
         const strict = readStrictPort(ctx);
-        const prompt = buildStrictAnalystPrompt({
+        return buildStrictAnalystPrompt({
           epoch: readStrictAnalysisEpoch(strict),
           limits: strict.analysisLimits,
         });
-        return appendStrictTestExecutionScope(prompt, strict);
       },
     },
     {
@@ -84,13 +79,7 @@ export function buildStrictProductionPipelineStagesV1() {
       toolChoiceOverride: 'none',
       promptBuilder: (ctx: Record<string, unknown>) => {
         const strict = readStrictPort(ctx);
-        const producerInput = strict.buildProducerInput(ctx.gateArtifact);
-        const strictTestScope = readStrictTestExecutionScope(strict);
-        return buildStrictProducerPrompt(
-          strictTestScope
-            ? { ...producerInput, strictTestExecutionScope: strictTestScope }
-            : producerInput
-        );
+        return buildStrictProducerPrompt(strict.buildProducerInput(ctx.gateArtifact));
       },
     },
     {
@@ -207,52 +196,7 @@ function readStrictPort(context: Record<string, unknown>): StrictProductionRunti
   ) {
     throw new Error('STRICT_PRODUCTION_RUNTIME_PORT_INVALID');
   }
-  const hasStrictTestAuthority = Object.hasOwn(port, 'strictTestAuthority');
-  const hasEligibleCells = Object.hasOwn(port, 'eligibleCells');
-  if (hasStrictTestAuthority || hasEligibleCells) {
-    if (!hasStrictTestAuthority || !hasEligibleCells) {
-      throw new Error('STRICT_TEST_DIMENSION_RUNTIME_BINDING_INCOMPLETE');
-    }
-    assertStrictTestDimensionProductionRuntimePortBindingV1(
-      port as StrictTestDimensionProductionRuntimePortV1
-    );
-  }
   return port as StrictProductionRuntimePortV1;
-}
-
-function readStrictTestExecutionScope(port: StrictProductionRuntimePortV1): {
-  readonly authorityHash: string;
-  readonly selectedDimensionId: string;
-  readonly selectedCellIds: readonly string[];
-  readonly selectedCellSetHash: string;
-  readonly fullCellUniverseHash: string;
-  readonly fullEligibleCellsHash: string;
-  readonly fullExcludedCellsHash: string;
-} | null {
-  if (!Object.hasOwn(port, 'strictTestAuthority')) {
-    return null;
-  }
-  const bound = port as StrictTestDimensionProductionRuntimePortV1;
-  return Object.freeze({
-    authorityHash: bound.strictTestAuthority.authorityHash,
-    selectedDimensionId: bound.strictTestAuthority.selectedDimensionId,
-    selectedCellIds: bound.eligibleCells.map((cell) => cell.cellId),
-    selectedCellSetHash: bound.strictTestAuthority.selectedCellSetHash,
-    fullCellUniverseHash: bound.strictTestAuthority.fullCellUniverseHash,
-    fullEligibleCellsHash: bound.strictTestAuthority.fullEligibleCellsHash,
-    fullExcludedCellsHash: bound.strictTestAuthority.fullExcludedCellsHash,
-  });
-}
-
-function appendStrictTestExecutionScope(
-  prompt: string,
-  port: StrictProductionRuntimePortV1
-): string {
-  const scope = readStrictTestExecutionScope(port);
-  if (!scope) {
-    return prompt;
-  }
-  return `${prompt}\n\nStrict-test automatic execution scope (immutable):\n${JSON.stringify(scope)}`;
 }
 
 function readStrictAnalysisEpoch(
