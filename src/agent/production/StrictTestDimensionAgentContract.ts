@@ -187,18 +187,6 @@ const PIPELINE_EXECUTION_INPUT_KEYS = [
   'producerStageResult',
   'reviewStageEvidence',
 ] as const;
-const STAGE_SEAL_INPUT_KEYS = ['authority', 'stageName', 'stageResult'] as const;
-const STAGE_SEAL_KEYS = [
-  'authorityHash',
-  'kind',
-  'runId',
-  'schemaVersion',
-  'selectedCellSetHash',
-  'stageName',
-  'stageResult',
-  'stageResultHash',
-  'stageSealHash',
-] as const;
 const CELL_ANALYSIS_INPUT_KEYS = ['analysis', 'cellId', 'factReceiptHashes'] as const;
 const CELL_STAGE_INPUT_KEYS = [
   'analysisCellEvidence',
@@ -442,29 +430,6 @@ export interface StrictTestDimensionAgentPipelineExecutionV1 {
   readonly analysisStageEvidence: StrictTestDimensionAgentAnalysisStageEvidenceV1;
   readonly reviewStageEvidence: StrictTestDimensionAgentReviewStageEvidenceV1;
   readonly pipelineExecutionHash: CanonicalSha256;
-}
-
-export type StrictTestDimensionAgentStageNameV1 = 'analyze' | 'produce';
-
-export interface StrictTestDimensionAgentStageResultSnapshotV1 {
-  readonly reply: string;
-  readonly toolCalls: readonly Record<string, unknown>[];
-  readonly tokenUsage: Readonly<{ input: number; output: number }>;
-  readonly iterations: number;
-  readonly timedOut: boolean;
-}
-
-/** PipelineStrategy 在任何 gate 可见之前创建的不可变同 run stage 存证。 */
-export interface StrictTestDimensionAgentStageSealV1 {
-  readonly kind: 'StrictTestDimensionAgentStageSealV1';
-  readonly schemaVersion: 1;
-  readonly runId: string;
-  readonly authorityHash: CanonicalSha256;
-  readonly selectedCellSetHash: CanonicalSha256;
-  readonly stageName: StrictTestDimensionAgentStageNameV1;
-  readonly stageResult: StrictTestDimensionAgentStageResultSnapshotV1;
-  readonly stageResultHash: CanonicalSha256;
-  readonly stageSealHash: CanonicalSha256;
 }
 
 export interface CreateStrictTestDimensionAgentExecutionReceiptInputV1 {
@@ -846,54 +811,6 @@ export function hashStrictTestDimensionAgentStageResultV1(value: unknown): Canon
   });
 }
 
-/**
- * 断开 provider 原对象别名并只保留 receipt-authoritative 固定投影；返回前深冻结，gate
- * 只能读取该 snapshot，不能把 gate 后状态冒充模型原始输出。
- */
-export function sealStrictTestDimensionAgentStageResultV1(input: {
-  readonly authority: StrictTestDimensionAgentAuthorityV1;
-  readonly stageName: StrictTestDimensionAgentStageNameV1;
-  readonly stageResult: unknown;
-}): StrictTestDimensionAgentStageSealV1 {
-  assertExactKeys(
-    input,
-    STAGE_SEAL_INPUT_KEYS,
-    'STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_INPUT_INVALID'
-  );
-  assertStrictTestDimensionAgentAuthorityV1(input.authority);
-  if (input.stageName !== 'analyze' && input.stageName !== 'produce') {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_NAME_INVALID');
-  }
-  const result = requireRecord(
-    input.stageResult,
-    'STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID'
-  );
-  const tokenUsage = requireRecord(
-    result.tokenUsage,
-    'STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID'
-  );
-  const toolCalls = cloneStrictStageToolCalls(result.toolCalls);
-  const stageResult = freezeDeep({
-    reply: result.reply,
-    toolCalls,
-    tokenUsage: { input: tokenUsage.input, output: tokenUsage.output },
-    iterations: result.iterations,
-    timedOut: result.timedOut === true,
-  }) as StrictTestDimensionAgentStageResultSnapshotV1;
-  const stageResultHash = hashStrictTestDimensionAgentStageResultV1(stageResult);
-  const semantic = {
-    kind: 'StrictTestDimensionAgentStageSealV1' as const,
-    schemaVersion: 1 as const,
-    runId: input.authority.runId,
-    authorityHash: input.authority.authorityHash,
-    selectedCellSetHash: input.authority.selectedCellSetHash,
-    stageName: input.stageName,
-    stageResult,
-    stageResultHash,
-  };
-  return freezeDeep({ ...semantic, stageSealHash: hashCanonicalJson(semantic) });
-}
-
 /** G1 以实际 terminal fact receipts 与同次 fixpoint 生成唯一 cell 分析证据。 */
 export function createStrictTestDimensionAgentCellAnalysisEvidenceV1(input: {
   readonly cellId: string;
@@ -1032,11 +949,10 @@ export function createStrictTestDimensionAgentExecutionReceiptFromPipelineV1(inp
   readonly runtimeId: string;
   readonly authority: StrictTestDimensionAgentAuthorityV1;
   readonly phases: Record<string, unknown>;
-  readonly stageSeals: readonly StrictTestDimensionAgentStageSealV1[];
 }): StrictTestDimensionAgentExecutionReceiptV1 {
   assertExactKeys(
     input,
-    ['authority', 'phases', 'runtimeId', 'stageSeals'],
+    ['authority', 'phases', 'runtimeId'],
     'STRICT_TEST_DIMENSION_AGENT_PIPELINE_INPUT_INVALID'
   );
   assertStrictTestDimensionAgentAuthorityV1(input.authority);
@@ -1051,11 +967,9 @@ export function createStrictTestDimensionAgentExecutionReceiptFromPipelineV1(inp
     fail('STRICT_TEST_DIMENSION_AGENT_PIPELINE_NOT_COMPLETED');
   }
 
-  const analystSeal = requireStrictStageSeal(
-    input.authority,
-    input.stageSeals,
-    'analyze',
-    input.phases.analyze
+  const analystResult = requireRecord(
+    input.phases.analyze,
+    'STRICT_TEST_DIMENSION_AGENT_ANALYST_RESULT_REQUIRED'
   );
   const analysisGate = requirePassedGate(
     input.phases.analyst_fixpoint_gate,
@@ -1070,15 +984,13 @@ export function createStrictTestDimensionAgentExecutionReceiptFromPipelineV1(inp
   }
   const analysisStageEvidence = validateAnalysisStageEvidence(
     input.authority,
-    analystSeal.stageResultHash,
+    analystResult,
     transition.resultArtifact
   );
 
-  const producerSeal = requireStrictStageSeal(
-    input.authority,
-    input.stageSeals,
-    'produce',
-    input.phases.produce
+  const producerResult = requireRecord(
+    input.phases.produce,
+    'STRICT_TEST_DIMENSION_AGENT_PRODUCER_RESULT_REQUIRED'
   );
   const reviewGate = requirePassedGate(
     input.phases.independent_review_gate,
@@ -1086,15 +998,15 @@ export function createStrictTestDimensionAgentExecutionReceiptFromPipelineV1(inp
   );
   const reviewStageEvidence = validateReviewStageEvidence(
     input.authority,
-    producerSeal.stageResultHash,
+    producerResult,
     analysisStageEvidence,
     reviewGate.artifact
   );
   const pipelineExecution = createStrictTestDimensionAgentPipelineExecutionV1({
     authority: input.authority,
-    analystStageResult: analystSeal.stageResultHash,
+    analystStageResult: analystResult,
     analysisStageEvidence,
-    producerStageResult: producerSeal.stageResultHash,
+    producerStageResult: producerResult,
     reviewStageEvidence,
   });
   const receipt = createStrictTestDimensionAgentExecutionReceiptV1({
@@ -2103,67 +2015,6 @@ function expectedStageResultHash(value: unknown): CanonicalSha256 {
     return value;
   }
   return hashStrictTestDimensionAgentStageResultV1(value);
-}
-
-function cloneStrictStageToolCalls(value: unknown): Record<string, unknown>[] {
-  if (!Array.isArray(value)) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID');
-  }
-  const cloned = JSON.parse(canonicalJsonStringify(value)) as unknown;
-  if (
-    !Array.isArray(cloned) ||
-    cloned.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))
-  ) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_RESULT_INVALID');
-  }
-  return cloned as Record<string, unknown>[];
-}
-
-function requireStrictStageSeal(
-  authority: StrictTestDimensionAgentAuthorityV1,
-  stageSeals: readonly StrictTestDimensionAgentStageSealV1[],
-  stageName: StrictTestDimensionAgentStageNameV1,
-  phaseStageResult: unknown
-): StrictTestDimensionAgentStageSealV1 {
-  const expectedStageNames: readonly StrictTestDimensionAgentStageNameV1[] = ['analyze', 'produce'];
-  if (
-    stageSeals.length !== expectedStageNames.length ||
-    stageSeals.some((seal, index) => seal.stageName !== expectedStageNames[index])
-  ) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_SET_INVALID');
-  }
-  const seal = stageSeals[stageName === 'analyze' ? 0 : 1];
-  if (!seal) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_REQUIRED');
-  }
-  assertExactKeys(seal, STAGE_SEAL_KEYS, 'STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_FIELDS_INVALID');
-  if (
-    seal.kind !== 'StrictTestDimensionAgentStageSealV1' ||
-    seal.schemaVersion !== 1 ||
-    seal.stageName !== stageName ||
-    seal.runId !== authority.runId ||
-    seal.authorityHash !== authority.authorityHash ||
-    seal.selectedCellSetHash !== authority.selectedCellSetHash
-  ) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_IDENTITY_MISMATCH');
-  }
-  if (
-    phaseStageResult !== seal.stageResult ||
-    !Object.isFrozen(seal) ||
-    !Object.isFrozen(seal.stageResult) ||
-    !Object.isFrozen(seal.stageResult.toolCalls) ||
-    !Object.isFrozen(seal.stageResult.tokenUsage)
-  ) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_MUTATED');
-  }
-  if (hashStrictTestDimensionAgentStageResultV1(seal.stageResult) !== seal.stageResultHash) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_HASH_MISMATCH');
-  }
-  const { stageSealHash: _stageSealHash, ...semantic } = seal;
-  if (hashCanonicalJson(semantic) !== seal.stageSealHash) {
-    fail('STRICT_TEST_DIMENSION_AGENT_STAGE_SEAL_HASH_MISMATCH');
-  }
-  return seal;
 }
 
 function analysisEvidenceRefsFor(
