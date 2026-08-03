@@ -82,7 +82,6 @@ export class AgentRuntimeBuilder {
 
     this.#logger.debug('[AgentRuntimeBuilder] building runtime', { presetName });
     return new AgentRuntime({
-      ...(options.runId ? { id: options.runId } : {}),
       presetName,
       aiProvider: this.#aiProvider as never,
       toolRegistry: this.#toolRegistry as never,

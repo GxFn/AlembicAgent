@@ -1841,8 +1841,8 @@
       ]
     },
     "./production": {
-      "exportCount": 23,
-      "signatureHash": "6f79acfd74e3a2bd4c9ab95ad702a5f32334ae9ae208d35a5a73f8d914df583f",
+      "exportCount": 19,
+      "signatureHash": "a63e575ec1f963f5e57c1f27de6059d04674004652c182e65f8674e5bbfb0486",
       "entries": [
         {
           "name": "DurableSemanticReviewRuntimeError",
@@ -1909,23 +1909,7 @@
           "kind": "function"
         },
         {
-          "name": "createStrictTestDimensionAgentCellAnalysisEvidenceV1",
-          "kind": "function"
-        },
-        {
-          "name": "createStrictTestDimensionAgentCellStageEvidenceV1",
-          "kind": "function"
-        },
-        {
           "name": "createStrictTestDimensionAgentExecutionReceiptV1",
-          "kind": "function"
-        },
-        {
-          "name": "createStrictTestDimensionAgentPipelineExecutionV1",
-          "kind": "function"
-        },
-        {
-          "name": "hashStrictTestDimensionAgentStageResultV1",
           "kind": "function"
         },
         {

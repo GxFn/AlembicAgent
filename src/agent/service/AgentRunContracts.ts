@@ -1,4 +1,3 @@
-import type { StrictTestDimensionAgentExecutionReceiptV1 } from '../production/StrictTestDimensionAgentContract.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import type {
   AgentDiagnostics,
@@ -215,7 +214,6 @@ export interface AgentRunResult {
   toolCalls: ToolCallEntry[];
   usage: AgentRunUsage;
   diagnostics: AgentDiagnostics | null;
-  strictTestExecutionReceipt?: StrictTestDimensionAgentExecutionReceiptV1;
 }
 
 export interface AgentRuntimeRunOptions {
@@ -236,8 +234,6 @@ export interface AgentRuntimeRunOptions {
 }
 
 export interface AgentRuntimeBuildOptions {
-  /** strict-test 以 frozen authority runId 建立真实 runtime，禁止事后改写返回身份。 */
-  runId?: string;
   lang?: string | null;
   onProgress?: ((event: ProgressEvent) => void) | null;
   onToolCall?:
@@ -259,7 +255,5 @@ export interface AgentRuntimeLike {
     durationMs?: number;
     phases?: Record<string, unknown>;
     diagnostics?: AgentDiagnostics;
-    strictTestExecutionReceipt?: StrictTestDimensionAgentExecutionReceiptV1;
-    outcome?: string;
   }>;
 }

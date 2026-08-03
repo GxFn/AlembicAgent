@@ -3,10 +3,7 @@
 process.env.ALEMBIC_LOG_LEVEL = 'silent';
 
 const {
-  assertFactQueryExecutionReceiptV1,
   buildFactQueryCatalogSnapshot,
-  createAnalysisFixpointReceiptV1,
-  createFinalExpandedMiningScheduleReceiptV1,
   createStrictTestAutomaticSelectionReceiptV1,
   createStrictTestDimensionExecutionProjectionV1,
   validateStrictTestPreflightV1,
@@ -24,8 +21,7 @@ const {
   createStrictAnalysisExpansionPortV1,
   createStrictAnalysisGateOutcomeV1,
   createStrictTestDimensionAgentAuthorityV1,
-  createStrictTestDimensionAgentCellAnalysisEvidenceV1,
-  createStrictTestDimensionAgentCellStageEvidenceV1,
+  createStrictTestDimensionAgentExecutionReceiptV1,
 } = await import('../dist/production.js');
 const { AgentService } = await import('../dist/agent/service/AgentService.js');
 const { PipelineStrategy } = await import('../dist/agent/strategies/PipelineStrategy.js');
@@ -61,8 +57,7 @@ const factFamilies = [
 ];
 const factQueryCatalog = buildFactQueryCatalogSnapshot(factFamilies);
 
-const executionReceipts = createSameRunExecutionReceipts();
-const compiledPlan = createCompiledPlan(executionReceipts);
+const compiledPlan = createCompiledPlan();
 const currentBindings = createBindings();
 const preflight = validateStrictTestPreflightV1(compiledPlan, currentBindings);
 const automaticSelection = createStrictTestAutomaticSelectionReceiptV1({
@@ -89,7 +84,7 @@ const cells = authority.selectedCellIds.map((cellId) => {
 });
 const boundPort = bindStrictTestDimensionProductionRuntimePortV1({
   authority,
-  runtimePort: strictSameRunRuntimePort(authority, executionReceipts),
+  runtimePort: strictRuntimePort(authority),
   eligibleCells: cells,
 });
 
@@ -110,25 +105,24 @@ const invalid = await agentService(invalidModelCalls).run(
     eligibleCells: cells,
   })
 );
-const reorderedModelCalls = [];
-const reordered = await agentService(reorderedModelCalls).run(
-  agentInput(
-    bindStrictTestDimensionProductionRuntimePortV1({
-      authority,
-      runtimePort: strictSameRunRuntimePort(authority, executionReceipts, (artifact) =>
-        rehashReviewArtifact({
-          ...artifact,
-          cellDispositions: [...artifact.cellDispositions].reverse(),
-        })
-      ),
-      eligibleCells: cells,
-    })
-  )
-);
-const executionReceipt = valid.strictTestExecutionReceipt;
-const phases = valid.phases ?? {};
-const analysisGate = phases.analyst_fixpoint_gate?.artifact?.resultArtifact;
-const reviewGate = phases.independent_review_gate?.artifact;
+
+const factExecution = emptyFactExecution(authority);
+const executionReceipt = createStrictTestDimensionAgentExecutionReceiptV1({
+  authority,
+  factExecution,
+  analysis: null,
+  cellDispositions: authority.selectedCellIds.map((cellId) => ({
+    cellId,
+    disposition: 'failed',
+    expressionSetReceipts: [],
+    semanticReviewAttestations: [],
+    dispositionReviewAttestations: [],
+    reasonCode: 'probe-controlled-failure',
+    evidenceRefs: [`probe:${cellId}`],
+  })),
+  expectedTrustPolicies: [],
+  completedAt: '2026-07-30T06:03:00.000Z',
+});
 
 const report = {
   schemaVersion: 1,
@@ -146,69 +140,26 @@ const report = {
   dimensionStateCount: projection.dimensionStates.length,
   validRoute: {
     status: valid.status,
-    runId: valid.runId,
     modelCallCount: validModelCalls.length,
     analystScopeBound: validModelCalls[0]?.includes(authority.authorityHash) === true,
     producerScopeBound: validModelCalls[1]?.includes(authority.authorityHash) === true,
-    receiptReturned: Boolean(executionReceipt),
   },
   failClosedRoute: {
     status: invalid.status,
     modelCallCount: invalidModelCalls.length,
     errorCode: invalid.reply,
   },
-  cellConservationFailClosed: {
-    status: reordered.status,
-    modelCallCount: reorderedModelCalls.length,
-    errorCode: reordered.reply,
-    receiptReturned: Boolean(reordered.strictTestExecutionReceipt),
+  receipt: {
+    attemptedCount: executionReceipt.attemptedCount,
+    acceptedCount: executionReceipt.acceptedCount,
+    rejectedCount: executionReceipt.rejectedCount,
+    investigatedEmptyCount: executionReceipt.investigatedEmptyCount,
+    failedCount: executionReceipt.failedCount,
+    segmentStatus: executionReceipt.segmentStatus,
+    productionFinalized: executionReceipt.productionFinalized,
+    publicRouteChanged: executionReceipt.publicRouteChanged,
+    receiptHash: executionReceipt.receiptHash,
   },
-  receipt: executionReceipt
-    ? {
-        runId: executionReceipt.runId,
-        authorityHash: executionReceipt.authorityHash,
-        selectedCellIds: executionReceipt.selectedCellIds,
-        selectedCellSetHash: executionReceipt.selectedCellSetHash,
-        attemptedCount: executionReceipt.attemptedCount,
-        acceptedCount: executionReceipt.acceptedCount,
-        rejectedCount: executionReceipt.rejectedCount,
-        investigatedEmptyCount: executionReceipt.investigatedEmptyCount,
-        failedCount: executionReceipt.failedCount,
-        segmentStatus: executionReceipt.segmentStatus,
-        productionFinalized: executionReceipt.productionFinalized,
-        publicRouteChanged: executionReceipt.publicRouteChanged,
-        receiptHash: executionReceipt.receiptHash,
-        pipelineExecution: executionReceipt.pipelineExecution
-          ? {
-              pipelineExecutionHash: executionReceipt.pipelineExecution.pipelineExecutionHash,
-              analystStageResultHash:
-                executionReceipt.pipelineExecution.analysisStageEvidence.analystStageResultHash,
-              analysisStageEvidenceHash:
-                executionReceipt.pipelineExecution.analysisStageEvidence.analysisStageEvidenceHash,
-              producerStageResultHash:
-                executionReceipt.pipelineExecution.reviewStageEvidence.producerStageResultHash,
-              reviewStageEvidenceHash:
-                executionReceipt.pipelineExecution.reviewStageEvidence.reviewStageEvidenceHash,
-              cellStageEvidence:
-                executionReceipt.pipelineExecution.reviewStageEvidence.cellDispositions.map(
-                  (row) => ({
-                    cellId: row.cellId,
-                    cellStageEvidenceHash: row.stageEvidence.cellStageEvidenceHash,
-                  })
-                ),
-            }
-          : null,
-        actualStageHashesMatch:
-          executionReceipt.pipelineExecution?.analysisStageEvidence.analystStageResultHash ===
-            stageResultHash(phases.analyze) &&
-          executionReceipt.pipelineExecution?.analysisStageEvidence.analysisStageEvidenceHash ===
-            analysisGate?.analysisStageEvidenceHash &&
-          executionReceipt.pipelineExecution?.reviewStageEvidence.producerStageResultHash ===
-            stageResultHash(phases.produce) &&
-          executionReceipt.pipelineExecution?.reviewStageEvidence.reviewStageEvidenceHash ===
-            reviewGate?.reviewStageEvidenceHash,
-      }
-    : null,
 };
 
 if (
@@ -216,41 +167,28 @@ if (
   report.selectedCellIds.length !== 2 ||
   report.dimensionStateCount !== 26 ||
   report.validRoute.status !== 'success' ||
-  report.validRoute.runId !== authority.runId ||
   report.validRoute.modelCallCount !== 2 ||
   !report.validRoute.analystScopeBound ||
   !report.validRoute.producerScopeBound ||
-  !report.validRoute.receiptReturned ||
   report.failClosedRoute.status !== 'error' ||
   report.failClosedRoute.modelCallCount !== 0 ||
-  report.cellConservationFailClosed.status !== 'error' ||
-  report.cellConservationFailClosed.modelCallCount !== 2 ||
-  report.cellConservationFailClosed.receiptReturned ||
-  report.receipt?.runId !== authority.runId ||
-  report.receipt?.authorityHash !== authority.authorityHash ||
-  report.receipt?.selectedCellSetHash !== authority.selectedCellSetHash ||
-  report.receipt?.segmentStatus !== 'completed' ||
-  report.receipt?.attemptedCount !== 2 ||
-  report.receipt?.rejectedCount !== 2 ||
-  !report.receipt.actualStageHashesMatch ||
+  report.receipt.segmentStatus !== 'failed' ||
+  report.receipt.failedCount !== 2 ||
   report.receipt.productionFinalized ||
   report.receipt.publicRouteChanged
 ) {
-  throw new Error(`STRICT_TEST_DIMENSION_AGENT_PROBE_INVALID:${JSON.stringify(report)}`);
+  throw new Error('STRICT_TEST_DIMENSION_AGENT_PROBE_INVALID');
 }
 
 process.stdout.write(`${JSON.stringify(report)}\n`);
 
-function strictRuntimePort(agentAuthority, executionReceipts = []) {
-  const baselineObligationIds = agentAuthority.compiledPlan.schedule.factHarvestObligations.map(
-    (row) => row.obligationId
-  );
+function strictRuntimePort(agentAuthority) {
   const expansionPort = createStrictAnalysisExpansionPortV1({
     baselineScheduleHash: agentAuthority.fullBaselineScheduleHash,
-    baselineObligationIds,
+    baselineObligationIds: [],
     knownFactFamilies: [],
     knownSubjectRefs: [],
-    obligationCap: Math.max(1, baselineObligationIds.length),
+    obligationCap: 1,
   });
   const finalSchedule = expansionPort.seal();
   const context = createStrictAnalysisContextProjectionV1({
@@ -264,17 +202,14 @@ function strictRuntimePort(agentAuthority, executionReceipts = []) {
     expansionHeadHash: null,
     currentExpandedScheduleHash: agentAuthority.fullBaselineScheduleHash,
     finalExpandedScheduleHash: finalSchedule.finalExpandedScheduleHash,
-    analysisFixpointHash:
-      executionReceipts.length > 0
-        ? analysisLineageFor(agentAuthority, executionReceipts).analysisFixpoint.fixpointHash
-        : sha('probe-fixpoint'),
+    analysisFixpointHash: sha('probe-fixpoint'),
     privateCorpusRevision: null,
     hypothesisExpressionSetHash: null,
     lensBindingsHash: agentAuthority.compiledPlan.schedule.lensBindingsHash,
     sourceArtifactHash: agentAuthority.certifiedProjectFactsSourceArtifactHash,
     sourceRevisionVectorHash: agentAuthority.sourceRevisionVectorHash,
     questionIds: ['question:probe'],
-    factQueryObligationIds: baselineObligationIds,
+    factQueryObligationIds: [],
     analysisUnitIds: ['analysis-unit:probe'],
     factIds: [],
     witnessIds: [],
@@ -291,15 +226,12 @@ function strictRuntimePort(agentAuthority, executionReceipts = []) {
     epoch: 1,
     context,
     populations: [],
-    terminalObligationIds: baselineObligationIds,
+    terminalObligationIds: [],
     outstandingObligationIds: [],
   });
   return {
     enabled: true,
-    analysisLimits: {
-      maxEpochs: 1,
-      maxObligations: Math.max(1, baselineObligationIds.length),
-    },
+    analysisLimits: { maxEpochs: 1, maxObligations: 1 },
     expansionPort,
     readAnalysisEpoch: () => epoch,
     buildProducerInput: () => ({
@@ -321,71 +253,19 @@ function strictRuntimePort(agentAuthority, executionReceipts = []) {
   };
 }
 
-function strictSameRunRuntimePort(
-  agentAuthority,
-  executionReceipts,
-  mutateReview = (value) => value
-) {
-  const base = strictRuntimePort(agentAuthority, executionReceipts);
-  const factExecution = factExecutionFor(agentAuthority, executionReceipts);
-  const analysis = analysisLineageFor(agentAuthority, executionReceipts);
-  let analysisStageEvidence = null;
-  return {
-    ...base,
-    buildProducerInput: () => ({
-      analysisFixpointHash: analysis.analysisFixpoint.fixpointHash,
-      producerEligibleHypothesisIds: [],
-      analysisStageEvidenceHash: analysisStageEvidence?.analysisStageEvidenceHash ?? null,
-    }),
-    validateAnalystResult: (source, observedEpoch) => {
-      analysisStageEvidence = createAnalysisStageEvidence(
-        agentAuthority,
-        source,
-        factExecution,
-        analysis,
-        executionReceipts
-      );
-      return createStrictAnalysisGateOutcomeV1({
-        action: 'pass',
-        reasonCode: 'strict-analysis-fixpoint-stable',
-        observedEpochHash: observedEpoch.snapshotHash,
-        artifact: analysisStageEvidence,
-      });
-    },
-    reviewProducerResult: (source) => {
-      if (!analysisStageEvidence) {
-        throw new Error('STRICT_TEST_DIMENSION_AGENT_PROBE_ANALYSIS_REQUIRED');
-      }
-      return {
-        action: 'pass',
-        pass: true,
-        artifact: mutateReview(
-          createReviewStageEvidence(
-            agentAuthority,
-            source,
-            analysisStageEvidence,
-            executionReceipts
-          )
-        ),
-      };
-    },
-  };
-}
-
 function agentService(modelCalls) {
   return new AgentService({
     runtimeBuilder: {
-      build(profile, options) {
+      build(profile) {
         const strategy = new PipelineStrategy({
           stages: profile.runtimeOverrides.strategy.stages,
         });
-        const runtimeId = options?.runId ?? 'strict-test-probe-runtime';
         return {
-          id: runtimeId,
+          id: 'strict-test-probe-runtime',
           execute: async (message, options) =>
             strategy.execute(
               {
-                id: runtimeId,
+                id: 'strict-test-probe-model',
                 reactLoop: async (prompt) => {
                   modelCalls.push(prompt);
                   return {
@@ -423,121 +303,22 @@ function agentInput(strictProduction) {
   };
 }
 
-function createSameRunExecutionReceipts() {
-  return ['module-a', 'module-b']
-    .map((moduleId) =>
-      createExecutionReceipt({
-        name: `strict-test-${moduleId}`,
-        canonicalSubjectRef: `repo:${moduleId}`,
-        relativePath: `src/${moduleId}/index.ts`,
-        blobHash: sha(`blob:${moduleId}`),
-        evidenceEntryId: `evidence:${moduleId}:fact`,
-        projectContextRefId: `file:repo:src/${moduleId}/index.ts`,
-        witnessBindingHash: sha(`witness:${moduleId}`),
-        harvestKey: sha(`harvest-key:${moduleId}`),
-        harvestReceiptHash: sha(`harvest-receipt:${moduleId}`),
-      })
-    )
-    .sort((left, right) => left.obligationId.localeCompare(right.obligationId));
-}
-
-function createExecutionReceipt(input) {
-  const canonicalSubjectRef = input.canonicalSubjectRef;
-  const obligationSemantic = {
-    factFamilyId: 'syntax-idiom',
-    capabilityId: 'tree-sitter-query',
-    canonicalSubjectRef,
-    analysisScale: 'file',
-    denominator: 'complete-frozen-subject',
-  };
-  const obligationId = `fact:${sha(obligationSemantic).slice(7, 31)}`;
-  const denominatorFileIds = [`repo:${input.relativePath}@${input.blobHash}`];
-  const fileExecutionSemantic = {
-    repoId: 'repo',
-    relativePath: input.relativePath,
-    blobHash: input.blobHash,
-    status: 'complete',
-    reasonCode: 'COMPLETE',
-    truncated: false,
-    continuation: null,
-    witnessBindingHash: input.witnessBindingHash,
-    evidenceEntryId: input.evidenceEntryId,
-    projectContextRefId: input.projectContextRefId,
-    stagedFactIds: [],
-    discardedFactIds: [],
-    emittedFactIds: [],
-  };
-  const fileExecution = {
-    ...fileExecutionSemantic,
-    executionHash: sha(fileExecutionSemantic),
-  };
-  const outputSemantic = {
-    obligationId,
-    denominatorHash: sha(denominatorFileIds),
-    fileExecutionHashes: [fileExecution.executionHash],
-    derivedFactIds: [],
-    emittedFactIds: [],
-    disposition: 'inspected-no-pattern',
-    truncated: false,
-    continuation: null,
-  };
-  const semantic = {
-    schemaVersion: 1,
-    obligationId,
-    ...obligationSemantic,
-    sourceRevisionVectorHash: SOURCE_REVISION,
-    backendProducer: 'loaded:tree-sitter-query:probe-v1',
-    backendManifestHash: sha(`${input.name}:backend-manifest`),
-    backendLoadReceiptHash: sha(`${input.name}:backend-load`),
-    queryPackHash: sha(`${input.name}:query-pack`),
-    harvestKey: input.harvestKey,
-    harvestReceiptHash: input.harvestReceiptHash,
-    expectedFileCount: 1,
-    inspectedFileCount: 1,
-    denominatorFileIds,
-    denominatorHash: sha(denominatorFileIds),
-    witnessBindingHash: sha([input.witnessBindingHash]),
-    fileExecutions: [fileExecution],
-    derivedFactIds: [],
-    emittedFactIds: [],
-    disposition: 'inspected-no-pattern',
-    reasonCode: 'COMPLETE_FROZEN_SUBJECT_INSPECTED',
-    truncated: false,
-    continuation: null,
-    outputHash: sha(outputSemantic),
-  };
-  const receiptHash = sha(semantic);
-  const receipt = {
-    ...semantic,
-    terminalReceiptId: `fact-execution:${receiptHash.slice(7, 31)}`,
-    receiptHash,
-  };
-  assertFactQueryExecutionReceiptV1(receipt);
-  return receipt;
-}
-
-function factExecutionFor(agentAuthority, receipts) {
-  const terminalReceiptIds = receipts.map((receipt) => receipt.terminalReceiptId);
-  const terminalReceiptHashes = receipts.map((receipt) => receipt.receiptHash);
-  const harvestReceiptHashes = uniqueSorted(receipts.map((receipt) => receipt.harvestReceiptHash));
-  const denominatorHashes = uniqueSorted(receipts.map((receipt) => receipt.denominatorHash));
+function emptyFactExecution(agentAuthority) {
   const manifestSemantic = {
     schemaVersion: 1,
-    sourceArtifactId: 'artifact:strict-test-same-run-probe',
+    sourceArtifactId: 'artifact:strict-test-probe',
     sourceRevisionVectorHash: agentAuthority.sourceRevisionVectorHash,
     factQueryCatalogHash: agentAuthority.fullFactQueryCatalogHash,
     factHarvestScheduleHash: agentAuthority.compiledPlan.schedule.factHarvestScheduleHash,
     backendRegistryHash: sha('probe-backend-registry'),
-    obligationCount: receipts.length,
-    terminalReceiptIds,
-    terminalReceiptHashes,
-    terminalReceiptSetHash: hashCanonicalJson(terminalReceiptHashes),
-    harvestReceiptHashes,
-    harvestCount: harvestReceiptHashes.length,
-    denominatorHashes,
-    witnessBindingSetHash: hashCanonicalJson(
-      receipts.map((receipt) => receipt.witnessBindingHash).sort()
-    ),
+    obligationCount: 0,
+    terminalReceiptIds: [],
+    terminalReceiptHashes: [],
+    terminalReceiptSetHash: hashCanonicalJson([]),
+    harvestReceiptHashes: [],
+    harvestCount: 0,
+    denominatorHashes: [],
+    witnessBindingSetHash: hashCanonicalJson([]),
     factIds: [],
     factCount: 0,
     unexecutableCatalogFamilyIds: [],
@@ -548,7 +329,7 @@ function factExecutionFor(agentAuthority, receipts) {
   };
   return {
     facts: [],
-    receipts,
+    receipts: [],
     manifest: {
       ...manifestSemantic,
       manifestHash: hashCanonicalJson(manifestSemantic),
@@ -556,132 +337,7 @@ function factExecutionFor(agentAuthority, receipts) {
   };
 }
 
-function analysisLineageFor(agentAuthority, receipts) {
-  const baselineObligationIds = agentAuthority.compiledPlan.schedule.factHarvestObligations.map(
-    (row) => row.obligationId
-  );
-  const finalExpandedSchedule = createFinalExpandedMiningScheduleReceiptV1({
-    baselineScheduleHash: agentAuthority.fullBaselineScheduleHash,
-    baselineObligationIds,
-    expansionReceipts: [],
-  });
-  return {
-    baselineObligationIds,
-    expansionReceipts: [],
-    finalExpandedSchedule,
-    finalFactSchedule: agentAuthority.compiledPlan.schedule,
-    analysisFixpoint: createAnalysisFixpointReceiptV1({
-      finalExpandedSchedule,
-      terminalObligations: receipts.map((receipt) => ({
-        obligationId: receipt.obligationId,
-        disposition: receipt.disposition,
-        terminalReceiptId: receipt.terminalReceiptId,
-      })),
-      populationHashes: [],
-      clusterSets: [],
-      inductionReceiptHashes: [],
-      falsificationReceiptHashes: [],
-    }),
-    clusterSets: [],
-  };
-}
-
-function createAnalysisStageEvidence(agentAuthority, source, factExecution, analysis, receipts) {
-  const cells = agentAuthority.selectedCellIds.map((cellId) => {
-    const receipt = executionReceiptForCell(receipts, cellId);
-    return createStrictTestDimensionAgentCellAnalysisEvidenceV1({
-      cellId,
-      factReceiptHashes: [receipt.receiptHash],
-      analysis,
-    });
-  });
-  const semantic = {
-    kind: 'StrictTestDimensionAgentAnalysisStageEvidenceV1',
-    schemaVersion: 1,
-    runId: agentAuthority.runId,
-    authorityHash: agentAuthority.authorityHash,
-    selectedCellIds: agentAuthority.selectedCellIds,
-    selectedCellSetHash: agentAuthority.selectedCellSetHash,
-    analystStageResultHash: stageResultHash(source),
-    factExecution,
-    analysis,
-    cells,
-  };
-  return { ...semantic, analysisStageEvidenceHash: sha(semantic) };
-}
-
-function createReviewStageEvidence(agentAuthority, source, analysisStageEvidence, receipts) {
-  const producerStageResultHash = stageResultHash(source);
-  const cellDispositions = agentAuthority.selectedCellIds.map((cellId, index) => {
-    const analysisCell = analysisStageEvidence.cells[index];
-    const disposition = {
-      cellId,
-      disposition: 'rejected',
-      expressionSetReceipts: [],
-      semanticReviewAttestations: [],
-      dispositionReviewAttestations: [],
-      reasonCode: 'independent-review-rejected',
-      evidenceRefs: [`evidence:${cellId}`],
-    };
-    return {
-      ...disposition,
-      stageEvidence: createStrictTestDimensionAgentCellStageEvidenceV1({
-        authority: agentAuthority,
-        analysisCellEvidence: analysisCell,
-        producerStageResultHash,
-        disposition,
-      }),
-    };
-  });
-  const semantic = {
-    kind: 'StrictTestDimensionAgentReviewStageEvidenceV1',
-    schemaVersion: 1,
-    runId: agentAuthority.runId,
-    authorityHash: agentAuthority.authorityHash,
-    selectedCellIds: agentAuthority.selectedCellIds,
-    selectedCellSetHash: agentAuthority.selectedCellSetHash,
-    analysisStageEvidenceHash: analysisStageEvidence.analysisStageEvidenceHash,
-    producerStageResultHash,
-    cellDispositions,
-    expectedTrustPolicies: [],
-    completedAt: '2026-07-30T06:04:00.000Z',
-  };
-  return { ...semantic, reviewStageEvidenceHash: sha(semantic) };
-}
-
-function rehashReviewArtifact(artifact) {
-  const { reviewStageEvidenceHash: _reviewStageEvidenceHash, ...semantic } = artifact;
-  return { ...semantic, reviewStageEvidenceHash: sha(semantic) };
-}
-
-function executionReceiptForCell(receipts, cellId) {
-  const moduleId = cellId.split('::')[0];
-  const receipt = receipts.find((candidate) =>
-    candidate.fileExecutions.some((row) => row.relativePath.includes(`/${moduleId}/`))
-  );
-  if (!receipt) {
-    throw new Error(`STRICT_TEST_DIMENSION_AGENT_PROBE_FACT_RECEIPT_REQUIRED:${cellId}`);
-  }
-  return receipt;
-}
-
-function stageResultHash(value) {
-  const result = value && typeof value === 'object' ? value : {};
-  const tokenUsage =
-    result.tokenUsage && typeof result.tokenUsage === 'object' ? result.tokenUsage : {};
-  return sha({
-    reply: typeof result.reply === 'string' ? result.reply : '',
-    toolCalls: Array.isArray(result.toolCalls) ? result.toolCalls : [],
-    tokenUsage: {
-      input: typeof tokenUsage.input === 'number' ? tokenUsage.input : 0,
-      output: typeof tokenUsage.output === 'number' ? tokenUsage.output : 0,
-    },
-    iterations: typeof result.iterations === 'number' ? result.iterations : 0,
-    timedOut: result.timedOut === true,
-  });
-}
-
-function createCompiledPlan(executionReceipts = []) {
+function createCompiledPlan() {
   const catalog = buildDimensionCatalogSnapshot();
   const anatomy = buildAnatomyLensCatalogSnapshot();
   const requiredFactApplicability = buildRequiredFactApplicabilityUniverseV1(
@@ -710,25 +366,14 @@ function createCompiledPlan(executionReceipts = []) {
     eligibleCellsHash: hashCanonicalJson(cells),
     excludedCellsHash: hashCanonicalJson([]),
   };
-  const factHarvestObligations = executionReceipts
-    .map((receipt) => ({
-      obligationId: receipt.obligationId,
-      factFamilyId: receipt.factFamilyId,
-      capabilityId: receipt.capabilityId,
-      canonicalSubjectRef: receipt.canonicalSubjectRef,
-      analysisScale: receipt.analysisScale,
-      denominator: receipt.denominator,
-      source: 'required-universe',
-    }))
-    .sort((left, right) => left.obligationId.localeCompare(right.obligationId));
   const schedule = {
     schemaVersion: 1,
-    factHarvestObligations,
+    factHarvestObligations: [],
     lensBindings: [],
-    factHarvestScheduleHash: hashCanonicalJson(factHarvestObligations),
+    factHarvestScheduleHash: hashCanonicalJson([]),
     lensBindingsHash: hashCanonicalJson([]),
     baselineScheduleHash: hashCanonicalJson({
-      factHarvestScheduleHash: hashCanonicalJson(factHarvestObligations),
+      factHarvestScheduleHash: hashCanonicalJson([]),
       lensBindingsHash: hashCanonicalJson([]),
     }),
   };
@@ -864,8 +509,4 @@ function family(id, capabilityId) {
 
 function sha(value) {
   return hashCanonicalJson(value);
-}
-
-function uniqueSorted(values) {
-  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
 }

@@ -18,7 +18,6 @@ export const STRICT_SOURCE_REVISION = `sha256:${'1'.repeat(64)}`;
 export function createExecutionReceipt(input: {
   readonly name: string;
   readonly emittedFactIds: readonly string[];
-  readonly canonicalSubjectRef?: string;
   readonly disposition?: FactQueryExecutionReceiptV1['disposition'];
   readonly relativePath?: string;
   readonly blobHash?: string;
@@ -33,7 +32,7 @@ export function createExecutionReceipt(input: {
   const disposition = input.disposition ?? 'matched';
   const relativePath = input.relativePath ?? `src/${input.name}.ts`;
   const blobHash = input.blobHash ?? `sha256:${'9'.repeat(64)}`;
-  const canonicalSubjectRef = input.canonicalSubjectRef ?? `file:repo:${relativePath}`;
+  const canonicalSubjectRef = `file:repo:${relativePath}`;
   const evidenceEntryId = input.evidenceEntryId ?? `E-${input.name}`;
   const projectContextRefId = input.projectContextRefId ?? canonicalSubjectRef;
   const witnessBindingHash = input.witnessBindingHash ?? `sha256:${'0'.repeat(64)}`;
