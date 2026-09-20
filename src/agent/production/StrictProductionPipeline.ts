@@ -408,13 +408,23 @@ export class StrictAnalysisExpansionPortV1 {
     return row;
   }
 
-  seal() {
-    this.#finalSchedule ??= createFinalExpandedMiningScheduleReceiptV1({
-      baselineScheduleHash: this.#input.baselineScheduleHash,
-      baselineObligationIds: this.#input.baselineObligationIds,
-      expansionReceipts: this.#receipts,
-    });
-    return this.#finalSchedule;
+  /** Core 生成并校验回执后，先核对调用者的预期再提交状态；无参调用保持兼容。 */
+  seal(expectedFinalScheduleHash?: string) {
+    const schedule =
+      this.#finalSchedule ??
+      createFinalExpandedMiningScheduleReceiptV1({
+        baselineScheduleHash: this.#input.baselineScheduleHash,
+        baselineObligationIds: this.#input.baselineObligationIds,
+        expansionReceipts: this.#receipts,
+      });
+    if (
+      expectedFinalScheduleHash !== undefined &&
+      schedule.finalExpandedScheduleHash !== expectedFinalScheduleHash
+    ) {
+      fail('STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH');
+    }
+    this.#finalSchedule = schedule;
+    return schedule;
   }
 
   get receipts() {
@@ -705,6 +715,12 @@ function resolveStrictHypothesisDispositions(
   readonly dispositions: readonly StrictHypothesisDispositionV1[];
   readonly producerEligibleHypotheses: readonly ProducerEligibleHypothesisV1[];
 } {
+  // 外部解码结果不受 TS union 约束；非法标签不能绕过 unknown 的 fixpoint 失败路径。
+  for (const disposition of input.hypothesisDispositions) {
+    if (!['survived', 'narrowed', 'refuted', 'unknown'].includes(disposition.status)) {
+      fail('STRICT_ANALYST_HYPOTHESIS_DISPOSITION_INVALID', disposition.hypothesisId);
+    }
+  }
   const falsificationByHypothesis = new Map(
     falsifications.map((receipt) => [receipt.hypothesisId, receipt])
   );
@@ -2112,11 +2128,13 @@ function sortCanonical(value: unknown): unknown {
   );
 }
 
-function freeze<T>(value: T): T {
-  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+function freeze<T>(value: T, visited = new WeakSet<object>()): T {
+  // 已冻住容器不代表子记录不可变；独立访问集合也避免共享引用/循环重复遍历。
+  if (value && typeof value === 'object' && !visited.has(value)) {
+    visited.add(value);
     Object.freeze(value);
     for (const child of Object.values(value as Record<string, unknown>)) {
-      freeze(child);
+      freeze(child, visited);
     }
   }
   return value;

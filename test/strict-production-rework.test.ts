@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { createFrozenEvidenceProjection } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import {
   createStrictAnalysisContextProjectionV1,
+  createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisFixpointV1,
   createStrictHypothesisExpressionSetReceiptV1,
   createStrictProducerExpressionSetV1,
@@ -95,7 +96,7 @@ function createLineageFixture() {
     hypothesisId: 'hypothesis-handler',
     evidence,
   });
-  return { analysisFixpoint, lineage, semantic };
+  return { analysisFixpoint, lineage, semantic, context };
 }
 
 function createSet(
@@ -120,6 +121,24 @@ function createSet(
 }
 
 describe('strict producer predecessor-bound causal lineage', () => {
+  it('freezes nested population payloads behind an already frozen container', () => {
+    const { context } = createLineageFixture();
+    const nested = { factIds: ['fact-handler'] };
+    const population = Object.freeze({ nested });
+    const input = {
+      epoch: 1,
+      context,
+      populations: [population],
+      terminalObligationIds: context.factQueryObligationIds,
+      outstandingObligationIds: [],
+    };
+    const snapshot = createStrictAnalysisEpochSnapshotV1(input);
+    expect(Object.isFrozen(nested)).toBe(true);
+    expect(Object.isFrozen(nested.factIds)).toBe(true);
+    expect(() => nested.factIds.push('late-fact')).toThrow(TypeError);
+    expect(createStrictAnalysisEpochSnapshotV1(input).snapshotHash).toBe(snapshot.snapshotHash);
+  });
+
   it('derives immutable roots from semantic receipts and cannot reset the repair depth', () => {
     const { analysisFixpoint, lineage, semantic } = createLineageFixture();
     const initial = createSet(lineage, null, 'initial');
@@ -240,6 +259,68 @@ describe('strict producer predecessor-bound causal lineage', () => {
         terminalResolutions: [],
       })
     ).toThrow(/STRICT_EXPRESSION_TERMINAL_RESOLUTION_CONSERVATION/u);
+  });
+
+  it('rejects an invalid hypothesis disposition before an epoch can reach fixpoint', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        hypothesisDispositions: [
+          // 模拟外部解码输入越过 TS union，不能静默从 Producer 集合丢弃该假设。
+          { hypothesisId: 'hypothesis-handler', status: 'not-a-disposition' as never },
+        ],
+      })
+    ).toThrow(/STRICT_ANALYST_HYPOTHESIS_DISPOSITION_INVALID/u);
+  });
+
+  it('keeps unknown hypotheses unresolved until the fixpoint gate rejects them', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const enrolledCounterqueryIds = [semantic.executionReceipt.obligationId];
+    const counterqueryApplicability = {
+      status: 'required' as const,
+      reasonCode: 'counterquery-not-yet-executed',
+    };
+    const review = createReview({
+      reviewKind: 'falsification',
+      currentAnalysisFixpointHash: semantic.currentAnalysisFixpointHash,
+      populationHash: semantic.population.populationHash,
+      proposal: {
+        reviewKind: 'falsification',
+        populationHash: semantic.population.populationHash,
+        hypothesisId: 'hypothesis-handler',
+        enrolledCounterqueryIds,
+        executions: [],
+        counterqueryApplicability,
+      },
+      executionReceipts: [semantic.executionReceipt],
+      finalExpandedSchedule: semantic.finalExpandedSchedule,
+      terminalObligations: semantic.terminalObligations,
+    });
+    const epoch = validateStrictAnalystEpochV1({
+      ...semantic.epochInput,
+      enrolledObligationIds: enrolledCounterqueryIds,
+      falsificationInputs: [
+        {
+          hypothesisId: 'hypothesis-handler',
+          enrolledCounterqueryIds,
+          executions: [],
+          counterqueryApplicability,
+          dispositionReview: review,
+        },
+      ],
+      hypothesisDispositions: [{ hypothesisId: 'hypothesis-handler', status: 'unknown' }],
+      dispositionReviews: [review],
+    });
+    expect(epoch.falsifications[0]?.verdict).toBe('unknown');
+    expect(epoch.producerEligibleHypotheses).toEqual([]);
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [epoch],
+      })
+    ).toThrow(/STRICT_ANALYSIS_FIXPOINT_HYPOTHESIS_UNRESOLVED/u);
   });
 
   it('fails partial populations, string authority, and orphan disposition reviews closed', () => {

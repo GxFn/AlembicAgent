@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { createFinalExpandedMiningScheduleReceiptV1 } from '@alembic/core/production';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
@@ -8,7 +9,10 @@ import {
   type StrictAnalysisEpochSnapshotV1,
   type StrictAnalysisGateOutcomeV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
-import type { StrictProductionRuntimePortV1 } from '../src/agent/production/StrictProductionStages.js';
+import {
+  buildStrictProductionPipelineStagesV1,
+  type StrictProductionRuntimePortV1,
+} from '../src/agent/production/StrictProductionStages.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import type { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -63,6 +67,23 @@ function createInitialEpoch(): StrictAnalysisEpochSnapshotV1 {
     populations: [{ populationId: 'population-main', revision: 1, factIds: ['fact-base'] }],
     terminalObligationIds: ['base-1'],
     outstandingObligationIds: [],
+  });
+}
+
+/** 由真实 Core 纯构造器预先生成匹配 hash，不触发待测 expansion port 的 seal 副作用。 */
+function createReadyEpoch(): StrictAnalysisEpochSnapshotV1 {
+  const schedule = createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash: 'schedule-baseline',
+    baselineObligationIds: ['base-1'],
+    expansionReceipts: [],
+  });
+  const { schemaVersion: _version, snapshotHash: _hash, ...initial } = createInitialEpoch();
+  return createStrictAnalysisEpochSnapshotV1({
+    ...initial,
+    context: createContext({
+      finalExpandedScheduleHash: schedule.finalExpandedScheduleHash,
+      analysisFixpointHash: 'analysis-fixpoint-1',
+    }),
   });
 }
 
@@ -152,7 +173,11 @@ function buildRuntimePort(input: {
   };
 }
 
-async function executeStrict(runtimePort: StrictProductionRuntimePortV1, prompts: string[]) {
+async function executeStrict(
+  runtimePort: StrictProductionRuntimePortV1,
+  prompts: string[],
+  abortSignal?: AbortSignal
+) {
   const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
     params: { needsCandidates: true },
     context: { strategyContext: { strictProduction: runtimePort } },
@@ -174,11 +199,134 @@ async function executeStrict(runtimePort: StrictProductionRuntimePortV1, prompts
       },
     },
     message,
-    { strategyContext: { strictProduction: runtimePort } }
+    { strategyContext: { strictProduction: runtimePort }, abortSignal }
   );
 }
 
 describe('strict iterative Analyst epochs', () => {
+  it('does not seal the actual port before rejecting a corrupted typed outcome', async () => {
+    const epoch = createReadyEpoch();
+    const port = buildRuntimePort({
+      readAnalysisEpoch: () => epoch,
+      validateAnalystResult: (_source, observed) => ({
+        ...createStrictAnalysisGateOutcomeV1({
+          action: 'pass',
+          reasonCode: 'corrupted-pass',
+          observedEpochHash: observed.snapshotHash,
+        }),
+        outcomeHash: 'tampered',
+      }),
+    });
+    const prompts: string[] = [];
+    const output = await executeStrict(port, prompts);
+    expect(output.outcome).toBe('failed');
+    expect(output.phases.analyst_fixpoint_gate).toMatchObject({
+      action: 'reject',
+      reason: expect.stringContaining('STRICT_ANALYSIS_GATE_OUTCOME_HASH_MISMATCH'),
+    });
+    expect(port.expansionPort.finalSchedule).toBeNull();
+    expect(prompts).toHaveLength(1);
+  });
+
+  it('checks an expected schedule hash before committing seal and keeps the no-argument contract', () => {
+    const port = createStrictAnalysisExpansionPortV1({
+      baselineScheduleHash: 'schedule-baseline',
+      baselineObligationIds: ['base-1'],
+      knownFactFamilies: [],
+      knownSubjectRefs: [],
+      obligationCap: 1,
+    });
+    expect(() => port.seal('mismatched-schedule')).toThrow(
+      'STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH'
+    );
+    expect(port.finalSchedule).toBeNull();
+    const sealed = port.seal();
+    expect(port.seal(sealed.finalExpandedScheduleHash)).toBe(sealed);
+    expect(() => port.seal('mismatched-schedule')).toThrow(
+      'STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH'
+    );
+    expect(port.finalSchedule).toBe(sealed);
+  });
+  it('does not read or seal after a late validator response reaches a cancelled strict factory', async () => {
+    const epoch = createReadyEpoch();
+    const controller = new AbortController();
+    const readEpoch = vi.fn(() => epoch);
+    let entered!: () => void;
+    const entering = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: (outcome: StrictAnalysisGateOutcomeV1) => void;
+    const outcome = createStrictAnalysisGateOutcomeV1({
+      action: 'pass',
+      reasonCode: 'valid-late-review',
+      observedEpochHash: epoch.snapshotHash,
+    });
+    const port = buildRuntimePort({
+      readAnalysisEpoch: readEpoch,
+      validateAnalystResult: () => {
+        entered();
+        return new Promise<StrictAnalysisGateOutcomeV1>((resolve) => {
+          release = resolve;
+        });
+      },
+    });
+    const seal = vi.spyOn(port.expansionPort, 'seal');
+    const prompts: string[] = [];
+    const pending = executeStrict(port, prompts, controller.signal);
+    try {
+      await entering;
+      controller.abort();
+      const output = await pending;
+      const readsAtReturn = readEpoch.mock.calls.length;
+      expect(output.outcome).toBe('aborted');
+      expect(port.expansionPort.finalSchedule).toBeNull();
+      release(outcome); // 外部 validator 只返回回执，不调用 seal；后续副作用只能来自 adapter。
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(readEpoch).toHaveBeenCalledTimes(readsAtReturn);
+      expect(seal).not.toHaveBeenCalled();
+      expect(port.expansionPort.finalSchedule).toBeNull();
+      expect(prompts).toHaveLength(1);
+      expect(output.phases).not.toHaveProperty('analyst_fixpoint_gate');
+    } finally {
+      controller.abort();
+      release?.(outcome);
+    }
+  });
+
+  it('does not invoke strict ports when the factory evaluator is already cancelled', async () => {
+    const epoch = createReadyEpoch();
+    const readEpoch = vi.fn(() => epoch);
+    const validate = vi.fn(() =>
+      createStrictAnalysisGateOutcomeV1({
+        action: 'pass',
+        reasonCode: 'unused-review',
+        observedEpochHash: epoch.snapshotHash,
+      })
+    );
+    const port = buildRuntimePort({
+      readAnalysisEpoch: readEpoch,
+      validateAnalystResult: validate,
+    });
+    const review = vi.spyOn(port, 'reviewProducerResult');
+    const signal = AbortSignal.abort();
+    const stages = buildStrictProductionPipelineStagesV1();
+    for (const index of [1, 3]) {
+      const result = await stages[index].gate?.evaluator(
+        {},
+        {},
+        { strictProduction: port, abortSignal: signal }
+      );
+      expect(result).toMatchObject({
+        action: 'reject',
+        pass: false,
+        reason: 'STRICT_PRODUCTION_ABORTED',
+      });
+    }
+    expect(readEpoch).not.toHaveBeenCalled();
+    expect(validate).not.toHaveBeenCalled();
+    expect(review).not.toHaveBeenCalled();
+    expect(port.expansionPort.finalSchedule).toBeNull();
+  });
   it('enrolls and executes a discovered counterquery, then reruns Analyst to a stable fixpoint', async () => {
     const expansionPort = createStrictAnalysisExpansionPortV1({
       baselineScheduleHash: 'schedule-baseline',
@@ -822,6 +970,7 @@ describe('strict iterative Analyst epochs', () => {
       action: 'reject',
       reason: expect.stringContaining('STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH'),
     });
+    expect(expansionPort.finalSchedule).toBeNull();
     expect(output.phases).not.toHaveProperty('produce');
   });
 

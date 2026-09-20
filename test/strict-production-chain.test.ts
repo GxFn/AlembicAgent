@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 import {
   canonicalizeKnowledgeClustersV1,
   canonicalizeObservationPopulationV1,
@@ -6,7 +7,7 @@ import {
   createFinalExpandedMiningScheduleReceiptV1,
   hashKnowledgeClusterV1,
 } from '@alembic/core/production';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
   buildIndependentReviewPrompt,
@@ -646,6 +647,78 @@ describe('strict PipelineStrategy', () => {
     content: 'run strict pipeline',
     metadata: {},
   } as AgentMessage;
+
+  async function executeReviewResult(review: unknown) {
+    const runtimePort = { ...strictRuntimePort(), reviewProducerResult: () => review };
+    const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true },
+      context: { strategyContext: { strictProduction: runtimePort } },
+    });
+    return new PipelineStrategy({ stages }).execute(
+      {
+        id: 'strict-review-result',
+        reactLoop: async () => ({
+          reply: 'strict stage output',
+          toolCalls: [],
+          tokenUsage: { input: 1, output: 1 },
+          iterations: 1,
+        }),
+      },
+      message,
+      { strategyContext: { strictProduction: runtimePort } }
+    );
+  }
+
+  it('accepts the Main host continue/true review through the real strict stage factory', async () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    try {
+      const output = await executeReviewResult({
+        action: 'continue',
+        pass: true,
+        artifact: { expressionSets: [] },
+      });
+      expect(output.outcome).toBe('completed');
+      expect(output.phases.independent_review_gate).toMatchObject({
+        action: 'pass',
+        pass: true,
+        artifact: { expressionSets: [] },
+      });
+      expect(output.phases._strictGateReturns).toContainEqual(
+        expect.objectContaining({ gate: 'G2', verdict: 'pass' })
+      );
+      const translation = info.mock.calls.find(
+        ([message]) => message === '[StrictProductionStages] G2 reviewer compatibility translation'
+      );
+      expect(translation?.[1]).toEqual({
+        gate: 'G2',
+        originalAction: 'continue',
+        selectedAction: 'pass',
+        reason: 'main-review-compatibility',
+      });
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it.each([
+    { label: 'contradictory pass', value: { action: 'pass', pass: false } },
+    { label: 'truthy string', value: { pass: 'false' } },
+    { label: 'unknown action', value: { action: 'unexpected', pass: true } },
+    { label: 'null action', value: { action: null, pass: true } },
+    { label: 'contradictory continue', value: { action: 'continue', pass: false } },
+    { label: 'null', value: null },
+  ])('rejects an invalid strict reviewer result: $label', async ({ value }) => {
+    const output = await executeReviewResult(value);
+    expect(output.outcome).toBe('failed');
+    expect(output.phases.independent_review_gate).toMatchObject({
+      action: 'reject',
+      pass: false,
+      reason: expect.stringContaining('STRICT_PRODUCTION_GATE_RESULT_INVALID'),
+    });
+    expect(output.phases._strictGateReturns).toContainEqual(
+      expect.objectContaining({ gate: 'G2', verdict: 'failed', owner: 'independent-reviewer' })
+    );
+  });
 
   it('blocks Producer submit/review/persist tools at the existing production strategy boundary', async () => {
     const strategy = new PipelineStrategy({
