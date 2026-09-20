@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
 import type {
   ToolCallRequest,
   ToolDecision,
@@ -14,13 +15,17 @@ import type {
   ToolResultEnvelope,
   ToolResultTrust,
   ToolRouterContract,
+  ToolRuntimeCallContext,
   ToolScopeRelease,
 } from '#tools/kernel/index.js';
 import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
+import { toolAdmissionFailure } from '../admission.js';
 import { ToolRouter } from '../router.js';
 
 export interface ToolContextFactoryContract {
   create(request: ToolCallRequest): ToolContext;
+  /** 无副作用的宿主能力快照；查询不能调用 create 或执行工具来探测。 */
+  getAvailability?(runtime?: ToolRuntimeCallContext): ToolAvailabilitySnapshot;
   releaseScope?(scope: ToolScopeRelease): void | Promise<void>;
 }
 
@@ -51,14 +56,23 @@ const DEFAULT_TRUST: ToolResultTrust = {
  * …) — those are recorded directly into the DiagnosticsCollector by the pipeline — so only
  * degraded/fallbackUsed can be known here. Returns the shared empty constant for clean calls.
  */
-function diagnosticsFromResult(result: ToolResult): ToolResultDiagnostics {
+function diagnosticsFromResult(result: ToolResult, toolId: string): ToolResultDiagnostics {
   const degraded = result._meta?.degraded === true;
   const fallbackUsed = result._meta?.fallbackUsed === true;
   const warnings = result._meta?.diagnosticWarnings ?? [];
-  if (!degraded && !fallbackUsed && warnings.length === 0) {
+  const blocked = result._meta?.resultStatus === 'blocked';
+  if (!degraded && !fallbackUsed && warnings.length === 0 && !blocked) {
     return EMPTY_DIAGNOSTICS;
   }
-  return { ...EMPTY_DIAGNOSTICS, degraded, fallbackUsed, warnings };
+  return {
+    ...EMPTY_DIAGNOSTICS,
+    degraded,
+    fallbackUsed,
+    warnings,
+    ...(blocked
+      ? { blockedTools: [{ tool: toolId, reason: result.error || 'Tool call blocked' }] }
+      : {}),
+  };
 }
 
 export class ToolRouterAdapter implements ToolRouterContract {
@@ -97,15 +111,34 @@ export class ToolRouterAdapter implements ToolRouterContract {
         return this.#errorEnvelope(request.toolId, callId, startedAt, parsed.error);
       }
 
+      const toolAvailability = this.#contextFactory.getAvailability?.(request.runtime);
+      const decision = this.router.explain(parsed, { runtime: request.runtime, toolAvailability });
+      if (!decision.allowed) {
+        return this.#toEnvelope(
+          toolAdmissionFailure(parsed, decision),
+          request.toolId,
+          callId,
+          startedAt,
+          Date.now() - t0
+        );
+      }
+
       const cacheHint =
         this.router.getToolSpec(parsed.tool)?.actions[parsed.action]?.cache ?? 'none';
       const cachePolicy = cacheHint === 'delta' ? 'session' : cacheHint;
 
       const ctx = {
         ...this.#contextFactory.create(request),
+        ...(request.runtime ? { runtime: request.runtime } : {}),
+        ...(toolAvailability ? { toolAvailability } : {}),
         ...(request.abortSignal ? { abortSignal: request.abortSignal } : {}),
       };
-      const result = await this.router.execute(parsed, ctx);
+      const getAvailability = this.#contextFactory.getAvailability;
+      const result = await this.router.execute(parsed, ctx, {
+        ...(getAvailability
+          ? { getAvailability: () => getAvailability.call(this.#contextFactory, request.runtime) }
+          : {}),
+      });
       const durationMs = Date.now() - t0;
 
       const envelope = this.#toEnvelope(
@@ -143,24 +176,31 @@ export class ToolRouterAdapter implements ToolRouterContract {
   }
 
   async explain(request: ToolCallRequest): Promise<ToolDecision> {
+    if (request.abortSignal?.aborted) {
+      return {
+        allowed: false,
+        stage: 'execute',
+        resultStatus: 'aborted',
+        reason: 'Tool call aborted before execution',
+      };
+    }
     const parsed = this.router.parseToolCall(request.toolId, request.args);
     if ('error' in parsed) {
       return { allowed: false, stage: 'discover', reason: parsed.error };
     }
 
-    const spec = this.router.getToolSpec(parsed.tool);
-    if (!spec) {
-      return { allowed: false, stage: 'discover', reason: `Unknown tool: ${parsed.tool}` };
-    }
-    if (!spec.actions[parsed.action]) {
+    try {
+      return this.router.explain(parsed, {
+        runtime: request.runtime,
+        toolAvailability: this.#contextFactory.getAvailability?.(request.runtime),
+      });
+    } catch (err: unknown) {
       return {
         allowed: false,
         stage: 'discover',
-        reason: `Unknown action: ${parsed.tool}.${parsed.action}`,
+        reason: err instanceof Error ? err.message : String(err),
       };
     }
-
-    return { allowed: true, stage: 'execute' };
   }
 
   #toEnvelope(
@@ -183,14 +223,14 @@ export class ToolRouterAdapter implements ToolRouterContract {
       callId,
       startedAt,
       durationMs,
-      status: result.ok ? 'success' : 'error',
+      status: result.ok ? 'success' : (result._meta?.resultStatus ?? 'error'),
       text,
       structuredContent: result.data,
       cache: {
         hit: result._meta?.cached ?? false,
         policy: cachePolicy,
       },
-      diagnostics: diagnosticsFromResult(result),
+      diagnostics: diagnosticsFromResult(result, toolId),
       trust: result.ok ? DEFAULT_TRUST : { ...DEFAULT_TRUST, containsUntrustedText: true },
     };
   }

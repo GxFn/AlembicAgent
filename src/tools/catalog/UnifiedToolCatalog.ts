@@ -28,6 +28,7 @@ import type {
   InternalToolHandlerStore,
   ToolRouterContract,
 } from '#tools/kernel/index.js';
+import type { ToolSchemaQuery } from '#tools/kernel/toolSchema.js';
 
 // ── Types inlined from deleted ToolDefinition.ts ──
 
@@ -211,18 +212,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
    * When `model` is provided, tool descriptions are matched against modelOverrides.
    */
   toToolSchemasForModel(ids?: readonly string[] | null, model?: string): ToolSchemaProjection[] {
-    const manifests = this.list({ ids });
-    return manifests.map((manifest) => {
-      const def = this.#defs.get(manifest.id);
-      if (def && model) {
-        return definitionToSchemaProjection(def, model);
-      }
-      return {
-        name: manifest.id,
-        description: manifest.description,
-        parameters: manifest.inputSchema,
-      };
-    });
+    return this.querySchemas({ selection: ids, model, mode: 'full' }).schemas;
   }
 
   // ── Lazy Loading: lightweight / mixed schema projection ──
@@ -252,11 +242,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
    * Used for tools the agent hasn't touched yet to reduce token overhead.
    */
   toLightweightSchemas(ids?: readonly string[] | null): ToolSchemaProjection[] {
-    return this.list({ ids }).map((manifest) => ({
-      name: manifest.id,
-      description: manifest.description.split('\n')[0].slice(0, 120),
-      parameters: { type: 'object', properties: {} },
-    }));
+    return this.querySchemas({ selection: ids, mode: 'lightweight' }).schemas;
   }
 
   /**
@@ -276,29 +262,23 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     model?: string,
     firstRound = false
   ): ToolSchemaProjection[] {
-    if (firstRound) {
-      return this.toToolSchemasForModel(ids, model);
-    }
+    return this.querySchemas({ selection: ids, model, mode: 'mixed', firstRound }).schemas;
+  }
 
-    const manifests = this.list({ ids });
-    return manifests.map((manifest) => {
-      if (this.#expandedToolIds.has(manifest.id)) {
-        const def = this.#defs.get(manifest.id);
-        if (def && model) {
-          return definitionToSchemaProjection(def, model);
-        }
-        return {
-          name: manifest.id,
-          description: manifest.description,
-          parameters: manifest.inputSchema,
-        };
-      }
-      return {
-        name: manifest.id,
-        description: manifest.description.split('\n')[0].slice(0, 120),
-        parameters: { type: 'object', properties: {} },
-      };
-    });
+  protected override projectSchema(
+    manifest: ToolCapabilityManifest,
+    query: ToolSchemaQuery
+  ): ToolSchemaProjection {
+    const lightweight =
+      query.mode === 'lightweight' ||
+      (query.mode === 'mixed' && !query.firstRound && !this.#expandedToolIds.has(manifest.id));
+    if (lightweight) {
+      return super.projectSchema(manifest, { ...query, mode: 'lightweight' });
+    }
+    const def = this.#defs.get(manifest.id);
+    return def && query.model
+      ? definitionToSchemaProjection(def, query.model)
+      : super.projectSchema(manifest, { ...query, mode: 'full' });
   }
 
   // ── Inspection ──

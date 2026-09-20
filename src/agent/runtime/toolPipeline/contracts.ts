@@ -27,7 +27,7 @@ export type ToolRuntimePort = Pick<
   | 'emitProgress'
   | 'bus'
 >;
-export type ToolLoopPort = Partial<Pick<LoopContext, 'resourceScope'>> &
+export type ToolLoopPort = Partial<Pick<LoopContext, 'resourceScope' | 'toolSchemas'>> &
   Pick<
     LoopContext,
     | 'abortSignal'

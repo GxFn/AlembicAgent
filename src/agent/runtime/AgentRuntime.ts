@@ -38,8 +38,11 @@ import {
   resolveModelQuirks,
   TEXT_COMPAT_CALL_SOURCE,
 } from '#ai/registry/ModelQuirks.js';
-import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
+import { queryToolSchemas } from '#tools/catalog/schemaQuery.js';
+import type { ToolRuntimeCallContext } from '#tools/kernel/context.js';
 import { isToolResultEnvelope, type ToolScopeRelease } from '#tools/kernel/index.js';
+import type { ToolActionAllowlist, ToolSchemaQueryResult } from '#tools/kernel/toolSchema.js';
+import { isToolActionAllowlist } from '#tools/kernel/toolSelection.js';
 import {
   applyDimensionSubmitSchemaVariant,
   DEPTH_SLOT_PROPS,
@@ -149,12 +152,9 @@ function resolveProviderInputBudget(stageProfile: LLMInputStageProfile) {
   }
 }
 
-type RuntimeToolActionAllowlist = Record<string, string[] | null>;
-
 interface RuntimeToolContract {
-  actions: RuntimeToolActionAllowlist;
+  actions: ToolActionAllowlist;
   ids: string[];
-  restrictedActions: Record<string, string[]>;
 }
 
 // 单个模块级 ALS 随 runtime 模块存活，避免每个短命 Agent 实例创建需 disable 的 ALS。
@@ -618,37 +618,10 @@ export class AgentRuntime {
       ? this.#resolveCapabilities(capabilityOverride)
       : this.capabilities;
 
-    // 构建基础系统提示词 (委托 SystemPromptBuilder)
-    let baseSystemPrompt = systemPromptOverride || this.#promptBuilder.build(caps, context);
-
     // 收集工具 (空列表是明确无工具，不再隐式展开为全量工具)
     const toolContract = this.#collectToolContract(caps, additionalToolsOverride);
-    const allowedToolIds = toolContract.ids;
-    const toolSchemas = this.#getToolSchemas(toolContract, this.#modelRef);
-    diagnosticsCollector.recordStageToolset({
-      stage: typeof context.pipelinePhase === 'string' ? context.pipelinePhase : 'react_loop',
-      capabilities: caps.map((c: Capability) => c.name),
-      allowedToolIds,
-      allowedToolActions: toolContract.restrictedActions,
-      toolSchemaCount: toolSchemas.length,
-      ...(source ? { source } : {}),
-    });
-    // P1-A F4：装配契约显性化。capabilities 解析出了工具 id 但 schema 投影为空，唯一常见
-    // 原因是宿主 container 没接 capabilityCatalog(#getToolSchemas 经 container.get 解析)——
-    // 此前表现为 toolChoice=none、工具面整体静默死亡、零诊断(E2E 装配首跑实证)。
-    // 只留痕不改行为：宿主一眼能定位接线错误，而不是面对一个"会说话不干活"的 agent。
-    if (caps.length > 0 && allowedToolIds.length > 0 && toolSchemas.length === 0) {
-      this.logger.warn(
-        '[AgentRuntime] tool schema projection is EMPTY while capabilities resolved tool ids — ' +
-          'capabilityCatalog is likely missing from the container; tools will be invisible to the model',
-        { capabilities: caps.map((c: Capability) => c.name), allowedToolIds }
-      );
-      diagnosticsCollector.warn({
-        code: 'tool_schema_projection_empty',
-        message:
-          'capabilities resolved tool ids but schema projection is empty (container capabilityCatalog missing/miswired?)',
-      });
-    }
+    // 构建基础系统提示词 (委托 SystemPromptBuilder)
+    let baseSystemPrompt = systemPromptOverride || this.#promptBuilder.build(caps, context);
 
     // 创建统一消息适配器 (消除 useCtxWin 双模式)
     const messages = createMessageAdapter(contextWindow);
@@ -714,6 +687,57 @@ export class AgentRuntime {
       );
     }
 
+    // 当前运行资源准备后再查询。schema 与执行动作消费同一快照；无资源的静态目录不能代替此判断。
+    const projection = this.#queryToolSchemas(toolContract, this.#modelRef, {
+      agentId: this.id,
+      sharedState: sharedState || null,
+      memoryCoordinator: memoryCoordinator || null,
+      evidenceLedger,
+    });
+    const toolSchemas = projection.schemas;
+    const allowedToolIds = toolContract.ids.filter((id) =>
+      Object.hasOwn(projection.allowedTools, id)
+    );
+    const allowedToolActions = Object.fromEntries(
+      Object.entries(projection.allowedTools)
+        .filter(([, actions]) => actions != null)
+        .map(([tool, actions]) => [tool, [...(actions ?? [])]])
+    );
+    diagnosticsCollector.recordStageToolset({
+      stage: typeof context.pipelinePhase === 'string' ? context.pipelinePhase : 'react_loop',
+      capabilities: caps.map((c: Capability) => c.name),
+      allowedToolIds,
+      allowedToolActions,
+      toolSchemaCount: toolSchemas.length,
+      ...(source ? { source } : {}),
+    });
+    for (const unavailable of projection.unavailable ?? []) {
+      diagnosticsCollector.warn({
+        code: 'tool_host_unavailable',
+        tool: unavailable.tool,
+        message: unavailable.reason,
+      });
+    }
+    if (
+      caps.length > 0 &&
+      toolContract.ids.length > 0 &&
+      toolSchemas.length === 0 &&
+      !projection.unavailable?.length
+    ) {
+      this.logger.warn(
+        '[AgentRuntime] tool schema projection is EMPTY while capabilities resolved tool ids; capabilityCatalog may be missing or miswired',
+        {
+          capabilities: caps.map((cap: Capability) => cap.name),
+          allowedToolIds: toolContract.ids,
+        }
+      );
+      diagnosticsCollector.warn({
+        code: 'tool_schema_projection_empty',
+        message:
+          'capabilities resolved tool ids but schema projection is empty (container capabilityCatalog missing/miswired?)',
+      });
+    }
+
     const ctx = new LoopContext({
       resourceRunId: toolResourceRun.getStore()?.runId,
       messages,
@@ -727,7 +751,7 @@ export class AgentRuntime {
       capabilities: caps,
       baseSystemPrompt,
       allowedToolIds,
-      allowedToolActions: toolContract.restrictedActions,
+      allowedToolActions,
       toolSchemas,
       prompt,
       onToolCall: onToolCall || null,
@@ -2143,7 +2167,7 @@ export class AgentRuntime {
     const allowAllActions = (tool: string) => {
       actionMap.set(tool, null);
     };
-    const allowActions = (tool: string, actions: string[]) => {
+    const allowActions = (tool: string, actions: readonly string[]) => {
       if (actionMap.get(tool) === null) {
         return;
       }
@@ -2158,9 +2182,16 @@ export class AgentRuntime {
 
     for (const cap of caps) {
       const allowedTools = (cap as { allowedTools?: unknown }).allowedTools;
-      if (isActionAllowlist(allowedTools)) {
+      if (allowedTools !== undefined) {
+        if (!isToolActionAllowlist(allowedTools)) {
+          throw new Error(`Invalid capability action allowlist: ${cap.name}`);
+        }
         for (const [tool, actions] of Object.entries(allowedTools)) {
-          allowActions(tool, actions);
+          if (actions == null) {
+            allowAllActions(tool);
+          } else {
+            allowActions(tool, actions);
+          }
         }
         continue;
       }
@@ -2177,68 +2208,42 @@ export class AgentRuntime {
       allowAllActions(String(t));
     }
 
-    const ids = [...actionMap.keys()];
-    const actions: RuntimeToolActionAllowlist = {};
-    const restrictedActions: Record<string, string[]> = {};
-    for (const [tool, set] of actionMap.entries()) {
-      if (set === null) {
-        actions[tool] = null;
-        continue;
-      }
-      const values = [...set];
-      actions[tool] = values;
-      restrictedActions[tool] = values;
-    }
-    return { actions, ids, restrictedActions };
+    const ids = [...actionMap.entries()]
+      .filter(([, set]) => set === null || set.size > 0)
+      .map(([tool]) => tool);
+    const actions = Object.fromEntries(
+      ids.map((tool) => {
+        const set = actionMap.get(tool);
+        return [tool, set ? [...set] : null];
+      })
+    );
+    return { actions, ids };
   }
 
-  #getToolSchemas(toolContract: RuntimeToolContract, model?: string): ToolSchemaProjection[] {
-    const ids = toolContract.ids.map(String);
+  #queryToolSchemas(
+    toolContract: RuntimeToolContract,
+    model: string,
+    runtime: ToolRuntimeCallContext
+  ): ToolSchemaQueryResult {
     const catalog = (this.container as { get?: (name: string) => unknown } | null)?.get?.(
       'capabilityCatalog'
-    ) as
-      | {
-          toToolSchemas(ids?: readonly string[] | null): ToolSchemaProjection[];
-          toToolSchemasForActions?(
-            allowedTools?: RuntimeToolActionAllowlist | null,
-            model?: string
-          ): ToolSchemaProjection[];
-          toToolSchemasForModel?(
-            ids?: readonly string[] | null,
-            model?: string
-          ): ToolSchemaProjection[];
-          toMixedSchemas?(
-            ids?: readonly string[] | null,
-            model?: string,
-            firstRound?: boolean
-          ): ToolSchemaProjection[];
-          toMixedSchemasForActions?(
-            allowedTools?: RuntimeToolActionAllowlist | null,
-            model?: string,
-            firstRound?: boolean
-          ): ToolSchemaProjection[];
-        }
-      | undefined;
-    // Lazy Loading: use mixed schemas (lightweight for unused tools)
-    // firstRound = true when no tools have been expanded yet (first stage or fresh session)
-    if (catalog?.toMixedSchemasForActions) {
-      const expandedCount = (catalog as { expandedCount?: number }).expandedCount ?? 0;
-      return catalog.toMixedSchemasForActions(toolContract.actions, model, expandedCount === 0);
-    }
-    if (catalog?.toToolSchemasForActions) {
-      return catalog.toToolSchemasForActions(toolContract.actions, model);
-    }
-    if (catalog?.toMixedSchemas) {
-      const expandedCount = (catalog as { expandedCount?: number }).expandedCount ?? 0;
-      return catalog.toMixedSchemas(ids, model, expandedCount === 0);
-    }
-    if (model && catalog?.toToolSchemasForModel) {
-      return catalog.toToolSchemasForModel(ids, model);
-    }
-    if (catalog?.toToolSchemas) {
-      return catalog.toToolSchemas(ids);
-    }
-    return [];
+    );
+    const expandedCount = (catalog as { expandedCount?: number } | undefined)?.expandedCount ?? 0;
+    return queryToolSchemas(
+      catalog,
+      {
+        selection: toolContract.actions,
+        model,
+        mode: 'mixed',
+        firstRound: expandedCount === 0,
+        runtime,
+      },
+      (method) => {
+        this.logger.info(
+          `[AgentRuntime] legacy schema query adapter: ${method}; stage action constraints retained`
+        );
+      }
+    );
   }
 
   /** Mark tools as expanded after use (for lazy loading) */
@@ -2360,15 +2365,6 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
       additionalProperties: false,
     },
   };
-}
-
-function isActionAllowlist(value: unknown): value is Record<string, string[]> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false;
-  }
-  return Object.values(value).every(
-    (actions) => Array.isArray(actions) && actions.every((action) => typeof action === 'string')
-  );
 }
 
 function buildAgentProcessEvent(

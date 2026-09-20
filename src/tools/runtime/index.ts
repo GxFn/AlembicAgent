@@ -1,4 +1,14 @@
-export type { KnowledgeManagementPort, KnowledgeReadPort } from '#tools/kernel/knowledge.js';
+export type {
+  ToolAvailabilityContext,
+  ToolAvailabilitySnapshot,
+  ToolUnavailableReason,
+} from '#tools/kernel/availability.js';
+export type {
+  KnowledgeManagementPort,
+  KnowledgeReadPort,
+  KnowledgeSearchPort,
+  KnowledgeSearchResult,
+} from '#tools/kernel/knowledge.js';
 export type {
   ActionHandler,
   CapabilityDef,
@@ -20,6 +30,13 @@ export type {
   ToolSpec,
 } from '#tools/kernel/registry.js';
 export { estimateTokens, fail, ok } from '#tools/kernel/registry.js';
+export type {
+  ToolActionAllowlist,
+  ToolSchemaQuery,
+  ToolSchemaQueryPort,
+  ToolSchemaQueryResult,
+  ToolSelection,
+} from '#tools/kernel/toolSchema.js';
 export * from './adapter/index.js';
 export * from './cache/index.js';
 export * from './compressor/index.js';

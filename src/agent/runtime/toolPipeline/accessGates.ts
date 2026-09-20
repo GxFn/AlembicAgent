@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { stableStringify } from '#shared/serialization.js';
 import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
+import { isToolActionAllowed } from '#tools/kernel/toolSelection.js';
 import { checkTerminalCommandAllowlist } from '#tools/runtime/handlers/terminalSafety.js';
 import {
   getToolAction,
@@ -68,12 +69,20 @@ export const allowlistGate = {
       };
     }
     const action = getToolAction(call);
-    if (action && !isActionAllowed(ctx.loopCtx, call.name, action)) {
+    const schema = ctx.loopCtx.toolSchemas?.find((item) => item.name === call.name);
+    const parameters = schema?.parameters as { required?: unknown } | undefined;
+    const requiresAction =
+      Array.isArray(parameters?.required) && parameters.required.includes('action');
+    // 只有实际schema要求action时才拒绝省略；泛型flat工具不能被强加内置envelope语法。
+    if (
+      (requiresAction && !action) ||
+      (action && !isActionAllowed(ctx.loopCtx, call.name, action))
+    ) {
       const allowedActions = ctx.loopCtx.allowedToolActions?.[call.name] || [];
       return {
         blocked: true,
         result: {
-          error: `Action "${call.name}.${action}" is not available in the current stage. Allowed actions for "${call.name}": ${allowedActions.join(', ')}`,
+          error: `Action "${call.name}.${action || '(missing)'}" is not available in the current stage. Allowed actions for "${call.name}": ${allowedActions.join(', ')}`,
         },
       };
     }
@@ -169,6 +178,8 @@ function isActionAllowed(loopCtx: ToolLoopPort, toolName: string, actionName: st
   if (!allowedNames.has(toolName)) {
     return false;
   }
-  const allowedActions = loopCtx.allowedToolActions?.[toolName];
-  return !allowedActions || allowedActions.includes(actionName);
+  const allowedActions = Object.hasOwn(loopCtx.allowedToolActions ?? {}, toolName)
+    ? loopCtx.allowedToolActions[toolName]
+    : null;
+  return isToolActionAllowed({ [toolName]: allowedActions }, toolName, actionName);
 }

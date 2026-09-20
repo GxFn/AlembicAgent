@@ -6,6 +6,7 @@
 
 import type { ToolDecisionResultStatus } from './decision.js';
 import type { ToolResultEnvelope } from './result.js';
+import type { ToolActionAllowlist } from './toolSchema.js';
 
 export type ToolSurface = 'runtime' | 'http' | 'mcp' | 'dashboard' | 'composer' | 'system';
 
@@ -147,6 +148,8 @@ export interface ToolScopeRelease {
 }
 
 export interface ToolRuntimeCallContext {
+  /** 当前阶段允许集合，由 runtime 投影；仅可收窄宿主/router 配置，不来自模型参数。 */
+  allowedTools?: ToolActionAllowlist;
   agentId?: string;
   resourceScope?: ToolResourceScope;
   presetName?: string;

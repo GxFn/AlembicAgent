@@ -1,5 +1,5 @@
 /** 知识 search、prime、detail 的只读查询与受限投影。 */
-import type { KnowledgeReadPort } from '#tools/kernel/knowledge.js';
+import { KNOWLEDGE_SEARCH_DEFAULT_KIND, type KnowledgeReadPort } from '#tools/kernel/knowledge.js';
 import {
   estimateTokens,
   fail,
@@ -56,7 +56,7 @@ export async function handleSearch(
     return fail('knowledge.search requires query');
   }
 
-  const kind = (params.kind as string) ?? 'all';
+  const kind = (params.kind as string) ?? KNOWLEDGE_SEARCH_DEFAULT_KIND;
   const limit = Math.min((params.limit as number) || 10, 50);
   const category = params.category as string | undefined;
 

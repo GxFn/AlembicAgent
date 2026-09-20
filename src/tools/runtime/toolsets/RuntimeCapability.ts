@@ -7,12 +7,14 @@
  */
 
 import type { CapabilityDef, TerminalCommandAllowlist } from '#tools/kernel/registry.js';
+import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
+import { normalizeToolActions } from '#tools/kernel/toolSelection.js';
 import { TOOL_REGISTRY } from '../registry.js';
 import { Capability } from './Capability.js';
 
 export abstract class RuntimeCapability extends Capability {
   abstract get description(): string;
-  abstract get allowedTools(): Record<string, string[]>;
+  abstract get allowedTools(): ToolActionAllowlist;
 
   get commandAllowlist(): TerminalCommandAllowlist | undefined {
     return undefined;
@@ -38,10 +40,19 @@ export abstract class RuntimeCapability extends Capability {
   }
 }
 
-function generatePromptFragment(allowedTools: Record<string, string[]>): string {
-  const lines: string[] = ['## Available Tools'];
+function generatePromptFragment(allowedTools: ToolActionAllowlist): string {
+  const lines: string[] = [
+    '## Capability Tool Permissions',
+    'The following actions are permitted by this capability. Call only tools and branches present in the current tool schemas.',
+  ];
 
-  for (const [tool, actions] of Object.entries(allowedTools)) {
+  const selection = normalizeToolActions(
+    allowedTools,
+    Object.fromEntries(
+      Object.entries(TOOL_REGISTRY).map(([tool, spec]) => [tool, Object.keys(spec.actions)])
+    )
+  );
+  for (const [tool, actions] of Object.entries(selection)) {
     const spec = TOOL_REGISTRY[tool];
     if (!spec) {
       continue;

@@ -8,6 +8,11 @@
  * there are no version labels left in the tool system.
  */
 
+export type {
+  ToolAvailabilityContext,
+  ToolAvailabilitySnapshot,
+  ToolUnavailableReason,
+} from './availability.js';
 export * from './context.js';
 export * from './decision.js';
 export * from './handler.js';
@@ -16,3 +21,10 @@ export * from './registry.js';
 export * from './request.js';
 export * from './result.js';
 export * from './routing.js';
+export type {
+  ToolActionAllowlist,
+  ToolSchemaQuery,
+  ToolSchemaQueryPort,
+  ToolSchemaQueryResult,
+  ToolSelection,
+} from './toolSchema.js';

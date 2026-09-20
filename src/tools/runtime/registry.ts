@@ -7,7 +7,10 @@
  */
 
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
+import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
+import { KNOWLEDGE_SEARCH_DEFAULT_KIND } from '#tools/kernel/knowledge.js';
 import type { ToolRegistry, ToolSpec } from '#tools/kernel/registry.js';
+import type { ToolSelection } from '#tools/kernel/toolSchema.js';
 import { handle as handleCode } from './handlers/code.js';
 import { handle as handleEvidence } from './handlers/evidence.js';
 import { handle as handleGraph } from './handlers/graph.js';
@@ -15,6 +18,7 @@ import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
 import { handle as handleMeta } from './handlers/meta.js';
 import { handle as handleTerminal } from './handlers/terminal.js';
+import { createToolRegistryView } from './selection.js';
 
 /**
  * P4/C10: note_finding 的结构化深度槽，从 Core DEPTH_DIMENSIONS 单源渲染(与深度契约/裁判/评分/指引同源)。
@@ -293,6 +297,7 @@ const KNOWLEDGE_SPEC: ToolSpec = {
           kind: {
             type: 'string',
             enum: ['recipe', 'candidate', 'all'],
+            default: KNOWLEDGE_SEARCH_DEFAULT_KIND,
             description: 'Filter by kind (default: all)',
           },
           limit: { type: 'number', description: 'Max results (default 10)' },
@@ -798,7 +803,11 @@ function actionScopedDescription(spec: ToolSpec, actionNames: string[], restrict
   return summaries.length > 0 ? `${spec.name} actions: ${summaries.join('; ')}` : spec.description;
 }
 
-function actionScopedParamsSchema(spec: ToolSpec, actionNames: string[]): Record<string, unknown> {
+function actionScopedParamsSchema(
+  spec: ToolSpec,
+  actionNames: string[],
+  constraints?: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>
+): Record<string, unknown> {
   if (actionNames.length === 1) {
     const action = spec.actions[actionNames[0]];
     if (action) {
@@ -811,9 +820,36 @@ function actionScopedParamsSchema(spec: ToolSpec, actionNames: string[]): Record
   }
 
   const paramsDescription = actionParamsDescription(spec, actionNames);
+  const constrainedNames = new Set(
+    actionNames.flatMap((action) => Object.keys(constraints?.[action] || {}))
+  );
+  const properties: Record<string, unknown> = {};
+  for (const name of constrainedNames) {
+    const relevant = actionNames.flatMap((action) => {
+      const property = (
+        spec.actions[action].params.properties as
+          | Record<string, Record<string, unknown>>
+          | undefined
+      )?.[name];
+      return property ? [{ action, property }] : [];
+    });
+    // 多动作共用参数对象：只合并真正声明该字段的动作，不向其他动作新增 required。
+    // 任一动作该字段没有枚举时不能用别的动作枚举缩窄它，执行端仍逐动作检查。
+    if (relevant.length === 0 || relevant.some(({ property }) => !Array.isArray(property.enum))) {
+      continue;
+    }
+    properties[name] = {
+      ...cloneJsonSchema(relevant[0].property),
+      enum: [...new Set(relevant.flatMap(({ property }) => property.enum as string[]))],
+      description: relevant
+        .map(({ action, property }) => `${action}: ${(property.enum as string[]).join(', ')}`)
+        .join('; '),
+    };
+  }
   return {
     type: 'object',
     ...(paramsDescription ? { description: paramsDescription } : {}),
+    ...(Object.keys(properties).length > 0 ? { properties } : {}),
   };
 }
 
@@ -868,19 +904,27 @@ export function applyDimensionSubmitSchemaVariant(
 
 /** 生成轻量 schema（首轮发给 LLM） */
 export function generateLightweightSchemas(
-  allowedTools?: Record<string, string[]>
+  allowedTools?: ToolSelection,
+  availability?: ToolAvailabilitySnapshot
+): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
+  return projectRegistrySchemas(
+    createToolRegistryView(TOOL_REGISTRY, allowedTools, availability),
+    allowedTools != null || availability !== undefined,
+    availability?.parameters
+  );
+}
+
+/** 内部投影接缝：catalog 同一次视图同时产出 schema 和执行动作集。 */
+export function projectRegistrySchemas(
+  registry: ToolRegistry,
+  restricted: boolean,
+  parameters?: ToolAvailabilitySnapshot['parameters']
 ): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
   const schemas: Array<{ name: string; description: string; parameters: Record<string, unknown> }> =
     [];
 
-  for (const [name, spec] of Object.entries(TOOL_REGISTRY)) {
-    const allowedActions = allowedTools?.[name];
-    if (allowedTools && !allowedActions) {
-      continue;
-    }
-
-    const actionEnum = allowedActions ?? Object.keys(spec.actions);
-    const restricted = Boolean(allowedTools && allowedActions);
+  for (const [name, spec] of Object.entries(registry)) {
+    const actionEnum = Object.keys(spec.actions);
 
     schemas.push({
       name: spec.name,
@@ -889,7 +933,7 @@ export function generateLightweightSchemas(
         type: 'object',
         properties: {
           action: { type: 'string', enum: actionEnum },
-          params: actionScopedParamsSchema(spec, actionEnum),
+          params: actionScopedParamsSchema(spec, actionEnum, parameters?.[name]),
         },
         required: ['action', 'params'],
       },

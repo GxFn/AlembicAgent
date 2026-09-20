@@ -63,23 +63,39 @@ export interface GuardViolation {
   [key: string]: unknown;
 }
 
+interface DuplicateCheckResult {
+  similar: DuplicateEntry[];
+}
+
+interface QualityScoreResult {
+  score: number;
+  grade: string;
+  dimensions: unknown;
+}
+
+interface GuardCheckResult {
+  violationCount: number;
+  violations?: GuardViolation[];
+}
+
 export async function taskCheckAndSubmit(
   context: TaskContext,
   { candidate, projectRoot }: { candidate: CandidateInput; projectRoot?: string }
 ) {
   const { aiProvider } = context;
 
-  const duplicates = await invokeTaskTool<{ similar?: DuplicateEntry[] }>(
+  const duplicates = await invokeTaskTool<DuplicateCheckResult>(
     context,
     'check_duplicate',
     {
       candidate,
       projectRoot,
       threshold: 0.5,
-    }
+    },
+    isDuplicateCheckResult
   );
 
-  const highSim = (duplicates.similar || []).filter((d: DuplicateEntry) => d.similarity >= 0.7);
+  const highSim = duplicates.similar.filter((d: DuplicateEntry) => d.similarity >= 0.7);
   let aiVerdict: string | null = null;
   if (highSim.length > 0 && aiProvider) {
     const verdictPrompt = `以下新候选代码与已有 Recipe 高度相似，请判断是否真正重复。
@@ -102,7 +118,7 @@ ${highSim.map((s: DuplicateEntry) => `- ${s.title} (相似度: ${s.similarity})`
   }
 
   return {
-    duplicates: duplicates.similar || [],
+    duplicates: duplicates.similar,
     highSimilarity: highSim,
     aiVerdict,
     recommendation:
@@ -183,11 +199,12 @@ export async function taskQualityAudit(
   const gradeDistribution = { A: 0, B: 0, C: 0, D: 0, F: 0 };
 
   for (const recipe of recipes) {
-    const scoreResult = await invokeTaskTool<{
-      score: number;
-      grade: string;
-      dimensions: unknown;
-    }>(context, 'quality_score', { recipe });
+    const scoreResult = await invokeTaskTool<QualityScoreResult>(
+      context,
+      'quality_score',
+      { recipe },
+      isQualityScoreResult
+    );
     if (scoreResult.grade) {
       (gradeDistribution as Record<string, number>)[scoreResult.grade] =
         ((gradeDistribution as Record<string, number>)[scoreResult.grade] || 0) + 1;
@@ -223,14 +240,16 @@ export async function taskGuardFullScan(
     return { error: 'code is required' };
   }
 
-  const checkResult = await invokeTaskTool<{
-    violationCount: number;
-    violations?: GuardViolation[];
-  }>(context, 'guard_check_code', {
-    code,
-    language: language || 'unknown',
-    scope: 'project',
-  });
+  const checkResult = await invokeTaskTool<GuardCheckResult>(
+    context,
+    'guard_check_code',
+    {
+      code,
+      language: language || 'unknown',
+      scope: 'project',
+    },
+    isGuardCheckResult
+  );
 
   let suggestions: unknown = null;
   if (checkResult.violationCount > 0 && aiProvider) {
@@ -278,9 +297,69 @@ ${code.substring(0, 3000)}
 async function invokeTaskTool<T = Record<string, unknown>>(
   context: TaskContext,
   toolName: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  validateResult?: (result: unknown) => result is T
 ): Promise<T> {
-  return projectTaskToolEnvelope(await context.invokeToolEnvelope(toolName, params)) as T;
+  const envelope = await context.invokeToolEnvelope(toolName, params);
+  // 仅完整成功回执能进入任务推断。partial/取消/拒绝都不是“检查通过”；错误保留原
+  // envelope供宿主诊断，不新增recommendation值或把错误投影成空候选/零违规。
+  if (envelope.ok !== true || envelope.status !== 'success') {
+    throw new Error(
+      `Task tool ${toolName} did not complete successfully (${envelope.status}): ${envelope.text}`,
+      { cause: envelope }
+    );
+  }
+  const result = projectTaskToolEnvelope(envelope);
+  if (validateResult && !validateResult(result)) {
+    throw new Error(
+      `Task tool ${toolName} returned an invalid structured result: ${envelope.text}`,
+      {
+        cause: envelope,
+      }
+    );
+  }
+  return result as T;
+}
+
+function isResultRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isDuplicateCheckResult(value: unknown): value is DuplicateCheckResult {
+  if (!isResultRecord(value) || !Array.isArray(value.similar)) {
+    return false;
+  }
+  for (const entry of value.similar) {
+    if (
+      !isResultRecord(entry) ||
+      typeof entry.similarity !== 'number' ||
+      !Number.isFinite(entry.similarity)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isQualityScoreResult(value: unknown): value is QualityScoreResult {
+  return (
+    isResultRecord(value) &&
+    typeof value.score === 'number' &&
+    Number.isFinite(value.score) &&
+    typeof value.grade === 'string' &&
+    value.grade.trim().length > 0
+  );
+}
+
+function isGuardCheckResult(value: unknown): value is GuardCheckResult {
+  return (
+    isResultRecord(value) &&
+    typeof value.violationCount === 'number' &&
+    Number.isInteger(value.violationCount) &&
+    value.violationCount >= 0 &&
+    (value.violations === undefined ||
+      (Array.isArray(value.violations) && value.violations.every(isResultRecord)))
+  );
 }
 
 function projectTaskToolEnvelope(envelope: ToolResultEnvelope): unknown {

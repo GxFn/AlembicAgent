@@ -1,6 +1,10 @@
 /** 知识工具内部消费的宿主端口与来源词汇；Core production contract 仍从包入口接入。 */
 import type { RecipeProductionPort } from '@alembic/core';
-import type { KnowledgeReadPort } from '#tools/kernel/knowledge.js';
+import type {
+  KnowledgeReadPort,
+  KnowledgeSearchPort,
+  KnowledgeSearchResult,
+} from '#tools/kernel/knowledge.js';
 
 export const AGENT_RUNTIME_SOURCE = 'alembic-agent';
 
@@ -16,21 +20,8 @@ export interface DimensionMetaLike {
 /*  DI Interface Types                                                 */
 /* ================================================================== */
 
-export interface SearchResult {
-  id: string;
-  title: string;
-  kind?: string;
-  score: number;
-  content?: string;
-  description?: string;
-}
-
-export interface SearchEngineLike {
-  search(
-    query: string,
-    opts: { limit: number; kind?: string; category?: string }
-  ): Promise<SearchResult[]>;
-}
+export type SearchResult = KnowledgeSearchResult;
+export type SearchEngineLike = KnowledgeSearchPort;
 
 export type RecipeGatewayLike = RecipeProductionPort;
 

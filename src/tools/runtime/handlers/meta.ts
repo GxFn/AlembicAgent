@@ -53,7 +53,7 @@ async function handleTools(params: Record<string, unknown>, ctx: ToolContext): P
     return ok(text, { tokensEstimate: estimateTokens(text) });
   }
 
-  const spec = registry[name];
+  const spec = Object.hasOwn(registry, name) ? registry[name] : undefined;
   if (!spec) {
     return fail(`Unknown tool: ${name}. Available: ${Object.keys(registry).join(', ')}`);
   }

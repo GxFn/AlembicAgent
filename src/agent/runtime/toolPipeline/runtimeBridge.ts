@@ -73,6 +73,14 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
     },
     abortSignal: loopCtx.abortSignal || null,
     runtime: {
+      allowedTools: Object.fromEntries(
+        loopCtx.allowedToolIds.map((tool) => [
+          tool,
+          Object.hasOwn(loopCtx.allowedToolActions ?? {}, tool)
+            ? [...loopCtx.allowedToolActions[tool]]
+            : null,
+        ])
+      ),
       agentId: runtime.id,
       resourceScope: loopCtx.resourceScope,
       presetName: runtime.presetName,

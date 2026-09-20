@@ -6,8 +6,11 @@
  * implementation module.
  */
 
+import type { ToolAvailabilitySnapshot } from './availability.js';
 import type { ToolRuntimeCallContext } from './context.js';
+import type { ToolDecisionResultStatus } from './decision.js';
 import type { KnowledgeManagementPort, KnowledgeReadPort } from './knowledge.js';
+import type { ToolActionAllowlist } from './toolSchema.js';
 
 /** JSON Schema 类型简化定义，避免外部依赖 */
 export type JSONSchema4 = Record<string, unknown>;
@@ -59,6 +62,8 @@ export interface ParsedToolCall {
 
 /** 结果元信息 — 对 LLM 不可见，供 ContextWindow 消费 */
 export interface ToolResultMeta {
+  /** 路由准入/取消层的明确终态事实；普通业务 handler 可不提供，由 adapter 按 ok 归一化。 */
+  resultStatus?: ToolDecisionResultStatus;
   cached: boolean;
   compression?: { parser: string; ratio: number };
   tokensEstimate: number;
@@ -101,6 +106,8 @@ export interface ToolResult {
  * - 轻量级工具组件 (deltaCache/searchCache 等) 通过 DI 接口 (*Like) 定义最小契约
  */
 export interface ToolContext {
+  /** 宿主当前接线事实；缺省是旧宿主未声明，不代表 actor 获得任何额外权限。 */
+  toolAvailability?: ToolAvailabilitySnapshot;
   /** 项目根目录绝对路径 */
   projectRoot: string;
 
@@ -218,7 +225,7 @@ export interface CapabilityDef {
   name: string;
   description: string;
   promptFragment?: string;
-  allowedTools: Record<string, string[]>;
+  allowedTools: ToolActionAllowlist;
   commandAllowlist?: TerminalCommandAllowlist;
 }
 

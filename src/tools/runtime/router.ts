@@ -7,6 +7,11 @@
  */
 
 import type {
+  ToolAvailabilityContext,
+  ToolAvailabilitySnapshot,
+} from '#tools/kernel/availability.js';
+import type { ToolDecision } from '#tools/kernel/decision.js';
+import type {
   CapabilityDef,
   ParsedToolCall,
   ToolAction,
@@ -15,7 +20,12 @@ import type {
   ToolSpec,
 } from '#tools/kernel/registry.js';
 import { estimateTokens, fail } from '#tools/kernel/registry.js';
+import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
+import { intersectToolActions, isToolActionAllowed } from '#tools/kernel/toolSelection.js';
+import { toolAdmissionFailure } from './admission.js';
+import { describeToolAvailability } from './availability.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
+import { createToolRegistryView } from './selection.js';
 
 export interface RouterConfig {
   capability?: CapabilityDef;
@@ -42,34 +52,124 @@ export class ToolRouter {
     this.#config = config;
   }
 
+  static describeAvailability(context: ToolAvailabilityContext): ToolAvailabilitySnapshot {
+    return describeToolAvailability(context);
+  }
+
+  /** execute 共用的静态准入；发现不代替宿主权限/业务校验，不调用任何 handler。 */
+  explain(
+    call: ParsedToolCall,
+    ctx: Pick<ToolContext, 'runtime' | 'toolAvailability'> = {}
+  ): ToolDecision {
+    const spec = this.getToolSpec(call.tool);
+    if (!spec || !Object.hasOwn(spec.actions, call.action)) {
+      return {
+        allowed: false,
+        stage: 'discover',
+        reason: `Unknown tool action: ${call.tool}.${call.action}`,
+      };
+    }
+    const paramError = validateParams(call, spec.actions[call.action]);
+    if (paramError) {
+      return { allowed: false, stage: 'discover', reason: paramError };
+    }
+    const capability = this.#config.capability;
+    if (capability && !isToolActionAllowed(capability.allowedTools, call.tool, call.action)) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        resultStatus: 'blocked',
+        reason: `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`,
+      };
+    }
+    if (
+      ctx.runtime?.allowedTools !== undefined &&
+      !isToolActionAllowed(ctx.runtime.allowedTools, call.tool, call.action)
+    ) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        resultStatus: 'blocked',
+        reason: `Permission denied: Action "${call.tool}.${call.action}" not allowed in the current stage`,
+      };
+    }
+    const availability = ctx.toolAvailability;
+    if (
+      availability &&
+      Object.hasOwn(availability.actions, call.tool) &&
+      !isToolActionAllowed(availability.actions, call.tool, call.action)
+    ) {
+      const unavailable = availability.unavailable?.find(
+        (entry) =>
+          entry.tool === call.tool &&
+          (entry.action === undefined || entry.action === call.action) &&
+          entry.operation === undefined
+      );
+      return {
+        allowed: false,
+        stage: 'execute',
+        resultStatus: 'blocked',
+        reason: `Tool unavailable: ${call.tool}.${call.action}${unavailable ? ` — ${unavailable.reason}` : ''}`,
+      };
+    }
+    const constraints = availability?.parameters?.[call.tool]?.[call.action];
+    for (const [parameter, values] of Object.entries(constraints ?? {})) {
+      const properties = spec.actions[call.action].params.properties as
+        | Record<string, { default?: unknown }>
+        | undefined;
+      const value =
+        call.params[parameter] === undefined
+          ? properties?.[parameter]?.default
+          : call.params[parameter];
+      // 缺省分支也按同一 action schema 的真实默认值检查，不能省略参数绕过宿主约束。
+      if (values.length === 0 || (value !== undefined && !values.includes(String(value)))) {
+        return {
+          allowed: false,
+          stage: 'execute',
+          resultStatus: 'blocked',
+          reason: `Tool unavailable: ${call.tool}.${call.action} ${parameter}=${String(value)}. Available: ${values.join(', ')}`,
+        };
+      }
+    }
+    return { allowed: true, stage: 'execute' };
+  }
+
+  #selection(ctx: Pick<ToolContext, 'runtime'>): ToolActionAllowlist | undefined {
+    const configured = this.#config.capability?.allowedTools;
+    const stage = ctx.runtime?.allowedTools;
+    return configured && stage ? intersectToolActions(configured, stage) : (stage ?? configured);
+  }
+
   /**
    * 执行工具调用。
    *
    * 完整流程: 参数校验 → Capability 检查 → 并发控制 → handler → 输出截断
    */
-  async execute(call: ParsedToolCall, ctx: ToolContext): Promise<ToolResult> {
+  async execute(
+    call: ParsedToolCall,
+    ctx: ToolContext,
+    options: {
+      getAvailability?: () => ToolAvailabilitySnapshot;
+    } = {}
+  ): Promise<ToolResult> {
     const startMs = Date.now();
 
     try {
       if (ctx.abortSignal?.aborted) {
         return fail('Tool execution aborted before scheduling');
       }
-      const spec = TOOL_REGISTRY[call.tool];
-      const action = spec?.actions[call.action];
+      const spec = this.getToolSpec(call.tool);
+      const action =
+        spec && Object.hasOwn(spec.actions, call.action) ? spec.actions[call.action] : undefined;
       if (!spec || !action) {
         return fail(
           `Invalid call: ${call.tool}.${call.action} — use parseToolCall() first to validate`
         );
       }
 
-      const paramError = validateParams(call, action);
-      if (paramError) {
-        return fail(paramError);
-      }
-
-      const capCheck = this.#checkCapability(call.tool, call.action);
-      if (!capCheck.allowed) {
-        return fail(`Permission denied: ${call.tool}.${call.action} — ${capCheck.reason}`);
+      const decision = this.explain(call, ctx);
+      if (!decision.allowed) {
+        return toolAdmissionFailure(call, decision);
       }
 
       const mode = action.concurrency ?? 'parallel';
@@ -78,18 +178,29 @@ export class ToolRouter {
         return fail('Tool execution aborted while waiting');
       }
 
-      const handlerCtx: ToolContext = {
-        ...ctx,
-        toolRegistry: TOOL_REGISTRY,
-        ...(this.#config.capability
-          ? { commandAllowlist: this.#config.capability.commandAllowlist }
-          : {}),
-      };
-
       try {
         if (ctx.abortSignal?.aborted) {
           return fail('Tool execution aborted before handler');
         }
+        // single/exclusive排队后重读宿主事实；入队时可用不代表获得slot时仍可用。
+        const currentCtx = options.getAvailability
+          ? { ...ctx, toolAvailability: options.getAvailability() }
+          : ctx;
+        const currentDecision = this.explain(call, currentCtx);
+        if (!currentDecision.allowed) {
+          return toolAdmissionFailure(call, currentDecision);
+        }
+        const handlerCtx: ToolContext = {
+          ...currentCtx,
+          toolRegistry: createToolRegistryView(
+            TOOL_REGISTRY,
+            this.#selection(currentCtx),
+            currentCtx.toolAvailability
+          ),
+          ...(this.#config.capability
+            ? { commandAllowlist: this.#config.capability.commandAllowlist }
+            : {}),
+        };
         const result = await action.handler(call.params, handlerCtx);
 
         if (result._meta) {
@@ -144,20 +255,20 @@ export class ToolRouter {
       if (!isParamObject(args)) {
         return { error: 'Tool arguments must be an object' };
       }
-      const action = args.action as string;
+      const action = args.action;
       const params = (args.params ?? {}) as Record<string, unknown>;
 
-      if (!action) {
+      if (typeof action !== 'string' || !action) {
         return { error: `Missing "action" in tool call for ${name}` };
       }
 
-      const spec = TOOL_REGISTRY[name];
+      const spec = this.getToolSpec(name);
       if (!spec) {
         return {
           error: `Unknown tool: ${name}. Available: ${Object.keys(TOOL_REGISTRY).join(', ')}`,
         };
       }
-      if (!spec.actions[action]) {
+      if (!Object.hasOwn(spec.actions, action)) {
         return {
           error: `Unknown action: ${name}.${action}. Available: ${Object.keys(spec.actions).join(', ')}`,
         };
@@ -174,40 +285,22 @@ export class ToolRouter {
   /**
    * 生成当前 capability 允许的轻量 schema 列表。
    */
-  getSchemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
-    const allowed = this.#config.capability?.allowedTools;
-    return generateLightweightSchemas(allowed);
+  getSchemas(
+    ctx: Pick<ToolContext, 'runtime' | 'toolAvailability'> = {}
+  ): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
+    return generateLightweightSchemas(this.#selection(ctx), ctx.toolAvailability);
   }
 
   /**
    * 获取单个工具的完整 spec（用于 meta.tools）。
    */
   getToolSpec(name: string): ToolSpec | undefined {
-    return TOOL_REGISTRY[name];
+    return Object.hasOwn(TOOL_REGISTRY, name) ? TOOL_REGISTRY[name] : undefined;
   }
 
   /* ------------------------------------------------------------------ */
   /*  Capability 权限检查                                                */
   /* ------------------------------------------------------------------ */
-
-  #checkCapability(tool: string, action: string): { allowed: boolean; reason?: string } {
-    const cap = this.#config.capability;
-    if (!cap) {
-      return { allowed: true };
-    }
-
-    const allowedActions = cap.allowedTools[tool];
-    if (!allowedActions) {
-      return { allowed: false, reason: `Tool "${tool}" not allowed in capability "${cap.name}"` };
-    }
-    if (!allowedActions.includes(action)) {
-      return {
-        allowed: false,
-        reason: `Action "${action}" not allowed for "${tool}" in capability "${cap.name}". Allowed: ${allowedActions.join(', ')}`,
-      };
-    }
-    return { allowed: true };
-  }
 
   /* ------------------------------------------------------------------ */
   /*  并发控制 — single (同工具互斥) / exclusive (全局独占)               */

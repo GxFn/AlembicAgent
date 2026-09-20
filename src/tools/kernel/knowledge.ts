@@ -1,6 +1,26 @@
 /** 知识读取只返回 DTO；仓储实体与可信调用身份由宿主 adapter 处理。 */
+export const KNOWLEDGE_SEARCH_DEFAULT_KIND = 'all';
+
 export interface KnowledgeReadPort {
   getById(id: string): Promise<Record<string, unknown> | null>;
+}
+
+export interface KnowledgeSearchResult {
+  id: string;
+  title: string;
+  score: number;
+  kind?: string;
+  content?: string;
+  description?: string;
+}
+
+/** 搜索结果必须是有界 DTO 数组；Core 的 SearchResponse 包装由宿主转换。 */
+export interface KnowledgeSearchPort {
+  readonly supportedKinds?: readonly string[];
+  search(
+    query: string,
+    options: { limit: number; kind?: string; category?: string }
+  ): Promise<KnowledgeSearchResult[]>;
 }
 
 /**

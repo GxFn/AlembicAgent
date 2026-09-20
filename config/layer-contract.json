@@ -23,12 +23,26 @@
   "fileBoundaries": {
     "requiredUnder": [
       "src/agent/runtime/toolPipeline/",
+      "src/tools/kernel/toolSchema.ts",
+      "src/tools/kernel/toolSelection.ts",
+      "src/tools/kernel/availability.ts",
+      "src/tools/runtime/selection.ts",
+      "src/tools/runtime/availability.ts",
+      "src/tools/runtime/admission.ts",
+      "src/tools/catalog/schemaQuery.ts",
       "src/agent/strategies/pipeline/",
       "src/tools/runtime/handlers/knowledge/",
       "src/shared/operation.ts",
       "src/agent/production/strict/"
     ],
     "runtimeImports": {
+      "src/tools/kernel/toolSchema.ts": [],
+      "src/tools/kernel/toolSelection.ts": [],
+      "src/tools/kernel/availability.ts": [],
+      "src/tools/runtime/selection.ts": ["src/tools/kernel/toolSelection.ts"],
+      "src/tools/runtime/availability.ts": ["src/tools/runtime/registry.ts"],
+      "src/tools/runtime/admission.ts": [],
+      "src/tools/catalog/schemaQuery.ts": ["src/tools/kernel/toolSelection.ts"],
       "src/agent/runtime/ToolExecutionPipeline.ts": [
         "src/agent/runtime/toolPipeline/accessGates.ts",
         "src/agent/runtime/toolPipeline/duplicateCache.ts",
@@ -51,6 +65,7 @@
       "src/agent/runtime/toolPipeline/accessGates.ts": [
         "node:path",
         "src/shared/serialization.ts",
+        "src/tools/kernel/toolSelection.ts",
         "src/tools/runtime/handlers/terminalSafety.ts",
         "src/agent/runtime/toolPipeline/callNormalization.ts"
       ],
@@ -98,6 +113,7 @@
         "src/tools/runtime/handlers/recipeAuthoringGate.ts"
       ],
       "src/tools/runtime/handlers/knowledge/queries.ts": [
+        "src/tools/kernel/knowledge.ts",
         "src/tools/kernel/registry.ts",
         "src/tools/runtime/handlers/knowledge/operation.ts"
       ],
