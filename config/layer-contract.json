@@ -21,7 +21,12 @@
   },
   "blessedImports": [],
   "fileBoundaries": {
-    "requiredUnder": ["src/agent/runtime/toolPipeline/"],
+    "requiredUnder": [
+      "src/agent/runtime/toolPipeline/",
+      "src/agent/strategies/pipeline/",
+      "src/tools/runtime/handlers/knowledge/",
+      "src/shared/operation.ts"
+    ],
     "runtimeImports": {
       "src/agent/runtime/ToolExecutionPipeline.ts": [
         "src/agent/runtime/toolPipeline/accessGates.ts",
@@ -62,6 +67,81 @@
       ],
       "src/agent/runtime/toolPipeline/submissionLedger.ts": [
         "src/agent/utils/toolOutcomes.ts"
+      ],
+      "src/shared/operation.ts": [],
+      "src/agent/strategies/pipeline/contracts.ts": [],
+      "src/agent/strategies/pipeline/attempt.ts": [
+        "src/shared/operation.ts",
+        "src/shared/serialization.ts",
+        "src/agent/runtime/AgentEventBus.ts",
+        "src/agent/runtime/DiagnosticsCollector.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/contracts.ts": [],
+      "src/tools/runtime/handlers/knowledge/input.ts": [
+        "node:path",
+        "@alembic/core/dimensions",
+        "src/tools/runtime/handlers/knowledge/contracts.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/operation.ts": [
+        "@alembic/core/logging",
+        "src/tools/kernel/registry.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/sessionState.ts": [
+        "src/tools/runtime/handlers/knowledge/input.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/sources.ts": [
+        "node:fs",
+        "node:path",
+        "@alembic/core/logging",
+        "src/shared/projectPath.ts",
+        "src/tools/runtime/handlers/recipeAuthoringGate.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/queries.ts": [
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/knowledge/operation.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/management.ts": [
+        "src/shared/operation.ts",
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/knowledge/contracts.ts",
+        "src/tools/runtime/handlers/knowledge/input.ts",
+        "src/tools/runtime/handlers/knowledge/operation.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/authoring.ts": [
+        "@alembic/core/knowledge",
+        "@alembic/core/logging",
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/recipeAuthoringGate.ts",
+        "src/tools/runtime/handlers/recipeProductionAdapter.ts",
+        "src/tools/runtime/handlers/submitEvidenceExpansion.ts",
+        "src/tools/runtime/handlers/knowledge/input.ts",
+        "src/tools/runtime/handlers/knowledge/operation.ts",
+        "src/tools/runtime/handlers/knowledge/sessionState.ts",
+        "src/tools/runtime/handlers/knowledge/sources.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/submission.ts": [
+        "@alembic/core/knowledge",
+        "@alembic/core/logging",
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/knowledge/authoring.ts",
+        "src/tools/runtime/handlers/knowledge/contracts.ts",
+        "src/tools/runtime/handlers/knowledge/input.ts",
+        "src/tools/runtime/handlers/knowledge/operation.ts",
+        "src/tools/runtime/handlers/knowledge/submissionResult.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/submissionResult.ts": [
+        "@alembic/core/logging",
+        "src/shared/operation.ts",
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/knowledge/sessionState.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge.ts": [
+        "@alembic/core/knowledge",
+        "src/tools/kernel/registry.ts",
+        "src/tools/runtime/handlers/knowledge/management.ts",
+        "src/tools/runtime/handlers/knowledge/operation.ts",
+        "src/tools/runtime/handlers/knowledge/queries.ts",
+        "src/tools/runtime/handlers/knowledge/submission.ts"
       ]
     }
   },

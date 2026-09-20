@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -76,6 +76,32 @@ function runLint(
 }
 
 describe('layer contract CLI', () => {
+  it.each([
+    ['src/agent/strategies/pipeline/attempt.ts', 'src/agent/strategies/PipelineStrategy.ts'],
+    [
+      'src/tools/runtime/handlers/knowledge/authoring.ts',
+      'src/tools/runtime/handlers/knowledge/submission.ts',
+    ],
+    [
+      'src/tools/runtime/handlers/knowledge/queries.ts',
+      'src/tools/runtime/handlers/knowledge/submission.ts',
+    ],
+    ['src/shared/operation.ts', 'src/tools/kernel/registry.ts'],
+  ])('current policy rejects the reverse dependency from %s to %s', (from, to) => {
+    const current = JSON.parse(
+      readFileSync(path.join(REPO_ROOT, 'config/layer-contract.json'), 'utf8')
+    ) as { fileBoundaries: FileBoundaries };
+    const relative = path.posix.relative(path.posix.dirname(from), to).replace(/\.ts$/, '.js');
+    const specifier = relative.startsWith('.') ? relative : `./${relative}`;
+    const result = runLint(
+      { [from]: `import { value } from '${specifier}';`, [to]: 'export const value = 1;' },
+      { fileBoundaries: current.fileBoundaries }
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`${from}:1`);
+    expect(result.stderr).toContain('file boundary');
+  });
+
   it.each([
     '../ToolExecutionPipeline.js',
     '#agent/runtime/ToolExecutionPipeline.js',

@@ -99,6 +99,9 @@ Internal imports use the `#agent/*`, `#ai/*`, `#shared/*`, `#tools/*` aliases
 
 ## Key runtime guarantees
 
+Stage attempts, partial results, knowledge persistence receipts, and internal module boundaries
+are documented in [Execution lifecycle](docs/execution-lifecycle.md).
+
 - **Structured execution results** — single-run execution
   errors are degraded into a complete `AgentRunResult` with a five-state
   status (success / blocked / aborted / timeout / error); the frozen

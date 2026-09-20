@@ -90,6 +90,8 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
 
 ## 关键运行时保证
 
+阶段尝试、部分结果、知识持久化回执与内部分层详见[执行生命周期](docs/execution-lifecycle.md)。
+
 - **结构化执行结果** —— 单次 runtime 执行错误被归一为完整的
   `AgentRunResult`,状态归一为五态(success / blocked / aborted / timeout /
   error);冻结的 `AgentInterfaceContract` 固化结果分支、普通输出策略与

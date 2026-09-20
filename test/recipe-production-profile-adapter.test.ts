@@ -197,6 +197,21 @@ const readyReport: RetrievalReadinessReport = {
 };
 
 describe('Agent Recipe production profile adapter', () => {
+  test('checks cancellation after preparation yields and before starting the Core write', async () => {
+    const controller = new AbortController();
+    const fake = fakePort(readyReport);
+    // 合法候选无需 AI 修复，但异步准备边界仍可能让父取消先于 Core 写入发生。
+    queueMicrotask(() => controller.abort());
+    const result = await handleKnowledge('submit', submitParams(), {
+      projectRoot: makeProject(),
+      recipeGateway: fake.port,
+      abortSignal: controller.signal,
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('aborted');
+    expect(fake.calls).toHaveLength(0);
+  });
+
   test.each([
     'submit',
     'publish',
