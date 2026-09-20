@@ -75,6 +75,7 @@ import {
   type RunStrictPlanAgentInput,
   runStrictPlanAgent,
 } from '@alembic/agent/runs';
+import { type AgentRuntime, type LoopContext, ToolExecutionPipeline } from '@alembic/agent/runtime';
 
 export interface StrictFacadePrivateSurfaceAssertions {
   // @ts-expect-error Legacy Plan execution is intentionally absent from the strict runs facade.
@@ -97,6 +98,21 @@ export interface StrictFacadePrivateSurfaceAssertions {
   readonly durableRuntimeImplementation: typeof EvaluationFacade.DurableSemanticReviewRuntime;
   // @ts-expect-error 私有 EvidenceLedgerStore 不能从 production facade 导出。
   readonly privateLedgerStore: typeof ProductionFacade.EvidenceLedgerStore;
+}
+
+/** 管道内部分层不能收窄既有 public middleware 的完整 Runtime/LoopContext。 */
+export function consumePublicMiddlewareContext(pipeline = new ToolExecutionPipeline()) {
+  return pipeline.use({
+    name: 'public-context-compatibility',
+    before(_call, context) {
+      const runtime: AgentRuntime = context.runtime;
+      const loop: LoopContext = context.loopCtx;
+      void runtime.abort;
+      void runtime.reactLoop;
+      void loop.prompt;
+      return undefined;
+    },
+  });
 }
 
 export const strictRuntimeBindings = {

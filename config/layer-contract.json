@@ -20,6 +20,51 @@
     "types": []
   },
   "blessedImports": [],
+  "fileBoundaries": {
+    "requiredUnder": ["src/agent/runtime/toolPipeline/"],
+    "runtimeImports": {
+      "src/agent/runtime/ToolExecutionPipeline.ts": [
+        "src/agent/runtime/toolPipeline/accessGates.ts",
+        "src/agent/runtime/toolPipeline/duplicateCache.ts",
+        "src/agent/runtime/toolPipeline/engine.ts",
+        "src/agent/runtime/toolPipeline/observations.ts",
+        "src/agent/runtime/toolPipeline/phaseGates.ts",
+        "src/agent/runtime/toolPipeline/runtimeBridge.ts",
+        "src/agent/runtime/toolPipeline/submissionLedger.ts"
+      ],
+      "src/agent/runtime/toolPipeline/contracts.ts": [],
+      "src/agent/runtime/toolPipeline/engine.ts": [],
+      "src/agent/runtime/toolPipeline/callNormalization.ts": [
+        "src/tools/runtime/registry.ts"
+      ],
+      "src/agent/runtime/toolPipeline/runtimeBridge.ts": [
+        "src/tools/kernel/index.ts",
+        "src/agent/policies/index.ts",
+        "src/agent/runtime/toolPipeline/callNormalization.ts"
+      ],
+      "src/agent/runtime/toolPipeline/accessGates.ts": [
+        "node:path",
+        "src/shared/serialization.ts",
+        "src/tools/runtime/handlers/terminalSafety.ts",
+        "src/agent/runtime/toolPipeline/callNormalization.ts"
+      ],
+      "src/agent/runtime/toolPipeline/phaseGates.ts": [
+        "src/agent/runtime/toolPipeline/callNormalization.ts"
+      ],
+      "src/agent/runtime/toolPipeline/duplicateCache.ts": [
+        "src/shared/serialization.ts",
+        "src/agent/utils/toolOutcomes.ts",
+        "src/agent/runtime/toolPipeline/callNormalization.ts"
+      ],
+      "src/agent/runtime/toolPipeline/observations.ts": [
+        "src/agent/evidence/EvidenceCapture.ts",
+        "src/agent/utils/toolOutcomes.ts"
+      ],
+      "src/agent/runtime/toolPipeline/submissionLedger.ts": [
+        "src/agent/utils/toolOutcomes.ts"
+      ]
+    }
+  },
   "cycleFindings": [
     {
       "cycle": "agent -> tools (acyclic)",

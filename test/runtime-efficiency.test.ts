@@ -1,12 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { NudgeGenerator, PlanTracker } from '../src/agent/context/index.js';
+import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
-import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
+import {
+  createToolPipeline,
+  DiagnosticsCollector,
+  ToolExecutionPipeline,
+} from '../src/agent/runtime/index.js';
 import { submitDedup, trackerSignal } from '../src/agent/runtime/ToolExecutionPipeline.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
 import { Evolution } from '../src/tools/runtime/toolsets/Evolution.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 function createManifest(overrides: Partial<ToolCapabilityManifest> = {}): ToolCapabilityManifest {
   const manifest: ToolCapabilityManifest = {
@@ -129,6 +135,149 @@ function createLoopContext(diagnostics: DiagnosticsCollector): LoopContext {
     trace: null,
   } as unknown as LoopContext;
 }
+
+describe('tool pipeline lifecycle', () => {
+  it('captures evidence before memory, tracker and trace consume the same envelope', async () => {
+    const order: string[] = [];
+    const ledger = new EvidenceLedgerStore({
+      dataRoot: createTempProject('pipeline-order-'),
+      jobId: 'job',
+      sessionId: 'session',
+      dimensionId: 'dimension',
+    });
+    const runtime = createRuntime(createManifest(), async (request) => ({
+      ...createEnvelope(request, 1),
+      text: 'export const value = 1;',
+      structuredContent: { files: [{ path: 'src/a.ts', content: 'export const value = 1;' }] },
+    }));
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.evidenceLedger = ledger;
+    // 这些观察端口只替代外部消费者；台账、默认工厂与 envelope 流转使用真实实现。
+    loopCtx.memoryCoordinator = {
+      recordObservation: (_name: string, _args: unknown, envelope: ToolResultEnvelope) => {
+        expect(envelope.text).toContain('[evidence]');
+        order.push('memory');
+      },
+    } as never;
+    loopCtx.tracker = {
+      noteLedgerStats: () => {
+        order.push('ledger');
+      },
+      recordToolCall: () => {
+        order.push('tracker');
+        return { isNew: true };
+      },
+    } as never;
+    loopCtx.trace = {
+      recordToolCall: (
+        _name: string,
+        _args: unknown,
+        envelope: ToolResultEnvelope,
+        isNew: boolean
+      ) => {
+        expect(envelope.text).toContain('[evidence]');
+        expect(isNew).toBe(true);
+        order.push('trace');
+      },
+    } as never;
+    const result = await createToolPipeline().execute(
+      { id: 'read', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    expect(result.metadata.envelope?.text).toContain('[evidence]');
+    expect(order).toEqual(['ledger', 'memory', 'tracker', 'trace']);
+  });
+  it('awaits before hooks and invokes after hooks in registration order', async () => {
+    const events: string[] = [];
+    const runtime = createRuntime(createManifest(), async (request) => {
+      events.push('execute');
+      return createEnvelope(request, 1);
+    });
+    const pipeline = new ToolExecutionPipeline()
+      .use({
+        name: 'first',
+        before: async () => {
+          events.push('before:first');
+          await Promise.resolve();
+          events.push('before:first:awaited');
+        },
+        after: () => {
+          events.push('after:first');
+        },
+      })
+      .use({
+        name: 'second',
+        before: () => {
+          events.push('before:second');
+        },
+        after: () => {
+          events.push('after:second');
+        },
+      });
+    const result = await pipeline.execute(
+      { id: 'read', name: 'code', args: { action: 'read' } },
+      { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+    );
+    expect(result.result).toEqual({ executeCount: 1 });
+    expect(events).toEqual([
+      'before:first',
+      'before:first:awaited',
+      'before:second',
+      'execute',
+      'after:first',
+      'after:second',
+    ]);
+  });
+  it.each([
+    { label: 'null', verdict: { result: null }, blocked: false },
+    { label: 'zero', verdict: { result: 0 }, blocked: false },
+    { label: 'false', verdict: { result: false }, blocked: false },
+    { label: 'empty string', verdict: { result: '' }, blocked: false },
+    { label: 'blocked without result', verdict: { blocked: true }, blocked: true },
+  ])('short-circuits a $label verdict but still runs all after hooks', async ({
+    verdict,
+    blocked,
+  }) => {
+    const execute = vi.fn();
+    const after = vi.fn();
+    const laterBefore = vi.fn();
+    const runtime = createRuntime(createManifest(), execute);
+    const pipeline = new ToolExecutionPipeline()
+      .use({ name: 'stop', before: () => verdict, after })
+      .use({ name: 'later', before: laterBefore, after });
+    const result = await pipeline.execute(
+      { id: 'read', name: 'code', args: {} },
+      { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(laterBefore).not.toHaveBeenCalled();
+    expect(after).toHaveBeenCalledTimes(2);
+    expect(result.result).toBe('result' in verdict ? verdict.result : undefined);
+    expect(result.metadata).toMatchObject({ blocked, cacheHit: !blocked });
+  });
+  it.each([
+    'before',
+    'after',
+  ])('propagates a custom %s hook failure without silently continuing', async (phase) => {
+    const execute = vi.fn(async (request: ToolCallRequest) => createEnvelope(request, 1));
+    const laterAfter = vi.fn();
+    const fail = async () => {
+      throw new Error('custom middleware failed');
+    };
+    const pipeline = new ToolExecutionPipeline()
+      .use({ name: 'failing', [phase]: fail })
+      .use({ name: 'later', after: laterAfter });
+    const runtime = createRuntime(createManifest(), execute);
+    await expect(
+      pipeline.execute(
+        { id: 'read', name: 'code', args: {} },
+        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+      )
+    ).rejects.toThrow('custom middleware failed');
+    expect(execute).toHaveBeenCalledTimes(phase === 'before' ? 0 : 1);
+    expect(laterAfter).not.toHaveBeenCalled();
+  });
+});
 
 describe('runtime efficiency diagnostics', () => {
   it.each([
