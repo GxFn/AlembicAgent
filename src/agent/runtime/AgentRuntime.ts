@@ -29,6 +29,7 @@ import { isPersistedSubmission } from '../utils/toolOutcomes.js';
  * @module AgentRuntime
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import {
@@ -38,7 +39,7 @@ import {
   TEXT_COMPAT_CALL_SOURCE,
 } from '#ai/registry/ModelQuirks.js';
 import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
-import { isToolResultEnvelope } from '#tools/kernel/index.js';
+import { isToolResultEnvelope, type ToolScopeRelease } from '#tools/kernel/index.js';
 import {
   applyDimensionSubmitSchemaVariant,
   DEPTH_SLOT_PROPS,
@@ -155,6 +156,14 @@ interface RuntimeToolContract {
   ids: string[];
   restrictedActions: Record<string, string[]>;
 }
+
+// 单个模块级 ALS 随 runtime 模块存活，避免每个短命 Agent 实例创建需 disable 的 ALS。
+// owner 校验使嵌套的另一个 runtime 有自己的 run，不会误继承父 runtime 的工具会话。
+const toolResourceRun = new AsyncLocalStorage<{
+  owner: AgentRuntime;
+  runId: string;
+  closed: boolean;
+}>();
 
 export class AgentRuntime {
   onToolCall: ToolCallHook | null;
@@ -275,6 +284,33 @@ export class AgentRuntime {
    * @param [opts] 策略特定选项 (如 FanOut 的 items)
    */
   async execute(message: AgentMessage, opts: Record<string, unknown> = {}): Promise<AgentResult> {
+    return this.#withToolResourceRun(() => this.#executeRun(message, opts));
+  }
+
+  async #withToolResourceRun<T>(operation: () => Promise<T>): Promise<T> {
+    const runId = randomUUID();
+    const scope = { owner: this, runId, closed: false };
+    try {
+      return await toolResourceRun.run(scope, operation);
+    } finally {
+      scope.closed = true;
+      await this.#releaseToolScope({ runId });
+    }
+  }
+
+  async #releaseToolScope(scope: ToolScopeRelease): Promise<void> {
+    try {
+      await this.toolRouter.releaseScope?.(scope);
+    } catch (err: unknown) {
+      // 清理失败可观测，但不能把已经确认的工具写入改成业务失败或覆盖原始异常。
+      this.logger.warn('[AgentRuntime] tool scope cleanup failed', {
+        ...scope,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  async #executeRun(message: AgentMessage, opts: Record<string, unknown>): Promise<AgentResult> {
     this.#abortEventPublished = false;
     this.startTime = Date.now();
     this.iterationCount = 0;
@@ -456,8 +492,30 @@ export class AgentRuntime {
    *   仅在第一轮生效，后续轮次恢复正常 toolChoice 逻辑。
    */
   async reactLoop(prompt: string, opts: ReactLoopOpts = {}) {
-    const ctx = this.#initLoop(prompt, opts);
+    const scope = toolResourceRun.getStore();
+    if (scope?.owner === this) {
+      if (scope.closed) {
+        this.logger.warn('[AgentRuntime] late loop rejected: tool resource run already closed');
+        throw new Error('Cannot start a loop after its tool resource run has closed');
+      }
+      return this.#runReactLoop(prompt, opts);
+    }
+    return this.#withToolResourceRun(() => this.#runReactLoop(prompt, opts));
+  }
 
+  async #runReactLoop(prompt: string, opts: ReactLoopOpts) {
+    const ctx = this.#initLoop(prompt, opts);
+    try {
+      return await this.#performReactLoop(ctx);
+    } finally {
+      const scope = ctx.resourceScope;
+      if (scope) {
+        await this.#releaseToolScope({ runId: scope.runId, viewId: scope.viewId });
+      }
+    }
+  }
+
+  async #performReactLoop(ctx: LoopContext) {
     // ─── ReAct 主循环 (编排骨架) ─────
     while (true) {
       ctx.iteration++;
@@ -657,6 +715,7 @@ export class AgentRuntime {
     }
 
     const ctx = new LoopContext({
+      resourceRunId: toolResourceRun.getStore()?.runId,
       messages,
       tracker: tracker || null,
       trace: trace || null,
@@ -1529,6 +1588,20 @@ export class AgentRuntime {
         resultStr = limitToolResult(fc.name, (rawForLimit as { text: string }).text, toolQuota);
       } else {
         resultStr = limitToolResult(fc.name, rawForLimit, toolQuota);
+      }
+      if (
+        fc.name === 'code' &&
+        fc.args.action === 'read' &&
+        envelope &&
+        resultStr !== envelope.text
+      ) {
+        messages.invalidateReadView();
+        ctx.diagnostics?.warn({
+          code: 'tool_read_view_invalidated',
+          tool: 'code',
+          message:
+            'Read output was limited before entering model history; the next read must establish a new full-content baseline.',
+        });
       }
       budgetCtrl.recordToolCharsUsed(resultStr.length);
 

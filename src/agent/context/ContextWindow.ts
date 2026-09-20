@@ -142,6 +142,18 @@ export class ContextWindow {
   #enableL4LLM: boolean;
   /** Session-level budget pressure (0-1). Affects getToolResultQuota(). */
   #sessionPressure = 0;
+  #readViewRevision = 0;
+
+  get readViewRevision(): number {
+    return this.#readViewRevision;
+  }
+
+  #invalidateReadView(reason: string): void {
+    this.#readViewRevision++;
+    this.#logger.info(
+      `[ContextWindow] read view invalidated: ${reason}, revision=${this.#readViewRevision}`
+    );
+  }
 
   /**
    * 模型名 → 上下文窗口大小映射（token 数）。
@@ -270,12 +282,19 @@ export class ContextWindow {
    * 独立命名以便审计和搜索。
    */
   appendUserNudge(content: string) {
+    let removedBeforeCollapse = 0;
     this.#messages = this.#messages.filter((message, index) => {
       if (index === 0) {
         return true;
       }
-      return message.metadata?.kind !== 'runtime_nudge';
+      const keep = message.metadata?.kind !== 'runtime_nudge';
+      if (!keep && index < this.#collapseThreshold) {
+        removedBeforeCollapse++;
+      }
+      return keep;
     });
+    // L3 使用绝对索引；移除旧 nudge 后必须移动边界，不能额外隐藏仍可见的工具调用。
+    this.#collapseThreshold -= removedBeforeCollapse;
     this.#messages.push({ role: 'user', content, metadata: { kind: 'runtime_nudge' } });
   }
 
@@ -545,6 +564,7 @@ export class ContextWindow {
         },
       ];
       this.#collapseThreshold = -1;
+      this.#invalidateReadView('l4_summary');
       this.#compactionLog.push(`L4: memory package summary replaced ${removed} messages`);
       this.#logger.info(
         `[ContextWindow] L4 auto-compact: removed ${removed} messages, ` +
@@ -587,6 +607,7 @@ export class ContextWindow {
     }
 
     if (truncated > 0) {
+      this.#invalidateReadView('l1_truncation');
       const afterTokens = this.estimateTokens();
       const ratio = this.getTokenUsageRatio();
       this.#logger.info(
@@ -608,6 +629,7 @@ export class ContextWindow {
       const curr = this.#messages[i];
       const prev = this.#messages[i - 1];
       if (
+        i !== this.#collapseThreshold &&
         curr.role === prev.role &&
         curr.role !== 'tool' &&
         !curr.toolCalls &&
@@ -617,6 +639,9 @@ export class ContextWindow {
       ) {
         prev.content = `${prev.content}\n---\n${curr.content}`;
         this.#messages.splice(i, 1);
+        if (i < this.#collapseThreshold) {
+          this.#collapseThreshold--;
+        }
         merged++;
       }
     }
@@ -647,6 +672,9 @@ export class ContextWindow {
       return { level: 3, removed: 0 };
     }
 
+    if (keepFrom > this.#collapseThreshold) {
+      this.#invalidateReadView('l3_collapse');
+    }
     this.#collapseThreshold = keepFrom;
     this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}`);
     this.#logger.info(
@@ -825,6 +853,7 @@ export class ContextWindow {
   resetToPromptOnly() {
     this.#collapseThreshold = -1;
     if (this.#messages.length > 1) {
+      this.#invalidateReadView('reset_to_prompt');
       // 提取所有已提交候选
       this.#extractCompactedSubmits(1);
       this.#messages.length = 1;
@@ -844,6 +873,7 @@ export class ContextWindow {
    * 保留 compactedSubmits 以支持跨阶段提交去重。
    */
   resetForNewStage() {
+    this.#invalidateReadView('new_stage');
     this.#extractCompactedSubmits(0);
     this.#messages = [];
     this.#collapseThreshold = -1;

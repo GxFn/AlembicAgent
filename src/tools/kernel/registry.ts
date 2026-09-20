@@ -7,6 +7,7 @@
  */
 
 import type { ToolRuntimeCallContext } from './context.js';
+import type { KnowledgeManagementPort, KnowledgeReadPort } from './knowledge.js';
 
 /** JSON Schema 类型简化定义，避免外部依赖 */
 export type JSONSchema4 = Record<string, unknown>;
@@ -94,9 +95,9 @@ export interface ToolResult {
  *
  * 设计约束:
  * - 各字段为可选（不是所有 handler 都需要全部依赖），由 ToolContextFactory 在调用前按需组装
- * - 重量级服务 (projectGraph/searchEngine 等) 使用 `unknown` 类型是有意为之:
- *   这些服务的真实接口定义在各自的 handler 文件中（duck typing），
- *   避免 types.ts 反向依赖 handler 或外部服务模块
+ * - 知识读写端口定义在 kernel 叶子合同中，由宿主绑定真实服务；
+ *   尚未迁移的 projectGraph/searchEngine 等保留 unknown，由 handler 检查最小能力，
+ *   不让 kernel 反向依赖 handler 或具体宿主模块
  * - 轻量级工具组件 (deltaCache/searchCache 等) 通过 DI 接口 (*Like) 定义最小契约
  */
 export interface ToolContext {
@@ -111,13 +112,19 @@ export interface ToolContext {
   /** 代码实体图谱 — graph handler 内部 cast 为 CodeEntityGraphLike */
   codeEntityGraph?: unknown;
 
-  /** 知识搜索引擎 — knowledge handler 内部 cast 为 SearchEngineLike */
+  /** 知识搜索引擎 — knowledge 查询先检查运行时 search 能力。 */
   searchEngine?: unknown;
 
   /** 知识提交网关 — knowledge handler 内部 cast 为 RecipeGatewayLike */
   recipeGateway?: unknown;
 
-  /** 知识仓库 — knowledge handler 内部 cast 为 KnowledgeRepoLike */
+  /** 显式知识读取端口；提供后即不再回落 knowledgeRepo。 */
+  knowledgeRead?: KnowledgeReadPort;
+
+  /** 显式知识管理端口；缺少具体方法必须报告不可用，不回落原始仓储。 */
+  knowledgeManagement?: KnowledgeManagementPort;
+
+  /** 旧宿主兼容入口；仅对应的显式端口未提供时使用，不能冒充 Core 管理服务。 */
   knowledgeRepo?: unknown;
 
   /** staging 复核通道 — knowledge.manage(review) cast 为 StagingManagerLike（recordReview）。 */

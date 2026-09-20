@@ -16,6 +16,8 @@ export interface DeltaCacheEntry {
   content: string;
   lineCount: number;
   lastAccess: number;
+  /** 指纹用于写前新鲜度，只有完整返回的内容才能成为 delta 基线。 */
+  visible?: boolean;
 }
 
 export interface DeltaReadResult {
@@ -41,13 +43,14 @@ export class DeltaCache {
     return entry;
   }
 
-  /** 写入缓存并触发 LRU 驱逐 */
+  /** 记录文件版本，不宣称模型看过全文；范围读、提纲、写入均使用此入口。 */
   set(path: string, hash: string, content: string): void {
     this.#cache.set(path, {
       hash,
       content,
       lineCount: content.split('\n').length,
       lastAccess: Date.now(),
+      visible: false,
     });
     this.#evictLRU();
   }
@@ -61,7 +64,7 @@ export class DeltaCache {
     const cached = this.#cache.get(path);
     const lineCount = currentContent.split('\n').length;
 
-    if (cached) {
+    if (cached?.visible) {
       cached.lastAccess = Date.now();
 
       if (cached.hash === currentHash) {
@@ -74,11 +77,16 @@ export class DeltaCache {
         content: currentContent,
         lineCount,
         lastAccess: Date.now(),
+        visible: true,
       });
       return { mode: 'delta', content: diff, lineCount };
     }
 
     this.set(path, currentHash, currentContent);
+    const entry = this.#cache.get(path);
+    if (entry) {
+      entry.visible = true;
+    }
     return { mode: 'full', content: currentContent, lineCount };
   }
 

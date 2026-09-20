@@ -74,6 +74,7 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
     abortSignal: loopCtx.abortSignal || null,
     runtime: {
       agentId: runtime.id,
+      resourceScope: loopCtx.resourceScope,
       presetName: runtime.presetName,
       iteration: loopCtx.iteration || 0,
       policyValidator: runtime.policies,

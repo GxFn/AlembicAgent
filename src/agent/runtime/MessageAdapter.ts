@@ -11,6 +11,7 @@
  * @module core/MessageAdapter
  */
 
+import Logger from '@alembic/core/logging';
 import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import { limitToolResult } from '../context/ContextWindow.js';
@@ -48,6 +49,17 @@ interface ChatMessage {
 
 /** @abstract */
 export class MessageAdapter {
+  #readViewRevision = 0;
+
+  get readViewRevision(): number {
+    return this.#readViewRevision;
+  }
+
+  /** 工具结果进入历史前已被配额裁剪时，也必须失效当前已读视图。 */
+  invalidateReadView(): void {
+    this.#readViewRevision++;
+  }
+
   /** 追加用户消息 */
   appendUserMessage(_text: string) {
     throw new Error('not implemented');
@@ -160,15 +172,32 @@ export class MessageAdapter {
  */
 export class ContextWindowAdapter extends MessageAdapter {
   #ctxWin;
+  readonly #legacyReadView: boolean;
 
   constructor(ctxWin: ContextWindow) {
     super();
     this.#ctxWin = ctxWin;
+    this.#legacyReadView =
+      !Number.isSafeInteger(ctxWin.readViewRevision) || ctxWin.readViewRevision < 0;
+    if (this.#legacyReadView) {
+      Logger.getInstance().warn(
+        '[MessageAdapter] legacy context window has no read-view revision; delta reuse disabled for this loop'
+      );
+    }
   }
 
   /** 获取底层 ContextWindow 实例 (供 forcedSummary 等外部逻辑使用) */
   get contextWindow() {
     return this.#ctxWin;
+  }
+
+  get readViewRevision(): number {
+    if (this.#legacyReadView) {
+      // 旧 duck-typed window 不能证明压缩后仍保留全文；每次请求换视图，保持工具可用。
+      this.invalidateReadView();
+      return super.readViewRevision;
+    }
+    return super.readViewRevision + this.#ctxWin.readViewRevision;
   }
 
   appendUserMessage(text: string) {
@@ -278,6 +307,7 @@ export class SimpleArrayAdapter extends MessageAdapter {
 
   resetToPromptOnly() {
     const first = this.#messages[0];
+    this.invalidateReadView();
     this.#messages.length = 0;
     if (first) {
       this.#messages.push(first);

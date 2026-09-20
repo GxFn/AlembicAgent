@@ -102,8 +102,9 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
   强制总结兜底,在允许收尾时保留已有成果；取消和超时不会追加模型总结。
 - **工具安全** —— `terminal` 在全局危险命令黑名单 + 只读 allowlist
   双层安全下执行,可用时走沙箱(降级时记审计);`code.write` 强制
-  写前新鲜度门(read-before-write / TOCTOU),由 run 级共享的
-  `DeltaCache` 支撑。
+  写前新鲜度门(read-before-write / TOCTOU),由读取视图内共享的
+  `DeltaCache` 支撑，文件版本指纹与全文可见性分开记录，循环/运行结束时释放宿主状态。
+  端口与生命周期规则见[工具宿主接入](docs/tool-host-integration.md)。
 - **可观测优先** —— 钩子、事件总线、诊断收集器,加上 observe-only 的
   PCV 节点证据引擎(grounding enforcement 默认 `off`);每条
   fallback / 降级 / 重试路径都记录触发条件与选择路径。

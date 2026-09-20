@@ -1,7 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-
+import { describe, expect, it, vi } from 'vitest';
 import {
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   isToolResultEnvelope,
@@ -13,6 +12,7 @@ import {
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
+import { type ToolContext, ToolRouterAdapter } from '../src/tools/runtime/index.js';
 
 function walkSource(dir: string, acc: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -203,6 +203,318 @@ describe('tool kernel contract', () => {
     ]);
     expect(toolsIndex).not.toContain("export * from './core/LightweightRouter.js';");
     expect(toolsIndex).not.toContain("export * from './terminal/index.js';");
+  });
+});
+
+/** 经真实adapter/router/registry/handler检查接线，不把知识端口测试降成局部选择器。 */
+function knowledgeAdapter(ports: Partial<ToolContext>) {
+  const adapter = new ToolRouterAdapter({
+    contextFactory: {
+      create: () => ({ projectRoot: process.cwd(), tokenBudget: 4000, ...ports }),
+    },
+  });
+  return (action: string, params: Record<string, unknown>, abortSignal?: AbortSignal) =>
+    adapter.execute({
+      toolId: 'knowledge',
+      args: { action, params },
+      surface: 'runtime',
+      actor: { role: 'developer', user: 'port-test-user' },
+      source: { kind: 'runtime', name: 'knowledge-port-test' },
+      abortSignal,
+    });
+}
+
+describe('knowledge host ports through ToolRouterAdapter', () => {
+  const managementCases = [
+    {
+      operation: 'update',
+      params: { operation: 'update', id: 'recipe', data: { description: 'Updated' } },
+      args: ['recipe', { description: 'Updated' }],
+      status: 'updated',
+    },
+    {
+      operation: 'reject',
+      params: { operation: 'reject', id: 'recipe', reason: 'Review declined' },
+      args: ['recipe', 'Review declined'],
+      status: 'rejected',
+    },
+    {
+      operation: 'score',
+      params: { operation: 'score', id: 'recipe', data: { score: 73 } },
+      args: ['recipe', 73],
+      status: 'scored',
+    },
+    {
+      operation: 'validate',
+      params: { operation: 'validate', id: 'recipe' },
+      args: ['recipe'],
+      status: 'validated',
+    },
+  ];
+
+  it('reads from the explicit knowledge port before the legacy repository', async () => {
+    const dto = { id: 'recipe', title: 'Explicit read DTO', lifecycle: 'pending' };
+    const read = {
+      getById: vi.fn(async function (this: unknown, id: string) {
+        expect(this).toBe(read);
+        expect(id).toBe('recipe');
+        return dto;
+      }),
+    };
+    const legacyRead = vi.fn(async () => ({ id: 'recipe', title: 'Legacy repository' }));
+    const result = await knowledgeAdapter({
+      knowledgeRead: read,
+      knowledgeRepo: { getById: legacyRead },
+    })('detail', { id: 'recipe' });
+
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toEqual(dto);
+    expect(read.getById).toHaveBeenCalledOnce();
+    expect(legacyRead).not.toHaveBeenCalled();
+  });
+
+  it.each(managementCases)('routes $operation through the explicit management port', async ({
+    params,
+    args,
+    status,
+  }) => {
+    const method = vi.fn(async function (this: unknown) {
+      expect(this).toBe(management);
+      return { checked: true };
+    });
+    const management = { update: method, reject: method, score: method, validate: method };
+    const legacy = vi.fn(async () => undefined);
+    const result = await knowledgeAdapter({
+      knowledgeManagement: management,
+      knowledgeRepo: { update: legacy, reject: legacy, score: legacy, validate: legacy },
+    })('manage', params);
+
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toMatchObject({ id: 'recipe', status });
+    if (params.operation === 'validate') {
+      expect(result.structuredContent).toMatchObject({ result: { checked: true } });
+    }
+    expect(method).toHaveBeenCalledExactlyOnceWith(...args);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    managementCases
+  )('does not fall back when the explicit management port lacks $operation', async ({
+    operation,
+    params,
+  }) => {
+    const legacy = vi.fn(async () => undefined);
+    const result = await knowledgeAdapter({
+      knowledgeManagement: {},
+      knowledgeRepo: { update: legacy, reject: legacy, score: legacy, validate: legacy },
+    })('manage', params);
+
+    expect(result.ok).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      status: 'port-unavailable',
+      code: 'KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE',
+      port: 'knowledgeManagement',
+      method: operation,
+    });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it('enriches prime results through the explicit read port', async () => {
+    const getById = vi.fn(async () => ({
+      id: 'recipe',
+      doClause: 'Use the controlled read DTO.',
+      reasoning: { sources: ['src/a.ts:1-2'] },
+    }));
+    const legacy = vi.fn(async () => ({ doClause: 'Legacy result' }));
+    const result = await knowledgeAdapter({
+      searchEngine: { search: async () => [{ id: 'recipe', title: 'Recipe', score: 1 }] },
+      knowledgeRead: { getById },
+      knowledgeRepo: { getById: legacy },
+    })('prime', { taskGoal: 'Edit the module' });
+
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      knowledge: [
+        { id: 'recipe', doClause: 'Use the controlled read DTO.', sources: ['src/a.ts:1-2'] },
+      ],
+    });
+    expect(getById).toHaveBeenCalledExactlyOnceWith('recipe');
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'detail',
+    'prime',
+  ])('does not fall back from an incomplete explicit read port for %s', async (action) => {
+    const legacy = vi.fn(async () => ({ id: 'recipe' }));
+    const result = await knowledgeAdapter({
+      searchEngine: { search: async () => [{ id: 'recipe', title: 'Recipe', score: 1 }] },
+      // 模拟未类型检查的宿主注入；运行时不能把缺能力掩盖成旧仓储成功。
+      knowledgeRead: {} as never,
+      knowledgeRepo: { getById: legacy },
+    })(action, { id: 'recipe', taskGoal: 'Read context' });
+
+    expect(result.ok).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      code: 'KNOWLEDGE_READ_PORT_UNAVAILABLE',
+      port: 'knowledgeRead',
+      method: 'getById',
+    });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it('preserves search-only prime when no knowledge reader was provided', async () => {
+    const result = await knowledgeAdapter({
+      searchEngine: {
+        search: async () => [{ id: 'recipe', title: 'Search-only recipe', score: 1 }],
+      },
+    })('prime', { taskGoal: 'Read context' });
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      knowledge: [{ title: 'Search-only recipe' }],
+    });
+  });
+
+  it('keeps prime search results while diagnosing a failed detail enrichment', async () => {
+    const getById = vi.fn(async () => {
+      throw new Error('read port unavailable');
+    });
+    const result = await knowledgeAdapter({
+      searchEngine: { search: async () => [{ id: 'recipe', title: 'Search result', score: 1 }] },
+      knowledgeRead: { getById },
+    })('prime', { taskGoal: 'Read context' });
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      knowledge: [{ id: 'recipe', title: 'Search result' }],
+    });
+    expect(getById).toHaveBeenCalledOnce();
+    expect(result.diagnostics).toMatchObject({
+      degraded: true,
+      warnings: [expect.objectContaining({ code: 'KNOWLEDGE_PRIME_DETAIL_UNAVAILABLE' })],
+    });
+  });
+
+  it.each([
+    'search',
+    'prime',
+  ])('checks the search capability before executing %s', async (action) => {
+    const result = await knowledgeAdapter({ searchEngine: {} })(action, {
+      query: 'recipe',
+      taskGoal: 'Read context',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain('Search engine not available');
+    expect(result.text).not.toContain('is not a function');
+  });
+
+  it('keeps the legacy repository usable when the corresponding explicit port is absent', async () => {
+    const getById = vi.fn(async () => ({ id: 'recipe', title: 'Legacy DTO' }));
+    const method = vi.fn(async () => ({ checked: true }));
+    const call = knowledgeAdapter({
+      knowledgeRepo: { getById, update: method, reject: method, score: method, validate: method },
+    });
+    expect((await call('detail', { id: 'recipe' })).structuredContent).toMatchObject({
+      title: 'Legacy DTO',
+    });
+    for (const { params, args, status } of managementCases) {
+      const result = await call('manage', params);
+      expect(result.ok).toBe(true);
+      expect(result.structuredContent).toMatchObject({ status });
+      expect(method).toHaveBeenLastCalledWith(...args);
+    }
+    expect(getById).toHaveBeenCalledOnce();
+    expect(method).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ['knowledgeRead', 'detail'],
+    ['knowledgeManagement', 'manage'],
+  ])('does not treat an explicit null %s as permission to use a raw repository', async (port, action) => {
+    const legacy = vi.fn(async () => ({ id: 'recipe' }));
+    const result = await knowledgeAdapter({
+      [port]: null,
+      knowledgeRepo: { getById: legacy, update: legacy },
+    })(action, { id: 'recipe', operation: 'update', data: { description: 'Edit' } });
+    expect(result.ok).toBe(false);
+    expect(result.structuredContent).toMatchObject({ status: 'port-unavailable', port });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'failure',
+    'not-found',
+  ])('does not hide an explicit read %s with a legacy lookup', async (mode) => {
+    const getById = vi.fn(async () => {
+      if (mode === 'failure') {
+        throw new Error('Explicit reader failed');
+      }
+      return null;
+    });
+    const legacy = vi.fn(async () => ({ id: 'recipe', title: 'Must not be read' }));
+    const result = await knowledgeAdapter({
+      knowledgeRead: { getById },
+      knowledgeRepo: { getById: legacy },
+    })('detail', { id: 'recipe' });
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain(
+      mode === 'failure' ? 'Explicit reader failed' : 'Recipe not found'
+    );
+    expect(getById).toHaveBeenCalledOnce();
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'detail',
+    'update',
+  ])('retains the established cancellation contract for explicit %s', async (operation) => {
+    const controller = new AbortController();
+    const method = vi.fn(async () => {
+      controller.abort();
+      return { id: 'recipe', title: 'Confirmed host result' };
+    });
+    const result = await knowledgeAdapter({
+      knowledgeRead: { getById: method },
+      knowledgeManagement: { update: method },
+    })(
+      operation === 'detail' ? 'detail' : 'manage',
+      { id: 'recipe', operation, data: { description: 'Edit' } },
+      controller.signal
+    );
+    expect(method).toHaveBeenCalledOnce();
+    expect(result.ok).toBe(operation === 'update');
+    expect(result.status).toBe(operation === 'update' ? 'success' : 'aborted');
+    if (operation === 'update') {
+      expect(result.structuredContent).toMatchObject({ status: 'updated' });
+      expect(result.diagnostics?.warnings).toContainEqual(
+        expect.objectContaining({ code: 'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT' })
+      );
+    }
+  });
+
+  it('preserves partial-write evidence from an explicit management failure', async () => {
+    const details = { entryIds: ['recipe'], fileOpsCompleted: 1, reconcileVia: 'read-back' };
+    const error = Object.assign(new Error('Core state diverged'), {
+      code: 'STATE_DIVERGENCE',
+      details,
+    });
+    const update = vi.fn(async () => {
+      throw error;
+    });
+    const legacy = vi.fn(async () => undefined);
+    const result = await knowledgeAdapter({
+      knowledgeManagement: { update },
+      knowledgeRepo: { update: legacy },
+    })('manage', { operation: 'update', id: 'recipe', data: { description: 'Edit' } });
+    expect(result.ok).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      code: 'STATE_DIVERGENCE',
+      details,
+      writeState: 'partial',
+      requiresReadback: true,
+    });
+    expect(update).toHaveBeenCalledOnce();
+    expect(legacy).not.toHaveBeenCalled();
   });
 });
 

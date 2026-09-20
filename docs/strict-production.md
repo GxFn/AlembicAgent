@@ -43,13 +43,23 @@ readiness/review-queue是可取消读取；已经发出的Core管理写入继续
 
 ## 宿主接入边界
 
-当前本地Main的ToolContextFactory向`knowledgeRepo`注入原始Core repository。它的`findById`与Agent查询端口的`getById`不是同一个接口；它也不提供Agent管理口期望的`reject`、`score`、`validate`方法。原始repository的`update`不等价于KnowledgeService的受控更新。
+宿主通过`ToolContext`注入两个窄端口；类型从`@alembic/agent/tools/runtime`导出：
 
-宿主应注入明确adapter：读取方法映射到Core的读取入口与DTO；内容更新/拒绝调用已配置的KnowledgeService并提供可信服务上下文；评分和验证须连接实际拥有该能力的服务。Agent不生成替代数据库或虚构缺失实现，缺方法时返回`KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE`，包含port/method。相关宿主接线属于Main仓库，本次未修改。
+| 字段 / 类型 | 合同 |
+| --- | --- |
+| `knowledgeRead` / `KnowledgeReadPort` | `getById(id)`返回DTO或`null`，不把仓储实体直接交给Agent |
+| `knowledgeManagement` / `KnowledgeManagementPort` | 可选的`update`、`reject`、`score`、`validate`方法；宿主只声明真正可用的能力 |
+
+Agent优先使用对应显式端口。只有该字段为`undefined`时才使用旧`knowledgeRepo`兼容入口；显式对象缺方法或运行时误注入`null`都不能回落原始仓储。缺能力返回`KNOWLEDGE_READ_PORT_UNAVAILABLE`或`KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE`，带所选port和method。旧字段保留给尚未迁移的宿主；各宿主完成迁移并通过消费扫描与真实入口回归后，才能另行评估退役。
+
+`knowledge.prime`在完全未提供读取端口时仍可只返回搜索摘要。提供的端口必须有可调用的`getById`；详情增强抛错时保留搜索结果并标记降级诊断，不调用旧仓储掩盖错误。`knowledge.detail`的读取失败和未找到仍是明确失败。
+
+宿主adapter应把读取映射到Core读取入口并转成DTO；内容更新/拒绝调用已配置的KnowledgeService，可信用户/会话上下文由宿主绑定。管理方法正常resolve表示该次调用已完成，失败须reject；validate返回值原样投影。评分和验证须连接真正拥有该能力的服务，不能按方法名猜测替代操作。原始repository的`findById`与端口`getById`不同，repository的`update`也不等价于受控服务更新。Agent不生成替代数据库或虚构缺失实现。
 
 ## 回归入口
 
 - `strict-production-chain`、`strict-iterative-analysis`：真实factory、Main成功回执形状、typed Core gate、取消后的内部副作用与封印前验证。
 - `strict-production-rework`：浅冻输入、合法/非法disposition、真实Core语义回执与血缘。
 - `recipe-production-profile-adapter`：真实knowledge入口、受控输入、Core仓储合并、部分写入、取消和缺端口。
+- `tool-system`：真实ToolRouterAdapter到知识handler的显式端口优先级、缺能力不回落、legacy兼容、错误和取消回执。
 - `layer-contract`、公开签名及实际strict consumer：分层方向和消费者兼容。

@@ -362,7 +362,34 @@ async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Pr
   if (!result.ok) {
     return fail(result.error);
   }
-  return ok(result.content, { tokensEstimate: result.tokensEstimate });
+  const outputLimit = ctx.toolRegistry?.code?.actions.read?.maxOutputTokens;
+  const willTruncate = Boolean(outputLimit && result.tokensEstimate > outputLimit);
+  if (willTruncate) {
+    // Router 的 action 配额也是有损边界；采用它注入的单源规格，避免第二次读取只剩 unchanged。
+    forgetFullRead(result.path, ctx);
+  }
+  return ok(result.content, {
+    tokensEstimate: result.tokensEstimate,
+    ...(willTruncate
+      ? {
+          diagnosticWarnings: [
+            {
+              code: 'code_read_partial_view',
+              message:
+                'Read output exceeds the action limit; only the file-version fingerprint is retained. Use a line range to retrieve omitted content.',
+              tool: 'code',
+            },
+          ],
+        }
+      : {}),
+  });
+}
+
+function forgetFullRead(filePath: string, ctx: ToolContext): void {
+  const observed = ctx.deltaCache?.get(filePath);
+  if (observed) {
+    ctx.deltaCache?.set(filePath, observed.hash, observed.content);
+  }
 }
 
 interface ReadSingleSuccess {
@@ -410,7 +437,12 @@ async function handleBatchRead(
       files.push(result);
       continue;
     }
-    files.push(clampReadResult(result, perFileTokenBudget));
+    const rendered = clampReadResult(result, perFileTokenBudget);
+    if (rendered.truncated && ctx.deltaCache) {
+      // batch 配额隐藏了部分内容：保留版本指纹，但撤销全文已展示的断言。
+      forgetFullRead(result.path, ctx);
+    }
+    files.push(rendered);
   }
 
   const succeeded = files.filter((file) => file.ok).length;
@@ -467,10 +499,11 @@ async function readSingleFile(
   const lines = content.split('\n');
   const lineCount = lines.length;
 
-  if (ctx.deltaCache) {
+  const isFullRead = !startLine && !endLine && !maxLines && lineCount <= 500;
+  if (ctx.deltaCache && isFullRead) {
     const delta = ctx.deltaCache.check(resolved.relPath, content);
     // 文件指纹相同不代表该区间已展示；范围补读必须返回真实源码。
-    if (delta.mode === 'unchanged' && !startLine && !endLine && !maxLines) {
+    if (delta.mode === 'unchanged') {
       return {
         ok: true,
         path: resolved.relPath,
@@ -480,7 +513,7 @@ async function readSingleFile(
         mode: 'unchanged',
       };
     }
-    if (delta.mode === 'delta' && !startLine && !endLine && !maxLines) {
+    if (delta.mode === 'delta') {
       return {
         ok: true,
         path: resolved.relPath,
@@ -490,6 +523,9 @@ async function readSingleFile(
         mode: 'delta',
       };
     }
+  } else {
+    // 读到磁盘版本不等于把全文交给当前视图；写前门仍可使用这个版本指纹。
+    ctx.deltaCache?.set(resolved.relPath, freshnessFingerprint(content), content);
   }
 
   if (startLine || endLine || maxLines) {

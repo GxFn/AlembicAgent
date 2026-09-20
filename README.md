@@ -114,7 +114,9 @@ and the host knowledge-management port requirements.
 - **Tool safety** — `terminal` runs behind a global dangerous-command
   blocklist plus a read-only allowlist, sandboxed when available (audited on
   degradation); `code.write` enforces a read-before-write freshness (TOCTOU)
-  gate backed by a run-scoped shared `DeltaCache`.
+  gate backed by a view-scoped `DeltaCache`. File-version fingerprints are distinct
+  from full-content visibility; host state is released at loop/run completion.
+  See [tool host integration](docs/tool-host-integration.md) for ports and lifecycle contracts.
 - **Observability first** — hooks, an event bus, a diagnostics collector, and
   the observe-only PCV node-evidence engine (grounding enforcement defaults to
   `off`); every fallback / degraded / retry path logs its trigger and choice.

@@ -287,7 +287,21 @@ export class PipelineStrategy extends Strategy {
       ...(opts.systemRunContext ? { systemRunContext: opts.systemRunContext } : {}),
       ...((opts.strategyContext || {}) as Record<string, unknown>),
     };
-    const incomingStrategyContext = expandSystemRunContext(rawStrategyContext);
+    // AgentService 会把资源平铺到 RuntimeOptions；只接收这五项，不把 budget 等运行控制
+    // 混入 prompt context。既有 system/显式 strategy 投影优先，资源本身保持原引用。
+    const flatResources = Object.fromEntries(
+      ['contextWindow', 'trace', 'memoryCoordinator', 'sharedState', 'source']
+        .filter((key) => opts[key] !== undefined)
+        .map((key) => [key, opts[key]])
+    );
+    const incomingStrategyContext = {
+      ...flatResources,
+      ...expandSystemRunContext(rawStrategyContext),
+    };
+    _pipelineLogger().debug('[PipelineStrategy] Context resource projection', {
+      flatDefaults: Object.keys(flatResources),
+      precedence: 'flat-defaults < system-context < explicit-strategy-context',
+    });
     const diagnostics = DiagnosticsCollector.from(
       opts.diagnostics || incomingStrategyContext.diagnostics
     );

@@ -12,6 +12,8 @@
  * @module core/LoopContext
  */
 
+import { randomUUID } from 'node:crypto';
+import type { ToolResourceScope } from '#tools/kernel/context.js';
 import type { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
@@ -64,6 +66,7 @@ interface BudgetConfig {
 
 /** LoopContext configuration — accepts both concrete and duck-typed inputs from callers */
 interface LoopContextConfig {
+  resourceRunId?: string;
   messages: MessageAdapter;
   tracker?: ExplorationTracker | Record<string, unknown> | null;
   trace?: ActiveContext | Record<string, unknown> | null;
@@ -90,6 +93,18 @@ interface LoopContextConfig {
 }
 
 export class LoopContext {
+  readonly #resourceRunId: string | undefined;
+  readonly #resourceViewId = randomUUID();
+
+  get resourceScope(): ToolResourceScope | undefined {
+    return this.#resourceRunId
+      ? {
+          runId: this.#resourceRunId,
+          viewId: this.#resourceViewId,
+          revision: this.messages.readViewRevision,
+        }
+      : undefined;
+  }
   // ─── 注入依赖 ───
 
   /** 统一消息适配器 */
@@ -196,6 +211,7 @@ export class LoopContext {
   evidenceLedger: EvidenceLedgerStore | null;
 
   constructor(config: LoopContextConfig) {
+    this.#resourceRunId = config.resourceRunId;
     this.messages = config.messages;
     this.tracker = (config.tracker || null) as ExplorationTracker | null;
     this.trace = (config.trace || null) as ActiveContext | null;

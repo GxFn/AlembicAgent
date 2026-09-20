@@ -27,24 +27,25 @@ export type ToolRuntimePort = Pick<
   | 'emitProgress'
   | 'bus'
 >;
-export type ToolLoopPort = Pick<
-  LoopContext,
-  | 'abortSignal'
-  | 'allowedToolIds'
-  | 'allowedToolActions'
-  | 'budget'
-  | 'capabilities'
-  | 'context'
-  | 'diagnostics'
-  | 'evidenceLedger'
-  | 'iteration'
-  | 'memoryCoordinator'
-  | 'sharedState'
-  | 'source'
-  | 'toolCalls'
-  | 'trace'
-  | 'tracker'
->;
+export type ToolLoopPort = Partial<Pick<LoopContext, 'resourceScope'>> &
+  Pick<
+    LoopContext,
+    | 'abortSignal'
+    | 'allowedToolIds'
+    | 'allowedToolActions'
+    | 'budget'
+    | 'capabilities'
+    | 'context'
+    | 'diagnostics'
+    | 'evidenceLedger'
+    | 'iteration'
+    | 'memoryCoordinator'
+    | 'sharedState'
+    | 'source'
+    | 'toolCalls'
+    | 'trace'
+    | 'tracker'
+  >;
 export interface ToolPipelineContext {
   runtime: ToolRuntimePort;
   loopCtx: ToolLoopPort;

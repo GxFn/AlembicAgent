@@ -131,8 +131,24 @@ export interface EvidenceLedgerLike {
   checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown';
 }
 
+/** 宿主状态的生命周期身份；由运行时生成，不能从模型工具参数推导。 */
+export interface ToolResourceScope {
+  runId: string;
+  /** 一次 reactLoop 的读取视图；同一 run 可并行持有多个视图。 */
+  viewId: string;
+  /** 有损压缩/重置后递增，旧视图的全文可见性不能被继续借用。 */
+  revision: number;
+}
+
+/** 缺省 viewId 释放整个 run；指定时只释放该读取视图，保留运行记忆。 */
+export interface ToolScopeRelease {
+  runId: string;
+  viewId?: string;
+}
+
 export interface ToolRuntimeCallContext {
   agentId?: string;
+  resourceScope?: ToolResourceScope;
   presetName?: string;
   iteration?: number;
   /** 证据台账（Wave A E3）；缺席=非维度场景，note_finding 降级为不校验直存 */

@@ -14,12 +14,14 @@ import type {
   ToolResultEnvelope,
   ToolResultTrust,
   ToolRouterContract,
+  ToolScopeRelease,
 } from '#tools/kernel/index.js';
 import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
 import { ToolRouter } from '../router.js';
 
 export interface ToolContextFactoryContract {
   create(request: ToolCallRequest): ToolContext;
+  releaseScope?(scope: ToolScopeRelease): void | Promise<void>;
 }
 
 export type ToolContextProviderContract = ToolContextFactoryContract;
@@ -134,6 +136,10 @@ export class ToolRouterAdapter implements ToolRouterContract {
     request: ToolCallRequest & { parentCallId: string }
   ): Promise<ToolResultEnvelope> {
     return this.execute(request);
+  }
+
+  async releaseScope(scope: ToolScopeRelease): Promise<void> {
+    await this.#contextFactory.releaseScope?.(scope);
   }
 
   async explain(request: ToolCallRequest): Promise<ToolDecision> {

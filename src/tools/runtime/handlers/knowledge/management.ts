@@ -9,7 +9,6 @@ import { runOperation } from '#shared/operation.js';
 import { fail, ok, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
 import {
   AGENT_RUNTIME_SOURCE,
-  type KnowledgeRepoLike,
   LEGACY_IDE_AGENT_SOURCE,
   type RecipeGatewayLike,
 } from './contracts.js';
@@ -71,11 +70,17 @@ const EVOLUTION_SOURCES = new Set<EvolutionProposalSource>([
 
 function unavailableManagementPort(
   operation: string,
-  port: 'knowledgeRepo' | 'recipeGateway' | 'stagingManager' | 'proposalGateway',
+  port:
+    | 'knowledgeManagement'
+    | 'knowledgeRepo'
+    | 'recipeGateway'
+    | 'stagingManager'
+    | 'proposalGateway',
   method: string,
   id?: string
 ): ToolResult {
   const labels = {
+    knowledgeManagement: 'Knowledge management port',
     knowledgeRepo: 'Knowledge repository',
     recipeGateway: 'Recipe production port',
     stagingManager: 'Staging manager',
@@ -304,16 +309,18 @@ export async function handleManage(
     return handleActiveTransition(operation, id, ctx);
   }
 
-  const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;
-  // 宿主可能误注入原始 Core repository；不能用 duck type 断言制造不存在的管理能力。
-  if (!repo || typeof recordValue(repo)?.[operation] !== 'function') {
-    return unavailableManagementPort(operation, 'knowledgeRepo', operation, id);
+  // 显式端口是宿主能力边界。仅未提供时兼容旧字段，缺方法不能回落原始仓储。
+  const port = ctx.knowledgeManagement !== undefined ? 'knowledgeManagement' : 'knowledgeRepo';
+  const management = ctx[port];
+  const method = recordValue(management)?.[operation];
+  if (typeof method !== 'function') {
+    return unavailableManagementPort(operation, port, operation, id);
   }
 
   try {
     switch (operation) {
       case 'reject':
-        await repo.reject(id, reason ?? 'Rejected by agent');
+        await method.call(management, id, reason ?? 'Rejected by agent');
         return ok(
           { operation, id, status: 'rejected' },
           completedMutationMeta(ctx, 'manage(reject)')
@@ -323,7 +330,7 @@ export async function handleManage(
         if (!data) {
           return fail('knowledge.manage(update) requires data');
         }
-        await repo.update(id, data);
+        await method.call(management, id, data);
         return ok(
           { operation, id, status: 'updated' },
           completedMutationMeta(ctx, 'manage(update)')
@@ -331,7 +338,7 @@ export async function handleManage(
 
       case 'score': {
         const score = data?.score as number;
-        await repo.score(id, score);
+        await method.call(management, id, score);
         return ok(
           { operation, id, status: 'scored', score },
           completedMutationMeta(ctx, 'manage(score)')
@@ -339,7 +346,7 @@ export async function handleManage(
       }
 
       case 'validate': {
-        const validation = await repo.validate(id);
+        const validation = await method.call(management, id);
         const aborted = abortedKnowledgeResult(ctx, 'manage(validate)');
         if (aborted) {
           return aborted;

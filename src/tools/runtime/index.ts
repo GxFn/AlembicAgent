@@ -1,3 +1,4 @@
+export type { KnowledgeManagementPort, KnowledgeReadPort } from '#tools/kernel/knowledge.js';
 export type {
   ActionHandler,
   CapabilityDef,

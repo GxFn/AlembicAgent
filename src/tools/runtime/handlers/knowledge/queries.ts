@@ -1,13 +1,47 @@
 /** 知识 search、prime、detail 的只读查询与受限投影。 */
+import type { KnowledgeReadPort } from '#tools/kernel/knowledge.js';
 import {
   estimateTokens,
   fail,
   ok,
   type ToolContext,
+  type ToolDiagnosticWarning,
   type ToolResult,
 } from '#tools/kernel/registry.js';
-import type { KnowledgeRepoLike, SearchEngineLike, SearchResult } from './contracts.js';
+import type { SearchEngineLike, SearchResult } from './contracts.js';
 import { abortedKnowledgeResult } from './operation.js';
+
+function isKnowledgeReadPort(port: unknown): port is KnowledgeReadPort {
+  return (
+    port !== null &&
+    typeof port === 'object' &&
+    'getById' in port &&
+    typeof port.getById === 'function'
+  );
+}
+
+function unavailableReadPort(action: string, port: 'knowledgeRead' | 'knowledgeRepo'): ToolResult {
+  return {
+    ok: false,
+    data: {
+      action,
+      status: 'port-unavailable',
+      code: 'KNOWLEDGE_READ_PORT_UNAVAILABLE',
+      port,
+      method: 'getById',
+    },
+    error: `Knowledge read port not available for ${action} (${port}.getById)`,
+  };
+}
+
+function isSearchEngine(port: unknown): port is SearchEngineLike {
+  return (
+    port !== null &&
+    typeof port === 'object' &&
+    'search' in port &&
+    typeof port.search === 'function'
+  );
+}
 
 /* ================================================================== */
 /*  knowledge.search                                                   */
@@ -26,8 +60,8 @@ export async function handleSearch(
   const limit = Math.min((params.limit as number) || 10, 50);
   const category = params.category as string | undefined;
 
-  const engine = ctx.searchEngine as SearchEngineLike | undefined;
-  if (!engine) {
+  const engine = ctx.searchEngine;
+  if (!isSearchEngine(engine)) {
     return fail('Search engine not available');
   }
 
@@ -79,10 +113,16 @@ export async function handlePrime(
     : [];
   const limit = Math.min(Math.max((params.limit as number) || 5, 1), 10);
 
-  const engine = ctx.searchEngine as SearchEngineLike | undefined;
-  const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;
-  if (!engine) {
+  const engine = ctx.searchEngine;
+  if (!isSearchEngine(engine)) {
     return fail('Search engine not available');
+  }
+  const port = ctx.knowledgeRead !== undefined ? 'knowledgeRead' : 'knowledgeRepo';
+  const repo = ctx[port];
+  const canRead = isKnowledgeReadPort(repo);
+  // 未注入读取能力时保留 search-only prime；已注入但缺方法时不能伪装成可用端口。
+  if (!canRead && (port === 'knowledgeRead' || repo != null)) {
+    return unavailableReadPort('prime', port);
   }
 
   try {
@@ -98,13 +138,21 @@ export async function handlePrime(
       .slice(0, limit);
 
     const knowledge: Array<Record<string, unknown>> = [];
+    const diagnosticWarnings: ToolDiagnosticWarning[] = [];
     for (const hit of top) {
       let detail: Record<string, unknown> | null = null;
-      if (repo) {
+      if (canRead) {
         try {
-          detail = (await repo.getById(hit.id)) as Record<string, unknown> | null;
-        } catch {
+          detail = await repo.getById(hit.id);
+        } catch (err: unknown) {
           detail = null;
+          // prime 的详情增强仍可降级到搜索摘要，但能力失败需要可观察，不能静默回落旧仓储。
+          diagnosticWarnings.push({
+            code: 'KNOWLEDGE_PRIME_DETAIL_UNAVAILABLE',
+            message: `Knowledge prime detail ${hit.id} unavailable: ${err instanceof Error ? err.message : String(err)}`,
+            stage: 'knowledge.prime',
+            tool: 'knowledge',
+          });
         }
         const aborted = abortedKnowledgeResult(ctx, 'prime detail');
         if (aborted) {
@@ -151,7 +199,10 @@ export async function handlePrime(
             ? 'Existing project knowledge relevant to this task. Follow the doClause/dontClause conventions; cite sources when reusing a pattern; do not re-submit a candidate that duplicates one of these.'
             : 'No existing project knowledge matched this task. Proceed from source analysis; new candidates on this topic are likely novel.',
       },
-      { tokensEstimate: estimateTokens(formatted) }
+      {
+        tokensEstimate: estimateTokens(formatted),
+        ...(diagnosticWarnings.length > 0 ? { degraded: true, diagnosticWarnings } : {}),
+      }
     );
   } catch (err: unknown) {
     return fail(`Prime failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -171,9 +222,11 @@ export async function handleDetail(
     return fail('knowledge.detail requires id');
   }
 
-  const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;
-  if (!repo) {
-    return fail('Knowledge repository not available');
+  // undefined 表示旧宿主未迁移；显式空对象/null 是缺能力，不能绕回原始仓储。
+  const port = ctx.knowledgeRead !== undefined ? 'knowledgeRead' : 'knowledgeRepo';
+  const repo = ctx[port];
+  if (!isKnowledgeReadPort(repo)) {
+    return unavailableReadPort('detail', port);
   }
 
   try {

@@ -10,6 +10,7 @@ import type {
   ToolCallContext,
   ToolCallSource,
   ToolRuntimeCallContext,
+  ToolScopeRelease,
   ToolSurface,
 } from './context.js';
 import type { ToolDecision, ToolExecutionPreview } from './decision.js';
@@ -51,6 +52,8 @@ export interface ToolExecutionAdapter {
 }
 
 export interface ToolRouterContract {
+  /** 可选生命周期接缝；旧宿主仍可运行，新宿主必须释放自己持有的可变状态。 */
+  releaseScope?(scope: ToolScopeRelease): void | Promise<void>;
   execute(request: ToolCallRequest): Promise<ToolResultEnvelope>;
   executeChildCall(
     request: ToolCallRequest & { parentCallId: string }
