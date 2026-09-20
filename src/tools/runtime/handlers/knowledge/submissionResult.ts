@@ -148,10 +148,16 @@ const PERSISTED_RECIPE_REVIEW_FIELDS = [
 
 // 只投影 reviewer 首屏所需的有界字段；身份与摘要都来自 gateway 返回的同一份 persisted raw，
 // 避免为了扫描结果再读库、再次创建，或把模型原始候选误当成已持久化 Recipe。
-function projectPersistedRecipeReview(raw: Record<string, unknown>): Record<string, unknown> {
+function projectPersistedRecipeReview(raw: object | null): Record<string, unknown> {
+  // raw 保留真实实体身份；不以空对象伪造持久化内容，失败仍发生在原首字段投影处。
+  if (raw === null || raw === undefined) {
+    throw new TypeError(
+      `Cannot read properties of ${raw} (reading '${PERSISTED_RECIPE_REVIEW_FIELDS[0]}')`
+    );
+  }
   const review: Record<string, unknown> = {};
   for (const field of PERSISTED_RECIPE_REVIEW_FIELDS) {
-    const value = raw[field];
+    const value: unknown = Reflect.get(Object(raw), field, raw);
     if (value !== undefined) {
       review[field] = Array.isArray(value) ? [...value] : value;
     }

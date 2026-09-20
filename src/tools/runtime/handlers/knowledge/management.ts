@@ -204,6 +204,10 @@ async function handleActiveTransition(
     const published = await gateway.publish(id, {
       userId: pickString(ctx.runtime?.agentId) ?? AGENT_RUNTIME_SOURCE,
     });
+    // 可空类型不改变旧失败位置：写入已经开始，仍由 managementFailure 要求读回确认。
+    if (published === null || published === undefined) {
+      throw new TypeError(`Cannot read properties of ${published} (reading 'lifecycle')`);
+    }
     return ok(
       {
         operation,

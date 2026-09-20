@@ -1190,6 +1190,42 @@ describe('Agent Recipe production profile adapter', () => {
     expect(repository.publish).not.toHaveBeenCalled();
   });
 
+  test('nullable publish keeps the existing failed-write/readback classification', async () => {
+    const result = await handleKnowledge('manage', { operation: 'publish', id: 'null-publish' }, {
+      projectRoot: makeProject(),
+      recipeGateway: {
+        evaluateReadiness: async () => readyReport,
+        publish: async () => null,
+      },
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      status: 'publish-failed',
+      writeState: 'unknown',
+      requiresReadback: true,
+      lifecycle: 'unknown',
+      reason: 'core-publish-failed',
+    });
+    expect(result.error).toContain("Cannot read properties of null (reading 'lifecycle')");
+  });
+
+  test('null persisted raw retains its read failure after confirmed creation', async () => {
+    const fake = fakePort(readyReport);
+    const result = await handleKnowledge('submit', submitParams(), {
+      projectRoot: makeProject(),
+      recipeGateway: {
+        ...fake.port,
+        createOrStage: async (...args: Parameters<typeof fake.port.createOrStage>) => {
+          const created = await fake.port.createOrStage(...args);
+          return { ...created, created: created.created.map((item) => ({ ...item, raw: null })) };
+        },
+      },
+    } as never);
+    expect(fake.calls).toHaveLength(1);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Cannot read properties of null (reading 'description')");
+  });
+
   test('Core publish exceptions retain structured readiness evidence', async () => {
     const projectRoot = makeProject();
     const changedReadiness = {
