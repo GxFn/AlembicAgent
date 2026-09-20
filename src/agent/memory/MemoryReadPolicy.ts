@@ -1,4 +1,5 @@
 import Logger from '@alembic/core/logging';
+import { runOperation } from '#shared/operation.js';
 
 /** 只描述一次读取，不把 session、持久记忆和工作记忆强行合成同一存储接口。 */
 export interface MemoryReadOptions {
@@ -57,43 +58,8 @@ export async function readMemoryValue<T>(
     return { status: 'aborted' };
   }
   const timeoutMs = Math.max(0, memoryReadDeadline(options) - Date.now());
-  if (timeoutMs === 0) {
-    return { status: 'timeout' };
-  }
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let abort: () => void = () => {};
-  const interrupted = new Promise<MemoryReadResult<T>>((resolve) => {
-    abort = () => {
-      resolve({ status: 'aborted' });
-      controller.abort();
-    };
-    options.abortSignal?.addEventListener('abort', abort, { once: true });
-    if (Number.isFinite(timeoutMs)) {
-      timer = setTimeout(() => {
-        resolve({ status: 'timeout' });
-        controller.abort();
-      }, timeoutMs);
-    }
-  });
-  try {
-    const operationResult = Promise.resolve()
-      .then(() => {
-        if (controller.signal.aborted) {
-          return { status: 'aborted' } as const;
-        }
-        return Promise.resolve(operation(controller.signal)).then(
-          (value): MemoryReadResult<T> => ({ status: 'ok', value }),
-          (error: unknown): MemoryReadResult<T> => ({ status: 'error', error })
-        );
-      })
-      .catch((error: unknown): MemoryReadResult<T> => ({ status: 'error', error }));
-    const result = await Promise.race([operationResult, interrupted]);
-    return options.abortSignal?.aborted ? { status: 'aborted' } : result;
-  } finally {
-    clearTimeout(timer);
-    options.abortSignal?.removeEventListener('abort', abort);
-  }
+  const result = await runOperation(operation, { abortSignal: options.abortSignal, timeoutMs });
+  return options.abortSignal?.aborted ? { status: 'aborted' } : result;
 }
 
 export function reportMemoryRead(
