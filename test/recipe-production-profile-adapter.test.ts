@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   computeRecipeSourceContentHash,
+  DivergenceError,
   KnowledgeRepositoryImpl,
   type ProducerContext,
   projectRecipeRetrievalDocumentSet,
@@ -11,6 +12,7 @@ import {
 import { DatabaseConnection } from '@alembic/core/database';
 import { pathGuard } from '@alembic/core/io';
 import {
+  KnowledgeEntry,
   KnowledgeFileWriter,
   KnowledgeService,
   parseKnowledgeMarkdown,
@@ -195,6 +197,477 @@ const readyReport: RetrievalReadinessReport = {
   violations: [],
   warnings: [],
 };
+
+/** 真 Core merge/序列化/读回，只将 Drizzle 执行面替换为本测试私有内存行。 */
+function managementCoreRepository() {
+  let row: Record<string, unknown>;
+  let writes = 0;
+  const drizzle = {
+    update: () => ({
+      set: (next: Record<string, unknown>) => ({
+        where: () => ({
+          run: () => {
+            row = { ...row, ...next };
+            writes += 1;
+            return { changes: 1 };
+          },
+        }),
+      }),
+    }),
+  };
+  const repository = new KnowledgeRepositoryImpl({ getDb: () => ({}) } as never, drizzle as never);
+  row = repository._entityToRow(
+    KnowledgeEntry.fromJSON({
+      id: 'management-recipe',
+      title: 'Management fixture',
+      description: 'Original description',
+      lifecycle: 'staging',
+      stagingDeadline: 1_000_000,
+      autoApprovable: true,
+      stats: { stagingReview: { outcome: 'fail', reviewedAt: 1 } },
+      content: { markdown: 'Verified source content', rationale: 'Existing evidence' },
+    })
+  );
+  vi.spyOn(repository, 'findById').mockImplementation(async () => repository._rowToEntity(row));
+  return {
+    repository,
+    writes: () => writes,
+    read: () => {
+      const entry = repository._rowToEntity(row);
+      if (!entry) {
+        throw new Error('Core management fixture readback is missing');
+      }
+      return entry.toJSON();
+    },
+  };
+}
+
+describe('knowledge management boundaries', () => {
+  test.each([
+    { label: 'stagingDeadline', data: { stagingDeadline: 1, description: 'Do not apply' } },
+    { label: 'stats', data: { stats: {}, description: 'Do not apply' } },
+    {
+      label: 'unknown system field',
+      data: { futureSystemState: undefined, description: 'Do not apply' },
+    },
+  ])('rejects $label before the actual Core merge and preserves the complete input', async ({
+    data,
+  }) => {
+    const fixture = managementCoreRepository();
+    const before = fixture.read();
+    const input = structuredClone(data);
+    expect(before.stats).toMatchObject({ stagingReview: { outcome: 'fail' } });
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation: 'update',
+        id: 'management-recipe',
+        data,
+      },
+      { projectRoot: '.', knowledgeRepo: fixture.repository } as never
+    );
+    const after = fixture.read();
+    expect({
+      ok: result.ok,
+      writes: fixture.writes(),
+      description: after.description,
+      deadline: after.stagingDeadline,
+      review: (after.stats as Record<string, unknown>).stagingReview,
+    }).toEqual({
+      ok: false,
+      writes: 0,
+      description: before.description,
+      deadline: before.stagingDeadline,
+      review: (before.stats as Record<string, unknown>).stagingReview,
+    });
+    expect(data).toEqual(input);
+  });
+
+  test('applies permitted content edits through the actual Core merge without mutating input', async () => {
+    const fixture = managementCoreRepository();
+    const data = Object.freeze({
+      description: 'Verified revised description',
+      title: 'Revised title',
+    });
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation: 'update',
+        id: 'management-recipe',
+        data,
+      },
+      { projectRoot: '.', knowledgeRepo: fixture.repository } as never
+    );
+    expect(result.ok).toBe(true);
+    expect(fixture.writes()).toBe(1);
+    expect(fixture.read()).toMatchObject({
+      ...data,
+      lifecycle: 'staging',
+      stagingDeadline: 1_000_000,
+      stats: { stagingReview: { outcome: 'fail' } },
+    });
+    expect(data).toEqual({ description: 'Verified revised description', title: 'Revised title' });
+  });
+
+  test.each([
+    'review',
+    'review-queue',
+  ])('normalizes %s service exceptions at the public handle boundary', async (operation) => {
+    const reject = async () => {
+      throw new Error('staging unavailable');
+    };
+    await expect(
+      handleKnowledge('manage', { operation, id: 'recipe', outcome: 'pass' }, {
+        projectRoot: '.',
+        stagingManager: { listReviewQueue: reject, recordReview: reject },
+      } as never)
+    ).resolves.toMatchObject({
+      ok: false,
+      data: { operation, status: 'failed' },
+      error: expect.stringContaining('staging unavailable'),
+    });
+  });
+
+  test('settles a cancelled review queue before a non-cooperative read returns', async () => {
+    const controller = new AbortController();
+    let release!: (queue: unknown[]) => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let settled = false;
+    const pending = handleKnowledge('manage', { operation: 'review-queue', limit: 1 }, {
+      projectRoot: '.',
+      abortSignal: controller.signal,
+      stagingManager: {
+        listReviewQueue: () => {
+          started();
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+      },
+    } as never).then((result) => {
+      settled = true;
+      return result;
+    });
+    try {
+      await entered;
+      controller.abort();
+      for (let index = 0; index < 30; index += 1) {
+        await Promise.resolve();
+      }
+      expect(settled).toBe(true);
+      expect(await pending).toMatchObject({ ok: false, error: expect.stringMatching(/abort/i) });
+      release([{ id: 'late' }]);
+      expect((await pending).data).toBeNull();
+    } finally {
+      release?.([]);
+      await pending;
+    }
+  });
+
+  test.each([
+    true,
+    false,
+  ])('retains the actual review write receipt after cancellation: %s', async (recorded) => {
+    const controller = new AbortController();
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review', id: 'recipe', outcome: 'fail' },
+      {
+        projectRoot: '.',
+        abortSignal: controller.signal,
+        stagingManager: {
+          recordReview: async () => {
+            controller.abort();
+            return recorded;
+          },
+        },
+      } as never
+    );
+    expect(result.ok).toBe(recorded);
+    if (recorded) {
+      expect(result.data).toMatchObject({ recorded: true, outcome: 'fail' });
+      expect(result._meta?.degraded).toBe(true);
+    } else {
+      expect(result.error).toContain('not in staging');
+    }
+  });
+
+  test.each([
+    'review',
+    'publish',
+  ])('preserves Core partial-persistence details for %s', async (operation) => {
+    const details = {
+      code: 'core.diagnostic.knowledge.file-db-divergence',
+      entryIds: ['recipe'],
+      fileOpsCompleted: 1,
+      operation,
+      reconcileVia: 'KnowledgeSyncService.sync',
+    };
+    const error = new DivergenceError('File persisted but DB commit failed', details);
+    const reject = async () => {
+      throw error;
+    };
+    const result = await handleKnowledge('manage', { operation, id: 'recipe', outcome: 'pass' }, {
+      projectRoot: '.',
+      stagingManager: { recordReview: reject },
+      recipeGateway: { evaluateReadiness: async () => readyReport, publish: reject },
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      code: 'STATE_DIVERGENCE',
+      details,
+      writeState: 'partial',
+      requiresReadback: true,
+    });
+    expect(result._meta?.degraded).toBe(true);
+    if (operation === 'publish') {
+      expect(result.data).toMatchObject({ lifecycle: 'unknown' });
+    }
+  });
+
+  test.each([
+    'readiness',
+    'publish',
+  ])('distinguishes an unknown write from a %s preflight failure', async (phase) => {
+    const error = new Error('host unavailable');
+    const publish = vi.fn(async () => {
+      throw error;
+    });
+    const result = await handleKnowledge('manage', { operation: 'publish', id: 'recipe' }, {
+      projectRoot: '.',
+      recipeGateway: {
+        evaluateReadiness: async () => {
+          if (phase === 'readiness') {
+            throw error;
+          }
+          return readyReport;
+        },
+        publish,
+      },
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      lifecycle: phase === 'publish' ? 'unknown' : 'unchanged',
+      writeState: phase === 'publish' ? 'unknown' : 'not-started',
+      requiresReadback: phase === 'publish',
+    });
+    expect(publish).toHaveBeenCalledTimes(phase === 'publish' ? 1 : 0);
+  });
+
+  test.each([
+    'evolve',
+    'deprecate',
+  ])('preserves Core skipped %s as a no-op with its reason', async (operation) => {
+    const result = await handleKnowledge('manage', { operation, id: 'recipe' }, {
+      projectRoot: '.',
+      proposalGateway: {
+        submit: async () => ({
+          recipeId: 'recipe',
+          action: operation === 'evolve' ? 'update' : 'deprecate',
+          outcome: 'skipped',
+          error: 'Duplicate proposal (evidence not richer)',
+        }),
+      },
+    } as never);
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      outcome: 'skipped',
+      status: operation === 'evolve' ? 'evolution_skipped' : 'deprecation_skipped',
+      reason: 'Duplicate proposal (evidence not richer)',
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.data).not.toHaveProperty('proposalId', expect.any(String));
+  });
+
+  test.each([
+    ['evolve', 'proposal-created', 'evolution_proposed'],
+    ['evolve', 'proposal-upgraded', 'evolution_proposal_upgraded'],
+    ['deprecate', 'immediately-executed', 'deprecated'],
+    ['skip_evolution', 'verified', 'evolution_verified'],
+  ])('retains confirmed Core %s/%s receipts', async (operation, outcome, status) => {
+    const result = await handleKnowledge('manage', { operation, id: 'recipe' }, {
+      projectRoot: '.',
+      proposalGateway: { submit: async () => ({ outcome, proposalId: 'proposal' }) },
+    } as never);
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ operation, outcome, status });
+  });
+
+  test.each([
+    'reject',
+    'score',
+    'validate',
+    'update',
+  ])('reports a missing %s management port structurally without inventing an implementation', async (operation) => {
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation,
+        id: 'recipe',
+        data: operation === 'update' ? { description: 'Edit' } : { score: 50 },
+      },
+      { projectRoot: '.', knowledgeRepo: {} } as never
+    );
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      status: 'port-unavailable',
+      code: 'KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE',
+      operation,
+      id: 'recipe',
+      port: 'knowledgeRepo',
+      method: operation,
+    });
+    expect(result.error).not.toContain('is not a function');
+  });
+
+  test.each([
+    { label: 'score NaN', params: { operation: 'score', id: 'recipe', data: { score: NaN } } },
+    {
+      label: 'score Infinity',
+      params: { operation: 'score', id: 'recipe', data: { score: Infinity } },
+    },
+    {
+      label: 'score string',
+      params: { operation: 'score', id: 'recipe', data: { score: 'high' } },
+    },
+    { label: 'score missing', params: { operation: 'score', id: 'recipe' } },
+    {
+      label: 'confidence negative',
+      params: { operation: 'deprecate', id: 'recipe', data: { confidence: -0.1 } },
+    },
+    {
+      label: 'confidence percentage',
+      params: { operation: 'deprecate', id: 'recipe', data: { confidence: 80 } },
+    },
+    {
+      label: 'confidence NaN',
+      params: { operation: 'evolve', id: 'recipe', data: { confidence: NaN }, confidence: 0.9 },
+    },
+    {
+      label: 'confidence Infinity',
+      params: { operation: 'evolve', id: 'recipe', confidence: Infinity },
+    },
+    {
+      label: 'confidence string',
+      params: { operation: 'deprecate', id: 'recipe', confidence: '0.9' },
+    },
+    {
+      label: 'confidence null',
+      params: { operation: 'deprecate', id: 'recipe', data: { confidence: null } },
+    },
+    { label: 'id number', params: { operation: 'evolve', id: 12 } },
+    { label: 'id object', params: { operation: 'evolve', id: {} } },
+    { label: 'id blank', params: { operation: 'evolve', id: '   ' } },
+    { label: 'limit fractional', params: { operation: 'review-queue', limit: 0.5 } },
+    { label: 'limit negative', params: { operation: 'review-queue', limit: -1 } },
+    { label: 'limit Infinity', params: { operation: 'review-queue', limit: Infinity } },
+    { label: 'limit string', params: { operation: 'review-queue', limit: 'small' } },
+  ])('rejects invalid explicit management input: $label', async ({ params }) => {
+    const score = vi.fn(async () => {});
+    const submit = vi.fn(async () => ({ outcome: 'proposal-created', proposalId: 'proposal' }));
+    const listReviewQueue = vi.fn(async () => []);
+    const result = await handleKnowledge('manage', params, {
+      projectRoot: '.',
+      knowledgeRepo: { score },
+      proposalGateway: { submit },
+      stagingManager: { listReviewQueue },
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Validation failed:');
+    expect(score).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(listReviewQueue).not.toHaveBeenCalled();
+  });
+
+  test('preserves valid numeric boundaries and defaults only omitted confidence', async () => {
+    const submitted: Array<{ confidence: number; recipeId: string }> = [];
+    const submit = vi.fn(async (decision: { confidence: number; recipeId: string }) => {
+      submitted.push(decision);
+      return { ...decision, outcome: 'proposal-created', proposalId: 'proposal' };
+    });
+    for (const confidence of [0, 1, undefined]) {
+      const result = await handleKnowledge(
+        'manage',
+        {
+          operation: 'deprecate',
+          id: '  recipe  ',
+          ...(confidence === undefined ? {} : { confidence }),
+        },
+        { projectRoot: '.', proposalGateway: { submit } } as never
+      );
+      expect(result.ok).toBe(true);
+    }
+    expect(submitted.map((decision) => decision.confidence)).toEqual([0, 1, 0.7]);
+    expect(submitted.every((decision) => decision.recipeId === 'recipe')).toBe(true);
+    const score = vi.fn(async () => {});
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation: 'score',
+        id: 'recipe',
+        data: { score: 0 },
+      },
+      { projectRoot: '.', knowledgeRepo: { score } } as never
+    );
+    expect(result.ok).toBe(true);
+    expect(score).toHaveBeenCalledWith('recipe', 0);
+  });
+
+  test.each([
+    'lifecycle',
+    'lifecycleHistory',
+    'publishedAt',
+    'publishedBy',
+    'reviewedBy',
+    'reviewedAt',
+    'rejectionReason',
+    'autoApprovable',
+  ])('rejects update of Core-managed %s before invoking the host', async (field) => {
+    const update = vi.fn(async () => {});
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation: 'update',
+        id: 'recipe-pending',
+        data: { [field]: 'active' },
+      },
+      { projectRoot: '.', knowledgeRepo: { update } } as never
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain(field);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  test('preserves supported ordinary update calls', async () => {
+    const update = vi.fn(async () => {});
+    const data = { description: 'Verified description' };
+    const result = await handleKnowledge('manage', { operation: 'update', id: 'recipe', data }, {
+      projectRoot: '.',
+      knowledgeRepo: { update },
+    } as never);
+    expect(result.ok).toBe(true);
+    expect(update).toHaveBeenCalledWith('recipe', data);
+  });
+
+  test('rejects an own lifecycle field even when its explicit value is undefined', async () => {
+    const update = vi.fn(async () => {});
+    const result = await handleKnowledge(
+      'manage',
+      {
+        operation: 'update',
+        id: 'recipe',
+        data: { lifecycle: undefined },
+      },
+      { projectRoot: '.', knowledgeRepo: { update } } as never
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('lifecycle');
+    expect(update).not.toHaveBeenCalled();
+  });
+});
 
 describe('Agent Recipe production profile adapter', () => {
   test('checks cancellation after preparation yields and before starting the Core write', async () => {

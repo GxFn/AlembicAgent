@@ -4,6 +4,89 @@ import { dimensionTags } from '@alembic/core/dimensions';
 import type { ToolContext } from '#tools/kernel/registry.js';
 import { AGENT_RUNTIME_SOURCE, type DimensionMetaLike } from './contracts.js';
 
+// Agent 工具许可面与当前 Core KnowledgeService.update 的 UPDATABLE 内容字段对齐。
+// Core 尚未公开该集合；这里不复制 tag 合并、profile 校验或事务规则，正式宿主仍须注入
+// 受控管理服务。未知自有字段整体拒绝，不能通过黑名单遗漏清空 stats 或改变 staging 时序。
+const MANAGEMENT_EDITABLE_FIELDS = new Set([
+  'title',
+  'description',
+  'trigger',
+  'language',
+  'dimensionId',
+  'category',
+  'knowledgeType',
+  'complexity',
+  'scope',
+  'difficulty',
+  'content',
+  'relations',
+  'constraints',
+  'reasoning',
+  'tags',
+  'headers',
+  'headerPaths',
+  'moduleName',
+  'includeHeaders',
+  'agentNotes',
+  'aiInsight',
+  'topicHint',
+  'whenClause',
+  'doClause',
+  'dontClause',
+  'coreCode',
+  'usageGuide',
+  'retrievalProfile',
+]);
+
+/** management 输入与提交输入共用归一化模块；不执行查询、状态转换或写入。 */
+export function validateManagementInput(params: Record<string, unknown>): string | null {
+  const operation = params.operation;
+  if (operation !== 'review-queue' && (typeof params.id !== 'string' || !params.id.trim())) {
+    return 'id must be a non-empty string';
+  }
+  const data = recordValue(params.data);
+  if (params.data !== undefined && !data) {
+    return 'data must be an object';
+  }
+  if (operation === 'review-queue' && params.limit !== undefined) {
+    if (
+      typeof params.limit !== 'number' ||
+      !Number.isSafeInteger(params.limit) ||
+      params.limit < 1
+    ) {
+      return 'limit must be a positive safe integer';
+    }
+  }
+  if (operation === 'score') {
+    if (typeof data?.score !== 'number' || !Number.isFinite(data.score)) {
+      return 'data.score must be a finite number';
+    }
+  }
+  if (operation === 'evolve' || operation === 'deprecate' || operation === 'skip_evolution') {
+    // 两个兼容输入位置都验证：非法显式值不能被另一个位置或默认置信度悄悄覆盖。
+    for (const value of [data?.confidence, params.confidence]) {
+      if (
+        value !== undefined &&
+        (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1)
+      ) {
+        return 'confidence must be a finite number between 0 and 1';
+      }
+    }
+  }
+  if (params.operation === 'update') {
+    // 不静默删字段，也不把显式 undefined 当缺席；整个输入留给调用方纠正。
+    const forbidden = data
+      ? Reflect.ownKeys(data).filter(
+          (field) => typeof field !== 'string' || !MANAGEMENT_EDITABLE_FIELDS.has(field)
+        )
+      : [];
+    if (forbidden.length > 0) {
+      return `Fields are not editable through knowledge.manage(update): ${forbidden.map(String).join(', ')}; only supported content fields are permitted`;
+    }
+  }
+  return null;
+}
+
 export function pickString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }

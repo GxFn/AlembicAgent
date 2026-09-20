@@ -1,4 +1,10 @@
 /** 知识生命周期管理与 evolution proposal 适配；激活仍由 Core publish 再验证。 */
+import type {
+  EvolutionDecision,
+  EvolutionResult,
+  ProposalGateway,
+  StagingManager,
+} from '@alembic/core/sustain';
 import { runOperation } from '#shared/operation.js';
 import { fail, ok, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
 import {
@@ -7,7 +13,13 @@ import {
   LEGACY_IDE_AGENT_SOURCE,
   type RecipeGatewayLike,
 } from './contracts.js';
-import { numberValue, pickString, recordValue, stringValue } from './input.js';
+import {
+  numberValue,
+  pickString,
+  recordValue,
+  stringValue,
+  validateManagementInput,
+} from './input.js';
 import { abortedKnowledgeResult, completedMutationMeta } from './operation.js';
 
 /* ================================================================== */
@@ -41,36 +53,10 @@ const VALID_OPERATIONS = new Set<ManageOperation>([
   'review-queue',
 ]);
 
-type EvolutionProposalSource =
-  | typeof AGENT_RUNTIME_SOURCE
-  | typeof LEGACY_IDE_AGENT_SOURCE
-  | 'metabolism'
-  | 'decay-scan'
-  | 'consolidation'
-  | 'relevance-audit'
-  | 'file-change'
-  | 'rescan-evolution';
-
-type EvolutionAction = 'update' | 'deprecate' | 'valid';
-
-interface ProposalGatewayLike {
-  submit(decision: {
-    recipeId: string;
-    action: EvolutionAction;
-    source: EvolutionProposalSource;
-    confidence: number;
-    description?: string;
-    evidence?: Record<string, unknown>[];
-    reason?: string;
-    replacedByRecipeId?: string;
-  }): Promise<{
-    recipeId: string;
-    action: EvolutionAction;
-    outcome: string;
-    proposalId?: string;
-    error?: string;
-  }>;
-}
+type EvolutionProposalSource = EvolutionDecision['source'];
+type EvolutionAction = EvolutionDecision['action'];
+type ProposalGatewayLike = Pick<ProposalGateway, 'submit'>;
+type StagingReviewPort = Pick<StagingManager, 'listReviewQueue' | 'recordReview'>;
 
 const EVOLUTION_SOURCES = new Set<EvolutionProposalSource>([
   AGENT_RUNTIME_SOURCE,
@@ -83,16 +69,101 @@ const EVOLUTION_SOURCES = new Set<EvolutionProposalSource>([
   'rescan-evolution',
 ]);
 
+function unavailableManagementPort(
+  operation: string,
+  port: 'knowledgeRepo' | 'recipeGateway' | 'stagingManager' | 'proposalGateway',
+  method: string,
+  id?: string
+): ToolResult {
+  const labels = {
+    knowledgeRepo: 'Knowledge repository',
+    recipeGateway: 'Recipe production port',
+    stagingManager: 'Staging manager',
+    proposalGateway: 'Evolution gateway',
+  };
+  return {
+    ok: false,
+    data: {
+      operation,
+      ...(id ? { id } : {}),
+      status: 'port-unavailable',
+      code: 'KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE',
+      port,
+      method,
+    },
+    error: `${labels[port]} not available for ${operation} (${method})`,
+  };
+}
+
+/** 只投影 Core 已给出的写入事实；异常不等于回滚，原始 details 留给宿主读回/修复。 */
+function managementFailure(
+  operation: string,
+  id: string | undefined,
+  err: unknown,
+  writeStarted: boolean
+): ToolResult {
+  const errorRecord = recordValue(err);
+  const details = recordValue(errorRecord?.details);
+  const code =
+    typeof errorRecord?.code === 'string' ? errorRecord.code : 'KNOWLEDGE_MANAGEMENT_FAILED';
+  const partial = code === 'STATE_DIVERGENCE' || (numberValue(details?.fileOpsCompleted) ?? 0) > 0;
+  const readiness = recordValue(details?.readiness);
+  const readinessBlocked = !partial && readiness?.ready === false;
+  const requiresReadback = partial || (writeStarted && !readinessBlocked);
+  const activeTransition = operation === 'approve' || operation === 'publish';
+  const message = err instanceof Error ? err.message : String(err);
+  const data = {
+    operation,
+    ...(id ? { id } : {}),
+    status: activeTransition
+      ? readinessBlocked
+        ? 'readiness-blocked'
+        : 'publish-failed'
+      : 'failed',
+    code,
+    message,
+    writeState: partial ? 'partial' : requiresReadback ? 'unknown' : 'not-started',
+    requiresReadback,
+    ...(activeTransition
+      ? {
+          lifecycle: requiresReadback ? 'unknown' : 'unchanged',
+          reason: readinessBlocked ? 'core-readiness-blocked' : 'core-publish-failed',
+        }
+      : {}),
+    ...(details ? { details } : {}),
+    ...(readiness ? { readiness } : {}),
+  };
+  return {
+    ...ok(
+      data,
+      requiresReadback
+        ? {
+            degraded: true,
+            diagnosticWarnings: [
+              { code, message, stage: `knowledge.manage(${operation})`, tool: 'knowledge' },
+            ],
+          }
+        : undefined
+    ),
+    ok: false,
+    error: `Manage(${operation}) failed${activeTransition ? ' through Core production port' : ''}: ${message}`,
+  };
+}
+
 async function handleActiveTransition(
   operation: 'approve' | 'publish',
   id: string,
   ctx: ToolContext
 ): Promise<ToolResult> {
   const gateway = ctx.recipeGateway as RecipeGatewayLike | undefined;
-  if (!gateway) {
-    return fail('Recipe production port not available for active transition');
+  if (typeof gateway?.evaluateReadiness !== 'function') {
+    return unavailableManagementPort(operation, 'recipeGateway', 'evaluateReadiness', id);
+  }
+  if (typeof gateway.publish !== 'function') {
+    return unavailableManagementPort(operation, 'recipeGateway', 'publish', id);
   }
 
+  let writeStarted = false;
   try {
     // Core readiness is both exposed as structured tool evidence here and rechecked by
     // RecipeProductionPort.publish at the authoritative mutation boundary.
@@ -124,6 +195,7 @@ async function handleActiveTransition(
       };
     }
 
+    writeStarted = true;
     const published = await gateway.publish(id, {
       userId: pickString(ctx.runtime?.agentId) ?? AGENT_RUNTIME_SOURCE,
     });
@@ -139,25 +211,7 @@ async function handleActiveTransition(
       completedMutationMeta(ctx, `manage(${operation})`)
     );
   } catch (err: unknown) {
-    const errorRecord = recordValue(err);
-    const details = recordValue(errorRecord?.details);
-    const readiness = recordValue(details?.readiness);
-    const readinessBlocked = readiness?.ready === false;
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      ok: false,
-      data: {
-        operation,
-        id,
-        status: readinessBlocked ? 'readiness-blocked' : 'publish-failed',
-        lifecycle: 'unchanged',
-        reason: readinessBlocked ? 'core-readiness-blocked' : 'core-publish-failed',
-        message,
-        ...(typeof errorRecord?.code === 'string' ? { code: errorRecord.code } : {}),
-        ...(readiness ? { readiness } : {}),
-      },
-      error: `Manage(${operation}) failed through Core production port: ${message}`,
-    };
+    return managementFailure(operation, id, err, writeStarted);
   }
 }
 
@@ -166,44 +220,46 @@ export async function handleManage(
   ctx: ToolContext
 ): Promise<ToolResult> {
   const operation = params.operation as string;
-  const id = params.id as string;
+  const id = pickString(params.id);
 
   if (!operation || !VALID_OPERATIONS.has(operation as ManageOperation)) {
     return fail(`Invalid operation: ${operation}. Valid: ${[...VALID_OPERATIONS].join(', ')}`);
+  }
+  const validationError = validateManagementInput(params);
+  if (validationError) {
+    return fail(`Validation failed: ${validationError}`);
   }
 
   // staging 复核队列（Option A：宿主 LLM 按需复核的只读读面）。列表操作，无需 id——须在下方
   // id 必填校验之前处理。返回 staging 中待复核条目及其「断言 vs 源码」所需内容（断言四要素 +
   // reasoning.sources 引用位置）；宿主据此读源码对比，再经 operation='review' 写回结论。
   if (operation === 'review-queue') {
-    const stagingManager = ctx.stagingManager as {
-      listReviewQueue?(limit?: number): Promise<
-        Array<{
-          id: string;
-          title: string;
-          whenClause: string;
-          doClause: string;
-          dontClause: string;
-          coreCode: string;
-          sources: string[];
-          stagingDeadline: number;
-        }>
-      >;
-    } | null;
+    const stagingManager = ctx.stagingManager as StagingReviewPort | null;
     if (!stagingManager || typeof stagingManager.listReviewQueue !== 'function') {
-      return fail('Staging manager not available');
+      return unavailableManagementPort(operation, 'stagingManager', 'listReviewQueue');
     }
-    const limitRaw = params.limit;
-    const limit =
-      typeof limitRaw === 'number' && Number.isFinite(limitRaw) && limitRaw > 0
-        ? Math.floor(limitRaw)
-        : undefined;
-    const queue = await stagingManager.listReviewQueue(limit);
-    const aborted = abortedKnowledgeResult(ctx, 'manage(review-queue)');
-    if (aborted) {
-      return aborted;
+    const limit = params.limit as number | undefined;
+    try {
+      // 这是只读端口；取消可结束等待，迟到数据不能再成为本次工具结果。
+      const read = await runOperation(() => stagingManager.listReviewQueue(limit), {
+        abortSignal: ctx.abortSignal,
+      });
+      const aborted = abortedKnowledgeResult(ctx, 'manage(review-queue)');
+      if (aborted) {
+        return aborted;
+      }
+      if (read.status !== 'ok') {
+        return managementFailure(
+          operation,
+          undefined,
+          read.error ?? new Error(`Review queue ${read.status}`),
+          false
+        );
+      }
+      return ok({ queue: read.value, count: read.value.length });
+    } catch (err: unknown) {
+      return managementFailure(operation, undefined, err, false);
     }
-    return ok({ queue, count: queue.length });
   }
 
   if (!id) {
@@ -220,28 +276,28 @@ export async function handleManage(
   // staging 复核通道（2026-07-06 复核期落地）：AI/程序化复核者把"断言 vs 源码"
   // 结论写回 StagingManager（fail=到期回滚不晋级；pass/缺失=现状晋级）。
   if (operation === 'review') {
-    const stagingManager = ctx.stagingManager as {
-      recordReview(
-        entryId: string,
-        review: { outcome: 'pass' | 'fail'; reviewer?: string; notes?: string }
-      ): Promise<boolean>;
-    } | null;
+    const stagingManager = ctx.stagingManager as StagingReviewPort | null;
     if (!stagingManager || typeof stagingManager.recordReview !== 'function') {
-      return fail('Staging manager not available');
+      return unavailableManagementPort(operation, 'stagingManager', 'recordReview', id);
     }
     const outcome = stringValue(params.outcome);
     if (outcome !== 'pass' && outcome !== 'fail') {
       return fail("knowledge.manage review requires outcome: 'pass' | 'fail'");
     }
-    const recorded = await stagingManager.recordReview(id, {
-      outcome,
-      reviewer: stringValue(params.reviewer) ?? 'in-process-agent',
-      ...(reason ? { notes: reason } : {}),
-    });
-    if (!recorded) {
-      return fail(`Staging review rejected: entry ${id} is not in staging`);
+    try {
+      // 无 signal 的写入一旦启动，继续等待真实回执；取消不能被解释成回滚。
+      const recorded = await stagingManager.recordReview(id, {
+        outcome,
+        reviewer: stringValue(params.reviewer) ?? 'in-process-agent',
+        ...(reason ? { notes: reason } : {}),
+      });
+      if (!recorded) {
+        return fail(`Staging review rejected: entry ${id} is not in staging`);
+      }
+      return ok({ id, outcome, recorded: true }, completedMutationMeta(ctx, 'manage(review)'));
+    } catch (err: unknown) {
+      return managementFailure(operation, id, err, true);
     }
-    return ok({ id, outcome, recorded: true }, completedMutationMeta(ctx, 'manage(review)'));
   }
 
   if (operation === 'approve' || operation === 'publish') {
@@ -249,8 +305,9 @@ export async function handleManage(
   }
 
   const repo = ctx.knowledgeRepo as KnowledgeRepoLike | undefined;
-  if (!repo) {
-    return fail('Knowledge repository not available');
+  // 宿主可能误注入原始 Core repository；不能用 duck type 断言制造不存在的管理能力。
+  if (!repo || typeof recordValue(repo)?.[operation] !== 'function') {
+    return unavailableManagementPort(operation, 'knowledgeRepo', operation, id);
   }
 
   try {
@@ -273,7 +330,7 @@ export async function handleManage(
         );
 
       case 'score': {
-        const score = (data?.score as number) ?? 0;
+        const score = data?.score as number;
         await repo.score(id, score);
         return ok(
           { operation, id, status: 'scored', score },
@@ -294,7 +351,7 @@ export async function handleManage(
         return fail(`Unhandled operation: ${operation}`);
     }
   } catch (err: unknown) {
-    return fail(`Manage(${operation}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    return managementFailure(operation, id, err, operation !== 'validate');
   }
 }
 
@@ -307,8 +364,8 @@ async function handleEvolutionManage(
   ctx: ToolContext
 ): Promise<ToolResult> {
   const gateway = ctx.proposalGateway as ProposalGatewayLike | undefined;
-  if (!gateway?.submit) {
-    return fail('Evolution gateway not available');
+  if (typeof gateway?.submit !== 'function') {
+    return unavailableManagementPort(operation, 'proposalGateway', 'submit', id);
   }
 
   const confidence =
@@ -343,7 +400,12 @@ async function handleEvolutionManage(
     });
 
     if (result.outcome === 'error') {
-      return fail(result.error || `Evolution ${operation} failed`);
+      return managementFailure(
+        operation,
+        id,
+        new Error(result.error || `Evolution ${operation} failed`),
+        true
+      );
     }
 
     return ok(
@@ -353,11 +415,12 @@ async function handleEvolutionManage(
         status: evolutionStatus(operation, result.outcome),
         outcome: result.outcome,
         proposalId: result.proposalId,
+        ...(result.error ? { reason: result.error } : {}),
       },
       completedMutationMeta(ctx, `manage(${operation})`)
     );
   } catch (err: unknown) {
-    return fail(`Manage(${operation}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    return managementFailure(operation, id, err, true);
   }
 }
 
@@ -380,8 +443,12 @@ function defaultEvolutionDescription(operation: 'evolve' | 'deprecate' | 'skip_e
 
 function evolutionStatus(
   operation: 'evolve' | 'deprecate' | 'skip_evolution',
-  outcome: string
+  outcome: EvolutionResult['outcome']
 ): string {
+  // skipped 是 Core 确认的无新写入结果；不能靠兼容 status 再提升成 proposal 成功。
+  if (outcome === 'skipped') {
+    return operation === 'deprecate' ? 'deprecation_skipped' : 'evolution_skipped';
+  }
   if (operation === 'skip_evolution') {
     return outcome === 'verified' ? 'evolution_verified' : 'evolution_skipped';
   }

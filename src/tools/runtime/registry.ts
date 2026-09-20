@@ -412,10 +412,26 @@ const KNOWLEDGE_SPEC: ToolSpec = {
           },
           id: {
             type: 'string',
+            minLength: 1,
             description: 'canonical recipe id (required for all ops except review-queue)',
           },
           reason: { type: 'string' },
-          data: { type: 'object' },
+          data: {
+            type: 'object',
+            description:
+              'Operation-specific fields. update accepts only the Core content-edit field allowlist. Unknown/system fields, including lifecycle, stats and stagingDeadline, are rejected as a whole; use the dedicated management operation.',
+            properties: {
+              score: { type: 'number', description: 'Required finite numeric value for score.' },
+              confidence: { type: 'number', minimum: 0, maximum: 1 },
+            },
+          },
+          confidence: {
+            type: 'number',
+            minimum: 0,
+            maximum: 1,
+            description:
+              'Evolution confidence in the 0..1 range. Invalid explicit values are rejected.',
+          },
           outcome: {
             type: 'string',
             enum: ['pass', 'fail'],
@@ -423,8 +439,10 @@ const KNOWLEDGE_SPEC: ToolSpec = {
           },
           reviewer: { type: 'string', description: 'review only: reviewer identity' },
           limit: {
-            type: 'number',
-            description: 'review-queue only: cap entries returned (oldest-first)',
+            type: 'integer',
+            minimum: 1,
+            description:
+              'review-queue only: positive integer cap on entries returned (oldest-first)',
           },
         },
         required: ['operation'],
