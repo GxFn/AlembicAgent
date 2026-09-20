@@ -204,6 +204,25 @@ async function handleActiveTransition(
     const published = await gateway.publish(id, {
       userId: pickString(ctx.runtime?.agentId) ?? AGENT_RUNTIME_SOURCE,
     });
+    if (published === null) {
+      // Core 允许写后读回为空；写入已经发出，缺回执不能推断未写，也不能自动重试。
+      throw Object.assign(
+        new Error(
+          'Core publish returned no confirmation receipt; read back the write outcome before retrying'
+        ),
+        {
+          code: 'KNOWLEDGE_WRITE_RECEIPT_UNAVAILABLE',
+          details: {
+            operation,
+            id,
+            coreReceipt: null,
+            writeState: 'unknown',
+            requiresReadback: true,
+            retryable: false,
+          },
+        }
+      );
+    }
     return ok(
       {
         operation,

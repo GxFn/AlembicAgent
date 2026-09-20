@@ -103,9 +103,19 @@ export async function completeCreatedSubmission(
       recordPostCommitWarning('KNOWLEDGE_SESSION_SAVE_FAILED', err);
     }
   }
+  // Core 先确认 created 身份，再补写关系；补写读回可能为空，不能据此抹掉创建事实。
+  const persistedReview = created.raw == null ? {} : projectPersistedRecipeReview(created.raw);
+  if (created.raw == null) {
+    recordPostCommitWarning(
+      'KNOWLEDGE_CREATED_DETAILS_UNAVAILABLE',
+      new Error(
+        'Core confirmed the created identity but returned no persisted details; keep the identity and read back details without creating again'
+      )
+    );
+  }
   return ok(
     {
-      ...projectPersistedRecipeReview(created.raw),
+      ...persistedReview,
       status: 'created',
       id: created.id,
       candidateId: created.id,
@@ -146,12 +156,13 @@ const PERSISTED_RECIPE_REVIEW_FIELDS = [
   'source',
 ] as const;
 
-// 只投影 reviewer 首屏所需的有界字段；身份与摘要都来自 gateway 返回的同一份 persisted raw，
-// 避免为了扫描结果再读库、再次创建，或把模型原始候选误当成已持久化 Recipe。
-function projectPersistedRecipeReview(raw: Record<string, unknown>): Record<string, unknown> {
+// 详情只来自 Core 返回的 raw；创建身份由已确认 wrapper 提供，缺详情不能用模型候选补齐。
+// 只投影 reviewer 首屏所需的有界字段，避免为了扫描结果再读库或再次创建。
+function projectPersistedRecipeReview(raw: object): Record<string, unknown> {
   const review: Record<string, unknown> = {};
   for (const field of PERSISTED_RECIPE_REVIEW_FIELDS) {
-    const value = raw[field];
+    // Core 的 raw 也可以是实体类；只读取白名单属性，不要求实体伪造字符串索引签名。
+    const value: unknown = Reflect.get(raw, field);
     if (value !== undefined) {
       review[field] = Array.isArray(value) ? [...value] : value;
     }

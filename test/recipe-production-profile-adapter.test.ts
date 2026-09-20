@@ -1121,6 +1121,118 @@ describe('Agent Recipe production profile adapter', () => {
     });
   });
 
+  test.each([
+    'approve',
+    'publish',
+  ])('keeps an unknown write outcome when real Core returns a null %s receipt', async (operation) => {
+    const projectRoot = makeProject();
+    const publish = vi.fn(async () => null);
+    const port = new RecipeProductionGateway({
+      projectRoot,
+      knowledgeService: {
+        create: vi.fn(async () => ({ id: 'unused', title: 'unused', lifecycle: 'pending' })),
+        update: vi.fn(async () => null),
+        updateQuality: vi.fn(async () => undefined),
+        evaluateRetrievalReadiness: vi.fn(async () => readyReport),
+        publish,
+      },
+    });
+
+    const result = await handleKnowledge('manage', { operation, id: 'recipe-null-receipt' }, {
+      projectRoot,
+      recipeGateway: port,
+    } as never);
+
+    expect(publish).toHaveBeenCalledExactlyOnceWith('recipe-null-receipt', {
+      userId: 'alembic-agent',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.data).toMatchObject({
+      operation,
+      id: 'recipe-null-receipt',
+      status: 'publish-failed',
+      code: 'KNOWLEDGE_WRITE_RECEIPT_UNAVAILABLE',
+      lifecycle: 'unknown',
+      writeState: 'unknown',
+      requiresReadback: true,
+      details: {
+        operation,
+        id: 'recipe-null-receipt',
+        coreReceipt: null,
+        writeState: 'unknown',
+        requiresReadback: true,
+        retryable: false,
+      },
+    });
+    expect(result._meta).toMatchObject({
+      degraded: true,
+      diagnosticWarnings: [
+        expect.objectContaining({ code: 'KNOWLEDGE_WRITE_RECEIPT_UNAVAILABLE' }),
+      ],
+    });
+    expect(result.data).not.toHaveProperty('record');
+  });
+
+  test('retains the confirmed identity when real Core relation readback makes created.raw null', async () => {
+    const projectRoot = makeProject();
+    const create = vi.fn(async (data: Record<string, unknown>) => ({
+      ...data,
+      id: 'recipe-confirmed',
+      title: String(data.title),
+      lifecycle: 'staging',
+    }));
+    const update = vi.fn(async () => null);
+    const evaluateReadiness = vi.fn(async () => readyReport);
+    const port = new RecipeProductionGateway({
+      projectRoot,
+      knowledgeService: {
+        create,
+        update,
+        updateQuality: vi.fn(async () => undefined),
+        evaluateRetrievalReadiness: evaluateReadiness,
+      },
+    });
+    const createOrStage = vi.spyOn(port, 'createOrStage');
+    const save = vi.fn();
+    const result = await handleKnowledge(
+      'submit',
+      submitParams({
+        localRelationKey: 'confirmed',
+        relations: { related: [{ target: 'local:confirmed', description: 'confirmed reference' }] },
+        sourceGraphRefs: ['sourceGraph:fixture-relation-readback'],
+      }),
+      { projectRoot, recipeGateway: port, sessionStore: { save } } as never
+    );
+
+    expect(createOrStage).toHaveBeenCalledOnce();
+    const coreResult = await createOrStage.mock.results[0].value;
+    expect(coreResult.created).toHaveLength(1);
+    expect(coreResult.created[0]).toMatchObject({
+      id: 'recipe-confirmed',
+      lifecycle: 'staging',
+      raw: null,
+    });
+    expect(create).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledOnce();
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      status: 'created',
+      id: 'recipe-confirmed',
+      candidateId: 'recipe-confirmed',
+      lifecycle: 'staging',
+      readiness: readyReport,
+    });
+    expect(result._meta).toMatchObject({
+      degraded: true,
+      diagnosticWarnings: [
+        expect.objectContaining({ code: 'KNOWLEDGE_CREATED_DETAILS_UNAVAILABLE' }),
+      ],
+    });
+    expect(result.data).not.toHaveProperty('description');
+    expect(evaluateReadiness).toHaveBeenCalledExactlyOnceWith('recipe-confirmed');
+    expect(save).toHaveBeenCalledOnce();
+  });
+
   test('invalid Core readiness blocks publish with structured evidence and no lifecycle mutation', async () => {
     const projectRoot = makeProject();
     const blockedReadiness: RetrievalReadinessReport = {
