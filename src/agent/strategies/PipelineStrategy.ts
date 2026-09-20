@@ -19,6 +19,7 @@
 
 import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
+import { runOperation } from '#shared/operation.js';
 import { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { PipelineType } from '../context/exploration/ExplorationStrategies.js';
 import {
@@ -33,26 +34,11 @@ import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
+import { runStageAttempt, type StageAttemptScope } from './pipeline/attempt.js';
+import type { PipelineRuntime, StageResult } from './pipeline/contracts.js';
 import { Strategy } from './Strategy.js';
 
 // ───── Local Types for PipelineStrategy ──────────────────
-
-/** Extended runtime — may carry an optional logger (AgentRuntime provides one) */
-interface PipelineRuntime {
-  id: string;
-  reactLoop(prompt: string, opts?: Record<string, unknown>): Promise<StageResult>;
-  logger?: { info?: (...args: unknown[]) => void };
-}
-
-/** Result of a single stage execution */
-interface StageResult {
-  reply: string;
-  toolCalls: Array<Record<string, unknown>>;
-  tokenUsage: { input: number; output: number };
-  iterations: number;
-  timedOut?: boolean;
-  [key: string]: unknown;
-}
 
 /** Budget configuration for a pipeline stage */
 interface StageBudget {
@@ -162,6 +148,8 @@ interface PipelineContext {
   retryExhausted: boolean;
   /** 严格链失败不是可降级成功，也不沿用 legacy abandoned 语义。 */
   strictFailed: boolean;
+  /** 父信号或阶段主动停止都终止本管线；诊断只投影原因，不反向控制流程。 */
+  cancelled: boolean;
 }
 
 interface GateEvalResult {
@@ -321,6 +309,7 @@ export class PipelineStrategy extends Strategy {
       abandonInfo: null,
       retryExhausted: false,
       strictFailed: false,
+      cancelled: false,
     };
 
     // 会话计数盒预建：必须在任何阶段对 sharedState 做浅拷贝之前把嵌套盒挂上——
@@ -339,9 +328,10 @@ export class PipelineStrategy extends Strategy {
       baseSharedStateForCounters._sessionCounters = {};
     }
 
+    let lastMainStageName: string | null = null;
     for (let i = 0; i < this.#stages.length; i++) {
-      if ((ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted) {
-        ctx.diagnostics.recordCancelReason('abort_signal');
+      if (this.#isCancelled(ctx)) {
+        this.#recordCancellation(ctx);
         break;
       }
       const stage = this.#stages[i];
@@ -371,12 +361,14 @@ export class PipelineStrategy extends Strategy {
       }
 
       await this.#executeStage(runtime, message, stage, ctx, bus);
+      lastMainStageName = stage.name;
     }
 
     // 最终回复 = 最后一个执行阶段的输出
-    const lastStage = Object.values(ctx.phaseResults)
-      .filter((r): r is StageResult => r != null && typeof r === 'object' && 'reply' in r)
-      .pop();
+    // phaseResults 同时保存修复微阶段；覆写已有键不会改变插入顺序，不能据此猜最后主阶段。
+    const lastStage = lastMainStageName
+      ? (ctx.phaseResults[lastMainStageName] as StageResult | undefined)
+      : undefined;
 
     // P0-4：管线结局一等化。phases 会原样穿透 AgentRuntime.execute → AgentRunResult.phases
     // → coordinator child result → merger，因此 _pipelineOutcome 是父 run 聚合
@@ -388,9 +380,9 @@ export class PipelineStrategy extends Strategy {
     const recipeReadiness = readRecipeReadinessReports(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
     const abandoned = ctx.degraded || ctx.retryExhausted;
-    const aborted = (ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted === true;
+    const aborted = this.#isCancelled(ctx);
     if (aborted) {
-      ctx.diagnostics.recordCancelReason('abort_signal');
+      this.#recordCancellation(ctx);
     }
     const outcome = aborted
       ? 'aborted'
@@ -441,6 +433,9 @@ export class PipelineStrategy extends Strategy {
     }
     const gate = stage.gate;
     let gateResult = await this.#evaluateGateResult(stage, ctx, bus);
+    if (this.#isCancelled(ctx)) {
+      return 'break';
+    }
     this.#storeGateResult(stage, gateResult, ctx, bus);
     const strictContext = this.#strictProductionContext(ctx);
     const strictAnalysisRetryEnabled =
@@ -537,9 +532,15 @@ export class PipelineStrategy extends Strategy {
           ctx,
           bus
         );
+        if (this.#isCancelled(ctx)) {
+          return 'break';
+        }
         phaseResults._recordRepairToolWritten = this.#stageHasNoteFindingCall(repairResult);
 
         gateResult = await this.#evaluateGateResult(stage, ctx, bus);
+        if (this.#isCancelled(ctx)) {
+          return 'break';
+        }
         this.#storeGateResult(stage, gateResult, ctx, bus);
         if (gateResult.action === 'pass') {
           return 'continue';
@@ -580,10 +581,16 @@ export class PipelineStrategy extends Strategy {
           ctx,
           bus
         );
+        if (this.#isCancelled(ctx)) {
+          return 'break';
+        }
         const newReply = typeof rewriteResult?.reply === 'string' ? rewriteResult.reply.trim() : '';
         if (source && newReply.length > 0) {
           phaseResults[sourceName] = { ...source, reply: newReply };
           gateResult = await this.#evaluateGateResult(stage, ctx, bus);
+          if (this.#isCancelled(ctx)) {
+            return 'break';
+          }
           this.#storeGateResult(stage, gateResult, ctx, bus);
           if (gateResult.action === 'pass') {
             return 'continue';
@@ -703,11 +710,28 @@ export class PipelineStrategy extends Strategy {
       const gateSource = gate.useCumulativeToolCalls
         ? this.#withCumulativeToolCalls(source, ctx)
         : source;
-      const evaluated = (await gate.evaluator(
-        gateSource,
-        phaseResults,
-        strategyContext
-      )) as GateEvalResult;
+      const gateDiagnostics = new DiagnosticsCollector();
+      const evaluation = await runOperation(
+        (signal) =>
+          gate.evaluator?.(gateSource, phaseResults, {
+            ...strategyContext,
+            abortSignal: signal,
+            diagnostics: gateDiagnostics,
+          }),
+        { abortSignal: strategyContext.abortSignal as AbortSignal | undefined }
+      );
+      ctx.diagnostics.merge(gateDiagnostics.toJSON());
+      if (evaluation.status === 'aborted') {
+        ctx.cancelled = true;
+        this.#recordCancellation(ctx);
+        return { action: 'aborted', pass: false };
+      }
+      if (evaluation.status !== 'ok') {
+        throw evaluation.error instanceof Error
+          ? evaluation.error
+          : new Error('Pipeline gate evaluation failed');
+      }
+      const evaluated = evaluation.value as GateEvalResult;
       return {
         ...evaluated,
         action: evaluated.action || (evaluated.pass ? 'pass' : 'analysis_retry'),
@@ -987,130 +1011,119 @@ export class PipelineStrategy extends Strategy {
       ),
     });
 
-    // 构建阶段 prompt
-    const stagePrompt = await this.#buildStagePrompt(
-      stage,
-      message,
-      phaseResults,
-      strategyContext,
-      ctx
-    );
-
-    // Budget (retry 时使用 retryBudget; 无 stage.budget 时回退到 strategyContext._computedBudget)
+    // 在准备前捕获预算；异步 promptBuilder 不能为同一次 attempt 延长或替换期限。
     const isRetry = !!phaseResults[`_was_retry_${stage.name}`];
     const decisionOnly = isRetry && stage.decisionOnlyOnRetry === true;
     const computedBudget = (strategyContext._computedBudget || null) as StageBudget | null;
-    let effectiveBudget =
+    const configuredBudget =
       isRetry && stage.retryBudget
         ? stage.retryBudget
         : stage.budget || computedBudget || undefined;
     const strictProduction = Boolean(this.#strictProductionContext(ctx));
-    effectiveBudget = withProducerCoverageBudget(
+    const effectiveBudget = withProducerCoverageBudget(
       stage,
-      effectiveBudget,
+      configuredBudget ? { ...configuredBudget } : undefined,
       ctx.gateArtifact,
       strictProduction
     );
+    const retryBudget = stage.retryBudget ? { ...stage.retryBudget } : undefined;
     delete phaseResults[`_was_retry_${stage.name}`];
-
-    // 阶段隔离 (ContextWindow + ExplorationTracker)
     const ctxWin = (strategyContext.contextWindow || null) as StageContextWindow | null;
-    const isNewStage = ctx.lastExecutedStageName !== stage.name;
-    if (ctxWin && ctx.execStageCount > 0 && isNewStage) {
-      ctxWin.resetForNewStage();
-    } else if (ctxWin && ctx.execStageCount > 0 && !isNewStage) {
-      _pipelineLogger().info(
-        `[PipelineStrategy] ♻️ Retry stage "${stage.name}" — preserving ContextWindow (${ctxWin.tokenCount || 0} tokens)`
-      );
-    }
+    let stagePrompt = '';
 
-    // ExplorationTracker (per-stage)
-    const stageTracker = this.#resolveStageTracker(stage, ctx, strategyContext, effectiveBudget);
-
-    ctx.lastExecutedStageName = stage.name;
-    ctx.execStageCount++;
-
-    const submitToolName = (stage.submitToolName || strategyContext.submitToolName || undefined) as
-      | string
-      | undefined;
-    _pipelineLogger().info(
-      `[PipelineStrategy] ▶ Stage "${stage.name}"${isRetry ? ' (retry)' : ''} — ` +
-        `budget: ${effectiveBudget?.maxIterations || '∞'} iters, ` +
-        `timeout: ${effectiveBudget?.timeoutMs ? `${effectiveBudget.timeoutMs / 1000}s` : '∞'}, ` +
-        `tracker: ${stageTracker?.constructor?.name || 'none'}` +
-        `${submitToolName ? `, submitTool: ${submitToolName}` : ''}`
-    );
-
-    // 执行 reactLoop (含 per-stage 硬超时保护)
-    let stageResult = await this.#runWithTimeout(
-      runtime,
-      stagePrompt,
-      message,
-      stage,
-      effectiveBudget,
-      ctxWin,
-      stageTracker,
-      strategyContext,
-      phaseResults,
-      decisionOnly,
-      bus
-    );
-
-    // ── 超时零输出快速重试 ──
-    // 当阶段 hard timeout 且 0 tool calls（LLM 完全卡住），
-    // 如果有 retryBudget 且本次非 retry，立即以降级预算重跑一次，
-    // 跳过 gate 往返，争取在更短时限内拿到输出。
-    if (
-      !strictProduction &&
-      stageResult.timedOut &&
-      !stageResult.toolCalls?.length &&
-      !isRetry &&
-      stage.retryBudget
-    ) {
-      _pipelineLogger().info(
-        `[PipelineStrategy] ♻️ Stage "${stage.name}" timed out with 0 tool calls — fast-retrying with retryBudget`
-      );
-      bus.publish(AgentEvents.PROGRESS, {
-        type: 'pipeline_stage_fast_retry',
-        stage: stage.name,
-      });
-
-      // 重置 ContextWindow (清空上一轮的空消息)
-      if (ctxWin) {
-        ctxWin.resetForNewStage();
-      }
-
-      // 重建 tracker — 用 retryBudget 的更短限制
-      const retryTracker = this.#resolveStageTracker(
-        stage,
-        ctx,
-        strategyContext,
-        stage.retryBudget
-      );
-
-      // 构建简化 prompt（如果有 retryPromptBuilder 则使用）
-      let retryPrompt = stagePrompt;
-      if (typeof stage.retryPromptBuilder === 'function') {
-        retryPrompt = stage.retryPromptBuilder(
-          { reason: 'Stage hard timeout with 0 tool calls', artifact: null },
-          message.content,
-          phaseResults
-        );
-      }
-
-      stageResult = await this.#runWithTimeout(
+    const executeAttempt = async (budget: StageBudget | undefined, fastRetry: boolean) => {
+      const timeoutMs = budget?.timeoutMs;
+      const attempt = await runStageAttempt(
         runtime,
-        retryPrompt,
-        message,
-        stage,
-        stage.retryBudget,
-        ctxWin,
-        retryTracker,
-        strategyContext,
-        phaseResults,
-        decisionOnly,
-        bus
+        {
+          stage: stage.name,
+          abortSignal: strategyContext.abortSignal as AbortSignal | undefined,
+          // 保留原来的 forced-summary 60s 缓冲，但准备与执行只共享这一份期限。
+          ...(timeoutMs ? { timeoutMs: timeoutMs + 60_000 } : {}),
+          diagnostics: ctx.diagnostics,
+          onToolCall: stage.onToolCall,
+        },
+        async (scope) => {
+          const attemptContext = {
+            ...strategyContext,
+            abortSignal: scope.signal,
+            diagnostics: scope.diagnostics,
+          };
+          const prompt = fastRetry
+            ? stage.retryPromptBuilder
+              ? stage.retryPromptBuilder(
+                  { reason: 'Stage hard timeout with 0 tool calls', artifact: null },
+                  message.content,
+                  phaseResults
+                )
+              : stagePrompt
+            : await this.#buildStagePrompt(stage, message, phaseResults, attemptContext, ctx);
+          // 不合作的准备任务即使晚到，也不能重置上下文或启动一次新的工具循环。
+          if (scope.signal.aborted) {
+            return { reply: '', toolCalls: [], iterations: 0, tokenUsage: { input: 0, output: 0 } };
+          }
+          if (!fastRetry) {
+            stagePrompt = prompt;
+          }
+          const isNewStage = ctx.lastExecutedStageName !== stage.name;
+          if (ctxWin && (fastRetry || (ctx.execStageCount > 0 && isNewStage))) {
+            ctxWin.resetForNewStage();
+          } else if (ctxWin && ctx.execStageCount > 0) {
+            _pipelineLogger().info(
+              `[PipelineStrategy] Retry stage "${stage.name}" — preserving ContextWindow (${ctxWin.tokenCount || 0} tokens)`
+            );
+          }
+          const tracker = this.#resolveStageTracker(stage, ctx, attemptContext, budget);
+          if (!fastRetry) {
+            ctx.lastExecutedStageName = stage.name;
+            ctx.execStageCount++;
+          }
+          _pipelineLogger().info(
+            `[PipelineStrategy] Stage "${stage.name}"${fastRetry || isRetry ? ' (retry)' : ''} — budget: ${budget?.maxIterations || '∞'} iters, timeout: ${budget?.timeoutMs || '∞'}ms`
+          );
+          return this.#runPreparedStage(
+            prompt,
+            message,
+            stage,
+            budget,
+            ctxWin,
+            tracker,
+            attemptContext,
+            phaseResults,
+            decisionOnly,
+            scope
+          );
+        }
       );
+      ctx.cancelled ||= attempt.result.aborted === true;
+      this.#accumulateStageAttempt(ctx, attempt.result);
+      if (attempt.status === 'error') {
+        throw attempt.error instanceof Error
+          ? attempt.error
+          : new Error(String(attempt.error || 'Pipeline stage failed'));
+      }
+      if (attempt.result.timedOut) {
+        bus.publish(AgentEvents.PROGRESS, {
+          type: 'pipeline_stage_timeout',
+          stage: stage.name,
+          timeoutMs: timeoutMs ? timeoutMs + 60_000 : null,
+        });
+      }
+      return attempt;
+    };
+
+    let attempt = await executeAttempt(effectiveBudget, false);
+    if (!strictProduction && !isRetry && retryBudget && attempt.canFastRetry) {
+      _pipelineLogger().info(
+        `[PipelineStrategy] Stage "${stage.name}" confirmed no tools — fast-retrying with retryBudget`
+      );
+      bus.publish(AgentEvents.PROGRESS, { type: 'pipeline_stage_fast_retry', stage: stage.name });
+      attempt = await executeAttempt(retryBudget, true);
+    }
+    const stageResult = attempt.result;
+    phaseResults[stage.name] = stageResult;
+    if (this.#isCancelled(ctx)) {
+      return stageResult;
     }
 
     if (strictProduction) {
@@ -1121,15 +1134,6 @@ export class PipelineStrategy extends Strategy {
         stageResult.toolCalls || [],
         strictContext?.factQueryObligationIds || []
       );
-    }
-
-    // 累计结果
-    phaseResults[stage.name] = stageResult;
-    ctx.totalToolCalls.push(...(stageResult.toolCalls || []));
-    ctx.totalIterations += stageResult.iterations || 0;
-    if (stageResult.tokenUsage) {
-      ctx.totalTokenUsage.input += stageResult.tokenUsage.input || 0;
-      ctx.totalTokenUsage.output += stageResult.tokenUsage.output || 0;
     }
 
     _pipelineLogger().info(
@@ -1145,6 +1149,27 @@ export class PipelineStrategy extends Strategy {
     });
 
     return stageResult;
+  }
+
+  #isCancelled(ctx: PipelineContext): boolean {
+    return (
+      ctx.cancelled ||
+      (ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted === true
+    );
+  }
+
+  #recordCancellation(ctx: PipelineContext): void {
+    const parentAborted =
+      (ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted === true;
+    ctx.diagnostics.recordCancelReason(parentAborted ? 'abort_signal' : 'stage_aborted');
+  }
+
+  /** 每次尝试的已知成本均入总账，最终阶段结果仍只表示最后一次尝试。 */
+  #accumulateStageAttempt(ctx: PipelineContext, result: StageResult): void {
+    ctx.totalToolCalls.push(...(result.toolCalls || []));
+    ctx.totalIterations += result.iterations || 0;
+    ctx.totalTokenUsage.input += result.tokenUsage?.input || 0;
+    ctx.totalTokenUsage.output += result.tokenUsage?.output || 0;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -1163,7 +1188,6 @@ export class PipelineStrategy extends Strategy {
     if (phaseResults._retryContext && stage.retryPromptBuilder) {
       const retryCtx = phaseResults._retryContext as { reason?: string; artifact?: unknown };
       prompt = stage.retryPromptBuilder(retryCtx, message.content, phaseResults);
-      delete phaseResults._retryContext;
     } else if (stage.promptBuilder) {
       prompt = await stage.promptBuilder({
         message: message.content,
@@ -1178,7 +1202,10 @@ export class PipelineStrategy extends Strategy {
     }
 
     // 清除已消费的 retryContext
-    if (phaseResults._retryContext) {
+    if (
+      !(strategyContext.abortSignal as AbortSignal | undefined)?.aborted &&
+      phaseResults._retryContext
+    ) {
       delete phaseResults._retryContext;
     }
     return prompt;
@@ -1366,9 +1393,8 @@ export class PipelineStrategy extends Strategy {
     };
   }
 
-  /** 执行 reactLoop 并添加硬超时保护 */
-  async #runWithTimeout(
-    runtime: PipelineRuntime,
+  /** 真实 stage→reactLoop 投影；signal、诊断与观察钩子由唯一 attempt 边界注入。 */
+  #runPreparedStage(
     stagePrompt: string,
     message: AgentMessage,
     stage: PipelineStage,
@@ -1378,22 +1404,8 @@ export class PipelineStrategy extends Strategy {
     strategyContext: Record<string, unknown>,
     phaseResults: Record<string, unknown>,
     decisionOnly: boolean,
-    bus: AgentEventBus
+    scope: StageAttemptScope
   ): Promise<StageResult> {
-    // 创建 AbortController — hard timeout 时取消进行中的 LLM 请求
-    const abortController = new AbortController();
-    const parentAbortSignal =
-      strategyContext.abortSignal &&
-      typeof (strategyContext.abortSignal as AbortSignal).aborted === 'boolean'
-        ? (strategyContext.abortSignal as AbortSignal)
-        : null;
-    const onParentAbort = () => abortController.abort();
-    if (parentAbortSignal?.aborted) {
-      abortController.abort();
-    } else {
-      parentAbortSignal?.addEventListener('abort', onParentAbort, { once: true });
-    }
-
     const dimensionScopeId =
       typeof (strategyContext.sharedState as Record<string, unknown> | undefined)
         ?._dimensionScopeId === 'string'
@@ -1452,7 +1464,7 @@ export class PipelineStrategy extends Strategy {
             }
           : baseSharedState;
 
-    const reactPromise = runtime.reactLoop(stagePrompt, {
+    return scope.runLoop(stagePrompt, {
       history: message.history,
       context: {
         ...(messageContext || {}),
@@ -1476,7 +1488,6 @@ export class PipelineStrategy extends Strategy {
       additionalToolsOverride: stage.additionalTools,
       budgetOverride: effectiveBudget,
       systemPromptOverride: stage.systemPrompt,
-      onToolCall: stage.onToolCall,
       contextWindow: ctxWin,
       tracker: stageTracker,
       trace: strategyContext.trace || null,
@@ -1484,58 +1495,7 @@ export class PipelineStrategy extends Strategy {
       sharedState: stageSharedState,
       source: strategyContext.source || null,
       toolChoiceOverride: stage.toolChoiceOverride || null,
-      abortSignal: abortController.signal,
-      diagnostics: strategyContext.diagnostics as DiagnosticsCollector,
     });
-
-    const stageTimeoutMs = effectiveBudget?.timeoutMs;
-    if (!stageTimeoutMs) {
-      return reactPromise.finally(() => {
-        parentAbortSignal?.removeEventListener('abort', onParentAbort);
-      });
-    }
-
-    // 硬超时 = budget.timeoutMs + 60s 缓冲（ForcedSummary AI 调用需要 ~30s）
-    const hardLimitMs = stageTimeoutMs + 60_000;
-    let hardTimer: ReturnType<typeof setTimeout> | undefined;
-
-    return Promise.race([
-      reactPromise,
-      new Promise<StageResult>((_, reject) => {
-        hardTimer = setTimeout(() => {
-          // 先中止进行中的 LLM HTTP 请求，再触发 reject
-          abortController.abort();
-          reject(new Error('__STAGE_HARD_TIMEOUT__'));
-        }, hardLimitMs);
-      }),
-    ])
-      .catch((err: unknown) => {
-        if (err instanceof Error && err.message === '__STAGE_HARD_TIMEOUT__') {
-          runtime.logger?.info?.(
-            `[PipelineStrategy] ⏰ Stage "${stage.name}" hard timeout (${hardLimitMs}ms) — continuing pipeline`
-          );
-          bus.publish(AgentEvents.PROGRESS, {
-            type: 'pipeline_stage_timeout',
-            stage: stage.name,
-            timeoutMs: hardLimitMs,
-          });
-          (strategyContext.diagnostics as DiagnosticsCollector | undefined)?.recordTimedOutStage(
-            stage.name
-          );
-          return {
-            reply: '',
-            toolCalls: [],
-            iterations: 0,
-            tokenUsage: { input: 0, output: 0 },
-            timedOut: true,
-          };
-        }
-        throw err;
-      })
-      .finally(() => {
-        clearTimeout(hardTimer);
-        parentAbortSignal?.removeEventListener('abort', onParentAbort);
-      });
   }
 
   /** 质量门控评估 (向后兼容: 阈值模式) */

@@ -9,7 +9,7 @@
  *      ToolExecutionPipeline 每次调用现造的一次性投影(门0 真跑实测假零的根因)；
  *   3) fan-out merger 把 abandoned child 聚合为父结果 phases.abandonedModules(一等字段)。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runModuleMining } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import type {
@@ -48,6 +48,53 @@ function pipelineOutcome(result: { phases?: Record<string, unknown> }) {
 }
 
 describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
+  it('returns the latest main-stage reply after rewrite falls back to analysis retry', async () => {
+    const { runtime } = createFakeRuntime([
+      'initial analysis',
+      'old rewritten analysis',
+      'fresh analysis',
+    ]);
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({
+        action: 'summary_rewrite',
+        pass: false,
+        artifact: { findings: [], referencedFiles: [] },
+      })
+      .mockReturnValueOnce({ action: 'analysis_retry', pass: false })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze' }, { name: 'quality_gate', gate: { evaluator, maxRetries: 1 } }],
+    }).execute(runtime, new AgentMessage({ content: 'analyze' }));
+    expect(evaluator).toHaveBeenCalledTimes(3);
+    expect(result.phases.analyze).toMatchObject({ reply: 'fresh analysis' });
+    expect(result.reply).toBe('fresh analysis');
+  });
+  it('counts the cost of a returned timed-out attempt before successful fast retry', async () => {
+    const { runtime } = createFakeRuntime();
+    runtime.reactLoop = vi
+      .fn()
+      .mockResolvedValueOnce({
+        reply: '',
+        toolCalls: [],
+        tokenUsage: { input: 50, output: 10 },
+        iterations: 2,
+        timedOut: true,
+      })
+      .mockResolvedValue({
+        reply: 'recovered',
+        toolCalls: [],
+        tokenUsage: { input: 7, output: 3 },
+        iterations: 1,
+      });
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze', retryBudget: { maxIterations: 1 } }],
+    }).execute(runtime, new AgentMessage({ content: 'analyze' }));
+    expect(runtime.reactLoop).toHaveBeenCalledTimes(2);
+    expect(result.reply).toBe('recovered');
+    expect(result.iterations).toBe(3);
+    expect(result.tokenUsage).toEqual({ input: 57, output: 13 });
+  });
   it.each([
     'before',
     'during',
