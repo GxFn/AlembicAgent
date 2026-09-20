@@ -181,6 +181,7 @@ function formatMessageForMeasurement(message: UnifiedMessage): string {
     `role:${message.role}`,
     message.name ? `name:${message.name}` : null,
     message.content || null,
+    message.continuation ? `continuation:${JSON.stringify(message.continuation)}` : null,
     message.toolCallId ? `toolCallId:${message.toolCallId}` : null,
     message.toolCalls?.length ? `toolCalls:${JSON.stringify(message.toolCalls)}` : null,
   ]

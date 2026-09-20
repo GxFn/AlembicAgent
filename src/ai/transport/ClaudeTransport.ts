@@ -9,7 +9,7 @@
  *   - 消息必须严格交替 user/assistant
  */
 
-import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import type { ToolSchema, UnifiedMessage } from '../contracts.js';
 import {
   LLMTransport,
   type TransportConfig,

@@ -3,7 +3,7 @@ import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
-import { mockJsonFetch as mockFetch } from './helpers/mockFetch.js';
+import { mockJsonFetch as mockFetch, responsesText } from './helpers/mockFetch.js';
 
 /**
  * ClaudeTransport is the protocol-translation layer for the *primary* provider,
@@ -306,7 +306,7 @@ describe('GoogleTransport Gemini protocol translation', () => {
 function mockDeepSeekFetch(
   capture: { body?: Record<string, unknown> },
   response: Record<string, unknown> = {
-    choices: [{ message: { content: 'ok' } }],
+    choices: [{ index: 0, message: { content: 'ok' } }],
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
   }
 ) {
@@ -512,7 +512,10 @@ describe('OpenAiTransport apiStyle=chat (default)', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('does not fetch when the caller signal is already aborted', async () => {
-    const fetch = mockFetch({}, { choices: [{ message: { content: 'should not run' } }] });
+    const fetch = mockFetch(
+      {},
+      { choices: [{ index: 0, message: { content: 'should not run' } }] }
+    );
     const controller = new AbortController();
     controller.abort();
     await expect(
@@ -550,7 +553,7 @@ describe('OpenAiTransport apiStyle=chat (default)', () => {
   it('posts to /chat/completions and parses content', async () => {
     const capture: Capture = {};
     mockFetch(capture, {
-      choices: [{ message: { content: 'hello' } }],
+      choices: [{ index: 0, message: { content: 'hello' } }],
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     });
     const transport = new OpenAiTransport({ apiKey: 'k' });
@@ -570,7 +573,7 @@ describe('OpenAiTransport apiStyle=responses', () => {
   it('posts to /responses with input + max_output_tokens and parses output_text', async () => {
     const capture: Capture = {};
     mockFetch(capture, {
-      output_text: 'mined',
+      output: [responsesText('mined')],
       usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
       status: 'completed',
     });
@@ -591,7 +594,15 @@ describe('OpenAiTransport apiStyle=responses', () => {
   it('emits flat tool schema and parses function_call output', async () => {
     const capture: Capture = {};
     mockFetch(capture, {
-      output: [{ type: 'function_call', call_id: 'c1', name: 'lookup', arguments: '{"q":"x"}' }],
+      output: [
+        {
+          type: 'function_call',
+          id: 'function-fixture',
+          call_id: 'c1',
+          name: 'lookup',
+          arguments: '{"q":"x"}',
+        },
+      ],
       usage: { input_tokens: 5, output_tokens: 4 },
       status: 'completed',
     });
@@ -614,7 +625,7 @@ describe('OpenAiTransport apiStyle=responses', () => {
 
   it('declares JSON output via text.format when responseFormat=json', async () => {
     const capture: Capture = {};
-    mockFetch(capture, { output_text: '{"ok":true}', status: 'completed' });
+    mockFetch(capture, { output: [responsesText('{"ok":true}')], status: 'completed' });
     const transport = new OpenAiTransport({ apiKey: 'k', apiStyle: 'responses' });
     await transport.chat({
       model: 'gpt-5.1',
@@ -625,15 +636,20 @@ describe('OpenAiTransport apiStyle=responses', () => {
     expect(capture.body?.text).toEqual({ format: { type: 'json_object' } });
   });
 
-  it('propagates streaming abort signals through the provider fetch path', async () => {
+  it('propagates cancellation to an in-flight HTTP request', async () => {
     const abortController = new AbortController();
     let requestSignal: AbortSignal | null = null;
+    let started!: () => void;
+    const fetching = new Promise<void>((resolve) => {
+      started = resolve;
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn(
         async (_url: string | URL | Request, init?: RequestInit) =>
           new Promise<Response>((_resolve, reject) => {
             requestSignal = init?.signal ?? null;
+            started();
             requestSignal?.addEventListener('abort', () => {
               reject(Object.assign(new Error('aborted by caller'), { name: 'AbortError' }));
             });
@@ -648,6 +664,7 @@ describe('OpenAiTransport apiStyle=responses', () => {
       abortSignal: abortController.signal,
     });
 
+    await fetching;
     abortController.abort();
 
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });

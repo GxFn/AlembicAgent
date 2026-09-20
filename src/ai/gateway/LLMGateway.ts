@@ -17,14 +17,17 @@ import Logger from '@alembic/core/logging';
 import type {
   ChatWithToolsResult,
   FunctionCallResult,
+  LlmCallOptions,
   TokenUsage,
   ToolSchema,
   UnifiedMessage,
-} from '../AiProvider.js';
+} from '../contracts.js';
+import { LlmResponseError, throwIfLlmCancelled } from '../errors.js';
 import { ParameterGuard } from '../guard/ParameterGuard.js';
 import type { ModelDef, ProviderId } from '../registry/ModelDefs.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
 import { ReliabilityController } from '../shared/reliability.js';
+import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schemaValidation.js';
 import { extractJSON } from '../shared/structuredOutput.js';
 import { ClaudeTransport } from '../transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../transport/DeepSeekTransport.js';
@@ -156,11 +159,20 @@ export class LLMGateway {
       schema: request.schema,
     };
 
-    const response = await this.#runWithReliability(
-      providerId,
-      () => transport.chatWithTools(transportReq),
-      request.abortSignal
-    );
+    let response: TransportResponse;
+    try {
+      response = await this.#runWithReliability(
+        providerId,
+        () => transport.chatWithTools(transportReq),
+        request.abortSignal
+      );
+    } catch (err: unknown) {
+      // 输出被拒绝不等于模型未执行：只记录 adapter 确认过的用量，不推测失败请求的成本。
+      if (err instanceof LlmResponseError) {
+        this.#emitUsage(err.usage, providerId, apiModelId, request.usageSource ?? 'chatWithTools');
+      }
+      throw err;
+    }
     this.#emitUsage(response.usage, providerId, apiModelId, request.usageSource ?? 'chatWithTools');
     return this.#normalizeResponse(response);
   }
@@ -185,22 +197,40 @@ export class LLMGateway {
    * 替代原先脆弱的 JSON.parse(text)，与 Provider 层 chatWithStructuredOutput 一致。
    */
   async chatStructured(request: GatewayChatRequest): Promise<unknown> {
+    throwIfLlmCancelled(request.abortSignal);
+    const validate = prepareStructuredValidation(request.schema, (level, message) =>
+      this.#log(level, message)
+    );
+    if (!validate) {
+      return null;
+    }
     const text = await this.chat({ ...request, responseFormat: 'json' });
     if (!text || text.trim().length === 0) {
       return null;
     }
-    return extractJSON(text, request.openChar ?? '{', request.closeChar ?? '}', (level, message) =>
-      this.#log(level, message)
+    if (request.schema !== undefined) {
+      return parseSchemaOutput(text, validate, (level, message) => this.#log(level, message));
+    }
+    const value = extractJSON(
+      text,
+      request.openChar ?? '{',
+      request.closeChar ?? '}',
+      (level, message) => this.#log(level, message)
     );
+    return validate(value) ? value : null;
   }
 
   /**
    * Embedding
    */
-  async embed(modelRef: string, texts: string[]): Promise<number[][]> {
+  async embed(modelRef: string, texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     const { providerId } = this.#resolveModel(modelRef);
     const transport = this.#getTransport(providerId);
-    return this.#runWithReliability(providerId, () => transport.embed(texts));
+    return this.#runWithReliability(
+      providerId,
+      () => transport.embed(texts, opts),
+      opts.abortSignal
+    );
   }
 
   /**
@@ -212,9 +242,9 @@ export class LLMGateway {
 
   /**
    * 探测某模型是否可用（轻量 chat），用于 fallback 决策。
-   * 与 AiProvider.probe 对齐；任何异常视为不可用返回 false。
+   * 普通失败返回 false；取消必须终止探活链，不能继续请求下一模型。
    */
-  async probe(modelRef: string): Promise<boolean> {
+  async probe(modelRef: string, opts: LlmCallOptions = {}): Promise<boolean> {
     try {
       const text = await this.chat({
         modelRef,
@@ -222,9 +252,11 @@ export class LLMGateway {
         maxTokens: 16,
         temperature: 0,
         usageSource: 'probe',
+        abortSignal: opts.abortSignal,
       });
       return Boolean(text);
-    } catch (err) {
+    } catch (err: unknown) {
+      throwIfLlmCancelled(opts.abortSignal, err);
       this.#log('warn', `[LLMGateway] probe(${modelRef}) failed: ${(err as Error).message}`);
       return false;
     }
@@ -234,9 +266,12 @@ export class LLMGateway {
    * 按候选模型链探活降级：返回第一个可用的 modelRef。
    * 与 Provider 层 getProviderWithFallback 思路一致，但统一在网关侧完成。
    */
-  async resolveWithFallback(candidates: string[]): Promise<string | null> {
+  async resolveWithFallback(
+    candidates: string[],
+    opts: LlmCallOptions = {}
+  ): Promise<string | null> {
     for (const modelRef of candidates) {
-      if (await this.probe(modelRef)) {
+      if (await this.probe(modelRef, opts)) {
         return modelRef;
       }
     }
@@ -380,11 +415,14 @@ export class LLMGateway {
       case 'google':
         return new GoogleTransport(config);
       case 'ollama':
-        return new OpenAiTransport({
-          ...config,
-          apiKey: config.apiKey || 'ollama',
-          baseUrl: config.baseUrl || 'http://127.0.0.1:11434/v1',
-        });
+        return new OpenAiTransport(
+          {
+            ...config,
+            apiKey: config.apiKey || 'ollama',
+            baseUrl: config.baseUrl || 'http://127.0.0.1:11434/v1',
+          },
+          'ollama'
+        );
       default:
         logger().warn(
           `[LLMGateway] Unknown provider '${providerId}', falling back to OpenAI transport`
@@ -436,6 +474,7 @@ export class LLMGateway {
       functionCalls,
       usage,
       reasoningContent: response.reasoningContent ?? undefined,
+      continuation: response.continuation,
       finishReason: response.finishReason ?? undefined,
     };
   }

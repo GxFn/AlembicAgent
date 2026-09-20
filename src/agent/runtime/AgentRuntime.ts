@@ -1471,7 +1471,8 @@ export class AgentRuntime {
     messages.appendAssistantWithToolCalls(
       llmResult.text || null,
       activeCalls.map((call) => ({ ...call, args: { ...call.args } })),
-      llmResult.reasoningContent
+      llmResult.reasoningContent,
+      llmResult.continuation
     );
 
     let roundSubmitCount = 0;
@@ -1833,7 +1834,11 @@ export class AgentRuntime {
           ? evaluateAnalyzeTextGroundingGate(ctx, this.#modelRef)
           : { block: false, nudge: '', reason: '' };
       if (groundingGate.block) {
-        messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
+        messages.appendAssistantText(
+          llmResult.text || '',
+          llmResult.reasoningContent,
+          llmResult.continuation
+        );
         messages.appendUserNudge(groundingGate.nudge);
         tracker.rollbackTick?.();
         ctx.diagnostics?.warn({
@@ -1881,7 +1886,11 @@ export class AgentRuntime {
               `⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。`
             : null;
         if (digestNudge) {
-          messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
+          messages.appendAssistantText(
+            llmResult.text || '',
+            llmResult.reasoningContent,
+            llmResult.continuation
+          );
           messages.appendUserNudge(digestNudge);
           ctx.diagnostics?.recordNudge({ type: 'digest' });
           this.#emitProcessProgress(
@@ -1905,7 +1914,11 @@ export class AgentRuntime {
       }
 
       if (textResult.needsDigestNudge) {
-        messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
+        messages.appendAssistantText(
+          llmResult.text || '',
+          llmResult.reasoningContent,
+          llmResult.continuation
+        );
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
           ctx.diagnostics?.recordNudge({ type: 'digest' });
@@ -1929,7 +1942,11 @@ export class AgentRuntime {
       }
 
       if (textResult.shouldContinue) {
-        messages.appendAssistantText(llmResult.text || '', llmResult.reasoningContent);
+        messages.appendAssistantText(
+          llmResult.text || '',
+          llmResult.reasoningContent,
+          llmResult.continuation
+        );
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
           ctx.diagnostics?.recordNudge({ type: 'continue' });

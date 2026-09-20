@@ -1,356 +1,338 @@
 /**
- * OpenAiTransport — OpenAI Chat Completions / Responses API 协议转换
- *
- * 纯协议层：UnifiedMessage ↔ OpenAI 请求/响应格式
- * 不含参数校验、重试、用量上报（由 Gateway 层 ParameterGuard / ReliabilityController 负责）
- *
- * 支持两种 API 风格（apiStyle）：
- *   - 'chat'      → 经典 Chat Completions（POST /chat/completions），默认
- *   - 'responses' → 新版 Responses API（POST /responses）
- * gpt-5.x 等部分中转站 / 新模型只开放 /responses，需显式切换。
- * 风格来源：config.apiStyle ＞ 环境变量 ALEMBIC_OPENAI_API_STYLE ＞ 默认 'chat'。
+ * OpenAI 协议由固定版本 AI SDK provider 维护；保留原公共 Transport 入口。
+ * 只调用版本化 doGenerate/doEmbed：没有 SDK 重试、工具执行或隐藏的 Agent 循环。
+ * 本仓继续负责 HTTP 生命周期/代理、合同转换、权限上游边界与错误/用量归一化。
  */
-
-import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
-import { normalizeRawUsage } from '../shared/usage.js';
+import { createHash } from 'node:crypto';
+import { createOpenAI, type OpenAIProvider } from '@ai-sdk/openai';
+import type {
+  LanguageModelV4CallOptions,
+  LanguageModelV4GenerateResult,
+  LanguageModelV4Prompt,
+} from '@ai-sdk/provider';
+import Logger from '@alembic/core/logging';
+import type { LlmCallOptions, TokenUsage, UnifiedMessage } from '../contracts.js';
+import { LlmResponseError } from '../errors.js';
+import type { ProviderId } from '../registry/ModelDefs.js';
+import { prepareStructuredValidation } from '../shared/schemaValidation.js';
 import {
   LLMTransport,
   type TransportConfig,
-  type TransportFunctionCall,
   type TransportRequest,
   type TransportResponse,
 } from './LLMTransport.js';
-
-const OPENAI_BASE = 'https://api.openai.com/v1';
+import { normalizeSdkError } from './sdkErrors.js';
 
 export class OpenAiTransport extends LLMTransport {
-  #embedModel: string;
-  #apiStyle: 'chat' | 'responses';
+  readonly #client: OpenAIProvider;
+  readonly #embedModel: string;
+  readonly #apiStyle: 'chat' | 'responses';
+  readonly #connection: string;
 
-  constructor(config: TransportConfig) {
-    super('openai', { ...config, baseUrl: config.baseUrl || OPENAI_BASE });
-    this.#embedModel = (config.embedModel as string) || 'text-embedding-3-small';
-    const styleRaw = String(
-      (config.apiStyle as string) || process.env.ALEMBIC_OPENAI_API_STYLE || 'chat'
+  constructor(config: TransportConfig, providerId: ProviderId = 'openai') {
+    super(providerId, { ...config, baseUrl: config.baseUrl || 'https://api.openai.com/v1' });
+    this.#embedModel =
+      typeof config.embedModel === 'string' ? config.embedModel : 'text-embedding-3-small';
+    const style = String(
+      config.apiStyle ||
+        (providerId === 'openai' ? process.env.ALEMBIC_OPENAI_API_STYLE : undefined) ||
+        'chat'
     ).toLowerCase();
-    this.#apiStyle = styleRaw === 'responses' ? 'responses' : 'chat';
+    this.#apiStyle = style === 'responses' ? 'responses' : 'chat';
+    this.#connection = createHash('sha256')
+      .update(JSON.stringify([this.providerId, this.baseUrl, this.apiKey]))
+      .digest('hex');
+    this.#client = createOpenAI({
+      apiKey: this.apiKey,
+      baseURL: this.baseUrl,
+      fetch: (url, options) => this.fetchWithProxy(url, options),
+    });
   }
 
   async chat(request: TransportRequest): Promise<string> {
-    this.requireApiKey('OpenAI');
-    if (this.#apiStyle === 'responses') {
-      const data = await this.post(
-        `${this.baseUrl}/responses`,
-        this.#buildResponsesBody(request),
-        this.#headers(),
-        request.abortSignal
-      );
-      return this.#parseResponsesOutput(data).text || '';
-    }
-
-    const messages = this.#buildMessages(request.messages, request.systemPrompt);
-
-    const body: Record<string, unknown> = {
-      model: request.model,
-      messages,
-      max_tokens: request.maxTokens,
-    };
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature;
-    }
-    if (request.reasoningEffort) {
-      body.reasoning_effort = request.reasoningEffort;
-    }
-    if (request.responseFormat === 'json') {
-      body.response_format = { type: 'json_object' };
-    }
-
-    const data = await this.post(
-      `${this.baseUrl}/chat/completions`,
-      body,
-      this.#headers(),
-      request.abortSignal
-    );
-    const choices = (data?.choices as Array<Record<string, unknown>>) || [];
-    const message = choices[0]?.message as Record<string, string> | undefined;
-    return message?.content || '';
+    return (await this.chatWithTools(request)).text || '';
   }
 
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {
-    this.requireApiKey('OpenAI');
-    if (this.#apiStyle === 'responses') {
-      const data = await this.post(
-        `${this.baseUrl}/responses`,
-        this.#buildResponsesBody(request),
-        this.#headers(),
+    this.requireApiKey(this.providerId === 'ollama' ? 'Ollama' : 'OpenAI');
+    Logger.getInstance().debug(
+      `[ai-sdk] native_request provider=${this.providerId} protocol=${this.#apiStyle} model=${request.model} tools=${request.tools?.length ?? 0}; retry_owner=gateway`
+    );
+    const model =
+      this.#apiStyle === 'responses'
+        ? this.#client.responses(request.model)
+        : this.#client.chat(request.model);
+    const options: LanguageModelV4CallOptions = {
+      prompt: toSdkPrompt(
+        request.messages,
+        this.#apiStyle === 'chat' ? request.systemPrompt : undefined,
+        this.providerId,
+        request.model,
+        this.#apiStyle,
+        this.#connection
+      ),
+      maxOutputTokens: request.maxTokens,
+      temperature: request.temperature,
+      tools: request.tools?.map((tool) => ({
+        type: 'function',
+        name: tool.name,
+        description: tool.description || '',
+        inputSchema: tool.parameters || { type: 'object', properties: {} },
+      })),
+      toolChoice:
+        request.toolChoice === undefined
+          ? undefined
+          : ['auto', 'none', 'required'].includes(request.toolChoice)
+            ? { type: request.toolChoice as 'auto' | 'none' | 'required' }
+            : { type: 'tool', toolName: request.toolChoice },
+      responseFormat:
+        request.responseFormat === 'json' ? { type: 'json', schema: request.schema } : undefined,
+      providerOptions: {
+        openai: {
+          systemMessageMode: 'system',
+          strictJsonSchema: false,
+          ...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
+          ...(this.#apiStyle === 'responses' ? { instructions: request.systemPrompt } : {}),
+        },
+      },
+    };
+    let result: LanguageModelV4GenerateResult;
+    try {
+      result = await this.runRequest(
+        (signal) => model.doGenerate({ ...options, abortSignal: signal }),
         request.abortSignal
       );
-      return this.#parseResponsesOutput(data);
+    } catch (err: unknown) {
+      throw normalizeSdkError(err, this.providerId);
     }
-
-    const messages = this.#buildMessages(request.messages, request.systemPrompt);
-
-    const body: Record<string, unknown> = {
-      model: request.model,
-      messages,
-      max_tokens: request.maxTokens,
-    };
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature;
+    for (const warning of result.warnings) {
+      Logger.getInstance().warn(
+        `[ai-sdk] provider=${this.providerId} model=${request.model} warning=${warning.type} feature=${'feature' in warning ? warning.feature : 'provider-specific'}; inspect model capabilities`
+      );
     }
-    if (request.reasoningEffort) {
-      body.reasoning_effort = request.reasoningEffort;
-    }
-
-    if (request.tools && request.tools.length > 0) {
-      body.tools = request.tools.map((s: ToolSchema) => ({
-        type: 'function',
-        function: {
-          name: s.name,
-          description: s.description || '',
-          parameters: s.parameters || { type: 'object', properties: {} },
-        },
-      }));
-    }
-
-    if (request.responseFormat === 'json') {
-      body.response_format = { type: 'json_object' };
-    }
-
-    if (request.toolChoice) {
-      body.tool_choice = request.toolChoice;
-    }
-
-    const data = await this.post(
-      `${this.baseUrl}/chat/completions`,
-      body,
-      this.#headers(),
-      request.abortSignal
-    );
-
-    return this.#parseResponse(data);
-  }
-
-  async embed(texts: string[]): Promise<number[][]> {
-    this.requireApiKey('OpenAI');
-    const body = {
-      model: this.#embedModel,
-      input: texts.map((t) => t.slice(0, 8000)),
-    };
-    const data = await this.post(`${this.baseUrl}/embeddings`, body, this.#headers());
-    const items = ((data as Record<string, unknown>)?.data || []) as Array<{
-      index: number;
-      embedding: number[];
-    }>;
-    return items.sort((a, b) => a.index - b.index).map((d) => d.embedding);
-  }
-
-  // ─── 消息转换 ──────────────────────────────────────
-
-  #buildMessages(unified: UnifiedMessage[], systemPrompt?: string): Array<Record<string, unknown>> {
-    const messages: Array<Record<string, unknown>> = [];
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt });
-    }
-
-    for (const msg of unified) {
-      if (msg.role === 'user') {
-        messages.push({ role: 'user', content: msg.content });
-      } else if (msg.role === 'assistant') {
-        const m: Record<string, unknown> = { role: 'assistant', content: msg.content || null };
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          m.tool_calls = msg.toolCalls.map((tc) => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.name, arguments: JSON.stringify(tc.args || {}) },
-          }));
+    const usage = toTokenUsage(result);
+    const functionCalls = result.content
+      .filter((part) => part.type === 'tool-call')
+      .map((part) => {
+        let args: unknown;
+        try {
+          args = JSON.parse(part.input.trim() || '{}');
+        } catch (err: unknown) {
+          throw new LlmResponseError(
+            `Invalid tool arguments from ${this.providerId} (${err instanceof SyntaxError ? 'invalid_json' : 'invalid_input'}); tool execution rejected`,
+            usage
+          );
         }
-        messages.push(m);
-      } else if (msg.role === 'tool') {
-        messages.push({
-          role: 'tool',
-          tool_call_id: msg.toolCallId,
-          content: msg.content || '',
-        });
-      }
-    }
-
-    return messages;
-  }
-
-  // ─── 响应解析 ──────────────────────────────────────
-
-  #parseResponse(data: Record<string, unknown>): TransportResponse {
-    const choices = data?.choices as Array<Record<string, unknown>> | undefined;
-    const choice = choices?.[0];
-    const rawUsage = data?.usage as Record<string, number> | undefined;
-
-    const usage = rawUsage
-      ? {
-          inputTokens: rawUsage.prompt_tokens || 0,
-          outputTokens: rawUsage.completion_tokens || 0,
-          totalTokens: rawUsage.total_tokens || 0,
+        if (
+          !args ||
+          typeof args !== 'object' ||
+          Array.isArray(args) ||
+          !part.toolCallId ||
+          part.providerExecuted
+        ) {
+          throw new LlmResponseError(
+            `Invalid tool proposal from ${this.providerId}; tool execution rejected`,
+            usage
+          );
         }
-      : null;
-
-    if (!choice) {
-      return { text: '', functionCalls: null, usage };
-    }
-
-    const message = choice.message as Record<string, unknown>;
-    const text = (message?.content as string) || null;
-
-    const toolCalls = message?.tool_calls as Array<Record<string, unknown>> | undefined;
-    if (toolCalls && toolCalls.length > 0) {
-      const functionCalls: TransportFunctionCall[] = toolCalls
-        .filter((tc) => tc.type === 'function')
-        .map((tc) => ({
-          id: tc.id as string,
-          name: (tc.function as Record<string, unknown>).name as string,
-          args: (() => {
-            try {
-              return JSON.parse(
-                ((tc.function as Record<string, unknown>).arguments as string) || '{}'
-              );
-            } catch {
-              return {};
-            }
-          })(),
-        }));
-
-      if (functionCalls.length > 0) {
-        return { text, functionCalls, usage };
-      }
-    }
-
-    return { text, functionCalls: null, usage };
-  }
-
-  // ─── Responses API（POST /responses）────────────────────
-
-  /** 构造 Responses API 请求体（chat 与 chatWithTools 共用）。 */
-  #buildResponsesBody(request: TransportRequest): Record<string, unknown> {
-    const body: Record<string, unknown> = {
-      model: request.model,
-      input: this.#buildResponsesInput(request.messages),
-      max_output_tokens: request.maxTokens,
-    };
-    if (request.systemPrompt) {
-      body.instructions = request.systemPrompt;
-    }
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature;
-    }
-    if (request.reasoningEffort) {
-      body.reasoning_effort = request.reasoningEffort;
-    }
-    // Responses API 用 text.format 声明 JSON 输出，对应 Chat Completions 的 response_format。
-    if (request.responseFormat === 'json') {
-      body.text = { format: { type: 'json_object' } };
-    }
-    // Responses API 的工具是扁平结构（name/description/parameters 直接在 function 项上），
-    // 区别于 Chat Completions 的 { type:'function', function:{...} } 嵌套结构。
-    if (request.tools && request.tools.length > 0) {
-      body.tools = request.tools.map((s: ToolSchema) => ({
-        type: 'function',
-        name: s.name,
-        description: s.description || '',
-        parameters: s.parameters || { type: 'object', properties: {} },
-      }));
-      if (request.toolChoice) {
-        body.tool_choice = request.toolChoice;
-      }
-    }
-    return body;
-  }
-
-  /**
-   * 把统一消息数组转换为 Responses API 的 input 项。
-   *   - user      → { role:'user', content:[{type:'input_text', text}] }
-   *   - assistant → 文本作为 message，tool_calls 拆为独立 function_call 项
-   *   - tool      → { type:'function_call_output', call_id, output }
-   * call_id 在 function_call 与 function_call_output 间原样回传，保证 ReAct 多轮闭合。
-   */
-  #buildResponsesInput(unified: UnifiedMessage[]): Array<Record<string, unknown>> {
-    const input: Array<Record<string, unknown>> = [];
-    for (const msg of unified) {
-      if (msg.role === 'user') {
-        input.push({ role: 'user', content: [{ type: 'input_text', text: msg.content || '' }] });
-      } else if (msg.role === 'assistant') {
-        if (msg.content) {
-          input.push({ role: 'assistant', content: [{ type: 'output_text', text: msg.content }] });
+        const tool = request.tools?.find((candidate) => candidate.name === part.toolName);
+        const validate = tool
+          ? prepareStructuredValidation(tool.parameters, (_level, message) =>
+              Logger.getInstance().warn(message)
+            )
+          : null;
+        if (!validate || !validate(args)) {
+          throw new LlmResponseError(
+            `Unknown tool or invalid arguments from ${this.providerId}; tool execution rejected`,
+            usage
+          );
         }
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          for (const tc of msg.toolCalls) {
-            input.push({
-              type: 'function_call',
-              call_id: tc.id,
-              name: tc.name,
-              arguments: JSON.stringify(tc.args || {}),
-            });
-          }
-        }
-      } else if (msg.role === 'tool') {
-        input.push({
-          type: 'function_call_output',
-          call_id: msg.toolCallId,
-          output: msg.content || '',
-        });
-      }
-    }
-    return input;
-  }
-
-  /** 解析 Responses API 输出：聚合文本、提取 function_call、归一化 usage。 */
-  #parseResponsesOutput(data: Record<string, unknown>): TransportResponse {
-    const usage = normalizeRawUsage(data?.usage as Record<string, number> | undefined);
-    const output: Array<Record<string, unknown>> = Array.isArray(data?.output)
-      ? (data.output as Array<Record<string, unknown>>)
-      : [];
-
-    // 文本：优先用顶层便捷字段 output_text，否则从 message 项的 output_text 聚合。
-    let text: string | null =
-      typeof data?.output_text === 'string' && (data.output_text as string).length > 0
-        ? (data.output_text as string)
-        : null;
-    if (text === null) {
-      const parts: string[] = [];
-      for (const item of output) {
-        if (item?.type === 'message' && Array.isArray(item.content)) {
-          for (const c of item.content as Array<Record<string, unknown>>) {
-            if (c?.type === 'output_text' && typeof c.text === 'string') {
-              parts.push(c.text);
-            }
-          }
-        }
-      }
-      text = parts.length > 0 ? parts.join('') : null;
-    }
-
-    const functionCalls: TransportFunctionCall[] = output
-      .filter((item) => item?.type === 'function_call')
-      .map((item) => ({
-        id: (item.call_id || item.id) as string,
-        name: item.name as string,
-        args: (() => {
-          try {
-            return JSON.parse((item.arguments as string) || '{}');
-          } catch {
-            return {};
-          }
-        })(),
-      }));
-
-    const finishReason = (data?.status as string) || null;
+        return { id: part.toolCallId, name: part.toolName, args: args as Record<string, unknown> };
+      });
+    const raw = result.response?.body;
+    // 保持 Responses 原有 completed/incomplete 词汇；chat 终于完整转发 stop/length/tool_calls。
+    const finishReason =
+      this.#apiStyle === 'responses' && isRecord(raw) && typeof raw.status === 'string'
+        ? raw.status
+        : (result.finishReason.raw ?? result.finishReason.unified);
+    const reasoningItemIds =
+      this.#apiStyle === 'responses'
+        ? [
+            ...new Set(
+              result.content
+                .filter((part) => part.type === 'reasoning')
+                .map((part) => part.providerMetadata?.openai?.itemId)
+                .filter((id): id is string => typeof id === 'string' && id.length > 0)
+            ),
+          ]
+        : [];
     return {
-      text,
-      functionCalls: functionCalls.length > 0 ? functionCalls : null,
+      ...(reasoningItemIds.length
+        ? {
+            continuation: {
+              kind: 'stored-reasoning-v1' as const,
+              provider: this.providerId,
+              model: request.model,
+              connection: this.#connection,
+              reasoningItemIds,
+            },
+          }
+        : {}),
+      text:
+        result.content
+          .filter((part) => part.type === 'text')
+          .map((part) => part.text)
+          .join('') || null,
+      functionCalls: functionCalls.length ? functionCalls : null,
       usage,
       finishReason,
+      reasoningContent:
+        result.content
+          .filter((part) => part.type === 'reasoning')
+          .map((part) => part.text)
+          .join('') || undefined,
     };
   }
 
-  #headers(): Record<string, string> {
-    return { Authorization: `Bearer ${this.apiKey}` };
+  async embed(texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
+    this.requireApiKey(this.providerId === 'ollama' ? 'Ollama' : 'OpenAI');
+    if (texts.length === 0) {
+      return [];
+    }
+    try {
+      const model = this.#client.embeddingModel(this.#embedModel);
+      if (texts.some((text) => text.length > 8000)) {
+        Logger.getInstance().warn(
+          `[ai-sdk] embedding_input_truncated provider=${this.providerId} limit=8000; legacy input boundary preserved`
+        );
+      }
+      // 保留旧入口 8000 字符边界；跨批调度由 Gateway/调用者承担，单次尝试不隐藏重放。
+      const result = await this.runRequest(
+        (signal) =>
+          model.doEmbed({ values: texts.map((text) => text.slice(0, 8000)), abortSignal: signal }),
+        opts.abortSignal
+      );
+      const raw = result.response?.body;
+      const items = isRecord(raw) && Array.isArray(raw.data) ? raw.data : [];
+      if (items.length !== texts.length || result.embeddings.length !== texts.length) {
+        throw new Error('Embedding count does not match input count');
+      }
+      const ordered: number[][] = new Array(texts.length);
+      for (const [position, item] of items.entries()) {
+        const index = isRecord(item) ? item.index : undefined;
+        const vector = result.embeddings[position];
+        if (
+          typeof index !== 'number' ||
+          !Number.isInteger(index) ||
+          index < 0 ||
+          index >= texts.length ||
+          ordered[index] ||
+          !vector?.length ||
+          !vector.every(Number.isFinite)
+        ) {
+          throw new Error('Invalid embedding index or vector');
+        }
+        ordered[index] = vector;
+      }
+      if (ordered.some((vector) => vector.length !== ordered[0].length)) {
+        throw new Error('Embedding dimensions do not match within the batch');
+      }
+      return ordered;
+    } catch (err: unknown) {
+      throw normalizeSdkError(err, this.providerId);
+    }
   }
+}
+
+function toSdkPrompt(
+  messages: UnifiedMessage[],
+  systemPrompt: string | undefined,
+  provider: string,
+  model: string,
+  apiStyle: string,
+  connection: string
+): LanguageModelV4Prompt {
+  const prompt: LanguageModelV4Prompt = [];
+  if (systemPrompt) {
+    prompt.push({ role: 'system', content: systemPrompt });
+  }
+  for (const message of messages) {
+    if (message.role === 'user') {
+      prompt.push({ role: 'user', content: [{ type: 'text', text: message.content || '' }] });
+    } else if (message.role === 'tool') {
+      prompt.push({
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: message.toolCallId || '',
+            toolName: message.name || '',
+            output: { type: 'text', value: message.content || '' },
+          },
+        ],
+      });
+    } else {
+      const content: Extract<LanguageModelV4Prompt[number], { role: 'assistant' }>['content'] = [];
+      const continuation = message.continuation;
+      if (continuation) {
+        if (
+          apiStyle === 'responses' &&
+          continuation.kind === 'stored-reasoning-v1' &&
+          continuation.provider === provider &&
+          continuation.model === model &&
+          continuation.connection === connection &&
+          Array.isArray(continuation.reasoningItemIds) &&
+          continuation.reasoningItemIds.every((id) => typeof id === 'string' && id.length > 0)
+        ) {
+          for (const itemId of continuation.reasoningItemIds) {
+            content.push({ type: 'reasoning', text: '', providerOptions: { openai: { itemId } } });
+          }
+        } else {
+          Logger.getInstance().warn(
+            `[ai-sdk] continuation_filtered provider=${provider} model=${model}; protocol/model/connection identity mismatch`
+          );
+        }
+      }
+      if (message.content) {
+        content.push({ type: 'text', text: message.content });
+      }
+      for (const call of message.toolCalls || []) {
+        content.push({
+          type: 'tool-call',
+          toolCallId: call.id,
+          toolName: call.name,
+          input: call.args,
+        });
+      }
+      prompt.push({ role: 'assistant', content });
+    }
+  }
+  return prompt;
+}
+
+function toTokenUsage(result: LanguageModelV4GenerateResult): TokenUsage | null {
+  const raw = result.usage.raw;
+  const inputTokens = raw?.input_tokens ?? raw?.prompt_tokens;
+  const outputTokens = raw?.output_tokens ?? raw?.completion_tokens;
+  // SDK 会为缺失的可选细分补 0；本仓保留「未上报」与真实 0 的区别。
+  if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') {
+    return null;
+  }
+  const inputDetails = raw?.input_tokens_details ?? raw?.prompt_tokens_details;
+  const outputDetails = raw?.output_tokens_details ?? raw?.completion_tokens_details;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(isRecord(outputDetails) && typeof outputDetails.reasoning_tokens === 'number'
+      ? { reasoningTokens: outputDetails.reasoning_tokens }
+      : {}),
+    ...(isRecord(inputDetails) && typeof inputDetails.cached_tokens === 'number'
+      ? { cacheHitTokens: inputDetails.cached_tokens }
+      : {}),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

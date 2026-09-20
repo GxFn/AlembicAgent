@@ -1,3 +1,4 @@
+import type { LlmContinuation } from '#ai/contracts.js';
 /**
  * MessageAdapter — 统一消息操作接口
  *
@@ -38,6 +39,7 @@ interface ChatMessage {
   role: 'user' | 'assistant' | 'tool';
   content: string | null;
   reasoningContent?: string | null;
+  continuation?: LlmContinuation;
   toolCalls?: ToolCallRecord[];
   toolCallId?: string;
   name?: string;
@@ -66,7 +68,11 @@ export class MessageAdapter {
   }
 
   /** 追加助手纯文本回复 */
-  appendAssistantText(_text: string, _reasoningContent?: string | null) {
+  appendAssistantText(
+    _text: string,
+    _reasoningContent?: string | null,
+    _continuation?: LlmContinuation
+  ) {
     throw new Error('not implemented');
   }
 
@@ -78,7 +84,8 @@ export class MessageAdapter {
   appendAssistantWithToolCalls(
     _text: string | null,
     _calls: ToolCallRecord[],
-    _reasoningContent?: string | null
+    _reasoningContent?: string | null,
+    _continuation?: LlmContinuation
   ) {
     throw new Error('not implemented');
   }
@@ -204,16 +211,21 @@ export class ContextWindowAdapter extends MessageAdapter {
     this.#ctxWin.appendUserMessage(text);
   }
 
-  appendAssistantText(text: string, reasoningContent?: string | null) {
-    this.#ctxWin.appendAssistantText(text, reasoningContent);
+  appendAssistantText(
+    text: string,
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
+  ) {
+    this.#ctxWin.appendAssistantText(text, reasoningContent, continuation);
   }
 
   appendAssistantWithToolCalls(
     text: string | null,
     calls: ToolCallRecord[],
-    reasoningContent?: string | null
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
   ) {
-    this.#ctxWin.appendAssistantWithToolCalls(text, calls, reasoningContent);
+    this.#ctxWin.appendAssistantWithToolCalls(text, calls, reasoningContent, continuation);
   }
 
   appendToolResult(callId: string, name: string, content: string) {
@@ -271,10 +283,17 @@ export class SimpleArrayAdapter extends MessageAdapter {
     this.#messages.push({ role: 'user', content: text });
   }
 
-  appendAssistantText(text: string, reasoningContent?: string | null) {
+  appendAssistantText(
+    text: string,
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
+  ) {
     const msg: ChatMessage = { role: 'assistant', content: text };
     if (reasoningContent != null) {
       msg.reasoningContent = reasoningContent;
+    }
+    if (continuation) {
+      msg.continuation = structuredClone(continuation);
     }
     this.#messages.push(msg);
   }
@@ -282,7 +301,8 @@ export class SimpleArrayAdapter extends MessageAdapter {
   appendAssistantWithToolCalls(
     text: string | null,
     calls: ToolCallRecord[],
-    reasoningContent?: string | null
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
   ) {
     const msg: ChatMessage = {
       role: 'assistant',
@@ -290,6 +310,9 @@ export class SimpleArrayAdapter extends MessageAdapter {
       toolCalls: calls,
       reasoningContent: reasoningContent ?? '',
     };
+    if (continuation) {
+      msg.continuation = structuredClone(continuation);
+    }
     this.#messages.push(msg);
   }
 

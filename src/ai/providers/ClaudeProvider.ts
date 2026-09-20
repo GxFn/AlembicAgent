@@ -7,20 +7,22 @@
  *   - 连续同角色消息合并、tool_use → 结构化 functionCall 解析
  *   - token 计量与重试 / 熔断 / 并发闸门
  *
- * Claude 无原生 JSON mode，结构化输出经 transport.chat + gateway extractJSON 兜底。
+ * 当前 transport 未传原生输出 schema；Gateway 保留文本提取，并在有 schema 时本地校验。
  * Claude 无嵌入 API，embed 直接返回空数组触发上层降级（与原实现一致）。
  */
 
 import Logger from '@alembic/core/logging';
-import {
-  type AiLogger,
-  AiProvider,
-  type AiProviderConfig,
-  type ChatContext,
-  type ChatWithToolsOptions,
-  type ChatWithToolsResult,
-  type StructuredOutputOptions,
-} from '../AiProvider.js';
+import { AiProvider } from '../AiProvider.js';
+import type {
+  AiLogger,
+  AiProviderConfig,
+  ChatContext,
+  ChatWithToolsOptions,
+  ChatWithToolsResult,
+  LlmCallOptions,
+  StructuredOutputOptions,
+} from '../contracts.js';
+import { throwIfLlmCancelled } from '../errors.js';
 
 const CLAUDE_BASE = 'https://api.anthropic.com/v1';
 
@@ -61,7 +63,8 @@ export class ClaudeProvider extends AiProvider {
     return false;
   }
 
-  async embed(_text: string | string[]) {
+  async embed(_text: string | string[], opts: LlmCallOptions = {}) {
+    throwIfLlmCancelled(opts.abortSignal);
     return [];
   }
 }

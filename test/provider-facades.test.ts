@@ -1,16 +1,67 @@
 import { afterEach, describe, expect, it, test, vi } from 'vitest';
+import { ClaudeProvider } from '../src/ai/providers/ClaudeProvider.js';
 import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
+import { GoogleGeminiProvider } from '../src/ai/providers/GoogleGeminiProvider.js';
 import { normalizeOllamaBaseUrl, OllamaProvider } from '../src/ai/providers/OllamaProvider.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
-import { mockJsonFetch as mockFetch } from './helpers/mockFetch.js';
+import { jsonResponse, mockJsonFetch as mockFetch, responsesText } from './helpers/mockFetch.js';
 
-describe('OpenAiProvider baseUrl override', () => {
+describe('AI provider facade lifecycle and configuration', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
+  it.each(
+    [OpenAiProvider, GoogleGeminiProvider, DeepSeekProvider, ClaudeProvider, OllamaProvider].map(
+      (Provider) => ({ name: Provider.name, Provider })
+    )
+  )('$name rejects cancelled structured calls before any HTTP request', async ({ Provider }) => {
+    const fetchMock = mockFetch({}, { choices: [{ index: 0, message: { content: '{}' } }] });
+    const controller = new AbortController();
+    controller.abort(new Error('run ended'));
+    const provider = new Provider({ apiKey: 'test-key', maxRetries: 0 });
+
+    await expect(
+      provider.chatWithStructuredOutput('json', { abortSignal: controller.signal })
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    [OpenAiProvider, GoogleGeminiProvider, DeepSeekProvider, ClaudeProvider, OllamaProvider].map(
+      (Provider) => ({ name: Provider.name, Provider })
+    )
+  )('$name propagates embedding cancellation instead of returning an empty vector', async ({
+    Provider,
+  }) => {
+    const fetchMock = mockFetch({}, { data: [{ index: 0, embedding: [1, 2] }] });
+    const controller = new AbortController();
+    controller.abort(new Error('embedding no longer needed'));
+    const provider = new Provider({ apiKey: 'test-key', maxRetries: 0 });
+
+    await expect(provider.embed('text', { abortSignal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('honors an explicit zero retry limit', () => {
     expect(new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 }).maxRetries).toBe(0);
+  });
+
+  it.each([
+    'probe',
+    'summarize',
+  ] as const)('forwards cancellation through %s', async (operation) => {
+    const fetchMock = mockFetch({}, { choices: [{ index: 0, message: { content: '{}' } }] });
+    const controller = new AbortController();
+    controller.abort(new Error('caller cancelled'));
+    const provider = new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 });
+    const options = { abortSignal: controller.signal };
+    await expect(
+      operation === 'probe' ? provider.probe(options) : provider.summarize('code', options)
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('forwards chat cancellation to the actual transport signal', async () => {
@@ -42,13 +93,59 @@ describe('OpenAiProvider baseUrl override', () => {
     await fetching;
     controller.abort();
     const transportWasAborted = transportSignal?.aborted;
-    finish({
-      ok: true,
-      json: async () => ({ choices: [{ message: { content: 'late' } }] }),
-    } as Response);
+    finish(jsonResponse({ choices: [{ index: 0, message: { content: 'late' } }] }));
     const settled = await result;
     expect(transportWasAborted).toBe(true);
     expect(settled.error).toBeInstanceOf(Error);
+    expect(settled.value).toBeUndefined();
+  });
+
+  it.each([
+    'structured',
+    'embed',
+  ] as const)('cancels the %s HTTP request and rejects a late body', async (operation) => {
+    let started!: () => void;
+    const fetching = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish!: (response: Response) => void;
+    let transportSignal: AbortSignal | null | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url, init: RequestInit) => {
+        transportSignal = init.signal;
+        started();
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      })
+    );
+    const controller = new AbortController();
+    const provider = new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 });
+    const options = { abortSignal: controller.signal };
+    const result = (
+      operation === 'embed'
+        ? provider.embed('text', options)
+        : provider.chatWithStructuredOutput('json', options)
+    ).then(
+      (value) => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error })
+    );
+    await fetching;
+    controller.abort(new Error('run cancelled'));
+    // 模拟不合作的宿主 fetch：已取消但仍返回 HTTP/body，不能复活已取消的调用。
+    finish(
+      new Response(
+        JSON.stringify({
+          choices: [{ index: 0, message: { content: '{"ok":true}' } }],
+          data: [{ index: 0, embedding: [1, 2] }],
+        }),
+        { status: 200 }
+      )
+    );
+    const settled = await result;
+    expect(transportSignal?.aborted).toBe(true);
+    expect(settled.error).toMatchObject({ name: 'AbortError' });
     expect(settled.value).toBeUndefined();
   });
 
@@ -62,10 +159,7 @@ describe('OpenAiProvider baseUrl override', () => {
         peak = Math.max(peak, active);
         await new Promise((resolve) => setTimeout(resolve, 5));
         active--;
-        return {
-          ok: true,
-          json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
-        } as Response;
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'ok' } }] });
       })
     );
     const provider = new OpenAiProvider({ apiKey: 'test-key', maxConcurrency: 1, maxRetries: 0 });
@@ -79,7 +173,7 @@ describe('OpenAiProvider baseUrl override', () => {
   it('uses ALEMBIC_OPENAI_BASE_URL / config.baseUrl for chat/completions endpoint', async () => {
     const capture: { url?: string; body?: Record<string, unknown> } = {};
     mockFetch(capture, {
-      choices: [{ message: { content: 'ok' } }],
+      choices: [{ index: 0, message: { content: 'ok' } }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     });
     const provider = new OpenAiProvider({
@@ -113,7 +207,7 @@ describe('OpenAiProvider Responses API style', () => {
     const capture: { url?: string; body?: Record<string, unknown> } = {};
     mockFetch(capture, {
       status: 'completed',
-      output_text: '我是 GPT',
+      output: [responsesText('我是 GPT')],
       usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
     });
 
@@ -135,13 +229,14 @@ describe('OpenAiProvider Responses API style', () => {
     mockFetch(capture, {
       status: 'completed',
       output: [
-        { type: 'reasoning', summary: [] },
+        { type: 'reasoning', id: 'reasoning-fixture', summary: [] },
         {
           type: 'message',
+          id: 'message-fixture',
           role: 'assistant',
           content: [
-            { type: 'output_text', text: 'part-1 ' },
-            { type: 'output_text', text: 'part-2' },
+            { type: 'output_text', text: 'part-1 ', annotations: [] },
+            { type: 'output_text', text: 'part-2', annotations: [] },
           ],
         },
       ],
@@ -159,6 +254,7 @@ describe('OpenAiProvider Responses API style', () => {
       output: [
         {
           type: 'function_call',
+          id: 'function-fixture',
           call_id: 'call_abc',
           name: 'get_weather',
           arguments: '{"city":"杭州"}',
@@ -196,7 +292,7 @@ describe('OpenAiProvider Responses API style', () => {
     const capture: { url?: string; body?: Record<string, unknown> } = {};
     mockFetch(capture, {
       status: 'completed',
-      output_text: 'done',
+      output: [responsesText('done')],
       usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
     });
 
@@ -231,7 +327,7 @@ describe('OpenAiProvider Responses API style', () => {
     const capture: { url?: string; body?: Record<string, unknown> } = {};
     mockFetch(capture, {
       status: 'completed',
-      output_text: '{"title":"T","description":"D"}',
+      output: [responsesText('{"title":"T","description":"D"}')],
       usage: { input_tokens: 2, output_tokens: 3, total_tokens: 5 },
     });
 
@@ -248,7 +344,7 @@ describe('OpenAiProvider Responses API style', () => {
 function mockDeepSeekFetch(
   capture: { body?: Record<string, unknown> },
   response: Record<string, unknown> = {
-    choices: [{ message: { content: 'ok' } }],
+    choices: [{ index: 0, message: { content: 'ok' } }],
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
   }
 ) {

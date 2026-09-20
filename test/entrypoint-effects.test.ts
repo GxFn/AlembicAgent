@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConversationStore } from '../src/agent/context/ConversationStore.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
+import { jsonResponse } from './helpers/mockFetch.js';
 import { createTempProject } from './helpers/tempProject.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -137,14 +138,10 @@ describe('entrypoint effects (AD6 inflow/outflow audit)', () => {
       'fetch',
       vi.fn(async (url: string | URL | Request) => {
         calls.push(String(url));
-        return {
-          ok: true,
-          json: async () => ({
-            choices: [{ message: { content: 'stubbed' } }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          }),
-          text: async () => '',
-        } as Response;
+        return jsonResponse({
+          choices: [{ index: 0, message: { content: 'stubbed' } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
       })
     );
     const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ad6-agent-net-fx-'));

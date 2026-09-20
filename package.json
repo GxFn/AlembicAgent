@@ -129,10 +129,15 @@
     "check:ci": "npm run build:check && npm run lint && npm run lint:agent-import-boundary && npm run lint:public-api-boundary && npm run lint:core-import-boundary && npm run lint:space-edges && npm run lint:layer-contract && npm run lint:doctrine && npm run lint:naming && npm run lint:provider-neutral-kernel && npm run smoke:public-signatures && npm run verify:validation-floor && npm run test && npm run lint:retired-symbols"
   },
   "dependencies": {
+    "@ai-sdk/openai": "4.0.71",
+    "@ai-sdk/provider": "4.0.17",
     "@alembic/core": "file:../AlembicCore",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
     "better-sqlite3": "^12.6.2",
     "drizzle-orm": "^0.45.1",
-    "undici": "^7.22.0"
+    "undici": "^7.22.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.6",

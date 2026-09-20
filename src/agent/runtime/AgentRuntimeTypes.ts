@@ -1,3 +1,4 @@
+import type { LlmContinuation } from '#ai/contracts.js';
 /**
  * AgentRuntimeTypes — AgentRuntime 共享类型定义
  *
@@ -41,6 +42,7 @@ export interface LLMResult {
   };
   /** DeepSeek V4 thinking 推理内容，需原样回传 */
   reasoningContent?: string | null;
+  continuation?: LlmContinuation;
   /** Provider stop reason，例如 DeepSeek/OpenAI finish_reason */
   finishReason?: string | null;
 }

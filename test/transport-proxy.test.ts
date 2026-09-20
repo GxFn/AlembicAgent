@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { __testingProxyDispatcherCache } from '../src/ai/transport/LLMTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
+import { jsonResponse } from './helpers/mockFetch.js';
 
 // 薄壳化后代理感知从 AiProvider 下沉到 LLMTransport。
 // 这里直接验证 resolveProxyUrl 的优先级与映射，确保依赖 HTTPS_PROXY 等
@@ -107,11 +108,7 @@ describe('LLMTransport proxy fetch wiring', () => {
     let capturedInit: Record<string, unknown> | undefined;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       capturedInit = init as unknown as Record<string, unknown>;
-      return {
-        ok: true,
-        json: async () => ({ choices: [{ message: { content: 'via-proxy' } }] }),
-        text: async () => '',
-      } as Response;
+      return jsonResponse({ choices: [{ index: 0, message: { content: 'via-proxy' } }] });
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -131,11 +128,7 @@ describe('LLMTransport proxy fetch wiring', () => {
     let capturedInit: Record<string, unknown> | undefined;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       capturedInit = init as unknown as Record<string, unknown>;
-      return {
-        ok: true,
-        json: async () => ({ choices: [{ message: { content: 'direct' } }] }),
-        text: async () => '',
-      } as Response;
+      return jsonResponse({ choices: [{ index: 0, message: { content: 'direct' } }] });
     });
     vi.stubGlobal('fetch', fetchMock);
 

@@ -147,4 +147,31 @@ describe('ReliabilityController retry & circuit breaker', () => {
     c.releaseSlot();
     expect(c.activeRequests).toBe(0);
   });
+
+  it('keeps an Error cancellation reason out of provider failure accounting', async () => {
+    const c = new ReliabilityController({
+      maxConcurrency: 1,
+      maxRetries: 0,
+      circuitThreshold: 1,
+    });
+    const controller = new AbortController();
+    const reason = new Error('caller stopped the run');
+    let executions = 0;
+    await c.acquireSlot();
+    const pending = c
+      .run(async () => executions++, 0, 1, { abortSignal: controller.signal })
+      .catch((err: unknown) => err);
+    // 等待真实 run 进入并发队列，再模拟宿主使用 Error 作为取消原因。
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort(reason);
+    const error = await pending;
+    c.releaseSlot();
+
+    expect(executions).toBe(0);
+    expect(error).toMatchObject({ name: 'AbortError', cause: reason });
+    expect(c.circuitFailures).toBe(0);
+    expect(c.circuitState).toBe('CLOSED');
+    expect(c.activeRequests).toBe(0);
+    await expect(c.run(async () => 'next caller')).resolves.toBe('next caller');
+  });
 });

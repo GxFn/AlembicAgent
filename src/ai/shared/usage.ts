@@ -12,7 +12,7 @@
  * Gateway / Transport 共用。
  */
 
-import type { TokenUsage } from '../AiProvider.js';
+import type { TokenUsage } from '../contracts.js';
 
 /** 厂商原始 usage 对象（字段并集，全部可选）。 */
 export interface RawUsage {

@@ -10,15 +10,16 @@
  */
 
 import Logger from '@alembic/core/logging';
-import {
-  type AiLogger,
-  AiProvider,
-  type AiProviderConfig,
-  type ChatContext,
-  type ChatWithToolsOptions,
-  type ChatWithToolsResult,
-  type StructuredOutputOptions,
-} from '../AiProvider.js';
+import { AiProvider } from '../AiProvider.js';
+import type {
+  AiLogger,
+  AiProviderConfig,
+  ChatContext,
+  ChatWithToolsOptions,
+  ChatWithToolsResult,
+  LlmCallOptions,
+  StructuredOutputOptions,
+} from '../contracts.js';
 
 const OLLAMA_DEFAULT_BASE = 'http://localhost:11434/v1';
 const OLLAMA_DUMMY_KEY = 'ollama';
@@ -87,7 +88,7 @@ export class OllamaProvider extends AiProvider {
     return this._gatewayChatWithStructuredOutput(prompt, opts);
   }
 
-  async embed(text: string | string[]) {
-    return this._gatewayEmbed(text);
+  async embed(text: string | string[], opts: LlmCallOptions = {}) {
+    return this._gatewayEmbed(text, opts);
   }
 }

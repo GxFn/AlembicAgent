@@ -10,7 +10,7 @@
  *   - thoughtSignature 必须原样回传 (Gemini 3+)
  */
 
-import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import type { LlmCallOptions, ToolSchema, UnifiedMessage } from '../contracts.js';
 import {
   LLMTransport,
   type TransportConfig,
@@ -113,7 +113,7 @@ export class GoogleTransport extends LLMTransport {
     return this.#parseResponse(data);
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     this.requireApiKey('Google Gemini');
     const results: number[][] = [];
 
@@ -125,7 +125,7 @@ export class GoogleTransport extends LLMTransport {
       }));
 
       const url = `${this.baseUrl}/${this.#embedModel}:batchEmbedContents?key=${this.apiKey}`;
-      const data = await this.post(url, { requests }, {});
+      const data = await this.post(url, { requests }, {}, opts.abortSignal);
       const embeddings = (data?.embeddings || []) as Array<{ values: number[] }>;
       results.push(...embeddings.map((e) => e.values));
     }

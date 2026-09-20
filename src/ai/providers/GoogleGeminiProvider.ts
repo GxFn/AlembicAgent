@@ -14,15 +14,16 @@
  */
 
 import Logger from '@alembic/core/logging';
-import {
-  type AiLogger,
-  AiProvider,
-  type AiProviderConfig,
-  type ChatContext,
-  type ChatWithToolsOptions,
-  type ChatWithToolsResult,
-  type StructuredOutputOptions,
-} from '../AiProvider.js';
+import { AiProvider } from '../AiProvider.js';
+import type {
+  AiLogger,
+  AiProviderConfig,
+  ChatContext,
+  ChatWithToolsOptions,
+  ChatWithToolsResult,
+  LlmCallOptions,
+  StructuredOutputOptions,
+} from '../contracts.js';
 
 export class GoogleGeminiProvider extends AiProvider {
   constructor(config: AiProviderConfig = {}) {
@@ -75,8 +76,8 @@ export class GoogleGeminiProvider extends AiProvider {
     return this._gatewayChatWithStructuredOutput(prompt, opts);
   }
 
-  async embed(text: string | string[]) {
-    return this._gatewayEmbed(text);
+  async embed(text: string | string[], opts: LlmCallOptions = {}) {
+    return this._gatewayEmbed(text, opts);
   }
 
   /** Gemini 处理更大的代码摘要预算。 */

@@ -1,15 +1,30 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-
 import { getLLMGateway, LLMGateway, resetLLMGateway } from '../src/ai/gateway/LLMGateway.js';
+import { jsonResponse } from './helpers/mockFetch.js';
 
 function stubFetch(response: Record<string, unknown>) {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => ({ ok: true, json: async () => response, text: async () => '' }) as Response)
+    vi.fn(async () => jsonResponse(response))
   );
 }
 
 describe('LLMGateway horizontal capabilities', () => {
+  it('stops provider fallback when the caller cancels the probe chain', async () => {
+    stubFetch({ choices: [{ index: 0, message: { content: 'ok' } }] });
+    const controller = new AbortController();
+    controller.abort(new Error('probe cancelled'));
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'test-key' } },
+      maxRetries: 0,
+    });
+    await expect(
+      gateway.resolveWithFallback(['openai:gpt-4o', 'openai:gpt-4o-mini'], {
+        abortSignal: controller.signal,
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it.each([
     'chat',
     'chatStructured',
@@ -19,13 +34,10 @@ describe('LLMGateway horizontal capabilities', () => {
       'fetch',
       vi.fn(async (_url, options) => {
         body = JSON.parse(options.body);
-        return {
-          ok: true,
-          json: async () => ({
-            choices: [{ message: { content: '{"value":42}' } }],
-            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
-          }),
-        } as Response;
+        return jsonResponse({
+          choices: [{ index: 0, message: { content: '{"value":42}' } }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        });
       })
     );
     const onUsage = vi.fn();
@@ -69,7 +81,7 @@ describe('LLMGateway horizontal capabilities', () => {
 
   it('fires onUsage callback with provider/model/source after chatWithTools', async () => {
     stubFetch({
-      choices: [{ message: { content: 'done' } }],
+      choices: [{ index: 0, message: { content: 'done' } }],
       usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
     });
     const usageEvents: Array<Record<string, unknown>> = [];
@@ -99,14 +111,10 @@ describe('LLMGateway horizontal capabilities', () => {
       'fetch',
       vi.fn(async (_url: string, init?: RequestInit) => {
         requestBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
-        return {
-          ok: true,
-          json: async () => ({
-            choices: [{ message: { content: 'done' } }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          }),
-          text: async () => '',
-        } as Response;
+        return jsonResponse({
+          choices: [{ index: 0, message: { content: 'done' } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
       })
     );
 
@@ -125,7 +133,7 @@ describe('LLMGateway horizontal capabilities', () => {
 
   it('chatStructured robustly extracts JSON wrapped in markdown fences', async () => {
     stubFetch({
-      choices: [{ message: { content: '```json\n{"value": 42}\n```' } }],
+      choices: [{ index: 0, message: { content: '```json\n{"value": 42}\n```' } }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     });
     const gateway = new LLMGateway({ providers: { openai: { apiKey: 'k' } } });

@@ -147,6 +147,8 @@ AI provider 改动必须用 mock provider 通过测试 —— 测试绝不依赖
 API key。入口点的已声明副作用固化在 `docs/entrypoint-effects.md` 与
 `test/entrypoint-effects.test.ts`。
 
+模型接入、取消、schema 验证与 SDK 兼容边界见 [LLM 接入与调用合同](docs/llm-adapters.md)。
+
 ## 发布
 
 发布预览单独 staging:

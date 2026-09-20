@@ -163,6 +163,8 @@ AI provider changes must pass with mock providers — tests never depend on real
 API keys. Declared entrypoint side effects are pinned in
 `docs/entrypoint-effects.md` and `test/entrypoint-effects.test.ts`.
 
+See [LLM adapter contracts](docs/llm-adapters.md) for cancellation, schema validation, and SDK compatibility boundaries.
+
 ## Release
 
 Publish previews are staged separately:

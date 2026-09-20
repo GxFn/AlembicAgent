@@ -15,6 +15,7 @@
  * Transport 调用外层包裹可靠性逻辑。
  */
 
+import { createLlmAbortError } from '../errors.js';
 import { classifyLlmError } from './errorClassify.js';
 
 /** 日志回调，level 与现有 logger 对齐（info/warn/error）。 */
@@ -44,18 +45,6 @@ export interface ReliabilityOptions {
 function makeCircuitOpenError(message: string): Error & { code: string } {
   const err = new Error(message) as Error & { code: string };
   err.code = 'CIRCUIT_OPEN';
-  return err;
-}
-
-function makeAbortError(reason?: unknown): Error & { code?: string } {
-  if (reason instanceof Error) {
-    return reason;
-  }
-  const err = new Error(typeof reason === 'string' ? reason : 'Operation aborted') as Error & {
-    code?: string;
-  };
-  err.name = 'AbortError';
-  err.code = 'ABORT_ERR';
   return err;
 }
 
@@ -106,7 +95,7 @@ export class ReliabilityController {
 
   async acquireSlot(abortSignal: AbortSignal | null = null): Promise<void> {
     if (abortSignal?.aborted) {
-      throw makeAbortError(abortSignal.reason);
+      throw createLlmAbortError(abortSignal.reason);
     }
     if (this.activeRequests < this.maxConcurrency) {
       this.activeRequests += 1;
@@ -125,7 +114,7 @@ export class ReliabilityController {
         if (index >= 0) {
           this.requestQueue.splice(index, 1);
         }
-        reject(makeAbortError(abortSignal?.reason));
+        reject(createLlmAbortError(abortSignal?.reason));
       };
       abortSignal?.addEventListener('abort', queued.onAbort, { once: true });
       this.requestQueue.push(queued);
@@ -139,7 +128,7 @@ export class ReliabilityController {
         next.abortSignal?.removeEventListener('abort', next.onAbort);
       }
       if (next.abortSignal?.aborted) {
-        next.reject(makeAbortError(next.abortSignal.reason));
+        next.reject(createLlmAbortError(next.abortSignal.reason));
         this.releaseSlot();
         return;
       }
@@ -151,7 +140,7 @@ export class ReliabilityController {
 
   async waitForRateLimitWindow(abortSignal: AbortSignal | null = null): Promise<void> {
     if (abortSignal?.aborted) {
-      throw makeAbortError(abortSignal.reason);
+      throw createLlmAbortError(abortSignal.reason);
     }
     const waitMs = this.rateLimitedUntil - Date.now();
     if (waitMs > 0) {
@@ -164,7 +153,7 @@ export class ReliabilityController {
       return new Promise((resolve) => setTimeout(resolve, waitMs));
     }
     if (abortSignal.aborted) {
-      return Promise.reject(makeAbortError(abortSignal.reason));
+      return Promise.reject(createLlmAbortError(abortSignal.reason));
     }
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -174,7 +163,7 @@ export class ReliabilityController {
       const onAbort = () => {
         clearTimeout(timeout);
         abortSignal.removeEventListener('abort', onAbort);
-        reject(makeAbortError(abortSignal.reason));
+        reject(createLlmAbortError(abortSignal.reason));
       };
       abortSignal.addEventListener('abort', onAbort, { once: true });
     });

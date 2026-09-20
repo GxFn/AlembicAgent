@@ -12,13 +12,18 @@
  *   - 业务逻辑 (上下文窗口管理、工具路由等) → AgentRuntime
  */
 
-import {
-  createMissingApiKeyError,
-  type TokenUsage,
-  type ToolSchema,
-  type UnifiedMessage,
-} from '../AiProvider.js';
+import Logger from '@alembic/core/logging';
+import { runOperation } from '../../shared/operation.js';
+import type {
+  LlmCallOptions,
+  LlmContinuation,
+  TokenUsage,
+  ToolSchema,
+  UnifiedMessage,
+} from '../contracts.js';
+import { createLlmAbortError, createMissingApiKeyError, throwIfLlmCancelled } from '../errors.js';
 import type { ProviderId } from '../registry/ModelDefs.js';
+import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schemaValidation.js';
 
 // ─── 代理 dispatcher 缓存 ────────────────────────────────
 //
@@ -137,6 +142,7 @@ export interface TransportResponse {
   functionCalls: TransportFunctionCall[] | null;
   usage: TokenUsage | null;
   reasoningContent?: string | null;
+  continuation?: LlmContinuation;
   /** Provider stop reason，例如 Chat Completions choice.finish_reason */
   finishReason?: string | null;
 }
@@ -171,19 +177,36 @@ export abstract class LLMTransport {
   abstract chat(request: TransportRequest): Promise<string>;
 
   /** embed 能力，不支持的 Transport 返回空数组 */
-  async embed(_texts: string[]): Promise<number[][]> {
+  async embed(_texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
+    throwIfLlmCancelled(opts.abortSignal);
     return [];
   }
 
   /** 带 JSON 格式约束的 chat */
   async chatStructured(request: TransportRequest): Promise<unknown> {
+    throwIfLlmCancelled(request.abortSignal);
+    const validate = prepareStructuredValidation(request.schema, (_level, message) =>
+      Logger.getInstance().warn(message)
+    );
+    if (!validate) {
+      return null;
+    }
     const text = await this.chat({ ...request, responseFormat: 'json' });
     if (!text) {
       return null;
     }
+    if (request.schema !== undefined) {
+      return parseSchemaOutput(text, validate, (_level, message) =>
+        Logger.getInstance().warn(message)
+      );
+    }
     try {
-      return JSON.parse(text);
-    } catch {
+      const value: unknown = JSON.parse(text);
+      return validate(value) ? value : null;
+    } catch (err: unknown) {
+      Logger.getInstance().warn(
+        `[structured-output] parse_failed provider=${this.providerId} kind=${err instanceof SyntaxError ? 'invalid_json' : 'validation_error'}; result rejected`
+      );
       return null;
     }
   }
@@ -230,24 +253,12 @@ export abstract class LLMTransport {
     headers: Record<string, string>,
     externalSignal?: AbortSignal
   ): Promise<Record<string, unknown>> {
-    if (externalSignal?.aborted) {
-      throw new DOMException('Provider request cancelled before dispatch', 'AbortError');
-    }
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, this.timeout);
-    const onExternalAbort = () => controller.abort();
-    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
-
-    try {
-      const res = await this.#fetch(url, {
+    return this.runRequest(async (signal) => {
+      const res = await this.fetchWithProxy(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(body),
-        signal: controller.signal,
+        signal,
       });
 
       if (!res.ok) {
@@ -267,17 +278,30 @@ export abstract class LLMTransport {
       }
 
       return (await res.json()) as Record<string, unknown>;
-    } catch (err: unknown) {
-      if (timedOut && !externalSignal?.aborted) {
-        throw Object.assign(new Error(`Provider request timed out after ${this.timeout}ms`), {
-          code: 'ETIMEDOUT',
-        });
-      }
-      throw err instanceof Error ? err : new Error(String(err));
-    } finally {
-      clearTimeout(timer);
-      externalSignal?.removeEventListener('abort', onExternalAbort);
+    }, externalSignal);
+  }
+
+  /** 单次 HTTP/SDK 请求的共同期限；取消先确定终态，迟到 body 不得复活调用。 */
+  protected async runRequest<T>(
+    operation: (signal: AbortSignal) => PromiseLike<T>,
+    externalSignal?: AbortSignal
+  ): Promise<T> {
+    const outcome = await runOperation(operation, {
+      abortSignal: externalSignal,
+      timeoutMs: this.timeout,
+    });
+    if (outcome.status === 'ok') {
+      return outcome.value;
     }
+    if (outcome.status === 'aborted') {
+      throw createLlmAbortError(externalSignal?.reason);
+    }
+    if (outcome.status === 'timeout') {
+      throw Object.assign(new Error(`Provider request timed out after ${this.timeout}ms`), {
+        code: 'ETIMEDOUT',
+      });
+    }
+    throw outcome.error instanceof Error ? outcome.error : new Error(String(outcome.error));
   }
 
   /**
@@ -288,7 +312,10 @@ export abstract class LLMTransport {
    * `vi.stubGlobal('fetch')` 的桩——避免“环境带 HTTPS_PROXY 时单测被绕过”的回归。
    * ProxyAgent 按 proxyUrl 缓存复用，避免每请求新建导致的 socket 泄漏。
    */
-  async #fetch(url: string, options: Record<string, unknown> = {}): Promise<Response> {
+  protected async fetchWithProxy(
+    url: string | URL | Request,
+    options: RequestInit = {}
+  ): Promise<Response> {
     const proxyUrl = this.resolveProxyUrl();
     if (proxyUrl) {
       const dispatcher = await getProxyDispatcher(proxyUrl);
@@ -297,7 +324,7 @@ export abstract class LLMTransport {
         return fetch(url, { ...options, dispatcher } as RequestInit);
       }
     }
-    return fetch(url, options as RequestInit);
+    return fetch(url, options);
   }
 
   protected requireApiKey(label: string): void {

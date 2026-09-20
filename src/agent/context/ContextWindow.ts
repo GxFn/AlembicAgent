@@ -1,3 +1,4 @@
+import type { LlmContinuation } from '#ai/contracts.js';
 /**
  * ContextWindow — Agent 的上下文窗口管理器
  *
@@ -47,6 +48,7 @@ export interface ContextMessage {
   content?: string | null;
   /** DeepSeek V4 thinking / 推理内容，多轮对话需原样回传 */
   reasoningContent?: string | null;
+  continuation?: LlmContinuation;
   toolCalls?: ToolCallInfo[];
   toolCallId?: string;
   name?: string;
@@ -307,7 +309,8 @@ export class ContextWindow {
   appendAssistantWithToolCalls(
     text: string | null,
     toolCalls: ToolCallInfo[],
-    reasoningContent?: string | null
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
   ) {
     const msg: ContextMessage = {
       role: 'assistant',
@@ -317,6 +320,9 @@ export class ContextWindow {
       // 始终存储此字段（即使为空），确保后续 API 调用不会丢失
       reasoningContent: reasoningContent ?? '',
     };
+    if (continuation) {
+      msg.continuation = structuredClone(continuation);
+    }
     this.#messages.push(msg);
   }
 
@@ -335,13 +341,20 @@ export class ContextWindow {
   }
 
   /** 追加 assistant 纯文本消息（无工具调用） */
-  appendAssistantText(text: string, reasoningContent?: string | null) {
+  appendAssistantText(
+    text: string,
+    reasoningContent?: string | null,
+    continuation?: LlmContinuation
+  ) {
     const msg: ContextMessage = {
       role: 'assistant',
       content: text,
     };
     if (reasoningContent != null) {
       msg.reasoningContent = reasoningContent;
+    }
+    if (continuation) {
+      msg.continuation = structuredClone(continuation);
     }
     this.#messages.push(msg);
   }
@@ -765,6 +778,9 @@ export class ContextWindow {
       }
       if (m.reasoningContent && recentToolCallIndices.has(i)) {
         total += estimateTokensFast(m.reasoningContent);
+      }
+      if (m.continuation) {
+        total += estimateTokensFast(JSON.stringify(m.continuation));
       }
       if (m.toolCalls) {
         total += estimateTokensFast(JSON.stringify(m.toolCalls));

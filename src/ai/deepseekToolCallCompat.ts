@@ -1,4 +1,4 @@
-import type { FunctionCallResult } from './AiProvider.js';
+import type { FunctionCallResult } from './contracts.js';
 
 const INVOKE_RE = /<invoke\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/invoke>/gi;
 const PARAM_RE = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;

@@ -4,193 +4,29 @@
  */
 
 import { LanguageService } from '@alembic/core/shared';
+import type {
+  AiLogger,
+  AiProviderConfig,
+  ChatContext,
+  ChatWithToolsOptions,
+  ChatWithToolsResult,
+  EmbeddingCapacityHint,
+  EmbeddingCapacityHintSource,
+  FileContentEntry,
+  LanguageProfile,
+  LlmCallOptions,
+  StructuredOutputOptions,
+  TokenUsage,
+  UnifiedMessage,
+} from './contracts.js';
+import { throwIfLlmCancelled } from './errors.js';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
+import { parseSchemaOutput, prepareStructuredValidation } from './shared/schemaValidation.js';
 import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-/** Loose JSON record for external API responses (inherently untyped) */
-// biome-ignore lint: API responses are dynamic JSON
-export type ApiResponse = Record<string, any>;
-/* eslint-enable @typescript-eslint/no-explicit-any */
-
-/** AI provider 构造配置 */
-export interface AiProviderConfig {
-  model?: string;
-  apiKey?: string;
-  baseUrl?: string;
-  timeout?: number;
-  maxRetries?: number;
-  circuitThreshold?: number;
-  maxConcurrency?: number | string;
-  name?: string;
-  embedModel?: string;
-  responses?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-/** Provider 缺 key 统一错误；只给 host-neutral 元数据，具体 UI 指引由宿主渲染。 */
-export interface MissingApiKeyError extends Error {
-  code: 'API_KEY_MISSING';
-  provider: string;
-  envVar: string;
-  hostAction: 'configure-provider-credential';
-}
-
-export function createMissingApiKeyError(
-  label: string,
-  envVar: string,
-  provider: string
-): MissingApiKeyError {
-  const err = new Error(
-    `${label} API Key 未配置。请在宿主环境或 Alembic 运行配置中设置 ${envVar}。`
-  ) as MissingApiKeyError;
-  err.code = 'API_KEY_MISSING';
-  err.provider = provider;
-  err.envVar = envVar;
-  err.hostAction = 'configure-provider-credential';
-  return err;
-}
-
-/** 对话历史条目 */
-export interface ChatHistoryEntry {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-/** 对话上下文选项 */
-export interface ChatContext {
-  history?: ChatHistoryEntry[];
-  temperature?: number;
-  maxTokens?: number;
-  systemPrompt?: string;
-  /** 取消文本子调用；由 gateway 继续传到 provider transport。 */
-  abortSignal?: AbortSignal;
-}
-
-/** 统一消息格式 */
-export interface UnifiedMessage {
-  role: 'user' | 'assistant' | 'tool';
-  content?: string | null;
-  /** DeepSeek V4 thinking / 推理内容，多轮对话需原样回传 */
-  reasoningContent?: string | null;
-  toolCalls?: Array<{
-    id: string;
-    name: string;
-    args: Record<string, unknown>;
-    thoughtSignature?: string;
-  }>;
-  toolCallId?: string;
-  name?: string;
-}
-
-/** 工具 schema */
-export interface ToolSchema {
-  name: string;
-  description?: string;
-  parameters?: Record<string, unknown>;
-}
-
-/** chatWithTools 选项 */
-export interface ChatWithToolsOptions {
-  messages?: UnifiedMessage[];
-  toolSchemas?: ToolSchema[];
-  toolChoice?: string;
-  systemPrompt?: string;
-  temperature?: number;
-  maxTokens?: number;
-  /** 外部中止信号 — hard timeout 时取消进行中的 LLM 请求 */
-  abortSignal?: AbortSignal;
-}
-
-/** 函数调用结果 */
-export interface FunctionCallResult {
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-  thoughtSignature?: string;
-}
-
-/** chatWithTools 返回值 */
-export interface ChatWithToolsResult {
-  text: string | null;
-  functionCalls: FunctionCallResult[] | null;
-  usage?: TokenUsage | null;
-  /** DeepSeek V4 thinking 模式返回的推理内容 */
-  reasoningContent?: string | null;
-  /** Provider stop reason，例如 DeepSeek/OpenAI finish_reason */
-  finishReason?: string | null;
-}
-
-/** Token 用量 */
-export interface TokenUsage {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  /** V4 thinking 模式消耗的推理 token (包含在 outputTokens 内) */
-  reasoningTokens?: number;
-  /** V4 prompt 缓存命中 token 数 */
-  cacheHitTokens?: number;
-}
-
-/** chatWithStructuredOutput 选项 */
-export interface StructuredOutputOptions {
-  schema?: Record<string, unknown>;
-  openChar?: string;
-  closeChar?: string;
-  temperature?: number;
-  maxTokens?: number;
-  systemPrompt?: string;
-}
-
-/** AD5 embedding 容量提示的取值来源 */
-export type EmbeddingCapacityHintSource =
-  | 'provider-config'
-  | 'environment'
-  | 'conservative-default';
-
-/**
- * AD5 embedding 容量提示（只读）。
- * Agent transport 层向外部批处理消费者（Core BatchEmbedder 经注入的
- * provider 对象读取）暴露本 provider 实例的真实请求闸门；
- * 只暴露信息，不改变任何节流行为。
- */
-export interface EmbeddingCapacityHint {
-  /** Provider 名称（如 'openai' / 'google'） */
-  provider: string;
-  /** 建议的最大并发 embedding 请求数 = 本实例的并发闸门值 */
-  maxInFlightEmbeddings: number;
-  /** 取值来源 */
-  source: EmbeddingCapacityHintSource;
-}
-
-// AiProvider.enrichCandidates (with its EnrichOptions/EnrichCandidate types and
-// prompt builders) was deleted under the Train B DCR default-delete lineage: its
-// last caller, the Alembic resident alembic_enrich_candidates surface, was
-// removed in the pB1 DCR commit and a fresh five-repo scan found zero consumers.
-
-/** 文件内容条目（用于语言检测） */
-export interface FileContentEntry {
-  name?: string;
-  [key: string]: unknown;
-}
-
-/** 语言 profile */
-export interface LanguageProfile {
-  primaryLanguage: string;
-  role: string;
-  patternExamples: string;
-  extractionExamples: string;
-  categories: string;
-}
-
-/** Logger 接口 — 兼容 winston.Logger 实例 */
-export interface AiLogger {
-  debug(message: string, ...args: unknown[]): void;
-  info(message: string, ...args: unknown[]): void;
-  warn(message: string, ...args: unknown[]): void;
-  error(message: string, ...args: unknown[]): void;
-  [key: string]: unknown;
-}
+// 保留原公共入口：外部消费者无需随内部依赖分层更换导入路径。
+export type * from './contracts.js';
+export { createMissingApiKeyError, type MissingApiKeyError } from './errors.js';
 
 export class AiProvider {
   _circuitThreshold: number;
@@ -283,18 +119,20 @@ export class AiProvider {
    * 实现对所有 provider 相同（仅 maxTokens 预算可经 summarizeMaxTokens 调整），
    * 故收敛到基类，子类不再各自复制。
    */
-  async summarize(code: string): Promise<unknown> {
+  async summarize(code: string, opts: LlmCallOptions = {}): Promise<unknown> {
     const prompt = `请对以下代码生成结构化摘要，返回 JSON 格式 {title, description, language, patterns: [], keyAPIs: []}:\n\n${code}`;
     return (
       (await this.chatWithStructuredOutput(prompt, {
         temperature: 0.3,
         maxTokens: this.summarizeMaxTokens,
+        abortSignal: opts.abortSignal,
       })) || { title: '', description: '' }
     );
   }
 
   /** 向量嵌入 - 返回浮点数组 */
-  async embed(text: string | string[]): Promise<number[] | number[][]> {
+  async embed(text: string | string[], opts: LlmCallOptions = {}): Promise<number[] | number[][]> {
+    throwIfLlmCancelled(opts.abortSignal);
     throw new Error(`${this.name}.embed() not implemented`);
   }
 
@@ -302,8 +140,8 @@ export class AiProvider {
    * 探测 provider 是否可用（轻量级 API 调用验证连接性）
    * 子类可覆盖实现更具体的探测逻辑
    */
-  async probe() {
-    const result = await this.chat('ping', { maxTokens: 16, temperature: 0 });
+  async probe(opts: LlmCallOptions = {}) {
+    const result = await this.chat('ping', { maxTokens: 16, temperature: 0, ...opts });
     return !!result;
   }
 
@@ -373,6 +211,7 @@ export class AiProvider {
       systemPrompt: opts.systemPrompt,
       temperature: opts.temperature,
       maxTokens: opts.maxTokens,
+      abortSignal: opts.abortSignal,
     });
     return { text, functionCalls: null };
   }
@@ -396,17 +235,29 @@ export class AiProvider {
     prompt: string,
     opts: StructuredOutputOptions = {}
   ): Promise<unknown> {
+    throwIfLlmCancelled(opts.abortSignal);
+    const validate = prepareStructuredValidation(opts.schema, (level, message) =>
+      this._log(level, message)
+    );
+    if (!validate) {
+      return null;
+    }
     const response = await this.chat(prompt, {
       temperature: opts.temperature ?? 0.3,
       maxTokens: opts.maxTokens ?? 32768,
       systemPrompt: opts.systemPrompt,
+      abortSignal: opts.abortSignal,
     });
     if (!response || response.trim().length === 0) {
       return null;
     }
+    if (opts.schema !== undefined) {
+      return parseSchemaOutput(response, validate, (level, message) => this._log(level, message));
+    }
     const openChar = opts.openChar || '{';
     const closeChar = opts.closeChar || '}';
-    return this.extractJSON(response, openChar, closeChar);
+    const value = this.extractJSON(response, openChar, closeChar);
+    return validate(value) ? value : null;
   }
 
   // ─── Gateway 委托（方案①：协议下沉 transport，横切收敛 gateway）─────────────
@@ -427,8 +278,7 @@ export class AiProvider {
     if (this.#gateway) {
       return this.#gateway;
     }
-    // 动态 import 打破 AiProvider ↔ LLMGateway/transport 的模块循环依赖（顶层仅保留 type import）。
-    // 首次 chat 时所有模块已加载完毕，动态加载不会触发初始化死锁。
+    // DTO/错误已经叶子化；仍按需加载 Gateway，避免只读 Provider 合同时加载全部 SDK。
     const { LLMGateway } = await import('./gateway/LLMGateway.js');
     // 首次并发请求可能一起等待动态加载；恢复后再次检查，确保所有请求共享同一个闸门。
     if (this.#gateway) {
@@ -512,20 +362,28 @@ export class AiProvider {
       openChar: opts.openChar,
       closeChar: opts.closeChar,
       usageSource: 'structured',
+      abortSignal: opts.abortSignal,
     });
   }
 
   /** 委托 gateway 的向量嵌入；transport 依据 _transportExtras.embedModel 选择 embed 模型。 */
-  async _gatewayEmbed(text: string | string[]): Promise<number[] | number[][]> {
+  async _gatewayEmbed(
+    text: string | string[],
+    opts: LlmCallOptions = {}
+  ): Promise<number[] | number[][]> {
     const isArray = Array.isArray(text);
     const texts = isArray ? (text as string[]) : [text as string];
     try {
-      const embeddings = await (await this._getGateway()).embed(this._modelRef, texts);
+      const embeddings = await (await this._getGateway()).embed(this._modelRef, texts, opts);
       return isArray ? embeddings : embeddings[0] || [];
-    } catch (err) {
+    } catch (err: unknown) {
+      throwIfLlmCancelled(opts.abortSignal, err);
       // embed 失败不应中断主流程：返回空向量，由上层决定降级策略（与原 Provider 行为一致）。
-      this._log('warn', `[${this.name}] embed failed: ${(err as Error).message}`);
-      return isArray ? [] : [];
+      this._log(
+        'warn',
+        `[${this.name}] embed failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return [];
     }
   }
 

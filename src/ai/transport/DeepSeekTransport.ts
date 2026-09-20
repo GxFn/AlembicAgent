@@ -8,7 +8,7 @@
  *   - max_tokens 自动提升以容纳 reasoning token
  */
 
-import type { ToolSchema, UnifiedMessage } from '../AiProvider.js';
+import type { LlmCallOptions, ToolSchema, UnifiedMessage } from '../contracts.js';
 import { parseDeepSeekTextToolCalls } from '../deepseekToolCallCompat.js';
 import { normalizeToolTranscriptForChatCompletions } from '../toolTranscript.js';
 import {
@@ -143,13 +143,18 @@ export class DeepSeekTransport extends LLMTransport {
     return this.#parseResponse(data, request);
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     this.requireApiKey('DeepSeek');
     const body = {
       model: 'deepseek-embedding',
       input: texts.map((t) => t.slice(0, 8000)),
     };
-    const data = await this.post(`${this.baseUrl}/embeddings`, body, this.#headers());
+    const data = await this.post(
+      `${this.baseUrl}/embeddings`,
+      body,
+      this.#headers(),
+      opts.abortSignal
+    );
     const items = ((data as Record<string, unknown>)?.data || []) as Array<{
       index: number;
       embedding: number[];

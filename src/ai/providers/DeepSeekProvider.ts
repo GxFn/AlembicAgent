@@ -14,15 +14,16 @@
  */
 
 import Logger from '@alembic/core/logging';
-import {
-  type AiLogger,
-  AiProvider,
-  type AiProviderConfig,
-  type ChatContext,
-  type ChatWithToolsOptions,
-  type ChatWithToolsResult,
-  type StructuredOutputOptions,
-} from '../AiProvider.js';
+import { AiProvider } from '../AiProvider.js';
+import type {
+  AiLogger,
+  AiProviderConfig,
+  ChatContext,
+  ChatWithToolsOptions,
+  ChatWithToolsResult,
+  LlmCallOptions,
+  StructuredOutputOptions,
+} from '../contracts.js';
 
 const DEEPSEEK_BASE = 'https://api.deepseek.com';
 const VALID_EFFORTS = new Set(['high', 'max']);
@@ -63,7 +64,7 @@ export class DeepSeekProvider extends AiProvider {
     return this._gatewayChatWithStructuredOutput(prompt, opts);
   }
 
-  async embed(text: string | string[]) {
-    return this._gatewayEmbed(text);
+  async embed(text: string | string[], opts: LlmCallOptions = {}) {
+    return this._gatewayEmbed(text, opts);
   }
 }

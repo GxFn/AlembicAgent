@@ -47,8 +47,8 @@
       "pattern": "surfaces mid-stream JSON body drops instead of returning a false success"
     },
     {
-      "name": "provider streaming abort",
-      "pattern": "propagates streaming abort signals through the provider fetch path"
+      "name": "provider HTTP abort",
+      "pattern": "propagates cancellation to an in-flight HTTP request"
     }
   ]
 }

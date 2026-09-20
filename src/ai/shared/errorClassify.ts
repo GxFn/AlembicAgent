@@ -37,6 +37,7 @@ export interface ErrorClassification {
 
 /** 已知的可重试网络级错误码集合（Node fetch / undici）。 */
 const RETRYABLE_NETWORK_CODES = new Set([
+  'LLM_NETWORK_ERROR',
   'ECONNRESET',
   'ECONNREFUSED',
   'ENOTFOUND',
