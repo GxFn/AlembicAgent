@@ -40,6 +40,16 @@ const WRITE_LIKE_ARGS = new Set([
   '--update-snapshot',
   '-delete',
   '-exec',
+  '-execdir',
+  '-ok',
+  '-okdir',
+  '-fprint',
+  '-fprint0',
+  '-fprintf',
+  '--pre',
+  '--output',
+  '--ext-diff',
+  '--textconv',
 ]);
 
 export function detectDangerousShellPayload(payload: string): TerminalSafetyBlock | null {
@@ -162,7 +172,8 @@ export function checkTerminalCommandAllowlist(
 }
 
 export function containsShellMeta(value: string): boolean {
-  return /[;&|<>`]|\$\(/.test(value);
+  // 换行可启动第二条命令；变量展开可拼出被禁止的选项，均不能当普通参数放行。
+  return /[\r\n;&|<>`$]/.test(value);
 }
 
 function firstShellWord(command: string): string | null {
@@ -250,7 +261,11 @@ function findWriteLikeArg(args: string[]): string | null {
     if (WRITE_LIKE_ARGS.has(normalized)) {
       return arg;
     }
-    if (normalized.startsWith('--output=') || normalized.startsWith('--write=')) {
+    if (
+      normalized.startsWith('--output=') ||
+      normalized.startsWith('--write=') ||
+      normalized.startsWith('--pre=')
+    ) {
       return arg;
     }
   }
@@ -269,7 +284,7 @@ function checkReadonlySubcommand(
     case 'yarn':
       return checkPackageManagerSubcommand(bin, args);
     case 'tsc':
-      return args.some((arg) => arg === '--noEmit' || arg.startsWith('--noEmit='))
+      return hasEffectiveNoEmit(args)
         ? { safe: true }
         : readonlyBlock('allowlist-tsc-noemit', 'tsc must include --noEmit');
     case 'node':
@@ -283,6 +298,21 @@ function checkReadonlySubcommand(
     default:
       return { safe: true };
   }
+}
+
+function hasEffectiveNoEmit(args: string[]): boolean {
+  let noEmit = false;
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === '--noEmit') {
+      noEmit = args[index + 1] !== 'false';
+      if (args[index + 1] === 'true' || args[index + 1] === 'false') {
+        index++;
+      }
+    } else if (args[index].startsWith('--noEmit=')) {
+      return false;
+    }
+  }
+  return noEmit;
 }
 
 function checkGitSubcommand(args: string[]) {
@@ -324,7 +354,7 @@ function checkPackageManagerSubcommand(bin: string, args: string[]) {
 }
 
 function checkNodeSubcommand(args: string[]) {
-  if (args.some((arg) => ['-e', '--eval', '-p', '--print'].includes(arg.toLowerCase()))) {
+  if (args.some((arg) => /^(?:-e|-p|--eval|--print)(?:=|$)/u.test(arg.toLowerCase()))) {
     return readonlyBlock('allowlist-node-eval', 'node eval/print modes are blocked');
   }
   if (args.includes('--test')) {

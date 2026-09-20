@@ -3,7 +3,7 @@ import { ContextWindow } from '../src/agent/context/index.js';
 import { BudgetController } from '../src/agent/runtime/index.js';
 
 function createBudgetController(
-  contextWindow: ContextWindow,
+  contextWindow: ContextWindow | null,
   opts: {
     maxSessionInputTokens?: number;
     input?: number;
@@ -25,6 +25,18 @@ function createBudgetController(
 }
 
 describe('BudgetController L4 cooldown', () => {
+  it('initializes and resets per-round quotas without a context window', () => {
+    const controller = createBudgetController(null);
+    const budget = controller.getToolBudget(1);
+    expect(controller.getRemainingToolBudget()).toEqual({
+      maxChars: budget.roundMaxChars,
+      maxMatches: budget.perToolMaxMatches,
+    });
+    controller.recordToolCharsUsed(1000);
+    expect(controller.getRemainingToolBudget().maxChars).toBe(budget.roundMaxChars - 1000);
+    controller.getToolBudget(1);
+    expect(controller.getRemainingToolBudget().maxChars).toBe(budget.roundMaxChars);
+  });
   it('keeps L4 compaction disabled by default under pressure', async () => {
     const contextWindow = new ContextWindow(1, { thresholds: [0, 0, 0, 0, 0] });
     contextWindow.appendUserMessage('initial prompt');

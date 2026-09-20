@@ -24,7 +24,6 @@ const ESLINT_LINE_RE = /^\s*(.+?):(\d+):\d+\s+(error|warning)\s+(.+?)(?:\s{2,}|\
 const TSC_LINE_RE = /^(.+?)\((\d+),\d+\):\s+error\s+(TS\d+):\s+(.+)$/;
 const TSC_LINE_ALT_RE = /^(.+?):(\d+):\d+\s+-\s+error\s+(TS\d+):\s+(.+)$/;
 
-const _BIOME_LINE_RE = /^(.+?):(\d+):\d+\s+(lint\/\S+)\s+━+\s*$/;
 const BIOME_DIAG_RE = /^(.+?):(\d+):\d+\s+(error|warning|info)\[(.+?)]\s+(.+)$/;
 
 function tryEslint(raw: string): LintResult | null {

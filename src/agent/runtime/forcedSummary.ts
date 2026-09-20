@@ -1,3 +1,4 @@
+import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcomes.js';
 /**
  * forcedSummary.ts — 强制退出后的摘要生成
  *
@@ -53,6 +54,7 @@ interface TokenUsage {
 
 /** Options for {@link produceForcedSummary} */
 interface ForcedSummaryOpts {
+  abortSignal?: AbortSignal;
   aiProvider: AiProvider;
   source?: string;
   toolCalls?: ToolCallRecord[];
@@ -79,6 +81,7 @@ const logger = () => Logger.getInstance();
  * @returns }>}
  */
 export async function produceForcedSummary({
+  abortSignal,
   aiProvider,
   source,
   toolCalls = [],
@@ -87,6 +90,13 @@ export async function produceForcedSummary({
   prompt,
   tokenUsage,
 }: ForcedSummaryOpts) {
+  toolCalls = toolCalls.map((call) => {
+    const params = readToolObservation(call).params;
+    return {
+      ...call,
+      args: { ...params, filePath: params.filePath ?? params.path } as ToolCallArgs,
+    };
+  });
   const isSystem = source === 'system';
   const iterations = tracker?.iteration || 0;
   const pipelineType = tracker?.pipelineType || (isSystem ? 'bootstrap' : 'user');
@@ -98,13 +108,13 @@ export async function produceForcedSummary({
     `[ForcedSummary] ⚠ producing forced summary (${iterations} iters, ${toolCalls.length} calls, source=${source}, pipeline=${pipelineType})`
   );
 
-  const candidateCount = toolCalls.filter((tc: ToolCallRecord) => tc.tool === 'knowledge').length;
+  const candidateCount = toolCalls.filter(isPersistedSubmission).length;
 
   let finalReply: string | undefined;
 
   // 收集工具调用摘要
   const submitSummary = toolCalls
-    .filter((tc: ToolCallRecord) => tc.tool === 'knowledge')
+    .filter(isPersistedSubmission)
     .map(
       (tc: ToolCallRecord, i: number) =>
         `${i + 1}. ${tc.args?.title || tc.args?.category || tc.params?.title || tc.params?.category || 'untitled'}`
@@ -174,6 +184,7 @@ ${toolContextSummary}
 
     // 用空 messages 避免累积上下文导致 400
     const summaryResult = await aiProvider.chatWithTools(summaryPrompt, {
+      abortSignal,
       messages: [],
       toolChoice: 'none',
       systemPrompt,
@@ -244,7 +255,7 @@ ${toolContextSummary}
     } else if (isSystem) {
       // system 源兜底: 合成 dimensionDigest JSON
       const titles = toolCalls
-        .filter((tc: ToolCallRecord) => tc.tool === 'knowledge')
+        .filter(isPersistedSubmission)
         .map((tc: ToolCallRecord) => tc.args?.title || tc.params?.title || 'untitled');
       finalReply = `\`\`\`json
 {

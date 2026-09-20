@@ -2,6 +2,53 @@ import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow, limitToolResult } from '../src/agent/context/index.js';
 
 describe('ContextWindow L4 compaction transcript safety', () => {
+  it('keeps repeated tool calls paired with their results during L2 compression', () => {
+    const window = new ContextWindow(48_000, { thresholds: [0, 0, 0, 100, 100] });
+    window.appendUserMessage('produce');
+    for (let round = 0; round < 4; round++) {
+      window.appendAssistantWithToolCalls(null, [
+        {
+          id: `submit-${round}`,
+          name: 'knowledge',
+          args: { action: 'submit', params: { title: 'same candidate' } },
+        },
+        { id: `read-${round}`, name: 'code', args: { action: 'read' } },
+      ]);
+      window.appendToolResult(`submit-${round}`, 'knowledge', 'submission result');
+      window.appendToolResult(`read-${round}`, 'code', 'source');
+    }
+    window.compactIfNeeded();
+    const messages = window.toMessages();
+    const calls = messages.flatMap((message) => message.toolCalls?.map((call) => call.id) ?? []);
+    const results = messages
+      .filter((message) => message.role === 'tool')
+      .map((message) => message.toolCallId);
+    expect(calls.sort()).toEqual(results.sort());
+    expect(calls).toHaveLength(8);
+  });
+
+  it.each([
+    'resetToPromptOnly',
+    'resetForNewStage',
+  ] as const)('clears stale compression projections on %s', (reset) => {
+    const window = new ContextWindow(48_000, { thresholds: [0, 0, 0, 0, 100] });
+    window.appendUserMessage('old prompt');
+    for (let round = 0; round < 4; round++) {
+      window.appendAssistantWithToolCalls(null, [{ id: `old-${round}`, name: 'code', args: {} }]);
+      window.appendToolResult(`old-${round}`, 'code', `old ${round}`);
+    }
+    window.compactIfNeeded();
+    window[reset]();
+    if (reset === 'resetForNewStage') {
+      window.appendUserMessage('new prompt');
+    }
+    for (let round = 0; round < 4; round++) {
+      window.appendAssistantWithToolCalls(null, [{ id: `new-${round}`, name: 'code', args: {} }]);
+      window.appendToolResult(`new-${round}`, 'code', `new ${round}`);
+    }
+    expect(window.toProjectedMessages()).toEqual(window.toMessages());
+  });
+
   it('keeps runtime nudges ephemeral instead of accumulating repeated user messages', () => {
     const contextWindow = new ContextWindow(48_000);
     contextWindow.appendUserMessage('initial analyze prompt');
@@ -303,6 +350,19 @@ describe('A-1 #compactL1 head+tail retention', () => {
 // ─── A-1b limit* 系列首+尾保留（独立验收，§8 Phase 1b）────────────────────────
 // 独立于 A-1：直接对导出符号 limitToolResult 断言，marker=tool-result snip 且 ≠ 另两层。
 describe('A-1b limitToolResult/limitFileContent head+tail', () => {
+  it('limits batch search results without changing the original tool result', () => {
+    const input = {
+      batchResults: {
+        query: {
+          matches: Array.from({ length: 8 }, (_, line) => ({ file: 'a.ts', line, code: 'source' })),
+        },
+      },
+    };
+    const before = structuredClone(input);
+    const output = JSON.parse(limitToolResult('code', input, { maxMatches: 2, maxChars: 4000 }));
+    expect(output.batchResults.query.matches).toHaveLength(2);
+    expect(input).toEqual(before);
+  });
   it('keeps tail of a generic oversized string result', () => {
     const big = `START_HEAD${'y'.repeat(5000)}END_TAIL_match_count=17`;
     const out = limitToolResult('shell', big, { maxChars: 500 });

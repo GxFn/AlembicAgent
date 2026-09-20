@@ -12,7 +12,16 @@
  */
 
 import { cosineSimilarity } from '@alembic/core/search';
+import { estimateTokens } from '#shared/tokenUtils.js';
 import type { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
+import type { MemoryPromptOptions } from './MemoryPrompt.js';
+import {
+  isMemoryVector,
+  type MemoryReadOptions,
+  memoryReadDeadline,
+  readMemoryValue,
+  reportMemoryRead,
+} from './MemoryReadPolicy.js';
 import type { DeserializedMemory } from './MemoryStore.js';
 import { MemoryStore } from './MemoryStore.js';
 
@@ -42,19 +51,14 @@ export interface ScoredMemory extends DeserializedMemory {
 }
 
 /** 检索选项 */
-export interface RetrieveOptions {
+export interface RetrieveOptions extends MemoryReadOptions {
   limit?: number;
   source?: string;
   type?: string;
 }
 
 /** Prompt section 生成选项 */
-export interface PromptSectionOptions {
-  source?: string;
-  query?: string;
-  limit?: number;
-  tokenBudget?: number;
-}
+export type PromptSectionOptions = MemoryPromptOptions;
 
 /** Memory.load 兼容选项 */
 export interface LoadOptions {
@@ -63,6 +67,7 @@ export interface LoadOptions {
 
 /** Memory.append 兼容入口 */
 export interface AppendEntry {
+  importance?: number;
   type?: string;
   content: string;
   source?: string;
@@ -70,7 +75,10 @@ export interface AppendEntry {
 }
 
 /** 嵌入函数签名 — 异步向量嵌入 (返回 float[] 向量) */
-export type EmbeddingFn = (text: string) => Promise<number[]>;
+export type EmbeddingFn = (
+  text: string,
+  options?: { abortSignal?: AbortSignal }
+) => Promise<number[]>;
 
 export class MemoryRetriever {
   #store: MemoryStore;
@@ -104,11 +112,23 @@ export class MemoryRetriever {
    * @param query 查询文本
    * @returns 按 score 降序排列
    */
-  async retrieve(
-    query: string,
-    { limit = 10, source, type }: RetrieveOptions = {}
-  ): Promise<ScoredMemory[]> {
-    const all = this.#store.getAllActive({ source, type });
+  async retrieve(query: string, options: RetrieveOptions = {}): Promise<ScoredMemory[]> {
+    const selected = await this.#rank(query, options);
+    if (options.abortSignal?.aborted) {
+      return [];
+    }
+    for (const memory of selected) {
+      this.#store.touchAccess(memory.id);
+    }
+    return selected;
+  }
+
+  async #rank(query: string, options: RetrieveOptions): Promise<ScoredMemory[]> {
+    const { limit = 10, source, type } = options;
+    if (options.abortSignal?.aborted || limit <= 0 || Number.isNaN(limit)) {
+      return [];
+    }
+    let all = this.#store.getAllActive({ source, type });
     if (all.length === 0) {
       return [];
     }
@@ -120,11 +140,25 @@ export class MemoryRetriever {
     // 向量检索: 嵌入 query，然后与存储的 embedding 做余弦相似度
     let queryVec: number[] | null = null;
     if (this.#embeddingFn) {
-      try {
-        queryVec = await this.#embeddingFn(query);
-      } catch {
-        // embedding 不可用时 graceful degrade 到纯词汇
+      const embeddingFn = this.#embeddingFn;
+      const result = await readMemoryValue(
+        (signal) => embeddingFn(query, { abortSignal: signal }),
+        options
+      );
+      if (result.status === 'ok' && isMemoryVector(result.value)) {
+        queryVec = result.value;
+      } else {
+        reportMemoryRead(options, {
+          phase: 'embedding',
+          status: result.status === 'ok' ? 'invalid' : result.status,
+          reason: 'lexical-fallback',
+        });
+        if (result.status === 'aborted') {
+          return [];
+        }
       }
+      // embedding 等待期间，原记忆可能被更新、删除或过期；排序使用重新确认的事实。
+      all = this.#store.getAllActive({ source, type });
     }
 
     const scored = all.map((m) => {
@@ -133,7 +167,9 @@ export class MemoryRetriever {
         ? new Date(m.last_accessed_at).getTime()
         : new Date(m.updated_at).getTime();
       const daysSinceAccess = (now - lastAccess) / 86400_000;
-      const recency = Math.exp((-daysSinceAccess * Math.LN2) / RECENCY_HALF_LIFE_DAYS);
+      const recency = Number.isFinite(daysSinceAccess)
+        ? Math.exp((-Math.max(0, daysSinceAccess) * Math.LN2) / RECENCY_HALF_LIFE_DAYS)
+        : 0;
 
       // Importance: 归一化到 0-1
       const importance = (m.importance || 5) / 10;
@@ -148,16 +184,23 @@ export class MemoryRetriever {
       // 向量相关性: 从 embeddingStore 查找 embedding 做余弦相似度
       const deserialized = MemoryStore.deserialize(m);
       let vectorRelevance = 0;
-      const storedEmbedding = this.#embeddingStore?.get(m.id) ?? null;
-      if (queryVec && storedEmbedding) {
+      const storedEmbedding = this.#embeddingStore?.get(m.id, m.content) ?? null;
+      const usableVector = queryVec && isMemoryVector(storedEmbedding, queryVec.length);
+      if (queryVec && storedEmbedding && !usableVector) {
+        reportMemoryRead(options, {
+          phase: 'embedding',
+          status: 'invalid',
+          reason: 'stored-vector-dimension-mismatch',
+        });
+      }
+      if (queryVec && storedEmbedding && usableVector) {
         vectorRelevance = Math.max(0, cosineSimilarity(queryVec, storedEmbedding));
       }
 
       // 混合相关性: 有向量时 0.6 * vector + 0.4 * lexical，否则纯 lexical
-      const relevance =
-        queryVec && storedEmbedding
-          ? 0.6 * vectorRelevance + 0.4 * lexicalRelevance
-          : lexicalRelevance;
+      const relevance = usableVector
+        ? 0.6 * vectorRelevance + 0.4 * lexicalRelevance
+        : lexicalRelevance;
 
       const score =
         WEIGHT_RECENCY * recency + WEIGHT_IMPORTANCE * importance + WEIGHT_RELEVANCE * relevance;
@@ -172,13 +215,7 @@ export class MemoryRetriever {
 
     scored.sort((a, b) => b._score - a._score);
 
-    // 更新访问计数 (只更新返回的)
-    const topN = scored.slice(0, limit);
-    for (const m of topN) {
-      this.#store.touchAccess(m.id);
-    }
-
-    return topN;
+    return scored.slice(0, Math.floor(limit));
   }
 
   /** 简单文本搜索 (不打分, 用于去重检查) */
@@ -196,26 +233,17 @@ export class MemoryRetriever {
    *
    * @returns Markdown 格式
    */
-  async toPromptSection({
-    source,
-    query,
-    limit = 15,
-    tokenBudget,
-  }: PromptSectionOptions = {}): Promise<string> {
-    if (tokenBudget && tokenBudget > 0) {
-      const EST_TOKENS_PER_MEMORY = 30;
-      const HEADER_TOKENS = 15;
-      const maxByBudget = Math.max(
-        3,
-        Math.floor((tokenBudget - HEADER_TOKENS) / EST_TOKENS_PER_MEMORY)
-      );
-      limit = Math.min(limit, maxByBudget);
+  async toPromptSection(options: PromptSectionOptions = {}): Promise<string> {
+    const { source, query, limit = 15, tokenBudget } = options;
+    const budget = tokenBudget ?? Infinity;
+    if (budget <= 0 || Number.isNaN(budget) || options.abortSignal?.aborted) {
+      return '';
     }
 
     let memories: DeserializedMemory[];
 
     if (query) {
-      memories = await this.retrieve(query, { limit, source });
+      memories = await this.#rank(query, { ...options, limit, source });
     } else {
       memories = this.#store
         .getAllActive({ source })
@@ -237,10 +265,23 @@ export class MemoryRetriever {
       const badge = m.importance >= 8 ? '⚠️' : m.importance >= 5 ? '📌' : '💡';
       // CG-1：>7 天召回记忆加软前缀，提示对照当前源码核实；新鲜记忆不加噪。
       const stale = MemoryRetriever.#stalenessPrefix(m, now);
-      return `- ${badge} ${stale}[${m.type}] ${m.content}`;
+      return { id: m.id, text: `- ${badge} ${stale}[${m.type}] ${m.content}` };
     });
 
-    return `\n## 项目记忆 (${memories.length} 条最相关)\n${lines.join('\n')}\n`;
+    const render = (selected: string[]) =>
+      `\n## 项目记忆 (${selected.length} 条最相关)\n${selected.join('\n')}\n`;
+    const selected: string[] = [];
+    for (const line of lines) {
+      if (options.abortSignal?.aborted) {
+        return '';
+      }
+      if (estimateTokens(render([...selected, line.text])) <= budget) {
+        selected.push(line.text);
+        // 只为实际注入上下文的记忆计访问；召回但被预算丢弃不应人为抬升热度。
+        this.#store.touchAccess(line.id);
+      }
+    }
+    return selected.length > 0 ? render(selected) : '';
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -276,6 +317,9 @@ export class MemoryRetriever {
     // 去重: 检查是否已有高相似度记忆
     const similar = this.#store.findSimilar(content, entry.type ?? null, 1);
     if (similar.length > 0 && (similar[0].similarity ?? 0) >= SIMILARITY_UPDATE) {
+      if (entry.importance !== undefined && entry.importance > (similar[0].importance ?? 5)) {
+        this.#store.update(similar[0].id, { importance: entry.importance });
+      }
       this.#store.touchAccess(similar[0].id);
       return;
     }
@@ -284,7 +328,7 @@ export class MemoryRetriever {
       type: entry.type || 'context',
       content,
       source: entry.source || 'user',
-      importance: 5,
+      importance: entry.importance ?? 5,
       ttlDays: entry.ttl || null,
     });
   }
@@ -308,34 +352,56 @@ export class MemoryRetriever {
    * @param batchSize 每批数量 (默认 20)
    * @returns 成功嵌入的记忆数
    */
-  async embedAllMemories(batchSize = 20): Promise<number> {
-    if (!this.#embeddingFn || !this.#embeddingStore) {
+  async embedAllMemories(batchSize = 20, options: MemoryReadOptions = {}): Promise<number> {
+    if (
+      !this.#embeddingFn ||
+      !this.#embeddingStore ||
+      options.abortSignal?.aborted ||
+      !Number.isFinite(batchSize) ||
+      batchSize <= 0
+    ) {
       return 0;
     }
 
     // 从 MemoryStore 获取所有活跃记忆 ID，找出 embeddingStore 中缺失的
     const allActive = this.#store.getAllActive();
-    const allIds = allActive.map((m) => m.id);
-    const missingIds = this.#embeddingStore.getMissingIds(allIds);
+    const missingIds = allActive
+      .filter((memory) => !this.#embeddingStore?.get(memory.id, memory.content))
+      .map((memory) => memory.id);
     if (missingIds.length === 0) {
       return 0;
     }
 
     // 取前 batchSize 条
-    const batch = missingIds.slice(0, batchSize);
+    const batch = missingIds.slice(0, Math.floor(batchSize));
     const contentMap = new Map(allActive.map((m) => [m.id, m.content]));
+    const deadlineAt = memoryReadDeadline(options);
+    const embeddingFn = this.#embeddingFn;
 
-    const entries: Array<{ id: string; embedding: number[] }> = [];
+    const entries: Array<{ id: string; embedding: number[]; content: string }> = [];
     for (const id of batch) {
       const content = contentMap.get(id);
       if (!content) {
         continue;
       }
-      try {
-        const vec = await this.#embeddingFn(content);
-        entries.push({ id, embedding: vec });
-      } catch {
-        // 单条失败不阻塞
+      const result = await readMemoryValue(
+        (signal) => embeddingFn(content, { abortSignal: signal }),
+        { ...options, deadlineAt }
+      );
+      if (result.status === 'ok' && isMemoryVector(result.value)) {
+        entries.push({ id, embedding: result.value, content });
+      } else {
+        reportMemoryRead(options, {
+          phase: 'backfill',
+          status: result.status === 'ok' ? 'invalid' : result.status,
+          reason: 'embedding-not-written',
+        });
+        if (result.status === 'aborted') {
+          return 0;
+        }
+        if (result.status === 'timeout') {
+          break;
+        }
       }
     }
 
@@ -343,7 +409,28 @@ export class MemoryRetriever {
       return 0;
     }
 
-    return this.#embeddingStore.batchSet(entries);
+    if (options.abortSignal?.aborted) {
+      return 0;
+    }
+    // 最后一次 await 后重新核对整个批次；早先成功的内容也可能已被后续操作修改。
+    const currentEntries = entries.filter((entry) => {
+      const current = this.#store.get(entry.id);
+      const valid =
+        current?.content === entry.content &&
+        (!current.expiresAt || new Date(current.expiresAt).getTime() > Date.now());
+      if (!valid) {
+        reportMemoryRead(options, {
+          phase: 'backfill',
+          status: 'stale',
+          reason: 'source-changed-before-write',
+        });
+      }
+      return valid;
+    });
+    if (options.abortSignal?.aborted) {
+      return 0;
+    }
+    return this.#embeddingStore.batchSet(currentEntries);
   }
 
   /**
@@ -352,19 +439,36 @@ export class MemoryRetriever {
    * @param content 记忆内容
    * @returns 相似度分数 或 null
    */
-  async computeEmbeddingRelevance(query: string, content: string): Promise<number | null> {
+  async computeEmbeddingRelevance(
+    query: string,
+    content: string,
+    options: MemoryReadOptions = {}
+  ): Promise<number | null> {
     if (!this.#embeddingFn) {
       return null;
     }
-    try {
-      const [queryVec, contentVec] = await Promise.all([
-        this.#embeddingFn(query),
-        this.#embeddingFn(content),
-      ]);
-      return cosineSimilarity(queryVec, contentVec);
-    } catch {
-      return null;
+    const embeddingFn = this.#embeddingFn;
+    const result = await readMemoryValue(
+      (signal) =>
+        Promise.all([
+          embeddingFn(query, { abortSignal: signal }),
+          embeddingFn(content, { abortSignal: signal }),
+        ]),
+      options
+    );
+    if (
+      result.status === 'ok' &&
+      isMemoryVector(result.value[0]) &&
+      isMemoryVector(result.value[1], result.value[0].length)
+    ) {
+      return cosineSimilarity(result.value[0], result.value[1]);
     }
+    reportMemoryRead(options, {
+      phase: 'embedding',
+      status: result.status === 'ok' ? 'invalid' : result.status,
+      reason: 'similarity-unavailable',
+    });
+    return null;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -378,7 +482,7 @@ export class MemoryRetriever {
    * 无效/缺失时间戳 → 显式 return ''（unknown-age 不标注，不把 NaN 当"很旧"，不抛错）。
    */
   static #stalenessPrefix(m: DeserializedMemory, now: number): string {
-    const stamp = m.updatedAt || m.lastAccessedAt || m.updatedAt; // 优先 updatedAt，空才看 lastAccessedAt
+    const stamp = m.updatedAt || m.lastAccessedAt; // 优先 updatedAt，空才看 lastAccessedAt
     const ts = stamp ? new Date(stamp).getTime() : Number.NaN;
     if (Number.isNaN(ts)) {
       return ''; // unknown-age：不标注

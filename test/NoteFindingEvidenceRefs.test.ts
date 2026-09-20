@@ -4,18 +4,16 @@
  * 旧 evidence 自由文本迁移拒绝、无台账场景降级直存（显式 unverified 标注）、
  * refs 流转 scratchpad→distill 投影。
  */
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 type MemoryHandlerCtx = Parameters<typeof handleMemory>[2];
 
 function makeLedger() {
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-refs-'));
+  const dataRoot = createTempProject('evidence-refs-');
   return new EvidenceLedgerStore({
     dataRoot,
     jobId: 'job_1',

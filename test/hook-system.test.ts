@@ -1,8 +1,37 @@
 import { describe, expect, it } from 'vitest';
 
-import { HookSystem } from '../src/agent/runtime/index.js';
+import { AgentEventBus, HookSystem } from '../src/agent/runtime/index.js';
+
+describe('AgentEventBus request/reply', () => {
+  it('times out when nobody replies instead of accepting its own request', async () => {
+    const bus = new AgentEventBus();
+    await expect(bus.request('request', {}, { timeout: 5 })).rejects.toThrow(/timeout/);
+    expect(bus.getStats().pendingReplies).toBe(0);
+  });
+  it('resolves only a matching reply event', async () => {
+    const bus = new AgentEventBus();
+    bus.subscribe('request', (event) => {
+      bus.publish('response', { value: 'answer' }, { correlationId: String(event.correlationId) });
+    });
+    await expect(bus.request('request', {}, { timeout: 100 })).resolves.toMatchObject({
+      type: 'response',
+      payload: { value: 'answer' },
+    });
+  });
+});
 
 describe('HookSystem diagnostics', () => {
+  it('captures asynchronous observer rejection from synchronous dispatch', async () => {
+    const hooks = new HookSystem();
+    hooks.on('agent:iteration:after', async () => {
+      throw new Error('async observer failed');
+    });
+    hooks.emitSync('agent:iteration:after', { iteration: 1, hadToolCalls: false, hadText: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(hooks.getDiagnostics().hookErrors).toEqual([
+      expect.objectContaining({ message: 'async observer failed' }),
+    ]);
+  });
   it('surfaces synchronous hook errors as stable diagnostics', () => {
     const hooks = new HookSystem();
     const processEvent = { metadata: {} };

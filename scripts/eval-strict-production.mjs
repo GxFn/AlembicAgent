@@ -93,6 +93,12 @@ const reportSemantic = {
   schemaVersion: 1,
   kind: 'StrictProductionEvaluationReport',
   executionMode: 'frozen/mock-no-network-no-key',
+  evidenceScope: {
+    calibration: 'synthetic-perfect-agreement-fixture; not a human calibration sample',
+    stageOrder: 'declared contract sequence; not an observed AgentRuntime execution trace',
+    runtimeIntegration:
+      'validated separately by strict connected consumer probes and pipeline tests',
+  },
   providerIdentity,
   reviewerIdentity,
   identityHashes: {

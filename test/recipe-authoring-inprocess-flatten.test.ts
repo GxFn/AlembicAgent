@@ -15,10 +15,12 @@
  *     resolver 下，host-agent 路径与 in-process 路径的 validateAgainst 裁决逐字节一致（path 标签
  *     不得改变裁决）。
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  isSoftAuthoringViolation as coreSoftViolation,
+  applyStyleWaiver as coreStyleWaiver,
   type RecipeAuthoringProfile,
   type RecipeAuthoringViolation,
   renderGuidance,
@@ -31,6 +33,10 @@ import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
+import {
+  applyStyleWaiver,
+  isSoftAuthoringViolation,
+} from '../src/tools/runtime/handlers/knowledge.js';
 import {
   createInProcessSourceRefResolver,
   formatRecipeAuthoringViolations,
@@ -542,4 +548,136 @@ describe('冷启动候选拒绝修复：copy-ready 证据 → cold-start 门禁�
       expect(PRODUCER_SYSTEM_PROMPT).toContain(code);
     }
   });
+});
+
+it('rejects source references whose symlink escapes the project root', () => {
+  const inner = path.join(projectRoot, 'inner');
+  mkdirSync(inner);
+  symlinkSync(path.join(projectRoot, 'src/alpha.ts'), path.join(inner, 'alias.ts'));
+  const result = createInProcessSourceRefResolver()({
+    projectRoot: inner,
+    sourcePath: 'alias.ts',
+    startLine: 1,
+    endLine: 2,
+    sourceRef: 'alias.ts:1-2',
+    itemIndex: 0,
+    title: 'scope',
+  });
+  expect(result).toMatchObject({ violation: { code: 'SOURCE_REF_INVALID' } });
+});
+
+/**
+ * Direct Core validateAgainst call mirroring exactly what the wrapper composes internally:
+ * single item, stage:'all', path:'in-process', the SAME fs resolver factory + projectRoot, and the
+ * profile + dimensionId the wrapper would resolve/pass. The wrapper must return THIS, unmutated.
+ */
+function directCoreVerdict(
+  item: Record<string, unknown>,
+  profile: RecipeAuthoringProfile,
+  dimensionId?: string
+): RecipeAuthoringViolation[] {
+  return validateAgainst([item], {
+    stage: 'all',
+    path: 'in-process',
+    profile,
+    sourceRefResolver: createInProcessSourceRefResolver(),
+    projectRoot,
+    dimensionId,
+  });
+}
+
+/**
+ * Fixture corpus (no dimensionId → the wrapper resolves opportunistic). Mixes a gate-clean candidate
+ * with stage-1 / stage-2 / stage-3 / fs-port (NOT_FOUND, LINE_OUT_OF_RANGE) violations so the parity
+ * assertion is exercised across pass AND fail and through the injected fs resolver.
+ */
+function fixtureCorpus(): Array<Record<string, unknown>> {
+  // 与同文件的门禁/提示测试共享真实源码和 clean candidate；保留 wrapper 的独立对照。
+  const clean = cleanRecipe();
+
+  return [
+    // 0: gate-clean → zero violations (tie must hold on the pass path).
+    clean,
+    // 1: stage-1 content — non-imperative doClause + missing dontClause + no ✅/❌ contrast.
+    {
+      ...clean,
+      doClause: 'Persist the alpha mapping for compatibility reasons.',
+      dontClause: undefined,
+      content: {
+        markdown: `Alpha module guidance without any contrast marker (来源: src/alpha.ts:1). ${'pad '.repeat(50)}`,
+        rationale: '单向 import 保持分层边界清晰，避免成环，便于独立测试与未来替换实现。',
+      },
+    },
+    // 2: stage-2 cheap grounding — bare source ref (no line range).
+    {
+      ...clean,
+      sourceRefs: ['src/alpha.ts'],
+      reasoning: { sources: ['src/alpha.ts'], confidence: 0.8 },
+    },
+    // 3: fs port — source ref file does not exist (SOURCE_REF_NOT_FOUND).
+    {
+      ...clean,
+      sourceRefs: ['src/missing.ts:1-3'],
+      reasoning: { sources: ['src/missing.ts:1-3'], confidence: 0.8 },
+    },
+    // 4: fs port — line range outside the file (SOURCE_REF_LINE_OUT_OF_RANGE).
+    {
+      ...clean,
+      sourceRefs: ['src/alpha.ts:1-999'],
+      reasoning: { sources: ['src/alpha.ts:1-999'], confidence: 0.8 },
+    },
+  ];
+}
+
+describe('P4 in-process wrapper parity — runInProcessRecipeAuthoringGate == direct Core validateAgainst', () => {
+  it('opportunistic: wrapper verdict is byte-identical to direct Core validateAgainst (per item, full corpus)', () => {
+    const corpus = fixtureCorpus();
+    let totalViolations = 0;
+    let cleanItems = 0;
+
+    for (const item of corpus) {
+      // wrapper resolves opportunistic for a dimensionless item and returns Core's verdict unmutated.
+      const wrapperVerdict = runInProcessRecipeAuthoringGate(item, { projectRoot });
+      const coreVerdict = directCoreVerdict(item, 'opportunistic', undefined);
+      expect(wrapperVerdict).toEqual(coreVerdict);
+
+      totalViolations += wrapperVerdict.length;
+      if (wrapperVerdict.length === 0) {
+        cleanItems += 1;
+      }
+    }
+
+    // Non-vacuous tie: the tripwire must cover both a passing item and real violations.
+    expect(totalViolations).toBeGreaterThan(0);
+    expect(cleanItems).toBeGreaterThan(0);
+  });
+
+  it('the wrapper actually selects the opportunistic profile (dimensionless) — it never silently runs cold-start', () => {
+    // 反平凡：opportunistic 与 cold-start 在含单文件 rule 候选时裁决不同（cold-start 多出 3-file 证据
+    // 下限）。包装器无 dimensionId 时必须等于 opportunistic、不等于 cold-start。
+    const singleFileItem = {
+      ...fixtureCorpus()[0],
+      sourceRefs: ['src/alpha.ts:1-3'],
+      reasoning: { sources: ['src/alpha.ts:1-3'], confidence: 0.8 },
+    };
+    const wrapperVerdict = runInProcessRecipeAuthoringGate(singleFileItem, { projectRoot });
+    expect(wrapperVerdict).toEqual(directCoreVerdict(singleFileItem, 'opportunistic', undefined));
+    expect(wrapperVerdict).not.toEqual(directCoreVerdict(singleFileItem, 'cold-start', undefined));
+  });
+
+  it('cold-start (dimension-bearing): wrapper verdict equals direct Core validateAgainst with the cold-start profile', () => {
+    // 携带 dimensionId 时包装器解析为 cold-start，仍是 Core validateAgainst 的忠实透传（含 3-file
+    // 证据下限），证明 profile-resolution 分支也不改写裁决。
+    const dimensionId = 'architecture';
+    for (const item of fixtureCorpus()) {
+      const wrapperVerdict = runInProcessRecipeAuthoringGate(item, { projectRoot, dimensionId });
+      const coreVerdict = directCoreVerdict(item, 'cold-start', dimensionId);
+      expect(wrapperVerdict).toEqual(coreVerdict);
+    }
+  });
+});
+
+it('reuses the Core style waiver authority without a second rule implementation', () => {
+  expect(applyStyleWaiver).toBe(coreStyleWaiver);
+  expect(isSoftAuthoringViolation).toBe(coreSoftViolation);
 });

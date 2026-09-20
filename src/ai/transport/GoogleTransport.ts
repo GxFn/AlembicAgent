@@ -99,6 +99,14 @@ export class GoogleTransport extends LLMTransport {
       body.systemInstruction = { parts: [{ text: request.systemPrompt }] };
     }
 
+    if (request.responseFormat === 'json') {
+      const config = body.generationConfig as Record<string, unknown>;
+      config.responseMimeType = 'application/json';
+      if (request.schema) {
+        config.responseSchema = this.#sanitizeSchema(request.schema);
+      }
+    }
+
     const url = `${this.baseUrl}/models/${request.model}:generateContent?key=${this.apiKey}`;
     const data = await this.post(url, body, {}, request.abortSignal);
 

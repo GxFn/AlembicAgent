@@ -6,7 +6,6 @@
  * producer 提示词含 evidenceRefs 指引。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
@@ -15,11 +14,12 @@ import {
   expandEvidenceRefsForSubmit,
 } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 /** 建一个真实临时项目：源文件 + 与其行区间严格一致的台账条目 */
 function makeProject() {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'expansion-proj-'));
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'expansion-data-'));
+  const projectRoot = createTempProject('expansion-proj-');
+  const dataRoot = createTempProject('expansion-data-');
   fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
   const fileLines = ['L1', 'L2', 'const x = 1;', 'const y = 2;', 'L5'];
   fs.writeFileSync(path.join(projectRoot, 'lib/a.ts'), fileLines.join('\n'), 'utf8');

@@ -4,7 +4,7 @@
   "typeOnlyImportsExempt": true,
   "typeOnlyNote": "import type / export type imports are type bridges and do not create runtime coupling; runtime imports must follow allowedRuntimeImports.",
   "layerRationale": [
-    "Base leaves (import nothing cross-area): shared (vendor-neutral helpers: structuredOutput, language service), ai (provider adapters, transports, registry, gateway — consumes shared code only via its own copies and @alembic/core externally), types (ambient .d.ts declarations only; no runtime edges by construction since the lint scans no .d.ts).",
+    "Base leaves: shared (vendor-neutral helpers: structuredOutput, serialization, path and token utilities) and types (ambient declarations). AI provider adapters, transports, registry and gateway may consume shared helpers. The 2026-09-18 repository review consolidated JSON extraction into shared; ai/shared/structuredOutput remains a compatibility re-export. AI still imports neither agent nor tools.",
     "Mid: tools (generic tool system: contracts, catalog, router, capabilities, terminal) sits over shared and imports nothing from agent. The Capability base contract lives in the tools leaf (tools/runtime/toolsets/Capability.ts) so capabilities subclass downward — the former agent<->tools cycle was resolved 2026-06-19 (AAO6).",
     "Top: agent (runtime, service, memory, context, prompts, profiles, tasks, policies, coordination, strategies, runs, capabilities) orchestrates and consumes ai, tools, and shared.",
     "root (src/index.ts) is the package facade composition entry with a wildcard: it re-exports agent, ai, and tools wholesale (the post-IC3 public surface).",
@@ -13,7 +13,7 @@
   "areas": ["agent", "ai", "root", "shared", "tools", "types"],
   "allowedRuntimeImports": {
     "agent": ["ai", "shared", "tools"],
-    "ai": [],
+    "ai": ["shared"],
     "root": ["*"],
     "shared": [],
     "tools": ["shared"],

@@ -729,7 +729,10 @@ export class EvidenceCollector {
 
   /** 检测错误字符串 */
   #isErrorString(str: string) {
-    return /not found|error|不存在|无法|failed/i.test(str);
+    // 错误处理代码本身也包含 Error/failed；只识别工具错误前缀，不在源码正文找关键字。
+    return /^\s*(?:error\s*:|tool execution error\b|cannot (?:read|search|list)\b|file not found\b|access denied\b|search failed\b|无法读取|文件不存在)/i.test(
+      str
+    );
   }
 
   /** 从搜索参数中提取搜索模式 */

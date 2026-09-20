@@ -19,7 +19,7 @@
 //   substrings (storage keys, area names, prose) are never touched — semantic
 //   rows such as file-stem-derived config keys are a documented manual pass.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -31,13 +31,20 @@ if (mapFlagIndex === -1 || !process.argv[mapFlagIndex + 1]) {
   console.error('usage: node scripts/codemod-rename.mjs --map <renames.json> [--apply]');
   process.exit(1);
 }
-const renames = JSON.parse(
-  readFileSync(path.resolve(root, process.argv[mapFlagIndex + 1]), 'utf8')
-);
+const mapPath = path.resolve(root, process.argv[mapFlagIndex + 1]);
+const renames = JSON.parse(readFileSync(mapPath, 'utf8'));
 
 const CODE_EXTENSIONS = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
 const TEXT_SCAN_EXTENSIONS = /\.(ts|tsx|js|jsx|mjs|cjs|json|md|html)$/;
-const SCAN_DIR_EXCLUDES = new Set(['.git', 'node_modules', 'dist', '.vite']);
+const SCAN_DIR_EXCLUDES = new Set([
+  '.git',
+  'node_modules',
+  'dist',
+  '.vite',
+  'tmp',
+  'coverage',
+  'test-reports',
+]);
 
 function caseSensitiveExists(repoRelative) {
   const absolute = path.join(root, repoRelative);
@@ -66,7 +73,18 @@ function walk(dir, files = []) {
 // ── validate the rename map ──
 const errors = [];
 for (const { from, to } of renames) {
-  if (!from || !to || from === to) {
+  if (
+    !from ||
+    !to ||
+    from === to ||
+    [from, to].some((value) => {
+      if (typeof value !== 'string' || path.isAbsolute(value)) {
+        return true;
+      }
+      const relative = path.relative(root, path.resolve(root, value));
+      return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    })
+  ) {
     errors.push(`invalid pair ${from} -> ${to}`);
   } else {
     if (!caseSensitiveExists(from)) {
@@ -152,7 +170,7 @@ function addPlan(filePath, plan) {
   filePlans.get(filePath).push(plan);
 }
 
-const allFiles = walk(root);
+const allFiles = walk(root).filter((filePath) => filePath !== mapPath);
 for (const filePath of allFiles.filter((file) => CODE_EXTENSIONS.test(file))) {
   const text = readFileSync(filePath, 'utf8');
   for (const match of text.matchAll(SPECIFIER_RE)) {
@@ -162,12 +180,13 @@ for (const filePath of allFiles.filter((file) => CODE_EXTENSIONS.test(file))) {
       continue;
     }
     const renamed = fromByAbsolute.get(resolution.resolved);
-    if (!renamed) {
+    const renamedImporter = fromByAbsolute.get(filePath);
+    if (!renamed && !renamedImporter) {
       continue;
     }
     const newSpecifier = toSpecifier(
-      path.dirname(filePath),
-      path.join(root, renamed.to),
+      path.dirname(renamedImporter ? path.join(root, renamedImporter.to) : filePath),
+      renamed ? path.join(root, renamed.to) : resolution.resolved,
       resolution.suffix
     );
     if (newSpecifier !== specifier) {
@@ -196,9 +215,13 @@ for (const filePath of allFiles.filter((file) => TEXT_SCAN_EXTENSIONS.test(file)
   }
 }
 for (const [filePath, plans] of [...filePlans.entries()].sort()) {
-  const _relative = path.relative(root, filePath).replaceAll(path.sep, '/');
-  for (const _plan of plans) {
+  const relative = path.relative(root, filePath).replaceAll(path.sep, '/');
+  for (const plan of plans) {
+    process.stdout.write(`${relative}: ${plan.kind}: ${plan.before} -> ${plan.after}\n`);
   }
+}
+for (const { from, to } of renames) {
+  process.stdout.write(`rename: ${from} -> ${to}\n`);
 }
 if (!apply) {
   process.exit(0);
@@ -206,20 +229,40 @@ if (!apply) {
 
 // ── apply: git mv first, then rewrites ──
 for (const { from, to } of renames) {
+  mkdirSync(path.dirname(path.join(root, to)), { recursive: true });
   execFileSync('git', ['mv', from, to], { cwd: root, stdio: 'inherit' });
 }
 for (const [filePath, plans] of filePlans.entries()) {
   const renamedSelf = fromByAbsolute.get(filePath);
   const targetPath = renamedSelf ? path.join(root, renamedSelf.to) : filePath;
-  let text = readFileSync(targetPath, 'utf8');
-  for (const plan of plans) {
-    if (plan.kind === 'specifier') {
-      text = text
-        .replaceAll(`'${plan.before}'`, `'${plan.after}'`)
-        .replaceAll(`"${plan.before}"`, `"${plan.after}"`);
-    } else {
-      text = text.replaceAll(plan.before, plan.after);
+  const original = readFileSync(targetPath, 'utf8');
+  const edits = [];
+  const specifiers = new Map(
+    plans.filter((plan) => plan.kind === 'specifier').map((plan) => [plan.before, plan.after])
+  );
+  for (const match of original.matchAll(SPECIFIER_RE)) {
+    const replacement = specifiers.get(match[3]);
+    if (replacement !== undefined) {
+      const start = match.index + match[1].length + match[2].length;
+      edits.push({ start, end: start + match[3].length, replacement });
     }
+  }
+  // 所有替换基于原文坐标；长路径优先，避免扩展名/无扩展名和导入替换互相级联。
+  for (const plan of plans
+    .filter((item) => item.kind === 'path-string')
+    .sort((a, b) => b.before.length - a.before.length)) {
+    let start = original.indexOf(plan.before);
+    while (start >= 0) {
+      const end = start + plan.before.length;
+      if (!edits.some((edit) => start < edit.end && end > edit.start)) {
+        edits.push({ start, end, replacement: plan.after });
+      }
+      start = original.indexOf(plan.before, end);
+    }
+  }
+  let text = original;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) {
+    text = text.slice(0, edit.start) + edit.replacement + text.slice(edit.end);
   }
   writeFileSync(targetPath, text);
 }

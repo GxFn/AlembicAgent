@@ -11,7 +11,7 @@
  *
  * 新增能力 (vs 原模块):
  *   - getDistilledForProducer(dimId): Producer 专用蒸馏上下文 (B2 fix)
- *   - NON_CACHEABLE 内置: 副作用工具自动排除 (B3 fix)
+ *   - 仅缓存 code.read/search，副作用工具不能进入缓存 (B3 fix)
  *   - buildContextForDimension 增强: 消费 workingMemoryDistilled (B1 fix, 已在 EpisodicMemory 修复)
  *   - 统一的 getStats(): 合并维度 + 缓存统计
  *
@@ -27,19 +27,12 @@ import type { Disposable } from '@alembic/core/events';
 import { timerRegistry } from '@alembic/core/events';
 import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
+import { stableStringify } from '#shared/serialization.js';
+import { truncateToTokenBudget } from '#shared/tokenUtils.js';
 import type { SessionStoreSerialized } from './SessionStoreSchema.js';
 import { validateSessionStoreShape } from './SessionStoreSchema.js';
 
 // ── 类型定义 ──
-
-/** 副作用工具 — 不缓存结果 (B3 fix) */
-const NON_CACHEABLE = new Set([
-  'knowledge',
-  'memory',
-  'note_finding',
-  'get_previous_analysis',
-  'get_previous_evidence',
-]);
 
 /** 缓存上限：Agent runtime 自有策略，避免消费 Core shared/constants 内部路径。 */
 const SESSION_CACHE_DEFAULTS = Object.freeze({
@@ -141,12 +134,6 @@ interface SearchCacheEntry {
   hitCount: number;
 }
 
-interface FileCacheEntry {
-  content: string;
-  cachedAt: number;
-  hitCount: number;
-}
-
 /** SessionStore 构造选项 */
 export interface SessionStoreConfig {
   projectContext?: Record<string, unknown>;
@@ -181,7 +168,7 @@ export class SessionStore implements Disposable {
 
   // ── 子系统 2: ReadOnlyCache (from ToolResultCache) ──
   #searchCache = new Map<string, SearchCacheEntry>();
-  #fileCache = new Map<string, FileCacheEntry>();
+  #fileCache = new Map<string, SearchCacheEntry>();
   /** } */
   #cacheStats = { hits: 0, misses: 0, evictions: 0 };
   #ttlMs;
@@ -447,19 +434,51 @@ export class SessionStore implements Disposable {
       focusKeywords = focusKeywordsOrOpts;
     } else if (typeof focusKeywordsOrOpts === 'object') {
       focusKeywords = focusKeywordsOrOpts.focusKeywords || [];
-      tokenBudget = focusKeywordsOrOpts.tokenBudget || Infinity;
+      tokenBudget = focusKeywordsOrOpts.tokenBudget ?? Infinity;
     }
 
     const parts: string[] = [];
     const completedDims = [...this.#dimensionReports.entries()].filter(
       ([id]) => id !== currentDimId
     );
+    const keywords = focusKeywords.map((word) => word.trim().toLowerCase()).filter(Boolean);
+    if (keywords.length > 0) {
+      const scores = new Map(
+        completedDims.map(([id, report]) => {
+          const findings =
+            report.findings.length > 0
+              ? report.findings
+              : report.workingMemoryDistilled?.keyFindings || [];
+          const text = [
+            id,
+            report.digest?.summary,
+            report.analysisText,
+            ...findings.map((finding) => finding.finding),
+            ...report.referencedFiles,
+          ]
+            .join(' ')
+            .toLowerCase();
+          return [id, keywords.filter((word) => text.includes(word)).length] as const;
+        })
+      );
+      // 同分保持历史顺序；优先投影当前任务相关维度，再由已有 evidence 工具补细节。
+      completedDims.sort(([a], [b]) => (scores.get(b) ?? 0) - (scores.get(a) ?? 0));
+    }
 
     if (completedDims.length === 0 && this.#tierReflections.length === 0) {
       return '';
     }
 
     parts.push('## 前序维度分析成果（避免重复探索）');
+    if (completedDims.length > 0) {
+      parts.push(
+        `前序维度索引: ${completedDims
+          .slice(0, 5)
+          .map(([id]) => id)
+          .join(', ')}${completedDims.length > 5 ? ` (+${completedDims.length - 5})` : ''}`
+      );
+      parts.push('详细来源可用 memory.get_previous_evidence 按关键词检索。');
+    }
 
     // §1: 前序维度的关键发现
     for (const [dimId, report] of completedDims) {
@@ -527,16 +546,11 @@ export class SessionStore implements Disposable {
     }
 
     // Token 预算裁剪
-    let result = parts.join('\n');
-    if (tokenBudget < Infinity) {
-      const estimatedTokens = Math.ceil(result.length / 4);
-      if (estimatedTokens > tokenBudget) {
-        // 粗略裁剪
-        const maxChars = tokenBudget * 4;
-        result = `${result.substring(0, maxChars)}\n…(truncated due to budget)`;
-      }
+    const text = parts.join('\n');
+    const result = truncateToTokenBudget(text, tokenBudget);
+    if (result !== text) {
+      this.#logger.debug(`[SessionStore] context truncated to ${tokenBudget} estimated tokens`);
     }
-
     return result;
   }
 
@@ -587,86 +601,71 @@ export class SessionStore implements Disposable {
   // §8: 只读缓存 (from ToolResultCache, B3 fix)
   // ═══════════════════════════════════════════════════════
 
-  /** 获取缓存的工具结果 */
+  /** 只复用同一完整请求；路径、范围和搜索选项都参与缓存键。 */
   getCachedResult(toolName: string, args: ToolArgs): unknown | null {
-    if (NON_CACHEABLE.has(toolName)) {
+    if (toolName !== 'code') {
       return null;
     }
-
-    if (toolName === 'code' && args?.action === 'search') {
-      const pattern = args?.pattern || '';
-      if (pattern) {
-        const entry = this.#searchCache.get(pattern as string);
-        if (entry) {
-          if (this.#ttlMs > 0 && Date.now() - entry.cachedAt > this.#ttlMs) {
-            this.#searchCache.delete(pattern as string);
-            this.#cacheStats.evictions++;
-            this.#cacheStats.misses++;
-            return null;
-          }
-          entry.hitCount++;
-          this.#cacheStats.hits++;
-          return entry.result;
-        }
-      }
-    }
-    if (toolName === 'code' && args?.action === 'read') {
-      const filePath = args?.filePath || '';
-      if (filePath) {
-        const entry = this.#fileCache.get(filePath);
-        if (entry) {
-          if (this.#ttlMs > 0 && Date.now() - entry.cachedAt > this.#ttlMs) {
-            this.#fileCache.delete(filePath);
-            this.#cacheStats.evictions++;
-            this.#cacheStats.misses++;
-            return null;
-          }
-          entry.hitCount++;
-          this.#cacheStats.hits++;
-          return { content: entry.content, path: filePath, cached: true };
-        }
+    const params = normalizeCacheArgs(args);
+    const cache =
+      toolName === 'code' && params.action === 'search'
+        ? this.#searchCache
+        : toolName === 'code' && params.action === 'read'
+          ? this.#fileCache
+          : null;
+    const key = stableStringify(params);
+    const entry = cache?.get(key);
+    if (entry) {
+      if (this.#ttlMs > 0 && Date.now() - entry.cachedAt > this.#ttlMs) {
+        cache?.delete(key);
+        this.#cacheStats.evictions++;
+      } else {
+        entry.hitCount++;
+        this.#cacheStats.hits++;
+        cache?.delete(key);
+        cache?.set(key, entry);
+        return entry.result;
       }
     }
     this.#cacheStats.misses++;
     return null;
   }
 
-  /** 缓存工具结果 (自动排除副作用工具) */
   cacheToolResult(toolName: string, args: ToolArgs, result: unknown) {
-    if (NON_CACHEABLE.has(toolName)) {
+    if (toolName !== 'code') {
       return;
     }
-
-    if (toolName === 'code' && args?.action === 'search') {
-      const pattern = args?.pattern || '';
-      if (pattern) {
-        if (this.#searchCache.size >= MAX_SEARCH_CACHE) {
-          const oldestKey = this.#searchCache.keys().next().value as string | undefined;
-          if (oldestKey) {
-            this.#searchCache.delete(oldestKey);
-          }
-        }
-        this.#searchCache.set(pattern as string, { result, cachedAt: Date.now(), hitCount: 0 });
-      }
+    const params = normalizeCacheArgs(args);
+    const record =
+      result && typeof result === 'object' ? (result as Record<string, unknown>) : null;
+    if (record?.ok === false || record?.error !== undefined) {
+      return;
     }
-    if (toolName === 'code' && args?.action === 'read') {
-      const filePath = args?.filePath || '';
-      const content =
-        typeof result === 'object' && result !== null
-          ? (result as Record<string, unknown>).content
-          : String(result);
-      if (filePath && content) {
-        if (this.#fileCache.size >= MAX_FILE_CACHE) {
-          const oldestKey = this.#fileCache.keys().next().value as string | undefined;
-          if (oldestKey) {
-            this.#fileCache.delete(oldestKey);
-          }
-        }
-        this.#fileCache.set(filePath, {
-          content: String(content),
-          cachedAt: Date.now(),
-          hitCount: 0,
-        });
+    let cache: Map<string, SearchCacheEntry>;
+    let value: unknown;
+    let limit: number;
+    if (params.action === 'search') {
+      cache = this.#searchCache;
+      value = result;
+      limit = MAX_SEARCH_CACHE;
+    } else if (params.action === 'read' && typeof params.path === 'string') {
+      const content = record ? record.content : typeof result === 'string' ? result : null;
+      if (typeof content !== 'string') {
+        return;
+      }
+      cache = this.#fileCache;
+      value = { content, path: params.path, cached: true };
+      limit = MAX_FILE_CACHE;
+    } else {
+      return;
+    }
+    const key = stableStringify(params);
+    cache.delete(key);
+    cache.set(key, { result: value, cachedAt: Date.now(), hitCount: 0 });
+    if (cache.size > limit) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) {
+        cache.delete(oldest);
       }
     }
   }
@@ -689,6 +688,7 @@ export class SessionStore implements Disposable {
     const checkpointDir = path.join(projectRoot, '.asd', 'bootstrap-checkpoint');
     try {
       const data = {
+        ...this.toJSON(),
         version: 2,
         savedAt: Date.now(),
         dimensionReports: Object.fromEntries(
@@ -746,22 +746,14 @@ export class SessionStore implements Disposable {
         return false;
       }
 
-      if (data.dimensionReports) {
-        for (const [dimId, report] of Object.entries(data.dimensionReports)) {
-          this.#dimensionReports.set(dimId, report as DimensionReport);
-        }
+      if (typeof data.savedAt !== 'number' || !Number.isFinite(data.savedAt)) {
+        throw new Error('SessionStore checkpoint savedAt must be finite');
       }
-      if (data.crossReferences) {
-        this.#crossReferences = data.crossReferences;
-      }
-      if (data.tierReflections) {
-        this.#tierReflections = data.tierReflections;
-      }
-      if (data.submittedCandidates) {
-        for (const [dimId, candidates] of Object.entries(data.submittedCandidates)) {
-          this.#submittedCandidates.set(dimId, candidates as CandidateSummary[]);
-        }
-      }
+      const validated = validateSessionStoreShape({
+        ...data,
+        projectContext: data.projectContext ?? this.#projectContext,
+      });
+      this.#restoreSnapshot(validated);
 
       this.#logger.info(`[SessionStore] Checkpoint loaded: ${this.#dimensionReports.size} reports`);
       return true;
@@ -782,6 +774,7 @@ export class SessionStore implements Disposable {
       tierReflections: this.#tierReflections,
       submittedCandidates: Object.fromEntries(this.#submittedCandidates),
       projectContext: this.#projectContext,
+      evidenceStore: Object.fromEntries(this.#evidenceStore),
     };
   }
 
@@ -790,15 +783,34 @@ export class SessionStore implements Disposable {
     const store = new SessionStore({
       projectContext: validated.projectContext,
     });
-    for (const [k, v] of Object.entries(validated.dimensionReports)) {
-      store.#dimensionReports.set(k, v);
-    }
-    store.#crossReferences = validated.crossReferences;
-    store.#tierReflections = validated.tierReflections;
-    for (const [k, v] of Object.entries(validated.submittedCandidates)) {
-      store.#submittedCandidates.set(k, v);
-    }
+    store.#restoreSnapshot(validated);
     return store;
+  }
+
+  /** 验证/克隆已在外部完成；在任何字段替换前构造所有集合，失败不污染当前会话。 */
+  #restoreSnapshot(snapshot: SessionStoreSerialized): void {
+    const evidence: Record<string, Finding[]> = snapshot.evidenceStore ?? Object.create(null);
+    if (snapshot.evidenceStore === undefined) {
+      for (const [dimId, report] of Object.entries(snapshot.dimensionReports)) {
+        for (const finding of report.findings) {
+          if (finding.evidence) {
+            const file = finding.evidence.split(':')[0];
+            (evidence[file] ??= []).push({ ...finding, dimId, timestamp: report.completedAt });
+          }
+        }
+      }
+    }
+    const dimensionReports = new Map(Object.entries(snapshot.dimensionReports));
+    const submittedCandidates = new Map(Object.entries(snapshot.submittedCandidates));
+    const evidenceStore = new Map<string, Finding[]>(Object.entries(evidence));
+    this.#dimensionReports = dimensionReports;
+    this.#submittedCandidates = submittedCandidates;
+    this.#evidenceStore = evidenceStore;
+    this.#crossReferences = snapshot.crossReferences;
+    this.#tierReflections = snapshot.tierReflections;
+    this.#projectContext = snapshot.projectContext;
+    this.#searchCache.clear();
+    this.#fileCache.clear();
   }
 
   // ═══════════════════════════════════════════════════════
@@ -934,3 +946,20 @@ export class SessionStore implements Disposable {
 }
 
 export default SessionStore;
+
+function normalizeCacheArgs(args: ToolArgs): Record<string, unknown> {
+  const { params, ...outer } = args;
+  const normalized = {
+    ...outer,
+    ...(params && typeof params === 'object' && !Array.isArray(params) ? params : {}),
+  } as Record<string, unknown>;
+  // 与路由一致：顶层 action 决定操作，参数不能把副作用操作转换成只读缓存。
+  if (outer.action !== undefined) {
+    normalized.action = outer.action;
+  }
+  if (normalized.path === undefined && typeof normalized.filePath === 'string') {
+    normalized.path = normalized.filePath;
+    delete normalized.filePath;
+  }
+  return normalized;
+}

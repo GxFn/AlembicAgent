@@ -169,6 +169,7 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
 ): ToolResultOrdinaryOutput {
   const forbiddenFields = options.forbiddenFields ?? TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS;
   const sanitized = sanitizeOrdinaryValue(envelope.structuredContent, forbiddenFields);
+  const sanitizedText = sanitizeOrdinaryText(envelope.text, forbiddenFields);
   const failureTaxonomy = options.failureTaxonomy ?? undefined;
   const output: ToolResultOrdinaryOutput = {
     ok: envelope.ok,
@@ -178,7 +179,7 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
     startedAt: envelope.startedAt,
     durationMs: envelope.durationMs,
     status: envelope.status,
-    text: envelope.text,
+    text: sanitizedText.value as string,
     ...(sanitized.value !== undefined ? { structuredContent: sanitized.value } : {}),
     ...(envelope.artifacts?.length
       ? { artifacts: envelope.artifacts.map(projectArtifactRef) }
@@ -191,11 +192,24 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
     ...(failureTaxonomy ? { failureTaxonomy } : {}),
     diagnosticSummary: summarizeToolResultDiagnostics(
       envelope.diagnostics,
-      sanitized.redactedFields
+      uniqueStrings([...sanitized.redactedFields, ...sanitizedText.redactedFields])
     ),
   };
 
   return output;
+}
+
+/** Adapter 的 JSON 文本是同一结果的另一份载体，必须使用与结构化内容相同的字段规则。 */
+function sanitizeOrdinaryText(text: string, forbiddenFields: readonly string[]): SanitizedValue {
+  try {
+    const sanitized = sanitizeOrdinaryValue(JSON.parse(text), forbiddenFields);
+    return {
+      value: sanitized.redactedFields.length > 0 ? JSON.stringify(sanitized.value, null, 2) : text,
+      redactedFields: sanitized.redactedFields,
+    };
+  } catch {
+    return { value: text, redactedFields: [] };
+  }
 }
 
 function summarizeToolResultDiagnostics(

@@ -580,19 +580,31 @@ export class ActiveContext {
     if (this.#scratchpad.length > 0) {
       const sorted = [...this.#scratchpad].sort((a, b) => b.importance - a.importance);
       const scratchLines = ['## 📌 已确认的关键发现'];
+      let scratchTokens = this.#estimateTokens(scratchLines[0]);
+      let omitted = 0;
       for (const f of sorted) {
         const badge = f.importance >= 8 ? '⚠️' : f.importance >= 5 ? '📋' : '💡';
         let line = `- ${badge} [${f.importance}/10] ${f.finding}`;
         if (f.evidence) {
           line += ` (${f.evidence})`;
         }
-        scratchLines.push(line);
+        const tokens = this.#estimateTokens(`\n${line}`);
+        if (scratchTokens + tokens <= remaining) {
+          scratchLines.push(line);
+          scratchTokens += tokens;
+        } else {
+          omitted++;
+        }
       }
       const scratchSection = scratchLines.join('\n');
-      const scratchTokens = this.#estimateTokens(scratchSection);
-      if (scratchTokens <= remaining) {
+      if (scratchLines.length > 1) {
         parts.push(scratchSection);
         remaining -= scratchTokens;
+      }
+      if (omitted > 0) {
+        this.#logger.info(
+          `[ActiveContext] context budget retained ${scratchLines.length - 1} findings and omitted ${omitted}`
+        );
       }
     }
 

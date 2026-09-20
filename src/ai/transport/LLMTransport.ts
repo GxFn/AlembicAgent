@@ -230,8 +230,15 @@ export abstract class LLMTransport {
     headers: Record<string, string>,
     externalSignal?: AbortSignal
   ): Promise<Record<string, unknown>> {
+    if (externalSignal?.aborted) {
+      throw new DOMException('Provider request cancelled before dispatch', 'AbortError');
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeout);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.timeout);
     const onExternalAbort = () => controller.abort();
     externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
@@ -260,6 +267,13 @@ export abstract class LLMTransport {
       }
 
       return (await res.json()) as Record<string, unknown>;
+    } catch (err: unknown) {
+      if (timedOut && !externalSignal?.aborted) {
+        throw Object.assign(new Error(`Provider request timed out after ${this.timeout}ms`), {
+          code: 'ETIMEDOUT',
+        });
+      }
+      throw err instanceof Error ? err : new Error(String(err));
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener('abort', onExternalAbort);

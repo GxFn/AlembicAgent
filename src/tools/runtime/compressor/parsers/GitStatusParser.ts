@@ -6,6 +6,7 @@
 const PORCELAIN_RE = /^([MADRCU?! ]{2})\s+(.+)$/;
 
 interface StatusBuckets {
+  conflicted: string[];
   staged: string[];
   modified: string[];
   untracked: string[];
@@ -15,6 +16,7 @@ interface StatusBuckets {
 
 function parsePorcelain(lines: string[]): StatusBuckets | null {
   const buckets: StatusBuckets = {
+    conflicted: [],
     staged: [],
     modified: [],
     untracked: [],
@@ -32,7 +34,9 @@ function parsePorcelain(lines: string[]): StatusBuckets | null {
     const [idx, wt] = [m[1][0], m[1][1]];
     const file = m[2].trim();
 
-    if (idx === '?') {
+    if (new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']).has(m[1])) {
+      buckets.conflicted.push(file);
+    } else if (idx === '?') {
       buckets.untracked.push(file);
     } else {
       if (idx === 'A') {
@@ -58,6 +62,7 @@ function parsePorcelain(lines: string[]): StatusBuckets | null {
 
 function parseHumanReadable(raw: string): StatusBuckets | null {
   const buckets: StatusBuckets = {
+    conflicted: [],
     staged: [],
     modified: [],
     untracked: [],
@@ -101,6 +106,7 @@ function parseHumanReadable(raw: string): StatusBuckets | null {
 function formatBuckets(buckets: StatusBuckets): string {
   const parts: string[] = [];
   const entries: [string, string[]][] = [
+    ['conflicted', buckets.conflicted],
     ['staged', buckets.staged],
     ['modified', buckets.modified],
     ['deleted', buckets.deleted],

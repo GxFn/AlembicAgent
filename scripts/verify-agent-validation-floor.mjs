@@ -3,6 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
 
 const root = process.cwd();
 const failures = [];
@@ -39,7 +40,30 @@ function countDeclaredTests(testFiles) {
   let count = 0;
   for (const file of testFiles) {
     const source = fs.readFileSync(path.join(root, file), 'utf8');
-    count += source.match(/\b(?:it|test)\s*\(/gu)?.length ?? 0;
+    const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+    const baseName = (expression) => {
+      if (ts.isIdentifier(expression)) {
+        return expression.text;
+      }
+      if (ts.isPropertyAccessExpression(expression) || ts.isCallExpression(expression)) {
+        return baseName(expression.expression);
+      }
+      if (ts.isTaggedTemplateExpression(expression)) {
+        return baseName(expression.tag);
+      }
+      return null;
+    };
+    const visit = (node) => {
+      if (
+        ts.isCallExpression(node) &&
+        ['it', 'test'].includes(baseName(node.expression)) &&
+        !(ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'each')
+      ) {
+        count++;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
   }
   return count;
 }

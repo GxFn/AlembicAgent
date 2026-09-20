@@ -129,6 +129,10 @@ export class DeepSeekTransport extends LLMTransport {
       body.tool_choice = request.toolChoice;
     }
 
+    if (request.responseFormat === 'json') {
+      body.response_format = { type: 'json_object' };
+    }
+
     const data = await this.post(
       `${this.baseUrl}/chat/completions`,
       body,

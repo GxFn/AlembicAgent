@@ -82,12 +82,7 @@ export function measureLlmInputAssembly(
   const toolSchemaText = assembly.tools?.length
     ? formatToolSchemasForMeasurement(assembly.tools)
     : '';
-  const measuredText = [
-    assembly.systemPrompt,
-    providerMessageText,
-    toolSchemaText,
-    ...assembly.sections.map((section) => section.content),
-  ]
+  const measuredText = [assembly.systemPrompt, providerMessageText, toolSchemaText]
     .filter(Boolean)
     .join('\n\n');
   const blocks = collectPromptBlocks(

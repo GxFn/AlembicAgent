@@ -1,3 +1,9 @@
+import {
+  collectSuccessfulEvolutionIds,
+  hasPersistedCandidate,
+  isKnowledgeSubmit,
+  readToolObservation,
+} from '../utils/toolOutcomes.js';
 /**
  * gateEvaluators.ts — PipelineStrategy gate.evaluator 适配器三件
  *
@@ -261,60 +267,7 @@ export function evolutionGateEvaluator(
   const expectedIds = (strategyContext.existingRecipes ?? strategyContext.decayedRecipes ?? []).map(
     (r) => r.id
   );
-  const expectedIdSet = new Set(expectedIds);
-  const toolCalls = source?.toolCalls || [];
-
-  const processedIds = new Set<string>();
-  const markProcessed = (id: unknown) => {
-    if (typeof id !== 'string' || id.length === 0) {
-      return;
-    }
-    if (expectedIdSet.size > 0 && !expectedIdSet.has(id)) {
-      return;
-    }
-    processedIds.add(id);
-  };
-
-  for (const tc of toolCalls) {
-    const tool = tc.tool || tc.name;
-    const args = tc.args || {};
-
-    if (!isSuccessfulEvolutionToolCall(tc)) {
-      continue;
-    }
-
-    // V2: knowledge({ action: "manage", params: { operation: "evolve"|"deprecate"|"skip_evolution", id } })
-    if (tool === 'knowledge') {
-      const params = (args.params as Record<string, unknown>) || args;
-      const action = args.action as string | undefined;
-      const operation = params.operation as string | undefined;
-      const recipeId = (params.id ?? params.recipeId) as string | undefined;
-
-      if (
-        action === 'manage' &&
-        recipeId &&
-        (operation === 'evolve' || operation === 'deprecate' || operation === 'skip_evolution')
-      ) {
-        markProcessed(recipeId);
-      }
-      // V2: knowledge.submit with supersedes
-      const supersedes = args.supersedes || params.supersedes;
-      if ((action === 'submit' || supersedes) && supersedes) {
-        markProcessed(supersedes);
-      }
-    }
-
-    // V1 compat: standalone tool names
-    if (tool === 'propose_evolution' && args.recipeId) {
-      markProcessed(args.recipeId);
-    }
-    if (tool === 'confirm_deprecation' && args.recipeId) {
-      markProcessed(args.recipeId);
-    }
-    if (tool === 'skip_evolution' && args.recipeId) {
-      markProcessed(args.recipeId);
-    }
-  }
+  const processedIds = collectSuccessfulEvolutionIds(source?.toolCalls || [], expectedIds);
 
   const processed = processedIds.size;
   const pendingIds = expectedIds.filter((id) => !processedIds.has(id));
@@ -333,31 +286,14 @@ export function evolutionGateEvaluator(
   };
 }
 
-function isSuccessfulEvolutionToolCall(tc: EvolutionToolCallRecord): boolean {
-  if (tc.envelope?.ok === false) {
-    return false;
-  }
-  const result = tc.result as Record<string, unknown> | undefined;
-  if (result && typeof result === 'object' && typeof result.error === 'string') {
-    return false;
-  }
-  return true;
-}
-
 // ──────────────────────────────────────────────────────────────────
 // Producer Rejection Gate Evaluator — 拒绝率门控
 // ──────────────────────────────────────────────────────────────────
 
 /** reactLoop 返回值 (门控评估用) */
 interface ReactLoopResult {
-  toolCalls?: ToolCallRecord[];
-}
-
-/** 工具调用记录 */
-interface ToolCallRecord {
-  tool?: string;
-  name?: string;
-  result?: string | { status?: string; reason?: string };
+  /** 外部工具观察统一交给 readToolObservation 验证，不再维护过时的局部结果壳。 */
+  toolCalls?: readonly unknown[];
 }
 
 /** 门控策略上下文 */
@@ -383,24 +319,13 @@ export function producerRejectionGateEvaluator(
     return { action: 'pass', reason: '' };
   }
 
-  // 可配置的提交工具名 — V2 统一为 knowledge，scan 用 knowledge
-  const submitToolNames = _strategyContext.submitToolNames || ['knowledge'];
-  const submitCalls = (source.toolCalls || []).filter((tc: ToolCallRecord) =>
-    submitToolNames.includes(tc.tool || tc.name || '')
-  );
-  const rejected = submitCalls.filter((tc: ToolCallRecord) => {
-    const res = tc.result;
-    if (!res) {
-      return false;
-    }
-    if (typeof res === 'string') {
-      return res.includes('rejected') || res.includes('error');
-    }
-    return (
-      res.status === 'rejected' || res.status === 'error' || res.reason === 'validation_failed'
-    );
-  }).length;
-  const success = submitCalls.length - rejected;
+  const names = _strategyContext.submitToolNames ?? ['knowledge'];
+  const submitCalls = (source.toolCalls || []).filter((call) => {
+    const { tool } = readToolObservation(call);
+    return names.includes(tool) && (tool !== 'knowledge' || isKnowledgeSubmit(call));
+  });
+  const success = submitCalls.filter(hasPersistedCandidate).length;
+  const rejected = submitCalls.length - success;
 
   if (rejected > success && rejected >= 2) {
     return { action: 'retry', reason: `${rejected} rejections vs ${success} successes` };

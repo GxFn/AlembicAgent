@@ -25,7 +25,6 @@ import {
   DEPTH_DIMENSIONS,
   type DepthReviewResult,
   DIMENSION_COMPLETION_FLOOR,
-  RELATIONSHIP_CN_RE,
   reviewRecipeDepth,
 } from '@alembic/core/knowledge';
 import type { EvidenceCollectorResult } from '../evidence/EvidenceCollector.js';
@@ -412,13 +411,3 @@ export function applyDepthRetryGate(
   }
   return baseGate;
 }
-
-/**
- * C-7(2026-07-02 统一重构)：关系词表改为 Core 单源导出——此前是「本地同形副本」，
- * Core 收窄词表(20dae5e)时必须手动同步；现在 graph-retry 判定与 submit 门禁共用同一 RegExp。
- */
-const GRAPH_RELATIONSHIP_CN_RE = RELATIONSHIP_CN_RE;
-
-/** graph-retry 的 reason（buildRetryPrompt 会把它呈给 Analyst 作为重挖指令） */
-const GRAPH_GAP_REASON =
-  'Relationship claims lack graph backing: run ONE graph({ action: "query" }) on the core classes/modules you already identified, then re-summarize. Do not add new topics.';

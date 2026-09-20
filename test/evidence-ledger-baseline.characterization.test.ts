@@ -7,10 +7,9 @@
  *   2) produce 工具面无任何 code/evidence 读取能力 —— 候选被拒后无自救通道（E4 后扩 evidence.get/search）；
  *   3) RECORD 配额公式 = max(3, ceil(evidenceToolCallCount/2)) —— 与真实证据支撑量脱钩（E4 改绑台账）；
  *   4) analyst 五相序列 —— VERIFY 相已存在但无台账审计契约（Wave C 强化）；
- *   5) 真机 baseline 数据冻结 —— E6 与 U-2 的唯一对照基准。
+ * 历史 baseline JSON 保留作人工对照资料，不以断言自身常量计为产品回归覆盖。
  * 断言全部落在可导出 seam（ActiveContext / GenerateProduce / ExplorationStrategies），不触内部私有实现。
  */
-import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import {
   STRATEGY_ANALYST,
@@ -18,14 +17,6 @@ import {
 } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
-
-const baseline = JSON.parse(
-  readFileSync(new URL('./fixtures/coldstart-baseline-2026-07-04.json', import.meta.url), 'utf8')
-) as {
-  tsJsModule: { submitted: number; accepted: number };
-  architecture: { submitted: number; accepted: number };
-  cacheHitRatio: number;
-};
 
 describe('E0 冷启动证据保真基线表征', () => {
   test('1) ActiveContext 存储层保持宽容（引用校验已上移 memory handler——E3 反转见 NoteFindingEvidenceRefs 测试）', () => {
@@ -51,11 +42,5 @@ describe('E0 冷启动证据保真基线表征', () => {
 
   test('4) analyst 五相序列（VERIFY 相存在，现状无台账审计契约）', () => {
     expect(STRATEGY_ANALYST.phases).toEqual(['SCAN', 'EXPLORE', 'VERIFY', 'RECORD', 'SUMMARIZE']);
-  });
-
-  test('5) 真机 baseline fixture 冻结（E6/U-2 对照基准）', () => {
-    expect(baseline.tsJsModule).toEqual({ submitted: 15, accepted: 1 });
-    expect(baseline.architecture).toEqual({ submitted: 8, accepted: 2 });
-    expect(baseline.cacheHitRatio).toBeCloseTo(0.64, 2);
   });
 });

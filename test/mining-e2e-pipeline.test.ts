@@ -22,6 +22,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { createEvaluationRecipeGateway } from '../scripts/lib/mining-eval-runtime.mjs';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { runModuleMining } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import type { FunctionCall, LLMResult } from '../src/agent/runtime/AgentRuntimeTypes.js';
@@ -362,8 +363,13 @@ function assembleMiningRun(input: {
   moduleId: string;
   /** P1-A F4 测试用：故意不接 capabilityCatalog，复现宿主接线错误形态。 */
   omitCatalog?: boolean;
+  evaluationCandidates?: Record<string, unknown>[];
 }) {
-  const { gateway, created } = createFakeGateway();
+  const fake = createFakeGateway();
+  const gateway = input.evaluationCandidates
+    ? createEvaluationRecipeGateway(input.evaluationCandidates, input.moduleId)
+    : fake.gateway;
+  const created = fake.created;
   const memoryCoordinator = new MemoryCoordinator();
   const scopeId = 'e2e-module:analyst';
   memoryCoordinator.createDimensionScope(scopeId);
@@ -451,6 +457,21 @@ function childOutcome(result: AgentRunResult, moduleId: string): Record<string, 
 }
 
 describe('mining E2E — 真实组合链路(fixture 仓 + 脚本化 provider)', () => {
+  it('runs ordinary mining through the evaluation CLI gateway contract', {
+    timeout: E2E_TIMEOUT,
+  }, async () => {
+    const candidates: Record<string, unknown>[] = [];
+    const { agentService, runInput } = assembleMiningRun({
+      provider: new ScriptedMiningProvider('healthy'),
+      fixtureRoot: materializeFixture(),
+      moduleId: 'evaluation',
+      evaluationCandidates: candidates,
+    });
+    const result = await agentService.run(runInput);
+    expect(result.status).toBe('success');
+    expect(candidates).toHaveLength(1);
+    expect(childOutcome(result, 'evaluation').outcome).toBe('completed');
+  });
   it('健康模块：analyze(真台账)→note_finding(ledger-id)→质量门→produce→submit 全链产出 1 条 rule', {
     timeout: E2E_TIMEOUT,
   }, async () => {

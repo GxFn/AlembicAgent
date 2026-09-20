@@ -153,9 +153,16 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     if (this.#defs.has(def.id)) {
       throw new Error(`Tool '${def.id}' already registered in UnifiedToolCatalog`);
     }
-    this.#defs.set(def.id, def);
     // Also register as CapabilityManifest for backward compatibility
     super.register(definitionToManifest(def));
+    this.#defs.set(def.id, def);
+  }
+
+  override unregister(id: string): boolean {
+    const removed = super.unregister(id);
+    this.#defs.delete(id);
+    this.#expandedToolIds.delete(id);
+    return removed;
   }
 
   registerDefinitions(defs: ToolDefinition[]): void {

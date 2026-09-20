@@ -21,11 +21,22 @@ export interface RouterConfig {
   capability?: CapabilityDef;
 }
 
+type ConcurrencyMode = NonNullable<ToolAction['concurrency']>;
+interface ScheduledCall {
+  tool: string;
+  mode: ConcurrencyMode;
+  signal?: AbortSignal;
+  resolve: (release: (() => void) | null) => void;
+  onAbort: () => void;
+}
+
 export class ToolRouter {
   readonly #config: RouterConfig;
-  readonly #toolLocks = new Map<string, Promise<void>>();
-  #globalLock: Promise<void> | null = null;
-  #globalRelease: (() => void) | null = null;
+  readonly #waiting: ScheduledCall[] = [];
+  readonly #activeTools = new Map<string, number>();
+  readonly #singleTools = new Set<string>();
+  #activeCount = 0;
+  #exclusive = false;
 
   constructor(config: RouterConfig = {}) {
     this.#config = config;
@@ -40,6 +51,9 @@ export class ToolRouter {
     const startMs = Date.now();
 
     try {
+      if (ctx.abortSignal?.aborted) {
+        return fail('Tool execution aborted before scheduling');
+      }
       const spec = TOOL_REGISTRY[call.tool];
       const action = spec?.actions[call.action];
       if (!spec || !action) {
@@ -59,10 +73,9 @@ export class ToolRouter {
       }
 
       const mode = action.concurrency ?? 'parallel';
-      if (mode === 'exclusive') {
-        await this.#acquireGlobalLock();
-      } else if (mode === 'single') {
-        await this.#acquireToolLock(call.tool);
+      const release = await this.#schedule(call.tool, mode, ctx.abortSignal);
+      if (!release) {
+        return fail('Tool execution aborted while waiting');
       }
 
       const handlerCtx: ToolContext = {
@@ -74,6 +87,9 @@ export class ToolRouter {
       };
 
       try {
+        if (ctx.abortSignal?.aborted) {
+          return fail('Tool execution aborted before handler');
+        }
         const result = await action.handler(call.params, handlerCtx);
 
         if (result._meta) {
@@ -86,11 +102,7 @@ export class ToolRouter {
 
         return result;
       } finally {
-        if (mode === 'exclusive') {
-          this.#releaseGlobalLock();
-        } else if (mode === 'single') {
-          this.#releaseToolLock(call.tool);
-        }
+        release();
       }
     } catch (err: unknown) {
       return fail(
@@ -129,6 +141,9 @@ export class ToolRouter {
   ): ParsedToolCall | { error: string } {
     try {
       const args = typeof rawArguments === 'string' ? JSON.parse(rawArguments) : rawArguments;
+      if (!isParamObject(args)) {
+        return { error: 'Tool arguments must be an object' };
+      }
       const action = args.action as string;
       const params = (args.params ?? {}) as Record<string, unknown>;
 
@@ -198,42 +213,80 @@ export class ToolRouter {
   /*  并发控制 — single (同工具互斥) / exclusive (全局独占)               */
   /* ------------------------------------------------------------------ */
 
-  async #acquireToolLock(tool: string): Promise<void> {
-    while (this.#toolLocks.has(tool)) {
-      await this.#toolLocks.get(tool);
+  #schedule(
+    tool: string,
+    mode: ConcurrencyMode,
+    signal?: AbortSignal
+  ): Promise<(() => void) | null> {
+    if (signal?.aborted) {
+      return Promise.resolve(null);
     }
-    let release!: () => void;
-    const promise = new Promise<void>((r) => {
-      release = r;
+    return new Promise((resolve) => {
+      const entry: ScheduledCall = {
+        tool,
+        mode,
+        signal,
+        resolve,
+        onAbort: () => {
+          const index = this.#waiting.indexOf(entry);
+          if (index >= 0) {
+            this.#waiting.splice(index, 1);
+            resolve(null);
+            this.#drain();
+          }
+        },
+      };
+      signal?.addEventListener('abort', entry.onAbort, { once: true });
+      this.#waiting.push(entry);
+      this.#drain();
     });
-    (promise as unknown as { _release: () => void })._release = release;
-    this.#toolLocks.set(tool, promise);
   }
 
-  #releaseToolLock(tool: string): void {
-    const p = this.#toolLocks.get(tool);
-    this.#toolLocks.delete(tool);
-    if (p) {
-      (p as unknown as { _release: () => void })._release();
+  #drain(): void {
+    if (this.#exclusive) {
+      return;
     }
-  }
-
-  async #acquireGlobalLock(): Promise<void> {
-    while (this.#globalLock) {
-      await this.#globalLock;
+    for (let index = 0; index < this.#waiting.length; ) {
+      const entry = this.#waiting[index];
+      // 已排队的独占调用形成屏障，后来的读不能越过它；其他工具仍可在屏障前并发。
+      if (entry.mode === 'exclusive' && this.#activeCount > 0) {
+        return;
+      }
+      if (
+        this.#singleTools.has(entry.tool) ||
+        (entry.mode === 'single' && this.#activeTools.has(entry.tool))
+      ) {
+        index++;
+        continue;
+      }
+      this.#waiting.splice(index, 1);
+      entry.signal?.removeEventListener('abort', entry.onAbort);
+      this.#activeCount++;
+      this.#activeTools.set(entry.tool, (this.#activeTools.get(entry.tool) ?? 0) + 1);
+      if (entry.mode === 'single') {
+        this.#singleTools.add(entry.tool);
+      }
+      this.#exclusive = entry.mode === 'exclusive';
+      entry.resolve(() => {
+        this.#activeCount--;
+        const count = (this.#activeTools.get(entry.tool) ?? 1) - 1;
+        if (count === 0) {
+          this.#activeTools.delete(entry.tool);
+        } else {
+          this.#activeTools.set(entry.tool, count);
+        }
+        if (entry.mode === 'single') {
+          this.#singleTools.delete(entry.tool);
+        }
+        if (entry.mode === 'exclusive') {
+          this.#exclusive = false;
+        }
+        this.#drain();
+      });
+      if (this.#exclusive) {
+        return;
+      }
     }
-    let release!: () => void;
-    this.#globalLock = new Promise<void>((r) => {
-      release = r;
-    });
-    this.#globalRelease = release;
-  }
-
-  #releaseGlobalLock(): void {
-    const release = this.#globalRelease;
-    this.#globalLock = null;
-    this.#globalRelease = null;
-    release?.();
   }
 }
 
@@ -242,6 +295,9 @@ export class ToolRouter {
 /* ------------------------------------------------------------------ */
 
 function validateParams(call: ParsedToolCall, action: ToolAction): string | null {
+  if (!isParamObject(call.params)) {
+    return `Invalid params for ${call.tool}.${call.action}: expected object`;
+  }
   const schema = action.params as {
     required?: string[];
     properties?: Record<string, { type?: string; enum?: unknown[] }>;
@@ -261,6 +317,9 @@ function validateParams(call: ParsedToolCall, action: ToolAction): string | null
       if (!prop) {
         continue;
       }
+      if (prop.type && !matchesParamType(val, prop.type)) {
+        return `Invalid type for ${call.tool}.${call.action}.${key}: expected ${String(prop.type)}`;
+      }
       if (prop.enum && !prop.enum.includes(val)) {
         return (
           `Invalid value "${String(val)}" for ${call.tool}.${call.action}.${key}. ` +
@@ -271,6 +330,30 @@ function validateParams(call: ParsedToolCall, action: ToolAction): string | null
   }
 
   return null;
+}
+
+function isParamObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function matchesParamType(value: unknown, type: string | string[]): boolean {
+  if (Array.isArray(type)) {
+    return type.some((candidate) => matchesParamType(value, candidate));
+  }
+  switch (type) {
+    case 'object':
+      return isParamObject(value);
+    case 'array':
+      return Array.isArray(value);
+    case 'integer':
+      return Number.isSafeInteger(value);
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'null':
+      return value === null;
+    default:
+      return typeof value === type;
+  }
 }
 
 /* ------------------------------------------------------------------ */

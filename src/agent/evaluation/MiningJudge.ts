@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute } from 'node:path';
+import { resolveProjectPath } from '../../shared/projectPath.js';
 
 export interface MiningJudgeEvidenceSliceV1 {
   readonly file: string;
@@ -61,6 +62,14 @@ export function sliceEvidenceForJudge(
 ): MiningJudgeEvidenceSliceV1[] {
   const maxSlices = options.maxSlices ?? 6;
   const maxLines = options.maxLines ?? 60;
+  if (
+    !Number.isSafeInteger(maxSlices) ||
+    maxSlices < 1 ||
+    !Number.isSafeInteger(maxLines) ||
+    maxLines < 1
+  ) {
+    return [];
+  }
   const reasoning = readRecord(readRecord(candidate).reasoning);
   const sources = Array.isArray(reasoning.sources) ? reasoning.sources : [];
   const slices: MiningJudgeEvidenceSliceV1[] = [];
@@ -75,12 +84,20 @@ export function sliceEvidenceForJudge(
     const [, file, startRaw, endRaw] = match;
     const start = Number(startRaw);
     const requestedEnd = Number(endRaw);
-    if (!file || !Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd)) {
+    if (
+      !file ||
+      isAbsolute(file) ||
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(requestedEnd) ||
+      start < 1 ||
+      requestedEnd < start
+    ) {
       continue;
     }
     const end = Math.min(requestedEnd, start + maxLines - 1);
     try {
-      const lines = readFileSync(join(projectRoot, file), 'utf8').split('\n');
+      const resolved = resolveProjectPath(projectRoot, file);
+      const lines = readFileSync(resolved.absolute, 'utf8').split('\n');
       if (start < 1 || start > lines.length) {
         continue;
       }

@@ -9,7 +9,7 @@ const coreRoot = path.join(workspaceRoot, 'AlembicCore');
 const stagingDir = path.join(repoRoot, 'tmp', 'release', '@alembic-agent');
 const packageJsonPath = path.join(repoRoot, 'package.json');
 const corePackageJsonPath = path.join(coreRoot, 'package.json');
-const readmePath = path.join(repoRoot, 'README.md');
+const readmeFiles = ['README.md', 'README.zh-CN.md'];
 const distPath = path.join(repoRoot, 'dist');
 
 const dependencySections = [
@@ -88,7 +88,7 @@ function createStagedManifest(agentPackageJson, corePackageJson, sourceMetadata)
   stagedPackageJson.files = uniqueFiles([
     ...(Array.isArray(agentPackageJson.files) ? agentPackageJson.files : []),
     '.alembic-source.json',
-    'README.md',
+    ...readmeFiles,
     'dist',
   ]);
   stagedPackageJson.scripts = withoutLifecycleHardGate(agentPackageJson.scripts);
@@ -122,7 +122,9 @@ if (agentPackageJson.dependencies?.['@alembic/core'] !== 'file:../AlembicCore') 
   fail('AlembicAgent dev manifest must keep @alembic/core as file:../AlembicCore before staging.');
 }
 
-requireFile(readmePath, 'Run from the AlembicAgent package root.');
+for (const file of readmeFiles) {
+  requireFile(path.join(repoRoot, file), 'Run from the AlembicAgent package root.');
+}
 requireDirectory(distPath, 'Run `npm run build` before staging.');
 
 const coreSourceCommit = git(coreRoot, ['rev-parse', 'HEAD']);
@@ -183,7 +185,9 @@ rmSync(stagingDir, { force: true, recursive: true });
 mkdirSync(stagingDir, { recursive: true });
 writeJson(path.join(stagingDir, 'package.json'), stagedPackageJson);
 writeJson(path.join(stagingDir, '.alembic-source.json'), sourceMetadata);
-cpSync(readmePath, path.join(stagingDir, 'README.md'));
+for (const file of readmeFiles) {
+  cpSync(path.join(repoRoot, file), path.join(stagingDir, file));
+}
 cpSync(distPath, path.join(stagingDir, 'dist'), { recursive: true });
 
 process.stdout.write(

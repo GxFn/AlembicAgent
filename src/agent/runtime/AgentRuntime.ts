@@ -1,3 +1,4 @@
+import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 /**
  * AgentRuntime — 统一 Agent 执行引擎 (The Brain)
  *
@@ -191,6 +192,8 @@ export class AgentRuntime {
   #groundingEnforcement: GroundingEnforcement;
   /** 统一事件钩子系统 */
   #hookSystem: HookSystem;
+  #executionAbortController: AbortController | null = null;
+  #abortEventPublished = false;
 
   // ── 执行统计 ──
   iterationCount = 0;
@@ -272,6 +275,7 @@ export class AgentRuntime {
    * @param [opts] 策略特定选项 (如 FanOut 的 items)
    */
   async execute(message: AgentMessage, opts: Record<string, unknown> = {}): Promise<AgentResult> {
+    this.#abortEventPublished = false;
     this.startTime = Date.now();
     this.iterationCount = 0;
     this.toolCallHistory = [];
@@ -309,8 +313,9 @@ export class AgentRuntime {
 
     // ── 超时保护 ──
     const budget = this.policies.getBudget();
-    const timeoutMs = budget?.timeoutMs || 300_000;
+    const timeoutMs = readPositiveBudgetNumber(opts.timeoutMs) ?? budget?.timeoutMs ?? 300_000;
     const abortController = new AbortController();
+    this.#executionAbortController = abortController;
     const parentAbortSignal =
       opts.abortSignal && typeof (opts.abortSignal as AbortSignal).aborted === 'boolean'
         ? (opts.abortSignal as AbortSignal)
@@ -324,6 +329,9 @@ export class AgentRuntime {
     const cleanupExecutionGuards = () => {
       clearTimeout(timeoutId);
       parentAbortSignal?.removeEventListener('abort', onParentAbort);
+      if (this.#executionAbortController === abortController) {
+        this.#executionAbortController = null;
+      }
     };
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -346,6 +354,14 @@ export class AgentRuntime {
       if (diagnostics.isEmpty()) {
         diagnostics.merge(result.diagnostics);
       }
+      if (abortController.signal.aborted) {
+        diagnostics.recordCancelReason('abort_signal');
+        result.reply = '[run stopped: abort_signal] Execution was cancelled.';
+        const pipelineOutcome = result.phases?._pipelineOutcome;
+        if (result.phases && pipelineOutcome && typeof pipelineOutcome === 'object') {
+          result.phases._pipelineOutcome = { ...pipelineOutcome, outcome: 'aborted' };
+        }
+      }
 
       // ── Policy: 执行后校验 ──
       const afterCheck = this.policies.validateAfter(
@@ -361,7 +377,9 @@ export class AgentRuntime {
       }
 
       // 状态完成
-      this.#safeTransition('finish', { reply: result.reply?.slice(0, 100) });
+      this.#safeTransition(abortController.signal.aborted ? 'abort' : 'finish', {
+        reply: result.reply?.slice(0, 100),
+      });
 
       // 回复给原始渠道
       if (message.replyFn && result.reply) {
@@ -375,16 +393,18 @@ export class AgentRuntime {
       }
       result.diagnostics = diagnostics.toJSON();
 
-      this.bus.publish(
-        AgentEvents.AGENT_COMPLETED,
-        {
-          agentId: this.id,
-          preset: this.presetName,
-          iterations: result.iterations,
-          durationMs: result.durationMs,
-        },
-        { source: this.id }
-      );
+      if (!abortController.signal.aborted || !this.#abortEventPublished) {
+        this.bus.publish(
+          abortController.signal.aborted ? AgentEvents.AGENT_ABORTED : AgentEvents.AGENT_COMPLETED,
+          {
+            agentId: this.id,
+            preset: this.presetName,
+            iterations: result.iterations,
+            durationMs: result.durationMs,
+          },
+          { source: this.id }
+        );
+      }
 
       return result;
     } catch (err: unknown) {
@@ -851,7 +871,10 @@ export class AgentRuntime {
     }
     if (ctx.isSystem && ctx.memoryCoordinator) {
       const wmContext = ctx.memoryCoordinator.buildDynamicMemoryPrompt?.({
-        mode: (ctx.source || 'analyst') as 'user' | 'analyst' | 'producer',
+        mode:
+          ctx.context?.pipelinePhase === 'produce' || tracker?.pipelineType === 'producer'
+            ? 'producer'
+            : 'analyst',
         scopeId: (ctx.context?.dimensionScopeId as string) || undefined,
       });
       if (wmContext) {
@@ -897,7 +920,10 @@ export class AgentRuntime {
       ) {
         return [];
       }
-      return [buildDirectNoteFindingSchema(true)];
+      return [
+        buildDirectNoteFindingSchema(true),
+        ...ctx.toolSchemas.filter((schema) => schema.name === 'evidence'),
+      ];
     }
     // M1a：维度运行（证据台账在场）时对 knowledge.submit 施加契约面变体——
     // evidenceRefs 必填、sources 降述、scope 自声明；广告面与运行时闸一致（E4/run-6 双教训钉）。
@@ -1130,6 +1156,14 @@ export class AgentRuntime {
       ctx.addTokenUsage(llmResult.usage);
       ctx.diagnostics?.recordTokenUsage(llmResult.usage);
     }
+    if (ctx.abortSignal?.aborted) {
+      ctx.diagnostics?.recordCancelReason('abort_signal');
+      ctx.diagnostics?.warn({
+        code: 'late_llm_response_discarded',
+        message: 'Provider response arrived after cancellation and was discarded',
+      });
+      return null;
+    }
     recordPcvLlmOutput(ctx.pcvNodeEvidence, {
       functionCalls: llmResult.functionCalls || [],
       reasoningTokens: llmResult.usage?.reasoningTokens || 0,
@@ -1280,6 +1314,7 @@ export class AgentRuntime {
 
     // 熔断器感知
     if (aiErr.code === 'CIRCUIT_OPEN') {
+      ctx.diagnostics?.recordCancelReason('provider_circuit_open');
       this.logger.warn(
         `[AgentRuntime] 🛑 circuit breaker OPEN — breaking to summary ${formatLoopTrace(trace)}`
       );
@@ -1291,6 +1326,7 @@ export class AgentRuntime {
 
     // 2-strike 策略
     if (ctx.consecutiveAiErrors >= 2) {
+      ctx.diagnostics?.recordCancelReason('provider_error');
       this.logger.warn(
         `[AgentRuntime] 🛑 2 consecutive AI errors — breaking to summary ${formatLoopTrace(trace)}`
       );
@@ -1409,19 +1445,37 @@ export class AgentRuntime {
       );
 
       // HookSystem: tool:execute:before
-      this.#hookSystem.emitSync('tool:execute:before', {
+      const hookAllowed = await this.#hookSystem.emit('tool:execute:before', {
         toolId: fc.name,
         args: fc.args,
         callId: fc.id,
         processEvent: toolStartProcessEvent,
       });
+      if (ctx.abortSignal?.aborted) {
+        ctx.diagnostics?.recordCancelReason('abort_signal');
+        return true;
+      }
 
       // 通过 Pipeline 执行 (safety → cache → execute → observe → track → trace → dedup)
-      const { result: toolResult, metadata } = await this.#toolPipeline.execute(fc, {
-        runtime: this,
-        loopCtx: ctx,
-        iteration: ctx.iteration,
-      });
+      if (!hookAllowed) {
+        ctx.diagnostics?.recordBlockedTool(fc.name, 'tool:execute:before hook rejected the call');
+        this.logger.warn(`[AgentRuntime] tool blocked by hook: ${fc.name}`);
+      }
+      const { result: toolResult, metadata } = hookAllowed
+        ? await this.#toolPipeline.execute(fc, {
+            runtime: this,
+            loopCtx: ctx,
+            iteration: ctx.iteration,
+          })
+        : {
+            result: { error: 'Tool call blocked by hook' },
+            metadata: {
+              cacheHit: false,
+              blocked: true,
+              isNew: false,
+              durationMs: 0,
+            } as ToolMetadata,
+          };
 
       const durationMs = metadata.durationMs;
       const envelope = (metadata as ToolMetadata).envelope;
@@ -1647,6 +1701,7 @@ export class AgentRuntime {
         toolChoice: 'none',
         temperature: ctx.budget.temperature ?? 0.7,
         maxTokens: ctx.budget.maxTokens ?? 4096,
+        abortSignal: ctx.abortSignal ?? undefined,
       })) as LLMResult;
       if (summary.usage) {
         this.tokenUsage.input += summary.usage.inputTokens || 0;
@@ -1870,9 +1925,7 @@ export class AgentRuntime {
     // Scan 管线: 所有结果在 toolCalls 中 (knowledge.submit)，不需要文本回复
     // 直接跳过 forced summary，避免浪费一次 LLM 调用
     if (!ctx.lastReply && ctx.tracker?.pipelineType === 'scan') {
-      const recipeCount = ctx.toolCalls.filter(
-        (tc: ToolCallEntry) => (tc.tool || tc.name) === 'knowledge'
-      ).length;
+      const recipeCount = ctx.toolCalls.filter(isPersistedSubmission).length;
       ctx.lastReply = `[scan complete: ${recipeCount} recipes collected]`;
     }
 
@@ -1895,6 +1948,7 @@ export class AgentRuntime {
           contextWindow: ctx.contextWindow,
           prompt: ctx.prompt,
           tokenUsage: this.tokenUsage,
+          abortSignal: ctx.abortSignal ?? undefined,
         });
         ctx.lastReply = forcedResult.reply;
         ctx.diagnostics?.recordForcedSummary();
@@ -1937,6 +1991,11 @@ export class AgentRuntime {
 
   /** 中止执行 */
   abort(reason = 'User aborted') {
+    this.#executionAbortController?.abort(new Error(reason));
+    if (this.#abortEventPublished) {
+      return;
+    }
+    this.#abortEventPublished = true;
     this.#safeTransition('abort', { reason });
     this.bus.publish(
       AgentEvents.AGENT_ABORTED,

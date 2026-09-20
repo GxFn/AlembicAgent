@@ -191,7 +191,8 @@ function compilePolicyDeclarations(policies: unknown[] | undefined) {
       return new BudgetPolicy(config);
     }
     if (policy.type === 'safety') {
-      return new SafetyPolicy();
+      const { type: _type, ...config } = policy;
+      return new SafetyPolicy(config);
     }
     return policy as unknown as Policy;
   });

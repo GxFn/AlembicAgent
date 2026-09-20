@@ -19,18 +19,19 @@ interface ParserEntry {
 }
 
 const parsers: ParserEntry[] = [];
-let parsersLoaded = false;
+let parserLoading: Promise<void> | null = null;
 
 /**
  * 延迟加载所有解析器（避免启动时 import 全部模块）。
  * 幂等 — 多次调用只执行一次。
  */
-async function ensureParsers(): Promise<void> {
-  if (parsersLoaded) {
-    return;
-  }
-  parsersLoaded = true;
+function ensureParsers(): Promise<void> {
+  // 同一次初始化 Promise 供所有并发首调等待，避免只设置 loaded 标志却尚未完成导入。
+  parserLoading ??= loadParsers();
+  return parserLoading;
+}
 
+async function loadParsers(): Promise<void> {
   const modules = await Promise.allSettled([
     import('./parsers/GitStatusParser.js'),
     import('./parsers/GitDiffParser.js'),
@@ -80,32 +81,7 @@ export class OutputCompressor {
 
     await ensureParsers();
 
-    const cleaned = cleanOutput(raw);
-    const command = opts.command ?? '';
-    const tokenBudget = opts.tokenBudget ?? 4000;
-    const maxChars = tokenBudget * 4;
-
-    for (const entry of parsers) {
-      if (entry.pattern.test(command)) {
-        try {
-          const result = entry.parse(cleaned);
-          if (result !== null) {
-            if (result.length <= maxChars) {
-              return result;
-            }
-            return truncateOutput(result, maxChars);
-          }
-        } catch {
-          // 解析失败，fallback 到通用截断
-        }
-        break;
-      }
-    }
-
-    if (cleaned.length <= maxChars) {
-      return cleaned;
-    }
-    return truncateOutput(cleaned, maxChars);
+    return this.compressSync(raw, opts);
   }
 
   /**

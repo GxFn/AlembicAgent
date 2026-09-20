@@ -2,7 +2,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryConsolidator } from '../src/agent/memory/MemoryConsolidator.js';
+import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js';
 // MemoryRetriever 未从 src/index.ts barrel 导出 → 必须走直接路径（barrel 路径会编译失败）。
 import { MemoryRetriever } from '../src/agent/memory/MemoryRetriever.js';
 import {
@@ -15,6 +17,7 @@ import {
   MemoryStoreWriteError,
   SessionStore,
 } from '../src/index.js';
+import { estimateTokens } from '../src/shared/tokenUtils.js';
 
 const tempRoots: string[] = [];
 
@@ -32,6 +35,160 @@ afterEach(() => {
 });
 
 describe('MemoryStore', () => {
+  it('revalidates current memory content after the asynchronous query embedding', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({ content: 'obsolete decision' });
+      const retriever = new MemoryRetriever(store, {
+        embeddingFn: async () => {
+          store.update(id, { content: 'current decision' });
+          return [1, 0];
+        },
+      });
+      expect((await retriever.retrieve('decision'))[0].content).toBe('current decision');
+    } finally {
+      db.close();
+    }
+  });
+  it.each([
+    { vector: [Number.NaN] },
+    { vector: [0, 0] },
+    { vector: [1e308, 1e308] },
+  ])('keeps lexical scores finite for invalid query vectors $vector', async ({ vector }) => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      store.add({ content: 'transaction boundary' });
+      const diagnostics: unknown[] = [];
+      const results = await new MemoryRetriever(store, {
+        embeddingFn: async () => vector,
+      }).retrieve('transaction', { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) });
+      expect(Number.isFinite(results[0]._score)).toBe(true);
+      expect(diagnostics).toContainEqual(
+        expect.objectContaining({ phase: 'embedding', status: 'invalid' })
+      );
+    } finally {
+      db.close();
+    }
+  });
+  it('does not count memories discarded by the prompt budget as accessed', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({ content: 'transaction isolation '.repeat(20), source: 'user' });
+      expect(
+        await new MemoryRetriever(store).toPromptSection({ query: 'transaction', tokenBudget: 1 })
+      ).toBe('');
+      expect(store.get(id)?.accessCount).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+  it('does not accept late embedding results or touch memories after cancellation', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({ content: 'transaction isolation', source: 'user' });
+      const controller = new AbortController();
+      const embeddingFn = vi.fn(async () => {
+        controller.abort();
+        return [1, 0];
+      });
+      const retriever = new MemoryRetriever(store, { embeddingFn });
+      expect(await retriever.retrieve('transaction', { abortSignal: controller.signal })).toEqual(
+        []
+      );
+      expect(store.get(id)?.accessCount).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+  it('returns lexical candidates by the deadline when embedding does not settle', async () => {
+    vi.useFakeTimers();
+    const db = new Database(':memory:');
+    let release!: (value: number[]) => void;
+    try {
+      const store = new MemoryStore(db);
+      store.add({ content: 'transaction isolation', source: 'user' });
+      const diagnostics: unknown[] = [];
+      const retriever = new MemoryRetriever(store, {
+        embeddingFn: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      });
+      let completed = false;
+      const pending = retriever
+        .retrieve('transaction', {
+          timeoutMs: 20,
+          onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        })
+        .then((value) => {
+          completed = true;
+          return value;
+        });
+      await vi.advanceTimersByTimeAsync(21);
+      expect(completed).toBe(true);
+      expect((await pending)[0].content).toBe('transaction isolation');
+      expect(diagnostics).toContainEqual(
+        expect.objectContaining({ status: 'timeout', phase: 'embedding' })
+      );
+    } finally {
+      release?.([1, 0]);
+      vi.useRealTimers();
+      db.close();
+    }
+  });
+  it('rolls back conflict replacements when later consolidation writes fail', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const original = 'Use a transaction to update persistent memories';
+      const { id } = store.add({ type: 'fact', content: original });
+      const update = vi.spyOn(store, 'update');
+      vi.spyOn(store, 'add').mockImplementation(() => {
+        throw new Error('simulated write failure');
+      });
+      expect(() =>
+        new MemoryConsolidator(store).consolidate([
+          {
+            type: 'fact',
+            content: 'Do not use a transaction to update persistent memories',
+            importance: 8,
+          },
+          { type: 'fact', content: 'Quartz geometry defines a blue triangle', importance: 5 },
+        ])
+      ).toThrow('simulated write failure');
+      expect(update).toHaveBeenCalled();
+      expect(store.get(id)?.content).toBe(original);
+    } finally {
+      vi.restoreAllMocks();
+      db.close();
+    }
+  });
+  it('preserves explicit importance when appending and recognizing a duplicate memory', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const retriever = new MemoryRetriever(store);
+      retriever.append({
+        content: 'Preserve the domain ownership decision.',
+        type: 'decision',
+        importance: 8,
+      });
+      expect(store.getAllActive()[0].importance).toBe(8);
+      retriever.append({
+        content: 'Preserve the domain ownership decision.',
+        type: 'decision',
+        importance: 9,
+      });
+      expect(store.getAllActive()).toHaveLength(1);
+      expect(store.getAllActive()[0].importance).toBe(9);
+    } finally {
+      db.close();
+    }
+  });
   it('fails fast when the Core semantic memory schema shape drifts', () => {
     const db = new Database(':memory:');
     try {
@@ -125,6 +282,154 @@ describe('MemoryStore', () => {
 });
 
 describe('MemoryCoordinator', () => {
+  it('keeps the complete request budget stable across concurrent reconfiguration', async () => {
+    let release!: (value: string) => void;
+    const coordinator = new MemoryCoordinator({
+      totalMemoryBudget: 100,
+      persistentMemory: {
+        toPromptSection: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+        append() {},
+      },
+    });
+    const context = coordinator.createDimensionScope('scope');
+    vi.spyOn(context, 'buildContext').mockImplementation((budget) => 'x'.repeat((budget ?? 0) * 4));
+    const pending = coordinator.buildMemoryPrompt({ scopeId: 'scope' });
+    await Promise.resolve();
+    coordinator.allocateBudget('analyst', 1000);
+    release('retained');
+    expect(estimateTokens(await pending)).toBeLessThanOrEqual(100);
+    coordinator.dispose();
+  });
+  it('normalizes invalid time limits without creating an unbounded request', async () => {
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const pending = readPersistentMemorySection(
+        { toPromptSection: () => new Promise(() => {}) },
+        { timeoutMs: Number.NaN, deadlineAt: Number.NaN, tokenBudget: 30 }
+      ).then((result) => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(5001);
+      expect(settled).toBe(true);
+      expect((await pending).content).toBe('');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('forwards task relevance and keeps session context when persistent memory fails', async () => {
+    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    session.storeDimensionReport('previous', {
+      analysisText: 'Session evidence remains available',
+    });
+    const persistent = {
+      toPromptSection: vi.fn(() => {
+        throw new Error('offline');
+      }),
+      append: vi.fn(),
+    };
+    const coordinator = new MemoryCoordinator({
+      persistentMemory: persistent,
+      sessionStore: session,
+    });
+    try {
+      const result = await coordinator.buildStaticMemoryPrompt({
+        taskContext: 'transaction isolation',
+        currentDimId: 'next',
+      });
+      expect(persistent.toPromptSection).toHaveBeenCalledWith(
+        expect.objectContaining({ query: 'transaction isolation' })
+      );
+      expect(result).toContain('Session evidence remains available');
+    } finally {
+      session.dispose();
+      coordinator.dispose();
+    }
+  });
+  it('isolates per-scope budgets when asynchronous reads finish in reverse order', async () => {
+    let release!: (text: string) => void;
+    const persistent = {
+      toPromptSection: vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<string>((resolve) => {
+              release = resolve;
+            })
+        )
+        .mockResolvedValue(''),
+      append: vi.fn(),
+    };
+    const coordinator = new MemoryCoordinator({
+      persistentMemory: persistent,
+      totalMemoryBudget: 100,
+    });
+    coordinator.createDimensionScope('a');
+    const b = coordinator.createDimensionScope('b');
+    const build = vi.spyOn(b, 'buildContext').mockReturnValue('');
+    const pendingA = coordinator.buildStaticMemoryPrompt({ scopeId: 'a', mode: 'analyst' });
+    await coordinator.buildStaticMemoryPrompt({ scopeId: 'b', mode: 'producer' });
+    coordinator.buildDynamicMemoryPrompt({ scopeId: 'b', mode: 'producer' });
+    expect(build).toHaveBeenLastCalledWith(100);
+    release('x'.repeat(40));
+    await pendingA;
+    coordinator.buildDynamicMemoryPrompt({ scopeId: 'b', mode: 'producer' });
+    expect(build).toHaveBeenLastCalledWith(100);
+    coordinator.dispose();
+  });
+  it.each([
+    0, 100,
+  ])('enforces a %i token memory budget even for an oversized external port', async (budget) => {
+    const persistent = {
+      toPromptSection: vi.fn(() => '大量无界历史'.repeat(200)),
+      append: vi.fn(),
+    };
+    const coordinator = new MemoryCoordinator({
+      persistentMemory: persistent,
+      totalMemoryBudget: budget,
+    });
+    const result = await coordinator.buildMemoryPrompt();
+    expect(estimateTokens(result)).toBeLessThanOrEqual(budget);
+    if (budget === 0) {
+      expect(persistent.toPromptSection).not.toHaveBeenCalled();
+    }
+    coordinator.dispose();
+  });
+  it('passes the allocated budget into persistent and session memory ports', async () => {
+    const persistent = { toPromptSection: vi.fn(() => ''), append: vi.fn() };
+    const session = { buildContextForDimension: vi.fn(() => '') };
+    const coordinator = new MemoryCoordinator({
+      persistentMemory: persistent,
+      sessionStore: session as unknown as SessionStore,
+      totalMemoryBudget: 1000,
+    });
+    coordinator.allocateBudget('producer');
+    await coordinator.buildStaticMemoryPrompt({ currentDimId: 'a', focusKeywords: ['boundary'] });
+    expect(persistent.toPromptSection).toHaveBeenCalledWith(
+      expect.objectContaining({ tokenBudget: 150 })
+    );
+    expect(session.buildContextForDimension).toHaveBeenCalledWith(
+      'a',
+      expect.objectContaining({ tokenBudget: 550 })
+    );
+  });
+  it('recomputes the active allocation profile when the total context budget changes', () => {
+    const coordinator = new MemoryCoordinator();
+    coordinator.allocateBudget('producer');
+    coordinator.configure({ totalContextBudget: 8000 });
+    expect(coordinator.getTotalBudget()).toBe(1000);
+    expect(coordinator.getBudgetAllocation()).toEqual({
+      activeContext: 250,
+      sessionStore: 550,
+      persistentMemory: 150,
+      conversationLog: 50,
+    });
+  });
   it('returns visible degraded diagnostics when evidence search fails', () => {
     const coordinator = new MemoryCoordinator({
       sessionStore: {
@@ -196,6 +501,182 @@ describe('MemoryCoordinator', () => {
 });
 
 describe('SessionStore', () => {
+  it('ranks distilled findings using the same projection that is rendered', () => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.storeDimensionReport('old', { analysisText: 'decorative visual layout '.repeat(40) });
+      store.storeDimensionReport('relevant', {
+        workingMemoryDistilled: {
+          keyFindings: [{ finding: 'Transaction isolation', importance: 8 }],
+        },
+      });
+      expect(
+        store.buildContextForDimension('next', { focusKeywords: ['Transaction'], tokenBudget: 100 })
+      ).toContain('Transaction isolation');
+    } finally {
+      store.dispose();
+    }
+  });
+  it('puts relevant dimension summaries before unrelated history within the budget', () => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.storeDimensionReport('old-unrelated', {
+        analysisText: 'decorative visual layout '.repeat(40),
+      });
+      store.storeDimensionReport('transaction-boundary', {
+        analysisText: 'Transaction isolation prevents concurrent write loss.',
+        referencedFiles: ['src/transaction.ts'],
+      });
+      const context = store.buildContextForDimension('next', {
+        focusKeywords: ['Transaction'],
+        tokenBudget: 100,
+      });
+      expect(context).toContain('Transaction isolation');
+      expect(estimateTokens(context)).toBeLessThanOrEqual(100);
+    } finally {
+      store.dispose();
+    }
+  });
+  it.each([0, 1, 55])('fits real Chinese session context within %i tokens', (tokenBudget) => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.storeDimensionReport('previous', {
+        analysisText: '上下文预算必须包括裁剪说明。'.repeat(50),
+      });
+      const output = store.buildContextForDimension('next', { tokenBudget });
+      expect(estimateTokens(output)).toBeLessThanOrEqual(tokenBudget);
+      if (tokenBudget === 55) {
+        expect(output).toContain('truncated');
+      }
+    } finally {
+      store.dispose();
+    }
+  });
+  it.each([
+    { dimensionReports: { a: { workingMemoryDistilled: { keyFindings: {} } } } },
+    { tierReflections: [{ topFindings: [null] }] },
+    { workingMemory: { toolCallSummary: [null] } },
+    { dimensionReports: { a: { digest: { summary: {} } } } },
+    { submittedCandidates: { a: [{ title: {} }] } },
+  ])('rejects malformed nested session data before replacing state: %j', (snapshot) => {
+    expect(() => SessionStore.fromJSON(snapshot)).toThrow('SessionStore schema');
+  });
+  it('never lets nested action turn a write into a cached read', () => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.cacheToolResult(
+        'code',
+        { action: 'write', params: { action: 'read', path: 'a.ts' } },
+        'write-result'
+      );
+      expect(store.getCachedResult('code', { action: 'read', path: 'a.ts' })).toBeNull();
+    } finally {
+      store.dispose();
+    }
+  });
+  it('keys cached reads and searches by the complete normalized request', () => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.cacheToolResult(
+        'code',
+        { action: 'search', pattern: 'symbol', glob: 'src/a/**' },
+        { matches: ['a'] }
+      );
+      expect(
+        store.getCachedResult('code', { action: 'search', pattern: 'symbol', glob: 'src/b/**' })
+      ).toBeNull();
+      expect(
+        store.getCachedResult('code', {
+          action: 'search',
+          params: { glob: 'src/a/**', pattern: 'symbol' },
+        })
+      ).toEqual({ matches: ['a'] });
+      store.cacheToolResult(
+        'code',
+        { action: 'read', filePath: 'src/a.ts', startLine: 1, endLine: 3 },
+        { content: 'first' }
+      );
+      expect(
+        store.getCachedResult('code', {
+          action: 'read',
+          filePath: 'src/a.ts',
+          startLine: 10,
+          endLine: 12,
+        })
+      ).toBeNull();
+      expect(
+        store.getCachedResult('code', {
+          action: 'read',
+          params: { path: 'src/a.ts', startLine: 1, endLine: 3 },
+        })
+      ).toEqual({ content: 'first', path: 'src/a.ts', cached: true });
+    } finally {
+      store.dispose();
+    }
+  });
+  it('rebuilds legacy evidence only when the persisted evidence field is absent', () => {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    store.storeDimensionReport('a', {
+      findings: [{ finding: 'Legacy finding', evidence: 'src/a.ts:2', importance: 8 }],
+    });
+    const { evidenceStore: _evidence, ...legacy } = store.toJSON();
+    const rebuilt = SessionStore.fromJSON(legacy);
+    const empty = SessionStore.fromJSON({ ...legacy, evidenceStore: {} });
+    try {
+      expect(rebuilt.searchEvidence('Legacy')).toHaveLength(1);
+      expect(empty.searchEvidence('Legacy')).toEqual([]);
+      expect(() =>
+        SessionStore.fromJSON({ dimensionReports: { a: { findings: null } } })
+      ).toThrow();
+    } finally {
+      store.dispose();
+      rebuilt.dispose();
+      empty.dispose();
+    }
+  });
+  it('preserves evidence through JSON and checkpoint round trips without merging old state', async () => {
+    const root = makeTempRoot('session-evidence');
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    store.addEvidence('src/a.ts', {
+      finding: 'Evidence survives restart',
+      importance: 8,
+      dimId: 'a',
+    });
+    const before = store.searchEvidence('survives');
+    const restored = SessionStore.fromJSON(store.toJSON());
+    try {
+      expect(restored.searchEvidence('survives')).toEqual(before);
+      await store.saveCheckpoint(root);
+      restored.addEvidence('src/stale.ts', { finding: 'Old state', importance: 1, dimId: 'old' });
+      expect(await restored.loadCheckpoint(root)).toBe(true);
+      expect(restored.searchEvidence('survives')).toEqual(before);
+      expect(restored.searchEvidence('Old state')).toEqual([]);
+    } finally {
+      store.dispose();
+      restored.dispose();
+    }
+  });
+
+  it('rejects malformed checkpoints without partially replacing live state', async () => {
+    const root = makeTempRoot('session-invalid');
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    store.addEvidence('src/a.ts', { finding: 'Keep existing evidence', importance: 8 });
+    await store.saveCheckpoint(root);
+    const before = store.toJSON();
+    const checkpoint = join(root, '.asd/bootstrap-checkpoint/session-store.json');
+    writeFileSync(
+      checkpoint,
+      JSON.stringify({
+        version: 2,
+        savedAt: Date.now(),
+        dimensionReports: { invalid: null },
+        crossReferences: [],
+      })
+    );
+    expect(await store.loadCheckpoint(root)).toBe(false);
+    expect(store.toJSON()).toEqual(before);
+    store.dispose();
+  });
   it('saves and restores bootstrap checkpoints while validating serialized shape', async () => {
     const root = makeTempRoot('session-store');
     const store = new SessionStore({ cleanupIntervalMs: 0 });
@@ -273,6 +754,138 @@ describe('SessionStore', () => {
 });
 
 describe('MemoryEmbeddingStore', () => {
+  it('honors cancellation from a stale-result observer before committing the remaining batch', async () => {
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-callback-cancel'));
+    try {
+      const store = new MemoryStore(db);
+      const stale = store.add({ content: 'will change' });
+      store.add({ content: 'still current' });
+      const controller = new AbortController();
+      const retriever = new MemoryRetriever(store, {
+        embeddingStore: embeddings,
+        embeddingFn: async () => {
+          store.update(stale.id, { content: 'now changed' });
+          return [1, 0];
+        },
+      });
+      expect(
+        await retriever.embedAllMemories(20, {
+          abortSignal: controller.signal,
+          onDiagnostic: (diagnostic) => {
+            if (diagnostic.status === 'stale') {
+              controller.abort();
+            }
+          },
+        })
+      ).toBe(0);
+      expect(embeddings.size).toBe(0);
+    } finally {
+      embeddings.dispose();
+      db.close();
+    }
+  });
+  it('flushes and releases its own timer on dispose without allowing later mutations', () => {
+    vi.useFakeTimers();
+    try {
+      const root = makeTempRoot('embedding-dispose');
+      const store = new MemoryEmbeddingStore(root);
+      store.set('m1', [1, 0]);
+      expect(vi.getTimerCount()).toBe(1);
+      store.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(new MemoryEmbeddingStore(root).get('m1')).toEqual([1, 0]);
+      expect(() => store.set('m2', [0, 1])).toThrow('disposed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('shares one backfill deadline and keeps only completed valid entries', async () => {
+    vi.useFakeTimers();
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-partial'));
+    try {
+      const store = new MemoryStore(db);
+      store.add({ content: 'first entry' });
+      store.add({ content: 'second entry' });
+      store.add({ content: 'third entry' });
+      const embeddingFn = vi
+        .fn()
+        .mockResolvedValueOnce([1, 0])
+        .mockImplementation(() => new Promise(() => {}));
+      const retriever = new MemoryRetriever(store, { embeddingStore: embeddings, embeddingFn });
+      const pending = retriever.embedAllMemories(20, { timeoutMs: 20 });
+      await vi.advanceTimersByTimeAsync(21);
+      expect(await pending).toBe(1);
+      expect(embeddingFn).toHaveBeenCalledTimes(2);
+      expect(embeddings.size).toBe(1);
+    } finally {
+      embeddings.dispose();
+      db.close();
+      vi.useRealTimers();
+    }
+  });
+  it('retains failed writes for a later flush and persists content-bound vectors', () => {
+    const root = makeTempRoot('embedding-retry');
+    const filePath = join(root, 'vectors.json');
+    mkdirSync(filePath);
+    const store = new MemoryEmbeddingStore(root, { filePath });
+    store.set('m1', [1, 0], 'current text');
+    store.flushSync();
+    rmSync(filePath, { recursive: true });
+    store.flushSync();
+    const reloaded = new MemoryEmbeddingStore(root, { filePath });
+    expect(reloaded.get('m1', 'current text')).toEqual([1, 0]);
+    expect(reloaded.get('m1', 'changed text')).toBeNull();
+  });
+  it('loads legacy vectors for compatibility but requires regeneration for content-aware recall', () => {
+    const root = makeTempRoot('embedding-legacy');
+    const filePath = join(root, 'vectors.json');
+    writeFileSync(filePath, JSON.stringify({ m1: [1, 0] }));
+    const store = new MemoryEmbeddingStore(root, { filePath });
+    expect(store.get('m1')).toEqual([1, 0]);
+    expect(store.get('m1', 'current text')).toBeNull();
+    store.set('m1', [0, 1], 'current text');
+    store.flushSync();
+    expect(new MemoryEmbeddingStore(root, { filePath }).get('m1', 'current text')).toEqual([0, 1]);
+  });
+  it('does not expose mutable vector arrays and rejects malformed vectors', () => {
+    const store = new MemoryEmbeddingStore(makeTempRoot('embedding-valid'));
+    const vector = [1, 0];
+    store.set('m1', vector);
+    vector[0] = 7;
+    const value = store.get('m1');
+    if (value) {
+      value[0] = 9;
+    }
+    expect(store.get('m1')).toEqual([1, 0]);
+    store.set('bad', [Number.NaN, 0]);
+    expect(store.get('bad')).toBeNull();
+    store.flushSync();
+  });
+  it('discards backfill results when memory content changes during embedding', async () => {
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-stale'));
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({ content: 'original memory' });
+      const retriever = new MemoryRetriever(store, {
+        embeddingStore: embeddings,
+        embeddingFn: async () => {
+          store.update(id, { content: 'changed memory' });
+          return [1, 0];
+        },
+      });
+      expect(await retriever.embedAllMemories()).toBe(0);
+      expect(embeddings.get(id)).toBeNull();
+      retriever.setEmbeddingFunction(async () => [0, 1]);
+      expect(await retriever.embedAllMemories()).toBe(1);
+      expect(embeddings.get(id, 'changed memory')).toEqual([0, 1]);
+    } finally {
+      embeddings.flushSync();
+      db.close();
+    }
+  });
   it('persists embeddings to a JSON sidecar and tolerates corrupt files', () => {
     const root = makeTempRoot('embedding-store');
     const filePath = join(root, '.asd', 'context', 'memory_embeddings.json');
@@ -289,7 +902,10 @@ describe('MemoryEmbeddingStore', () => {
     expect(reloaded.gc(new Set(['m1']))).toBe(1);
     reloaded.flushSync();
 
-    expect(JSON.parse(readFileSync(filePath, 'utf-8'))).toEqual({ m1: [0.1, 0.2] });
+    expect(JSON.parse(readFileSync(filePath, 'utf-8'))).toEqual({
+      schemaVersion: 2,
+      embeddings: { m1: { vector: [0.1, 0.2] } },
+    });
 
     writeFileSync(filePath, '{not-json', 'utf-8');
     const recovered = new MemoryEmbeddingStore(root, { filePath });
@@ -299,6 +915,39 @@ describe('MemoryEmbeddingStore', () => {
 });
 
 describe('ConversationStore', () => {
+  it('rejects conversation ids that escape the store for reads, appends and deletes', () => {
+    const root = makeTempRoot('conversation-id-boundary');
+    const store = new ConversationStore(root);
+    store.create();
+    const victim = join(root, 'victim.jsonl');
+    const original = `${JSON.stringify({ role: 'user', content: 'outside conversation store' })}\n`;
+    writeFileSync(victim, original);
+    expect(store.load('../../victim')).toEqual([]);
+    store.append('../../victim', { role: 'user', content: 'overwritten' });
+    store.delete('../../victim');
+    expect(readFileSync(victim, 'utf8')).toBe(original);
+  });
+
+  it('does not overwrite messages appended while a summary is being generated', async () => {
+    const root = makeTempRoot('conversation-summary-race');
+    const store = new ConversationStore(root);
+    const id = store.create();
+    for (let index = 0; index < 6; index++) {
+      store.append(id, { role: 'user', content: `message ${index}` });
+    }
+    const summarized = await store.summarize(id, {
+      aiProvider: {
+        chat: async () => {
+          store.append(id, { role: 'user', content: 'arrived during summary' });
+          return 'summary';
+        },
+      },
+    });
+    expect(summarized).toBe(false);
+    expect(store.load(id)).toHaveLength(7);
+    expect(store.load(id).at(-1)?.content).toBe('arrived during summary');
+  });
+
   it('persists conversation index and loads only valid JSONL messages within budget', () => {
     const root = makeTempRoot('conversation-store');
     const store = new ConversationStore(root);
@@ -331,6 +980,19 @@ describe('ConversationStore', () => {
 // fixture 硬约束：经真 store.add → getAllActive/deserialize 路径构造（不手搓 camelCase 字面量，
 // 使大小写漂移直接红）；用 raw-row UPDATE 改 updated_at/last_accessed_at 造"旧"记忆。
 describe('MemoryRetriever staleness annotation (A-2)', () => {
+  it('fits actual rendered memory text within the supplied token budget', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      store.add({ content: 'long '.repeat(300), importance: 5, source: 'user' });
+      store.add({ content: 'Short important decision', importance: 9, source: 'user' });
+      const output = await new MemoryRetriever(store).toPromptSection({ tokenBudget: 60 });
+      expect(output).toContain('Short important decision');
+      expect(estimateTokens(output)).toBeLessThanOrEqual(60);
+    } finally {
+      db.close();
+    }
+  });
   function makeRetrieverWith(rows: Array<{ content: string; ageDays: number | null }>) {
     const db = new Database(':memory:');
     const store = new MemoryStore(db);

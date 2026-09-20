@@ -21,8 +21,8 @@ provider/transport 栈、以及契约优先的工具系统 —— 从 Alembic
   Google Gemini、DeepSeek、Ollama 五家厂商,含各厂商 transport、可靠性控制
   (重试 / 熔断 / 并发 / 429 冷却)、参数守卫与结构化输出修复。
 - **工具系统** —— 单源工具注册表 + `ToolRouter` + kernel 契约,内建
-  `code` / `terminal` / `knowledge` / `graph` / `memory` / `meta`
-  六类 handler,附终端安全模型与输出压缩。
+  `code` / `terminal` / `knowledge` / `graph` / `memory` / `meta` / `evidence`
+  七类 handler,附终端安全模型与输出压缩。
 
 **不是:**
 
@@ -37,45 +37,14 @@ provider/transport 栈、以及契约优先的工具系统 —— 从 Alembic
 
 ## 架构
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Surface Layer   HTTP · CLI · MCP · Workflow(宿主表面)         │
-│                 只构造 AgentRunInput                           │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ AgentRunInput
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentService    统一服务入口 + profile 编译                    │
-│                 校验 → AgentProfileCompiler →                  │
-│                 (AgentRunCoordinator 扇出?) →                  │
-│                 AgentRuntimeBuilder → runtime.execute →        │
-│                 规范化 AgentRunResult(异常降级为结构化结果,   │
-│                 绝不外抛)                                      │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ CompiledAgentProfile
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentRuntimeBuilder   profile + DI(container/tools/ai/root)  │
-│                       → preset 合并 → strategy 解析 →          │
-│                       capabilities → PolicyEngine → Runtime    │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ new AgentRuntime(config)
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentRuntime    ReAct 循环(Thought → Action → Observation)   │
-│   ├─ Capability   技能 / 工具白名单组合                        │
-│   ├─ Strategy     Single / Pipeline / FanOut / Adaptive        │
-│   ├─ Policy       Budget(硬停机)/ Safety(硬拦截)/          │
-│   │               QualityGate(软告警)                        │
-│   └─ 横切: 记忆 / 上下文 / 事件 / 诊断 / PCV 证据 / 预算压缩   │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ tool call
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ Action Layer    ToolRouter → handler(code / terminal /       │
-│                 knowledge / graph / memory / meta)            │
-│                 只执行动作,不选择 profile                     │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Host[Host: AgentRunInput] --> Service[AgentService: profile compilation]
+  Service --> Builder[AgentRuntimeBuilder: capabilities, strategy, policies]
+  Builder --> Runtime[AgentRuntime: ReAct loop]
+  Runtime <--> AI[AiProvider / LLMGateway / Transport]
+  Runtime <--> Tools[ToolExecutionPipeline / Router / Handler]
+  Runtime --> Result[Status, phase outcomes, usage, diagnostics]
 ```
 
 基线 preset(一个 profile 声明 capabilities、strategy、policies;
@@ -85,8 +54,8 @@ provider/transport 栈、以及契约优先的工具系统 —— 从 Alembic
 | Preset      | Capabilities            | Strategy          | Policies          |
 | ----------- | ----------------------- | ----------------- | ----------------- |
 | `chat`      | Conversation + Analysis | Single            | Budget(8 轮)    |
-| `bootstrap` | Analysis + Knowledge    | FanOut + Pipeline | Budget + Quality  |
-| `scan`      | Analysis + Knowledge    | Pipeline          | Budget + Quality  |
+| `insight`   | Analysis + Knowledge    | Pipeline          | Budget + Quality  |
+| `evolution` | Evolution analysis      | Pipeline          | Budget + Quality  |
 
 领域化 run(`src/agent/runs/`:plan、scan、evolution、relation、
 translation、module mining)以领域 profile 与结果投影包装同一个服务入口。
@@ -100,10 +69,10 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
 | `src/agent/service/` | `AgentService` 入口、`AgentRuntimeBuilder` DI 装配、run 契约、系统运行上下文工厂 |
 | `src/agent/runtime/` | `AgentRuntime` ReAct 内核、`LoopContext`、`ExitController`、`BudgetController`、`ToolExecutionPipeline`、LLM 输入装配/计量、钩子/事件/诊断、冻结接口契约、PCV 节点证据(observe-only) |
 | `src/agent/profiles/` | Preset、可序列化 profile 定义、`AgentProfileCompiler`、注册表 |
-| `src/agent/strategies/` | `Single` / `FanOut` / `Adaptive` / `Pipeline` 编排策略 |
+| `src/agent/strategies/` | `Single` / `FanOut` / `Pipeline` 编排策略 |
 | `src/agent/policies/` | `PolicyEngine` 与 Budget / Safety / QualityGate 三类 policy |
-| `src/agent/capabilities/` | Capability 注册表(技能 + 工具白名单组合) |
-| `src/agent/memory/` + `src/agent/domain/` | 三层记忆(`ActiveContext` 工作记忆 / `SessionStore` 会话记忆 / `PersistentMemory` SQLite 语义记忆),由 `MemoryCoordinator` 统一协调;证据采集与情节固化 |
+| `src/tools/runtime/toolsets/` | Capability 注册表(技能 + 工具白名单组合) |
+| `src/agent/memory/` + `src/agent/evidence/` | 三层记忆(`ActiveContext` 工作记忆 / `SessionStore` 会话记忆 / `PersistentMemory` SQLite 语义记忆),由 `MemoryCoordinator` 统一协调;证据采集与情节固化 |
 | `src/agent/context/` | `ContextWindow`(多级递进压缩)、`ExplorationTracker` 探索追踪、计划跟踪、nudge 引导 |
 | `src/agent/prompts/` | Insight 提示词体系(analyst → producer → gate → evolver)与扫描提示词 |
 | `src/agent/runs/` + `coordination/` + `tasks/` | 领域化 run、扇出协调、宿主 task 处理器 |
@@ -114,20 +83,20 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
 
 子路径入口(见 `package.json` 的 `exports`):`.`、`./agent`、`./service`、
 `./runtime`、`./prompts`、`./domain`、`./tasks`、`./profiles`、`./ai`、
-`./tools/runtime`、`./memory`、`./context`。
+`./tools/runtime`、`./memory`、`./context`、`./runs`、`./production`、`./evaluation`。
 
 内部 import 使用 `#agent/*`、`#ai/*`、`#shared/*`、`#tools/*` 别名
 (`alembic-dev` 条件下解析到 `src/`,否则解析到 `dist/`)。
 
 ## 关键运行时保证
 
-- **结构化结果,异常绝不外泄** —— 单次执行路径的异常被降级成完整的
+- **结构化执行结果** —— 单次 runtime 执行错误被归一为完整的
   `AgentRunResult`,状态归一为五态(success / blocked / aborted / timeout /
   error);冻结的 `AgentInterfaceContract` 固化结果分支、普通输出策略与
-  失败分类学。
-- **预算只压缩,退出归退出** —— session 预算阈值只触发分级上下文压缩;
+  失败分类学。输入校验、profile 编译和装配错误会抛出异常，由宿主处理。
+- **预算与退出** —— session 预算压力触发分级上下文压缩;显式预算耗尽、
   终止由 max-iterations / timeout / `ExitController` 退出信号负责,并有
-  强制总结兜底,保证最终回复永不为空。
+  强制总结兜底,在允许收尾时保留已有成果；取消和超时不会追加模型总结。
 - **工具安全** —— `terminal` 在全局危险命令黑名单 + 只读 allowlist
   双层安全下执行,可用时走沙箱(降级时记审计);`code.write` 强制
   写前新鲜度门(read-before-write / TOCTOU),由 run 级共享的
@@ -191,3 +160,13 @@ manifest 会把本地 `file:../AlembicCore` 依赖替换成 registry 版
 ## 许可证
 
 MIT
+
+## 验证范围与宿主装配
+
+`npm run check` 包含真实相邻 Alembic 宿主的 strict-consumer 验证。
+CI 的 `npm run check:ci` 运行当前 Agent/Core checkout 可执行的同组门禁；宿主验证需要另备完整 Alembic 安装。
+`build` 清理本仓 `dist/` 后重新编译，防止已删除源码的旧产物继续进入发布包。
+
+基础 preset 为 chat / insight / evolution；scan、generate、module-mining 等是领域 profile。
+严格生产须由宿主显式注入 strictProduction 端口；系统上下文默认只建立工作记忆，持久记忆与会话存储由宿主装配。
+运行 status 与阶段业务结果分开：取消、拒绝、超时、错误均有明确状态；知识生产还应检查阶段 outcome、实际创建的 pending/staging 候选和 readiness。

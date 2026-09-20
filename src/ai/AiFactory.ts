@@ -149,7 +149,7 @@ export async function getProviderWithFallback() {
     return null;
   }
 
-  const currentProvider = (process.env.ALEMBIC_AI_PROVIDER || 'google').toLowerCase();
+  const currentProvider = primary.name;
 
   try {
     if (typeof primary.probe === 'function') {

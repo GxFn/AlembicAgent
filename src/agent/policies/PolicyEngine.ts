@@ -75,8 +75,18 @@ export class PolicyEngine {
       return { ok: true };
     }
 
-    if (toolName === 'terminal' && typeof args?.bin === 'string') {
-      const check = safety.checkCommand(formatTerminalExecForSafetyPolicy(args));
+    const terminalParams =
+      args?.params && typeof args.params === 'object'
+        ? (args.params as Record<string, unknown>)
+        : args;
+    const command =
+      typeof terminalParams.command === 'string'
+        ? terminalParams.command
+        : typeof args?.bin === 'string'
+          ? formatTerminalExecForSafetyPolicy(args)
+          : null;
+    if (toolName === 'terminal' && command !== null) {
+      const check = safety.checkCommand(command);
       if (!check.safe) {
         return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
       }

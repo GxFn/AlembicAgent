@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
@@ -79,7 +80,14 @@ async function handleSearch(
       break;
     }
 
-    const cacheKey = `${pattern}|${glob ?? ''}|${regex ? 'r' : 'l'}`;
+    const cacheKey = JSON.stringify([
+      ctx.projectRoot,
+      pattern,
+      glob ?? null,
+      regex,
+      maxResults,
+      contextLines,
+    ]);
     const cached = ctx.searchCache?.get(cacheKey);
     if (cached) {
       const cachedResult = cached as { matches: SearchMatch[]; total: number };
@@ -461,7 +469,8 @@ async function readSingleFile(
 
   if (ctx.deltaCache) {
     const delta = ctx.deltaCache.check(resolved.relPath, content);
-    if (delta.mode === 'unchanged') {
+    // 文件指纹相同不代表该区间已展示；范围补读必须返回真实源码。
+    if (delta.mode === 'unchanged' && !startLine && !endLine && !maxLines) {
       return {
         ok: true,
         path: resolved.relPath,
@@ -673,13 +682,10 @@ async function handleStructure(
   const directory = (params.directory as string) || '.';
   const depth = Math.min((params.depth as number) || 3, 5);
 
-  const absDir = path.resolve(ctx.projectRoot, directory);
-  if (!isPathInsideProject(absDir, ctx.projectRoot)) {
-    return fail('Access denied: path is outside project root');
-  }
-
   try {
-    const tree = await buildDirectoryTree(absDir, ctx.projectRoot, depth, 0);
+    const absDir = resolveProjectPath(ctx.projectRoot, directory).absolute;
+    const canonicalRoot = resolveProjectPath(ctx.projectRoot, '.').absolute;
+    const tree = await buildDirectoryTree(absDir, canonicalRoot, depth, 0);
     return ok(tree, { tokensEstimate: estimateTokens(tree) });
   } catch (err: unknown) {
     return fail(`Cannot list structure: ${err instanceof Error ? err.message : String(err)}`);
@@ -937,20 +943,16 @@ function resolveProjectFilePath(
   filePath: string,
   projectRoot: string
 ): { ok: true; absPath: string; relPath: string } | { ok: false; error: string } {
-  const absPath = path.resolve(projectRoot, filePath);
-  if (!isPathInsideProject(absPath, projectRoot)) {
-    return { ok: false, error: 'Access denied: path is outside project root' };
+  try {
+    const resolved = resolveProjectPath(projectRoot, filePath, true);
+    return {
+      ok: true,
+      absPath: resolved.absolute,
+      relPath: resolved.relative || path.basename(resolved.absolute),
+    };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Cannot resolve project path' };
   }
-  return {
-    ok: true,
-    absPath,
-    relPath: path.relative(projectRoot, absPath) || path.basename(absPath),
-  };
-}
-
-function isPathInsideProject(absPath: string, projectRoot: string): boolean {
-  const rel = path.relative(projectRoot, absPath);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
 function clampReadResult(

@@ -14,6 +14,7 @@ import { exec } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
@@ -247,7 +248,14 @@ function resolveTerminalCwd(
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
     return { ok: false, error: `cwd must be within project root: ${root}` };
   }
-  return { ok: true, cwd };
+  try {
+    return { ok: true, cwd: resolveProjectPath(root, cwd).absolute };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: `cwd must be within project root: ${root}; ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 function terminalMeta(

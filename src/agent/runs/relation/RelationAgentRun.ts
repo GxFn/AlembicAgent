@@ -34,17 +34,28 @@ export async function runRelationDiscovery({
 export function projectRelationDiscoveryResult(result: AgentRunResult): RelationDiscoveryResult {
   const phases = result.phases as Record<string, { reply?: string }> | undefined;
   const synthesizeReply = phases?.synthesize?.reply || result.reply;
-  const parsed = parseJsonResponse(synthesizeReply, { analyzed: 0, relations: [] });
+  const value = parseJsonResponse(synthesizeReply, { analyzed: 0, relations: [] });
+  const parsed =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const relations = Array.isArray(parsed.relations) ? parsed.relations.filter(isRelation) : [];
   return {
-    analyzed: typeof parsed.analyzed === 'number' ? parsed.analyzed : 0,
-    relations: Array.isArray(parsed.relations)
-      ? (parsed.relations as RelationDiscoveryResult['relations'])
-      : [],
+    analyzed:
+      typeof parsed.analyzed === 'number' &&
+      Number.isSafeInteger(parsed.analyzed) &&
+      parsed.analyzed >= 0
+        ? parsed.analyzed
+        : 0,
+    relations,
     diagnostics: {
       toolCallCount: result.toolCalls.length,
       iterations: result.usage.iterations,
       durationMs: result.usage.durationMs,
       runtimeDiagnostics: result.diagnostics || null,
+      invalidRelationCount: Array.isArray(parsed.relations)
+        ? parsed.relations.length - relations.length
+        : 0,
     },
   };
 }
@@ -52,7 +63,7 @@ export function projectRelationDiscoveryResult(result: AgentRunResult): Relation
 function parseJsonResponse(
   text: string | null | undefined,
   fallback: RelationDiscoveryResult
-): RelationDiscoveryResult {
+): unknown {
   if (!text) {
     return fallback;
   }
@@ -69,4 +80,17 @@ function parseJsonResponse(
   } catch {
     return fallback;
   }
+}
+
+function isRelation(value: unknown): value is RelationDiscoveryResult['relations'][number] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const relation = value as Record<string, unknown>;
+  return (
+    ['from', 'to', 'type'].every(
+      (key) => typeof relation[key] === 'string' && String(relation[key]).trim().length > 0
+    ) &&
+    (relation.evidence === undefined || typeof relation.evidence === 'string')
+  );
 }

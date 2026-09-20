@@ -1,30 +1,40 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, test, vi } from 'vitest';
+import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
+import { normalizeOllamaBaseUrl, OllamaProvider } from '../src/ai/providers/OllamaProvider.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
-
-/**
- * Mock 全局 fetch，捕获请求 url + body，返回指定响应。
- * 用于在无真实 API key 的前提下验证 OpenAiProvider 的请求构造与响应解析。
- */
-function mockFetch(
-  capture: { url?: string; body?: Record<string, unknown> },
-  response: Record<string, unknown>
-) {
-  const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-    capture.url = String(url);
-    capture.body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
-    return {
-      ok: true,
-      json: async () => response,
-      text: async () => '',
-    } as Response;
-  });
-  vi.stubGlobal('fetch', fetchMock);
-  return fetchMock;
-}
+import { mockJsonFetch as mockFetch } from './helpers/mockFetch.js';
 
 describe('OpenAiProvider baseUrl override', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('honors an explicit zero retry limit', () => {
+    expect(new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 }).maxRetries).toBe(0);
+  });
+
+  it('shares the concurrency gate across simultaneous first requests', async () => {
+    let active = 0;
+    let peak = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active--;
+        return {
+          ok: true,
+          json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+        } as Response;
+      })
+    );
+    const provider = new OpenAiProvider({ apiKey: 'test-key', maxConcurrency: 1, maxRetries: 0 });
+    expect(await Promise.all([provider.chat('first'), provider.chat('second')])).toEqual([
+      'ok',
+      'ok',
+    ]);
+    expect(peak).toBe(1);
   });
 
   it('uses ALEMBIC_OPENAI_BASE_URL / config.baseUrl for chat/completions endpoint', async () => {
@@ -193,5 +203,110 @@ describe('OpenAiProvider Responses API style', () => {
 
     expect(capture.body?.text).toEqual({ format: { type: 'json_object' } });
     expect(result).toEqual({ title: 'T', description: 'D' });
+  });
+});
+
+function mockDeepSeekFetch(
+  capture: { body?: Record<string, unknown> },
+  response: Record<string, unknown> = {
+    choices: [{ message: { content: 'ok' } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }
+) {
+  return mockFetch(capture, response);
+}
+
+describe('DeepSeekProvider V4 tool calls', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('omits tool_choice for V4 tool requests even when required is requested', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    const provider = new DeepSeekProvider({ apiKey: 'test-key', model: 'deepseek-v4-pro' });
+
+    await provider.chatWithTools('inspect code', {
+      messages: [{ role: 'user', content: 'inspect code' }],
+      toolSchemas: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'required',
+      maxTokens: 1024,
+    });
+
+    expect(capture.body?.thinking).toEqual({ type: 'enabled' });
+    expect(capture.body?.tool_choice).toBeUndefined();
+  });
+
+  it('keeps text function-call parsing as compatibility, independent from required tool_choice', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture, {
+      choices: [
+        {
+          finish_reason: 'length',
+          message: {
+            content:
+              '<function_calls><invoke name="code"><parameter name="action">read</parameter><parameter name="path">Sources/App.swift</parameter></invoke></function_calls>',
+            reasoning_content: 'need file evidence',
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    const provider = new DeepSeekProvider({ apiKey: 'test-key', model: 'deepseek-v4-pro' });
+
+    const result = await provider.chatWithTools('inspect code', {
+      messages: [{ role: 'user', content: 'inspect code' }],
+      toolSchemas: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'auto',
+      maxTokens: 1024,
+    });
+
+    expect(result.text).toBeNull();
+    expect(result.finishReason).toBe('length');
+    expect(result.functionCalls).toEqual([
+      {
+        id: 'call_deepseek_compat_1',
+        name: 'code',
+        args: { action: 'read', path: 'Sources/App.swift' },
+      },
+    ]);
+  });
+});
+
+describe('normalizeOllamaBaseUrl', () => {
+  test('bare host:port gets /v1 appended with an info trace', () => {
+    const logger = { info: vi.fn() };
+    expect(normalizeOllamaBaseUrl('http://127.0.0.1:11434', logger as never)).toBe(
+      'http://127.0.0.1:11434/v1'
+    );
+    expect(logger.info).toHaveBeenCalledOnce();
+  });
+
+  test('bare root with trailing slash also normalizes', () => {
+    expect(normalizeOllamaBaseUrl('http://localhost:11434/')).toBe('http://localhost:11434/v1');
+  });
+
+  test('explicit /v1 is preserved (only trailing slash stripped)', () => {
+    expect(normalizeOllamaBaseUrl('http://localhost:11434/v1')).toBe('http://localhost:11434/v1');
+    expect(normalizeOllamaBaseUrl('http://localhost:11434/v1/')).toBe('http://localhost:11434/v1');
+  });
+
+  test('custom reverse-proxy path is left untouched', () => {
+    expect(normalizeOllamaBaseUrl('https://gw.example.com/ollama/v1')).toBe(
+      'https://gw.example.com/ollama/v1'
+    );
+    expect(normalizeOllamaBaseUrl('https://gw.example.com/custom-openai')).toBe(
+      'https://gw.example.com/custom-openai'
+    );
+  });
+
+  test('invalid url passes through for the transport to surface the real error', () => {
+    expect(normalizeOllamaBaseUrl('not-a-url')).toBe('not-a-url');
+  });
+
+  test('OllamaProvider constructor applies normalization to configured baseUrl', () => {
+    // 2026-07-06 真机根因回归钉：settings 面板写入的裸 host:port 必须能直接工作。
+    const provider = new OllamaProvider({ baseUrl: 'http://127.0.0.1:11434' });
+    expect(provider.baseUrl).toBe('http://127.0.0.1:11434/v1');
   });
 });

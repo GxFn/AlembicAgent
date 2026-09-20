@@ -48,6 +48,47 @@ function pipelineOutcome(result: { phases?: Record<string, unknown> }) {
 }
 
 describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
+  it.each([
+    'before',
+    'during',
+  ])('stops stages and gates when aborted %s execution', async (when) => {
+    const controller = new AbortController();
+    const { runtime, calls } = createFakeRuntime();
+    const original = runtime.reactLoop;
+    runtime.reactLoop = async (prompt) => {
+      const result = await original(prompt);
+      controller.abort();
+      return result;
+    };
+    let gateCalls = 0;
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: {
+            evaluator: () => {
+              gateCalls++;
+              return { action: 'pass', pass: true };
+            },
+          },
+        },
+        { name: 'produce' },
+      ],
+    });
+    if (when === 'before') {
+      controller.abort();
+    }
+    const result = await strategy.execute(
+      runtime,
+      new AgentMessage({ content: 'cancelled work' }),
+      { abortSignal: controller.signal }
+    );
+    expect(calls).toHaveLength(when === 'before' ? 0 : 1);
+    expect(gateCalls).toBe(0);
+    expect(result.outcome).toBe('aborted');
+    expect(result.diagnostics.efficiency?.cancelReason).toBe('abort_signal');
+  });
   it('gate degrade → outcome=abandoned 携带 stage/action/reason，且下游执行阶段被跳过', async () => {
     const { runtime, calls } = createFakeRuntime();
     const strategy = new PipelineStrategy({

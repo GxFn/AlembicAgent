@@ -29,6 +29,7 @@ import {
   renderReportMarkdown,
   scoreFixture,
 } from './lib/mining-eval-core.mjs';
+import { createEvaluationRecipeGateway } from './lib/mining-eval-runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -258,20 +259,7 @@ async function runFixture(fixture) {
     : null;
 
   const created = [];
-  const gateway = {
-    async create(input) {
-      created.push(...input.items);
-      return {
-        created: input.items.map((item, index) => ({
-          id: `eval-${fixture.id}-${created.length}-${index}`,
-          title: String(item.title ?? ''),
-        })),
-        duplicates: [],
-        rejected: [],
-        blocked: [],
-      };
-    },
-  };
+  const gateway = createEvaluationRecipeGateway(created, fixture.id);
 
   const memoryCoordinator = new MemoryCoordinator();
   const scopeId = `eval-${fixture.id}:analyst`;

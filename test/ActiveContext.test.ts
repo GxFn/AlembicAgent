@@ -40,6 +40,13 @@ function envelope(
 }
 
 describe('ActiveContext observation ledger', () => {
+  it('keeps a high-priority finding when a lower-priority finding exceeds the budget', () => {
+    const ctx = new ActiveContext();
+    ctx.noteKeyFinding('Critical boundary', 'src/a.ts:1', 9);
+    ctx.noteKeyFinding('background '.repeat(500), 'src/b.ts:1', 2);
+    expect(ctx.buildContext(100)).toContain('Critical boundary');
+    expect(ctx.buildContext(100)).not.toContain('background '.repeat(500));
+  });
   it('renders a structured ledger instead of raw compressed observation dumps', () => {
     const ctx = new ActiveContext({ maxRecentRounds: 0 });
     ctx.startRound(1);

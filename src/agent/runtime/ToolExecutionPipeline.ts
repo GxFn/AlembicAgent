@@ -17,6 +17,8 @@
  * @module core/ToolExecutionPipeline
  */
 
+import path from 'node:path';
+import { stableStringify } from '#shared/serialization.js';
 import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
 import {
   projectToolResultOrdinaryOutput,
@@ -24,11 +26,15 @@ import {
   type ToolResultEnvelope,
   type ToolResultStatus,
 } from '#tools/kernel/index.js';
+import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
+import { checkTerminalCommandAllowlist } from '#tools/runtime/handlers/terminalSafety.js';
+import { DEPTH_SLOT_PROPS } from '#tools/runtime/registry.js';
 import {
   appendEvidenceAnnotation,
   captureEvidenceFromEnvelope,
 } from '../evidence/EvidenceCapture.js';
 import { SafetyPolicy } from '../policies/index.js';
+import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcomes.js';
 import type { AgentRuntime } from './AgentRuntime.js';
 import type { LoopContext } from './LoopContext.js';
 
@@ -102,6 +108,11 @@ function toExecutableToolCall(call: ToolCall): ToolCall {
         excerpt: call.args.excerpt,
         evidence: call.args.evidence,
         importance: call.args.importance,
+        ...Object.fromEntries(
+          Object.keys(DEPTH_SLOT_PROPS)
+            .filter((key) => call.args[key] !== undefined)
+            .map((key) => [key, call.args[key]])
+        ),
       },
     },
   };
@@ -171,22 +182,6 @@ interface ProducerSubmitLedger {
   targetSubmits?: number;
 }
 
-const READ_LIKE_ACTIONS = new Set([
-  'detail',
-  'get_previous_evidence',
-  'inspect',
-  'list',
-  'outline',
-  'overview',
-  'query',
-  'read',
-  'recall',
-  'review',
-  'search',
-  'structure',
-  'tools',
-]);
-
 const SIDE_EFFECT_ACTIONS = new Set([
   'approve',
   'create',
@@ -255,12 +250,22 @@ function isDeterministicDuplicateCandidate(call: ToolCall, ctx: ToolExecContext)
   if (SIDE_EFFECT_ACTIONS.has(action)) {
     return false;
   }
-  const manifest = getToolManifest(ctx.runtime, call.name);
-  if (manifest && manifest.execution.concurrency === 'exclusive') {
+  // 文件/知识/记忆/台账都是运行中可变状态。外层复用会绕过 handler 的新鲜度检查，
+  // 因而只缓存显式声明为只读、并绑定真实 snapshot 的其他工具。
+  if (
+    ['code', 'memory', 'knowledge', 'evidence'].includes(call.name) ||
+    (call.name === 'meta' && action === 'review')
+  ) {
     return false;
   }
-  if (READ_LIKE_ACTIONS.has(action)) {
-    return true;
+  const manifest = getToolManifest(ctx.runtime, call.name);
+  if (
+    !manifest ||
+    manifest.execution.concurrency === 'exclusive' ||
+    manifest.execution.cachePolicy === 'none' ||
+    !resolveProjectSnapshotId(ctx)
+  ) {
+    return false;
   }
   return isReadLikeManifest(manifest);
 }
@@ -279,27 +284,6 @@ function cloneCacheValue<T>(value: T): T {
   }
 }
 
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-  if (value instanceof Set) {
-    return stableStringify([...value].sort());
-  }
-  if (value instanceof Map) {
-    const entries = [...value.entries()].sort(([left], [right]) =>
-      String(left).localeCompare(String(right))
-    );
-    return stableStringify(entries);
-  }
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
-}
-
 function measureToolArgBytes(call: ToolCall): { ok: true; bytes: number } | { ok: false } {
   try {
     const serialized = String(stableStringify(call.args) ?? '');
@@ -309,7 +293,7 @@ function measureToolArgBytes(call: ToolCall): { ok: true; bytes: number } | { ok
   }
 }
 
-function resolveProjectSnapshotId(ctx: ToolExecContext): string {
+function resolveProjectSnapshotId(ctx: ToolExecContext): string | null {
   const shared = (ctx.loopCtx.sharedState || {}) as ToolEfficiencySharedState;
   const context = ctx.loopCtx.context || {};
   const explicit =
@@ -319,19 +303,11 @@ function resolveProjectSnapshotId(ctx: ToolExecContext): string {
     context.workspaceRevision ??
     shared._projectSnapshotId ??
     shared._projectRevision ??
-    shared._workspaceRevision ??
-    shared._dimensionScopeId;
+    shared._workspaceRevision;
   if (explicit) {
     return String(explicit);
   }
-  if (Array.isArray(ctx.runtime.fileCache)) {
-    const paths = ctx.runtime.fileCache
-      .map((file) => `${file.relativePath}:${file.content?.length ?? 0}`)
-      .sort()
-      .join('|');
-    return `file-cache:${ctx.runtime.fileCache.length}:${paths}`;
-  }
-  return 'session';
+  return null;
 }
 
 function buildCacheKey(call: ToolCall, ctx: ToolExecContext): string {
@@ -630,6 +606,51 @@ export const toolArgumentBoundsGate = {
   },
 };
 
+/** 宿主 router 不一定实现运行时策略；在调用宿主前执行当前 profile 的完整安全约束。 */
+const runtimeSafetyGate: ToolMiddleware = {
+  name: 'runtimeSafetyGate',
+  before(call, ctx) {
+    const executable = toExecutableToolCall(call);
+    const params = getToolParams(executable);
+    const policyParams = { ...params };
+    if (executable.name === 'code' && ctx.runtime.projectRoot) {
+      for (const key of ['path', 'filePath']) {
+        if (typeof policyParams[key] === 'string') {
+          policyParams[key] = path.resolve(ctx.runtime.projectRoot, policyParams[key]);
+        }
+      }
+      if (Array.isArray(policyParams.filePaths)) {
+        policyParams.filePaths = policyParams.filePaths.map((file) =>
+          typeof file === 'string' ? path.resolve(ctx.runtime.projectRoot, file) : file
+        );
+      }
+    }
+    const policy = ctx.runtime.policies.validateToolCall?.(executable.name, {
+      ...executable.args,
+      params: policyParams,
+    });
+    if (policy && !policy.ok) {
+      return {
+        blocked: true,
+        result: { error: policy.reason || 'Tool call denied by runtime policy' },
+      };
+    }
+    if (executable.name === 'terminal' && typeof params.command === 'string') {
+      for (const capability of ctx.loopCtx.capabilities ?? []) {
+        const allowlist = (capability as { commandAllowlist?: TerminalCommandAllowlist })
+          .commandAllowlist;
+        if (allowlist) {
+          const check = checkTerminalCommandAllowlist(params.command, allowlist.bins);
+          if (!check.safe) {
+            return { blocked: true, result: { error: `Command blocked: ${check.block.reason}` } };
+          }
+        }
+      }
+    }
+    return undefined;
+  },
+};
+
 function isActionAllowed(loopCtx: LoopContext, toolName: string, actionName: string): boolean {
   const allowedNames = new Set(loopCtx?.allowedToolIds || []);
   if (!allowedNames.has(toolName)) {
@@ -695,7 +716,7 @@ const PRODUCER_META_ACTIONS = new Set(['review']);
 function getToolParams(call: ToolCall): Record<string, unknown> {
   return call.args?.params && typeof call.args.params === 'object'
     ? (call.args.params as Record<string, unknown>)
-    : {};
+    : call.args;
 }
 
 /**
@@ -811,6 +832,10 @@ export const producerSubmitOnlyGate = {
     }
 
     if (phase !== 'PRODUCE') {
+      return undefined;
+    }
+
+    if (call.name === 'evidence' && EVIDENCE_READ_ACTIONS.has(action)) {
       return undefined;
     }
 
@@ -945,7 +970,14 @@ export const trackerSignal = {
   name: 'trackerSignal',
   after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
     if (ctx.loopCtx.tracker) {
-      const r = ctx.loopCtx.tracker.recordToolCall(call.name, call.args, result);
+      const r = ctx.loopCtx.tracker.recordToolCall(
+        call.name,
+        call.args,
+        // 失败状态优先于内层业务 payload；成功时仍给信号检测器原始结果。
+        meta.blocked || !readToolObservation({ ...call, result, envelope: meta.envelope }).ok
+          ? { ok: false, status: meta.envelope?.status || 'blocked', data: result }
+          : result
+      );
       meta.isNew = r.isNew;
     }
   },
@@ -975,7 +1007,7 @@ export const submitDedup = {
   name: 'submitDedup',
 
   after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
-    if (call.name !== 'knowledge') {
+    if (meta.blocked || call.name !== 'knowledge') {
       return;
     }
     const action = String(call.args?.action || '');
@@ -983,11 +1015,11 @@ export const submitDedup = {
       return;
     }
 
-    const resultObj = result as Record<string, unknown> | null;
-    const status = typeof result === 'object' ? String(resultObj?.status || '') : '';
-    if (status !== 'created') {
+    const observed = { ...call, result, envelope: meta.envelope };
+    if (!isPersistedSubmission(observed)) {
       return;
     }
+    const resultObj = readToolObservation(observed).result;
 
     // V2 args structure: { action: "submit", params: { title, ... } }
     const params = (call.args?.params as Record<string, unknown>) ?? call.args ?? {};
@@ -1236,7 +1268,7 @@ export const eventBusPublisher = {
  *   5. traceRecord (推理链)
  *   6. submitDedup (提交成功后登记会话状态；不做提前拦截)
  *
- * Runtime SafetyPolicy 已迁入 ToolRouter/GovernanceEngine 的 approve 阶段。
+ * Runtime SafetyPolicy 与当前阶段的命令白名单在进入宿主 router 前强制检查。
  *
  * NOTE: eventBusPublisher 和 progressEmitter 不在默认管道中，
  * 由 #processToolCalls 直接处理，以保持与原始 reactLoop 完全一致的事件顺序
@@ -1246,6 +1278,7 @@ export function createToolPipeline() {
   return new ToolExecutionPipeline()
     .use(allowlistGate)
     .use(toolArgumentBoundsGate)
+    .use(runtimeSafetyGate)
     .use(evolutionDecisionGate)
     .use(recordRepairOnlyGate)
     .use(analystVerifyOnlyGate)

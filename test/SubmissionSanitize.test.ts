@@ -3,7 +3,6 @@
  * 证据驱动 scope 收窄、逐违规修复模板。
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
@@ -11,10 +10,11 @@ import {
   buildViolationRepairTemplates,
   sanitizeSubmissionEvidence,
 } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 function makeWorkspace() {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sanitize-proj-'));
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sanitize-data-'));
+  const projectRoot = createTempProject('sanitize-proj-');
+  const dataRoot = createTempProject('sanitize-data-');
   // 多仓形态：真实文件在 AlembicAgent/config/ 下（模型常漏写仓库前缀）
   fs.mkdirSync(path.join(projectRoot, 'AlembicAgent/config'), { recursive: true });
   fs.writeFileSync(
@@ -134,6 +134,19 @@ describe('sanitizeSubmissionEvidence（E7）', () => {
 });
 
 describe('repairStyleViolations（E7-R 修复子调用）', () => {
+  test('preserves braces and code fences inside repaired JSON strings', async () => {
+    const { repairStyleViolations } = await import(
+      '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
+    );
+    const markdown = 'Use an opening brace { and a ```ts code fence';
+    const result = await repairStyleViolations(
+      { content: { markdown: 'before' } },
+      [{ code: 'CONTENT_CONTRAST_MISSING' }],
+      { chat: async () => JSON.stringify({ markdown }) },
+      { positive: ['Use'], negative: ['Avoid'] }
+    );
+    expect(result?.content).toEqual({ markdown });
+  });
   const allowlist = { positive: ['使用', '统一'], negative: ['避免'] };
   const item = {
     title: 'T',
@@ -229,7 +242,7 @@ describe('Recipe production adapter（bounded code only）', () => {
     const { prepareRecipeProductionItem } = await import(
       '../src/tools/runtime/handlers/recipeProductionAdapter.js'
     );
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'corecode-'));
+    const projectRoot = createTempProject('corecode-');
     fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
     fs.writeFileSync(path.join(projectRoot, 'lib/a.ts'), 'L1\nconst real = 1;\nL3', 'utf8');
     const rejected = prepareRecipeProductionItem(
@@ -259,8 +272,8 @@ describe('Recipe production adapter（bounded code only）', () => {
 describe('门禁分层 v2（2026-07-04 用户裁定：证据硬门+风格 advisory 不阻断）', () => {
   async function submitFixture(overrides: Record<string, unknown>) {
     const { handle: handleKnowledge } = await import('../src/tools/runtime/handlers/knowledge.js');
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-tier-'));
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-tier-data-'));
+    const projectRoot = createTempProject('gate-tier-');
+    const dataRoot = createTempProject('gate-tier-data-');
     fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
     fs.writeFileSync(
       path.join(projectRoot, 'lib/a.ts'),
@@ -399,7 +412,7 @@ describe('EVIDENCE_REFS_REQUIRED 以 resolvedRefs 判定（run-6 无 file 条目
     const { expandEvidenceRefsForSubmit } = await import(
       '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
     );
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'labelless-'));
+    const dataRoot = createTempProject('labelless-');
     const ledger = new EvidenceLedgerStore({
       dataRoot,
       jobId: 'j2',
@@ -428,8 +441,8 @@ describe('EVIDENCE_REFS_REQUIRED 以 resolvedRefs 判定（run-6 无 file 条目
     const { sanitizeSubmissionEvidence } = await import(
       '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
     );
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-'));
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-root-'));
+    const dataRoot = createTempProject('backfill-');
+    const projectRoot = createTempProject('backfill-root-');
     for (const rel of ['src/tools/index.ts', 'src/agent/index.ts', 'src/other.ts']) {
       fs.mkdirSync(path.dirname(path.join(projectRoot, rel)), { recursive: true });
       fs.writeFileSync(path.join(projectRoot, rel), 'export {};\n', 'utf8');
@@ -489,7 +502,7 @@ describe('M2 采集形态（search 一等公民 + terminal 归属）', () => {
     const { expandEvidenceRefsForSubmit } = await import(
       '../src/tools/runtime/handlers/submitEvidenceExpansion.js'
     );
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'm2-derive-'));
+    const dataRoot = createTempProject('m2-derive-');
     const ledger = new EvidenceLedgerStore({
       dataRoot,
       jobId: 'j4',
@@ -518,7 +531,7 @@ describe('M2 采集形态（search 一等公民 + terminal 归属）', () => {
     const { captureEvidenceFromEnvelope } = await import(
       '../src/agent/evidence/EvidenceCapture.js'
     );
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'm2-term-'));
+    const dataRoot = createTempProject('m2-term-');
     const ledger = new EvidenceLedgerStore({
       dataRoot,
       jobId: 'j5',

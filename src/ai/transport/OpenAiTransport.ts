@@ -113,6 +113,10 @@ export class OpenAiTransport extends LLMTransport {
       }));
     }
 
+    if (request.responseFormat === 'json') {
+      body.response_format = { type: 'json_object' };
+    }
+
     if (request.toolChoice) {
       body.tool_choice = request.toolChoice;
     }

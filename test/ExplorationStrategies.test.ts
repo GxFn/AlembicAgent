@@ -10,6 +10,23 @@ import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
 
 describe('analyst exploration strategy boundaries', () => {
+  it('counts only persisted candidate submissions as producer progress', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10 }
+    );
+    for (const action of ['search', 'detail', 'manage']) {
+      tracker?.recordToolCall('knowledge', { action }, { status: 'success' });
+    }
+    tracker?.recordToolCall('knowledge', { action: 'submit' }, { status: 'duplicate_blocked' });
+    expect(tracker?.totalSubmits).toBe(0);
+    tracker?.recordToolCall(
+      'knowledge',
+      { action: 'submit' },
+      { status: 'created', id: 'recipe-1', lifecycle: 'pending' }
+    );
+    expect(tracker?.totalSubmits).toBe(1);
+  });
   it('keeps SCAN as a no-tool briefing phase and transitions to EXPLORE after one round', () => {
     const tracker = ExplorationTracker.resolve(
       { source: 'system', strategy: 'analyst' },
@@ -181,7 +198,7 @@ describe('analyst exploration strategy boundaries', () => {
     tracker?.recordToolCall(
       'knowledge',
       { action: 'submit' },
-      { id: 'candidate-1', status: 'accepted' }
+      { id: 'candidate-1', status: 'created', lifecycle: 'pending' }
     );
     tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
 
@@ -199,7 +216,7 @@ describe('analyst exploration strategy boundaries', () => {
       tracker?.recordToolCall(
         'knowledge',
         { action: 'submit' },
-        { id: `candidate-${i}`, status: 'accepted' }
+        { id: `candidate-${i}`, status: 'created', lifecycle: 'pending' }
       );
       tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
     }
@@ -214,176 +231,76 @@ describe('analyst exploration strategy boundaries', () => {
     expect(completeText?.shouldContinue).toBe(false);
   });
 
-  it('lets producer final completion text stop after successful submissions', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer' }
-    );
-
-    expect(tracker).not.toBeNull();
-    tracker?.tick();
-    tracker?.recordToolCall(
-      'knowledge',
-      { action: 'submit' },
-      { id: 'candidate-1', status: 'accepted' }
-    );
-    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      '## 候选生产总结\n已完成 1 个候选提交。无未提交发现，不需要 Analyst 补证。'
-    );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
-  });
-
-  it('recognizes Package K producer completion wording as terminal', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer' }
-    );
-
-    expect(tracker).not.toBeNull();
-    tracker?.tick();
-    tracker?.recordToolCall(
-      'knowledge',
-      { action: 'submit' },
-      { id: 'candidate-1', status: 'accepted' }
-    );
-    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      '所有 6 个知识候选已成功提交，覆盖了 Analyst 分析中的全部 6 项发现。无未提交发现，无阻断。'
-    );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
-  });
-
-  it('recognizes Package M submitted/unsubmitted table as terminal', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer' }
-    );
-
-    expect(tracker).not.toBeNull();
-    tracker?.tick();
-    tracker?.recordToolCall(
-      'knowledge',
-      { action: 'submit' },
-      { id: 'candidate-1', status: 'accepted' }
-    );
-    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      '## 提交完成报告\n\n**已提交候选**: 5\n**未提交**: 0\n\n覆盖情况：结构化发现已完成候选提交。'
-    );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
-  });
-
-  it('recognizes Package O mixed English completion summary as terminal', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer' }
-    );
-
-    expect(tracker).not.toBeNull();
-    tracker?.tick();
-    tracker?.recordToolCall(
-      'knowledge',
-      { action: 'submit' },
-      { id: 'candidate-1', status: 'accepted' }
-    );
-    tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      [
+  it.each([
+    {
+      label: 'lets producer final completion text stop after successful submissions',
+      targetSubmits: undefined,
+      count: 1,
+      text: '## 候选生产总结\n已完成 1 个候选提交。无未提交发现，不需要 Analyst 补证。',
+    },
+    {
+      label: 'recognizes Package K producer completion wording as terminal',
+      targetSubmits: undefined,
+      count: 1,
+      text: '所有 6 个知识候选已成功提交，覆盖了 Analyst 分析中的全部 6 项发现。无未提交发现，无阻断。',
+    },
+    {
+      label: 'recognizes Package M submitted/unsubmitted table as terminal',
+      targetSubmits: undefined,
+      count: 1,
+      text: '## 提交完成报告\n\n**已提交候选**: 5\n**未提交**: 0\n\n覆盖情况：结构化发现已完成候选提交。',
+    },
+    {
+      label: 'recognizes Package O mixed English completion summary as terminal',
+      targetSubmits: undefined,
+      count: 1,
+      text: [
         'All 7 structured Analyst findings have been successfully submitted.',
         '',
         '## 提交总结',
         '- **提交候选数**: 7/7',
         '- **覆盖率**: 100%',
         '- **阻塞项**: 无',
-      ].join('\n')
-    );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
-  });
-
-  it('recognizes Package U all-structured-findings wording as terminal', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer', targetSubmits: 6 }
-    );
-
-    expect(tracker).not.toBeNull();
-    for (let i = 1; i <= 6; i++) {
-      tracker?.tick();
-      tracker?.recordToolCall(
-        'knowledge',
-        { action: 'submit' },
-        { id: `candidate-${i}`, status: 'accepted' }
-      );
-      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-    }
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      '所有 6 个结构化发现已全部提交完毕，无需继续。提交数: 6/6，未提交: 0，阻塞: 无。'
-    );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
-  });
-
-  it('recognizes Package W Analyst-confirmed completion summary as terminal', () => {
-    const tracker = ExplorationTracker.resolve(
-      { source: 'system', strategy: 'producer' },
-      { maxIterations: 10, pipelineType: 'producer', targetSubmits: 6 }
-    );
-
-    expect(tracker).not.toBeNull();
-    for (let i = 1; i <= 6; i++) {
-      tracker?.tick();
-      tracker?.recordToolCall(
-        'knowledge',
-        { action: 'submit' },
-        { id: `candidate-${i}`, status: 'accepted' }
-      );
-      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
-    }
-
-    tracker?.tick();
-    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
-    const textResult = tracker?.onTextResponse(
-      [
+      ].join('\n'),
+    },
+    {
+      label: 'recognizes Package U all-structured-findings wording as terminal',
+      targetSubmits: 6,
+      count: 6,
+      text: '所有 6 个结构化发现已全部提交完毕，无需继续。提交数: 6/6，未提交: 0，阻塞: 无。',
+    },
+    {
+      label: 'recognizes Package W Analyst-confirmed completion summary as terminal',
+      targetSubmits: 6,
+      count: 6,
+      text: [
         '所有 6 个 Analyst 已确认结构化发现均已提交，无重复、无遗漏。',
         '```json',
         '{"phase":"PRODUCE","status":"complete","totalSubmitted":6,"blockers":[],"unsubmittedFindings":[]}',
         '```',
-      ].join('\n')
+      ].join('\n'),
+    },
+  ])('$label', ({ targetSubmits, count, text }) => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10, pipelineType: 'producer', ...(targetSubmits ? { targetSubmits } : {}) }
     );
-
-    expect(textResult?.isFinalAnswer).toBe(true);
-    expect(textResult?.shouldContinue).toBe(false);
-    expect(textResult?.nudge).toBeNull();
+    expect(tracker).not.toBeNull();
+    for (let i = 1; i <= count; i++) {
+      tracker?.tick();
+      tracker?.recordToolCall(
+        'knowledge',
+        { action: 'submit' },
+        { id: `candidate-${i}`, status: 'created', lifecycle: 'pending' }
+      );
+      tracker?.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+    }
+    tracker?.tick();
+    tracker?.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    const result = tracker?.onTextResponse(text);
+    expect(result?.isFinalAnswer).toBe(true);
+    expect(result?.shouldContinue).toBe(false);
+    expect(result?.nudge).toBeNull();
   });
 
   it('keeps Producer focused on submit coverage instead of detail/tools exploration', async () => {
@@ -409,7 +326,12 @@ describe('analyst exploration strategy boundaries', () => {
             text: 'ok',
             structuredContent:
               request.toolId === 'knowledge'
-                ? { id: 'recipe-1', status: 'created', title: 'FeatureCoordinator' }
+                ? {
+                    id: 'recipe-1',
+                    status: 'created',
+                    lifecycle: 'pending',
+                    title: 'FeatureCoordinator',
+                  }
                 : { ok: true },
             durationMs: 1,
             startedAt: new Date().toISOString(),

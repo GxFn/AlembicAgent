@@ -20,7 +20,7 @@ import {
   type SemanticDispositionReviewerModelLoadReceiptV1,
   type SemanticDispositionReviewRequestV1,
 } from '@alembic/core/production';
-import { createProjectContextFileRef } from '@alembic/core/project-context-foundation';
+import { createProjectContextFileRef } from '@alembic/core/project-context';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
 import {
@@ -101,39 +101,12 @@ describe('DurableSemanticReviewRuntime', () => {
 
     const attestation = await runtime.execute({ semanticRequest: fixture.semanticRequest });
     const rehydrated = JSON.parse(JSON.stringify(attestation)) as typeof attestation;
-    const verificationRoot = mkdtempSync(
-      path.join(tmpdir(), 'alembic-agent-durable-review-verification-')
-    );
-    temporaryRoots.add(verificationRoot);
-    const verificationInputPath = path.join(verificationRoot, 'attestation.json');
-    writeFileSync(
-      verificationInputPath,
-      JSON.stringify({
+    const verifierOutput = verifyAttestationInFreshProcess(
+      {
         attestation: rehydrated,
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
-      })
-    );
-    const verifierOutput = execFileSync(
-      process.execPath,
-      [
-        '--input-type=module',
-        '--eval',
-        [
-          "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
-          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_DURABLE_REVIEW_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV5(input);',
-          "process.stdout.write('fresh-process-verified');",
-        ].join('\n'),
-      ],
-      {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ALEMBIC_DURABLE_REVIEW_FIXTURE: verificationInputPath,
-        },
-      }
+      },
+      'alembic-agent-durable-review-verification-'
     );
 
     expect(invoke).toHaveBeenCalledOnce();
@@ -242,41 +215,13 @@ describe('DurableSemanticReviewRuntime', () => {
     expect(resolve).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledOnce();
 
-    const verificationRoot = mkdtempSync(
-      path.join(tmpdir(), 'alembic-agent-shared-harvest-v4-verification-')
-    );
-    temporaryRoots.add(verificationRoot);
-    const verificationInputPath = path.join(verificationRoot, 'attestation.json');
-    writeFileSync(
-      verificationInputPath,
-      JSON.stringify({
+    const verifierOutput = verifyAttestationInFreshProcess(
+      {
         attestation: JSON.parse(JSON.stringify(attestation)),
         expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
-      })
-    );
-    const verifierOutput = execFileSync(
-      process.execPath,
-      [
-        '--input-type=module',
-        '--eval',
-        [
-          "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
-          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_SHARED_HARVEST_V5_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV5(input);',
-          'consumeMainSemanticDispositionReviewDurableAttestationV5(input);',
-          "process.stdout.write('fresh-process-v5-verified');",
-        ].join('\n'),
-      ],
-      {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ALEMBIC_SHARED_HARVEST_V5_FIXTURE: verificationInputPath,
-        },
-      }
+      },
+      'alembic-agent-shared-harvest-v4-verification-'
     );
     expect(verifierOutput).toBe('fresh-process-v5-verified');
     expect(() =>
@@ -370,41 +315,13 @@ describe('DurableSemanticReviewRuntime', () => {
     expect(resolve).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledOnce();
 
-    const verificationRoot = mkdtempSync(
-      path.join(tmpdir(), 'alembic-agent-cross-harvest-v5-verification-')
-    );
-    temporaryRoots.add(verificationRoot);
-    const verificationInputPath = path.join(verificationRoot, 'attestation.json');
-    writeFileSync(
-      verificationInputPath,
-      JSON.stringify({
+    const verifierOutput = verifyAttestationInFreshProcess(
+      {
         attestation: JSON.parse(JSON.stringify(attestation)),
         expectedSemanticRequest: JSON.parse(JSON.stringify(fixture.semanticRequest)),
         expectedTrustPolicy: JSON.parse(JSON.stringify(runtime.trustPolicy)),
-      })
-    );
-    const verifierOutput = execFileSync(
-      process.execPath,
-      [
-        '--input-type=module',
-        '--eval',
-        [
-          "import { readFileSync } from 'node:fs';",
-          "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
-          "const input = JSON.parse(readFileSync(process.env.ALEMBIC_CROSS_HARVEST_V5_FIXTURE, 'utf8'));",
-          'assertSemanticDispositionReviewDurableAttestationV5(input);',
-          'consumeMainSemanticDispositionReviewDurableAttestationV5(input);',
-          "process.stdout.write('fresh-process-v5-verified');",
-        ].join('\n'),
-      ],
-      {
-        cwd: process.cwd(),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ALEMBIC_CROSS_HARVEST_V5_FIXTURE: verificationInputPath,
-        },
-      }
+      },
+      'alembic-agent-cross-harvest-v5-verification-'
     );
     expect(verifierOutput).toBe('fresh-process-v5-verified');
     expect(() =>
@@ -1548,6 +1465,46 @@ function passingDecisionFromCompiledPrompt(compiledPrompt: string): string {
       },
     ],
   });
+}
+
+/** 每种拓扑都启动新的 Node 进程；只收敛序列化和装配，不替代 Core 的两种验证入口。 */
+function verifyAttestationInFreshProcess(
+  input: {
+    attestation: unknown;
+    expectedTrustPolicy: unknown;
+    expectedSemanticRequest?: unknown;
+  },
+  directoryPrefix: string
+): string {
+  const verificationRoot = mkdtempSync(path.join(tmpdir(), directoryPrefix));
+  temporaryRoots.add(verificationRoot);
+  const verificationInputPath = path.join(verificationRoot, 'attestation.json');
+  writeFileSync(verificationInputPath, JSON.stringify(input));
+  const consume = Object.hasOwn(input, 'expectedSemanticRequest');
+  const marker = consume ? 'fresh-process-v5-verified' : 'fresh-process-verified';
+  return execFileSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      [
+        "import { readFileSync } from 'node:fs';",
+        "import { assertSemanticDispositionReviewDurableAttestationV5, consumeMainSemanticDispositionReviewDurableAttestationV5 } from '@alembic/core/production';",
+        "const input = JSON.parse(readFileSync(process.env.ALEMBIC_DURABLE_REVIEW_FIXTURE, 'utf8'));",
+        'assertSemanticDispositionReviewDurableAttestationV5(input);',
+        ...(consume ? ['consumeMainSemanticDispositionReviewDurableAttestationV5(input);'] : []),
+        `process.stdout.write(${JSON.stringify(marker)});`,
+      ].join('\n'),
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALEMBIC_DURABLE_REVIEW_FIXTURE: verificationInputPath,
+      },
+    }
+  );
 }
 
 function shaText(value: string): string {

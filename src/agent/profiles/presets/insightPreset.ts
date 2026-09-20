@@ -20,6 +20,7 @@ import {
   PRODUCER_BUDGET,
   PRODUCER_SYSTEM_PROMPT,
 } from '../../prompts/insightProducer.js';
+import type { DiagnosticsCollector } from '../../runtime/DiagnosticsCollector.js';
 import type { PolicyFactoryConfig, ToolCallRecord } from './types.js';
 
 const PRODUCER_TIMEOUT_MS = 900_000;
@@ -69,7 +70,18 @@ export const INSIGHT_PRESET = {
             ctx.panorama as Parameters<typeof buildAnalystPrompt>[7],
             ctx.evidenceStarters as Parameters<typeof buildAnalystPrompt>[8],
             ctx.gateArtifact as Parameters<typeof buildAnalystPrompt>[9],
-            ctx.toolPolicyHints as Parameters<typeof buildAnalystPrompt>[10]
+            ctx.toolPolicyHints as Parameters<typeof buildAnalystPrompt>[10],
+            {
+              abortSignal: ctx.abortSignal as AbortSignal | undefined,
+              timeoutMs: ctx.memoryReadTimeoutMs as number | undefined,
+              totalMemoryBudget: ctx.memoryTokenBudget as number | undefined,
+              onDiagnostic: (diagnostic) =>
+                (ctx.diagnostics as DiagnosticsCollector | undefined)?.warn({
+                  code: `memory_${diagnostic.phase}_${diagnostic.status}`,
+                  stage: 'analyze',
+                  message: diagnostic.reason,
+                }),
+            }
           ),
         retryPromptBuilder: (
           retryCtx: { reason?: string },

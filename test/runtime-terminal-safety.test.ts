@@ -1,13 +1,19 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import { Evolution, ToolRouter } from '../src/tools/runtime/index.js';
 
-const projectRoot = '/tmp/alembic-agent-live-terminal-safety-root';
+let projectRoot: string;
+beforeAll(() => {
+  projectRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'agent-terminal-safety-')));
+});
+afterAll(() => {
+  rmSync(projectRoot, { recursive: true, force: true });
+});
 
 function baseToolContext(overrides: Partial<ToolContext> = {}): ToolContext {
   return {
@@ -37,6 +43,32 @@ async function runTerminalExec(
 }
 
 describe('runtime terminal.exec safety', () => {
+  it('rejects a cwd symlink that escapes the analyzed project', async () => {
+    const outer = mkdtempSync(path.join(os.tmpdir(), 'terminal-cwd-link-'));
+    const root = path.join(outer, 'project');
+    mkdirSync(root);
+    symlinkSync(outer, path.join(root, 'outside'));
+    let executions = 0;
+    try {
+      const result = await runTerminalExec(
+        'pwd',
+        baseToolContext({
+          projectRoot: root,
+          sandboxExecutor: {
+            exec: async () => {
+              executions++;
+              return { stdout: 'unsafe', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        { cwd: 'outside' }
+      );
+      expect(result.ok).toBe(false);
+      expect(executions).toBe(0);
+    } finally {
+      rmSync(outer, { recursive: true, force: true });
+    }
+  });
   it('blocks sudo spacing and quoted bypass attempts before execution', async () => {
     const commands = ['sudo\twhoami', '"sudo" whoami', "'sudo' whoami", '/usr/bin/sudo whoami'];
 
@@ -155,6 +187,17 @@ describe('runtime terminal.exec safety', () => {
       'npm run lint:fix',
       'node -e "console.log(1)"',
       'find . -delete',
+      'git status\nrm important.txt',
+      'git status\rrm important.txt',
+      'find . -execdir touch changed.txt +',
+      'find . -ok touch changed.txt ;',
+      'rg --pre=./script pattern src',
+      'git diff --output output.patch',
+      'git diff --out${EMPTY}put=output.patch',
+      'tsc --noEmit=false',
+      'tsc --noEmit false',
+      'tsc --noEmit true --noEmit false',
+      'node --test --eval=process.exit()',
     ];
 
     for (const command of commands) {

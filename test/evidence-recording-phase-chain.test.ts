@@ -1,9 +1,9 @@
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
-import { ExplorationTracker } from '../src/agent/context/index.js';
 import { analysisQualityGate, insightGateEvaluator } from '../src/agent/evaluation/index.js';
+import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insightAnalyst.js';
+import { buildRecordRepairPrompt } from '../src/agent/prompts/insightGate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
-import { AgentRuntime as AgentRuntimeImpl } from '../src/agent/runtime/AgentRuntime.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import {
   buildPcvQualityGateEvidence,
@@ -14,6 +14,17 @@ import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 
 const MISSING_FINDINGS = 'Required note_finding calls are missing';
 const INSUFFICIENT_FINDINGS = 'At least 3 note_finding calls are required';
+
+it('advertises the live finding reference contract and real snippet coordinates', () => {
+  const prompt = buildRecordRepairPrompt({
+    artifact: {
+      evidenceMap: new Map([['src/a.ts', { codeSnippets: [{ startLine: 10, endLine: 12 }] }]]),
+    },
+  });
+  expect(prompt).toContain('src/a.ts:10-12');
+  expect(prompt).toContain('evidenceRefs');
+  expect(ANALYST_SYSTEM_PROMPT).not.toContain('finding, evidence, importance');
+});
 
 function gateableReport(suggestions: string[], scores = {}) {
   return {
@@ -105,36 +116,6 @@ function createStrategy(minFindings = 3) {
       { name: 'produce', capabilities: [], promptBuilder: () => 'produce' },
     ],
   });
-}
-
-function createRuntimeForReactLoop() {
-  const chatWithTools = vi.fn(async () => ({
-    text: 'forced summary should not be called',
-    functionCalls: [],
-    usage: { inputTokens: 1, outputTokens: 1 },
-  }));
-  const toolRouter = { execute: vi.fn() };
-  const runtime = new AgentRuntimeImpl({
-    aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
-    toolRegistry: { getManifest: () => null } as never,
-    toolRouter: toolRouter as never,
-    capabilities: [],
-    strategy: { name: 'unused', execute: vi.fn() } as never,
-  });
-  return { runtime, chatWithTools };
-}
-
-function createExitingTracker() {
-  return {
-    phase: 'SUMMARIZE',
-    pipelineType: 'analyst',
-    isGracefulExit: false,
-    isHardExit: true,
-    iteration: 1,
-    totalSubmits: 0,
-    tick: vi.fn(),
-    shouldExit: vi.fn(() => true),
-  };
 }
 
 describe('evidence recording quality gate actions', () => {
@@ -433,7 +414,7 @@ describe('record repair pipeline stage', () => {
         }
         if (phase === 'quality_gate_record_repair') {
           expect(opts.capabilityOverride).toEqual([]);
-          expect(opts.additionalToolsOverride).toEqual(['memory']);
+          expect(opts.additionalToolsOverride).toEqual(['memory', 'evidence']);
           expect((opts.sharedState as Record<string, unknown>)._recordRepairOnly).toBe(true);
           expect(opts.toolChoiceOverride).toBe('auto');
           const args = {

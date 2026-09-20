@@ -217,6 +217,7 @@ export interface AgentRunResult {
 }
 
 export interface AgentRuntimeRunOptions {
+  timeoutMs?: number;
   abortSignal?: AbortSignal;
   diagnostics?: unknown;
   strategyContext?: Record<string, unknown>;

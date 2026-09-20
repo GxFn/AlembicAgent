@@ -91,13 +91,14 @@ export class MemoryConsolidator {
     candidateMemories: CandidateMemory[],
     { bootstrapSession }: ConsolidateOptions = {}
   ): ConsolidateStats {
-    // Phase 1: 冲突预解决
-    const { processed, replaced } = this.#preResolveConflicts(candidateMemories);
-
-    // Phase 2: 正常 consolidate 流程
+    let replaced = 0;
     const stats: ConsolidateStats = { added: 0, updated: 0, merged: 0, skipped: 0 };
 
     const runConsolidate = this.#store.transaction(() => {
+      // 冲突替换、普通合并与容量淘汰属于同一持久化操作，任何写失败都整体回滚。
+      const conflicts = this.#preResolveConflicts(candidateMemories);
+      const processed = conflicts.processed;
+      replaced = conflicts.replaced;
       for (const candidate of processed) {
         const content = (candidate.content || '').trim();
         if (!content || content.length < 5) {
@@ -148,6 +149,7 @@ export class MemoryConsolidator {
           stats.added++;
         }
       }
+      this.#store.enforceCapacity();
     });
 
     runConsolidate();
@@ -155,9 +157,6 @@ export class MemoryConsolidator {
     this.#log(
       `Consolidation: +${stats.added} ADD, ~${stats.updated} UPDATE, ⊕${stats.merged} MERGE, =${stats.skipped} SKIP`
     );
-
-    // 容量控制
-    this.#store.enforceCapacity();
 
     if (replaced > 0) {
       stats.replaced = replaced;
@@ -282,7 +281,7 @@ export class MemoryConsolidator {
               conflictResolved = true;
               replaced++;
               this.#log(
-                `Conflict resolved: replaced "${existing.content.substring(0, 50)}..." with "${content.substring(0, 50)}..."`
+                `Conflict replacement staged: "${existing.content.substring(0, 50)}..." → "${content.substring(0, 50)}..."`
               );
               break;
             }
@@ -292,8 +291,11 @@ export class MemoryConsolidator {
         if (!conflictResolved) {
           processed.push(candidate);
         }
-      } catch {
-        processed.push(candidate);
+      } catch (err: unknown) {
+        this.#log(
+          `Conflict resolution failed; consolidation will roll back: ${err instanceof Error ? err.message : String(err)}`
+        );
+        throw err instanceof Error ? err : new Error(String(err));
       }
     }
 

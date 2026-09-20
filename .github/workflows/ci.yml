@@ -52,25 +52,9 @@ jobs:
         working-directory: AlembicAgent
         run: npm ci
 
-      - name: Typecheck
+      - name: Repository and Core contract gates
         working-directory: AlembicAgent
-        run: npm run build:check
-
-      - name: Lint
-        working-directory: AlembicAgent
-        run: npm run lint
-
-      - name: Import boundary
-        working-directory: AlembicAgent
-        run: npm run lint:agent-import-boundary
-
-      - name: Build
-        working-directory: AlembicAgent
-        run: npm run build
-
-      - name: Test
-        working-directory: AlembicAgent
-        run: npm run test
+        run: npm run check:ci
 
       - name: Package export smoke
         working-directory: AlembicAgent

@@ -8,6 +8,23 @@ Machine companion: `config/side-effect-doctrine.json` (blessed-singleton list,
 layer-contract config idiom). Dispositions are behavior-preserving; redesigns
 go through controller-decided waves.
 
+## Current reconciliation (2026-09-18)
+
+The tables below preserve the 2026-06-12 baseline rather than claim its paths
+and counts are current. The current machine record uses `src/tools/runtime/`
+and `RuntimeCapability`. `TemporaryToolRegistry` has already retired; the
+remaining `timerRegistry` consumer is `SessionStore`, whose checkpoint restore
+reuses its existing instance and cleanup timer. The compressor now shares one
+lazy initialization Promise between concurrent callers instead of exposing a
+premature `parsersLoaded` flag. Its obsolete lint exemption has been removed.
+The former RuntimeCapability reach-up exception was already resolved by the
+kernel extraction recorded in `config/layer-contract.json` on 2026-06-19;
+the stale standing exception has now been removed from the machine record.
+
+Current side effects and host responsibilities are described in
+`docs/entrypoint-effects.md`; public singleton compatibility and the existing
+Core-owned memory adapter exception remain in force.
+
 ## 1. Module-scope singletons and registries
 
 | Id | Item | Site | Disposition |

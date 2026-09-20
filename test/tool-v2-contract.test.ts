@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
@@ -13,15 +13,156 @@ import {
   ToolRouter,
   ToolRouterAdapter,
 } from '../src/tools/runtime/index.js';
+import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
+
+let baseRoot: string;
+beforeAll(async () => {
+  baseRoot = await realpath(await mkdtemp(join(tmpdir(), 'agent-tool-contract-')));
+});
+afterAll(async () => {
+  await rm(baseRoot, { recursive: true, force: true });
+});
 
 function baseToolContext(): ToolContext {
   return {
-    projectRoot: '/tmp/alembic-agent-tool-v2-test',
+    projectRoot: baseRoot,
     tokenBudget: 4000,
   };
 }
 
+describe('ToolRouter scheduling and cancellation', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([123, [], {}])('rejects an invalid memory key before storing it: %j', async (key) => {
+    const handler = vi
+      .spyOn(TOOL_REGISTRY.memory.actions.save, 'handler')
+      .mockResolvedValue({ ok: true, data: 'should not run' });
+    const result = await new ToolRouter().execute(
+      { tool: 'memory', action: 'save', params: { key, content: 'finding' } },
+      baseToolContext()
+    );
+    expect(result.ok).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['write', 'read'],
+    ['read', 'write'],
+    ['write', 'write'],
+  ] as const)('keeps exclusive calls isolated: %s then %s', async (firstAction, secondAction) => {
+    const router = new ToolRouter();
+    const entered: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let firstEntered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    for (const action of new Set([firstAction, secondAction])) {
+      vi.spyOn(TOOL_REGISTRY.code.actions[action], 'handler').mockImplementation(async (params) => {
+        const name = String(params.path);
+        entered.push(name);
+        if (name === 'first') {
+          firstEntered();
+          await held;
+        }
+        return { ok: true, data: name };
+      });
+    }
+    const first = router.execute(
+      { tool: 'code', action: firstAction, params: { path: 'first', content: '' } },
+      baseToolContext()
+    );
+    await started;
+    const second = router.execute(
+      { tool: 'code', action: secondAction, params: { path: 'second', content: '' } },
+      baseToolContext()
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const whileHeld = [...entered];
+    release();
+    await Promise.all([first, second]);
+    expect(whileHeld).toEqual(['first']);
+    expect(entered).toEqual(['first', 'second']);
+  });
+
+  it('does not execute a queued mutation after cancellation', async () => {
+    const router = new ToolRouter();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handler = vi
+      .spyOn(TOOL_REGISTRY.code.actions.write, 'handler')
+      .mockImplementation(async () => {
+        await held;
+        return { ok: true, data: 'done' };
+      });
+    const call = { tool: 'code', action: 'write', params: { path: 'file.ts', content: '' } };
+    const first = router.execute(call, baseToolContext());
+    const controller = new AbortController();
+    const second = router.execute(call, { ...baseToolContext(), abortSignal: controller.signal });
+    controller.abort();
+    release();
+    const [, cancelled] = await Promise.all([first, second]);
+    expect(cancelled.ok).toBe(false);
+    expect(cancelled.error).toMatch(/abort/i);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('Tool V2 contract exports', () => {
+  it('preserves an aborted status through the host adapter before execution', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const adapter = new ToolRouterAdapter({ contextFactory: { create: () => baseToolContext() } });
+    const result = await adapter.execute({
+      toolId: 'meta',
+      args: { action: 'tools', params: {} },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'test' },
+      abortSignal: controller.signal,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe('aborted');
+  });
+  it('awaits parser initialization for all concurrent first compressions', async () => {
+    vi.resetModules();
+    const { OutputCompressor: FreshCompressor } = await import(
+      '../src/tools/runtime/compressor/OutputCompressor.js'
+    );
+    const compressor = new FreshCompressor();
+    const outputs = await Promise.all([
+      compressor.compress('?? fresh.ts', { command: 'git status' }),
+      compressor.compress('?? fresh.ts', { command: 'git status' }),
+    ]);
+    expect(outputs).toEqual(['untracked(1): fresh.ts', 'untracked(1): fresh.ts']);
+  });
+  it.each([
+    'UU',
+    'AA',
+    'DD',
+    'AU',
+    'UA',
+    'DU',
+    'UD',
+  ])('preserves git conflict status %s', (status) => {
+    expect(parseGitStatusOutput(`${status} conflict.ts`)).toBe('conflicted(1): conflict.ts');
+  });
+
+  it.each([
+    '1 failed, 2 passed',
+    '2 passed, 1 failed',
+    '1 error, 2 passed',
+  ])('preserves pytest failures in %s', async (summary) => {
+    const output = `===== test session starts =====\ncollected 3 items\n===== ${summary} in 0.1s =====`;
+    expect(await new OutputCompressor().compress(output, { command: 'pytest' })).toContain(
+      '2 passed, 1 failed, 3 total'
+    );
+  });
   it('exports capability catalog projections from the V2 registry', () => {
     const catalog = new RuntimeCapabilityCatalog();
     const schemas = catalog.toToolSchemas(['meta']);
@@ -243,7 +384,6 @@ describe('Tool V2 contract exports', () => {
   it('routes V2 terminal cancellation as a structured partial timeout result', async () => {
     const router = new ToolRouter();
     const abortController = new AbortController();
-    abortController.abort();
     const parsed = router.parseToolCall('terminal', {
       action: 'exec',
       params: { command: 'node -e "setTimeout(() => {}, 1000)"' },
@@ -259,6 +399,9 @@ describe('Tool V2 contract exports', () => {
       abortSignal: abortController.signal,
       sandboxExecutor: {
         exec: async (_command: string, opts: { signal?: AbortSignal }) => {
+          // 部分输出来自已开始的执行；预先取消由 router 拒绝，不应伪造执行结果。
+          expect(opts.signal?.aborted).toBe(false);
+          abortController.abort();
           expect(opts.signal?.aborted).toBe(true);
           return { stdout: 'partial output\n', stderr: '', exitCode: 137 };
         },
@@ -480,6 +623,125 @@ async function withWriteFixture(run: (root: string) => Promise<void>): Promise<v
 }
 
 describe('B-1 write-freshness gate (read-before-write / TOCTOU)', () => {
+  it('does not reuse a narrower search result for an expanded request', async () => {
+    await withWriteFixture(async (root) => {
+      await writeFile(
+        join(root, 'src/a.ts'),
+        'match one\nmatch two\nmatch three\nmatch four\nmatch five\nmatch six\n'
+      );
+      const router = new ToolRouter();
+      const ctx = { ...freshnessCtx(root), searchCache: new SearchCache() };
+      const narrow = await router.execute(
+        {
+          tool: 'code',
+          action: 'search',
+          params: { patterns: ['match'], maxResults: 1, contextLines: 0 },
+        },
+        ctx
+      );
+      expect(narrow.ok).toBe(true);
+      const call = {
+        tool: 'code',
+        action: 'search',
+        params: { patterns: ['match'], maxResults: 6, contextLines: 1 },
+      };
+      const expanded = await router.execute(call, ctx);
+      const fresh = await router.execute(call, {
+        ...freshnessCtx(root),
+        searchCache: new SearchCache(),
+      });
+      expect(expanded.ok).toBe(true);
+      expect((expanded.data as { matches: unknown[] }).matches).toHaveLength(6);
+      expect(expanded.data).toEqual(fresh.data);
+    });
+  });
+  it('keeps structure paths relative to a symlinked checkout', async () => {
+    await withWriteFixture(async (outer) => {
+      await symlink(join(outer, 'src'), join(outer, 'checkout'));
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'structure', params: {} },
+        freshnessCtx(join(outer, 'checkout'))
+      );
+      expect(String(result.data).split('\n')[0]).toBe('./');
+    });
+  });
+  it.each([
+    20, 600,
+  ])('serves requested ranges after a cached read of %i lines', async (lineCount) => {
+    await withWriteFixture(async (root) => {
+      await writeFile(
+        join(root, 'src/a.ts'),
+        Array.from({ length: lineCount }, (_, index) => `line ${index + 1}`).join('\n')
+      );
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      await router.execute({ tool: 'code', action: 'read', params: { path: 'src/a.ts' } }, ctx);
+      for (const startLine of [5, 10]) {
+        const result = await router.execute(
+          {
+            tool: 'code',
+            action: 'read',
+            params: { path: 'src/a.ts', startLine, endLine: startLine + 1 },
+          },
+          ctx
+        );
+        expect(result.ok).toBe(true);
+        expect(result.data).toContain(`${startLine}|line ${startLine}`);
+      }
+    });
+  });
+
+  it.each([
+    'read',
+    'write',
+  ])('rejects code.%s through a symlink outside the project', async (action) => {
+    await withWriteFixture(async (outer) => {
+      const root = join(outer, 'project');
+      await mkdir(root);
+      await symlink(join(outer, 'src'), join(root, 'linked'));
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action, params: { path: 'linked/a.ts', content: 'overwritten' } },
+        freshnessCtx(root)
+      );
+      expect(result.ok).toBe(false);
+      expect(await readFile(join(outer, 'src/a.ts'), 'utf8')).toBe('export const a = 1;\n');
+    });
+  });
+
+  it('rejects creating a new file through a symlink outside the project', async () => {
+    await withWriteFixture(async (outer) => {
+      const root = join(outer, 'project');
+      await mkdir(root);
+      await symlink(join(outer, 'src'), join(root, 'linked'));
+      const result = await new ToolRouter().execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: 'linked/new/a.ts', content: 'new', createDirectories: true },
+        },
+        freshnessCtx(root)
+      );
+      expect(result.ok).toBe(false);
+      await expect(readFile(join(outer, 'src/new/a.ts'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+  });
+
+  it('applies protected paths to symlink targets inside the project', async () => {
+    await withWriteFixture(async (root) => {
+      await mkdir(join(root, '.git'));
+      await writeFile(join(root, '.git/config'), 'protected');
+      await symlink(join(root, '.git/config'), join(root, 'alias'));
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'write', params: { path: 'alias', content: 'overwritten' } },
+        freshnessCtx(root)
+      );
+      expect(result.ok).toBe(false);
+      expect(await readFile(join(root, '.git/config'), 'utf8')).toBe('protected');
+    });
+  });
+
   it('state 4: writes a brand-new (disk-absent) file without requiring a prior read', async () => {
     await withWriteFixture(async (root) => {
       const router = new ToolRouter();

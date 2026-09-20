@@ -1,8 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  AiProvider,
-  type AiProviderConfig,
   AiProviderManager,
   autoDetectProvider,
   ClaudeProvider,
@@ -25,54 +23,6 @@ function restoreEnv(name: string, value: string | undefined): void {
     return;
   }
   process.env[name] = value;
-}
-
-class TestLocalFakeProvider extends AiProvider {
-  #calls: Array<{ method: string }> = [];
-  #chatResponse: string;
-
-  constructor(config: AiProviderConfig = {}) {
-    super(config);
-    this.name = 'test-local-fake';
-    this.model = 'test-local-model';
-    this.#chatResponse = String(config.responses?.chat ?? 'test response');
-  }
-
-  async chat(): Promise<string> {
-    this.#calls.push({ method: 'chat' });
-    return this.#chatResponse;
-  }
-
-  async chatWithTools(): Promise<{
-    text: null;
-    functionCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>;
-  }> {
-    this.#calls.push({ method: 'chatWithTools' });
-    return {
-      text: null,
-      functionCalls: [
-        {
-          id: 'test-fake-call',
-          name: 'classify_intent',
-          args: { type: 'general', confidence: 0.9 },
-        },
-      ],
-    };
-  }
-
-  async embed(text: string | string[]): Promise<number[] | number[][]> {
-    this.#calls.push({ method: 'embed' });
-    const values = Array.isArray(text) ? text : [text];
-    const vectors = values.map((value) => {
-      const seed = [...value].reduce((acc, char) => acc + char.charCodeAt(0), 0);
-      return Array.from({ length: 8 }, (_, index) => ((seed + index) % 17) / 17);
-    });
-    return Array.isArray(text) ? vectors : vectors[0];
-  }
-
-  getCalls(): Array<{ method: string }> {
-    return this.#calls;
-  }
 }
 
 function createThinkingModel(): ModelDef {
@@ -107,6 +57,9 @@ function createThinkingModel(): ModelDef {
 }
 
 describe('AI provider public entrypoint', () => {
+  it('reports Claude embedding as unsupported so the host can choose a fallback', () => {
+    expect(new ClaudeProvider({ apiKey: 'test-key' }).supportsEmbedding()).toBe(false);
+  });
   it('exports provider configuration and model routing helpers', () => {
     expect(PROVIDER_CONFIGS.length).toBeGreaterThan(0);
     expect(getProviderConfig('openai')).toMatchObject({
@@ -148,6 +101,21 @@ describe('AI provider public entrypoint', () => {
 });
 
 describe('AI provider credential guidance', () => {
+  beforeEach(() => {
+    for (const name of ['OPENAI', 'CLAUDE', 'DEEPSEEK', 'GOOGLE']) {
+      vi.stubEnv(`ALEMBIC_${name}_API_KEY`, '');
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => {
+        throw new Error('Credential tests must not access the network');
+      })
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
   async function captureMissingKeyError(run: () => Promise<unknown>) {
     try {
       await run();
@@ -197,35 +165,8 @@ describe('AI provider credential guidance', () => {
       expect(err.message).toContain(c.envVar);
       expect(err.message).not.toContain('Dashboard');
       expect(err.message).not.toContain('AI Settings');
+      expect(fetch).not.toHaveBeenCalled();
     }
-  });
-});
-
-describe('TestLocalFakeProvider', () => {
-  it('returns deterministic chat, tool, and embedding results inside the test boundary', async () => {
-    const provider = new TestLocalFakeProvider({ responses: { chat: 'fixed response' } });
-
-    await expect(provider.chat('hello')).resolves.toBe('fixed response');
-
-    const toolResult = await provider.chatWithTools('route this request', {
-      toolSchemas: [{ name: 'classify_intent' }],
-    });
-
-    expect(toolResult.text).toBeNull();
-    expect(toolResult.functionCalls?.[0]).toMatchObject({
-      name: 'classify_intent',
-      args: { type: 'general', confidence: 0.9 },
-    });
-
-    const embeddings = (await provider.embed(['alpha', 'alpha'])) as number[][];
-    expect(embeddings).toHaveLength(2);
-    expect(embeddings[0]).toHaveLength(8);
-    expect(embeddings[1]).toEqual(embeddings[0]);
-    expect(provider.getCalls().map((entry) => entry.method)).toEqual([
-      'chat',
-      'chatWithTools',
-      'embed',
-    ]);
   });
 });
 

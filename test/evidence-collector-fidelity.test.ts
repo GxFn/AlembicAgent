@@ -16,7 +16,7 @@
  * 端到端闭环（工具返回 → EvidenceCollector → buildCodeContextSection → 照抄构造候选 →
  * runInProcessRecipeAuthoringGate 0 违规）。
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -36,6 +36,39 @@ import {
 
 // 与 recipe-authoring-inprocess-flatten 相同的确定性临时项目：行 n 的文本可由公式重建。
 let projectRoot: string;
+
+it('does not ground findings through an out-of-project symlink', () => {
+  const inner = path.join(projectRoot, 'isolated');
+  mkdirSync(inner);
+  symlinkSync(path.join(projectRoot, 'src/alpha.ts'), path.join(inner, 'alias.ts'));
+  const artifact = buildAnalysisArtifact(
+    { reply: 'Evidence in alias.ts:1-2', toolCalls: [] },
+    'architecture',
+    null,
+    {
+      distill: () => ({
+        keyFindings: [{ finding: 'external alias', evidence: 'alias.ts:1-2', importance: 8 }],
+        toolCallSummary: [],
+      }),
+    },
+    { projectRoot: inner }
+  );
+  const entry = (artifact.evidenceMap as Map<string, { codeSnippets: unknown[] }>).get('alias.ts');
+  expect(entry?.codeSnippets ?? []).toEqual([]);
+});
+
+it.each(['read', 'search'])('keeps valid error-handling source from code.%s', (action) => {
+  const collector = new EvidenceCollector();
+  const source = 'export class AppError extends Error {}';
+  collector.processToolCall({
+    tool: 'code',
+    args: { action, params: { path: 'src/errors.ts', pattern: 'AppError' } },
+    result: action === 'read' ? `1|${source}` : `src/errors.ts:1: ${source}`,
+  });
+  const result = collector.build();
+  expect(result.evidenceMap.get('src/errors.ts')?.codeSnippets[0]?.content).toContain(source);
+  expect(result.negativeSignals).toEqual([]);
+});
 
 /** 行 n 的源码文本 = `export const <name><n-1> = <n-1>;`（与 beforeAll 写入逐字一致） */
 function fileLines(name: 'alpha' | 'beta' | 'gamma', startLine: number, endLine: number): string {

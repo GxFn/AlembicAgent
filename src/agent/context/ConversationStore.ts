@@ -50,7 +50,6 @@ interface AiProvider {
 
 const DEFAULT_TOKEN_BUDGET = 12000; // ~12K tokens 留给历史, 其余给系统提示词和当前消息
 const MAX_CONVERSATIONS = 100; // 索引最多保留 100 个对话
-const _SUMMARY_TARGET_TOKENS = 500; // 压缩后的摘要目标 token 数
 
 export class ConversationStore {
   #dir;
@@ -112,6 +111,7 @@ export class ConversationStore {
    */
   append(conversationId: string, message: ConversationMessage) {
     try {
+      const filePath = this.#conversationPath(conversationId);
       const line = JSON.stringify({
         role: message.role,
         content: message.content,
@@ -121,7 +121,6 @@ export class ConversationStore {
         this.#wz.appendFile(this.#wz.runtime(`conversations/${conversationId}.jsonl`), `${line}\n`);
       } else {
         fs.mkdirSync(this.#dir, { recursive: true });
-        const filePath = this.#conversationPath(conversationId);
         fs.appendFileSync(filePath, `${line}\n`, 'utf-8');
       }
 
@@ -262,6 +261,14 @@ export class ConversationStore {
         return false;
       }
 
+      // 模型请求期间对话可能追加、删除或被另一次摘要替换；旧快照不能覆盖较新的事实。
+      if (fs.readFileSync(filePath, 'utf-8').trim() !== raw) {
+        this.#logger.info(
+          '[ConversationStore] summary skipped: conversation changed during generation'
+        );
+        return false;
+      }
+
       // 重写对话文件: 摘要 + 最近消息
       const newMessages = [
         { role: 'system', content: `[对话摘要] ${summary.trim()}`, ts: new Date().toISOString() },
@@ -399,18 +406,21 @@ export class ConversationStore {
   }
 
   #conversationPath(id: string) {
+    if (!id || /[/\\\0]/u.test(id) || id === '.' || id === '..') {
+      throw new Error('Invalid conversation id');
+    }
     return path.join(this.#dir, `${id}.jsonl`);
   }
 
   #deleteConversationFile(id: string) {
     try {
+      const filePath = this.#conversationPath(id);
       if (this.#wz) {
         const target = this.#wz.runtime(`conversations/${id}.jsonl`);
         if (fs.existsSync(target.absolute)) {
           this.#wz.remove(target);
         }
       } else {
-        const filePath = this.#conversationPath(id);
         if (fs.existsSync(filePath)) {
           fs.unlinkSync(filePath);
         }

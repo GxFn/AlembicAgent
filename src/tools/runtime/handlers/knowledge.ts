@@ -19,6 +19,7 @@ import {
   STYLE_WAIVER_SESSION_LIMIT,
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
+import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
@@ -79,7 +80,7 @@ function readRefRangeCode(
       if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
         continue;
       }
-      const absPath = path.join(projectRoot, normalized);
+      const absPath = resolveProjectPath(projectRoot, normalized).absolute;
       if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
         continue;
       }
@@ -570,7 +571,7 @@ async function handleSubmit(
       sanitized.item,
       sharedStateForSubmit
     );
-    const preparedProduction = prepareRecipeProductionItem(effectiveItem, ctx.projectRoot);
+    let preparedProduction = prepareRecipeProductionItem(effectiveItem, ctx.projectRoot);
     effectiveItem = preparedProduction.item as Record<string, unknown>;
     if (!preparedProduction.codeEvidence.accepted) {
       bumpSubmitRepairStat(ctx.runtime, 'unsafe_core_code_removed');
@@ -578,22 +579,7 @@ async function handleSubmit(
         `[knowledge.submit] unsafe coreCode removed with diagnostic=${preparedProduction.codeEvidence.reason}; retrieval profile remains independently evaluated for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
       );
     }
-    let gateViolations = runInProcessRecipeAuthoringGate(effectiveItem, {
-      projectRoot: ctx.projectRoot,
-      dimensionId: effectiveDimensionId,
-    });
-    if (!preparedProduction.codeEvidence.accepted) {
-      const repairablePendingCodes = new Set([
-        'SNIPPET_MISMATCH',
-        'SOURCE_REF_INVALID',
-        'SOURCE_REF_LINE_MISSING',
-        'SOURCE_REF_LINE_OUT_OF_RANGE',
-        'SOURCE_REF_NOT_FOUND',
-      ]);
-      gateViolations = gateViolations.filter(
-        (violation) => !repairablePendingCodes.has(violation.code)
-      );
-    }
+    let gateViolations = evaluatePreparedItem(preparedProduction, ctx, effectiveDimensionId);
     // F4e：GRAPH_REF_INVALID 且 Analyst 真有 graph 查询证据时，自动注入 reasoning.graphRefs
     // （替模型完成「复制」动作——graphEvidence 来自真实 graph 调用，非编造；为空则保持拒绝）。
     if (gateViolations.some((v) => v.code === 'GRAPH_REF_INVALID')) {
@@ -669,16 +655,22 @@ async function handleSubmit(
           getImperativeVerbAllowlist()
         );
         if (repaired) {
-          const reVerified = runInProcessRecipeAuthoringGate(repaired, {
-            projectRoot: ctx.projectRoot,
-            dimensionId: effectiveDimensionId,
-          });
+          const refreshed = prepareRecipeProductionItem(repaired, ctx.projectRoot);
+          const repairedProduction = {
+            ...refreshed,
+            // 不复活已移除片段，也不让二次 prepare 的 absent 覆盖首次不安全输入诊断。
+            codeEvidence: preparedProduction.codeEvidence.accepted
+              ? refreshed.codeEvidence
+              : preparedProduction.codeEvidence,
+          };
+          const reVerified = evaluatePreparedItem(repairedProduction, ctx, effectiveDimensionId);
           if (reVerified.length < gateViolations.length) {
             bumpSubmitRepairStat(ctx.runtime, 'style_repair_subcall');
             Logger.getInstance().info(
               `[knowledge.submit] style repair sub-call fixed "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): violations ${gateViolations.length}→${reVerified.length}`
             );
-            effectiveItem = repaired;
+            preparedProduction = repairedProduction;
+            effectiveItem = repairedProduction.item as Record<string, unknown>;
             gateViolations = reVerified;
           } else {
             // 降级必须可观测：修复产物未减少违规（run-5 静默分支补钉）
@@ -1565,4 +1557,27 @@ function truncateText(text: string, maxLen: number): string {
     return text;
   }
   return `${text.slice(0, maxLen - 3)}...`;
+}
+
+/** 初次提交和风格修复采用相同门禁；profile 哈希由最终 authored 字段重算。 */
+function evaluatePreparedItem(
+  prepared: ReturnType<typeof prepareRecipeProductionItem>,
+  ctx: ToolContext,
+  dimensionId?: string
+) {
+  const violations = runInProcessRecipeAuthoringGate(prepared.item as Record<string, unknown>, {
+    projectRoot: ctx.projectRoot,
+    dimensionId,
+  });
+  if (prepared.codeEvidence.accepted) {
+    return violations;
+  }
+  const pendingCodes = new Set([
+    'SNIPPET_MISMATCH',
+    'SOURCE_REF_INVALID',
+    'SOURCE_REF_LINE_MISSING',
+    'SOURCE_REF_LINE_OUT_OF_RANGE',
+    'SOURCE_REF_NOT_FOUND',
+  ]);
+  return violations.filter((violation) => !pendingCodes.has(violation.code));
 }

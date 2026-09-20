@@ -26,7 +26,7 @@ hosts can embed it through dependency injection.
   parameter guarding, and structured-output repair.
 - **Tool system** — a single-source tool registry + `ToolRouter` + kernel
   contracts, with built-in `code` / `terminal` / `knowledge` / `graph` /
-  `memory` / `meta` handlers, a terminal safety model, and output compression.
+  `memory` / `meta` / `evidence` handlers, a terminal safety model, and output compression.
 
 **Is not:**
 
@@ -43,46 +43,14 @@ These boundaries are pinned by frozen, executable manifests
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Surface Layer   HTTP · CLI · MCP · Workflow (hosts)           │
-│                 only construct an AgentRunInput               │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ AgentRunInput
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentService    unified entrypoint + profile compilation      │
-│                 validate → AgentProfileCompiler →             │
-│                 (AgentRunCoordinator fan-out?) →              │
-│                 AgentRuntimeBuilder → runtime.execute →       │
-│                 normalized AgentRunResult (errors degraded    │
-│                 to structured results, never thrown)          │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ CompiledAgentProfile
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentRuntimeBuilder   profile + DI (container/tools/ai/root)  │
-│                       → preset merge → strategy resolution →  │
-│                       capabilities → PolicyEngine → Runtime   │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ new AgentRuntime(config)
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ AgentRuntime    ReAct loop (Thought → Action → Observation)   │
-│   ├─ Capability   skill / tool-allowlist composition          │
-│   ├─ Strategy     Single / Pipeline / FanOut / Adaptive       │
-│   ├─ Policy       Budget (hard stop) / Safety (hard block) /  │
-│   │               QualityGate (soft warning)                  │
-│   └─ cross-cutting: memory / context / events / diagnostics / │
-│                     PCV evidence / budget compression         │
-└───────────────────────────────┬──────────────────────────────┘
-                                │ tool call
-                                ▼
-┌──────────────────────────────────────────────────────────────┐
-│ Action Layer    ToolRouter → handlers (code / terminal /      │
-│                 knowledge / graph / memory / meta)            │
-│                 executes actions; never selects profiles      │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Host[Host: AgentRunInput] --> Service[AgentService: profile compilation]
+  Service --> Builder[AgentRuntimeBuilder: capabilities, strategy, policies]
+  Builder --> Runtime[AgentRuntime: ReAct loop]
+  Runtime <--> AI[AiProvider / LLMGateway / Transport]
+  Runtime <--> Tools[ToolExecutionPipeline / Router / Handler]
+  Runtime --> Result[Status, phase outcomes, usage, diagnostics]
 ```
 
 Baseline presets (a profile declares capabilities, strategy, and policies;
@@ -92,8 +60,8 @@ Baseline presets (a profile declares capabilities, strategy, and policies;
 | Preset      | Capabilities            | Strategy          | Policies         |
 | ----------- | ----------------------- | ----------------- | ---------------- |
 | `chat`      | Conversation + Analysis | Single            | Budget (8 turns) |
-| `bootstrap` | Analysis + Knowledge    | FanOut + Pipeline | Budget + Quality |
-| `scan`      | Analysis + Knowledge    | Pipeline          | Budget + Quality |
+| `insight`   | Analysis + Knowledge    | Pipeline          | Budget + Quality |
+| `evolution` | Evolution analysis      | Pipeline          | Budget + Quality |
 
 Domain runs (`src/agent/runs/`: plan, scan, evolution, relation, translation,
 module mining) wrap the same service entrypoint with domain profiles and
@@ -108,7 +76,7 @@ become partial results instead of aborting the batch.
 | `src/agent/service/` | `AgentService` entrypoint, `AgentRuntimeBuilder` DI assembly, run contracts, system-run context factory |
 | `src/agent/runtime/` | `AgentRuntime` ReAct kernel, `LoopContext`, `ExitController`, `BudgetController`, `ToolExecutionPipeline`, LLM input assembly/measurement, hooks/events/diagnostics, frozen interface contracts, PCV node evidence (observe-only) |
 | `src/agent/profiles/` | Serializable profile definitions, `AgentProfileCompiler`, registries; `presets/` holds the runtime base blocks (chat/insight/evolution — Capability+Strategy+Policy compositions that stay out of serializable profiles by design) |
-| `src/agent/strategies/` | `Single` / `FanOut` / `Adaptive` / `Pipeline` orchestration |
+| `src/agent/strategies/` | `Single` / `FanOut` / `Pipeline` orchestration |
 | `src/agent/policies/` | `PolicyEngine` with Budget / Safety / QualityGate policies |
 | `src/agent/memory/` + `src/agent/evidence/` | Three-tier memory (`ActiveContext` working / `SessionStore` session / `PersistentMemory` SQLite semantic) coordinated by `MemoryCoordinator`, plus `EpisodicConsolidator`; `evidence/EvidenceCollector` supplies grounded evidence (`domain/` is now a thin re-export shell) |
 | `src/agent/context/` | `ContextWindow` (staged progressive compression), `ExplorationTracker`, plan tracking, nudges |
@@ -131,15 +99,13 @@ Internal imports use the `#agent/*`, `#ai/*`, `#shared/*`, `#tools/*` aliases
 
 ## Key runtime guarantees
 
-- **Structured results, never leaked exceptions** — single-run execution
+- **Structured execution results** — single-run execution
   errors are degraded into a complete `AgentRunResult` with a five-state
   status (success / blocked / aborted / timeout / error); the frozen
   `AgentInterfaceContract` pins the result branches, the ordinary-output
   policy, and the failure taxonomy.
-- **Budget compresses, exit decides** — session-budget thresholds only
-  trigger staged context compression; termination belongs to max-iterations /
-  timeout / `ExitController` exit signals, with a forced-summary fallback so
-  the final reply is never empty.
+- **Budget and exit control** — session-budget pressure triggers staged context compression; exhausted budgets, iteration limits, timeouts, and `ExitController` signals stop execution. A forced-summary fallback preserves
+  available partial work; cancellation and timeouts suppress extra model summaries.
 - **Tool safety** — `terminal` runs behind a global dangerous-command
   blocklist plus a read-only allowlist, sandboxed when available (audited on
   degradation); `code.write` enforces a read-before-write freshness (TOCTOU)
@@ -207,3 +173,18 @@ registry `@alembic/core` version and records the Core source commit in
 ## License
 
 MIT
+
+## Validation and host wiring
+
+`npm run check` also runs the strict consumer against the real adjacent Alembic
+installation. CI uses `npm run check:ci` for gates supported by its Agent/Core
+checkout; the host probe requires a complete Alembic installation separately.
+Builds clear this repository's generated `dist/` before compiling, so retired
+source files cannot survive in a publish package.
+
+Input validation, profile compilation, and assembly errors may throw before
+runtime execution. Runtime cancellation, policy rejection, and terminal errors
+are reflected in the service status. Pipeline outcomes and persisted candidate
+readiness remain separate from that status. The system context factory creates
+working memory by default; durable/session memory and strict production ports
+must be wired by the host.

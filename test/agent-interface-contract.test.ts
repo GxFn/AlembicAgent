@@ -11,39 +11,8 @@ import {
   getAgentInterfaceContractBranch,
   getAgentInterfaceFailureTaxonomyEntry,
   supportsAgentRuntimeRoute,
-  type ToolResultEnvelope,
   validateAgentInterfaceContract,
 } from '../src/index.js';
-
-function createPartialEnvelope(): ToolResultEnvelope<{ completed: number; failed: number }> {
-  return {
-    ok: true,
-    toolId: 'demo.partial',
-    callId: 'call-partial',
-    startedAt: '2026-06-10T00:00:00.000Z',
-    durationMs: 7,
-    status: 'partial',
-    text: 'Tool produced partial output',
-    structuredContent: { completed: 1, failed: 1 },
-    diagnostics: {
-      degraded: false,
-      fallbackUsed: false,
-      warnings: [{ code: 'partial-result', message: 'one item failed', stage: 'execute' }],
-      timedOutStages: [],
-      blockedTools: [],
-      truncatedToolCalls: 0,
-      emptyResponses: 0,
-      aiErrorCount: 0,
-      gateFailures: [],
-    },
-    trust: {
-      source: 'internal',
-      sanitized: true,
-      containsUntrustedText: false,
-      containsSecrets: false,
-    },
-  };
-}
 
 describe('AlembicAgent public interface contract', () => {
   it('covers every D1 Agent-owned row and canonical result branch', () => {
@@ -71,16 +40,12 @@ describe('AlembicAgent public interface contract', () => {
 
   it('treats partial results as a first-class successful envelope branch', () => {
     const fixture = getAgentInterfaceContractBranch('partial-result');
-    const envelope = createPartialEnvelope();
 
     expect(fixture).toMatchObject({
       toolStatus: 'partial',
       ok: true,
       errorKind: 'none',
     });
-    expect(envelope.ok).toBe(true);
-    expect(envelope.status).toBe('partial');
-    expect(envelope.structuredContent).toEqual({ completed: 1, failed: 1 });
   });
 
   it('keeps confirmation requests and host failures as distinct non-success branches', () => {

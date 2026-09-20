@@ -77,6 +77,18 @@ export class ToolRouterAdapter implements ToolRouterContract {
     const callId = randomUUID();
     const t0 = Date.now();
 
+    if (request.abortSignal?.aborted) {
+      return {
+        ...this.#errorEnvelope(
+          request.toolId,
+          callId,
+          startedAt,
+          'Tool call aborted before execution'
+        ),
+        status: 'aborted',
+      };
+    }
+
     try {
       const parsed = this.router.parseToolCall(request.toolId, request.args);
       if ('error' in parsed) {
@@ -87,11 +99,25 @@ export class ToolRouterAdapter implements ToolRouterContract {
         this.router.getToolSpec(parsed.tool)?.actions[parsed.action]?.cache ?? 'none';
       const cachePolicy = cacheHint === 'delta' ? 'session' : cacheHint;
 
-      const ctx = this.#contextFactory.create(request);
+      const ctx = {
+        ...this.#contextFactory.create(request),
+        ...(request.abortSignal ? { abortSignal: request.abortSignal } : {}),
+      };
       const result = await this.router.execute(parsed, ctx);
       const durationMs = Date.now() - t0;
 
-      return this.#toEnvelope(result, request.toolId, callId, startedAt, durationMs, cachePolicy);
+      const envelope = this.#toEnvelope(
+        result,
+        request.toolId,
+        callId,
+        startedAt,
+        durationMs,
+        cachePolicy
+      );
+      if (!result.ok && ctx.abortSignal?.aborted) {
+        envelope.status = 'aborted';
+      }
+      return envelope;
     } catch (err: unknown) {
       const durationMs = Date.now() - t0;
       return this.#errorEnvelope(

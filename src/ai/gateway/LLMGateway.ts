@@ -57,6 +57,7 @@ export interface GatewayRequest {
   reasoningEffort?: string;
 
   responseFormat?: 'text' | 'json';
+  schema?: Record<string, unknown>;
   abortSignal?: AbortSignal;
   /** 用量上报来源标签（用于成本归类）。 */
   usageSource?: string;
@@ -151,6 +152,8 @@ export class LLMGateway {
         ? undefined
         : (guarded.reasoningEffort ?? request.reasoningEffort),
       abortSignal: request.abortSignal,
+      responseFormat: request.responseFormat,
+      schema: request.schema,
     };
 
     const response = await this.#runWithReliability(
@@ -166,33 +169,13 @@ export class LLMGateway {
    * 简单 chat — 单轮对话，不含工具
    */
   async chat(request: GatewayChatRequest): Promise<string> {
-    const { modelDef, providerId, apiModelId } = this.#resolveModel(request.modelRef);
-
-    const guarded = ParameterGuard.guard(modelDef, {
-      temperature: request.temperature,
-      maxTokens: request.maxTokens,
+    // 文本与结构化对话复用同一完整响应通道，避免丢失用量和可靠性行为。
+    const response = await this.chatWithTools({
+      ...request,
+      messages: [{ role: 'user', content: request.prompt }],
+      usageSource: request.usageSource ?? 'chat',
     });
-
-    const transport = this.#getTransport(providerId);
-    const wasFiltered = (param: string) => guarded.filtered.some((f) => f.param === param);
-
-    return this.#runWithReliability(
-      providerId,
-      () =>
-        transport.chat({
-          model: apiModelId,
-          messages: [{ role: 'user', content: request.prompt }],
-          systemPrompt: request.systemPrompt,
-          temperature: wasFiltered('temperature')
-            ? undefined
-            : (guarded.temperature ?? request.temperature),
-          maxTokens: guarded.maxTokens ?? request.maxTokens,
-          responseFormat: request.responseFormat,
-          schema: request.schema,
-          abortSignal: request.abortSignal,
-        }),
-      request.abortSignal
-    );
+    return response.text || '';
   }
 
   /**
@@ -413,7 +396,7 @@ export class LLMGateway {
   #resolveTransportConfig(providerId: ProviderId): TransportConfig {
     const explicit = this.#config.providers?.[providerId];
     if (explicit?.apiKey) {
-      return explicit;
+      return { ...explicit, timeout: this.#config.timeout ?? explicit.timeout };
     }
 
     const envMap: Record<string, { key: string; base?: string }> = {
@@ -430,7 +413,7 @@ export class LLMGateway {
       ...explicitRest,
       apiKey: (env.key ? process.env[env.key] : undefined) || '',
       baseUrl: (env.base ? process.env[env.base] : undefined) || explicit?.baseUrl,
-      timeout: this.#config.timeout || explicit?.timeout,
+      timeout: this.#config.timeout ?? explicit?.timeout,
     };
   }
 

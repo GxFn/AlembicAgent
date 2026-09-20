@@ -1,3 +1,4 @@
+import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 /**
  * ExplorationTracker — 统一的 AI 探索生命周期控制器
  *
@@ -343,16 +344,9 @@ export class ExplorationTracker {
       this.#currentRoundHasSearch = true;
     }
 
-    // Submit 追踪
-    if (toolName === 'knowledge') {
-      const resultObj = typeof result === 'object' ? (result as Record<string, unknown>) : null;
-      const hasError = resultObj?.error !== undefined;
-      const status = resultObj?.status as string | undefined;
-      const isRejected = status === 'rejected' || status === 'duplicate';
-      if (!hasError && !isRejected) {
-        this.#metrics.submitCount++;
-        this.#metrics.roundsSinceSubmit = 0;
-      }
+    if (isPersistedSubmission({ tool: toolName, args, result })) {
+      this.#metrics.submitCount++;
+      this.#metrics.roundsSinceSubmit = 0;
     }
     const isDirectNoteFinding = toolName === 'note_finding';
     const isMemoryNoteFinding = toolName === 'memory' && args?.action === 'note_finding';

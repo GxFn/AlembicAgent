@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   computeRecipeSourceContentHash,
@@ -20,9 +19,10 @@ import {
 import { describe, expect, test, vi } from 'vitest';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 function makeProject() {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-recipe-profile-'));
+  const projectRoot = createTempProject('agent-recipe-profile-');
   fs.mkdirSync(path.join(projectRoot, 'src'), { recursive: true });
   fs.mkdirSync(path.join(projectRoot, 'docs'), { recursive: true });
   fs.writeFileSync(
@@ -197,6 +197,47 @@ const readyReport: RetrievalReadinessReport = {
 };
 
 describe('Agent Recipe production profile adapter', () => {
+  test('refreshes retrieval provenance after a style repair changes authored fields', async () => {
+    const projectRoot = makeProject();
+    let stored: Record<string, unknown> | undefined;
+    const corrected = 'Use import type for type-only dependencies.';
+    const provider = { chat: vi.fn(async () => JSON.stringify({ doClause: corrected })) };
+    try {
+      const result = await handleKnowledge(
+        'submit',
+        submitParams({ doClause: 'ImportType is needed for type-only dependencies.' }),
+        {
+          projectRoot,
+          runtime: { aiProvider: provider },
+          recipeGateway: {
+            createOrStage: async ({ items }: { items: Record<string, unknown>[] }) => {
+              stored = items[0];
+              return {
+                created: [
+                  { id: 'repaired', title: stored.title, lifecycle: 'pending', raw: stored },
+                ],
+                rejected: [],
+                duplicates: [],
+                merged: [],
+                blocked: [],
+                supersedeProposal: null,
+              };
+            },
+            evaluateReadiness: async () => readyReport,
+          },
+        } as never
+      );
+      expect(result.ok).toBe(true);
+      expect(provider.chat).toHaveBeenCalledTimes(1);
+      expect(stored?.doClause).toBe(corrected);
+      expect(
+        (stored?.retrievalProfile as { provenance: { sourceContentHash: string } }).provenance
+          .sourceContentHash
+      ).toBe(computeRecipeSourceContentHash(stored as never));
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
   test.each([
     'approve',
     'publish',

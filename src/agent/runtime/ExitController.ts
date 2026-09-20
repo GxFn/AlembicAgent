@@ -142,7 +142,8 @@ export class ExitController {
 
     // P3: policy validation (with token budget)
     const duringCheck = this.#validateDuring({
-      iteration: this.#skipPolicyIterCheck ? 0 : ctx.iteration,
+      // Policy 接收已完成的轮数；当前轮在调用前已加一，不能用它提前消耗第一轮预算。
+      iteration: this.#skipPolicyIterCheck ? 0 : Math.max(0, ctx.iteration - 1),
       startTime: this.#loopStartTime,
       totalTokens: runtimeTokenUsage.input + runtimeTokenUsage.output,
       totalInputTokens: runtimeTokenUsage.input,

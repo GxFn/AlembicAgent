@@ -13,29 +13,26 @@ violation to report, not to absorb.
 ./evaluation` (G5 boundary;
 consumed by Alembic per the space-edge config).
 
-- **Importing performs NO work** (post-AD4): no filesystem, no network, no
-  env reads at import — env/config reads happen at construction; the Core
+- **Importing performs NO work** (post-AD4): no filesystem or network effects are expected at import; provider configuration is resolved during construction; the Core
   logger is acquired lazily on first use (AD4 I1-I4). Proven by the
   clean-child-process import snapshot across all 15 facades.
-- **Network happens ONLY via injected/configured provider transports**:
+- **Direct AI network calls use injected/configured provider transports**:
   every outbound call flows AiProvider → LLMGateway → transport `fetch`
   (OpenAI/DeepSeek/Google/Ollama endpoints from provider config or env);
   proxy use is the env-configured undici dispatcher (bounded
-  `proxyDispatcherCache`, AD4 M1). No other code path opens sockets.
-- **The SD-4 declared DB read**: `agent/memory/MemoryStore` reads
+  `proxyDispatcherCache`, AD4 M1). Tool handlers can also delegate process/network effects to host-injected services; terminal sandbox enforcement remains host-owned.
+- **Agent session memory storage**: `agent/memory/MemoryStore` reads and writes
   `semantic_memories` through the better-sqlite3 handle its CALLER injects
   (constructor parameter; standing AD2 charter exception with the Option-C
   end-state trigger). Agent opens no databases of its own.
 - **Runtime persistence only under caller-provided roots**: conversation/
   session/memory stores write under `<projectRoot>/.asd/...` with a
-  pathGuard write-safety assertion at construction; nothing lands in cwd,
-  home, or globals.
+  pathGuard write-safety assertion at construction; Runtime builders default projectRoot to the current working directory when omitted; Evidence Ledger placement uses dataRoot. File tools can also read/write project source within their policy boundary.
 
 ## Family 2 — shipped tooling
 
-`package.json` has NO `bin` field and packs only `dist/` + `README.md`
-(`files[]`; pack floor 434). The repo `scripts/*.mjs` are local read-only
-gates and probes run via `node` in this repo — they are not shipped and not
+`package.json` has NO `bin` field and packs `dist/` plus the English and Chinese READMEs
+(`files[]`; pack floor 432). The repo `scripts/*.mjs` include gates, probes, isolated evaluation reports, and explicit build/release/codemod operations — they are not shipped and not
 an entrypoint family for consumers.
 
 ## Charter completeness (AD2 cross-check, findings only)

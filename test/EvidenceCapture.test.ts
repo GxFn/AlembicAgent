@@ -3,9 +3,6 @@
  * 覆盖：证据工具识别、read/search 结构化归一、文本回退、失败零采集、
  * 标注格式、evidenceCapture 中间件端到端（真实台账落盘 + envelope.text 标注）。
  */
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import {
   appendEvidenceAnnotation,
@@ -14,9 +11,10 @@ import {
 } from '../src/agent/evidence/EvidenceCapture.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { evidenceCapture } from '../src/agent/runtime/ToolExecutionPipeline.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 function makeLedger() {
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-capture-'));
+  const dataRoot = createTempProject('evidence-capture-');
   return new EvidenceLedgerStore({
     dataRoot,
     jobId: 'job_1',
@@ -173,7 +171,7 @@ describe('EvidenceCapture（E2 采集即落盘）', () => {
 
 describe('run-13 EVIDENCE_STALE 事故回归钉（判据×形态交叉）', () => {
   test('带 N| 前缀的 full 模式 batch 项：原文入账+range{1..lineCount}+freshness=fresh', () => {
-    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-pin-'));
+    const dataRoot = createTempProject('stale-pin-');
     const ledger = new EvidenceLedgerStore({
       dataRoot,
       jobId: 'jp',
@@ -256,6 +254,28 @@ describe('run-13 EVIDENCE_STALE 事故回归钉（判据×形态交叉）', () =
 
 // ─── P1-A F3：单 path read 的 file 归属(此前兜底只查 args.path，运行时形态是 args.params.path) ───
 describe('P1-A F3 单 path read 采集', () => {
+  test('records actual nested range coordinates and excludes derived-view ranges', () => {
+    const ledger = makeLedger();
+    const call = {
+      name: 'code',
+      args: { action: 'read', params: { path: 'src/a.ts', startLine: 10, endLine: 100 } },
+      id: 'range',
+    };
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      call,
+      makeEnvelope({ text: '10|const a = 1;\n11|export default a;' })
+    );
+    expect(entries[0].range).toEqual({ start: 10, end: 11 });
+    expect(entries[0].content).toBe('const a = 1;\nexport default a;');
+    const derived = captureEvidenceFromEnvelope(
+      ledger,
+      call,
+      makeEnvelope({ text: '[unchanged since last read]' })
+    );
+    expect(derived[0].range).toBeUndefined();
+  });
+
   test('args.params.path + N| 文本 → 带 file+range 的 verbatim 条目(不再 unverified 折价)', () => {
     const ledger = makeLedger();
     const entries = captureEvidenceFromEnvelope(

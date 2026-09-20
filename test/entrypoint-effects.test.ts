@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ConversationStore } from '../src/agent/context/ConversationStore.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -57,6 +58,50 @@ function listTree(root: string): string[] {
 }
 
 describe('entrypoint effects (AD6 inflow/outflow audit)', () => {
+  it('cleans a dist symlink without deleting its external target', () => {
+    const root = createTempProject('agent-build-clean-');
+    const outside = createTempProject('agent-build-outside-');
+    fs.mkdirSync(path.join(root, 'scripts'));
+    fs.copyFileSync(
+      path.join(repoRoot, 'scripts/build-agent.mjs'),
+      path.join(root, 'scripts/build-agent.mjs')
+    );
+    fs.mkdirSync(path.join(root, 'node_modules/typescript/bin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'node_modules/typescript/bin/tsc'), 'process.exit(0);');
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep');
+    fs.symlinkSync(outside, path.join(root, 'dist'));
+    execFileSync(process.execPath, ['scripts/build-agent.mjs'], { cwd: root });
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('keep');
+    expect(fs.existsSync(path.join(root, 'dist'))).toBe(false);
+  });
+  it('rewrites moved-file imports against their original text without cascading', () => {
+    const root = createTempProject('agent-codemod-');
+    for (const dir of ['scripts', 'src']) {
+      fs.mkdirSync(path.join(root, dir));
+    }
+    fs.copyFileSync(
+      path.join(repoRoot, 'scripts/codemod-rename.mjs'),
+      path.join(root, 'scripts/codemod-rename.mjs')
+    );
+    const before = "import local from './b.js';\nimport outer from '../b.js';\n";
+    fs.writeFileSync(path.join(root, 'src/a.ts'), before);
+    fs.writeFileSync(path.join(root, 'src/b.ts'), 'export default 1;');
+    fs.writeFileSync(path.join(root, 'b.ts'), 'export default 2;');
+    fs.writeFileSync(
+      path.join(root, 'renames.json'),
+      JSON.stringify([{ from: 'src/a.ts', to: 'src/deep/a.ts' }])
+    );
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    execFileSync('git', ['add', '.'], { cwd: root });
+    const args = ['scripts/codemod-rename.mjs', '--map', 'renames.json'];
+    const plan = execFileSync(process.execPath, args, { cwd: root, encoding: 'utf8' });
+    expect(plan).toContain('./b.js -> ../b.js');
+    expect(fs.readFileSync(path.join(root, 'src/a.ts'), 'utf8')).toBe(before);
+    execFileSync(process.execPath, [...args, '--apply'], { cwd: root });
+    expect(fs.readFileSync(path.join(root, 'src/deep/a.ts'), 'utf8')).toBe(
+      "import local from '../b.js';\nimport outer from '../../b.js';\n"
+    );
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });

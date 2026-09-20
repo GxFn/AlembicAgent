@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { NudgeGenerator, PlanTracker } from '../src/agent/context/index.js';
+import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
+import { submitDedup, trackerSignal } from '../src/agent/runtime/ToolExecutionPipeline.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
+import { Evolution } from '../src/tools/runtime/toolsets/Evolution.js';
 
 function createManifest(overrides: Partial<ToolCapabilityManifest> = {}): ToolCapabilityManifest {
   const manifest: ToolCapabilityManifest = {
@@ -127,6 +131,139 @@ function createLoopContext(diagnostics: DiagnosticsCollector): LoopContext {
 }
 
 describe('runtime efficiency diagnostics', () => {
+  it.each([
+    'blocked',
+    'timeout',
+    'metadata-blocked',
+  ])('never counts a %s tool result as a persisted submission', (failure) => {
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 10 }
+    );
+    loopCtx.tracker = tracker;
+    loopCtx.sharedState = { submittedTitles: new Set() };
+    const call = {
+      id: 'call',
+      name: 'knowledge',
+      args: { action: 'submit', params: { title: 'Candidate' } },
+    };
+    const result = { status: 'created', id: 'candidate', lifecycle: 'pending' };
+    const envelope = {
+      ok: true,
+      status: failure,
+      structuredContent: result,
+    } as unknown as ToolResultEnvelope;
+    const metadata = {
+      blocked: failure === 'metadata-blocked',
+      cacheHit: false,
+      isNew: false,
+      isSubmit: false,
+      durationMs: 0,
+      ...(failure === 'metadata-blocked' ? {} : { envelope }),
+    };
+    const ctx = { runtime: {} as AgentRuntime, loopCtx, iteration: 1 };
+    trackerSignal.after(call, result, ctx, metadata);
+    submitDedup.after(call, result, ctx, metadata);
+    expect(tracker?.totalSubmits).toBe(0);
+    expect(metadata.isSubmit).toBe(false);
+    expect(loopCtx.sharedState.submittedTitles).toEqual(new Set());
+  });
+  it('validates repository-relative code paths against the analyzed project root', async () => {
+    let executions = 0;
+    const runtime = createRuntime(createManifest(), async (request) =>
+      createEnvelope(request, ++executions)
+    );
+    Object.assign(runtime, { projectRoot: '/tmp/review-other-project' });
+    runtime.policies = new PolicyEngine([
+      new SafetyPolicy({ fileScope: '/tmp/review-other-project' }),
+    ]);
+    const result = await createToolPipeline().execute(
+      { id: 'read', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+      { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+    );
+    expect(result.metadata.blocked).toBe(false);
+    expect(executions).toBe(1);
+  });
+  it.each([
+    'get',
+    'search',
+  ])('allows the producer to retrieve existing evidence with %s', async (action) => {
+    let executions = 0;
+    const runtime = createRuntime(createManifest({ id: 'evidence' }), async (request) =>
+      createEnvelope(request, ++executions)
+    );
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.allowedToolIds = ['evidence'];
+    loopCtx.tracker = {
+      pipelineType: 'producer',
+      phase: 'PRODUCE',
+      recordToolCall: () => ({ isNew: true }),
+    } as never;
+    const result = await createToolPipeline().execute(
+      {
+        id: 'evidence-read',
+        name: 'evidence',
+        args: { action, params: { id: 'E-1', query: 'file.ts' } },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    expect(result.metadata.blocked).toBe(false);
+    expect(executions).toBe(1);
+  });
+  it('forwards direct finding depth slots through the memory tool bridge', async () => {
+    let request: ToolCallRequest | undefined;
+    const runtime = createRuntime(createManifest({ id: 'memory' }), async (input) => {
+      request = input;
+      return createEnvelope(input, 1);
+    });
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.allowedToolIds = ['memory'];
+    await createToolPipeline().execute(
+      {
+        id: 'finding',
+        name: 'note_finding',
+        args: {
+          finding: 'boundary',
+          evidenceRefs: ['E-1'],
+          importance: 8,
+          designIntent: 'keep writes in the owner',
+          failureModes: ['stale state'],
+        },
+      },
+      { runtime, loopCtx, iteration: 1 }
+    );
+    expect(request?.args.params).toMatchObject({
+      designIntent: 'keep writes in the owner',
+      failureModes: ['stale state'],
+    });
+  });
+  it.each([
+    'policy',
+    'capability',
+  ])('enforces %s restrictions before invoking the host router', async (mode) => {
+    let executions = 0;
+    const runtime = createRuntime(createManifest({ id: 'terminal' }), async (request) =>
+      createEnvelope(request, ++executions)
+    );
+    runtime.policies = new PolicyEngine(
+      mode === 'policy' ? [new SafetyPolicy({ commandBlacklist: [/custom-denied/] })] : []
+    );
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.allowedToolIds = ['terminal'];
+    loopCtx.capabilities = mode === 'capability' ? [new Evolution()] : [];
+    const call = {
+      id: 'blocked',
+      name: 'terminal',
+      args: {
+        action: 'exec',
+        params: { command: mode === 'policy' ? 'custom-denied' : 'git checkout main' },
+      },
+    };
+    const result = await createToolPipeline().execute(call, { runtime, loopCtx, iteration: 1 });
+    expect(result.metadata.blocked).toBe(true);
+    expect(executions).toBe(0);
+  });
   it('blocks oversized tool arguments before execution or cache admission', async () => {
     const manifest = createManifest();
     let executeCount = 0;
@@ -160,17 +297,18 @@ describe('runtime efficiency diagnostics', () => {
 
   it('short-circuits duplicate deterministic tool calls within a session snapshot', async () => {
     const diagnostics = new DiagnosticsCollector();
-    const manifest = createManifest({ id: 'code' });
+    const manifest = createManifest({ id: 'snapshot.lookup' });
     let executeCount = 0;
     const runtime = createRuntime(manifest, async (request) => {
       executeCount++;
       return createEnvelope(request, executeCount);
     });
     const loopCtx = createLoopContext(diagnostics);
+    loopCtx.allowedToolIds = ['snapshot.lookup'];
     const pipeline = createToolPipeline();
     const call = {
       id: 'tool-1',
-      name: 'code',
+      name: 'snapshot.lookup',
       args: { action: 'search', params: { patterns: ['AgentRuntime'] } },
     };
 
@@ -190,6 +328,40 @@ describe('runtime efficiency diagnostics', () => {
       cacheHits: 1,
       cacheMisses: 1,
     });
+  });
+
+  it.each([
+    'code',
+    'memory',
+    'knowledge',
+    'meta',
+  ])('does not bypass live %s reads with an old session result', async (tool) => {
+    let count = 0;
+    const runtime = createRuntime(createManifest({ id: tool }), async (request) =>
+      createEnvelope(request, ++count)
+    );
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.allowedToolIds = [tool];
+    const pipeline = createToolPipeline();
+    const call = {
+      id: 'read',
+      name: tool,
+      args: {
+        action:
+          tool === 'meta'
+            ? 'review'
+            : tool === 'memory'
+              ? 'recall'
+              : tool === 'code'
+                ? 'read'
+                : 'search',
+        params: {},
+      },
+    };
+    await pipeline.execute(call, { runtime, loopCtx, iteration: 1 });
+    const second = await pipeline.execute(call, { runtime, loopCtx, iteration: 2 });
+    expect(count).toBe(2);
+    expect(second.result).toEqual({ executeCount: 2 });
   });
 
   it('does not short-circuit submit or side-effect tools', async () => {

@@ -15,6 +15,14 @@
 
 import { getDimensionSOP } from '@alembic/core/dimensions';
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
+import {
+  allocateMemoryBudget,
+  DEFAULT_MEMORY_BUDGET,
+  type MemoryPromptPort,
+  projectMemorySection,
+  readPersistentMemorySection,
+} from '../memory/MemoryPrompt.js';
+import { type MemoryReadOptions, reportMemoryRead } from '../memory/MemoryReadPolicy.js';
 
 /**
  * P4/C10: 深度捕获指令——从 Core DEPTH_DIMENSIONS 单源渲染(与契约/裁判/评分/指引同源)。取四个深度维度
@@ -75,12 +83,9 @@ interface EpisodicMemoryLike {
 }
 
 /** PersistentMemory 最小接口 */
-interface SemanticMemoryLike {
-  toPromptSection(opts: {
-    source: string;
-    query: string;
-    limit: number;
-  }): Promise<string | null> | string | null;
+type SemanticMemoryLike = MemoryPromptPort;
+export interface AnalystMemoryOptions extends MemoryReadOptions {
+  totalMemoryBudget?: number;
 }
 
 /** CodeEntityGraph 最小接口 */
@@ -105,7 +110,7 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 | 1. 全局扫描 | 第 1-3 轮 | code({ action: "structure" }) 了解项目结构 |
 | 2. 结构化探索 | 第 4-N×60% 轮 | graph({ action: "query" }) 理解核心类；code({ action: "search" }) 批量搜索关键模式 |
 | 3. 深度验证 | 第 N×60%-N×80% 轮 | code({ action: "read" }) 阅读关键实现，确认细节；确认核心发现后立即记录 |
-| 4. 结构化记录 | 总结前 | 用 note_finding({ finding, evidence, importance }) 补齐核心发现；这是 QualityGate 的重要质量依据 |
+| 4. 结构化记录 | 总结前 | 用 note_finding({ finding, evidenceRefs, importance }) 补齐核心发现；这是 QualityGate 的重要质量依据 |
 | 5. 输出总结 | 最后阶段 | 停止工具，直接输出你的分析文本 |
 
 ## 关键规则
@@ -114,7 +119,7 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 - 没有调用过 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) / code({ action: "read" }) 之前，禁止输出最终分析
 - 不要重复搜索相同关键词或读取相同文件（系统会返回缓存并扣轮次）
 - 优先使用注入的 panorama / projectInfo / codeEntityGraph / sessionStore，再用工具验证关键事实
-- **note_finding 是硬性质量依据**: 一旦在扫描、探索或验证阶段确认核心发现，允许并且应该立即调用 note_finding({ finding, evidence, importance })；最终至少提交 3 条结构化发现；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止，缺失或不足会导致 QualityGate retry
+- **note_finding 是硬性质量依据**: 一旦在扫描、探索或验证阶段确认核心发现，允许并且应该立即调用 note_finding({ finding, evidenceRefs, importance })；最终至少提交 3 条结构化发现；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止，缺失或不足会导致 QualityGate retry
 - **单一事实源**: Producer 只消费 note_finding 结构化发现。最终 Markdown 只能总结已记录的 note_finding，不得新增未结构化记录的模式家族、候选主题或可提交发现。
 - **证据必须落到代码，文档只是线索**: 协作/设计/总结类 markdown（如 wakeflow-ledger、Design、docs 下的 *.md）是二手描述，只能用来导航，不能作为知识证据——note_finding 的 evidence 锚点与最终 (来源: …) 必须指向真实源码/配置文件（.ts/.js/.json/.yaml 等）的具体行。看到 .md 里的架构结论时，回到它描述的真实代码文件验证并引用代码行；抄文档结论而不读代码等同编造。
 ${DEPTH_CAPTURE_INSTRUCTION}
@@ -326,9 +331,14 @@ export async function buildAnalystPrompt(
     skipped?: number;
     totalRecipes?: number;
   } | null,
-  toolPolicyHints?: Record<string, unknown> | null
+  toolPolicyHints?: Record<string, unknown> | null,
+  memoryOptions: AnalystMemoryOptions = {}
 ) {
   const parts: string[] = [];
+  const memoryBudget = allocateMemoryBudget(
+    'analyst',
+    memoryOptions.totalMemoryBudget ?? DEFAULT_MEMORY_BUDGET
+  );
 
   // §1 任务描述
   parts.push(
@@ -396,7 +406,7 @@ ${depthHint}
 最终 Markdown 报告不能替代 note_finding 结构化函数调用。
 note_finding 是 QualityGate 的重要质量依据，也是 Producer 后续生成候选知识的主要输入之一。
 不要等到总结阶段；一旦在扫描/探索/验证阶段确认核心发现，允许并且必须主动调用:
-note_finding({ finding: "发现描述", evidence: "完整相对路径:行号", importance: 8 })
+note_finding({ finding: "发现描述", evidenceRefs: ["E-1"], importance: 8 })
 如果当前维度需要产出候选知识，最终至少记录 3 条 note_finding；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止；若确认不足 3 条，请记录所有已确认发现，并在最终报告说明不足原因。
 最终 Markdown 报告只能围绕已记录的 note_finding 展开；不要把未调用 note_finding 的信号写成核心发现或候选义务。未记录的信号只能放入待探索/未结构化记录说明。
 缺少 note_finding(...) 或数量不足会直接影响 QualityGate 评分并触发 retry。`);
@@ -405,57 +415,74 @@ note_finding({ finding: "发现描述", evidence: "完整相对路径:行号", i
   );
 
   // §6 前序维度分析摘要 (Tier 2+ 才有)
-  if (episodicMemory) {
-    const emContext = episodicMemory.buildContextForDimension(
-      dimConfig.id,
-      dimConfig.focusKeywords || []
-    );
-    if (emContext) {
-      parts.push(emContext);
+  const historyParts: string[] = [];
+  try {
+    if (memoryOptions.abortSignal?.aborted) {
+      return parts.join('\n\n');
     }
-
-    // §7: Tier Reflection 洞察
-    const reflections = episodicMemory.getRelevantReflections(dimConfig.id);
-    if (reflections) {
-      parts.push('## 跨维度综合洞察');
-      parts.push(reflections);
-    }
-  } else if (dimensionContext) {
-    const snapshot = dimensionContext.buildContextForDimension(dimConfig.id);
-    const prevDims = Object.entries(snapshot.previousDimensions) as [string, DimensionDigestLike][];
-    if (prevDims.length > 0) {
-      parts.push(`## 前序维度分析摘要（避免重复探索）`);
-      for (const [dimId, digest] of prevDims) {
-        parts.push(`### ${dimId}\n${digest.summary || '(无摘要)'}`);
-        if (digest.keyFindings?.length > 0) {
-          parts.push(`关键发现: ${digest.keyFindings.join('; ')}`);
-        }
-        if (digest.crossRefs?.[dimConfig.id]) {
-          parts.push(`💡 对本维度的建议: ${digest.crossRefs[dimConfig.id]}`);
+    if (episodicMemory && memoryBudget.sessionStore > 0) {
+      const emContext = episodicMemory.buildContextForDimension(
+        dimConfig.id,
+        dimConfig.focusKeywords || []
+      );
+      if (emContext) {
+        historyParts.push(emContext);
+      }
+      // SessionStore 已在自己的投影中包含反思；旧端口可能没有，兼容补充但不重复注入。
+      const reflections = episodicMemory.getRelevantReflections(dimConfig.id);
+      if (reflections && !emContext?.includes(reflections)) {
+        historyParts.push('## 跨维度综合洞察', reflections);
+      }
+    } else if (dimensionContext && memoryBudget.sessionStore > 0) {
+      const snapshot = dimensionContext.buildContextForDimension(dimConfig.id);
+      const prevDims = Object.entries(snapshot.previousDimensions) as [
+        string,
+        DimensionDigestLike,
+      ][];
+      if (prevDims.length > 0) {
+        historyParts.push(`## 前序维度分析摘要（避免重复探索）`);
+        for (const [dimId, digest] of prevDims) {
+          historyParts.push(`### ${dimId}\n${digest.summary || '(无摘要)'}`);
+          if (digest.keyFindings?.length > 0) {
+            historyParts.push(`关键发现: ${digest.keyFindings.join('; ')}`);
+          }
+          if (digest.crossRefs?.[dimConfig.id]) {
+            historyParts.push(`💡 对本维度的建议: ${digest.crossRefs[dimConfig.id]}`);
+          }
         }
       }
     }
+  } catch (err: unknown) {
+    reportMemoryRead(memoryOptions, {
+      phase: 'session',
+      status: 'error',
+      reason: err instanceof Error ? err.name : 'unknown',
+    });
+  }
+  const history = projectMemorySection(
+    'session',
+    historyParts.join('\n'),
+    memoryBudget.sessionStore,
+    memoryOptions
+  );
+  if (history.content) {
+    parts.push(history.content);
   }
 
   // §8: 历史语义记忆 (Tier 3)
-  if (semanticMemory) {
-    try {
-      const query = `${dimConfig.label} ${dimConfig.guide || ''} ${projectInfo.lang}`;
-      const section = await semanticMemory.toPromptSection({
-        source: 'bootstrap',
-        query,
-        limit: 10,
-      });
-      if (section) {
-        parts.push(section);
-      }
-    } catch {
-      /* SemanticMemory retrieval failed, non-critical */
-    }
+  const semanticSection = await readPersistentMemorySection(semanticMemory, {
+    ...memoryOptions,
+    source: 'bootstrap',
+    query: `${dimConfig.label} ${dimConfig.guide || ''} ${projectInfo.lang}`,
+    limit: 10,
+    tokenBudget: memoryBudget.persistentMemory,
+  });
+  if (semanticSection.content) {
+    parts.push(semanticSection.content);
   }
 
   // §9: 代码实体图谱 (Phase E)
-  if (codeEntityGraph) {
+  if (codeEntityGraph && !memoryOptions.abortSignal?.aborted) {
     try {
       const graphCtx = await codeEntityGraph.generateContextForAgent({
         maxEntities: 20,

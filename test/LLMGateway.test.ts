@@ -10,6 +10,58 @@ function stubFetch(response: Record<string, unknown>) {
 }
 
 describe('LLMGateway horizontal capabilities', () => {
+  it.each([
+    'chat',
+    'chatStructured',
+  ] as const)('records usage once for %s while retaining JSON mode', async (method) => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, options) => {
+        body = JSON.parse(options.body);
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [{ message: { content: '{"value":42}' } }],
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          }),
+        } as Response;
+      })
+    );
+    const onUsage = vi.fn();
+    const gateway = new LLMGateway({ providers: { openai: { apiKey: 'test-key' } }, onUsage });
+    await gateway[method]({ modelRef: 'openai:gpt-4o', prompt: 'json', usageSource: method });
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 5, outputTokens: 3, source: method })
+    );
+    expect(body.response_format).toEqual(
+      method === 'chatStructured' ? { type: 'json_object' } : undefined
+    );
+  });
+  it('applies the global timeout even when provider credentials are explicit', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_url, options) =>
+          new Promise((_resolve, reject) => {
+            options.signal.addEventListener(
+              'abort',
+              () => reject(new DOMException('aborted', 'AbortError')),
+              { once: true }
+            );
+          })
+      )
+    );
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'test-key', timeout: 200 } },
+      timeout: 5,
+      maxRetries: 0,
+    });
+    await expect(gateway.chat({ modelRef: 'openai:gpt-4o', prompt: 'hello' })).rejects.toThrow(
+      'after 5ms'
+    );
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
     resetLLMGateway();

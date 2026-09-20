@@ -25,7 +25,7 @@ const JEST_SUMMARY_RE =
   /Tests:\s+(?:(\d+)\s+failed,?\s*)?(?:(\d+)\s+skipped,?\s*)?(?:(\d+)\s+passed,?\s*)?(\d+)\s+total/;
 
 const PYTEST_SUMMARY_RE =
-  /=+\s+(?:(\d+)\s+passed)?(?:,?\s*(\d+)\s+failed)?(?:,?\s*(\d+)\s+skipped)?(?:,?\s*(\d+)\s+error)?/;
+  /^=+\s+((?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)(?:,\s*|\s+))+).*?=+$/gm;
 
 const MOCHA_PASSING_RE = /(\d+)\s+passing/;
 const MOCHA_FAILING_RE = /(\d+)\s+failing/;
@@ -102,15 +102,20 @@ function tryJest(raw: string): TestResult | null {
 }
 
 function tryPytest(raw: string): TestResult | null {
-  const m = PYTEST_SUMMARY_RE.exec(raw);
+  // 标题行不是结果；从最后一个含真实计数的摘要取值，不能把 session starts 解析成零通过。
+  const summaries = [...raw.matchAll(PYTEST_SUMMARY_RE)];
+  const m = summaries.at(-1);
   if (!m) {
     return null;
   }
 
-  const passed = m[1] ? parseInt(m[1], 10) : 0;
-  const failed = m[2] ? parseInt(m[2], 10) : 0;
-  const skipped = m[3] ? parseInt(m[3], 10) : 0;
-  const errors = m[4] ? parseInt(m[4], 10) : 0;
+  const counts = new Map(
+    [...m[1].matchAll(/(\d+)\s+(\w+)/g)].map((match) => [match[2], Number(match[1])])
+  );
+  const passed = counts.get('passed') ?? 0;
+  const failed = counts.get('failed') ?? 0;
+  const skipped = (counts.get('skipped') ?? 0) + (counts.get('xfailed') ?? 0);
+  const errors = (counts.get('error') ?? 0) + (counts.get('errors') ?? 0);
 
   return {
     passed,

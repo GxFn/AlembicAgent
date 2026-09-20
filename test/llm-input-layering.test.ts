@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
+import { SessionStore } from '../src/agent/memory/SessionStore.js';
+import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
 import { ANALYST_SYSTEM_PROMPT, buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
 import {
   buildProducerPromptV2,
@@ -106,6 +108,21 @@ function getLlmInput(progress: ProgressEvent[]) {
 }
 
 describe('LLM input layering', () => {
+  it('counts provider payload once while retaining section measurements', () => {
+    const systemPrompt = 'x'.repeat(400);
+    const measurement = measureLlmInputAssembly({
+      systemPrompt,
+      messages: [],
+      providerMessages: [],
+      tools: [],
+      sections: [{ id: 'identity', title: 'Identity', content: systemPrompt }],
+      stageProfile: 'analyze',
+      inputLayerMessage: null,
+    } as never);
+    expect(measurement.estimatedTokens).toBe(measurePromptText(systemPrompt).estimatedTokens);
+    expect(measurement.charCount).toBe(systemPrompt.length);
+    expect(measurement.sectionMeasurements).toHaveLength(1);
+  });
   it('compacts repeated analyze input blocks without provider calls', () => {
     const repeatedFact =
       'Shared project fact: Sources/App/Feature.swift owns the feature boundary and should be cited exactly once in the analyze context.';
@@ -738,7 +755,7 @@ describe('LLM input layering', () => {
     });
   });
 
-  it('keeps RECORD as a note_finding-only stage without exploration instructions', async () => {
+  it('keeps RECORD limited to note_finding and existing evidence retrieval', async () => {
     const progress: ProgressEvent[] = [];
     const capture: {
       toolSchemas?: Array<Record<string, unknown>>;
@@ -756,13 +773,14 @@ describe('LLM input layering', () => {
         { name: 'memory', description: 'Memory', parameters: { type: 'object' } },
         { name: 'code', description: 'Code', parameters: { type: 'object' } },
         { name: 'graph', description: 'Graph', parameters: { type: 'object' } },
+        { name: 'evidence', description: 'Existing evidence', parameters: { type: 'object' } },
       ],
     });
     const tracker = createTracker({ phase: 'RECORD', toolChoice: 'required' });
 
     await runtime.reactLoop('record confirmed findings', {
       source: 'system',
-      additionalToolsOverride: ['memory', 'code', 'graph'],
+      additionalToolsOverride: ['memory', 'code', 'graph', 'evidence'],
       context: { pipelinePhase: 'analyze' },
       systemPromptOverride: 'Record identity prompt',
       tracker: tracker as never,
@@ -773,7 +791,7 @@ describe('LLM input layering', () => {
     const llmInput = getLlmInput(progress);
     const inputText = llmInput?.content?.text || '';
 
-    expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['note_finding']);
+    expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['note_finding', 'evidence']);
     expect(providerLayer).toContain('stageProfile: record');
     expect(providerLayer).toContain('Record-only phase');
     expect(providerLayer).not.toContain('code({ action');
@@ -1082,5 +1100,100 @@ describe('LLM input layering', () => {
 
     expect(tracker.pipelineType).toBe('producer');
     expect(tracker.phase).toBe('PRODUCE');
+  });
+});
+describe('bounded Analyst memory assembly', () => {
+  it.each([
+    'aborted',
+    'timeout',
+  ])('propagates %s through the actual Analyst preset prompt boundary', async (status) => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const warn = vi.fn();
+      const recall = vi.fn(() => new Promise<string>(() => {}));
+      const build = INSIGHT_PRESET.strategy.stages[0].promptBuilder;
+      if (!build) {
+        throw new Error('Analyst prompt builder missing');
+      }
+      const pending = build({
+        dimConfig: { id: 'transaction', label: 'Transaction' },
+        projectInfo: { name: 'fixture', lang: 'typescript', fileCount: 3 },
+        semanticMemory: { toPromptSection: recall },
+        abortSignal: controller.signal,
+        memoryReadTimeoutMs: 20,
+        diagnostics: { warn },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      if (status === 'aborted') {
+        controller.abort();
+      } else {
+        await vi.advanceTimersByTimeAsync(21);
+      }
+      expect(await pending).toContain('分析项目 fixture');
+      expect(recall).toHaveBeenCalledTimes(1);
+      expect(recall.mock.calls[0][0]).toMatchObject({
+        abortSignal: expect.objectContaining({ aborted: true }),
+        tokenBudget: 600,
+      });
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ code: `memory_persistent_${status}` })
+      );
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('budgets real session and persistent memory without duplicating reflections', async () => {
+    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    session.addTierReflection(0, {
+      tierIndex: 0,
+      completedDimensions: ['before'],
+      topFindings: [],
+      crossDimensionPatterns: ['UNIQUE_REFLECTION'],
+      suggestionsForNextTier: [],
+    });
+    let received: Record<string, unknown> = {};
+    const semantic = {
+      toPromptSection: async (options: Record<string, unknown>) => {
+        received = options;
+        return 'OVERSIZED_MEMORY '.repeat(3000);
+      },
+    };
+    try {
+      const prompt = await buildAnalystPrompt(
+        { id: 'next', label: 'transactions' },
+        { name: 'fixture', lang: 'typescript', fileCount: 3 },
+        null,
+        session,
+        semantic,
+        null
+      );
+      expect(prompt.split('UNIQUE_REFLECTION')).toHaveLength(2);
+      expect(received).toMatchObject({ query: 'transactions  typescript', tokenBudget: 600 });
+      expect(prompt.split('OVERSIZED_MEMORY').length).toBeLessThan(160);
+    } finally {
+      session.dispose();
+    }
+  });
+  it('preserves the analysis task when session memory cannot be read', async () => {
+    const broken = {
+      buildContextForDimension() {
+        throw new Error('broken session');
+      },
+      getRelevantReflections() {
+        return '';
+      },
+    };
+    await expect(
+      buildAnalystPrompt(
+        { id: 'next', label: 'transactions' },
+        { name: 'fixture', lang: 'typescript', fileCount: 3 },
+        null,
+        broken,
+        null,
+        null
+      )
+    ).resolves.toContain('分析项目 fixture');
   });
 });

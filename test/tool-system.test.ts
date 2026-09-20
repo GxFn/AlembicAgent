@@ -140,6 +140,16 @@ function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResu
   };
 }
 
+it('sanitizes the JSON text projection as well as structuredContent', () => {
+  const envelope = createEnvelopeForStatus('success');
+  envelope.structuredContent = { apiKey: 'synthetic-sensitive-value', publicValue: 'kept' };
+  envelope.text = JSON.stringify(envelope.structuredContent, null, 2);
+  const output = projectToolResultOrdinaryOutput(envelope);
+  expect(output.structuredContent).toEqual({ publicValue: 'kept' });
+  expect(JSON.parse(output.text)).toEqual({ publicValue: 'kept' });
+  expect(JSON.stringify(output)).not.toContain('synthetic-sensitive-value');
+});
+
 describe('tool kernel contract', () => {
   it('removes the V1 core-contract shims and the runtime bridge from source', () => {
     const removed = [
@@ -236,6 +246,15 @@ describe('UnifiedToolCatalog', () => {
       description: 'Model-specific echo schema',
       parameters: { type: 'object', properties: { compact: { type: 'boolean' } } },
     });
+
+    expect(catalog.unregister('demo.echo')).toBe(true);
+    expect(catalog.getHandler('demo.echo')).toBeNull();
+    expect(catalog.expandedCount).toBe(0);
+    expect(() => catalog.registerDefinition(definition)).not.toThrow();
+    catalog.unregister('demo.echo');
+    catalog.register(createManifest());
+    expect(() => catalog.registerDefinition(definition)).toThrow();
+    expect(catalog.getHandler('demo.echo')).toBeNull();
   });
 });
 

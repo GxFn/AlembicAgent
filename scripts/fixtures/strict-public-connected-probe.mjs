@@ -51,12 +51,12 @@ import {
   STRICT_G1_HARD_AXES_V1,
   STRICT_G2_HARD_AXES_V1,
 } from '@alembic/core/production';
+import { createProjectContextFileRef } from '@alembic/core/project-context';
 import {
   buildProjectContextRequestMatrixV2,
   buildProjectScopeManifestV1,
   CERTIFIED_PROJECT_FACTS_CONSUMERS,
   captureCertifiedProjectFactsV2,
-  createProjectContextFileRef,
   createProjectContextRequestAuditPlansV2,
   hashCanonicalJson,
   readCertifiedProjectFactsFrozenFile,

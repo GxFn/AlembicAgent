@@ -57,6 +57,10 @@ export class ClaudeProvider extends AiProvider {
   }
 
   // Claude 不支持嵌入 API，返回空数组触发上层降级（与原实现一致）。
+  override supportsEmbedding(): boolean {
+    return false;
+  }
+
   async embed(_text: string | string[]) {
     return [];
   }

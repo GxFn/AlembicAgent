@@ -4,9 +4,6 @@
  * evidence.search（路径+内容匹配、limit 钳制）、RECORD/VERIFY 相位门放行 evidence 只读、
  * 配额受台账 distinctFiles 钳制（P4 收口）、采集中间件刷新 tracker 台账统计。
  */
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { targetMemoryFindingCount } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
@@ -18,11 +15,12 @@ import {
   EVIDENCE_GET_MAX_LINES,
   handle as handleEvidence,
 } from '../src/tools/runtime/handlers/evidence.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 type EvidenceHandlerCtx = Parameters<typeof handleEvidence>[2];
 
 function makeLedger() {
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-tool-'));
+  const dataRoot = createTempProject('evidence-tool-');
   return new EvidenceLedgerStore({
     dataRoot,
     jobId: 'job_1',

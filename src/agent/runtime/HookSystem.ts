@@ -202,7 +202,12 @@ export class HookSystem {
 
     for (const entry of list) {
       try {
-        entry.handler(payload as never);
+        const result = entry.handler(payload as never);
+        if (result instanceof Promise) {
+          void result.catch((err: unknown) =>
+            this.#recordHookError(event, entry, err, 'sync', payload)
+          );
+        }
       } catch (err) {
         this.#recordHookError(event, entry, err, 'sync', payload);
       }

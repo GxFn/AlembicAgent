@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import {
+  evolutionGateEvaluator,
+  producerRejectionGateEvaluator,
+} from '../src/agent/evaluation/gateEvaluators.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import {
   AgentProfileCompiler,
   AgentProfileRegistry,
   AgentStageFactoryRegistry,
 } from '../src/agent/profiles/index.js';
+import { collectEvolutionDecisionIds } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
+import { projectRelationDiscoveryResult } from '../src/agent/runs/relation/RelationAgentRun.js';
 import type {
   AgentRunInput,
   AgentRunResult,
@@ -120,6 +126,51 @@ function childResult(input: AgentRunInput): AgentRunResult {
 }
 
 describe('task handler public contracts', () => {
+  it('does not count rejected replacements or skipped proposals as completed evolution decisions', () => {
+    const calls = [
+      {
+        tool: 'knowledge',
+        args: { action: 'submit', params: { supersedes: 'old' } },
+        result: { status: 'duplicate_blocked' },
+        durationMs: 0,
+      },
+      {
+        tool: 'knowledge',
+        args: { action: 'manage', params: { operation: 'evolve', id: 'old' } },
+        result: { status: 'evolution_proposed', outcome: 'skipped' },
+        durationMs: 0,
+      },
+    ];
+    expect(collectEvolutionDecisionIds(calls)).toEqual(new Set());
+    expect(
+      evolutionGateEvaluator({ toolCalls: calls }, {}, { existingRecipes: [{ id: 'old' }] }).action
+    ).toBe('retry');
+  });
+
+  it('does not let successful knowledge queries hide rejected submissions', () => {
+    const toolCalls = [
+      ...Array.from({ length: 3 }, () => ({
+        tool: 'knowledge',
+        args: { action: 'search' },
+        result: { status: 'success' },
+      })),
+      ...Array.from({ length: 2 }, () => ({
+        tool: 'knowledge',
+        args: { action: 'submit' },
+        result: { status: 'rejected' },
+      })),
+    ];
+    expect(producerRejectionGateEvaluator({ toolCalls }, {}).action).toBe('retry');
+  });
+  it.each([
+    'null',
+    '[]',
+    '{"analyzed":-1,"relations":[null,{"from":3}]}',
+  ])('normalizes malformed relation output: %s', (reply) => {
+    expect(
+      projectRelationDiscoveryResult({ ...childResult(baseRunInput([])), reply })
+    ).toMatchObject({ analyzed: 0, relations: [] });
+  });
   it('checks duplicate candidates and keeps AI verdict optional', async () => {
     const context = createTaskContext({
       check_duplicate: {
@@ -285,6 +336,37 @@ describe('policy public contracts', () => {
 });
 
 describe('profile public contracts', () => {
+  it('preserves declarative safety constraints through profile compilation', () => {
+    const compiler = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry([]),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    });
+    const profile = compiler.compile({
+      basePreset: 'chat',
+      policies: [
+        {
+          type: 'safety',
+          allowedSenders: ['allowed'],
+          fileScope: projectRoot,
+          requireApprovalFor: ['publish'],
+          commandBlacklist: [/custom-denied/],
+        },
+      ],
+    });
+    const policy = profile.policies?.[0] as SafetyPolicy;
+    expect(policy.validateBefore({ message: { sender: { id: 'denied' } } } as never).ok).toBe(
+      false
+    );
+    expect(policy.checkFilePath('/outside/file.ts').safe).toBe(false);
+    expect(policy.needsApproval('publish')).toBe(true);
+    const engine = new PolicyEngine([policy]);
+    expect(
+      engine.validateToolCall('terminal', {
+        action: 'exec',
+        params: { command: 'custom-denied arg' },
+      }).ok
+    ).toBe(false);
+  });
   it('registers serializable profile definitions and rejects runtime closures', () => {
     const registry = new AgentProfileRegistry([]);
 
@@ -339,38 +421,55 @@ describe('profile public contracts', () => {
   });
 });
 
+function coordinationProfile(): CompiledAgentProfile {
+  return {
+    kind: 'compiled-agent-profile',
+    id: 'parent-profile',
+    title: 'Parent Profile',
+    serviceKind: 'system-analysis',
+    lifecycle: 'active',
+    basePreset: 'chat',
+    actionSpace: { mode: 'listed', toolIds: [] },
+    additionalTools: [],
+    params: {},
+    runtimeOverrides: {},
+    concurrency: {
+      mode: 'tiered',
+      concurrency: 1,
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
+      childProfile: 'child-profile',
+    },
+  };
+}
+
 describe('coordination public contracts', () => {
+  it.each([
+    'timeout',
+    'blocked',
+    'aborted',
+    'error',
+  ] as const)('preserves child %s status in the parent result', async (status) => {
+    const result = await new AgentRunCoordinator().run(
+      baseRunInput([{ id: 'a', tier: 0 }]),
+      coordinationProfile(),
+      async (input) => ({ ...childResult(input), status })
+    );
+    expect(result?.status).toBe(status);
+  });
   it('partitions bootstrap dimensions by tier and merges child results deterministically', async () => {
     const coordinator = new AgentRunCoordinator();
     const tierEvents: number[] = [];
     const input = baseRunInput([
-      { id: 'scan', tier: 0, prompt: 'scan project' },
       { id: 'produce', tier: 1, prompt: 'produce records' },
+      { id: 'scan', tier: 0, prompt: 'scan project' },
     ]);
     input.context.coordination = {
       onTierComplete: async (event) => {
         tierEvents.push(event.tierIndex);
       },
     };
-    const profile: CompiledAgentProfile = {
-      kind: 'compiled-agent-profile',
-      id: 'parent-profile',
-      title: 'Parent Profile',
-      serviceKind: 'system-analysis',
-      lifecycle: 'active',
-      basePreset: 'chat',
-      actionSpace: { mode: 'listed', toolIds: [] },
-      additionalTools: [],
-      params: {},
-      runtimeOverrides: {},
-      concurrency: {
-        mode: 'tiered',
-        concurrency: 1,
-        partitioner: 'generateSessionDimensions',
-        merge: 'generateSessionResults',
-        childProfile: 'child-profile',
-      },
-    };
+    const profile = coordinationProfile();
 
     await expect(
       coordinator.run(input, profile, async (child) => childResult(child))
@@ -401,25 +500,7 @@ describe('coordination public contracts', () => {
         shouldAbort = true;
       },
     };
-    const profile: CompiledAgentProfile = {
-      kind: 'compiled-agent-profile',
-      id: 'parent-profile',
-      title: 'Parent Profile',
-      serviceKind: 'system-analysis',
-      lifecycle: 'active',
-      basePreset: 'chat',
-      actionSpace: { mode: 'listed', toolIds: [] },
-      additionalTools: [],
-      params: {},
-      runtimeOverrides: {},
-      concurrency: {
-        mode: 'tiered',
-        concurrency: 1,
-        partitioner: 'generateSessionDimensions',
-        merge: 'generateSessionResults',
-        childProfile: 'child-profile',
-      },
-    };
+    const profile = coordinationProfile();
 
     await expect(
       coordinator.run(input, profile, async (child) => childResult(child))

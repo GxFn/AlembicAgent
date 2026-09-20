@@ -35,6 +35,7 @@ import {
   resolveAuthoringProfile,
   validateAgainst,
 } from '@alembic/core/knowledge';
+import { resolveProjectPath } from '#shared/projectPath.js';
 
 /**
  * in-process fs 来源接地端口。逐字节复刻 host 侧 §C.11 resolver 的归一化、越界判定与文案，
@@ -66,7 +67,7 @@ export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
       };
     }
 
-    const absolutePath = path.resolve(projectRoot, sourcePath);
+    let absolutePath = path.resolve(projectRoot, sourcePath);
     if (!isInsideRoot(projectRoot, absolutePath)) {
       return {
         violation: {
@@ -90,6 +91,21 @@ export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
           title,
           message: 'Source ref file does not exist.',
           nextAction: 'Check the repo-relative path and cite an existing source file.',
+        },
+      };
+    }
+    try {
+      absolutePath = resolveProjectPath(projectRoot, sourcePath).absolute;
+    } catch {
+      return {
+        violation: {
+          code: 'SOURCE_REF_INVALID',
+          itemIndex,
+          sourceRef,
+          title,
+          path: sourcePath,
+          message: 'Source ref resolves outside the project source root.',
+          nextAction: 'Use a source path under the current project root.',
         },
       };
     }

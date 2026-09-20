@@ -223,7 +223,7 @@ export class AiProvider {
     this.apiKey = config.apiKey || '';
     this.baseUrl = config.baseUrl || '';
     this.timeout = config.timeout || 300_000; // 5min
-    this.maxRetries = config.maxRetries || 3;
+    this.maxRetries = config.maxRetries ?? 3;
     this.name = 'abstract';
 
     // The live circuit breaker now lives in the gateway's ReliabilityController;
@@ -428,6 +428,10 @@ export class AiProvider {
     // 动态 import 打破 AiProvider ↔ LLMGateway/transport 的模块循环依赖（顶层仅保留 type import）。
     // 首次 chat 时所有模块已加载完毕，动态加载不会触发初始化死锁。
     const { LLMGateway } = await import('./gateway/LLMGateway.js');
+    // 首次并发请求可能一起等待动态加载；恢复后再次检查，确保所有请求共享同一个闸门。
+    if (this.#gateway) {
+      return this.#gateway;
+    }
     // this.name 即 ProviderId（openai/claude/deepseek/google/ollama）。
     const providers = {
       [this.name]: {

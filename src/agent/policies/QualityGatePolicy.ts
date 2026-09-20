@@ -1,3 +1,4 @@
+import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import { Policy, type PolicyResult } from './Policy.js';
 
 export interface QualityGatePolicyOptions {
@@ -38,11 +39,7 @@ export class QualityGatePolicy extends Policy {
     }
 
     if (result.reply) {
-      const hasSubmitCalls = (result.toolCalls || []).some((tc: unknown) => {
-        const obj = tc as Record<string, unknown>;
-        const name = (obj.tool || obj.name) as string;
-        return name === 'knowledge';
-      });
+      const hasSubmitCalls = (result.toolCalls || []).some(isPersistedSubmission);
       if (!hasSubmitCalls) {
         const fileRefCount = (result.reply.match(/[\w/-]+\.\w{1,6}/g) || []).length;
         if (fileRefCount < this.#minFileRefs) {

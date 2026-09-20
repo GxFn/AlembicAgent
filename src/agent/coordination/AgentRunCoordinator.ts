@@ -89,22 +89,23 @@ async function runChildren(
     );
     return childRuns.map((childRun) => childRun.result);
   }
-  const results: AgentRunResult[] = [];
+  const results = new Map<AgentRunInput, AgentRunResult>();
   const tiers = groupByTier(childInputs);
   for (let tierIndex = 0; tierIndex < tiers.length; tierIndex++) {
     if (await shouldAbort(parentInput)) {
-      const abortedRuns = await abortChildInputs(
-        tiers.slice(tierIndex).flat(),
-        parentInput,
-        profile
-      );
-      results.push(...abortedRuns.map((childRun) => childRun.result));
+      const abortedInputs = tiers.slice(tierIndex).flat();
+      const abortedRuns = await abortChildInputs(abortedInputs, parentInput, profile);
+      abortedRuns.forEach((childRun, index) => {
+        results.set(abortedInputs[index], childRun.result);
+      });
       break;
     }
     const tier = tiers[tierIndex];
     const tierRuns = await Promise.all(tier.map((child) => limit(() => runOneChild(child))));
     const tierResults = tierRuns.map((childRun) => childRun.result);
-    results.push(...tierResults);
+    tierResults.forEach((result, index) => {
+      results.set(tier[index], result);
+    });
     await parentInput.context.coordination?.onTierComplete?.({
       tierIndex,
       childInputs: tierRuns.map((childRun) => childRun.childInput),
@@ -112,7 +113,14 @@ async function runChildren(
       profile,
     });
   }
-  return results;
+  // 分层改变执行顺序，但 merger 的下标契约始终对应原始输入，不能把另一个模块的结果错配。
+  return childInputs.map((input) => {
+    const result = results.get(input);
+    if (!result) {
+      throw new Error('Coordinated child result is missing');
+    }
+    return result;
+  });
 }
 
 async function runChildWithHooks(
@@ -288,8 +296,10 @@ function resolveDimensionId(input: AgentRunInput) {
 }
 
 function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile): AgentRunResult {
-  const hasError = results.some((result) => result.status === 'error');
-  const hasAborted = results.some((result) => result.status === 'aborted');
+  const status =
+    (['error', 'aborted', 'timeout', 'blocked'] as const).find((candidate) =>
+      results.some((result) => result.status === candidate)
+    ) ?? 'success';
   return {
     runId: `${profile.id}:parent`,
     profileId: profile.id,
@@ -297,7 +307,7 @@ function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile):
       .map((result) => result.reply)
       .filter(Boolean)
       .join('\n\n'),
-    status: hasError ? 'error' : hasAborted ? 'aborted' : 'success',
+    status,
     phases: { childResults: results },
     toolCalls: results.flatMap((result) => result.toolCalls),
     usage: {

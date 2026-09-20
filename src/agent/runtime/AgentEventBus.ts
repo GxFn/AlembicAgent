@@ -122,9 +122,11 @@ export class AgentEventBus extends EventEmitter {
     // 检查是否有 pending reply
     if (opts.correlationId && this.#pendingReplies.has(opts.correlationId)) {
       const pending = this.#pendingReplies.get(opts.correlationId);
-      clearTimeout(pending.timer);
-      this.#pendingReplies.delete(opts.correlationId);
-      pending.resolve(event);
+      if (type !== pending.requestType) {
+        clearTimeout(pending.timer);
+        this.#pendingReplies.delete(opts.correlationId);
+        pending.resolve(event);
+      }
     }
   }
 
@@ -173,7 +175,7 @@ export class AgentEventBus extends EventEmitter {
       reject(new Error(`AgentEventBus request timeout: ${requestType} (${timeout}ms)`));
     }, timeout);
 
-    this.#pendingReplies.set(correlationId, { resolve, reject, timer });
+    this.#pendingReplies.set(correlationId, { resolve, reject, timer, requestType });
 
     this.publish(requestType, payload, {
       source: opts.source,

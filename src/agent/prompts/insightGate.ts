@@ -56,9 +56,9 @@ export function buildRetryPrompt(reason: string) {
     'Analysis lacks structure':
       '请将分析组织成结构化的段落，使用编号列表或标题来区分不同的发现。每个发现应包含具体的文件路径和代码位置。',
     [REQUIRED_MEMORY_FINDING_SUGGESTION]:
-      '上一轮没有形成可验收的结构化证据记录。不要直接写总结；先用 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) 定位相关实现，再用 code({ action: "read" }) 验证至少 3 个文件；每确认一个核心发现就调用 note_finding({ finding, evidence, importance })，evidence 必须包含完整相对路径和行号，最后再输出报告。',
+      '上一轮没有形成可验收的结构化证据记录。不要直接写总结；先用 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) 定位相关实现，再用 code({ action: "read" }) 验证至少 3 个文件；每确认一个核心发现就调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 必须引用已采集证据的 E-id；文件路径与行号由台账展开，最后再输出报告。',
     [INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION]:
-      '结构化发现数量不足。先检查已有证据是否覆盖至少 3 个真实文件；如证据不足，继续用 code({ action: "read" }) 验证关键实现；随后调用 note_finding({ finding, evidence, importance }) 补齐到至少 3 个核心发现，每个 evidence 必须包含完整相对路径和行号，然后再输出最终报告。',
+      '结构化发现数量不足。先检查已有证据是否覆盖至少 3 个真实文件；如证据不足，继续用 code({ action: "read" }) 验证关键实现；随后调用 note_finding({ finding, evidenceRefs, importance }) 补齐到至少 3 个核心发现，每个 evidenceRefs 必须引用已采集证据的 E-id；文件路径与行号由台账展开，然后再输出最终报告。',
   };
 
   return (
@@ -78,18 +78,23 @@ function stringifyRecordRepairEvidenceMap(evidenceMap: unknown) {
   return entries
     .slice(0, 12)
     .map(([filePath, value]) => {
-      const record = value as { summary?: string; codeSnippets?: Array<{ line?: number }> };
+      const record = value as {
+        summary?: string;
+        codeSnippets?: Array<{ startLine?: number; endLine?: number }>;
+      };
       const lines =
         Array.isArray(record?.codeSnippets) && record.codeSnippets.length > 0
           ? record.codeSnippets
               .slice(0, 3)
               .map((snippet) =>
-                typeof snippet.line === 'number' ? `${String(filePath)}:${snippet.line}` : null
+                typeof snippet.startLine === 'number'
+                  ? `${String(filePath)}:${snippet.startLine}-${snippet.endLine ?? snippet.startLine}`
+                  : null
               )
               .filter(Boolean)
               .join(', ')
           : String(filePath);
-      return `- ${lines}${record?.summary ? ` — ${record.summary}` : ''}`;
+      return `- ${lines || String(filePath)}${record?.summary ? ` — ${record.summary}` : ''}`;
     })
     .filter(Boolean)
     .join('\n');
@@ -128,9 +133,9 @@ export function buildRecordRepairPrompt({
 本阶段至少补写: ${missing} 条
 
 硬性规则:
-- 只调用 note_finding({ finding, evidence, importance })
+- 使用 note_finding({ finding, evidenceRefs, importance }) 记录；可用 evidence.search/get 查回已采集证据及其 E-id
 - 每次工具调用只记录一条发现，直到补齐至少 ${minFindings} 条结构化发现
-- evidence 必须来自下面的已验证文件路径或证据摘要，并尽量包含行号
+- evidenceRefs 必须使用工具实际返回的台账 E-id，不得把 file:line 字符串当成引用 id
 - 禁止调用 code、graph、terminal、knowledge 或任何探索/提交工具
 - 不要把 Markdown 正文当作完成结果
 - 如果无法调用 note_finding，本阶段必须失败并回到调用链修复；不要输出 JSON、Markdown 或其它替代格式

@@ -47,8 +47,12 @@ function firstFiniteInt(...candidates: unknown[]): number | null {
 
 /** read 调用的请求区间（startLine/endLine 或 start/end）；无合法区间返回 undefined */
 function extractRequestedRange(args: Record<string, unknown>): EvidenceRange | undefined {
-  const start = firstFiniteInt(args.startLine, args.start);
-  const end = firstFiniteInt(args.endLine, args.end);
+  const params =
+    args.params && typeof args.params === 'object'
+      ? (args.params as Record<string, unknown>)
+      : args;
+  const start = firstFiniteInt(params.startLine, params.start);
+  const end = firstFiniteInt(params.endLine, params.end);
   if (start !== null && end !== null && start >= 1 && end >= start) {
     return { start, end };
   }
@@ -87,7 +91,9 @@ function asFileList(value: unknown): FileItem[] {
  * 台账存 verbatim 原文——freshness 重切用原文切片比哈希，存显示形态会天生 stale
  * （run-13 EVIDENCE_STALE ×11 事故根因）。仅当每个非空行都带前缀才剥（防误伤原文里的竖线）。
  */
-function stripReadDisplayDecorations(content: string): string | null {
+function stripReadDisplayDecorations(
+  content: string
+): { content: string; range: EvidenceRange } | null {
   const lines = content.split('\n');
   const body =
     lines.length > 0 && /^\.\.\. \[\d+ lines omitted/.test(lines[lines.length - 1] ?? '')
@@ -97,14 +103,21 @@ function stripReadDisplayDecorations(content: string): string | null {
     return null;
   }
   const stripped: string[] = [];
+  let start = 0;
   for (const line of body) {
     const m = /^(\d+)\|(.*)$/.exec(line);
-    if (!m) {
+    const lineNumber = m ? Number(m[1]) : 0;
+    if (!m || !Number.isSafeInteger(lineNumber) || lineNumber < 1) {
+      return null;
+    }
+    if (stripped.length === 0) {
+      start = lineNumber;
+    } else if (lineNumber !== start + stripped.length) {
       return null;
     }
     stripped.push(m[2]);
   }
-  return stripped.join('\n');
+  return { content: stripped.join('\n'), range: { start, end: start + stripped.length - 1 } };
 }
 
 interface MatchItem {
@@ -162,19 +175,23 @@ function normalizeDrafts(
         const raw = stripReadDisplayDecorations(file.content);
         const mode = file.mode ?? '';
         if (raw !== null && (mode === 'range' || mode === 'full' || mode === '')) {
-          const range =
-            mode === 'range' && file.startLine && file.endLine
-              ? { start: file.startLine, end: file.endLine }
-              : mode === 'full' && file.lineCount
-                ? { start: 1, end: file.lineCount }
-                : (requestedRange ?? { start: 1, end: raw.split('\n').length });
-          return { tool, callId: call.id, file: file.path, range, content: raw };
+          return { tool, callId: call.id, file: file.path, range: raw.range, content: raw.content };
         }
         return {
           tool,
           callId: call.id,
           file: file.path,
-          ...(requestedRange ? { range: requestedRange } : {}),
+          ...(!mode && requestedRange
+            ? {
+                range: {
+                  start: requestedRange.start,
+                  end: Math.min(
+                    requestedRange.end,
+                    requestedRange.start + file.content.split('\n').length - 1
+                  ),
+                },
+              }
+            : {}),
           content: file.content,
         };
       });
@@ -186,13 +203,13 @@ function normalizeDrafts(
     const singleParams = (call.args?.params ?? call.args) as Record<string, unknown> | undefined;
     const singlePath = typeof singleParams?.path === 'string' ? singleParams.path : undefined;
     if (singlePath) {
-      const requestedRange = extractRequestedRange(call.args);
       const textContent = typeof envelope.text === 'string' ? envelope.text : '';
       // 尾随换行会产生空末行、让全行 N| 校验失败——剥掉再判(不影响 verbatim 语义)。
       const raw = textContent ? stripReadDisplayDecorations(textContent.replace(/\n+$/, '')) : null;
-      if (raw !== null && raw.length > 0) {
-        const range = requestedRange ?? { start: 1, end: raw.split('\n').length };
-        return [{ tool, callId: call.id, file: singlePath, range, content: raw }];
+      if (raw !== null && raw.content.length > 0) {
+        return [
+          { tool, callId: call.id, file: singlePath, range: raw.range, content: raw.content },
+        ];
       }
       if (textContent) {
         // outline/delta 等派生视图：诚实降级 file-only(不参与 freshness，verified 按 file 在场放行)。
@@ -201,7 +218,6 @@ function normalizeDrafts(
             tool,
             callId: call.id,
             file: singlePath,
-            ...(requestedRange ? { range: requestedRange } : {}),
             content: textContent,
           },
         ];

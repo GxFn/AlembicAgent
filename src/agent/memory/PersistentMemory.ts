@@ -29,6 +29,7 @@ import type {
 } from './MemoryConsolidator.js';
 import { MemoryConsolidator } from './MemoryConsolidator.js';
 import type { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
+import type { MemoryReadOptions } from './MemoryReadPolicy.js';
 import type {
   AppendEntry,
   EmbeddingFn,
@@ -214,8 +215,8 @@ export class PersistentMemory {
    * @param batchSize 每批数量
    * @returns 成功嵌入的记忆数
    */
-  async embedAllMemories(batchSize = 20): Promise<number> {
-    const count = await this.#retriever.embedAllMemories(batchSize);
+  async embedAllMemories(batchSize = 20, options?: MemoryReadOptions): Promise<number> {
+    const count = await this.#retriever.embedAllMemories(batchSize, options);
     if (count > 0) {
       this.#log(`Embedded ${count} memories`);
     }
@@ -228,8 +229,12 @@ export class PersistentMemory {
    * @param content 记忆内容
    * @returns 相似度分数 或 null
    */
-  async computeEmbeddingRelevance(query: string, content: string): Promise<number | null> {
-    return this.#retriever.computeEmbeddingRelevance(query, content);
+  async computeEmbeddingRelevance(
+    query: string,
+    content: string,
+    options?: MemoryReadOptions
+  ): Promise<number | null> {
+    return this.#retriever.computeEmbeddingRelevance(query, content, options);
   }
 
   // ═══════════════════════════════════════════════════════════

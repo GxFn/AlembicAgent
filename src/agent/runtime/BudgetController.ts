@@ -117,7 +117,6 @@ export class BudgetController {
   readonly #maxSessionInputTokens: number;
   readonly #cumulativeUsage: TokenUsageAccumulator;
   readonly #contextWindow: ContextWindow | null;
-  readonly #tracker: ExplorationTracker | null;
   readonly #baseSystemPromptLength: number;
   readonly #toolSchemaCount: number;
   readonly #logger: BudgetLogger;
@@ -150,7 +149,6 @@ export class BudgetController {
     this.#maxSessionInputTokens = config.maxSessionInputTokens;
     this.#cumulativeUsage = config.cumulativeUsage;
     this.#contextWindow = config.contextWindow;
-    this.#tracker = config.tracker;
     this.#baseSystemPromptLength = config.baseSystemPromptLength;
     this.#toolSchemaCount = config.toolSchemaCount;
     this.#logger = config.logger;
@@ -414,6 +412,9 @@ export class BudgetController {
    */
   getToolBudget(parallelCount: number): ToolBudget {
     if (!this.#contextWindow) {
+      this.#roundMaxChars = 6000;
+      this.#roundCharsUsed = 0;
+      this.#roundPerToolMaxMatches = 15;
       return {
         roundMaxChars: 6000,
         perToolMaxChars: 6000,

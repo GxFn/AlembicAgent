@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ClaudeProvider,
   createProvider,
+  GoogleGeminiProvider,
   getAvailableFallbacks,
+  getProviderWithFallback,
   isGeoOrProviderError,
 } from '../src/ai/AiFactory.js';
 
@@ -30,6 +32,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const k of KEY_ENVS) {
     const v = saved.get(k);
     if (v === undefined) {
@@ -41,6 +44,15 @@ afterEach(() => {
 });
 
 describe('AiFactory fallback selection', () => {
+  it('excludes the actual auto-detected provider after a failed probe', async () => {
+    process.env.ALEMBIC_AI_PROVIDER = 'auto';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'synthetic-google';
+    process.env.ALEMBIC_OPENAI_API_KEY = 'synthetic-openai';
+    vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockRejectedValue(
+      new Error('unsupported region')
+    );
+    expect((await getProviderWithFallback())?.name).toBe('openai');
+  });
   describe('isGeoOrProviderError', () => {
     it('flags geo-restriction and failed_precondition errors', () => {
       expect(

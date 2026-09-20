@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { collectSourceFileReceipts } from './lib/mining-eval-runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const args = parseArgs(process.argv.slice(2));
@@ -227,34 +228,6 @@ function parseArgs(argv) {
 
 function fmt(value) {
   return value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`;
-}
-
-function collectSourceFileReceipts(samples, sourceInputPath) {
-  const rows = new Map();
-  for (const sample of samples) {
-    const projectRoot = path.resolve(path.dirname(sourceInputPath), sample.projectRoot || '.');
-    const sources = Array.isArray(sample.candidate?.reasoning?.sources)
-      ? sample.candidate.reasoning.sources
-      : [];
-    for (const source of sources) {
-      const match = /^(.+?):\d+-\d+$/u.exec(String(source));
-      if (!match) {
-        continue;
-      }
-      const relativePath = match[1];
-      const absolutePath = path.resolve(projectRoot, relativePath);
-      rows.set(`${sample.projectRoot || '.'}/${relativePath}`, {
-        projectRoot: sample.projectRoot || '.',
-        relativePath,
-        sha256: sha256(readFileSync(absolutePath)),
-      });
-    }
-  }
-  return [...rows.values()].sort((left, right) =>
-    `${left.projectRoot}/${left.relativePath}`.localeCompare(
-      `${right.projectRoot}/${right.relativePath}`
-    )
-  );
 }
 
 function sha256(value) {

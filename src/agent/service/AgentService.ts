@@ -95,7 +95,7 @@ export class AgentService {
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
-      const status = inferRunStatus(result.reply || '');
+      const status = inferRunStatus(result);
       this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
@@ -192,6 +192,7 @@ function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
       ? input.context.sharedState._dimensionScopeId
       : undefined);
   return {
+    timeoutMs: input.execution?.timeoutMs,
     abortSignal: input.execution?.abortSignal,
     diagnostics: input.execution?.diagnostics,
     strategyContext: input.context.strategyContext,
@@ -236,8 +237,46 @@ function toChannel(source: AgentRunInput['context']['source']) {
   return Channel.HTTP;
 }
 
-function inferRunStatus(reply: string): AgentRunStatus {
-  return reply ? 'success' : 'error';
+function inferRunStatus(result: Awaited<ReturnType<AgentRuntimeLike['execute']>>): AgentRunStatus {
+  const cancellation = getDiagnosticsCancelReason(result.diagnostics);
+  const outcome = getRecord(result.phases?._pipelineOutcome).outcome;
+  if (outcome === 'aborted') {
+    return 'aborted';
+  }
+  const timedOutStages = result.diagnostics?.timedOutStages || [];
+  // timedOutStages 是历史尝试记录。只有每个超时阶段都有明确的最终成功输出，
+  // 且管线正常完成，才把旧超时及其派生 abort 当成已恢复；审计历史继续保留。
+  const recoveredTimeouts =
+    outcome === 'completed' &&
+    timedOutStages.length > 0 &&
+    timedOutStages.every((stage) => {
+      const finalStage = getRecord(result.phases?.[stage]);
+      return finalStage.timedOut !== true && Boolean(stringValue(finalStage.reply)?.trim());
+    });
+  const terminalCancellation =
+    recoveredTimeouts && ['stage_timeout', 'abort_signal'].includes(cancellation || '')
+      ? null
+      : cancellation;
+  if (
+    terminalCancellation === 'stage_timeout' ||
+    (timedOutStages.length > 0 && !recoveredTimeouts)
+  ) {
+    return 'timeout';
+  }
+  if (terminalCancellation === 'abort_signal') {
+    return 'aborted';
+  }
+  if (result.diagnostics?.warnings?.some((warning) => warning.code === 'policy_rejected')) {
+    return 'blocked';
+  }
+  if (
+    outcome === 'failed' ||
+    terminalCancellation ||
+    result.diagnostics?.warnings?.some((warning) => warning.code === 'fallback_reply')
+  ) {
+    return 'error';
+  }
+  return result.reply?.trim() ? 'success' : 'error';
 }
 
 function inferErrorStatus(err: unknown): AgentRunStatus {

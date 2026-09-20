@@ -15,6 +15,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Logger from '@alembic/core/logging';
+import { resolveProjectPath } from '#shared/projectPath.js';
+import { extractJSON } from '#shared/structuredOutput.js';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
 
 export type SubmitExpansionResult =
@@ -84,14 +86,12 @@ export function expandEvidenceRefsForSubmit(
     resolvedRefs += 1;
     if (entry.file && entry.range) {
       // 新鲜度终检：文件缺失/不可读与哈希不一致同判 stale——引用的采集内容已不再代表当前源码
-      const absolute = join(options.projectRoot, entry.file);
       let current: string | null = null;
-      if (existsSync(absolute)) {
-        try {
-          current = readFileSync(absolute, 'utf8');
-        } catch {
-          current = null;
-        }
+      try {
+        const absolute = resolveProjectPath(options.projectRoot, entry.file).absolute;
+        current = readFileSync(absolute, 'utf8');
+      } catch {
+        current = null;
       }
       const freshness = current === null ? 'stale' : ledger.checkFreshness(ref, current);
       if (freshness === 'stale') {
@@ -331,29 +331,14 @@ export function isStyleRepairable(violations: Array<{ code: string }>): boolean 
 }
 
 function extractFirstJsonObject(text: string): Record<string, unknown> | null {
-  const start = text.indexOf('{');
-  if (start < 0) {
-    return null;
-  }
-  let depth = 0;
-  for (let i = start; i < text.length; i++) {
-    if (text[i] === '{') {
-      depth++;
-    } else if (text[i] === '}') {
-      depth--;
-      if (depth === 0) {
-        try {
-          const parsed = JSON.parse(text.slice(start, i + 1)) as unknown;
-          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-            ? (parsed as Record<string, unknown>)
-            : null;
-        } catch {
-          return null;
-        }
-      }
+  const parsed = extractJSON(text, '{', '}', (level, message) => {
+    if (level === 'warn') {
+      Logger.getInstance().warn(message);
     }
-  }
-  return null;
+  });
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null;
 }
 
 /**

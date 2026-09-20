@@ -9,6 +9,17 @@ describe('shared/structuredOutput extractJSON', () => {
     expect(extractJSON('{"a":1}')).toEqual({ a: 1 });
   });
 
+  it.each([
+    'literal,}',
+    'literal, ]',
+    '```ts\ncode\n```',
+    'escaped "quote",}',
+  ])('preserves JSON string content: %s', (value) => {
+    const item = { value };
+    expect(extractJSON(JSON.stringify(item))).toEqual(item);
+    expect(extractJSON(`[${JSON.stringify(item)},{"unfinished":`, '[', ']')).toEqual([item]);
+  });
+
   it('strips markdown code fences before parsing', () => {
     expect(extractJSON('```json\n{"a":1}\n```')).toEqual({ a: 1 });
   });

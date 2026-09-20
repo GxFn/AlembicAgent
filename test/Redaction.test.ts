@@ -6,6 +6,26 @@ import { describe, expect, test } from 'vitest';
 import { redactDeveloperText } from '../src/agent/utils/Redaction.js';
 
 describe('redactDeveloperText（E1 迁出行为钉）', () => {
+  test.each([
+    'api_key',
+    'token',
+    'secret',
+    'password',
+    'authorization',
+  ])('redacts JSON-encoded %s values', (key) => {
+    const input = JSON.stringify({ [key]: 'synthetic-sensitive-value', normal: 'kept' });
+    expect(JSON.parse(redactDeveloperText(input))).toEqual({ [key]: '[redacted]', normal: 'kept' });
+  });
+  test.each([
+    'with space',
+    'synthetic sensitive value',
+    'synthetic"secret-tail',
+    'synthetic\\secret-tail',
+  ])('preserves valid JSON while redacting %s', (password) => {
+    expect(JSON.parse(redactDeveloperText(JSON.stringify({ password })))).toEqual({
+      password: '[redacted]',
+    });
+  });
   test('OpenAI 形态 key 打码', () => {
     // sk- 规则先于键值对规则执行；'key' 不含 api 前缀故不触发第四条规则
     expect(redactDeveloperText('key=sk-xxxxxxxxxxxxxxxx end')).toBe('key=[redacted-api-key] end');

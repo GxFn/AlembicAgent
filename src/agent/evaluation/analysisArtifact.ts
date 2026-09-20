@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
+import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   EvidenceCollector,
   type SnippetRangeReader,
@@ -326,7 +327,7 @@ function createFsSnippetRangeReader(projectRoot: string): SnippetRangeReader {
       if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
         return null;
       }
-      const absPath = path.join(projectRoot, normalized);
+      const absPath = resolveProjectPath(projectRoot, normalized).absolute;
       if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
         return null;
       }

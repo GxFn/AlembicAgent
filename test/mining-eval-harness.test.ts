@@ -2,7 +2,7 @@
  * P0-2/P0-3(挖掘质量升级)：eval harness 确定性核心 + Judge 机械面的单测。
  * LLM 调用不在此测(judge.chat 注入 fake)；真实 Tier-B 由 `npm run eval:mining` 手动跑。
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -15,6 +15,10 @@ import {
   renderReportMarkdown,
   scoreFixture,
 } from '../scripts/lib/mining-eval-core.mjs';
+import {
+  collectSourceFileReceipts,
+  createEvaluationRecipeGateway,
+} from '../scripts/lib/mining-eval-runtime.mjs';
 import {
   assertFrozenJudgeModelLoadReceiptV1,
   buildJudgePrompt,
@@ -31,6 +35,38 @@ import {
 } from '../src/agent/evaluation/StrictProductionFixtureEvaluation.js';
 
 const tempRoots: string[] = [];
+
+it.each([
+  {},
+  7,
+  'bad',
+  null,
+])('retains calibration reports with malformed sources: %j', (sources) => {
+  expect(
+    collectSourceFileReceipts([{ candidate: { reasoning: { sources } } }], '/unused/input.json')
+  ).toEqual([]);
+});
+
+it('records missing calibration evidence instead of losing the complete report', () => {
+  const root = mkdtempSync(join(tmpdir(), 'eval-missing-source-'));
+  tempRoots.push(root);
+  const rows = collectSourceFileReceipts(
+    [{ candidate: { reasoning: { sources: ['missing.ts:1-2'] } } }],
+    join(root, 'samples.json')
+  );
+  expect(rows).toEqual([
+    { projectRoot: '.', relativePath: 'missing.ts', sha256: null, error: 'ENOENT' },
+  ]);
+});
+
+it('provides the current createOrStage/readiness port for isolated mining evaluation', async () => {
+  const created: Record<string, unknown>[] = [];
+  const gateway = createEvaluationRecipeGateway(created, 'fixture');
+  const result = await gateway.createOrStage({ items: [{ title: 'candidate' }] });
+  expect(created).toEqual([{ title: 'candidate' }]);
+  expect(result.created[0]).toMatchObject({ id: expect.any(String), lifecycle: 'pending' });
+  expect(await gateway.evaluateReadiness(result.created[0].id)).toMatchObject({ ready: false });
+});
 afterAll(() => {
   for (const root of tempRoots) {
     rmSync(root, { force: true, recursive: true });
@@ -176,6 +212,20 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     const prompt = buildJudgePrompt(candidate, slices);
     expect(prompt).toContain('refute');
     expect(prompt).toContain('file.ts:2-4');
+  });
+
+  it.each(['parent', 'absolute', 'symlink'])('rejects %s evidence outside the project', (kind) => {
+    const outer = makeProject();
+    const root = join(outer, 'project');
+    mkdirSync(root);
+    symlinkSync(join(outer, 'file.ts'), join(root, 'linked.ts'));
+    const file =
+      kind === 'parent' ? '../file.ts' : kind === 'absolute' ? join(outer, 'file.ts') : 'linked.ts';
+    expect(sliceEvidenceForJudge({ reasoning: { sources: [`${file}:1-2`] } }, root)).toEqual([]);
+  });
+
+  it.each(['file.ts:0-2', 'file.ts:4-2'])('rejects invalid evidence range %s', (source) => {
+    expect(sliceEvidenceForJudge({ reasoning: { sources: [source] } }, makeProject())).toEqual([]);
   });
 
   it('parseJudgeVerdict：JSON 提取 + 非法 verdict → null(保守)', () => {

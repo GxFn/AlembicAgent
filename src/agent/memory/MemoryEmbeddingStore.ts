@@ -1,70 +1,91 @@
 /**
- * MemoryEmbeddingStore — 向量嵌入的 JSON sidecar 存储
- *
- * 将 Agent Memory 的向量嵌入从 SQLite BLOB 迁移到独立 JSON 文件，
- * 与 Knowledge 侧 HNSW `.asvec` 的设计理念对齐：
- * **结构化数据存 SQLite，向量存独立文件。**
- *
- * 设计:
- *   - 内存 Map<id, number[]> 缓存，启动时一次性加载
- *   - 写入时更新内存 + debounced flush 到 JSON
- *   - 崩溃丢失可通过 embedAllMemories() backfill 恢复
- *
- * 文件位置: .asd/context/memory_embeddings.json
- *
- * @module MemoryEmbeddingStore
+ * Agent 记忆向量 sidecar。SQLite 仍是记忆事实源；此处只保存可重建的向量缓存。
+ * v2 在向量旁记录正文 hash，旧 id→vector JSON 可读，但参与正文召回前须重新生成。
  */
-
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
+import { isMemoryVector, type MemoryReadOptions, reportMemoryRead } from './MemoryReadPolicy.js';
 
-/** debounce flush 延迟 (ms) */
 const FLUSH_DELAY_MS = 2000;
+const SIDECAR_PATH = 'context/memory_embeddings.json';
+interface EmbeddingEntry {
+  vector: number[];
+  contentHash?: string;
+}
+interface EmbeddingInput {
+  id: string;
+  embedding: number[];
+  content?: string;
+}
+interface EmbeddingStoreOptions {
+  filePath?: string;
+  wz?: WriteZone;
+  onDiagnostic?: MemoryReadOptions['onDiagnostic'];
+}
+
+function contentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
 
 export class MemoryEmbeddingStore {
-  /** 内存缓存: id → embedding vector */
-  #cache = new Map<string, number[]>();
-
-  /** JSON 文件路径 */
+  #cache = new Map<string, EmbeddingEntry>();
   #filePath: string;
-
-  /** debounce timer */
   #flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** dirty flag */
   #dirty = false;
-
+  #disposed = false;
   readonly #wz: WriteZone | null;
+  readonly #diagnostics: MemoryReadOptions;
 
-  /**
-   * @param projectRoot 项目根目录
-   * @param opts.filePath 覆盖默认文件路径 (测试用)
-   * @param opts.wz WriteZone 实例 (DI 注入)
-   */
-  constructor(projectRoot: string, opts?: { filePath?: string; wz?: WriteZone }) {
+  constructor(projectRoot: string, opts: EmbeddingStoreOptions = {}) {
+    this.#wz = opts.wz ?? null;
+    // 注入 WriteZone 时读写使用同一目标；filePath 仅覆盖直接文件系统模式。
     this.#filePath =
-      opts?.filePath ?? join(projectRoot, '.asd', 'context', 'memory_embeddings.json');
-    this.#wz = opts?.wz ?? null;
+      this.#wz?.runtime(SIDECAR_PATH).absolute ??
+      opts.filePath ??
+      join(projectRoot, '.asd', SIDECAR_PATH);
+    this.#diagnostics = { onDiagnostic: opts.onDiagnostic };
     this.#load();
   }
 
-  /** 获取单条 embedding */
-  get(id: string): number[] | null {
-    return this.#cache.get(id) ?? null;
+  /** 不传 content 保留旧读取接口；实际召回必须绑定当前正文。返回副本避免绕过 dirty 状态。 */
+  get(id: string, content?: string): number[] | null {
+    const entry = this.#cache.get(id);
+    if (!entry) {
+      return null;
+    }
+    if (content !== undefined && entry.contentHash !== contentHash(content)) {
+      reportMemoryRead(this.#diagnostics, {
+        phase: 'embedding',
+        status: 'stale',
+        reason: 'content-version-mismatch',
+      });
+      return null;
+    }
+    return [...entry.vector];
   }
 
-  /** 设置单条 embedding */
-  set(id: string, embedding: number[]): void {
-    this.#cache.set(id, embedding);
-    this.#scheduleDirtyFlush();
+  set(id: string, embedding: number[], content?: string): void {
+    this.batchSet([{ id, embedding, content }]);
   }
 
-  /** 批量设置 embeddings */
-  batchSet(entries: Array<{ id: string; embedding: number[] }>): number {
+  batchSet(entries: EmbeddingInput[]): number {
+    this.#assertOpen();
     let count = 0;
-    for (const { id, embedding } of entries) {
-      this.#cache.set(id, embedding);
+    for (const { id, embedding, content } of entries) {
+      if (!id || !isMemoryVector(embedding)) {
+        reportMemoryRead(this.#diagnostics, {
+          phase: 'backfill',
+          status: 'invalid',
+          reason: 'invalid-vector',
+        });
+        continue;
+      }
+      this.#cache.set(id, {
+        vector: [...embedding],
+        ...(content !== undefined ? { contentHash: contentHash(content) } : {}),
+      });
       count++;
     }
     if (count > 0) {
@@ -73,8 +94,8 @@ export class MemoryEmbeddingStore {
     return count;
   }
 
-  /** 删除单条 embedding */
   delete(id: string): boolean {
+    this.#assertOpen();
     const existed = this.#cache.delete(id);
     if (existed) {
       this.#scheduleDirtyFlush();
@@ -82,42 +103,41 @@ export class MemoryEmbeddingStore {
     return existed;
   }
 
-  /** 检查是否有 embedding */
   has(id: string): boolean {
     return this.#cache.has(id);
   }
-
-  /** 返回所有缺少 embedding 的 ID (给定候选 ID 列表) */
   getMissingIds(candidateIds: string[]): string[] {
     return candidateIds.filter((id) => !this.#cache.has(id));
   }
-
-  /** 缓存大小 */
   get size(): number {
     return this.#cache.size;
   }
 
-  /** 清除所有 embeddings (用于重建) */
   clear(): void {
+    this.#assertOpen();
     this.#cache.clear();
     this.#scheduleDirtyFlush();
   }
 
-  /** 立即刷写到磁盘 (shutdown / 测试用) */
+  /** 写成功才清 dirty；失败可再次显式 flush，或由后续写入触发重试。 */
   flushSync(): void {
     if (this.#flushTimer) {
       clearTimeout(this.#flushTimer);
       this.#flushTimer = null;
     }
-    if (!this.#dirty) {
-      return;
+    if (this.#dirty && this.#writeFile()) {
+      this.#dirty = false;
     }
-    this.#writeFile();
-    this.#dirty = false;
   }
 
-  /** GC: 移除不在给定 ID 集合中的 embeddings */
+  /** 释放自己拥有的 timer；失败保留内存中的 dirty 状态，仍允许显式 flush 重试。 */
+  dispose(): void {
+    this.flushSync();
+    this.#disposed = true;
+  }
+
   gc(activeIds: Set<string>): number {
+    this.#assertOpen();
     let removed = 0;
     for (const id of this.#cache.keys()) {
       if (!activeIds.has(id)) {
@@ -131,57 +151,118 @@ export class MemoryEmbeddingStore {
     return removed;
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // Private
-  // ═══════════════════════════════════════════════════════════
-
-  #load(): void {
-    try {
-      if (existsSync(this.#filePath)) {
-        const raw = readFileSync(this.#filePath, 'utf-8');
-        const data = JSON.parse(raw) as Record<string, number[]>;
-        for (const [id, vec] of Object.entries(data)) {
-          if (Array.isArray(vec)) {
-            this.#cache.set(id, vec);
-          }
-        }
-      }
-    } catch {
-      // 文件不存在或解析失败 → 空缓存，后续 backfill 会重建
+  #assertOpen(): void {
+    if (this.#disposed) {
+      throw new Error('MemoryEmbeddingStore is disposed');
     }
   }
 
-  #writeFile(): void {
+  #load(): void {
     try {
-      const obj: Record<string, number[]> = {};
-      for (const [id, vec] of this.#cache) {
-        obj[id] = vec;
+      if (!existsSync(this.#filePath)) {
+        return;
       }
-      if (this.#wz) {
-        this.#wz.writeFile(this.#wz.runtime('context/memory_embeddings.json'), JSON.stringify(obj));
-      } else {
-        const dir = dirname(this.#filePath);
-        if (!existsSync(dir)) {
-          mkdirSync(dir, { recursive: true });
+      const data: unknown = JSON.parse(readFileSync(this.#filePath, 'utf8'));
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('Invalid embedding sidecar');
+      }
+      const object = data as Record<string, unknown>;
+      const versioned = object.schemaVersion !== undefined;
+      if (
+        versioned &&
+        (object.schemaVersion !== 2 ||
+          !object.embeddings ||
+          typeof object.embeddings !== 'object' ||
+          Array.isArray(object.embeddings))
+      ) {
+        throw new Error('Unsupported embedding sidecar');
+      }
+      const entries = versioned ? (object.embeddings as Record<string, unknown>) : object;
+      let rejected = false;
+      for (const [id, raw] of Object.entries(entries)) {
+        const entry =
+          versioned && raw && typeof raw === 'object' && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>)
+            : null;
+        const vector = versioned ? entry?.vector : raw;
+        const hash = entry?.contentHash;
+        if (
+          !isMemoryVector(vector) ||
+          (hash !== undefined && (typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)))
+        ) {
+          rejected = true;
+          continue;
         }
-        writeFileSync(this.#filePath, JSON.stringify(obj), 'utf-8');
+        this.#cache.set(id, {
+          vector: [...vector],
+          ...(typeof hash === 'string' ? { contentHash: hash } : {}),
+        });
       }
-    } catch {
-      // 写入失败不阻塞运行时；下次 flush 或 backfill 会重试
+      if (rejected) {
+        reportMemoryRead(this.#diagnostics, {
+          phase: 'embedding',
+          status: 'invalid',
+          reason: 'invalid-sidecar-entries-skipped',
+        });
+      }
+    } catch (err: unknown) {
+      reportMemoryRead(this.#diagnostics, {
+        phase: 'embedding',
+        status: 'error',
+        reason: err instanceof SyntaxError ? 'sidecar-invalid-json' : 'sidecar-unreadable',
+      });
+    }
+  }
+
+  #writeFile(): boolean {
+    const temporary = `${this.#filePath}.${randomUUID()}.tmp`;
+    const staged = this.#wz?.runtime(`context/.memory_embeddings.${randomUUID()}.tmp`);
+    try {
+      const content = JSON.stringify({
+        schemaVersion: 2,
+        embeddings: Object.fromEntries(this.#cache),
+      });
+      if (this.#wz && staged) {
+        this.#wz.writeFile(staged, content);
+        this.#wz.rename(staged, this.#wz.runtime(SIDECAR_PATH));
+      } else {
+        mkdirSync(dirname(this.#filePath), { recursive: true });
+        writeFileSync(temporary, content, { encoding: 'utf8', flag: 'wx' });
+        renameSync(temporary, this.#filePath);
+      }
+      return true;
+    } catch (err: unknown) {
+      reportMemoryRead(this.#diagnostics, {
+        phase: 'backfill',
+        status: 'error',
+        reason: `sidecar-write-failed:${err instanceof Error ? err.name : 'unknown'}`,
+      });
+      return false;
+    } finally {
+      try {
+        if (this.#wz && staged) {
+          this.#wz.remove(staged);
+        } else {
+          rmSync(temporary, { force: true });
+        }
+      } catch (err: unknown) {
+        reportMemoryRead(this.#diagnostics, {
+          phase: 'backfill',
+          status: 'error',
+          reason: `sidecar-temp-cleanup-failed:${err instanceof Error ? err.name : 'unknown'}`,
+        });
+      }
     }
   }
 
   #scheduleDirtyFlush(): void {
     this.#dirty = true;
-    if (this.#flushTimer) {
-      return; // 已有 pending timer
+    if (!this.#flushTimer) {
+      this.#flushTimer = setTimeout(() => {
+        this.#flushTimer = null;
+        this.flushSync();
+      }, FLUSH_DELAY_MS);
+      this.#flushTimer.unref?.();
     }
-    this.#flushTimer = setTimeout(() => {
-      this.#flushTimer = null;
-      if (this.#dirty) {
-        this.#writeFile();
-        this.#dirty = false;
-      }
-    }, FLUSH_DELAY_MS);
   }
 }

@@ -340,6 +340,10 @@ export class PipelineStrategy extends Strategy {
     }
 
     for (let i = 0; i < this.#stages.length; i++) {
+      if ((ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted) {
+        ctx.diagnostics.recordCancelReason('abort_signal');
+        break;
+      }
       const stage = this.#stages[i];
 
       // ── Quality Gate 阶段 ──
@@ -384,7 +388,17 @@ export class PipelineStrategy extends Strategy {
     const recipeReadiness = readRecipeReadinessReports(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
     const abandoned = ctx.degraded || ctx.retryExhausted;
-    const outcome = ctx.strictFailed ? 'failed' : abandoned ? 'abandoned' : 'completed';
+    const aborted = (ctx.strategyContext.abortSignal as AbortSignal | undefined)?.aborted === true;
+    if (aborted) {
+      ctx.diagnostics.recordCancelReason('abort_signal');
+    }
+    const outcome = aborted
+      ? 'aborted'
+      : ctx.strictFailed
+        ? 'failed'
+        : abandoned
+          ? 'abandoned'
+          : 'completed';
     ctx.phaseResults._pipelineOutcome = {
       outcome,
       ...(abandoned && ctx.abandonInfo ? ctx.abandonInfo : {}),
@@ -768,7 +782,7 @@ export class PipelineStrategy extends Strategy {
     const repairStage: PipelineStage = {
       name: `${gateStage.name || 'quality_gate'}_record_repair`,
       capabilities: [],
-      additionalTools: ['memory'],
+      additionalTools: ['memory', 'evidence'],
       budget: {
         maxIterations: gate.recordRepairMaxRounds ?? 3,
         timeoutMs: gate.recordRepairTimeoutMs ?? 90_000,
@@ -782,7 +796,7 @@ export class PipelineStrategy extends Strategy {
       toolChoiceOverride: 'auto',
       recordRepairEvidencePaths: this.#extractRecordRepairEvidencePaths(gateResult.artifact),
       systemPrompt:
-        'You are in a record-only repair stage. Do not explore. Use only note_finding to record already verified findings.',
+        'You are in a record-only repair stage. Do not explore. Retrieve already captured evidence with evidence.get/search, then use note_finding with evidenceRefs to record verified findings.',
       promptBuilder: () =>
         buildRecordRepairPrompt({
           reason: gateResult.reason || '',

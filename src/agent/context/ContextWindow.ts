@@ -13,10 +13,9 @@
  *   3. 每次 AI 调用前自动压缩到 TOKEN_BUDGET 以内
  *   4. 不通过追加 user 消息来控制 AI 行为（由 ExplorationTracker 管理）
  *
- * 三级递进压缩:
- *   L1 (60-80%): 截断旧的 tool results 内容
- *   L2 (80-95%): 摘要历史轮次，保留最后 2 轮完整链
- *   L3 (>95%):  仅保留 prompt + 最后 1 轮 + 已提交列表
+ * 递进压缩（阈值可配置）:
+ *   L1: 缩短旧工具结果；L2: 合并文本并保持工具调用/结果配对
+ *   L3: 裁剪完整历史轮次；L4: 在预算控制器协调下生成结构化记忆摘要
  *
  * @module ContextWindow
  */
@@ -599,8 +598,7 @@ export class ContextWindow {
   }
 
   /**
-   * L2 Merge: 合并连续同角色消息 + 去重 submit 记录
-   * 保留语义完整性，不删除消息，只合并冗余。
+   * L2 Merge: 合并连续同角色文本。工具调用与结果保留完整配对；同标题重试也有独立结果。
    */
   #compactL2Merge() {
     let merged = 0;
@@ -620,29 +618,6 @@ export class ContextWindow {
         prev.content = `${prev.content}\n---\n${curr.content}`;
         this.#messages.splice(i, 1);
         merged++;
-      }
-    }
-
-    // Pass 2: deduplicate submit-related tool calls in older rounds
-    const seen = new Set<string>();
-    const lastRoundStart = this.#findLastToolRoundStart();
-    for (let i = 1; i < lastRoundStart && i < this.#messages.length; i++) {
-      const msg = this.#messages[i];
-      if (msg.role === 'assistant' && msg.toolCalls) {
-        for (const tc of msg.toolCalls) {
-          if (tc.name === 'knowledge') {
-            const key = `${tc.name}:${getKnowledgeToolCallLabel(tc.args)}`;
-            if (seen.has(key)) {
-              const tcIndex = msg.toolCalls.indexOf(tc);
-              if (tcIndex >= 0 && msg.toolCalls.length > 1) {
-                msg.toolCalls.splice(tcIndex, 1);
-                merged++;
-              }
-            } else {
-              seen.add(key);
-            }
-          }
-        }
       }
     }
 
@@ -848,6 +823,7 @@ export class ContextWindow {
    * 用于致命错误后的恢复
    */
   resetToPromptOnly() {
+    this.#collapseThreshold = -1;
     if (this.#messages.length > 1) {
       // 提取所有已提交候选
       this.#extractCompactedSubmits(1);
@@ -870,6 +846,7 @@ export class ContextWindow {
   resetForNewStage() {
     this.#extractCompactedSubmits(0);
     this.#messages = [];
+    this.#collapseThreshold = -1;
     this.#compactionLog.push('RESET_STAGE: cleared all messages for new pipeline stage');
   }
 
@@ -1142,11 +1119,11 @@ function limitToolResultBody(toolName: string, result: unknown, quota: ToolResul
       ((result as SearchResultLike).matches || (result as SearchResultLike).batchResults)
     ) {
       if ((result as SearchResultLike).batchResults) {
-        const limited: SearchResultLike = { ...(result as SearchResultLike) };
+        const source = result as SearchResultLike;
+        const limited: SearchResultLike = { ...source, batchResults: { ...source.batchResults } };
         const batchResults = limited.batchResults ?? {};
-        const perKeyChars = Math.floor(maxChars / Object.keys(batchResults).length);
         for (const [key, sub] of Object.entries(batchResults)) {
-          batchResults[key] = limitSearchResultObj(sub, Math.min(maxMatches, 3), perKeyChars);
+          batchResults[key] = limitSearchResultObj(sub, Math.min(maxMatches, 3));
         }
         const raw = JSON.stringify(limited);
         // A-1b：V1 batch 搜索纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
@@ -1155,12 +1132,7 @@ function limitToolResultBody(toolName: string, result: unknown, quota: ToolResul
       return limitSearchResult(result, maxMatches, maxChars);
     }
 
-    // 文件内容 (read/write/outline/structure)
-    if (typeof result === 'object' && result !== null && (result as FileResultLike).batchResults) {
-      const raw = JSON.stringify(result);
-      // A-1b：文件内容 batch 纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
-      return raw.length > maxChars ? snipHeadTail(raw, maxChars, LIMIT_SNIP_MARKER_TAG) : raw;
-    }
+    // batchResults 已在上面统一处理；这里只剩单个文件内容。
     return limitFileContent(result, maxChars);
   }
 
@@ -1224,16 +1196,9 @@ function limitSearchResult(result: unknown, maxMatches: number, maxChars: number
  * 限制搜索结果（返回对象） — 用于批量模式，避免 JSON.stringify → JSON.parse 往返
  * 当源码含控制字符时，stringify→substring 截断会破坏 JSON 结构导致 parse 失败
  */
-function limitSearchResultObj(
-  result: unknown,
-  maxMatches: number,
-  maxChars: number
-): SearchResultLike {
+function limitSearchResultObj(result: unknown, maxMatches: number): SearchResultLike {
   if (!result || typeof result !== 'object') {
     return (result || {}) as SearchResultLike;
-  }
-  if (typeof result === 'string') {
-    return { _raw: (result as string).substring(0, maxChars) };
   }
 
   const src = result as SearchResultLike;
