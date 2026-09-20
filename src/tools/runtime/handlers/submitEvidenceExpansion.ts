@@ -15,6 +15,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Logger from '@alembic/core/logging';
+import { type OperationOptions, runOperation } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import { extractJSON } from '#shared/structuredOutput.js';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
@@ -351,7 +352,8 @@ export async function repairStyleViolations(
   item: Record<string, unknown>,
   violations: Array<{ code: string; message?: string }>,
   provider: unknown,
-  allowlist: { positive: string[]; negative: string[] }
+  allowlist: { positive: string[]; negative: string[] },
+  options: OperationOptions = {}
 ): Promise<Record<string, unknown> | null> {
   const providerLike = provider as {
     chat?: (prompt: string, context?: Record<string, unknown>) => Promise<string>;
@@ -384,7 +386,18 @@ export async function repairStyleViolations(
     '只返回一个 JSON 对象，仅含需要修改的字段(可选键: title, doClause, dontClause, markdown)，不要任何其它文字。',
   ].join('\n');
   try {
-    const raw = await chat(prompt, { maxTokens: 1600, temperature: 0 });
+    // 修复是可选子调用，期限属于此调用层；取消等待后不再消费不合作 provider 的迟到响应。
+    const outcome = await runOperation(
+      (abortSignal) => chat(prompt, { maxTokens: 1600, temperature: 0, abortSignal }),
+      { abortSignal: options.abortSignal, timeoutMs: options.timeoutMs ?? 30_000 }
+    );
+    if (outcome.status !== 'ok') {
+      const detail =
+        outcome.error instanceof Error ? outcome.error.message : String(outcome.error ?? '');
+      Logger.getInstance().warn(`[style-repair] ${outcome.status}${detail ? `: ${detail}` : ''}`);
+      return null;
+    }
+    const raw = outcome.value;
     const fixed = extractFirstJsonObject(String(raw ?? ''));
     if (!fixed) {
       Logger.getInstance().warn(

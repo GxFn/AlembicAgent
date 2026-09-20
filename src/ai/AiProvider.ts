@@ -63,6 +63,8 @@ export interface ChatContext {
   temperature?: number;
   maxTokens?: number;
   systemPrompt?: string;
+  /** 取消文本子调用；由 gateway 继续传到 provider transport。 */
+  abortSignal?: AbortSignal;
 }
 
 /** 统一消息格式 */
@@ -467,6 +469,7 @@ export class AiProvider {
       temperature: context.temperature ?? 0.7,
       maxTokens: context.maxTokens ?? 4096,
       usageSource: 'chat',
+      abortSignal: context.abortSignal,
     });
     return result.text || '';
   }

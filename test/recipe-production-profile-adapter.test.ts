@@ -197,6 +197,216 @@ const readyReport: RetrievalReadinessReport = {
 };
 
 describe('Agent Recipe production profile adapter', () => {
+  test.each([
+    'submit',
+    'publish',
+  ])('does not start a pre-aborted %s operation', async (operation) => {
+    const controller = new AbortController();
+    controller.abort();
+    const fake = fakePort(readyReport);
+    const evaluateReadiness = vi.fn(async () => readyReport);
+    const result = await handleKnowledge(
+      operation === 'submit' ? 'submit' : 'manage',
+      operation === 'submit' ? submitParams() : { operation, id: 'recipe-existing' },
+      {
+        projectRoot: makeProject(),
+        abortSignal: controller.signal,
+        recipeGateway: { ...fake.port, evaluateReadiness },
+      } as never
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/abort/i);
+    expect(fake.calls).toHaveLength(0);
+    expect(evaluateReadiness).not.toHaveBeenCalled();
+    expect(fake.publishCalls).toBe(0);
+  });
+
+  test('does not persist a late style repair after cancellation', async () => {
+    const controller = new AbortController();
+    const fake = fakePort(readyReport);
+    let finishRepair!: (value: string) => void;
+    let repairStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      repairStarted = resolve;
+    });
+    const chat = vi.fn((_prompt: string, _options: { abortSignal?: AbortSignal }) => {
+      repairStarted();
+      return new Promise<string>((resolve) => {
+        finishRepair = resolve;
+      });
+    });
+    const pending = handleKnowledge(
+      'submit',
+      submitParams({ doClause: 'ImportType is needed for type-only dependencies.' }),
+      {
+        projectRoot: makeProject(),
+        abortSignal: controller.signal,
+        recipeGateway: fake.port,
+        runtime: { sharedState: {}, aiProvider: { chat } },
+      } as never
+    );
+    await started;
+    controller.abort();
+    finishRepair(JSON.stringify({ doClause: 'Use import type for type-only dependencies.' }));
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/abort/i);
+    expect(fake.calls).toHaveLength(0);
+    expect(chat.mock.calls[0][1].abortSignal?.aborted).toBe(true);
+  });
+
+  test.each([
+    'approve',
+    'publish',
+  ])('does not %s after its readiness wait is cancelled', async (operation) => {
+    const controller = new AbortController();
+    let finishReadiness!: (value: RetrievalReadinessReport) => void;
+    let readinessStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      readinessStarted = resolve;
+    });
+    const publish = vi.fn(async () => ({ id: 'recipe-existing', lifecycle: 'active' }));
+    const pending = handleKnowledge('manage', { operation, id: 'recipe-existing' }, {
+      projectRoot: makeProject(),
+      abortSignal: controller.signal,
+      recipeGateway: {
+        evaluateReadiness: () => {
+          readinessStarted();
+          return new Promise<RetrievalReadinessReport>((resolve) => {
+            finishReadiness = resolve;
+          });
+        },
+        publish,
+      },
+    } as never);
+    await started;
+    controller.abort();
+    finishReadiness(readyReport);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/abort/i);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  test('keeps a Core commit confirmed after cancellation and skips new post-commit work', async () => {
+    const controller = new AbortController();
+    const fake = fakePort(readyReport);
+    const evaluateReadiness = vi.fn(async () => readyReport);
+    const save = vi.fn();
+    const result = await handleKnowledge('submit', submitParams(), {
+      projectRoot: makeProject(),
+      abortSignal: controller.signal,
+      recipeGateway: {
+        ...fake.port,
+        createOrStage: async (input: RecipeProductionInput, context: ProducerContext) => {
+          const committed = await fake.port.createOrStage(input, context);
+          controller.abort();
+          return committed;
+        },
+        evaluateReadiness,
+      },
+      sessionStore: { save },
+    } as never);
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      status: 'created',
+      id: 'recipe-1',
+      lifecycle: 'staging',
+      readinessStatus: 'unavailable',
+    });
+    expect(result._meta?.degraded).toBe(true);
+    expect(fake.calls).toHaveLength(1);
+    expect(evaluateReadiness).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    'title',
+    'description',
+    'trigger',
+    'whenClause',
+    'doClause',
+    'content.markdown',
+    'content.rationale',
+  ])('returns validation failure for a non-string direct submit %s', async (field) => {
+    const params = submitParams() as Record<string, unknown>;
+    if (field.startsWith('content.')) {
+      params.content = { ...(params.content as object), [field.slice('content.'.length)]: 42 };
+    } else {
+      params[field] = 42;
+    }
+    const fake = fakePort(readyReport);
+    const result = await handleKnowledge('submit', params, {
+      projectRoot: makeProject(),
+      recipeGateway: fake.port,
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Validation failed:');
+    expect(result.error).toContain(field);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  test.each([
+    'readiness',
+    'session-save',
+    'async-session-save',
+  ])('keeps the persisted receipt when %s post-processing fails', async (failure) => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const error = new Error(`${failure} unavailable`);
+    const rejectedSave = Promise.reject(error);
+    // 旧 handler 不等待 save 时也保持 probe 无 unhandled rejection；断言仍要求等待并诊断。
+    void rejectedSave.catch(() => {});
+    const result = await handleKnowledge('submit', submitParams(), {
+      projectRoot,
+      recipeGateway: {
+        ...fake.port,
+        evaluateReadiness: async () => {
+          if (failure === 'readiness') {
+            throw error;
+          }
+          return readyReport;
+        },
+      },
+      sessionStore: {
+        save: () => {
+          if (failure === 'session-save') {
+            throw error;
+          }
+          if (failure === 'async-session-save') {
+            return rejectedSave;
+          }
+        },
+      },
+    } as never);
+
+    expect(fake.calls).toHaveLength(1);
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      status: 'created',
+      id: 'recipe-1',
+      candidateId: 'recipe-1',
+      lifecycle: 'staging',
+    });
+    expect(result._meta).toMatchObject({
+      degraded: true,
+      diagnosticWarnings: [
+        {
+          code:
+            failure === 'readiness'
+              ? 'KNOWLEDGE_READINESS_UNAVAILABLE'
+              : 'KNOWLEDGE_SESSION_SAVE_FAILED',
+        },
+      ],
+    });
+    if (failure === 'readiness') {
+      expect(result.data).toMatchObject({ readinessStatus: 'unavailable' });
+      expect(result.data).not.toHaveProperty('readiness');
+    } else {
+      expect(result.data).toMatchObject({ readiness: readyReport });
+    }
+  });
+
   test('refreshes retrieval provenance after a style repair changes authored fields', async () => {
     const projectRoot = makeProject();
     let stored: Record<string, unknown> | undefined;
@@ -238,6 +448,150 @@ describe('Agent Recipe production profile adapter', () => {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   });
+  test('shares the per-title style repair budget across runtime projections and phase copies', async () => {
+    const projectRoot = makeProject();
+    const sharedState = { _sessionCounters: {} };
+    const chat = vi.fn(async () => 'not repair JSON');
+    const fake = fakePort(readyReport);
+    for (let index = 0; index < 3; index += 1) {
+      const result = await handleKnowledge(
+        'submit',
+        submitParams({ doClause: 'ImportType is needed for type-only dependencies.' }),
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: {
+            sharedState: index === 2 ? { ...sharedState } : sharedState,
+            aiProvider: { chat },
+          },
+        } as never
+      );
+      expect(result.ok).toBe(true);
+    }
+    expect(chat).toHaveBeenCalledTimes(2);
+
+    await handleKnowledge(
+      'submit',
+      submitParams({
+        title: 'SeparateImportType uses a separate repair budget',
+        doClause: 'ImportType is needed for type-only dependencies.',
+      }),
+      {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState, aiProvider: { chat } },
+      } as never
+    );
+    expect(chat).toHaveBeenCalledTimes(3);
+  });
+
+  test('stops the fourth title attempt when every call receives a fresh shallow projection', async () => {
+    const projectRoot = makeProject();
+    const counters: Record<string, unknown> = {};
+    const base = { _sessionCounters: counters };
+    const chat = vi.fn(async () => 'not repair JSON');
+    const fake = fakePort(readyReport);
+    const projections: Array<Record<string, unknown>> = [];
+    const submit = () => {
+      const sharedState = { ...base };
+      projections.push(sharedState);
+      return handleKnowledge(
+        'submit',
+        submitParams({ doClause: 'ImportType is needed for type-only dependencies.' }),
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState, aiProvider: { chat } },
+        } as never
+      );
+    };
+    for (let index = 0; index < 3; index += 1) {
+      expect((await submit()).ok).toBe(true);
+    }
+    const fourth = await submit();
+    expect(fourth.ok).toBe(false);
+    expect(fourth.error).toContain('已尝试 3 次');
+    expect(fake.calls).toHaveLength(3);
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(base).not.toHaveProperty('_submitTitleAttempts');
+    for (const projection of projections) {
+      expect(projection._sessionCounters).toBe(counters);
+      expect(projection._submitTitleAttempts).toBe(counters._submitTitleAttempts);
+    }
+  });
+
+  test.each([
+    'constructor',
+    '__proto__',
+  ])('counts the prototype-shaped title %s using its own session entries', async (title) => {
+    const projectRoot = makeProject();
+    // 覆盖旧宿主普通字典；不能只让新建的 null-prototype 字典正确。
+    const sharedState = {
+      _submitTitleAttempts: {},
+      _sessionCounters: { _styleRepairAttempts: {} },
+    };
+    const legacyAttempts = sharedState._submitTitleAttempts;
+    const chat = vi.fn(async () => 'not repair JSON');
+    const fake = fakePort(readyReport);
+    const submit = () =>
+      handleKnowledge(
+        'submit',
+        submitParams({ title, doClause: 'ImportType is needed for type-only dependencies.' }),
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState, aiProvider: { chat } },
+        } as never
+      );
+    for (let index = 0; index < 3; index += 1) {
+      expect((await submit()).ok).toBe(true);
+    }
+    const fourth = await submit();
+    expect(fourth.ok).toBe(false);
+    expect(fourth.error).toContain('已尝试 3 次');
+    expect(fake.calls).toHaveLength(3);
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(Object.hasOwn(sharedState._submitTitleAttempts, title)).toBe(true);
+    expect(Object.hasOwn(sharedState._sessionCounters._styleRepairAttempts, title)).toBe(true);
+    expect(sharedState._submitTitleAttempts).toBe(legacyAttempts);
+    expect((sharedState._sessionCounters as Record<string, unknown>)._submitTitleAttempts).toBe(
+      legacyAttempts
+    );
+  });
+
+  test('uses the same prepared gate for explicit and analyst-injected graph refs', async () => {
+    const projectRoot = makeProject();
+    const graphRefs = ['sourceGraph:verified-callers'];
+    const explicit = fakePort(readyReport);
+    const injected = fakePort(readyReport);
+    const params = submitParams({
+      description:
+        'The ImportType caller invokes a module while consuming only its type dependency.',
+      coreCode: 'export const invented = missingSource();',
+      reasoning: { sources: ['src/a.ts:99-100'] },
+    });
+    const first = await handleKnowledge(
+      'submit',
+      { ...params, reasoning: { ...params.reasoning, graphRefs } },
+      { projectRoot, recipeGateway: explicit.port } as never
+    );
+    const second = await handleKnowledge('submit', params, {
+      projectRoot,
+      recipeGateway: injected.port,
+      runtime: { sharedState: { _analystGraphEvidence: graphRefs } },
+    } as never);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(explicit.calls).toHaveLength(1);
+    expect(injected.calls).toHaveLength(1);
+    expect(injected.calls[0].input.items).toEqual(explicit.calls[0].input.items);
+    expect(injected.calls[0].input.items[0].coreCode).toBe('');
+    expect(second.data).toMatchObject({
+      codeEvidence: { accepted: false, reason: 'unbounded-or-unrelated' },
+    });
+  });
+
   test.each([
     'approve',
     'publish',

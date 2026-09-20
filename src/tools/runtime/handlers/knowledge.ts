@@ -19,13 +19,16 @@ import {
   STYLE_WAIVER_SESSION_LIMIT,
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
+import { runOperation } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
   ok,
   type ToolContext,
+  type ToolDiagnosticWarning,
   type ToolResult,
+  type ToolResultMeta,
 } from '#tools/kernel/registry.js';
 import {
   formatRecipeAuthoringViolations,
@@ -167,11 +170,42 @@ function buildSnippetRepairHint(sourceRefs: unknown, projectRoot: string | undef
   return ` 📎 修复提示：引用范围 ${range.refText} 的真实代码如下。仅当它确实是本候选需要表达的 bounded snippet 时，才逐字重提 coreCode；不得把首个来源或整文件当作自动答案。markdown 特写正文与模板代码保持你自己的提炼创作：\n${range.code}`;
 }
 
+/** 只在尚未开始下一项操作时拒绝；已获 Core 写入回执的路径必须保留真实结果。 */
+function abortedKnowledgeResult(ctx: ToolContext, stage: string): ToolResult | null {
+  if (!ctx.abortSignal?.aborted) {
+    return null;
+  }
+  const message = `Knowledge ${stage} aborted before the next operation`;
+  Logger.getInstance().warn(`[knowledge] ${message}`);
+  return fail(message);
+}
+
+function completedMutationMeta(
+  ctx: ToolContext,
+  stage: string
+): Partial<ToolResultMeta> | undefined {
+  if (!ctx.abortSignal?.aborted) {
+    return undefined;
+  }
+  const message = `Knowledge ${stage} completed after cancellation; the confirmed write is retained`;
+  Logger.getInstance().warn(`[knowledge] ${message}`);
+  return {
+    degraded: true,
+    diagnosticWarnings: [
+      { code: 'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT', message, stage, tool: 'knowledge' },
+    ],
+  };
+}
+
 export async function handle(
   action: string,
   params: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
+  const aborted = abortedKnowledgeResult(ctx, action);
+  if (aborted) {
+    return aborted;
+  }
   switch (action) {
     case 'search':
       return handleSearch(params, ctx);
@@ -212,6 +246,10 @@ async function handleSearch(
 
   try {
     const results = await engine.search(query, { limit, kind, category });
+    const aborted = abortedKnowledgeResult(ctx, 'search');
+    if (aborted) {
+      return aborted;
+    }
     const items = results.map((r: SearchResult) => ({
       id: r.id,
       title: r.title,
@@ -260,6 +298,10 @@ async function handlePrime(params: Record<string, unknown>, ctx: ToolContext): P
   try {
     const query = [taskGoal, ...keywords].join(' ');
     const results = await engine.search(query, { limit: limit * 2, kind: 'all' });
+    const aborted = abortedKnowledgeResult(ctx, 'prime');
+    if (aborted) {
+      return aborted;
+    }
     const top = results
       .slice()
       .sort((a: SearchResult, b: SearchResult) => b.score - a.score)
@@ -273,6 +315,10 @@ async function handlePrime(params: Record<string, unknown>, ctx: ToolContext): P
           detail = (await repo.getById(hit.id)) as Record<string, unknown> | null;
         } catch {
           detail = null;
+        }
+        const aborted = abortedKnowledgeResult(ctx, 'prime detail');
+        if (aborted) {
+          return aborted;
         }
       }
       const reasoning =
@@ -464,15 +510,24 @@ async function handleSubmit(
     // 此前没有任何自动化通路（F4b/F4d 都需要可解析行号）。范围来自 evidenceMap 投影
     // （sharedState._analystGroundedRanges），即 Analyst 真实读过/锚点补齐过的行，非任意指派。
     // H1(2026-07-02 数量专项)：同题硬止损——真机同一候选被拒后模型无视 STOP 软指令连提 6 次,
-    // 烧掉 60% 提交名额。同 title 第 3 次尝试起直接 terminal 拒绝(不跑门禁不给修复提示)。
+    // 烧掉 60% 提交名额。同 title 已尝试 3 次后直接 terminal 拒绝(不跑门禁不给修复提示)。
     const sharedStateForSubmit = (ctx.runtime?.sharedState ?? null) as Record<
       string,
       unknown
     > | null;
     const titleKey = String(item.title ?? '').trim();
-    if (sharedStateForSubmit && titleKey) {
-      const attempts = (sharedStateForSubmit._submitTitleAttempts ?? {}) as Record<string, number>;
-      const tried = attempts[titleKey] ?? 0;
+    const submitCounters = sessionCounterBox(ctx.runtime);
+    if (submitCounters && titleKey) {
+      // 从第一轮起都可能拿到 {...base}：字典归属稳定盒，不能在临时顶层懒创建。
+      // 旧宿主的顶层字典按原引用接入一次；顶层继续作为兼容别名，不复制或重置预算。
+      const attempts = (recordValue(submitCounters._submitTitleAttempts) ??
+        recordValue(sharedStateForSubmit?._submitTitleAttempts) ??
+        {}) as Record<string, number>;
+      submitCounters._submitTitleAttempts = attempts;
+      if (sharedStateForSubmit) {
+        sharedStateForSubmit._submitTitleAttempts = attempts;
+      }
+      const tried = readTitleAttempt(attempts, titleKey);
       if (tried >= 3) {
         Logger.getInstance().warn(
           `[knowledge.submit] hard stop-loss: "${titleKey}" already attempted ${tried} times (dim=${String(effectiveDimensionId ?? '')})`
@@ -481,8 +536,7 @@ async function handleSubmit(
           `🛑 候选 "${titleKey}" 已尝试 ${tried} 次未通过——本会话禁止再提交该标题。立即换一个【不同的】发现提交，或输出最终总结并把它列为 blocker。`
         );
       }
-      attempts[titleKey] = tried + 1;
-      sharedStateForSubmit._submitTitleAttempts = attempts;
+      writeTitleAttempt(attempts, titleKey, tried + 1);
     }
 
     // E5（证据保真）：reasoning.evidenceRefs 台账机械展开——sources 由程序从台账
@@ -591,19 +645,19 @@ async function handleSubmit(
         : [];
       if (analystGraphEvidence.length > 0) {
         const reasoning = (effectiveItem.reasoning ?? {}) as Record<string, unknown>;
-        const withGraphRefs = {
+        const withGraphRefs: Record<string, unknown> = {
           ...effectiveItem,
           reasoning: { ...reasoning, graphRefs: analystGraphEvidence },
         };
-        const reVerified = runInProcessRecipeAuthoringGate(withGraphRefs, {
-          projectRoot: ctx.projectRoot,
-          dimensionId: effectiveDimensionId,
-        });
+        // 只补图谱证据，不复活已移除 coreCode；与初次/风格修复共享同一 prepared 裁决。
+        const graphProduction = { ...preparedProduction, item: withGraphRefs };
+        const reVerified = evaluatePreparedItem(graphProduction, ctx, effectiveDimensionId);
         if (!reVerified.some((v) => v.code === 'GRAPH_REF_INVALID')) {
           bumpSubmitRepairStat(ctx.runtime, 'graph_refs_injected');
           Logger.getInstance().info(
             `[knowledge.submit] graph refs injected from analyst evidence (${analystGraphEvidence.length} refs) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), remaining violations=${reVerified.length}`
           );
+          preparedProduction = graphProduction;
           effectiveItem = withGraphRefs;
           gateViolations = reVerified;
         }
@@ -639,12 +693,14 @@ async function handleSubmit(
       }
     }
     // E7-R（接受率 100% 最后一级）：纯风格类拒绝→一次 schema 收窄的修复子调用后重跑门禁
-    // （每 title 限 1 次；任何失败零影响走原拒绝路径）。证据类违规不修——那是事实问题不是写法问题。
+    // （每 title 限 2 次；任何失败零影响走原拒绝路径）。证据类违规不修——那是事实问题不是写法问题。
     if (gateViolations.length > 0 && isStyleRepairable(gateViolations)) {
-      const repairState = ctx.runtime as Record<string, unknown> | undefined;
+      // runtime 是逐调用投影；嵌套会话盒在阶段浅拷贝后仍保留相同预算。
+      const repairState = sessionCounterBox(ctx.runtime);
       const repairAttempts = (repairState?._styleRepairAttempts ?? {}) as Record<string, number>;
-      if ((repairAttempts[titleKey] ?? 0) < 2) {
-        repairAttempts[titleKey] = (repairAttempts[titleKey] ?? 0) + 1;
+      const tried = readTitleAttempt(repairAttempts, titleKey);
+      if (tried < 2) {
+        writeTitleAttempt(repairAttempts, titleKey, tried + 1);
         if (repairState) {
           repairState._styleRepairAttempts = repairAttempts;
         }
@@ -652,8 +708,13 @@ async function handleSubmit(
           effectiveItem,
           gateViolations,
           ctx.runtime?.aiProvider,
-          getImperativeVerbAllowlist()
+          getImperativeVerbAllowlist(),
+          { abortSignal: ctx.abortSignal }
         );
+        const aborted = abortedKnowledgeResult(ctx, 'submit style repair');
+        if (aborted) {
+          return aborted;
+        }
         if (repaired) {
           const refreshed = prepareRecipeProductionItem(repaired, ctx.projectRoot);
           const repairedProduction = {
@@ -679,6 +740,10 @@ async function handleSubmit(
             );
           }
         }
+      } else {
+        Logger.getInstance().info(
+          `[style-repair] skipped: per-title budget exhausted for "${titleKey}"`
+        );
       }
     }
     // 门禁分层（2026-07-04 用户裁定：要证据/价值/深度，不强制格式）：
@@ -774,6 +839,11 @@ async function handleSubmit(
       }
     }
 
+    const aborted = abortedKnowledgeResult(ctx, 'submit');
+    if (aborted) {
+      return aborted;
+    }
+    // Core port 暂无取消参数；一旦调用就等待真实回执，不把中途取消当作写入已回滚。
     const result = await gateway.createOrStage(
       {
         items: [effectiveItem],
@@ -798,50 +868,100 @@ async function handleSubmit(
 
     if (result.created.length > 0) {
       const created = result.created[0];
-      const readiness = await gateway.evaluateReadiness(created.id);
-      const readinessEvidence = {
-        id: created.id,
-        lifecycle: created.lifecycle,
-        ready: readiness.ready,
-        violationCodes: readiness.violations.map((violation) => violation.code),
-      };
-      const readinessBox = sessionCounterBox(ctx.runtime);
-      if (readinessBox) {
-        const reports = Array.isArray(readinessBox.recipeReadinessReports)
-          ? readinessBox.recipeReadinessReports
-          : [];
-        readinessBox.recipeReadinessReports = [...reports, readinessEvidence];
-      }
-      if (!readiness.ready) {
+      // Core 已确认持久化：后续读取/会话记录失败只能降级诊断，不能抹掉身份或诱发再次 create。
+      const diagnosticWarnings: ToolDiagnosticWarning[] = [];
+      const recordPostCommitWarning = (code: string, err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        diagnosticWarnings.push({ code, message, stage: 'knowledge.submit', tool: 'knowledge' });
         Logger.getInstance().warn(
-          `[knowledge.submit] candidate persisted as ${created.lifecycle} with Core readiness violations for "${String(item.title ?? '')}": ${readiness.violations.map((violation) => violation.code).join(', ')}`
+          `[knowledge.submit] persisted ${created.id}; ${code}: ${message}`
         );
+      };
+      let readiness: Awaited<ReturnType<RecipeGatewayLike['evaluateReadiness']>> | undefined;
+      try {
+        const read = await runOperation(() => gateway.evaluateReadiness(created.id), {
+          abortSignal: ctx.abortSignal,
+        });
+        if (read.status === 'ok') {
+          readiness = read.value;
+        } else {
+          recordPostCommitWarning(
+            'KNOWLEDGE_READINESS_UNAVAILABLE',
+            read.error ?? new Error(`Readiness ${read.status} after persistence`)
+          );
+        }
+      } catch (err: unknown) {
+        recordPostCommitWarning('KNOWLEDGE_READINESS_UNAVAILABLE', err);
       }
-      if (ctx.sessionStore) {
-        ctx.sessionStore.save(
-          `submit:${item.title}`,
-          JSON.stringify({
-            title: item.title,
-            kind: item.kind,
+      if (readiness) {
+        try {
+          const readinessEvidence = {
+            id: created.id,
             lifecycle: created.lifecycle,
-            production: result.production,
-            codeEvidence: preparedProduction.codeEvidence,
-            readiness,
-          }),
-          { tags: ['submission'] }
-        );
+            ready: readiness.ready,
+            violationCodes: readiness.violations.map((violation) => violation.code),
+          };
+          const readinessBox = sessionCounterBox(ctx.runtime);
+          if (readinessBox) {
+            const reports = Array.isArray(readinessBox.recipeReadinessReports)
+              ? readinessBox.recipeReadinessReports
+              : [];
+            readinessBox.recipeReadinessReports = [...reports, readinessEvidence];
+          }
+          if (!readiness.ready) {
+            Logger.getInstance().warn(
+              `[knowledge.submit] candidate persisted as ${created.lifecycle} with Core readiness violations for "${String(item.title ?? '')}": ${readiness.violations.map((violation) => violation.code).join(', ')}`
+            );
+          }
+        } catch (err: unknown) {
+          recordPostCommitWarning('KNOWLEDGE_SUBMISSION_RECORD_FAILED', err);
+        }
       }
-      return ok({
-        ...projectPersistedRecipeReview(created.raw),
-        status: 'created',
-        id: created.id,
-        candidateId: created.id,
-        title: created.title,
-        lifecycle: created.lifecycle,
-        production: result.production,
-        codeEvidence: preparedProduction.codeEvidence,
-        readiness,
-      });
+      // 不可用与 Core 明确 ready=false 不同；保留缺席形态，不编造 Core 的判定。
+      const readinessData = readiness ? { readiness } : { readinessStatus: 'unavailable' };
+      if (ctx.sessionStore && ctx.abortSignal?.aborted) {
+        recordPostCommitWarning(
+          'KNOWLEDGE_SESSION_SAVE_SKIPPED',
+          new Error('Session save aborted before starting')
+        );
+      } else if (ctx.sessionStore) {
+        try {
+          await ctx.sessionStore.save(
+            `submit:${item.title}`,
+            JSON.stringify({
+              title: item.title,
+              kind: item.kind,
+              lifecycle: created.lifecycle,
+              production: result.production,
+              codeEvidence: preparedProduction.codeEvidence,
+              ...readinessData,
+            }),
+            { tags: ['submission'] }
+          );
+          if (ctx.abortSignal?.aborted) {
+            recordPostCommitWarning(
+              'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT',
+              new Error('Session save completed after cancellation')
+            );
+          }
+        } catch (err: unknown) {
+          recordPostCommitWarning('KNOWLEDGE_SESSION_SAVE_FAILED', err);
+        }
+      }
+      return ok(
+        {
+          ...projectPersistedRecipeReview(created.raw),
+          status: 'created',
+          id: created.id,
+          candidateId: created.id,
+          title: created.title,
+          lifecycle: created.lifecycle,
+          production: result.production,
+          codeEvidence: preparedProduction.codeEvidence,
+          ...readinessData,
+        },
+        diagnosticWarnings.length > 0 ? { degraded: true, diagnosticWarnings } : undefined
+      );
     }
 
     // gateway 层三类非 created 结果统一留痕（run-8 复盘缺口：查重/拒绝/blocked 全静默，
@@ -923,8 +1043,22 @@ function pickString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+/** 标题可合法等于 constructor/__proto__；兼容旧普通字典，保持共享对象身份。 */
+function readTitleAttempt(attempts: Record<string, number>, title: string): number {
+  return Object.hasOwn(attempts, title) ? (numberValue(attempts[title]) ?? 0) : 0;
+}
+
+function writeTitleAttempt(attempts: Record<string, number>, title: string, count: number): void {
+  Object.defineProperty(attempts, title, {
+    value: count,
+    writable: true,
+    configurable: true,
+    enumerable: true,
+  });
+}
+
 /**
- * 会话级计数盒(修复层计量/waiver 上限/拒绝止损三族共用宿主)。
+ * 会话级计数盒(题目预算/修复层计量/waiver 上限/拒绝止损共用宿主)。
  *
  * 为什么不能挂 ctx.runtime：ToolExecutionPipeline.buildRuntimeToolCallRequest 对每次工具
  * 调用现造一个一次性 runtime 投影对象——直接写在 ctx.runtime 上的字段随调用即弃(门0 真跑
@@ -1015,47 +1149,48 @@ function buildDefaultUsageGuide(params: Record<string, unknown>) {
 
 function validateSubmitParams(params: Record<string, unknown>): string | null {
   const errors: string[] = [];
-  const title = params.title as string | undefined;
-  const description = params.description as string | undefined;
-  const content = params.content as Record<string, unknown> | undefined;
-  const kind = params.kind as string | undefined;
-  const trigger = params.trigger as string | undefined;
-  const whenClause = params.whenClause as string | undefined;
-  const doClause = params.doClause as string | undefined;
-  const reasoning = params.reasoning as Record<string, unknown> | undefined;
+  // handle 也是直接调用入口，不能依赖 ToolRouter 已做过 schema 检查。
+  const title = params.title;
+  const description = params.description;
+  const content = recordValue(params.content);
+  const kind = params.kind;
+  const trigger = params.trigger;
+  const whenClause = params.whenClause;
+  const doClause = params.doClause;
+  const reasoning = recordValue(params.reasoning);
   const retrievalProfile = params.retrievalProfile;
 
   // 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：长度阈值属风格类——权威门禁已把
   // 长度类violation 分层为 advisory，本廉价前检若先硬拒即旁路分层（run-14 四拒全为此路径
   // 且静默）。前检只留存在性与结构性；上限保护防垃圾输入。
-  if (!title || !title.trim() || title.length > 200) {
+  if (typeof title !== 'string' || !title.trim() || title.length > 200) {
     errors.push('title is required (≤200 characters)');
   }
-  if (!description || !description.trim()) {
+  if (typeof description !== 'string' || !description.trim()) {
     errors.push('description is required');
   }
-  if (!content || typeof content !== 'object') {
+  if (!content) {
     errors.push('content must be an object');
   } else {
-    const md = content.markdown as string | undefined;
-    if (!md || !md.trim()) {
+    const md = content.markdown;
+    if (typeof md !== 'string' || !md.trim()) {
       errors.push('content.markdown is required');
     }
-    const rat = content.rationale as string | undefined;
-    if (!rat || !rat.trim()) {
+    const rat = content.rationale;
+    if (typeof rat !== 'string' || !rat.trim()) {
       errors.push('content.rationale is required');
     }
   }
-  if (!kind || !['rule', 'pattern', 'fact'].includes(kind)) {
+  if (typeof kind !== 'string' || !['rule', 'pattern', 'fact'].includes(kind)) {
     errors.push('kind must be rule/pattern/fact');
   }
-  if (!trigger || !trigger.trim()) {
+  if (typeof trigger !== 'string' || !trigger.trim()) {
     errors.push('trigger is required');
   }
-  if (!whenClause || !whenClause.trim()) {
+  if (typeof whenClause !== 'string' || !whenClause.trim()) {
     errors.push('whenClause is required');
   }
-  if (!doClause || !doClause.trim()) {
+  if (typeof doClause !== 'string' || !doClause.trim()) {
     errors.push('doClause is required');
   }
   const sources = reasoning?.sources;
@@ -1101,6 +1236,10 @@ async function handleDetail(
 
   try {
     const recipe = await repo.getById(id);
+    const aborted = abortedKnowledgeResult(ctx, 'detail');
+    if (aborted) {
+      return aborted;
+    }
     if (!recipe) {
       return fail(`Recipe not found: ${id}`);
     }
@@ -1198,7 +1337,17 @@ async function handleActiveTransition(
   try {
     // Core readiness is both exposed as structured tool evidence here and rechecked by
     // RecipeProductionPort.publish at the authoritative mutation boundary.
-    const readiness = await gateway.evaluateReadiness(id);
+    const read = await runOperation(() => gateway.evaluateReadiness(id), {
+      abortSignal: ctx.abortSignal,
+    });
+    const aborted = abortedKnowledgeResult(ctx, `manage(${operation}) readiness`);
+    if (aborted) {
+      return aborted;
+    }
+    if (read.status !== 'ok') {
+      throw read.error instanceof Error ? read.error : new Error(`Core readiness ${read.status}`);
+    }
+    const readiness = read.value;
     if (!readiness.ready) {
       const message = `Core readiness blocked knowledge.manage(${operation})`;
       return {
@@ -1219,14 +1368,17 @@ async function handleActiveTransition(
     const published = await gateway.publish(id, {
       userId: pickString(ctx.runtime?.agentId) ?? AGENT_RUNTIME_SOURCE,
     });
-    return ok({
-      operation,
-      id,
-      status: operation === 'approve' ? 'approved' : 'published',
-      lifecycle: published.lifecycle,
-      record: published,
-      readiness,
-    });
+    return ok(
+      {
+        operation,
+        id,
+        status: operation === 'approve' ? 'approved' : 'published',
+        lifecycle: published.lifecycle,
+        record: published,
+        readiness,
+      },
+      completedMutationMeta(ctx, `manage(${operation})`)
+    );
   } catch (err: unknown) {
     const errorRecord = recordValue(err);
     const details = recordValue(errorRecord?.details);
@@ -1288,6 +1440,10 @@ async function handleManage(
         ? Math.floor(limitRaw)
         : undefined;
     const queue = await stagingManager.listReviewQueue(limit);
+    const aborted = abortedKnowledgeResult(ctx, 'manage(review-queue)');
+    if (aborted) {
+      return aborted;
+    }
     return ok({ queue, count: queue.length });
   }
 
@@ -1326,7 +1482,7 @@ async function handleManage(
     if (!recorded) {
       return fail(`Staging review rejected: entry ${id} is not in staging`);
     }
-    return ok({ id, outcome, recorded: true });
+    return ok({ id, outcome, recorded: true }, completedMutationMeta(ctx, 'manage(review)'));
   }
 
   if (operation === 'approve' || operation === 'publish') {
@@ -1342,23 +1498,36 @@ async function handleManage(
     switch (operation) {
       case 'reject':
         await repo.reject(id, reason ?? 'Rejected by agent');
-        return ok({ operation, id, status: 'rejected' });
+        return ok(
+          { operation, id, status: 'rejected' },
+          completedMutationMeta(ctx, 'manage(reject)')
+        );
 
       case 'update':
         if (!data) {
           return fail('knowledge.manage(update) requires data');
         }
         await repo.update(id, data);
-        return ok({ operation, id, status: 'updated' });
+        return ok(
+          { operation, id, status: 'updated' },
+          completedMutationMeta(ctx, 'manage(update)')
+        );
 
       case 'score': {
         const score = (data?.score as number) ?? 0;
         await repo.score(id, score);
-        return ok({ operation, id, status: 'scored', score });
+        return ok(
+          { operation, id, status: 'scored', score },
+          completedMutationMeta(ctx, 'manage(score)')
+        );
       }
 
       case 'validate': {
         const validation = await repo.validate(id);
+        const aborted = abortedKnowledgeResult(ctx, 'manage(validate)');
+        if (aborted) {
+          return aborted;
+        }
         return ok({ operation, id, status: 'validated', result: validation });
       }
 
@@ -1418,13 +1587,16 @@ async function handleEvolutionManage(
       return fail(result.error || `Evolution ${operation} failed`);
     }
 
-    return ok({
-      operation,
-      id,
-      status: evolutionStatus(operation, result.outcome),
-      outcome: result.outcome,
-      proposalId: result.proposalId,
-    });
+    return ok(
+      {
+        operation,
+        id,
+        status: evolutionStatus(operation, result.outcome),
+        outcome: result.outcome,
+        proposalId: result.proposalId,
+      },
+      completedMutationMeta(ctx, `manage(${operation})`)
+    );
   } catch (err: unknown) {
     return fail(`Manage(${operation}) failed: ${err instanceof Error ? err.message : String(err)}`);
   }

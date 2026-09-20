@@ -13,6 +13,45 @@ describe('OpenAiProvider baseUrl override', () => {
     expect(new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 }).maxRetries).toBe(0);
   });
 
+  it('forwards chat cancellation to the actual transport signal', async () => {
+    const controller = new AbortController();
+    let started!: () => void;
+    const fetching = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish!: (response: Response) => void;
+    let transportSignal: AbortSignal | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url, init: RequestInit) => {
+        transportSignal = init.signal ?? undefined;
+        started();
+        return new Promise<Response>((resolve, reject) => {
+          finish = resolve;
+          transportSignal?.addEventListener('abort', () => reject(new Error('fetch aborted')), {
+            once: true,
+          });
+        });
+      })
+    );
+    const provider = new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 });
+    const result = provider.chat('bounded repair', { abortSignal: controller.signal }).then(
+      (value) => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error })
+    );
+    await fetching;
+    controller.abort();
+    const transportWasAborted = transportSignal?.aborted;
+    finish({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'late' } }] }),
+    } as Response);
+    const settled = await result;
+    expect(transportWasAborted).toBe(true);
+    expect(settled.error).toBeInstanceOf(Error);
+    expect(settled.value).toBeUndefined();
+  });
+
   it('shares the concurrency gate across simultaneous first requests', async () => {
     let active = 0;
     let peak = 0;

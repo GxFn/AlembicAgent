@@ -7,11 +7,13 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { describe, expect, test, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import {
   buildEvidenceCandidatesHint,
   expandEvidenceRefsForSubmit,
+  repairStyleViolations,
 } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -150,5 +152,75 @@ describe('拒绝反馈增强与提示词（E5）', () => {
     const fragment = new GenerateProduce().promptFragment;
     expect(fragment).toContain('reasoning.evidenceRefs');
     expect(fragment).toContain('evidence.get');
+  });
+});
+
+describe('bounded style repair lifecycle', () => {
+  test.each([
+    'timeout',
+    'aborted',
+    'completed',
+  ])('settles %s repairs once and cleans its timer/listener', async (outcome) => {
+    vi.useFakeTimers();
+    // Winston Console 的 logged 事件另用 setImmediate；隔离日志调度，只量本次操作资源。
+    const logger = Logger.getInstance();
+    const warning = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
+    let finish!: (value: string) => void;
+    let childSignal: AbortSignal | undefined;
+    let settled = false;
+    const response = JSON.stringify({ doClause: 'Use the existing source.' });
+    const pending = repairStyleViolations(
+      { doClause: 'The source is used.' },
+      [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }],
+      {
+        chat: (_prompt: string, options: { abortSignal?: AbortSignal }) => {
+          childSignal = options.abortSignal;
+          return new Promise<string>((resolve) => {
+            finish = resolve;
+          });
+        },
+      },
+      { positive: ['Use'], negative: ['Avoid'] },
+      { abortSignal: controller.signal }
+    ).then((value) => {
+      settled = true;
+      return value;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      if (outcome === 'timeout') {
+        await vi.advanceTimersByTimeAsync(30_000);
+      } else if (outcome === 'aborted') {
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(0);
+      } else {
+        finish(response);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(settled).toBe(true);
+      expect(childSignal).toBeInstanceOf(AbortSignal);
+      expect(childSignal?.aborted).toBe(outcome !== 'completed');
+      expect(vi.getTimerCount()).toBe(0);
+      expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
+      if (outcome !== 'completed') {
+        expect(warning).toHaveBeenCalledWith(`[style-repair] ${outcome}`);
+      }
+      expect(await pending).toEqual(
+        outcome === 'completed' ? { doClause: 'Use the existing source.' } : null
+      );
+      // 不合作 provider 的迟到响应不会再改变已决出的结果。
+      finish(response);
+      expect(await pending).toEqual(
+        outcome === 'completed' ? { doClause: 'Use the existing source.' } : null
+      );
+    } finally {
+      finish?.(response);
+      await pending;
+      vi.useRealTimers();
+      warning.mockRestore();
+      removeListener.mockRestore();
+    }
   });
 });
