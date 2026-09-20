@@ -132,6 +132,43 @@ function createLoopContext(diagnostics: DiagnosticsCollector): LoopContext {
 
 describe('runtime efficiency diagnostics', () => {
   it.each([
+    {
+      label: 'Error',
+      failure: new Error('transient host failure'),
+      message: 'transient host failure',
+    },
+    { label: 'string', failure: 'transient host failure', message: 'transient host failure' },
+    { label: 'unknown', failure: null, message: 'Tool execution failed' },
+  ])('retries the host after a $label failure instead of caching it', async ({
+    failure,
+    message,
+  }) => {
+    let attempts = 0;
+    const runtime = createRuntime(createManifest({ id: 'snapshot.lookup' }), async (request) => {
+      attempts++;
+      // 外部宿主未必遵守只抛 Error 的规则，用拒绝值覆盖真正的输入边界。
+      if (attempts === 1) {
+        return Promise.reject(failure);
+      }
+      return createEnvelope(request, attempts);
+    });
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    loopCtx.allowedToolIds = ['snapshot.lookup'];
+    const call = { id: 'snapshot-lookup', name: 'snapshot.lookup', args: { action: 'read' } };
+    const pipeline = createToolPipeline();
+    expect((await pipeline.execute(call, { runtime, loopCtx, iteration: 1 })).result).toEqual({
+      error: message,
+    });
+    const recovered = await pipeline.execute(call, { runtime, loopCtx, iteration: 2 });
+    expect(recovered.result).toEqual({ executeCount: 2 });
+    expect(recovered.metadata.duplicateShortCircuit).not.toBe(true);
+    expect(attempts).toBe(2);
+    const cached = await pipeline.execute(call, { runtime, loopCtx, iteration: 3 });
+    expect(cached.result).toEqual({ executeCount: 2 });
+    expect(cached.metadata.duplicateShortCircuit).toBe(true);
+    expect(attempts).toBe(2);
+  });
+  it.each([
     'blocked',
     'timeout',
     'metadata-blocked',

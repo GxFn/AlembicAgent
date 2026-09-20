@@ -364,7 +364,17 @@ async function executeRuntimeToolCall(
     recordExecutedEnvelope(call, context, metadata, envelope);
     return projectPipelineToolResult(envelope);
   } catch (err: unknown) {
-    return { error: (err as Error).message };
+    const error =
+      err instanceof Error && err.message
+        ? err.message
+        : typeof err === 'string' && err
+          ? err
+          : 'Tool execution failed';
+    context.loopCtx.diagnostics?.warn({
+      code: 'TOOL_HOST_EXECUTION_FAILED',
+      message: `Host execution of ${call.name} failed before returning an envelope.`,
+    });
+    return { error };
   } finally {
     metadata.durationMs = Date.now() - t0;
   }
@@ -896,8 +906,8 @@ export const deterministicDuplicateGuard = {
     if (!meta.cacheEligible || !meta.cacheKey || meta.blocked || meta.duplicateShortCircuit) {
       return;
     }
-    const envelopeOk = meta.envelope ? meta.envelope.ok : true;
-    if (!envelopeOk) {
+    // 宿主抛错时只有归一化 error，没有 envelope。缺少信封不能被提升为可缓存成功。
+    if (!readToolObservation({ ...call, result, envelope: meta.envelope }).ok) {
       return;
     }
     getEfficiencyCache(ctx).set(meta.cacheKey, {
