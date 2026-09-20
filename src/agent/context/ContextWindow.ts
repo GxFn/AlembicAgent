@@ -596,8 +596,7 @@ export class ContextWindow {
   /**
    * L1 压缩: 截断旧轮次的工具结果内容。
    *
-   * reasoning 管理已下沉到 Transport 层（DeepSeekTransport.#projectV4Reasoning），
-   * ContextWindow 不再关心供应商特定的 reasoning 约束。
+   * reasoning 管理由 SDK transport 处理；这里仅维护通用的消息原子性和配对。
    */
   #compactL1() {
     const TRUNCATE_THRESHOLD = 2000;
@@ -636,6 +635,7 @@ export class ContextWindow {
    */
   #compactL2Merge() {
     let merged = 0;
+    let protectedPairs = 0;
 
     // Pass 1: merge consecutive same-role text messages (not tool messages)
     for (let i = this.#messages.length - 1; i >= 2; i--) {
@@ -650,6 +650,11 @@ export class ContextWindow {
         curr.content &&
         prev.content
       ) {
+        // 续接提示绑定这一条消息的原始内容次序，不能合并后只留下其中一份提示。
+        if (curr.continuation || prev.continuation) {
+          protectedPairs++;
+          continue;
+        }
         prev.content = `${prev.content}\n---\n${curr.content}`;
         this.#messages.splice(i, 1);
         if (i < this.#collapseThreshold) {
@@ -657,6 +662,12 @@ export class ContextWindow {
         }
         merged++;
       }
+    }
+
+    if (protectedPairs > 0) {
+      this.#logger.info(
+        `[ContextWindow] L2 preserved ${protectedPairs} native-continuation message pairs; protocol state remains atomic`
+      );
     }
 
     if (merged > 0) {
@@ -761,22 +772,21 @@ export class ContextWindow {
   /**
    * 估算实际发送给 LLM 的 token 使用量。
    *
-   * reasoningContent 只对最近 2 轮 tool-call assistant 消息计数，
-   * 因为 Transport 层会在发送前剥离更早的 reasoning。
+   * SDK 续接块完整计数；旧 reasoningContent 也不能只计最近两轮，
+   * 因为适配器可能仍需回传更早的内容。相同内容不与 replay 块重复计数。
    */
   estimateTokens() {
     return this.#estimateMessagesTokens(this.#messages);
   }
 
   #estimateMessagesTokens(messages: ContextMessage[]) {
-    const recentToolCallIndices = this.#findRecentToolCallIndicesIn(messages, 2);
     let total = 0;
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
       if (m.content) {
         total += estimateTokensFast(m.content);
       }
-      if (m.reasoningContent && recentToolCallIndices.has(i)) {
+      if (m.reasoningContent && m.continuation?.kind !== 'content-replay-v1') {
         total += estimateTokensFast(m.reasoningContent);
       }
       if (m.continuation) {
@@ -787,17 +797,6 @@ export class ContextWindow {
       }
     }
     return total;
-  }
-
-  #findRecentToolCallIndicesIn(messages: ContextMessage[], n: number): Set<number> {
-    const indices = new Set<number>();
-    for (let i = messages.length - 1; i >= 0 && indices.size < n; i--) {
-      const m = messages[i];
-      if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-        indices.add(i);
-      }
-    }
-    return indices;
   }
 
   /** 获取 token 使用率 (0-1) */

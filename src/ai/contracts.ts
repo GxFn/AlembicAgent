@@ -41,16 +41,31 @@ export interface ChatContext extends LlmCallOptions {
   systemPrompt?: string;
 }
 
-/** 统一消息格式 */
-export interface LlmContinuation {
-  /** 仅为模型协议回传提示，不代表 Agent 运行状态或工具执行授权。 */
-  kind: 'stored-reasoning-v1';
+/** 原生内容次序；可见文本用范围引用，工具用 id 引用，避免复制另一份业务历史。 */
+export type LlmReplayPart =
+  | { type: 'text'; start: number; end: number; thoughtSignature?: string }
+  | { type: 'tool-call'; id: string }
+  | {
+      type: 'reasoning';
+      text: string;
+      signature?: string;
+      redactedData?: string;
+      thoughtSignature?: string;
+    };
+
+interface LlmContinuationScope {
   provider: string;
   model: string;
   /** 连接身份摘要；不携带原始 endpoint 或凭据，防止跨连接复用服务端 item。 */
   connection: string;
-  reasoningItemIds: string[];
 }
+
+/** 仅为模型协议回传提示，不代表 Agent 运行状态或工具执行授权。 */
+export type LlmContinuation = LlmContinuationScope &
+  (
+    | { kind: 'stored-reasoning-v1'; reasoningItemIds: string[] }
+    | { kind: 'content-replay-v1'; parts: LlmReplayPart[] }
+  );
 
 /** 统一消息格式 */
 export interface UnifiedMessage {
@@ -115,6 +130,8 @@ export interface TokenUsage {
   reasoningTokens?: number;
   /** V4 prompt 缓存命中 token 数 */
   cacheHitTokens?: number;
+  /** Provider 报告的缓存创建输入 token；已计入 inputTokens。 */
+  cacheWriteTokens?: number;
 }
 
 /** chatWithStructuredOutput 选项 */

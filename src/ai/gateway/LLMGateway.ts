@@ -143,10 +143,14 @@ export class LLMGateway {
       model: apiModelId,
       messages: request.messages,
       systemPrompt: request.systemPrompt,
-      tools: request.tools,
-      toolChoice: wasFiltered('toolChoice')
-        ? undefined
-        : (guarded.toolChoice ?? request.toolChoice),
+      // none 是调用者的能力边界；厂商 wire 参数不支持不能把禁用意图过滤掉。
+      tools: request.toolChoice === 'none' ? undefined : request.tools,
+      toolChoice:
+        request.toolChoice === 'none'
+          ? 'none'
+          : wasFiltered('toolChoice')
+            ? undefined
+            : (guarded.toolChoice ?? request.toolChoice),
       temperature: wasFiltered('temperature')
         ? undefined
         : (guarded.temperature ?? request.temperature),
@@ -224,13 +228,36 @@ export class LLMGateway {
    * Embedding
    */
   async embed(modelRef: string, texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
+    throwIfLlmCancelled(opts.abortSignal);
     const { providerId } = this.#resolveModel(modelRef);
     const transport = this.#getTransport(providerId);
-    return this.#runWithReliability(
-      providerId,
-      () => transport.embed(texts, opts),
-      opts.abortSignal
-    );
+    const batchSize = transport.maxEmbeddingBatchSize;
+    if (!(batchSize === Infinity || (Number.isInteger(batchSize) && batchSize > 0))) {
+      throw new Error('Invalid embedding batch size');
+    }
+    const result: number[][] = [];
+    try {
+      for (let start = 0; start < texts.length; start += batchSize) {
+        const batch = texts.slice(start, start + batchSize);
+        // 完成批次保存在本次调用局部，不进入 controller 的重试 closure。
+        const vectors = await this.#runWithReliability(
+          providerId,
+          () => transport.embed(batch, opts),
+          opts.abortSignal
+        );
+        if (result.length > 0 && vectors.some((vector) => vector.length !== result[0].length)) {
+          throw new Error('Embedding dimensions differ between completed batches');
+        }
+        result.push(...vectors);
+      }
+      return result;
+    } catch (err: unknown) {
+      this.#log(
+        'warn',
+        `[LLMGateway] embedding_incomplete provider=${providerId} completed=${result.length} requested=${texts.length}; completed batches not replayed`
+      );
+      throw err;
+    }
   }
 
   /**

@@ -40,7 +40,7 @@
     },
     {
       "name": "provider malformed body",
-      "pattern": "treats malformed provider bodies as empty text without fabricating tool calls"
+      "pattern": "rejects malformed provider bodies without fabricating tool calls or empty success"
     },
     {
       "name": "provider mid-stream drop",

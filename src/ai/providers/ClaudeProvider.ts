@@ -7,7 +7,7 @@
  *   - 连续同角色消息合并、tool_use → 结构化 functionCall 解析
  *   - token 计量与重试 / 熔断 / 并发闸门
  *
- * 当前 transport 未传原生输出 schema；Gateway 保留文本提取，并在有 schema 时本地校验。
+ * SDK 选择原生 output_config.format；Gateway 在有 schema 时仍独立执行本地校验。
  * Claude 无嵌入 API，embed 直接返回空数组触发上层降级（与原实现一致）。
  */
 
@@ -33,8 +33,8 @@ export class ClaudeProvider extends AiProvider {
     this.model = config.model || process.env.ALEMBIC_AI_MODEL || 'claude-sonnet-4-6';
     this.apiKey = config.apiKey || process.env.ALEMBIC_CLAUDE_API_KEY || '';
     this.baseUrl = config.baseUrl || process.env.ALEMBIC_CLAUDE_BASE_URL || CLAUDE_BASE;
-    // Claude 上游通常自带退避语义，保持 maxRetries=0 避免叠加放大；gateway 据此关闭重试。
-    this.maxRetries = 0;
+    // 保留默认不重试；显式配置由 Gateway 消费，SDK 单次接口不额外重试。
+    this.maxRetries = config.maxRetries ?? 0;
     this.logger = Logger.getInstance() as unknown as AiLogger;
   }
 

@@ -1,8 +1,15 @@
 # LLM 接入与调用合同
 
-OpenAI 和 Ollama 的 OpenAI 兼容协议由固定版本的 Vercel AI SDK provider 处理。公开的 `OpenAiProvider`、`OllamaProvider`、`OpenAiTransport` 与包入口保持可用。Google、Claude、DeepSeek 目前继续使用各自的 transport。
+OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本的 Vercel AI SDK provider 处理。既有 Provider、Transport 类名和包入口保持可用；厂商装配与策略留在各 transport，共同消息、结果和错误映射集中在内部 SDK 模块。
 
-调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。
+| Provider | 生成 | Embedding |
+| --- | --- | --- |
+| OpenAI / Ollama | OpenAI SDK，显式选择 chat/responses 协议 | OpenAI SDK |
+| Google | Google SDK 原生协议 | Google SDK，Gateway 按 100 项分批重试 |
+| Claude | Anthropic SDK 原生协议 | 继续明确声明不支持 |
+| DeepSeek | DeepSeek SDK 原生协议，保留 V4 策略和文本工具兼容 | SDK 无此接口；保留已有可配置 `/embeddings` 兼容端点并验证返回向量，不宣称官方 DeepSeek 服务支持 |
+
+调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。Google 的已完成 embedding 批次保留在本次调用局部，后续批次失败不会重放它们。
 
 ## 调用和取消
 
@@ -51,13 +58,18 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 ## 模型协议与兼容边界
 
 - OpenAI 默认仍为 Chat Completions；通过 `apiStyle: 'responses'` 或 `ALEMBIC_OPENAI_API_STYLE` 明确选择 Responses。Ollama 使用自身逻辑身份和代理配置，默认不继承 OpenAI 的全局协议选择。
+- Google 使用 `x-goog-api-key` 请求头及原生 `parametersJsonSchema` / `responseJsonSchema` 字段，支持 `ALEMBIC_GOOGLE_BASE_URL`；自定义代理应兼容这些原生字段。Claude 的 system 使用原生内容块格式，schema 选择 `output_config.format`，不自动创建 JSON 格式化工具；显式 `maxRetries` 由 Gateway 执行，默认仍为 0。
+- `toolChoice: none` 是调用者的禁用意图，即使厂商不支持同名 wire 参数，也不暴露可调用工具；违背该意图的工具建议会被拒绝。原生和 DeepSeek 文本转译的参数共用 schema 校验，同次响应的重复调用 ID 明确拒绝。
 - SDK 现在验证原生 HTTP 响应形状。mock/兼容代理应返回真实协议字段，例如 Chat 的 `choices[].index` 和 Responses 的 `output` 内容块。仅返回客户端派生便利字段 `output_text` 的对象不属于原生 Responses wire 合同。
-- Responses 的服务端 reasoning item 引用随消息保存，并经过 Gateway、AgentRuntime 和两种消息适配器回传；它们按 provider、model 和连接摘要隔离，不写入原始 endpoint 或凭据。更换连接时过滤不可复用的引用并记录诊断。当前模式依赖服务端保存的 item；本次没有新增 stateless encrypted-reasoning、流式或多模态能力。
-- 用量与当前响应一起返回；未上报的细分项不伪造成零。响应包含无效工具调用时，已确认用量仍上报一次。SDK 原始错误 body/请求信息不进入普通错误链。
+- Responses 的服务端 reasoning item 引用，以及其他协议的 thinking、签名和 opaque/redacted 块，随消息经过 Gateway、AgentRuntime 和两种消息适配器回传。续接数据按 provider、model 和连接摘要隔离，不携带原始 endpoint 或凭据。内容块保留顺序，可见文本以范围引用、工具以 ID 引用，避免再复制整份业务历史；更换连接或历史投影变化时记录不兼容诊断。普通进度事件省略推理原文和签名。Responses 模式仍依赖服务端 item 保存期限；未新增 stateless encrypted-reasoning、SSE 或多模态入口。
+- 带续接信息的 assistant 消息保持原子性，L2 文本合并不会破坏其范围引用和签名序列；预算估算包含仍可能回传的旧 reasoning 内容，避免只计最近两轮，也避免与 replay 块重复计数。
+- DeepSeek V4 工具模式保留 reasoning 回传、`tool_choice` 省略和原有 reasoning 输出预算下限，预算提升会记录诊断；孤立工具历史仍显式转为文本。文本 `<function_calls>` 转译有独立诊断与调用 ID 前缀，不等同原生调用。
+- 用量与当前响应一起返回；缓存读取/创建和 reasoning 细分仅在上报时返回，异常或负数计数不进入预算。Claude 输入总量包含缓存输入，Google 输出总量包含 thinking。响应含无效工具调用时，已确认用量仍上报一次。HTTP 2xx 的无效协议 body 归为 `LLM_INVALID_RESPONSE`，不伪造空文本成功；SDK 原始错误 body/请求信息不进入普通错误链。
+- 已识别的 SDK 本地参数/能力错误归为 `LLM_INVALID_REQUEST`，不伪造 HTTP 状态、不重试、不计入服务端熔断；调用者修正输入后仍可使用同一 Provider。
 - embedding 验证数量、索引、维度与有限数值，并按原输入顺序返回。保留旧入口的每项 8000 字符边界并记录截断诊断。单次 OpenAI embedding 超过 SDK 上限会明确失败，由现有调用者批处理；adapter 不隐藏分批重放。
 
 ## 开发验证
 
-使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/openai-sdk.test.ts` 覆盖原生协议、错误/重试、embedding 及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
+使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
 
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。

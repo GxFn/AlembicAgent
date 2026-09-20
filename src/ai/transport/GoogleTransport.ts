@@ -1,281 +1,108 @@
-/**
- * GoogleTransport — Google Gemini REST API 协议转换
- *
- * Gemini 特有差异：
- *   - contents 格式 (role: user/model, parts 数组)
- *   - functionDeclarations 工具声明
- *   - toolConfig.functionCallingConfig.mode: AUTO/ANY/NONE
- *   - API key 通过 URL query 传递
- *   - JSON Schema 需清理 (不支持 default/examples)
- *   - thoughtSignature 必须原样回传 (Gemini 3+)
- */
-
-import type { LlmCallOptions, ToolSchema, UnifiedMessage } from '../contracts.js';
+/** Gemini 原生协议交给 SDK；保留本仓取消/代理、批次和结果验证边界。 */
+import { createGoogle, type GoogleProvider } from '@ai-sdk/google';
+import type { LanguageModelV4GenerateResult } from '@ai-sdk/provider';
+import Logger from '@alembic/core/logging';
+import type { LlmCallOptions } from '../contracts.js';
 import {
   LLMTransport,
   type TransportConfig,
-  type TransportFunctionCall,
   type TransportRequest,
   type TransportResponse,
 } from './LLMTransport.js';
-
-const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const DEFAULT_EMBED_MODEL = 'models/gemini-embedding-001';
+import { normalizeSdkError } from './sdkErrors.js';
+import { type SdkCallContext, sdkCallOptions, sdkConnection, sdkResponse } from './sdkProtocol.js';
 
 export class GoogleTransport extends LLMTransport {
-  #embedModel: string;
+  readonly #client: GoogleProvider;
+  readonly #embedModel: string;
+  readonly #connection: string;
 
   constructor(config: TransportConfig) {
-    super('google', { ...config, baseUrl: config.baseUrl || GEMINI_BASE });
-    this.#embedModel = config.embedModel
-      ? `models/${(config.embedModel as string).replace(/^models\//, '')}`
-      : DEFAULT_EMBED_MODEL;
+    super('google', {
+      ...config,
+      baseUrl: config.baseUrl || 'https://generativelanguage.googleapis.com/v1beta',
+    });
+    this.#embedModel =
+      typeof config.embedModel === 'string' && config.embedModel
+        ? config.embedModel.replace(/^models\//, '')
+        : 'gemini-embedding-001';
+    this.#connection = sdkConnection(this.providerId, this.baseUrl, this.apiKey);
+    this.#client = createGoogle({
+      apiKey: this.apiKey,
+      baseURL: this.baseUrl,
+      fetch: (url, options) => this.fetchWithProxy(url, options),
+    });
   }
 
   async chat(request: TransportRequest): Promise<string> {
-    this.requireApiKey('Google Gemini');
+    return (await this.chatWithTools(request)).text || '';
+  }
 
-    const contents = this.#buildContents(request.messages);
-    const body: Record<string, unknown> = {
-      contents,
-      generationConfig: {
-        temperature: request.temperature,
-        maxOutputTokens: request.maxTokens,
-      },
-    };
-    if (request.systemPrompt) {
-      body.systemInstruction = { parts: [{ text: request.systemPrompt }] };
-    }
-    if (request.responseFormat === 'json') {
-      const gc = body.generationConfig as Record<string, unknown>;
-      gc.responseMimeType = 'application/json';
-      // Gemini 原生结构化输出：传入清理后的 JSON Schema 做服务端校验，
-      // 等价于 GoogleGeminiProvider.chatWithStructuredOutput 的 responseSchema 行为。
-      if (request.schema) {
-        gc.responseSchema = this.#sanitizeSchema(request.schema);
-      }
-    }
-
-    const url = `${this.baseUrl}/models/${request.model}:generateContent?key=${this.apiKey}`;
-    const data = await this.post(url, body, {}, request.abortSignal);
-
-    const candidates = (data?.candidates as Array<Record<string, unknown>>) || [];
-    const parts = (candidates[0]?.content as Record<string, unknown>)?.parts as
-      | Array<{ text?: string }>
-      | undefined;
-    return parts?.[0]?.text || '';
+  override get maxEmbeddingBatchSize(): number {
+    return 100;
   }
 
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {
     this.requireApiKey('Google Gemini');
-
-    const contents = this.#buildContents(request.messages);
-    const body: Record<string, unknown> = {
-      contents,
-      generationConfig: {
-        temperature: request.temperature,
-        maxOutputTokens: request.maxTokens,
-      },
+    const context: SdkCallContext = {
+      provider: this.providerId,
+      model: request.model,
+      protocol: 'google',
+      connection: this.#connection,
     };
-
-    if (request.tools && request.tools.length > 0) {
-      body.tools = [
-        {
-          functionDeclarations: request.tools.map((s: ToolSchema) => ({
-            name: s.name,
-            description: s.description || '',
-            parameters: this.#sanitizeSchema(s.parameters),
-          })),
-        },
-      ];
-      body.toolConfig = {
-        functionCallingConfig: {
-          mode: this.#toGeminiMode(request.toolChoice || 'auto'),
-        },
-      };
+    const model = this.#client.chat(request.model);
+    let result: LanguageModelV4GenerateResult;
+    try {
+      result = await this.runRequest(
+        (signal) => model.doGenerate({ ...sdkCallOptions(request, context), abortSignal: signal }),
+        request.abortSignal
+      );
+    } catch (err: unknown) {
+      throw normalizeSdkError(err, this.providerId);
     }
-
-    if (request.systemPrompt) {
-      body.systemInstruction = { parts: [{ text: request.systemPrompt }] };
-    }
-
-    if (request.responseFormat === 'json') {
-      const config = body.generationConfig as Record<string, unknown>;
-      config.responseMimeType = 'application/json';
-      if (request.schema) {
-        config.responseSchema = this.#sanitizeSchema(request.schema);
-      }
-    }
-
-    const url = `${this.baseUrl}/models/${request.model}:generateContent?key=${this.apiKey}`;
-    const data = await this.post(url, body, {}, request.abortSignal);
-
-    return this.#parseResponse(data);
+    return sdkResponse(result, request, context);
   }
 
   async embed(texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     this.requireApiKey('Google Gemini');
+    const model = this.#client.embeddingModel(this.#embedModel);
     const results: number[][] = [];
-
-    for (let i = 0; i < texts.length; i += 100) {
-      const batch = texts.slice(i, i + 100);
-      const requests = batch.map((t) => ({
-        model: this.#embedModel,
-        content: { parts: [{ text: t.slice(0, 8000) }] },
-      }));
-
-      const url = `${this.baseUrl}/${this.#embedModel}:batchEmbedContents?key=${this.apiKey}`;
-      const data = await this.post(url, { requests }, {}, opts.abortSignal);
-      const embeddings = (data?.embeddings || []) as Array<{ values: number[] }>;
-      results.push(...embeddings.map((e) => e.values));
+    if (texts.some((text) => text.length > 8000)) {
+      Logger.getInstance().warn(
+        '[ai-sdk] embedding_input_truncated provider=google limit=8000; legacy input boundary preserved'
+      );
     }
-
+    for (let start = 0; start < texts.length; start += this.maxEmbeddingBatchSize) {
+      const batch = texts.slice(start, start + this.maxEmbeddingBatchSize);
+      try {
+        const result = await this.runRequest(
+          (signal) =>
+            model.doEmbed({
+              values: batch.map((text) => text.slice(0, 8000)),
+              abortSignal: signal,
+            }),
+          opts.abortSignal
+        );
+        const vectors = result.embeddings;
+        if (
+          vectors.length !== batch.length ||
+          vectors.some(
+            (vector) =>
+              !vector.length ||
+              !vector.every(Number.isFinite) ||
+              vector.length !== (results[0]?.length ?? vectors[0].length)
+          )
+        ) {
+          throw new Error('Invalid embedding count, dimensions or values');
+        }
+        results.push(...vectors);
+      } catch (err: unknown) {
+        Logger.getInstance().warn(
+          `[ai-sdk] embedding_batch_failed provider=google completed=${results.length} requested=${texts.length}; partial result withheld`
+        );
+        throw normalizeSdkError(err, this.providerId);
+      }
+    }
     return results;
-  }
-
-  // ─── 消息转换 ──────────────────────────────────────
-
-  #buildContents(messages: UnifiedMessage[]): Array<{ role: string; parts: unknown[] }> {
-    const contents: Array<{ role: string; parts: unknown[] }> = [];
-    let pendingToolResults: {
-      functionResponse: { name: string; response: { result: string } };
-    }[] = [];
-
-    const pushOrMerge = (entry: { role: string; parts: unknown[] }) => {
-      const last = contents[contents.length - 1];
-      if (last && last.role === entry.role) {
-        last.parts.push(...entry.parts);
-      } else {
-        contents.push(entry);
-      }
-    };
-
-    for (const msg of messages) {
-      if (msg.role === 'tool') {
-        pendingToolResults.push({
-          functionResponse: {
-            name: msg.name || '',
-            response: { result: msg.content || '' },
-          },
-        });
-        continue;
-      }
-
-      if (pendingToolResults.length > 0) {
-        pushOrMerge({ role: 'user', parts: pendingToolResults });
-        pendingToolResults = [];
-      }
-
-      if (msg.role === 'user') {
-        pushOrMerge({ role: 'user', parts: [{ text: msg.content || '' }] });
-      } else if (msg.role === 'assistant') {
-        const parts: Array<Record<string, unknown>> = [];
-        if (msg.content) {
-          parts.push({ text: msg.content });
-        }
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          for (const tc of msg.toolCalls) {
-            const fcPart: Record<string, unknown> = {
-              functionCall: { name: tc.name, args: tc.args || {} },
-            };
-            if (tc.thoughtSignature) {
-              fcPart.thoughtSignature = tc.thoughtSignature;
-            }
-            parts.push(fcPart);
-          }
-        }
-        if (parts.length > 0) {
-          pushOrMerge({ role: 'model', parts });
-        }
-      }
-    }
-
-    if (pendingToolResults.length > 0) {
-      pushOrMerge({ role: 'user', parts: pendingToolResults });
-    }
-
-    return contents;
-  }
-
-  #toGeminiMode(toolChoice: string): string {
-    switch (toolChoice) {
-      case 'required':
-        return 'ANY';
-      case 'none':
-        return 'NONE';
-      default:
-        return 'AUTO';
-    }
-  }
-
-  // ─── 响应解析 ──────────────────────────────────────
-
-  #parseResponse(data: Record<string, unknown>): TransportResponse {
-    const candidates = (data?.candidates as Array<Record<string, unknown>>) || [];
-    const content = candidates[0]?.content as Record<string, unknown> | undefined;
-    const meta = data?.usageMetadata as Record<string, number> | undefined;
-
-    const usage = meta
-      ? {
-          inputTokens: meta.promptTokenCount || 0,
-          outputTokens: meta.candidatesTokenCount || 0,
-          totalTokens: meta.totalTokenCount || 0,
-        }
-      : null;
-
-    const parts = (content?.parts || []) as Array<Record<string, unknown>>;
-    if (parts.length === 0) {
-      return { text: '', functionCalls: null, usage };
-    }
-
-    const functionCalls: TransportFunctionCall[] = [];
-    const textParts: string[] = [];
-    let fcIndex = 0;
-
-    for (const part of parts) {
-      if (part.functionCall) {
-        const fc = part.functionCall as Record<string, unknown>;
-        functionCalls.push({
-          id: `gemini_fc_${Date.now()}_${fcIndex++}`,
-          name: fc.name as string,
-          args: (fc.args as Record<string, unknown>) || {},
-          thoughtSignature: (part.thoughtSignature as string) || undefined,
-        });
-      } else if (part.text) {
-        textParts.push(part.text as string);
-      }
-    }
-
-    return {
-      text: textParts.length > 0 ? textParts.join('\n') : null,
-      functionCalls: functionCalls.length > 0 ? functionCalls : null,
-      usage,
-    };
-  }
-
-  #sanitizeSchema(schema: unknown): Record<string, unknown> {
-    if (!schema || typeof schema !== 'object') {
-      return { type: 'object', properties: {} };
-    }
-    const cleaned = { ...(schema as Record<string, unknown>) };
-    delete cleaned.default;
-    delete cleaned.examples;
-    if (!cleaned.type) {
-      cleaned.type = 'object';
-    }
-
-    if (cleaned.properties) {
-      const props: Record<string, unknown> = {};
-      for (const [key, val] of Object.entries(cleaned.properties as Record<string, unknown>)) {
-        props[key] = this.#sanitizeSchema(val);
-      }
-      cleaned.properties = props;
-    }
-
-    if (cleaned.type === 'array') {
-      cleaned.items = cleaned.items ? this.#sanitizeSchema(cleaned.items) : { type: 'string' };
-    }
-
-    return cleaned;
   }
 }

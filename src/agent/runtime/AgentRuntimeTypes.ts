@@ -39,6 +39,7 @@ export interface LLMResult {
     outputTokens?: number;
     reasoningTokens?: number;
     cacheHitTokens?: number;
+    cacheWriteTokens?: number;
   };
   /** DeepSeek V4 thinking 推理内容，需原样回传 */
   reasoningContent?: string | null;

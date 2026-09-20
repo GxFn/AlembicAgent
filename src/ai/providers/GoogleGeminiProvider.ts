@@ -4,8 +4,8 @@
  * chat / chatWithTools / chatWithStructuredOutput / embed 委托基类 _gateway* helper，
  * 由 LLMGateway + GoogleTransport 统一承担：
  *   - Gemini REST contents / functionDeclarations / toolConfig 协议拼装
- *   - JSON Schema 清理（去 default/examples，array 强制补 items）
- *   - 原生 JSON mode（responseMimeType + responseSchema 服务端校验）
+ *   - 原生 JSON Schema（parametersJsonSchema / responseJsonSchema，由 SDK 维护）
+ *   - 原生 JSON mode 与本仓输出 schema 校验
  *   - thoughtSignature 原样回传（Gemini 3+ 必须，否则后续请求 400）
  *   - batchEmbedContents 嵌入、token 计量与重试 / 熔断 / 并发闸门
  *
@@ -46,6 +46,7 @@ export class GoogleGeminiProvider extends AiProvider {
         : 'conservative-default';
     this.model = config.model || 'gemini-3-flash-preview';
     this.apiKey = config.apiKey || process.env.ALEMBIC_GOOGLE_API_KEY || '';
+    this.baseUrl = config.baseUrl || process.env.ALEMBIC_GOOGLE_BASE_URL || '';
     this.logger = Logger.getInstance() as unknown as AiLogger;
 
     // 嵌入模型透传给 GoogleTransport（transport 内部统一补 'models/' 前缀并兜底默认）。

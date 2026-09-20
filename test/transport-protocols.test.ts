@@ -20,7 +20,15 @@ function mockClaudeFetch(
     usage: { input_tokens: 1, output_tokens: 1 },
   }
 ) {
-  return mockFetch(capture, response);
+  return mockFetch(capture, {
+    id: 'msg-fixture',
+    type: 'message',
+    role: 'assistant',
+    model: 'claude-sonnet-4-6',
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    ...response,
+  });
 }
 
 function sentMessages(capture: { body?: Record<string, unknown> }) {
@@ -87,7 +95,7 @@ describe('ClaudeTransport Anthropic protocol translation', () => {
       maxTokens: 512,
     });
 
-    expect(capture.body?.system).toBe('You are precise.');
+    expect(capture.body?.system).toEqual([{ type: 'text', text: 'You are precise.' }]);
     // system is a top-level field, NOT a message.
     expect(sentMessages(capture)).toHaveLength(1);
     expect(capture.body?.tool_choice).toEqual({ type: 'any' });
@@ -159,8 +167,8 @@ describe('ClaudeTransport Anthropic protocol translation', () => {
  * GoogleTransport carries the Gemini REST contract, which diverges sharply from
  * the OpenAI/Anthropic shapes and had no dedicated test: contents use role
  * user/model, tool results ride as functionResponse parts, tool_choice maps to
- * functionCallingConfig.mode, schemas must be sanitized (no default/examples),
- * the API key travels in the URL query, and thoughtSignature must round-trip.
+ * functionCallingConfig.mode, native JSON Schemas and header authentication,
+ * and thoughtSignature must round-trip.
  */
 
 function mockGeminiFetch(
@@ -208,12 +216,13 @@ describe('GoogleTransport Gemini protocol translation', () => {
     expect(contents[2].role).toBe('user');
     const toolParts = contents[2].parts as Array<Record<string, unknown>>;
     expect(toolParts[0].functionResponse).toEqual({
+      id: 'c1',
       name: 'code',
-      response: { result: 'file body' },
+      response: { name: 'code', content: 'file body' },
     });
   });
 
-  it('maps tool_choice required->ANY and sanitizes schemas (strips default/examples)', async () => {
+  it('maps tool_choice required->ANY and preserves the native JSON Schema', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     mockGeminiFetch(capture);
     const transport = new GoogleTransport({ apiKey: 'k' });
@@ -241,18 +250,20 @@ describe('GoogleTransport Gemini protocol translation', () => {
     expect(toolConfig.functionCallingConfig.mode).toBe('ANY');
 
     const tools = capture.body?.tools as Array<{
-      functionDeclarations: Array<{ parameters: Record<string, unknown> }>;
+      functionDeclarations: Array<{ parametersJsonSchema: Record<string, unknown> }>;
     }>;
-    const params = tools[0].functionDeclarations[0].parameters;
-    expect(params.default).toBeUndefined();
-    expect(params.examples).toBeUndefined();
-    expect(
-      (params.properties as Record<string, Record<string, unknown>>).path.default
-    ).toBeUndefined();
+    const params = tools[0].functionDeclarations[0].parametersJsonSchema;
+    expect(params.default).toEqual({});
+    expect(params.examples).toEqual([]);
+    expect((params.properties as Record<string, Record<string, unknown>>).path.default).toBe('x');
   });
 
-  it('passes the API key as a URL query param, not a header', async () => {
-    const capture: { url?: string; body?: Record<string, unknown> } = {};
+  it('uses native key headers without putting credentials in the URL', async () => {
+    const capture: {
+      url?: string;
+      body?: Record<string, unknown>;
+      headers?: Record<string, string>;
+    } = {};
     mockGeminiFetch(capture);
     const transport = new GoogleTransport({ apiKey: 'gem-key' });
 
@@ -264,7 +275,8 @@ describe('GoogleTransport Gemini protocol translation', () => {
 
     expect(text).toBe('ok');
     expect(capture.url).toContain('models/gemini-2.5-flash:generateContent');
-    expect(capture.url).toContain('key=gem-key');
+    expect(capture.url).not.toContain('gem-key');
+    expect(capture.headers?.['x-goog-api-key']).toBe('gem-key');
   });
 
   it('parses functionCall + text parts, maps usageMetadata, and preserves thoughtSignature', async () => {
@@ -298,7 +310,8 @@ describe('GoogleTransport Gemini protocol translation', () => {
       args: { q: 1 },
       thoughtSignature: 'sig-abc',
     });
-    expect(result.functionCalls?.[0].id).toMatch(/^gemini_fc_\d+_0$/u);
+    expect(result.functionCalls?.[0].id).toEqual(expect.any(String));
+    expect(result.functionCalls?.[0].id).not.toBe('');
     expect(result.usage).toEqual({ inputTokens: 20, outputTokens: 8, totalTokens: 28 });
   });
 });
@@ -457,7 +470,7 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     ]);
   });
 
-  it('treats malformed provider bodies as empty text without fabricating tool calls', async () => {
+  it('rejects malformed provider bodies without fabricating tool calls or empty success', async () => {
     const capture: { body?: Record<string, unknown> } = {};
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
     mockDeepSeekFetch(capture, {
@@ -465,31 +478,31 @@ describe('DeepSeekTransport tool transcript preflight', () => {
       usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 },
     });
 
-    const result = await transport.chatWithTools({
-      model: 'deepseek-v4-flash',
-      messages: [{ role: 'user', content: 'call a tool only if valid' }],
-      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
-      toolChoice: 'auto',
-      maxTokens: 1024,
-    });
-
-    expect(result).toMatchObject({
-      text: null,
-      functionCalls: null,
-      usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 },
-    });
+    await expect(
+      transport.chatWithTools({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'call a tool only if valid' }],
+        tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+        toolChoice: 'auto',
+        maxTokens: 1024,
+      })
+    ).rejects.toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
   });
 
   it('surfaces mid-stream JSON body drops instead of returning a false success', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({
-        ok: true,
-        json: async () => {
-          throw new Error('provider body stream terminated');
-        },
-        text: async () => '',
-      })) as unknown as typeof fetch
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error('provider body stream terminated'));
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )
+      )
     );
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
 
@@ -499,7 +512,8 @@ describe('DeepSeekTransport tool transcript preflight', () => {
         messages: [{ role: 'user', content: 'hello' }],
         maxTokens: 64,
       })
-    ).rejects.toThrow('provider body stream terminated');
+    ).rejects.toBeInstanceOf(Error);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
 

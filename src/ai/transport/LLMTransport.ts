@@ -176,6 +176,11 @@ export abstract class LLMTransport {
 
   abstract chat(request: TransportRequest): Promise<string>;
 
+  /** 单次 embedding HTTP 尝试的上限；Gateway 据此把重试限定在未完成批次。 */
+  get maxEmbeddingBatchSize(): number {
+    return Infinity;
+  }
+
   /** embed 能力，不支持的 Transport 返回空数组 */
   async embed(_texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     throwIfLlmCancelled(opts.abortSignal);

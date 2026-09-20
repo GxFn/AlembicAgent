@@ -2482,7 +2482,8 @@ function buildLlmOutputCompletenessMetadata(
   const reasoningTokens = result.usage?.reasoningTokens || 0;
   const finishReason = normalizeFinishReason(result.finishReason);
   const providerOutputTruncated = isProviderOutputTruncated(finishReason);
-  const reasoningContentOmitted = reasoningContentChars > 0 || reasoningTokens > 0;
+  const reasoningContentOmitted =
+    reasoningContentChars > 0 || reasoningTokens > 0 || Boolean(result.continuation);
 
   return {
     agentOutputTruncated: false,
@@ -2767,7 +2768,7 @@ function formatDeveloperVisibleMessage(
   if (message.toolCallId) {
     lines.push(`toolCallId: ${message.toolCallId}`);
   }
-  if (message.reasoningContent) {
+  if (message.reasoningContent || message.continuation) {
     lines.push('[hidden reasoning omitted]');
   }
   return lines.join('\n');

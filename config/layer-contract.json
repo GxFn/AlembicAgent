@@ -39,9 +39,46 @@
       "src/ai/errors.ts",
       "src/ai/transport/LLMTransport.ts",
       "src/ai/transport/OpenAiTransport.ts",
-      "src/ai/transport/sdkErrors.ts"
+      "src/ai/transport/sdkErrors.ts",
+      "src/ai/transport/GoogleTransport.ts",
+      "src/ai/transport/ClaudeTransport.ts",
+      "src/ai/transport/DeepSeekTransport.ts",
+      "src/ai/transport/sdkProtocol.ts",
+      "src/ai/transport/sdkContinuation.ts"
     ],
     "runtimeImports": {
+      "src/ai/transport/sdkContinuation.ts": [
+        "@alembic/core/logging"
+      ],
+      "src/ai/transport/sdkProtocol.ts": [
+        "node:crypto",
+        "@alembic/core/logging",
+        "src/ai/errors.ts",
+        "src/ai/shared/schemaValidation.ts",
+        "src/ai/transport/sdkContinuation.ts"
+      ],
+      "src/ai/transport/DeepSeekTransport.ts": [
+        "@ai-sdk/deepseek",
+        "@alembic/core/logging",
+        "src/ai/deepseekToolCallCompat.ts",
+        "src/ai/toolTranscript.ts",
+        "src/ai/transport/LLMTransport.ts",
+        "src/ai/transport/sdkErrors.ts",
+        "src/ai/transport/sdkProtocol.ts"
+      ],
+      "src/ai/transport/ClaudeTransport.ts": [
+        "@ai-sdk/anthropic",
+        "src/ai/transport/LLMTransport.ts",
+        "src/ai/transport/sdkErrors.ts",
+        "src/ai/transport/sdkProtocol.ts"
+      ],
+      "src/ai/transport/GoogleTransport.ts": [
+        "@ai-sdk/google",
+        "@alembic/core/logging",
+        "src/ai/transport/LLMTransport.ts",
+        "src/ai/transport/sdkErrors.ts",
+        "src/ai/transport/sdkProtocol.ts"
+      ],
       "src/ai/contracts.ts": [],
       "src/ai/errors.ts": [],
       "src/ai/transport/LLMTransport.ts": [
@@ -52,13 +89,11 @@
         "undici"
       ],
       "src/ai/transport/OpenAiTransport.ts": [
-        "node:crypto",
         "@ai-sdk/openai",
         "@alembic/core/logging",
-        "src/ai/errors.ts",
-        "src/ai/shared/schemaValidation.ts",
         "src/ai/transport/LLMTransport.ts",
-        "src/ai/transport/sdkErrors.ts"
+        "src/ai/transport/sdkErrors.ts",
+        "src/ai/transport/sdkProtocol.ts"
       ],
       "src/ai/transport/sdkErrors.ts": [
         "@ai-sdk/provider"
