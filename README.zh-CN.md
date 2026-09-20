@@ -91,6 +91,7 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
 ## 关键运行时保证
 
 阶段尝试、部分结果、知识持久化回执与内部分层详见[执行生命周期](docs/execution-lifecycle.md)。
+严格门禁、回执分层及宿主管理端口要求见[Strict 生产合同](docs/strict-production.md)。
 
 - **结构化执行结果** —— 单次 runtime 执行错误被归一为完整的
   `AgentRunResult`,状态归一为五态(success / blocked / aborted / timeout /

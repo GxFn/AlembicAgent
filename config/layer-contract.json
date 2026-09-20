@@ -25,7 +25,8 @@
       "src/agent/runtime/toolPipeline/",
       "src/agent/strategies/pipeline/",
       "src/tools/runtime/handlers/knowledge/",
-      "src/shared/operation.ts"
+      "src/shared/operation.ts",
+      "src/agent/production/strict/"
     ],
     "runtimeImports": {
       "src/agent/runtime/ToolExecutionPipeline.ts": [
@@ -142,6 +143,39 @@
         "src/tools/runtime/handlers/knowledge/operation.ts",
         "src/tools/runtime/handlers/knowledge/queries.ts",
         "src/tools/runtime/handlers/knowledge/submission.ts"
+      ],
+      "src/agent/production/StrictProductionPipeline.ts": [
+        "src/agent/production/strict/analysisLoop.ts",
+        "src/agent/production/strict/analyst.ts",
+        "src/agent/production/strict/expressions.ts",
+        "src/agent/production/strict/gates.ts",
+        "src/agent/production/strict/lineage.ts"
+      ],
+      "src/agent/production/strict/analysisLoop.ts": [
+        "@alembic/core/production",
+        "src/agent/production/strict/primitives.ts"
+      ],
+      "src/agent/production/strict/analyst.ts": [
+        "@alembic/core/production",
+        "src/agent/production/strict/primitives.ts"
+      ],
+      "src/agent/production/strict/lineage.ts": [
+        "node:crypto",
+        "src/agent/production/strict/analysisLoop.ts",
+        "src/agent/production/strict/analyst.ts",
+        "src/agent/production/strict/primitives.ts"
+      ],
+      "src/agent/production/strict/expressions.ts": [
+        "@alembic/core/production",
+        "src/agent/production/strict/lineage.ts",
+        "src/agent/production/strict/primitives.ts"
+      ],
+      "src/agent/production/strict/gates.ts": [
+        "@alembic/core/production",
+        "src/agent/production/strict/primitives.ts"
+      ],
+      "src/agent/production/strict/primitives.ts": [
+        "node:crypto"
       ]
     }
   },

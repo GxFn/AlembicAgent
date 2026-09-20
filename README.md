@@ -101,6 +101,8 @@ Internal imports use the `#agent/*`, `#ai/*`, `#shared/*`, `#tools/*` aliases
 
 Stage attempts, partial results, knowledge persistence receipts, and internal module boundaries
 are documented in [Execution lifecycle](docs/execution-lifecycle.md).
+See [Strict production contracts](docs/strict-production.md) for gate adapters, receipt layers,
+and the host knowledge-management port requirements.
 
 - **Structured execution results** — single-run execution
   errors are degraded into a complete `AgentRunResult` with a five-state

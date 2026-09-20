@@ -77,6 +77,9 @@ function runLint(
 
 describe('layer contract CLI', () => {
   it.each([
+    ['src/agent/production/strict/primitives.ts', 'src/agent/production/strict/analysisLoop.ts'],
+    ['src/agent/production/strict/analysisLoop.ts', 'src/agent/production/strict/expressions.ts'],
+    ['src/agent/production/strict/lineage.ts', 'src/agent/production/StrictProductionPipeline.ts'],
     ['src/agent/strategies/pipeline/attempt.ts', 'src/agent/strategies/PipelineStrategy.ts'],
     [
       'src/tools/runtime/handlers/knowledge/authoring.ts',
