@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getLLMGateway, LLMGateway, resetLLMGateway } from '../src/ai/gateway/LLMGateway.js';
+import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
+import { LLMTransport, type TransportRequest } from '../src/ai/transport/LLMTransport.js';
+import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { jsonResponse } from './helpers/mockFetch.js';
 
 function stubFetch(response: Record<string, unknown>) {
@@ -10,6 +13,68 @@ function stubFetch(response: Record<string, unknown>) {
 }
 
 describe('LLMGateway horizontal capabilities', () => {
+  // Main 不再维护第二套 SDK/transport 单测；保留原有独特合同到其实现仓库。
+  it.each([
+    ['openai:gpt-5.5', 'openai', 'gpt-5.5'],
+    ['claude:claude-sonnet-4-6', 'claude', 'claude-sonnet-4-6'],
+    ['deepseek:deepseek-v4-flash', 'deepseek', 'deepseek-v4-flash'],
+    ['google:gemini-3-flash-preview', 'google', 'gemini-3-flash-preview'],
+    ['gpt-5.5', 'openai', 'gpt-5.5'],
+    ['claude-sonnet-4-6', 'claude', 'claude-sonnet-4-6'],
+    ['openai:custom-model', 'openai', 'custom-model'],
+  ])('resolves %s without a network request', (modelRef, provider, apiModelId) => {
+    expect(new LLMGateway().getModelDef(modelRef)).toMatchObject({ provider, apiModelId });
+  });
+
+  it.each([
+    { Transport: OpenAiTransport, provider: 'openai', model: 'gpt-5.5' },
+    { Transport: ClaudeTransport, provider: 'claude', model: 'claude-sonnet-4-6' },
+  ])('rejects explicitly empty $provider credentials before HTTP', async ({
+    Transport,
+    provider,
+    model,
+  }) => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const transport = new Transport({ apiKey: '' });
+    expect(transport.providerId).toBe(provider);
+    await expect(
+      transport.chat({ model, messages: [{ role: 'user', content: 'ping' }] })
+    ).rejects.toThrow('API Key');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('filters model parameters before the native Anthropic request', async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        body = JSON.parse(String(init.body));
+        return jsonResponse({
+          id: 'msg-fixture',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-opus-4-7',
+          content: [{ type: 'text', text: 'done' }],
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 5 },
+        });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { claude: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    const result = await gateway.chatWithTools({
+      modelRef: 'claude:claude-opus-4-7',
+      messages: [{ role: 'user', content: 'ping' }],
+      temperature: 0.9,
+    });
+    expect(body.temperature).toBeUndefined();
+    expect(result).toMatchObject({ text: 'done', usage: { inputTokens: 10, outputTokens: 5 } });
+  });
+
   it('stops provider fallback when the caller cancels the probe chain', async () => {
     stubFetch({ choices: [{ index: 0, message: { content: 'ok' } }] });
     const controller = new AbortController();
@@ -136,5 +201,34 @@ describe('LLMGateway horizontal capabilities', () => {
     const g2 = getLLMGateway({ providers: { openai: { apiKey: 'b' } } });
     expect(g2).not.toBe(g1);
     expect(getLLMGateway()).toBe(g2);
+  });
+});
+
+describe('LLMTransport explicit legacy defaults', () => {
+  class LocalTransport extends LLMTransport {
+    request?: TransportRequest;
+    constructor(private readonly reply: string) {
+      super('openai', { apiKey: '' });
+    }
+    async chat(request: TransportRequest) {
+      this.request = request;
+      return this.reply;
+    }
+    async chatWithTools() {
+      return { text: this.reply, functionCalls: null, usage: null };
+    }
+  }
+
+  it.each([
+    { reply: '{"value":42}', expected: { value: 42 } },
+    { reply: 'invalid-json', expected: null },
+  ])('retains structured parsing for $reply', async ({ reply, expected }) => {
+    const transport = new LocalTransport(reply);
+    expect(await transport.chatStructured({ model: 'fixture', messages: [] })).toEqual(expected);
+    expect(transport.request?.responseFormat).toBe('json');
+  });
+
+  it('retains the base transport explicit unsupported embedding result', async () => {
+    expect(await new LocalTransport('').embed(['fixture'])).toEqual([]);
   });
 });

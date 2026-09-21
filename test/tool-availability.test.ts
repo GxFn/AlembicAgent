@@ -20,6 +20,24 @@ function request(
 }
 
 describe('schema, introspection, and static execution admission', () => {
+  it.each([
+    { tool: 'terminal', action: 'exec', params: { command: 'fixture' } },
+    { tool: 'code', action: 'write', params: { path: 'fixture.ts', content: 'fixture' } },
+  ])('rejects a disallowed tool or action $tool.$action before host allocation', async ({
+    tool,
+    action,
+    params,
+  }) => {
+    const create = vi.fn(() => ({ projectRoot: process.cwd(), tokenBudget: 4000 }));
+    const adapter = new ToolRouterAdapter({
+      capability: { name: 'read-only', description: 'fixture', allowedTools: { code: ['read'] } },
+      contextFactory: { create },
+    });
+    const result = await adapter.execute(request(tool, action, params));
+    expect(result).toMatchObject({ ok: false, text: expect.stringContaining('Permission denied') });
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('checks an omitted filter against its real default before executing', async () => {
     const search = vi.fn(async () => []);
     const adapter = new ToolRouterAdapter({

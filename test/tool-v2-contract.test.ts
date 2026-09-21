@@ -33,6 +33,76 @@ function baseToolContext(): ToolContext {
 describe('ToolRouter scheduling and cancellation', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it.each([
+    {
+      label: 'object',
+      tool: 'code',
+      raw: { action: 'search', params: { patterns: ['TODO'] } },
+      action: 'search',
+      params: { patterns: ['TODO'] },
+    },
+    {
+      label: 'JSON',
+      tool: 'terminal',
+      raw: JSON.stringify({ action: 'exec', params: { command: 'fixture' } }),
+      action: 'exec',
+      params: { command: 'fixture' },
+    },
+    {
+      label: 'omitted params',
+      tool: 'graph',
+      raw: { action: 'overview' },
+      action: 'overview',
+      params: {},
+    },
+  ])('normalizes tool arguments from $label without executing a handler', ({
+    tool,
+    raw,
+    action,
+    params,
+  }) => {
+    expect(new ToolRouter().parseToolCall(tool, raw)).toEqual({ tool, action, params });
+  });
+
+  it.each([
+    { label: 'missing action', raw: { params: { path: 'fixture.ts' } } },
+    { label: 'malformed JSON', raw: '{invalid json}' },
+  ])('rejects $label before execution', ({ raw }) => {
+    expect(new ToolRouter().parseToolCall('code', raw)).toHaveProperty('error');
+  });
+
+  it.each([
+    { tool: 'unknown-tool', action: 'read' },
+    { tool: 'code', action: 'unknown-action' },
+  ])('rejects unknown execution target $tool.$action', async ({ tool, action }) => {
+    const result = await new ToolRouter().execute({ tool, action, params: {} }, baseToolContext());
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('Invalid call') });
+  });
+
+  it('passes an immutable registry view with the actual handler and preserves execution errors', async () => {
+    const handler = vi
+      .spyOn(TOOL_REGISTRY.meta.actions.review, 'handler')
+      .mockResolvedValue({ ok: true, data: { found: true } });
+    const router = new ToolRouter();
+    const call = { tool: 'meta', action: 'review', params: {} };
+    expect(await router.execute(call, baseToolContext())).toMatchObject({
+      ok: true,
+      data: { found: true },
+    });
+    expect(handler).toHaveBeenCalledOnce();
+    const [params, context] = handler.mock.calls[0];
+    expect(params).toEqual({});
+    expect(context.projectRoot).toBe(baseRoot);
+    expect(context.toolRegistry).not.toBe(TOOL_REGISTRY);
+    expect(Object.isFrozen(context.toolRegistry)).toBe(true);
+    expect(context.toolRegistry?.meta.actions.review.handler).toBe(handler);
+    handler.mockRejectedValueOnce(new Error('fixture handler failed'));
+    expect(await router.execute(call, baseToolContext())).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('fixture handler failed'),
+    });
+  });
+
   it.each([123, [], {}])('rejects an invalid memory key before storing it: %j', async (key) => {
     const handler = vi
       .spyOn(TOOL_REGISTRY.memory.actions.save, 'handler')

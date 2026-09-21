@@ -1,6 +1,10 @@
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
-import { analysisQualityGate, insightGateEvaluator } from '../src/agent/evaluation/index.js';
+import {
+  analysisQualityGate,
+  buildAnalysisArtifact,
+  insightGateEvaluator,
+} from '../src/agent/evaluation/index.js';
 import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insightAnalyst.js';
 import { buildRecordRepairPrompt } from '../src/agent/prompts/insightGate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
@@ -118,7 +122,85 @@ function createStrategy(minFindings = 3) {
   });
 }
 
+function recordedFindingFixture(count: number) {
+  const findings = [
+    {
+      finding: 'NetworkError 统一网络错误枚举',
+      evidence: 'Packages/AOXNetworkKit/Sources/AOXNetworkKit/Core/NetworkError.swift:12',
+      importance: 9,
+    },
+    {
+      finding: 'ResponseDecoder 容错解析链路',
+      evidence: 'Packages/AOXNetworkKit/Sources/AOXNetworkKit/Core/ResponseDecoder.swift:44',
+      importance: 8,
+    },
+    {
+      finding: '中间件错误恢复',
+      evidence: 'Sources/Infrastructure/Networking/Client/NetworkError+App.swift:8',
+      importance: 8,
+    },
+  ];
+  const reply = `
+## NetworkError 统一网络错误枚举
+核心错误模型落在 Packages/AOXNetworkKit/Sources/AOXNetworkKit/Core/NetworkError.swift，并通过 Sources/Infrastructure/Networking/Client/NetworkError+App.swift 转换成业务可读错误。
+## ResponseDecoder 容错解析链路
+响应解析由 Packages/AOXNetworkKit/Sources/AOXNetworkKit/Core/ResponseDecoder.swift 承担，业务扩展位于 Sources/Infrastructure/Networking/Client/ResponseDecoder+App.swift。
+## 中间件错误恢复
+请求链路中的 Sources/Infrastructure/Networking/Middleware/AuthMiddleware.swift 和 Packages/AOXNetworkKit/Sources/AOXNetworkKit/Middleware/CacheMiddleware.swift 提供认证恢复与缓存降级。
+`;
+  return {
+    source: {
+      reply,
+      toolCalls: findings.map((finding) => ({
+        tool: 'code',
+        args: { action: 'read', path: finding.evidence.split(':')[0] },
+        result: '12|public enum NetworkError: Error {\n13| case invalidURL(String)\n}',
+      })),
+    },
+    activeContext: {
+      distill: () => ({ keyFindings: findings.slice(0, count), toolCallSummary: [] }),
+    },
+  };
+}
+
 describe('evidence recording quality gate actions', () => {
+  it.each([0, 1, 3])('keeps derived markdown separate from %s recorded findings', (count) => {
+    const { source, activeContext } = recordedFindingFixture(count);
+    const artifact = buildAnalysisArtifact(source, 'error-resilience', null, activeContext);
+    expect(artifact.metadata).toMatchObject({
+      memoryFindingCount: count,
+      derivedFindingCount: count === 0 ? 3 : 0,
+    });
+    expect(artifact.findings).toHaveLength(count || 3);
+    if (count === 0) {
+      expect(artifact.findings[0].evidence).toContain('NetworkError.swift');
+      expect(artifact.qualityReport.scores.evidenceScore).toBeGreaterThanOrEqual(50);
+      expect(artifact.qualityReport.suggestions).toContain(MISSING_FINDINGS);
+      expect(analysisQualityGate(artifact, { outputType: 'candidate' })).toMatchObject({
+        pass: false,
+        action: 'record_repair',
+        reason: MISSING_FINDINGS,
+      });
+    } else if (count === 1) {
+      expect(artifact.qualityReport.suggestions).toContain(INSUFFICIENT_FINDINGS);
+      expect(analysisQualityGate(artifact, { outputType: 'candidate' }).pass).toBe(false);
+    } else {
+      expect(artifact.qualityReport.suggestions).not.toContain(MISSING_FINDINGS);
+      expect(artifact.qualityReport.suggestions).not.toContain(INSUFFICIENT_FINDINGS);
+    }
+  });
+
+  it('requires recorded findings when needsCandidates overrides analysis-only output', () => {
+    const { source, activeContext } = recordedFindingFixture(0);
+    expect(
+      insightGateEvaluator(
+        source,
+        {},
+        { activeContext, dimId: 'error-resilience', outputType: 'analysis', needsCandidates: true }
+      )
+    ).toMatchObject({ action: 'record_repair', reason: MISSING_FINDINGS });
+  });
+
   it('routes adequate analysis with missing note_finding records to record_repair', () => {
     const gate = analysisQualityGate(gateableReport([MISSING_FINDINGS]), {
       outputType: 'candidate',

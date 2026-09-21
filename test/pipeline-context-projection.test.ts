@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ContextWindow } from '../src/agent/context/ContextWindow.js';
+import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { PolicyEngine } from '../src/agent/policies/PolicyEngine.js';
+import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
-import type { SystemRunContext } from '../src/agent/runtime/SystemRunContext.js';
+import {
+  createSystemRunContext,
+  type SystemRunContext,
+} from '../src/agent/runtime/SystemRunContext.js';
 import type { AgentRunContext } from '../src/agent/service/AgentRunContracts.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -67,6 +73,84 @@ async function runContext(context: Omit<AgentRunContext, 'source'>, secondStage 
 }
 
 describe('AgentService pipeline context projection', () => {
+  it.each([
+    'legacy trace',
+    'system context',
+  ] as const)('passes %s to stage and gate without losing scope identity', async (entry) => {
+    const memoryCoordinator = new MemoryCoordinator({ mode: 'bootstrap' });
+    const activeContext = memoryCoordinator.createDimensionScope('fixture:analyst');
+    // 真实窗口、SystemRunContext 和 memory scope 均执行；只替代模型循环。
+    const contextWindow = new ContextWindow();
+    const systemRunContext = createSystemRunContext({
+      memoryCoordinator,
+      scopeId: 'fixture:analyst',
+      activeContext,
+      contextWindow,
+      source: 'system',
+      projectLanguage: 'ts',
+      sharedState: { submittedTitles: new Set(), customFlag: true },
+    });
+    const evaluator = vi.fn(
+      (_source: unknown, _phases: Record<string, unknown>, context: Record<string, unknown>) => ({
+        pass: context.activeContext === activeContext,
+        action: context.activeContext === activeContext ? 'pass' : 'retry',
+      })
+    );
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze', disableTracker: true },
+        { name: 'quality_gate', gate: { evaluator } },
+      ],
+    });
+    const reactLoop = vi.fn(async (_prompt: string, _options?: Record<string, unknown>) => ({
+      reply: 'analysis with evidence',
+      toolCalls: [],
+      tokenUsage: { input: 1, output: 1 },
+      iterations: 1,
+    }));
+    const runtime: Parameters<PipelineStrategy['execute']>[0] = {
+      id: 'fixture',
+      logger: { info: vi.fn() },
+      reactLoop,
+    };
+    const result = await strategy.execute(
+      runtime,
+      new AgentMessage({ content: 'analyze' }),
+      entry === 'legacy trace'
+        ? { strategyContext: { trace: activeContext } }
+        : { systemRunContext }
+    );
+    expect(result.phases.quality_gate).toMatchObject({ pass: true, action: 'pass' });
+    expect(evaluator).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ activeContext, trace: activeContext })
+    );
+    if (entry === 'system context') {
+      expect(reactLoop.mock.calls[0][1]).toMatchObject({
+        trace: activeContext,
+        contextWindow,
+        memoryCoordinator,
+        source: 'system',
+        sharedState: {
+          _dimensionScopeId: 'fixture:analyst',
+          _projectLanguage: 'ts',
+          customFlag: true,
+        },
+      });
+    } else {
+      expect(result.diagnostics.warnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: 'pipeline_context_warning',
+            stage: 'quality_gate',
+            message: expect.stringContaining('aliased'),
+          }),
+        ])
+      );
+    }
+  });
+
   it('forwards flat resources once and keeps shared references across stage copies', async () => {
     const flat = resources('flat');
     const { prepared, loopOptions } = await runContext({ ...flat, runtimeSource: 'analyst' }, true);

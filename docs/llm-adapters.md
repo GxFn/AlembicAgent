@@ -116,6 +116,8 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 
 `test/ai-provider-manager.test.ts` 通过公开 AI 入口覆盖热切换、补偿边界、观察者和计量绑定，并用真实 SDK + 延迟 HTTP fixture 验证切换后的旧请求归属。原 `ai-provider.test.ts` 的 Manager 用例已迁入，后者保留 Provider、模型策略和公共入口测试。
 
+LLMGateway/Transport 的内部回归统一在本仓维护：`test/LLMGateway.test.ts` 保留路由、参数过滤与旧显式 transport 默认合同，其余协议、工具调用和 HTTP 错误归入已有 SDK 测试矩阵。主仓用真实的公开 Provider → DI/Manager → 计量存储链路验证接入，避免再次复制内部协议测试及过期的 HTTP mock。
+
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。
 
 ## 固定向量空间与宿主迁移
