@@ -160,7 +160,6 @@ export class MemoryCoordinator {
   #currentScopeId: string | null;
 
   #logger: ReturnType<typeof Logger.getInstance>;
-  #completedScopes: Set<string>;
   #writeFailures: MemoryWriteFailureDiagnostic[] = [];
 
   /**
@@ -178,7 +177,6 @@ export class MemoryCoordinator {
 
     this.#activeContexts = new Map<string, ActiveContext>();
     this.#currentScopeId = null;
-    this.#completedScopes = new Set<string>();
 
     this.#budgetAllocation = {
       activeContext: 0,
@@ -342,9 +340,7 @@ export class MemoryCoordinator {
         return '';
       }
 
-      const ac = options.scopeId
-        ? this.getActiveContext(options.scopeId)
-        : this.#getCurrentActiveContext();
+      const ac = this.getActiveContext(options.scopeId);
       if (!ac) {
         return '';
       }
@@ -414,7 +410,7 @@ export class MemoryCoordinator {
     evidenceRefs?: string[]
   ): MemoryNoteFindingResult {
     try {
-      const ac = scopeId ? this.getActiveContext(scopeId) : this.#getCurrentActiveContext();
+      const ac = this.getActiveContext(scopeId);
       if (ac) {
         ac.noteKeyFinding(finding, evidence, importance, round, evidenceRefs);
         return {
@@ -539,14 +535,13 @@ export class MemoryCoordinator {
    * @returns WorkingMemory (Phase 2) / ActiveContext (Phase 3)
    */
   createDimensionScope(scopeId: string, config: DimensionScopeConfig = {}): ActiveContext {
-    this.#promptBudgets.delete(scopeId);
-    this.#currentScopeId = scopeId;
-
-    // Phase 3: 创建 ActiveContext 实例
+    // 先由 ActiveContext 校验配置，再替换 scope；拒绝非法配置不能丢掉现有工作记忆。
     const ac = new ActiveContext({
       lightweight: config.lightweight || false,
-      maxRecentRounds: config.maxRecentRounds || 3,
+      maxRecentRounds: config.maxRecentRounds,
     });
+    this.#promptBudgets.delete(scopeId);
+    this.#currentScopeId = scopeId;
     this.#activeContexts.set(scopeId, ac);
     this.#logger.debug(`[MemoryCoordinator] scope created: ${scopeId} (ActiveContext)`);
     return ac;
@@ -574,7 +569,6 @@ export class MemoryCoordinator {
         ac.clear();
         this.#activeContexts.delete(scopeId);
       }
-      this.#completedScopes.add(scopeId);
 
       // 切换当前 scope 到下一个或清空
       if (this.#currentScopeId === scopeId) {
@@ -752,20 +746,11 @@ export class MemoryCoordinator {
     this.#activeContexts.clear();
     this.#sessionStore = null;
     this.#currentScopeId = null;
-    this.#completedScopes.clear();
   }
 
   // ═══════════════════════════════════════════════════════════
   // 私有方法
   // ═══════════════════════════════════════════════════════════
-
-  /** 获取当前 scope 的 ActiveContext */
-  #getCurrentActiveContext() {
-    if (!this.#currentScopeId) {
-      return null;
-    }
-    return this.#activeContexts.get(this.#currentScopeId) || null;
-  }
 
   #recordMemoryWriteFailure(err: unknown, operation: 'persistentMemory.append'): void {
     const diagnostic: MemoryWriteFailureDiagnostic = {

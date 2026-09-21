@@ -8,6 +8,8 @@ Agent 保留记忆策略和装配，Core 提供现有 SQLite schema 和公共 IO
 
 `MemoryReadPolicy` 只管理单次读取的期限、取消和诊断。`MemoryPrompt` 统一预算分配、section 来源与实际 token 估算。Facade、检索、会话存储各保留本来的职责，宿主仍可注入兼容端口。
 
+`ActiveContext.maxRecentRounds` 与 `MemoryCoordinator.createDimensionScope` 的同名配置共用校验：缺省为 3，显式 0 表示立即压缩；负数、小数、NaN 与无穷值在创建时抛出 `RangeError`，避免压缩循环无法退出。非法 scope 配置不会替换当前上下文或清除已有预算。观察保留与 `memory.note_finding` 写入回归集中在 `test/ActiveContext.test.ts`，L4 记忆包与压缩回归集中在 `test/ContextWindow.test.ts`。
+
 ## 读取与预算
 
 - `retrieve`、`toPromptSection`、`embedAllMemories`、`computeEmbeddingRelevance` 接受可选 `abortSignal`、`timeoutMs`、`deadlineAt`、`onDiagnostic`。旧调用不需要新增参数。

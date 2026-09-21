@@ -299,7 +299,12 @@ export class ActiveContext {
    * @param [options.lightweight=false] 轻量模式: 跳过 WM 的压缩/Scratchpad 逻辑 (D5)
    */
   constructor(options: ActiveContextOptions = {}) {
-    this.#maxRecentRounds = options.maxRecentRounds ?? 3;
+    const maxRecentRounds = options.maxRecentRounds ?? 3;
+    // 0 表示立即压缩；负数会使队列清空后仍进入 while，必须在记录观察前拒绝。
+    if (!Number.isInteger(maxRecentRounds) || maxRecentRounds < 0) {
+      throw new RangeError('ActiveContext maxRecentRounds must be a non-negative integer');
+    }
+    this.#maxRecentRounds = maxRecentRounds;
     this.#lightweight = options.lightweight ?? false;
     this.#logger = Logger.getInstance();
   }
