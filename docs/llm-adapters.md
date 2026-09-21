@@ -13,6 +13,10 @@ OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本�
 
 调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。Google 的已完成 embedding 批次保留在本次调用局部，后续批次失败不会重放它们。
 
+Gateway 按 provider 维护可靠性控制器。每次传输尝试在排队后、实际调用前重新核对取消、429 冷却与熔断状态；冷却延长对已等待请求同样生效。并发槽位只覆盖在途调用，重试退避不占用槽位。首次熔断冷却为 30 秒，失败探测后的下一窗口依次翻倍，上限 300 秒；半开期间只允许一个逻辑请求探测，并在其重试间保留探测资格。旧请求的迟到成功不能关闭后来打开的熔断。取消与客户端输入错误不累计服务端失败，日志回调失败不改变调用结果。
+
+相关回归集中在 `test/reliability.test.ts`；模型注册、参数约束与兼容策略集中在 `test/ai-provider.test.ts`。Transport 与 Gateway 的真实协议映射仍由各自测试验证。
+
 ## 配置解析与装配
 
 Factory 选择逻辑 provider，公共 Provider 保留宿主所需的身份与回执字段，内部 `configuration.ts` 统一解析模型、连接和适配器选项。Transport 使用同一解析规则，SDK 不再自行从厂商通用环境变量读取凭据。配置、模型能力 Registry、请求参数策略和网络代理各有一个负责入口。
