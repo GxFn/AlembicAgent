@@ -365,12 +365,20 @@ export async function handleManage(
       }
 
       case 'validate': {
-        const validation = await method.call(management, id);
+        // validate 是只读端口；与 update/reject/score 的真实写回执等待分开处理。
+        const read = await runOperation(() => method.call(management, id), {
+          abortSignal: ctx.abortSignal,
+        });
         const aborted = abortedKnowledgeResult(ctx, 'manage(validate)');
         if (aborted) {
           return aborted;
         }
-        return ok({ operation, id, status: 'validated', result: validation });
+        if (read.status !== 'ok') {
+          throw read.error instanceof Error
+            ? read.error
+            : new Error(String(read.error ?? `Knowledge validation ${read.status}`));
+        }
+        return ok({ operation, id, status: 'validated', result: read.value });
       }
 
       default:

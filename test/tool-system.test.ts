@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
@@ -194,6 +195,50 @@ function knowledgeAdapter(ports: Partial<ToolContext>) {
 }
 
 describe('knowledge host ports through ToolRouterAdapter', () => {
+  it.each([
+    'throw',
+    'reject',
+  ])('retains read cancellation when the %s logger fails', async (mode) => {
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      if (mode === 'reject') {
+        return Promise.reject(new Error('fixture cancellation logger failure'));
+      }
+      throw new Error('fixture cancellation logger failure');
+    });
+    const read = knowledgeAdapter({
+      knowledgeRead: {
+        getById: async () => {
+          enter();
+          await pending;
+          return null;
+        },
+      },
+    });
+    const result = read('detail', { id: 'fixture' }, controller.signal);
+    try {
+      await entered;
+      controller.abort();
+      const envelope = await result;
+      expect(envelope).toMatchObject({ ok: false, status: 'aborted' });
+      expect(envelope.text).toContain('detail aborted');
+      expect(envelope.text).not.toContain('fixture cancellation logger failure');
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      release();
+      await result;
+      warn.mockRestore();
+    }
+  });
+
   const managementCases = [
     {
       operation: 'update',
@@ -458,6 +503,145 @@ describe('knowledge host ports through ToolRouterAdapter', () => {
       expect(result.diagnostics?.warnings).toContainEqual(
         expect.objectContaining({ code: 'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT' })
       );
+    }
+  });
+
+  it.each([
+    'sync',
+    'async',
+  ])('retains the confirmed update when its %s diagnostic logger fails', async (mode) => {
+    const controller = new AbortController();
+    const update = vi.fn(async () => {
+      controller.abort(new Error('fixture cancelled after write'));
+      return { id: 'recipe', confirmed: true };
+    });
+    const logger = Logger.getInstance();
+    const originalWarn = logger.warn;
+    let warningCalls = 0;
+    // 不用返回 Promise 的 mock spy：mock 框架自身可能订阅 rejection，掩盖漏掉的观察边界。
+    logger.warn = () => {
+      warningCalls++;
+      if (mode === 'async') {
+        return Promise.reject(new Error('fixture diagnostic failure'));
+      }
+      throw new Error('fixture diagnostic failure');
+    };
+    try {
+      const result = await knowledgeAdapter({ knowledgeManagement: { update } })(
+        'manage',
+        { id: 'recipe', operation: 'update', data: { description: 'Confirmed update' } },
+        controller.signal
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(update).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({
+        ok: true,
+        status: 'success',
+        structuredContent: { id: 'recipe', status: 'updated' },
+      });
+      expect(result.diagnostics.warnings).toContainEqual(
+        expect.objectContaining({ code: 'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT' })
+      );
+      expect(warningCalls).toBe(1);
+    } finally {
+      logger.warn = originalWarn;
+    }
+  });
+
+  it.each([
+    'detail',
+    'search',
+    'prime',
+    'validate',
+  ])('preserves a non-Error %s port rejection diagnostic', async (action) => {
+    const rejectRead = () => Promise.reject('Fixture original read rejection');
+    const result = await knowledgeAdapter({
+      knowledgeRead: { getById: rejectRead },
+      searchEngine: { search: rejectRead },
+      knowledgeManagement: { validate: rejectRead },
+    })(action === 'validate' ? 'manage' : action, {
+      id: 'recipe',
+      query: 'recipe',
+      taskGoal: 'Read recipe',
+      operation: 'validate',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain('Fixture original read rejection');
+  });
+
+  it.each([
+    'detail',
+    'search',
+    'prime-search',
+    'prime-detail',
+    'validate',
+  ])('ends a cancelled %s read before its non-cooperative port settles', async (readStage) => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    let entered!: () => void;
+    let release!: () => void;
+    let rejectRead!: (error: Error) => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const waiting = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      rejectRead = reject;
+    });
+    const waitForPort = vi.fn(async () => {
+      entered();
+      await waiting;
+    });
+    const getById = vi.fn(async (id: string) => {
+      await waitForPort();
+      return { id, title: 'Late detail must not replace cancellation' };
+    });
+    const search = vi.fn(async () => {
+      if (readStage !== 'prime-detail') {
+        await waitForPort();
+      }
+      return [
+        { id: 'recipe', title: 'First result', score: 1 },
+        { id: 'next-recipe', title: 'Must not start another detail read', score: 0.5 },
+      ];
+    });
+    const pending = knowledgeAdapter({
+      knowledgeRead: { getById },
+      searchEngine: { search },
+      knowledgeManagement: { validate: waitForPort },
+    })(
+      readStage === 'validate' ? 'manage' : readStage.startsWith('prime-') ? 'prime' : readStage,
+      { id: 'recipe', operation: 'validate', query: 'recipe', taskGoal: 'Read recipe' },
+      controller.signal
+    );
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    try {
+      await started;
+      controller.abort(new Error('fixture read cancelled'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      const result = await pending;
+      expect(result).toMatchObject({ ok: false, status: 'aborted' });
+      expect(result.structuredContent).toBeNull();
+      expect(waitForPort).toHaveBeenCalledOnce();
+      expect(getById).toHaveBeenCalledTimes(['detail', 'prime-detail'].includes(readStage) ? 1 : 0);
+      // 同时覆盖迟到数据与迟到拒绝；已结束的工具不能重放或启动 prime 的下一次详情读取。
+      if (readStage === 'validate') {
+        rejectRead(new Error('late read failure'));
+      } else {
+        release();
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(await pending).toBe(result);
+      expect(waitForPort).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      await pending;
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
     }
   });
 

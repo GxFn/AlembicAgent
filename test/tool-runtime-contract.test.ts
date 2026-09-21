@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
@@ -146,6 +147,172 @@ describe('Tool adapter receipt ownership', () => {
 
 describe('ToolRouter scheduling and cancellation', () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    { tool: 'meta', action: 'plan', params: { steps: [42], strategy: 'fixture' } },
+    {
+      tool: 'meta',
+      action: 'plan',
+      params: { steps: [{ id: 'wrong', action: 12 }], strategy: 'fixture' },
+    },
+    {
+      tool: 'memory',
+      action: 'save',
+      params: { key: 'fixture', content: 'fixture', tags: ['valid', 123] },
+    },
+    {
+      tool: 'memory',
+      action: 'note_finding',
+      params: { finding: 'fixture', evidenceRefs: ['E-fixture', 123] },
+    },
+  ])('rejects nested parameter shapes before native $tool.$action writes', async ({
+    tool,
+    action,
+    params,
+  }) => {
+    const save = vi.fn();
+    const noteFinding = vi.fn(() => 'fixture recorded');
+    const create = vi.fn(() => ({
+      ...baseToolContext(),
+      sessionStore: { save },
+      memoryCoordinator: { noteFinding },
+    }));
+    const adapter = new ToolRouterAdapter({ contextFactory: { create } });
+    const result = await adapter.execute({
+      toolId: tool,
+      args: { action, params },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' },
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      structuredContent: { code: 'TOOL_CALL_INVALID', writeState: 'not-started' },
+    });
+    expect(create).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(noteFinding).not.toHaveBeenCalled();
+  });
+
+  it('keeps schema-permitted extra params without coercing or deleting them', async () => {
+    const save = vi.fn();
+    const router = new ToolRouter();
+    const steps = [{ id: 1, action: 'read', extra: 'retained' }];
+    const result = await router.execute(
+      { tool: 'meta', action: 'plan', params: { steps, strategy: 'fixture', extra: 'permitted' } },
+      { ...baseToolContext(), sessionStore: { save } }
+    );
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(save.mock.calls[0][1])).toEqual({ steps, strategy: 'fixture' });
+    expect(steps[0].extra).toBe('retained');
+  });
+
+  it('refreshes validation when a public schema changes in place and isolates reused schema ids', async () => {
+    const saveAction = TOOL_REGISTRY.memory.actions.save;
+    const planAction = TOOL_REGISTRY.meta.actions.plan;
+    const originalSave = saveAction.params;
+    const originalPlan = planAction.params;
+    const save = vi.fn();
+    const router = new ToolRouter();
+    const context = { ...baseToolContext(), sessionStore: { save } };
+    const call = { tool: 'memory', action: 'save', params: { key: 'k', content: 'finding' } };
+    try {
+      // 两个独立action可合法使用同一个$id；验证缓存不能成为全局schema注册表。
+      saveAction.params = { ...structuredClone(originalSave), $id: 'urn:fixture:tool-params' };
+      planAction.params = { ...structuredClone(originalPlan), $id: 'urn:fixture:tool-params' };
+      expect((await router.execute(call, context)).ok).toBe(true);
+      expect(
+        (
+          await router.execute(
+            { tool: 'meta', action: 'plan', params: { steps: [], strategy: 'fixture' } },
+            context
+          )
+        ).ok
+      ).toBe(true);
+      const properties = saveAction.params.properties as Record<string, Record<string, unknown>>;
+      properties.key.minLength = 2;
+      expect(await router.execute(call, context)).toMatchObject({
+        ok: false,
+        data: { code: 'TOOL_CALL_INVALID' },
+      });
+      expect(save).toHaveBeenCalledTimes(2);
+      delete properties.key.minLength;
+      expect((await router.execute(call, context)).ok).toBe(true);
+      expect(save).toHaveBeenCalledTimes(3);
+    } finally {
+      saveAction.params = originalSave;
+      planAction.params = originalPlan;
+    }
+  });
+
+  it('keeps the captured write target tied to live permissions after scheduling', async () => {
+    const save = vi.fn();
+    const recall = vi.fn(() => []);
+    const capability = {
+      name: 'fixture',
+      description: 'fixture',
+      allowedTools: { memory: ['save', 'recall'] },
+    };
+    const router = new ToolRouter({ capability });
+    const call = { tool: 'memory', action: 'save', params: { key: 'fixture', content: 'finding' } };
+    const pending = router.execute(call, { ...baseToolContext(), sessionStore: { save, recall } });
+    // Router 已在准入后等待 slot；改写调用对象不能使 save handler 获得 recall 的授权。
+    call.action = 'recall';
+    capability.allowedTools.memory = ['recall'];
+    expect(await pending).toMatchObject({
+      ok: false,
+      data: { code: 'TOOL_ACTION_DENIED', action: 'save', writeState: 'not-started' },
+    });
+    expect(save).not.toHaveBeenCalled();
+    expect(recall).not.toHaveBeenCalled();
+  });
+
+  it('owns nested params while the native single-action handler waits for its slot', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const update = vi.fn(async (id: string) => {
+      if (id === 'first') {
+        entered();
+        await held;
+      }
+      return { id };
+    });
+    const router = new ToolRouter();
+    const context = { ...baseToolContext(), knowledgeManagement: { update } };
+    const first = router.execute(
+      {
+        tool: 'knowledge',
+        action: 'manage',
+        params: { operation: 'update', id: 'first', data: { title: 'first' } },
+      },
+      context
+    );
+    await started;
+    const call = {
+      tool: 'knowledge',
+      action: 'manage',
+      params: {
+        operation: 'update',
+        id: 'second',
+        data: { title: 'original', tags: ['original'] },
+      },
+    };
+    const second = router.execute(call, context);
+    call.params.id = 'changed';
+    call.params.data.title = 'changed';
+    call.params.data.tags.push('changed');
+    release();
+    expect((await first).ok).toBe(true);
+    expect((await second).ok).toBe(true);
+    expect(update).toHaveBeenLastCalledWith('second', { title: 'original', tags: ['original'] });
+    expect(call.params.data.tags).toEqual(['original', 'changed']);
+  });
 
   it.each([
     {
@@ -298,6 +465,71 @@ describe('ToolRouter scheduling and cancellation', () => {
 });
 
 describe('tool runtime adapters and public contracts', () => {
+  it.each(
+    (['execute', 'executeChildCall'] as const).flatMap((entry) =>
+      ['success', 'blocked', 'invalid', 'pre-aborted', 'host-error', 'timeout'].map((outcome) => ({
+        entry,
+        outcome,
+      }))
+    )
+  )('preserves parent identity through $entry returning $outcome', async ({ entry, outcome }) => {
+    const abort = new AbortController();
+    if (outcome === 'pre-aborted') {
+      abort.abort('fixture cancellation');
+    }
+    const save = vi.fn();
+    const adapter = new ToolRouterAdapter({
+      ...(outcome === 'blocked'
+        ? { capability: { name: 'fixture', description: 'fixture', allowedTools: {} } }
+        : {}),
+      contextFactory: {
+        create: (request) => {
+          expect(request.parentCallId).toBe('fixture-parent');
+          if (outcome === 'host-error') {
+            throw new Error('fixture host allocation failed');
+          }
+          return {
+            ...baseToolContext(),
+            sessionStore: { save },
+            sandboxExecutor: {
+              exec: async () => {
+                abort.abort(new DOMException('fixture deadline', 'TimeoutError'));
+                return { stdout: 'partial output', stderr: '', exitCode: 137 };
+              },
+            },
+          };
+        },
+      },
+    });
+    const result = await adapter[entry]({
+      toolId:
+        outcome === 'invalid' ? 'fixture-unknown' : outcome === 'timeout' ? 'terminal' : 'memory',
+      args:
+        outcome === 'timeout'
+          ? { action: 'exec', params: { command: 'fixture' } }
+          : { action: 'save', params: { key: 'fixture', content: 'finding' } },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' },
+      parentCallId: 'fixture-parent',
+      abortSignal: abort.signal,
+    });
+    expect(result.parentCallId).toBe('fixture-parent');
+    expect(result.callId).toEqual(expect.any(String));
+    expect(result.callId).not.toBe(result.parentCallId);
+    expect(result.status).toBe(
+      outcome === 'invalid' || outcome === 'host-error'
+        ? 'error'
+        : outcome === 'pre-aborted'
+          ? 'aborted'
+          : outcome
+    );
+    expect(save).toHaveBeenCalledTimes(outcome === 'success' ? 1 : 0);
+    if (outcome === 'timeout') {
+      expect(result.structuredContent).toContain('partial output');
+    }
+  });
+
   it('preserves an aborted status through the host adapter before execution', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -649,8 +881,53 @@ describe('tool runtime adapters and public contracts', () => {
     expect(envelope.diagnostics?.fallbackUsed).toBe(false);
   });
 
-  it('writes new knowledge submissions with the Alembic Agent source by default', async () => {
+  it.each([
+    { evidenceMode: 'static sources', scope: undefined },
+    { evidenceMode: 'ledger refs', scope: 'narrow' },
+    { evidenceMode: 'ledger inferred sources', scope: 'narrow' },
+    { evidenceMode: 'ledger unmatched sources', scope: 'narrow' },
+    { evidenceMode: 'ledger empty refs', scope: 'narrow' },
+    { evidenceMode: 'ledger refs', scope: 'file-local' },
+    { evidenceMode: 'ledger refs', scope: 'single-file' },
+    { evidenceMode: 'ledger refs', scope: 'local-only' },
+    { evidenceMode: 'ledger refs', scope: 'fixture-unknown-scope', coreError: 'SNIPPET_MISMATCH' },
+  ])('preserves actual knowledge submission validation with $evidenceMode / $scope', async ({
+    evidenceMode,
+    scope,
+    coreError,
+  }) => {
     const router = new ToolRouter();
+    const ledger =
+      evidenceMode === 'static sources'
+        ? undefined
+        : new EvidenceLedgerStore({
+            dataRoot: baseRoot,
+            jobId: 'parameter-contract',
+            sessionId: 'fixture-session',
+            dimensionId: `${evidenceMode.replaceAll(' ', '-')}-${scope}`,
+          });
+    const entry = ledger?.append({
+      tool: 'code.read',
+      callId: 'fixture-read',
+      file: 'package.json',
+      range: { start: 1, end: 3 },
+      content: (await readFile(join(process.cwd(), 'package.json'), 'utf8'))
+        .split('\n')
+        .slice(0, 3)
+        .join('\n'),
+    });
+    const evidenceRefs = entry ? [entry.id] : [];
+    const reasoning =
+      evidenceMode === 'ledger refs'
+        ? { evidenceRefs, confidence: 0.9 }
+        : evidenceMode === 'ledger empty refs'
+          ? { evidenceRefs: [], confidence: 0.9 }
+          : {
+              sources: [
+                evidenceMode === 'ledger unmatched sources' ? 'README.md:1-3' : 'package.json:1-3',
+              ],
+              confidence: 0.9,
+            };
     const createRequests: Array<{
       input: { items: Record<string, unknown>[]; options?: Record<string, unknown> };
       context: { source: string; userId: string; capability: string };
@@ -673,16 +950,15 @@ describe('tool runtime adapters and public contracts', () => {
           ].join('\n'),
           rationale:
             'The source value must distinguish Alembic Agent owned writes from legacy IDE agent compatibility inputs.',
+          ...(coreError ? { pattern: 'export const notInSources = true;' } : {}),
         },
         kind: 'pattern',
         trigger: 'Tool V2 source boundary',
         whenClause: 'When the Agent runtime submits a new knowledge candidate through Tool V2.',
         doClause: 'Record alembic-agent as the default source for the submitted candidate.',
         dontClause: 'Do not reuse the legacy ide-agent source for new Agent writes.',
-        reasoning: {
-          sources: ['package.json:1-3'],
-          confidence: 0.9,
-        },
+        reasoning,
+        ...(scope ? { scope } : {}),
       },
     });
 
@@ -691,9 +967,10 @@ describe('tool runtime adapters and public contracts', () => {
       throw new Error(parsed.error);
     }
 
-    const result = await router.execute(parsed, {
+    const context: ToolContext = {
       ...baseToolContext(),
       projectRoot: process.cwd(),
+      ...(ledger ? { runtime: { evidenceLedger: ledger } } : {}),
       recipeGateway: {
         createOrStage: async (
           input: { items: Record<string, unknown>[]; options?: Record<string, unknown> },
@@ -726,15 +1003,44 @@ describe('tool runtime adapters and public contracts', () => {
           warnings: [],
         }),
       },
+    };
+    const adapter = new ToolRouterAdapter({ router, contextFactory: { create: () => context } });
+    const result = await adapter.execute({
+      toolId: parsed.tool,
+      args: { action: parsed.action, params: parsed.params },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' },
+      runtime: context.runtime,
     });
 
-    expect(result.ok).toBe(true);
+    if (coreError) {
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain(coreError);
+      expect(createRequests).toEqual([]);
+      return;
+    }
+    if (evidenceMode === 'ledger unmatched sources' || evidenceMode === 'ledger empty refs') {
+      expect(result.ok).toBe(false);
+      expect(createRequests).toEqual([]);
+      return;
+    }
+    expect(result.ok, result.text).toBe(true);
     expect(createRequests[0]?.context).toEqual({
       source: 'alembic-agent',
       userId: 'alembic-agent',
       capability: 'knowledge-submit',
     });
     expect(createRequests[0]?.input.items[0]?.source).toBe('alembic-agent');
+    expect(createRequests[0]?.input.items[0]?.reasoning).toMatchObject({
+      sources: ['package.json:1-3'],
+    });
+    if (ledger) {
+      expect(createRequests[0]?.input.items[0]?.reasoning).toMatchObject({
+        evidenceRefs,
+      });
+      expect(createRequests[0]?.input.items[0]?.scope).toBe(scope);
+    }
   });
 
   it('defaults evolution decisions to alembic-agent while preserving legacy and domain sources', async () => {

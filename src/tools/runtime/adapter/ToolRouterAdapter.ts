@@ -89,6 +89,14 @@ export class ToolRouterAdapter implements ToolRouterContract {
   }
 
   async execute(request: ToolCallRequest): Promise<ToolResultEnvelope> {
+    // 在最外层一次绑定父调用身份，成功、准入拒绝、取消和异常都不能丢失关联。
+    // 只快照身份字段，不冻结宿主持有的 request/runtime 资源。
+    const parentCallId = request.parentCallId;
+    const envelope = await this.#executeCall(request);
+    return parentCallId === undefined ? envelope : { ...envelope, parentCallId };
+  }
+
+  async #executeCall(request: ToolCallRequest): Promise<ToolResultEnvelope> {
     const startedAt = new Date().toISOString();
     const callId = randomUUID();
     const t0 = Date.now();
@@ -189,13 +197,14 @@ export class ToolRouterAdapter implements ToolRouterContract {
   }
 
   async explain(request: ToolCallRequest): Promise<ToolDecision> {
+    const abortedDecision: ToolDecision = {
+      allowed: false,
+      stage: 'execute',
+      resultStatus: 'aborted',
+      reason: 'Tool call aborted before execution',
+    };
     if (request.abortSignal?.aborted) {
-      return {
-        allowed: false,
-        stage: 'execute',
-        resultStatus: 'aborted',
-        reason: 'Tool call aborted before execution',
-      };
+      return abortedDecision;
     }
     const parsed = this.router.parseToolCall(request.toolId, request.args);
     if ('error' in parsed) {
@@ -203,11 +212,17 @@ export class ToolRouterAdapter implements ToolRouterContract {
     }
 
     try {
-      return this.router.explain(parsed, {
-        runtime: request.runtime,
-        toolAvailability: this.#contextFactory.getAvailability?.(request.runtime),
-      });
+      const toolAvailability = this.#contextFactory.getAvailability?.(request.runtime);
+      // explain 同样经过宿主回调；取消后的允许决策不能再向调用方广告可执行性。
+      if (request.abortSignal?.aborted) {
+        return abortedDecision;
+      }
+      const decision = this.router.explain(parsed, { runtime: request.runtime, toolAvailability });
+      return request.abortSignal?.aborted ? abortedDecision : decision;
     } catch (err: unknown) {
+      if (request.abortSignal?.aborted) {
+        return abortedDecision;
+      }
       return {
         allowed: false,
         stage: 'discover',

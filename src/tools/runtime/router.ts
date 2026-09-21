@@ -28,6 +28,7 @@ import {
 } from '#tools/kernel/toolSelection.js';
 import { toolAdmissionFailure } from './admission.js';
 import { describeToolAvailability } from './availability.js';
+import { validateToolParameters } from './parameters.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
 import { createToolRegistryView, toolAvailabilityError } from './selection.js';
 
@@ -73,7 +74,7 @@ export class ToolRouter {
         reason: `Unknown tool action: ${call.tool}.${call.action}`,
       };
     }
-    const paramError = validateParams(call, spec.actions[call.action]);
+    const paramError = validateToolParameters(call, spec.actions[call.action], ctx.runtime);
     if (paramError) {
       return { allowed: false, stage: 'discover', reason: paramError };
     }
@@ -182,6 +183,9 @@ export class ToolRouter {
       if (ctx.abortSignal?.aborted) {
         return fail('Tool execution aborted before scheduling');
       }
+      // 调用声明属于本次执行：等待 slot 时外部不能改目标或嵌套参数，让已选 handler
+      // 借另一个 action 的权限执行。ctx/capability 保持 live，排队撤权仍在下方重检。
+      call = { tool: call.tool, action: call.action, params: structuredClone(call.params) };
       const spec = this.getToolSpec(call.tool);
       const action =
         spec && Object.hasOwn(spec.actions, call.action) ? spec.actions[call.action] : undefined;
@@ -411,70 +415,8 @@ export class ToolRouter {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  参数 Schema 校验 — 轻量内联，不依赖 ajv                             */
-/* ------------------------------------------------------------------ */
-
-function validateParams(call: ParsedToolCall, action: ToolAction): string | null {
-  if (!isParamObject(call.params)) {
-    return `Invalid params for ${call.tool}.${call.action}: expected object`;
-  }
-  const schema = action.params as {
-    required?: string[];
-    properties?: Record<string, { type?: string; enum?: unknown[] }>;
-  };
-
-  if (schema.required) {
-    for (const field of schema.required) {
-      if (call.params[field] === undefined || call.params[field] === null) {
-        return `Missing required param "${field}" for ${call.tool}.${call.action}`;
-      }
-    }
-  }
-
-  if (schema.properties) {
-    for (const [key, val] of Object.entries(call.params)) {
-      const prop = schema.properties[key];
-      if (!prop) {
-        continue;
-      }
-      if (prop.type && !matchesParamType(val, prop.type)) {
-        return `Invalid type for ${call.tool}.${call.action}.${key}: expected ${String(prop.type)}`;
-      }
-      if (prop.enum && !prop.enum.includes(val)) {
-        return (
-          `Invalid value "${String(val)}" for ${call.tool}.${call.action}.${key}. ` +
-          `Expected: ${prop.enum.join(', ')}`
-        );
-      }
-    }
-  }
-
-  return null;
-}
-
 function isParamObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function matchesParamType(value: unknown, type: string | string[]): boolean {
-  if (Array.isArray(type)) {
-    return type.some((candidate) => matchesParamType(value, candidate));
-  }
-  switch (type) {
-    case 'object':
-      return isParamObject(value);
-    case 'array':
-      return Array.isArray(value);
-    case 'integer':
-      return Number.isSafeInteger(value);
-    case 'number':
-      return typeof value === 'number' && Number.isFinite(value);
-    case 'null':
-      return value === null;
-    default:
-      return typeof value === type;
-  }
 }
 
 /* ------------------------------------------------------------------ */

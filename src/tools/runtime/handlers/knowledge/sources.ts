@@ -134,19 +134,11 @@ export function evaluatePreparedItem(
   ctx: Pick<ToolContext, 'projectRoot'>,
   dimensionId?: string
 ) {
-  const violations = runInProcessRecipeAuthoringGate(prepared.item as Record<string, unknown>, {
+  // unsafe coreCode 已在 prepare 中移除；此时剩余违规来自真实保留字段，必须交还 Core 裁决。
+  // 不能因曾出现坏片段而过滤 SOURCE_REF_* 或其它片段的 SNIPPET_MISMATCH，否则添加垃圾
+  // coreCode 反而会让不存在/越界的来源通过。剥除片段的诊断仍保留在 prepared.codeEvidence。
+  return runInProcessRecipeAuthoringGate(prepared.item as Record<string, unknown>, {
     projectRoot: ctx.projectRoot,
     dimensionId,
   });
-  if (prepared.codeEvidence.accepted) {
-    return violations;
-  }
-  const pendingCodes = new Set([
-    'SNIPPET_MISMATCH',
-    'SOURCE_REF_INVALID',
-    'SOURCE_REF_LINE_MISSING',
-    'SOURCE_REF_LINE_OUT_OF_RANGE',
-    'SOURCE_REF_NOT_FOUND',
-  ]);
-  return violations.filter((violation) => !pendingCodes.has(violation.code));
 }

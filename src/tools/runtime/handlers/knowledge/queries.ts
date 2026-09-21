@@ -1,4 +1,5 @@
 /** 知识 search、prime、detail 的只读查询与受限投影。 */
+import { runOperation } from '#shared/operation.js';
 import { KNOWLEDGE_SEARCH_DEFAULT_KIND, type KnowledgeReadPort } from '#tools/kernel/knowledge.js';
 import {
   estimateTokens,
@@ -66,11 +67,20 @@ export async function handleSearch(
   }
 
   try {
-    const results = await engine.search(query, { limit, kind, category });
+    // 只读端口没有 signal 参数；取消只结束本次等待，迟到结果由 operation 消费。
+    const read = await runOperation(() => engine.search(query, { limit, kind, category }), {
+      abortSignal: ctx.abortSignal,
+    });
     const aborted = abortedKnowledgeResult(ctx, 'search');
     if (aborted) {
       return aborted;
     }
+    if (read.status !== 'ok') {
+      throw read.error instanceof Error
+        ? read.error
+        : new Error(String(read.error ?? `Knowledge search ${read.status}`));
+    }
+    const results = read.value;
     const items = results.map((r: SearchResult) => ({
       id: r.id,
       title: r.title,
@@ -127,11 +137,19 @@ export async function handlePrime(
 
   try {
     const query = [taskGoal, ...keywords].join(' ');
-    const results = await engine.search(query, { limit: limit * 2, kind: 'all' });
+    const read = await runOperation(() => engine.search(query, { limit: limit * 2, kind: 'all' }), {
+      abortSignal: ctx.abortSignal,
+    });
     const aborted = abortedKnowledgeResult(ctx, 'prime');
     if (aborted) {
       return aborted;
     }
+    if (read.status !== 'ok') {
+      throw read.error instanceof Error
+        ? read.error
+        : new Error(String(read.error ?? `Knowledge prime ${read.status}`));
+    }
+    const results = read.value;
     const top = results
       .slice()
       .sort((a: SearchResult, b: SearchResult) => b.score - a.score)
@@ -143,7 +161,17 @@ export async function handlePrime(
       let detail: Record<string, unknown> | null = null;
       if (canRead) {
         try {
-          detail = await repo.getById(hit.id);
+          const detailRead = await runOperation(() => repo.getById(hit.id), {
+            abortSignal: ctx.abortSignal,
+          });
+          if (detailRead.status !== 'ok') {
+            throw detailRead.error instanceof Error
+              ? detailRead.error
+              : new Error(
+                  String(detailRead.error ?? `Knowledge prime detail ${detailRead.status}`)
+                );
+          }
+          detail = detailRead.value;
         } catch (err: unknown) {
           detail = null;
           // prime 的详情增强仍可降级到搜索摘要，但能力失败需要可观察，不能静默回落旧仓储。
@@ -230,11 +258,17 @@ export async function handleDetail(
   }
 
   try {
-    const recipe = await repo.getById(id);
+    const read = await runOperation(() => repo.getById(id), { abortSignal: ctx.abortSignal });
     const aborted = abortedKnowledgeResult(ctx, 'detail');
     if (aborted) {
       return aborted;
     }
+    if (read.status !== 'ok') {
+      throw read.error instanceof Error
+        ? read.error
+        : new Error(String(read.error ?? `Knowledge detail ${read.status}`));
+    }
+    const recipe = read.value;
     if (!recipe) {
       return fail(`Recipe not found: ${id}`);
     }

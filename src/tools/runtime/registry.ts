@@ -18,6 +18,7 @@ import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
 import { handle as handleMeta } from './handlers/meta.js';
 import { handle as handleTerminal } from './handlers/terminal.js';
+import { DIMENSION_SUBMIT_REQUIREMENT_NOTE, dimensionSubmitParameters } from './parameters.js';
 import { createToolRegistryView } from './selection.js';
 
 /**
@@ -446,6 +447,7 @@ const KNOWLEDGE_SPEC: ToolSpec = {
           limit: {
             type: 'integer',
             minimum: 1,
+            maximum: Number.MAX_SAFE_INTEGER,
             description:
               'review-queue only: positive integer cap on entries returned (oldest-first)',
           },
@@ -877,27 +879,15 @@ export function applyDimensionSubmitSchemaVariant(
         | Record<string, unknown>
         | undefined
     )?.params as Record<string, unknown> | undefined;
-    const props = params?.properties as Record<string, unknown> | undefined;
-    const reasoning = props?.reasoning as Record<string, unknown> | undefined;
-    if (!props || !reasoning) {
+    const variant = params ? dimensionSubmitParameters(params, 'model') : null;
+    if (!variant) {
       return schema;
     }
-    reasoning.required = ['evidenceRefs'];
+    ((clone.parameters as Record<string, unknown>).properties as Record<string, unknown>).params =
+      variant;
     // run-9 残余①：provider（DeepSeek）对深层嵌套 required 执行弱——把要求同时上提到
     // 工具 description 顶层观感位，双通道强化（schema 结构面 + 描述面）。
-    clone.description = `${String(clone.description ?? '')} [REQUIRED every submit: params.reasoning.evidenceRefs — cite [evidence] E-x ids from tool results]`;
-    const reasoningProps = reasoning.properties as Record<string, unknown> | undefined;
-    const sources = reasoningProps?.sources as Record<string, unknown> | undefined;
-    if (sources) {
-      sources.description =
-        'Auto-expanded from evidenceRefs by the ledger — do NOT hand-write. Only fill real file:line when citing search/terminal-class evidence entries that carry no file range.';
-    }
-    props.scope = {
-      type: 'string',
-      enum: ['narrow', 'module', 'project'],
-      description:
-        'Evidence-breadth self-declaration. Use "narrow" when evidence spans <3 distinct files (single-file/local rule).',
-    };
+    clone.description = `${String(clone.description ?? '')}${DIMENSION_SUBMIT_REQUIREMENT_NOTE}`;
     return clone;
   });
 }

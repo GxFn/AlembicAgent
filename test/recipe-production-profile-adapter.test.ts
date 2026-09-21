@@ -18,9 +18,11 @@ import {
   parseKnowledgeMarkdown,
   RecipeProductionGateway,
 } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
 import { createTempProject } from './helpers/tempProject.js';
 
 function makeProject() {
@@ -187,6 +189,23 @@ function fakePort(readiness: RetrievalReadinessReport) {
       },
     },
   };
+}
+
+function submitThroughAdapter(
+  projectRoot: string,
+  recipeGateway: unknown,
+  params: Record<string, unknown> = submitParams()
+) {
+  const adapter = new ToolRouterAdapter({
+    contextFactory: { create: () => ({ projectRoot, tokenBudget: 8000, recipeGateway }) },
+  });
+  return adapter.execute({
+    toolId: 'knowledge',
+    args: { action: 'submit', params },
+    surface: 'runtime',
+    actor: { role: 'agent' },
+    source: { kind: 'runtime', name: 'production-receipt-fixture' },
+  });
 }
 
 const readyReport: RetrievalReadinessReport = {
@@ -1056,7 +1075,7 @@ describe('Agent Recipe production profile adapter', () => {
       description:
         'The ImportType caller invokes a module while consuming only its type dependency.',
       coreCode: 'export const invented = missingSource();',
-      reasoning: { sources: ['src/a.ts:99-100'] },
+      reasoning: { sources: ['src/a.ts:2-3'] },
     });
     const first = await handleKnowledge(
       'submit',
@@ -1231,6 +1250,62 @@ describe('Agent Recipe production profile adapter', () => {
     expect(result.data).not.toHaveProperty('description');
     expect(evaluateReadiness).toHaveBeenCalledExactlyOnceWith('recipe-confirmed');
     expect(save).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    'raw getter',
+    'missing-details logger',
+  ])('retains the confirmed created wrapper when its optional %s fails', async (failure) => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const gateway = {
+      ...fake.port,
+      createOrStage: async (input: RecipeProductionInput, context: ProducerContext) => {
+        const result = await fake.port.createOrStage(input, context);
+        return {
+          ...result,
+          created: result.created.map((created) => ({
+            ...created,
+            raw:
+              failure === 'missing-details logger'
+                ? null
+                : Object.defineProperty({ ...created.raw }, 'description', {
+                    get() {
+                      throw new Error('Fixture optional detail unavailable');
+                    },
+                  }),
+          })),
+        };
+      },
+    };
+    const warn =
+      failure === 'missing-details logger'
+        ? vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+            throw new Error('Fixture post-commit logger unavailable');
+          })
+        : undefined;
+    try {
+      const result = await submitThroughAdapter(projectRoot, gateway);
+      expect(fake.calls).toHaveLength(1);
+      expect(result).toMatchObject({
+        ok: true,
+        status: 'success',
+        structuredContent: {
+          status: 'created',
+          id: 'recipe-1',
+          candidateId: 'recipe-1',
+          lifecycle: 'staging',
+          readiness: readyReport,
+        },
+        diagnostics: { degraded: true },
+      });
+      expect(result.diagnostics.warnings).toContainEqual(
+        expect.objectContaining({ code: 'KNOWLEDGE_CREATED_DETAILS_UNAVAILABLE' })
+      );
+      expect(result.structuredContent).not.toHaveProperty('description');
+    } finally {
+      warn?.mockRestore();
+    }
   });
 
   test('invalid Core readiness blocks publish with structured evidence and no lifecycle mutation', async () => {
@@ -1709,20 +1784,6 @@ describe('Agent Recipe production profile adapter', () => {
         coreCode: '# Design\nUse import type for type-only dependencies.',
       },
     ],
-    [
-      'out-of-range citation',
-      {
-        reasoning: { sources: ['src/a.ts:99-100'] },
-        coreCode: 'export const count = 1;',
-      },
-    ],
-    [
-      'bare citation',
-      {
-        reasoning: { sources: ['src/a.ts'] },
-        coreCode: 'export const count = 1;',
-      },
-    ],
   ])('%s cannot inject code but preserves an independently grounded profile', async (_name, override) => {
     const projectRoot = makeProject();
     const fake = fakePort(readyReport);
@@ -1813,6 +1874,75 @@ describe('Agent Recipe production profile adapter', () => {
       }
     } finally {
       fs.rmSync(outsidePath, { force: true });
+    }
+  });
+
+  test('uses the real document source behind a code alias without losing its declared provenance', async () => {
+    const projectRoot = makeProject();
+    const code = submitParams().coreCode;
+    fs.writeFileSync(
+      path.join(projectRoot, 'docs/design.md'),
+      `# Design\n${code}\nDocumentation footer`
+    );
+    fs.symlinkSync('../docs/design.md', path.join(projectRoot, 'src/document-link.ts'));
+    for (const source of ['docs/design.md:2-3', 'src/document-link.ts:2-3']) {
+      const fake = fakePort(readyReport);
+      const params = submitParams({
+        sourceRefs: [source],
+        reasoning: { whyStandard: 'Documented source fact.', sources: [source], confidence: 0.95 },
+      });
+      const result = await submitThroughAdapter(projectRoot, fake.port, params);
+      expect(fake.calls).toHaveLength(1);
+      expect(result.ok).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        status: 'created',
+        coreCode: '',
+        codeEvidence: { accepted: false, reason: 'unbounded-or-unrelated' },
+      });
+      expect(fake.calls[0].input.items[0]).toMatchObject({
+        coreCode: '',
+        reasoning: { sources: [source] },
+        retrievalProfile: { provenance: { evidenceRefs: [source] } },
+      });
+    }
+  });
+
+  test.each([
+    { source: 'src/not-present.ts:2-3', code: 'SOURCE_REF_NOT_FOUND' },
+    { source: 'src/a.ts:2-999', code: 'SOURCE_REF_LINE_OUT_OF_RANGE' },
+    { source: 'src/a.ts', code: 'SOURCE_REF_LINE_MISSING' },
+    { source: '../outside.ts:2-3', code: 'SOURCE_REF_INVALID' },
+    {
+      source: 'src/a.ts:2-3',
+      code: 'SNIPPET_MISMATCH',
+      pattern: 'export const notInSources = true;',
+    },
+  ])('does not bypass Core $code by adding an unsafe coreCode', async ({
+    source,
+    code,
+    pattern,
+  }) => {
+    const projectRoot = makeProject();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      for (const coreCode of ['', 'export const fabricatedEvidence = true;']) {
+        const fake = fakePort(readyReport);
+        const params = submitParams({
+          coreCode,
+          sourceRefs: [source],
+          reasoning: { whyStandard: 'Fixture source claim.', sources: [source], confidence: 0.95 },
+          ...(pattern ? { content: { ...submitParams().content, pattern } } : {}),
+        });
+        const result = await submitThroughAdapter(projectRoot, fake.port, params);
+        expect(fake.calls).toHaveLength(0);
+        expect(result).toMatchObject({ ok: false, status: 'error' });
+        expect(result.text).toContain(code);
+        if (coreCode) {
+          expect(warn).toHaveBeenCalledWith(expect.stringContaining('unsafe coreCode removed'));
+        }
+      }
+    } finally {
+      warn.mockRestore();
     }
   });
 });

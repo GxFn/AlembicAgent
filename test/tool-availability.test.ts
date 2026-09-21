@@ -21,6 +21,67 @@ function request(
 }
 
 describe('schema, introspection, and static execution admission', () => {
+  it('keeps safe-integer admission for the review queue limit before host allocation', async () => {
+    const listReviewQueue = vi.fn(async () => []);
+    const create = vi.fn(() => ({
+      projectRoot: process.cwd(),
+      tokenBudget: 4000,
+      stagingManager: { listReviewQueue },
+    }));
+    const adapter = new ToolRouterAdapter({ contextFactory: { create } });
+    const invalid = request('knowledge', 'manage', {
+      operation: 'review-queue',
+      limit: Number.MAX_SAFE_INTEGER + 1,
+    });
+    expect((await adapter.explain(invalid)).allowed).toBe(false);
+    expect(await adapter.execute(invalid)).toMatchObject({
+      ok: false,
+      structuredContent: { code: 'TOOL_CALL_INVALID', writeState: 'not-started' },
+    });
+    expect(
+      (
+        await adapter.explain(
+          request('knowledge', 'manage', {
+            operation: 'review-queue',
+            limit: Number.MAX_SAFE_INTEGER,
+          })
+        )
+      ).allowed
+    ).toBe(true);
+    expect(create).not.toHaveBeenCalled();
+    expect(listReviewQueue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    false,
+    true,
+  ])('reports aborted when availability cancels an explanation (throws=%s)', async (throws) => {
+    const controller = new AbortController();
+    const create = vi.fn(() => ({ projectRoot: process.cwd(), tokenBudget: 4000 }));
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create,
+        getAvailability: () => {
+          controller.abort('fixture cancellation');
+          if (throws) {
+            throw new Error('fixture availability failed after cancellation');
+          }
+          return { actions: { memory: ['save'] } };
+        },
+      },
+    });
+    const decision = await adapter.explain({
+      ...request('memory', 'save', { key: 'fixture', content: 'fixture' }),
+      abortSignal: controller.signal,
+    });
+    expect(decision).toMatchObject({
+      allowed: false,
+      stage: 'execute',
+      resultStatus: 'aborted',
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(
     ['capability', 'runtime', 'availability'].flatMap((source) =>
       [

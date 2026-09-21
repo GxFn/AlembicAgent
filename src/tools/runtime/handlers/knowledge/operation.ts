@@ -1,6 +1,7 @@
 /** 知识操作的取消检查和已完成写入诊断；不承诺回滚无 signal 的宿主端口。 */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import {
   fail,
   type ToolContext,
@@ -17,7 +18,11 @@ export function abortedKnowledgeResult(
     return null;
   }
   const message = `Knowledge ${stage} aborted before the next operation`;
-  Logger.getInstance().warn(`[knowledge] ${message}`);
+  // 取消事实不受诊断通道影响；包括返回 rejected Promise 的宿主日志实现。
+  observeSafely(
+    () => Logger.getInstance().warn(`[knowledge] ${message}`),
+    () => undefined
+  );
   return fail(message);
 }
 
@@ -29,7 +34,11 @@ export function completedMutationMeta(
     return undefined;
   }
   const message = `Knowledge ${stage} completed after cancellation; the confirmed write is retained`;
-  Logger.getInstance().warn(`[knowledge] ${message}`);
+  // 日志只是观察者；真实写回执的 warning 仍保留取消事实，日志失败不递归报告或改写结果。
+  observeSafely(
+    () => Logger.getInstance().warn(`[knowledge] ${message}`),
+    () => undefined
+  );
   return {
     degraded: true,
     diagnosticWarnings: [

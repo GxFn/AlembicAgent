@@ -1,5 +1,6 @@
 /** Core 确认创建后的只读 readiness 与会话投影；附加失败不能抹掉持久化回执。 */
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { runOperation } from '#shared/operation.js';
 import {
   ok,
@@ -30,7 +31,14 @@ export async function completeCreatedSubmission(
   const recordPostCommitWarning = (code: string, err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     diagnosticWarnings.push({ code, message, stage: 'knowledge.submit', tool: 'knowledge' });
-    Logger.getInstance().warn(`[knowledge.submit] persisted ${created.id}; ${code}: ${message}`);
+    // 警告已写入真实回执；日志通道的同步/异步失败不得再进入 submission 的失败分支。
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          `[knowledge.submit] persisted ${created.id}; ${code}: ${message}`
+        ),
+      () => undefined
+    );
   };
   let readiness: Awaited<ReturnType<RecipeGatewayLike['evaluateReadiness']>> | undefined;
   try {
@@ -64,8 +72,10 @@ export async function completeCreatedSubmission(
         readinessBox.recipeReadinessReports = [...reports, readinessEvidence];
       }
       if (!readiness.ready) {
-        Logger.getInstance().warn(
-          `[knowledge.submit] candidate persisted as ${created.lifecycle} with Core readiness violations for "${String(item.title ?? '')}": ${readiness.violations.map((violation) => violation.code).join(', ')}`
+        const message = `[knowledge.submit] candidate persisted as ${created.lifecycle} with Core readiness violations for "${String(item.title ?? '')}": ${readiness.violations.map((violation) => violation.code).join(', ')}`;
+        observeSafely(
+          () => Logger.getInstance().warn(message),
+          () => undefined
         );
       }
     } catch (err: unknown) {
@@ -104,7 +114,7 @@ export async function completeCreatedSubmission(
     }
   }
   // Core 先确认 created 身份，再补写关系；补写读回可能为空，不能据此抹掉创建事实。
-  const persistedReview = created.raw == null ? {} : projectPersistedRecipeReview(created.raw);
+  let persistedReview: Record<string, unknown> = {};
   if (created.raw == null) {
     recordPostCommitWarning(
       'KNOWLEDGE_CREATED_DETAILS_UNAVAILABLE',
@@ -112,6 +122,13 @@ export async function completeCreatedSubmission(
         'Core confirmed the created identity but returned no persisted details; keep the identity and read back details without creating again'
       )
     );
+  } else {
+    try {
+      persistedReview = projectPersistedRecipeReview(created.raw);
+    } catch (err: unknown) {
+      // Core wrapper 已确认身份；实体的可选 getter/详情读取失败只降级详情，不重做 create。
+      recordPostCommitWarning('KNOWLEDGE_CREATED_DETAILS_UNAVAILABLE', err);
+    }
   }
   return ok(
     {

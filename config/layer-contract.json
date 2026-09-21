@@ -50,7 +50,10 @@
       "src/ai/transport/sdkProtocol.ts",
       "src/ai/transport/sdkContinuation.ts",
       "src/ai/transport/sdkContext.ts",
-      "src/tools/kernel/manifest.ts"
+      "src/tools/kernel/manifest.ts",
+      "src/tools/runtime/parameters.ts",
+      "src/tools/runtime/handlers/graph.ts",
+      "src/tools/runtime/compressor/"
     ],
     "runtimeImports": {
       "src/ai/AiProviderManager.ts": [
@@ -187,7 +190,8 @@
       ],
       "src/tools/runtime/handlers/knowledge/operation.ts": [
         "@alembic/core/logging",
-        "src/tools/kernel/registry.ts"
+        "src/tools/kernel/registry.ts",
+        "src/shared/observers.ts"
       ],
       "src/tools/runtime/handlers/knowledge/sessionState.ts": [
         "src/tools/runtime/handlers/knowledge/input.ts"
@@ -202,7 +206,8 @@
       "src/tools/runtime/handlers/knowledge/queries.ts": [
         "src/tools/kernel/knowledge.ts",
         "src/tools/kernel/registry.ts",
-        "src/tools/runtime/handlers/knowledge/operation.ts"
+        "src/tools/runtime/handlers/knowledge/operation.ts",
+        "src/shared/operation.ts"
       ],
       "src/tools/runtime/handlers/knowledge/management.ts": [
         "src/shared/operation.ts",
@@ -237,7 +242,8 @@
         "@alembic/core/logging",
         "src/shared/operation.ts",
         "src/tools/kernel/registry.ts",
-        "src/tools/runtime/handlers/knowledge/sessionState.ts"
+        "src/tools/runtime/handlers/knowledge/sessionState.ts",
+        "src/shared/observers.ts"
       ],
       "src/tools/runtime/handlers/knowledge.ts": [
         "@alembic/core/knowledge",
@@ -279,7 +285,46 @@
       ],
       "src/agent/production/strict/primitives.ts": ["node:crypto"],
       "src/ai/transport/sdkContext.ts": ["node:crypto", "src/shared/serialization.ts"],
-      "src/tools/kernel/manifest.ts": []
+      "src/tools/kernel/manifest.ts": [],
+      "src/tools/runtime/parameters.ts": ["ajv"],
+      "src/tools/runtime/handlers/graph.ts": ["src/shared/operation.ts","src/tools/kernel/registry.ts"],
+      "src/tools/runtime/compressor/OutputCompressor.ts": [
+        "@alembic/core/logging",
+        "src/shared/observers.ts",
+        "src/tools/runtime/compressor/strip.ts",
+        "src/tools/runtime/compressor/parsers/GitStatusParser.ts",
+        "src/tools/runtime/compressor/parsers/GitDiffParser.ts",
+        "src/tools/runtime/compressor/parsers/GitLogParser.ts",
+        "src/tools/runtime/compressor/parsers/TestOutputParser.ts",
+        "src/tools/runtime/compressor/parsers/LintOutputParser.ts",
+        "src/tools/runtime/compressor/parsers/GrepParser.ts",
+        "src/tools/runtime/compressor/parsers/TreeParser.ts",
+        "src/tools/runtime/compressor/parsers/PackageParser.ts"
+      ],
+      "src/tools/runtime/compressor/strip.ts": [],
+      "src/tools/runtime/compressor/index.ts": [
+        "src/tools/runtime/compressor/OutputCompressor.ts",
+        "src/tools/runtime/compressor/parsers/index.ts",
+        "src/tools/runtime/compressor/strip.ts"
+      ],
+      "src/tools/runtime/compressor/parsers/GitDiffParser.ts": [],
+      "src/tools/runtime/compressor/parsers/GitLogParser.ts": [],
+      "src/tools/runtime/compressor/parsers/GitStatusParser.ts": [],
+      "src/tools/runtime/compressor/parsers/GrepParser.ts": [],
+      "src/tools/runtime/compressor/parsers/LintOutputParser.ts": [],
+      "src/tools/runtime/compressor/parsers/PackageParser.ts": [],
+      "src/tools/runtime/compressor/parsers/TestOutputParser.ts": [],
+      "src/tools/runtime/compressor/parsers/TreeParser.ts": [],
+      "src/tools/runtime/compressor/parsers/index.ts": [
+        "src/tools/runtime/compressor/parsers/GitDiffParser.ts",
+        "src/tools/runtime/compressor/parsers/GitLogParser.ts",
+        "src/tools/runtime/compressor/parsers/GitStatusParser.ts",
+        "src/tools/runtime/compressor/parsers/GrepParser.ts",
+        "src/tools/runtime/compressor/parsers/LintOutputParser.ts",
+        "src/tools/runtime/compressor/parsers/PackageParser.ts",
+        "src/tools/runtime/compressor/parsers/TestOutputParser.ts",
+        "src/tools/runtime/compressor/parsers/TreeParser.ts"
+      ]
     }
   },
   "cycleFindings": [

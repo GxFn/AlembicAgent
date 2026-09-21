@@ -127,7 +127,9 @@ function readProjectSourceEvidence(ref: string, projectRoot: string): ProjectSou
       ? {
           ref: `${relative}:${start}-${end}`,
           content,
-          documentation: isDocumentationPath(relative),
+          // 分类依据受控解析后的真实来源；src 下的符号链接不能把文档提升为代码证据。
+          // ref 仍保留调用方声明的有界引用，便于沿原引用追溯。
+          documentation: isDocumentationPath(path.relative(realRoot, realFile)),
           wholeFile: start === 1 && end === lines.length,
         }
       : null;

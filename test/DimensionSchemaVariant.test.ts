@@ -35,7 +35,7 @@ describe('M1a 维度 submit schema 变体（契约面=校验面）', () => {
     // 运行时闸 EVIDENCE_REFS_REQUIRED 的广告面
     expect(vReasoning.required).toEqual(['evidenceRefs']);
     // scope 自声明通道（证据驱动收窄 gate 读 item.scope）
-    expect((vProps.scope as R).enum).toContain('narrow');
+    expect((vProps.scope as R).enum).toEqual(['narrow', 'module', 'project']);
     expect(String(((vReasoning.properties as R).sources as R).description)).toContain(
       'Auto-expanded'
     );
