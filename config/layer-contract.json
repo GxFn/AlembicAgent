@@ -49,7 +49,8 @@
       "src/ai/transport/DeepSeekTransport.ts",
       "src/ai/transport/sdkProtocol.ts",
       "src/ai/transport/sdkContinuation.ts",
-      "src/ai/transport/sdkContext.ts"
+      "src/ai/transport/sdkContext.ts",
+      "src/tools/kernel/manifest.ts"
     ],
     "runtimeImports": {
       "src/ai/AiProviderManager.ts": [
@@ -128,7 +129,11 @@
       "src/tools/runtime/selection.ts": ["src/tools/kernel/toolSelection.ts"],
       "src/tools/runtime/availability.ts": ["src/tools/runtime/registry.ts"],
       "src/tools/runtime/admission.ts": [],
-      "src/tools/catalog/schemaQuery.ts": ["src/tools/kernel/toolSelection.ts"],
+      "src/tools/catalog/schemaQuery.ts": [
+        "@alembic/core/logging",
+        "src/shared/observers.ts",
+        "src/tools/kernel/toolSelection.ts"
+      ],
       "src/agent/runtime/ToolExecutionPipeline.ts": [
         "src/agent/runtime/toolPipeline/accessGates.ts",
         "src/agent/runtime/toolPipeline/duplicateCache.ts",
@@ -273,7 +278,8 @@
         "src/agent/production/strict/primitives.ts"
       ],
       "src/agent/production/strict/primitives.ts": ["node:crypto"],
-      "src/ai/transport/sdkContext.ts": ["node:crypto", "src/shared/serialization.ts"]
+      "src/ai/transport/sdkContext.ts": ["node:crypto", "src/shared/serialization.ts"],
+      "src/tools/kernel/manifest.ts": []
     }
   },
   "cycleFindings": [

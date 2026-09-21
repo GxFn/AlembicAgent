@@ -1,12 +1,50 @@
 import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
 import type { ToolAction, ToolRegistry } from '#tools/kernel/registry.js';
 import type { ToolSelection } from '#tools/kernel/toolSchema.js';
-import { isToolActionAllowed, normalizeToolActions } from '#tools/kernel/toolSelection.js';
+import {
+  isToolActionAllowed,
+  isToolActionAllowlist,
+  isToolStringList,
+  normalizeToolActions,
+} from '#tools/kernel/toolSelection.js';
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+/** 查询和执行共用宿主约束校验；参数枚举不继承动作合同的 null 通配语义。 */
+export function toolAvailabilityError(
+  availability: ToolAvailabilitySnapshot | undefined
+): string | null {
+  if (availability === undefined) {
+    return null;
+  }
+  const snapshot = record(availability);
+  if (!snapshot || !isToolActionAllowlist(snapshot.actions)) {
+    return 'Invalid tool availability: expected an action allowlist';
+  }
+  if (snapshot.parameters === undefined) {
+    return null;
+  }
+  const tools = record(snapshot.parameters);
+  if (tools) {
+    const valid = Object.values(tools).every((tool) => {
+      const actions = record(tool);
+      return (
+        actions &&
+        Object.values(actions).every((action) => {
+          const parameters = record(action);
+          return parameters && Object.values(parameters).every(isToolStringList);
+        })
+      );
+    });
+    if (valid) {
+      return null;
+    }
+  }
+  return 'Invalid tool availability: expected parameter string enums';
 }
 
 function freezeSchema(value: unknown): void {
@@ -77,6 +115,10 @@ export function createToolRegistryView(
   selection?: ToolSelection,
   availability?: ToolAvailabilitySnapshot
 ): ToolRegistry {
+  const availabilityError = toolAvailabilityError(availability);
+  if (availabilityError) {
+    throw new Error(availabilityError);
+  }
   const selected = normalizeToolActions(
     selection,
     Object.fromEntries(

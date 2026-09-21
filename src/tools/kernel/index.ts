@@ -16,6 +16,7 @@ export type {
 export * from './context.js';
 export * from './decision.js';
 export * from './handler.js';
+export type * from './manifest.js';
 export * from './presenter.js';
 export * from './registry.js';
 export * from './request.js';
@@ -23,6 +24,7 @@ export * from './result.js';
 export * from './routing.js';
 export type {
   ToolActionAllowlist,
+  ToolSchemaProjection,
   ToolSchemaQuery,
   ToolSchemaQueryPort,
   ToolSchemaQueryResult,

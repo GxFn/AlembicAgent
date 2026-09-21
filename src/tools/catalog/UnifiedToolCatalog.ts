@@ -15,20 +15,19 @@
 
 import { CapabilityCatalog } from '#tools/catalog/CapabilityCatalog.js';
 import type {
-  CapabilityKind,
-  ToolCapabilityManifest,
-  ToolExecutionProfile,
-  ToolGovernanceProfile,
-  ToolRiskProfile,
-  ToolSchemaProjection,
-} from '#tools/catalog/CapabilityManifest.js';
-import type {
   InternalToolHandler,
   InternalToolHandlerEntry,
   InternalToolHandlerStore,
   ToolRouterContract,
 } from '#tools/kernel/index.js';
-import type { ToolSchemaQuery } from '#tools/kernel/toolSchema.js';
+import type {
+  CapabilityKind,
+  ToolCapabilityManifest,
+  ToolExecutionProfile,
+  ToolGovernanceProfile,
+  ToolRiskProfile,
+} from '#tools/kernel/manifest.js';
+import type { ToolSchemaProjection, ToolSchemaQuery } from '#tools/kernel/toolSchema.js';
 
 // ── Types inlined from deleted ToolDefinition.ts ──
 
@@ -88,24 +87,31 @@ function definitionToManifest(def: ToolDefinition): ToolCapabilityManifest {
   };
 }
 
-function definitionToSchemaProjection(def: ToolDefinition, model?: string): ToolSchemaProjection {
-  const override = model ? matchModelOverride(def, model) : undefined;
+function definitionToSchemaProjection(
+  def: ToolDefinition,
+  model?: string,
+  apiModelId?: string
+): ToolSchemaProjection {
+  const override = model ? matchModelOverride(def, model, apiModelId) : undefined;
   return {
     name: def.id,
     description: override?.description ?? def.description,
-    parameters: override?.inputSchema ?? def.inputSchema,
+    parameters: structuredClone(override?.inputSchema ?? def.inputSchema),
   };
 }
 
 function matchModelOverride(
   def: ToolDefinition,
-  model: string
+  model: string,
+  apiModelId?: string
 ): { description?: string; inputSchema?: Record<string, unknown> } | undefined {
   if (!def.modelOverrides) {
     return undefined;
   }
   for (const [pattern, override] of Object.entries(def.modelOverrides)) {
-    if (matchGlob(model, pattern)) {
+    // 只使用调用方明确提供的 API 身份；旧裸 id 可含冒号，目录不能自行猜测/拆分。
+    // 同一项同时接受两种名称并沿用声明顺序，不能让后面的 '*' 抢走首个匹配。
+    if (matchGlob(model, pattern) || (apiModelId !== undefined && matchGlob(apiModelId, pattern))) {
       return override;
     }
   }
@@ -277,7 +283,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     }
     const def = this.#defs.get(manifest.id);
     return def && query.model
-      ? definitionToSchemaProjection(def, query.model)
+      ? definitionToSchemaProjection(def, query.model, query.apiModelId)
       : super.projectSchema(manifest, { ...query, mode: 'full' });
   }
 

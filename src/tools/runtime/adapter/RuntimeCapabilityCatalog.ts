@@ -9,11 +9,11 @@
  *   { name: "code", description: "...", parameters: { action: enum, params: ... } }
  */
 
-import type { ToolSchemaProjection } from '#tools/catalog/CapabilityManifest.js';
 import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
 import type { ToolRuntimeCallContext } from '#tools/kernel/context.js';
 import type {
   ToolActionAllowlist,
+  ToolSchemaProjection,
   ToolSchemaQuery,
   ToolSchemaQueryPort,
   ToolSchemaQueryResult,

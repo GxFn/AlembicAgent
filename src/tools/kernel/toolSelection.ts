@@ -1,15 +1,40 @@
 import type { ToolActionAllowlist, ToolSelection } from './toolSchema.js';
 
+/** 动作和参数枚举共用字符串列表校验；Array.from 保留 holes 的非法 undefined 事实。 */
+export function isToolStringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && Array.from(value).every((item) => typeof item === 'string');
+}
+
 /** 仅验证显式动作合同；非法声明不能回落旧 tools 列表扩大权限。 */
 export function isToolActionAllowlist(value: unknown): value is ToolActionAllowlist {
   return (
     value !== null &&
     typeof value === 'object' &&
     !Array.isArray(value) &&
-    Object.values(value).every(
-      (actions) =>
-        actions == null ||
-        (Array.isArray(actions) && actions.every((action) => typeof action === 'string'))
+    Object.values(value).every((actions) => actions == null || isToolStringList(actions))
+  );
+}
+
+/**
+ * 在调用宿主查询前固定授权事实；只复制声明，不克隆 runtime 资源。
+ * 顶层 null/undefined 是 selection 的不限制语义，不能用于验证完整 allowlist 合同。
+ */
+export function snapshotToolSelection(selection: ToolSelection): ToolSelection {
+  if (selection == null) {
+    return selection;
+  }
+  if (isToolStringList(selection)) {
+    return Object.freeze([...selection]);
+  }
+  if (!isToolActionAllowlist(selection)) {
+    throw new Error('Invalid tool selection: expected tool ids or an action allowlist');
+  }
+  return Object.freeze(
+    Object.fromEntries(
+      Object.entries(selection).map(([tool, actions]) => [
+        tool,
+        actions == null ? actions : Object.freeze([...actions]),
+      ])
     )
   );
 }
@@ -19,8 +44,9 @@ export function selectToolActions(
   selection: ToolSelection,
   registeredTools: readonly string[]
 ): ToolActionAllowlist {
-  const ids = Array.isArray(selection) ? new Set(selection) : null;
-  const selected = selection as ToolActionAllowlist | null | undefined;
+  const snapshot = snapshotToolSelection(selection);
+  const ids = Array.isArray(snapshot) ? new Set(snapshot) : null;
+  const selected = snapshot as ToolActionAllowlist | null | undefined;
   const entries: Array<[string, readonly string[] | null]> = [];
   for (const tool of registeredTools) {
     if (ids ? !ids.has(tool) : selected != null && !Object.hasOwn(selected, tool)) {
@@ -62,7 +88,7 @@ export function isToolActionAllowed(
   tool: string,
   action?: string
 ): boolean {
-  if (!Object.hasOwn(allowlist, tool)) {
+  if (!isToolActionAllowlist(allowlist) || !Object.hasOwn(allowlist, tool)) {
     return false;
   }
   const actions = allowlist[tool];
@@ -76,6 +102,9 @@ export function intersectToolActions(
   left: ToolActionAllowlist,
   right: ToolActionAllowlist
 ): ToolActionAllowlist {
+  if (!isToolActionAllowlist(left) || !isToolActionAllowlist(right)) {
+    throw new Error('Invalid tool action allowlist');
+  }
   const entries: Array<[string, readonly string[] | null]> = [];
   for (const [tool, leftActions] of Object.entries(left)) {
     if (!Object.hasOwn(right, tool)) {

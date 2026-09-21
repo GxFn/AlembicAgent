@@ -112,6 +112,19 @@ export class ToolRouterAdapter implements ToolRouterContract {
       }
 
       const toolAvailability = this.#contextFactory.getAvailability?.(request.runtime);
+      // 能力查询是宿主同步边界；其中的取消必须先于 context 分配及后续执行生效。
+      if (request.abortSignal?.aborted) {
+        return {
+          ...this.#errorEnvelope(
+            request.toolId,
+            callId,
+            startedAt,
+            'Tool call aborted during availability lookup',
+            Date.now() - t0
+          ),
+          status: 'aborted',
+        };
+      }
       const decision = this.router.explain(parsed, { runtime: request.runtime, toolAvailability });
       if (!decision.allowed) {
         return this.#toEnvelope(

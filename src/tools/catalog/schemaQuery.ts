@@ -1,4 +1,6 @@
 /** 新查询端口的唯一消费入口；旧方法探测保留在这一处兼容，不散落在 Runtime。 */
+import Logger from '@alembic/core/logging';
+import { isThenable, observeSafely } from '#shared/observers.js';
 import type {
   ToolActionAllowlist,
   ToolSchemaProjection,
@@ -9,6 +11,7 @@ import {
   intersectToolActions,
   isToolActionAllowlist,
   selectToolActions,
+  snapshotToolSelection,
 } from '#tools/kernel/toolSelection.js';
 
 interface LegacySchemaCatalog {
@@ -32,6 +35,18 @@ interface LegacySchemaCatalog {
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertSynchronousResult(value: unknown, method: string): void {
+  if (!isThenable(value)) {
+    return;
+  }
+  // 下面同步拒绝违约端口；这里只观察 Promise 的迟到失败，不能等待它并开放工具。
+  observeSafely(
+    () => value,
+    () => undefined
+  );
+  throw new Error(`Schema query method ${method} must return synchronously`);
 }
 
 function isSchemas(value: unknown): value is ToolSchemaProjection[] {
@@ -88,11 +103,16 @@ export function queryToolSchemas(
   query: ToolSchemaQuery,
   onLegacy: (method: string) => void
 ): ToolSchemaQueryResult {
+  // 宿主投影和诊断都可能改写入参；授权只看调用前的自有快照，不重新读取外部 query。
+  const selection = snapshotToolSelection(query.selection);
+  // 仅复制声明数据；runtime 内的 ledger/coordinator 等活跃资源仍保持原身份。
+  const portQuery = { ...query, selection: structuredClone(selection) };
   if (!record(catalog)) {
     return { schemas: [], allowedTools: {} };
   }
   if (typeof catalog.querySchemas === 'function') {
-    const result: unknown = catalog.querySchemas(query);
+    const result: unknown = catalog.querySchemas(portQuery);
+    assertSynchronousResult(result, 'querySchemas');
     if (
       !record(result) ||
       !isSchemas(result.schemas) ||
@@ -115,7 +135,7 @@ export function queryToolSchemas(
       throw new Error('Invalid ToolSchemaQueryPort unavailable reasons');
     }
     const requested = selectToolActions(
-      query.selection,
+      selection,
       result.schemas.map((schema) => schema.name)
     );
     const allowedTools = intersectToolActions(requested, result.allowedTools);
@@ -134,11 +154,11 @@ export function queryToolSchemas(
 
   const legacy = catalog as LegacySchemaCatalog;
   const actions =
-    query.selection && !Array.isArray(query.selection)
-      ? (query.selection as ToolActionAllowlist)
+    portQuery.selection && !Array.isArray(portQuery.selection)
+      ? (portQuery.selection as ToolActionAllowlist)
       : undefined;
-  const ids = Array.isArray(query.selection)
-    ? query.selection
+  const ids = Array.isArray(portQuery.selection)
+    ? portQuery.selection
     : actions
       ? Object.keys(actions).filter((id) => actions[id] == null || (actions[id]?.length ?? 0) > 0)
       : null;
@@ -162,12 +182,20 @@ export function queryToolSchemas(
   } else {
     return { schemas: [], allowedTools: {} };
   }
-  onLegacy(method);
+  assertSynchronousResult(schemas, method);
+  // 兼容路径通知只做观察；日志失败不能改变查询结果，也不能逃逸为未处理拒绝。
+  observeSafely(
+    () => onLegacy(method),
+    () =>
+      Logger.getInstance().warn(
+        '[ToolSchemaQuery] legacy_diagnostic_failed; query result and authorization retained'
+      )
+  );
   if (!isSchemas(schemas)) {
     throw new Error(`Invalid legacy schema result from ${method}`);
   }
   const allowedTools = selectToolActions(
-    query.selection,
+    selection,
     schemas.map((schema) => schema.name)
   );
   const narrowed = narrowSchemas(schemas, allowedTools);

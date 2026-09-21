@@ -21,11 +21,15 @@ import type {
 } from '#tools/kernel/registry.js';
 import { estimateTokens, fail } from '#tools/kernel/registry.js';
 import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
-import { intersectToolActions, isToolActionAllowed } from '#tools/kernel/toolSelection.js';
+import {
+  intersectToolActions,
+  isToolActionAllowed,
+  isToolActionAllowlist,
+} from '#tools/kernel/toolSelection.js';
 import { toolAdmissionFailure } from './admission.js';
 import { describeToolAvailability } from './availability.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
-import { createToolRegistryView } from './selection.js';
+import { createToolRegistryView, toolAvailabilityError } from './selection.js';
 
 export interface RouterConfig {
   capability?: CapabilityDef;
@@ -79,7 +83,9 @@ export class ToolRouter {
         allowed: false,
         stage: 'approve',
         resultStatus: 'blocked',
-        reason: `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`,
+        reason: isToolActionAllowlist(capability.allowedTools)
+          ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`
+          : 'Permission denied: invalid capability action allowlist',
       };
     }
     if (
@@ -90,10 +96,21 @@ export class ToolRouter {
         allowed: false,
         stage: 'approve',
         resultStatus: 'blocked',
-        reason: `Permission denied: Action "${call.tool}.${call.action}" not allowed in the current stage`,
+        reason: isToolActionAllowlist(ctx.runtime.allowedTools)
+          ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in the current stage`
+          : 'Permission denied: invalid stage action allowlist',
       };
     }
     const availability = ctx.toolAvailability;
+    const availabilityError = toolAvailabilityError(availability);
+    if (availabilityError) {
+      return {
+        allowed: false,
+        stage: 'execute',
+        resultStatus: 'blocked',
+        reason: availabilityError,
+      };
+    }
     if (
       availability &&
       Object.hasOwn(availability.actions, call.tool) &&
@@ -137,6 +154,13 @@ export class ToolRouter {
   #selection(ctx: Pick<ToolContext, 'runtime'>): ToolActionAllowlist | undefined {
     const configured = this.#config.capability?.allowedTools;
     const stage = ctx.runtime?.allowedTools;
+    // 完整授权合同不采用 selection 顶层 null 的“不限制”语义。
+    if (
+      (this.#config.capability && !isToolActionAllowlist(configured)) ||
+      (stage !== undefined && !isToolActionAllowlist(stage))
+    ) {
+      throw new Error('Invalid tool action allowlist');
+    }
     return configured && stage ? intersectToolActions(configured, stage) : (stage ?? configured);
   }
 
@@ -201,6 +225,10 @@ export class ToolRouter {
             ? { commandAllowlist: this.#config.capability.commandAllowlist }
             : {}),
         };
+        // 宿主可用性/上下文回调可能同步取消；最终副作用入口必须重新检查。
+        if (ctx.abortSignal?.aborted) {
+          return fail('Tool execution aborted before handler');
+        }
         const result = await action.handler(call.params, handlerCtx);
 
         if (result._meta) {

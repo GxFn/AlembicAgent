@@ -2,9 +2,9 @@ import type {
   CapabilityLifecycle,
   CapabilitySurface,
   ToolCapabilityManifest,
-  ToolSchemaProjection,
-} from '#tools/catalog/CapabilityManifest.js';
+} from '#tools/kernel/manifest.js';
 import type {
+  ToolSchemaProjection,
   ToolSchemaQuery,
   ToolSchemaQueryPort,
   ToolSchemaQueryResult,
@@ -97,7 +97,10 @@ export class CapabilityCatalog implements ToolSchemaQueryPort {
       description: lightweight
         ? manifest.description.split('\n')[0].slice(0, 120)
         : manifest.description,
-      parameters: lightweight ? { type: 'object', properties: {} } : manifest.inputSchema,
+      // 投影由调用方拥有；编辑本轮 JSON schema 不能反写注册合同或后续查询。
+      parameters: lightweight
+        ? { type: 'object', properties: {} }
+        : structuredClone(manifest.inputSchema),
     };
   }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ToolAvailabilitySnapshot } from '../src/tools/kernel/availability.js';
 import type { ToolCallRequest } from '../src/tools/kernel/request.js';
+import type { ToolActionAllowlist } from '../src/tools/kernel/toolSchema.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import { ToolRouter } from '../src/tools/runtime/router.js';
@@ -20,6 +21,215 @@ function request(
 }
 
 describe('schema, introspection, and static execution admission', () => {
+  it.each(
+    ['capability', 'runtime', 'availability'].flatMap((source) =>
+      [
+        { kind: 'string', value: { memory: 'save' } },
+        { kind: 'mixed array', value: { memory: ['save', null] } },
+        {
+          kind: 'sparse array',
+          value: { memory: Object.assign(new Array<string>(2), { 0: 'save' }) },
+        },
+        { kind: 'null contract', value: null },
+      ].map((entry) => ({ source, ...entry }))
+    )
+  )('rejects malformed $source $kind before host allocation or writes', async ({
+    source,
+    value,
+  }) => {
+    // 模拟跨宿主边界的不可信声明；显式完整授权合同不能使用 selection 的顶层 null 语义。
+    const allowedTools = value as unknown as ToolActionAllowlist;
+    const save = vi.fn();
+    const create = vi.fn(() => ({
+      projectRoot: process.cwd(),
+      tokenBudget: 4000,
+      sessionStore: { save },
+    }));
+    const adapter = new ToolRouterAdapter({
+      ...(source === 'capability'
+        ? { capability: { name: 'fixture', description: 'fixture', allowedTools } }
+        : {}),
+      contextFactory: {
+        create,
+        ...(source === 'availability'
+          ? { getAvailability: () => ({ actions: allowedTools }) }
+          : {}),
+      },
+    });
+    const call = {
+      ...request('memory', 'save', { key: 'fixture', content: 'fixture' }),
+      ...(source === 'runtime' ? { runtime: { allowedTools } } : {}),
+    };
+    const result = await adapter.execute(call);
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect((await adapter.explain(call)).allowed).toBe(false);
+    expect(create).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { kind: 'string', values: 'update' },
+    { kind: 'mixed array', values: ['update', null] },
+    { kind: 'sparse array', values: Object.assign(new Array<string>(2), { 0: 'update' }) },
+    { kind: 'null enum', values: null },
+  ])('rejects a malformed host parameter $kind in both query and execution', async ({ values }) => {
+    // 宿主参数约束只允许字符串枚举，不能借用动作 allowlist 的 null 通配语义。
+    const availability = {
+      actions: { knowledge: ['manage'] },
+      parameters: { knowledge: { manage: { operation: values } } },
+    } as unknown as ToolAvailabilitySnapshot;
+    const update = vi.fn(async () => undefined);
+    const create = vi.fn(() => ({
+      projectRoot: process.cwd(),
+      tokenBudget: 4000,
+      knowledgeManagement: { update },
+    }));
+    const getAvailability = () => availability;
+    const adapter = new ToolRouterAdapter({ contextFactory: { create, getAvailability } });
+    const result = await adapter.execute(
+      request('knowledge', 'manage', {
+        operation: 'update',
+        id: 'fixture',
+        data: { title: 'fixture' },
+      })
+    );
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect(create).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    const catalog = new RuntimeCapabilityCatalog({ availability: getAvailability });
+    expect(() => catalog.querySchemas({ selection: { knowledge: ['manage'] } })).toThrow(
+      'Invalid tool availability'
+    );
+  });
+
+  it.each([
+    { phase: 'preflight availability', abortAtRead: 1, abortAtCreate: false, allocations: 0 },
+    { phase: 'context allocation', abortAtRead: 0, abortAtCreate: true, allocations: 1 },
+    { phase: 'slot availability', abortAtRead: 2, abortAtCreate: false, allocations: 1 },
+  ])('does not proceed after cancellation inside $phase', async ({
+    abortAtRead,
+    abortAtCreate,
+    allocations,
+  }) => {
+    const controller = new AbortController();
+    const save = vi.fn();
+    let reads = 0;
+    const create = vi.fn(() => {
+      if (abortAtCreate) {
+        controller.abort('fixture cancellation');
+      }
+      return { projectRoot: process.cwd(), tokenBudget: 4000, sessionStore: { save } };
+    });
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create,
+        getAvailability: () => {
+          if (++reads === abortAtRead) {
+            controller.abort('fixture cancellation');
+          }
+          return { actions: { memory: ['save'] } };
+        },
+      },
+    });
+    const result = await adapter.execute({
+      ...request('memory', 'save', { key: 'fixture', content: 'fixture' }),
+      abortSignal: controller.signal,
+    });
+    expect(result).toMatchObject({ ok: false, status: 'aborted' });
+    expect(create).toHaveBeenCalledTimes(allocations);
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'capability',
+    'runtime',
+    'availability',
+  ])('preserves wildcard, empty, and own-key semantics for valid %s contracts', async (source) => {
+    const cases: Array<{ allowedTools: ToolActionAllowlist; permitted: boolean }> = [
+      { allowedTools: { memory: null }, permitted: true },
+      { allowedTools: { memory: undefined }, permitted: true },
+      { allowedTools: { memory: [] }, permitted: false },
+      { allowedTools: {}, permitted: source === 'availability' },
+      {
+        allowedTools: Object.create({ memory: ['save'] }) as ToolActionAllowlist,
+        permitted: source === 'availability',
+      },
+    ];
+    for (const { allowedTools, permitted } of cases) {
+      const save = vi.fn();
+      const adapter = new ToolRouterAdapter({
+        ...(source === 'capability'
+          ? { capability: { name: 'fixture', description: 'fixture', allowedTools } }
+          : {}),
+        contextFactory: {
+          create: () => ({ projectRoot: process.cwd(), tokenBudget: 4000, sessionStore: { save } }),
+          ...(source === 'availability'
+            ? { getAvailability: () => ({ actions: allowedTools }) }
+            : {}),
+        },
+      });
+      const result = await adapter.execute({
+        ...request('memory', 'save', { key: 'fixture', content: 'fixture' }),
+        ...(source === 'runtime' ? { runtime: { allowedTools } } : {}),
+      });
+      expect(result.ok).toBe(permitted);
+      expect(save).toHaveBeenCalledTimes(permitted ? 1 : 0);
+    }
+  });
+
+  it.each([
+    'capability',
+    'runtime',
+  ])('rechecks changed %s action permissions when a queued writer gains its slot', async (source) => {
+    let finishUpdate!: () => void;
+    let updateStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      updateStarted = resolve;
+    });
+    const updateGate = new Promise<void>((resolve) => {
+      finishUpdate = resolve;
+    });
+    const reject = vi.fn(async () => undefined);
+    const allowedTools = { knowledge: ['manage'] };
+    const runtime = source === 'runtime' ? { allowedTools } : undefined;
+    const adapter = new ToolRouterAdapter({
+      ...(source === 'capability'
+        ? { capability: { name: 'fixture', description: 'fixture', allowedTools } }
+        : {}),
+      contextFactory: {
+        create: () => ({
+          projectRoot: process.cwd(),
+          tokenBudget: 4000,
+          knowledgeManagement: {
+            update: async () => {
+              updateStarted();
+              await updateGate;
+            },
+            reject,
+          },
+        }),
+      },
+    });
+    const first = adapter.execute({
+      ...request('knowledge', 'manage', {
+        operation: 'update',
+        id: 'fixture',
+        data: { title: 'next' },
+      }),
+      runtime,
+    });
+    await started;
+    const second = adapter.execute({
+      ...request('knowledge', 'manage', { operation: 'reject', id: 'fixture' }),
+      runtime,
+    });
+    allowedTools.knowledge = [];
+    finishUpdate();
+    expect((await first).ok).toBe(true);
+    expect(await second).toMatchObject({ ok: false, status: 'blocked' });
+    expect(reject).not.toHaveBeenCalled();
+  });
+
   it.each([
     { tool: 'terminal', action: 'exec', params: { command: 'fixture' } },
     { tool: 'code', action: 'write', params: { path: 'fixture.ts', content: 'fixture' } },

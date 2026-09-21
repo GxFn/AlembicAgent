@@ -2288,6 +2288,9 @@ export class AgentRuntime {
       {
         selection: toolContract.actions,
         model,
+        // 这里的 model 来自明确的 modelRef（provider:model）；API id 可继续包含冒号。
+        // catalog 的旧直接调用只拿到裸字符串，不能在那里猜测 provider 身份。
+        apiModelId: model.slice(model.indexOf(':') + 1),
         mode: 'mixed',
         firstRound: expandedCount === 0,
         runtime,

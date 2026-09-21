@@ -1,7 +1,7 @@
 /** 只读 snapshot 结果的准入与复用；失败结果、可变状态读取和副作用调用不能进入缓存。 */
 import { stableStringify } from '#shared/serialization.js';
-import type { ToolCapabilityManifest } from '#tools/catalog/CapabilityManifest.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
+import type { ToolCapabilityManifest } from '#tools/kernel/manifest.js';
 import { readToolObservation } from '../../utils/toolOutcomes.js';
 import { getToolAction } from './callNormalization.js';
 import type {

@@ -1,7 +1,9 @@
+import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { CapabilityCatalog } from '../src/tools/catalog/CapabilityCatalog.js';
+import { queryToolSchemas } from '../src/tools/catalog/schemaQuery.js';
 import {
   type ToolDefinition,
   UnifiedToolCatalog,
@@ -9,7 +11,11 @@ import {
 import type { ToolAvailabilitySnapshot } from '../src/tools/kernel/availability.js';
 import type { ToolRuntimeCallContext } from '../src/tools/kernel/context.js';
 import type { ToolCallRequest } from '../src/tools/kernel/request.js';
-import type { ToolSelection } from '../src/tools/kernel/toolSchema.js';
+import type {
+  ToolActionAllowlist,
+  ToolSchemaQuery,
+  ToolSelection,
+} from '../src/tools/kernel/toolSchema.js';
 import { intersectToolActions, isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { getActionNames } from '../src/tools/runtime/index.js';
@@ -228,6 +234,110 @@ function genericDefinition(): ToolDefinition {
 }
 
 describe('generic schema query compatibility', () => {
+  it('keeps a legacy bare model ID containing a colon intact', () => {
+    const definition = genericDefinition();
+    definition.modelOverrides = {
+      latest: { description: 'unrelated suffix model' },
+      'qwen2:latest': { description: 'complete bare API model ID' },
+    };
+    const catalog = new UnifiedToolCatalog([definition]);
+    expect(catalog.toToolSchemasForModel(['demo.echo'], 'qwen2:latest')[0].description).toBe(
+      'complete bare API model ID'
+    );
+    expect(catalog.toMixedSchemas(['demo.echo'], 'qwen2:latest', true)[0].description).toBe(
+      'complete bare API model ID'
+    );
+  });
+
+  it.each([
+    'base',
+    'model-override',
+  ])('owns nested JSON schema data returned by a %s projection', (kind) => {
+    const definition = genericDefinition();
+    const schema = {
+      type: 'object',
+      required: ['value'],
+      properties: { value: { type: 'string', enum: ['original'] } },
+    };
+    definition.inputSchema = schema;
+    definition.modelOverrides = { 'fixture-*': { inputSchema: schema } };
+    const unified = new UnifiedToolCatalog([definition]);
+    const catalog =
+      kind === 'base'
+        ? new CapabilityCatalog([
+            {
+              ...definition,
+              owner: 'fixture',
+              lifecycle: 'active',
+              surfaces: ['runtime'],
+              evals: { required: false, cases: [] },
+            },
+          ])
+        : unified;
+    const query = {
+      selection: ['demo.echo'],
+      model: kind === 'model-override' ? 'fixture-model' : undefined,
+    };
+    const expected = structuredClone(schema);
+    const first = queryToolSchemas(catalog, query, () => {}).schemas[0].parameters as typeof schema;
+    first.required.push('injected');
+    first.properties.value.enum.push('injected');
+    expect(queryToolSchemas(catalog, query, () => {}).schemas[0].parameters).toEqual(expected);
+    expect(schema).toEqual(expected);
+    expect(unified.getDefinition('demo.echo')).toBe(definition);
+    expect(unified.getHandler('demo.echo')).toBe(definition.handler);
+  });
+
+  it.each([
+    { provider: 'openai', model: 'gpt-4o', pattern: 'gpt-*' },
+    { provider: 'openai', model: 'gpt-4o', pattern: 'openai:gpt-*' },
+    { provider: 'ollama', model: 'qwen2:latest', pattern: 'qwen2:latest' },
+    { provider: 'ollama', model: 'qwen2:latest', pattern: 'ollama:qwen2:*' },
+  ])('applies $pattern through the real Runtime model reference', async ({
+    provider,
+    model,
+    pattern,
+  }) => {
+    const definition = genericDefinition();
+    definition.modelOverrides = {
+      [pattern]: {
+        description: 'matched override',
+        inputSchema: {
+          type: 'object',
+          required: ['compact'],
+          properties: { compact: { type: 'boolean' } },
+        },
+      },
+      '*': { description: 'later fallback must not hide the first match' },
+    };
+    class FlatCapability extends ReadCapability {
+      get allowedTools(): unknown {
+        return { 'demo.echo': ['invoke'] };
+      }
+      get tools() {
+        return ['demo.echo'];
+      }
+    }
+    const { runtime, chatWithTools } = runtimeWith(
+      new UnifiedToolCatalog([definition]),
+      new FlatCapability(),
+      { name: provider, model }
+    );
+    chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
+    await runtime.reactLoop('model override fixture');
+    expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual([
+      {
+        name: 'demo.echo',
+        description: 'matched override',
+        parameters: {
+          type: 'object',
+          required: ['compact'],
+          properties: { compact: { type: 'boolean' } },
+        },
+      },
+    ]);
+  });
+
   it('keeps flat schemas and selected action words without inventing a builtin action envelope', () => {
     const definition = genericDefinition();
     const catalog = new CapabilityCatalog([
@@ -290,7 +400,11 @@ class ReadCapability extends Capability {
   }
 }
 
-function runtimeWith(catalog: unknown, capability = new ReadCapability()) {
+function runtimeWith(
+  catalog: unknown,
+  capability = new ReadCapability(),
+  identity?: { name: string; model: string }
+) {
   const execute = vi.fn(async (request: ToolCallRequest) => ({
     ok: true,
     status: 'success',
@@ -317,7 +431,7 @@ function runtimeWith(catalog: unknown, capability = new ReadCapability()) {
     })
     .mockResolvedValue({ text: 'done' });
   const runtime = new AgentRuntime({
-    aiProvider: { name: 'mock', chatWithTools } as never,
+    aiProvider: { name: 'mock', ...identity, chatWithTools } as never,
     container: { get: () => catalog },
     toolRegistry: new RuntimeCapabilityCatalog() as never,
     toolRouter: { execute } as never,
@@ -328,6 +442,142 @@ function runtimeWith(catalog: unknown, capability = new ReadCapability()) {
 }
 
 describe('runtime schema query port', () => {
+  it.each([
+    'sync',
+    'async',
+  ])('isolates a %s legacy diagnostic observer without changing the query authorization', async (mode) => {
+    const native = new RuntimeCapabilityCatalog();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = queryToolSchemas(
+        { toToolSchemas: () => native.toToolSchemas(['code', 'graph']) },
+        { selection: { code: ['read'] } },
+        () => {
+          const error = new Error('fixture-private-diagnostic-detail');
+          if (mode === 'async') {
+            return Promise.reject(error);
+          }
+          throw error;
+        }
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(result.allowedTools).toEqual({ code: ['read'] });
+      expect(actionsOf(result.schemas)).toEqual([{ tool: 'code', actions: ['read'] }]);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('legacy_diagnostic_failed'));
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('fixture-private-diagnostic-detail');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    { port: 'modern', rejects: false },
+    { port: 'modern', rejects: true },
+    { port: 'legacy', rejects: false },
+    { port: 'legacy', rejects: true },
+  ])('rejects the asynchronous $port contract (rejects=$rejects) without running the model or host', async ({
+    port,
+    rejects,
+  }) => {
+    const value = () =>
+      rejects
+        ? Promise.reject(new Error('fixture asynchronous schema rejection'))
+        : Promise.resolve(port === 'modern' ? { schemas: [], allowedTools: {} } : []);
+    const catalog = port === 'modern' ? { querySchemas: value } : { toToolSchemas: value };
+    const { runtime, execute, chatWithTools } = runtimeWith(catalog);
+    await expect(runtime.reactLoop('invalid async port')).rejects.toThrow(/synchronous/);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'modern',
+    'legacy',
+    'diagnostic',
+  ])('keeps the original stage mask when the %s boundary changes its query input', async (boundary) => {
+    const native = new RuntimeCapabilityCatalog();
+    let observedActions: ToolActionAllowlist | undefined;
+    const catalog =
+      boundary === 'modern'
+        ? {
+            querySchemas(query: ToolSchemaQuery) {
+              query.selection = { code: null };
+              return native.querySchemas(query);
+            },
+          }
+        : {
+            toMixedSchemasForActions(actions: ToolActionAllowlist) {
+              observedActions = actions;
+              if (boundary === 'legacy') {
+                // JS 宿主可能原地归一化入参；不能因此改变调用者的授权快照。
+                (actions as Record<string, null>).code = null;
+              }
+              return native.toToolSchemasForActions(actions);
+            },
+          };
+    class OnlyReadCapability extends ReadCapability {
+      get allowedTools(): unknown {
+        return { code: ['read'] };
+      }
+    }
+    const { runtime, execute, chatWithTools } = runtimeWith(catalog, new OnlyReadCapability());
+    const info = vi.spyOn(runtime.logger, 'info').mockImplementation((message: string) => {
+      if (
+        boundary === 'diagnostic' &&
+        message.includes('legacy schema query adapter') &&
+        observedActions
+      ) {
+        (observedActions as Record<string, null>).code = null;
+      }
+    });
+    try {
+      await runtime.reactLoop('read-only fixture');
+    } finally {
+      info.mockRestore();
+    }
+    expect(execute.mock.calls.map(([call]) => call.args.action)).toEqual(['read']);
+    expect(execute.mock.calls[0]?.[0].runtime?.allowedTools).toEqual({ code: ['read'] });
+    expect(actionsOf(chatWithTools.mock.calls[0]?.[1].toolSchemas ?? [])).toEqual([
+      { tool: 'code', actions: ['read'] },
+    ]);
+  });
+
+  it.each([
+    'modern',
+    'legacy',
+    'diagnostic',
+  ])('isolates tool IDs before invoking a %s schema boundary', (boundary) => {
+    const native = new RuntimeCapabilityCatalog();
+    const selected = ['code'];
+    const catalog =
+      boundary === 'modern'
+        ? {
+            querySchemas(query: ToolSchemaQuery) {
+              (query.selection as string[]).push('graph');
+              return native.querySchemas(query);
+            },
+          }
+        : {
+            toToolSchemas(ids: string[]) {
+              if (boundary === 'legacy') {
+                ids.push('graph');
+              }
+              return native.toToolSchemas(['code', 'graph']);
+            },
+          };
+    const result = queryToolSchemas(catalog, { selection: selected }, () => {
+      if (boundary === 'diagnostic') {
+        selected.push('graph');
+      }
+    });
+    expect(result.schemas.map(({ name }) => name)).toEqual(['code']);
+    expect(Object.keys(result.allowedTools)).toEqual(['code']);
+    if (boundary !== 'diagnostic') {
+      expect(selected).toEqual(['code']);
+    }
+  });
+
   it('keeps generic flat tools callable without inventing an action argument', async () => {
     const catalog = new CapabilityCatalog([
       {

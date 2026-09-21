@@ -4,7 +4,6 @@
  * host-surface router. Canonical home (formerly src/tools/core/ToolContracts.ts).
  */
 
-import type { CapabilityKind, ToolCapabilityManifest } from '../catalog/CapabilityManifest.js';
 import type {
   ToolActor,
   ToolCallContext,
@@ -14,6 +13,7 @@ import type {
   ToolSurface,
 } from './context.js';
 import type { ToolDecision, ToolExecutionPreview } from './decision.js';
+import type { CapabilityKind, ToolCapabilityManifest } from './manifest.js';
 import type { ToolResultEnvelope } from './result.js';
 
 export interface ToolCallRequest {
