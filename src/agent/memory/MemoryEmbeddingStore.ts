@@ -20,6 +20,8 @@ interface EmbeddingInput {
   content?: string;
 }
 interface EmbeddingStoreOptions {
+  /** 独立 embedding 的模型空间身份；不依赖当前生成模型或连接凭据。 */
+  profileId?: string;
   filePath?: string;
   wz?: WriteZone;
   onDiagnostic?: MemoryReadOptions['onDiagnostic'];
@@ -37,8 +39,16 @@ export class MemoryEmbeddingStore {
   #disposed = false;
   readonly #wz: WriteZone | null;
   readonly #diagnostics: MemoryReadOptions;
+  readonly #profileId: string | undefined;
 
   constructor(projectRoot: string, opts: EmbeddingStoreOptions = {}) {
+    if (
+      opts.profileId !== undefined &&
+      (typeof opts.profileId !== 'string' || !opts.profileId.trim())
+    ) {
+      throw new Error('Embedding profileId must be a non-empty string');
+    }
+    this.#profileId = opts.profileId;
     this.#wz = opts.wz ?? null;
     // 注入 WriteZone 时读写使用同一目标；filePath 仅覆盖直接文件系统模式。
     this.#filePath =
@@ -167,6 +177,15 @@ export class MemoryEmbeddingStore {
         throw new Error('Invalid embedding sidecar');
       }
       const object = data as Record<string, unknown>;
+      if (this.#profileId !== undefined && object.profileId !== this.#profileId) {
+        // 维度相同不等于向量空间相同；旧缓存只跳过读取，不在构造时删除或重写。
+        reportMemoryRead(this.#diagnostics, {
+          phase: 'embedding',
+          status: 'stale',
+          reason: 'embedding-profile-mismatch',
+        });
+        return;
+      }
       const versioned = object.schemaVersion !== undefined;
       if (
         versioned &&
@@ -220,6 +239,7 @@ export class MemoryEmbeddingStore {
     try {
       const content = JSON.stringify({
         schemaVersion: 2,
+        ...(this.#profileId !== undefined ? { profileId: this.#profileId } : {}),
         embeddings: Object.fromEntries(this.#cache),
       });
       if (this.#wz && staged) {

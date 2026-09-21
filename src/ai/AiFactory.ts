@@ -117,7 +117,8 @@ export async function getProviderWithFallback() {
 }
 
 /**
- * 创建独立的 Embedding Provider
+ * 创建独立的 Embedding Provider（旧显式 SDK 调用兼容入口）
+ * @deprecated 产品向量装配使用 Core EmbeddingPort；不要从 LLM 选择或热切换触发此入口。
  *
  * 当 ALEMBIC_EMBED_PROVIDER 被设置时，创建一个专用于 embedding 的 provider 实例，
  * 使 embedding 和 LLM 生成可以使用不同的提供商/模型。

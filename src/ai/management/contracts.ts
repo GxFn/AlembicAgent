@@ -46,8 +46,3 @@ export interface SwitchResult {
 
 /** 切换监听器 */
 export type SwitchListener = (result: SwitchResult) => void;
-
-/** Embedding Fallback 初始化器（注入，避免循环依赖） */
-export type EmbedFallbackInitializer = (
-  currentProvider: ManagedAiProvider
-) => ManagedAiProvider | null;

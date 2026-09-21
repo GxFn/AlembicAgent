@@ -2,7 +2,9 @@
 
 OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本的 Vercel AI SDK provider 处理。既有 Provider、Transport 类名和包入口保持可用；厂商装配与策略留在各 transport，共同消息、结果和错误映射集中在内部 SDK 模块。
 
-| Provider | 生成 | Embedding |
+生产向量使用宿主独立装配的固定 Qwen embedding 服务，复用 Core `EmbeddingPort` / `OllamaEmbedProvider`。下表中的 embedding 方法只保留显式兼容调用，不参与 LLM 自动发现或热切换。
+
+| Provider | 生成 | 显式 embedding 兼容接口 |
 | --- | --- | --- |
 | OpenAI / Ollama | OpenAI SDK，显式选择 chat/responses 协议 | OpenAI SDK |
 | Google | Google SDK 原生协议 | Google SDK，Gateway 按 100 项分批重试 |
@@ -35,14 +37,14 @@ OpenAI、Claude、DeepSeek 的公开 `baseUrl` 保留配置原字符串，SDK �
 
 ## Provider 热切换与计量
 
-`AiProviderManager.switchProvider()` 保留同步接口，按“准备候选与 embedding → 绑定用量 → 发布路由/同步 DI → 失效依赖缓存 → 通知”的顺序执行。准备失败保留旧状态，不通知成功；DI 同步或缓存失效失败时恢复 Manager 旧引用，并用旧 provider/embedding 调用 DI 同步函数补偿。已清理的缓存由宿主按恢复后的路由重新构建，Manager 不会伪造原对象或撤销任意宿主副作用。
+`AiProviderManager.switchProvider()` 保留同步接口，按“准备生成模型 → 绑定用量 → 发布 LLM 路由/同步 DI → 失效 LLM 依赖缓存 → 通知”的顺序执行。准备失败保留旧状态，不通知成功；DI 同步或缓存失效失败时恢复 Manager 旧引用，并用旧 provider/embedding 调用 DI 同步函数补偿。已清理的缓存由宿主按恢复后的路由重新构建，Manager 不会伪造原对象或撤销任意宿主副作用。
 
 切换失败抛出 `AI_PROVIDER_SWITCH_FAILED`，携带 `phase` 和 `recovery`：`not-needed` 表示没有发布新路由，`routing-restored` 表示路由补偿成功，`required` 表示宿主仍需恢复。后者使 `isReady` 为 false，修复接线后的成功切换才能恢复就绪。切换期间的嵌套路由修改抛 `AI_PROVIDER_SWITCH_IN_PROGRESS`。
 
 宿主接入须遵守以下合同：
 
-- embedding 选择器、能力查询、DI 同步和缓存失效函数必须同步。返回 Promise 会被观测并拒绝，在其结束前禁止新路由修改，防止迟到副作用覆盖后续切换。同步 DI 函数应只赋引用，并允许重复传入旧引用；缓存失效函数只清缓存，返回受影响的 key 列表。
-- `setEmbedProvider()` 设置当前 embedding 与计量绑定，不替宿主更新 DI，也不推断它是固定专用配置还是临时 fallback；下一次主 provider 切换仍调用宿主选择器。选择器须自行考虑专用 embedding 的优先级。
+- LLM 能力查询、DI 同步和缓存失效函数必须同步。返回 Promise 会被观测并拒绝，在其结束前禁止新路由修改，防止迟到副作用覆盖后续切换。同步 DI 函数应只赋引用，并允许重复传入旧引用；缓存失效函数只清缓存，返回受影响的 key 列表。
+- 旧 `setEmbedProvider()` / `rawEmbedProvider` 仅保留显式兼容绑定。`embedProvider` 现在可为 `null`，不再返回生成 provider；LLM 切换保持该显式对象。`_bindEmbedFallbackInit` 及其专用类型已退役，Main 的唯一生产消费者已迁移到独立装配。新宿主直接向向量/检索/记忆注入 Core embedding port。
 - 初次启用 AI 和热切换都需要完整装配 Manager、embedding、TokenRecorder 与 DI。启动时没有 provider，不代表后续启用可以跳过这些步骤。
 
 用量绑定保留原有 `_onTokenUsage` 观察者，每个实例仅安装一次；主 provider 与独立 embedding 实例均可接收绑定。旧实例不因切换而卸载，以记录仍在执行的请求。计量优先采用响应里的 provider/model，缺少这些字段时使用绑定时的身份快照。宿主若后来接管回调槽，Manager 会保留该所有权并诊断；宿主需要继续计量时，应转发到原 managed hook，不要依赖 Manager 再次包装。
@@ -115,3 +117,11 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 `test/ai-provider-manager.test.ts` 通过公开 AI 入口覆盖热切换、补偿边界、观察者和计量绑定，并用真实 SDK + 延迟 HTTP fixture 验证切换后的旧请求归属。原 `ai-provider.test.ts` 的 Manager 用例已迁入，后者保留 Provider、模型策略和公共入口测试。
 
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。
+
+## 固定向量空间与宿主迁移
+
+Main 通过独立 embedding env 或 `vector.localEmbedding.enabled` 显式启用服务，支持明确的 `qwen3-embedding:0.6b` / `:4b` / `:8b` 型号；未配置时保留词法检索，不使用 LLM 的 embed 方法补缺。Main 复用 Core 原生 `/api/embed`，补齐官方完整维度并验证每次响应；不拉取模型，也不默认请求维度截断。
+
+LLM 更新保留 embedding、索引、检索服务及 active generation；上下文增强通过稳定 delegate 使用当前 LLM。embedding 配置保存后会报告连接是否需重启、模型空间是否需重建，实际服务不会随 LLM 热切换。仅凭据/endpoint 变化不更换模型空间。索引模型、维度、格式等不匹配时保留旧数据和指针，停止 dense 读取，自动维护只返回迁移计划；通过 Main 显式 dry-run/rebuild 迁移。
+
+Agent memory 的 `EmbeddingFn` 可选参数增加 `inputKind: 'query' | 'document'`，检索和文档回填分别标记用途并携带取消信号。Main 转发到 Core 的 `embedQuery` / `embedDocuments`，保留 Qwen 查询指令格式。`MemoryEmbeddingStore` 新增可选 `profileId`：同维度但不同 profile 的旧缓存不参与召回，旧缓存文件不会在构造时被删除；旧未提供 profile 的直接调用继续兼容。

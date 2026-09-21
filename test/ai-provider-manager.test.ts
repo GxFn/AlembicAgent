@@ -127,7 +127,6 @@ describe('AiProviderManager usage ownership', () => {
     const usage = { inputTokens: 2, outputTokens: 3, totalTokens: 5 };
     initial._onTokenUsage?.(usage);
     embedding._onTokenUsage?.({ ...usage, source: 'embed', model: 'actual-embedding' });
-    manager._bindEmbedFallbackInit(() => embedding);
     manager.switchProvider(provider('next'));
     manager.switchProvider(initial);
     manager.setTokenRecorder({ record });
@@ -173,6 +172,25 @@ describe('AiProviderManager usage ownership', () => {
 });
 
 describe('AiProviderManager routing lifecycle', () => {
+  it('keeps an explicitly configured embedding instance across LLM switches', () => {
+    const embedding = provider('fixed-qwen-embedding');
+    const manager = new AiProviderManager(provider('first-llm'));
+    manager.setEmbedProvider(embedding);
+    const sync = vi.fn();
+    manager._bindDiSync(sync);
+    manager.switchProvider(provider('second-llm'));
+    expect(manager.embedProvider).toBe(embedding);
+    expect(manager.rawEmbedProvider).toBe(embedding);
+    expect(sync).toHaveBeenCalledWith(manager.provider, embedding);
+  });
+
+  it('leaves embedding unavailable when only an LLM provider is configured', () => {
+    const manager = new AiProviderManager(provider('llm-only'));
+    expect(manager.embedProvider).toBeNull();
+    manager.switchProvider(provider('another-llm'));
+    expect(manager.embedProvider).toBeNull();
+  });
+
   it('observes an asynchronous capability rejection and requires repair of the synchronous contract', async () => {
     const initial = provider('initial');
     const manager = new AiProviderManager(initial);
@@ -303,7 +321,7 @@ describe('AiProviderManager routing lifecycle', () => {
     expect(manager.rawEmbedProvider).toBeNull();
     expect(failures).toEqual(['AI_PROVIDER_SWITCH_IN_PROGRESS', 'AI_PROVIDER_SWITCH_IN_PROGRESS']);
     manager.setEmbedProvider(provider('standalone-embedding'));
-    expect(manager.embedProvider.name).toBe('standalone-embedding');
+    expect(manager.embedProvider?.name).toBe('standalone-embedding');
   });
 
   it.each([
@@ -387,9 +405,9 @@ describe('AiProviderManager routing lifecycle', () => {
     manager._bindDiSync(sync);
     manager._bindDependentClearer(clear);
     manager.onSwitch(listener);
-    manager._bindEmbedFallbackInit(() => {
+    next.supportsEmbedding = () => {
       throw new Error('fixture initialization failure');
-    });
+    };
 
     expect(() => manager.switchProvider(next)).toThrow();
     expect(manager.provider).toBe(initial);

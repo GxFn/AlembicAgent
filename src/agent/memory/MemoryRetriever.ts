@@ -77,7 +77,7 @@ export interface AppendEntry {
 /** 嵌入函数签名 — 异步向量嵌入 (返回 float[] 向量) */
 export type EmbeddingFn = (
   text: string,
-  options?: { abortSignal?: AbortSignal }
+  options?: { abortSignal?: AbortSignal; inputKind?: 'query' | 'document' }
 ) => Promise<number[]>;
 
 export class MemoryRetriever {
@@ -142,7 +142,7 @@ export class MemoryRetriever {
     if (this.#embeddingFn) {
       const embeddingFn = this.#embeddingFn;
       const result = await readMemoryValue(
-        (signal) => embeddingFn(query, { abortSignal: signal }),
+        (signal) => embeddingFn(query, { abortSignal: signal, inputKind: 'query' }),
         options
       );
       if (result.status === 'ok' && isMemoryVector(result.value)) {
@@ -385,7 +385,7 @@ export class MemoryRetriever {
         continue;
       }
       const result = await readMemoryValue(
-        (signal) => embeddingFn(content, { abortSignal: signal }),
+        (signal) => embeddingFn(content, { abortSignal: signal, inputKind: 'document' }),
         { ...options, deadlineAt }
       );
       if (result.status === 'ok' && isMemoryVector(result.value)) {
@@ -451,8 +451,8 @@ export class MemoryRetriever {
     const result = await readMemoryValue(
       (signal) =>
         Promise.all([
-          embeddingFn(query, { abortSignal: signal }),
-          embeddingFn(content, { abortSignal: signal }),
+          embeddingFn(query, { abortSignal: signal, inputKind: 'query' }),
+          embeddingFn(content, { abortSignal: signal, inputKind: 'document' }),
         ]),
       options
     );

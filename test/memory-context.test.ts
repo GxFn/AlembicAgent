@@ -35,6 +35,47 @@ afterEach(() => {
 });
 
 describe('MemoryStore', () => {
+  it('labels query and document embedding calls while preserving cancellation', async () => {
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-purpose'));
+    try {
+      const store = new MemoryStore(db);
+      store.add({ content: 'fixed vector space' });
+      const embeddingFn = vi.fn(async () => [1, 0]);
+      const retriever = new MemoryRetriever(store, { embeddingFn, embeddingStore: embeddings });
+      const controller = new AbortController();
+      await retriever.embedAllMemories(10, { abortSignal: controller.signal });
+      await retriever.retrieve('vector', { abortSignal: controller.signal });
+      expect(embeddingFn.mock.calls.map((call) => call[1]?.inputKind)).toEqual([
+        'document',
+        'query',
+      ]);
+      expect(
+        embeddingFn.mock.calls.every((call) => call[1]?.abortSignal instanceof AbortSignal)
+      ).toBe(true);
+    } finally {
+      embeddings.dispose();
+      db.close();
+    }
+  });
+
+  it('does not reuse cached vectors across embedding profiles with the same dimension', () => {
+    const root = makeTempRoot('embedding-profile');
+    const first = new MemoryEmbeddingStore(root, { profileId: 'profile-one' });
+    first.set('memory', [1, 0], 'same content');
+    first.dispose();
+    const same = new MemoryEmbeddingStore(root, { profileId: 'profile-one' });
+    expect(same.get('memory', 'same content')).toEqual([1, 0]);
+    same.dispose();
+    const changed = new MemoryEmbeddingStore(root, { profileId: 'profile-two' });
+    expect(changed.get('memory', 'same content')).toBeNull();
+    changed.dispose();
+    // 丢弃不兼容缓存读取不等于删除磁盘上的旧缓存。
+    expect(
+      JSON.parse(readFileSync(join(root, '.asd/context/memory_embeddings.json'), 'utf8')).profileId
+    ).toBe('profile-one');
+  });
+
   it('revalidates current memory content after the asynchronous query embedding', async () => {
     const db = new Database(':memory:');
     try {

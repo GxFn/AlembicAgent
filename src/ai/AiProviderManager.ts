@@ -1,12 +1,11 @@
 /**
  * AiProviderManager — 宿主可注入的 Provider 路由生命周期。
- * 准备候选 → 同步路由/DI → 失效旧缓存 → 通知；失败仅补偿路由，不能还原缓存。
+ * 准备生成模型 → 同步 LLM 路由/DI → 失效 LLM 依赖缓存 → 通知；失败仅补偿路由，不能还原缓存。
  * 用量绑定由独立 tracker 持有，旧请求完成时仍按其真实模型归档。
  */
 
 import Logger from '@alembic/core/logging';
 import type {
-  EmbedFallbackInitializer,
   ManagedAiProvider,
   ProviderInfo,
   SwitchListener,
@@ -19,7 +18,6 @@ import { ProviderUsageTracker } from './management/ProviderUsageTracker.js';
 // ── 类型 ────────────────────────────────────────────────
 
 export type {
-  EmbedFallbackInitializer,
   ManagedAiProvider,
   ProviderInfo,
   SwitchListener,
@@ -43,9 +41,6 @@ export class AiProviderManager {
   /** DI 容器注入: 清除 AI 依赖 singleton 的回调 */
   #clearDependents: (() => string[]) | null = null;
 
-  /** DI 容器注入: Embedding fallback 初始化器 */
-  #embedFallbackInit: EmbedFallbackInitializer | null = null;
-
   /** DI 数据管道: 切换时同步 singletons 中的 provider 引用（供 DI 工厂函数读取） */
   #syncToDi: ((provider: ManagedAiProvider, embed: ManagedAiProvider | null) => void) | null = null;
 
@@ -64,12 +59,12 @@ export class AiProviderManager {
     return this.#provider;
   }
 
-  /** 当前 Embedding Provider (优先 fallback，回退到主 provider) */
-  get embedProvider(): ManagedAiProvider {
-    return this.#embedProvider ?? this.#provider;
+  /** 独立显式配置；缺席时不把生成模型当作 embedding 服务。 */
+  get embedProvider(): ManagedAiProvider | null {
+    return this.#embedProvider;
   }
 
-  /** 原始 Embedding fallback (可能为 null) */
+  /** 兼容旧读取入口，与 embedProvider 相同。 */
   get rawEmbedProvider(): ManagedAiProvider | null {
     return this.#embedProvider;
   }
@@ -137,7 +132,6 @@ export class AiProviderManager {
     const previousEmbedding = this.#embedProvider;
     const previousRecovery = this.#recoveryRequired;
     // 本次操作使用固定 hooks；回调中重新绑定只影响下一次切换。
-    const selectEmbedding = this.#embedFallbackInit;
     const syncToDi = this.#syncToDi;
     const clearDependents = this.#clearDependents;
     let phase = 'prepare';
@@ -147,15 +141,10 @@ export class AiProviderManager {
     try {
       const previous = this.info;
       const current = this.#providerInfo(newProvider);
-      const embedding = this.#synchronous(selectEmbedding?.(newProvider), 'prepare') ?? null;
-      if (embedding) {
-        this.#providerInfo(embedding);
-      }
+      // 生成模型切换不选择、重建或清空独立 embedding。
+      const embedding = previousEmbedding;
       phase = 'wire';
       undoBindings.push(this.#usageTracker.bind(newProvider));
-      if (embedding) {
-        undoBindings.push(this.#usageTracker.bind(embedding));
-      }
       this.#provider = newProvider;
       this.#embedProvider = embedding;
       published = true;
@@ -287,7 +276,7 @@ export class AiProviderManager {
   //  Embedding 管理
   // ═══════════════════════════════════════════════════════
 
-  /** 设置当前 embedding 并绑定用量；不代替宿主的 DI 同步或专用/fallback 选择政策。 */
+  /** 兼容显式旧配置；新宿主的 embedding 由独立 Core port 管理，不参与 LLM 切换。 */
   setEmbedProvider(ep: ManagedAiProvider | null): void {
     this.#assertRoutingMutable();
     if (ep) {
@@ -326,11 +315,6 @@ export class AiProviderManager {
   /** 注入同步缓存失效函数；不能依赖 Manager 还原被清理的对象。 */
   _bindDependentClearer(fn: () => string[]): void {
     this.#clearDependents = fn;
-  }
-
-  /** 注入同步 embedding 选择器；候选准备期间仍读取到旧路由。 */
-  _bindEmbedFallbackInit(fn: EmbedFallbackInitializer): void {
-    this.#embedFallbackInit = fn;
   }
 
   /** 注入同步 DI 赋值函数；失败补偿可能再次以旧引用调用，须可重复赋值。 */
