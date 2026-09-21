@@ -88,10 +88,25 @@ async function handlePlan(params: Record<string, unknown>, ctx: ToolContext): Pr
   }
 
   if (ctx.sessionStore) {
-    ctx.sessionStore.save('_plan', JSON.stringify({ steps, strategy }), { tags: ['plan'] });
+    await ctx.sessionStore.save('_plan', JSON.stringify({ steps, strategy }), { tags: ['plan'] });
+    return ok({ recorded: true, steps: steps.length, strategy });
   }
 
-  return ok({ recorded: true, steps: steps.length, strategy });
+  // 无状态宿主仍可结构化规划，但不能把工具调用历史冒充 sessionStore 中已保存的计划。
+  return ok(
+    { recorded: false, steps: steps.length, strategy },
+    {
+      degraded: true,
+      diagnosticWarnings: [
+        {
+          code: 'META_PLAN_NOT_PERSISTED',
+          message: 'No session store is bound; the plan was returned without persistence',
+          stage: 'meta.plan',
+          tool: 'meta',
+        },
+      ],
+    }
+  );
 }
 
 /**

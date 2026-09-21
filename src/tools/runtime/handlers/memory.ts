@@ -80,7 +80,8 @@ async function handleSave(params: Record<string, unknown>, ctx: ToolContext): Pr
     meta.category = category;
   }
 
-  ctx.sessionStore.save(key, content, meta);
+  // void 端口也可能由异步宿主实现；完成/失败必须在回执之前明确，不竞速已开始的写入。
+  await ctx.sessionStore.save(key, content, meta);
 
   return ok({ saved: key, size: content.length });
 }

@@ -671,6 +671,207 @@ describe('knowledge host ports through ToolRouterAdapter', () => {
   });
 });
 
+describe('graph and plan host outcomes', () => {
+  function execute(
+    ports: Partial<ToolContext>,
+    toolId: string,
+    args: Record<string, unknown>,
+    abortSignal?: AbortSignal
+  ) {
+    return new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({ projectRoot: process.cwd(), tokenBudget: 4000, ...ports }),
+      },
+    }).execute({
+      toolId,
+      args,
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' },
+      abortSignal,
+    });
+  }
+
+  it('awaits an async graph overview and preserves the host facts', async () => {
+    const overview = { totalFiles: 3, totalClasses: 2, topLevelModules: ['src'] };
+    const result = await execute({ projectGraph: { getOverview: async () => overview } }, 'graph', {
+      action: 'overview',
+    });
+    expect(result.ok).toBe(true);
+    expect(result.structuredContent).toEqual(overview);
+    expect(result.structuredContent).not.toHaveProperty('totalDefinitions');
+  });
+
+  it('reports an asynchronous graph failure through the adapter', async () => {
+    const pending = Promise.reject(new Error('fixture graph read failed'));
+    // RED旧实现会丢掉Promise；测试仍观察其拒绝，避免伪造独立的进程故障。
+    void pending.catch(() => undefined);
+    const result = await execute({ projectGraph: { getOverview: () => pending } }, 'graph', {
+      action: 'overview',
+    });
+    expect(result).toMatchObject({ ok: false, status: 'error' });
+    expect(result.text).toContain('fixture graph read failed');
+  });
+
+  it.each([
+    'class',
+    'callers',
+    'callees',
+    'search',
+  ] as const)('awaits the primary %s query before using its fallback', async (type) => {
+    const primaryName = {
+      class: 'getClassInfo',
+      callers: 'getCallers',
+      callees: 'getCallees',
+      search: 'searchEntities',
+    }[type];
+    const secondaryName = {
+      class: 'queryEntity',
+      callers: 'queryCallGraph',
+      callees: 'queryCallGraph',
+      search: 'search',
+    }[type];
+    const fallback = vi.fn(async () => ({ name: 'Fixture', found: true }));
+    const result = await execute(
+      {
+        // search 的历史优先级与 class/call graph 相反：先查实体图，再查项目图。
+        projectGraph:
+          type === 'search' ? { searchEntities: fallback } : { [primaryName]: async () => null },
+        codeEntityGraph:
+          type === 'search' ? { search: async () => null } : { [secondaryName]: fallback },
+      },
+      'graph',
+      { action: 'query', params: { type, entity: 'Fixture' } }
+    );
+    expect(fallback).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      ok: true,
+      structuredContent: { result: { found: true } },
+      diagnostics: { fallbackUsed: true },
+    });
+  });
+
+  it('distinguishes an unavailable graph method from a valid empty query', async () => {
+    const request = { action: 'query', params: { type: 'protocol', entity: 'Fixture' } };
+    expect((await execute({ projectGraph: {} }, 'graph', request)).ok).toBe(false);
+    expect(
+      (await execute({ projectGraph: { getProtocolInfo: () => null } }, 'graph', request)).ok
+    ).toBe(true);
+  });
+
+  it('finishes a canceled uncooperative read without starting a later fallback', async () => {
+    const controller = new AbortController();
+    let start!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let finish!: (value: null) => void;
+    const pending = new Promise<null>((resolve) => {
+      finish = resolve;
+    });
+    const fallback = vi.fn(() => ({ found: true }));
+    const result = execute(
+      {
+        projectGraph: {
+          getClassInfo: () => {
+            start();
+            return pending;
+          },
+        },
+        codeEntityGraph: { queryEntity: fallback },
+      },
+      'graph',
+      { action: 'query', params: { type: 'class', entity: 'Fixture' } },
+      controller.signal
+    );
+    await entered;
+    controller.abort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        result,
+        new Promise<'pending'>((resolve) => {
+          timer = setTimeout(() => resolve('pending'), 100);
+        }),
+      ]);
+      expect(settled).toMatchObject({ ok: false, status: 'aborted' });
+    } finally {
+      clearTimeout(timer);
+      finish(null);
+      await result;
+    }
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it('reports whether a plan was actually persisted to its optional session store', async () => {
+    const args = {
+      action: 'plan',
+      params: { steps: [{ id: 1, action: 'Inspect' }], strategy: 'sequential' },
+    };
+    const absent = await execute({}, 'meta', args);
+    expect(absent).toMatchObject({
+      ok: true,
+      structuredContent: { recorded: false },
+      diagnostics: { degraded: true },
+    });
+    const save = vi.fn();
+    const stored = await execute({ sessionStore: { save, recall: () => [] } }, 'meta', args);
+    expect(save).toHaveBeenCalledOnce();
+    expect(stored.structuredContent).toMatchObject({ recorded: true, steps: 1 });
+  });
+
+  it.each([
+    { tool: 'memory', args: { action: 'save', params: { key: 'fixture', content: 'value' } } },
+    {
+      tool: 'meta',
+      args: {
+        action: 'plan',
+        params: { steps: [{ id: 1, action: 'Inspect' }], strategy: 'sequential' },
+      },
+    },
+  ])('waits for $tool session persistence instead of returning early success', async ({
+    tool,
+    args,
+  }) => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    let written = false;
+    const result = execute(
+      {
+        sessionStore: {
+          save: async () => {
+            enter();
+            await pending;
+            written = true;
+          },
+          recall: () => [],
+        },
+      },
+      tool,
+      args
+    );
+    await entered;
+    let settled = false;
+    void result.then(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally {
+      release();
+    }
+    expect((await result).ok).toBe(true);
+    expect(written).toBe(true);
+  });
+});
+
 describe('UnifiedToolCatalog', () => {
   it('projects tool schemas and preserves internal handler access', () => {
     const definition: ToolDefinition = {
