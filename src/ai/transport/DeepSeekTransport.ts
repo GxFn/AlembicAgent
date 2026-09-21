@@ -27,8 +27,8 @@ export class DeepSeekTransport extends LLMTransport {
   readonly #reasoningEffort: string;
   readonly #connection: string;
   constructor(config: TransportConfig) {
-    super('deepseek', { ...config, baseUrl: config.baseUrl || 'https://api.deepseek.com' });
-    this.#reasoningEffort = config.reasoningEffort === 'max' ? 'max' : 'high';
+    super('deepseek', config);
+    this.#reasoningEffort = this.settings.reasoningEffort;
     this.#connection = sdkConnection(this.providerId, this.baseUrl, this.apiKey);
     this.#client = createDeepSeek({
       apiKey: this.apiKey,
@@ -133,7 +133,7 @@ export class DeepSeekTransport extends LLMTransport {
     this.requireApiKey('DeepSeek');
     // SDK 没有 embedding 模型。保留已有可配置兼容 endpoint 的真实调用，不宣称官方支持。
     Logger.getInstance().debug(
-      '[DeepSeekTransport] compatibility_embedding_endpoint model=deepseek-embedding; SDK embedding unavailable'
+      '[DeepSeekTransport] compatibility_embedding_endpoint configured_model; SDK embedding unavailable'
     );
     if (texts.some((text) => text.length > 8000)) {
       Logger.getInstance().warn(
@@ -141,8 +141,8 @@ export class DeepSeekTransport extends LLMTransport {
       );
     }
     const data = await this.post(
-      `${this.baseUrl}/embeddings`,
-      { model: 'deepseek-embedding', input: texts.map((text) => text.slice(0, 8000)) },
+      `${this.baseUrl.replace(/\/+$/, '')}/embeddings`,
+      { model: this.settings.embedModel, input: texts.map((text) => text.slice(0, 8000)) },
       { Authorization: `Bearer ${this.apiKey}` },
       opts.abortSignal
     );

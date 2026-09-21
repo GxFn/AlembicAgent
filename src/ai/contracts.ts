@@ -17,6 +17,8 @@ export interface AiProviderConfig {
   maxConcurrency?: number | string;
   name?: string;
   embedModel?: string;
+  apiStyle?: string;
+  reasoningEffort?: string;
   responses?: Record<string, unknown>;
   [key: string]: unknown;
 }

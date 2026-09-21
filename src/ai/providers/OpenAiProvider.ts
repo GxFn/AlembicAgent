@@ -9,6 +9,7 @@
 
 import Logger from '@alembic/core/logging';
 import { AiProvider } from '../AiProvider.js';
+import { resolveProviderSettings } from '../configuration.js';
 import type {
   AiLogger,
   AiProviderConfig,
@@ -19,33 +20,18 @@ import type {
   StructuredOutputOptions,
 } from '../contracts.js';
 
-const OPENAI_BASE = 'https://api.openai.com/v1';
-
 export class OpenAiProvider extends AiProvider {
   /** 嵌入模型（保留为公共字段以兼容外部读取），同时透传给 transport。 */
   embedModel: string;
 
   constructor(config: AiProviderConfig = {}) {
-    super(config);
+    const settings = resolveProviderSettings('openai', config);
+    super(settings);
     this.name = 'openai';
-    this.model = config.model || process.env.ALEMBIC_AI_MODEL || 'gpt-5.5';
-    this.apiKey = config.apiKey || process.env.ALEMBIC_OPENAI_API_KEY || '';
-    // 支持通过环境变量覆盖 baseUrl，用于接入 OpenAI 兼容的中转站/代理网关；
-    // 与 DeepSeek / Claude provider 的 ALEMBIC_*_BASE_URL 约定保持一致。
-    this.baseUrl = config.baseUrl || process.env.ALEMBIC_OPENAI_BASE_URL || OPENAI_BASE;
-    this.embedModel =
-      config.embedModel || process.env.ALEMBIC_EMBED_MODEL || 'text-embedding-3-small';
-    // API 协议风格：'chat'（/chat/completions）或 'responses'（/responses）。
-    // 部分中转站只暴露其中一种端点，通过配置或 ALEMBIC_OPENAI_API_STYLE 显式切换，避免 404。
-    const styleRaw = (
-      (config.apiStyle as string) ||
-      process.env.ALEMBIC_OPENAI_API_STYLE ||
-      'chat'
-    ).toLowerCase();
-    const apiStyle = styleRaw === 'responses' ? 'responses' : 'chat';
-    // 透传 provider 特有配置给 OpenAiTransport（协议风格与嵌入模型）。
-    this._transportExtras = { apiStyle, embedModel: this.embedModel };
+    this._transportExtras = settings.transportExtras;
+    this._maxConcurrencySource = settings.concurrencySource;
     this.logger = Logger.getInstance() as unknown as AiLogger;
+    this.embedModel = settings.embedModel;
   }
 
   /** OpenAI 支持原生 Function Calling，AgentRuntime 据此跳过文本正则解析。 */

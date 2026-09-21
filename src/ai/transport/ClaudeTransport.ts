@@ -14,7 +14,7 @@ export class ClaudeTransport extends LLMTransport {
   readonly #client: AnthropicProvider;
   readonly #connection: string;
   constructor(config: TransportConfig) {
-    super('claude', { ...config, baseUrl: config.baseUrl || 'https://api.anthropic.com/v1' });
+    super('claude', config);
     this.#connection = sdkConnection(this.providerId, this.baseUrl, this.apiKey);
     this.#client = createAnthropic({
       apiKey: this.apiKey,

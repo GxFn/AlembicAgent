@@ -14,6 +14,7 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { configuredProvider, resolveConnection } from '../configuration.js';
 import type {
   ChatWithToolsResult,
   FunctionCallResult,
@@ -26,6 +27,8 @@ import { LlmResponseError, throwIfLlmCancelled } from '../errors.js';
 import { ParameterGuard } from '../guard/ParameterGuard.js';
 import type { ModelDef, ProviderId } from '../registry/ModelDefs.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
+import { PROVIDER_CONFIGS } from '../registry/ProviderConfig.js';
+import { resolveConcurrency } from '../shared/concurrency.js';
 import { ReliabilityController } from '../shared/reliability.js';
 import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schemaValidation.js';
 import { extractJSON } from '../shared/structuredOutput.js';
@@ -112,7 +115,14 @@ export class LLMGateway {
   #config: GatewayConfig;
 
   constructor(config: GatewayConfig = {}) {
-    this.#config = config;
+    // 连接在创建时固定，惰性加载 SDK 不得改变 endpoint、凭据或协议。
+    this.#config = {
+      ...config,
+      maxConcurrency: resolveConcurrency(config.maxConcurrency).value,
+      providers: Object.fromEntries(
+        PROVIDER_CONFIGS.map(({ id }) => [id, resolveConnection(id, config.providers?.[id])])
+      ),
+    };
   }
 
   /**
@@ -316,9 +326,9 @@ export class LLMGateway {
 
     const providerSeparator = modelRef.indexOf(':');
     if (providerSeparator > 0) {
-      const provider = modelRef.slice(0, providerSeparator);
+      const provider = configuredProvider(modelRef.slice(0, providerSeparator));
       const model = modelRef.slice(providerSeparator + 1);
-      const modelDef = registry.resolveOrCreate(provider as ProviderId, model);
+      const modelDef = registry.resolveOrCreate(provider, model);
       return {
         modelDef,
         providerId: modelDef.provider,
@@ -442,44 +452,16 @@ export class LLMGateway {
       case 'google':
         return new GoogleTransport(config);
       case 'ollama':
-        return new OpenAiTransport(
-          {
-            ...config,
-            apiKey: config.apiKey || 'ollama',
-            baseUrl: config.baseUrl || 'http://127.0.0.1:11434/v1',
-          },
-          'ollama'
-        );
+        return new OpenAiTransport(config, 'ollama');
       default:
-        logger().warn(
-          `[LLMGateway] Unknown provider '${providerId}', falling back to OpenAI transport`
-        );
-        return new OpenAiTransport(config);
+        // 显式身份错误不能悄悄把请求路由到另一厂商。
+        throw new Error(`Unknown AI provider: ${providerId}`);
     }
   }
 
   #resolveTransportConfig(providerId: ProviderId): TransportConfig {
-    const explicit = this.#config.providers?.[providerId];
-    if (explicit?.apiKey) {
-      return { ...explicit, timeout: this.#config.timeout ?? explicit.timeout };
-    }
-
-    const envMap: Record<string, { key: string; base?: string }> = {
-      openai: { key: 'ALEMBIC_OPENAI_API_KEY', base: 'ALEMBIC_OPENAI_BASE_URL' },
-      claude: { key: 'ALEMBIC_CLAUDE_API_KEY', base: 'ALEMBIC_CLAUDE_BASE_URL' },
-      deepseek: { key: 'ALEMBIC_DEEPSEEK_API_KEY', base: 'ALEMBIC_DEEPSEEK_BASE_URL' },
-      google: { key: 'ALEMBIC_GOOGLE_API_KEY', base: 'ALEMBIC_GOOGLE_BASE_URL' },
-      ollama: { key: '', base: 'ALEMBIC_OLLAMA_BASE_URL' },
-    };
-
-    const env = envMap[providerId] || { key: '' };
-    const { apiKey: _discardedKey, ...explicitRest } = explicit || ({} as TransportConfig);
-    return {
-      ...explicitRest,
-      apiKey: (env.key ? process.env[env.key] : undefined) || '',
-      baseUrl: (env.base ? process.env[env.base] : undefined) || explicit?.baseUrl,
-      timeout: this.#config.timeout ?? explicit?.timeout,
-    };
+    const config = this.#config.providers?.[providerId] ?? { apiKey: '' };
+    return { ...config, timeout: this.#config.timeout ?? config.timeout };
   }
 
   // ─── Response Normalization ───────────────────────────

@@ -21,6 +21,7 @@ import type {
 } from './contracts.js';
 import { throwIfLlmCancelled } from './errors.js';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
+import { resolveConcurrency } from './shared/concurrency.js';
 import { parseSchemaOutput, prepareStructuredValidation } from './shared/schemaValidation.js';
 import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
 
@@ -69,17 +70,9 @@ export class AiProvider {
     // concurrency all live in the gateway now).
     this._circuitThreshold = config.circuitThreshold || 5;
 
-    // ── Provider 级并发上限（透传 gateway + 嵌入容量提示溯源）──
-    this._maxConcurrency = Math.max(
-      1,
-      Number(config.maxConcurrency || process.env.ALEMBIC_AI_MAX_CONCURRENCY || 4)
-    );
-    // AD5: 与上面的取值链并行记录来源（不改变取值计算本身），供容量提示溯源。
-    this._maxConcurrencySource = config.maxConcurrency
-      ? 'provider-config'
-      : process.env.ALEMBIC_AI_MAX_CONCURRENCY
-        ? 'environment'
-        : 'conservative-default';
+    const concurrency = resolveConcurrency(config.maxConcurrency);
+    this._maxConcurrency = concurrency.value;
+    this._maxConcurrencySource = concurrency.source;
   }
 
   /**

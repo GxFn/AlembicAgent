@@ -30,17 +30,9 @@ export class OpenAiTransport extends LLMTransport {
   readonly #connection: string;
 
   constructor(config: TransportConfig, providerId: ProviderId = 'openai') {
-    super(providerId, { ...config, baseUrl: config.baseUrl || 'https://api.openai.com/v1' });
-    this.#embedModel =
-      typeof config.embedModel === 'string' && config.embedModel
-        ? config.embedModel
-        : 'text-embedding-3-small';
-    const style = String(
-      config.apiStyle ||
-        (providerId === 'openai' ? process.env.ALEMBIC_OPENAI_API_STYLE : undefined) ||
-        'chat'
-    ).toLowerCase();
-    this.#apiStyle = style === 'responses' ? 'responses' : 'chat';
+    super(providerId, config);
+    this.#embedModel = this.settings.embedModel;
+    this.#apiStyle = this.settings.apiStyle;
     this.#connection = sdkConnection(this.providerId, this.baseUrl, this.apiKey);
     this.#client = createOpenAI({
       apiKey: this.apiKey,

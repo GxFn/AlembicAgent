@@ -28,6 +28,7 @@ describe('LLMGateway horizontal capabilities', () => {
   it.each([
     'chat',
     'chatStructured',
+    'chatWithTools',
   ] as const)('records usage once for %s while retaining JSON mode', async (method) => {
     let body: Record<string, unknown> = {};
     vi.stubGlobal(
@@ -42,10 +43,21 @@ describe('LLMGateway horizontal capabilities', () => {
     );
     const onUsage = vi.fn();
     const gateway = new LLMGateway({ providers: { openai: { apiKey: 'test-key' } }, onUsage });
-    await gateway[method]({ modelRef: 'openai:gpt-4o', prompt: 'json', usageSource: method });
+    const request = { modelRef: 'openai:gpt-4o', prompt: 'json', usageSource: method };
+    if (method === 'chatWithTools') {
+      await gateway.chatWithTools({ ...request, messages: [{ role: 'user', content: 'json' }] });
+    } else {
+      await gateway[method](request);
+    }
     expect(onUsage).toHaveBeenCalledTimes(1);
     expect(onUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ inputTokens: 5, outputTokens: 3, source: method })
+      expect.objectContaining({
+        inputTokens: 5,
+        outputTokens: 3,
+        source: method,
+        provider: 'openai',
+        model: 'gpt-4o',
+      })
     );
     expect(body.response_format).toEqual(
       method === 'chatStructured' ? { type: 'json_object' } : undefined
@@ -77,32 +89,6 @@ describe('LLMGateway horizontal capabilities', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     resetLLMGateway();
-  });
-
-  it('fires onUsage callback with provider/model/source after chatWithTools', async () => {
-    stubFetch({
-      choices: [{ index: 0, message: { content: 'done' } }],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    });
-    const usageEvents: Array<Record<string, unknown>> = [];
-    const gateway = new LLMGateway({
-      providers: { openai: { apiKey: 'k' } },
-      onUsage: (u) => usageEvents.push(u),
-    });
-    await gateway.chatWithTools({
-      modelRef: 'openai:gpt-4o',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 64,
-      usageSource: 'unit-test',
-    });
-    expect(usageEvents).toHaveLength(1);
-    expect(usageEvents[0]).toMatchObject({
-      inputTokens: 10,
-      outputTokens: 5,
-      provider: 'openai',
-      model: 'gpt-4o',
-      source: 'unit-test',
-    });
   });
 
   it('preserves provider-prefixed model ids after the first colon', async () => {

@@ -10,11 +10,12 @@
  *   - 重试 / 熔断 / 并发闸门 / 用量上报等横切能力
  *
  * DeepSeek 专属的 reasoning_effort（high/max）通过 _transportExtras 透传给 DeepSeekTransport。
- * embed 由 DeepSeekTransport 固定使用 deepseek-embedding 模型，无需在此透传。
+ * embed 模型由共同配置层解析，兼容端点继续由 DeepSeekTransport 调用。
  */
 
 import Logger from '@alembic/core/logging';
 import { AiProvider } from '../AiProvider.js';
+import { resolveProviderSettings } from '../configuration.js';
 import type {
   AiLogger,
   AiProviderConfig,
@@ -25,24 +26,14 @@ import type {
   StructuredOutputOptions,
 } from '../contracts.js';
 
-const DEEPSEEK_BASE = 'https://api.deepseek.com';
-const VALID_EFFORTS = new Set(['high', 'max']);
-
 export class DeepSeekProvider extends AiProvider {
   constructor(config: AiProviderConfig = {}) {
-    super(config);
+    const settings = resolveProviderSettings('deepseek', config);
+    super(settings);
     this.name = 'deepseek';
-    this.model = config.model || process.env.ALEMBIC_AI_MODEL || 'deepseek-v4-flash';
-    this.apiKey = config.apiKey || process.env.ALEMBIC_DEEPSEEK_API_KEY || '';
-    this.baseUrl = config.baseUrl || process.env.ALEMBIC_DEEPSEEK_BASE_URL || DEEPSEEK_BASE;
+    this._transportExtras = settings.transportExtras;
+    this._maxConcurrencySource = settings.concurrencySource;
     this.logger = Logger.getInstance() as unknown as AiLogger;
-
-    // V4 推理力度 high(默认)/max；透传给 DeepSeekTransport 决定 thinking 模式下的 reasoning_effort。
-    const effort =
-      (config.reasoningEffort as string) || process.env.ALEMBIC_DEEPSEEK_REASONING_EFFORT || 'high';
-    this._transportExtras = {
-      reasoningEffort: VALID_EFFORTS.has(effort) ? effort : 'high',
-    };
   }
 
   get supportsNativeToolCalling() {

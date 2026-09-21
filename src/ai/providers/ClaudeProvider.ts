@@ -13,6 +13,7 @@
 
 import Logger from '@alembic/core/logging';
 import { AiProvider } from '../AiProvider.js';
+import { resolveProviderSettings } from '../configuration.js';
 import type {
   AiLogger,
   AiProviderConfig,
@@ -24,17 +25,13 @@ import type {
 } from '../contracts.js';
 import { throwIfLlmCancelled } from '../errors.js';
 
-const CLAUDE_BASE = 'https://api.anthropic.com/v1';
-
 export class ClaudeProvider extends AiProvider {
   constructor(config: AiProviderConfig = {}) {
-    super(config);
+    const settings = resolveProviderSettings('claude', config);
+    super(settings);
     this.name = 'claude';
-    this.model = config.model || process.env.ALEMBIC_AI_MODEL || 'claude-sonnet-4-6';
-    this.apiKey = config.apiKey || process.env.ALEMBIC_CLAUDE_API_KEY || '';
-    this.baseUrl = config.baseUrl || process.env.ALEMBIC_CLAUDE_BASE_URL || CLAUDE_BASE;
-    // 保留默认不重试；显式配置由 Gateway 消费，SDK 单次接口不额外重试。
-    this.maxRetries = config.maxRetries ?? 0;
+    this._transportExtras = settings.transportExtras;
+    this._maxConcurrencySource = settings.concurrencySource;
     this.logger = Logger.getInstance() as unknown as AiLogger;
   }
 

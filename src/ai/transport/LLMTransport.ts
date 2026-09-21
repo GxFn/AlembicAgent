@@ -14,6 +14,7 @@
 
 import Logger from '@alembic/core/logging';
 import { runOperation } from '../../shared/operation.js';
+import { providerKeyEnv, type ResolvedConnection, resolveConnection } from '../configuration.js';
 import type {
   LlmCallOptions,
   LlmContinuation,
@@ -150,8 +151,12 @@ export interface TransportResponse {
 // ─── Transport Config ───────────────────────────────────
 
 export interface TransportConfig {
-  apiKey: string;
+  /** undefined 继承环境，空字符串显式禁止 ambient key 回填。 */
+  apiKey?: string;
   baseUrl?: string;
+  embedModel?: string;
+  apiStyle?: string;
+  reasoningEffort?: string;
   timeout?: number;
   /** Provider-specific extensions (e.g. DeepSeek reasoningEffort default) */
   [key: string]: unknown;
@@ -161,14 +166,16 @@ export interface TransportConfig {
 
 export abstract class LLMTransport {
   readonly providerId: ProviderId;
+  protected readonly settings: ResolvedConnection;
   protected apiKey: string;
   protected baseUrl: string;
   protected timeout: number;
 
   constructor(providerId: ProviderId, config: TransportConfig) {
     this.providerId = providerId;
-    this.apiKey = config.apiKey;
-    this.baseUrl = config.baseUrl || '';
+    this.settings = resolveConnection(providerId, config);
+    this.apiKey = this.settings.apiKey;
+    this.baseUrl = this.settings.baseUrl;
     this.timeout = config.timeout ?? 120_000;
   }
 
@@ -334,22 +341,7 @@ export abstract class LLMTransport {
 
   protected requireApiKey(label: string): void {
     if (!this.apiKey) {
-      throw createMissingApiKeyError(label, providerEnvVar(this.providerId), this.providerId);
+      throw createMissingApiKeyError(label, providerKeyEnv(this.providerId), this.providerId);
     }
-  }
-}
-
-function providerEnvVar(providerId: ProviderId): string {
-  switch (providerId) {
-    case 'openai':
-      return 'ALEMBIC_OPENAI_API_KEY';
-    case 'deepseek':
-      return 'ALEMBIC_DEEPSEEK_API_KEY';
-    case 'claude':
-      return 'ALEMBIC_CLAUDE_API_KEY';
-    case 'google':
-      return 'ALEMBIC_GOOGLE_API_KEY';
-    case 'ollama':
-      return 'ALEMBIC_OLLAMA_API_KEY';
   }
 }

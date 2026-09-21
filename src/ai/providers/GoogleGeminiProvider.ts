@@ -15,6 +15,7 @@
 
 import Logger from '@alembic/core/logging';
 import { AiProvider } from '../AiProvider.js';
+import { resolveProviderSettings } from '../configuration.js';
 import type {
   AiLogger,
   AiProviderConfig,
@@ -27,30 +28,12 @@ import type {
 
 export class GoogleGeminiProvider extends AiProvider {
   constructor(config: AiProviderConfig = {}) {
-    super({
-      ...config,
-      // Gemini 默认并发 2（低于通用默认），规避 Google 配额限制；可被显式配置覆盖。
-      maxConcurrency:
-        config.maxConcurrency ||
-        Number(
-          process.env.ALEMBIC_GEMINI_MAX_CONCURRENCY || process.env.ALEMBIC_AI_MAX_CONCURRENCY || 2
-        ),
-    });
+    const settings = resolveProviderSettings('google', config);
+    super(settings);
     this.name = 'google';
-    // AD5: 上面预先折叠的 maxConcurrency 到达基类时一律呈现为 config 值，
-    // 这里用原始输入重推真实来源（Gemini 专属 env 链），保证提示溯源诚实。
-    this._maxConcurrencySource = config.maxConcurrency
-      ? 'provider-config'
-      : process.env.ALEMBIC_GEMINI_MAX_CONCURRENCY || process.env.ALEMBIC_AI_MAX_CONCURRENCY
-        ? 'environment'
-        : 'conservative-default';
-    this.model = config.model || 'gemini-3-flash-preview';
-    this.apiKey = config.apiKey || process.env.ALEMBIC_GOOGLE_API_KEY || '';
-    this.baseUrl = config.baseUrl || process.env.ALEMBIC_GOOGLE_BASE_URL || '';
+    this._transportExtras = settings.transportExtras;
+    this._maxConcurrencySource = settings.concurrencySource;
     this.logger = Logger.getInstance() as unknown as AiLogger;
-
-    // 嵌入模型透传给 GoogleTransport（transport 内部统一补 'models/' 前缀并兜底默认）。
-    this._transportExtras = { embedModel: config.embedModel };
   }
 
   /** 是否支持原生结构化函数调用 */

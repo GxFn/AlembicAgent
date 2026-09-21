@@ -35,6 +35,8 @@
       "src/tools/runtime/handlers/knowledge/",
       "src/shared/operation.ts",
       "src/agent/production/strict/",
+      "src/ai/configuration.ts",
+      "src/ai/shared/concurrency.ts",
       "src/ai/contracts.ts",
       "src/ai/errors.ts",
       "src/ai/transport/LLMTransport.ts",
@@ -47,6 +49,12 @@
       "src/ai/transport/sdkContinuation.ts"
     ],
     "runtimeImports": {
+      "src/ai/configuration.ts": [
+        "@alembic/core/logging",
+        "src/ai/registry/ProviderConfig.ts",
+        "src/ai/shared/concurrency.ts"
+      ],
+      "src/ai/shared/concurrency.ts": ["@alembic/core/logging"],
       "src/ai/transport/sdkContinuation.ts": [
         "@alembic/core/logging"
       ],
@@ -82,6 +90,7 @@
       "src/ai/contracts.ts": [],
       "src/ai/errors.ts": [],
       "src/ai/transport/LLMTransport.ts": [
+        "src/ai/configuration.ts",
         "@alembic/core/logging",
         "src/shared/operation.ts",
         "src/ai/errors.ts",

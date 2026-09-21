@@ -16,6 +16,7 @@
  */
 
 import { createLlmAbortError } from '../errors.js';
+import { resolveConcurrency } from './concurrency.js';
 import { classifyLlmError } from './errorClassify.js';
 
 /** 日志回调，level 与现有 logger 对齐（info/warn/error）。 */
@@ -81,10 +82,7 @@ export class ReliabilityController {
   constructor(opts: ReliabilityOptions = {}) {
     this.maxRetries = opts.maxRetries ?? 3;
     this.circuitThreshold = opts.circuitThreshold ?? 5;
-    this.maxConcurrency = Math.max(
-      1,
-      Number(opts.maxConcurrency || process.env.ALEMBIC_AI_MAX_CONCURRENCY || 4)
-    );
+    this.maxConcurrency = resolveConcurrency(opts.maxConcurrency).value;
     this.label = opts.label || 'llm';
     this.onLog = opts.onLog;
   }

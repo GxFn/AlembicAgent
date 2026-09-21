@@ -11,6 +11,28 @@ OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本�
 
 调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。Google 的已完成 embedding 批次保留在本次调用局部，后续批次失败不会重放它们。
 
+## 配置解析与装配
+
+Factory 选择逻辑 provider，公共 Provider 保留宿主所需的身份与回执字段，内部 `configuration.ts` 统一解析模型、连接和适配器选项。Transport 使用同一解析规则，SDK 不再自行从厂商通用环境变量读取凭据。配置、模型能力 Registry、请求参数策略和网络代理各有一个负责入口。
+
+| 配置 | 规则 |
+| --- | --- |
+| provider | Factory 接受既有 `gemini` / `google-gemini` / `anthropic` 别名和大小写；Gateway 的显式模型前缀也使用同一别名规则。未知显式 provider 报错。 |
+| endpoint | 非空显式 `baseUrl` > 对应 `ALEMBIC_<PROVIDER>_BASE_URL` > 注册默认值；优先级不取决于是否同时传 key。Google 裸根补 `/v1beta`，Ollama 裸根补 `/v1`，显式代理路径保留。 |
+| credential | 显式 `apiKey` > 对应 Alembic 环境变量；`undefined` 表示继承，**空字符串表示保持无凭据**，不会从环境补回。未配置 Ollama key 时使用本地 dummy key。 |
+| 生成模型 | 显式 `model` > 属于当前 provider 的 `ALEMBIC_AI_MODEL` > 注册默认模型。Google/Ollama 的直接构造也遵守该规则。未指定 provider 或指定 `auto` 时，全局模型供选中的主 provider 使用；切换到 fallback 时使用目标 provider 默认模型。 |
+| embedding 模型 | 显式 `embedModel` > 属于当前 embedding provider 的 `ALEMBIC_EMBED_MODEL` > 厂商默认模型。独立 `createEmbedProvider()` 同步设置公开 `model` 与实际 embedding 模型，避免宿主回执记录成生成模型。 |
+| 协议与推理 | OpenAI `apiStyle` > `ALEMBIC_OPENAI_API_STYLE` > `chat`；Ollama 不继承 OpenAI 的环境协议。DeepSeek `reasoningEffort` > 对应环境变量 > `high`，保留 `high/max` 规则。非法枚举保留原兼容默认并记录诊断。 |
+| 并发 | 显式值 > Google 专属环境变量 > 通用环境变量 > 默认值；接受正整数字符串，拒绝零、负数、小数、NaN 和无穷值。公开容量提示与实际闸门共用解析结果和来源。 |
+
+Provider、Gateway、直接 Transport 在创建时固定模型服务配置，惰性创建 SDK 不会重新吸入后来变化的 key、endpoint 或协议。重新配置请创建新实例；共享 Gateway 可通过 `getLLMGateway(config)` 重建。网络代理仍按请求读取既有代理变量，其优先级未改动。
+
+兼容默认仍保留：Facade 超时 300 秒，直接 Gateway/Transport 超时 120 秒；Facade 默认重试 3 次，Claude 默认 0 次；Google Facade 默认并发 2，其余 Facade 及直接 Gateway 默认 4。Ollama Facade 的默认地址为 `localhost:11434/v1`，直接 Gateway 的注册默认为 `127.0.0.1:11434/v1`。自动发现顺序仍为 Google→OpenAI→Claude→DeepSeek，错误回退候选顺序仍为 Google→OpenAI→DeepSeek→Claude。
+
+OpenAI、Claude、DeepSeek 的公开 `baseUrl` 保留配置原字符串，SDK 负责 API 路径规范化；尤其不能改写 DeepSeek 端点导致宿主严格回执不匹配。错误与规范化诊断只记录字段、provider 和处理结果，不输出 key 或完整 endpoint。已知字符串字段类型不合法时，在构造边界抛 `LLM_INVALID_REQUEST`。
+
+升级时若原调用传 `apiKey: ''` 以继承环境，应改为省略该字段或传 `undefined`。`TransportConfig.apiKey` 已改为可选。DeepSeek 的兼容 embedding 请求现在使用有效 `embedModel`，仍不表示官方服务提供 embedding API。
+
 ## 调用和取消
 
 `chat`、`chatWithTools`、`chatWithStructuredOutput`、`embed`、`summarize` 和 `probe` 都接受可选的 `abortSignal`。旧调用参数仍然有效。
@@ -70,6 +92,6 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 
 ## 开发验证
 
-使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
+使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/ai-configuration.test.ts` 集中覆盖入口配置、容量提示、URL 规则、快照和回执兼容；原独立容量提示测试已合入此处。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
 
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。

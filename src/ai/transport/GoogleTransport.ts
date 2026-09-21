@@ -18,14 +18,8 @@ export class GoogleTransport extends LLMTransport {
   readonly #connection: string;
 
   constructor(config: TransportConfig) {
-    super('google', {
-      ...config,
-      baseUrl: config.baseUrl || 'https://generativelanguage.googleapis.com/v1beta',
-    });
-    this.#embedModel =
-      typeof config.embedModel === 'string' && config.embedModel
-        ? config.embedModel.replace(/^models\//, '')
-        : 'gemini-embedding-001';
+    super('google', config);
+    this.#embedModel = this.settings.embedModel.replace(/^models\//, '');
     this.#connection = sdkConnection(this.providerId, this.baseUrl, this.apiKey);
     this.#client = createGoogle({
       apiKey: this.apiKey,
