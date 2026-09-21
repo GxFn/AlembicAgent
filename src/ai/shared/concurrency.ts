@@ -1,5 +1,6 @@
 /** 并发闸门和容量提示共享同一解析结果；不把无效数字交给队列。 */
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { EmbeddingCapacityHintSource } from '../contracts.js';
 
 export function resolveConcurrency(
@@ -15,8 +16,12 @@ export function resolveConcurrency(
   const value = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
   if (!Number.isSafeInteger(value) || value < 1) {
     // 只记录字段及来源，环境值可能被误填成敏感信息，不输出原值。
-    Logger.getInstance().warn(
-      `[ai-config] invalid_max_concurrency source=${explicit ? 'config' : 'environment'}; construction rejected before queueing`
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          `[ai-config] invalid_max_concurrency source=${explicit ? 'config' : 'environment'}; construction rejected before queueing`
+        ),
+      () => undefined
     );
     throw Object.assign(new Error('maxConcurrency must be a finite positive integer'), {
       code: 'LLM_INVALID_REQUEST',

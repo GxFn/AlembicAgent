@@ -1,15 +1,180 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { buildAnalystPrompt } from '../src/agent/prompts/index.js';
+import type { UnifiedMessage } from '../src/ai/contracts.js';
+import { normalizeToolTranscriptForChatCompletions } from '../src/ai/toolTranscript.js';
+import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import {
   DeltaCache,
   TOOL_REGISTRY,
   type ToolContext,
   ToolRouter,
 } from '../src/tools/runtime/index.js';
+import { mockJsonFetch } from './helpers/mockFetch.js';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function deepSeekReply(content: string) {
+  return {
+    id: 'fixture',
+    created: 1,
+    model: 'deepseek-v4-pro',
+    choices: [
+      {
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content, reasoning_content: 'fixture' },
+      },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+}
+
+const codeInvoke =
+  '<invoke name="code"><parameter name="action">read</parameter><parameter name="params">{"path":"declared.ts"}</parameter></invoke>';
+const codeTool = {
+  name: 'code',
+  parameters: {
+    type: 'object',
+    required: ['action', 'params'],
+    properties: {
+      action: { type: 'string', enum: ['read'] },
+      params: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    },
+  },
+};
+
+describe('DeepSeek text tool declaration boundary', () => {
+  it.each([
+    { name: 'invoke before declaration', text: `${codeInvoke}\n<function_calls></function_calls>` },
+    { name: 'invoke after declaration', text: `<function_calls></function_calls>\n${codeInvoke}` },
+    {
+      name: 'fenced example',
+      text: `\`\`\`xml\n<function_calls>${codeInvoke}</function_calls>\n\`\`\``,
+    },
+    {
+      name: 'unclosed fenced example',
+      text: `\`\`\`xml\n<function_calls>${codeInvoke}</function_calls>`,
+    },
+    { name: 'unclosed declaration', text: `<function_calls>${codeInvoke}` },
+  ])('keeps $name as text through the real transport', async ({ text }) => {
+    const fetch = mockJsonFetch({}, deepSeekReply(text));
+    const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'fixture' }],
+      tools: [codeTool],
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(result.functionCalls).toBeNull();
+    expect(result.text).toBe(text);
+  });
+
+  it('keeps a real declared call while ignoring surrounding invoke examples', async () => {
+    const outside = codeInvoke.replace('declared.ts', 'example.ts');
+    const text = `Explanation: ${outside}\n<function_calls>${codeInvoke}</function_calls>\nMore explanation: ${outside}`;
+    mockJsonFetch({}, deepSeekReply(text));
+    const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'fixture' }],
+      tools: [codeTool],
+    });
+    expect(result.functionCalls).toEqual([
+      {
+        id: 'call_deepseek_compat_1',
+        name: 'code',
+        args: { action: 'read', params: { path: 'declared.ts' } },
+      },
+    ]);
+    expect(result.text).toBeNull();
+  });
+
+  it('preserves fenced code and line endings inside declared arguments', async () => {
+    const snippet = '```ts\r\nconst fixture = 1;\r\n```';
+    const invoke = codeInvoke.replace(
+      '</invoke>',
+      `<parameter name="snippet">${snippet}</parameter></invoke>`
+    );
+    mockJsonFetch({}, deepSeekReply(`<function_calls>${invoke}</function_calls>`));
+    const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'fixture' }],
+      tools: [codeTool],
+    });
+    expect(result.functionCalls?.[0].args.snippet).toBe(snippet);
+  });
+});
+
+describe('DeepSeek tool history completeness', () => {
+  it.each([
+    { name: 'duplicate call ids', ids: ['first', 'first'], replies: ['first'], converted: true },
+    { name: 'empty call id', ids: ['first', ''], replies: ['first'], converted: true },
+    {
+      name: 'complete distinct calls',
+      ids: ['first', 'second'],
+      replies: ['first', 'second'],
+      converted: false,
+    },
+  ])('handles $name without fabricating a missing receipt', async ({ ids, replies, converted }) => {
+    const messages: UnifiedMessage[] = [
+      {
+        role: 'assistant',
+        content: null,
+        reasoningContent: 'retained thought',
+        toolCalls: ids.map((id) => ({
+          id,
+          name: 'code',
+          args: { action: 'read', params: { path: 'fixture.ts' } },
+        })),
+      },
+      ...replies.map(
+        (id): UnifiedMessage => ({
+          role: 'tool',
+          name: 'code',
+          toolCallId: id,
+          content: 'observed result',
+        })
+      ),
+      { role: 'user', content: 'continue' },
+    ];
+    const normalized = normalizeToolTranscriptForChatCompletions(
+      messages.map((message) => ({ ...message }))
+    );
+    const capture: { body?: Record<string, unknown> } = {};
+    const fetch = mockJsonFetch(capture, deepSeekReply('done'));
+    const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages,
+      tools: [codeTool],
+    });
+    expect(result.text).toBe('done');
+    expect(fetch).toHaveBeenCalledOnce();
+    const sent = capture.body?.messages as Array<Record<string, unknown>>;
+    const assistant = sent.find((message) => message.role === 'assistant');
+    expect(sent.filter((message) => message.role === 'tool')).toHaveLength(
+      converted ? 0 : replies.length
+    );
+    if (converted) {
+      expect(assistant?.tool_calls).toBeUndefined();
+      expect(normalized.messages[0]).not.toHaveProperty('reasoningContent');
+      // SDK 为普通 assistant 补空 reasoning_content 是合法 wire 默认；旧思维正文不能回放。
+      expect(assistant?.reasoning_content ?? '').toBe('');
+      expect(assistant?.content).toContain('tool calls converted to text');
+      expect(
+        sent.filter((message) => String(message.content).includes('tool result converted to text'))
+      ).toHaveLength(replies.length);
+    } else {
+      expect(assistant?.tool_calls).toHaveLength(ids.length);
+      expect(assistant?.reasoning_content).toBe('retained thought');
+    }
+    expect(normalized.normalizedCount).toBe(converted ? 1 + replies.length : 0);
+  });
+});
 
 interface BatchReadFile {
   ok: boolean;

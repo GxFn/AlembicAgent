@@ -7,6 +7,7 @@ import {
   getProviderWithFallback,
   isGeoOrProviderError,
 } from '../src/ai/AiFactory.js';
+import { jsonResponse } from './helpers/mockFetch.js';
 
 /**
  * AiFactory owns provider selection + the geo/provider-error fallback gate, with
@@ -21,6 +22,7 @@ const KEY_ENVS = [
   'ALEMBIC_CLAUDE_API_KEY',
   'ALEMBIC_DEEPSEEK_API_KEY',
   'ALEMBIC_AI_PROVIDER',
+  'ALEMBIC_AI_MODEL',
 ] as const;
 const saved = new Map<string, string | undefined>();
 
@@ -33,6 +35,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   for (const k of KEY_ENVS) {
     const v = saved.get(k);
     if (v === undefined) {
@@ -44,6 +47,64 @@ afterEach(() => {
 });
 
 describe('AiFactory fallback selection', () => {
+  it.each([
+    { status: 403, providerName: 'openai' },
+    { status: 429, providerName: 'google' },
+    { status: 503, providerName: 'google' },
+  ])('uses the actual SDK probe status $status after its provider error message is sanitized', async ({
+    status,
+    providerName,
+  }) => {
+    process.env.ALEMBIC_AI_PROVIDER = 'google';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'fixture-google';
+    process.env.ALEMBIC_OPENAI_API_KEY = 'fixture-openai';
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: { code: status, message: 'fixture-private-region-detail' },
+        },
+        status
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const originalProbe = GoogleGeminiProvider.prototype.probe;
+    let probeFailure: unknown;
+    vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockImplementation(async function (
+      this: GoogleGeminiProvider,
+      options
+    ) {
+      // 只把当前探针的重试预算设为零；真实 Provider/Gateway/SDK 错误路径全部保留。
+      this.maxRetries = 0;
+      try {
+        return await originalProbe.call(this, options);
+      } catch (error: unknown) {
+        probeFailure = error;
+        throw error;
+      }
+    });
+
+    const provider = await getProviderWithFallback();
+    expect(probeFailure).toMatchObject({ status, code: 'LLM_API_ERROR' });
+    expect((probeFailure as Error).message).not.toContain('fixture-private-region-detail');
+    expect(provider?.name).toBe(providerName);
+    expect(provider?._fallbackFrom).toBe(providerName === 'openai' ? 'google' : undefined);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    null,
+    undefined,
+    { message: 42 },
+  ])('keeps the selected provider when its probe rejects an unclassified value %s', async (failure) => {
+    process.env.ALEMBIC_AI_PROVIDER = 'google';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'fixture-google';
+    process.env.ALEMBIC_OPENAI_API_KEY = 'fixture-openai';
+    // 外部 JS probe 可以拒绝非 Error 值；分类器不能用新的 TypeError 覆盖该事实。
+    const probe = vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockRejectedValue(failure);
+    await expect(getProviderWithFallback()).resolves.toMatchObject({ name: 'google' });
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
   it('excludes the actual auto-detected provider after a failed probe', async () => {
     process.env.ALEMBIC_AI_PROVIDER = 'auto';
     process.env.ALEMBIC_GOOGLE_API_KEY = 'synthetic-google';
@@ -54,6 +115,73 @@ describe('AiFactory fallback selection', () => {
     expect((await getProviderWithFallback())?.name).toBe('openai');
   });
   describe('isGeoOrProviderError', () => {
+    it.each([
+      {
+        label: 'known 429 with blocked wording',
+        error: { status: 429, message: 'requests blocked' },
+        fallback: false,
+      },
+      {
+        label: 'known 503 with forbidden wording',
+        error: { status: 503, message: 'forbidden by upstream' },
+        fallback: false,
+      },
+      {
+        label: 'known 408 with blocked wording',
+        error: { status: 408, message: 'requests blocked' },
+        fallback: false,
+      },
+      {
+        label: 'network reset with blocked wording',
+        error: { code: 'ECONNRESET', message: 'connection blocked' },
+        fallback: false,
+      },
+      {
+        label: 'network timeout cause with forbidden wording',
+        error: { cause: { code: 'ETIMEDOUT' }, message: 'forbidden' },
+        fallback: false,
+      },
+      {
+        label: 'cancelled request with blocked wording',
+        error: { name: 'AbortError', message: 'request blocked' },
+        fallback: false,
+      },
+      {
+        label: 'legacy rate-limit wording before blocked',
+        error: new Error('rate limit exceeded; requests blocked'),
+        fallback: false,
+      },
+      {
+        label: 'legacy 429 quota wording before blocked',
+        error: new Error('429 quota exceeded; requests temporarily blocked'),
+        fallback: false,
+      },
+      {
+        label: 'known 403 with sanitized message',
+        error: { status: 403, message: 'API request failed' },
+        fallback: true,
+      },
+      {
+        label: 'known 403 account quota block',
+        error: { status: 403, message: 'account quota exhausted; access blocked' },
+        fallback: true,
+      },
+      {
+        label: 'legacy permanent account quota block',
+        error: new Error('account quota exhausted; access blocked'),
+        fallback: true,
+      },
+      {
+        label: 'non-numeric HTTP status',
+        error: { status: '403', message: 'API request failed' },
+        fallback: false,
+      },
+      { label: 'missing error', error: null, fallback: false },
+      { label: 'non-string message', error: { message: 42 }, fallback: false },
+    ])('classifies $label without losing structured error facts', ({ error, fallback }) => {
+      expect(isGeoOrProviderError(error)).toBe(fallback);
+    });
+
     it('flags geo-restriction and failed_precondition errors', () => {
       expect(
         isGeoOrProviderError(new Error('User location is not supported for the API use'))

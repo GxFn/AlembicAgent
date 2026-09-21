@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   autoDetectProvider,
@@ -34,6 +35,26 @@ afterEach(() => {
 });
 
 describe('effective AI connection configuration', () => {
+  it.each([
+    { name: 'OpenAI provider', create: () => new OpenAiProvider({ maxConcurrency: 0 }) },
+    { name: 'Google provider', create: () => new GoogleGeminiProvider({ maxConcurrency: 0 }) },
+    { name: 'gateway', create: () => new LLMGateway({ maxConcurrency: 0 }) },
+    {
+      name: 'reliability controller',
+      create: () => new ReliabilityController({ maxConcurrency: 0 }),
+    },
+  ])('preserves invalid concurrency classification when $name logging fails', ({ create }) => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      throw new Error('fixture log failure');
+    });
+    expect(create).toThrow(
+      expect.objectContaining({
+        code: 'LLM_INVALID_REQUEST',
+        message: expect.stringContaining('maxConcurrency'),
+      })
+    );
+  });
+
   it('does not invent reasoning metadata for providers that do not use the DeepSeek adapter option', () => {
     for (const Provider of [OpenAiProvider, GoogleGeminiProvider, ClaudeProvider, OllamaProvider]) {
       expect(new Provider()._transportExtras).not.toHaveProperty('reasoningEffort');

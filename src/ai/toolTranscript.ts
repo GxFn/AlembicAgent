@@ -88,14 +88,21 @@ function isCompleteImmediateToolRound(
   assistant: MessageRecord,
   toolMessages: MessageRecord[]
 ): boolean {
-  const expectedIds = toolCallsOf(assistant)
-    .map((call) => String(call.id ?? ''))
-    .filter(Boolean);
-  if (expectedIds.length === 0 || toolMessages.length === 0) {
+  const calls = toolCallsOf(assistant);
+  const expectedIds = calls.map((call) => String(call.id ?? '')).filter(Boolean);
+  if (
+    expectedIds.length === 0 ||
+    expectedIds.length !== calls.length ||
+    toolMessages.length === 0
+  ) {
     return false;
   }
 
   const expected = new Set(expectedIds);
+  // 重复或缺失 id 不能靠 Set 去重被伪装成完整闭环；沿既有转文本路径保留历史。
+  if (expected.size !== calls.length) {
+    return false;
+  }
   const seen = new Set<string>();
   for (const toolMessage of toolMessages) {
     const id = toolCallIdOf(toolMessage);

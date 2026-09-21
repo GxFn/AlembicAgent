@@ -22,6 +22,7 @@ import { GoogleGeminiProvider } from './providers/GoogleGeminiProvider.js';
 import { OllamaProvider } from './providers/OllamaProvider.js';
 import { OpenAiProvider } from './providers/OpenAiProvider.js';
 import type { ProviderId } from './registry/ModelDefs.js';
+import { classifyLlmError } from './shared/errorClassify.js';
 
 const PROVIDER_MAP: Record<ProviderId, ProviderClass> = {
   google: GoogleGeminiProvider,
@@ -60,12 +61,39 @@ export function getAvailableFallbacks(currentProvider: string) {
 
 /** 判断是否为地理限制 / 不可恢复的 provider 级错误（应触发 fallback） */
 export function isGeoOrProviderError(err: unknown) {
-  const msg = ((err as Error).message || '').toLowerCase();
+  const details = err && typeof err === 'object' ? (err as Record<string, unknown>) : {};
+  const msg = typeof details.message === 'string' ? details.message.toLowerCase() : '';
+  const status =
+    typeof details.status === 'number' &&
+    Number.isInteger(details.status) &&
+    details.status >= 100 &&
+    details.status <= 599
+      ? details.status
+      : undefined;
+  const classification = classifyLlmError({
+    name: details.name,
+    message: msg,
+    status,
+    code: details.code,
+    cause: details.cause,
+  });
+  // 先用真实状态/网络事实排除暂时故障和取消，不能被错误正文中的 blocked/forbidden 覆盖。
+  if (classification.isAbort || classification.isRetryable || status === 408) {
+    return false;
+  }
+  // SDK 会脱敏原厂错误正文；已知 403 仍是权限/地区限制，不依赖保留下来的文案。
+  if (status === 403) {
+    return true;
+  }
+  // 旧宿主无状态码时保留文本兼容；quota + 长期 blocked 不等于临时 429 限流。
+  if (/rate.?limit|\b429\b/i.test(msg)) {
+    return false;
+  }
   return (
     /user location is not supported|failed_precondition|unsupported.*(region|country|location)|geo|blocked/i.test(
       msg
     ) ||
-    (/permission.*denied|forbidden/i.test(msg) && !/rate.?limit|quota|429/i.test(msg))
+    (/permission.*denied|forbidden/i.test(msg) && !/quota/i.test(msg))
   );
 }
 
@@ -89,10 +117,13 @@ export async function getProviderWithFallback() {
     return primary;
   } catch (probeErr: unknown) {
     if (!isGeoOrProviderError(probeErr)) {
+      logger.debug(
+        `[AiFactory] Primary provider "${currentProvider}" probe failed without a provider restriction; retaining primary`
+      );
       return primary;
     }
     logger.warn(
-      `[AiFactory] Primary provider "${currentProvider}" failed: ${(probeErr as Error).message}`
+      `[AiFactory] Primary provider "${currentProvider}" has a provider restriction; selecting configured fallback`
     );
   }
 
@@ -109,7 +140,9 @@ export async function getProviderWithFallback() {
       fbProvider._fallbackFrom = currentProvider;
       return fbProvider;
     } catch (e: unknown) {
-      logger.warn(`[AiFactory] Fallback "${fbName}" creation failed: ${(e as Error).message}`);
+      logger.warn(
+        `[AiFactory] Fallback "${fbName}" creation failed (${e instanceof Error ? e.name : 'unknown'}); trying next configured provider`
+      );
     }
   }
 

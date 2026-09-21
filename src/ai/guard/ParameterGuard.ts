@@ -26,6 +26,20 @@ export interface FilteredParam {
   originalValue: unknown;
 }
 
+function invalidNumericParam(param: string, requirement: string): Error {
+  return Object.assign(new Error(`${param} must be ${requirement}`), {
+    code: 'LLM_INVALID_REQUEST',
+  });
+}
+
+/** 仅校验模型允许的输入；不做隐式数字转换，也不把原值带进错误诊断。 */
+function finiteNumericParam(param: string, value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw invalidNumericParam(param, 'a finite number');
+  }
+  return value;
+}
+
 export class ParameterGuard {
   /**
    * 根据 ModelDef 过滤并修正请求参数
@@ -64,7 +78,7 @@ export class ParameterGuard {
       });
       return;
     }
-    const val = raw.temperature as number;
+    const val = finiteNumericParam('temperature', raw.temperature);
     out.temperature = Math.max(rule.min ?? 0, Math.min(rule.max ?? 2, val));
   }
 
@@ -85,7 +99,7 @@ export class ParameterGuard {
       });
       return;
     }
-    const val = raw.topP as number;
+    const val = finiteNumericParam('topP', raw.topP);
     out.topP = Math.max(rule.min ?? 0, Math.min(rule.max ?? 1, val));
   }
 
@@ -106,7 +120,7 @@ export class ParameterGuard {
       });
       return;
     }
-    const val = raw.topK as number;
+    const val = finiteNumericParam('topK', raw.topK);
     out.topK = Math.max(rule.min ?? 0, Math.min(rule.max ?? 100, val));
   }
 
@@ -175,7 +189,10 @@ export class ParameterGuard {
     if (!('maxTokens' in raw) || raw.maxTokens == null) {
       return;
     }
-    const val = raw.maxTokens as number;
+    const val = finiteNumericParam('maxTokens', raw.maxTokens);
+    if (!Number.isSafeInteger(val) || val <= 0) {
+      throw invalidNumericParam('maxTokens', 'a positive safe integer');
+    }
     out.maxTokens = Math.min(val, model.maxOutputTokens);
   }
 }

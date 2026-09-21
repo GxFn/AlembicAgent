@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AiProvider, type StructuredOutputOptions } from '../src/ai/AiProvider.js';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
+import {
+  parseSchemaOutput,
+  prepareStructuredValidation,
+} from '../src/ai/shared/schemaValidation.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { mockJsonFetch } from './helpers/mockFetch.js';
 
@@ -56,6 +60,39 @@ function response(value: unknown) {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe('structured validator diagnostic boundary', () => {
+  it.each([
+    { name: 'valid fenced JSON', text: '```json\n{"ok":true}\n```', expected: { ok: true } },
+    { name: 'schema mismatch', text: '{"wrong":true}', expected: null },
+    { name: 'invalid JSON', text: '{"ok":', expected: null },
+  ])('preserves $name classification when its diagnostic callback throws', ({ text, expected }) => {
+    const log = vi.fn(() => {
+      throw new Error('fixture log failure');
+    });
+    const validate = prepareStructuredValidation(
+      {
+        type: 'object',
+        required: ['ok'],
+        properties: { ok: { type: 'boolean' } },
+      },
+      log
+    );
+    if (!validate) {
+      throw new Error('Fixture schema did not compile');
+    }
+    expect(parseSchemaOutput(text, validate, log)).toEqual(expected);
+    expect(log).toHaveBeenCalled();
+  });
+
+  it('rejects an invalid schema even when diagnostic logging throws', () => {
+    const log = vi.fn(() => {
+      throw new Error('fixture log failure');
+    });
+    expect(prepareStructuredValidation({ type: 'object', unknownKeyword: true }, log)).toBeNull();
+    expect(log).toHaveBeenCalled();
+  });
+});
 
 describe.each(entries)('structured output at $name', ({ call }) => {
   it('rejects parseable JSON that violates the caller schema', async () => {

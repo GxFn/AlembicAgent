@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
+import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { isTextCompatToolCallId, resolveModelQuirks } from '../src/ai/registry/ModelQuirks.js';
-
+import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import {
   autoDetectProvider,
   ClaudeProvider,
@@ -15,6 +15,7 @@ import {
   ParameterGuard,
   PROVIDER_CONFIGS,
 } from '../src/index.js';
+import { mockJsonFetch } from './helpers/mockFetch.js';
 
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) {
@@ -170,6 +171,79 @@ describe('AI provider credential guidance', () => {
 });
 
 describe('ParameterGuard', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { field: 'temperature', value: NaN },
+    { field: 'temperature', value: Infinity },
+    { field: 'maxTokens', value: NaN },
+    { field: 'maxTokens', value: Infinity },
+    { field: 'maxTokens', value: 0 },
+    { field: 'maxTokens', value: -1 },
+    { field: 'maxTokens', value: 1.5 },
+    { field: 'maxTokens', value: Number.MAX_SAFE_INTEGER + 1 },
+  ])('rejects invalid supported $field=$value at the gateway before transport or retry', async ({
+    field,
+    value,
+  }) => {
+    const fetch = mockJsonFetch(
+      {},
+      {
+        id: 'fixture',
+        created: 1,
+        model: 'gpt-5.5',
+        choices: [
+          { index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' },
+        ],
+      }
+    );
+    const transport = vi.spyOn(OpenAiTransport.prototype, 'chatWithTools');
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'fixture-key' } },
+      maxRetries: 2,
+    });
+    await expect(
+      gateway.chatWithTools({
+        modelRef: 'openai:gpt-5.5',
+        messages: [{ role: 'user', content: 'fixture' }],
+        [field]: value,
+      })
+    ).rejects.toMatchObject({
+      code: 'LLM_INVALID_REQUEST',
+      message: expect.stringContaining(field),
+    });
+    expect(transport).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'topP',
+    'topK',
+  ] as const)('rejects non-finite numeric %s when its model rule allows it', (field) => {
+    const model = createThinkingModel();
+    model.parameterConstraints[field] = { allowed: true, min: 0, max: 1 };
+    expect(() => ParameterGuard.guard(model, { [field]: NaN })).toThrow(
+      expect.objectContaining({ code: 'LLM_INVALID_REQUEST' })
+    );
+  });
+
+  it('keeps unsupported numeric options filtered even if their values are invalid', () => {
+    const model = new ModelRegistry().resolve('claude', 'claude-opus-4-7');
+    if (!model) {
+      throw new Error('Fixture model missing');
+    }
+    expect(ParameterGuard.guard(model, { temperature: NaN, topP: NaN, topK: NaN })).toEqual({
+      filtered: [
+        expect.objectContaining({ param: 'temperature' }),
+        expect.objectContaining({ param: 'topP' }),
+        expect.objectContaining({ param: 'topK' }),
+      ],
+    });
+  });
+
   it('clamps allowed params and filters unsupported model params', () => {
     const guarded = ParameterGuard.guard(createThinkingModel(), {
       temperature: 5,

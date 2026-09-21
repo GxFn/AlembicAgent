@@ -2,7 +2,20 @@ import { Ajv, type Options, type ValidateFunction } from 'ajv';
 import { Ajv2019 } from 'ajv/dist/2019.js';
 import { Ajv2020 } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
+import { observeSafely } from '#shared/observers.js';
 import type { StructuredLogFn } from './structuredOutput.js';
+
+/** 诊断旁路不能把合法 JSON 变成失败，也不能覆盖原 schema/解析拒绝。 */
+function logSafely(
+  log: StructuredLogFn,
+  level: Parameters<StructuredLogFn>[0],
+  message: string
+): void {
+  observeSafely(
+    () => log(level, message),
+    () => undefined
+  );
+}
 
 /** 有 schema 时只接受完整 JSON，避免截断修复后恰好满足 schema 被当成完整输出。 */
 export function parseSchemaOutput(
@@ -14,13 +27,18 @@ export function parseSchemaOutput(
   const fence = /^```(?:json)?\s*\n([\s\S]*?)\n```$/u.exec(source);
   if (fence) {
     source = fence[1];
-    log('info', '[structured-output] outer_json_fence_removed; validating complete payload');
+    logSafely(
+      log,
+      'info',
+      '[structured-output] outer_json_fence_removed; validating complete payload'
+    );
   }
   try {
     const value: unknown = JSON.parse(source);
     return validate(value) ? value : null;
   } catch (err: unknown) {
-    log(
+    logSafely(
+      log,
       'warn',
       `[structured-output] parse_failed kind=${err instanceof SyntaxError ? 'invalid_json' : 'validation_error'}; no repair attempted`
     );
@@ -68,7 +86,8 @@ export function prepareStructuredValidation(
       throw new Error('Asynchronous output schemas are unsupported');
     }
   } catch (err: unknown) {
-    log(
+    logSafely(
+      log,
       'warn',
       `[structured-output] invalid_schema; model request skipped: ${err instanceof Error ? err.message : 'invalid schema'}`
     );
@@ -80,7 +99,8 @@ export function prepareStructuredValidation(
     }
     // 只记录位置与规则，不把模型输出、schema 或厂商原始响应写入日志。
     const first = validate.errors?.[0];
-    log(
+    logSafely(
+      log,
       'warn',
       `[structured-output] schema_mismatch path=${first?.instancePath || '/'} keyword=${first?.keyword ?? 'unknown'}; result rejected`
     );
