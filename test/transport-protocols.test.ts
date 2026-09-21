@@ -3,7 +3,7 @@ import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
-import { mockJsonFetch as mockFetch, responsesText } from './helpers/mockFetch.js';
+import { jsonResponse, mockJsonFetch as mockFetch, responsesText } from './helpers/mockFetch.js';
 
 /**
  * ClaudeTransport is the protocol-translation layer for the *primary* provider,
@@ -514,6 +514,76 @@ describe('DeepSeekTransport tool transcript preflight', () => {
       })
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('DeepSeek compatibility POST failure metadata', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { headers: { 'retry-after': '120' }, retryAfterMs: 120_000 },
+    { headers: { 'retry-after-ms': '2500', 'retry-after': '120' }, retryAfterMs: 2500 },
+    { headers: { 'retry-after': 'Thu, 01 Jan 2026 00:02:00 GMT' }, retryAfterMs: 120_000 },
+  ])('preserves Retry-After metadata and withholds provider body: $headers', async ({
+    headers,
+    retryAfterMs,
+  }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const response = jsonResponse(
+      { error: { message: 'PRIVATE_PROVIDER_RESPONSE' } },
+      429,
+      headers
+    );
+    const fetchMock = vi.fn(async () => response);
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new DeepSeekTransport({
+      apiKey: 'fixture',
+      baseUrl: 'https://embedding.invalid/v1',
+    });
+    const error = await transport.embed(['fixture']).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ status: 429, retryAfterMs, code: 'LLM_API_ERROR' });
+    expect((error as Error).message).not.toContain('PRIVATE_PROVIDER_RESPONSE');
+    expect((error as Error).message).not.toContain('embedding.invalid');
+    expect(response.bodyUsed).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    'rejects',
+    'never-settles',
+  ] as const)('keeps known HTTP failure when response-body cleanup %s', async (behavior) => {
+    const response = jsonResponse({ error: { message: 'PRIVATE_PROVIDER_RESPONSE' } }, 503, {
+      'retry-after': '60',
+    });
+    if (!response.body) {
+      throw new Error('Expected a response body for the cleanup fixture');
+    }
+    const cancel = vi
+      .spyOn(response.body, 'cancel')
+      .mockImplementation(() =>
+        behavior === 'rejects'
+          ? Promise.reject(new Error('cleanup diagnostic unavailable'))
+          : new Promise<void>(() => {})
+      );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => response)
+    );
+    const transport = new DeepSeekTransport({ apiKey: 'fixture', timeout: 20 });
+    const error = await transport.embed(['fixture']).catch((err: unknown) => err);
+    expect(error).toMatchObject({ status: 503, retryAfterMs: 60_000, code: 'LLM_API_ERROR' });
+    expect((error as Error).message).not.toContain('PRIVATE_PROVIDER_RESPONSE');
+    expect((error as Error).message).not.toContain('cleanup diagnostic unavailable');
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });
 

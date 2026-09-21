@@ -13,16 +13,23 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '../../shared/observers.js';
 import { runOperation } from '../../shared/operation.js';
 import { providerKeyEnv, type ResolvedConnection, resolveConnection } from '../configuration.js';
 import type {
+  ChatWithToolsResult,
+  FunctionCallResult,
   LlmCallOptions,
-  LlmContinuation,
   TokenUsage,
   ToolSchema,
   UnifiedMessage,
 } from '../contracts.js';
-import { createLlmAbortError, createMissingApiKeyError, throwIfLlmCancelled } from '../errors.js';
+import {
+  createLlmAbortError,
+  createLlmHttpError,
+  createMissingApiKeyError,
+  throwIfLlmCancelled,
+} from '../errors.js';
 import type { ProviderId } from '../registry/ModelDefs.js';
 import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schemaValidation.js';
 
@@ -30,83 +37,159 @@ import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schema
 //
 // undici ProxyAgent 内部维护连接池，必须按 proxyUrl 复用，否则在长驻 daemon 里
 // 每次请求都 new 一个会泄漏 socket / 文件句柄，且无 keep-alive 复用。
-// 用 null 缓存“已尝试但 undici 不可用 / 代理初始化失败”的结果，避免重复 import。
-const proxyDispatcherCache = new Map<string, unknown | null>();
+// entry 统一保存初始化和借用；失败结果为 null，避免重复 import。
+interface ProxyDispatcherEntry {
+  dispatcher: unknown | null;
+  readonly initialization: Promise<unknown | null>;
+  readonly owner: Map<string, ProxyDispatcherEntry>;
+  borrowers: number;
+  retired: boolean;
+}
+
+let proxyDispatcherCache: Map<string, ProxyDispatcherEntry> | null = null;
 const MAX_PROXY_DISPATCHER_CACHE_SIZE = 8;
+
+function currentProxyCache(): Map<string, ProxyDispatcherEntry> {
+  proxyDispatcherCache ??= new Map();
+  return proxyDispatcherCache;
+}
 
 function closeProxyDispatcher(dispatcher: unknown | null): void {
   if (!dispatcher || typeof dispatcher !== 'object') {
     return;
   }
   const disposable = dispatcher as { close?: () => unknown; destroy?: () => unknown };
-  try {
-    if (typeof disposable.close === 'function') {
-      disposable.close();
-      return;
-    }
-    disposable.destroy?.();
-  } catch {
-    /* best effort cache eviction */
+  // undici 的关闭方法返回 Promise；清理失败只影响资源诊断，不能逃逸为未处理拒绝。
+  observeSafely(
+    () => (typeof disposable.close === 'function' ? disposable.close() : disposable.destroy?.()),
+    () => undefined
+  );
+}
+
+function closeRetiredProxyEntry(entry: ProxyDispatcherEntry): void {
+  if (entry.retired && entry.borrowers === 0) {
+    const dispatcher = entry.dispatcher;
+    entry.dispatcher = null;
+    closeProxyDispatcher(dispatcher);
   }
 }
 
-function setProxyDispatcherCache(proxyUrl: string, dispatcher: unknown | null): void {
-  if (proxyDispatcherCache.has(proxyUrl)) {
-    closeProxyDispatcher(proxyDispatcherCache.get(proxyUrl) ?? null);
-    proxyDispatcherCache.delete(proxyUrl);
+function retireProxyEntry(entry: ProxyDispatcherEntry): void {
+  entry.retired = true;
+  closeRetiredProxyEntry(entry);
+}
+
+function createProxyEntry(
+  initialization: Promise<unknown | null>,
+  dispatcher: unknown | null = null,
+  borrowers = 0
+): ProxyDispatcherEntry {
+  return {
+    initialization,
+    dispatcher,
+    borrowers,
+    owner: currentProxyCache(),
+    retired: false,
+  };
+}
+
+function cacheProxyEntry(proxyUrl: string, entry: ProxyDispatcherEntry): void {
+  const cache = entry.owner;
+  const previous = cache.get(proxyUrl);
+  cache.delete(proxyUrl);
+  cache.set(proxyUrl, entry);
+  if (previous) {
+    retireProxyEntry(previous);
   }
-  proxyDispatcherCache.set(proxyUrl, dispatcher);
-  while (proxyDispatcherCache.size > MAX_PROXY_DISPATCHER_CACHE_SIZE) {
-    const oldest = proxyDispatcherCache.entries().next().value as
-      | [string, unknown | null]
-      | undefined;
+  while (cache.size > MAX_PROXY_DISPATCHER_CACHE_SIZE) {
+    const oldest = cache.entries().next().value;
     if (!oldest) {
       break;
     }
-    proxyDispatcherCache.delete(oldest[0]);
-    closeProxyDispatcher(oldest[1]);
+    cache.delete(oldest[0]);
+    retireProxyEntry(oldest[1]);
   }
 }
 
 export const __testingProxyDispatcherCache = {
   maxSize: MAX_PROXY_DISPATCHER_CACHE_SIZE,
   clear(): void {
-    for (const dispatcher of proxyDispatcherCache.values()) {
-      closeProxyDispatcher(dispatcher);
+    // 原有托管缓存的身份就是生命周期边界；先解绑，再清空并释放旧缓存快照。
+    const cache = proxyDispatcherCache;
+    proxyDispatcherCache = null;
+    const entries = [...(cache?.values() ?? [])];
+    cache?.clear();
+    for (const entry of entries) {
+      retireProxyEntry(entry);
     }
-    proxyDispatcherCache.clear();
   },
   keys(): string[] {
-    return [...proxyDispatcherCache.keys()];
+    return [...(proxyDispatcherCache?.keys() ?? [])];
   },
   set(proxyUrl: string, dispatcher: unknown | null): void {
-    setProxyDispatcherCache(proxyUrl, dispatcher);
+    cacheProxyEntry(proxyUrl, createProxyEntry(Promise.resolve(dispatcher), dispatcher));
   },
   size(): number {
-    return proxyDispatcherCache.size;
+    return proxyDispatcherCache?.size ?? 0;
   },
 };
 
 /**
- * 解析（并缓存）指定 proxyUrl 对应的 undici ProxyAgent dispatcher。
+ * 同步取得借用，再异步初始化；驱逐不能关闭尚在 import→fetch 交接中的 dispatcher。
  * undici 不可用或构造失败时返回 null（缓存，后续直连）。
  */
-async function getProxyDispatcher(proxyUrl: string): Promise<unknown | null> {
-  if (proxyDispatcherCache.has(proxyUrl)) {
-    const cached = proxyDispatcherCache.get(proxyUrl) ?? null;
-    proxyDispatcherCache.delete(proxyUrl);
-    proxyDispatcherCache.set(proxyUrl, cached);
+function borrowProxyDispatcher(proxyUrl: string): ProxyDispatcherEntry {
+  const cache = currentProxyCache();
+  const cached = cache.get(proxyUrl);
+  if (cached) {
+    cached.borrowers++;
+    cache.delete(proxyUrl);
+    cache.set(proxyUrl, cached);
     return cached;
   }
-  try {
-    const undici = await import('undici');
-    const dispatcher = new undici.ProxyAgent(proxyUrl);
-    setProxyDispatcherCache(proxyUrl, dispatcher);
-    return dispatcher;
-  } catch {
-    setProxyDispatcherCache(proxyUrl, null);
-    return null;
-  }
+  // 宿主可能以较早的 TS lib 检查公开源码；使用标准 Promise 构造，不要求 ES2024 类型库。
+  let resolveInitialization!: (dispatcher: unknown | null) => void;
+  let rejectInitialization!: (error: unknown) => void;
+  const initialization = new Promise<unknown | null>((resolve, reject) => {
+    resolveInitialization = resolve;
+    rejectInitialization = reject;
+  });
+  const entry = createProxyEntry(initialization, null, 1);
+  // 借用和共享 entry 必须在首次 await/import 前保留；LRU 只移除缓存拥有权。
+  cacheProxyEntry(proxyUrl, entry);
+  void (async () => {
+    try {
+      const undici = await import('undici');
+      if (entry.owner !== proxyDispatcherCache) {
+        throw createLlmAbortError('Proxy dispatcher cache was cleared during initialization');
+      }
+      entry.dispatcher = new undici.ProxyAgent(proxyUrl);
+      if (entry.owner !== proxyDispatcherCache) {
+        throw createLlmAbortError('Proxy dispatcher cache was cleared during initialization');
+      }
+      return entry.dispatcher;
+    } catch (err: unknown) {
+      if (entry.owner !== proxyDispatcherCache) {
+        // 缓存失效是资源取消，不得以 null 让旧请求绕过配置的代理直连。
+        throw createLlmAbortError('Proxy dispatcher cache was cleared during initialization');
+      }
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            '[LLMTransport] proxy initialization failed; direct fetch fallback',
+            {
+              reason: err instanceof Error ? err.name : 'unknown',
+            }
+          ),
+        () => undefined
+      );
+      if (entry.owner !== proxyDispatcherCache) {
+        throw createLlmAbortError('Proxy dispatcher cache was cleared during initialization');
+      }
+      return null;
+    }
+  })().then(resolveInitialization, rejectInitialization);
+  return entry;
 }
 
 // ─── Transport Request ──────────────────────────────────
@@ -131,21 +214,12 @@ export interface TransportRequest {
 
 // ─── Transport Response ─────────────────────────────────
 
-export interface TransportFunctionCall {
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-  thoughtSignature?: string;
-}
+/** 保留公开的 Transport 名称，字段由消息/结果共同使用的 AI 合同定义。 */
+export type TransportFunctionCall = FunctionCallResult;
 
-export interface TransportResponse {
-  text: string | null;
-  functionCalls: TransportFunctionCall[] | null;
+export interface TransportResponse extends ChatWithToolsResult {
+  /** Transport 明确报告已知用量或 null；Facade 继续兼容缺省 usage 的旧实现。 */
   usage: TokenUsage | null;
-  reasoningContent?: string | null;
-  continuation?: LlmContinuation;
-  /** Provider stop reason，例如 Chat Completions choice.finish_reason */
-  finishReason?: string | null;
 }
 
 // ─── Transport Config ───────────────────────────────────
@@ -274,17 +348,14 @@ export abstract class LLMTransport {
       });
 
       if (!res.ok) {
-        let detail = '';
-        try {
-          const errBody = await res.text();
-          const parsed = JSON.parse(errBody);
-          detail = parsed?.error?.message || errBody.slice(0, 300);
-        } catch {
-          /* best effort */
-        }
-        const err = Object.assign(
-          new Error(`${this.providerId} API error: ${res.status}${detail ? ` — ${detail}` : ''}`),
-          { status: res.status }
+        const err = createLlmHttpError(this.providerId, {
+          status: res.status,
+          responseHeaders: Object.fromEntries(res.headers),
+        });
+        // HTTP 事实已确认；释放失败响应体，但清理拒绝/悬挂不能覆盖它或泄露正文。
+        observeSafely(
+          () => res.body?.cancel(),
+          () => undefined
         );
         throw err;
       }
@@ -328,12 +399,21 @@ export abstract class LLMTransport {
     url: string | URL | Request,
     options: RequestInit = {}
   ): Promise<Response> {
+    throwIfLlmCancelled(options.signal);
     const proxyUrl = this.resolveProxyUrl();
     if (proxyUrl) {
-      const dispatcher = await getProxyDispatcher(proxyUrl);
-      if (dispatcher) {
-        // dispatcher 不在标准 RequestInit 类型里，但全局 fetch（undici）运行时识别。
-        return fetch(url, { ...options, dispatcher } as RequestInit);
+      const entry = borrowProxyDispatcher(proxyUrl);
+      try {
+        const dispatcher = await entry.initialization;
+        throwIfLlmCancelled(options.signal);
+        if (entry.owner !== proxyDispatcherCache) {
+          throw createLlmAbortError('Proxy dispatcher cache was cleared before fetch');
+        }
+        // 必须 await fetch 后再释放借用；undici.close 对已经 dispatch 的响应体仍是优雅关闭。
+        return await fetch(url, dispatcher ? ({ ...options, dispatcher } as RequestInit) : options);
+      } finally {
+        entry.borrowers--;
+        closeRetiredProxyEntry(entry);
       }
     }
     return fetch(url, options);

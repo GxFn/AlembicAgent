@@ -25,6 +25,14 @@ Current side effects and host responsibilities are described in
 `docs/entrypoint-effects.md`; public singleton compatibility and the existing
 Core-owned memory adapter exception remain in force.
 
+The 2026-09-21 AI review keeps the existing M1 proxy-cache owner and its cap of
+8. Its Map is now initialized lazily, and the Map identity invalidates pending
+initialization after clear. Entries share initialization and retain fetch borrows;
+eviction drops cache ownership, then closes the dispatcher after the last borrow.
+This needs no separate module-level generation counter or new managed owner. The
+old empty-Map lint exemption has been removed because the cache now uses the
+documented null-slot lifecycle; the HookSystem counter exemption remains.
+
 ## 1. Module-scope singletons and registries
 
 | Id | Item | Site | Disposition |

@@ -144,6 +144,166 @@ describe('LLMTransport proxy fetch wiring', () => {
     expect(text).toBe('direct');
   });
 
+  it('shares one live dispatcher across concurrent first requests', async () => {
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:7890';
+    const dispatchers: unknown[] = [];
+    const closedAtFetch: boolean[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        const dispatcher = (init as RequestInit & { dispatcher: { closed: boolean } }).dispatcher;
+        dispatchers.push(dispatcher);
+        closedAtFetch.push(dispatcher.closed);
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'via-proxy' } }] });
+      })
+    );
+    const transport = new OpenAiTransport({ apiKey: 'k' });
+    const request = { model: 'gpt-4o', messages: [{ role: 'user' as const, content: 'hi' }] };
+
+    expect(await Promise.all([transport.chat(request), transport.chat(request)])).toEqual([
+      'via-proxy',
+      'via-proxy',
+    ]);
+    expect(dispatchers[0]).toBeDefined();
+    expect(dispatchers[1]).toBe(dispatchers[0]);
+    expect(closedAtFetch).toEqual([false, false]);
+    expect(__testingProxyDispatcherCache.size()).toBe(1);
+  });
+
+  it.each([
+    'close',
+    'destroy',
+  ] as const)('consumes rejected asynchronous dispatcher %s cleanup', async (method) => {
+    const then = vi.fn((_resolve: unknown, reject: (error: Error) => void) => {
+      reject(new Error('dispatcher cleanup failed'));
+    });
+    __testingProxyDispatcherCache.set('http://fixture:8080', { [method]: () => ({ then }) });
+    __testingProxyDispatcherCache.clear();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(then).toHaveBeenCalledOnce();
+    expect(__testingProxyDispatcherCache.size()).toBe(0);
+  });
+
+  it.each([
+    'success',
+    'reject',
+    'cancel',
+  ] as const)('keeps nine cold-start dispatchers live through fetch and releases on %s', async (outcome) => {
+    class FixedProxyTransport extends OpenAiTransport {
+      constructor(private readonly proxyId: number) {
+        super({ apiKey: 'k', baseUrl: `https://fixture-${proxyId}.invalid/v1` });
+      }
+
+      protected override resolveProxyUrl(): string {
+        return `http://127.0.0.1:${8100 + this.proxyId}`;
+      }
+    }
+    const ready = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const cancelled = new AbortController();
+    const dispatchers = new Map<number, { closed: boolean }>();
+    const closedAtFetch: boolean[] = [];
+    const fetchMock = vi.fn(async (url, init: RequestInit) => {
+      const id = Number(new URL(String(url)).hostname.match(/fixture-(\d+)/)?.[1]);
+      const dispatcher = (init as RequestInit & { dispatcher: { closed: boolean } }).dispatcher;
+      dispatchers.set(id, dispatcher);
+      closedAtFetch.push(dispatcher.closed);
+      if (dispatchers.size === 9) {
+        ready.resolve();
+      }
+      if (id === 0 && outcome === 'cancel') {
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      await resume.promise;
+      if (id === 0 && outcome === 'reject') {
+        throw new Error('fixture request failed');
+      }
+      return jsonResponse({ choices: [{ index: 0, message: { content: 'via-proxy' } }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = Array.from({ length: 9 }, (_, index) =>
+      new FixedProxyTransport(index).chat({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        ...(index === 0 ? { abortSignal: cancelled.signal } : {}),
+      })
+    );
+    const settled = Promise.allSettled(pending);
+    try {
+      await ready.promise;
+      expect(closedAtFetch).toEqual(Array(9).fill(false));
+      expect(__testingProxyDispatcherCache.size()).toBe(8);
+      expect(dispatchers.get(0)?.closed).toBe(false);
+      if (outcome === 'cancel') {
+        cancelled.abort(new Error('fixture cancellation'));
+      }
+      resume.resolve();
+      const results = await settled;
+      expect(results[0].status).toBe(outcome === 'success' ? 'fulfilled' : 'rejected');
+      expect(results.slice(1).every((result) => result.status === 'fulfilled')).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(9);
+      expect(dispatchers.get(0)?.closed).toBe(true);
+      expect(__testingProxyDispatcherCache.size()).toBe(8);
+      __testingProxyDispatcherCache.clear();
+      expect([...dispatchers.values()].every((dispatcher) => dispatcher.closed)).toBe(true);
+    } finally {
+      cancelled.abort();
+      resume.resolve();
+      await settled;
+    }
+  });
+
+  it('does not revive a cleared cache when an older initialization finishes', async () => {
+    vi.resetModules();
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const createDispatcher = vi.fn(function ProxyAgentFixture() {
+      return { close: vi.fn(), closed: false };
+    });
+    vi.doMock('undici', async () => {
+      entered.resolve();
+      await resume.promise;
+      return { ProxyAgent: createDispatcher };
+    });
+    const { OpenAiTransport: FreshTransport } = await import(
+      '../src/ai/transport/OpenAiTransport.js'
+    );
+    const { __testingProxyDispatcherCache: freshCache } = await import(
+      '../src/ai/transport/LLMTransport.js'
+    );
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:7890';
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ choices: [{ index: 0, message: { content: 'fresh request' } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new FreshTransport({ apiKey: 'k' });
+    const request = { model: 'gpt-4o', messages: [{ role: 'user' as const, content: 'hi' }] };
+    const pending = transport.chat(request).catch((error: unknown) => error);
+    try {
+      await entered.promise;
+      freshCache.clear();
+      resume.resolve();
+      expect(await pending).toMatchObject({ name: 'AbortError' });
+      expect(freshCache.size()).toBe(0);
+      expect(createDispatcher).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      expect(await transport.chat(request)).toBe('fresh request');
+      expect(createDispatcher).toHaveBeenCalledOnce();
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(freshCache.size()).toBe(1);
+    } finally {
+      resume.resolve();
+      await pending;
+      freshCache.clear();
+      vi.doUnmock('undici');
+      vi.resetModules();
+    }
+  });
+
   it('evicts the oldest proxy dispatcher when the cache exceeds its bound', () => {
     const closed: string[] = [];
     for (let index = 0; index < __testingProxyDispatcherCache.maxSize + 1; index++) {

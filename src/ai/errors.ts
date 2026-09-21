@@ -37,6 +37,47 @@ export function createMissingApiKeyError(
   return err;
 }
 
+/** HTTP 事实的安全投影：只保留状态/退避信息，不携带 URL、凭据或响应正文。 */
+export function createLlmHttpError(
+  provider: string,
+  {
+    status,
+    responseHeaders = {},
+    retryableNetwork = false,
+    causeName,
+  }: {
+    status?: number;
+    responseHeaders?: Readonly<Record<string, string>>;
+    retryableNetwork?: boolean;
+    causeName?: string;
+  }
+) {
+  let retryAfterMs: number | undefined;
+  const milliseconds = Number(responseHeaders['retry-after-ms']);
+  if (responseHeaders['retry-after-ms'] !== undefined && Number.isFinite(milliseconds)) {
+    retryAfterMs = Math.max(0, milliseconds);
+  } else if (responseHeaders['retry-after']) {
+    const seconds = Number(responseHeaders['retry-after']);
+    const delay = Number.isFinite(seconds)
+      ? seconds * 1000
+      : Date.parse(responseHeaders['retry-after']) - Date.now();
+    if (Number.isFinite(delay)) {
+      retryAfterMs = Math.max(0, delay);
+    }
+  }
+  return Object.assign(
+    new Error(
+      `${provider} API request failed${status ? ` (HTTP ${status})` : ''}`,
+      causeName ? { cause: new Error(causeName) } : undefined
+    ),
+    {
+      status,
+      retryAfterMs,
+      code: status === undefined && retryableNetwork ? 'LLM_NETWORK_ERROR' : 'LLM_API_ERROR',
+    }
+  );
+}
+
 export function createLlmAbortError(reason?: unknown): Error & { code?: string } {
   if (reason instanceof Error && reason.name === 'AbortError') {
     return reason;

@@ -29,7 +29,7 @@
     {
       "name": "proxyDispatcherCache",
       "file": "src/ai/transport/LLMTransport.ts",
-      "policy": "Bounded Map (cap 8) with close/destroy on eviction and null-caching of failed initialization; rationale documented in-file (undici proxy connection-pool reuse in the resident daemon).",
+      "policy": "Lazy bounded Map (cap 8) owning initialization and fetch borrows. Map identity invalidates cleared generations; eviction releases cache ownership and closes dispatchers after the last borrower. Failed initialization is cached as null; no import-time resource creation.",
       "owner": "AlembicAgent window"
     },
     {
@@ -68,12 +68,6 @@
       "binding": "_hookCounter",
       "entry": "HookSystem id counter",
       "reason": "Monotonic uniqueness-only id counter (AD4 M3); behavioral hook state is instance-scoped."
-    },
-    {
-      "file": "src/ai/transport/LLMTransport.ts",
-      "binding": "proxyDispatcherCache",
-      "entry": "proxyDispatcherCache",
-      "reason": "Bounded cache with close-on-evict policy (AD4 M1, cap 8); deliberately module-scoped for daemon-wide undici connection-pool reuse."
     }
   ],
   "standingExceptionsOutOfScope": [
