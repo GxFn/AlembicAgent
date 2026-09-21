@@ -14,12 +14,13 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { configuredProvider, resolveConnection } from '../configuration.js';
 import type {
   ChatWithToolsResult,
-  FunctionCallResult,
   LlmCallOptions,
   TokenUsage,
+  TokenUsagePayload,
   ToolSchema,
   UnifiedMessage,
 } from '../contracts.js';
@@ -104,7 +105,7 @@ export interface GatewayConfig {
    * Token 用量回调 — 每次成功调用后触发，驱动全局预算 / 成本统计。
    * 与 AiProvider._onTokenUsage 对齐，由外部（如 DI 容器）注入。
    */
-  onUsage?: (usage: TokenUsage & { provider?: string; model?: string; source?: string }) => void;
+  onUsage?: (usage: TokenUsagePayload) => void;
 }
 
 // ─── LLMGateway ─────────────────────────────────────────
@@ -141,33 +142,24 @@ export class LLMGateway {
     });
 
     if (guarded.filtered.length > 0) {
-      logger().debug(
+      this.#log(
+        'debug',
         `[LLMGateway] ${modelDef.displayName} filtered params: ${guarded.filtered.map((f) => `${f.param}(${f.reason})`).join(', ')}`
       );
     }
 
     const transport = this.#getTransport(providerId);
-    const wasFiltered = (param: string) => guarded.filtered.some((f) => f.param === param);
-
     const transportReq: TransportRequest = {
       model: apiModelId,
       messages: request.messages,
       systemPrompt: request.systemPrompt,
       // none 是调用者的能力边界；厂商 wire 参数不支持不能把禁用意图过滤掉。
       tools: request.toolChoice === 'none' ? undefined : request.tools,
-      toolChoice:
-        request.toolChoice === 'none'
-          ? 'none'
-          : wasFiltered('toolChoice')
-            ? undefined
-            : (guarded.toolChoice ?? request.toolChoice),
-      temperature: wasFiltered('temperature')
-        ? undefined
-        : (guarded.temperature ?? request.temperature),
-      maxTokens: guarded.maxTokens ?? request.maxTokens,
-      reasoningEffort: wasFiltered('reasoningEffort')
-        ? undefined
-        : (guarded.reasoningEffort ?? request.reasoningEffort),
+      // filtered 是审计信息，也可能说明已替换为模型默认值；实际输出以 guard 结果为准。
+      toolChoice: request.toolChoice === 'none' ? 'none' : guarded.toolChoice,
+      temperature: guarded.temperature,
+      maxTokens: guarded.maxTokens,
+      reasoningEffort: guarded.reasoningEffort,
       abortSignal: request.abortSignal,
       responseFormat: request.responseFormat,
       schema: request.schema,
@@ -336,7 +328,7 @@ export class LLMGateway {
       };
     }
 
-    const modelDef = registry.get(modelRef);
+    const modelDef = registry.get(modelRef) ?? registry.findByApiModelId(modelRef);
     if (modelDef) {
       return {
         modelDef,
@@ -346,6 +338,10 @@ export class LLMGateway {
     }
 
     const guessed = this.#guessProvider(modelRef);
+    this.#log(
+      'debug',
+      `[LLMGateway] unregistered_model_fallback provider=${guessed}; explicit provider prefix remains authoritative`
+    );
     const resolved = registry.resolveOrCreate(guessed, modelRef);
     return {
       modelDef: resolved,
@@ -374,10 +370,17 @@ export class LLMGateway {
 
   /** 桥接 core Logger（控制器 / 结构化提取的日志回调）。 */
   #log(level: string, message: string): void {
-    const fn = (logger() as unknown as Record<string, (msg: string) => void>)[level];
-    if (typeof fn === 'function') {
-      fn.call(logger(), message);
-    }
+    observeSafely(
+      () => {
+        const target = logger();
+        const fn = (target as unknown as Record<string, (msg: string) => unknown>)[level];
+        if (typeof fn === 'function') {
+          return fn.call(target, message);
+        }
+        return undefined;
+      },
+      () => undefined
+    );
   }
 
   /** 每个 provider 独立的可靠性控制器（熔断 / 并发 / 限流隔离）。 */
@@ -420,11 +423,14 @@ export class LLMGateway {
     if (total === 0) {
       return;
     }
-    try {
-      this.#config.onUsage({ ...usage, provider, model, source });
-    } catch {
-      /* token tracking should never break execution */
-    }
+    observeSafely(
+      () => this.#config.onUsage?.({ ...usage, provider, model, source }),
+      () =>
+        this.#log(
+          'warn',
+          `[LLMGateway] usage_observer_failed provider=${provider} source=${source}; response retained without replay`
+        )
+    );
   }
 
   // ─── Transport Lifecycle ──────────────────────────────
@@ -467,21 +473,18 @@ export class LLMGateway {
   // ─── Response Normalization ───────────────────────────
 
   #normalizeResponse(response: TransportResponse): ChatWithToolsResult {
-    const functionCalls: FunctionCallResult[] | null = response.functionCalls
-      ? response.functionCalls.map((fc) => ({
-          id: fc.id,
-          name: fc.name,
-          args: fc.args,
-          thoughtSignature: fc.thoughtSignature,
-        }))
-      : null;
-
-    const usage: TokenUsage | null = response.usage;
-
+    // 公开投影仍逐字段复制，避免把 Transport 扩展/原始响应带出；空值兼容保持不变。
     return {
       text: response.text,
-      functionCalls,
-      usage,
+      functionCalls: response.functionCalls
+        ? response.functionCalls.map((fc) => ({
+            id: fc.id,
+            name: fc.name,
+            args: fc.args,
+            thoughtSignature: fc.thoughtSignature,
+          }))
+        : null,
+      usage: response.usage,
       reasoningContent: response.reasoningContent ?? undefined,
       continuation: response.continuation,
       finishReason: response.finishReason ?? undefined,

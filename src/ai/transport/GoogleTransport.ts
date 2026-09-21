@@ -9,8 +9,9 @@ import {
   type TransportRequest,
   type TransportResponse,
 } from './LLMTransport.js';
+import { type SdkCallContext, sdkConnection } from './sdkContext.js';
 import { normalizeSdkError } from './sdkErrors.js';
-import { type SdkCallContext, sdkCallOptions, sdkConnection, sdkResponse } from './sdkProtocol.js';
+import { sdkCallOptions, sdkResponse } from './sdkProtocol.js';
 
 export class GoogleTransport extends LLMTransport {
   readonly #client: GoogleProvider;

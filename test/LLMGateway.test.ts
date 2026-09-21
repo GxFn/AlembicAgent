@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getLLMGateway, LLMGateway, resetLLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
@@ -13,6 +14,46 @@ function stubFetch(response: Record<string, unknown>) {
 }
 
 describe('LLMGateway horizontal capabilities', () => {
+  it.each([
+    'sync',
+    'async',
+    'thenable',
+  ])('isolates a %s usage observer without losing a completed response or replaying HTTP', async (mode) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    stubFetch({
+      choices: [{ index: 0, message: { content: 'confirmed reply' } }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    });
+    const failure = new Error('private observer payload');
+    const onUsage = vi.fn(() => {
+      if (mode === 'async') {
+        return Promise.reject(failure);
+      }
+      if (mode === 'thenable') {
+        // biome-ignore lint/suspicious/noThenProperty: PromiseLike observer fixture must exercise non-Promise assimilation.
+        return { then: (_resolve: unknown, reject: (error: Error) => void) => reject(failure) };
+      }
+      throw failure;
+    });
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'test-key' } },
+      maxRetries: 1,
+      onUsage,
+    });
+    expect(await gateway.chat({ modelRef: 'openai:gpt-4o', prompt: 'hello' })).toBe(
+      'confirmed reply'
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 5, outputTokens: 3 })
+    );
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('usage_observer_failed'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('private observer payload');
+  });
+
   // Main 不再维护第二套 SDK/transport 单测；保留原有独特合同到其实现仓库。
   it.each([
     ['openai:gpt-5.5', 'openai', 'gpt-5.5'],
@@ -22,8 +63,33 @@ describe('LLMGateway horizontal capabilities', () => {
     ['gpt-5.5', 'openai', 'gpt-5.5'],
     ['claude-sonnet-4-6', 'claude', 'claude-sonnet-4-6'],
     ['openai:custom-model', 'openai', 'custom-model'],
+    ['custom-unregistered', 'openai', 'custom-unregistered'],
   ])('resolves %s without a network request', (modelRef, provider, apiModelId) => {
     expect(new LLMGateway().getModelDef(modelRef)).toMatchObject({ provider, apiModelId });
+  });
+
+  it.each([
+    'llama3',
+    'qwen2',
+  ])('uses the registered provider for the bare model %s', async (modelRef) => {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url) => {
+        requests.push(String(url));
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'done' } }] });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: {
+        ollama: { apiKey: 'fixture-key', baseUrl: 'http://ollama.example.invalid/v1' },
+        openai: { apiKey: 'fixture-key', baseUrl: 'https://wrong-route.example.invalid/v1' },
+      },
+      maxRetries: 0,
+    });
+    expect(await gateway.chat({ modelRef, prompt: 'hello' })).toBe('done');
+    expect(requests).toEqual(['http://ollama.example.invalid/v1/chat/completions']);
+    expect(gateway.getModelDef(modelRef).provider).toBe('ollama');
   });
 
   it.each([
@@ -73,6 +139,31 @@ describe('LLMGateway horizontal capabilities', () => {
     });
     expect(body.temperature).toBeUndefined();
     expect(result).toMatchObject({ text: 'done', usage: { inputTokens: 10, outputTokens: 5 } });
+  });
+
+  it('forwards the guard replacement for an invalid effort to the real SDK request', async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        body = JSON.parse(String(init.body));
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'done' } }] });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    const model = gateway.getModelDef('openai:gpt-5.5');
+    await gateway.chatWithTools({
+      modelRef: model.id,
+      messages: [{ role: 'user', content: 'hello' }],
+      reasoningEffort: 'invalid-effort',
+      temperature: 5,
+      maxTokens: model.maxOutputTokens + 1,
+    });
+    expect(body.reasoning_effort).toBe(model.reasoning.defaultEffort);
+    expect(body.max_completion_tokens).toBe(model.maxOutputTokens);
   });
 
   it('stops provider fallback when the caller cancels the probe chain', async () => {
@@ -153,6 +244,7 @@ describe('LLMGateway horizontal capabilities', () => {
   });
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     resetLLMGateway();
   });
 

@@ -14,14 +14,9 @@ import {
   type TransportRequest,
   type TransportResponse,
 } from './LLMTransport.js';
+import { type SdkCallContext, sdkConnection } from './sdkContext.js';
 import { normalizeSdkError } from './sdkErrors.js';
-import {
-  isRecord,
-  type SdkCallContext,
-  sdkCallOptions,
-  sdkConnection,
-  sdkResponse,
-} from './sdkProtocol.js';
+import { isRecord, sdkCallOptions, sdkResponse } from './sdkProtocol.js';
 
 export class OpenAiTransport extends LLMTransport {
   readonly #client: OpenAIProvider;
@@ -43,6 +38,15 @@ export class OpenAiTransport extends LLMTransport {
 
   async chat(request: TransportRequest): Promise<string> {
     return (await this.chatWithTools(request)).text || '';
+  }
+
+  override get maxEmbeddingBatchSize(): number {
+    // 显式兼容 embedding 也必须遵守固定版本 SDK 的单批容量；调度/重试仍由 Gateway 拥有。
+    const limit = this.#client.embeddingModel(this.#embedModel).maxEmbeddingsPerCall;
+    if (typeof limit !== 'number') {
+      throw new Error('OpenAI SDK embedding batch limit must be synchronously available');
+    }
+    return limit;
   }
 
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {

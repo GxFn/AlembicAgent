@@ -60,6 +60,8 @@ interface LlmContinuationScope {
   model: string;
   /** 连接身份摘要；不携带原始 endpoint 或凭据，防止跨连接复用服务端 item。 */
   connection: string;
+  /** 新回执绑定当前消息与原生附件；旧无摘要历史仅走显式未验证兼容路径。 */
+  projectionHash?: string;
 }
 
 /** 仅为模型协议回传提示，不代表 Agent 运行状态或工具执行授权。 */
@@ -76,12 +78,7 @@ export interface UnifiedMessage {
   /** DeepSeek V4 thinking / 推理内容，多轮对话需原样回传 */
   reasoningContent?: string | null;
   continuation?: LlmContinuation;
-  toolCalls?: Array<{
-    id: string;
-    name: string;
-    args: Record<string, unknown>;
-    thoughtSignature?: string;
-  }>;
+  toolCalls?: FunctionCallResult[];
   toolCallId?: string;
   name?: string;
 }
@@ -134,6 +131,13 @@ export interface TokenUsage {
   cacheHitTokens?: number;
   /** Provider 报告的缓存创建输入 token；已计入 inputTokens。 */
   cacheWriteTokens?: number;
+}
+
+/** 请求级用量通知；归属随回执固定，不从可能已切换的 Provider 实例重新读取。 */
+export interface TokenUsagePayload extends TokenUsage {
+  provider?: string;
+  model?: string;
+  source?: string;
 }
 
 /** chatWithStructuredOutput 选项 */

@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/ContextWindow.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
@@ -263,7 +264,77 @@ async function toolRound(provider: AiProvider) {
 }
 
 describe('native SDK provider contracts', () => {
+  it.each([
+    'append',
+    'prepend',
+    'omitted-part',
+    'overlap',
+    'reasoning-only',
+  ])('preserves the current assistant text when continuation coverage changed: %s', async (change) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const content = [
+      { type: 'thinking', thinking: 'private reasoning', signature: 'old_signature' },
+      ...(change === 'reasoning-only'
+        ? []
+        : [
+            { type: 'text', text: 'First' },
+            { type: 'text', text: 'Last' },
+          ]),
+    ];
+    const bodies: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({
+          id: 'msg_fixture',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-4-6',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          content: bodies.length === 1 ? content : [{ type: 'text', text: 'done' }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        });
+      })
+    );
+    const provider = new ClaudeProvider({ apiKey: 'test-key', maxRetries: 0 });
+    const first = await provider.chatWithTools('hello');
+    const continuation = structuredClone(first.continuation);
+    if (!continuation || continuation.kind !== 'content-replay-v1') {
+      throw new Error('fixture did not produce native replay metadata');
+    }
+    let text = first.text || '';
+    if (change === 'append' || change === 'reasoning-only') {
+      text += ' appended context';
+    } else if (change === 'prepend') {
+      text = `extra context ${text}`;
+    } else if (change === 'omitted-part') {
+      continuation.parts.pop();
+    } else {
+      const last = continuation.parts.at(-1);
+      if (!last || last.type !== 'text') {
+        throw new Error('fixture has no final text range');
+      }
+      last.start = 0;
+    }
+    await provider.chatWithTools('', {
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: text, continuation },
+        { role: 'user', content: 'continue' },
+      ],
+    });
+    expect(bodies[1].messages.find((message) => message.role === 'assistant')?.content).toEqual([
+      { type: 'text', text },
+    ]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('reason=text_projection_changed'));
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps local SDK input rejection from poisoning the provider circuit', async () => {
+    // 强制过大单批以独立覆盖真实 SDK 的本地拒绝；正常 Gateway 应按已声明容量切批。
+    vi.spyOn(OpenAiTransport.prototype, 'maxEmbeddingBatchSize', 'get').mockReturnValue(Infinity);
     const fetchMock = vi.fn(async () =>
       jsonResponse({
         choices: [
@@ -288,6 +359,42 @@ describe('native SDK provider contracts', () => {
       'healthy'
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('batches explicit OpenAI embedding compatibility calls at the SDK limit without replaying completed batches', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const batches: number[][] = [];
+    let failedSecond = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        const body = JSON.parse(String(init.body));
+        const inputs = (body.input as string[]).map(Number);
+        batches.push(inputs);
+        if (inputs[0] === 2048 && !failedSecond) {
+          failedSecond = true;
+          return jsonResponse({ error: { message: 'temporary batch failure' } }, 503);
+        }
+        return jsonResponse({
+          data: inputs.map((value, index) => ({ index, embedding: [value, 1] })),
+          usage: { prompt_tokens: inputs.length, total_tokens: inputs.length },
+        });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'fixture-key' } },
+      maxRetries: 1,
+    });
+    const vectors = await gateway.embed(
+      'openai:gpt-4o',
+      Array.from({ length: 2049 }, (_, index) => String(index))
+    );
+    expect(vectors).toEqual(Array.from({ length: 2049 }, (_, index) => [index, 1]));
+    expect(batches.map((batch) => [batch[0], batch.length])).toEqual([
+      [0, 2048],
+      [2048, 1],
+      [2048, 1],
+    ]);
   });
   it.each([
     'stored-reasoning-v1',
@@ -658,6 +765,94 @@ describe('native SDK provider contracts', () => {
     expect(first.text).toBe('Looking');
     expect(second.text).toBe('done');
     expect(bodies[1].contents.find((message) => message.role === 'model')?.parts).toEqual(parts);
+  });
+
+  it.each([
+    'text',
+    'arguments',
+    'signature',
+    'hash',
+    'legacy',
+  ])('binds native Google replay to its captured message projection: %s', async (change) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const originalParts = [
+      { text: 'private reasoning', thought: true, thoughtSignature: 'sig_thinking' },
+      { text: 'First', thoughtSignature: 'sig_text' },
+      {
+        functionCall: { id: 'g1', name: 'lookup', args: { q: 'x' } },
+        thoughtSignature: 'sig_call',
+      },
+    ];
+    const bodies: Array<{ contents: Array<{ role: string; parts: unknown[] }> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: bodies.length === 1 ? originalParts : [{ text: 'done' }],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        });
+      })
+    );
+    const provider = new GoogleGeminiProvider({
+      apiKey: 'test-key',
+      model: 'gemini-3-flash-preview',
+      maxRetries: 0,
+    });
+    const tools = [
+      { name: 'lookup', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+    ];
+    const first = await provider.chatWithTools('lookup', { toolSchemas: tools });
+    const continuation = structuredClone(first.continuation) as LlmContinuation & {
+      projectionHash?: string;
+    };
+    const calls = structuredClone(first.functionCalls || []);
+    let text = first.text || '';
+    if (continuation.kind !== 'content-replay-v1') {
+      throw new Error('fixture did not produce native replay metadata');
+    }
+    if (change === 'text') {
+      text = 'Other'; // 等长改动不会改变既有范围。
+    } else if (change === 'arguments') {
+      calls[0].args.q = 'changed';
+    } else if (change === 'signature') {
+      const part = continuation.parts.find((part) => part.type === 'text');
+      if (part?.type === 'text') {
+        part.thoughtSignature = 'changed_signature';
+      }
+    } else if (change === 'hash') {
+      continuation.projectionHash = 'invalid';
+    } else {
+      delete continuation.projectionHash;
+    }
+    await provider.chatWithTools('', {
+      toolSchemas: tools,
+      messages: [
+        { role: 'user', content: 'lookup' },
+        { role: 'assistant', content: text, toolCalls: calls, continuation },
+        { role: 'tool', toolCallId: calls[0].id, name: 'lookup', content: 'found' },
+      ],
+    });
+    const parts = bodies[1].contents.find((message) => message.role === 'model')?.parts;
+    if (change === 'legacy') {
+      expect(parts).toEqual(originalParts);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('legacy_projection_unverified'));
+    } else {
+      expect(parts).toContainEqual({ text });
+      expect(parts).toContainEqual(
+        expect.objectContaining({ functionCall: expect.objectContaining({ args: calls[0].args }) })
+      );
+      expect(JSON.stringify(parts)).not.toMatch(/sig_thinking|sig_text|sig_call|changed_signature/);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('projection_binding_changed'));
+    }
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
   it('preserves Claude stop reason and complete cache accounting without exposing thinking as text', async () => {
     vi.stubGlobal(

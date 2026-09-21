@@ -1,9 +1,10 @@
 /**
- * AiProvider - AI 提供商抽象基类
- * 所有具体 Provider 必须实现这3个方法
+ * AiProvider — 公开 Provider 门面及宿主用量通知。
+ * 具体 Provider 固定身份/配置，并将生成协议与可靠性委托给 Gateway/Transport。
  */
 
 import { LanguageService } from '@alembic/core/shared';
+import { observeSafely } from '#shared/observers.js';
 import type {
   AiLogger,
   AiProviderConfig,
@@ -16,7 +17,7 @@ import type {
   LanguageProfile,
   LlmCallOptions,
   StructuredOutputOptions,
-  TokenUsage,
+  TokenUsagePayload,
   UnifiedMessage,
 } from './contracts.js';
 import { throwIfLlmCancelled } from './errors.js';
@@ -46,7 +47,7 @@ export class AiProvider {
    * Token 用量回调 — 每次 API 调用后触发（包括 chat / chatWithStructuredOutput / chatWithTools）
    * 由外部（如 DI 容器）注入以实现全局 token 计量。
    */
-  _onTokenUsage: ((usage: TokenUsage & { source?: string }) => void) | null = null;
+  _onTokenUsage: ((usage: TokenUsagePayload) => void) | null = null;
 
   /** 协议下沉 transport 后，本 provider 专属的 LLMGateway 实例（lazy 构造）。 */
   #gateway: LLMGateway | null = null;
@@ -87,19 +88,21 @@ export class AiProvider {
    * 从 API 原始响应中提取 token 用量并触发回调。
    * 子类在 chat() / chatWithStructuredOutput() 中调用。
    */
-  _emitTokenUsage(usage: TokenUsage | null | undefined, source?: string) {
-    if (!usage || !this._onTokenUsage) {
+  _emitTokenUsage(usage: TokenUsagePayload | null | undefined, source?: string) {
+    const observer = this._onTokenUsage;
+    if (!usage || !observer) {
       return;
     }
     const total = (usage.inputTokens || 0) + (usage.outputTokens || 0);
     if (total === 0) {
       return;
     }
-    try {
-      this._onTokenUsage({ ...usage, source });
-    } catch {
-      /* token tracking should never break execution */
-    }
+    // 直接使用 Provider 的宿主也可能返回 Promise；计量观察失败不能重发已完成的请求。
+    observeSafely(
+      () => observer.call(this, { ...usage, source }),
+      () =>
+        this._log('warn', `[${this.name}] usage_observer_failed; response and known usage retained`)
+    );
   }
 
   /** summarize 的 maxTokens 预算；子类可覆写（如 Gemini 用更大的 8192）。 */

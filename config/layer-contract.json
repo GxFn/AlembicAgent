@@ -48,7 +48,8 @@
       "src/ai/transport/ClaudeTransport.ts",
       "src/ai/transport/DeepSeekTransport.ts",
       "src/ai/transport/sdkProtocol.ts",
-      "src/ai/transport/sdkContinuation.ts"
+      "src/ai/transport/sdkContinuation.ts",
+      "src/ai/transport/sdkContext.ts"
     ],
     "runtimeImports": {
       "src/ai/AiProviderManager.ts": [
@@ -64,12 +65,13 @@
         "src/ai/registry/ProviderConfig.ts",
         "src/ai/shared/concurrency.ts"
       ],
-      "src/ai/shared/concurrency.ts": ["@alembic/core/logging"],
+      "src/ai/shared/concurrency.ts": ["@alembic/core/logging", "src/shared/observers.ts"],
       "src/ai/transport/sdkContinuation.ts": [
-        "@alembic/core/logging"
+        "@alembic/core/logging",
+        "src/shared/observers.ts",
+        "src/ai/transport/sdkContext.ts"
       ],
       "src/ai/transport/sdkProtocol.ts": [
-        "node:crypto",
         "@alembic/core/logging",
         "src/ai/errors.ts",
         "src/ai/shared/schemaValidation.ts",
@@ -82,20 +84,23 @@
         "src/ai/toolTranscript.ts",
         "src/ai/transport/LLMTransport.ts",
         "src/ai/transport/sdkErrors.ts",
-        "src/ai/transport/sdkProtocol.ts"
+        "src/ai/transport/sdkProtocol.ts",
+        "src/ai/transport/sdkContext.ts"
       ],
       "src/ai/transport/ClaudeTransport.ts": [
         "@ai-sdk/anthropic",
         "src/ai/transport/LLMTransport.ts",
         "src/ai/transport/sdkErrors.ts",
-        "src/ai/transport/sdkProtocol.ts"
+        "src/ai/transport/sdkProtocol.ts",
+        "src/ai/transport/sdkContext.ts"
       ],
       "src/ai/transport/GoogleTransport.ts": [
         "@ai-sdk/google",
         "@alembic/core/logging",
         "src/ai/transport/LLMTransport.ts",
         "src/ai/transport/sdkErrors.ts",
-        "src/ai/transport/sdkProtocol.ts"
+        "src/ai/transport/sdkProtocol.ts",
+        "src/ai/transport/sdkContext.ts"
       ],
       "src/ai/contracts.ts": [],
       "src/ai/errors.ts": [],
@@ -105,18 +110,18 @@
         "src/shared/operation.ts",
         "src/ai/errors.ts",
         "src/ai/shared/schemaValidation.ts",
-        "undici"
+        "undici",
+        "src/shared/observers.ts"
       ],
       "src/ai/transport/OpenAiTransport.ts": [
         "@ai-sdk/openai",
         "@alembic/core/logging",
         "src/ai/transport/LLMTransport.ts",
         "src/ai/transport/sdkErrors.ts",
-        "src/ai/transport/sdkProtocol.ts"
+        "src/ai/transport/sdkProtocol.ts",
+        "src/ai/transport/sdkContext.ts"
       ],
-      "src/ai/transport/sdkErrors.ts": [
-        "@ai-sdk/provider"
-      ],
+      "src/ai/transport/sdkErrors.ts": ["@ai-sdk/provider", "src/ai/errors.ts"],
       "src/tools/kernel/toolSchema.ts": [],
       "src/tools/kernel/toolSelection.ts": [],
       "src/tools/kernel/availability.ts": [],
@@ -135,9 +140,7 @@
       ],
       "src/agent/runtime/toolPipeline/contracts.ts": [],
       "src/agent/runtime/toolPipeline/engine.ts": [],
-      "src/agent/runtime/toolPipeline/callNormalization.ts": [
-        "src/tools/runtime/registry.ts"
-      ],
+      "src/agent/runtime/toolPipeline/callNormalization.ts": ["src/tools/runtime/registry.ts"],
       "src/agent/runtime/toolPipeline/runtimeBridge.ts": [
         "src/tools/kernel/index.ts",
         "src/agent/policies/index.ts",
@@ -162,9 +165,7 @@
         "src/agent/evidence/EvidenceCapture.ts",
         "src/agent/utils/toolOutcomes.ts"
       ],
-      "src/agent/runtime/toolPipeline/submissionLedger.ts": [
-        "src/agent/utils/toolOutcomes.ts"
-      ],
+      "src/agent/runtime/toolPipeline/submissionLedger.ts": ["src/agent/utils/toolOutcomes.ts"],
       "src/shared/operation.ts": [],
       "src/agent/strategies/pipeline/contracts.ts": [],
       "src/agent/strategies/pipeline/attempt.ts": [
@@ -271,9 +272,8 @@
         "@alembic/core/production",
         "src/agent/production/strict/primitives.ts"
       ],
-      "src/agent/production/strict/primitives.ts": [
-        "node:crypto"
-      ]
+      "src/agent/production/strict/primitives.ts": ["node:crypto"],
+      "src/ai/transport/sdkContext.ts": ["node:crypto", "src/shared/serialization.ts"]
     }
   },
   "cycleFindings": [

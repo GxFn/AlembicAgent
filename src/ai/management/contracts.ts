@@ -1,5 +1,7 @@
 /** Provider 路由与计量合同；只依赖 AI DTO，不引入具体 Provider 或宿主。 */
-import type { TokenUsage } from '../contracts.js';
+import type { TokenUsagePayload } from '../contracts.js';
+
+export type { TokenUsagePayload } from '../contracts.js';
 
 /** AI Provider 最小接口（避免引入 AiProvider 具体类的循环依赖） */
 export interface ManagedAiProvider {
@@ -9,13 +11,6 @@ export interface ManagedAiProvider {
   _onTokenUsage?: ((usage: TokenUsagePayload) => void) | null;
   supportsEmbedding?: () => boolean;
   _fallbackFrom?: string;
-}
-
-export interface TokenUsagePayload extends TokenUsage {
-  /** 本次请求归属；旧 Provider 的在途响应不依赖可变实例字段。 */
-  provider?: string;
-  model?: string;
-  source?: string;
 }
 
 /** Token 记录器最小接口（对应 TokenUsageStore.record） */

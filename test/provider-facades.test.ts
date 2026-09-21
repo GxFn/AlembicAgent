@@ -11,6 +11,54 @@ describe('AI provider facade lifecycle and configuration', () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([
+    'synchronous',
+    'asynchronous',
+  ])('isolates a direct %s usage observer failure without losing the response or replaying HTTP', async (mode) => {
+    const fetchMock = mockFetch(
+      {},
+      {
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'known response' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+      }
+    );
+    const provider = new OpenAiProvider({ apiKey: 'fixture-key', model: 'gpt-4o', maxRetries: 0 });
+    const warn = vi.fn();
+    provider.logger = { warn };
+    const observer = vi.fn(() => {
+      const error = new Error('fixture-private-observer-detail');
+      if (mode === 'asynchronous') {
+        return Promise.reject(error);
+      }
+      throw error;
+    });
+    provider._onTokenUsage = observer;
+
+    const result = await provider.chatWithTools('fixture prompt');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(result).toMatchObject({
+      text: 'known response',
+      usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observer).toHaveBeenCalledExactlyOnceWith({
+      inputTokens: 2,
+      outputTokens: 3,
+      totalTokens: 5,
+      provider: 'openai',
+      model: 'gpt-4o',
+      source: 'tools',
+    });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('usage_observer_failed'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('fixture-private-observer-detail');
+  });
+
   it.each(
     [OpenAiProvider, GoogleGeminiProvider, DeepSeekProvider, ClaudeProvider, OllamaProvider].map(
       (Provider) => ({ name: Provider.name, Provider })

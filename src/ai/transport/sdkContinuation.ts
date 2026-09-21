@@ -1,20 +1,26 @@
 /** 只保存协议续接信息；工具参数和可见文本仍由当前消息拥有。 */
 import type { LanguageModelV4GenerateResult, LanguageModelV4Prompt } from '@ai-sdk/provider';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { LlmContinuation, LlmReplayPart, UnifiedMessage } from '../contracts.js';
-import type { SdkCallContext } from './sdkProtocol.js';
+import { type SdkCallContext, sdkProjectionHash } from './sdkContext.js';
 
 type AssistantParts = Extract<LanguageModelV4Prompt[number], { role: 'assistant' }>['content'];
 
 export function captureSdkContinuation(
   result: LanguageModelV4GenerateResult,
-  context: SdkCallContext
+  context: SdkCallContext,
+  message: Pick<UnifiedMessage, 'content' | 'toolCalls'>
 ): LlmContinuation | undefined {
   const scope = {
     provider: context.provider,
     model: context.model,
     connection: context.connection,
   };
+  const bind = (continuation: LlmContinuation): LlmContinuation => ({
+    ...continuation,
+    projectionHash: sdkProjectionHash(message, continuation),
+  });
   if (context.protocol === 'responses') {
     const ids = [
       ...new Set(
@@ -25,7 +31,7 @@ export function captureSdkContinuation(
       ),
     ];
     return ids.length
-      ? { ...scope, kind: 'stored-reasoning-v1', reasoningItemIds: ids }
+      ? bind({ ...scope, kind: 'stored-reasoning-v1', reasoningItemIds: ids })
       : undefined;
   }
   if (!['google', 'anthropic', 'deepseek'].includes(context.protocol)) {
@@ -70,7 +76,7 @@ export function captureSdkContinuation(
       });
     }
   }
-  return required ? { ...scope, kind: 'content-replay-v1', parts } : undefined;
+  return required ? bind({ ...scope, kind: 'content-replay-v1', parts }) : undefined;
 }
 
 export function replaySdkContinuation(
@@ -81,8 +87,13 @@ export function replaySdkContinuation(
   if (!continuation) {
     return undefined;
   }
+  const warn = (message: string) =>
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
   const reject = (reason: string) => {
-    Logger.getInstance().warn(
+    warn(
       `[ai-sdk] continuation_filtered provider=${context.provider} model=${context.model} reason=${reason}; native metadata omitted`
     );
     return undefined;
@@ -94,6 +105,27 @@ export function replaySdkContinuation(
   ) {
     return reject('identity_mismatch');
   }
+  const validateBinding = (): boolean => {
+    if (continuation.projectionHash === undefined) {
+      // 旧持久化回执无法补造原文摘要；保留已有身份/范围检查并明确兼容限制。
+      warn(
+        `[ai-sdk] legacy_projection_unverified provider=${context.provider} model=${context.model}; retaining legacy identity/range checks`
+      );
+      return true;
+    }
+    try {
+      if (
+        typeof continuation.projectionHash === 'string' &&
+        continuation.projectionHash === sdkProjectionHash(message, continuation)
+      ) {
+        return true;
+      }
+    } catch (err: unknown) {
+      void err;
+    }
+    reject('projection_binding_changed');
+    return false;
+  };
   if (continuation.kind === 'stored-reasoning-v1') {
     if (
       context.protocol !== 'responses' ||
@@ -101,6 +133,9 @@ export function replaySdkContinuation(
       !continuation.reasoningItemIds.every((id) => typeof id === 'string' && id.length > 0)
     ) {
       return reject('invalid_stored_items');
+    }
+    if (!validateBinding()) {
+      return undefined;
     }
     return {
       parts: continuation.reasoningItemIds.map((itemId) => ({
@@ -121,21 +156,29 @@ export function replaySdkContinuation(
   }
   const parts: AssistantParts = [];
   const text = message.content || '';
+  let textOffset = 0;
+  let hasText = false;
   const calls = new Map((message.toolCalls || []).map((call) => [call.id, call]));
   for (const part of continuation.parts) {
     if (!part || typeof part !== 'object') {
       return reject('invalid_part');
     }
     if (part.type === 'text') {
+      // 续接可以引用当前文本，但必须完整且不重叠；仅检查边界会静默吞掉新增文本。
+      const separator = hasText && context.protocol !== 'deepseek' ? '\n' : '';
       if (
         !Number.isInteger(part.start) ||
         !Number.isInteger(part.end) ||
         part.start < 0 ||
+        part.start !== textOffset + separator.length ||
+        text.slice(textOffset, part.start) !== separator ||
         part.end < part.start ||
         part.end > text.length
       ) {
         return reject('text_projection_changed');
       }
+      textOffset = part.end;
+      hasText = true;
       parts.push({
         type: 'text',
         text: text.slice(part.start, part.end),
@@ -186,8 +229,14 @@ export function replaySdkContinuation(
       return reject('invalid_part');
     }
   }
+  if (textOffset !== text.length) {
+    return reject('text_projection_changed');
+  }
   if (calls.size) {
     return reject('tool_projection_changed');
+  }
+  if (!validateBinding()) {
+    return undefined;
   }
   return { parts, complete: true };
 }

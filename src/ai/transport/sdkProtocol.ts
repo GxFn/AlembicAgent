@@ -1,5 +1,4 @@
 /** 本仓消息/结果与 SDK V4 之间的共同投影；不创建网络请求或执行工具。 */
-import { createHash } from 'node:crypto';
 import type {
   LanguageModelV4CallOptions,
   LanguageModelV4GenerateResult,
@@ -10,20 +9,8 @@ import type { TokenUsage, UnifiedMessage } from '../contracts.js';
 import { LlmResponseError } from '../errors.js';
 import { prepareStructuredValidation } from '../shared/schemaValidation.js';
 import type { TransportRequest, TransportResponse } from './LLMTransport.js';
+import type { SdkCallContext } from './sdkContext.js';
 import { captureSdkContinuation, replaySdkContinuation } from './sdkContinuation.js';
-
-export interface SdkCallContext {
-  provider: string;
-  model: string;
-  connection: string;
-  protocol: 'chat' | 'responses' | 'google' | 'anthropic' | 'deepseek';
-}
-
-export function sdkConnection(provider: string, baseUrl: string, apiKey: string): string {
-  return createHash('sha256')
-    .update(JSON.stringify([provider, baseUrl, apiKey]))
-    .digest('hex');
-}
 
 export function sdkCallOptions(
   request: TransportRequest,
@@ -131,15 +118,19 @@ export function sdkResponse(
     context.protocol === 'responses' && isRecord(raw) && typeof raw.status === 'string'
       ? raw.status
       : (result.finishReason.raw ?? result.finishReason.unified);
-  const continuation = captureSdkContinuation(result, context);
+  const text =
+    result.content
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join(context.protocol === 'google' || context.protocol === 'anthropic' ? '\n' : '') || null;
+  // 用已验证的公共投影绑定续接，不在续接层再次解析工具参数或复制一套消息状态。
+  const continuation = captureSdkContinuation(result, context, {
+    content: text,
+    toolCalls: functionCalls,
+  });
   return {
     ...(continuation ? { continuation } : {}),
-    text:
-      result.content
-        .filter((part) => part.type === 'text')
-        .map((part) => part.text)
-        .join(context.protocol === 'google' || context.protocol === 'anthropic' ? '\n' : '') ||
-      null,
+    text,
     functionCalls: functionCalls.length ? functionCalls : null,
     usage,
     finishReason,
