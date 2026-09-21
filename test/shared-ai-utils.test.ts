@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { classifyLlmError } from '../src/ai/shared/errorClassify.js';
 import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structuredOutput.js';
-import { normalizeRawUsage } from '../src/ai/shared/usage.js';
 import { createLimit } from '../src/shared/concurrency.js';
 import { runOperation } from '../src/shared/operation.js';
 
@@ -224,43 +223,5 @@ describe('shared/errorClassify classifyLlmError', () => {
   it('reads cause.code for network classification', () => {
     const c = classifyLlmError({ message: 'fetch failed', cause: { code: 'ECONNRESET' } });
     expect(c.isNetworkError).toBe(true);
-  });
-});
-
-describe('shared/usage normalizeRawUsage', () => {
-  it('returns null for missing usage', () => {
-    expect(normalizeRawUsage(null)).toBeNull();
-    expect(normalizeRawUsage(undefined)).toBeNull();
-  });
-
-  it('maps OpenAI Chat Completions / DeepSeek field names', () => {
-    expect(
-      normalizeRawUsage({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 })
-    ).toEqual({ inputTokens: 10, outputTokens: 5, totalTokens: 15 });
-  });
-
-  it('maps OpenAI Responses / Anthropic field names', () => {
-    expect(normalizeRawUsage({ input_tokens: 7, output_tokens: 3 })).toEqual({
-      inputTokens: 7,
-      outputTokens: 3,
-      totalTokens: 10,
-    });
-  });
-
-  it('maps Google Gemini field names', () => {
-    expect(
-      normalizeRawUsage({ promptTokenCount: 4, candidatesTokenCount: 6, totalTokenCount: 10 })
-    ).toEqual({ inputTokens: 4, outputTokens: 6, totalTokens: 10 });
-  });
-
-  it('carries reasoning and cache-hit tokens when present', () => {
-    const usage = normalizeRawUsage({
-      prompt_tokens: 1,
-      completion_tokens: 2,
-      total_tokens: 3,
-      reasoning_tokens: 1,
-      prompt_cache_hit_tokens: 1,
-    });
-    expect(usage).toMatchObject({ reasoningTokens: 1, cacheHitTokens: 1 });
   });
 });

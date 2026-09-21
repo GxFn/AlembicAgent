@@ -6,12 +6,14 @@ OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本�
 
 | Provider | 生成 | 显式 embedding 兼容接口 |
 | --- | --- | --- |
-| OpenAI / Ollama | OpenAI SDK，显式选择 chat/responses 协议 | OpenAI SDK |
+| OpenAI / Ollama | OpenAI SDK，显式选择 chat/responses 协议 | OpenAI SDK，Gateway 按 SDK 声明的单批上限切分 |
 | Google | Google SDK 原生协议 | Google SDK，Gateway 按 100 项分批重试 |
 | Claude | Anthropic SDK 原生协议 | 继续明确声明不支持 |
 | DeepSeek | DeepSeek SDK 原生协议，保留 V4 策略和文本工具兼容 | SDK 无此接口；保留已有可配置 `/embeddings` 兼容端点并验证返回向量，不宣称官方 DeepSeek 服务支持 |
 
-调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。Google 的已完成 embedding 批次保留在本次调用局部，后续批次失败不会重放它们。
+调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。显式 embedding 兼容调用的已完成批次保留在本次调用局部，后续批次失败不会重放它们。
+
+`contracts.ts` 是工具调用字段和请求级 `TokenUsagePayload` 的共同定义。历史消息、Provider 与 Transport 共用工具调用结构；旧 `TransportFunctionCall` 名称仍可导入，Transport 的 `usage` 必填且可为 null，公开 Provider 结果仍允许省略。Gateway 保留逐字段的白名单投影与空值兼容。`sdkContext.ts` 负责 SDK 调用身份和续接摘要，protocol 与 continuation 都依赖这个叶子模块。
 
 Gateway 按 provider 维护可靠性控制器。每次传输尝试在排队后、实际调用前重新核对取消、429 冷却与熔断状态；冷却延长对已等待请求同样生效。并发槽位只覆盖在途调用，重试退避不占用槽位。首次熔断冷却为 30 秒，失败探测后的下一窗口依次翻倍，上限 300 秒；半开期间只允许一个逻辑请求探测，并在其重试间保留探测资格。旧请求的迟到成功不能关闭后来打开的熔断。取消与客户端输入错误不累计服务端失败，日志回调失败不改变调用结果。
 
@@ -32,6 +34,10 @@ Factory 选择逻辑 provider，公共 Provider 保留宿主所需的身份与�
 | 并发 | 显式值 > Google 专属环境变量 > 通用环境变量 > 默认值；接受正整数字符串，拒绝零、负数、小数、NaN 和无穷值。公开容量提示与实际闸门共用解析结果和来源。 |
 
 Provider、Gateway、直接 Transport 在创建时固定模型服务配置，惰性创建 SDK 不会重新吸入后来变化的 key、endpoint 或协议。重新配置请创建新实例；共享 Gateway 可通过 `getLLMGateway(config)` 重建。网络代理仍按请求读取既有代理变量，其优先级未改动。
+
+Gateway 的裸模型名优先匹配 Registry 中的 API model ID，未注册名称才沿用厂商名称推断；显式 provider 前缀始终优先。请求参数直接使用 ParameterGuard 的输出，包括非法 effort 被替换后的模型默认值；受支持的数值参数拒绝非有限数，maxTokens 要求正安全整数。合法的范围裁剪和不支持参数的过滤行为保持不变。
+
+代理缓存按 URL 共享初始化；请求在等待初始化前取得借用，LRU 驱逐先放弃缓存所有权，最后一个请求释放后才关闭 dispatcher。清理时未完成的旧初始化不能复活缓存或让旧请求转为直连。SDK 与显式兼容 HTTP 入口共用安全错误投影，保留状态码和 Retry-After 秒/日期/毫秒值，普通错误不复制响应正文或 URL。Factory 按已知状态判断暂时失败与提供商限制，429、5xx、网络错误和取消不因错误文案出现 blocked 而切换厂商。
 
 兼容默认仍保留：Facade 超时 300 秒，直接 Gateway/Transport 超时 120 秒；Facade 默认重试 3 次，Claude 默认 0 次；Google Facade 默认并发 2，其余 Facade 及直接 Gateway 默认 4。Ollama Facade 的默认地址为 `localhost:11434/v1`，直接 Gateway 的注册默认为 `127.0.0.1:11434/v1`。自动发现顺序仍为 Google→OpenAI→Claude→DeepSeek，错误回退候选顺序仍为 Google→OpenAI→DeepSeek→Claude。
 
@@ -54,6 +60,8 @@ OpenAI、Claude、DeepSeek 的公开 `baseUrl` 保留配置原字符串，SDK �
 用量绑定保留原有 `_onTokenUsage` 观察者，每个实例仅安装一次；主 provider 与独立 embedding 实例均可接收绑定。旧实例不因切换而卸载，以记录仍在执行的请求。计量优先采用响应里的 provider/model，缺少这些字段时使用绑定时的身份快照。宿主若后来接管回调槽，Manager 会保留该所有权并诊断；宿主需要继续计量时，应转发到原 managed hook，不要依赖 Manager 再次包装。
 
 监听器按通知开始时的订阅快照执行，每个监听器收到独立结果；监听器、原用量观察者和记录器的同步异常或异步 rejection 只做诊断，不改变已经提交的路由或模型响应。记录器失败后不会重试，因为失败前可能已经写入。非法 token 数值不进入记录器；日志不复制回调错误正文。
+
+直接使用 Provider 或 Gateway 时也隔离同步、Promise 和 PromiseLike 用量观察者失败，不依赖 Manager 包装才能避免未处理拒绝。JSON/schema 诊断失败也不会改写已解析结果或覆盖输入错误。
 
 计量绑定不等于 embedding 成本提取：当前 `Gateway.embed()` 返回向量，不上报原生 embedding token 用量；只有实例实际发出的 usage 事件会被记录。这里没有按文本长度估算费用，也没有最近一次用量的共享旁路。
 
@@ -108,11 +116,12 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 - `toolChoice: none` 是调用者的禁用意图，即使厂商不支持同名 wire 参数，也不暴露可调用工具；违背该意图的工具建议会被拒绝。原生和 DeepSeek 文本转译的参数共用 schema 校验，同次响应的重复调用 ID 明确拒绝。
 - SDK 现在验证原生 HTTP 响应形状。mock/兼容代理应返回真实协议字段，例如 Chat 的 `choices[].index` 和 Responses 的 `output` 内容块。仅返回客户端派生便利字段 `output_text` 的对象不属于原生 Responses wire 合同。
 - Responses 的服务端 reasoning item 引用，以及其他协议的 thinking、签名和 opaque/redacted 块，随消息经过 Gateway、AgentRuntime 和两种消息适配器回传。续接数据按 provider、model 和连接摘要隔离，不携带原始 endpoint 或凭据。内容块保留顺序，可见文本以范围引用、工具以 ID 引用，避免再复制整份业务历史；更换连接或历史投影变化时记录不兼容诊断。普通进度事件省略推理原文和签名。Responses 模式仍依赖服务端 item 保存期限；未新增 stateless encrypted-reasoning、SSE 或多模态入口。
+- 新续接回执的 `projectionHash` 绑定当前文本、工具调用与原生附件；等长改文、同 ID 参数变化或附件改变都会停止旧元数据回放，保留当前文本和调用。摘要按 JSON 值归一，对象键重排不影响等价性；它是漂移检查，不能替代权限或输出 schema 验证。旧无摘要回执保留身份和范围兼容检查，并报告 `legacy_projection_unverified`，不能声称已验证等长内容改动。
 - 带续接信息的 assistant 消息保持原子性，L2 文本合并不会破坏其范围引用和签名序列；预算估算包含仍可能回传的旧 reasoning 内容，避免只计最近两轮，也避免与 replay 块重复计数。
-- DeepSeek V4 工具模式保留 reasoning 回传、`tool_choice` 省略和原有 reasoning 输出预算下限，预算提升会记录诊断；孤立工具历史仍显式转为文本。文本 `<function_calls>` 转译有独立诊断与调用 ID 前缀，不等同原生调用。
+- DeepSeek V4 工具模式保留 reasoning 回传、`tool_choice` 省略和原有 reasoning 输出预算下限，预算提升会记录诊断；孤立、重复 ID 或缺 ID 的工具历史显式转为文本。文本转译只读取完整 `<function_calls>` 声明块，声明外的 invoke 和代码围栏示例不会变成调用，参数内代码围栏仍保留原文。转译有独立诊断与调用 ID 前缀，不等同原生调用。
 - 用量与当前响应一起返回；缓存读取/创建和 reasoning 细分仅在上报时返回，异常或负数计数不进入预算。Claude 输入总量包含缓存输入，Google 输出总量包含 thinking。响应含无效工具调用时，已确认用量仍上报一次。HTTP 2xx 的无效协议 body 归为 `LLM_INVALID_RESPONSE`，不伪造空文本成功；SDK 原始错误 body/请求信息不进入普通错误链。
 - 已识别的 SDK 本地参数/能力错误归为 `LLM_INVALID_REQUEST`，不伪造 HTTP 状态、不重试、不计入服务端熔断；调用者修正输入后仍可使用同一 Provider。
-- embedding 验证数量、索引、维度与有限数值，并按原输入顺序返回。保留旧入口的每项 8000 字符边界并记录截断诊断。单次 OpenAI embedding 超过 SDK 上限会明确失败，由现有调用者批处理；adapter 不隐藏分批重放。
+- embedding 验证数量、索引、维度与有限数值，并按原输入顺序返回。保留旧入口的每项 8000 字符边界并记录截断诊断。Gateway 读取 OpenAI SDK 当前单批容量后切分，后续批失败只重试该批；直接 Transport 仍代表单批，超过 SDK 上限会明确失败。
 
 ## 开发验证
 
@@ -121,6 +130,8 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 `test/ai-provider-manager.test.ts` 通过公开 AI 入口覆盖热切换、补偿边界、观察者和计量绑定，并用真实 SDK + 延迟 HTTP fixture 验证切换后的旧请求归属。原 `ai-provider.test.ts` 的 Manager 用例已迁入，后者保留 Provider、模型策略和公共入口测试。
 
 LLMGateway/Transport 的内部回归统一在本仓维护：`test/LLMGateway.test.ts` 保留路由、参数过滤与旧显式 transport 默认合同，其余协议、工具调用和 HTTP 错误归入已有 SDK 测试矩阵。主仓用真实的公开 Provider → DI/Manager → 计量存储链路验证接入，避免再次复制内部协议测试及过期的 HTTP mock。
+
+无生产消费者且未公开导出的旧 `ai/shared/usage.ts` 和内部聚合入口已移除，其 5 个实现镜像测试一并清理。原生协议用量继续由 `sdkProtocol.toTokenUsage` 验证、转换，并由既有 SDK fixture 覆盖；没有把旧字段强制转换规则搬进当前链路。
 
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。
 
