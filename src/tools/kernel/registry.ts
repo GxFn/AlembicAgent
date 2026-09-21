@@ -8,8 +8,8 @@
 
 import type { ToolAvailabilitySnapshot } from './availability.js';
 import type { ToolRuntimeCallContext } from './context.js';
-import type { ToolDecisionResultStatus } from './decision.js';
 import type { KnowledgeManagementPort, KnowledgeReadPort } from './knowledge.js';
+import type { ToolResultStatus } from './result.js';
 import type { ToolActionAllowlist } from './toolSchema.js';
 
 /** JSON Schema 类型简化定义，避免外部依赖 */
@@ -62,8 +62,8 @@ export interface ParsedToolCall {
 
 /** 结果元信息 — 对 LLM 不可见，供 ContextWindow 消费 */
 export interface ToolResultMeta {
-  /** 路由准入/取消层的明确终态事实；普通业务 handler 可不提供，由 adapter 按 ok 归一化。 */
-  resultStatus?: ToolDecisionResultStatus;
+  /** producer/路由层确认的结果状态，优先于旧 ok 标记；缺省时 adapter 才按 ok 归一化。 */
+  resultStatus?: ToolResultStatus;
   cached: boolean;
   compression?: { parser: string; ratio: number };
   tokensEstimate: number;

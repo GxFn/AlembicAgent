@@ -161,6 +161,14 @@ export interface ToolResultOrdinaryOutputProjectionOptions {
 interface SanitizedValue {
   value: unknown;
   redactedFields: string[];
+  warningCodes: string[];
+}
+
+interface ProjectionState {
+  ancestors: Set<object>;
+  remaining: number;
+  redactedFields: string[];
+  warningCodes: Set<string>;
 }
 
 export function projectToolResultOrdinaryOutput<T = unknown>(
@@ -187,12 +195,29 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
     ...(envelope.resources?.length
       ? { resources: envelope.resources.map(projectResourceRef) }
       : {}),
-    ...(envelope.cache ? { cache: envelope.cache } : {}),
+    ...(envelope.cache
+      ? { cache: { hit: envelope.cache.hit, policy: envelope.cache.policy } }
+      : {}),
     ...(envelope.nextActionHint ? { nextActionHint: envelope.nextActionHint } : {}),
-    ...(failureTaxonomy ? { failureTaxonomy } : {}),
+    ...(failureTaxonomy
+      ? {
+          failureTaxonomy: {
+            agentBranch: failureTaxonomy.agentBranch,
+            kind: failureTaxonomy.kind,
+            privateDataSafe: failureTaxonomy.privateDataSafe,
+            problemClass: failureTaxonomy.problemClass,
+            refPolicy: failureTaxonomy.refPolicy,
+            retryPolicy: failureTaxonomy.retryPolicy,
+            retryable: failureTaxonomy.retryable,
+            stableId: failureTaxonomy.stableId,
+            status: failureTaxonomy.status,
+          },
+        }
+      : {}),
     diagnosticSummary: summarizeToolResultDiagnostics(
       envelope.diagnostics,
-      uniqueStrings([...sanitized.redactedFields, ...sanitizedText.redactedFields])
+      uniqueStrings([...sanitized.redactedFields, ...sanitizedText.redactedFields]),
+      uniqueStrings([...sanitized.warningCodes, ...sanitizedText.warningCodes])
     ),
   };
 
@@ -201,26 +226,47 @@ export function projectToolResultOrdinaryOutput<T = unknown>(
 
 /** Adapter 的 JSON 文本是同一结果的另一份载体，必须使用与结构化内容相同的字段规则。 */
 function sanitizeOrdinaryText(text: string, forbiddenFields: readonly string[]): SanitizedValue {
+  let parsed: unknown;
   try {
-    const sanitized = sanitizeOrdinaryValue(JSON.parse(text), forbiddenFields);
+    parsed = JSON.parse(text);
+  } catch (err: unknown) {
+    void err;
+    // 非 JSON 的普通文本没有结构化字段语义，保持原样；已解析 JSON 的清理失败不能走此分支。
+    return { value: text, redactedFields: [], warningCodes: [] };
+  }
+  try {
+    const sanitized = sanitizeOrdinaryValue(parsed, forbiddenFields);
     return {
-      value: sanitized.redactedFields.length > 0 ? JSON.stringify(sanitized.value, null, 2) : text,
+      value:
+        sanitized.redactedFields.length > 0 || sanitized.warningCodes.length > 0
+          ? JSON.stringify(sanitized.value, null, 2)
+          : text,
       redactedFields: sanitized.redactedFields,
+      warningCodes: sanitized.warningCodes,
     };
-  } catch {
-    return { value: text, redactedFields: [] };
+  } catch (err: unknown) {
+    // 清理异常只产生固定显示诊断，不能把可能含宿主敏感信息的错误内容或原 JSON 返回。
+    void err;
+    return {
+      value: '[unavailable: JSON display failed]',
+      redactedFields: [],
+      warningCodes: ['TOOL_RESULT_DISPLAY_UNSUPPORTED'],
+    };
   }
 }
 
 function summarizeToolResultDiagnostics(
   diagnostics: ToolResultDiagnostics,
-  redactedFields: readonly string[]
+  redactedFields: readonly string[],
+  projectionWarnings: readonly string[]
 ): ToolResultDiagnosticSummary {
+  const existingCodes = diagnostics.warnings.map((warning) => warning.code);
+  const addedWarnings = projectionWarnings.filter((code) => !existingCodes.includes(code));
   return {
-    degraded: diagnostics.degraded,
+    degraded: diagnostics.degraded || projectionWarnings.length > 0,
     fallbackUsed: diagnostics.fallbackUsed,
-    warningCount: diagnostics.warnings.length,
-    warningCodes: uniqueStrings(diagnostics.warnings.map((warning) => warning.code)),
+    warningCount: diagnostics.warnings.length + addedWarnings.length,
+    warningCodes: uniqueStrings([...existingCodes, ...addedWarnings]),
     timedOutStages: uniqueStrings(diagnostics.timedOutStages),
     blockedToolCount: diagnostics.blockedTools.length,
     blockedToolIds: uniqueStrings(diagnostics.blockedTools.map((entry) => entry.tool)),
@@ -238,9 +284,18 @@ function summarizeToolResultDiagnostics(
 function sanitizeOrdinaryValue(value: unknown, forbiddenFields: readonly string[]): SanitizedValue {
   const forbiddenKeys = new Set(forbiddenFields.filter((field) => !field.includes('.')));
   const forbiddenPaths = new Set(forbiddenFields.filter((field) => field.includes('.')));
-  const redactedFields: string[] = [];
-  const sanitized = sanitizeOrdinaryNode(value, [], forbiddenKeys, forbiddenPaths, redactedFields);
-  return { value: sanitized, redactedFields };
+  const state: ProjectionState = {
+    ancestors: new Set(),
+    remaining: 4096,
+    redactedFields: [],
+    warningCodes: new Set(),
+  };
+  const sanitized = sanitizeOrdinaryNode(value, [], forbiddenKeys, forbiddenPaths, state, 0);
+  return {
+    value: sanitized,
+    redactedFields: state.redactedFields,
+    warningCodes: [...state.warningCodes],
+  };
 }
 
 function sanitizeOrdinaryNode(
@@ -248,35 +303,124 @@ function sanitizeOrdinaryNode(
   path: string[],
   forbiddenKeys: ReadonlySet<string>,
   forbiddenPaths: ReadonlySet<string>,
-  redactedFields: string[]
+  state: ProjectionState,
+  depth: number,
+  reserved = false
 ): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) =>
-      sanitizeOrdinaryNode(item, path, forbiddenKeys, forbiddenPaths, redactedFields)
-    );
+  // 显示投影不是业务执行。循环、过深/过宽结构只能降级显示，不能使已确认写入变失败。
+  if (depth > 64 || (!reserved && state.remaining-- <= 0)) {
+    state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
+    return '[unavailable: display limit]';
   }
-
-  if (!isPlainRecord(value)) {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
     return value;
   }
-
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    const childPath = [...path, key];
-    const dottedPath = childPath.join('.');
-    if (forbiddenKeys.has(key) || forbiddenPaths.has(dottedPath)) {
-      redactedFields.push(dottedPath);
-      continue;
-    }
-    out[key] = sanitizeOrdinaryNode(
-      child,
-      childPath,
-      forbiddenKeys,
-      forbiddenPaths,
-      redactedFields
-    );
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
   }
-  return out;
+  if (typeof value !== 'object') {
+    state.warningCodes.add('TOOL_RESULT_DISPLAY_UNSUPPORTED');
+    return '[unavailable: non-JSON value]';
+  }
+  if (state.ancestors.has(value)) {
+    state.warningCodes.add('TOOL_RESULT_DISPLAY_CYCLE');
+    return '[unavailable: circular reference]';
+  }
+  state.ancestors.add(value);
+  try {
+    // 保留 Date 的原生 JSON 值；不运行宿主自定义 toJSON/valueOf 或属性 getter。
+    if (value instanceof Date) {
+      if (Object.hasOwn(value, 'toJSON')) {
+        state.warningCodes.add('TOOL_RESULT_DISPLAY_NORMALIZED');
+      }
+      return Number.isFinite(Date.prototype.getTime.call(value))
+        ? Date.prototype.toISOString.call(value)
+        : null;
+    }
+    const array = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (!array && prototype !== null && prototype !== Object.prototype) {
+      state.warningCodes.add('TOOL_RESULT_DISPLAY_NORMALIZED');
+    }
+    const out: Record<string, unknown> | unknown[] = array ? [] : {};
+    const keys = array
+      ? Array.from({ length: Math.min(value.length, state.remaining + 1) }, (_, i) => String(i))
+      : Object.keys(value);
+    const pending: Array<{ key: string; value: object; path: string[] }> = [];
+    // 先为当前层的自有数据预留节点，再进入子树；前面的超大详情不能吞掉后面的
+    // 纯量回执字段。此规则不识别业务 id/status，也不改变原字段的插入次序。
+    for (const key of keys) {
+      const childPath = array ? path : [...path, key];
+      const dottedPath = childPath.join('.');
+      if (!array && (forbiddenKeys.has(key) || forbiddenPaths.has(dottedPath))) {
+        state.redactedFields.push(dottedPath);
+        continue;
+      }
+      if (state.remaining <= 0) {
+        state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
+        break;
+      }
+      state.remaining--;
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      let child: unknown;
+      if (property && !('value' in property)) {
+        state.warningCodes.add('TOOL_RESULT_DISPLAY_UNSUPPORTED');
+        child = '[unavailable: accessor]';
+      } else if (key === 'toJSON' && typeof property?.value === 'function') {
+        // 不保留可执行序列化钩子，否则最终 JSON.stringify 可以把已删字段重新注入。
+        state.warningCodes.add('TOOL_RESULT_DISPLAY_UNSUPPORTED');
+        continue;
+      } else if (property?.value !== null && typeof property?.value === 'object') {
+        pending.push({ key, value: property.value, path: childPath });
+        child = '[unavailable: display limit]';
+      } else {
+        child = sanitizeOrdinaryNode(
+          property?.value,
+          childPath,
+          forbiddenKeys,
+          forbiddenPaths,
+          state,
+          depth + 1,
+          true
+        );
+      }
+      // __proto__ 也是合法 JSON 数据键；普通赋值会改变新对象的原型。
+      Object.defineProperty(out, key, {
+        value: array && child === undefined ? null : child,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    for (const child of pending) {
+      Object.defineProperty(out, child.key, {
+        value: sanitizeOrdinaryNode(
+          child.value,
+          child.path,
+          forbiddenKeys,
+          forbiddenPaths,
+          state,
+          depth + 1,
+          true
+        ),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    return out;
+  } catch (err: unknown) {
+    void err;
+    state.warningCodes.add('TOOL_RESULT_DISPLAY_UNSUPPORTED');
+    return '[unavailable: unreadable value]';
+  } finally {
+    state.ancestors.delete(value);
+  }
 }
 
 function projectArtifactRef(ref: ToolArtifactRef): ToolArtifactRef {
@@ -299,8 +443,4 @@ function projectResourceRef(ref: ToolResourceRef): ToolResourceRef {
 
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values.filter((value) => value.length > 0))].sort();
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype;
 }

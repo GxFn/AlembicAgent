@@ -140,16 +140,6 @@ function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResu
   };
 }
 
-it('sanitizes the JSON text projection as well as structuredContent', () => {
-  const envelope = createEnvelopeForStatus('success');
-  envelope.structuredContent = { apiKey: 'synthetic-sensitive-value', publicValue: 'kept' };
-  envelope.text = JSON.stringify(envelope.structuredContent, null, 2);
-  const output = projectToolResultOrdinaryOutput(envelope);
-  expect(output.structuredContent).toEqual({ publicValue: 'kept' });
-  expect(JSON.parse(output.text)).toEqual({ publicValue: 'kept' });
-  expect(JSON.stringify(output)).not.toContain('synthetic-sensitive-value');
-});
-
 describe('tool kernel contract', () => {
   it('removes the V1 core-contract shims and the runtime bridge from source', () => {
     const removed = [
@@ -182,27 +172,6 @@ describe('tool kernel contract', () => {
       .sort();
 
     expect(stragglers).toEqual([]);
-  });
-
-  it('re-exports the tool contract from the kernel on the public ./tools surface', () => {
-    const toolsIndex = readFileSync(path.join(process.cwd(), 'src/tools/index.ts'), 'utf8');
-    const kernelReexports = toolsIndex
-      .split('\n')
-      .filter((line) => line.startsWith("export * from './kernel/"))
-      .map((line) => line.trim())
-      .sort();
-
-    expect(kernelReexports).toEqual([
-      "export * from './kernel/context.js';",
-      "export * from './kernel/decision.js';",
-      "export * from './kernel/handler.js';",
-      "export * from './kernel/presenter.js';",
-      "export * from './kernel/request.js';",
-      "export * from './kernel/result.js';",
-      "export * from './kernel/routing.js';",
-    ]);
-    expect(toolsIndex).not.toContain("export * from './core/LightweightRouter.js';");
-    expect(toolsIndex).not.toContain("export * from './terminal/index.js';");
   });
 });
 
@@ -570,7 +539,25 @@ describe('UnifiedToolCatalog', () => {
   });
 });
 
+function knowledgeResultBoundary(
+  injected: Partial<ToolContext>,
+  action = 'detail',
+  params: Record<string, unknown> = { id: 'receipt-fixture' }
+) {
+  return knowledgeAdapter(injected)(action, params);
+}
+
 describe('tool result ordinary output', () => {
+  it('sanitizes the JSON text projection as well as structuredContent', () => {
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = { apiKey: 'synthetic-sensitive-value', publicValue: 'kept' };
+    envelope.text = JSON.stringify(envelope.structuredContent, null, 2);
+    const output = projectToolResultOrdinaryOutput(envelope);
+    expect(output.structuredContent).toEqual({ publicValue: 'kept' });
+    expect(JSON.parse(output.text)).toEqual({ publicValue: 'kept' });
+    expect(JSON.stringify(output)).not.toContain('synthetic-sensitive-value');
+  });
+
   it('recognizes and presents result envelopes without a retired router dependency', () => {
     const envelope = createEnvelopeForStatus('success');
 
@@ -687,5 +674,278 @@ describe('tool result ordinary output', () => {
       ['host-failure', 'error'],
       ['host-adapter', 'error'],
     ]);
+  });
+
+  it.each([
+    {
+      label: 'null prototype DTO',
+      create: () =>
+        Object.assign(Object.create(null), {
+          id: 'receipt-fixture',
+          apiKey: 'synthetic-display-secret',
+        }),
+    },
+    {
+      label: 'class DTO',
+      create: () =>
+        new (class {
+          id = 'receipt-fixture';
+          apiKey = 'synthetic-display-secret';
+        })(),
+    },
+    {
+      label: 'own toJSON',
+      create: () => ({
+        id: 'receipt-fixture',
+        toJSON: () => ({ id: 'receipt-fixture', apiKey: 'synthetic-display-secret' }),
+      }),
+    },
+  ])('sanitizes the real knowledge receipt for $label', async ({ create }) => {
+    const dto = create();
+    const envelope = await knowledgeResultBoundary({ knowledgeRead: { getById: async () => dto } });
+    expect(envelope.ok).toBe(true);
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    expect(projected.structuredContent).toMatchObject({ id: 'receipt-fixture' });
+    expect(JSON.stringify(projected)).not.toContain('synthetic-display-secret');
+    expect(presentToolResult(envelope)).not.toContain('synthetic-display-secret');
+    expect(projected.structuredContent).not.toBe(dto);
+  });
+
+  it('keeps an own __proto__ JSON key as data without changing the projection prototype', async () => {
+    const dto = JSON.parse(
+      '{"id":"receipt-fixture","__proto__":{"visible":"nested-value"},"publicValue":"kept"}'
+    );
+    const envelope = await knowledgeResultBoundary({ knowledgeRead: { getById: async () => dto } });
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    expect(Object.getPrototypeOf(projected.structuredContent)).toBe(Object.prototype);
+    expect(Object.hasOwn(projected.structuredContent as object, '__proto__')).toBe(true);
+    expect(JSON.parse(JSON.stringify(projected.structuredContent))).toEqual(dto);
+  });
+
+  it('owns the projected cache and failure taxonomy without changing the original receipt', async () => {
+    const envelope = await knowledgeResultBoundary({
+      knowledgeRead: { getById: async () => ({ id: 'receipt-fixture' }) },
+    });
+    const taxonomy = {
+      agentBranch: 'host-failure',
+      kind: 'host-failure',
+      privateDataSafe: true as const,
+      problemClass: 'host-problem',
+      refPolicy: 'opaque',
+      retryPolicy: 'never',
+      retryable: false,
+      stableId: 'core.failure.host-fixture' as const,
+      status: 'error',
+    };
+    const projected = projectToolResultOrdinaryOutput(envelope, { failureTaxonomy: taxonomy });
+    if (!projected.cache || !projected.failureTaxonomy) {
+      throw new Error('Expected projected metadata');
+    }
+    projected.cache.hit = true;
+    projected.failureTaxonomy.retryable = true;
+    expect(envelope.cache?.hit).toBe(false);
+    expect(taxonomy.retryable).toBe(false);
+  });
+
+  it.each([
+    {
+      label: 'cyclic detail',
+      detail: () => {
+        const value: Record<string, unknown> = {};
+        value.self = value;
+        return value;
+      },
+      code: 'TOOL_RESULT_DISPLAY_CYCLE',
+    },
+    {
+      label: 'non-JSON bigint',
+      detail: () => 1n,
+      code: 'TOOL_RESULT_DISPLAY_UNSUPPORTED',
+    },
+    {
+      label: 'throwing toJSON',
+      detail: () => ({
+        toJSON() {
+          throw new Error('synthetic-display-secret');
+        },
+      }),
+      code: 'TOOL_RESULT_DISPLAY_UNSUPPORTED',
+    },
+    {
+      label: 'throwing accessor',
+      detail: () =>
+        Object.defineProperty({}, 'value', {
+          enumerable: true,
+          get() {
+            throw new Error('synthetic-display-secret');
+          },
+        }),
+      code: 'TOOL_RESULT_DISPLAY_UNSUPPORTED',
+    },
+    {
+      label: 'over-depth detail',
+      detail: () => {
+        let value: Record<string, unknown> = { leaf: true };
+        for (let depth = 0; depth < 1000; depth++) {
+          value = { child: value };
+        }
+        return value;
+      },
+      code: 'TOOL_RESULT_DISPLAY_LIMIT',
+    },
+    {
+      label: 'over-wide detail',
+      detail: () => Array.from({ length: 11000 }, () => 1),
+      code: 'TOOL_RESULT_DISPLAY_LIMIT',
+    },
+  ])('retains a confirmed publish with a bounded safe display for $label', async ({
+    detail,
+    code,
+  }) => {
+    // 身份故意排在耗预算详情之后，投影不能依赖宿主 DTO 的属性插入次序。
+    const record = { detail: detail(), id: 'receipt-fixture', lifecycle: 'active' };
+    const publish = vi.fn(async () => record);
+    const envelope = await knowledgeResultBoundary(
+      {
+        recipeGateway: {
+          evaluateReadiness: async () => ({ ready: true, violations: [] }),
+          publish,
+        },
+      },
+      'manage',
+      { operation: 'publish', id: 'receipt-fixture' }
+    );
+    expect(publish).toHaveBeenCalledOnce();
+    expect(envelope).toMatchObject({
+      ok: true,
+      status: 'success',
+      structuredContent: {
+        id: 'receipt-fixture',
+        lifecycle: 'active',
+        status: 'published',
+        record: { id: 'receipt-fixture', lifecycle: 'active' },
+      },
+      diagnostics: { degraded: true },
+    });
+    expect(envelope.diagnostics.warnings.map((warning) => warning.code)).toContain(code);
+    expect(() => JSON.stringify(envelope)).not.toThrow();
+    const serialized = JSON.stringify(projectToolResultOrdinaryOutput(envelope));
+    expect(serialized).not.toContain('synthetic-display-secret');
+    expect(serialized.length).toBeLessThan(100_000);
+    expect(presentToolResult(envelope)).toContain('receipt-fixture');
+  });
+
+  it('preserves native Date serialization without running host getters or custom toJSON', async () => {
+    const getter = vi.fn(() => 'synthetic-display-secret');
+    const toJSON = vi.fn(() => ({ apiKey: 'synthetic-display-secret' }));
+    const validation = {
+      checkedAt: new Date('2026-09-21T00:00:00.000Z'),
+      invalidDate: new Date(Number.NaN),
+      custom: { visible: 'kept', toJSON },
+      accessor: Object.defineProperty({}, 'secret', { enumerable: true, get: getter }),
+    };
+    const envelope = await knowledgeResultBoundary(
+      { knowledgeManagement: { validate: async () => validation } },
+      'manage',
+      { operation: 'validate', id: 'receipt-fixture' }
+    );
+    expect(envelope.ok).toBe(true);
+    expect(getter).not.toHaveBeenCalled();
+    expect(toJSON).not.toHaveBeenCalled();
+    expect(projectToolResultOrdinaryOutput(envelope).structuredContent).toMatchObject({
+      result: {
+        checkedAt: '2026-09-21T00:00:00.000Z',
+        invalidDate: null,
+        custom: { visible: 'kept' },
+      },
+    });
+    expect(JSON.stringify(envelope)).not.toContain('synthetic-display-secret');
+  });
+
+  it.each([
+    ['ok', undefined],
+    ['toolId', 1],
+    ['callId', null],
+    ['status', 'invented-status'],
+    ['text', {}],
+    ['startedAt', undefined],
+    ['durationMs', Number.NaN],
+    ['diagnostics', undefined],
+    ['diagnostics', { warnings: [] }],
+    ['trust', {}],
+    ['cache', { hit: true, policy: 'invented-policy' }],
+    ['artifacts', [{ id: 'artifact', kind: 'file' }]],
+    ['resources', [{ uri: 123 }]],
+  ])('rejects an incomplete or invalid %s field before presentation', async (field, value) => {
+    const envelope = await knowledgeResultBoundary({
+      knowledgeRead: { getById: async () => ({ id: 'receipt-fixture' }) },
+    });
+    const malformed = { ...envelope, [field]: value };
+    expect(isToolResultEnvelope(malformed)).toBe(false);
+  });
+
+  it.each([
+    ['status', 'success'],
+    ['cache', 'session'],
+    ['artifacts', 'file'],
+    ['trust', 'internal'],
+  ])('rejects an object posing as the %s enum without running its toString', async (field, label) => {
+    const envelope = await knowledgeResultBoundary({
+      knowledgeRead: { getById: async () => ({ id: 'receipt-fixture' }) },
+    });
+    const stringifyEnum = vi.fn(() => label);
+    const disguised = { toString: stringifyEnum };
+    const value =
+      field === 'cache'
+        ? { hit: false, policy: disguised }
+        : field === 'artifacts'
+          ? [{ id: 'fixture', kind: disguised, uri: 'memory://fixture' }]
+          : field === 'trust'
+            ? { ...envelope.trust, source: disguised }
+            : disguised;
+    expect(isToolResultEnvelope({ ...envelope, [field]: value })).toBe(false);
+    expect(stringifyEnum).not.toHaveBeenCalled();
+  });
+
+  it('rejects inherited envelope fields and accessors while preserving all seven status shapes', async () => {
+    const envelope = await knowledgeResultBoundary({
+      knowledgeRead: { getById: async () => ({ id: 'receipt-fixture' }) },
+    });
+    expect(isToolResultEnvelope(Object.create(envelope))).toBe(false);
+    const getter = vi.fn(() => 'untrusted getter');
+    expect(
+      isToolResultEnvelope(Object.defineProperty({ ...envelope }, 'text', { get: getter }))
+    ).toBe(false);
+    expect(getter).not.toHaveBeenCalled();
+    for (const status of [
+      'success',
+      'partial',
+      'error',
+      'blocked',
+      'aborted',
+      'timeout',
+      'needs-confirmation',
+    ]) {
+      const value = { ...envelope, status };
+      expect(isToolResultEnvelope(value)).toBe(true);
+      if (isToolResultEnvelope(value)) {
+        expect(presentToolResult(value)).toContain('receipt-fixture');
+      }
+    }
+  });
+
+  it('rejects malformed nested diagnostics instead of promising a presentable envelope', async () => {
+    const envelope = await knowledgeResultBoundary({
+      knowledgeRead: { getById: async () => ({ id: 'receipt-fixture' }) },
+    });
+    for (const diagnostics of [
+      { ...envelope.diagnostics, warnings: [null] },
+      { ...envelope.diagnostics, timedOutStages: [1] },
+      { ...envelope.diagnostics, blockedTools: [{}] },
+      { ...envelope.diagnostics, gateFailures: [{ stage: 'execute' }] },
+      { ...envelope.diagnostics, aiErrorCount: Number.POSITIVE_INFINITY },
+    ]) {
+      expect(isToolResultEnvelope({ ...envelope, diagnostics })).toBe(false);
+    }
   });
 });

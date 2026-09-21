@@ -98,22 +98,40 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
       ctx
     );
 
-    const rawOutput = combineOutput(stdout, stderr);
-    const compressed = await compressOutput(rawOutput, command, ctx);
-    const durationMs = Date.now() - startMs;
-
     if (exitCode === 137) {
+      // 旧宿主用 137 同时表示超时、取消和输出配额强杀；没有信号事实时不能猜成超时。
+      // 保留已执行得到的输出和兼容 ok，明确终态供 adapter/观察器判断；不再等待无用的压缩。
+      const abortReason: unknown = ctx.abortSignal?.reason;
+      const resultStatus = ctx.abortSignal?.aborted
+        ? abortReason instanceof Error && abortReason.name === 'TimeoutError'
+          ? 'timeout'
+          : 'aborted'
+        : 'error';
+      const reason = ctx.abortSignal?.aborted ? 'abort-signal' : 'unknown-termination';
+      const label = resultStatus === 'error' ? 'interrupted' : resultStatus;
       const partial = stripAnsi(stdout);
       const text = withTerminalDiagnostics(
-        partial ? `[timeout] partial output:\n${partial}` : '[command timed out or aborted]',
+        partial ? `[${label}] partial output:\n${partial}` : `[command ${label}]`,
         diagnostics
       );
-      // SIGKILL/timeout — the command was cut off, so this output is partial.
       return finish(
         ok(
           text,
           terminalMeta(
-            { durationMs, tokensEstimate: estimateTokens(text), degraded: true },
+            {
+              durationMs: Date.now() - startMs,
+              tokensEstimate: estimateTokens(text),
+              degraded: true,
+              resultStatus,
+              diagnosticWarnings: [
+                {
+                  code: 'terminal_execution_interrupted',
+                  message: `exitCode=137; status=${resultStatus}; reason=${reason}; output=partial`,
+                  stage: 'terminal.exec',
+                  tool: 'terminal',
+                },
+              ],
+            },
             diagnostics
           )
         ),
@@ -121,6 +139,8 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
       );
     }
 
+    const compressed = await compressOutput(combineOutput(stdout, stderr), command, ctx);
+    const durationMs = Date.now() - startMs;
     const text = withTerminalDiagnostics(
       exitCode === 0 ? compressed : `[exit ${exitCode}]\n${compressed}`,
       diagnostics
@@ -269,6 +289,7 @@ function terminalMeta(
     ...base,
     fallbackUsed: true,
     diagnosticWarnings: [
+      ...(base.diagnosticWarnings ?? []),
       {
         code: 'terminal_sandbox_fallback',
         message: formatTerminalDiagnostic(diagnostics),

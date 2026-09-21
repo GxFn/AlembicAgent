@@ -31,12 +31,12 @@
       "pattern": "describe('coordination public contracts'"
     },
     {
-      "name": "v2 terminal execution",
-      "pattern": "binds V2 terminal exec calls to the injected sandbox executor"
+      "name": "terminal execution",
+      "pattern": "binds terminal exec calls to the injected sandbox executor"
     },
     {
-      "name": "v2 terminal cancellation",
-      "pattern": "routes V2 terminal cancellation as a structured partial timeout result"
+      "name": "terminal interrupted result states",
+      "pattern": "retains terminal partial output and $label through the real adapter"
     },
     {
       "name": "provider malformed body",

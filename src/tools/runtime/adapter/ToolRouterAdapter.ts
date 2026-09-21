@@ -19,6 +19,7 @@ import type {
   ToolScopeRelease,
 } from '#tools/kernel/index.js';
 import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
+import { projectToolResultOrdinaryOutput } from '#tools/kernel/result.js';
 import { toolAdmissionFailure } from '../admission.js';
 import { ToolRouter } from '../router.js';
 
@@ -31,17 +32,19 @@ export interface ToolContextFactoryContract {
 
 export type ToolContextProviderContract = ToolContextFactoryContract;
 
-const EMPTY_DIAGNOSTICS: ToolResultDiagnostics = {
-  degraded: false,
-  fallbackUsed: false,
-  warnings: [],
-  timedOutStages: [],
-  blockedTools: [],
-  truncatedToolCalls: 0,
-  emptyResponses: 0,
-  aiErrorCount: 0,
-  gateFailures: [],
-};
+function emptyDiagnostics(): ToolResultDiagnostics {
+  return {
+    degraded: false,
+    fallbackUsed: false,
+    warnings: [],
+    timedOutStages: [],
+    blockedTools: [],
+    truncatedToolCalls: 0,
+    emptyResponses: 0,
+    aiErrorCount: 0,
+    gateFailures: [],
+  };
+}
 
 const DEFAULT_TRUST: ToolResultTrust = {
   source: 'internal',
@@ -54,21 +57,18 @@ const DEFAULT_TRUST: ToolResultTrust = {
  * Lift the handler-set degrade/fallback meta onto the per-call envelope diagnostics.
  * A single ToolResult has no notion of the loop-level fields (blockedTools, gateFailures,
  * …) — those are recorded directly into the DiagnosticsCollector by the pipeline — so only
- * degraded/fallbackUsed can be known here. Returns the shared empty constant for clean calls.
+ * degraded/fallbackUsed can be known here. Every call owns its diagnostic arrays and entries.
  */
 function diagnosticsFromResult(result: ToolResult, toolId: string): ToolResultDiagnostics {
   const degraded = result._meta?.degraded === true;
   const fallbackUsed = result._meta?.fallbackUsed === true;
   const warnings = result._meta?.diagnosticWarnings ?? [];
   const blocked = result._meta?.resultStatus === 'blocked';
-  if (!degraded && !fallbackUsed && warnings.length === 0 && !blocked) {
-    return EMPTY_DIAGNOSTICS;
-  }
   return {
-    ...EMPTY_DIAGNOSTICS,
+    ...emptyDiagnostics(),
     degraded,
     fallbackUsed,
-    warnings,
+    warnings: warnings.map((warning) => ({ ...warning })),
     ...(blocked
       ? { blockedTools: [{ tool: toolId, reason: result.error || 'Tool call blocked' }] }
       : {}),
@@ -162,7 +162,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
         durationMs,
         cachePolicy
       );
-      if (!result.ok && ctx.abortSignal?.aborted) {
+      if (!result.ok && result._meta?.resultStatus === undefined && ctx.abortSignal?.aborted) {
         envelope.status = 'aborted';
       }
       return envelope;
@@ -224,28 +224,50 @@ export class ToolRouterAdapter implements ToolRouterContract {
     durationMs: number,
     cachePolicy: 'none' | 'session' | 'scope' | 'persistent' = 'none'
   ): ToolResultEnvelope {
-    const text = result.ok
-      ? typeof result.data === 'string'
-        ? result.data
-        : JSON.stringify(result.data, null, 2)
-      : result.error || 'Unknown error';
-
-    return {
+    const envelope: ToolResultEnvelope = {
       ok: result.ok,
       toolId,
       callId,
       startedAt,
       durationMs,
-      status: result.ok ? 'success' : (result._meta?.resultStatus ?? 'error'),
-      text,
+      status: result._meta?.resultStatus ?? (result.ok ? 'success' : 'error'),
+      text: result.ok ? '' : result.error || 'Unknown error',
       structuredContent: result.data,
       cache: {
         hit: result._meta?.cached ?? false,
         policy: cachePolicy,
       },
       diagnostics: diagnosticsFromResult(result, toolId),
-      trust: result.ok ? DEFAULT_TRUST : { ...DEFAULT_TRUST, containsUntrustedText: true },
+      trust: { ...DEFAULT_TRUST, containsUntrustedText: !result.ok },
     };
+    // 先保留 handler 的执行真值，再单独归一显示数据。宿主已写成功后的循环/BigInt/
+    // getter 等不能使 JSON.stringify 抛出并落入 execute 的失败分支，更不能重试写入。
+    // 内部信封保留业务字段；普通输出的私有字段规则仍由 presenter 的默认投影执行。
+    const display = projectToolResultOrdinaryOutput(envelope, { forbiddenFields: [] });
+    envelope.structuredContent = display.structuredContent;
+    if (result.ok) {
+      envelope.text =
+        typeof display.structuredContent === 'string'
+          ? display.structuredContent
+          : (JSON.stringify(display.structuredContent, null, 2) ?? '[no tool result]');
+    }
+    const originalCodes = new Set(envelope.diagnostics.warnings.map((warning) => warning.code));
+    const displayWarnings = display.diagnosticSummary.warningCodes
+      .filter((code) => !originalCodes.has(code))
+      .map((code) => ({
+        code,
+        message: 'Tool result display was normalized; the confirmed execution outcome is retained.',
+        stage: 'result-display',
+        tool: toolId,
+      }));
+    if (displayWarnings.length > 0) {
+      envelope.diagnostics = {
+        ...envelope.diagnostics,
+        degraded: true,
+        warnings: [...envelope.diagnostics.warnings, ...displayWarnings],
+      };
+    }
+    return envelope;
   }
 
   #errorEnvelope(
@@ -263,8 +285,8 @@ export class ToolRouterAdapter implements ToolRouterContract {
       durationMs,
       status: 'error',
       text: error,
-      diagnostics: EMPTY_DIAGNOSTICS,
-      trust: DEFAULT_TRUST,
+      diagnostics: emptyDiagnostics(),
+      trust: { ...DEFAULT_TRUST },
     };
   }
 }

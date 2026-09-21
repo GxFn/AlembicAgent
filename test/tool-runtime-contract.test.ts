@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
@@ -29,6 +30,119 @@ function baseToolContext(): ToolContext {
     tokenBudget: 4000,
   };
 }
+
+describe('Tool adapter receipt ownership', () => {
+  it.each([
+    'success',
+    'error',
+    'blocked',
+    'degraded',
+  ])('isolates diagnostics and trust before a later %s call', async (branch) => {
+    const adapter = new ToolRouterAdapter({
+      capability: {
+        name: 'receipt-owner',
+        description: 'receipt fixture',
+        allowedTools: { knowledge: ['detail', 'prime'] },
+      },
+      contextFactory: {
+        create: () => ({
+          ...baseToolContext(),
+          searchEngine: {
+            search: async () => [
+              {
+                id: branch === 'degraded' ? 'fail-enrichment' : 'receipt-fixture',
+                title: 'Recipe',
+                score: 1,
+              },
+            ],
+          },
+          knowledgeRead: {
+            getById: async (id) => {
+              if (id === 'fail-enrichment') {
+                throw new Error('synthetic enrichment failure');
+              }
+              return { id };
+            },
+          },
+        }),
+      },
+    });
+    const request = {
+      toolId: 'knowledge',
+      args: { action: 'detail', params: { id: 'receipt-fixture' } },
+      surface: 'runtime' as const,
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' as const },
+    };
+    const first = await adapter.execute(request);
+    const later =
+      branch === 'error'
+        ? { ...request, args: { action: 'unknown', params: {} } }
+        : branch === 'blocked'
+          ? { ...request, args: { action: 'search', params: { query: 'recipe' } } }
+          : branch === 'degraded'
+            ? { ...request, args: { action: 'prime', params: { taskGoal: 'Read recipe' } } }
+            : request;
+    first.diagnostics.warnings.push({ code: 'FIRST_CALL_ONLY', message: 'Fixture annotation' });
+    first.diagnostics.timedOutStages.push('first-call');
+    first.diagnostics.gateFailures.push({ stage: 'fixture', action: 'first-only' });
+    first.trust.containsSecrets = true;
+    try {
+      const second = await adapter.execute(later);
+      expect(second.diagnostics).not.toBe(first.diagnostics);
+      expect(second.trust).not.toBe(first.trust);
+      expect(second.diagnostics.warnings.map((warning) => warning.code)).not.toContain(
+        'FIRST_CALL_ONLY'
+      );
+      expect(second.diagnostics.timedOutStages).toEqual([]);
+      expect(second.diagnostics.gateFailures).toEqual([]);
+      expect(second.trust.containsSecrets).toBe(false);
+      expect(second.diagnostics.degraded).toBe(branch === 'degraded');
+    } finally {
+      // RED 阶段旧实现共用模块对象，清理 fixture 修改，避免污染同文件后续验证。
+      first.diagnostics.warnings.length = 0;
+      first.diagnostics.timedOutStages.length = 0;
+      first.diagnostics.gateFailures.length = 0;
+      first.trust.containsSecrets = false;
+    }
+  });
+
+  it('keeps an explicit failed timeout receipt ahead of a concurrently aborted signal', async () => {
+    const abortController = new AbortController();
+    const router = new ToolRouter();
+    const execute = vi.spyOn(router, 'execute').mockImplementation(async () => {
+      abortController.abort();
+      return {
+        ok: false,
+        data: { retained: 'partial readback' },
+        error: 'Fixture timeout',
+        _meta: { cached: false, tokensEstimate: 0, durationMs: 0, resultStatus: 'timeout' },
+      };
+    });
+    try {
+      const adapter = new ToolRouterAdapter({
+        router,
+        contextFactory: { create: () => baseToolContext() },
+      });
+      const envelope = await adapter.execute({
+        toolId: 'meta',
+        args: { action: 'tools', params: {} },
+        surface: 'runtime',
+        actor: { role: 'agent' },
+        source: { kind: 'runtime' },
+        abortSignal: abortController.signal,
+      });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(envelope).toMatchObject({
+        ok: false,
+        status: 'timeout',
+        structuredContent: { retained: 'partial readback' },
+      });
+    } finally {
+      execute.mockRestore();
+    }
+  });
+});
 
 describe('ToolRouter scheduling and cancellation', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -183,7 +297,7 @@ describe('ToolRouter scheduling and cancellation', () => {
   });
 });
 
-describe('Tool V2 contract exports', () => {
+describe('tool runtime adapters and public contracts', () => {
   it('preserves an aborted status through the host adapter before execution', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -233,7 +347,7 @@ describe('Tool V2 contract exports', () => {
       '2 passed, 1 failed, 3 total'
     );
   });
-  it('exports capability catalog projections from the V2 registry', () => {
+  it('exports capability catalog projections from the runtime registry', () => {
     const catalog = new RuntimeCapabilityCatalog();
     const schemas = catalog.toToolSchemas(['meta']);
 
@@ -347,7 +461,7 @@ describe('Tool V2 contract exports', () => {
     expect(compressed).toContain('modified');
   });
 
-  it('routes V2 calls through generic router and adapter contracts', async () => {
+  it('routes tool calls through generic router and adapter contracts', async () => {
     const router = new ToolRouter();
     const parsed = router.parseToolCall('meta', {
       action: 'tools',
@@ -381,7 +495,7 @@ describe('Tool V2 contract exports', () => {
     expect(envelope.cache?.policy).toBe('none');
   });
 
-  it('binds V2 terminal exec calls to the injected sandbox executor', async () => {
+  it('binds terminal exec calls to the injected sandbox executor', async () => {
     const router = new ToolRouter();
     const parsed = router.parseToolCall('terminal', {
       action: 'exec',
@@ -451,46 +565,35 @@ describe('Tool V2 contract exports', () => {
     expect(order[3]).toBe(`exit:${order[2].slice('enter:'.length)}`);
   });
 
-  it('routes V2 terminal cancellation as a structured partial timeout result', async () => {
-    const router = new ToolRouter();
+  it.each([
+    { label: 'confirmed cancellation', reason: () => new Error('fixture stop'), status: 'aborted' },
+    {
+      label: 'confirmed deadline',
+      reason: () => new DOMException('fixture deadline', 'TimeoutError'),
+      status: 'timeout',
+    },
+    { label: 'unknown SIGKILL cause', reason: () => undefined, status: 'error' },
+  ])('retains terminal partial output and $label through the real adapter', async ({
+    reason,
+    status,
+  }) => {
     const abortController = new AbortController();
-    const parsed = router.parseToolCall('terminal', {
-      action: 'exec',
-      params: { command: 'node -e "setTimeout(() => {}, 1000)"' },
+    const compress = vi.fn(async (output: string) => output);
+    const exec = vi.fn(async (_command: string, opts: { signal?: AbortSignal }) => {
+      expect(opts.signal).toBe(abortController.signal);
+      expect(opts.signal?.aborted).toBe(false);
+      const abortReason = reason();
+      if (abortReason !== undefined) {
+        abortController.abort(abortReason);
+      }
+      return { stdout: 'partial output\n', stderr: '', exitCode: 137 };
     });
-
-    expect('error' in parsed).toBe(false);
-    if ('error' in parsed) {
-      throw new Error(parsed.error);
-    }
-
-    const result = await router.execute(parsed, {
-      ...baseToolContext(),
-      abortSignal: abortController.signal,
-      sandboxExecutor: {
-        exec: async (_command: string, opts: { signal?: AbortSignal }) => {
-          // 部分输出来自已开始的执行；预先取消由 router 拒绝，不应伪造执行结果。
-          expect(opts.signal?.aborted).toBe(false);
-          abortController.abort();
-          expect(opts.signal?.aborted).toBe(true);
-          return { stdout: 'partial output\n', stderr: '', exitCode: 137 };
-        },
-      },
-    });
-
-    expect(result.ok).toBe(true);
-    expect(String(result.data)).toContain('[timeout] partial output');
-    expect(String(result.data)).toContain('partial output');
-  });
-
-  it('surfaces a degraded handler result on the per-call envelope diagnostics', async () => {
     const adapter = new ToolRouterAdapter({
       contextFactory: {
         create: () => ({
           ...baseToolContext(),
-          sandboxExecutor: {
-            exec: async () => ({ stdout: 'half done', stderr: '', exitCode: 137 }),
-          },
+          sandboxExecutor: { exec },
+          compressor: { compress },
         }),
       },
     });
@@ -501,14 +604,24 @@ describe('Tool V2 contract exports', () => {
       surface: 'runtime',
       actor: { role: 'agent' },
       source: { kind: 'runtime', name: 'vitest' },
+      abortSignal: abortController.signal,
     });
 
-    // terminal.exec marks a SIGKILL/timeout partial as degraded; the adapter must
-    // lift that onto the envelope diagnostics (which feeds the ordinary-output summary).
+    expect(exec).toHaveBeenCalledOnce();
+    expect(compress).not.toHaveBeenCalled();
+    // 旧 ok:true 表示调用返回了可用输出；明确终态必须阻止下游把中止当作命令成功。
     expect(envelope.ok).toBe(true);
-    expect(envelope.text).toContain('[timeout] partial output');
+    expect(envelope.status).toBe(status);
+    expect(envelope.text).toContain('partial output');
+    expect(envelope.structuredContent).toContain('partial output');
     expect(envelope.diagnostics?.degraded).toBe(true);
     expect(envelope.diagnostics?.fallbackUsed).toBe(false);
+    expect(envelope.diagnostics.warnings).toContainEqual(
+      expect.objectContaining({ code: 'terminal_execution_interrupted' })
+    );
+    expect(readToolObservation({ tool: 'terminal', args: { action: 'exec' }, envelope }).ok).toBe(
+      false
+    );
   });
 
   it('reports clean diagnostics for a normal handler result', async () => {
