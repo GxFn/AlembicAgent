@@ -64,6 +64,35 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     return new DiagnosticsCollector(isDiagnostics(value) ? value : undefined);
   }
 
+  #readCount(value: unknown, field: string): number {
+    if (value === undefined) {
+      return 0;
+    }
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+    // opts / strategy 回执属于外部边界；坏计数只降级诊断字段，不中断实际任务。
+    const received =
+      typeof value === 'number' ? String(value) : value === null ? 'null' : typeof value;
+    this.warn({
+      code: 'diagnostics_invalid_count',
+      message: `Ignored ${field}: expected a finite non-negative number, received ${received}`,
+    });
+    return 0;
+  }
+
+  #addCount(current: number, value: unknown, field: string): number {
+    const total = current + this.#readCount(value, field);
+    if (Number.isFinite(total)) {
+      return total;
+    }
+    this.warn({
+      code: 'diagnostics_invalid_count',
+      message: `Ignored ${field}: addition would overflow a finite diagnostic count; previous total retained`,
+    });
+    return current;
+  }
+
   markDegraded() {
     this.#diagnostics.degraded = true;
   }
@@ -73,7 +102,7 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
   }
 
   warn(warning: AgentDiagnosticWarning) {
-    this.#diagnostics.warnings.push(warning);
+    this.#diagnostics.warnings.push({ ...warning });
   }
 
   recordTimedOutStage(stage: string) {
@@ -87,9 +116,11 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
   }
 
   recordTruncatedToolCalls(count: number) {
-    if (count > 0) {
-      this.#diagnostics.truncatedToolCalls += count;
-    }
+    this.#diagnostics.truncatedToolCalls = this.#addCount(
+      this.#diagnostics.truncatedToolCalls,
+      count,
+      'truncatedToolCalls'
+    );
   }
 
   recordEmptyResponse() {
@@ -185,20 +216,34 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     reasoningTokens?: number;
     cacheHitTokens?: number;
   }) {
-    this.#diagnostics.efficiency ??= emptyEfficiency();
-    this.#diagnostics.efficiency.tokenUsage.input += usage.inputTokens || 0;
-    this.#diagnostics.efficiency.tokenUsage.output += usage.outputTokens || 0;
-    this.#diagnostics.efficiency.tokenUsage.reasoning += usage.reasoningTokens || 0;
-    this.#diagnostics.efficiency.tokenUsage.cacheHit += usage.cacheHitTokens || 0;
+    const target = (this.#diagnostics.efficiency ??= emptyEfficiency()).tokenUsage;
+    target.input = this.#addCount(target.input, usage.inputTokens, 'efficiency.tokenUsage.input');
+    target.output = this.#addCount(
+      target.output,
+      usage.outputTokens,
+      'efficiency.tokenUsage.output'
+    );
+    target.reasoning = this.#addCount(
+      target.reasoning,
+      usage.reasoningTokens,
+      'efficiency.tokenUsage.reasoning'
+    );
+    target.cacheHit = this.#addCount(
+      target.cacheHit,
+      usage.cacheHitTokens,
+      'efficiency.tokenUsage.cacheHit'
+    );
   }
 
   recordCompaction(result: { level?: number; removed?: number }) {
-    this.#diagnostics.efficiency ??= emptyEfficiency();
-    const level = result.level || 0;
-    if (level > this.#diagnostics.efficiency.maxCompactionLevel) {
-      this.#diagnostics.efficiency.maxCompactionLevel = level;
-    }
-    this.#diagnostics.efficiency.totalCompactedItems += result.removed || 0;
+    const efficiency = (this.#diagnostics.efficiency ??= emptyEfficiency());
+    const level = this.#readCount(result.level, 'efficiency.maxCompactionLevel');
+    efficiency.maxCompactionLevel = Math.max(efficiency.maxCompactionLevel, level);
+    efficiency.totalCompactedItems = this.#addCount(
+      efficiency.totalCompactedItems,
+      result.removed,
+      'efficiency.totalCompactedItems'
+    );
   }
 
   recordNudge(input: { type?: string; isReplan?: boolean } = {}) {
@@ -239,13 +284,22 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     for (const blockedTool of input.blockedTools || []) {
       this.recordBlockedTool(blockedTool.tool, blockedTool.reason);
     }
-    this.recordTruncatedToolCalls(input.truncatedToolCalls || 0);
-    for (let index = 0; index < (input.emptyResponses || 0); index++) {
-      this.recordEmptyResponse();
-    }
-    for (let index = 0; index < (input.aiErrorCount || 0); index++) {
-      this.#diagnostics.aiErrorCount++;
-    }
+    // 合并聚合计数只做一次加法，耗时不随策略提供的计数值增长。
+    this.#diagnostics.truncatedToolCalls = this.#addCount(
+      this.#diagnostics.truncatedToolCalls,
+      input.truncatedToolCalls,
+      'truncatedToolCalls'
+    );
+    this.#diagnostics.emptyResponses = this.#addCount(
+      this.#diagnostics.emptyResponses,
+      input.emptyResponses,
+      'emptyResponses'
+    );
+    this.#diagnostics.aiErrorCount = this.#addCount(
+      this.#diagnostics.aiErrorCount,
+      input.aiErrorCount,
+      'aiErrorCount'
+    );
     for (const gateFailure of input.gateFailures || []) {
       this.recordGateFailure(gateFailure.stage, gateFailure.action, gateFailure.reason);
     }
@@ -260,22 +314,33 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     }
     if (input.efficiency) {
       const target = (this.#diagnostics.efficiency ??= emptyEfficiency());
-      target.toolCalls += input.efficiency.toolCalls || 0;
-      target.duplicateToolCalls += input.efficiency.duplicateToolCalls || 0;
-      target.cacheHits += input.efficiency.cacheHits || 0;
-      target.cacheMisses += input.efficiency.cacheMisses || 0;
-      target.tokenUsage.input += input.efficiency.tokenUsage?.input || 0;
-      target.tokenUsage.output += input.efficiency.tokenUsage?.output || 0;
-      target.tokenUsage.reasoning += input.efficiency.tokenUsage?.reasoning || 0;
-      target.tokenUsage.cacheHit += input.efficiency.tokenUsage?.cacheHit || 0;
+      for (const field of [
+        'toolCalls',
+        'duplicateToolCalls',
+        'cacheHits',
+        'cacheMisses',
+        'totalCompactedItems',
+        'nudgeCount',
+        'replanCount',
+        'emptyRetries',
+      ] as const) {
+        target[field] = this.#addCount(
+          target[field],
+          input.efficiency[field],
+          `efficiency.${field}`
+        );
+      }
+      for (const field of ['input', 'output', 'reasoning', 'cacheHit'] as const) {
+        target.tokenUsage[field] = this.#addCount(
+          target.tokenUsage[field],
+          input.efficiency.tokenUsage?.[field],
+          `efficiency.tokenUsage.${field}`
+        );
+      }
       target.maxCompactionLevel = Math.max(
         target.maxCompactionLevel,
-        input.efficiency.maxCompactionLevel || 0
+        this.#readCount(input.efficiency.maxCompactionLevel, 'efficiency.maxCompactionLevel')
       );
-      target.totalCompactedItems += input.efficiency.totalCompactedItems || 0;
-      target.nudgeCount += input.efficiency.nudgeCount || 0;
-      target.replanCount += input.efficiency.replanCount || 0;
-      target.emptyRetries += input.efficiency.emptyRetries || 0;
       target.forcedSummary = target.forcedSummary || input.efficiency.forcedSummary === true;
       if (input.efficiency.cancelReason) {
         target.cancelReason = input.efficiency.cancelReason;
@@ -323,13 +388,14 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     return {
       degraded: this.#diagnostics.degraded,
       fallbackUsed: this.#diagnostics.fallbackUsed,
-      warnings: [...this.#diagnostics.warnings],
+      // 公开快照拥有自己的条目，调用方修改回执不能反写运行中的诊断收集器。
+      warnings: this.#diagnostics.warnings.map((warning) => ({ ...warning })),
       timedOutStages: [...this.#diagnostics.timedOutStages],
-      blockedTools: [...this.#diagnostics.blockedTools],
+      blockedTools: this.#diagnostics.blockedTools.map((tool) => ({ ...tool })),
       truncatedToolCalls: this.#diagnostics.truncatedToolCalls,
       emptyResponses: this.#diagnostics.emptyResponses,
       aiErrorCount: this.#diagnostics.aiErrorCount,
-      gateFailures: [...this.#diagnostics.gateFailures],
+      gateFailures: this.#diagnostics.gateFailures.map((failure) => ({ ...failure })),
       ...(this.#diagnostics.toolCalls
         ? { toolCalls: this.#diagnostics.toolCalls.map((call) => ({ ...call })) }
         : {}),

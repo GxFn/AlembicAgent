@@ -4,7 +4,7 @@
  * 借鉴 AutoGen Core Event-Driven 架构 + RxJS Observable 模式:
  *   - Agent 间松耦合通信（publish/subscribe）
  *   - 支持同步和异步事件处理
- *   - 内置事件过滤、优先级、TTL
+ *   - 事件元信息与通配监听
  *   - 支持 request/reply 模式（Agent 间 RPC）
  *
  * @module AgentEventBus
@@ -12,6 +12,14 @@
 
 import { EventEmitter } from 'node:events';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
+import { runOperation } from '#shared/operation.js';
+
+interface PendingReply {
+  requestType: string;
+  resolve: (event: unknown) => void;
+  cancel: (reason: Error) => void;
+}
 
 /** 标准事件类型 */
 export const AgentEvents = Object.freeze({
@@ -48,9 +56,9 @@ export class AgentEventBus extends EventEmitter {
   static #instance: AgentEventBus | null = null;
   #logger;
   /** topic → handlers */
-  #subscriptions = new Map();
-  /** >} */
-  #pendingReplies = new Map();
+  #subscriptions = new Map<string, Array<(event: Record<string, unknown>) => void>>();
+  /** correlationId → 尚未完成的请求 */
+  #pendingReplies = new Map<string, PendingReply>();
   /** 事件计数 */
   #eventCount = 0;
 
@@ -68,11 +76,16 @@ export class AgentEventBus extends EventEmitter {
     return AgentEventBus.#instance;
   }
 
-  /** 重置单例（测试用） */
+  /** 重置单例（测试用）；取消旧实例的未完成请求并释放等待资源。 */
   static resetInstance() {
     if (AgentEventBus.#instance) {
       AgentEventBus.#instance.removeAllListeners();
       AgentEventBus.#instance.#subscriptions.clear();
+      for (const pending of AgentEventBus.#instance.#pendingReplies.values()) {
+        pending.cancel(
+          new Error(`AgentEventBus request cancelled by reset: ${pending.requestType}`)
+        );
+      }
       AgentEventBus.#instance.#pendingReplies.clear();
     }
     AgentEventBus.#instance = null;
@@ -103,27 +116,26 @@ export class AgentEventBus extends EventEmitter {
       correlationId: opts.correlationId || null,
     };
 
-    // 发射到 EventEmitter（通用监听）
-    this.emit(type, event);
-    this.emit('*', event); // 全局监听
-
-    // 发射到 topic 订阅者
-    const handlers = this.#subscriptions.get(type) || [];
+    // 一次发布冻结所有监听通道。rawListeners 保留 once wrapper 与 EventEmitter 的 this 绑定；
+    // 只在 publish 边界隔离观察者，继承的 emit 仍保留 Node EventEmitter 的公开语义。
+    const listeners = [...this.rawListeners(type), ...this.rawListeners('*')];
+    const handlers = [...(this.#subscriptions.get(type) || [])];
+    const onFailure = (err: unknown) => {
+      this.#logger.warn(
+        `[AgentEventBus] Handler error on ${type}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    };
+    for (const listener of listeners) {
+      observeSafely(() => listener.call(this, event), onFailure);
+    }
     for (const handler of handlers) {
-      try {
-        handler(event);
-      } catch (err: unknown) {
-        this.#logger.warn(
-          `[AgentEventBus] Handler error on ${type}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
+      observeSafely(() => handler(event), onFailure);
     }
 
     // 检查是否有 pending reply
-    if (opts.correlationId && this.#pendingReplies.has(opts.correlationId)) {
+    if (opts.correlationId) {
       const pending = this.#pendingReplies.get(opts.correlationId);
-      if (type !== pending.requestType) {
-        clearTimeout(pending.timer);
+      if (pending && type !== pending.requestType) {
         this.#pendingReplies.delete(opts.correlationId);
         pending.resolve(event);
       }
@@ -137,10 +149,9 @@ export class AgentEventBus extends EventEmitter {
    * @returns 取消订阅函数
    */
   subscribe(type: string, handler: (event: Record<string, unknown>) => void) {
-    if (!this.#subscriptions.has(type)) {
-      this.#subscriptions.set(type, []);
-    }
-    this.#subscriptions.get(type).push(handler);
+    const handlers = this.#subscriptions.get(type) ?? [];
+    this.#subscriptions.set(type, handlers);
+    handlers.push(handler);
 
     return () => {
       const handlers = this.#subscriptions.get(type);
@@ -170,19 +181,45 @@ export class AgentEventBus extends EventEmitter {
     const timeout = opts.timeout || 30_000;
 
     const { promise, resolve, reject } = Promise.withResolvers();
-    const timer = setTimeout(() => {
-      this.#pendingReplies.delete(correlationId);
-      reject(new Error(`AgentEventBus request timeout: ${requestType} (${timeout}ms)`));
-    }, timeout);
-
-    this.#pendingReplies.set(correlationId, { resolve, reject, timer, requestType });
-
-    this.publish(requestType, payload, {
-      source: opts.source,
-      correlationId,
+    // 生命周期可能在接管 reply 前结束；仍接住发布/重置带来的迟到拒绝，不产生孤立 promise。
+    void promise.catch(() => undefined);
+    const cancellation = new AbortController();
+    const pendingOperation = runOperation(() => promise, {
+      timeoutMs: timeout,
+      abortSignal: cancellation.signal,
     });
-
-    return promise;
+    this.#pendingReplies.set(correlationId, {
+      resolve,
+      requestType,
+      cancel: (reason) => {
+        cancellation.abort(reason);
+        reject(reason);
+      },
+    });
+    try {
+      // 保留同步 publish 合同；只把等待/取消/长 timer 策略交给共享生命周期。
+      try {
+        this.publish(requestType, payload, {
+          source: opts.source,
+          correlationId,
+        });
+      } catch (err: unknown) {
+        reject(err);
+      }
+      const outcome = await pendingOperation;
+      if (outcome.status === 'ok') {
+        return outcome.value;
+      }
+      if (outcome.status === 'error') {
+        return Promise.reject(outcome.error);
+      }
+      if (outcome.status === 'aborted') {
+        return Promise.reject(cancellation.signal.reason);
+      }
+      throw new Error(`AgentEventBus request timeout: ${requestType} (${timeout}ms)`);
+    } finally {
+      this.#pendingReplies.delete(correlationId);
+    }
   }
 
   /** 获取事件统计 */

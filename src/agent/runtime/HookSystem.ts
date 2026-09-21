@@ -1,19 +1,21 @@
 /**
- * HookSystem — 统一事件与可扩展切点
+ * HookSystem — 可阻断的执行钩子与兼容事件桥接
  *
- * 替代碎片化的 4 个事件通道（AgentEventBus / EventBus / SignalBus / Pipeline Middleware），
- * 提供统一的 hook 注册和分发机制。
+ * AgentRuntime 拥有调用时机；本模块负责注册、优先级、工具执行前阻断和错误诊断。
+ * AgentEventBus 仍负责广播与请求回执，ToolExecutionPipeline 仍负责工具准入、执行和结果观察。
  *
  * 设计原则：
  *   - 类型安全：每个 HookEvent 有明确的 payload 类型
  *   - 可组合：支持 sync 和 async hook
  *   - 可拦截：tool:execute:before 支持 block（返回 false 阻止执行）
- *   - 兼容：通过 bridge 连接 AgentEventBus / SignalBus
+ *   - 兼容：通过默认 hook 桥接 AgentEventBus，避免重复发布工具事件
  *
- * @module core/HookSystem
+ * @module agent/runtime/HookSystem
  */
 
 import Logger from '@alembic/core/logging';
+import { isThenable, observeSafely } from '#shared/observers.js';
+import { redactDeveloperText } from '../utils/Redaction.js';
 import type { AgentProgressProcessEvent } from './AgentRuntimeTypes.js';
 
 // ── Hook Events ──
@@ -88,6 +90,7 @@ interface HookEntry<E extends HookEvent = HookEvent> {
   handler: HookHandler<E>;
   priority: number;
   once: boolean;
+  fired?: boolean;
   id: string;
 }
 
@@ -130,12 +133,7 @@ export class HookSystem {
     list.push(entry as unknown as HookEntry);
     list.sort((a, b) => a.priority - b.priority);
 
-    return () => {
-      const idx = list.findIndex((e) => e.id === id);
-      if (idx >= 0) {
-        list.splice(idx, 1);
-      }
-    };
+    return () => this.#removeHook(event, id);
   }
 
   /** Register a one-shot hook. */
@@ -143,11 +141,32 @@ export class HookSystem {
     return this.on(event, handler, { priority, once: true });
   }
 
+  #removeHook(event: HookEvent, id: string): void {
+    const list = this.#hooks.get(event);
+    const index = list?.findIndex((entry) => entry.id === id) ?? -1;
+    if (list && index >= 0) {
+      list.splice(index, 1);
+    }
+  }
+
+  #claimOnce(entry: HookEntry): boolean {
+    if (!entry.once) {
+      return true;
+    }
+    // 不同分发可能早已快照到同一 entry；共享领取事实，不能只检查 live list。
+    if (entry.fired) {
+      return false;
+    }
+    entry.fired = true;
+    this.#removeHook(entry.event, entry.id);
+    return true;
+  }
+
   /**
    * Emit an event to all registered hooks.
    *
    * For 'tool:execute:before': if any handler returns false, the tool execution is blocked.
-   * All other events are fire-and-forget.
+   * Handlers are awaited in order; only blocking events interpret a false result.
    *
    * @returns For blocking events, returns false if any handler blocked. Otherwise true.
    */
@@ -157,33 +176,23 @@ export class HookSystem {
       return true;
     }
 
-    const toRemove: string[] = [];
     let blocked = false;
 
-    for (const entry of list) {
+    // 当前分发使用固定快照；自退订不能跳过后续阻断器，新 hook 只影响下一次分发。
+    for (const entry of [...list]) {
+      // 调用前领取 once，防止同步重入或 await 期间并发 emit 再次执行。
+      if (!this.#claimOnce(entry)) {
+        continue;
+      }
       try {
         const result = entry.handler(payload as never);
-        const resolved = result instanceof Promise ? await result : result;
+        const resolved = isThenable(result) ? await result : result;
 
         if (event === 'tool:execute:before' && resolved === false) {
           blocked = true;
         }
-      } catch (err) {
+      } catch (err: unknown) {
         this.#recordHookError(event, entry, err, 'async', payload);
-      }
-
-      if (entry.once) {
-        toRemove.push(entry.id);
-      }
-    }
-
-    // Clean up one-shot hooks
-    if (toRemove.length > 0) {
-      for (const id of toRemove) {
-        const idx = list.findIndex((e) => e.id === id);
-        if (idx >= 0) {
-          list.splice(idx, 1);
-        }
       }
     }
 
@@ -192,7 +201,7 @@ export class HookSystem {
 
   /**
    * Synchronous emit — for performance-critical hooks where async is unnecessary.
-   * Does not support blocking (always returns true).
+   * Does not wait or support blocking; observer promises are monitored for rejection.
    */
   emitSync<E extends HookEvent>(event: E, payload: HookPayloadMap[E]): void {
     const list = this.#hooks.get(event);
@@ -200,26 +209,14 @@ export class HookSystem {
       return;
     }
 
-    for (const entry of list) {
-      try {
-        const result = entry.handler(payload as never);
-        if (result instanceof Promise) {
-          void result.catch((err: unknown) =>
-            this.#recordHookError(event, entry, err, 'sync', payload)
-          );
-        }
-      } catch (err) {
-        this.#recordHookError(event, entry, err, 'sync', payload);
+    for (const entry of [...list]) {
+      if (!this.#claimOnce(entry)) {
+        continue;
       }
-    }
-
-    // Clean up one-shot hooks
-    const toRemove = list.filter((e) => e.once).map((e) => e.id);
-    for (const id of toRemove) {
-      const idx = list.findIndex((e) => e.id === id);
-      if (idx >= 0) {
-        list.splice(idx, 1);
-      }
+      observeSafely(
+        () => entry.handler(payload as never),
+        (err) => this.#recordHookError(event, entry, err, 'sync', payload)
+      );
     }
   }
 
@@ -259,16 +256,25 @@ export class HookSystem {
     mode: 'async' | 'sync',
     payload: HookPayloadMap[E]
   ): void {
-    const diagnostic: HookErrorDiagnostic = {
-      code: 'HOOK_HANDLER_FAILED',
-      event,
-      hookId: entry.id,
-      message: err instanceof Error ? err.message : String(err),
-      mode,
-    };
-    this.#hookErrors.push(diagnostic);
-    attachHookDiagnosticToProcessEvent(payload, diagnostic);
-    this.#logger.warn(`[HookSystem] hook error on ${event} (${entry.id}): ${diagnostic.message}`);
+    // 错误附件或日志端口自身失败不能重新中断已经隔离的观察者分发。
+    observeSafely(
+      () => {
+        const diagnostic: HookErrorDiagnostic = {
+          code: 'HOOK_HANDLER_FAILED',
+          event,
+          hookId: entry.id,
+          // 错误会进入 developer-facing 过程事件；必须在附加到已净化 metadata 前脱敏。
+          message: redactDeveloperText(err instanceof Error ? err.message : String(err)),
+          mode,
+        };
+        this.#hookErrors.push(diagnostic);
+        attachHookDiagnosticToProcessEvent(payload, diagnostic);
+        return this.#logger.warn(
+          `[HookSystem] hook error on ${event} (${entry.id}): ${diagnostic.message}`
+        );
+      },
+      () => undefined
+    );
   }
 }
 

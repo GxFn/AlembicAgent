@@ -1,5 +1,17 @@
 # 阶段执行与知识提交的生命周期
 
+## 运行边界与观察通知
+
+`AgentRuntime.execute`、阶段尝试和 Transport 共用 `shared/operation.ts` 的四态生命周期。预先取消的运行不会进入策略；运行中取消会结束等待并保留已确认的工具回执和用量，父 signal 的取消原因传至子操作。超时先固定为 timeout，再取消子操作；同步的取消回调不能把它改成成功或主动取消。超长有限期限按 Node timer 上限分段等待。
+
+硬超时继续通过 Error 拒绝，内部 Runtime/Service 共享的超时错误携带已确认的部分结果。Service 返回 `timeout` 时保留这些工具回执、已知用量和诊断；仍在途的外部写入可能需要宿主读回，不能把取消或超时当作回滚。资源清理及清理诊断失败均不覆盖已确认结果。
+
+`shared/observers.ts` 只负责旁路观察者的同步异常与 PromiseLike 拒绝隔离，由调用方决定诊断内容。AI 管理、JSON 恢复日志、runtime 进度和工具结果通知使用同一辅助入口。通知失败不能抹掉结果、重放工具或阻断后续监听者；诊断通道自身失败也不递归报告。权限判断仍由可等待、可返回 false 的执行前 Hook 完成。
+
+EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和监听器的 `this`；直接调用继承的 `emit` 仍遵守 Node 原有语义。request/reply 同步发布请求、按 correlationId 接受响应，等待期限复用 `runOperation`；reset 清理尚未完成的请求。Hook 同样使用分发快照，退订不会跳过后续阻断器；`once` 的领取状态在并发分发间共享。
+
+诊断计数只接受有限非负数，非法输入或累加溢出产生 `diagnostics_invalid_count`，保留合法字段与已有总量。合并聚合计数不按数值大小循环。诊断快照复制公开条目，宿主修改快照不会反写收集器。
+
 ## 阶段尝试
 
 `PipelineStrategy` 负责阶段顺序、gate 路由、Core strict receipt 接入和结果汇总。`strategies/pipeline/attempt.ts` 负责单次尝试的期限、取消、工具观察和诊断；`shared/operation.ts` 仅提供异步操作的四种终态：`ok`、`timeout`、`aborted`、`error`。

@@ -1,3 +1,6 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { NudgeGenerator, PlanTracker } from '../src/agent/context/index.js';
@@ -363,6 +366,209 @@ describe('tool pipeline lifecycle', () => {
 });
 
 describe('runtime efficiency diagnostics', () => {
+  it('isolates mutable entries in every public diagnostic snapshot', () => {
+    const diagnostics = new DiagnosticsCollector({
+      warnings: [{ code: 'known_warning', message: 'original warning' }],
+      blockedTools: [{ tool: 'terminal', reason: 'original block' }],
+      gateFailures: [{ stage: 'review', action: 'degrade', reason: 'original failure' }],
+      toolCalls: [
+        {
+          tool: 'code',
+          callId: 'read',
+          status: 'success',
+          ok: true,
+          startedAt: 'now',
+          durationMs: 1,
+        },
+      ],
+      stageToolsets: [
+        {
+          stage: 'review',
+          capabilities: ['read'],
+          allowedToolIds: ['code'],
+          allowedToolActions: { code: ['read'] },
+          toolSchemaCount: 1,
+        },
+      ],
+    });
+    diagnostics.recordTokenUsage({ inputTokens: 5 });
+    const snapshot = diagnostics.toJSON();
+    const expected = structuredClone(snapshot);
+    assert(snapshot.toolCalls);
+    assert(snapshot.stageToolsets);
+    assert(snapshot.stageToolsets[0].allowedToolActions);
+    assert(snapshot.efficiency);
+    snapshot.warnings[0].message = 'changed warning';
+    snapshot.blockedTools[0].reason = 'changed block';
+    snapshot.gateFailures[0].reason = 'changed failure';
+    snapshot.toolCalls[0].status = 'changed status';
+    snapshot.stageToolsets[0].capabilities.push('changed capability');
+    snapshot.stageToolsets[0].allowedToolIds.push('terminal');
+    snapshot.stageToolsets[0].allowedToolActions.code.push('write');
+    snapshot.efficiency.tokenUsage.input = 100;
+    expect(diagnostics.toJSON()).toEqual(expected);
+  });
+
+  it.each(['seed', 'warn'])('owns warning entries accepted through %s', (entrypoint) => {
+    const warning = { code: 'known_warning', message: 'original warning' };
+    const diagnostics =
+      entrypoint === 'seed'
+        ? DiagnosticsCollector.from({ warnings: [warning] })
+        : new DiagnosticsCollector();
+    if (entrypoint === 'warn') {
+      diagnostics.warn(warning);
+    }
+    warning.message = 'changed by caller';
+    expect(diagnostics.toJSON().warnings).toEqual([
+      { code: 'known_warning', message: 'original warning' },
+    ]);
+  });
+
+  it('bounds unknown counters and merges large diagnostic counts without blocking the runtime', () => {
+    // 无限循环回归只在可强制终止的子进程运行；转译真实收集器源码，不读取旧 dist。
+    const source = fileURLToPath(
+      new URL('../src/agent/runtime/DiagnosticsCollector.ts', import.meta.url)
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+          import { readFileSync } from 'node:fs';
+          import ts from 'typescript';
+          const { outputText } = ts.transpileModule(readFileSync(${JSON.stringify(source)}, 'utf8'), {
+            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+          });
+          const { DiagnosticsCollector } = await import(
+            'data:text/javascript;base64,' + Buffer.from(outputText).toString('base64')
+          );
+          console.log('before: DiagnosticsCollector.from({ emptyResponses: Infinity })');
+          const collector = DiagnosticsCollector.from({ emptyResponses: Infinity });
+          collector.merge({ aiErrorCount: Infinity, truncatedToolCalls: Infinity });
+          const invalid = collector.toJSON();
+          collector.merge({ emptyResponses: 1_000_000_000_000, aiErrorCount: 1_000_000_000_000 });
+          collector.recordEmptyResponse();
+          collector.recordAiError('known failure');
+          console.log(JSON.stringify({ invalid, merged: collector.toJSON() }));
+        `,
+      ],
+      {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        encoding: 'utf8',
+        timeout: 3000,
+        killSignal: 'SIGKILL',
+      }
+    );
+    expect(result.stdout).toContain('before: DiagnosticsCollector.from');
+    expect(result.error?.message).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const { invalid, merged } = JSON.parse(result.stdout.trim().split('\n').at(-1) || '{}');
+    expect(invalid).toMatchObject({ emptyResponses: 0, aiErrorCount: 0, truncatedToolCalls: 0 });
+    expect(invalid.warnings).toHaveLength(3);
+    expect(invalid.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: 'diagnostics_invalid_count',
+          message: expect.stringContaining('emptyResponses'),
+        }),
+        expect.objectContaining({
+          code: 'diagnostics_invalid_count',
+          message: expect.stringContaining('aiErrorCount'),
+        }),
+        expect.objectContaining({
+          code: 'diagnostics_invalid_count',
+          message: expect.stringContaining('truncatedToolCalls'),
+        }),
+      ])
+    );
+    expect(merged).toMatchObject({
+      emptyResponses: 1_000_000_000_001,
+      aiErrorCount: 1_000_000_000_001,
+    });
+  });
+
+  it.each([
+    Number.NaN,
+    -1,
+    '2',
+    null,
+  ])('reports invalid diagnostic count %s without coercing it or discarding valid siblings', (invalid) => {
+    const diagnostics = DiagnosticsCollector.from({
+      emptyResponses: invalid,
+      aiErrorCount: 2,
+      efficiency: {
+        toolCalls: 3,
+        cacheHits: invalid,
+        tokenUsage: { input: invalid, output: 5 },
+        maxCompactionLevel: invalid,
+        totalCompactedItems: invalid,
+        nudgeCount: invalid,
+        replanCount: invalid,
+        emptyRetries: invalid,
+      },
+    });
+    const snapshot = diagnostics.toJSON();
+    expect(snapshot).toMatchObject({
+      emptyResponses: 0,
+      aiErrorCount: 2,
+      efficiency: {
+        toolCalls: 3,
+        cacheHits: 0,
+        tokenUsage: { input: 0, output: 5 },
+        maxCompactionLevel: 0,
+        totalCompactedItems: 0,
+        nudgeCount: 0,
+        replanCount: 0,
+        emptyRetries: 0,
+      },
+    });
+    expect(snapshot.warnings).toHaveLength(8);
+    expect(snapshot.warnings.every((warning) => warning.code === 'diagnostics_invalid_count')).toBe(
+      true
+    );
+  });
+
+  it('validates direct counters and rejects overflowing additions without inventing infinite totals', () => {
+    const diagnostics = new DiagnosticsCollector();
+    diagnostics.recordTruncatedToolCalls(Infinity);
+    diagnostics.recordTokenUsage({
+      inputTokens: Infinity,
+      outputTokens: -2,
+      reasoningTokens: Number.NaN,
+    });
+    diagnostics.recordCompaction({ level: Infinity, removed: -1 });
+    expect(diagnostics.toJSON()).toMatchObject({
+      truncatedToolCalls: 0,
+      efficiency: {
+        tokenUsage: { input: 0, output: 0, reasoning: 0, cacheHit: 0 },
+        maxCompactionLevel: 0,
+        totalCompactedItems: 0,
+      },
+    });
+    expect(diagnostics.toJSON().warnings).toHaveLength(6);
+
+    diagnostics.recordTruncatedToolCalls(Number.MAX_VALUE);
+    diagnostics.recordTokenUsage({ inputTokens: Number.MAX_VALUE });
+    diagnostics.recordCompaction({ level: 2, removed: Number.MAX_VALUE });
+    diagnostics.merge({
+      truncatedToolCalls: Number.MAX_VALUE,
+      efficiency: {
+        tokenUsage: { input: Number.MAX_VALUE },
+        totalCompactedItems: Number.MAX_VALUE,
+      },
+    });
+    expect(diagnostics.toJSON()).toMatchObject({
+      truncatedToolCalls: Number.MAX_VALUE,
+      efficiency: {
+        tokenUsage: { input: Number.MAX_VALUE },
+        maxCompactionLevel: 2,
+        totalCompactedItems: Number.MAX_VALUE,
+      },
+    });
+    expect(diagnostics.toJSON().warnings).toHaveLength(9);
+  });
+
   it.each([
     {
       label: 'Error',
