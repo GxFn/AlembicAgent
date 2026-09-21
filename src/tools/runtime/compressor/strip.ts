@@ -2,7 +2,7 @@
  * @module tools/runtime/compressor/strip
  *
  * 文本清理工具: ANSI 控制字符去除 + 连续重复行折叠。
- * 用于终端输出的预处理，节省 10-30% 无用 token。
+ * 用于终端输出的显示清理；需要真实计数的解析器先消费未折叠的行集合。
  */
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape sequences require matching control characters
@@ -52,45 +52,28 @@ export function collapseRepeats(text: string, threshold = 3): string {
 }
 
 /**
- * 通用截断: head(40%) + 省略提示 + tail(10%)
- * 保留 stderr 完整输出。
+ * 通用截断：头尾片段和提示共用字符预算。长单行也必须留下有用内容，不能只返回提示。
  */
 export function truncateOutput(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
     return text;
   }
 
-  const headRatio = 0.4;
-  const tailRatio = 0.1;
-  const headLen = Math.floor(maxChars * headRatio);
-  const tailLen = Math.floor(maxChars * tailRatio);
-
-  const lines = text.split('\n');
-  const totalLines = lines.length;
-
-  let headContent = '';
-  let headLineCount = 0;
-  for (const line of lines) {
-    if (headContent.length + line.length + 1 > headLen) {
-      break;
-    }
-    headContent += (headContent ? '\n' : '') + line;
-    headLineCount++;
+  const budget = Number.isNaN(maxChars) ? 0 : Math.max(0, Math.floor(maxChars));
+  if (budget === 0) {
+    return '';
   }
-
-  let tailContent = '';
-  let tailLineCount = 0;
-  for (let i = lines.length - 1; i >= headLineCount; i--) {
-    const candidate = lines[i] + (tailContent ? '\n' : '') + tailContent;
-    if (candidate.length > tailLen) {
-      break;
-    }
-    tailContent = candidate;
-    tailLineCount++;
+  const marker = '\n… [output truncated] …\n';
+  if (budget <= marker.length) {
+    return `${text.slice(0, budget - 1).replace(/[\uD800-\uDBFF]$/u, '')}…`;
   }
-
-  const omitted = totalLines - headLineCount - tailLineCount;
-  return `${headContent}\n\n... (${omitted} lines omitted) ...\n\n${tailContent}`;
+  const available = budget - marker.length;
+  const headLength = Math.ceil(available * 0.8);
+  const tailLength = available - headLength;
+  // 不留下截断产生的孤立UTF-16代理半字；字符预算仍以上界约束。
+  const head = text.slice(0, headLength).replace(/[\uD800-\uDBFF]$/u, '');
+  const tail = tailLength > 0 ? text.slice(-tailLength).replace(/^[\uDC00-\uDFFF]/u, '') : '';
+  return `${head}${marker}${tail}`;
 }
 
 /** 完整清理流水线: stripAnsi → collapseRepeats */

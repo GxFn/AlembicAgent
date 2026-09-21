@@ -120,10 +120,11 @@ and the host knowledge-management port requirements.
 - **Observability first** — hooks, an event bus, a diagnostics collector, and
   the observe-only PCV node-evidence engine (grounding enforcement defaults to
   `off`); every fallback / degraded / retry path logs its trigger and choice.
-- **Token discipline** — LLM input assembly is measured and budget-trimmed;
-  tool outputs go through an ANSI-strip → fold → dedicated-parser compression
-  pipeline (git / grep / test / lint / tree / package parsers) with
-  head+tail-preserving truncation.
+- **Token discipline** — LLM input assembly is measured and budget-trimmed.
+  Terminal output is ANSI-stripped before format parsing; generic fallback folds
+  repeated lines. Parsers retain stderr and decline ambiguous or incomplete formats.
+  Head/tail truncation includes its marker in the budget; structured search keeps
+  complete evidence lines and reports omitted locations separately.
 
 ## Install & local development
 

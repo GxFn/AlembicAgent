@@ -69,46 +69,59 @@ function tryTreeCommand(raw: string): TreeNode | null {
     return null;
   }
 
-  const treeLineRe = /^([│├└─\s|`\\+-]*)\s*(.+?)$/;
+  const treeLineRe = /^((?:│ {3}| {4})*)(?:├── |└── )(.+)$/;
   let matched = 0;
   const root: TreeNode = { name: '.', children: new Map() };
-  const pathStack: string[] = [];
+  const rootName = lines[0];
+  if (treeLineRe.test(rootName) || /[│├└]/.test(rootName)) {
+    return null;
+  }
+  const pathStack: string[] = rootName === '.' ? [] : [rootName];
+  const rootDepth = pathStack.length;
 
-  for (const line of lines) {
+  for (const line of lines.slice(1)) {
+    if (/^\d+ director(?:y|ies)(?:, \d+ files?)?$/.test(line.trim())) {
+      continue;
+    }
     const m = treeLineRe.exec(line);
     if (!m) {
-      continue;
+      return null;
     }
 
-    const prefixLen = m[1].replace(/[^\s│|]/g, ' ').length;
     const name = m[2].trim();
-    if (!name || name === '.' || name.match(/^\d+\s+directories/)) {
-      continue;
+    const depth = m[1].length / 4;
+    if (!name || depth > pathStack.length - rootDepth) {
+      return null;
     }
 
-    const depth = Math.floor(prefixLen / 4) || 0;
     matched++;
 
-    pathStack.length = depth;
+    pathStack.length = rootDepth + depth;
     pathStack.push(name.replace(/\/$/, ''));
     insertPath(root, pathStack);
   }
 
-  return matched > 2 ? root : null;
+  return matched > 0 ? root : null;
 }
 
 function tryFindOutput(raw: string): TreeNode | null {
   const root: TreeNode = { name: '.', children: new Map() };
   let matched = 0;
 
+  if (!raw.includes('/')) {
+    return null;
+  }
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) {
       continue;
     }
+    if (trimmed !== line || /^(?:find|tree|ls):|^\//.test(trimmed) || /[│├└]/.test(trimmed)) {
+      return null;
+    }
 
     const cleaned = trimmed.replace(/^\.\//, '');
-    if (!cleaned) {
+    if (!cleaned || cleaned === '.') {
       continue;
     }
 
@@ -133,7 +146,9 @@ function tryLsR(raw: string): TreeNode | null {
   let currentDir = '';
   let matched = 0;
 
-  const dirHeaderRe = /^(.+):$/;
+  // 单列 ls -R 的明确目录标题；普通文件名末尾的冒号不能被猜成另一层目录。
+  const dirHeaderRe = /^(\.|\.\/.*|.*\/.*):$/;
+  let hasHeader = false;
 
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -143,13 +158,17 @@ function tryLsR(raw: string): TreeNode | null {
 
     const dirMatch = dirHeaderRe.exec(trimmed);
     if (dirMatch) {
-      currentDir = dirMatch[1].replace(/^\.\//, '');
+      currentDir = dirMatch[1] === '.' ? '' : dirMatch[1].replace(/^\.\//, '');
+      hasHeader = true;
       matched++;
       continue;
     }
 
     if (trimmed.startsWith('total ')) {
       continue;
+    }
+    if (!hasHeader || /^(?:find|tree|ls):/.test(trimmed)) {
+      return null;
     }
 
     const parts = currentDir ? [...currentDir.split('/'), trimmed] : [trimmed];
@@ -161,7 +180,7 @@ function tryLsR(raw: string): TreeNode | null {
     insertPath(root, parts.filter(Boolean));
   }
 
-  return matched > 2 ? root : null;
+  return matched > 1 ? root : null;
 }
 
 /** 尝试解析 raw 输出，失败返回 null */
@@ -171,7 +190,12 @@ export function parse(raw: string): string | null {
       return null;
     }
 
-    const root = tryTreeCommand(raw) ?? tryLsR(raw) ?? tryFindOutput(raw);
+    // 先按真实格式分派；宽泛的“树行”正则曾把 find 路径和 tree footer 当成文件。
+    const root = /[│├└]/.test(raw)
+      ? tryTreeCommand(raw)
+      : /^(?:\.|\.\/.*|.*\/.*):$/m.test(raw)
+        ? tryLsR(raw)
+        : tryFindOutput(raw);
 
     if (!root || root.children.size === 0) {
       return null;
@@ -183,7 +207,8 @@ export function parse(raw: string): string | null {
     }
 
     return lines.join('\n');
-  } catch {
+  } catch (err: unknown) {
+    void err;
     return null;
   }
 }

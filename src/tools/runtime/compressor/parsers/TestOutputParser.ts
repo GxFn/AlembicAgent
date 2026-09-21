@@ -17,9 +17,9 @@ interface FailureInfo {
 }
 
 const VITEST_SUMMARY_RE =
-  /Tests\s+(\d+)\s+failed\s*\|\s*(\d+)\s+passed\s*(?:\|\s*(\d+)\s+skipped\s*)?\(\s*(\d+)\s*\)/;
+  /^\s*Tests\s+(\d+)\s+failed\s*(?:\|\s*(\d+)\s+passed\s*)?(?:\|\s*(\d+)\s+skipped\s*)?\(\s*(\d+)\s*\)\s*$/m;
 const VITEST_SUMMARY_PASS_RE =
-  /Tests\s+(\d+)\s+passed\s*(?:\|\s*(\d+)\s+skipped\s*)?\(\s*(\d+)\s*\)/;
+  /^\s*Tests\s+(\d+)\s+passed\s*(?:\|\s*(\d+)\s+skipped\s*)?\(\s*(\d+)\s*\)\s*$/m;
 
 const JEST_SUMMARY_RE =
   /Tests:\s+(?:(\d+)\s+failed,?\s*)?(?:(\d+)\s+skipped,?\s*)?(?:(\d+)\s+passed,?\s*)?(\d+)\s+total/;
@@ -66,7 +66,7 @@ function tryVitest(raw: string): TestResult | null {
   if (m) {
     return {
       failed: parseInt(m[1], 10),
-      passed: parseInt(m[2], 10),
+      passed: m[2] ? parseInt(m[2], 10) : 0,
       skipped: m[3] ? parseInt(m[3], 10) : 0,
       total: parseInt(m[4], 10),
       failures: extractFailures(raw),
@@ -102,10 +102,10 @@ function tryJest(raw: string): TestResult | null {
 }
 
 function tryPytest(raw: string): TestResult | null {
-  // 标题行不是结果；从最后一个含真实计数的摘要取值，不能把 session starts 解析成零通过。
+  // 标题行不是结果；多个运行的摘要无法当成一次完整结果，交回原文。
   const summaries = [...raw.matchAll(PYTEST_SUMMARY_RE)];
-  const m = summaries.at(-1);
-  if (!m) {
+  const m = summaries[0];
+  if (!m || summaries.length !== 1) {
     return null;
   }
 
@@ -116,6 +116,10 @@ function tryPytest(raw: string): TestResult | null {
   const failed = counts.get('failed') ?? 0;
   const skipped = (counts.get('skipped') ?? 0) + (counts.get('xfailed') ?? 0);
   const errors = (counts.get('error') ?? 0) + (counts.get('errors') ?? 0);
+  // XPASS 的结论受 pytest strict 配置影响，不能丢掉它后声称“0 tests”。
+  if ((counts.get('xpassed') ?? 0) > 0 || passed + failed + skipped + errors === 0) {
+    return null;
+  }
 
   return {
     passed,
@@ -168,13 +172,29 @@ export function parse(raw: string): string | null {
       return null;
     }
 
+    // watch/多项目输出的先后结果不能互相覆盖，也不能猜测它们应该累加还是取最后一次。
+    if (
+      (raw.match(/^\s*Tests(?:\s|:)/gm)?.length ?? 0) > 1 ||
+      (raw.match(/^\s*\d+\s+passing\b/gm)?.length ?? 0) > 1 ||
+      (raw.match(/^\s*\d+\s+failing\b/gm)?.length ?? 0) > 1 ||
+      /^\s*Errors\s+[1-9]\d*\s+errors?\b/m.test(raw)
+    ) {
+      return null;
+    }
+
     const result = tryVitest(raw) ?? tryJest(raw) ?? tryPytest(raw) ?? tryMocha(raw);
 
-    if (!result) {
+    if (
+      !result ||
+      ![result.passed, result.failed, result.skipped, result.total].every(Number.isSafeInteger) ||
+      result.passed + result.failed + result.skipped !== result.total ||
+      (result.failed === 0 && /^\s*Test (?:Files|Suites:).*\bfailed\b/m.test(raw))
+    ) {
       return null;
     }
     return formatResult(result);
-  } catch {
+  } catch (err: unknown) {
+    void err;
     return null;
   }
 }

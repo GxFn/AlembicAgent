@@ -108,9 +108,9 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
 - **可观测优先** —— 钩子、事件总线、诊断收集器,加上 observe-only 的
   PCV 节点证据引擎(grounding enforcement 默认 `off`);每条
   fallback / 降级 / 重试路径都记录触发条件与选择路径。
-- **Token 纪律** —— LLM 输入经计量与预算裁剪;工具输出走
-  ANSI strip → 折叠 → 专用 parser 的压缩管线(git / grep / test / lint /
-  tree / package 各有 parser),截断保首尾。
+- **Token 纪律** —— LLM 输入经计量与预算裁剪；终端输出先去 ANSI，再按格式解析，
+  通用降级才折叠重复行。stderr 保留，不确定或不完整格式回到原文。
+  头尾截断的提示也计入预算；结构化搜索保留完整证据行，遗漏项另给定位。
 
 ## 安装与本地开发
 

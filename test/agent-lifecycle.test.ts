@@ -78,6 +78,8 @@ describe('Runtime operation boundary', () => {
   };
 
   it('keeps confirmed tool receipts when cancellation interrupts a later model request', async () => {
+    // 此例验证显式取消；并行全检的机器负载不应先触发夹具的100ms期限。
+    vi.useFakeTimers();
     const entered = Promise.withResolvers<void>();
     const lateReply = Promise.withResolvers<{ text: string; functionCalls: never[] }>();
     const chat = vi
@@ -102,6 +104,7 @@ describe('Runtime operation boundary', () => {
       lateReply.resolve({ text: 'too late', functionCalls: [] });
       await pending;
       await flushPipelineTasks();
+      vi.useRealTimers();
     }
   });
 

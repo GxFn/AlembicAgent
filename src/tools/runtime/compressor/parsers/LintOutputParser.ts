@@ -29,13 +29,20 @@ const BIOME_DIAG_RE = /^(.+?):(\d+):\d+\s+(error|warning|info)\[(.+?)]\s+(.+)$/;
 function tryEslint(raw: string): LintResult | null {
   const summaryMatch = ESLINT_SUMMARY_RE.exec(raw);
   const issues: LintIssue[] = [];
+  let errors = 0;
+  let warnings = 0;
 
   for (const line of raw.split('\n')) {
-    if (issues.length >= MAX_ISSUES) {
-      break;
-    }
     const m = ESLINT_LINE_RE.exec(line);
     if (m) {
+      if (m[3] === 'error') {
+        errors++;
+      } else {
+        warnings++;
+      }
+      if (issues.length >= MAX_ISSUES) {
+        continue;
+      }
       issues.push({
         file: m[1],
         line: m[2],
@@ -55,8 +62,8 @@ function tryEslint(raw: string): LintResult | null {
 
   if (issues.length > 0) {
     return {
-      errors: issues.filter((i) => i.severity === 'error').length,
-      warnings: issues.filter((i) => i.severity === 'warning').length,
+      errors,
+      warnings,
       issues,
     };
   }
@@ -98,13 +105,24 @@ function tryTsc(raw: string): LintResult | null {
 
 function tryBiome(raw: string): LintResult | null {
   const issues: LintIssue[] = [];
+  let errors = 0;
+  let warnings = 0;
 
   for (const line of raw.split('\n')) {
-    if (issues.length >= MAX_ISSUES) {
-      break;
-    }
     const m = BIOME_DIAG_RE.exec(line.trim());
     if (m) {
+      // 展示只存十条，计数必须遍历完整输入；info 不属于 warning，未知摘要交回原文。
+      if (m[3] === 'info') {
+        return null;
+      }
+      if (m[3] === 'error') {
+        errors++;
+      } else {
+        warnings++;
+      }
+      if (issues.length >= MAX_ISSUES) {
+        continue;
+      }
       issues.push({
         file: m[1],
         line: m[2],
@@ -119,8 +137,8 @@ function tryBiome(raw: string): LintResult | null {
   }
 
   return {
-    errors: issues.filter((i) => i.severity === 'error').length,
-    warnings: issues.filter((i) => i.severity === 'warning').length,
+    errors,
+    warnings,
     issues,
   };
 }
@@ -133,6 +151,10 @@ function formatResult(result: LintResult): string {
     parts.push('Top issues:');
     for (const issue of result.issues.slice(0, MAX_ISSUES)) {
       parts.push(`  ${issue.file}:${issue.line}: ${issue.message}`);
+    }
+    const omitted = result.errors + result.warnings - result.issues.length;
+    if (omitted > 0) {
+      parts.push(`  ... ${omitted} more issues not shown`);
     }
   }
 
@@ -152,7 +174,8 @@ export function parse(raw: string): string | null {
     }
 
     return formatResult(result);
-  } catch {
+  } catch (err: unknown) {
+    void err;
     return null;
   }
 }

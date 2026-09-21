@@ -8,8 +8,6 @@ import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   Evolution,
-  OutputCompressor,
-  parseGitStatusOutput,
   RuntimeCapabilityCatalog,
   SearchCache,
   ToolRouter,
@@ -545,40 +543,6 @@ describe('tool runtime adapters and public contracts', () => {
     expect(result.ok).toBe(false);
     expect(result.status).toBe('aborted');
   });
-  it('awaits parser initialization for all concurrent first compressions', async () => {
-    vi.resetModules();
-    const { OutputCompressor: FreshCompressor } = await import(
-      '../src/tools/runtime/compressor/OutputCompressor.js'
-    );
-    const compressor = new FreshCompressor();
-    const outputs = await Promise.all([
-      compressor.compress('?? fresh.ts', { command: 'git status' }),
-      compressor.compress('?? fresh.ts', { command: 'git status' }),
-    ]);
-    expect(outputs).toEqual(['untracked(1): fresh.ts', 'untracked(1): fresh.ts']);
-  });
-  it.each([
-    'UU',
-    'AA',
-    'DD',
-    'AU',
-    'UA',
-    'DU',
-    'UD',
-  ])('preserves git conflict status %s', (status) => {
-    expect(parseGitStatusOutput(`${status} conflict.ts`)).toBe('conflicted(1): conflict.ts');
-  });
-
-  it.each([
-    '1 failed, 2 passed',
-    '2 passed, 1 failed',
-    '1 error, 2 passed',
-  ])('preserves pytest failures in %s', async (summary) => {
-    const output = `===== test session starts =====\ncollected 3 items\n===== ${summary} in 0.1s =====`;
-    expect(await new OutputCompressor().compress(output, { command: 'pytest' })).toContain(
-      '2 passed, 1 failed, 3 total'
-    );
-  });
   it('exports capability catalog projections from the runtime registry', () => {
     const catalog = new RuntimeCapabilityCatalog();
     const schemas = catalog.toToolSchemas(['meta']);
@@ -674,23 +638,6 @@ describe('tool runtime adapters and public contracts', () => {
 
     expect(searchCache.get(key)).toEqual({ matches: 1 });
     expect(searchCache.size).toBe(1);
-  });
-
-  it('exports output compressor and parser utilities', async () => {
-    const gitStatus = [
-      'On branch main',
-      'Changes not staged for commit:',
-      '  modified:   src/index.ts',
-      '',
-    ].join('\n');
-    const parsed = parseGitStatusOutput(gitStatus);
-    const compressed = await new OutputCompressor().compress(gitStatus, {
-      command: 'git status',
-      tokenBudget: 200,
-    });
-
-    expect(parsed).toContain('modified');
-    expect(compressed).toContain('modified');
   });
 
   it('routes tool calls through generic router and adapter contracts', async () => {

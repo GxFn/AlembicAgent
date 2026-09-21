@@ -1,6 +1,6 @@
 /**
  * @module tools/runtime/compressor/parsers/PackageParser
- * 解析 npm/pnpm/yarn install 输出为紧凑结构化格式。
+ * 解析 npm/pnpm 的明确安装计数；未知格式与失败输出交回原文降级。
  */
 
 interface PackageResult {
@@ -18,10 +18,7 @@ const NPM_AUDIT_RE = /(\d+)\s+vulnerabilit(?:y|ies)/;
 
 const PNPM_ADDED_RE = /Packages:\s+\+(\d+)/;
 const PNPM_REMOVED_RE = /Packages:.*-(\d+)/;
-const PNPM_PROGRESS_RE = /Progress:.*,\s+(\d+)\s+done/;
-
-const YARN_ADDED_RE = /Done in\s+[\d.]+s/;
-const YARN_FETCH_RE = /Fetched\s+(\d+)\s+packages?/;
+const PNPM_PROGRESS_RE = /^Progress:.*,\s+done\s*$/m;
 
 const WARN_RE = /(?:npm\s+)?(?:WARN|warn)\s+(.+)/;
 const DEPRECATED_RE = /deprecated\s+(.+)/i;
@@ -38,7 +35,7 @@ function tryNpm(raw: string): PackageResult | null {
   const warnings: string[] = [];
   for (const line of raw.split('\n')) {
     const warnMatch = WARN_RE.exec(line);
-    if (warnMatch && warnings.length < 10) {
+    if (warnMatch) {
       warnings.push(warnMatch[1].trim());
     }
   }
@@ -62,18 +59,18 @@ function tryPnpm(raw: string): PackageResult | null {
   const added = PNPM_ADDED_RE.exec(raw);
   const removed = PNPM_REMOVED_RE.exec(raw);
 
-  if (!added && !removed && !PNPM_PROGRESS_RE.test(raw)) {
+  if ((!added && !removed) || (!PNPM_PROGRESS_RE.test(raw) && !/^Done in\s/m.test(raw))) {
     return null;
   }
 
   const warnings: string[] = [];
   for (const line of raw.split('\n')) {
     const warnMatch = WARN_RE.exec(line);
-    if (warnMatch && warnings.length < 10) {
+    if (warnMatch) {
       warnings.push(warnMatch[1].trim());
     }
     const depMatch = DEPRECATED_RE.exec(line);
-    if (depMatch && warnings.length < 10) {
+    if (!warnMatch && depMatch) {
       warnings.push(`deprecated: ${depMatch[1].trim()}`);
     }
   }
@@ -81,39 +78,6 @@ function tryPnpm(raw: string): PackageResult | null {
   return {
     added: added ? parseInt(added[1], 10) : 0,
     removed: removed ? parseInt(removed[1], 10) : 0,
-    changed: 0,
-    warnings,
-    extra: [],
-  };
-}
-
-function tryYarn(raw: string): PackageResult | null {
-  if (!YARN_ADDED_RE.test(raw) && !raw.includes('YN0000')) {
-    return null;
-  }
-
-  const warnings: string[] = [];
-  let added = 0;
-
-  for (const line of raw.split('\n')) {
-    const fetchMatch = YARN_FETCH_RE.exec(line);
-    if (fetchMatch) {
-      added = parseInt(fetchMatch[1], 10);
-    }
-
-    const warnMatch = WARN_RE.exec(line);
-    if (warnMatch && warnings.length < 10) {
-      warnings.push(warnMatch[1].trim());
-    }
-
-    if (line.includes('YN0002') && warnings.length < 10) {
-      warnings.push(line.trim());
-    }
-  }
-
-  return {
-    added,
-    removed: 0,
     changed: 0,
     warnings,
     extra: [],
@@ -136,8 +100,11 @@ function formatResult(result: PackageResult): string {
   if (result.warnings.length > 0) {
     parts.push('');
     parts.push('Warnings:');
-    for (const w of result.warnings) {
+    for (const w of result.warnings.slice(0, 10)) {
       parts.push(`  ${w}`);
+    }
+    if (result.warnings.length > 10) {
+      parts.push(`  ... ${result.warnings.length - 10} more warnings`);
     }
   }
 
@@ -151,13 +118,19 @@ export function parse(raw: string): string | null {
       return null;
     }
 
-    const result = tryNpm(raw) ?? tryPnpm(raw) ?? tryYarn(raw);
+    // 计数行可能出现在稍后失败的安装中；不能只摘出早期计数并吞掉失败事实。
+    if (/^\s*(?:npm\s+(?:ERR!|error)(?:\s|$)|ERR_PNPM_|error\b)/im.test(raw)) {
+      return null;
+    }
+    // Yarn 的 YN0000 是普通日志级别，Fetched 也不是新增安装数；缺乏明确计数时保留原文。
+    const result = tryNpm(raw) ?? tryPnpm(raw);
     if (!result) {
       return null;
     }
 
     return formatResult(result);
-  } catch {
+  } catch (err: unknown) {
+    void err;
     return null;
   }
 }

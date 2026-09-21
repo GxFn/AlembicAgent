@@ -21,14 +21,17 @@ const FORMAT_RE =
 
 const MAX_ENTRIES = 20;
 
-function parseFullFormat(raw: string): LogEntry[] {
+function parseFullFormat(raw: string): LogEntry[] | null {
   const entries: LogEntry[] = [];
   const lines = raw.split('\n');
   let i = 0;
 
-  while (i < lines.length && entries.length < MAX_ENTRIES) {
-    const commitMatch = COMMIT_RE.exec(lines[i]?.trim() ?? '');
+  while (i < lines.length) {
+    const commitMatch = COMMIT_RE.exec(lines[i] ?? '');
     if (!commitMatch) {
+      if (lines[i]?.trim()) {
+        return null;
+      }
       i++;
       continue;
     }
@@ -40,7 +43,7 @@ function parseFullFormat(raw: string): LogEntry[] {
     i++;
 
     while (i < lines.length) {
-      const line = lines[i]?.trim() ?? '';
+      const line = lines[i] ?? '';
       const authorMatch = AUTHOR_RE.exec(line);
       if (authorMatch) {
         author = authorMatch[1];
@@ -49,11 +52,11 @@ function parseFullFormat(raw: string): LogEntry[] {
       }
       const dateMatch = DATE_RE.exec(line);
       if (dateMatch) {
-        date = dateMatch[1].trim().split(' ').slice(0, 4).join(' ');
+        date = dateMatch[1].trim();
         i++;
         continue;
       }
-      if (line === '') {
+      if (line.trim() === '' || /^Merge: [0-9a-f ]+$/.test(line)) {
         i++;
         continue;
       }
@@ -61,28 +64,30 @@ function parseFullFormat(raw: string): LogEntry[] {
         break;
       }
 
+      // full-format 的正文固定缩进；正文里的 commit/Author/Date 只是消息，不能改写元信息。
+      if (!line.startsWith('    ')) {
+        return null;
+      }
       if (!message) {
-        message = line;
+        message = line.slice(4).trim();
       }
       i++;
     }
 
-    if (hash) {
-      entries.push({ hash, date, author, message });
+    if (!author || !date || !message) {
+      return null;
     }
+    entries.push({ hash, date, author, message });
   }
 
   return entries;
 }
 
-function parseOneline(raw: string): LogEntry[] {
+function parseOneline(raw: string): LogEntry[] | null {
   const entries: LogEntry[] = [];
 
   for (const line of raw.split('\n')) {
-    if (entries.length >= MAX_ENTRIES) {
-      break;
-    }
-    const trimmed = line.trim();
+    const trimmed = line.trimEnd();
     if (!trimmed) {
       continue;
     }
@@ -106,6 +111,8 @@ function parseOneline(raw: string): LogEntry[] {
         author: '',
         message: oneMatch[2],
       });
+    } else {
+      return null;
     }
   }
 
@@ -113,7 +120,8 @@ function parseOneline(raw: string): LogEntry[] {
 }
 
 function formatEntries(entries: LogEntry[]): string {
-  return entries
+  const rendered = entries
+    .slice(0, MAX_ENTRIES)
     .map((e) => {
       const parts = [e.hash];
       if (e.date) {
@@ -126,6 +134,10 @@ function formatEntries(entries: LogEntry[]): string {
       return parts.join(' ');
     })
     .join('\n');
+  const omitted = entries.length - MAX_ENTRIES;
+  return omitted > 0
+    ? `${rendered}\n... (${omitted} commit${omitted === 1 ? '' : 's'} omitted)`
+    : rendered;
 }
 
 /** 尝试解析 raw 输出，失败返回 null */
@@ -135,18 +147,15 @@ export function parse(raw: string): string | null {
       return null;
     }
 
-    const full = parseFullFormat(raw);
-    if (full.length > 0) {
-      return formatEntries(full);
-    }
-
-    const oneline = parseOneline(raw);
-    if (oneline.length > 0) {
-      return formatEntries(oneline);
+    // 已出现完整格式的标题时，失败不能再由oneline正则部分接管。
+    const entries = /^commit\s/m.test(raw) ? parseFullFormat(raw) : parseOneline(raw);
+    if (entries && entries.length > 0) {
+      return formatEntries(entries);
     }
 
     return null;
-  } catch {
+  } catch (err: unknown) {
+    void err;
     return null;
   }
 }
