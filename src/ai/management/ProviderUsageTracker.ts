@@ -1,6 +1,7 @@
 /** 管理实例上的用量订阅；不参与路由、DI 或模型调用。 */
+
+import { observeSafely } from '#shared/observers.js';
 import type { ManagedAiProvider, TokenRecorder, TokenUsagePayload } from './contracts.js';
-import { observeSafely } from './observers.js';
 
 type UsageCallback = (usage: TokenUsagePayload) => void;
 

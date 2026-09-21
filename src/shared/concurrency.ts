@@ -1,8 +1,8 @@
 export type LimitFunction = <T>(task: () => T | Promise<T>) => Promise<T>;
 
 export function createLimit(concurrency: number): LimitFunction {
-  if (!Number.isFinite(concurrency) || concurrency < 1) {
-    throw new RangeError(`concurrency must be a finite number >= 1, got ${concurrency}`);
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new RangeError(`concurrency must be a finite positive integer, got ${concurrency}`);
   }
 
   let activeCount = 0;

@@ -5,6 +5,7 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { isThenable, observeSafely } from '#shared/observers.js';
 import type {
   ManagedAiProvider,
   ProviderInfo,
@@ -12,7 +13,6 @@ import type {
   SwitchResult,
   TokenRecorder,
 } from './management/contracts.js';
-import { isThenable, observeSafely } from './management/observers.js';
 import { ProviderUsageTracker } from './management/ProviderUsageTracker.js';
 
 // ── 类型 ────────────────────────────────────────────────

@@ -6,8 +6,8 @@
  * 熔断世代隔离旧请求的迟到结果；协议转换与 HTTP 期限仍由 Transport 负责。
  */
 
+import { observeSafely } from '#shared/observers.js';
 import { createLlmAbortError, throwIfLlmCancelled } from '../errors.js';
-import { observeSafely } from '../management/observers.js';
 import { resolveConcurrency } from './concurrency.js';
 import { classifyLlmError } from './errorClassify.js';
 

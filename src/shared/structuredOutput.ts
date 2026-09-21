@@ -9,10 +9,12 @@
  * 厂商无关的纯函数，供 Provider 与 Gateway 共用，避免两套实现继续漂移。
  *
  * 设计约束：
- *   - 纯函数：不依赖任何实例状态；唯一副作用通过可选 onLog 回调外抛，便于测试。
+ *   - 不依赖实例状态；可选 onLog 只作观察，同步/异步失败不能改变恢复结果或递归报告。
  *   - 行为等价：从 AiProvider.extractJSON / _repairTruncatedArray 系列逐字迁移，
  *     不改变任何解析策略，保证既有调用方行为不变。
  */
+
+import { observeSafely } from '#shared/observers.js';
 
 /** 结构化提取的日志回调；level 与现有 logger 对齐（info/warn/error）。 */
 export type StructuredLogFn = (level: string, message: string) => void;
@@ -50,7 +52,10 @@ export function extractJSON(
       const repaired = stripTrailingCommas(jsonStr);
       const result: unknown = JSON.parse(repaired);
       if (repaired !== jsonStr) {
-        onLog?.('warn', '[extractJSON] Repaired trailing commas outside JSON strings');
+        observeSafely(
+          () => onLog?.('warn', '[extractJSON] Repaired trailing commas outside JSON strings'),
+          () => undefined
+        );
       }
       return result;
     } catch {
@@ -189,9 +194,13 @@ function tryRepairAt(text: string, endPos: number, onLog?: StructuredLogFn): unk
   try {
     const result = JSON.parse(repaired);
     if (Array.isArray(result) && result.length > 0) {
-      onLog?.(
-        'warn',
-        `[extractJSON] Repaired truncated JSON array: recovered ${result.length} items from truncated response`
+      observeSafely(
+        () =>
+          onLog?.(
+            'warn',
+            `[extractJSON] Repaired truncated JSON array: recovered ${result.length} items from truncated response`
+          ),
+        () => undefined
       );
       return result;
     }
