@@ -38,6 +38,8 @@ import {
   resolveModelQuirks,
   TEXT_COMPAT_CALL_SOURCE,
 } from '#ai/registry/ModelQuirks.js';
+import { observeSafely } from '#shared/observers.js';
+import { runOperation } from '#shared/operation.js';
 import { queryToolSchemas } from '#tools/catalog/schemaQuery.js';
 import type { ToolRuntimeCallContext } from '#tools/kernel/context.js';
 import { isToolResultEnvelope, type ToolScopeRelease } from '#tools/kernel/index.js';
@@ -61,6 +63,7 @@ import {
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
+import { AgentExecutionTimeoutError } from './AgentExecutionTimeoutError.js';
 import type { AgentMessage } from './AgentMessage.js';
 import {
   type AgentProgressProcessEvent,
@@ -303,10 +306,14 @@ export class AgentRuntime {
       await this.toolRouter.releaseScope?.(scope);
     } catch (err: unknown) {
       // 清理失败可观测，但不能把已经确认的工具写入改成业务失败或覆盖原始异常。
-      this.logger.warn('[AgentRuntime] tool scope cleanup failed', {
-        ...scope,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      observeSafely(
+        () =>
+          this.logger.warn('[AgentRuntime] tool scope cleanup failed', {
+            ...scope,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        () => undefined
+      );
     }
   }
 
@@ -347,7 +354,7 @@ export class AgentRuntime {
       };
     }
 
-    // ── 超时保护 ──
+    // ── 单次执行边界：与阶段/transport 共用期限和取消终态，不再维护第二套 race ──
     const budget = this.policies.getBudget();
     const timeoutMs = readPositiveBudgetNumber(opts.timeoutMs) ?? budget?.timeoutMs ?? 300_000;
     const abortController = new AbortController();
@@ -356,42 +363,56 @@ export class AgentRuntime {
       opts.abortSignal && typeof (opts.abortSignal as AbortSignal).aborted === 'boolean'
         ? (opts.abortSignal as AbortSignal)
         : null;
-    const onParentAbort = () => abortController.abort();
-    if (parentAbortSignal?.aborted) {
-      abortController.abort();
-    } else {
-      parentAbortSignal?.addEventListener('abort', onParentAbort, { once: true });
-    }
-    const cleanupExecutionGuards = () => {
-      clearTimeout(timeoutId);
-      parentAbortSignal?.removeEventListener('abort', onParentAbort);
-      if (this.#executionAbortController === abortController) {
-        this.#executionAbortController = null;
-      }
-    };
-
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        abortController.abort();
-        reject(new Error(`Agent timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
+    const abortSignal = parentAbortSignal
+      ? AbortSignal.any([parentAbortSignal, abortController.signal])
+      : abortController.signal;
+    const snapshot = (): AgentResult => ({
+      reply: '',
+      toolCalls: [...this.toolCallHistory],
+      tokenUsage: { ...this.tokenUsage },
+      iterations: this.iterationCount,
+      durationMs: Date.now() - this.startTime,
+      state: this.state.toJSON(),
+      diagnostics: diagnostics.toJSON(),
     });
 
     try {
       // ── 委托给 Strategy ──
-      const resultPromise = this.strategy.execute(this, message, {
-        ...opts,
-        abortSignal: abortController.signal,
-        diagnostics,
-      });
-      const result = (await Promise.race([resultPromise, timeoutPromise])) as AgentResult;
-      cleanupExecutionGuards();
+      const outcome = await runOperation(
+        (signal) =>
+          this.strategy.execute(this, message, { ...opts, abortSignal: signal, diagnostics }),
+        { abortSignal, timeoutMs }
+      );
+      if (this.#executionAbortController === abortController) {
+        this.#executionAbortController = null;
+      }
+      if (outcome.status === 'timeout') {
+        diagnostics.warn({
+          code: 'runtime_timeout',
+          message:
+            'Execution deadline reached; confirmed receipts retained and in-flight operations may require readback',
+        });
+        throw new AgentExecutionTimeoutError(timeoutMs, snapshot());
+      }
+      if (outcome.status === 'error') {
+        throw outcome.error instanceof Error
+          ? outcome.error
+          : new Error('Agent execution failed', { cause: outcome.error });
+      }
+      const cancelled = outcome.status === 'aborted' || abortSignal.aborted;
+      // 不合作的策略可能仍在执行；只返回本边界已知事实，不等待/接纳它的迟到成功。
+      // Strategy 保留既有宽 tool DTO；Runtime 在下方补齐公开结果的 state/duration。
+      const result = (outcome.status === 'ok' ? outcome.value : snapshot()) as AgentResult;
       if (diagnostics.isEmpty()) {
         diagnostics.merge(result.diagnostics);
       }
-      if (abortController.signal.aborted) {
+      if (cancelled) {
         diagnostics.recordCancelReason('abort_signal');
+        diagnostics.warn({
+          code: 'runtime_aborted',
+          message:
+            'Execution boundary stopped waiting after cancellation; late strategy output is ignored',
+        });
         result.reply = '[run stopped: abort_signal] Execution was cancelled.';
         const pipelineOutcome = result.phases?._pipelineOutcome;
         if (result.phases && pipelineOutcome && typeof pipelineOutcome === 'object') {
@@ -413,7 +434,7 @@ export class AgentRuntime {
       }
 
       // 状态完成
-      this.#safeTransition(abortController.signal.aborted ? 'abort' : 'finish', {
+      this.#safeTransition(cancelled ? 'abort' : 'finish', {
         reply: result.reply?.slice(0, 100),
       });
 
@@ -429,9 +450,13 @@ export class AgentRuntime {
       }
       result.diagnostics = diagnostics.toJSON();
 
-      if (!abortController.signal.aborted || !this.#abortEventPublished) {
+      if (!cancelled || !this.#abortEventPublished) {
+        if (cancelled) {
+          // 父 signal 取消与公开 abort() 共用一次事件；发布前标记，防止观察者重入。
+          this.#abortEventPublished = true;
+        }
         this.bus.publish(
-          abortController.signal.aborted ? AgentEvents.AGENT_ABORTED : AgentEvents.AGENT_COMPLETED,
+          cancelled ? AgentEvents.AGENT_ABORTED : AgentEvents.AGENT_COMPLETED,
           {
             agentId: this.id,
             preset: this.presetName,
@@ -444,17 +469,25 @@ export class AgentRuntime {
 
       return result;
     } catch (err: unknown) {
-      cleanupExecutionGuards();
-      this.state.send('error', { error: (err as Error).message });
+      const error =
+        err instanceof Error ? err : new Error('Agent execution failed', { cause: err });
+      this.#safeTransition('error', { error: error.message });
+      if (error instanceof AgentExecutionTimeoutError) {
+        error.partialResult.state = this.state.toJSON();
+      }
       this.bus.publish(
         AgentEvents.AGENT_FAILED,
         {
           agentId: this.id,
-          error: (err as Error).message,
+          error: error.message,
         },
         { source: this.id }
       );
-      throw err;
+      throw error;
+    } finally {
+      if (this.#executionAbortController === abortController) {
+        this.#executionAbortController = null;
+      }
     }
   }
 
@@ -1581,11 +1614,15 @@ export class AgentRuntime {
       // onToolCall 通知
       const effectiveHook = ctx.onToolCall || this.onToolCall;
       if (effectiveHook) {
-        try {
-          effectiveHook(fc.name, fc.args, toolResult, ctx.iteration);
-        } catch {
-          /* 观察者错误不中断 */
-        }
+        observeSafely(
+          () => effectiveHook(fc.name, fc.args, toolResult, ctx.iteration),
+          () =>
+            this.logger.warn('[AgentRuntime] tool observer failed; tool result retained', {
+              tool: fc.name,
+              agentId: this.id,
+              iteration: ctx.iteration,
+            })
+        );
       }
 
       const toolResultObj = toolResult as Record<string, unknown> | null;
@@ -2306,9 +2343,14 @@ export class AgentRuntime {
       ...data,
       timestamp: Date.now(),
     };
-    if (this.onProgress) {
-      this.onProgress(event);
-    }
+    observeSafely(
+      () => this.onProgress?.(event),
+      () =>
+        this.logger.warn('[AgentRuntime] progress observer failed; execution continues', {
+          eventType: type,
+          agentId: this.id,
+        })
+    );
     this.bus.publish(AgentEvents.PROGRESS, event, { source: this.id });
   }
 

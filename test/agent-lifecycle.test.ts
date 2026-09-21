@@ -49,6 +49,278 @@ async function flushPipelineTasks() {
   }
 }
 
+describe('Runtime operation boundary', () => {
+  function toolHarness(chat: ReturnType<typeof vi.fn>, onToolCall?: RuntimeConfig['onToolCall']) {
+    const execute = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      toolId: 'meta',
+      callId: 'fixture',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      text: 'confirmed tool result',
+      structuredContent: { observed: true },
+    }));
+    return {
+      ...harness(chat, 3, {
+        additionalTools: ['meta'],
+        toolRouter: { execute } as never,
+        container: { get: () => new RuntimeCapabilityCatalog() },
+        onToolCall,
+      }),
+      execute,
+    };
+  }
+
+  const toolReply = {
+    text: null,
+    functionCalls: [{ id: 'fixture', name: 'meta', args: { action: 'tools', params: {} } }],
+  };
+
+  it('keeps confirmed tool receipts when cancellation interrupts a later model request', async () => {
+    const entered = Promise.withResolvers<void>();
+    const lateReply = Promise.withResolvers<{ text: string; functionCalls: never[] }>();
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce(toolReply)
+      .mockImplementationOnce(() => {
+        entered.resolve();
+        return lateReply.promise;
+      });
+    const { runtime, service, input, execute } = toolHarness(chat);
+    const pending = service.run(input);
+    try {
+      await entered.promise;
+      runtime.abort('cancel after a confirmed tool result');
+      const result = await pending;
+      expect(result).toMatchObject({
+        status: 'aborted',
+        toolCalls: [{ tool: 'meta', result: { observed: true }, envelope: { ok: true } }],
+      });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      lateReply.resolve({ text: 'too late', functionCalls: [] });
+      await pending;
+      await flushPipelineTasks();
+    }
+  });
+
+  it('keeps confirmed tool receipts and usage when a later model request reaches the hard timeout', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const entered = Promise.withResolvers<void>();
+    const lateReply = Promise.withResolvers<{ text: string; functionCalls: never[] }>();
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({ ...toolReply, usage: { inputTokens: 12, outputTokens: 7 } })
+      .mockImplementationOnce(() => {
+        entered.resolve();
+        return lateReply.promise;
+      });
+    const { service, input, execute } = toolHarness(chat);
+    const pending = service.run({ ...input, execution: { timeoutMs: 1000 } });
+    try {
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await pending).toMatchObject({
+        status: 'timeout',
+        toolCalls: [{ tool: 'meta', result: { observed: true }, envelope: { ok: true } }],
+        usage: { inputTokens: 12, outputTokens: 7 },
+      });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      lateReply.resolve({ text: 'too late', functionCalls: [] });
+      await pending;
+      await flushPipelineTasks();
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a confirmed result when resource cleanup and its diagnostic observer both fail', async () => {
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce(toolReply)
+      .mockResolvedValue({ text: 'done', functionCalls: [] });
+    const { runtime, service, input, execute } = toolHarness(chat);
+    runtime.toolRouter.releaseScope = vi.fn(async () => {
+      throw new Error('cleanup failed');
+    });
+    const warn = vi.spyOn(runtime.logger, 'warn').mockImplementation(() => {
+      throw new Error('diagnostic failed');
+    });
+    try {
+      expect(await service.run(input)).toMatchObject({
+        status: 'success',
+        reply: 'done',
+        toolCalls: [{ result: { observed: true } }],
+      });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(runtime.toolRouter.releaseScope).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    'sync',
+    'async',
+  ])('isolates a %s tool observer failure without replaying the tool', async (mode) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce(toolReply)
+      .mockResolvedValue({ text: 'done', functionCalls: [] });
+    const { service, input, execute } = toolHarness(chat, () => {
+      if (mode === 'async') {
+        return Promise.reject(new Error('observer private tool payload'));
+      }
+      throw new Error('observer private tool payload');
+    });
+    try {
+      expect(await service.run(input)).toMatchObject({
+        status: 'success',
+        toolCalls: [{ result: { observed: true } }],
+      });
+      await flushPipelineTasks();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('tool observer failed'),
+        expect.objectContaining({ tool: 'meta' })
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('observer private tool payload');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('settles cancellation without waiting for an uncooperative provider and preserves the reason', async () => {
+    vi.useFakeTimers();
+    const pendingReply = Promise.withResolvers<{ text: string; functionCalls: never[] }>();
+    const entered = Promise.withResolvers<AbortSignal>();
+    const chat = vi.fn((_prompt, options) => {
+      entered.resolve(options.abortSignal);
+      return pendingReply.promise;
+    });
+    const { runtime, service, input } = harness(chat);
+    const parent = new AbortController();
+    const aborted = vi.fn();
+    runtime.bus.on(AgentEvents.AGENT_ABORTED, aborted);
+    const releaseScope = vi.fn();
+    runtime.toolRouter.releaseScope = releaseScope;
+    const reason = new Error('caller stopped this run');
+    let result: Awaited<ReturnType<AgentService['run']>> | undefined;
+    const pending = service
+      .run({ ...input, execution: { abortSignal: parent.signal } })
+      .then((value) => {
+        result = value;
+        return value;
+      });
+    try {
+      const signal = await entered.promise;
+      parent.abort(reason);
+      await flushPipelineTasks();
+      expect(result?.status).toBe('aborted');
+      expect(signal.reason).toBe(reason);
+      expect(result?.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+      expect(releaseScope).toHaveBeenCalledWith({ runId: expect.any(String) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+      runtime.abort('already stopped');
+      expect(aborted).toHaveBeenCalledOnce();
+    } finally {
+      pendingReply.resolve({ text: 'late result', functionCalls: [] });
+      await pending;
+      await flushPipelineTasks();
+      runtime.bus.off(AgentEvents.AGENT_ABORTED, aborted);
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not start the strategy after a pre-cancelled parent signal', async () => {
+    const execute = vi.fn(async () => stageOutput());
+    const { service, input } = harness(vi.fn(), 2, { strategy: { execute } as never });
+    const parent = new AbortController();
+    parent.abort('pre-cancelled');
+    expect(
+      await service.run({ ...input, execution: { abortSignal: parent.signal } })
+    ).toMatchObject({ status: 'aborted' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('preserves the execution failure when a state-transition observer throws', async () => {
+    const failure = new Error('original strategy failure');
+    const { runtime } = harness(vi.fn(), 2, {
+      strategy: {
+        execute: async () => {
+          throw failure;
+        },
+      } as never,
+    });
+    runtime.state.on('transition', () => {
+      throw new Error('state observer failed');
+    });
+    await expect(runtime.execute(new AgentMessage({ content: 'task' }))).rejects.toBe(failure);
+  });
+
+  it('keeps a hard timeout authoritative when strategy resolves synchronously on abort', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const execute = vi.fn(
+      (_runtime, _message, options) =>
+        new Promise((resolve) => {
+          options.abortSignal.addEventListener(
+            'abort',
+            () => resolve(stageOutput('cooperative late reply')),
+            { once: true }
+          );
+        })
+    );
+    const { service, input } = harness(vi.fn(), 2, { strategy: { execute } as never });
+    try {
+      const pending = service.run({ ...input, execution: { timeoutMs: 10 } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(await pending).toMatchObject({ status: 'timeout' });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    'sync',
+    'async',
+  ])('isolates a %s progress observer failure from the real run and event bus', async (mode) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const chat = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    const observed = vi.fn();
+    const { runtime, service, input } = harness(chat, 2, {
+      onProgress: () => {
+        if (mode === 'async') {
+          return Promise.reject(new Error('observer private request body'));
+        }
+        throw new Error('observer private request body');
+      },
+    });
+    runtime.bus.on(AgentEvents.PROGRESS, observed);
+    try {
+      expect(await service.run(input)).toMatchObject({ status: 'success', reply: 'done' });
+      await flushPipelineTasks();
+      expect(chat).toHaveBeenCalledOnce();
+      expect(observed).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('progress observer failed'),
+        expect.objectContaining({ eventType: expect.any(String) })
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('observer private request body');
+    } finally {
+      runtime.bus.off(AgentEvents.PROGRESS, observed);
+      warn.mockRestore();
+    }
+  });
+});
+
 describe('Pipeline attempt lifecycle', () => {
   it.each([
     {

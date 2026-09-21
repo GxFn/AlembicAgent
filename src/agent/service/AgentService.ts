@@ -4,6 +4,7 @@ import { AgentRunCoordinator } from '../coordination/AgentRunCoordinator.js';
 import { AgentProfileCompiler } from '../profiles/AgentProfileCompiler.js';
 import { AgentProfileRegistry } from '../profiles/AgentProfileRegistry.js';
 import { AgentStageFactoryRegistry } from '../profiles/AgentStageFactoryRegistry.js';
+import { AgentExecutionTimeoutError } from '../runtime/AgentExecutionTimeoutError.js';
 import { AgentMessage, Channel } from '../runtime/AgentMessage.js';
 import type {
   AgentRunInput,
@@ -121,6 +122,7 @@ export class AgentService {
         diagnostics: result.diagnostics || null,
       };
     } catch (err: unknown) {
+      const partial = err instanceof AgentExecutionTimeoutError ? err.partialResult : null;
       this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
@@ -132,14 +134,14 @@ export class AgentService {
         profileId: compiledProfile.id,
         reply: err instanceof Error ? err.message : String(err),
         status: inferErrorStatus(err),
-        toolCalls: [],
+        toolCalls: partial?.toolCalls || [],
         usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          iterations: 0,
-          durationMs: 0,
+          inputTokens: partial?.tokenUsage.input || 0,
+          outputTokens: partial?.tokenUsage.output || 0,
+          iterations: partial?.iterations || 0,
+          durationMs: partial?.durationMs || 0,
         },
-        diagnostics: null,
+        diagnostics: partial?.diagnostics || null,
       };
     }
   }
