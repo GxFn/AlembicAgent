@@ -1,83 +1,44 @@
 /**
- * AiProviderManager — 统一 AI 提供商管理器（切面层）
- *
- * 设计目标:
- *   1. 唯一权威: 当前 AI Provider 的唯一管理入口，所有读取/切换集中在此
- *   2. AOP 切面: Token 追踪回调随 Provider 切换自动重新挂载，无需外部干预
- *   3. 热切换: switchProvider() 一次调用 → Token AOP + Embedding fallback + DI 级联清理 + 事件通知
- *   4. 模式查询: isMock / isReady 集中管理，消除散落的 name === 'mock' 判断
- *   5. 事件驱动: 注册监听器，切换时自动回调（Realtime 广播、SearchEngine 重建等）
- *
- * 集成方式:
- *   - 由 AiModule.initialize() 创建并注入 DI 容器
- *   - ServiceContainer.reloadAiProvider() 委托 manager.switchProvider()
- *   - 消费者通过 container.get('aiProviderManager') 获取
- *   - DI 数据管道: switchProvider() 通过回调同步 singletons 中的 provider 引用
+ * AiProviderManager — 宿主可注入的 Provider 路由生命周期。
+ * 准备候选 → 同步路由/DI → 失效旧缓存 → 通知；失败仅补偿路由，不能还原缓存。
+ * 用量绑定由独立 tracker 持有，旧请求完成时仍按其真实模型归档。
  */
 
 import Logger from '@alembic/core/logging';
+import type {
+  EmbedFallbackInitializer,
+  ManagedAiProvider,
+  ProviderInfo,
+  SwitchListener,
+  SwitchResult,
+  TokenRecorder,
+} from './management/contracts.js';
+import { isThenable, observeSafely } from './management/observers.js';
+import { ProviderUsageTracker } from './management/ProviderUsageTracker.js';
 
 // ── 类型 ────────────────────────────────────────────────
 
-/** AI Provider 最小接口（避免引入 AiProvider 具体类的循环依赖） */
-export interface ManagedAiProvider {
-  name: string;
-  model: string;
-  apiKey?: string;
-  _onTokenUsage?: ((usage: TokenUsagePayload) => void) | null;
-  supportsEmbedding?: () => boolean;
-  _fallbackFrom?: string;
-}
-
-export interface TokenUsagePayload {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  source?: string;
-}
-
-/** Token 记录器最小接口（对应 TokenUsageStore.record） */
-export interface TokenRecorder {
-  record(r: {
-    source: string;
-    provider?: string;
-    model?: string;
-    inputTokens: number;
-    outputTokens: number;
-  }): void;
-}
-
-/** Provider 信息快照 */
-export interface ProviderInfo {
-  name: string;
-  model: string;
-  isMock: boolean;
-  supportsEmbedding: boolean;
-}
-
-/** 切换结果 */
-export interface SwitchResult {
-  previous: ProviderInfo;
-  current: ProviderInfo;
-  clearedSingletons: string[];
-}
-
-/** 切换监听器 */
-export type SwitchListener = (result: SwitchResult) => void;
-
-/** Embedding Fallback 初始化器（注入，避免循环依赖） */
-export type EmbedFallbackInitializer = (
-  currentProvider: ManagedAiProvider
-) => ManagedAiProvider | null;
+export type {
+  EmbedFallbackInitializer,
+  ManagedAiProvider,
+  ProviderInfo,
+  SwitchListener,
+  SwitchResult,
+  TokenRecorder,
+  TokenUsagePayload,
+} from './management/contracts.js';
 
 // ── Manager ────────────────────────────────────────────
 
 export class AiProviderManager {
   #provider: ManagedAiProvider;
   #embedProvider: ManagedAiProvider | null = null;
-  #tokenRecorder: TokenRecorder | null = null;
   #listeners = new Set<SwitchListener>();
   #logger = Logger.getInstance();
+  #switching = false;
+  #recoveryRequired = false;
+  #pendingHooks = 0;
+  #usageTracker = new ProviderUsageTracker((event, details) => this.#diagnose(event, details));
 
   /** DI 容器注入: 清除 AI 依赖 singleton 的回调 */
   #clearDependents: (() => string[]) | null = null;
@@ -89,8 +50,9 @@ export class AiProviderManager {
   #syncToDi: ((provider: ManagedAiProvider, embed: ManagedAiProvider | null) => void) | null = null;
 
   constructor(initialProvider: ManagedAiProvider) {
+    this.#providerInfo(initialProvider);
     this.#provider = initialProvider;
-    this.#wireTokenTracking();
+    this.#usageTracker.bind(initialProvider);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -117,9 +79,9 @@ export class AiProviderManager {
     return this.#provider.name === 'mock';
   }
 
-  /** provider 是否可用于 AI 操作（非 mock） */
+  /** 已配置真实 provider，且没有未修复的宿主同步失败。 */
   get isReady(): boolean {
-    return !!this.#provider && !this.isMock;
+    return !this.isMock && !this.#recoveryRequired;
   }
 
   /** 当前 provider 名称 */
@@ -134,13 +96,29 @@ export class AiProviderManager {
 
   /** 结构化信息快照 */
   get info(): ProviderInfo {
+    return this.#providerInfo(this.#provider);
+  }
+
+  #providerInfo(provider: ManagedAiProvider): ProviderInfo {
+    if (
+      !provider ||
+      typeof provider !== 'object' ||
+      typeof provider.name !== 'string' ||
+      !provider.name ||
+      typeof provider.model !== 'string'
+    ) {
+      throw new TypeError('Managed provider must have a name and model');
+    }
+    const supportsEmbedding =
+      this.#synchronous(provider.supportsEmbedding?.(), 'capability') ?? false;
+    if (typeof supportsEmbedding !== 'boolean') {
+      throw new TypeError('Managed provider embedding capability must be boolean');
+    }
     return {
-      name: this.#provider.name,
-      model: this.#provider.model,
-      isMock: this.isMock,
-      supportsEmbedding:
-        typeof this.#provider.supportsEmbedding === 'function' &&
-        this.#provider.supportsEmbedding(),
+      name: provider.name,
+      model: provider.model,
+      isMock: provider.name === 'mock',
+      supportsEmbedding,
     };
   }
 
@@ -149,68 +127,175 @@ export class AiProviderManager {
   // ═══════════════════════════════════════════════════════
 
   /**
-   * 切换 AI Provider — 原子操作
-   *
-   * 自动处理:
-   *   1. Token 追踪 AOP 重新挂载
-   *   2. Embedding fallback 重建
-   *   3. DI 数据管道同步（singletons.aiProvider）
-   *   4. DI 容器中的 AI 依赖 singleton 级联清除
-   *   5. 监听器回调通知
+   * 同步切换。宿主 hooks 必须同步，DI 同步必须允许用旧引用补偿，失效只清缓存。
+   * 失败抛 AI_PROVIDER_SWITCH_FAILED（phase/recovery）；观察者失败仅诊断。
    */
   switchProvider(newProvider: ManagedAiProvider): SwitchResult {
-    const prev = this.info;
-
-    // 1. 替换核心引用
-    this.#provider = newProvider;
-
-    // 2. AOP: 重新挂载 Token 追踪
-    this.#wireTokenTracking();
-
-    // 3. Embedding fallback 重建
-    this.#embedProvider = null;
-    if (this.#embedFallbackInit) {
-      this.#embedProvider = this.#embedFallbackInit(newProvider);
-    }
-
-    // 4. DI 数据管道同步
-    this.#syncToDi?.(this.#provider, this.#embedProvider);
-
-    // 5. 清除 DI 容器中的依赖 singleton
-    const clearedSingletons = this.#clearDependents?.() ?? [];
-
-    const result: SwitchResult = {
-      previous: prev,
-      current: this.info,
-      clearedSingletons,
-    };
-
-    // 6. 通知监听器
-    for (const fn of this.#listeners) {
-      try {
-        fn(result);
-      } catch {
-        /* listener should not break switching */
+    this.#assertRoutingMutable();
+    this.#switching = true;
+    const previousProvider = this.#provider;
+    const previousEmbedding = this.#embedProvider;
+    const previousRecovery = this.#recoveryRequired;
+    // 本次操作使用固定 hooks；回调中重新绑定只影响下一次切换。
+    const selectEmbedding = this.#embedFallbackInit;
+    const syncToDi = this.#syncToDi;
+    const clearDependents = this.#clearDependents;
+    let phase = 'prepare';
+    let published = false;
+    let syncAttempted = false;
+    const undoBindings: (() => void)[] = [];
+    try {
+      const previous = this.info;
+      const current = this.#providerInfo(newProvider);
+      const embedding = this.#synchronous(selectEmbedding?.(newProvider), 'prepare') ?? null;
+      if (embedding) {
+        this.#providerInfo(embedding);
       }
+      phase = 'wire';
+      undoBindings.push(this.#usageTracker.bind(newProvider));
+      if (embedding) {
+        undoBindings.push(this.#usageTracker.bind(embedding));
+      }
+      this.#provider = newProvider;
+      this.#embedProvider = embedding;
+      published = true;
+      phase = 'sync';
+      if (syncToDi) {
+        syncAttempted = true;
+        this.#synchronous(syncToDi(newProvider, embedding), 'sync');
+      }
+      phase = 'invalidate';
+      const clearedSingletons = this.#synchronous(clearDependents?.(), 'invalidate') ?? [];
+      if (
+        !Array.isArray(clearedSingletons) ||
+        !clearedSingletons.every((key) => typeof key === 'string')
+      ) {
+        throw new Error('Dependency clearer must return singleton keys');
+      }
+      this.#recoveryRequired = false;
+      const result: SwitchResult = { previous, current, clearedSingletons: [...clearedSingletons] };
+      // 通知不属于提交阶段；观察者异常不能把已经完成的切换伪装为失败。
+      phase = 'notify';
+      for (const fn of [...this.#listeners]) {
+        // 每个订阅者拿独立 DTO；同步异常和异步 rejection 都不改变提交结果。
+        observeSafely(
+          () =>
+            fn({
+              previous: { ...result.previous },
+              current: { ...result.current },
+              clearedSingletons: [...result.clearedSingletons],
+            }),
+          () => this.#diagnose('listener_failed')
+        );
+      }
+      this.#diagnose(
+        'switched',
+        { from: previous.name, to: current.name, cleared: result.clearedSingletons },
+        'info'
+      );
+      return result;
+    } catch (err: unknown) {
+      const compensationErrors: unknown[] = [];
+      this.#provider = previousProvider;
+      this.#embedProvider = previousEmbedding;
+      for (const undo of undoBindings.reverse()) {
+        try {
+          undo();
+        } catch (restoreError: unknown) {
+          compensationErrors.push(restoreError);
+        }
+      }
+      if (syncAttempted && syncToDi) {
+        try {
+          this.#synchronous(syncToDi(previousProvider, previousEmbedding), 'compensate');
+        } catch (restoreError: unknown) {
+          compensationErrors.push(restoreError);
+        }
+      }
+      this.#recoveryRequired =
+        previousRecovery || this.#pendingHooks > 0 || compensationErrors.length > 0;
+      const recovery = this.#recoveryRequired
+        ? 'required'
+        : published
+          ? 'routing-restored'
+          : 'not-needed';
+      this.#diagnose('switch_failed', {
+        phase,
+        recovery,
+        cacheState: phase === 'invalidate' ? 'possibly-invalidated' : 'unchanged',
+      });
+      // 只补偿路由引用；已失效的缓存和任意宿主副作用不在可逆合同内。
+      throw Object.assign(
+        new Error(`AI provider switch failed during ${phase}`, {
+          cause: compensationErrors.length
+            ? new AggregateError(
+                [err, ...compensationErrors],
+                'Provider switch compensation failed'
+              )
+            : err,
+        }),
+        { code: 'AI_PROVIDER_SWITCH_FAILED', phase, recovery }
+      );
+    } finally {
+      this.#switching = false;
     }
+  }
 
-    this.#logger.info('[AiProviderManager] Provider switched', {
-      from: `${prev.name}/${prev.model}`,
-      to: `${result.current.name}/${result.current.model}`,
-      mock: result.current.isMock,
-      cleared: clearedSingletons,
-    });
+  #assertRoutingMutable(): void {
+    if (this.#switching || this.#pendingHooks > 0) {
+      this.#diagnose('reentrant_switch_rejected');
+      throw Object.assign(new Error('AI provider switch is already in progress'), {
+        code: 'AI_PROVIDER_SWITCH_IN_PROGRESS',
+      });
+    }
+  }
 
-    return result;
+  #synchronous<T>(value: T, phase: string): T {
+    if (!isThenable(value)) {
+      return value;
+    }
+    // 旧 API 是同步提交。不能忽略宿主 Promise 并先宣称切换成功；也不能
+    // 让其迟到副作用覆盖下一次切换。挂起期间阻止再次改路由，结束后仍需修复接线。
+    this.#recoveryRequired = true;
+    this.#pendingHooks += 1;
+    const settle = (failed: boolean) => {
+      this.#pendingHooks -= 1;
+      this.#diagnose('async_hook_settled', { phase, failed, recovery: 'required' });
+    };
+    void Promise.resolve(value).then(
+      () => settle(false),
+      () => settle(true)
+    );
+    this.#diagnose('async_hook_rejected', { phase });
+    throw new TypeError(`Provider ${phase} hook must be synchronous`);
+  }
+
+  #diagnose(
+    event: string,
+    details: Record<string, unknown> = {},
+    level: 'info' | 'warn' = 'warn'
+  ): void {
+    try {
+      this.#logger[level](`[AiProviderManager] ${event}`, details);
+    } catch (err: unknown) {
+      // 日志不可改变提交结果或请求结果，也不递归记录日志器自身失败。
+      void err;
+    }
   }
 
   // ═══════════════════════════════════════════════════════
   //  Embedding 管理
   // ═══════════════════════════════════════════════════════
 
-  /** 手动设置 Embedding fallback provider */
+  /** 设置当前 embedding 并绑定用量；不代替宿主的 DI 同步或专用/fallback 选择政策。 */
   setEmbedProvider(ep: ManagedAiProvider | null): void {
+    this.#assertRoutingMutable();
+    if (ep) {
+      this.#providerInfo(ep);
+      this.#usageTracker.bind(ep);
+    }
     this.#embedProvider = ep;
+    this.#diagnose('embedding_updated', { provider: ep?.name ?? null }, 'info');
   }
 
   // ═══════════════════════════════════════════════════════
@@ -219,36 +304,7 @@ export class AiProviderManager {
 
   /** 注入 TokenRecorder (延迟绑定，避免循环依赖) */
   setTokenRecorder(recorder: TokenRecorder): void {
-    this.#tokenRecorder = recorder;
-    this.#wireTokenTracking();
-  }
-
-  /**
-   * 在当前 provider 上安装 _onTokenUsage 回调
-   * 每次 provider.chat() / chatWithTools() 等调用后自动触发
-   */
-  #wireTokenTracking(): void {
-    const p = this.#provider;
-    if (!p || typeof p !== 'object') {
-      return;
-    }
-
-    p._onTokenUsage = (usage: TokenUsagePayload) => {
-      if (!this.#tokenRecorder) {
-        return;
-      }
-      try {
-        this.#tokenRecorder.record({
-          source: usage.source || 'provider',
-          provider: p.name ?? undefined,
-          model: p.model ?? undefined,
-          inputTokens: usage.inputTokens || 0,
-          outputTokens: usage.outputTokens || 0,
-        });
-      } catch {
-        /* token tracking never breaks execution */
-      }
-    };
+    this.#usageTracker.setRecorder(recorder);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -267,17 +323,17 @@ export class AiProviderManager {
   //  DI 绑定 (仅 ServiceContainer / AiModule 调用)
   // ═══════════════════════════════════════════════════════
 
-  /** 注入 DI 容器的级联清理回调 */
+  /** 注入同步缓存失效函数；不能依赖 Manager 还原被清理的对象。 */
   _bindDependentClearer(fn: () => string[]): void {
     this.#clearDependents = fn;
   }
 
-  /** 注入 Embedding Fallback 初始化器 */
+  /** 注入同步 embedding 选择器；候选准备期间仍读取到旧路由。 */
   _bindEmbedFallbackInit(fn: EmbedFallbackInitializer): void {
     this.#embedFallbackInit = fn;
   }
 
-  /** 注入 DI 数据管道同步回调（切换时更新 singletons 中的 provider 引用） */
+  /** 注入同步 DI 赋值函数；失败补偿可能再次以旧引用调用，须可重复赋值。 */
   _bindDiSync(fn: (provider: ManagedAiProvider, embed: ManagedAiProvider | null) => void): void {
     this.#syncToDi = fn;
   }

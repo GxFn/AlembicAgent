@@ -33,6 +33,24 @@ OpenAI、Claude、DeepSeek 的公开 `baseUrl` 保留配置原字符串，SDK �
 
 升级时若原调用传 `apiKey: ''` 以继承环境，应改为省略该字段或传 `undefined`。`TransportConfig.apiKey` 已改为可选。DeepSeek 的兼容 embedding 请求现在使用有效 `embedModel`，仍不表示官方服务提供 embedding API。
 
+## Provider 热切换与计量
+
+`AiProviderManager.switchProvider()` 保留同步接口，按“准备候选与 embedding → 绑定用量 → 发布路由/同步 DI → 失效依赖缓存 → 通知”的顺序执行。准备失败保留旧状态，不通知成功；DI 同步或缓存失效失败时恢复 Manager 旧引用，并用旧 provider/embedding 调用 DI 同步函数补偿。已清理的缓存由宿主按恢复后的路由重新构建，Manager 不会伪造原对象或撤销任意宿主副作用。
+
+切换失败抛出 `AI_PROVIDER_SWITCH_FAILED`，携带 `phase` 和 `recovery`：`not-needed` 表示没有发布新路由，`routing-restored` 表示路由补偿成功，`required` 表示宿主仍需恢复。后者使 `isReady` 为 false，修复接线后的成功切换才能恢复就绪。切换期间的嵌套路由修改抛 `AI_PROVIDER_SWITCH_IN_PROGRESS`。
+
+宿主接入须遵守以下合同：
+
+- embedding 选择器、能力查询、DI 同步和缓存失效函数必须同步。返回 Promise 会被观测并拒绝，在其结束前禁止新路由修改，防止迟到副作用覆盖后续切换。同步 DI 函数应只赋引用，并允许重复传入旧引用；缓存失效函数只清缓存，返回受影响的 key 列表。
+- `setEmbedProvider()` 设置当前 embedding 与计量绑定，不替宿主更新 DI，也不推断它是固定专用配置还是临时 fallback；下一次主 provider 切换仍调用宿主选择器。选择器须自行考虑专用 embedding 的优先级。
+- 初次启用 AI 和热切换都需要完整装配 Manager、embedding、TokenRecorder 与 DI。启动时没有 provider，不代表后续启用可以跳过这些步骤。
+
+用量绑定保留原有 `_onTokenUsage` 观察者，每个实例仅安装一次；主 provider 与独立 embedding 实例均可接收绑定。旧实例不因切换而卸载，以记录仍在执行的请求。计量优先采用响应里的 provider/model，缺少这些字段时使用绑定时的身份快照。宿主若后来接管回调槽，Manager 会保留该所有权并诊断；宿主需要继续计量时，应转发到原 managed hook，不要依赖 Manager 再次包装。
+
+监听器按通知开始时的订阅快照执行，每个监听器收到独立结果；监听器、原用量观察者和记录器的同步异常或异步 rejection 只做诊断，不改变已经提交的路由或模型响应。记录器失败后不会重试，因为失败前可能已经写入。非法 token 数值不进入记录器；日志不复制回调错误正文。
+
+计量绑定不等于 embedding 成本提取：当前 `Gateway.embed()` 返回向量，不上报原生 embedding token 用量；只有实例实际发出的 usage 事件会被记录。这里没有按文本长度估算费用，也没有最近一次用量的共享旁路。
+
 ## 调用和取消
 
 `chat`、`chatWithTools`、`chatWithStructuredOutput`、`embed`、`summarize` 和 `probe` 都接受可选的 `abortSignal`。旧调用参数仍然有效。
@@ -93,5 +111,7 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 ## 开发验证
 
 使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/ai-configuration.test.ts` 集中覆盖入口配置、容量提示、URL 规则、快照和回执兼容；原独立容量提示测试已合入此处。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
+
+`test/ai-provider-manager.test.ts` 通过公开 AI 入口覆盖热切换、补偿边界、观察者和计量绑定，并用真实 SDK + 延迟 HTTP fixture 验证切换后的旧请求归属。原 `ai-provider.test.ts` 的 Manager 用例已迁入，后者保留 Provider、模型策略和公共入口测试。
 
 依赖升级必须同时验证协议 fixture、取消与超时、细分用量、工具参数、推理回传、代理、公共导出及边界检查。运行 `npm run check` 完成仓库验证。

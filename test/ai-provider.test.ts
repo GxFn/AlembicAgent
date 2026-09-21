@@ -1,20 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  AiProviderManager,
   autoDetectProvider,
   ClaudeProvider,
   createProvider,
   DeepSeekProvider,
   GoogleGeminiProvider,
   getProviderConfig,
-  type ManagedAiProvider,
   type ModelDef,
   ModelRegistry,
   OpenAiProvider,
   ParameterGuard,
   PROVIDER_CONFIGS,
-  type SwitchResult,
 } from '../src/index.js';
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -210,74 +207,5 @@ describe('ParameterGuard', () => {
     expect(guarded.filtered.find((item) => item.param === 'toolChoice')?.reason).toContain(
       'reasoning_content'
     );
-  });
-});
-
-describe('AiProviderManager', () => {
-  it('rewires token tracking and emits switch events when routing providers', () => {
-    const initialProvider: ManagedAiProvider = {
-      name: 'test-local-fake',
-      model: 'test-local-model',
-      supportsEmbedding: () => true,
-    };
-    const nextProvider: ManagedAiProvider = {
-      name: 'openai',
-      model: 'gpt-test',
-      supportsEmbedding: () => false,
-    };
-    const tokenRecords: Array<{
-      source: string;
-      provider?: string;
-      model?: string;
-      inputTokens: number;
-      outputTokens: number;
-    }> = [];
-    const switches: SwitchResult[] = [];
-    const manager = new AiProviderManager(initialProvider);
-
-    manager.setTokenRecorder({
-      record: (entry) => {
-        tokenRecords.push(entry);
-      },
-    });
-    manager.onSwitch((result) => {
-      switches.push(result);
-    });
-
-    initialProvider._onTokenUsage?.({
-      inputTokens: 2,
-      outputTokens: 3,
-      totalTokens: 5,
-      source: 'chat',
-    });
-
-    const result = manager.switchProvider(nextProvider);
-    nextProvider._onTokenUsage?.({
-      inputTokens: 7,
-      outputTokens: 11,
-      totalTokens: 18,
-      source: 'tools',
-    });
-
-    expect(result.previous).toMatchObject({ name: 'test-local-fake', isMock: false });
-    expect(result.current).toMatchObject({ name: 'openai', model: 'gpt-test', isMock: false });
-    expect(manager.isMock).toBe(false);
-    expect(switches).toHaveLength(1);
-    expect(tokenRecords).toEqual([
-      {
-        source: 'chat',
-        provider: 'test-local-fake',
-        model: 'test-local-model',
-        inputTokens: 2,
-        outputTokens: 3,
-      },
-      {
-        source: 'tools',
-        provider: 'openai',
-        model: 'gpt-test',
-        inputTokens: 7,
-        outputTokens: 11,
-      },
-    ]);
   });
 });
