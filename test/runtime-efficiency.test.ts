@@ -9,7 +9,12 @@ import {
   DiagnosticsCollector,
   ToolExecutionPipeline,
 } from '../src/agent/runtime/index.js';
-import { submitDedup, trackerSignal } from '../src/agent/runtime/ToolExecutionPipeline.js';
+import {
+  eventBusPublisher,
+  progressEmitter,
+  submitDedup,
+  trackerSignal,
+} from '../src/agent/runtime/ToolExecutionPipeline.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
 import { Evolution } from '../src/tools/runtime/toolsets/Evolution.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -137,6 +142,84 @@ function createLoopContext(diagnostics: DiagnosticsCollector): LoopContext {
 }
 
 describe('tool pipeline lifecycle', () => {
+  it.each([
+    { label: 'success', status: 'success', ok: true, success: true },
+    { label: 'usable partial', status: 'partial', ok: true, success: true },
+    { label: 'blocked', status: 'blocked', ok: false, success: false },
+    { label: 'aborted', status: 'aborted', ok: false, success: false },
+    { label: 'timeout', status: 'timeout', ok: false, success: false },
+    { label: 'error', status: 'error', ok: false, success: false },
+    { label: 'needs confirmation', status: 'needs-confirmation', ok: false, success: false },
+    { label: 'timeout despite ok flag', status: 'timeout', ok: true, success: false },
+  ] as const)('reports $label consistently to optional observers without losing the payload', async ({
+    status,
+    ok,
+    success,
+  }) => {
+    const payload = { output: 'available readback' };
+    const emitProgress = vi.fn();
+    const publish = vi.fn();
+    const runtime = createRuntime(createManifest(), async (request) => ({
+      ...createEnvelope(request, 1),
+      ok,
+      status,
+      text: 'host result details',
+      structuredContent: payload,
+    }));
+    // 只替代通知端口；真实 pipeline/bridge 负责 envelope 和 metadata 的投影。
+    Object.assign(runtime, { emitProgress, bus: { publish } });
+    const result = await new ToolExecutionPipeline()
+      .use(progressEmitter)
+      .use(eventBusPublisher)
+      .execute(
+        { id: 'read', name: 'code', args: { action: 'read' } },
+        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+      );
+
+    expect(result.result).toBe(payload);
+    expect(result.metadata.envelope).toMatchObject({ ok, status, structuredContent: payload });
+    expect(emitProgress).toHaveBeenCalledWith('tool_end', {
+      tool: 'code',
+      duration: result.metadata.durationMs,
+      status: success ? 'ok' : 'error',
+      error: success ? undefined : 'host result details',
+    });
+    expect(publish).toHaveBeenCalledWith(
+      'tool:call:end',
+      { agentId: runtime.id, tool: 'code', durationMs: result.metadata.durationMs, success },
+      { source: runtime.id }
+    );
+  });
+
+  it('reports a metadata-only blocked verdict as failure to optional observers', async () => {
+    const execute = vi.fn();
+    const emitProgress = vi.fn();
+    const publish = vi.fn();
+    const payload = { retained: 'readback instruction' };
+    const runtime = createRuntime(createManifest(), execute);
+    Object.assign(runtime, { emitProgress, bus: { publish } });
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'blocked', before: () => ({ blocked: true, result: payload }) })
+      .use(progressEmitter)
+      .use(eventBusPublisher)
+      .execute(
+        { id: 'read', name: 'code', args: { action: 'read' } },
+        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+      );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.result).toBe(payload);
+    expect(emitProgress).toHaveBeenCalledWith(
+      'tool_end',
+      expect.objectContaining({ status: 'error' })
+    );
+    expect(publish).toHaveBeenCalledWith(
+      'tool:call:end',
+      expect.objectContaining({ success: false }),
+      { source: runtime.id }
+    );
+  });
+
   it('captures evidence before memory, tracker and trace consume the same envelope', async () => {
     const order: string[] = [];
     const ledger = new EvidenceLedgerStore({

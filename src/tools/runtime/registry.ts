@@ -744,9 +744,9 @@ export function getToolNames(): string[] {
   return Object.keys(TOOL_REGISTRY);
 }
 
-/** 获取指定工具的所有 action 名 */
+/** 获取已注册工具的所有 action 名；原型属性与其他未知名称一样返回空集。 */
 export function getActionNames(tool: string): string[] {
-  const spec = TOOL_REGISTRY[tool];
+  const spec = Object.hasOwn(TOOL_REGISTRY, tool) ? TOOL_REGISTRY[tool] : undefined;
   return spec ? Object.keys(spec.actions) : [];
 }
 

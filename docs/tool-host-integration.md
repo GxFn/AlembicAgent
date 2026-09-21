@@ -38,6 +38,8 @@ Adapter 的 explain、执行前检查、获得队列执行位置后的检查使�
 
 接入该新能力端口后，宿主准入拒绝在 handler 前返回 `TOOL_ACTION_DENIED` 或 `TOOL_UNAVAILABLE`，带 `writeState: 'not-started'`、`requiresReadback: false` 和 blocked 状态。未声明可用性的旧宿主保留 handler 错误路径。执行后的 Core 回执和异常继续原样归一化，不能用这类“未开始”标记覆盖已经发生的写入。
 
+可选 `progressEmitter` / `eventBusPublisher` 中间件与 tracker 共用完整回执的成功判定：blocked、aborted、timeout、error、needs-confirmation 或 `ok: false` 均报告失败，即使 payload 中仍有部分读回数据。`ok: true` 的可用 partial 回执保持成功，业务 payload 和原始 envelope 均保留。这两种通知中间件需显式安装；默认 Runtime 仍通过自身事件路径通知宿主。
+
 ## 可空写回执
 
 Core 公开写口允许返回 null 时，缺回执不能表示未写入或成功。Agent/Main 明确报告 `KNOWLEDGE_WRITE_RECEIPT_UNAVAILABLE`、`writeState: 'unknown'`、`requiresReadback: true`、`retryable: false`。严格生产停止后续 content-ready/CAS；HTTP 批量接口保留已确认成功子集，单列未知项。HTTP publication.confirmed 仍表示原有控制器确认门，不据此推断全批写入成功。
@@ -69,4 +71,4 @@ Core 已放入 created 列表并提供 id/lifecycle 的创建回执仍保留；�
 
 Agent 的 `test/tool-resource-scope.test.ts` 覆盖运行/视图传播与释放、裁剪、旧 window 和迟到 loop；Main 的 `ToolContextScope.test.ts` 覆盖真实 factory/router 隔离和写前门。Main 的 `KnowledgeServiceAdapter.test.ts` 通过真实 Core 与临时 SQLite 验证 DTO、系统字段保护、复核、取消和文件/数据库分歧回执，无需真实模型或 API key。
 
-Schema/准入回归位于 Agent 的 tool-schema-projection、tool-availability、runtime-schema-query；任务真值位于 task-tool-outcomes。Main 的 MainToolAvailability 覆盖真实 AgentModule 装配和 HTTP 列表，KnowledgeWriteReceiptBoundary 与严格生产 Facade 集成用例覆盖缺回执时真实写入已发生的情况。
+Schema/准入回归集中在 Agent 的 tool-schema-projection、tool-availability；前者同时覆盖 Runtime 到外部宿主的真实查询与执行链。可选事件中间件位于 runtime-efficiency，任务真值位于 task-tool-outcomes。Main 的 MainToolAvailability 覆盖真实 AgentModule 装配和 HTTP 列表，KnowledgeWriteReceiptBoundary 与严格生产 Facade 集成用例覆盖缺回执时真实写入已发生的情况。

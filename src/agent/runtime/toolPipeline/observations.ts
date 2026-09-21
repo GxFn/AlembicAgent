@@ -10,6 +10,11 @@ import type {
   ToolMetadata,
 } from './contracts.js';
 
+/** 业务 payload 可保留部分读回信息；通知与 tracker 共用完整观察的失败优先级。 */
+function isSuccessfulToolObservation(call: ToolCall, result: unknown, meta: ToolMetadata): boolean {
+  return !meta.blocked && readToolObservation({ ...call, result, envelope: meta.envelope }).ok;
+}
+
 /**
  * EvidenceCapture — 证据台账采集（Wave A E2）
  *
@@ -74,7 +79,7 @@ export const trackerSignal = {
         call.name,
         call.args,
         // 失败状态优先于内层业务 payload；成功时仍给信号检测器原始结果。
-        meta.blocked || !readToolObservation({ ...call, result, envelope: meta.envelope }).ok
+        !isSuccessfulToolObservation(call, result, meta)
           ? { ok: false, status: meta.envelope?.status || 'blocked', data: result }
           : result
       );
@@ -107,12 +112,15 @@ export const progressEmitter = {
     ctx.runtime.emitProgress?.('tool_call', { tool: call.name, args: call.args });
   },
   after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
+    const success = isSuccessfulToolObservation(call, result, meta);
     const resultObj = result as Record<string, unknown> | null;
     ctx.runtime.emitProgress?.('tool_end', {
       tool: call.name,
       duration: meta.durationMs,
-      status: resultObj?.error ? 'error' : 'ok',
-      error: (resultObj?.error as string | undefined) || undefined,
+      status: success ? 'ok' : 'error',
+      error: success
+        ? undefined
+        : meta.envelope?.text || (resultObj?.error as string | undefined) || undefined,
     });
   },
 };
@@ -138,7 +146,6 @@ export const eventBusPublisher = {
     }
   },
   after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
-    const resultObj = result as Record<string, unknown> | null;
     if (ctx.runtime.bus?.publish) {
       ctx.runtime.bus.publish(
         'tool:call:end',
@@ -146,7 +153,7 @@ export const eventBusPublisher = {
           agentId: ctx.runtime.id,
           tool: call.name,
           durationMs: meta.durationMs,
-          success: !resultObj?.error,
+          success: isSuccessfulToolObservation(call, result, meta),
         },
         { source: ctx.runtime.id }
       );
