@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import { Evolution, ToolRouter } from '../src/tools/runtime/index.js';
@@ -43,6 +45,215 @@ async function runTerminalExec(
 }
 
 describe('runtime terminal.exec safety', () => {
+  it.each([
+    'cat ./docs/sudo',
+    'git show HEAD:docs/sudo',
+    'git diff -- ./docs/mkfs',
+    'env FIXTURE=1 cat ./docs/sudo',
+    'command -v /usr/bin/sudo',
+    'command -- cat ./docs/sudo',
+    'cat ./docs/safe',
+  ])('does not treat ordinary path operands as executables: %s', async (command) => {
+    const calls: string[] = [];
+    const result = await runTerminalExec(
+      command,
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async (value: string) => {
+            calls.push(value);
+            return { stdout: 'fixture read', stderr: '', exitCode: 0 };
+          },
+        },
+      })
+    );
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([command]);
+  });
+
+  it.each([
+    { mode: 'exit0', status: 'success' },
+    { mode: 'exit1', status: 'error' },
+    { mode: 'exit2', status: 'error' },
+    { mode: 'throw', status: 'error' },
+    { mode: 'abort', status: 'aborted' },
+    { mode: 'timeout', status: 'timeout' },
+  ])('carries $mode execution facts through the adapter and outcome observation', async ({
+    mode,
+    status,
+  }) => {
+    const controller = new AbortController();
+    let executions = 0;
+    const router = new ToolRouterAdapter({
+      contextFactory: {
+        create: () =>
+          baseToolContext({
+            sandboxExecutor: {
+              exec: async () => {
+                executions++;
+                if (mode.startsWith('exit')) {
+                  return {
+                    stdout: 'attempted stdout',
+                    stderr: 'attempted stderr',
+                    exitCode: Number(mode.slice(4)),
+                  };
+                }
+                if (mode === 'abort') {
+                  controller.abort(new Error('fixture stopped after execution started'));
+                } else if (mode === 'timeout') {
+                  controller.abort(new DOMException('fixture deadline', 'TimeoutError'));
+                }
+                throw Object.assign(new Error('fixture executor failed'), {
+                  stdout: 'attempted stdout',
+                  stderr: 'attempted stderr',
+                });
+              },
+            },
+          }),
+      },
+    });
+    const envelope = await router.execute({
+      toolId: 'terminal',
+      args: { action: 'exec', params: { command: 'pwd' } },
+      surface: 'runtime',
+      actor: { user: 'fixture' },
+      source: { kind: 'runtime' },
+      abortSignal: controller.signal,
+    });
+    expect(executions).toBe(1);
+    expect(envelope).toMatchObject({ ok: true, status });
+    expect(envelope.text).toContain('attempted stdout');
+    expect(envelope.text).toContain('[stderr]\nattempted stderr');
+    expect(readToolObservation({ tool: 'terminal', args: { action: 'exec' }, envelope }).ok).toBe(
+      status === 'success'
+    );
+    expect(envelope.structuredContent).not.toMatchObject({ writeState: 'not-started' });
+  });
+
+  it.each([
+    "r''m -r''f fixture-dir",
+    'rm -r -f fixture-dir',
+    'rm --recursive --force fixture-dir',
+    'rm -R -f fixture-dir',
+    'rm -r >fixture.log -f fixture-dir',
+    '/bin/rm -r &>fixture.log -f fixture-dir',
+    'rm -r > -- -f fixture-dir',
+    'rm -r ">" -f fixture-dir',
+    'env FIXTURE=1 /bin/r""m -r -f fixture-dir',
+    'command -- rm --force --recursive fixture-dir',
+    "echo ready && r''m -r -f fixture-dir",
+    "printf ready; r''m -r -f fixture-dir",
+    'sh -c "r\'\'m -r -f fixture-dir"',
+    "sh -c 'env FIXTURE=1 rm -r -f fixture-dir'",
+    'echo ready && s\\udo whoami',
+    "env FIXTURE=1 /usr/bin/su''do whoami",
+  ])('blocks normalized dangerous literal command %s before any sandbox call', async (command) => {
+    let executions = 0;
+    const result = await runTerminalExec(
+      command,
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async () => {
+            executions++;
+            return { stdout: 'must not run', stderr: '', exitCode: 0 };
+          },
+        },
+      })
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Command blocked');
+    expect(executions).toBe(0);
+  });
+
+  it.each([
+    'git status && git log -1',
+    'rm -r fixture-dir; printf -f',
+    'rm -- -r -f',
+    'rm -r > -f',
+    'rm -r ">" -- -f',
+    'env FIXTURE=1 node --test fixture.test.js',
+    'sh -c "printf ready && git status"',
+  ])('retains ordinary compound and literal argument semantics for %s', async (command) => {
+    const executed: string[] = [];
+    const result = await runTerminalExec(
+      command,
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async (value: string) => {
+            executed.push(value);
+            return { stdout: 'fixture output', stderr: '', exitCode: 0 };
+          },
+        },
+      })
+    );
+    expect(result.ok).toBe(true);
+    expect(executed).toEqual([command]);
+  });
+
+  it.each([
+    {
+      stdout: ' M tracked.ts\n',
+      stderr: '  indented diagnostic\n',
+      expected: ' M tracked.ts\n\n[stderr]\n  indented diagnostic',
+    },
+    { stdout: '   \n', stderr: '\t \n', expected: '[no output]' },
+  ])('preserves meaningful leading output columns while dropping empty channels ($stdout)', async ({
+    stdout,
+    stderr,
+    expected,
+  }) => {
+    const result = await runTerminalExec(
+      'git status --porcelain',
+      baseToolContext({
+        sandboxExecutor: { exec: async () => ({ stdout, stderr, exitCode: 0 }) },
+      })
+    );
+    expect(result.data).toBe(expected);
+  });
+
+  it.each([
+    { label: 'unknown termination', reason: () => undefined, status: 'error', stdout: '' },
+    {
+      label: 'cancellation',
+      reason: () => new Error('fixture stopped'),
+      status: 'aborted',
+      stdout: 'partial stdout',
+    },
+    {
+      label: 'deadline',
+      reason: () => new DOMException('fixture deadline', 'TimeoutError'),
+      status: 'timeout',
+      stdout: 'partial stdout',
+    },
+  ])('preserves stderr from 137 $label without changing its terminal status', async ({
+    reason,
+    status,
+    stdout,
+  }) => {
+    const controller = new AbortController();
+    const result = await runTerminalExec(
+      'pwd',
+      baseToolContext({
+        abortSignal: controller.signal,
+        sandboxExecutor: {
+          exec: async () => {
+            const cause = reason();
+            if (cause) {
+              controller.abort(cause);
+            }
+            return { stdout, stderr: '\u001b[31mpartial stderr\u001b[0m', exitCode: 137 };
+          },
+        },
+      })
+    );
+    expect(result.ok).toBe(true);
+    expect(result._meta).toMatchObject({ resultStatus: status, degraded: true });
+    expect(String(result.data)).toContain('[stderr]\npartial stderr');
+    expect(String(result.data)).not.toContain('\u001b[');
+    if (stdout) {
+      expect(String(result.data)).toContain(stdout);
+    }
+  });
+
   it('rejects a cwd symlink that escapes the analyzed project', async () => {
     const outer = mkdtempSync(path.join(os.tmpdir(), 'terminal-cwd-link-'));
     const root = path.join(outer, 'project');

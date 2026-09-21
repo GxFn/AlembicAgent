@@ -11,12 +11,14 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { isThenable, observeSafely } from '#shared/observers.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
   ok,
   type ToolContext,
+  type ToolDiagnosticWarning,
   type ToolResult,
 } from '#tools/kernel/registry.js';
 
@@ -52,6 +54,10 @@ interface SearchMatch {
   context?: string[];
 }
 
+// 缓存实例由宿主按读取视图复用；旧 get/set-only 端口也能逻辑失效，无需新增 clear 合同。
+// generation 只进入本工具的缓存 key；旧条目的容量/TTL 仍由宿主管理。
+const searchCacheGenerations = new WeakMap<NonNullable<ToolContext['searchCache']>, number>();
+
 async function handleSearch(
   params: Record<string, unknown>,
   ctx: ToolContext
@@ -74,14 +80,22 @@ async function handleSearch(
   const startMs = Date.now();
   let totalCount = 0;
   let fellBack = false;
+  let rejectedPaths = 0;
+  let incomplete: RipgrepResult['incomplete'];
+  const warnings: ToolDiagnosticWarning[] = [];
 
   for (const pattern of patterns) {
     if (ctx.abortSignal?.aborted) {
+      incomplete = {
+        status: searchAbortStatus(ctx.abortSignal),
+        reason: 'Search cancelled before the next pattern.',
+      };
       break;
     }
 
     const cacheKey = JSON.stringify([
       ctx.projectRoot,
+      ctx.searchCache ? (searchCacheGenerations.get(ctx.searchCache) ?? 0) : 0,
       pattern,
       glob ?? null,
       regex,
@@ -96,28 +110,44 @@ async function handleSearch(
       continue;
     }
 
+    const opts = { glob, maxResults, contextLines, regex, signal: ctx.abortSignal };
     try {
-      const result = await ripgrepSearch(pattern, ctx.projectRoot, {
-        glob,
-        maxResults,
-        contextLines,
-        regex,
-      });
+      let result: RipgrepResult;
+      let fallback = false;
+      try {
+        result = await ripgrepSearch(pattern, ctx.projectRoot, opts);
+      } catch (err: unknown) {
+        // 只有明确的可执行文件缺席才切 JS fallback；语法/权限/终止错误不能换引擎伪装成功。
+        if (!(err instanceof Error && 'code' in err && err.code === 'ENOENT')) {
+          throw err;
+        }
+        fallback = true;
+        fellBack = true;
+        warnings.push({
+          code: 'code_search_fallback',
+          message: 'ripgrep is unavailable (ENOENT); using the in-process search fallback.',
+          stage: 'code.search',
+          tool: 'code',
+        });
+        result = await fallbackRegexSearch(pattern, ctx.projectRoot, opts);
+      }
       allMatches.push(...result.matches);
       totalCount += result.total;
-      ctx.searchCache?.set(cacheKey, { matches: result.matches, total: result.total });
-    } catch {
-      // Primary ripgrep failed (binary missing / spawn error) — fall back to an
-      // in-process regex scan and mark the result as fallback-produced.
-      fellBack = true;
-      const result = await fallbackRegexSearch(pattern, ctx.projectRoot, {
-        glob,
-        maxResults,
-        contextLines,
-        regex,
-      });
-      allMatches.push(...result.matches);
-      totalCount += result.total;
+      rejectedPaths += result.rejectedPaths ?? 0;
+      if (result.incomplete) {
+        incomplete = result.incomplete;
+        break;
+      }
+      if (!fallback) {
+        ctx.searchCache?.set(cacheKey, { matches: result.matches, total: result.total });
+      }
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : 'Search failed';
+      if (allMatches.length === 0) {
+        return fail(`code.search failed: ${reason}`);
+      }
+      incomplete = { status: 'partial', reason };
+      break;
     }
   }
 
@@ -127,21 +157,148 @@ async function handleSearch(
   // 读 structuredContent.matches（EvidenceCapture.ts:138-154），此前只返回格式化字符串导致
   // 分支永不触发、search 证据全部落成无 file 台账条目（run-6 误杀链的采集端根因）。
   // 模型可见文本随 adapter 约定变为 JSON（与 code.read batch 同一约定，字段本就更可解析）。
-  const data = {
-    total: totalCount,
-    shown: deduped.length,
-    matches: deduped,
-  };
-  return ok(data, {
-    tokensEstimate: estimateTokens(JSON.stringify(data)),
+  const actionBudget = ctx.toolRegistry?.code?.actions.search?.maxOutputTokens;
+  const budget = Math.min(ctx.tokenBudget, actionBudget ?? Number.POSITIVE_INFINITY);
+  const data = projectSearchResults(deduped, totalCount, budget, incomplete !== undefined);
+  if (!data) {
+    return fail('code.search output budget is too small to represent result counts');
+  }
+  if (incomplete) {
+    warnings.push({
+      code: 'code_search_incomplete',
+      message: `${incomplete.reason} total represents observed matches only.`,
+      stage: 'code.search',
+      tool: 'code',
+    });
+  }
+  if (rejectedPaths > 0) {
+    warnings.push({
+      code: 'code_search_path_rejected',
+      message: `Skipped ${rejectedPaths} fallback search candidate(s) that failed project path validation.`,
+      stage: 'code.search',
+      tool: 'code',
+    });
+  }
+  if (data.truncated) {
+    warnings.push({
+      code: 'code_search_output_truncated',
+      message: `Omitted ${data.omittedCount} complete match(es) to fit ${budget} tokens; use code.read for source content.`,
+      stage: 'code.search',
+      tool: 'code',
+    });
+  }
+  const result = ok(data, {
+    // Adapter 的真实展示为缩进 JSON，预算必须使用同一序列化格式。
+    tokensEstimate: estimateTokens(JSON.stringify(data, null, 2)),
     durationMs: Date.now() - startMs,
+    ...(incomplete || data.truncated
+      ? { degraded: true, resultStatus: incomplete?.status ?? 'partial' }
+      : {}),
     ...(fellBack ? { fallbackUsed: true } : {}),
+    ...(warnings.length > 0 ? { diagnosticWarnings: warnings } : {}),
   });
+  return incomplete && deduped.length === 0
+    ? { ...result, ok: false, error: `code.search ${incomplete.status}: ${incomplete.reason}` }
+    : result;
+}
+
+interface SearchProjection {
+  total: number;
+  shown: number;
+  matches: SearchMatch[];
+  truncated?: true;
+  omittedCount?: number;
+  omittedLocations?: Array<{ file: string; line: number }>;
+  guidance?: string;
+  /** 仅已观察数量，不能把中断或失败搜索的 total 当全量总数。 */
+  incomplete?: true;
+}
+
+/**
+ * 只投影模型可见结果，不改原 cache；证据采集会把 matches.content 当原文，所以只能整条取舍。
+ * 超长命中保留真实定位供 code.read，定位也整条取舍，不能截出一个并不存在的文件路径。
+ */
+function projectSearchResults(
+  matches: SearchMatch[],
+  total: number,
+  budget: number,
+  incomplete: boolean
+): SearchProjection | null {
+  const copies = matches.map((match) => ({
+    ...match,
+    ...(match.context ? { context: [...match.context] } : {}),
+  }));
+  const complete: SearchProjection = {
+    total,
+    shown: copies.length,
+    matches: copies,
+    ...(incomplete ? { incomplete: true } : {}),
+  };
+  const fits = (value: SearchProjection) =>
+    estimateTokens(JSON.stringify(value, null, 2)) <= budget;
+  if (fits(complete)) {
+    return complete;
+  }
+  const projected: SearchProjection = {
+    total,
+    shown: 0,
+    matches: [],
+    truncated: true,
+    omittedCount: copies.length,
+    ...(incomplete ? { incomplete: true } : {}),
+  };
+  if (!fits(projected)) {
+    return null;
+  }
+  projected.guidance = 'Use code.read to inspect omitted matches.';
+  if (!fits(projected)) {
+    delete projected.guidance;
+  }
+  const omitted: SearchMatch[] = [];
+  for (const match of copies) {
+    projected.matches.push(match);
+    projected.shown++;
+    projected.omittedCount = copies.length - projected.shown;
+    if (!fits(projected)) {
+      projected.matches.pop();
+      projected.shown--;
+      projected.omittedCount = copies.length - projected.shown;
+      omitted.push(match);
+    }
+  }
+  for (const match of omitted) {
+    const locations = projected.omittedLocations ?? [];
+    projected.omittedLocations = [...locations, { file: match.file, line: match.line }];
+    if (!fits(projected)) {
+      if (locations.length > 0) {
+        projected.omittedLocations = locations;
+      } else {
+        delete projected.omittedLocations;
+      }
+    }
+  }
+  return projected;
 }
 
 interface RipgrepResult {
   matches: SearchMatch[];
   total: number;
+  rejectedPaths?: number;
+  incomplete?: { status: 'partial' | 'timeout' | 'aborted'; reason: string };
+}
+
+interface SearchOptions {
+  glob?: string;
+  maxResults: number;
+  contextLines: number;
+  regex: boolean;
+  signal?: AbortSignal;
+}
+
+function searchAbortStatus(signal: AbortSignal): 'timeout' | 'aborted' {
+  return signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
+    ? 'timeout'
+    : 'aborted';
 }
 
 /** ripgrep 排除的噪音目录 — 与 IGNORED_DIRS 对齐 */
@@ -166,7 +323,7 @@ const RG_EXCLUDE_GLOBS = [
 async function ripgrepSearch(
   pattern: string,
   cwd: string,
-  opts: { glob?: string; maxResults: number; contextLines: number; regex: boolean }
+  opts: SearchOptions
 ): Promise<RipgrepResult> {
   const args = [
     '--json',
@@ -188,7 +345,7 @@ async function ripgrepSearch(
   }
   args.push('--', pattern, './');
 
-  return spawnRg(args, cwd, 15000);
+  return spawnRg(args, cwd, 15000, opts.contextLines, opts.signal);
 }
 
 /**
@@ -199,8 +356,25 @@ async function ripgrepSearch(
  * 解决方案：stdio: ['ignore', 'pipe', 'pipe'] + 显式传入 './' 搜索路径。
  * see: https://github.com/BurntSushi/ripgrep/issues/2056
  */
-function spawnRg(args: string[], cwd: string, timeout: number): Promise<RipgrepResult> {
+function spawnRg(
+  args: string[],
+  cwd: string,
+  timeout: number,
+  contextLines: number,
+  signal?: AbortSignal
+): Promise<RipgrepResult> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      resolve({
+        matches: [],
+        total: 0,
+        incomplete: {
+          status: searchAbortStatus(signal),
+          reason: 'Search cancelled before spawning ripgrep.',
+        },
+      });
+      return;
+    }
     const child = spawn('rg', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -210,47 +384,93 @@ function spawnRg(args: string[], cwd: string, timeout: number): Promise<RipgrepR
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     const MAX_BUFFER = 2 * 1024 * 1024;
+    let stderr = '';
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const partial = () => parseRipgrepJson(Buffer.concat(chunks).toString('utf-8'), contextLines);
+    const terminate = (status: 'partial' | 'timeout' | 'aborted', reason: string) => {
+      if (settled) {
+        return;
+      }
+      // 先封闭回执，再停止只读 child；迟到 data/close/error 不能改变结果或启动 fallback。
+      settled = true;
+      cleanup();
+      resolve({ ...partial(), incomplete: { status, reason } });
+      child.kill('SIGKILL');
+    };
+    const onAbort = () => {
+      if (signal) {
+        terminate(searchAbortStatus(signal), 'Search cancelled while ripgrep was running.');
+      }
+    };
 
     child.stdout.on('data', (chunk: Buffer) => {
+      if (settled) {
+        return;
+      }
+      const remaining = MAX_BUFFER - totalBytes;
+      chunks.push(chunk.subarray(0, remaining));
       totalBytes += chunk.length;
-      if (totalBytes <= MAX_BUFFER) {
-        chunks.push(chunk);
+      if (totalBytes > MAX_BUFFER) {
+        terminate('partial', `ripgrep output exceeded ${MAX_BUFFER} bytes.`);
+      }
+    });
+    // 始终消费 stderr 避免 pipe 反压；诊断存储有界，不因错误噪声放大内存。
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (!settled && stderr.length < 4096) {
+        stderr += chunk.toString('utf-8').slice(0, 4096 - stderr.length);
       }
     });
 
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-    }, timeout);
+    timer = setTimeout(
+      () => terminate('timeout', `ripgrep exceeded its ${timeout}ms search deadline.`),
+      timeout
+    );
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
 
     child.on('close', (code) => {
-      clearTimeout(timer);
-      const stdout = Buffer.concat(chunks).toString('utf-8');
-
-      if (code === 0 || code === 2) {
-        resolve(parseRipgrepJson(stdout, cwd));
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      const result = partial();
+      if (code === 0) {
+        resolve(result);
       } else if (code === 1) {
         // rg exit code 1 = no matches
         resolve({ matches: [], total: 0 });
       } else {
-        // timeout killed or other error — return partial if any
-        const partial = parseRipgrepJson(stdout, cwd);
-        if (partial.matches.length > 0) {
-          resolve(partial);
+        const reason = `ripgrep exited with code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`;
+        if (result.matches.length > 0) {
+          resolve({ ...result, incomplete: { status: 'partial', reason } });
         } else {
-          reject(new Error(`rg exited with code ${code}`));
+          reject(new Error(reason));
         }
       }
     });
 
-    child.on('error', (err) => {
-      clearTimeout(timer);
+    child.on('error', (err: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       reject(err);
     });
   });
 }
 
-function parseRipgrepJson(jsonOutput: string, _cwd: string): RipgrepResult {
+function parseRipgrepJson(jsonOutput: string, contextLines: number): RipgrepResult {
   const matches: SearchMatch[] = [];
+  const observedLines = new Map<string, Map<number, string>>();
   let total = 0;
 
   for (const line of jsonOutput.split('\n')) {
@@ -259,16 +479,26 @@ function parseRipgrepJson(jsonOutput: string, _cwd: string): RipgrepResult {
     }
     try {
       const obj = JSON.parse(line);
-      if (obj.type === 'match') {
+      if (obj.type === 'match' || obj.type === 'context') {
         const data = obj.data;
         const rawPath = (data.path?.text ?? '') as string;
         const relPath = rawPath.startsWith('./') ? rawPath.slice(2) : rawPath;
-        matches.push({
+        const match: SearchMatch = {
           file: relPath,
           line: data.line_number ?? 0,
-          content: (data.lines?.text ?? '').trimEnd(),
-        });
-        total++;
+          // rg 的行终止符不属于源码行；其余空白必须保真，不能 trimEnd 改证据原文。
+          content: String(data.lines?.text ?? '').replace(/\r?\n$/, ''),
+        };
+        let fileLines = observedLines.get(relPath);
+        if (!fileLines) {
+          fileLines = new Map();
+          observedLines.set(relPath, fileLines);
+        }
+        fileLines.set(match.line, match.content);
+        if (obj.type === 'match') {
+          matches.push(match);
+          total++;
+        }
       } else if (obj.type === 'summary') {
         total = obj.data?.stats?.matches ?? total;
       }
@@ -277,38 +507,80 @@ function parseRipgrepJson(jsonOutput: string, _cwd: string): RipgrepResult {
     }
   }
 
+  if (contextLines > 0) {
+    for (const match of matches) {
+      const lines = observedLines.get(match.file);
+      match.context = Array.from(lines ?? [])
+        .filter(([line]) => line !== match.line && Math.abs(line - match.line) <= contextLines)
+        .sort(([left], [right]) => left - right)
+        .map(([, content]) => content);
+    }
+  }
   return { matches, total };
 }
 
 async function fallbackRegexSearch(
   pattern: string,
   cwd: string,
-  opts: { glob?: string; maxResults: number; contextLines: number; regex: boolean }
+  opts: SearchOptions
 ): Promise<RipgrepResult> {
   const matches: SearchMatch[] = [];
   let searchRe: RegExp;
   try {
-    searchRe = opts.regex ? new RegExp(pattern, 'gi') : new RegExp(escapeRegex(pattern), 'gi');
-  } catch {
-    return { matches: [], total: 0 };
+    // 与 rg 默认大小写敏感行为一致；fallback 方言仍是 JavaScript RegExp，诊断明确标识。
+    searchRe = opts.regex ? new RegExp(pattern, 'g') : new RegExp(escapeRegex(pattern), 'g');
+  } catch (err: unknown) {
+    throw new Error(
+      `Invalid fallback regex: ${err instanceof Error ? err.message : 'pattern rejected'}`
+    );
   }
 
-  const files = await collectFiles(cwd, opts.glob);
+  const files = await collectFiles(cwd, opts.glob, opts.signal);
   let total = 0;
+  let rejectedPaths = 0;
 
   for (const file of files) {
+    if (opts.signal?.aborted) {
+      break;
+    }
     if (matches.length >= opts.maxResults) {
       break;
     }
+    let absolute: string;
     try {
-      const content = await fs.readFile(path.join(cwd, file), 'utf-8');
-      const lines = content.split('\n');
+      // fallback 与 code.read 使用同一实际路径约束，不能通过文件 symlink 读取仓外内容。
+      absolute = resolveProjectPath(cwd, file).absolute;
+    } catch (err: unknown) {
+      void err;
+      rejectedPaths++;
+      continue;
+    }
+    try {
+      const content = await fs.readFile(absolute, 'utf-8');
+      if (opts.signal?.aborted) {
+        break;
+      }
+      const lines = content.split(/\r?\n/);
+      if (content.endsWith('\n')) {
+        lines.pop();
+      }
       for (let i = 0; i < lines.length; i++) {
         searchRe.lastIndex = 0;
         if (searchRe.test(lines[i])) {
           total++;
           if (matches.length < opts.maxResults) {
-            matches.push({ file, line: i + 1, content: lines[i].trimEnd() });
+            matches.push({
+              file,
+              line: i + 1,
+              content: lines[i],
+              ...(opts.contextLines > 0
+                ? {
+                    context: lines
+                      .slice(Math.max(0, i - opts.contextLines), i)
+                      .concat(lines.slice(i + 1, i + 1 + opts.contextLines)),
+                  }
+                : {}),
+            });
           }
         }
       }
@@ -317,7 +589,19 @@ async function fallbackRegexSearch(
     }
   }
 
-  return { matches, total };
+  return {
+    matches,
+    total,
+    ...(rejectedPaths > 0 ? { rejectedPaths } : {}),
+    ...(opts.signal?.aborted
+      ? {
+          incomplete: {
+            status: searchAbortStatus(opts.signal),
+            reason: 'Search cancelled during the in-process fallback.',
+          },
+        }
+      : {}),
+  };
 }
 
 function deduplicateMatches(matches: SearchMatch[]): SearchMatch[] {
@@ -852,16 +1136,76 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
   // ────────────────────────────────────────────────────────────────────
 
   try {
+    if (ctx.abortSignal?.aborted) {
+      return fail('code.write aborted before writing file content');
+    }
     if (createDirs) {
       await fs.mkdir(path.dirname(resolved.absPath), { recursive: true });
+      if (ctx.abortSignal?.aborted) {
+        return fail(
+          'code.write aborted before writing file content; parent directories may already exist'
+        );
+      }
+    }
+    // 最后一个可取消点已过；写入开始后以真实 IO 回执为准，不用迟到取消伪造回滚。
+    if (ctx.searchCache) {
+      // 失败也可能已经改过磁盘；在真正尝试写入时失效，不能等成功回执后才撤销旧命中。
+      searchCacheGenerations.set(
+        ctx.searchCache,
+        (searchCacheGenerations.get(ctx.searchCache) ?? 0) + 1
+      );
     }
     await fs.writeFile(resolved.absPath, content, 'utf-8');
-    // 写成功后更新读时指纹，使后续 read/write 以新内容为基线（指纹一致态）。
-    ctx.deltaCache?.set(resolved.relPath, freshnessFingerprint(content), content);
-    return ok({ written: filePath, bytes: Buffer.byteLength(content) });
   } catch (err: unknown) {
     return fail(`Write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+  // 磁盘写入已确认；可选缓存维护不属于提交阶段，不能覆盖 written 事实或触发重写。
+  let warning: ToolDiagnosticWarning | undefined;
+  let asynchronous = false;
+  observeSafely(
+    () => {
+      const result: unknown = ctx.deltaCache?.set(
+        resolved.relPath,
+        freshnessFingerprint(content),
+        content
+      );
+      if (isThenable(result)) {
+        asynchronous = true;
+        warning = {
+          code: 'code_write_cache_refresh_unconfirmed',
+          message:
+            'File written; asynchronous cache refresh is unconfirmed. Use code.read before a subsequent write.',
+          stage: 'code.write',
+          tool: 'code',
+        };
+      }
+      return result;
+    },
+    () => {
+      if (asynchronous) {
+        // 返回之后的拒绝只作诊断，不能再修改已发布回执；不记录缓存异常中的原始内容。
+        console.warn(
+          '[code.write] Optional cache refresh rejected after confirmed write; use code.read before a subsequent write.'
+        );
+      } else {
+        warning = {
+          code: 'code_write_cache_refresh_failed',
+          message:
+            'File written; cached fingerprint refresh failed. Use code.read before a subsequent write.',
+          stage: 'code.write',
+          tool: 'code',
+        };
+      }
+    }
+  );
+  return ok(
+    {
+      written: filePath,
+      bytes: Buffer.byteLength(content),
+      ...(warning ? { guidance: warning.message } : {}),
+    },
+    warning ? { resultStatus: 'success', degraded: true, diagnosticWarnings: [warning] } : undefined
+  );
 }
 
 /**
@@ -881,9 +1225,15 @@ async function checkWriteFreshness(
   let diskContent: string;
   try {
     diskContent = await fs.readFile(absPath, 'utf-8');
-  } catch {
-    // ENOENT → 新文件放行；其它读错误（权限等）不在新鲜度门职责内，透传给写盘报错。
-    return { ok: true };
+  } catch (err: unknown) {
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
+      return { ok: true };
+    }
+    // 不可读的文件仍可能可写；不能把权限/IO 失败当成“新文件”绕过先读后写。
+    return {
+      ok: false,
+      error: `code.write rejected: cannot verify the current version of ${relPath}: ${err instanceof Error ? err.message : 'file read failed'}`,
+    };
   }
 
   if (!ctx.deltaCache) {
@@ -1014,7 +1364,7 @@ function clampReadResult(
   };
 }
 
-async function collectFiles(cwd: string, glob?: string): Promise<string[]> {
+async function collectFiles(cwd: string, glob?: string, signal?: AbortSignal): Promise<string[]> {
   const files: string[] = [];
   const extensions = glob
     ? glob
@@ -1024,8 +1374,14 @@ async function collectFiles(cwd: string, glob?: string): Promise<string[]> {
     : null;
 
   async function walk(dir: string, relDir: string): Promise<void> {
+    if (signal?.aborted) {
+      return;
+    }
     const entries = await fs.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
+      if (signal?.aborted) {
+        return;
+      }
       if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith('.')) {
         continue;
       }

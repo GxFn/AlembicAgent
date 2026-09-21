@@ -99,24 +99,139 @@ export function detectDangerousShellPayload(payload: string): TerminalSafetyBloc
 export function checkTerminalCommandSafety(
   command: string
 ): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
+  return inspectLiteralShellCommand(command, 0);
+}
+
+function inspectLiteralShellCommand(
+  command: string,
+  depth: number
+): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
   const dangerousPayload = detectDangerousShellPayload(command);
   if (dangerousPayload) {
     return { safe: false, block: dangerousPayload };
   }
 
-  const firstExecutable = firstShellWord(command);
-  const executableName = firstExecutable ? path.basename(firstExecutable).toLowerCase() : '';
-  if (DENIED_BINS.has(executableName)) {
-    return {
-      safe: false,
-      block: {
-        rule: 'shell-denied-bin',
-        reason: `Blocked executable in terminal.exec: ${executableName}`,
-      },
-    };
+  const parsed = parseSimpleShellWords(command, true);
+  if (!parsed.ok) {
+    return readonlyBlock('shell-unparseable-command', parsed.error);
   }
-
+  // 这里只检查静态 literal 形态，不求值变量/别名/脚本。实际隔离仍由宿主 sandbox 提供。
+  // 仅命令位置及已知 wrapper 链有执行身份；cat ./docs/sudo 等普通参数不是可执行文件。
+  for (const tokens of parsed.commands) {
+    const words: string[] = [];
+    for (let index = 0; index < tokens.length; index++) {
+      if (tokens[index].redirection) {
+        // 重定向不开始新命令，其目标也不是 rm 参数；引号内的 > 仍是普通 literal。
+        index++;
+      } else {
+        words.push(tokens[index].value);
+      }
+    }
+    const commandWords = unwrapLiteralCommand(words);
+    if (commandWords.length > 0) {
+      const bin = path.basename(commandWords[0]).toLowerCase();
+      if (DENIED_BINS.has(bin)) {
+        return readonlyBlock('shell-denied-bin', `Blocked executable in terminal.exec: ${bin}`);
+      }
+      const isShell = ['sh', 'bash', 'zsh', 'fish'].includes(bin);
+      if (bin !== 'rm' && !isShell) {
+        continue;
+      }
+      const args = commandWords.slice(1);
+      if (bin === 'rm' && hasRecursiveForceFlags(args)) {
+        return readonlyBlock(
+          'shell-rm-recursive-force',
+          'Recursive force remove is blocked in terminal.exec'
+        );
+      }
+      if (isShell) {
+        const commandFlag = args.findIndex(
+          (arg) => /^-[A-Za-z]*c[A-Za-z]*$/.test(arg) || arg === '--command'
+        );
+        const payload = commandFlag < 0 ? undefined : args[commandFlag + 1];
+        if (payload !== undefined) {
+          // 已知 -c literal 可以复用同一词法器；有界递归避免深嵌套耗尽调用栈。
+          if (depth >= 8) {
+            return readonlyBlock(
+              'shell-nesting-limit',
+              'Nested shell command exceeds the safety inspection limit'
+            );
+          }
+          const nested = inspectLiteralShellCommand(payload, depth + 1);
+          if (!nested.safe) {
+            return nested;
+          }
+        }
+      }
+    }
+  }
   return { safe: true };
+}
+
+/** 只解开明确的执行 wrapper；未知程序的参数仍由程序解释，不能擅当 shell 命令。 */
+function unwrapLiteralCommand(input: string[]): string[] {
+  let words = input;
+  let index = 0;
+  while (index < words.length) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index])) {
+      index++;
+      continue;
+    }
+    const bin = path.basename(words[index]).toLowerCase();
+    if (!['env', 'command', 'exec', 'nohup'].includes(bin)) {
+      break;
+    }
+    index++;
+    while (index < words.length && words[index].startsWith('-')) {
+      const option = words[index++];
+      if (option === '--') {
+        break;
+      }
+      // command -v/-V 与帮助查询不执行目标；例如 sudo 的路径在这里只是查询参数。
+      if (
+        option === '--help' ||
+        option === '--version' ||
+        (bin === 'command' && /^-[p]*[vV]/.test(option))
+      ) {
+        return [];
+      }
+      if (
+        bin === 'env' &&
+        (option === '-S' || option === '--split-string' || option.startsWith('--split-string='))
+      ) {
+        const value = option.startsWith('--split-string=')
+          ? option.slice('--split-string='.length)
+          : words[index++];
+        const parsed = parseSimpleShellWords(value ?? '');
+        if (!parsed.ok) {
+          return [];
+        }
+        words = [...parsed.words, ...words.slice(index)];
+        index = 0;
+        break;
+      }
+      if (
+        (bin === 'env' && ['-u', '--unset', '-C', '--chdir'].includes(option)) ||
+        (bin === 'exec' && option === '-a')
+      ) {
+        index++;
+      }
+    }
+  }
+  return words.slice(index);
+}
+
+function hasRecursiveForceFlags(args: string[]): boolean {
+  let recursive = false;
+  let force = false;
+  for (const arg of args) {
+    if (arg === '--') {
+      break;
+    }
+    recursive ||= arg === '--recursive' || (/^-[^-]/.test(arg) && /[rR]/.test(arg.slice(1)));
+    force ||= arg === '--force' || (/^-[^-]/.test(arg) && arg.slice(1).includes('f'));
+  }
+  return recursive && force;
 }
 
 export function checkTerminalCommandAllowlist(
@@ -176,51 +291,39 @@ export function containsShellMeta(value: string): boolean {
   return /[\r\n;&|<>`$]/.test(value);
 }
 
-function firstShellWord(command: string): string | null {
-  const input = command.trim();
-  if (!input) {
-    return null;
-  }
-
-  let word = '';
-  let quote: '"' | "'" | null = null;
-
-  for (let i = 0; i < input.length; i++) {
-    const char = input[i];
-    if (!quote && (char === '"' || char === "'")) {
-      quote = char;
-      continue;
-    }
-    if (quote && char === quote) {
-      quote = null;
-      continue;
-    }
-    if (!quote && /[\s;&|<>()]/.test(char)) {
-      break;
-    }
-    word += char;
-  }
-
-  return word || null;
-}
-
 function parseSimpleShellWords(
-  command: string
-): { ok: true; words: string[] } | { ok: false; error: string } {
+  command: string,
+  splitCommands = false
+):
+  | { ok: true; words: string[]; commands: Array<Array<{ value: string; redirection?: true }>> }
+  | { ok: false; error: string } {
   const input = command.trim();
   if (!input) {
-    return { ok: true, words: [] };
+    return { ok: true, words: [], commands: [] };
   }
 
   const words: string[] = [];
+  const commands: Array<Array<{ value: string; redirection?: true }>> = [[]];
   let current = '';
+  let hasWord = false;
   let quote: '"' | "'" | null = null;
   let escaped = false;
+  const flushWord = () => {
+    if (hasWord) {
+      words.push(current);
+      commands[commands.length - 1].push({ value: current });
+      current = '';
+      hasWord = false;
+    }
+  };
 
   for (let i = 0; i < input.length; i++) {
     const char = input[i];
     if (escaped) {
-      current += char;
+      if (char !== '\n') {
+        current += char;
+        hasWord = true;
+      }
       escaped = false;
       continue;
     }
@@ -230,29 +333,42 @@ function parseSimpleShellWords(
     }
     if (!quote && (char === '"' || char === "'")) {
       quote = char;
+      hasWord = true;
       continue;
     }
     if (quote && char === quote) {
       quote = null;
       continue;
     }
-    if (!quote && /\s/.test(char)) {
-      if (current) {
-        words.push(current);
-        current = '';
+    if (splitCommands && !quote && (/[<>]/.test(char) || (char === '&' && input[i + 1] === '>'))) {
+      flushWord();
+      let operator = char;
+      while (i + 1 < input.length && /[<>&|]/.test(input[i + 1])) {
+        operator += input[++i];
       }
+      words.push(operator);
+      commands[commands.length - 1].push({ value: operator, redirection: true });
+      continue;
+    }
+    if (splitCommands && !quote && /[\r\n;&|()]/.test(char)) {
+      flushWord();
+      words.push(char);
+      commands.push([]);
+      continue;
+    }
+    if (!quote && /\s/.test(char)) {
+      flushWord();
       continue;
     }
     current += char;
+    hasWord = true;
   }
 
   if (escaped || quote) {
-    return { ok: false, error: 'Unable to parse read-only terminal command' };
+    return { ok: false, error: 'Unable to parse terminal command literals' };
   }
-  if (current) {
-    words.push(current);
-  }
-  return { ok: true, words };
+  flushWord();
+  return { ok: true, words, commands };
 }
 
 function findWriteLikeArg(args: string[]): string | null {

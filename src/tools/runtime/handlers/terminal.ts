@@ -101,15 +101,15 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
     if (exitCode === 137) {
       // 旧宿主用 137 同时表示超时、取消和输出配额强杀；没有信号事实时不能猜成超时。
       // 保留已执行得到的输出和兼容 ok，明确终态供 adapter/观察器判断；不再等待无用的压缩。
-      const abortReason: unknown = ctx.abortSignal?.reason;
-      const resultStatus = ctx.abortSignal?.aborted
-        ? abortReason instanceof Error && abortReason.name === 'TimeoutError'
-          ? 'timeout'
-          : 'aborted'
-        : 'error';
+      const resultStatus = terminalFailureStatus(ctx.abortSignal);
       const reason = ctx.abortSignal?.aborted ? 'abort-signal' : 'unknown-termination';
       const label = resultStatus === 'error' ? 'interrupted' : resultStatus;
-      const partial = stripAnsi(stdout);
+      const partialStdout = stripAnsi(stdout);
+      const partialStderr = stripAnsi(stderr);
+      // 强制终止前 stderr 也可能已有有效诊断；保留它，不改既有 137 原因/状态映射。
+      const partial = partialStderr.trim()
+        ? combineOutput(partialStdout, partialStderr)
+        : partialStdout;
       const text = withTerminalDiagnostics(
         partial ? `[${label}] partial output:\n${partial}` : `[command ${label}]`,
         diagnostics
@@ -152,6 +152,7 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
           {
             tokensEstimate: estimateTokens(text),
             durationMs,
+            ...(exitCode !== 0 ? { resultStatus: 'error' } : {}),
           },
           diagnostics
         )
@@ -161,9 +162,42 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
   } catch (err: unknown) {
     const durationMs = Date.now() - startMs;
     const msg = err instanceof Error ? err.message : 'Command failed';
-    const text = `[exit 1]\n${msg}`;
-    return finish(ok(text, { tokensEstimate: estimateTokens(text), durationMs }), 'failure');
+    const resultStatus = terminalFailureStatus(ctx.abortSignal);
+    const failure = err !== null && typeof err === 'object' ? err : {};
+    const stdout =
+      'stdout' in failure && typeof failure.stdout === 'string' ? stripAnsi(failure.stdout) : '';
+    const stderr =
+      'stderr' in failure && typeof failure.stderr === 'string' ? stripAnsi(failure.stderr) : '';
+    const partial = stdout.trim() || stderr.trim() ? `\n\n${combineOutput(stdout, stderr)}` : '';
+    const text = `[${resultStatus === 'error' ? 'exit 1' : resultStatus}]\n${msg}${partial}`;
+    // executor 已被调用：保留旧 ok 和已观察输出，由明确终态阻止观察层把失败计为成功。
+    return finish(
+      ok(text, {
+        tokensEstimate: estimateTokens(text),
+        durationMs,
+        resultStatus,
+        degraded: true,
+        diagnosticWarnings: [
+          {
+            code: 'terminal_execution_failed',
+            message: `Executor threw after invocation; status=${resultStatus}; captured output retained.`,
+            stage: 'terminal.exec',
+            tool: 'terminal',
+          },
+        ],
+      }),
+      'failure'
+    );
   }
+}
+
+function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'timeout' {
+  if (!signal?.aborted) {
+    return 'error';
+  }
+  return signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
+    ? 'timeout'
+    : 'aborted';
 }
 
 /**
@@ -247,10 +281,11 @@ interface SandboxExecutorLike {
 function combineOutput(stdout: string, stderr: string): string {
   const parts: string[] = [];
   if (stdout?.trim()) {
-    parts.push(stdout.trim());
+    // Git porcelain 等协议把前导空格作为字段；只清理展示尾部，不破坏首行列位。
+    parts.push(stdout.trimEnd());
   }
   if (stderr?.trim()) {
-    parts.push(`[stderr]\n${stderr.trim()}`);
+    parts.push(`[stderr]\n${stderr.trimEnd()}`);
   }
   return parts.join('\n\n') || '[no output]';
 }

@@ -2,8 +2,8 @@
  * @module tools/runtime/cache/DeltaCache
  *
  * 文件读取增量缓存。同一会话中再次读取已读文件时:
- *   - 内容未变 → 返回 "[unchanged since last read]"（节省 99.7% token）
- *   - 内容有变 → 返回变更 diff（节省 95-99% token）
+ *   - 内容未变且此前完整可见 → 返回 "[unchanged since last read]"
+ *   - 内容有变且此前完整可见 → 返回变更 diff
  *   - 首次读取 → 写入缓存
  *
  * 使用 LRU 策略控制内存（默认缓存 200 个文件）。
@@ -57,7 +57,7 @@ export class DeltaCache {
 
   /**
    * 智能读取: 根据缓存状态决定返回全文 / unchanged / diff
-   * 返回 null 表示缓存未命中（调用方需执行完整读取）
+   * 缓存未命中或旧内容不可见时返回 full；不以指纹存在推断全文已被展示。
    */
   check(path: string, currentContent: string): DeltaReadResult {
     const currentHash = md5(currentContent);
