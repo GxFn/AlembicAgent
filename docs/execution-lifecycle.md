@@ -12,6 +12,12 @@ EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和�
 
 诊断计数只接受有限非负数，非法输入或累加溢出产生 `diagnostics_invalid_count`，保留合法字段与已有总量。合并聚合计数不按数值大小循环。诊断快照复制公开条目，宿主修改快照不会反写收集器。
 
+无 Tracker 的循环同样执行 `maxIterations`；模型反复返回被禁止的工具调用，也不能绕过轮数上限。真实取消和期限优先于轮数耗尽。空响应和服务错误的重试等待响应同一 `AbortSignal`。
+
+强制摘要只有 `forcedSummary.ts` 一个实现入口。它保留 Runtime 的身份提示、显式输出预算和温度，使用有界的真实工具回执，优先容纳最新结果；参数和回执分别分配空间，失败、部分结果和截断都有标识。摘要失败或空响应保留工具结果并报告降级，不再追加第二次摘要；取消后的迟到文本丢弃，已知 input/output/reasoning/cache 用量仍归原调用统计。
+
+LLM 输入压缩只删除逐字重复的完整长行，不通过子串、大小写或缩进猜测等价。Producer 历史只有在请求 ID 非空、唯一且与回执一一对应时才折叠；摘要合并只修改本次装配生成的对象。PCV 从已确认工具结果累计证据，批次中途取消也保留已完成部分；现代 `evidenceRefs` 通过本轮台账解析为精确来源。PCV 始终是观察数据，缺失链接按当前快照重算，不升级为新的生产门。
+
 ## 阶段尝试
 
 `PipelineStrategy` 负责阶段顺序、gate 路由、Core strict receipt 接入和结果汇总。`strategies/pipeline/attempt.ts` 负责单次尝试的期限、取消、工具观察和诊断；`shared/operation.ts` 仅提供异步操作的四种终态：`ok`、`timeout`、`aborted`、`error`。
@@ -33,6 +39,14 @@ EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和�
 宿主返回 `aborted: true` 时，即使父 signal 未取消，也会停止后续主阶段、gate 与修复重评，管线结果为 `aborted`。
 
 非 strict 的快速重试仍受 `retryBudget` 和一次上限约束，只在宿主显式返回零工具超时，或 native 观察确认循环内没有工具开始时允许。宿主若携带 `partial`，其中已知工具活动、未知开始次数或读回要求均会否决重试；已有部分回执保留。未知执行历史的硬超时不据此重试。所有尝试的已知用量与迭代次数均累计；最终阶段结果描述最后一次尝试，最终回复取实际最后主阶段，避免被旧 repair 微阶段覆盖。
+
+质量门的拒绝、未知动作或相互矛盾的结果不能报告 `completed`。显式 `skipOnFail=false` 仍允许后续清理阶段执行，最终结果保留未通过事实。超时判断使用各阶段的最终回执，成功重试不被历史超时记录重新判为失败。`QualityGatePolicy.toGateConfig()` 负责将 Policy 的 `ok` 翻译为 Pipeline 的 `pass`；缺少拒绝原因不会把失败变成通过。多条 SafetyPolicy 按全部同意执行，`g`/`y` 正则的匹配游标不在调用间共享。
+
+## 子任务协调
+
+`AgentRunCoordinator` 在启动子任务前确认 partitioner 和 merger。`onChildResult` / `onTierComplete` 可能负责持久化，异常仍拒绝父运行；错误附带 `partialResult` 和 `coordinationFailures`。已启动子任务结算后保留各自真实回执，尚未启动的任务停止派发。每个结果按计划索引保存，重复使用同一个输入对象也不会互相覆盖。取消阻止的 tier 不发送完成回调。
+
+`FanOutStrategy` 向子策略传递执行配置，每个 item 使用独立诊断，最后合并一次。子 Pipeline 只获得所需的 loop 与工具观察接口，不读取父 Runtime 的共享迭代计数；中断时无法观察的工具启动数继续报告未知。显式注入同一个 ContextWindow、Tracker 或 ActiveContext 时，item 串行使用这些可变资源，并记录诊断。跨维度需要独立 Runtime 的宿主流程继续使用 Coordinator。
 
 ## 知识工具职责
 
@@ -69,5 +83,6 @@ Core 当前的 `createOrStage`、`publish` 端口不接收 signal；已开始的
 - `recipe-production-profile-adapter`：真实 Core authoring/production 接口、写入前后取消、readiness/会话记录失败、共享预算与 graph 修复一致性。
 - `SubmitEvidenceExpansion`、`provider-facades`：风格修复期限和实际 mock transport 的 signal。
 - `layer-contract`：使用实际配置验证禁止的反向依赖。
+- `AgentRuntime`、`llm-input-layering`、`agent-surface-floor`：摘要回执和预算、输入保真、策略及协调器边界；公开出口与接口合同集中在 `contract-surface`。
 
 测试复用现有文件、参数化场景与临时项目，不需要真实 API key。`npm run check` 同时检查构建、导入边界、冻结公开接口、相邻宿主消费和完整测试集。
