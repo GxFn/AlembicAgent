@@ -1,12 +1,19 @@
 import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
+import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
 import { BudgetPolicy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
+import type {
+  AgentRunInput,
+  AgentRunResult,
+  CompiledAgentProfile,
+} from '../src/agent/service/AgentRunContracts.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
+import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
@@ -1001,5 +1008,392 @@ describe('Agent service lifecycle', () => {
       execution: { timeoutMs: 7 },
     });
     expect(execute.mock.calls[0][1]).toMatchObject({ timeoutMs: 7 });
+  });
+});
+
+const items = [
+  { id: 'a', label: 'a', prompt: 'item-a' },
+  { id: 'b', label: 'b', prompt: 'item-b' },
+];
+const stageResult = {
+  reply: 'done',
+  toolCalls: [],
+  tokenUsage: { input: 1, output: 1 },
+  iterations: 1,
+};
+function fanoutRuntime(strategy: FanOutStrategy) {
+  const chatWithTools = vi.fn(async (prompt: string) => ({
+    text: `done:${prompt}`,
+    functionCalls: [],
+    usage: { inputTokens: 1, outputTokens: 1 },
+  }));
+  return {
+    chatWithTools,
+    runtime: new AgentRuntime({
+      aiProvider: { name: 'probe', model: 'probe', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy,
+    }),
+  };
+}
+describe('fanout option and accounting isolation', () => {
+  it('counts real loop iterations once when itemStrategy is a pipeline', async () => {
+    const fixture = fanoutRuntime(
+      new FanOutStrategy({
+        itemStrategy: new PipelineStrategy({ stages: [{ name: 'analyze', capabilities: [] }] }),
+      })
+    );
+    const result = await fixture.runtime.execute(
+      new AgentMessage({ content: 'controlled fanout' }),
+      { items }
+    );
+    expect(fixture.chatWithTools).toHaveBeenCalledTimes(2);
+    expect(result.iterations).toBe(2);
+  });
+  it('retains explicitly supplied policy-independent execution options for SingleStrategy items', async () => {
+    const options: Record<string, unknown>[] = [];
+    const diagnostics = new DiagnosticsCollector();
+    const sharedState = { fixture: true };
+    const budgetOverride = { maxIterations: 2 };
+    await new FanOutStrategy().execute(
+      {
+        id: 'probe',
+        reactLoop: async (_prompt, opts) => {
+          options.push(opts || {});
+          return stageResult;
+        },
+      },
+      new AgentMessage({ content: 'controlled options' }),
+      { items: [items[0]], source: 'system', sharedState, budgetOverride, diagnostics }
+    );
+    expect(options[0]).toMatchObject({
+      source: 'system',
+      sharedState,
+      budgetOverride,
+      diagnostics,
+    });
+  });
+  it('makes upstream strategy context available to nested pipeline prompt builders', async () => {
+    const seen: unknown[] = [];
+    const strategy = new FanOutStrategy({
+      itemStrategy: new PipelineStrategy({
+        stages: [
+          {
+            name: 'analyze',
+            promptBuilder: (ctx) => {
+              seen.push(ctx.projectInfo);
+              return 'done';
+            },
+          },
+        ],
+      }),
+    });
+    await strategy.execute(
+      { id: 'probe', reactLoop: async () => stageResult },
+      new AgentMessage({ content: 'controlled nested options' }),
+      { items: [items[0]], strategyContext: { projectInfo: { name: 'known-project' } } }
+    );
+    expect(seen).toEqual([{ name: 'known-project' }]);
+  });
+});
+it('does not start pre-cancelled fanout items', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const reactLoop = vi.fn(async () => stageResult);
+  await new FanOutStrategy().execute(
+    { id: 'fanout', reactLoop },
+    new AgentMessage({ content: 'cancelled' }),
+    { items, abortSignal: controller.signal }
+  );
+  expect(reactLoop).not.toHaveBeenCalled();
+});
+
+function deferred() {
+  return Promise.withResolvers<void>();
+}
+
+const profile: CompiledAgentProfile = {
+  kind: 'compiled-agent-profile',
+  id: 'parent',
+  title: 'probe',
+  serviceKind: 'system-analysis',
+  lifecycle: 'active',
+  basePreset: 'chat',
+  actionSpace: { mode: 'listed', toolIds: [] },
+  additionalTools: [],
+  params: {},
+  runtimeOverrides: {},
+  concurrency: {
+    mode: 'tiered',
+    concurrency: 2,
+    partitioner: 'generateSessionDimensions',
+    merge: 'generateSessionResults',
+    childProfile: 'child',
+  },
+};
+const childResult = (child: AgentRunInput): AgentRunResult => ({
+  runId: String(child.params?.dimId),
+  profileId: 'child',
+  reply: `confirmed:${child.params?.dimId}`,
+  status: 'success',
+  toolCalls: [{ name: 'knowledge', result: { id: child.params?.dimId } }],
+  usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+  diagnostics: null,
+});
+describe('R05 independent strategy rework cross review', () => {
+  it('serializes top-level SystemRunContext mutable resources', async () => {
+    const sharedWindow = { resetForNewStage: vi.fn(), tokenCount: 0 };
+    const systemRunContext = {
+      scopeId: 'probe',
+      sharedState: { _dimensionScopeId: 'probe' },
+      memoryCoordinator: {},
+      contextWindow: sharedWindow,
+      trace: {},
+      activeContext: {},
+      source: 'system',
+    };
+    let active = 0;
+    let peak = 0;
+    const observed: unknown[] = [];
+    const runtime = {
+      id: 'probe',
+      reactLoop: async (_prompt: string, opts?: Record<string, unknown>) => {
+        observed.push(opts?.contextWindow);
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setImmediate(resolve));
+        active--;
+        return stageResult;
+      },
+    };
+    await new FanOutStrategy({
+      itemStrategy: new PipelineStrategy({ stages: [{ name: 'analyze' }] }),
+    }).execute(runtime, new AgentMessage({ content: 'controlled shared context' }), {
+      items,
+      systemRunContext,
+    });
+    expect(observed).toEqual([sharedWindow, sharedWindow]);
+    expect(peak).toBe(1);
+  });
+  it('does not announce completion of tiers that cancellation prevented from starting', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const onTierComplete = vi.fn();
+    const onChildResult = vi.fn();
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'cancelled' },
+      params: {
+        dimensions: [
+          { id: 'a', tier: 0 },
+          { id: 'b', tier: 1 },
+        ],
+      },
+      context: { source: 'internal', coordination: { onChildResult, onTierComplete } },
+      execution: { abortSignal: controller.signal },
+    };
+    const result = await new AgentRunCoordinator().run(input, profile, runChild);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(result?.status).toBe('aborted');
+    expect(onChildResult).toHaveBeenCalledTimes(2);
+    expect(onTierComplete).not.toHaveBeenCalled();
+  });
+  it('keeps the real runtime configured tool observer through nested pipeline items', async () => {
+    const onToolCall = vi.fn();
+    const execute = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      toolId: 'meta',
+      callId: 'observed',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      text: 'confirmed',
+      structuredContent: { observed: true },
+    }));
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [{ id: 'observed', name: 'meta', args: { action: 'tools', params: {} } }],
+      })
+      .mockResolvedValue({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'probe', model: 'probe', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: { get: () => new RuntimeCapabilityCatalog() },
+      capabilities: [],
+      additionalTools: ['meta'],
+      onToolCall,
+      strategy: new FanOutStrategy({
+        itemStrategy: new PipelineStrategy({
+          stages: [{ name: 'analyze', capabilities: [], additionalTools: ['meta'] }],
+        }),
+      }),
+    });
+    const result = await runtime.execute(new AgentMessage({ content: 'observe tool' }), {
+      items: [items[0]],
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.toolCalls).toHaveLength(1);
+    expect(onToolCall).toHaveBeenCalledOnce();
+  });
+  it('isolates each child diagnostic collector and merges additive usage once', async () => {
+    const parent = new DiagnosticsCollector();
+    parent.warn({ code: 'parent', message: 'parent seed' });
+    const collectors: DiagnosticsCollector[] = [];
+    const result = await new FanOutStrategy().execute(
+      {
+        id: 'probe',
+        reactLoop: async (_prompt, options) => {
+          const diagnostics = options?.diagnostics as DiagnosticsCollector;
+          collectors.push(diagnostics);
+          diagnostics.recordTokenUsage({ inputTokens: 3, outputTokens: 2 });
+          diagnostics.warn({ code: 'child', message: 'child observation' });
+          return {
+            ...stageResult,
+            tokenUsage: { input: 3, output: 2 },
+            diagnostics: diagnostics.toJSON(),
+          };
+        },
+      },
+      new AgentMessage({ content: 'diagnostics' }),
+      { items, diagnostics: parent }
+    );
+    expect(collectors[0]).not.toBe(parent);
+    expect(collectors[1]).not.toBe(parent);
+    expect(collectors[0]).not.toBe(collectors[1]);
+    expect(result.diagnostics.efficiency?.tokenUsage).toMatchObject({ input: 6, output: 4 });
+    expect(result.diagnostics.warnings.map((w) => w.code)).toEqual(['parent', 'child', 'child']);
+  });
+  it('waits for started children, preserves their facts, and never starts queued children after consumer failure', async () => {
+    const bStarted = deferred();
+    const releaseB = deferred();
+    const failed = deferred();
+    const ran: string[] = [];
+    const consumed: string[] = [];
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'controlled consumer failure' },
+      params: { dimensions: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] },
+      context: {
+        source: 'internal',
+        coordination: {
+          onChildResult: ({ childInput }) => {
+            const id = String(childInput.params?.dimId);
+            consumed.push(id);
+            if (id === 'a') {
+              failed.resolve();
+              throw new Error('checkpoint write failed');
+            }
+          },
+        },
+      },
+    };
+    let settled = false;
+    const pending = new AgentRunCoordinator()
+      .run(
+        input,
+        {
+          ...profile,
+          concurrency: {
+            mode: 'parallel',
+            concurrency: 2,
+            partitioner: 'generateSessionDimensions',
+            merge: 'generateSessionResults',
+            childProfile: 'child',
+          },
+        },
+        async (child) => {
+          const id = String(child.params?.dimId);
+          ran.push(id);
+          if (id === 'b') {
+            bStarted.resolve();
+            await releaseB.promise;
+          }
+          return childResult(child);
+        }
+      )
+      .then(
+        (value) => {
+          settled = true;
+          return { value };
+        },
+        (error) => {
+          settled = true;
+          return { error };
+        }
+      );
+    await Promise.all([bStarted.promise, failed.promise]);
+    await new Promise((resolve) => setImmediate(resolve));
+    const wasSettled = settled;
+    releaseB.resolve();
+    const outcome = await pending;
+    expect(wasSettled).toBe(false);
+    expect(ran).toEqual(['a', 'b']);
+    expect(consumed).toEqual(['a', 'b']);
+    expect(outcome).toMatchObject({
+      error: {
+        partialResult: {
+          status: 'error',
+          phases: {
+            childResults: [
+              { status: 'success', runId: 'a' },
+              { status: 'success', runId: 'b' },
+              { status: 'aborted' },
+            ],
+          },
+          toolCalls: [{ result: { id: 'a' } }, { result: { id: 'b' } }],
+        },
+        coordinationFailures: [{ hook: 'onChildResult', childId: 'a' }],
+      },
+    });
+  });
+});
+describe('R05 result-control compatibility edges', () => {
+  it.each([
+    'retry',
+    'reject',
+  ])('preserves explicit skipOnFail=false continuation for %s while keeping abandoned outcome', async (action) => {
+    const reactLoop = vi.fn(async () => stageResult);
+    const result = await new PipelineStrategy({
+      maxRetries: 0,
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'gate',
+          skipOnFail: false,
+          gate: { evaluator: () => ({ action, pass: false, reason: 'negative fixture' }) },
+        },
+        { name: 'cleanup' },
+      ],
+    }).execute({ id: 'probe', reactLoop }, new AgentMessage({ content: 'explicit continuation' }));
+    expect(result.outcome).toBe('abandoned');
+    expect(reactLoop).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    false,
+    true,
+  ])('distinguishes terminal timeout from recovered timeout in fanout item summary: recovered=%s', async (recovered) => {
+    const reactLoop = vi
+      .fn()
+      .mockResolvedValueOnce({ ...stageResult, timedOut: true })
+      .mockResolvedValue(stageResult);
+    const result = await new FanOutStrategy({
+      itemStrategy: new PipelineStrategy({
+        stages: [{ name: 'analyze', ...(recovered ? { retryBudget: { maxIterations: 1 } } : {}) }],
+      }),
+    }).execute({ id: 'probe', reactLoop }, new AgentMessage({ content: 'timeout accounting' }), {
+      items: [items[0]],
+    });
+    const results = result.itemResults as Array<{ status: string }>;
+    expect(results[0].status).toBe(recovered ? 'completed' : 'failed');
   });
 });

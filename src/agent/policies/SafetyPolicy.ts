@@ -80,7 +80,8 @@ export class SafetyPolicy extends Policy {
 
   checkCommand(command: string) {
     for (const pattern of this.#commandBlacklist) {
-      if (pattern.test(command)) {
+      // /g 与 /y 会修改 lastIndex；每次检查用独立 matcher，避免同一命令交替放行。
+      if (new RegExp(pattern.source, pattern.flags).test(command)) {
         return { safe: false, reason: `Blocked: matches dangerous pattern ${pattern}` };
       }
     }
@@ -117,6 +118,10 @@ function isWithinPathScope(filePath: string, scopePath: string) {
   const scope = path.resolve(scopePath);
   const relative = path.relative(scope, resolved);
   return (
-    relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative))
+    relative === '' ||
+    (!!relative &&
+      relative !== '..' &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative))
   );
 }

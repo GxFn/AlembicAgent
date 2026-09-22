@@ -55,6 +55,11 @@ export class AgentRunCoordinator {
     if (!partitioner) {
       throw new Error(`Unknown agent run partitioner: "${partitionerName}"`);
     }
+    const mergeName = profile.concurrency.merge;
+    const merger = mergeName ? this.#mergers.get(mergeName) : null;
+    if (mergeName && !merger) {
+      throw new Error(`Unknown agent run merger: "${mergeName}"`);
+    }
     const childInputs = partitioner(input, profile);
     const childResults = await runChildren(
       childInputs,
@@ -63,11 +68,7 @@ export class AgentRunCoordinator {
       input,
       profile
     );
-    const mergeName = profile.concurrency.merge;
-    const merger = mergeName ? this.#mergers.get(mergeName) : null;
-    if (mergeName && !merger) {
-      throw new Error(`Unknown agent run merger: "${mergeName}"`);
-    }
+
     return merger ? merger(childResults, input, profile) : defaultMerge(childResults, profile);
   }
 }
@@ -79,109 +80,128 @@ async function runChildren(
   parentInput: AgentRunInput,
   profile: CompiledAgentProfile
 ) {
-  const concurrency = resolveConcurrency(concurrencyPlan.concurrency);
-  const limit = createLimit(concurrency);
-  const runOneChild = (child: AgentRunInput) =>
-    runChildWithHooks(child, runChild, parentInput, profile);
-  if (concurrencyPlan.mode !== 'tiered') {
-    const childRuns = await Promise.all(
-      childInputs.map((child) => limit(() => runOneChild(child)))
-    );
-    return childRuns.map((childRun) => childRun.result);
-  }
-  const results = new Map<AgentRunInput, AgentRunResult>();
-  const tiers = groupByTier(childInputs);
-  for (let tierIndex = 0; tierIndex < tiers.length; tierIndex++) {
-    if (await shouldAbort(parentInput)) {
-      const abortedInputs = tiers.slice(tierIndex).flat();
-      const abortedRuns = await abortChildInputs(abortedInputs, parentInput, profile);
-      abortedRuns.forEach((childRun, index) => {
-        results.set(abortedInputs[index], childRun.result);
-      });
-      break;
+  const limit = createLimit(resolveConcurrency(concurrencyPlan.concurrency));
+  const records: ChildRunRecord[] = [];
+  const failures: Array<{ hook: string; childId?: string; tierIndex?: number; message: string }> =
+    [];
+  let firstError: unknown;
+  const fail = (
+    hook: string,
+    err: unknown,
+    details: { childId?: string; tierIndex?: number } = {}
+  ) => {
+    if (failures.length === 0) {
+      firstError = err;
     }
-    const tier = tiers[tierIndex];
-    const tierRuns = await Promise.all(tier.map((child) => limit(() => runOneChild(child))));
-    const tierResults = tierRuns.map((childRun) => childRun.result);
-    tierResults.forEach((result, index) => {
-      results.set(tier[index], result);
-    });
-    await parentInput.context.coordination?.onTierComplete?.({
-      tierIndex,
-      childInputs: tierRuns.map((childRun) => childRun.childInput),
-      results: tierResults,
-      profile,
-    });
+    failures.push({ hook, ...details, message: err instanceof Error ? err.message : String(err) });
+  };
+  const runOneChild = async (index: number, forceAbort = false): Promise<ChildRunRecord> => {
+    const planned = childInputs[index];
+    let childInput = planned;
+    let result: AgentRunResult;
+    let started = false;
+    // 回调可能保存检查点，失败后不能重试它或继续派发尚未开始的子任务。
+    if (forceAbort || failures.length > 0) {
+      result = createChildAbortedResult(childInput);
+    } else {
+      try {
+        if ((await shouldAbort(parentInput)) || failures.length > 0) {
+          result = createChildAbortedResult(childInput);
+        } else {
+          childInput = await resolveLazyChildInput(planned, parentInput);
+          const aborted = await shouldAbort(parentInput);
+          // shouldAbort/懒构造均可挂起；恢复后必须重新读取停止事实，不能用 await 前的值。
+          if (aborted || failures.length > 0) {
+            result = createChildAbortedResult(childInput);
+          } else {
+            started = true;
+            result = await runChild(childInput);
+          }
+        }
+      } catch (err: unknown) {
+        result = createChildErrorResult(childInput, err);
+      }
+    }
+    const record = { childInput, result };
+    records[index] = record;
+    if (failures.length === 0 || started) {
+      try {
+        await parentInput.context.coordination?.onChildResult?.({ childInput, result, profile });
+      } catch (err: unknown) {
+        fail('onChildResult', err, { childId: resolveDimensionId(childInput) || undefined });
+      }
+    }
+    return record;
+  };
+  const tiers =
+    concurrencyPlan.mode === 'tiered'
+      ? groupByTier(childInputs)
+      : [childInputs.map((_, index) => index)];
+  for (const [tierIndex, tier] of tiers.entries()) {
+    if (concurrencyPlan.mode === 'tiered') {
+      let cancelled = failures.length > 0;
+      if (!cancelled) {
+        try {
+          cancelled = await shouldAbort(parentInput);
+        } catch (err: unknown) {
+          fail('shouldAbort', err, { tierIndex });
+          cancelled = true;
+        }
+      }
+      if (cancelled) {
+        await Promise.all(
+          tiers
+            .slice(tierIndex)
+            .flat()
+            .map((index) => runOneChild(index, true))
+        );
+        break;
+      }
+    }
+    // 单个 callback 的拒绝不会让 Promise.all 早退；已开始的 child 仍需结算真实回执。
+    const runs = await Promise.all(tier.map((child) => limit(() => runOneChild(child))));
+    if (concurrencyPlan.mode === 'tiered' && failures.length === 0) {
+      try {
+        await parentInput.context.coordination?.onTierComplete?.({
+          tierIndex,
+          childInputs: runs.map((run) => run.childInput),
+          results: runs.map((run) => run.result),
+          profile,
+        });
+      } catch (err: unknown) {
+        fail('onTierComplete', err, { tierIndex });
+      }
+    }
   }
-  // 分层改变执行顺序，但 merger 的下标契约始终对应原始输入，不能把另一个模块的结果错配。
-  return childInputs.map((input) => {
-    const result = results.get(input);
-    if (!result) {
+  const results = childInputs.map((_, index) => {
+    const record = records[index];
+    if (!record) {
       throw new Error('Coordinated child result is missing');
     }
-    return result;
+    return record.result;
   });
-}
-
-async function runChildWithHooks(
-  childInput: AgentRunInput,
-  runChild: ChildRunner,
-  parentInput: AgentRunInput,
-  profile: CompiledAgentProfile
-): Promise<ChildRunRecord> {
-  if (await shouldAbort(parentInput)) {
-    return createAbortedChildRunWithHooks(childInput, parentInput, profile);
+  if (failures.length > 0) {
+    // 保持父 run 抛错（宿主据此停止 finalize）；附带原始 child 状态供恢复/读回，不能冒充成功。
+    const partialResult = { ...defaultMerge(results, profile), status: 'error' as const };
+    throw Object.assign(
+      new Error(`Agent coordination consumption failed: ${failures[0].message}`, {
+        cause: firstError,
+      }),
+      {
+        partialResult,
+        coordinationFailures: failures,
+      }
+    );
   }
-  let resolvedChildInput = childInput;
-  let result: AgentRunResult;
-  try {
-    resolvedChildInput = await resolveLazyChildInput(childInput, parentInput);
-    if (await shouldAbort(parentInput)) {
-      return createAbortedChildRunWithHooks(resolvedChildInput, parentInput, profile);
-    }
-    result = await runChild(resolvedChildInput);
-  } catch (err: unknown) {
-    result = createChildErrorResult(resolvedChildInput, err);
-  }
-  await parentInput.context.coordination?.onChildResult?.({
-    childInput: resolvedChildInput,
-    result,
-    profile,
-  });
-  return { childInput: resolvedChildInput, result };
-}
-
-async function abortChildInputs(
-  childInputs: AgentRunInput[],
-  parentInput: AgentRunInput,
-  profile: CompiledAgentProfile
-) {
-  return Promise.all(
-    childInputs.map((childInput) =>
-      createAbortedChildRunWithHooks(childInput, parentInput, profile)
-    )
-  );
+  return results;
 }
 
 async function shouldAbort(input: AgentRunInput) {
   if (input.execution?.abortSignal?.aborted) {
     return true;
   }
-  return (await input.execution?.shouldAbort?.()) === true;
-}
-
-async function createAbortedChildRunWithHooks(
-  childInput: AgentRunInput,
-  parentInput: AgentRunInput,
-  profile: CompiledAgentProfile
-): Promise<ChildRunRecord> {
-  const result = createChildAbortedResult(childInput);
-  await parentInput.context.coordination?.onChildResult?.({
-    childInput,
-    result,
-    profile,
-  });
-  return { childInput, result };
+  const requested = await input.execution?.shouldAbort?.();
+  return input.execution?.abortSignal?.aborted === true || requested === true;
 }
 
 function createChildErrorResult(input: AgentRunInput, err: unknown): AgentRunResult {
@@ -263,10 +283,10 @@ function resolveConcurrency(concurrency: AgentConcurrencyPlan['concurrency']) {
 }
 
 function groupByTier(childInputs: AgentRunInput[]) {
-  const groups = new Map<number, AgentRunInput[]>();
-  for (const child of childInputs) {
+  const groups = new Map<number, number[]>();
+  for (const [index, child] of childInputs.entries()) {
     const tier = resolveTier(child);
-    groups.set(tier, [...(groups.get(tier) || []), child]);
+    groups.set(tier, [...(groups.get(tier) || []), index]);
   }
   return [...groups.entries()].sort(([left], [right]) => left - right).map(([, inputs]) => inputs);
 }

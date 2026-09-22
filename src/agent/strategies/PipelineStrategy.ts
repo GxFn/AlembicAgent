@@ -393,14 +393,19 @@ export class PipelineStrategy extends Strategy {
     const submitRepairs = readSubmitRepairStats(ctx.strategyContext.sharedState);
     const recipeReadiness = readRecipeReadinessReports(ctx.strategyContext.sharedState);
     // F2：abandoned 覆盖 degrade 族 + retry_exhausted 两类放弃；degraded 布尔语义不变。
-    const abandoned = ctx.degraded || ctx.retryExhausted;
+    const abandoned = ctx.degraded || ctx.retryExhausted || Boolean(ctx.abandonInfo);
+    // 只看每个执行阶段的最终回执；一次超时后的成功重试不能被历史诊断重新判失败。
+    const timedOut = this.#stages.some(
+      (stage) =>
+        !stage.gate && (ctx.phaseResults[stage.name] as StageResult | undefined)?.timedOut === true
+    );
     const aborted = this.#isCancelled(ctx);
     if (aborted) {
       this.#recordCancellation(ctx);
     }
     const outcome = aborted
       ? 'aborted'
-      : ctx.strictFailed
+      : ctx.strictFailed || timedOut
         ? 'failed'
         : abandoned
           ? 'abandoned'
@@ -419,6 +424,7 @@ export class PipelineStrategy extends Strategy {
       iterations: ctx.totalIterations,
       phases: ctx.phaseResults,
       degraded: ctx.degraded,
+      ...(timedOut ? { timedOut: true } : {}),
       outcome,
       diagnostics: ctx.diagnostics.toJSON(),
     };
@@ -674,7 +680,13 @@ export class PipelineStrategy extends Strategy {
       return 'continue';
     }
 
-    // 兜底: 未知 action
+    // 非通过事实影响最终 outcome；执行是否继续仍尊重显式 skipOnFail，
+    // 不能通过 degraded 间接吞掉宿主要求执行的清理阶段。
+    ctx.abandonInfo ??= {
+      stage: stage.name || 'gate',
+      action: gateResult.action,
+      reason: gateResult.reason || 'Gate did not pass',
+    };
     if (stage.skipOnFail !== false) {
       return 'break';
     }
@@ -745,7 +757,17 @@ export class PipelineStrategy extends Strategy {
           ? evaluation.error
           : new Error('Pipeline gate evaluation failed');
       }
-      const evaluated = evaluation.value as GateEvalResult;
+      const evaluated = evaluation.value as GateEvalResult | null;
+      if (!evaluated || typeof evaluated !== 'object') {
+        throw new Error('Pipeline gate returned no decision');
+      }
+      if (evaluated.action === 'pass' && evaluated.pass === false) {
+        return {
+          ...evaluated,
+          action: 'reject',
+          reason: evaluated.reason || 'Gate returned conflicting pass and action fields',
+        };
+      }
       return {
         ...evaluated,
         action: evaluated.action || (evaluated.pass ? 'pass' : 'analysis_retry'),

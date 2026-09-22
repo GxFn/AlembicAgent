@@ -24,6 +24,7 @@ import type {
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
 import { AgentRunCoordinator } from '../src/agent/service/index.js';
+import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import {
   type TaskContext,
@@ -396,6 +397,58 @@ describe('policy public contracts', () => {
     });
   });
 
+  it.each(['g', 'y'])('composes every safety policy with stateful pattern %s', (flags) => {
+    const pattern = new RegExp('custom-denied', flags);
+    pattern.lastIndex = 3;
+    const engine = new PolicyEngine([
+      new SafetyPolicy(),
+      new SafetyPolicy({
+        commandBlacklist: [pattern],
+        fileScope: projectRoot,
+        requireApprovalFor: ['meta'],
+      }),
+    ]);
+    for (let i = 0; i < 3; i++) {
+      expect(engine.validateToolCall('terminal', { params: { command: 'custom-denied' } }).ok).toBe(
+        false
+      );
+    }
+    expect(pattern.lastIndex).toBe(3);
+    expect(engine.validateToolCall('meta', {}).ok).toBe(false);
+    expect(engine.validateToolCall('code', { path: `${projectRoot}-other/file.ts` }).ok).toBe(
+      false
+    );
+    expect(engine.validateToolCall('code', { path: `${projectRoot}/..notes/file.ts` }).ok).toBe(
+      true
+    );
+  });
+
+  it('keeps reasonless and empty-reply quality failures visible', () => {
+    const custom = new QualityGatePolicy({
+      minEvidenceLength: 0,
+      minFileRefs: 0,
+      minToolCalls: 0,
+      customValidator: () => ({ ok: false }),
+    });
+    expect(custom.validateAfter({ reply: 'done' })).toMatchObject({
+      ok: false,
+      reason: expect.any(String),
+    });
+    const required = new QualityGatePolicy({
+      minEvidenceLength: 5,
+      minFileRefs: 1,
+      minToolCalls: 0,
+    });
+    expect(required.validateAfter({ reply: '' })).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('分析长度不足'),
+    });
+    expect(required.validateAfter({})).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('文件引用不足'),
+    });
+  });
+
   it.each([
     'tool',
     'name',
@@ -460,7 +513,11 @@ describe('policy public contracts', () => {
       minEvidenceLength: 5,
       minFileRefs: 1,
       minToolCalls: 2,
-      custom,
+      custom: expect.any(Function),
+    });
+    expect(policy.toGateConfig().custom?.({ reply: 'deny src/file.ts' })).toMatchObject({
+      pass: false,
+      reason: 'custom rejection',
     });
   });
 });
@@ -704,7 +761,110 @@ function coordinationProfile(): CompiledAgentProfile {
   };
 }
 
+describe('pipeline quality decision adapters', () => {
+  it('maps the quality policy validator to the pipeline pass contract', async () => {
+    const gate = new QualityGatePolicy({
+      minEvidenceLength: 0,
+      minFileRefs: 0,
+      minToolCalls: 0,
+      customValidator: () => ({ ok: true }),
+    }).toGateConfig();
+    const result = await new PipelineStrategy({
+      maxRetries: 0,
+      stages: [{ name: 'analyze' }, { name: 'quality', gate }],
+    }).execute(
+      {
+        id: 'pipeline',
+        reactLoop: async () => ({
+          reply: 'analysis',
+          toolCalls: [],
+          tokenUsage: { input: 0, output: 0 },
+          iterations: 1,
+        }),
+      },
+      new AgentMessage({ content: 'analyze' })
+    );
+    expect(result.outcome).toBe('completed');
+  });
+  it.each([
+    { action: 'reject', pass: false },
+    { action: 'pass', pass: false },
+    { action: 'unknown', pass: false },
+  ])('does not promote a negative gate $action to completed', async (decision) => {
+    const loop = vi.fn(async () => ({
+      reply: 'analysis',
+      toolCalls: [],
+      tokenUsage: { input: 0, output: 0 },
+      iterations: 1,
+    }));
+    const result = await new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        { name: 'quality', gate: { evaluator: () => decision } },
+        { name: 'produce' },
+      ],
+    }).execute({ id: 'pipeline', reactLoop: loop }, new AgentMessage({ content: 'analyze' }));
+    expect(result.outcome).not.toBe('completed');
+    expect(loop).toHaveBeenCalledOnce();
+  });
+});
+
 describe('coordination public contracts', () => {
+  it('rejects an unknown merger before child execution', async () => {
+    const profile = coordinationProfile();
+    if (!profile.concurrency) {
+      throw new Error('Fixture requires concurrency');
+    }
+    profile.concurrency.merge = 'missing';
+    const runChild = vi.fn(async (input: AgentRunInput) => childResult(input));
+    await expect(
+      new AgentRunCoordinator().run(baseRunInput([{ id: 'a', tier: 0 }]), profile, runChild)
+    ).rejects.toThrow('Unknown agent run merger');
+    expect(runChild).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'child',
+    'tier',
+  ])('keeps confirmed receipts on %s consumption failure and stops pending work', async (kind) => {
+    const input = baseRunInput([
+      { id: 'a', tier: 0 },
+      { id: 'b', tier: kind === 'tier' ? 1 : 0 },
+    ]);
+    input.context.coordination =
+      kind === 'child'
+        ? {
+            onChildResult: async () => {
+              throw new Error('persist child failed');
+            },
+          }
+        : {
+            onTierComplete: async () => {
+              throw new Error('persist tier failed');
+            },
+          };
+    const ran: string[] = [];
+    const run = new AgentRunCoordinator().run(input, coordinationProfile(), async (child) => {
+      ran.push(String(child.params?.dimId));
+      return {
+        ...childResult(child),
+        toolCalls: [{ tool: 'knowledge', result: { id: 'confirmed' } }],
+      };
+    });
+    const error = await run.then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      partialResult: { status: 'error', toolCalls: [{ result: { id: 'confirmed' } }] },
+      coordinationFailures: [
+        expect.objectContaining({ hook: kind === 'child' ? 'onChildResult' : 'onTierComplete' }),
+      ],
+    });
+    expect(ran).toEqual(['a']);
+  });
+
   it.each([
     'timeout',
     'blocked',
@@ -774,5 +934,160 @@ describe('coordination public contracts', () => {
         },
       },
     });
+  });
+});
+
+function coordinationLatch<T>() {
+  return Promise.withResolvers<T>();
+}
+
+describe('coordination asynchronous admission', () => {
+  it('does not start a pending child after sibling consumption fails during async abort check', async () => {
+    const secondPreflight = coordinationLatch<boolean>();
+    const failureObserved = coordinationLatch<void>();
+    let checks = 0;
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      params: { dimensions: [{ id: 'a' }, { id: 'b' }] },
+      context: {
+        source: 'internal',
+        coordination: {
+          onChildResult: async ({ childInput }) => {
+            if (childInput.params?.dimId === 'a') {
+              failureObserved.resolve();
+              throw new Error('controlled consumer failure');
+            }
+          },
+        },
+      },
+      execution: {
+        shouldAbort: async () => {
+          checks++;
+          return checks === 4 ? secondPreflight.promise : false;
+        },
+      },
+    };
+    const profile: CompiledAgentProfile = {
+      kind: 'compiled-agent-profile',
+      id: 'parent',
+      title: 'review',
+      serviceKind: 'system-analysis',
+      lifecycle: 'active',
+      basePreset: 'chat',
+      actionSpace: { mode: 'listed', toolIds: [] },
+      additionalTools: [],
+      params: {},
+      runtimeOverrides: {},
+      concurrency: {
+        mode: 'parallel',
+        concurrency: 2,
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
+        childProfile: 'child',
+      },
+    };
+    const ran: string[] = [];
+    const resultPromise = new AgentRunCoordinator()
+      .run(input, profile, async (child): Promise<AgentRunResult> => {
+        ran.push(String(child.params?.dimId));
+        return {
+          runId: String(child.params?.dimId),
+          profileId: 'child',
+          reply: 'confirmed',
+          status: 'success',
+          toolCalls: [{ tool: 'knowledge', result: { id: String(child.params?.dimId) } }],
+          usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+          diagnostics: null,
+        };
+      })
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error })
+      );
+    await failureObserved.promise;
+    // 先让协调器观察回调拒绝，再解除 sibling 的异步 preflight。
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    secondPreflight.resolve(false);
+    await resultPromise;
+    expect(ran).toEqual(['a']);
+  });
+  it('rechecks an external AbortSignal after an async cancellation hook returns false', async () => {
+    const controller = new AbortController();
+    const entered = coordinationLatch<void>();
+    const release = coordinationLatch<boolean>();
+    let checks = 0;
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      context: { source: 'internal' },
+      params: { dimensions: [{ id: 'a' }] },
+      execution: {
+        abortSignal: controller.signal,
+        shouldAbort: async () => {
+          checks++;
+          if (checks === 2) {
+            entered.resolve();
+            return release.promise;
+          }
+          return false;
+        },
+      },
+    };
+    const profile = {
+      id: 'parent',
+      concurrency: { mode: 'parallel', concurrency: 1, partitioner: 'generateSessionDimensions' },
+    } as CompiledAgentProfile;
+    let started = 0;
+    const run = new AgentRunCoordinator().run(input, profile, async () => {
+      started++;
+      return {
+        runId: 'unexpected',
+        profileId: 'child',
+        reply: 'ran',
+        status: 'success',
+        toolCalls: [],
+        usage: { inputTokens: 0, outputTokens: 0, iterations: 0, durationMs: 0 },
+        diagnostics: null,
+      };
+    });
+    await entered.promise;
+    controller.abort();
+    release.resolve(false);
+    await run;
+    expect(started).toBe(0);
+  });
+  it('keeps each execution receipt when a public partitioner reuses an input object', async () => {
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      context: { source: 'internal' },
+    };
+    const profile = {
+      id: 'parent',
+      concurrency: { mode: 'parallel', concurrency: 1, partitioner: 'repeat' },
+    } as CompiledAgentProfile;
+    let index = 0;
+    const coordinator = new AgentRunCoordinator().registerPartitioner('repeat', () => [
+      input,
+      input,
+    ]);
+    const result = await coordinator.run(input, profile, async () => {
+      index++;
+      return {
+        runId: String(index),
+        profileId: 'child',
+        reply: `receipt ${index}`,
+        status: 'success',
+        toolCalls: [{ tool: 'knowledge', result: { id: `confirmed-${index}` } }],
+        usage: { inputTokens: index, outputTokens: 0, iterations: 1, durationMs: 0 },
+        diagnostics: null,
+      };
+    });
+    expect(index).toBe(2);
+    expect(result?.toolCalls).toEqual([
+      { tool: 'knowledge', result: { id: 'confirmed-1' } },
+      { tool: 'knowledge', result: { id: 'confirmed-2' } },
+    ]);
   });
 });

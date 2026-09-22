@@ -70,66 +70,78 @@ export class PolicyEngine {
   }
 
   validateToolCall(toolName: string, args: Record<string, unknown>) {
-    const safety = this.get(SafetyPolicy);
-    if (!safety) {
-      return { ok: true };
-    }
-
-    const terminalParams =
-      args?.params && typeof args.params === 'object'
-        ? (args.params as Record<string, unknown>)
-        : args;
-    const command =
-      typeof terminalParams.command === 'string'
-        ? terminalParams.command
-        : typeof args?.bin === 'string'
-          ? formatTerminalExecForSafetyPolicy(args)
-          : null;
-    if (toolName === 'terminal' && command !== null) {
-      const check = safety.checkCommand(command);
-      if (!check.safe) {
-        return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
+    // 声明式 profile 可叠加多条安全策略；每条都必须同意，不能只取第一条。
+    for (const policy of this.#policies) {
+      if (policy instanceof SafetyPolicy) {
+        const result = validateSafetyToolCall(policy, toolName, args);
+        if (!result.ok) {
+          return result;
+        }
       }
     }
-
-    if (toolName === 'write_project_file' && args?.filePath) {
-      const check = safety.checkFilePath(args.filePath as string);
-      if (!check.safe) {
-        return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
-      }
-    }
-
-    const filePathsToCheck: string[] = [];
-    if (toolName === 'code') {
-      const p = (args?.params || args) as Record<string, unknown>;
-      if (typeof p?.path === 'string') {
-        filePathsToCheck.push(p.path);
-      }
-      if (typeof p?.filePath === 'string') {
-        filePathsToCheck.push(p.filePath);
-      }
-      if (Array.isArray(p?.filePaths)) {
-        filePathsToCheck.push(
-          ...(p.filePaths as unknown[]).filter(
-            (filePath): filePath is string => typeof filePath === 'string'
-          )
-        );
-      }
-    }
-
-    for (const filePath of filePathsToCheck) {
-      const check = safety.checkFilePath(filePath);
-      if (!check.safe) {
-        return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
-      }
-    }
-
-    if (safety.needsApproval(toolName)) {
-      return { ok: false, reason: `[SafetyPolicy] 工具 "${toolName}" 需要人工确认` };
-    }
-
     return { ok: true };
   }
+}
+
+function validateSafetyToolCall(
+  safety: SafetyPolicy,
+  toolName: string,
+  args: Record<string, unknown>
+) {
+  const terminalParams =
+    args?.params && typeof args.params === 'object'
+      ? (args.params as Record<string, unknown>)
+      : args;
+  const command =
+    typeof terminalParams.command === 'string'
+      ? terminalParams.command
+      : typeof args?.bin === 'string'
+        ? formatTerminalExecForSafetyPolicy(args)
+        : null;
+  if (toolName === 'terminal' && command !== null) {
+    const check = safety.checkCommand(command);
+    if (!check.safe) {
+      return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
+    }
+  }
+
+  if (toolName === 'write_project_file' && args?.filePath) {
+    const check = safety.checkFilePath(args.filePath as string);
+    if (!check.safe) {
+      return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
+    }
+  }
+
+  const filePathsToCheck: string[] = [];
+  if (toolName === 'code') {
+    const p = (args?.params || args) as Record<string, unknown>;
+    if (typeof p?.path === 'string') {
+      filePathsToCheck.push(p.path);
+    }
+    if (typeof p?.filePath === 'string') {
+      filePathsToCheck.push(p.filePath);
+    }
+    if (Array.isArray(p?.filePaths)) {
+      filePathsToCheck.push(
+        ...(p.filePaths as unknown[]).filter(
+          (filePath): filePath is string => typeof filePath === 'string'
+        )
+      );
+    }
+  }
+
+  for (const filePath of filePathsToCheck) {
+    const check = safety.checkFilePath(filePath);
+    if (!check.safe) {
+      return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
+    }
+  }
+
+  if (safety.needsApproval(toolName)) {
+    return { ok: false, reason: `[SafetyPolicy] 工具 "${toolName}" 需要人工确认` };
+  }
+
+  return { ok: true };
 }
 
 function formatTerminalExecForSafetyPolicy(args: Record<string, unknown>) {

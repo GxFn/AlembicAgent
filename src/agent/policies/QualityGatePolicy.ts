@@ -34,14 +34,15 @@ export class QualityGatePolicy extends Policy {
   validateAfter(result: PolicyResult) {
     const reasons: string[] = [];
 
-    if (result.reply && result.reply.length < this.#minEvidenceLength) {
-      reasons.push(`分析长度不足: ${result.reply.length} < ${this.#minEvidenceLength}`);
+    const reply = result.reply || '';
+    if (reply.length < this.#minEvidenceLength) {
+      reasons.push(`分析长度不足: ${reply.length} < ${this.#minEvidenceLength}`);
     }
 
-    if (result.reply) {
+    {
       const hasSubmitCalls = (result.toolCalls || []).some(isPersistedSubmission);
       if (!hasSubmitCalls) {
-        const fileRefCount = (result.reply.match(/[\w/-]+\.\w{1,6}/g) || []).length;
+        const fileRefCount = (reply.match(/[\w/-]+\.\w{1,6}/g) || []).length;
         if (fileRefCount < this.#minFileRefs) {
           reasons.push(`文件引用不足: ${fileRefCount} < ${this.#minFileRefs}`);
         }
@@ -54,8 +55,8 @@ export class QualityGatePolicy extends Policy {
 
     if (this.#customValidator) {
       const custom = this.#customValidator(result);
-      if (!custom.ok && custom.reason) {
-        reasons.push(custom.reason);
+      if (!custom.ok) {
+        reasons.push(custom.reason || '自定义质量校验未通过');
       }
     }
 
@@ -63,11 +64,18 @@ export class QualityGatePolicy extends Policy {
   }
 
   toGateConfig() {
+    const customValidator = this.#customValidator;
     return {
       minEvidenceLength: this.#minEvidenceLength,
       minFileRefs: this.#minFileRefs,
       minToolCalls: this.#minToolCalls,
-      custom: this.#customValidator,
+      // Policy 使用 ok；Pipeline gate 使用 pass。此处是两份现有公开合同的唯一翻译点。
+      custom: customValidator
+        ? (result: PolicyResult) => {
+            const decision = customValidator(result);
+            return { pass: decision.ok, reason: decision.reason };
+          }
+        : null,
     };
   }
 }
