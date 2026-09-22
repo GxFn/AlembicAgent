@@ -178,7 +178,7 @@ const FEATURE_FLAGS = [
     owner: 'provider-adapter',
     defaultValue: 'high',
     productionRelevant: true,
-    allowedValues: ['low', 'medium', 'high'],
+    allowedValues: ['high', 'max'],
     sourceRefs: ['src/ai/providers/DeepSeekProvider.ts'], // provider-name-ok: env manifest record, owner=provider-adapter
   },
 ] as const satisfies readonly AgentRuntimeFeatureFlag[];

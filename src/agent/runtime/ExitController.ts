@@ -116,6 +116,17 @@ export class ExitController {
       };
     }
 
+    // P2: stage budget timeout (unified — eliminates triple timeout)
+    const elapsed = Date.now() - this.#loopStartTime;
+    if (this.#effectiveTimeoutMs > 0 && elapsed > this.#effectiveTimeoutMs) {
+      return {
+        action: 'exit',
+        reason: 'stage_timeout',
+        needsSummary: false,
+        detail: `${this.#effectiveTimeoutMs}ms exceeded (elapsed: ${elapsed}ms)`,
+      };
+    }
+
     // P1: tracker exit (manages its own iteration/grace logic)
     if (this.#tracker) {
       this.#tracker.tick();
@@ -129,14 +140,13 @@ export class ExitController {
       }
     }
 
-    // P2: stage budget timeout (unified — eliminates triple timeout)
-    const elapsed = Date.now() - this.#loopStartTime;
-    if (this.#effectiveTimeoutMs > 0 && elapsed > this.#effectiveTimeoutMs) {
+    // 无 tracker 时也必须执行本 loop 的上限；工具选择违规和重试路径未必经过 post-tool gate。
+    if (!this.#tracker && ctx.iteration > this.#maxIterations) {
       return {
         action: 'exit',
-        reason: 'stage_timeout',
-        needsSummary: false,
-        detail: `${this.#effectiveTimeoutMs}ms exceeded (elapsed: ${elapsed}ms)`,
+        reason: 'iteration_exhausted',
+        needsSummary: true,
+        detail: `completed ${ctx.iteration - 1} rounds; maxIterations=${this.#maxIterations}`,
       };
     }
 

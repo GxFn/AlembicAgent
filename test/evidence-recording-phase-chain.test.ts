@@ -5,16 +5,27 @@ import {
   buildAnalysisArtifact,
   insightGateEvaluator,
 } from '../src/agent/evaluation/index.js';
+import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { ANALYST_SYSTEM_PROMPT } from '../src/agent/prompts/insightAnalyst.js';
 import { buildRecordRepairPrompt } from '../src/agent/prompts/insightGate.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
-import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import {
+  AgentRuntime,
+  buildLlmInputAssembly,
   buildPcvQualityGateEvidence,
+  createMessageAdapter,
   createToolPipeline,
   DiagnosticsCollector,
+  LoopContext,
 } from '../src/agent/runtime/index.js';
+import {
+  recordPcvInputAssembly,
+  recordPcvToolResult,
+} from '../src/agent/runtime/PcvNodeEvidenceRecorder.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
+import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 const MISSING_FINDINGS = 'Required note_finding calls are missing';
 const INSUFFICIENT_FINDINGS = 'At least 3 note_finding calls are required';
@@ -828,5 +839,190 @@ describe('analyst phase-chain state gating', () => {
     expect(allowedGraph.metadata.blocked).toBe(false);
     expect(allowedFinding.metadata.blocked).toBe(false);
     expect(executeCount).toBe(3);
+  });
+});
+
+function createLoop() {
+  const messages = createMessageAdapter(null);
+  messages.appendUserMessage('review code');
+  return new LoopContext({
+    messages,
+    capabilities: [],
+    baseSystemPrompt: 'review',
+    allowedToolIds: ['memory'],
+    toolSchemas: [],
+    source: 'system',
+    budget: { maxIterations: 1 },
+    prompt: 'review code',
+    context: { pipelinePhase: 'analyze', dimensionId: 'probe' },
+  });
+}
+function recordInput(ctx: LoopContext) {
+  const assembly = buildLlmInputAssembly({
+    ctx,
+    dynamicContext: null,
+    effectiveToolChoice: 'auto',
+    messages: ctx.messages.toMessages(),
+    modelRef: 'unit:model',
+    requestedToolChoice: 'auto',
+    systemPrompt: 'review',
+    tools: [{ name: 'memory', description: 'memory' }],
+  });
+  recordPcvInputAssembly(ctx.pcvNodeEvidence, assembly, { iteration: 1, modelRef: 'unit:model' });
+}
+
+describe('runtime evidence facts and snapshots', () => {
+  it('preserves real ledger source links on modern note_finding', async () => {
+    const dataRoot = createTempProject('runtime-evidence-');
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'job',
+      sessionId: 'session',
+      dimensionId: 'probe',
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'read',
+      file: 'src/widget.ts',
+      range: { start: 10, end: 12 },
+      content: 'a\nb\nc',
+    });
+    const memory = new MemoryCoordinator({ mode: 'bootstrap' });
+    const active = memory.createDimensionScope('probe');
+    const args = {
+      action: 'note_finding',
+      params: {
+        finding: 'The handler owns the boundary',
+        evidenceRefs: ['E-1@11-12'],
+        importance: 8,
+      },
+    };
+    const result = await handleMemory('note_finding', args.params, {
+      runtime: { evidenceLedger: ledger, dimensionScopeId: 'probe' },
+      memoryCoordinator: memory,
+    } as never);
+    expect(result.ok).toBe(true);
+    expect(active.distill().keyFindings[0].evidence).toContain('src/widget.ts:11-12');
+    const ctx = createLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      { id: 'note', name: 'memory', args },
+      result.data,
+      undefined,
+      { toolSucceeded: result.ok, evidenceLedger: ledger }
+    );
+    expect(ctx.pcvNodeEvidence.findingRefs.accepted[0].sourceRefs).toContain('src/widget.ts:11-12');
+  });
+
+  it('returns owned PCV snapshots', () => {
+    const ctx = createLoop();
+    recordInput(ctx);
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      {
+        id: 'note',
+        name: 'note_finding',
+        args: { finding: 'boundary', evidence: 'src/widget.ts:11', importance: 8 },
+      },
+      { recorded: true, target: 'activeContext' },
+      undefined,
+      { toolSucceeded: true }
+    );
+    const expected = structuredClone(ctx.pcvNodeEvidence);
+    const result = ctx.buildResult();
+    if (!result.pcvNodeEvidence.inputAssembly) {
+      throw new Error('Fixture must record input assembly');
+    }
+    result.pcvNodeEvidence.inputAssembly.toolSchemaNames.push('invented');
+    result.pcvNodeEvidence.findingRefs.accepted[0].evidence.push('invented source');
+    expect(ctx.pcvNodeEvidence).toEqual(expected);
+  });
+
+  it('recomputes missing links after real quality artifact supplied findings', () => {
+    const ctx = createLoop();
+    const initial = ctx.buildResult();
+    expect(initial.pcvNodeEvidence.missingLinkReasons).toContain('missing-finding-refs');
+    const quality = buildPcvQualityGateEvidence({
+      source: initial,
+      artifact: {
+        findings: [{ finding: 'bounded owner', evidence: 'src/widget.ts:11', importance: 8 }],
+        referencedFiles: ['src/widget.ts:11'],
+      },
+      gate: { pass: true, action: 'pass' },
+    });
+    expect(quality.missingLinkReasons).not.toContain('missing-finding-refs');
+    expect(quality.missingLinkReasons).not.toContain('missing-source-refs');
+  });
+
+  it('does not call a blocked tool evidence-produced', async () => {
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [
+          { id: 'read', name: 'code', args: { action: 'read', params: { path: 'src/widget.ts' } } },
+        ],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      })
+      .mockResolvedValue({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const execute = vi.fn(async () => ({
+      ok: false,
+      toolId: 'code',
+      callId: 'read',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      status: 'blocked',
+      text: 'read denied',
+      structuredContent: { error: 'read denied' },
+      diagnostics: {
+        degraded: false,
+        fallbackUsed: false,
+        warnings: [],
+        timedOutStages: [],
+        blockedTools: [],
+        truncatedToolCalls: 0,
+        emptyResponses: 0,
+        aiErrorCount: 0,
+        gateFailures: [],
+      },
+      trust: {
+        source: 'internal',
+        sanitized: true,
+        containsUntrustedText: false,
+        containsSecrets: false,
+      },
+    }));
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit', model: 'model', chatWithTools },
+      toolRegistry: { getManifest: () => null },
+      toolRouter: { execute },
+      container: {
+        get: (name: string) =>
+          name === 'capabilityCatalog'
+            ? {
+                toToolSchemas: () => [
+                  { name: 'code', description: 'source', parameters: { type: 'object' } },
+                ],
+              }
+            : undefined,
+      },
+      capabilities: [],
+      additionalTools: ['code'],
+      strategy: { name: 'unused', execute: vi.fn() },
+      logger: { info: () => {}, warn: () => {} },
+    } as never);
+    const result = await runtime.reactLoop('read bounded source', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze' },
+      toolChoiceOverride: 'auto',
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.toolCalls[0].envelope.status).toBe('blocked');
+    expect(result.pcvNodeEvidence.groundingLedger[0].classification).not.toBe('evidence-produced');
   });
 });

@@ -156,7 +156,13 @@ function collectPromptBlocks(
   const minimumBlockChars = options.minimumBlockChars ?? DEFAULT_MINIMUM_BLOCK_CHARS;
   const blocks: PromptBlockOccurrence[] = [];
   for (const item of items) {
-    const candidates = [...item.text.split(/\n{2,}/), ...item.text.split('\n')];
+    // 每个物理片段只计一次，避免单行同时以 paragraph 与 line 身份重复入账。
+    const candidates = item.text.split(/\n{2,}/).flatMap((paragraph) => {
+      const lines = paragraph.split('\n');
+      return lines.some((line) => normalizePromptBlock(line).length >= minimumBlockChars)
+        ? lines
+        : [paragraph];
+    });
     for (const candidate of candidates) {
       const normalized = normalizePromptBlock(candidate);
       if (normalized.length >= minimumBlockChars) {

@@ -151,7 +151,7 @@ export class SystemPromptBuilder {
         prompt +
         `\n\n## Producer 轮次预算\n- 总轮次: **${maxIter} 轮**\n` +
         `- 候选提交阶段: 优先把 Analyst 已确认发现转成 knowledge 提交\n` +
-        `- 证据补齐阶段: 只读取 Analyst 已引用的文件片段，禁止新增搜索、结构化探索或终端验证\n` +
+        `- 证据补齐阶段: 仅通过 evidence 工具检索 Analyst 已记录的证据，禁止读取源文件、新增搜索、结构化探索或终端验证\n` +
         `- 总结阶段: 停止工具调用，输出提交结果和未提交原因\n\n` +
         `Producer 不继承 Analyst 的探索/验证预算；不要启动新的项目扫描。`
       );

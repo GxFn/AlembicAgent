@@ -138,6 +138,7 @@ function projectMessagesForStage(
 
 function collapseProducerSubmitToolRounds(messages: UnifiedMessage[]): UnifiedMessage[] {
   const projected: UnifiedMessage[] = [];
+  const summaries = new Set<UnifiedMessage>();
   for (let i = 0; i < messages.length; ) {
     const message = messages[i];
     const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
@@ -159,11 +160,20 @@ function collapseProducerSubmitToolRounds(messages: UnifiedMessage[]): UnifiedMe
         next++;
       }
 
-      if (toolResults.length === submitCalls.length) {
-        projected.push({
+      // 每个请求 id 必须恰好有一条回执；重复 A 不能替代缺失的 B。
+      const resultIds = new Set(toolResults.map((result) => result.toolCallId));
+      if (
+        submitCalls.every((call) => typeof call.id === 'string' && call.id.trim().length > 0) &&
+        toolCallIds.size === submitCalls.length &&
+        resultIds.size === submitCalls.length &&
+        toolResults.length === submitCalls.length
+      ) {
+        const summary: UnifiedMessage = {
           role: 'user',
           content: formatProducerSubmitHistorySummary(submitCalls, toolResults),
-        });
+        };
+        summaries.add(summary);
+        projected.push(summary);
         i = next;
         continue;
       }
@@ -172,18 +182,22 @@ function collapseProducerSubmitToolRounds(messages: UnifiedMessage[]): UnifiedMe
     projected.push(message);
     i++;
   }
-  return mergeAdjacentProducerSubmitSummaries(projected);
+  return mergeAdjacentProducerSubmitSummaries(projected, summaries);
 }
 
-function mergeAdjacentProducerSubmitSummaries(messages: UnifiedMessage[]): UnifiedMessage[] {
+function mergeAdjacentProducerSubmitSummaries(
+  messages: UnifiedMessage[],
+  summaries: Set<UnifiedMessage>
+): UnifiedMessage[] {
   const merged: UnifiedMessage[] = [];
   for (const message of messages) {
     const previous = merged[merged.length - 1];
     if (
       previous?.role === 'user' &&
       message.role === 'user' &&
-      String(previous.content || '').startsWith('[[Producer submit history]]') &&
-      String(message.content || '').startsWith('[[Producer submit history]]')
+      // 只合并本次生成的摘要，用户粘贴相同标记仍是原始输入，不能识别成内部可写对象。
+      summaries.has(previous) &&
+      summaries.has(message)
     ) {
       previous.content = `${previous.content}\n${String(message.content || '')
         .split('\n')
@@ -613,24 +627,12 @@ function compactRepeatedBlocks(text: string, seenBlocks: Set<string>): string {
 }
 
 function hasSeenCompactionBlock(key: string, seenBlocks: Set<string>): boolean {
-  if (seenBlocks.has(key)) {
-    return true;
-  }
-  for (const seen of seenBlocks) {
-    if (key.includes(seen) || seen.includes(key)) {
-      return true;
-    }
-  }
-  return false;
+  return seenBlocks.has(key);
 }
 
 function normalizeCompactionBlock(text: string): string | null {
-  const normalized = text
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n+/g, '\n')
-    .trim()
-    .toLowerCase();
-  return normalized.length >= 48 ? normalized : null;
+  // 代码/路径的大小写、缩进和后续限定语都可能改变语义；仅去除逐字重复的完整行。
+  return text.trim().length >= 48 ? text : null;
 }
 
 function formatProviderInputLayer(sections: LLMInputSection[]): string | null {

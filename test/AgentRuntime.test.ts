@@ -5,8 +5,10 @@ import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
+import { produceForcedSummary } from '../src/agent/runtime/forcedSummary.js';
 import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
+import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
 function createRuntimeForReactLoop() {
   const chatWithTools = vi.fn(async () => ({
@@ -70,6 +72,153 @@ function createToolEnvelope(
     },
   };
 }
+
+describe('runtime loop boundaries', () => {
+  it('stops a provider that repeatedly ignores toolChoice none within the loop budget', async () => {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    chatWithTools.mockImplementation(
+      async () =>
+        ({
+          text: chatWithTools.mock.calls.length > 5 ? 'provider eventually stopped' : '',
+          functionCalls:
+            chatWithTools.mock.calls.length > 5
+              ? []
+              : [{ id: 'ignored', name: 'meta', args: { action: 'tools' } }],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        }) as never
+    );
+
+    const result = await runtime.reactLoop('finish without tools', {
+      budgetOverride: { maxIterations: 2 },
+    });
+
+    expect(chatWithTools).toHaveBeenCalledTimes(2);
+    expect(result.toolCalls).toEqual([]);
+    expect(result.diagnostics?.warnings).toContainEqual(
+      expect.objectContaining({ code: 'iteration_exhausted' })
+    );
+  });
+
+  it('prioritizes elapsed deadlines over loop exhaustion without starting a summary', async () => {
+    vi.useFakeTimers();
+    try {
+      const { runtime, chatWithTools } = createRuntimeForReactLoop();
+      chatWithTools.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 100);
+        return {
+          text: '',
+          functionCalls: [{ id: 'ignored', name: 'meta', args: { action: 'tools' } }],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        } as never;
+      });
+      const result = await runtime.reactLoop('stop at deadline', {
+        source: 'system',
+        budgetOverride: { maxIterations: 1, timeoutMs: 10 },
+      });
+      expect(chatWithTools).toHaveBeenCalledOnce();
+      expect(result.reply).toContain('stage_timeout');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['empty', 'error'])('cancels the %s-response retry delay immediately', async (kind) => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    chatWithTools.mockImplementation(async () => {
+      if (kind === 'error') {
+        throw new Error('temporary provider failure');
+      }
+      return { text: '', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    let settled = false;
+    const pending = runtime
+      .reactLoop('cancel during retry', {
+        source: 'system',
+        abortSignal: controller.signal,
+      })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    try {
+      for (let i = 0; i < 30; i++) {
+        await Promise.resolve();
+      }
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      controller.abort(new Error('cancel retry'));
+      for (let i = 0; i < 30; i++) {
+        await Promise.resolve();
+      }
+      expect(settled).toBe(true);
+      expect((await pending).reply).toContain('abort_signal');
+      expect(chatWithTools).toHaveBeenCalledOnce();
+    } finally {
+      controller.abort();
+      await vi.runAllTimersAsync();
+      await pending;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    'error',
+    'empty',
+    'cancelled',
+  ])('preserves tool receipts when the final summary is %s', async (kind) => {
+    const controller = new AbortController();
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: '',
+        functionCalls: [{ id: 'confirmed', name: 'meta', args: { action: 'tools' } }],
+        usage: { inputTokens: 3, outputTokens: 2 },
+      })
+      .mockImplementation(async () => {
+        if (kind === 'error') {
+          throw new Error('summary unavailable');
+        }
+        if (kind === 'cancelled') {
+          controller.abort();
+        }
+        return {
+          text: kind === 'cancelled' ? 'late success' : '',
+          functionCalls: [],
+          usage: { inputTokens: 5, outputTokens: 4, reasoningTokens: 2, cacheHitTokens: 1 },
+        };
+      });
+    const execute = vi.fn(async () =>
+      createToolEnvelope('meta', 'confirmed result', { observed: true })
+    );
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools: chat } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: { get: () => new RuntimeCapabilityCatalog() },
+      additionalTools: ['meta'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+
+    const result = await runtime.reactLoop('inspect metadata', {
+      budgetOverride: { maxIterations: 1, maxTokens: 128 },
+      abortSignal: controller.signal,
+    });
+    expect(result.toolCalls).toMatchObject([{ tool: 'meta', result: { observed: true } }]);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(chat.mock.calls[1][1].maxTokens).toBe(128);
+    expect(JSON.stringify(chat.mock.calls[1])).toContain('confirmed result');
+    expect(result.reply).toBeTruthy();
+    expect(result.reply).not.toContain('late success');
+    if (kind === 'cancelled') {
+      expect(result.reply).toContain('abort_signal');
+    }
+    if (kind !== 'error') {
+      expect(result.tokenUsage).toMatchObject({ input: 8, output: 6, reasoning: 2, cacheHit: 1 });
+    }
+  });
+});
 
 describe('agent runtime forced summary suppression', () => {
   it('uses the production ledger authority coordinate gate for dimension runs', async () => {
@@ -983,5 +1132,135 @@ describe('agent runtime forced summary suppression', () => {
         process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION = originalEnableL4;
       }
     }
+  });
+});
+
+function receipt(
+  status: ToolResultEnvelope['status'],
+  text: string,
+  ok = true
+): ToolResultEnvelope {
+  return {
+    ok,
+    toolId: 'code',
+    callId: 'call',
+    startedAt: new Date().toISOString(),
+    durationMs: 1,
+    status,
+    text,
+    structuredContent: { text },
+    diagnostics: {
+      degraded: false,
+      fallbackUsed: false,
+      warnings: [],
+      timedOutStages: [],
+      blockedTools: [],
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: 0,
+      gateFailures: [],
+    },
+    trust: {
+      source: 'internal',
+      sanitized: true,
+      containsUntrustedText: false,
+      containsSecrets: false,
+    },
+  };
+}
+async function capture(toolCalls: Parameters<typeof produceForcedSummary>[0]['toolCalls']) {
+  const chat = vi.fn().mockResolvedValue({ text: 'summary', functionCalls: [] });
+  const result = await produceForcedSummary({
+    aiProvider: { chatWithTools: chat } as never,
+    toolCalls,
+    prompt: 'Report observed facts',
+    source: 'system',
+    tracker: { pipelineType: 'analyst' },
+  });
+  return { input: JSON.stringify(chat.mock.calls[0]), result };
+}
+describe('R05 final summary receipt boundaries', () => {
+  it.each([
+    { status: 'partial' as const, ok: true },
+    { status: 'blocked' as const, ok: false },
+    { status: 'timeout' as const, ok: false },
+    { status: 'success' as const, ok: true },
+  ])('keeps $status receipt status and actual body', async ({ status, ok }) => {
+    const { input } = await capture([
+      {
+        tool: 'code',
+        args: { action: 'read', params: { filePaths: ['src/a.ts'] } },
+        envelope: receipt(status, `ACTUAL_${status}_BODY`, ok),
+      },
+    ]);
+    expect(input).toContain(`status=${status}`);
+    expect(input).toContain(`ACTUAL_${status}_BODY`);
+  });
+  it('preserves a short confirmed receipt when request arguments are large', async () => {
+    const { input } = await capture([
+      {
+        tool: 'code',
+        args: { action: 'write', params: { path: 'src/a.ts', content: 'x'.repeat(5000) } },
+        envelope: receipt('success', 'CONFIRMED_WRITE_RECEIPT id=write-42 bytes=5000'),
+      },
+    ]);
+    expect(input).toContain('CONFIRMED_WRITE_RECEIPT');
+  });
+  it('keeps the final accepted finding after many large exploratory receipts', async () => {
+    const calls = Array.from({ length: 31 }, (_, i) => ({
+      tool: 'code',
+      args: { action: 'read', params: { filePaths: [`src/a${i}.ts`] } },
+      envelope: receipt('success', `code result ${'.'.repeat(4000)}`),
+    }));
+    calls.push({
+      tool: 'memory',
+      args: {
+        action: 'note_finding',
+        params: { finding: 'FINAL_VERIFIED_FINDING', evidenceRefs: ['E-31'], importance: 8 },
+      },
+      envelope: {
+        ...receipt('success', 'recorded:true,target:activeContext'),
+        toolId: 'memory',
+        structuredContent: { recorded: true, target: 'activeContext' },
+      },
+    } as never);
+    const { input } = await capture(calls);
+    expect(input).toContain('FINAL_VERIFIED_FINDING');
+  });
+});
+
+it('records confirmed evidence before cancellation ends the rest of a tool batch', async () => {
+  const controller = new AbortController();
+  const chatWithTools = vi.fn().mockResolvedValue({
+    text: '',
+    functionCalls: [
+      { id: 'first', name: 'code', args: { action: 'read', params: { filePaths: ['src/a.ts'] } } },
+      { id: 'second', name: 'code', args: { action: 'read', params: { filePaths: ['src/b.ts'] } } },
+    ],
+    usage: { inputTokens: 1, outputTokens: 1 },
+  });
+  const execute = vi.fn(async () => receipt('success', 'ACTUAL_BEFORE_CANCEL'));
+  const runtime = new AgentRuntime({
+    aiProvider: { name: 'unit', model: 'test', chatWithTools },
+    toolRegistry: { getManifest: () => null },
+    toolRouter: { execute },
+    container: { get: () => new RuntimeCapabilityCatalog() },
+    additionalTools: ['code'],
+    strategy: { name: 'unused', execute: vi.fn() },
+  } as never);
+  const result = await runtime.reactLoop('inspect', {
+    source: 'system',
+    context: { pipelinePhase: 'analyze' },
+    budgetOverride: { maxIterations: 2 },
+    abortSignal: controller.signal,
+    onToolCall: () => controller.abort(),
+  });
+  expect(execute).toHaveBeenCalledOnce();
+  expect(result.toolCalls).toHaveLength(1);
+  expect(result.reply).toContain('abort_signal');
+  expect(result.pcvNodeEvidence.groundingLedger[0]).toMatchObject({
+    classification: 'evidence-produced',
+    evidenceToolCallDelta: 1,
+    toolCallDelta: 1,
   });
 });

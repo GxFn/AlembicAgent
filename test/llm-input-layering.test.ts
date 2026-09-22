@@ -20,6 +20,7 @@ import {
   type ProgressEvent,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
+import type { UnifiedMessage } from '../src/ai/contracts.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
@@ -1195,5 +1196,185 @@ describe('bounded Analyst memory assembly', () => {
         null
       )
     ).resolves.toContain('分析项目 fixture');
+  });
+});
+
+function assembly(messages: UnifiedMessage[], dynamicContext: string | null = null) {
+  return buildLlmInputAssembly({
+    ctx: {
+      tracker: { phase: 'PRODUCE', pipelineType: 'producer' },
+      context: { pipelinePhase: 'produce' },
+      sharedState: {},
+      source: 'system',
+      prompt: 'produce',
+      iteration: 1,
+      maxIterations: 2,
+      toolCalls: [],
+    } as never,
+    dynamicContext,
+    effectiveToolChoice: 'auto',
+    messages,
+    modelRef: 'fixture',
+    requestedToolChoice: 'auto',
+    systemPrompt: 'fixture identity',
+    tools: [{ name: 'knowledge', parameters: { type: 'object' } }],
+  });
+}
+
+describe('input preservation and transcript ownership', () => {
+  it('retains a distinct longer evidence finding through the actual reactLoop provider input', async () => {
+    const base = 'The payment service retries a failed request after one second.';
+    const extended = `${base} However, authorization failures must never be retried.`;
+    let captured: UnifiedMessage[] = [];
+    const provider = {
+      name: 'fixture',
+      model: 'fixture',
+      chatWithTools: vi.fn(async (_prompt: string, opts: { messages: UnifiedMessage[] }) => {
+        captured = opts.messages;
+        return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
+      }),
+    };
+    const tracker = {
+      phase: 'SCAN',
+      pipelineType: 'analyst',
+      isGracefulExit: false,
+      isHardExit: false,
+      iteration: 0,
+      totalSubmits: 0,
+      tick: vi.fn(),
+      shouldExit: () => false,
+      getNudge: () => null,
+      getPhaseContext: () => `${base}\n\n${extended}`,
+      getToolChoice: () => 'none',
+      getMetrics: () => ({ phase: 'SCAN', evidenceToolCallCount: 0, memoryFindingCount: 0 }),
+      getPlanProgress: () => ({ coveredSteps: 0, totalSteps: 0 }),
+      endRound: () => null,
+      onTextResponse: () => ({
+        isFinalAnswer: true,
+        needsDigestNudge: false,
+        shouldContinue: false,
+        nudge: null,
+      }),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: provider as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    await runtime.reactLoop('analyze payment behavior', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze' },
+      tracker,
+      systemPromptOverride: 'fixture identity',
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    expect(provider.chatWithTools).toHaveBeenCalledOnce();
+    expect(captured.at(-1)?.content).toContain(extended);
+  });
+
+  it('does not count one physical text block as duplicate', () => {
+    const measured = measurePromptText(
+      'A unique payment service boundary owns invoice transitions and retry limits.'
+    );
+    expect(measured.duplicateBlocks).toEqual([]);
+    expect(measured.duplicateBlockRatio).toBe(0);
+  });
+
+  it('does not collapse a result set whose IDs do not match all requested calls', () => {
+    const messages: UnifiedMessage[] = [
+      {
+        role: 'assistant',
+        content: null,
+        toolCalls: ['a', 'b'].map((id) => ({
+          id,
+          name: 'knowledge',
+          args: { action: 'submit', params: { title: id } },
+        })),
+      },
+      {
+        role: 'tool',
+        name: 'knowledge',
+        toolCallId: 'a',
+        content: '{"status":"created","id":"actual-a"}',
+      },
+      {
+        role: 'tool',
+        name: 'knowledge',
+        toolCallId: 'a',
+        content: 'second result wrongly reuses a',
+      },
+    ];
+    const output = assembly(messages);
+    expect(output.messages).toEqual(messages);
+  });
+
+  it('does not mutate caller-owned marked user history during producer summary merging', () => {
+    const messages: UnifiedMessage[] = [
+      {
+        role: 'user',
+        content: '[[Producer submit history]]\nUser pasted a prior summary.\nPreserve this input.',
+      },
+      {
+        role: 'assistant',
+        content: null,
+        toolCalls: [
+          { id: 'a', name: 'knowledge', args: { action: 'submit', params: { title: 'a' } } },
+        ],
+      },
+      {
+        role: 'tool',
+        name: 'knowledge',
+        toolCallId: 'a',
+        content: '{"status":"created","id":"actual-a"}',
+      },
+    ];
+    const before = structuredClone(messages);
+    assembly(messages);
+    expect(messages).toEqual(before);
+  });
+});
+
+function round(id: string): UnifiedMessage[] {
+  return [
+    {
+      role: 'assistant',
+      content: null,
+      toolCalls: [{ id, name: 'knowledge', args: { action: 'submit', params: { title: 'a' } } }],
+    },
+    {
+      role: 'tool',
+      name: 'knowledge',
+      toolCallId: id,
+      content: '{"status":"created","id":"confirmed"}',
+    },
+  ];
+}
+
+describe('input text and receipt identity', () => {
+  it('keeps case/indent-distinct and enriched full lines', () => {
+    const statement =
+      'export const UserRole = "admin"; // module contract owns current user identity';
+    const text = [
+      statement,
+      statement.toLowerCase(),
+      `  ${statement}`,
+      `${statement} // extra requirement`,
+    ].join('\n');
+    const section = assembly([], text).sections.find((section) => section.id === 'dynamicContext');
+    expect(section?.content).toBe(text);
+  });
+  it('counts physical duplicates once each', () => {
+    const text =
+      'The payment domain records confirmed transaction facts with exact receipt identity.';
+    expect(measurePromptText(text).duplicateBlocks).toHaveLength(0);
+    expect(measurePromptText(`${text}\n\n${text}`).duplicateBlocks).toMatchObject([
+      { occurrences: 2 },
+    ]);
+  });
+  it.each(['', '   '])('keeps invalid receipt IDs raw: %j', (id) => {
+    const messages = round(id);
+    expect(assembly(messages).messages).toEqual(messages);
   });
 });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
+import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
 
@@ -447,9 +448,6 @@ export function recordPcvLlmOutput(
   const functionCallNames = functionCalls
     .map((call) => stringValue(call.name))
     .filter((name): name is string => Boolean(name));
-  const evidenceFunctionCallCount = functionCalls.filter((call) =>
-    isEvidenceFunctionCall(call.name || '', call.args || {})
-  ).length;
 
   entry.textOutputChars = text.length;
   entry.reasoningTokens = Math.max(0, Number(options.reasoningTokens || 0));
@@ -461,7 +459,6 @@ export function recordPcvLlmOutput(
   // outputSourceRefs 只作为后续审计材料，不作为 grounding 成功指标。
   // 之前 AI 把 sourceRefDelta 当成阶段进展，导致 sourceRef 伪指标反复扩张和重大资源浪费。
   entry.classification = classifyGroundingEntry(entry, {
-    evidenceFunctionCallCount,
     hasFunctionCalls: functionCalls.length > 0,
   });
   return entry;
@@ -485,7 +482,6 @@ export function recordPcvToolRoundOutcome(
   entry.acceptedFindingDelta += options.acceptedFindingDelta || 0;
   entry.rejectedFindingDelta += options.rejectedFindingDelta || 0;
   entry.classification = classifyGroundingEntry(entry, {
-    evidenceFunctionCallCount: entry.evidenceToolCallDelta,
     hasFunctionCalls: entry.toolCallDelta > 0 || entry.functionCallNames.length > 0,
   });
   return entry;
@@ -502,7 +498,10 @@ export function recordPcvToolResult(
   call: FunctionCallLike,
   result: unknown,
   envelope: ToolResultEnvelope | undefined,
-  options: { toolSucceeded?: boolean } = {}
+  options: {
+    toolSucceeded?: boolean;
+    evidenceLedger?: Pick<EvidenceLedgerStore, 'get'> | null;
+  } = {}
 ): void {
   const toolName = call.name || 'unknown';
   const callId = call.id || null;
@@ -525,7 +524,19 @@ export function recordPcvToolResult(
 
   const params = getNoteFindingParams(call);
   const finding = stringValue(params.finding) || '';
-  const evidenceText = stringValue(params.evidence) || '';
+  // 当前工具以 ledger id 传引用；旧文本仅为兼容回执保留，不参与引用校验。
+  const refs = stringArray(params.evidenceRefs);
+  const evidenceText =
+    refs.length > 0
+      ? refs
+          .map((ref) => {
+            const entry = options.toolSucceeded !== false ? options.evidenceLedger?.get(ref) : null;
+            return entry?.file
+              ? `${ref}=${entry.file}${entry.range ? `:${entry.range.start}-${entry.range.end}` : ''}`
+              : ref;
+          })
+          .join('; ')
+      : stringValue(params.evidence) || '';
   const importance = numberValue(params.importance);
   const resultRecord = asRecord(result);
   const toolSucceeded =
@@ -1064,7 +1075,18 @@ function buildMissingLinkReasons(
   if (options.requireQualityGate === true && !summary.qualityGate) {
     reasons.push('missing-quality-gate-status');
   }
-  return uniqueStrings([...summary.missingLinkReasons, ...reasons]);
+  // 这些缺失项是当前快照的派生事实；后续 QualityGate 补齐后应消失。
+  const derived = new Set([
+    'missing-input-assembly-ref',
+    'missing-observation-ledger-ref',
+    'missing-finding-refs',
+    'missing-source-refs',
+    'missing-quality-gate-status',
+  ]);
+  return uniqueStrings([
+    ...summary.missingLinkReasons.filter((reason) => !derived.has(reason)),
+    ...reasons,
+  ]);
 }
 
 function pushUniqueAcceptedFinding(
@@ -1363,7 +1385,7 @@ function getLatestGroundingEntry(
 
 function classifyGroundingEntry(
   entry: PcvBurnGroundingLedgerEntry,
-  options: { evidenceFunctionCallCount: number; hasFunctionCalls: boolean }
+  options: { hasFunctionCalls: boolean }
 ): PcvBurnGroundingClassification {
   const phase = (entry.trackerPhase || '').toUpperCase();
   if (entry.stageProfile === 'summarize') {
@@ -1374,11 +1396,7 @@ function classifyGroundingEntry(
       ? 'record-only'
       : 'invalid-no-evidence';
   }
-  if (
-    entry.evidenceToolCallDelta > 0 ||
-    options.evidenceFunctionCallCount > 0 ||
-    entry.toolCallDelta > 0
-  ) {
+  if (entry.evidenceToolCallDelta > 0) {
     return 'evidence-produced';
   }
   if (entry.consumedEvidenceRefs.length > 0) {
@@ -1393,7 +1411,7 @@ function classifyGroundingEntry(
   if (entry.stageProfile === 'analyze') {
     return 'invalid-no-evidence';
   }
-  return options.hasFunctionCalls ? 'evidence-produced' : 'summary-only';
+  return options.hasFunctionCalls ? 'planning-only' : 'summary-only';
 }
 
 function collectConsumedEvidenceRefs(text: string, refs: string[]): string[] {
@@ -1410,17 +1428,6 @@ function collectConsumedEvidenceRefs(text: string, refs: string[]): string[] {
     const pathOnly = lower.replace(/:\d+(?:-\d+)?$/u, '');
     return normalizedText.includes(lower) || normalizedText.includes(pathOnly);
   });
-}
-
-function isEvidenceFunctionCall(toolName: string, args: JsonRecord): boolean {
-  const action = stringValue(args.action) || stringValue(asRecord(args.params).action);
-  if (toolName === 'code') {
-    return ['structure', 'search', 'read', 'outline'].includes(action || '');
-  }
-  if (toolName === 'graph') {
-    return ['overview', 'query'].includes(action || '');
-  }
-  return toolName === 'terminal';
 }
 
 function collectSourceRefs(
@@ -1536,8 +1543,16 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
     ...evidence,
     correlation: { ...evidence.correlation },
     findingRefs: {
-      accepted: evidence.findingRefs.accepted.map((finding) => ({ ...finding })),
-      rejected: evidence.findingRefs.rejected.map((finding) => ({ ...finding })),
+      accepted: evidence.findingRefs.accepted.map((finding) => ({
+        ...finding,
+        evidence: [...finding.evidence],
+        sourceRefs: [...finding.sourceRefs],
+      })),
+      rejected: evidence.findingRefs.rejected.map((finding) => ({
+        ...finding,
+        ...(finding.evidence ? { evidence: [...finding.evidence] } : {}),
+        ...(finding.sourceRefs ? { sourceRefs: [...finding.sourceRefs] } : {}),
+      })),
     },
     groundingLedger: (evidence.groundingLedger || []).map((entry) => ({
       ...entry,
@@ -1548,10 +1563,18 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
       outputSourceRefs: [...entry.outputSourceRefs],
       toolSchemaNames: [...entry.toolSchemaNames],
     })),
-    inputAssembly: evidence.inputAssembly ? { ...evidence.inputAssembly } : null,
+    inputAssembly: evidence.inputAssembly
+      ? {
+          ...evidence.inputAssembly,
+          inputSectionIds: [...evidence.inputAssembly.inputSectionIds],
+          providerVisibleSectionIds: [...evidence.inputAssembly.providerVisibleSectionIds],
+          staticSectionIds: [...evidence.inputAssembly.staticSectionIds],
+          toolSchemaNames: [...evidence.inputAssembly.toolSchemaNames],
+        }
+      : null,
     ledgerRefs: evidence.ledgerRefs.map((ledger) => ({
       ...ledger,
-      ...(ledger.stats ? { stats: { ...ledger.stats } } : {}),
+      ...(ledger.stats ? { stats: sanitizeStats(ledger.stats) } : {}),
     })),
     missingLinkReasons: [...(evidence.missingLinkReasons || [])],
     qualityGate: evidence.qualityGate
@@ -1564,7 +1587,9 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
         }
       : null,
     repair: { ...evidence.repair, evidencePaths: [...evidence.repair.evidencePaths] },
-    sourceRefDiagnostics: [...(evidence.sourceRefDiagnostics || [])],
+    sourceRefDiagnostics: (evidence.sourceRefDiagnostics || []).map((diagnostic) => ({
+      ...diagnostic,
+    })),
     sourceRefs: [...evidence.sourceRefs],
     stageIdentity: { ...evidence.stageIdentity },
   };

@@ -1,4 +1,4 @@
-import { isPersistedSubmission } from '../utils/toolOutcomes.js';
+import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcomes.js';
 /**
  * AgentRuntime — 统一 Agent 执行引擎 (The Brain)
  *
@@ -31,6 +31,7 @@ import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import Logger from '@alembic/core/logging';
 import {
   isTextCompatToolCallId,
@@ -595,7 +596,7 @@ export class AgentRuntime {
 
       // 分支: 有 Tool Call
       if ((llmResult.functionCalls?.length ?? 0) > 0) {
-        const exitAfterTools = await this.#processToolCalls(ctx, llmResult, effectiveSystemPrompt);
+        const exitAfterTools = await this.#processToolCalls(ctx, llmResult);
         this.#hookSystem.emitSync('agent:iteration:after', {
           iteration: ctx.iteration,
           hadToolCalls: true,
@@ -867,29 +868,6 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] ExitController: ${signal.reason} (graceful) — ${signal.detail || ''}`
         );
-      }
-    } else {
-      // Legacy fallback (no ExitController — should not happen in normal flow)
-      if (ctx.abortSignal?.aborted) {
-        return true;
-      }
-      if (ctx.tracker) {
-        ctx.tracker.tick();
-        if (ctx.tracker.shouldExit()) {
-          return true;
-        }
-      }
-      if (ctx.budget?.timeoutMs && Date.now() - ctx.loopStartTime > ctx.budget.timeoutMs) {
-        return true;
-      }
-      const duringCheck = this.policies.validateDuring({
-        iteration: ctx.tracker ? 0 : ctx.iteration,
-        startTime: ctx.loopStartTime,
-        totalTokens: this.tokenUsage.input + this.tokenUsage.output,
-        totalInputTokens: this.tokenUsage.input,
-      });
-      if (!duringCheck.ok) {
-        return true;
       }
     }
 
@@ -1334,40 +1312,21 @@ export class AgentRuntime {
     // 空响应重试
     if (!llmResult.text && !llmResult.functionCalls?.length) {
       ctx.diagnostics?.recordEmptyResponse();
-      // B4 fix: SUMMARIZE 阶段也允许重试 — force_exit nudge 刚注入时 LLM 可能
-      // 需要额外一轮才能生成有效输出。与 ExplorationTracker 的 2 轮 grace 对齐，
-      // 避免 grace 机制被架空。重试次数由 tracker.phaseRounds 控制而非独立计数。
-      const isTerminal = ctx.tracker && ctx.tracker.phase === 'SUMMARIZE';
-      if (isTerminal && ctx.tracker) {
-        const phaseRounds = ctx.tracker.metrics?.phaseRounds ?? 0;
-        if (phaseRounds < 2) {
-          ctx.consecutiveEmptyResponses++;
-          ctx.diagnostics?.recordEmptyRetry();
-          this.logger.warn(
-            `[AgentRuntime] ⚠ empty response in SUMMARIZE — retrying (grace ${phaseRounds + 1}/2)`
-          );
-          // 不 rollbackTick: 让 tracker 计入 phaseRounds 以便到达 grace 上限退出
-          await new Promise((r) => setTimeout(r, 1500));
-          return continueResult() as LLMResult;
-        }
-        this.logger.warn(
-          '[AgentRuntime] ⚠ empty response in SUMMARIZE (grace exhausted) — proceeding to forced summary'
-        );
-        return null;
-      }
-      if (ctx.isSystem && ctx.consecutiveEmptyResponses < 2) {
+      const decision = ctx.exitController?.checkAfterLLM(llmResult, ctx);
+      if (decision?.action === 'retry') {
         ctx.consecutiveEmptyResponses++;
         ctx.diagnostics?.recordEmptyRetry();
-        this.logger.warn(
-          `[AgentRuntime] ⚠ empty response — retrying (${ctx.consecutiveEmptyResponses}/2)`
-        );
-        ctx.tracker?.rollbackTick?.();
-        await new Promise((r) => setTimeout(r, 1500));
-        // 返回 CONTINUE 信号 — 调用方需重走循环
-        return continueResult() as LLMResult;
+        // SUMMARIZE 的 grace 由阶段轮数推进；普通空响应才回退 tracker 轮数。
+        if (decision.reason !== 'empty_response_terminal') {
+          ctx.tracker?.rollbackTick?.();
+        }
+        this.logger.warn(`[AgentRuntime] empty response — ${decision.detail}`);
+        return (await this.#waitForRetry(ctx, 1500)) ? (continueResult() as LLMResult) : null;
       }
-      return null; // 退出
+      this.logger.warn(`[AgentRuntime] empty response — ${decision?.detail || 'retry exhausted'}`);
+      return null;
     }
+
     if (llmResult.text || llmResult.functionCalls?.length) {
       ctx.consecutiveEmptyResponses = 0;
     }
@@ -1453,17 +1412,30 @@ export class AgentRuntime {
       return null;
     }
 
-    await new Promise((r) => setTimeout(r, 2000));
-    return continueResult() as LLMResult;
+    return (await this.#waitForRetry(ctx, 2000)) ? (continueResult() as LLMResult) : null;
+  }
+
+  /** 等待属于本次循环，取消后不再占用重试期限，也不启动下一次模型请求。 */
+  async #waitForRetry(ctx: LoopContext, milliseconds: number): Promise<boolean> {
+    try {
+      await delay(milliseconds, undefined, { signal: ctx.abortSignal ?? undefined });
+      return true;
+    } catch (err: unknown) {
+      if (!ctx.abortSignal?.aborted) {
+        throw err instanceof Error ? err : new Error('Retry delay failed', { cause: err });
+      }
+      ctx.diagnostics?.recordCancelReason('abort_signal');
+      this.logger.info('[AgentRuntime] retry delay cancelled; no further model call');
+      return false;
+    }
   }
 
   /**
    * 工具调用处理 — 执行 + 记录 + 去重 + 阶段转换
    *
-   * @param effectiveSystemPrompt 用于 budget 耗尽时的摘要调用
    * @returns true = 应退出循环
    */
-  async #processToolCalls(ctx: LoopContext, llmResult: LLMResult, effectiveSystemPrompt: string) {
+  async #processToolCalls(ctx: LoopContext, llmResult: LLMResult) {
     const { tracker, trace, messages } = ctx;
 
     // 工具调用数量限制
@@ -1626,8 +1598,24 @@ export class AgentRuntime {
       }
 
       const toolResultObj = toolResult as Record<string, unknown> | null;
-      const toolSucceeded = envelope ? envelope.ok : !toolResultObj?.error;
-      recordPcvToolResult(ctx.pcvNodeEvidence, fc, toolResult, envelope, { toolSucceeded });
+      const toolSucceeded = readToolObservation(toolEntry).ok;
+      recordPcvToolResult(ctx.pcvNodeEvidence, fc, toolResult, envelope, {
+        toolSucceeded,
+        evidenceLedger: ctx.evidenceLedger,
+      });
+      // 每条回执立即入账；后续工具取消/失败不能使本轮已确认的证据消失。
+      recordPcvToolRoundOutcome(ctx.pcvNodeEvidence, {
+        acceptedFindingDelta:
+          ctx.pcvNodeEvidence.findingRefs.accepted.length - pcvBefore.acceptedFindingCount,
+        rejectedFindingDelta:
+          ctx.pcvNodeEvidence.findingRefs.rejected.length - pcvBefore.rejectedFindingCount,
+        evidenceToolCallDelta:
+          toolSucceeded && isEvidenceGroundingToolCall(fc.name, fc.args) ? 1 : 0,
+        toolCallDelta: 1,
+      });
+      pcvBefore.acceptedFindingCount = ctx.pcvNodeEvidence.findingRefs.accepted.length;
+      pcvBefore.rejectedFindingCount = ctx.pcvNodeEvidence.findingRefs.rejected.length;
+
       if (isNoteFindingFunctionCall(fc)) {
         const recorded = toolResultObj?.recorded === true;
         const target = String(toolResultObj?.target || 'unknown');
@@ -1735,17 +1723,6 @@ export class AgentRuntime {
       messages.appendToolResult(fc.id, fc.name, resultStr);
     }
 
-    recordPcvToolRoundOutcome(ctx.pcvNodeEvidence, {
-      acceptedFindingDelta:
-        ctx.pcvNodeEvidence.findingRefs.accepted.length - pcvBefore.acceptedFindingCount,
-      evidenceToolCallDelta: activeCalls.filter((call) =>
-        isEvidenceGroundingToolCall(call.name, call.args)
-      ).length,
-      rejectedFindingDelta:
-        ctx.pcvNodeEvidence.findingRefs.rejected.length - pcvBefore.rejectedFindingCount,
-      toolCallDelta: activeCalls.length,
-    });
-
     if (truncatedCalls.length > 0) {
       const truncatedNames = truncatedCalls
         .map((call) => call.name)
@@ -1816,39 +1793,10 @@ export class AgentRuntime {
 
     this.#safeTransition('step_done', stepResult);
 
-    // 检查预算 (非 tracker 模式)
-    if (!tracker && ctx.iteration >= ctx.maxIterations) {
-      const suppression = this.#getForcedSummarySuppression(ctx);
-      if (suppression) {
-        ctx.lastReply = this.#buildSuppressedSummaryReply(suppression);
-        ctx.diagnostics?.warn({
-          code: 'forced_summary_suppressed',
-          message: suppression.message,
-        });
-        return true;
-      }
-
-      const summaryMessages = messages.toMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
-      // 方案①：强制摘要也统一走 aiProvider.chatWithTools（provider 内部委托 gateway）
-      const summary: LLMResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
-        messages: summaryMessages,
-        systemPrompt: effectiveSystemPrompt,
-        toolChoice: 'none',
-        temperature: ctx.budget.temperature ?? 0.7,
-        maxTokens: ctx.budget.maxTokens ?? 4096,
-        abortSignal: ctx.abortSignal ?? undefined,
-      })) as LLMResult;
-      if (summary.usage) {
-        this.tokenUsage.input += summary.usage.inputTokens || 0;
-        this.tokenUsage.output += summary.usage.outputTokens || 0;
-        this.tokenUsage.reasoning += summary.usage.reasoningTokens || 0;
-        this.tokenUsage.cacheHit += summary.usage.cacheHitTokens || 0;
-        ctx.addTokenUsage(summary.usage);
-        ctx.diagnostics?.recordTokenUsage(summary.usage);
-      }
-      ctx.diagnostics?.recordForcedSummary();
-      ctx.lastReply = cleanFinalAnswer(summary.text || '');
-      return true; // 退出
+    // 所有强制摘要统一在 finalize 生成；此处只结束工具轮。
+    // 摘要失败/空响应不能让已确认回执丢失，也不能触发第二次摘要请求。
+    if (ctx.exitController?.checkAfterToolCalls(ctx).action === 'exit') {
+      return true;
     }
 
     this.#safeTransition('continue');
@@ -2023,10 +1971,23 @@ export class AgentRuntime {
       };
     }
 
-    if (cancelReason === 'stage_timeout' || (diagnostics?.timedOutStages?.length ?? 0) > 0) {
+    if (
+      cancelReason === 'stage_timeout' ||
+      (diagnostics?.timedOutStages?.length ?? 0) > 0 ||
+      (Number(ctx.budget.timeoutMs) > 0 &&
+        Date.now() - ctx.loopStartTime >= Number(ctx.budget.timeoutMs))
+    ) {
+      ctx.diagnostics?.recordCancelReason('stage_timeout');
       return {
         code: 'stage_timeout',
         message: 'Run reached a stage timeout before a normal summary could be produced',
+      };
+    }
+
+    if (diagnostics?.warnings.some((warning) => warning.code === LLM_INPUT_TOO_LARGE_CODE)) {
+      return {
+        code: LLM_INPUT_TOO_LARGE_CODE,
+        message: 'Provider input budget exceeded; summary request suppressed',
       };
     }
 
@@ -2099,21 +2060,34 @@ export class AgentRuntime {
           contextWindow: ctx.contextWindow,
           prompt: ctx.prompt,
           tokenUsage: this.tokenUsage,
+          systemPrompt: ctx.baseSystemPrompt,
+          maxTokens: ctx.budget.maxTokens,
+          temperature: ctx.budget.temperature,
           abortSignal: ctx.abortSignal ?? undefined,
         });
         ctx.lastReply = forcedResult.reply;
         ctx.diagnostics?.recordForcedSummary();
         if (forcedResult.tokenUsage) {
-          this.tokenUsage.input += forcedResult.tokenUsage.input || 0;
-          this.tokenUsage.output += forcedResult.tokenUsage.output || 0;
-          ctx.addTokenUsage({
-            inputTokens: forcedResult.tokenUsage.input || 0,
-            outputTokens: forcedResult.tokenUsage.output || 0,
+          const usage = {
+            inputTokens: forcedResult.tokenUsage.input,
+            outputTokens: forcedResult.tokenUsage.output,
+            reasoningTokens: forcedResult.tokenUsage.reasoning,
+            cacheHitTokens: forcedResult.tokenUsage.cacheHit,
+          };
+          requireBudgetController(ctx).recordLLMUsage(usage);
+          ctx.addTokenUsage(usage);
+          ctx.diagnostics?.recordTokenUsage(usage);
+        }
+        if (forcedResult.degraded) {
+          ctx.diagnostics?.markDegraded();
+          ctx.diagnostics?.markFallbackUsed();
+          ctx.diagnostics?.warn({
+            code: 'forced_summary_degraded',
+            message: 'Summary unavailable; confirmed tool observations retained',
           });
-          ctx.diagnostics?.recordTokenUsage({
-            inputTokens: forcedResult.tokenUsage.input || 0,
-            outputTokens: forcedResult.tokenUsage.output || 0,
-          });
+        }
+        if (ctx.abortSignal?.aborted) {
+          ctx.diagnostics?.recordCancelReason('abort_signal');
         }
       } else {
         // 兜底: 既无工具调用也无文本回复
