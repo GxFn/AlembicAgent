@@ -876,10 +876,21 @@ function createCancellation(
   } else {
     parentSignal?.addEventListener('abort', onParentAbort, { once: true });
   }
-  const timer = setTimeout(
-    () => update('timeout', new Error('semantic review timed out')),
-    timeoutMs
-  );
+  // Node 超过 2^31-1ms 会把 timer 钳成 1ms；按实际 deadline 分段等待，不能提前超时。
+  const deadline = Date.now() + timeoutMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const schedule = () => {
+    if (termination !== 'active') {
+      return;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      update('timeout', new Error('semantic review timed out'));
+      return;
+    }
+    timer = setTimeout(schedule, Math.min(remaining, 2_147_483_647));
+  };
+  schedule();
   return {
     abortSignal: controller.signal,
     termination: () => termination,
@@ -1024,7 +1035,7 @@ function isPartialFinishReason(reason: string | null | undefined): boolean {
   if (!reason) {
     return false;
   }
-  return !['stop', 'stop_sequence', 'end_turn'].includes(reason.toLowerCase());
+  return !['stop', 'stop_sequence', 'end_turn', 'completed'].includes(reason.toLowerCase());
 }
 
 function errorMessage(err: unknown): string {

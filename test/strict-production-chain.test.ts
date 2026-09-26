@@ -917,6 +917,48 @@ describe('production independent reviewers', () => {
     ],
   });
 
+  it.each([
+    'malformed-score',
+    'mixed-evidence-id',
+    'mixed-citation',
+  ])('fails closed on independent review %s', async (mutation) => {
+    const reviewer = new IndependentValueReviewer({
+      identity: { provider: 'reviewer', model: 'independent', method: 'review' },
+      chat: async () =>
+        JSON.stringify({
+          axes: [
+            'entailment',
+            'contradiction-free',
+            'project-specificity',
+            'actionability',
+            'scope-correctness',
+            'retrieval-fitness',
+          ].map((axis) => ({
+            axis,
+            verdict: 'pass',
+            score: mutation === 'malformed-score' ? [2] : 2,
+            reasonCode: 'supported',
+            evidenceEntryIds:
+              mutation === 'mixed-evidence-id' ? ['E-1', { missing: true }] : ['E-1'],
+          })),
+          noveltyDecision: 'novel-project-specific',
+          duplicateDecision: 'no-match',
+          citedLines:
+            mutation === 'mixed-citation' ? ['src/handler.ts:1', 99] : ['src/handler.ts:1'],
+        }),
+    });
+    const result = await reviewer.review({
+      authored,
+      evidence,
+      expectedSourceRevisionVectorHash: 'vector-1',
+      producerIdentity: 'producer/different',
+      admissionReceiptId: 'admission-1',
+      calibrationReceiptHash: 'calibration-1',
+      repairAttempt: 0,
+    });
+    expect(result.verdict).toBe('reject');
+  });
+
   it('reviews the complete authored projection from frozen evidence and fails closed on drift', async () => {
     const prompt = buildIndependentReviewPrompt({ authored, evidence });
     expect(prompt).toContain('usageGuide');
@@ -1056,5 +1098,56 @@ describe('production independent reviewers', () => {
       promotionEligible: true,
       negativeSubset: { total: 10, caught: 10, recall: 1 },
     });
+  });
+});
+
+describe('R07 strict gate actual logger observer boundary', () => {
+  it('retains a confirmed Main G2 pass when the real Winston data observer throws', async () => {
+    const prior = Logger.instance;
+    Logger.instance = null;
+    const logger = Logger.getInstance({ console: false });
+    let observed = 0;
+    const callback = (info: { message?: unknown }) => {
+      if (info.message === '[StrictProductionStages] G2 reviewer compatibility translation') {
+        observed++;
+        throw new Error('observer fixture failure');
+      }
+    };
+    logger.on('data', callback);
+    try {
+      const artifact = { expressionSets: [], receipt: 'confirmed-review' };
+      const port = {
+        ...strictRuntimePort(),
+        reviewProducerResult: () => ({ action: 'continue', pass: true, artifact }),
+      };
+      const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+        params: { needsCandidates: true },
+        context: { strategyContext: { strictProduction: port } },
+      });
+      const output = await new PipelineStrategy({ stages }).execute(
+        {
+          id: 'log-observer-probe',
+          reactLoop: async () => ({
+            reply: 'strict stage output',
+            toolCalls: [],
+            tokenUsage: { input: 1, output: 1 },
+            iterations: 1,
+          }),
+        },
+        { role: 'internal', content: 'strict boundary probe', metadata: {} } as AgentMessage,
+        { strategyContext: { strictProduction: port } }
+      );
+      expect(observed).toBe(1);
+      expect(output.outcome).toBe('completed');
+      expect(output.phases.independent_review_gate).toMatchObject({
+        action: 'pass',
+        pass: true,
+        artifact,
+      });
+    } finally {
+      logger.removeListener('data', callback);
+      logger.destroy();
+      Logger.instance = prior;
+    }
   });
 });

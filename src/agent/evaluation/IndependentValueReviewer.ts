@@ -288,22 +288,22 @@ function parseReview(text: string): ParsedReviewV1 | null {
       const axis = readRecord(raw);
       if (
         !REQUIRED_AXES.includes(axis.axis as IndependentReviewAxisV1['axis']) ||
-        !['pass', 'narrow', 'fail'].includes(String(axis.verdict)) ||
-        ![0, 1, 2].includes(Number(axis.score)) ||
+        typeof axis.verdict !== 'string' ||
+        !['pass', 'narrow', 'fail'].includes(axis.verdict) ||
+        typeof axis.score !== 'number' ||
+        ![0, 1, 2].includes(axis.score) ||
         typeof axis.reasonCode !== 'string' ||
         !axis.reasonCode.trim() ||
-        !Array.isArray(axis.evidenceEntryIds)
+        !isTextArray(axis.evidenceEntryIds)
       ) {
         return null;
       }
       axes.push({
         axis: axis.axis as IndependentReviewAxisV1['axis'],
         verdict: axis.verdict as IndependentReviewAxisV1['verdict'],
-        score: Number(axis.score) as IndependentReviewAxisV1['score'],
+        score: axis.score as IndependentReviewAxisV1['score'],
         reasonCode: axis.reasonCode,
-        evidenceEntryIds: axis.evidenceEntryIds.filter(
-          (entryId): entryId is string => typeof entryId === 'string'
-        ),
+        evidenceEntryIds: axis.evidenceEntryIds,
       });
       if (axes.at(-1)?.evidenceEntryIds.length === 0) {
         return null;
@@ -312,12 +312,14 @@ function parseReview(text: string): ParsedReviewV1 | null {
     if (new Set(axes.map((axis) => axis.axis)).size !== axes.length) {
       return null;
     }
-    const noveltyDecision = String(value.noveltyDecision);
-    const duplicateDecision = String(value.duplicateDecision);
+    const noveltyDecision = value.noveltyDecision;
+    const duplicateDecision = value.duplicateDecision;
     if (
+      typeof noveltyDecision !== 'string' ||
+      typeof duplicateDecision !== 'string' ||
       !['novel-project-specific', 'known-general', 'not-novel'].includes(noveltyDecision) ||
       !['no-match', 'merge', 'duplicate'].includes(duplicateDecision) ||
-      !Array.isArray(value.citedLines)
+      !isTextArray(value.citedLines)
     ) {
       return null;
     }
@@ -325,7 +327,7 @@ function parseReview(text: string): ParsedReviewV1 | null {
       axes,
       noveltyDecision: noveltyDecision as ParsedReviewV1['noveltyDecision'],
       duplicateDecision: duplicateDecision as ParsedReviewV1['duplicateDecision'],
-      citedLines: value.citedLines.filter((line): line is string => typeof line === 'string'),
+      citedLines: value.citedLines,
     };
   } catch {
     return null;
@@ -409,4 +411,12 @@ function freeze<T>(value: T): T {
     }
   }
   return value;
+}
+
+/** 输出 schema 全量验证，不能过滤掉非法成员后把剩余数据升级为有效裁决。 */
+function isTextArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => typeof item === 'string' && item.trim().length > 0)
+  );
 }

@@ -166,20 +166,35 @@ export function parseJudgeVerdict(text: unknown): MiningJudgeVerdictV1 | null {
   }
   try {
     const parsed = readRecord(JSON.parse(match[0]));
-    const verdict = String(parsed.verdict ?? '');
-    if (!['uphold', 'narrow', 'trivial', 'reject'].includes(verdict)) {
+    const verdict = parsed.verdict;
+    // 四轴是既有输出合同，不用类型转换/过滤把不完整裁决“修成”有效结果。
+    if (
+      typeof verdict !== 'string' ||
+      !['uphold', 'narrow', 'trivial', 'reject'].includes(verdict) ||
+      typeof parsed.entailment !== 'string' ||
+      !['entailed', 'partial', 'not_entailed'].includes(parsed.entailment) ||
+      typeof parsed.trivial !== 'boolean' ||
+      typeof parsed.actionable !== 'boolean' ||
+      typeof parsed.scopeCorrect !== 'boolean' ||
+      typeof parsed.reason !== 'string' ||
+      !Array.isArray(parsed.citedLines) ||
+      parsed.citedLines.some((line) => typeof line !== 'string' || !line.trim()) ||
+      (verdict === 'uphold' &&
+        (parsed.entailment !== 'entailed' ||
+          parsed.trivial ||
+          !parsed.actionable ||
+          !parsed.scopeCorrect))
+    ) {
       return null;
     }
     return {
-      entailment: String(parsed.entailment ?? ''),
+      entailment: parsed.entailment,
       trivial: parsed.trivial === true,
       actionable: parsed.actionable === true,
       scopeCorrect: parsed.scopeCorrect === true,
       verdict: verdict as MiningJudgeVerdictV1['verdict'],
-      citedLines: Array.isArray(parsed.citedLines)
-        ? parsed.citedLines.filter((line): line is string => typeof line === 'string')
-        : [],
-      reason: String(parsed.reason ?? ''),
+      citedLines: parsed.citedLines as string[],
+      reason: parsed.reason,
     };
   } catch {
     return null;
@@ -294,7 +309,11 @@ export function createFrozenJudgeModelLoadReceiptV1(
   const requestedModel = normalizeOptionalText(input.requestedModel);
   const resolvedProvider = requireText(input.resolvedProvider, 'JUDGE_MODEL_PROVIDER_REQUIRED');
   const resolvedModel = requireText(input.resolvedModel, 'JUDGE_MODEL_REQUIRED');
-  if (!Number.isFinite(input.temperature) || !Number.isSafeInteger(input.maxTokens)) {
+  if (
+    !Number.isFinite(input.temperature) ||
+    !Number.isSafeInteger(input.maxTokens) ||
+    input.maxTokens <= 0
+  ) {
     fail('JUDGE_MODEL_PARAMETERS_INVALID');
   }
   if (!/^[a-f0-9]{64}$/u.test(input.implementationModuleSha256)) {

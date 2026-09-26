@@ -228,6 +228,49 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     expect(sliceEvidenceForJudge({ reasoning: { sources: [source] } }, makeProject())).toEqual([]);
   });
 
+  it('does not count an incomplete judge response as a valid uphold verdict', async () => {
+    const root = makeProject();
+    const verdict = await judgeCandidate({
+      candidate: { reasoning: { sources: ['file.ts:2-4'] } },
+      projectRoot: root,
+      chat: async () => JSON.stringify({ verdict: 'uphold', citedLines: ['file.ts:2'] }),
+    });
+    expect(verdict).toBeNull();
+  });
+
+  it('does not uphold a verdict contradicted by its own required axes', async () => {
+    const root = makeProject();
+    const verdict = await judgeCandidate({
+      candidate: { reasoning: { sources: ['file.ts:2-4'] } },
+      projectRoot: root,
+      chat: async () =>
+        JSON.stringify({
+          entailment: 'not_entailed',
+          trivial: true,
+          actionable: false,
+          scopeCorrect: false,
+          verdict: 'uphold',
+          citedLines: ['file.ts:2'],
+          reason: 'not supported',
+        }),
+    });
+    expect(verdict?.verdict).not.toBe('uphold');
+  });
+
+  it('rejects nonpositive generation budgets before minting a model receipt', () => {
+    expect(() =>
+      createFrozenJudgeModelLoadReceiptV1({
+        selectionMode: 'fixture',
+        requestedProvider: 'fixture',
+        requestedModel: 'fixture-model',
+        resolvedProvider: 'fixture',
+        resolvedModel: 'fixture-model',
+        temperature: 0,
+        maxTokens: 0,
+        implementationModuleSha256: 'a'.repeat(64),
+      })
+    ).toThrow();
+  });
   it('parseJudgeVerdict：JSON 提取 + 非法 verdict → null(保守)', () => {
     expect(
       parseJudgeVerdict(

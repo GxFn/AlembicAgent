@@ -1528,3 +1528,38 @@ function sortCanonical(value: unknown): unknown {
       .map(([key, child]) => [key, sortCanonical(child)])
   );
 }
+
+describe('durable reviewer completion and deadline boundaries', () => {
+  it('accepts a complete OpenAI Responses response in the real durable authority chain', async () => {
+    const fixture = createFixture();
+    const runtime = await createRuntime(fixture, { finishReason: 'completed' });
+    await expect(
+      runtime.execute({ semanticRequest: fixture.semanticRequest })
+    ).resolves.toMatchObject({ schemaVersion: 5 });
+  });
+
+  it('does not turn a valid large timeout into a 1ms timeout', async () => {
+    vi.useFakeTimers();
+    const fixture = createFixture();
+    const runtime = await createRuntime(fixture, {
+      timeoutMs: 2_147_483_648,
+      invoke: () => new Promise<string>(() => {}),
+    });
+    const controller = new AbortController();
+    let settled = false;
+    const pending = runtime
+      .execute({ semanticRequest: fixture.semanticRequest, abortSignal: controller.signal })
+      .catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+    try {
+      await vi.advanceTimersByTimeAsync(2);
+      expect(settled).toBe(false);
+    } finally {
+      controller.abort();
+      await pending;
+      vi.useRealTimers();
+    }
+  });
+});

@@ -3,6 +3,7 @@ import { hashKnowledgeClusterV1 } from '@alembic/core/production';
 import { describe, expect, it } from 'vitest';
 import { createFrozenEvidenceProjection } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import {
+  type CreateStrictProducerExpressionSetInputV1,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
   createStrictAnalysisFixpointV1,
@@ -512,5 +513,61 @@ describe('strict producer predecessor-bound causal lineage', () => {
         repairNode: initial.repairNode,
       } as never)
     ).toThrow(/STRICT_PRODUCER_CALLER_LINEAGE_FIELD_FORBIDDEN/u);
+  });
+});
+
+function createSetWith(proposal: unknown) {
+  const { lineage } = createLineageFixture();
+  return createStrictProducerExpressionSetV1({
+    lineage,
+    parentSet: null,
+    proposals: [proposal],
+    zeroDisposition: null,
+    modelHash: 'producer-fixture',
+    reasonHash: 'input-shape-boundary',
+  } as CreateStrictProducerExpressionSetInputV1);
+}
+describe('R07 strict Producer actual model input boundary', () => {
+  it.each([
+    'not-a-kind',
+    '',
+    undefined,
+  ])('rejects a malformed proposal kind=%j before sealing', (kind) => {
+    expect(() => createSetWith({ expressionId: 'expression-1', kind, authored })).toThrow();
+  });
+  it.each([
+    ['negativeIntent', { ...authored, negativeIntent: 'not an array' }],
+    ['evidenceEntryIds', { ...authored, evidenceEntryIds: 'E-1' }],
+    ['blank evidenceEntryIds', { ...authored, evidenceEntryIds: [''] }],
+    ['blank negativeIntent', { ...authored, negativeIntent: [' '] }],
+    ['retrievalProfile array', { ...authored, retrievalProfile: [] }],
+  ] as const)('rejects malformed authored %s before sealing', (_label, badAuthored) => {
+    expect(() =>
+      createSetWith({ expressionId: 'expression-1', kind: 'draft', authored: badAuthored })
+    ).toThrow();
+  });
+  it('rejects a whitespace-only merge representative ID', () => {
+    expect(() =>
+      createSetWith({
+        expressionId: 'expression-1',
+        kind: 'merge',
+        matchingRepresentativeId: ' ',
+        authored,
+      })
+    ).toThrow();
+  });
+  it('retains valid draft and matching representative proposal shapes', () => {
+    expect(createSetWith({ expressionId: 'expression-1', kind: 'draft', authored })).toMatchObject({
+      cardinality: 1,
+      version: 1,
+    });
+    expect(
+      createSetWith({
+        expressionId: 'expression-1',
+        kind: 'merge',
+        matchingRepresentativeId: 'representative-1',
+        authored,
+      })
+    ).toMatchObject({ cardinality: 1, version: 1 });
   });
 });

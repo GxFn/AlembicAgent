@@ -1,4 +1,5 @@
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import {
   createStrictAnalysisEpochSnapshotV1,
   type StrictAnalysisEpochSnapshotV1,
@@ -159,12 +160,19 @@ function normalizeStrictReviewResult(value: unknown): StrictProductionGateResult
     throw new Error('STRICT_PRODUCTION_GATE_RESULT_INVALID');
   }
   if (result.action === 'continue') {
-    Logger.getInstance().info('[StrictProductionStages] G2 reviewer compatibility translation', {
-      gate: 'G2',
-      originalAction: 'continue',
-      selectedAction: 'pass',
-      reason: 'main-review-compatibility',
-    });
+    observeSafely(
+      () =>
+        Logger.getInstance().info(
+          '[StrictProductionStages] G2 reviewer compatibility translation',
+          {
+            gate: 'G2',
+            originalAction: 'continue',
+            selectedAction: 'pass',
+            reason: 'main-review-compatibility',
+          }
+        ),
+      () => undefined
+    );
   }
   return { ...result, action, pass: action === 'pass' };
 }

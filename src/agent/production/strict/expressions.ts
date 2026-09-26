@@ -176,6 +176,9 @@ function resolveStrictProducerPredecessor(input: CreateStrictProducerExpressionS
 function validateProducerExpressionCardinality(
   input: CreateStrictProducerExpressionSetInputV1
 ): void {
+  if (!Array.isArray(input.proposals)) {
+    fail('STRICT_PRODUCER_PROPOSALS_INVALID');
+  }
   if (input.proposals.length === 0 && !input.zeroDisposition) {
     fail('STRICT_PRODUCER_ZERO_DISPOSITION_REQUIRED');
   }
@@ -195,10 +198,14 @@ function normalizeStrictProducerProposals(
     fail('STRICT_PRODUCER_EXPRESSION_DUPLICATE');
   }
   for (const proposal of input) {
+    if (!['draft', 'merge', 'duplicate'].includes(proposal.kind)) {
+      fail('STRICT_PRODUCER_KIND_INVALID', proposal.expressionId);
+    }
     validateAuthoredProjection(proposal.authored);
     if (
       (proposal.kind === 'merge' || proposal.kind === 'duplicate') &&
-      !proposal.matchingRepresentativeId
+      (typeof proposal.matchingRepresentativeId !== 'string' ||
+        !proposal.matchingRepresentativeId.trim())
     ) {
       fail('STRICT_PRODUCER_REPRESENTATIVE_REQUIRED', proposal.expressionId);
     }
@@ -400,6 +407,9 @@ function assertStrictProducerExpressionSetIntegrity(set: StrictProducerExpressio
 }
 
 function validateAuthoredProjection(authored: FullAuthoredProjectionV1): void {
+  if (!authored || typeof authored !== 'object' || Array.isArray(authored)) {
+    fail('STRICT_AUTHORED_PROJECTION_INCOMPLETE');
+  }
   for (const [field, value] of Object.entries({
     title: authored.title,
     kind: authored.kind,
@@ -413,11 +423,21 @@ function validateAuthoredProjection(authored: FullAuthoredProjectionV1): void {
   if (
     !authored.retrievalProfile ||
     typeof authored.retrievalProfile !== 'object' ||
-    authored.negativeIntent.length === 0 ||
-    authored.scope.moduleIds.length === 0 ||
-    authored.scope.dimensionIds.length === 0 ||
-    authored.evidenceEntryIds.length === 0
+    Array.isArray(authored.retrievalProfile) ||
+    !isNonEmptyTextArray(authored.negativeIntent) ||
+    !isNonEmptyTextArray(authored.scope?.moduleIds) ||
+    !isNonEmptyTextArray(authored.scope?.dimensionIds) ||
+    !isNonEmptyTextArray(authored.evidenceEntryIds)
   ) {
     fail('STRICT_AUTHORED_PROJECTION_INCOMPLETE');
   }
+}
+
+/** 模型 JSON 的数组形状在封印前验证；不能把字符串的 length 当成已验证引用集合。 */
+function isNonEmptyTextArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => typeof item === 'string' && item.trim().length > 0)
+  );
 }

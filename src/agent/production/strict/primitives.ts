@@ -25,6 +25,9 @@ export function assertContainsIds(
 }
 
 export function normalizeIds(values: readonly string[], field: string): string[] {
+  if (!Array.isArray(values) || values.some((value) => typeof value !== 'string')) {
+    fail('STRICT_ID_SET_INVALID', field);
+  }
   const normalized = values
     .map((value) => value.trim())
     .filter(Boolean)
