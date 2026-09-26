@@ -637,6 +637,8 @@ function readCall(id: string) {
 
 describe('runtime-owned tool resource lifecycle', () => {
   it('shares the run across stages, assigns distinct views, then releases both views and the run', async () => {
+    // 验证真实文件IO的资源身份/释放；不让并行机器负载先耗尽1000ms安全预算。
+    vi.useFakeTimers();
     const strategy: RuntimeConfig['strategy'] = {
       name: 'scope-fixture',
       execute: async (runtime, _message, opts) => {
@@ -697,11 +699,15 @@ describe('runtime-owned tool resource lifecycle', () => {
     'cancel',
     'timeout',
   ] as const)('releases run resources after %s', async (mode) => {
+    // 先完成真实工具调用，再显式触发预期终态；150ms期限与错误/回执断言保持不变。
+    vi.useFakeTimers();
+    const stageCompleted = Promise.withResolvers<void>();
     const abort = new AbortController();
     const strategy: RuntimeConfig['strategy'] = {
       name: 'cleanup-fixture',
       execute: async (runtime, _message, opts) => {
         const result = await runtime.reactLoop('stage', opts);
+        stageCompleted.resolve();
         if (mode === 'failure') {
           throw new Error('fixture failure');
         }
@@ -720,13 +726,18 @@ describe('runtime-owned tool resource lifecycle', () => {
       abortSignal: abort.signal,
       timeoutMs: 150,
     });
-    if (mode === 'cancel') {
-      expect((await pending).diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
-    } else {
-      await expect(pending).rejects.toThrow(
-        mode === 'failure' ? 'fixture failure' : 'Agent timeout'
-      );
+    // 提前订阅失败，避免推进虚拟时间时出现未处理拒绝。
+    const settled =
+      mode === 'cancel'
+        ? pending.then((result) => {
+            expect(result.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+          })
+        : expect(pending).rejects.toThrow(mode === 'failure' ? 'fixture failure' : 'Agent timeout');
+    if (mode === 'timeout') {
+      await stageCompleted.promise;
+      await vi.advanceTimersByTimeAsync(150);
     }
+    await settled;
     const scope = requests[0]?.runtime?.resourceScope;
     expect(scope?.runId).toEqual(expect.any(String));
     expect(releaseScope).toHaveBeenCalledWith({ runId: scope?.runId });

@@ -77,6 +77,10 @@ function runLint(
 
 describe('layer contract CLI', () => {
   it.each([
+    ['src/agent/runtime/processEvents.ts', 'src/agent/runtime/AgentRuntime.ts'],
+    ['src/agent/runtime/processEvents.ts', 'src/agent/runtime/LoopContext.ts'],
+    ['src/agent/runtime/llmInput.ts', 'src/agent/runtime/AgentRuntime.ts'],
+    ['src/agent/runtime/llmInput.ts', 'src/agent/runtime/processEvents.ts'],
     ['src/agent/production/strict/primitives.ts', 'src/agent/production/strict/analysisLoop.ts'],
     ['src/agent/production/strict/analysisLoop.ts', 'src/agent/production/strict/expressions.ts'],
     ['src/agent/production/strict/lineage.ts', 'src/agent/production/StrictProductionPipeline.ts'],

@@ -150,6 +150,8 @@ describe('Runtime operation boundary', () => {
   });
 
   it('keeps a confirmed result when resource cleanup and its diagnostic observer both fail', async () => {
+    // 本例验证已确认结果的清理语义；保留100ms预算，但不让并行负载先触发无关的阶段超时。
+    vi.useFakeTimers();
     const chat = vi
       .fn()
       .mockResolvedValueOnce(toolReply)
@@ -171,6 +173,7 @@ describe('Runtime operation boundary', () => {
       expect(runtime.toolRouter.releaseScope).toHaveBeenCalled();
     } finally {
       warn.mockRestore();
+      vi.useRealTimers();
     }
   });
 

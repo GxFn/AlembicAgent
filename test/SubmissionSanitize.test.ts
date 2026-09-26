@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import {
   buildViolationRepairTemplates,
   sanitizeSubmissionEvidence,
@@ -238,10 +239,7 @@ describe('buildViolationRepairTemplates（E7）', () => {
 });
 
 describe('Recipe production adapter（bounded code only）', () => {
-  test('只保留逐字匹配的 bounded snippet，绝不以首个 source 内容覆盖模型代码', async () => {
-    const { prepareRecipeProductionItem } = await import(
-      '../src/tools/runtime/handlers/recipeProductionAdapter.js'
-    );
+  test('只保留逐字匹配的 bounded snippet，绝不以首个 source 内容覆盖模型代码', () => {
     const projectRoot = createTempProject('corecode-');
     fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
     fs.writeFileSync(path.join(projectRoot, 'lib/a.ts'), 'L1\nconst real = 1;\nL3', 'utf8');

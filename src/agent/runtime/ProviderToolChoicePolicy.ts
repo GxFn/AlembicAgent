@@ -1,5 +1,14 @@
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
-import type { LoopContext } from './LoopContext.js';
+
+/** 兼容决策只观察阶段及指标；不取得预算、消息写口或整个循环状态。 */
+export interface ProviderToolChoiceContext {
+  readonly tracker?: {
+    readonly phase?: unknown;
+    readonly pipelineType?: unknown;
+    getMetrics?(): Record<string, unknown> | null | undefined;
+  } | null;
+  readonly context?: Readonly<Record<string, unknown>>;
+}
 
 /**
  * Provider tool-choice 正确性策略（provider 兼容层）。
@@ -29,7 +38,7 @@ export interface ProviderToolChoiceDecision {
  * 行为对等迁出自 `AgentRuntime.buildDeepSeekV4AnalyzeGroundingPolicy`。
  */
 export function resolveProviderToolChoice(
-  ctx: LoopContext,
+  ctx: ProviderToolChoiceContext,
   modelRef: string,
   requestedToolChoice: string
 ): ProviderToolChoiceDecision {
@@ -81,7 +90,10 @@ export function allowsToolCallsUnderForcedNone(mode: string | null | undefined):
  * 行为对等迁出自 `AgentRuntime.isDeepSeekV4AnalyzeFirstGroundingBurn`；
  * analyze grounding gate（AP-2 领地）亦复用此首轮判定。
  */
-export function isAnalyzeFirstBurnGuardEligible(ctx: LoopContext, modelRef: string): boolean {
+export function isAnalyzeFirstBurnGuardEligible(
+  ctx: ProviderToolChoiceContext,
+  modelRef: string
+): boolean {
   // P1-B-3：guard 适格由 ModelQuirks 声明(V4 家族)；phase 判定是 provider 中立的内核逻辑,保留。
   if (!resolveModelQuirks(modelRef).analyzeGroundingGuardEligible) {
     return false;

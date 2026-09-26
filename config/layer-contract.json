@@ -23,6 +23,8 @@
   "blessedImports": [],
   "fileBoundaries": {
     "requiredUnder": [
+      "src/agent/runtime/llmInput.ts",
+      "src/agent/runtime/processEvents.ts",
       "src/agent/prompts/producerFindings.ts",
       "src/agent/prompts/producerRetry.ts",
       "src/agent/runs/result.ts",
@@ -59,6 +61,11 @@
       "src/tools/runtime/compressor/"
     ],
     "runtimeImports": {
+      "src/agent/runtime/llmInput.ts": [
+        "src/ai/registry/ModelQuirks.ts",
+        "src/agent/runtime/ProviderToolChoicePolicy.ts"
+      ],
+      "src/agent/runtime/processEvents.ts": ["src/agent/utils/Redaction.ts"],
       "src/agent/prompts/producerFindings.ts": [],
       "src/agent/prompts/producerRetry.ts": ["src/agent/utils/toolOutcomes.ts"],
       "src/agent/runs/result.ts": [],

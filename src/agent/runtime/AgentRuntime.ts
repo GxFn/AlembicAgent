@@ -36,7 +36,6 @@ import Logger from '@alembic/core/logging';
 import {
   isTextCompatToolCallId,
   NATIVE_TOOL_CALL_SOURCE,
-  resolveModelQuirks,
   TEXT_COMPAT_CALL_SOURCE,
 } from '#ai/registry/ModelQuirks.js';
 import { observeSafely } from '#shared/observers.js';
@@ -91,18 +90,16 @@ import { createExitController } from './ExitController.js';
 import { cleanFinalAnswer } from './finalAnswer.js';
 import { produceForcedSummary } from './forcedSummary.js';
 import { HookSystem, registerDefaultHooks } from './HookSystem.js';
-import {
-  buildLlmInputAssembly,
-  type LLMInputAssembly,
-  type LLMInputStageProfile,
-  resolveLlmInputStageProfile,
-} from './LLMInputAssembly.js';
-import {
-  type LLMInputAssemblyMeasurement,
-  measureLlmInputAssembly,
-} from './LLMInputMeasurement.js';
+import { buildLlmInputAssembly, resolveLlmInputStageProfile } from './LLMInputAssembly.js';
+import { measureLlmInputAssembly } from './LLMInputMeasurement.js';
 import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
+import {
+  LLM_INPUT_TOO_LARGE_CODE,
+  resolveProviderInputBudget,
+  selectLlmInputTools,
+  validateLlmInputSize,
+} from './llmInput.js';
 import { createMessageAdapter } from './MessageAdapter.js';
 import {
   buildPcvNodeEvidenceProcessMetadata,
@@ -111,11 +108,16 @@ import {
   recordPcvToolResult,
   recordPcvToolRoundOutcome,
 } from './PcvNodeEvidenceRecorder.js';
+import { allowsToolCallsUnderForcedNone } from './ProviderToolChoicePolicy.js';
 import {
-  allowsToolCallsUnderForcedNone,
-  observeForcedToolChoiceMode,
-  resolveProviderToolChoice,
-} from './ProviderToolChoicePolicy.js';
+  createAgentProcessEvent,
+  formatToolCallForDeveloperContent,
+  isDeveloperVisibleReflectionNudge,
+  type ProcessEventInput,
+  projectLlmInputEvent,
+  projectLlmOutput,
+  projectSemanticNudgeEvent,
+} from './processEvents.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
 
@@ -144,20 +146,6 @@ export type {
   ToolMetadata,
 } from './AgentRuntimeTypes.js';
 export { MAX_TOOL_CALLS_PER_ITER } from './AgentRuntimeTypes.js';
-
-function resolveProviderInputBudget(stageProfile: LLMInputStageProfile) {
-  switch (stageProfile) {
-    case 'record':
-      return { maxProjectedMessages: 40, maxProjectedTokens: 14_000 };
-    case 'produce':
-      return { maxProjectedMessages: 20, maxProjectedTokens: 12_000 };
-    case 'analyze':
-    case 'summarize':
-      return { maxProjectedMessages: 44, maxProjectedTokens: 16_000 };
-    default:
-      return null;
-  }
-}
 
 interface RuntimeToolContract {
   actions: ToolActionAllowlist;
@@ -1100,39 +1088,14 @@ export class AgentRuntime {
     // 跨 try/catch 携带到工具抑制判定，替代「写入 PCV burn 再读回」的 R4 往返。
     let providerToolChoiceMode: string | null = null;
     try {
-      // toolChoice='none' 时是否保留 tool schemas 取决于供应商:
-      //   - 保留: 维持 prefix cache (system prompt + tool schemas 不变 → cache hit)
-      //   - 移除: DeepSeek V4 会因 hasTools=true 启用 thinking mode（增加 token 成本）;
-      //           Gemini 在禁止调用但看到定义时可能返回空内容
-      // 策略: DeepSeek V4 和 Gemini 移除 schemas，其他保留以获得 cache 收益
-      // P1-B-3：provider 判定收敛到 ModelQuirks(内核零 provider 名分支)。
-      const isToolSchemaHarmful = resolveModelQuirks(
-        this.#modelRef
-      ).dropToolSchemasWhenToolChoiceNone;
-      const providerToolChoice = resolveProviderToolChoice(ctx, this.#modelRef, toolChoice);
-      const effectiveToolSchemas = providerToolChoice.keepToolSchemasVisible
-        ? toolSchemas.length > 0
-          ? toolSchemas
-          : undefined
-        : toolChoice === 'none' && isToolSchemaHarmful
-          ? undefined
-          : toolSchemas.length > 0
-            ? toolSchemas
-            : undefined;
-      const unifiedTools = effectiveToolSchemas as
-        | import('#ai/AiProvider.js').ToolSchema[]
-        | undefined;
-      const effectiveToolChoice = providerToolChoice.keepToolSchemasVisible
-        ? 'auto'
-        : unifiedTools
-          ? toolChoice
-          : 'none';
-      // PCV 仅观察该 mode（effective vs requested）；主循环抑制例外读本地结果，不回读 PCV burn。
-      providerToolChoiceMode = observeForcedToolChoiceMode(
+      const inputTools = selectLlmInputTools(
+        { tracker: ctx.tracker, context: ctx.context },
         this.#modelRef,
         toolChoice,
-        effectiveToolChoice
+        toolSchemas
       );
+      const { tools: unifiedTools, effectiveToolChoice, providerDecisionMode } = inputTools;
+      providerToolChoiceMode = inputTools.observedToolChoiceMode;
 
       const inputStageProfile = resolveLlmInputStageProfile(ctx, toolChoice, effectiveToolChoice);
       const providerInputBudget = resolveProviderInputBudget(inputStageProfile);
@@ -1165,7 +1128,7 @@ export class AgentRuntime {
         requestedToolChoice: toolChoice,
       });
       const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
-      const llmInputValidation = validateLlmInputSize(ctx, llmInputMeasurement);
+      const llmInputValidation = validateLlmInputSize(ctx.budget, llmInputMeasurement);
       if (!llmInputValidation.ok) {
         ctx.diagnostics?.warn({
           code: llmInputValidation.code,
@@ -1186,31 +1149,16 @@ export class AgentRuntime {
         return null;
       }
       const unifiedMessages = llmInputAssembly.providerMessages;
-      const llmInputProcessEvent = buildAgentProcessEvent(ctx, {
-        kind: 'llm.input',
-        title: 'LLM input prepared',
-        summary: `Sending ${unifiedMessages.length} message(s) to ${this.#modelRef}`,
-        content: {
-          role: 'developer',
-          text: formatDeveloperVisibleLlmInput(llmInputAssembly),
-        },
-        metadata: {
-          ...llmTrace,
-          messageCount: unifiedMessages.length,
-          hasDynamicContext: Boolean(dynamicContext),
+      const llmInputProcessEvent = buildAgentProcessEvent(
+        ctx,
+        projectLlmInputEvent(llmInputAssembly, llmInputMeasurement, {
+          trace: llmTrace,
+          modelRef: this.#modelRef,
+          dynamicContext,
           requestedToolChoice: toolChoice,
           effectiveToolChoice,
-          inputSizeEstimate: {
-            inputLayer: llmInputMeasurement.inputLayerEstimatedTokens,
-            providerHistory: llmInputMeasurement.providerHistoryEstimatedTokens,
-            providerMessages: llmInputMeasurement.providerMessageEstimatedTokens,
-            systemPrompt: llmInputMeasurement.systemPromptEstimatedTokens,
-            toolSchemas: llmInputMeasurement.toolSchemaEstimatedTokens,
-          },
-          toolSchemaNames: (unifiedTools || []).map((schema) => schema.name),
-          ...llmInputAssembly.metadata,
-        },
-      });
+        })
+      );
       this.#hookSystem.emitSync('llm:call:before', {
         iteration: ctx.iteration,
         toolChoice: effectiveToolChoice,
@@ -1224,7 +1172,7 @@ export class AgentRuntime {
         ...llmTrace,
         messageCount: unifiedMessages.length,
         hasDynamicContext: Boolean(dynamicContext),
-        deepseekV4ToolChoiceMode: providerToolChoice.mode, // provider-name-ok: recorded evidence field key
+        deepseekV4ToolChoiceMode: providerDecisionMode, // provider-name-ok: recorded evidence field key
         requestedToolChoice: toolChoice,
         effectiveToolChoice,
         toolSchemaCount: unifiedTools?.length || 0,
@@ -1234,6 +1182,17 @@ export class AgentRuntime {
 
       // 方案①：统一经 aiProvider.chatWithTools 调用；provider 内部已委托 LLMGateway + Transport，
       // 不再保留 runtime 级 gateway/provider 双分支（横切能力由 provider 背后的 gateway 统一承担）。
+      // Hook、进度和日志都是可执行的宿主回调；最后一个观察点之后再次确认取消，
+      // 不能依赖默认gateway替任意注入provider阻止已经取消的调用。
+      if (ctx.abortSignal?.aborted) {
+        ctx.diagnostics?.recordCancelReason('abort_signal');
+        recordAbortRecoveryDiagnostic(ctx, 'AbortSignal was aborted before provider dispatch');
+        this.logger.info(`[AgentRuntime] LLM dispatch cancelled ${formatLoopTrace(llmTrace)}`, {
+          ...llmTrace,
+          abortReason: stringifyAbortReason(ctx.abortSignal.reason),
+        });
+        return null;
+      }
       llmResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
         messages: unifiedMessages,
         toolSchemas: unifiedTools,
@@ -1284,21 +1243,10 @@ export class AgentRuntime {
       });
     }
 
-    const llmOutputDeveloperText = redactDeveloperText(
-      llmResult.text || formatFunctionCallsForDeveloperContent(llmResult.functionCalls || [])
-    );
-    const llmOutputCompleteness = buildLlmOutputCompletenessMetadata(
-      llmResult,
-      llmOutputDeveloperText
-    );
+    const outputProjection = projectLlmOutput(llmResult);
+    const llmOutputCompleteness = outputProjection.completeness;
     const llmOutputProcessEvent = buildAgentProcessEvent(ctx, {
-      kind: 'llm.output',
-      title: 'LLM output received',
-      summary: formatLlmOutputSummary(llmResult, llmOutputCompleteness),
-      content: {
-        role: 'assistant',
-        text: llmOutputDeveloperText,
-      },
+      ...outputProjection.event,
       metadata: {
         ...llmTrace,
         durationMs: Date.now() - llmStartedAt,
@@ -2418,54 +2366,34 @@ function buildDirectNoteFindingSchema(recordOnly: boolean): Record<string, unkno
 
 function buildAgentProcessEvent(
   ctx: LoopContext,
-  input: {
-    kind: AgentProgressProcessEvent['kind'];
-    title: string;
-    summary?: string | null;
-    content?: AgentProgressProcessEvent['content'];
-    correlationId?: string | null;
-    metadata?: Record<string, unknown>;
-    phase?: string | null;
-    retention?: AgentProgressProcessEvent['retention'];
-    severity?: AgentProgressProcessEvent['severity'];
-    sourceClass?: AgentProgressProcessEvent['sourceClass'];
-    displayPolicy?: AgentProgressProcessEvent['displayPolicy'];
-  }
+  input: ProcessEventInput
 ): AgentProgressProcessEvent {
   const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
   const phase =
     input.phase ??
     stringValue(ctx.context?.pipelinePhase) ??
     (typeof ctx.tracker?.phase === 'string' ? ctx.tracker.phase : null);
-  return {
-    content: input.content ?? null,
-    correlationId: input.correlationId ?? null,
-    createdAt: new Date().toISOString(),
-    dimensionId:
-      stringValue(dimensionMeta.id) ||
-      stringValue(ctx.context?.dimensionId) ||
-      stringValue(ctx.context?.dimId) ||
-      null,
-    displayPolicy: input.displayPolicy ?? 'full',
-    kind: input.kind,
-    metadata: sanitizeDeveloperData({
+  // 先完成内容投影，再在原发射点取时间和PCV快照；观察模块不接管这些活跃状态。
+  return createAgentProcessEvent(
+    {
+      createdAt: new Date().toISOString(),
+      dimensionId:
+        stringValue(dimensionMeta.id) ||
+        stringValue(ctx.context?.dimensionId) ||
+        stringValue(ctx.context?.dimId) ||
+        null,
       iteration: ctx.iteration,
       source: ctx.source,
       pcvNodeEvidence: buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence),
-      ...(input.metadata || {}),
-    }) as Record<string, unknown>,
-    phase,
-    retention: input.retention ?? 'job-retained',
-    severity: input.severity ?? 'info',
-    sourceClass: input.sourceClass ?? 'developer-facing',
-    summary: input.summary ?? null,
-    targetName:
-      stringValue(dimensionMeta.label) ||
-      stringValue(dimensionMeta.targetName) ||
-      stringValue(ctx.context?.targetName) ||
-      null,
-    title: input.title,
-  };
+      phase,
+      targetName:
+        stringValue(dimensionMeta.label) ||
+        stringValue(dimensionMeta.targetName) ||
+        stringValue(ctx.context?.targetName) ||
+        null,
+    },
+    input
+  );
 }
 
 function isEvidenceGroundingToolCall(toolName: string, args: Record<string, unknown>): boolean {
@@ -2477,104 +2405,6 @@ function isEvidenceGroundingToolCall(toolName: string, args: Record<string, unkn
     return ['overview', 'query'].includes(action || '');
   }
   return toolName === 'terminal';
-}
-
-type LlmOutputCompletenessStatus =
-  | 'visible_text_complete'
-  | 'provider_truncated'
-  | 'tool_call_only'
-  | 'empty';
-
-interface LlmOutputCompletenessMetadata extends Record<string, unknown> {
-  agentOutputTruncated: false;
-  developerContentChars: number;
-  finishReason: string | null;
-  functionCallCount: number;
-  functionCallNames: string[];
-  hasHiddenReasoningContent: boolean;
-  hasText: boolean;
-  outputCompleteness: LlmOutputCompletenessStatus;
-  providerOutputTruncated: boolean;
-  reasoningContentChars: number;
-  reasoningContentOmitted: boolean;
-  reasoningTokens: number;
-  textChars: number;
-  usage: LLMResult['usage'] | null;
-  visibleTextChars: number;
-}
-
-function buildLlmOutputCompletenessMetadata(
-  result: LLMResult,
-  developerContentText: string
-): LlmOutputCompletenessMetadata {
-  const visibleTextChars = result.text?.length || 0;
-  const functionCalls = result.functionCalls || [];
-  const functionCallCount = functionCalls.length;
-  const reasoningContentChars = result.reasoningContent?.length || 0;
-  const reasoningTokens = result.usage?.reasoningTokens || 0;
-  const finishReason = normalizeFinishReason(result.finishReason);
-  const providerOutputTruncated = isProviderOutputTruncated(finishReason);
-  const reasoningContentOmitted =
-    reasoningContentChars > 0 || reasoningTokens > 0 || Boolean(result.continuation);
-
-  return {
-    agentOutputTruncated: false,
-    developerContentChars: developerContentText.length,
-    finishReason,
-    functionCallCount,
-    functionCallNames: functionCalls.map((call) => call.name).slice(0, 12),
-    hasHiddenReasoningContent: reasoningContentOmitted,
-    hasText: visibleTextChars > 0,
-    outputCompleteness: providerOutputTruncated
-      ? 'provider_truncated'
-      : visibleTextChars > 0
-        ? 'visible_text_complete'
-        : functionCallCount > 0
-          ? 'tool_call_only'
-          : 'empty',
-    providerOutputTruncated,
-    reasoningContentChars,
-    reasoningContentOmitted,
-    reasoningTokens,
-    textChars: visibleTextChars,
-    usage: result.usage || null,
-    visibleTextChars,
-  };
-}
-
-function formatLlmOutputSummary(
-  result: LLMResult,
-  metadata: LlmOutputCompletenessMetadata
-): string {
-  if (metadata.visibleTextChars > 0) {
-    const suffixes: string[] = [];
-    if (metadata.providerOutputTruncated) {
-      suffixes.push(`provider stopped with finishReason=${metadata.finishReason}`);
-    }
-    if (metadata.reasoningContentOmitted) {
-      suffixes.push('hidden reasoning omitted');
-    }
-    return [`Received ${metadata.visibleTextChars} visible character(s)`, ...suffixes].join('; ');
-  }
-  if (metadata.functionCallCount > 0) {
-    return `Received ${metadata.functionCallCount} tool call(s) without visible text`;
-  }
-  if (metadata.providerOutputTruncated) {
-    return `Received empty LLM output; provider stopped with finishReason=${metadata.finishReason}`;
-  }
-  return `Received empty LLM output from provider${result.finishReason ? ` (finishReason=${result.finishReason})` : ''}`;
-}
-
-function normalizeFinishReason(finishReason: string | null | undefined): string | null {
-  const normalized = finishReason?.trim();
-  return normalized ? normalized : null;
-}
-
-function isProviderOutputTruncated(finishReason: string | null): boolean {
-  if (!finishReason) {
-    return false;
-  }
-  return new Set(['length', 'max_tokens', 'max_output_tokens']).has(finishReason.toLowerCase());
 }
 
 function buildSemanticNudgeProcessEvent(
@@ -2600,141 +2430,20 @@ function buildSemanticNudgeProcessEvent(
   const phase = options.phase ?? stringValue(ctx.context?.pipelinePhase) ?? trackerPhase ?? null;
   const pipelineType =
     typeof ctx.tracker?.pipelineType === 'string' ? ctx.tracker.pipelineType : null;
-  const semanticKind = options.semanticKind ?? classifySemanticNudgeKind(nudge.type);
-  const title = formatSemanticNudgeTitle(nudge, semanticKind, phase);
-  return buildAgentProcessEvent(ctx, {
-    kind: 'llm.reflection',
-    title,
-    summary: formatSemanticNudgeSummary(nudge, semanticKind, phase),
-    phase,
-    content: {
-      role: 'developer',
-      text: redactDeveloperText(nudge.text),
-    },
-    metadata: {
-      dimensionId,
-      nudgeType: nudge.type,
-      phase,
-      pipelineType,
-      semanticKind,
-      source: ctx.source,
-      targetName,
-    },
-  });
-}
-
-function classifySemanticNudgeKind(type: string): string {
-  switch (type) {
-    case 'transition':
-      return 'transition-nudge';
-    case 'digest':
-      return 'digest-nudge';
-    case 'continue':
-      return 'continue-nudge';
-    case 'planning':
-    case 'replan':
-      return 'planning-nudge';
-    case 'convergence':
-      return 'convergence-nudge';
-    default:
-      return 'reflection-nudge';
-  }
-}
-
-function formatSemanticNudgeTitle(
-  nudge: { type: string; text: string },
-  semanticKind: string,
-  phase: string | null
-): string {
-  if (semanticKind === 'transition-nudge') {
-    return phase ? `Agent 阶段转换 Nudge: ${phase}` : 'Agent 阶段转换 Nudge';
-  }
-  if (semanticKind === 'digest-nudge') {
-    return 'Agent 总结 Nudge';
-  }
-  if (semanticKind === 'continue-nudge') {
-    return 'Agent 继续执行 Nudge';
-  }
-  if (semanticKind === 'planning-nudge') {
-    return nudge.type === 'replan' ? 'Agent 重新计划 Nudge' : 'Agent 计划检查 Nudge';
-  }
-  if (semanticKind === 'convergence-nudge') {
-    return 'Agent 收敛检查 Nudge';
-  }
-  if (nudge.text.includes('停滞反思')) {
-    return 'Agent 停滞反思';
-  }
-  if (nudge.text.includes('中期反思')) {
-    return 'Agent 中期反思';
-  }
-  return 'Agent 反思 Nudge';
-}
-
-function formatSemanticNudgeSummary(
-  nudge: { type: string; text: string },
-  semanticKind: string,
-  phase: string | null
-): string {
-  if (semanticKind === 'transition-nudge') {
-    return phase ? `阶段机切换后注入 ${phase} 阶段指令。` : '阶段机切换后注入下一阶段指令。';
-  }
-  if (semanticKind === 'digest-nudge') {
-    return '要求 Agent 停止探索并产出 dimensionDigest 或最终分析摘要。';
-  }
-  if (semanticKind === 'continue-nudge') {
-    return '要求 Agent 基于当前回复继续推进，而不是结束本轮执行。';
-  }
-  if (nudge.text.includes('停滞反思')) {
-    return '检测到连续无新信息，注入停滞反思。';
-  }
-  if (nudge.text.includes('中期反思')) {
-    return '达到中期预算节点，注入阶段性反思。';
-  }
-  return `Injected ${nudge.type} semantic nudge before the next LLM step.`;
-}
-
-const DEFAULT_LLM_INPUT_TOKEN_LIMIT = 128_000;
-const LLM_INPUT_TOO_LARGE_CODE = 'LLM_INPUT_TOO_LARGE';
-
-function validateLlmInputSize(
-  ctx: LoopContext,
-  measurement: LLMInputAssemblyMeasurement
-):
-  | { ok: true }
-  | {
-      ok: false;
-      code: typeof LLM_INPUT_TOO_LARGE_CODE;
-      estimatedTokens: number;
-      maxTokens: number;
-      message: string;
-    } {
-  const maxTokens = resolveLlmInputTokenLimit(ctx);
-  if (measurement.estimatedTokens <= maxTokens) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    code: LLM_INPUT_TOO_LARGE_CODE,
-    estimatedTokens: measurement.estimatedTokens,
-    maxTokens,
-    message: `LLM input exceeds provider input budget (${measurement.estimatedTokens}/${maxTokens} tokens)`,
-  };
-}
-
-function resolveLlmInputTokenLimit(ctx: LoopContext): number {
-  const budget = ctx.budget || {};
-  const explicit = readPositiveBudgetNumber(
-    budget.maxProviderInputTokens ?? budget.maxInputTokens ?? budget.contextWindowTokens
+  return buildAgentProcessEvent(
+    ctx,
+    projectSemanticNudgeEvent(
+      nudge,
+      {
+        dimensionId,
+        phase,
+        pipelineType,
+        source: ctx.source,
+        targetName,
+      },
+      options.semanticKind
+    )
   );
-  return explicit ?? DEFAULT_LLM_INPUT_TOKEN_LIMIT;
-}
-
-function readPositiveBudgetNumber(value: unknown): number | null {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return null;
-  }
-  return Math.floor(numeric);
 }
 
 function recordAbortRecoveryDiagnostic(ctx: LoopContext, message: string): void {
@@ -2744,96 +2453,12 @@ function recordAbortRecoveryDiagnostic(ctx: LoopContext, message: string): void 
   });
 }
 
-function formatDeveloperVisibleLlmInput(assembly: LLMInputAssembly): string {
-  const sections = assembly.sections.map((section) => {
-    const suffix = section.staticCacheable ? ' (static)' : '';
-    return `## ${section.title}${suffix}\n${redactDeveloperText(section.content)}`;
-  });
-  sections.push(
-    [
-      '## Messages',
-      ...assembly.messages.map((message, index) => formatDeveloperVisibleMessage(message, index)),
-    ].join('\n\n')
-  );
-  if (assembly.inputLayerMessage) {
-    sections.push(
-      `## Provider runtime layer\n${redactDeveloperText(assembly.inputLayerMessage.content || '')}`
-    );
+function readPositiveBudgetNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
   }
-  if (assembly.tools?.length) {
-    sections.push(
-      [
-        '## Available tools',
-        ...assembly.tools.map((tool) =>
-          [
-            `### ${tool.name}`,
-            tool.description ? redactDeveloperText(tool.description) : null,
-            tool.parameters ? `parameters:\n${stringifyDeveloperData(tool.parameters)}` : null,
-          ]
-            .filter(Boolean)
-            .join('\n')
-        ),
-      ].join('\n\n')
-    );
-  }
-  return sections.join('\n\n');
-}
-
-function formatDeveloperVisibleMessage(
-  message: import('#ai/AiProvider.js').UnifiedMessage,
-  index: number
-): string {
-  const lines = [`### ${index + 1}. ${message.role}${message.name ? ` (${message.name})` : ''}`];
-  if (message.content) {
-    lines.push(redactDeveloperText(message.content));
-  }
-  if (message.toolCalls?.length) {
-    lines.push(
-      [
-        'tool calls:',
-        ...message.toolCalls.map(
-          (call) => `- ${call.name} (${call.id}): ${stringifyDeveloperData(call.args)}`
-        ),
-      ].join('\n')
-    );
-  }
-  if (message.toolCallId) {
-    lines.push(`toolCallId: ${message.toolCallId}`);
-  }
-  if (message.reasoningContent || message.continuation) {
-    lines.push('[hidden reasoning omitted]');
-  }
-  return lines.join('\n');
-}
-
-function formatFunctionCallsForDeveloperContent(
-  calls: Array<{ id?: string; name?: string; args?: Record<string, unknown> }>
-): string {
-  if (calls.length === 0) {
-    return '';
-  }
-  return [
-    'LLM requested tool calls:',
-    ...calls.map(
-      (call) =>
-        `- ${call.name || 'unknown'} (${call.id || 'no-id'}): ${stringifyDeveloperData(call.args || {})}`
-    ),
-  ].join('\n');
-}
-
-function formatToolCallForDeveloperContent(toolName: string, args: Record<string, unknown>) {
-  return [`tool: ${toolName}`, 'args:', stringifyDeveloperData(args)].join('\n');
-}
-
-function isDeveloperVisibleReflectionNudge(type: string): boolean {
-  return (
-    type === 'reflection' ||
-    type === 'planning' ||
-    type === 'replan' ||
-    type === 'convergence' ||
-    type === 'digest' ||
-    type === 'continue'
-  );
+  return Math.floor(numeric);
 }
 
 function inferFunctionCallSource(call: { id?: string }) {
@@ -2904,42 +2529,6 @@ function stringifyAbortReason(reason: unknown): string | null {
   return String(reason);
 }
 
-function stringifyDeveloperData(value: unknown): string {
-  try {
-    if (value === undefined) {
-      return 'undefined';
-    }
-    return JSON.stringify(sanitizeDeveloperData(value), null, 2);
-  } catch {
-    return redactDeveloperText(String(value));
-  }
-}
-
-function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (typeof value === 'string') {
-    return redactDeveloperText(value);
-  }
-  if (value === null || typeof value !== 'object') {
-    return value;
-  }
-  if (seen.has(value)) {
-    return '[Circular]';
-  }
-  seen.add(value);
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeDeveloperData(item, seen));
-  }
-  const record = value as Record<string, unknown>;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record)) {
-    output[key] =
-      isSecretLikeKey(key) && !isSafeNumericTokenMetric(key, child)
-        ? '[redacted]'
-        : sanitizeDeveloperData(child, seen);
-  }
-  return output;
-}
-
 /**
  * 证据台账构造（Wave A E2）：dataRoot + 维度身份齐备才创建；缺任一返回 null——
  * 非维度场景（对话/翻译等）零行为。维度 id 优先取 sharedState._dimensionMeta.id，
@@ -2995,20 +2584,6 @@ function buildEvidenceLedgerForLoop(options: {
     });
     throw err instanceof Error ? err : new Error(String(err));
   }
-}
-
-function isSecretLikeKey(key: string): boolean {
-  return /api[_-]?key|token|secret|password|authorization|credential/i.test(key);
-}
-
-function isSafeNumericTokenMetric(key: string, value: unknown): boolean {
-  // token 计数是 developer-safe 观测指标；真实 token / key 字段仍按 isSecretLikeKey 脱敏。
-  return (
-    typeof value === 'number' &&
-    /^(inputTokens|outputTokens|totalTokens|reasoningTokens|cacheHitTokens|cacheWriteTokens)$/.test(
-      key
-    )
-  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

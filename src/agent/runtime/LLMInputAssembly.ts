@@ -65,9 +65,20 @@ export function buildLlmInputAssembly({
   const stageProfile = resolveLlmInputStageProfile(ctx, requestedToolChoice, effectiveToolChoice);
   const providerHistoryMessages = projectMessagesForStage(messages, stageProfile);
   const groundingContext = buildGroundingContext(ctx, modelRef);
+  // 两个可见章节共享实际Scan补证权限，避免阶段说明允许读、工具说明却随后禁止。
+  const scanReadAllowed =
+    stringValue(valueAt(ctx.tracker, 'pipelineType')) === 'scan' &&
+    ctx.allowedToolIds?.includes('code') &&
+    (!ctx.allowedToolActions?.code || ctx.allowedToolActions.code.includes('read'));
   const rawInputLayerSections = [
-    buildStagePolicySection(stageProfile, ctx),
-    buildToolContractSection(stageProfile, requestedToolChoice, effectiveToolChoice, tools),
+    buildStagePolicySection(stageProfile, ctx, scanReadAllowed),
+    buildToolContractSection(
+      stageProfile,
+      requestedToolChoice,
+      effectiveToolChoice,
+      tools,
+      scanReadAllowed
+    ),
     buildTaskContextSection(ctx, modelRef, providerHistoryMessages),
     buildEvidenceContextSection(ctx, groundingContext),
     buildDynamicContextSection(dynamicContext),
@@ -296,7 +307,8 @@ export function resolveLlmInputStageProfile(
 
 function buildStagePolicySection(
   stageProfile: LLMInputStageProfile,
-  ctx: LoopContext
+  ctx: LoopContext,
+  scanReadAllowed: boolean
 ): LLMInputSection {
   const phase =
     stringValue(valueAt(ctx.tracker, 'phase')) || stringValue(ctx.context?.pipelinePhase);
@@ -309,10 +321,6 @@ function buildStagePolicySection(
     .filter(Boolean)
     .join('\n');
 
-  const scanReadAllowed =
-    pipelineType === 'scan' &&
-    ctx.allowedToolIds?.includes('code') &&
-    (!ctx.allowedToolActions?.code || ctx.allowedToolActions.code.includes('read'));
   const producerEvidencePolicy = scanReadAllowed
     ? 'Only code.read of already referenced files may supplement evidence; do not start new search, graph, or terminal exploration.'
     : 'Do not start new exploration or read source files; use Analyst evidence/snippets as the source of truth.';
@@ -340,7 +348,8 @@ function buildToolContractSection(
   stageProfile: LLMInputStageProfile,
   requestedToolChoice: string,
   effectiveToolChoice: string,
-  tools?: ToolSchema[]
+  tools: ToolSchema[] | undefined,
+  scanReadAllowed: boolean
 ): LLMInputSection {
   const toolNames = (tools || []).map((tool) => tool.name).filter(Boolean);
   const base = [
@@ -355,8 +364,9 @@ function buildToolContractSection(
     record:
       'Only note_finding and read-only evidence.get/search are valid in this stage. If no note_finding schema is available, explain that structured recording is blocked.',
     summarize: 'No tool calls are valid. Ignore any retained tool schemas and return text only.',
-    produce:
-      'Use submission tools for candidate creation. code.read, search, graph, terminal, and broad exploration are out of scope for Producer.',
+    produce: scanReadAllowed
+      ? 'Use submission tools for candidate creation. Only code.read of already referenced files may supplement evidence; do not start new search, graph, or terminal exploration.'
+      : 'Use submission tools for candidate creation. code.read, search, graph, terminal, and broad exploration are out of scope for Producer.',
     generic: 'Use only the tools exposed in this call.',
   };
 

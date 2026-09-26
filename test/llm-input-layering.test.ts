@@ -28,6 +28,7 @@ import type { UnifiedMessage } from '../src/ai/contracts.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
+import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
 import { cases, envelope, runtimeFixture, usage } from './helpers/developerRedaction.js';
 
 function createRuntime({
@@ -1560,5 +1561,118 @@ describe('developer-visible output redaction and business fidelity', () => {
     )?.processEvent;
     expect(result.tokenUsage).toMatchObject({ input: 11, output: 7 });
     expect(process?.metadata?.usage).toEqual(usage);
+  });
+});
+
+describe('provider input dispatch boundaries', () => {
+  it.each([
+    'before-hook',
+    'input-progress',
+    'start-log',
+  ])('does not start provider work after %s cancels', async (origin) => {
+    const controller = new AbortController();
+    const chatWithTools = vi.fn(async () => ({
+      text: 'late output',
+      functionCalls: [],
+      usage: { inputTokens: 5, outputTokens: 2 },
+    }));
+    const runtime = createRuntime({
+      chatWithTools,
+      onProgress: (event) => {
+        if (origin === 'input-progress' && event.processEvent?.kind === 'llm.input') {
+          controller.abort('cancel before dispatch');
+        }
+      },
+    });
+    if (origin === 'before-hook') {
+      runtime.hookSystem.on('llm:call:before', () => controller.abort('cancel before dispatch'));
+    }
+    if (origin === 'start-log') {
+      runtime.logger = {
+        info: (message) => {
+          if (String(message).includes('LLM call start')) {
+            controller.abort('cancel before dispatch');
+          }
+        },
+        warn: vi.fn(),
+      };
+    }
+    const result = await runtime.reactLoop('fixture request', {
+      abortSignal: controller.signal,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+    expect(result.tokenUsage).toMatchObject({ input: 0, output: 0 });
+    expect(result.reply).not.toContain('late output');
+  });
+
+  it.each([
+    { pipelineType: 'scan' as const, readAllowed: true, maySupplement: true },
+    { pipelineType: 'scan' as const, readAllowed: false, maySupplement: false },
+    { pipelineType: 'producer' as const, readAllowed: true, maySupplement: false },
+  ])('keeps stage and tool instructions consistent for $pipelineType/read=$readAllowed', ({
+    pipelineType,
+    readAllowed,
+    maySupplement,
+  }) => {
+    const stage = new AgentStageFactoryRegistry()
+      .build('scanPipeline', {
+        params: { task: 'extract' },
+      })
+      .find((item) => item.name === 'produce');
+    if (!stage || typeof stage.systemPrompt !== 'string') {
+      throw new Error('Real Scan producer stage must provide its system prompt');
+    }
+    const capability = new ScanProduce();
+    const allowed = { ...capability.allowedTools, ...(!readAllowed ? { code: [] } : {}) };
+    const tools = generateLightweightSchemas(allowed);
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { ...stage.budget, pipelineType }
+    );
+    if (!tracker) {
+      throw new Error('Real Scan producer stage must resolve its tracker');
+    }
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Submit recorded findings.');
+    const ctx = new LoopContext({
+      allowedToolIds: Object.keys(allowed),
+      allowedToolActions: allowed,
+      baseSystemPrompt: stage.systemPrompt,
+      budget: { maxIterations: 24 },
+      capabilities: [capability],
+      context: { pipelinePhase: 'produce' },
+      messages,
+      prompt: 'Submit recorded findings.',
+      source: 'system',
+      toolSchemas: tools,
+      tracker,
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      requestedToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'fixture',
+      systemPrompt: stage.systemPrompt,
+      tools,
+    });
+    const policy = assembly.sections.find((section) => section.id === 'stagePolicy')?.content;
+    const contract = assembly.sections.find((section) => section.id === 'toolContract')?.content;
+    const readPolicy = 'Only code.read of already referenced files may supplement evidence';
+    const prohibited =
+      'code.read, search, graph, terminal, and broad exploration are out of scope for Producer.';
+    if (maySupplement) {
+      expect(policy).toContain(readPolicy);
+      expect(contract).toContain(readPolicy);
+      expect(assembly.inputLayerMessage?.content).not.toContain(prohibited);
+    } else {
+      expect(policy).toContain('Do not start new exploration or read source files');
+      expect(contract).toContain(prohibited);
+      expect(assembly.inputLayerMessage?.content).not.toContain(readPolicy);
+    }
   });
 });

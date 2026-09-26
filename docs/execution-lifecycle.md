@@ -2,6 +2,17 @@
 
 ## 运行边界与观察通知
 
+Runtime 内部按状态所有权分工，公开包入口保持不变：
+
+| 实现 | 负责内容 |
+| --- | --- |
+| `AgentRuntime` | 循环状态、取消与期限、PCV 记账、Hook/事件发送顺序、provider 调用和真实用量 |
+| `runtime/llmInput.ts` | 工具 schema/choice 兼容策略、阶段投影预算和输入大小判定；仅观察阶段端口及预算数据 |
+| `LLMInputAssembly` / `LLMInputMeasurement` | 既有消息与输入章节装配、完整 provider 请求的大小测量 |
+| `runtime/processEvents.ts` | 普通快照到开发者文本/元数据的纯投影，包括脱敏、输出完整度和 Nudge 说明 |
+
+事件时间与 PCV 快照仍在 Runtime 原构造点取得，先生成事件，再执行 Hook 和发送。事件 metadata 保持可附加，Hook 错误仍可在发送前写入。工具进度/总线与 `agent_process_event` 保留各自通道；显示投影不持有 Runtime、LoopContext、provider 或持久化端口。
+
 `AgentRuntime.execute`、阶段尝试和 Transport 共用 `shared/operation.ts` 的四态生命周期。预先取消的运行不会进入策略；运行中取消会结束等待并保留已确认的工具回执和用量，父 signal 的取消原因传至子操作。超时先固定为 timeout，再取消子操作；同步的取消回调不能把它改成成功或主动取消。超长有限期限按 Node timer 上限分段等待。
 
 硬超时继续通过 Error 拒绝，内部 Runtime/Service 共享的超时错误携带已确认的部分结果；普通执行或后置校验异常也保留本次 Runtime 绑定的已确认快照。相同 Error 被不同 Runtime 复用时按实例隔离，不采信任意外部 Error 自带的 partialResult。Service 返回 `timeout` 时保留这些工具回执、已知用量和诊断；仍在途的外部写入可能需要宿主读回，不能把取消或超时当作回滚。资源清理及清理诊断失败均不覆盖已确认结果。
@@ -19,6 +30,8 @@ EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和�
 强制摘要只有 `forcedSummary.ts` 一个实现入口。它保留 Runtime 的身份提示、显式输出预算和温度，使用有界的真实工具回执，优先容纳最新结果；参数和回执分别分配空间，失败、部分结果和截断都有标识。摘要失败或空响应保留工具结果并报告降级，不再追加第二次摘要；取消后的迟到文本丢弃，已知 input/output/reasoning/cache 用量仍归原调用统计。
 
 LLM 输入压缩只删除逐字重复的完整长行，不通过子串、大小写或缩进猜测等价。Producer 历史只有在请求 ID 非空、唯一且与回执一一对应时才折叠；摘要合并只修改本次装配生成的对象。PCV 从已确认工具结果累计证据，批次中途取消也保留已完成部分；现代 `evidenceRefs` 通过本轮台账解析为精确来源。PCV 始终是观察数据，缺失链接按当前快照重算，不升级为新的生产门。
+
+模型请求仍按“工具策略 → 阶段压缩/装配 → PCV 观察 → 大小校验 → Hook → 进度/日志 → provider”执行。最后一个宿主观察回调之后再次检查取消；已取消的请求不进入注入的 provider 端口。输入过大仍保留 PCV 观察并按原规则抑制强制摘要。Scan 的阶段说明与工具说明共用补证权限判定，只有原本允许 `code.read` 的 Scan Producer 可补读已有引用文件，普通 Producer 的探索限制不变。
 
 ## 服务与任务装配
 
