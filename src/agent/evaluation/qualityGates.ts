@@ -1,25 +1,5 @@
-/**
- * qualityGates.ts — 分析质量门(评分 + 门控 + depth/graph retry 门)
- *
- * W6-d(A1)段级迁移自 src/agent/prompts/insightGate.ts(拆前基线 4fa4814):
- * - 深度 retry 常量 DEPTH_RETRY_MIN_GROUNDED_DIMS/DEPTH_GAP_REASON(原 :49,:52)
- * - 评分/门控类型 NormalizedFinding/QualityScores/QualityReport/GateOptions/
- *   GateResult/GateableReport(原 :109-157)
- * - suggestion 路由常量 REQUIRED_MEMORY_FINDING_SUGGESTION/
- *   INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION(原 :131,:132)
- * - buildQualityScores(原 :566)、analysisQualityGate(原 :664)、
- *   applyGateThresholds(原 :680)、analysisQualityGateV1(原 :737)
- * - getArtifactMemoryFindingCount(原 :842;门与 repair prompt 共用,改由本文件单源导出)
- * - reviewInsightDepth(原 :981)、applyDepthRetryGate(原 :1002)、
- *   applyGraphRetryGate 已删除(P1-B-4)：由 gateEvaluators.applyModuleCoverageGate 替代(确定性覆盖度判据,与 provider 意愿无关)
- *
- * ⚠️ 跨段路由常量契约:DEPTH_GAP_REASON 与两条 suggestion 常量既是本文件门控产出的
- * reason/suggestion 字面,也是 prompts/insightGate.ts buildRetryPrompt 的路由键
- * (startsWith 前缀路由 + hints 精确键)。两侧必须引用同一导出——若 prompts 侧退化为
- * 本地字面量副本,编译仍绿,但深度 retry/记忆修复路由在运行期静默失效。
- *
- * @module evaluation/qualityGates
- */
+/** 分析质量评分与重试路由：区分补记发现、补充证据和已有发现的摘要重写。
+ * reason/suggestion 常量与 insightGate 提示共享，保持既定阈值和兼容工件入口。 */
 
 import {
   DEPTH_DIMENSIONS,
@@ -94,6 +74,7 @@ export interface GateResult {
 export interface GateableReport {
   analysisText: string;
   referencedFiles: string[];
+  groundedFiles?: string[];
   qualityReport?: QualityReport;
 }
 
@@ -294,6 +275,7 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
 
 function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}): GateResult {
   const needsCandidates = options.outputType === 'dual' || options.outputType === 'candidate';
+  const groundedFiles = report.groundedFiles ?? report.referencedFiles;
   const minChars = needsCandidates ? 400 : 200;
   const minFileRefs = needsCandidates ? 3 : 2;
   // V1 的「文本短/缺结构」同属写作类失败：findings 已记录充足时改走 summary_rewrite。
@@ -305,7 +287,7 @@ function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}
   if (report.analysisText.length < minChars) {
     return { pass: false, reason: 'Analysis too short', action: writingGapAction };
   }
-  if (report.referencedFiles.length < minFileRefs) {
+  if (groundedFiles.length < minFileRefs) {
     return { pass: false, reason: 'Too few file references', action: 'analysis_retry' };
   }
 
@@ -323,7 +305,7 @@ function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}
     /[-•]\s/.test(report.analysisText) ||
     /[：:].+\n/.test(report.analysisText) ||
     report.analysisText.length >= 500 ||
-    (report.referencedFiles.length >= 3 && report.analysisText.length >= 200);
+    (groundedFiles.length >= 3 && report.analysisText.length >= 200);
   if (!hasStructure) {
     return { pass: false, reason: 'Analysis lacks structure', action: writingGapAction };
   }
@@ -349,8 +331,10 @@ function reviewInsightDepth(artifact: Record<string, unknown>): DepthReviewResul
     .map((f) => (typeof f.evidence === 'string' ? f.evidence : ''))
     .join('\n');
   const analysisText = typeof artifact.analysisText === 'string' ? artifact.analysisText : '';
-  const validSourcePaths = Array.isArray(artifact.referencedFiles)
-    ? (artifact.referencedFiles as unknown[]).filter((p): p is string => typeof p === 'string')
+  // 新工件明确区分提及与接地；仅无该字段的旧宿主工件沿用 referencedFiles。
+  const grounded = artifact.groundedFiles ?? artifact.referencedFiles;
+  const validSourcePaths = Array.isArray(grounded)
+    ? (grounded as unknown[]).filter((p): p is string => typeof p === 'string')
     : [];
   return reviewRecipeDepth({ markdown: `${analysisText}\n${evidenceText}` }, { validSourcePaths });
 }

@@ -42,6 +42,18 @@ LLM 输入压缩只删除逐字重复的完整长行，不通过子串、大小�
 
 质量门的拒绝、未知动作或相互矛盾的结果不能报告 `completed`。显式 `skipOnFail=false` 仍允许后续清理阶段执行，最终结果保留未通过事实。超时判断使用各阶段的最终回执，成功重试不被历史超时记录重新判为失败。`QualityGatePolicy.toGateConfig()` 负责将 Policy 的 `ok` 翻译为 Pipeline 的 `pass`；缺少拒绝原因不会把失败变成通过。多条 SafetyPolicy 按全部同意执行，`g`/`y` 正则的匹配游标不在调用间共享。
 
+## 证据与评审边界
+
+`EvidenceCapture` 保存模型实际得到的工具观察，`EvidenceCollector` 从成功观察提取可引用源码片段，`EvidenceLedgerStore` 负责追加存储和恢复，`ProductionEvidenceLedgerAuthority` 校验严格生产的身份与完整快照。失败批次成员不会被成功成员覆盖；批量落账中途失败时，中间件保留已经确认的条目标注与统计，并报告 `persisted` 数量。写入失败不表示前项回滚。
+
+源码片段只取连续原文。outline/delta/unchanged 仍可作为台账中的工具观察，但不进入可照抄的源码片段；read/search 共用字符和每文件片段预算。只有明确完成的零命中搜索产生负空间信号，省略、截断、取消和错误都不等于没有找到。V1 报告与 V2 工件共用采集投影：`referencedFiles` 保留分析提及路径，`groundedFiles` 仅保留已采集源码片段的路径；覆盖度与深度门优先使用后者。旧宿主未提供该字段时保留原合同。
+
+台账在成功 append 后推进编号；同进程重复打开的 store 在磁盘版本变化后刷新，再读取或分配 ID。宿主仍负责每份台账只由一个进程写入，本接口不提供跨进程事务锁。严格快照和生产采集检查当前磁盘完整性；已观察到的历史删除或改写使当前 authority 失效，修复磁盘后需重新打开；截断内容只支持已完整捕获的行范围。各维度可以有独立 runtime session；跨维度导入先检查来源文件内部的 session 一致性、dimension、完整序号与内容哈希，再重编号，不能通过重算哈希认证损坏来源。普通历史读取仍可保留兼容条目，严格 authority 不接受旧哈希或部分台账。
+
+严格 Producer 在封印表达集前检查 proposal kind、非空引用数组及 authored 对象形状，Core 继续负责语义裁决。独立评审输出的分数与引用数组必须满足原始类型，不能先转换或过滤再宣称有效；mining judge 的 `uphold` 必须与既有四轴结论一致。Durable reviewer 接受 provider 的正常 `completed` 结束状态，超长期限按 Node timer 上限分段等待。评审失败、取消和超时沿既有错误与诊断合同返回，不改动生产阈值。
+
+质量门的深度重试与摘要重写测试集中在 `analysis-quality-gates.test.ts`；证据保真、台账恢复、严格 lineage 和 durable authority 各由原有测试入口验证。
+
 ## 子任务协调
 
 `AgentRunCoordinator` 在启动子任务前确认 partitioner 和 merger。`onChildResult` / `onTierComplete` 可能负责持久化，异常仍拒绝父运行；错误附带 `partialResult` 和 `coordinationFailures`。已启动子任务结算后保留各自真实回执，尚未启动的任务停止派发。每个结果按计划索引保存，重复使用同一个输入对象也不会互相覆盖。取消阻止的 tier 不发送完成回调。

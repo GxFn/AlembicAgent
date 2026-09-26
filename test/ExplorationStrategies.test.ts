@@ -884,3 +884,7 @@ describe('independent R06 repaired-boundary cases', () => {
     }
   });
 });
+
+it('preserves the analyst verification phase before recording and summary', () => {
+  expect(STRATEGY_ANALYST.phases).toEqual(['SCAN', 'EXPLORE', 'VERIFY', 'RECORD', 'SUMMARIZE']);
+});

@@ -4,25 +4,11 @@ import {
   isKnowledgeSubmit,
   readToolObservation,
 } from '../utils/toolOutcomes.js';
-/**
- * gateEvaluators.ts — PipelineStrategy gate.evaluator 适配器三件
- *
- * W6-d(A1)段级迁移(拆前基线 4fa4814):
- * - 自 src/agent/prompts/insightGate.ts:
- *   InsightGateStrategyContext(原 :160)、insightGateEvaluator(原 :1102)、
- *   EvolutionToolCallRecord(原 :1210)、evolutionGateEvaluator(原 :1230)、
- *   isSuccessfulEvolutionToolCall(原 :1315)
- * - 自 src/agent/prompts/insightProducer.ts:
- *   ReactLoopResult/ToolCallRecord/GateStrategyContext(原 :59-75)、
- *   producerRejectionGateEvaluator(原 :655)
- *
- * 适配器把 PipelineStrategy 的 (source, phaseResults, strategyContext) 签名
- * 接到工件构建(analysisArtifact)+质量门(qualityGates)+PCV 证据记录调用链。
- *
- * @module evaluation/gateEvaluators
- */
+/** Pipeline gate 适配器：分析工件接质量门，实际 evolution/submit 回执接完成判定。
+ * 同轮证据投影供后续提交使用；可观测数据不授予新的生产权限。 */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { buildPcvQualityGateEvidence } from '../runtime/PcvNodeEvidenceRecorder.js';
 import {
   type ActiveContextLike,
@@ -95,10 +81,9 @@ export function applyModuleCoverageGate<
   if (ownedFiles.length < minModuleFiles) {
     return gate;
   }
-  const referenced = Array.isArray(artifact.referencedFiles)
-    ? (artifact.referencedFiles as unknown[]).filter(
-        (file): file is string => typeof file === 'string'
-      )
+  const groundedFiles = artifact.groundedFiles ?? artifact.referencedFiles;
+  const referenced = Array.isArray(groundedFiles)
+    ? (groundedFiles as unknown[]).filter((file): file is string => typeof file === 'string')
     : [];
   // 路径形态宽容匹配(referencedFiles 可能带仓根前缀或相对形态)。
   const grounded = ownedFiles.filter((owned) =>
@@ -128,6 +113,15 @@ export function insightGateEvaluator(
   phaseResults: Record<string, unknown>,
   strategyContext: Record<string, unknown> = {}
 ) {
+  const sharedState =
+    strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
+      ? (strategyContext.sharedState as Record<string, unknown>)
+      : null;
+  // 每次 gate 都是本轮分析的完整投影；空结果也要清掉旧轮次/维度的来源，防止 submit 借用。
+  if (sharedState) {
+    sharedState._analystGraphEvidence = [];
+    sharedState._analystGroundedRanges = {};
+  }
   if (!(source as AnalystResult | null | undefined)?.reply) {
     return { action: 'degrade', reason: 'No analysis output', artifact: null };
   }
@@ -143,10 +137,7 @@ export function insightGateEvaluator(
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
   // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。
-  const sharedState =
-    strategyContext.sharedState && typeof strategyContext.sharedState === 'object'
-      ? (strategyContext.sharedState as Record<string, unknown>)
-      : null;
+
   // F4g graph-retry 已删除(P1-B-4)：它靠"命令模型调 graph"，DeepSeek 实测不从(retry 只把
   // 维度拖成 error)。替代者是下方 applyModuleCoverageGate——判据来自确定性事实(实读/接地
   // 了哪些文件)，与 provider 意愿无关。关系声明的 graph 背书仍走 F4e 注入/submit 拒绝反馈。
@@ -209,16 +200,24 @@ export function insightGateEvaluator(
       typeof artifactMetadata.memoryFindingCount === 'number'
         ? artifactMetadata.memoryFindingCount
         : 0;
-    logger().info(
-      `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} ` +
-        `total=${qr.totalScore} depth=${qr.scores.depthScore} breadth=${qr.scores.breadthScore} ` +
-        `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore} ` +
-        `memoryFindings=${memoryFindingCount}` +
-        (qr.suggestions.length > 0 ? ` suggestions=[${qr.suggestions.join('; ')}]` : '')
+    observeSafely(
+      () =>
+        logger().info(
+          `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} ` +
+            `total=${qr.totalScore} depth=${qr.scores.depthScore} breadth=${qr.scores.breadthScore} ` +
+            `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore} ` +
+            `memoryFindings=${memoryFindingCount}` +
+            (qr.suggestions.length > 0 ? ` suggestions=[${qr.suggestions.join('; ')}]` : '')
+        ),
+      () => undefined
     );
   } else {
-    logger().info(
-      `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} reason="${gate.reason || 'v1-rules'}" (v1 fallback)`
+    observeSafely(
+      () =>
+        logger().info(
+          `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} reason="${gate.reason || 'v1-rules'}" (v1 fallback)`
+        ),
+      () => undefined
     );
   }
 

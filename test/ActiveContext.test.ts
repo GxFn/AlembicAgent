@@ -660,3 +660,9 @@ describe('note_finding evidenceRefs 硬切（E3，E0 钉 1 反转）', () => {
     expect(distilled.keyFindings[0].evidence).toBe('E-9=lib/z.ts');
   });
 });
+
+it('keeps storage permissive after finding references are validated by the memory handler', () => {
+  const context = new ActiveContext();
+  context.noteKeyFinding('类型导入保持隔离', 'E-1=lib/types/agent.d.ts:1-7', 8);
+  expect(context.scratchpadSize).toBe(1);
+});

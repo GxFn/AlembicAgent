@@ -15,6 +15,7 @@ import {
   EVIDENCE_GET_MAX_LINES,
   handle as handleEvidence,
 } from '../src/tools/runtime/handlers/evidence.js';
+import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
 
 type EvidenceHandlerCtx = Parameters<typeof handleEvidence>[2];
@@ -134,6 +135,7 @@ describe('evidence 工具（E4 全链可查）', () => {
     );
     expect(targetMemoryFindingCount({ evidenceToolCallCount: 37, ledgerDistinctFiles: 0 })).toBe(3);
     expect(targetMemoryFindingCount({ evidenceToolCallCount: 37 })).toBe(19); // 无台账回退
+    expect(targetMemoryFindingCount({ evidenceToolCallCount: 0 })).toBe(3);
     expect(targetMemoryFindingCount({ evidenceToolCallCount: 4, ledgerDistinctFiles: 9 })).toBe(3);
   });
 
@@ -162,4 +164,11 @@ describe('evidence 工具（E4 全链可查）', () => {
     );
     expect(seen).toEqual([{ entries: 1, distinctFiles: 1 }]);
   });
+});
+
+test('producer exposes ledger repair reads alongside the existing submit-only knowledge action', () => {
+  const tools = new GenerateProduce().allowedTools;
+  expect(Object.keys(tools).sort()).toEqual(['evidence', 'knowledge', 'memory', 'meta']);
+  expect(tools.knowledge).toEqual(['submit']);
+  expect(tools.evidence).toEqual(['get', 'search']);
 });

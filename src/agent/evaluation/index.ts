@@ -1,9 +1,6 @@
 /**
- * evaluation — 分析工件构建 + 质量门 + gate evaluator 适配器 + stage 工厂
- *
- * W6-d(A1)自 prompts/ 拆出的评估层 barrel,仅供 Agent 仓内部 import;
- * 不是 package exports 子路径(agent-public-api-boundary 禁三段深路径),
- * 对外仍只经 @alembic/agent/prompts 既有 barrel 面世(名集恒等 re-export)。
+ * Agent 内部评估入口：工件、质量门、阶段工厂与独立评审。
+ * 宿主通过根层 prompts/evaluation/production 显式 facade 访问；此目录路径不作为包出口。
  */
 export * from './analysisArtifact.js';
 export * from './DurableSemanticReviewRuntime.js';

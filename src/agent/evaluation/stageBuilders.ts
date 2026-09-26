@@ -1,26 +1,11 @@
-/**
- * stageBuilders.ts — scan/relations Pipeline stage 工厂(接线件)
- *
- * W6-d(A1)段级迁移自 src/agent/prompts/scanPrompts.ts(拆前基线 4fa4814):
- * - 局部类型 ScanSourceFile/ScanToolCallRecord/PhaseResult/GateArtifact/
- *   ScanPipelineOpts/ProducerPromptContext(原 :23-68)
- * - buildScanPipelineStages(原 :186,内嵌 quality_gate/rejection_gate 接线与
- *   inline rejection evaluator 原 :307)
- * - buildScanProducerPrompt(原 :346,仅被 buildScanPipelineStages 消费,随迁保持私有)
- * - RELATIONS_EXPLORE_PROMPT/RELATIONS_SYNTHESIZE_PROMPT(原 :431,:458,仅被
- *   buildRelationsPipelineStages 消费,随迁保持私有)
- * - buildRelationsPipelineStages(原 :492)
- *
- * stage 名 'analyze'/'quality_gate'/'produce'/'rejection_gate' 等为半 wire
- * (主体 PcvStageNodeMap 硬编码 canonical 序列),字面串全程冻结。
- *
- * @module evaluation/stageBuilders
- */
+/** Scan 与 relations 的阶段接线；提示构建和 gate 消费同一工具回执合同。
+ * 阶段名是 runtime/host 共享标识，保持 analyze/quality_gate/produce/rejection_gate。 */
 
 import { ANALYST_SYSTEM_PROMPT } from '../prompts/insightAnalyst.js';
 import { buildRetryPrompt } from '../prompts/insightGate.js';
 import { buildCodeContextSection } from '../prompts/insightProducer.js';
 import { buildProducerFindingsSection } from '../prompts/producerFindings.js';
+import { hasPersistedCandidate, isKnowledgeSubmit } from '../utils/toolOutcomes.js';
 import { insightGateEvaluator, producerRejectionGateEvaluator } from './gateEvaluators.js';
 
 // ── Local Type Definitions ──
@@ -188,24 +173,15 @@ export function buildScanPipelineStages(
             prev: Record<string, PhaseResult>
           ) => {
             const prevProduce = prev.produce;
-            const submitCalls = (prevProduce?.toolCalls || []).filter((tc: ScanToolCallRecord) =>
-              submitToolNames.includes((tc.tool || tc.name) as string)
-            );
-            const rejected = submitCalls.filter((tc: ScanToolCallRecord) => {
-              const res = tc.result;
-              if (!res) {
-                return false;
-              }
-              if (typeof res === 'string') {
-                return res.includes('rejected') || res.includes('error');
-              }
-              return res.status === 'rejected' || res.status === 'error';
-            }).length;
+            // 与 rejection gate 共用真实提交回执；查询失败和成功内容里的 error 字样不是拒绝。
+            const rejected = (prevProduce?.toolCalls || []).filter(
+              (call) => isKnowledgeSubmit(call) && !hasPersistedCandidate(call)
+            ).length;
             return `你的 ${rejected} 个提交被拒绝了。请根据拒绝原因改进后重新提交，确保:
 1. content 必须是对象: { markdown: "...", rationale: "...", pattern: "..." }
 2. content.markdown 字段 ≥ 200 字符，含代码块 (\`\`\`)
 3. content.rationale 必填 — 设计原理说明
-4. reasoning.sources 必须是非空数组
+4. 台账在场时 params.reasoning.evidenceRefs 必填，引用真实 E-id；无台账时按当前 schema 提供 reasoning.sources
 5. 标题使用项目真实类名，不以项目名开头
 6. 必填: trigger (@kebab-case)、kind (rule/pattern/fact)、doClause (英文祈使句)`;
           },

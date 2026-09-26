@@ -1,24 +1,10 @@
-/**
- * analysisArtifact.ts — AnalysisReport(v1)/AnalysisArtifact(v2) 工件构建
- *
- * W6-d(A1)段级迁移自 src/agent/prompts/insightGate.ts(拆前基线 4fa4814):
- * - 输入类型 AnalystResult/ProjectGraphLike/ActiveContextLike/ToolCallArgsLike/
- *   RawFinding(原 :59-107)与 FILE_REF_RE(原 :171)
- * - sanitizeAnalysisText(原 :182)、extractFileRefs(原 :228)、
- *   splitMarkdownSections(原 :239)、shouldSkipDerivedFindingTitle(原 :252)、
- *   deriveFindingsFromAnalysisText(原 :256)、buildAnalysisReport(原 :297)
- * - createFsSnippetRangeReader(原 :418)、countSnippets(原 :444)、
- *   buildAnalysisArtifact(原 :452)
- *
- * 依赖走向:本文件持有 EvidenceCollector(evidence/)与 qualityGates 的评分器;
- * prompts/ 拆余不再反向依赖本文件。
- *
- * @module evaluation/analysisArtifact
- */
+/** 分析报告与工件装配：规范化工具事实、保留文本引用、补齐受限源码锚点并计算质量分。
+ * 严格生产仅接收 Core authority 投影；legacy 工具记录不生成第二份严格证据。 */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   EvidenceCollector,
@@ -26,6 +12,7 @@ import {
   type ToolCall,
 } from '../evidence/EvidenceCollector.js';
 import type { StrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
+import { readToolObservation, successfulReadPaths } from '../utils/toolOutcomes.js';
 import { buildQualityScores, type NormalizedFinding } from './qualityGates.js';
 
 // AD4: lazy logger accessor — the Core logger singleton materializes on first
@@ -57,28 +44,6 @@ export interface ActiveContextLike {
     toolCallSummary: unknown[];
     strictAnalysisContext?: StrictAnalysisContextProjectionV1;
   };
-}
-
-/** 工具调用参数 (门控模块内部使用, V2 资源导向格式) */
-interface ToolCallArgsLike {
-  action?: string;
-  params?: {
-    path?: string;
-    filePath?: string;
-    filePaths?: string[];
-    patterns?: string[];
-    pattern?: string;
-    query?: string;
-    type?: string;
-    entity?: string;
-    [key: string]: unknown;
-  };
-  filePath?: string;
-  pattern?: string;
-  query?: string;
-  className?: string;
-  protocolName?: string;
-  [key: string]: unknown;
 }
 
 /** 原始发现 (来自 ActiveContext.distill()) */
@@ -219,74 +184,73 @@ export function buildAnalysisReport(
   dimensionId: string,
   projectGraph: ProjectGraphLike | null = null
 ) {
+  return buildReportFromEvidence(
+    analystResult,
+    dimensionId,
+    projectGraph,
+    collectToolEvidence(analystResult.toolCalls || [])
+  );
+}
+
+function collectToolEvidence(toolCalls: ToolCall[]): EvidenceCollector {
+  const collector = new EvidenceCollector();
+  toolCalls.forEach((call, index) => {
+    collector.processToolCall(call, index);
+  });
+  return collector;
+}
+
+/** V1 报告和 V2 工件共用同一采集投影，outline/失败/截断结果不能变成接地事实。 */
+function buildReportFromEvidence(
+  analystResult: AnalystResult,
+  dimensionId: string,
+  projectGraph: ProjectGraphLike | null,
+  collector: EvidenceCollector
+) {
   const referencedFiles = new Set<string>();
   const searchQueries: string[] = [];
   const classesExplored: string[] = [];
 
+  const groundedFiles = new Set(
+    [...collector.build().evidenceMap.values()]
+      .filter((entry) => entry.codeSnippets.length > 0)
+      .map((entry) => entry.filePath)
+  );
   for (const call of analystResult.toolCalls || []) {
-    const tool = call.tool || call.name;
-    const args: ToolCallArgsLike = call.params || call.args || {};
-    const result = call.result;
-
-    switch (tool) {
-      case 'code': {
-        const p = args.params || args;
-        if (args.action === 'read') {
-          const fp = p.path || p.filePath || (args as ToolCallArgsLike).filePath;
-          if (fp && typeof fp === 'string') {
-            referencedFiles.add(fp);
-          }
-          if (Array.isArray(p.filePaths)) {
-            for (const f of p.filePaths) {
-              referencedFiles.add(f);
-            }
-          }
-        } else if (args.action === 'search') {
-          const pat =
-            p.pattern ||
-            p.query ||
-            (args as ToolCallArgsLike).pattern ||
-            (args as ToolCallArgsLike).query;
-          if (pat) {
-            searchQueries.push(pat as string);
-          }
-          if (typeof result === 'string') {
-            // 扩展名组后必须收 \b：否则 alternation 里 `m` 排在 `md` 前，`findings.md:120`
-            // 会被截成 `findings.m`（真机 SOURCE_REF_NOT_FOUND ×8 的来源——模型照抄了截断路径）。
-            const fileMatches = result.match(
-              /(?:^|\n)([\w/.-]+\.(?:go|mod|sum|py|pyi|java|kt|kts|js|ts|jsx|tsx|mjs|cjs|swift|m|h|c|cpp|cc|hpp|cs|rb|rs|sql|json|yaml|yml|toml|xml|html|css|scss|less|sh|md|txt|gradle|properties|proto|vue|svelte|graphql|cfg|conf|ini|env|lock|rst)\b)(?::\d+)?/gi
-            );
-            if (fileMatches) {
-              for (const m of fileMatches) {
-                const clean = m.trim().replace(/:\d+$/, '').replace(/^\n/, '');
-                if (clean.length > 2 && clean.length < 120) {
-                  referencedFiles.add(clean);
-                }
-              }
-            }
+    const { tool, action, params, result, ok } = readToolObservation(call);
+    if (!ok) {
+      continue;
+    }
+    if (tool === 'code' && action === 'read') {
+      // 请求路径不是成功回执；批量读取只纳入成功成员，与 runtime 的已读口径共用。
+      for (const file of successfulReadPaths(call)) {
+        referencedFiles.add(file);
+      }
+    } else if (tool === 'code' && action === 'search') {
+      const query = params.pattern ?? params.query;
+      if (typeof query === 'string') {
+        searchQueries.push(query);
+      }
+      if (typeof call.result === 'string') {
+        for (const file of extractFileRefs(call.result)) {
+          referencedFiles.add(file);
+        }
+      } else if (Array.isArray(result.matches)) {
+        for (const match of result.matches) {
+          if (match && typeof match === 'object' && typeof match.file === 'string') {
+            referencedFiles.add(match.file);
           }
         }
-        break;
       }
-      case 'graph': {
-        const p = args.params || args;
-        const entity =
-          p.entity ||
-          (args as ToolCallArgsLike).className ||
-          (args as ToolCallArgsLike).protocolName;
-        if (entity && typeof entity === 'string') {
-          classesExplored.push(entity);
-          if (projectGraph) {
-            const info = projectGraph.getClassInfo(entity) || projectGraph.getProtocolInfo(entity);
-            if (info?.filePath) {
-              referencedFiles.add(info.filePath);
-            }
-          }
+    } else if (tool === 'graph') {
+      const entity = params.entity ?? params.className ?? params.protocolName;
+      if (typeof entity === 'string' && entity) {
+        classesExplored.push(entity);
+        const info = projectGraph?.getClassInfo(entity) || projectGraph?.getProtocolInfo(entity);
+        if (info?.filePath) {
+          referencedFiles.add(info.filePath);
         }
-        break;
       }
-      default:
-        break;
     }
   }
 
@@ -299,6 +263,8 @@ export function buildAnalysisReport(
   return {
     analysisText: text,
     referencedFiles: [...referencedFiles],
+    // 文本提及仍保留给旧消费者；质量门只把真实读取/片段投影当作接地事实。
+    groundedFiles: [...groundedFiles],
     searchQueries,
     classesExplored,
     dimensionId,
@@ -324,7 +290,7 @@ function createFsSnippetRangeReader(projectRoot: string): SnippetRangeReader {
   return (filePath, startLine, endLine) => {
     try {
       const normalized = path.posix.normalize(String(filePath).replaceAll('\\', '/'));
-      if (path.isAbsolute(normalized) || normalized.startsWith('..')) {
+      if (path.isAbsolute(normalized) || normalized === '..' || normalized.startsWith('../')) {
         return null;
       }
       const absPath = resolveProjectPath(projectRoot, normalized).absolute;
@@ -379,16 +345,13 @@ export function buildAnalysisArtifact(
   // 严格路径的语义只来自 Core 投影；legacy reply/tool trace 不得变成第二证据面。
   const toolCalls = opts.strictColdStart ? [] : analystResult.toolCalls || [];
 
-  const baseReport = buildAnalysisReport(
+  const collector = collectToolEvidence(toolCalls);
+  const baseReport = buildReportFromEvidence(
     opts.strictColdStart ? { ...analystResult, reply: '', toolCalls: [] } : analystResult,
     dimensionId,
-    projectGraph
+    projectGraph,
+    collector
   );
-
-  const collector = new EvidenceCollector();
-  for (let i = 0; i < toolCalls.length; i++) {
-    collector.processToolCall(toolCalls[i], i);
-  }
 
   const distilled = activeContext?.distill() || { keyFindings: [], toolCallSummary: [] };
   const strictAnalysisContext = distilled.strictAnalysisContext;
@@ -432,16 +395,24 @@ export function buildAnalysisArtifact(
     ).length;
     // 残余根因分辨日志：anchored=0 → Analyst 没写行号锚（依从性缺口在上游）；
     // anchored>0 且 grounded=0 → 锚点路径解析失败；grounded>0 仍被拒 → Producer 没照抄。
-    logger().info(
-      `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, groundedSnippets=+${afterSnippets - beforeSnippets} (dim=${dimensionId})`
+    observeSafely(
+      () =>
+        logger().info(
+          `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, groundedSnippets=+${afterSnippets - beforeSnippets} (dim=${dimensionId})`
+        ),
+      () => undefined
     );
   }
 
   const evidence = collector.build();
 
   const allFiles = new Set(baseReport.referencedFiles);
+  const groundedFiles = new Set(baseReport.groundedFiles);
   for (const filePath of evidence.evidenceMap.keys()) {
     allFiles.add(filePath);
+    if (evidence.evidenceMap.get(filePath)?.codeSnippets.length) {
+      groundedFiles.add(filePath);
+    }
   }
 
   const qualityReport = buildQualityScores(baseReport.analysisText, findings, evidence, {
@@ -454,6 +425,7 @@ export function buildAnalysisArtifact(
     analysisText: baseReport.analysisText,
     findings,
     referencedFiles: [...allFiles],
+    groundedFiles: [...groundedFiles],
     dimensionId,
 
     // Layer 2: Detail
