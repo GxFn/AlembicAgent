@@ -15,7 +15,14 @@
  *   seq 续接最大序号不重号。
  */
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   EVIDENCE_ENTRY_MAX_CHARS,
@@ -26,6 +33,8 @@ import {
   makeEvidenceId,
   parseEvidenceRef,
 } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 
 export interface EvidenceLedgerStoreOptions {
   dataRoot: string;
@@ -64,7 +73,10 @@ function hashLegacyEvidenceContent(content: string): string {
 /** 确定性序列化：顶层 key 字母序 + 单行——保证 JSONL 可重放与字节级比对 */
 function stableStringifyEntry(entry: EvidenceEntry): string {
   const ordered: Record<string, unknown> = {};
-  const source = entry as unknown as Record<string, unknown>;
+  const source: Record<string, unknown> = {
+    ...entry,
+    ...(entry.range ? { range: { start: entry.range.start, end: entry.range.end } } : {}),
+  };
   for (const key of Object.keys(source).sort()) {
     if (source[key] !== undefined) {
       ordered[key] = source[key];
@@ -80,6 +92,10 @@ function stableStringifyEntry(entry: EvidenceEntry): string {
  */
 function sliceEntry(entry: EvidenceEntry, requested: EvidenceRange): EvidenceEntry | null {
   const lines = entry.content.split('\n');
+  // cap 标记前最后一行可能只剩前半段；只有更早的完整行能声明精确子区间。
+  const capturedLineCount = entry.content.endsWith(`\n${EVIDENCE_TRUNCATION_MARKER}`)
+    ? Math.max(0, lines.length - 2)
+    : lines.length;
   let startIdx: number;
   let endIdx: number;
   if (entry.range) {
@@ -95,11 +111,11 @@ function sliceEntry(entry: EvidenceEntry, requested: EvidenceRange): EvidenceEnt
     startIdx = requested.start - 1;
     endIdx = requested.end - 1;
   }
-  if (startIdx >= lines.length) {
+  if (startIdx >= capturedLineCount || endIdx >= capturedLineCount) {
     // 条目内容被截断上限裁短时，尾部行不可达——按不可解析处理
     return null;
   }
-  const content = lines.slice(startIdx, Math.min(endIdx, lines.length - 1) + 1).join('\n');
+  const content = lines.slice(startIdx, endIdx + 1).join('\n');
   return { ...entry, range: requested, content, contentHash: hashEvidenceContent(content) };
 }
 
@@ -112,6 +128,8 @@ export class EvidenceLedgerStore {
   readonly #hydrateIntegrityIssues: string[] = [];
   #seq = 0;
   #dirReady = false;
+  #diskRevision = 'missing';
+  #historyChanged = false;
 
   constructor(options: EvidenceLedgerStoreOptions) {
     this.#sessionId = options.sessionId;
@@ -129,9 +147,10 @@ export class EvidenceLedgerStore {
 
   /** 采集侧唯一写入口（E2 在工具结果收口处调用）；返回带 id 的完整条目 */
   append(draft: EvidenceEntryDraft): EvidenceEntry {
+    this.#refresh();
     const capped = this.#redactAndCap(draft.content);
     const entry: EvidenceEntry = {
-      id: makeEvidenceId(++this.#seq),
+      id: makeEvidenceId(this.#seq + 1),
       sessionId: this.#sessionId,
       dimensionId: this.#dimensionId,
       tool: draft.tool,
@@ -144,12 +163,32 @@ export class EvidenceLedgerStore {
     };
     const frozen = freezeEvidenceEntry(entry);
     this.#writeLine(frozen);
+    // durable append 成功后才消耗 ID；写失败的下次调用先刷新磁盘以发现残行。
+    this.#seq += 1;
     this.#entries.set(frozen.id, frozen);
+    this.#diskRevision = 'refresh-required';
+    try {
+      this.#diskRevision = this.#readDiskRevision();
+    } catch (err: unknown) {
+      // append 已确认，stat 只是缓存元数据；保留回执，下次访问必须重读，不能误报写入失败。
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            '[EvidenceLedger] post-append metadata unavailable; refresh required',
+            {
+              evidenceId: frozen.id,
+              error: err instanceof Error ? err.message : String(err),
+            }
+          ),
+        () => undefined
+      );
+    }
     return cloneEvidenceEntry(frozen);
   }
 
   /** 只读取回：接受 `E-12` 或 `E-12@5-20`；子区间返回派生副本（content 为切片） */
   get(ref: string): EvidenceEntry | null {
+    this.#refresh();
     const parsed = parseEvidenceRef(ref);
     if (!parsed) {
       return null;
@@ -162,6 +201,7 @@ export class EvidenceLedgerStore {
   }
 
   has(id: string): boolean {
+    this.#refresh();
     return this.#entries.has(id);
   }
 
@@ -172,6 +212,7 @@ export class EvidenceLedgerStore {
    * 直接 'stale'。
    */
   checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown' {
+    this.#refresh();
     const parsed = parseEvidenceRef(ref);
     if (!parsed) {
       return 'unknown';
@@ -198,6 +239,7 @@ export class EvidenceLedgerStore {
 
   /** 按文件路径片段检索（E3 近似候选提示 / E5 producer 展开用），按采集序返回 */
   searchByFile(fragment: string, limit = 20): EvidenceEntry[] {
+    this.#refresh();
     const needle = fragment.toLowerCase();
     const hits: EvidenceEntry[] = [];
     for (const entry of this.#entries.values()) {
@@ -212,6 +254,7 @@ export class EvidenceLedgerStore {
   }
 
   stats(): { entries: number; distinctFiles: number } {
+    this.#refresh();
     const files = new Set<string>();
     for (const entry of this.#entries.values()) {
       if (entry.file) {
@@ -223,6 +266,7 @@ export class EvidenceLedgerStore {
 
   /** 近期条目（按采集序尾部）——note_finding 引用解析失败时的真实候选提示（E3） */
   listRecent(limit = 5): EvidenceEntry[] {
+    this.#refresh();
     const all = [...this.#entries.values()];
     return all.slice(Math.max(0, all.length - limit)).map(cloneEvidenceEntry);
   }
@@ -235,6 +279,7 @@ export class EvidenceLedgerStore {
    * foreign session/dimension 都会在这里 fail closed。
    */
   listStrictSnapshotEntries(): readonly EvidenceEntry[] {
+    this.#refresh();
     if (this.#hydrateIntegrityIssues.length > 0) {
       throw new Error(
         `EVIDENCE_LEDGER_STRICT_SNAPSHOT_INVALID:${this.#hydrateIntegrityIssues.join(',')}`
@@ -251,6 +296,7 @@ export class EvidenceLedgerStore {
    * hydrate 污染都必须在交给 capture/read facet 或 AgentRuntime 前失败。
    */
   assertProductionAuthorityHealthy(): void {
+    this.#refresh();
     if (this.#hydrateIntegrityIssues.length > 0) {
       throw new Error(
         `EVIDENCE_LEDGER_PRODUCTION_AUTHORITY_INVALID:${this.#hydrateIntegrityIssues.join(',')}`
@@ -260,6 +306,7 @@ export class EvidenceLedgerStore {
 
   /** 台账内检索（E4 evidence.search）：路径片段或内容关键词，大小写不敏感，按采集序返回 */
   search(query: string, limit = 8): EvidenceEntry[] {
+    this.#refresh();
     const needle = query.toLowerCase();
     const hits: EvidenceEntry[] = [];
     for (const entry of this.#entries.values()) {
@@ -276,11 +323,32 @@ export class EvidenceLedgerStore {
     return hits;
   }
 
-  #hydrate(): void {
-    if (!existsSync(this.filePath)) {
-      return;
+  // 同进程的同步 store 操作可重开同一台账；检测磁盘版本后再分配 ID/读取 snapshot。
+  // 这不是跨进程写锁：宿主仍须让每个台账只有一个进程负责写入。
+  #refresh(): void {
+    if (this.#readDiskRevision() !== this.#diskRevision) {
+      this.#hydrate();
     }
-    const lines = readFileSync(this.filePath, 'utf8').split('\n');
+  }
+
+  #readDiskRevision(): string {
+    if (!existsSync(this.filePath)) {
+      return 'missing';
+    }
+    const stat = statSync(this.filePath, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  }
+
+  #hydrate(): void {
+    // 先完成可能失败的 I/O，再替换缓存；读取异常不能把当前磁盘版本误记为已加载。
+    const revision = this.#readDiskRevision();
+    const lines = revision === 'missing' ? [] : readFileSync(this.filePath, 'utf8').split('\n');
+    const previous = new Map(this.#entries);
+    const previousSequence = this.#seq;
+    this.#entries.clear();
+    this.#hydrateIntegrityIssues.length = 0;
+    this.#seq = 0;
+    this.#dirReady = revision !== 'missing';
     for (const [lineIndex, line] of lines.entries()) {
       const trimmed = line.trim();
       if (!trimmed) {
@@ -321,12 +389,24 @@ export class EvidenceLedgerStore {
     }
     // append-only authority 的 id 必须从 E-1 连续到磁盘最大序号；中间行被删除时不能把剩余
     // 条目误报成 complete snapshot。尾部截断若留下半行则由上面的 JSON 校验拒绝。
-    for (let sequence = 1; sequence <= this.#seq; sequence += 1) {
-      if (!this.#entries.has(makeEvidenceId(sequence))) {
-        this.#hydrateIntegrityIssues.push(`missing-id:E-${sequence}`);
+    const ids = [...this.#entries.keys()].sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)));
+    if (ids.length !== this.#seq || ids.some((id, index) => id !== makeEvidenceId(index + 1))) {
+      // O(实际条目数)，同时保留 canonical E-n 校验，E-01 不能伪装成 E-1。
+      this.#hydrateIntegrityIssues.push('missing-id:non-contiguous');
+    }
+    for (const [id, entry] of previous) {
+      const current = this.#entries.get(id);
+      if (!current || stableStringifyEntry(current) !== stableStringifyEntry(entry)) {
+        this.#historyChanged = true;
       }
     }
-    this.#dirReady = true;
+    if (this.#historyChanged) {
+      // 已见过的历史分叉不能被后续替代行洗白；恢复磁盘后需重新打开 authority。
+      this.#hydrateIntegrityIssues.push('history-changed');
+    }
+    // 已确认的历史即使被外部删除也不能复用编号；严格路径必须报告历史已改变。
+    this.#seq = Math.max(previousSequence, this.#seq);
+    this.#diskRevision = revision;
   }
 
   #writeLine(entry: EvidenceEntry): void {
@@ -380,26 +460,27 @@ export function seedLedgerFromJobSiblings(
     }
     const sourceDim = name.slice(0, -'.jsonl'.length);
     try {
-      const lines = readFileSync(join(dir, name), 'utf8').split('\n');
-      for (const line of lines) {
-        if (!line.trim()) {
-          continue;
-        }
-        const entry = JSON.parse(line) as {
-          id?: string;
-          tool?: string;
-          callId?: string;
-          file?: string;
-          range?: { start: number; end: number };
-          content?: string;
-        };
-        if (!entry.tool || typeof entry.content !== 'string') {
-          continue;
-        }
+      // 先验证完整来源再重编号；否则重算 contentHash 会把损坏/外来条目重新认证为本轮证据。
+      // 每个维度由独立 AgentRuntime 执行，来源 session 不必等于目标 session。
+      // 先取来源文件自身的身份，再由 hydrate 验证该文件内所有条目的同一 session/dimension。
+      const firstLine = readFileSync(join(dir, name), 'utf8')
+        .split('\n')
+        .find((line) => line.trim());
+      const first: unknown = firstLine ? JSON.parse(firstLine) : null;
+      if (!isValidEvidenceEntry(first)) {
+        throw new Error('EVIDENCE_LEDGER_SEED_SOURCE_IDENTITY_INVALID');
+      }
+      const source = new EvidenceLedgerStore({
+        dataRoot: options.dataRoot,
+        jobId: options.jobId,
+        sessionId: first.sessionId,
+        dimensionId: sourceDim,
+      });
+      const entries = source.listStrictSnapshotEntries();
+      for (const entry of entries) {
         store.append({
-          // 兄弟文件由同版本 store 写出，tool 必属合法枚举；此处断言仅为跨文件反序列化收窄
-          tool: entry.tool as EvidenceToolId,
-          callId: `seed:${sourceDim}:${entry.id ?? entry.callId ?? 'unknown'}`,
+          tool: entry.tool,
+          callId: `seed:${sourceDim}:${entry.id}`,
           ...(entry.file ? { file: entry.file } : {}),
           ...(entry.range ? { range: entry.range } : {}),
           content: entry.content,
@@ -407,8 +488,12 @@ export function seedLedgerFromJobSiblings(
         seeded += 1;
       }
     } catch (err: unknown) {
-      options.logger?.warn(
-        `[EvidenceLedger] seed skip ${name}: ${err instanceof Error ? err.message : String(err)}`
+      observeSafely(
+        () =>
+          options.logger?.warn(
+            `[EvidenceLedger] seed skip ${name}: ${err instanceof Error ? err.message : String(err)}`
+          ),
+        () => undefined
       );
     }
   }

@@ -13,6 +13,7 @@ import {
   type EvidenceToolId,
   isEvidenceToolId,
 } from '@alembic/core/knowledge';
+import { readToolObservation } from '../utils/toolOutcomes.js';
 import type { EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
 
 /** 管道 ToolCall 的采集视图（name 是工具族名如 'code'，action 在 args 里） */
@@ -80,7 +81,10 @@ function asFileList(value: unknown): FileItem[] {
       typeof (item as FileItem).path === 'string' &&
       typeof (item as FileItem).content === 'string'
     ) {
-      files.push(item as FileItem);
+      // 顶层 partial 成功不代表每个成员成功；失败成员可能仍携带旧 content。
+      if (readToolObservation({ result: item }).ok) {
+        files.push(item as FileItem);
+      }
     }
   }
   return files;
@@ -165,7 +169,7 @@ function normalizeDrafts(
 
   if (tool === 'code.read') {
     const files = asFileList(data?.files);
-    if (files.length > 0) {
+    if (Array.isArray(data?.files)) {
       const requestedRange = extractRequestedRange(call.args);
       return files.map((file) => {
         // run-13 EVIDENCE_STALE 事故根修：台账存 verbatim 原文（剥 `N|` 显示前缀与 omitted
@@ -289,20 +293,41 @@ function normalizeDrafts(
   return [{ tool, callId: call.id, ...(file ? { file } : {}), content }];
 }
 
+/** 仅供采集中间件恢复已确认回执；异常不意味着前面的 append 已回滚。 */
+export class EvidenceCaptureError extends Error {
+  readonly entries: readonly EvidenceEntry[];
+  constructor(cause: unknown, entries: readonly EvidenceEntry[]) {
+    super(
+      `Evidence capture failed after ${entries.length} persisted entries: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause }
+    );
+    this.name = 'EvidenceCaptureError';
+    this.entries = Object.freeze([...entries]);
+  }
+}
+
 /** 采集入口：非证据工具/失败返回→空数组（零行为）；成功→逐条落账并返回条目 */
 export function captureEvidenceFromEnvelope(
   ledger: EvidenceLedgerStore,
   call: EvidenceCaptureCall,
   envelope: EvidenceCaptureEnvelope
 ): EvidenceEntry[] {
-  if (!envelope.ok) {
+  if (!envelope.ok || !readToolObservation({ args: call.args, envelope }).ok) {
     return [];
   }
   const tool = resolveEvidenceAction(call);
   if (!tool) {
     return [];
   }
-  return normalizeDrafts(tool, call, envelope).map((draft) => ledger.append(draft));
+  const entries: EvidenceEntry[] = [];
+  try {
+    for (const draft of normalizeDrafts(tool, call, envelope)) {
+      entries.push(ledger.append(draft));
+    }
+  } catch (err: unknown) {
+    throw new EvidenceCaptureError(err, entries);
+  }
+  return entries;
 }
 
 /** 模型可见标注：`[evidence] E-1=lib/a.ts:10-14; E-2=package.json`，追加于文本尾 */

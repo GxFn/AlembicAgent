@@ -88,8 +88,12 @@ export function createProductionEvidenceLedgerAuthority(
   const binding: AuthorityBinding = { identity, store };
   const capture = Object.freeze({
     identity,
-    capture: (draft: ProductionEvidenceCaptureInputV1) =>
-      freezeEvidenceEntry(store.append(validateCaptureInput(draft))),
+    capture: (draft: ProductionEvidenceCaptureInputV1) => {
+      const validated = validateCaptureInput(draft);
+      // 已打开的 authority 也可能遇到外部写入/残行；每次提交前核对当前磁盘完整性。
+      store.assertProductionAuthorityHealthy();
+      return freezeEvidenceEntry(store.append(validated));
+    },
   }) satisfies ProductionEvidenceLedgerCaptureFacetV1;
   const read = Object.freeze({
     identity,

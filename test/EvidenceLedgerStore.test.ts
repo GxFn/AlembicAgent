@@ -5,18 +5,24 @@
  */
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, it, test, vi } from 'vitest';
 import {
   EVIDENCE_TRUNCATION_MARKER,
   EvidenceLedgerStore,
   hashEvidenceContent,
+  seedLedgerFromJobSiblings,
 } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import {
+  createProductionEvidenceLedgerAuthority,
+  resolveProductionEvidenceLedgerStore,
+} from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
 import { redactDeveloperText } from '../src/agent/utils/Redaction.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 function makeStore(overrides: { redactor?: (t: string) => string } = {}) {
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-ledger-'));
+  const dataRoot = createTempProject('evidence-ledger-');
   const store = new EvidenceLedgerStore({
     dataRoot,
     jobId: 'bootstrap_test_1',
@@ -262,5 +268,205 @@ describe('EvidenceLedgerStore', () => {
     expect(store.get('E-1@3-1')).toBeNull();
     expect(store.has('E-1')).toBe(true);
     expect(store.has('E-99')).toBe(false);
+  });
+});
+
+function ledgerCoordinates() {
+  return {
+    dataRoot: createTempProject('evidence-ledger-recovery-'),
+    jobId: 'job',
+    sessionId: 'session',
+    dimensionId: 'dimension',
+  };
+}
+it('failed ledger append cannot consume an unwritten sequence number', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  const store = resolveProductionEvidenceLedgerStore(authority);
+  fs.mkdirSync(store.filePath, { recursive: true });
+  expect(() =>
+    authority.capture.capture({ tool: 'code.read', callId: 'failed', content: 'failed write' })
+  ).toThrow();
+  fs.rmSync(store.filePath, { recursive: true });
+  const entry = authority.capture.capture({
+    tool: 'code.read',
+    callId: 'success',
+    content: 'successful read',
+  });
+  expect(entry.id).toBe('E-1');
+  expect(() => createProductionEvidenceLedgerAuthority(coordinates)).not.toThrow();
+});
+it('same-coordinate open authorities cannot produce duplicate durable evidence ids', () => {
+  const coordinates = ledgerCoordinates();
+  const first = createProductionEvidenceLedgerAuthority(coordinates);
+  const second = createProductionEvidenceLedgerAuthority(coordinates);
+  const a = first.capture.capture({ tool: 'code.read', callId: 'first', content: 'first capture' });
+  const b = second.capture.capture({
+    tool: 'code.read',
+    callId: 'second',
+    content: 'second capture',
+  });
+  expect(new Set([a.id, b.id]).size).toBe(2);
+  expect(() => createProductionEvidenceLedgerAuthority(coordinates)).not.toThrow();
+});
+it('subranges crossing the content cap cannot claim the uncaptured tail', () => {
+  const store = new EvidenceLedgerStore(ledgerCoordinates());
+  const content = Array.from({ length: 200 }, (_, i) => `line ${i + 1} ${'x'.repeat(90)}`).join(
+    '\n'
+  );
+  store.append({
+    tool: 'code.read',
+    callId: 'capped',
+    file: 'src/a.ts',
+    range: { start: 1, end: 200 },
+    content,
+  });
+  expect(store.get('E-1@70-160')).toBeNull();
+});
+it('sibling seeding must not re-certify content with a corrupt source hash', () => {
+  const coordinates = ledgerCoordinates();
+  const sibling = new EvidenceLedgerStore({ ...coordinates, dimensionId: 'source' });
+  const entry = sibling.append({
+    tool: 'code.read',
+    callId: 'source-read',
+    file: 'src/a.ts',
+    range: { start: 1, end: 1 },
+    content: 'original source',
+  });
+  fs.writeFileSync(
+    sibling.filePath,
+    `${JSON.stringify({ ...entry, content: 'altered without a matching hash' })}\n`
+  );
+  const authority = createProductionEvidenceLedgerAuthority({
+    ...coordinates,
+    dimensionId: 'cross-dimension-synthesis',
+  });
+  const target = resolveProductionEvidenceLedgerStore(authority);
+  const seeded = seedLedgerFromJobSiblings(target, {
+    ...coordinates,
+    selfDimensionId: 'cross-dimension-synthesis',
+  });
+  expect(seeded).toBe(0);
+  expect(target.stats().entries).toBe(0);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+});
+it('a failed refresh read must be retried before strict snapshot or later append', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  authority.capture.capture({ tool: 'code.read', callId: 'first', content: 'first' });
+  const peer = createProductionEvidenceLedgerAuthority(coordinates);
+  peer.capture.capture({ tool: 'code.read', callId: 'second', content: 'second' });
+  const target = resolveProductionEvidenceLedgerStore(authority).filePath;
+  const read = fs.readFileSync;
+  const spy = vi.spyOn(fs, 'readFileSync').mockImplementation(((
+    file: fs.PathOrFileDescriptor,
+    ...args: unknown[]
+  ) => {
+    if (String(file) === target) {
+      throw new Error('fixture read denied');
+    }
+    return Reflect.apply(read, fs, [file, ...args]);
+  }) as typeof fs.readFileSync);
+  syncBuiltinESMExports();
+  expect(() => authority.read.strictSnapshot()).toThrow('fixture read denied');
+  spy.mockRestore();
+  syncBuiltinESMExports();
+  expect(authority.read.strictSnapshot().entries).toHaveLength(2);
+  expect(
+    authority.capture.capture({ tool: 'code.read', callId: 'third', content: 'third' }).id
+  ).toBe('E-3');
+});
+it('a live strict authority must not silently accept removed committed tail entries', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  authority.capture.capture({ tool: 'code.read', callId: 'first', content: 'first' });
+  authority.capture.capture({ tool: 'code.read', callId: 'second', content: 'second' });
+  const target = resolveProductionEvidenceLedgerStore(authority).filePath;
+  const first = fs.readFileSync(target, 'utf8').trim().split('\n')[0];
+  fs.writeFileSync(target, `${first}\n`);
+  expect(() => authority.read.strictSnapshot()).toThrow();
+  expect(() =>
+    authority.capture.capture({ tool: 'code.read', callId: 'third', content: 'third' })
+  ).toThrow();
+});
+it('post-append metadata refresh failure cannot erase the confirmed capture receipt', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  const target = resolveProductionEvidenceLedgerStore(authority).filePath;
+  let written = false;
+  const append = fs.appendFileSync;
+  const stat = fs.statSync;
+  vi.spyOn(fs, 'appendFileSync').mockImplementation(((
+    file: fs.PathOrFileDescriptor,
+    ...args: unknown[]
+  ) => {
+    const value = Reflect.apply(append, fs, [file, ...args]);
+    if (String(file) === target) {
+      written = true;
+    }
+    return value;
+  }) as typeof fs.appendFileSync);
+  vi.spyOn(fs, 'statSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+    if (String(file) === target && written) {
+      throw new Error('fixture post-write stat failure');
+    }
+    return Reflect.apply(stat, fs, [file, ...args]);
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  let result: unknown;
+  let failure: unknown;
+  try {
+    result = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'first',
+      content: 'durable first',
+    });
+  } catch (err: unknown) {
+    failure = err;
+  }
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  expect(JSON.parse(fs.readFileSync(target, 'utf8').trim()).callId).toBe('first');
+  expect(failure).toBeUndefined();
+  expect(result).toMatchObject({ id: 'E-1', content: 'durable first' });
+});
+it('strict hydration retains canonical contiguous id validation for zero-padded ids', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  const entry = authority.capture.capture({ tool: 'code.read', callId: 'first', content: 'first' });
+  const target = resolveProductionEvidenceLedgerStore(authority).filePath;
+  fs.writeFileSync(target, `${JSON.stringify({ ...entry, id: 'E-01' })}\n`);
+  expect(() => createProductionEvidenceLedgerAuthority(coordinates)).toThrow('AUTHORITY_INVALID');
+});
+
+it('seeds complete sibling dimensions with distinct runtime sessions from the same job', () => {
+  const coordinates = ledgerCoordinates();
+  const source = new EvidenceLedgerStore({
+    ...coordinates,
+    sessionId: 'analyst-runtime',
+    dimensionId: 'source',
+  });
+  source.append({
+    tool: 'code.read',
+    callId: 'source-read',
+    content: 'verified source',
+    file: 'src/a.ts',
+  });
+  const target = new EvidenceLedgerStore({
+    ...coordinates,
+    sessionId: 'synthesis-runtime',
+    dimensionId: 'synthesis',
+  });
+  expect(seedLedgerFromJobSiblings(target, { ...coordinates, selfDimensionId: 'synthesis' })).toBe(
+    1
+  );
+  expect(target.listRecent()[0]).toMatchObject({
+    sessionId: 'synthesis-runtime',
+    callId: 'seed:source:E-1',
+    content: 'verified source',
   });
 });

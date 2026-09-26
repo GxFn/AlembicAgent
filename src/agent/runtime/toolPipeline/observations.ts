@@ -2,6 +2,7 @@
 import {
   appendEvidenceAnnotation,
   captureEvidenceFromEnvelope,
+  EvidenceCaptureError,
 } from '../../evidence/EvidenceCapture.js';
 import { readToolObservation } from '../../utils/toolOutcomes.js';
 import type {
@@ -21,7 +22,7 @@ function isSuccessfulToolObservation(call: ToolCall, result: unknown, meta: Tool
  * after（必须排在 observationRecord/traceRecord 之前）：证据类工具成功返回时自动落台账，
  * 并把 `[evidence] E-x=file:range` 标注追加进 envelope.text——模型看到的文本、记忆观察、
  * 推理链留痕三者一致，模型从第一眼即以条目 ID 认知证据。
- * loopCtx.evidenceLedger 缺席（非维度场景）或采集失败时零行为——采集是旁路，绝不阻断工具链。
+ * loopCtx.evidenceLedger 缺席（非维度场景）时零行为；采集部分失败保留已确认标注，不能宣称零落账。
  */
 export const evidenceCapture = {
   name: 'evidenceCapture',
@@ -39,10 +40,15 @@ export const evidenceCapture = {
         ctx.loopCtx.tracker?.noteLedgerStats(ledger.stats());
       }
     } catch (err: unknown) {
-      // 采集异常降级为不落账（等价改造前行为），但降级必须可观测
+      // append-only 的前项不会随后项失败回滚；先回传已确认部分，再报告剩余采集失败。
+      const entries = err instanceof EvidenceCaptureError ? err.entries : [];
+      if (entries.length > 0) {
+        envelope.text = appendEvidenceAnnotation(envelope.text, [...entries]);
+        ctx.loopCtx.tracker?.noteLedgerStats(ledger.stats());
+      }
       ctx.loopCtx.diagnostics?.warn({
         code: 'EVIDENCE_CAPTURE_FAILED',
-        message: `${call.name}: ${err instanceof Error ? err.message : String(err)}`,
+        message: `${call.name}: persisted=${entries.length}; ${err instanceof Error ? err.message : String(err)}`,
       });
     }
   },

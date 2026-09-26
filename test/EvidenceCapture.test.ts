@@ -3,7 +3,7 @@
  * 覆盖：证据工具识别、read/search 结构化归一、文本回退、失败零采集、
  * 标注格式、evidenceCapture 中间件端到端（真实台账落盘 + envelope.text 标注）。
  */
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
   appendEvidenceAnnotation,
   captureEvidenceFromEnvelope,
@@ -301,4 +301,133 @@ describe('P1-A F3 单 path read 采集', () => {
     expect(entries[0].file).toBe('src/big.ts');
     expect(entries[0].range).toBeUndefined();
   });
+});
+
+test('capture keeps only successful batch members, preserving legitimate partial successes', async () => {
+  const store = makeLedger();
+  const entries = captureEvidenceFromEnvelope(
+    store,
+    {
+      name: 'code',
+      args: { action: 'read', params: { filePaths: ['src/ok.ts', 'src/failed.ts'] } },
+      id: 'partial-batch',
+    },
+    {
+      ok: true,
+      text: 'partial batch',
+      structuredContent: {
+        files: [
+          {
+            ok: true,
+            path: 'src/ok.ts',
+            mode: 'range',
+            content: '7|confirmed line one\n8|confirmed line two',
+          },
+          {
+            ok: false,
+            path: 'src/failed.ts',
+            error: 'read denied',
+            content: '1|unconfirmed stale payload',
+          },
+        ],
+      },
+    }
+  );
+  expect(entries.map((e) => e.file)).toEqual(['src/ok.ts']);
+  expect(entries[0]).toMatchObject({
+    range: { start: 7, end: 8 },
+    content: 'confirmed line one\nconfirmed line two',
+  });
+});
+test('capture preserves exact multiline and an empty final source line for a successful batch member', async () => {
+  const store = makeLedger();
+  const entries = captureEvidenceFromEnvelope(
+    store,
+    {
+      name: 'code',
+      args: { action: 'read', params: { filePaths: ['src/a.ts', 'src/failed.ts'] } },
+      id: 'multiline',
+    },
+    {
+      ok: true,
+      text: 'partial batch',
+      structuredContent: {
+        files: [
+          {
+            ok: true,
+            path: 'src/a.ts',
+            mode: 'full',
+            content: '1|function keep() {\n2|\n3|  return "7|literal";\n4|}\n5|',
+          },
+          { ok: false, path: 'src/failed.ts', error: 'read denied' },
+        ],
+      },
+    }
+  );
+  expect(entries).toHaveLength(1);
+  expect(entries[0]).toMatchObject({
+    range: { start: 1, end: 5 },
+    content: 'function keep() {\n\n  return "7|literal";\n}\n',
+  });
+});
+test('capture never assigns a contiguous range to a discontinuous display projection', async () => {
+  const store = makeLedger();
+  const entries = captureEvidenceFromEnvelope(
+    store,
+    {
+      name: 'code',
+      args: { action: 'read', params: { filePaths: ['src/a.ts'] } },
+      id: 'discontinuous',
+    },
+    {
+      ok: true,
+      text: 'preview',
+      structuredContent: {
+        files: [{ ok: true, path: 'src/a.ts', mode: 'full', content: '1|start\n80|distant' }],
+      },
+    }
+  );
+  expect(entries).toHaveLength(1);
+  expect(entries[0].range).toBeUndefined();
+  expect(entries[0].content).toBe('1|start\n80|distant');
+});
+
+test('keeps confirmed evidence annotations when the next batch append fails', () => {
+  const ledger = makeLedger();
+  const append = ledger.append.bind(ledger);
+  vi.spyOn(ledger, 'append')
+    .mockImplementationOnce(append)
+    .mockImplementationOnce(() => {
+      throw new Error('simulated storage failure');
+    });
+  const envelope = makeEnvelope({
+    text: 'batch read',
+    structuredContent: {
+      files: [
+        { path: 'src/first.ts', content: 'confirmed' },
+        { path: 'src/second.ts', content: 'not persisted' },
+      ],
+    },
+  });
+  const warn = vi.fn();
+  const noteLedgerStats = vi.fn();
+  type AfterParams = Parameters<typeof evidenceCapture.after>;
+  evidenceCapture.after(
+    { name: 'code', args: { action: 'read' }, id: 'partial-capture' },
+    null,
+    {
+      loopCtx: { evidenceLedger: ledger, diagnostics: { warn }, tracker: { noteLedgerStats } },
+    } as unknown as AfterParams[2],
+    { envelope } as unknown as AfterParams[3]
+  );
+  expect(ledger.stats().entries).toBe(1);
+  expect(envelope.text).toContain('[evidence] E-1=src/first.ts');
+  expect(envelope.text).not.toContain('E-2');
+  expect(noteLedgerStats).toHaveBeenCalledWith({ entries: 1, distinctFiles: 1 });
+  expect(warn).toHaveBeenCalledWith(
+    expect.objectContaining({
+      code: 'EVIDENCE_CAPTURE_FAILED',
+      message: expect.stringContaining('persisted=1'),
+    })
+  );
 });

@@ -29,10 +29,12 @@ import {
   buildCodeContextSection,
   buildProducerPromptV2,
 } from '../src/agent/prompts/insightProducer.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import {
   formatRecipeAuthoringViolations,
   runInProcessRecipeAuthoringGate,
 } from '../src/tools/runtime/handlers/recipeAuthoringGate.js';
+import { createTempProject } from './helpers/tempProject.js';
 
 // 与 recipe-authoring-inprocess-flatten 相同的确定性临时项目：行 n 的文本可由公式重建。
 let projectRoot: string;
@@ -575,4 +577,119 @@ describe('R2 graph 证据流（关系声明不再被迫在阉割表述与编造 
     );
     expect(prompt).not.toContain('可复制 graphRefs');
   });
+});
+
+it.each([
+  {
+    total: 3,
+    shown: 0,
+    matches: [],
+    truncated: true,
+    omittedCount: 3,
+    omittedLocations: [{ file: 'src/a.ts', line: 1 }],
+  },
+  { total: 0, shown: 0, matches: [], incomplete: true },
+  'code.search failed: invalid regular expression',
+])('unknown/failed/truncated search is never asserted as not found: %j', (result) => {
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'search', params: { patterns: ['Transaction'] } },
+    result,
+  });
+  expect(collector.build().negativeSignals).toEqual([]);
+});
+it('derived outline content is not promoted to source snippets', () => {
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'read', params: { path: 'src/a.ts' } },
+    result: {
+      files: [
+        {
+          path: 'src/a.ts',
+          mode: 'outline',
+          content: '// class Summary\n// file structure, not source',
+        },
+      ],
+    },
+  });
+  expect(collector.build().evidenceMap.get('src/a.ts')?.codeSnippets ?? []).toEqual([]);
+});
+it('failed tool envelope cannot contribute successful-looking source snippets', () => {
+  const collector = new EvidenceCollector();
+  const call = {
+    tool: 'code',
+    args: { action: 'read', params: { path: 'src/a.ts' } },
+    result: { files: [{ path: 'src/a.ts', content: '1|unconfirmed payload' }] },
+    envelope: { ok: false, status: 'aborted', text: 'cancelled' },
+  };
+  collector.processToolCall(call);
+  expect(collector.build().evidenceMap.size).toBe(0);
+  expect(collector.build().explorationLog[0].effective).toBe(false);
+});
+it('search snippets obey the same declared collector budget as read snippets', () => {
+  const collector = new EvidenceCollector({ snippetBudget: 10 });
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'search', params: { patterns: ['needle'] } },
+    result: {
+      matches: [{ file: 'src/a.ts', line: 1, content: 'a matched line longer than ten chars' }],
+    },
+  });
+  const chars = [...collector.build().evidenceMap.values()]
+    .flatMap((e) => e.codeSnippets)
+    .reduce((s, e) => s + e.content.length, 0);
+  expect(chars).toBeLessThanOrEqual(10);
+});
+it('router head-tail display truncation never joins distant source lines in a collector snippet', () => {
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'read', params: { path: 'src/a.ts' } },
+    result:
+      '1|const first = 1;\n2|const second = 2;\n\n... [5000 chars truncated, exceeded 300 token limit] ...\n\n88|const distant = 88;',
+  });
+  expect(collector.build().evidenceMap.get('src/a.ts')?.codeSnippets[0]?.content).toBe(
+    'const first = 1;\nconst second = 2;'
+  );
+});
+
+it('outer partial envelope with no matches is unknown rather than negative evidence', () => {
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'search', params: { patterns: ['needle'] } },
+    result: { matches: [] },
+    envelope: { ok: true, status: 'partial', structuredContent: { matches: [] } },
+  });
+  expect(collector.build().negativeSignals).toEqual([]);
+});
+it('real single-path outline output cannot become a verbatim collector source snippet', async () => {
+  const coordinates = { dataRoot: createTempProject('collector-display-') };
+  writeFileSync(
+    path.join(coordinates.dataRoot, 'large.ts'),
+    Array.from({ length: 550 }, (_, i) => `export const value${i} = ${i};`).join('\n')
+  );
+  const router = new ToolRouterAdapter({
+    contextFactory: { create: () => ({ projectRoot: coordinates.dataRoot, tokenBudget: 8000 }) },
+  });
+  const args = { action: 'read', params: { path: 'large.ts' } };
+  const envelope = await router.execute({
+    toolId: 'code',
+    args,
+    surface: 'runtime',
+    actor: { user: 'test' },
+    source: { kind: 'runtime' },
+  });
+  expect(envelope.ok).toBe(true);
+  expect(envelope.text).toContain('showing head + tail');
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args,
+    result: envelope.structuredContent as string,
+    envelope,
+  });
+  expect(collector.build().evidenceMap.get('large.ts')?.codeSnippets ?? []).toEqual([]);
 });

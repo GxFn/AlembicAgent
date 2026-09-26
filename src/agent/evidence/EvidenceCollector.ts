@@ -15,6 +15,8 @@
  * @module EvidenceCollector
  */
 
+import { readToolObservation } from '../utils/toolOutcomes.js';
+
 // ── 常量 ──────────────────────────────────────────────────────────
 
 /** 单个代码片段最大行数 */
@@ -36,7 +38,7 @@ const DEFAULT_SNIPPET_BUDGET = 32_000;
 // 是「给模型看的展示态」，含三类非源码杂质，直接入库会毒化整条照抄链路：
 //   1. 范围读每行带 `42|` 行号前缀（code.ts readSingleFile 的 slice 渲染）；
 //   2. 范围读省略后缀 `... [N lines omitted; use startLine/endLine for more]`；
-//   3. batch clamp 截断标记 `... [N chars truncated for batch read budget] ...`，且标记后
+//   3. batch clamp 截断标记 batch/router 的显式截断标记，且标记后
 //      的 tail 与 head 不连续，绝不能拼进同一片段。
 // 这里在采集端一次性还原为纯源码，并用行号前缀校准 startLine（范围读的返回体不带
 // startLine 字段，前缀是唯一可靠行号来源）。
@@ -50,7 +52,7 @@ const READ_OMITTED_SUFFIX_RE =
 
 /** batch clamp 截断标记（其后的 tail 与 head 不连续，只保留 head） */
 const READ_CLAMP_MARKER_RE =
-  /\n*\.\.\. \[\d+ chars truncated for batch read budget\] \.\.\.[\s\S]*$/;
+  /\n*\.\.\. \[\d+ chars truncated(?: for batch read budget|, exceeded \d+ token limit)\] \.\.\.[\s\S]*$/;
 
 /** 净化结果：纯源码内容 + 从行号前缀校准出的起始行（无前缀时为 null） */
 interface SanitizedReadSnippet {
@@ -64,6 +66,16 @@ interface SanitizedReadSnippet {
  */
 function sanitizeReadSnippet(raw: string): SanitizedReadSnippet | null {
   let text = String(raw);
+  // 单 path 的旧返回口是纯字符串，mode 已丢失；识别宿主自身的 outline/头尾预览模板。
+  // 这些显示内容不是连续源码，即使夹有 N| 行也不能整体重新认证为 source snippet。
+  if (
+    /^\/\/ .+ — \d+ lines \(showing head \+ tail\)/.test(text) ||
+    /File has \d+ lines\. Showing outline\. Use startLine\/endLine to read specific sections\.\s*$/.test(
+      text
+    )
+  ) {
+    return null;
+  }
   // clamp 头尾拼接：只保留 head（源文件逐字前缀），丢弃标记与不连续的 tail。
   text = text.replace(READ_CLAMP_MARKER_RE, '');
   // 范围读省略后缀：剔除标记行本身。
@@ -217,6 +229,7 @@ export interface ToolCall {
   params?: ToolCallArgs;
   args?: ToolCallArgs;
   result?: ToolResult;
+  envelope?: { ok?: boolean; status?: string; text?: string; structuredContent?: unknown };
 }
 
 /** 搜索匹配条目（code.search 实际产出字段是 content；context 为历史别名兼容） */
@@ -306,14 +319,22 @@ export class EvidenceCollector {
    * @param [round=0] 调用序号
    */
   processToolCall(toolCall: ToolCall, round = 0) {
-    const tool = toolCall.tool || toolCall.name || 'unknown';
-    const rawArgs = toolCall.params || toolCall.args || {};
-    // V2 tool calls nest real params under args.params — flatten for uniform access
-    const nested =
-      rawArgs.params && typeof rawArgs.params === 'object' ? (rawArgs.params as ToolCallArgs) : {};
-    const args: ToolCallArgs = { ...nested, ...rawArgs };
-    const result = toolCall.result;
-    const hasResult = result != null && result !== '';
+    const observation = readToolObservation(toolCall);
+    const tool = observation.tool || 'unknown';
+    const args = observation.params as ToolCallArgs;
+    const raw = toolCall.envelope?.structuredContent ?? toolCall.result ?? toolCall.envelope?.text;
+    const result: ToolResult =
+      typeof raw === 'string'
+        ? raw
+        : raw && typeof raw === 'object' && 'data' in raw && typeof raw.data === 'string'
+          ? raw.data
+          : observation.result;
+    const hasResult =
+      observation.ok &&
+      result != null &&
+      result !== '' &&
+      !(typeof result === 'string' && this.#isErrorString(result));
+    let extractionFailed = false;
 
     // 按工具类型提取证据
     if (hasResult) {
@@ -324,7 +345,7 @@ export class EvidenceCollector {
             if (action === 'read') {
               this.#extractFileEvidence(args, result);
             } else if (action === 'search') {
-              this.#extractSearchEvidence(args, result);
+              this.#extractSearchEvidence(args, result, toolCall.envelope?.status !== 'partial');
             }
             break;
           case 'graph':
@@ -336,8 +357,10 @@ export class EvidenceCollector {
             break;
           // note_finding → WorkingMemory 已处理，不在此重复采集
         }
-      } catch {
-        // 证据提取失败不影响整体流程，仅记入探索日志
+      } catch (err: unknown) {
+        // 采集降级必须留在探索日志，不能把有返回体等同于成功证据。
+        extractionFailed = true;
+        void err;
       }
     }
 
@@ -346,8 +369,8 @@ export class EvidenceCollector {
       round,
       tool,
       intent: this.#inferIntent(tool, args),
-      resultSummary: this.#summarizeResult(tool, result),
-      effective: hasResult && this.#isEffective(tool, result),
+      resultSummary: `${!hasResult ? '[unconfirmed result; evidence skipped] ' : extractionFailed ? '[evidence extraction failed] ' : ''}${this.#summarizeResult(tool, result)}`,
+      effective: hasResult && !extractionFailed && this.#isEffective(tool, result),
     });
   }
 
@@ -447,7 +470,12 @@ export class EvidenceCollector {
     if (Array.isArray(result.files)) {
       for (const f of result.files) {
         const filePath = f.path || f.filePath;
-        if (filePath && f.content && !this.#isNonSourceReadMode(f.mode)) {
+        if (
+          readToolObservation({ result: f }).ok &&
+          filePath &&
+          f.content &&
+          !this.#isNonSourceReadMode(f.mode)
+        ) {
           this.#addSanitizedSnippet(filePath, f.content, f.startLine || 1);
         }
       }
@@ -467,7 +495,7 @@ export class EvidenceCollector {
 
   /** deltaCache 命中的读取模式：内容不是完整源码，不可作照抄证据 */
   #isNonSourceReadMode(mode: unknown): boolean {
-    return mode === 'unchanged' || mode === 'delta';
+    return mode === 'unchanged' || mode === 'delta' || mode === 'outline';
   }
 
   /** 净化 code.read 展示态内容后入库；行号前缀存在时以前缀校准 startLine（比参数更可靠） */
@@ -484,23 +512,17 @@ export class EvidenceCollector {
   }
 
   /** code.search — 提取匹配 + 负空间信号（字符串输出 / 批量 batchResults / 单模式 matches） */
-  #extractSearchEvidence(args: ToolCallArgs, result: ToolResult) {
+  #extractSearchEvidence(args: ToolCallArgs, result: ToolResult, complete = true) {
     const patterns = this.#extractSearchPatterns(args);
 
     if (typeof result === 'string') {
-      if (this.#isErrorString(result) || result.length < 10) {
-        for (const p of patterns) {
-          this.#addNegativeSignal(p);
-        }
-        return;
-      }
-      // search handler 的 data 是 formatSearchOutput 字符串（`path:line: content` 行）——
-      // 旧实现对正常字符串直接 return，search 命中的行号证据从不进 evidenceMap，是
-      // 冷启动候选 INSUFFICIENT_EVIDENCE / 裸路径 sourceRefs 的采集端根因。
       const parsed = parseSearchOutputText(result);
       if (parsed.length === 0) {
-        for (const p of patterns) {
-          this.#addNegativeSignal(p);
+        // 只有明确完成的零命中回执才是负证据；错误、预算省略和未知文本都不是“没找到”。
+        if (complete && /^\s*0 matches \(showing 0\)\s*$/.test(result)) {
+          for (const pattern of patterns) {
+            this.#addNegativeSignal(pattern);
+          }
         }
         return;
       }
@@ -522,8 +544,13 @@ export class EvidenceCollector {
     if (Object.keys(batchResults).length > 0) {
       for (const [pattern, sub] of Object.entries(batchResults)) {
         const subMatches = (sub as { matches?: SearchMatch[] }).matches || [];
+        if (!readToolObservation({ result: sub }).ok) {
+          continue;
+        }
         if (subMatches.length === 0) {
-          this.#addNegativeSignal(pattern);
+          if (complete && this.#isCompleteEmptySearch(sub)) {
+            this.#addNegativeSignal(pattern);
+          }
         } else {
           for (const m of subMatches.slice(0, MAX_SEARCH_MATCHES)) {
             this.#addSearchMatch(m, pattern);
@@ -535,8 +562,10 @@ export class EvidenceCollector {
 
     // 单模式搜索
     if (matches.length === 0) {
-      for (const p of patterns) {
-        this.#addNegativeSignal(p);
+      if (complete && this.#isCompleteEmptySearch(result)) {
+        for (const p of patterns) {
+          this.#addNegativeSignal(p);
+        }
       }
     } else {
       const searchNote = patterns[0] || '?';
@@ -544,6 +573,19 @@ export class EvidenceCollector {
         this.#addSearchMatch(m, searchNote);
       }
     }
+  }
+
+  /** 完整空数组是旧版已完成回执；显式部分/省略状态始终优先。 */
+  #isCompleteEmptySearch(result: ToolResultObject): boolean {
+    return (
+      Array.isArray(result.matches) &&
+      result.matches.length === 0 &&
+      !result.incomplete &&
+      result.truncated !== true &&
+      result.status !== 'partial' &&
+      (result.total === undefined || result.total === 0) &&
+      (result.omittedCount === undefined || result.omittedCount === 0)
+    );
   }
 
   /** get_class_info — 提取类结构 → evidenceMap */
@@ -640,7 +682,7 @@ export class EvidenceCollector {
   }
 
   /** 向 evidenceMap 添加代码片段 (带预算控制) */
-  #addCodeSnippet(filePath: string, content: string, startLine = 1) {
+  #addCodeSnippet(filePath: string, content: string, startLine = 1, analystNote?: string) {
     if (!filePath || !content) {
       return;
     }
@@ -648,8 +690,8 @@ export class EvidenceCollector {
       return;
     }
 
-    const entry = this.#getOrCreateEntry(filePath);
-    if (entry.codeSnippets.length >= MAX_SNIPPETS_PER_FILE) {
+    const entry = this.#evidenceMap.get(filePath);
+    if ((entry?.codeSnippets.length ?? 0) >= MAX_SNIPPETS_PER_FILE) {
       return;
     }
 
@@ -665,10 +707,11 @@ export class EvidenceCollector {
       return;
     }
 
-    entry.codeSnippets.push({
+    this.#getOrCreateEntry(filePath).codeSnippets.push({
       startLine,
       endLine: startLine + trimmed.length - 1,
       content: snippetContent,
+      ...(analystNote ? { analystNote } : {}),
     });
     this.#snippetCharsUsed += snippetContent.length;
   }
@@ -687,13 +730,9 @@ export class EvidenceCollector {
       return;
     }
 
-    const entry = this.#getOrCreateEntry(match.file);
-    if (entry.codeSnippets.length >= MAX_SNIPPETS_PER_FILE) {
-      return;
-    }
-
-    // 去重: 同一行不重复添加
-    if (entry.codeSnippets.some((s) => s.startLine === match.line)) {
+    const entry = this.#evidenceMap.get(match.file);
+    // 去重: 同一行不重复添加；随后与 read 共用片段数量和字符预算。
+    if (entry?.codeSnippets.some((s) => s.startLine === match.line)) {
       return;
     }
 
@@ -704,12 +743,7 @@ export class EvidenceCollector {
     if (!singleLine.trim()) {
       return;
     }
-    entry.codeSnippets.push({
-      startLine: match.line,
-      endLine: match.line,
-      content: singleLine,
-      analystNote: `search: "${searchNote}"`,
-    });
+    this.#addCodeSnippet(match.file, singleLine, match.line, `search: "${searchNote}"`);
   }
 
   /** 添加负空间信号 (去重) */
@@ -730,7 +764,7 @@ export class EvidenceCollector {
   /** 检测错误字符串 */
   #isErrorString(str: string) {
     // 错误处理代码本身也包含 Error/failed；只识别工具错误前缀，不在源码正文找关键字。
-    return /^\s*(?:error\s*:|tool execution error\b|cannot (?:read|search|list)\b|file not found\b|access denied\b|search failed\b|无法读取|文件不存在)/i.test(
+    return /^\s*(?:error\s*:|tool execution error\b|cannot (?:read|search|list)\b|file not found\b|access denied\b|search failed\b|code\.(?:read|search) failed\b|无法读取|文件不存在)/i.test(
       str
     );
   }
@@ -829,7 +863,7 @@ export class EvidenceCollector {
           return `${total} matches across ${batchKeys.length} patterns`;
         }
         if (result.matches) {
-          return `${result.matches.length} matches`;
+          return `${result.matches.length} matches${result.incomplete ? '; incomplete' : ''}${result.truncated ? '; truncated' : ''}`;
         }
         if (result.entries || result.children) {
           return `${(result.entries || result.children || []).length} entries`;
