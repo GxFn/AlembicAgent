@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { NudgeGenerator, PlanTracker } from '../src/agent/context/index.js';
@@ -429,20 +431,18 @@ describe('runtime efficiency diagnostics', () => {
     const source = fileURLToPath(
       new URL('../src/agent/runtime/DiagnosticsCollector.ts', import.meta.url)
     );
+    // 编译是fixture准备，不能消耗防计数死循环的3秒执行窗口；仍运行当前源码而非dist。
+    const { outputText } = ts.transpileModule(readFileSync(source, 'utf8'), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+    });
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
     const result = spawnSync(
       process.execPath,
       [
         '--input-type=module',
         '-e',
         `
-          import { readFileSync } from 'node:fs';
-          import ts from 'typescript';
-          const { outputText } = ts.transpileModule(readFileSync(${JSON.stringify(source)}, 'utf8'), {
-            compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
-          });
-          const { DiagnosticsCollector } = await import(
-            'data:text/javascript;base64,' + Buffer.from(outputText).toString('base64')
-          );
+          const { DiagnosticsCollector } = await import(${JSON.stringify(moduleUrl)});
           console.log('before: DiagnosticsCollector.from({ emptyResponses: Infinity })');
           const collector = DiagnosticsCollector.from({ emptyResponses: Infinity });
           collector.merge({ aiErrorCount: Infinity, truncatedToolCalls: Infinity });
@@ -460,7 +460,13 @@ describe('runtime efficiency diagnostics', () => {
         killSignal: 'SIGKILL',
       }
     );
-    expect(result.stdout).toContain('before: DiagnosticsCollector.from');
+    const exitInfo = JSON.stringify({
+      status: result.status,
+      signal: result.signal,
+      error: result.error?.message,
+      stderr: result.stderr,
+    });
+    expect(result.stdout, exitInfo).toContain('before: DiagnosticsCollector.from');
     expect(result.error?.message).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
     const { invalid, merged } = JSON.parse(result.stdout.trim().split('\n').at(-1) || '{}');
