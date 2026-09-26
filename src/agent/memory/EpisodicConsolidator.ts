@@ -14,6 +14,7 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 
 // ────────────────────────────────────────────────────────────
 // 本地类型定义
@@ -30,7 +31,7 @@ interface PersistentMemoryLike {
   compact(): void;
   consolidate(
     candidates: CandidateMemoryEntry[],
-    opts?: { bootstrapSession?: string }
+    opts?: { bootstrapSession?: string; clearPreviousBootstrap?: boolean }
   ): ConsolidateResult;
 }
 
@@ -161,15 +162,7 @@ export class EpisodicConsolidator {
   ) {
     const t0 = Date.now();
 
-    // 可选: 清除旧的 bootstrap 记忆 (全量重跑场景)
-    if (clearPrevious) {
-      const cleared = this.#semanticMemory.clearBootstrapMemories();
-      this.#logger.info(`[Consolidator] Cleared ${cleared} previous bootstrap memories`);
-    }
-
-    // 1. 先执行维护 (过期清理)
-    this.#semanticMemory.compact();
-
+    // 提取成功后才触及存储；全量清理交给 consolidate 的事务，失败保留上一代记忆。
     // 2. 从 findings 提取 fact 记忆
     const findingMemories = this.#extractFromFindings(sessionStore);
 
@@ -187,22 +180,28 @@ export class EpisodicConsolidator {
     const importanceDist = this.#computeImportanceDistribution(allCandidates);
     const entityCount = allCandidates.reduce((sum, c) => sum + (c.relatedEntities?.length || 0), 0);
 
-    this.#logger.info(
+    this.#log(
       `[Consolidator] Extracted ${allCandidates.length} candidate memories: ` +
         `${findingMemories.length} findings, ${insightMemories.length} insights, ` +
         `${textFactMemories.length} text facts`
     );
-    this.#logger.info(
+    this.#log(
       `[Consolidator] Per-dimension: ${dimStats.map((d) => `${d.dim}=${d.count}`).join(', ')}`
     );
-    this.#logger.info(
+    this.#log(
       `[Consolidator] Importance distribution: ${importanceDist} | Entities extracted: ${entityCount}`
     );
 
-    const result = this.#semanticMemory.consolidate(allCandidates, { bootstrapSession });
+    if (!clearPrevious) {
+      this.#semanticMemory.compact();
+    }
+    const result = this.#semanticMemory.consolidate(allCandidates, {
+      bootstrapSession,
+      ...(clearPrevious ? { clearPreviousBootstrap: true } : {}),
+    });
 
     const durationMs = Date.now() - t0;
-    this.#logger.info(
+    this.#log(
       `[Consolidator] Consolidation complete in ${durationMs}ms: ` +
         `+${result.added} ADD, ~${result.updated} UPDATE, ⊕${result.merged} MERGE, ` +
         `=${result.skipped} SKIP`
@@ -218,6 +217,13 @@ export class EpisodicConsolidator {
       importanceDistribution: this.#importanceHistogram(allCandidates),
       entityCount,
     };
+  }
+
+  #log(message: string): void {
+    observeSafely(
+      () => this.#logger.info(message),
+      () => undefined
+    );
   }
 
   // ─── 提取器 ───────────────────────────────────────────

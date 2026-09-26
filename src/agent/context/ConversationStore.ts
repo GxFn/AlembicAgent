@@ -24,7 +24,11 @@ import path from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
 import { pathGuard } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
-import { estimateTokens as _estimateTokens } from '../../shared/tokenUtils.js';
+import { observeSafely } from '#shared/observers.js';
+import {
+  estimateTokens as _estimateTokens,
+  truncateToTokenBudget,
+} from '../../shared/tokenUtils.js';
 
 /** 对话索引中的条目 */
 interface ConversationEntry {
@@ -59,7 +63,8 @@ export class ConversationStore {
 
   /** @param projectRoot 用户项目根目录 */
   constructor(projectRoot: string, wz?: WriteZone) {
-    this.#dir = path.join(projectRoot, '.asd', 'conversations');
+    this.#dir =
+      wz?.runtime('conversations').absolute ?? path.join(projectRoot, '.asd', 'conversations');
     this.#indexPath = path.join(this.#dir, 'index.json');
     this.#logger = Logger.getInstance();
     this.#wz = wz ?? null;
@@ -77,7 +82,7 @@ export class ConversationStore {
    * @param [opts.title] 对话标题
    * @returns conversationId
    */
-  create({ category = 'user', title = '' } = {}) {
+  create({ category = 'user', title = '' }: { category?: 'user' | 'system'; title?: string } = {}) {
     const id = crypto.randomUUID();
     const entry = {
       id,
@@ -137,7 +142,7 @@ export class ConversationStore {
         this.#saveIndex(index);
       }
     } catch (err: unknown) {
-      this.#logger.warn(`[ConversationStore] append failed: ${(err as Error).message}`);
+      this.#log('warn', `[ConversationStore] append failed: ${(err as Error).message}`);
     }
   }
 
@@ -164,18 +169,7 @@ export class ConversationStore {
         return [];
       }
 
-      const messages = raw
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => {
-          try {
-            const parsed = JSON.parse(line);
-            return { role: parsed.role, content: parsed.content } as ConversationMessage;
-          } catch {
-            return null;
-          }
-        })
-        .filter((m): m is ConversationMessage => m !== null);
+      const messages = this.#parseMessages(raw).map(({ role, content }) => ({ role, content }));
 
       return this.#fitWithinBudget(messages, tokenBudget);
     } catch {
@@ -227,17 +221,7 @@ export class ConversationStore {
         return false;
       }
 
-      const messages = raw
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => {
-          try {
-            return JSON.parse(line);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
+      const messages = this.#parseMessages(raw);
 
       if (messages.length < 6) {
         return false; // 太短不需要压缩
@@ -257,13 +241,14 @@ export class ConversationStore {
         maxTokens: 300,
       });
 
-      if (!summary) {
+      if (typeof summary !== 'string' || !summary.trim()) {
         return false;
       }
 
       // 模型请求期间对话可能追加、删除或被另一次摘要替换；旧快照不能覆盖较新的事实。
       if (fs.readFileSync(filePath, 'utf-8').trim() !== raw) {
-        this.#logger.info(
+        this.#log(
+          'info',
           '[ConversationStore] summary skipped: conversation changed during generation'
         );
         return false;
@@ -291,12 +276,13 @@ export class ConversationStore {
         this.#saveIndex(index);
       }
 
-      this.#logger.info(
+      this.#log(
+        'info',
         `[ConversationStore] summarized conversation ${conversationId}: ${messages.length} → ${newMessages.length} messages`
       );
       return true;
     } catch (err: unknown) {
-      this.#logger.warn(`[ConversationStore] summarize failed: ${(err as Error).message}`);
+      this.#log('warn', `[ConversationStore] summarize failed: ${(err as Error).message}`);
       return false;
     }
   }
@@ -333,7 +319,7 @@ export class ConversationStore {
 
     if (deleted > 0) {
       this.#saveIndex(kept);
-      this.#logger.info(`[ConversationStore] cleaned up ${deleted} old conversations`);
+      this.#log('info', `[ConversationStore] cleaned up ${deleted} old conversations`);
     }
 
     return { deleted };
@@ -353,56 +339,100 @@ export class ConversationStore {
    * 策略: 保留首条摘要(如有) + 最新消息，丢弃中间旧消息
    */
   #fitWithinBudget(messages: ConversationMessage[], tokenBudget: number) {
-    if (messages.length === 0) {
+    const budget =
+      tokenBudget === Infinity
+        ? Infinity
+        : Number.isFinite(tokenBudget)
+          ? Math.max(0, Math.floor(tokenBudget))
+          : DEFAULT_TOKEN_BUDGET;
+    if (messages.length === 0 || budget === 0) {
       return [];
     }
-
-    // 计算总 token
-    let totalTokens = 0;
-    const tokenCounts = messages.map((m: ConversationMessage) => {
-      const tokens = this.estimateTokens(m.content);
-      totalTokens += tokens;
-      return tokens;
-    });
-
-    if (totalTokens <= tokenBudget) {
+    const counts = messages.map((message) => this.estimateTokens(message.content));
+    if (counts.reduce((sum, count) => sum + count, 0) <= budget) {
       return messages;
     }
-
-    // 超预算 — 保留首条(摘要) + 从末尾往前取
+    const marker = (dropped: number) =>
+      `[上下文截断] 省略了 ${dropped} 条较早的消息以适应上下文窗口。`;
+    const markerTokens = this.estimateTokens(marker(messages.length));
+    const reserve = markerTokens < budget / 2 ? markerTokens : 0;
+    let remaining = budget - reserve;
     const result: ConversationMessage[] = [];
-    let used = 0;
-
-    // 如果首条是 system 摘要，优先保留
-    if (messages[0].role === 'system' && messages[0].content.startsWith('[对话摘要]')) {
-      result.push(messages[0]);
-      used += tokenCounts[0];
-    }
-
-    // 从末尾往前填充
     const tail: ConversationMessage[] = [];
-    for (let i = messages.length - 1; i >= (result.length > 0 ? 1 : 0); i--) {
-      if (used + tokenCounts[i] > tokenBudget) {
+    let firstIndex = 0;
+    // 摘要不能挤掉最近一条消息；不足时先保留最近内容，再用日志说明省略。
+    if (
+      messages[0].role === 'system' &&
+      messages[0].content.startsWith('[对话摘要]') &&
+      counts[0] + counts[counts.length - 1] <= remaining
+    ) {
+      result.push(messages[0]);
+      remaining -= counts[0];
+      firstIndex = 1;
+    }
+    for (let i = messages.length - 1; i >= firstIndex; i--) {
+      if (counts[i] > remaining) {
+        if (tail.length === 0 && remaining > 0) {
+          tail.unshift({
+            ...messages[i],
+            content: truncateToTokenBudget(messages[i].content, remaining),
+          });
+        }
         break;
       }
       tail.unshift(messages[i]);
-      used += tokenCounts[i];
+      remaining -= counts[i];
     }
-
-    // 如果丢弃了消息，插入提示
-    const keptFromStart = result.length;
-    const keptFromEnd = tail.length;
-    const dropped = messages.length - keptFromStart - keptFromEnd;
-
-    if (dropped > 0) {
-      result.push({
-        role: 'system',
-        content: `[上下文截断] 省略了 ${dropped} 条较早的消息以适应上下文窗口。`,
-      });
+    const dropped = messages.length - result.length - tail.length;
+    if (dropped > 0 && reserve > 0) {
+      result.push({ role: 'system', content: marker(dropped) });
     }
-
     result.push(...tail);
+    this.#log(
+      'info',
+      `[ConversationStore] history budget=${budget}; omitted=${dropped}; kept=${tail.length}`
+    );
     return result;
+  }
+
+  #parseMessages(raw: string): ConversationMessage[] {
+    const messages: ConversationMessage[] = [];
+    let invalid = 0;
+    for (const line of raw.split('\n').filter(Boolean)) {
+      try {
+        const value: unknown = JSON.parse(line);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          invalid++;
+          continue;
+        }
+        const record = value as Record<string, unknown>;
+        if (
+          typeof record.role !== 'string' ||
+          !record.role.trim() ||
+          typeof record.content !== 'string'
+        ) {
+          invalid++;
+          continue;
+        }
+        messages.push({ ...record, role: record.role, content: record.content });
+      } catch (err: unknown) {
+        if (!(err instanceof SyntaxError)) {
+          this.#log('warn', '[ConversationStore] unreadable message record ignored');
+        }
+        invalid++;
+      }
+    }
+    if (invalid > 0) {
+      this.#log('warn', `[ConversationStore] ignored ${invalid} invalid message record(s)`);
+    }
+    return messages;
+  }
+
+  #log(level: 'info' | 'warn', message: string): void {
+    observeSafely(
+      () => this.#logger[level](message),
+      () => undefined
+    );
   }
 
   #conversationPath(id: string) {
@@ -433,7 +463,25 @@ export class ConversationStore {
   #loadIndex() {
     try {
       if (fs.existsSync(this.#indexPath)) {
-        return JSON.parse(fs.readFileSync(this.#indexPath, 'utf-8'));
+        const value: unknown = JSON.parse(fs.readFileSync(this.#indexPath, 'utf-8'));
+        if (!Array.isArray(value)) {
+          this.#log('warn', '[ConversationStore] invalid index shape; using an empty index');
+          return [];
+        }
+        return value.filter(
+          (entry): entry is ConversationEntry =>
+            entry &&
+            typeof entry === 'object' &&
+            typeof entry.id === 'string' &&
+            entry.id.length > 0 &&
+            !/[/\\\0]/u.test(entry.id) &&
+            typeof entry.title === 'string' &&
+            typeof entry.createdAt === 'string' &&
+            typeof entry.updatedAt === 'string' &&
+            (entry.category === 'user' || entry.category === 'system') &&
+            Number.isFinite(entry.messageCount) &&
+            typeof entry.hasSummary === 'boolean'
+        );
       }
     } catch {
       /* corrupt — reset */
@@ -453,7 +501,7 @@ export class ConversationStore {
         fs.writeFileSync(this.#indexPath, JSON.stringify(index, null, 2), 'utf-8');
       }
     } catch (err: unknown) {
-      this.#logger.warn(`[ConversationStore] index save failed: ${(err as Error).message}`);
+      this.#log('warn', `[ConversationStore] index save failed: ${(err as Error).message}`);
     }
   }
 }

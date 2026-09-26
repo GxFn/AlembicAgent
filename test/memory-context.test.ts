@@ -1,12 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import fs, { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os, { tmpdir } from 'node:os';
+import path, { join } from 'node:path';
+import { pathGuard, WriteZone } from '@alembic/core/io';
+import { WorkspaceResolver } from '@alembic/core/workspace';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EpisodicConsolidator } from '../src/agent/memory/EpisodicConsolidator.js';
 import { MemoryConsolidator } from '../src/agent/memory/MemoryConsolidator.js';
 import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js';
 // MemoryRetriever 未从 src/index.ts barrel 导出 → 必须走直接路径（barrel 路径会编译失败）。
 import { MemoryRetriever } from '../src/agent/memory/MemoryRetriever.js';
+import { PersistentMemory } from '../src/agent/memory/PersistentMemory.js';
+import type { DimensionReportInput } from '../src/agent/memory/SessionStore.js';
 import {
   ConversationStore,
   MEMORY_STORE_REQUIRED_COLUMNS,
@@ -1101,4 +1106,561 @@ describe('MemoryRetriever staleness annotation (A-2)', () => {
       db.close();
     }
   });
+});
+
+const persistenceLogger = { info() {} };
+afterEach(() => vi.restoreAllMocks());
+it('preserves prior bootstrap memory when a replacement INSERT fails', () => {
+  const db = new Database(':memory:');
+  const memory = new PersistentMemory(db);
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    const old = memory.add({
+      content: 'Original bootstrap fact from previous successful generation',
+      source: 'bootstrap',
+    });
+    store.storeDimensionReport('runtime', {
+      findings: [
+        { finding: 'Replacement unique memory about async runtime cancellation', importance: 8 },
+      ],
+    });
+    db.exec(
+      "CREATE TRIGGER reject_new_memory BEFORE INSERT ON semantic_memories BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+    );
+    expect(() =>
+      new EpisodicConsolidator(memory, { logger: persistenceLogger }).consolidate(store, {
+        clearPrevious: true,
+        bootstrapSession: 'new-run',
+      })
+    ).toThrow('injected write failure');
+    expect(memory.get(old.id)?.content).toBe(
+      'Original bootstrap fact from previous successful generation'
+    );
+  } finally {
+    store.dispose();
+    db.close();
+  }
+});
+it('preserves a committed consolidation receipt if final logger fails', () => {
+  const db = new Database(':memory:');
+  try {
+    const store = new MemoryStore(db);
+    const logger = {
+      info() {
+        throw new Error('logger unavailable');
+      },
+    };
+    let error: unknown;
+    let result: unknown;
+    try {
+      result = new MemoryConsolidator(store, { logger }).consolidate([
+        { content: 'New confirmed memory after transaction commit' },
+      ]);
+    } catch (err: unknown) {
+      error = err;
+    }
+    expect(store.size()).toBe(1);
+    expect(error).toBeUndefined();
+    expect(result).toMatchObject({ added: 1 });
+  } finally {
+    db.close();
+  }
+});
+it('replaces old dimension evidence rather than accumulating both generations', () => {
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    store.storeDimensionReport('runtime', {
+      findings: [{ finding: 'old conclusion', evidence: 'old.ts:1', importance: 5 }],
+    });
+    store.storeDimensionReport('runtime', {
+      findings: [{ finding: 'new conclusion', evidence: 'new.ts:2', importance: 8 }],
+    });
+    expect(store.getDimensionReport('runtime')?.findings.map((x) => x.finding)).toEqual([
+      'new conclusion',
+    ]);
+    expect(store.searchEvidence('', 'runtime').map((x) => x.evidence.finding)).toEqual([
+      'new conclusion',
+    ]);
+  } finally {
+    store.dispose();
+  }
+});
+it('snapshot edits do not mutate the current session', () => {
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    store.storeDimensionReport('runtime', {
+      findings: [{ finding: 'confirmed finding', evidence: 'a.ts:1', importance: 8 }],
+    });
+    const snapshot = store.toJSON();
+    snapshot.dimensionReports.runtime.findings[0].finding = 'mutated outside';
+    expect(store.getDimensionReport('runtime')?.findings[0].finding).toBe('confirmed finding');
+  } finally {
+    store.dispose();
+  }
+});
+it('failed checkpoint write leaves the last valid checkpoint readable', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-probe-'));
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
+  try {
+    store.storeDimensionReport('runtime', { analysisText: 'last valid state' });
+    await store.saveCheckpoint(root);
+    const before = fs.readFileSync(target, 'utf8');
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(((
+      file: fs.PathOrFileDescriptor,
+      ...args: unknown[]
+    ) => {
+      if (String(file).startsWith(target)) {
+        write(file, '{partially-written');
+        throw new Error('injected ENOSPC');
+      }
+      return write(file, ...(args as [string, fs.WriteFileOptions]));
+    }) as typeof fs.writeFileSync);
+    store.storeDimensionReport('runtime', { analysisText: 'next state' });
+    await expect(store.saveCheckpoint(root)).rejects.toThrow('injected ENOSPC');
+    expect(fs.readFileSync(target, 'utf8')).toBe(before);
+  } finally {
+    vi.restoreAllMocks();
+    store.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+it('resolves contradictory candidates within the same incoming batch', () => {
+  const db = new Database(':memory:');
+  try {
+    const store = new MemoryStore(db);
+    new MemoryConsolidator(store).consolidate([
+      { content: 'Use a transaction to update persistent memories', type: 'fact' },
+      { content: 'Do not use a transaction to update persistent memories', type: 'fact' },
+    ]);
+    expect(store.getAllActive().map((x) => x.content)).toEqual([
+      'Do not use a transaction to update persistent memories',
+    ]);
+  } finally {
+    db.close();
+  }
+});
+it('preserves Main bootstrap constructor metadata in the session snapshot', () => {
+  const store = new SessionStore({
+    cleanupIntervalMs: 0,
+    projectName: 'fixture-project',
+    primaryLang: 'TypeScript',
+    fileCount: 9,
+    modules: ['runtime'],
+  });
+  try {
+    expect(store.toJSON().projectContext).toMatchObject({
+      projectName: 'fixture-project',
+      primaryLang: 'TypeScript',
+      fileCount: 9,
+      modules: ['runtime'],
+    });
+  } finally {
+    store.dispose();
+  }
+});
+
+describe('conversation input and read boundary', () => {
+  it('reads from the same injected data zone it writes', () => {
+    const projectRoot = makeTempRoot('conversation-project');
+    const dataRoot = makeTempRoot('conversation-data');
+    const zone = new WriteZone({
+      projectRoot,
+      dataRoot,
+      knowledgeBaseDir: 'Alembic',
+      ghost: true,
+    } as never);
+    const store = new ConversationStore(projectRoot, zone);
+    const id = store.create();
+    store.append(id, { role: 'user', content: 'data-zone fact' });
+    expect(store.list()[0]).toMatchObject({ id, messageCount: 1 });
+    expect(store.load(id)).toEqual([{ role: 'user', content: 'data-zone fact' }]);
+    expect(existsSync(join(projectRoot, '.asd/conversations'))).toBe(false);
+  });
+  it('skips malformed JSON message shapes while preserving neighboring valid messages', () => {
+    const root = makeTempRoot('conversation-shapes');
+    const store = new ConversationStore(root);
+    const id = store.create();
+    store.append(id, { role: 'user', content: 'valid first' });
+    writeFileSync(
+      join(root, '.asd/conversations', `${id}.jsonl`),
+      '\n{}\n[]\nnull\n{"role":"user","content":42}\n',
+      { flag: 'a' }
+    );
+    store.append(id, { role: 'assistant', content: 'valid last' });
+    expect(store.load(id)).toEqual([
+      { role: 'user', content: 'valid first' },
+      { role: 'assistant', content: 'valid last' },
+    ]);
+  });
+  it('recovers a malformed index shape without throwing from create/list', () => {
+    const root = makeTempRoot('conversation-index');
+    const store = new ConversationStore(root);
+    store.create();
+    writeFileSync(join(root, '.asd/conversations/index.json'), '{"unexpected":true}');
+    const id = store.create();
+    expect(store.list()).toMatchObject([{ id }]);
+  });
+  it.each([
+    0, 1, 20, 60,
+  ])('keeps loaded conversation within %i tokens including truncation markers', (budget) => {
+    const root = makeTempRoot(`conversation-budget-${budget}`);
+    const store = new ConversationStore(root);
+    const id = store.create();
+    store.append(id, { role: 'system', content: `[对话摘要] ${'旧摘要'.repeat(80)}` });
+    store.append(id, { role: 'user', content: 'older user fact' });
+    store.append(id, { role: 'assistant', content: `LATEST ${'新回复'.repeat(100)}` });
+    const messages = store.load(id, { tokenBudget: budget });
+    expect(messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)).toBeLessThanOrEqual(
+      budget
+    );
+    if (budget >= 20) {
+      expect(messages.at(-1)?.content).toContain('LATEST');
+    }
+  });
+});
+
+it('migrates legacy ledger-label evidence indexes before replacing a restored report', () => {
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    store.storeDimensionReport('runtime', {
+      findings: [
+        { finding: 'old report', evidence: 'E-1=src/a.ts:1-3; E-2=src/b.ts:4-6', importance: 8 },
+      ],
+    });
+    const legacy = store.toJSON();
+    legacy.evidenceStore = {
+      'E-1=src/a.ts': [{ dimId: 'runtime', finding: 'old report', importance: 8 }],
+    };
+    const restored = SessionStore.fromJSON(legacy);
+    try {
+      expect(restored.getEvidenceForFile('src/a.ts')).toHaveLength(1);
+      expect(restored.getEvidenceForFile('src/b.ts')).toHaveLength(1);
+      restored.storeDimensionReport('runtime', { findings: [] });
+      expect(restored.searchEvidence('')).toEqual([]);
+    } finally {
+      restored.dispose();
+    }
+  } finally {
+    store.dispose();
+  }
+});
+
+it.each([
+  '__proto__',
+  'constructor',
+])('keeps %s as ordinary restored evidence and dimension keys', (key) => {
+  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    store.storeDimensionReport(key, {
+      findings: [{ finding: 'confirmed special file', evidence: `E-1=${key}:1-2`, importance: 8 }],
+    });
+    const legacy = store.toJSON();
+    legacy.evidenceStore = Object.fromEntries([
+      [`E-1=${key}`, [{ dimId: key, finding: 'confirmed special file', importance: 8 }]],
+    ]);
+    const restored = SessionStore.fromJSON(legacy);
+    try {
+      expect(restored.getEvidenceForFile(key)).toHaveLength(1);
+      expect(Object.hasOwn(restored.buildContextSnapshot('next').previousDimensions, key)).toBe(
+        true
+      );
+    } finally {
+      restored.dispose();
+    }
+  } finally {
+    store.dispose();
+  }
+});
+
+const recoveryLog = { info() {} };
+afterEach(() => {
+  vi.restoreAllMocks();
+  pathGuard._reset();
+});
+function fixture() {
+  const db = new Database(':memory:');
+  const memory = new PersistentMemory(db);
+  const session = new SessionStore({ cleanupIntervalMs: 0 });
+  memory.add({
+    content: 'remember the user preference about monochrome editor appearance',
+    source: 'user',
+    importance: 9,
+  });
+  const old = memory.add({
+    content: 'old bootstrap generation describes obsolete unique implementation',
+    source: 'bootstrap',
+  });
+  return {
+    db,
+    memory,
+    session,
+    old,
+    dispose() {
+      session.dispose();
+      db.close();
+    },
+  };
+}
+it('atomically replaces bootstrap facts while preserving user facts', () => {
+  const f = fixture();
+  try {
+    f.session.storeDimensionReport('runtime', {
+      findings: [
+        {
+          finding: 'generated asynchronous scheduling permits reactive queue workers',
+          importance: 8,
+        },
+      ],
+    });
+    const result = new EpisodicConsolidator(f.memory, { logger: recoveryLog }).consolidate(
+      f.session,
+      { clearPrevious: true, bootstrapSession: 'new' }
+    );
+    expect(result.total.added).toBe(1);
+    expect(f.memory.get(f.old.id)).toBeNull();
+    expect(f.memory.size({ source: 'user' })).toBe(1);
+    expect(f.memory.size({ source: 'bootstrap' })).toBe(1);
+  } finally {
+    f.dispose();
+  }
+});
+it('rolls back bootstrap deletion and an earlier successful replacement insert', () => {
+  const f = fixture();
+  try {
+    f.session.storeDimensionReport('runtime', {
+      findings: [
+        { finding: 'blue circular container carries quartz stones', importance: 8 },
+        { finding: 'red hexagonal river bank shelters finches', importance: 8 },
+      ],
+    });
+    f.db.exec(
+      "CREATE TRIGGER fail_second BEFORE INSERT ON semantic_memories WHEN new.content = 'red hexagonal river bank shelters finches' BEGIN SELECT RAISE(ABORT, 'second insert failure'); END;"
+    );
+    expect(() =>
+      new EpisodicConsolidator(f.memory, { logger: recoveryLog }).consolidate(f.session, {
+        clearPrevious: true,
+      })
+    ).toThrow('second insert failure');
+    expect(f.memory.get(f.old.id)).not.toBeNull();
+    expect(f.memory.size()).toBe(2);
+  } finally {
+    f.dispose();
+  }
+});
+it('never touches prior memories if extraction fails', () => {
+  const f = fixture();
+  try {
+    vi.spyOn(f.session, 'getDimensionReport').mockImplementation(() => {
+      throw new Error('broken report');
+    });
+    f.session.storeDimensionReport('runtime', { findings: [] });
+    expect(() =>
+      new EpisodicConsolidator(f.memory, { logger: recoveryLog }).consolidate(f.session, {
+        clearPrevious: true,
+      })
+    ).toThrow('broken report');
+    expect(f.memory.get(f.old.id)).not.toBeNull();
+    expect(f.memory.size()).toBe(2);
+  } finally {
+    f.dispose();
+  }
+});
+it('observer rejections after consolidation never erase the actual return', async () => {
+  const f = fixture();
+  try {
+    f.session.storeDimensionReport('runtime', {
+      findings: [
+        {
+          finding: 'generated asynchronous scheduling permits reactive queue workers',
+          importance: 8,
+        },
+      ],
+    });
+    const observer = { info: () => Promise.reject(new Error('async observer failure')) };
+    const result = new EpisodicConsolidator(f.memory, { logger: observer }).consolidate(f.session, {
+      clearPrevious: true,
+    });
+    expect(result.total.added).toBe(1);
+    await Promise.resolve();
+    await Promise.resolve();
+  } finally {
+    f.dispose();
+  }
+});
+it('bad report replacement must not remove the live report indexes', () => {
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    s.storeDimensionReport('runtime', {
+      findings: [{ finding: 'confirmed current fact', evidence: 'old.ts:1', importance: 8 }],
+      digest: { crossRefs: { next: 'keep this confirmed reference' } },
+    });
+    const before = s.toJSON();
+    expect(() =>
+      s.storeDimensionReport('runtime', { findings: [null] } as unknown as DimensionReportInput)
+    ).toThrow();
+    expect(s.toJSON()).toEqual(before);
+  } finally {
+    s.dispose();
+  }
+});
+it('producer projection cannot alter the owned working-memory report', () => {
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    s.storeDimensionReport('runtime', {
+      referencedFiles: ['a.ts'],
+      workingMemoryDistilled: {
+        keyFindings: [{ finding: 'confirmed fact', importance: 8 }],
+        toolCallSummary: ['read a.ts'],
+      },
+    });
+    const projection = s.getDistilledForProducer('runtime');
+    if (!projection) {
+      throw new Error('Fixture must provide projection');
+    }
+    projection.keyFindings[0].finding = 'mutated producer fact';
+    projection.referencedFiles.push('rogue.ts');
+    expect(s.getDimensionReport('runtime')?.workingMemoryDistilled?.keyFindings?.[0].finding).toBe(
+      'confirmed fact'
+    );
+    expect(s.getAllReferencedFiles()).toEqual(new Set(['a.ts']));
+  } finally {
+    s.dispose();
+  }
+});
+it('context snapshot cannot alter the stored digest or submitted candidates', () => {
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    s.storeDimensionReport('runtime', { digest: { summary: 'owned digest' } });
+    s.addSubmittedCandidate('runtime', {
+      title: 'owned candidate',
+      subTopic: 'core',
+      summary: 'owned',
+    });
+    const projection = s.buildContextSnapshot('next');
+    projection.previousDimensions.runtime.summary = 'mutated digest';
+    projection.submittedCandidates[0].title = 'mutated candidate';
+    expect(s.getDimensionReport('runtime')?.digest?.summary).toBe('owned digest');
+    expect(s.toJSON().submittedCandidates.runtime[0].title).toBe('owned candidate');
+  } finally {
+    s.dispose();
+  }
+});
+it('new report generations retain unrelated and independent addEvidence data', () => {
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    s.addEvidence('independent.ts', {
+      dimId: 'runtime',
+      finding: 'independent appendix',
+      importance: 6,
+    });
+    s.storeDimensionReport('other', {
+      findings: [{ finding: 'other report', evidence: 'other.ts:2', importance: 5 }],
+    });
+    s.storeDimensionReport('runtime', {
+      findings: [{ finding: 'prior report', evidence: 'old.ts:3', importance: 8 }],
+    });
+    const restored = SessionStore.fromJSON(s.toJSON());
+    try {
+      restored.storeDimensionReport('runtime', {
+        findings: [{ finding: 'new report', evidence: 'new.ts:4', importance: 9 }],
+      });
+      expect(
+        restored
+          .searchEvidence('')
+          .map((x) => x.evidence.finding)
+          .sort()
+      ).toEqual(['independent appendix', 'new report', 'other report']);
+      expect(restored.getEvidenceForFile('new.ts')[0]).not.toHaveProperty('reportDimId');
+    } finally {
+      restored.dispose();
+    }
+  } finally {
+    s.dispose();
+  }
+});
+it('legacy snapshots infer report ownership without deleting distinct independent evidence', () => {
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  try {
+    s.addEvidence('old.ts', { dimId: 'runtime', finding: 'independent appendix', importance: 6 });
+    s.storeDimensionReport('runtime', {
+      findings: [{ finding: 'prior report', evidence: 'old.ts:3', importance: 8 }],
+    });
+    const legacy = s.toJSON();
+    for (const entries of Object.values(legacy.evidenceStore || {})) {
+      for (const e of entries) {
+        delete e.reportDimId;
+      }
+    }
+    const restored = SessionStore.fromJSON(legacy);
+    try {
+      restored.storeDimensionReport('runtime', { findings: [] });
+      expect(restored.searchEvidence('').map((x) => x.evidence.finding)).toEqual([
+        'independent appendix',
+      ]);
+    } finally {
+      restored.dispose();
+    }
+  } finally {
+    s.dispose();
+  }
+});
+it.each([
+  'fs',
+  'write-zone',
+] as const)('checkpoint write failure preserves the previous snapshot using %s', async (mode) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-cross-'));
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
+  try {
+    pathGuard.configure({ projectRoot: root, extraAllowPaths: [root] });
+    const wz =
+      mode === 'write-zone'
+        ? new WriteZone(new WorkspaceResolver({ projectRoot: root }))
+        : undefined;
+    s.storeDimensionReport('runtime', { analysisText: 'old valid state' });
+    await s.saveCheckpoint(root, wz);
+    const before = fs.readFileSync(target, 'utf8');
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(((
+      p: fs.PathOrFileDescriptor,
+      ...args: unknown[]
+    ) => {
+      if (String(p).startsWith(`${target}.`)) {
+        write(p, 'partial-stage');
+        throw new Error('injected stage ENOSPC');
+      }
+      return write(p, ...(args as [string, fs.WriteFileOptions]));
+    }) as typeof fs.writeFileSync);
+    s.storeDimensionReport('runtime', { analysisText: 'new state' });
+    await expect(s.saveCheckpoint(root, wz)).rejects.toThrow('injected stage ENOSPC');
+    expect(fs.readFileSync(target, 'utf8')).toBe(before);
+    expect(fs.readdirSync(path.dirname(target))).toEqual(['session-store.json']);
+  } finally {
+    vi.restoreAllMocks();
+    s.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+it('checkpoint rename failure is visible and preserves the previous file', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-rename-'));
+  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
+  try {
+    s.storeDimensionReport('runtime', { analysisText: 'old' });
+    await s.saveCheckpoint(root);
+    const before = fs.readFileSync(target, 'utf8');
+    vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('rename denied');
+    });
+    s.storeDimensionReport('runtime', { analysisText: 'new' });
+    await expect(s.saveCheckpoint(root)).rejects.toThrow('rename denied');
+    expect(fs.readFileSync(target, 'utf8')).toBe(before);
+    expect(fs.readdirSync(path.dirname(target))).toEqual(['session-store.json']);
+  } finally {
+    vi.restoreAllMocks();
+    s.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

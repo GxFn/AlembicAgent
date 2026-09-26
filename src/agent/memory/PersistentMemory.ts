@@ -22,6 +22,7 @@
  */
 
 import { unwrapRawDb } from '@alembic/core/search';
+import { observeSafely } from '#shared/observers.js';
 import type {
   CandidateMemory,
   ConsolidateOptions,
@@ -244,7 +245,10 @@ export class PersistentMemory {
   #log(msg: string) {
     const formatted = `[PersistentMemory] ${msg}`;
     if (this.#logger?.info) {
-      this.#logger.info(formatted);
+      observeSafely(
+        () => this.#logger?.info(formatted),
+        () => undefined
+      );
     }
   }
 }

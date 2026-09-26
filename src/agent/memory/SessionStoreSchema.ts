@@ -144,7 +144,7 @@ function validateRecords(value: unknown, label: string): Record<string, unknown>
 
 function validateFindings(value: unknown, label: string): Finding[] {
   return validateRecords(value, label).map((finding) => {
-    validateStringFields(finding, ['dimId'], label);
+    validateStringFields(finding, ['dimId', 'reportDimId'], label);
     validateNumberFields(finding, ['timestamp'], label);
     if (
       typeof finding.finding !== 'string' ||

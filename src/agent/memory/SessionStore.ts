@@ -21,12 +21,14 @@
  * @module SessionStore
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Disposable } from '@alembic/core/events';
 import { timerRegistry } from '@alembic/core/events';
 import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { stableStringify } from '#shared/serialization.js';
 import { truncateToTokenBudget } from '#shared/tokenUtils.js';
 import type { SessionStoreSerialized } from './SessionStoreSchema.js';
@@ -54,6 +56,8 @@ export interface Finding {
   importance: number;
   dimId?: string;
   timestamp?: number;
+  /** 检查点中的派生索引归属；独立 addEvidence 不接受此字段。 */
+  reportDimId?: string;
 }
 
 /** 候选摘要 */
@@ -177,7 +181,14 @@ export class SessionStore implements Disposable {
   #logger: ReturnType<typeof Logger.getInstance>;
 
   constructor(config: SessionStoreConfig = {}) {
-    this.#projectContext = config.projectContext || {};
+    this.#projectContext = structuredClone({
+      ...Object.fromEntries(
+        ['projectName', 'primaryLang', 'fileCount', 'modules']
+          .filter((key) => config[key] !== undefined)
+          .map((key) => [key, config[key]])
+      ),
+      ...(config.projectContext || {}),
+    });
     this.#ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
     this.#logger = Logger.getInstance();
 
@@ -197,7 +208,8 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   /** 维度完成后存储完整报告 */
-  storeDimensionReport(dimId: string, report: DimensionReportInput) {
+  storeDimensionReport(dimId: string, input: DimensionReportInput) {
+    const report = structuredClone(input);
     // findings 统一形状: { finding: string, evidence: string, importance: number }
     // P0 Fix: evidence 可能是 array/object，强制 string
     const findings: Finding[] = (report.findings || []).map((f) => ({
@@ -213,27 +225,47 @@ export class SessionStore implements Disposable {
       importance: f.importance || 5,
     }));
 
-    this.#dimensionReports.set(dimId, {
-      dimId,
-      completedAt: Date.now(),
-      analysisText: report.analysisText || '',
-      findings,
-      referencedFiles: report.referencedFiles || [],
-      candidatesSummary: report.candidatesSummary || [],
-      workingMemoryDistilled: report.workingMemoryDistilled || null,
-      digest: report.digest || null,
-    });
+    const nextReport = validateSessionStoreShape({
+      dimensionReports: {
+        [dimId]: {
+          dimId,
+          completedAt: Date.now(),
+          analysisText: report.analysisText || '',
+          findings,
+          referencedFiles: report.referencedFiles || [],
+          candidatesSummary: report.candidatesSummary || [],
+          workingMemoryDistilled: report.workingMemoryDistilled || null,
+          digest: report.digest || null,
+        },
+      },
+    }).dimensionReports[dimId];
+    // 报告及其派生索引是一代数据；只删本维报告产生的索引，保留独立追加证据。
+    for (const [file, entries] of this.#evidenceStore) {
+      const kept = entries.filter((entry) => entry.reportDimId !== dimId);
+      if (kept.length > 0) {
+        this.#evidenceStore.set(file, kept);
+      } else {
+        this.#evidenceStore.delete(file);
+      }
+    }
+    this.#crossReferences = this.#crossReferences.filter((ref) => ref.from !== dimId);
+    this.#dimensionReports.set(dimId, nextReport);
 
     // 自动提取文件级 Evidence
     for (const f of findings) {
       if (f.evidence) {
         const ev = typeof f.evidence === 'string' ? f.evidence : String(f.evidence);
-        const filePath = ev.split(':')[0];
-        this.addEvidence(filePath, {
-          dimId,
-          finding: f.finding,
-          importance: f.importance,
-        });
+        for (const filePath of evidenceFilePaths(ev)) {
+          const entries = this.#evidenceStore.get(filePath) || [];
+          entries.push({
+            dimId,
+            reportDimId: dimId,
+            finding: f.finding,
+            importance: f.importance,
+            timestamp: Date.now(),
+          });
+          this.#evidenceStore.set(filePath, entries);
+        }
       }
     }
 
@@ -251,7 +283,8 @@ export class SessionStore implements Disposable {
       }
     }
 
-    this.#logger.info(
+    this.#log(
+      'info',
       `[SessionStore] Stored report for "${dimId}": ` +
         `${report.findings?.length || 0} findings, ` +
         `${report.referencedFiles?.length || 0} files`
@@ -259,7 +292,7 @@ export class SessionStore implements Disposable {
   }
 
   getDimensionReport(dimId: string): DimensionReport | undefined {
-    return this.#dimensionReports.get(dimId);
+    return structuredClone(this.#dimensionReports.get(dimId));
   }
 
   getCompletedDimensions() {
@@ -270,20 +303,19 @@ export class SessionStore implements Disposable {
   // §2: Evidence Store
   // ═══════════════════════════════════════════════════════
 
-  addEvidence(filePath: string, evidence: Omit<Finding, 'timestamp'>) {
+  addEvidence(filePath: string, evidence: Omit<Finding, 'timestamp' | 'reportDimId'>) {
     let evidenceList = this.#evidenceStore.get(filePath);
     if (!evidenceList) {
       evidenceList = [];
       this.#evidenceStore.set(filePath, evidenceList);
     }
-    evidenceList.push({
-      ...evidence,
-      timestamp: Date.now(),
-    });
+    const owned = structuredClone(evidence) as Finding;
+    delete owned.reportDimId;
+    evidenceList.push({ ...owned, timestamp: Date.now() });
   }
 
   getEvidenceForFile(filePath: string): Finding[] {
-    return this.#evidenceStore.get(filePath) || [];
+    return (this.#evidenceStore.get(filePath) || []).map(publicEvidence);
   }
 
   /** @returns >} */
@@ -298,7 +330,7 @@ export class SessionStore implements Disposable {
         const matchesFile = filePath.toLowerCase().includes(lowerQuery);
         const matchesFinding = (ev.finding || '').toLowerCase().includes(lowerQuery);
         if (matchesFile || matchesFinding) {
-          results.push({ filePath, evidence: ev });
+          results.push({ filePath, evidence: publicEvidence(ev) });
         }
       }
     }
@@ -327,7 +359,9 @@ export class SessionStore implements Disposable {
   // §4: DimensionDigest 兼容层
   // ═══════════════════════════════════════════════════════
 
-  addDimensionDigest(dimId: string, digest: DimensionDigest) {
+  addDimensionDigest(dimId: string, input: DimensionDigest) {
+    const digest = structuredClone(input);
+    this.#crossReferences = this.#crossReferences.filter((ref) => ref.from !== dimId);
     const existing = this.#dimensionReports.get(dimId);
     if (existing) {
       existing.digest = digest;
@@ -372,8 +406,9 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   addTierReflection(tierIndex: number, reflection: TierReflection) {
-    this.#tierReflections.push(reflection);
-    this.#logger.info(
+    this.#tierReflections.push(structuredClone(reflection));
+    this.#log(
+      'info',
       `[SessionStore] Tier ${tierIndex + 1} reflection: ` +
         `${reflection.topFindings?.length || 0} top findings, ` +
         `${reflection.crossDimensionPatterns?.length || 0} patterns`
@@ -382,7 +417,7 @@ export class SessionStore implements Disposable {
 
   /** 获取所有 TierReflection (F17: EpisodicConsolidator 需要) */
   getTierReflections() {
-    return [...this.#tierReflections];
+    return structuredClone(this.#tierReflections);
   }
 
   getRelevantReflections(currentDimId: string): string | null {
@@ -556,7 +591,7 @@ export class SessionStore implements Disposable {
 
   /** 兼容 DimensionContext.buildContextForDimension 返回格式 */
   buildContextSnapshot(currentDimId: string) {
-    const previousDimensions: Record<string, DimensionDigest> = {};
+    const previousDimensions: Record<string, DimensionDigest> = Object.create(null);
     for (const [dimId, report] of this.#dimensionReports) {
       if (dimId === currentDimId) {
         continue;
@@ -573,7 +608,7 @@ export class SessionStore implements Disposable {
     for (const [, candidates] of this.#submittedCandidates) {
       submittedCandidates.push(...candidates);
     }
-    return { previousDimensions, submittedCandidates };
+    return structuredClone({ previousDimensions, submittedCandidates });
   }
 
   // ═══════════════════════════════════════════════════════
@@ -590,11 +625,11 @@ export class SessionStore implements Disposable {
       return null;
     }
 
-    return {
+    return structuredClone({
       keyFindings: report.workingMemoryDistilled?.keyFindings || [],
       toolCallSummary: report.workingMemoryDistilled?.toolCallSummary || [],
       referencedFiles: report.referencedFiles || [],
-    };
+    });
   }
 
   // ═══════════════════════════════════════════════════════
@@ -685,36 +720,59 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   async saveCheckpoint(projectRoot: string, wz?: WriteZone) {
-    const checkpointDir = path.join(projectRoot, '.asd', 'bootstrap-checkpoint');
+    const relative = '.asd/bootstrap-checkpoint/session-store.json';
+    const target = wz?.data(relative).absolute ?? path.join(projectRoot, relative);
+    const temporaryRelative = `${relative}.${randomUUID()}.tmp`;
+    const temporary =
+      wz?.data(temporaryRelative).absolute ?? path.join(projectRoot, temporaryRelative);
     try {
+      const snapshot = this.toJSON();
       const data = {
-        ...this.toJSON(),
+        ...snapshot,
         version: 2,
         savedAt: Date.now(),
         dimensionReports: Object.fromEntries(
-          [...this.#dimensionReports].map(([k, v]) => [
-            k,
-            {
-              ...v,
-              analysisText: v.analysisText?.substring(0, 500) || '',
-            },
+          Object.entries(snapshot.dimensionReports).map(([id, report]) => [
+            id,
+            { ...report, analysisText: report.analysisText.substring(0, 500) },
           ])
         ),
-        crossReferences: this.#crossReferences,
-        tierReflections: this.#tierReflections,
-        submittedCandidates: Object.fromEntries(this.#submittedCandidates),
-        evidenceIndex: [...this.#evidenceStore.keys()],
+        evidenceIndex: Object.keys(snapshot.evidenceStore || {}),
       };
       const content = JSON.stringify(data, null, 2);
+      // 同目录临时文件写完才替换；失败不能破坏上一次可恢复检查点。
       if (wz) {
-        wz.writeFile(wz.data('.asd/bootstrap-checkpoint/session-store.json'), content);
+        wz.writeFile(wz.data(temporaryRelative), content);
+        wz.rename(wz.data(temporaryRelative), wz.data(relative));
       } else {
-        fs.mkdirSync(checkpointDir, { recursive: true });
-        fs.writeFileSync(path.join(checkpointDir, 'session-store.json'), content, 'utf-8');
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(temporary, content, 'utf-8');
+        fs.renameSync(temporary, target);
       }
-      this.#logger.info(`[SessionStore] Checkpoint saved: ${this.#dimensionReports.size} reports`);
+      this.#log('info', `[SessionStore] Checkpoint saved: ${this.#dimensionReports.size} reports`);
     } catch (err: unknown) {
-      this.#logger.warn(`[SessionStore] Failed to save checkpoint: ${(err as Error).message}`);
+      this.#log(
+        'warn',
+        `[SessionStore] Failed to save checkpoint; previous file retained: ${err instanceof Error ? err.message : String(err)}`
+      );
+      throw err instanceof Error
+        ? err
+        : new Error('Session checkpoint write failed', { cause: err });
+    } finally {
+      try {
+        if (wz) {
+          if (fs.existsSync(temporary)) {
+            wz.remove(wz.data(temporaryRelative));
+          }
+        } else {
+          fs.rmSync(temporary, { force: true });
+        }
+      } catch (err: unknown) {
+        this.#log(
+          'warn',
+          `[SessionStore] temporary checkpoint cleanup failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
   }
 
@@ -738,11 +796,11 @@ export class SessionStore implements Disposable {
       const data = JSON.parse(raw);
 
       if (data.version !== 1 && data.version !== 2) {
-        this.#logger.warn(`[SessionStore] Unsupported checkpoint version: ${data.version}`);
+        this.#log('warn', `[SessionStore] Unsupported checkpoint version: ${data.version}`);
         return false;
       }
       if (Date.now() - data.savedAt > 3600_000) {
-        this.#logger.info(`[SessionStore] Checkpoint expired (>1h), ignoring`);
+        this.#log('info', `[SessionStore] Checkpoint expired (>1h), ignoring`);
         return false;
       }
 
@@ -755,10 +813,10 @@ export class SessionStore implements Disposable {
       });
       this.#restoreSnapshot(validated);
 
-      this.#logger.info(`[SessionStore] Checkpoint loaded: ${this.#dimensionReports.size} reports`);
+      this.#log('info', `[SessionStore] Checkpoint loaded: ${this.#dimensionReports.size} reports`);
       return true;
     } catch (err: unknown) {
-      this.#logger.warn(`[SessionStore] Failed to load checkpoint: ${(err as Error).message}`);
+      this.#log('warn', `[SessionStore] Failed to load checkpoint: ${(err as Error).message}`);
       return false;
     }
   }
@@ -768,14 +826,14 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
 
   toJSON(): SessionStoreSerialized {
-    return {
+    return structuredClone({
       dimensionReports: Object.fromEntries(this.#dimensionReports),
       crossReferences: this.#crossReferences,
       tierReflections: this.#tierReflections,
       submittedCandidates: Object.fromEntries(this.#submittedCandidates),
       projectContext: this.#projectContext,
       evidenceStore: Object.fromEntries(this.#evidenceStore),
-    };
+    });
   }
 
   static fromJSON(json: Record<string, unknown>) {
@@ -789,13 +847,75 @@ export class SessionStore implements Disposable {
 
   /** 验证/克隆已在外部完成；在任何字段替换前构造所有集合，失败不污染当前会话。 */
   #restoreSnapshot(snapshot: SessionStoreSerialized): void {
-    const evidence: Record<string, Finding[]> = snapshot.evidenceStore ?? Object.create(null);
+    const evidence: Record<string, Finding[]> = Object.assign(
+      Object.create(null),
+      snapshot.evidenceStore || {}
+    );
     if (snapshot.evidenceStore === undefined) {
       for (const [dimId, report] of Object.entries(snapshot.dimensionReports)) {
         for (const finding of report.findings) {
           if (finding.evidence) {
-            const file = finding.evidence.split(':')[0];
-            (evidence[file] ??= []).push({ ...finding, dimId, timestamp: report.completedAt });
+            for (const file of evidenceFilePaths(finding.evidence)) {
+              (evidence[file] ??= []).push({
+                ...finding,
+                dimId,
+                reportDimId: dimId,
+                timestamp: report.completedAt,
+              });
+            }
+          }
+        }
+      }
+    }
+    for (const [dimId, report] of Object.entries(snapshot.dimensionReports)) {
+      for (const finding of report.findings) {
+        if (!finding.evidence) {
+          continue;
+        }
+        const files = evidenceFilePaths(finding.evidence);
+        const oldFile = finding.evidence.split(':')[0];
+        // 旧版把 E-id=path 整体当文件键；仅迁移与本报告匹配的那一项，独立证据仍原样保留。
+        if (!files.includes(oldFile)) {
+          const oldEntries = evidence[oldFile] || [];
+          const index = oldEntries.findIndex(
+            (entry) =>
+              entry.reportDimId === undefined &&
+              entry.dimId === dimId &&
+              entry.finding === finding.finding &&
+              entry.importance === finding.importance
+          );
+          if (index >= 0) {
+            const [legacy] = oldEntries.splice(index, 1);
+            if (oldEntries.length === 0) {
+              delete evidence[oldFile];
+            }
+            for (const file of files) {
+              (evidence[file] ??= []).push({ ...legacy, reportDimId: dimId });
+            }
+            this.#log(
+              'info',
+              '[SessionStore] restored legacy report evidence paths from ledger labels'
+            );
+          }
+        }
+        for (const file of files) {
+          const candidates = evidence[file] || [];
+          if (
+            candidates.some(
+              (entry) => entry.reportDimId === dimId && entry.finding === finding.finding
+            )
+          ) {
+            continue;
+          }
+          const legacy = candidates.find(
+            (entry) =>
+              entry.reportDimId === undefined &&
+              entry.dimId === dimId &&
+              entry.finding === finding.finding &&
+              entry.importance === finding.importance
+          );
+          if (legacy) {
+            legacy.reportDimId = dimId;
           }
         }
       }
@@ -889,6 +1009,13 @@ export class SessionStore implements Disposable {
   // 私有方法
   // ═══════════════════════════════════════════════════════
 
+  #log(level: 'info' | 'warn', message: string): void {
+    observeSafely(
+      () => this.#logger[level](message),
+      () => undefined
+    );
+  }
+
   /** 从 findings 中选择与当前焦点最相关的 */
   #selectRelevantFindings(
     findings: Finding[] | undefined,
@@ -962,4 +1089,22 @@ function normalizeCacheArgs(args: ToolArgs): Record<string, unknown> {
     delete normalized.filePath;
   }
   return normalized;
+}
+
+/** ledger 引用先展开路径；旧纯 file:line 仍按既有入口接受。 */
+function evidenceFilePaths(evidence: string): string[] {
+  const labelled = [...evidence.matchAll(/(?:^|;\s*)E-\d+(?:@\d+-\d+)?=([^;\n]+)/g)]
+    .map((match) =>
+      match[1]
+        .split(' — ')[0]
+        .split(' [unverified:')[0]
+        .replace(/:\d+(?:-\d+)?\b.*$/, '')
+        .trim()
+    )
+    .filter(Boolean);
+  return labelled.length ? [...new Set(labelled)] : [evidence.split(':')[0]];
+}
+function publicEvidence(evidence: Finding): Finding {
+  const { reportDimId: _owner, ...finding } = evidence;
+  return structuredClone(finding);
 }

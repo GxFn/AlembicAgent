@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
+import { observeSafely } from '#shared/observers.js';
 import { MemoryStore } from './MemoryStore.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
@@ -37,6 +38,8 @@ export interface ConsolidateStats {
 /** consolidate 选项 */
 export interface ConsolidateOptions {
   bootstrapSession?: string;
+  /** 全量 bootstrap 代际替换必须与本次写入共享事务。 */
+  clearPreviousBootstrap?: boolean;
 }
 
 /** Logger 接口 */
@@ -89,20 +92,29 @@ export class MemoryConsolidator {
    */
   consolidate(
     candidateMemories: CandidateMemory[],
-    { bootstrapSession }: ConsolidateOptions = {}
+    { bootstrapSession, clearPreviousBootstrap = false }: ConsolidateOptions = {}
   ): ConsolidateStats {
     let replaced = 0;
     const stats: ConsolidateStats = { added: 0, updated: 0, merged: 0, skipped: 0 };
 
     const runConsolidate = this.#store.transaction(() => {
       // 冲突替换、普通合并与容量淘汰属于同一持久化操作，任何写失败都整体回滚。
-      const conflicts = this.#preResolveConflicts(candidateMemories);
-      const processed = conflicts.processed;
-      replaced = conflicts.replaced;
-      for (const candidate of processed) {
+      if (clearPreviousBootstrap) {
+        const cleared = this.#store.clearBootstrapMemories();
+        this.#store.compact();
+        this.#logDebug(`Bootstrap replacement staged: ${cleared} previous memories`);
+      }
+      for (const candidate of candidateMemories) {
         const content = (candidate.content || '').trim();
         if (!content || content.length < 5) {
           stats.skipped++;
+          continue;
+        }
+
+        // 前一候选已在同一事务内写入；冲突判断必须看到它，不能整批预判后再写。
+        const conflicts = this.#preResolveConflicts([candidate]);
+        replaced += conflicts.replaced;
+        if (conflicts.processed.length === 0) {
           continue;
         }
 
@@ -415,16 +427,25 @@ export class MemoryConsolidator {
   #logDebug(msg: string) {
     const formatted = `[MemoryConsolidator] ${msg}`;
     if (this.#logger?.debug) {
-      this.#logger.debug(formatted);
+      observeSafely(
+        () => this.#logger?.debug?.(formatted),
+        () => undefined
+      );
     } else if (this.#logger?.info) {
-      this.#logger.info(formatted);
+      observeSafely(
+        () => this.#logger?.info(formatted),
+        () => undefined
+      );
     }
   }
 
   #log(msg: string) {
     const formatted = `[MemoryConsolidator] ${msg}`;
     if (this.#logger?.info) {
-      this.#logger.info(formatted);
+      observeSafely(
+        () => this.#logger?.info(formatted),
+        () => undefined
+      );
     }
   }
 }
