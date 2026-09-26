@@ -1,6 +1,5 @@
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-
 import {
   AgentEventBus,
   AgentEvents,
@@ -16,6 +15,7 @@ import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/result.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { cases, runtimeFixture, usage } from './helpers/developerRedaction.js';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -554,6 +554,40 @@ describe('HookSystem diagnostics', () => {
       event: 'tool:execute:before',
       message: 'async failed',
       mode: 'async',
+    });
+  });
+});
+
+describe('hook failure text redaction', () => {
+  it.each(cases)('masks $name in actual hook error metadata without blocking the run', async ({
+    text,
+    values,
+    expected,
+  }) => {
+    const warn = vi.spyOn(Logger, 'warn').mockImplementation(() => {});
+    const chat = vi.fn(async () => ({ text: 'done', functionCalls: [], usage }));
+    const { runtime, events } = runtimeFixture(chat);
+    runtime.hookSystem.on('llm:call:before', () => {
+      throw new Error(text);
+    });
+    const result = await runtime.reactLoop('Handle the synthetic observer failure.', {
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    const process = events.find(
+      (event) => event.type === 'agent_process_event' && event.processEvent?.kind === 'llm.input'
+    )?.processEvent;
+    const observed = JSON.stringify({
+      event: process,
+      hook: runtime.hookSystem.getDiagnostics(),
+      warn: warn.mock.calls,
+    });
+    for (const value of values) {
+      expect(observed).not.toContain(value);
+    }
+    expect(result.reply).toBe('done');
+    expect(runtime.hookSystem.getDiagnostics().hookErrors[0].message).toBe(expected);
+    expect(process).toMatchObject({
+      metadata: { hookErrors: [expect.objectContaining({ code: 'HOOK_HANDLER_FAILED' })] },
     });
   });
 });

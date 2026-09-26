@@ -925,7 +925,8 @@ export class AgentRuntime {
           process.stderr.write(
             `\n\x1b[36m━━━ Nudge [${nudge.type}] iter=${ctx.iteration}${_dim ? ` dim=${_dim}` : ''} ━━━\x1b[0m\n`
           );
-          process.stderr.write(`\x1b[33m${nudge.text}\x1b[0m\n\n`);
+          // 终端也是开发者观察副本；模型消息已在上方按原文入列，不能反向改写。
+          process.stderr.write(`\x1b[33m${redactDeveloperText(nudge.text)}\x1b[0m\n\n`);
         }
       }
     }
@@ -1775,7 +1776,7 @@ export class AgentRuntime {
           process.stderr.write(
             `\n\x1b[35m━━━ Transition Nudge [${transitionNudge.type}] phase=${tracker.phase}${_dimT ? ` dim=${_dimT}` : ''} ━━━\x1b[0m\n`
           );
-          process.stderr.write(`\x1b[33m${transitionNudge.text}\x1b[0m\n\n`);
+          process.stderr.write(`\x1b[33m${redactDeveloperText(transitionNudge.text)}\x1b[0m\n\n`);
         }
       }
     }
@@ -1932,7 +1933,7 @@ export class AgentRuntime {
           process.stderr.write(
             `\n\x1b[34m━━━ Digest Nudge [SUMMARIZE]${_dimD ? ` dim=${_dimD}` : ''} ━━━\x1b[0m\n`
           );
-          process.stderr.write(`\x1b[33m${textResult.nudge}\x1b[0m\n\n`);
+          process.stderr.write(`\x1b[33m${redactDeveloperText(textResult.nudge)}\x1b[0m\n\n`);
         }
         trace?.endRound?.();
         return false; // continue
@@ -1958,7 +1959,7 @@ export class AgentRuntime {
             process.stderr.write(
               `\n\x1b[32m━━━ Continue Nudge${_dimC ? ` dim=${_dimC}` : ''} ━━━\x1b[0m\n`
             );
-            process.stderr.write(`\x1b[33m${textResult.nudge}\x1b[0m\n\n`);
+            process.stderr.write(`\x1b[33m${redactDeveloperText(textResult.nudge)}\x1b[0m\n\n`);
           }
         }
         trace?.endRound?.();
@@ -3004,7 +3005,9 @@ function isSafeNumericTokenMetric(key: string, value: unknown): boolean {
   // token 计数是 developer-safe 观测指标；真实 token / key 字段仍按 isSecretLikeKey 脱敏。
   return (
     typeof value === 'number' &&
-    /^(inputTokens|outputTokens|totalTokens|reasoningTokens|cacheHitTokens)$/.test(key)
+    /^(inputTokens|outputTokens|totalTokens|reasoningTokens|cacheHitTokens|cacheWriteTokens)$/.test(
+      key
+    )
   );
 }
 

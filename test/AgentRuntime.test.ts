@@ -73,6 +73,23 @@ function createToolEnvelope(
   };
 }
 
+async function captureDeveloperStderr(action: () => Promise<unknown>): Promise<string> {
+  const previousMode = process.env.ALEMBIC_MCP_MODE;
+  const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  try {
+    process.env.ALEMBIC_MCP_MODE = '0';
+    await action();
+    return write.mock.calls.map(([chunk]) => String(chunk)).join('');
+  } finally {
+    write.mockRestore();
+    if (previousMode === undefined) {
+      delete process.env.ALEMBIC_MCP_MODE;
+    } else {
+      process.env.ALEMBIC_MCP_MODE = previousMode;
+    }
+  }
+}
+
 describe('runtime loop boundaries', () => {
   it('stops a provider that repeatedly ignores toolChoice none within the loop budget', async () => {
     const { runtime, chatWithTools } = createRuntimeForReactLoop();
@@ -363,7 +380,7 @@ describe('agent runtime forced summary suppression', () => {
       endRound.mock.calls.length === 1
         ? {
             type: 'transition',
-            text: '阶段切换: EXPLORE → SUMMARIZE',
+            text: '阶段切换: EXPLORE → SUMMARIZE password=SYNTHETIC_TRANSITION_ONLY',
           }
         : null
     );
@@ -414,11 +431,22 @@ describe('agent runtime forced summary suppression', () => {
       onProgress: (event) => progress.push(event),
     });
 
-    await runtime.reactLoop('call demo tool', {
-      source: 'system',
-      tracker: tracker as never,
-      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
-    });
+    const terminalOutput = await captureDeveloperStderr(() =>
+      runtime.reactLoop('call demo tool', {
+        source: 'system',
+        tracker: tracker as never,
+        budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+      })
+    );
+
+    // 以下均为合成凭据；终端副本脱敏，真正送给模型的上下文仍保持原始业务文本。
+    expect(terminalOutput).toContain('Nudge [reflection]');
+    expect(terminalOutput).toContain('Transition Nudge');
+    expect(terminalOutput).not.toContain('visibleNudgeSecret12345');
+    expect(terminalOutput).not.toContain('SYNTHETIC_TRANSITION_ONLY');
+    const requests = JSON.stringify(chatWithTools.mock.calls);
+    expect(requests).toContain('visibleNudgeSecret12345');
+    expect(requests).toContain('SYNTHETIC_TRANSITION_ONLY');
 
     const processEvents = progress
       .map((event) => event.processEvent)
@@ -530,15 +558,24 @@ describe('agent runtime forced summary suppression', () => {
       onProgress: (event) => progress.push(event),
     });
 
-    await runtime.reactLoop('summarize semantic nudges', {
-      source: 'system',
-      context: {
-        dimensionId: 'domain',
-        targetName: 'Domain',
-      },
-      tracker: tracker as never,
-      budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
-    });
+    const terminalOutput = await captureDeveloperStderr(() =>
+      runtime.reactLoop('summarize semantic nudges', {
+        source: 'system',
+        context: {
+          dimensionId: 'domain',
+          targetName: 'Domain',
+        },
+        tracker: tracker as never,
+        budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+      })
+    );
+    expect(terminalOutput).toContain('Digest Nudge');
+    expect(terminalOutput).toContain('Continue Nudge');
+    expect(terminalOutput).not.toContain('visibleDigestSecret12345');
+    expect(terminalOutput).not.toContain('visibleContinueSecret12345');
+    const requests = JSON.stringify(chatWithTools.mock.calls);
+    expect(requests).toContain('visibleDigestSecret12345');
+    expect(requests).toContain('visibleContinueSecret12345');
 
     const processEvents = progress
       .map((event) => event.processEvent)

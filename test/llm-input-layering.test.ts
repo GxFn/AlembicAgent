@@ -28,6 +28,7 @@ import type { UnifiedMessage } from '../src/ai/contracts.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
+import { cases, envelope, runtimeFixture, usage } from './helpers/developerRedaction.js';
 
 function createRuntime({
   chatWithTools,
@@ -1484,5 +1485,80 @@ describe('R06 prompt boundary facts', () => {
     const prompt = buildProducerPromptV2(a, promptDimension, { name: 'fixture' });
     expect(prompt).toContain('背景文件');
     expect(prompt).not.toContain('可复制 coreCode(来源 docs/design.md');
+  });
+});
+
+describe('developer-visible output redaction and business fidelity', () => {
+  it.each(cases)('masks $name in tool output while preserving the business receipt', async ({
+    text,
+    values,
+    expected,
+  }) => {
+    const receipt = envelope(text);
+    const original = structuredClone(receipt);
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: '',
+        functionCalls: [{ id: 'fixture-call', name: 'meta', args: { action: 'tools' } }],
+        usage,
+      })
+      .mockResolvedValue({ text: 'done', functionCalls: [], usage });
+    const { runtime, events, execute } = runtimeFixture(chat, receipt);
+    const result = await runtime.reactLoop('Read the synthetic fixture.', {
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+    const process = events.find((event) => event.type === 'tool_end')?.processEvent;
+    expect(process).toMatchObject({
+      sourceClass: 'developer-facing',
+      content: { role: 'tool' },
+      metadata: { toolName: 'meta', status: 'ok', resultSize: text.length },
+    });
+    for (const value of values) {
+      expect(process?.content?.text).not.toContain(value);
+    }
+    expect(process?.content?.text).toBe(expected);
+    expect(receipt).toEqual(original);
+    expect(result.toolCalls[0].result).toEqual(original.structuredContent);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.tokenUsage).toMatchObject({ input: 22, output: 14, reasoning: 6, cacheHit: 4 });
+  });
+
+  it.each(cases)('masks $name in llm.output without rewriting returned reply', async ({
+    text,
+    values,
+    expected,
+  }) => {
+    const chat = vi.fn(async () => ({ text, functionCalls: [], usage }));
+    const { runtime, events } = runtimeFixture(chat);
+    const result = await runtime.reactLoop('Return the synthetic fixture.', {
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    const process = events.find(
+      (event) => event.type === 'agent_process_event' && event.processEvent?.kind === 'llm.output'
+    )?.processEvent;
+    for (const value of values) {
+      expect(process?.content?.text).not.toContain(value);
+    }
+    expect(process?.content?.text).toBe(expected);
+    expect(result.reply).toBe(text);
+    expect(process?.metadata).toMatchObject({
+      visibleTextChars: text.length,
+      functionCallCount: 0,
+      usage: { inputTokens: 11, outputTokens: 7, reasoningTokens: 3, cacheHitTokens: 2 },
+    });
+  });
+
+  it('retains all normal numeric token usage metrics on developer output metadata', async () => {
+    const chat = vi.fn(async () => ({ text: 'ordinary output', functionCalls: [], usage }));
+    const { runtime, events } = runtimeFixture(chat);
+    const result = await runtime.reactLoop('Return normal metrics.', {
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+    const process = events.find(
+      (event) => event.type === 'agent_process_event' && event.processEvent?.kind === 'llm.output'
+    )?.processEvent;
+    expect(result.tokenUsage).toMatchObject({ input: 11, output: 7 });
+    expect(process?.metadata?.usage).toEqual(usage);
   });
 });

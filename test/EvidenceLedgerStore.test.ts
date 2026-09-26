@@ -470,3 +470,26 @@ it('seeds complete sibling dimensions with distinct runtime sessions from the sa
     content: 'verified source',
   });
 });
+
+test('production ledger stores fully masked tool output while preserving freshness', () => {
+  const coordinates = ledgerCoordinates();
+  const authority = createProductionEvidenceLedgerAuthority(coordinates);
+  const source = JSON.stringify(
+    { stdout: 'password="SYNTHETIC head SYNTHETIC_TAIL_NEVER_REAL"', normal: 7 },
+    null,
+    2
+  );
+  const entry = authority.capture.capture({
+    tool: 'code.read',
+    callId: 'fixture',
+    file: '.env.example',
+    range: { start: 1, end: source.split('\n').length },
+    content: source,
+  });
+  const store = resolveProductionEvidenceLedgerStore(authority);
+  const persisted = JSON.parse(fs.readFileSync(store.filePath, 'utf8').trim());
+  expect(persisted.content).not.toContain('SYNTHETIC');
+  expect(JSON.parse(persisted.content)).toEqual({ stdout: 'password="[redacted]"', normal: 7 });
+  expect(entry.content).toBe(persisted.content);
+  expect(store.checkFreshness(entry.id, source)).toBe('fresh');
+});

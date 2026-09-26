@@ -10,6 +10,8 @@
 
 EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和监听器的 `this`；直接调用继承的 `emit` 仍遵守 Node 原有语义。request/reply 同步发布请求、按 correlationId 接受响应，等待期限复用 `runOperation`；reset 清理尚未完成的请求。Hook 同样使用分发快照，退订不会跳过后续阻断器；`once` 的领取状态在并发分发间共享。
 
+开发者事件、终端 Nudge 输出、Hook 错误和新采集的生产台账共用 `utils/Redaction.ts` 处理已知凭据形态与敏感键纯量。引号内的多词值、数字值和嵌套 JSON 字符串均在对应表示层脱敏；未修改的 JSON 片段保持原始格式，换行数量保留。编码嵌套超过八层时返回可见的 `[redacted-nested-value]` 标记。送给模型的原始消息、业务工具回执和 LLM 最终回复保持原值，正常的数字 token 用量仍可观测，包括 `cacheWriteTokens`。台账 freshness 对输入使用同一脱敏规则；规则更新不改写已有台账，旧规则产物可能需要重新采集，也不声称识别所有未知凭据格式。
+
 诊断计数只接受有限非负数，非法输入或累加溢出产生 `diagnostics_invalid_count`，保留合法字段与已有总量。合并聚合计数不按数值大小循环。诊断快照复制公开条目，宿主修改快照不会反写收集器。
 
 无 Tracker 的循环同样执行 `maxIterations`；模型反复返回被禁止的工具调用，也不能绕过轮数上限。真实取消和期限优先于轮数耗尽。空响应和服务错误的重试等待响应同一 `AbortSignal`。
@@ -108,5 +110,6 @@ Core 当前的 `createOrStage`、`publish` 端口不接收 signal；已开始的
 - `SubmitEvidenceExpansion`、`provider-facades`：风格修复期限和实际 mock transport 的 signal。
 - `layer-contract`：使用实际配置验证禁止的反向依赖。
 - `AgentRuntime`、`llm-input-layering`、`agent-surface-floor`：摘要回执和预算、输入保真、策略及协调器边界；公开出口与接口合同集中在 `contract-surface`。
+- `Redaction`、`EvidenceLedgerStore`、`llm-input-layering`、`hook-system`：文本格式、台账 freshness，以及真实开发者事件与业务返回的隔离。
 
 测试复用现有文件、参数化场景与临时项目，不需要真实 API key。`npm run check` 同时检查构建、导入边界、冻结公开接口、相邻宿主消费和完整测试集。
