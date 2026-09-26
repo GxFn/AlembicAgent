@@ -23,6 +23,7 @@
   "blessedImports": [],
   "fileBoundaries": {
     "requiredUnder": [
+      "src/agent/prompts/producerFindings.ts",
       "src/agent/runtime/toolPipeline/",
       "src/tools/kernel/toolSchema.ts",
       "src/tools/kernel/toolSelection.ts",
@@ -56,6 +57,7 @@
       "src/tools/runtime/compressor/"
     ],
     "runtimeImports": {
+      "src/agent/prompts/producerFindings.ts": [],
       "src/ai/AiProviderManager.ts": [
         "@alembic/core/logging",
         "src/shared/observers.ts",

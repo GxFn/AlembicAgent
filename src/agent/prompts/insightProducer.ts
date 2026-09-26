@@ -18,17 +18,21 @@
  * @module insightProducer
  */
 
-import {
-  describeSubmitToolFields,
-  renderGuidance,
-  SUBMIT_REQUIREMENTS,
-} from '@alembic/core/knowledge';
+import { describeSubmitToolFields, renderGuidance } from '@alembic/core/knowledge';
 import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
 import { type EvidenceEntry, isDocEvidencePath } from '../evidence/EvidenceCollector.js';
+import { buildProducerFindingsSection } from './producerFindings.js';
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义
 // ──────────────────────────────────────────────────────────────────
+
+interface ProducerEvidenceStarter {
+  hint: string;
+  data?: unknown;
+  strength?: number;
+  weight?: number;
+}
 
 /** AnalysisReport 最小接口 (v1) */
 interface AnalysisReportLike {
@@ -87,17 +91,17 @@ export const PRODUCER_SYSTEM_PROMPT = `你是知识管理专家。你会收到�
 关键规则:
 - 结构化发现中的每个要点都应转化为至少一个候选；不要把最终 Markdown 里未结构化记录的主题当成额外提交义务
 - 不要调用 code.read、search、graph 或 terminal；缺少短代码片段时使用 Analyst 已给出的证据摘要完成候选，证据不足才在最终总结中列为 blocker
-- reasoning.sources 必须是非空数组，填写文件的完整相对路径，如 ["Packages/AOXNetworkKit/Sources/AOXNetworkKit/Client/NetworkClient.swift"]（禁止只写文件名）
+- 维度台账在场时 params.reasoning.evidenceRefs 必填，使用工具返回的真实 E-id；宿主据此展开来源。无台账且当前 schema 要求时，reasoning.sources 非空并提供真实 sources，禁止只写文件名。
 - sourceRefs / reasoning.sources 只服务最终候选证据；不要为了满足指标编造模块别名、类名或不存在路径
 - content.markdown 中的来源标注使用完整相对路径+行号: (来源: Full/Path/FileName.ext:行号)
-- 每次 knowledge.submit 前先自检 params.title、params.description、content.markdown、content.rationale、kind、trigger、whenClause、doClause、reasoning.sources 非空；缺少 title/description 等字段会被工具拒绝并浪费 Producer 轮次
+- 每次 knowledge.submit 前先自检 params.title、params.description、content.markdown、content.rationale、kind、trigger、whenClause、doClause 以及当前 schema 要求的 reasoning.evidenceRefs 或来源字段非空；缺少 title/description 等字段会被工具拒绝并浪费 Producer 轮次
 - Analyst 结构化发现已全部提交后，不再调用 meta.review，直接输出最终总结
 - 如果分析提到了 3 个模式，就应该提交 3 个候选，不要合并
 - 禁止: 不要搜索新文件、不要做额外分析、不要使用终端工具，专注于格式化和提交
 - 【跨维度去重】每条候选必须聚焦当前维度独有的视角，不得将同一知识点换个说法重复提交。相同的类/模式只在最相关的维度出现一次，宁可少提交也不要充数
 
 🚨 过门禁硬约束（不满足必被拒，白白浪费提交轮次；按此逐条自检后再 submit）:
-- sourceRefs / reasoning.sources / content.markdown 的 (来源: …) 必须【逐字复制】上面 Analyst evidence refs 里的「path:起行-止行」，务必带行号——绝不能只写路径（否则 SOURCE_REF_LINE_MISSING）。
+- 展示性 sourceRefs / content.markdown 的 (来源: …) 必须【逐字复制】上面 Analyst evidence refs 里的「path:起行-止行」，务必带行号——绝不能只写路径（否则 SOURCE_REF_LINE_MISSING）。
 - rule / pattern 候选必须引用【至少 3 个不同文件】的 path:行（evidence refs 已给多个，选最相关的 3+ 个）；确实只涉及单文件时，才在 params 里显式加 scope: "narrow"（否则 INSUFFICIENT_EVIDENCE）。
 - coreCode 必须【逐字复制】上面「可复制 coreCode」提供的真实代码（它是接地证据位，凭空写会 SNIPPET_MISMATCH）；确无对应代码时省略 coreCode。
 - content.markdown 的代码块是「项目特写」的**范式模板**：以证据代码为素材提炼出可直接复用的规范形态（可去噪、简化、突出模式骨架），配 (来源: path:行号) 标注——绝不要整段粘贴项目原文充当正文代码（原文混乱无序，无范式意义）。
@@ -147,12 +151,14 @@ const STYLE_GUIDE = renderGuidance('in-process', undefined, 'cold-start').text;
 // 由 Agent 当前 submit schema 决定，避免把可选 coreCode 错标为必填。
 const PRODUCER_SUBMIT_FIELD_CONTRACT = buildProducerSubmitFieldContract();
 
-// Core 的通用 authoring 文案仍把 coreCode 列作历史必填字段；Agent production profile 已明确
-// coreCode 可选，因此只在本 consumer prompt 层做兼容收窄，不改变 Core 门禁或其他消费者。
-const PRODUCER_SUBMIT_REQUIREMENTS = SUBMIT_REQUIREMENTS.replace(
-  '9. dontClause（反向约束）、whenClause（触发场景）、coreCode（代码骨架）均为必填',
-  '9. dontClause（反向约束）与 whenClause（触发场景）为必填；coreCode 可选，只有匹配合格 bounded code evidence 时才提交'
-);
+// Core 字段说明仍是单一来源；阶段接线说明由 Agent 持有，不能把通用补读建议带入禁补读阶段。
+const PRODUCER_SUBMIT_REQUIREMENTS = `提交要求（以本次工具 schema 为准）:
+1. 只将 Analyst 已确认的结构化发现转为候选，不按 Markdown 段落凑数量。
+2. Producer 不补读源码；缺证据时只检索已有 evidence 台账，仍不足则列为 blocker。
+3. 维度台账在场时 params.reasoning.evidenceRefs 必填，逐字复制工具 [evidence] 中的 E-id 或 E-id@起行-止行；不能用裸路径代替。
+4. 无台账的兼容运行按当前 schema 提供真实 sources / reasoning.sources；不要编造 E-id。来源采用完整相对路径及已验证行号。
+5. description 中文简述 ≤80 字，引用真实类名；content 必须同时包含 markdown 与 rationale。kind 仅 rule/pattern/fact。
+6. trigger、whenClause、doClause、dontClause 按字段说明填写；coreCode 可选且只能逐字复制已提供的合格代码片段。`;
 
 /** 从 Core spec 的字段描述表渲染 Producer 字段清单（说明 spec-sourced，分组 schema-sourced）。 */
 function buildProducerSubmitFieldContract(): string {
@@ -167,11 +173,13 @@ function buildProducerSubmitFieldContract(): string {
     'whenClause',
     'doClause',
     'dontClause',
-    'reasoning.sources',
   ];
   return [
     '## knowledge.submit 必填字段（字段说明取自 Core RecipeAuthoringSpec，避免与门禁漂移）',
     ...requiredKeys.map((key) => `- ${key}: ${fields[key] ?? ''}`),
+    '## knowledge.submit 证据字段（按本轮 schema 选择）',
+    '- reasoning.evidenceRefs: 维度台账在场时必填，使用真实工具返回的条目 ID；无台账时按当前 schema 提供 sources / reasoning.sources。',
+    `- reasoning.sources: ${fields['reasoning.sources'] ?? ''}；无台账兼容运行直接填写，维度台账运行的来源由宿主依据 reasoning.evidenceRefs 展开。`,
     '## knowledge.submit 可选字段',
     `- coreCode: ${fields.coreCode ?? ''}`,
   ].join('\n');
@@ -212,7 +220,8 @@ export function buildProducerPrompt(
   parts.push(PRODUCER_SUBMIT_REQUIREMENTS);
   parts.push(RECIPE_PRODUCTION_PROFILE_PROMPT);
 
-  return compactProducerPromptParts(parts).join('\n\n');
+  // 段内可能是可复制代码或不同发现，不得做行级/子串去重。只合并完全相同的完整段。
+  return [...new Set(parts)].join('\n\n');
 }
 
 /** Panorama context for Producer */
@@ -252,7 +261,10 @@ export function buildProducerPromptV2(
   panorama?: ProducerPanoramaContext | null,
   toolPolicyHints?: Record<string, unknown> | null,
   /** G3: 冷启动预计算的加权统计/结构证据（命名前缀占比、继承热点等），供「为什么这样选」引用 */
-  evidenceStarters?: ReadonlyArray<{ hint: string; data: unknown; strength?: number }> | null,
+  evidenceStarters?:
+    | ReadonlyArray<ProducerEvidenceStarter>
+    | Readonly<Record<string, ProducerEvidenceStarter>>
+    | null,
   /** M1b（挖掘产出升级 P5a）：本维度已入库知识标题——查重视野，模式中性（bootstrap 饱和库/rescan 皆可） */
   existingDimensionTitles?: ReadonlyArray<{
     id?: string;
@@ -268,47 +280,16 @@ export function buildProducerPromptV2(
     parts.push(`## Analyst 分析摘要 (已压缩)\n${analysisDigest}`);
   }
 
-  // §3 结构化发现
-  // M3（VERIFY 机械化）："已确认"只渲染 verified 发现（evidence 串带 [unverified:] 标记的
-  // 是引用无文件区间的未核实线索——单列低信区，禁止作为候选唯一证据）。
-  if (artifact.findings?.length > 0) {
-    const isUnverified = (f: { evidence?: string }) =>
-      typeof f.evidence === 'string' && f.evidence.includes('[unverified:');
-    const verifiedFindings = artifact.findings.filter((f) => !isUnverified(f));
-    const unverifiedFindings = artifact.findings.filter(isUnverified);
-    const findingLines = ['## 关键发现 (Analyst 已确认)'];
-    const sorted = [...verifiedFindings].sort((a, b) => b.importance - a.importance);
-    for (const f of sorted) {
-      const badge = f.importance >= 8 ? '⚠️' : '📋';
-      findingLines.push(`${badge} **[${f.importance}/10]** ${f.finding}`);
-      if (f.evidence) {
-        findingLines.push(`  证据: ${f.evidence}`);
-      }
-    }
-    if (unverifiedFindings.length > 0) {
-      findingLines.push('');
-      findingLines.push('### ⚠️ 未核实线索（引用无文件区间——不得作为候选的唯一证据）');
-      for (const f of unverifiedFindings) {
-        findingLines.push(`- [${f.importance}/10] ${f.finding}`);
-      }
-      findingLines.push(
-        '如需基于以上线索提交候选：先用 evidence.search 找到带文件区间的支撑条目并引用，否则放弃该线索。'
-      );
-    }
-    findingLines.push('');
-    findingLines.push(
-      '☝️ 上述结构化发现是唯一候选义务；最终 Markdown 摘要只作背景，不要从摘要里新增候选主题。'
-    );
-    // 深度洞察随 evidence 字符串完整到达这里（note_finding 的深挖叙述/可选深度槽 → markdown），
-    // 但没有映射义务时模型会把它当纯证据引用丢弃——深度才是候选的核心价值，必须显式要求落字段。
-    findingLines.push(
-      '📐 发现证据里的深度洞察（为何这样选 / 违反后果 / 例外对照 / 代价取舍，含 ## 小节或叙述句）是该候选的核心价值：必须把它们完整承载进 content.markdown（保留 file:line 接地，组织形式随你），并把关键理由写进 content.rationale，不得丢弃或泛化成一句空话。'
-    );
-    parts.push(findingLines.join('\n'));
+  const findingsSection = buildProducerFindingsSection(artifact.findings || []);
+  if (findingsSection) {
+    parts.push(findingsSection);
   }
 
   // §4 代码证据
-  const codeContext = buildCodeContextSection(artifact.evidenceMap);
+  const codeContext = buildCodeContextSection(
+    artifact.evidenceMap,
+    new Set((artifact.findings || []).map((finding) => finding.finding))
+  );
   if (codeContext) {
     parts.push(codeContext);
   }
@@ -330,14 +311,17 @@ export function buildProducerPromptV2(
   // §4c 项目统计与结构证据（G3）：EvidenceStarters 在冷启动已算好命名前缀占比/类型分布/
   // 继承热点/耦合热点等量化事实——STYLE_GUIDE 要求写「为什么这样选(统计分布、占比)」，此前
   // 素材备好却从未端给 Producer，模型只能泛泛而谈。渲染 top-6 加权证据供直接引用。
-  if (Array.isArray(evidenceStarters) && evidenceStarters.length > 0) {
+  const starters = Array.isArray(evidenceStarters)
+    ? evidenceStarters
+    : Object.values(evidenceStarters || {});
+  if (starters.length > 0) {
     const statLines = ['## 📊 项目统计与结构证据（写「为什么这样选」时可直接引用这些量化事实）'];
-    const sorted = [...evidenceStarters]
+    const sorted = [...starters]
       .filter(
-        (s): s is { hint: string; data: unknown; strength?: number } =>
+        (s): s is ProducerEvidenceStarter =>
           !!s && typeof (s as { hint?: unknown }).hint === 'string'
       )
-      .sort((a, b) => (b.strength ?? 0) - (a.strength ?? 0))
+      .sort((a, b) => (b.strength ?? b.weight ?? 0) - (a.strength ?? a.weight ?? 0))
       .slice(0, 6);
     for (const starter of sorted) {
       const dataText =
@@ -475,7 +459,8 @@ export function buildProducerPromptV2(
     parts.push(kLines.join('\n'));
   }
 
-  return compactProducerPromptParts(parts).join('\n\n');
+  // 段内可能是可复制代码或不同发现，不得做行级/子串去重。只合并完全相同的完整段。
+  return [...new Set(parts)].join('\n\n');
 }
 
 function buildAnalysisDigest(
@@ -492,10 +477,18 @@ function buildAnalysisDigest(
       .map((part) => part.trim().toLowerCase())
       .filter((part) => part.length >= 4)
   );
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
+  const knownFindings = new Set((findings || []).map((finding) => finding.finding));
+  const lines = [
+    ...new Set(
+      text
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && !knownFindings.has(line))
+    ),
+  ];
+  if (lines.length === 0) {
+    return null;
+  }
   const selected: string[] = [];
   for (const line of lines) {
     const lower = line.toLowerCase();
@@ -560,7 +553,8 @@ function truncateCodeVerbatim(content: string, maxChars: number): string {
  * 额外 code.read 和 submit payload。
  */
 export function buildCodeContextSection(
-  evidenceMap: Map<string, EvidenceEntry> | null | undefined
+  evidenceMap: Map<string, EvidenceEntry> | null | undefined,
+  knownSummaries?: ReadonlySet<string>
 ) {
   if (!evidenceMap || evidenceMap.size === 0) {
     return null;
@@ -606,7 +600,10 @@ export function buildCodeContextSection(
       continue;
     }
     const refText = groundedRefs.join(', ');
-    const summary = entry.summary ? ` — ${limitText(entry.summary, 140)}` : '';
+    const summary =
+      entry.summary && !knownSummaries?.has(entry.summary)
+        ? ` — ${limitText(entry.summary, 140)}`
+        : '';
     const line = `- ${refText}${entry.role ? ` (${entry.role})` : ''}${summary}`;
     parts.push(line);
     totalChars += line.length;
@@ -631,52 +628,4 @@ export function buildCodeContextSection(
   }
 
   return parts.length > 1 ? parts.join('\n') : null;
-}
-
-function compactProducerPromptParts(parts: string[]): string[] {
-  const seen = new Set<string>();
-  const compacted: string[] = [];
-  for (const part of parts) {
-    const nextPart = compactRepeatedPromptLines(part, seen);
-    if (nextPart.trim()) {
-      compacted.push(nextPart);
-    }
-  }
-  return compacted;
-}
-
-function compactRepeatedPromptLines(part: string, seen: Set<string>): string {
-  const lines = part.split('\n');
-  const compactedLines: string[] = [];
-  for (const line of lines) {
-    const key = normalizePromptLineForCompaction(line);
-    if (key && hasSeenPromptLineOverlap(key, seen)) {
-      continue;
-    }
-    compactedLines.push(line);
-    if (key) {
-      seen.add(key);
-    }
-  }
-  return compactedLines.join('\n').trim();
-}
-
-function hasSeenPromptLineOverlap(key: string, seen: Set<string>): boolean {
-  if (seen.has(key)) {
-    return true;
-  }
-  for (const existing of seen) {
-    if (key.includes(existing) || existing.includes(key)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function normalizePromptLineForCompaction(line: string): string | null {
-  const normalized = line
-    .replace(/[ \t]+/g, ' ')
-    .trim()
-    .toLowerCase();
-  return normalized.length >= 48 ? normalized : null;
 }

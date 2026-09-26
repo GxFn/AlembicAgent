@@ -20,6 +20,7 @@
 import { ANALYST_SYSTEM_PROMPT } from '../prompts/insightAnalyst.js';
 import { buildRetryPrompt } from '../prompts/insightGate.js';
 import { buildCodeContextSection } from '../prompts/insightProducer.js';
+import { buildProducerFindingsSection } from '../prompts/producerFindings.js';
 import { insightGateEvaluator, producerRejectionGateEvaluator } from './gateEvaluators.js';
 
 // ── Local Type Definitions ──
@@ -278,22 +279,9 @@ function buildScanProducerPrompt(
       `将以下代码分析转化为 knowledge({ action: "submit" }) 调用。\n\n---\n${artifact.analysisText}\n---`
     );
 
-    // §2 结构化发现 (来自 ActiveContext scratchpad)
-    if (artifact.findings && artifact.findings.length > 0) {
-      const findingLines = ['## 关键发现 (Analyst 已确认)'];
-      const sorted = [...artifact.findings].sort(
-        (a, b) => (b.importance || 0) - (a.importance || 0)
-      );
-      for (const f of sorted) {
-        const badge = (f.importance || 0) >= 8 ? '⚠️' : '📋';
-        findingLines.push(`${badge} **[${f.importance || 5}/10]** ${f.finding}`);
-        if (f.evidence) {
-          findingLines.push(`  证据: ${f.evidence}`);
-        }
-      }
-      findingLines.push('');
-      findingLines.push('☝️ 上述每个发现都应至少转化为一个候选。');
-      parts.push(findingLines.join('\n'));
+    const findingsSection = buildProducerFindingsSection(artifact.findings || []);
+    if (findingsSection) {
+      parts.push(findingsSection);
     }
 
     // §3 代码证据 (来自 EvidenceCollector)

@@ -10,6 +10,28 @@ Agent 保留记忆策略和装配，Core 提供现有 SQLite schema 和公共 IO
 
 `ActiveContext.maxRecentRounds` 与 `MemoryCoordinator.createDimensionScope` 的同名配置共用校验：缺省为 3，显式 0 表示立即压缩；负数、小数、NaN 与无穷值在创建时抛出 `RangeError`，避免压缩循环无法退出。非法 scope 配置不会替换当前上下文或清除已有预算。观察保留与 `memory.note_finding` 写入回归集中在 `test/ActiveContext.test.ts`，L4 记忆包与压缩回归集中在 `test/ContextWindow.test.ts`。
 
+`ActiveContext.distill()` 同时包含已压缩观察与滑动窗口里最新的观察，调用蒸馏不推进保留状态。公开的计划、发现、序列化快照拥有嵌套数据副本；只有明确命名的 `getPlanStepsMutable()` 供阶段机写回进度。批量读取按每个成员的实际回执记录成功路径，失败文件不进入已读集合或计划完成判断。
+
+L4 使用结构化记忆包，成功替换前重新核对消息快照与读取视图版本；并发追加、阶段重置或另一轮压缩会使旧摘要失效。已付用量仍返回，日志失败也不改变压缩结果。Runtime 将已确认提交事实独立传入消息历史，不用经过字符裁剪的显示文本推断是否写入成功；该内部 metadata 不进入 SDK 请求。L2 保留 nudge/记忆摘要边界，替换引导文字不会删除相邻用户事实。
+
+## 写入与恢复
+
+`EpisodicConsolidator` 先提取候选；`clearPrevious=true` 经现有 `consolidate` 选项 `clearPreviousBootstrap` 传递，在同一 SQLite 事务中清理旧 bootstrap 记忆、维护和写入新候选。提取失败不触及存储，任一写入失败整体回滚。默认 `PersistentMemory` 支持该选项；自定义语义记忆端口须实现同样的原子替换语义。普通 `clearBootstrapMemories()` 入口仍保留。
+
+同批候选按顺序解决冲突，每个候选都能看到本事务中前一个候选的写入。固化、scope 创建、记忆读取及检查点日志属于观察通道，异常或异步拒绝不会覆盖已确认结果。
+
+`SessionStore.storeDimensionReport()` 在校验完整新报告后替换该报告及其派生证据、交叉引用；独立 `addEvidence()` 数据保留。检查点中的 `reportDimId` 标识派生索引归属，普通证据查询会移除此内部字段。旧快照通过原报告匹配已有索引，旧 `E-id=path` 键归一到真实路径。查询、Producer 投影和 `toJSON()` 返回独立快照；顶层项目便捷配置与 `projectContext` 合并，显式 `projectContext` 优先。
+
+检查点先写同目录临时文件，再 rename 替换目标；写入或重命名失败保留上次有效文件并抛出错误。注入 WriteZone 时写入、重命名与清理走同一边界。`MemoryCoordinator.checkpoint()` 仍是记录失败诊断的兼容便利入口，需要确认持久化的宿主应直接等待 `saveCheckpoint()`。这提供原子文件替换，不宣称跨进程事务或断电持久性。
+
+`ConversationStore` 使用同一个 data zone 读取和写入；损坏的 JSONL 记录逐条跳过并报告，合法相邻记录保留。读取预算包含截断标记，过长摘要不挤掉最近消息；摘要生成期间的对话变更会使旧结果失效。
+
+## 探索与 Producer 接口
+
+探索计数采用执行回执，失败调用只计尝试；深度配额使用同一条已核实发现的实际深度槽交集。Producer 停滞提醒使用距上次成功提交的轮数。提示层共享确认/未确认发现的投影，按完整事实记录去重，保留原始代码片段与不同证据。
+
+冷启动 Producer 使用已有 evidence，扫描 Producer 保留 `ScanProduce` 实际开放的定向 `code.read`；提示不为任何阶段增加工具权限。`note_finding` 使用顶层 `evidenceRefs`，维度知识提交使用 `params.reasoning.evidenceRefs`。Core 的 evidence starter map 与旧数组形态均可进入现有 Producer 装配。
+
 ## 读取与预算
 
 - `retrieve`、`toPromptSection`、`embedAllMemories`、`computeEmbeddingRelevance` 接受可选 `abortSignal`、`timeoutMs`、`deadlineAt`、`onDiagnostic`。旧调用不需要新增参数。
@@ -60,7 +82,7 @@ const count = await persistentMemory.embedAllMemories(20, {
 
 写入采用临时文件加 rename；注入 WriteZone 时，读写和临时文件都使用同一公共 IO 边界。写入失败保留 dirty，后续显式 `flushSync()` 或新的写入可重试。`dispose()` 尝试 flush 并释放自身定时器，之后拒绝新变更；若最后一次写失败，仍允许显式 flush 重试。debounce timer 不会延长进程寿命，因此短任务退出前应显式 flush 或 dispose。宿主负责关闭自己创建的 embedding store 和数据库，PersistentMemory 不擅自关闭借入资源。
 
-内容 hash 不包含 embedding 模型身份。宿主切换到不同模型，特别是维度相同的模型时，应调用 `clear()` 并重新回填，不能把正文一致误当向量空间一致。
+内容 hash 描述正文；向量空间另由 `profileId` 标识。以不同 profile 创建 store 时不会复用旧空间的缓存，维度相同也不能绕过该检查。若宿主直接更换已有实例的 embedding 函数，须同步管理 profile 或显式 `clear()` 后回填。LLM 路由与独立 embedding 接线分开。
 
 ## 诊断与验证
 

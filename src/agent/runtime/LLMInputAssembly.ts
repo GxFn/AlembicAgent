@@ -309,6 +309,13 @@ function buildStagePolicySection(
     .filter(Boolean)
     .join('\n');
 
+  const scanReadAllowed =
+    pipelineType === 'scan' &&
+    ctx.allowedToolIds?.includes('code') &&
+    (!ctx.allowedToolActions?.code || ctx.allowedToolActions.code.includes('read'));
+  const producerEvidencePolicy = scanReadAllowed
+    ? 'Only code.read of already referenced files may supplement evidence; do not start new search, graph, or terminal exploration.'
+    : 'Do not start new exploration or read source files; use Analyst evidence/snippets as the source of truth.';
   const bodyByProfile: Record<LLMInputStageProfile, string> = {
     analyze:
       'Analyze real project evidence with discovery tools, then record confirmed findings with note_finding. Final text must summarize recorded note_finding items only: verified finding ids or next evidence action; do not introduce Markdown-only candidate themes, source context, code, or injected evidence.',
@@ -316,8 +323,7 @@ function buildStagePolicySection(
       'Record-only phase. Do not perform additional exploration or emit prose. Use note_finding for already verified findings, one finding per call, citing evidenceRefs from [evidence] annotations. Read-only evidence.get/search may be used to re-check captured evidence before recording.',
     summarize:
       'Summary-only phase. Stop tool use and produce a concise final answer from recorded note_finding items only for confirmed/core sections. Prior messages may provide wording and evidence context, but unrecorded signals must be downgraded to unstructured/pending notes; do not replay full evidence text or introduce Markdown-only candidate themes.',
-    produce:
-      'Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. Do not start new exploration or read source files; use Analyst evidence/snippets as the source of truth. Final text: submit counts and blockers only; do not restate submitted candidate content.',
+    produce: `Producer phase. Transform structured Analyst findings into knowledge submissions. Structured findings are the only candidate obligations; do not mine final Markdown for new themes. ${producerEvidencePolicy} Final text: submit counts and blockers only; do not restate submitted candidate content.`,
     generic: 'Follow the current task prompt and runtime tool contract.',
   };
 

@@ -33,7 +33,7 @@ import { type MemoryReadOptions, reportMemoryRead } from '../memory/MemoryReadPo
 // 2026-07-02 重设计(用户决策)：深度捕获从「逐槽填四维」改为「自选角度真挖」——固定四问会把
 // 深度退化成填表式格式化措辞。深度槽(designIntent/boundaries/failureModes/tradeoffs)保留为
 // 可选的结构化载体：挖到哪个角度就填哪个槽，没挖到的留空。
-const DEPTH_CAPTURE_INSTRUCTION = `- **深度捕获（强价值要求，非硬门槛）**: 确认核心发现后，对它做一轮真深挖——从「这个设计最反直觉之处 / 违反它最先坏什么(真实失败路径) / 项目内的例外与对照 / 它替代了什么、代价是什么」里挑你**真的读到代码证据**的角度想透，把洞察写进 note_finding 的 evidence（关键句挂真实 file:line）；挖到的角度恰好对应深度槽（${DEPTH_DIMENSIONS.filter(
+const DEPTH_CAPTURE_INSTRUCTION = `- **深度捕获（强价值要求，非硬门槛）**: 确认核心发现后，对它做一轮真深挖——从「这个设计最反直觉之处 / 违反它最先坏什么(真实失败路径) / 项目内的例外与对照 / 它替代了什么、代价是什么」里挑你**真的读到代码证据**的角度想透，把洞察写进 finding 或实际挖到的深度槽，evidenceRefs 引用工具返回的台账 ID（由台账映射真实 file:line）；挖到的角度恰好对应深度槽（${DEPTH_DIMENSIONS.filter(
   (d) => d.key !== 'multiSourceCorroboration'
 )
   .map((d) => d.label)
@@ -107,21 +107,21 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 
 | 阶段 | 轮次占比 | 目标 |
 |------|---------|------|
-| 1. 全局扫描 | 第 1-3 轮 | code({ action: "structure" }) 了解项目结构 |
-| 2. 结构化探索 | 第 4-N×60% 轮 | graph({ action: "query" }) 理解核心类；code({ action: "search" }) 批量搜索关键模式 |
+| 1. SCAN 简报 | 首轮 | 消费已有结构上下文并计划，不调用工具 |
+| 2. EXPLORE 探索 | 阶段机进入探索后 | graph({ action: "query" }) 理解核心类；code({ action: "search" }) 批量搜索关键模式 |
 | 3. 深度验证 | 第 N×60%-N×80% 轮 | code({ action: "read" }) 阅读关键实现，确认细节；确认核心发现后立即记录 |
 | 4. 结构化记录 | 总结前 | 用 note_finding({ finding, evidenceRefs, importance }) 补齐核心发现；这是 QualityGate 的重要质量依据 |
 | 5. 输出总结 | 最后阶段 | 停止工具，直接输出你的分析文本 |
 
 ## 关键规则
-- **到达 80% 轮次时必须开始写总结**，但总结前必须已有真实代码证据和结构化发现
+- **遵守当前阶段机的预算与总结指令**，但总结前必须已有真实代码证据和结构化发现
 - 每一轮都必须产生新证据；全景数据和已有上下文只能作为线索，不能替代至少一次 code/graph 证据工具调用
 - 没有调用过 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) / code({ action: "read" }) 之前，禁止输出最终分析
 - 不要重复搜索相同关键词或读取相同文件（系统会返回缓存并扣轮次）
 - 优先使用注入的 panorama / projectInfo / codeEntityGraph / sessionStore，再用工具验证关键事实
 - **note_finding 是硬性质量依据**: 一旦在扫描、探索或验证阶段确认核心发现，允许并且应该立即调用 note_finding({ finding, evidenceRefs, importance })；最终至少提交 3 条结构化发现；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止，缺失或不足会导致 QualityGate retry
 - **单一事实源**: Producer 只消费 note_finding 结构化发现。最终 Markdown 只能总结已记录的 note_finding，不得新增未结构化记录的模式家族、候选主题或可提交发现。
-- **证据必须落到代码，文档只是线索**: 协作/设计/总结类 markdown（如 wakeflow-ledger、Design、docs 下的 *.md）是二手描述，只能用来导航，不能作为知识证据——note_finding 的 evidence 锚点与最终 (来源: …) 必须指向真实源码/配置文件（.ts/.js/.json/.yaml 等）的具体行。看到 .md 里的架构结论时，回到它描述的真实代码文件验证并引用代码行；抄文档结论而不读代码等同编造。
+- **证据必须落到代码，文档只是线索**: 协作/设计/总结类 markdown（如 wakeflow-ledger、Design、docs 下的 *.md）是二手描述，只能用来导航，不能作为知识证据——note_finding 的 evidenceRefs 台账锚点与最终 (来源: …) 必须指向真实源码/配置文件（.ts/.js/.json/.yaml 等）的具体行。看到 .md 里的架构结论时，回到它描述的真实代码文件验证并引用代码行；抄文档结论而不读代码等同编造。
 ${DEPTH_CAPTURE_INSTRUCTION}
 
 ## 工具效率

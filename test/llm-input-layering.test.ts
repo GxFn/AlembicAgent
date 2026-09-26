@@ -1,11 +1,15 @@
+import { buildEvidenceStarters } from '@alembic/core/host-agent-workflows';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
+import type { EvidenceEntry } from '../src/agent/evidence/EvidenceCollector.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
+import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
 import { ANALYST_SYSTEM_PROMPT, buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
 import {
+  buildCodeContextSection,
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
@@ -1376,5 +1380,109 @@ describe('input text and receipt identity', () => {
   it.each(['', '   '])('keeps invalid receipt IDs raw: %j', (id) => {
     const messages = round(id);
     expect(assembly(messages).messages).toEqual(messages);
+  });
+});
+
+const promptDimension = { id: 'architecture', label: 'Architecture' };
+function artifact() {
+  return {
+    analysisText: '',
+    findings: [],
+    referencedFiles: [],
+    negativeSignals: [],
+    evidenceMap: new Map<string, EvidenceEntry>(),
+  };
+}
+function snippet(filePath: string, content: string): EvidenceEntry {
+  return { filePath, summary: '', codeSnippets: [{ startLine: 1, endLine: 3, content }] };
+}
+
+describe('R06 prompt boundary facts', () => {
+  it('preserves each copy-ready source snippet even when files share long lines', () => {
+    const body =
+      '  return { allowed: true, policyName: "AllowKnownUsers", defaultScope: "project" };';
+    const alpha = `function alpha() {\n${body}\n}`;
+    const beta = `function beta() {\n${body}\n}`;
+    const a = artifact();
+    a.evidenceMap.set('src/a.ts', snippet('src/a.ts', alpha));
+    a.evidenceMap.set('src/b.ts', snippet('src/b.ts', beta));
+    const section = buildCodeContextSection(a.evidenceMap);
+    expect(section).toContain(beta);
+    const prompt = buildProducerPromptV2(a, promptDimension, { name: 'fixture' });
+    expect(prompt).toContain(`可复制 coreCode(来源 src/b.ts:1-3): ${beta}`);
+  });
+  it('preserves a distinct specific finding which contains an earlier long finding', () => {
+    const first =
+      'Runtime closes the request scope when host cancellation interrupts an outstanding operation.';
+    const second = `${first} The pending write receipt remains recoverable through the audit ledger.`;
+    const a = {
+      ...artifact(),
+      findings: [
+        { finding: first, evidence: 'src/a.ts:1-3', importance: 9 },
+        { finding: second, evidence: 'src/b.ts:1-3', importance: 9 },
+      ],
+    };
+    const prompt = buildProducerPromptV2(a, promptDimension, { name: 'fixture' });
+    expect(prompt).toContain(first);
+    expect(prompt).toContain(second);
+  });
+  it('passes the actual Core evidence starter map through the existing Producer preset', () => {
+    const starters = buildEvidenceStarters(promptDimension, {
+      astData: {
+        classes: [],
+        protocols: [],
+        fileSummaries: [],
+        patternStats: { factory: 3 },
+      } as never,
+    });
+    expect(starters?.detectedPatterns?.hint).toBeTruthy();
+    const stage = INSIGHT_PRESET.strategy.stages.find((s) => s.name === 'produce');
+    if (!stage?.promptBuilder) {
+      throw new Error('Producer fixture requires a prompt builder');
+    }
+    const prompt = stage.promptBuilder({
+      gateArtifact: artifact(),
+      dimConfig: promptDimension,
+      projectInfo: { name: 'fixture' },
+      evidenceStarters: starters,
+    });
+    expect(prompt).toContain(starters?.detectedPatterns?.hint);
+  });
+  it('does not promote an unverified finding in the real scan stage prompt', () => {
+    const stages = new AgentStageFactoryRegistry().build('scanPipeline', {
+      params: { task: 'extract' },
+    });
+    const stage = stages.find((s) => s.name === 'produce');
+    if (!stage?.promptBuilder) {
+      throw new Error('Producer fixture requires a prompt builder');
+    }
+    const prompt = (stage.promptBuilder as (context: unknown) => string)({
+      gateArtifact: {
+        ...artifact(),
+        analysisText: 'Verified analysis',
+        findings: [
+          { finding: 'Confirmed source behavior', evidence: 'E-1=src/a.ts:1-3', importance: 8 },
+          {
+            finding: 'Unverified behavior',
+            evidence: 'E-2 [unverified: 证据均无文件归属]',
+            importance: 9,
+          },
+        ],
+      },
+    });
+    const confirmed =
+      prompt.split('## 关键发现 (Analyst 已确认)')[1]?.split('### ⚠️ 未核实线索')[0] ?? '';
+    expect(confirmed).toContain('Confirmed source behavior');
+    expect(confirmed).not.toContain('Unverified behavior');
+  });
+  it('retains doc-background policy without exposing it as a coreCode source', () => {
+    const a = artifact();
+    a.evidenceMap.set(
+      'docs/design.md',
+      snippet('docs/design.md', 'A source reference to a historical note.')
+    );
+    const prompt = buildProducerPromptV2(a, promptDimension, { name: 'fixture' });
+    expect(prompt).toContain('背景文件');
+    expect(prompt).not.toContain('可复制 coreCode(来源 docs/design.md');
   });
 });
