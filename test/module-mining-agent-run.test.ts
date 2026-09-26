@@ -1,3 +1,4 @@
+import { buildCanonicalCoverageLedgerModuleId } from '@alembic/core/host-agent-workflows';
 import { describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
 import { SCOPED_MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module-mining/ScopedModuleMiningProfile.js';
@@ -215,3 +216,127 @@ function createService(executions: RuntimeExecution[]) {
     },
   });
 }
+
+type ChildObservation = { id: string; files: string[] };
+function observedModuleService(children: ChildObservation[], failSecond = false) {
+  return new AgentService({
+    runtimeBuilder: {
+      build(profile: CompiledAgentProfile): AgentRuntimeLike {
+        return {
+          id: `rt:${profile.id}`,
+          async execute(message) {
+            const id = String(message.metadata?.moduleId);
+            const context = (message.metadata?.context || {}) as Record<string, unknown>;
+            children.push({ id, files: (context.ownedFiles || []) as string[] });
+            const failing = failSecond && id === 'bad';
+            return {
+              reply: failing ? 'provider unavailable' : `done:${id}`,
+              phases: { _pipelineOutcome: { outcome: failing ? 'failed' : 'completed' } },
+              toolCalls: failing
+                ? []
+                : [
+                    {
+                      tool: 'knowledge',
+                      args: { action: 'submit' },
+                      result: { id: `receipt:${id}`, status: 'created', lifecycle: 'pending' },
+                    },
+                  ],
+              tokenUsage: { input: 2, output: 1 },
+              iterations: 1,
+              durationMs: 1,
+            } as never;
+          },
+        };
+      },
+    },
+  });
+}
+
+describe('module split identities and partial outcomes', () => {
+  it('splits actual project-relative module files by the module internal directories', async () => {
+    const children: ChildObservation[] = [];
+    const files = [
+      ...Array.from({ length: 40 }, (_, i) => `Sources/App/alpha/f${i}.ts`),
+      ...Array.from({ length: 30 }, (_, i) => `Sources/App/beta/f${i}.ts`),
+    ];
+    await runModuleMining({
+      agentService: observedModuleService(children),
+      modules: [
+        { moduleId: 'target:App:Sources/App', modulePath: 'Sources/App', ownedFiles: files },
+      ],
+      projectFacts: { project: 'fixture' },
+      scaleCap: 1,
+    });
+    expect(children.length).toBeGreaterThan(1);
+    expect(children.flatMap((c) => c.files).sort()).toEqual([...files].sort());
+  });
+  it('keeps distinct group combinations from overwriting a sibling module result', async () => {
+    const children: ChildObservation[] = [];
+    const files = [
+      ...Array.from({ length: 61 }, (_, i) => `alpha+beta/f${i}.ts`),
+      ...Array.from({ length: 40 }, (_, i) => `alpha/f${i}.ts`),
+      ...Array.from({ length: 20 }, (_, i) => `beta/f${i}.ts`),
+    ];
+    const output = await runModuleMining({
+      agentService: observedModuleService(children),
+      modules: [{ moduleId: 'root', ownedFiles: files }],
+      projectFacts: { project: 'fixture' },
+    });
+    expect(children).toHaveLength(2);
+    expect(new Set(children.map((c) => c.id)).size).toBe(2);
+    expect(Object.keys(output.phases?.moduleResults as object)).toHaveLength(2);
+  });
+  it('retains confirmed sibling results on a failed module run error', async () => {
+    const children: ChildObservation[] = [];
+    let failure: unknown;
+    try {
+      await runModuleMining({
+        agentService: observedModuleService(children, true),
+        modules: [
+          { moduleId: 'good', ownedFiles: ['src/good.ts'] },
+          { moduleId: 'bad', ownedFiles: ['src/bad.ts'] },
+        ],
+        projectFacts: { project: 'fixture' },
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).toMatchObject({
+      partialResult: {
+        status: 'error',
+        toolCalls: [{ result: { id: 'receipt:good', status: 'created' } }],
+        phases: { moduleResults: { good: { status: 'success' }, bad: { status: 'error' } } },
+      },
+    });
+  });
+});
+
+it('keeps generated split identity distinct from a real existing Core module identity', async () => {
+  const children: ChildObservation[] = [];
+  const baseId = buildCanonicalCoverageLedgerModuleId({
+    moduleName: 'App',
+    modulePath: 'Sources/App',
+  });
+  const existingId = buildCanonicalCoverageLedgerModuleId({
+    moduleName: 'App',
+    modulePath: 'Sources/App#alpha',
+  });
+  const files = [
+    ...Array.from({ length: 40 }, (_, i) => `Sources/App/alpha/f${i}.ts`),
+    ...Array.from({ length: 30 }, (_, i) => `Sources/App/beta/f${i}.ts`),
+  ];
+  const existingFile = 'Sources/App#alpha/index.ts';
+  const result = await runModuleMining({
+    agentService: observedModuleService(children),
+    modules: [
+      { moduleId: baseId, modulePath: 'Sources/App', ownedFiles: files },
+      { moduleId: existingId, modulePath: 'Sources/App#alpha', ownedFiles: [existingFile] },
+    ],
+    projectFacts: { project: 'fixture' },
+  });
+  expect(children).toHaveLength(3);
+  expect(new Set(children.map((c) => c.id)).size).toBe(3);
+  expect(Object.keys(result.phases?.moduleResults as object)).toHaveLength(3);
+  expect(children.flatMap((c) => c.files).sort()).toEqual([...files, existingFile].sort());
+});

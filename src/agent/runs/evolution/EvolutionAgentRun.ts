@@ -1,7 +1,13 @@
 import type { EvolutionCandidateReason } from '@alembic/core/evolution';
 import type { ToolCallEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentService } from '../../service/AgentService.js';
-import { collectSuccessfulEvolutionIds, evolutionOutcome } from '../../utils/toolOutcomes.js';
+import {
+  collectSuccessfulEvolutionIds,
+  evolutionOutcome,
+  isPersistedSubmission,
+  readToolObservation,
+} from '../../utils/toolOutcomes.js';
+import { runFailure } from '../result.js';
 
 export interface EvolutionAuditRecipe {
   id: string;
@@ -92,6 +98,12 @@ export async function runEvolutionAudit({
     presentation: { responseShape: 'system-task-result' },
   });
 
+  if (result.status !== 'success') {
+    throw runFailure(
+      result,
+      `Evolution audit failed with status ${result.status}: ${result.reply || 'empty reply'}`
+    );
+  }
   const audit = projectEvolutionAuditResult({
     reply: result.reply,
     toolCalls: result.toolCalls,
@@ -103,7 +115,8 @@ export async function runEvolutionAudit({
   );
   if (decisionIds.size < recipes.length) {
     const pending = recipes.map((r) => r.id).filter((id) => !decisionIds.has(id));
-    throw new Error(
+    throw runFailure(
+      result,
       `Evolution audit incomplete: decisions ${decisionIds.size}/${recipes.length}; pending=${pending.join(', ')}`
     );
   }
@@ -120,7 +133,13 @@ export function projectEvolutionAuditResult({
   iterations: number;
 }): EvolutionAuditResult {
   return {
-    proposed: toolCalls.filter((call) => evolutionOutcome(call) === 'proposal').length,
+    proposed: toolCalls.filter(
+      (call) =>
+        evolutionOutcome(call) === 'proposal' ||
+        (isPersistedSubmission(call) &&
+          typeof readToolObservation(call).params.supersedes === 'string' &&
+          String(readToolObservation(call).params.supersedes).trim().length > 0)
+    ).length,
     deprecated: toolCalls.filter((call) => evolutionOutcome(call) === 'deprecated').length,
     skipped: toolCalls.filter((call) => evolutionOutcome(call) === 'verified').length,
     iterations,

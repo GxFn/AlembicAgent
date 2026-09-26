@@ -39,7 +39,9 @@ export async function runScanAgentTask({
   source = 'system-workflow',
   onParseError,
 }: RunScanAgentTaskOptions): Promise<ScanKnowledgeProjection> {
-  const taskConfig = (SCAN_TASK_CONFIGS as Record<string, ScanTaskConfig>)[task];
+  const taskConfig = Object.hasOwn(SCAN_TASK_CONFIGS, task)
+    ? (SCAN_TASK_CONFIGS as Record<string, ScanTaskConfig>)[task]
+    : undefined;
   if (!taskConfig) {
     throw new Error(
       `Unknown scan task: "${task}". Available: ${Object.keys(SCAN_TASK_CONFIGS).join(', ')}`

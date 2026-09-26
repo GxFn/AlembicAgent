@@ -1,5 +1,6 @@
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
+import { runFailure } from '../result.js';
 
 export interface RelationDiscoveryResult extends Record<string, unknown> {
   analyzed: number;
@@ -32,6 +33,13 @@ export async function runRelationDiscovery({
 }
 
 export function projectRelationDiscoveryResult(result: AgentRunResult): RelationDiscoveryResult {
+  // 宿主会持久化返回的 relations；失败/取消的阶段文本只能留在错误回执，不能进入写图。
+  if (result.status !== 'success') {
+    throw runFailure(
+      result,
+      `Relation discovery failed with status ${result.status}: ${result.reply || 'empty reply'}`
+    );
+  }
   const phases = result.phases as Record<string, { reply?: string }> | undefined;
   const synthesizeReply = phases?.synthesize?.reply || result.reply;
   const value = parseJsonResponse(synthesizeReply, { analyzed: 0, relations: [] });

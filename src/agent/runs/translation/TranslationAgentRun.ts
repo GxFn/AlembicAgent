@@ -1,3 +1,4 @@
+import { observeSafely } from '#shared/observers.js';
 import type { AgentService } from '../../service/AgentService.js';
 
 export interface TranslationJsonResult {
@@ -74,7 +75,10 @@ function parseTranslationJson(
     }
     return normalizeTranslation(JSON.parse(text.trim()), fallback);
   } catch (err: unknown) {
-    onParseError?.(err);
+    observeSafely(
+      () => onParseError?.(err),
+      () => undefined
+    );
     return fallback;
   }
 }

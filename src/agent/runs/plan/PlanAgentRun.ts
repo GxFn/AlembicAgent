@@ -9,6 +9,7 @@ import {
   type StrictPlanIntentV1,
 } from '@alembic/core/plans';
 import type { AgentService } from '../../service/AgentService.js';
+import { runFailure } from '../result.js';
 
 export interface PlanContextProjectionV1 {
   readonly schemaVersion: 1;
@@ -74,7 +75,10 @@ export async function runStrictPlanAgent({
       presentation: { responseShape: 'system-task-result' },
     });
     if (result.status !== 'success') {
-      throw new Error(`STRICT_PLAN_RUN_FAILED: ${result.status}: ${result.reply || 'empty reply'}`);
+      throw runFailure(
+        result,
+        `STRICT_PLAN_RUN_FAILED: ${result.status}: ${result.reply || 'empty reply'}`
+      );
     }
     if (result.toolCalls.length > 0) {
       throw new Error('PLAN_TOOL_FORBIDDEN');
@@ -118,6 +122,8 @@ export async function runStrictPlanAgent({
       receiptId: `plan-cognition-receipt-${hashCanonical(semantic)}`,
     };
     try {
+      // 冻结 query 是语义校验；与 Core 拒绝共用既有因果修复预算，不绕过父 invocation。
+      validateFrozenPlanQueries(intent, contextProjection);
       await validateReceipt(receipt);
       return receipt;
     } catch (error: unknown) {
@@ -162,7 +168,8 @@ export async function runPlanAgent({
   });
 
   if (result.status !== 'success') {
-    throw new Error(
+    throw runFailure(
+      result,
       `Plan agent failed with status ${result.status}: ${result.reply || 'empty reply'}`
     );
   }
@@ -305,9 +312,17 @@ function parseStrictPlanIntent(
   ) {
     throw new Error('STRICT_PLAN_INTENT_SHAPE_INVALID');
   }
+  return intent;
+}
+
+function validateFrozenPlanQueries(
+  intent: StrictPlanIntentV1,
+  context: PlanContextProjectionV1
+): void {
+  const record = readRecord(intent);
   const frozenCapabilities = new Set(context.frozenCapabilityIds);
   const frozenFamilies = new Set(context.frozenQueryFamilyIds);
-  for (const raw of record.plannedNextActions) {
+  for (const raw of record.plannedNextActions as unknown[]) {
     const action = readRecord(raw);
     if (
       !frozenCapabilities.has(String(action.capabilityId ?? '')) ||
@@ -316,7 +331,6 @@ function parseStrictPlanIntent(
       throw new Error('PLAN_UNKNOWN_FROZEN_QUERY');
     }
   }
-  return intent;
 }
 
 function validateStrictPlanContext(context: PlanContextProjectionV1): void {

@@ -50,6 +50,17 @@ function topLevelGroup(file: string): string {
   return idx > 0 ? file.slice(0, idx) : '(root)';
 }
 
+/** ownedFiles 是项目相对路径；跳过共同父目录后才是模块内部的第一层分组。 */
+function commonDirectoryDepth(files: string[]): number {
+  const directories = files.map((file) => file.split('/').slice(0, -1));
+  const first = directories[0] || [];
+  let depth = 0;
+  while (depth < first.length && directories.every((parts) => parts[depth] === first[depth])) {
+    depth += 1;
+  }
+  return depth;
+}
+
 /** 依赖关系(可选)：facts/module 携带 dependencies/imports/relations 数组时提取字符串项。 */
 function extractRelations(module: ModuleLikeRecord): string[] {
   const out: string[] = [];
@@ -88,8 +99,9 @@ export function buildModuleContextMap(
 
   // 1) 目录分组文件清单(封顶 MAX_LISTED_FILES,超出按目录汇总)
   const byGroup = new Map<string, string[]>();
+  const depth = commonDirectoryDepth(files);
   for (const file of files) {
-    const group = topLevelGroup(file);
+    const group = topLevelGroup(file.split('/').slice(depth).join('/'));
     const bucket = byGroup.get(group) ?? [];
     bucket.push(file);
     byGroup.set(group, bucket);
@@ -134,7 +146,7 @@ export function buildModuleContextMap(
 }
 
 /**
- * 超大模块拆分：ownedFiles > OVERSIZE_THRESHOLD 时按顶层子目录贪心分组,每组 ≤ 阈值。
+ * 超大模块拆分：ownedFiles > OVERSIZE_THRESHOLD 时按共同父目录下的子目录贪心分组；单目录超限仍保留内聚性。
  * 拆出的条目是真实 module 条目(moduleId#<group>),下游 partitioner/merger 契约不变。
  */
 export function splitOversizedModule(
@@ -152,8 +164,9 @@ export function splitOversizedModule(
     baseId;
 
   const byGroup = new Map<string, string[]>();
+  const depth = commonDirectoryDepth(files);
   for (const file of files) {
-    const group = topLevelGroup(file);
+    const group = topLevelGroup(file.split('/').slice(depth).join('/'));
     const bucket = byGroup.get(group) ?? [];
     bucket.push(file);
     byGroup.set(group, bucket);
@@ -176,7 +189,9 @@ export function splitOversizedModule(
     return [module];
   }
   return bins.map((bin, index) => {
-    const suffix = bin.label.slice(0, 2).join('+') || `part-${index + 1}`;
+    // 每个目录名先编码再连接；字面 a+b 与两个目录 a、b 不共享身份，也不截去后续分组。
+    const suffix =
+      bin.label.map((label) => encodeURIComponent(label)).join('+') || `part-${index + 1}`;
     return {
       ...module,
       moduleId: `${baseId}#${suffix}`,

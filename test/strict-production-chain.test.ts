@@ -1151,3 +1151,48 @@ describe('R07 strict gate actual logger observer boundary', () => {
     }
   });
 });
+
+describe('strict Plan local semantic validation', () => {
+  it('routes a local PLAN_UNKNOWN_FROZEN_QUERY failure through the existing semantic repair budget', async () => {
+    const calls: AgentRunInput[] = [];
+    const invalid = {
+      ...strictIntent,
+      plannedNextActions: strictIntent.plannedNextActions.map((a) => ({
+        ...a,
+        capabilityId: 'not-in-frozen-catalog',
+      })),
+    };
+    const receipt = await runStrictPlanAgent({
+      contextProjection: planContext(),
+      agentService: {
+        async run(input) {
+          calls.push(input);
+          return result(JSON.stringify(calls.length === 1 ? invalid : strictIntent));
+        },
+      },
+      validateReceipt: () => undefined,
+    });
+    expect(calls).toHaveLength(2);
+    expect(receipt.lineage.repairs).toHaveLength(1);
+    expect(receipt.lineage.repairs[0].reason).toContain('PLAN_UNKNOWN_FROZEN_QUERY');
+    expect(receipt.lineage.repairs[0].parentInvocationId).toBe(
+      receipt.lineage.initial.invocationId
+    );
+  });
+  it('does not retry a failed provider as semantic plan repair', async () => {
+    let count = 0;
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: {
+          async run() {
+            count++;
+            return { ...result('provider unavailable'), status: 'error' };
+          },
+        },
+        validateReceipt: () => undefined,
+      })
+    ).rejects.toThrow('STRICT_PLAN_RUN_FAILED');
+    expect(count).toBe(1);
+  });
+});

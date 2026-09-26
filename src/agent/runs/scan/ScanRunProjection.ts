@@ -1,5 +1,10 @@
 import type { AgentDiagnostics, ToolCallEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
+import {
+  isKnowledgeSubmit,
+  isPersistedSubmission,
+  readToolObservation,
+} from '../../utils/toolOutcomes.js';
 
 export interface ScanRecipe extends Record<string, unknown> {
   id: string;
@@ -39,6 +44,10 @@ export function projectScanRunResult({
   result,
   fallback,
 }: ScanProjectionOptions): ScanKnowledgeProjection {
+  const failure =
+    result.status === 'success'
+      ? {}
+      : { error: `Scan failed with status ${result.status}: ${result.reply || 'empty reply'}` };
   const toolCalls = result.toolCalls || [];
   const recipes = extractCreatedRecipes(toolCalls);
   if (recipes.length > 0) {
@@ -47,6 +56,7 @@ export function projectScanRunResult({
       const first = recipes[0];
       return {
         ...first,
+        ...failure,
         title: first.title || '',
         summary: first.description || first.summary || '',
         usageGuide: first.usageGuide || '',
@@ -59,7 +69,7 @@ export function projectScanRunResult({
         diagnostics,
       };
     }
-    return { targetName: label, extracted: recipes.length, recipes, diagnostics };
+    return { targetName: label, extracted: recipes.length, recipes, diagnostics, ...failure };
   }
 
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
@@ -70,6 +80,7 @@ export function projectScanRunResult({
   const ignoredUnpersistedOutput = Boolean(produceReply?.trim());
   return {
     ...fallbackValue,
+    ...failure,
     diagnostics: buildScanDiagnostics({
       label,
       task,
@@ -82,34 +93,18 @@ export function projectScanRunResult({
 }
 
 export function extractCreatedRecipes(toolCalls: ToolCallEntry[]): ScanRecipe[] {
-  return toolCalls
-    .filter(isKnowledgeSubmitCall)
-    .map((tc) => {
-      const res = tc.result as Record<string, unknown> | null;
-      if (!res || typeof res !== 'object' || res.status !== 'created') {
-        return null;
-      }
-      const id = typeof res.id === 'string' ? res.id.trim() : '';
-      const lifecycle = res.lifecycle;
-      if (!id || (lifecycle !== 'pending' && lifecycle !== 'staging')) {
-        return null;
-      }
-      return {
-        ...res,
-        id,
-        candidateId: id,
-        status: 'created' as const,
-        lifecycle,
-      };
-    })
-    .filter((recipe): recipe is ScanRecipe => Boolean(recipe));
-}
-
-function isKnowledgeSubmitCall(toolCall: ToolCallEntry): boolean {
-  return (
-    (toolCall.tool || toolCall.name) === 'knowledge' &&
-    String(toolCall.args?.action || '') === 'submit'
-  );
+  return toolCalls.filter(isPersistedSubmission).map((call) => {
+    // isPersistedSubmission 验证完整 envelope 和业务回执，之后再投影规范化 payload。
+    const receipt = readToolObservation(call).result;
+    const id = (receipt.id as string).trim();
+    return {
+      ...receipt,
+      id,
+      candidateId: id,
+      status: 'created' as const,
+      lifecycle: receipt.lifecycle as ScanRecipe['lifecycle'],
+    };
+  });
 }
 
 function buildScanDiagnostics({
@@ -132,7 +127,7 @@ function buildScanDiagnostics({
   const phases = result.phases as Record<string, PhaseSummary> | undefined;
   const toolCalls = result.toolCalls || [];
   const collectCalls = toolCalls.filter((tc) => (tc.tool || tc.name) === 'knowledge');
-  const submitCalls = toolCalls.filter(isKnowledgeSubmitCall);
+  const submitCalls = toolCalls.filter(isKnowledgeSubmit);
   const persistenceOutcome =
     recipesFound > 0
       ? 'created'
@@ -142,6 +137,7 @@ function buildScanDiagnostics({
   return {
     label: label || '',
     task,
+    runStatus: result.status,
     recipesFound,
     persistenceOutcome,
     projectionAuthority: 'persisted-knowledge-submit-results-only',

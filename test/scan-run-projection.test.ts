@@ -1,7 +1,13 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, it, test, vi } from 'vitest';
+import {
+  type RunScanAgentTaskOptions,
+  runScanAgentTask,
+} from '../src/agent/runs/scan/ScanAgentRun.js';
 import { projectScanRunResult } from '../src/agent/runs/scan/ScanRunProjection.js';
 import type { ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
-import type { AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
+import type { AgentRunResult, AgentRunStatus } from '../src/agent/service/AgentRunContracts.js';
+import type { AgentService } from '../src/agent/service/AgentService.js';
+import { SystemRunContextFactory } from '../src/agent/service/SystemRunContextFactory.js';
 
 function knowledgeCall(result: unknown): ToolCallEntry {
   return {
@@ -200,4 +206,90 @@ describe('ScanRunProjection persisted Recipe identity', () => {
       extracted: 1,
     });
   });
+});
+
+describe('scan observation truth and partial failures', () => {
+  function runResult(
+    toolCalls: ToolCallEntry[] = [],
+    status: AgentRunStatus = 'success'
+  ): AgentRunResult {
+    return {
+      runId: 'fixture',
+      profileId: 'scan-extract',
+      reply: 'finished',
+      status,
+      toolCalls,
+      usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+      diagnostics: null,
+    };
+  }
+  function submitted(result: unknown, envelope?: unknown): ToolCallEntry {
+    return {
+      tool: 'knowledge',
+      args: { action: 'submit', params: { title: 'Verified', supersedes: 'old-recipe' } },
+      result,
+      durationMs: 1,
+      ...(envelope ? { envelope: envelope as ToolCallEntry['envelope'] } : {}),
+    };
+  }
+  const created = { status: 'created', id: 'real-recipe', lifecycle: 'pending' };
+  const fallback = (label: string) => ({ targetName: label, extracted: 0, recipes: [] });
+
+  it('never projects a created payload inside an explicitly failed receipt', () => {
+    const result = projectScanRunResult({
+      label: 'fixture',
+      task: 'extract',
+      result: runResult([submitted(created, { ok: false, status: 'blocked', text: 'denied' })]),
+      fallback,
+    });
+    expect(result.recipes).toEqual([]);
+  });
+  it('keeps created results wrapped in a successful host envelope', () => {
+    const payload = { ok: true, data: created };
+    const result = projectScanRunResult({
+      label: 'fixture',
+      task: 'extract',
+      result: runResult([
+        submitted(payload, {
+          ok: true,
+          status: 'success',
+          text: 'confirmed',
+          structuredContent: payload,
+        }),
+      ]),
+      fallback,
+    });
+    expect(result.extracted).toBe(1);
+  });
+  it.each([
+    false,
+    true,
+  ])('does not hide scan timeout while preserving confirmed partial receipts=%s', (withCreated) => {
+    const result = projectScanRunResult({
+      label: 'fixture',
+      task: 'extract',
+      result: runResult(withCreated ? [submitted(created)] : [], 'timeout'),
+      fallback,
+    });
+    expect(result.error).toBeTruthy();
+    expect(result.extracted).toBe(withCreated ? 1 : 0);
+  });
+});
+
+it.each([
+  '__proto__',
+  'constructor',
+  'toString',
+])('rejects inherited scan task %s before creating a run', async (task) => {
+  const run = vi.fn(async () => {
+    throw new Error('must not start a provider run');
+  });
+  await expect(
+    runScanAgentTask({
+      agentService: { run } as unknown as AgentService,
+      systemRunContextFactory: new SystemRunContextFactory(),
+      task: task as RunScanAgentTaskOptions['task'],
+    })
+  ).rejects.toThrow('Unknown scan task');
+  expect(run).not.toHaveBeenCalled();
 });

@@ -1,6 +1,9 @@
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { computeModuleAnalystBudget } from '../../prompts/insightAnalyst.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
+import { runFailure } from '../result.js';
 import {
   buildModuleContextMap,
   type ModuleLikeRecord,
@@ -74,7 +77,8 @@ export async function runScopedModuleMining({
   });
 
   if (result.status !== 'success') {
-    throw new Error(
+    throw runFailure(
+      result,
       `ProjectIndex scoped module mining agent failed with status ${result.status}: ${
         result.reply || 'empty reply'
       }`
@@ -101,9 +105,36 @@ function selectScopedIndexModulesForRun(modules: ScopedMiningModule[], scaleCap?
   );
   // P1-B-2：超大模块按顶层子目录拆分成真实 module 条目——在 run 入口拆(scaleCap 之后)，
   // partitioner/merger 的按下标 1:1 契约零改动。
-  const expanded = normalized.flatMap((moduleRecord) =>
-    splitOversizedModule(moduleRecord as ModuleLikeRecord)
-  );
+  // 为真实模块预留身份；派生分组也可能撞上路径中含 # 的合法 Core moduleId。
+  const allocatedIds = new Set(normalized.map((module) => String(module.moduleId)));
+  const expanded = normalized.flatMap((moduleRecord) => {
+    const parts = splitOversizedModule(moduleRecord as ModuleLikeRecord);
+    if (parts.length === 1) {
+      return parts;
+    }
+    return parts.map((part) => {
+      const proposedId = String(part.moduleId);
+      let moduleId = proposedId;
+      let suffix = 2;
+      while (allocatedIds.has(moduleId)) {
+        moduleId = `${proposedId}#part-${suffix++}`;
+      }
+      allocatedIds.add(moduleId);
+      if (moduleId === proposedId) {
+        return part;
+      }
+      observeSafely(
+        () =>
+          Logger.getInstance().info('[ModuleMining] disambiguated split module identity', {
+            sourceModuleId: moduleRecord.moduleId,
+            proposedId,
+            moduleId,
+          }),
+        () => undefined
+      );
+      return { ...part, moduleId, id: moduleId };
+    });
+  });
   // P1-B-1/2：为每个(拆分后)模块确定性附着——
   //   contextMap：静态模块图谱(coordinator 拼进 dimConfig.guide,Analyst 首轮即见骨架，
   //   不再求 LLM 自觉调 graph 才能定位)；
