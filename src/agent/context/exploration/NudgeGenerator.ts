@@ -105,7 +105,8 @@ export class NudgeGenerator {
     if (
       !isTerminalPhase &&
       !this.#convergenceNudged &&
-      m.roundsSinceNewInfo >= DEFAULT_CONVERGENCE_STALE_THRESHOLD &&
+      (state.phase === 'PRODUCE' ? m.roundsSinceSubmit : m.roundsSinceNewInfo) >=
+        DEFAULT_CONVERGENCE_STALE_THRESHOLD &&
       m.iteration >= DEFAULT_MIN_EXPLORE_ITERS
     ) {
       this.#convergenceNudged = true;
@@ -113,7 +114,7 @@ export class NudgeGenerator {
         return this.#emitNudge(state, {
           type: 'convergence',
           text:
-            `Producer 阶段已连续 ${m.roundsSinceNewInfo} 轮没有有效新提交。` +
+            `Producer 阶段已连续 ${m.roundsSinceSubmit} 轮没有有效新提交。` +
             `如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出总结 JSON；` +
             `否则只调用 ${state.submitToolName} 提交尚未提交且不重复的候选。\n` +
             `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,

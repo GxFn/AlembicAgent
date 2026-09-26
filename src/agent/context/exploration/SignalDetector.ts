@@ -1,3 +1,5 @@
+import { stableStringify } from '#shared/serialization.js';
+import { readToolObservation, successfulReadPaths } from '../../utils/toolOutcomes.js';
 /**
  * SignalDetector — V2 工具调用信号检测器
  *
@@ -51,7 +53,13 @@ export class SignalDetector {
    * 检测工具调用是否产生了新信息
    */
   detect(toolName: string, args: Record<string, unknown>, result: unknown): boolean {
-    const action = (args?.action as string) || '';
+    const observation = readToolObservation({ tool: toolName, args, result });
+    if (!observation.ok) {
+      return false;
+    }
+    args = observation.params;
+    result = typeof result === 'string' ? result : observation.result;
+    const action = observation.action;
 
     switch (toolName) {
       case 'code': {
@@ -59,7 +67,10 @@ export class SignalDetector {
           return this.#detectSearchSignal(args, result);
         }
         if (action === 'read') {
-          return this.#detectFileSignal(args);
+          return this.#detectFileSignal({
+            ...args,
+            filePaths: successfulReadPaths({ tool: toolName, args, result }),
+          });
         }
         if (action === 'outline') {
           return this.#detectFileSignal(args);
@@ -97,7 +108,9 @@ export class SignalDetector {
     let foundNew = false;
 
     const pattern = (args?.pattern as string) || '';
-    const patterns = (args?.patterns as string[]) || [];
+    const patterns = Array.isArray(args.patterns)
+      ? args.patterns.filter((value): value is string => typeof value === 'string')
+      : [];
 
     if (pattern && !this.#metrics.uniquePatterns.has(pattern)) {
       this.#metrics.uniquePatterns.add(pattern);
@@ -117,6 +130,19 @@ export class SignalDetector {
       for (const f of files) {
         if (!this.#metrics.uniqueFiles.has(f)) {
           this.#metrics.uniqueFiles.add(f);
+          foundNew = true;
+        }
+      }
+    }
+
+    if (result && typeof result === 'object') {
+      const record = result as Record<string, unknown>;
+      const matches = Array.isArray(record.matches) ? record.matches : [];
+      for (const match of matches) {
+        const file =
+          match && typeof match === 'object' ? (match as Record<string, unknown>).file : null;
+        if (typeof file === 'string' && file && !this.#metrics.uniqueFiles.has(file)) {
+          this.#metrics.uniqueFiles.add(file);
           foundNew = true;
         }
       }
@@ -154,7 +180,7 @@ export class SignalDetector {
   #detectGraphSignal(args: Record<string, unknown>): boolean {
     const action = (args?.action as string) || '';
     const type = (args?.type as string) || '';
-    const entity = (args?.entity as string) || '';
+    const entity = String(args.entity || args.className || args.protocolName || args.name || '');
     const qKey = `graph:${action}:${type}:${entity}`;
     if (!this.#metrics.uniqueQueries.has(qKey)) {
       this.#metrics.uniqueQueries.add(qKey);
@@ -166,7 +192,7 @@ export class SignalDetector {
   /** terminal.exec — command 信号去重 */
   #detectTerminalSignal(args: Record<string, unknown>): boolean {
     const cmd = (args?.command as string) || '';
-    const qKey = `terminal:${cmd.substring(0, 100)}`;
+    const qKey = `terminal:${cmd}`;
     if (!this.#metrics.uniqueQueries.has(qKey)) {
       this.#metrics.uniqueQueries.add(qKey);
       return true;
@@ -176,7 +202,7 @@ export class SignalDetector {
 
   /** 通用降级 — 按工具名 + 参数指纹去重 */
   #detectGenericSignal(toolName: string, args: Record<string, unknown>): boolean {
-    const qKey = `${toolName}:${JSON.stringify(args || {}).substring(0, 80)}`;
+    const qKey = `${toolName}:${stableStringify(args || {})}`;
     if (!this.#metrics.uniqueQueries.has(qKey)) {
       this.#metrics.uniqueQueries.add(qKey);
       return true;

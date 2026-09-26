@@ -7,6 +7,7 @@
  */
 
 import path from 'node:path';
+import { readToolObservation, successfulReadPaths } from '../utils/toolOutcomes.js';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -58,6 +59,7 @@ interface ToolCallLike {
   args?: unknown;
   params?: unknown;
   result?: unknown;
+  envelope?: unknown;
 }
 
 interface DiagnosticsLike {
@@ -261,26 +263,24 @@ function evidenceFromMap(
 function evidenceFromToolCalls(toolCalls: readonly ToolCallLike[] = []): L4EvidenceRef[] {
   const refs: L4EvidenceRef[] = [];
   for (const call of toolCalls) {
-    const args =
-      call.args && typeof call.args === 'object'
-        ? (call.args as UnknownRecord)
-        : call.params && typeof call.params === 'object'
-          ? (call.params as UnknownRecord)
-          : {};
-    const result =
-      call.result && typeof call.result === 'object' ? (call.result as UnknownRecord) : {};
-    const filePath = asString(
-      args.path ||
-        args.filePath ||
-        result.path ||
-        result.filePath ||
-        (Array.isArray(result.files) && (result.files[0] as UnknownRecord | undefined)?.path)
-    );
-    if (filePath) {
+    const observation = readToolObservation(call);
+    if (!observation.ok) {
+      continue;
+    }
+    const args = observation.params;
+    const result = observation.result;
+    const files =
+      observation.tool === 'code' && observation.action === 'read'
+        ? successfulReadPaths(call)
+        : [asString(args.path || args.filePath || result.path || result.filePath)];
+    for (const filePath of files) {
+      if (!filePath) {
+        continue;
+      }
       pushUniqueEvidence(refs, {
         path: filePath,
         ...(typeof args.startLine === 'number' ? { line: args.startLine } : {}),
-        summary: `${asString(call.tool || call.name, 'tool')} ${safeJson(args, 180)}`,
+        summary: `${observation.tool} ${safeJson(args, 180)}`,
         source: 'tool-call',
       });
     }
@@ -299,8 +299,14 @@ function normalizeToolSummary(distilled: DistilledContextLike, input: L4MemoryPa
     }
   }
   for (const call of input.toolCalls || []) {
-    const tool = asString(call.tool || call.name, 'tool');
-    summaries.push(`[${tool}] ${safeJson(call.result ?? call.args ?? call.params, 220)}`);
+    const observation = readToolObservation(call);
+    const envelope =
+      call.envelope && typeof call.envelope === 'object' ? (call.envelope as UnknownRecord) : {};
+    const body =
+      envelope.text ?? (typeof call.result === 'string' ? call.result : observation.result);
+    summaries.push(
+      `[${observation.tool || 'tool'}${observation.ok ? '' : ' failed'}] ${safeJson(body, 220)}`
+    );
   }
   return summaries.filter(Boolean).slice(-MAX_TOOL_SUMMARIES);
 }

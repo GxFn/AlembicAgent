@@ -21,11 +21,14 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
+import { estimateTokens } from '#shared/tokenUtils.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import {
   createStrictAnalysisContextProjectionV1,
   type StrictAnalysisContextProjectionV1,
 } from '../production/StrictProductionPipeline.js';
+import { readToolObservation, successfulReadPaths } from '../utils/toolOutcomes.js';
 import type { DistilledContext } from './MemoryFlushContract.js';
 
 // ═══════════════════════════════════════════════════════════
@@ -157,6 +160,9 @@ interface ScratchpadEntry {
 }
 
 interface RoundAction {
+  /** 旧 addAction 无回执，保持 undefined；真实工具回执明确记录成功/失败。 */
+  ok?: boolean;
+  successfulReadPaths?: string[];
   tool: string;
   params: Record<string, unknown>;
 }
@@ -365,7 +371,20 @@ export class ActiveContext {
     const round = this.#currentRound?.iteration || 0;
 
     // ── RT 部分: Action + Observation ──
-    this.#currentRound?.actions.push({ tool: toolName, params: args });
+    const observedCall = {
+      tool: toolName,
+      args,
+      result,
+      ...(isToolResultEnvelope(result) ? { envelope: result } : {}),
+    };
+    this.#currentRound?.actions.push({
+      tool: toolName,
+      params: args,
+      ok: readToolObservation(observedCall).ok,
+      ...(toolName === 'code' && args.action === 'read'
+        ? { successfulReadPaths: successfulReadPaths(observedCall) }
+        : {}),
+    });
     const observationMeta = ActiveContext.buildObservationMeta(toolName, args, result, isNew);
     this.#currentRound?.observations.push({ tool: toolName, ...observationMeta });
 
@@ -469,8 +488,12 @@ export class ActiveContext {
       ...(evidenceRefs?.length ? { evidenceRefs: [...evidenceRefs] } : {}),
     });
 
-    this.#logger.debug(
-      `[ActiveContext] 📌 noted finding (${importance}/10): ${finding.substring(0, 80)}`
+    observeSafely(
+      () =>
+        this.#logger.debug(
+          `[ActiveContext] 📌 noted finding (${importance}/10): ${finding.substring(0, 80)}`
+        ),
+      () => undefined
     );
   }
 
@@ -535,7 +558,7 @@ export class ActiveContext {
     }
     return {
       ...this.#plan,
-      steps: this.#plan.steps.map((s) => ({ ...s })),
+      steps: structuredClone(this.#plan.steps),
     };
   }
 
@@ -546,7 +569,7 @@ export class ActiveContext {
 
   /** 获取计划历史 (F7) */
   getPlanHistory() {
-    return this.#planHistory.map((p) => ({ ...p, steps: p.steps.map((s) => ({ ...s })) }));
+    return structuredClone(this.#planHistory);
   }
 
   /**
@@ -554,7 +577,7 @@ export class ActiveContext {
    * @returns >}
    */
   getCurrentRoundActions() {
-    return this.#currentRound?.actions || [];
+    return structuredClone(this.#currentRound?.actions || []);
   }
 
   /** 获取当前轮次的 iteration 编号 (F8) */
@@ -585,7 +608,7 @@ export class ActiveContext {
     if (this.#scratchpad.length > 0) {
       const sorted = [...this.#scratchpad].sort((a, b) => b.importance - a.importance);
       const scratchLines = ['## 📌 已确认的关键发现'];
-      let scratchTokens = this.#estimateTokens(scratchLines[0]);
+      let scratchTokens = estimateTokens(scratchLines[0]);
       let omitted = 0;
       for (const f of sorted) {
         const badge = f.importance >= 8 ? '⚠️' : f.importance >= 5 ? '📋' : '💡';
@@ -593,7 +616,7 @@ export class ActiveContext {
         if (f.evidence) {
           line += ` (${f.evidence})`;
         }
-        const tokens = this.#estimateTokens(`\n${line}`);
+        const tokens = estimateTokens(`\n${line}`);
         if (scratchTokens + tokens <= remaining) {
           scratchLines.push(line);
           scratchTokens += tokens;
@@ -607,15 +630,21 @@ export class ActiveContext {
         remaining -= scratchTokens;
       }
       if (omitted > 0) {
-        this.#logger.info(
-          `[ActiveContext] context budget retained ${scratchLines.length - 1} findings and omitted ${omitted}`
+        observeSafely(
+          () =>
+            this.#logger.info(
+              `[ActiveContext] context budget retained ${scratchLines.length - 1} findings and omitted ${omitted}`
+            ),
+          () => undefined
         );
       }
     }
 
     // §2: Observation Ledger (中等优先级)
     if (this.#compressedObservations.length > 0 && remaining > 100) {
-      const ledgerSection = this.#buildObservationLedgerSection(remaining);
+      const ledgerSection = this.#buildObservationLedgerSection(
+        Math.max(0, remaining - (parts.length ? estimateTokens('\n') : 0))
+      );
       if (ledgerSection) {
         parts.push(ledgerSection);
       }
@@ -640,9 +669,11 @@ export class ActiveContext {
         importance: f.importance,
         ...(f.evidenceRefs?.length ? { evidenceRefs: [...f.evidenceRefs] } : {}),
       })),
-      toolCallSummary: this.#compressedObservations.map(
-        (s) => `[${s.toolName}] ${s.summary.substring(0, 150)}`
-      ),
+      // 蒸馏是退出时的完整观察摘要，滑动窗口中尚未压缩的最后几条也必须带出。
+      toolCallSummary: [
+        ...this.#compressedObservations,
+        ...this.#recentObservations.map((observation) => this.#compressObservation(observation)),
+      ].map((s) => `[${s.toolName}] ${s.summary.substring(0, 150)}`),
       stats: this.getStats(),
       plan: this.getPlan(),
       totalObservations: this.#totalObservations,
@@ -747,7 +778,8 @@ export class ActiveContext {
   getHighPriorityFindings(minImportance = 7) {
     return this.#scratchpad
       .filter((f) => f.importance >= minImportance)
-      .sort((a, b) => b.importance - a.importance);
+      .sort((a, b) => b.importance - a.importance)
+      .map((finding) => structuredClone(finding));
   }
 
   // ═══════════════════════════════════════════════════════
@@ -757,9 +789,9 @@ export class ActiveContext {
   /** 可序列化输出 */
   toJSON() {
     return {
-      rounds: this.#rounds.map((r) => ({ ...r })),
+      rounds: structuredClone(this.#rounds),
       stats: this.getStats(),
-      scratchpad: this.#scratchpad.map((f) => ({ ...f })),
+      scratchpad: structuredClone(this.#scratchpad),
       compressedObservations: this.#compressedObservations.length,
       totalObservations: this.#totalObservations,
       ...(this.#strictAnalysisContext
@@ -769,7 +801,7 @@ export class ActiveContext {
         ? {
             plan: {
               text: this.#plan.text,
-              steps: this.#plan.steps.map((s) => ({ ...s })),
+              steps: structuredClone(this.#plan.steps),
               createdAtIteration: this.#plan.createdAtIteration,
               lastUpdatedAtIteration: this.#plan.lastUpdatedAtIteration,
             },
@@ -786,10 +818,10 @@ export class ActiveContext {
   static fromJSON(json: ActiveContextJSON) {
     const ctx = new ActiveContext();
     if (json.rounds) {
-      ctx.#rounds = json.rounds.map((r) => ({ ...r }));
+      ctx.#rounds = structuredClone(json.rounds);
     }
     if (json.scratchpad) {
-      ctx.#scratchpad = json.scratchpad.map((f) => ({ ...f }));
+      ctx.#scratchpad = structuredClone(json.scratchpad);
     }
     if (json.totalObservations) {
       ctx.#totalObservations = json.totalObservations;
@@ -797,7 +829,7 @@ export class ActiveContext {
     if (json.plan) {
       ctx.#plan = {
         text: json.plan.text,
-        steps: json.plan.steps.map((s) => ({ ...s })),
+        steps: structuredClone(json.plan.steps),
         createdAtIteration: json.plan.createdAtIteration,
         lastUpdatedAtIteration: json.plan.lastUpdatedAtIteration,
       };
@@ -999,21 +1031,17 @@ export class ActiveContext {
     }
 
     const lines = ['## Observation Ledger'];
-    let remaining = tokenBudget - this.#estimateTokens(lines[0]);
     for (const category of OBSERVATION_LEDGER_CATEGORIES) {
       const items = (ledger.get(category) || []).slice(-OBSERVATION_LEDGER_LIMITS[category]);
-      if (items.length === 0 || remaining <= 0) {
-        continue;
-      }
       const categoryLines = [`### ${category}`];
       for (const item of items) {
         const line = `- [R${item.round}|${item.toolName}] ${item.text}`;
-        const lineTokens = this.#estimateTokens(line);
-        if (lineTokens > remaining) {
+        // 标题、换行和中日韩正文与外层使用同一估算，不把超额尾部留给外层硬截断。
+        const candidate = [...lines, [...categoryLines, line].join('\n')].join('\n');
+        if (estimateTokens(candidate) > tokenBudget) {
           break;
         }
         categoryLines.push(line);
-        remaining -= lineTokens;
       }
       if (categoryLines.length > 1) {
         lines.push(categoryLines.join('\n'));
@@ -1029,10 +1057,17 @@ export class ActiveContext {
   ): ObservationLedgerItem[] {
     const envelope = isToolResultEnvelope(observation.result) ? observation.result : null;
     const structured = envelope?.structuredContent ?? observation.result;
-    const args = observation.args || {};
-    const action = stringFrom(args.action);
+    const observedCall = {
+      tool: observation.toolName,
+      args: observation.args,
+      result: observation.result,
+      ...(envelope ? { envelope } : {}),
+    };
+    const normalized = readToolObservation(observedCall);
+    const args = normalized.params;
+    const action = normalized.action;
     const items: ObservationLedgerItem[] = [];
-    const ok = envelope ? envelope.ok && envelope.status === 'success' : true;
+    const ok = normalized.ok;
 
     if (!ok) {
       const failureText = sanitizeLedgerText(envelope?.text || summary || 'tool call failed', 180);
@@ -1068,7 +1103,7 @@ export class ActiveContext {
 
     if (observation.toolName === 'code') {
       if (action === 'read') {
-        const paths = extractReadPaths(args, structured);
+        const paths = successfulReadPaths(observedCall);
         for (const filePath of paths) {
           items.push(
             this.#ledgerItem('readSet', `read:${filePath}`, filePath, observation),
@@ -1157,11 +1192,6 @@ export class ActiveContext {
     };
   }
 
-  /** 粗糙 token 估算 (1 token ≈ 4 chars) */
-  #estimateTokens(text: string) {
-    return Math.ceil((text || '').length / 4);
-  }
-
   // ── Plan 内部方法 (从 ReasoningTrace 迁入) ──
 
   #setPlan(planText: string, iteration: number) {
@@ -1178,7 +1208,7 @@ export class ActiveContext {
       this.#setPlan(replanText, iteration);
       return;
     }
-    this.#planHistory.push({ ...this.#plan, steps: this.#plan.steps.map((s) => ({ ...s })) });
+    this.#planHistory.push({ ...this.#plan, steps: structuredClone(this.#plan.steps) });
     this.#plan.text = replanText;
     this.#plan.steps = this.#parsePlanSteps(replanText);
     this.#plan.lastUpdatedAtIteration = iteration;
@@ -1287,22 +1317,6 @@ function isToolResultEnvelope(value: unknown): value is ToolResultEnvelope {
     typeof (value as ToolResultEnvelope).callId === 'string' &&
     typeof (value as ToolResultEnvelope).status === 'string'
   );
-}
-
-function extractReadPaths(args: Record<string, unknown>, structured: unknown): string[] {
-  const paths = new Set<string>();
-  addString(paths, args.path);
-  addStringList(paths, args.filePaths);
-
-  const structuredObj = objectFrom(structured);
-  addString(paths, structuredObj?.path);
-  const files = Array.isArray(structuredObj?.files) ? structuredObj.files : [];
-  for (const file of files) {
-    const fileObj = objectFrom(file);
-    addString(paths, fileObj?.path);
-  }
-
-  return [...paths].map((p) => sanitizeLedgerText(p, 180)).filter(Boolean);
 }
 
 function extractSearches(
@@ -1418,19 +1432,6 @@ function stringListFrom(value: unknown): string[] {
     return [];
   }
   return value.map((item) => stringFrom(item)).filter(Boolean);
-}
-
-function addString(target: Set<string>, value: unknown) {
-  const text = stringFrom(value);
-  if (text) {
-    target.add(text);
-  }
-}
-
-function addStringList(target: Set<string>, value: unknown) {
-  for (const item of stringListFrom(value)) {
-    target.add(item);
-  }
 }
 
 export default ActiveContext;

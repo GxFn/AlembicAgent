@@ -1720,7 +1720,9 @@ export class AgentRuntime {
       });
 
       // 追加 tool result
-      messages.appendToolResult(fc.id, fc.name, resultStr);
+      messages.appendToolResult(fc.id, fc.name, resultStr, {
+        persistedSubmission: isPersistedSubmission(toolEntry),
+      });
     }
 
     if (truncatedCalls.length > 0) {

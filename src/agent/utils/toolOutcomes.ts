@@ -14,7 +14,10 @@ export function readToolObservation(call: unknown) {
   const params = { ...outer, ...record(nested) };
   const envelope = record(input.envelope);
   let payload = record(envelope.structuredContent ?? input.result);
-  let ok = input.result != null || envelope.structuredContent != null;
+  let ok =
+    input.result != null ||
+    envelope.structuredContent != null ||
+    (envelope.ok === true && typeof envelope.text === 'string');
   const seen = new Set<unknown>();
   for (const wrapper of [envelope, record(input.result), payload]) {
     if (
@@ -132,4 +135,44 @@ export function collectSuccessfulEvolutionIds(
     }
   }
   return ids;
+}
+
+/** code.read 的实际成功路径；批量成员状态优先于请求列表，部分结果不能把失败成员标成已读。 */
+export function successfulReadPaths(call: unknown): string[] {
+  const observation = readToolObservation(call);
+  if (!observation.ok || observation.tool !== 'code' || observation.action !== 'read') {
+    return [];
+  }
+  const payload = observation.result;
+  const paths = new Set<string>();
+  const add = (value: unknown) => {
+    if (typeof value === 'string' && value) {
+      paths.add(value);
+    }
+  };
+  if (Array.isArray(payload.files)) {
+    for (const file of payload.files) {
+      if (readToolObservation({ result: file }).ok) {
+        const entry = record(file);
+        add(entry.path ?? entry.filePath);
+      }
+    }
+  } else if (payload.batchResults && typeof payload.batchResults === 'object') {
+    for (const [file, value] of Object.entries(record(payload.batchResults))) {
+      if (readToolObservation({ result: value }).ok) {
+        add(file);
+      }
+    }
+  } else {
+    add(payload.path ?? payload.filePath);
+    if (paths.size === 0) {
+      const params = observation.params;
+      for (const file of Array.isArray(params.filePaths)
+        ? params.filePaths
+        : [params.path ?? params.filePath]) {
+        add(file);
+      }
+    }
+  }
+  return [...paths];
 }

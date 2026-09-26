@@ -23,7 +23,9 @@ import type { LlmContinuation } from '#ai/contracts.js';
 
 import Logger from '@alembic/core/logging';
 import { getModelRegistry } from '#ai/registry/ModelRegistry.js';
+import { observeSafely } from '#shared/observers.js';
 import { estimateTokensFast } from '../../shared/tokenUtils.js';
+import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import {
   buildL4MemoryPackage,
   formatL4MemorySummary,
@@ -55,6 +57,8 @@ export interface ContextMessage {
   metadata?: {
     kind?: 'l4_memory_summary' | 'runtime_nudge';
     source?: string;
+    /** Runtime 已确认的持久化事实，独立于受限的显示文本。 */
+    persistedSubmission?: boolean;
     [key: string]: unknown;
   };
 }
@@ -133,7 +137,7 @@ export class ContextWindow {
   /** 被压缩掉的轮次摘要（用于 digest 生成） */
   #compactionLog: string[] = [];
   /** 被压缩前提取的已提交候选标题 */
-  #compactedSubmits = new Set();
+  #compactedSubmits = new Set<string>();
   /** 日志器 */
   #logger;
   /** L3 collapse threshold: messages before this index are collapsed in projection. -1 = inactive. */
@@ -152,7 +156,8 @@ export class ContextWindow {
 
   #invalidateReadView(reason: string): void {
     this.#readViewRevision++;
-    this.#logger.info(
+    this.#log(
+      'info',
       `[ContextWindow] read view invalidated: ${reason}, revision=${this.#readViewRevision}`
     );
   }
@@ -331,12 +336,20 @@ export class ContextWindow {
    * @param name 工具名
    * @param content 工具返回内容（已经过 ToolResultLimiter 截断）
    */
-  appendToolResult(toolCallId: string, name: string, content: string) {
+  appendToolResult(
+    toolCallId: string,
+    name: string,
+    content: string,
+    metadata?: { persistedSubmission?: boolean }
+  ) {
     this.#messages.push({
       role: 'tool',
       toolCallId,
       name,
       content,
+      ...(typeof metadata?.persistedSubmission === 'boolean'
+        ? { metadata: { persistedSubmission: metadata.persistedSubmission } }
+        : {}),
     });
   }
 
@@ -449,7 +462,8 @@ export class ContextWindow {
       this.#compactionLog.push(
         `provider-input-budget: ${reason}; projected ${beforeProjectedTokens}->${afterProjectedTokens} tokens, ${beforeMessageCount}->${afterMessageCount} messages`
       );
-      this.#logger.info(
+      this.#log(
+        'info',
         `[ContextWindow] provider input budget compact: ${reason} | ` +
           `tokens≈${beforeProjectedTokens}->${afterProjectedTokens}, ` +
           `messages=${beforeMessageCount}->${afterMessageCount}`
@@ -479,8 +493,8 @@ export class ContextWindow {
   /**
    * L4 Auto-compact — LLM-based summary (async, called separately by AgentRuntime).
    *
-   * Replaces old messages with a summary while preserving the last 2 rounds
-   * and key findings extracted from compacted submits.
+   * 用结构化运行记忆替换旧协议历史；近期消息先进入 memory package。
+   * 生成期间若上下文变化，旧摘要失效，不能覆盖新消息或新阶段。
    */
   async compactL4(
     aiProvider: {
@@ -507,7 +521,7 @@ export class ContextWindow {
     }
 
     if (opts.abortSignal?.aborted) {
-      this.#logger.warn('[ContextWindow] L4 compact skipped: abort signal already fired');
+      this.#log('warn', '[ContextWindow] L4 compact skipped: abort signal already fired');
       return { level: 4, removed: 0, failed: true, cancelled: true };
     }
 
@@ -523,6 +537,8 @@ export class ContextWindow {
               (opts.memoryPackage as L4MemoryPackageInput | undefined)?.recentMessages ||
               this.#messages.slice(1),
           });
+    const originalMessages = JSON.stringify(this.#messages);
+    const originalRevision = this.#readViewRevision;
     const renderedPackage = renderL4MemoryPackage(memoryPackage);
     const summaryPrompt = [
       '请将下面的 L4 Memory Package 压缩成稳定的运行记忆摘要。',
@@ -543,13 +559,32 @@ export class ContextWindow {
         abortSignal: opts.abortSignal ?? undefined,
       });
       if (opts.abortSignal?.aborted) {
-        this.#logger.warn('[ContextWindow] L4 compact result discarded after abort');
+        this.#log('warn', '[ContextWindow] L4 compact result discarded after abort');
         return { level: 4, removed: 0, usage: summary.usage, failed: true, cancelled: true };
+      }
+
+      // toMessages 的公开原始视图也可能被修改，因此同时核对内容快照与资源视图版本。
+      if (
+        this.#readViewRevision !== originalRevision ||
+        JSON.stringify(this.#messages) !== originalMessages
+      ) {
+        this.#log(
+          'info',
+          '[ContextWindow] L4 summary discarded: context changed during generation'
+        );
+        return {
+          level: 4,
+          removed: 0,
+          usage: summary.usage,
+          failed: true,
+          validationMissing: ['context_changed'],
+        };
       }
 
       const validation = validateL4Summary(summary.text, memoryPackage);
       if (!validation.ok) {
-        this.#logger.warn(
+        this.#log(
+          'warn',
           `[ContextWindow] L4 memory summary validation failed: ${validation.missing.join(', ')}`
         );
         this.#compactionLog.push(
@@ -564,6 +599,7 @@ export class ContextWindow {
         };
       }
 
+      this.#extractCompactedSubmits(1);
       const removed = Math.max(0, oldLen - 2);
       this.#messages = [
         this.#messages[0],
@@ -579,14 +615,16 @@ export class ContextWindow {
       this.#collapseThreshold = -1;
       this.#invalidateReadView('l4_summary');
       this.#compactionLog.push(`L4: memory package summary replaced ${removed} messages`);
-      this.#logger.info(
+      this.#log(
+        'info',
         `[ContextWindow] L4 auto-compact: removed ${removed} messages, ` +
           `tokens≈${this.estimateTokens()}/${this.#tokenBudget}`
       );
 
       return { level: 4, removed, usage: summary.usage };
-    } catch (err) {
-      this.#logger.warn(
+    } catch (err: unknown) {
+      this.#log(
+        'warn',
         `[ContextWindow] L4 auto-compact failed: ${err instanceof Error ? err.message : String(err)}`
       );
       return { level: 4, removed: 0, failed: true };
@@ -622,7 +660,8 @@ export class ContextWindow {
       this.#invalidateReadView('l1_truncation');
       const afterTokens = this.estimateTokens();
       const ratio = this.getTokenUsageRatio();
-      this.#logger.info(
+      this.#log(
+        'info',
         `[ContextWindow] L1 compact: truncated ${truncated} tool results | ` +
           `tokens≈${afterTokens}/${this.#tokenBudget} (${(ratio * 100).toFixed(1)}%)`
       );
@@ -651,7 +690,7 @@ export class ContextWindow {
         prev.content
       ) {
         // 续接提示绑定这一条消息的原始内容次序，不能合并后只留下其中一份提示。
-        if (curr.continuation || prev.continuation) {
+        if (curr.continuation || prev.continuation || curr.metadata?.kind || prev.metadata?.kind) {
           protectedPairs++;
           continue;
         }
@@ -665,14 +704,16 @@ export class ContextWindow {
     }
 
     if (protectedPairs > 0) {
-      this.#logger.info(
-        `[ContextWindow] L2 preserved ${protectedPairs} native-continuation message pairs; protocol state remains atomic`
+      this.#log(
+        'info',
+        `[ContextWindow] L2 preserved ${protectedPairs} message pairs with continuation or runtime memory metadata; boundaries remain atomic`
       );
     }
 
     if (merged > 0) {
       this.#compactionLog.push(`L2-merge: merged ${merged} entries`);
-      this.#logger.info(
+      this.#log(
+        'info',
         `[ContextWindow] L2 merge: ${merged} entries merged | ` +
           `tokens≈${this.estimateTokens()}/${this.#tokenBudget}`
       );
@@ -699,9 +740,11 @@ export class ContextWindow {
     if (keepFrom > this.#collapseThreshold) {
       this.#invalidateReadView('l3_collapse');
     }
+    this.#extractCompactedSubmits(1, keepFrom);
     this.#collapseThreshold = keepFrom;
     this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}`);
-    this.#logger.info(
+    this.#log(
+      'info',
       `[ContextWindow] L3 collapse: projection threshold at index ${keepFrom}, ` +
         `${this.#messages.length - keepFrom} messages visible in projection`
     );
@@ -899,20 +942,68 @@ export class ContextWindow {
    * 从消息中提取已提交候选到 compactedSubmits
    * @param fromIdx 从哪个索引开始扫描
    */
-  #extractCompactedSubmits(fromIdx: number) {
-    for (let i = fromIdx; i < this.#messages.length; i++) {
-      const m = this.#messages[i];
-      if (m.role === 'assistant' && m.toolCalls) {
-        for (const tc of m.toolCalls) {
-          if (tc.name === 'knowledge') {
-            this.#compactedSubmits.add(getKnowledgeToolCallLabel(tc.args));
+  #extractCompactedSubmits(fromIdx: number, toIdx = this.#messages.length) {
+    let unconfirmed = 0;
+    for (let i = fromIdx; i < toIdx; i++) {
+      const message = this.#messages[i];
+      if (message.role !== 'assistant' || !message.toolCalls) {
+        continue;
+      }
+      for (const call of message.toolCalls) {
+        if (call.name !== 'knowledge' || call.args?.action !== 'submit') {
+          continue;
+        }
+        let confirmed = false;
+        for (let j = i + 1; j < this.#messages.length && this.#messages[j].role === 'tool'; j++) {
+          const result = this.#messages[j];
+          if (result.toolCallId !== call.id) {
+            continue;
           }
+          if (typeof result.metadata?.persistedSubmission === 'boolean') {
+            confirmed = result.metadata.persistedSubmission;
+            break;
+          }
+          try {
+            confirmed = isPersistedSubmission({
+              tool: call.name,
+              args: call.args,
+              result: JSON.parse(result.content || ''),
+            });
+          } catch (err: unknown) {
+            if (!(err instanceof SyntaxError)) {
+              this.#log(
+                'warn',
+                '[ContextWindow] receipt inspection failed; title remains unconfirmed'
+              );
+            }
+            // 显示文本或被裁剪的 JSON 无法证明持久化，不得凭请求标题宣称已提交。
+            confirmed = false;
+          }
+          break;
+        }
+        if (confirmed) {
+          this.#compactedSubmits.add(getKnowledgeToolCallLabel(call.args));
+        } else {
+          unconfirmed++;
         }
       }
+    }
+    if (unconfirmed > 0) {
+      this.#log(
+        'info',
+        `[ContextWindow] ${unconfirmed} unconfirmed submit title(s) excluded from retained history`
+      );
     }
   }
 
   // ─── 内部方法 ──────────────────────────────────────────
+
+  #log(level: 'info' | 'warn', message: string): void {
+    observeSafely(
+      () => this.#logger[level](message),
+      () => undefined
+    );
+  }
 
   /**
    * 找到最后一个 assistant(toolCalls) 的位置

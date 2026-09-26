@@ -1,4 +1,5 @@
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { runOperation } from '#shared/operation.js';
 
 /** 只描述一次读取，不把 session、持久记忆和工作记忆强行合成同一存储接口。 */
@@ -68,19 +69,21 @@ export function reportMemoryRead(
 ): void {
   // 诊断不包含查询、记忆正文或 provider 原始异常，避免观测链泄漏持久记忆。
   const message = `[MemoryRead] ${diagnostic.phase}: ${diagnostic.status} (${diagnostic.reason})`;
-  const logger = Logger.getInstance();
-  if (['error', 'timeout', 'invalid'].includes(diagnostic.status)) {
-    logger.warn(message);
-  } else {
-    logger.debug(message);
-  }
-  try {
-    options.onDiagnostic?.(diagnostic);
-  } catch (err: unknown) {
-    Logger.getInstance().warn(
-      `[MemoryRead] diagnostic observer failed: ${err instanceof Error ? err.name : 'unknown'}`
-    );
-  }
+  observeSafely(
+    () => {
+      const logger = Logger.getInstance();
+      if (['error', 'timeout', 'invalid'].includes(diagnostic.status)) {
+        logger.warn(message);
+      } else {
+        logger.debug(message);
+      }
+    },
+    () => undefined
+  );
+  observeSafely(
+    () => options.onDiagnostic?.({ ...diagnostic }),
+    () => Logger.getInstance().warn('[MemoryRead] diagnostic observer failed; read result retained')
+  );
 }
 
 export function isMemoryVector(value: unknown, dimensions?: number): value is number[] {

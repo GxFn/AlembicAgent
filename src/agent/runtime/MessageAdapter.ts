@@ -43,6 +43,7 @@ interface ChatMessage {
   toolCalls?: ToolCallRecord[];
   toolCallId?: string;
   name?: string;
+  metadata?: { persistedSubmission?: boolean };
 }
 
 // ─────────────────────────────────────────────
@@ -91,7 +92,12 @@ export class MessageAdapter {
   }
 
   /** 追加工具执行结果 */
-  appendToolResult(_callId: string, _name: string, _content: string) {
+  appendToolResult(
+    _callId: string,
+    _name: string,
+    _content: string,
+    _metadata?: { persistedSubmission?: boolean }
+  ) {
     throw new Error('not implemented');
   }
 
@@ -228,8 +234,13 @@ export class ContextWindowAdapter extends MessageAdapter {
     this.#ctxWin.appendAssistantWithToolCalls(text, calls, reasoningContent, continuation);
   }
 
-  appendToolResult(callId: string, name: string, content: string) {
-    this.#ctxWin.appendToolResult(callId, name, content);
+  appendToolResult(
+    callId: string,
+    name: string,
+    content: string,
+    metadata?: { persistedSubmission?: boolean }
+  ) {
+    this.#ctxWin.appendToolResult(callId, name, content, metadata);
   }
 
   appendUserNudge(text: string) {
@@ -316,8 +327,19 @@ export class SimpleArrayAdapter extends MessageAdapter {
     this.#messages.push(msg);
   }
 
-  appendToolResult(callId: string, name: string, content: string) {
-    this.#messages.push({ role: 'tool', toolCallId: callId, name, content });
+  appendToolResult(
+    callId: string,
+    name: string,
+    content: string,
+    metadata?: { persistedSubmission?: boolean }
+  ) {
+    this.#messages.push({
+      role: 'tool',
+      toolCallId: callId,
+      name,
+      content,
+      ...(metadata ? { metadata: { ...metadata } } : {}),
+    });
   }
 
   appendUserNudge(text: string) {

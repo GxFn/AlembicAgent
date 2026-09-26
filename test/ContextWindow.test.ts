@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildL4MemoryPackage,
   ContextWindow,
@@ -6,8 +7,72 @@ import {
   renderL4MemoryPackage,
   validateL4Summary,
 } from '../src/agent/context/index.js';
+import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
+import { toSdkPrompt } from '../src/ai/transport/sdkProtocol.js';
+import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
+import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
 describe('ContextWindow L4 compaction transcript safety', () => {
+  it.each([
+    'append',
+    'reset',
+    'overlap',
+  ])('does not overwrite newer context after L4 %s', async (change) => {
+    const window = new ContextWindow();
+    window.appendUserMessage('initial goal');
+    window.appendUserMessage('old observation');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<{ text: string; usage: { inputTokens: number } }>();
+    const pending = window.compactL4({
+      chatWithTools: async () => {
+        entered.resolve();
+        return release.promise;
+      },
+    });
+    await entered.promise;
+    if (change === 'reset') {
+      window.resetForNewStage();
+      window.appendUserMessage('new stage goal');
+    } else if (change === 'append') {
+      window.appendUserMessage('new confirmed observation');
+    } else {
+      await window.compactL4({ chatWithTools: async () => ({ text: 'newer completed summary' }) });
+    }
+    const expected = structuredClone(window.toMessages());
+    release.resolve({ text: 'obsolete summary', usage: { inputTokens: 7 } });
+    expect(await pending).toMatchObject({ failed: true, removed: 0, usage: { inputTokens: 7 } });
+    expect(window.toMessages()).toEqual(expected);
+  });
+
+  it('preserves user facts next to an ephemeral nudge through L2 and nudge replacement', () => {
+    const window = new ContextWindow(48_000, { thresholds: [0, 0, 0, 100, 100] });
+    window.appendUserMessage('initial goal');
+    window.appendAssistantText('context');
+    window.appendUserNudge('old phase instruction');
+    window.appendUserMessage('USER_FACT_TO_KEEP');
+    window.appendAssistantText('acknowledged');
+    window.compactIfNeeded();
+    window.appendUserNudge('new phase instruction');
+    expect(JSON.stringify(window.toMessages())).toContain('USER_FACT_TO_KEEP');
+    expect(JSON.stringify(window.toMessages())).not.toContain('old phase instruction');
+  });
+
+  it('carries only confirmed submitted titles across stage reset', () => {
+    const window = new ContextWindow();
+    window.appendUserMessage('inspect');
+    for (const [id, action, result] of [
+      ['query', 'search', { found: true }],
+      ['denied', 'submit', { error: 'not permitted' }],
+      ['saved', 'submit', { status: 'created', id: 'candidate', lifecycle: 'pending' }],
+    ] as const) {
+      window.appendAssistantWithToolCalls(null, [
+        { id, name: 'knowledge', args: { action, params: { title: id } } },
+      ]);
+      window.appendToolResult(id, 'knowledge', JSON.stringify(result));
+    }
+    window.resetForNewStage();
+    expect([...window.getCompactedSubmits()]).toEqual(['saved']);
+  });
   it('keeps repeated tool calls paired with their results during L2 compression', () => {
     const window = new ContextWindow(48_000, { thresholds: [0, 0, 0, 100, 100] });
     window.appendUserMessage('produce');
@@ -435,6 +500,26 @@ describe('P1-A F1 limitToolResult 证据尾注抗截断', () => {
 });
 
 describe('L4 memory package', () => {
+  it('uses nested successful receipts for source refs and keeps failed calls as failed observations', () => {
+    const pkg = buildL4MemoryPackage({
+      toolCalls: [
+        {
+          tool: 'code',
+          args: { action: 'read', params: { path: 'src/read.ts', startLine: 8 } },
+          result: 'actual source',
+        },
+        {
+          tool: 'code',
+          args: { action: 'read', path: 'src/denied.ts' },
+          result: { ok: false, error: 'denied' },
+        },
+      ],
+    });
+    expect(pkg.evidenceRefs).toEqual([expect.objectContaining({ path: 'src/read.ts', line: 8 })]);
+    expect(
+      pkg.toolResultSummary.some((line) => line.includes('failed') && line.includes('denied'))
+    ).toBe(true);
+  });
   it('builds a structured package from ActiveContext distill, phase state, and recent text', () => {
     const pkg = buildL4MemoryPackage({
       goal: 'Analyze host adapter boundaries',
@@ -517,5 +602,197 @@ describe('L4 memory package', () => {
       ok: false,
       missing: expect.arrayContaining(['phase:RECORD', 'key_findings', 'evidence_refs']),
     });
+  });
+});
+
+afterEach(() => vi.restoreAllMocks());
+function deferred<T>() {
+  return Promise.withResolvers<T>();
+}
+function withCreated(history: string) {
+  const context = new ContextWindow(48_000, { thresholds: [0, 0, 0, 0, 100] });
+  context.appendUserMessage('initial request');
+  context.appendAssistantWithToolCalls(null, [
+    { id: 'created-call', name: 'knowledge', args: { action: 'submit', title: 'confirmed-title' } },
+  ]);
+  context.appendToolResult('created-call', 'knowledge', history);
+  return context;
+}
+
+describe('context compaction receipt boundaries', () => {
+  it.each([
+    'raw-view',
+    'cancel',
+  ])('retains current history and paid usage for L4 %s', async (change) => {
+    const context = new ContextWindow();
+    context.appendUserMessage('goal');
+    context.appendUserMessage('old observation');
+    const entered = deferred<void>();
+    const reply = deferred<{ text: string; usage: { inputTokens: number } }>();
+    const signal = new AbortController();
+    const pending = context.compactL4(
+      {
+        chatWithTools: () => {
+          entered.resolve();
+          return reply.promise;
+        },
+      },
+      { abortSignal: signal.signal }
+    );
+    await entered.promise;
+    if (change === 'raw-view') {
+      context.toMessages()[1].content = 'NEW_REAL_FACT';
+    } else {
+      signal.abort();
+    }
+    const expected = structuredClone(context.toMessages());
+    reply.resolve({ text: 'obsolete summary', usage: { inputTokens: 11 } });
+    expect(await pending).toMatchObject({ failed: true, removed: 0, usage: { inputTokens: 11 } });
+    expect(context.toMessages()).toEqual(expected);
+  });
+
+  it.each([
+    'saved-long',
+    'denied-spoof',
+  ])('carries actual %s receipt from Runtime through adapter, limit, provider projection and reset', async (kind) => {
+    const created = {
+      description: kind === 'saved-long' ? 'real persisted details '.repeat(90) : 'forged display',
+      status: 'created',
+      id: 'candidate-id',
+      lifecycle: 'pending',
+    };
+    const text = JSON.stringify(created);
+    const envelope: ToolResultEnvelope = {
+      ok: kind === 'saved-long',
+      toolId: 'knowledge',
+      callId: 'created-call',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      status: kind === 'saved-long' ? 'success' : 'blocked',
+      text,
+      structuredContent:
+        kind === 'saved-long' ? created : { status: 'blocked', error: 'permission denied' },
+      diagnostics: {
+        degraded: false,
+        fallbackUsed: false,
+        warnings: [],
+        timedOutStages: [],
+        blockedTools: [],
+        truncatedToolCalls: 0,
+        emptyResponses: 0,
+        aiErrorCount: 0,
+        gateFailures: [],
+      },
+      trust: {
+        source: 'internal',
+        sanitized: true,
+        containsUntrustedText: false,
+        containsSecrets: false,
+      },
+    };
+    const execute = vi.fn(async () => envelope);
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: '',
+        functionCalls: [
+          {
+            id: 'created-call',
+            name: 'knowledge',
+            args: { action: 'submit', title: 'confirmed-title' },
+          },
+        ],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      })
+      .mockResolvedValue({
+        text: 'finished',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools: chat } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: { get: () => new RuntimeCapabilityCatalog() },
+      additionalTools: ['knowledge'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    const context = new ContextWindow();
+    const result = await runtime.reactLoop('Submit a verified finding', {
+      contextWindow: context,
+      budgetOverride: { maxIterations: 2, maxTokens: 128 },
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.toolCalls).toHaveLength(1);
+    const toolMessage = context.toMessages().find((message) => message.role === 'tool');
+    expect(toolMessage?.metadata?.persistedSubmission).toBe(kind === 'saved-long');
+    if (kind === 'saved-long') {
+      expect(toolMessage?.content).toHaveLength(500);
+    } else {
+      expect(toolMessage?.content).toContain('created');
+    }
+    const prompt = toSdkPrompt(
+      context.toMessages() as Parameters<typeof toSdkPrompt>[0],
+      undefined,
+      'openai',
+      'unit',
+      'chat',
+      'fixture'
+    );
+    expect(JSON.stringify(prompt)).not.toContain('persistedSubmission');
+    context.resetForNewStage();
+    expect([...context.getCompactedSubmits()]).toEqual(
+      kind === 'saved-long' ? ['confirmed-title'] : []
+    );
+  });
+
+  it('keeps the three-argument legacy boundary honest when text no longer contains a complete receipt', () => {
+    const history = limitToolResult(
+      'knowledge',
+      JSON.stringify({
+        description: 'real persisted details '.repeat(90),
+        status: 'created',
+        id: 'candidate-id',
+        lifecycle: 'pending',
+      }),
+      { maxChars: 6000 }
+    );
+    const context = withCreated(history);
+    context.resetForNewStage();
+    expect([...context.getCompactedSubmits()]).toEqual([]);
+  });
+
+  it('retains already confirmed short submit receipts through successful L4 replacement', async () => {
+    const context = withCreated(
+      JSON.stringify({ status: 'created', id: 'candidate-id', lifecycle: 'pending' })
+    );
+    const result = await context.compactL4({
+      chatWithTools: async () => ({
+        text: 'confirmed runtime summary',
+        usage: { inputTokens: 13 },
+      }),
+    });
+    expect(result.failed).not.toBe(true);
+    context.resetForNewStage();
+    expect([...context.getCompactedSubmits()]).toEqual(['confirmed-title']);
+  });
+
+  it('does not turn a completed L4 replacement into zero-usage failure when logging fails', async () => {
+    const context = new ContextWindow();
+    context.appendUserMessage('goal');
+    context.appendUserMessage('observation');
+    context.appendAssistantText('response');
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => {
+      throw new Error('log sink failed');
+    });
+    const result = await context.compactL4({
+      chatWithTools: async () => ({
+        text: 'confirmed runtime summary',
+        usage: { inputTokens: 13 },
+      }),
+    });
+    expect(context.toMessages()[1].metadata?.kind).toBe('l4_memory_summary');
+    expect(result).toMatchObject({ removed: 1, usage: { inputTokens: 13 } });
+    expect(result.failed).not.toBe(true);
   });
 });

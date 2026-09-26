@@ -1,3 +1,4 @@
+import { readToolObservation } from '../../utils/toolOutcomes.js';
 /**
  * PlanTracker — 探索计划跟踪器
  *
@@ -34,6 +35,8 @@ interface TraceStats {
 
 /** 工具动作 */
 interface ToolAction {
+  ok?: boolean;
+  successfulReadPaths?: string[];
   tool: string;
   params?: Record<string, unknown>;
 }
@@ -251,6 +254,9 @@ export class PlanTracker {
     let matchedThisRound = false;
 
     for (const action of actions) {
+      if (action.ok === false) {
+        continue;
+      }
       const matchedStep = this.#findMatchingStep(steps, action);
       if (matchedStep) {
         matchedStep.status = 'done';
@@ -377,10 +383,41 @@ export class PlanTracker {
    */
   #findMatchingStep(steps: PlanStep[], action: ToolAction): PlanStep | null {
     const toolName = action.tool;
-    const argsStr = JSON.stringify(action.params || {}).toLowerCase();
+    const params = readToolObservation({ tool: toolName, args: action.params }).params;
+    const argsStr = JSON.stringify(params).toLowerCase();
 
     for (const step of steps) {
       if (step.status === 'done') {
+        continue;
+      }
+
+      // 明确文件目标比“read/文件”等泛化词优先；读另一个文件不能完成指定文件步骤。
+      const targets =
+        step.description.match(/[\w@.-]+(?:\/[\w@.-]+)*\.[A-Za-z][\w-]*(?:\.[\w-]+)*/g) || [];
+      if (toolName === 'code' && params.action === 'read') {
+        const paths =
+          action.successfulReadPaths ??
+          (Array.isArray(params.filePaths) ? params.filePaths : [params.path ?? params.filePath]);
+        const normalized = paths
+          .filter((value): value is string => typeof value === 'string')
+          .map((value) => value.replaceAll('\\', '/').replace(/^\.\//, ''));
+        if (action.successfulReadPaths && normalized.length === 0) {
+          continue;
+        }
+        if (
+          targets.length > 0 &&
+          !targets.some((target) =>
+            normalized.some(
+              (file) => file === target || (!target.includes('/') && file.endsWith(`/${target}`))
+            )
+          )
+        ) {
+          continue;
+        }
+      } else if (
+        targets.length > 0 &&
+        !targets.some((target) => argsStr.includes(target.toLowerCase()))
+      ) {
         continue;
       }
 
@@ -394,7 +431,7 @@ export class PlanTracker {
 
       // 策略 2: 工具类型 → 步骤描述的语义匹配
       const desc = step.description.toLowerCase();
-      const actionName = (action.params?.action as string) || '';
+      const actionName = (params.action as string) || '';
 
       if (
         toolName === 'code' &&

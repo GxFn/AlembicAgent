@@ -1,4 +1,4 @@
-import { isPersistedSubmission } from '../utils/toolOutcomes.js';
+import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcomes.js';
 /**
  * ExplorationTracker — 统一的 AI 探索生命周期控制器
  *
@@ -25,6 +25,7 @@ import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 
 import type { SignalBus } from '@alembic/core/events';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { DEPTH_SLOT_KEYS } from '../../tools/runtime/registry.js';
 import type {
   ExplorationBudget,
@@ -91,6 +92,7 @@ export class ExplorationTracker {
     memoryFindingCount: 0,
     depthSlottedFindingCount: 0,
     verifiedFindingCount: 0,
+    verifiedDepthSlottedFindingCount: 0,
     roundsSinceNewInfo: 0,
     roundsSinceSubmit: 0,
     iteration: 0,
@@ -335,6 +337,17 @@ export class ExplorationTracker {
    */
   recordToolCall(toolName: string, args: Record<string, unknown>, result: unknown) {
     this.#metrics.totalToolCalls++;
+    const observation = readToolObservation({ tool: toolName, args, result });
+    if (!observation.ok) {
+      observeSafely(
+        () =>
+          this.#logger.debug(
+            `[ExplorationTracker] failed ${toolName} observation retained as attempt; no evidence or novelty credit`
+          ),
+        () => undefined
+      );
+      return { isNew: false };
+    }
     if (isEvidenceToolCall(toolName, args)) {
       this.#metrics.evidenceToolCallCount++;
     }
@@ -351,7 +364,7 @@ export class ExplorationTracker {
     const isDirectNoteFinding = toolName === 'note_finding';
     const isMemoryNoteFinding = toolName === 'memory' && args?.action === 'note_finding';
     if (isDirectNoteFinding || isMemoryNoteFinding) {
-      const resultObj = typeof result === 'object' ? (result as Record<string, unknown>) : null;
+      const resultObj = observation.result;
       const hasError = resultObj?.error !== undefined;
       const recorded = resultObj?.recorded === true;
       const target = resultObj?.target;
@@ -364,9 +377,7 @@ export class ExplorationTracker {
         }
         // M1c（挖掘产出升级）：深度槽计数——带任一非空深度槽的发现享受配额加权（CG-D 1.5）。
         // args 形态：直呼型 note_finding 平铺；memory 工具嵌在 params 内。
-        const slotCarrier = (
-          isDirectNoteFinding ? args : (args?.params as Record<string, unknown> | undefined)
-        ) as Record<string, unknown> | undefined;
+        const slotCarrier = observation.params;
         if (
           slotCarrier &&
           DEPTH_SLOT_KEYS.some((key) => {
@@ -376,6 +387,10 @@ export class ExplorationTracker {
         ) {
           this.#metrics.depthSlottedFindingCount =
             (this.#metrics.depthSlottedFindingCount ?? 0) + 1;
+          if (resultObj?.verified !== false) {
+            this.#metrics.verifiedDepthSlottedFindingCount =
+              (this.#metrics.verifiedDepthSlottedFindingCount ?? 0) + 1;
+          }
         }
       }
     }
@@ -510,7 +525,7 @@ export class ExplorationTracker {
         needsDigestNudge: false,
         shouldContinue: true,
         nudge:
-          '当前证据仍不足。请不要输出最终分析；继续使用 code({ action: "read" }) 或 graph({ action: "query" }) 校验已发现的文件、类和调用关系，确认后立即调用 note_finding({ finding, evidence, importance })。',
+          '当前证据仍不足。请不要输出最终分析；继续使用 code({ action: "read" }) 或 graph({ action: "query" }) 校验已发现的文件、类和调用关系，确认后立即调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 使用工具返回 [evidence] 中的台账 ID。',
       };
     }
 
@@ -545,7 +560,7 @@ export class ExplorationTracker {
         needsDigestNudge: false,
         shouldContinue: true,
         nudge:
-          '当前仍处于 RECORD 结构化记录阶段。不要输出自然语言正文；请只调用 note_finding({ finding, evidence, importance })，直到至少记录 3 条核心发现。note_finding 是 QualityGate 的重要质量依据。',
+          '当前仍处于 RECORD 结构化记录阶段。不要输出自然语言正文；请只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 使用工具返回 [evidence] 中的台账 ID，直到至少记录 3 条核心发现。note_finding 是 QualityGate 的重要质量依据。',
       };
     }
 
@@ -615,6 +630,7 @@ export class ExplorationTracker {
       memoryFindingCount: this.#metrics.memoryFindingCount,
       depthSlottedFindingCount: this.#metrics.depthSlottedFindingCount,
       verifiedFindingCount: this.#metrics.verifiedFindingCount,
+      verifiedDepthSlottedFindingCount: this.#metrics.verifiedDepthSlottedFindingCount,
       evidenceToolCallCount: this.#metrics.evidenceToolCallCount,
       uniqueFiles: this.#metrics.uniqueFiles.size,
       uniquePatterns: this.#metrics.uniquePatterns.size,

@@ -15,6 +15,7 @@
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { estimateTokens, truncateToTokenBudget } from '#shared/tokenUtils.js';
 import { ActiveContext } from './ActiveContext.js';
 import {
@@ -348,7 +349,8 @@ export class MemoryCoordinator {
       return projectMemorySection('working', ac.buildContext(acBudget) || '', acBudget, options)
         .content;
     } catch (err: unknown) {
-      this.#logger.warn(
+      this.#log(
+        'warn',
         `[MemoryCoordinator] buildDynamicMemoryPrompt error: ${(err as Error).message}`
       );
       return '';
@@ -391,7 +393,7 @@ export class MemoryCoordinator {
         this.#sessionStore.cacheToolResult(toolName, args, result);
       }
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] recordObservation error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] recordObservation error: ${(err as Error).message}`);
     }
   }
 
@@ -430,7 +432,7 @@ export class MemoryCoordinator {
         ...(scopeId ? { scopeId } : {}),
       };
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] noteFinding error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] noteFinding error: ${(err as Error).message}`);
       return {
         recorded: false,
         target: 'error',
@@ -543,7 +545,7 @@ export class MemoryCoordinator {
     this.#promptBudgets.delete(scopeId);
     this.#currentScopeId = scopeId;
     this.#activeContexts.set(scopeId, ac);
-    this.#logger.debug(`[MemoryCoordinator] scope created: ${scopeId} (ActiveContext)`);
+    this.#log('debug', `[MemoryCoordinator] scope created: ${scopeId} (ActiveContext)`);
     return ac;
   }
 
@@ -574,9 +576,9 @@ export class MemoryCoordinator {
       if (this.#currentScopeId === scopeId) {
         this.#currentScopeId = null;
       }
-      this.#logger.debug(`[MemoryCoordinator] scope completed: ${scopeId}`);
+      this.#log('debug', `[MemoryCoordinator] scope completed: ${scopeId}`);
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] completeDimension error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] completeDimension error: ${(err as Error).message}`);
     }
   }
 
@@ -587,10 +589,10 @@ export class MemoryCoordinator {
   async completeSession(): Promise<{ consolidated: number } | null> {
     try {
       this.#currentScopeId = null;
-      this.#logger.info('[MemoryCoordinator] session completed');
+      this.#log('info', '[MemoryCoordinator] session completed');
       return { consolidated: 0 };
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] completeSession error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] completeSession error: ${(err as Error).message}`);
       return null;
     }
   }
@@ -647,7 +649,8 @@ export class MemoryCoordinator {
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      this.#logger.warn(
+      this.#log(
+        'warn',
         `[MemoryCoordinator] searchEvidence degraded (MEMORY_EVIDENCE_SEARCH_FAILED): ${message}`
       );
       return {
@@ -712,7 +715,7 @@ export class MemoryCoordinator {
         await this.#sessionStore.saveCheckpoint(projectRoot);
       }
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] checkpoint error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] checkpoint error: ${(err as Error).message}`);
     }
   }
 
@@ -724,7 +727,7 @@ export class MemoryCoordinator {
       }
       return false;
     } catch (err: unknown) {
-      this.#logger.warn(`[MemoryCoordinator] restore error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] restore error: ${(err as Error).message}`);
       return false;
     }
   }
@@ -764,7 +767,8 @@ export class MemoryCoordinator {
       operation,
     };
     this.#writeFailures.push(diagnostic);
-    this.#logger.warn(
+    this.#log(
+      'warn',
       `[MemoryCoordinator] ${operation} failed (${diagnostic.code}): ${diagnostic.message}`
     );
   }
@@ -786,6 +790,13 @@ export class MemoryCoordinator {
         focusKeywords: options.focusKeywords || [],
         tokenBudget,
       }) || ''
+    );
+  }
+  /** 诊断是旁路，不能让已创建/已完成的 memory scope 失去回执。 */
+  #log(level: 'info' | 'warn' | 'debug', message: string): void {
+    observeSafely(
+      () => this.#logger[level](message),
+      () => undefined
     );
   }
 }

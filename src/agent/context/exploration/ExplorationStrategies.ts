@@ -39,6 +39,8 @@ export interface ExplorationMetrics {
   depthSlottedFindingCount?: number;
   /** M3：至少一个引用带文件区间的发现数（可选——缺席时按 memoryFindingCount 处理，行为等价旧版） */
   verifiedFindingCount?: number;
+  /** 同一条发现同时核实且含深度槽的数量；不能用两个总计数的min猜交集。 */
+  verifiedDepthSlottedFindingCount?: number;
   evidenceToolCallCount: number;
   totalToolCalls: number;
   searchRoundsInPhase: number;
@@ -120,13 +122,20 @@ export function targetMemoryFindingCount(
 export function effectiveMemoryFindingCount(
   m: Pick<
     ExplorationMetrics,
-    'memoryFindingCount' | 'depthSlottedFindingCount' | 'verifiedFindingCount'
+    | 'memoryFindingCount'
+    | 'depthSlottedFindingCount'
+    | 'verifiedFindingCount'
+    | 'verifiedDepthSlottedFindingCount'
   >
 ) {
   // M3：配额基数只认 verified（引用带文件区间）——未核实线索不抵配额，逼 VERIFY 补采。
   // verifiedFindingCount 缺席（旧快照/夹具/无台账运行）回退 memoryFindingCount（行为等价）。
   const base = Math.min(m.verifiedFindingCount ?? m.memoryFindingCount, m.memoryFindingCount);
-  const slotted = Math.min(m.depthSlottedFindingCount ?? 0, base);
+  const depth = m.depthSlottedFindingCount ?? 0;
+  // 旧快照只有边际计数时只采用可证明的交集下界；无verified字段沿旧版全部已核实语义。
+  const verifiedDepth =
+    m.verifiedDepthSlottedFindingCount ?? Math.max(0, depth - (m.memoryFindingCount - base));
+  const slotted = Math.min(depth, base, verifiedDepth);
   return base + 0.5 * slotted;
 }
 
