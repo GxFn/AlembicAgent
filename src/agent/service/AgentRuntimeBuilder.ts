@@ -1,7 +1,12 @@
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { ToolRouterContract } from '#tools/kernel/index.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
 import { type Policy, PolicyEngine } from '../policies/index.js';
+import {
+  type AgentProfileCompiler,
+  createDefaultProfileCompiler,
+} from '../profiles/AgentProfileCompiler.js';
 import { getPreset } from '../profiles/presets/index.js';
 import { AgentRuntime } from '../runtime/AgentRuntime.js';
 import type { Strategy } from '../strategies/index.js';
@@ -34,6 +39,7 @@ export class AgentRuntimeBuilder {
   #aiProvider: unknown;
   #toolRouter: unknown;
   #logger = Logger.getInstance();
+  #profileCompiler?: AgentProfileCompiler;
   #sharedOpts: {
     memoryCoordinator: unknown;
     projectBriefing: string | null;
@@ -67,10 +73,15 @@ export class AgentRuntimeBuilder {
     profileRef: AgentProfileRef | AgentProfileOverride | CompiledAgentProfile,
     options: AgentRuntimeBuildOptions = {}
   ) {
-    const { presetName, overrides } = normalizeProfile(profileRef);
+    const compiled =
+      'kind' in profileRef && profileRef.kind === 'compiled-agent-profile'
+        ? profileRef
+        : (this.#profileCompiler ??= createDefaultProfileCompiler()).compile(profileRef);
+    const presetName = compiled.basePreset;
+    const overrides = compiled.runtimeOverrides || {};
     const preset = getPreset(presetName, overrides as Record<string, unknown>);
     const capabilities = ((preset.capabilities as string[]) || []).map((name) =>
-      CapabilityRegistry.create(name, this.#getCapabilityOpts(name))
+      CapabilityRegistry.create(name, this.#getCapabilityOpts())
     );
     const resolvedPolicies = (
       (preset.policies || []) as Array<Policy | ((input: Record<string, unknown>) => Policy)>
@@ -80,7 +91,10 @@ export class AgentRuntimeBuilder {
         : policyOrFactory
     );
 
-    this.#logger.debug('[AgentRuntimeBuilder] building runtime', { presetName });
+    observeSafely(
+      () => this.#logger.debug('[AgentRuntimeBuilder] building runtime', { presetName }),
+      () => undefined
+    );
     return new AgentRuntime({
       presetName,
       aiProvider: this.#aiProvider as never,
@@ -96,57 +110,20 @@ export class AgentRuntimeBuilder {
       onProgress: options.onProgress || null,
       onToolCall: options.onToolCall || null,
       lang: options.lang || null,
-      additionalTools: resolveActionSpaceAdditionalTools(profileRef),
+      additionalTools: compiled.additionalTools || [],
       projectRoot: this.#sharedOpts.projectRoot,
       dataRoot: this.#sharedOpts.dataRoot,
     });
   }
 
-  #getCapabilityOpts(name: string) {
+  #getCapabilityOpts() {
     return {
       container: this.#container,
       memoryCoordinator: this.#sharedOpts.memoryCoordinator,
       projectBriefing: this.#sharedOpts.projectBriefing,
       projectRoot: this.#sharedOpts.projectRoot,
-      ...(name === 'system_interaction' ? { projectRoot: this.#sharedOpts.projectRoot } : {}),
     };
   }
-}
-
-function normalizeProfile(profile: AgentProfileRef | AgentProfileOverride | CompiledAgentProfile) {
-  if ('kind' in profile && profile.kind === 'compiled-agent-profile') {
-    return { presetName: profile.basePreset, overrides: profile.runtimeOverrides || {} };
-  }
-  if (isProfileRef(profile)) {
-    return { presetName: profile.preset || profile.id || 'chat', overrides: {} };
-  }
-  const { basePreset, skills, actionSpace, ...rest } = profile;
-  return {
-    presetName: basePreset,
-    overrides: {
-      ...rest,
-      ...(skills ? { capabilities: skills } : {}),
-      ...(actionSpace?.mode === 'listed' ? { additionalTools: actionSpace.toolIds } : {}),
-    },
-  };
-}
-
-function resolveActionSpaceAdditionalTools(
-  profile: AgentProfileRef | AgentProfileOverride | CompiledAgentProfile
-) {
-  if ('kind' in profile && profile.kind === 'compiled-agent-profile') {
-    return profile.additionalTools || [];
-  }
-  if (isProfileRef(profile) || profile.actionSpace?.mode !== 'listed') {
-    return [];
-  }
-  return profile.actionSpace.toolIds;
-}
-
-function isProfileRef(
-  profile: AgentProfileRef | AgentProfileOverride | CompiledAgentProfile
-): profile is AgentProfileRef {
-  return !('basePreset' in profile) && !('kind' in profile);
 }
 
 export default AgentRuntimeBuilder;

@@ -14,13 +14,13 @@ export class AgentProfileRegistry {
     if (!profile.id) {
       throw new Error('Agent profile id is required');
     }
-    assertSerializableProfile(profile);
-    this.#profiles.set(profile.id, profile);
+    this.#profiles.set(profile.id, snapshotProfile(profile));
     return this;
   }
 
   get(id: string) {
-    return this.#profiles.get(id) || null;
+    const profile = this.#profiles.get(id);
+    return profile ? snapshotProfile(profile) : null;
   }
 
   require(id: string) {
@@ -32,12 +32,13 @@ export class AgentProfileRegistry {
   }
 
   list() {
-    return [...this.#profiles.values()];
+    return [...this.#profiles.values()].map(snapshotProfile);
   }
 }
 
-function assertSerializableProfile(profile: AgentProfileDefinition) {
-  JSON.stringify(profile, (_key, value) => {
+/** 注册表拥有声明；调用方可修改自己的快照，不能回写默认权限或下一次编译。 */
+function snapshotProfile(profile: AgentProfileDefinition): AgentProfileDefinition {
+  const json = JSON.stringify(profile, (_key, value) => {
     if (typeof value === 'function') {
       throw new Error(`Agent profile "${profile.id}" must not contain functions`);
     }
@@ -46,6 +47,7 @@ function assertSerializableProfile(profile: AgentProfileDefinition) {
     }
     return value;
   });
+  return JSON.parse(json) as AgentProfileDefinition;
 }
 
 export default AgentProfileRegistry;

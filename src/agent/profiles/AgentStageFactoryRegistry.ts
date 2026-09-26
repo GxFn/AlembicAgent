@@ -9,7 +9,7 @@ import {
   buildScanPipelineStages,
 } from '../evaluation/stageBuilders.js';
 import { buildStrictProductionPipelineStagesV1 } from '../production/StrictProductionStages.js';
-import { PRESETS } from '../profiles/presets/index.js';
+import { cloneRuntimeConfig, PRESETS } from '../profiles/presets/index.js';
 import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
 
 export type AgentStageFactoryInput = {
@@ -43,7 +43,7 @@ export class AgentStageFactoryRegistry {
   }
 
   build(name: string, input: AgentStageFactoryInput) {
-    return this.resolve(name)(input);
+    return cloneRuntimeConfig(this.resolve(name)(input));
   }
 
   list() {

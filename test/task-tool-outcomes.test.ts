@@ -253,3 +253,148 @@ describe('task tool outcomes', () => {
     await expect(taskCheckAndSubmit(context, { candidate: {} })).rejects.toBe(error);
   });
 });
+
+const projectRoot = process.cwd();
+function createTaskContext(
+  responses: Record<string, unknown>,
+  services: Record<string, unknown> = {}
+): TaskContext & { calls: Array<{ toolName: string; params: Record<string, unknown> }> } {
+  const calls: Array<{ toolName: string; params: Record<string, unknown> }> = [];
+  return {
+    calls,
+    async invokeToolEnvelope(toolName, params) {
+      calls.push({ toolName, params });
+      return toolResult(responses[toolName] ?? {});
+    },
+    container: {
+      get(name: string) {
+        const service = services[name];
+        if (!service) {
+          throw new Error(`missing service: ${name}`);
+        }
+        return service;
+      },
+    },
+  };
+}
+
+describe('task successful result projections', () => {
+  it('checks duplicate candidates and keeps AI verdict optional', async () => {
+    const context = createTaskContext({
+      check_duplicate: {
+        similar: [
+          { title: 'same recipe', similarity: 0.82 },
+          { title: 'near recipe', similarity: 0.63 },
+        ],
+      },
+    });
+    context.aiProvider = {
+      chat: async () => 'SIMILAR because the evidence differs',
+      chatWithStructuredOutput: async () => ({}),
+    };
+
+    await expect(
+      taskCheckAndSubmit(context, {
+        candidate: { title: 'candidate', code: 'export const answer = 42;' },
+        projectRoot,
+      })
+    ).resolves.toMatchObject({
+      duplicates: [
+        { title: 'same recipe', similarity: 0.82 },
+        { title: 'near recipe', similarity: 0.63 },
+      ],
+      highSimilarity: [{ title: 'same recipe', similarity: 0.82 }],
+      aiVerdict: 'SIMILAR',
+      recommendation: 'review_suggested',
+    });
+    expect(context.calls[0]).toMatchObject({
+      toolName: 'check_duplicate',
+      params: { projectRoot, threshold: 0.5 },
+    });
+  });
+
+  it('enriches only candidates missing required metadata', async () => {
+    const knowledgeService = {
+      list: async () => ({
+        items: [
+          { id: 'needs-rationale', metadata: { knowledgeType: 'pattern', complexity: 'low' } },
+          {
+            id: 'complete',
+            metadata: { rationale: 'why', knowledgeType: 'fact', complexity: 'low' },
+          },
+          { id: 'needs-complexity', metadata: { rationale: 'why', knowledgeType: 'rule' } },
+        ],
+      }),
+    };
+    const context = createTaskContext(
+      {
+        enrich_candidate: { enriched: 2 },
+      },
+      { knowledgeService }
+    );
+
+    await expect(taskFullEnrich(context, { maxCount: 10 })).resolves.toEqual({ enriched: 2 });
+    expect(context.calls[0]).toEqual({
+      toolName: 'enrich_candidate',
+      params: { candidateIds: ['needs-rationale', 'needs-complexity'] },
+    });
+  });
+
+  it('audits recipe quality and sorts low-quality records by score', async () => {
+    const knowledgeService = {
+      list: async () => ({
+        data: [
+          { id: 'b', title: 'borderline' },
+          { id: 'a', title: 'weak' },
+          { id: 'c', title: 'strong' },
+        ],
+      }),
+    };
+    const scores: Record<string, unknown> = {
+      b: { score: 0.5, grade: 'D', dimensions: { evidence: 0.4 } },
+      a: { score: 0.2, grade: 'F', dimensions: { evidence: 0.1 } },
+      c: { score: 0.95, grade: 'A', dimensions: { evidence: 1 } },
+    };
+    const context = createTaskContext({}, { knowledgeService });
+    context.invokeToolEnvelope = async (_toolName, params) => {
+      const recipe = params.recipe as { id: string };
+      return toolResult(scores[recipe.id]);
+    };
+
+    await expect(taskQualityAudit(context, { threshold: 0.6 })).resolves.toMatchObject({
+      total: 3,
+      lowQualityCount: 2,
+      lowQuality: [
+        { id: 'a', score: 0.2, grade: 'F' },
+        { id: 'b', score: 0.5, grade: 'D' },
+      ],
+      gradeDistribution: { A: 1, B: 0, C: 0, D: 1, F: 1 },
+    });
+  });
+
+  it('runs guard scans with structured AI suggestions only after violations exist', async () => {
+    const context = createTaskContext({
+      guard_check_code: {
+        violationCount: 1,
+        violations: [{ severity: 'error', message: 'no any', line: 3 }],
+      },
+    });
+    context.aiProvider = {
+      chat: async () => 'unused',
+      chatWithStructuredOutput: async () => [{ violation: 'no any', suggestion: 'use unknown' }],
+    };
+
+    await expect(
+      taskGuardFullScan(context, {
+        code: 'const value: any = input;',
+        language: 'ts',
+        filePath: 'src/example.ts',
+      })
+    ).resolves.toMatchObject({
+      filePath: 'src/example.ts',
+      language: 'ts',
+      violationCount: 1,
+      suggestions: [{ violation: 'no any', suggestion: 'use unknown' }],
+    });
+  });
+});

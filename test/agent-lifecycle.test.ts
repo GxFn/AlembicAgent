@@ -1,7 +1,7 @@
 import Logger from '@alembic/core/logging';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
-import { BudgetPolicy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
+import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
@@ -10,8 +10,10 @@ import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.
 import type {
   AgentRunInput,
   AgentRunResult,
+  AgentRuntimeLike,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -1395,5 +1397,373 @@ describe('R05 result-control compatibility edges', () => {
     });
     const results = result.itemResults as Array<{ status: string }>;
     expect(results[0].status).toBe(recovered ? 'completed' : 'failed');
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+describe('service compilation and confirmed runtime receipts', () => {
+  const input: AgentRunInput = {
+    profile: { preset: 'chat' },
+    message: { content: 'test' },
+    context: { source: 'internal' },
+  };
+  function builder() {
+    return new AgentRuntimeBuilder({
+      container: {},
+      toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+      aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: vi.fn() },
+    });
+  }
+  it('service completion logging cannot erase a confirmed execution result', async () => {
+    const output = {
+      reply: 'confirmed result',
+      toolCalls: [
+        { tool: 'knowledge', args: { action: 'submit' }, result: { id: 'r1', status: 'created' } },
+      ],
+      tokenUsage: { input: 4, output: 2 },
+      iterations: 1,
+      durationMs: 10,
+    };
+    const runtime = {
+      id: 'fixture',
+      execute: vi.fn(async () => output),
+    } as unknown as AgentRuntimeLike;
+    const log = vi.spyOn(Logger.getInstance(), 'info').mockImplementation((message: string) => {
+      if (message.includes('runtime execute complete')) {
+        throw new Error('logger unavailable');
+      }
+    });
+    const result = await new AgentService({ runtimeBuilder: { build: () => runtime } }).run(input);
+    expect(runtime.execute).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      status: 'success',
+      reply: 'confirmed result',
+      toolCalls: output.toolCalls,
+      usage: { inputTokens: 4, outputTokens: 2 },
+    });
+    expect(log).toHaveBeenCalled();
+  });
+  it('service forwards legacy metadata context through the actual SingleStrategy merge', async () => {
+    const reactLoop = vi.fn(async () => ({
+      reply: 'done',
+      toolCalls: [],
+      tokenUsage: { input: 1, output: 1 },
+      iterations: 1,
+    }));
+    const runtime = {
+      id: 'fixture',
+      execute: (
+        message: Parameters<SingleStrategy['execute']>[1],
+        opts?: Record<string, unknown>
+      ) => new SingleStrategy().execute({ reactLoop } as never, message, opts),
+    };
+    await new AgentService({ runtimeBuilder: { build: () => runtime } }).run({
+      ...input,
+      message: { content: 'test', metadata: { context: { legacyOnly: 'keep', shared: 'legacy' } } },
+      context: { source: 'internal', promptContext: { shared: 'explicit', newOnly: 'keep too' } },
+    });
+    expect(reactLoop.mock.calls[0]?.[1]).toMatchObject({
+      context: { legacyOnly: 'keep', shared: 'explicit', newOnly: 'keep too' },
+    });
+  });
+  it('direct runtime builder preserves preset parameter overrides', () => {
+    const runtime = builder().build({
+      preset: 'chat',
+      params: { maxIterations: 2, maxTokens: 333, temperature: 0.1, timeoutMs: 4567 },
+    });
+    expect(runtime.policies.getBudget()).toMatchObject({
+      maxIterations: 2,
+      maxTokens: 333,
+      temperature: 0.1,
+      timeoutMs: 4567,
+    });
+  });
+  it('service compilation preserves explicit preset params at the real builder seam', async () => {
+    const real = builder();
+    let budget: unknown;
+    const service = new AgentService({
+      runtimeBuilder: {
+        build: (profile, opts) => {
+          const runtime = real.build(profile, opts);
+          budget = runtime.policies.getBudget();
+          vi.spyOn(runtime, 'execute').mockResolvedValue({
+            reply: 'done',
+            toolCalls: [],
+            tokenUsage: { input: 0, output: 0 },
+            iterations: 0,
+            diagnostics: new DiagnosticsCollector().toJSON(),
+          } as never);
+          return runtime;
+        },
+      },
+    });
+    await service.run({
+      ...input,
+      profile: { preset: 'chat', params: { maxIterations: 2, maxTokens: 333 } },
+    });
+    expect(budget).toMatchObject({ maxIterations: 2, maxTokens: 333 });
+  });
+  it('raw override policy declarations are executable at the public builder entry', () => {
+    const runtime = builder().build({
+      basePreset: 'chat',
+      policies: [{ type: 'budget', maxIterations: 2, maxTokens: 333 }],
+    });
+    expect(() => runtime.policies.validateBefore({})).not.toThrow();
+    expect(runtime.policies.getBudget()).toMatchObject({ maxIterations: 2, maxTokens: 333 });
+  });
+  it('a true standalone shouldAbort check prevents starting runtime work', async () => {
+    const execute = vi.fn(async () => ({ reply: 'ran anyway' }));
+    const build = vi.fn(() => ({ id: 'fixture', execute }));
+    const result = await new AgentService({ runtimeBuilder: { build } }).run({
+      ...input,
+      execution: { shouldAbort: async () => true },
+    });
+    expect(result.status).toBe('aborted');
+    expect(execute).not.toHaveBeenCalled();
+  });
+  it('a real post-execution failure preserves already confirmed tool receipts in the service result', async () => {
+    const { AgentRuntime } = await import('../src/agent/runtime/AgentRuntime.js');
+    const { Policy, PolicyEngine, BudgetPolicy } = await import('../src/agent/policies/index.js');
+    const { RuntimeCapabilityCatalog } = await import(
+      '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js'
+    );
+    class FailAfterPolicy extends Policy {
+      override validateAfter() {
+        throw new Error('post-execution validation failed');
+      }
+    }
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [{ id: 'c1', name: 'meta', args: { action: 'tools', params: {} } }],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'confirmed outcome',
+        functionCalls: [],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      });
+    const execute = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      toolId: 'meta',
+      callId: 'c1',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      text: 'confirmed receipt',
+      structuredContent: { observed: true },
+    }));
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: chat } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      strategy: new SingleStrategy(),
+      policies: new PolicyEngine([
+        new BudgetPolicy({ maxIterations: 3, timeoutMs: 2000 }),
+        new FailAfterPolicy(),
+      ]),
+      capabilities: [],
+      additionalTools: ['meta'],
+      container: { get: () => new RuntimeCapabilityCatalog() },
+    });
+    const result = await new AgentService({ runtimeBuilder: { build: () => runtime } }).run(input);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.status).toBe('error');
+    expect(result.toolCalls).toContainEqual(
+      expect.objectContaining({ tool: 'meta', result: { observed: true } })
+    );
+    expect(result.usage.inputTokens).toBe(4);
+  });
+  it('factory contexts retain scoped mutable resources but isolate separate runs', async () => {
+    const { SystemRunContextFactory } = await import(
+      '../src/agent/service/SystemRunContextFactory.js'
+    );
+    const { MemoryCoordinator } = await import('../src/agent/memory/MemoryCoordinator.js');
+    const factory = new SystemRunContextFactory();
+    const first = factory.createSystemContext({
+      label: 'same',
+      budget: { maxIterations: 2 },
+      lang: 'ts',
+    });
+    const second = factory.createSystemContext({
+      label: 'same',
+      budget: { maxIterations: 2 },
+      lang: 'ts',
+    });
+    try {
+      expect(first.trace).toBe(first.activeContext);
+      expect(first.memoryCoordinator).not.toBe(second.memoryCoordinator);
+      expect(first.contextWindow).not.toBe(second.contextWindow);
+      const left = first.sharedState as { submittedTitles: Set<string> };
+      const right = second.sharedState as { submittedTitles: Set<string> };
+      left.submittedTitles.add('first-only');
+      expect(right.submittedTitles.has('first-only')).toBe(false);
+      expect(first.systemRunContext).toMatchObject({ scopeId: 'scan:same', projectLanguage: 'ts' });
+    } finally {
+      (first.memoryCoordinator as InstanceType<typeof MemoryCoordinator>).dispose();
+      (second.memoryCoordinator as InstanceType<typeof MemoryCoordinator>).dispose();
+    }
+  });
+});
+
+describe('service cancellation and snapshot ownership', () => {
+  const input: AgentRunInput = {
+    profile: { preset: 'chat' },
+    message: { content: 'run' },
+    context: { source: 'internal' },
+  };
+  it('cancellation resolves a pending async shouldAbort check without waiting for its host promise', async () => {
+    vi.useFakeTimers();
+    const entered = Promise.withResolvers<void>();
+    const decision = Promise.withResolvers<boolean>();
+    const controller = new AbortController();
+    const execute = vi.fn(async () => ({ reply: 'must not run' }));
+    let result: AgentRunResult | undefined;
+    const pending = new AgentService({
+      runtimeBuilder: { build: () => ({ id: 'fixture', execute }) },
+    })
+      .run({
+        ...input,
+        execution: {
+          abortSignal: controller.signal,
+          shouldAbort: () => {
+            entered.resolve();
+            return decision.promise;
+          },
+        },
+      })
+      .then((value) => {
+        result = value;
+        return value;
+      });
+    try {
+      await entered.promise;
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(result?.status).toBe('aborted');
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      decision.resolve(true);
+      await pending;
+    }
+  });
+  it('the explicit execution timeout also bounds an async shouldAbort preflight', async () => {
+    vi.useFakeTimers();
+    const entered = Promise.withResolvers<void>();
+    const decision = Promise.withResolvers<boolean>();
+    const execute = vi.fn(async () => ({ reply: 'must not run' }));
+    let result: AgentRunResult | undefined;
+    const pending = new AgentService({
+      runtimeBuilder: { build: () => ({ id: 'fixture', execute }) },
+    })
+      .run({
+        ...input,
+        execution: {
+          timeoutMs: 10,
+          shouldAbort: () => {
+            entered.resolve();
+            return decision.promise;
+          },
+        },
+      })
+      .then((value) => {
+        result = value;
+        return value;
+      });
+    try {
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(11);
+      expect(result?.status).toBe('timeout');
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      decision.resolve(true);
+      await pending;
+    }
+  });
+  it('two real runtimes throwing the same Error keep their own confirmed receipts', async () => {
+    const shared = new Error('shared post-execution policy error');
+    class SharedFailurePolicy extends Policy {
+      override validateAfter() {
+        throw shared;
+      }
+    }
+    function runtimeFor(owner: string) {
+      const chat = vi
+        .fn()
+        .mockResolvedValueOnce({
+          text: null,
+          functionCalls: [
+            { id: `c-${owner}`, name: 'meta', args: { action: 'tools', params: {} } },
+          ],
+          usage: { inputTokens: 2, outputTokens: 1 },
+        })
+        .mockResolvedValueOnce({
+          text: `complete-${owner}`,
+          functionCalls: [],
+          usage: { inputTokens: 2, outputTokens: 1 },
+        });
+      return new AgentRuntime({
+        aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: chat } as never,
+        toolRegistry: { getManifest: () => null } as never,
+        toolRouter: {
+          execute: async () => ({
+            ok: true,
+            status: 'success',
+            toolId: 'meta',
+            callId: `c-${owner}`,
+            startedAt: new Date().toISOString(),
+            durationMs: 1,
+            text: `confirmed ${owner}`,
+            structuredContent: { owner },
+          }),
+        } as never,
+        strategy: new SingleStrategy(),
+        policies: new PolicyEngine([
+          new BudgetPolicy({ maxIterations: 3, timeoutMs: 2000 }),
+          new SharedFailurePolicy(),
+        ]),
+        capabilities: [],
+        additionalTools: ['meta'],
+        container: { get: () => new RuntimeCapabilityCatalog() },
+      });
+    }
+    const a = runtimeFor('A');
+    const b = runtimeFor('B');
+    const [left, right] = await Promise.all([
+      new AgentService({ runtimeBuilder: { build: () => a } }).run(input),
+      new AgentService({ runtimeBuilder: { build: () => b } }).run(input),
+    ]);
+    expect(left.status).toBe('error');
+    expect(right.status).toBe('error');
+    expect(left.toolCalls).toContainEqual(expect.objectContaining({ result: { owner: 'A' } }));
+    expect(right.toolCalls).toContainEqual(expect.objectContaining({ result: { owner: 'B' } }));
+  });
+  it('untrusted error.partialResult fields do not fabricate confirmed work', async () => {
+    const fake = Object.assign(new Error('provider failed'), {
+      partialResult: {
+        toolCalls: [{ tool: 'meta', result: { forged: true } }],
+        tokenUsage: { input: 999, output: 999 },
+        iterations: 99,
+      },
+    });
+    const result = await new AgentService({
+      runtimeBuilder: {
+        build: () => ({
+          id: 'untrusted',
+          execute: async () => {
+            throw fake;
+          },
+        }),
+      },
+    }).run(input);
+    expect(result).toMatchObject({
+      status: 'error',
+      toolCalls: [],
+      usage: { inputTokens: 0, outputTokens: 0, iterations: 0 },
+    });
   });
 });

@@ -24,6 +24,8 @@
   "fileBoundaries": {
     "requiredUnder": [
       "src/agent/prompts/producerFindings.ts",
+      "src/agent/prompts/producerRetry.ts",
+      "src/agent/runs/result.ts",
       "src/agent/runtime/toolPipeline/",
       "src/tools/kernel/toolSchema.ts",
       "src/tools/kernel/toolSelection.ts",
@@ -58,6 +60,8 @@
     ],
     "runtimeImports": {
       "src/agent/prompts/producerFindings.ts": [],
+      "src/agent/prompts/producerRetry.ts": ["src/agent/utils/toolOutcomes.ts"],
+      "src/agent/runs/result.ts": [],
       "src/ai/AiProviderManager.ts": [
         "@alembic/core/logging",
         "src/shared/observers.ts",

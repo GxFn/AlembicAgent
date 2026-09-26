@@ -5,7 +5,7 @@ import { ANALYST_SYSTEM_PROMPT } from '../prompts/insightAnalyst.js';
 import { buildRetryPrompt } from '../prompts/insightGate.js';
 import { buildCodeContextSection } from '../prompts/insightProducer.js';
 import { buildProducerFindingsSection } from '../prompts/producerFindings.js';
-import { hasPersistedCandidate, isKnowledgeSubmit } from '../utils/toolOutcomes.js';
+import { buildProducerRetryPrompt } from '../prompts/producerRetry.js';
 import { insightGateEvaluator, producerRejectionGateEvaluator } from './gateEvaluators.js';
 
 // ── Local Type Definitions ──
@@ -172,18 +172,7 @@ export function buildScanPipelineStages(
             _origPrompt: string,
             prev: Record<string, PhaseResult>
           ) => {
-            const prevProduce = prev.produce;
-            // 与 rejection gate 共用真实提交回执；查询失败和成功内容里的 error 字样不是拒绝。
-            const rejected = (prevProduce?.toolCalls || []).filter(
-              (call) => isKnowledgeSubmit(call) && !hasPersistedCandidate(call)
-            ).length;
-            return `你的 ${rejected} 个提交被拒绝了。请根据拒绝原因改进后重新提交，确保:
-1. content 必须是对象: { markdown: "...", rationale: "...", pattern: "..." }
-2. content.markdown 字段 ≥ 200 字符，含代码块 (\`\`\`)
-3. content.rationale 必填 — 设计原理说明
-4. 台账在场时 params.reasoning.evidenceRefs 必填，引用真实 E-id；无台账时按当前 schema 提供 reasoning.sources
-5. 标题使用项目真实类名，不以项目名开头
-6. 必填: trigger (@kebab-case)、kind (rule/pattern/fact)、doClause (英文祈使句)`;
+            return buildProducerRetryPrompt(prev.produce);
           },
           skipOnDegrade: true,
         }

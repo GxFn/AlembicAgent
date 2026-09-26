@@ -9,8 +9,8 @@ import type {
   AgentStrategyTemplate,
   CompiledAgentProfile,
 } from '../service/AgentRunContracts.js';
-import type { AgentProfileRegistry } from './AgentProfileRegistry.js';
-import type { AgentStageFactoryRegistry } from './AgentStageFactoryRegistry.js';
+import { AgentProfileRegistry } from './AgentProfileRegistry.js';
+import { AgentStageFactoryRegistry } from './AgentStageFactoryRegistry.js';
 
 interface AgentProfileCompilerOptions {
   profileRegistry: AgentProfileRegistry;
@@ -65,6 +65,7 @@ export class AgentProfileCompiler {
     const params = mergeParams(options.params, profileOverride.params);
     const actionSpace = profileOverride.actionSpace || { mode: 'listed', toolIds: [] };
     const runtimeOverrides = stripUndefined({
+      ...presetBudgetParams(params),
       capabilities: profileOverride.skills,
       strategy: profileOverride.strategy,
       policies: compilePolicyDeclarations(profileOverride.policies),
@@ -101,7 +102,7 @@ export class AgentProfileCompiler {
       actionSpace: { mode: 'listed', toolIds: [] },
       additionalTools: [],
       params,
-      runtimeOverrides: {},
+      runtimeOverrides: presetBudgetParams(params),
     };
   }
 
@@ -293,3 +294,28 @@ function serviceKindForPreset(preset: string): CompiledAgentProfile['serviceKind
 }
 
 export default AgentProfileCompiler;
+
+/** Legacy preset 参数只投影已声明预算字段；业务 params 不能暗中替换权限/策略。 */
+function presetBudgetParams(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    [
+      'maxIterations',
+      'maxTokens',
+      'temperature',
+      'timeoutMs',
+      'minEvidenceLength',
+      'minFileRefs',
+      'minToolCalls',
+    ]
+      .filter((key) => params[key] !== undefined)
+      .map((key) => [key, params[key]])
+  );
+}
+
+/** Service 与直接 Builder 共享同一声明编译入口，不各自解释 policy。 */
+export function createDefaultProfileCompiler(): AgentProfileCompiler {
+  return new AgentProfileCompiler({
+    profileRegistry: new AgentProfileRegistry(),
+    stageFactoryRegistry: new AgentStageFactoryRegistry(),
+  });
+}

@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
+import { runOperation } from '#shared/operation.js';
 import { AgentRunCoordinator } from '../coordination/AgentRunCoordinator.js';
-import { AgentProfileCompiler } from '../profiles/AgentProfileCompiler.js';
-import { AgentProfileRegistry } from '../profiles/AgentProfileRegistry.js';
-import { AgentStageFactoryRegistry } from '../profiles/AgentStageFactoryRegistry.js';
-import { AgentExecutionTimeoutError } from '../runtime/AgentExecutionTimeoutError.js';
+import {
+  type AgentProfileCompiler,
+  createDefaultProfileCompiler,
+} from '../profiles/AgentProfileCompiler.js';
+import { readRuntimeFailureSnapshot } from '../runtime/AgentExecutionTimeoutError.js';
 import { AgentMessage, Channel } from '../runtime/AgentMessage.js';
+import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 import type {
   AgentRunInput,
   AgentRunResult,
@@ -51,10 +55,10 @@ export class AgentService {
     });
     const trace = describeRun(input, compiledProfile.id);
     const startedAt = Date.now();
-    this.#logger.info(`[AgentService] run start ${formatRunTrace(trace)}`, trace);
+    this.#log('info', `[AgentService] run start ${formatRunTrace(trace)}`, trace);
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
       try {
-        this.#logger.info(`[AgentService] coordinated run start ${formatRunTrace(trace)}`, {
+        this.#log('info', `[AgentService] coordinated run start ${formatRunTrace(trace)}`, {
           ...trace,
           concurrencyMode: compiledProfile.concurrency?.mode || null,
         });
@@ -62,7 +66,7 @@ export class AgentService {
           this.run(childInput)
         );
         if (coordinated) {
-          this.#logger.info(`[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
+          this.#log('info', `[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
             ...trace,
             durationMs: Date.now() - startedAt,
             status: coordinated.status,
@@ -71,13 +75,80 @@ export class AgentService {
           return coordinated;
         }
       } catch (err: unknown) {
-        this.#logger.warn(`[AgentService] coordinated run failed ${formatRunTrace(trace)}`, {
+        this.#log('warn', `[AgentService] coordinated run failed ${formatRunTrace(trace)}`, {
           ...trace,
           durationMs: Date.now() - startedAt,
           error: err instanceof Error ? err.message : String(err),
         });
-        throw err;
+        throw err instanceof Error ? err : new Error(String(err));
       }
+    }
+    let preflightStatus: 'aborted' | 'timeout' | null = input.execution?.abortSignal?.aborted
+      ? 'aborted'
+      : null;
+    const shouldAbort = input.execution?.shouldAbort;
+    if (!preflightStatus && shouldAbort) {
+      const timeout = input.execution?.timeoutMs;
+      // 开工检查可以异步，但等待也必须响应本次signal和显式期限；不增加运行中轮询。
+      const check = await runOperation(() => shouldAbort(), {
+        abortSignal: input.execution?.abortSignal,
+        timeoutMs:
+          typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+            ? timeout
+            : undefined,
+      });
+      if (check.status === 'error') {
+        const error =
+          check.error instanceof Error
+            ? check.error
+            : new Error('Agent cancellation check failed', { cause: check.error });
+        this.#log('warn', `[AgentService] cancellation check failed ${formatRunTrace(trace)}`, {
+          ...trace,
+          error: error.message,
+        });
+        throw error;
+      }
+      if (check.status === 'timeout') {
+        preflightStatus = 'timeout';
+      } else if (
+        check.status === 'aborted' ||
+        (check.status === 'ok' && check.value === true) ||
+        input.execution?.abortSignal?.aborted
+      ) {
+        preflightStatus = 'aborted';
+      }
+    }
+    if (preflightStatus) {
+      const diagnostics = DiagnosticsCollector.from(input.execution?.diagnostics);
+      diagnostics.recordCancelReason(
+        preflightStatus === 'timeout' ? 'stage_timeout' : 'abort_signal'
+      );
+      if (preflightStatus === 'timeout') {
+        diagnostics.recordTimedOutStage('service-preflight');
+      }
+      diagnostics.warn({
+        code: `run_${preflightStatus}_before_execution`,
+        message: `AgentService did not start runtime work after preflight ${preflightStatus}`,
+      });
+      this.#log(
+        'info',
+        `[AgentService] run ${preflightStatus} before execution ${formatRunTrace(trace)}`,
+        trace
+      );
+      return {
+        runId: randomUUID(),
+        profileId: compiledProfile.id,
+        reply: `Agent run ${preflightStatus} before execution`,
+        status: preflightStatus,
+        toolCalls: [],
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          iterations: 0,
+          durationMs: Date.now() - startedAt,
+        },
+        diagnostics: diagnostics.toJSON(),
+      };
     }
     const runtime = this.#runtimeBuilder.build(compiledProfile, {
       lang: input.context.lang || null,
@@ -91,13 +162,13 @@ export class AgentService {
     try {
       // 冷启动监控依赖这里把“维度 child run 已进入 AgentRuntime”明确打出来。
       // 仅靠 GenerateTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
-      this.#logger.info(`[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
+      this.#log('info', `[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
         ...trace,
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input));
       const status = inferRunStatus(result);
-      this.#logger.info(`[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
+      this.#log('info', `[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
         status,
@@ -122,8 +193,8 @@ export class AgentService {
         diagnostics: result.diagnostics || null,
       };
     } catch (err: unknown) {
-      const partial = err instanceof AgentExecutionTimeoutError ? err.partialResult : null;
-      this.#logger.warn(`[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
+      const partial = readRuntimeFailureSnapshot(runtime, err);
+      this.#log('warn', `[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
         error: err instanceof Error ? err.message : String(err),
@@ -134,6 +205,7 @@ export class AgentService {
         profileId: compiledProfile.id,
         reply: err instanceof Error ? err.message : String(err),
         status: inferErrorStatus(err),
+        phases: partial?.phases,
         toolCalls: partial?.toolCalls || [],
         usage: {
           inputTokens: partial?.tokenUsage.input || 0,
@@ -144,6 +216,13 @@ export class AgentService {
         diagnostics: partial?.diagnostics || null,
       };
     }
+  }
+
+  #log(level: 'info' | 'warn', message: string, metadata: Record<string, unknown>): void {
+    observeSafely(
+      () => this.#logger[level](message, metadata),
+      () => undefined
+    );
   }
 }
 
@@ -160,11 +239,7 @@ function validateRunInput(input: AgentRunInput) {
 }
 
 function buildAgentMessage(input: AgentRunInput) {
-  const metadataContext = getRecord(input.message.metadata?.context);
-  const promptContext = {
-    ...metadataContext,
-    ...(input.context.promptContext || {}),
-  };
+  const promptContext = promptContextFor(input);
   return new AgentMessage({
     content: input.message.content,
     channel: toChannel(input.context.source),
@@ -207,7 +282,7 @@ function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
     memoryCoordinator: input.context.memoryCoordinator,
     sharedState: input.context.sharedState,
     context: {
-      ...(input.context.promptContext || {}),
+      ...promptContextFor(input),
       ...(projectedScopeId ? { dimensionScopeId: projectedScopeId } : {}),
     },
     source: input.context.runtimeSource || runtimeSourceFor(input.context.source),
@@ -295,11 +370,8 @@ function inferErrorStatus(err: unknown): AgentRunStatus {
   return 'error';
 }
 
-function createDefaultProfileCompiler() {
-  return new AgentProfileCompiler({
-    profileRegistry: new AgentProfileRegistry(),
-    stageFactoryRegistry: new AgentStageFactoryRegistry(),
-  });
+function promptContextFor(input: AgentRunInput): Record<string, unknown> {
+  return { ...getRecord(input.message.metadata?.context), ...(input.context.promptContext || {}) };
 }
 
 function describeRun(input: AgentRunInput, profileId: string): Record<string, unknown> {

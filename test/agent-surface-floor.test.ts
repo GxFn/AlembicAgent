@@ -14,26 +14,30 @@ import {
   AgentProfileCompiler,
   AgentProfileRegistry,
   AgentStageFactoryRegistry,
+  getPreset,
+  PRESETS,
 } from '../src/agent/profiles/index.js';
-import { collectEvolutionDecisionIds } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
-import { projectRelationDiscoveryResult } from '../src/agent/runs/relation/RelationAgentRun.js';
+import {
+  collectEvolutionDecisionIds,
+  projectEvolutionAuditResult,
+} from '../src/agent/runs/evolution/EvolutionAgentRun.js';
+import {
+  projectRelationDiscoveryResult,
+  runRelationDiscovery,
+} from '../src/agent/runs/relation/RelationAgentRun.js';
+import { runTranslationJson } from '../src/agent/runs/translation/TranslationAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import type { ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
 import type {
   AgentRunInput,
   AgentRunResult,
+  AgentRunStatus,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
+import type { AgentService } from '../src/agent/service/AgentService.js';
 import { AgentRunCoordinator } from '../src/agent/service/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
-import {
-  type TaskContext,
-  taskCheckAndSubmit,
-  taskFullEnrich,
-  taskGuardFullScan,
-  taskQualityAudit,
-} from '../src/agent/tasks/index.js';
-import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 
 const projectRoot = '/tmp/alembic-agent-surface-floor';
 
@@ -45,59 +49,6 @@ class BlockingPolicy extends Policy {
   override validateBefore() {
     return { ok: false, reason: 'blocked-before-run' };
   }
-}
-
-function toolEnvelope(structuredContent: unknown): ToolResultEnvelope {
-  return {
-    ok: true,
-    toolId: 'task-tool',
-    callId: 'task-call',
-    startedAt: '2026-06-12T00:00:00.000Z',
-    durationMs: 1,
-    status: 'success',
-    text: JSON.stringify(structuredContent),
-    structuredContent,
-    diagnostics: {
-      degraded: false,
-      fallbackUsed: false,
-      warnings: [],
-      timedOutStages: [],
-      blockedTools: [],
-      truncatedToolCalls: 0,
-      emptyResponses: 0,
-      aiErrorCount: 0,
-      gateFailures: [],
-    },
-    trust: {
-      source: 'internal',
-      sanitized: true,
-      containsUntrustedText: false,
-      containsSecrets: false,
-    },
-  };
-}
-
-function createTaskContext(
-  responses: Record<string, unknown>,
-  services: Record<string, unknown> = {}
-): TaskContext & { calls: Array<{ toolName: string; params: Record<string, unknown> }> } {
-  const calls: Array<{ toolName: string; params: Record<string, unknown> }> = [];
-  return {
-    calls,
-    async invokeToolEnvelope(toolName, params) {
-      calls.push({ toolName, params });
-      return toolEnvelope(responses[toolName] ?? {});
-    },
-    container: {
-      get(name: string) {
-        const service = services[name];
-        if (!service) {
-          throw new Error(`missing service: ${name}`);
-        }
-        return service;
-      },
-    },
-  };
 }
 
 function baseRunInput(dimensions: unknown[]): AgentRunInput {
@@ -179,124 +130,6 @@ describe('task handler public contracts', () => {
     expect(
       projectRelationDiscoveryResult({ ...childResult(baseRunInput([])), reply })
     ).toMatchObject({ analyzed: 0, relations: [] });
-  });
-  it('checks duplicate candidates and keeps AI verdict optional', async () => {
-    const context = createTaskContext({
-      check_duplicate: {
-        similar: [
-          { title: 'same recipe', similarity: 0.82 },
-          { title: 'near recipe', similarity: 0.63 },
-        ],
-      },
-    });
-    context.aiProvider = {
-      chat: async () => 'SIMILAR because the evidence differs',
-      chatWithStructuredOutput: async () => ({}),
-    };
-
-    await expect(
-      taskCheckAndSubmit(context, {
-        candidate: { title: 'candidate', code: 'export const answer = 42;' },
-        projectRoot,
-      })
-    ).resolves.toMatchObject({
-      duplicates: [
-        { title: 'same recipe', similarity: 0.82 },
-        { title: 'near recipe', similarity: 0.63 },
-      ],
-      highSimilarity: [{ title: 'same recipe', similarity: 0.82 }],
-      aiVerdict: 'SIMILAR',
-      recommendation: 'review_suggested',
-    });
-    expect(context.calls[0]).toMatchObject({
-      toolName: 'check_duplicate',
-      params: { projectRoot, threshold: 0.5 },
-    });
-  });
-
-  it('enriches only candidates missing required metadata', async () => {
-    const knowledgeService = {
-      list: async () => ({
-        items: [
-          { id: 'needs-rationale', metadata: { knowledgeType: 'pattern', complexity: 'low' } },
-          {
-            id: 'complete',
-            metadata: { rationale: 'why', knowledgeType: 'fact', complexity: 'low' },
-          },
-          { id: 'needs-complexity', metadata: { rationale: 'why', knowledgeType: 'rule' } },
-        ],
-      }),
-    };
-    const context = createTaskContext(
-      {
-        enrich_candidate: { enriched: 2 },
-      },
-      { knowledgeService }
-    );
-
-    await expect(taskFullEnrich(context, { maxCount: 10 })).resolves.toEqual({ enriched: 2 });
-    expect(context.calls[0]).toEqual({
-      toolName: 'enrich_candidate',
-      params: { candidateIds: ['needs-rationale', 'needs-complexity'] },
-    });
-  });
-
-  it('audits recipe quality and sorts low-quality records by score', async () => {
-    const knowledgeService = {
-      list: async () => ({
-        data: [
-          { id: 'b', title: 'borderline' },
-          { id: 'a', title: 'weak' },
-          { id: 'c', title: 'strong' },
-        ],
-      }),
-    };
-    const scores: Record<string, unknown> = {
-      b: { score: 0.5, grade: 'D', dimensions: { evidence: 0.4 } },
-      a: { score: 0.2, grade: 'F', dimensions: { evidence: 0.1 } },
-      c: { score: 0.95, grade: 'A', dimensions: { evidence: 1 } },
-    };
-    const context = createTaskContext({}, { knowledgeService });
-    context.invokeToolEnvelope = async (_toolName, params) => {
-      const recipe = params.recipe as { id: string };
-      return toolEnvelope(scores[recipe.id]);
-    };
-
-    await expect(taskQualityAudit(context, { threshold: 0.6 })).resolves.toMatchObject({
-      total: 3,
-      lowQualityCount: 2,
-      lowQuality: [
-        { id: 'a', score: 0.2, grade: 'F' },
-        { id: 'b', score: 0.5, grade: 'D' },
-      ],
-      gradeDistribution: { A: 1, B: 0, C: 0, D: 1, F: 1 },
-    });
-  });
-
-  it('runs guard scans with structured AI suggestions only after violations exist', async () => {
-    const context = createTaskContext({
-      guard_check_code: {
-        violationCount: 1,
-        violations: [{ severity: 'error', message: 'no any', line: 3 }],
-      },
-    });
-    context.aiProvider = {
-      chat: async () => 'unused',
-      chatWithStructuredOutput: async () => [{ violation: 'no any', suggestion: 'use unknown' }],
-    };
-
-    await expect(
-      taskGuardFullScan(context, {
-        code: 'const value: any = input;',
-        language: 'ts',
-        filePath: 'src/example.ts',
-      })
-    ).resolves.toMatchObject({
-      filePath: 'src/example.ts',
-      language: 'ts',
-      violationCount: 1,
-      suggestions: [{ violation: 'no any', suggestion: 'use unknown' }],
-    });
   });
 });
 
@@ -1090,4 +923,183 @@ describe('coordination asynchronous admission', () => {
       { tool: 'knowledge', result: { id: 'confirmed-2' } },
     ]);
   });
+});
+
+describe('profile ownership and preset selection', () => {
+  it.each(['__proto__', 'constructor', 'toString'])('rejects inherited preset name %s', (name) => {
+    expect(() => getPreset(name)).toThrow('Unknown preset');
+  });
+
+  it('owns registered declarations and returns independent get/list snapshots', () => {
+    const definition = {
+      id: 'owned',
+      title: 'Owned',
+      serviceKind: 'system-analysis' as const,
+      lifecycle: 'active' as const,
+      basePreset: 'chat',
+      defaults: {
+        skills: ['conversation'],
+        actionSpace: { mode: 'listed' as const, toolIds: ['memory'] },
+      },
+      strategy: { type: 'single' as const },
+    };
+    const registry = new AgentProfileRegistry([definition]);
+    definition.defaults.skills.push('system_interaction');
+    const first = registry.require('owned');
+    first.defaults?.actionSpace?.mode === 'listed' &&
+      first.defaults.actionSpace.toolIds.push('terminal');
+    registry.list()[0].defaults?.skills?.push('code_analysis');
+    expect(registry.require('owned').defaults).toEqual({
+      skills: ['conversation'],
+      actionSpace: { mode: 'listed', toolIds: ['memory'] },
+    });
+  });
+
+  it('does not let a compiled profile mutate the next compilation', () => {
+    const registry = new AgentProfileRegistry();
+    const compiler = new AgentProfileCompiler({
+      profileRegistry: registry,
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    });
+    const first = compiler.compile({ id: 'scan-extract' });
+    first.skills?.push('system_interaction');
+    expect(compiler.compile({ id: 'scan-summarize' }).skills).toEqual(['code_analysis']);
+  });
+
+  it('owns the preset runtime configuration while retaining function and policy ports', () => {
+    const before = [...PRESETS.chat.capabilities];
+    const preset = getPreset('chat');
+    try {
+      (preset.capabilities as string[]).push('system_interaction');
+      expect(getPreset('chat').capabilities).toEqual(before);
+      expect((getPreset('chat').policies as unknown[])[0]).toBe(PRESETS.chat.policies[0]);
+    } finally {
+      PRESETS.chat.capabilities.splice(0, PRESETS.chat.capabilities.length, ...before);
+    }
+  });
+
+  it('isolates mutable stage budgets and gates across factory calls', () => {
+    const factories = new AgentStageFactoryRegistry();
+    const first = factories.build('generateDimensionPipeline', { params: {} });
+    const gate = first.find((stage) => stage.name === 'quality_gate')?.gate as {
+      maxRetries: number;
+    };
+    const before = gate.maxRetries;
+    try {
+      gate.maxRetries = 99;
+      const next = factories.build('generateDimensionPipeline', { params: {} });
+      expect(
+        (next.find((stage) => stage.name === 'quality_gate')?.gate as { maxRetries: number })
+          .maxRetries
+      ).toBe(before);
+    } finally {
+      PRESETS.insight.strategy.stages[1].gate.maxRetries = before;
+    }
+  });
+
+  it('uses the same confirmed submission and evidence contract for insight and scan retries', () => {
+    const previous = {
+      produce: {
+        toolCalls: [
+          { tool: 'knowledge', args: { action: 'search' }, result: { status: 'error' } },
+          { tool: 'knowledge', args: { action: 'submit' }, result: { status: 'rejected' } },
+          {
+            tool: 'knowledge',
+            args: { action: 'submit' },
+            envelope: { ok: false, text: 'blocked' },
+          },
+          {
+            tool: 'knowledge',
+            args: { action: 'submit' },
+            result: { status: 'created', id: 'saved', lifecycle: 'pending' },
+          },
+        ],
+      },
+    };
+    const factories = new AgentStageFactoryRegistry();
+    for (const [name, params] of [
+      ['generateDimensionPipeline', {}],
+      ['scanPipeline', { task: 'extract' }],
+    ] as const) {
+      const stages = factories.build(name, { params });
+      const stage = stages.find((value) => value.name === 'produce') as {
+        retryPromptBuilder: (reason: object, input: string, prev: object) => string;
+      };
+      const prompt = stage.retryPromptBuilder({ reason: 'retry' }, '', previous);
+      expect(prompt).toContain('你的 2 个提交');
+      expect(prompt).toContain('reasoning.evidenceRefs');
+      expect(prompt).toContain('无台账');
+    }
+  });
+});
+
+describe('run projection outcomes', () => {
+  function runResult(
+    toolCalls: ToolCallEntry[] = [],
+    status: AgentRunStatus = 'success'
+  ): AgentRunResult {
+    return {
+      runId: 'fixture',
+      profileId: 'scan-extract',
+      reply: 'finished',
+      status,
+      toolCalls,
+      usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+      diagnostics: null,
+    };
+  }
+  function submitted(result: unknown, envelope?: unknown): ToolCallEntry {
+    return {
+      tool: 'knowledge',
+      args: { action: 'submit', params: { title: 'Verified', supersedes: 'old-recipe' } },
+      result,
+      durationMs: 1,
+      ...(envelope ? { envelope: envelope as ToolCallEntry['envelope'] } : {}),
+    };
+  }
+  const created = { status: 'created', id: 'real-recipe', lifecycle: 'pending' };
+
+  it.each([
+    'aborted',
+    'timeout',
+    'blocked',
+    'error',
+  ] as const)('does not emit writable relations from a %s run', async (status) => {
+    const result = {
+      ...runResult([], status),
+      reply: JSON.stringify({
+        analyzed: 2,
+        relations: [{ from: 'one', to: 'two', type: 'depends_on' }],
+      }),
+    };
+    const service = { run: vi.fn(async () => result) } as unknown as AgentService;
+    await expect(runRelationDiscovery({ agentService: service })).rejects.toMatchObject({
+      cause: result,
+    });
+  });
+  it('counts a persisted superseding recipe as a proposed evolution outcome', () => {
+    expect(
+      projectEvolutionAuditResult({ reply: 'done', toolCalls: [submitted(created)], iterations: 1 })
+        .proposed
+    ).toBe(1);
+  });
+  it('retains translation fallback when the optional parse observer throws', async () => {
+    const service = {
+      run: vi.fn(async () => ({ ...runResult(), reply: 'not-json' })),
+    } as unknown as AgentService;
+    await expect(
+      runTranslationJson({
+        agentService: service,
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError: () => {
+          throw new Error('observer failed');
+        },
+      })
+    ).resolves.toEqual({ summaryEn: '原文', usageGuideEn: '用法' });
+  });
+});
+
+it('keeps the preset strategy when an optional override is explicitly undefined', () => {
+  expect(getPreset('insight', { strategy: undefined }).strategyInstance.name).toBe('pipeline');
 });

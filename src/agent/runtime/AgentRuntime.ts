@@ -64,7 +64,10 @@ import {
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
-import { AgentExecutionTimeoutError } from './AgentExecutionTimeoutError.js';
+import {
+  AgentExecutionTimeoutError,
+  bindRuntimeFailureSnapshot,
+} from './AgentExecutionTimeoutError.js';
 import type { AgentMessage } from './AgentMessage.js';
 import {
   type AgentProgressProcessEvent,
@@ -367,6 +370,7 @@ export class AgentRuntime {
     const abortSignal = parentAbortSignal
       ? AbortSignal.any([parentAbortSignal, abortController.signal])
       : abortController.signal;
+    let completedResult: AgentResult | undefined;
     const snapshot = (): AgentResult => ({
       reply: '',
       toolCalls: [...this.toolCallHistory],
@@ -421,6 +425,7 @@ export class AgentRuntime {
         }
       }
 
+      completedResult = result;
       // ── Policy: 执行后校验 ──
       const afterCheck = this.policies.validateAfter(
         result as import('../policies/index.js').PolicyResult
@@ -473,9 +478,14 @@ export class AgentRuntime {
       const error =
         err instanceof Error ? err : new Error('Agent execution failed', { cause: err });
       this.#safeTransition('error', { error: error.message });
-      if (error instanceof AgentExecutionTimeoutError) {
-        error.partialResult.state = this.state.toJSON();
-      }
+      const partial =
+        error instanceof AgentExecutionTimeoutError
+          ? error.partialResult
+          : completedResult || snapshot();
+      partial.state = this.state.toJSON();
+      partial.durationMs = Date.now() - this.startTime;
+      partial.diagnostics = diagnostics.toJSON();
+      bindRuntimeFailureSnapshot(this, error, partial);
       this.bus.publish(
         AgentEvents.AGENT_FAILED,
         {

@@ -20,8 +20,9 @@ import {
   PRODUCER_BUDGET,
   PRODUCER_SYSTEM_PROMPT,
 } from '../../prompts/insightProducer.js';
+import { buildProducerRetryPrompt } from '../../prompts/producerRetry.js';
 import type { DiagnosticsCollector } from '../../runtime/DiagnosticsCollector.js';
-import type { PolicyFactoryConfig, ToolCallRecord } from './types.js';
+import type { PolicyFactoryConfig } from './types.js';
 
 const PRODUCER_TIMEOUT_MS = 900_000;
 const PRODUCER_RETRY_TIMEOUT_MS = 300_000;
@@ -133,32 +134,9 @@ export const INSIGHT_PRESET = {
           _origPrompt: string,
           prev: Record<string, unknown>
         ) => {
-          const prevProduce = prev.produce as { toolCalls?: ToolCallRecord[] } | undefined;
-          const submitCalls = (prevProduce?.toolCalls || []).filter(
-            (tc) => (tc.tool || tc.name) === 'knowledge'
+          return buildProducerRetryPrompt(
+            prev.produce as { toolCalls?: readonly unknown[] } | undefined
           );
-          const rejected = submitCalls.filter((tc) => {
-            const res = tc.result;
-            if (!res) {
-              return false;
-            }
-            if (typeof res === 'string') {
-              return res.includes('rejected') || res.includes('error');
-            }
-            return (
-              res.status === 'rejected' ||
-              res.status === 'error' ||
-              res.reason === 'validation_failed'
-            );
-          }).length;
-          return `你的 ${rejected} 个提交被拒绝了。请根据拒绝原因改进后重新提交，确保:
-1. content 必须是对象: { markdown: "...", rationale: "...", pattern: "..." }
-2. content.markdown 字段 ≥ 200 字符，含代码块 (\`\`\`)
-3. content.rationale 必填 — 设计原理说明（为什么这样设计）
-4. 包含来源标注 (来源: FileName.m:行号)
-5. 标题使用项目真实类名，不以项目名开头
-6. description 中文简述 ≤80 字，引用真实类名
-7. 必填: title、description、trigger (@kebab-case)、kind (rule/pattern/fact)、doClause (英文祈使句)、reasoning.sources`;
         },
         skipOnDegrade: true,
       },
