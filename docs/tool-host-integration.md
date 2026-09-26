@@ -36,6 +36,8 @@ Agent 剥除无法证明的 coreCode 后，继续交给 Core 检查保留的来�
 
 旧的 toToolSchemas、toToolSchemasForModel、toMixedSchemas、toToolSchemasForActions、toMixedSchemasForActions 保留包装；旧宿主只有这些方法时，Runtime 通过一个兼容入口查询并记录所选路径。非法显式 capability 合同会失败，不回落到旧 tools 列表扩大权限。Capability 的文本片段描述允许范围，实际可调用分支以本次 schema 为准。
 
+显式 `mode: full` 优先选择旧宿主可用的完整投影方法；仅有 mixed 方法时保留兼容结果，并记录 `legacy_mode_degraded`。默认和 mixed 查询保持原探测顺序。降级日志失败不改变结果，各条路径仍按调用前的 selection 收窄权限。
+
 查询前固定 selection 的自有快照，传给宿主的是独立副本；宿主或兼容通知修改入参不能扩大本次授权。查询端口保持同步：Promise 结果明确拒绝，并观察其迟到失败，避免未处理拒绝。兼容通知失败只记录 `legacy_diagnostic_failed`。泛型目录的 schema 参数投影也独立于注册定义；工具 handler 与活跃 runtime 资源保留原引用。
 
 Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiModelId`，包括模型名自身的后续冒号。模型覆盖按原声明顺序匹配这两个明确名称。旧目录直接调用只按传入 model 字符串匹配，不擅自拆分 `qwen2:latest` 这类裸模型名；catalog 不持有另一份 provider 注册表。
@@ -45,6 +47,8 @@ Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiM
 `ToolRouter.describeAvailability` 按实际端口方法描述 graph、outline、knowledge 管理分支和运行期 memory/evidence。prime 可以使用 search-only 路径；只有某些 manage 分支可用时保留这些分支。服务可用性不是 actor 权限，也不是 Core 对具体业务输入的批准。
 
 Adapter 的 explain、执行前检查、获得队列执行位置后的检查使用同一准入规则。排队期间撤销的能力不能继续执行；省略参数也要检查真实默认值。meta.tools 只查询当前有效 registry 视图，不修改全局注册表。
+
+公开的 `allowToolDecision` / `denyToolDecision` 保留原签名；显式 allowed、stage、reason 优先于 extras 中的同名字段，extras 只补充其余元数据。旧调用如果用冲突 extras 反转裁决，应改为调用对应的 allow/deny 入口；实际 Router 的权限检查链保持独立。
 
 完整权限合同必须是动作映射；字符串、混合类型数组、稀疏数组或显式 null 不能代替它。宿主参数约束必须是字符串枚举，不接受字符串的子串匹配。查询和执行共用校验，非法声明明确拒绝。可用性回调中触发的取消，在首次宿主 context 分配前和最终 handler 入口前重新检查。
 
@@ -94,6 +98,8 @@ Core 已放入 created 列表并提供 id/lifecycle 的创建回执仍保留；�
 新 `ContextWindow` 在 L1/L3/L4 内容丢失和 reset 后更新 revision。旧 duck-typed window 无法报告 revision 时会告警，并保守禁用 delta 复用。重复读取一个大文件不能保证拿到全部内容；输出配额仍生效，应按行范围补读。
 
 `DeltaCache.set` 记录磁盘版本指纹，用于写前新鲜度校验；它不声明全文已经展示。`check` 只有在完整输出有资格进入当前视图时建立增量基线。范围读、outline、batch/action 配额截断保留指纹但不建立全文可见性。读取视图重置后，修改已有文件需要重新读取。
+
+两种缓存容量必须是非负安全整数；非法值在构造时抛出 `RangeError`，0 继续表示禁用缓存。`SearchCache.makeKey` 使用 JSON 元组区分 pattern、glob 和 regex，避免分隔符碰撞；调用方应把返回值当作不透明键，不手写或解析其格式。升级时重新创建已有缓存实例；真实 code.search 自有的结构化键与写后失效机制保持不变。
 
 ## 文件工具与输出
 

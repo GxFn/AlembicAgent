@@ -164,13 +164,23 @@ export function queryToolSchemas(
       : null;
   let schemas: ToolSchemaProjection[];
   let method: string;
-  if (typeof legacy.toMixedSchemasForActions === 'function' && actions) {
+  // full是显式投影要求；有可用完整端口时不能因旧方法探测顺序而选中mixed。
+  // 只有mixed的旧宿主继续可用，但必须报告降级；默认/mixed保留原有优先级。
+  const fullRequested = portQuery.mode === 'full';
+  const preferMixed =
+    !fullRequested ||
+    !(
+      (actions && typeof legacy.toToolSchemasForActions === 'function') ||
+      (query.model && typeof legacy.toToolSchemasForModel === 'function') ||
+      typeof legacy.toToolSchemas === 'function'
+    );
+  if (preferMixed && typeof legacy.toMixedSchemasForActions === 'function' && actions) {
     method = 'toMixedSchemasForActions';
     schemas = legacy.toMixedSchemasForActions(actions, query.model, query.firstRound);
   } else if (typeof legacy.toToolSchemasForActions === 'function' && actions) {
     method = 'toToolSchemasForActions';
     schemas = legacy.toToolSchemasForActions(actions, query.model);
-  } else if (typeof legacy.toMixedSchemas === 'function') {
+  } else if (preferMixed && typeof legacy.toMixedSchemas === 'function') {
     method = 'toMixedSchemas';
     schemas = legacy.toMixedSchemas(ids, query.model, query.firstRound);
   } else if (query.model && typeof legacy.toToolSchemasForModel === 'function') {
@@ -193,6 +203,16 @@ export function queryToolSchemas(
   );
   if (!isSchemas(schemas)) {
     throw new Error(`Invalid legacy schema result from ${method}`);
+  }
+  if (fullRequested && method.startsWith('toMixed')) {
+    // 诊断不参与准入；日志失败不能改变下方仍按原始selection收窄的结果。
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          `[ToolSchemaQuery] legacy_mode_degraded; requestedMode=full selectedMode=mixed method=${method}; authorization remains narrowed`
+        ),
+      () => undefined
+    );
   }
   const allowedTools = selectToolActions(
     selection,

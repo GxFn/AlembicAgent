@@ -14,12 +14,16 @@ export class SearchCache {
   readonly #maxEntries: number;
 
   constructor(maxEntries = 100) {
+    // 0显式禁用缓存；非法容量在构造边界拒绝，避免NaN/Infinity变成无界保留。
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) {
+      throw new RangeError('SearchCache maxEntries must be a non-negative safe integer');
+    }
     this.#maxEntries = maxEntries;
   }
 
-  /** 生成缓存 key: pattern + glob + regex flag 组合 */
+  /** 实例内的不透明键；独立编码各分量，pattern/glob中的分隔符不能串成同一个搜索。 */
   static makeKey(pattern: string, glob?: string, regex?: boolean): string {
-    return `${pattern}|${glob ?? ''}|${regex ? 'r' : 'l'}`;
+    return JSON.stringify([pattern, glob ?? '', Boolean(regex)]);
   }
 
   get(key: string): unknown | undefined {

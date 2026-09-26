@@ -1,51 +1,11 @@
 /**
- * Alembic Agent 模块 — 统一出口
- *
- * @module agent
- *
- * 统一架构: Surface -> AgentService -> Runtime -> Action Layer
- *
- *   ┌──────── Surface Layer ─────────┐
- *   │  HTTP│CLI│MCP│Workflow         │  ← 宿主表面只构造 AgentRunInput
- *   └──────────────┬─────────────────┘
- *              │     Codex MCP / marketplace / channel 由 AlembicPlugin 承载
- *              │
- *   ┌──────────▼─────────────────────┐
- *   │          AgentService          │  ← 统一服务入口 + profile 编译
- *   └──────────────┬─────────────────┘
- *              │
- *   ┌──────────▼─────────────────────┐
- *   │      AgentRuntimeBuilder       │  ← Profile + DI → Runtime
- *   └──────────────┬─────────────────┘
- *              │
- *   ┌──────────▼────────────────────────────────────────┐
- *   │              AgentRuntime                          │
- *   │                                                    │
- *   │  ┌────────────┐ ┌───────────┐ ┌────────────────┐ │
- *   │  │Agent Skill │ │ Strategy  │ │    Policy       │ │
- *   │  │ 运行时技能 │ │ 工程编排  │ │    约束引擎    │ │
- *   │  └────────────┘ └───────────┘ └────────────────┘ │
- *   │                                                    │
- *   │  ┌─────────────────────────────────────────┐      │
- *   │  │  ReAct Loop  (Thought→Action→Observe)   │      │
- *   │  └─────────────────────────────────────────┘      │
- *   └───────────────────────────────────────────────────┘
- *              │
- *   ┌──────────▼─────────────────────┐
- *   │ Action Layer: ToolRouter        │  ← 执行动作，不选择 Agent profile
- *   └────────────────────────────────┘
- *
- * Preset 配置表(W6-0 校准,真集=chat/insight/evolution):
- *   | Preset       | Capabilities             | Strategy    | Policies         |
- *   |--------------|--------------------------|-------------|------------------|
- *   | chat         | Conv + Analysis          | Single      | Budget(8轮)      |
- *   | insight      | Analysis + Knowledge     | Pipeline    | Budget+Quality   |
- *   | evolution    | Evolution analysis       | Pipeline    | Budget+Quality   |
+ * Agent 聚合兼容入口：Service 编排 profile、Runtime、策略与工具执行。
+ * HTTP/CLI/Workflow 交付壳由宿主提供；Codex host-agent 路由由 AlembicPlugin 提供。
+ * Core 的确定性内核通过 @alembic/core 消费，不能从本入口复制为第二套实现。
+ * 运行默认值由 profiles/presets 单源维护；公开名集由 public-signature probe 校验。
  */
 
-// ── Capabilities(W6-c:别名层删除,直引 toolsets;三个旧别名公共名
-// (Code-Analysis/Knowledge-Production/System-Interaction 词形)随删——
-// 全空间零消费实证,签名快照同批 regen)──
+// ── Capabilities ──
 export { Capability } from '../tools/runtime/toolsets/Capability.js';
 export { CapabilityRegistry } from '../tools/runtime/toolsets/CapabilityRegistry.js';
 export { Conversation } from '../tools/runtime/toolsets/Conversation.js';
@@ -72,7 +32,7 @@ export {
   validateAgentInterfaceContract,
 } from './runtime/AgentInterfaceContract.js';
 export { AgentMessage, Channel } from './runtime/AgentMessage.js';
-// ── Core ──
+// ── Runtime（Core确定性能力仍由 @alembic/core 提供）──
 export { AgentRuntime } from './runtime/AgentRuntime.js';
 export {
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,

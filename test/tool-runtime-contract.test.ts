@@ -640,6 +640,37 @@ describe('tool runtime adapters and public contracts', () => {
     expect(searchCache.size).toBe(1);
   });
 
+  it.each([
+    { name: 'search', Cache: SearchCache },
+    { name: 'delta', Cache: DeltaCache },
+  ])('rejects invalid $name capacity at the public construction boundary', ({ Cache }) => {
+    for (const capacity of [-1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new Cache(capacity), `capacity=${capacity}`).toThrow(RangeError);
+    }
+  });
+
+  it('keeps zero-capacity caches disabled while returning full read observations', () => {
+    const search = new SearchCache(0);
+    search.set('key', { matches: 1 });
+    expect(search.get('key')).toBeUndefined();
+    expect(search.size).toBe(0);
+    const delta = new DeltaCache(0);
+    expect(delta.check('source.ts', 'first').mode).toBe('full');
+    expect(delta.check('source.ts', 'first').mode).toBe('full');
+    expect(delta.size).toBe(0);
+  });
+
+  it('keeps search key components distinct even when pattern or glob contains a delimiter', () => {
+    const cache = new SearchCache();
+    const first = SearchCache.makeKey('a|b', 'c');
+    const second = SearchCache.makeKey('a', 'b|c');
+    cache.set(first, { source: 'first' });
+    expect(cache.get(second)).toBeUndefined();
+    expect(cache.get(first)).toEqual({ source: 'first' });
+    expect(SearchCache.makeKey('x')).toBe(SearchCache.makeKey('x', '', false));
+    expect(SearchCache.makeKey('x', '', true)).not.toBe(SearchCache.makeKey('x'));
+  });
+
   it('routes tool calls through generic router and adapter contracts', async () => {
     const router = new ToolRouter();
     const parsed = router.parseToolCall('meta', {

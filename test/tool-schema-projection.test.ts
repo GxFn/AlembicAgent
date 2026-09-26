@@ -442,6 +442,97 @@ function runtimeWith(
 }
 
 describe('runtime schema query port', () => {
+  it.each<{
+    selection: ToolSelection;
+    model?: string;
+    fullActions: boolean;
+    method: string;
+  }>([
+    {
+      selection: { code: ['read'] },
+      model: 'fixture',
+      fullActions: true,
+      method: 'toToolSchemasForActions',
+    },
+    { selection: ['code'], model: 'fixture', fullActions: true, method: 'toToolSchemasForModel' },
+    { selection: ['code'], fullActions: true, method: 'toToolSchemas' },
+    {
+      selection: { code: ['read'] },
+      model: 'fixture',
+      fullActions: false,
+      method: 'toToolSchemasForModel',
+    },
+  ])('honors explicit full projection via legacy $method', ({
+    selection,
+    model,
+    fullActions,
+    method,
+  }) => {
+    const full = [
+      {
+        name: 'code',
+        description: 'full',
+        parameters: {
+          type: 'object',
+          properties: { action: { enum: ['read', 'write'] } },
+        },
+      },
+    ];
+    const mixed = [{ name: 'code', description: 'mixed', parameters: { type: 'object' } }];
+    const catalog = {
+      toMixedSchemasForActions: () => mixed,
+      toMixedSchemas: () => mixed,
+      ...(fullActions ? { toToolSchemasForActions: () => full } : {}),
+      toToolSchemasForModel: () => full,
+      toToolSchemas: () => full,
+    };
+    const diagnostic = vi.fn();
+    const result = queryToolSchemas(catalog, { selection, model, mode: 'full' }, diagnostic);
+    expect(result.schemas[0].description).toBe('full');
+    expect(diagnostic).toHaveBeenCalledWith(method);
+    if (!Array.isArray(selection)) {
+      expect(result.allowedTools).toEqual({ code: ['read'] });
+      expect(actionsOf(result.schemas)).toEqual([{ tool: 'code', actions: ['read'] }]);
+    }
+    expect(full[0].parameters.properties.action.enum).toEqual(['read', 'write']);
+  });
+
+  it.each([
+    false,
+    true,
+  ])('reports full-to-mixed fallback without losing authorization when logging throws=%s', (throws) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      if (throws) {
+        throw new Error('synthetic logger unavailable');
+      }
+    });
+    try {
+      const catalog = {
+        toMixedSchemas: () => [
+          {
+            name: 'code',
+            parameters: {
+              type: 'object',
+              properties: { action: { enum: ['read', 'write'] } },
+            },
+          },
+        ],
+      };
+      const diagnostic = vi.fn();
+      const result = queryToolSchemas(
+        catalog,
+        { selection: { code: ['read'] }, mode: 'full' },
+        diagnostic
+      );
+      expect(actionsOf(result.schemas)).toEqual([{ tool: 'code', actions: ['read'] }]);
+      expect(result.allowedTools).toEqual({ code: ['read'] });
+      expect(diagnostic).toHaveBeenCalledWith('toMixedSchemas');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('legacy_mode_degraded'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it.each([
     'sync',
     'async',

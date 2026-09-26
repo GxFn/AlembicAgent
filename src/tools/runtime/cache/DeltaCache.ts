@@ -31,6 +31,10 @@ export class DeltaCache {
   readonly #maxEntries: number;
 
   constructor(maxEntries = 200) {
+    // 0保留每次全文读取的禁用语义；负数/非整数会破坏驱逐边界，不能延至写入时才失败。
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) {
+      throw new RangeError('DeltaCache maxEntries must be a non-negative safe integer');
+    }
     this.#maxEntries = maxEntries;
   }
 

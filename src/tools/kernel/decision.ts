@@ -27,7 +27,8 @@ export interface ToolDecision {
 }
 
 export function allowToolDecision(stage: ToolDecisionStage, extras: Partial<ToolDecision> = {}) {
-  return { allowed: true, stage, ...extras };
+  // 显式裁决参数是事实；extras只补诊断/确认元数据，不能反转权限或替换执行阶段。
+  return { ...extras, allowed: true, stage };
 }
 
 export function denyToolDecision(
@@ -35,5 +36,5 @@ export function denyToolDecision(
   reason: string,
   extras: Partial<ToolDecision> = {}
 ) {
-  return { allowed: false, stage, reason, ...extras };
+  return { ...extras, allowed: false, stage, reason };
 }
