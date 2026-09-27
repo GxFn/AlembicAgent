@@ -12,6 +12,32 @@ interface ToolPipelineResultState {
   hasResult: boolean;
 }
 
+interface FailedToolReceipt {
+  call: ToolCall;
+  result: unknown;
+  metadata: ToolMetadata;
+}
+// 后置处理失败不撤销执行回执。每次Runtime调用使用独立context；同一Error跨运行复用时
+// 仍按context和call身份隔离，绝不采信外部Error自带的partialResult/receipt字段。
+const failedReceipts = new WeakMap<Error, WeakMap<object, FailedToolReceipt>>();
+
+export function takeToolPipelineFailure(
+  error: unknown,
+  context: ToolPipelineContext,
+  call: ToolCall
+): FailedToolReceipt | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const byContext = failedReceipts.get(error);
+  const receipt = byContext?.get(context);
+  if (!receipt || receipt.call !== call) {
+    return undefined;
+  }
+  byContext?.delete(context);
+  return receipt;
+}
+
 function diagnosticReason(result: unknown) {
   if (result && typeof result === 'object' && 'error' in result) {
     return String((result as { error?: unknown }).error || 'blocked');
@@ -71,13 +97,20 @@ export async function executeToolPipeline<Context extends ToolPipelineContext>(
     ? beforeState.result
     : await executor(call, context, metadata);
 
-  await runAfterMiddlewares(middlewares, call, toolResult, context, metadata);
-
-  context.loopCtx.diagnostics?.recordEfficiencyToolCall({
-    cacheHit: metadata.cacheHit,
-    cacheMiss: metadata.cacheMiss,
-    duplicateShortCircuit: metadata.duplicateShortCircuit,
-  });
+  try {
+    await runAfterMiddlewares(middlewares, call, toolResult, context, metadata);
+    context.loopCtx.diagnostics?.recordEfficiencyToolCall({
+      cacheHit: metadata.cacheHit,
+      cacheMiss: metadata.cacheMiss,
+      duplicateShortCircuit: metadata.duplicateShortCircuit,
+    });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err : new Error(String(err), { cause: err });
+    const byContext = failedReceipts.get(error) ?? new WeakMap<object, FailedToolReceipt>();
+    byContext.set(context, { call, result: toolResult, metadata });
+    failedReceipts.set(error, byContext);
+    throw error;
+  }
 
   return { result: toolResult, metadata };
 }

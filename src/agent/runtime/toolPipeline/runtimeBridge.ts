@@ -35,9 +35,18 @@ export async function executeRuntimeToolCall(
 ): Promise<unknown> {
   const t0 = Date.now();
   try {
-    const envelope = await context.runtime.toolRouter.execute(
-      buildRuntimeToolCallRequest(call, context)
-    );
+    const request = buildRuntimeToolCallRequest(call, context);
+    // SafetyPolicy及请求装配可能执行宿主代码；最后一道取消检查必须位于真实路由入口前。
+    if (request.abortSignal?.aborted) {
+      metadata.blocked = true;
+      context.loopCtx.diagnostics?.recordCancelReason('abort_signal');
+      context.loopCtx.diagnostics?.warn({
+        code: 'TOOL_HOST_DISPATCH_CANCELLED',
+        message: `Host dispatch of ${call.name} was cancelled before execution.`,
+      });
+      return { status: 'aborted', error: 'Tool call cancelled before host dispatch' };
+    }
+    const envelope = await context.runtime.toolRouter.execute(request);
     recordExecutedEnvelope(call, context, metadata, envelope);
     return projectPipelineToolResult(envelope);
   } catch (err: unknown) {

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
+import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { produceForcedSummary } from '../src/agent/runtime/forcedSummary.js';
 import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
@@ -1299,5 +1300,91 @@ it('records confirmed evidence before cancellation ends the rest of a tool batch
     classification: 'evidence-produced',
     evidenceToolCallDelta: 1,
     toolCallDelta: 1,
+  });
+});
+
+describe('runtime safety evaluation to host dispatch', () => {
+  it.each(['allow', 'cancel'])('honors %s from a host policy before router entry', async (mode) => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const needsApproval = vi.fn(() => {
+        if (mode === 'cancel') {
+          controller.abort('policy host cancelled request');
+        }
+        return false;
+      });
+      class HostSafetyPolicy extends SafetyPolicy {
+        override needsApproval() {
+          return needsApproval();
+        }
+      }
+      const execute = vi.fn(async () => ({
+        ok: true,
+        status: 'success',
+        toolId: 'code',
+        callId: 'completed-host-call',
+        startedAt: new Date().toISOString(),
+        durationMs: 1,
+        text: 'confirmed read',
+        structuredContent: { path: 'src/a.ts', content: 'confirmed read' },
+        diagnostics: {
+          degraded: false,
+          fallbackUsed: false,
+          warnings: [],
+          timedOutStages: [],
+          blockedTools: [],
+          truncatedToolCalls: 0,
+          emptyResponses: 0,
+          aiErrorCount: 0,
+          gateFailures: [],
+        },
+        trust: {
+          source: 'internal',
+          sanitized: true,
+          containsUntrustedText: false,
+          containsSecrets: false,
+        },
+      }));
+      const chatWithTools = vi
+        .fn()
+        .mockResolvedValueOnce({
+          text: '',
+          functionCalls: [
+            { id: 'call-a', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+          ],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        })
+        .mockResolvedValue({
+          text: 'done',
+          functionCalls: [],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        });
+      const runtime = new AgentRuntime({
+        aiProvider: { name: 'fixture', model: 'fixture', chatWithTools } as never,
+        toolRegistry: { getManifest: () => null } as never,
+        toolRouter: { execute } as never,
+        container: { get: () => new RuntimeCapabilityCatalog() },
+        additionalTools: ['code'],
+        policies: new PolicyEngine([new HostSafetyPolicy()]),
+        strategy: { name: 'unused', execute: vi.fn() } as never,
+      });
+      const result = await runtime.reactLoop('read referenced source', {
+        abortSignal: controller.signal,
+        budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+      });
+      expect(needsApproval).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledTimes(mode === 'cancel' ? 0 : 1);
+      if (mode === 'cancel') {
+        expect(result.diagnostics?.efficiency?.cancelReason).toBe('abort_signal');
+      } else {
+        expect(result.toolCalls[0]).toMatchObject({
+          result: { content: 'confirmed read' },
+          envelope: { ok: true, callId: 'completed-host-call' },
+        });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

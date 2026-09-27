@@ -4,7 +4,12 @@
  * 返回对象保持可写，HookSystem可以继续在发送前附加hookErrors，不能冻结为新协议。
  */
 import { redactDeveloperText } from '../utils/Redaction.js';
-import type { AgentProgressProcessEvent, LLMResult } from './AgentRuntimeTypes.js';
+import type {
+  AgentProgressProcessEvent,
+  FunctionCall,
+  LLMResult,
+  ToolMetadata,
+} from './AgentRuntimeTypes.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LLMInputAssemblyMeasurement } from './LLMInputMeasurement.js';
 
@@ -56,6 +61,45 @@ export function createAgentProcessEvent(
     summary: input.summary ?? null,
     targetName: origin.targetName,
     title: input.title,
+  };
+}
+
+/** 工具事件只投影已经确定的调用/显示数据，调用和发送顺序仍由Runtime控制。 */
+export function projectToolStartEvent(call: FunctionCall, source: string): ProcessEventInput {
+  return {
+    kind: 'tool',
+    title: `Tool call started: ${call.name}`,
+    summary: `Calling tool ${call.name}`,
+    content: { role: 'developer', text: formatToolCallForDeveloperContent(call.name, call.args) },
+    correlationId: call.id,
+    metadata: { toolName: call.name, callId: call.id, source, status: 'started' },
+  };
+}
+
+export function projectToolEndEvent(
+  call: FunctionCall,
+  metadata: Pick<ToolMetadata, 'durationMs' | 'cacheHit' | 'cacheMiss'>,
+  resultText: string,
+  succeeded: boolean,
+  source: string
+): ProcessEventInput {
+  return {
+    kind: 'tool',
+    title: `Tool call ${succeeded ? 'completed' : 'failed'}: ${call.name}`,
+    summary: `${call.name} ${succeeded ? 'completed' : 'failed'} in ${metadata.durationMs}ms`,
+    content: { role: 'tool', text: redactDeveloperText(resultText) },
+    correlationId: call.id,
+    severity: succeeded ? 'success' : 'error',
+    metadata: {
+      toolName: call.name,
+      callId: call.id,
+      status: succeeded ? 'ok' : 'error',
+      durationMs: metadata.durationMs,
+      resultSize: resultText.length,
+      cacheHit: metadata.cacheHit,
+      cacheMiss: metadata.cacheMiss === true,
+      source,
+    },
   };
 }
 
@@ -386,7 +430,7 @@ function formatFunctionCallsForDeveloperContent(
   ].join('\n');
 }
 
-export function formatToolCallForDeveloperContent(toolName: string, args: Record<string, unknown>) {
+function formatToolCallForDeveloperContent(toolName: string, args: Record<string, unknown>) {
   return [`tool: ${toolName}`, 'args:', stringifyDeveloperData(args)].join('\n');
 }
 

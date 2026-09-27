@@ -1,6 +1,9 @@
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
+import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
+import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
@@ -18,6 +21,7 @@ import { AgentService } from '../src/agent/service/AgentService.js';
 import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
+import type { StrategyRuntime } from '../src/agent/strategies/Strategy.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
 function harness(
@@ -59,6 +63,72 @@ async function flushPipelineTasks() {
 }
 
 describe('Runtime operation boundary', () => {
+  it.each([
+    'memory',
+    'tracker',
+    'trace',
+  ] as const)('retains the returned host receipt when default %s postprocessing fails', async (port) => {
+    vi.useFakeTimers();
+    const failure = new Error(`Synthetic ${port} observer failure`);
+    const memory = new MemoryCoordinator();
+    const trace = new ActiveContext();
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 8, searchBudget: 8 }
+    );
+    if (!tracker) {
+      throw new Error('Tracker fixture must resolve');
+    }
+    const after =
+      port === 'memory'
+        ? vi.spyOn(memory, 'recordObservation')
+        : port === 'trace'
+          ? vi.spyOn(trace, 'recordToolCall')
+          : vi.spyOn(tracker, 'recordToolCall');
+    after.mockImplementation(() => {
+      throw failure;
+    });
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({ ...toolReply, usage: { inputTokens: 4, outputTokens: 3 } })
+      .mockResolvedValue({ text: 'must not continue after observer failure', functionCalls: [] });
+    const { runtime, service, input, execute } = toolHarness(chat);
+    class InjectedSingleStrategy extends SingleStrategy {
+      override execute(
+        owner: StrategyRuntime,
+        message: AgentMessage,
+        options: Record<string, unknown> = {}
+      ) {
+        return super.execute(owner, message, {
+          ...options,
+          ...(port === 'tracker' ? { tracker, toolChoiceOverride: 'auto' } : {}),
+        });
+      }
+    }
+    runtime.strategy = new InjectedSingleStrategy();
+    try {
+      const result = await service.run({
+        ...input,
+        context: { ...input.context, memoryCoordinator: memory, trace },
+      });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(after).toHaveBeenCalledOnce();
+      expect(chat).toHaveBeenCalledOnce();
+      expect(result.status).toBe('error');
+      expect(result.reply).toBe(failure.message);
+      expect(result.usage).toMatchObject({ inputTokens: 4, outputTokens: 3 });
+      expect(result.toolCalls).toMatchObject([
+        { tool: 'meta', result: { observed: true }, envelope: { ok: true } },
+      ]);
+      expect(runtime.toolCallHistory).toHaveLength(1);
+      expect(runtime.toolCallHistory[0].envelope).toBe(await execute.mock.results[0].value);
+    } finally {
+      after.mockRestore();
+      memory.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   function toolHarness(chat: ReturnType<typeof vi.fn>, onToolCall?: RuntimeConfig['onToolCall']) {
     const execute = vi.fn(async () => ({
       ok: true,

@@ -20,6 +20,7 @@ import {
   submitDedup,
   trackerSignal,
 } from '../src/agent/runtime/ToolExecutionPipeline.js';
+import { takeToolPipelineFailure } from '../src/agent/runtime/toolPipeline/engine.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
 import { Evolution } from '../src/tools/runtime/toolsets/Evolution.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -983,5 +984,76 @@ describe('bootstrap nudge and replan efficiency', () => {
     );
 
     expect(produceNudge).toBeNull();
+  });
+});
+
+describe('failed tool postprocessing receipt ownership', () => {
+  it('keeps reused errors isolated by invocation and call, then consumes each receipt once', async () => {
+    const failure = new Error('same observer error reused');
+    const envelopes: ToolResultEnvelope[] = [];
+    const runtime = createRuntime(createManifest(), async (request) => {
+      const envelope = createEnvelope(request, envelopes.length + 1);
+      envelopes.push(envelope);
+      return envelope;
+    });
+    const pipeline = new ToolExecutionPipeline().use({
+      name: 'observer',
+      after: () => {
+        throw failure;
+      },
+    });
+    const callA = { id: 'a', name: 'code', args: { action: 'read' } };
+    const callB = { id: 'b', name: 'code', args: { action: 'read' } };
+    const ctxA = { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 };
+    const ctxB = { ...ctxA };
+    await expect(pipeline.execute(callA, ctxA)).rejects.toBe(failure);
+    await expect(pipeline.execute(callB, ctxB)).rejects.toBe(failure);
+    expect(takeToolPipelineFailure(failure, { ...ctxA }, callA)).toBeUndefined();
+    expect(takeToolPipelineFailure(failure, ctxA, callB)).toBeUndefined();
+    expect(takeToolPipelineFailure({ partialResult: envelopes[0] }, ctxA, callA)).toBeUndefined();
+    const first = takeToolPipelineFailure(failure, ctxA, callA);
+    const second = takeToolPipelineFailure(failure, ctxB, callB);
+    expect(first?.call).toBe(callA);
+    expect(first?.metadata.envelope).toBe(envelopes[0]);
+    expect(first?.result).toBe(envelopes[0].structuredContent);
+    expect(second?.call).toBe(callB);
+    expect(second?.metadata.envelope).toBe(envelopes[1]);
+    expect(takeToolPipelineFailure(failure, ctxA, callA)).toBeUndefined();
+  });
+
+  it('never treats an error payload as a returned receipt when a before hook fails', async () => {
+    const failure = Object.assign(new Error('before failed'), { partialResult: { ok: true } });
+    const execute = vi.fn();
+    const runtime = createRuntime(createManifest(), execute);
+    const ctx = { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 };
+    const call = { id: 'before', name: 'code', args: { action: 'read' } };
+    const pipeline = new ToolExecutionPipeline().use({
+      name: 'before',
+      before: () => {
+        throw failure;
+      },
+    });
+    await expect(pipeline.execute(call, ctx)).rejects.toBe(failure);
+    expect(execute).not.toHaveBeenCalled();
+    expect(takeToolPipelineFailure(failure, ctx, call)).toBeUndefined();
+  });
+
+  it('retains the actual receipt when the final efficiency recorder fails', async () => {
+    const failure = new Error('efficiency observer failed');
+    const diagnostics = new DiagnosticsCollector();
+    const record = vi.spyOn(diagnostics, 'recordEfficiencyToolCall').mockImplementation(() => {
+      throw failure;
+    });
+    const runtime = createRuntime(createManifest(), async (request) => createEnvelope(request, 1));
+    const ctx = { runtime, loopCtx: createLoopContext(diagnostics), iteration: 1 };
+    const call = { id: 'efficiency', name: 'code', args: { action: 'read' } };
+    try {
+      await expect(new ToolExecutionPipeline().execute(call, ctx)).rejects.toBe(failure);
+      expect(takeToolPipelineFailure(failure, ctx, call)?.metadata.envelope).toMatchObject({
+        ok: true,
+      });
+    } finally {
+      record.mockRestore();
+    }
   });
 });

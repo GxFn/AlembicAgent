@@ -77,6 +77,8 @@ function runLint(
 
 describe('layer contract CLI', () => {
   it.each([
+    ['src/agent/runtime/toolReceipt.ts', 'src/agent/runtime/AgentRuntime.ts'],
+    ['src/agent/runtime/toolReceipt.ts', 'src/agent/runtime/LoopContext.ts'],
     ['src/agent/runtime/processEvents.ts', 'src/agent/runtime/AgentRuntime.ts'],
     ['src/agent/runtime/processEvents.ts', 'src/agent/runtime/LoopContext.ts'],
     ['src/agent/runtime/llmInput.ts', 'src/agent/runtime/AgentRuntime.ts'],

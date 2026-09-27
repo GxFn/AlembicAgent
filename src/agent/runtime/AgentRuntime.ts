@@ -42,7 +42,7 @@ import { observeSafely } from '#shared/observers.js';
 import { runOperation } from '#shared/operation.js';
 import { queryToolSchemas } from '#tools/catalog/schemaQuery.js';
 import type { ToolRuntimeCallContext } from '#tools/kernel/context.js';
-import { isToolResultEnvelope, type ToolScopeRelease } from '#tools/kernel/index.js';
+import type { ToolScopeRelease } from '#tools/kernel/index.js';
 import type { ToolActionAllowlist, ToolSchemaQueryResult } from '#tools/kernel/toolSchema.js';
 import { isToolActionAllowlist } from '#tools/kernel/toolSelection.js';
 import {
@@ -51,7 +51,6 @@ import {
 } from '../../tools/runtime/registry.js';
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
-import { limitToolResult } from '../context/ContextWindow.js';
 import {
   type EvidenceLedgerStore,
   seedLedgerFromJobSiblings,
@@ -111,15 +110,18 @@ import {
 import { allowsToolCallsUnderForcedNone } from './ProviderToolChoicePolicy.js';
 import {
   createAgentProcessEvent,
-  formatToolCallForDeveloperContent,
   isDeveloperVisibleReflectionNudge,
   type ProcessEventInput,
   projectLlmInputEvent,
   projectLlmOutput,
   projectSemanticNudgeEvent,
+  projectToolEndEvent,
+  projectToolStartEvent,
 } from './processEvents.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
+import { takeToolPipelineFailure } from './toolPipeline/engine.js';
+import { createToolReceipt, projectToolReceipt } from './toolReceipt.js';
 
 // ── Re-exports for backward compatibility ──
 export type {
@@ -1460,22 +1462,10 @@ export class AgentRuntime {
         return true;
       }
 
-      const toolStartProcessEvent = buildAgentProcessEvent(ctx, {
-        kind: 'tool',
-        title: `Tool call started: ${fc.name}`,
-        summary: `Calling tool ${fc.name}`,
-        content: {
-          role: 'developer',
-          text: formatToolCallForDeveloperContent(fc.name, fc.args),
-        },
-        correlationId: fc.id,
-        metadata: {
-          toolName: fc.name,
-          callId: fc.id,
-          source: inferFunctionCallSource(fc),
-          status: 'started',
-        },
-      });
+      const toolStartProcessEvent = buildAgentProcessEvent(
+        ctx,
+        projectToolStartEvent(fc, inferFunctionCallSource(fc))
+      );
       this.#emitProgress('tool_call', {
         tool: fc.name,
         args: fc.args,
@@ -1509,31 +1499,45 @@ export class AgentRuntime {
         ctx.diagnostics?.recordBlockedTool(fc.name, 'tool:execute:before hook rejected the call');
         this.logger.warn(`[AgentRuntime] tool blocked by hook: ${fc.name}`);
       }
-      const { result: toolResult, metadata } = hookAllowed
-        ? await this.#toolPipeline.execute(fc, {
-            runtime: this,
-            loopCtx: ctx,
-            iteration: ctx.iteration,
-          })
-        : {
-            result: { error: 'Tool call blocked by hook' },
-            metadata: {
-              cacheHit: false,
-              blocked: true,
-              isNew: false,
-              durationMs: 0,
-            } as ToolMetadata,
-          };
+      const pipelineContext = { runtime: this, loopCtx: ctx, iteration: ctx.iteration };
+      let execution: { result: unknown; metadata: ToolMetadata };
+      if (hookAllowed) {
+        try {
+          execution = await this.#toolPipeline.execute(fc, pipelineContext);
+        } catch (err: unknown) {
+          const failed = takeToolPipelineFailure(err, pipelineContext, fc);
+          if (failed) {
+            // 只有本次管道确认的回执可进入partial历史；不重跑after、不通知成功或伪造轮次完成。
+            const entry = createToolReceipt(fc, failed.result, failed.metadata);
+            ctx.toolCalls.push(entry);
+            this.toolCallHistory.push(entry);
+            observeSafely(
+              () =>
+                ctx.diagnostics?.warn({
+                  code: 'TOOL_POSTPROCESSING_FAILED',
+                  tool: fc.name,
+                  message:
+                    'Tool returned a receipt, but postprocessing failed; receipt retained and run stopped.',
+                }),
+              () =>
+                this.logger.warn(
+                  '[AgentRuntime] postprocessing diagnostic failed; confirmed receipt retained'
+                )
+            );
+          }
+          throw err instanceof Error ? err : new Error(String(err), { cause: err });
+        }
+      } else {
+        execution = {
+          result: { error: 'Tool call blocked by hook' },
+          metadata: { cacheHit: false, blocked: true, isNew: false, durationMs: 0 },
+        };
+      }
+      const { result: toolResult, metadata } = execution;
 
       const durationMs = metadata.durationMs;
-      const envelope = (metadata as ToolMetadata).envelope;
-      const toolEntry: ToolCallEntry = {
-        tool: fc.name,
-        args: fc.args,
-        result: toolResult,
-        envelope,
-        durationMs,
-      };
+      const envelope = metadata.envelope;
+      const toolEntry = createToolReceipt(fc, toolResult, metadata);
       (ctx.toolCalls as ToolCallEntry[]).push(toolEntry);
       this.toolCallHistory.push(toolEntry);
 
@@ -1591,19 +1595,9 @@ export class AgentRuntime {
         maxChars: Math.min(toolBudget.perToolMaxChars, remaining.maxChars),
         maxMatches: toolBudget.perToolMaxMatches,
       };
-      const rawForLimit = envelope || toolResult;
-      let resultStr: string;
-      if (isToolResultEnvelope(rawForLimit)) {
-        resultStr = limitToolResult(fc.name, (rawForLimit as { text: string }).text, toolQuota);
-      } else {
-        resultStr = limitToolResult(fc.name, rawForLimit, toolQuota);
-      }
-      if (
-        fc.name === 'code' &&
-        fc.args.action === 'read' &&
-        envelope &&
-        resultStr !== envelope.text
-      ) {
+      const projection = projectToolReceipt(toolEntry, toolQuota);
+      let resultStr = projection.text;
+      if (projection.invalidatesReadView) {
         messages.invalidateReadView();
         ctx.diagnostics?.warn({
           code: 'tool_read_view_invalidated',
@@ -1615,34 +1609,23 @@ export class AgentRuntime {
       budgetCtrl.recordToolCharsUsed(resultStr.length);
 
       // 提交去重: pipeline 中间件已标记 metadata
-      const dedupMessage = (metadata as ToolMetadata).dedupMessage;
+      const dedupMessage = metadata.dedupMessage;
       if (dedupMessage) {
         resultStr = dedupMessage;
-      } else if ((metadata as ToolMetadata).isSubmit) {
+      } else if (metadata.isSubmit) {
         roundSubmitCount++;
       }
 
-      const toolEndProcessEvent = buildAgentProcessEvent(ctx, {
-        kind: 'tool',
-        title: `Tool call ${toolSucceeded ? 'completed' : 'failed'}: ${fc.name}`,
-        summary: `${fc.name} ${toolSucceeded ? 'completed' : 'failed'} in ${durationMs}ms`,
-        content: {
-          role: 'tool',
-          text: redactDeveloperText(resultStr),
-        },
-        correlationId: fc.id,
-        severity: toolSucceeded ? 'success' : 'error',
-        metadata: {
-          toolName: fc.name,
-          callId: fc.id,
-          status: toolSucceeded ? 'ok' : 'error',
-          durationMs,
-          resultSize: resultStr.length,
-          cacheHit: metadata.cacheHit,
-          cacheMiss: (metadata as ToolMetadata).cacheMiss === true,
-          source: inferFunctionCallSource(fc),
-        },
-      });
+      const toolEndProcessEvent = buildAgentProcessEvent(
+        ctx,
+        projectToolEndEvent(
+          fc,
+          { durationMs, cacheHit: metadata.cacheHit, cacheMiss: metadata.cacheMiss },
+          resultStr,
+          toolSucceeded,
+          inferFunctionCallSource(fc)
+        )
+      );
 
       // 进度回调 (tool_end 需要 resultStr.length)
       this.#emitProgress('tool_end', {
