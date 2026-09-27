@@ -38,7 +38,9 @@ Agent 剥除无法证明的 coreCode 后，继续交给 Core 检查保留的来�
 
 显式 `mode: full` 优先选择旧宿主可用的完整投影方法；仅有 mixed 方法时保留兼容结果，并记录 `legacy_mode_degraded`。默认和 mixed 查询保持原探测顺序。降级日志失败不改变结果，各条路径仍按调用前的 selection 收窄权限。
 
-查询前固定 selection 的自有快照，传给宿主的是独立副本；宿主或兼容通知修改入参不能扩大本次授权。查询端口保持同步：Promise 结果明确拒绝，并观察其迟到失败，避免未处理拒绝。兼容通知失败只记录 `legacy_diagnostic_failed`。泛型目录的 schema 参数投影也独立于注册定义；工具 handler 与活跃 runtime 资源保留原引用。
+查询前固定 selection 的自有快照，传给宿主的是独立副本；宿主或兼容通知修改入参不能扩大本次授权。 `schemaQuery.ts` 内部分别处理现代结果校验、旧方法选择，并共用最后的权限投影；两类目录的模型覆盖、lazy 状态和内置可用性仍由各自实现持有。查询端口保持同步：Promise 结果明确拒绝，并观察其迟到失败，避免未处理拒绝。兼容通知失败只记录 `legacy_diagnostic_failed`。泛型目录的 schema 参数投影也独立于注册定义；工具 handler 与活跃 runtime 资源保留原引用。
+
+宿主返回的 schema 成员、name/parameters、有效动作值和不可用原因先读取为本地声明快照，再按原形状规则校验。稀疏数组按含有 undefined 条目拒绝，不静默丢弃；变化 getter 不能在校验后把禁用动作改成全开放或把对象参数换成字符串。仅在选中工具后展开其描述和扩展字段，函数 metadata 与活跃资源引用保留，不深克隆；旧宿主省略 description 的兼容行为不变。旧查询的 model/firstRound 使用进入接口时的声明快照；选中工具的扩展 getter 在本次投影时取值，不承诺延迟到后续消费者才读取。这不是完整 JSON Schema 语义验证。
 
 Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiModelId`，包括模型名自身的后续冒号。模型覆盖按原声明顺序匹配这两个明确名称。旧目录直接调用只按传入 model 字符串匹配，不擅自拆分 `qwen2:latest` 这类裸模型名；catalog 不持有另一份 provider 注册表。
 

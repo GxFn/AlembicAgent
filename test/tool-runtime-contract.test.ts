@@ -8,7 +8,6 @@ import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   Evolution,
-  RuntimeCapabilityCatalog,
   SearchCache,
   ToolRouter,
   ToolRouterAdapter,
@@ -543,59 +542,6 @@ describe('tool runtime adapters and public contracts', () => {
     expect(result.ok).toBe(false);
     expect(result.status).toBe('aborted');
   });
-  it('exports capability catalog projections from the runtime registry', () => {
-    const catalog = new RuntimeCapabilityCatalog();
-    const schemas = catalog.toToolSchemas(['meta']);
-
-    expect(catalog.has('meta')).toBe(true);
-    expect(schemas).toHaveLength(1);
-    expect(schemas[0]?.name).toBe('meta');
-    expect(schemas[0]?.parameters).toMatchObject({
-      type: 'object',
-    });
-
-    catalog.markExpanded('meta');
-    expect(catalog.expandedCount).toBe(1);
-  });
-
-  it('projects action-level allowlists into provider-visible schemas', () => {
-    const catalog = new RuntimeCapabilityCatalog();
-    const schemas = catalog.toToolSchemasForActions({
-      knowledge: ['submit'],
-      meta: ['review'],
-    });
-
-    const knowledge = schemas.find((schema) => schema.name === 'knowledge');
-    const meta = schemas.find((schema) => schema.name === 'meta');
-    const knowledgeParams = knowledge?.parameters as {
-      properties?: {
-        action?: { enum?: string[] };
-        params?: { required?: string[]; properties?: Record<string, unknown> };
-      };
-    };
-    const metaParams = meta?.parameters as {
-      properties?: { action?: { enum?: string[] } };
-    };
-
-    expect(knowledge?.description).not.toContain('detail');
-    expect(knowledge?.description).not.toContain('manage');
-    expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
-    expect(knowledgeParams.properties?.params?.required).toEqual([
-      'title',
-      'description',
-      'content',
-      'kind',
-      'trigger',
-      'whenClause',
-      'doClause',
-      'reasoning',
-    ]);
-    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('description');
-    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('content');
-    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('reasoning');
-    expect(metaParams.properties?.action?.enum).toEqual(['review']);
-  });
-
   it('projects Evolution terminal access with a read-only command allowlist', () => {
     const capability = new Evolution().toDef();
     const router = new ToolRouter({ capability });

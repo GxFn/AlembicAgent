@@ -17,8 +17,7 @@ import type {
   ToolSelection,
 } from '../src/tools/kernel/toolSchema.js';
 import { intersectToolActions, isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
-import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
-import { getActionNames } from '../src/tools/runtime/index.js';
+import { getActionNames, RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 import { ToolRouter } from '../src/tools/runtime/router.js';
 import { createToolRegistryView } from '../src/tools/runtime/selection.js';
@@ -93,6 +92,59 @@ describe('tool schema selection', () => {
 });
 
 describe('runtime schema query', () => {
+  it('exports capability catalog projections from the runtime registry', () => {
+    const catalog = new RuntimeCapabilityCatalog();
+    const schemas = catalog.toToolSchemas(['meta']);
+
+    expect(catalog.has('meta')).toBe(true);
+    expect(schemas).toHaveLength(1);
+    expect(schemas[0]?.name).toBe('meta');
+    expect(schemas[0]?.parameters).toMatchObject({
+      type: 'object',
+    });
+
+    catalog.markExpanded('meta');
+    expect(catalog.expandedCount).toBe(1);
+  });
+
+  it('projects action-level allowlists into provider-visible schemas', () => {
+    const catalog = new RuntimeCapabilityCatalog();
+    const schemas = catalog.toToolSchemasForActions({
+      knowledge: ['submit'],
+      meta: ['review'],
+    });
+
+    const knowledge = schemas.find((schema) => schema.name === 'knowledge');
+    const meta = schemas.find((schema) => schema.name === 'meta');
+    const knowledgeParams = knowledge?.parameters as {
+      properties?: {
+        action?: { enum?: string[] };
+        params?: { required?: string[]; properties?: Record<string, unknown> };
+      };
+    };
+    const metaParams = meta?.parameters as {
+      properties?: { action?: { enum?: string[] } };
+    };
+
+    expect(knowledge?.description).not.toContain('detail');
+    expect(knowledge?.description).not.toContain('manage');
+    expect(knowledgeParams.properties?.action?.enum).toEqual(['submit']);
+    expect(knowledgeParams.properties?.params?.required).toEqual([
+      'title',
+      'description',
+      'content',
+      'kind',
+      'trigger',
+      'whenClause',
+      'doClause',
+      'reasoning',
+    ]);
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('description');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('content');
+    expect(knowledgeParams.properties?.params?.properties).toHaveProperty('reasoning');
+    expect(metaParams.properties?.action?.enum).toEqual(['review']);
+  });
+
   it('creates an immutable view while preserving the actual handler and global schema', () => {
     const original = TOOL_REGISTRY.knowledge.actions.manage;
     const view = createToolRegistryView(
@@ -442,6 +494,139 @@ function runtimeWith(
 }
 
 describe('runtime schema query port', () => {
+  it.each([
+    { port: 'modern', field: 'description' },
+    { port: 'legacy', field: 'description' },
+    { port: 'modern', field: 'extension' },
+    { port: 'legacy', field: 'extension' },
+  ])('does not read an unselected $port schema $field getter', ({ port, field }) => {
+    const extension = () => 'live metadata';
+    const code = { name: 'code', parameters: { type: 'object' }, extension };
+    const graph = { name: 'graph', parameters: { type: 'object' } };
+    const unavailableField = vi.fn(() => {
+      throw new Error('Unselected projection accessed');
+    });
+    Object.defineProperty(graph, field, { enumerable: true, get: unavailableField });
+    const schemas = [code, graph];
+    const catalog =
+      port === 'modern'
+        ? { querySchemas: () => ({ schemas, allowedTools: { code: null } }) }
+        : { toToolSchemas: () => schemas };
+    const result = queryToolSchemas(catalog, { selection: ['code'] }, () => undefined);
+    expect(unavailableField).not.toHaveBeenCalled();
+    expect(result.schemas).toEqual([code]);
+    expect(result.schemas[0].extension).toBe(extension);
+    expect(result.schemas[0]).not.toHaveProperty('description');
+  });
+
+  it.each([
+    false,
+    true,
+  ])('rejects malformed unavailable reasons including sparse=%s before dispatch', async (sparse) => {
+    const unavailable: unknown[] = [{ tool: 'graph', reason: 'Port is missing' }];
+    if (sparse) {
+      unavailable.length = 2;
+    } else {
+      unavailable.push(undefined);
+    }
+    const { runtime, execute, chatWithTools } = runtimeWith({
+      querySchemas: () => ({
+        schemas: [{ name: 'code', parameters: { type: 'object' } }],
+        allowedTools: { code: ['read'] },
+        unavailable,
+      }),
+    });
+    await expect(runtime.reactLoop('invalid unavailable entries')).rejects.toThrow(
+      'Invalid ToolSchemaQueryPort unavailable reasons'
+    );
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { port: 'modern', sparse: false },
+    { port: 'modern', sparse: true },
+    { port: 'legacy', sparse: false },
+    { port: 'legacy', sparse: true },
+  ])('rejects malformed $port schema entries including sparse=$sparse before dispatch', async ({
+    port,
+    sparse,
+  }) => {
+    const schemas: unknown[] = [{ name: 'code', parameters: { type: 'object' } }];
+    if (sparse) {
+      schemas.length = 2;
+    } else {
+      schemas.push(undefined);
+    }
+    const catalog =
+      port === 'modern'
+        ? { querySchemas: () => ({ schemas, allowedTools: { code: ['read'] } }) }
+        : { toToolSchemas: () => schemas };
+    const { runtime, execute, chatWithTools } = runtimeWith(catalog);
+    await expect(runtime.reactLoop('reject malformed schema list')).rejects.toThrow(
+      port === 'modern' ? 'Invalid ToolSchemaQueryPort result' : 'Invalid legacy schema result'
+    );
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'schemas',
+    'name',
+    'parameters',
+    'allowed-actions',
+  ] as const)('validates and consumes one snapshot of the modern %s field', async (field) => {
+    const parameters = { type: 'object', properties: { action: { enum: ['read'] } } };
+    const schema = { name: 'code', description: 'read fixture', parameters };
+    let reads = 0;
+    const result: Record<string, unknown> = { schemas: [schema], allowedTools: { code: ['read'] } };
+    if (field === 'schemas') {
+      Object.defineProperty(result, 'schemas', {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return reads === 1 ? [schema] : [{ ...schema, parameters: 'invalid-after-validation' }];
+        },
+      });
+    } else if (field === 'allowed-actions') {
+      result.allowedTools = {
+        get code() {
+          reads++;
+          return reads === 1 ? [] : null;
+        },
+      };
+    } else {
+      Object.defineProperty(schema, field, {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return reads === 1
+            ? field === 'name'
+              ? 'code'
+              : parameters
+            : field === 'name'
+              ? 'graph'
+              : 'invalid-after-validation';
+        },
+      });
+    }
+    const { runtime, execute, chatWithTools } = runtimeWith({ querySchemas: () => result });
+    if (field !== 'allowed-actions') {
+      chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
+    }
+    await runtime.reactLoop('stable validated tool projection');
+    expect(reads).toBe(1);
+    expect(execute).not.toHaveBeenCalled();
+    if (field === 'allowed-actions') {
+      // Runtime 省略无工具请求的字段；首次空动作快照必须保持禁用。
+      expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toBeUndefined();
+    } else {
+      expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual([
+        { name: 'code', description: 'read fixture', parameters },
+      ]);
+    }
+  });
+
   it.each<{
     selection: ToolSelection;
     model?: string;

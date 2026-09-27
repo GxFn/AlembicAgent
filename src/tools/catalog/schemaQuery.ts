@@ -6,6 +6,7 @@ import type {
   ToolSchemaProjection,
   ToolSchemaQuery,
   ToolSchemaQueryResult,
+  ToolSelection,
 } from '#tools/kernel/toolSchema.js';
 import {
   intersectToolActions,
@@ -33,6 +34,12 @@ interface LegacySchemaCatalog {
   toToolSchemas?(ids?: readonly string[] | null): ToolSchemaProjection[];
 }
 
+interface QueriedSchema {
+  name: string;
+  parameters: Record<string, unknown>;
+  source: Record<string, unknown>;
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -49,13 +56,76 @@ function assertSynchronousResult(value: unknown, method: string): void {
   throw new Error(`Schema query method ${method} must return synchronously`);
 }
 
-function isSchemas(value: unknown): value is ToolSchemaProjection[] {
-  return (
-    Array.isArray(value) &&
-    value.every(
-      (schema) => record(schema) && typeof schema.name === 'string' && record(schema.parameters)
-    )
+function readSchemas(value: unknown, error: string): QueriedSchema[] {
+  if (!Array.isArray(value)) {
+    throw new Error(error);
+  }
+  // Array.from 固定成员并保留 holes 的 undefined 事实，不能用 every 跳过坏条目。
+  return Array.from(value, (schema: unknown) => {
+    if (!record(schema)) {
+      throw new Error(error);
+    }
+    // JS 宿主可能用 getter 生成字段；后续必须消费已校验值，不能再次读取原条目。
+    // 此处只读取既有校验字段；未选工具的 description/metadata getter 不参与查询。
+    const { name, parameters } = schema;
+    if (typeof name !== 'string' || !record(parameters)) {
+      throw new Error(error);
+    }
+    return { name, parameters, source: schema };
+  });
+}
+
+function readModernResult(value: unknown): Omit<ToolSchemaQueryResult, 'schemas'> & {
+  schemas: QueriedSchema[];
+} {
+  assertSynchronousResult(value, 'querySchemas');
+  if (!record(value)) {
+    throw new Error('Invalid ToolSchemaQueryPort result');
+  }
+  const schemas = readSchemas(value.schemas, 'Invalid ToolSchemaQueryPort result');
+  const hostActions = value.allowedTools;
+  if (!record(hostActions)) {
+    throw new Error('Invalid ToolSchemaQueryPort result');
+  }
+  // 在类型校验前捕获动作值和数组成员；重复校验原 getter 会把 [] 读成后来的 null 全开放。
+  const allowedTools = Object.fromEntries(
+    Object.entries(hostActions).map(([tool, actions]) => [
+      tool,
+      Array.isArray(actions) ? Array.from(actions) : actions,
+    ])
   );
+  if (!isToolActionAllowlist(allowedTools)) {
+    throw new Error('Invalid ToolSchemaQueryPort result');
+  }
+  const unavailable = value.unavailable;
+  if (unavailable === undefined) {
+    return { schemas, allowedTools };
+  }
+  if (!Array.isArray(unavailable)) {
+    throw new Error('Invalid ToolSchemaQueryPort unavailable reasons');
+  }
+  const reasons = Array.from(unavailable, (entry: unknown) => {
+    if (!record(entry)) {
+      throw new Error('Invalid ToolSchemaQueryPort unavailable reasons');
+    }
+    const { tool, reason, action, operation, ...extensions } = entry;
+    if (
+      typeof tool !== 'string' ||
+      typeof reason !== 'string' ||
+      (action !== undefined && typeof action !== 'string') ||
+      (operation !== undefined && typeof operation !== 'string')
+    ) {
+      throw new Error('Invalid ToolSchemaQueryPort unavailable reasons');
+    }
+    return {
+      ...extensions,
+      tool,
+      reason,
+      ...('action' in entry ? { action } : {}),
+      ...('operation' in entry ? { operation } : {}),
+    };
+  });
+  return { schemas, allowedTools, unavailable: reasons };
 }
 
 function narrowSchemas(
@@ -63,7 +133,6 @@ function narrowSchemas(
   actions: ToolActionAllowlist
 ): ToolSchemaProjection[] {
   return schemas
-    .filter((schema) => Object.hasOwn(actions, schema.name))
     .map((schema) => {
       const allowed = actions[schema.name];
       const properties = schema.parameters.properties;
@@ -98,6 +167,42 @@ function narrowSchemas(
     });
 }
 
+/** 两类端口共用最终投影；旧端口没有额外有效动作集，仍必须服从调用前的 selection。 */
+function projectQueryResult(
+  selection: ToolSelection,
+  schemas: QueriedSchema[],
+  hostActions?: ToolActionAllowlist
+): ToolSchemaQueryResult {
+  const requested = selectToolActions(
+    selection,
+    schemas.map((schema) => schema.name)
+  );
+  const allowedTools = hostActions ? intersectToolActions(requested, hostActions) : requested;
+  const selected = schemas
+    .filter(({ name }) => Object.hasOwn(allowedTools, name))
+    .map(({ name, parameters, source }) => {
+      // 只展开实际入选的声明，已校验字段不再触碰原 getter；扩展值保持原引用。
+      const projection = Object.fromEntries(
+        Object.keys(source)
+          .filter((key) => key !== 'name' && key !== 'parameters')
+          .map((key) => [key, source[key]])
+      );
+      if (!Object.hasOwn(projection, 'description') && 'description' in source) {
+        projection.description = source.description;
+      }
+      // 旧宿主允许省略 description；不在本次声明快照中收紧这个兼容合同。
+      return { ...projection, name, parameters } as ToolSchemaProjection;
+    });
+  const narrowed = narrowSchemas(selected, allowedTools);
+  return {
+    schemas: narrowed,
+    allowedTools: selectToolActions(
+      allowedTools,
+      narrowed.map((schema) => schema.name)
+    ),
+  };
+}
+
 export function queryToolSchemas(
   catalog: unknown,
   query: ToolSchemaQuery,
@@ -111,62 +216,38 @@ export function queryToolSchemas(
     return { schemas: [], allowedTools: {} };
   }
   if (typeof catalog.querySchemas === 'function') {
-    const result: unknown = catalog.querySchemas(portQuery);
-    assertSynchronousResult(result, 'querySchemas');
-    if (
-      !record(result) ||
-      !isSchemas(result.schemas) ||
-      !isToolActionAllowlist(result.allowedTools)
-    ) {
-      throw new Error('Invalid ToolSchemaQueryPort result');
-    }
-    if (
-      result.unavailable !== undefined &&
-      (!Array.isArray(result.unavailable) ||
-        !result.unavailable.every(
-          (entry) =>
-            record(entry) &&
-            typeof entry.tool === 'string' &&
-            typeof entry.reason === 'string' &&
-            (entry.action === undefined || typeof entry.action === 'string') &&
-            (entry.operation === undefined || typeof entry.operation === 'string')
-        ))
-    ) {
-      throw new Error('Invalid ToolSchemaQueryPort unavailable reasons');
-    }
-    const requested = selectToolActions(
-      selection,
-      result.schemas.map((schema) => schema.name)
-    );
-    const allowedTools = intersectToolActions(requested, result.allowedTools);
-    const schemas = narrowSchemas(result.schemas, allowedTools);
+    const result = readModernResult(catalog.querySchemas(portQuery));
     return {
-      schemas,
-      allowedTools: selectToolActions(
-        allowedTools,
-        schemas.map((schema) => schema.name)
-      ),
-      ...(Array.isArray(result.unavailable)
-        ? { unavailable: result.unavailable as ToolSchemaQueryResult['unavailable'] }
-        : {}),
+      ...projectQueryResult(selection, result.schemas, result.allowedTools),
+      ...(result.unavailable !== undefined ? { unavailable: result.unavailable } : {}),
     };
   }
+  const schemas = queryLegacySchemas(catalog, portQuery, onLegacy);
+  return schemas === null
+    ? { schemas: [], allowedTools: {} }
+    : projectQueryResult(selection, schemas);
+}
 
-  const legacy = catalog as LegacySchemaCatalog;
+/** 保持旧端口条件优先级与 this；不尝试用另一个旧方法掩盖已选端口的失败。 */
+function queryLegacySchemas(
+  legacy: LegacySchemaCatalog,
+  query: ToolSchemaQuery,
+  onLegacy: (method: string) => void
+): QueriedSchema[] | null {
   const actions =
-    portQuery.selection && !Array.isArray(portQuery.selection)
-      ? (portQuery.selection as ToolActionAllowlist)
+    query.selection && !Array.isArray(query.selection)
+      ? (query.selection as ToolActionAllowlist)
       : undefined;
-  const ids = Array.isArray(portQuery.selection)
-    ? portQuery.selection
+  const ids = Array.isArray(query.selection)
+    ? query.selection
     : actions
       ? Object.keys(actions).filter((id) => actions[id] == null || (actions[id]?.length ?? 0) > 0)
       : null;
-  let schemas: ToolSchemaProjection[];
+  let value: unknown;
   let method: string;
-  // full是显式投影要求；有可用完整端口时不能因旧方法探测顺序而选中mixed。
-  // 只有mixed的旧宿主继续可用，但必须报告降级；默认/mixed保留原有优先级。
-  const fullRequested = portQuery.mode === 'full';
+  // full 是显式投影要求；有可用完整端口时不能因旧方法探测顺序而选中 mixed。
+  // 只有 mixed 的旧宿主继续可用，但必须报告降级；默认/mixed 保留原有优先级。
+  const fullRequested = query.mode === 'full';
   const preferMixed =
     !fullRequested ||
     !(
@@ -176,23 +257,23 @@ export function queryToolSchemas(
     );
   if (preferMixed && typeof legacy.toMixedSchemasForActions === 'function' && actions) {
     method = 'toMixedSchemasForActions';
-    schemas = legacy.toMixedSchemasForActions(actions, query.model, query.firstRound);
+    value = legacy.toMixedSchemasForActions(actions, query.model, query.firstRound);
   } else if (typeof legacy.toToolSchemasForActions === 'function' && actions) {
     method = 'toToolSchemasForActions';
-    schemas = legacy.toToolSchemasForActions(actions, query.model);
+    value = legacy.toToolSchemasForActions(actions, query.model);
   } else if (preferMixed && typeof legacy.toMixedSchemas === 'function') {
     method = 'toMixedSchemas';
-    schemas = legacy.toMixedSchemas(ids, query.model, query.firstRound);
+    value = legacy.toMixedSchemas(ids, query.model, query.firstRound);
   } else if (query.model && typeof legacy.toToolSchemasForModel === 'function') {
     method = 'toToolSchemasForModel';
-    schemas = legacy.toToolSchemasForModel(ids, query.model);
+    value = legacy.toToolSchemasForModel(ids, query.model);
   } else if (typeof legacy.toToolSchemas === 'function') {
     method = 'toToolSchemas';
-    schemas = legacy.toToolSchemas(ids);
+    value = legacy.toToolSchemas(ids);
   } else {
-    return { schemas: [], allowedTools: {} };
+    return null;
   }
-  assertSynchronousResult(schemas, method);
+  assertSynchronousResult(value, method);
   // 兼容路径通知只做观察；日志失败不能改变查询结果，也不能逃逸为未处理拒绝。
   observeSafely(
     () => onLegacy(method),
@@ -201,11 +282,8 @@ export function queryToolSchemas(
         '[ToolSchemaQuery] legacy_diagnostic_failed; query result and authorization retained'
       )
   );
-  if (!isSchemas(schemas)) {
-    throw new Error(`Invalid legacy schema result from ${method}`);
-  }
+  const schemas = readSchemas(value, `Invalid legacy schema result from ${method}`);
   if (fullRequested && method.startsWith('toMixed')) {
-    // 诊断不参与准入；日志失败不能改变下方仍按原始selection收窄的结果。
     observeSafely(
       () =>
         Logger.getInstance().warn(
@@ -214,16 +292,5 @@ export function queryToolSchemas(
       () => undefined
     );
   }
-  const allowedTools = selectToolActions(
-    selection,
-    schemas.map((schema) => schema.name)
-  );
-  const narrowed = narrowSchemas(schemas, allowedTools);
-  return {
-    schemas: narrowed,
-    allowedTools: selectToolActions(
-      allowedTools,
-      narrowed.map((schema) => schema.name)
-    ),
-  };
+  return schemas;
 }
