@@ -23,6 +23,7 @@
   "blessedImports": [],
   "fileBoundaries": {
     "requiredUnder": [
+      "src/agent/evidence/loopLedger.ts",
       "src/agent/runtime/toolReceipt.ts",
       "src/agent/runtime/llmInput.ts",
       "src/agent/runtime/processEvents.ts",
@@ -62,6 +63,11 @@
       "src/tools/runtime/compressor/"
     ],
     "runtimeImports": {
+      "src/agent/evidence/loopLedger.ts": [
+        "src/shared/observers.ts",
+        "src/agent/evidence/EvidenceLedgerStore.ts",
+        "src/agent/evidence/ProductionEvidenceLedgerAuthority.ts"
+      ],
       "src/agent/runtime/toolReceipt.ts": [
         "src/tools/kernel/index.ts",
         "src/agent/context/ContextWindow.ts"

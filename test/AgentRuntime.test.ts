@@ -239,33 +239,70 @@ describe('runtime loop boundaries', () => {
 });
 
 describe('agent runtime forced summary suppression', () => {
-  it('uses the production ledger authority coordinate gate for dimension runs', async () => {
+  it.each([
+    'invalid-control',
+    'invalid-warning',
+    'valid-schema-info',
+    'valid-seed-info',
+  ])('preserves the production ledger initialization result with %s', async (mode) => {
+    vi.useFakeTimers();
     const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-ledger-'));
-    const chatWithTools = vi.fn();
+    const chatWithTools = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    const releaseScope = vi.fn();
     const runtime = new AgentRuntime({
       id: 'session:agent-runtime-ledger',
       dataRoot,
       jobId: 'job:agent-runtime-ledger',
       aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
       toolRegistry: { getManifest: () => null } as never,
-      toolRouter: { execute: vi.fn() } as never,
+      toolRouter: { execute: vi.fn(), releaseScope } as never,
       capabilities: [],
       strategy: { name: 'unused', execute: vi.fn() } as never,
     });
+    runtime.logger = {
+      info: (message) => {
+        if (
+          (mode === 'valid-schema-info' &&
+            String(message).includes('dimension submit schema variant active')) ||
+          (mode === 'valid-seed-info' &&
+            String(message).includes('[EvidenceLedger] synthesis seeded'))
+        ) {
+          throw new Error('Initialization info observer failed');
+        }
+      },
+      warn: () => {
+        if (mode === 'invalid-warning') {
+          throw new Error('Initialization warning observer failed');
+        }
+      },
+    };
+    const invalid = mode.startsWith('invalid');
     try {
-      await expect(
-        runtime.reactLoop('reject escaped ledger dimension', {
-          source: 'system',
-          sharedState: {
-            _bootstrapSessionId: 'job:agent-runtime-ledger',
-            _dimensionMeta: { id: '../escaped-dimension' },
+      const pending = runtime.reactLoop('initialize dimension', {
+        source: 'system',
+        sharedState: {
+          _bootstrapSessionId: 'job:agent-runtime-ledger',
+          _dimensionMeta: {
+            id: invalid
+              ? '../escaped-dimension'
+              : mode === 'valid-seed-info'
+                ? 'cross-dimension-synthesis'
+                : 'valid-dimension',
           },
-          budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
-        })
-      ).rejects.toThrow('ALEMBIC_AGENT_EVIDENCE_LEDGER_COORDINATES_INVALID');
-      expect(chatWithTools).not.toHaveBeenCalled();
+        },
+        budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+      });
+      if (invalid) {
+        await expect(pending).rejects.toThrow('ALEMBIC_AGENT_EVIDENCE_LEDGER_COORDINATES_INVALID');
+        expect(chatWithTools).not.toHaveBeenCalled();
+      } else {
+        expect((await pending).reply).toBe('done');
+        expect(chatWithTools).toHaveBeenCalledOnce();
+      }
+      expect(releaseScope).toHaveBeenCalledWith({ runId: expect.any(String) });
     } finally {
       rmSync(dataRoot, { force: true, recursive: true });
+      vi.useRealTimers();
     }
   });
 

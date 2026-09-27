@@ -64,6 +64,200 @@ async function flushPipelineTasks() {
 
 describe('Runtime operation boundary', () => {
   it.each([
+    'normal',
+    'postprocessing',
+  ] as const)('does not retry trace closure or replace the original %s error', async (mode) => {
+    vi.useFakeTimers();
+    const trace = new ActiveContext();
+    const memory = new MemoryCoordinator();
+    const primaryFailure = new Error('Postprocessing failed');
+    const closeFailure = new Error('Trace closure failed');
+    const close = vi.spyOn(trace, 'endRound').mockImplementation(() => {
+      throw closeFailure;
+    });
+    vi.spyOn(memory, 'recordObservation').mockImplementation(() => {
+      throw primaryFailure;
+    });
+    const chat = vi
+      .fn()
+      .mockResolvedValue(mode === 'normal' ? { text: 'done', functionCalls: [] } : toolReply);
+    const { runtime, execute } = toolHarness(chat);
+    const finalized = vi.fn();
+    runtime.hookSystem.on('agent:finalize', finalized);
+    runtime.logger = {
+      info: () => undefined,
+      warn: () => {
+        throw new Error('Cleanup diagnostic failed');
+      },
+    };
+    try {
+      await expect(
+        runtime.reactLoop('close round', { trace, memoryCoordinator: memory })
+      ).rejects.toBe(mode === 'normal' ? closeFailure : primaryFailure);
+      expect(close).toHaveBeenCalledOnce();
+      expect(chat).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledTimes(mode === 'normal' ? 0 : 1);
+      expect(runtime.toolCallHistory).toHaveLength(mode === 'normal' ? 0 : 1);
+      expect(finalized).not.toHaveBeenCalled();
+    } finally {
+      memory.dispose();
+    }
+  });
+
+  it('closes a pre-exit trace round before finalization observers run', async () => {
+    vi.useFakeTimers();
+    const trace = new ActiveContext();
+    const chat = vi.fn();
+    const { runtime } = harness(chat);
+    const controller = new AbortController();
+    controller.abort();
+    let observed: number | null | undefined;
+    runtime.hookSystem.on('agent:finalize', () => {
+      observed = trace.getCurrentIteration();
+    });
+    await runtime.reactLoop('stop', { source: 'system', trace, abortSignal: controller.signal });
+    expect(chat).not.toHaveBeenCalled();
+    expect(observed).toBeNull();
+    expect(trace.getCurrentIteration()).toBeNull();
+    expect(trace.toJSON().rounds).toHaveLength(1);
+  });
+
+  it('closes every empty-response retry round before forced summary', async () => {
+    vi.useFakeTimers();
+    const trace = new ActiveContext();
+    let observed: number | null | undefined;
+    const chat = vi
+      .fn()
+      .mockResolvedValueOnce({ text: '', functionCalls: [] })
+      .mockResolvedValueOnce({ text: '', functionCalls: [] })
+      .mockResolvedValueOnce({ text: '', functionCalls: [] })
+      .mockImplementationOnce(async () => {
+        observed = trace.getCurrentIteration();
+        return { text: 'summary retained', functionCalls: [] };
+      });
+    const { runtime } = harness(chat, 8);
+    const pending = runtime.reactLoop('empty retry', {
+      source: 'system',
+      trace,
+      budgetOverride: { maxIterations: 8, timeoutMs: 10_000 },
+    });
+    await vi.runAllTimersAsync();
+    expect((await pending).reply).toBe('summary retained');
+    expect(chat).toHaveBeenCalledTimes(4);
+    expect(observed).toBeNull();
+    expect(trace.getCurrentIteration()).toBeNull();
+    expect(trace.toJSON().rounds).toHaveLength(3);
+  });
+
+  it.each([
+    'abort',
+    'timeout',
+    'complete',
+  ] as const)('reports a scan %s with its real terminal flags and confirmed receipts', async (mode) => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const trace = new ActiveContext();
+    const chat = vi.fn().mockResolvedValue(toolReply);
+    const { runtime, execute } = toolHarness(chat);
+    const originalExecute = execute.getMockImplementation();
+    if (!originalExecute) {
+      throw new Error('Tool receipt fixture must resolve');
+    }
+    execute.mockImplementation(async () => {
+      const receipt = await originalExecute();
+      if (mode === 'timeout') {
+        vi.setSystemTime(startedAt + 11);
+      }
+      return receipt;
+    });
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      {
+        pipelineType: 'scan',
+        maxIterations: mode === 'complete' ? 2 : 8,
+        maxSubmits: 10,
+        softSubmitLimit: 10,
+      }
+    );
+    if (!tracker) {
+      throw new Error('Scan tracker fixture must resolve');
+    }
+    const controller = new AbortController();
+    if (mode === 'abort') {
+      controller.abort();
+    }
+    const result = await runtime.reactLoop('scan', {
+      source: 'system',
+      trace,
+      tracker,
+      toolChoiceOverride: 'auto',
+      abortSignal: controller.signal,
+      budgetOverride: { maxIterations: 8, timeoutMs: 10 },
+    });
+    expect(chat).toHaveBeenCalledTimes(mode === 'abort' ? 0 : mode === 'complete' ? 2 : 1);
+    expect(execute).toHaveBeenCalledTimes(mode === 'abort' ? 0 : 1);
+    expect(result.toolCalls).toHaveLength(mode === 'abort' ? 0 : 1);
+    expect(trace.getCurrentIteration()).toBeNull();
+    if (mode === 'complete') {
+      expect(result.reply).toBe('[scan complete: 0 recipes collected]');
+      expect(result).not.toHaveProperty('timedOut');
+      expect(result).not.toHaveProperty('aborted');
+    } else {
+      const reason = mode === 'abort' ? 'abort_signal' : 'stage_timeout';
+      expect(result.reply).toContain(`[run stopped: ${reason}]`);
+      expect(result).toHaveProperty(mode === 'abort' ? 'aborted' : 'timedOut', true);
+      expect(result.diagnostics?.efficiency?.cancelReason).toBe(reason);
+    }
+  });
+
+  it('propagates an inner scan deadline through Pipeline and Service without recovered success', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const chat = vi.fn().mockResolvedValue(toolReply);
+    const { runtime, service, input, execute } = toolHarness(chat);
+    const originalExecute = execute.getMockImplementation();
+    if (!originalExecute) {
+      throw new Error('Tool receipt fixture must resolve');
+    }
+    execute.mockImplementation(async () => {
+      const receipt = await originalExecute();
+      vi.setSystemTime(startedAt + 11);
+      return receipt;
+    });
+    runtime.strategy = new PipelineStrategy({
+      stages: [
+        {
+          name: 'produce',
+          pipelineType: 'scan',
+          toolChoiceOverride: 'auto',
+          additionalTools: ['meta'],
+          budget: { maxIterations: 8, timeoutMs: 10 },
+        },
+      ],
+    });
+    const result = await service.run({
+      ...input,
+      context: {
+        ...input.context,
+        trace: new ActiveContext(),
+        strategyContext: {
+          pipelineType: 'scan',
+          tracker: ExplorationTracker.resolve(
+            { source: 'system', strategy: 'producer' },
+            { pipelineType: 'scan', maxIterations: 8 }
+          ),
+        },
+      },
+      execution: { timeoutMs: 10_000 },
+    });
+    expect(result.status).toBe('timeout');
+    expect(result.reply).not.toContain('[scan complete:');
+    expect(result.toolCalls).toHaveLength(1);
+    expect(chat).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it.each([
     'memory',
     'tracker',
     'trace',
@@ -120,6 +314,8 @@ describe('Runtime operation boundary', () => {
       expect(result.toolCalls).toMatchObject([
         { tool: 'meta', result: { observed: true }, envelope: { ok: true } },
       ]);
+      expect(trace.getCurrentIteration()).toBeNull();
+      expect(trace.toJSON().rounds).toHaveLength(1);
       expect(runtime.toolCallHistory).toHaveLength(1);
       expect(runtime.toolCallHistory[0].envelope).toBe(await execute.mock.results[0].value);
     } finally {

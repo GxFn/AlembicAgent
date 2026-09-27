@@ -7,10 +7,13 @@ Runtime 内部按状态所有权分工，公开包入口保持不变：
 | 实现 | 负责内容 |
 | --- | --- |
 | `AgentRuntime` | 循环状态、取消与期限、PCV 记账、Hook/事件发送顺序、provider 调用和真实用量 |
+| `evidence/loopLedger.ts` | 宿主 job/维度坐标选择、唯一生产台账打开及跨维 seed；不依赖 Runtime 或 LoopContext |
 | `runtime/llmInput.ts` | 工具 schema/choice 兼容策略、阶段投影预算和输入大小判定；仅观察阶段端口及预算数据 |
 | `LLMInputAssembly` / `LLMInputMeasurement` | 既有消息与输入章节装配、完整 provider 请求的大小测量 |
 | `runtime/processEvents.ts` | 普通快照到开发者文本/元数据的纯投影，包括脱敏、输出完整度和 Nudge 说明 |
 | `runtime/toolReceipt.ts` | 已返回工具结果的条目组装与显式配额文本投影；保留原始对象身份，不执行工具或写入运行状态 |
+
+台账资源在 catalog 查询前准备完成，schema 可用性消费同一真实 store。bootstrap job 与维度坐标优先级保持不变；无维度时不创建台账。初始化日志失败不覆盖坐标或持久化错误，也不让有效台账降级为 null。历史、预算、ContextWindow、memory 与控制器装配仍由 Runtime 按原顺序完成；L4 回调读取当前循环状态。
 
 事件时间与 PCV 快照仍在 Runtime 原构造点取得，先生成事件，再执行 Hook 和发送。事件 metadata 保持可附加，Hook 错误仍可在发送前写入。工具进度/总线与 `agent_process_event` 保留各自通道；显示投影不持有 Runtime、LoopContext、provider 或持久化端口。
 
@@ -26,7 +29,11 @@ EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和�
 
 诊断计数只接受有限非负数，非法输入或累加溢出产生 `diagnostics_invalid_count`，保留合法字段与已有总量。合并聚合计数不按数值大小循环。诊断快照复制公开条目，宿主修改快照不会反写收集器。
 
+每个已开始的 trace 轮次关闭一次。正常工具轮仍在 Capability `onAfterStep` 前关闭，文本分支保留原时序；提前退出、空响应重试与异常由循环 `finally` 补关。补关失败只做观察诊断，不掩盖原错误；异常路径不推进 Tracker、不补发成功 Hook，也不调用最终摘要。
+
 无 Tracker 的循环同样执行 `maxIterations`；模型反复返回被禁止的工具调用，也不能绕过轮数上限。真实取消和期限优先于轮数耗尽。空响应和服务错误的重试等待响应同一 `AbortSignal`。
+
+Scan 先判定取消、超时和其他既有摘要抑制原因，再生成完成文案；正常 Scan 继续直接统计确认的提交回执，不额外调用模型。Runtime 返回阶段合同已有的 `aborted` / `timedOut` 标志，Pipeline 与 Service 因此不会把非空停止文案当作恢复成功；已完成的工具回执继续保留。
 
 强制摘要只有 `forcedSummary.ts` 一个实现入口。它保留 Runtime 的身份提示、显式输出预算和温度，使用有界的真实工具回执，优先容纳最新结果；参数和回执分别分配空间，失败、部分结果和截断都有标识。摘要失败或空响应保留工具结果并报告降级，不再追加第二次摘要；取消后的迟到文本丢弃，已知 input/output/reasoning/cache 用量仍归原调用统计。
 
@@ -36,7 +43,7 @@ LLM 输入压缩只删除逐字重复的完整长行，不通过子串、大小�
 
 工具宿主请求在安全策略和装配完成后、真实 router 入口前再次检查取消；已取消时保留明确的 aborted 失败观察，不调用宿主。正常回执继续按“pipeline after → 两份历史 → onToolCall → 逐条 PCV → 文本配额/读视图 → 字符记账 → 事件/Hook → 模型历史”的顺序处理。args/result/envelope 的身份保持不变，阶段观察者仍可从对应历史关联原 envelope。
 
-pipeline 已获得结果、但 after 或最后的效率记账抛错时，内部 WeakMap 按原 Error、本次调用 context 与 call 身份保存回执。Runtime 只消费自己的记录一次，补入真实部分历史并报告 `TOOL_POSTPROCESSING_FAILED`，随后保留原异常退出；不采信外部 Error 自带 partial 字段，不重放工具、不补发成功事件，也不把未完成的观察链标记为完成。PCV、预算和轮次收尾在这条失败路径不继续推进。
+pipeline 已获得结果、但 after 或最后的效率记账抛错时，内部 WeakMap 按原 Error、本次调用 context 与 call 身份保存回执。Runtime 只消费自己的记录一次，补入真实部分历史并报告 `TOOL_POSTPROCESSING_FAILED`，随后保留原异常退出；不采信外部 Error 自带 partial 字段，不重放工具、不补发成功事件，也不把未完成的观察链标记为完成。PCV、预算和 Tracker 的业务收尾在这条失败路径不继续推进；trace 仍由循环的清理边界关闭。
 
 ## 服务与任务装配
 

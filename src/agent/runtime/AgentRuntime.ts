@@ -51,14 +51,7 @@ import {
 } from '../../tools/runtime/registry.js';
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
-import {
-  type EvidenceLedgerStore,
-  seedLedgerFromJobSiblings,
-} from '../evidence/EvidenceLedgerStore.js';
-import {
-  createProductionEvidenceLedgerAuthority,
-  resolveProductionEvidenceLedgerStore,
-} from '../evidence/ProductionEvidenceLedgerAuthority.js';
+import { openLoopEvidence } from '../evidence/loopLedger.js';
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
@@ -555,67 +548,89 @@ export class AgentRuntime {
       ctx.iteration++;
       this.iterationCount++;
 
-      // ActiveContext: 开始新轮次 (必须在 #shouldExit 前, 保证 endRound 有配对)
-      ctx.trace?.startRound(ctx.iteration);
+      let roundOpen = false;
+      const closeRound = () => {
+        if (!roundOpen) {
+          return;
+        }
+        // 先标记，避免自定义 trace 抛错后被 finally 再次调用。
+        roundOpen = false;
+        ctx.trace?.endRound?.();
+      };
+      try {
+        ctx.trace?.startRound(ctx.iteration);
+        roundOpen = Boolean(ctx.trace);
 
-      this.#hookSystem.emitSync('agent:iteration:before', {
-        iteration: ctx.iteration,
-        phase: ctx.tracker?.phase,
-      });
-
-      // 退出判定 (tracker + policy)
-      if (this.#shouldExit(ctx)) {
-        break;
-      }
-
-      // 迭代准备 (hooks + nudge + compact + toolChoice + prompt)
-      const { toolChoice, toolSchemas, effectiveSystemPrompt, dynamicContext, compactResult } =
-        this.#prepareIteration(ctx);
-
-      // LLM 调用 (含错误恢复 + 空响应重试)
-      const llmResult = await this.#callLLM(
-        ctx,
-        toolChoice,
-        toolSchemas,
-        effectiveSystemPrompt,
-        dynamicContext,
-        compactResult
-      );
-      if (!llmResult) {
-        break;
-      }
-      if (llmResult.type === LLMResultType.CONTINUE) {
-        continue;
-      }
-
-      // ActiveContext: 记录 AI 的推理文本 + 提取/更新计划
-      if (ctx.trace && llmResult.text) {
-        ctx.trace.setThought(llmResult.text);
-        ctx.trace.extractAndSetPlan?.(llmResult.text, ctx.iteration);
-      }
-
-      // 分支: 有 Tool Call
-      if ((llmResult.functionCalls?.length ?? 0) > 0) {
-        const exitAfterTools = await this.#processToolCalls(ctx, llmResult);
-        this.#hookSystem.emitSync('agent:iteration:after', {
+        this.#hookSystem.emitSync('agent:iteration:before', {
           iteration: ctx.iteration,
-          hadToolCalls: true,
-          hadText: !!llmResult.text,
+          phase: ctx.tracker?.phase,
         });
-        if (exitAfterTools) {
+
+        // 退出判定 (tracker + policy)
+        if (this.#shouldExit(ctx)) {
           break;
         }
-        continue;
-      }
 
-      // 分支: 纯文本回复
-      this.#hookSystem.emitSync('agent:iteration:after', {
-        iteration: ctx.iteration,
-        hadToolCalls: false,
-        hadText: true,
-      });
-      if (this.#processTextResponse(ctx, llmResult)) {
-        break;
+        // 迭代准备 (hooks + nudge + compact + toolChoice + prompt)
+        const { toolChoice, toolSchemas, effectiveSystemPrompt, dynamicContext, compactResult } =
+          this.#prepareIteration(ctx);
+
+        // LLM 调用 (含错误恢复 + 空响应重试)
+        const llmResult = await this.#callLLM(
+          ctx,
+          toolChoice,
+          toolSchemas,
+          effectiveSystemPrompt,
+          dynamicContext,
+          compactResult
+        );
+        if (!llmResult) {
+          break;
+        }
+        if (llmResult.type === LLMResultType.CONTINUE) {
+          continue;
+        }
+
+        // ActiveContext: 记录 AI 的推理文本 + 提取/更新计划
+        if (ctx.trace && llmResult.text) {
+          ctx.trace.setThought(llmResult.text);
+          ctx.trace.extractAndSetPlan?.(llmResult.text, ctx.iteration);
+        }
+
+        // 分支: 有 Tool Call
+        if ((llmResult.functionCalls?.length ?? 0) > 0) {
+          const exitAfterTools = await this.#processToolCalls(ctx, llmResult, closeRound);
+          this.#hookSystem.emitSync('agent:iteration:after', {
+            iteration: ctx.iteration,
+            hadToolCalls: true,
+            hadText: !!llmResult.text,
+          });
+          if (exitAfterTools) {
+            break;
+          }
+          continue;
+        }
+
+        // 分支: 纯文本回复
+        this.#hookSystem.emitSync('agent:iteration:after', {
+          iteration: ctx.iteration,
+          hadToolCalls: false,
+          hadText: true,
+        });
+        if (this.#processTextResponse(ctx, llmResult, closeRound)) {
+          break;
+        }
+      } finally {
+        // 正常分支仍在原位置关闭；提前退出/重试/异常只补关闭 trace，不推进 tracker 或补发成功 Hook。
+        // 清理观察失败不能覆盖 provider/tool 的原始错误或取消终态。
+        if (roundOpen) {
+          observeSafely(closeRound, () =>
+            this.logger.warn('[AgentRuntime] trace round cleanup failed; loop outcome retained', {
+              agentId: this.id,
+              iteration: ctx.iteration,
+            })
+          );
+        }
       }
     }
 
@@ -624,7 +639,7 @@ export class AgentRuntime {
 
   // ─── 提取方法: reactLoop 内部阶段 ────────────
 
-  /** 初始化循环上下文 — 封装 reactLoop 前 ~60 行初始化逻辑 */
+  /** 按调用顺序装配循环资源；共享引用与控制器的状态所有权在这里保持可见。 */
   #initLoop(prompt: string, opts: ReactLoopOpts) {
     const {
       history = [],
@@ -699,27 +714,14 @@ export class AgentRuntime {
       { source: this.id }
     );
 
-    // 证据台账（Wave A E2）：dataRoot+维度身份齐备才创建；缺任一=null（非维度场景零影响面）
-    // M4 前置：宿主经 sharedState 传 bootstrap 会话 id——同会话全部维度共享台账目录，
-    // 跨维综合 pass 才能 seed 兄弟维度证据；缺席回退实例级 fallback（行为等价旧版）。
-    const sharedSessionKey = (sharedState as Record<string, unknown> | null | undefined)
-      ?._bootstrapSessionId;
-    const evidenceLedger = buildEvidenceLedgerForLoop({
+    // 先按宿主 job/维度打开唯一生产台账，再由 catalog 根据真实资源裁剪 schema。
+    const evidenceLedger = openLoopEvidence({
       dataRoot: this.#dataRoot,
-      jobId:
-        typeof sharedSessionKey === 'string' && sharedSessionKey
-          ? sharedSessionKey
-          : this.#evidenceJobId,
+      defaultJobId: this.#evidenceJobId,
       sessionId: this.id,
-      sharedState: (sharedState as Record<string, unknown> | null | undefined) ?? null,
+      sharedState: sharedState ?? null,
       logger: this.logger,
     });
-    if (evidenceLedger) {
-      // M1a 观测留痕（run-9 残余①）：没有这行就无法区分"变体没生效"与"provider 弱执行嵌套 required"
-      this.logger.info(
-        '[AgentRuntime] dimension submit schema variant active (evidenceRefs required, per-iteration)'
-      );
-    }
 
     // 当前运行资源准备后再查询。schema 与执行动作消费同一快照；无资源的静态目录不能代替此判断。
     const projection = this.#queryToolSchemas(toolContract, this.#modelRef, {
@@ -1396,7 +1398,7 @@ export class AgentRuntime {
    *
    * @returns true = 应退出循环
    */
-  async #processToolCalls(ctx: LoopContext, llmResult: LLMResult) {
+  async #processToolCalls(ctx: LoopContext, llmResult: LLMResult, closeRound: () => void) {
     const { tracker, trace, messages } = ctx;
 
     // 工具调用数量限制
@@ -1721,7 +1723,7 @@ export class AgentRuntime {
         cumulativeFiles: tracker?.getMetrics?.()?.uniqueFiles || 0,
         cumulativePatterns: tracker?.getMetrics?.()?.uniquePatterns || 0,
       });
-      trace.endRound?.();
+      closeRound();
     }
 
     // Capability 后置钩子
@@ -1752,8 +1754,8 @@ export class AgentRuntime {
    *
    * @returns true = 应退出循环
    */
-  #processTextResponse(ctx: LoopContext, llmResult: LLMResult) {
-    const { tracker, trace, messages } = ctx;
+  #processTextResponse(ctx: LoopContext, llmResult: LLMResult, closeRound: () => void) {
+    const { tracker, messages } = ctx;
 
     if (tracker) {
       // AP-3：CP4 analyze 文本轮阻断仅在 grounding enforcement = 'guard' 时生效（调用点短路）。
@@ -1788,7 +1790,7 @@ export class AgentRuntime {
             }
           )
         );
-        trace?.endRound?.();
+        closeRound();
         return false;
       }
       // 文本轮次也需要更新 tracker 指标 — 否则 roundsSinceNewInfo / consecutiveIdleRounds
@@ -1828,7 +1830,7 @@ export class AgentRuntime {
           this.logger.info(
             '[AgentRuntime] 📝 metrics-transition to terminal — injecting digest nudge'
           );
-          trace?.endRound?.();
+          closeRound();
           return false; // continue — let agent produce a full summary
         }
       }
@@ -1838,7 +1840,7 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] ✅ final answer — ${ctx.lastReply.length} chars, ${tracker.iteration} iters, ${ctx.toolCalls.length} tool calls`
         );
-        trace?.endRound?.();
+        closeRound();
         return true;
       }
 
@@ -1866,7 +1868,7 @@ export class AgentRuntime {
           );
           process.stderr.write(`\x1b[33m${redactDeveloperText(textResult.nudge)}\x1b[0m\n\n`);
         }
-        trace?.endRound?.();
+        closeRound();
         return false; // continue
       }
 
@@ -1893,14 +1895,14 @@ export class AgentRuntime {
             process.stderr.write(`\x1b[33m${redactDeveloperText(textResult.nudge)}\x1b[0m\n\n`);
           }
         }
-        trace?.endRound?.();
+        closeRound();
         return false; // continue
       }
     }
 
     // 非 tracker 模式: 文字回答即最终回答
     ctx.lastReply = cleanFinalAnswer(llmResult.text || '');
-    trace?.endRound?.();
+    closeRound();
     return true;
   }
 
@@ -1978,13 +1980,6 @@ export class AgentRuntime {
 
   /** 循环退出后处理 — 强制摘要 + 构建返回值 */
   async #finalize(ctx: LoopContext) {
-    // Scan 管线: 所有结果在 toolCalls 中 (knowledge.submit)，不需要文本回复
-    // 直接跳过 forced summary，避免浪费一次 LLM 调用
-    if (!ctx.lastReply && ctx.tracker?.pipelineType === 'scan') {
-      const recipeCount = ctx.toolCalls.filter(isPersistedSubmission).length;
-      ctx.lastReply = `[scan complete: ${recipeCount} recipes collected]`;
-    }
-
     // 强制摘要 — 循环结束后无文本回复时，生成摘要
     // 覆盖所有场景: 系统管线、tracker 管线、用户对话(有/无工具调用)
     if (!ctx.lastReply) {
@@ -1995,6 +1990,10 @@ export class AgentRuntime {
           code: 'forced_summary_suppressed',
           message: suppression.message,
         });
+      } else if (ctx.tracker?.pipelineType === 'scan') {
+        // 先判定真实停止原因。正常 Scan 的产物已在回执中，继续跳过额外摘要调用。
+        const recipeCount = ctx.toolCalls.filter(isPersistedSubmission).length;
+        ctx.lastReply = `[scan complete: ${recipeCount} recipes collected]`;
       } else if (ctx.toolCalls.length > 0 || ctx.tracker || ctx.isSystem) {
         const forcedResult = await produceForcedSummary({
           aiProvider: this.aiProvider,
@@ -2053,7 +2052,14 @@ export class AgentRuntime {
       toolCallCount: ctx.toolCalls.length,
     });
 
-    return ctx.buildResult();
+    const result = ctx.buildResult();
+    const cancelReason = result.diagnostics?.efficiency?.cancelReason;
+    // 复用阶段既有终态合同。非空停止文案不是成功，也不能被 Pipeline 当作已恢复超时。
+    return {
+      ...result,
+      ...(ctx.abortSignal?.aborted || cancelReason === 'abort_signal' ? { aborted: true } : {}),
+      ...(cancelReason === 'stage_timeout' ? { timedOut: true } : {}),
+    };
   }
 
   // ─── 公共工具方法 ────────────────────────────
@@ -2510,63 +2516,6 @@ function stringifyAbortReason(reason: unknown): string | null {
     return null;
   }
   return String(reason);
-}
-
-/**
- * 证据台账构造（Wave A E2）：dataRoot + 维度身份齐备才创建；缺任一返回 null——
- * 非维度场景（对话/翻译等）零行为。维度 id 优先取 sharedState._dimensionMeta.id，
- * 回退 _dimensionScopeId 冒号前段（形如 'ts-js-module:analyst'）。
- * 同一 runtime 实例内 analyst→producer 两次 reactLoop 命中同一 JSONL 文件，
- * producer 经 hydrate 复用 analyst 台账（E5 机械展开的粮草由此而来）。
- */
-function buildEvidenceLedgerForLoop(options: {
-  dataRoot: string;
-  jobId: string;
-  sessionId: string;
-  sharedState: Record<string, unknown> | null;
-  logger: Pick<Console, 'warn'>;
-}): EvidenceLedgerStore | null {
-  const shared = options.sharedState;
-  const metaId = (shared?._dimensionMeta as { id?: unknown } | undefined)?.id;
-  const scopeId = shared?._dimensionScopeId;
-  const dimensionId =
-    typeof metaId === 'string' && metaId
-      ? metaId
-      : typeof scopeId === 'string' && scopeId
-        ? scopeId.split(':')[0]
-        : null;
-  if (!dimensionId) {
-    return null;
-  }
-  try {
-    const authority = createProductionEvidenceLedgerAuthority({
-      dataRoot: options.dataRoot,
-      jobId: options.jobId,
-      sessionId: options.sessionId,
-      dimensionId,
-    });
-    const store = resolveProductionEvidenceLedgerStore(authority);
-    // M4（跨维综合）：合成维度冷启动时 seed 同 job 兄弟维度的全部台账证据——
-    // 仅在本维文件为空时执行（producer 二次 reactLoop hydrate 到非空文件即跳过，防重复 seed）。
-    if (dimensionId === 'cross-dimension-synthesis' && store.stats().entries === 0) {
-      const seeded = seedLedgerFromJobSiblings(store, {
-        dataRoot: options.dataRoot,
-        jobId: options.jobId,
-        selfDimensionId: dimensionId,
-        logger: options.logger,
-      });
-      (options.logger as Pick<Console, 'warn'> & { info?: (msg: string) => void }).info?.(
-        `[EvidenceLedger] synthesis seeded ${seeded} sibling entries (job=${options.jobId})`
-      );
-    }
-    return store;
-  } catch (err: unknown) {
-    // production ledger 坐标或持久化初始化失败时必须关闭本次维度运行，不能悄悄退回无台账。
-    options.logger.warn('[EvidenceLedger] production authority initialization failed', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err instanceof Error ? err : new Error(String(err));
-  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
