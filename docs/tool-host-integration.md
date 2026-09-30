@@ -34,6 +34,10 @@ Agent 剥除无法证明的 coreCode 后，继续交给 Core 检查保留的来�
 | `{ code: [] }` | 禁用 code |
 | 未知/重复动作 | 过滤未知项、稳定去重，不回落全集 |
 
+Runtime 收集多个 capability 时取权限并集，null/undefined 动作通配占优；某个 capability 的空动作集不会否决另一个 capability 的授权。空项仍保留最早的工具插入位置。运行级 additionalTools 与阶段 additionalToolsOverride 继续追加合并，阶段空数组不清空运行级额外工具；capabilityOverride 的空数组只清空 capability。非法显式 allowedTools 会拒绝，不回落到 tools。
+
+完整动作声明的快照共用于能力收集、查询和准入，先固定值及数组成员，再判断合法性。目录声明只枚举可见工具；准入与稀疏宿主约束仍检查自有隐藏键，复制时保持原枚举性，不把隐藏授权新增到模型列表。宿主参数约束的 tool/action 层保留继承和非枚举的数据字段，末层参数名维持自有可枚举语义，避免整理结构后丢失原有拒绝条件。
+
 旧的 toToolSchemas、toToolSchemasForModel、toMixedSchemas、toToolSchemasForActions、toMixedSchemasForActions 保留包装；旧宿主只有这些方法时，Runtime 通过一个兼容入口查询并记录所选路径。非法显式 capability 合同会失败，不回落到旧 tools 列表扩大权限。Capability 的文本片段描述允许范围，实际可调用分支以本次 schema 为准。
 
 显式 `mode: full` 优先选择旧宿主可用的完整投影方法；仅有 mixed 方法时保留兼容结果，并记录 `legacy_mode_degraded`。默认和 mixed 查询保持原探测顺序。降级日志失败不改变结果，各条路径仍按调用前的 selection 收窄权限。
@@ -48,7 +52,7 @@ Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiM
 
 `ToolRouter.describeAvailability` 按实际端口方法描述 graph、outline、knowledge 管理分支和运行期 memory/evidence。prime 可以使用 search-only 路径；只有某些 manage 分支可用时保留这些分支。服务可用性不是 actor 权限，也不是 Core 对具体业务输入的批准。
 
-Adapter 的 explain、执行前检查、获得队列执行位置后的检查使用同一准入规则。排队期间撤销的能力不能继续执行；省略参数也要检查真实默认值。meta.tools 只查询当前有效 registry 视图，不修改全局注册表。
+Adapter 的 explain、执行前检查、获得队列执行位置后的检查使用同一准入规则。 每次检查只消费本次固定并验证的动作/参数声明；快照不跨排队等待缓存，获得执行位置后仍读取最新宿主可用性和权限。排队期间撤销的能力不能继续执行；省略参数也要检查真实默认值。meta.tools 只查询当前有效 registry 视图，不修改全局注册表。
 
 公开的 `allowToolDecision` / `denyToolDecision` 保留原签名；显式 allowed、stage、reason 优先于 extras 中的同名字段，extras 只补充其余元数据。旧调用如果用冲突 extras 反转裁决，应改为调用对应的 allow/deny 入口；实际 Router 的权限检查链保持独立。
 

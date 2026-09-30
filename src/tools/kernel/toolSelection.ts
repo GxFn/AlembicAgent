@@ -5,14 +5,34 @@ export function isToolStringList(value: unknown): value is readonly string[] {
   return Array.isArray(value) && Array.from(value).every((item) => typeof item === 'string');
 }
 
-/** 仅验证显式动作合同；非法声明不能回落旧 tools 列表扩大权限。 */
-export function isToolActionAllowlist(value: unknown): value is ToolActionAllowlist {
-  return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.values(value).every((actions) => actions == null || isToolStringList(actions))
-  );
+/**
+ * 完整动作声明的单次读取边界；非法形状返回 null，entry 的 null/undefined 通配语义保留。
+ * 先复制每个值及数组成员再校验，不能先验证 getter、后消费它变化后的第二个值。
+ * 空动作项与原键顺序必须保留，Runtime 的多能力并集仍需要它们的插入位置。
+ */
+export function snapshotToolActionAllowlist(
+  value: unknown,
+  keys: 'enumerable' | 'own' = 'enumerable'
+): ToolActionAllowlist | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const source = value as Record<string, unknown>;
+  const snapshot: Record<string, readonly string[] | null | undefined> = {};
+  const names = keys === 'own' ? Object.getOwnPropertyNames(source) : Object.keys(source);
+  for (const tool of names) {
+    const declared = source[tool];
+    const actions = Array.isArray(declared) ? Array.from(declared) : declared;
+    if (actions != null && !isToolStringList(actions)) {
+      return null;
+    }
+    // 准入按 hasOwn 读取隐藏键，目录/能力收集只枚举可见声明；不能把隐藏键改成广告工具。
+    Object.defineProperty(snapshot, tool, {
+      value: Array.isArray(actions) ? Object.freeze(actions) : actions,
+      enumerable: Object.getOwnPropertyDescriptor(source, tool)?.enumerable === true,
+    });
+  }
+  return Object.freeze(snapshot);
 }
 
 /**
@@ -23,20 +43,18 @@ export function snapshotToolSelection(selection: ToolSelection): ToolSelection {
   if (selection == null) {
     return selection;
   }
-  if (isToolStringList(selection)) {
-    return Object.freeze([...selection]);
+  if (Array.isArray(selection)) {
+    const ids = Array.from(selection);
+    if (isToolStringList(ids)) {
+      return Object.freeze(ids);
+    }
+  } else {
+    const actions = snapshotToolActionAllowlist(selection);
+    if (actions) {
+      return actions;
+    }
   }
-  if (!isToolActionAllowlist(selection)) {
-    throw new Error('Invalid tool selection: expected tool ids or an action allowlist');
-  }
-  return Object.freeze(
-    Object.fromEntries(
-      Object.entries(selection).map(([tool, actions]) => [
-        tool,
-        actions == null ? actions : Object.freeze([...actions]),
-      ])
-    )
-  );
+  throw new Error('Invalid tool selection: expected tool ids or an action allowlist');
 }
 
 /** 泛型工具只按注册 id 选择，不为其 flat schema 臆造动作词汇。 */
@@ -88,10 +106,11 @@ export function isToolActionAllowed(
   tool: string,
   action?: string
 ): boolean {
-  if (!isToolActionAllowlist(allowlist) || !Object.hasOwn(allowlist, tool)) {
+  const snapshot = snapshotToolActionAllowlist(allowlist, 'own');
+  if (!snapshot || !Object.hasOwn(snapshot, tool)) {
     return false;
   }
-  const actions = allowlist[tool];
+  const actions = snapshot[tool];
   return (
     actions == null || (actions.length > 0 && (action === undefined || actions.includes(action)))
   );
@@ -102,15 +121,20 @@ export function intersectToolActions(
   left: ToolActionAllowlist,
   right: ToolActionAllowlist
 ): ToolActionAllowlist {
-  if (!isToolActionAllowlist(left) || !isToolActionAllowlist(right)) {
+  const leftSnapshot = snapshotToolActionAllowlist(left);
+  if (!leftSnapshot) {
+    throw new Error('Invalid tool action allowlist');
+  }
+  const rightSnapshot = snapshotToolActionAllowlist(right, 'own');
+  if (!rightSnapshot) {
     throw new Error('Invalid tool action allowlist');
   }
   const entries: Array<[string, readonly string[] | null]> = [];
-  for (const [tool, leftActions] of Object.entries(left)) {
-    if (!Object.hasOwn(right, tool)) {
+  for (const [tool, leftActions] of Object.entries(leftSnapshot)) {
+    if (!Object.hasOwn(rightSnapshot, tool)) {
       continue;
     }
-    const rightActions = right[tool];
+    const rightActions = rightSnapshot[tool];
     const actions =
       leftActions == null
         ? rightActions

@@ -82,6 +82,97 @@ describe('schema, introspection, and static execution admission', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it.each([
+    'inherited-tool',
+    'inherited-action',
+    'hidden-tool',
+    'hidden-action',
+    'hidden-action-mask',
+  ])('preserves a denying %s availability declaration', async (kind) => {
+    const parameter = { key: ['allowed-key'] };
+    const actions =
+      kind === 'hidden-action-mask' ? Object.defineProperty({}, 'memory', { value: [] }) : {};
+    const parameters =
+      kind === 'inherited-tool'
+        ? Object.create({ memory: { save: parameter } })
+        : kind === 'inherited-action'
+          ? { memory: Object.create({ save: parameter }) }
+          : kind === 'hidden-tool'
+            ? Object.defineProperty({}, 'memory', { value: { save: parameter } })
+            : kind === 'hidden-action'
+              ? { memory: Object.defineProperty({}, 'save', { value: parameter }) }
+              : undefined;
+    const save = vi.fn();
+    const create = vi.fn(() => ({
+      projectRoot: process.cwd(),
+      tokenBudget: 4000,
+      sessionStore: { save },
+    }));
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create,
+        getAvailability: () => ({ actions, ...(parameters === undefined ? {} : { parameters }) }),
+      },
+    });
+    const result = await adapter.execute(
+      request('memory', 'save', { key: 'fixture', content: 'fixture' })
+    );
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect(create).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'capability',
+    'runtime',
+    'availability-actions',
+    'availability-parameter',
+  ] as const)('honors the first denied %s declaration before host allocation', async (source) => {
+    const save = vi.fn();
+    const create = vi.fn(() => ({
+      projectRoot: process.cwd(),
+      tokenBudget: 4000,
+      sessionStore: { save },
+    }));
+    const changing = (key: string, later: unknown) => {
+      let reads = 0;
+      return {
+        get [key]() {
+          return ++reads === 1 ? [] : later;
+        },
+      };
+    };
+    const allowedTools = changing('memory', null) as ToolActionAllowlist;
+    const adapter = new ToolRouterAdapter({
+      ...(source === 'capability'
+        ? { capability: { name: 'fixture', description: 'fixture', allowedTools } }
+        : {}),
+      contextFactory: {
+        create,
+        ...(source.startsWith('availability')
+          ? {
+              getAvailability: () =>
+                source === 'availability-actions'
+                  ? { actions: changing('memory', null) as ToolActionAllowlist }
+                  : {
+                      actions: { memory: ['save'] },
+                      parameters: {
+                        memory: { save: changing('key', ['fixture']) as Record<string, string[]> },
+                      },
+                    },
+            }
+          : {}),
+      },
+    });
+    const result = await adapter.execute({
+      ...request('memory', 'save', { key: 'fixture', content: 'fixture' }),
+      ...(source === 'runtime' ? { runtime: { allowedTools } } : {}),
+    });
+    expect(result).toMatchObject({ ok: false, status: 'blocked' });
+    expect(create).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it.each(
     ['capability', 'runtime', 'availability'].flatMap((source) =>
       [

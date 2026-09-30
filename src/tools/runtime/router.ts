@@ -24,13 +24,13 @@ import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
 import {
   intersectToolActions,
   isToolActionAllowed,
-  isToolActionAllowlist,
+  snapshotToolActionAllowlist,
 } from '#tools/kernel/toolSelection.js';
 import { toolAdmissionFailure } from './admission.js';
 import { describeToolAvailability } from './availability.js';
 import { validateToolParameters } from './parameters.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
-import { createToolRegistryView, toolAvailabilityError } from './selection.js';
+import { createToolRegistryView, readToolAvailability } from './selection.js';
 
 export interface RouterConfig {
   capability?: CapabilityDef;
@@ -79,37 +79,45 @@ export class ToolRouter {
       return { allowed: false, stage: 'discover', reason: paramError };
     }
     const capability = this.#config.capability;
-    if (capability && !isToolActionAllowed(capability.allowedTools, call.tool, call.action)) {
-      return {
-        allowed: false,
-        stage: 'approve',
-        resultStatus: 'blocked',
-        reason: isToolActionAllowlist(capability.allowedTools)
-          ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`
-          : 'Permission denied: invalid capability action allowlist',
-      };
-    }
+    const capabilityActions = capability
+      ? snapshotToolActionAllowlist(capability.allowedTools, 'own')
+      : undefined;
     if (
-      ctx.runtime?.allowedTools !== undefined &&
-      !isToolActionAllowed(ctx.runtime.allowedTools, call.tool, call.action)
+      capability &&
+      (!capabilityActions || !isToolActionAllowed(capabilityActions, call.tool, call.action))
     ) {
       return {
         allowed: false,
         stage: 'approve',
         resultStatus: 'blocked',
-        reason: isToolActionAllowlist(ctx.runtime.allowedTools)
+        reason: capabilityActions
+          ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`
+          : 'Permission denied: invalid capability action allowlist',
+      };
+    }
+    const stageActions = ctx.runtime?.allowedTools;
+    const stageSnapshot =
+      stageActions === undefined ? undefined : snapshotToolActionAllowlist(stageActions, 'own');
+    if (
+      stageActions !== undefined &&
+      (!stageSnapshot || !isToolActionAllowed(stageSnapshot, call.tool, call.action))
+    ) {
+      return {
+        allowed: false,
+        stage: 'approve',
+        resultStatus: 'blocked',
+        reason: stageSnapshot
           ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in the current stage`
           : 'Permission denied: invalid stage action allowlist',
       };
     }
-    const availability = ctx.toolAvailability;
-    const availabilityError = toolAvailabilityError(availability);
-    if (availabilityError) {
+    const availability = readToolAvailability(ctx.toolAvailability);
+    if (typeof availability === 'string') {
       return {
         allowed: false,
         stage: 'execute',
         resultStatus: 'blocked',
-        reason: availabilityError,
+        reason: availability,
       };
     }
     if (
@@ -153,16 +161,20 @@ export class ToolRouter {
   }
 
   #selection(ctx: Pick<ToolContext, 'runtime'>): ToolActionAllowlist | undefined {
-    const configured = this.#config.capability?.allowedTools;
+    const capability = this.#config.capability;
     const stage = ctx.runtime?.allowedTools;
-    // 完整授权合同不采用 selection 顶层 null 的“不限制”语义。
-    if (
-      (this.#config.capability && !isToolActionAllowlist(configured)) ||
-      (stage !== undefined && !isToolActionAllowlist(stage))
-    ) {
+    const configured = capability
+      ? snapshotToolActionAllowlist(capability.allowedTools, 'own')
+      : undefined;
+    const currentStage =
+      stage === undefined ? undefined : snapshotToolActionAllowlist(stage, 'own');
+    // 完整授权合同不采用 selection 顶层 null 的“不限制”语义；后续只消费已验证值。
+    if (configured === null || currentStage === null) {
       throw new Error('Invalid tool action allowlist');
     }
-    return configured && stage ? intersectToolActions(configured, stage) : (stage ?? configured);
+    return configured && currentStage
+      ? intersectToolActions(configured, currentStage)
+      : (currentStage ?? configured);
   }
 
   /**

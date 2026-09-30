@@ -20,7 +20,7 @@ import type {
 } from '#tools/kernel/toolSchema.js';
 import { isToolActionAllowed, normalizeToolActions } from '#tools/kernel/toolSelection.js';
 import { projectRegistrySchemas, TOOL_REGISTRY } from '../registry.js';
-import { createToolRegistryView } from '../selection.js';
+import { createToolRegistryView, readToolAvailability } from '../selection.js';
 
 export type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
 
@@ -39,7 +39,10 @@ export class RuntimeCapabilityCatalog implements ToolSchemaQueryPort {
   }
 
   querySchemas(query: ToolSchemaQuery = {}): ToolSchemaQueryResult {
-    const availability = this.#availability?.(query.runtime);
+    const availability = readToolAvailability(this.#availability?.(query.runtime));
+    if (typeof availability === 'string') {
+      throw new Error(availability);
+    }
     const view = createToolRegistryView(TOOL_REGISTRY, query.selection, availability);
     const allowedTools = normalizeToolActions(
       undefined,

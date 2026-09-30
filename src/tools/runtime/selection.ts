@@ -3,9 +3,9 @@ import type { ToolAction, ToolRegistry } from '#tools/kernel/registry.js';
 import type { ToolSelection } from '#tools/kernel/toolSchema.js';
 import {
   isToolActionAllowed,
-  isToolActionAllowlist,
   isToolStringList,
   normalizeToolActions,
+  snapshotToolActionAllowlist,
 } from '#tools/kernel/toolSelection.js';
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -14,37 +14,93 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-/** 查询和执行共用宿主约束校验；参数枚举不继承动作合同的 null 通配语义。 */
-export function toolAvailabilityError(
+/**
+ * 每次查询/准入固定当前宿主约束，再校验同一份声明；不跨排队等待缓存授权。
+ * 字符串是原有的拒绝原因，undefined 仍表示宿主没有额外约束。
+ */
+export function readToolAvailability(
   availability: ToolAvailabilitySnapshot | undefined
-): string | null {
+): ToolAvailabilitySnapshot | string | undefined {
   if (availability === undefined) {
-    return null;
+    return undefined;
   }
-  const snapshot = record(availability);
-  if (!snapshot || !isToolActionAllowlist(snapshot.actions)) {
+  const source = record(availability);
+  const actions = source ? snapshotToolActionAllowlist(source.actions, 'own') : null;
+  if (!source || !actions) {
     return 'Invalid tool availability: expected an action allowlist';
   }
-  if (snapshot.parameters === undefined) {
+  const declaredParameters = source.parameters;
+  const parameters =
+    declaredParameters === undefined ? undefined : readParameterEnums(declaredParameters, 2);
+  if (parameters === null) {
+    return 'Invalid tool availability: expected parameter string enums';
+  }
+  return {
+    actions,
+    ...(parameters !== undefined
+      ? {
+          parameters: parameters as NonNullable<ToolAvailabilitySnapshot['parameters']>,
+        }
+      : {}),
+    // 诊断不参与授权；保持原来仅在消费者需要原因时才读取，不触发无关宿主 getter。
+    get unavailable() {
+      return availability.unavailable;
+    },
+  };
+}
+
+/** 固定 tool/action/parameter 三层字典；叶子只能是字符串枚举，不接受 null 通配。 */
+function readParameterEnums(value: unknown, depth: number): Record<string, unknown> | null {
+  const source = record(value);
+  if (!source) {
     return null;
   }
-  const tools = record(snapshot.parameters);
-  if (tools) {
-    const valid = Object.values(tools).every((tool) => {
-      const actions = record(tool);
-      return (
-        actions &&
-        Object.values(actions).every((action) => {
-          const parameters = record(action);
-          return parameters && Object.values(parameters).every(isToolStringList);
-        })
-      );
-    });
-    if (valid) {
-      return null;
+  const snapshot: Record<string, unknown> = {};
+  for (const [key, enumerable] of parameterKeys(source, depth)) {
+    const declared = source[key];
+    if (depth === 0) {
+      const values = Array.isArray(declared) ? Array.from(declared) : declared;
+      if (!isToolStringList(values)) {
+        return null;
+      }
+      Object.defineProperty(snapshot, key, { value: Object.freeze(values), enumerable });
+    } else {
+      const nested = readParameterEnums(declared, depth - 1);
+      if (nested === null) {
+        return null;
+      }
+      Object.defineProperty(snapshot, key, { value: nested, enumerable });
     }
   }
-  return 'Invalid tool availability: expected parameter string enums';
+  return Object.freeze(snapshot);
+}
+
+/** tool/action 按属性寻址，末层参数按 entries 枚举；保留原可访问限制及枚举性。 */
+function parameterKeys(source: Record<string, unknown>, depth: number): Map<string, boolean> {
+  const keys = new Map<string, boolean>();
+  if (depth === 0) {
+    for (const key of Object.keys(source)) {
+      keys.set(key, true);
+    }
+    return keys;
+  }
+  for (
+    let owner: object | null = source;
+    owner && owner !== Object.prototype;
+    owner = Object.getPrototypeOf(owner)
+  ) {
+    for (const key of Object.getOwnPropertyNames(owner)) {
+      const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+      // class 的默认 constructor 不是参数约束；其余可访问的数据仍必须通过枚举合同。
+      if (owner !== source && key === 'constructor' && typeof descriptor?.value === 'function') {
+        continue;
+      }
+      if (!keys.has(key)) {
+        keys.set(key, descriptor?.enumerable === true);
+      }
+    }
+  }
+  return keys;
 }
 
 function freezeSchema(value: unknown): void {
@@ -113,11 +169,11 @@ function projectAction(
 export function createToolRegistryView(
   registry: ToolRegistry,
   selection?: ToolSelection,
-  availability?: ToolAvailabilitySnapshot
+  declaredAvailability?: ToolAvailabilitySnapshot
 ): ToolRegistry {
-  const availabilityError = toolAvailabilityError(availability);
-  if (availabilityError) {
-    throw new Error(availabilityError);
+  const availability = readToolAvailability(declaredAvailability);
+  if (typeof availability === 'string') {
+    throw new Error(availability);
   }
   const selected = normalizeToolActions(
     selection,

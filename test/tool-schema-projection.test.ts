@@ -494,6 +494,107 @@ function runtimeWith(
 }
 
 describe('runtime schema query port', () => {
+  it('keeps an initially empty tool slot when another capability grants its action', async () => {
+    class FirstCapability extends ReadCapability {
+      override get allowedTools(): unknown {
+        return { code: [], graph: ['overview'] };
+      }
+    }
+    class SecondCapability extends ReadCapability {
+      override get allowedTools(): unknown {
+        return { code: ['read'] };
+      }
+    }
+    const native = new RuntimeCapabilityCatalog();
+    const querySchemas = vi.fn((query: ToolSchemaQuery) => native.querySchemas(query));
+    const { runtime, execute } = runtimeWith({ querySchemas }, new FirstCapability());
+    runtime.capabilities.push(new SecondCapability());
+    await runtime.reactLoop('combine capability grants');
+    expect(Object.keys(querySchemas.mock.calls[0][0].selection ?? {})).toEqual(['code', 'graph']);
+    expect(querySchemas.mock.calls[0][0].selection).toEqual({
+      code: ['read'],
+      graph: ['overview'],
+    });
+    expect(execute.mock.calls.map(([call]) => `${call.toolId}.${call.args.action}`)).toEqual([
+      'graph.overview',
+      'code.read',
+    ]);
+  });
+
+  it.each([
+    'empty-to-wildcard',
+    'read-to-write',
+    'invalid-first',
+  ] as const)('consumes one validated capability declaration for %s', async (mode) => {
+    let reads = 0;
+    const actions: unknown[] = [];
+    Object.defineProperty(actions, '0', {
+      enumerable: true,
+      get: () => {
+        reads++;
+        return reads === 1 ? (mode === 'invalid-first' ? 42 : 'read') : 'write';
+      },
+    });
+    const declaration =
+      mode === 'empty-to-wildcard'
+        ? {
+            get code() {
+              reads++;
+              return reads === 1 ? [] : null;
+            },
+          }
+        : { code: actions };
+    class SnapshotCapability extends ReadCapability {
+      override get allowedTools(): unknown {
+        return declaration;
+      }
+    }
+    const { runtime, execute, chatWithTools } = runtimeWith(
+      new RuntimeCapabilityCatalog(),
+      new SnapshotCapability()
+    );
+    if (mode === 'invalid-first') {
+      await expect(runtime.reactLoop('reject invalid capability')).rejects.toThrow(
+        'Invalid capability action allowlist'
+      );
+      expect(chatWithTools).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    } else {
+      await runtime.reactLoop('honor first capability snapshot');
+      expect(execute.mock.calls.map(([call]) => call.args.action)).toEqual(
+        mode === 'empty-to-wildcard' ? [] : ['read']
+      );
+    }
+    expect(reads).toBe(1);
+  });
+
+  it.each([
+    'ids',
+    'actions',
+  ] as const)('snapshots query selection %s before validation consumes it', (mode) => {
+    let reads = 0;
+    const ids: string[] = [];
+    Object.defineProperty(ids, '0', {
+      enumerable: true,
+      get: () => {
+        reads++;
+        return reads === 1 ? 'code' : 'graph';
+      },
+    });
+    const selection =
+      mode === 'ids'
+        ? ids
+        : {
+            get code() {
+              reads++;
+              return reads === 1 ? [] : null;
+            },
+          };
+    const result = queryToolSchemas(new RuntimeCapabilityCatalog(), { selection }, () => undefined);
+    expect(result.schemas.map(({ name }) => name)).toEqual(mode === 'ids' ? ['code'] : []);
+    expect(reads).toBe(1);
+  });
+
   it.each([
     { port: 'modern', field: 'description' },
     { port: 'legacy', field: 'description' },

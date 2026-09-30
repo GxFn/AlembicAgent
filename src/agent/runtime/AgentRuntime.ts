@@ -44,7 +44,7 @@ import { queryToolSchemas } from '#tools/catalog/schemaQuery.js';
 import type { ToolRuntimeCallContext } from '#tools/kernel/context.js';
 import type { ToolScopeRelease } from '#tools/kernel/index.js';
 import type { ToolActionAllowlist, ToolSchemaQueryResult } from '#tools/kernel/toolSchema.js';
-import { isToolActionAllowlist } from '#tools/kernel/toolSelection.js';
+import { snapshotToolActionAllowlist } from '#tools/kernel/toolSelection.js';
 import {
   applyDimensionSubmitSchemaVariant,
   DEPTH_SLOT_PROPS,
@@ -2161,10 +2161,11 @@ export class AgentRuntime {
     for (const cap of caps) {
       const allowedTools = (cap as { allowedTools?: unknown }).allowedTools;
       if (allowedTools !== undefined) {
-        if (!isToolActionAllowlist(allowedTools)) {
+        const snapshot = snapshotToolActionAllowlist(allowedTools);
+        if (!snapshot) {
           throw new Error(`Invalid capability action allowlist: ${cap.name}`);
         }
-        for (const [tool, actions] of Object.entries(allowedTools)) {
+        for (const [tool, actions] of Object.entries(snapshot)) {
           if (actions == null) {
             allowAllActions(tool);
           } else {

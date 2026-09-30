@@ -10,8 +10,8 @@ import type {
 } from '#tools/kernel/toolSchema.js';
 import {
   intersectToolActions,
-  isToolActionAllowlist,
   selectToolActions,
+  snapshotToolActionAllowlist,
   snapshotToolSelection,
 } from '#tools/kernel/toolSelection.js';
 
@@ -83,18 +83,8 @@ function readModernResult(value: unknown): Omit<ToolSchemaQueryResult, 'schemas'
     throw new Error('Invalid ToolSchemaQueryPort result');
   }
   const schemas = readSchemas(value.schemas, 'Invalid ToolSchemaQueryPort result');
-  const hostActions = value.allowedTools;
-  if (!record(hostActions)) {
-    throw new Error('Invalid ToolSchemaQueryPort result');
-  }
-  // 在类型校验前捕获动作值和数组成员；重复校验原 getter 会把 [] 读成后来的 null 全开放。
-  const allowedTools = Object.fromEntries(
-    Object.entries(hostActions).map(([tool, actions]) => [
-      tool,
-      Array.isArray(actions) ? Array.from(actions) : actions,
-    ])
-  );
-  if (!isToolActionAllowlist(allowedTools)) {
+  const allowedTools = snapshotToolActionAllowlist(value.allowedTools);
+  if (!allowedTools) {
     throw new Error('Invalid ToolSchemaQueryPort result');
   }
   const unavailable = value.unavailable;
