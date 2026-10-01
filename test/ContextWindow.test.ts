@@ -796,3 +796,124 @@ describe('context compaction receipt boundaries', () => {
     expect(result.failed).not.toBe(true);
   });
 });
+
+/**
+ * 折叠后的上下文记账钉子。
+ *
+ * 背景：L3 collapse 是读时投影——原始消息保留，发给模型的是 toProjectedMessages()。
+ * 但用量比例、工具结果配额、压缩触发、L4 判定此前都按原始消息估算：长阶段里原始历史
+ * 只增不减，配额被永久压到最低档（400 字符），而模型实际看到的输入只占预算的一小部分；
+ * compactIfNeeded 也会在每一轮重复折叠并重复写压缩日志。
+ * 现在「用量」只有一个口径：发给模型的投影视图。
+ */
+describe('context usage follows the provider-visible projection', () => {
+  /** 每轮结果不超过 L1 截断阈值，保证原始历史不会被 L1 缩小——只有折叠能让模型输入变小。 */
+  function fillRounds(window: ContextWindow, rounds: number, resultChars = 1900) {
+    window.appendUserMessage('initial analyze prompt');
+    for (let index = 0; index < rounds; index++) {
+      window.appendAssistantWithToolCalls(null, [
+        { id: `call-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      window.appendToolResult(`call-${index}`, 'code', `r${index}:${'x'.repeat(resultChars)}`);
+    }
+  }
+
+  it('restores the tool-result quota once the collapsed projection is small', () => {
+    const window = new ContextWindow(24_000);
+    fillRounds(window, 60);
+    expect(window.getTokenUsageRatio()).toBeGreaterThan(0.95);
+    expect(window.getToolResultQuota()).toEqual({ maxChars: 400, maxMatches: 2 });
+
+    const result = window.compactForProviderInputBudget({
+      maxProjectedMessages: 12,
+      maxProjectedTokens: 4_000,
+      stageProfile: 'analyze',
+    });
+    expect(result.level).toBe(3);
+
+    // 模型只会看到最近两轮；配额按它实际看到的输入恢复，而不是按保留的原始历史。
+    expect(window.estimateTokens()).toBe(window.estimateProjectedTokens());
+    expect(window.estimateRetainedTokens()).toBeGreaterThan(window.estimateTokens() * 10);
+    expect(window.getTokenUsageRatio()).toBeCloseTo(
+      window.estimateProjectedTokens() / window.tokenBudget,
+      10
+    );
+    expect(window.getTokenUsageRatio()).toBeLessThan(0.4);
+    expect(window.getToolResultQuota()).toEqual({ maxChars: 6000, maxMatches: 15 });
+    expect(window.estimateFullContextTokens(3500, 2)).toBe(
+      window.estimateProjectedTokens() + 1000 + 200
+    );
+    expect(window.tokenCount).toBe(window.estimateTokens());
+  });
+
+  it('still lowers the quota under session pressure after a collapse', () => {
+    const window = new ContextWindow(24_000);
+    fillRounds(window, 60);
+    window.compactForProviderInputBudget({ maxProjectedMessages: 12, maxProjectedTokens: 4_000 });
+    window.setSessionPressure(0.9);
+    expect(window.getToolResultQuota()).toEqual({ maxChars: 800, maxMatches: 3 });
+  });
+
+  it('does not re-run compaction every turn while the projection stays under the thresholds', () => {
+    const window = new ContextWindow(24_000);
+    fillRounds(window, 60);
+    expect(window.compactIfNeeded().level).toBe(3);
+    const revision = window.readViewRevision;
+    const logLength = window.getCompactionLog().length;
+
+    for (let turn = 0; turn < 3; turn++) {
+      expect(window.compactIfNeeded()).toEqual({ level: 0, removed: 0 });
+    }
+    expect(window.getCompactionLog()).toHaveLength(logLength);
+    expect(window.readViewRevision).toBe(revision);
+  });
+
+  it('collapses again only after new rounds push the projection back over the threshold', () => {
+    const window = new ContextWindow(24_000);
+    fillRounds(window, 60);
+    window.compactIfNeeded();
+    const firstBoundary = window.toProjectedMessages().length;
+
+    // 再追加足够多的轮次，让投影重新越过 L3 阈值。
+    for (let index = 60; index < 110; index++) {
+      window.appendAssistantWithToolCalls(null, [
+        { id: `call-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      window.appendToolResult(`call-${index}`, 'code', `r${index}:${'x'.repeat(1900)}`);
+    }
+    expect(window.getTokenUsageRatio()).toBeGreaterThan(0.82);
+    expect(window.compactIfNeeded().level).toBe(3);
+    expect(window.toProjectedMessages()).toHaveLength(firstBoundary);
+    expect(JSON.stringify(window.toProjectedMessages())).toContain('r109:');
+    expect(window.getTokenUsageRatio()).toBeLessThan(0.4);
+  });
+
+  it('does not log a repeated collapse at an unchanged boundary', () => {
+    // 预算很小：最近两轮本身就超过阈值，折叠后投影仍然偏高，每轮都会再次进入 L3。
+    const window = new ContextWindow(1_000);
+    fillRounds(window, 4);
+    expect(window.compactIfNeeded().level).toBe(3);
+    const revision = window.readViewRevision;
+    const logLength = window.getCompactionLog().length;
+    const projected = structuredClone(window.toProjectedMessages());
+
+    expect(window.getTokenUsageRatio()).toBeGreaterThan(0.82);
+    expect(window.compactIfNeeded().level).toBe(3);
+    expect(window.compactIfNeeded().level).toBe(3);
+    expect(window.getCompactionLog()).toHaveLength(logLength);
+    expect(window.readViewRevision).toBe(revision);
+    expect(window.toProjectedMessages()).toEqual(projected);
+  });
+
+  it('asks for an L4 summary only when the projection itself is near the budget', () => {
+    const collapsed = new ContextWindow(24_000, { enableL4LLM: true });
+    fillRounds(collapsed, 60);
+    collapsed.compactIfNeeded();
+    expect(collapsed.needsL4Compaction()).toBe(false);
+
+    const saturated = new ContextWindow(1_000, { enableL4LLM: true });
+    fillRounds(saturated, 4);
+    saturated.compactIfNeeded();
+    expect(saturated.needsL4Compaction()).toBe(true);
+  });
+});

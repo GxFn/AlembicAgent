@@ -13,6 +13,9 @@ import type { LlmContinuation } from '#ai/contracts.js';
  *   2. assistant(toolCalls) 与其 tool results 是原子单元（不可拆分）
  *   3. 每次 AI 调用前自动压缩到 TOKEN_BUDGET 以内
  *   4. 不通过追加 user 消息来控制 AI 行为（由 ExplorationTracker 管理）
+ *   5. 「用量」只有一个口径：发给模型的投影视图（toProjectedMessages）。用量比例、
+ *      工具结果配额、压缩触发和 L4 判定都读这一个口径；L3 折叠后保留的原始历史
+ *      不计入用量，只通过 estimateRetainedTokens() 供诊断观察。
  *
  * 递进压缩（阈值可配置）:
  *   L1: 缩短旧工具结果；L2: 合并文本并保持工具调用/结果配对
@@ -385,6 +388,8 @@ export class ContextWindow {
    *   L4 (≥0.92): Auto-compact — 需 LLM 调用，由 compactL4() 单独处理
    *
    * 单次调用可递进（如从 L1 升级到 L3），但不进入 L4（异步）。
+   * 使用率按投影视图计算：L3 折叠后投影低于阈值时本方法是 no-op，
+   * 直到新增轮次把投影重新推过阈值才会再次折叠。
    *
    * @returns } 压缩结果
    */
@@ -737,16 +742,23 @@ export class ContextWindow {
       return { level: 3, removed: 0 };
     }
 
-    if (keepFrom > this.#collapseThreshold) {
-      this.#invalidateReadView('l3_collapse');
+    // 边界没有前移：投影不会变化。最近两轮本身就偏大时每轮都会走到这里，
+    // 重复写日志、重复提取提交标题没有意义；折叠状态保持，仍报告 L3。
+    if (keepFrom <= this.#collapseThreshold) {
+      return { level: 3, removed: 0 };
     }
+
+    const retainedTokens = this.estimateRetainedTokens();
+    this.#invalidateReadView('l3_collapse');
     this.#extractCompactedSubmits(1, keepFrom);
     this.#collapseThreshold = keepFrom;
     this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}`);
     this.#log(
       'info',
       `[ContextWindow] L3 collapse: projection threshold at index ${keepFrom}, ` +
-        `${this.#messages.length - keepFrom} messages visible in projection`
+        `${this.#messages.length - keepFrom} messages visible in projection | ` +
+        `provider-visible tokens≈${this.estimateTokens()}/${this.#tokenBudget}, ` +
+        `retained history tokens≈${retainedTokens}`
     );
     return { level: 3, removed: 0 };
   }
@@ -789,13 +801,19 @@ export class ContextWindow {
     ];
   }
 
+  /** 投影视图的 token 估算；与 estimateTokens() 同一口径，保留此名供既有调用方使用。 */
   estimateProjectedTokens(): number {
-    return this.#estimateMessagesTokens(this.toProjectedMessages());
+    return this.estimateTokens();
   }
 
   /** 获取消息数量 */
   get length() {
     return this.#messages.length;
+  }
+
+  /** 当前发给模型的 token 估算（阶段日志等只读观察面使用）。 */
+  get tokenCount() {
+    return this.estimateTokens();
   }
 
   /** 获取 token 预算 */
@@ -813,12 +831,20 @@ export class ContextWindow {
   }
 
   /**
-   * 估算实际发送给 LLM 的 token 使用量。
+   * 估算实际发送给 LLM 的 token 使用量——即投影视图（L3 折叠生效时不含被折叠的轮次）。
    *
    * SDK 续接块完整计数；旧 reasoningContent 也不能只计最近两轮，
    * 因为适配器可能仍需回传更早的内容。相同内容不与 replay 块重复计数。
    */
   estimateTokens() {
+    return this.#estimateMessagesTokens(this.toProjectedMessages());
+  }
+
+  /**
+   * 估算保留的原始历史（含已折叠轮次）的 token 量。只用于诊断：它反映内存里留了多少
+   * 历史，不代表模型看到的输入，不得用来决定配额或压缩。
+   */
+  estimateRetainedTokens() {
     return this.#estimateMessagesTokens(this.#messages);
   }
 
@@ -842,7 +868,7 @@ export class ContextWindow {
     return total;
   }
 
-  /** 获取 token 使用率 (0-1) */
+  /** 获取 token 使用率：发给模型的投影视图占预算的比例（可能大于 1）。 */
   getTokenUsageRatio() {
     return this.estimateTokens() / this.#tokenBudget;
   }
@@ -864,8 +890,9 @@ export class ContextWindow {
   /**
    * 获取动态工具结果配额 — 5 级预算阶梯。
    *
-   * 综合 ContextWindow 使用率和 session-level 预算压力,
-   * 取两者的较高值作为有效使用率:
+   * 综合 ContextWindow 使用率（投影视图口径）和 session-level 预算压力,
+   * 取两者的较高值作为有效使用率。折叠后投影变小，配额随之恢复；
+   * 会话预算紧张时仍由 sessionPressure 压低配额:
    *
    *   | 有效使用率 | 状态      | maxChars | maxMatches |
    *   |-----------|----------|----------|------------|
