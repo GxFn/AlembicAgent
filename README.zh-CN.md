@@ -127,7 +127,12 @@ npm run build        # tsc -> dist/
 npm test             # vitest run(mock provider,不需要真实 API key)
 ```
 
-运行时依赖:`@alembic/core`、`better-sqlite3`、`drizzle-orm`、`undici`。
+源码导入的运行时依赖:`@alembic/core`;Vercel AI SDK 的 provider 包
+(`@ai-sdk/openai`、`@ai-sdk/anthropic`、`@ai-sdk/google`、`@ai-sdk/deepseek`、
+`@ai-sdk/provider`)及其 peer 依赖 `zod`;`ajv` + `ajv-formats`(结构化输出与工具参数
+校验);`undici`(代理 dispatcher)。`package.json` 另声明了 `better-sqlite3` 与
+`drizzle-orm`,但没有源码模块导入它们:Agent 记忆使用调用方注入的 SQLite 句柄,只有
+测试直接加载 `better-sqlite3`。
 
 ## 验证
 

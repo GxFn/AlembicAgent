@@ -153,27 +153,33 @@ Before returning a `TargetResultEnvelope` or handoff, this child window must sel
 - 不要把 API key、token、用户路径或本机绝对路径写入长期文档、fixture 或提交。
 - 不要回退其他窗口或用户已有改动；如果工作区已有无关变更，只处理当前任务需要的文件。
 
-## 工具系统 V1 退役登记（2026-06-11）
+## 工具系统契约单源（V1/V2 收敛已完成，2026-06-19）
 
-本节是退役意向登记，不是删除授权；登记本身不改变任何代码。
+本节记录已发生的事实，取代 2026-06-11 的“V1 退役登记”。该登记的退役条件已满足：RC6
+于 2026-06-12 接受 SD-3 收敛方案，并在 2026-06-19 执行完毕；登记中的旧目录和类名
+不再存在。
 
-- V2（`src/tools/v2/`）是本仓库的主工具系统（primary tool system）。
-- V1 表面（`src/tools/core/`：InternalToolHandler、LightweightRouter、ToolCallContext、
-  ToolContracts、ToolDecision、ToolResultEnvelope、ToolResultPresenter、
-  ToolRoutingServices）与 `V2ToolRouterAdapter`（`src/tools/v2/adapter/`）仅作
-  兼容层保留（compatibility-only），不得在其上扩展新能力。
-- 当前消费方（2026-06-11 扫描）：
-  - `src/tools/v2/adapter/V2ToolRouterAdapter.ts` 通过 V1 `ToolRouterContract` /
-    `ToolDecision` / `ToolResultEnvelope` 适配 V2 路由；
-  - `src/agent/runtime/AgentRuntimeBoundary.ts` 在 runtime boundary manifest 中
-    引用 `V2ToolRouterAdapter`；
-  - 此外 V1 的 contract 类型（`ToolContracts` / `ToolResultEnvelope` /
-    `ToolCallContext` / `InternalToolHandler`）仍是 runtime、catalog、terminal、
-    workflow、forge、tasks 等模块共享的类型词汇（约 15 个 src 文件 type-import）。
-- 退役条件：V1 表面与 adapter 的删除/结构收敛属于 RC6 SD-3 决策
-  （demand 序列 `alembic-redundancy-stale-logic-cleanup`）；在 SD-3 决策落地并给出
-  替代 contract 入口、消费方迁移路径和验证证据之前，不得删除 V1 或合并两套系统。
-- 登记 owner：AlembicAgent 窗口；触发复查时机：RC6 SD-3 决策记录产生时。
+- 工具契约只有一份：`src/tools/kernel/`（result envelope、decision、request、router
+  contract、call context、handler、registry 类型等）。所有消费方从这里导入，工具系统
+  内不再有 V1/V2 之分。
+- 运行时实现位于 `src/tools/runtime/`（registry、router、handlers、adapter、cache、
+  compressor、toolsets），能力目录位于 `src/tools/catalog/`。`ToolRouterAdapter`
+  （`src/tools/runtime/adapter/`）把 `ToolRouter` 适配到 kernel 的 `ToolRouterContract`。
+- 已删除的旧表面：`src/tools/core/`（7 个 V1 contract shim 与 `LightweightRouter`）、
+  `ToolRuntimeBridge`、`src/tools/v2/`（已改名为 `src/tools/runtime/`）以及
+  `V2ToolRouterAdapter` 等带 V2 标签的类名；公开子路径相应为
+  `@alembic/agent/tools/runtime`。
+- 落地提交：2026-06-19 的 SD-3 P0–P4b 序列（`0ccb3c0` 建立 kernel，`dec460e` 删除 V1
+  shim 与 bridge，`414cffa` 删除 `v2/types` shim，`f4f80f4` 目录改名，`2628ccd` 去除 V2
+  类名标签），以及 2026-06-27 的 `33ed20d`（删除 `LightweightRouter`）。
+- 守护：`test/tool-system.test.ts` 的 `tool kernel contract` 用例断言 V1 shim 与 bridge
+  文件不存在，且源码没有残留导入。
+- 保留的冻结标识：`AgentRuntimeBoundary` manifest 的 area id `tool-v2` 和
+  `package.json` 关键字 `tool-v2` 只是公开标识，不代表存在第二套工具系统。
+- 新增工具能力按 `src/tools/runtime/registry.ts` 的单源注册表和 kernel 契约扩展；
+  上述旧目录、shim 和版本标签不应恢复。
+- 决策记录（workspace 级，不在本仓库内）：
+  `../wakeflow-ledger/requirement-designs/alembic-redundancy-stale-logic-cleanup/rc6-structural-debt-decisions-2026-06-12.md`。
 
 ## 长期维护规则
 

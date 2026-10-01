@@ -141,8 +141,14 @@ npm run build        # tsc -> dist/
 npm test             # vitest run (mock providers; no real API keys required)
 ```
 
-Runtime dependencies: `@alembic/core`, `better-sqlite3`, `drizzle-orm`,
-`undici`.
+Runtime dependencies imported by the source: `@alembic/core`; the Vercel AI SDK
+provider packages (`@ai-sdk/openai`, `@ai-sdk/anthropic`, `@ai-sdk/google`,
+`@ai-sdk/deepseek`, `@ai-sdk/provider`) with their `zod` peer; `ajv` +
+`ajv-formats` for structured-output and tool-parameter validation; and `undici`
+for proxy dispatchers. `package.json` also declares `better-sqlite3` and
+`drizzle-orm`, but no source module imports them: agent memory uses the SQLite
+handle its caller injects, and only the test suite loads `better-sqlite3`
+directly.
 
 ## Verification
 
