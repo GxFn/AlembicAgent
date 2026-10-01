@@ -7,6 +7,7 @@ import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import {
   insightGateEvaluator,
   producerRejectionGateEvaluator,
+  readEvolutionGateArtifact,
 } from '../../evaluation/gateEvaluators.js';
 import { BudgetPolicy, QualityGatePolicy } from '../../policies/index.js';
 import {
@@ -70,7 +71,8 @@ export const INSIGHT_PRESET = {
             ctx.rescanContext as Parameters<typeof buildAnalystPrompt>[6],
             ctx.panorama as Parameters<typeof buildAnalystPrompt>[7],
             ctx.evidenceStarters as Parameters<typeof buildAnalystPrompt>[8],
-            ctx.gateArtifact as Parameters<typeof buildAnalystPrompt>[9],
+            // 进化结果按阶段名取进化门产物；没跑进化阶段时为 null，提示省略该小节。
+            readEvolutionGateArtifact(ctx.phaseResults),
             ctx.toolPolicyHints as Parameters<typeof buildAnalystPrompt>[10],
             {
               abortSignal: ctx.abortSignal as AbortSignal | undefined,

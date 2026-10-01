@@ -1,7 +1,7 @@
 /**
  * evolution preset —— 衰退 Recipe 进化决策的运行时基块(W6-e 自 presets.ts 拆出,内容原样)。
  */
-import { evolutionGateEvaluator } from '../../evaluation/gateEvaluators.js';
+import { EVOLUTION_GATE_STAGE, evolutionGateEvaluator } from '../../evaluation/gateEvaluators.js';
 import { BudgetPolicy } from '../../policies/index.js';
 import {
   buildEvolverPrompt,
@@ -73,7 +73,7 @@ export const EVOLUTION_PRESET = {
       },
       // ── Phase 2: Evolution Gate ──
       {
-        name: 'evolution_gate',
+        name: EVOLUTION_GATE_STAGE,
         gate: {
           evaluator: evolutionGateEvaluator,
           useCumulativeToolCalls: true,

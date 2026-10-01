@@ -1,5 +1,5 @@
 import {
-  collectSuccessfulEvolutionIds,
+  collectEvolutionDecisions,
   hasPersistedCandidate,
   isKnowledgeSubmit,
   readToolObservation,
@@ -242,6 +242,24 @@ interface EvolutionToolCallRecord {
 }
 
 /**
+ * 进化门产物：进化阶段对本维度现有 Recipe 的决策账。
+ *
+ * processed/pendingIds 供进化阶段补写；evolved/deprecated/skipped 供后续分析阶段了解
+ * 已处理范围。三类计数按 Recipe 归并，恒有 evolved + deprecated + skipped === processed。
+ */
+export interface EvolutionGateArtifact {
+  processed: number;
+  totalRecipes: number;
+  pendingIds: string[];
+  evolved: number;
+  deprecated: number;
+  skipped: number;
+}
+
+/** 进化门在管线里的阶段名；下游按名取产物，不依赖它是不是「最近一个门」。 */
+export const EVOLUTION_GATE_STAGE = 'evolution_gate';
+
+/**
  * Evolution Gate 评估器 — 面向 PipelineStrategy gate.evaluator
  *
  * 检查 Evolution Agent 是否对所有现有 Recipe 做出了决策:
@@ -266,22 +284,84 @@ export function evolutionGateEvaluator(
   const expectedIds = (strategyContext.existingRecipes ?? strategyContext.decayedRecipes ?? []).map(
     (r) => r.id
   );
-  const processedIds = collectSuccessfulEvolutionIds(source?.toolCalls || [], expectedIds);
+  // 门配置了 useCumulativeToolCalls：这里看到的是进化阶段全部尝试的累计回执，
+  // 所以三类计数覆盖补写轮，而不是只有最后一次尝试。
+  const decisions = collectEvolutionDecisions(source?.toolCalls || [], expectedIds);
 
-  const processed = processedIds.size;
-  const pendingIds = expectedIds.filter((id) => !processedIds.has(id));
+  const processed = decisions.size;
+  const pendingIds = expectedIds.filter((id) => !decisions.has(id));
+  const artifact: EvolutionGateArtifact = {
+    processed,
+    totalRecipes,
+    pendingIds,
+    evolved: 0,
+    deprecated: 0,
+    skipped: 0,
+  };
+  for (const decision of decisions.values()) {
+    artifact[decision] += 1;
+  }
 
   if (totalRecipes > 0 && pendingIds.length > 0) {
     return {
       action: 'retry',
       reason: `只处理了 ${processed}/${totalRecipes} 个 Recipe，还有 ${pendingIds.length} 个未决策`,
-      artifact: { processed, totalRecipes, pendingIds },
+      artifact,
     };
   }
 
   return {
     action: 'pass',
-    artifact: { processed, totalRecipes, pendingIds },
+    artifact,
+  };
+}
+
+/**
+ * 从阶段结果里按名读取进化门产物；进化阶段没跑、或产物形状不符时返回 null。
+ *
+ * 提示构建器用它而不是「最近一个门产物」：后者的形状取决于上一个门是谁，
+ * 管线里多插一个门就会把无关字段当成进化结果喂给模型。
+ */
+export function readEvolutionGateArtifact(phaseResults: unknown): EvolutionGateArtifact | null {
+  if (!phaseResults || typeof phaseResults !== 'object') {
+    return null;
+  }
+  const gate = (phaseResults as Record<string, unknown>)[EVOLUTION_GATE_STAGE];
+  const artifact =
+    gate && typeof gate === 'object' ? (gate as { artifact?: unknown }).artifact : null;
+  if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) {
+    return null;
+  }
+  const record = artifact as Record<string, unknown>;
+  const count = (key: string) => {
+    const value = record[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const [processed, totalRecipes, evolved, deprecated, skipped] = [
+    count('processed'),
+    count('totalRecipes'),
+    count('evolved'),
+    count('deprecated'),
+    count('skipped'),
+  ];
+  if (
+    processed === null ||
+    totalRecipes === null ||
+    evolved === null ||
+    deprecated === null ||
+    skipped === null
+  ) {
+    return null;
+  }
+  return {
+    processed,
+    totalRecipes,
+    pendingIds: Array.isArray(record.pendingIds)
+      ? record.pendingIds.filter((id): id is string => typeof id === 'string')
+      : [],
+    evolved,
+    deprecated,
+    skipped,
   };
 }
 

@@ -75,66 +75,114 @@ export function hasPersistedCandidate(call: unknown): boolean {
   );
 }
 
-export function evolutionOutcome(call: unknown): 'proposal' | 'deprecated' | 'verified' | null {
+type EvolutionOperation = 'evolve' | 'deprecate' | 'skip_evolution';
+type EvolutionOutcome = 'proposal' | 'deprecated' | 'verified';
+
+const LEGACY_EVOLUTION_TOOLS: Record<string, EvolutionOperation> = {
+  propose_evolution: 'evolve',
+  confirm_deprecation: 'deprecate',
+  skip_evolution: 'skip_evolution',
+};
+
+function isEvolutionOperation(value: unknown): value is EvolutionOperation {
+  return value === 'evolve' || value === 'deprecate' || value === 'skip_evolution';
+}
+
+/** 一次成功的进化决策回执：目标 Recipe、Agent 选择的操作、Core 确认的结果。 */
+function readEvolutionReceipt(
+  call: unknown
+): { target: string; operation: EvolutionOperation; outcome: EvolutionOutcome } | null {
   const { tool, action, params, result, ok } = readToolObservation(call);
-  const legacy: Record<string, string> = {
-    propose_evolution: 'evolve',
-    confirm_deprecation: 'deprecate',
-    skip_evolution: 'skip_evolution',
-  };
-  const operation = tool === 'knowledge' && action === 'manage' ? params.operation : legacy[tool];
+  const operation =
+    tool === 'knowledge' && action === 'manage' ? params.operation : LEGACY_EVOLUTION_TOOLS[tool];
   const target = params.id ?? params.recipeId;
-  if (
-    !ok ||
-    typeof target !== 'string' ||
-    !target ||
-    !['evolve', 'deprecate', 'skip_evolution'].includes(String(operation))
-  ) {
+  if (!ok || typeof target !== 'string' || !target || !isEvolutionOperation(operation)) {
     return null;
   }
+  let outcome: EvolutionOutcome | null;
   // Core outcome 是事实；不得让兼容 status 把 skipped 重新提升成成功提案。
   if (typeof result.outcome === 'string' && result.outcome) {
     if (result.outcome === 'proposal-created' || result.outcome === 'proposal-upgraded') {
-      return 'proposal';
+      outcome = 'proposal';
+    } else if (result.outcome === 'immediately-executed') {
+      outcome = 'deprecated';
+    } else {
+      outcome = result.outcome === 'verified' ? 'verified' : null;
     }
-    if (result.outcome === 'immediately-executed') {
-      return 'deprecated';
-    }
-    return result.outcome === 'verified' ? 'verified' : null;
-  }
-  if (
+  } else if (
     ['evolution_proposed', 'evolution_proposal_upgraded', 'deprecation_proposed'].includes(
       String(result.status)
     )
   ) {
-    return 'proposal';
+    outcome = 'proposal';
+  } else if (result.status === 'deprecated') {
+    outcome = 'deprecated';
+  } else {
+    outcome = ['evolution_verified', 'evolution_skipped', 'verified'].includes(
+      String(result.status)
+    )
+      ? 'verified'
+      : null;
   }
-  if (result.status === 'deprecated') {
-    return 'deprecated';
+  return outcome ? { target, operation, outcome } : null;
+}
+
+export function evolutionOutcome(call: unknown): EvolutionOutcome | null {
+  return readEvolutionReceipt(call)?.outcome ?? null;
+}
+
+/** 每个 Recipe 的最终进化决策：进化（含替代提交）、废弃（含废弃提案）、跳过（验证仍有效）。 */
+export type EvolutionDecision = 'evolved' | 'deprecated' | 'skipped';
+
+/**
+ * 把工具回执按 Recipe 归并成决策表，同一 Recipe 只计一次。
+ *
+ * - 只认成功回执：请求被执行不等于决策已落库。
+ * - 提案分两类：Agent 选 deprecate 而 Core 降级为提案时仍属「废弃」，其余提案属「进化」。
+ * - 进化/废弃是已落库的变更，后到的「跳过」不能把它盖回「仍然有效」；两个变更之间后者生效。
+ * - expectedIds 非空时只统计清单内的 Recipe，防止无关 ID 冒充本维度的决策。
+ */
+export function collectEvolutionDecisions(
+  toolCalls: readonly unknown[],
+  expectedIds: readonly string[] = []
+): Map<string, EvolutionDecision> {
+  const decisions = new Map<string, EvolutionDecision>();
+  const expected = new Set(expectedIds);
+  for (const call of toolCalls) {
+    let id: unknown;
+    let decision: EvolutionDecision;
+    if (isPersistedSubmission(call)) {
+      id = readToolObservation(call).params.supersedes;
+      decision = 'evolved';
+    } else {
+      const receipt = readEvolutionReceipt(call);
+      if (!receipt) {
+        continue;
+      }
+      id = receipt.target;
+      decision =
+        receipt.outcome === 'verified'
+          ? 'skipped'
+          : receipt.outcome === 'deprecated' || receipt.operation === 'deprecate'
+            ? 'deprecated'
+            : 'evolved';
+    }
+    if (typeof id !== 'string' || !id || (expected.size > 0 && !expected.has(id))) {
+      continue;
+    }
+    if (decision === 'skipped' && decisions.has(id) && decisions.get(id) !== 'skipped') {
+      continue;
+    }
+    decisions.set(id, decision);
   }
-  return ['evolution_verified', 'evolution_skipped', 'verified'].includes(String(result.status))
-    ? 'verified'
-    : null;
+  return decisions;
 }
 
 export function collectSuccessfulEvolutionIds(
   toolCalls: readonly unknown[],
   expectedIds: readonly string[] = []
 ): Set<string> {
-  const ids = new Set<string>();
-  const expected = new Set(expectedIds);
-  for (const call of toolCalls) {
-    const observation = readToolObservation(call);
-    const id = isPersistedSubmission(call)
-      ? observation.params.supersedes
-      : evolutionOutcome(call)
-        ? (observation.params.id ?? observation.params.recipeId)
-        : null;
-    if (typeof id === 'string' && id && (expected.size === 0 || expected.has(id))) {
-      ids.add(id);
-    }
-  }
-  return ids;
+  return new Set(collectEvolutionDecisions(toolCalls, expectedIds).keys());
 }
 
 /** code.read 的实际成功路径；批量成员状态优先于请求列表，部分结果不能把失败成员标成已读。 */
