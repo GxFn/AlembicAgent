@@ -16,9 +16,10 @@
 //      a write site (assignment target or object-literal key). Host writers cannot
 //      be verified from this repository and are recorded as declared facts.
 //
-// Channels with an empty `writers` list are read here but written by nobody. They
-// are reported on every run as "unwired" so the gap stays visible; they do not fail
-// the lint, because removing a read path is a product decision, not a lint fix.
+// Channels with an empty `writers` list are read here but written by nobody. A dead
+// read path may only stay when the row records why (`unwiredReason`): wire it, delete
+// the read, or acknowledge the gap. Acknowledged gaps are reported on every run so they
+// stay visible, and the acknowledgment must be removed once a writer appears.
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -191,6 +192,18 @@ for (const [key, entry] of [...Object.entries(channels), ...Object.entries(prefi
   }
   if (typeof entry?.purpose !== 'string' || entry.purpose.trim().length === 0) {
     failures.push(`'${key}' needs a non-empty purpose`);
+  }
+  const acknowledged =
+    typeof entry?.unwiredReason === 'string' && entry.unwiredReason.trim().length > 0;
+  if (Array.isArray(entry?.writers) && Object.hasOwn(channels, key)) {
+    if (entry.writers.length === 0 && !acknowledged) {
+      failures.push(
+        `channel '${key}' has no writer — wire it, delete the read, or record an unwiredReason`
+      );
+    }
+    if (entry.writers.length > 0 && entry.unwiredReason !== undefined) {
+      failures.push(`channel '${key}' has writers but still carries an unwiredReason`);
+    }
   }
 }
 for (const [key, entry] of Object.entries(fields)) {

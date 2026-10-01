@@ -1138,12 +1138,7 @@ function resolvePcvSourceRefIndex(...sources: unknown[]): PcvProjectScopeSourceR
 
 function findProjectScopeSourceRefIndex(source: unknown): PcvProjectScopeSourceRefIndex | null {
   const record = asRecord(source);
-  const candidates = [
-    record.sourceRefIndex,
-    record.projectScopeSourceRefIndex,
-    record._sourceRefIndex,
-    record._projectScopeSourceRefIndex,
-  ];
+  const candidates = [record.sourceRefIndex, record.projectScopeSourceRefIndex];
   return candidates.find(isProjectScopeSourceRefIndex) ?? null;
 }
 
@@ -1156,8 +1151,6 @@ function collectCanonicalSourceIdentities(source: unknown): PcvCanonicalSourceId
     record.canonicalSourceIdentities,
     record.sourceRefIdentities,
     record._sourceIdentities,
-    record._projectScopeSourceIdentities,
-    record._canonicalSourceIdentities,
     asRecord(record.projectScope).sourceIdentities,
     asRecord(record.projectScopeAnalysis).sourceIdentities,
     asRecord(record.projectIntelligence).sourceIdentities,

@@ -530,7 +530,7 @@ interface GroundingContext {
 }
 
 function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingContext {
-  const evidenceStarters = ctx.context?.evidenceStarters ?? ctx.sharedState?._evidenceStarters;
+  const evidenceStarters = ctx.context?.evidenceStarters;
   const evidenceStarterRefs = uniqueStrings(extractSourceRefsFromValue(evidenceStarters)).slice(
     0,
     24
@@ -543,9 +543,6 @@ function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingCon
       ctx.context?.deterministicEvidenceRefs,
       ctx.context?.referencedFiles,
       ctx.context?.recordRepairEvidencePaths,
-      ctx.sharedState?._deterministicEvidenceRefs,
-      ctx.sharedState?._referencedFiles,
-      ctx.sharedState?._producerReferencedFiles,
       ctx.sharedState?._recordRepairEvidencePaths,
       ctx.sharedState?.referencedFiles,
     ]),

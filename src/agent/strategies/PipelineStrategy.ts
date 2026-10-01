@@ -1470,7 +1470,6 @@ export class PipelineStrategy extends Strategy {
       strategyContext.sourceIdentities ??
       strategyContext.projectScopeSourceIdentities ??
       baseSharedState?._sourceIdentities ??
-      baseSharedState?._projectScopeSourceIdentities ??
       baseSharedState?.sourceIdentities ??
       baseSharedState?.projectScopeSourceIdentities ??
       null;

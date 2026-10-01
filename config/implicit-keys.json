@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "description": "下划线隐式键登记表。sharedState / strategyContext / phaseResults 是多个模块和宿主共同读写的无类型容器，这些键没有编译期约束；本表给每个键一个归属：位于哪个容器、由谁写入、用途是什么。scripts/lint-implicit-keys.mjs 逐次校验：src/ 中出现的下划线键必须登记，登记的键必须仍在使用，writers 含 agent 当且仅当 src/ 中存在写入点。宿主侧写入无法在本仓校验，按 hostScanDate 当日对宿主源码的只读扫描登记。",
+  "description": "下划线隐式键登记表。sharedState / strategyContext / phaseResults 是多个模块和宿主共同读写的无类型容器，这些键没有编译期约束；本表给每个键一个归属：位于哪个容器、由谁写入、用途是什么。scripts/lint-implicit-keys.mjs 逐次校验：src/ 中出现的下划线键必须登记，登记的键必须仍在使用，writers 含 agent 当且仅当 src/ 中存在写入点，无人写入的通道必须用 unwiredReason 说明保留原因。宿主侧写入无法在本仓校验，按 hostScanDate 当日对宿主源码的只读扫描登记。",
   "hostScanDate": "2026-10-01",
   "containers": {
     "sharedState": "一次运行/一个维度内跨阶段共享的可变状态（宿主创建，经 SystemRunContext 或 strategyContext.sharedState 传入）",
@@ -35,20 +35,10 @@
       "writers": ["host"],
       "purpose": "冷启动会话 id；loopLedger 用它作为证据台账的 jobId。"
     },
-    "_canonicalSourceIdentities": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "PCV 来源身份的候选别名之一；本仓只读，宿主未写入。"
-    },
     "_computedBudget": {
       "container": "strategyContext",
       "writers": ["agent", "host"],
       "purpose": "按规模计算的 Analyst 预算。宿主冷启动与本仓 module-mining 入口写入；阶段工厂和 PipelineStrategy 读取。"
-    },
-    "_deterministicEvidenceRefs": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "LLM 输入装配的证据引用候选来源之一；本仓只读，宿主未写入。"
     },
     "_diagnostics": {
       "container": "phaseResults",
@@ -64,11 +54,6 @@
       "container": "sharedState",
       "writers": ["agent"],
       "purpose": "当前维度作用域 id。createSystemRunContext 写入；台账、PCV 记录、去重缓存键和工具上下文读取。"
-    },
-    "_evidenceStarters": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "证据起点的 sharedState 别名；宿主实际经 context.evidenceStarters 传入，本键无写入方。"
     },
     "_evolutionDecisionOnly": {
       "container": "sharedState",
@@ -90,11 +75,6 @@
       "writers": ["agent"],
       "purpose": "管线结局一等字段（completed/abandoned/failed/aborted 及原因）。PipelineStrategy 写入；运行时、Service 和 Coordinator 读取并聚合。"
     },
-    "_producerReferencedFiles": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "LLM 输入装配的引用文件候选来源之一；本仓只读，宿主未写入。"
-    },
     "_producerSubmitLedger": {
       "container": "sharedState",
       "writers": ["agent"],
@@ -108,22 +88,14 @@
     "_projectRevision": {
       "container": "sharedState",
       "writers": [],
-      "purpose": "重复调用缓存的项目快照别名；无写入方，缓存因此不生效。"
-    },
-    "_projectScopeSourceIdentities": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "PCV 来源身份的候选别名。宿主只在自己的 DI 容器上写同名字段，sharedState 上无写入方。"
-    },
-    "_projectScopeSourceRefIndex": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "PCV 来源引用索引的候选别名；本仓只读，宿主未写入。"
+      "purpose": "重复调用缓存的项目快照标识（别名）。",
+      "unwiredReason": "重复调用缓存没有快照提供方，缓存因此从不生效。它唯一有意义的适用范围是图谱查询，去留随图谱接线与公开面收窄一并决定。"
     },
     "_projectSnapshotId": {
       "container": "sharedState",
       "writers": [],
-      "purpose": "重复调用缓存的项目快照 id；无写入方，缓存因此不生效。"
+      "purpose": "重复调用缓存的项目快照标识。",
+      "unwiredReason": "重复调用缓存没有快照提供方，缓存因此从不生效。它唯一有意义的适用范围是图谱查询，去留随图谱接线与公开面收窄一并决定。"
     },
     "_recordRepairEvidencePaths": {
       "container": "sharedState",
@@ -140,11 +112,6 @@
       "writers": ["agent"],
       "purpose": "record_repair 是否真的调用过 note_finding；只写入供观测，本仓与宿主均无读取方。"
     },
-    "_referencedFiles": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "LLM 输入装配的引用文件候选来源之一；本仓只读，宿主未写入。"
-    },
     "_retryContext": {
       "container": "phaseResults",
       "writers": ["agent"],
@@ -159,11 +126,6 @@
       "container": "sharedState",
       "writers": ["agent"],
       "purpose": "规范来源身份。PipelineStrategy 从多个别名解析后写入阶段 sharedState；PCV 记录器读取。"
-    },
-    "_sourceRefIndex": {
-      "container": "sharedState",
-      "writers": [],
-      "purpose": "PCV 来源引用索引的候选别名；本仓只读，宿主未写入。"
     },
     "_strictAnalysisLoopReceipt": {
       "container": "phaseResults",
@@ -203,7 +165,8 @@
     "_workspaceRevision": {
       "container": "sharedState",
       "writers": [],
-      "purpose": "重复调用缓存的项目快照别名；无写入方，缓存因此不生效。"
+      "purpose": "重复调用缓存的项目快照标识（别名）。",
+      "unwiredReason": "重复调用缓存没有快照提供方，缓存因此从不生效。它唯一有意义的适用范围是图谱查询，去留随图谱接线与公开面收窄一并决定。"
     }
   },
   "prefixes": {

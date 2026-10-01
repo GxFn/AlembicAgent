@@ -15,9 +15,16 @@ import { createTempProject } from './helpers/tempProject.js';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
+interface ChannelRow {
+  container: string;
+  writers: string[];
+  purpose: string;
+  unwiredReason?: string;
+}
+
 interface Registry {
-  channels?: Record<string, { container: string; writers: string[]; purpose: string }>;
-  prefixes?: Record<string, { container: string; writers: string[]; purpose: string }>;
+  channels?: Record<string, ChannelRow>;
+  prefixes?: Record<string, ChannelRow>;
   fields?: Record<string, { owner: string; purpose: string }>;
 }
 
@@ -60,6 +67,10 @@ describe('implicit key lint CLI', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('Implicit-key lint OK');
+    // 无人写入的通道只剩重复调用缓存的三个快照键（去留随图谱接线决定）；新增必须显式登记原因。
+    expect(result.stdout).toContain(
+      'unwired channels (read here, written by nobody): _projectRevision, _projectSnapshotId, _workspaceRevision\n'
+    );
   });
 
   it('accepts registered channels, key families and typed fields, and reports unwired channels', () => {
@@ -88,7 +99,7 @@ describe('implicit key lint CLI', () => {
           _quoted: channel(['agent']),
           _literal: channel(['agent']),
           _hostOnly: channel(['host']),
-          _nobody: channel([]),
+          _nobody: { ...channel([]), unwiredReason: 'fixture: provider not wired yet' },
         },
         prefixes: { _retries_: channel(['agent'], 'phaseResults') },
         fields: { _score: { owner: 'src/reader.ts', purpose: 'fixture typed field' } },
@@ -177,6 +188,33 @@ describe('implicit key lint CLI', () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(message);
+  });
+
+  it('fails on a channel nobody writes unless the gap is acknowledged with a reason', () => {
+    const result = runLint(
+      { 'src/read.ts': 'export const f = (s: Record<string, unknown>) => s._orphan;' },
+      { channels: { _orphan: channel([]) } }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "channel '_orphan' has no writer — wire it, delete the read, or record an unwiredReason"
+    );
+  });
+
+  it('fails on a stale unwired acknowledgment once the channel has a writer', () => {
+    const result = runLint(
+      {
+        'src/wired.ts':
+          'export function f(s: Record<string, unknown>) {\n  s._wired = 1;\n  return s._wired;\n}',
+      },
+      { channels: { _wired: { ...channel(['agent']), unwiredReason: 'no longer true' } } }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "channel '_wired' has writers but still carries an unwiredReason"
+    );
   });
 
   it('rejects malformed registry rows before scanning', () => {
