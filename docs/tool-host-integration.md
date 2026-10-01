@@ -50,6 +50,8 @@ Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiM
 
 宿主可实现 `ToolContextFactoryContract.getAvailability(runtime?)`。它返回 `ToolAvailabilitySnapshot`：actions 是稀疏的工具动作约束，parameters 按 tool/action/参数名声明可用枚举。缺项不施加额外约束，显式空集禁用对应工具或动作。Main 复用实际服务装配进行方法检查，不调用 create/forRequest 分配运行状态，不执行 search/get/写入/sandbox 探测；已有 DI 仍可能正常解析惰性实例。
 
+Runtime 在循环初始化时用同一次 schema 投影的 `unavailable` 生成「本次运行不可用的工具」说明，追加到系统提示末尾（能力片段、阶段系统提示覆盖都适用）。静态提示里仍会提到的工具（例如没有图谱服务时的 `graph.query`）由这段说明明确标为不可调用；说明只反映宿主接线缺口，一次循环内不变。
+
 `ToolRouter.describeAvailability` 按实际端口方法描述 graph、outline、knowledge 管理分支和运行期 memory/evidence。prime 可以使用 search-only 路径；只有某些 manage 分支可用时保留这些分支。服务可用性不是 actor 权限，也不是 Core 对具体业务输入的批准。
 
 Adapter 的 explain、执行前检查、获得队列执行位置后的检查使用同一准入规则。 每次检查只消费本次固定并验证的动作/参数声明；快照不跨排队等待缓存，获得执行位置后仍读取最新宿主可用性和权限。排队期间撤销的能力不能继续执行；省略参数也要检查真实默认值。meta.tools 只查询当前有效 registry 视图，不修改全局注册表。

@@ -754,6 +754,19 @@ export class AgentRuntime {
         message: unavailable.reason,
       });
     }
+    // 提示与 schema 读同一份可用性事实：阶段请求了但宿主没接线的工具，在系统提示末尾明说。
+    const availabilityAwarePrompt = SystemPromptBuilder.injectToolAvailability(
+      baseSystemPrompt,
+      projection
+    );
+    if (availabilityAwarePrompt !== baseSystemPrompt) {
+      this.logger.info(
+        `[AgentRuntime] system prompt notes host-unavailable tools: ${[
+          ...new Set((projection.unavailable ?? []).map((entry) => entry.tool)),
+        ].join(', ')}`
+      );
+      baseSystemPrompt = availabilityAwarePrompt;
+    }
     if (
       caps.length > 0 &&
       toolContract.ids.length > 0 &&

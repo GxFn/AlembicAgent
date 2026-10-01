@@ -12,6 +12,9 @@
  * @module SystemPromptBuilder
  */
 
+import type { ToolUnavailableReason } from '#tools/kernel/availability.js';
+import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
+import { isToolActionAllowed } from '#tools/kernel/toolSelection.js';
 import type { Capability } from '../../tools/runtime/toolsets/Capability.js';
 
 /** File cache entry shape */
@@ -41,6 +44,16 @@ interface SystemPromptBuilderOptions {
   lang?: string | null;
   memoryConfig?: MemoryConfig | null;
 }
+
+/** 本次循环的工具 schema 投影中，与提示相关的两项事实。 */
+interface ToolAvailabilityProjection {
+  /** 宿主接线后实际可用的工具与动作（schema 与执行共用的同一份）。 */
+  allowedTools: ToolActionAllowlist;
+  /** 阶段请求了、但宿主没有接线的工具/动作/分支。 */
+  unavailable?: readonly ToolUnavailableReason[];
+}
+
+const TOOL_AVAILABILITY_HEADING = '## 本次运行不可用的工具';
 
 /** Budget injection options */
 interface BudgetOptions {
@@ -179,6 +192,78 @@ export class SystemPromptBuilder {
       `到达第 ${verifyEnd} 轮时你必须开始输出总结，不要继续搜索。`
     );
   }
+
+  /**
+   * 注入「本次运行不可用的工具」说明。
+   *
+   * 工具 schema 已按宿主接线事实裁剪，但能力片段、阶段系统提示和门重试提示都是静态文本，
+   * 仍会推荐没接线的工具（例如没有图谱服务时的 graph.query）。这里用同一份 schema 投影
+   * 生成说明，让提示和 schema 读同一个事实；模型不必通过一次被拒绝的调用才发现工具不存在。
+   *
+   * 只描述宿主接线缺口（一次循环内不变），不描述阶段策略对工具的临时收紧，
+   * 因此同一循环内系统提示保持稳定，不破坏 provider 的提示缓存。
+   *
+   * @param prompt 已完成角色/能力/预算装配的系统提示词
+   * @param projection 本次循环的 schema 投影（allowedTools + unavailable）
+   * @returns 没有缺口或已注入过时原样返回
+   */
+  static injectToolAvailability(prompt: string, projection: ToolAvailabilityProjection) {
+    if (!projection.unavailable?.length || prompt.includes(TOOL_AVAILABILITY_HEADING)) {
+      return prompt;
+    }
+    const lines = describeUnavailableTools(projection);
+    if (lines.length === 0) {
+      return prompt;
+    }
+    return (
+      prompt +
+      `\n\n${TOOL_AVAILABILITY_HEADING}\n` +
+      '宿主没有接线下列工具、动作或分支，它们不在当前工具 schema 中，调用会被拒绝。' +
+      '本提示其余部分提到它们的步骤，一律改用仍可用的工具完成，不要调用：\n' +
+      lines.join('\n')
+    );
+  }
+}
+
+/** 把不可用条目归并成给模型看的行：整工具 > 整动作 > 分支，细的不重复粗的。 */
+function describeUnavailableTools(projection: ToolAvailabilityProjection): string[] {
+  const byTool = new Map<string, ToolUnavailableReason[]>();
+  for (const entry of projection.unavailable ?? []) {
+    const entries = byTool.get(entry.tool) ?? [];
+    entries.push(entry);
+    byTool.set(entry.tool, entries);
+  }
+
+  const lines: string[] = [];
+  for (const [tool, entries] of byTool) {
+    // 没有任何可用动作，或宿主给出的是工具级原因：整个工具都不要调用。
+    if (
+      !isToolActionAllowed(projection.allowedTools, tool) ||
+      entries.some((entry) => !entry.action)
+    ) {
+      lines.push(`- ${tool}（整个工具不可用）`);
+      continue;
+    }
+    const deadActions = new Set(
+      entries.filter((entry) => entry.action && !entry.operation).map((entry) => entry.action)
+    );
+    for (const action of deadActions) {
+      lines.push(`- ${tool}.${action}`);
+    }
+    const branches = new Map<string, Set<string>>();
+    for (const entry of entries) {
+      if (!entry.action || !entry.operation || deadActions.has(entry.action)) {
+        continue;
+      }
+      const operations = branches.get(entry.action) ?? new Set<string>();
+      operations.add(entry.operation);
+      branches.set(entry.action, operations);
+    }
+    for (const [action, operations] of branches) {
+      lines.push(`- ${tool}.${action}：以下分支不可用——${[...operations].sort().join('、')}`);
+    }
+  }
+  return lines;
 }
 
 function getTrackerString(tracker: unknown, key: string): string | null {
