@@ -60,10 +60,41 @@ export function hashCanonical(value: unknown): string {
     .digest('hex');
 }
 
+/**
+ * 与 Core `hashCanonicalJson` 逐字节一致的哈希，用于跨仓交叉校验的值
+ * （校验 Core 生成的 fixpointHash；生成由 Core 复算的 authoredFingerprint）。
+ *
+ * 键按 UTF-16 码元序（`Array.prototype.sort` 默认序）排列，与 Core 的
+ * `Object.keys().sort()` 相同，不随运行环境的 locale/ICU 变化。不能借用下方仓内
+ * `hashCanonical` 的 localeCompare 顺序：两者在 `refs`/`refSet` 这类键对上不同。
+ * Core 尚未从公开子路径导出该实现；导出后应改为直接消费，删除这份镜像。
+ */
 export function hashCoreCanonical(value: unknown): string {
-  return `sha256:${hashCanonical(value)}`;
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify(sortCoreCanonical(value)))
+    .digest('hex')}`;
 }
 
+function sortCoreCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortCoreCanonical);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  // Object.fromEntries 以自有数据属性写入，`__proto__` 作为普通键保留（与 Core 一致）。
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => [key, sortCoreCanonical((value as Record<string, unknown>)[key])])
+  );
+}
+
+/**
+ * 仓内自用哈希的键排序（localeCompare）。已有持久化的 epoch/lineage/expression 哈希依赖
+ * 这个顺序，改动会让旧数据校验失败，因此保持不变；它依赖运行环境 locale，跨环境校验
+ * 同一份数据时存在不一致风险，收敛到码元序需要配套的数据迁移决定。
+ */
 function sortCanonical(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sortCanonical);
