@@ -29,6 +29,8 @@ export interface ErrorClassification {
   isRetryable: boolean;
   /** 是否服务端错误（用于熔断计数）：网络错误 / 429 / 5xx / 无 status。 */
   isServerError: boolean;
+  /** 服务已应答但模型输出不可执行（如工具参数非法）；不重试，也不计入熔断。 */
+  isModelOutputError: boolean;
   /** HTTP 状态码（若有）。 */
   status: number;
   /** cause 链上的底层错误码（若有）。 */
@@ -71,6 +73,12 @@ export function classifyLlmError(err: unknown): ErrorClassification {
   const isLocalInputError = e.code === 'LLM_INVALID_REQUEST' || e.code === 'API_KEY_MISSING';
   const isRetryable = !isLocalInputError && (status === 429 || status >= 500 || isNetworkError);
 
+  // 模型输出被本地拒绝（LlmResponseError）：请求已被服务正常处理，坏的是模型给出的内容。
+  // 它是模型行为而不是服务可用性信号——计入熔断会让一个模型的坏输出把同 provider 的其他
+  // 并发请求一起挡掉。注意与 LLM_INVALID_RESPONSE 区分：后者是响应体不符合协议（上游或
+  // 代理返回了坏 body），仍按服务端故障兜底计数。
+  const isModelOutputError = !e.status && e.code === 'LLM_INVALID_TOOL_CALL';
+
   // 程序员错误（TypeError/ReferenceError/SyntaxError/RangeError）是代码 bug，不是服务端
   // 故障，绝不能计入熔断 — 否则一个确定性 bug 连续抛出会把熔断器打开、伪装成「AI 服务中断」。
   const isProgrammerError =
@@ -80,10 +88,19 @@ export function classifyLlmError(err: unknown): ErrorClassification {
     e.name === 'RangeError';
 
   // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题。无 status 的错误默认按服务端
-  // 故障兜底（保留对未知网络错误的检测），但排除上面的程序员错误类型。
+  // 故障兜底（保留对未知网络错误的检测），但排除上面的程序员错误与模型输出错误。
   const isServerError =
     !isLocalInputError &&
+    !isModelOutputError &&
     (isNetworkError || status === 429 || status >= 500 || (!e.status && !isProgrammerError));
 
-  return { isAbort, isNetworkError, isRetryable, isServerError, status, causeCode };
+  return {
+    isAbort,
+    isNetworkError,
+    isRetryable,
+    isServerError,
+    isModelOutputError,
+    status,
+    causeCode,
+  };
 }

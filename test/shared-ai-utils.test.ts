@@ -220,6 +220,27 @@ describe('shared/errorClassify classifyLlmError', () => {
     expect(c.isServerError).toBe(false);
   });
 
+  it('separates rejected model output from service failures', () => {
+    // 模型输出不可执行：服务已应答，不重试、不计入熔断。
+    const rejected = classifyLlmError(
+      Object.assign(new Error('Invalid tool arguments'), {
+        name: 'LlmResponseError',
+        code: 'LLM_INVALID_TOOL_CALL',
+      })
+    );
+    expect(rejected.isModelOutputError).toBe(true);
+    expect(rejected.isRetryable).toBe(false);
+    expect(rejected.isServerError).toBe(false);
+
+    // 响应体不符合协议：仍按服务端故障兜底计数。
+    const badBody = classifyLlmError({ message: 'bad body', code: 'LLM_INVALID_RESPONSE' });
+    expect(badBody.isModelOutputError).toBe(false);
+    expect(badBody.isServerError).toBe(true);
+
+    // 带 HTTP 状态的错误不受该分类影响。
+    expect(classifyLlmError({ status: 503 }).isModelOutputError).toBe(false);
+  });
+
   it('reads cause.code for network classification', () => {
     const c = classifyLlmError({ message: 'fetch failed', cause: { code: 'ECONNRESET' } });
     expect(c.isNetworkError).toBe(true);

@@ -300,8 +300,15 @@ export class ReliabilityController {
           return result;
         } catch (err: unknown) {
           throwIfLlmCancelled(abortSignal, err);
-          const { isAbort, isNetworkError, isRetryable, isServerError, causeCode, status } =
-            classifyLlmError(err);
+          const {
+            isAbort,
+            isNetworkError,
+            isRetryable,
+            isServerError,
+            isModelOutputError,
+            causeCode,
+            status,
+          } = classifyLlmError(err);
 
           // AbortError — 外部主动中止，不重试直接抛出
           if (isAbort) {
@@ -351,6 +358,13 @@ export class ReliabilityController {
             // 只有服务端 / 网络错误才累计熔断计数；客户端错误 (4xx 非 429) 不触发熔断
             if (isServerError) {
               this.recordFailure(epoch);
+            } else if (isModelOutputError) {
+              // 服务已应答、模型输出被拒：熔断状态保持原样。半开探活既不据此重开也不据此闭合，
+              // 探活许可由外层 finally 归还，下一个请求继续核验服务。
+              this.log(
+                'info',
+                `[CircuitBreaker] ${this.label} model output rejected (code=${(e as { code?: string }).code || 'unknown'}); not counted as service failure, circuit stays ${this.circuitState}`
+              );
             }
             throw e;
           }

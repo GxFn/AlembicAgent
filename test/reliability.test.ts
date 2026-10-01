@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { LlmResponseError } from '../src/ai/errors.js';
 import { ReliabilityController } from '../src/ai/shared/reliability.js';
 
 afterEach(() => {
@@ -397,6 +398,57 @@ describe('ReliabilityController retry & circuit breaker', () => {
     await expect(c.run(() => Promise.reject(bug), 0, 1)).rejects.toBeInstanceOf(TypeError);
     expect(c.circuitFailures).toBe(0);
     expect(c.circuitState).toBe('CLOSED');
+  });
+
+  it('does not trip the circuit when the model output is rejected', async () => {
+    const logs: string[] = [];
+    const c = new ReliabilityController({
+      maxRetries: 0,
+      circuitThreshold: 1,
+      label: 'fixture',
+      onLog: (_level, message) => logs.push(message),
+    });
+    // 服务已正常应答，只是模型给出的工具参数不可执行：这是模型行为，不是服务中断。
+    // 计入熔断会让一个模型的坏输出把同 provider 的其他并发请求一起挡掉。
+    const rejected = new LlmResponseError('Invalid tool arguments from fixture', null);
+    await expect(c.run(() => Promise.reject(rejected), 0, 1)).rejects.toBe(rejected);
+    expect(c.circuitFailures).toBe(0);
+    expect(c.circuitState).toBe('CLOSED');
+    expect(c.activeRequests).toBe(0);
+    expect(logs.some((line) => line.includes('LLM_INVALID_TOOL_CALL'))).toBe(true);
+    await expect(c.run(() => Promise.resolve('ok'), 0, 1)).resolves.toBe('ok');
+  });
+
+  it('still counts a protocol-invalid provider response as a service failure', async () => {
+    const c = new ReliabilityController({ maxRetries: 0, circuitThreshold: 1 });
+    // HTTP 成功但响应体不符合协议，属于上游/代理故障信号，仍计入熔断。
+    const badBody = Object.assign(new Error('fixture SDK response validation failed'), {
+      code: 'LLM_INVALID_RESPONSE',
+    });
+    await expect(c.run(() => Promise.reject(badBody), 0, 1)).rejects.toBe(badBody);
+    expect(c.circuitFailures).toBe(1);
+    expect(c.circuitState).toBe('OPEN');
+  });
+
+  it('keeps a half-open probe pending when the probe ends in rejected model output', async () => {
+    vi.useFakeTimers();
+    const c = new ReliabilityController({ maxRetries: 0, circuitThreshold: 1 });
+    await expect(c.run(() => Promise.reject(serviceFailure()), 0, 1)).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(c.circuitState).toBe('OPEN');
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // 探活请求拿到了应答但模型输出被拒：既不能据此重新打开，也不能据此宣布恢复。
+    const rejected = new LlmResponseError('Invalid tool proposal from fixture', null);
+    await expect(c.run(() => Promise.reject(rejected), 0, 1)).rejects.toBe(rejected);
+    expect(c.circuitState).toBe('HALF_OPEN');
+    expect(c.circuitCooldownMs).toBe(60_000);
+
+    // 探活许可已归还：下一个请求继续核验服务，成功后闭合。
+    await expect(c.run(() => Promise.resolve('ok'), 0, 1)).resolves.toBe('ok');
+    expect(c.circuitState).toBe('CLOSED');
+    expect(c.circuitFailures).toBe(0);
   });
 
   it('classifies timeout as retryable and opens the circuit', async () => {
