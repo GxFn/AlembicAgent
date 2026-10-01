@@ -117,6 +117,10 @@ rg 的退出码1表示无匹配，其他错误不冒充空成功；仅明确缺�
 
 终端 stdout/stderr 保留前导空白，专用解析器只压缩 stdout，stderr 仍进入总预算。复合命令使用通用输出；解析器无法确认格式或完整性时记录降级并保留原文。截断提示本身计入预算，长单行保留头尾。测试、lint 和包管理摘要分开计算总数与展示上限，不能把进度日志或多个运行摘要合成成功结论。
 
+## 终端沙箱
+
+`terminal.exec` 通过 `ToolContext.sandboxExecutor` 执行；沙箱不可用时的降级由执行器自己报告（`diagnostics.sandboxed/fallbackUsed/degradeReason`），Agent 原样带入结果与审计。宿主没有注入执行器时，Agent 在启动任何进程之前拒绝调用，结果状态为 `blocked`，诊断码 `terminal_sandbox_required`。只有 `ToolContext.allowUnsandboxedTerminal === true` 时才以普通子进程执行（继承宿主环境变量），结果带 `[unsandboxed:missing_sandbox_executor]` 标记；该开关面向测试夹具和自担风险的受信宿主，生产宿主不应打开。
+
 ## 其他宿主能力
 
 graph 等待同步或异步宿主读取，保留宿主统计字段，不把未完成查询补成零计数。没有方法是能力不可用，方法返回 null 才表示空结果。备用查询保留原优先级及 this，并记录选择路径；取消后不再启动备用读取。当前 Main 没有装配 projectGraph，本能力通过明确的宿主端口接入。

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -601,13 +601,49 @@ describe('runtime terminal.exec safety', () => {
     });
   });
 
-  it('surfaces sandbox fallback diagnostics when no sandbox executor is injected', async () => {
+  it('refuses to run when no sandbox executor is injected', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-terminal-safety-'));
+    const marker = path.join(root, 'executed.marker');
+    const auditEntries: unknown[] = [];
+    try {
+      // 命令若被执行会留下标记文件；默认拒绝必须发生在任何进程启动之前。
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`
+      )}`;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          projectRoot: root,
+          auditSink: { log: (entry) => auditEntries.push(entry) },
+        })
+      );
+
+      expect(existsSync(marker)).toBe(false);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('no sandbox executor');
+      expect(result._meta?.resultStatus).toBe('blocked');
+      expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+        code: 'terminal_sandbox_required',
+        stage: 'terminal.exec',
+        tool: 'terminal',
+      });
+      expect(auditEntries).toHaveLength(1);
+      expect(auditEntries[0]).toMatchObject({ action: 'terminal.exec', result: 'failure' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('runs unsandboxed only when the host explicitly opts in, and says so in the result', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-terminal-safety-'));
     try {
       const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
         "process.stdout.write('ok')"
       )}`;
-      const result = await runTerminalExec(command, baseToolContext({ projectRoot: root }));
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({ projectRoot: root, allowUnsandboxedTerminal: true })
+      );
 
       expect(result.ok).toBe(true);
       expect(String(result.data)).toContain('ok');
@@ -621,6 +657,23 @@ describe('runtime terminal.exec safety', () => {
         stage: 'terminal.exec',
         tool: 'terminal',
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not treat a truthy non-boolean opt-in as permission to run unsandboxed', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-terminal-safety-'));
+    try {
+      const result = await runTerminalExec(
+        'pwd',
+        baseToolContext({
+          projectRoot: root,
+          allowUnsandboxedTerminal: 'yes' as unknown as boolean,
+        })
+      );
+      expect(result.ok).toBe(false);
+      expect(result._meta?.resultStatus).toBe('blocked');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -146,8 +146,15 @@ export interface ToolContext {
   /** 安全策略 — terminal handler 可选引用 */
   safetyPolicy?: unknown;
 
-  /** Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入，未注入时降级为 plain exec */
+  /** Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入；未注入时默认拒绝执行。 */
   sandboxExecutor?: unknown;
+
+  /**
+   * 显式许可：没有 sandboxExecutor 时允许 terminal 以普通子进程执行（继承宿主环境变量）。
+   * 只有字面量 true 生效。面向测试夹具和自担风险的受信宿主；生产宿主应注入
+   * sandboxExecutor，由沙箱模块自己报告降级，而不是打开这个开关。
+   */
+  allowUnsandboxedTerminal?: boolean;
 
   /** Optional audit sink. Mirrors the host AuditLogger.log(entry) duck type. */
   auditSink?: ToolAuditSinkLike;

@@ -112,8 +112,10 @@ and the host knowledge-management port requirements.
 - **Budget and exit control** — session-budget pressure triggers staged context compression; exhausted budgets, iteration limits, timeouts, and `ExitController` signals stop execution. A forced-summary fallback preserves
   available partial work; cancellation and timeouts suppress extra model summaries.
 - **Tool safety** — `terminal` runs behind a global dangerous-command
-  blocklist plus a read-only allowlist, sandboxed when available (audited on
-  degradation); `code.write` enforces a read-before-write freshness (TOCTOU)
+  blocklist plus a read-only allowlist and executes through the host-injected
+  sandbox executor (degradation reported by the executor is audited). Without an
+  executor it refuses to run unless the host sets `allowUnsandboxedTerminal`;
+  `code.write` enforces a read-before-write freshness (TOCTOU)
   gate backed by a view-scoped `DeltaCache`. File-version fingerprints are distinct
   from full-content visibility; host state is released at loop/run completion.
   See [tool host integration](docs/tool-host-integration.md) for ports and lifecycle contracts.

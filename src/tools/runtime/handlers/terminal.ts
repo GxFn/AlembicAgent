@@ -6,8 +6,10 @@
  *
  * 执行流程: 安全检查 → cwd 校验 → Seatbelt 沙箱执行 → OutputCompressor 压缩 → token budget 截断
  *
- * 沙箱集成: 通过 ToolContext.sandboxExecutor 注入 SandboxExecutor，
- *           未注入时降级为 plain exec（测试/非 macOS 环境）。
+ * 沙箱集成: 通过 ToolContext.sandboxExecutor 注入 SandboxExecutor。
+ *           未注入时默认拒绝执行（fail-closed）：宿主漏接线不应悄悄变成继承宿主环境变量的
+ *           无沙箱执行。只有 ToolContext.allowUnsandboxedTerminal === true 时才降级为
+ *           plain exec，并在结果里标注 unsandboxed。
  */
 
 import { exec } from 'node:child_process';
@@ -29,6 +31,9 @@ import { checkTerminalCommandAllowlist, checkTerminalCommandSafety } from './ter
 
 const execAsync = promisify(exec);
 const SANDBOX_FALLBACK_REASON = 'missing_sandbox_executor';
+const SANDBOX_REQUIRED_MESSAGE =
+  'Terminal execution unavailable: no sandbox executor is configured for this host. ' +
+  'Continue with code/graph/knowledge tools instead.';
 
 export async function handle(
   action: string,
@@ -86,6 +91,34 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
       fail(
         `Command blocked by allowlist: ${allowlistCheck.block.reason} (${allowlistCheck.block.rule})`
       ),
+      'failure'
+    );
+  }
+
+  // 执行器缺失且宿主没有显式许可：在启动任何进程之前拒绝。blocked 状态让 adapter 把它记入
+  // blockedTools，诊断里写明触发条件，宿主能据此发现接线缺口。
+  if (!ctx.sandboxExecutor && ctx.allowUnsandboxedTerminal !== true) {
+    return finish(
+      {
+        ok: false,
+        data: null,
+        error: SANDBOX_REQUIRED_MESSAGE,
+        _meta: {
+          cached: false,
+          tokensEstimate: 0,
+          durationMs: Date.now() - startMs,
+          resultStatus: 'blocked',
+          diagnosticWarnings: [
+            {
+              code: 'terminal_sandbox_required',
+              message:
+                'sandboxExecutor missing and allowUnsandboxedTerminal is not true; command was not started',
+              stage: 'terminal.exec',
+              tool: 'terminal',
+            },
+          ],
+        },
+      },
       'failure'
     );
   }
@@ -201,7 +234,7 @@ function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'tim
 }
 
 /**
- * 优先使用 Seatbelt 沙箱执行，未注入时降级为 plain exec。
+ * 优先使用 Seatbelt 沙箱执行；未注入时只有调用方已通过显式许可检查才会走到 plain exec。
  *
  * ctx.sandboxExecutor 由 ToolContextFactory 从 DI 容器注入，
  * 类型为 { exec(cmd, opts): Promise<{stdout,stderr,exitCode}> }
@@ -229,7 +262,7 @@ async function execInSandboxOrDirect(
     };
   }
 
-  // 降级: plain exec（测试环境 / sandboxExecutor 未注入）
+  // 降级: plain exec（sandboxExecutor 未注入，且 allowUnsandboxedTerminal === true）
   const diagnostics = {
     sandboxed: false,
     fallbackUsed: true,

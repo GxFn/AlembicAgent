@@ -101,7 +101,8 @@ translation、module mining)以领域 profile 与结果投影包装同一个服�
   终止由 max-iterations / timeout / `ExitController` 退出信号负责,并有
   强制总结兜底,在允许收尾时保留已有成果；取消和超时不会追加模型总结。
 - **工具安全** —— `terminal` 在全局危险命令黑名单 + 只读 allowlist
-  双层安全下执行,可用时走沙箱(降级时记审计);`code.write` 强制
+  双层安全下执行,经宿主注入的沙箱执行器运行(执行器报告的降级会记审计);
+  未注入执行器时默认拒绝,除非宿主显式设置 `allowUnsandboxedTerminal`;`code.write` 强制
   写前新鲜度门(read-before-write / TOCTOU),由读取视图内共享的
   `DeltaCache` 支撑，文件版本指纹与全文可见性分开记录，循环/运行结束时释放宿主状态。
   端口与生命周期规则见[工具宿主接入](docs/tool-host-integration.md)。
