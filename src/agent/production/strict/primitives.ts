@@ -66,7 +66,7 @@ export function hashCanonical(value: unknown): string {
  *
  * 键按 UTF-16 码元序（`Array.prototype.sort` 默认序）排列，与 Core 的
  * `Object.keys().sort()` 相同，不随运行环境的 locale/ICU 变化。不能借用下方仓内
- * `hashCanonical` 的 localeCompare 顺序：两者在 `refs`/`refSet` 这类键对上不同。
+ * `hashCanonical` 的排序规则顺序：两者在 `refs`/`refSet` 这类键对上不同。
  * Core 尚未从公开子路径导出该实现；导出后应改为直接消费，删除这份镜像。
  */
 export function hashCoreCanonical(value: unknown): string {
@@ -91,9 +91,12 @@ function sortCoreCanonical(value: unknown): unknown {
 }
 
 /**
- * 仓内自用哈希的键排序（localeCompare）。已有持久化的 epoch/lineage/expression 哈希依赖
- * 这个顺序，改动会让旧数据校验失败，因此保持不变；它依赖运行环境 locale，跨环境校验
- * 同一份数据时存在不一致风险，收敛到码元序需要配套的数据迁移决定。
+ * 仓内自用哈希的键排序。已有持久化的 epoch/lineage/expression 哈希依赖 localeCompare 的
+ * 顺序（与码元序不同，例如 `clusters` 排在 `clusterSetHash` 之前），改成码元序会让旧数据
+ * 校验失败，需要配套的数据迁移决定，因此顺序保持不变。
+ *
+ * 排序规则固定为 en：英文、中文环境下与不带参数的历史结果完全相同，同时不再随进程默认
+ * 区域变化（匈牙利语、丹麦语等区域对 ASCII 标识符的排序不同）。
  */
 function sortCanonical(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -104,7 +107,8 @@ function sortCanonical(value: unknown): unknown {
   }
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
+      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
+      .sort(([left], [right]) => left.localeCompare(right, 'en'))
       .map(([key, child]) => [key, sortCanonical(child)])
   );
 }

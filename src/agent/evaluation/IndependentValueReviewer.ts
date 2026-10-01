@@ -398,7 +398,8 @@ function sortCanonical(value: unknown): unknown {
   }
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
+      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
+      .sort(([left], [right]) => left.localeCompare(right, 'en'))
       .map(([key, child]) => [key, sortCanonical(child)])
   );
 }
