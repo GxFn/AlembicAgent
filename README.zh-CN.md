@@ -146,6 +146,7 @@ npm test             # vitest run(mock provider,不需要真实 API key)
 | `lint:layer-contract` / `lint:space-edges` | 分层与模块边规则 |
 | `lint:doctrine` | 副作用信条 —— 无 import-time 工作,副作用一律经注入端口流动(见 `docs/side-effect-doctrine-census.md`) |
 | `lint:naming` / `lint:retired-symbols` | 命名规则;已退役符号不得复活 |
+| `lint:implicit-keys` | 无类型共享容器(sharedState / strategyContext / phaseResults)上的每个 `_xxx` 键都在 `config/implicit-keys.json` 登记容器与写入方;同时报告无人写入的通道 |
 | `verify:validation-floor` | 最低验证下限 |
 | `test` | vitest 套件(`test/`),含接口契约、终端安全、PCV observe-only 表征/验收测试 |
 

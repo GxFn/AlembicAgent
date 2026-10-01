@@ -165,6 +165,7 @@ boundary/contract gates —
 | `lint:layer-contract` / `lint:space-edges` | layering and module-edge rules |
 | `lint:doctrine` | side-effect doctrine — no import-time work, effects flow through injected ports (see `docs/side-effect-doctrine-census.md`) |
 | `lint:naming` / `lint:retired-symbols` | naming rules; retired symbols stay dead |
+| `lint:implicit-keys` | every `_xxx` key on the untyped shared bags (sharedState / strategyContext / phaseResults) is registered in `config/implicit-keys.json` with its container and writers; reports channels nobody writes |
 | `verify:validation-floor` | minimum validation floor |
 | `test` | vitest suite (`test/`), including interface-contract, terminal-safety, and PCV observe-only characterization/acceptance tests |
 

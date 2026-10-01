@@ -1,0 +1,313 @@
+{
+  "schemaVersion": 1,
+  "description": "下划线隐式键登记表。sharedState / strategyContext / phaseResults 是多个模块和宿主共同读写的无类型容器，这些键没有编译期约束；本表给每个键一个归属：位于哪个容器、由谁写入、用途是什么。scripts/lint-implicit-keys.mjs 逐次校验：src/ 中出现的下划线键必须登记，登记的键必须仍在使用，writers 含 agent 当且仅当 src/ 中存在写入点。宿主侧写入无法在本仓校验，按 hostScanDate 当日对宿主源码的只读扫描登记。",
+  "hostScanDate": "2026-10-01",
+  "containers": {
+    "sharedState": "一次运行/一个维度内跨阶段共享的可变状态（宿主创建，经 SystemRunContext 或 strategyContext.sharedState 传入）",
+    "strategyContext": "宿主注入给 Strategy 的运行上下文（AgentRunInput.context.strategyContext）",
+    "phaseResults": "PipelineStrategy 的阶段结果表，最终以 AgentRunResult.phases 返回宿主",
+    "toolCallContext": "legacy 工具处理器上下文（tools/kernel/handler.ts 的 InternalToolHandlerContext）",
+    "hostContainer": "宿主 DI 容器的内部字段，本仓越过端口直接读取"
+  },
+  "channels": {
+    "_aiProviderManager": {
+      "container": "hostContainer",
+      "writers": ["host"],
+      "purpose": "关系发现任务读取宿主容器 singletons 上的 provider 管理器以判断是否 Mock 模式；越过端口的宿主耦合，应由显式端口替代。"
+    },
+    "_analystGraphEvidence": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "insightGateEvaluator 写入 Analyst 真实 graph 查询的可复制 refs；knowledge.submit 在 GRAPH_REF_INVALID 时据此补全。"
+    },
+    "_analystGroundedRanges": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "insightGateEvaluator 写入 Analyst 已接地的文件行范围；knowledge.submit 用它把裸路径 sourceRefs 规范化。"
+    },
+    "_bootstrapDedup": {
+      "container": "sharedState",
+      "writers": ["agent", "host"],
+      "purpose": "冷启动去重器。宿主放入 sharedState，runtimeBridge 读出后经 legacy 工具上下文同名字段交给提交处理器。"
+    },
+    "_bootstrapSessionId": {
+      "container": "sharedState",
+      "writers": ["host"],
+      "purpose": "冷启动会话 id；loopLedger 用它作为证据台账的 jobId。"
+    },
+    "_canonicalSourceIdentities": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "PCV 来源身份的候选别名之一；本仓只读，宿主未写入。"
+    },
+    "_computedBudget": {
+      "container": "strategyContext",
+      "writers": ["agent", "host"],
+      "purpose": "按规模计算的 Analyst 预算。宿主冷启动与本仓 module-mining 入口写入；阶段工厂和 PipelineStrategy 读取。"
+    },
+    "_deterministicEvidenceRefs": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "LLM 输入装配的证据引用候选来源之一；本仓只读，宿主未写入。"
+    },
+    "_diagnostics": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "PipelineStrategy 在门缺少 activeContext 时累积的上下文告警。"
+    },
+    "_dimensionMeta": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "当前维度元数据（id、outputType、allowedKnowledgeTypes）。createSystemRunContext 写入；运行时、台账、PCV 记录和工具上下文读取。"
+    },
+    "_dimensionScopeId": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "当前维度作用域 id。createSystemRunContext 写入；台账、PCV 记录、去重缓存键和工具上下文读取。"
+    },
+    "_evidenceStarters": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "证据起点的 sharedState 别名；宿主实际经 context.evidenceStarters 传入，本键无写入方。"
+    },
+    "_evolutionDecisionOnly": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "PipelineStrategy 在进化补写轮置位；evolutionDecisionGate 据此只放行 knowledge.manage 决策调用。"
+    },
+    "_pcvChainNodes": {
+      "container": "sharedState",
+      "writers": ["host"],
+      "purpose": "宿主写入的 PCV 链节点表；PipelineStrategy 和 PCV 记录器读取。"
+    },
+    "_pcvStageNodeMap": {
+      "container": "sharedState",
+      "writers": ["host"],
+      "purpose": "宿主写入的 阶段→PCV 节点 映射；PipelineStrategy 和 PCV 记录器读取。"
+    },
+    "_pipelineOutcome": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "管线结局一等字段（completed/abandoned/failed/aborted 及原因）。PipelineStrategy 写入；运行时、Service 和 Coordinator 读取并聚合。"
+    },
+    "_producerReferencedFiles": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "LLM 输入装配的引用文件候选来源之一；本仓只读，宿主未写入。"
+    },
+    "_producerSubmitLedger": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "Producer 提交台账（已提交/被拒标题）。submissionLedger 写入；LLM 输入装配读取以提示已提交项。"
+    },
+    "_projectLanguage": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "项目主语言。createSystemRunContext 写入；runtimeBridge 读出后交给工具上下文。"
+    },
+    "_projectRevision": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "重复调用缓存的项目快照别名；无写入方，缓存因此不生效。"
+    },
+    "_projectScopeSourceIdentities": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "PCV 来源身份的候选别名。宿主只在自己的 DI 容器上写同名字段，sharedState 上无写入方。"
+    },
+    "_projectScopeSourceRefIndex": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "PCV 来源引用索引的候选别名；本仓只读，宿主未写入。"
+    },
+    "_projectSnapshotId": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "重复调用缓存的项目快照 id；无写入方，缓存因此不生效。"
+    },
+    "_recordRepairEvidencePaths": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "record_repair 微阶段可引用的证据路径。PipelineStrategy 写入阶段 sharedState；LLM 输入装配和 PCV 记录器读取。"
+    },
+    "_recordRepairOnly": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "record_repair 微阶段标记。PipelineStrategy 写入；运行时、输入装配、阶段门据此只允许 note_finding。"
+    },
+    "_recordRepairToolWritten": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "record_repair 是否真的调用过 note_finding；只写入供观测，本仓与宿主均无读取方。"
+    },
+    "_referencedFiles": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "LLM 输入装配的引用文件候选来源之一；本仓只读，宿主未写入。"
+    },
+    "_retryContext": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "门判定重试时留给被重试阶段的原因与产物；该阶段构建提示后清除。"
+    },
+    "_sessionCounters": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "会话计数盒（修复层命中、waiver、拒绝止损）。PipelineStrategy 预建；knowledge 处理器写入计数，管线收尾投影读取。"
+    },
+    "_sourceIdentities": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "规范来源身份。PipelineStrategy 从多个别名解析后写入阶段 sharedState；PCV 记录器读取。"
+    },
+    "_sourceRefIndex": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "PCV 来源引用索引的候选别名；本仓只读，宿主未写入。"
+    },
+    "_strictAnalysisLoopReceipt": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "严格链分析迭代的回执链；PipelineStrategy 追加并校验连续性。"
+    },
+    "_strictAnalysisRetryCount": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "严格链分析重试次数。"
+    },
+    "_strictGateReturns": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "严格链各门的 typed return 列表（通过与失败关闭）。"
+    },
+    "_strictRoleRouteReceipt": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "严格链阶段角色路由回执。"
+    },
+    "_styleRepairAttempts": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "knowledge.submit 文风修复的按标题尝试次数。"
+    },
+    "_submitTitleAttempts": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "knowledge.submit 按标题的提交尝试次数，优先放在 _sessionCounters 盒内，回落 sharedState。"
+    },
+    "_toolEfficiencyCache": {
+      "container": "sharedState",
+      "writers": ["agent"],
+      "purpose": "重复调用缓存的存储；由 deterministicDuplicateGuard 创建和读取。"
+    },
+    "_workspaceRevision": {
+      "container": "sharedState",
+      "writers": [],
+      "purpose": "重复调用缓存的项目快照别名；无写入方，缓存因此不生效。"
+    }
+  },
+  "prefixes": {
+    "_recordRepairRetries_": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "后接门阶段名：该门已触发的 record_repair 次数。"
+    },
+    "_retries_": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "后接门阶段名：该门已触发的 analysis_retry/retry 次数。"
+    },
+    "_summaryRewriteRetries_": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "后接门阶段名：该门已触发的 summary_rewrite 次数。"
+    },
+    "_was_retry_": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "后接执行阶段名：标记该阶段下一次执行是门触发的重试，执行时读取并清除。"
+    }
+  },
+  "fields": {
+    "_currentRound": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：当前循环轮次。"
+    },
+    "_fallbackFrom": {
+      "owner": "src/ai/management/contracts.ts",
+      "purpose": "provider 实例字段：自动回退时记录原 provider 名。"
+    },
+    "_memoryCoordinator": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：记忆协调器。"
+    },
+    "_meta": {
+      "owner": "src/tools/kernel/registry.ts",
+      "purpose": "ToolResult 的结果元信息（状态、缓存、压缩、诊断），对模型不可见。"
+    },
+    "_note": {
+      "owner": "src/agent/context/ContextWindow.ts",
+      "purpose": "搜索结果裁剪后附带的说明字段。"
+    },
+    "_onTokenUsage": {
+      "owner": "src/ai/management/contracts.ts",
+      "purpose": "provider 实例上的用量观察回调槽，由 ProviderUsageTracker 安装与恢复。"
+    },
+    "_raw": {
+      "owner": "src/agent/context/ContextWindow.ts",
+      "purpose": "搜索结果无法解析时保留的原始文本字段。"
+    },
+    "_readCache": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolSharedState 字段：legacy 读取缓存。"
+    },
+    "_recency": {
+      "owner": "src/agent/memory/MemoryRetriever.ts",
+      "purpose": "记忆检索打分明细：时间新近度分量。"
+    },
+    "_registry": {
+      "owner": "src/tools/runtime/toolsets/CapabilityRegistry.ts",
+      "purpose": "CapabilityRegistry 对象字面量上的内部注册表。"
+    },
+    "_relevance": {
+      "owner": "src/agent/memory/MemoryRetriever.ts",
+      "purpose": "记忆检索打分明细：相关度分量。"
+    },
+    "_score": {
+      "owner": "src/agent/memory/MemoryRetriever.ts",
+      "purpose": "记忆检索综合得分，排序后剥离。"
+    },
+    "_searchCache": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolSharedState 字段：legacy 搜索缓存。"
+    },
+    "_searchCallCount": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolSharedState 字段：legacy 搜索调用计数。"
+    },
+    "_sessionToolCalls": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：本会话工具调用记录。"
+    },
+    "_sharedState": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：透传运行时 sharedState。"
+    },
+    "_submittedPatterns": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：已提交模式集合。"
+    },
+    "_submittedTitles": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：已提交标题集合。"
+    },
+    "_truncated": {
+      "owner": "src/agent/context/ContextWindow.ts",
+      "purpose": "搜索匹配项被裁剪的标记字段。"
+    },
+    "_validator": {
+      "owner": "src/tools/kernel/handler.ts",
+      "purpose": "InternalToolHandlerContext 字段：提交校验器。"
+    }
+  }
+}
