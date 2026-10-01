@@ -3,6 +3,7 @@ import {
   getGenerateStageTerminalTools,
   resolveGenerateTerminalToolset,
 } from '@alembic/core/host-agent-workflows';
+import { EVOLUTION_GATE_STAGE } from '../evaluation/gateEvaluators.js';
 // W6-d(A1):两个 stage builder 已从 prompts/scanPrompts 迁往 evaluation/stageBuilders
 import {
   buildRelationsPipelineStages,
@@ -18,6 +19,22 @@ export type AgentStageFactoryInput = {
 };
 
 export type AgentStageFactory = (input: AgentStageFactoryInput) => Record<string, unknown>[];
+
+/**
+ * 按阶段名取 preset 阶段。preset 数组的下标顺序不是契约：在 preset 里调整顺序或插入阶段
+ * 不会让工厂把门当成执行阶段；缺少必需阶段时在装配期立即失败，而不是带着错位的管线运行。
+ */
+function requirePresetStage<T extends { name: string }>(
+  stages: readonly T[],
+  presetName: string,
+  stageName: string
+): T {
+  const stage = stages.find((candidate) => candidate.name === stageName);
+  if (!stage) {
+    throw new Error(`Preset "${presetName}" has no stage named "${stageName}"`);
+  }
+  return stage;
+}
 
 export class AgentStageFactoryRegistry {
   #factories = new Map<string, AgentStageFactory>();
@@ -79,8 +96,8 @@ export class AgentStageFactoryRegistry {
       ) {
         return buildStrictProductionPipelineStagesV1() as Record<string, unknown>[];
       }
-      const presetStages = PRESETS.insight.strategy.stages;
-      const evolutionPresetStages = PRESETS.evolution.strategy.stages;
+      const insightStages = PRESETS.insight.strategy.stages;
+      const presetAnalyze = requirePresetStage(insightStages, 'insight', 'analyze');
       const needsCandidates = params.needsCandidates !== false;
       const hasExistingRecipes = params.hasExistingRecipes === true;
       const prescreenDone = params.prescreenDone === true;
@@ -131,29 +148,32 @@ export class AgentStageFactoryRegistry {
       }
 
       const analyzeStage = {
-        ...presetStages[0],
+        ...presetAnalyze,
         ...(Object.keys(dynamicAnalyzeBudget).length > 0
           ? {
               budget: {
-                ...((presetStages[0].budget as Record<string, unknown> | undefined) || {}),
+                ...((presetAnalyze.budget as Record<string, unknown> | undefined) || {}),
                 ...dynamicAnalyzeBudget,
               },
             }
           : {}),
         additionalTools: getGenerateStageTerminalTools('analyze', terminalCapability),
         promptBuilder: (ctx: Record<string, unknown>) =>
-          presetStages[0].promptBuilder?.(withTerminalPromptContext(ctx)),
+          presetAnalyze.promptBuilder?.(withTerminalPromptContext(ctx)),
       };
       if (!needsCandidates) {
         return [analyzeStage] as Record<string, unknown>[];
       }
 
+      const presetQualityGate = requirePresetStage(insightStages, 'insight', 'quality_gate');
+      const presetProduce = requirePresetStage(insightStages, 'insight', 'produce');
+      const presetRejectionGate = requirePresetStage(insightStages, 'insight', 'rejection_gate');
       const produceStage = {
-        ...presetStages[2],
+        ...presetProduce,
         ...(rescanCreateBudget != null && rescanCreateBudget > 0
           ? {
               budget: {
-                ...((presetStages[2].budget as Record<string, unknown> | undefined) || {}),
+                ...((presetProduce.budget as Record<string, unknown> | undefined) || {}),
                 maxSubmits: rescanCreateBudget,
                 softSubmitLimit: rescanCreateBudget,
               },
@@ -161,30 +181,34 @@ export class AgentStageFactoryRegistry {
           : {}),
         promptBuilder: (ctx: Record<string, unknown>) => {
           memoryCoordinator?.allocateBudget?.('producer');
-          return presetStages[2].promptBuilder?.(withTerminalPromptContext(ctx));
+          return presetProduce.promptBuilder?.(withTerminalPromptContext(ctx));
         },
       };
 
       if (hasExistingRecipes && !prescreenDone) {
+        const evolutionStages = PRESETS.evolution.strategy.stages;
+        const presetEvolve = requirePresetStage(evolutionStages, 'evolution', 'evolve');
+        const presetEvolutionGate = requirePresetStage(
+          evolutionStages,
+          'evolution',
+          EVOLUTION_GATE_STAGE
+        );
         return [
           {
-            ...evolutionPresetStages[0],
-            additionalTools: getGenerateStageTerminalTools(
-              evolutionPresetStages[0].name || 'evolve',
-              terminalCapability
-            ),
+            ...presetEvolve,
+            additionalTools: getGenerateStageTerminalTools(presetEvolve.name, terminalCapability),
             promptBuilder: (ctx: Record<string, unknown>) =>
-              evolutionPresetStages[0].promptBuilder?.(withTerminalPromptContext(ctx)),
+              presetEvolve.promptBuilder?.(withTerminalPromptContext(ctx)),
           },
-          evolutionPresetStages[1],
+          presetEvolutionGate,
           analyzeStage,
-          presetStages[1],
+          presetQualityGate,
           produceStage,
-          presetStages[3],
+          presetRejectionGate,
         ] as Record<string, unknown>[];
       }
 
-      return [analyzeStage, presetStages[1], produceStage, presetStages[3]] as Record<
+      return [analyzeStage, presetQualityGate, produceStage, presetRejectionGate] as Record<
         string,
         unknown
       >[];

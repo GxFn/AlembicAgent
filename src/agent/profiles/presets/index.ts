@@ -15,7 +15,7 @@ import { EVOLUTION_PRESET } from './evolutionPreset.js';
 import { INSIGHT_PRESET } from './insightPreset.js';
 import type { StrategyConfig } from './types.js';
 
-// ─── Preset 定义(对象身份=各 preset 文件的字面量;insight stages 下标契约随之保持)──
+// ─── Preset 定义(对象身份=各 preset 文件的字面量;阶段工厂按阶段名取 insight/evolution stages)──
 
 /** 所有内置 Preset */
 export const PRESETS = Object.freeze({

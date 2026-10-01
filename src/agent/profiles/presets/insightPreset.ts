@@ -1,7 +1,8 @@
 /**
  * insight preset —— 深度分析+知识产出的运行时基块(W6-e 自 presets.ts 拆出,内容原样)。
- * ⚠️ strategy.stages 数组身份与下标顺序是契约:AgentStageFactoryRegistry 按
- * presetStages[0..3] 复制覆盖(analyze/quality_gate/produce/rejection_gate)。
+ * strategy.stages 的阶段名是契约:AgentStageFactoryRegistry 按名取
+ * analyze/quality_gate/produce/rejection_gate 再复制覆盖;数组下标顺序只决定
+ * 直接以本 preset 运行时的执行顺序,不被工厂依赖。
  */
 import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import {
