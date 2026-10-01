@@ -26,7 +26,6 @@ interface AgentRuntimeBuilderOptions {
   container: Record<string, unknown>;
   toolRegistry: ToolRegistryLike;
   aiProvider: unknown;
-  memoryCoordinator?: unknown;
   projectBriefing?: string | null;
   projectRoot?: string;
   dataRoot?: string;
@@ -41,7 +40,6 @@ export class AgentRuntimeBuilder {
   #logger = Logger.getInstance();
   #profileCompiler?: AgentProfileCompiler;
   #sharedOpts: {
-    memoryCoordinator: unknown;
     projectBriefing: string | null;
     projectRoot: string;
     dataRoot: string;
@@ -51,7 +49,6 @@ export class AgentRuntimeBuilder {
     container,
     toolRegistry,
     aiProvider,
-    memoryCoordinator = null,
     projectBriefing = null,
     projectRoot = process.cwd(),
     dataRoot = projectRoot,
@@ -62,7 +59,6 @@ export class AgentRuntimeBuilder {
     this.#aiProvider = aiProvider;
     this.#toolRouter = toolRouter;
     this.#sharedOpts = {
-      memoryCoordinator,
       projectBriefing,
       projectRoot,
       dataRoot,
@@ -116,10 +112,10 @@ export class AgentRuntimeBuilder {
     });
   }
 
+  // 能力实例跨运行复用，这里只传与运行无关的配置；记忆协调器按每次运行经上下文进入循环。
   #getCapabilityOpts() {
     return {
       container: this.#container,
-      memoryCoordinator: this.#sharedOpts.memoryCoordinator,
       projectBriefing: this.#sharedOpts.projectBriefing,
       projectRoot: this.#sharedOpts.projectRoot,
     };

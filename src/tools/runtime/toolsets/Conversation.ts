@@ -9,36 +9,29 @@ import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../recipeProductionContract.js
 import { RuntimeCapability } from './RuntimeCapability.js';
 
 interface ConversationOpts {
-  memoryCoordinator?: MemoryCoordinator | null;
   soulPath?: string;
   projectBriefing?: string | null;
   [key: string]: unknown;
 }
 
-interface MemoryCoordinator {
-  buildPromptInjection(mode: string): string | null;
-  cacheToolResult?(tool: string, args: unknown, result: unknown): void;
-}
-
 interface ContextInput {
   projectBriefing?: string | null;
-  memoryMode?: string;
   [key: string]: unknown;
 }
 
-interface StepResult {
-  toolCalls?: Array<{ tool: string; args: unknown; result: unknown }>;
-  [key: string]: unknown;
-}
-
+/**
+ * 对话能力只提供工具集与静态上下文（生产契约、SOUL、项目概况）。
+ *
+ * 它不持有记忆协调器：记忆注入与工具观察缓存由运行循环按「本次运行」的协调器负责
+ * （buildDynamicMemoryPrompt / recordObservation）。能力实例由 builder 跨运行复用，
+ * 在这里持有协调器会让不同会话共用同一份记忆。
+ */
 export class Conversation extends RuntimeCapability {
-  #memoryCoordinator: MemoryCoordinator | null;
   #soulContent: string | null;
   #projectBriefing: string | null;
 
   constructor(opts: ConversationOpts = {}) {
     super();
-    this.#memoryCoordinator = (opts.memoryCoordinator as MemoryCoordinator) || null;
     this.#projectBriefing = (opts.projectBriefing as string) || null;
 
     const soulPath = opts.soulPath || path.resolve(PACKAGE_ROOT, 'SOUL.md');
@@ -82,31 +75,6 @@ export class Conversation extends RuntimeCapability {
       parts.push(`## 项目概况\n${briefing}`);
     }
 
-    if (this.#memoryCoordinator) {
-      try {
-        const memoryContext = this.#memoryCoordinator.buildPromptInjection(
-          context.memoryMode || 'user'
-        );
-        if (memoryContext) {
-          parts.push(`## 记忆上下文\n${memoryContext}`);
-        }
-      } catch {
-        /* non-critical */
-      }
-    }
-
     return parts.length > 0 ? parts.join('\n\n') : null;
-  }
-
-  onAfterStep(stepResult: StepResult) {
-    if (this.#memoryCoordinator && stepResult.toolCalls?.length) {
-      try {
-        for (const tc of stepResult.toolCalls) {
-          this.#memoryCoordinator.cacheToolResult?.(tc.tool, tc.args, tc.result);
-        }
-      } catch {
-        /* non-critical */
-      }
-    }
   }
 }
