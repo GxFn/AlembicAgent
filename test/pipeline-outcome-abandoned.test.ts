@@ -169,6 +169,31 @@ describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('degrade 是终态：后续阶段无论带什么标记都不再执行', async () => {
+    const { runtime, calls } = createFakeRuntime();
+    const laterGate = vi.fn(() => ({ action: 'pass', pass: true }));
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: { evaluator: () => ({ action: 'degrade', pass: false, reason: 'too weak' }) },
+        },
+        // 历史上的 skipOnDegrade 开关从未生效(降级后管线直接结束)；这里钉住真实语义。
+        { name: 'produce', skipOnDegrade: false },
+        { name: 'rejection_gate', gate: { evaluator: laterGate }, skipOnDegrade: false },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'mine module' }));
+
+    expect(result.outcome).toBe('abandoned');
+    expect(calls).toHaveLength(1);
+    expect(laterGate).not.toHaveBeenCalled();
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.phases.rejection_gate).toBeUndefined();
+  });
+
   it('record_repair 救不回 → degraded_no_findings 同样进入一等结局(第二个降级点)', async () => {
     const { runtime } = createFakeRuntime();
     const strategy = new PipelineStrategy({
@@ -382,7 +407,7 @@ describe('PipelineStrategy — retry 耗尽的一等结局(F2)', () => {
 
     const result = await strategy.execute(runtime, new AgentMessage({ content: 'mine module' }));
 
-    // degraded 布尔语义不变(不触发 skipOnDegrade 分支)，但结局如实为放弃。
+    // degraded 布尔语义不变(retry 耗尽不算降级)，但结局如实为放弃。
     expect(result.degraded).toBe(false);
     expect(result.outcome).toBe('abandoned');
     expect(pipelineOutcome(result)).toMatchObject({

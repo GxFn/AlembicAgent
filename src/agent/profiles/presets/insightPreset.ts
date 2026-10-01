@@ -141,7 +141,6 @@ export const INSIGHT_PRESET = {
             prev.produce as { toolCalls?: readonly unknown[] } | undefined
           );
         },
-        skipOnDegrade: true,
       },
 
       // ── Phase 4: Rejection Gate ──
@@ -151,7 +150,6 @@ export const INSIGHT_PRESET = {
           evaluator: producerRejectionGateEvaluator,
           maxRetries: 1,
         },
-        skipOnDegrade: true,
       },
     ],
   },

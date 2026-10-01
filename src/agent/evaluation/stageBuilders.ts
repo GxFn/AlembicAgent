@@ -174,11 +174,8 @@ export function buildScanPipelineStages(
           ) => {
             return buildProducerRetryPrompt(prev.produce);
           },
-          skipOnDegrade: true,
         }
-      : {
-          skipOnDegrade: true,
-        }),
+      : {}),
   };
 
   const stages: Record<string, unknown>[] = [analyzeStage, qualityGateStage, produceStage];
@@ -203,7 +200,6 @@ export function buildScanPipelineStages(
           ),
         maxRetries: 1,
       },
-      skipOnDegrade: true,
     });
   }
 

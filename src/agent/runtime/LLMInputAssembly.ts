@@ -276,7 +276,6 @@ export function resolveLlmInputStageProfile(
   }
   if (
     trackerPhase === 'SUMMARIZE' ||
-    trackerPhase === 'FINALIZE' ||
     pipelinePhase.includes('summarize') ||
     (effectiveToolChoice === 'none' &&
       (trackerPhase === 'SUMMARIZE' || pipelinePhase.includes('summary')))

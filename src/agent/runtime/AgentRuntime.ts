@@ -1297,7 +1297,7 @@ export class AgentRuntime {
     // Graceful exit 保护 — toolChoice=none 或 gracefulExit 状态下，
     // 部分 LLM (DeepSeek 等) 可能仍然返回 tool calls，需要忽略。
     // Analyst 的 RECORD 阶段会暴露 note_finding-only 补记录窗口，不能在这里丢弃。
-    const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE' || ctx.tracker?.phase === 'FINALIZE';
+    const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE';
     const allowToolCallsUnderForcedNone = allowsToolCallsUnderForcedNone(providerToolChoiceMode);
     if (
       (ctx.tracker?.isGracefulExit || (toolChoice === 'none' && !allowToolCallsUnderForcedNone)) &&
@@ -1802,8 +1802,7 @@ export class AgentRuntime {
         toolNames: [],
       });
       const metricsTransitionedToTerminal =
-        phaseBefore !== tracker.phase &&
-        (tracker.phase === 'SUMMARIZE' || tracker.phase === 'FINALIZE');
+        phaseBefore !== tracker.phase && tracker.phase === 'SUMMARIZE';
 
       const textResult = tracker.onTextResponse(llmResult.text || '');
 

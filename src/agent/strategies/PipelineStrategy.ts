@@ -107,7 +107,6 @@ interface PipelineStage {
   onToolCall?: (...args: unknown[]) => unknown;
   budget?: StageBudget;
   retryBudget?: StageBudget;
-  skipOnDegrade?: boolean;
   skipOnFail?: boolean;
   submitToolName?: string;
   decisionOnlyOnRetry?: boolean;
@@ -143,7 +142,7 @@ interface PipelineContext {
   /**
    * P1-A F2：第三种静默归零形态——analysis_retry 耗尽后 break(不设 degraded)此前产出
    * `completed + 0 候选`且无原因留痕。此标记让 outcome 如实报 abandoned(action='retry_exhausted')，
-   * 而 degraded 布尔保持原语义不动(不触发 skipOnDegrade 等既有分支)。
+   * 而 degraded 布尔保持原语义不动(只表示 degrade 类门动作)。
    */
   retryExhausted: boolean;
   /** 严格链失败不是可降级成功，也不沿用 legacy abandoned 语义。 */
@@ -351,10 +350,9 @@ export class PipelineStrategy extends Strategy {
       const stage = this.#stages[i];
 
       // ── Quality Gate 阶段 ──
+      // degrade 类门动作是终态：#processGate 置 ctx.degraded 后必返回 'break'，循环到此结束，
+      // 因此这里不需要「降级后跳过后续阶段」的分支。
       if (stage.gate) {
-        if (ctx.degraded) {
-          continue;
-        }
         const gateAction = await this.#processGate(runtime, message, stage, i, ctx, bus);
         if (gateAction === 'break') {
           break;
@@ -370,10 +368,6 @@ export class PipelineStrategy extends Strategy {
       }
 
       // ── 执行阶段 ──
-      if (ctx.degraded && stage.skipOnDegrade !== false) {
-        continue;
-      }
-
       await this.#executeStage(runtime, message, stage, ctx, bus);
       lastMainStageName = stage.name;
     }
@@ -664,7 +658,7 @@ export class PipelineStrategy extends Strategy {
         }
       }
       // 重试次数耗尽 —— P1-A F2：此前静默 break(completed + 0 候选，无原因)；现在如实
-      // 记为第三种放弃形态。不设 ctx.degraded(保持 skipOnDegrade 等既有分支语义不变)，
+      // 记为第三种放弃形态。不设 ctx.degraded(该布尔只表示 degrade 类门动作)，
       // 只让 outcome/abandonedModules 观测面如实报 retry_exhausted。
       ctx.retryExhausted = true;
       if (!ctx.abandonInfo) {

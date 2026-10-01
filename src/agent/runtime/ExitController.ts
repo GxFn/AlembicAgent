@@ -330,7 +330,7 @@ export class ExitController {
     text?: string | null;
     functionCalls?: unknown[] | null;
   }): ExitSignal {
-    const isTerminal = this.#tracker?.phase === 'SUMMARIZE' || this.#tracker?.phase === 'FINALIZE';
+    const isTerminal = this.#tracker?.phase === 'SUMMARIZE';
     const isGraceful = this.#tracker?.isGracefulExit;
 
     if (
