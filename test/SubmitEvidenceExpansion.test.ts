@@ -111,6 +111,33 @@ describe('expandEvidenceRefsForSubmit（E5 机械展开）', () => {
     expect(kept.ok && kept.item.coreCode).toBe('model-written');
   });
 
+  test('search 条目的子区间引用：按切片里的真实行号展开，不把条目内行号写成文件行号', () => {
+    const { projectRoot, ledger } = makeProject();
+    // per-file search 条目（E-2）：有 file、无 range；内容每行前缀是采集到的真实文件行号。
+    ledger.append({
+      tool: 'code.search',
+      callId: 'c2',
+      file: 'lib/a.ts',
+      content: '1: L1\n3: const x = 1;\n4: const y = 2;',
+    });
+    const result = expandEvidenceRefsForSubmit(
+      {
+        title: 'T',
+        coreCode: '',
+        sourceRefs: [],
+        reasoning: { sources: [], evidenceRefs: ['E-2@2-3'] },
+      },
+      { ledger, projectRoot }
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.expandedSources).toEqual(['lib/a.ts:3-3', 'lib/a.ts:4-4']);
+      // 条目内第 2-3 行不是文件第 2-3 行。
+      expect(result.expandedSources).not.toContain('lib/a.ts:2-3');
+    }
+  });
+
   test('run 中途文件变更：EVIDENCE_STALE 拒并提示重采', () => {
     const { projectRoot, ledger } = makeProject();
     fs.writeFileSync(

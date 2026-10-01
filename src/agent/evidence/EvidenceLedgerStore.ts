@@ -89,6 +89,10 @@ function stableStringifyEntry(entry: EvidenceEntry): string {
  * 子区间切片：条目带 range 时请求区间按「文件绝对行号」判定并切片；
  * 条目无 range（search 分组/terminal 等）时按 content 内 1-indexed 行号切片。
  * 越界返回 null（不静默钳制——引用越界本身是需要暴露的信号）。
+ *
+ * 派生副本的 range 只在原条目带 range 时写入：EvidenceEntry.range 的契约是「文件行区间」，
+ * 无 range 条目的请求区间只是条目内容的行号，写进 range 会被下游当成 file:start-end
+ * 渲染成错误的源码引用。无 range 条目的切片保持无 range，由下游按内容里的真实行号展开。
  */
 function sliceEntry(entry: EvidenceEntry, requested: EvidenceRange): EvidenceEntry | null {
   const lines = entry.content.split('\n');
@@ -116,7 +120,12 @@ function sliceEntry(entry: EvidenceEntry, requested: EvidenceRange): EvidenceEnt
     return null;
   }
   const content = lines.slice(startIdx, endIdx + 1).join('\n');
-  return { ...entry, range: requested, content, contentHash: hashEvidenceContent(content) };
+  return {
+    ...entry,
+    ...(entry.range ? { range: requested } : {}),
+    content,
+    contentHash: hashEvidenceContent(content),
+  };
 }
 
 export class EvidenceLedgerStore {

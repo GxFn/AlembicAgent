@@ -96,6 +96,39 @@ describe('EvidenceLedgerStore', () => {
     expect(store.get('E-1@4-5')).toBeNull();
   });
 
+  test('无 range 条目的切片不携带 range：条目内行号不能冒充文件行号', () => {
+    const { store } = makeStore();
+    // per-file search 条目：有 file、无 range，每行前缀是真实文件行号。
+    store.append({
+      tool: 'code.search',
+      callId: 'call_1',
+      file: 'lib/a.ts',
+      content: '120: alpha()\n133: beta()\n150: gamma()',
+    });
+    store.append({ tool: 'terminal.exec', callId: 'call_2', content: 'out-1\nout-2\nout-3' });
+
+    const searchSlice = store.get('E-1@2-3');
+    expect(searchSlice?.content).toBe('133: beta()\n150: gamma()');
+    expect(searchSlice?.contentHash).toBe(hashEvidenceContent('133: beta()\n150: gamma()'));
+    expect(searchSlice?.file).toBe('lib/a.ts');
+    // range 的契约是「文件行区间」；这里的 2-3 只是条目内容的第 2-3 行。
+    expect(searchSlice?.range).toBeUndefined();
+    expect(store.get('E-2@2-3')?.range).toBeUndefined();
+
+    // 带 range 的 read 条目：请求区间本来就是文件行号，切片继续携带它。
+    store.append({
+      tool: 'code.read',
+      callId: 'call_3',
+      file: 'lib/a.ts',
+      range: { start: 10, end: 14 },
+      content: 'L10\nL11\nL12\nL13\nL14',
+    });
+    expect(store.get('E-3@11-12')).toMatchObject({
+      range: { start: 11, end: 12 },
+      content: 'L11\nL12',
+    });
+  });
+
   test('searchByFile 与 stats（distinctFiles 去重）', () => {
     const { store } = makeStore();
     store.append({ tool: 'code.read', callId: 'c1', file: 'lib/a.ts', content: 'a' });
