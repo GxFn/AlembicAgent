@@ -27,7 +27,8 @@ export type StructuredLogFn = (level: string, message: string) => void;
  *   - boundary_invalid：首尾边界完整但无法解析（数组模式下回收也失败）
  *   - malformed_complete：数组结构已闭合但某个条目格式错误，只回收到坏条目之前
  *   - truncated：没有闭合边界（被 token 上限截断）；对象模式不做修复，直接失败
- *   - repair_failed：截断数组里找不到可回收的完整条目
+ *   - repair_failed：截断数组里找不到可回收的完整条目（正则回退超出候选预算时
+ *     另打 repair_budget_exhausted warn）
  */
 type ExtractReason =
   | 'empty'
@@ -152,11 +153,15 @@ function reportFailure(
   );
 }
 
-/** 仅修复结构分隔符；字符串内的逗号、括号、转义引号和代码围栏都是模型原文。 */
+/**
+ * 仅修复结构分隔符；字符串内的逗号、括号、转义引号和代码围栏都是模型原文。
+ * 按片段 slice + join 拼接（不逐字符 +=），没有尾逗号时原样返回输入。
+ */
 function stripTrailingCommas(text: string): string {
   let inString = false;
   let escaped = false;
-  let result = '';
+  const segments: string[] = [];
+  let segmentStart = 0;
   for (let index = 0; index < text.length; index++) {
     const char = text[index];
     if (inString) {
@@ -171,16 +176,30 @@ function stripTrailingCommas(text: string): string {
       inString = true;
     } else if (char === ',') {
       let next = index + 1;
-      while (next < text.length && /\s/u.test(text[next])) {
+      while (next < text.length && isWhitespace(text[next])) {
         next++;
       }
       if (text[next] === '}' || text[next] === ']') {
-        continue;
+        // 丢弃这个尾逗号：先收下逗号之前的片段，下一段从逗号之后开始。
+        segments.push(text.slice(segmentStart, index));
+        segmentStart = index + 1;
       }
     }
-    result += char;
   }
-  return result;
+  if (segments.length === 0) {
+    return text;
+  }
+  segments.push(text.slice(segmentStart));
+  return segments.join('');
+}
+
+/** 与原先 /\s/u 判定等价：ASCII 常见空白走字符比较快路径，其余字符才回落到正则。 */
+function isWhitespace(char: string): boolean {
+  if (char === ' ' || char === '\n' || char === '\r' || char === '\t') {
+    return true;
+  }
+  // 其余 ASCII 中只有 \v 与 \f 属于 \s；非 ASCII 空白（如 \u00a0、\u3000）交给正则判定。
+  return char > '\u007f' ? /\s/u.test(char) : char === '\v' || char === '\f';
 }
 
 /**
@@ -263,8 +282,17 @@ function scanTopLevelObjects(text: string): { lastCompleteObjEnd: number; finalD
 }
 
 /**
+ * 正则回退最多尝试的候选数（从后往前）。每次尝试都要对整段前缀做尾逗号修复和
+ * JSON.parse，成本为 O(候选数 × 文本长度)；不设上限时，早期元素含未转义引号的
+ * 大段截断输出（所有前缀都会失败）会同步阻塞事件循环秒级。
+ * 取舍：坏元素位于预算窗口之前、只有更早候选才能成功的极端输入会从“部分回收”
+ * 变成返回 null，并由 repair_budget_exhausted 诊断标记；调用方已有空结果兜底。
+ */
+const REGEX_FALLBACK_CANDIDATE_BUDGET = 32;
+
+/**
  * 正则回退修复 — 不依赖 inString 追踪。
- * 寻找所有可能的对象边界，从后往前尝试 JSON.parse。
+ * 寻找所有可能的对象边界，从后往前尝试 JSON.parse，最多尝试 REGEX_FALLBACK_CANDIDATE_BUDGET 个。
  */
 function repairByRegexFallback(
   text: string,
@@ -280,12 +308,25 @@ function repairByRegexFallback(
     candidates.push(m.index); // "}" 的位置
   }
 
-  // 从后往前尝试
-  for (let i = candidates.length - 1; i >= 0; i--) {
+  // 从后往前尝试，只覆盖最后 BUDGET 个候选。
+  const lowestIndex = Math.max(0, candidates.length - REGEX_FALLBACK_CANDIDATE_BUDGET);
+  for (let i = candidates.length - 1; i >= lowestIndex; i--) {
     const result = tryRepairAt(text, candidates[i], reason, context, onLog);
     if (result) {
       return result;
     }
+  }
+  if (lowestIndex > 0) {
+    // 预算耗尽而跳过了更早的候选：记录候选总数、输入长度与预算（不含模型原文），
+    // 失败出口的 parse_failed 仍由调用方统一报告。
+    observeSafely(
+      () =>
+        onLog?.(
+          'warn',
+          `[extractJSON] repair_budget_exhausted candidates=${candidates.length} length=${text.length} budget=${REGEX_FALLBACK_CANDIDATE_BUDGET}`
+        ),
+      () => undefined
+    );
   }
   return null;
 }

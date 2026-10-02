@@ -608,6 +608,89 @@ describe('shared/structuredOutput extractJSON diagnostics', () => {
   });
 });
 
+// 正则回退预算：截断数组里早期元素含未转义引号时，所有候选前缀都会失败；
+// 回退只尝试最后 32 个候选，超出预算时留下 repair_budget_exhausted 诊断并返回 null。
+describe('shared/structuredOutput regex fallback budget', () => {
+  const SENTINEL = 'SENTINEL_MODEL_TEXT';
+  const BUDGET = 32;
+
+  // 构造 Guard 建议形状的数组：badIndex 处元素的 fixExample 含未转义引号，最后一个元素被截断。
+  function buildGuardArray(count: number, badIndex: number | null): string {
+    const items: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const example = index === badIndex ? `print("${SENTINEL}")` : `ok ${SENTINEL}`;
+      items.push(
+        `{"violation": "v${index}", "suggestion": "s${index}", "fixExample": "${example}"}`
+      );
+    }
+    return `[${items.join(',\n')},\n{"violation": "trunc`;
+  }
+
+  function collect(): {
+    logs: Array<{ level: string; message: string }>;
+    onLog: (level: string, message: string) => void;
+  } {
+    const logs: Array<{ level: string; message: string }> = [];
+    return { logs, onLog: (level, message) => logs.push({ level, message }) };
+  }
+
+  function attemptsOf(message: string): number {
+    const match = /attempts=(\d+)/u.exec(message);
+    return match ? Number(match[1]) : Number.NaN;
+  }
+
+  it('stops after the candidate budget on a large truncated array with an early malformed item', () => {
+    const { logs, onLog } = collect();
+    const text = buildGuardArray(1500, 0);
+    const startedAt = performance.now();
+    expect(extractJSON(text, '[', ']', onLog)).toBeNull();
+    const elapsedMs = performance.now() - startedAt;
+
+    const budgetLog = logs.find((log) => log.message.includes('repair_budget_exhausted'));
+    expect(budgetLog?.level).toBe('warn');
+    expect(budgetLog?.message).toContain('[extractJSON] repair_budget_exhausted');
+    expect(budgetLog?.message).toContain('candidates=1500');
+    expect(budgetLog?.message).toContain(`length=${text.length}`);
+    const failure = logs.find((log) => log.message.includes('parse_failed'));
+    expect(failure?.message).toContain('reason=repair_failed');
+    // 策略 1 一次 + 回退最多 BUDGET 次。
+    expect(attemptsOf(failure?.message ?? '')).toBeLessThanOrEqual(BUDGET + 1);
+    expect(logs.every((log) => !log.message.includes(SENTINEL))).toBe(true);
+    expect(elapsedMs).toBeLessThan(300);
+  });
+
+  it('drops a recoverable prefix that sits before the budget window (documented trade-off)', () => {
+    const { logs, onLog } = collect();
+    // 坏元素在第 10 个：可回收前缀只有 10 条，但对应候选位于最后 32 个之外。
+    const text = buildGuardArray(100, 10);
+    expect(extractJSON(text, '[', ']', onLog)).toBeNull();
+    expect(logs.some((log) => log.message.includes('repair_budget_exhausted'))).toBe(true);
+  });
+
+  it('still recovers through the fallback when the good candidate is inside the budget', () => {
+    const { logs, onLog } = collect();
+    // 坏元素在第 90 个（共 100 个）：从后往前第 11 个候选即可回收前 90 条。
+    const result = extractJSON(buildGuardArray(100, 90), '[', ']', onLog);
+    expect(Array.isArray(result) && result.length).toBe(90);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].message).toContain('recoveredItems=90');
+    expect(logs.some((log) => log.message.includes('repair_budget_exhausted'))).toBe(false);
+  });
+
+  it('recovers every completed item of a large well-formed truncated array', () => {
+    const { logs, onLog } = collect();
+    const result = extractJSON(buildGuardArray(1500, null), '[', ']', onLog);
+    expect(Array.isArray(result) && result.length).toBe(1500);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].message).toContain('recoveredItems=1500');
+  });
+
+  it('keeps trailing-comma repair semantics for whitespace variants outside strings', () => {
+    expect(extractJSON('{"a":[1,2 ,\t\r\n],"b":"x, ]",\n}')).toEqual({ a: [1, 2], b: 'x, ]' });
+    expect(extractJSON('[{"a":1},\n{"a":2,}\n,{"a":', '[', ']')).toEqual([{ a: 1 }, { a: 2 }]);
+  });
+});
+
 describe('shared/errorClassify classifyLlmError', () => {
   it('flags AbortError as abort and non-retryable', () => {
     const c = classifyLlmError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
