@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { createLlmAbortError } from '../src/ai/errors.js';
 import { classifyLlmError } from '../src/ai/shared/errorClassify.js';
 import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structuredOutput.js';
 import { createLimit } from '../src/shared/concurrency.js';
@@ -135,6 +136,40 @@ describe('shared/operation lifecycle', () => {
     });
     expect(await runOperation(operation, { timeoutMs: 0 })).toEqual({ status: 'timeout' });
     expect(operation).not.toHaveBeenCalled();
+  });
+});
+
+// 锁定 createLlmAbortError 的真实契约：取消只能按 name 判定，code 可能是 DOMException 的数字常量。
+describe('ai/errors createLlmAbortError contract', () => {
+  it('returns a native AbortError reason unchanged, so its code stays numeric', () => {
+    const controller = new AbortController();
+    controller.abort();
+    const err = createLlmAbortError(controller.signal.reason);
+    // 默认 abort() 的 reason 原样返回，保持对象同一性；code 是 DOMException.ABORT_ERR（20），不是字符串。
+    expect(err).toBe(controller.signal.reason);
+    expect(err.name).toBe('AbortError');
+    expect(err.code).toBe(20);
+    expect(err.code).not.toBe('ABORT_ERR');
+  });
+
+  it('wraps non-AbortError reasons with the string code and keeps the original as cause', () => {
+    const hostReason = new Error('host stopped the run');
+    const fromError = createLlmAbortError(hostReason);
+    expect(fromError).not.toBe(hostReason);
+    expect(fromError.name).toBe('AbortError');
+    expect(fromError.code).toBe('ABORT_ERR');
+    expect(fromError.message).toBe('host stopped the run');
+    expect(fromError.cause).toBe(hostReason);
+
+    const fromString = createLlmAbortError('cache cleared');
+    expect(fromString.name).toBe('AbortError');
+    expect(fromString.code).toBe('ABORT_ERR');
+    expect(fromString.message).toBe('cache cleared');
+
+    const fromUndefined = createLlmAbortError();
+    expect(fromUndefined.name).toBe('AbortError');
+    expect(fromUndefined.code).toBe('ABORT_ERR');
+    expect(fromUndefined.message).toBe('Operation aborted');
   });
 });
 

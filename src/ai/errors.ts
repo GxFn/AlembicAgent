@@ -78,8 +78,20 @@ export function createLlmHttpError(
   );
 }
 
-export function createLlmAbortError(reason?: unknown): Error & { code?: string } {
+/**
+ * 把取消原因归一化为 name='AbortError' 的 Error。
+ *
+ * 契约：判定“是否为取消”只能看 `name === 'AbortError'`，不能看 `code`。
+ * - reason 本身已是 AbortError（最常见的是 `controller.abort()` 默认产生的 DOMException）时原样返回，
+ *   保持与 `signal.reason` 的对象同一性；此时 `code` 是 DOMException 遗留的数字常量（ABORT_ERR = 20），
+ *   不是字符串 'ABORT_ERR'。
+ * - 其余 reason（字符串、普通 Error、undefined 等）才包装为新 Error，`code` 为字符串 'ABORT_ERR'，
+ *   原 reason 放在 `cause`。
+ * 因此返回类型如实声明 `code?: string | number`。
+ */
+export function createLlmAbortError(reason?: unknown): Error & { code?: string | number } {
   if (reason instanceof Error && reason.name === 'AbortError') {
+    // 原样返回：调用方可能依赖 err === signal.reason；code 可能是数字，见上方契约说明。
     return reason;
   }
   // 宿主可以用任意 Error 取消；保留 cause，而不能把其原 name 当作服务端故障。
@@ -89,7 +101,7 @@ export function createLlmAbortError(reason?: unknown): Error & { code?: string }
       : typeof reason === 'string'
         ? reason
         : 'Operation aborted';
-  const err = new Error(message, { cause: reason }) as Error & { code?: string };
+  const err = new Error(message, { cause: reason }) as Error & { code?: string | number };
   err.name = 'AbortError';
   err.code = 'ABORT_ERR';
   return err;
