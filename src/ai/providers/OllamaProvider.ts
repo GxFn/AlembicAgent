@@ -1,12 +1,15 @@
 /**
- * OllamaProvider - Ollama 本地 AI 提供商（方案① 薄壳）
+ * OllamaProvider - Ollama 本地 AI 提供商（薄壳）
  *
- * 连接本地 Ollama 服务（OpenAI 兼容 API 格式），无需 API Key（使用固定 dummy key）。
- * chat / chatWithTools / chatWithStructuredOutput / embed 委托基类 _gateway* helper，
- * 由 LLMGateway 选用 OpenAiTransport 完成协议拼装、响应解析与横切能力。
+ * 连接本地 Ollama 服务（OpenAI 兼容 API 格式），无需 API Key（configuration 补固定 dummy key）。
  *
- * baseUrl（本地端点）与 embedModel（本地嵌入模型）通过 _transportExtras 透传，
- * 保证本地部署的 LLM / Embedding 模型与端点可配置。
+ * 职责分工：
+ *   - 本类：provider 身份、配置与默认值（经 configuration.resolveProviderSettings 解析，
+ *     含 baseUrl 规范化与 embedModel 默认值）。
+ *   - wire 协议：由 @ai-sdk/openai 维护，LLMGateway 以 'ollama' 身份选用 OpenAiTransport
+ *     做本仓 DTO ↔ SDK 的边界转换。
+ *   - 重试 / 熔断 / 并发闸门 / 用量上报：在 LLMGateway 的 ReliabilityController。
+ * chat / chatWithTools / chatWithStructuredOutput / embed 仅委托基类 _gateway* helper。
  */
 
 import Logger from '@alembic/core/logging';
@@ -22,9 +25,6 @@ import type {
   StructuredOutputOptions,
 } from '../contracts.js';
 
-// 兼容公开入口；规范化实现由共同配置层持有。
-export { normalizeOllamaBaseUrl } from '../configuration.js';
-
 export class OllamaProvider extends AiProvider {
   embedModel: string;
 
@@ -38,6 +38,7 @@ export class OllamaProvider extends AiProvider {
     this.embedModel = settings.embedModel;
   }
 
+  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
   get supportsNativeToolCalling() {
     return true;
   }

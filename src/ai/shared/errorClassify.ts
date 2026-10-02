@@ -1,12 +1,17 @@
 /**
  * errorClassify — LLM 调用错误分类（纯函数）
  *
- * 背景：重试 / 熔断的决策依赖「这个错误是否可重试」「是否网络级错误」「是否服务端错误」
- * 「是否外部主动 abort」。这套判断历史上内联在 AiProvider._withRetry 里，Gateway 层
- * 想做重试时无从复用，只能重写，必然漂移。
+ * 重试 / 熔断的决策依赖「这个错误是否可重试」「是否网络级错误」「是否服务端错误」
+ * 「是否外部主动 abort」；本模块把这套判断收敛为厂商无关的纯函数，避免各层各自重写后漂移。
  *
- * 本模块把分类逻辑抽成厂商无关的纯函数，供 Provider 与 Gateway 共用。
- * 行为从 AiProvider._withRetry 逐字迁移，不改变任何判定阈值。
+ * 当前消费者：
+ *   - ReliabilityController.run（shared/reliability.ts）：重试、熔断计数与取消识别。
+ *   - AiFactory.isGeoOrProviderError：先排除取消与暂时故障，再判断是否触发 provider fallback。
+ *
+ * 分类阈值是当前的权威口径，可以随错误语义演进修正（修改时同步更新 reliability / AiFactory 测试）。
+ * 各「排除类」的理由见 classifyLlmError 内注释：本地输入错误（LLM_INVALID_REQUEST /
+ * API_KEY_MISSING）不重试也不熔断；模型输出错误（LLM_INVALID_TOOL_CALL）不熔断；
+ * 程序员错误（TypeError 等）不计入熔断；4xx（非 429）是请求本身问题，不熔断。
  */
 
 /** LLM 调用错误的通用形状（不同厂商 SDK / fetch 抛出的错误字段并集）。 */
@@ -15,6 +20,10 @@ export interface ClassifiableError {
   message?: string;
   status?: number;
   code?: string;
+  /**
+   * 仅作为错误形状说明：classifyLlmError 不读取此字段，
+   * 由 ReliabilityController 直接从原始错误读取并计算重试等待。
+   */
   retryAfterMs?: number;
   cause?: { code?: string; message?: string; name?: string };
 }

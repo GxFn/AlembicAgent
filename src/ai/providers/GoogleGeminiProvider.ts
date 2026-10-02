@@ -1,16 +1,16 @@
 /**
- * GoogleGeminiProvider - Google Gemini AI 提供商（方案① 薄壳）
+ * GoogleGeminiProvider - Google Gemini AI 提供商（薄壳）
  *
- * chat / chatWithTools / chatWithStructuredOutput / embed 委托基类 _gateway* helper，
- * 由 LLMGateway + GoogleTransport 统一承担：
- *   - Gemini REST contents / functionDeclarations / toolConfig 协议拼装
- *   - 原生 JSON Schema（parametersJsonSchema / responseJsonSchema，由 SDK 维护）
- *   - 原生 JSON mode 与本仓输出 schema 校验
- *   - thoughtSignature 原样回传（Gemini 3+ 必须，否则后续请求 400）
- *   - batchEmbedContents 嵌入、token 计量与重试 / 熔断 / 并发闸门
+ * 职责分工：
+ *   - 本类：provider 身份、配置与默认值（经 configuration.resolveProviderSettings 解析），
+ *     以及 Gemini 专属的 chat / summarize 输出上限 8192。
+ *   - wire 协议：由 @ai-sdk/google 维护（contents、函数声明、原生 JSON Schema、
+ *     thoughtSignature 回传等），GoogleTransport 只做本仓 DTO ↔ SDK 的边界转换。
+ *   - 重试 / 熔断 / 并发闸门 / 用量上报：在 LLMGateway 的 ReliabilityController。
+ * chat / chatWithTools / chatWithStructuredOutput / embed 仅委托基类 _gateway* helper。
  *
  * Gemini 并发默认 2（低于通用默认，规避 Google 配额限制）；
- * 嵌入模型经 _transportExtras 透传，由 GoogleTransport 统一补 'models/' 前缀并兜底默认。
+ * embedModel 默认值由 configuration 解析，GoogleTransport 去掉可选的 'models/' 前缀。
  */
 
 import Logger from '@alembic/core/logging';
@@ -36,7 +36,7 @@ export class GoogleGeminiProvider extends AiProvider {
     this.logger = Logger.getInstance() as unknown as AiLogger;
   }
 
-  /** 是否支持原生结构化函数调用 */
+  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
   get supportsNativeToolCalling() {
     return true;
   }

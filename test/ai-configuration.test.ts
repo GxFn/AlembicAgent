@@ -8,11 +8,12 @@ import {
   getProviderWithFallback,
 } from '../src/ai/AiFactory.js';
 import type { AiProvider } from '../src/ai/AiProvider.js';
+import { normalizeOllamaBaseUrl } from '../src/ai/configuration.js';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { ClaudeProvider } from '../src/ai/providers/ClaudeProvider.js';
 import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
 import { GoogleGeminiProvider } from '../src/ai/providers/GoogleGeminiProvider.js';
-import { normalizeOllamaBaseUrl, OllamaProvider } from '../src/ai/providers/OllamaProvider.js';
+import { OllamaProvider } from '../src/ai/providers/OllamaProvider.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
 import { ReliabilityController } from '../src/ai/shared/reliability.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';

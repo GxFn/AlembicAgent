@@ -3,6 +3,7 @@
  * 具体 Provider 固定身份/配置，并将生成协议与可靠性委托给 Gateway/Transport。
  */
 
+import Logger from '@alembic/core/logging';
 import { LanguageService } from '@alembic/core/shared';
 import { observeSafely } from '#shared/observers.js';
 import type {
@@ -51,6 +52,9 @@ export class AiProvider {
 
   /** 协议下沉 transport 后，本 provider 专属的 LLMGateway 实例（lazy 构造）。 */
   #gateway: LLMGateway | null = null;
+
+  /** 默认 chatWithTools 纯文本降级是否已告警（每实例一次）。 */
+  #textDegradeWarned = false;
 
   /**
    * Provider 特有的 transport 扩展配置（如 apiStyle / reasoningEffort / embedModel）。
@@ -163,8 +167,10 @@ export class AiProvider {
   }
 
   /**
-   * 是否支持原生结构化函数调用（非文本解析）
-   * 子类（如 GoogleGeminiProvider）覆盖返回 true
+   * 公开能力标记：本 Provider 的 chatWithTools 是否走原生结构化函数调用（非文本解析）。
+   * 当前没有运行时消费者：AgentRuntime 无条件调用 chatWithTools，不读取本 getter；
+   * 文本工具调用兼容解析只存在于 DeepSeekTransport。5 个内置 Provider 均覆写为 true，
+   * 基类默认 false 只对应下方的纯文本降级实现。getter 去留属于待决事项②。
    */
   get supportsNativeToolCalling(): boolean {
     return false;
@@ -173,22 +179,24 @@ export class AiProvider {
   /**
    * 带工具声明的结构化对话 — 原生函数调用 API
    *
-   * 支持原生函数调用的 Provider（Gemini / OpenAI / Claude）覆盖此方法,
-   * 返回结构化 functionCall 而非文本，AgentRuntime 据此跳过正则解析。
+   * 5 个内置 Provider 全部覆写此方法，经 _gatewayChatWithTools → LLMGateway → *Transport
+   * 返回结构化 functionCalls。AgentRuntime 不做文本工具调用解析。
    *
-   * 默认实现降级为 chat()，由 AgentRuntime 进行文本解析。
+   * 默认实现只服务于直接继承基类、只实现 chat() 的自定义子类：降级为纯文本 chat()，
+   * 丢弃 toolSchemas / toolChoice 与 role='tool' 消息，不返回 functionCalls / usage，
+   * 并在每个实例首次降级时 warn `chatWithTools_text_degrade`。降级语义的修正属于待决事项②。
    *
    * 统一消息格式 (Provider-Agnostic):
    *   - { role: 'user', content: 'text' }
    *   - { role: 'assistant', content: 'text or null', toolCalls: [{id, name, args}] }
    *   - { role: 'tool', toolCallId: 'id', name: 'tool_name', content: 'result string' }
    *
-   * @param prompt 用户消息（仅在 messages 为空时使用）
+   * @param prompt 用户消息（内置 Provider 仅在 messages 为空时使用；默认降级实现总会追加它）
    * @param opts.messages 统一格式消息历史
    * @param opts.toolSchemas [{name, description, parameters}]
    * @param opts.toolChoice 'auto' | 'required' | 'none'
    * @param [opts.systemPrompt] 系统指令
-   * @returns >|null}>}
+   * @returns ChatWithToolsResult：{ text, functionCalls }；默认降级实现的 functionCalls 恒为 null
    */
   async chatWithTools(
     prompt: string,
@@ -196,6 +204,16 @@ export class AiProvider {
   ): Promise<ChatWithToolsResult> {
     // 默认降级: 忽略 tools/toolChoice，走纯文本 chat()
     const messages = (opts.messages || []) as UnifiedMessage[];
+    if (!this.#textDegradeWarned) {
+      this.#textDegradeWarned = true;
+      // 只记录计数，不记录工具名、消息正文或 prompt；每个实例只记一次，避免 Agent 循环刷屏。
+      const toolCount = Array.isArray(opts.toolSchemas) ? opts.toolSchemas.length : 0;
+      const droppedToolMessages = messages.filter((m) => m.role === 'tool').length;
+      this._log(
+        'warn',
+        `[${this.name}] chatWithTools_text_degrade tools=${toolCount} dropped_tool_messages=${droppedToolMessages}`
+      );
+    }
     const history = messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
@@ -386,12 +404,16 @@ export class AiProvider {
   /** 内部日志辅助（子类可通过 this.logger 覆盖） */
   _log(level: string, message: string) {
     try {
-      if (this.logger && typeof this.logger[level] === 'function') {
-        this.logger[level](message);
-      } else {
+      // 内置 Provider 在构造器里注入 Core Logger；直接继承基类的自定义 Provider 默认 logger 为 null，
+      // 此时回落到 Core Logger，避免 embed 失败、schema 编译失败、用量观察者失败等降级告警被静默吞掉。
+      const target = this.logger ?? (Logger.getInstance() as unknown as AiLogger);
+      const method = target[level];
+      if (typeof method === 'function') {
+        method.call(target, message);
       }
-    } catch {
-      /* best effort */
+    } catch (err: unknown) {
+      // 日志本身失败不能影响已完成的降级结果；这里只能尽力而为，无法再记录到同一个 logger。
+      void err;
     }
   }
 

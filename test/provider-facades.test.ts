@@ -1,4 +1,8 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AiProvider } from '../src/ai/AiProvider.js';
+import type { ChatContext } from '../src/ai/contracts.js';
+import type { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { ClaudeProvider } from '../src/ai/providers/ClaudeProvider.js';
 import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
 import { GoogleGeminiProvider } from '../src/ai/providers/GoogleGeminiProvider.js';
@@ -452,6 +456,110 @@ describe('DeepSeekProvider V4 tool calls', () => {
         name: 'code',
         args: { action: 'read', path: 'Sources/App.swift' },
       },
+    ]);
+  });
+});
+
+// 直接继承 AiProvider 的自定义 provider：不设置 logger，也不覆写 chatWithTools。
+class TextOnlyProvider extends AiProvider {
+  readonly chatCalls: Array<{ prompt: string; context: ChatContext }> = [];
+
+  constructor() {
+    super({});
+    this.name = 'custom-text';
+  }
+
+  async chat(prompt: string, context: ChatContext = {}): Promise<string> {
+    this.chatCalls.push({ prompt, context });
+    return 'text-only answer';
+  }
+}
+
+describe('provider degrade diagnostics', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('routes base-class warnings to the Core logger when a direct subclass sets no logger', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const provider = new TextOnlyProvider();
+    const failingGateway = {
+      embed: () => Promise.reject(new Error('fixture embed outage')),
+    } as unknown as LLMGateway;
+    vi.spyOn(provider, '_getGateway').mockResolvedValue(failingGateway);
+
+    expect(provider.logger).toBeNull();
+    await expect(provider._gatewayEmbed('fixture text')).resolves.toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[custom-text] embed failed'));
+  });
+
+  it('keeps an explicitly injected logger ahead of the Core logger fallback', () => {
+    const coreWarn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const provider = new TextOnlyProvider();
+    const warn = vi.fn();
+    provider.logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+
+    provider._log('warn', 'fixture injected warning');
+
+    expect(warn).toHaveBeenCalledWith('fixture injected warning');
+    expect(coreWarn).not.toHaveBeenCalled();
+  });
+
+  it('warns once per Claude instance that embedding is unsupported while keeping the [] result', async () => {
+    const provider = new ClaudeProvider({ apiKey: 'fixture-key', model: 'claude-sonnet-4-5' });
+    const warn = vi.fn();
+    provider.logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+
+    await expect(provider.embed(['a'])).resolves.toEqual([]);
+    await expect(provider.embed('b')).resolves.toEqual([]);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      '[claude] embedding_unsupported; returning empty result for upper-layer degrade'
+    );
+  });
+
+  it('still rejects a pre-cancelled Claude embed before logging the unsupported diagnostic', async () => {
+    const provider = new ClaudeProvider({ apiKey: 'fixture-key', model: 'claude-sonnet-4-5' });
+    const warn = vi.fn();
+    provider.logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(provider.embed(['a'], { abortSignal: controller.signal })).rejects.toThrow();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('warns once when the default chatWithTools degrades to text-only chat', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const provider = new TextOnlyProvider();
+    const opts = {
+      messages: [
+        { role: 'user' as const, content: 'inspect' },
+        {
+          role: 'assistant' as const,
+          content: null,
+          toolCalls: [{ id: 'call-1', name: 'code', args: {} }],
+        },
+        { role: 'tool' as const, toolCallId: 'call-1', name: 'code', content: 'fixture result' },
+      ],
+      toolSchemas: [
+        { name: 'code', description: 'read code', parameters: { type: 'object' } },
+        { name: 'search', description: 'search code', parameters: { type: 'object' } },
+      ],
+    };
+
+    const first = await provider.chatWithTools('inspect', opts);
+    const second = await provider.chatWithTools('inspect', opts);
+
+    // 降级结果语义不变（语义修正属于待决事项②），这里只锁定诊断。
+    expect(first).toEqual({ text: 'text-only answer', functionCalls: null });
+    expect(second).toEqual({ text: 'text-only answer', functionCalls: null });
+    const degradeWarnings = warn.mock.calls.filter(([message]) =>
+      String(message).includes('chatWithTools_text_degrade')
+    );
+    expect(degradeWarnings).toEqual([
+      ['[custom-text] chatWithTools_text_degrade tools=2 dropped_tool_messages=1'],
     ]);
   });
 });

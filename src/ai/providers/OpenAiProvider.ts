@@ -1,9 +1,11 @@
 /**
  * OpenAiProvider - OpenAI 提供商（薄壳）
  *
- * 方案①重构后，本类只负责 provider 身份与配置；HTTP body 拼装、响应解析、
- * Chat Completions / Responses 协议分支全部下沉到 OpenAiTransport，重试 / 熔断 /
- * 并发 / 用量上报等横切能力由 LLMGateway 的 ReliabilityController 统一提供。
+ * 职责分工：
+ *   - 本类：provider 身份、配置与默认值（经 configuration.resolveProviderSettings 解析）。
+ *   - wire 协议：由 @ai-sdk/openai 维护；OpenAiTransport 做本仓 DTO ↔ SDK 的边界转换，
+ *     并按配置的 apiStyle 选择 Chat Completions 或 Responses。
+ *   - 重试 / 熔断 / 并发闸门 / 用量上报：在 LLMGateway 的 ReliabilityController。
  * chat / chatWithTools / chatWithStructuredOutput / embed 仅委托给基类的 gateway helper。
  */
 
@@ -34,7 +36,7 @@ export class OpenAiProvider extends AiProvider {
     this.embedModel = settings.embedModel;
   }
 
-  /** OpenAI 支持原生 Function Calling，AgentRuntime 据此跳过文本正则解析。 */
+  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
   get supportsNativeToolCalling() {
     return true;
   }
@@ -63,5 +65,3 @@ export class OpenAiProvider extends AiProvider {
     return this._gatewayEmbed(text, opts);
   }
 }
-
-export default OpenAiProvider;
