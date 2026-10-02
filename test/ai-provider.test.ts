@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { isTextCompatToolCallId, resolveModelQuirks } from '../src/ai/registry/ModelQuirks.js';
+import { CLAUDE_MODELS } from '../src/ai/registry/models/claude.js';
+import { DEEPSEEK_MODELS } from '../src/ai/registry/models/deepseek.js';
+import { GOOGLE_MODELS } from '../src/ai/registry/models/google.js';
+import { OLLAMA_MODELS } from '../src/ai/registry/models/ollama.js';
+import { OPENAI_MODELS } from '../src/ai/registry/models/openai.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import {
   autoDetectProvider,
@@ -284,6 +289,82 @@ describe('ParameterGuard', () => {
       'reasoning_content'
     );
   });
+
+  // 注册表规则声明了 reason 时，filtered 审计必须写出该原因，而不是笼统的默认文案。
+  // 内置注册表当前没有任何 temperature/topP 规则带 reason，这里用合成规则锁定回读语义。
+  it('writes the registry rule reason into filtered temperature and topP audits', () => {
+    const model = createThinkingModel();
+    model.parameterConstraints.temperature = {
+      allowed: false,
+      reason: 'fixture temperature reason',
+    };
+    model.parameterConstraints.topP = { allowed: false, reason: 'fixture topP reason' };
+    const guarded = ParameterGuard.guard(model, { temperature: 0.7, topP: 0.9 });
+    expect(guarded.temperature).toBeUndefined();
+    expect(guarded.topP).toBeUndefined();
+    expect(guarded.filtered).toEqual([
+      { param: 'temperature', reason: 'fixture temperature reason', originalValue: 0.7 },
+      { param: 'topP', reason: 'fixture topP reason', originalValue: 0.9 },
+    ]);
+  });
+
+  it('keeps the display-name fallback reason when a disallowed temperature rule has no reason', () => {
+    const model = createThinkingModel();
+    model.parameterConstraints.temperature = { allowed: false };
+    model.parameterConstraints.topP = { allowed: false };
+    expect(ParameterGuard.guard(model, { temperature: 0.5, topP: 0.5 }).filtered).toEqual([
+      {
+        param: 'temperature',
+        reason: 'Test Thinking Model 禁止设置 temperature',
+        originalValue: 0.5,
+      },
+      { param: 'topP', reason: '该模型不支持 topP', originalValue: 0.5 },
+    ]);
+  });
+});
+
+describe('ModelRegistry data invariants', () => {
+  const builtins: ModelDef[] = [
+    ...OPENAI_MODELS,
+    ...CLAUDE_MODELS,
+    ...DEEPSEEK_MODELS,
+    ...GOOGLE_MODELS,
+    ...OLLAMA_MODELS,
+  ];
+
+  it('uses unique ids shaped as provider:apiModelId', () => {
+    const ids = builtins.map((m) => m.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const m of builtins) {
+      expect(m.id).toBe(`${m.provider}:${m.apiModelId}`);
+    }
+  });
+
+  it('keeps apiModelId globally unique so bare-ref lookups cannot hit the wrong provider', () => {
+    const apiIds = builtins.map((m) => m.apiModelId);
+    expect(new Set(apiIds).size).toBe(apiIds.length);
+  });
+
+  it('resolves every provider default model and deprecation target', () => {
+    const registry = new ModelRegistry();
+    for (const config of PROVIDER_CONFIGS) {
+      expect(registry.get(config.defaultModelId), config.defaultModelId).toBeDefined();
+    }
+    for (const m of builtins) {
+      if (m.deprecated) {
+        expect(registry.get(m.deprecated.migrateToId), m.id).toBeDefined();
+      }
+    }
+  });
+
+  it('keeps defaultEffort inside the reasoningEffort allowlist when one is declared', () => {
+    for (const m of builtins) {
+      const allowed = m.parameterConstraints.reasoningEffort?.allowedValues;
+      if (allowed && m.reasoning.defaultEffort !== undefined) {
+        expect(allowed, m.id).toContain(m.reasoning.defaultEffort);
+      }
+    }
+  });
 });
 
 describe('resolveModelQuirks', () => {
@@ -317,6 +398,19 @@ describe('resolveModelQuirks', () => {
     expect(raw.analyzeGroundingGuardEligible).toBe(true);
     expect(resolveModelQuirks('claude-sonnet-5').forcedToolChoiceUnsupported).toBe(false);
     expect(resolveModelQuirks(null).analyzeGroundingGuardEligible).toBe(false);
+  });
+
+  it('生产形态 provider:apiModelId 前缀 ref 与裸 ref 判定一致', () => {
+    const v4 = resolveModelQuirks('deepseek:deepseek-v4-flash');
+    expect(v4).toEqual(resolveModelQuirks('deepseek-v4-flash'));
+    expect(v4.forcedToolChoiceUnsupported).toBe(true);
+    expect(v4.analyzeGroundingGuardEligible).toBe(true);
+    expect(v4.usesTextToolCallCompat).toBe(true);
+    const gemini = resolveModelQuirks('google:gemini-2.5-pro');
+    expect(gemini).toEqual(resolveModelQuirks('gemini-2.5-pro'));
+    expect(gemini.dropToolSchemasWhenToolChoiceNone).toBe(true);
+    expect(gemini.forcedToolChoiceUnsupported).toBe(false);
+    expect(gemini.usesTextToolCallCompat).toBe(false);
   });
 
   it('isTextCompatToolCallId 前缀判定', () => {

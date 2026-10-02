@@ -71,9 +71,10 @@ export class ParameterGuard {
     }
     const rule = c.temperature;
     if (!rule?.allowed) {
+      // 注册表声明了具体原因（如推理模型由 SDK 剥离）时优先写入审计，便于网关 debug 日志定位。
       out.filtered.push({
         param: 'temperature',
-        reason: `${model.displayName} 禁止设置 temperature`,
+        reason: rule?.reason ?? `${model.displayName} 禁止设置 temperature`,
         originalValue: raw.temperature,
       });
       return;
@@ -94,7 +95,7 @@ export class ParameterGuard {
     if (!rule?.allowed) {
       out.filtered.push({
         param: 'topP',
-        reason: '该模型不支持 topP',
+        reason: rule?.reason ?? '该模型不支持 topP',
         originalValue: raw.topP,
       });
       return;
