@@ -5,6 +5,7 @@ import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.j
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js';
+import { SessionStore } from '../src/agent/memory/SessionStore.js';
 import { estimateTokens } from '../src/shared/tokenUtils.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import type { ToolContext } from '../src/tools/kernel/registry.js';
@@ -340,6 +341,20 @@ describe('working memory ownership and read budgets', () => {
         { tokenBudget: 30 }
       )
     ).resolves.toMatchObject({ budget: 30 });
+  });
+
+  it('logs and empties a session context built with a NaN host budget instead of throwing', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      store.storeDimensionReport('previous', { analysisText: 'prior analysis '.repeat(40) });
+      expect(store.buildContextForDimension('next', { tokenBudget: Number.NaN })).toBe('');
+      const messages = warn.mock.calls.map((call) => String(call[0]));
+      expect(messages.some((message) => message.includes('reason=invalid_budget'))).toBe(true);
+      expect(messages.join('\n')).not.toContain('prior analysis');
+    } finally {
+      store.dispose();
+    }
   });
 
   it('keeps a legal CJK scratchpad prompt within its token budget', () => {

@@ -582,7 +582,10 @@ export class SessionStore implements Disposable {
 
     // Token 预算裁剪
     const text = parts.join('\n');
-    const result = truncateToTokenBudget(text, tokenBudget);
+    // tokenBudget 来自宿主 opts 且未经校验；NaN 等非法值由 tokenUtils 按 0 处理并经此 logger 报告。
+    const result = truncateToTokenBudget(text, tokenBudget, undefined, (level, message) =>
+      this.#log(level, `[SessionStore] ${message}`)
+    );
     if (result !== text) {
       this.#logger.debug(`[SessionStore] context truncated to ${tokenBudget} estimated tokens`);
     }

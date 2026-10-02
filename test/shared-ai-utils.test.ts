@@ -11,6 +11,7 @@ import { isThenable, observeSafely } from '../src/shared/observers.js';
 import { runOperation } from '../src/shared/operation.js';
 import { resolveProjectPath } from '../src/shared/projectPath.js';
 import { stableStringify } from '../src/shared/serialization.js';
+import { estimateTokens, truncateToTokenBudget } from '../src/shared/tokenUtils.js';
 
 const temporaryRoots: string[] = [];
 
@@ -358,6 +359,83 @@ describe('shared/serialization stableStringify', () => {
     ]);
     expect(stableStringify(forward)).toBe(stableStringify(reverse));
     expect(stableStringify(forward)).toBe('[["a",1],["b",2]]');
+  });
+});
+
+// 截断标记保底：被裁剪的内容要么带标记，要么整段为空，绝不交出无标记残片。
+describe('shared/tokenUtils truncateToTokenBudget', () => {
+  const FULL_SUFFIX = '\n…(truncated due to budget)';
+
+  it('falls back to a one-token ellipsis when the default suffix does not fit', () => {
+    const result = truncateToTokenBudget('a'.repeat(100), 3);
+    expect(estimateTokens(result)).toBeLessThanOrEqual(3);
+    expect(result.endsWith('…')).toBe(true);
+    expect(result.length).toBeGreaterThan(1);
+  });
+
+  it('never returns an unmarked fragment for any budget smaller than the text', () => {
+    const text = 'a'.repeat(100);
+    for (let budget = 0; budget < estimateTokens(text); budget++) {
+      const result = truncateToTokenBudget(text, budget);
+      expect(estimateTokens(result), `budget=${budget}`).toBeLessThanOrEqual(budget);
+      const marked = result === '' || result.endsWith('…') || result.endsWith(FULL_SUFFIX);
+      expect(marked, `budget=${budget} result=${JSON.stringify(result)}`).toBe(true);
+    }
+  });
+
+  it('returns an empty string when not even the ellipsis fits', () => {
+    expect(truncateToTokenBudget('a'.repeat(100), 0)).toBe('');
+    expect(truncateToTokenBudget('a'.repeat(100), 0.5)).toBe('');
+  });
+
+  it('falls back to the ellipsis when a custom suffix is larger than the budget', () => {
+    const result = truncateToTokenBudget('b'.repeat(100), 4, ' [cut: budget exhausted]');
+    expect(estimateTokens(result)).toBeLessThanOrEqual(4);
+    expect(result.endsWith('…')).toBe(true);
+  });
+
+  it('keeps the full suffix when it fits within the budget', () => {
+    const result = truncateToTokenBudget('c'.repeat(200), 20);
+    expect(estimateTokens(result)).toBeLessThanOrEqual(20);
+    expect(result.endsWith(FULL_SUFFIX)).toBe(true);
+    expect(result.startsWith('c')).toBe(true);
+  });
+
+  it('returns text unchanged for an Infinity budget or text within budget', () => {
+    const text = 'd'.repeat(1000);
+    expect(truncateToTokenBudget(text, Infinity)).toBe(text);
+    expect(truncateToTokenBudget('short', 100)).toBe('short');
+  });
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['-Infinity', Number.NEGATIVE_INFINITY],
+  ])('treats a %s budget as zero and reports an invalid_budget diagnostic', (_label, budget) => {
+    const logs: Array<{ level: string; message: string }> = [];
+    const result = truncateToTokenBudget('secret body text', budget, undefined, (level, message) =>
+      logs.push({ level, message })
+    );
+    expect(result).toBe('');
+    expect(logs).toHaveLength(1);
+    expect(logs[0].level).toBe('warn');
+    expect(logs[0].message).toContain('reason=invalid_budget');
+    expect(logs[0].message).toContain(`budget=${String(budget)}`);
+    // 诊断只记录预算与长度，不回显正文。
+    expect(logs[0].message).not.toContain('secret');
+  });
+
+  it('does not throw or escalate when the diagnostic sink fails', () => {
+    expect(
+      truncateToTokenBudget('payload', Number.NaN, undefined, () => {
+        throw new Error('sink failed');
+      })
+    ).toBe('');
+  });
+
+  it('does not report a diagnostic for a legal budget', () => {
+    const logs: string[] = [];
+    truncateToTokenBudget('e'.repeat(100), 3, undefined, (_level, message) => logs.push(message));
+    expect(logs).toEqual([]);
   });
 });
 
