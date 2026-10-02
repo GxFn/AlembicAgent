@@ -500,7 +500,11 @@ const GRAPH_SPEC: ToolSpec = {
               'search',
             ],
           },
-          entity: { type: 'string', description: 'Entity name (class/method/function)' },
+          entity: {
+            type: 'string',
+            description:
+              'A declaration name (Type, Type.member, function), path#name to pick one of several same-named declarations, or a file path',
+          },
           limit: { type: 'number', description: 'Max results (default 20)' },
         },
         required: ['type'],

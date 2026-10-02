@@ -31,6 +31,9 @@ const MAX_SEARCH_MATCHES = 5;
 /** 默认代码片段总字符预算 */
 const DEFAULT_SNIPPET_BUDGET = 32_000;
 
+/** 可复制 graph 引用的总量上限（防 prompt 膨胀） */
+const MAX_GRAPH_EVIDENCE = 8;
+
 // ── 读取内容净化（证据保真核心） ─────────────────────────────────
 //
 // evidenceMap 的片段会被 Producer 渲染成「可逐字复制的 coreCode」，其内容必须与源文件的
@@ -273,11 +276,55 @@ interface ToolResultObject {
   children?: unknown[];
   classes?: unknown[];
   hierarchy?: unknown[];
+  /** graph 工具回执的包装层：{ type, entity, result } 或 { type, entity, message }。 */
+  result?: unknown;
+  message?: string;
+  /** 宿主随关系查询给出的图引用：每条是一个关系事实的规范写法，可原样引用。 */
+  graphRefs?: unknown;
+  /** 宿主没能把实体名落到声明上时为 false（没找到 / 有歧义）。 */
+  resolved?: boolean;
   [key: string]: unknown;
 }
 
 /** 工具结果类型 */
 type ToolResult = string | ToolResultObject | null | undefined;
+
+/**
+ * graph 工具回执里的查询结果。包装形态 { type, entity, result } 取 result；
+ * 没有结果的回执（{ type, entity, message }）返回 null；旧的直连形态就是结果本身。
+ */
+function unwrapGraphResult(result: ToolResult): ToolResultObject | null {
+  if (!result || typeof result !== 'object') {
+    return null;
+  }
+  if ('result' in result) {
+    const inner = result.result;
+    return inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? (inner as ToolResultObject)
+      : null;
+  }
+  if (typeof result.type === 'string' && typeof result.message === 'string') {
+    return null;
+  }
+  return result;
+}
+
+/**
+ * 宿主随结果给出的图引用（去掉空串、非字符串与重复）。
+ * 结果里没有 graphRefs 字段时返回 null：这个宿主不说图引用的写法。
+ */
+function hostGraphRefs(result: ToolResultObject): string[] | null {
+  if (!Array.isArray(result.graphRefs)) {
+    return null;
+  }
+  return [
+    ...new Set(
+      result.graphRefs.filter(
+        (ref): ref is string => typeof ref === 'string' && ref.trim().length > 0
+      )
+    ),
+  ];
+}
 
 // ── 主类 ──────────────────────────────────────────────────────────
 
@@ -296,8 +343,11 @@ export class EvidenceCollector {
    * （依赖/调用链/上游下游等词）要求非空 graphRefs；架构维度知识本质就是关系，「规避关系词」
    * 是阉割价值。这里只物化真实发生过的 graph 查询——Producer 把它们渲染成可逐字复制的
    * graphRefs，模型没有 graph 证据时仍须改述，绝不教模型编造 ref 绕门禁。
+   *
+   * 按调用分组保存：一次调用方查询可能带回十几条引用，总量上限又只有几条，
+   * 先到先得会让后面的查询一条也留不下。取用时各组轮流出一条（见 #selectGraphEvidence）。
    */
-  #graphEvidence: string[] = [];
+  #graphEvidenceByCall: string[][] = [];
 
   /** 代码片段总字符预算 */
   #snippetBudget;
@@ -349,11 +399,7 @@ export class EvidenceCollector {
             }
             break;
           case 'graph':
-            if (args.protocolName || (action === 'query' && args.type === 'protocol')) {
-              this.#extractProtocolEvidence(args, result);
-            } else {
-              this.#extractClassEvidence(args, result);
-            }
+            this.#extractGraphEvidence(args, result);
             break;
           // note_finding → WorkingMemory 已处理，不在此重复采集
         }
@@ -388,7 +434,7 @@ export class EvidenceCollector {
       evidenceMap: this.#evidenceMap,
       explorationLog: this.#explorationLog,
       negativeSignals: this.#negativeSignals,
-      graphEvidence: this.#graphEvidence,
+      graphEvidence: this.#selectGraphEvidence(),
     };
   }
 
@@ -588,17 +634,40 @@ export class EvidenceCollector {
     );
   }
 
-  /** get_class_info — 提取类结构 → evidenceMap */
-  #extractClassEvidence(args: ToolCallArgs, result: ToolResult) {
-    if (typeof result !== 'object' || !result) {
+  /**
+   * graph 工具 — 结构事实 → evidenceMap，关系事实 → 可复制 graph 引用。
+   *
+   * 两种回执：graph 工具的包装形态 { type, entity, result }，以及旧的直连形态（结果本身）。
+   * 宿主随结果给出 graphRefs 时，那就是关系事实的规范写法，原样收下；宿主不说这种写法
+   * （旧形态）时才由这里按类 / 协议的结构结论拼一条。
+   */
+  #extractGraphEvidence(args: ToolCallArgs, result: ToolResult) {
+    const payload = unwrapGraphResult(result);
+    if (!payload || payload.resolved === false) {
       return;
     }
+    const isProtocol = Boolean(
+      args.protocolName || args.type === 'protocol' || payload.protocolName
+    );
+    const summaryRef = isProtocol
+      ? this.#extractProtocolEvidence(args, payload)
+      : this.#extractClassEvidence(args, payload);
+    const hostRefs = hostGraphRefs(payload);
+    if (hostRefs) {
+      this.#recordGraphEvidence(hostRefs);
+    } else if (summaryRef) {
+      this.#recordGraphEvidence([summaryRef]);
+    }
+  }
 
-    const className = result.className || args.className || args.entity;
+  /** 类结构 → evidenceMap；返回按结构结论拼出的 graph 引用（旧形态的宿主用它） */
+  #extractClassEvidence(args: ToolCallArgs, result: ToolResultObject): string | undefined {
     const filePath = result.filePath;
-    if (!filePath) {
-      return;
+    // 说图引用写法的宿主，调用方 / 影响面等回执里也可能带 filePath；只有带类名的才是类结构。
+    if (!filePath || (Array.isArray(result.graphRefs) && !result.className)) {
+      return undefined;
     }
+    const className = result.className || args.className || args.entity;
 
     const entry = this.#getOrCreateEntry(filePath);
     entry.role = entry.role || 'class-definition';
@@ -622,22 +691,16 @@ export class EvidenceCollector {
 
     const classSummary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${classSummary}` : classSummary;
-    // 物化为可复制 graph ref：真实 graph 查询的结构结论（fresh，供关系声明引用）。
-    this.#addGraphEvidence(
-      `graph:class ${className} (${filePath}) — ${classSummary.replaceAll('|', '·')}`
-    );
+    // 真实 graph 查询的结构结论，供关系声明引用。
+    return `graph:class ${className} (${filePath}) — ${classSummary.replaceAll('|', '·')}`;
   }
 
-  /** get_protocol_info — 提取协议结构 → evidenceMap */
-  #extractProtocolEvidence(args: ToolCallArgs, result: ToolResult) {
-    if (typeof result !== 'object' || !result) {
-      return;
-    }
-
-    const protocolName = result.protocolName || args.protocolName;
+  /** 协议结构 → evidenceMap；返回按结构结论拼出的 graph 引用（旧形态的宿主用它） */
+  #extractProtocolEvidence(args: ToolCallArgs, result: ToolResultObject): string | undefined {
+    const protocolName = result.protocolName || args.protocolName || args.entity;
     const filePath = result.filePath;
     if (!filePath) {
-      return;
+      return undefined;
     }
 
     const entry = this.#getOrCreateEntry(filePath);
@@ -653,22 +716,44 @@ export class EvidenceCollector {
 
     const summary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${summary}` : summary;
-    this.#addGraphEvidence(
-      `graph:protocol ${protocolName} (${filePath}) — ${summary.replaceAll('|', '·')}`
-    );
+    return `graph:protocol ${protocolName} (${filePath}) — ${summary.replaceAll('|', '·')}`;
   }
 
   // ─── 内部辅助 ─────────────────────────────────────────
 
-  /** 追加 graph 证据（去重 + 上限，防 prompt 膨胀） */
-  #addGraphEvidence(ref: string) {
-    if (!ref || this.#graphEvidence.includes(ref)) {
-      return;
+  /** 记下一次 graph 调用带回的引用（空组不记） */
+  #recordGraphEvidence(refs: string[]) {
+    if (refs.length > 0) {
+      this.#graphEvidenceByCall.push(refs);
     }
-    if (this.#graphEvidence.length >= 8) {
-      return;
+  }
+
+  /**
+   * 取出可复制的 graph 引用：各次调用轮流出一条，直到上限。
+   * 这样第一次查询带回再多引用，也不会把后面查询的引用挤掉。
+   */
+  #selectGraphEvidence(): string[] {
+    const selected: string[] = [];
+    for (let round = 0; selected.length < MAX_GRAPH_EVIDENCE; round += 1) {
+      let remaining = false;
+      for (const refs of this.#graphEvidenceByCall) {
+        const ref = refs[round];
+        if (ref === undefined) {
+          continue;
+        }
+        remaining = true;
+        if (!selected.includes(ref)) {
+          selected.push(ref);
+        }
+        if (selected.length >= MAX_GRAPH_EVIDENCE) {
+          break;
+        }
+      }
+      if (!remaining) {
+        break;
+      }
     }
-    this.#graphEvidence.push(ref);
+    return selected;
   }
 
   /** 获取或创建 evidence entry */
@@ -814,6 +899,10 @@ export class EvidenceCollector {
         if (args.protocolName) {
           return `Inspect protocol ${args.protocolName}`;
         }
+        // 调用方、层级、影响面等查询按查询类型说明意图，不都叫"查看类"。
+        if (typeof args.type === 'string' && args.type !== 'class' && args.entity) {
+          return `Graph ${args.type} of ${args.entity}`;
+        }
         if (args.className || args.entity) {
           return `Inspect class ${args.className || args.entity}`;
         }
@@ -870,11 +959,27 @@ export class EvidenceCollector {
         }
         return JSON.stringify(result).substring(0, 100);
       }
-      case 'graph':
-        if (result.classes || result.hierarchy) {
-          return `${(result.classes || result.hierarchy || []).length} classes`;
+      case 'graph': {
+        const graph = unwrapGraphResult(result);
+        if (!graph) {
+          return typeof result.message === 'string' ? result.message : 'no graph result';
         }
-        return `class ${result.className || '?'}${result.superClass ? ` < ${result.superClass}` : ''}, ${result.methods?.length || 0} methods`;
+        if (graph.resolved === false) {
+          return `entity not resolved (${String(graph.reason ?? 'unknown')})`;
+        }
+        if (graph.classes || graph.hierarchy) {
+          return `${(graph.classes || graph.hierarchy || []).length} classes`;
+        }
+        if (graph.className) {
+          return `class ${graph.className}${graph.superClass ? ` < ${graph.superClass}` : ''}, ${graph.methods?.length || 0} methods`;
+        }
+        // 其余查询（调用方、层级、影响面、搜索、概览）：报出各清单的条数与图引用数。
+        const counts = Object.entries(graph)
+          .filter(([key, value]) => Array.isArray(value) && key !== 'graphRefs')
+          .map(([key, value]) => `${key}=${(value as unknown[]).length}`);
+        const refs = hostGraphRefs(graph)?.length ?? 0;
+        return `${counts.join(', ') || 'graph result'}${refs > 0 ? `; ${refs} graph refs` : ''}`;
+      }
       default:
         return JSON.stringify(result).substring(0, 100);
     }
@@ -901,8 +1006,17 @@ export class EvidenceCollector {
             (r: { matches?: SearchMatch[] }) => (r.matches?.length ?? 0) > 0
           )
         );
-      case 'graph':
-        return !!(result.className || result.classes || result.hierarchy);
+      case 'graph': {
+        const graph = unwrapGraphResult(result);
+        if (!graph || graph.resolved === false) {
+          return false;
+        }
+        // 结构结论，或任何一份非空清单（调用方、层级、影响面、搜索命中、模块）。
+        return (
+          !!(graph.className || graph.protocolName || graph.classes || graph.hierarchy) ||
+          Object.values(graph).some((value) => Array.isArray(value) && value.length > 0)
+        );
+      }
       default:
         return true;
     }

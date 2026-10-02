@@ -563,6 +563,122 @@ describe('R2 graph 证据流（关系声明不再被迫在阉割表述与编造 
     expect(prompt).toContain('graph:class AlphaService (src/alpha.ts)');
   });
 
+  /** graph 工具的真实回执：ToolRouterAdapter 把 handler 的 { type, entity, result } 放进 structuredContent。 */
+  function graphCall(type: string, entity: string, result: Record<string, unknown> | null) {
+    return {
+      tool: 'graph',
+      args: { action: 'query', params: { type, entity } },
+      envelope: {
+        ok: true,
+        status: 'success',
+        structuredContent: result
+          ? { type, entity, result }
+          : { type, entity, message: 'No results found' },
+      },
+    };
+  }
+  const callRef = (index: number, target = 'Store.read') =>
+    `graph:calls Caller${index}.run -> ${target} [relation-site:root:src/caller${index}.ts:calls:${target}:L${index}-L${index}:1-9:00000000000000${String(index).padStart(2, '0')}]`;
+
+  it('宿主随关系查询给出的图引用原样收下，不再另拼一条', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall(
+      graphCall('callers', 'Store.read', {
+        entity: 'Store.read',
+        symbol: { name: 'Store.read', kind: 'method', location: 'src/store.ts:40' },
+        direction: 'callers',
+        calls: [
+          {
+            name: 'Caller1.run',
+            kind: 'method',
+            location: 'src/caller1.ts:1',
+            sites: ['src/caller1.ts:1'],
+          },
+        ],
+        truncated: false,
+        graphRefs: [callRef(1), callRef(1), '', 7],
+      })
+    );
+    collector.processToolCall(
+      graphCall('class', 'Store', {
+        className: 'Store',
+        kind: 'class',
+        filePath: 'src/store.ts',
+        superClass: 'Base',
+        methods: ['read', 'write'],
+        properties: [],
+        subtypes: ['CachedStore'],
+        graphRefs: [
+          'graph:extends CachedStore -> Store [relation-site:root:src/cached.ts:extends:Store:L3-L3:0123456789abcdef]',
+        ],
+      })
+    );
+    const { graphEvidence, evidenceMap, explorationLog } = collector.build();
+
+    // 两次调用各出一条；重复、空串与非字符串被丢掉；类查询不再拼 graph:class。
+    expect(graphEvidence).toEqual([
+      callRef(1),
+      'graph:extends CachedStore -> Store [relation-site:root:src/cached.ts:extends:Store:L3-L3:0123456789abcdef]',
+    ]);
+    // 类结构照旧进 evidenceMap；调用方查询不产生"类定义"条目。
+    expect([...evidenceMap.keys()]).toEqual(['src/store.ts']);
+    expect(evidenceMap.get('src/store.ts')).toMatchObject({
+      role: 'class-definition',
+      summary: expect.stringContaining('Extends: Base'),
+    });
+    expect(
+      explorationLog.map((entry) => [entry.intent, entry.resultSummary, entry.effective])
+    ).toEqual([
+      ['Graph callers of Store.read', 'calls=1; 1 graph refs', true],
+      ['Inspect class Store', 'class Store < Base, 2 methods', true],
+    ]);
+  });
+
+  it('多次查询轮流出引用：先到的查询带回再多，也不挤掉后面的', () => {
+    const collector = new EvidenceCollector();
+    const refsOf = (target: string) =>
+      Array.from({ length: 10 }, (_, index) => callRef(index + 1, target));
+    for (const target of ['A.one', 'B.two', 'C.three']) {
+      collector.processToolCall(
+        graphCall('callers', target, {
+          entity: target,
+          direction: 'callers',
+          calls: [],
+          graphRefs: refsOf(target),
+        })
+      );
+    }
+    const { graphEvidence } = collector.build();
+    expect(graphEvidence).toHaveLength(8);
+    expect(graphEvidence.slice(0, 3)).toEqual([
+      callRef(1, 'A.one'),
+      callRef(1, 'B.two'),
+      callRef(1, 'C.three'),
+    ]);
+    expect(graphEvidence.filter((ref) => ref.includes('C.three'))).toHaveLength(2);
+  });
+
+  it('没落到声明上的查询、没有结果的回执都不产生引用，也不算有效探索', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall(
+      graphCall('callers', 'run', {
+        entity: 'run',
+        resolved: false,
+        reason: 'ambiguous',
+        message: 'More than one declaration is named run.',
+        candidates: ['src/a.ts#run', 'src/b.ts#run'],
+      })
+    );
+    collector.processToolCall(graphCall('protocol', 'Missing', null));
+    const { graphEvidence, evidenceMap, explorationLog } = collector.build();
+    expect(graphEvidence).toEqual([]);
+    expect(evidenceMap.size).toBe(0);
+    expect(explorationLog.map((entry) => [entry.resultSummary, entry.effective])).toEqual([
+      ['entity not resolved (ambiguous)', false],
+      ['No results found', false],
+    ]);
+  });
+
   it('无 graph 调用时不渲染 graphRefs 段（不给编造留口子）', () => {
     const prompt = buildProducerPromptV2(
       {
