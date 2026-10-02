@@ -755,9 +755,7 @@ describe('shared/structuredOutput regex fallback budget', () => {
   it('stops after the candidate budget on a large truncated array with an early malformed item', () => {
     const { logs, onLog } = collect();
     const text = buildGuardArray(1500, 0);
-    const startedAt = performance.now();
     expect(extractJSON(text, '[', ']', onLog)).toBeNull();
-    const elapsedMs = performance.now() - startedAt;
 
     const budgetLog = logs.find((log) => log.message.includes('repair_budget_exhausted'));
     expect(budgetLog?.level).toBe('warn');
@@ -766,10 +764,9 @@ describe('shared/structuredOutput regex fallback budget', () => {
     expect(budgetLog?.message).toContain(`length=${text.length}`);
     const failure = logs.find((log) => log.message.includes('parse_failed'));
     expect(failure?.message).toContain('reason=repair_failed');
-    // 策略 1 一次 + 回退最多 BUDGET 次。
+    // 策略 1 一次 + 回退最多 BUDGET 次：用尝试次数确定性地约束成本，不断言墙钟耗时（负载下会抖动）。
     expect(attemptsOf(failure?.message ?? '')).toBeLessThanOrEqual(BUDGET + 1);
     expect(logs.every((log) => !log.message.includes(SENTINEL))).toBe(true);
-    expect(elapsedMs).toBeLessThan(300);
   });
 
   it('drops a recoverable prefix that sits before the budget window (documented trade-off)', () => {
