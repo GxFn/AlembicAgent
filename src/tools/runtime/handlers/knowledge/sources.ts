@@ -64,8 +64,13 @@ function readRefRangeCode(
         code,
         refText: `${normalized}:${start}-${end}`,
       };
-    } catch {
-      // 只读失败换下一个 ref：宁缺毋错。
+    } catch (err: unknown) {
+      // 只读失败换下一个 ref：宁缺毋错。跳过不改变提示结果，但留一条 debug 诊断，
+      // 只含 ref 文本与错误消息（如越界的 Access denied、fs 的 EACCES），不含文件内容。
+      const reason = err instanceof Error ? err.message : String(err);
+      Logger.getInstance().debug(
+        `[knowledge.submit] snippet repair hint skipped unreadable source ref "${ref}": ${reason}`
+      );
     }
   }
   return null;
@@ -115,7 +120,8 @@ export function normalizeBareSourceRefs(
 
 /**
  * F4b：代码/引用门禁拒绝时，读取第一个可解析 sourceRef 的真实 bounded range 作为诊断提示。
- * 该提示不会修改候选，也不把首个来源或整文件视为 coreCode 答案；失败时静默返回空串。
+ * 该提示不会修改候选，也不把首个来源或整文件视为 coreCode 答案；失败时返回空串
+ * （读取失败而被跳过的 ref 各留一条 debug 诊断）。
  */
 export function buildSnippetRepairHint(
   sourceRefs: unknown,

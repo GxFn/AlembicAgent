@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { existsSync } from 'node:fs';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
+import { PACKAGE_ROOT } from '../src/shared/packageAssets.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
 
 /**
@@ -62,5 +68,99 @@ describe('conversation capability', () => {
 
     expect(runtime.capabilities.map((capability) => capability.name)).toContain('conversation');
     expect(accessed).toEqual([]);
+  });
+});
+
+/**
+ * SOUL 人格资源缺失诊断钉子（L1-I4 / I46 的 Agent 内部部分）。
+ *
+ * 背景：Agent 包根当前没有 SOUL.md，宿主也不传 soulPath，Conversation 的人格段在生产中
+ * 恒为空，而「文件不存在」与「读取失败」两条分支此前都静默置空。资源归属仍待决定，
+ * 这里只锁定可定位的诊断：区分 soulPath 来源（default|option）、是否存在、错误类别，
+ * 且不记录文件内容。若日后决定把 SOUL.md 随 Agent 包发布，默认路径用例需同步更新。
+ */
+describe('conversation SOUL diagnostics', () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    for (const root of roots.splice(0)) {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  function spyLogger() {
+    const logger = Logger.getInstance();
+    return {
+      info: vi.spyOn(logger, 'info').mockImplementation(() => logger),
+      warn: vi.spyOn(logger, 'warn').mockImplementation(() => logger),
+    };
+  }
+
+  function messagesOf(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('reports the default package-root SOUL.md as missing with source=default', () => {
+    const defaultPath = resolve(PACKAGE_ROOT, 'SOUL.md');
+    expect(existsSync(defaultPath)).toBe(false);
+    const { info, warn } = spyLogger();
+
+    const context = new Conversation().buildContext({}) ?? '';
+
+    const messages = [...messagesOf(info), ...messagesOf(warn)].filter((m) =>
+      m.includes('[Conversation]')
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('source=default');
+    expect(messages[0]).toContain('exists=false');
+    expect(messages[0]).toContain(defaultPath);
+    expect(context).not.toContain('AI Identity');
+  });
+
+  it('warns with source=option when an explicit soulPath does not exist', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-soul-')));
+    roots.push(root);
+    const missing = join(root, 'SOUL.md');
+    const { warn } = spyLogger();
+
+    new Conversation({ soulPath: missing });
+
+    const messages = messagesOf(warn).filter((m) => m.includes('[Conversation]'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('source=option');
+    expect(messages[0]).toContain('exists=false');
+    expect(messages[0]).toContain(missing);
+  });
+
+  it('warns with the error code when an explicit soulPath cannot be read', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-soul-')));
+    roots.push(root);
+    const { warn } = spyLogger();
+
+    // 目录存在但无法按文件读取（EISDIR），模拟「存在却读取失败」。
+    const capability = new Conversation({ soulPath: root });
+
+    const messages = messagesOf(warn).filter((m) => m.includes('[Conversation]'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('source=option');
+    expect(messages[0]).toContain('exists=true');
+    expect(messages[0]).toContain('EISDIR');
+    expect(messages[0]).toContain(root);
+    expect(capability.buildContext({})).not.toContain('AI Identity');
+  });
+
+  it('loads an explicit soulPath silently when the file is readable', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-soul-')));
+    roots.push(root);
+    const soulPath = join(root, 'SOUL.md');
+    await writeFile(soulPath, '# AI Identity\nfixture persona\n', 'utf-8');
+    const { info, warn } = spyLogger();
+
+    const context = new Conversation({ soulPath }).buildContext({}) ?? '';
+
+    expect(context).toContain('# AI Identity\nfixture persona');
+    expect(
+      [...messagesOf(info), ...messagesOf(warn)].filter((m) => m.includes('[Conversation]'))
+    ).toEqual([]);
   });
 });

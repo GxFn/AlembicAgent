@@ -1,9 +1,11 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Logger from '@alembic/core/logging';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
@@ -1320,5 +1322,38 @@ describe('B-1 write-freshness gate (read-before-write / TOCTOU)', () => {
       expect(rejected.ok).toBe(false);
       expect(rejected.error).toContain('exists on disk but was not read');
     });
+  });
+});
+
+/**
+ * F4b 修复提示的 ref 读取失败可观测性钉子（I46 / P31）。
+ *
+ * 读取失败仍然跳到下一个 ref（宁缺毋错，不改变提示结果），但不再静默：每个被跳过的
+ * ref 都有一条 debug 诊断，带 ref 文本与错误类别，不带文件内容。
+ */
+describe('snippet repair hint ref read failures', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs a debug diagnostic for a ref that escapes the project root and moves on', async () => {
+    const root = await mkdtemp(join(baseRoot, 'snippet-hint-'));
+    const outside = await mkdtemp(join(baseRoot, 'snippet-outside-'));
+    await writeFile(join(outside, 'secret.ts'), 'export const secret = 1;\n');
+    await symlink(join(outside, 'secret.ts'), join(root, 'escape.ts'));
+    await writeFile(join(root, 'ok.ts'), 'export const ok = 1;\nexport const ok2 = 2;\n');
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+
+    const hint = buildSnippetRepairHint(['escape.ts:1-1', 'ok.ts:1-2'], root);
+
+    expect(hint).toContain('ok.ts:1-2');
+    expect(hint).not.toContain('secret');
+    const messages = debug.mock.calls
+      .map((call) => String(call[0]))
+      .filter((m) => m.includes('[knowledge.submit]'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('escape.ts:1-1');
+    expect(messages[0]).toContain('Access denied');
   });
 });
