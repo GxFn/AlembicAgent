@@ -114,7 +114,11 @@ import {
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
 import { takeToolPipelineFailure } from './toolPipeline/engine.js';
-import { createToolReceipt, projectToolReceipt } from './toolReceipt.js';
+import {
+  createToolReceipt,
+  projectToolReceipt,
+  TOOL_ENVELOPE_SHAPE_REJECTED,
+} from './toolReceipt.js';
 
 // ── Re-exports for backward compatibility ──
 export type {
@@ -1612,6 +1616,16 @@ export class AgentRuntime {
       };
       const projection = projectToolReceipt(toolEntry, toolQuota);
       let resultStr = projection.text;
+      if (projection.envelopeShapeRejected) {
+        // 信封未通过严格守卫（如 durationMs 非法）：模型只拿到 envelope.text（或旧原值投影），
+        // 这里留下可定位诊断；只记工具名，不记信封正文。
+        ctx.diagnostics?.warn({
+          code: TOOL_ENVELOPE_SHAPE_REJECTED,
+          tool: fc.name,
+          message:
+            'Tool result envelope failed the strict shape guard; its own text field (when present) was projected instead of the whole envelope.',
+        });
+      }
       if (projection.invalidatesReadView) {
         messages.invalidateReadView();
         ctx.diagnostics?.warn({

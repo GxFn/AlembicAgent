@@ -16,6 +16,7 @@ import Logger from '@alembic/core/logging';
 import { isToolResultEnvelope } from '#tools/kernel/index.js';
 import type { ContextWindow } from '../context/ContextWindow.js';
 import { limitToolResult } from '../context/ContextWindow.js';
+import { readRejectedEnvelopeText, TOOL_ENVELOPE_SHAPE_REJECTED } from './toolReceipt.js';
 
 export interface ProviderInputBudgetProjection {
   afterMessageCount: number;
@@ -169,8 +170,33 @@ export class MessageAdapter {
     if (isToolResultEnvelope(rawResult)) {
       return limitToolResult(toolName, rawResult.text, quota);
     }
+    if (looksLikeToolResultEnvelope(rawResult)) {
+      // 形似信封却未过严格守卫（如 durationMs 为负）：不把 trust/diagnostics 等内部字段整份
+      // 序列化给模型；text 是自有字符串时回退用它。只记录工具名，不记录信封正文。
+      const fallbackText = readRejectedEnvelopeText(rawResult);
+      Logger.getInstance().warn(
+        `[MessageAdapter] ${TOOL_ENVELOPE_SHAPE_REJECTED}: tool=${toolName}, textFallback=${fallbackText !== undefined}`
+      );
+      if (fallbackText !== undefined) {
+        return limitToolResult(toolName, fallbackText, quota);
+      }
+    }
     return limitToolResult(toolName, rawResult, quota);
   }
+}
+
+/**
+ * 宽松信封识别：自有数据属性 toolId/callId/status 均为字符串即视为“意图是信封”。
+ * 仅用于区分“守卫失败的信封”和普通工具原值；不读取 accessor，不放行进入严格信封路径。
+ */
+function looksLikeToolResultEnvelope(value: unknown): boolean {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  return ['toolId', 'callId', 'status'].every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return Boolean(descriptor && 'value' in descriptor && typeof descriptor.value === 'string');
+  });
 }
 
 // ─────────────────────────────────────────────

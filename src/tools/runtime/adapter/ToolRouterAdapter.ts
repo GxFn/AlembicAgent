@@ -46,6 +46,15 @@ function emptyDiagnostics(): ToolResultDiagnostics {
   };
 }
 
+/**
+ * 信封 durationMs 只取单调时钟差值。Date.now() 是墙钟，NTP step / 手动改时间会让差值为负，
+ * 而 presenter.isToolResultEnvelope 要求 durationMs 非负；负值会让消费端整份信封被拒。
+ * performance.now() 单调不减，取整保持历史上的整数毫秒形状。
+ */
+function elapsedMs(monotonicStart: number): number {
+  return Math.round(performance.now() - monotonicStart);
+}
+
 const DEFAULT_TRUST: ToolResultTrust = {
   source: 'internal',
   sanitized: true,
@@ -99,7 +108,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
   async #executeCall(request: ToolCallRequest): Promise<ToolResultEnvelope> {
     const startedAt = new Date().toISOString();
     const callId = randomUUID();
-    const t0 = Date.now();
+    const t0 = performance.now();
 
     if (request.abortSignal?.aborted) {
       return {
@@ -128,7 +137,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
             callId,
             startedAt,
             'Tool call aborted during availability lookup',
-            Date.now() - t0
+            elapsedMs(t0)
           ),
           status: 'aborted',
         };
@@ -140,7 +149,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
           request.toolId,
           callId,
           startedAt,
-          Date.now() - t0
+          elapsedMs(t0)
         );
       }
 
@@ -160,7 +169,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
           ? { getAvailability: () => getAvailability.call(this.#contextFactory, request.runtime) }
           : {}),
       });
-      const durationMs = Date.now() - t0;
+      const durationMs = elapsedMs(t0);
 
       const envelope = this.#toEnvelope(
         result,
@@ -175,7 +184,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
       }
       return envelope;
     } catch (err: unknown) {
-      const durationMs = Date.now() - t0;
+      const durationMs = elapsedMs(t0);
       return this.#errorEnvelope(
         request.toolId,
         callId,

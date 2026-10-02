@@ -33,7 +33,8 @@ export async function executeRuntimeToolCall(
   context: ToolExecContext,
   metadata: ToolMetadata
 ): Promise<unknown> {
-  const t0 = Date.now();
+  // 单调时钟：墙钟回拨不能让 metadata.durationMs 变负（L3-C03）；取整保持整数毫秒。
+  const t0 = performance.now();
   try {
     const request = buildRuntimeToolCallRequest(call, context);
     // SafetyPolicy及请求装配可能执行宿主代码；最后一道取消检查必须位于真实路由入口前。
@@ -62,7 +63,7 @@ export async function executeRuntimeToolCall(
     });
     return { error };
   } finally {
-    metadata.durationMs = Date.now() - t0;
+    metadata.durationMs = Math.round(performance.now() - t0);
   }
 }
 
