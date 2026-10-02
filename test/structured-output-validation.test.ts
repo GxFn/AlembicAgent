@@ -1,3 +1,4 @@
+import { Ajv } from 'ajv';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AiProvider, type StructuredOutputOptions } from '../src/ai/AiProvider.js';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
@@ -91,6 +92,95 @@ describe('structured validator diagnostic boundary', () => {
     });
     expect(prepareStructuredValidation({ type: 'object', unknownKeyword: true }, log)).toBeNull();
     expect(log).toHaveBeenCalled();
+  });
+
+  it('labels a tool parameter schema failure without claiming the model request was skipped', () => {
+    const responseLog = vi.fn();
+    const toolLog = vi.fn();
+    const schema = { type: 'object', unknownKeyword: true };
+    expect(prepareStructuredValidation(schema, responseLog)).toBeNull();
+    expect(prepareStructuredValidation(schema, toolLog, 'tool-parameters')).toBeNull();
+    // 默认调用点（响应 schema）在请求前编译，文案保持“跳过模型请求”。
+    expect(responseLog).toHaveBeenCalledWith(
+      'warn',
+      expect.stringContaining('model request skipped')
+    );
+    const toolMessage = String(toolLog.mock.calls[0]?.[1]);
+    expect(toolMessage).toContain('context=tool-parameters');
+    expect(toolMessage).not.toContain('model request skipped');
+  });
+});
+
+describe('structured validator compile cache', () => {
+  // 编译只发生在 Ajv 核心原型上；三种方言都继承它，所以按原型计数即可观察缓存命中。
+  const corePrototype = Object.getPrototypeOf(Ajv.prototype) as { compile: Ajv['compile'] };
+  let fixture = 0;
+  const uniqueSchema = (extra: Record<string, unknown> = {}) => ({
+    description: `cache-fixture-${Date.now()}-${fixture++}`,
+    type: 'object',
+    required: ['ok'],
+    properties: { ok: { type: 'boolean' } },
+    ...extra,
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('reuses one compiled validator for an identical schema with identical results and logs', () => {
+    const compile = vi.spyOn(corePrototype, 'compile');
+    const schema = uniqueSchema();
+    const firstLog = vi.fn();
+    const secondLog = vi.fn();
+    const first = prepareStructuredValidation(schema, firstLog);
+    const second = prepareStructuredValidation(structuredClone(schema), secondLog);
+    if (!first || !second) {
+      throw new Error('Fixture schema did not compile');
+    }
+    expect(compile).toHaveBeenCalledTimes(1);
+    for (const value of [{ ok: true }, { ok: 'yes' }, {}]) {
+      expect(second(value)).toBe(first(value));
+    }
+    expect(secondLog.mock.calls).toEqual(firstLog.mock.calls);
+    expect(firstLog).toHaveBeenCalledWith('warn', expect.stringContaining('schema_mismatch'));
+  });
+
+  it('keys the cache by dialect and snapshot so a changed schema recompiles', () => {
+    const compile = vi.spyOn(corePrototype, 'compile');
+    const base = uniqueSchema();
+    expect(prepareStructuredValidation(base, vi.fn())).not.toBeNull();
+    expect(
+      prepareStructuredValidation(
+        { ...base, $schema: 'https://json-schema.org/draft/2020-12/schema' },
+        vi.fn()
+      )
+    ).not.toBeNull();
+    // strict 模式含 strictRequired：新增的必填字段必须同时在 properties 中声明才能编译。
+    const stricter = prepareStructuredValidation(
+      {
+        ...base,
+        required: ['ok', 'more'],
+        properties: { ok: { type: 'boolean' }, more: { type: 'string' } },
+      },
+      vi.fn()
+    );
+    expect(compile).toHaveBeenCalledTimes(3);
+    expect(stricter?.({ ok: true })).toBe(false);
+  });
+
+  it('bounds the cache and evicts the least recently used entry', () => {
+    const schemas = Array.from({ length: 64 }, () => uniqueSchema());
+    for (const schema of schemas) {
+      prepareStructuredValidation(schema, vi.fn());
+    }
+    const compile = vi.spyOn(corePrototype, 'compile');
+    // 访问第一条使其成为最近使用，再插入一条新 schema，应淘汰第二条而不是第一条。
+    prepareStructuredValidation(schemas[0], vi.fn());
+    expect(compile).not.toHaveBeenCalled();
+    prepareStructuredValidation(uniqueSchema(), vi.fn());
+    expect(compile).toHaveBeenCalledTimes(1);
+    prepareStructuredValidation(schemas[0], vi.fn());
+    expect(compile).toHaveBeenCalledTimes(1);
+    prepareStructuredValidation(schemas[1], vi.fn());
+    expect(compile).toHaveBeenCalledTimes(2);
   });
 });
 

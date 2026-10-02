@@ -332,6 +332,27 @@ describe('native SDK provider contracts', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    ...providers.map(({ name, Provider, model }) => ({ name, Provider, model })),
+    { name: 'openai', Provider: OpenAiProvider, model: 'gpt-4o' },
+  ])('rejects an uncompilable $name tool parameter schema before dispatch', async ({
+    Provider,
+    model,
+  }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const fetchMock = vi.fn(async () => jsonResponse({}));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(
+      new Provider({ apiKey: 'test-key', model, maxRetries: 0 }).chatWithTools('look up x', {
+        toolSchemas: [{ name: 'lookup', parameters: { type: 'object', unknownKeyword: true } }],
+      })
+    ).rejects.toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    const messages = warn.mock.calls.map(([message]) => String(message));
+    expect(messages.some((message) => message.includes('context=tool-parameters'))).toBe(true);
+    expect(messages.some((message) => message.includes('model request skipped'))).toBe(false);
+  });
+
   it('keeps local SDK input rejection from poisoning the provider circuit', async () => {
     // 强制过大单批以独立覆盖真实 SDK 的本地拒绝；正常 Gateway 应按已声明容量切批。
     vi.spyOn(OpenAiTransport.prototype, 'maxEmbeddingBatchSize', 'get').mockReturnValue(Infinity);

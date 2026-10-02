@@ -12,10 +12,45 @@ import type { TransportRequest, TransportResponse } from './LLMTransport.js';
 import type { SdkCallContext } from './sdkContext.js';
 import { captureSdkContinuation, replaySdkContinuation } from './sdkContinuation.js';
 
+/**
+ * 编译单个工具的参数 schema；编译结果由 schemaValidation 按快照缓存，
+ * 请求前预编译与响应后校验因此复用同一个已编译校验器。
+ */
+function prepareToolValidator(
+  parameters: Record<string, unknown> | undefined
+): ((value: unknown) => boolean) | null {
+  return prepareStructuredValidation(
+    parameters,
+    (_level, message) => Logger.getInstance().warn(message),
+    'tool-parameters'
+  );
+}
+
+/**
+ * 请求前预编译全部工具参数 schema：本地 schema 缺陷属于调用方输入错误，
+ * 以 LLM_INVALID_REQUEST 拒绝，不发请求、不消耗 token，也不归因为模型输出。
+ */
+function assertToolSchemasCompile(request: TransportRequest, context: SdkCallContext): void {
+  for (const tool of request.tools ?? []) {
+    if (prepareToolValidator(tool.parameters) === null) {
+      Logger.getInstance().warn(
+        `[ai-sdk] invalid_tool_schema provider=${context.provider} model=${request.model} tool=${tool.name}; request rejected before dispatch`
+      );
+      throw Object.assign(
+        new Error(
+          `${context.provider} tool parameter schema for "${tool.name}" failed to compile; request rejected before dispatch`
+        ),
+        { code: 'LLM_INVALID_REQUEST' }
+      );
+    }
+  }
+}
+
 export function sdkCallOptions(
   request: TransportRequest,
   context: SdkCallContext
 ): LanguageModelV4CallOptions {
+  assertToolSchemasCompile(request, context);
   Logger.getInstance().debug(
     `[ai-sdk] native_request provider=${context.provider} protocol=${context.protocol} model=${request.model} tools=${request.tools?.length ?? 0}; retry_owner=gateway`
   );
@@ -59,7 +94,7 @@ export function sdkResponse(
   }
   const usage = toTokenUsage(result, context);
   const callIds = new Set<string>();
-  // 同次响应内按声明编译一次；不跨请求缓存可变 schema。
+  // 同次响应内按工具名取一次校验器；编译结果来自请求前预编译时写入的快照缓存。
   const validators = new Map<string, ((value: unknown) => boolean) | null>();
   const functionCalls = result.content
     .filter((part) => part.type === 'tool-call')
@@ -91,11 +126,7 @@ export function sdkResponse(
       let validate = validators.get(part.toolName);
       if (validate === undefined) {
         const tool = request.tools?.find((candidate) => candidate.name === part.toolName);
-        validate = tool
-          ? prepareStructuredValidation(tool.parameters, (_level, message) =>
-              Logger.getInstance().warn(message)
-            )
-          : null;
+        validate = tool ? prepareToolValidator(tool.parameters) : null;
         validators.set(part.toolName, validate);
       }
       if (!validate || !validate(args)) {
