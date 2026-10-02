@@ -107,7 +107,8 @@ export function normalizeOllamaBaseUrl(rawUrl: string, logger?: AiLogger): strin
 function scopedModel(
   env: ConfigEnvironment,
   owner: 'AI' | 'EMBED',
-  providerId: ProviderId
+  providerId: ProviderId,
+  logger: AiLogger = Logger.getInstance() as unknown as AiLogger
 ): string | undefined {
   const selected = env[`ALEMBIC_${owner}_PROVIDER`];
   if (
@@ -116,7 +117,7 @@ function scopedModel(
     canonicalProvider(selected) !== providerId
   ) {
     if (env[`ALEMBIC_${owner}_MODEL`]) {
-      Logger.getInstance().debug(
+      logger.debug?.(
         `[ai-config] foreign_model_ignored scope=${owner} provider=${providerId}; use provider default`
       );
     }
@@ -125,14 +126,24 @@ function scopedModel(
   return env[`ALEMBIC_${owner}_MODEL`] || undefined;
 }
 
+export interface ResolveConnectionOptions {
+  /**
+   * 配置诊断（invalid_api_style、endpoint 归一化等）的接收方，默认 Core Logger。
+   * Gateway 用它把未显式配置的 provider 的告警暂存，等该 provider 真正被使用时再输出，
+   * 避免与当前调用无关的环境变量在每次构造时刷出告警。取值本身不受影响。
+   */
+  logger?: AiLogger;
+}
+
 /** endpoint 与 key 独立取值；是否显式传 key 不能改变 endpoint 的优先级。 */
 export function resolveConnection(
   providerId: ProviderId,
   config: ConnectionConfig = {},
-  env: ConfigEnvironment = process.env
+  env: ConfigEnvironment = process.env,
+  options: ResolveConnectionOptions = {}
 ): ResolvedConnection {
   const defaults = providerConfig(providerId);
-  const logger = Logger.getInstance() as unknown as AiLogger;
+  const logger = options.logger ?? (Logger.getInstance() as unknown as AiLogger);
   const rawUrl =
     configString(config.baseUrl, 'baseUrl') ||
     (defaults.baseUrlEnvVar ? env[defaults.baseUrlEnvVar] : '') ||
@@ -169,7 +180,7 @@ export function resolveConnection(
     baseUrl,
     embedModel:
       configString(config.embedModel, 'embedModel') ||
-      scopedModel(env, 'EMBED', providerId) ||
+      scopedModel(env, 'EMBED', providerId, logger) ||
       EMBEDDING_MODELS[providerId],
     apiStyle: style === 'responses' ? 'responses' : 'chat',
     reasoningEffort: effort === 'max' ? 'max' : 'high',

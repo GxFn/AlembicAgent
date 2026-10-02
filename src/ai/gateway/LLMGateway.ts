@@ -17,6 +17,7 @@ import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { configuredProvider, resolveConnection } from '../configuration.js';
 import type {
+  AiLogger,
   ChatWithToolsResult,
   LlmCallOptions,
   TokenUsage,
@@ -47,6 +48,13 @@ import { OpenAiTransport } from '../transport/OpenAiTransport.js';
 // AD4: lazy logger accessor — the Core logger singleton materializes on first
 // use instead of at module import (no import-time work; same singleton).
 const logger = () => Logger.getInstance();
+
+// 注册表声明诊断的进程内去重：同一模型的退役 / 能力不符告警只输出一次，
+// 避免 Agent 多轮循环或多个 Gateway 实例反复刷同一条告警。
+const warnedDeprecatedModels = new Set<string>();
+const warnedToolCallingModels = new Set<string>();
+
+type DeferredConfigLog = { level: 'debug' | 'info' | 'warn' | 'error'; message: string };
 
 // ─── Gateway Request ────────────────────────────────────
 
@@ -114,14 +122,26 @@ export class LLMGateway {
   #transports = new Map<ProviderId, LLMTransport>();
   #controllers = new Map<ProviderId, ReliabilityController>();
   #config: GatewayConfig;
+  /** 未显式配置的 provider 在构造时产生的配置诊断，等首次创建其 Transport 时再输出。 */
+  #deferredConfigLogs = new Map<ProviderId, DeferredConfigLog[]>();
 
   constructor(config: GatewayConfig = {}) {
     // 连接在创建时固定，惰性加载 SDK 不得改变 endpoint、凭据或协议。
+    // 冻结仍覆盖全部 provider；但只有 config.providers 里显式出现的 provider 立即输出配置告警，
+    // 其他 provider（例如 DeepSeek Provider 的 Gateway 里的 openai）的告警暂存，避免无关刷屏。
+    const explicit = config.providers ?? {};
     this.#config = {
       ...config,
       maxConcurrency: resolveConcurrency(config.maxConcurrency).value,
       providers: Object.fromEntries(
-        PROVIDER_CONFIGS.map(({ id }) => [id, resolveConnection(id, config.providers?.[id])])
+        PROVIDER_CONFIGS.map(({ id }) => [
+          id,
+          Object.hasOwn(explicit, id)
+            ? resolveConnection(id, explicit[id])
+            : resolveConnection(id, undefined, process.env, {
+                logger: this.#deferringLogger(id),
+              }),
+        ])
       ),
     };
   }
@@ -133,6 +153,7 @@ export class LLMGateway {
    */
   async chatWithTools(request: GatewayRequest): Promise<ChatWithToolsResult> {
     const { modelDef, providerId, apiModelId } = this.#resolveModel(request.modelRef);
+    this.#reportModelDeclarations(modelDef, request);
 
     const guarded = ParameterGuard.guard(modelDef, {
       temperature: request.temperature,
@@ -367,7 +388,61 @@ export class LLMGateway {
     return 'openai';
   }
 
+  // ─── Model Declaration Diagnostics ────────────────────
+
+  /**
+   * deprecated / capabilities 是注册表的描述性声明：这里只输出诊断，不迁移模型、不拒绝请求、
+   * 不剥离 tools（这些属于产品决定）。日志只含模型 id 与数量，不含消息或工具内容。
+   */
+  #reportModelDeclarations(modelDef: ModelDef, request: GatewayRequest): void {
+    const deprecated = modelDef.deprecated;
+    if (deprecated && !warnedDeprecatedModels.has(modelDef.id)) {
+      warnedDeprecatedModels.add(modelDef.id);
+      const retireAt = Date.parse(deprecated.retireDate);
+      // 退役日期无法解析时不猜测是否已退役，单独归类，便于修正注册表数据。
+      const status = Number.isNaN(retireAt)
+        ? 'deprecated_model_unknown_retire_date'
+        : retireAt <= Date.now()
+          ? 'deprecated_model_retired'
+          : 'deprecated_model_scheduled';
+      this.#log(
+        'warn',
+        `[LLMGateway] ${status} model=${modelDef.id} retireDate=${deprecated.retireDate} migrateTo=${deprecated.migrateToId}; request sent unchanged`
+      );
+    }
+    const toolCount = request.tools?.length ?? 0;
+    if (
+      toolCount > 0 &&
+      request.toolChoice !== 'none' &&
+      modelDef.capabilities.toolCalling === false &&
+      !warnedToolCallingModels.has(modelDef.id)
+    ) {
+      warnedToolCallingModels.add(modelDef.id);
+      this.#log(
+        'warn',
+        `[LLMGateway] tool_calling_unsupported model=${modelDef.id} tools=${toolCount}; path=send_unchanged (registry declares toolCalling=false)`
+      );
+    }
+  }
+
   // ─── Reliability & Observability ──────────────────────
+
+  /** 收集某个 provider 的配置诊断而不立即输出；#getTransport 首次创建该 provider 时 flush。 */
+  #deferringLogger(providerId: ProviderId): AiLogger {
+    const record =
+      (level: DeferredConfigLog['level']) =>
+      (message: string): void => {
+        const pending = this.#deferredConfigLogs.get(providerId) ?? [];
+        pending.push({ level, message });
+        this.#deferredConfigLogs.set(providerId, pending);
+      };
+    return {
+      debug: record('debug'),
+      info: record('info'),
+      warn: record('warn'),
+      error: record('error'),
+    };
+  }
 
   /** 桥接 core Logger（控制器 / 结构化提取的日志回调）。 */
   #log(level: string, message: string): void {
@@ -440,6 +515,15 @@ export class LLMGateway {
     let transport = this.#transports.get(providerId);
     if (transport) {
       return transport;
+    }
+
+    // 该 provider 第一次真正被使用：补发构造时暂存的配置诊断（每个 Gateway 只输出一次）。
+    const deferred = this.#deferredConfigLogs.get(providerId);
+    if (deferred) {
+      this.#deferredConfigLogs.delete(providerId);
+      for (const entry of deferred) {
+        this.#log(entry.level, `${entry.message} (deferred until first use)`);
+      }
     }
 
     const config = this.#resolveTransportConfig(providerId);

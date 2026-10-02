@@ -296,6 +296,130 @@ describe('LLMGateway horizontal capabilities', () => {
   });
 });
 
+// 注册表的 deprecated / capabilities 只用于诊断：请求必须照常发出，告警按模型进程内去重。
+// 去重集合是模块级状态，因此每个用例使用本文件其他用例不会触达的模型。
+describe('LLMGateway model declaration diagnostics', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function warnMessages(warn: { mock: { calls: unknown[][] } }, marker: string): string[] {
+    return warn.mock.calls.map((call) => String(call[0])).filter((msg) => msg.includes(marker));
+  }
+
+  function anthropicReply() {
+    return jsonResponse({
+      id: 'msg-fixture',
+      type: 'message',
+      role: 'assistant',
+      model: 'fixture',
+      content: [{ type: 'text', text: 'done' }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+  }
+
+  it('warns once that a retired model is still requested and still sends it unchanged', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const models: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        models.push(JSON.parse(String(init.body)).model);
+        return anthropicReply();
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { claude: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await gateway.chatWithTools({
+        modelRef: 'claude:claude-sonnet-4-20250514',
+        messages: [{ role: 'user', content: 'ping' }],
+      });
+    }
+    expect(models).toEqual(['claude-sonnet-4-20250514', 'claude-sonnet-4-20250514']);
+    const messages = warnMessages(warn, 'deprecated_model');
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('deprecated_model_retired');
+    expect(messages[0]).toContain('model=claude:claude-sonnet-4-20250514');
+    expect(messages[0]).toContain('retireDate=2026-06-15');
+    expect(messages[0]).toContain('migrateTo=claude:claude-sonnet-4-6');
+    expect(messages[0]).toContain('sent unchanged');
+  });
+
+  it('distinguishes a deprecated model whose retire date has not passed yet', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => anthropicReply())
+    );
+    const gateway = new LLMGateway({
+      providers: { claude: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    await gateway.chatWithTools({
+      modelRef: 'claude:claude-opus-4-20250514',
+      messages: [{ role: 'user', content: 'ping' }],
+    });
+    const messages = warnMessages(warn, 'deprecated_model');
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('deprecated_model_scheduled');
+    expect(messages[0]).toContain('retireDate=2026-06-15');
+    expect(messages[0]).toContain('migrateTo=claude:claude-opus-4-7');
+  });
+
+  it('warns when tools reach a model declared without tool calling but still sends them', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'done' } }] });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { deepseek: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    const tools = [
+      { name: 'first_tool', description: 'first', parameters: { type: 'object', properties: {} } },
+      {
+        name: 'second_tool',
+        description: 'second',
+        parameters: { type: 'object', properties: {} },
+      },
+    ];
+    const request = {
+      modelRef: 'deepseek:deepseek-reasoner',
+      messages: [{ role: 'user' as const, content: 'ping' }],
+      tools,
+    };
+    // toolChoice=none 时调用者已禁用工具，不属于能力不符。
+    await gateway.chatWithTools({ ...request, toolChoice: 'none' });
+    expect(warnMessages(warn, 'tool_calling_unsupported')).toEqual([]);
+    await gateway.chatWithTools({ ...request, toolChoice: 'auto' });
+    await gateway.chatWithTools({ ...request, toolChoice: 'auto' });
+    expect(bodies[1]?.tools).toHaveLength(2);
+    expect(bodies[2]?.tools).toHaveLength(2);
+    const messages = warnMessages(warn, 'tool_calling_unsupported');
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('model=deepseek:deepseek-reasoner');
+    expect(messages[0]).toContain('tools=2');
+    expect(messages[0]).toContain('path=send_unchanged');
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('first_tool');
+  });
+});
+
 describe('LLMTransport explicit legacy defaults', () => {
   class LocalTransport extends LLMTransport {
     request?: TransportRequest;

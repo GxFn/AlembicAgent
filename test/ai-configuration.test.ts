@@ -358,6 +358,52 @@ describe('effective AI connection configuration', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  // Gateway 构造时仍冻结全部 provider 的连接，但只对显式配置的 provider 立即输出配置告警；
+  // 未配置的 provider 的告警延后到它真正创建 Transport 时输出一次，不丢失也不刷屏。
+  it('reports an OpenAI style warning only for gateways that actually use OpenAI', async () => {
+    vi.stubEnv('ALEMBIC_OPENAI_API_STYLE', 'bad-style');
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const styleWarnings = () =>
+      warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((msg) => msg.includes('invalid_api_style provider=openai'));
+
+    await new DeepSeekProvider({ apiKey: 'fixture-key' })._getGateway();
+    expect(styleWarnings()).toEqual([]);
+
+    await new OpenAiProvider({ apiKey: 'fixture-key' })._getGateway();
+    expect(styleWarnings()).toHaveLength(1);
+  });
+
+  it('defers configuration warnings for an unconfigured provider until its first request', async () => {
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', 'fixture-key');
+    vi.stubEnv('ALEMBIC_OPENAI_API_STYLE', 'bad-style');
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const styleWarnings = () =>
+      warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((msg) => msg.includes('invalid_api_style provider=openai'));
+    const gateway = new LLMGateway({
+      providers: { deepseek: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    expect(styleWarnings()).toEqual([]);
+    // 构造后再改环境不能影响已冻结的连接（仍按 chat 协议发出）。
+    vi.stubEnv('ALEMBIC_OPENAI_API_STYLE', 'responses');
+    const urls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url) => {
+        urls.push(String(url));
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'ok' } }] });
+      })
+    );
+    await gateway.chat({ modelRef: 'openai:gpt-5.5', prompt: 'ping' });
+    await gateway.chat({ modelRef: 'openai:gpt-5.5', prompt: 'ping' });
+    expect(urls.every((url) => url.endsWith('/chat/completions'))).toBe(true);
+    expect(styleWarnings()).toHaveLength(1);
+  });
+
   it('uses an explicit endpoint with an inherited key instead of the environment endpoint', async () => {
     vi.stubEnv('ALEMBIC_OPENAI_API_KEY', 'fixture-environment-key');
     vi.stubEnv('ALEMBIC_OPENAI_BASE_URL', 'https://environment.example.invalid/v1');
