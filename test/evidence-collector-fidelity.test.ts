@@ -634,6 +634,31 @@ describe('R2 graph 证据流（关系声明不再被迫在阉割表述与编造 
     ]);
   });
 
+  it('概览回执没有包装层：图引用照收，意图如实写成概览', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'graph',
+      args: { action: 'overview' },
+      envelope: {
+        ok: true,
+        status: 'success',
+        structuredContent: {
+          index: { freshness: 'fresh', coverageGaps: 0 },
+          modules: [{ name: 'core', kind: 'area', files: 3 }],
+          moduleDependencies: [],
+          graphRefs: [callRef(1)],
+        },
+      },
+    });
+    const { graphEvidence, explorationLog } = collector.build();
+    expect(graphEvidence).toEqual([callRef(1)]);
+    expect(explorationLog[0]).toMatchObject({
+      intent: 'Graph overview',
+      resultSummary: 'modules=1, moduleDependencies=0; 1 graph refs',
+      effective: true,
+    });
+  });
+
   it('多次查询轮流出引用：先到的查询带回再多，也不挤掉后面的', () => {
     const collector = new EvidenceCollector();
     const refsOf = (target: string) =>

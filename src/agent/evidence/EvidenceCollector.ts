@@ -906,6 +906,9 @@ export class EvidenceCollector {
         if (args.className || args.entity) {
           return `Inspect class ${args.className || args.entity}`;
         }
+        if (action === 'overview') {
+          return 'Graph overview';
+        }
         return `Query graph: ${(args.query || '').substring(0, 50)}`;
       case 'knowledge':
         if (action === 'search') {
