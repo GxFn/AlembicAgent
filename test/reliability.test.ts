@@ -416,6 +416,11 @@ describe('ReliabilityController retry & circuit breaker', () => {
     expect(c.circuitState).toBe('CLOSED');
     expect(c.activeRequests).toBe(0);
     expect(logs.some((line) => line.includes('LLM_INVALID_TOOL_CALL'))).toBe(true);
+    // 模型输出被拒只写一条终态诊断，并标明未计入熔断。
+    const terminal = logs.filter((line) => line.includes('[reliability] fixture terminal'));
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toContain('counted=false');
+    expect(terminal[0]).toContain('model output rejected');
     await expect(c.run(() => Promise.resolve('ok'), 0, 1)).resolves.toBe('ok');
   });
 
@@ -449,6 +454,91 @@ describe('ReliabilityController retry & circuit breaker', () => {
     await expect(c.run(() => Promise.resolve('ok'), 0, 1)).resolves.toBe('ok');
     expect(c.circuitState).toBe('CLOSED');
     expect(c.circuitFailures).toBe(0);
+  });
+
+  it('logs a structured terminal diagnostic when a counted 503 ends the request', async () => {
+    const logs: Array<{ level: string; message: string }> = [];
+    const c = new ReliabilityController({
+      maxRetries: 0,
+      circuitThreshold: 5,
+      label: 'fixture',
+      onLog: (level, message) => logs.push({ level, message }),
+    });
+    // Claude 默认 maxRetries=0：首个 503 直接进入终态，必须留下可定位的诊断。
+    await expect(c.run(() => Promise.reject(serviceFailure(503)), 0, 1)).rejects.toMatchObject({
+      status: 503,
+    });
+    const terminal = logs.filter((entry) =>
+      entry.message.includes('[reliability] fixture terminal')
+    );
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.level).toBe('warn');
+    expect(terminal[0]?.message).toContain('reason=retries-exhausted');
+    expect(terminal[0]?.message).toContain('status=503');
+    expect(terminal[0]?.message).toContain('retryable=true');
+    expect(terminal[0]?.message).toContain('counted=true');
+    expect(terminal[0]?.message).toContain('circuitState=CLOSED');
+    expect(terminal[0]?.message).toContain('attempts=1');
+    expect(terminal[0]?.message).toContain('retries=0');
+    // 只记录结构化元数据，不写错误 message 正文。
+    expect(logs.some((entry) => entry.message.includes('fixture service failure'))).toBe(false);
+  });
+
+  it('logs uncounted client errors at info level without the message body', async () => {
+    const logs: Array<{ level: string; message: string }> = [];
+    const c = new ReliabilityController({
+      maxRetries: 2,
+      circuitThreshold: 1,
+      label: 'fixture',
+      onLog: (level, message) => logs.push({ level, message }),
+    });
+    const clientError = Object.assign(new Error('secret prompt body'), {
+      status: 400,
+      code: 'LLM_API_ERROR',
+    });
+    await expect(c.run(() => Promise.reject(clientError), 2, 1)).rejects.toBe(clientError);
+    const terminal = logs.filter((entry) =>
+      entry.message.includes('[reliability] fixture terminal')
+    );
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.level).toBe('info');
+    expect(terminal[0]?.message).toContain('reason=non-retryable');
+    expect(terminal[0]?.message).toContain('status=400');
+    expect(terminal[0]?.message).toContain('code=LLM_API_ERROR');
+    expect(terminal[0]?.message).toContain('retryable=false');
+    expect(terminal[0]?.message).toContain('counted=false');
+    expect(terminal[0]?.message).not.toContain('probe released without verdict');
+    expect(logs.some((entry) => entry.message.includes('secret prompt body'))).toBe(false);
+  });
+
+  it('logs a half-open probe released without verdict when it ends in a 400', async () => {
+    vi.useFakeTimers();
+    const logs: Array<{ level: string; message: string }> = [];
+    const c = new ReliabilityController({
+      maxRetries: 0,
+      circuitThreshold: 1,
+      label: 'fixture',
+      onLog: (level, message) => logs.push({ level, message }),
+    });
+    await expect(c.run(() => Promise.reject(serviceFailure()), 0, 1)).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(c.circuitState).toBe('OPEN');
+    await vi.advanceTimersByTimeAsync(30_000);
+    logs.length = 0;
+
+    const clientError = Object.assign(new Error('bad request'), { status: 400 });
+    await expect(c.run(() => Promise.reject(clientError), 0, 1)).rejects.toBe(clientError);
+    // 4xx 既不计数也不闭合：熔断停在 HALF_OPEN，日志要说明探活无结论地释放。
+    expect(c.circuitState).toBe('HALF_OPEN');
+    const terminal = logs.filter((entry) =>
+      entry.message.includes('[reliability] fixture terminal')
+    );
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.level).toBe('info');
+    expect(terminal[0]?.message).toContain('counted=false');
+    expect(terminal[0]?.message).toContain('circuitState=HALF_OPEN');
+    expect(terminal[0]?.message).toContain('probe released without verdict');
   });
 
   it('classifies timeout as retryable and opens the circuit', async () => {

@@ -274,6 +274,44 @@ export class ReliabilityController {
   }
 
   /**
+   * 终态（不再重试、即将抛出）统一写一条结构化诊断。
+   *
+   * 只记录分类元数据，不写错误 message 正文（可能夹带提示词、模型原文或密钥片段）。
+   * 级别：重试耗尽或计入熔断的服务端错误用 warn；其余（客户端 4xx、本地输入、模型输出被拒、
+   * 程序员错误）不代表服务可用性问题，用 info。半开探活以未计数错误结束时，熔断停在
+   * HALF_OPEN 且许可由 run 的 finally 归还，这里注明“无结论释放”，便于排查熔断迟迟不闭合。
+   */
+  private logTerminal(input: {
+    owner: symbol;
+    attempt: number;
+    retries: number;
+    status: number;
+    code: unknown;
+    isRetryable: boolean;
+    counted: boolean;
+    isModelOutputError: boolean;
+  }): void {
+    const exhausted = input.isRetryable && input.attempt >= input.retries;
+    const reason = exhausted ? 'retries-exhausted' : 'non-retryable';
+    // code 来自外部 transport，只接受短标识符形态，避免把任意文本写进日志。
+    const code =
+      typeof input.code === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(input.code)
+        ? input.code
+        : 'unknown';
+    const notes: string[] = [];
+    if (input.isModelOutputError) {
+      notes.push('model output rejected; not counted as service failure');
+    }
+    if (!input.counted && this.circuitState === 'HALF_OPEN' && this.probeOwner === input.owner) {
+      notes.push('probe released without verdict');
+    }
+    this.log(
+      exhausted || input.counted ? 'warn' : 'info',
+      `[reliability] ${this.label} terminal reason=${reason} attempts=${input.attempt + 1} retries=${input.retries} status=${input.status || 'none'} code=${code} retryable=${input.isRetryable} counted=${input.counted} circuitState=${this.circuitState} circuitFailures=${this.circuitFailures}/${this.circuitThreshold}${notes.length > 0 ? ` — ${notes.join('; ')}` : ''}`
+    );
+  }
+
+  /**
    * 在可靠性包裹下执行一次 LLM 调用。
    *
    * @param fn 实际的 Transport 调用
@@ -355,17 +393,22 @@ export class ReliabilityController {
           }
 
           if (attempt >= retries || !isRetryable) {
-            // 只有服务端 / 网络错误才累计熔断计数；客户端错误 (4xx 非 429) 不触发熔断
+            // 只有服务端 / 网络错误才累计熔断计数；客户端错误 (4xx 非 429) 不触发熔断。
+            // 服务已应答、模型输出被拒时熔断状态保持原样：半开探活既不据此重开也不据此闭合，
+            // 探活许可由外层 finally 归还，下一个请求继续核验服务。
             if (isServerError) {
               this.recordFailure(epoch);
-            } else if (isModelOutputError) {
-              // 服务已应答、模型输出被拒：熔断状态保持原样。半开探活既不据此重开也不据此闭合，
-              // 探活许可由外层 finally 归还，下一个请求继续核验服务。
-              this.log(
-                'info',
-                `[CircuitBreaker] ${this.label} model output rejected (code=${(e as { code?: string }).code || 'unknown'}); not counted as service failure, circuit stays ${this.circuitState}`
-              );
             }
+            this.logTerminal({
+              owner,
+              attempt,
+              retries,
+              status,
+              code: 'code' in e ? e.code : undefined,
+              isRetryable,
+              counted: isServerError,
+              isModelOutputError,
+            });
             throw e;
           }
 
