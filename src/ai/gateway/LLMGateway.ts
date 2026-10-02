@@ -199,7 +199,8 @@ export class LLMGateway {
   /**
    * Structured JSON output
    *
-   * 稳健解析：复用 shared/extractJSON（去 markdown 围栏 + 容错 + 截断修复），
+   * 稳健解析：复用 shared/extractJSON（截取外层边界 + 字符串感知尾逗号修复 + 数组截断回收，
+   * 失败与部分回收都会经 #log 打 warn），
    * 替代原先脆弱的 JSON.parse(text)，与 Provider 层 chatWithStructuredOutput 一致。
    */
   async chatStructured(request: GatewayChatRequest): Promise<unknown> {

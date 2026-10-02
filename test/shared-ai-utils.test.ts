@@ -489,6 +489,125 @@ describe('shared/structuredOutput extractJSON', () => {
   });
 });
 
+// 诊断契约：每个 null 出口与每次部分回收都要留下可定位的 warn（原因、长度、回收条数），
+// 但绝不能把模型原文带进日志。返回值保持现状（完整但含坏元素数组的回收策略见待决包 L1-P5）。
+describe('shared/structuredOutput extractJSON diagnostics', () => {
+  const SENTINEL = 'SENTINEL_MODEL_TEXT';
+
+  function collect(): {
+    logs: Array<{ level: string; message: string }>;
+    onLog: (level: string, message: string) => void;
+  } {
+    const logs: Array<{ level: string; message: string }> = [];
+    return { logs, onLog: (level, message) => logs.push({ level, message }) };
+  }
+
+  it.each([
+    { name: 'empty text', text: '', open: '{', close: '}', reason: 'empty' },
+    {
+      name: 'no opening char',
+      text: `plain ${SENTINEL} reply`,
+      open: '{',
+      close: '}',
+      reason: 'no_open_char',
+    },
+    {
+      name: 'object followed by braced prose',
+      text: `{"a":1}\n说明：字段 {a} ${SENTINEL}`,
+      open: '{',
+      close: '}',
+      reason: 'boundary_invalid',
+    },
+    {
+      name: 'bracketed prose before an array',
+      text: `建议如下 [见下] ${SENTINEL}:\n[{"a":1}]`,
+      open: '[',
+      close: ']',
+      reason: 'boundary_invalid',
+    },
+    {
+      name: 'truncated object',
+      text: `{"a":"${SENTINEL}`,
+      open: '{',
+      close: '}',
+      reason: 'truncated',
+    },
+    {
+      name: 'truncated array without a complete item',
+      text: `[{"a":"${SENTINEL}`,
+      open: '[',
+      close: ']',
+      reason: 'repair_failed',
+    },
+  ])('returns null and reports reason for $name', ({ text, open, close, reason }) => {
+    const { logs, onLog } = collect();
+    expect(extractJSON(text, open, close, onLog)).toBeNull();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].level).toBe('warn');
+    expect(logs[0].message).toContain('[extractJSON] parse_failed');
+    expect(logs[0].message).toContain(`reason=${reason}`);
+    expect(logs[0].message).toContain(`open=${open}`);
+    expect(logs[0].message).toContain(`length=${text.length}`);
+    expect(logs[0].message).not.toContain(SENTINEL);
+  });
+
+  it('labels recovery from a structurally complete array with a malformed item', () => {
+    const { logs, onLog } = collect();
+    const text = `[{"v":"1"},{"v":"say "${SENTINEL}""},{"v":"3"}]`;
+    // 返回值维持现状：仍回收坏元素之前的条目（是否改为 null 由 L1-P5 决定）。
+    expect(extractJSON(text, '[', ']', onLog)).toEqual([{ v: '1' }]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].level).toBe('warn');
+    expect(logs[0].message).toContain('reason=malformed_complete');
+    expect(logs[0].message).toContain('recoveredItems=1');
+    expect(logs[0].message).toContain(`droppedChars=${text.length - '[{"v":"1"}'.length}`);
+    expect(logs[0].message).not.toContain('from truncated response');
+    expect(logs[0].message).not.toContain(SENTINEL);
+  });
+
+  it('labels recovery from a genuinely truncated array', () => {
+    const { logs, onLog } = collect();
+    const text = `[{"a":1},{"a":2},{"a":"${SENTINEL}`;
+    expect(extractJSON(text, '[', ']', onLog)).toEqual([{ a: 1 }, { a: 2 }]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].message).toContain('reason=truncated');
+    expect(logs[0].message).toContain('recoveredItems=2');
+    expect(logs[0].message).toContain(`droppedChars=${text.length - '[{"a":1},{"a":2}'.length}`);
+    expect(logs[0].message).not.toContain(SENTINEL);
+  });
+
+  it('treats a closing bracket inside a string of a truncated array as truncation', () => {
+    const { logs, onLog } = collect();
+    const text = '[{"v":"literal, ]"},{"unfinished":';
+    expect(extractJSON(text, '[', ']', onLog)).toEqual([{ v: 'literal, ]' }]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0].message).toContain('reason=truncated');
+  });
+
+  it('reports a failed direct array repair without echoing the input', () => {
+    const { logs, onLog } = collect();
+    expect(repairTruncatedArray(`[{"a":"${SENTINEL}`, onLog)).toBeNull();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].message).toContain('reason=repair_failed');
+    expect(logs[0].message).not.toContain(SENTINEL);
+  });
+
+  it('keeps returning null when the failure observer throws', () => {
+    const onLog = vi.fn(() => {
+      throw new Error('observer unavailable');
+    });
+    expect(extractJSON('{"a":', '{', '}', onLog)).toBeNull();
+    expect(onLog).toHaveBeenCalledOnce();
+  });
+
+  it('does not log on a clean parse', () => {
+    const { logs, onLog } = collect();
+    expect(extractJSON('{"a":1}', '{', '}', onLog)).toEqual({ a: 1 });
+    expect(extractJSON('[{"a":1}]', '[', ']', onLog)).toEqual([{ a: 1 }]);
+    expect(logs).toEqual([]);
+  });
+});
+
 describe('shared/errorClassify classifyLlmError', () => {
   it('flags AbortError as abort and non-retryable', () => {
     const c = classifyLlmError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
