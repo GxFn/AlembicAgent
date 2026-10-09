@@ -1,10 +1,21 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
@@ -1355,5 +1366,262 @@ describe('snippet repair hint ref read failures', () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain('escape.ts:1-1');
     expect(messages[0]).toContain('Access denied');
+  });
+});
+
+// ─── L4-P13 code.search 多 pattern 完整性与计数语义 ───────────────────────────────
+// 来源：module-review-2026-10-01 I13。rg 输出超限曾与 timeout/aborted 共用中断通道：第一个常见词
+// pattern 超过 2MB 就终止整个循环，后续 pattern 不执行且诊断不点名；合并又按 pattern 顺序拼接后
+// slice(0, maxResults)，靠后 pattern 的命中被静默挤掉。这里用真实 rg + 合成项目钉住用户可见行为，
+// 用受控 rg 替身（只发 --json 协议回执，不执行项目命令）钉住 spawn 边界：超限、收满、计数、中断。
+interface SearchData {
+  total: number;
+  shown: number;
+  matches: Array<{ file: string; line: number; content: string }>;
+  incomplete?: true;
+}
+
+function searchRequest(
+  params: Record<string, unknown>,
+  abortSignal?: AbortSignal
+): ToolCallRequest {
+  return {
+    toolId: 'code',
+    args: { action: 'search', params },
+    surface: 'runtime',
+    actor: { user: 'test' },
+    source: { kind: 'runtime' },
+    ...(abortSignal ? { abortSignal } : {}),
+  };
+}
+
+/** 1500 个文件各 20 行 import（rg --json 总输出远超 2MB）+ 一个只含 UniqueTargetSymbol 的文件。 */
+async function makeImportHeavyProject(): Promise<string> {
+  const root = await mkdtemp(join(baseRoot, 'p13-synthetic-'));
+  const pad = 'x'.repeat(120);
+  const body = Array.from({ length: 20 }, (_, i) => `import a${i} from 'mod${i}'; // ${pad}`).join(
+    '\n'
+  );
+  await Promise.all(
+    Array.from({ length: 1500 }, (_, i) => writeFile(join(root, `f${i}.ts`), `${body}\n`))
+  );
+  await writeFile(join(root, 'target.ts'), 'export const UniqueTargetSymbol = 1;\n');
+  return root;
+}
+
+/** 受控 rg 替身：按 pattern（argv 倒数第二个）回放固定的 --json 事件流。 */
+const FAKE_RG_SCRIPT = `#!${process.execPath}
+const pattern = process.argv[process.argv.length - 2];
+const event = (type, file, line, text) =>
+  JSON.stringify({ type, data: { path: { text: './' + file }, line_number: line, lines: { text: text + '\\n' } } }) + '\\n';
+const end = (file) => JSON.stringify({ type: 'end', data: { path: { text: './' + file } } }) + '\\n';
+const summary = (matches, matchedLines) =>
+  JSON.stringify({ type: 'summary', data: { stats: { matches, matched_lines: matchedLines } } }) + '\\n';
+switch (pattern) {
+  case 'overflow-short': {
+    // 3 hits, then > 2MB of context: the output limit is reached before maxResults hits exist.
+    const parts = [
+      event('match', 'a.ts', 1, 'overflow-short one'),
+      event('match', 'a.ts', 5, 'overflow-short two'),
+      event('match', 'a.ts', 9, 'overflow-short three'),
+    ];
+    const filler = event('context', 'a.ts', 100, 'x'.repeat(240));
+    for (let i = 0; i < 12000; i++) parts.push(filler);
+    process.stdout.write(parts.join(''));
+    break;
+  }
+  case 'tail-hit':
+    process.stdout.write(event('match', 'b.ts', 2, 'tail-hit here') + end('b.ts') + summary(7, 1));
+    break;
+  case 'summary-counts':
+    process.stdout.write(
+      event('match', 'c.ts', 1, 'summary-counts a') +
+        event('match', 'c.ts', 4, 'summary-counts b') +
+        end('c.ts') +
+        summary(9, 2)
+    );
+    break;
+  case 'satisfied-hang': {
+    // maxResults hits + file end, then the process stays alive: only an early finish returns quickly.
+    const parts = [];
+    for (let i = 1; i <= 10; i++) parts.push(event('match', 'd.ts', i, 'satisfied-hang ' + i));
+    parts.push(end('d.ts'));
+    process.stdout.write(parts.join(''));
+    setTimeout(() => {}, 20000);
+    break;
+  }
+  case 'hang-after-hit':
+    process.stdout.write(event('match', 'e.ts', 3, 'hang-after-hit'));
+    require('node:fs').writeFileSync(process.env.P13_MARKER, 'printed');
+    setTimeout(() => {}, 20000);
+    break;
+  default:
+    process.exitCode = 1;
+}
+`;
+
+async function installFakeRg(): Promise<string> {
+  const bin = await mkdtemp(join(baseRoot, 'p13-fake-rg-'));
+  await writeFile(join(bin, 'rg'), FAKE_RG_SCRIPT);
+  await chmod(join(bin, 'rg'), 0o755);
+  vi.stubEnv('PATH', bin);
+  return bin;
+}
+
+describe('L4-P13 code.search multi-pattern completeness and count semantics', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('keeps a later pattern visible and undegraded when an earlier common pattern floods rg output', async () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const root = await makeImportHeavyProject();
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+    });
+    const forward = await router.execute(
+      searchRequest({ patterns: ['import', 'UniqueTargetSymbol'], contextLines: 0 })
+    );
+    const reversed = await router.execute(
+      searchRequest({ patterns: ['UniqueTargetSymbol', 'import'], contextLines: 0 })
+    );
+    for (const result of [forward, reversed]) {
+      expect(result.ok).toBe(true);
+      expect(result.status).toBe('success');
+      expect(result.diagnostics?.degraded).toBe(false);
+      expect(result.diagnostics?.warnings ?? []).not.toContainEqual(
+        expect.objectContaining({ code: 'code_search_incomplete' })
+      );
+      const data = result.structuredContent as SearchData;
+      expect(data.incomplete).toBeUndefined();
+      expect(data.shown).toBe(10);
+      // 轮转取名额：常见词只占 9 个名额，目标符号一定出现；两种顺序的名额分配一致。
+      expect(data.matches.filter((m) => m.file === 'target.ts')).toHaveLength(1);
+      expect(data.matches.filter((m) => m.content.includes('import '))).toHaveLength(9);
+      // import 收满 10 条即收尾（观察下界 10），目标符号 1 条。
+      expect(data.total).toBe(11);
+    }
+    const solo = await router.execute(searchRequest({ patterns: ['import'], contextLines: 0 }));
+    expect(solo.status).toBe('success');
+    expect(solo.diagnostics?.degraded).toBe(false);
+    expect(solo.structuredContent).toMatchObject({ total: 10, shown: 10 });
+  });
+
+  it('continues past a pattern whose output overflowed before enough hits and names it in the warning', async () => {
+    await installFakeRg();
+    const root = await mkdtemp(join(baseRoot, 'p13-overflow-'));
+    const cache = new SearchCache();
+    const set = vi.spyOn(cache, 'set');
+    const router = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({ projectRoot: root, tokenBudget: 8000, searchCache: cache }),
+      },
+    });
+    const result = await router.execute(
+      searchRequest({ patterns: ['overflow-short', 'tail-hit'], contextLines: 0 })
+    );
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe('partial');
+    expect(result.diagnostics?.degraded).toBe(true);
+    const data = result.structuredContent as SearchData;
+    expect(data.incomplete).toBe(true);
+    expect(data.matches).toEqual([
+      { file: 'a.ts', line: 1, content: 'overflow-short one' },
+      { file: 'b.ts', line: 2, content: 'tail-hit here' },
+      { file: 'a.ts', line: 5, content: 'overflow-short two' },
+      { file: 'a.ts', line: 9, content: 'overflow-short three' },
+    ]);
+    // 3 条观察到的命中 + tail-hit 的 matched_lines(1)，而不是子匹配计数 matches(7)。
+    expect(data).toMatchObject({ total: 4, shown: 4 });
+    const warning = (result.diagnostics?.warnings ?? []).find(
+      (w) => w.code === 'code_search_incomplete'
+    );
+    expect(warning?.message).toContain('"overflow-short"');
+    expect(warning?.message).toMatch(/exceeded/);
+    expect(warning?.message).not.toContain('"tail-hit"');
+    // 超限的 partial pattern 不进缓存；完整的 tail-hit 照常缓存。
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(set.mock.calls[0][1]).toMatchObject({ total: 1 });
+  });
+
+  it('counts rg matched_lines rather than sub-match totals', async () => {
+    await installFakeRg();
+    const root = await mkdtemp(join(baseRoot, 'p13-counts-'));
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 8000 }) },
+    });
+    const result = await router.execute(
+      searchRequest({ patterns: ['summary-counts'], contextLines: 0 })
+    );
+    expect(result.status).toBe('success');
+    expect(result.structuredContent).toMatchObject({ total: 2, shown: 2 });
+  });
+
+  it('finishes as satisfied once maxResults hits are collected without waiting for rg to exit', async () => {
+    await installFakeRg();
+    const root = await mkdtemp(join(baseRoot, 'p13-satisfied-'));
+    const cache = new SearchCache();
+    const set = vi.spyOn(cache, 'set');
+    const router = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({ projectRoot: root, tokenBudget: 8000, searchCache: cache }),
+      },
+    });
+    const started = Date.now();
+    const result = await router.execute(
+      searchRequest({ patterns: ['satisfied-hang'], maxResults: 10, contextLines: 0 })
+    );
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe('success');
+    expect(result.diagnostics?.degraded).toBe(false);
+    const data = result.structuredContent as SearchData;
+    expect(data.incomplete).toBeUndefined();
+    expect(data).toMatchObject({ total: 10, shown: 10 });
+    expect(data.matches.map((m) => m.line)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // 请求已满足的结果与普通成功同样确定，可以缓存。
+    expect(set).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops only for cancellation and lists the patterns it never searched', async () => {
+    await installFakeRg();
+    const root = await mkdtemp(join(baseRoot, 'p13-abort-'));
+    const marker = join(root, 'printed.marker');
+    vi.stubEnv('P13_MARKER', marker);
+    const cache = new SearchCache();
+    const set = vi.spyOn(cache, 'set');
+    const router = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({ projectRoot: root, tokenBudget: 8000, searchCache: cache }),
+      },
+    });
+    const controller = new AbortController();
+    const pending = router.execute(
+      searchRequest(
+        { patterns: ['hang-after-hit', 'never-run', 'never-run-either'], contextLines: 0 },
+        controller.signal
+      )
+    );
+    // 替身进程启动后才写 marker；放宽等待上限，避免负载高时误判为未启动。
+    await vi.waitFor(
+      async () => {
+        await stat(marker);
+      },
+      { timeout: 5000, interval: 25 }
+    );
+    controller.abort(new Error('fixture cancelled active rg'));
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe('aborted');
+    const data = result.structuredContent as SearchData;
+    expect(data.incomplete).toBe(true);
+    expect(data.matches).toEqual([{ file: 'e.ts', line: 3, content: 'hang-after-hit' }]);
+    const warning = (result.diagnostics?.warnings ?? []).find(
+      (w) => w.code === 'code_search_incomplete'
+    );
+    expect(warning?.message).toContain('"hang-after-hit"');
+    expect(warning?.message).toContain('"never-run"');
+    expect(warning?.message).toContain('"never-run-either"');
+    expect(set).not.toHaveBeenCalled();
   });
 });

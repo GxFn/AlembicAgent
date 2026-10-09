@@ -19,7 +19,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
   EvidenceCollector,
@@ -833,4 +833,45 @@ it('real single-path outline output cannot become a verbatim collector source sn
     envelope,
   });
   expect(collector.build().evidenceMap.get('large.ts')?.codeSnippets ?? []).toEqual([]);
+});
+
+// L4-P13（module-review-2026-10-01 I13）：批量 pattern 中靠后的稀有符号曾被前面常见 pattern 的命中
+// 按顺序拼接后 slice 掉，采集端于是只看到常见词、看不到目标符号。真实 rg 走通 adapter → collector。
+it('L4-P13: a rare later pattern stays visible to the collector beside a common earlier pattern', async () => {
+  vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+  try {
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot, tokenBudget: 8000 }) },
+    });
+    const args = {
+      action: 'search',
+      params: { patterns: ['export const alpha', 'gamma5'], maxResults: 5, contextLines: 0 },
+    };
+    const envelope = await router.execute({
+      toolId: 'code',
+      args,
+      surface: 'runtime',
+      actor: { user: 'test' },
+      source: { kind: 'runtime' },
+    });
+    expect(envelope.ok).toBe(true);
+    expect(envelope.status).toBe('success');
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args,
+      result: envelope.structuredContent as Record<string, unknown>,
+      envelope,
+    });
+    const { evidenceMap, negativeSignals } = collector.build();
+    expect(evidenceMap.get('src/gamma.ts')?.codeSnippets[0]).toMatchObject({
+      startLine: 6,
+      endLine: 6,
+      content: fileLines('gamma', 6, 6),
+    });
+    expect(evidenceMap.get('src/alpha.ts')?.codeSnippets.length).toBeGreaterThan(0);
+    expect(negativeSignals).toEqual([]);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

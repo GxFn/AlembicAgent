@@ -11,6 +11,8 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import Logger from '@alembic/core/logging';
 import { isThenable, observeSafely } from '#shared/observers.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
@@ -58,6 +60,21 @@ interface SearchMatch {
 // generation 只进入本工具的缓存 key；旧条目的容量/TTL 仍由宿主管理。
 const searchCacheGenerations = new WeakMap<NonNullable<ToolContext['searchCache']>, number>();
 
+/** 单个 pattern 的搜索结果；matches 保持引擎的遍历顺序，total 是该 pattern 的观察下界。 */
+interface PatternSearchOutcome {
+  pattern: string;
+  matches: SearchMatch[];
+  total: number;
+}
+
+/** timeout/aborted 中断点：哪个 pattern 被打断、哪些 pattern 根本没有执行。 */
+interface SearchHalt {
+  status: 'timeout' | 'aborted';
+  reason: string;
+  pattern?: string;
+  skipped: string[];
+}
+
 async function handleSearch(
   params: Record<string, unknown>,
   ctx: ToolContext
@@ -76,19 +93,24 @@ async function handleSearch(
   const contextLines = (params.contextLines as number) ?? 2;
   const regex = (params.regex as boolean) ?? false;
 
-  const allMatches: SearchMatch[] = [];
+  const outcomes: PatternSearchOutcome[] = [];
   const startMs = Date.now();
-  let totalCount = 0;
   let fellBack = false;
   let rejectedPaths = 0;
-  let incomplete: RipgrepResult['incomplete'];
+  // I13：输出超限 / rg 非零退出只影响单个 pattern（affected），引擎异常且无命中记为 failures；
+  // 两者都继续执行后续 pattern。只有 timeout/aborted（halted）才中断循环，并记下未执行的 pattern。
+  const affected: Array<{ pattern: string; reason: string }> = [];
+  const failures: Array<{ pattern: string; reason: string }> = [];
+  let halted: SearchHalt | undefined;
   const warnings: ToolDiagnosticWarning[] = [];
 
-  for (const pattern of patterns) {
+  for (let index = 0; index < patterns.length; index++) {
+    const pattern = patterns[index];
     if (ctx.abortSignal?.aborted) {
-      incomplete = {
+      halted = {
         status: searchAbortStatus(ctx.abortSignal),
         reason: 'Search cancelled before the next pattern.',
+        skipped: patterns.slice(index),
       };
       break;
     }
@@ -105,8 +127,7 @@ async function handleSearch(
     const cached = ctx.searchCache?.get(cacheKey);
     if (cached) {
       const cachedResult = cached as { matches: SearchMatch[]; total: number };
-      allMatches.push(...cachedResult.matches);
-      totalCount += cachedResult.total;
+      outcomes.push({ pattern, matches: cachedResult.matches, total: cachedResult.total });
       continue;
     }
 
@@ -131,27 +152,38 @@ async function handleSearch(
         });
         result = await fallbackRegexSearch(pattern, ctx.projectRoot, opts);
       }
-      allMatches.push(...result.matches);
-      totalCount += result.total;
+      outcomes.push({ pattern, matches: result.matches, total: result.total });
       rejectedPaths += result.rejectedPaths ?? 0;
       if (result.incomplete) {
-        incomplete = result.incomplete;
+        if (result.incomplete.status === 'partial') {
+          // 部分结果只属于这个 pattern：记录名字后继续，不写缓存（下次仍需重跑）。
+          affected.push({ pattern, reason: result.incomplete.reason });
+          continue;
+        }
+        halted = {
+          status: result.incomplete.status,
+          reason: result.incomplete.reason,
+          pattern,
+          skipped: patterns.slice(index + 1),
+        };
         break;
       }
       if (!fallback) {
         ctx.searchCache?.set(cacheKey, { matches: result.matches, total: result.total });
       }
     } catch (err: unknown) {
-      const reason = err instanceof Error ? err.message : 'Search failed';
-      if (allMatches.length === 0) {
-        return fail(`code.search failed: ${reason}`);
-      }
-      incomplete = { status: 'partial', reason };
-      break;
+      // 引擎对这个 pattern 失败（非法正则、rg 无命中即非零退出）：记录后继续后续 pattern；
+      // 全局零命中时整体失败，非法 pattern 不能伪装成“没找到”。
+      failures.push({ pattern, reason: err instanceof Error ? err.message : 'Search failed' });
     }
   }
 
-  const deduped = deduplicateMatches(allMatches).slice(0, maxResults);
+  const deduped = mergeRoundRobin(outcomes, maxResults);
+  const totalCount = outcomes.reduce((sum, outcome) => sum + outcome.total, 0);
+  if (deduped.length === 0 && failures.length > 0 && !halted) {
+    return fail(`code.search failed: ${describePatternIssues(failures)}`);
+  }
+  const incomplete = describeIncompleteSearch(halted, affected, failures, maxResults);
 
   // M2/P1a（挖掘产出升级）：结构化返回 matches——EvidenceCapture 的 per-file 分组分支
   // 读 structuredContent.matches（EvidenceCapture.ts:138-154），此前只返回格式化字符串导致
@@ -202,7 +234,84 @@ async function handleSearch(
     : result;
 }
 
+/**
+ * 按 pattern 轮转取名额合并：每轮依次从每个 pattern 取一条未见过的命中，直到收满 maxResults。
+ * 只要 maxResults 不少于有命中的 pattern 数，每个有命中的 pattern 至少出现一次；同一 file:line
+ * 被多个 pattern 命中时只保留第一次出现。此前按 pattern 顺序拼接后 slice(0, maxResults)，
+ * 第一个常见词就把靠后 pattern 的命中静默挤掉（I13）。
+ */
+function mergeRoundRobin(outcomes: PatternSearchOutcome[], maxResults: number): SearchMatch[] {
+  const seen = new Set<string>();
+  const merged: SearchMatch[] = [];
+  const cursors = outcomes.map(() => 0);
+  let progressed = true;
+  while (merged.length < maxResults && progressed) {
+    progressed = false;
+    for (let index = 0; index < outcomes.length && merged.length < maxResults; index++) {
+      const { matches } = outcomes[index];
+      while (cursors[index] < matches.length) {
+        const match = matches[cursors[index]++];
+        const key = `${match.file}:${match.line}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(match);
+          progressed = true;
+          break;
+        }
+      }
+    }
+  }
+  return merged;
+}
+
+function quotePatterns(patterns: string[]): string {
+  return patterns.map((pattern) => JSON.stringify(pattern)).join(', ');
+}
+
+function describePatternIssues(issues: Array<{ pattern: string; reason: string }>): string {
+  return issues.map((issue) => `${JSON.stringify(issue.pattern)} (${issue.reason})`).join('; ');
+}
+
+/**
+ * 把本次搜索的不完整原因写成可定位的诊断：受影响（partial）的 pattern、失败的 pattern、
+ * 中断点与被跳过的 pattern 都逐个点名——模型和证据采集端必须能分辨“没搜到”与“没搜”。
+ */
+function describeIncompleteSearch(
+  halted: SearchHalt | undefined,
+  affected: Array<{ pattern: string; reason: string }>,
+  failures: Array<{ pattern: string; reason: string }>,
+  maxResults: number
+): { status: 'partial' | 'timeout' | 'aborted'; reason: string } | undefined {
+  const parts: string[] = [];
+  if (affected.length > 0) {
+    parts.push(
+      `Partial results (fewer than ${maxResults} matches collected) for pattern(s) ${describePatternIssues(affected)}.`
+    );
+  }
+  if (failures.length > 0) {
+    parts.push(`No results for failed pattern(s) ${describePatternIssues(failures)}.`);
+  }
+  if (halted) {
+    parts.push(
+      halted.pattern !== undefined
+        ? `Search ${halted.status} while running pattern ${JSON.stringify(halted.pattern)}: ${halted.reason}`
+        : `Search ${halted.status}: ${halted.reason}`
+    );
+    if (halted.skipped.length > 0) {
+      parts.push(`Skipped pattern(s) ${quotePatterns(halted.skipped)}.`);
+    }
+  }
+  if (parts.length === 0) {
+    return undefined;
+  }
+  return { status: halted?.status ?? 'partial', reason: parts.join(' ') };
+}
+
 interface SearchProjection {
+  /**
+   * 已观察到的命中行数下界，不是全仓精确总数：rg 按文件 --max-count 截断且收满 maxResults 即收尾，
+   * fallback 收满即停止扫描；多 pattern 时为各 pattern 下界之和（跨 pattern 命中同一行会重复计入）。
+   */
   total: number;
   shown: number;
   matches: SearchMatch[];
@@ -210,7 +319,10 @@ interface SearchProjection {
   omittedCount?: number;
   omittedLocations?: Array<{ file: string; line: number }>;
   guidance?: string;
-  /** 仅已观察数量，不能把中断或失败搜索的 total 当全量总数。 */
+  /**
+   * 本次搜索有 pattern 未完整执行（输出超限、引擎失败、timeout/aborted 跳过）；具体名单见
+   * code_search_incomplete 诊断。缺席的 pattern 不能被当作“没找到”。
+   */
   incomplete?: true;
 }
 
@@ -282,8 +394,13 @@ function projectSearchResults(
 
 interface RipgrepResult {
   matches: SearchMatch[];
+  /** 已观察到的命中行数下界（语义见 SearchProjection.total）。 */
   total: number;
   rejectedPaths?: number;
+  /**
+   * partial：这个 pattern 的输出超限（命中尚不足 maxResults）或 rg 非零退出，只影响本 pattern；
+   * timeout/aborted：整次搜索被取消，调用方据此中断后续 pattern。
+   */
   incomplete?: { status: 'partial' | 'timeout' | 'aborted'; reason: string };
 }
 
@@ -345,7 +462,20 @@ async function ripgrepSearch(
   }
   args.push('--', pattern, './');
 
-  return spawnRg(args, cwd, 15000, opts.contextLines, opts.signal);
+  return spawnRg(args, cwd, 15000, {
+    pattern,
+    maxResults: opts.maxResults,
+    contextLines: opts.contextLines,
+    signal: opts.signal,
+  });
+}
+
+interface RgSpawnOptions {
+  /** 只用于诊断日志，不参与 rg 参数。 */
+  pattern: string;
+  maxResults: number;
+  contextLines: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -355,15 +485,21 @@ async function ripgrepSearch(
  * Node.js exec/execFile 默认保持 stdin 打开 → rg 永远挂起。
  * 解决方案：stdio: ['ignore', 'pipe', 'pipe'] + 显式传入 './' 搜索路径。
  * see: https://github.com/BurntSushi/ripgrep/issues/2056
+ *
+ * 结束方式有三类，必须分开（I13）：
+ * - 请求已满足：流式解析收满 maxResults 条命中且当前文件已结束（或此后输出才超限），提前 kill rg，
+ *   结果与自然结束同样完整（不设 incomplete，可缓存），total 只是观察下界；
+ * - partial：命中不足 maxResults 时输出就超过缓冲上限，或 rg 非零退出——只影响这个 pattern；
+ * - timeout/aborted：整次搜索被取消，调用方中断后续 pattern。
  */
 function spawnRg(
   args: string[],
   cwd: string,
   timeout: number,
-  contextLines: number,
-  signal?: AbortSignal
+  opts: RgSpawnOptions
 ): Promise<RipgrepResult> {
   return new Promise((resolve, reject) => {
+    const { signal } = opts;
     if (signal?.aborted) {
       resolve({
         matches: [],
@@ -381,7 +517,8 @@ function spawnRg(
       env: { ...process.env, TERM: 'dumb', NO_COLOR: '1' },
     });
 
-    const chunks: Buffer[] = [];
+    const stream = new RipgrepJsonStream(opts.maxResults, opts.contextLines);
+    const decoder = new StringDecoder('utf-8');
     let totalBytes = 0;
     const MAX_BUFFER = 2 * 1024 * 1024;
     let stderr = '';
@@ -391,15 +528,30 @@ function spawnRg(
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
     };
-    const partial = () => parseRipgrepJson(Buffer.concat(chunks).toString('utf-8'), contextLines);
+    const settle = (result: RipgrepResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
     const terminate = (status: 'partial' | 'timeout' | 'aborted', reason: string) => {
       if (settled) {
         return;
       }
       // 先封闭回执，再停止只读 child；迟到 data/close/error 不能改变结果或启动 fallback。
-      settled = true;
-      cleanup();
-      resolve({ ...partial(), incomplete: { status, reason } });
+      settle({ ...stream.finish(), incomplete: { status, reason } });
+      child.kill('SIGKILL');
+    };
+    const finishSatisfied = (trigger: string) => {
+      if (settled) {
+        return;
+      }
+      Logger.getInstance().debug(
+        `[code.search] ripgrep stopped early for pattern ${JSON.stringify(opts.pattern)}: ${trigger}; ${opts.maxResults} matches collected, total is an observed lower bound.`
+      );
+      settle(stream.finish());
       child.kill('SIGKILL');
     };
     const onAbort = () => {
@@ -412,11 +564,22 @@ function spawnRg(
       if (settled) {
         return;
       }
-      const remaining = MAX_BUFFER - totalBytes;
-      chunks.push(chunk.subarray(0, remaining));
+      const remaining = Math.max(0, MAX_BUFFER - totalBytes);
       totalBytes += chunk.length;
+      if (stream.feed(decoder.write(chunk.subarray(0, remaining)))) {
+        finishSatisfied('maxResults reached and the current file ended');
+        return;
+      }
       if (totalBytes > MAX_BUFFER) {
-        terminate('partial', `ripgrep output exceeded ${MAX_BUFFER} bytes.`);
+        if (stream.collected >= opts.maxResults) {
+          // 命中已够，只是尾部上下文/后续文件把输出撑过上限：按请求已满足收尾，不是 partial。
+          finishSatisfied(`output exceeded ${MAX_BUFFER} bytes after maxResults was reached`);
+        } else {
+          terminate(
+            'partial',
+            `ripgrep output exceeded ${MAX_BUFFER} bytes before ${opts.maxResults} matches were collected.`
+          );
+        }
       }
     });
     // 始终消费 stderr 避免 pipe 反压；诊断存储有界，不因错误噪声放大内存。
@@ -441,7 +604,8 @@ function spawnRg(
       }
       settled = true;
       cleanup();
-      const result = partial();
+      stream.feed(decoder.end());
+      const result = stream.finish();
       if (code === 0) {
         resolve(result);
       } else if (code === 1) {
@@ -468,55 +632,126 @@ function spawnRg(
   });
 }
 
-function parseRipgrepJson(jsonOutput: string, contextLines: number): RipgrepResult {
-  const matches: SearchMatch[] = [];
-  const observedLines = new Map<string, Map<number, string>>();
-  let total = 0;
+interface RgJsonEvent {
+  type?: unknown;
+  data?: {
+    path?: { text?: unknown };
+    line_number?: unknown;
+    lines?: { text?: unknown };
+    stats?: { matched_lines?: unknown };
+  };
+}
 
-  for (const line of jsonOutput.split('\n')) {
-    if (!line.trim()) {
-      continue;
+/**
+ * rg --json 的流式解析器：按行累积事件，命中与上下文行同时登记。
+ * 命中只保留前 maxResults 条，之后的 match 事件仍计入 total 下界并作为邻近行参与上下文；
+ * 收满后遇到当前文件的 end 事件即判定“请求已满足”，调用方据此提前终止 rg（尾部上下文完整）。
+ */
+class RipgrepJsonStream {
+  readonly #maxResults: number;
+  readonly #contextLines: number;
+  readonly #matches: SearchMatch[] = [];
+  readonly #observedLines = new Map<string, Map<number, string>>();
+  #pending = '';
+  #observedMatchLines = 0;
+  #summaryMatchedLines: number | undefined;
+
+  constructor(maxResults: number, contextLines: number) {
+    this.#maxResults = maxResults;
+    this.#contextLines = contextLines;
+  }
+
+  /** 已登记的命中数（不超过 maxResults）。 */
+  get collected(): number {
+    return this.#matches.length;
+  }
+
+  /** 喂入一段文本；返回 true 表示已收满 maxResults 且当前文件已结束（请求已满足）。 */
+  feed(text: string): boolean {
+    if (!text) {
+      return false;
     }
-    try {
-      const obj = JSON.parse(line);
-      if (obj.type === 'match' || obj.type === 'context') {
-        const data = obj.data;
-        const rawPath = (data.path?.text ?? '') as string;
-        const relPath = rawPath.startsWith('./') ? rawPath.slice(2) : rawPath;
-        const match: SearchMatch = {
-          file: relPath,
-          line: data.line_number ?? 0,
-          // rg 的行终止符不属于源码行；其余空白必须保真，不能 trimEnd 改证据原文。
-          content: String(data.lines?.text ?? '').replace(/\r?\n$/, ''),
-        };
-        let fileLines = observedLines.get(relPath);
-        if (!fileLines) {
-          fileLines = new Map();
-          observedLines.set(relPath, fileLines);
-        }
-        fileLines.set(match.line, match.content);
-        if (obj.type === 'match') {
-          matches.push(match);
-          total++;
-        }
-      } else if (obj.type === 'summary') {
-        total = obj.data?.stats?.matches ?? total;
+    const lines = (this.#pending + text).split('\n');
+    this.#pending = lines.pop() ?? '';
+    for (const line of lines) {
+      if (this.#consume(line)) {
+        // 同一块里后面的事件属于下一个文件，不再属于本次请求。
+        this.#pending = '';
+        return true;
       }
-    } catch {
-      // 跳过无法解析的行
     }
+    return false;
   }
 
-  if (contextLines > 0) {
-    for (const match of matches) {
-      const lines = observedLines.get(match.file);
-      match.context = Array.from(lines ?? [])
-        .filter(([line]) => line !== match.line && Math.abs(line - match.line) <= contextLines)
-        .sort(([left], [right]) => left - right)
-        .map(([, content]) => content);
+  /** 消费一行事件；返回 true 表示请求已满足。无法解析（被截断/非 JSON）的行跳过。 */
+  #consume(line: string): boolean {
+    if (!line.trim()) {
+      return false;
     }
+    let event: RgJsonEvent;
+    try {
+      event = JSON.parse(line) as RgJsonEvent;
+    } catch (err: unknown) {
+      void err;
+      return false;
+    }
+    if (!event || typeof event !== 'object') {
+      return false;
+    }
+    if (event.type === 'match' || event.type === 'context') {
+      const data = event.data ?? {};
+      const rawPath = typeof data.path?.text === 'string' ? data.path.text : '';
+      const relPath = rawPath.startsWith('./') ? rawPath.slice(2) : rawPath;
+      const lineNumber = typeof data.line_number === 'number' ? data.line_number : 0;
+      // rg 的行终止符不属于源码行；其余空白必须保真，不能 trimEnd 改证据原文。
+      const content = String(data.lines?.text ?? '').replace(/\r?\n$/, '');
+      let fileLines = this.#observedLines.get(relPath);
+      if (!fileLines) {
+        fileLines = new Map();
+        this.#observedLines.set(relPath, fileLines);
+      }
+      fileLines.set(lineNumber, content);
+      if (event.type === 'match') {
+        this.#observedMatchLines++;
+        if (this.#matches.length < this.#maxResults) {
+          this.#matches.push({ file: relPath, line: lineNumber, content });
+        }
+      }
+      return false;
+    }
+    if (event.type === 'end') {
+      return this.#matches.length >= this.#maxResults;
+    }
+    if (event.type === 'summary') {
+      const matchedLines = event.data?.stats?.matched_lines;
+      if (typeof matchedLines === 'number') {
+        this.#summaryMatchedLines = matchedLines;
+      }
+    }
+    return false;
   }
-  return { matches, total };
+
+  finish(): RipgrepResult {
+    if (this.#pending) {
+      this.#consume(this.#pending);
+      this.#pending = '';
+    }
+    if (this.#contextLines > 0) {
+      for (const match of this.#matches) {
+        const lines = this.#observedLines.get(match.file);
+        match.context = Array.from(lines ?? [])
+          .filter(
+            ([line]) => line !== match.line && Math.abs(line - match.line) <= this.#contextLines
+          )
+          .sort(([left], [right]) => left - right)
+          .map(([, content]) => content);
+      }
+    }
+    // rg 的 stats.matched_lines 与 match 事件同为行粒度（都受 --max-count 逐文件截断），自然结束时
+    // 以它为准；提前收尾/中断时只有已观察的 match 事件。两者都是下界，不用 stats.matches（子匹配计数）。
+    const total = Math.max(this.#observedMatchLines, this.#summaryMatchedLines ?? 0);
+    return { matches: this.#matches, total };
+  }
 }
 
 async function fallbackRegexSearch(
@@ -602,18 +837,6 @@ async function fallbackRegexSearch(
         }
       : {}),
   };
-}
-
-function deduplicateMatches(matches: SearchMatch[]): SearchMatch[] {
-  const seen = new Set<string>();
-  return matches.filter((m) => {
-    const key = `${m.file}:${m.line}`;
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
 }
 
 /* ================================================================== */

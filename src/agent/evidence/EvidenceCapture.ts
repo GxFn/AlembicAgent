@@ -230,6 +230,9 @@ function normalizeDrafts(
   }
 
   if (tool === 'code.search') {
+    // L4-P13：partial 回执（某个 pattern 输出超限 / 引擎部分失败 / structuredContent.incomplete）里的
+    // matches 仍是真实观察到的原文，照常落账；漏搜的 pattern 由 code_search_incomplete 诊断说明，
+    // 台账不据此推断“不存在”。timeout/aborted 是失败状态，入口的 readToolObservation 已整体拒绝。
     const matches = asMatchList(data?.matches);
     if (matches.length > 0) {
       const byFile = new Map<string, MatchItem[]>();

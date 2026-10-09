@@ -117,7 +117,7 @@ const CODE_SPEC: ToolSpec = {
     search: {
       summary: 'Search source code with patterns',
       description:
-        'Search project source code using ripgrep. Supports batch patterns, glob filtering, regex mode.',
+        'Search project source code using ripgrep. Supports batch patterns (hits are merged round-robin so every pattern with hits is shown), glob filtering, regex mode. total is an observed lower bound of matching lines, not a whole-project count; an incomplete flag plus a code_search_incomplete warning name any pattern that was cut short or skipped.',
       params: {
         type: 'object',
         properties: {
