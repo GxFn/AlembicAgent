@@ -43,6 +43,18 @@
       "file": "src/agent/runtime/HookSystem.ts",
       "policy": "Monotonic uniqueness-only counter; all behavioral hook state is instance-scoped and dies with the per-run AgentRuntime.",
       "owner": "AlembicAgent window"
+    },
+    {
+      "name": "LLMGateway registry warning dedup",
+      "file": "src/ai/gateway/LLMGateway.ts",
+      "policy": "Two process-wide Sets keyed by registered model id (warnedDeprecatedModels, warnedToolCallingModels) so each deprecation or tool-capability warning is logged once per process. Bounded by the declarative model registry, hold no resources, and are never cleared; the gateway behaviour itself stays instance-scoped.",
+      "owner": "AlembicAgent window"
+    },
+    {
+      "name": "compiled schema validator cache",
+      "file": "src/ai/shared/schemaValidation.ts",
+      "policy": "LRU Map keyed by dialect plus schema snapshot JSON, capped at COMPILED_SCHEMA_CACHE_LIMIT (64) with oldest-entry eviction. Caches only successfully compiled validators, each owning its own Ajv instance; failed schemas are recompiled and logged per call; no import-time work.",
+      "owner": "AlembicAgent window"
     }
   ],
   "outOfRepoSingletons": [
@@ -68,6 +80,24 @@
       "binding": "_hookCounter",
       "entry": "HookSystem id counter",
       "reason": "Monotonic uniqueness-only id counter (AD4 M3); behavioral hook state is instance-scoped."
+    },
+    {
+      "file": "src/ai/gateway/LLMGateway.ts",
+      "binding": "warnedDeprecatedModels",
+      "entry": "LLMGateway registry warning dedup",
+      "reason": "Once-per-process deprecation warning dedup keyed by registry model id (L2-P17); bounded by the model registry."
+    },
+    {
+      "file": "src/ai/gateway/LLMGateway.ts",
+      "binding": "warnedToolCallingModels",
+      "entry": "LLMGateway registry warning dedup",
+      "reason": "Once-per-process tool-capability warning dedup keyed by registry model id (L2-P17); bounded by the model registry."
+    },
+    {
+      "file": "src/ai/shared/schemaValidation.ts",
+      "binding": "compiledSchemaCache",
+      "entry": "compiled schema validator cache",
+      "reason": "Bounded LRU of compiled Ajv validators (cap 64, L2-P09); eviction drops the oldest entry, nothing else is held."
     }
   ],
   "standingExceptionsOutOfScope": [
