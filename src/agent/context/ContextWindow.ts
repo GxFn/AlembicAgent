@@ -825,9 +825,21 @@ export class ContextWindow {
    * 设置 session-level 预算压力（0-1）。
    * 影响 getToolResultQuota() 返回更保守的配额。
    * 由 AgentRuntime 在每轮迭代前根据 session token 消耗比例更新。
+   *
+   * 压力的唯一写入方是有会话预算的 BudgetController（used/max 在同一 loop 内单调不减），
+   * 所以“从非零降到 0”只会来自无会话预算 loop 的显式清零。该值本身不对外暴露（不加 getter、
+   * 不改返回类型），因此在这里记录清除前的原值，使工具配额与压缩时机的变化可追溯。
    */
   setSessionPressure(ratio: number) {
-    this.#sessionPressure = Math.max(0, Math.min(1, ratio));
+    const previous = this.#sessionPressure;
+    const next = Math.max(0, Math.min(1, ratio));
+    this.#sessionPressure = next;
+    if (previous > 0 && next === 0) {
+      this.#log(
+        'info',
+        `[ContextWindow] session pressure cleared (was ${(previous * 100).toFixed(1)}%); tool result quota and compaction now follow this window's own usage`
+      );
+    }
   }
 
   /**
@@ -956,13 +968,26 @@ export class ContextWindow {
    * systemPrompt 通过 chatWithTools 参数独立传递，不受影响。
    *
    * 保留 compactedSubmits 以支持跨阶段提交去重。
+   *
+   * 同时清零 sessionPressure：压力只由有会话预算的 BudgetController 在预检时写入，
+   * 无预算阶段（如 produce）复用同一窗口时没有任何写入点，上一阶段残留的高压会把
+   * getToolResultQuota 压到最低档并让 compactIfNeeded 误触发 L1。有预算的新阶段会在
+   * 首轮预检重新写入，不会丢失有效压力。清除前的原值写入 RESET_STAGE 日志以便追溯。
    */
   resetForNewStage() {
     this.#invalidateReadView('new_stage');
     this.#extractCompactedSubmits(0);
     this.#messages = [];
     this.#collapseThreshold = -1;
-    this.#compactionLog.push('RESET_STAGE: cleared all messages for new pipeline stage');
+    const previousPressure = this.#sessionPressure;
+    this.#sessionPressure = 0;
+    const pressureNote = `session pressure cleared (was ${(previousPressure * 100).toFixed(1)}%)`;
+    this.#compactionLog.push(
+      `RESET_STAGE: cleared all messages for new pipeline stage; ${pressureNote}`
+    );
+    if (previousPressure > 0) {
+      this.#log('info', `[ContextWindow] stage reset: ${pressureNote}`);
+    }
   }
 
   /**

@@ -130,6 +130,7 @@ export class BudgetController {
   #l4RequestBlockedForCurrentCheck = false;
   #l4FailureCount = 0;
   #l4DisabledLogged = false;
+  #noSessionBudgetLogged = false;
   #lastProjectedSessionUsageRatio = 0;
   #consecutiveZeroCacheHits = 0;
 
@@ -193,6 +194,21 @@ export class BudgetController {
     };
 
     if (!this.hasSessionBudget) {
+      // 无会话预算：预检短路为 noop。但 ContextWindow 由 pipeline 各阶段复用，
+      // sessionPressure 只有本方法在有预算时才会写入，没有其它清零方；若不在这里清零，
+      // 上一阶段（如 analyze）残留的高压会在本 loop 全程生效：工具结果配额被压到最低档，
+      // compactIfNeeded 在 messages>4 时逐轮误触发 L1。清零是幂等的，每轮都做；
+      // 原因日志每个 loop 只记一次（BudgetController 每个 reactLoop 新建一个），
+      // 原压力值由 ContextWindow.setSessionPressure 在非零→0 时记录。
+      if (this.#contextWindow) {
+        this.#contextWindow.setSessionPressure(0);
+        if (!this.#noSessionBudgetLogged) {
+          this.#noSessionBudgetLogged = true;
+          this.#logger.info(
+            '[BudgetController] no session budget for this loop; preflight skipped and session pressure reset to 0 on the shared context window'
+          );
+        }
+      }
       return noopResult;
     }
 
