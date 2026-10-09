@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { checkTerminalCommandAllowlist } from '../src/tools/runtime/handlers/terminalSafety.js';
 
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import { Evolution, ToolRouter } from '../src/tools/runtime/index.js';
@@ -677,6 +678,217 @@ describe('runtime terminal.exec safety', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Evolution read-only allowlist tightening (I30)', () => {
+  const evolutionBins = new Evolution().commandAllowlist.bins;
+
+  it.each([
+    // node：--test 必须出现在第一个脚本/测试路径之前，否则 node 直接执行该脚本，--test 只是脚本 argv。
+    { command: 'node scripts/release.mjs --test', rule: 'allowlist-node-test' },
+    { command: 'node -- --test test/a.test.mjs', rule: 'allowlist-node-test' },
+    { command: 'node test/a.test.mjs', rule: 'allowlist-node-test' },
+    // node：预加载/导入选项会执行模型自写或仓库内的任意模块，无论出现在哪个位置都拒绝
+    // （Node 24 在 --test 模式下连 '--' 之后、测试路径之后的选项都会生效）。
+    {
+      command: 'node --test --import data:text/javascript,process.exit(0)',
+      rule: 'allowlist-node-preload',
+    },
+    {
+      command: 'node --test --import=data:text/javascript,process.exit(0)',
+      rule: 'allowlist-node-preload',
+    },
+    { command: 'node --test --require ./x.cjs', rule: 'allowlist-node-preload' },
+    { command: 'node -r ./x.cjs --test', rule: 'allowlist-node-preload' },
+    { command: 'node --test test/a.test.mjs --require ./x.cjs', rule: 'allowlist-node-preload' },
+    { command: 'node --test -- --import ./x.mjs test/a.test.mjs', rule: 'allowlist-node-preload' },
+    { command: 'node --test --loader ./x.mjs', rule: 'allowlist-node-preload' },
+    { command: 'node --test --experimental-loader=./x.mjs', rule: 'allowlist-node-preload' },
+    { command: 'node --test --env-file=.env', rule: 'allowlist-node-preload' },
+    // node：eval/print 仍单独归类，便于诊断。
+    { command: 'node --test --eval=process.exit()', rule: 'allowlist-node-eval' },
+    { command: 'node -p 1 --test', rule: 'allowlist-node-eval' },
+    // node：白名单之外的选项一律拒绝（含写文件的 reporter destination、覆盖率、stdin 脚本）。
+    { command: 'node --test --test-reporter-destination=out.txt', rule: 'allowlist-node-option' },
+    { command: 'node --test --experimental-test-coverage', rule: 'allowlist-node-option' },
+    { command: 'node --test --test-update-snapshots', rule: 'allowlist-node-option' },
+    { command: 'node --test --watch', rule: 'allowlist-node-option' },
+    { command: 'node --test -', rule: 'allowlist-node-option' },
+    { command: 'node --test --test=foo', rule: 'allowlist-node-option' },
+    // node：需要值的只读选项，值本身也要是只读形态（自定义 reporter 路径会执行模块代码）。
+    {
+      command: 'node --test --test-reporter ./rep.cjs test/a.test.mjs',
+      rule: 'allowlist-node-option-value',
+    },
+    { command: 'node --test --test-reporter=./rep.cjs', rule: 'allowlist-node-option-value' },
+    { command: 'node --test --test-name-pattern', rule: 'allowlist-node-option-value' },
+    { command: 'node --test --test-name-pattern --test-only', rule: 'allowlist-node-option-value' },
+    { command: 'node --test --test-concurrency=lots', rule: 'allowlist-node-option-value' },
+    { command: 'node --test --test-timeout -5', rule: 'allowlist-node-option-value' },
+    // 写类参数黑名单补齐：find / eslint / jest / vitest / tsc / biome。
+    { command: 'find . -fls out', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint -o src/index.ts src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --output-file=out.txt src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --output-file out.txt src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --cache --cache-location src/x.ts src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --cache-file=.cache src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --init', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --outputFile=package.json', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --json --outputFile out.json', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --coverage', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --coverageDirectory=src', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --clearCache', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --outputFile=out.json', rule: 'allowlist-write-like-arg' },
+    // vitest 4（cac）与 jest（yargs）都支持点号写法：--outputFile.json=x 等价于把 json reporter 的结果写进 x，
+    // 实测 'npx vitest run --reporter=json --outputFile.json=package.json' 会用 JSON 报告覆盖 package.json。
+    {
+      command: 'vitest run --reporter=json --outputFile.json=package.json',
+      rule: 'allowlist-write-like-arg',
+    },
+    {
+      command: 'vitest run --reporter=json --outputFile.json package.json',
+      rule: 'allowlist-write-like-arg',
+    },
+    { command: 'npm test -- --outputFile.json=package.json', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --json --outputFile.json=package.json', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --coverage.enabled', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --init --noEmit', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --generateTrace trace', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --generateCpuProfile=prof', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc -b --noEmit', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --build --noEmit', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --incremental', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --tsBuildInfoFile=.x', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --apply src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --apply-unsafe src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --fix=true src', rule: 'allowlist-write-like-arg' },
+    // 路径限定的可执行文件：同名脚本会绕过 git/node 等子命令约束，只允许裸命令名经 PATH 解析。
+    { command: './scripts/git log', rule: 'allowlist-path-qualified-bin' },
+    { command: '/usr/bin/git log', rule: 'allowlist-path-qualified-bin' },
+    { command: 'node_modules/.bin/eslint src', rule: 'allowlist-path-qualified-bin' },
+    { command: '/tmp/x/cat a', rule: 'allowlist-path-qualified-bin' },
+    // 未加引号的反斜杠在 sh 中是转义符，字面反斜杠分隔符要写成 '\\\\'。
+    { command: 'scripts\\\\git log', rule: 'allowlist-path-qualified-bin' },
+  ])('blocks $command with $rule', ({ command, rule }) => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule).toBe(rule);
+      expect(result.block.reason).not.toBe('');
+    }
+  });
+
+  it.each([
+    // node --test 的只读选项白名单：'=' 与空格两种写法、下划线拼写、位于测试路径前后都放行。
+    'node --test',
+    'node --test test/a.test.mjs',
+    'node --test --test-name-pattern foo',
+    'node --test --test-name-pattern=foo test/a.test.mjs',
+    'node --test-name-pattern foo --test test/a.test.mjs',
+    'node --test --test-skip-pattern slow --test-only --test-concurrency 2 --test-timeout=5000 --test-reporter spec test/a.test.mjs',
+    'node --test --test-reporter=tap --test-reporter dot test/a.test.mjs test/b.test.mjs',
+    'node --test -- test/a.test.mjs',
+    'node --test test/a.test.mjs --test-name-pattern foo',
+    'node --test_only --test',
+    // 仅对 eslint/tsc 生效的 -o / -b 不能误伤 rg/grep/jest 的同名只读参数。
+    'rg -o Recipe src',
+    'grep -o Recipe src/index.ts',
+    'jest -o',
+    'jest -b --ci --json',
+    // evolutionPreset 提示中列出的取证命令及其常见写法。
+    'git log -n3',
+    'git blame -L 1,20 src/index.ts',
+    'git diff --stat HEAD~1',
+    'git status --porcelain',
+    'rg Recipe src',
+    'grep -rn Recipe src',
+    'npm test -- test/example.test.ts',
+    'npm test -- --reporter=dot',
+    'vitest run test/a.test.ts --reporter=dot',
+    // 点号写法只按选项名首段判定：vitest 的 --sequence.* / --typecheck.* 是只读选项，json reporter 不带
+    // --outputFile 时只输出到 stdout。
+    'vitest run --reporter=json test/a.test.ts',
+    'vitest run --sequence.shuffle --sequence.seed=1 test/a.test.ts',
+    'vitest run --typecheck.only test/a.test.ts',
+    'npm test -- --sequence.shuffle',
+    'tsc --noEmit',
+    'tsc --noEmit -p tsconfig.json --pretty false',
+    'eslint src --ext .ts --format json',
+    'eslint . --max-warnings 0',
+    'biome check src',
+    'biome ci src',
+    'find . -name *.ts -not -path ./node_modules/*',
+    'find src -type f -newer package.json',
+    'cat package.json',
+    'ls -la src',
+    'head -n 20 src/index.ts',
+    'wc -l src/index.ts',
+  ])('still allows read-only evidence command %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it('blocks the bypass commands before the sandbox executor through the Evolution router', async () => {
+    const commands = [
+      'node scripts/release.mjs --test',
+      'node --test --import=data:text/javascript,process.exit(0)',
+      'node --test --require ./x.cjs',
+      'node -r ./x.cjs --test',
+      'node --test --test-reporter ./rep.cjs',
+      'find . -fls out',
+      'eslint -o src/index.ts src',
+      'jest --outputFile=package.json',
+      'vitest run --reporter=json --outputFile.json=package.json',
+      'npm test -- --outputFile.json=package.json',
+      'tsc --init --noEmit',
+      './scripts/git log',
+    ];
+    for (const command of commands) {
+      let executorCalls = 0;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        new ToolRouter({ capability: new Evolution().toDef() })
+      );
+      expect(result.ok, command).toBe(false);
+      expect(result.error, command).toContain('Command blocked by allowlist');
+      expect(executorCalls, command).toBe(0);
+    }
+  });
+
+  it('passes the allowed node --test forms through the Evolution router unchanged', async () => {
+    const commands = [
+      'node --test test/a.test.mjs',
+      'node --test --test-name-pattern foo',
+      'node --test --test-only --test-reporter=spec test/a.test.mjs',
+      'rg -o Recipe src',
+    ];
+    const calls: string[] = [];
+    for (const command of commands) {
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async (seenCommand: string) => {
+              calls.push(seenCommand);
+              return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        new ToolRouter({ capability: new Evolution().toDef() })
+      );
+      expect(result.ok, command).toBe(true);
+    }
+    expect(calls).toEqual(commands);
   });
 });
 
