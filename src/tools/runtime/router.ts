@@ -22,6 +22,8 @@ import type {
 import { estimateTokens, fail } from '#tools/kernel/registry.js';
 import type { ToolActionAllowlist } from '#tools/kernel/toolSchema.js';
 import {
+  describeToolParameterDenial,
+  findDeniedToolParameter,
   intersectToolActions,
   isToolActionAllowed,
   snapshotToolActionAllowlist,
@@ -94,6 +96,30 @@ export class ToolRouter {
           ? `Permission denied: Action "${call.tool}.${call.action}" not allowed in capability "${capability.name}"`
           : 'Permission denied: invalid capability action allowlist',
       };
+    }
+    // action 通过后再按能力名查内部参数 allowlist（L4-P29）：例如 evolution_analysis 的
+    // knowledge.manage 只开放 evolve/deprecate/skip_evolution。拒绝仍是 approve 阶段的 blocked，
+    // 原因带 capability/operation/id，经 toolAdmissionFailure 落到 tool_preflight_rejected 诊断。
+    // 宿主构造 Adapter 时通常不传 capability，这条检查只覆盖带能力的路由；生产路径由
+    // agent 层 runtimeSafetyGate 按 loopCtx.capabilities 执行同一张表。
+    if (capability) {
+      const denial = findDeniedToolParameter(
+        capability.name,
+        call.tool,
+        call.action,
+        call.params,
+        spec.actions[call.action].params.properties as
+          | Record<string, { default?: unknown }>
+          | undefined
+      );
+      if (denial) {
+        return {
+          allowed: false,
+          stage: 'approve',
+          resultStatus: 'blocked',
+          reason: describeToolParameterDenial(denial, call.params),
+        };
+      }
     }
     const stageActions = ctx.runtime?.allowedTools;
     const stageSnapshot =

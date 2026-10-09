@@ -227,7 +227,11 @@ export type ActionHandler = (
 /*  Capability                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Capability 定义 — tool → 允许的 action 列表 */
+/**
+ * Capability 定义 — tool → 允许的 action 列表。
+ * 参数级（例如 knowledge.manage.operation）allowlist 暂未进入本公开类型；在公开字段获批前由
+ * tools/kernel/toolSelection.ts 的 CAPABILITY_PARAMETER_ALLOWLISTS 按能力名登记（L4-P29）。
+ */
 export interface CapabilityDef {
   name: string;
   description: string;

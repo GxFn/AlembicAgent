@@ -116,6 +116,92 @@ export function isToolActionAllowed(
   );
 }
 
+/** 能力级参数 allowlist：tool → action → parameter → 允许值；形状与宿主 availability.parameters 一致。 */
+export type ToolParameterAllowlist = Readonly<
+  Record<string, Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>>
+>;
+
+/**
+ * 内部常量（L4-P29 过渡方案）：按 capability 名登记的参数级 allowlist。
+ *
+ * 公开的 CapabilityDef.parameterAllowlist 字段尚未获批，先用这张表让 ToolRouter.explain 与
+ * agent 层 runtimeSafetyGate 执行同一约束。进程内 Evolution 智能体（evolution_analysis）的
+ * knowledge.manage 只开放 evolve/deprecate/skip_evolution：approve/publish 会直接把候选激活、
+ * update/reject 会改写或驳回 active 知识、review/review-queue 属于 staging 复核归属，
+ * 这些操作都绕过提案观察窗口与人工复核，不对进程内 Evolution 开放。
+ * 未登记的 capability 不受此表约束（宿主 MCP/Dashboard 的 manage 路径保持现状）。
+ * 字段获批后应迁移为 Evolution 自己声明 parameterAllowlist，并让 schema 投影与之求交。
+ */
+export const CAPABILITY_PARAMETER_ALLOWLISTS: Readonly<Record<string, ToolParameterAllowlist>> =
+  Object.freeze({
+    evolution_analysis: Object.freeze({
+      knowledge: Object.freeze({
+        manage: Object.freeze({
+          operation: Object.freeze(['evolve', 'deprecate', 'skip_evolution']),
+        }),
+      }),
+    }),
+  });
+
+/** 一次被拒的参数事实；value 已转成字符串，和 allowlist 的比较口径一致。 */
+export interface ToolParameterDenial {
+  capability: string;
+  tool: string;
+  action: string;
+  parameter: string;
+  value: string;
+  allowed: readonly string[];
+}
+
+/**
+ * 按 capability 名查内部 allowlist，返回第一个越权参数；没有登记、没有约束或全部允许时返回 null。
+ * 参数缺省时按 schema 真实默认值判断（与宿主 availability 的缺省分支同口径）；缺省且无默认值不在
+ * 这里裁决，交给 schema required 校验和 handler 自己拒绝，避免把“参数缺失”误报成越权。
+ * 允许值为空数组表示该 action 在此能力下整体关闭。
+ */
+export function findDeniedToolParameter(
+  capabilityName: string,
+  tool: string,
+  action: string,
+  params: Readonly<Record<string, unknown>>,
+  properties?: Readonly<Record<string, { default?: unknown } | undefined>>
+): ToolParameterDenial | null {
+  const allowlist = Object.hasOwn(CAPABILITY_PARAMETER_ALLOWLISTS, capabilityName)
+    ? CAPABILITY_PARAMETER_ALLOWLISTS[capabilityName]
+    : undefined;
+  const constraints =
+    allowlist && Object.hasOwn(allowlist, tool) && Object.hasOwn(allowlist[tool], action)
+      ? allowlist[tool][action]
+      : undefined;
+  if (!constraints) {
+    return null;
+  }
+  for (const [parameter, allowed] of Object.entries(constraints)) {
+    const value =
+      params[parameter] === undefined ? properties?.[parameter]?.default : params[parameter];
+    if (allowed.length === 0 || (value !== undefined && !allowed.includes(String(value)))) {
+      return {
+        capability: capabilityName,
+        tool,
+        action,
+        parameter,
+        value: String(value),
+        allowed,
+      };
+    }
+  }
+  return null;
+}
+
+/** router 与 agent 层共用的拒绝文案：带 capability、tool.action、参数值、allowlist，有 id 时一并给出。 */
+export function describeToolParameterDenial(
+  denial: ToolParameterDenial,
+  params: Readonly<Record<string, unknown>>
+): string {
+  const id = typeof params.id === 'string' && params.id.length > 0 ? ` (id=${params.id})` : '';
+  return `Permission denied: ${denial.tool}.${denial.action} ${denial.parameter}="${denial.value}" not allowed in capability "${denial.capability}"${id}. Allowed: ${denial.allowed.join(', ')}`;
+}
+
 /** 两份完整授权集求交；稀疏宿主约束应先补齐未约束工具，不能把缺键误作允许。 */
 export function intersectToolActions(
   left: ToolActionAllowlist,

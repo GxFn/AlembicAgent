@@ -2,7 +2,11 @@
 import path from 'node:path';
 import { stableStringify } from '#shared/serialization.js';
 import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
-import { isToolActionAllowed } from '#tools/kernel/toolSelection.js';
+import {
+  describeToolParameterDenial,
+  findDeniedToolParameter,
+  isToolActionAllowed,
+} from '#tools/kernel/toolSelection.js';
 import { checkTerminalCommandAllowlist } from '#tools/runtime/handlers/terminalSafety.js';
 import {
   getToolAction,
@@ -23,6 +27,8 @@ const MAX_TOOL_ARG_BYTES = 256_000;
 const TOOL_ARGS_INVALID_CODE = 'TOOL_ARGS_INVALID';
 
 const TOOL_ARGS_TOO_LARGE_CODE = 'TOOL_ARGS_TOO_LARGE';
+
+const TOOL_PARAMETER_DENIED_CODE = 'TOOL_PARAMETER_DENIED';
 
 function measureToolArgBytes(call: ToolCall): { ok: true; bytes: number } | { ok: false } {
   try {
@@ -168,6 +174,42 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
           }
         }
       }
+    }
+    // 能力级参数 allowlist（L4-P29）：生产宿主构造 ToolRouterAdapter 时不传 capability，
+    // router.explain 的同一检查覆盖不到生产路径，所以这里按 loopCtx.capabilities 的能力名再执行
+    // 一次内部常量表（evolution_analysis 的 knowledge.manage 只开放 evolve/deprecate/skip_evolution）。
+    // 拒绝发生在宿主调度之前：端口零调用，并留下含 capability/operation/id 的日志与诊断。
+    const action = getToolAction(executable);
+    for (const capability of ctx.loopCtx.capabilities ?? []) {
+      const capabilityName = (capability as { name?: unknown }).name;
+      if (typeof capabilityName !== 'string') {
+        continue;
+      }
+      const denial = findDeniedToolParameter(capabilityName, executable.name, action, params);
+      if (!denial) {
+        continue;
+      }
+      const reason = describeToolParameterDenial(denial, params);
+      ctx.runtime.logger.warn(`[ToolPipeline] ⛔ ${reason} — blocked before host dispatch`);
+      ctx.loopCtx.diagnostics?.warn({
+        code: TOOL_PARAMETER_DENIED_CODE,
+        message: reason,
+        tool: executable.name,
+      });
+      return {
+        blocked: true,
+        result: {
+          error: reason,
+          code: TOOL_PARAMETER_DENIED_CODE,
+          status: 'blocked',
+          capability: denial.capability,
+          tool: denial.tool,
+          action: denial.action,
+          parameter: denial.parameter,
+          value: denial.value,
+          allowed: [...denial.allowed],
+        },
+      };
     }
     return undefined;
   },

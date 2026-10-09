@@ -29,6 +29,12 @@ const EVOLUTION_READONLY_TERMINAL_ALLOWLIST: TerminalCommandAllowlist = {
   intent: { network: 'none', filesystem: 'read-only' },
 };
 
+/**
+ * knowledge.manage 的 operation 级权限（L4-P29）：本能力只开放 evolve/deprecate/skip_evolution。
+ * 约束由 tools/kernel/toolSelection.ts 的 CAPABILITY_PARAMETER_ALLOWLISTS 按能力名
+ * 'evolution_analysis' 登记，ToolRouter.explain 与 agent 层 runtimeSafetyGate 两处执行；
+ * 公开的 parameterAllowlist 字段获批后再迁到这里声明。改能力名时必须同步那张表。
+ */
 export class Evolution extends RuntimeCapability {
   get name() {
     return 'evolution_analysis';
@@ -64,6 +70,7 @@ export class Evolution extends RuntimeCapability {
 - 优先 skip_evolution，只有证据明确时才 evolve 或 deprecate
 - 允许使用 terminal.exec 的只读 allowlist 命令取证，例如 git log/blame/diff/status、grep/rg、npm test、vitest run、tsc --noEmit、eslint/biome check
 - 使用终端证据时先验证 Recipe 是否仍符合代码与近期历史，再决定 evolve / deprecate / skip_evolution
+- knowledge.manage 对本能力只开放 evolve / deprecate / skip_evolution；approve/publish/update/reject/review 等其它 operation 会被拒绝，不要调用
 - 不提交新知识
 
 ${super.promptFragment}`;
