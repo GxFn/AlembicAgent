@@ -343,10 +343,102 @@ function extractFirstJsonObject(text: string): Record<string, unknown> | null {
 }
 
 /**
+ * 修复子调用给模型展示的 markdown 窗口（按 UTF-16 code unit 计）。超出部分不进提示——
+ * 这是 prompt 预算，不是允许截断正文的许可：未展示尾部必须由程序原样拼回（I32）。
+ */
+const STYLE_REPAIR_MARKDOWN_WINDOW = 1800;
+
+/** 修复子调用返回 JSON 里程序认识的键；contrastBlock 只是返回契约，不会成为候选字段。 */
+type StyleRepairField = 'title' | 'doClause' | 'dontClause' | 'markdown' | 'contrastBlock';
+const STYLE_REPAIR_FIELDS: ReadonlySet<string> = new Set<StyleRepairField>([
+  'title',
+  'doClause',
+  'dontClause',
+  'markdown',
+  'contrastBlock',
+]);
+
+/**
+ * 违规码 → 修复子调用可采纳的返回字段（I32）。模型只被允许改「被拒字段」：
+ * - DO_CLAUSE_* / DONT_CLAUSE_*（祈使/英文措辞）→ doClause / dontClause；
+ * - STAGE3_TITLE_TOO_GENERIC → title；
+ * - CONTENT_CONTRAST_MISSING → contrastBlock（只返回要追加的对比块，程序拼到完整原文末尾）；
+ *   兼容模型仍回传整段 markdown 的旧形态，但必须过 mergeRepairedMarkdown 的保真校验；
+ * - STAGE3_MARKDOWN_TOO_SHORT → markdown（正文 <200 字必然整段可见，整体替换安全）；
+ * - GRAPH_REF_INVALID → markdown / doClause / dontClause（调用链断言可能落在正文或条款）。
+ * 映射之外的返回键一律丢弃并留痕——此前只报 DO_CLAUSE 时模型顺带回显的（截断）markdown
+ * 也会整体覆盖原文。
+ */
+function repairableFieldsFor(violations: Array<{ code: string }>): Set<StyleRepairField> {
+  const fields = new Set<StyleRepairField>();
+  for (const violation of violations) {
+    const code = violation.code;
+    if (code.startsWith('DO_CLAUSE_') || code.startsWith('DONT_CLAUSE_')) {
+      fields.add('doClause');
+      fields.add('dontClause');
+    } else if (code === 'STAGE3_TITLE_TOO_GENERIC') {
+      fields.add('title');
+    } else if (code === 'CONTENT_CONTRAST_MISSING') {
+      fields.add('contrastBlock');
+      fields.add('markdown');
+    } else if (code === 'STAGE3_MARKDOWN_TOO_SHORT') {
+      fields.add('markdown');
+    } else if (code === 'GRAPH_REF_INVALID') {
+      fields.add('markdown');
+      fields.add('doClause');
+      fields.add('dontClause');
+    }
+  }
+  return fields;
+}
+
+/** 在完整正文末尾追加一段块（保证块从新行开始，原文一字不改）。 */
+function appendMarkdownBlock(base: string, block: string): string {
+  const separator = base.endsWith('\n') || block.startsWith('\n') ? '' : '\n';
+  return `${base}${separator}${block}`;
+}
+
+type MarkdownMerge =
+  | { markdown: string; mode: 'full-view' | 'complete' | 'appended' }
+  | { markdown: null; reason: string };
+
+/**
+ * 把模型返回的 markdown 合并回完整原文（I32 保真规则）。模型只看到前 WINDOW 字符：
+ * - 原文未超窗：模型看过全文，整体替换照常采纳（门禁重验兜底）；
+ * - 原文超窗且返回值以展示前缀原样开头（忽略前缀末尾空白——模型常 trim 后再追加）：
+ *   · 前缀之后紧接原文剩余部分 → 返回值已含全文，原样采纳；
+ *   · 否则把前缀之后的部分视为「追加块」，拼到完整原文末尾（未展示尾部一字不丢）；
+ * - 原文超窗且返回值不以展示前缀开头：无法判断哪些原文被改写或丢弃，整个字段丢弃
+ *   （调用方回落到既有拒绝/advisory 路径——比把截断正文入库安全）。
+ */
+function mergeRepairedMarkdown(original: string, returned: string): MarkdownMerge {
+  if (original.length <= STYLE_REPAIR_MARKDOWN_WINDOW) {
+    return { markdown: returned, mode: 'full-view' };
+  }
+  const shownPrefix = original.slice(0, STYLE_REPAIR_MARKDOWN_WINDOW).trimEnd();
+  if (shownPrefix.length === 0 || !returned.startsWith(shownPrefix)) {
+    return {
+      markdown: null,
+      reason: `original exceeds the ${STYLE_REPAIR_MARKDOWN_WINDOW}-char window (${original.length} chars) and the reply (${returned.length} chars) does not start with the shown prefix`,
+    };
+  }
+  const rest = returned.slice(shownPrefix.length);
+  const hiddenRemainder = original.slice(shownPrefix.length);
+  if (rest.startsWith(hiddenRemainder)) {
+    return { markdown: returned, mode: 'complete' };
+  }
+  return { markdown: appendMarkdownBlock(original, rest), mode: 'appended' };
+}
+
+/**
  * E7-R 修复子调用（接受率 100% 的最后一级）：纯风格类拒绝时发起一次 schema 收窄的 LLM
  * 修复——只返回需要修改的字段 JSON，其余字段程序保留原值，修复后由调用方重跑权威门禁。
  * E6 三跑证明拒绝反馈+模板都无法稳定驱动 DeepSeek 自修（DO_CLAUSE 连续三跑最高频）；
  * 把「重写整个候选」压缩为「填 2 个字段」后服从面大幅收窄。任何失败返回 null（绝不阻断原拒绝路径）。
+ *
+ * I32 字段契约：返回键按违规码限定（repairableFieldsFor），越界键丢弃并 warn；
+ * markdown 经 mergeRepairedMarkdown 保真合并，contrastBlock 由程序追加到完整原文末尾——
+ * 修复子调用不得让入库正文比不修更短。
  */
 export async function repairStyleViolations(
   item: Record<string, unknown>,
@@ -367,6 +459,10 @@ export async function repairStyleViolations(
   const chat = providerLike.chat.bind(providerLike);
   const content = (item.content ?? {}) as Record<string, unknown>;
   const markdown = typeof content.markdown === 'string' ? content.markdown : '';
+  const titleForLog = String(item.title ?? '');
+  const codes = violations.map((v) => v.code);
+  const allowed = repairableFieldsFor(violations);
+  const markdownTruncated = markdown.length > STYLE_REPAIR_MARKDOWN_WINDOW;
   const prompt = [
     '你是候选修复器。以下知识候选被写作风格门禁拒绝，修复它——只改被拒字段，保留全部事实与引用。',
     `违规: ${violations.map((v) => `${v.code}${v.message ? `(${v.message.slice(0, 80)})` : ''}`).join('; ')}`,
@@ -375,15 +471,21 @@ export async function repairStyleViolations(
         title: item.title,
         doClause: item.doClause,
         dontClause: item.dontClause,
-        markdown: markdown.slice(0, 1800),
+        markdown: markdown.slice(0, STYLE_REPAIR_MARKDOWN_WINDOW),
+        ...(markdownTruncated ? { markdownTruncated: true } : {}),
       },
       null,
       0
     )}`,
     `修复要求: doClause 必须以下列动词之一开头(${allowlist.positive.slice(0, 12).join('/')}；否定式 ${allowlist.negative.slice(0, 6).join('/')})；`,
-    'CONTENT_CONTRAST_MISSING→在 markdown 追加"✅ 正确：<真实做法> (来源: 沿用原文引用)\\n❌ 错误：<反例>\\n违反后果：<一句>"；',
+    'CONTENT_CONTRAST_MISSING→只返回 contrastBlock 键（不要回传 markdown）：内容为"✅ 正确：<真实做法> (来源: 沿用原文引用)\\n❌ 错误：<反例>\\n违反后果：<一句>"，程序会把它追加到完整正文末尾；',
     'GRAPH_REF_INVALID→把调用链断言(callers/invokes/调用链)改写为静态描述(导入/依赖/组合)或删除该句；',
-    '只返回一个 JSON 对象，仅含需要修改的字段(可选键: title, doClause, dontClause, markdown)，不要任何其它文字。',
+    ...(markdownTruncated
+      ? [
+          `注意: markdown 只展示了前 ${STYLE_REPAIR_MARKDOWN_WINDOW} 字符(markdownTruncated=true)，未展示部分会由程序原样保留；如返回 markdown，必须以展示内容原样开头、只在其后追加，否则该键会被丢弃；`,
+        ]
+      : []),
+    `只返回一个 JSON 对象，仅含需要修改的字段(本次可用键: ${[...allowed].join(', ')})，不要任何其它文字。`,
   ].join('\n');
   try {
     // 修复是可选子调用，期限属于此调用层；取消等待后不再消费不合作 provider 的迟到响应。
@@ -409,11 +511,63 @@ export async function repairStyleViolations(
       typeof fixed[key] === 'string' && (fixed[key] as string).trim()
         ? (fixed[key] as string)
         : null;
-    const nextTitle = pick('title');
-    const nextDo = pick('doClause');
-    const nextDont = pick('dontClause');
-    const nextMarkdown = pick('markdown');
-    if (!nextTitle && !nextDo && !nextDont && !nextMarkdown) {
+    // 越界键（映射外或未知）：丢弃并集中留痕——这是「只改被拒字段」契约的程序侧执行。
+    const dropped: string[] = [];
+    const takeField = (key: StyleRepairField): string | null => {
+      const value = pick(key);
+      if (value === null) {
+        return null;
+      }
+      if (!allowed.has(key)) {
+        dropped.push(key);
+        return null;
+      }
+      return value;
+    };
+    for (const key of Object.keys(fixed)) {
+      if (!STYLE_REPAIR_FIELDS.has(key)) {
+        dropped.push(key);
+      }
+    }
+    const nextTitle = takeField('title');
+    const nextDo = takeField('doClause');
+    const nextDont = takeField('dontClause');
+    let nextMarkdown: string | null = null;
+    const returnedMarkdown = takeField('markdown');
+    if (returnedMarkdown !== null) {
+      const merged = mergeRepairedMarkdown(markdown, returnedMarkdown);
+      if (merged.markdown === null) {
+        // 降级必须可观测：保真校验不过的正文丢弃，原文原样保留给后续拒绝/advisory 路径
+        Logger.getInstance().warn(
+          `[style-repair] dropped field markdown for "${titleForLog}": ${merged.reason}`
+        );
+      } else {
+        nextMarkdown = merged.markdown;
+        Logger.getInstance().info(
+          `[style-repair] markdown merged (${merged.mode}) for "${titleForLog}": ${markdown.length}→${merged.markdown.length} chars`
+        );
+      }
+    }
+    const contrastBlock = takeField('contrastBlock');
+    if (contrastBlock !== null) {
+      if (!contrastBlock.includes('✅') || !contrastBlock.includes('❌')) {
+        // 对比块必须同时带 ✅/❌ 标记，否则追加也修不掉 CONTENT_CONTRAST_MISSING——不污染正文
+        Logger.getInstance().warn(
+          `[style-repair] dropped field contrastBlock for "${titleForLog}": missing ✅/❌ markers`
+        );
+      } else {
+        nextMarkdown = appendMarkdownBlock(nextMarkdown ?? markdown, contrastBlock.trim());
+      }
+    }
+    if (dropped.length > 0) {
+      Logger.getInstance().warn(
+        `[style-repair] dropped field ${dropped.join(', ')} for "${titleForLog}": not repairable under [${codes.join(', ')}] (allowed: ${[...allowed].join(', ') || 'none'})`
+      );
+    }
+    if (!nextTitle && !nextDo && !nextDont && nextMarkdown === null) {
+      Logger.getInstance().warn(
+        `[style-repair] no adoptable field in reply for "${titleForLog}" (violations: ${codes.join(', ')})`
+      );
       return null;
     }
     return {
@@ -421,7 +575,7 @@ export async function repairStyleViolations(
       ...(nextTitle ? { title: nextTitle } : {}),
       ...(nextDo ? { doClause: nextDo } : {}),
       ...(nextDont ? { dontClause: nextDont } : {}),
-      ...(nextMarkdown ? { content: { ...content, markdown: nextMarkdown } } : {}),
+      ...(nextMarkdown !== null ? { content: { ...content, markdown: nextMarkdown } } : {}),
     };
   } catch (err: unknown) {
     // 降级必须可观测：修复子调用失败原样走拒绝路径，但失败原因必须留痕

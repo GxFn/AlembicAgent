@@ -955,6 +955,184 @@ describe('Agent Recipe production profile adapter', () => {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   });
+  /** I32：超过修复子调用 1800 字符展示窗口、且没有 ✅/❌ 对比块的正文，尾部带不可丢失的标记。 */
+  const LONG_MARKDOWN_TAIL = 'TAIL-SENTINEL (Source: src/a.ts:2-3)';
+  function longMarkdownWithoutContrast(): string {
+    return [
+      '## ImportType runtime boundary',
+      '',
+      'Type-only dependencies use import type so compilation does not emit a runtime import edge. '.repeat(
+        30
+      ),
+      '',
+      '```ts',
+      "import type { User } from './user.js';",
+      'export const count = 1;',
+      '```',
+      '',
+      LONG_MARKDOWN_TAIL,
+    ].join('\n');
+  }
+  /** 模型在修复提示里实际看到的 markdown（展示窗口）。 */
+  function shownRepairMarkdown(prompt: string): string {
+    const line = prompt.split('\n').find((candidate) => candidate.startsWith('候选字段: '));
+    if (!line) {
+      throw new Error('repair prompt has no 候选字段 line');
+    }
+    return (JSON.parse(line.slice('候选字段: '.length)) as { markdown: string }).markdown;
+  }
+  /** 只有软违规 {DO_CLAUSE_NON_IMPERATIVE, CONTENT_CONTRAST_MISSING} 的长正文候选。 */
+  function softOnlyLongParams() {
+    return submitParams({
+      doClause: 'ImportType is needed for type-only dependencies.',
+      content: {
+        markdown: longMarkdownWithoutContrast(),
+        rationale:
+          'The source keeps a type-only dependency out of emitted JavaScript and the runtime graph.',
+      },
+    });
+  }
+  function storedItem(fake: ReturnType<typeof fakePort>): Record<string, unknown> {
+    return fake.calls[0].input.items[0] as unknown as Record<string, unknown>;
+  }
+
+  test('keeps the complete markdown when the style repair echoes only the shown window plus a contrast block', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const original = longMarkdownWithoutContrast();
+    expect(original.length).toBeGreaterThan(1800);
+    const chat = vi.fn(async (prompt: string) =>
+      JSON.stringify({
+        doClause: 'Use import type for every type-only dependency.',
+        markdown: `${shownRepairMarkdown(prompt)}\n✅ Correct: use import type for a type-only dependency.\n❌ Wrong: use a value import when no runtime value is consumed.`,
+      })
+    );
+    try {
+      const result = await handleKnowledge('submit', softOnlyLongParams(), {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState: {}, aiProvider: { chat } },
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(chat).toHaveBeenCalledTimes(1);
+      expect(fake.calls).toHaveLength(1);
+      const stored = storedItem(fake);
+      const markdown = (stored.content as { markdown: string }).markdown;
+      // 截断前后对照：原文必须完整地作为前缀保留，尾部标记不丢，对比块追加在末尾
+      expect(markdown.startsWith(original)).toBe(true);
+      expect(markdown).toContain(LONG_MARKDOWN_TAIL);
+      expect(markdown).toContain('✅ Correct');
+      expect(markdown.length).toBeGreaterThanOrEqual(original.length);
+      expect(stored.doClause).toBe('Use import type for every type-only dependency.');
+      expect((stored.reasoning as { styleAdvisories?: string[] }).styleAdvisories).toBeUndefined();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('appends a returned contrastBlock to the complete markdown instead of replacing it', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const original = longMarkdownWithoutContrast();
+    const chat = vi.fn(async () =>
+      JSON.stringify({
+        doClause: 'Use import type for every type-only dependency.',
+        contrastBlock:
+          '✅ Correct: use import type for a type-only dependency. (Source: src/a.ts:2-3)\n❌ Wrong: use a value import when no runtime value is consumed.\nConsequence: the compiled output gains a runtime import edge.',
+      })
+    );
+    try {
+      const result = await handleKnowledge('submit', softOnlyLongParams(), {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState: {}, aiProvider: { chat } },
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(fake.calls).toHaveLength(1);
+      const stored = storedItem(fake);
+      const markdown = (stored.content as { markdown: string }).markdown;
+      expect(markdown.startsWith(original)).toBe(true);
+      expect(markdown).toContain('❌ Wrong');
+      expect(stored).not.toHaveProperty('contrastBlock');
+      expect((stored.reasoning as { styleAdvisories?: string[] }).styleAdvisories).toBeUndefined();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('drops a markdown echoed by the repair when only DO_CLAUSE_NON_IMPERATIVE was reported', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const params = submitParams({ doClause: 'ImportType is needed for type-only dependencies.' });
+    const original = (params.content as { markdown: string }).markdown;
+    // 只报 doClause 违规，模型却顺带回传了一段改写正文——按违规码限定字段，正文不得被覆盖
+    const chat = vi.fn(async () =>
+      JSON.stringify({
+        doClause: 'Use import type for every type-only dependency.',
+        markdown:
+          '## Rewritten body\n\nThis replacement must never reach the store. (Source: src/a.ts:2-3)',
+      })
+    );
+    try {
+      const result = await handleKnowledge('submit', params, {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState: {}, aiProvider: { chat } },
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(chat).toHaveBeenCalledTimes(1);
+      expect(fake.calls).toHaveLength(1);
+      const stored = storedItem(fake);
+      expect((stored.content as { markdown: string }).markdown).toBe(original);
+      expect(stored.doClause).toBe('Use import type for every type-only dependency.');
+      expect((stored.reasoning as { styleAdvisories?: string[] }).styleAdvisories).toBeUndefined();
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('does not adopt a style repair that introduces GRAPH_REF_INVALID and stores the soft-only candidate with advisories', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const original = longMarkdownWithoutContrast();
+    // 模型回传全文+对比块，但对比块里出现“调用方”——Core 关系断言门会产生硬违规 GRAPH_REF_INVALID
+    const chat = vi.fn(async () =>
+      JSON.stringify({
+        doClause: 'Use import type for every type-only dependency.',
+        markdown: `${original}\n✅ 正确：类型专用依赖用 import type。\n❌ 错误：绕过调用方直接用值导入。\n违反后果：产生运行时导入边。`,
+      })
+    );
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      const result = await handleKnowledge('submit', softOnlyLongParams(), {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState: {}, aiProvider: { chat } },
+      } as never);
+      expect(chat).toHaveBeenCalledTimes(1);
+      // 原违规全软：不修也会带 advisory 完整入库，修复不得让结果更差（硬拒）
+      expect(result.ok).toBe(true);
+      expect(fake.calls).toHaveLength(1);
+      const stored = storedItem(fake);
+      expect((stored.content as { markdown: string }).markdown).toBe(original);
+      expect(stored.doClause).toBe('ImportType is needed for type-only dependencies.');
+      const advisories = (stored.reasoning as { styleAdvisories?: string[] }).styleAdvisories ?? [];
+      expect(advisories.join(' ')).toContain('DO_CLAUSE_NON_IMPERATIVE');
+      expect(advisories.join(' ')).toContain('CONTENT_CONTRAST_MISSING');
+      expect(
+        warn.mock.calls.some(
+          ([message]) =>
+            String(message).includes('[style-repair] rejected') &&
+            String(message).includes('GRAPH_REF_INVALID')
+        )
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('shares the per-title style repair budget across runtime projections and phase copies', async () => {
     const projectRoot = makeProject();
     const sharedState = { _sessionCounters: {} };

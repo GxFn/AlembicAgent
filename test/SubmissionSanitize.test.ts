@@ -4,11 +4,13 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { describe, expect, test, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import {
   buildViolationRepairTemplates,
+  repairStyleViolations,
   sanitizeSubmissionEvidence,
 } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -216,6 +218,167 @@ describe('repairStyleViolations（E7-R 修复子调用）', () => {
       isStyleRepairable([{ code: 'DO_CLAUSE_NON_IMPERATIVE' }, { code: 'SOURCE_REF_NOT_FOUND' }])
     ).toBe(false);
     expect(isStyleRepairable([])).toBe(false);
+  });
+});
+
+describe('repairStyleViolations（I32：按违规码限定字段 + markdown 保真）', () => {
+  const allowlist = { positive: ['Use'], negative: ['Avoid'] };
+  const TAIL_MARKER = 'TAIL-SENTINEL (来源: lib/a.ts:1-3)';
+  const CONTRAST_BLOCK =
+    '✅ 正确：使用 import type 引入类型 (来源: lib/a.ts:1-3)\n❌ 错误：用普通 import 引入类型\n违反后果：类型依赖变成运行时依赖';
+
+  /** 超过 1800 字符展示窗口的正文，尾部带不可丢失的标记（截断前后对照基准） */
+  function longMarkdown(): string {
+    return `## 类型导入隔离\n\n${'模块统一使用 import type 声明类型级导入，编译后完全擦除。'.repeat(110)}\n\n${TAIL_MARKER}`;
+  }
+
+  /** 从修复提示里取出模型实际看到的 markdown（展示窗口），模拟"照做"的模型 */
+  function shownMarkdown(prompt: string): string {
+    const line = prompt.split('\n').find((candidate) => candidate.startsWith('候选字段: '));
+    if (!line) {
+      throw new Error('repair prompt has no 候选字段 line');
+    }
+    return (JSON.parse(line.slice('候选字段: '.length)) as { markdown: string }).markdown;
+  }
+
+  function spyWarn() {
+    const logger = Logger.getInstance();
+    return vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+  }
+
+  function warnedWith(warn: ReturnType<typeof spyWarn>, ...fragments: string[]): boolean {
+    return warn.mock.calls.some(([message]) =>
+      fragments.every((fragment) => String(message).includes(fragment))
+    );
+  }
+
+  test('CONTENT_CONTRAST_MISSING：模型只返回 contrastBlock → 程序拼到完整原文末尾', async () => {
+    const original = longMarkdown();
+    expect(original.length).toBeGreaterThan(1800);
+    const repaired = await repairStyleViolations(
+      { title: 'T', doClause: 'Use x', content: { markdown: original, rationale: 'r' } },
+      [{ code: 'CONTENT_CONTRAST_MISSING' }],
+      { chat: async () => JSON.stringify({ contrastBlock: CONTRAST_BLOCK }) },
+      allowlist
+    );
+    const next = repaired?.content as { markdown: string; rationale: string };
+    expect(next.markdown.startsWith(original)).toBe(true);
+    expect(next.markdown).toContain(TAIL_MARKER);
+    expect(next.markdown.endsWith(CONTRAST_BLOCK)).toBe(true);
+    expect(next.markdown.length).toBeGreaterThanOrEqual(original.length + CONTRAST_BLOCK.length);
+    expect(next.rationale).toBe('r');
+    expect(repaired).not.toHaveProperty('contrastBlock');
+  });
+
+  test('CONTENT_CONTRAST_MISSING：模型回显展示前缀+对比块 → 未展示尾部拼回，正文不截断', async () => {
+    const original = longMarkdown();
+    const repaired = await repairStyleViolations(
+      { title: 'T', content: { markdown: original } },
+      [{ code: 'CONTENT_CONTRAST_MISSING' }],
+      {
+        chat: async (prompt: string) =>
+          JSON.stringify({ markdown: `${shownMarkdown(prompt)}\n\n${CONTRAST_BLOCK}` }),
+      },
+      allowlist
+    );
+    const next = (repaired?.content as { markdown: string }).markdown;
+    expect(next.startsWith(original)).toBe(true);
+    expect(next).toContain(TAIL_MARKER);
+    expect(next.endsWith(CONTRAST_BLOCK)).toBe(true);
+  });
+
+  test('只报 DO_CLAUSE_NON_IMPERATIVE：模型顺带回显的 markdown 被丢弃并留痕，doClause 照常采纳', async () => {
+    const original = longMarkdown();
+    const warn = spyWarn();
+    try {
+      const repaired = await repairStyleViolations(
+        {
+          title: 'T',
+          doClause: 'All types should use import type',
+          content: { markdown: original },
+        },
+        [{ code: 'DO_CLAUSE_NON_IMPERATIVE' }],
+        {
+          chat: async (prompt: string) =>
+            JSON.stringify({
+              doClause: 'Use import type for type-only imports',
+              markdown: `${shownMarkdown(prompt)}\n\n${CONTRAST_BLOCK}`,
+            }),
+        },
+        allowlist
+      );
+      expect(repaired?.doClause).toBe('Use import type for type-only imports');
+      expect((repaired?.content as { markdown: string }).markdown).toBe(original);
+      expect(warnedWith(warn, '[style-repair] dropped field', 'markdown')).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('GRAPH_REF_INVALID 长正文：返回值不以展示前缀开头 → markdown 丢弃；无其它字段时返回 null', async () => {
+    const original = longMarkdown();
+    const warn = spyWarn();
+    try {
+      const repaired = await repairStyleViolations(
+        { title: 'T', content: { markdown: original } },
+        [{ code: 'GRAPH_REF_INVALID' }],
+        {
+          chat: async () =>
+            JSON.stringify({
+              markdown: '## 改写后的短正文\n\n模块通过导入依赖另一模块。(来源: lib/a.ts:1-3)',
+            }),
+        },
+        allowlist
+      );
+      expect(repaired).toBeNull();
+      expect(warnedWith(warn, '[style-repair] dropped field', 'markdown')).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('短正文（未超窗）GRAPH_REF_INVALID：模型看过全文，整体替换照常采纳', async () => {
+    const original = '模块 A 的 callers 会 invokes 模块 B。(来源: lib/a.ts:1-3)';
+    const rewritten = '模块 A 通过导入依赖模块 B。(来源: lib/a.ts:1-3)';
+    const repaired = await repairStyleViolations(
+      { title: 'T', content: { markdown: original } },
+      [{ code: 'GRAPH_REF_INVALID' }],
+      { chat: async () => JSON.stringify({ markdown: rewritten }) },
+      allowlist
+    );
+    expect((repaired?.content as { markdown: string }).markdown).toBe(rewritten);
+  });
+
+  test('contrastBlock 缺 ✅/❌ 标记 → 丢弃；STAGE3_TITLE_TOO_GENERIC 只收 title，越界 doClause 丢弃', async () => {
+    const warn = spyWarn();
+    try {
+      const noMarkers = await repairStyleViolations(
+        { title: 'T', content: { markdown: '正文' } },
+        [{ code: 'CONTENT_CONTRAST_MISSING' }],
+        { chat: async () => JSON.stringify({ contrastBlock: '正确：A；错误：B' }) },
+        allowlist
+      );
+      expect(noMarkers).toBeNull();
+      expect(warnedWith(warn, '[style-repair] dropped field', 'contrastBlock')).toBe(true);
+
+      const titleOnly = await repairStyleViolations(
+        { title: 'Singleton pattern', doClause: 'Keep it', content: { markdown: '正文' } },
+        [{ code: 'STAGE3_TITLE_TOO_GENERIC' }],
+        {
+          chat: async () =>
+            JSON.stringify({
+              title: 'Config loader Singleton pattern for AlembicAgent',
+              doClause: 'Use something else',
+            }),
+        },
+        allowlist
+      );
+      expect(titleOnly?.title).toBe('Config loader Singleton pattern for AlembicAgent');
+      expect(titleOnly?.doClause).toBe('Keep it');
+      expect(warnedWith(warn, '[style-repair] dropped field', 'doClause')).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

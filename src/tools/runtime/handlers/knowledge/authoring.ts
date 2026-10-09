@@ -34,6 +34,48 @@ import {
 } from './sources.js';
 
 type SubmissionInput = ReturnType<typeof buildSubmissionInput>;
+type AuthoringViolationLike = { code: string };
+
+/**
+ * I32 修复采纳判定：修复子调用的定位是「在不改变事实的前提下改进软违规」，不是在通过与
+ * 拒绝之间做取舍。软违规不修也会在下游降为 advisory 完整入库，所以修复不得让结果更差：
+ * - 违规必须真的减少（条数严格下降；此前唯一的判定）；
+ * - 不得引入原集合之外的新硬违规——否则本可带 advisory 入库的候选会被硬拒并计入止损；
+ * - 原违规全为软规则时，修复后也必须全为软规则且 code 集合是原集合子集：新软 code
+ *   （如正文丢了代码块触发 STAGE3_MARKDOWN_NEEDS_CODE_OR_FILEREF）往往意味着正文被改坏，
+ *   不能被「条数减少」抵消。
+ * 原违规含硬规则时维持原判（不修也会硬拒），只加「不引入新硬违规」这一条。
+ */
+function judgeStyleRepairAdoption(
+  before: AuthoringViolationLike[],
+  after: AuthoringViolationLike[]
+): { adopt: true } | { adopt: false; reason: string } {
+  const beforeCodes = new Set(before.map((v) => v.code));
+  const afterCodes = after.map((v) => v.code);
+  const introduced = afterCodes.filter((code) => !beforeCodes.has(code));
+  const describe = `${[...beforeCodes].join(',') || '-'}→${afterCodes.join(',') || '-'}`;
+  if (after.length >= before.length) {
+    return {
+      adopt: false,
+      reason: `no improvement (${before.length}→${after.length}: ${describe})`,
+    };
+  }
+  const introducedHard = introduced.filter((code) => !isSoftAuthoringViolation(code));
+  if (introducedHard.length > 0) {
+    return {
+      adopt: false,
+      reason: `introduces hard violation ${introducedHard.join(',')} (${describe})`,
+    };
+  }
+  const beforeAllSoft = before.every((v) => isSoftAuthoringViolation(v.code));
+  if (beforeAllSoft && introduced.length > 0) {
+    return {
+      adopt: false,
+      reason: `soft-only candidate gains new code ${introduced.join(',')} (${describe})`,
+    };
+  }
+  return { adopt: true };
+}
 type SubmissionPreparation =
   | { status: 'rejected'; result: ToolResult }
   | {
@@ -285,7 +327,9 @@ export async function prepareSubmission(
             : preparedProduction.codeEvidence,
         };
         const reVerified = evaluatePreparedItem(repairedProduction, ctx, effectiveDimensionId);
-        if (reVerified.length < gateViolations.length) {
+        // I32：不再只比条数——不得引入新硬违规；全软候选不得新增任何 code（见 judgeStyleRepairAdoption）。
+        const adoption = judgeStyleRepairAdoption(gateViolations, reVerified);
+        if (adoption.adopt) {
           bumpSubmitRepairStat(ctx.runtime, 'style_repair_subcall');
           Logger.getInstance().info(
             `[knowledge.submit] style repair sub-call fixed "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): violations ${gateViolations.length}→${reVerified.length}`
@@ -294,9 +338,10 @@ export async function prepareSubmission(
           effectiveItem = repairedProduction.item as Record<string, unknown>;
           gateViolations = reVerified;
         } else {
-          // 降级必须可观测：修复产物未减少违规（run-5 静默分支补钉）
+          // 降级必须可观测：修复产物被拒绝采纳（未减少违规 / 引入新硬违规 / 全软候选新增 code），
+          // 候选保持修复前原文走既有拒绝或 advisory 路径（run-5 静默分支补钉 + I32）。
           Logger.getInstance().warn(
-            `[style-repair] no improvement for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${gateViolations.length}→${reVerified.length}`
+            `[style-repair] rejected for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${adoption.reason}`
           );
         }
       }
