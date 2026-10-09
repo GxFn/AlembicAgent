@@ -23,19 +23,29 @@
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { estimateTokens } from '#shared/tokenUtils.js';
-import type { ToolResultEnvelope } from '#tools/kernel/index.js';
+import { isToolResultEnvelope, type ToolResultEnvelope } from '#tools/kernel/index.js';
 import {
   createStrictAnalysisContextProjectionV1,
   type StrictAnalysisContextProjectionV1,
 } from '../production/StrictProductionPipeline.js';
-import { readToolObservation, successfulReadPaths } from '../utils/toolOutcomes.js';
+import {
+  failedReadPaths,
+  readToolObservation,
+  successfulReadPaths,
+} from '../utils/toolOutcomes.js';
 import type { DistilledContext } from './MemoryFlushContract.js';
 
 // ═══════════════════════════════════════════════════════════
 // §1: 工具压缩策略 (从 WorkingMemory 迁入)
 // ═══════════════════════════════════════════════════════════
 
-/** 工具特化压缩策略 — 不同工具返回不同结构，压缩时保留最有价值的部分 */
+/**
+ * 工具特化压缩策略 — 不同工具返回不同结构，压缩时保留最有价值的部分。
+ *
+ * 策略收到的是业务载荷（unwrapObservedResult 已拆开 ToolResultEnvelope：structuredContent
+ * 优先，其次模型可见 text），不是信封本身；纯文本形态（如 "N matches (showing M)…"）按字符串截断，
+ * 首行即匹配计数会落在摘要前 150 字符内。
+ */
 const TOOL_COMPRESS_STRATEGIES = {
   code(result: unknown) {
     if (typeof result !== 'object' || result === null) {
@@ -48,11 +58,17 @@ const TOOL_COMPRESS_STRATEGIES = {
     }>;
     const batchResults = (r.batchResults || {}) as Record<string, Record<string, unknown>>;
 
-    // search action: 有 matches 或 batchResults
+    // search action: 有 matches 或 batchResults；适配器投影为 { total, shown, matches }，
+    // total 是观察到的总命中数，matches 可能因预算只展示一部分。
     if (matches.length > 0 || Object.keys(batchResults).length > 0) {
       const lines: string[] = [];
       if (matches.length > 0) {
-        lines.push(`搜索到 ${matches.length} 个匹配`);
+        const total = typeof r.total === 'number' ? r.total : matches.length;
+        lines.push(
+          total > matches.length
+            ? `搜索到 ${total} 个匹配（显示 ${matches.length}）`
+            : `搜索到 ${total} 个匹配`
+        );
         const fileGroups: Record<string, number[]> = {};
         for (const m of matches) {
           if (!fileGroups[m.file]) {
@@ -77,20 +93,28 @@ const TOOL_COMPRESS_STRATEGIES = {
       return lines.join('\n');
     }
 
-    // read action: 有 files 数组或 content 字段
+    // read action: 有 files 数组或 content 字段。批量成员各自带 ok/error：
+    // 失败成员必须在摘要里点名，否则整体 ok 的部分失败会被当成全部读到。
     if (Array.isArray(r.files)) {
-      const files = r.files as Array<{ content?: string; path?: string }>;
+      const files = r.files as Array<{
+        ok?: boolean;
+        content?: string;
+        path?: string;
+        error?: string;
+        lineCount?: number;
+      }>;
       const lines = [`读取 ${files.length} 个文件`];
       for (const f of files.slice(0, 5)) {
-        const totalLines = (f.content || '').split('\n').length;
-        lines.push(`  ${f.path} (${totalLines} 行)`);
+        if (f && typeof f === 'object' && f.ok === false) {
+          lines.push(`  ${f.path ?? '?'} (失败: ${f.error || 'read failed'})`);
+          continue;
+        }
+        lines.push(`  ${f?.path ?? '?'} (${countReadLines(f) ?? '?'} 行)`);
       }
       return lines.join('\n');
     }
     if (r.content) {
-      const content = (r.content as string) || String(result);
-      const totalLines = content.split('\n').length;
-      return `文件 ${(r.path as string) || '?'} (${totalLines} 行)`;
+      return `文件 ${(r.path as string) || '?'} (${countReadLines(r) ?? '?'} 行)`;
     }
 
     // structure/outline action: 有 entries/children
@@ -106,7 +130,14 @@ const TOOL_COMPRESS_STRATEGIES = {
     if (typeof result !== 'object' || result === null) {
       return String(result).substring(0, 600);
     }
-    const r = result as Record<string, unknown>;
+    const outer = result as Record<string, unknown>;
+    // graph handler 的投影是 { type, entity, result } 或 { type, entity, message }：
+    // 宿主查询体在 result 里，实体名在外层 entity；裸结果（旧形态）则直接是查询体。
+    const r = objectFrom(outer.result) ?? outer;
+    const entity = stringFrom(outer.entity);
+    if (!objectFrom(outer.result) && typeof outer.message === 'string' && entity) {
+      return `图谱 ${stringFrom(outer.type) || 'query'} ${entity}: ${outer.message}`;
+    }
 
     // hierarchy query: 有 classes 或 hierarchy 数组
     const classes = r.classes || r.hierarchy;
@@ -115,7 +146,7 @@ const TOOL_COMPRESS_STRATEGIES = {
     }
 
     // class/protocol query: 有 className 等
-    const lines = [`类 ${(r.className as string) || (r.protocolName as string) || '?'}`];
+    const lines = [`类 ${(r.className as string) || (r.protocolName as string) || entity || '?'}`];
     if (r.superClass) {
       lines.push(`  继承: ${r.superClass}`);
     }
@@ -128,17 +159,67 @@ const TOOL_COMPRESS_STRATEGIES = {
     if (Array.isArray(r.properties) && r.properties.length) {
       lines.push(`  属性数: ${r.properties.length}`);
     }
+    if (Array.isArray(r.calls) && r.calls.length) {
+      lines.push(`  调用关系: ${r.calls.length} 条`);
+    }
     return lines.join('\n');
   },
 };
 
-/** 默认压缩 — 截断到 maxChars */
+/** 默认压缩 — 截断到 maxChars；undefined/函数等 stringify 不出字符串时退回 String()。 */
 function defaultCompress(result: unknown, maxChars = 600) {
-  const str = typeof result === 'string' ? result : JSON.stringify(result);
+  const str =
+    typeof result === 'string' ? result : (JSON.stringify(result) ?? String(result ?? ''));
   if (str.length <= maxChars) {
     return str;
   }
   return `${str.substring(0, maxChars)}…(truncated)`;
+}
+
+/** 读取结果的行数：handler 已给 lineCount 时直接用，否则按 content 换行计数；都没有则 null。 */
+function countReadLines(entry: unknown): number | null {
+  const r = objectFrom(entry);
+  if (!r) {
+    return null;
+  }
+  if (typeof r.lineCount === 'number' && Number.isFinite(r.lineCount)) {
+    return r.lineCount;
+  }
+  return typeof r.content === 'string' ? r.content.split('\n').length : null;
+}
+
+interface UnwrappedObservation {
+  /** 通过 kernel 严格守卫的真实信封；业务对象恰好带 toolId/callId/status 字符串也不会被误判。 */
+  envelope: ToolResultEnvelope | null;
+  /** 交给压缩策略/元数据的业务载荷：信封的 structuredContent，其次模型可见 text；非信封则原结果。 */
+  payload: unknown;
+}
+
+/**
+ * 拆开 ToolResultEnvelope：runtimeBridge 总把 metadata.envelope 交给 recordToolCall，
+ * 压缩策略、Observation Ledger 与观察元数据必须看到同一份业务载荷，而不是信封元数据。
+ */
+function unwrapObservedResult(result: unknown): UnwrappedObservation {
+  if (!isToolResultEnvelope(result)) {
+    return { envelope: null, payload: result };
+  }
+  return { envelope: result, payload: result.structuredContent ?? result.text };
+}
+
+/** search 结果的匹配数：结构化投影读 total，纯文本读首行 "N matches"，都没有则 null。 */
+function readSearchMatchCount(payload: unknown): number | null {
+  const structured = objectFrom(payload);
+  if (structured && typeof structured.total === 'number' && Number.isFinite(structured.total)) {
+    return structured.total;
+  }
+  if (typeof payload === 'string') {
+    const firstLine = payload.split('\n').find((line) => line.trim());
+    const matched = firstLine?.trim().match(/^(\d+) matches\b/);
+    if (matched) {
+      return Number(matched[1]);
+    }
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -641,12 +722,19 @@ export class ActiveContext {
     }
 
     // §2: Observation Ledger (中等优先级)
-    if (this.#compressedObservations.length > 0 && remaining > 100) {
-      const ledgerSection = this.#buildObservationLedgerSection(
-        Math.max(0, remaining - (parts.length ? estimateTokens('\n') : 0))
-      );
-      if (ledgerSection) {
-        parts.push(ledgerSection);
+    if (this.#compressedObservations.length > 0) {
+      if (remaining > 100) {
+        const ledgerSection = this.#buildObservationLedgerSection(
+          Math.max(0, remaining - (parts.length ? estimateTokens('\n') : 0))
+        );
+        if (ledgerSection) {
+          parts.push(ledgerSection);
+        } else {
+          this.#logLedgerSkipped('no_item_fits', remaining);
+        }
+      } else {
+        // 剩余预算不足以放下台账标题+一条记录：整段跳过，模型本轮看不到失败/已读记录。
+        this.#logLedgerSkipped('budget_exhausted', remaining);
       }
     }
 
@@ -877,20 +965,20 @@ export class ActiveContext {
       resultSize: 0,
     };
 
-    const resultStr = typeof result === 'string' ? result : JSON.stringify(result || '');
-    meta.resultSize = resultStr.length;
-
-    const envelope = isToolResultEnvelope(result) ? result : null;
+    const { envelope, payload } = unwrapObservedResult(result);
+    // 观察元数据只有 gotNewInfo 被消费：不再为 resultSize 对整个结果（批量读取全文）做一次
+    // JSON.stringify——既省掉随结果体积线性增长的开销，也避免不可序列化结果让 traceRecord 抛错。
+    // 只对已是字符串的结果取长度；信封取模型可见 text 的长度；其余对象记 0。
+    meta.resultSize =
+      typeof result === 'string' ? result.length : envelope ? envelope.text.length : 0;
 
     switch (toolName) {
       case 'code': {
         const action = (args?.action as string) || '';
         if (action === 'search') {
           meta.resultType = 'search';
-          // V2 搜索结果为紧凑文本 "N matches (showing M)\n\nfile:line: content"
-          const matchCount =
-            typeof result === 'string' ? ((result.match(/^(\d+) matches/) ?? [])[1] ?? '?') : '?';
-          meta.keyFacts.push(`${matchCount} matches found`);
+          // 适配器投影为 { total, shown, matches }；旧纯文本形态首行是 "N matches (showing M)"。
+          meta.keyFacts.push(`${readSearchMatchCount(payload) ?? '?'} matches found`);
           if (isNew) {
             meta.keyFacts.push('new files discovered');
           }
@@ -992,11 +1080,26 @@ export class ActiveContext {
     const strategy = (TOOL_COMPRESS_STRATEGIES as Record<string, (result: unknown) => string>)[
       observation.toolName
     ];
+    // 先拆信封再压缩：策略按业务载荷编写，生产传入的却总是 ToolResultEnvelope。
+    const { envelope, payload } = unwrapObservedResult(observation.result);
     let summary: string;
     try {
-      summary = strategy ? strategy(observation.result) : defaultCompress(observation.result);
-    } catch {
-      summary = defaultCompress(observation.result);
+      summary = strategy ? strategy(payload) : defaultCompress(payload);
+    } catch (err: unknown) {
+      // 策略只认识已知业务形状；形状漂移时退回通用截断，并留下可定位的降级记录。
+      const reason = err instanceof Error ? err.message : String(err);
+      observeSafely(
+        () =>
+          this.#logger.warn(
+            `[ActiveContext] compress strategy failed tool=${observation.toolName} round=${observation.round} reason=${reason}; fallback=defaultCompress`
+          ),
+        () => undefined
+      );
+      summary = defaultCompress(payload);
+    }
+    if (envelope && !envelope.ok) {
+      // 失败回执的载荷通常只是错误文本；状态前缀让蒸馏摘要与宿主拼接的文本能分辨失败/阻断/超时。
+      summary = `[${envelope.status}] ${summary}`;
     }
     return {
       toolName: observation.toolName,
@@ -1031,10 +1134,14 @@ export class ActiveContext {
     }
 
     const lines = ['## Observation Ledger'];
+    const omitted: string[] = [];
+    let retained = 0;
     for (const category of OBSERVATION_LEDGER_CATEGORIES) {
       const items = (ledger.get(category) || []).slice(-OBSERVATION_LEDGER_LIMITS[category]);
       const categoryLines = [`### ${category}`];
-      for (const item of items) {
+      let index = 0;
+      for (; index < items.length; index++) {
+        const item = items[index];
         const line = `- [R${item.round}|${item.toolName}] ${item.text}`;
         // 标题、换行和中日韩正文与外层使用同一估算，不把超额尾部留给外层硬截断。
         const candidate = [...lines, [...categoryLines, line].join('\n')].join('\n');
@@ -1043,19 +1150,44 @@ export class ActiveContext {
         }
         categoryLines.push(line);
       }
+      retained += categoryLines.length - 1;
+      if (index < items.length) {
+        omitted.push(`${category}=${items.length - index}`);
+      }
       if (categoryLines.length > 1) {
         lines.push(categoryLines.join('\n'));
       }
     }
+    if (omitted.length > 0) {
+      // 预算截断是降级：记录每类被省略的条数，排查“模型为何看不到失败记录/重复读文件”时可定位。
+      observeSafely(
+        () =>
+          this.#logger.info(
+            `[ActiveContext] observation ledger truncated by budget=${tokenBudget}: retained ${retained} item(s), omitted ${omitted.join(', ')}`
+          ),
+        () => undefined
+      );
+    }
 
     return lines.length > 1 ? lines.join('\n') : null;
+  }
+
+  /** 台账整段跳过的降级记录：触发条件、剩余预算与被跳过的压缩观察数。 */
+  #logLedgerSkipped(reason: 'budget_exhausted' | 'no_item_fits', remaining: number) {
+    observeSafely(
+      () =>
+        this.#logger.info(
+          `[ActiveContext] observation ledger skipped reason=${reason} remaining=${remaining} compressed=${this.#compressedObservations.length}`
+        ),
+      () => undefined
+    );
   }
 
   #extractObservationLedgerItems(
     observation: Observation,
     summary: string
   ): ObservationLedgerItem[] {
-    const envelope = isToolResultEnvelope(observation.result) ? observation.result : null;
+    const { envelope } = unwrapObservedResult(observation.result);
     const structured = envelope?.structuredContent ?? observation.result;
     const observedCall = {
       tool: observation.toolName,
@@ -1103,17 +1235,34 @@ export class ActiveContext {
 
     if (observation.toolName === 'code') {
       if (action === 'read') {
-        const paths = successfulReadPaths(observedCall);
-        for (const filePath of paths) {
+        // successfulReadPaths 在调用失败时恒为空，这里只会是真正读到的文件。
+        for (const filePath of successfulReadPaths(observedCall)) {
           items.push(
             this.#ledgerItem('readSet', `read:${filePath}`, filePath, observation),
+            this.#ledgerItem('evidence', `read:${filePath}`, `Read ${filePath}`, observation)
+          );
+        }
+        // 批量读取整体 ok 时单个失败成员不会走上面的 !ok 分支：必须单独进入 failureSet，
+        // 否则窗口滑出后模型会反复请求同一缺失文件。整体失败时成员级条目补充具体文件名。
+        for (const failure of failedReadPaths(observedCall)) {
+          items.push(
             this.#ledgerItem(
-              'evidence',
-              `read:${filePath}`,
-              `${ok ? 'Read' : 'Attempted read'} ${filePath}`,
+              'failureSet',
+              `read:${failure.path}:${failure.reason}`,
+              `code.read failed: ${failure.path} (${failure.reason})`,
               observation
             )
           );
+          if (ok && !envelope?.nextActionHint) {
+            items.push(
+              this.#ledgerItem(
+                'nextHints',
+                `read:${failure.path}:retry`,
+                `Verify the path before re-reading ${failure.path}.`,
+                observation
+              )
+            );
+          }
         }
       } else if (action === 'search') {
         const searches = extractSearches(args, structured, envelope?.text);
@@ -1307,16 +1456,6 @@ export class ActiveContext {
 
     return planLines.join('\n').trim();
   }
-}
-
-function isToolResultEnvelope(value: unknown): value is ToolResultEnvelope {
-  return (
-    !!value &&
-    typeof value === 'object' &&
-    typeof (value as ToolResultEnvelope).toolId === 'string' &&
-    typeof (value as ToolResultEnvelope).callId === 'string' &&
-    typeof (value as ToolResultEnvelope).status === 'string'
-  );
 }
 
 function extractSearches(

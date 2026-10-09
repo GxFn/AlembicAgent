@@ -7,7 +7,7 @@ import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
 import { estimateTokens } from '../src/shared/tokenUtils.js';
-import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
+import { isToolResultEnvelope, type ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import type { ToolContext } from '../src/tools/kernel/registry.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -185,6 +185,287 @@ describe('ActiveContext observation ledger', () => {
     expect(rendered.indexOf('## 📌 已确认的关键发现')).toBeLessThan(
       rendered.indexOf('## Observation Ledger')
     );
+  });
+});
+
+describe('ActiveContext envelope-aware observation compression (L6-P10)', () => {
+  const METADATA_WORDS = ['callId', 'startedAt', 'toolId', 'durationMs', '"ok"', 'trust'];
+
+  function recordProductionEnvelopes(context: ActiveContext) {
+    context.startRound(1);
+    context.recordToolCall(
+      'code',
+      { action: 'read', filePaths: ['src/a.ts', 'src/b.ts'] },
+      envelope({
+        callId: 'call-read-batch',
+        structuredContent: {
+          mode: 'batch',
+          files: [
+            { ok: true, path: 'src/a.ts', content: '1|export const a = 1;', lineCount: 1 },
+            { ok: true, path: 'src/b.ts', content: '1|export const b = 1;\n2|', lineCount: 2 },
+          ],
+          summary: { requested: 2, succeeded: 2, failed: 0, partialFailure: false },
+        },
+      }),
+      true
+    );
+    context.recordToolCall(
+      'code',
+      { action: 'search', patterns: ['needle'], glob: 'src/**' },
+      envelope({
+        callId: 'call-search',
+        structuredContent: {
+          total: 3,
+          shown: 2,
+          matches: [
+            { file: 'src/a.ts', line: 1, content: 'needle one' },
+            { file: 'src/b.ts', line: 2, content: 'needle two' },
+          ],
+        },
+      }),
+      true
+    );
+    context.recordToolCall(
+      'graph',
+      { action: 'query', type: 'class', entity: 'AlphaService' },
+      envelope({
+        toolId: 'graph',
+        callId: 'call-graph',
+        structuredContent: {
+          type: 'class',
+          entity: 'AlphaService',
+          result: {
+            className: 'AlphaService',
+            superClass: 'BaseService',
+            methods: ['run', 'stop'],
+          },
+        },
+      }),
+      true
+    );
+    context.recordToolCall(
+      'knowledge',
+      { action: 'search', query: 'retry policy' },
+      envelope({
+        toolId: 'knowledge',
+        callId: 'call-knowledge',
+        structuredContent: { items: [{ id: 'k-1', title: 'Retry policy' }], total: 1 },
+      }),
+      true
+    );
+    context.endRound();
+  }
+
+  it('summarizes the tool payload of production envelopes instead of envelope metadata', () => {
+    const context = new ActiveContext({ maxRecentRounds: 2 });
+    recordProductionEnvelopes(context);
+    const { toolCallSummary } = context.distill();
+
+    expect(toolCallSummary).toHaveLength(4);
+    for (const line of toolCallSummary) {
+      for (const word of METADATA_WORDS) {
+        expect(line, line).not.toContain(word);
+      }
+    }
+    const [read, search, graph, knowledge] = toolCallSummary;
+    expect(read).toContain('[code] 读取 2 个文件');
+    expect(read).toContain('src/a.ts (1 行)');
+    expect(read).toContain('src/b.ts (2 行)');
+    expect(search).toContain('[code] 搜索到 3 个匹配');
+    expect(search).toContain('src/a.ts: L1');
+    expect(graph).toContain('[graph] 类 AlphaService');
+    expect(graph).toContain('继承: BaseService');
+    expect(graph).toContain('方法数: 2');
+    expect(knowledge).toContain('[knowledge]');
+    expect(knowledge).toContain('Retry policy');
+  });
+
+  it('prefixes a failed envelope summary with its status', () => {
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(1);
+    context.recordToolCall(
+      'code',
+      { action: 'read', path: 'src/missing.ts' },
+      envelope({
+        ok: false,
+        status: 'error',
+        callId: 'call-missing',
+        text: 'Cannot read file: ENOENT src/missing.ts',
+      }),
+      false
+    );
+    context.recordToolCall(
+      'terminal',
+      { command: 'rm -rf /' },
+      envelope({
+        ok: false,
+        status: 'blocked',
+        toolId: 'terminal',
+        callId: 'call-blocked',
+        text: 'Permission denied: destructive command',
+      }),
+      false
+    );
+    context.endRound();
+    const { toolCallSummary } = context.distill();
+    expect(toolCallSummary[0]).toBe('[code] [error] Cannot read file: ENOENT src/missing.ts');
+    expect(toolCallSummary[1]).toBe('[terminal] [blocked] Permission denied: destructive command');
+  });
+
+  it('records partially failed batch reads in the ledger failureSet and nextHints', () => {
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(2);
+    context.recordToolCall(
+      'code',
+      { action: 'read', filePaths: ['src/a.ts', 'src/missing.ts'] },
+      envelope({
+        callId: 'call-partial',
+        structuredContent: {
+          mode: 'batch',
+          files: [
+            { ok: true, path: 'src/a.ts', content: '1|export const a = 1;', lineCount: 1 },
+            { ok: false, path: 'src/missing.ts', error: 'Cannot read file: ENOENT' },
+          ],
+          summary: { requested: 2, succeeded: 1, failed: 1, partialFailure: true },
+        },
+      }),
+      true
+    );
+    context.endRound();
+
+    const rendered = context.buildContext(4000);
+    const failureSection = rendered.split('### failureSet')[1]?.split('### nextHints')[0] ?? '';
+    const hintSection = rendered.split('### nextHints')[1] ?? '';
+    expect(rendered).toContain('### readSet');
+    expect(rendered).toContain('- [R2|code] src/a.ts');
+    expect(failureSection).toContain('src/missing.ts');
+    expect(failureSection).toContain('Cannot read file: ENOENT');
+    expect(hintSection).toContain('src/missing.ts');
+    expect(rendered).not.toContain('Attempted read');
+    expect(context.distill().toolCallSummary[0]).toContain(
+      'src/missing.ts (失败: Cannot read file: ENOENT)'
+    );
+  });
+
+  it('does not treat a business record carrying toolId/callId/status strings as an envelope', () => {
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(1);
+    const receiptLike = { toolId: 'code', callId: 'other-call', status: 'created', id: 'recipe-1' };
+    // 本地弱守卫只查三个字符串字段会把它当信封；kernel 严格守卫（ok/startedAt/text/durationMs…）不会。
+    expect(isToolResultEnvelope(receiptLike)).toBe(false);
+    expect(isToolResultEnvelope(envelope({ structuredContent: receiptLike }))).toBe(true);
+    context.recordToolCall('knowledge', { action: 'submit', title: 'Recipe' }, receiptLike, true);
+    expect(context.getCurrentRoundActions()[0].ok).toBe(true);
+    const meta = ActiveContext.buildObservationMeta(
+      'knowledge',
+      { action: 'submit', title: 'Recipe' },
+      receiptLike,
+      true
+    );
+    expect(meta.resultType).toBe('submit');
+    expect(meta).not.toHaveProperty('toolCall');
+    const rendered = context.buildContext(4000);
+    expect(rendered).toContain('### evidence');
+    expect(rendered).not.toContain('### failureSet');
+    expect(rendered).toContain('Observed knowledge.submit');
+  });
+
+  it('warns and falls back to the default compression when a strategy throws', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    const hostile: Record<string, unknown> = { path: 'src/a.ts' };
+    // 非枚举 getter：code 策略读取 batchResults 时抛错，而 JSON.stringify 的回退路径不会触碰它。
+    Object.defineProperty(hostile, 'batchResults', {
+      enumerable: false,
+      get() {
+        throw new Error('shape drift');
+      },
+    });
+    context.startRound(3);
+    context.recordToolCall('code', { action: 'search', pattern: 'x' }, hostile, false);
+    context.endRound();
+
+    expect(context.distill().toolCallSummary[0]).toBe('[code] {"path":"src/a.ts"}');
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    expect(messages.some((message) => message.includes('compress strategy failed'))).toBe(true);
+    expect(messages.some((message) => message.includes('tool=code'))).toBe(true);
+    expect(messages.some((message) => message.includes('shape drift'))).toBe(true);
+  });
+
+  it('logs when the observation ledger is skipped or truncated by the budget', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.noteKeyFinding('finding '.repeat(40), 'E-1=src/a.ts:1', 9);
+    context.startRound(1);
+    for (let index = 0; index < 12; index++) {
+      const path = `src/modules/feature-${index}/implementation-details.ts`;
+      context.recordToolCall(
+        'code',
+        { action: 'read', path },
+        envelope({
+          callId: `read-${index}`,
+          structuredContent: { ok: true, path, content: '1|x', lineCount: 1 },
+        }),
+        true
+      );
+    }
+    context.endRound();
+    const full = context.buildContext(Infinity);
+    expect(full).toContain('## Observation Ledger');
+    const scratchTokens = estimateTokens(full.split('\n## Observation Ledger')[0]);
+    const fullTokens = estimateTokens(full);
+    expect(fullTokens - scratchTokens).toBeGreaterThan(150);
+
+    // 剩余预算 ≤ 100：整段跳过，且必须留下可定位的降级日志。
+    const skipped = context.buildContext(scratchTokens + 90);
+    expect(skipped).not.toContain('## Observation Ledger');
+    let messages = info.mock.calls.map((call) => String(call[0]));
+    expect(messages.some((message) => message.includes('observation ledger skipped'))).toBe(true);
+    expect(messages.some((message) => message.includes('reason=budget_exhausted'))).toBe(true);
+
+    // 剩余预算放得下标题但放不下全部条目：按类截断并记录省略条数。
+    info.mockClear();
+    const truncated = context.buildContext(fullTokens - 20);
+    expect(truncated).toContain('## Observation Ledger');
+    expect(truncated.length).toBeLessThan(full.length);
+    messages = info.mock.calls.map((call) => String(call[0]));
+    const truncation = messages.find((message) => message.includes('observation ledger truncated'));
+    expect(truncation).toBeDefined();
+    expect(truncation).toMatch(/omitted (readSet|evidence)=\d+/);
+  });
+
+  it('builds observation meta without serializing the full result and reads search counts from the payload', () => {
+    const stringify = vi.spyOn(JSON, 'stringify');
+    const searchEnvelope = envelope({
+      callId: 'call-search-meta',
+      structuredContent: {
+        total: 3,
+        shown: 2,
+        matches: [{ file: 'src/a.ts', line: 1, content: 'needle' }],
+      },
+    });
+    const meta = ActiveContext.buildObservationMeta(
+      'code',
+      { action: 'search', pattern: 'needle' },
+      searchEnvelope,
+      true
+    );
+    expect(stringify).not.toHaveBeenCalled();
+    expect(meta.keyFacts).toContain('3 matches found');
+    expect(meta.resultSize).toBe(searchEnvelope.text.length);
+
+    const textMeta = ActiveContext.buildObservationMeta(
+      'code',
+      { action: 'search', pattern: 'needle' },
+      '2 matches (showing 2)\n\nsrc/a.ts:1: needle',
+      true
+    );
+    expect(textMeta.keyFacts).toContain('2 matches found');
+
+    // 不可序列化的结果不能让 traceRecord 中间件抛错。
+    expect(() =>
+      ActiveContext.buildObservationMeta('code', { action: 'read' }, { value: 10n }, true)
+    ).not.toThrow();
   });
 });
 
@@ -370,7 +651,10 @@ describe('working memory ownership and read budgets', () => {
       context.recordToolCall(
         'code',
         { action: 'read', path },
-        { path, content: 'actual source' },
+        envelope({
+          callId: `read-${path}`,
+          structuredContent: { ok: true, path, content: '1|actual source', lineCount: 1 },
+        }),
         true
       );
     }
@@ -378,6 +662,10 @@ describe('working memory ownership and read budgets', () => {
     const distilled = context.distill();
     expect(distilled.totalObservations).toBe(3);
     expect(distilled.toolCallSummary).toHaveLength(3);
+    // 蒸馏摘要是宿主直接拼进 analysisText 的人类可读文本：必须是文件事实，不能是信封元数据。
+    for (const [index, path] of ['src/a.ts', 'src/b.ts', 'src/c.ts'].entries()) {
+      expect(distilled.toolCallSummary[index]).toBe(`[code] 文件 ${path} (1 行)`);
+    }
   });
 
   it('does not let a toJSON observer replace authoritative finding references', () => {

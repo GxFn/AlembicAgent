@@ -21,6 +21,11 @@ export interface DistilledContext {
     /** 证据台账条目 id（Wave A E3）——随发现流向 Producer/评估器的程序化引用 */
     evidenceRefs?: string[];
   }>;
+  /**
+   * 每项是一条人类可读的工具摘要 `[tool] 摘要`（失败项为 `[tool] [status] 原因`），
+   * 由 ActiveContext 先拆开 ToolResultEnvelope 再压缩业务载荷得到；不是信封元数据
+   * （callId/startedAt/durationMs 等）。宿主会把它原样拼进 analysisText 与 SessionStore.toolCallLog。
+   */
   toolCallSummary: string[];
   stats: {
     totalRounds: number;
@@ -54,7 +59,7 @@ export interface DimensionFlushManifest {
   /** 原始 scratchpad findings — 重要性 >= threshold 的需要转发 */
   highPriorityFindings: Finding[];
 
-  /** 工具调用统计 — 用于 SessionStore.toolCallLog */
+  /** 工具调用摘要（与 DistilledContext.toolCallSummary 同一文本）— 用于 SessionStore.toolCallLog */
   toolCallSummary: string[];
 
   /** 是否触发向 PersistentMemory 的异步 consolidation */

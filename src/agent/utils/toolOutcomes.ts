@@ -224,3 +224,46 @@ export function successfulReadPaths(call: unknown): string[] {
   }
   return [...paths];
 }
+
+/**
+ * code.read 中真实失败的成员，与 successfulReadPaths 对称：只看批量成员自身的 ok/error，
+ * 不看整体 ok——批量读取部分失败时整体仍是成功回执，失败文件不能被成功路径吞掉。
+ * 单文件读取失败由调用整体失败表达，这里不重复；非 read 调用返回空。
+ */
+export function failedReadPaths(call: unknown): Array<{ path: string; reason: string }> {
+  const observation = readToolObservation(call);
+  if (observation.tool !== 'code' || observation.action !== 'read') {
+    return [];
+  }
+  const payload = observation.result;
+  const failures: Array<{ path: string; reason: string }> = [];
+  const seen = new Set<string>();
+  const add = (path: unknown, entry: Record<string, unknown>) => {
+    if (typeof path !== 'string' || !path || seen.has(path)) {
+      return;
+    }
+    seen.add(path);
+    const reason =
+      typeof entry.error === 'string' && entry.error.trim()
+        ? entry.error.trim()
+        : typeof entry.status === 'string' && entry.status.trim()
+          ? entry.status.trim()
+          : 'read failed';
+    failures.push({ path, reason });
+  };
+  if (Array.isArray(payload.files)) {
+    for (const file of payload.files) {
+      if (!readToolObservation({ result: file }).ok) {
+        const entry = record(file);
+        add(entry.path ?? entry.filePath, entry);
+      }
+    }
+  } else if (payload.batchResults && typeof payload.batchResults === 'object') {
+    for (const [file, value] of Object.entries(record(payload.batchResults))) {
+      if (!readToolObservation({ result: value }).ok) {
+        add(file, record(value));
+      }
+    }
+  }
+  return failures;
+}
