@@ -3,6 +3,7 @@ import { Conversation } from './Conversation.js';
 import { Evolution } from './Evolution.js';
 import { GenerateAnalyze } from './GenerateAnalyze.js';
 import { GenerateProduce } from './GenerateProduce.js';
+import { RelationExploration } from './RelationExploration.js';
 import { ScanAnalyze } from './ScanAnalyze.js';
 import { ScanProduce } from './ScanProduce.js';
 import { System } from './System.js';
@@ -18,6 +19,8 @@ export const CapabilityRegistry = {
     ['scan_analyze', ScanAnalyze as CapabilityConstructor],
     ['system_interaction', System as CapabilityConstructor],
     ['evolution_analysis', Evolution as CapabilityConstructor],
+    // relations pipeline explore 阶段的只读能力（L7-P19）；不含 submit/terminal/memory 写入。
+    ['relation_exploration', RelationExploration as CapabilityConstructor],
   ]),
 
   create(name: string, opts: Record<string, unknown> = {}): Capability {

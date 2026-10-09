@@ -8,7 +8,10 @@ export const RELATION_PROFILES: AgentProfileDefinition[] = [
     lifecycle: 'active',
     basePreset: 'insight',
     defaults: {
-      skills: ['knowledge_production', 'code_analysis'],
+      // 与 buildRelationsPipelineStages 默认 exploreCaps 同一集合：只读探索，不含
+      // knowledge.submit / terminal.exec / memory 写入（L7-P19 / C04）。运行时级能力实例
+      // 由此创建，explore 阶段的 capabilityOverride 按名复用同一实例。
+      skills: ['relation_exploration'],
       policies: [
         {
           type: 'budget',

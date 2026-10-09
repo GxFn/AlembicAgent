@@ -352,12 +352,20 @@ const RELATIONS_SYNTHESIZE_PROMPT = `你是结构化数据专家。将知识图�
  *   - 2 阶段: explore (工具驱动) → synthesize (文本输出)
  *   - 无质量门控 (探索结果质量由工具返回保证)
  *
- * @param [opts.exploreCaps] Explore 阶段 capabilities
+ * explore 阶段默认只给只读能力 relation_exploration（knowledge:[search,detail]、
+ * code:[read,search,outline]、graph:[query]）：RELATIONS_EXPLORE_PROMPT 第 1 步要求
+ * knowledge.search 并记录真实条目 id，第 3 步要求 code.read 验证引用；此前默认的
+ * knowledge_production + code_analysis 并集里 knowledge 只有 submit，检索在准入就被拒，
+ * 而“只读发现”阶段却握有 submit/terminal.exec/memory 写权限（L7-P19 / C04）。宿主经
+ * relation-discovery profile → relationsPipeline 工厂走到这里，relation.profile 的 skills
+ * 与此默认值保持同一集合。
+ *
+ * @param [opts.exploreCaps=['relation_exploration']] Explore 阶段 capabilities
  * @param [opts.exploreMaxIter=20] Explore 最大迭代
  * @returns PipelineStrategy stages 数组
  */
 export function buildRelationsPipelineStages({
-  exploreCaps = ['knowledge_production', 'code_analysis'],
+  exploreCaps = ['relation_exploration'],
   exploreMaxIter = 20,
 } = {}) {
   return [
