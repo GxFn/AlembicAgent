@@ -905,8 +905,9 @@ export class AgentRuntime {
   /**
    * 迭代准备 — 合并 nudge/压缩/提示词增强/toolChoice
    *
-   * 包含 session token 预算预检: 在 LLM 调用前估算 input token，
-   * 如果即将超出 session 级预算，提前触发 SUMMARIZE 而非等到下轮被硬杀。
+   * 包含 session token 预算预检: 在 LLM 调用前估算 input token。预检只返回 normal|compress，
+   * 只触发额外压缩与 L4 挂起（BudgetController.checkBeforeLLMCall），不做终止或 SUMMARIZE 决策；
+   * 终止由 ExitController 与 policy 负责。
    *
    * @returns }
    */

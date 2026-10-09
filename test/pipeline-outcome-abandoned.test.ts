@@ -179,9 +179,9 @@ describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
           name: 'quality_gate',
           gate: { evaluator: () => ({ action: 'degrade', pass: false, reason: 'too weak' }) },
         },
-        // 历史上的 skipOnDegrade 开关从未生效(降级后管线直接结束)；这里钉住真实语义。
-        { name: 'produce', skipOnDegrade: false },
-        { name: 'rejection_gate', gate: { evaluator: laterGate }, skipOnDegrade: false },
+        // 降级后管线直接结束，后续执行阶段与门都不再运行；这里钉住这一终态语义。
+        { name: 'produce' },
+        { name: 'rejection_gate', gate: { evaluator: laterGate } },
       ],
     });
 

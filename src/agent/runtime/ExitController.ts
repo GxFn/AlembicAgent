@@ -1,19 +1,24 @@
 /**
- * ExitController — 统一 Agent 退出决策
+ * ExitController — ReAct 循环的退出决策
  *
- * 合并散落在 AgentRuntime 各处的 13 条退出路径为单一检查点：
- *   - #shouldExit（abortSignal / tracker / stage timeout / policy）
- *   - #callLLM null 路径（空响应 / AI 错误 / 熔断 / toolChoice 违反）
- *   - #processToolCalls 末轮摘要
- *   - #processTextResponse 终答判定
+ * AgentRuntime 实际接线的检查点只有三个：
+ *   - checkBeforeIteration ← AgentRuntime.#shouldExit（每轮开始：abort → 阶段超时 → tracker
+ *     → 无 tracker 时的轮数上限 → policy，见方法内 P1–P5 标注）
+ *   - checkAfterLLM        ← AgentRuntime.#callLLM 的空响应分支（SUMMARIZE grace 与 system 场景重试）
+ *   - checkAfterToolCalls  ← AgentRuntime.#processToolCalls 末尾（无 tracker 时的轮数上限）
+ *
+ * 下列退出路径仍由 AgentRuntime 内联处理，不经过本类：
+ *   - AI 错误（abort / CIRCUIT_OPEN / 连续两次错误）：AgentRuntime.#handleAiError
+ *   - toolChoice=none 或 graceful exit 下仍返回工具调用：AgentRuntime.#callLLM
+ *   - 文本终答、digest nudge、继续探索：AgentRuntime.#processTextResponse
+ *   checkAfterAiError / checkAfterTextResponse / checkToolChoiceViolation 是与上述内联逻辑平行的
+ *   公开方法，目前没有被 AgentRuntime 调用；改退出语义时必须同时改内联路径，只改这里不会生效。
  *
  * 设计原则：
- *   - 单一检查入口，明确优先级
- *   - 返回结构化 ExitSignal 而非分散的 boolean/null
- *   - 保留 ExplorationTracker 的 phase/grace 语义
- *   - 向后兼容：AgentRuntime 可逐步迁移到 ExitController
+ *   - 每个检查点按固定顺序判定，返回结构化 ExitSignal 而非分散的 boolean/null
+ *   - 保留 ExplorationTracker 的 phase/grace 语义（tick / shouldExit / forceTerminal 由本类触发）
  *
- * @module core/ExitController
+ * @module agent/runtime/ExitController
  */
 
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
@@ -49,7 +54,10 @@ export interface ExitSignal {
 
 export interface ExitControllerConfig {
   tracker?: ExplorationTracker | null;
-  /** Effective timeout = min(stage budget, policy timeout) */
+  /**
+   * 阶段超时：工厂只传入 ctx.budget.timeoutMs，0 表示不启用。
+   * 策略级超时（BudgetPolicy.timeoutMs）不在这里合并，而是经 validateDuring 在 P5 分支判定。
+   */
   effectiveTimeoutMs: number;
   abortSignal?: AbortSignal | null;
   /** Policy validateDuring callback */
@@ -106,7 +114,7 @@ export class ExitController {
     ctx: LoopContext,
     runtimeTokenUsage: { input: number; output: number }
   ): ExitSignal {
-    // P0: abort signal — highest priority
+    // P1: abort signal — 最高优先级，早于一切预算判定
     if (this.#abortSignal?.aborted) {
       return {
         action: 'exit',
@@ -116,7 +124,7 @@ export class ExitController {
       };
     }
 
-    // P2: stage budget timeout (unified — eliminates triple timeout)
+    // P2: 阶段超时（effectiveTimeoutMs<=0 表示不启用）；先于 tracker.tick，超时轮不计入 tracker 轮次
     const elapsed = Date.now() - this.#loopStartTime;
     if (this.#effectiveTimeoutMs > 0 && elapsed > this.#effectiveTimeoutMs) {
       return {
@@ -127,7 +135,7 @@ export class ExitController {
       };
     }
 
-    // P1: tracker exit (manages its own iteration/grace logic)
+    // P3: tracker exit（tracker 自管 iteration/grace 逻辑）
     if (this.#tracker) {
       this.#tracker.tick();
       if (this.#tracker.shouldExit()) {
@@ -140,7 +148,7 @@ export class ExitController {
       }
     }
 
-    // 无 tracker 时也必须执行本 loop 的上限；工具选择违规和重试路径未必经过 post-tool gate。
+    // P4: 无 tracker 时也必须执行本 loop 的上限；工具选择违规和重试路径未必经过 post-tool gate。
     if (!this.#tracker && ctx.iteration > this.#maxIterations) {
       return {
         action: 'exit',
@@ -150,7 +158,7 @@ export class ExitController {
       };
     }
 
-    // P3: policy validation (with token budget)
+    // P5: policy validation（含 token 预算；token 超限首次只给一轮 grace，见下方）
     const duringCheck = this.#validateDuring({
       // Policy 接收已完成的轮数；当前轮在调用前已加一，不能用它提前消耗第一轮预算。
       iteration: this.#skipPolicyIterCheck ? 0 : Math.max(0, ctx.iteration - 1),
@@ -202,9 +210,8 @@ export class ExitController {
       // SUMMARIZE grace
       const isTerminal = this.#tracker?.phase === 'SUMMARIZE';
       if (isTerminal && this.#tracker) {
-        const phaseRounds =
-          (this.#tracker as unknown as { metrics?: { phaseRounds?: number } }).metrics
-            ?.phaseRounds ?? 0;
+        // ExplorationTracker 公开 getter metrics 已含 phaseRounds；直接读取让字段改名在编译期暴露。
+        const phaseRounds = this.#tracker.metrics.phaseRounds;
         if (phaseRounds < 2) {
           return {
             action: 'retry',

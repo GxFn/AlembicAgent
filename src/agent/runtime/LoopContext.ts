@@ -2,14 +2,17 @@
  * LoopContext — reactLoop 单次执行的完整状态
  *
  * 封装原 reactLoop 内散落的 10+ 局部变量:
- *   - 注入依赖 (messages, tracker, trace, memoryCoordinator, sharedState)
- *   - 循环状态 (iteration, lastReply, toolCalls, tokenUsage)
+ *   - 注入依赖 (messages, tracker, trace, memoryCoordinator, sharedState；sharedState 会被工具管线
+ *     用 ??= 惰性创建并写入)
+ *   - 循环状态 (iteration, lastReply, toolCalls, tokenUsage；toolCalls/tokenUsage 是本次 loop 的累计值)
  *   - 错误恢复 (consecutiveAiErrors, consecutiveEmptyResponses)
- *   - 配置 (source, budget, capabilities, baseSystemPrompt, toolSchemas, prompt)
+ *   - 构造期配置 (source, budget, capabilities, baseSystemPrompt, toolSchemas, prompt 等)
+ *   - 构造后由 AgentRuntime.#initLoop 挂接的控制器 (exitController, budgetController)
  *
+ * 字段都是公开可写的（没有 readonly，以免改变公开 d.ts）；上面的分组描述的是实际写入方，不是类型约束。
  * 使 reactLoop 的提取方法只需接收一个 ctx 参数。
  *
- * @module core/LoopContext
+ * @module agent/runtime/LoopContext
  */
 
 import { randomUUID } from 'node:crypto';
@@ -119,7 +122,10 @@ export class LoopContext {
   /** MemoryCoordinator 实例 */
   memoryCoordinator: MemoryCoordinator | null;
 
-  /** 共享状态 */
+  /**
+   * 阶段间 / 宿主注入的共享状态。不是只读：工具管线（submissionLedger、duplicateCache）会用 ??=
+   * 惰性创建这个对象并写入 _producerSubmitLedger / _toolEfficiencyCache 等隐式键。
+   */
   sharedState: SharedState | null;
 
   // ─── 循环状态 ───
@@ -130,11 +136,11 @@ export class LoopContext {
   /** 最终回复文本 */
   lastReply = '';
 
-  /** 本轮工具调用记录 */
+  /** 本次 loop 累计的工具调用记录（逐轮追加，buildResult 原样返回；不在迭代间重置） */
   // biome-ignore lint/suspicious/noExplicitAny: tool call entries have varying shapes across callers; no common structural type satisfies all consumers.
   toolCalls: any[] = [];
 
-  /** 本轮 token 用量 */
+  /** 本次 loop 累计 token 用量（addTokenUsage 逐轮累加，buildResult 原样返回） */
   tokenUsage = { input: 0, output: 0, reasoning: 0, cacheHit: 0 };
 
   /** 循环开始时间戳 */
@@ -148,7 +154,8 @@ export class LoopContext {
   /** 连续空响应计数 */
   consecutiveEmptyResponses = 0;
 
-  // ─── 配置 (只读) ───
+  // ─── 构造期配置 ───
+  // 由 LoopContextConfig 注入；AgentRuntime 构造 ctx 后不再改写这些字段（字段本身仍是公开可写的）。
 
   /** 来源 'user' | 'system' */
   source: string;
@@ -198,11 +205,17 @@ export class LoopContext {
   /** 统一诊断收集器 */
   diagnostics: DiagnosticsCollector | null;
 
-  /** ExitController — 统一退出决策 */
+  // ─── 构造后由 AgentRuntime 挂接的控制器 ───
+  // createExitController 需要已构造好的 ctx（tracker/budget/abortSignal），BudgetController 需要
+  // 运行时累计用量，所以二者都在 AgentRuntime.#initLoop 里于 new LoopContext 之后赋值。
+
+  /** ExitController — 统一退出决策；构造后由 AgentRuntime.#initLoop 通过 createExitController 挂接 */
   exitController: ExitController | null;
 
-  /** BudgetController — 预算决策 + 压缩触发 + 遥测 */
+  /** BudgetController — 预算决策 + 压缩触发 + 遥测；构造后由 AgentRuntime.#initLoop 挂接 */
   budgetController: BudgetController | null = null;
+
+  // ─── 证据面 ───
 
   /** PCVM N9 node-local evidence — 供宿主 trace/artifact/metrics 承接 */
   pcvNodeEvidence: PcvNodeEvidenceSummary;

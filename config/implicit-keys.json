@@ -130,7 +130,7 @@
     "_strictAnalysisLoopReceipt": {
       "container": "phaseResults",
       "writers": ["agent"],
-      "purpose": "严格链分析迭代的回执链；PipelineStrategy 追加并校验连续性。"
+      "purpose": "严格链分析迭代的回执链；PipelineStrategy 只追加每次 gate 的 typed transition 回执，不校验跨 gate 连续性。单条 transition 的一致性由 validateStrictAnalysisEpochTransitionV1 保证，跨 gate 的 epoch 连续性依赖宿主端口。"
     },
     "_strictAnalysisRetryCount": {
       "container": "phaseResults",

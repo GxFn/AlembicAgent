@@ -1,18 +1,36 @@
 /**
  * PipelineStrategy — 顺序多阶段执行策略
  *
- * 从 strategies.js 提取的独立模块。
- * 每个阶段可以有不同的 Capability 和 Budget，
- * 阶段间可插入质量门控 (Quality Gate)。
- *
+ * 每个阶段可以有不同的 Capability 和 Budget，阶段间可插入质量门控 (Quality Gate)。
  * 等价于 Anthropic 的 "Prompt Chaining" + "Evaluator-Optimizer"。
  *
- * 增强特性 (v3):
- *   - Gate 支持自定义 evaluator 函数 (三态: pass/retry/degrade)
- *   - Gate retry: 失败时回退重新执行前一阶段
- *   - Stage 支持 promptBuilder(context), systemPrompt, onToolCall
- *   - Per-stage 硬超时保护
- *   - 阶段隔离 (ContextWindow/ExplorationTracker 状态)
+ * 门动作表（#processGate；evaluator 返回 action，缺省由 pass 布尔推导为 pass/analysis_retry，
+ * action='pass' 却 pass=false 归一为 reject；无 evaluator 时走阈值评估，只产生 pass/analysis_retry）：
+ *   - pass                    → 'continue'，进入下一阶段（非终态）
+ *   - analysis_retry / retry  → 回退到前一执行阶段重跑（非终态）；次数上限 gate.maxRetries；
+ *                               会话输入预算压制时转 degraded_budget_exhausted（终态）；次数耗尽记
+ *                               retryExhausted + abandonInfo(retry_exhausted)，再按 skipOnFail 决定是否继续
+ *   - record_repair           → 跑记录补写微阶段后重评（非终态）；上限 gate.maxRecordRepairRetries；
+ *                               仍不通过转 degraded_no_findings（终态）
+ *   - summary_rewrite         → 跑零工具重写微阶段后重评（非终态）；上限 gate.maxSummaryRewriteRetries；
+ *                               重写后仍判 summary_rewrite 或产出为空则转 analysis_retry 路径
+ *   - degrade                 → ctx.degraded=true 并 'break'（终态；内部合成的 degraded_* 同为终态）
+ *   - reject 及其他非通过动作 → 记 abandonInfo，再按 skipOnFail 决定是否继续
+ *   - aborted                 → evaluator 被父信号取消，'break'
+ *   skipOnFail：缺省/true 时非通过门直接 'break'；显式 false 时 'continue' 执行后续阶段。
+ *   它只影响执行是否继续，不改变 outcome 里的非通过事实。
+ *
+ * 严格链（strategyContext 携带 strict production 上下文）：第一个非通过门 fail-closed——写 typed
+ * gate return、置 strictFailed 并 'break'，legacy repair/degrade/skipOnFail 均不接管；只有
+ * strictGate.retryMode='strict-analysis-epoch' 的 analysis_retry 允许回退到 strict-analyst 阶段，
+ * 每次 transition 追加到 phaseResults._strictAnalysisLoopReceipt（只追加，不校验跨 gate 连续性）。
+ *
+ * 结局投影：execute 末尾把 aborted / failed(strictFailed 或阶段超时) / abandoned(degrade 族、
+ * retry_exhausted、其他非通过) / completed 连同 abandonInfo 写入 phaseResults._pipelineOutcome，
+ * 供父 run 聚合 abandonedModules。修复微阶段的结果也写入 phaseResults，不能据插入顺序猜最后主阶段。
+ *
+ * 其他特性：Stage 支持 promptBuilder(context)、systemPrompt、onToolCall；per-stage 硬超时；
+ * 阶段隔离 (ContextWindow/ExplorationTracker 状态)。
  *
  * @module PipelineStrategy
  */
@@ -431,7 +449,7 @@ export class PipelineStrategy extends Strategy {
   /**
    * 处理 Quality Gate 阶段
    *
-   * @returns break/continue 或 retry 回退索引 (i-1)
+   * @returns 'break' | 'continue' | 目标阶段索引 - 1（调用方 for 循环 i++ 后落到目标阶段）
    */
   async #processGate(
     runtime: PipelineRuntime,
