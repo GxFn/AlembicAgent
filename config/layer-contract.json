@@ -109,6 +109,7 @@
         "@ai-sdk/deepseek",
         "@alembic/core/logging",
         "src/ai/deepseekToolCallCompat.ts",
+        "src/ai/registry/ModelQuirks.ts",
         "src/ai/toolTranscript.ts",
         "src/ai/transport/LLMTransport.ts",
         "src/ai/transport/sdkErrors.ts",

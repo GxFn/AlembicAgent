@@ -1,4 +1,6 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resolveModelQuirks } from '../src/ai/registry/ModelQuirks.js';
 import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
@@ -391,6 +393,80 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     expect(capture.body?.thinking).toEqual({ type: 'enabled' });
     expect(capture.body?.tool_choice).toBeUndefined();
     expect(capture.body?.tools).toHaveLength(1);
+  });
+
+  it('applies the V4 request policy exactly when ModelQuirks judges the model V4 (registered and unregistered names)', async () => {
+    const models = [
+      'deepseek-v4-flash',
+      'deepseek-v4-pro',
+      'deepseek-chat',
+      'deepseek-reasoner',
+      'deepseek-pro-0901',
+      'deepseek-flash',
+      'deepseek-coder',
+    ];
+    for (const model of models) {
+      const capture: { body?: Record<string, unknown> } = {};
+      mockDeepSeekFetch(capture);
+      await new DeepSeekTransport({ apiKey: 'test-key' }).chatWithTools({
+        model,
+        messages: [{ role: 'user', content: 'read code' }],
+        tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+        toolChoice: 'required',
+        temperature: 0.3,
+        maxTokens: 1024,
+      });
+      const transportV4 = capture.body?.thinking !== undefined;
+      // PCV 证据按 ModelQuirks 记录 tool_choice 形态；它必须与 transport 实际发出的请求一致。
+      expect(transportV4, model).toBe(resolveModelQuirks(model).analyzeGroundingGuardEligible);
+      if (model === 'deepseek-reasoner') {
+        // reasoner 不是 V4 家族；它的 thinking 默认值与参数裁剪由 SDK 按模型名自行处理，不在本仓断言。
+        continue;
+      }
+      expect(capture.body?.tool_choice === undefined, model).toBe(transportV4);
+      expect(capture.body?.temperature === undefined, model).toBe(transportV4);
+    }
+  });
+
+  it('records a debug diagnostic when the V4 policy drops tool_choice and temperature', async () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => {});
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    await new DeepSeekTransport({ apiKey: 'test-key' }).chatWithTools({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read code' }],
+      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      toolChoice: 'required',
+      temperature: 0.3,
+      maxTokens: 1024,
+    });
+    const lines = debug.mock.calls.map((call) => String(call[0]));
+    const policy = lines.find((line) => line.includes('v4_param_policy'));
+    expect(policy).toBeDefined();
+    expect(policy).toContain('source=registry');
+    expect(policy).toContain('dropped=toolChoice,temperature');
+    // 只记录参数名，不记录 tool_choice 原值或消息正文。
+    expect(policy).not.toContain('required');
+    expect(policy).not.toContain('read code');
+    debug.mockRestore();
+  });
+
+  it('marks the name-regex fallback for unregistered V4-looking DeepSeek models', async () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => {});
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    await new DeepSeekTransport({ apiKey: 'test-key' }).chatWithTools({
+      model: 'deepseek-pro-0901',
+      messages: [{ role: 'user', content: 'plain question' }],
+      maxTokens: 1024,
+    });
+    const policy = debug.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('v4_param_policy'));
+    expect(policy).toContain('source=name-fallback');
+    expect(policy).toContain('dropped=none');
+    expect(capture.body?.thinking).toEqual({ type: 'disabled' });
+    debug.mockRestore();
   });
 
   it('keeps reasoning_content for every complete V4 assistant tool-call round', async () => {

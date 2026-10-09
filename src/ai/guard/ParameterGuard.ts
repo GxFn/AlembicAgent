@@ -2,9 +2,12 @@
  * ParameterGuard — 参数约束执行器
  *
  * 在 API 调用之前，根据 ModelDef.parameterConstraints 自动过滤/修正参数。
- * 替代各 Provider 中分散的 if 判断:
- *   - ClaudeProvider: if (isOpus47) 不传 temperature
- *   - DeepSeekProvider: if (v4Thinking) 不传 tool_choice
+ * 只执行注册表上的静态声明(例如 Claude Opus 4.7 不允许 temperature、DeepSeek V4 不允许 tool_choice)。
+ *
+ * 不覆盖的部分：DeepSeekTransport 仍按请求持有 thinking 相关调整——有工具时开启 thinking、
+ * 丢弃 temperature、抬高 maxTokens 下限，并再次确保 V4 不发 tool_choice；这些按请求变化的调整
+ * 不进入本类的 filtered 审计，而由 transport 的 v4_param_policy 诊断日志记录。
+ * V4 家族身份由 registry/ModelQuirks 的 resolveDeepSeekV4Family 单源判定。
  */
 
 import type { ModelDef, ParameterConstraints } from '../registry/ModelDefs.js';

@@ -1,4 +1,5 @@
 import type { FunctionCallResult } from './contracts.js';
+import { TEXT_COMPAT_CALL_ID_PREFIX } from './registry/ModelQuirks.js';
 
 const INVOKE_RE = /<invoke\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/invoke>/gi;
 const PARAM_RE = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
@@ -80,7 +81,8 @@ export function parseDeepSeekTextToolCalls(
       }
 
       calls.push({
-        id: `call_deepseek_compat_${calls.length + 1}`,
+        // 前缀与 AgentRuntime 的来源判定(isTextCompatToolCallId)同源，兼容转译不会被当成原生 tool_calls。
+        id: `${TEXT_COMPAT_CALL_ID_PREFIX}${calls.length + 1}`,
         name,
         args: parseParams(match[2] || ''),
       });

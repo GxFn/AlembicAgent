@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { buildAnalystPrompt } from '../src/agent/prompts/index.js';
 import type { UnifiedMessage } from '../src/ai/contracts.js';
+import { parseDeepSeekTextToolCalls } from '../src/ai/deepseekToolCallCompat.js';
+import { isTextCompatToolCallId } from '../src/ai/registry/ModelQuirks.js';
 import { normalizeToolTranscriptForChatCompletions } from '../src/ai/toolTranscript.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import {
@@ -51,6 +53,18 @@ const codeTool = {
 };
 
 describe('DeepSeek text tool declaration boundary', () => {
+  it('emits call ids that AgentRuntime recognises as text-compat (shared prefix constant)', () => {
+    const calls = parseDeepSeekTextToolCalls(
+      `<function_calls>${codeInvoke}${codeInvoke}</function_calls>`,
+      ['code']
+    );
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(isTextCompatToolCallId(call.id), call.id).toBe(true);
+    }
+    expect(new Set(calls.map((call) => call.id)).size).toBe(2);
+  });
+
   it.each([
     { name: 'invoke before declaration', text: `${codeInvoke}\n<function_calls></function_calls>` },
     { name: 'invoke after declaration', text: `<function_calls></function_calls>\n${codeInvoke}` },

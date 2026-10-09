@@ -1,9 +1,15 @@
-/** DeepSeek wire 协议交给 SDK；V4 策略与文本工具兼容仍由本仓显式管理。 */
+/**
+ * DeepSeek wire 协议交给 SDK；V4 策略与文本工具兼容仍由本仓显式管理。
+ * V4 家族身份统一读 registry/ModelQuirks 的 resolveDeepSeekV4Family(注册表优先、共享名字正则回退)，
+ * 本文件不再自带模型名正则。按请求的 thinking 调整(toolChoice/temperature 丢弃、maxTokens 下限、
+ * thinking 开关)仍由本 transport 持有，ParameterGuard 的静态约束不覆盖这部分。
+ */
 import { createDeepSeek, type DeepSeekProvider as DeepSeekSdkProvider } from '@ai-sdk/deepseek';
 import type { LanguageModelV4GenerateResult } from '@ai-sdk/provider';
 import Logger from '@alembic/core/logging';
 import type { LlmCallOptions, UnifiedMessage } from '../contracts.js';
 import { parseDeepSeekTextToolCalls } from '../deepseekToolCallCompat.js';
+import { resolveDeepSeekV4Family } from '../registry/ModelQuirks.js';
 import { normalizeToolTranscriptForChatCompletions } from '../toolTranscript.js';
 import {
   LLMTransport,
@@ -14,8 +20,6 @@ import {
 import { type SdkCallContext, sdkConnection } from './sdkContext.js';
 import { normalizeSdkError } from './sdkErrors.js';
 import { isRecord, sdkCallOptions, sdkResponse } from './sdkProtocol.js';
-
-const V4_PATTERN = /deepseek-(?:v4|flash|pro)/i;
 
 export class DeepSeekTransport extends LLMTransport {
   readonly #client: DeepSeekSdkProvider;
@@ -40,7 +44,8 @@ export class DeepSeekTransport extends LLMTransport {
 
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {
     this.requireApiKey('DeepSeek');
-    const isV4 = V4_PATTERN.test(request.model);
+    const v4Family = resolveDeepSeekV4Family(request.model);
+    const isV4 = v4Family.isV4;
     const hasTools = Boolean(request.tools?.length) && request.toolChoice !== 'none';
     const normalized = normalizeToolTranscriptForChatCompletions(
       request.messages.map((message) => ({ ...message }))
@@ -61,13 +66,27 @@ export class DeepSeekTransport extends LLMTransport {
         `[DeepSeekTransport] compat_reasoning_budget requested=${request.maxTokens ?? 0} effective=${maxTokens} effort=${effort}`
       );
     }
+    // V4 拒绝强制 tool_choice；thinking 开启(有工具)时 temperature 无效，一并不发。
+    const dropToolChoice = isV4 && request.toolChoice !== undefined;
+    const dropTemperature = isV4 && hasTools && request.temperature !== undefined;
+    if (isV4 || v4Family.source === 'name-fallback') {
+      // 诊断只记录判定来源与被丢弃的参数名，不记录参数原值或消息内容；
+      // source=name-fallback 表示模型未登记、按共享名字正则判定，供核对注册表是否需要补登记。
+      const dropped =
+        [dropToolChoice ? 'toolChoice' : '', dropTemperature ? 'temperature' : '']
+          .filter(Boolean)
+          .join(',') || 'none';
+      Logger.getInstance().debug(
+        `[DeepSeekTransport] v4_param_policy model=${request.model} v4=${isV4} source=${v4Family.source} hasTools=${hasTools} dropped=${dropped}`
+      );
+    }
     const effective: TransportRequest = {
       ...request,
       messages,
       maxTokens,
       tools: hasTools ? request.tools : undefined,
-      toolChoice: isV4 ? undefined : request.toolChoice,
-      temperature: isV4 && hasTools ? undefined : request.temperature,
+      toolChoice: dropToolChoice ? undefined : request.toolChoice,
+      temperature: dropTemperature ? undefined : request.temperature,
     };
     const context: SdkCallContext = {
       provider: this.providerId,

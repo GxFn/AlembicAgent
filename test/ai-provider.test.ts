@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
-import { isTextCompatToolCallId, resolveModelQuirks } from '../src/ai/registry/ModelQuirks.js';
+import {
+  isDeepSeekV4Family,
+  isTextCompatToolCallId,
+  resolveModelQuirks,
+} from '../src/ai/registry/ModelQuirks.js';
 import { CLAUDE_MODELS } from '../src/ai/registry/models/claude.js';
 import { DEEPSEEK_MODELS } from '../src/ai/registry/models/deepseek.js';
 import { GOOGLE_MODELS } from '../src/ai/registry/models/google.js';
@@ -374,15 +378,14 @@ describe('resolveModelQuirks', () => {
     expect(q.analyzeGroundingGuardEligible).toBe(true);
     expect(q.dropToolSchemasWhenToolChoiceNone).toBe(true);
     expect(q.groundingPolicyProviderNote).toContain('DeepSeek V4');
-    expect(q.usesTextToolCallCompat).toBe(true);
   });
 
-  it('deepseek-chat(allowed=true)→ 全非特化(除文本兼容桥)', () => {
+  it('deepseek-chat(allowed=true)→ 全非特化', () => {
     const q = resolveModelQuirks('deepseek-chat');
     expect(q.forcedToolChoiceUnsupported).toBe(false);
     expect(q.analyzeGroundingGuardEligible).toBe(false);
+    expect(q.dropToolSchemasWhenToolChoiceNone).toBe(false);
     expect(q.groundingPolicyProviderNote).toBeNull();
-    expect(q.usesTextToolCallCompat).toBe(true);
   });
 
   it('deepseek-reasoner：按注册表声明 forced=true(旧 V4 正则漏掉的已声明修正),但 guard 不适格', () => {
@@ -405,12 +408,40 @@ describe('resolveModelQuirks', () => {
     expect(v4).toEqual(resolveModelQuirks('deepseek-v4-flash'));
     expect(v4.forcedToolChoiceUnsupported).toBe(true);
     expect(v4.analyzeGroundingGuardEligible).toBe(true);
-    expect(v4.usesTextToolCallCompat).toBe(true);
     const gemini = resolveModelQuirks('google:gemini-2.5-pro');
     expect(gemini).toEqual(resolveModelQuirks('gemini-2.5-pro'));
     expect(gemini.dropToolSchemasWhenToolChoiceNone).toBe(true);
     expect(gemini.forcedToolChoiceUnsupported).toBe(false);
-    expect(gemini.usesTextToolCallCompat).toBe(false);
+  });
+
+  it('档案不再携带无消费者的 usesTextToolCallCompat 旗标(兼容桥只由 DeepSeekTransport 决定)', () => {
+    for (const ref of ['deepseek-v4-flash', 'openai:deepseek-v4-flash', 'gemini-2.5-pro']) {
+      expect(Object.keys(resolveModelQuirks(ref))).not.toContain('usesTextToolCallCompat');
+    }
+  });
+
+  it('isDeepSeekV4Family：已登记模型读注册表声明，判定与改造前一致', () => {
+    expect(isDeepSeekV4Family('deepseek-v4-flash')).toBe(true);
+    expect(isDeepSeekV4Family('deepseek-v4-pro')).toBe(true);
+    expect(isDeepSeekV4Family('deepseek:deepseek-v4-pro')).toBe(true);
+    // deepseek-reasoner 虽声明 toolChoice.allowed=false，但不支持工具调用，不属于 V4 thinking+tools 家族。
+    expect(isDeepSeekV4Family('deepseek-reasoner')).toBe(false);
+    expect(isDeepSeekV4Family('deepseek-chat')).toBe(false);
+    expect(isDeepSeekV4Family('gpt-5.5-pro')).toBe(false);
+    expect(isDeepSeekV4Family('gemini-2.5-pro')).toBe(false);
+    expect(isDeepSeekV4Family(null)).toBe(false);
+  });
+
+  it('未登记的 deepseek-pro/flash 变体:ModelQuirks 与 transport 共用同一 V4 判定', () => {
+    for (const ref of ['deepseek-pro-0901', 'deepseek-flash', 'custom-deepseek-v4-build']) {
+      expect(isDeepSeekV4Family(ref), ref).toBe(true);
+      const q = resolveModelQuirks(ref);
+      expect(q.forcedToolChoiceUnsupported, ref).toBe(true);
+      expect(q.analyzeGroundingGuardEligible, ref).toBe(true);
+      expect(q.dropToolSchemasWhenToolChoiceNone, ref).toBe(true);
+    }
+    expect(isDeepSeekV4Family('deepseek-coder')).toBe(false);
+    expect(resolveModelQuirks('deepseek-coder').forcedToolChoiceUnsupported).toBe(false);
   });
 
   it('isTextCompatToolCallId 前缀判定', () => {
