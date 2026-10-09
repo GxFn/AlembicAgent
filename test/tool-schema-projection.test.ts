@@ -16,7 +16,11 @@ import type {
   ToolSchemaQuery,
   ToolSelection,
 } from '../src/tools/kernel/toolSchema.js';
-import { intersectToolActions, isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
+import {
+  intersectToolActions,
+  isToolActionAllowed,
+  normalizeToolActions,
+} from '../src/tools/kernel/toolSelection.js';
 import { getActionNames, RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 import { ToolRouter } from '../src/tools/runtime/router.js';
@@ -78,6 +82,74 @@ describe('tool schema selection', () => {
     expect(actionsOf(new RuntimeCapabilityCatalog().toToolSchemasForActions(selection))).toEqual(
       expected
     );
+  });
+
+  // 非法 selection 的直接断言：快照边界必须抛错，不能静默退化为“不限制”或空授权。
+  function invalidSelections(): Array<{ label: string; selection: unknown }> {
+    const sparse: string[] = ['code'];
+    // 稀疏数组的 hole 在 Array.from 后是 undefined，必须被视为非法成员而不是被 every 跳过。
+    sparse.length = 2;
+    return [
+      { label: 'non-string id', selection: ['code', 1] },
+      { label: 'string action value', selection: { code: 'all' } },
+      { label: 'sparse ids', selection: sparse },
+    ];
+  }
+
+  it.each(
+    invalidSelections()
+  )('rejects an invalid $label selection before invoking any schema port', ({ selection }) => {
+    const modern = { querySchemas: vi.fn(() => ({ schemas: [], allowedTools: {} })) };
+    const legacy = { toToolSchemas: vi.fn(() => []) };
+    const diagnostic = vi.fn();
+    for (const catalog of [modern, legacy]) {
+      expect(() =>
+        queryToolSchemas(catalog, { selection: selection as ToolSelection }, diagnostic)
+      ).toThrow('Invalid tool selection');
+    }
+    expect(modern.querySchemas).toHaveBeenCalledTimes(0);
+    expect(legacy.toToolSchemas).toHaveBeenCalledTimes(0);
+    expect(diagnostic).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    invalidSelections()
+  )('rejects an invalid $label selection in the runtime catalog query and projections', ({
+    selection,
+  }) => {
+    const availability = vi.fn(() => undefined);
+    const catalog = new RuntimeCapabilityCatalog({ availability });
+    expect(() => catalog.querySchemas({ selection: selection as ToolSelection })).toThrow(
+      'Invalid tool selection'
+    );
+    expect(() => catalog.toToolSchemas(selection as ToolSelection)).toThrow(
+      'Invalid tool selection'
+    );
+  });
+
+  it.each<{ label: string; left: unknown; right: unknown }>([
+    { label: 'string right actions', left: { code: ['read'] }, right: { code: 'read' } },
+    { label: 'array right', left: { code: ['read'] }, right: ['code'] },
+    { label: 'null right', left: { code: ['read'] }, right: null },
+    { label: 'non-string right action', left: { code: ['read'] }, right: { code: ['read', 1] } },
+    { label: 'string left actions', left: { code: 'read' }, right: { code: ['read'] } },
+  ])('rejects an invalid allowlist when intersecting: $label', ({ left, right }) => {
+    expect(() => intersectToolActions(left as never, right as never)).toThrow(
+      'Invalid tool action allowlist'
+    );
+  });
+
+  it('never emits normalized entries for tools whose registered or selected actions are empty', () => {
+    const available = { code: ['read', 'write'], empty: [] as string[] };
+    for (const selection of [undefined, null, ['code', 'empty'], { code: null, empty: null }]) {
+      const result = normalizeToolActions(selection, available);
+      expect(Object.keys(result)).toEqual(['code']);
+      expect(result.code).toEqual(['read', 'write']);
+      expect(Object.hasOwn(result, 'empty')).toBe(false);
+      expect(Object.isFrozen(result)).toBe(true);
+    }
+    expect(normalizeToolActions({ code: [], empty: ['read'] }, available)).toEqual({});
+    expect(normalizeToolActions({ code: ['missing'] }, available)).toEqual({});
   });
 
   it('ignores inherited object names when selecting registered tools', () => {
