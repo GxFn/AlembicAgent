@@ -964,6 +964,8 @@ describe('production independent reviewers', () => {
     expect(prompt).toContain('usageGuide');
     expect(prompt).toContain('negativeIntent');
     expect(prompt).toContain('src/handler.ts:1-3');
+    // P21：提示词写明轴 verdict/score 配对规则，parseReview 对不配对的轴整份拒绝。
+    expect(prompt).toContain('pass=2, narrow=1, fail=0');
 
     const reviewer = new IndependentValueReviewer({
       identity: { provider: 'frozen', model: 'reviewer-v1', method: 'independent-value-v1' },
