@@ -9,9 +9,11 @@
  *      ToolExecutionPipeline 每次调用现造的一次性投影(门0 真跑实测假零的根因)；
  *   3) fan-out merger 把 abandoned child 聚合为父结果 phases.abandonedModules(一等字段)。
  */
-import { describe, expect, it, vi } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runModuleMining } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
 import type {
   AgentRuntimeBuildOptions,
   AgentRuntimeLike,
@@ -416,5 +418,262 @@ describe('PipelineStrategy — retry 耗尽的一等结局(F2)', () => {
       action: 'retry_exhausted',
       reason: 'score below threshold',
     });
+  });
+});
+
+// ─── I35(L5-P32)：门耗尽、未知动作终止下游、评估器异常的可定位诊断 ───
+// 背景：#processGate 的重试耗尽分支与非通过兜底分支此前只写 ctx.retryExhausted/abandonInfo
+// 后 'break'，没有日志、diagnostics.warn 或事件；评估器抛错/返回非对象时直接 throw，
+// 不带门名与源阶段。宿主只读 diagnostics/phases 时看不到"为什么 analyze/produce 没跑"。
+// 本组测试锁定三类 warn 诊断 + warn 日志，同时钉住 gateFailures 语义不变(不复用
+// recordGateFailure，宿主与 l4MemoryPackage 都读它的条数)。
+describe('PipelineStrategy — 门耗尽 / 未知动作 / 评估异常的诊断(I35)', () => {
+  type Warning = { code: string; stage?: string; message: string };
+
+  function warningsOf(diagnostics: { warnings?: unknown[] } | undefined): Warning[] {
+    return (diagnostics?.warnings ?? []) as Warning[];
+  }
+
+  function spyWarnLog() {
+    return vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('进化门 8 次重试后仍有待决 → warnings 含 pipeline_gate_retry_exhausted(stage、次数)，gateFailures 语义不变', async () => {
+    const warnLog = spyWarnLog();
+    const { runtime, calls } = createFakeRuntime(['no decisions submitted']);
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'evolve' },
+        {
+          name: 'evolution_gate',
+          gate: {
+            // 模拟 evolutionGateEvaluator：仍有未决 Recipe 时一直返回 'retry'。
+            evaluator: () => ({ action: 'retry', pass: false, reason: 'pending recipes remain' }),
+            maxRetries: 8,
+          },
+        },
+        { name: 'analyze' },
+        { name: 'produce' },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'evolve' }));
+
+    // 既有语义不动：1 次首跑 + 8 次重试 = 9 次 evolve；下游 analyze/produce 被跳过。
+    expect(calls).toHaveLength(9);
+    expect(result.phases.analyze).toBeUndefined();
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.outcome).toBe('abandoned');
+    expect(result.degraded).toBe(false);
+    expect(pipelineOutcome(result)).toMatchObject({
+      stage: 'evolution_gate',
+      action: 'retry_exhausted',
+    });
+    // gateFailures 仍是 9 条原始 'retry'：不新增 retry_exhausted 条目(宿主读取面不变)。
+    expect(result.diagnostics.gateFailures).toHaveLength(9);
+    expect(result.diagnostics.gateFailures.every((g) => g.action === 'retry')).toBe(true);
+
+    // 新增：耗尽事实进入 warnings，并带阶段、次数、上限与是否跳过下游。
+    const exhausted = warningsOf(result.diagnostics).filter(
+      (w) => w.code === 'pipeline_gate_retry_exhausted'
+    );
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0].stage).toBe('evolution_gate');
+    expect(exhausted[0].message).toContain('attempts=9');
+    expect(exhausted[0].message).toContain('maxRetries=8');
+    expect(exhausted[0].message).toMatch(/downstream[^;]*skipped/);
+    expect(exhausted[0].message).toContain('pending recipes remain');
+    // warn 日志同样可定位(含门名与耗尽字样)。
+    expect(
+      warnLog.mock.calls.some(
+        (c) => /retry.*exhausted/i.test(String(c[0])) && String(c[0]).includes('evolution_gate')
+      )
+    ).toBe(true);
+  });
+
+  it('retry 耗尽但 skipOnFail=false → 仍写 pipeline_gate_retry_exhausted，message 说明下游继续执行', async () => {
+    spyWarnLog();
+    const { runtime, calls } = createFakeRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: {
+            evaluator: () => ({ action: 'analysis_retry', pass: false, reason: 'weak' }),
+            maxRetries: 1,
+          },
+          skipOnFail: false,
+        },
+        { name: 'produce' },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    // analyze ×2(首跑+1 次重试) + produce ×1：显式 skipOnFail=false 时下游继续。
+    expect(calls).toHaveLength(3);
+    expect(result.phases.produce).toBeDefined();
+    expect(result.outcome).toBe('abandoned');
+    const exhausted = warningsOf(result.diagnostics).filter(
+      (w) => w.code === 'pipeline_gate_retry_exhausted'
+    );
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0].stage).toBe('quality_gate');
+    expect(exhausted[0].message).toContain('attempts=2');
+    expect(exhausted[0].message).toContain('maxRetries=1');
+    expect(exhausted[0].message).toMatch(/downstream[^;]*continue/);
+    expect(exhausted[0].message).toContain('skipOnFail=false');
+  });
+
+  it('自定义门返回拼错动作 "analysis-retry" → 下游被终止且 warnings 含 pipeline_gate_non_pass_terminated', async () => {
+    const warnLog = spyWarnLog();
+    const { runtime, calls } = createFakeRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'g',
+          gate: {
+            evaluator: () => ({ action: 'analysis-retry', pass: false, reason: 'typo' }),
+          },
+        },
+        { name: 'produce' },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'x' }));
+
+    // 既有语义不动：原始动作连同 reason 仍只在 gateFailures 里记 1 条，produce 被跳过。
+    expect(calls).toHaveLength(1);
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.diagnostics.gateFailures).toEqual([
+      { stage: 'g', action: 'analysis-retry', reason: 'typo' },
+    ]);
+    expect(pipelineOutcome(result)).toMatchObject({
+      outcome: 'abandoned',
+      stage: 'g',
+      action: 'analysis-retry',
+    });
+
+    // 新增：「已终止下游」这一事实进入 warnings 并打 warn 日志。
+    const terminated = warningsOf(result.diagnostics).filter(
+      (w) => w.code === 'pipeline_gate_non_pass_terminated'
+    );
+    expect(terminated).toHaveLength(1);
+    expect(terminated[0].stage).toBe('g');
+    expect(terminated[0].message).toContain('"analysis-retry"');
+    expect(terminated[0].message).toMatch(/downstream[^;]*skipped/);
+    expect(terminated[0].message).toContain('typo');
+    expect(
+      warnLog.mock.calls.some(
+        (c) => String(c[0]).includes('"analysis-retry"') && String(c[0]).includes('"g"')
+      )
+    ).toBe(true);
+  });
+
+  it('非通过动作但 skipOnFail=false → warnings 仍含 pipeline_gate_non_pass_terminated，message 说明下游继续', async () => {
+    spyWarnLog();
+    const { runtime, calls } = createFakeRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'rejection_gate',
+          gate: { evaluator: () => ({ action: 'reject', pass: false, reason: 'rejected' }) },
+          skipOnFail: false,
+        },
+        { name: 'cleanup' },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'x' }));
+
+    expect(calls).toHaveLength(2);
+    expect(result.phases.cleanup).toBeDefined();
+    const terminated = warningsOf(result.diagnostics).filter(
+      (w) => w.code === 'pipeline_gate_non_pass_terminated'
+    );
+    expect(terminated).toHaveLength(1);
+    expect(terminated[0].stage).toBe('rejection_gate');
+    expect(terminated[0].message).toContain('"reject"');
+    expect(terminated[0].message).toMatch(/downstream[^;]*continue/);
+    expect(terminated[0].message).toContain('skipOnFail=false');
+  });
+
+  it('评估器抛错 → 抛出前写 pipeline_gate_evaluation_failed(门名、源阶段)，原错误仍原样抛出', async () => {
+    const warnLog = spyWarnLog();
+    const { runtime } = createFakeRuntime();
+    const diagnostics = new DiagnosticsCollector();
+    const boom = new Error('deep review crashed');
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: {
+            evaluator: () => {
+              throw boom;
+            },
+          },
+        },
+        { name: 'produce' },
+      ],
+    });
+
+    // 错误仍然抛出(同一实例，宿主的 instanceof/name/message 归类不受影响)。
+    await expect(
+      strategy.execute(runtime, new AgentMessage({ content: 'x' }), { diagnostics })
+    ).rejects.toBe(boom);
+
+    // 共享的 collector 在抛出前已拿到门级诊断：门名 + 源阶段 + 原始错误信息。
+    const failed = warningsOf(diagnostics.toJSON()).filter(
+      (w) => w.code === 'pipeline_gate_evaluation_failed'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0].stage).toBe('quality_gate');
+    expect(failed[0].message).toContain('"analyze"');
+    expect(failed[0].message).toContain('deep review crashed');
+    // 不复用 recordGateFailure：gateFailures 不因评估异常新增条目。
+    expect(diagnostics.toJSON().gateFailures).toEqual([]);
+    expect(
+      warnLog.mock.calls.some(
+        (c) => String(c[0]).includes('"quality_gate"') && String(c[0]).includes('"analyze"')
+      )
+    ).toBe(true);
+  });
+
+  it('评估器返回非对象 → 同样写 pipeline_gate_evaluation_failed 并抛出 Error', async () => {
+    spyWarnLog();
+    const { runtime } = createFakeRuntime();
+    const diagnostics = new DiagnosticsCollector();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: {
+            // 故意返回 null：评估器契约要求对象，这里走"无决策"分支。
+            evaluator: () => null as unknown as { action: string; pass: boolean },
+          },
+        },
+      ],
+    });
+
+    await expect(
+      strategy.execute(runtime, new AgentMessage({ content: 'x' }), { diagnostics })
+    ).rejects.toThrow(/no decision/);
+
+    const failed = warningsOf(diagnostics.toJSON()).filter(
+      (w) => w.code === 'pipeline_gate_evaluation_failed'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0].stage).toBe('quality_gate');
+    expect(failed[0].message).toContain('"analyze"');
+    expect(failed[0].message).toMatch(/no decision/);
   });
 });

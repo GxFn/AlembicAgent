@@ -686,6 +686,23 @@ export class PipelineStrategy extends Strategy {
           reason: gateResult.reason || 'gate retries exhausted',
         };
       }
+      // I35：耗尽是短路路径，必须可定位。_pipelineOutcome 只在本仓被读取，宿主
+      // (AgentRunProjections)只看 diagnostics/phases，因此这里补 warn 诊断 + warn 日志。
+      // 不复用 recordGateFailure：它会改变 gateFailures 条数，而宿主与 l4MemoryPackage 都
+      // 按条读取该字段，耗尽前的每次 'retry' 已经在 #storeGateResult 里逐条记录。
+      // attempts<=maxRetries 却到达这里，唯一原因是门前没有可重跑的执行阶段(prevIdx<0)。
+      const attempts = phaseResults[retryKey] as number;
+      const retryTargetMissing = attempts <= maxRetries;
+      this.#warnGateTermination(
+        ctx,
+        stage,
+        'pipeline_gate_retry_exhausted',
+        `Gate action "${gateResult.action}" retries exhausted: attempts=${attempts}, maxRetries=${maxRetries}` +
+          (retryTargetMissing ? ', no previous execution stage to retry' : '') +
+          `; downstream stages ${this.#describeDownstream(stage)}; reason=${
+            gateResult.reason || 'gate retries exhausted'
+          }`
+      );
       if (stage.skipOnFail !== false) {
         return 'break';
       }
@@ -699,10 +716,51 @@ export class PipelineStrategy extends Strategy {
       action: gateResult.action,
       reason: gateResult.reason || 'Gate did not pass',
     };
+    // I35：兜底分支承接 reject 与一切未识别动作(例如拼错的 'analysis-retry')。原始动作已由
+    // #storeGateResult 记入 gateFailures 与 PROGRESS 事件，这里只补「非通过并按 skipOnFail
+    // 处置下游」这一事实；code 命名分支，message 说明下游实际是跳过还是继续。
+    this.#warnGateTermination(
+      ctx,
+      stage,
+      'pipeline_gate_non_pass_terminated',
+      `Gate returned non-pass action "${gateResult.action}" (not pass/retry/repair/degrade); ` +
+        `downstream stages ${this.#describeDownstream(stage)}; reason=${
+          gateResult.reason || 'Gate did not pass'
+        }`
+    );
     if (stage.skipOnFail !== false) {
       return 'break';
     }
     return 'continue';
+  }
+
+  /** skipOnFail 缺省/true 时非通过门 'break'；显式 false 才继续执行后续阶段。 */
+  #describeDownstream(stage: PipelineStage): string {
+    return stage.skipOnFail !== false
+      ? 'skipped (skipOnFail defaults to true)'
+      : 'continue (skipOnFail=false)';
+  }
+
+  /**
+   * I35：门的短路/终止/异常路径统一在此留痕——同一条信息既进 diagnostics.warnings
+   * (随 result.diagnostics 与 AgentRuntime 共享的 collector 到达宿主)，也进 warn 日志
+   * (运维定位)。只做加性观测，不触碰 gateFailures / degraded / abandonInfo 语义。
+   */
+  #warnGateTermination(
+    ctx: PipelineContext,
+    stage: PipelineStage,
+    code:
+      | 'pipeline_gate_retry_exhausted'
+      | 'pipeline_gate_non_pass_terminated'
+      | 'pipeline_gate_evaluation_failed',
+    message: string
+  ): void {
+    const stageName = stage.name || 'gate';
+    ctx.diagnostics.warn({ code, stage: stageName, message });
+    _pipelineLogger().warn(`[PipelineStrategy] ${code} at gate "${stageName}": ${message}`, {
+      code,
+      stage: stageName,
+    });
   }
 
   #getRetryBudgetSuppression(
@@ -765,13 +823,39 @@ export class PipelineStrategy extends Strategy {
         return { action: 'aborted', pass: false };
       }
       if (evaluation.status !== 'ok') {
+        // I35：评估器抛错后 execute 不会写 _pipelineOutcome，阶段级 pipeline_attempt_interrupted
+        // 也不覆盖门。抛出前先把门名 + 源阶段 + 原始错误写进共享 collector(AgentRuntime 把同一
+        // 实例传进来，DiagnosticsCollector.from 原样返回)，让宿主能区分是哪个门挂了。
+        // 原 Error 实例原样重抛——不包装，避免破坏宿主的 instanceof/name 归类。
+        const errorMessage =
+          evaluation.error instanceof Error ? evaluation.error.message : String(evaluation.error);
+        this.#warnGateTermination(
+          ctx,
+          stage,
+          'pipeline_gate_evaluation_failed',
+          `Gate evaluator threw (source stage "${sourceName}"): ${errorMessage}`
+        );
         throw evaluation.error instanceof Error
           ? evaluation.error
-          : new Error('Pipeline gate evaluation failed');
+          : new Error(
+              `Pipeline gate "${stage.name || 'gate'}" evaluation failed (source stage "${sourceName}"): ${errorMessage}`,
+              { cause: evaluation.error }
+            );
       }
       const evaluated = evaluation.value as GateEvalResult | null;
       if (!evaluated || typeof evaluated !== 'object') {
-        throw new Error('Pipeline gate returned no decision');
+        // 评估器契约要求返回对象；null/undefined/原始值一律视为无决策，与抛错同码留痕。
+        this.#warnGateTermination(
+          ctx,
+          stage,
+          'pipeline_gate_evaluation_failed',
+          `Gate evaluator returned no decision (source stage "${sourceName}"): got ${
+            evaluated === null ? 'null' : typeof evaluated
+          }`
+        );
+        throw new Error(
+          `Pipeline gate "${stage.name || 'gate'}" returned no decision (source stage "${sourceName}")`
+        );
       }
       if (evaluated.action === 'pass' && evaluated.pass === false) {
         return {
