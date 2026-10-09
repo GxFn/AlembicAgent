@@ -50,7 +50,7 @@ import {
 import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/insightGate.js';
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
-import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
+import { DiagnosticsCollector, isDegradeGateAction } from '../runtime/DiagnosticsCollector.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
 import { runStageAttempt, type StageAttemptScope } from './pipeline/attempt.js';
 import type { PipelineRuntime, StageResult } from './pipeline/contracts.js';
@@ -826,10 +826,9 @@ export class PipelineStrategy extends Strategy {
     // P0-4：degrade 类动作(degrade / degraded_no_findings / degraded_budget_exhausted)都是
     // 终态(存储后必然 ctx.degraded=true + break)，在此单点捕获首个即可覆盖全部 4 个降级点，
     // 不必在每个分支重复。只记首个：后续不会再有(终态)，防御性保留 first-wins 语义。
-    if (
-      !ctx.abandonInfo &&
-      (gateResult.action === 'degrade' || gateResult.action.startsWith('degraded_'))
-    ) {
+    // 谓词与 DiagnosticsCollector.recordGateFailure 共用，保证 abandonInfo 与 diagnostics.degraded
+    // 对同一动作集合做出一致判断。
+    if (!ctx.abandonInfo && isDegradeGateAction(gateResult.action)) {
       ctx.abandonInfo = {
         stage: stage.name || 'gate',
         action: gateResult.action,

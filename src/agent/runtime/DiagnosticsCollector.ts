@@ -47,6 +47,84 @@ function isDiagnostics(value: unknown): value is Partial<AgentDiagnostics> {
   return !!value && typeof value === 'object';
 }
 
+/**
+ * degrade 类门动作的单一谓词：`degrade` 与所有 `degraded_*`（degraded_no_findings、
+ * degraded_budget_exhausted 及后续新增）都是终态降级。DiagnosticsCollector.recordGateFailure
+ * 与 PipelineStrategy.#storeGateResult 共用它，避免两处集合漂移（此前 recordGateFailure
+ * 漏掉 degraded_budget_exhausted，只靠策略显式 markDegraded 兜底）。
+ */
+export function isDegradeGateAction(action: string): boolean {
+  return action === 'degrade' || action.startsWith('degraded_');
+}
+
+// ── merge 外部边界的形状守卫 ──
+// 公开入参 AgentRunExecutionOptions.diagnostics / ReactLoopOpts.diagnostics 类型都是 unknown，
+// 自定义策略回执也会经由 merge 进入；这里只校验运行时真正会解引用/展开的字段，
+// 合法的 AgentDiagnostics 快照（含 toJSON 产物）全部通过，不改变既有行为。
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isDiagnosticWarning(value: unknown): value is AgentDiagnosticWarning {
+  return isRecord(value) && typeof value.code === 'string' && typeof value.message === 'string';
+}
+
+function isStage(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isBlockedTool(value: unknown): value is { tool: string; reason: string } {
+  return isRecord(value) && typeof value.tool === 'string' && typeof value.reason === 'string';
+}
+
+function isGateFailure(
+  value: unknown
+): value is { stage: string; action: string; reason?: string } {
+  return (
+    isRecord(value) &&
+    typeof value.stage === 'string' &&
+    typeof value.action === 'string' &&
+    (value.reason === undefined || typeof value.reason === 'string')
+  );
+}
+
+function isToolCallDiagnostic(value: unknown): value is ToolCallDiagnostic {
+  // callId 是去重键，没有它条目既无法合并也无法回放；其余字段按快照原样透传。
+  return isRecord(value) && typeof value.callId === 'string';
+}
+
+function isStageToolsetDiagnostic(value: unknown): value is StageToolsetDiagnostic {
+  if (!isRecord(value) || typeof value.stage !== 'string') {
+    return false;
+  }
+  if (!isStringArray(value.capabilities) || !isStringArray(value.allowedToolIds)) {
+    return false;
+  }
+  if (value.allowedToolActions === undefined) {
+    return true;
+  }
+  // recordStageToolset 会对每个 action 列表做展开，值不是数组就会在复制时抛错。
+  return (
+    isRecord(value.allowedToolActions) &&
+    Object.values(value.allowedToolActions).every((actions) => Array.isArray(actions))
+  );
+}
+
+function describeReceived(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
 export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
   #diagnostics: AgentDiagnostics;
 
@@ -91,6 +169,39 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
       message: `Ignored ${field}: addition would overflow a finite diagnostic count; previous total retained`,
     });
     return current;
+  }
+
+  #warnInvalidEntry(field: string, expected: string, value: unknown) {
+    // 与 #readCount 同一原则：畸形诊断只降级为可见警告，不中断实际任务；
+    // 消息里带字段名与收到的类型，便于定位是哪一个外部调用方传了坏形状。
+    this.warn({
+      code: 'diagnostics_invalid_entry',
+      message: `Ignored ${field}: expected ${expected}, received ${describeReceived(value)}`,
+    });
+  }
+
+  #mergeArray<T>(
+    value: unknown,
+    field: string,
+    expected: string,
+    guard: (item: unknown) => item is T,
+    apply: (item: T) => void
+  ) {
+    // undefined 表示字段缺省（toJSON 会省略可选数组），静默跳过；其它非数组值一律告警。
+    if (value === undefined) {
+      return;
+    }
+    if (!Array.isArray(value)) {
+      this.#warnInvalidEntry(field, 'an array', value);
+      return;
+    }
+    value.forEach((item, index) => {
+      if (guard(item)) {
+        apply(item);
+      } else {
+        this.#warnInvalidEntry(`${field}[${index}]`, expected, item);
+      }
+    });
   }
 
   markDegraded() {
@@ -139,7 +250,7 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
 
   recordGateFailure(stage: string, action: string, reason?: string) {
     this.#diagnostics.gateFailures.push({ stage, action, ...(reason ? { reason } : {}) });
-    if (action === 'degrade' || action === 'degraded_no_findings') {
+    if (isDegradeGateAction(action)) {
       this.markDegraded();
     }
   }
@@ -275,15 +386,27 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     if (input.fallbackUsed) {
       this.markFallbackUsed();
     }
-    for (const warning of input.warnings || []) {
-      this.warn(warning);
-    }
-    for (const stage of input.timedOutStages || []) {
-      this.recordTimedOutStage(stage);
-    }
-    for (const blockedTool of input.blockedTools || []) {
-      this.recordBlockedTool(blockedTool.tool, blockedTool.reason);
-    }
+    this.#mergeArray(
+      input.warnings,
+      'warnings',
+      'a warning with string code/message',
+      isDiagnosticWarning,
+      (warning) => this.warn(warning)
+    );
+    this.#mergeArray(
+      input.timedOutStages,
+      'timedOutStages',
+      'a stage name string',
+      isStage,
+      (stage) => this.recordTimedOutStage(stage)
+    );
+    this.#mergeArray(
+      input.blockedTools,
+      'blockedTools',
+      'an entry with string tool/reason',
+      isBlockedTool,
+      (blockedTool) => this.recordBlockedTool(blockedTool.tool, blockedTool.reason)
+    );
     // 合并聚合计数只做一次加法，耗时不随策略提供的计数值增长。
     this.#diagnostics.truncatedToolCalls = this.#addCount(
       this.#diagnostics.truncatedToolCalls,
@@ -300,19 +423,36 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
       input.aiErrorCount,
       'aiErrorCount'
     );
-    for (const gateFailure of input.gateFailures || []) {
-      this.recordGateFailure(gateFailure.stage, gateFailure.action, gateFailure.reason);
-    }
-    for (const toolCall of input.toolCalls || []) {
-      const calls = (this.#diagnostics.toolCalls ??= []);
-      if (!calls.some((call) => call.callId === toolCall.callId)) {
-        calls.push({ ...toolCall });
+    this.#mergeArray(
+      input.gateFailures,
+      'gateFailures',
+      'an entry with string stage/action',
+      isGateFailure,
+      (gateFailure) =>
+        this.recordGateFailure(gateFailure.stage, gateFailure.action, gateFailure.reason)
+    );
+    this.#mergeArray(
+      input.toolCalls,
+      'toolCalls',
+      'an entry with string callId',
+      isToolCallDiagnostic,
+      (toolCall) => {
+        const calls = (this.#diagnostics.toolCalls ??= []);
+        if (!calls.some((call) => call.callId === toolCall.callId)) {
+          calls.push({ ...toolCall });
+        }
       }
-    }
-    for (const toolset of input.stageToolsets || []) {
-      this.recordStageToolset(toolset);
-    }
-    if (input.efficiency) {
+    );
+    this.#mergeArray(
+      input.stageToolsets,
+      'stageToolsets',
+      'an entry with string stage and string[] capabilities/allowedToolIds',
+      isStageToolsetDiagnostic,
+      (toolset) => this.recordStageToolset(toolset)
+    );
+    if (input.efficiency !== undefined && !isRecord(input.efficiency)) {
+      this.#warnInvalidEntry('efficiency', 'an object', input.efficiency);
+    } else if (input.efficiency) {
       const target = (this.#diagnostics.efficiency ??= emptyEfficiency());
       for (const field of [
         'toolCalls',
@@ -342,8 +482,14 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
         this.#readCount(input.efficiency.maxCompactionLevel, 'efficiency.maxCompactionLevel')
       );
       target.forcedSummary = target.forcedSummary || input.efficiency.forcedSummary === true;
-      if (input.efficiency.cancelReason) {
-        target.cancelReason = input.efficiency.cancelReason;
+      // cancelReason 会原样投影到结果与宿主报表，只接受字符串；空串沿用旧行为视为未取消。
+      const cancelReason: unknown = input.efficiency.cancelReason;
+      if (typeof cancelReason === 'string') {
+        if (cancelReason) {
+          target.cancelReason = cancelReason;
+        }
+      } else if (cancelReason !== undefined) {
+        this.#warnInvalidEntry('efficiency.cancelReason', 'a string', cancelReason);
       }
     }
   }

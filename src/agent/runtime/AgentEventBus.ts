@@ -155,11 +155,20 @@ export class AgentEventBus extends EventEmitter {
 
     return () => {
       const handlers = this.#subscriptions.get(type);
-      if (handlers) {
-        const idx = handlers.indexOf(handler);
-        if (idx >= 0) {
-          handlers.splice(idx, 1);
-        }
+      if (!handlers) {
+        return;
+      }
+      const idx = handlers.indexOf(handler);
+      if (idx < 0) {
+        // 取消函数重复调用或 topic 已被后来者重建：没有可删的 handler 就不能动 Map，
+        // 否则会误删别人刚订阅的 topic。
+        return;
+      }
+      handlers.splice(idx, 1);
+      // 最后一个 handler 退出后删掉空 topic；getStats().subscriptionTopics 取 Map.size，
+      // 只有这样它才表示"仍有活跃处理器的 topic 数"，动态 topic 的泄漏排查才不会虚高。
+      if (handlers.length === 0) {
+        this.#subscriptions.delete(type);
       }
     };
   }
