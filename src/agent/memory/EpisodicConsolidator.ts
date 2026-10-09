@@ -20,14 +20,25 @@ import { observeSafely } from '#shared/observers.js';
 // 本地类型定义
 // ────────────────────────────────────────────────────────────
 
-/** Logger 最小接口 */
+/**
+ * Logger 最小接口
+ *
+ * 宿主（CompletionSteps.createDefaultConsolidator）目前只注入 info；warn/debug 为可选，
+ * 缺失时由 #log 回退到 info 并加 [level] 前缀，保证跳过/降级路径在宿主日志里仍可见。
+ */
 interface ConsolidatorLogger {
   info(msg: string): void;
+  warn?(msg: string): void;
+  debug?(msg: string): void;
 }
 
-/** PersistentMemory 最小接口 */
+/**
+ * PersistentMemory 最小接口
+ *
+ * 代际清理从不由本类直接触发：clearPreviousBootstrap 交给 consolidate 的同一事务执行，
+ * 所以端口不再要求 clearBootstrapMemories（C33）。
+ */
 interface PersistentMemoryLike {
-  clearBootstrapMemories(): number;
   compact(): void;
   consolidate(
     candidates: CandidateMemoryEntry[],
@@ -55,7 +66,7 @@ interface CandidateMemoryEntry {
   tags: string[];
 }
 
-/** 维度发现 */
+/** 维度发现（SessionStore.storeDimensionReport 已归一化为对象，不再有字符串形态） */
 interface FindingLike {
   finding?: string;
   evidence?: string;
@@ -78,10 +89,16 @@ interface TierReflectionLike {
   suggestionsForNextTier?: string[];
 }
 
-/** SessionStore 最小接口 */
+/**
+ * SessionStore 最小接口
+ *
+ * getTierReflections 可选：真实 SessionStore 提供它，只克隆反思数组；宿主侧鸭子类型检查
+ * （isCompletionSessionStore）只要求 toJSON，因此必须保留 toJSON 回退路径。
+ */
 interface SessionStoreLike {
   getCompletedDimensions(): string[];
   getDimensionReport(dimId: string): DimensionReportLike | undefined;
+  getTierReflections?(): TierReflectionLike[];
   toJSON(): { tierReflections?: TierReflectionLike[] };
 }
 
@@ -150,8 +167,9 @@ export class EpisodicConsolidator {
    * 执行固化: SessionStore → PersistentMemory
    *
    * @param [opts.bootstrapSession] Bootstrap session ID
-   * @param [opts.clearPrevious=false] 是否先清除旧的 bootstrap 记忆
-   * @returns }
+   * @param [opts.clearPrevious=false] 是否以本次候选整代替换旧的 bootstrap 记忆；
+   *   候选为 0 时不替换（见 clearSkipped）
+   * @returns 固化回执；clearSkipped=true 表示请求了 clearPrevious 但因 0 候选而保留了上一代
    */
   consolidate(
     sessionStore: SessionStoreLike,
@@ -181,27 +199,46 @@ export class EpisodicConsolidator {
     const entityCount = allCandidates.reduce((sum, c) => sum + (c.relatedEntities?.length || 0), 0);
 
     this.#log(
+      'info',
       `[Consolidator] Extracted ${allCandidates.length} candidate memories: ` +
         `${findingMemories.length} findings, ${insightMemories.length} insights, ` +
         `${textFactMemories.length} text facts`
     );
     this.#log(
+      'info',
       `[Consolidator] Per-dimension: ${dimStats.map((d) => `${d.dim}=${d.count}`).join(', ')}`
     );
     this.#log(
+      'info',
       `[Consolidator] Importance distribution: ${importanceDist} | Entities extracted: ${entityCount}`
     );
 
-    if (!clearPrevious) {
+    // 0 候选保护（C26）：宿主每次非 rescan bootstrap 都传 clearPrevious:true，而"失败保留上一代"
+    // 只防住了异常；提取成功但为空（AI 失败被吞、维度全部跳过、全部低于阈值）时若仍整代替换，
+    // 上一代全部 bootstrap 语义记忆会在事务内被无告警删除。此处只在候选恰为 0 时跳过替换；
+    // "部分维度成功时是否整代替换"是待产品决定事项，这里不做判断。
+    const clearSkipped = clearPrevious && allCandidates.length === 0;
+    const replacePrevious = clearPrevious && !clearSkipped;
+    if (clearSkipped) {
+      this.#log(
+        'warn',
+        '[Consolidator] clearPrevious skipped: 0 candidates extracted, previous bootstrap generation retained'
+      );
+    }
+
+    // 非替换路径：维护性 compact 在事务外执行；替换路径：clearBootstrapMemories + compact 由
+    // MemoryConsolidator 在同一事务内完成，写失败整体回滚、保留上一代。
+    if (!replacePrevious) {
       this.#semanticMemory.compact();
     }
     const result = this.#semanticMemory.consolidate(allCandidates, {
       bootstrapSession,
-      ...(clearPrevious ? { clearPreviousBootstrap: true } : {}),
+      ...(replacePrevious ? { clearPreviousBootstrap: true } : {}),
     });
 
     const durationMs = Date.now() - t0;
     this.#log(
+      'info',
       `[Consolidator] Consolidation complete in ${durationMs}ms: ` +
         `+${result.added} ADD, ~${result.updated} UPDATE, ⊕${result.merged} MERGE, ` +
         `=${result.skipped} SKIP`
@@ -216,12 +253,26 @@ export class EpisodicConsolidator {
       perDimension: Object.fromEntries(dimStats.map((d) => [d.dim, d.count])),
       importanceDistribution: this.#importanceHistogram(allCandidates),
       entityCount,
+      clearSkipped,
     };
   }
 
-  #log(message: string): void {
+  /**
+   * 日志出口：warn/debug 在注入的 logger 上可选，缺失时回退到 info 并带 [level] 前缀，
+   * 保证跳过/降级路径不会因宿主只注入 info 而消失。
+   *
+   * 必须把 sink 的返回值交还 observeSafely：异步 logger 返回的 rejected promise 由它兜底，
+   * 否则会变成 unhandled rejection（同步抛错同样被隔离）。
+   */
+  #log(level: 'info' | 'warn' | 'debug', message: string): void {
     observeSafely(
-      () => this.#logger.info(message),
+      () => {
+        const sink = level === 'info' ? undefined : this.#logger[level];
+        if (typeof sink === 'function') {
+          return sink.call(this.#logger, message);
+        }
+        return this.#logger.info(level === 'info' ? message : `[${level}] ${message}`);
+      },
       () => undefined
     );
   }
@@ -250,7 +301,7 @@ export class EpisodicConsolidator {
         }
 
         // 跳过过短的发现
-        const content = typeof f === 'string' ? f : f.finding || '';
+        const content = f.finding || '';
         if (content.length < 10) {
           continue;
         }
@@ -262,9 +313,9 @@ export class EpisodicConsolidator {
           type: 'fact',
           content: content.substring(0, 500),
           source: 'bootstrap',
-          importance: typeof f === 'string' ? 5 : f.importance || 5,
+          importance: f.importance || 5,
           sourceDimension: dimId,
-          sourceEvidence: typeof f === 'string' ? '' : f.evidence || '',
+          sourceEvidence: f.evidence || '',
           relatedEntities: entities,
           tags: [dimId],
         });
@@ -283,8 +334,7 @@ export class EpisodicConsolidator {
    */
   #extractFromReflections(sessionStore: SessionStoreLike) {
     const memories: CandidateMemoryEntry[] = [];
-    const json = sessionStore.toJSON();
-    const reflections = json.tierReflections || [];
+    const reflections = this.#readTierReflections(sessionStore);
 
     for (const ref of reflections) {
       // 跨维度模式 → insight
@@ -323,7 +373,7 @@ export class EpisodicConsolidator {
         if ((f.importance || 5) < 7) {
           continue;
         }
-        const content = typeof f === 'string' ? f : f.finding || '';
+        const content = f.finding || '';
         if (content.length < 10) {
           continue;
         }
@@ -342,6 +392,22 @@ export class EpisodicConsolidator {
     }
 
     return memories;
+  }
+
+  /**
+   * 读取 Tier 反思：优先 getTierReflections（只克隆反思数组），缺失时回退到 toJSON
+   * （会深拷贝整个会话快照，含 evidenceStore/submittedCandidates，大项目开销明显），
+   * 回退路径记 debug 以便定位鸭子类型宿主。
+   */
+  #readTierReflections(sessionStore: SessionStoreLike): TierReflectionLike[] {
+    if (typeof sessionStore.getTierReflections === 'function') {
+      return sessionStore.getTierReflections() || [];
+    }
+    this.#log(
+      'debug',
+      '[Consolidator] session store has no getTierReflections; falling back to the full toJSON snapshot for tier reflections'
+    );
+    return sessionStore.toJSON().tierReflections || [];
   }
 
   /**

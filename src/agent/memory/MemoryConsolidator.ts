@@ -54,8 +54,7 @@ interface MemoryLogger {
 /** 相似度阈值 */
 const SIMILARITY_UPDATE = 0.85; // ≥85% 同义 → UPDATE
 const SIMILARITY_MERGE = 0.6; // ≥60% 相关 → MERGE
-/** 详细日志开关 (合并时记录每次 MERGE/UPDATE/REPLACE 的内容摘要) */
-const VERBOSE_CONSOLIDATION = true;
+
 // ─── 矛盾检测模式 (Mem0 风格冲突解决) ─────────────────
 
 /** 中文否定/禁止模式 */
@@ -97,12 +96,25 @@ export class MemoryConsolidator {
     let replaced = 0;
     const stats: ConsolidateStats = { added: 0, updated: 0, merged: 0, skipped: 0 };
 
+    // 双保险（C26）：EpisodicConsolidator 已在 0 候选时不传 clearPreviousBootstrap；直接调用
+    // PersistentMemory.consolidate 的调用方若在候选为空时仍要求整代替换，这里同样短路并告警，
+    // 避免提交一个"只删不写"的事务抹掉上一代 bootstrap 记忆。判断只看候选条数，不看内容有效性。
+    const replacePrevious = clearPreviousBootstrap && candidateMemories.length > 0;
+    if (clearPreviousBootstrap && !replacePrevious) {
+      this.#warn(
+        'Bootstrap replacement skipped: 0 candidates supplied, previous bootstrap generation retained'
+      );
+    }
+
     const runConsolidate = this.#store.transaction(() => {
       // 冲突替换、普通合并与容量淘汰属于同一持久化操作，任何写失败都整体回滚。
-      if (clearPreviousBootstrap) {
+      if (replacePrevious) {
         const cleared = this.#store.clearBootstrapMemories();
         this.#store.compact();
-        this.#logDebug(`Bootstrap replacement staged: ${cleared} previous memories`);
+        // 代际删除是不可逆的数据变更，记 info 并带删除条数，便于事后核对回执。
+        this.#log(
+          `Bootstrap replacement staged: ${cleared} previous bootstrap memories deleted in this transaction`
+        );
       }
       for (const candidate of candidateMemories) {
         const content = (candidate.content || '').trim();
@@ -112,9 +124,8 @@ export class MemoryConsolidator {
         }
 
         // 前一候选已在同一事务内写入；冲突判断必须看到它，不能整批预判后再写。
-        const conflicts = this.#preResolveConflicts([candidate]);
-        replaced += conflicts.replaced;
-        if (conflicts.processed.length === 0) {
+        if (this.#resolveConflict(candidate, content)) {
+          replaced++;
           continue;
         }
 
@@ -136,11 +147,9 @@ export class MemoryConsolidator {
             accessCount: topMatch.access_count + 1,
           });
           stats.updated++;
-          if (VERBOSE_CONSOLIDATION) {
-            this.#logDebug(
-              `UPDATE sim=${(topMatch.similarity ?? 0).toFixed(2)}: "${content.substring(0, 40)}..." → existing "${topMatch.content.substring(0, 40)}..."`
-            );
-          }
+          this.#logDebug(
+            `UPDATE sim=${(topMatch.similarity ?? 0).toFixed(2)}: "${content.substring(0, 40)}..." → existing "${topMatch.content.substring(0, 40)}..."`
+          );
         } else if ((topMatch.similarity ?? 0) >= SIMILARITY_MERGE) {
           // MERGE: 相关但不同 → 合并信息
           const mergedContent = `${topMatch.content}; ${content}`.substring(0, 500);
@@ -151,11 +160,9 @@ export class MemoryConsolidator {
             relatedMemories: [...existingRelated, `merged:${Date.now()}`],
           });
           stats.merged++;
-          if (VERBOSE_CONSOLIDATION) {
-            this.#logDebug(
-              `MERGE sim=${(topMatch.similarity ?? 0).toFixed(2)}: "${content.substring(0, 40)}..." ⊕ "${topMatch.content.substring(0, 40)}..."`
-            );
-          }
+          this.#logDebug(
+            `MERGE sim=${(topMatch.similarity ?? 0).toFixed(2)}: "${content.substring(0, 40)}..." ⊕ "${topMatch.content.substring(0, 40)}..."`
+          );
         } else {
           this.#store.add({ ...candidate, bootstrapSession });
           stats.added++;
@@ -255,63 +262,38 @@ export class MemoryConsolidator {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 在 consolidate 主流程前检测并解决矛盾
-   * @returns }
+   * 单候选矛盾解决（Mem0 风格）：在 ADD/UPDATE/MERGE 之前检查同 type 的相似记忆，
+   * 发现否定/肯定矛盾时就地改写旧记忆并返回 true（调用方据此计 replaced 且不再写入）。
+   *
+   * 调用方已保证 content 去空白且 ≥5 字；查询异常会先记日志再重抛，由外层事务整体回滚。
    */
-  #preResolveConflicts(candidates: CandidateMemory[]) {
-    if (!candidates || candidates.length === 0) {
-      return { processed: [] as CandidateMemory[], replaced: 0 };
-    }
-
-    const processed: CandidateMemory[] = [];
-    let replaced = 0;
-
-    for (const candidate of candidates) {
-      const content = (candidate.content || '').trim();
-      if (!content || content.length < 5) {
-        processed.push(candidate);
-        continue;
-      }
-
-      try {
-        const similar = this.#store.findSimilar(content, null, 3);
-        const deserialized = similar.map((r) => MemoryStore.deserialize(r));
-        let conflictResolved = false;
-
-        for (const existing of deserialized) {
-          if (existing.type === (candidate.type || 'fact')) {
-            const isContradiction = MemoryConsolidator.#detectContradiction(
-              existing.content,
-              content
-            );
-
-            if (isContradiction) {
-              this.#store.update(existing.id, {
-                content: content.substring(0, 500),
-                importance: Math.max(existing.importance || 5, candidate.importance || 5),
-              });
-              conflictResolved = true;
-              replaced++;
-              this.#log(
-                `Conflict replacement staged: "${existing.content.substring(0, 50)}..." → "${content.substring(0, 50)}..."`
-              );
-              break;
-            }
-          }
+  #resolveConflict(candidate: CandidateMemory, content: string): boolean {
+    try {
+      const similar = this.#store.findSimilar(content, null, 3);
+      for (const row of similar) {
+        const existing = MemoryStore.deserialize(row);
+        if (existing.type !== (candidate.type || 'fact')) {
+          continue;
         }
-
-        if (!conflictResolved) {
-          processed.push(candidate);
+        if (!MemoryConsolidator.#detectContradiction(existing.content, content)) {
+          continue;
         }
-      } catch (err: unknown) {
+        this.#store.update(existing.id, {
+          content: content.substring(0, 500),
+          importance: Math.max(existing.importance || 5, candidate.importance || 5),
+        });
         this.#log(
-          `Conflict resolution failed; consolidation will roll back: ${err instanceof Error ? err.message : String(err)}`
+          `Conflict replacement staged: "${existing.content.substring(0, 50)}..." → "${content.substring(0, 50)}..."`
         );
-        throw err instanceof Error ? err : new Error(String(err));
+        return true;
       }
+      return false;
+    } catch (err: unknown) {
+      this.#log(
+        `Conflict resolution failed; consolidation will roll back: ${err instanceof Error ? err.message : String(err)}`
+      );
+      throw err instanceof Error ? err : new Error(String(err));
     }
-
-    return { processed, replaced };
   }
 
   /** 检测两段记忆内容是否矛盾 */
@@ -444,6 +426,22 @@ export class MemoryConsolidator {
     if (this.#logger?.info) {
       observeSafely(
         () => this.#logger?.info(formatted),
+        () => undefined
+      );
+    }
+  }
+
+  /** warn 在注入的 logger 上可选；缺失时回退到 info 并加 [warn] 前缀，跳过路径不能静默。 */
+  #warn(msg: string) {
+    const formatted = `[MemoryConsolidator] ${msg}`;
+    if (this.#logger?.warn) {
+      observeSafely(
+        () => this.#logger?.warn?.(formatted),
+        () => undefined
+      );
+    } else if (this.#logger?.info) {
+      observeSafely(
+        () => this.#logger?.info(`[warn] ${formatted}`),
         () => undefined
       );
     }
