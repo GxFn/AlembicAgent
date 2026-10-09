@@ -16,6 +16,8 @@
  *   - 统一的 getStats(): 合并维度 + 缓存统计
  *
  * 生命周期: 与 Bootstrap 会话一致。
+ * 缓存过期: 默认惰性清扫 (读取时按 TTL 判定、写入前顺带淘汰)，不注册后台定时器；
+ *   只有显式传入 cleanupIntervalMs>0 才注册 'SessionStore/cleanup' interval (见 SessionStoreConfig)。
  * 持久化: 通过 saveCheckpoint / loadCheckpoint 实现断点续传。
  *
  * @module SessionStore
@@ -141,7 +143,19 @@ interface SearchCacheEntry {
 /** SessionStore 构造选项 */
 export interface SessionStoreConfig {
   projectContext?: Record<string, unknown>;
+  /** 只读缓存条目 TTL (毫秒)，<=0 表示永不过期；默认 30 分钟。 */
   ttlMs?: number;
+  /**
+   * 主动清扫间隔 (毫秒)。默认 (undefined 或 <=0) 不注册任何定时器：过期条目在 getCachedResult
+   * 读取时按 TTL 判定、在 cacheToolResult 写入前顺带清扫 (惰性清扫)。
+   *
+   * 默认惰性的原因 (C41)：Core 全局 timerRegistry 只 unref 不自动移除条目，宿主 (长驻 daemon /
+   * api-server) 每次 generate 都新建 SessionStore 却从不 dispose；构造期注册的 interval 闭包会把
+   * 每个实例 (含全部维度报告与证据) 永久钉在注册表里，泄漏随作业次数线性增长。
+   *
+   * 显式传入 >0 才向 timerRegistry 注册 'SessionStore/cleanup' interval；该闭包只经 WeakRef 持有
+   * 实例，实例被 GC 后下一次触发即自注销。正常释放路径仍是调用 dispose()。
+   */
   cleanupIntervalMs?: number;
   /** 项目名 (便捷传入, 会合并到 projectContext) */
   projectName?: string;
@@ -192,14 +206,11 @@ export class SessionStore implements Disposable {
     this.#ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
     this.#logger = Logger.getInstance();
 
-    // 定期清理过期缓存条目
-    const cleanupInterval = config.cleanupIntervalMs ?? 5 * 60 * 1000;
+    // 默认惰性清扫，不注册全局定时器 (原因见 SessionStoreConfig.cleanupIntervalMs)。
+    // 只有调用方显式开启主动清扫且 TTL 有效时才注册；TTL<=0 时没有可过期条目，timer 无意义。
+    const cleanupInterval = config.cleanupIntervalMs ?? 0;
     if (this.#ttlMs > 0 && cleanupInterval > 0) {
-      this.#cleanupTimer = timerRegistry.setInterval(
-        () => this.#evictExpired(),
-        cleanupInterval,
-        'SessionStore/cleanup'
-      );
+      this.#cleanupTimer = this.#registerCleanupTimer(cleanupInterval);
     }
   }
 
@@ -697,6 +708,9 @@ export class SessionStore implements Disposable {
     } else {
       return;
     }
+    // 惰性清扫：没有后台 timer 时过期条目在这里顺带淘汰 (读取路径由 getCachedResult 按 TTL 判定)。
+    // 两个缓存上限很小 (200 / 500)，O(n) 扫描成本可忽略；TTL<=0 时 #evictExpired 直接返回。
+    this.#evictExpired();
     const key = stableStringify(params);
     cache.delete(key);
     cache.set(key, { result: value, cachedAt: Date.now(), hitCount: 0 });
@@ -1049,7 +1063,43 @@ export class SessionStore implements Disposable {
       .map(({ _score, ...rest }) => rest);
   }
 
-  /** 清理过期缓存条目 (F13) */
+  /**
+   * 注册显式主动清扫 timer (仅 cleanupIntervalMs>0 时调用)。
+   *
+   * 闭包只经 WeakRef 持有实例：宿主若从不 dispose，实例仍可被 GC，不会因为 Core timerRegistry
+   * 的 interval 闭包而永久存活。实例被回收后，下一次触发发现 deref 失败即自注销并打 debug 诊断，
+   * 保证注册表条目不随 generate 次数累积。正常释放路径仍是 dispose() → timerRegistry.clear。
+   */
+  #registerCleanupTimer(intervalMs: number): ReturnType<typeof setInterval> {
+    const ref = new WeakRef(this);
+    // logger 是 Core 单例，不是本实例；闭包中不得直接引用 this，否则 WeakRef 失去意义。
+    const logger = this.#logger;
+    const handle = timerRegistry.setInterval(
+      () => {
+        const store = ref.deref();
+        if (store) {
+          store.#evictExpired();
+          return;
+        }
+        // 实例已被回收却无人 dispose：timer 成为孤儿，自行注销并留下可追溯的诊断痕迹。
+        timerRegistry.clear(handle);
+        logger.debug(
+          `[SessionStore] cleanup timer released: store garbage-collected without dispose() (intervalMs=${intervalMs})`
+        );
+      },
+      intervalMs,
+      'SessionStore/cleanup'
+    );
+    logger.debug(
+      `[SessionStore] explicit cleanup timer registered (intervalMs=${intervalMs}, ttlMs=${this.#ttlMs})`
+    );
+    return handle;
+  }
+
+  /**
+   * 清理过期缓存条目 (F13)。
+   * 惰性路径由 cacheToolResult 写入前调用；显式 timer 路径由 #registerCleanupTimer 的闭包调用。
+   */
   #evictExpired() {
     if (this.#ttlMs <= 0) {
       return;
