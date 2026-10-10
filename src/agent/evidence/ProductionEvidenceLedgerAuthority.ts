@@ -5,6 +5,8 @@ import {
   type StrictEvidenceLedgerSnapshotV1,
 } from '@alembic/core/host-agent-workflows';
 import { type EvidenceEntry, type EvidenceRange, isEvidenceToolId } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { type EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
 
@@ -92,7 +94,9 @@ export function createProductionEvidenceLedgerAuthority(
       const validated = validateCaptureInput(draft);
       // 已打开的 authority 也可能遇到外部写入/残行；每次提交前核对当前磁盘完整性。
       store.assertProductionAuthorityHealthy();
-      return freezeEvidenceEntry(store.append(validated));
+      const entry = freezeEvidenceEntry(store.append(validated));
+      reportCaptureContentTransformation(store, validated, entry);
+      return entry;
     },
   }) satisfies ProductionEvidenceLedgerCaptureFacetV1;
   const read = Object.freeze({
@@ -112,6 +116,56 @@ export function createProductionEvidenceLedgerAuthority(
   authorityBindings.set(authority, binding);
   readFacetBindings.set(read, binding);
   return authority;
+}
+
+/**
+ * capture 落盘内容与原文不一致时的 warn 诊断（C03 诊断段）。
+ *
+ * 公开 capture facet 沿用循环证据的脱敏+8000 字符上限管线，这是既定行为；但宿主严格语义
+ * 评审把同一 facet 当逐字节见证使用（content===原文、contentHash===sha256(原文)），一旦
+ * 内容被变换，宿主只会在写入部分 E-n 后比对失败且同 runId 不可恢复。这里不改变写入内容、
+ * 返回值或错误语义，只在变换发生时记录文件、原长度、落盘长度和变换类型，让宿主能从日志
+ * 定位是哪个文件、因脱敏还是截断导致见证失配。原文与脱敏后的内容都不得进入日志。
+ * 诊断通道自身失败只能被吞掉，不得把已完成的 append 升级为 capture 失败。
+ */
+function reportCaptureContentTransformation(
+  store: EvidenceLedgerStore,
+  draft: EvidenceEntryDraft,
+  entry: EvidenceEntry
+): void {
+  if (entry.content === draft.content) {
+    return;
+  }
+  observeSafely(
+    () => {
+      const transformation = store.describeContentTransformation(draft.content);
+      const transformations: string[] = [];
+      if (transformation.redacted) {
+        transformations.push('redacted');
+      }
+      if (transformation.truncated) {
+        transformations.push('truncated');
+      }
+      if (transformations.length === 0) {
+        // 内容确实变了却无法归类：管线与描述口径出现漂移，必须显式暴露而不是静默归零。
+        transformations.push('unknown');
+      }
+      Logger.getInstance().warn(
+        '[ProductionEvidenceLedger] capture persisted transformed content; verbatim witness comparison against the source will not match',
+        {
+          evidenceId: entry.id,
+          tool: entry.tool,
+          callId: entry.callId,
+          ...(entry.file ? { file: entry.file } : {}),
+          ...(entry.range ? { range: `${entry.range.start}-${entry.range.end}` } : {}),
+          originalLength: transformation.originalLength,
+          storedLength: transformation.storedLength,
+          transformations,
+        }
+      );
+    },
+    () => undefined
+  );
 }
 
 /**

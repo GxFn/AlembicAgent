@@ -8,13 +8,20 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { EVIDENCE_ENTRY_MAX_CHARS } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  EVIDENCE_TRUNCATION_MARKER,
+  hashEvidenceContent,
+} from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { resolveProductionEvidenceLedgerStore } from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
 import { createProductionEvidenceLedgerAuthority } from '../src/production.js';
 
 const temporaryRoots = new Set<string>();
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const root of temporaryRoots) {
     rmSync(root, { force: true, recursive: true });
   }
@@ -469,6 +476,187 @@ describe('production Evidence Ledger authority', () => {
     expect(() => createProductionEvidenceLedgerAuthority(coordinates)).toThrow(
       'EVIDENCE_LEDGER_PRODUCTION_AUTHORITY_INVALID'
     );
+  });
+});
+
+describe('production Evidence Ledger capture content-transformation diagnostics', () => {
+  const coordinates = () => ({
+    dataRoot: createRoot(),
+    jobId: 'job:production-ledger',
+    sessionId: 'session:production-ledger',
+    dimensionId: 'dimension:strict-fact',
+  });
+  // 可辨识且不含敏感模式的大文件：行数足以越过 8000 字符上限，尾部行必然被截掉。
+  const oversizedSource = Array.from(
+    { length: 400 },
+    (_, index) => `export const oversizedWitnessLine${index} = ${index};`
+  ).join('\n');
+  const secretSource = [
+    'const apiKey = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";',
+    'export const password = "hunter2hunter2";',
+    '',
+  ].join('\n');
+
+  function spyWarn() {
+    return vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => Logger.getInstance());
+  }
+
+  function transformationCalls(warn: ReturnType<typeof spyWarn>) {
+    return warn.mock.calls.filter((call) => String(call[0]).includes('[ProductionEvidenceLedger]'));
+  }
+
+  function readPersistedLines(root: ReturnType<typeof coordinates>): Record<string, unknown>[] {
+    const filePath = path.join(
+      root.dataRoot,
+      '.asd',
+      'evidence-ledger',
+      root.jobId,
+      `${root.dimensionId}.jsonl`
+    );
+    return readFileSync(filePath, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it('warns with file, original length and transformation kind when the entry cap truncates an oversized capture, without changing the persisted entry', () => {
+    expect(oversizedSource.length).toBeGreaterThan(EVIDENCE_ENTRY_MAX_CHARS);
+    const warn = spyWarn();
+    const root = coordinates();
+    const authority = createProductionEvidenceLedgerAuthority(root);
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:strict-fact:oversized',
+      file: 'src/oversized.ts',
+      content: oversizedSource,
+    });
+
+    // 现有脱敏+截断语义保持不变：诊断不改变写入内容与返回值。
+    expect(entry.content).not.toBe(oversizedSource);
+    expect(entry.content.length).toBe(EVIDENCE_ENTRY_MAX_CHARS);
+    expect(entry.content.endsWith(`\n${EVIDENCE_TRUNCATION_MARKER}`)).toBe(true);
+    expect(entry.contentHash).toBe(hashEvidenceContent(entry.content));
+    expect(authority.read.get(entry.id)).toEqual(entry);
+    const [persisted] = readPersistedLines(root);
+    expect(persisted?.content).toBe(entry.content);
+    expect(persisted?.contentHash).toBe(entry.contentHash);
+
+    const calls = transformationCalls(warn);
+    expect(calls).toHaveLength(1);
+    const [message, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(message).toContain('transformed');
+    expect(meta).toMatchObject({
+      evidenceId: entry.id,
+      callId: 'call:strict-fact:oversized',
+      file: 'src/oversized.ts',
+      originalLength: oversizedSource.length,
+      storedLength: EVIDENCE_ENTRY_MAX_CHARS,
+      transformations: ['truncated'],
+    });
+    // 诊断只能带长度与变换类型，不得回显原文。
+    expect(JSON.stringify(calls)).not.toContain('oversizedWitnessLine');
+  });
+
+  it('warns with the redaction kind when credential-shaped literals are rewritten and keeps the secret out of the diagnostic', () => {
+    const warn = spyWarn();
+    const root = coordinates();
+    const authority = createProductionEvidenceLedgerAuthority(root);
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:strict-fact:secret',
+      file: 'src/config.ts',
+      range: { start: 1, end: 2 },
+      content: secretSource,
+    });
+
+    expect(entry.content).not.toContain('hunter2hunter2');
+    expect(entry.content).not.toContain('sk-proj-');
+    expect(entry.content).not.toBe(secretSource);
+    expect(entry.content.endsWith(`\n${EVIDENCE_TRUNCATION_MARKER}`)).toBe(false);
+    expect(authority.read.get(entry.id)).toEqual(entry);
+    const [persisted] = readPersistedLines(root);
+    expect(persisted?.content).toBe(entry.content);
+
+    const calls = transformationCalls(warn);
+    expect(calls).toHaveLength(1);
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(meta).toMatchObject({
+      evidenceId: entry.id,
+      file: 'src/config.ts',
+      range: '1-2',
+      originalLength: secretSource.length,
+      storedLength: entry.content.length,
+      transformations: ['redacted'],
+    });
+    const serialized = JSON.stringify(calls);
+    expect(serialized).not.toContain('hunter2hunter2');
+    expect(serialized).not.toContain('sk-proj-');
+  });
+
+  it('reports both redaction and truncation for an oversized capture that also carries secrets', () => {
+    const warn = spyWarn();
+    const authority = createProductionEvidenceLedgerAuthority(coordinates());
+    const content = `${secretSource}${oversizedSource}`;
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:strict-fact:both',
+      file: 'src/both.ts',
+      content,
+    });
+
+    expect(entry.content.length).toBe(EVIDENCE_ENTRY_MAX_CHARS);
+    expect(entry.content).not.toContain('hunter2hunter2');
+    const calls = transformationCalls(warn);
+    expect(calls).toHaveLength(1);
+    const [, meta] = calls[0] as [string, Record<string, unknown>];
+    expect(meta).toMatchObject({
+      file: 'src/both.ts',
+      originalLength: content.length,
+      storedLength: EVIDENCE_ENTRY_MAX_CHARS,
+      transformations: ['redacted', 'truncated'],
+    });
+    expect(JSON.stringify(calls)).not.toContain('hunter2hunter2');
+  });
+
+  it('stays silent for a capture that is persisted verbatim', () => {
+    const warn = spyWarn();
+    const authority = createProductionEvidenceLedgerAuthority(coordinates());
+    const content = 'export const fact = true;\nexport const other = 1;\n';
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:strict-fact:verbatim',
+      file: 'src/fact.ts',
+      content,
+    });
+
+    expect(entry.content).toBe(content);
+    expect(entry.contentHash).toBe(hashEvidenceContent(content));
+    expect(transformationCalls(warn)).toHaveLength(0);
+  });
+
+  it('keeps the capture result and persisted entry when the diagnostic channel itself throws', () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      throw new Error('diagnostic channel unavailable');
+    });
+    const root = coordinates();
+    const authority = createProductionEvidenceLedgerAuthority(root);
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:strict-fact:logger-down',
+      file: 'src/oversized.ts',
+      content: oversizedSource,
+    });
+
+    expect(entry.id).toBe('E-1');
+    expect(entry.content.length).toBe(EVIDENCE_ENTRY_MAX_CHARS);
+    expect(authority.read.get('E-1')).toEqual(entry);
+    expect(authority.read.strictSnapshot().entries).toEqual([entry]);
+    expect(readPersistedLines(root)).toHaveLength(1);
   });
 });
 

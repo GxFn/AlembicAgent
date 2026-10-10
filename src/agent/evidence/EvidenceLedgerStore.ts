@@ -56,6 +56,21 @@ export interface EvidenceEntryDraft {
 export const EVIDENCE_TRUNCATION_MARKER = '…[evidence truncated at entry cap]';
 
 /**
+ * 落盘管线对单条 content 的变换事实（脱敏 / 上限截断）。
+ *
+ * 只描述、不改变管线：production capture facet 用它向宿主发出“落盘内容不等于原文”的
+ * 诊断，循环路径（AgentRuntime 直接 append）把脱敏与截断视为设计内行为，不消费它。
+ */
+export interface EvidenceContentTransformation {
+  /** redactor 改写了内容（凭据形态字面量被替换） */
+  readonly redacted: boolean;
+  /** 脱敏后长度超过 EVIDENCE_ENTRY_MAX_CHARS，保头截断并附标记 */
+  readonly truncated: boolean;
+  readonly originalLength: number;
+  readonly storedLength: number;
+}
+
+/**
  * EvidenceEntry 的 canonical 内容哈希。
  *
  * Core strict fact / semantic-review authority 对 EvidenceEntry 使用原始 UTF-8 bytes 的
@@ -238,12 +253,43 @@ export class EvidenceLedgerStore {
     return hashEvidenceContent(this.#redactAndCap(slice)) === entry.contentHash ? 'fresh' : 'stale';
   }
 
+  /**
+   * 复算落盘管线并报告变换事实，不写盘、不分配 ID。
+   *
+   * 与 append 使用同一把尺（同一 redactor、同一上限），所以对同一 content 的结论与
+   * 实际落盘一致；调用方应只在 append 返回内容不等于原文时调用，避免对未变换内容重复
+   * 跑一遍脱敏正则。
+   */
+  describeContentTransformation(content: string): EvidenceContentTransformation {
+    const transformed = this.#transform(content);
+    return Object.freeze({
+      redacted: transformed.redacted,
+      truncated: transformed.truncated,
+      originalLength: content.length,
+      storedLength: transformed.stored.length,
+    });
+  }
+
   /** 落盘内容统一管线：脱敏→上限截断（append 与 checkFreshness 共用同一把尺） */
   #redactAndCap(content: string): string {
+    return this.#transform(content).stored;
+  }
+
+  /**
+   * 管线单源：脱敏后若超上限则保头截断并附显式标记。redacted/truncated 两个事实与
+   * stored 一起返回，保证 describeContentTransformation 与实际写入不会各算各的。
+   */
+  #transform(content: string): {
+    readonly stored: string;
+    readonly redacted: boolean;
+    readonly truncated: boolean;
+  } {
     const redacted = this.#redactor(content);
-    return redacted.length > EVIDENCE_ENTRY_MAX_CHARS
+    const truncated = redacted.length > EVIDENCE_ENTRY_MAX_CHARS;
+    const stored = truncated
       ? `${redacted.slice(0, EVIDENCE_ENTRY_MAX_CHARS - EVIDENCE_TRUNCATION_MARKER.length - 1)}\n${EVIDENCE_TRUNCATION_MARKER}`
       : redacted;
+    return { stored, redacted: redacted !== content, truncated };
   }
 
   /** 按文件路径片段检索（E3 近似候选提示 / E5 producer 展开用），按采集序返回 */
