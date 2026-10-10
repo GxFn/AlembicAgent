@@ -245,8 +245,10 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
     return { pass: true };
   }
   if (totalScore >= threshold - 20) {
-    // coherence 是唯一短板且证据面已满(典型：analyze 被超时打断，findings 都在 memory
-    // 里但总结文本没写出来)——整段重挖是浪费，改走 summary_rewrite 纯写作重组。
+    // coherence 是唯一短板且证据面已满(findings 都在 memory 里但总结文本没写好)——整段
+    // 重挖是浪费，改走 summary_rewrite 纯写作重组。注意它只服务「未超时」的写作类缺口：
+    // analyze 最终回执超时(timedOut)时，PipelineStrategy 不把 summary_rewrite/pass 当作恢复，
+    // 会改走 analysis_retry 整段重跑或终止(I05 方案 A，超时即终态)，本函数不读 timedOut。
     if (
       scores.coherenceScore < 50 &&
       scores.depthScore >= 40 &&

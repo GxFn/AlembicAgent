@@ -2,9 +2,11 @@ import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
+import { producerRejectionGateEvaluator } from '../src/agent/evaluation/gateEvaluators.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
+import { buildProducerRetryPrompt } from '../src/agent/prompts/producerRetry.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
@@ -22,6 +24,7 @@ import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import type { StrategyRuntime } from '../src/agent/strategies/Strategy.js';
+import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
 function harness(
@@ -1666,6 +1669,558 @@ describe('R05 result-control compatibility edges', () => {
     });
     const results = result.itemResults as Array<{ status: string }>;
     expect(results[0].status).toBe(recovered ? 'completed' : 'failed');
+  });
+});
+
+// ─── I05(L5-P33)：阶段最终回执超时即终态(方案 A) ───
+// 背景：insight 管线 analyze 的软超时是 480s(insightPreset budget.timeoutMs)。AgentRuntime 在
+// stage_timeout 时返回带非空停止文案 + timedOut:true 的回执；此前 quality_gate 判 summary_rewrite
+// 或直接 pass 后 produce 照跑并经 knowledge.submit 持久化候选，但 execute 末尾只看最终回执
+// (timedOut → outcome='failed')，AgentService 判 timeout、宿主计 0 有效候选——候选入库却计为 0。
+// 方案 A 把语义收敛为：源阶段最终回执超时时，pass/summary_rewrite/record_repair 都不是恢复，
+// 只有 analysis_retry 整段重跑(覆盖最终回执)能恢复；额度用尽/被压制/非通过动作/没有门裁决时
+// 终止并写 pipeline_timeout_terminal。mock runtime 直接给出超时回执(非零工具调用，避免走
+// fast-retry 分支)，不依赖真实计时。
+describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
+  type Warning = { code: string; stage?: string; message: string };
+  const warningsOf = (diagnostics: { warnings?: unknown[] } | undefined) =>
+    (diagnostics?.warnings ?? []) as Warning[];
+  const timeoutTerminalWarnings = (diagnostics: { warnings?: unknown[] } | undefined) =>
+    warningsOf(diagnostics).filter((warning) => warning.code === 'pipeline_timeout_terminal');
+  const timedOutAnalyze = {
+    reply: 'partial analysis text written before the 480s soft timeout',
+    toolCalls: [{ tool: 'read', args: { path: 'src/a.ts' }, result: 'contents' }],
+    tokenUsage: { input: 10, output: 5 },
+    iterations: 3,
+    timedOut: true,
+  };
+
+  /** 按 pipelinePhase 回放：首轮 analyze 超时；recoverOnRetry 时重跑成功，否则每次都超时。 */
+  function timeoutRuntime(options: { recoverOnRetry?: boolean; analyzeInputTokens?: number } = {}) {
+    const phases: string[] = [];
+    let analyzeRuns = 0;
+    const runtime = {
+      id: 'timeout-terminal-runtime',
+      reactLoop: vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        phases.push(phase);
+        if (phase === 'analyze') {
+          analyzeRuns += 1;
+          if (analyzeRuns === 1 || !options.recoverOnRetry) {
+            return {
+              ...timedOutAnalyze,
+              tokenUsage: { input: options.analyzeInputTokens ?? 10, output: 5 },
+            };
+          }
+          return {
+            ...stageOutput('complete analysis after a full re-run'),
+            toolCalls: [{ tool: 'read', args: { path: 'src/b.ts' }, result: 'contents' }],
+          };
+        }
+        return stageOutput(`${phase} output`);
+      }),
+    };
+    return { runtime, phases };
+  }
+
+  function insightLikeStages(
+    evaluator: (...args: unknown[]) => unknown,
+    options: {
+      maxRetries?: number;
+      skipOnFail?: boolean;
+      analyzeBudget?: Record<string, unknown>;
+      onRetryReason?: (reason: string | undefined) => void;
+    } = {}
+  ) {
+    return [
+      {
+        name: 'analyze',
+        budget: { timeoutMs: 480_000, ...(options.analyzeBudget || {}) },
+        ...(options.onRetryReason
+          ? {
+              retryPromptBuilder: (retryCtx: { reason?: string }, content: string) => {
+                options.onRetryReason?.(retryCtx.reason);
+                return `${content} (retry)`;
+              },
+            }
+          : {}),
+      },
+      {
+        name: 'quality_gate',
+        gate: { evaluator, maxRetries: options.maxRetries ?? 1 },
+        ...(options.skipOnFail === undefined ? {} : { skipOnFail: options.skipOnFail }),
+      },
+      { name: 'produce' },
+    ];
+  }
+
+  function serviceFor(strategy: PipelineStrategy, runtime: { reactLoop: unknown }) {
+    return new AgentService({
+      runtimeBuilder: {
+        build: () => ({
+          id: 'timeout-terminal-service-runtime',
+          execute: async (message: AgentMessage) => {
+            const result = await strategy.execute(runtime as never, message);
+            return { ...result, durationMs: 1 };
+          },
+        }),
+      },
+    });
+  }
+
+  it('480s 软超时 + summary_rewrite 且无重试额度 → 不跑重写微阶段与 produce，outcome=failed，诊断含 pipeline_timeout_terminal，服务状态仍为 timeout', async () => {
+    const warnLog = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({
+        action: 'summary_rewrite',
+        pass: false,
+        reason: 'Coherence-only gap with adequate evidence',
+        artifact: { findings: [{ finding: 'f1' }, { finding: 'f2' }] },
+      })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const strategy = new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 0 }),
+    });
+
+    const result = await serviceFor(strategy, runtime).run({
+      profile: { id: 'timeout-terminal' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    // 超时回执不被 rewrite 救回：既不跑 quality_gate_summary_rewrite 微阶段，也不跑 produce。
+    expect(phases).toEqual(['analyze']);
+    expect(evaluator).toHaveBeenCalledTimes(1);
+    const resultPhases = result.phases as Record<string, Record<string, unknown>>;
+    expect(resultPhases.produce).toBeUndefined();
+    expect(resultPhases.quality_gate_summary_rewrite).toBeUndefined();
+    expect(resultPhases.analyze).toMatchObject({ timedOut: true });
+    // 门回执只记有效裁决一次：summary_rewrite 被改写为 analysis_retry，原始动作留在 reason 里；
+    // gateFailures 同样只有这一条(宿主与 l4MemoryPackage 按条读取)。
+    expect(resultPhases.quality_gate).toMatchObject({ pass: false, action: 'analysis_retry' });
+    expect(String(resultPhases.quality_gate.reason)).toContain('summary_rewrite');
+    expect(result.diagnostics?.gateFailures).toEqual([
+      expect.objectContaining({ stage: 'quality_gate', action: 'analysis_retry' }),
+    ]);
+    expect(resultPhases._pipelineOutcome).toMatchObject({
+      outcome: 'failed',
+      stage: 'quality_gate',
+      action: 'timeout_terminal',
+    });
+    // AgentService 不改：最终回执超时且未恢复 → timeout(与宿主 AgentRunProjections 判定一致)。
+    expect(result.status).toBe('timeout');
+    expect(result.diagnostics?.timedOutStages).toEqual(['analyze']);
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].stage).toBe('quality_gate');
+    expect(terminal[0].message).toContain('analyze');
+    expect(terminal[0].message).toContain('summary_rewrite');
+    expect(terminal[0].message).toContain('maxRetries=0');
+    expect(
+      warnLog.mock.calls.some(
+        (call) =>
+          String(call[0]).includes('pipeline_timeout_terminal') &&
+          String(call[0]).includes('quality_gate')
+      )
+    ).toBe(true);
+  });
+
+  it.each([
+    'pass',
+    'summary_rewrite',
+    'record_repair',
+  ])('有重试额度时门动作 %s 不算恢复：走 analysis_retry 整段重跑，重跑成功后 outcome=completed、服务状态 success', async (action) => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime({ recoverOnRetry: true });
+    const retryReasons: Array<string | undefined> = [];
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({
+        action,
+        pass: action === 'pass',
+        reason: action === 'pass' ? undefined : 'gate wants a cheap repair',
+        artifact: { findings: [{ finding: 'f1' }] },
+      })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const strategy = new PipelineStrategy({
+      stages: insightLikeStages(evaluator, {
+        maxRetries: 1,
+        onRetryReason: (reason) => retryReasons.push(reason),
+      }),
+    });
+
+    const result = await serviceFor(strategy, runtime).run({
+      profile: { id: 'timeout-recovered' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    // 只有整段重跑：没有 rewrite/repair 微阶段；重跑覆盖最终回执后门重评通过，produce 正常执行。
+    expect(phases).toEqual(['analyze', 'analyze', 'produce']);
+    expect(evaluator).toHaveBeenCalledTimes(2);
+    const resultPhases = result.phases as Record<string, Record<string, unknown>>;
+    expect(resultPhases.analyze).toMatchObject({ reply: 'complete analysis after a full re-run' });
+    expect(resultPhases.analyze.timedOut).toBeUndefined();
+    expect(resultPhases.produce).toMatchObject({ reply: 'produce output' });
+    expect(resultPhases.quality_gate).toMatchObject({ pass: true, action: 'pass' });
+    expect(resultPhases._retries_quality_gate).toBe(1);
+    expect(resultPhases._pipelineOutcome).toEqual({ outcome: 'completed' });
+    // 与普通 analysis_retry 同构：首轮门回执按改写后的有效裁决记 1 条 gateFailures(reason 带原始动作)。
+    expect(result.diagnostics?.gateFailures).toHaveLength(1);
+    expect(result.diagnostics?.gateFailures?.[0]).toMatchObject({
+      stage: 'quality_gate',
+      action: 'analysis_retry',
+    });
+    expect(String(result.diagnostics?.gateFailures?.[0]?.reason)).toContain(action);
+    // 重试 prompt 能看出是超时触发的整段重跑，而不是门的原始动作。
+    expect(retryReasons).toHaveLength(1);
+    expect(retryReasons[0]).toMatch(/timed out/i);
+    expect(retryReasons[0]).toContain(action);
+    // 历史超时保留在 timedOutStages；最终回执已覆盖 → AgentService 判已恢复。
+    expect(result.diagnostics?.timedOutStages).toEqual(['analyze']);
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+    expect(result.status).toBe('success');
+    expect(result.reply).toBe('produce output');
+  });
+
+  it('重跑仍超时且额度用尽 → 终止(attempts/maxRetries 可定位)，produce 不跑', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime({ recoverOnRetry: false });
+    const evaluator = vi.fn(() => ({ action: 'pass', pass: true }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1 }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze', 'analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.timedOut).toBe(true);
+    expect(result.phases.produce).toBeUndefined();
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].message).toContain('attempts=2');
+    expect(terminal[0].message).toContain('maxRetries=1');
+    expect(result.phases._pipelineOutcome).toMatchObject({
+      outcome: 'failed',
+      action: 'timeout_terminal',
+      stage: 'quality_gate',
+    });
+  });
+
+  it('非通过动作 reject 落在超时源阶段上：即使 skipOnFail=false 也终止，不继续 produce', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const evaluator = vi.fn(() => ({ action: 'reject', pass: false, reason: 'rejected' }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1, skipOnFail: false }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.phases.quality_gate).toMatchObject({ action: 'reject' });
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].message).toContain('reject');
+    expect(terminal[0].message).toContain('skipOnFail=false');
+  });
+
+  it('重跑被会话输入预算压制 → degraded_budget_exhausted 终态，同时写 pipeline_timeout_terminal', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime({ recoverOnRetry: true, analyzeInputTokens: 95 });
+    const evaluator = vi.fn(() => ({ action: 'pass', pass: true }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, {
+        maxRetries: 1,
+        analyzeBudget: { maxSessionInputTokens: 100 },
+      }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.degraded).toBe(true);
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.phases.quality_gate).toMatchObject({ action: 'degraded_budget_exhausted' });
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].message).toMatch(/suppressed/i);
+  });
+
+  it('超时阶段后面没有门裁决(analyze → produce) → 直接终止，produce 不跑', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze', budget: { timeoutMs: 480_000 } }, { name: 'produce' }],
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.reply).toBe(timedOutAnalyze.reply);
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].stage).toBe('analyze');
+    expect(terminal[0].message).toContain('produce');
+    expect(result.phases._pipelineOutcome).toMatchObject({
+      outcome: 'failed',
+      stage: 'analyze',
+      action: 'timeout_terminal',
+    });
+  });
+
+  it('最后一个阶段超时(没有下游) → 保持原语义：outcome=failed 但不写 pipeline_timeout_terminal', async () => {
+    const { runtime, phases } = timeoutRuntime();
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze', budget: { timeoutMs: 480_000 } }],
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+    expect(result.phases._pipelineOutcome).toEqual({ outcome: 'failed' });
+  });
+
+  it('未超时的源阶段不受影响：summary_rewrite 仍走重写微阶段后通过，produce 正常执行', async () => {
+    const phases: string[] = [];
+    const runtime = {
+      id: 'no-timeout-runtime',
+      reactLoop: vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        phases.push(phase);
+        return stageOutput(`${phase} output`);
+      }),
+    };
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({ action: 'summary_rewrite', pass: false, reason: 'coherence' })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1 }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze', 'quality_gate_summary_rewrite', 'produce']);
+    expect(result.outcome).toBe('completed');
+    expect(result.phases.analyze).toMatchObject({
+      reply: 'quality_gate_summary_rewrite output',
+    });
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+  });
+
+  // ── 规则边界：producer 阶段的超时回执不在规则内(改动前语义，可救回由宿主判定) ──
+  // 宿主 AgentRunProjections.isRecoverableProducerTimeoutIssue：status=timeout + timedOutStages 含
+  // 'produce' + 按 phases.produce.toolCalls 数出的持久化提交数 > 0 ⇒ 维度可救回，候选按首轮回执计数。
+  // 若裁决 produce 的 rejection_gate 的 pass 也被改写成 analysis_retry，会用「N 个提交被拒绝」的
+  // 拒绝重试 prompt 白跑第二轮，并以第二轮回执覆盖 phases.produce——宿主计 0 候选而库里已有候选。
+  // 这是返工审查指出的回归；下面三例锁定 producer 路径(门裁决、拒绝重试、主循环)保持改动前语义。
+  const persistedSubmit = (id: string) => ({
+    tool: 'knowledge',
+    args: { action: 'submit', title: `candidate ${id}` },
+    result: { status: 'created', id, lifecycle: 'pending' },
+  });
+  const rejectedSubmit = (reason: string) => ({
+    tool: 'knowledge',
+    args: { action: 'submit', title: `rejected: ${reason}` },
+    result: { status: 'rejected', reason },
+  });
+
+  /** analyze/finalize 正常(带一条工具调用)；produce 第 n 次调用回放 produceAttempts[n](超出则复用末项)。 */
+  function producerRuntime(produceAttempts: Array<Record<string, unknown>>) {
+    const phases: string[] = [];
+    let produceRuns = 0;
+    const runtime = {
+      id: 'producer-timeout-runtime',
+      reactLoop: vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        phases.push(phase);
+        if (phase === 'produce') {
+          const attempt = produceAttempts[Math.min(produceRuns, produceAttempts.length - 1)];
+          produceRuns += 1;
+          return { ...stageOutput('producer summary'), ...attempt };
+        }
+        return {
+          ...stageOutput(`${phase} output`),
+          toolCalls: [{ tool: 'read', args: { path: 'src/a.ts' }, result: 'contents' }],
+        };
+      }),
+    };
+    return { runtime, phases };
+  }
+
+  /** 与 insightPreset / stageBuilders 同形：真实 producerRejectionGateEvaluator + buildProducerRetryPrompt。 */
+  function producerStages(retryPrompt: (prompt: string) => string) {
+    return [
+      { name: 'analyze', budget: { timeoutMs: 480_000 } },
+      {
+        name: 'quality_gate',
+        gate: {
+          evaluator: () => ({
+            action: 'pass',
+            pass: true,
+            artifact: { findings: [{ finding: 'f1' }, { finding: 'f2' }] },
+          }),
+          maxRetries: 1,
+        },
+      },
+      {
+        name: 'produce',
+        budget: { maxIterations: 24, temperature: 0.3, timeoutMs: 900_000, maxSubmits: 10 },
+        retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 },
+        retryPromptBuilder: (
+          _retryCtx: { reason?: string },
+          _origPrompt: string,
+          prev: Record<string, unknown>
+        ) =>
+          retryPrompt(
+            buildProducerRetryPrompt(prev.produce as { toolCalls?: readonly unknown[] } | undefined)
+          ),
+      },
+      {
+        name: 'rejection_gate',
+        gate: {
+          evaluator: (
+            source: unknown,
+            phaseResults: Record<string, unknown>,
+            ctx: Record<string, unknown>
+          ) =>
+            producerRejectionGateEvaluator(
+              source as Parameters<typeof producerRejectionGateEvaluator>[0],
+              phaseResults,
+              ctx
+            ),
+          maxRetries: 1,
+        },
+      },
+    ];
+  }
+
+  it('produce 超时但已持久化提交 + rejection_gate pass → 不重跑 produce、首轮回执保留、status=timeout、timedOutStages=[produce](宿主可救回路径不变)', async () => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const retryPrompt = vi.fn((prompt: string) => prompt);
+    const firstAttempt = {
+      reply: '[run stopped: stage_timeout] partial producer output',
+      toolCalls: [
+        persistedSubmit('cand-1'),
+        persistedSubmit('cand-2'),
+        rejectedSubmit('too short'),
+      ],
+      timedOut: true,
+    };
+    const { runtime, phases } = producerRuntime([
+      firstAttempt,
+      stageOutput('second produce must not run'),
+    ]);
+
+    const result = await serviceFor(
+      new PipelineStrategy({ stages: producerStages(retryPrompt) }),
+      runtime
+    ).run({
+      profile: { id: 'producer-timeout-recoverable' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    // 只有首轮 produce：rejection_gate 的 pass 不被改写成 analysis_retry，拒绝重试 prompt 不生成。
+    expect(phases).toEqual(['analyze', 'produce']);
+    expect(retryPrompt).not.toHaveBeenCalled();
+    const resultPhases = result.phases as Record<string, Record<string, unknown>>;
+    expect(resultPhases.produce).toMatchObject({ timedOut: true, reply: firstAttempt.reply });
+    // 宿主按 phases.produce.toolCalls 数持久化提交：首轮的 2 条必须原样保留。
+    const produceToolCalls = resultPhases.produce.toolCalls as unknown[];
+    expect(produceToolCalls).toHaveLength(3);
+    expect(produceToolCalls.filter(isPersistedSubmission)).toHaveLength(2);
+    expect(resultPhases.rejection_gate).toMatchObject({ pass: true, action: 'pass' });
+    expect(resultPhases._pipelineOutcome).toMatchObject({ outcome: 'failed' });
+    expect(resultPhases._pipelineOutcome.action).toBeUndefined();
+    expect(result.diagnostics?.gateFailures ?? []).toEqual([]);
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+    // AgentService 不改：最终回执超时 → timeout；宿主据 timedOutStages=['produce'] + 2 条持久化提交判可救回。
+    expect(result.status).toBe('timeout');
+    expect(result.diagnostics?.timedOutStages).toEqual(['produce']);
+    // 分叉留痕：日志能看出是 producer 超时、规则未套用、以及回执里的持久化提交数。
+    expect(
+      infoLog.mock.calls.some((call) => {
+        const text = String(call[0]);
+        return (
+          text.includes('producer stage') &&
+          text.includes('"rejection_gate"') &&
+          text.includes('persistedKnowledgeSubmits=2')
+        );
+      })
+    ).toBe(true);
+  });
+
+  it('produce 超时且拒绝占优 + rejection_gate 判 retry → 仍走既有拒绝重试(prompt 来自 buildProducerRetryPrompt)，重跑成功后 status=success', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const retryPrompt = vi.fn((prompt: string) => prompt);
+    const { runtime, phases } = producerRuntime([
+      {
+        reply: '[run stopped: stage_timeout] partial producer output',
+        toolCalls: [rejectedSubmit('a'), rejectedSubmit('b'), rejectedSubmit('c')],
+        timedOut: true,
+      },
+      {
+        ...stageOutput('repaired producer output'),
+        toolCalls: [persistedSubmit('cand-1'), persistedSubmit('cand-2')],
+      },
+    ]);
+
+    const result = await serviceFor(
+      new PipelineStrategy({ stages: producerStages(retryPrompt) }),
+      runtime
+    ).run({
+      profile: { id: 'producer-timeout-rejection-retry' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    // 拒绝重试是 rejection_gate 的既有路径，与超时无关：prompt 说的是首轮被拒绝的 3 条。
+    expect(phases).toEqual(['analyze', 'produce', 'produce']);
+    expect(retryPrompt).toHaveBeenCalledTimes(1);
+    expect(retryPrompt.mock.calls[0][0]).toContain('你的 3 个提交被拒绝了');
+    const resultPhases = result.phases as Record<string, Record<string, unknown>>;
+    expect(resultPhases.produce.timedOut).toBeUndefined();
+    expect(
+      (resultPhases.produce.toolCalls as unknown[]).filter(isPersistedSubmission)
+    ).toHaveLength(2);
+    expect(resultPhases.rejection_gate).toMatchObject({ pass: true, action: 'pass' });
+    expect(resultPhases._retries_rejection_gate).toBe(1);
+    expect(result.diagnostics?.gateFailures).toEqual([
+      expect.objectContaining({ stage: 'rejection_gate', action: 'retry' }),
+    ]);
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+    expect(resultPhases._pipelineOutcome).toMatchObject({ outcome: 'completed' });
+    // 历史超时保留在 timedOutStages；最终回执已被成功重跑覆盖 → AgentService 判已恢复。
+    expect(result.diagnostics?.timedOutStages).toEqual(['produce']);
+    expect(result.status).toBe('success');
+  });
+
+  it('producer 超时且下游不是门(produce → finalize) → 不触发主循环直接终止：finalize 照跑(改动前语义)，不写 pipeline_timeout_terminal', async () => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const { runtime, phases } = producerRuntime([
+      { reply: 'partial producer output', toolCalls: [persistedSubmit('cand-1')], timedOut: true },
+    ]);
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze' }, { name: 'produce' }, { name: 'finalize' }],
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze', 'produce', 'finalize']);
+    expect(result.outcome).toBe('failed');
+    expect(result.timedOut).toBe(true);
+    const produce = result.phases.produce as { timedOut?: boolean; toolCalls: unknown[] };
+    expect(produce.timedOut).toBe(true);
+    expect(produce.toolCalls.filter(isPersistedSubmission)).toHaveLength(1);
+    expect(result.phases.finalize).toMatchObject({ reply: 'finalize output' });
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+    expect(result.phases._pipelineOutcome).toEqual({ outcome: 'failed' });
+    expect(
+      infoLog.mock.calls.some((call) => {
+        const text = String(call[0]);
+        return text.includes('producer stage') && text.includes('finalize');
+      })
+    ).toBe(true);
   });
 });
 

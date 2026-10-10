@@ -20,13 +20,37 @@
  *   skipOnFail：缺省/true 时非通过门直接 'break'；显式 false 时 'continue' 执行后续阶段。
  *   它只影响执行是否继续，不改变 outcome 里的非通过事实。
  *
+ * 源阶段最终回执超时（I05，方案 A「超时即终态」）：规则只覆盖 produce 上游的分析类阶段（analyze /
+ *   evolve 等，即源阶段不是 producer；producer 的例外见本段末尾）。门评估照常进行并记录，但动作按
+ *   下表改写——
+ *   - pass / summary_rewrite / record_repair → 不是恢复（rewrite/repair 只改 reply，最终回执仍
+ *                               timedOut；门 pass 更不会改回执），改走 analysis_retry 整段重跑——
+ *                               这是最终回执规则唯一承认的恢复路径（重跑成功会覆盖回执）
+ *   - analysis_retry / retry  → 原样进入重试分支；额度用尽、被会话输入预算压制时都是终态 'break'
+ *   - degrade 族 / aborted    → 原样（本就终态）
+ *   - reject 及其他非通过动作 → 终态 'break'（skipOnFail=false 也不继续：超时回执无可继续之物）
+ *   每条终态都写 diagnostics.warn(pipeline_timeout_terminal) + warn 日志 + abandonInfo(action=
+ *   timeout_terminal)。执行阶段最终回执超时而下一阶段不是裁决它的门时，主循环直接 'break'，
+ *   避免 produce 在超时的 analyze 上白跑并持久化候选（宿主按 timedOutStages 判 timeout、计 0 候选）。
+ *   严格链无法合成 transition，源阶段超时时 pass 直接终态；门自身非通过仍走 fail-closed。
+ *   producer 阶段（按名 produce/producer，或严格链 strict-producer-v1 角色面；判别与
+ *   withProducerCoverageBudget / #resolveStageTracker 同源，见 #isProducerStage）不在规则内，保持
+ *   改动前语义：它边跑边经 knowledge.submit 持久化候选，宿主（AgentRunProjections.
+ *   isRecoverableProducerTimeoutIssue）按 status=timeout + timedOutStages 含 produce +
+ *   phases.produce.toolCalls 里的持久化提交数判「超时可救回」并按首轮回执计数。裁决它的门
+ *   （rejection_gate / 严格链 G2）按评估器原始裁决处理：pass 则管线正常结束、outcome 仍按最终回执
+ *   判 failed、status 仍为 timeout 交宿主判定；retry 仍是既有拒绝重试。若把 pass 改写成
+ *   analysis_retry，会用「N 个提交被拒绝」的拒绝重试 prompt 白跑一轮，并以第二轮回执覆盖首轮已
+ *   持久化的提交，宿主计 0 候选——这正是规则不覆盖 producer 的原因。producer 自身超时也不触发
+ *   主循环的直接终止（同一边界，见 #terminateOnTimedOutStage）。
+ *
  * 严格链（strategyContext 携带 strict production 上下文）：第一个非通过门 fail-closed——写 typed
  * gate return、置 strictFailed 并 'break'，legacy repair/degrade/skipOnFail 均不接管；只有
  * strictGate.retryMode='strict-analysis-epoch' 的 analysis_retry 允许回退到 strict-analyst 阶段，
  * 每次 transition 追加到 phaseResults._strictAnalysisLoopReceipt（只追加，不校验跨 gate 连续性）。
  *
- * 结局投影：execute 末尾把 aborted / failed(strictFailed 或阶段超时) / abandoned(degrade 族、
- * retry_exhausted、其他非通过) / completed 连同 abandonInfo 写入 phaseResults._pipelineOutcome，
+ * 结局投影：execute 末尾把 aborted / failed(strictFailed 或阶段最终回执超时) / abandoned(degrade
+ * 族、retry_exhausted、其他非通过) / completed 连同 abandonInfo 写入 phaseResults._pipelineOutcome，
  * 供父 run 聚合 abandonedModules。修复微阶段的结果也写入 phaseResults，不能据插入顺序猜最后主阶段。
  *
  * 其他特性：Stage 支持 promptBuilder(context)、systemPrompt、onToolCall；per-stage 硬超时；
@@ -52,6 +76,7 @@ import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector, isDegradeGateAction } from '../runtime/DiagnosticsCollector.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
+import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import { runStageAttempt, type StageAttemptScope } from './pipeline/attempt.js';
 import type { PipelineRuntime, StageResult } from './pipeline/contracts.js';
 import { Strategy } from './Strategy.js';
@@ -453,6 +478,11 @@ export class PipelineStrategy extends Strategy {
       // ── 执行阶段 ──
       await this.#executeStage(runtime, message, stage, ctx, bus);
       lastMainStageName = stage.name;
+      // I05：最终回执超时即终态。下一阶段若是裁决本阶段的门，由 #processGate 决定整段重跑
+      // 或终止；否则这里直接终止，不让下游(典型是 produce)在超时回执上白跑并持久化候选。
+      if (this.#terminateOnTimedOutStage(stage, i, ctx)) {
+        break;
+      }
     }
 
     // 最终回复 = 最后一个执行阶段的输出
@@ -533,10 +563,32 @@ export class PipelineStrategy extends Strategy {
     if (this.#isCancelled(ctx)) {
       return 'break';
     }
-    this.#storeGateResult(stage, gateResult, ctx, bus);
     const strictContext = this.#strictProductionContext(ctx);
     const strictAnalysisRetryEnabled =
       Boolean(strictContext) && gate.strictGate?.retryMode === 'strict-analysis-epoch';
+
+    // I05：源阶段最终回执超时即终态。pass/summary_rewrite/record_repair 都不能覆盖超时回执，
+    // 改写为 analysis_retry 整段重跑后再入账(phaseResults/gateFailures/PROGRESS 只记有效裁决一次，
+    // 原始动作写进 reason)；无法重跑的动作先把评估器原始裁决入账，再记超时终态并终止。
+    // 见文件头「源阶段最终回执超时」动作表。
+    const timedOutSource = this.#timedOutGateSource(stage, ctx);
+    if (timedOutSource !== null) {
+      const resolved = this.#resolveTimedOutSourceGate(
+        stage,
+        gateResult,
+        timedOutSource,
+        Boolean(strictContext)
+      );
+      if (resolved.kind === 'terminal') {
+        this.#storeGateResult(stage, gateResult, ctx, bus);
+        this.#recordTimeoutTerminal(ctx, stage.name || 'gate', resolved.reason);
+        return 'break';
+      }
+      if (resolved.kind === 'rewritten') {
+        gateResult = resolved.gateResult;
+      }
+    }
+    this.#storeGateResult(stage, gateResult, ctx, bus);
 
     // 三态处理
     if (gateResult.action === 'pass') {
@@ -730,6 +782,15 @@ export class PipelineStrategy extends Strategy {
             this.#storeGateResult(stage, degradedGate, ctx, bus);
             ctx.degraded = true;
             ctx.diagnostics.markDegraded();
+            if (timedOutSource !== null) {
+              // I05：超时回执唯一的恢复路径(整段重跑)被预算压制 → 终态。abandonInfo 已由
+              // #storeGateResult 记为 degraded_budget_exhausted(首个即近因)，这里只补超时终态留痕。
+              this.#recordTimeoutTerminal(
+                ctx,
+                stage.name || 'gate',
+                `Stage "${timedOutSource}" final receipt timed out and the only recovery (full re-run) was suppressed: ${budgetSuppression.reason}; downstream stages skipped`
+              );
+            }
             return 'break';
           }
           phaseResults._retryContext = {
@@ -744,6 +805,24 @@ export class PipelineStrategy extends Strategy {
       // 记为第三种放弃形态。不设 ctx.degraded(该布尔只表示 degrade 类门动作)，
       // 只让 outcome/abandonedModules 观测面如实报 retry_exhausted。
       ctx.retryExhausted = true;
+      if (timedOutSource !== null) {
+        // I05：超时回执的整段重跑额度用尽(或门前没有可重跑的执行阶段)→ 终态。与普通
+        // retry_exhausted 不同：skipOnFail=false 也不继续——超时回执上没有可供下游消费的产物，
+        // 继续只会让 produce 白跑并持久化宿主计为 0 的候选。
+        const attempts = phaseResults[retryKey] as number;
+        this.#recordTimeoutTerminal(
+          ctx,
+          stage.name || 'gate',
+          `Stage "${timedOutSource}" final receipt timed out and analysis retries are exhausted (attempts=${attempts}, maxRetries=${maxRetries}` +
+            (attempts <= maxRetries ? ', no previous execution stage to retry' : '') +
+            `); downstream stages skipped` +
+            (stage.skipOnFail === false
+              ? ' (skipOnFail=false does not override a terminal timeout)'
+              : '') +
+            `; reason=${gateResult.reason || 'gate retries exhausted'}`
+        );
+        return 'break';
+      }
       if (!ctx.abandonInfo) {
         ctx.abandonInfo = {
           stage: stage.name || 'gate',
@@ -826,6 +905,185 @@ export class PipelineStrategy extends Strategy {
       code,
       stage: stageName,
     });
+  }
+
+  /**
+   * I05：门裁决的源阶段(stage.source 或门前最近的执行阶段)最终回执是否超时且落在规则覆盖范围内。
+   * 返回源阶段名或 null。只看 phaseResults 里的最终回执：一次超时后被 analysis_retry 重跑覆盖的
+   * 回执不再算超时，与 execute 末尾的 outcome 口径一致。
+   * 范围边界：源阶段是 producer(#isProducerStage)时返回 null——它的超时回执由宿主按持久化提交数
+   * 判可救回，门按评估器原始裁决处理，首轮回执不被第二轮覆盖(见文件头 producer 说明)。
+   */
+  #timedOutGateSource(stage: PipelineStage, ctx: PipelineContext): string | null {
+    const sourceName = (stage.source || this.#prevStageName(stage)) as string | null;
+    if (!sourceName) {
+      return null;
+    }
+    const receipt = ctx.phaseResults[sourceName] as StageResult | undefined;
+    if (receipt?.timedOut !== true) {
+      return null;
+    }
+    const sourceStage = this.#stages.find((entry) => !entry.gate && entry.name === sourceName);
+    if (this.#isProducerStage(sourceStage)) {
+      const gateName = stage.name || 'gate';
+      const toolCalls = receipt.toolCalls || [];
+      const persistedSubmits = toolCalls.filter(isPersistedSubmission).length;
+      // 分叉留痕：触发条件(producer 超时)、选择路径(规则不适用、门按原裁决)、关键输入(回执里的
+      // 持久化提交数)、后续校验依据(宿主按 timedOutStages + 持久化提交数判可救回)。
+      _pipelineLogger().info(
+        `[PipelineStrategy] Gate "${gateName}" source stage "${sourceName}" final receipt timed out, but it is the producer stage — timeout-terminal rule not applied: gate verdict handled as-is and the first attempt's receipt is kept (persistedKnowledgeSubmits=${persistedSubmits}, toolCalls=${toolCalls.length}); the host decides recoverability from timedOutStages + persisted submits`,
+        {
+          gate: gateName,
+          sourceStage: sourceName,
+          persistedKnowledgeSubmits: persistedSubmits,
+          toolCalls: toolCalls.length,
+        }
+      );
+      return null;
+    }
+    return sourceName;
+  }
+
+  /**
+   * I05 规则的覆盖边界：producer 阶段按名(produce/producer，与 withProducerCoverageBudget /
+   * #resolveStageTracker 同一判别)或严格链角色面(strict-producer-v1)识别；门阶段永远不是 producer。
+   * producer 的超时回执不进「超时即终态」规则——理由见文件头「源阶段最终回执超时」段落。
+   */
+  #isProducerStage(stage: PipelineStage | undefined): boolean {
+    if (!stage || stage.gate) {
+      return false;
+    }
+    return (
+      stage.name === 'produce' ||
+      stage.name === 'producer' ||
+      stage.strictRoleSurface === 'strict-producer-v1'
+    );
+  }
+
+  /**
+   * I05：源阶段最终回执超时时裁决门动作(文件头「源阶段最终回执超时」动作表)。纯判定，不写状态：
+   *   - rewritten：pass/summary_rewrite/record_repair 改写为 analysis_retry(保留 artifact 供重试
+   *     prompt，原始动作写进 reason)；
+   *   - passthrough：analysis_retry/retry、degrade 族、aborted 原样交给既有分支；
+   *   - terminal：reject 等其他非通过动作——既不能重跑也无可继续之物(不看 skipOnFail)。
+   * 严格链：strict analysis_retry 只接受评估器签发的 transition，管线无权合成，因此
+   * pass/summary_rewrite/record_repair 直接 terminal；其余动作 passthrough 走既有 strict 分支
+   * (带 transition 的 analysis_retry 仍可重跑，非通过仍 fail-closed)。
+   */
+  #resolveTimedOutSourceGate(
+    stage: PipelineStage,
+    gateResult: GateEvalResult,
+    sourceName: string,
+    strict: boolean
+  ):
+    | { kind: 'rewritten'; gateResult: GateEvalResult }
+    | { kind: 'terminal'; reason: string }
+    | { kind: 'passthrough' } {
+    const action = gateResult.action;
+    const gateName = stage.name || 'gate';
+    const notARecovery =
+      action === 'pass' || action === 'summary_rewrite' || action === 'record_repair';
+    if (notARecovery) {
+      if (strict) {
+        return {
+          kind: 'terminal',
+          reason: `Stage "${sourceName}" final receipt timed out on the strict chain; gate action "${action}" cannot recover a timed-out receipt and the pipeline cannot synthesize a strict analysis_retry transition; downstream stages skipped`,
+        };
+      }
+      const reason =
+        `Stage "${sourceName}" final receipt timed out; gate action "${action}" cannot recover a timed-out receipt, ` +
+        `so the stage is re-run in full (analysis_retry)` +
+        (gateResult.reason ? `; gate reason: ${gateResult.reason}` : '');
+      _pipelineLogger().info(
+        `[PipelineStrategy] Gate "${gateName}" action "${action}" rewritten to analysis_retry — source stage "${sourceName}" final receipt timed out (only a full re-run can replace it)`,
+        { gate: gateName, sourceStage: sourceName, originalAction: action }
+      );
+      return {
+        kind: 'rewritten',
+        gateResult: { ...gateResult, action: 'analysis_retry', pass: false, reason },
+      };
+    }
+    if (
+      action === 'analysis_retry' ||
+      action === 'retry' ||
+      action === 'aborted' ||
+      isDegradeGateAction(action) ||
+      strict
+    ) {
+      return { kind: 'passthrough' };
+    }
+    return {
+      kind: 'terminal',
+      reason:
+        `Stage "${sourceName}" final receipt timed out and gate returned non-pass action "${action}" (no re-run requested); downstream stages skipped` +
+        (stage.skipOnFail === false
+          ? ' (skipOnFail=false does not override a terminal timeout)'
+          : '') +
+        `; reason=${gateResult.reason || 'Gate did not pass'}`,
+    };
+  }
+
+  /**
+   * I05：超时终态的统一留痕——diagnostics.warn(pipeline_timeout_terminal，随 result.diagnostics 到达
+   * 宿主) + warn 日志(运维定位) + abandonInfo(action=timeout_terminal，首个即近因，不覆盖已有)。
+   * outcome 本身由 execute 末尾按最终回执 timedOut 判 'failed'，这里不改 degraded/strictFailed。
+   */
+  #recordTimeoutTerminal(ctx: PipelineContext, stageName: string, reason: string): void {
+    const code = 'pipeline_timeout_terminal';
+    ctx.diagnostics.warn({ code, stage: stageName, message: reason });
+    _pipelineLogger().warn(`[PipelineStrategy] ${code} at "${stageName}": ${reason}`, {
+      code,
+      stage: stageName,
+    });
+    ctx.abandonInfo ??= { stage: stageName, action: 'timeout_terminal', reason };
+  }
+
+  /**
+   * I05：执行阶段最终回执超时且下一阶段不是裁决它的门时终止主循环。
+   * 取消路径(aborted)由循环顶部的 #isCancelled 处理，这里不抢先改写原因；最后一个阶段超时
+   * 没有下游可跳过，保持原语义(只由 outcome 报 failed)，不写终态留痕。
+   * 范围边界：producer 自身超时不终止(改动前语义，下游照常执行)——规则只保护 produce 不在超时的
+   * 上游回执上白跑；producer 的回执与可救回判定交宿主(见文件头 producer 说明)。
+   */
+  #terminateOnTimedOutStage(stage: PipelineStage, index: number, ctx: PipelineContext): boolean {
+    if (this.#isCancelled(ctx)) {
+      return false;
+    }
+    const receipt = ctx.phaseResults[stage.name] as StageResult | undefined;
+    if (receipt?.timedOut !== true) {
+      return false;
+    }
+    const downstream = this.#stages.slice(index + 1);
+    if (downstream.length === 0) {
+      return false;
+    }
+    const next = downstream[0];
+    if (next.gate && (next.source || this.#prevStageName(next)) === stage.name) {
+      return false;
+    }
+    const downstreamNames = downstream
+      .map((entry) => entry.name || (entry.gate ? 'gate' : 'stage'))
+      .join(', ');
+    if (this.#isProducerStage(stage)) {
+      const toolCalls = receipt.toolCalls || [];
+      const persistedSubmits = toolCalls.filter(isPersistedSubmission).length;
+      _pipelineLogger().info(
+        `[PipelineStrategy] Stage "${stage.name}" final receipt timed out, but it is the producer stage — timeout-terminal rule not applied: downstream stages continue on pre-I05 semantics (${downstreamNames}; persistedKnowledgeSubmits=${persistedSubmits}, toolCalls=${toolCalls.length})`,
+        {
+          stage: stage.name,
+          downstream: downstreamNames,
+          persistedKnowledgeSubmits: persistedSubmits,
+          toolCalls: toolCalls.length,
+        }
+      );
+      return false;
+    }
+    this.#recordTimeoutTerminal(
+      ctx,
+      stage.name,
+      `Stage "${stage.name}" final receipt timed out and no gate adjudicates it; downstream stages skipped: ${downstreamNames}`
+    );
+    return true;
   }
 
   #getRetryBudgetSuppression(
