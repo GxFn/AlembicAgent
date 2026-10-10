@@ -12,6 +12,27 @@ const logger = () => Logger.getInstance();
 /** 拒绝诊断统一消息；测试与宿主日志过滤都以这条消息定位独立评审的拒绝事件。 */
 const REJECT_LOG_MESSAGE = '[IndependentValueReviewer] independent review rejected';
 
+/**
+ * 独立性不可比诊断统一消息，与拒绝日志分开过滤：它不是拒绝，verdict 不受影响。
+ * 诊断 reasonCode 固定为 `reviewer-independence-uncomparable`，coordinateIssue 说明不可比的形状。
+ */
+const INDEPENDENCE_UNCOMPARABLE_LOG_MESSAGE =
+  '[IndependentValueReviewer] reviewer independence uncomparable';
+
+/**
+ * 摘要形状的身份段：可选算法标签加 40–128 位十六进制（sha1/sha256/sha384/sha512），
+ * 覆盖宿主 StrictAuthorization 校验的 `sha256:<64hex>` modelHash。这样的段标识模型内容哈希，
+ * 不是 provider/model 字面坐标，无法与 reviewer 的 `${provider}/${model}` 比较。
+ */
+const DIGEST_SEGMENT_PATTERN = /^(?:[a-z0-9-]+:)?[0-9a-f]{40,128}$/iu;
+
+/**
+ * producerIdentity 与 reviewer 坐标不可比的原因：
+ * - `model-hash-coordinate`：某一段是摘要（宿主生产格式 `producer/sha256:<64hex>`）；
+ * - `provider-model-shape-missing`：缺少 `<provider>/<model>` 两段（空串、无分隔符、某段为空）。
+ */
+type ProducerCoordinateIssueV1 = 'model-hash-coordinate' | 'provider-model-shape-missing';
+
 export interface FrozenEvidenceEntryV1 {
   readonly evidenceEntryId: string;
   readonly relativePath: string;
@@ -57,6 +78,13 @@ export interface IndependentReviewDecisionV1 {
   readonly admissionReceiptId: string;
   readonly calibrationReceiptHash: string;
   readonly sourceRevisionVectorHash: string;
+  /**
+   * 模型评审后的六轴裁决。七种整体拒绝（repair limit、source drift、reviewer 不独立、authored
+   * 证据缺失、输出/citation/rubric 无效）固定为空数组且 citedLines 为空：这些拒绝没有发生过逐轴
+   * 评分，不伪造六轴 fail/0。Core createStrictG2ReceiptV1 要求恰好六行，宿主遇 verdict=reject 且
+   * axes 为空时必须在构造 G2 之前直接终结并带上 reasonCode（P20 方案 A）；契约由
+   * test/independent-value-reviewer-core-g2-contract.test.ts 记录。
+   */
   readonly axes: readonly IndependentReviewAxisV1[];
   readonly noveltyDecision: 'novel-project-specific' | 'known-general' | 'not-novel';
   readonly duplicateDecision: 'no-match' | 'merge' | 'duplicate';
@@ -211,6 +239,27 @@ export class IndependentValueReviewer {
         producerIdentity: input.producerIdentity,
       });
     }
+    // 过渡期诊断（P20/C05）：上面的全等比较只对同一坐标系的 `<provider>/<model>` 有意义。
+    // 唯一生产宿主传入的是 `producer/${planning.modelHash}`（模型内容哈希），与 reviewer 坐标
+    // 没有规范化映射，比较必然不相等、独立性守卫形同虚设。这里只识别“比较无意义”的形状并
+    // 记录诊断，verdict 与 decision 均不变；结构化身份与双方共用的规范化函数属于跨仓决定②⑤。
+    const coordinateIssue = classifyProducerCoordinate(input.producerIdentity);
+    if (coordinateIssue !== null) {
+      observeSafely(
+        () =>
+          logger().warn(INDEPENDENCE_UNCOMPARABLE_LOG_MESSAGE, {
+            reasonCode: 'reviewer-independence-uncomparable',
+            coordinateIssue,
+            producerIdentity: input.producerIdentity,
+            reviewerIdentity,
+            admissionReceiptId: input.admissionReceiptId,
+            repairAttempt: input.repairAttempt,
+            sourceRevisionVectorHash: input.evidence.sourceRevisionVectorHash,
+            verdictEffect: 'none',
+          }),
+        () => undefined
+      );
+    }
     const authoredEvidenceIds = new Set(input.authored.evidenceEntryIds);
     const suppliedEvidenceIds = new Set(
       input.evidence.entries.map((entry) => entry.evidenceEntryId)
@@ -272,6 +321,10 @@ export class IndependentValueReviewer {
     // 裁决顺序刻意保持原样（narrow 先于 novelty/duplicate、merge 归 narrow）：按 Core 顺序
     // 重写属于 P21 的 verdict 部分，需与 P20 宿主改动同批落地，本批不改。parseReview 已保证
     // verdict/score 配对，下面的 `|| axis.score === 0/1` 兜底此时恒与 verdict 判断等价。
+    // 现状（narrow×not-novel/known-general、pass×merge 经宿主映射后 Core 抛
+    // STRICT_G2_REPAIR_FIELDS_INVALID；duplicate 被宿主硬编码 no-match）由
+    // test/independent-value-reviewer-core-g2-contract.test.ts 以 it.fails 记录，待 P20 跨仓决定
+    //（Core 导出单一 G2 verdict 纯函数，Agent 与宿主同批接入）落地后翻回 it。
     const verdict = axes.some((axis) => axis.verdict === 'fail' || axis.score === 0)
       ? 'reject'
       : axes.some((axis) => axis.verdict === 'narrow' || axis.score === 1) ||
@@ -470,6 +523,42 @@ function describeRawOutput(raw: unknown): {
     return { rawSha256: null, rawLength: null, rawType: typeof raw };
   }
   return { rawSha256: sha256(raw), rawLength: raw.length, rawType: 'string' };
+}
+
+/**
+ * 判断 producerIdentity 能否与 reviewer 坐标比较；返回 null 表示形状可比（字符串全等有意义）。
+ *
+ * 两种坐标的来源：
+ * - reviewer：`ReviewerIdentityV1.provider/model`，宿主取自授权回执 `planning.reviewer.identity`
+ *   的自由符号，比较串为 `${provider}/${model}`（Core G2 actor 再追加 `/${method}`）；
+ * - producer：`IndependentValueReviewInputV1.producerIdentity` 自由字符串。唯一生产宿主
+ *   StrictPrivateCorpusRuntime 传入 `producer/${planning.modelHash}`，modelHash 是
+ *   StrictAuthorization 校验为 `sha256:<64hex>` 的模型内容哈希，不含 provider/model 字面值。
+ *
+ * 因此只有 reviewer.provider 字面量为 'producer' 且 model 恰为该哈希的人为配置才会全等命中，
+ * 生产中独立性检查实际是死分支；Core createStrictG2ReceiptV1 的 identity 全等检查同样如此。
+ * 本函数只按形状判断（摘要段、缺段），不猜测 provider 名称的合法集合：形如 `producer/different`
+ * 这类字面 `<provider>/<model>` 仍视为可比。
+ */
+function classifyProducerCoordinate(producerIdentity: unknown): ProducerCoordinateIssueV1 | null {
+  // 非字符串违反类型契约，同样无法比较；按缺段归类而不抛错，保持 review() 的原有失败形态。
+  if (typeof producerIdentity !== 'string') {
+    return 'provider-model-shape-missing';
+  }
+  const trimmed = producerIdentity.trim();
+  const separator = trimmed.indexOf('/');
+  if (separator <= 0 || separator === trimmed.length - 1) {
+    return DIGEST_SEGMENT_PATTERN.test(trimmed)
+      ? 'model-hash-coordinate'
+      : 'provider-model-shape-missing';
+  }
+  const provider = trimmed.slice(0, separator);
+  // model 段允许再含 '/'（例如 openrouter/meta/llama-3），只按首个分隔符切分。
+  const model = trimmed.slice(separator + 1);
+  if (DIGEST_SEGMENT_PATTERN.test(provider) || DIGEST_SEGMENT_PATTERN.test(model)) {
+    return 'model-hash-coordinate';
+  }
+  return null;
 }
 
 /**
