@@ -76,6 +76,12 @@ export interface StrictProducerExpressionSetV1 {
   readonly setHash: string;
 }
 
+/**
+ * 建集输入由三段合并：模型提案（proposals、zeroDisposition.reasonCode/authored，形状由
+ * StrictProductionPrompts 的内部输出契约渲染给模型）、宿主权威（lineage、parentSet、modelHash、
+ * reasonHash）与宿主封印（zeroDisposition.dispositionReview）。类型尚未拆成“提案/封印”两段
+ * （已批准的跨仓第二步，届时零处置允许以待审查形态通过 G2，再由宿主终态封印）。
+ */
 export interface CreateStrictProducerExpressionSetInputV1 {
   readonly lineage: StrictProducerLineageReceiptV1;
   readonly parentSet: StrictProducerExpressionSetV1 | null;
@@ -83,6 +89,11 @@ export interface CreateStrictProducerExpressionSetInputV1 {
   readonly zeroDisposition: {
     readonly reasonCode: string;
     readonly authored: FullAuthoredProjectionV1;
+    /**
+     * 宿主经独立语义审查会话生成并注入的 producer-non-draft 回执，不是模型输出。当前实现在
+     * 建集时即要求该回执（createStrictProducerZeroDisposition fail-closed），而宿主真实零审查
+     * 在 G2 之后才生成，所以跨仓第二步落地前真实 provider 的零处置会在 G2 失败关闭。
+     */
     readonly dispositionReview: KnowledgeDispositionReviewV1;
   } | null;
   readonly modelHash: string;

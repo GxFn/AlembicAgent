@@ -35,6 +35,10 @@ export interface StrictInductionInputV1 {
   readonly mode: 'recurring' | 'bounded-singleton';
   readonly hypotheses: readonly HypothesisV1[];
   readonly zeroHypothesisReason?: InductionReceiptV1['zeroHypothesisReason'];
+  /**
+   * 宿主经独立语义审查会话生成并注入的 zero-hypothesis 回执，不是模型输出；模型只提交
+   * zeroHypothesisReason 提案。缺失或伪造都会在 Core createInductionReceiptV1 失败关闭。
+   */
   readonly zeroHypothesisDispositionReview?: KnowledgeDispositionReviewV1;
 }
 
@@ -52,23 +56,43 @@ export interface StrictFalsificationInputV1 {
     FalsificationReceiptV1['counterqueryApplicability'],
     'reviewerReceiptId'
   >;
+  /**
+   * 宿主经独立语义审查会话生成并注入的 falsification 回执，不是模型输出；模型只提交 ids、
+   * executions 与 counterqueryApplicability 提案，reviewerReceiptId 由此回执派生。
+   */
   readonly dispositionReview: KnowledgeDispositionReviewV1;
 }
 
+/**
+ * 一个 Analyst epoch 的完整校验输入，由三段合并而成：
+ * - 模型处置提案：clusterInputs、nonClusteredDispositions、inductionInputs、falsificationInputs、
+ *   hypothesisDispositions 中除审查回执以外的字段，形状由 StrictProductionPrompts 的内部输出
+ *   契约渲染给模型；
+ * - 宿主权威：population、knownFactIds、enrolledObligationIds，宿主用自身记录覆盖模型回传；
+ * - 宿主封印：currentAnalysisFixpointHash、各 dispositionReview 与 dispositionReviews，由宿主经
+ *   独立语义审查会话生成后注入，模型不能也不得产出。
+ * 类型尚未拆成“提案/封印”两段（已批准的跨仓第二步）；在此之前宿主在调用
+ * validateStrictAnalystEpochV1 前自行合并，缺少封印段会在此 fail-closed。
+ */
 export interface StrictAnalystEpochInputV1 {
   /**
-   * 这是 Core 的 analysis review context，不是最终 fixpoint receipt hash。调用者可以预先计算，
-   * 但 createStrictAnalysisFixpointV1 会用完整 schedule/population/cluster 集重新计算并对账。
+   * 这是 Core 的 analysis review context hash（createAnalysisReviewContextHashV1），不是最终
+   * fixpoint receipt hash。它依赖本 epoch 的 cluster set，由宿主在封印审查时计算并注入，模型
+   * 不输出；createStrictAnalysisFixpointV1 会用完整 schedule/population/cluster 集重新计算并对账。
    */
   readonly currentAnalysisFixpointHash: string;
+  /** 宿主权威：已执行的全部 factId，覆盖模型回传的同名字段。 */
   readonly knownFactIds: readonly string[];
+  /** 宿主权威：已登记的全部 obligationId，覆盖模型回传的同名字段。 */
   readonly enrolledObligationIds: readonly string[];
+  /** 宿主权威：canonical population 及其真实 Core execution receipts，覆盖模型回传的同名结构。 */
   readonly population: ObservationPopulationInputV1;
   readonly clusterInputs: readonly KnowledgeClusterInputV1[];
   readonly nonClusteredDispositions: readonly {
     readonly observationId: string;
     readonly status: 'discarded' | 'unresolved';
     readonly reasonCode: string;
+    /** 宿主注入的 cluster-discard 回执（discarded 必需），不是模型输出。 */
     readonly dispositionReview?: KnowledgeDispositionReviewV1;
     readonly owner?: string;
     readonly resumePoint?: string;
@@ -76,7 +100,10 @@ export interface StrictAnalystEpochInputV1 {
   readonly inductionInputs: readonly StrictInductionInputV1[];
   readonly falsificationInputs: readonly StrictFalsificationInputV1[];
   readonly hypothesisDispositions: readonly StrictHypothesisDispositionV1[];
-  /** 精确 review ledger；必须与上述 consumer 实际嵌入的 review 一一相等，额外行即 orphan。 */
+  /**
+   * 精确 review ledger，由宿主从其注入的回执汇总，不是模型输出；必须与上述 consumer 实际嵌入
+   * 的 review 一一相等，额外行即 orphan。
+   */
   readonly dispositionReviews: readonly KnowledgeDispositionReviewV1[];
 }
 

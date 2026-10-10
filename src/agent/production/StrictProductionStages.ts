@@ -45,6 +45,9 @@ export function buildStrictProductionPipelineStagesV1() {
       additionalTools: [],
       disableTracker: true,
       toolChoiceOverride: 'none',
+      // 提示只由端口快照与 StrictProductionPrompts 的内部输出契约渲染，宿主 run message 不转发
+      // （ctx.message 有意不读），所以模型可见的输出形状必须在契约常量中完整给出。审查回执
+      // 不是模型输出：模型回复原样交给宿主门，由宿主在 Core 校验前注入真实审查。
       promptBuilder: (ctx: Record<string, unknown>) => {
         const strict = readStrictPort(ctx);
         return buildStrictAnalystPrompt({
@@ -79,6 +82,8 @@ export function buildStrictProductionPipelineStagesV1() {
       additionalTools: [],
       disableTracker: true,
       toolChoiceOverride: 'none',
+      // 同上：Producer 只输出 expressionSets 提案；零处置的 producer-non-draft 回执由宿主封印，
+      // 不由模型携带。
       promptBuilder: (ctx: Record<string, unknown>) => {
         const strict = readStrictPort(ctx);
         return buildStrictProducerPrompt(strict.buildProducerInput(ctx.gateArtifact));
