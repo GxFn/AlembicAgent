@@ -168,6 +168,13 @@ export class AgentStageFactoryRegistry {
       const presetQualityGate = requirePresetStage(insightStages, 'insight', 'quality_gate');
       const presetProduce = requirePresetStage(insightStages, 'insight', 'produce');
       const presetRejectionGate = requirePresetStage(insightStages, 'insight', 'rejection_gate');
+      // I04(L5-P29)：增量重扫的 createBudget 是计划层硬配额(Core KnowledgeRescanPlanBuilder 令
+      // createBudget=gap，Core 简报与 insightProducer 文案都写"提交数量不得超过 createBudget"，宿主
+      // PcvStageNodeMap 记为 gapLimit)。只写 maxSubmits/softSubmitLimit 不够：PipelineStrategy 的
+      // H3 覆盖率放大把显式 maxSubmits 当作下限，按 quality_gate findings 放大到 findings+4。这里
+      // 额外写 hardSubmitCap 作为"不可放大"的标记——它是阶段预算字段(StageBudget 索引签名)，不进入
+      // sharedState/strategyContext/phaseResults 共享容器，也不是公开导出；无 rescan 配额的 bootstrap
+      // 冷启动不写该字段，H3 放大保持原样。
       const produceStage = {
         ...presetProduce,
         ...(rescanCreateBudget != null && rescanCreateBudget > 0
@@ -176,6 +183,7 @@ export class AgentStageFactoryRegistry {
                 ...((presetProduce.budget as Record<string, unknown> | undefined) || {}),
                 maxSubmits: rescanCreateBudget,
                 softSubmitLimit: rescanCreateBudget,
+                hardSubmitCap: rescanCreateBudget,
               },
             }
           : {}),

@@ -11,6 +11,8 @@
  */
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
+import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import { runModuleMining } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
@@ -675,5 +677,442 @@ describe('PipelineStrategy — 门耗尽 / 未知动作 / 评估异常的诊断(
     expect(failed[0].stage).toBe('quality_gate');
     expect(failed[0].message).toContain('"analyze"');
     expect(failed[0].message).toMatch(/no decision/);
+  });
+});
+
+// ─── I04(L5-P29)：produce 提交上限——rescan createBudget 是硬上限，gate 重试沿用 retryBudget ───
+// 背景：AgentStageFactoryRegistry 在增量重扫时把 produce 的 maxSubmits/softSubmitLimit 写成
+// createBudget(Core 简报、insightProducer 文案与宿主 gapLimit 都声明它是硬配额)，但
+// PipelineStrategy 的 H3 覆盖率放大不区分来源：createBudget=2、findings=10 时被放大成
+// maxSubmits=14/targetSubmits=10，tracker 到第 10 次提交才离开 PRODUCE；rejection_gate 判 retry
+// 时声明为"缩减预算"的 retryBudget(300s)同样被放大到 1800s 并注入 targetSubmits。
+// 本组测试锁定：Factory 写 hardSubmitCap；放大按 min(findings, cap) 封顶；重试轮不放大；
+// bootstrap 冷启动(无 cap)保留放大；每个分叉都有可定位日志。
+describe('PipelineStrategy — produce 覆盖率预算：rescan 硬上限与重试预算不放大(I04)', () => {
+  type ProduceCapture = {
+    budget: Record<string, unknown> | undefined;
+    tracker: ExplorationTracker | null;
+  };
+
+  /** 捕获每次 produce 阶段 reactLoop 收到的 budgetOverride 与 tracker。 */
+  function createCapturingRuntime() {
+    const produceCalls: ProduceCapture[] = [];
+    const runtime = {
+      id: 'capturing-runtime',
+      async reactLoop(_prompt: string, opts?: Record<string, unknown>) {
+        const phase = (opts?.context as Record<string, unknown> | undefined)?.pipelinePhase;
+        if (phase === 'produce') {
+          produceCalls.push({
+            budget: opts?.budgetOverride as Record<string, unknown> | undefined,
+            tracker: (opts?.tracker as ExplorationTracker | null | undefined) ?? null,
+          });
+        }
+        // 带一条工具调用：既不是 timedOut 也不是零工具，避免误入 fast-retry 分支。
+        return {
+          reply: 'stage output long enough to be a reply',
+          toolCalls: [{ tool: 'knowledge' }],
+          tokenUsage: { input: 1, output: 1 },
+          iterations: 1,
+        };
+      },
+    };
+    return { runtime, produceCalls };
+  }
+
+  function findingsOf(count: number) {
+    return Array.from({ length: count }, (_, i) => ({ finding: `f${i}`, evidenceRefs: [] }));
+  }
+
+  function qualityGateWithFindings(count: number) {
+    return {
+      name: 'quality_gate',
+      gate: {
+        evaluator: () => ({
+          action: 'pass',
+          pass: true,
+          artifact: { findings: findingsOf(count) },
+        }),
+      },
+    };
+  }
+
+  /** 模拟 producer 每轮提交 1 个已持久化候选，返回离开 PRODUCE 的提交序号(或 null)。 */
+  function submitUntilLeavingProduce(tracker: ExplorationTracker, maxRounds: number) {
+    for (let i = 1; i <= maxRounds; i++) {
+      tracker.tick();
+      tracker.recordToolCall(
+        'knowledge',
+        { action: 'submit', title: `candidate-${i}` },
+        { status: 'created', id: `cand-${i}`, lifecycle: 'pending' }
+      );
+      tracker.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+      if (tracker.phase !== 'PRODUCE') {
+        return i;
+      }
+    }
+    return null;
+  }
+
+  function spyInfoLog() {
+    return vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+  }
+
+  function buildRescanProduceStage(createBudget: number) {
+    const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true, hasExistingRecipes: false, prescreenDone: false },
+      context: { strategyContext: { rescanContext: { gap: createBudget, createBudget } } },
+    }) as Array<Record<string, unknown>>;
+    const produce = stages.find((stage) => stage.name === 'produce');
+    if (!produce) {
+      throw new Error('factory did not emit a produce stage');
+    }
+    // preset promptBuilder/retryPromptBuilder 依赖 dimConfig/projectInfo 等真机上下文；本测试只关心
+    // 预算，不渲染 prompt。
+    return {
+      ...produce,
+      promptBuilder: () => 'produce',
+      retryPromptBuilder: () => 'retry produce',
+    };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('Factory：rescanContext.createBudget=2 → produce.budget 写入 hardSubmitCap=2(与 maxSubmits/softSubmitLimit 同值)', () => {
+    const produce = buildRescanProduceStage(2);
+    expect(produce.budget).toMatchObject({ maxSubmits: 2, softSubmitLimit: 2, hardSubmitCap: 2 });
+  });
+
+  it('Factory：无 rescanContext(bootstrap 冷启动) → produce.budget 不带 hardSubmitCap', () => {
+    const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true, hasExistingRecipes: false, prescreenDone: false },
+      context: { strategyContext: {} },
+    }) as Array<Record<string, unknown>>;
+    const produce = stages.find((stage) => stage.name === 'produce') as Record<string, unknown>;
+    expect(produce.budget).toMatchObject({ maxSubmits: 10, softSubmitLimit: 10 });
+    expect((produce.budget as Record<string, unknown>).hardSubmitCap).toBeUndefined();
+  });
+
+  it('rescan 硬上限：createBudget=2 + 10 条 findings → maxSubmits=2/targetSubmits=2，第 2 次提交后进入 SUMMARIZE 且完成文本被接受', async () => {
+    const infoLog = spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const produce = buildRescanProduceStage(2);
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze', promptBuilder: () => 'analyze', budget: { maxIterations: 1 } },
+        qualityGateWithFindings(10),
+        produce,
+      ],
+    });
+    // 预置一个 analyst tracker：produce 阶段据此按有效预算重建 producer tracker。
+    const seedTracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 4 }
+    );
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }), {
+      strategyContext: { tracker: seedTracker, source: 'system' },
+    });
+
+    expect(produceCalls).toHaveLength(1);
+    const { budget, tracker } = produceCalls[0];
+    expect(budget).toMatchObject({
+      maxSubmits: 2,
+      targetSubmits: 2,
+      softSubmitLimit: 2,
+      hardSubmitCap: 2,
+      // 时间只按封顶后的目标放大：2×90s 不超过原值 900s，保持原值。
+      timeoutMs: 900_000,
+    });
+    expect(tracker).not.toBeNull();
+    expect(tracker?.strategyName).toBe('producer');
+    // 真实 producer tracker：第 2 次持久化提交后离开 PRODUCE(修复前要到第 10 次)。
+    expect(submitUntilLeavingProduce(tracker as ExplorationTracker, 16)).toBe(2);
+    // 提交 2 个后回复完成文本必须被接受，而不是继续催促提交。
+    const t2 = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { ...budget }
+    );
+    submitUntilLeavingProduce(t2, 2);
+    t2.tick();
+    const textAfterTwo = t2.onTextResponse('生产完成，已提交全部候选。');
+    expect(textAfterTwo.shouldContinue).toBe(false);
+    expect(textAfterTwo.isFinalAnswer).toBe(true);
+    // 封顶分叉留痕：日志含 findings、cap 与最终取值。
+    const capLog = infoLog.mock.calls.find((c) => /capped by hardSubmitCap/.test(String(c[0])));
+    expect(capLog).toBeDefined();
+    expect(String(capLog?.[0])).toContain('findings=10');
+    expect(String(capLog?.[0])).toContain('hardSubmitCap=2');
+    expect(String(capLog?.[0])).toContain('maxSubmits=2');
+    expect(String(capLog?.[0])).toContain('targetSubmits=2');
+  });
+
+  it('封顶取 min(findings, cap)：cap=3 + 1 条 findings → targetSubmits=1、maxSubmits=3', async () => {
+    spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(1),
+        {
+          name: 'produce',
+          budget: {
+            maxIterations: 24,
+            maxSubmits: 3,
+            softSubmitLimit: 3,
+            hardSubmitCap: 3,
+            timeoutMs: 900_000,
+          },
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(produceCalls).toHaveLength(1);
+    expect(produceCalls[0].budget).toMatchObject({
+      maxSubmits: 3,
+      targetSubmits: 1,
+      timeoutMs: 900_000,
+    });
+  });
+
+  it('bootstrap 冷启动无 cap：24 条 findings 仍放大到 maxSubmits=28/targetSubmits=24，timeoutMs 封顶 1800s(H3 保持)', async () => {
+    const infoLog = spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(24),
+        {
+          name: 'produce',
+          budget: { maxIterations: 24, maxSubmits: 10, softSubmitLimit: 10, timeoutMs: 900_000 },
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'bootstrap' }));
+
+    expect(produceCalls).toHaveLength(1);
+    expect(produceCalls[0].budget).toMatchObject({
+      maxSubmits: 28,
+      targetSubmits: 24,
+      timeoutMs: 1_800_000,
+    });
+    expect(produceCalls[0].budget?.hardSubmitCap).toBeUndefined();
+    const ampLog = infoLog.mock.calls.find((c) => /coverage budget amplified/.test(String(c[0])));
+    expect(ampLog).toBeDefined();
+    expect(String(ampLog?.[0])).toContain('findings=24');
+    expect(String(ampLog?.[0])).toContain('maxSubmits=28');
+    expect(String(ampLog?.[0])).toContain('targetSubmits=24');
+  });
+
+  it.each([
+    ['0', 0],
+    ['NaN', Number.NaN],
+    ['负数', -2],
+    ['字符串', '2'],
+  ])('hardSubmitCap 非法(%s) → 忽略 cap 走放大，并打 warn 日志', async (_label, invalidCap) => {
+    spyInfoLog();
+    const warnLog = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(12),
+        {
+          name: 'produce',
+          budget: {
+            maxIterations: 24,
+            maxSubmits: 10,
+            hardSubmitCap: invalidCap,
+            timeoutMs: 900_000,
+          },
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'x' }));
+
+    expect(produceCalls).toHaveLength(1);
+    expect(produceCalls[0].budget).toMatchObject({ maxSubmits: 16, targetSubmits: 12 });
+    expect(
+      warnLog.mock.calls.some(
+        (c) => /invalid hardSubmitCap/.test(String(c[0])) && String(c[0]).includes('"produce"')
+      )
+    ).toBe(true);
+  });
+
+  it('rejection_gate 判 retry → 第二次 produce 的 budgetOverride 等于声明的 retryBudget(无 targetSubmits)，首轮仍放大', async () => {
+    const infoLog = spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const retryBudget = { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 };
+    let rejectionCalls = 0;
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(20),
+        {
+          name: 'produce',
+          budget: { maxIterations: 24, maxSubmits: 10, softSubmitLimit: 10, timeoutMs: 900_000 },
+          retryBudget,
+          retryPromptBuilder: () => 'retry prompt',
+        },
+        {
+          name: 'rejection_gate',
+          gate: {
+            maxRetries: 1,
+            evaluator: () => {
+              rejectionCalls++;
+              return rejectionCalls === 1
+                ? { action: 'retry', pass: false, reason: '3 rejections vs 0 successes' }
+                : { action: 'pass', pass: true };
+            },
+          },
+        },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'go' }));
+
+    expect(result.outcome).toBe('completed');
+    expect(produceCalls).toHaveLength(2);
+    // 首轮：bootstrap 无 cap，H3 放大保持。
+    expect(produceCalls[0].budget).toMatchObject({
+      maxSubmits: 24,
+      targetSubmits: 20,
+      timeoutMs: 1_800_000,
+    });
+    // 重试轮：严格等于声明的 retryBudget——不放大 timeoutMs、不注入 targetSubmits/maxSubmits。
+    expect(produceCalls[1].budget).toEqual(retryBudget);
+    expect(produceCalls[1].budget?.targetSubmits).toBeUndefined();
+    const skipLog = infoLog.mock.calls.find((c) =>
+      /coverage amplification skipped/.test(String(c[0]))
+    );
+    expect(skipLog).toBeDefined();
+    expect(String(skipLog?.[0])).toContain('retryBudget');
+    expect(String(skipLog?.[0])).toContain('findings=20');
+  });
+
+  it('rejection_gate 判 retry 且阶段无 retryBudget → 重试沿用 stage.budget 原值，不注入 targetSubmits', async () => {
+    spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const stageBudget = {
+      maxIterations: 24,
+      maxSubmits: 10,
+      softSubmitLimit: 10,
+      timeoutMs: 900_000,
+    };
+    let rejectionCalls = 0;
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(20),
+        { name: 'produce', budget: stageBudget },
+        {
+          name: 'rejection_gate',
+          gate: {
+            maxRetries: 1,
+            evaluator: () => {
+              rejectionCalls++;
+              return rejectionCalls === 1
+                ? { action: 'retry', pass: false, reason: 'rejected' }
+                : { action: 'pass', pass: true };
+            },
+          },
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'go' }));
+
+    expect(produceCalls).toHaveLength(2);
+    expect(produceCalls[0].budget).toMatchObject({ maxSubmits: 24, targetSubmits: 20 });
+    expect(produceCalls[1].budget).toEqual(stageBudget);
+  });
+
+  it('封顶后时间只按 cap 放大：cap=12 + 24 条 findings → maxSubmits=12/targetSubmits=12、timeoutMs=1080s(无 cap 时会放大到 1800s)', async () => {
+    const infoLog = spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(24),
+        {
+          name: 'produce',
+          budget: {
+            maxIterations: 24,
+            maxSubmits: 12,
+            softSubmitLimit: 12,
+            hardSubmitCap: 12,
+            timeoutMs: 900_000,
+          },
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(produceCalls).toHaveLength(1);
+    expect(produceCalls[0].budget).toMatchObject({
+      maxSubmits: 12,
+      targetSubmits: 12,
+      // P-5 时间放大按封顶后的 maxSubmits(12×90s=1080s)估算，而不是按 findings+4=28 → 1800s。
+      timeoutMs: 1_080_000,
+    });
+    const capLog = infoLog.mock.calls.find((c) => /capped by hardSubmitCap/.test(String(c[0])));
+    expect(String(capLog?.[0])).toContain('hardSubmitCap=12');
+    expect(String(capLog?.[0])).toContain('timeoutMs=1080000');
+  });
+
+  it('rescan + rejection_gate 判 retry：首轮按 cap=2 封顶，重试轮等于 preset retryBudget(300s/5 轮，无 targetSubmits)，skip 日志报告阶段声明的 cap', async () => {
+    const infoLog = spyInfoLog();
+    const { runtime, produceCalls } = createCapturingRuntime();
+    const produce = buildRescanProduceStage(2);
+    let rejectionCalls = 0;
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(10),
+        produce,
+        {
+          name: 'rejection_gate',
+          gate: {
+            maxRetries: 1,
+            evaluator: () => {
+              rejectionCalls++;
+              return rejectionCalls === 1
+                ? { action: 'retry', pass: false, reason: 'rejected' }
+                : { action: 'pass', pass: true };
+            },
+          },
+        },
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(result.outcome).toBe('completed');
+    expect(produceCalls).toHaveLength(2);
+    expect(produceCalls[0].budget).toMatchObject({
+      maxSubmits: 2,
+      targetSubmits: 2,
+      hardSubmitCap: 2,
+    });
+    // 重试轮严格等于 insight preset 声明的 retryBudget(缩减预算)：不放大、不注入 targetSubmits；
+    // 按决策"沿用声明的 retryBudget"，stage.budget 的 hardSubmitCap 也不补进重试预算。
+    expect(produceCalls[1].budget).toEqual({
+      maxIterations: 5,
+      temperature: 0.3,
+      timeoutMs: 300_000,
+    });
+    const skipLog = infoLog.mock.calls.find((c) =>
+      /coverage amplification skipped/.test(String(c[0]))
+    );
+    expect(skipLog).toBeDefined();
+    expect(String(skipLog?.[0])).toContain('reuses declared retryBudget');
+    expect(String(skipLog?.[0])).toContain('stageHardSubmitCap=2');
+    expect(String(skipLog?.[0])).toContain('timeoutMs=300000');
   });
 });

@@ -184,11 +184,47 @@ function producerStructuredFindingTarget(artifact: unknown): number {
   return Array.isArray(findings) ? findings.length : 0;
 }
 
+/**
+ * I04(L5-P29)：读取阶段预算上的 hardSubmitCap(增量重扫由 AgentStageFactoryRegistry 写入的硬配额)。
+ * 缺省/null/undefined → null(bootstrap 冷启动没有配额)；存在但不是有限正数 → 'invalid'，由调用方
+ * 记 warn 后按无配额处理——坏配置不能静默改变数量语义，也不能让 produce 因此拿到 0 上限。
+ */
+function readHardSubmitCap(budget: StageBudget | undefined): number | null | 'invalid' {
+  const raw = budget?.hardSubmitCap;
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    return 'invalid';
+  }
+  const cap = Math.floor(raw);
+  return cap > 0 ? cap : 'invalid';
+}
+
+/**
+ * produce 阶段的覆盖率预算：按 quality_gate 的结构化 findings 数决定提交目标/上限/时间。
+ *
+ * 三条分叉(每条都留日志)：
+ *   - isRetry：重试轮沿用声明预算(retryBudget 或 stage.budget 原值)，不放大、不注入 targetSubmits。
+ *     preset/stageBuilders 把 retryBudget 声明为"缩减预算"(5 轮/300s 等)，重试 prompt 只修被拒条目；
+ *     放大会把 300s 拉到 1800s 并让 tracker 以 targetSubmits=findings 催促提交全部条目。首轮已经
+ *     按覆盖率放大过一次，重试不是第二次覆盖；与 fast-retry 直接用 retryBudget 的口径一致。
+ *     按决策"沿用声明的 retryBudget"，这里不把 stage.budget 的 hardSubmitCap 补进 retryBudget：
+ *     重试轮的提交上限由 retryBudget 自身(未声明时是 tracker 默认值)决定，日志报告阶段声明的 cap
+ *     以便定位。
+ *   - hardSubmitCap(增量重扫)：配额是计划层硬上限——targetSubmits=min(findings, cap)、maxSubmits=cap，
+ *     tracker 在第 cap 次持久化提交后转 SUMMARIZE，完成文本不再被催促。
+ *   - 无 cap(bootstrap 冷启动)：保留 H3(2026-07-02 数量专项)放大——静态 10 会把丰富维度硬顶
+ *     (真机 findings=24 只能提 10)，放大到 findings+4(拒绝重试余量)，原值作下限。
+ * 时间预算(P-5)按最终 maxSubmits 估算：真机每轮提交 60-90s，90s/轮，下限原值、上限 1800s；封顶后
+ * cap×90s 通常不超过原值，等价于保持原值。
+ */
 function withProducerCoverageBudget(
   stage: PipelineStage,
   budget: StageBudget | undefined,
   gateArtifact: unknown,
-  strictProduction: boolean
+  strictProduction: boolean,
+  isRetry: boolean
 ): StageBudget | undefined {
   if (stage.name !== 'produce' && stage.name !== 'producer') {
     return budget;
@@ -196,26 +232,55 @@ function withProducerCoverageBudget(
   if (strictProduction) {
     return budget;
   }
-  const targetSubmits = producerStructuredFindingTarget(gateArtifact);
-  if (targetSubmits <= 0) {
+  const findingCount = producerStructuredFindingTarget(gateArtifact);
+  if (findingCount <= 0) {
     return budget;
   }
-  // H3(2026-07-02 数量专项)：maxSubmits 随 findings 放大——静态 10 会把丰富维度硬顶
-  // (真机 findings=24 只能提 10)。放大到 findings+4(拒绝重试余量)，原值作下限。
-  const baseMaxSubmits = Number((budget as { maxSubmits?: unknown } | undefined)?.maxSubmits) || 10;
-  const scaledMaxSubmits = Math.max(baseMaxSubmits, targetSubmits + 4);
-  // P-5：produce 时间预算随目标提交数放大——真机 DeepSeek 每轮提交(长 reasoning+payload)
-  // 60-90s，静态 900s 只够约 10 轮；目标更高时时间不放大等于数量白给。90s/轮估算，
-  // 下限保持原值、上限 1800s 防失控。
-  const baseTimeoutMs = Number((budget as { timeoutMs?: unknown } | undefined)?.timeoutMs) || 0;
+  const baseMaxSubmits = Number(budget?.maxSubmits) || 10;
+  const baseTimeoutMs = Number(budget?.timeoutMs) || 0;
+  const capState = readHardSubmitCap(budget);
+  if (isRetry) {
+    // 预算来源与 #executeStage 的选择顺序一致：retryBudget > stage.budget > 宿主算出的预算。
+    // 重试预算(preset retryBudget)本身不带 hardSubmitCap，这里按 stage.budget 报告阶段声明的配额，
+    // 让日志能看出"该阶段受 rescan 配额约束，但重试轮按声明的 retryBudget 原值运行"。
+    const budgetSource = stage.retryBudget
+      ? 'retryBudget'
+      : stage.budget
+        ? 'stage.budget'
+        : 'computed budget';
+    const stageCap = readHardSubmitCap(stage.budget);
+    _pipelineLogger().info(
+      `[PipelineStrategy] Stage "${stage.name}" (retry) reuses declared ${budgetSource} — producer coverage amplification skipped (findings=${findingCount}, stageHardSubmitCap=${stageCap === null ? 'none' : stageCap}, maxSubmits=${budget?.maxSubmits ?? 'default'}, timeoutMs=${baseTimeoutMs || '∞'})`
+    );
+    return budget;
+  }
+  if (capState === 'invalid') {
+    _pipelineLogger().warn(
+      `[PipelineStrategy] Stage "${stage.name}" ignores invalid hardSubmitCap=${String(budget?.hardSubmitCap)} — falling back to coverage amplification (findings=${findingCount}, baseMaxSubmits=${baseMaxSubmits})`
+    );
+  }
+  const hardSubmitCap = typeof capState === 'number' ? capState : null;
+  const targetSubmits =
+    hardSubmitCap !== null ? Math.min(findingCount, hardSubmitCap) : findingCount;
+  const maxSubmits =
+    hardSubmitCap !== null ? hardSubmitCap : Math.max(baseMaxSubmits, findingCount + 4);
   const scaledTimeoutMs =
     baseTimeoutMs > 0
-      ? Math.min(1_800_000, Math.max(baseTimeoutMs, scaledMaxSubmits * 90_000))
+      ? Math.min(1_800_000, Math.max(baseTimeoutMs, maxSubmits * 90_000))
       : baseTimeoutMs;
+  if (hardSubmitCap !== null) {
+    _pipelineLogger().info(
+      `[PipelineStrategy] Stage "${stage.name}" producer coverage budget capped by hardSubmitCap — findings=${findingCount}, hardSubmitCap=${hardSubmitCap}, baseMaxSubmits=${baseMaxSubmits} → maxSubmits=${maxSubmits}, targetSubmits=${targetSubmits}, timeoutMs=${scaledTimeoutMs || '∞'}`
+    );
+  } else {
+    _pipelineLogger().info(
+      `[PipelineStrategy] Stage "${stage.name}" producer coverage budget amplified — findings=${findingCount}, baseMaxSubmits=${baseMaxSubmits} → maxSubmits=${maxSubmits}, targetSubmits=${targetSubmits}, timeoutMs=${scaledTimeoutMs || '∞'}`
+    );
+  }
   return {
     ...(budget || {}),
     targetSubmits,
-    maxSubmits: scaledMaxSubmits,
+    maxSubmits,
     ...(scaledTimeoutMs > 0 ? { timeoutMs: scaledTimeoutMs } : {}),
   };
 }
@@ -1155,7 +1220,8 @@ export class PipelineStrategy extends Strategy {
       stage,
       configuredBudget ? { ...configuredBudget } : undefined,
       ctx.gateArtifact,
-      strictProduction
+      strictProduction,
+      isRetry
     );
     const retryBudget = stage.retryBudget ? { ...stage.retryBudget } : undefined;
     delete phaseResults[`_was_retry_${stage.name}`];
