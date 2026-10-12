@@ -271,6 +271,8 @@ export class ToolRouterAdapter implements ToolRouterContract {
     }
   }
 
+  // executeChildCall/explain 在 ToolRouterContract 上是可选成员（L3-C09）。本 adapter 仍实现它们，
+  // 供直接持有 adapter 的调用方使用；经契约类型拿到的路由要先判断方法是否存在。
   async executeChildCall(
     request: ToolCallRequest & { parentCallId: string }
   ): Promise<ToolResultEnvelope> {

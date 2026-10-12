@@ -1,5 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import Logger from '@alembic/core/logging';
+import ts from 'typescript';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as domain from '../src/agent/domain/index.js';
 import * as profiles from '../src/agent/profiles/index.js';
 import * as prompts from '../src/agent/prompts/index.js';
@@ -16,12 +20,18 @@ import {
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,
   alembicAgentPackage,
   allowToolDecision,
+  createToolRoutingServiceContract,
   denyToolDecision,
   getAgentInterfaceContractBranch,
   getAgentInterfaceFailureTaxonomyEntry,
   projectToolResultOrdinaryOutput,
+  resolveToolRouterFromContext,
   supportsAgentRuntimeRoute,
+  type ToolCallContext,
   type ToolResultEnvelope,
+  ToolRouterAdapter,
+  type ToolRouterContract,
+  type ToolServiceContracts,
   validateAgentInterfaceContract,
 } from '../src/index.js';
 
@@ -180,6 +190,185 @@ describe('explicit AlembicAgent contract subpaths', () => {
   it('exposes domain consolidation helpers', () => {
     expect(typeof domain.EpisodicConsolidator).toBe('function');
     expect(typeof domain.EvidenceCollector).toBe('function');
+  });
+});
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+/** 用真实编译器检查一段只做类型赋值的探针源码，返回该探针文件自身的诊断文本。 */
+function typecheckRouterContractProbes(probes: Record<string, string>): Record<string, string[]> {
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+    types: [],
+  };
+  // 探针放在 test/ 下的虚拟路径，按仓库自己的 package.json（type: module）走 NodeNext 解析。
+  const virtualFiles = new Map(
+    Object.entries(probes).map(([name, text]) => [path.join(REPO_ROOT, 'test', name), text])
+  );
+  const host = ts.createCompilerHost(options);
+  const baseGetSourceFile = host.getSourceFile.bind(host);
+  const baseFileExists = host.fileExists.bind(host);
+  const baseReadFile = host.readFile.bind(host);
+  host.fileExists = (fileName) => virtualFiles.has(fileName) || baseFileExists(fileName);
+  host.readFile = (fileName) => virtualFiles.get(fileName) ?? baseReadFile(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
+    const text = virtualFiles.get(fileName);
+    return text === undefined
+      ? baseGetSourceFile(fileName, languageVersion, onError, shouldCreate)
+      : ts.createSourceFile(fileName, text, languageVersion, true);
+  };
+  const program = ts.createProgram([...virtualFiles.keys()], options, host);
+  const result: Record<string, string[]> = {};
+  for (const [name] of Object.entries(probes)) {
+    const sourceFile = program.getSourceFile(path.join(REPO_ROOT, 'test', name));
+    expect(sourceFile).toBeDefined();
+    result[name] = [
+      ...program.getSyntacticDiagnostics(sourceFile),
+      ...program.getSemanticDiagnostics(sourceFile),
+    ].map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+  }
+  return result;
+}
+
+function routingContext(serviceContracts?: ToolServiceContracts): ToolCallContext {
+  return {
+    callId: 'fixture-call',
+    toolId: 'fixture-tool',
+    surface: 'runtime',
+    actor: { role: 'fixture' },
+    source: { kind: 'runtime', name: 'fixture' },
+    projectRoot: 'fixture-project',
+    services: {
+      get: () => {
+        throw new Error('fixture service locator is not used by routing resolution');
+      },
+    },
+    ...(serviceContracts ? { serviceContracts } : {}),
+  };
+}
+
+function blockedEnvelope(): ToolResultEnvelope {
+  return {
+    ok: false,
+    toolId: 'fixture-tool',
+    callId: 'fixture-call',
+    startedAt: new Date(0).toISOString(),
+    durationMs: 0,
+    status: 'blocked',
+    text: 'fixture',
+    diagnostics: {
+      degraded: false,
+      fallbackUsed: false,
+      warnings: [],
+      timedOutStages: [],
+      blockedTools: [],
+      truncatedToolCalls: 0,
+      emptyResponses: 0,
+      aiErrorCount: 0,
+      gateFailures: [],
+    },
+    trust: {
+      source: 'internal',
+      sanitized: true,
+      containsUntrustedText: false,
+      containsSecrets: false,
+    },
+  };
+}
+
+describe('tool router contract seam (L3-C09)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('lets a router that only implements execute satisfy ToolRouterContract', () => {
+    const diagnostics = typecheckRouterContractProbes({
+      '__router-contract-execute-only.probe.ts': [
+        "import type { ToolRouterContract } from '../src/tools/kernel/request.js';",
+        'export const minimal: ToolRouterContract = {',
+        "  execute: async () => { throw new Error('probe'); },",
+        '};',
+        '',
+      ].join('\n'),
+      // 负对照：可选不等于放开形状，explain 给了就必须是正确签名的方法。
+      '__router-contract-wrong-explain.probe.ts': [
+        "import type { ToolRouterContract } from '../src/tools/kernel/request.js';",
+        'export const wrong: ToolRouterContract = {',
+        "  execute: async () => { throw new Error('probe'); },",
+        '  explain: 42,',
+        '};',
+        '',
+      ].join('\n'),
+    });
+    expect(diagnostics['__router-contract-execute-only.probe.ts']).toEqual([]);
+    expect(diagnostics['__router-contract-wrong-explain.probe.ts']).toEqual([
+      "Type 'number' is not assignable to type '(request: ToolCallRequest) => Promise<ToolDecision>'.",
+    ]);
+  }, 60000);
+
+  it('resolves a routing service contract whose router only implements execute', async () => {
+    const execute = vi.fn(async () => blockedEnvelope());
+    const minimal: ToolRouterContract = { execute };
+    const resolved = resolveToolRouterFromContext(
+      routingContext({ toolRouting: createToolRoutingServiceContract(minimal) })
+    );
+    expect(resolved).toBe(minimal);
+    await resolved?.execute({
+      toolId: 'fixture-tool',
+      args: {},
+      surface: 'runtime',
+      actor: {},
+      source: { kind: 'runtime' },
+    });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('still resolves the full ToolRouterAdapter implementation', () => {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => {
+          throw new Error('fixture context factory is not used by routing resolution');
+        },
+      },
+    });
+    expect(
+      resolveToolRouterFromContext(
+        routingContext({ toolRouting: createToolRoutingServiceContract(adapter) })
+      )
+    ).toBe(adapter);
+  });
+
+  it('returns null without a shape warning when no routing service contract is configured', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    expect(resolveToolRouterFromContext(routingContext())).toBeNull();
+    expect(
+      resolveToolRouterFromContext(
+        routingContext({ toolRouting: createToolRoutingServiceContract(null) })
+      )
+    ).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining('not configured'));
+  });
+
+  it('rejects and warns about a configured router value that lacks execute', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    // 旧的三方法守卫要求 explain/executeChildCall；现在只有 execute 是必需的执行入口。
+    const withoutExecute = {
+      explain: async () => ({ allowed: true, stage: 'execute' as const }),
+      executeChildCall: async () => blockedEnvelope(),
+    };
+    expect(
+      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: withoutExecute } }))
+    ).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/execute is not a function/);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('callId=fixture-call');
   });
 });
 
