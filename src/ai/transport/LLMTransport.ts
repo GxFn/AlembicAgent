@@ -196,6 +196,148 @@ function borrowProxyDispatcher(proxyUrl: string): ProxyDispatcherEntry {
   return entry;
 }
 
+// ─── NO_PROXY 与 provider 级直连 ─────────────────────────
+//
+// 代理来源（provider 专属变量、ALEMBIC_AI_PROXY、HTTPS_PROXY 等）只决定“用哪个代理”；
+// 是否对某个目标绕过代理由 NO_PROXY/no_proxy 统一决定，对所有代理来源一致生效。
+// 匹配语义对齐 undici EnvHttpProxyAgent（Node 全局 fetch 的同源实现），让用户沿用 curl/undici
+// 的既有配置习惯：逗号或空白分隔；`*` 表示全部直连；`.example.com` 与 `*.example.com`
+// 都匹配 example.com 本身及其子域；`host:port` 只匹配该端口（未写端口的目标按 scheme 默认端口
+// 80/443 计）；IP 字面量按字面相等；全部不区分大小写。
+// 与 undici 的两处超集差异（只放宽、不收紧）：`*` 作为列表中任一项都视为通配（undici 只认整串为 `*`）；
+// 裸 IPv6（如 `::1`）按主机处理并补齐方括号（undici 会把它误拆成 host=`:`、port=1，永不命中）。
+
+/** provider 专属代理变量的显式直连值，取自 PAC 的 DIRECT 关键字；比较时去空白、不区分大小写。 */
+const PROVIDER_DIRECT_PROXY_VALUE = 'direct';
+
+const DEFAULT_PORT_BY_PROTOCOL: Readonly<Record<string, number>> = {
+  'http:': 80,
+  'https:': 443,
+};
+
+interface NoProxyEntry {
+  /** 已去掉前导 `.`/`*.` 并转小写；IPv6 保持方括号形式，与 URL.host 对齐。 */
+  readonly hostname: string;
+  /** 0 表示任意端口。 */
+  readonly port: number;
+}
+
+interface NoProxyRules {
+  readonly matchAll: boolean;
+  readonly entries: readonly NoProxyEntry[];
+}
+
+/** 小写变量优先（与 curl/undici 一致）；空串视为未设置，与本文件其他代理变量的 `||` 约定一致。 */
+function readNoProxyRules(): NoProxyRules {
+  const raw = process.env.no_proxy || process.env.NO_PROXY || '';
+  const entries: NoProxyEntry[] = [];
+  let matchAll = false;
+  for (const token of raw.split(/[,\s]/)) {
+    if (!token) {
+      continue;
+    }
+    if (token === '*') {
+      matchAll = true;
+      continue;
+    }
+    entries.push(parseNoProxyEntry(token));
+  }
+  return { matchAll, entries };
+}
+
+function parseNoProxyEntry(token: string): NoProxyEntry {
+  // 含两个以上冒号且不带方括号的是裸 IPv6 字面量，不能按 host:port 拆分。
+  const colonCount = token.split(':').length - 1;
+  if (colonCount >= 2 && !token.startsWith('[')) {
+    return { hostname: `[${token.toLowerCase()}]`, port: 0 };
+  }
+  const parsed = /^(.+):(\d+)$/.exec(token);
+  const host = parsed ? parsed[1] : token;
+  return {
+    hostname: host.replace(/^\*?\./, '').toLowerCase(),
+    port: parsed ? Number.parseInt(parsed[2], 10) : 0,
+  };
+}
+
+interface ProxyTarget {
+  readonly hostname: string;
+  readonly port: number;
+}
+
+/** 解析失败返回 null；调用方保持原代理路由并记录诊断，不在这里吞掉判断。 */
+function proxyTargetOf(url: string | URL | Request): ProxyTarget | null {
+  let parsed: URL;
+  try {
+    parsed = typeof url === 'string' ? new URL(url) : url instanceof URL ? url : new URL(url.url);
+  } catch (err: unknown) {
+    // 相对或非法 URL 无法确定目标主机；错误对象可能回显 URL，因此不透传。
+    void err;
+    return null;
+  }
+  // 用 host 去端口而不是 hostname，保证 IPv6 方括号与 undici 的比较形式一致。
+  const hostname = parsed.host.replace(/:\d*$/, '').toLowerCase();
+  const port = Number.parseInt(parsed.port, 10) || DEFAULT_PORT_BY_PROTOCOL[parsed.protocol] || 0;
+  return { hostname, port };
+}
+
+function matchesNoProxy(rules: NoProxyRules, target: ProxyTarget): boolean {
+  for (const entry of rules.entries) {
+    if (entry.port && entry.port !== target.port) {
+      continue;
+    }
+    if (target.hostname === entry.hostname || target.hostname.endsWith(`.${entry.hostname}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 代理路由诊断：只记录 provider、目标主机与原因，绝不记录代理 URL（可能内嵌凭据）或请求路径。 */
+function logProxyRouting(message: string): void {
+  observeSafely(
+    () => Logger.getInstance().debug(`[LLMTransport] ${message}`),
+    () => undefined
+  );
+}
+
+/**
+ * 已解析出代理时判断本次目标是否按 NO_PROXY 直连。
+ * 模块私有函数而非类成员：LLMTransport 是公开导出类，不扩展其 protected/私有声明面。
+ * 未配置 NO_PROXY 时静默返回 false（原有代理路径，不逐请求刷日志）。
+ */
+function bypassesProxyForTarget(providerId: string, url: string | URL | Request): boolean {
+  const rules = readNoProxyRules();
+  if (rules.matchAll) {
+    // `*` 不依赖目标解析，相对 URL 也直连；仍记录可解析出的主机便于定位。
+    const target = proxyTargetOf(url);
+    logProxyRouting(
+      `proxy_bypassed provider=${providerId} host=${target?.hostname ?? 'unparsed'} reason=no_proxy match=*`
+    );
+    return true;
+  }
+  if (rules.entries.length === 0) {
+    return false;
+  }
+  const target = proxyTargetOf(url);
+  if (!target) {
+    // 无法确定目标主机时保持原代理路由（与修复前一致），只记录原因而不记录 URL。
+    logProxyRouting(
+      `proxy_not_bypassed provider=${providerId} reason=unparsed_target; NO_PROXY not evaluated, proxy kept`
+    );
+    return false;
+  }
+  if (matchesNoProxy(rules, target)) {
+    logProxyRouting(
+      `proxy_bypassed provider=${providerId} host=${target.hostname} reason=no_proxy port=${target.port}; direct fetch without proxy dispatcher`
+    );
+    return true;
+  }
+  logProxyRouting(
+    `proxy_not_bypassed provider=${providerId} host=${target.hostname} reason=no_proxy_miss port=${target.port} entries=${rules.entries.length}; proxy kept`
+  );
+  return false;
+}
+
 /**
  * 2xx 坏正文与 SDK 路径（sdkErrors 的 2xx 分支）同语义：code=LLM_INVALID_RESPONSE、不带 status，
  * 因而计入熔断但不重试。错误消息和诊断都不拼接正文或 URL，只记录 provider、状态码、content-type 与失败类别。
@@ -343,13 +485,27 @@ export abstract class LLMTransport {
    *
    * providerId 与环境变量 tag 映射：openai→OPENAI、deepseek→DEEPSEEK、
    *   claude→CLAUDE、google→GOOGLE、ollama→OLLAMA。
+   *
+   * provider 专属变量取值为 `direct`（去空白、不区分大小写）时表示该 provider 显式直连：
+   * 返回空串且不再回落到通用代理变量（空串本身仍表示“未设置”，会继续回落）。
+   * 目标主机级别的绕过（NO_PROXY）在 fetchWithProxy 中按请求 URL 判断，不在这里处理。
    */
   protected resolveProxyUrl(): string {
     const tag = (this.providerId || '').toUpperCase();
     if (tag) {
-      const specific =
-        process.env[`ALEMBIC_${tag}_PROXY_HTTPS`] || process.env[`ALEMBIC_${tag}_PROXY_HTTP`];
+      const httpsKey = `ALEMBIC_${tag}_PROXY_HTTPS`;
+      const httpKey = `ALEMBIC_${tag}_PROXY_HTTP`;
+      const httpsValue = process.env[httpsKey];
+      const source = httpsValue ? httpsKey : httpKey;
+      const specific = httpsValue || process.env[httpKey];
       if (specific) {
+        if (specific.trim().toLowerCase() === PROVIDER_DIRECT_PROXY_VALUE) {
+          // 显式直连短路：跳过 ALEMBIC_AI_PROXY 与标准代理变量，只记录来源变量名而不记录取值。
+          logProxyRouting(
+            `proxy_bypassed provider=${this.providerId} reason=provider_direct source=${source}; generic proxy variables skipped`
+          );
+          return '';
+        }
         return specific;
       }
     }
@@ -445,6 +601,8 @@ export abstract class LLMTransport {
    * 原生支持 `dispatcher` 选项）。这样既能让代理生效，又不会绕过测试里
    * `vi.stubGlobal('fetch')` 的桩——避免“环境带 HTTPS_PROXY 时单测被绕过”的回归。
    * ProxyAgent 按 proxyUrl 缓存复用，避免每请求新建导致的 socket 泄漏。
+   * 解析出代理后先按目标 host/port 匹配 NO_PROXY/no_proxy；命中时直连且不借用 ProxyAgent，
+   * 因此缓存、借用与退役逻辑只作用于真正走代理的请求。
    */
   protected async fetchWithProxy(
     url: string | URL | Request,
@@ -452,6 +610,9 @@ export abstract class LLMTransport {
   ): Promise<Response> {
     throwIfLlmCancelled(options.signal);
     const proxyUrl = this.resolveProxyUrl();
+    if (proxyUrl && bypassesProxyForTarget(this.providerId, url)) {
+      return fetch(url, options);
+    }
     if (proxyUrl) {
       const entry = borrowProxyDispatcher(proxyUrl);
       try {

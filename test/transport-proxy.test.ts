@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { __testingProxyDispatcherCache } from '../src/ai/transport/LLMTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
@@ -7,10 +8,14 @@ import { jsonResponse } from './helpers/mockFetch.js';
 // 这里直接验证 resolveProxyUrl 的优先级与映射，确保依赖 HTTPS_PROXY 等
 // 环境变量访问境外 API 的部署不会因为收口而回归。
 
+// 开发机常带 NO_PROXY 等变量；测试前统一清空，避免宿主环境改变代理路由断言。
 const PROXY_ENV_KEYS = [
   'ALEMBIC_OPENAI_PROXY_HTTPS',
   'ALEMBIC_OPENAI_PROXY_HTTP',
   'ALEMBIC_GOOGLE_PROXY_HTTPS',
+  'ALEMBIC_OLLAMA_PROXY_HTTPS',
+  'ALEMBIC_OLLAMA_PROXY_HTTP',
+  'ALEMBIC_OLLAMA_BASE_URL',
   'ALEMBIC_AI_PROXY',
   'HTTPS_PROXY',
   'https_proxy',
@@ -18,6 +23,8 @@ const PROXY_ENV_KEYS = [
   'http_proxy',
   'ALL_PROXY',
   'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
 ];
 
 // 访问 protected 方法用于单测。
@@ -316,5 +323,262 @@ describe('LLMTransport proxy fetch wiring', () => {
     expect(__testingProxyDispatcherCache.size()).toBe(__testingProxyDispatcherCache.maxSize);
     expect(__testingProxyDispatcherCache.keys()[0]).toBe('http://proxy-1:8080');
     expect(closed).toEqual(['http://proxy-0:8080']);
+  });
+});
+
+describe('LLMTransport NO_PROXY and provider-level direct routing', () => {
+  const saved: Record<string, string | undefined> = {};
+  let debugMessages: string[] = [];
+
+  beforeEach(() => {
+    for (const key of PROXY_ENV_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    debugMessages = [];
+    vi.spyOn(Logger.getInstance(), 'debug').mockImplementation((message: unknown) => {
+      debugMessages.push(String(message));
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    __testingProxyDispatcherCache.clear();
+    for (const key of PROXY_ENV_KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  });
+
+  interface CapturedCall {
+    url: string;
+    dispatcher: unknown;
+  }
+
+  // 走真实 SDK→fetchWithProxy 链路，只截获最终 fetch 的目标与 dispatcher。
+  function stubFetch(): CapturedCall[] {
+    const calls: CapturedCall[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: url instanceof Request ? url.url : String(url),
+          dispatcher: (init as (RequestInit & { dispatcher?: unknown }) | undefined)?.dispatcher,
+        });
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'ok' } }] });
+      })
+    );
+    return calls;
+  }
+
+  async function chatOnce(transport: OpenAiTransport): Promise<string> {
+    return transport.chat({ model: 'fixture-model', messages: [{ role: 'user', content: 'hi' }] });
+  }
+
+  function fetchDirect(transport: OpenAiTransport, url: string | URL | Request): Promise<Response> {
+    return (
+      transport as unknown as {
+        fetchWithProxy(url: string | URL | Request, options?: RequestInit): Promise<Response>;
+      }
+    ).fetchWithProxy(url, { method: 'POST' });
+  }
+
+  it('connects the default local Ollama endpoint directly when NO_PROXY lists localhost', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    process.env.NO_PROXY = 'localhost,127.0.0.1';
+    const calls = stubFetch();
+
+    expect(await chatOnce(new OpenAiTransport({}, 'ollama'))).toBe('ok');
+    expect(
+      await chatOnce(new OpenAiTransport({ baseUrl: 'http://localhost:11434/v1' }, 'ollama'))
+    ).toBe('ok');
+
+    expect(calls.map((call) => new URL(call.url).hostname)).toEqual(['127.0.0.1', 'localhost']);
+    expect(calls.every((call) => call.dispatcher === undefined)).toBe(true);
+    // 命中 NO_PROXY 的请求不借用、不创建 ProxyAgent。
+    expect(__testingProxyDispatcherCache.size()).toBe(0);
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining('proxy_bypassed provider=ollama host=127.0.0.1 reason=no_proxy')
+    );
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining('proxy_bypassed provider=ollama host=localhost reason=no_proxy')
+    );
+  });
+
+  it('matches NO_PROXY domain suffixes with a leading dot and keeps other hosts on the proxy', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    process.env.NO_PROXY = '.example.com';
+    const calls = stubFetch();
+
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://api.example.com/v1' }));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://example.com/v1' }));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://example.org/v1' }));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://notexample.com/v1' }));
+
+    expect(
+      calls.map((call) => [new URL(call.url).hostname, call.dispatcher !== undefined])
+    ).toEqual([
+      ['api.example.com', false],
+      ['example.com', false],
+      ['example.org', true],
+      ['notexample.com', true],
+    ]);
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining('proxy_bypassed provider=openai host=api.example.com reason=no_proxy')
+    );
+  });
+
+  it('bypasses every target when NO_PROXY is the * wildcard', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    process.env.NO_PROXY = '*';
+    const calls = stubFetch();
+
+    await chatOnce(new OpenAiTransport({ apiKey: 'k' }));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://gateway.internal/v1' }));
+
+    expect(calls).toHaveLength(2);
+    expect(calls.every((call) => call.dispatcher === undefined)).toBe(true);
+    expect(__testingProxyDispatcherCache.size()).toBe(0);
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining('proxy_bypassed provider=openai host=api.openai.com reason=no_proxy')
+    );
+  });
+
+  it('connects directly when the provider-specific proxy variable is direct (case-insensitive)', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    process.env.ALEMBIC_AI_PROXY = 'http://ai-proxy:8080';
+    const calls = stubFetch();
+    const remoteOllama = { baseUrl: 'http://ollama.internal:11434/v1' };
+
+    process.env.ALEMBIC_OLLAMA_PROXY_HTTPS = 'direct';
+    await chatOnce(new OpenAiTransport(remoteOllama, 'ollama'));
+    process.env.ALEMBIC_OLLAMA_PROXY_HTTPS = ' DIRECT ';
+    await chatOnce(new OpenAiTransport(remoteOllama, 'ollama'));
+    delete process.env.ALEMBIC_OLLAMA_PROXY_HTTPS;
+    process.env.ALEMBIC_OLLAMA_PROXY_HTTP = 'Direct';
+    await chatOnce(new OpenAiTransport(remoteOllama, 'ollama'));
+    // 其他 provider 不受 Ollama 专属直连值影响，仍走通用代理。
+    await chatOnce(new OpenAiTransport({ apiKey: 'k' }));
+
+    expect(calls.map((call) => call.dispatcher !== undefined)).toEqual([false, false, false, true]);
+    expect(__testingProxyDispatcherCache.keys()).toEqual(['http://ai-proxy:8080']);
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining(
+        'proxy_bypassed provider=ollama reason=provider_direct source=ALEMBIC_OLLAMA_PROXY_HTTPS'
+      )
+    );
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining(
+        'proxy_bypassed provider=ollama reason=provider_direct source=ALEMBIC_OLLAMA_PROXY_HTTP'
+      )
+    );
+    const transport = new OpenAiTransport({}, 'ollama');
+    expect(resolveProxy(transport)).toBe('');
+  });
+
+  it('honours NO_PROXY host:port entries and implicit scheme default ports', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    const calls = stubFetch();
+    const local = { baseUrl: 'http://localhost:11434/v1' };
+
+    process.env.NO_PROXY = 'localhost:9999';
+    await chatOnce(new OpenAiTransport(local, 'ollama'));
+    process.env.NO_PROXY = 'localhost:11434';
+    await chatOnce(new OpenAiTransport(local, 'ollama'));
+    process.env.NO_PROXY = 'api.example.com:443';
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://api.example.com/v1' }));
+    process.env.NO_PROXY = 'api.example.com:80';
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://api.example.com/v1' }));
+
+    expect(calls.map((call) => call.dispatcher !== undefined)).toEqual([true, false, false, true]);
+  });
+
+  it('matches hosts case-insensitively, reads lowercase no_proxy, and accepts IP literals', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    const calls = stubFetch();
+
+    process.env.no_proxy = 'LOCALHOST';
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://LocalHost:11434/v1' }, 'ollama'));
+    delete process.env.no_proxy;
+    process.env.NO_PROXY = '10.0.0.5, [::1]';
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://10.0.0.5:11434/v1' }, 'ollama'));
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://[::1]:11434/v1' }, 'ollama'));
+    // 裸 IPv6 字面量与括号形式等价；*.domain 与 .domain 等价。
+    process.env.NO_PROXY = '::1,*.corp.example';
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://[::1]:11434/v1' }, 'ollama'));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://llm.corp.example/v1' }));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'https://10.0.0.6/v1' }));
+
+    expect(calls.map((call) => call.dispatcher !== undefined)).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+    ]);
+  });
+
+  it('applies NO_PROXY to every proxy source, including provider-specific proxies', async () => {
+    process.env.ALEMBIC_OLLAMA_PROXY_HTTPS = 'http://ollama-proxy:8080';
+    process.env.ALEMBIC_AI_PROXY = 'http://ai-proxy:8080';
+    process.env.NO_PROXY = 'localhost';
+    const calls = stubFetch();
+
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://localhost:11434/v1' }, 'ollama'));
+    await chatOnce(new OpenAiTransport({ apiKey: 'k', baseUrl: 'http://localhost:8000/v1' }));
+    await chatOnce(new OpenAiTransport({ baseUrl: 'http://gpu-box:11434/v1' }, 'ollama'));
+
+    expect(calls.map((call) => call.dispatcher !== undefined)).toEqual([false, false, true]);
+    expect(__testingProxyDispatcherCache.keys()).toEqual(['http://ollama-proxy:8080']);
+  });
+
+  it('keeps the proxy and records a miss when NO_PROXY does not match or the target is unparseable', async () => {
+    process.env.HTTPS_PROXY = 'http://user:secret@proxy:8080';
+    process.env.NO_PROXY = 'localhost';
+    const calls = stubFetch();
+    const transport = new OpenAiTransport({ apiKey: 'k' });
+
+    await chatOnce(transport);
+    await fetchDirect(transport, '/relative/path');
+
+    expect(calls.map((call) => call.dispatcher !== undefined)).toEqual([true, true]);
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining(
+        'proxy_not_bypassed provider=openai host=api.openai.com reason=no_proxy_miss'
+      )
+    );
+    expect(debugMessages).toContainEqual(
+      expect.stringContaining('proxy_not_bypassed provider=openai reason=unparsed_target')
+    );
+    // 诊断只记录 host，不回显代理凭据或请求路径。
+    expect(debugMessages.some((message) => message.includes('secret'))).toBe(false);
+    expect(debugMessages.some((message) => message.includes('/relative/path'))).toBe(false);
+  });
+
+  it('routes Request inputs by their own URL and still honours cancellation on the direct path', async () => {
+    process.env.HTTPS_PROXY = 'http://proxy:8080';
+    process.env.NO_PROXY = 'localhost';
+    const calls = stubFetch();
+    const transport = new OpenAiTransport({}, 'ollama');
+
+    await fetchDirect(transport, new Request('http://localhost:11434/v1/models'));
+    await fetchDirect(transport, new URL('http://localhost:11434/v1/models'));
+    expect(calls.map((call) => call.dispatcher)).toEqual([undefined, undefined]);
+
+    const aborted = new AbortController();
+    aborted.abort(new Error('fixture cancel'));
+    await expect(
+      (
+        transport as unknown as {
+          fetchWithProxy(url: string, options?: RequestInit): Promise<Response>;
+        }
+      ).fetchWithProxy('http://localhost:11434/v1/models', { signal: aborted.signal })
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toHaveLength(2);
   });
 });
