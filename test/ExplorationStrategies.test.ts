@@ -877,11 +877,15 @@ describe('independent R06 repaired-boundary cases', () => {
   it('keeps the scan repair route consistent with its actual callable contract', async () => {
     const cap = new ScanProduce();
     expect(cap.allowedTools.code).toContain('read');
-    expect(cap.allowedTools.evidence).toBeUndefined();
+    // L4-P30（I44）：扫描 Produce 开放只读 evidence.get/search 作为拒绝后的自救通道，
+    // 阶段提示不能再说 evidence 工具未开放。
+    expect(cap.allowedTools.evidence).toEqual(['get', 'search']);
     for (const config of Object.values(SCAN_TASK_CONFIGS)) {
       expect(config.producePrompt).not.toContain('禁止补读源码');
       expect(config.producePrompt).not.toContain('仅可从已有 evidence 台账检索支撑');
+      expect(config.producePrompt).not.toContain('未开放的 evidence');
     }
+    expect(SCAN_TASK_CONFIGS.extract.producePrompt).toContain('evidence.search');
   });
 });
 

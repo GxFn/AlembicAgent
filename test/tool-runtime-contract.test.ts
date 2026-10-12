@@ -26,8 +26,10 @@ import {
   type ToolCallRequest,
   type ToolResultTrust,
 } from '../src/tools/kernel/index.js';
+import { isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
+import { buildEvidenceCandidatesHint } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
 import type {
   DeltaCacheLike,
   MemoryCoordinatorLike,
@@ -47,6 +49,7 @@ import {
 } from '../src/tools/runtime/index.js';
 import { toolParameterSchemaError } from '../src/tools/runtime/parameters.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
+import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
 
 let baseRoot: string;
 beforeAll(async () => {
@@ -3415,5 +3418,257 @@ describe('L4-P05 envelope trust derived from tool source', () => {
       expect(envelope.trust).toEqual(TRUSTED_INTERNAL);
       expect(isToolResultEnvelope(envelope)).toBe(true);
     }
+  });
+});
+
+describe('L4-P30 scan_production evidence self-rescue channel (I44)', () => {
+  // 扫描 Produce 经 SystemRunContext._dimensionScopeId 打开维度台账（openLoopEvidence），
+  // knowledge.submit 的证据类拒绝会让模型调用 evidence.search / memory.recall / code.read 自救。
+  // 这里用真实 ScanProduce 能力定义 + ToolRouterAdapter 复现扫描 Produce 的准入链路：能力
+  // allowlist（router capability 检查）与 runtime 投影的阶段 allowlist 都取自 ScanProduce。
+  const SCAN_DIMENSION = 'scan-module';
+  const ALPHA_SOURCE = 'export const alpha = 1;\nexport const beta = 2;\nexport const gamma = 3;';
+  const STALE_SOURCE = "export function stale() {\n  return 'before';\n}";
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function scanProduceFixture() {
+    const projectRoot = await mkdtemp(join(baseRoot, 'l4p30-project-'));
+    const dataRoot = await mkdtemp(join(baseRoot, 'l4p30-data-'));
+    await mkdir(join(projectRoot, 'lib'), { recursive: true });
+    await writeFile(join(projectRoot, 'lib/alpha.ts'), ALPHA_SOURCE);
+    await writeFile(join(projectRoot, 'lib/stale.ts'), STALE_SOURCE);
+    const ledger = new EvidenceLedgerStore({
+      dataRoot,
+      jobId: 'job_l4p30',
+      sessionId: 'sess_l4p30',
+      dimensionId: SCAN_DIMENSION,
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'c1',
+      file: 'lib/alpha.ts',
+      range: { start: 1, end: 3 },
+      content: ALPHA_SOURCE,
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'c2',
+      file: 'lib/stale.ts',
+      range: { start: 1, end: 3 },
+      content: STALE_SOURCE,
+    });
+    const capability = new ScanProduce().toDef();
+    // 拒绝路径在 gateway 写入前返回；写口被调用即说明拒绝没有生效。
+    const createOrStage = vi.fn();
+    const adapter = new ToolRouterAdapter({
+      capability,
+      contextFactory: {
+        create: () => ({
+          projectRoot,
+          tokenBudget: 4000,
+          recipeGateway: {
+            createOrStage,
+            evaluateReadiness: async () => ({
+              ready: true,
+              schemaVersion: '1',
+              profileHash: null,
+              documentSetHash: null,
+              violations: [],
+              warnings: [],
+            }),
+          },
+          runtime: {
+            allowedTools: capability.allowedTools,
+            evidenceLedger: ledger,
+            sharedState: { _sessionCounters: {} },
+          },
+        }),
+      },
+    });
+    return { projectRoot, ledger, adapter, capability, createOrStage };
+  }
+
+  function scanRequest(
+    toolId: string,
+    action: string,
+    params: Record<string, unknown>,
+    abortSignal?: AbortSignal
+  ): ToolCallRequest {
+    return {
+      toolId,
+      args: { action, params },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'vitest-scan-produce' },
+      ...(abortSignal ? { abortSignal } : {}),
+    };
+  }
+
+  function submitParams(title: string, reasoning: Record<string, unknown>) {
+    return {
+      title,
+      description: '模块用具名常量导出 alpha/beta/gamma，消费方按名引用。',
+      content: {
+        markdown:
+          '## 具名常量导出\n\n模块统一以具名常量导出配置值，消费方按名引用而不是依赖默认导出，便于摇树与重命名追踪。\n\n```typescript\nexport const alpha = 1;\n```\n(来源: lib/alpha.ts:1-3)',
+        rationale: '具名导出让引用关系可审计，重命名时编译器能找出全部消费方。',
+      },
+      kind: 'fact',
+      trigger: 'named constant export',
+      whenClause: '当模块向外暴露配置常量时',
+      doClause: '使用具名 export const 导出配置常量',
+      dontClause: '不要用默认导出暴露配置常量',
+      reasoning: { whyStandard: '具名导出可追踪。', confidence: 0.9, ...reasoning },
+    };
+  }
+
+  /** 从拒绝文本里提取模型被要求调用的 tool.action（只认注册表里真实存在的工具与动作）。 */
+  function mentionedToolActions(text: string): string[] {
+    const mentions = new Set<string>();
+    for (const match of text.matchAll(/\b([a-z]+)\.([a-z_]+)\b/g)) {
+      const [, tool, action] = match;
+      if (
+        Object.hasOwn(TOOL_REGISTRY, tool) &&
+        Object.hasOwn(TOOL_REGISTRY[tool].actions, action)
+      ) {
+        mentions.add(`${tool}.${action}`);
+      }
+    }
+    return [...mentions].sort();
+  }
+
+  it('admits every tool action that a dimension-run knowledge.submit rejection tells the scan producer to call', async () => {
+    const logger = Logger.getInstance();
+    vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const { projectRoot, ledger, adapter, capability, createOrStage } = await scanProduceFixture();
+
+    // 1) 台账在场、refs 缺席、手写 sources 不在台账 → EVIDENCE_REFS_REQUIRED（附台账候选提示）。
+    const refsRequired = await adapter.execute(
+      scanRequest(
+        'knowledge',
+        'submit',
+        submitParams('具名常量导出约定 A', { sources: ['lib/never-captured.ts:1-3'] })
+      )
+    );
+    // 2) 引用条目采集后文件被改写 → EVIDENCE_STALE（要求重采）。
+    await writeFile(
+      join(projectRoot, 'lib/stale.ts'),
+      "export function stale() {\n  return 'after';\n}"
+    );
+    const stale = await adapter.execute(
+      scanRequest(
+        'knowledge',
+        'submit',
+        submitParams('具名常量导出约定 B', { sources: ['lib/stale.ts:1-3'], evidenceRefs: ['E-2'] })
+      )
+    );
+    // 3) 引用不存在的条目 id → 无法解析（列出近期条目）。
+    const unresolved = await adapter.execute(
+      scanRequest(
+        'knowledge',
+        'submit',
+        submitParams('具名常量导出约定 C', {
+          sources: ['lib/alpha.ts:1-3'],
+          evidenceRefs: ['E-99'],
+        })
+      )
+    );
+
+    expect(refsRequired.ok).toBe(false);
+    expect(refsRequired.text).toContain('EVIDENCE_REFS_REQUIRED');
+    expect(stale.ok).toBe(false);
+    expect(stale.text).toContain('EVIDENCE_STALE');
+    expect(unresolved.ok).toBe(false);
+    expect(unresolved.text).toContain('E-99');
+    expect(createOrStage).not.toHaveBeenCalled();
+
+    // INSUFFICIENT_EVIDENCE / SOURCE_REF_NOT_FOUND 门禁拒绝附加的正是这段台账候选提示（authoring.ts）。
+    const rejectionTexts = [
+      refsRequired.text,
+      stale.text,
+      unresolved.text,
+      buildEvidenceCandidatesHint(ledger),
+    ];
+    const mentioned = mentionedToolActions(rejectionTexts.join('\n'));
+    expect(mentioned).toEqual(
+      expect.arrayContaining(['code.read', 'evidence.search', 'memory.recall'])
+    );
+    const notAdmitted = mentioned.filter((ref) => {
+      const [tool, action] = ref.split('.');
+      return !isToolActionAllowed(capability.allowedTools, tool, action);
+    });
+    expect(notAdmitted).toEqual([]);
+  });
+
+  it('executes the evidence self-rescue reads through the scan_production router and honours cancellation', async () => {
+    const { adapter } = await scanProduceFixture();
+
+    const search = await adapter.execute(scanRequest('evidence', 'search', { query: 'alpha' }));
+    expect(search.status).toBe('success');
+    expect(search.text).toContain('E-1');
+
+    const get = await adapter.execute(scanRequest('evidence', 'get', { ref: 'E-1@1-2' }));
+    expect(get.status).toBe('success');
+    expect(get.text).toContain('export const alpha = 1;');
+    expect(get.text).not.toContain('export const gamma = 3;');
+
+    // 自救通道只读台账：取不到的条目是业务失败（附近期条目），不是权限拒绝。
+    const missing = await adapter.execute(scanRequest('evidence', 'get', { ref: 'E-42' }));
+    expect(missing.ok).toBe(false);
+    expect(missing.status).not.toBe('blocked');
+    expect(missing.text).not.toContain('Permission denied');
+    expect(missing.text).toContain('E-1=lib/alpha.ts');
+
+    const aborted = new AbortController();
+    aborted.abort('fixture cancellation');
+    const cancelled = await adapter.execute(
+      scanRequest('evidence', 'search', { query: 'alpha' }, aborted.signal)
+    );
+    expect(cancelled.status).toBe('aborted');
+  });
+
+  it('keeps the scan_production opening limited to read-only evidence actions and strict mode tool-less', async () => {
+    const { adapter, capability } = await scanProduceFixture();
+
+    expect(capability.allowedTools).toEqual({
+      code: ['read'],
+      knowledge: ['submit'],
+      memory: ['recall'],
+      evidence: ['get', 'search'],
+    });
+    for (const [toolId, action, params] of [
+      ['knowledge', 'detail', { id: 'recipe-1' }],
+      ['terminal', 'exec', { command: 'node -v' }],
+    ] as const) {
+      const denied = await adapter.execute(scanRequest(toolId, action, params));
+      expect(denied.status).toBe('blocked');
+      expect(denied.text).toContain(
+        `"${toolId}.${action}" not allowed in capability "scan_production"`
+      );
+    }
+
+    const strict = new ScanProduce({ strictColdStart: true });
+    expect(strict.allowedTools).toEqual({});
+    expect(strict.promptFragment).not.toContain('evidence');
+  });
+
+  it('describes the read-only evidence self-rescue channel in the scan producer capability prompt', () => {
+    const capability = new ScanProduce();
+    const fragment = capability.promptFragment;
+    expect(fragment).toContain('evidence.search');
+    expect(fragment).toContain('evidence.get');
+    expect(fragment).toContain('EVIDENCE_STALE');
+    // 自动生成的权限清单与说明读同一份 allowlist。
+    expect(fragment).toContain('- **evidence**: get(');
+    // 能力提示自身点名的动作也必须可调用，避免说明与 allowlist 再次漂移。
+    const notAdmitted = mentionedToolActions(fragment).filter((ref) => {
+      const [tool, action] = ref.split('.');
+      return !isToolActionAllowed(capability.allowedTools, tool, action);
+    });
+    expect(notAdmitted).toEqual([]);
   });
 });

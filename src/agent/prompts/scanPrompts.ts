@@ -50,7 +50,7 @@ content.markdown 字段必须是「项目特写」：
 
 ## 关键规则
 - 已确认结构化发现才是候选义务；不要从 Markdown 段落新增主题或按段凑数量
-- 本扫描阶段可用 code.read 读取已定位文件；不新增搜索、图谱或终端探索，不调用未开放的 evidence 工具
+- 本扫描阶段可用 code.read 读取已定位文件；不新增代码搜索、图谱或终端探索。evidence.get/search 只读已采证据台账、不算探索：提交被拒时用 evidence.search 查条目 id、evidence.get 取 verbatim 原文，修正 evidenceRefs 后重提
 - 台账在场时 params.reasoning.evidenceRefs 必填，使用真实 E-id；无台账按当前 schema 提供真实来源，禁止只写文件名
 - content.markdown 中的来源标注必须使用完整相对路径: (来源: Full/Path/FileName.ext:行号)
 - 如果分析提到了 3 个模式，就应该提交 3 个候选，不要合并
