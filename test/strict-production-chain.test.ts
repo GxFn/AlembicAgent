@@ -714,6 +714,13 @@ describe('strict PipelineStrategy', () => {
       action: 'reject',
       pass: false,
       reason: expect.stringContaining('STRICT_PRODUCTION_GATE_RESULT_INVALID'),
+      // C19：宿主回执形状非法是 Reviewer 侧语义拒绝，与端口接线/I-O 故障（infrastructure）区分。
+      artifact: {
+        kind: 'StrictProductionGateExceptionV1',
+        gate: 'G2',
+        classification: 'semantic-reject',
+        errorCode: 'STRICT_PRODUCTION_GATE_RESULT_INVALID',
+      },
     });
     expect(output.phases._strictGateReturns).toContainEqual(
       expect.objectContaining({ gate: 'G2', verdict: 'failed', owner: 'independent-reviewer' })

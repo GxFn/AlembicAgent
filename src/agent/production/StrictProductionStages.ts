@@ -135,17 +135,99 @@ async function invokeGatePort(
     assertStrictGateActive(strategyContext);
     return normalizeStrictReviewResult(result);
   } catch (error: unknown) {
-    return {
-      action: 'reject',
-      pass: false,
-      reason: error instanceof Error ? error.message : String(error),
-    };
+    return rejectStrictGateAfterException('G2', error, strategyContext);
   }
+}
+
+/**
+ * 严格门 catch 分支的错误归类（C19），只服务诊断与审计，不改变失败关闭的 reject 裁决：
+ * - semantic-reject：STRICT_* 语义码（fail() 与宿主语义校验抛出）以及 STRICT_PRODUCTION_ABORTED，
+ *   属于 Analyst/Reviewer 或取消作用域内的预期拒绝；
+ * - infrastructure：其余异常（TypeError、宿主 I/O 错误、非 Error 抛出值）以及
+ *   STRICT_PRODUCTION_RUNTIME_PORT_* 端口接线错误，不是模型侧的语义失败。
+ * infrastructure 是否应改为重抛走 evaluation.status==='error' 属于跨仓开放问题，这里不做。
+ */
+type StrictGateExceptionClassification = 'semantic-reject' | 'infrastructure';
+
+/** fail(code, detail) 产生 `CODE` 或 `CODE: detail`；只取开头的语义码，不解析 detail。 */
+const STRICT_ERROR_CODE_PATTERN = /^(STRICT_[A-Z0-9_]+)(?::|$)/;
+/** 端口缺失或形状非法是宿主接线故障，即使带 STRICT_ 前缀也不归为语义拒绝。 */
+const STRICT_RUNTIME_PORT_CODE_PREFIX = 'STRICT_PRODUCTION_RUNTIME_PORT_';
+
+function classifyStrictGateException(error: unknown): {
+  readonly classification: StrictGateExceptionClassification;
+  readonly errorCode: string | null;
+} {
+  if (!(error instanceof Error)) {
+    return { classification: 'infrastructure', errorCode: null };
+  }
+  const errorCode = STRICT_ERROR_CODE_PATTERN.exec(error.message)?.[1] ?? null;
+  if (errorCode === null || errorCode.startsWith(STRICT_RUNTIME_PORT_CODE_PREFIX)) {
+    return { classification: 'infrastructure', errorCode };
+  }
+  return { classification: 'semantic-reject', errorCode };
+}
+
+/**
+ * G1/G2 共用的异常失败关闭出口。reason 与旧行为逐字一致（error.message 或 String(error)），
+ * 归类写进 artifact，供 phases[gate].artifact 区分基础设施故障与语义拒绝；artifact 的 kind 不是
+ * StrictAnalysisEpochTransitionV1，PipelineStrategy 不会把它当成分析循环回执入账。堆栈只进日志，
+ * 不进 artifact，避免本机路径随 phaseResults 扩散。日志经 observeSafely 隔离，观察器失败不影响裁决。
+ */
+function rejectStrictGateAfterException(
+  gate: 'G1' | 'G2',
+  error: unknown,
+  context: Record<string, unknown>
+): StrictProductionGateResultV1 {
+  const reason = error instanceof Error ? error.message : String(error);
+  const { classification, errorCode } = classifyStrictGateException(error);
+  const errorName = error instanceof Error ? error.name : 'NonError';
+  const aborted = isStrictGateAborted(context);
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        '[StrictProductionStages] strict gate exception converted to reject',
+        {
+          gate,
+          classification,
+          errorName,
+          errorCode,
+          thrownType: error === null ? 'null' : typeof error,
+          message: reason,
+          stack: error instanceof Error ? error.stack : undefined,
+          aborted,
+          selectedPath: 'reject-fail-closed',
+          followUpCheck:
+            classification === 'infrastructure'
+              ? 'inspect-host-port-wiring-or-io'
+              : 'strict-gate-semantic-code',
+        }
+      ),
+    () => undefined
+  );
+  return {
+    action: 'reject',
+    pass: false,
+    reason,
+    artifact: Object.freeze({
+      kind: 'StrictProductionGateExceptionV1',
+      gate,
+      classification,
+      errorName,
+      errorCode,
+      aborted,
+    }),
+  };
+}
+
+/** 与 assertStrictGateActive 同一判定口径：取消信号上的 aborted 为真即视为已取消。 */
+function isStrictGateAborted(context: Record<string, unknown>): boolean {
+  return Boolean((context.abortSignal as AbortSignal | null | undefined)?.aborted);
 }
 
 /** 外部 port 可能不响应 signal，但取消后 adapter 不得继续发起读取、授权检查或 seal。 */
 function assertStrictGateActive(context: Record<string, unknown>): void {
-  if ((context.abortSignal as AbortSignal | undefined)?.aborted) {
+  if (isStrictGateAborted(context)) {
     throw new Error('STRICT_PRODUCTION_ABORTED');
   }
 }
@@ -275,11 +357,7 @@ async function invokeStrictAnalysisGate(
       artifact: transition,
     };
   } catch (error: unknown) {
-    return {
-      action: 'reject',
-      pass: false,
-      reason: error instanceof Error ? error.message : String(error),
-    };
+    return rejectStrictGateAfterException('G1', error, strategyContext);
   }
 }
 

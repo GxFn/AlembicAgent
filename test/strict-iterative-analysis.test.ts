@@ -320,6 +320,8 @@ describe('strict iterative Analyst epochs', () => {
         action: 'reject',
         pass: false,
         reason: 'STRICT_PRODUCTION_ABORTED',
+        // C19：取消仍按语义拒绝失败关闭，但 artifact 记录 aborted=true，便于与模型拒绝区分。
+        artifact: { classification: 'semantic-reject', aborted: true },
       });
     }
     expect(readEpoch).not.toHaveBeenCalled();
