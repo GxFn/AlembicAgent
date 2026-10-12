@@ -20,6 +20,8 @@ import {
   LoopContext,
 } from '../src/agent/runtime/index.js';
 import {
+  buildPcvNodeEvidenceProcessMetadata,
+  buildPcvNodeEvidenceSummary,
   recordPcvInputAssembly,
   recordPcvToolResult,
 } from '../src/agent/runtime/PcvNodeEvidenceRecorder.js';
@@ -1024,5 +1026,216 @@ describe('runtime evidence facts and snapshots', () => {
     expect(execute).toHaveBeenCalledOnce();
     expect(result.toolCalls[0].envelope.status).toBe('blocked');
     expect(result.pcvNodeEvidence.groundingLedger[0].classification).not.toBe('evidence-produced');
+  });
+});
+
+// I28：PCV 节点证据细节修正。节点 sourceRefs 只收成功调用触及的来源；质量门对形状不合格的
+// source 证据退回 fallback 并留下持久原因；ledgerRefs 不再携带循环开始时的陈旧 stats 快照。
+describe('PCV evidence detail corrections (I28)', () => {
+  function createTracedLoop(
+    trace: Record<string, unknown>,
+    diagnostics = new DiagnosticsCollector()
+  ) {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('review code');
+    return new LoopContext({
+      messages,
+      capabilities: [],
+      baseSystemPrompt: 'review',
+      allowedToolIds: ['code', 'memory'],
+      toolSchemas: [],
+      source: 'system',
+      budget: { maxIterations: 1 },
+      prompt: 'review code',
+      context: { pipelinePhase: 'analyze', dimensionId: 'probe' },
+      trace,
+      diagnostics,
+    });
+  }
+
+  const blockedRead = {
+    id: 'read-secret',
+    name: 'code',
+    args: { action: 'read', params: { path: 'src/secret/a.ts' } },
+  };
+
+  it('keeps a blocked code.read path out of node sourceRefs and still reports missing-source-refs', () => {
+    const ctx = createLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      blockedRead,
+      { error: 'Tool call blocked by hook' },
+      undefined,
+      { toolSucceeded: false }
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).not.toContain('src/secret/a.ts');
+    expect(summary.missingLinkReasons).toContain('missing-source-refs');
+    // 跳过的引用经现有 sourceRefDiagnostics 留审计记录，但不冒充“缺失链接”。
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: 'src/secret/a.ts', reason: 'failed-tool-call', status: 'missing' },
+    ]);
+    expect(summary.missingLinkReasons).not.toContain('missing-source-ref:src/secret/a.ts');
+    expect(buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence).sourceRefs).toEqual([]);
+  });
+
+  it('derives failure from the envelope or result error when toolSucceeded is omitted', () => {
+    const viaEnvelope = createLoop();
+    recordPcvToolResult(viaEnvelope.pcvNodeEvidence, blockedRead, { error: 'read denied' }, {
+      ok: false,
+      status: 'blocked',
+      text: 'read denied for src/secret/b.ts',
+    } as never);
+    expect(viaEnvelope.pcvNodeEvidence.sourceRefs).toEqual([]);
+
+    const viaResult = createLoop();
+    recordPcvToolResult(viaResult.pcvNodeEvidence, blockedRead, {
+      error: 'ENOENT src/secret/a.ts',
+    });
+    expect(viaResult.pcvNodeEvidence.sourceRefs).toEqual([]);
+  });
+
+  it('still links paths touched by a successful read', () => {
+    const ctx = createLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      { id: 'read-ok', name: 'code', args: { action: 'read', params: { path: 'src/widget.ts' } } },
+      { path: 'src/widget.ts', content: 'export const widget = 1;' },
+      undefined,
+      { toolSucceeded: true }
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).toEqual(['src/widget.ts']);
+    expect(summary.missingLinkReasons).not.toContain('missing-source-refs');
+    expect(summary.sourceRefDiagnostics).toEqual([]);
+  });
+
+  it('keeps a failed note_finding reference on the rejected finding only', () => {
+    const ctx = createLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      {
+        id: 'note',
+        name: 'note_finding',
+        args: { finding: 'claimed boundary', evidence: 'src/claimed.ts:4', importance: 7 },
+      },
+      { error: 'note_finding rejected: evidence was never read' },
+      undefined,
+      { toolSucceeded: false }
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.findingRefs.rejected).toEqual([
+      expect.objectContaining({ sourceRefs: ['src/claimed.ts:4'] }),
+    ]);
+    expect(summary.sourceRefs).toEqual([]);
+    expect(summary.missingLinkReasons).toContain('missing-source-refs');
+  });
+
+  it('falls back instead of throwing when process-event metadata is passed as source evidence', () => {
+    const ctx = createLoop();
+    recordInput(ctx);
+    const metadata = buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence);
+    const build = () =>
+      buildPcvQualityGateEvidence({
+        source: { pcvNodeEvidence: metadata },
+        artifact: {
+          findings: [{ finding: 'bounded owner', evidence: 'src/widget.ts:11', importance: 8 }],
+          referencedFiles: ['src/widget.ts:11'],
+        },
+        dimId: 'probe',
+        gate: { pass: true, action: 'pass' },
+      });
+    expect(build).not.toThrow();
+    const quality = build();
+    expect(quality.nodeId).toBe('agent:quality_gate:probe');
+    expect(quality.groundingEnforcement).toBe('off');
+    expect(quality.missingLinkReasons).toContain('invalid-source-pcv-evidence');
+    expect(quality.sourceRefs).toContain('src/widget.ts:11');
+  });
+
+  it('does not flag a quality gate without source evidence as invalid', () => {
+    const quality = buildPcvQualityGateEvidence({
+      source: {},
+      artifact: { referencedFiles: ['src/widget.ts'] },
+      dimId: 'probe',
+      gate: { pass: true, action: 'pass' },
+    });
+    expect(quality.missingLinkReasons).not.toContain('invalid-source-pcv-evidence');
+  });
+
+  it('defaults a missing groundingEnforcement to observe-only off and keeps guard', () => {
+    const ctx = createLoop();
+    const { groundingEnforcement: _omitted, ...legacy } = ctx.buildResult().pcvNodeEvidence;
+    const legacyQuality = buildPcvQualityGateEvidence({
+      source: { pcvNodeEvidence: legacy },
+      artifact: { referencedFiles: ['src/widget.ts'] },
+      gate: { pass: true, action: 'pass' },
+    });
+    expect(legacyQuality.groundingEnforcement).toBe('off');
+    expect(legacyQuality.missingLinkReasons).not.toContain('invalid-source-pcv-evidence');
+
+    const guarded = buildPcvQualityGateEvidence({
+      source: { pcvNodeEvidence: { ...legacy, groundingEnforcement: 'guard' } },
+      artifact: { referencedFiles: ['src/widget.ts'] },
+      gate: { pass: true, action: 'pass' },
+    });
+    expect(guarded.groundingEnforcement).toBe('guard');
+  });
+
+  it('does not carry a stale observation-ledger stats snapshot', () => {
+    let rounds = 0;
+    const ctx = createTracedLoop({ getStats: () => ({ totalRounds: rounds, totalActions: 0 }) });
+    rounds = 12;
+    const result = ctx.buildResult();
+    expect(result.pcvNodeEvidence.ledgerRefs).toEqual([
+      { kind: 'observation-ledger', ref: 'active-context:probe', source: 'ActiveContext' },
+    ]);
+    expect(result.pcvNodeEvidence.missingLinkReasons).not.toContain(
+      'observation-ledger-stats-unavailable'
+    );
+
+    const quality = buildPcvQualityGateEvidence({
+      source: {
+        pcvNodeEvidence: {
+          ...result.pcvNodeEvidence,
+          ledgerRefs: [
+            {
+              kind: 'observation-ledger',
+              ref: 'active-context:probe',
+              source: 'ActiveContext',
+              stats: { totalRounds: 0 },
+            },
+          ],
+        },
+      },
+      artifact: { referencedFiles: ['src/widget.ts'] },
+      gate: { pass: true, action: 'pass' },
+    });
+    expect(quality.ledgerRefs).toEqual([
+      { kind: 'observation-ledger', ref: 'active-context:probe', source: 'ActiveContext' },
+    ]);
+  });
+
+  it('reports an unreadable observation ledger instead of swallowing the error', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const ctx = createTracedLoop(
+      {
+        getStats: () => {
+          throw new Error('ledger closed');
+        },
+      },
+      diagnostics
+    );
+    const summary = ctx.buildResult().pcvNodeEvidence;
+    expect(summary.ledgerRefs).toEqual([
+      { kind: 'observation-ledger', ref: 'active-context:probe', source: 'ActiveContext' },
+    ]);
+    expect(summary.missingLinkReasons).toContain('observation-ledger-stats-unavailable');
+    expect(diagnostics.toJSON().warnings).toEqual([
+      expect.objectContaining({
+        code: 'pcv_observation_ledger_stats_unavailable',
+        message: expect.stringContaining('ledger closed'),
+      }),
+    ]);
   });
 });

@@ -93,11 +93,15 @@ export interface PcvBurnGroundingLedgerEntry {
   visibleDeterministicEvidenceRefs?: string[];
 }
 
+/**
+ * 观察台账引用：只指向 ActiveContext（权威台账本身），不携带计数快照。
+ * I28：旧的 stats 字段只在循环开始时取一次、之后从不刷新，buildResult 返回的永远是开局计数，
+ * 且宿主不读它，因此删除；需要计数时直接读 ActiveContext。
+ */
 export interface PcvNodeLedgerRef {
   kind: 'observation-ledger';
   ref: string;
   source: 'ActiveContext';
-  stats?: JsonRecord;
 }
 
 export interface PcvNodeAcceptedFindingRef {
@@ -343,6 +347,7 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
   };
   attachPcvSourceRefIndex(evidence, ctx.context, ctx.sharedState);
   evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(evidence, rawRepairEvidencePaths);
+  probeObservationLedger(ctx, evidence);
   return evidence;
 }
 
@@ -533,18 +538,30 @@ export function recordPcvToolResult(
 ): void {
   const toolName = call.name || 'unknown';
   const callId = call.id || null;
-  const sourceRefs = normalizeSourceRefsForEvidence(
-    evidence,
-    extractSourceRefsFromValue([
-      call.args,
-      result,
-      envelope?.structuredContent,
-      envelope?.artifacts,
-      envelope?.resources,
-      envelope?.text,
-    ])
-  );
-  addSourceRefs(evidence, sourceRefs);
+  const resultRecord = asRecord(result);
+  // 调用方（AgentRuntime）总会传入 readToolObservation 的判定；未传时退回 envelope.ok，
+  // 没有 envelope 时以 result.error 是否存在判定，与下方 note_finding 的接受判定共用同一口径。
+  const toolSucceeded =
+    options.toolSucceeded ?? (envelope ? envelope.ok : resultRecord.error === undefined);
+  if (toolSucceeded) {
+    const sourceRefs = normalizeSourceRefsForEvidence(
+      evidence,
+      extractSourceRefsFromValue([
+        call.args,
+        result,
+        envelope?.structuredContent,
+        envelope?.artifacts,
+        envelope?.resources,
+        envelope?.text,
+      ])
+    );
+    addSourceRefs(evidence, sourceRefs);
+  } else {
+    // I28：被 hook / 阶段门阻断或执行失败的调用没有真正读到来源，其参数路径不能计入节点 sourceRefs，
+    // 否则一个全部读取失败的节点会被宿主显示为 linked，并掩盖 missing-source-refs。
+    // 跳过的只是“尝试过的参数路径”，经 sourceRefDiagnostics 留审计记录；失败回执文本里的路径不记录。
+    recordFailedCallSourceRefs(evidence, extractSourceRefsFromValue(call.args));
+  }
 
   if (!isNoteFindingCall(call)) {
     return;
@@ -558,7 +575,7 @@ export function recordPcvToolResult(
     refs.length > 0
       ? refs
           .map((ref) => {
-            const entry = options.toolSucceeded !== false ? options.evidenceLedger?.get(ref) : null;
+            const entry = toolSucceeded ? options.evidenceLedger?.get(ref) : null;
             return entry?.file
               ? `${ref}=${entry.file}${entry.range ? `:${entry.range.start}-${entry.range.end}` : ''}`
               : ref;
@@ -566,9 +583,6 @@ export function recordPcvToolResult(
           .join('; ')
       : stringValue(params.evidence) || '';
   const importance = numberValue(params.importance);
-  const resultRecord = asRecord(result);
-  const toolSucceeded =
-    options.toolSucceeded ?? (envelope ? envelope.ok : resultRecord.error === undefined);
   const recorded = toolSucceeded && resultRecord.recorded === true;
   const target = stringValue(resultRecord.target);
   const accepted = recorded && target === 'activeContext';
@@ -576,7 +590,11 @@ export function recordPcvToolResult(
     evidence,
     extractSourceRefsFromValue([evidenceText, params, resultRecord])
   );
-  addSourceRefs(evidence, findingSourceRefs);
+  // I28：与上方同一口径——失败的 note_finding 调用，其引用只保留在被拒 finding 记录的 sourceRefs 上供审计，
+  // 不并入节点 sourceRefs；调用成功但未进入 ActiveContext 的 finding 仍是一次成功调用，引用照旧并入。
+  if (toolSucceeded) {
+    addSourceRefs(evidence, findingSourceRefs);
+  }
 
   if (accepted) {
     pushUniqueAcceptedFinding(evidence, {
@@ -709,10 +727,18 @@ function createQualityGateEvidenceBase(
   dimId: string | null,
   source: unknown
 ): PcvNodeEvidenceSummary {
-  const sourceEvidence = getPcvNodeEvidence(source);
-  return sourceEvidence
-    ? cloneEvidence(sourceEvidence)
-    : createFallbackQualityGateEvidence(artifactRecord, dimId);
+  const candidate = asRecord(source).pcvNodeEvidence;
+  if (isPcvNodeEvidenceSummary(candidate)) {
+    return cloneEvidence(candidate);
+  }
+  const fallback = createFallbackQualityGateEvidence(artifactRecord, dimId);
+  if (candidate !== undefined && candidate !== null) {
+    // I28 降级路径：source 带了 pcvNodeEvidence，但形状不是完整摘要（例如误传进程事件元数据
+    // PcvNodeEvidenceProcessMetadata，或被宿主重组/截断过的旧摘要）。此时不再克隆它（会抛 TypeError
+    // 让整个 quality_gate 阶段失败），改用 fallback 证据，并留下持久原因供审计定位来源证据被丢弃。
+    fallback.missingLinkReasons.push('invalid-source-pcv-evidence');
+  }
+  return fallback;
 }
 
 function recordQualityGateReferencedFiles(
@@ -997,19 +1023,54 @@ function normalizePcvStageNodeMapValue(value: unknown): ResolvedPcvStageNodeIden
 }
 
 function buildLedgerRefs(ctx: LoopContext, dimensionScopeId: string | null): PcvNodeLedgerRef[] {
-  const stats = safeCall(() => ctx.trace?.getStats?.()) || null;
-  if (!ctx.trace && !stats) {
+  // 引用只在注入了观察台账（trace = ActiveContext）时存在；不再附带 stats 快照（见 PcvNodeLedgerRef）。
+  if (!ctx.trace) {
     return [];
   }
-  const ref = `active-context:${dimensionScopeId || 'session'}`;
   return [
     {
       kind: 'observation-ledger',
-      ref,
+      ref: `active-context:${dimensionScopeId || 'session'}`,
       source: 'ActiveContext',
-      ...(stats ? { stats: sanitizeStats(stats) } : {}),
     },
   ];
+}
+
+/**
+ * 观察台账可读性探针：节点创建时读一次 trace.getStats，只用来确认台账可读，不保留计数。
+ * trace 可能是宿主注入的鸭子类型对象，读取抛错时：引用照常保留（台账对象确实存在），
+ * 但在 missingLinkReasons 写入 observation-ledger-stats-unavailable，并经运行诊断报告错误原文，
+ * 取代原来裸 catch 静默吞错。没有 trace 或没有 getStats 方法不算失败。
+ */
+function probeObservationLedger(ctx: LoopContext, evidence: PcvNodeEvidenceSummary): void {
+  const trace = ctx.trace;
+  if (!trace || typeof trace.getStats !== 'function') {
+    return;
+  }
+  try {
+    trace.getStats();
+  } catch (err: unknown) {
+    // 非 Error 抛出值不走 String(err)：其 toString 可能再次抛错，让 LoopContext 构造失败。
+    const message =
+      err instanceof Error
+        ? err.message
+        : typeof err === 'string'
+          ? err
+          : Object.prototype.toString.call(err);
+    evidence.missingLinkReasons = uniqueStrings([
+      ...evidence.missingLinkReasons,
+      'observation-ledger-stats-unavailable',
+    ]);
+    ctx.diagnostics?.warn({
+      code: 'pcv_observation_ledger_stats_unavailable',
+      message: limitText(
+        `trace.getStats threw while probing the observation ledger for PCV node ${evidence.nodeId}; ` +
+          `ledger ref kept, missingLinkReasons marked observation-ledger-stats-unavailable: ${message}`,
+        400
+      ),
+      stage: evidence.stageIdentity.pipelinePhase ?? undefined,
+    });
+  }
 }
 
 function createFallbackQualityGateEvidence(
@@ -1054,18 +1115,124 @@ function createFallbackQualityGateEvidence(
   };
 }
 
-function getPcvNodeEvidence(source: unknown): PcvNodeEvidenceSummary | null {
-  const record = asRecord(source);
-  const candidate = record.pcvNodeEvidence;
-  if (!isPcvNodeEvidenceSummary(candidate)) {
-    return null;
+/**
+ * I28 结构守卫：只查 schemaVersion/nodeId 时，进程事件元数据（PcvNodeEvidenceProcessMetadata，
+ * 同样带 schemaVersion:1 与 nodeId，但没有 findingRefs/ledgerRefs 对象数组）也能通过，随后 cloneEvidence
+ * 无保护地解引用这些字段并抛 TypeError。这里按 cloneEvidence 与摘要构建实际解引用的字段逐项校验；
+ * 被 `|| []` 兜底的可选数组允许缺省（null/undefined），但出现时必须是数组。
+ * groundingEnforcement 缺省视为 AP-4 之前的旧摘要（clone 时补 'off'），出现时必须是合法取值。
+ */
+function isPcvNodeEvidenceSummary(value: unknown): value is PcvNodeEvidenceSummary {
+  if (!isJsonRecord(value)) {
+    return false;
   }
-  return candidate;
+  if (
+    value.schemaVersion !== 1 ||
+    typeof value.nodeId !== 'string' ||
+    typeof value.chainNodeId !== 'string' ||
+    !isJsonRecord(value.correlation) ||
+    !isJsonRecord(value.stageIdentity) ||
+    !Array.isArray(value.sourceRefs) ||
+    !isOptionalArray(value.missingLinkReasons) ||
+    !isOptionalArray(value.sourceRefDiagnostics) ||
+    !(
+      value.groundingEnforcement === undefined || isGroundingEnforcement(value.groundingEnforcement)
+    )
+  ) {
+    return false;
+  }
+  return (
+    hasValidFindingRefs(value.findingRefs) &&
+    hasValidLedgerRefs(value.ledgerRefs) &&
+    hasValidRepair(value.repair) &&
+    hasValidGroundingLedger(value.groundingLedger) &&
+    hasValidInputAssembly(value.inputAssembly) &&
+    hasValidQualityGate(value.qualityGate)
+  );
 }
 
-function isPcvNodeEvidenceSummary(value: unknown): value is PcvNodeEvidenceSummary {
-  const record = asRecord(value);
-  return record.schemaVersion === 1 && typeof record.nodeId === 'string';
+function hasValidFindingRefs(value: unknown): boolean {
+  if (!isJsonRecord(value) || !Array.isArray(value.accepted) || !Array.isArray(value.rejected)) {
+    return false;
+  }
+  return (
+    value.accepted.every((finding) => hasArrayFields(finding, ['evidence', 'sourceRefs'])) &&
+    value.rejected.every(
+      (finding) =>
+        isJsonRecord(finding) &&
+        isOptionalArray(finding.evidence) &&
+        isOptionalArray(finding.sourceRefs)
+    )
+  );
+}
+
+function hasValidLedgerRefs(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every((ledger) => isJsonRecord(ledger) && typeof ledger.ref === 'string')
+  );
+}
+
+function hasValidRepair(value: unknown): boolean {
+  return hasArrayFields(value, ['evidencePaths']);
+}
+
+function hasValidGroundingLedger(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        hasArrayFields(entry, [
+          'consumedEvidenceRefs',
+          'deterministicEvidenceRefs',
+          'evidenceStarterRefs',
+          'functionCallNames',
+          'outputSourceRefs',
+          'toolSchemaNames',
+        ]) && isOptionalArray(entry.visibleDeterministicEvidenceRefs)
+    )
+  );
+}
+
+function hasValidInputAssembly(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  return hasArrayFields(value, [
+    'inputSectionIds',
+    'providerVisibleSectionIds',
+    'staticSectionIds',
+    'toolSchemaNames',
+  ]);
+}
+
+function hasValidQualityGate(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+  return isJsonRecord(value) && isOptionalArray(value.suggestions);
+}
+
+function hasArrayFields(value: unknown, keys: readonly string[]): value is JsonRecord {
+  if (!isJsonRecord(value)) {
+    return false;
+  }
+  return keys.every((key) => Array.isArray(value[key]));
+}
+
+function isOptionalArray(value: unknown): boolean {
+  return value === undefined || value === null || Array.isArray(value);
+}
+
+function isGroundingEnforcement(value: unknown): value is GroundingEnforcement {
+  return value === 'off' || value === 'guard';
+}
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isNoteFindingCall(call: FunctionCallLike): boolean {
@@ -1132,6 +1299,25 @@ function pushUniqueRejectedFinding(
 ): void {
   if (!evidence.findingRefs.rejected.some((item) => item.ref === finding.ref)) {
     evidence.findingRefs.rejected.push(finding);
+  }
+}
+
+/**
+ * I28：失败调用的参数路径不进入节点 sourceRefs（见 recordPcvToolResult），在 sourceRefDiagnostics 里记
+ * `{ reason: 'failed-tool-call', status: 'missing' }` 留审计。刻意不镜像到 missingLinkReasons：
+ * 同一路径之后可能被成功读取并正常链接，镜像成 missing-source-ref 会与 sourceRefs 自相矛盾；
+ * 节点是否缺来源仍由派生原因 missing-source-refs 表达。
+ */
+function recordFailedCallSourceRefs(
+  evidence: PcvNodeEvidenceSummary,
+  refs: readonly string[]
+): void {
+  for (const ref of uniqueStrings([...refs])) {
+    pushSourceRefDiagnostic(evidence, {
+      input: ref,
+      reason: 'failed-tool-call',
+      status: 'missing',
+    });
   }
 }
 
@@ -1348,6 +1534,20 @@ function recordSourceRefDiagnostic(
   evidence: PcvNodeEvidenceSummary,
   diagnostic: PcvSourceRefDiagnostic
 ): void {
+  if (!pushSourceRefDiagnostic(evidence, diagnostic)) {
+    return;
+  }
+  evidence.missingLinkReasons = uniqueStrings([
+    ...evidence.missingLinkReasons,
+    `${diagnostic.status}-source-ref:${diagnostic.input}`,
+  ]);
+}
+
+/** 按 input/reason/status 去重写入 sourceRefDiagnostics；返回是否新增（已存在时不重复记录）。 */
+function pushSourceRefDiagnostic(
+  evidence: PcvNodeEvidenceSummary,
+  diagnostic: PcvSourceRefDiagnostic
+): boolean {
   if (
     evidence.sourceRefDiagnostics.some(
       (item) =>
@@ -1356,13 +1556,10 @@ function recordSourceRefDiagnostic(
         item.status === diagnostic.status
     )
   ) {
-    return;
+    return false;
   }
   evidence.sourceRefDiagnostics.push(diagnostic);
-  evidence.missingLinkReasons = uniqueStrings([
-    ...evidence.missingLinkReasons,
-    `${diagnostic.status}-source-ref:${diagnostic.input}`,
-  ]);
+  return true;
 }
 
 function isProjectScopeSourceRefIndex(value: unknown): value is PcvProjectScopeSourceRefIndex {
@@ -1526,43 +1723,13 @@ function asQualityReport(value: unknown): {
   };
 }
 
-function sanitizeStats(value: unknown): JsonRecord {
-  const record = asRecord(value);
-  const output: JsonRecord = {};
-  for (const [key, child] of Object.entries(record)) {
-    if (isSecretLikeKey(key)) {
-      continue;
-    }
-    if (
-      typeof child === 'string' ||
-      typeof child === 'number' ||
-      typeof child === 'boolean' ||
-      child === null
-    ) {
-      output[key] = child;
-    } else if (Array.isArray(child)) {
-      output[key] = child.slice(0, 12).map((item) => simpleValue(item));
-    }
-  }
-  return output;
-}
-
-function simpleValue(value: unknown): unknown {
-  if (
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean' ||
-    value === null
-  ) {
-    return value;
-  }
-  return String(value);
-}
-
 function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary {
   const cloned = {
     ...evidence,
     correlation: { ...evidence.correlation },
+    // I28：AP-4 之前的旧摘要没有 groundingEnforcement；缺省取值与 LoopContext 的默认一致，
+    // 即 observe-only 'off'（非法取值已被 isPcvNodeEvidenceSummary 拒绝，走 invalid-source-pcv-evidence）。
+    groundingEnforcement: evidence.groundingEnforcement ?? 'off',
     findingRefs: {
       accepted: evidence.findingRefs.accepted.map((finding) => ({
         ...finding,
@@ -1596,9 +1763,11 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
           toolSchemaNames: [...evidence.inputAssembly.toolSchemaNames],
         }
       : null,
+    // I28：只投影 kind/ref/source；旧形状输入里的 stats 快照（开局计数、宿主不读）在此丢弃。
     ledgerRefs: evidence.ledgerRefs.map((ledger) => ({
-      ...ledger,
-      ...(ledger.stats ? { stats: sanitizeStats(ledger.stats) } : {}),
+      kind: ledger.kind,
+      ref: ledger.ref,
+      source: ledger.source,
     })),
     missingLinkReasons: [...(evidence.missingLinkReasons || [])],
     qualityGate: evidence.qualityGate
@@ -1684,14 +1853,6 @@ function firstStringValue(...values: unknown[]): string | null {
     }
   }
   return null;
-}
-
-function safeCall<T>(fn: () => T | null | undefined): T | null {
-  try {
-    return fn() ?? null;
-  } catch {
-    return null;
-  }
 }
 
 function asRecord(value: unknown): JsonRecord {
