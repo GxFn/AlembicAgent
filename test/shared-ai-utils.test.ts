@@ -10,7 +10,7 @@ import { ReliabilityController } from '../src/ai/shared/reliability.js';
 import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structuredOutput.js';
 import { createLimit } from '../src/shared/concurrency.js';
 import { isThenable, observeSafely } from '../src/shared/observers.js';
-import { runOperation } from '../src/shared/operation.js';
+import { isDeadlineAbort, runOperation } from '../src/shared/operation.js';
 import { resolveProjectPath } from '../src/shared/projectPath.js';
 import { stableStringify } from '../src/shared/serialization.js';
 import { estimateTokens, truncateToTokenBudget } from '../src/shared/tokenUtils.js';
@@ -102,7 +102,75 @@ describe('shared/operation lifecycle', () => {
     parent.abort(reason);
     expect(await pending).toEqual({ status: 'aborted' });
     expect(innerSignal.reason).toBe(reason);
+    // 父取消是用户/宿主取消，不能被内层误判为期限。
+    expect(isDeadlineAbort(innerSignal)).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('aborts the inner signal with a TimeoutError reason when its own deadline expires', async () => {
+    vi.useFakeTimers();
+    const started = Promise.withResolvers<AbortSignal>();
+    const pending = runOperation(
+      (signal) => {
+        started.resolve(signal);
+        return new Promise(() => {});
+      },
+      { timeoutMs: 50 }
+    );
+    const innerSignal = await started.promise;
+    expect(isDeadlineAbort(innerSignal)).toBe(false);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await pending).toEqual({ status: 'timeout' });
+    expect(innerSignal.aborted).toBe(true);
+    // 与 AbortSignal.timeout 同名：工具层据 reason.name 区分期限与用户取消。
+    expect(innerSignal.reason).toBeInstanceOf(Error);
+    expect(innerSignal.reason).toMatchObject({
+      name: 'TimeoutError',
+      message: 'Operation deadline exceeded',
+    });
+    expect(isDeadlineAbort(innerSignal)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('propagates an outer deadline into a nested operation as a deadline, not a user cancel', async () => {
+    vi.useFakeTimers();
+    const nestedStarted = Promise.withResolvers<AbortSignal>();
+    let nestedOutcome: Promise<unknown> | undefined;
+    const outer = runOperation(
+      (outerSignal) => {
+        // 模拟运行期限 → reactLoop → 工具/传输层的嵌套 runOperation：内层自己的期限更长。
+        nestedOutcome = runOperation(
+          (signal) => {
+            nestedStarted.resolve(signal);
+            return new Promise(() => {});
+          },
+          { abortSignal: outerSignal, timeoutMs: 10_000 }
+        );
+        return nestedOutcome;
+      },
+      { timeoutMs: 100 }
+    );
+    const nestedSignal = await nestedStarted.promise;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await outer).toEqual({ status: 'timeout' });
+    // 内层看到的是父取消（aborted），但原因原样透传外层期限，仍可识别为期限。
+    expect(await nestedOutcome).toEqual({ status: 'aborted' });
+    expect(nestedSignal.reason).toMatchObject({ name: 'TimeoutError' });
+    expect(isDeadlineAbort(nestedSignal)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('recognises only aborted signals carrying a TimeoutError reason as deadline aborts', () => {
+    expect(isDeadlineAbort(undefined)).toBe(false);
+    expect(isDeadlineAbort(null)).toBe(false);
+    expect(isDeadlineAbort(new AbortController().signal)).toBe(false);
+    expect(isDeadlineAbort(AbortSignal.abort())).toBe(false);
+    expect(isDeadlineAbort(AbortSignal.abort(new Error('user stopped')))).toBe(false);
+    expect(isDeadlineAbort(AbortSignal.abort('TimeoutError'))).toBe(false);
+    expect(isDeadlineAbort(AbortSignal.abort({ name: 'TimeoutError' }))).toBe(false);
+    expect(isDeadlineAbort(AbortSignal.abort(new DOMException('deadline', 'TimeoutError')))).toBe(
+      true
+    );
   });
 
   it('settles timeout before a cooperative abort handler resolves', async () => {

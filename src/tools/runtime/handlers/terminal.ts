@@ -20,6 +20,7 @@ import { exec } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { isDeadlineAbort } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
@@ -233,13 +234,16 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
   }
 }
 
+/**
+ * 执行器失败/137 强杀后的终态归类：signal 未中止 → error（真实失败或来源不明的强杀）；
+ * 已中止时按 isDeadlineAbort 区分期限（runOperation 运行/阶段期限或 AbortSignal.timeout → timeout）
+ * 与用户/宿主取消（→ aborted）。归类结果写入回执 resultStatus 与输出标签，137 与执行器抛错两条路径共用。
+ */
 function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'timeout' {
   if (!signal?.aborted) {
     return 'error';
   }
-  return signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
-    ? 'timeout'
-    : 'aborted';
+  return isDeadlineAbort(signal) ? 'timeout' : 'aborted';
 }
 
 /**

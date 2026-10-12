@@ -13,6 +13,7 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import Logger from '@alembic/core/logging';
 import { isThenable, observeSafely } from '#shared/observers.js';
+import { isDeadlineAbort } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
@@ -413,10 +414,13 @@ interface SearchOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * 搜索被取消时的终态归类，与 terminal 共用 isDeadlineAbort：期限（runOperation 运行/阶段期限或
+ * AbortSignal.timeout）→ timeout，其余取消原因（用户/宿主停止）→ aborted。
+ * 归类结果进入 halted.status，并由 code_search_incomplete 诊断点名中断点与被跳过的 pattern。
+ */
 function searchAbortStatus(signal: AbortSignal): 'timeout' | 'aborted' {
-  return signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
-    ? 'timeout'
-    : 'aborted';
+  return isDeadlineAbort(signal) ? 'timeout' : 'aborted';
 }
 
 /** ripgrep 排除的噪音目录 — 与 IGNORED_DIRS 对齐 */

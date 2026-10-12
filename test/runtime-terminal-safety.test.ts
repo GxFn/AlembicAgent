@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import { runOperation } from '../src/shared/operation.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import { checkTerminalCommandAllowlist } from '../src/tools/runtime/handlers/terminalSafety.js';
 
@@ -253,6 +254,111 @@ describe('runtime terminal.exec safety', () => {
     if (stdout) {
       expect(String(result.data)).toContain(stdout);
     }
+  });
+
+  // 不用手工 TimeoutError fixture：信号由 runOperation 自己的期限或父取消产生，
+  // 锁定运行/阶段期限经 ctx.abortSignal 到达 terminal 时回执为 timeout，而父取消仍为 aborted。
+  it.each([
+    { label: 'its runOperation deadline expires', parentCancel: false, status: 'timeout' },
+    { label: 'the parent cancels the operation', parentCancel: true, status: 'aborted' },
+  ])('reports $status when a running command stops because $label', async ({
+    parentCancel,
+    status,
+  }) => {
+    const parent = new AbortController();
+    const executorStarted = Promise.withResolvers<void>();
+    let toolRun: ReturnType<typeof runTerminalExec> | undefined;
+    const pending = runOperation(
+      (signal) => {
+        toolRun = runTerminalExec(
+          'pwd',
+          baseToolContext({
+            abortSignal: signal,
+            sandboxExecutor: {
+              exec: (_command: string, opts: { signal?: AbortSignal }) =>
+                new Promise((_resolve, reject) => {
+                  executorStarted.resolve();
+                  // 模拟沙箱收到取消后强杀进程：以带部分输出的错误结束。
+                  opts.signal?.addEventListener(
+                    'abort',
+                    () => {
+                      reject(
+                        Object.assign(new Error('command killed'), {
+                          stdout: 'partial stdout',
+                          stderr: '',
+                        })
+                      );
+                    },
+                    { once: true }
+                  );
+                }),
+            },
+          })
+        );
+        return toolRun;
+      },
+      { abortSignal: parent.signal, timeoutMs: parentCancel ? 60_000 : 30 }
+    );
+    await executorStarted.promise;
+    if (parentCancel) {
+      parent.abort(new Error('host stopped the run'));
+    }
+    expect(await pending).toEqual({ status: parentCancel ? 'aborted' : 'timeout' });
+    const result = await toolRun;
+    expect(result?.ok).toBe(true);
+    expect(result?._meta).toMatchObject({ resultStatus: status, degraded: true });
+    expect(String(result?.data)).toContain(`[${status}]`);
+    expect(String(result?.data)).toContain('partial stdout');
+  });
+
+  it('carries a runOperation deadline through the adapter as a timeout envelope', async () => {
+    const executorStarted = Promise.withResolvers<void>();
+    let envelopeRun: ReturnType<ToolRouterAdapter['execute']> | undefined;
+    const pending = runOperation(
+      (signal) => {
+        const router = new ToolRouterAdapter({
+          contextFactory: {
+            create: () =>
+              baseToolContext({
+                sandboxExecutor: {
+                  exec: (_command: string, opts: { signal?: AbortSignal }) =>
+                    new Promise((_resolve, reject) => {
+                      executorStarted.resolve();
+                      opts.signal?.addEventListener(
+                        'abort',
+                        () => {
+                          reject(
+                            Object.assign(new Error('command killed'), {
+                              stdout: 'attempted stdout',
+                              stderr: '',
+                            })
+                          );
+                        },
+                        { once: true }
+                      );
+                    }),
+                },
+              }),
+          },
+        });
+        envelopeRun = router.execute({
+          toolId: 'terminal',
+          args: { action: 'exec', params: { command: 'pwd' } },
+          surface: 'runtime',
+          actor: { user: 'fixture' },
+          source: { kind: 'runtime' },
+          abortSignal: signal,
+        });
+        return envelopeRun;
+      },
+      { timeoutMs: 30 }
+    );
+    await executorStarted.promise;
+    expect(await pending).toEqual({ status: 'timeout' });
+    const envelope = await envelopeRun;
+    // 宿主据 envelope.status 映射 HTTP：timeout→504，aborted→499；期限不得再被记为 aborted。
+    expect(envelope).toMatchObject({ ok: true, status: 'timeout' });
+    expect(envelope?.text).toContain('attempted stdout');
   });
 
   it('rejects a cwd symlink that escapes the analyzed project', async () => {
