@@ -18,6 +18,7 @@ import type {
   ParsedToolCall,
   ToolAction,
   ToolContext,
+  ToolDiagnosticWarning,
   ToolResult,
   ToolSpec,
 } from '#tools/kernel/registry.js';
@@ -32,7 +33,7 @@ import {
 } from '#tools/kernel/toolSelection.js';
 import { toolAdmissionFailure } from './admission.js';
 import { describeToolAvailability } from './availability.js';
-import { validateToolParameters } from './parameters.js';
+import { type ToolParameterSchemaFailureSink, validateToolParameters } from './parameters.js';
 import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
 import { createToolRegistryView, readToolAvailability } from './selection.js';
 
@@ -78,9 +79,23 @@ export class ToolRouter {
         reason: `Unknown tool action: ${call.tool}.${call.action}`,
       };
     }
-    const paramError = validateToolParameters(call, spec.actions[call.action], ctx.runtime);
-    if (paramError) {
-      return { allowed: false, stage: 'discover', reason: paramError };
+    const paramRejection = validateToolParameters(
+      call,
+      spec.actions[call.action],
+      ctx.runtime,
+      reportParameterSchemaFailure
+    );
+    if (paramRejection) {
+      // schema 编译失败是注册表/宿主缺陷而非模型参数错误：按“工具不可用”拒绝（execute/blocked →
+      // TOOL_UNAVAILABLE），避免模型把它当成自己的参数问题反复改参重试；参数不符才是 discover。
+      return paramRejection.source === 'schema'
+        ? {
+            allowed: false,
+            stage: 'execute',
+            resultStatus: 'blocked',
+            reason: paramRejection.reason,
+          }
+        : { allowed: false, stage: 'discover', reason: paramRejection.reason };
     }
     const capability = this.#config.capability;
     const capabilityActions = capability
@@ -218,6 +233,8 @@ export class ToolRouter {
     } = {}
   ): Promise<ToolResult> {
     const startMs = Date.now();
+    // 记录异常发生在哪一段，catch 据此区分 handler 崩溃、宿主可用性回调失败与路由自身失败。
+    let phase: RouterFailurePhase = 'router';
 
     try {
       if (ctx.abortSignal?.aborted) {
@@ -251,9 +268,11 @@ export class ToolRouter {
           return fail('Tool execution aborted before handler');
         }
         // single/exclusive排队后重读宿主事实；入队时可用不代表获得slot时仍可用。
+        phase = 'availability';
         const currentCtx = options.getAvailability
           ? { ...ctx, toolAvailability: options.getAvailability() }
           : ctx;
+        phase = 'router';
         const currentDecision = this.explain(call, currentCtx);
         if (!currentDecision.allowed) {
           return toolAdmissionFailure(call, currentDecision);
@@ -273,14 +292,17 @@ export class ToolRouter {
         if (ctx.abortSignal?.aborted) {
           return fail('Tool execution aborted before handler');
         }
+        phase = 'handler';
         const result = await action.handler(call.params, handlerCtx);
+        phase = 'router';
+
+        // 先截断再记耗时：截断可能为没有 _meta 的 handler 结果补建元信息，耗时要落在同一份元信息上。
+        if (action.maxOutputTokens && result.ok) {
+          enforceOutputLimit(result, action.maxOutputTokens, call);
+        }
 
         if (result._meta) {
           result._meta.durationMs = Date.now() - startMs;
-        }
-
-        if (action.maxOutputTokens && result.ok) {
-          enforceOutputLimit(result, action.maxOutputTokens, `${call.tool}.${call.action}`);
         }
 
         return result;
@@ -288,9 +310,7 @@ export class ToolRouter {
         release();
       }
     } catch (err: unknown) {
-      return fail(
-        `Tool execution error (${call.tool}.${call.action}): ${err instanceof Error ? err.message : String(err)}`
-      );
+      return routerExecutionFailure(call, phase, err, Date.now() - startMs);
     }
   }
 
@@ -491,7 +511,7 @@ function truncationNotice(omittedChars: number, maxTokens: number): string {
  *   只保留说明，让下游仍能识别截断，并经 Logger.warn 报告该降级。
  * 非字符串结果（如 code.search 的结构化 matches）由 handler 自行按同一口径投影，这里不处理。
  */
-function enforceOutputLimit(result: ToolResult, maxTokens: number, toolLabel: string): void {
+function enforceOutputLimit(result: ToolResult, maxTokens: number, call: ParsedToolCall): void {
   if (typeof result.data !== 'string') {
     return;
   }
@@ -519,12 +539,17 @@ function enforceOutputLimit(result: ToolResult, maxTokens: number, toolLabel: st
   const truncated = `${head}${truncationNotice(omittedChars, maxTokens)}${tail}`;
   result.data = truncated;
   const finalTokens = estimateTokens(truncated);
-  if (result._meta) {
-    result._meta.tokensEstimate = finalTokens;
-  }
   // 只有说明本身超限时结果才会仍超过 maxTokens（见上方预算推导），据此区分常规截断与降级。
-  reportOutputTruncation(finalTokens > maxTokens ? 'warn' : 'debug', {
-    toolLabel,
+  const noticeOnly = finalTokens > maxTokens;
+  markOutputTruncated(result, call, {
+    maxTokens,
+    originalTokens,
+    finalTokens,
+    omittedChars,
+    noticeOnly,
+  });
+  reportOutputTruncation(noticeOnly ? 'warn' : 'debug', {
+    toolLabel: `${call.tool}.${call.action}`,
     maxTokens,
     originalTokens,
     finalTokens,
@@ -533,6 +558,60 @@ function enforceOutputLimit(result: ToolResult, maxTokens: number, toolLabel: st
     omittedChars,
   });
 }
+
+/**
+ * 把路由层截断写进结果元信息，让信封诊断能区分完整输出与被截断输出（L4-P04 / I02）。
+ *
+ * - degraded=true：输出是有损视图；adapter 把它提升到 envelope.diagnostics.degraded；
+ * - resultStatus 只在 handler 未声明时置为 'partial'：handler 的显式状态是执行真值，例如 terminal
+ *   非零退出码的 'error'、超时的 'timeout' 都不能被截断覆盖成 partial；
+ * - 追加 tool_output_truncated 警告（只含计数，不含输出原文）；handler 已给出同义警告
+ *   （code.read 的 code_read_partial_view）时不重复追加；
+ * - handler 返回的结果没有 _meta 时补建最小元信息，否则截断无法进入信封诊断。
+ * 警告数组整体替换而不原地 push：handler 可能复用常量数组。
+ */
+function markOutputTruncated(
+  result: ToolResult,
+  call: ParsedToolCall,
+  facts: {
+    maxTokens: number;
+    originalTokens: number;
+    finalTokens: number;
+    omittedChars: number;
+    noticeOnly: boolean;
+  }
+): void {
+  const meta = result._meta ?? { cached: false, durationMs: 0, tokensEstimate: facts.finalTokens };
+  result._meta = meta;
+  meta.tokensEstimate = facts.finalTokens;
+  meta.degraded = true;
+  if (meta.resultStatus === undefined) {
+    meta.resultStatus = 'partial';
+  }
+  const warnings = meta.diagnosticWarnings ?? [];
+  if (warnings.some((warning) => TRUNCATION_WARNING_CODES.has(warning.code))) {
+    return;
+  }
+  const truncation: ToolDiagnosticWarning = {
+    code: 'tool_output_truncated',
+    message:
+      `${facts.omittedChars} chars truncated to fit maxOutputTokens=${facts.maxTokens} ` +
+      `(originalTokens=${facts.originalTokens}, finalTokens=${facts.finalTokens}` +
+      `${facts.noticeOnly ? ', notice only: the limit cannot hold any output' : ''})`,
+    stage: `${call.tool}.${call.action}`,
+    tool: call.tool,
+  };
+  meta.diagnosticWarnings = [...warnings, truncation];
+}
+
+/**
+ * 已表达“输出被截断”的警告码：handler 自行声明的同义码（code.read 的 code_read_partial_view），
+ * 以及本函数自己的码（宿主复用同一结果对象时防重复）。出现任一时不再追加 tool_output_truncated。
+ */
+const TRUNCATION_WARNING_CODES: ReadonlySet<string> = new Set([
+  'code_read_partial_view',
+  'tool_output_truncated',
+]);
 
 /** 二分求在 budget 内能保留的最多字符数；estimateTokens 随字符数单调不减，二分结果即最大值。 */
 function countCharsWithinBudget(
@@ -584,3 +663,88 @@ function reportOutputTruncation(
     () => undefined
   );
 }
+
+/* ------------------------------------------------------------------ */
+/*  执行异常归类 — handler 崩溃 / 宿主可用性回调失败 / 路由自身失败      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * execute 抛错时所处的阶段：
+ * - handler：handler 自身抛错（崩溃），区别于 handler 正常返回的业务失败（fail(...)，不带此诊断）；
+ * - availability：排队后重读宿主可用性快照的回调抛错，属于宿主上下文失败；
+ * - router：路由自身步骤（参数快照、准入、registry 视图、输出截断等）抛错。
+ */
+type RouterFailurePhase = 'handler' | 'availability' | 'router';
+
+/**
+ * 把 execute 中的异常归一为带诊断码的失败结果（L4-P04 / I02）。返回值仍是 ok:false 的普通失败，
+ * error 文案保持“Tool execution error (tool.action): ...”不变；新增的 _meta.diagnosticWarnings
+ * 让信封与过程诊断能把“处理器崩溃/宿主接线错误”与业务失败分开计数，并同步写一条 warn 日志。
+ */
+function routerExecutionFailure(
+  call: ParsedToolCall,
+  phase: RouterFailurePhase,
+  err: unknown,
+  durationMs: number
+): ToolResult {
+  const label = `${call.tool}.${call.action}`;
+  const message = err instanceof Error ? err.message : String(err);
+  const errorName = err instanceof Error ? err.name : typeof err;
+  const warning: ToolDiagnosticWarning =
+    phase === 'handler'
+      ? {
+          code: 'tool_handler_threw',
+          message: `Handler threw ${errorName}: ${message}`,
+          stage: label,
+          tool: call.tool,
+        }
+      : phase === 'availability'
+        ? {
+            code: 'tool_host_context_failed',
+            message: `Host availability lookup threw ${errorName} after scheduling: ${message}`,
+            stage: 'availability',
+            tool: call.tool,
+          }
+        : {
+            code: 'tool_router_failed',
+            message: `Router step threw ${errorName}: ${message}`,
+            stage: label,
+            tool: call.tool,
+          };
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[ToolRouter] tool=${label}; ${warning.code} phase=${phase} path=fail ` +
+          `error=${errorName}: ${message}`
+      ),
+    () => undefined
+  );
+  return {
+    ...fail(`Tool execution error (${label}): ${message}`),
+    _meta: {
+      cached: false,
+      durationMs,
+      tokensEstimate: 0,
+      diagnosticWarnings: [warning],
+    },
+  };
+}
+
+/**
+ * 参数 schema 编译失败的一次性诊断（tool_parameter_schema_invalid）。parameters.ts 在失败首次
+ * 编译并缓存时调用，缓存命中不再调用；只记录 schema 关键字/路径说明，不记录调用参数。
+ */
+const reportParameterSchemaFailure: ToolParameterSchemaFailureSink = ({
+  label,
+  variant,
+  reason,
+}) => {
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[ToolRouter] tool=${label}; tool_parameter_schema_invalid variant=${variant} ` +
+          `path=blocked code=TOOL_UNAVAILABLE reason=${reason}`
+      ),
+    () => undefined
+  );
+};

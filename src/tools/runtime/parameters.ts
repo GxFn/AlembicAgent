@@ -53,40 +53,68 @@ export function dimensionSubmitParameters(
   return params;
 }
 
-type Compiled = { validate: ValidateFunction } | { error: string };
+type SchemaVariant = 'base' | 'dimension-submit';
+/** 编译失败只来自 schema 本身：error 是固定类别，detail 是 Ajv 给出的关键字/路径说明（可缺省）。 */
+type Compiled = { validate: ValidateFunction } | { error: string; detail?: string };
 interface CachedSchema {
   source: string;
-  variants: Partial<Record<'base' | 'dimension-submit', Compiled>>;
+  variants: Partial<Record<SchemaVariant, Compiled>>;
 }
+
+/**
+ * 参数准入拒绝的来源（只在 runtime 内部流转，不进入公开出口）：
+ * - 'params'：模型给出的参数不符合 schema，由模型修正后重试；
+ * - 'schema'：注册表 schema 本身无法编译，是注册表/宿主缺陷，换参数重试也不会成功。
+ */
+export interface ToolParameterRejection {
+  source: 'params' | 'schema';
+  reason: string;
+}
+
+/** schema 编译失败的一次性报告；只在失败首次编译并写入缓存时调用，缓存命中不再重复报告。 */
+export type ToolParameterSchemaFailureSink = (failure: {
+  label: string;
+  variant: SchemaVariant;
+  reason: string;
+}) => void;
 
 // schema 是公开可变对象：身份相同仍需比较内容，变体分别编译；只保留有界最近使用条目。
 const PARAMETER_SCHEMA_CACHE_LIMIT = 64;
 const compiledSchemas = new Map<Record<string, unknown>, CachedSchema>();
+/** 无法序列化（循环引用、BigInt 等）的 schema 用这个不可能是合法 JSON 的源标记缓存失败结果。 */
+const UNSERIALIZABLE_SCHEMA_SOURCE = '\u0000unserializable-schema';
+/** Ajv 编译说明的长度上限：足够定位关键字与路径，又不会把超长 schema 片段灌进诊断。 */
+const SCHEMA_ERROR_DETAIL_LIMIT = 300;
 
-function compiledParameters(schema: Record<string, unknown>, dimensionSubmit: boolean): Compiled {
+/** 编译/序列化异常只保留单行、有界的 message；Ajv 的说明只描述 schema 关键字与路径，不含调用参数。 */
+function schemaErrorDetail(err: unknown): string {
+  const text = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+  return text.length > SCHEMA_ERROR_DETAIL_LIMIT
+    ? `${text.slice(0, SCHEMA_ERROR_DETAIL_LIMIT)}…`
+    : text || 'unknown schema error';
+}
+
+function serializeSchema(schema: Record<string, unknown>): { source: string; failure?: Compiled } {
   try {
-    const source = JSON.stringify(schema);
-    let cached = compiledSchemas.get(schema);
-    if (!cached || cached.source !== source) {
-      cached = { source, variants: {} };
-    }
-    compiledSchemas.delete(schema);
-    compiledSchemas.set(schema, cached);
-    if (compiledSchemas.size > PARAMETER_SCHEMA_CACHE_LIMIT) {
-      const oldest = compiledSchemas.keys().next().value;
-      if (oldest !== undefined) {
-        compiledSchemas.delete(oldest);
-      }
-    }
-    const variant = dimensionSubmit ? 'dimension-submit' : 'base';
-    const previous = cached.variants[variant];
-    if (previous) {
-      return previous;
-    }
+    return { source: JSON.stringify(schema) };
+  } catch (err: unknown) {
+    return {
+      source: UNSERIALIZABLE_SCHEMA_SOURCE,
+      failure: {
+        error: 'Invalid tool parameter schema',
+        detail: `schema is not JSON-serializable (${schemaErrorDetail(err)})`,
+      },
+    };
+  }
+}
+
+function compileVariant(source: string, variant: SchemaVariant): Compiled {
+  try {
     const snapshot = JSON.parse(source) as Record<string, unknown>;
-    const effective = dimensionSubmit
-      ? (dimensionSubmitParameters(snapshot, 'execution') ?? snapshot)
-      : snapshot;
+    const effective =
+      variant === 'dimension-submit'
+        ? (dimensionSubmitParameters(snapshot, 'execution') ?? snapshot)
+        : snapshot;
     // 每个编译器拥有自己的$id空间；不联网解析$ref，不转换类型/补默认值/删除字段。
     const validate = new Ajv({
       strict: true,
@@ -99,17 +127,64 @@ function compiledParameters(schema: Record<string, unknown>, dimensionSubmit: bo
       removeAdditional: false,
       logger: false,
     }).compile(effective);
-    const compiled: Compiled =
-      '$async' in validate && validate.$async === true
-        ? { error: 'Asynchronous tool parameter schemas are unsupported' }
-        : { validate };
-    cached.variants[variant] = compiled;
-    return compiled;
+    return '$async' in validate && validate.$async === true
+      ? { error: 'Asynchronous tool parameter schemas are unsupported' }
+      : { validate };
   } catch (err: unknown) {
-    // 只报告合同问题，避免把schema或请求中的私有值写进诊断。
-    void err;
-    return { error: 'Invalid tool parameter schema' };
+    // 保留 Ajv 的编译说明（例如 unknown format "uri" ignored in schema at path "#/properties/x"），
+    // 它只描述 schema 关键字与路径；schema 本身已投影给模型，不含请求参数或宿主私有值。
+    return { error: 'Invalid tool parameter schema', detail: schemaErrorDetail(err) };
   }
+}
+
+/**
+ * 按 schema 内容与变体取编译结果。失败结果与成功结果一样写入缓存：注册表缺陷不会因每次调用
+ * 重编译而反复失败、反复报告；schema 原地修正后内容变化，缓存条目随之重建并重新编译。
+ */
+function compiledParameters(
+  schema: Record<string, unknown>,
+  variant: SchemaVariant,
+  report?: (reason: string) => void
+): Compiled {
+  const serialized = serializeSchema(schema);
+  let cached = compiledSchemas.get(schema);
+  if (!cached || cached.source !== serialized.source) {
+    cached = { source: serialized.source, variants: {} };
+  }
+  compiledSchemas.delete(schema);
+  compiledSchemas.set(schema, cached);
+  if (compiledSchemas.size > PARAMETER_SCHEMA_CACHE_LIMIT) {
+    const oldest = compiledSchemas.keys().next().value;
+    if (oldest !== undefined) {
+      compiledSchemas.delete(oldest);
+    }
+  }
+  const previous = cached.variants[variant];
+  if (previous) {
+    return previous;
+  }
+  const compiled = serialized.failure ?? compileVariant(serialized.source, variant);
+  cached.variants[variant] = compiled;
+  if ('error' in compiled) {
+    report?.(schemaFailureReason(compiled));
+  }
+  return compiled;
+}
+
+function schemaFailureReason(failure: { error: string; detail?: string }, label?: string): string {
+  return `${failure.error}${label ? ` for ${label}` : ''}${failure.detail ? `: ${failure.detail}` : ''}`;
+}
+
+/**
+ * 守护/诊断入口：用执行路径同一套缓存与编译选项检查某个 schema 变体能否编译，返回失败原因或 null。
+ * 不报告诊断事件；注册表守护测试据此遍历全部动作的 base 与 dimension-submit 变体。
+ */
+export function toolParameterSchemaError(
+  schema: Record<string, unknown>,
+  variant: SchemaVariant
+): string | null {
+  const compiled = compiledParameters(schema, variant);
+  return 'error' in compiled ? schemaFailureReason(compiled) : null;
 }
 
 function parameterError(call: ParsedToolCall, error: ErrorObject | undefined): string {
@@ -121,21 +196,37 @@ function parameterError(call: ParsedToolCall, error: ErrorObject | undefined): s
   return `Invalid params for ${call.tool}.${call.action} at ${at}: ${error?.message ?? 'schema mismatch'}`;
 }
 
+/**
+ * 运行期参数准入。返回 null 表示通过；拒绝时区分模型参数错误与 schema 编译失败，
+ * 由 router 分别映射为 discover（TOOL_CALL_INVALID）与 execute/blocked（TOOL_UNAVAILABLE）。
+ * onSchemaInvalid 只在某个 schema 变体首次编译失败时调用一次，供调用方输出诊断事件。
+ */
 export function validateToolParameters(
   call: ParsedToolCall,
   action: ToolAction,
-  runtime?: ToolRuntimeCallContext
-): string | null {
+  runtime?: ToolRuntimeCallContext,
+  onSchemaInvalid?: ToolParameterSchemaFailureSink
+): ToolParameterRejection | null {
   if (!record(call.params)) {
-    return `Invalid params for ${call.tool}.${call.action}: expected object`;
+    return {
+      source: 'params',
+      reason: `Invalid params for ${call.tool}.${call.action}: expected object`,
+    };
   }
-  const dimensionSubmit =
-    call.tool === 'knowledge' && call.action === 'submit' && Boolean(runtime?.evidenceLedger);
-  const compiled = compiledParameters(action.params, dimensionSubmit);
+  const variant: SchemaVariant =
+    call.tool === 'knowledge' && call.action === 'submit' && Boolean(runtime?.evidenceLedger)
+      ? 'dimension-submit'
+      : 'base';
+  const label = `${call.tool}.${call.action}`;
+  const compiled = compiledParameters(
+    action.params,
+    variant,
+    onSchemaInvalid && ((reason) => onSchemaInvalid({ label, variant, reason }))
+  );
   if ('error' in compiled) {
-    return `${compiled.error} for ${call.tool}.${call.action}`;
+    return { source: 'schema', reason: schemaFailureReason(compiled, label) };
   }
   return compiled.validate(call.params)
     ? null
-    : parameterError(call, compiled.validate.errors?.[0]);
+    : { source: 'params', reason: parameterError(call, compiled.validate.errors?.[0]) };
 }

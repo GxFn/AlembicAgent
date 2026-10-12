@@ -7,6 +7,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
 import type {
   ToolCallRequest,
@@ -76,6 +78,50 @@ const NORMALIZATION_WARNING_MESSAGES: Readonly<Record<string, string>> = {
 const NORMALIZATION_WARNING_FALLBACK_MESSAGE =
   'Tool result structuredContent was rewritten for JSON safety; see the in-band "[unavailable: ...]" markers. Status still reports the handler outcome.';
 
+/**
+ * execute 抛错时所处的阶段（L4-P04 / I02）：
+ * - context：宿主 contextFactory.create 分配上下文/资源时抛错；
+ * - availability：宿主 getAvailability 能力快照查询抛错；
+ * - adapter：解析、准入或信封组装等适配层自身步骤抛错。
+ * 前两者是宿主接线失败（tool_host_context_failed），与 handler 崩溃、业务失败分开归类。
+ */
+type AdapterFailurePhase = 'context' | 'availability' | 'adapter';
+
+type DiagnosticWarning = ToolResultDiagnostics['warnings'][number];
+
+/** 把适配层异常归一为一条诊断警告，并写一条 warn 日志（不含请求参数，只含阶段与错误文案）。 */
+function adapterFailureWarning(
+  phase: AdapterFailurePhase,
+  toolId: string,
+  err: unknown
+): DiagnosticWarning {
+  const message = err instanceof Error ? err.message : String(err);
+  const errorName = err instanceof Error ? err.name : typeof err;
+  const warning: DiagnosticWarning =
+    phase === 'adapter'
+      ? {
+          code: 'tool_router_failed',
+          message: `Tool adapter step threw ${errorName}: ${message}`,
+          stage: 'adapter',
+          tool: toolId,
+        }
+      : {
+          code: 'tool_host_context_failed',
+          message: `Host ${phase === 'context' ? 'context factory create' : 'availability lookup'} threw ${errorName}: ${message}`,
+          stage: phase,
+          tool: toolId,
+        };
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[ToolRouterAdapter] tool=${toolId}; ${warning.code} stage=${phase} path=error-envelope ` +
+          `error=${errorName}: ${message}`
+      ),
+    () => undefined
+  );
+  return warning;
+}
+
 const DEFAULT_TRUST: ToolResultTrust = {
   source: 'internal',
   sanitized: true,
@@ -143,13 +189,17 @@ export class ToolRouterAdapter implements ToolRouterContract {
       };
     }
 
+    // 记录异常发生在哪一段：宿主 create/getAvailability 失败与适配层自身失败分别归类。
+    let phase: AdapterFailurePhase = 'adapter';
     try {
       const parsed = this.router.parseToolCall(request.toolId, request.args);
       if ('error' in parsed) {
         return this.#errorEnvelope(request.toolId, callId, startedAt, parsed.error);
       }
 
+      phase = 'availability';
       const toolAvailability = this.#contextFactory.getAvailability?.(request.runtime);
+      phase = 'adapter';
       // 能力查询是宿主同步边界；其中的取消必须先于 context 分配及后续执行生效。
       if (request.abortSignal?.aborted) {
         return {
@@ -178,8 +228,11 @@ export class ToolRouterAdapter implements ToolRouterContract {
         this.router.getToolSpec(parsed.tool)?.actions[parsed.action]?.cache ?? 'none';
       const cachePolicy = cacheHint === 'delta' ? 'session' : cacheHint;
 
+      phase = 'context';
+      const hostContext = this.#contextFactory.create(request);
+      phase = 'adapter';
       const ctx = {
-        ...this.#contextFactory.create(request),
+        ...hostContext,
         ...(request.runtime ? { runtime: request.runtime } : {}),
         ...(toolAvailability ? { toolAvailability } : {}),
         ...(request.abortSignal ? { abortSignal: request.abortSignal } : {}),
@@ -211,7 +264,8 @@ export class ToolRouterAdapter implements ToolRouterContract {
         callId,
         startedAt,
         err instanceof Error ? err.message : String(err),
-        durationMs
+        durationMs,
+        [adapterFailureWarning(phase, request.toolId, err)]
       );
     }
   }
@@ -328,7 +382,8 @@ export class ToolRouterAdapter implements ToolRouterContract {
     callId: string,
     startedAt: string,
     error: string,
-    durationMs = 0
+    durationMs = 0,
+    warnings: DiagnosticWarning[] = []
   ): ToolResultEnvelope {
     return {
       ok: false,
@@ -338,7 +393,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
       durationMs,
       status: 'error',
       text: error,
-      diagnostics: emptyDiagnostics(),
+      diagnostics: { ...emptyDiagnostics(), warnings },
       trust: { ...DEFAULT_TRUST },
     };
   }

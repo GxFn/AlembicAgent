@@ -19,16 +19,18 @@ import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
 import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
-import type { ToolContext } from '../src/tools/runtime/index.js';
+import type { ToolContext, ToolContextFactoryContract } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   Evolution,
   estimateTokens as estimateToolTokens,
+  fail as failToolResult,
   ok as okToolResult,
   SearchCache,
   ToolRouter,
   ToolRouterAdapter,
 } from '../src/tools/runtime/index.js';
+import { toolParameterSchemaError } from '../src/tools/runtime/parameters.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 
 let baseRoot: string;
@@ -1932,5 +1934,338 @@ describe('L3-P12 batch code.read clamp uses the shared token estimate', () => {
     expect(big.truncated).toBeUndefined();
     expect(big.content).toBe(display);
     expect(big.tokensEstimate).toBe(estimateSharedTokens(display));
+  });
+});
+
+// ─── L4-P04 路由与参数层诊断补齐 ─────────────────────────────────────────────────────
+// 来源：module-review-2026-10-01 L4 I02（U12-F4、U12-F7、U11-F3）。路由截断、handler 崩溃、
+// 宿主上下文失败与参数 schema 编译失败原先在信封上没有诊断码，与完整成功或业务失败无法区分；
+// schema 编译失败还被归为模型参数错误（TOOL_CALL_INVALID）。决策 P04：截断标 degraded +
+// tool_output_truncated，status 只在 handler 未给 resultStatus 时置 partial；崩溃标
+// tool_handler_threw；宿主 create/getAvailability 失败标 tool_host_context_failed(stage)；
+// schema 编译失败保留 Ajv 原因、记录一次 tool_parameter_schema_invalid 并映射为 TOOL_UNAVAILABLE。
+describe('L4-P04 router and parameter diagnostics', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function runtimeRequest(
+    toolId: string,
+    action: string,
+    params: Record<string, unknown>
+  ): ToolCallRequest {
+    return {
+      toolId,
+      args: { action, params },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'vitest' },
+    };
+  }
+
+  function warningCodes(warnings: ReadonlyArray<{ code: string }> | undefined): string[] {
+    return (warnings ?? []).map((warning) => warning.code);
+  }
+
+  function loggedLines(spy: { mock: { calls: unknown[][] } }, needle: string): string[] {
+    return spy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes(needle));
+  }
+
+  /** 约 4000 token 的 ASCII 输出，超过 code.outline 的 maxOutputTokens=2000。 */
+  const OVERSIZED = 'o'.repeat(16000);
+
+  it('marks a router-truncated string result as degraded partial with tool_output_truncated', async () => {
+    expect(TOOL_REGISTRY.code.actions.outline.maxOutputTokens).toBe(2000);
+    vi.spyOn(TOOL_REGISTRY.code.actions.outline, 'handler').mockResolvedValue(
+      okToolResult(OVERSIZED, { tokensEstimate: estimateToolTokens(OVERSIZED) })
+    );
+    const result = await new ToolRouter().execute(
+      { tool: 'code', action: 'outline', params: { path: 'fixture.ts' } },
+      baseToolContext()
+    );
+    expect(result.ok).toBe(true);
+    expect(result._meta?.degraded).toBe(true);
+    expect(result._meta?.resultStatus).toBe('partial');
+    const warnings = result._meta?.diagnosticWarnings ?? [];
+    expect(warningCodes(warnings)).toEqual(['tool_output_truncated']);
+    expect(warnings[0]).toMatchObject({ stage: 'code.outline', tool: 'code' });
+    expect(warnings[0].message).toContain('2000');
+    // 诊断只含计数，不复制输出原文。
+    expect(warnings[0].message).not.toContain('oooo');
+  });
+
+  it('creates result meta for a handler that returned none before truncating', async () => {
+    vi.spyOn(TOOL_REGISTRY.code.actions.outline, 'handler').mockResolvedValue({
+      ok: true,
+      data: OVERSIZED,
+    });
+    const result = await new ToolRouter().execute(
+      { tool: 'code', action: 'outline', params: { path: 'fixture.ts' } },
+      baseToolContext()
+    );
+    expect(result._meta).toMatchObject({
+      cached: false,
+      degraded: true,
+      resultStatus: 'partial',
+      durationMs: expect.any(Number),
+      tokensEstimate: estimateSharedTokens(String(result.data)),
+    });
+    expect(warningCodes(result._meta?.diagnosticWarnings)).toEqual(['tool_output_truncated']);
+  });
+
+  it('leaves an output within the limit undegraded and warning-free', async () => {
+    vi.spyOn(TOOL_REGISTRY.code.actions.outline, 'handler').mockResolvedValue(
+      okToolResult('short outline', { tokensEstimate: 4 })
+    );
+    const result = await new ToolRouter().execute(
+      { tool: 'code', action: 'outline', params: { path: 'fixture.ts' } },
+      baseToolContext()
+    );
+    expect(result.data).toBe('short outline');
+    expect(result._meta?.degraded).toBeUndefined();
+    expect(result._meta?.resultStatus).toBeUndefined();
+    expect(result._meta?.diagnosticWarnings).toBeUndefined();
+  });
+
+  it('does not repeat the code.read partial-view warning when the router truncates', async () => {
+    const partialView = {
+      code: 'code_read_partial_view',
+      message: 'fixture partial view',
+      tool: 'code',
+    };
+    vi.spyOn(TOOL_REGISTRY.code.actions.read, 'handler').mockResolvedValue(
+      okToolResult('r'.repeat(40000), { diagnosticWarnings: [partialView] })
+    );
+    const result = await new ToolRouter().execute(
+      { tool: 'code', action: 'read', params: { path: 'fixture.ts' } },
+      baseToolContext()
+    );
+    expect(result._meta?.degraded).toBe(true);
+    expect(result._meta?.resultStatus).toBe('partial');
+    expect(warningCodes(result._meta?.diagnosticWarnings)).toEqual(['code_read_partial_view']);
+  });
+
+  it.each([
+    { exitCode: 0, status: 'partial' },
+    { exitCode: 1, status: 'error' },
+  ])('flags a truncated terminal exec (exit $exitCode) on the envelope as $status', async ({
+    exitCode,
+    status,
+  }) => {
+    // 约 7000 token 的终端输出，超过 terminal.exec 的 maxOutputTokens=4000。
+    const stdout = 'line of failing test output\n'.repeat(1000);
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({
+          ...baseToolContext(),
+          sandboxExecutor: { exec: async () => ({ stdout, stderr: '', exitCode }) },
+        }),
+      },
+    });
+    const envelope = await adapter.execute(
+      runtimeRequest('terminal', 'exec', { command: 'npm test' })
+    );
+    expect(envelope.ok).toBe(true);
+    // 非零退出码的 error 不能被截断覆盖成 partial；零退出码未声明状态时才降为 partial。
+    expect(envelope.status).toBe(status);
+    expect(envelope.diagnostics?.degraded).toBe(true);
+    expect(warningCodes(envelope.diagnostics?.warnings)).toContain('tool_output_truncated');
+  });
+
+  it('tags a handler crash with tool_handler_threw on the router result and the envelope', async () => {
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    vi.spyOn(TOOL_REGISTRY.meta.actions.review, 'handler').mockRejectedValue(
+      new TypeError('fixture handler crashed')
+    );
+    const result = await new ToolRouter().execute(
+      { tool: 'meta', action: 'review', params: {} },
+      baseToolContext()
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('fixture handler crashed');
+    expect(result._meta?.diagnosticWarnings).toEqual([
+      expect.objectContaining({ code: 'tool_handler_threw', stage: 'meta.review', tool: 'meta' }),
+    ]);
+    expect(result._meta?.diagnosticWarnings?.[0].message).toContain('TypeError');
+
+    const adapter = new ToolRouterAdapter({ contextFactory: { create: () => baseToolContext() } });
+    const envelope = await adapter.execute(runtimeRequest('meta', 'review', {}));
+    expect(envelope.status).toBe('error');
+    expect(warningCodes(envelope.diagnostics?.warnings)).toEqual(['tool_handler_threw']);
+    expect(loggedLines(warn, 'tool_handler_threw')).toHaveLength(2);
+  });
+
+  it('keeps a business failure returned by the handler free of crash diagnostics', async () => {
+    vi.spyOn(TOOL_REGISTRY.meta.actions.review, 'handler').mockResolvedValue(
+      failToolResult('fixture review not found')
+    );
+    const adapter = new ToolRouterAdapter({ contextFactory: { create: () => baseToolContext() } });
+    const envelope = await adapter.execute(runtimeRequest('meta', 'review', {}));
+    expect(envelope.status).toBe('error');
+    expect(envelope.text).toBe('fixture review not found');
+    expect(envelope.diagnostics?.warnings).toEqual([]);
+  });
+
+  it.each<{ stage: string; contextFactory: ToolContextFactoryContract }>([
+    {
+      stage: 'context',
+      contextFactory: {
+        create: () => {
+          throw new Error('fixture scope allocation failed');
+        },
+      },
+    },
+    {
+      stage: 'availability',
+      contextFactory: {
+        create: () => baseToolContext(),
+        getAvailability: () => {
+          throw new Error('fixture availability lookup failed');
+        },
+      },
+    },
+  ])('tags a host $stage failure with tool_host_context_failed', async ({
+    stage,
+    contextFactory,
+  }) => {
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const handler = vi.spyOn(TOOL_REGISTRY.meta.actions.review, 'handler');
+    const envelope = await new ToolRouterAdapter({ contextFactory }).execute(
+      runtimeRequest('meta', 'review', {})
+    );
+    expect(envelope.ok).toBe(false);
+    expect(envelope.status).toBe('error');
+    expect(envelope.text).toContain('fixture');
+    expect(envelope.diagnostics?.warnings).toEqual([
+      expect.objectContaining({ code: 'tool_host_context_failed', stage, tool: 'meta' }),
+    ]);
+    expect(handler).not.toHaveBeenCalled();
+    expect(loggedLines(warn, 'tool_host_context_failed')).toHaveLength(1);
+  });
+
+  it('tags an availability re-read failure after scheduling as a host context failure', async () => {
+    let lookups = 0;
+    const handler = vi.spyOn(TOOL_REGISTRY.meta.actions.review, 'handler');
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => baseToolContext(),
+        getAvailability: () => {
+          lookups += 1;
+          // 首次查询（准入）成功；获得 slot 后的重读失败，必须归为宿主上下文失败而非 handler 崩溃。
+          if (lookups > 1) {
+            throw new Error('fixture availability withdrawn');
+          }
+          return { actions: {} };
+        },
+      },
+    });
+    const envelope = await adapter.execute(runtimeRequest('meta', 'review', {}));
+    expect(lookups).toBe(2);
+    expect(envelope.status).toBe('error');
+    expect(envelope.diagnostics?.warnings).toEqual([
+      expect.objectContaining({ code: 'tool_host_context_failed', stage: 'availability' }),
+    ]);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('reports an uncompilable parameter schema as TOOL_UNAVAILABLE with the Ajv detail, logged once', async () => {
+    const saveAction = TOOL_REGISTRY.memory.actions.save;
+    const original = saveAction.params;
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const save = vi.fn();
+    const handler = vi.spyOn(saveAction, 'handler');
+    const params = { key: 'fixture', content: 'finding' };
+    try {
+      const broken = structuredClone(original);
+      (broken.properties as Record<string, Record<string, unknown>>).key.format = 'uri';
+      saveAction.params = broken;
+      const router = new ToolRouter();
+      const call = { tool: 'memory', action: 'save', params };
+      expect(router.explain(call)).toMatchObject({
+        allowed: false,
+        stage: 'execute',
+        resultStatus: 'blocked',
+      });
+      const result = await router.execute(call, { ...baseToolContext(), sessionStore: { save } });
+      expect(result).toMatchObject({
+        ok: false,
+        data: { code: 'TOOL_UNAVAILABLE', status: 'blocked', writeState: 'not-started' },
+      });
+      expect(result.error).toContain('Invalid tool parameter schema for memory.save');
+      expect(result.error).toContain('unknown format "uri"');
+
+      const adapter = new ToolRouterAdapter({
+        contextFactory: { create: () => ({ ...baseToolContext(), sessionStore: { save } }) },
+      });
+      const envelope = await adapter.execute(runtimeRequest('memory', 'save', params));
+      expect(envelope.status).toBe('blocked');
+      expect(envelope.structuredContent).toMatchObject({ code: 'TOOL_UNAVAILABLE' });
+      expect(envelope.diagnostics?.blockedTools).toEqual([
+        expect.objectContaining({ tool: 'memory' }),
+      ]);
+      expect(save).not.toHaveBeenCalled();
+      expect(handler).not.toHaveBeenCalled();
+      // 失败结果进入缓存：同一 schema 的多次准入只编译、只记录一次。
+      const logged = loggedLines(warn, 'tool_parameter_schema_invalid');
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('memory.save');
+      expect(logged[0]).toContain('unknown format "uri"');
+    } finally {
+      saveAction.params = original;
+    }
+  });
+
+  it('treats an asynchronous parameter schema as a registry defect rather than a model error', () => {
+    const saveAction = TOOL_REGISTRY.memory.actions.save;
+    const original = saveAction.params;
+    const logger = Logger.getInstance();
+    vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      saveAction.params = { ...structuredClone(original), $async: true };
+      expect(
+        new ToolRouter().explain({
+          tool: 'memory',
+          action: 'save',
+          params: { key: 'fixture', content: 'finding' },
+        })
+      ).toMatchObject({
+        allowed: false,
+        stage: 'execute',
+        resultStatus: 'blocked',
+        reason: expect.stringContaining('Asynchronous tool parameter schemas are unsupported'),
+      });
+    } finally {
+      saveAction.params = original;
+    }
+  });
+
+  it('compiles every registered action schema in base and dimension-submit variants', () => {
+    const logger = Logger.getInstance();
+    vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const failures: string[] = [];
+    let checked = 0;
+    for (const [tool, spec] of Object.entries(TOOL_REGISTRY)) {
+      for (const [action, definition] of Object.entries(spec.actions)) {
+        for (const variant of ['base', 'dimension-submit'] as const) {
+          checked += 1;
+          const error = toolParameterSchemaError(definition.params, variant);
+          if (error !== null) {
+            failures.push(`${tool}.${action} [${variant}]: ${error}`);
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(20);
+    expect(failures).toEqual([]);
+    // 守护本身必须能识别坏 schema，否则空失败列表没有意义。
+    expect(
+      toolParameterSchemaError(
+        { type: 'object', properties: { url: { type: 'string', format: 'uri' } } },
+        'base'
+      )
+    ).toContain('unknown format "uri"');
   });
 });
