@@ -59,8 +59,18 @@ const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
   'impact',
 ]);
 
-const PRODUCER_CODE_ACTIONS = new Set(['read']);
+/**
+ * 聚焦实体判定与 graph handler 对齐：handler 只从 params.entity 读取非空字符串，
+ * symbol/name/path 不是 graph.query 的入参，门放行它们只会让 handler 返回 requires entity。
+ * getToolParams 在没有嵌套 params 时返回扁平 args，所以扁平 call.args.entity 也由这里覆盖；
+ * 嵌套 params 之外另挂的 entity 到不了 handler，不算聚焦实体。
+ */
+function hasFocusedGraphEntity(params: Record<string, unknown>): boolean {
+  return typeof params.entity === 'string' && params.entity.trim().length > 0;
+}
 
+// Producer 不开放 code：GenerateProduce 能力白名单不含 code，阶段提示也禁止读取源文件；
+// 若在这里放行或推荐 code.read，模型照做后只会被 allowlistGate 再拦一次、白耗一轮。
 const PRODUCER_KNOWLEDGE_ACTIONS = new Set(['submit']);
 
 const PRODUCER_MEMORY_ACTIONS = new Set(['recall']);
@@ -135,19 +145,17 @@ export const analystVerifyOnlyGate = {
 
     if (call.name === 'graph' && action === 'query') {
       const queryType = String(params.type ?? call.args?.type ?? '');
-      const hasFocusedEntity = Boolean(
-        params.entity || params.symbol || params.name || params.path || call.args?.entity
-      );
-      if (ANALYST_VERIFY_GRAPH_QUERY_TYPES.has(queryType) && hasFocusedEntity) {
+      if (ANALYST_VERIFY_GRAPH_QUERY_TYPES.has(queryType) && hasFocusedGraphEntity(params)) {
         return undefined;
       }
     }
 
+    // 阻断原因（含 graph 缺少 entity）由执行引擎统一写入 diagnostics.blockedTools。
     return {
       blocked: true,
       result: {
         error:
-          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity/path), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
+          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
       },
     };
   },
@@ -190,9 +198,6 @@ export const producerSubmitOnlyGate = {
     if (call.name === 'knowledge' && PRODUCER_KNOWLEDGE_ACTIONS.has(action)) {
       return undefined;
     }
-    if (call.name === 'code' && PRODUCER_CODE_ACTIONS.has(action)) {
-      return undefined;
-    }
     if (call.name === 'memory' && PRODUCER_MEMORY_ACTIONS.has(action)) {
       return undefined;
     }
@@ -204,7 +209,7 @@ export const producerSubmitOnlyGate = {
       blocked: true,
       result: {
         error:
-          'Producer phase is submit-first. Allowed actions: knowledge.submit, code.read for missing short snippets, memory.recall, and meta.review. Do not call knowledge.detail, meta.tools, meta.plan, search, graph, terminal, or broad exploration; continue submitting remaining structured findings.',
+          'Producer phase is submit-first. Allowed actions: knowledge.submit, evidence.get/evidence.search for already captured evidence, memory.recall, and meta.review. Do not call knowledge.detail, meta.tools, meta.plan, source reads, search, graph, terminal, or broad exploration; continue submitting remaining structured findings.',
       },
     };
   },

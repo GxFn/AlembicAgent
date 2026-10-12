@@ -892,3 +892,172 @@ describe('independent R06 repaired-boundary cases', () => {
 it('preserves the analyst verification phase before recording and summary', () => {
   expect(STRATEGY_ANALYST.phases).toEqual(['SCAN', 'EXPLORE', 'VERIFY', 'RECORD', 'SUMMARIZE']);
 });
+
+/**
+ * L5-P17（I07）：阶段门放行的动作必须同时被能力白名单和真实 handler 接受，阻断文案也不能
+ * 推荐会被下一道门或 handler 拒绝的调用，否则模型按文案重试只会白耗一轮预算。
+ */
+function phaseGateFixture(input: {
+  allowedToolIds: string[];
+  tracker: { pipelineType: string; phase: string };
+}) {
+  const diagnostics = new DiagnosticsCollector();
+  const dispatched: string[] = [];
+  const runtime = {
+    id: 'phase-gate-alignment',
+    presetName: 'test',
+    container: null,
+    dataRoot: 'tmp/phase-gate-alignment',
+    fileCache: null,
+    lang: null,
+    logger: { info: () => undefined, warn: () => undefined },
+    aiProvider: null,
+    policies: { get: () => null },
+    toolRegistry: { getManifest: () => null },
+    toolRouter: {
+      async execute(request: { toolId: string; args: Record<string, unknown> }) {
+        dispatched.push(`${request.toolId}.${String(request.args?.action ?? '')}`);
+        return {
+          ok: true,
+          status: 'success',
+          text: 'ok',
+          structuredContent: { ok: true },
+          toolId: request.toolId,
+          callId: `phase-gate-${dispatched.length}`,
+          startedAt: new Date().toISOString(),
+          durationMs: 1,
+        };
+      },
+    },
+  } as unknown as AgentRuntime;
+  const loopCtx = {
+    allowedToolIds: input.allowedToolIds,
+    abortSignal: null,
+    context: {},
+    diagnostics,
+    iteration: 1,
+    memoryCoordinator: null,
+    sharedState: {
+      submittedPatterns: new Set(),
+      submittedTitles: new Set(),
+      submittedTriggers: new Set(),
+    },
+    source: 'system',
+    toolCalls: [],
+    tracker: { ...input.tracker, recordToolCall: () => ({ isNew: false }) },
+    trace: null,
+  } as unknown as LoopContext;
+  return { context: { runtime, loopCtx, iteration: 1 }, diagnostics, dispatched };
+}
+
+function blockedError(result: unknown): string {
+  if (result && typeof result === 'object' && 'error' in result) {
+    return String((result as { error?: unknown }).error ?? '');
+  }
+  return '';
+}
+
+describe('phase gates stay aligned with handlers and capability allowlists', () => {
+  it('blocks producer code.read in PRODUCE even when the stage allowlists code, and never recommends it', async () => {
+    // allowedToolIds 显式包含 code：否则 allowlistGate 先拦截，本门根本不会被执行到。
+    const { context, diagnostics, dispatched } = phaseGateFixture({
+      allowedToolIds: ['code', 'knowledge', 'memory', 'evidence', 'meta'],
+      tracker: { pipelineType: 'producer', phase: 'PRODUCE' },
+    });
+    const output = await createToolPipeline().execute(
+      { id: 'producer-read', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+      context
+    );
+    expect(output.metadata.blocked).toBe(true);
+    expect(dispatched).toEqual([]);
+    const error = blockedError(output.result);
+    expect(error).toContain('Producer phase is submit-first');
+    // 阻断文案只能推荐 GenerateProduce 白名单里真实可调用的动作。
+    expect(error).not.toContain('code.read');
+    for (const allowed of ['knowledge.submit', 'evidence.get', 'memory.recall', 'meta.review']) {
+      expect(error).toContain(allowed);
+    }
+    expect(diagnostics.toJSON().blockedTools).toEqual([{ tool: 'code', reason: error }]);
+  });
+
+  it('blocks every producer tool call in SUMMARIZE, including knowledge.submit', async () => {
+    const { context, diagnostics, dispatched } = phaseGateFixture({
+      allowedToolIds: ['knowledge', 'memory', 'evidence', 'meta'],
+      tracker: { pipelineType: 'producer', phase: 'SUMMARIZE' },
+    });
+    const output = await createToolPipeline().execute(
+      {
+        id: 'producer-late-submit',
+        name: 'knowledge',
+        args: { action: 'submit', params: { title: 'LateCandidate' } },
+      },
+      context
+    );
+    expect(output.metadata.blocked).toBe(true);
+    expect(dispatched).toEqual([]);
+    expect(blockedError(output.result)).toContain('Producer is already in SUMMARIZE');
+    expect(diagnostics.toJSON().blockedTools).toMatchObject([{ tool: 'knowledge' }]);
+  });
+
+  it.each([
+    {
+      label: 'path only',
+      args: { action: 'query', params: { type: 'callers', path: 'src/a.ts' } },
+    },
+    {
+      label: 'symbol only',
+      args: { action: 'query', params: { type: 'callers', symbol: 'Alpha' } },
+    },
+    { label: 'name only', args: { action: 'query', params: { type: 'class', name: 'Alpha' } } },
+    {
+      label: 'blank entity',
+      args: { action: 'query', params: { type: 'callers', entity: '   ' } },
+    },
+    {
+      label: 'non-string entity',
+      args: { action: 'query', params: { type: 'callers', entity: 42 } },
+    },
+    {
+      // graph handler 只读取嵌套 params.entity；嵌套 params 之外的 entity 到不了 handler。
+      label: 'entity outside nested params',
+      args: { action: 'query', entity: 'Alpha', params: { type: 'callers' } },
+    },
+  ])('blocks analyst VERIFY graph.query with $label because the graph handler requires entity', async ({
+    args,
+  }) => {
+    const { context, diagnostics, dispatched } = phaseGateFixture({
+      allowedToolIds: ['code', 'graph', 'memory', 'evidence'],
+      tracker: { pipelineType: 'analyst', phase: 'VERIFY' },
+    });
+    const output = await createToolPipeline().execute(
+      { id: 'verify-graph', name: 'graph', args },
+      context
+    );
+    expect(output.metadata.blocked).toBe(true);
+    expect(dispatched).toEqual([]);
+    const error = blockedError(output.result);
+    expect(error).toContain('Analyst VERIFY is evidence-only');
+    expect(error).toContain('with entity');
+    expect(error).not.toContain('entity/path');
+    expect(diagnostics.toJSON().blockedTools).toMatchObject([{ tool: 'graph' }]);
+  });
+
+  it.each([
+    {
+      label: 'nested params.entity',
+      args: { action: 'query', params: { type: 'callers', entity: 'Alpha' } },
+    },
+    { label: 'flat entity', args: { action: 'query', type: 'callers', entity: 'Alpha' } },
+  ])('allows a focused analyst VERIFY graph.query with $label', async ({ args }) => {
+    const { context, dispatched } = phaseGateFixture({
+      allowedToolIds: ['code', 'graph', 'memory', 'evidence'],
+      tracker: { pipelineType: 'analyst', phase: 'VERIFY' },
+    });
+    const output = await createToolPipeline().execute(
+      { id: 'verify-graph', name: 'graph', args },
+      context
+    );
+    expect(output.metadata.blocked).toBe(false);
+    expect(dispatched).toEqual(['graph.query']);
+  });
+});

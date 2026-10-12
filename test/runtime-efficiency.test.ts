@@ -1057,3 +1057,93 @@ describe('failed tool postprocessing receipt ownership', () => {
     }
   });
 });
+
+/**
+ * L5-P17（I07）：Evolution retry（PipelineStrategy 注入 _evolutionDecisionOnly）只能补写
+ * knowledge.manage(evolve|deprecate|skip_evolution + id)。这里不挂 Evolution capability，
+ * 避免 runtimeSafetyGate 的能力级参数 allowlist 先拦截，从而单独钉住 evolutionDecisionGate。
+ */
+describe('evolution decision-only gate', () => {
+  function decisionOnlyContext(decisionOnly: boolean) {
+    let executions = 0;
+    const runtime = createRuntime(createManifest({ id: 'knowledge' }), async (request) =>
+      createEnvelope(request, ++executions)
+    );
+    const diagnostics = new DiagnosticsCollector();
+    const loopCtx = createLoopContext(diagnostics);
+    // Evolution 能力白名单的工具名全集；本门要在 allowlist 放行之后再收窄到动作级。
+    loopCtx.allowedToolIds = ['code', 'terminal', 'knowledge', 'graph'];
+    loopCtx.sharedState = decisionOnly ? { _evolutionDecisionOnly: true } : {};
+    return {
+      context: { runtime, loopCtx, iteration: 1 },
+      diagnostics,
+      executions: () => executions,
+    };
+  }
+
+  it.each([
+    'evolve',
+    'deprecate',
+    'skip_evolution',
+  ])('allows knowledge.manage(%s) with a target recipe id', async (operation) => {
+    const { context, executions } = decisionOnlyContext(true);
+    const result = await createToolPipeline().execute(
+      {
+        id: `manage-${operation}`,
+        name: 'knowledge',
+        args: {
+          action: 'manage',
+          params: { operation, id: 'recipe-1', reason: 'source still matches' },
+        },
+      },
+      context
+    );
+    expect(result.metadata.blocked).toBe(false);
+    expect(executions()).toBe(1);
+  });
+
+  it.each([
+    {
+      label: 'manage without a recipe id',
+      call: { name: 'knowledge', args: { action: 'manage', params: { operation: 'evolve' } } },
+    },
+    {
+      label: 'manage with a non-decision operation',
+      call: {
+        name: 'knowledge',
+        args: { action: 'manage', params: { operation: 'update', id: 'recipe-1' } },
+      },
+    },
+    {
+      label: 'knowledge.search',
+      call: { name: 'knowledge', args: { action: 'search', params: { query: 'recipe' } } },
+    },
+    {
+      label: 'code.read',
+      call: { name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+    },
+  ])('blocks $label before host dispatch', async ({ call }) => {
+    const { context, diagnostics, executions } = decisionOnlyContext(true);
+    const result = await createToolPipeline().execute({ id: 'decision-only', ...call }, context);
+    expect(result.metadata.blocked).toBe(true);
+    expect(executions()).toBe(0);
+    expect(result.result).toMatchObject({
+      error: expect.stringContaining('Evolution retry is decision-only'),
+    });
+    expect(diagnostics.toJSON().blockedTools).toMatchObject([{ tool: call.name }]);
+  });
+
+  it('stays inactive outside the decision-only retry stage', async () => {
+    const { context, executions } = decisionOnlyContext(false);
+    const result = await createToolPipeline().execute(
+      {
+        id: 'ordinary-search',
+        name: 'knowledge',
+        args: { action: 'search', params: { query: 'recipe' } },
+      },
+      context
+    );
+    expect(result.metadata.blocked).toBe(false);
+    expect(executions()).toBe(1);
+  });
+});
