@@ -305,11 +305,17 @@ export interface MemoryCoordinatorLike {
 /** DeltaCache 最小接口 */
 export interface DeltaCacheLike {
   get(path: string): { hash: string; content: string } | undefined;
-  set(path: string, hash: string, content: string): void;
+  /** hash 传 undefined 时由缓存按自身指纹算法计算，调用方不再各自实现指纹。 */
+  set(path: string, hash: string | undefined, content: string): void;
   check(
     path: string,
     currentContent: string
   ): { mode: 'unchanged' | 'delta' | 'full'; content: string; lineCount: number };
+  /**
+   * 写前新鲜度：content 的指纹是否等于登记的版本指纹（可选）。
+   * 缺省的旧实现由 code.write 降级为与缓存全文的精确比对，并输出诊断。
+   */
+  isFresh?(path: string, content: string): boolean;
 }
 
 /** SearchCache 最小接口 */

@@ -8,7 +8,6 @@
  */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -897,6 +896,7 @@ async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Pr
 function forgetFullRead(filePath: string, ctx: ToolContext): void {
   const observed = ctx.deltaCache?.get(filePath);
   if (observed) {
+    // 显式沿用已登记的版本指纹：降级后的条目不再保存全文（content 可能已是 ''），指纹不能重算。
     ctx.deltaCache?.set(filePath, observed.hash, observed.content);
   }
 }
@@ -1033,8 +1033,8 @@ async function readSingleFile(
       };
     }
   } else {
-    // 读到磁盘版本不等于把全文交给当前视图；写前门仍可使用这个版本指纹。
-    ctx.deltaCache?.set(resolved.relPath, freshnessFingerprint(content), content);
+    // 读到磁盘版本不等于把全文交给当前视图；写前门仍可使用这个版本指纹（由缓存自算，单源）。
+    ctx.deltaCache?.set(resolved.relPath, undefined, content);
   }
 
   if (startLine || endLine || maxLines) {
@@ -1319,12 +1319,8 @@ async function buildDirectoryTree(
 
 const PROTECTED_PATHS = ['.git', 'node_modules', '.env'];
 
-// 写前新鲜度门：与 deltaCache.check() 内部一致的内容指纹（node:crypto md5），
-// 使"写时磁盘内容"与"读时缓存指纹"可比。DeltaCache 算法将来变更须同步本 helper
-// （已核验 DeltaCache.ts 用 createHash('md5')，与此对齐）。
-function freshnessFingerprint(content: string): string {
-  return createHash('md5').update(content).digest('hex');
-}
+// 写前新鲜度门的指纹只由 deltaCache 计算：读、写后登记都让缓存自算（set 的 hash 传 undefined），
+// 写前比较走 deltaCache.isFresh()，本 handler 不再保留第二份指纹实现。
 
 // CG-3 硬拒 + 重读引导文案，稳定可被验收 harness grep，不得随意改写。
 const REREAD_GUIDANCE =
@@ -1389,11 +1385,7 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
   let asynchronous = false;
   observeSafely(
     () => {
-      const result: unknown = ctx.deltaCache?.set(
-        resolved.relPath,
-        freshnessFingerprint(content),
-        content
-      );
+      const result: unknown = ctx.deltaCache?.set(resolved.relPath, undefined, content);
       if (isThenable(result)) {
         asynchronous = true;
         warning = {
@@ -1434,12 +1426,14 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
 }
 
 /**
- * 写前新鲜度判定（四态，CG-3 硬拒 + CG-4 复用 deltaCache 哈希）：
+ * 写前新鲜度判定（四态，CG-3 硬拒 + CG-4 复用 deltaCache 指纹）：
  *   1. 磁盘存在 ∧ 无指纹（本 run 未读）        → 拒：must read first
  *   2. 磁盘存在 ∧ 已读 ∧ 当前磁盘指纹 ≠ 读时指纹 → 拒：changed externally
  *   3. 磁盘存在 ∧ 已读 ∧ 指纹一致              → 准
  *   4. 磁盘不存在                              → 准（新文件）
  * deltaCache 未注入：透传（不误拒合法写，安全退回 PROTECTED_PATHS）。key 用 relPath（与 :459 一致）。
+ * 态 2/3 的指纹比较交给 deltaCache.isFresh()（指纹单源）；缺 isFresh 的旧式实现降级为与缓存
+ * 全文的精确比对：只会误拒（缓存未保存全文时），不会误放行。
  */
 async function checkWriteFreshness(
   absPath: string,
@@ -1474,8 +1468,10 @@ async function checkWriteFreshness(
     };
   }
 
-  const diskFingerprint = freshnessFingerprint(diskContent);
-  if (cached.hash !== diskFingerprint) {
+  const fresh = ctx.deltaCache.isFresh
+    ? ctx.deltaCache.isFresh(relPath, diskContent)
+    : legacyContentFreshness(relPath, cached.content, diskContent);
+  if (!fresh) {
     // 态 2 / CG-3：硬拒 + 重读引导，不静默覆盖、不仅记日志。
     return {
       ok: false,
@@ -1483,6 +1479,27 @@ async function checkWriteFreshness(
     };
   }
   return { ok: true }; // 态 3：一致 → 准。
+}
+
+/**
+ * 降级路径：宿主注入的 DeltaCacheLike 没有 isFresh 时，本 handler 不再自带指纹算法，
+ * 改为与缓存登记的全文精确比对。日志只记录路径、选择路径与比对结果，不记录文件内容。
+ */
+function legacyContentFreshness(
+  relPath: string,
+  cachedContent: string,
+  diskContent: string
+): boolean {
+  const fresh = cachedContent === diskContent;
+  const message =
+    `[code.write] path=${relPath}; freshness=content-compare; ` +
+    `reason=delta_cache_without_isFresh; result=${fresh ? 'fresh' : 'stale'}; ` +
+    `cachedChars=${cachedContent.length}; diskChars=${diskContent.length}`;
+  observeSafely(
+    () => Logger.getInstance().warn(message),
+    () => undefined
+  );
+  return fresh;
 }
 
 /* ================================================================== */

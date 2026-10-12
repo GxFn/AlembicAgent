@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   chmod,
   mkdir,
@@ -19,7 +20,11 @@ import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
 import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
-import type { ToolContext, ToolContextFactoryContract } from '../src/tools/runtime/index.js';
+import type {
+  DeltaCacheLike,
+  ToolContext,
+  ToolContextFactoryContract,
+} from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   Evolution,
@@ -589,9 +594,11 @@ describe('tool runtime adapters and public contracts', () => {
 
   it('exports generic delta and search cache contracts', () => {
     const deltaCache = new DeltaCache(1);
-    const first = deltaCache.check('a.ts', 'one\ntwo');
-    const unchanged = deltaCache.check('a.ts', 'one\ntwo');
-    const changed = deltaCache.check('a.ts', 'one\nthree');
+    // L4-P06：delta 不小于全文时回退 full，两行文件改一行（2 行 delta 对 2 行全文）不再是 delta；
+    // 用 4 行文件钉住公开 delta 模式仍可达。
+    const first = deltaCache.check('a.ts', 'one\ntwo\nthree\nfour');
+    const unchanged = deltaCache.check('a.ts', 'one\ntwo\nthree\nfour');
+    const changed = deltaCache.check('a.ts', 'one\nTWO\nthree\nfour');
 
     expect(first.mode).toBe('full');
     expect(unchanged.mode).toBe('unchanged');
@@ -1338,6 +1345,244 @@ describe('B-1 write-freshness gate (read-before-write / TOCTOU)', () => {
       );
       expect(rejected.ok).toBe(false);
       expect(rejected.error).toContain('exists on disk but was not read');
+    });
+  });
+});
+
+// ─── L4-P06 DeltaCache 增量回退、不可见条目瘦身与指纹单源 ─────────────────────────────
+// 来源：module-review-2026-10-01 I04（U12-F1 / U12-F3 / U12-F8）。逐位置比较的 diff 在文件头插入
+// 一行后把其后每一行都输出成 -/+，delta 约为全文两倍并被 code.read 动作配额截断；仅指纹的不可见
+// 条目也保存整文件内容；指纹由 DeltaCache 与 code.ts 各实现一份。钉住：行级 LCS 给出紧凑 hunk；
+// delta 不小于全文时回退 full 并刷新可见基线（带诊断日志）；不可见条目 content 为 ''；指纹只在
+// DeltaCache 内计算（与旧 md5 结果一致），写前门经 isFresh 判定，旧式缓存缺 isFresh 时降级为全文比对。
+describe('L4-P06 DeltaCache delta fallback, fingerprint-only entries and fingerprint source', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const md5 = (content: string): string => createHash('md5').update(content).digest('hex');
+  const sourceLines = (count: number, name = 'value'): string[] =>
+    Array.from(
+      { length: count },
+      (_, index) => `export const ${name}${index} = 'padding text for line ${index}';`
+    );
+  const taggedLogs = (spy: { mock: { calls: unknown[][] } }, tag: string): string[] =>
+    spy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes(tag));
+  const readA = { tool: 'code', action: 'read', params: { path: 'src/a.ts' } };
+  const writeA = (content: string) => ({
+    tool: 'code',
+    action: 'write',
+    params: { path: 'src/a.ts', content },
+  });
+
+  it('returns a compact hunk after a first-line insertion instead of re-pairing every line', () => {
+    const cache = new DeltaCache();
+    const lines = sourceLines(100);
+    cache.check('a.ts', lines.join('\n'));
+    const inserted = ["import { x } from './x.js';", ...lines].join('\n');
+    expect(cache.check('a.ts', inserted)).toEqual({
+      mode: 'delta',
+      content: "[delta: 1 hunk(s)]\n@@ line 1 @@\n+ import { x } from './x.js';",
+      lineCount: 101,
+    });
+    expect(cache.check('a.ts', inserted).mode).toBe('unchanged');
+  });
+
+  it('keeps compact deltas for a middle-line edit and a single-line deletion', () => {
+    const cache = new DeltaCache();
+    const lines = sourceLines(100);
+    cache.check('a.ts', lines.join('\n'));
+    const edited = [...lines];
+    edited[50] = 'export const value50 = 0;';
+    expect(cache.check('a.ts', edited.join('\n')).content).toBe(
+      `[delta: 1 hunk(s)]\n@@ line 51 @@\n- ${lines[50]}\n+ export const value50 = 0;`
+    );
+    const removed = edited.filter((_, index) => index !== 10);
+    expect(cache.check('a.ts', removed.join('\n'))).toEqual({
+      mode: 'delta',
+      content: `[delta: 1 hunk(s)]\n@@ line 11 @@\n- ${lines[10]}`,
+      lineCount: 99,
+    });
+  });
+
+  it('falls back to a refreshed full baseline with a diagnostic when the delta is not smaller', () => {
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const cache = new DeltaCache();
+    cache.check('a.ts', sourceLines(40).join('\n'));
+    const rewritten = sourceLines(40, 'renamed').join('\n');
+    expect(cache.check('a.ts', rewritten)).toEqual({
+      mode: 'full',
+      content: rewritten,
+      lineCount: 40,
+    });
+    expect(cache.get('a.ts')).toMatchObject({
+      hash: md5(rewritten),
+      content: rewritten,
+      lineCount: 40,
+      visible: true,
+    });
+    expect(cache.check('a.ts', rewritten).mode).toBe('unchanged');
+    const logs = taggedLogs(info, '[DeltaCache]');
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('path=a.ts');
+    expect(logs[0]).toContain('selected=full');
+    expect(logs[0]).toContain('reason=delta_not_smaller');
+    expect(logs[0]).toContain('changedLines=80');
+    expect(logs[0]).toContain('fullLines=40');
+    // 诊断只记录计数，不记录文件内容。
+    expect(logs[0]).not.toContain('padding text');
+  });
+
+  it('pairs oversized middles positionally and still falls back when that delta would be larger', () => {
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const cache = new DeltaCache();
+    const lines = sourceLines(600);
+    cache.check('big.ts', lines.join('\n'));
+    const edged = ['// head', ...lines.slice(1, -1), '// tail'];
+    expect(cache.check('big.ts', edged.join('\n'))).toEqual({
+      mode: 'delta',
+      content: `[delta: 2 hunk(s)]\n@@ line 1 @@\n- ${lines[0]}\n+ // head\n\n@@ line 600 @@\n- ${lines[599]}\n+ // tail`,
+      lineCount: 600,
+    });
+    const shifted = ['// inserted', ...edged.slice(0, -1), '// tail changed'].join('\n');
+    expect(cache.check('big.ts', shifted)).toEqual({
+      mode: 'full',
+      content: shifted,
+      lineCount: 601,
+    });
+    const logs = taggedLogs(info, '[DeltaCache]');
+    expect(logs).toHaveLength(2);
+    expect(logs[0]).toContain('selected=delta');
+    expect(logs[0]).toContain('diff=positional');
+    expect(logs[0]).toContain('reason=lcs_budget_exceeded');
+    expect(logs[1]).toContain('selected=full');
+    expect(logs[1]).toContain('diff=positional');
+    expect(logs[1]).toContain('reason=delta_not_smaller');
+  });
+
+  it('keeps a code.read re-read after a first-line insertion inside the action limit', async () => {
+    await withWriteFixture(async (root) => {
+      const lines = sourceLines(300);
+      await writeFile(join(root, 'src/a.ts'), lines.join('\n'), 'utf-8');
+      const cache = new DeltaCache(50);
+      const ctx = freshnessCtx(root, cache);
+      const router = new ToolRouter();
+      const first = await router.execute(readA, ctx);
+      expect(first.ok).toBe(true);
+      expect(first._meta?.diagnosticWarnings ?? []).toEqual([]);
+      expect(cache.get('src/a.ts')).toMatchObject({ visible: true });
+      await writeFile(
+        join(root, 'src/a.ts'),
+        ["import { x } from './x.js';", ...lines].join('\n'),
+        'utf-8'
+      );
+      const again = await router.execute(readA, ctx);
+      expect(again.ok).toBe(true);
+      expect(again.data).toBe("[delta: 1 hunk(s)]\n@@ line 1 @@\n+ import { x } from './x.js';");
+      expect(again._meta?.diagnosticWarnings ?? []).toEqual([]);
+      expect(cache.get('src/a.ts')).toMatchObject({ visible: true });
+    });
+  });
+
+  it('stores fingerprint-only entries without content and gates writes through isFresh', async () => {
+    await withWriteFixture(async (root) => {
+      const disk = sourceLines(20).join('\n');
+      await writeFile(join(root, 'src/a.ts'), disk, 'utf-8');
+      const cache = new DeltaCache(50);
+      const ctx = freshnessCtx(root, cache);
+      const router = new ToolRouter();
+      const range = await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'src/a.ts', startLine: 2, endLine: 3 } },
+        ctx
+      );
+      expect(range.ok).toBe(true);
+      // 指纹与旧 code.ts freshnessFingerprint（md5 hex）结果一致；不可见条目不再保存整文件。
+      expect(cache.get('src/a.ts')).toMatchObject({
+        hash: md5(disk),
+        content: '',
+        lineCount: 20,
+        visible: false,
+      });
+      expect(cache.isFresh('src/a.ts', disk)).toBe(true);
+      expect(cache.isFresh('src/a.ts', `${disk}\n`)).toBe(false);
+      expect(cache.isFresh('src/other.ts', disk)).toBe(false);
+      const write = await router.execute(writeA('export const a = 2;\n'), ctx);
+      expect(write.ok).toBe(true);
+      expect(cache.get('src/a.ts')).toMatchObject({
+        hash: md5('export const a = 2;\n'),
+        content: '',
+        lineCount: 2,
+        visible: false,
+      });
+      expect(cache.isFresh('src/a.ts', 'export const a = 2;\n')).toBe(true);
+    });
+  });
+
+  it('computes the fingerprint when set() omits the hash and keeps the line count on demotion', () => {
+    const cache = new DeltaCache();
+    cache.set('a.ts', undefined, 'one\ntwo\nthree');
+    expect(cache.get('a.ts')).toMatchObject({
+      hash: md5('one\ntwo\nthree'),
+      content: '',
+      lineCount: 3,
+      visible: false,
+    });
+    // 只带指纹降级（content 为空、指纹不变）沿用已知行数，不能把行数记成 1。
+    cache.set('a.ts', md5('one\ntwo\nthree'), '');
+    expect(cache.get('a.ts')).toMatchObject({ hash: md5('one\ntwo\nthree'), lineCount: 3 });
+    cache.check('b.ts', 'x\ny');
+    const visible = cache.get('b.ts');
+    expect(visible).toMatchObject({ content: 'x\ny', visible: true });
+    cache.set('b.ts', visible?.hash, visible?.content ?? '');
+    expect(cache.get('b.ts')).toMatchObject({
+      hash: md5('x\ny'),
+      content: '',
+      lineCount: 2,
+      visible: false,
+    });
+    expect(cache.check('b.ts', 'x\ny').mode).toBe('full');
+  });
+
+  it('degrades the write gate to an exact content comparison for a cache without isFresh', async () => {
+    await withWriteFixture(async (root) => {
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const entries = new Map<string, { hash: string; content: string }>();
+      // 旧式宿主实现：自带非 md5 指纹、没有 isFresh；写入路径不再替它计算指纹。
+      const legacy: DeltaCacheLike = {
+        get: (key) => entries.get(key),
+        set: (key, hash, content) => {
+          entries.set(key, { hash: hash ?? `legacy:${content.length}`, content });
+        },
+        check: (key, content) => {
+          entries.set(key, { hash: `legacy:${content.length}`, content });
+          return { mode: 'full', content, lineCount: content.split('\n').length };
+        },
+      };
+      const ctx: ToolContext = { projectRoot: root, tokenBudget: 4000, deltaCache: legacy };
+      const router = new ToolRouter();
+      expect((await router.execute(readA, ctx)).ok).toBe(true);
+      const allowed = await router.execute(writeA('export const a = 2;\n'), ctx);
+      expect(allowed.ok).toBe(true);
+      await writeFile(join(root, 'src/a.ts'), 'export const a = 3; // external\n', 'utf-8');
+      const rejected = await router.execute(writeA('export const a = 4;\n'), ctx);
+      expect(rejected.ok).toBe(false);
+      expect(rejected.error).toContain('changed externally since last read');
+      expect(await readFile(join(root, 'src/a.ts'), 'utf-8')).toBe(
+        'export const a = 3; // external\n'
+      );
+      const logs = taggedLogs(warn, '[code.write]');
+      expect(logs).toHaveLength(2);
+      for (const line of logs) {
+        expect(line).toContain('path=src/a.ts');
+        expect(line).toContain('freshness=content-compare');
+        expect(line).toContain('reason=delta_cache_without_isFresh');
+        expect(line).not.toContain('export const a');
+      }
+      expect(logs[0]).toContain('result=fresh');
+      expect(logs[1]).toContain('result=stale');
     });
   });
 });
