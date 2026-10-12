@@ -1,5 +1,6 @@
+import Logger from '@alembic/core/logging';
 import { createFinalExpandedMiningScheduleReceiptV1 } from '@alembic/core/production';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
@@ -9,6 +10,7 @@ import {
   type StrictAnalysisEpochSnapshotV1,
   type StrictAnalysisGateOutcomeV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
+import { buildStrictAnalystPrompt } from '../src/agent/production/StrictProductionPrompts.js';
 import {
   buildStrictProductionPipelineStagesV1,
   type StrictProductionRuntimePortV1,
@@ -1038,5 +1040,224 @@ describe('strict iterative Analyst epochs', () => {
 
     expect(output.outcome).toBe('completed');
     expect(analyzeCalls).toBe(3);
+  });
+});
+
+// C20：宿主对 population 只做 append-only 追加，Analyst 提示只能把末项当作当前份全量内联；
+// 历史份只给身份字段并标 superseded，避免同一观测在多 epoch 下重复出现、分母错乱、提示膨胀。
+describe('strict Analyst prompt population projection', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function populationRow(input: {
+    revision: number;
+    parentPopulationHash: string | null;
+    observationIds: readonly string[];
+  }) {
+    return {
+      schemaVersion: 1,
+      populationId: 'population-main',
+      revision: input.revision,
+      parentPopulationHash: input.parentPopulationHash,
+      populationHash: `population-hash-${input.revision}`,
+      sourceRevisionVectorHash: 'vector-iterative',
+      completion: 'complete',
+      denominator: {
+        kind: 'frozen-complete-subjects',
+        expectedObservationIds: [...input.observationIds],
+      },
+      observations: input.observationIds.map((observationId) => ({
+        observationId,
+        factIds: [observationId.replace('observation:', '')],
+      })),
+    };
+  }
+
+  /** 按宿主 executeAnalysisExpansion 的形状构造 3 个 epoch 的超集 population 链。 */
+  function createThreeEpochSnapshot(): StrictAnalysisEpochSnapshotV1 {
+    return createStrictAnalysisEpochSnapshotV1({
+      epoch: 3,
+      context: createContext({
+        factQueryObligationIds: ['base-1', 'counter-1', 'counter-2'],
+        factIds: ['fact-base', 'fact-counter-1', 'fact-counter-2'],
+        witnessIds: ['witness-base', 'witness-counter-1', 'witness-counter-2'],
+        populationHashes: ['population-hash-1', 'population-hash-2', 'population-hash-3'],
+      }),
+      populations: [
+        populationRow({
+          revision: 1,
+          parentPopulationHash: null,
+          observationIds: ['observation:fact-base'],
+        }),
+        populationRow({
+          revision: 2,
+          parentPopulationHash: 'population-hash-1',
+          observationIds: ['observation:fact-base', 'observation:fact-counter-1'],
+        }),
+        populationRow({
+          revision: 3,
+          parentPopulationHash: 'population-hash-2',
+          observationIds: [
+            'observation:fact-base',
+            'observation:fact-counter-1',
+            'observation:fact-counter-2',
+          ],
+        }),
+      ],
+      terminalObligationIds: ['base-1', 'counter-1', 'counter-2'],
+      outstandingObligationIds: [],
+    });
+  }
+
+  function countOccurrences(text: string, needle: string): number {
+    return text.split(needle).length - 1;
+  }
+
+  function promptLine(prompt: string, prefix: string): string {
+    const line = prompt.split('\n').find((candidate) => candidate.startsWith(prefix));
+    if (!line) {
+      throw new Error(`prompt line missing: ${prefix}`);
+    }
+    return line;
+  }
+
+  it('inlines only the last population as current and lists superseded ones by identity only', () => {
+    const epoch = createThreeEpochSnapshot();
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const prompt = buildStrictAnalystPrompt({
+      epoch,
+      limits: { maxEpochs: 8, maxObligations: 4 },
+    });
+
+    // 同一观测行只在当前份出现一次；分母（expectedObservationIds）也只出现一份。
+    for (const observationId of [
+      'observation:fact-base',
+      'observation:fact-counter-1',
+      'observation:fact-counter-2',
+    ]) {
+      expect(countOccurrences(prompt, `"observationId":"${observationId}"`)).toBe(1);
+    }
+    expect(countOccurrences(prompt, '"expectedObservationIds"')).toBe(1);
+    expect(countOccurrences(prompt, '"observations"')).toBe(1);
+    expect(prompt).not.toContain('Complete populations:');
+
+    const currentLine = promptLine(prompt, 'Current population');
+    const current = JSON.parse(currentLine.slice(currentLine.indexOf('{'))) as unknown;
+    expect(current).toEqual(epoch.populations[2]);
+    expect(currentLine).toContain('"observation:fact-base"');
+
+    const supersededLine = promptLine(prompt, 'Superseded populations');
+    expect(JSON.parse(supersededLine.slice(supersededLine.indexOf('[')))).toEqual([
+      {
+        populationHash: 'population-hash-1',
+        revision: 1,
+        parentPopulationHash: null,
+        status: 'superseded',
+      },
+      {
+        populationHash: 'population-hash-2',
+        revision: 2,
+        parentPopulationHash: 'population-hash-1',
+        status: 'superseded',
+      },
+    ]);
+    expect(supersededLine).not.toContain('observation:');
+
+    // 分母措辞针对当前 population，而不是“所有 populations”。
+    expect(prompt).not.toContain('Consume the complete multiscale observation populations');
+    expect(prompt).toMatch(/current observation population.*denominators/iu);
+    // 快照结构与 hash 不变：提示投影不回写快照。
+    expect(epoch.populations).toHaveLength(3);
+    expect(info).toHaveBeenCalledWith(
+      '[StrictProductionPrompts] analyst prompt inlines only the current population',
+      expect.objectContaining({
+        epoch: 3,
+        populationCount: 3,
+        currentPopulationHash: 'population-hash-3',
+        supersededPopulationHashes: ['population-hash-1', 'population-hash-2'],
+        selectedPath: 'current-inline-superseded-identity-only',
+      })
+    );
+  });
+
+  it('keeps a single-population epoch fully inlined as current with no superseded rows', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const epoch = createInitialEpoch();
+    const prompt = buildStrictAnalystPrompt({
+      epoch,
+      limits: { maxEpochs: 3, maxObligations: 3 },
+    });
+    const currentLine = promptLine(prompt, 'Current population');
+    expect(JSON.parse(currentLine.slice(currentLine.indexOf('{')))).toEqual(epoch.populations[0]);
+    const supersededLine = promptLine(prompt, 'Superseded populations');
+    expect(JSON.parse(supersededLine.slice(supersededLine.indexOf('[')))).toEqual([]);
+    expect(info).not.toHaveBeenCalledWith(
+      '[StrictProductionPrompts] analyst prompt inlines only the current population',
+      expect.anything()
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('renders an explicit null current population and warns when the host supplied none', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const prompt = buildStrictAnalystPrompt({
+      epoch: createStrictAnalysisEpochSnapshotV1({
+        epoch: 1,
+        context: createContext(),
+        populations: [],
+        terminalObligationIds: ['base-1'],
+        outstandingObligationIds: [],
+      }),
+      limits: { maxEpochs: 3, maxObligations: 3 },
+    });
+    expect(promptLine(prompt, 'Current population').endsWith(': null')).toBe(true);
+    expect(prompt).not.toContain('undefined');
+    expect(warn).toHaveBeenCalledWith(
+      '[StrictProductionPrompts] analyst prompt has no current population',
+      expect.objectContaining({
+        epoch: 1,
+        populationCount: 0,
+        selectedPath: 'render-null-current-population',
+      })
+    );
+  });
+
+  it('nulls missing identity fields of a malformed superseded population and warns', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const prompt = buildStrictAnalystPrompt({
+      epoch: createStrictAnalysisEpochSnapshotV1({
+        epoch: 2,
+        context: createContext(),
+        populations: [
+          'legacy-population-payload',
+          { revision: 1, observations: [{ observationId: 'observation:stale' }] },
+          populationRow({
+            revision: 2,
+            parentPopulationHash: null,
+            observationIds: ['observation:fact-base'],
+          }),
+        ],
+        terminalObligationIds: ['base-1'],
+        outstandingObligationIds: [],
+      }),
+      limits: { maxEpochs: 3, maxObligations: 3 },
+    });
+    const supersededLine = promptLine(prompt, 'Superseded populations');
+    expect(JSON.parse(supersededLine.slice(supersededLine.indexOf('[')))).toEqual([
+      { populationHash: null, revision: null, parentPopulationHash: null, status: 'superseded' },
+      { populationHash: null, revision: 1, parentPopulationHash: null, status: 'superseded' },
+    ]);
+    expect(prompt).not.toContain('observation:stale');
+    expect(prompt).not.toContain('legacy-population-payload');
+    expect(warn).toHaveBeenCalledWith(
+      '[StrictProductionPrompts] superseded population identity incomplete',
+      expect.objectContaining({
+        epoch: 2,
+        supersededIndexes: [0, 1],
+        selectedPath: 'render-null-identity-fields',
+      })
+    );
   });
 });

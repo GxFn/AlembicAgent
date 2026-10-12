@@ -1,4 +1,6 @@
+import Logger from '@alembic/core/logging';
 import type { AnalysisScheduleExpansionRowV1 } from '@alembic/core/production';
+import { observeSafely } from '#shared/observers.js';
 import type {
   CreateStrictProducerExpressionSetInputV1,
   FullAuthoredProjectionV1,
@@ -287,17 +289,150 @@ const STRICT_MODEL_OUTPUT_CONTRACT_V1 = Object.freeze({
 const OUTPUT_CONTRACT_INSTRUCTION =
   'Reply with exactly one JSON object matching the output contract below. Keys marked HOST-SEALED or HOST-OWNED are omitted from your reply because the host injects or overwrites them. Keys listed under neverEmit are derived by the Agent or Core and must not appear anywhere in your reply.';
 
+/** 历史 population 在 Analyst 提示中只保留的身份字段；缺失或类型不符的字段渲染为 null。 */
+interface SupersededPopulationIdentityV1 {
+  readonly populationHash: string | null;
+  readonly revision: number | null;
+  readonly parentPopulationHash: string | null;
+  readonly status: 'superseded';
+}
+
+interface StrictAnalystPopulationProjectionV1 {
+  /** populations 末项原样内联；宿主一份都没给时为 null。 */
+  readonly current: unknown;
+  readonly superseded: readonly SupersededPopulationIdentityV1[];
+}
+
+function isPopulationRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readNonEmptyString(record: Readonly<Record<string, unknown>>, key: string): string | null {
+  const value = record[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function readRevision(record: Readonly<Record<string, unknown>>): number | null {
+  const value = record.revision;
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : null;
+}
+
+function toSupersededIdentity(population: unknown): SupersededPopulationIdentityV1 {
+  if (!isPopulationRecord(population)) {
+    return {
+      populationHash: null,
+      revision: null,
+      parentPopulationHash: null,
+      status: 'superseded',
+    };
+  }
+  return {
+    populationHash: readNonEmptyString(population, 'populationHash'),
+    revision: readRevision(population),
+    parentPopulationHash: readNonEmptyString(population, 'parentPopulationHash'),
+    status: 'superseded',
+  };
+}
+
 /**
- * 严格 Analyst 不接收数量目标；它消费冻结语义投影与完整 population，并通过登记端口扩展。
- * 审查回执由宿主注入，提示只要求模型输出处置提案与扩展请求。
+ * C20：宿主（StrictAnalysisRuntime）对 population 只做 append-only 追加，每份都是对完整扩展
+ * 日程重新执行得到的全量观测，所以数组末项就是当前份，而宿主 validateAnalystResult 也只按
+ * 当前 state.population 校验。若把所有历史份全量内联，同一 observationId 会重复出现、模型按
+ * 全部副本统计分母会被 G1 拒绝，且提示随 epoch（最多 maxEpochs 个）线性膨胀。
+ *
+ * 这里只是模型可见投影：当前份原样全量内联，历史份只给 populationHash/revision/
+ * parentPopulationHash 并标 superseded。快照结构与 snapshotHash 不变，authority 仍是快照本身。
+ * 以数组末项识别当前份是已批准的决定，不在快照上新增 currentPopulationHash 字段。
+ */
+function projectAnalystPopulations(
+  epoch: StrictAnalysisEpochSnapshotV1
+): StrictAnalystPopulationProjectionV1 {
+  const { populations } = epoch;
+  if (populations.length === 0) {
+    // 降级路径：没有当前份时不抛错（提示构造不是 authority，旧行为渲染 []），显式渲染 null，
+    // 是否放行由宿主 Analyst 门按自身 population authority 判定。
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          '[StrictProductionPrompts] analyst prompt has no current population',
+          {
+            epoch: epoch.epoch,
+            snapshotHash: epoch.snapshotHash,
+            populationCount: 0,
+            selectedPath: 'render-null-current-population',
+            followUpCheck:
+              'host analyst gate must reject an epoch without a current population; check host readAnalysisEpoch',
+          }
+        ),
+      () => undefined
+    );
+    return { current: null, superseded: [] };
+  }
+  const current = populations[populations.length - 1];
+  const superseded = populations.slice(0, -1).map(toSupersededIdentity);
+  // parentPopulationHash 为 null 是首个 revision 的合法取值；只有 hash 或 revision 缺失才算身份不完整。
+  const incompleteIndexes = superseded.flatMap((row, index) =>
+    row.populationHash === null || row.revision === null ? [index] : []
+  );
+  if (incompleteIndexes.length > 0) {
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          '[StrictProductionPrompts] superseded population identity incomplete',
+          {
+            epoch: epoch.epoch,
+            snapshotHash: epoch.snapshotHash,
+            populationCount: populations.length,
+            supersededIndexes: incompleteIndexes,
+            selectedPath: 'render-null-identity-fields',
+            followUpCheck:
+              'superseded populations should be canonical Core ObservationPopulationV1 rows carrying populationHash and revision',
+          }
+        ),
+      () => undefined
+    );
+  }
+  if (superseded.length > 0) {
+    // 跳过历史份正文是有意的投影选择，记录被省略的身份以便回放时核对提示与快照的对应关系。
+    observeSafely(
+      () =>
+        Logger.getInstance().info(
+          '[StrictProductionPrompts] analyst prompt inlines only the current population',
+          {
+            epoch: epoch.epoch,
+            snapshotHash: epoch.snapshotHash,
+            populationCount: populations.length,
+            currentIndex: populations.length - 1,
+            currentPopulationHash: isPopulationRecord(current)
+              ? readNonEmptyString(current, 'populationHash')
+              : null,
+            currentRevision: isPopulationRecord(current) ? readRevision(current) : null,
+            supersededPopulationHashes: superseded.map((row) => row.populationHash),
+            selectedPath: 'current-inline-superseded-identity-only',
+            reason: 'host-append-only-populations',
+            followUpCheck:
+              'host validateAnalystResult validates against the current population only',
+          }
+        ),
+      () => undefined
+    );
+  }
+  return { current, superseded };
+}
+
+/**
+ * 严格 Analyst 不接收数量目标；它消费冻结语义投影与当前 population，并通过登记端口扩展。
+ * 历史 population 只以身份行出现（见 projectAnalystPopulations）。审查回执由宿主注入，提示只
+ * 要求模型输出处置提案与扩展请求。
  */
 export function buildStrictAnalystPrompt(input: {
   readonly epoch: StrictAnalysisEpochSnapshotV1;
   readonly limits: StrictAnalysisLoopLimitsV1;
 }): string {
+  const populations = projectAnalystPopulations(input.epoch);
   return [
     'You are the strict cold-start Analyst operating on immutable Core receipts.',
-    'Consume the complete multiscale observation populations and preserve denominators, variants, and outliers.',
+    'Consume the complete multiscale current observation population and preserve its denominators, variants, and outliers; superseded populations are listed by identity only and never form a second denominator.',
     'Own clustering, induction, falsification, narrowing, and refutation. Never invent a fact or infer one from prose.',
     'Every discard, zero-hypothesis, and falsification disposition is a proposal: give its ids, status, and reasonCode. The matching Core KnowledgeDispositionReview receipt is generated by the host through an independent semantic review session and sealed into the epoch before Core validation; never author, copy, or fabricate a review receipt, reviewReceiptId, or receiptHash, and reviewer strings are not authority.',
     'Exploration and every counterquery must be enrolled through the validated analysis expansion port before execution.',
@@ -308,7 +443,9 @@ export function buildStrictAnalystPrompt(input: {
     `Terminal obligations: ${JSON.stringify(input.epoch.terminalObligationIds)}`,
     `Outstanding obligations: ${JSON.stringify(input.epoch.outstandingObligationIds)}`,
     `Strict context: ${JSON.stringify(input.epoch.context)}`,
-    `Complete populations: ${JSON.stringify(input.epoch.populations)}`,
+    // 标签里不放 { 或 [，回放/测试可以从首个 JSON 定界符起解析。
+    `Current population (the last append-only revision; cluster and dispose every observation in it and take every denominator from it alone): ${JSON.stringify(populations.current ?? null)}`,
+    `Superseded populations (earlier append-only revisions replaced by the current population; identity only, never cluster, dispose, or count their observations): ${JSON.stringify(populations.superseded)}`,
     OUTPUT_CONTRACT_INSTRUCTION,
     `Output contract: ${JSON.stringify(STRICT_MODEL_OUTPUT_CONTRACT_V1.analystEnvelope)}`,
   ].join('\n');
