@@ -49,6 +49,14 @@
  * strictGate.retryMode='strict-analysis-epoch' 的 analysis_retry 允许回退到 strict-analyst 阶段，
  * 每次 transition 追加到 phaseResults._strictAnalysisLoopReceipt（只追加，不校验跨 gate 连续性）。
  *
+ * Producer 分析产物交接（I37）：非严格链的 producer 阶段（#isProducerStage）按门名读取
+ *   phaseResults.quality_gate.artifact，覆盖率预算（withProducerCoverageBudget）与 promptBuilder 入参
+ *   gateArtifact（字段名不变）共用这一次读取；读不到或形状不符时为 null 并记
+ *   diagnostics.warn(pipeline_producer_analysis_artifact_unavailable)，管线未声明 quality_gate 时只记
+ *   info 日志。ctx.gateArtifact（最近一个带产物的门）不再喂给非严格 producer——rejection_gate/中间门
+ *   的产物、或 quality_gate 无产物时更早的 evolution_gate 产物都会被误当成分析结果；它只留给严格链
+ *   （G1 pass 显式投影 transition.resultArtifact）与非 producer 阶段。见 #resolveStageGateArtifact。
+ *
  * 结局投影：execute 末尾把 aborted / failed(strictFailed 或阶段最终回执超时) / abandoned(degrade
  * 族、retry_exhausted、其他非通过) / completed 连同 abandonInfo 写入 phaseResults._pipelineOutcome，
  * 供父 run 聚合 abandonedModules。修复微阶段的结果也写入 phaseResults，不能据插入顺序猜最后主阶段。
@@ -181,6 +189,10 @@ interface PipelineContext {
   totalToolCalls: Array<Record<string, unknown>>;
   totalTokenUsage: { input: number; output: number };
   totalIterations: number;
+  /**
+   * 最近一个带真值产物的门（#storeGateResult 写入）；严格链 G1 pass 时被显式覆盖为
+   * transition.resultArtifact。I37：非严格 producer 不读它，改为按门名读取 quality_gate。
+   */
   gateArtifact: unknown;
   degraded: boolean;
   diagnostics: DiagnosticsCollector;
@@ -221,6 +233,97 @@ function producerStructuredFindingTarget(artifact: unknown): number {
 }
 
 /**
+ * I37(L5-P31)：非严格链 producer 的分析产物来源门。阶段名是 runtime/host 共享标识(insightPreset、
+ * stageBuilders 与 AgentStageFactoryRegistry 都按 analyze/quality_gate/produce/rejection_gate 组装)，
+ * producer 按这个名字从 phaseResults 读取，而不是读「最近一个带产物的门」。
+ */
+const ANALYSIS_GATE_STAGE = 'quality_gate';
+
+/** 按门名读取分析产物的结果：status 区分「门没跑 / 门没留产物 / 产物形状不符」，供诊断定位。 */
+type AnalysisGateArtifactRead =
+  | { status: 'ok'; artifact: Record<string, unknown> }
+  | {
+      status: 'gate_not_evaluated' | 'artifact_missing' | 'artifact_malformed';
+      artifact: null;
+      detail: string;
+    };
+
+/** 诊断用：列出产物的前 8 个键，非对象时报告其类型。 */
+function describeArtifactKeys(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return describeValueKind(value);
+  }
+  return Object.keys(value).slice(0, 8).join(',') || 'none';
+}
+
+function describeValueKind(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
+/**
+ * I37：从阶段结果里按门名读取分析产物(仿 gateEvaluators.readEvolutionGateArtifact)。
+ *
+ * 形状契约取 producer 两个消费方的交集：普通对象，且至少带 findings 数组(覆盖率预算按条数放大)或
+ * analysisText 字符串(提示构建)之一；已出现的这两个字段类型不符同样算形状不符。读不到或形状不符
+ * 一律返回 artifact=null 并附 status/detail——这里不做任何兜底取值(尤其不回退到别的门的产物)，
+ * 由调用方决定记诊断还是只记日志。
+ */
+function readAnalysisGateArtifact(
+  phaseResults: Record<string, unknown>,
+  gateName: string
+): AnalysisGateArtifactRead {
+  const gate = phaseResults[gateName];
+  if (!gate || typeof gate !== 'object' || Array.isArray(gate)) {
+    return {
+      status: 'gate_not_evaluated',
+      artifact: null,
+      detail: `phaseResults.${gateName} is ${describeValueKind(gate)}`,
+    };
+  }
+  const { artifact, action } = gate as { artifact?: unknown; action?: unknown };
+  if (artifact === null || artifact === undefined) {
+    // #storeGateResult 把 falsy 产物统一存成 null：门判了动作却没交出分析产物。
+    return {
+      status: 'artifact_missing',
+      artifact: null,
+      detail: `gate action=${String(action)} stored no artifact`,
+    };
+  }
+  if (typeof artifact !== 'object' || Array.isArray(artifact)) {
+    return {
+      status: 'artifact_malformed',
+      artifact: null,
+      detail: `artifact is ${describeValueKind(artifact)}`,
+    };
+  }
+  const record = artifact as Record<string, unknown>;
+  const hasFindings = Array.isArray(record.findings);
+  const hasAnalysisText = typeof record.analysisText === 'string';
+  const problems: string[] = [];
+  if (record.findings !== undefined && record.findings !== null && !hasFindings) {
+    problems.push(`findings is ${describeValueKind(record.findings)}`);
+  }
+  if (record.analysisText !== undefined && record.analysisText !== null && !hasAnalysisText) {
+    problems.push(`analysisText is ${describeValueKind(record.analysisText)}`);
+  }
+  if (problems.length === 0 && !hasFindings && !hasAnalysisText) {
+    problems.push(
+      `neither findings[] nor analysisText present (keys=${describeArtifactKeys(record)})`
+    );
+  }
+  if (problems.length > 0) {
+    return { status: 'artifact_malformed', artifact: null, detail: problems.join('; ') };
+  }
+  return { status: 'ok', artifact: record };
+}
+
+/**
  * I04(L5-P29)：读取阶段预算上的 hardSubmitCap(增量重扫由 AgentStageFactoryRegistry 写入的硬配额)。
  * 缺省/null/undefined → null(bootstrap 冷启动没有配额)；存在但不是有限正数 → 'invalid'，由调用方
  * 记 warn 后按无配额处理——坏配置不能静默改变数量语义，也不能让 produce 因此拿到 0 上限。
@@ -239,6 +342,8 @@ function readHardSubmitCap(budget: StageBudget | undefined): number | null | 'in
 
 /**
  * produce 阶段的覆盖率预算：按 quality_gate 的结构化 findings 数决定提交目标/上限/时间。
+ * analysisArtifact 由 #resolveStageGateArtifact 按门名从 quality_gate 读取(I37)；读不到时为 null，
+ * findings 计 0，预算原样返回(不放大)——读取失败的诊断已由调用方记录。
  *
  * 三条分叉(每条都留日志)：
  *   - isRetry：重试轮沿用声明预算(retryBudget 或 stage.budget 原值)，不放大、不注入 targetSubmits。
@@ -258,7 +363,7 @@ function readHardSubmitCap(budget: StageBudget | undefined): number | null | 'in
 function withProducerCoverageBudget(
   stage: PipelineStage,
   budget: StageBudget | undefined,
-  gateArtifact: unknown,
+  analysisArtifact: unknown,
   strictProduction: boolean,
   isRetry: boolean
 ): StageBudget | undefined {
@@ -268,7 +373,7 @@ function withProducerCoverageBudget(
   if (strictProduction) {
     return budget;
   }
-  const findingCount = producerStructuredFindingTarget(gateArtifact);
+  const findingCount = producerStructuredFindingTarget(analysisArtifact);
   if (findingCount <= 0) {
     return budget;
   }
@@ -620,7 +725,8 @@ export class PipelineStrategy extends Strategy {
         const transition = this.#readStrictAnalysisTransition(gateResult, 'pass');
         this.#appendStrictAnalysisLoopReceipt(ctx, transition);
         // Gate artifact 保留 transition 供审计；Producer 仍消费既有 analysisArtifact 语义，
-        // 避免把控制回执误当成 authored input。
+        // 避免把控制回执误当成 authored input。严格 producer 经 #resolveStageGateArtifact 读取的
+        // 正是这一显式投影(I37 的按门名交接只作用于非严格链)。
         ctx.gateArtifact = transition.resultArtifact;
       }
       if (strictContext && gate.strictGate?.passReasonCode) {
@@ -985,6 +1091,57 @@ export class PipelineStrategy extends Strategy {
   }
 
   /**
+   * I37(L5-P31)：解析本阶段 promptBuilder 入参 gateArtifact 与 producer 覆盖率预算的取数来源。
+   *   - 严格链：ctx.gateArtifact——G1 pass 时显式投影的 transition.resultArtifact(见 #processGate)，
+   *     语义不变；
+   *   - 非严格 producer(#isProducerStage)：按门名读取 quality_gate 的分析产物，不读「最近一个带产物的
+   *     门」(rejection_gate/中间门的产物、或 quality_gate 无产物时更早的 evolution_gate 产物都会被误用)。
+   *     读不到或形状不符 → null，并记 pipeline_producer_analysis_artifact_unavailable 诊断 + warn 日志；
+   *     管线根本没声明 quality_gate 门时只记 info 日志(没有交接可言，不算异常，也不再借用别的门)；
+   *   - 其他非严格阶段：保持 ctx.gateArtifact(通用管线的「最近门产物」入参，仓内无 producer 以外的消费方)。
+   * 纯取数 + 留痕，不改 ctx 状态；由 #executeStage 每次执行只调用一次。
+   */
+  #resolveStageGateArtifact(
+    stage: PipelineStage,
+    ctx: PipelineContext,
+    strictProduction: boolean
+  ): unknown {
+    if (strictProduction || !this.#isProducerStage(stage)) {
+      return ctx.gateArtifact;
+    }
+    const read = readAnalysisGateArtifact(ctx.phaseResults, ANALYSIS_GATE_STAGE);
+    if (read.status === 'ok') {
+      if (ctx.gateArtifact && ctx.gateArtifact !== read.artifact) {
+        // 改动前这里会把更新的门产物当成分析结果；留痕便于定位「哪个门在 quality_gate 之后交了产物」。
+        _pipelineLogger().info(
+          `[PipelineStrategy] Stage "${stage.name}" reads analysis artifact from "${ANALYSIS_GATE_STAGE}" by name and ignores newer gate artifact (findings=${producerStructuredFindingTarget(read.artifact)}, newerArtifactKeys=${describeArtifactKeys(ctx.gateArtifact)})`
+        );
+      }
+      return read.artifact;
+    }
+    const analysisGateDeclared = this.#stages.some(
+      (candidate) => Boolean(candidate.gate) && candidate.name === ANALYSIS_GATE_STAGE
+    );
+    if (!analysisGateDeclared) {
+      _pipelineLogger().info(
+        `[PipelineStrategy] Stage "${stage.name}" has no "${ANALYSIS_GATE_STAGE}" gate stage in this pipeline — gateArtifact=null (no analysis handoff; producer coverage amplification skipped${ctx.gateArtifact ? '; latest artifact from another gate not used' : ''})`
+      );
+      return null;
+    }
+    const message =
+      `Producer could not read the analysis artifact from gate "${ANALYSIS_GATE_STAGE}" by name: ` +
+      `${read.status} (${read.detail}) — gateArtifact=null, producer coverage amplification skipped` +
+      `${ctx.gateArtifact ? '; latest artifact from another gate not used' : ''}.`;
+    _pipelineLogger().warn(`[PipelineStrategy] Stage "${stage.name}" ${message}`);
+    ctx.diagnostics.warn({
+      code: 'pipeline_producer_analysis_artifact_unavailable',
+      stage: stage.name,
+      message,
+    });
+    return null;
+  }
+
+  /**
    * I05：源阶段最终回执超时时裁决门动作(文件头「源阶段最终回执超时」动作表)。纯判定，不写状态：
    *   - rewritten：pass/summary_rewrite/record_repair 改写为 analysis_retry(保留 artifact 供重试
    *     prompt，原始动作写进 reason)；
@@ -1284,6 +1441,9 @@ export class PipelineStrategy extends Strategy {
       reason: gateResult.reason || '',
       artifact: gateResult.artifact || null,
     };
+    // ctx.gateArtifact 只是「最近一个带产物的门」：任何门、任何动作都会覆盖，形状取决于上一个门是谁。
+    // I37：非严格 producer 不读它(按门名读取上面写入的 phaseResults.quality_gate.artifact)；严格链在
+    // G1 pass 时把它显式覆盖为 transition.resultArtifact；非 producer 阶段的 promptBuilder 仍可见它。
     if (gateResult.artifact) {
       ctx.gateArtifact = gateResult.artifact;
     }
@@ -1539,10 +1699,12 @@ export class PipelineStrategy extends Strategy {
         ? stage.retryBudget
         : stage.budget || computedBudget || undefined;
     const strictProduction = Boolean(this.#strictProductionContext(ctx));
+    // I37：本阶段 gateArtifact 只解析一次——覆盖率预算、首轮提示与 fast retry 重建共用，诊断不重复。
+    const stageGateArtifact = this.#resolveStageGateArtifact(stage, ctx, strictProduction);
     const effectiveBudget = withProducerCoverageBudget(
       stage,
       configuredBudget ? { ...configuredBudget } : undefined,
-      ctx.gateArtifact,
+      stageGateArtifact,
       strictProduction,
       isRetry
     );
@@ -1577,7 +1739,13 @@ export class PipelineStrategy extends Strategy {
           if (fastRetry) {
             const basePrompt =
               stagePrompt ||
-              (await this.#buildStagePrompt(stage, message, phaseResults, attemptContext, ctx));
+              (await this.#buildStagePrompt(
+                stage,
+                message,
+                phaseResults,
+                attemptContext,
+                stageGateArtifact
+              ));
             if (!basePrompt && !scope.signal.aborted) {
               _pipelineLogger().warn(
                 `[PipelineStrategy] Stage "${stage.name}" fast retry rebuilt an empty stage prompt — sending the timeout notice alone (cachedPromptChars=0, rebuiltPromptChars=0)`
@@ -1590,7 +1758,7 @@ export class PipelineStrategy extends Strategy {
               message,
               phaseResults,
               attemptContext,
-              ctx
+              stageGateArtifact
             );
           }
           // 不合作的准备任务即使晚到，也不能重置上下文或启动一次新的工具循环。
@@ -1729,13 +1897,15 @@ export class PipelineStrategy extends Strategy {
    * 构建阶段 prompt (优先级: 门重试的 retryPromptBuilder > promptBuilder > promptTransform > 原始)。
    * retryPromptBuilder 只在存在 phaseResults._retryContext（门重试）时使用；fast retry 复用首次
    * 尝试缓存的结果，缓存为空时才回到这里重建（I36）。
+   * gateArtifact 是 #resolveStageGateArtifact 为本阶段解析好的值（I37：非严格 producer 为按门名读取的
+   * quality_gate 产物或 null），以原字段名 gateArtifact 注入 promptBuilder，入参约定不变。
    */
   async #buildStagePrompt(
     stage: PipelineStage,
     message: AgentMessage,
     phaseResults: Record<string, unknown>,
     strategyContext: Record<string, unknown>,
-    ctx: PipelineContext
+    gateArtifact: unknown
   ) {
     let prompt: string;
     if (phaseResults._retryContext && stage.retryPromptBuilder) {
@@ -1745,7 +1915,7 @@ export class PipelineStrategy extends Strategy {
       prompt = await stage.promptBuilder({
         message: message.content,
         phaseResults,
-        gateArtifact: ctx.gateArtifact,
+        gateArtifact,
         ...strategyContext,
       });
     } else if (stage.promptTransform) {

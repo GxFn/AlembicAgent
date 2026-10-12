@@ -29,6 +29,35 @@ import type { PolicyFactoryConfig } from './types.js';
 const PRODUCER_TIMEOUT_MS = 900_000;
 const PRODUCER_RETRY_TIMEOUT_MS = 300_000;
 
+type ProducerAnalysisArtifact = Parameters<typeof buildProducerPromptV2>[0];
+
+/**
+ * I37(L5-P31)：produce 的 promptBuilder 入参 gateArtifact 由 PipelineStrategy 按门名从 quality_gate
+ * 读取(不再是「最近一个带产物的门」)；读不到或形状不符时为 null，管线已记
+ * pipeline_producer_analysis_artifact_unavailable 诊断。buildProducerPromptV2 要解引用 analysisText 与
+ * referencedFiles，缺失时只会得到空指针 TypeError——这里失败关闭并抛出带门名的明确错误：没有分析交接
+ * 就不生产知识候选(改动前 null 同样必然抛错，只是错误不可归类)，不以空产物降级渲染。
+ */
+function requireProducerAnalysisArtifact(value: unknown): ProducerAnalysisArtifact {
+  const kind = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(
+      `PRODUCER_ANALYSIS_ARTIFACT_UNAVAILABLE: produce stage requires the "quality_gate" AnalysisArtifact handed off by gate name, got ${kind}`
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const missing = [
+    typeof record.analysisText === 'string' ? null : 'analysisText',
+    Array.isArray(record.referencedFiles) ? null : 'referencedFiles',
+  ].filter((field): field is string => field !== null);
+  if (missing.length > 0) {
+    throw new Error(
+      `PRODUCER_ANALYSIS_ARTIFACT_UNAVAILABLE: "quality_gate" artifact lacks ${missing.join(', ')} required by the producer prompt`
+    );
+  }
+  return value as ProducerAnalysisArtifact;
+}
+
 // ─── insight: 深度代码分析 + 知识产出 ────────
 //
 // v3.0 重设计: PipelineStrategy 增强版
@@ -117,9 +146,10 @@ export const INSIGHT_PRESET = {
         // DeepSeek Pro 在真实项目候选生产阶段可能很慢；候选已提交前不要过早截断。
         budget: { ...PRODUCER_BUDGET, temperature: 0.3, timeoutMs: PRODUCER_TIMEOUT_MS },
         systemPrompt: PRODUCER_SYSTEM_PROMPT,
+        // gateArtifact：PipelineStrategy 按门名读取的 quality_gate AnalysisArtifact(I37)，字段名沿用。
         promptBuilder: (ctx: Record<string, unknown>) =>
           buildProducerPromptV2(
-            ctx.gateArtifact as Parameters<typeof buildProducerPromptV2>[0], // 来自 quality_gate 的 AnalysisArtifact
+            requireProducerAnalysisArtifact(ctx.gateArtifact),
             ctx.dimConfig as Parameters<typeof buildProducerPromptV2>[1],
             ctx.projectInfo as Parameters<typeof buildProducerPromptV2>[2],
             ctx.rescanContext as Parameters<typeof buildProducerPromptV2>[3],

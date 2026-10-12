@@ -53,9 +53,30 @@ interface ScanPipelineOpts {
 
 /** Prompt builder context (from PipelineContext) */
 interface ProducerPromptContext {
-  gateArtifact?: GateArtifact;
+  /**
+   * I37(L5-P31)：PipelineStrategy 按门名从 quality_gate 读取的 AnalysisArtifact(字段名沿用)；
+   * 不是「最近一个带产物的门」。读不到或形状不符时为 null(管线已记
+   * pipeline_producer_analysis_artifact_unavailable 诊断)。
+   */
+  gateArtifact?: GateArtifact | null;
   phaseResults?: Record<string, PhaseResult>;
+  /** 阶段 attempt 的诊断收集器(PipelineStrategy 经 strategyContext 展开注入)；用于 fallback 留痕。 */
+  diagnostics?: unknown;
   [key: string]: unknown;
+}
+
+/** 诊断收集器的最小写入面；直接调用 promptBuilder(测试/宿主)时可能缺失，缺失则只跳过留痕。 */
+interface PromptDiagnosticsSink {
+  warn(warning: { code: string; message: string; stage?: string }): void;
+}
+
+function readPromptDiagnostics(value: unknown): PromptDiagnosticsSink | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  return typeof (value as { warn?: unknown }).warn === 'function'
+    ? (value as PromptDiagnosticsSink)
+    : null;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -75,7 +96,8 @@ interface ProducerPromptContext {
  *   - quality_gate 通过 strategyContext.activeContext 走 buildAnalysisArtifact
  *     (而非降级的 buildAnalysisReport)，保留 findings/evidenceMap/negativeSignals
  *   - produce 使用 promptBuilder (而非 promptTransform)，
- *     从 gateArtifact 注入结构化发现和代码证据到 prompt
+ *     从 gateArtifact 注入结构化发现和代码证据到 prompt；gateArtifact 由 PipelineStrategy
+ *     按门名读取 quality_gate 的产物(I37)，中间门/rejection_gate 的产物不会替换它
  *   - strategyContext 需要包含 activeContext / outputType / dimId
  *     (由 SystemRunContextFactory / AgentRunInput.context 设置)
  *
@@ -154,8 +176,8 @@ export function buildScanPipelineStages(
     },
     systemPrompt: producePrompt,
     // 使用 promptBuilder (而非 promptTransform) — 与冷启动对齐
-    // promptBuilder 接收 gateArtifact (来自 quality_gate 的 AnalysisArtifact)，
-    // 注入结构化 findings + 代码证据到 prompt，而非仅传入 analyze.reply 纯文本
+    // promptBuilder 接收 gateArtifact：PipelineStrategy 按门名读取的 quality_gate AnalysisArtifact
+    // (I37；读不到时为 null)，注入结构化 findings + 代码证据到 prompt，而非仅传入 analyze.reply 纯文本
     promptBuilder: (ctx: ProducerPromptContext) => {
       return buildScanProducerPrompt(ctx, files, task);
     },
@@ -217,7 +239,8 @@ export function buildScanPipelineStages(
  *   - 优先使用 gateArtifact 中的 findings (结构化发现)
  *   - 注入 evidenceMap (Analyst 已读取的代码证据)
  *   - 注入 negativeSignals (搜索但未找到的模式)
- *   - 当 artifact 不可用时 fallback 到 analyze.reply 纯文本
+ *   - 当 artifact 不可用(null，或缺 analysisText)时 fallback 到 analyze.reply 纯文本，再不足时退回
+ *     源文件；每次 fallback 记 scan_producer_prompt_fallback 诊断(path、原因、关键长度)
  *
  * @param ctx promptBuilder 上下文 (含 gateArtifact, phaseResults, ...)
  * @param [files] 源文件 (fallback 用)
@@ -271,11 +294,25 @@ function buildScanProducerPrompt(
   }
 
   // ── Fallback: 无 artifact 时退回纯文本 (不应该发生，但防御性保留) ──
+  // I37：gateArtifact 按门名交接后，quality_gate 不交产物时这里拿到 null；降级路径必须留痕，
+  // 宿主才能区分「提示来自结构化分析」与「提示退回了纯文本/源文件」。
+  const artifactState = artifact ? 'analysisText missing' : 'gateArtifact=null';
+  const diagnostics = readPromptDiagnostics(ctx.diagnostics);
   if (analysis.length >= 200) {
+    diagnostics?.warn({
+      code: 'scan_producer_prompt_fallback',
+      stage: 'produce',
+      message: `Scan producer prompt fell back to plain analysis text: path=analyze_reply (${artifactState}; analyzeReplyChars=${analysis.length}; task=${task}).`,
+    });
     return `将以下代码分析转化为结构化输出。\n\n## 代码分析\n${analysis}`;
   }
 
   // Fallback: analyze reply 不足时直接提供源代码
+  diagnostics?.warn({
+    code: 'scan_producer_prompt_fallback',
+    stage: 'produce',
+    message: `Scan producer prompt fell back to source files: path=source_files (${artifactState}; analyzeReplyChars=${analysis.length}; sourceFiles=${files?.length || 0}; task=${task}).`,
+  });
   const fileCtx = (files || [])
     .slice(0, 15)
     .map((f: ScanSourceFile) => {
