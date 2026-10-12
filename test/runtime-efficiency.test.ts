@@ -21,6 +21,11 @@ import {
   recordPcvToolResult,
 } from '../src/agent/runtime/PcvNodeEvidenceRecorder.js';
 import {
+  createAgentProcessEvent,
+  projectLlmOutput,
+  projectSemanticNudgeEvent,
+} from '../src/agent/runtime/processEvents.js';
+import {
   eventBusPublisher,
   progressEmitter,
   submitDedup,
@@ -1460,5 +1465,392 @@ describe('I06 record-only stage execution gate', () => {
     expect(observed.map((entry) => entry.recordProfile)).toEqual(
       observed.map((entry) => entry.gateBlocks)
     );
+  });
+});
+
+// ─── L5-P20 / I46：阶段 action 白名单拒绝与开发者过程事件投影 ───────────────
+
+describe('allowlist gate action-level denial', () => {
+  function actionGateFixture(options: {
+    allowedToolIds: string[];
+    allowedToolActions?: Record<string, string[]>;
+    toolSchemas?: LoopContext['toolSchemas'];
+    manifestId?: string;
+  }) {
+    const dispatched: Array<{ toolId: string; action: unknown }> = [];
+    const warn = vi.fn();
+    const runtime = createRuntime(
+      createManifest({ id: options.manifestId ?? 'code' }),
+      async (request) => {
+        dispatched.push({ toolId: request.toolId, action: request.args?.action });
+        return createEnvelope(request, dispatched.length);
+      }
+    );
+    Object.assign(runtime, { logger: { info: () => undefined, warn } });
+    const diagnostics = new DiagnosticsCollector();
+    const loopCtx = createLoopContext(diagnostics);
+    loopCtx.allowedToolIds = options.allowedToolIds;
+    Object.assign(loopCtx, {
+      allowedToolActions: options.allowedToolActions,
+      toolSchemas: options.toolSchemas,
+    });
+    return { diagnostics, dispatched, loopCtx, runtime, warn };
+  }
+
+  const codeSchemaRequiringAction = [
+    {
+      name: 'code',
+      description: 'Read project code',
+      parameters: {
+        type: 'object',
+        properties: { action: { type: 'string' }, params: { type: 'object' } },
+        required: ['action'],
+      },
+    },
+  ] as unknown as LoopContext['toolSchemas'];
+
+  it('blocks code.write when the stage only allows code.read, before the host router runs', async () => {
+    const fixture = actionGateFixture({
+      allowedToolIds: ['code'],
+      allowedToolActions: { code: ['read'] },
+    });
+    const pipeline = createToolPipeline();
+    const context = { runtime: fixture.runtime, loopCtx: fixture.loopCtx, iteration: 1 };
+
+    const denied = await pipeline.execute(
+      { id: 'write', name: 'code', args: { action: 'write', params: { path: 'a.ts' } } },
+      context
+    );
+    const allowed = await pipeline.execute(
+      { id: 'read', name: 'code', args: { action: 'read', params: { path: 'a.ts' } } },
+      context
+    );
+
+    expect(denied.metadata.blocked).toBe(true);
+    expect(denied.result).toEqual({
+      error:
+        'Action "code.write" is not available in the current stage. Allowed actions for "code": read',
+    });
+    expect(allowed.metadata.blocked).toBe(false);
+    expect(fixture.dispatched).toEqual([{ toolId: 'code', action: 'read' }]);
+    expect(fixture.diagnostics.toJSON().blockedTools).toEqual([
+      { tool: 'code', reason: (denied.result as { error: string }).error },
+    ]);
+    // 短路路径必须留下日志：能看出被拒的 tool.action 与当前阶段开放的 action。
+    expect(fixture.warn).toHaveBeenCalledWith(expect.stringContaining('"code.write"'));
+    expect(fixture.warn).toHaveBeenCalledWith(expect.stringContaining('allowed: read'));
+  });
+
+  it('rejects a missing action as "(missing)" only when the tool schema requires one', async () => {
+    const restricted = actionGateFixture({
+      allowedToolIds: ['code'],
+      allowedToolActions: { code: ['read'] },
+      toolSchemas: codeSchemaRequiringAction,
+    });
+    const missingRestricted = await createToolPipeline().execute(
+      { id: 'missing', name: 'code', args: { params: { path: 'a.ts' } } },
+      { runtime: restricted.runtime, loopCtx: restricted.loopCtx, iteration: 1 }
+    );
+    expect(missingRestricted.metadata.blocked).toBe(true);
+    expect(missingRestricted.result).toEqual({
+      error:
+        'Action "code.(missing)" is not available in the current stage. Allowed actions for "code": read',
+    });
+    expect(restricted.warn).toHaveBeenCalledWith(expect.stringContaining('"code.(missing)"'));
+
+    // action 不受限（未登记 allowedToolActions）时，拒绝原因是缺 action，而不是“没有可用 action”。
+    const unrestricted = actionGateFixture({
+      allowedToolIds: ['code'],
+      toolSchemas: codeSchemaRequiringAction,
+    });
+    const missingUnrestricted = await createToolPipeline().execute(
+      { id: 'missing', name: 'code', args: { params: { path: 'a.ts' } } },
+      { runtime: unrestricted.runtime, loopCtx: unrestricted.loopCtx, iteration: 1 }
+    );
+    expect(missingUnrestricted.metadata.blocked).toBe(true);
+    expect(missingUnrestricted.result).toEqual({
+      error:
+        'Action "code.(missing)" is not available in the current stage. Allowed actions for "code": (any action defined by the tool schema; the call must name one)',
+    });
+    expect(restricted.dispatched).toEqual([]);
+    expect(unrestricted.dispatched).toEqual([]);
+
+    // 泛型 flat 工具：schema 不要求 action 时省略 action 不被拒。
+    const flat = actionGateFixture({ allowedToolIds: ['code'] });
+    const flatResult = await createToolPipeline().execute(
+      { id: 'flat', name: 'code', args: { params: { path: 'a.ts' } } },
+      { runtime: flat.runtime, loopCtx: flat.loopCtx, iteration: 1 }
+    );
+    expect(flatResult.metadata.blocked).toBe(false);
+    expect(flat.dispatched).toHaveLength(1);
+  });
+
+  it('treats an empty action list as "no action open" for that tool', async () => {
+    const fixture = actionGateFixture({
+      allowedToolIds: ['code'],
+      allowedToolActions: { code: [] },
+    });
+    const result = await createToolPipeline().execute(
+      { id: 'read', name: 'code', args: { action: 'read', params: { path: 'a.ts' } } },
+      { runtime: fixture.runtime, loopCtx: fixture.loopCtx, iteration: 1 }
+    );
+    expect(result.metadata.blocked).toBe(true);
+    expect(result.result).toEqual({
+      error:
+        'Action "code.read" is not available in the current stage. Allowed actions for "code": (none)',
+    });
+    expect(fixture.dispatched).toEqual([]);
+  });
+
+  it('lets a direct note_finding call through only when memory.note_finding is authorized', async () => {
+    const authorized = actionGateFixture({
+      allowedToolIds: ['memory'],
+      allowedToolActions: { memory: ['note_finding'] },
+      manifestId: 'memory',
+    });
+    const passed = await createToolPipeline().execute(
+      { id: 'finding', name: 'note_finding', args: { finding: 'boundary', evidenceRefs: ['E-1'] } },
+      { runtime: authorized.runtime, loopCtx: authorized.loopCtx, iteration: 1 }
+    );
+    expect(passed.metadata.blocked).toBe(false);
+    expect(authorized.dispatched).toEqual([{ toolId: 'memory', action: 'note_finding' }]);
+
+    const notAuthorized = actionGateFixture({
+      allowedToolIds: ['memory'],
+      allowedToolActions: { memory: ['recall'] },
+      manifestId: 'memory',
+    });
+    const blocked = await createToolPipeline().execute(
+      { id: 'finding', name: 'note_finding', args: { finding: 'boundary', evidenceRefs: ['E-1'] } },
+      { runtime: notAuthorized.runtime, loopCtx: notAuthorized.loopCtx, iteration: 1 }
+    );
+    expect(blocked.metadata.blocked).toBe(true);
+    expect((blocked.result as { error: string }).error).toContain('工具 "note_finding" 不可用');
+    expect(notAuthorized.dispatched).toEqual([]);
+  });
+});
+
+describe('developer process event projection', () => {
+  const eventOrigin = {
+    createdAt: '2026-10-11T00:00:00.000Z',
+    iteration: 3,
+    source: 'system',
+    phase: 'EXPLORE',
+    dimensionId: 'dim-1',
+    targetName: 'Runtime',
+    pcvNodeEvidence: null as unknown,
+  };
+  const nudgeOrigin = {
+    dimensionId: 'dim-1',
+    targetName: 'Runtime',
+    source: 'system',
+    phase: 'EXPLORE',
+    pipelineType: 'analyst',
+  };
+
+  it('keeps shared (DAG) references intact and marks only true cycles as [Circular]', () => {
+    const shared = { file: 'src/a.ts', line: 10 };
+    const cyclic: Record<string, unknown> = { name: 'loop' };
+    cyclic.self = cyclic;
+    const cyclicList: unknown[] = ['head'];
+    cyclicList.push(cyclicList);
+
+    const event = createAgentProcessEvent(
+      { ...eventOrigin, pcvNodeEvidence: { stageIdentity: shared } },
+      {
+        kind: 'tool',
+        title: 'shared refs',
+        metadata: {
+          a: shared,
+          b: shared,
+          list: [shared, shared],
+          nested: { again: shared },
+          cyclic,
+          cyclicList,
+        },
+      }
+    );
+
+    expect(event.metadata).toEqual({
+      iteration: 3,
+      source: 'system',
+      pcvNodeEvidence: { stageIdentity: { file: 'src/a.ts', line: 10 } },
+      a: { file: 'src/a.ts', line: 10 },
+      b: { file: 'src/a.ts', line: 10 },
+      list: [
+        { file: 'src/a.ts', line: 10 },
+        { file: 'src/a.ts', line: 10 },
+      ],
+      nested: { again: { file: 'src/a.ts', line: 10 } },
+      cyclic: { name: 'loop', self: '[Circular]' },
+      cyclicList: ['head', '[Circular]'],
+    });
+  });
+
+  it('keeps numeric token metrics but redacts secret-like and non-metric token fields', () => {
+    const event = createAgentProcessEvent(eventOrigin, {
+      kind: 'llm.output',
+      title: 'usage',
+      metadata: {
+        usage: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+          reasoningTokens: 5,
+          cacheHitTokens: 40,
+          cacheWriteTokens: 0,
+        },
+        outputTokens: '20',
+        tokenBudget: 5000,
+        accessToken: 'opaque-session-value',
+        apiKey: 'opaque-key-value',
+      },
+    });
+
+    expect(event.metadata).toMatchObject({
+      usage: {
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 120,
+        reasoningTokens: 5,
+        cacheHitTokens: 40,
+        cacheWriteTokens: 0,
+      },
+      outputTokens: '[redacted]',
+      tokenBudget: '[redacted]',
+      accessToken: '[redacted]',
+      apiKey: '[redacted]',
+    });
+  });
+
+  it('classifies tool-call-only, empty and provider-truncated LLM outputs', () => {
+    const toolOnly = projectLlmOutput({
+      text: '',
+      functionCalls: [{ id: 'call-1', name: 'code', args: { action: 'read' } }],
+      finishReason: 'tool_calls',
+    });
+    expect(toolOnly.completeness).toMatchObject({
+      outputCompleteness: 'tool_call_only',
+      functionCallCount: 1,
+      functionCallNames: ['code'],
+      hasText: false,
+      providerOutputTruncated: false,
+    });
+    expect(toolOnly.event.summary).toBe('Received 1 tool call(s) without visible text');
+    expect(toolOnly.event.content?.text).toContain('LLM requested tool calls:');
+
+    const empty = projectLlmOutput({ text: null, functionCalls: [], finishReason: 'stop' });
+    expect(empty.completeness).toMatchObject({
+      outputCompleteness: 'empty',
+      functionCallCount: 0,
+      developerContentChars: 0,
+    });
+    expect(empty.event.summary).toBe('Received empty LLM output from provider (finishReason=stop)');
+
+    const truncated = projectLlmOutput({ text: '', finishReason: 'length' });
+    expect(truncated.completeness).toMatchObject({
+      outputCompleteness: 'provider_truncated',
+      providerOutputTruncated: true,
+    });
+    expect(truncated.event.summary).toBe(
+      'Received empty LLM output; provider stopped with finishReason=length'
+    );
+  });
+
+  it('titles and summarizes the analyze evidence-grounding gate nudge as such', () => {
+    const nudge = {
+      type: 'evidence_grounding',
+      text: '本轮结论没有引用任何证据，不能推进阶段。',
+    };
+    const explicit = projectSemanticNudgeEvent(nudge, nudgeOrigin, 'evidence-grounding-nudge');
+    const classified = projectSemanticNudgeEvent(nudge, nudgeOrigin);
+
+    for (const event of [explicit, classified]) {
+      expect(event.title).toBe('Agent 证据门 Nudge');
+      expect(event.summary).toBe(
+        'analyze 阶段的结论没有引用证据，已被证据门阻断并回滚本轮，要求 Agent 先取证再下结论。'
+      );
+      expect(event.metadata).toMatchObject({
+        nudgeType: 'evidence_grounding',
+        semanticKind: 'evidence-grounding-nudge',
+      });
+    }
+  });
+
+  it('distinguishes plan elicitation from replans produced by the real PlanTracker', () => {
+    const trace = {
+      expectPlan: () => undefined,
+      getPlan: () => ({
+        createdAtIteration: 1,
+        steps: [{ description: 'Read runtime', status: 'pending' as const }],
+      }),
+    };
+    const elicitation = new PlanTracker().checkPlanning(
+      {
+        phase: 'EXPLORE',
+        metrics: { iteration: 1 },
+        budget: { maxIterations: 20 },
+        strategy: {},
+        pipelineType: 'analyst',
+        isTerminalPhase: false,
+      },
+      trace
+    );
+    const bootstrapReplan = new PlanTracker().checkPlanning(
+      {
+        phase: 'EXPLORE',
+        metrics: { iteration: 4 },
+        budget: { maxIterations: 20 },
+        strategy: { replanInterval: 1 },
+        pipelineType: 'bootstrap',
+        isTerminalPhase: false,
+      },
+      trace
+    );
+    const analystReplan = new PlanTracker().checkPlanning(
+      {
+        phase: 'EXPLORE',
+        metrics: { iteration: 4 },
+        budget: { maxIterations: 20 },
+        strategy: { replanInterval: 1 },
+        pipelineType: 'analyst',
+        isTerminalPhase: false,
+      },
+      trace
+    );
+    // PlanTracker 的初始计划与 replan 都以 type='planning' 发出，投影只能从 nudge 本身区分。
+    if (!elicitation || !bootstrapReplan || !analystReplan) {
+      throw new Error('PlanTracker did not produce the expected planning nudges');
+    }
+    expect([elicitation.type, bootstrapReplan.type, analystReplan.type]).toEqual([
+      'planning',
+      'planning',
+      'planning',
+    ]);
+
+    const elicitationEvent = projectSemanticNudgeEvent(elicitation, nudgeOrigin);
+    expect(elicitationEvent.title).toBe('Agent 计划检查 Nudge');
+    expect(elicitationEvent.summary).toBe('要求 Agent 在开始探索前先用编号列表给出探索计划。');
+
+    for (const replan of [bootstrapReplan, analystReplan, { type: 'replan', text: '重新计划' }]) {
+      const event = projectSemanticNudgeEvent(replan, nudgeOrigin);
+      expect(event.title).toBe('Agent 重新计划 Nudge');
+      expect(event.summary).toBe(
+        '计划进度回顾或偏差检查触发重新计划，要求 Agent 根据当前进度更新后续步骤。'
+      );
+      expect(event.metadata).toMatchObject({ semanticKind: 'planning-nudge' });
+    }
+  });
+
+  it('summarizes convergence nudges in the same language as their title', () => {
+    const event = projectSemanticNudgeEvent(
+      { type: 'convergence', text: '最近 3 轮没有发现新信息，建议开始撰写分析总结。' },
+      nudgeOrigin
+    );
+    expect(event.title).toBe('Agent 收敛检查 Nudge');
+    expect(event.summary).toBe(
+      '连续多轮没有新信息或有效新提交，引导 Agent 收敛：停止重复探索，输出总结或只提交剩余候选。'
+    );
+    expect(event.metadata).toMatchObject({ semanticKind: 'convergence-nudge' });
   });
 });

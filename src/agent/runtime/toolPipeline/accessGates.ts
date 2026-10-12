@@ -114,11 +114,22 @@ export const allowlistGate = {
       (requiresAction && !action) ||
       (action && !isActionAllowed(ctx.loopCtx, call.name, action))
     ) {
-      const allowedActions = ctx.loopCtx.allowedToolActions?.[call.name] || [];
+      const actionLabel = `${call.name}.${action || '(missing)'}`;
+      const allowedActionsText = describeAllowedActions(ctx.loopCtx, call.name, action);
+      // action 级拒绝有两种原因：schema 要求 action 而调用缺失，或 action 不在本阶段白名单里。
+      // 短路发生在宿主调度之前（端口零调用）；日志记下被拒的 tool.action、原因与本阶段开放的 action，
+      // engine 另把同一 error 计入 diagnostics.blockedTools。
+      ctx.runtime.logger.warn(
+        `[ToolPipeline] ⛔ Action "${actionLabel}" ${
+          action
+            ? 'is not allowed in the current stage'
+            : 'is missing but required by the tool schema'
+        } — blocked before host dispatch (allowed: ${allowedActionsText})`
+      );
       return {
         blocked: true,
         result: {
-          error: `Action "${call.name}.${action || '(missing)'}" is not available in the current stage. Allowed actions for "${call.name}": ${allowedActions.join(', ')}`,
+          error: `Action "${actionLabel}" is not available in the current stage. Allowed actions for "${call.name}": ${allowedActionsText}`,
         },
       };
     }
@@ -307,6 +318,26 @@ function resolveCodePathParams(
     );
   }
   return resolved;
+}
+
+/**
+ * 拒绝文案里的“本阶段开放的 action”，与 isActionAllowed 的归一语义一致：
+ * - 有声明的非空列表：逐个列出；
+ * - 空数组：该工具的 action 全部禁用，写 '(none)'，不能留空让模型误以为列表缺失；
+ * - 未声明 / null：action 不受限，此时被拒只可能是 schema 要求 action 而调用缺失，提示必须指定一个；
+ *   若调用带了 action 仍被拒，说明整张 allowlist 归一失败（isToolActionAllowed 按全禁处理），同样写 '(none)'。
+ */
+function describeAllowedActions(loopCtx: ToolLoopPort, toolName: string, action: string): string {
+  const declared: unknown = Object.hasOwn(loopCtx.allowedToolActions ?? {}, toolName)
+    ? loopCtx.allowedToolActions[toolName]
+    : null;
+  if (declared == null) {
+    return action ? '(none)' : '(any action defined by the tool schema; the call must name one)';
+  }
+  if (!Array.isArray(declared) || declared.length === 0) {
+    return '(none)';
+  }
+  return declared.join(', ');
 }
 
 function isActionAllowed(loopCtx: ToolLoopPort, toolName: string, actionName: string): boolean {

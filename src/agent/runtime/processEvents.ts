@@ -296,6 +296,10 @@ function classifySemanticNudgeKind(type: string): string {
       return 'planning-nudge';
     case 'convergence':
       return 'convergence-nudge';
+    case 'evidence_grounding':
+      // AgentRuntime 发射证据门事件时会显式传 semanticKind；这里补齐同一映射，
+      // 让未显式传 kind 的调用不会把证据门拦截误归为普通反思。
+      return 'evidence-grounding-nudge';
     default:
       return 'reflection-nudge';
   }
@@ -316,10 +320,13 @@ function formatSemanticNudgeTitle(
     return 'Agent 继续执行 Nudge';
   }
   if (semanticKind === 'planning-nudge') {
-    return nudge.type === 'replan' ? 'Agent 重新计划 Nudge' : 'Agent 计划检查 Nudge';
+    return isReplanNudge(nudge) ? 'Agent 重新计划 Nudge' : 'Agent 计划检查 Nudge';
   }
   if (semanticKind === 'convergence-nudge') {
     return 'Agent 收敛检查 Nudge';
+  }
+  if (semanticKind === 'evidence-grounding-nudge') {
+    return 'Agent 证据门 Nudge';
   }
   if (nudge.text.includes('停滞反思')) {
     return 'Agent 停滞反思';
@@ -344,6 +351,17 @@ function formatSemanticNudgeSummary(
   if (semanticKind === 'continue-nudge') {
     return '要求 Agent 基于当前回复继续推进，而不是结束本轮执行。';
   }
+  if (semanticKind === 'planning-nudge') {
+    return isReplanNudge(nudge)
+      ? '计划进度回顾或偏差检查触发重新计划，要求 Agent 根据当前进度更新后续步骤。'
+      : '要求 Agent 在开始探索前先用编号列表给出探索计划。';
+  }
+  if (semanticKind === 'convergence-nudge') {
+    return '连续多轮没有新信息或有效新提交，引导 Agent 收敛：停止重复探索，输出总结或只提交剩余候选。';
+  }
+  if (semanticKind === 'evidence-grounding-nudge') {
+    return 'analyze 阶段的结论没有引用证据，已被证据门阻断并回滚本轮，要求 Agent 先取证再下结论。';
+  }
   if (nudge.text.includes('停滞反思')) {
     return '检测到连续无新信息，注入停滞反思。';
   }
@@ -351,6 +369,22 @@ function formatSemanticNudgeSummary(
     return '达到中期预算节点，注入阶段性反思。';
   }
   return `Injected ${nudge.type} semantic nudge before the next LLM step.`;
+}
+
+/**
+ * PlanTracker 的初始计划征集与 replan 都以 type='planning' 发出（DiagnosticsCollector 另按
+ * iteration>1 计 replan），投影拿不到 iteration，只能从 nudge 本身区分：显式 type='replan'，
+ * 或正文带 PlanTracker replan 文案的固定标记（周期回顾“计划进度回顾”、偏差/bootstrap“计划偏差检查”）。
+ * 初始征集文案不含这两个标记。标记与 PlanTracker 文案的耦合由 runtime-efficiency.test.ts
+ * 用真实 PlanTracker 输出守护；文案改动后测试会失败，而不是静默把 replan 显示成计划检查。
+ */
+const REPLAN_TEXT_MARKERS = ['计划进度回顾', '计划偏差检查'] as const;
+
+function isReplanNudge(nudge: { type: string; text: string }): boolean {
+  if (nudge.type === 'replan') {
+    return true;
+  }
+  return REPLAN_TEXT_MARKERS.some((marker) => nudge.text.includes(marker));
 }
 
 function formatDeveloperVisibleLlmInput(assembly: LLMInputAssembly): string {
@@ -491,29 +525,39 @@ function stringifyFallback(value: unknown): string {
   }
 }
 
-function sanitizeDeveloperData(value: unknown, seen = new WeakSet<object>()): unknown {
+/**
+ * 递归脱敏开发者数据。ancestors 是“当前递归路径上的祖先栈”，不是“已访问集合”：
+ * 只有对象在自己的子树里再次出现（真循环）才替换为 '[Circular]'；同一对象被多个字段共享
+ * （DAG，如 {a: x, b: x}、pcvNodeEvidence 与调用方 metadata 共用子对象）时每处都保留真实内容。
+ * 子树处理完（含异常退出）即出栈，保证兄弟分支看到的祖先栈不受影响。
+ */
+function sanitizeDeveloperData(value: unknown, ancestors = new WeakSet<object>()): unknown {
   if (typeof value === 'string') {
     return redactDeveloperText(value);
   }
   if (value === null || typeof value !== 'object') {
     return value;
   }
-  if (seen.has(value)) {
+  if (ancestors.has(value)) {
     return '[Circular]';
   }
-  seen.add(value);
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeDeveloperData(item, seen));
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.map((item) => sanitizeDeveloperData(item, ancestors));
+    }
+    const record = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(record)) {
+      output[key] =
+        isSecretLikeKey(key) && !isSafeNumericTokenMetric(key, child)
+          ? '[redacted]'
+          : sanitizeDeveloperData(child, ancestors);
+    }
+    return output;
+  } finally {
+    ancestors.delete(value);
   }
-  const record = value as Record<string, unknown>;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record)) {
-    output[key] =
-      isSecretLikeKey(key) && !isSafeNumericTokenMetric(key, child)
-        ? '[redacted]'
-        : sanitizeDeveloperData(child, seen);
-  }
-  return output;
 }
 
 function isSecretLikeKey(key: string): boolean {
