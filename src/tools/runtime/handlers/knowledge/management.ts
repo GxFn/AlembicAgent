@@ -19,7 +19,11 @@ import {
   stringValue,
   validateManagementInput,
 } from './input.js';
-import { abortedKnowledgeResult, completedMutationMeta } from './operation.js';
+import {
+  abortedKnowledgeResult,
+  completedMutationMeta,
+  logKnowledgeFallback,
+} from './operation.js';
 
 /* ================================================================== */
 /*  knowledge.manage                                                   */
@@ -402,17 +406,26 @@ async function handleEvolutionManage(
     return unavailableManagementPort(operation, 'proposalGateway', 'submit', id);
   }
 
-  const confidence =
-    numberValue(data?.confidence) ??
-    numberValue(params.confidence) ??
-    (operation === 'deprecate' ? 0.7 : 0.9);
-  const source = resolveEvolutionSource(ctx);
+  // confidence 优先级：data > params > 按操作代填。代填值会直接决定 Core EvolutionPolicy 的
+  // 初始状态（update ≥0.7 即进入 observing；非 metabolism 的 deprecate ≥0.8 会立即执行），
+  // 因此代填必须留日志，并在提案 evidence 中标记 confidenceDefaulted，供审计区分"模型判断"与
+  // "Agent 代填"。默认值本身（evolve/skip_evolution 0.9、deprecate 0.7）是产品决策，此处不调整。
+  const explicitConfidence = numberValue(data?.confidence) ?? numberValue(params.confidence);
+  const confidenceDefaulted = explicitConfidence === undefined;
+  const confidence = explicitConfidence ?? (operation === 'deprecate' ? 0.7 : 0.9);
+  if (confidenceDefaulted) {
+    logKnowledgeFallback(
+      'info',
+      `[knowledge.manage] evolution confidence defaulted (operation=${operation}, id=${id}, confidence=${confidence}): neither data.confidence nor params.confidence was supplied; proposal evidence marked confidenceDefaulted=true`
+    );
+  }
+  const source = resolveEvolutionSource(ctx, operation, id);
   const description =
     stringValue(data?.description) ??
     stringValue(params.description) ??
     reason ??
     defaultEvolutionDescription(operation);
-  const evidence = buildEvolutionEvidence(data, params);
+  const evidence = buildEvolutionEvidence(data, params, confidenceDefaulted);
 
   const action: EvolutionAction =
     operation === 'evolve' ? 'update' : operation === 'deprecate' ? 'deprecate' : 'valid';
@@ -458,11 +471,36 @@ async function handleEvolutionManage(
   }
 }
 
-function resolveEvolutionSource(ctx: ToolContext): EvolutionProposalSource {
+/** 只渲染可安全写入日志的原值：字符串加引号（暴露首尾空白）并截断，对象类只记类型。 */
+function describeRawSource(raw: unknown): string {
+  if (typeof raw === 'string') {
+    return JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}...` : raw);
+  }
+  if (typeof raw === 'number' || typeof raw === 'boolean') {
+    return String(raw);
+  }
+  return `<${typeof raw}>`;
+}
+
+function resolveEvolutionSource(
+  ctx: ToolContext,
+  operation: 'evolve' | 'deprecate' | 'skip_evolution',
+  id: string
+): EvolutionProposalSource {
   const raw = ctx.runtime?.sharedState?.evolutionProposalSource;
-  return typeof raw === 'string' && EVOLUTION_SOURCES.has(raw as EvolutionProposalSource)
-    ? (raw as EvolutionProposalSource)
-    : AGENT_RUNTIME_SOURCE;
+  if (typeof raw === 'string' && EVOLUTION_SOURCES.has(raw as EvolutionProposalSource)) {
+    return raw as EvolutionProposalSource;
+  }
+  // 未设置（undefined/null）是常规路径：Agent 自身发起的提案默认归属 alembic-agent，不告警。
+  // 宿主显式给了非法值（如带空格的 'metabolism '）时回落会丢失该来源在 Core 的专属策略
+  // （metabolism 的 deprecate 不立即执行），必须告警；回落值本身保持不变。
+  if (raw !== undefined && raw !== null) {
+    logKnowledgeFallback(
+      'warn',
+      `[knowledge.manage] evolution proposal source fallback (operation=${operation}, id=${id}, raw=${describeRawSource(raw)}, fallback=${AGENT_RUNTIME_SOURCE}): sharedState.evolutionProposalSource is not a recognised proposal source`
+    );
+  }
+  return AGENT_RUNTIME_SOURCE;
 }
 
 function defaultEvolutionDescription(operation: 'evolve' | 'deprecate' | 'skip_evolution') {
@@ -494,7 +532,8 @@ function evolutionStatus(
 
 function buildEvolutionEvidence(
   data: Record<string, unknown> | undefined,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  confidenceDefaulted: boolean
 ): Record<string, unknown>[] {
   const records: Record<string, unknown>[] = [];
   const rawEvidence = data?.evidence ?? params.evidence;
@@ -513,6 +552,10 @@ function buildEvolutionEvidence(
   }
 
   const inline = collectInlineEvidence(data, params);
+  // 代填标记并入 Agent 侧 inline 记录，不额外新增一条 evidence；无 inline 字段时它单独成条。
+  if (confidenceDefaulted) {
+    inline.confidenceDefaulted = true;
+  }
   if (Object.keys(inline).length > 0) {
     records.push(inline);
   }

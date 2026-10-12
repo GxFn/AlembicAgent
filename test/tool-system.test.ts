@@ -853,6 +853,198 @@ describe('knowledge host ports through ToolRouterAdapter', () => {
   });
 });
 
+/**
+ * I41：进化提案的 confidence 代填与 source 回落必须可观测。默认值本身（evolve/skip 0.9、
+ * deprecate 0.7）属于产品决策，这里只锁定"代填被标记 + 记录日志"，不改变提交给 Core 的值。
+ */
+describe('knowledge evolution management defaults and fallbacks', () => {
+  type SubmittedDecision = {
+    recipeId: string;
+    source: string;
+    confidence: number;
+    evidence?: Record<string, unknown>[];
+  };
+
+  function evolutionCtx(sharedState?: Record<string, unknown>) {
+    const submitted: SubmittedDecision[] = [];
+    const submit = vi.fn(async (decision: SubmittedDecision) => {
+      submitted.push(decision);
+      return { outcome: 'proposal-created', proposalId: 'proposal' };
+    });
+    const ctx: ToolContext = {
+      projectRoot: process.cwd(),
+      proposalGateway: { submit },
+      ...(sharedState ? { runtime: { sharedState } } : {}),
+    };
+    return { ctx, submit, submitted };
+  }
+
+  function messages(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((message) => message.startsWith('[knowledge.manage]'));
+  }
+
+  it.each([
+    ['evolve', 0.9],
+    ['deprecate', 0.7],
+    ['skip_evolution', 0.9],
+  ] as const)('flags and logs the defaulted %s confidence without changing it', async (operation, expected) => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { ctx, submitted } = evolutionCtx();
+      const result = await handleKnowledge('manage', { operation, id: 'recipe-default' }, ctx);
+      expect(result.ok).toBe(true);
+      expect(submitted).toHaveLength(1);
+      // 默认值不变：仍按原产品默认提交给 Core。
+      expect(submitted[0]?.confidence).toBe(expected);
+      expect(submitted[0]?.evidence).toEqual([{ confidenceDefaulted: true }]);
+      const logged = messages(info);
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain(`operation=${operation}`);
+      expect(logged[0]).toContain('id=recipe-default');
+      expect(logged[0]).toContain(`confidence=${expected}`);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('merges the defaulted flag into the inline evidence record instead of adding a record', async () => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { ctx, submitted } = evolutionCtx();
+      const result = await handleKnowledge(
+        'manage',
+        {
+          operation: 'evolve',
+          id: 'recipe-inline',
+          data: { suggestedChanges: 'rename helper', evidence: [{ file: 'src/a.ts' }] },
+        },
+        ctx
+      );
+      expect(result.ok).toBe(true);
+      expect(submitted[0]?.evidence).toEqual([
+        { file: 'src/a.ts' },
+        { suggestedChanges: 'rename helper', confidenceDefaulted: true },
+      ]);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it.each([
+    ['data', { data: { confidence: 0.4 } }],
+    ['params', { confidence: 0.4 }],
+  ] as const)('does not flag or log a confidence supplied through %s', async (_label, extra) => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { ctx, submitted } = evolutionCtx();
+      const result = await handleKnowledge(
+        'manage',
+        { operation: 'evolve', id: 'recipe-explicit', ...extra },
+        ctx
+      );
+      expect(result.ok).toBe(true);
+      expect(submitted[0]?.confidence).toBe(0.4);
+      expect(submitted[0]?.evidence).toEqual([{ confidence: 0.4 }]);
+      expect(messages(info)).toEqual([]);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it.each([
+    ['a padded source string', 'metabolism ', '"metabolism "'],
+    ['an unknown source string', 'nightly-audit', '"nightly-audit"'],
+    ['a non-string source value', 42, '42'],
+  ] as const)('warns when the proposal source falls back from %s', async (_label, raw, rendered) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { ctx, submitted } = evolutionCtx({ evolutionProposalSource: raw });
+      const result = await handleKnowledge(
+        'manage',
+        { operation: 'deprecate', id: 'recipe-source', confidence: 0.85 },
+        ctx
+      );
+      expect(result.ok).toBe(true);
+      // 回落值不变：非法 source 仍按 alembic-agent 提交，只是不再静默。
+      expect(submitted[0]?.source).toBe('alembic-agent');
+      const logged = messages(warn);
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain(`raw=${rendered}`);
+      expect(logged[0]).toContain('fallback=alembic-agent');
+      expect(logged[0]).toContain('operation=deprecate');
+      expect(logged[0]).toContain('id=recipe-source');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    ['a legal source', { evolutionProposalSource: 'rescan-evolution' }, 'rescan-evolution'],
+    ['an unset source', {}, 'alembic-agent'],
+    ['a null source', { evolutionProposalSource: null }, 'alembic-agent'],
+    ['no shared state', undefined, 'alembic-agent'],
+  ] as const)('does not warn for %s', async (_label, sharedState, expected) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { ctx, submitted } = evolutionCtx(sharedState);
+      const result = await handleKnowledge(
+        'manage',
+        { operation: 'evolve', id: 'recipe-source', confidence: 0.5 },
+        ctx
+      );
+      expect(result.ok).toBe(true);
+      expect(submitted[0]?.source).toBe(expected);
+      expect(messages(warn)).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    'sync',
+    'async',
+  ])('still submits the proposal when the %s fallback logger fails', async (mode) => {
+    const logger = Logger.getInstance();
+    const originalInfo = logger.info;
+    const originalWarn = logger.warn;
+    let logCalls = 0;
+    // 日志只是观察者：日志实现抛错或返回 rejected Promise 都不能阻断真实提案写入。
+    const failing = () => {
+      logCalls++;
+      if (mode === 'async') {
+        return Promise.reject(new Error('fixture fallback logger failure'));
+      }
+      throw new Error('fixture fallback logger failure');
+    };
+    logger.info = failing;
+    logger.warn = failing;
+    try {
+      const { ctx, submit, submitted } = evolutionCtx({ evolutionProposalSource: 'metabolism ' });
+      const result = await handleKnowledge('manage', { operation: 'evolve', id: 'recipe' }, ctx);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(result.ok).toBe(true);
+      expect(submit).toHaveBeenCalledOnce();
+      expect(submitted[0]).toMatchObject({ source: 'alembic-agent', confidence: 0.9 });
+      expect(logCalls).toBe(2);
+    } finally {
+      logger.info = originalInfo;
+      logger.warn = originalWarn;
+    }
+  });
+});
+
 describe('graph and plan host outcomes', () => {
   function execute(
     ports: Partial<ToolContext>,
