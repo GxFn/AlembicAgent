@@ -163,6 +163,74 @@ describe('effective AI connection configuration', () => {
     }
   });
 
+  // 与上面的并发校验同口径：非法重试上限/熔断阈值由 ReliabilityController 统一拒绝。
+  // facade 与 Gateway 的控制器在首个请求时懒构造，因此在任何 HTTP 发出前以同一错误码拒绝；
+  // facade 不再把 circuitThreshold=0 静默改成 5（U06-F1 探针 d）。
+  it.each([
+    { field: 'maxRetries', value: 1.5 },
+    { field: 'maxRetries', value: Number.NaN },
+    { field: 'circuitThreshold', value: Number.NaN },
+    { field: 'circuitThreshold', value: 0 },
+  ] as const)('rejects invalid $field=$value before any provider request is dispatched', async ({
+    field,
+    value,
+  }) => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse({ choices: [{ index: 0, message: { content: 'unexpected' } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const option = field === 'maxRetries' ? { maxRetries: value } : { circuitThreshold: value };
+    const invalid = {
+      code: 'LLM_INVALID_REQUEST',
+      message: expect.stringContaining(field),
+    };
+    expect(() => new ReliabilityController(option)).toThrow(expect.objectContaining(invalid));
+    await expect(
+      new OpenAiProvider({ apiKey: 'fixture-key', ...option }).chat('ping')
+    ).rejects.toMatchObject(invalid);
+    await expect(
+      new LLMGateway({ providers: { openai: { apiKey: 'fixture-key' } }, ...option }).chat({
+        modelRef: 'openai:gpt-4o',
+        prompt: 'ping',
+      })
+    ).rejects.toMatchObject(invalid);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reports invalid reliability options by field and source only, even when logging fails', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ choices: [{ index: 0, message: { content: 'x' } }] }))
+    );
+    // 无 onLog 的直接构造落到 Core Logger；Gateway 经自身日志桥落到同一 Logger，标签为 provider。
+    expect(() => new ReliabilityController({ circuitThreshold: 0 })).toThrow(/circuitThreshold/);
+    await expect(
+      new LLMGateway({ providers: { openai: { apiKey: 'fixture-key' } }, maxRetries: -7 }).chat({
+        modelRef: 'openai:gpt-4o',
+        prompt: 'ping',
+      })
+    ).rejects.toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    expect(messages).toContain(
+      '[reliability] llm invalid_option field=circuitThreshold source=config; rejected before dispatch'
+    );
+    expect(messages).toContain(
+      '[reliability] openai invalid_option field=maxRetries source=config; rejected before dispatch'
+    );
+    expect(messages.some((message) => message.includes('-7'))).toBe(false);
+
+    warn.mockImplementation(() => {
+      throw new Error('fixture log failure');
+    });
+    expect(() => new ReliabilityController({ maxRetries: 1.5 })).toThrow(
+      expect.objectContaining({
+        code: 'LLM_INVALID_REQUEST',
+        message: expect.stringContaining('maxRetries'),
+      })
+    );
+  });
+
   it('validates environment concurrency and freezes a valid gateway limit at construction', async () => {
     vi.stubEnv('ALEMBIC_AI_MAX_CONCURRENCY', 'invalid');
     expect(() => new OpenAiProvider()).toThrow(/maxConcurrency/);

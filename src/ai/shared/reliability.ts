@@ -6,6 +6,7 @@
  * 熔断世代隔离旧请求的迟到结果；协议转换与 HTTP 期限仍由 Transport 负责。
  */
 
+import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { createLlmAbortError, throwIfLlmCancelled } from '../errors.js';
 import { resolveConcurrency } from './concurrency.js';
@@ -43,6 +44,32 @@ function makeCircuitOpenError(message: string): Error & { code: string } {
 
 const MAX_TIMER_MS = 2_147_483_647;
 
+/**
+ * 本地计算的指数退避上限（重试等待与 429 自适应冷却共用）。
+ * 大 maxRetries 下 baseDelay×2^attempt 会增长到按天计；服务端 Retry-After 是远端明确要求，不受此上限约束。
+ */
+const MAX_BACKOFF_MS = 60_000;
+
+/** 非法可靠性选项的来源：构造配置，或 run() 的单次入参。 */
+type ReliabilityOptionSource = 'config' | 'run-argument';
+
+/** 计数类选项（重试次数、熔断阈值）必须是不小于 min 的安全整数；其余值一律视为非法。 */
+function isSafeIntegerAtLeast(value: unknown, min: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+}
+
+/**
+ * 指数退避的本地部分：min(base × 2^attempt, 60s)。
+ * base=0 时直接为 0，避免 attempt 极大时 0 × Infinity 得到 NaN。
+ */
+function cappedBackoff(base: number, attempt: number): { ms: number; capped: boolean } {
+  if (base === 0) {
+    return { ms: 0, capped: false };
+  }
+  const raw = base * 2 ** attempt;
+  return raw > MAX_BACKOFF_MS ? { ms: MAX_BACKOFF_MS, capped: true } : { ms: raw, capped: false };
+}
+
 interface QueuedRequestSlot {
   resolve: () => void;
   reject: (err: Error) => void;
@@ -74,11 +101,42 @@ export class ReliabilityController {
   private probeOwner: symbol | null = null;
 
   constructor(opts: ReliabilityOptions = {}) {
-    this.maxRetries = opts.maxRetries ?? 3;
-    this.circuitThreshold = opts.circuitThreshold ?? 5;
-    this.maxConcurrency = resolveConcurrency(opts.maxConcurrency).value;
+    // 先确定日志通道与标签，非法配置的诊断才能带上 provider 标签。
     this.label = opts.label || 'llm';
     this.onLog = opts.onLog;
+    // 与 maxConcurrency 同口径：计数类配置在构造时校验，不把坏值带进重试循环或熔断计数。
+    // maxRetries 非整数曾把真实错误换成通用的 “unexpected retry exhaustion”，NaN 曾让 fn 一次都不执行；
+    // circuitThreshold=NaN 会让熔断永不打开，0 会让首次失败即熔断。
+    const maxRetries = opts.maxRetries ?? 3;
+    if (!isSafeIntegerAtLeast(maxRetries, 0)) {
+      this.rejectInvalidOption('maxRetries', 'config', 'must be a non-negative safe integer');
+    }
+    const circuitThreshold = opts.circuitThreshold ?? 5;
+    if (!isSafeIntegerAtLeast(circuitThreshold, 1)) {
+      this.rejectInvalidOption('circuitThreshold', 'config', 'must be a positive safe integer');
+    }
+    this.maxRetries = maxRetries;
+    this.circuitThreshold = circuitThreshold;
+    this.maxConcurrency = resolveConcurrency(opts.maxConcurrency).value;
+  }
+
+  /**
+   * 非法可靠性选项：先写一条只含字段名与来源的 warn（不写原值，配置可能被误填成敏感信息），
+   * 再抛 code=LLM_INVALID_REQUEST。有 onLog 时走控制器自身的日志通道（Gateway 会桥接到 Core Logger），
+   * 否则落到 Core Logger，保证诊断不丢也不重复。日志失败不改变错误分类。
+   */
+  private rejectInvalidOption(
+    field: string,
+    source: ReliabilityOptionSource,
+    requirement: string
+  ): never {
+    const message = `[reliability] ${this.label} invalid_option field=${field} source=${source}; rejected before dispatch`;
+    const onLog = this.onLog;
+    observeSafely(
+      () => (onLog ? onLog('warn', message) : Logger.getInstance().warn(message)),
+      () => undefined
+    );
+    throw Object.assign(new Error(`${field} ${requirement}`), { code: 'LLM_INVALID_REQUEST' });
   }
 
   private log(level: string, message: string): void {
@@ -315,8 +373,8 @@ export class ReliabilityController {
    * 在可靠性包裹下执行一次 LLM 调用。
    *
    * @param fn 实际的 Transport 调用
-   * @param retries 本次重试上限（默认控制器配置）
-   * @param baseDelay 退避基数毫秒（默认 2000）
+   * @param retries 本次重试上限（默认控制器配置）；须为 >=0 的安全整数，否则抛 LLM_INVALID_REQUEST
+   * @param baseDelay 退避基数毫秒（默认 2000）；须为有限非负数。指数退避的本地部分封顶 60s
    */
   async run<T>(
     fn: () => Promise<T>,
@@ -324,6 +382,13 @@ export class ReliabilityController {
     baseDelay = 2000,
     opts: ReliabilityRunOptions = {}
   ): Promise<T> {
+    // 单次入参与构造配置同口径校验：非法时在取槽、调用 fn 之前拒绝，不计入熔断。
+    if (!isSafeIntegerAtLeast(retries, 0)) {
+      this.rejectInvalidOption('retries', 'run-argument', 'must be a non-negative safe integer');
+    }
+    if (typeof baseDelay !== 'number' || !Number.isFinite(baseDelay) || baseDelay < 0) {
+      this.rejectInvalidOption('baseDelay', 'run-argument', 'must be a finite non-negative number');
+    }
     const abortSignal = opts.abortSignal || null;
     const owner = Symbol('reliability-request');
     try {
@@ -375,11 +440,19 @@ export class ReliabilityController {
                     : {}),
                 });
 
-          // 429：触发冷却窗，抑制并发重试风暴
+          // 429：触发冷却窗，抑制并发重试风暴。本地自适应部分封顶 60s（冷却窗按 provider 共享，
+          // 不封顶会把所有请求一起挡上按天计的时间）；服务端 Retry-After 更长时仍以它为准。
           if (status === 429) {
+            const local = cappedBackoff(baseDelay * 1.5, attempt);
+            if (local.capped) {
+              this.log(
+                'debug',
+                `[RateLimit] ${this.label} adaptive cooldown capped at ${MAX_BACKOFF_MS / 1000}s (attempt ${attempt + 1}); Retry-After still honored when longer`
+              );
+            }
             const adaptiveCooldown = Math.max(
               retryAfterMs,
-              Math.round(baseDelay * 2 ** attempt * 1.5 + Math.random() * 1000)
+              Math.round(local.ms + Math.random() * 1000)
             );
             this.setRateLimitWindow(adaptiveCooldown);
           }
@@ -412,10 +485,12 @@ export class ReliabilityController {
             throw e;
           }
 
-          delay = baseDelay * 2 ** attempt + Math.random() * 1000;
+          // 指数部分封顶 60s，抖动另加，保留并发请求错开重试的效果。
+          const backoff = cappedBackoff(baseDelay, attempt);
+          delay = backoff.ms + Math.random() * 1000;
           this.log(
             'info',
-            `[reliability] attempt ${attempt + 1} failed (${e.message}), retrying in ${Math.round(delay / 1000)}s…`
+            `[reliability] attempt ${attempt + 1} failed (${e.message}), retrying in ${Math.round(delay / 1000)}s${backoff.capped ? ` (backoff capped at ${MAX_BACKOFF_MS / 1000}s)` : ''}…`
           );
         } finally {
           this.releaseSlot();

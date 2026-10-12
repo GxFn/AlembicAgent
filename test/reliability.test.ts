@@ -693,3 +693,186 @@ describe('ReliabilityController retry & circuit breaker', () => {
     await expect(c.run(async () => 'next caller')).resolves.toBe('next caller');
   });
 });
+
+describe('ReliabilityController configuration validation', () => {
+  function captureLogs() {
+    const logs: Array<{ level: string; message: string }> = [];
+    const onLog = (level: string, message: string) => {
+      logs.push({ level, message });
+    };
+    return { logs, onLog };
+  }
+
+  // U06-F1 探针 (a)(b)：maxRetries=1.5 曾把真实 503 换成 “unexpected retry exhaustion”，
+  // NaN 曾让 fn 一次都不执行；现在构造时就以 LLM_INVALID_REQUEST 拒绝。
+  it.each([
+    1.5,
+    Number.NaN,
+    -1,
+    Number.POSITIVE_INFINITY,
+  ])('rejects maxRetries=%s at construction with a value-free warning', (maxRetries) => {
+    const { logs, onLog } = captureLogs();
+    expect(() => new ReliabilityController({ maxRetries, label: 'fixture', onLog })).toThrow(
+      expect.objectContaining({
+        code: 'LLM_INVALID_REQUEST',
+        message: 'maxRetries must be a non-negative safe integer',
+      })
+    );
+    // 只记字段名与来源，不记原值（配置可能被误填成敏感信息）。
+    expect(logs).toEqual([
+      {
+        level: 'warn',
+        message:
+          '[reliability] fixture invalid_option field=maxRetries source=config; rejected before dispatch',
+      },
+    ]);
+  });
+
+  // U06-F1 探针 (c)(d)：circuitThreshold=NaN 曾让熔断永不打开，0 曾让首次失败即熔断。
+  it.each([
+    Number.NaN,
+    0,
+    1.5,
+    -1,
+  ])('rejects circuitThreshold=%s at construction with a value-free warning', (circuitThreshold) => {
+    const { logs, onLog } = captureLogs();
+    expect(() => new ReliabilityController({ circuitThreshold, label: 'fixture', onLog })).toThrow(
+      expect.objectContaining({
+        code: 'LLM_INVALID_REQUEST',
+        message: 'circuitThreshold must be a positive safe integer',
+      })
+    );
+    expect(logs).toEqual([
+      {
+        level: 'warn',
+        message:
+          '[reliability] fixture invalid_option field=circuitThreshold source=config; rejected before dispatch',
+      },
+    ]);
+  });
+
+  it('keeps defaults and the inclusive boundaries of valid reliability options', () => {
+    const defaults = new ReliabilityController();
+    expect(defaults.maxRetries).toBe(3);
+    expect(defaults.circuitThreshold).toBe(5);
+    const boundary = new ReliabilityController({ maxRetries: 0, circuitThreshold: 1 });
+    expect(boundary.maxRetries).toBe(0);
+    expect(boundary.circuitThreshold).toBe(1);
+  });
+
+  it('surfaces the real 503 after the configured integer retries are exhausted', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const c = new ReliabilityController({ maxRetries: 1, circuitThreshold: 5 });
+    const execute = vi.fn(async () => {
+      throw serviceFailure(503);
+    });
+    const pending = c.run(execute, undefined, 1).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await pending;
+    expect(error).toMatchObject({ status: 503, message: 'fixture service failure' });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(c.circuitFailures).toBe(1);
+    expect(c.activeRequests).toBe(0);
+  });
+
+  it.each([
+    { retries: 1.5, baseDelay: 1, field: 'retries' },
+    { retries: Number.NaN, baseDelay: 1, field: 'retries' },
+    { retries: -1, baseDelay: 1, field: 'retries' },
+    { retries: 0, baseDelay: Number.NaN, field: 'baseDelay' },
+    { retries: 0, baseDelay: -1, field: 'baseDelay' },
+    { retries: 0, baseDelay: Number.POSITIVE_INFINITY, field: 'baseDelay' },
+  ])('rejects run(retries=$retries, baseDelay=$baseDelay) before dispatch', async ({
+    retries,
+    baseDelay,
+    field,
+  }) => {
+    const { logs, onLog } = captureLogs();
+    const c = new ReliabilityController({ maxRetries: 0, label: 'fixture', onLog });
+    const execute = vi.fn(async () => 'must not run');
+    await expect(c.run(execute, retries, baseDelay)).rejects.toMatchObject({
+      code: 'LLM_INVALID_REQUEST',
+      message: expect.stringContaining(field),
+    });
+    // 入参非法是调用方错误：不取槽、不调用 fn、不计熔断。
+    expect(execute).not.toHaveBeenCalled();
+    expect(c.activeRequests).toBe(0);
+    expect(c.circuitFailures).toBe(0);
+    expect(logs).toEqual([
+      {
+        level: 'warn',
+        message: `[reliability] fixture invalid_option field=${field} source=run-argument; rejected before dispatch`,
+      },
+    ]);
+  });
+
+  it('accepts zero retries and a zero backoff base as explicit run arguments', async () => {
+    const c = new ReliabilityController({ maxRetries: 3 });
+    const execute = vi.fn(async () => {
+      throw serviceFailure(503);
+    });
+    await expect(c.run(execute, 0, 0)).rejects.toMatchObject({ status: 503 });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it('caps the exponential retry backoff at 60 seconds and logs the cap', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const { logs, onLog } = captureLogs();
+    const c = new ReliabilityController({
+      maxRetries: 2,
+      circuitThreshold: 5,
+      label: 'fixture',
+      onLog,
+    });
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(serviceFailure(503))
+      .mockRejectedValueOnce(serviceFailure(503))
+      .mockResolvedValue('recovered');
+    const pending = c.run(execute, 2, 40_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(execute).toHaveBeenCalledTimes(1);
+    // 第 1 次退避：40s（未触顶）。
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(execute).toHaveBeenCalledTimes(2);
+    // 第 2 次退避：min(80s, 60s) = 60s。
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(execute).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(await pending).toBe('recovered');
+    const capped = logs.filter((entry) => entry.message.includes('backoff capped at 60s'));
+    expect(capped).toHaveLength(1);
+    expect(capped[0]?.message).toContain('attempt 2 failed');
+  });
+
+  it('caps the locally computed 429 cooldown at 60 seconds', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const { logs, onLog } = captureLogs();
+    const c = new ReliabilityController({
+      maxRetries: 1,
+      circuitThreshold: 5,
+      label: 'fixture',
+      onLog,
+    });
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(serviceFailure(429))
+      .mockResolvedValue('recovered');
+    // 本地自适应冷却 = min(50s × 1.5, 60s) = 60s；没有 Retry-After 时不再放大到 75s。
+    const pending = c.run(execute, 1, 50_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(execute).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(execute).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(await pending).toBe('recovered');
+    expect(
+      logs.some((entry) => entry.message.includes('[RateLimit] fixture adaptive cooldown capped'))
+    ).toBe(true);
+  });
+});

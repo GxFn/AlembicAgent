@@ -70,10 +70,10 @@ export class AiProvider {
     this.maxRetries = config.maxRetries ?? 3;
     this.name = 'abstract';
 
-    // The live circuit breaker now lives in the gateway's ReliabilityController;
-    // circuitThreshold/maxConcurrency are forwarded there (retry/circuit/
-    // concurrency all live in the gateway now).
-    this._circuitThreshold = config.circuitThreshold || 5;
+    // 熔断/重试/并发都在 Gateway 的 ReliabilityController 里生效；这里只转发配置。
+    // 与直接构造 Gateway 同口径用 `??`：0、NaN 等非法值不再被 `||` 静默改成 5，
+    // 而是交给控制器统一校验，在首个请求、任何 HTTP 发出前以 LLM_INVALID_REQUEST 拒绝。
+    this._circuitThreshold = config.circuitThreshold ?? 5;
 
     const concurrency = resolveConcurrency(config.maxConcurrency);
     this._maxConcurrency = concurrency.value;
