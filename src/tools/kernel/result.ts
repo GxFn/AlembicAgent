@@ -280,10 +280,32 @@ function arrayObjectPath(objectPath: ObjectPathState | null): ObjectPathState | 
   return { segments: objectPath.segments, insideArray: true };
 }
 
+/**
+ * 结果内容的来源与可信度标注（L4-P05 / I03 定义各字段语义；形状不变）。生产方必须按内容
+ * 真实来源填写，不能用一个常量覆盖所有结果；Agent 内的生产方是 ToolRouterAdapter 的 deriveTrust。
+ * 消费方据此决定是否隔离、脱敏或做提示注入防护时，要按下面的保守语义理解：
+ */
 export interface ToolResultTrust {
+  /**
+   * 内容的产出通道：'terminal' 是命令输出，'internal' 是 Agent 内置 handler 产出（含它读出的
+   * 仓库文件与知识库内容）。通道不等于可信，内容是否可当指令看 containsUntrustedText。
+   */
   source: 'internal' | 'terminal' | 'mcp' | 'skill' | 'macos' | 'user';
+  /**
+   * true 只表示结果内容确实经过了清洗步骤；没有清洗步骤时必须为 false。JSON 安全化（循环、
+   * BigInt、accessor 等的替换）与按字段名删除私有字段都不算内容清洗。
+   */
   sanitized: boolean;
+  /**
+   * true 表示内容可能含非 Agent 自写的文本（仓库文件、命令输出、知识库内容、回显模型参数或
+   * 宿主异常的失败文案），只能当数据处理，不能当指令执行。失败结果一律为 true。
+   */
   containsUntrustedText: boolean;
+  /**
+   * false 表示“未检测到”，不代表已证明不含密钥：当前生产方没有任何密钥检测步骤，命令输出、
+   * 仓库文件里打印出的密钥不会让它变为 true。需要密钥保证的消费方必须自行检测或脱敏；
+   * true 才是确定信号（检测到密钥）。
+   */
   containsSecrets: boolean;
 }
 

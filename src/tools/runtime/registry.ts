@@ -14,6 +14,9 @@
  *   - agent/runtime/toolPipeline/phaseGates.ts：Evolution、record repair、Analyst VERIFY、Producer
  *     等阶段的动作集合；新动作若需要直呼别名（如 note_finding → memory.note_finding），
  *     还要改同目录的 callNormalization.ts；
+ *   - adapter/ToolRouterAdapter.ts：信封 trust 的来源派生表（TOOL_RESULT_SOURCES、
+ *     UNTRUSTED_SUCCESS_SCOPES）；返回仓库文件、命令输出或知识库内容的新工具/动作要登记，
+ *     否则其成功结果会被标成 Agent 自写的可信文本（L4-P05）；
  *   - test/：可用性、schema 投影、阶段策略与 handler 的对应用例。
  */
 

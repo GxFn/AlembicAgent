@@ -123,12 +123,66 @@ function adapterFailureWarning(
   return warning;
 }
 
-const DEFAULT_TRUST: ToolResultTrust = {
-  source: 'internal',
-  sanitized: true,
-  containsUntrustedText: false,
-  containsSecrets: false,
-};
+/*
+ * envelope trust 按工具/动作来源派生（L4-P05 / I03）。
+ *
+ * 旧实现对所有结果使用常量 { source:'internal', sanitized:true, containsUntrustedText:!ok,
+ * containsSecrets:false }：code.read 读到的仓库文件（可能含提示注入）、terminal.exec 的命令输出
+ * （可能打印出 .env 里的密钥）、knowledge.* 的知识库内容都被声明成“内部、已清洗、不含不可信
+ * 文本”，语义正好颠倒。宿主与本仓目前没有按 trust 分支的消费者，但字段经 /agent/tool 对宿主
+ * 可见，下一个按 trust 做隔离/脱敏的消费者会被误导，所以按来源派生，规则如下（决策 P05）：
+ *
+ * - source：只按工具登记（与动作无关，适配层错误信封在解析出动作前也能给出同一来源）。
+ *   terminal.* 的内容来自命令输出，记 'terminal'；其余工具由 Agent 内置 handler 产出，记
+ *   'internal'——它描述产出通道，不代表内容可信，可信与否看 containsUntrustedText。
+ * - containsUntrustedText：失败结果一律 true（错误文本会回显模型给出的工具名/参数、宿主异常文案
+ *   或部分命令输出）；成功结果命中 UNTRUSTED_SUCCESS_SCOPES（返回仓库文件、命令输出或知识库
+ *   内容）时为 true，其余 Agent 自写的结果（memory.save、meta.tools 等）为 false。
+ * - sanitized：只有确实对结果内容做过清洗才能为 true。本 adapter 与当前 handler 都没有内容清洗
+ *   步骤：normalizeToolResultContent 只做 JSON 安全化（循环、BigInt、accessor 等），不删除也不
+ *   改写文本；D23 私有字段清理发生在下游 runtimeBridge/AgentTaskHandlers，且只按字段名删除。
+ *   所以这里恒为 false；将来加入真实清洗步骤时，由该步骤在自己的结果上显式置 true。
+ * - containsSecrets：没有任何密钥检测，false 只表示“未检测到”，不代表已证明无密钥（定义见
+ *   kernel/result.ts 的 ToolResultTrust）。
+ *
+ * 查表只用 Map/Set 的自有条目：工具名来自模型输出，constructor/__proto__ 之类名字不能命中
+ * 原型属性。新增返回仓库、命令或知识库文本的工具/动作要在这里登记（registry.ts 文件头列出了
+ * 这一处硬编码位置）。派生结果写在每个信封自己的 trust 上，这就是该分类的可观察诊断面；未命中
+ * 表不是降级或 fallback 路径，而是 Agent 自写结果的既定分类，因此不另打日志。
+ */
+
+/** 按工具登记的内容来源；未登记的工具由 Agent 内置 handler 产出，记 'internal'。 */
+const TOOL_RESULT_SOURCES: ReadonlyMap<string, ToolResultTrust['source']> = new Map([
+  ['terminal', 'terminal'],
+]);
+
+/**
+ * 成功结果携带外部文本（仓库文件、命令输出、知识库内容）的范围：条目是整个工具名，或
+ * “工具.动作”。code.structure/write 不在此列（决策 P05 只登记 read/search/outline）。
+ */
+const UNTRUSTED_SUCCESS_SCOPES: ReadonlySet<string> = new Set([
+  'terminal',
+  'knowledge',
+  'code.read',
+  'code.search',
+  'code.outline',
+]);
+
+/**
+ * 为一次调用派生 trust。每次返回新对象：调用方可以就地修改自己拿到的信封，不能影响其他调用。
+ * action 未知（解析前失败、适配层异常）时只影响成功分支的判定，失败结果本来就记为不可信。
+ */
+function deriveTrust(toolId: string, action: string | undefined, ok: boolean): ToolResultTrust {
+  const successCarriesExternalText =
+    UNTRUSTED_SUCCESS_SCOPES.has(toolId) ||
+    (action !== undefined && UNTRUSTED_SUCCESS_SCOPES.has(`${toolId}.${action}`));
+  return {
+    source: TOOL_RESULT_SOURCES.get(toolId) ?? 'internal',
+    sanitized: false,
+    containsUntrustedText: !ok || successCarriesExternalText,
+    containsSecrets: false,
+  };
+}
 
 /**
  * Lift the handler-set degrade/fallback meta onto the per-call envelope diagnostics.
@@ -219,6 +273,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
         return this.#toEnvelope(
           toolAdmissionFailure(parsed, decision),
           request.toolId,
+          parsed.action,
           callId,
           startedAt,
           elapsedMs(t0)
@@ -249,6 +304,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
       const envelope = this.#toEnvelope(
         result,
         request.toolId,
+        parsed.action,
         callId,
         startedAt,
         durationMs,
@@ -321,6 +377,7 @@ export class ToolRouterAdapter implements ToolRouterContract {
   #toEnvelope(
     result: ToolResult,
     toolId: string,
+    action: string,
     callId: string,
     startedAt: string,
     durationMs: number,
@@ -340,7 +397,8 @@ export class ToolRouterAdapter implements ToolRouterContract {
         policy: cachePolicy,
       },
       diagnostics: diagnosticsFromResult(result, toolId),
-      trust: { ...DEFAULT_TRUST, containsUntrustedText: !result.ok },
+      // 按工具/动作来源派生（见 deriveTrust）；失败结果始终不可信。
+      trust: deriveTrust(toolId, action, result.ok),
     };
     // 先保留 handler 的执行真值，再单独做 JSON 安全化。宿主已写成功后的循环/BigInt/
     // getter 等不能使 JSON.stringify 抛出并落入 execute 的失败分支，更不能重试写入。
@@ -400,7 +458,9 @@ export class ToolRouterAdapter implements ToolRouterContract {
       status: 'error',
       text: error,
       diagnostics: { ...emptyDiagnostics(), warnings },
-      trust: { ...DEFAULT_TRUST },
+      // 适配层错误信封（解析失败、取消、宿主上下文/能力查询或适配步骤抛错）都是失败结果：
+      // 文本可能回显模型给出的工具名与参数或宿主异常文案，按不可信处理；来源仍按工具登记。
+      trust: deriveTrust(toolId, undefined, false),
     };
   }
 }
