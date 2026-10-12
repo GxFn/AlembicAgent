@@ -227,11 +227,15 @@
         "src/tools/runtime/handlers/knowledge/input.ts"
       ],
       "src/tools/runtime/handlers/knowledge/sources.ts": [
-        "node:fs",
         "node:path",
         "@alembic/core/logging",
-        "src/shared/projectPath.ts",
-        "src/tools/runtime/handlers/recipeAuthoringGate.ts"
+        "src/tools/runtime/handlers/recipeAuthoringGate.ts",
+        "src/tools/runtime/handlers/knowledge/sourceRange.ts"
+      ],
+      "src/tools/runtime/handlers/knowledge/sourceRange.ts": [
+        "node:fs",
+        "node:path",
+        "src/shared/projectPath.ts"
       ],
       "src/tools/runtime/handlers/knowledge/queries.ts": [
         "src/tools/kernel/knowledge.ts",

@@ -107,8 +107,22 @@ describe('tools/runtime comments describe current facts (L4-P1)', () => {
     expect(resolverDoc).toContain('符号链接');
     expect(resolverDoc).toContain('resolveProjectPath');
 
-    // 事实核对：resolver 确实额外调用 resolveProjectPath；知识写入确实走 createOrStage。
-    expect(text).toMatch(/absolutePath = resolveProjectPath\(projectRoot, sourcePath\)\.absolute/);
+    // 事实核对（L4-P22）：resolver 经共享读取模块 sourceRange 取行，符号链接越界判定由该模块
+    // 调用 resolveProjectPath 完成；三处消费方都从同一模块读取，不再各自切行。
+    expect(text).toMatch(/from '\.\/knowledge\/sourceRange\.js'/);
+    expect(text).toMatch(/readSourceRange\(projectRoot, \{/);
+    expect(text).not.toMatch(/readFileSync/);
+    const sourceRange = readSource('src/tools/runtime/handlers/knowledge/sourceRange.ts');
+    expect(sourceRange).toMatch(/resolveProjectPath\(projectRoot, relative\)/);
+    expect(sourceRange).toMatch(/content\.split\(\/\\r\?\\n\/\)/);
+    for (const consumer of [
+      'src/tools/runtime/handlers/recipeProductionAdapter.ts',
+      'src/tools/runtime/handlers/knowledge/sources.ts',
+    ]) {
+      const consumerText = readSource(consumer);
+      expect(consumerText).toMatch(/sourceRange\.js'/);
+      expect(consumerText).not.toMatch(/readFileSync|realpathSync|\.split\('\\n'\)/);
+    }
     const submission = readSource('src/tools/runtime/handlers/knowledge/submission.ts');
     expect(submission).toMatch(/gateway\.createOrStage\(/);
   });

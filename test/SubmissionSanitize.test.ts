@@ -8,6 +8,10 @@ import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import type { EvidenceLedgerLike } from '../src/tools/kernel/context.js';
+import {
+  buildSnippetRepairHint,
+  collectSnippetHintCandidates,
+} from '../src/tools/runtime/handlers/knowledge/sources.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import {
   buildEvidenceCandidatesHint,
@@ -1042,6 +1046,109 @@ describe('L4-P19 I34：file-only 条目只有 code.search 派生命中行标签'
     expect(out.ok).toBe(true);
     if (out.ok) {
       expect(out.expandedSources).toEqual(['lib/a.ts']);
+    }
+  });
+});
+
+/**
+ * L4-P22 / I25（U18-F7）：F4b 修复提示按门禁违规挑引用。行号类违规只描述违规引用本身（路径与文件
+ * 实际行数），绝不展示另一条无关引用的代码；SNIPPET_MISMATCH 才展示已声明的可读范围，候选取
+ * sourceRefs ∪ reasoning.sources。读取统一走 sourceRange 单源（CRLF 去 '\r'、末尾换行不计行）。
+ */
+describe('L4-P22 F4b 修复提示按违规引用取片段', () => {
+  function hintProject() {
+    const root = createTempProject('snippet-hint-p22-');
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'src/a.ts'),
+      Array.from({ length: 20 }, (_, i) => `export const a${i + 1} = ${i + 1};`).join('\n'),
+      'utf8'
+    );
+    fs.writeFileSync(path.join(root, 'src/b.ts'), 'b1\r\nb2\r\nb3\r\n', 'utf8');
+    return root;
+  }
+
+  test('行号越界违规只列违规路径与实际行数，不展示第一条无关引用的代码', () => {
+    const root = hintProject();
+    const hint = buildSnippetRepairHint(['src/a.ts:5-9', 'src/b.ts:900-910'], root, [
+      {
+        code: 'SOURCE_REF_LINE_OUT_OF_RANGE',
+        sourceRef: 'src/b.ts:900-910',
+        path: 'src/b.ts',
+      },
+    ]);
+    expect(hint).toContain('src/b.ts:900-910');
+    expect(hint).toContain('实际 3 行');
+    expect(hint).not.toContain('export const a5');
+    expect(hint).not.toContain('src/a.ts:5-9');
+  });
+
+  test('缺行号违规列出文件实际行数而不猜范围', () => {
+    const root = hintProject();
+    const hint = buildSnippetRepairHint(['src/a.ts:5-9', 'src/a.ts'], root, [
+      { code: 'SOURCE_REF_LINE_MISSING', sourceRef: 'src/a.ts' },
+    ]);
+    expect(hint).toContain('src/a.ts');
+    expect(hint).toContain('实际 20 行');
+    expect(hint).not.toContain('export const a5');
+  });
+
+  test('SNIPPET_MISMATCH 展示首个可读声明范围（单行引用只取该行，最长 12 行），CRLF 不残留回车', () => {
+    const root = hintProject();
+    const single = buildSnippetRepairHint(['src/a.ts:5'], root, [{ code: 'SNIPPET_MISMATCH' }]);
+    expect(single).toContain('src/a.ts:5-5');
+    expect(single).toContain('export const a5 = 5;');
+    expect(single).not.toContain('export const a6');
+
+    const long = buildSnippetRepairHint(['src/a.ts:1-20'], root, [{ code: 'SNIPPET_MISMATCH' }]);
+    expect(long).toContain('src/a.ts:1-12');
+    expect(long).toContain('export const a12 = 12;');
+    expect(long).not.toContain('export const a13');
+
+    const crlf = buildSnippetRepairHint(['src/b.ts:1-3'], root, [{ code: 'SNIPPET_MISMATCH' }]);
+    expect(crlf).toContain('b1\nb2\nb3');
+    expect(crlf).not.toContain('\r');
+  });
+
+  test('SNIPPET_MISMATCH 与越界同时出现：片段取可读范围，越界引用另列行数', () => {
+    const root = hintProject();
+    const hint = buildSnippetRepairHint(['src/b.ts:900-910', 'src/a.ts:2-3'], root, [
+      { code: 'SOURCE_REF_LINE_OUT_OF_RANGE', sourceRef: 'src/b.ts:900-910', path: 'src/b.ts' },
+      { code: 'SNIPPET_MISMATCH' },
+    ]);
+    expect(hint).toContain('src/a.ts:2-3');
+    expect(hint).toContain('export const a2 = 2;');
+    expect(hint).toContain('src/b.ts:900-910');
+    expect(hint).toContain('实际 3 行');
+  });
+
+  test('候选集合取 sourceRefs ∪ reasoning.sources，去重并保持声明顺序', () => {
+    expect(
+      collectSnippetHintCandidates({
+        sourceRefs: ['src/a.ts:1-2', ' src/b.ts:1-2 ', 3],
+        reasoning: { sources: ['src/b.ts:1-2', 'docs/x.md:1-4', null] },
+      })
+    ).toEqual(['src/a.ts:1-2', 'src/b.ts:1-2', 'docs/x.md:1-4']);
+    expect(collectSnippetHintCandidates({ reasoning: 'not-a-record' })).toEqual([]);
+  });
+
+  test('跳过的候选各留一条带原因的 debug 诊断，不含文件内容', () => {
+    const root = hintProject();
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      const hint = buildSnippetRepairHint(['src/missing.ts:1-2', 'src/a.ts:2-3'], root, [
+        { code: 'SNIPPET_MISMATCH' },
+      ]);
+      expect(hint).toContain('src/a.ts:2-3');
+      const messages = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('[knowledge.submit]'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain('src/missing.ts:1-2');
+      expect(messages[0]).toContain('not-found');
+    } finally {
+      debug.mockRestore();
     }
   });
 });

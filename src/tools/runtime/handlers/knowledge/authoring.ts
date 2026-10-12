@@ -31,6 +31,7 @@ import {
 } from './sessionState.js';
 import {
   buildSnippetRepairHint,
+  collectSnippetHintCandidates,
   evaluatePreparedItem,
   normalizeBareSourceRefs,
 } from './sources.js';
@@ -358,6 +359,15 @@ export async function prepareSubmission(
   let effectiveItem: Record<string, unknown> = bareNormalized.item;
   let preparedProduction = prepareRecipeProductionItem(effectiveItem, ctx.projectRoot);
   effectiveItem = preparedProduction.item as Record<string, unknown>;
+  // I24：adapter 排除的 profile 证据引用不再静默——门禁对超过 160 行、只含空白等引用没有对应
+  // 违规，提交会“成功”但事实接地到发布阶段才失败，这里逐条记录引用、原因与细节。只在首次
+  // prepare 后记录：风格修复只改写风格字段，不改来源，重复记录同一批引用没有新信息。
+  const droppedProfileEvidence = preparedProduction.profileEvidence.rejected;
+  if (droppedProfileEvidence.length > 0) {
+    Logger.getInstance().warn(
+      `[knowledge.submit] profile evidence refs dropped for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${droppedProfileEvidence.map((entry) => `${entry.ref} [${entry.reason}: ${entry.detail}]`).join('; ')}; excluded from retrievalProfile.provenance.evidenceRefs and coreCode admission (profile evidence ranges are limited to 160 lines), facts citing them will fail Core readiness as fact-ungrounded`
+    );
+  }
   if (!preparedProduction.codeEvidence.accepted) {
     bumpSubmitRepairStat(ctx.runtime, 'unsafe_core_code_removed');
     Logger.getInstance().warn(
@@ -514,14 +524,19 @@ export async function prepareSubmission(
   }
   if (gateViolations.length > 0) {
     const detail = formatRecipeAuthoringViolations(gateViolations);
-    // F4b 诊断反馈：代码/引用类违规可附一个真实 bounded range，帮助模型判断引用是否相关。
+    // F4b 诊断反馈：按违规挑引用——行号类违规只列违规引用与文件实际行数，SNIPPET_MISMATCH 才从
+    // sourceRefs ∪ reasoning.sources 中展示一个真实 bounded range（L4-P22 / U18-F7）。
     // 提示不会修改候选，也不会把首个来源、无界范围或整文件自动提升为 coreCode。
     const snippetRepair = gateViolations.some((v) =>
       ['SNIPPET_MISMATCH', 'SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING'].includes(
         v.code
       )
     )
-      ? buildSnippetRepairHint(effectiveItem.sourceRefs, ctx.projectRoot)
+      ? buildSnippetRepairHint(
+          collectSnippetHintCandidates(effectiveItem),
+          ctx.projectRoot,
+          gateViolations
+        )
       : '';
     // E5/E6-F1 反馈增强：INSUFFICIENT_EVIDENCE 与 SOURCE_REF_NOT_FOUND 都附台账内真实
     // 可引用的 distinct 文件——E6 真机显示 NOT_FOUND 全部来自 producer 手写路径

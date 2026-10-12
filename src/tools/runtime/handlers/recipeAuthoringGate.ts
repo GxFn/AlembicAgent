@@ -24,22 +24,21 @@
  *
  * §C.11 端口边界：Core domain spec 保持纯（零 node:fs / node:path），把两处运行时耦合留给宿主注入。
  * 在 in-process 路径里：
- *   - sourceRefResolver：由本模块用 node:fs / node:path 实现，以 AlembicPlugin 的
+ *   - sourceRefResolver：由本模块经共享读取模块 knowledge/sourceRange 实现（L4-P22：门禁、production
+ *     adapter 与 F4b 修复提示共用同一份“引用 → 真实行”结论），以 AlembicPlugin 的
  *     createSourceRefResolver 为基线保持相同的分支顺序、违规码与文案，并在其之上多一道符号链接
- *     越界判定（详见 createInProcessSourceRefResolver），二者不是逐字节一致；
+ *     越界判定、统一行语义（详见 createInProcessSourceRefResolver），二者不是逐字节一致；
  *   - sessionScope：in-process **不注入** —— 与 P1-Plugin「session-scope 留 host 侧前置」的决策一致；
  *     opportunistic 本就关闭 session-scope，故无冲突；cold-start in-process 也只做 fs 接地，不做
  *     session 作用域（in-process 无 bootstrap session 对象可校验）。
  */
-import fs from 'node:fs';
-import path from 'node:path';
 import {
   type RecipeAuthoringViolation,
   type RecipeSourceRefResolver,
   resolveAuthoringProfile,
   validateAgainst,
 } from '@alembic/core/knowledge';
-import { resolveProjectPath } from '#shared/projectPath.js';
+import { readSourceRange } from './knowledge/sourceRange.js';
 
 /**
  * in-process fs 来源接地端口。以 AlembicPlugin recipe-evidence-gate 的 §C.11 resolver 为基线：
@@ -47,10 +46,16 @@ import { resolveProjectPath } from '#shared/projectPath.js';
  * 产出相同的 SOURCE_REF_INVALID / SOURCE_REF_NOT_FOUND / SOURCE_REF_LINE_OUT_OF_RANGE，或同样的
  * `{ rangeText, sourcePath }`，供 Core 纯 snippet / floor 谓词消费（两路打平的接地一致性基础）。
  *
- * 与 Plugin 版的有意差异（不是漂移，不得为“逐字节一致”而回退）：文件存在后再经
- * resolveProjectPath 做符号链接越界判定——项目内的符号链接指向项目根之外时，按
- * SOURCE_REF_INVALID（resolves outside）拒绝，而不是读取根外文件；通过时 evidence.filePath
- * 是解析后的真实路径（realpath），sourcePath 仍是模型引用的仓库相对路径。
+ * 读取本身委托 knowledge/sourceRange 的 readSourceRange（单源），本函数只把它的拒绝原因映射为
+ * Core 违规码与文案。与 Plugin 版的有意差异（不是漂移，不得为“逐字节一致”而回退）：
+ *   - 文件存在后再经 resolveProjectPath 做符号链接越界判定——项目内的符号链接指向项目根之外时，
+ *     按 SOURCE_REF_INVALID（resolves outside）拒绝，而不是读取根外文件；通过时 evidence.filePath
+ *     是解析后的真实路径（realpath），sourcePath 仍是模型引用的仓库相对路径；
+ *   - 行按 /\r?\n/ 切分且以换行结尾的文件不计额外空行（L4-P22 决策）：`path:N+1`（N 为最后一行）
+ *     判 SOURCE_REF_LINE_OUT_OF_RANGE，与 production adapter、code.read 的行数口径一致；Plugin 版
+ *     仍把末尾空串算作一行。
+ *   - 文件存在却读取失败（EACCES、竞态删除）时 Core 没有对应违规码：沿用此前语义抛出 Error，由
+ *     knowledge.submit 的异常分支记录 warn 并拒绝，而不是伪装成 NOT_FOUND 误导模型。
  */
 export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
   return ({
@@ -62,95 +67,72 @@ export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
     itemIndex,
     title,
   }) => {
-    const sourcePath = path.posix.normalize(rawPath.replaceAll('\\', '/'));
-    if (path.isAbsolute(sourcePath) || sourcePath.startsWith('..')) {
+    const range = readSourceRange(projectRoot, { path: rawPath, start: startLine, end: endLine });
+    if (range.ok) {
       return {
-        violation: {
-          code: 'SOURCE_REF_INVALID',
-          itemIndex,
-          sourceRef,
-          title,
-          message: 'Source ref must stay inside the project source root.',
-          nextAction: 'Use a repo-relative source path under the current project.',
+        evidence: {
+          filePath: range.realFile,
+          raw: sourceRef,
+          rangeText: range.lines.join('\n'),
+          sourcePath: range.relative,
         },
       };
     }
-
-    let absolutePath = path.resolve(projectRoot, sourcePath);
-    if (!isInsideRoot(projectRoot, absolutePath)) {
-      return {
-        violation: {
-          code: 'SOURCE_REF_INVALID',
-          itemIndex,
-          path: sourcePath,
-          sourceRef,
-          title,
-          message: 'Source ref resolves outside the project source root.',
-          nextAction: 'Use a source path under the current project root.',
-        },
-      };
+    const sourcePath = range.relative;
+    switch (range.reason) {
+      case 'path-invalid':
+        return {
+          violation: {
+            code: 'SOURCE_REF_INVALID',
+            itemIndex,
+            sourceRef,
+            title,
+            message: 'Source ref must stay inside the project source root.',
+            nextAction: 'Use a repo-relative source path under the current project.',
+          },
+        };
+      case 'outside-root':
+      case 'symlink-escape':
+        // 词法越界与符号链接越界对模型是同一修复动作，沿用同一违规码与文案。
+        return {
+          violation: {
+            code: 'SOURCE_REF_INVALID',
+            itemIndex,
+            path: sourcePath,
+            sourceRef,
+            title,
+            message: 'Source ref resolves outside the project source root.',
+            nextAction: 'Use a source path under the current project root.',
+          },
+        };
+      case 'not-found':
+        return {
+          violation: {
+            code: 'SOURCE_REF_NOT_FOUND',
+            itemIndex,
+            path: sourcePath,
+            sourceRef,
+            title,
+            message: 'Source ref file does not exist.',
+            nextAction: 'Check the repo-relative path and cite an existing source file.',
+          },
+        };
+      case 'line-out-of-range':
+        return {
+          violation: {
+            code: 'SOURCE_REF_LINE_OUT_OF_RANGE',
+            itemIndex,
+            path: sourcePath,
+            sourceRef,
+            title,
+            message: 'Source ref line range is outside the file.',
+            nextAction: 'Use a valid line range from the current source file.',
+          },
+        };
+      case 'read-error':
+        throw new Error(`Source ref ${sourceRef} could not be read: ${range.detail}`);
     }
-    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
-      return {
-        violation: {
-          code: 'SOURCE_REF_NOT_FOUND',
-          itemIndex,
-          path: sourcePath,
-          sourceRef,
-          title,
-          message: 'Source ref file does not exist.',
-          nextAction: 'Check the repo-relative path and cite an existing source file.',
-        },
-      };
-    }
-    try {
-      absolutePath = resolveProjectPath(projectRoot, sourcePath).absolute;
-    } catch {
-      return {
-        violation: {
-          code: 'SOURCE_REF_INVALID',
-          itemIndex,
-          sourceRef,
-          title,
-          path: sourcePath,
-          message: 'Source ref resolves outside the project source root.',
-          nextAction: 'Use a source path under the current project root.',
-        },
-      };
-    }
-    const lines = fs.readFileSync(absolutePath, 'utf8').split(/\r?\n/);
-    if (startLine < 1 || endLine < startLine || endLine > lines.length) {
-      return {
-        violation: {
-          code: 'SOURCE_REF_LINE_OUT_OF_RANGE',
-          itemIndex,
-          path: sourcePath,
-          sourceRef,
-          title,
-          message: 'Source ref line range is outside the file.',
-          nextAction: 'Use a valid line range from the current source file.',
-        },
-      };
-    }
-
-    return {
-      evidence: {
-        filePath: absolutePath,
-        raw: sourceRef,
-        rangeText: lines.slice(startLine - 1, endLine).join('\n'),
-        sourcePath,
-      },
-    };
   };
-}
-
-/**
- * 与 AlembicPlugin recipe-evidence-gate 的 isInsideRoot 同实现：按词法判定 target 是否在 root 内
- * （含 root 自身）。它不解析符号链接，符号链接越界由 resolver 里的 resolveProjectPath 另行判定。
- */
-function isInsideRoot(root: string, target: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(target));
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 /**

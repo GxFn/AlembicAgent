@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   computeRecipeSourceContentHash,
   DivergenceError,
+  evaluateRecipeRetrievalReadiness,
   KnowledgeRepositoryImpl,
   type ProducerContext,
   projectRecipeRetrievalDocumentSet,
@@ -23,9 +24,11 @@ import { describe, expect, test, vi } from 'vitest';
 import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
 import { buildSubmissionInput } from '../src/tools/runtime/handlers/knowledge/input.js';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
+import { createInProcessSourceRefResolver } from '../src/tools/runtime/handlers/recipeAuthoringGate.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
 import { validateToolParameters } from '../src/tools/runtime/parameters.js';
+import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../src/tools/runtime/recipeProductionContract.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -2805,6 +2808,288 @@ describe('knowledge submit outcome mapping', () => {
     } finally {
       log.restore();
       fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * L4-P22（I24 / I25）：门禁 resolver、production adapter 与 F4b 修复提示共用 sourceRange 单源读取。
+ * - CRLF 文件的多行 coreCode 在 adapter 中判 bounded-match，与门禁结论一致；
+ * - 以换行结尾文件的 `path:N+1` 在门禁与 adapter 中都越界；
+ * - provenance.evidenceRefs 写声明原文，单行、'./' 前缀与反斜杠引用的事实能通过 Core readiness；
+ * - 被 adapter 排除的引用带原因返回，authoring 以 warn 记录（含 160 行上限）。
+ */
+describe('L4-P22 bounded source reads share one implementation', () => {
+  function gateResolve(projectRoot: string, sourceRef: string) {
+    const match = /^(.+?):(\d+)(?:-(\d+))?$/.exec(sourceRef);
+    if (!match) {
+      throw new Error(`fixture ref is not bounded: ${sourceRef}`);
+    }
+    return createInProcessSourceRefResolver()({
+      projectRoot,
+      sourcePath: match[1],
+      startLine: Number(match[2]),
+      endLine: Number(match[3] ?? match[2]),
+      sourceRef,
+      itemIndex: 0,
+      title: 'fixture',
+    });
+  }
+
+  test('a CRLF multi-line coreCode is a bounded match in the adapter and in the gate', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/crlf.ts'),
+      '// header\r\nconst a = 1;\r\nconst b = 2;\r\n// footer\r\n'
+    );
+    const coreCode = 'const a = 1;\nconst b = 2;';
+    const prepared = prepareRecipeProductionItem(
+      {
+        coreCode,
+        reasoning: { sources: ['src/crlf.ts:2-3'] },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+    expect(prepared.codeEvidence).toEqual({
+      accepted: true,
+      reason: 'bounded-match',
+      provenanceRef: 'src/crlf.ts:2-3',
+    });
+    expect(prepared.item.coreCode).toBe(coreCode);
+    expect(prepared.profileEvidence.rejected).toEqual([]);
+    expect(gateResolve(projectRoot, 'src/crlf.ts:2-3')).toMatchObject({
+      evidence: { rangeText: coreCode, sourcePath: 'src/crlf.ts' },
+    });
+  });
+
+  test('path:N+1 of a newline-terminated file is out of range in both the gate and the adapter', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/nl.ts'),
+      'export const one = 1;\nexport const two = 2;\n'
+    );
+
+    expect(gateResolve(projectRoot, 'src/nl.ts:3')).toMatchObject({
+      violation: { code: 'SOURCE_REF_LINE_OUT_OF_RANGE', path: 'src/nl.ts' },
+    });
+    expect(gateResolve(projectRoot, 'src/nl.ts:2-3')).toMatchObject({
+      violation: { code: 'SOURCE_REF_LINE_OUT_OF_RANGE' },
+    });
+    expect(gateResolve(projectRoot, 'src/nl.ts:2')).toMatchObject({
+      evidence: { rangeText: 'export const two = 2;' },
+    });
+
+    const prepared = prepareRecipeProductionItem(
+      {
+        reasoning: { sources: ['src/nl.ts:3', 'src/nl.ts:2'] },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+    expect(prepared.item.retrievalProfile?.provenance.evidenceRefs).toEqual(['src/nl.ts:2']);
+    expect(prepared.profileEvidence.rejected).toEqual([
+      expect.objectContaining({ ref: 'src/nl.ts:3', reason: 'line-out-of-range' }),
+    ]);
+  });
+
+  test('declared single-line, ./-prefixed and backslash refs ground facts for Core readiness', () => {
+    const projectRoot = makeProject();
+    const profile = authoredProfile();
+    profile.concepts[0].provenanceRefs = ['src/a.ts:2'];
+    profile.scenarios[0].provenanceRefs = ['./src/a.ts:2-3'];
+    profile.exclusions[0].provenanceRefs = ['src\\a.ts:3'];
+    profile.provenance.sourceFieldRefs = ['field:description'];
+    const declared = ['src/a.ts:2', './src/a.ts:2-3', 'src\\a.ts:3'];
+    const prepared = prepareRecipeProductionItem(
+      directProductionParams({
+        reasoning: { sources: declared },
+        retrievalProfile: profile,
+      }),
+      projectRoot
+    );
+
+    // evidenceRefs 写声明原文；规范 ref 只出现在 codeEvidence.provenanceRef。
+    expect([...(prepared.item.retrievalProfile?.provenance.evidenceRefs ?? [])].sort()).toEqual(
+      [...declared].sort()
+    );
+    expect(prepared.codeEvidence).toEqual({
+      accepted: true,
+      reason: 'bounded-match',
+      provenanceRef: 'src/a.ts:2-3',
+    });
+    expect(prepared.profileEvidence.rejected).toEqual([]);
+
+    const readiness = evaluateRecipeRetrievalReadiness(prepared.item as never);
+    expect(readiness.violations.map((violation) => violation.code)).not.toContain(
+      'retrieval.profile.fact-ungrounded'
+    );
+    expect(readiness.ready).toBe(true);
+  });
+
+  test('returns every dropped profile evidence ref with its reason and detail', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(path.join(projectRoot, 'src/blank.ts'), 'export {};\n   \n\t\nexport {};\n');
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/Big.swift'),
+      Array.from({ length: 250 }, (_, index) => `let value${index + 1} = ${index + 1}`).join('\n')
+    );
+    const prepared = prepareRecipeProductionItem(
+      {
+        reasoning: {
+          sources: [
+            'src/a.ts',
+            '../outside.ts:1',
+            'src/missing.ts:1-2',
+            'src/blank.ts:2-3',
+            'src/Big.swift:10-200',
+            'src/a.ts:2-99',
+            'src/a.ts:2-3',
+          ],
+        },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+
+    expect(prepared.item.retrievalProfile?.provenance.evidenceRefs).toEqual(['src/a.ts:2-3']);
+    const byRef = Object.fromEntries(
+      prepared.profileEvidence.rejected.map((entry) => [entry.ref, entry])
+    );
+    expect(Object.keys(byRef).sort()).toEqual(
+      [
+        '../outside.ts:1',
+        'src/Big.swift:10-200',
+        'src/a.ts',
+        'src/a.ts:2-99',
+        'src/blank.ts:2-3',
+        'src/missing.ts:1-2',
+      ].sort()
+    );
+    expect(byRef['src/a.ts']?.reason).toBe('format');
+    expect(byRef['../outside.ts:1']?.reason).toBe('path-invalid');
+    expect(byRef['src/missing.ts:1-2']?.reason).toBe('not-found');
+    expect(byRef['src/blank.ts:2-3']?.reason).toBe('empty-range');
+    expect(byRef['src/Big.swift:10-200']).toMatchObject({ reason: 'range-too-long' });
+    expect(byRef['src/Big.swift:10-200']?.detail).toContain('160');
+    expect(byRef['src/a.ts:2-99']?.reason).toBe('line-out-of-range');
+    for (const entry of prepared.profileEvidence.rejected) {
+      expect(entry.detail.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('reports an unreadable cited file as read-error instead of swallowing the fs error', () => {
+    if (process.getuid?.() === 0) {
+      return;
+    }
+    const projectRoot = makeProject();
+    const locked = path.join(projectRoot, 'src/locked.ts');
+    fs.writeFileSync(locked, 'export const locked = 1;\n');
+    fs.chmodSync(locked, 0o000);
+    try {
+      const prepared = prepareRecipeProductionItem(
+        { reasoning: { sources: ['src/locked.ts:1'] }, retrievalProfile: authoredProfile() },
+        projectRoot
+      );
+      expect(prepared.profileEvidence.rejected).toEqual([
+        expect.objectContaining({ ref: 'src/locked.ts:1', reason: 'read-error' }),
+      ]);
+      expect(prepared.profileEvidence.rejected[0]?.detail).toContain('EACCES');
+      // 门禁没有“不可读”违规码：读取异常照旧作为 Error 抛出，由 submit 的异常分支记录与拒绝。
+      expect(() => gateResolve(projectRoot, 'src/locked.ts:1')).toThrow(/EACCES/);
+    } finally {
+      fs.chmodSync(locked, 0o644);
+    }
+  });
+
+  test('knowledge.submit warns about a gate-accepted ref the adapter drops, naming the 160-line cap', async () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/Big.swift'),
+      Array.from({ length: 250 }, (_, index) => `let value${index + 1} = ${index + 1}`).join('\n')
+    );
+    const fake = fakePort(readyReport);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = await handleKnowledge(
+        'submit',
+        submitParams({
+          reasoning: {
+            whyStandard: 'The cited source demonstrates the emitted-runtime boundary.',
+            sources: ['src/a.ts:2-3', 'src/Big.swift:10-200'],
+            confidence: 0.95,
+          },
+        }),
+        { projectRoot, recipeGateway: fake.port, sessionStore: null } as never
+      );
+      expect(result.ok).toBe(true);
+      expect(fake.calls[0].input.items[0].retrievalProfile?.provenance.evidenceRefs).toEqual([
+        'src/a.ts:2-3',
+      ]);
+      const messages = warn.mock.calls.map(([message]) => String(message));
+      const dropped = messages.find((message) => message.includes('src/Big.swift:10-200'));
+      expect(dropped).toBeDefined();
+      expect(dropped).toContain('range-too-long');
+      expect(dropped).toContain('160');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('the profile prompt states the 160-line evidence range limit', () => {
+    expect(RECIPE_PRODUCTION_PROFILE_PROMPT).toMatch(/160 lines/);
+  });
+
+  test('the repair hint only reads the ref the gate rejected, never an unrelated first source', async () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(path.join(projectRoot, 'src/b.ts'), 'b1\nb2\nb3\nb4\nb5\n');
+    const fake = fakePort(readyReport);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = await submitThroughAdapter(
+        projectRoot,
+        fake.port,
+        submitParams({
+          sourceRefs: ['src/a.ts:2-3', 'src/b.ts:900-910'],
+          reasoning: {
+            whyStandard: 'Fixture source claim.',
+            sources: ['src/a.ts:2-3', 'src/b.ts:900-910'],
+            confidence: 0.95,
+          },
+        })
+      );
+      expect(fake.calls).toHaveLength(0);
+      expect(result.text).toContain('SOURCE_REF_LINE_OUT_OF_RANGE');
+      expect(result.text).toContain('修复提示');
+      expect(result.text).toContain('src/b.ts:900-910');
+      expect(result.text).toContain('实际 5 行');
+      expect(result.text).not.toContain("import type { User } from './user.js';");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('a snippet mismatch hint reads cited ranges from reasoning.sources as well as sourceRefs', async () => {
+    const projectRoot = makeProject();
+    // sourceRefs 只引用一段空白行（门禁有效、提示不可展示），可展示的范围只在 reasoning.sources 里。
+    fs.writeFileSync(path.join(projectRoot, 'src/blank.ts'), 'export {};\n   \n\t\nexport {};\n');
+    const fake = fakePort(readyReport);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = await submitThroughAdapter(
+        projectRoot,
+        fake.port,
+        submitParams({
+          sourceRefs: ['src/blank.ts:2-3'],
+          content: { ...submitParams().content, pattern: 'export const notInSources = true;' },
+        })
+      );
+      expect(fake.calls).toHaveLength(0);
+      expect(result.text).toContain('SNIPPET_MISMATCH');
+      expect(result.text).toContain('src/a.ts:2-3');
+      expect(result.text).toContain("import type { User } from './user.js';");
+    } finally {
+      warn.mockRestore();
     }
   });
 });
