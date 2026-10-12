@@ -6,7 +6,7 @@ import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
-import { PACKAGE_ROOT } from '../src/shared/packageAssets.js';
+import { findAlembicPackageRoot } from '../src/shared/packageAssets.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
 
 /**
@@ -101,7 +101,7 @@ describe('conversation SOUL diagnostics', () => {
   }
 
   it('reports the default package-root SOUL.md as missing with source=default', () => {
-    const defaultPath = resolve(PACKAGE_ROOT, 'SOUL.md');
+    const defaultPath = resolve(findAlembicPackageRoot(), 'SOUL.md');
     expect(existsSync(defaultPath)).toBe(false);
     const { info, warn } = spyLogger();
 

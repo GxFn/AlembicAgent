@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { findAlembicPackageRoot, PACKAGE_ROOT } from '../src/shared/packageAssets.js';
+import * as packageAssets from '../src/shared/packageAssets.js';
+import { findAlembicPackageRoot } from '../src/shared/packageAssets.js';
 
 /**
  * 包根定位的错误原因钉子（L1-I8）。
@@ -26,7 +27,13 @@ describe('package asset root lookup', () => {
   }
 
   it('resolves the @alembic/agent package root from its own module location', () => {
-    expect(findAlembicPackageRoot()).toBe(PACKAGE_ROOT);
+    expect(findAlembicPackageRoot()).toBe(resolve(import.meta.dirname, '..'));
+  });
+
+  it('does not evaluate the package root at module load time (L1-P9)', () => {
+    // 包根只在使用方真正需要资源时惰性定位；模块不再导出加载期求值的 PACKAGE_ROOT，
+    // 避免可选资源（SOUL.md）在 import 期阻断 tools/runtime 导入链。
+    expect('PACKAGE_ROOT' in packageAssets).toBe(false);
   });
 
   it('keeps the unreadable ancestor package.json as the cause of the final error', async () => {

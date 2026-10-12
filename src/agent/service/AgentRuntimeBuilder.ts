@@ -30,6 +30,14 @@ interface AgentRuntimeBuilderOptions {
   projectRoot?: string;
   dataRoot?: string;
   toolRouter?: unknown;
+  /**
+   * 宿主产品人格资源 SOUL.md 的路径（可选）。
+   *
+   * SOUL.md 是 Alembic 产品人格，归宿主所有、不随 Agent 包发布；宿主应传入自己包根下的
+   * SOUL.md。未传时 Conversation 回落到 Agent 包根默认路径（当前不存在，只记 info 诊断，
+   * 人格段为空）。Agent 只负责透传与加载，不读取或校验其内容。
+   */
+  soulPath?: string;
 }
 
 export class AgentRuntimeBuilder {
@@ -43,6 +51,7 @@ export class AgentRuntimeBuilder {
     projectBriefing: string | null;
     projectRoot: string;
     dataRoot: string;
+    soulPath: string | null;
   };
 
   constructor({
@@ -53,6 +62,7 @@ export class AgentRuntimeBuilder {
     projectRoot = process.cwd(),
     dataRoot = projectRoot,
     toolRouter = null,
+    soulPath,
   }: AgentRuntimeBuilderOptions) {
     this.#container = container;
     this.#toolRegistry = toolRegistry;
@@ -62,6 +72,8 @@ export class AgentRuntimeBuilder {
       projectBriefing,
       projectRoot,
       dataRoot,
+      // 空串与未传等价（与 Conversation 的归一化一致），统一记为 null 表示「宿主未接线」。
+      soulPath: typeof soulPath === 'string' && soulPath.length > 0 ? soulPath : null,
     };
   }
 
@@ -113,11 +125,13 @@ export class AgentRuntimeBuilder {
   }
 
   // 能力实例跨运行复用，这里只传与运行无关的配置；记忆协调器按每次运行经上下文进入循环。
+  // soulPath 只有 Conversation 消费，其他能力忽略该键；为 null 时 Conversation 走默认路径并留诊断。
   #getCapabilityOpts() {
     return {
       container: this.#container,
       projectBriefing: this.#sharedOpts.projectBriefing,
       projectRoot: this.#sharedOpts.projectRoot,
+      soulPath: this.#sharedOpts.soulPath,
     };
   }
 }
