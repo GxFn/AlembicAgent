@@ -42,6 +42,12 @@ function deepSeekReply(content: string, finishReason = 'stop') {
   };
 }
 
+/**
+ * 兼容调用 id 形如 前缀 + 每次响应 8 位随机十六进制段 + `_` + 响应内序号；
+ * 随机段让 id 跨轮次唯一，测试只能按模式断言，不能再钉死 `call_deepseek_compat_1` 字面值。
+ */
+const COMPAT_CALL_ID_RE = /^call_deepseek_compat_([0-9a-f]{8})_(\d+)$/;
+
 const codeInvoke =
   '<invoke name="code"><parameter name="action">read</parameter><parameter name="params">{"path":"declared.ts"}</parameter></invoke>';
 const codeTool = {
@@ -67,6 +73,50 @@ describe('DeepSeek text tool declaration boundary', () => {
       expect(isTextCompatToolCallId(call.id), call.id).toBe(true);
     }
     expect(new Set(calls.map((call) => call.id)).size).toBe(2);
+  });
+
+  it('keeps compat call ids unique across consecutive responses of one transport', async () => {
+    // 同一 DeepSeekTransport 连续两次响应各含一个兼容调用：旧实现每次响应都从 _1 重新计数，
+    // 证据台账 callId 与 finding ref 会跨轮重复；这里要求两次 id 不同且都仍被识别为兼容转译。
+    mockJsonFetch({}, deepSeekReply(`<function_calls>${codeInvoke}</function_calls>`));
+    const transport = new DeepSeekTransport({ apiKey: 'fixture-key' });
+    const ids: string[] = [];
+    for (let turn = 0; turn < 2; turn++) {
+      const result = await transport.chatWithTools({
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'fixture' }],
+        tools: [codeTool],
+      });
+      expect(result.functionCalls).toHaveLength(1);
+      ids.push(result.functionCalls?.[0]?.id ?? '');
+    }
+    for (const id of ids) {
+      expect(isTextCompatToolCallId(id), id).toBe(true);
+    }
+    expect(ids[0]).not.toBe(ids[1]);
+    for (const id of ids) {
+      expect(id).toMatch(COMPAT_CALL_ID_RE);
+    }
+  });
+
+  it('shares one per-response segment across calls of a response and numbers them in order', () => {
+    const text = `<function_calls>${codeInvoke}${codeInvoke}</function_calls>`;
+    const first = parseDeepSeekTextToolCalls(text, ['code']).map((call) => call.id);
+    const second = parseDeepSeekTextToolCalls(text, ['code']).map((call) => call.id);
+    const segmentOf = (id: string) => COMPAT_CALL_ID_RE.exec(id)?.[1];
+    const ordinalOf = (id: string) => COMPAT_CALL_ID_RE.exec(id)?.[2];
+    for (const ids of [first, second]) {
+      expect(ids).toHaveLength(2);
+      for (const id of ids) {
+        expect(id).toMatch(COMPAT_CALL_ID_RE);
+      }
+      // 轮内配对仍按序号区分：同一响应共用一段随机段，序号从 1 递增。
+      expect(segmentOf(ids[0] ?? '')).toBe(segmentOf(ids[1] ?? ''));
+      expect(ids.map((id) => ordinalOf(id))).toEqual(['1', '2']);
+    }
+    // 跨响应：随机段不同，因此两次解析的 id 集合不相交。
+    expect(segmentOf(first[0] ?? '')).not.toBe(segmentOf(second[0] ?? ''));
+    expect(first.filter((id) => second.includes(id))).toEqual([]);
   });
 
   it.each([
@@ -104,7 +154,7 @@ describe('DeepSeek text tool declaration boundary', () => {
     });
     expect(result.functionCalls).toEqual([
       {
-        id: 'call_deepseek_compat_1',
+        id: expect.stringMatching(COMPAT_CALL_ID_RE),
         name: 'code',
         args: { action: 'read', params: { path: 'declared.ts' } },
       },
@@ -214,7 +264,7 @@ describe('DeepSeek text tool compat drop diagnostics', () => {
     const { result, dropWarnings } = await runCompatTranslation(text);
     expect(result.functionCalls).toEqual([
       {
-        id: 'call_deepseek_compat_1',
+        id: expect.stringMatching(COMPAT_CALL_ID_RE),
         name: 'code',
         args: { action: 'read', params: { path: 'declared.ts' } },
       },

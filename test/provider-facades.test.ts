@@ -452,7 +452,8 @@ describe('DeepSeekProvider V4 tool calls', () => {
     expect(result.finishReason).toBe('length');
     expect(result.functionCalls).toEqual([
       {
-        id: 'call_deepseek_compat_1',
+        // 兼容调用 id = 前缀 + 每次响应 8 位随机段 + 序号（跨轮唯一），只能按模式断言。
+        id: expect.stringMatching(/^call_deepseek_compat_[0-9a-f]{8}_1$/),
         name: 'code',
         args: { action: 'read', path: 'Sources/App.swift' },
       },

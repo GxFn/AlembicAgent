@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { FunctionCallResult } from './contracts.js';
 import { TEXT_COMPAT_CALL_ID_PREFIX } from './registry/ModelQuirks.js';
 
@@ -129,6 +130,13 @@ export function inspectDeepSeekTextToolCalls(
 
   const allowed = new Set(allowedToolNames);
   const dropped = new Set<string>();
+  // 每次响应生成一段 8 位随机十六进制段，本响应内所有兼容调用共用，再按出现顺序编号。
+  // 旧实现每次响应都从 `_1` 重新计数，同一次运行的多个轮次会产生相同 callId，
+  // 证据台账 callId、finding ref（dedupeBy ref）与 sameObservation 配对因此只能靠顺序区分。
+  // 选随机段而不是由 Transport 传入的响应序号：原生 provider 的 call id 本就是随机的，
+  // 共享 Transport 不必维护计数状态，进程重启或多实例时也不会重复。
+  // 段在通过上方入口守卫后才生成：不进入兼容桥（无声明标记/未声明 allowed tools）的路径不消耗随机数。
+  const responseSegment = randomUUID().slice(0, 8);
   const scan = scanDeclaredCallBlocks(text);
   diagnostics.declaredBlocks = scan.blocks.length;
   diagnostics.unclosedBlock = scan.unclosedBlock;
@@ -143,8 +151,9 @@ export function inspectDeepSeekTextToolCalls(
       }
 
       calls.push({
-        // 前缀与 AgentRuntime 的来源判定(isTextCompatToolCallId)同源，兼容转译不会被当成原生 tool_calls。
-        id: `${TEXT_COMPAT_CALL_ID_PREFIX}${calls.length + 1}`,
+        // 前缀与 AgentRuntime 的来源判定(isTextCompatToolCallId)同源，兼容转译不会被当成原生 tool_calls；
+        // 随机段保证跨轮次唯一，序号保证轮内唯一且保持出现顺序。
+        id: `${TEXT_COMPAT_CALL_ID_PREFIX}${responseSegment}_${calls.length + 1}`,
         name,
         args: parseParams(match[2] || ''),
       });
