@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import {
@@ -228,6 +229,57 @@ describe('ParameterGuard', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  // 字符串参数与数值参数同一校验口径：模型允许并将透传给 transport 时，非字符串或空白值
+  // 必须在发请求前以 LLM_INVALID_REQUEST 失败，不能以 as string 透传成厂商请求错误再进重试/熔断。
+  it.each([
+    { field: 'toolChoice', value: { type: 'tool', name: 'x' } },
+    { field: 'toolChoice', value: 42 },
+    { field: 'toolChoice', value: '   ' },
+    { field: 'reasoningEffort', value: { effort: 'high' } },
+    { field: 'reasoningEffort', value: '' },
+  ])('rejects non-string or blank $field=$value at the gateway before transport or retry', async ({
+    field,
+    value,
+  }) => {
+    const fetch = mockJsonFetch(
+      {},
+      {
+        id: 'fixture',
+        created: 1,
+        model: 'gpt-5.5',
+        choices: [
+          { index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' },
+        ],
+      }
+    );
+    const transport = vi.spyOn(OpenAiTransport.prototype, 'chatWithTools');
+    const gateway = new LLMGateway({
+      providers: { openai: { apiKey: 'fixture-key' } },
+      maxRetries: 2,
+    });
+    const rejection = gateway.chatWithTools({
+      modelRef: 'openai:gpt-5.5',
+      messages: [{ role: 'user', content: 'fixture' }],
+      [field]: value,
+    });
+    await expect(rejection).rejects.toMatchObject({
+      code: 'LLM_INVALID_REQUEST',
+      message: `${field} must be a non-empty string`,
+    });
+    expect(transport).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unsupported toolChoice filtered even if its value is not a string', () => {
+    const deepseekV4 = new ModelRegistry().resolve('deepseek', 'deepseek-v4-pro');
+    if (!deepseekV4) {
+      throw new Error('DeepSeek V4 Pro model definition is missing');
+    }
+    const guarded = ParameterGuard.guard(deepseekV4, { toolChoice: { type: 'tool', name: 'x' } });
+    expect(guarded.toolChoice).toBeUndefined();
+    expect(guarded.filtered.map((item) => item.param)).toEqual(['toolChoice']);
+  });
+
   it.each([
     'topP',
     'topK',
@@ -358,6 +410,32 @@ describe('ModelRegistry data invariants', () => {
       if (m.deprecated) {
         expect(registry.get(m.deprecated.migrateToId), m.id).toBeDefined();
       }
+    }
+  });
+
+  // 未登记模型走保守默认定义（maxOutputTokens=8192）属于降级路径：必须按模型 id 去重告警一次，
+  // 否则宿主请求的 maxTokens 被静默截断后只能看到下游 JSON 解析失败。
+  it('warns once per id when resolveOrCreate falls back to a dynamic definition', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const registry = new ModelRegistry();
+      const first = registry.resolveOrCreate('claude', 'claude-registry-dynamic-fixture');
+      registry.resolveOrCreate('claude', 'claude-registry-dynamic-fixture');
+      registry.resolveOrCreate('openai', 'gpt-5.5');
+      expect(first).toMatchObject({ maxOutputTokens: 8_192, contextWindow: 128_000 });
+      const messages = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('dynamic_model_def'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain('model=claude:claude-registry-dynamic-fixture');
+      expect(messages[0]).toContain('maxOutputTokens=8192');
+      expect(messages[0]).toContain('contextWindow=128000');
+      registry.resolveOrCreate('claude', 'claude-registry-dynamic-other');
+      expect(
+        warn.mock.calls.filter((call) => String(call[0]).includes('dynamic_model_def'))
+      ).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
     }
   });
 

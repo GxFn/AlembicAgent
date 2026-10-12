@@ -11,6 +11,8 @@
  *   - Provider: 查询模型推理能力
  */
 
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { ModelDef, ProviderId } from './ModelDefs.js';
 import { CLAUDE_MODELS } from './models/claude.js';
 import { DEEPSEEK_MODELS } from './models/deepseek.js';
@@ -26,8 +28,16 @@ const ALL_BUILTIN_MODELS: ModelDef[] = [
   ...OLLAMA_MODELS,
 ];
 
+// 惰性取 Core logger 单例，避免模块导入期副作用（与 LLMGateway 一致）。
+const logger = () => Logger.getInstance();
+
 export class ModelRegistry {
   #models = new Map<string, ModelDef>();
+  /**
+   * 已告警过的动态兜底模型 id。按实例去重：生产路径经 getModelRegistry() 单例访问，
+   * 因此同一未登记模型在进程内只告警一次；独立 new 出来的注册表各自计数。
+   */
+  #warnedDynamicIds = new Set<string>();
 
   constructor() {
     for (const def of ALL_BUILTIN_MODELS) {
@@ -72,10 +82,23 @@ export class ModelRegistry {
    * 优先级: 精确匹配 → provider+model 组合 → 动态定义
    */
   resolveOrCreate(provider: string, apiModelId: string): ModelDef {
-    return (
-      this.resolve(provider, apiModelId) ??
-      this.createDynamicDef(provider as ProviderId, apiModelId)
-    );
+    const registered = this.resolve(provider, apiModelId);
+    if (registered) {
+      return registered;
+    }
+    // 降级路径：未登记模型拿到保守默认（固定 contextWindow / maxOutputTokens），
+    // 调用方请求的 maxTokens 会被 ParameterGuard 截到该上限。按 id 去重 warn 一次，
+    // 让“输出被截断 → JSON 解析失败”能追溯到“模型未登记”这一根因。
+    const def = this.createDynamicDef(provider as ProviderId, apiModelId);
+    if (!this.#warnedDynamicIds.has(def.id)) {
+      this.#warnedDynamicIds.add(def.id);
+      const message = `[ModelRegistry] dynamic_model_def model=${def.id} contextWindow=${def.contextWindow} maxOutputTokens=${def.maxOutputTokens}; path=conservative_defaults (model not registered)`;
+      observeSafely(
+        () => logger().warn(message),
+        () => undefined
+      );
+    }
+    return def;
   }
 
   /** 列出指定 provider 的所有模型 */

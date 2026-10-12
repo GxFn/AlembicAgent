@@ -26,7 +26,7 @@ import type {
   UnifiedMessage,
 } from '../contracts.js';
 import { LlmResponseError, throwIfLlmCancelled } from '../errors.js';
-import { ParameterGuard } from '../guard/ParameterGuard.js';
+import { type GuardedParams, ParameterGuard } from '../guard/ParameterGuard.js';
 import type { ModelDef, ProviderId } from '../registry/ModelDefs.js';
 import { getModelRegistry } from '../registry/ModelRegistry.js';
 import { PROVIDER_CONFIGS } from '../registry/ProviderConfig.js';
@@ -152,7 +152,7 @@ export class LLMGateway {
    * Gateway 自动完成: modelRef 解析 → ParameterGuard → Transport → 响应归一化
    */
   async chatWithTools(request: GatewayRequest): Promise<ChatWithToolsResult> {
-    const { modelDef, providerId, apiModelId } = this.#resolveModel(request.modelRef);
+    const { modelDef, providerId, apiModelId, dynamic } = this.#resolveModel(request.modelRef);
     this.#reportModelDeclarations(modelDef, request);
 
     const guarded = ParameterGuard.guard(modelDef, {
@@ -168,6 +168,7 @@ export class LLMGateway {
         `[LLMGateway] ${modelDef.displayName} filtered params: ${guarded.filtered.map((f) => `${f.param}(${f.reason})`).join(', ')}`
       );
     }
+    this.#reportClampedParams(modelDef, dynamic, request, guarded);
 
     const transport = this.#getTransport(providerId);
     const transportReq: TransportRequest = {
@@ -335,8 +336,13 @@ export class LLMGateway {
     modelDef: ModelDef;
     providerId: ProviderId;
     apiModelId: string;
+    /** true 表示注册表未登记、拿到的是 createDynamicDef 的保守默认定义。 */
+    dynamic: boolean;
   } {
     const registry = getModelRegistry();
+    // 动态定义每次现造、从不写回注册表，因此“按 id 取回的不是同一对象”即说明走了兜底；
+    // 运行时 register() 的自定义模型会被取回，仍算已登记。
+    const isDynamic = (def: ModelDef): boolean => registry.get(def.id) !== def;
 
     const providerSeparator = modelRef.indexOf(':');
     if (providerSeparator > 0) {
@@ -347,6 +353,7 @@ export class LLMGateway {
         modelDef,
         providerId: modelDef.provider,
         apiModelId: modelDef.apiModelId,
+        dynamic: isDynamic(modelDef),
       };
     }
 
@@ -356,6 +363,7 @@ export class LLMGateway {
         modelDef,
         providerId: modelDef.provider,
         apiModelId: modelDef.apiModelId,
+        dynamic: false,
       };
     }
 
@@ -369,6 +377,7 @@ export class LLMGateway {
       modelDef: resolved,
       providerId: resolved.provider,
       apiModelId: resolved.apiModelId,
+      dynamic: isDynamic(resolved),
     };
   }
 
@@ -421,6 +430,40 @@ export class LLMGateway {
       this.#log(
         'warn',
         `[LLMGateway] tool_calling_unsupported model=${modelDef.id} tools=${toolCount}; path=send_unchanged (registry declares toolCalling=false)`
+      );
+    }
+  }
+
+  /**
+   * ParameterGuard 的钳制是合法修正、不进 filtered，这里补诊断：比较调用方请求值与 guard 输出。
+   * maxTokens 被截断会直接导致长输出（尤其结构化 JSON）被截断，故用 info 并标明是否动态定义；
+   * 其他数值（目前网关只透传 temperature）钳制用 debug。被过滤的参数已由 filtered 日志覆盖，
+   * guard 输出为 undefined 时不算钳制。日志只含模型 id 与数值，不含消息内容。
+   */
+  #reportClampedParams(
+    modelDef: ModelDef,
+    dynamic: boolean,
+    request: GatewayRequest,
+    guarded: GuardedParams
+  ): void {
+    if (
+      typeof request.maxTokens === 'number' &&
+      guarded.maxTokens !== undefined &&
+      guarded.maxTokens !== request.maxTokens
+    ) {
+      this.#log(
+        'info',
+        `[LLMGateway] max_tokens_clamped model=${modelDef.id} requested=${request.maxTokens} effective=${guarded.maxTokens} dynamic=${dynamic}; path=clamp_to_model_max_output_tokens`
+      );
+    }
+    if (
+      typeof request.temperature === 'number' &&
+      guarded.temperature !== undefined &&
+      guarded.temperature !== request.temperature
+    ) {
+      this.#log(
+        'debug',
+        `[LLMGateway] param_clamped model=${modelDef.id} param=temperature requested=${request.temperature} effective=${guarded.temperature}; path=clamp_to_model_range`
       );
     }
   }

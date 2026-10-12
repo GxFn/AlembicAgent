@@ -8,6 +8,10 @@
  * 丢弃 temperature、抬高 maxTokens 下限，并再次确保 V4 不发 tool_choice；这些按请求变化的调整
  * 不进入本类的 filtered 审计，而由 transport 的 v4_param_policy 诊断日志记录。
  * V4 家族身份由 registry/ModelQuirks 的 resolveDeepSeekV4Family 单源判定。
+ *
+ * 钳制（temperature/topP/topK 夹到区间、maxTokens 截到 model.maxOutputTokens）是合法修正，
+ * 不写入 filtered（filtered 只表示“被丢弃或被替换”）；钳制诊断由 LLMGateway.chatWithTools
+ * 比较请求值与本类输出后打出（maxTokens 为 info，其余数值为 debug）。
  */
 
 import type { ModelDef, ParameterConstraints } from '../registry/ModelDefs.js';
@@ -29,7 +33,7 @@ export interface FilteredParam {
   originalValue: unknown;
 }
 
-function invalidNumericParam(param: string, requirement: string): Error {
+function invalidParam(param: string, requirement: string): Error {
   return Object.assign(new Error(`${param} must be ${requirement}`), {
     code: 'LLM_INVALID_REQUEST',
   });
@@ -38,7 +42,20 @@ function invalidNumericParam(param: string, requirement: string): Error {
 /** 仅校验模型允许的输入；不做隐式数字转换，也不把原值带进错误诊断。 */
 function finiteNumericParam(param: string, value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw invalidNumericParam(param, 'a finite number');
+    throw invalidParam(param, 'a finite number');
+  }
+  return value;
+}
+
+/**
+ * 字符串参数与数值参数同一口径：只校验模型允许、即将透传给 transport 的值。
+ * 公开类型已是 string，这里拦的是 JS 调用方传入的对象（如 Anthropic 风格 {type,name}）、
+ * 数字或空白串——它们原本会被 as string 透传成厂商请求错误并进入重试/熔断。
+ * 不 trim、不改写合法值；错误信息不带原值，避免把调用方输入写进诊断。
+ */
+function nonBlankStringParam(param: string, value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw invalidParam(param, 'a non-empty string');
   }
   return value;
 }
@@ -155,7 +172,8 @@ export class ParameterGuard {
       });
       return;
     }
-    out.toolChoice = raw.toolChoice as string;
+    // 两个过滤分支之后才校验：不支持的 toolChoice 本就不会发出，保持“被过滤”审计而不是报错。
+    out.toolChoice = nonBlankStringParam('toolChoice', raw.toolChoice);
   }
 
   static #guardReasoningEffort(
@@ -176,7 +194,8 @@ export class ParameterGuard {
       });
       return;
     }
-    const val = raw.reasoningEffort as string;
+    // 先校验类型再比对 allowedValues：合法字符串但不在白名单时仍按原语义替换为模型默认值。
+    const val = nonBlankStringParam('reasoningEffort', raw.reasoningEffort);
     if (rule.allowedValues && !rule.allowedValues.includes(val)) {
       out.filtered.push({
         param: 'reasoningEffort',
@@ -195,7 +214,7 @@ export class ParameterGuard {
     }
     const val = finiteNumericParam('maxTokens', raw.maxTokens);
     if (!Number.isSafeInteger(val) || val <= 0) {
-      throw invalidNumericParam('maxTokens', 'a positive safe integer');
+      throw invalidParam('maxTokens', 'a positive safe integer');
     }
     out.maxTokens = Math.min(val, model.maxOutputTokens);
   }

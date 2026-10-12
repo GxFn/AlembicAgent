@@ -420,6 +420,125 @@ describe('LLMGateway model declaration diagnostics', () => {
   });
 });
 
+// ParameterGuard 的钳制语义保持不变（不进 filtered），但网关必须把被截断的 maxTokens 以 info、
+// 其他数值钳制以 debug 打出来，并标明定义是否来自未登记模型的动态兜底，便于定位输出截断根因。
+describe('LLMGateway parameter clamp diagnostics', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function messagesOf(spy: { mock: { calls: unknown[][] } }, marker: string): string[] {
+    return spy.mock.calls.map((call) => String(call[0])).filter((msg) => msg.includes(marker));
+  }
+
+  function captureOpenAiBodies(): Array<Record<string, unknown>> {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({ choices: [{ index: 0, message: { content: 'done' } }] });
+      })
+    );
+    return bodies;
+  }
+
+  it('logs requested and effective maxTokens at info when a registered model clamps them', async () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const bodies = captureOpenAiBodies();
+    const gateway = new LLMGateway({
+      providers: {
+        ollama: { apiKey: 'fixture-key', baseUrl: 'http://ollama.example.invalid/v1' },
+      },
+      maxRetries: 0,
+    });
+    const messages = [{ role: 'user' as const, content: 'ping' }];
+    await gateway.chatWithTools({ modelRef: 'ollama:llama3', messages, maxTokens: 32768 });
+    expect(bodies[0]?.max_tokens).toBe(4096);
+    const clamped = messagesOf(info, 'max_tokens_clamped');
+    expect(clamped).toHaveLength(1);
+    expect(clamped[0]).toContain('model=ollama:llama3');
+    expect(clamped[0]).toContain('requested=32768');
+    expect(clamped[0]).toContain('effective=4096');
+    expect(clamped[0]).toContain('dynamic=false');
+    // 未超过模型上限时不产生截断诊断。
+    await gateway.chatWithTools({ modelRef: 'ollama:llama3', messages, maxTokens: 1024 });
+    expect(bodies[1]?.max_tokens).toBe(1024);
+    expect(messagesOf(info, 'max_tokens_clamped')).toHaveLength(1);
+  });
+
+  it('logs other numeric clamps at debug without touching the filtered audit', async () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const bodies = captureOpenAiBodies();
+    const gateway = new LLMGateway({
+      providers: {
+        ollama: { apiKey: 'fixture-key', baseUrl: 'http://ollama.example.invalid/v1' },
+      },
+      maxRetries: 0,
+    });
+    const messages = [{ role: 'user' as const, content: 'ping' }];
+    await gateway.chatWithTools({ modelRef: 'ollama:llama3', messages, temperature: 5 });
+    expect(bodies[0]?.temperature).toBe(2);
+    const clamped = messagesOf(debug, 'param_clamped');
+    expect(clamped).toHaveLength(1);
+    expect(clamped[0]).toContain('model=ollama:llama3');
+    expect(clamped[0]).toContain('param=temperature');
+    expect(clamped[0]).toContain('requested=5');
+    expect(clamped[0]).toContain('effective=2');
+    expect(messagesOf(debug, 'filtered params')).toEqual([]);
+    await gateway.chatWithTools({ modelRef: 'ollama:llama3', messages, temperature: 0.5 });
+    expect(messagesOf(debug, 'param_clamped')).toHaveLength(1);
+  });
+
+  it('warns once for an unregistered prefixed model and marks its clamp as dynamic', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({
+          id: 'msg-fixture',
+          type: 'message',
+          role: 'assistant',
+          model: 'fixture',
+          content: [{ type: 'text', text: 'done' }],
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        });
+      })
+    );
+    const gateway = new LLMGateway({
+      providers: { claude: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await gateway.chatWithTools({
+        modelRef: 'claude:claude-sonnet-4-5-20250929',
+        messages: [{ role: 'user', content: 'ping' }],
+        maxTokens: 32768,
+      });
+    }
+    expect(bodies.map((body) => body.model)).toEqual([
+      'claude-sonnet-4-5-20250929',
+      'claude-sonnet-4-5-20250929',
+    ]);
+    expect(bodies.map((body) => body.max_tokens)).toEqual([8192, 8192]);
+    const dynamic = messagesOf(warn, 'dynamic_model_def');
+    expect(dynamic).toHaveLength(1);
+    expect(dynamic[0]).toContain('model=claude:claude-sonnet-4-5-20250929');
+    expect(dynamic[0]).toContain('maxOutputTokens=8192');
+    const clamped = messagesOf(info, 'max_tokens_clamped');
+    expect(clamped).toHaveLength(2);
+    expect(clamped[0]).toContain('requested=32768');
+    expect(clamped[0]).toContain('effective=8192');
+    expect(clamped[0]).toContain('dynamic=true');
+  });
+});
+
 describe('LLMTransport explicit legacy defaults', () => {
   class LocalTransport extends LLMTransport {
     request?: TransportRequest;
