@@ -950,6 +950,8 @@ export class AgentRuntime {
       // Policy（BudgetPolicy）的 session 上限是 profile 级配置，按整次运行累计判定，故传运行级
       // this.tokenUsage；阶段会话预算（阶段内口径）由 BudgetController 预检负责，不经这里。
       const signal = ec.checkBeforeIteration(ctx, this.tokenUsage);
+      // checkBeforeIteration 只返回 exit / continue；'graceful_exit' 只由未接线的 checkAfterTextResponse
+      // 产生（I34），这里按 exit 处理只是防御性分支，不代表存在优雅退出路径。
       if (signal.action === 'exit' || signal.action === 'graceful_exit') {
         this.logger.info(
           `[AgentRuntime] ExitController: ${signal.reason} — ${signal.detail || ''}`
@@ -1361,6 +1363,9 @@ export class AgentRuntime {
     // Graceful exit 保护 — toolChoice=none 或 gracefulExit 状态下，
     // 部分 LLM (DeepSeek 等) 可能仍然返回 tool calls，需要忽略。
     // Analyst 的 RECORD 阶段会暴露 note_finding-only 补记录窗口，不能在这里丢弃。
+    // 这里是 toolChoice 违规的唯一生效判定（I34）：ExitController.checkToolChoiceViolation 是未接线的
+    // 平行方法，条件不同（只看 tracker 的 graceful/SUMMARIZE，不看 toolChoice 与 provider 例外），
+    // 不能替换成它；改这里的条件时同步更新它的 @deprecated 差异说明。
     const isTerminalPhase = ctx.tracker?.phase === 'SUMMARIZE';
     const allowToolCallsUnderForcedNone = allowsToolCallsUnderForcedNone(providerToolChoiceMode);
     if (
@@ -1561,6 +1566,10 @@ export class AgentRuntime {
    * 只接收 provider 调用（chatWithTools）抛出的异常；本地输入装配缺陷由
    * #handleLlmInputAssemblyFailure 单独归类。provider 可能 reject 任意值（字符串、普通对象），
    * 入口先归一为 { message, code }，避免把 'undefined' 写进 ai_error 诊断或让熔断码判断失效。
+   *
+   * 本方法是 AI 错误退出的唯一生效判定（I34）：ExitController.checkAfterAiError 是未接线的平行方法，
+   * 不递增 consecutiveAiErrors，也没有这里的 cancelReason / resetToPromptOnly / lastReply 副作用；
+   * 改这里的语义时同步更新它的 @deprecated 差异说明。
    * @returns continueResult() 或 null (退出)
    */
   async #handleAiError(ctx: LoopContext, rawError: unknown): Promise<LLMResult | null> {
@@ -2016,6 +2025,10 @@ export class AgentRuntime {
 
   /**
    * 文本响应处理 — tracker 阶段路由 + 非 tracker 直接终止
+   *
+   * 本方法是文本轮退出的唯一生效判定（I34）：ExitController.checkAfterTextResponse 是未接线的平行方法，
+   * 不区分管线（这里只对 analyst 注入 digest nudge）、不建模 grounding guard；
+   * 改这里的语义时同步更新它的 @deprecated 差异说明。
    *
    * @returns true = 应退出循环
    */

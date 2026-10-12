@@ -12,7 +12,12 @@
  *   - toolChoice=none 或 graceful exit 下仍返回工具调用：AgentRuntime.#callLLM
  *   - 文本终答、digest nudge、继续探索：AgentRuntime.#processTextResponse
  *   checkAfterAiError / checkAfterTextResponse / checkToolChoiceViolation 是与上述内联逻辑平行的
- *   公开方法，目前没有被 AgentRuntime 调用；改退出语义时必须同时改内联路径，只改这里不会生效。
+ *   公开方法，目前没有被 AgentRuntime 调用，且语义已与内联判定分叉（差异逐条写在各方法的 JSDoc 里，
+ *   例如 checkToolChoiceViolation 不看 toolChoice 与 provider 例外）。不要把它们当作退出判定的复用入口：
+ *   新调用方按它们判定会放行 Runtime 会忽略的工具调用。改退出语义时只改内联路径才会生效。
+ *   去留（I34）：审阅决定采纳方案 b——随待决事项②删除这三个方法以及 ExitSignal.nudge 与
+ *   'graceful_exit' 动作，并由总控派发宿主删除依赖它们的单测；事项②落地前只保留并标注 @deprecated，
+ *   不改签名、不删导出。ExitSignal.needsSummary 同样没有运行时消费者（见字段注释）。
  *
  * 设计原则：
  *   - 每个检查点按固定顺序判定，返回结构化 ExitSignal 而非分散的 boolean/null
@@ -57,11 +62,28 @@ export type ExitReason =
   | 'tool_choice_violation';
 
 export interface ExitSignal {
+  /**
+   * 检查点给出的动作。AgentRuntime 只消费已接线检查点的结果：
+   *   - checkBeforeIteration：'exit' 结束循环；'continue' 带 reason 时只记日志（token grace）；
+   *   - checkAfterLLM：'retry' 重试空响应，其它动作结束循环；
+   *   - checkAfterToolCalls：只看是否为 'exit'。
+   * 'graceful_exit' 只由未接线的 checkAfterTextResponse 产生（I34，随事项②删除）；
+   * AgentRuntime.#shouldExit 把它与 'exit' 同样处理，只是防御性分支，已接线检查点从不返回它。
+   */
   action: 'continue' | 'exit' | 'graceful_exit' | 'retry';
   reason?: ExitReason;
-  /** Whether #finalize should produce a forced summary */
+  /**
+   * 描述性标记：这次退出在语义上是否期望补一份摘要。AgentRuntime 不读取本字段——
+   * 是否发强制摘要由 AgentRuntime.#finalize 决定：ctx.lastReply 为空时才考虑，再按
+   * #getForcedSummarySuppression（abort / 本地缺陷 / 超时等抑制清单）与摘要模式选择。
+   * 例如 stage_timeout 不发摘要是因为抑制清单命中超时，而不是因为本字段为 false；改这里的取值
+   * 不会改变运行时行为，只影响日志与测试断言（I34，字段去留随事项②）。
+   */
   needsSummary?: boolean;
-  /** Text to inject into message stream (digest/phase_transition nudge) */
+  /**
+   * 只由未接线的 checkAfterTextResponse 填写，运行时没有消费者（I34，随事项②删除）：
+   * digest / continue nudge 实际由 AgentRuntime.#processTextResponse 直接追加到消息流。
+   */
   nudge?: string | null;
   /** Details for logging/diagnostics */
   detail?: string;
@@ -374,8 +396,22 @@ export class ExitController {
     return CONTINUE;
   }
 
-  // ── 3. AI error check (replaces #handleAiError exit paths) ──
+  // ── 3. AI error check（未接线，生效路径是 AgentRuntime.#handleAiError） ──
 
+  /**
+   * @deprecated 未接线：AgentRuntime 不调用本方法，AI 错误的退出判定由 AgentRuntime.#handleAiError
+   * 内联完成；审阅决定（I34 方案 b）随待决事项②删除本方法，之前只保留签名，不要接入新调用方。
+   *
+   * 与内联判定的语义差异（按本方法判定会得到与 Runtime 不同的结论或缺失副作用）：
+   *   - 本方法不递增 ctx.consecutiveAiErrors，只读取它；Runtime 先递增再判定。调用方若不预先递增，
+   *     “连续两次错误”会推迟到第三次才退出。
+   *   - CIRCUIT_OPEN 与连续两次错误只返回信号；Runtime 还会记录 cancelReason
+   *     （provider_circuit_open / provider_error）、在连续错误时 messages.resetToPromptOnly()，
+   *     并给非 system 会话写入“AI 服务暂时不可用”的 lastReply（#finalize 因此不再发强制摘要），
+   *     而本方法对连续错误恒返回 needsSummary:true。
+   *   - Runtime 在递增后回退 tracker 轮次（rollbackTick），重试前做可被 abort 打断的 2 秒等待；
+   *     本方法只返回 retry，不涉及 tracker 与等待。
+   */
   checkAfterAiError(aiErr: { code?: string; message?: string }, ctx: LoopContext): ExitSignal {
     if (this.#abortSignal?.aborted) {
       return {
@@ -419,8 +455,21 @@ export class ExitController {
     return CONTINUE;
   }
 
-  // ── 5. Post-text check (replaces #processTextResponse exit paths) ──
+  // ── 5. Post-text check（未接线，生效路径是 AgentRuntime.#processTextResponse） ──
 
+  /**
+   * @deprecated 未接线：AgentRuntime 不调用本方法，文本终答、digest nudge 与继续探索由
+   * AgentRuntime.#processTextResponse 内联判定；审阅决定（I34 方案 b）随待决事项②删除本方法
+   * 及其唯一产出的 'graceful_exit' 动作与 nudge 字段，之前只保留签名，不要接入新调用方。
+   *
+   * 与内联判定的语义差异：
+   *   - metrics 刚把 tracker 推入 SUMMARIZE 且本轮被判为终答时，本方法对任何管线都返回
+   *     'graceful_exit'（nudge 为 null，要求调用方自行生成）；Runtime 只对 analyst 管线注入 digest
+   *     nudge 并继续一轮，其它管线直接把本轮文本当作最终回复。
+   *   - Runtime 在 analyze 阶段先执行 grounding guard（enforcement='guard'）：阻断轮追加 nudge、
+   *     回退轮次并继续，达到连续阻断上限后降级放行；本方法不建模这一步。
+   *   - Runtime 的 nudge 直接追加到消息流并记录诊断/进度事件；本方法只把 nudge 放进返回值。
+   */
   checkAfterTextResponse(
     textResult: {
       isFinalAnswer: boolean;
@@ -466,8 +515,27 @@ export class ExitController {
     return { action: 'exit', reason: 'task_complete' };
   }
 
-  // ── 6. Graceful exit: toolChoice violation check ──
+  // ── 6. toolChoice violation check（未接线，生效路径是 AgentRuntime.#callLLM） ──
 
+  /**
+   * @deprecated 未接线：AgentRuntime 不调用本方法，“toolChoice=none 或 graceful exit 下仍返回工具调用”
+   * 由 AgentRuntime.#callLLM 内联判定；审阅决定（I34 方案 b）随待决事项②删除本方法，
+   * 之前只保留签名，不要接入新调用方。
+   *
+   * 与内联判定的语义差异（不能用本方法替代 Runtime 的判定）：
+   *   - Runtime 的违规条件是
+   *       tracker.isGracefulExit || (toolChoice === 'none' && !allowsToolCallsUnderForcedNone(mode))
+   *     本方法的条件是 tracker.isGracefulExit || tracker.phase === 'SUMMARIZE'，不接收 toolChoice。
+   *   - 无 tracker 时本方法恒放行：Runtime 会忽略 toolChoice='none' 下返回的工具调用，
+   *     按本方法判定的调用方会执行这些调用。
+   *   - 本方法不知道 provider 例外：DeepSeek V4 首轮 'tools-visible-no-forced-tool-choice' 模式下，
+   *     只要 tracker 不处于 graceful exit，Runtime 就放行 toolChoice='none' 下的工具调用
+   *     （allowsToolCallsUnderForcedNone），本方法在 SUMMARIZE 下仍判违规；
+   *     反过来，tracker 经 metrics 自然转入 SUMMARIZE（isGracefulExit=false）而 toolChoice 不是 'none' 时，
+   *     本方法判违规而 Runtime 不判。
+   *   - 违规且有文本时 Runtime 把文本清洗后写入 lastReply 并结束循环，无文本时继续下一轮；
+   *     本方法只返回 exit / retry 信号，不处理回复。
+   */
   checkToolChoiceViolation(llmResult: {
     text?: string | null;
     functionCalls?: unknown[] | null;
