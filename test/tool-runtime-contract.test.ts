@@ -3075,3 +3075,163 @@ describe('memory handler degraded diagnostics and finding rounds (L4-P21)', () =
     expect(coordinator.noteFinding.mock.calls[1]?.[3]).toBe(0);
   });
 });
+
+describe('L4-P16 code.write protected path segments', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  type ProtectedWriteMeta = {
+    resultStatus?: string;
+    diagnosticWarnings?: Array<{ code: string; message: string; stage?: string; tool?: string }>;
+  };
+
+  const writeCall = (target: string, content = 'overwritten') => ({
+    tool: 'code',
+    action: 'write',
+    params: { path: target, content, createDirectories: true },
+  });
+
+  // 任一段（大小写不敏感）命中 .git / node_modules / .env 族都必须拒绝，且拒绝前不写盘。
+  it.each([
+    { target: '.env', rule: 'env-file' },
+    { target: '.env.local', rule: 'env-file' },
+    { target: '.ENV.Production.Local', rule: 'env-file' },
+    { target: 'packages/x/.env', rule: 'env-file' },
+    { target: 'packages/x/node_modules/a.js', rule: 'dependency-directory' },
+    { target: 'Node_Modules/pkg/index.js', rule: 'dependency-directory' },
+    { target: 'packages/x/.git/HEAD', rule: 'git-metadata' },
+    { target: '.GIT/config', rule: 'git-metadata', seed: '.git/config' },
+  ])('denies $target by segment rule $rule with a diagnostic', async ({ target, rule, seed }) => {
+    await withWriteFixture(async (root) => {
+      if (seed) {
+        await mkdir(join(root, seed, '..'), { recursive: true });
+        await writeFile(join(root, seed), 'protected');
+      }
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await new ToolRouter().execute(writeCall(target), freshnessCtx(root));
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('Write denied');
+      expect(result.error).toContain('protected path');
+      expect(result.error).toContain(rule);
+      const meta = result._meta as ProtectedWriteMeta | undefined;
+      expect(meta?.resultStatus).toBe('blocked');
+      expect(meta?.diagnosticWarnings).toHaveLength(1);
+      expect(meta?.diagnosticWarnings?.[0]).toMatchObject({
+        code: 'code_write_protected_path',
+        stage: 'code.write',
+        tool: 'code',
+      });
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain(`path=${target}`);
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain(`rule=${rule}`);
+      const logs = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('[code.write]'));
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain(`path=${target}`);
+      expect(logs[0]).toContain(`rule=${rule}`);
+      expect(logs[0]).toContain('result=denied');
+      // 不记录待写内容。
+      expect(logs[0]).not.toContain('overwritten');
+
+      if (seed) {
+        // macOS 大小写不敏感：.GIT/config 与 .git/config 是同一文件，原内容必须保持。
+        expect(await readFile(join(root, seed), 'utf8')).toBe('protected');
+      } else {
+        await expect(readFile(join(root, target), 'utf8')).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      }
+    });
+  });
+
+  // 模板名按决定显式放行；只是名字里含 git/env/node_modules 字样的普通源码文件不受影响。
+  it.each([
+    '.env.example',
+    '.env.sample',
+    'packages/x/.ENV.Example',
+    'src/.gitignore',
+    'src/environment.ts',
+    'config/env.local.ts',
+    'src/node_modules_shim.ts',
+  ])('allows writing %s', async (target) => {
+    await withWriteFixture(async (root) => {
+      const result = await new ToolRouter().execute(
+        writeCall(target, 'template = 1\n'),
+        freshnessCtx(root)
+      );
+      expect(result.ok).toBe(true);
+      expect(await readFile(join(root, target), 'utf8')).toBe('template = 1\n');
+    });
+  });
+
+  it('denies a requested .env path even when it is a symlink to an ordinary file', async () => {
+    await withWriteFixture(async (root) => {
+      await mkdir(join(root, 'config'));
+      await writeFile(join(root, 'config/secrets.txt'), 'API_TOKEN=fixture');
+      await symlink(join(root, 'config/secrets.txt'), join(root, '.env'));
+      const result = await new ToolRouter().execute(writeCall('.env'), freshnessCtx(root));
+
+      expect(result.ok).toBe(false);
+      const meta = result._meta as ProtectedWriteMeta | undefined;
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('view=requested');
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('rule=env-file');
+      expect(await readFile(join(root, 'config/secrets.txt'), 'utf8')).toBe('API_TOKEN=fixture');
+    });
+  });
+
+  it('denies an ordinary alias whose real target is a nested .env file', async () => {
+    await withWriteFixture(async (root) => {
+      await mkdir(join(root, 'packages/x'), { recursive: true });
+      await writeFile(join(root, 'packages/x/.env.local'), 'SECRET=fixture');
+      await symlink(join(root, 'packages/x/.env.local'), join(root, 'settings.txt'));
+      const result = await new ToolRouter().execute(writeCall('settings.txt'), freshnessCtx(root));
+
+      expect(result.ok).toBe(false);
+      const meta = result._meta as ProtectedWriteMeta | undefined;
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('view=resolved');
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('path=packages/x/.env.local');
+      expect(await readFile(join(root, 'packages/x/.env.local'), 'utf8')).toBe('SECRET=fixture');
+    });
+  });
+
+  it('surfaces the denial as a blocked envelope with the diagnostic through the host adapter', async () => {
+    await withWriteFixture(async (root) => {
+      const logger = Logger.getInstance();
+      vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const adapter = new ToolRouterAdapter({
+        contextFactory: { create: () => freshnessCtx(root) },
+      });
+      const envelope = await adapter.execute({
+        toolId: 'code',
+        args: { action: 'write', params: { path: '.env.local', content: 'SECRET=x' } },
+        surface: 'runtime',
+        actor: { role: 'agent' },
+        source: { kind: 'runtime' },
+      });
+
+      expect(envelope.ok).toBe(false);
+      expect(envelope.status).toBe('blocked');
+      expect(envelope.diagnostics.warnings.map((warning) => warning.code)).toContain(
+        'code_write_protected_path'
+      );
+      expect(envelope.diagnostics.blockedTools).toEqual([
+        { tool: 'code', reason: expect.stringContaining('protected path') },
+      ]);
+      await expect(readFile(join(root, '.env.local'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+  });
+
+  it('describes the segment-based protected path rule in the code.write registry entry', () => {
+    const description = TOOL_REGISTRY.code.actions.write.description;
+    expect(description).toContain('any path segment');
+    expect(description).toContain('case-insensitive');
+    expect(description).toContain('.env.*');
+    expect(description).toContain('.env.example');
+    expect(description).toContain('.env.sample');
+  });
+});

@@ -223,7 +223,7 @@ const CODE_SPEC: ToolSpec = {
     write: {
       summary: 'Write file content',
       description:
-        'Create or overwrite a file. Protected paths (.git, node_modules, .env) are blocked.',
+        'Create or overwrite a file. Blocked when any path segment (case-insensitive, requested or symlink-resolved) is .git, node_modules, .env or .env.*; the .env.example and .env.sample templates are allowed.',
       params: {
         type: 'object',
         properties: {

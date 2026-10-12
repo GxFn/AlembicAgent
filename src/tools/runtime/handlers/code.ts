@@ -1408,7 +1408,116 @@ async function buildDirectoryTree(
 /*  code.write                                                         */
 /* ================================================================== */
 
-const PROTECTED_PATHS = ['.git', 'node_modules', '.env'];
+/**
+ * code.write 受保护路径规则（L4-P16 / I15）。
+ *
+ * 旧实现只认根目录、区分大小写、按 '/' 前缀匹配 ['.git','node_modules','.env']，
+ * `.env.local`、子目录 `.env`、嵌套 node_modules、macOS 上 `.GIT/config` 都能写穿。
+ * 现在改为按路径段判定：路径按 '/' 与平台分隔符拆段，每段统一小写后比较，任一段命中即拒绝：
+ *   - git-metadata：段等于 `.git`（含子目录里的 .git，如子模块/嵌套仓库）；
+ *   - dependency-directory：段等于 `node_modules`（含 monorepo 子包里的依赖目录）；
+ *   - env-file：段匹配 /^\.env(\..+)?$/（`.env`、`.env.local`、`.env.production.local` 等）。
+ * `.env.example` 与 `.env.sample` 是约定入库、不含密钥的模板名，按决策显式放行。
+ * 统一小写是为了覆盖 macOS/Windows 默认大小写不敏感的文件系统：`.GIT/config` 实际写的就是
+ * `.git/config`；在大小写敏感的文件系统上这只会多拒一个同名异写路径，属于偏严的安全取舍。
+ */
+type ProtectedPathRule = 'git-metadata' | 'dependency-directory' | 'env-file';
+
+const PROTECTED_ENV_FILE_PATTERN = /^\.env(\..+)?$/;
+const PROTECTED_ENV_TEMPLATE_NAMES: ReadonlySet<string> = new Set(['.env.example', '.env.sample']);
+
+/** 命中详情：path 是命中视图下相对项目根的路径，segment 保留原始大小写便于排查。 */
+interface ProtectedPathHit {
+  rule: ProtectedPathRule;
+  segment: string;
+  path: string;
+  /** requested：模型请求的词法路径；resolved：symlink 解析后的真实落盘路径。 */
+  view: 'requested' | 'resolved';
+}
+
+function protectedSegmentRule(segment: string): ProtectedPathRule | undefined {
+  const normalized = segment.toLowerCase();
+  if (normalized === '.git') {
+    return 'git-metadata';
+  }
+  if (normalized === 'node_modules') {
+    return 'dependency-directory';
+  }
+  if (
+    PROTECTED_ENV_FILE_PATTERN.test(normalized) &&
+    !PROTECTED_ENV_TEMPLATE_NAMES.has(normalized)
+  ) {
+    return 'env-file';
+  }
+  return undefined;
+}
+
+function findProtectedSegment(
+  relPath: string,
+  view: ProtectedPathHit['view']
+): ProtectedPathHit | undefined {
+  // 同时按 '/' 与 path.sep 拆段：POSIX 上两者相同；Windows 上模型可能混用两种分隔符。
+  const segments = relPath.split('/').flatMap((part) => part.split(path.sep));
+  for (const segment of segments) {
+    const rule = protectedSegmentRule(segment);
+    if (rule) {
+      return { rule, segment, path: relPath, view };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 两个视图都要查：
+ * - requested（词法路径）：`.env -> config/secrets.txt` 这类 symlink 的真实目标是普通文件名，
+ *   只查真实路径会放行对 `.env` 的写入；
+ * - resolved（realpath 后的路径）：`alias -> packages/x/.env.local` 这类别名的请求名无害，
+ *   只查词法路径会写穿受保护文件。
+ * resolveProjectFilePath 已保证两者都在项目根内，这里只做段匹配，不重复包含校验。
+ */
+function checkProtectedWritePath(
+  filePath: string,
+  projectRoot: string,
+  resolvedRelPath: string
+): ProtectedPathHit | undefined {
+  const lexicalRoot = path.resolve(projectRoot);
+  const requestedRelPath = path.relative(lexicalRoot, path.resolve(lexicalRoot, filePath));
+  return (
+    findProtectedSegment(requestedRelPath, 'requested') ??
+    findProtectedSegment(resolvedRelPath, 'resolved')
+  );
+}
+
+/**
+ * 受保护路径拒绝回执：blocked 状态让 adapter 记入 blockedTools，诊断与日志写明命中视图、
+ * 路径、原始段与规则，不记录待写内容；写入从未开始。
+ */
+function protectedPathDenial(hit: ProtectedPathHit): ToolResult {
+  const detail = `path=${hit.path}; view=${hit.view}; segment=${hit.segment}; rule=${hit.rule}`;
+  observeSafely(
+    () => Logger.getInstance().warn(`[code.write] ${detail}; result=denied; write=not-started`),
+    () => undefined
+  );
+  return {
+    ok: false,
+    data: null,
+    error: `Write denied: ${hit.path} is a protected path (segment "${hit.segment}" matched rule ${hit.rule})`,
+    _meta: {
+      cached: false,
+      tokensEstimate: 0,
+      durationMs: 0,
+      resultStatus: 'blocked',
+      diagnosticWarnings: [
+        {
+          code: 'code_write_protected_path',
+          message: `${detail}; write was not attempted`,
+          stage: 'code.write',
+          tool: 'code',
+        },
+      ],
+    },
+  };
+}
 
 // 写前新鲜度门的指纹只由 deltaCache 计算：读、写后登记都让缓存自算（set 的 hash 传 undefined），
 // 写前比较走 deltaCache.isFresh()，本 handler 不再保留第二份指纹实现。
@@ -1431,16 +1540,16 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
     return fail(resolved.error);
   }
 
-  for (const p of PROTECTED_PATHS) {
-    if (resolved.relPath === p || resolved.relPath.startsWith(`${p}/`)) {
-      return fail(`Write denied: ${p} is a protected path`);
-    }
+  // 受保护路径先于新鲜度门判定：拒绝不读盘、不建目录、不写盘。
+  const protectedHit = checkProtectedWritePath(filePath, ctx.projectRoot, resolved.relPath);
+  if (protectedHit) {
+    return protectedPathDenial(protectedHit);
   }
 
   // ── B-1 写前新鲜度门（read-before-write, TOCTOU）──────────────────────
   // 新文件判定 key 在"写时磁盘是否存在"，非"cache 是否有记录"：磁盘已存在但本 run 未读的
   // 文件（上一轮产物或并发 host rescan/job 写的）必须走"已存在"分支，否则被当新文件放行
-  // → 重开 TOCTOU 洞。deltaCache 未注入时门降级透传，由 PROTECTED_PATHS 兜底。
+  // → 重开 TOCTOU 洞。deltaCache 未注入时门降级透传，由受保护路径段规则兜底。
   const freshness = await checkWriteFreshness(resolved.absPath, resolved.relPath, ctx);
   if (!freshness.ok) {
     return fail(freshness.error);
@@ -1522,7 +1631,7 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
  *   2. 磁盘存在 ∧ 已读 ∧ 当前磁盘指纹 ≠ 读时指纹 → 拒：changed externally
  *   3. 磁盘存在 ∧ 已读 ∧ 指纹一致              → 准
  *   4. 磁盘不存在                              → 准（新文件）
- * deltaCache 未注入：透传（不误拒合法写，安全退回 PROTECTED_PATHS）。key 用 relPath（与 :459 一致）。
+ * deltaCache 未注入：透传（不误拒合法写，安全退回受保护路径段规则）。key 用 relPath（与 :459 一致）。
  * 态 2/3 的指纹比较交给 deltaCache.isFresh()（指纹单源）；缺 isFresh 的旧式实现降级为与缓存
  * 全文的精确比对：只会误拒（缓存未保存全文时），不会误放行。
  */
