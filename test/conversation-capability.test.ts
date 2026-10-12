@@ -42,6 +42,8 @@ describe('conversation capability', () => {
     });
 
     const context = capability.buildContext({});
+    // 运行循环已不驱动 Capability 步骤钩子（I48，见 agent-runtime-internal-cleanup.test.ts）；
+    // 这里直接调用公开的 onAfterStep，只为确认宿主自行调用时也不会触碰协调器。
     capability.onAfterStep({
       toolCalls: [{ tool: 'code', args: { action: 'read' }, result: { content: 'ok' } }],
     });
@@ -62,6 +64,8 @@ describe('conversation capability', () => {
     }).build({ preset: 'chat' });
 
     for (const capability of runtime.capabilities) {
+      // 运行循环只经 SystemPromptBuilder 调用 buildContext；onAfterStep 不再由循环驱动，
+      // 仍直接调用公开钩子，覆盖宿主自行调用的路径。
       capability.buildContext({});
       capability.onAfterStep({ toolCalls: [{ tool: 'code', args: {}, result: {} }] });
     }

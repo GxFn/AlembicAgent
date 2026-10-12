@@ -5,7 +5,6 @@ import type { ToolCallHook } from '../../runtime/AgentRuntimeTypes.js';
 export interface PipelineRuntime {
   id: string;
   reactLoop(prompt: string, opts?: Record<string, unknown>): Promise<StageResult>;
-  logger?: { info?: (...args: unknown[]) => void };
   bus?: Pick<AgentEventBus, 'on' | 'off'>;
   toolCallHistory?: readonly unknown[];
   onToolCall?: ToolCallHook | null;

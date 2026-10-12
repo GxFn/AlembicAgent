@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
+import type { GroundingEnforcement } from './AgentRuntimeTypes.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
 
@@ -160,7 +161,7 @@ export interface PcvNodeEvidenceSummary {
    * groundingLedger（classification 等）解读为审计材料而非质量判定：observe-only 下增多的 invalid-no-evidence
    * 是预期、不应误判为回归（R6）。纯 additive：老消费者忽略此字段不受影响（schemaVersion 不变）。
    */
-  groundingEnforcement: 'off' | 'guard';
+  groundingEnforcement: GroundingEnforcement;
   groundingLedger: PcvBurnGroundingLedgerEntry[];
   inputAssembly: PcvNodeInputAssemblyEvidence | null;
   ledgerRefs: PcvNodeLedgerRef[];

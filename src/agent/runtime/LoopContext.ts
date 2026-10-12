@@ -23,6 +23,7 @@ import type { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
 import type { ActiveContext } from '../memory/ActiveContext.js';
 import type { MemoryCoordinator } from '../memory/MemoryCoordinator.js';
+import type { GroundingEnforcement } from './AgentRuntimeTypes.js';
 import type { BudgetController } from './BudgetController.js';
 import type { DiagnosticsCollector } from './DiagnosticsCollector.js';
 import type { ExitController } from './ExitController.js';
@@ -89,7 +90,7 @@ interface LoopContextConfig {
   context?: Record<string, unknown>;
   contextWindow?: ContextWindow | null;
   toolChoiceOverride?: string | null;
-  groundingEnforcement?: 'off' | 'guard';
+  groundingEnforcement?: GroundingEnforcement;
   abortSignal?: AbortSignal | null;
   diagnostics?: DiagnosticsCollector | null;
   exitController?: ExitController | null;
@@ -197,7 +198,7 @@ export class LoopContext {
    * AgentRuntime 在 #initLoop 解析（per-run override ?? 全局默认）后注入；
    * CP1 政策文本注入（LLMInputAssembly）与 CP4 analyze 阻断（AgentRuntime 调用点）仅在 `'guard'` 时生效。
    */
-  groundingEnforcement: 'off' | 'guard';
+  groundingEnforcement: GroundingEnforcement;
 
   /** 外部中止信号 — hard timeout 时取消进行中的 LLM 调用 */
   abortSignal: AbortSignal | null;

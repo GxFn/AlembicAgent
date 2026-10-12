@@ -7,9 +7,3 @@ export {
   type StrategyResult,
   type StrategyRuntime,
 } from './Strategy.js';
-
-import { FanOutStrategy } from './FanOutStrategy.js';
-import { SingleStrategy } from './SingleStrategy.js';
-import { Strategy } from './Strategy.js';
-
-export default { Strategy, SingleStrategy, FanOutStrategy };

@@ -31,6 +31,7 @@ import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcome
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { basename, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import Logger from '@alembic/core/logging';
 import {
@@ -179,8 +180,10 @@ export class AgentRuntime {
   logger: Pick<Console, 'info' | 'warn'>;
   #projectRoot;
   #dataRoot;
-  /** 证据台账目录键（Wave A E2）：宿主 jobId 或按实例生成的稳定回退；同实例多次 reactLoop 共享 */
+  /** 证据台账目录键（Wave A E2）：宿主 jobId 或按实例生成的稳定回退 `run-<runtime id>`；同实例多次 reactLoop 共享 */
   #evidenceJobId: string;
+  /** 证据台账目录键是否来自 runtime 回退（宿主未传 jobId）；只用于回退路径诊断。 */
+  #evidenceJobIdIsFallback: boolean;
   /** 文件缓存 (bootstrap 场景注入) */
   #fileCache: FileCacheEntry[] | null = null;
   /** 额外工具白名单 (调用方按需注入，不经 Capability) */
@@ -235,7 +238,11 @@ export class AgentRuntime {
     this.bus = AgentEventBus.getInstance();
     this.#projectRoot = config.projectRoot || process.cwd();
     this.#dataRoot = config.dataRoot || this.#projectRoot;
-    this.#evidenceJobId = config.jobId || `run-${Date.now()}`;
+    // 回退 jobId 绑定 runtime 实例 id（默认含随机 UUID 片段），而不是毫秒时间戳：
+    // 同一毫秒并发构建的两个 runtime 不会落进同一个 <dataRoot>/.asd/evidence-ledger/<jobId>/ 目录；
+    // 同一实例多次 reactLoop 仍共享同一回退目录。宿主 jobId 与 sharedState._bootstrapSessionId 优先。
+    this.#evidenceJobIdIsFallback = !config.jobId;
+    this.#evidenceJobId = config.jobId || `run-${this.id}`;
     this.#additionalTools = config.additionalTools || [];
     this.#modelRef =
       config.modelRef ||
@@ -244,7 +251,9 @@ export class AgentRuntime {
     this.#groundingEnforcementDefault = config.groundingEnforcement ?? 'off';
     this.#groundingEnforcement = this.#groundingEnforcementDefault;
     this.#toolPipeline = createToolPipeline();
-    this.#hookSystem = (config as { hookSystem?: HookSystem }).hookSystem ?? new HookSystem();
+    // HookSystem 由 runtime 自有：RuntimeConfig 从未声明 hookSystem，旧实现经强转读取的注入口
+    // 在 src、测试与宿主仓库中均无调用方（2026-10 扫描），已移除；外部订阅统一经 `runtime.hookSystem` getter。
+    this.#hookSystem = new HookSystem();
     registerDefaultHooks(this.#hookSystem, this.id, this.bus);
     this.#promptBuilder = new SystemPromptBuilder({
       persona: this.persona,
@@ -726,6 +735,28 @@ export class AgentRuntime {
       sharedState: sharedState ?? null,
       logger: this.logger,
     });
+    // 回退路径诊断：宿主未传 jobId，且台账实际落在 runtime 回退目录（即 sharedState 也未给
+    // _bootstrapSessionId）时记录一次。直接比对打开结果的 job 目录，不复制 openLoopEvidence 的选择逻辑。
+    if (
+      evidenceLedger &&
+      this.#evidenceJobIdIsFallback &&
+      basename(dirname(evidenceLedger.filePath)) === this.#evidenceJobId
+    ) {
+      const ledgerFile = evidenceLedger.filePath;
+      observeSafely(
+        () =>
+          this.logger.info(
+            '[AgentRuntime] evidence ledger opened under runtime-scoped fallback job id',
+            {
+              jobId: this.#evidenceJobId,
+              runtimeId: this.id,
+              dimensionId: basename(ledgerFile, '.jsonl'),
+              reason: 'no host jobId and no sharedState._bootstrapSessionId',
+            }
+          ),
+        () => undefined
+      );
+    }
 
     // 当前运行资源准备后再查询。schema 与执行动作消费同一快照；无资源的静态目录不能代替此判断。
     const projection = this.#queryToolSchemas(toolContract, this.#modelRef, {
@@ -890,15 +921,9 @@ export class AgentRuntime {
       }
     }
 
-    // Capability 前置钩子 (always executed regardless of exit controller)
-    for (const cap of ctx.capabilities) {
-      cap.onBeforeStep({
-        iteration: ctx.iteration,
-        messages: ctx.messages.toMessages(),
-        prompt: ctx.prompt,
-      });
-    }
-
+    // 运行循环不驱动 Capability.onBeforeStep/onAfterStep：两个钩子在全仓没有任何覆盖实现，
+    // 旧调用每轮为每个能力复制整份消息历史只为传给空函数，且未经 observeSafely 隔离。
+    // 基类空方法属于 tools 公开面，保留不动；若将来出现真实消费者，应按能力是否覆盖惰性构造参数并隔离异常。
     return false;
   }
 
@@ -1777,16 +1802,13 @@ export class AgentRuntime {
       closeRound();
     }
 
-    // Capability 后置钩子
+    // 本轮工具步骤摘要只交给状态机（Capability.onAfterStep 不再由运行循环驱动，见 #shouldExit 说明）。
     const stepToolEntries = ctx.toolCalls.slice(-activeCalls.length);
     const stepResult = {
       type: 'tool_calls',
       toolCalls: stepToolEntries,
       iteration: ctx.iteration,
     };
-    for (const cap of ctx.capabilities) {
-      cap.onAfterStep(stepResult);
-    }
 
     this.#safeTransition('step_done', stepResult);
 

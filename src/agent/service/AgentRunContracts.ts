@@ -2,6 +2,7 @@ import type { AgentMessage } from '../runtime/AgentMessage.js';
 import type {
   AgentDiagnostics,
   FileCacheEntry,
+  GroundingEnforcement,
   ProgressEvent,
   ToolCallEntry,
 } from '../runtime/AgentRuntimeTypes.js';
@@ -174,7 +175,7 @@ export interface AgentRunExecutionOptions {
   budgetOverride?: Record<string, unknown>;
   toolChoiceOverride?: 'auto' | 'required' | 'none';
   /** per-run grounding enforcement 覆盖（AP-3）；不设则回退 runtime 全局默认（默认 observe-only `'off'`）。 */
-  groundingEnforcement?: 'off' | 'guard';
+  groundingEnforcement?: GroundingEnforcement;
   diagnostics?: unknown;
   onProgress?: ((event: ProgressEvent) => void) | null;
   onToolCall?:
@@ -225,7 +226,7 @@ export interface AgentRuntimeRunOptions {
   budgetOverride?: Record<string, unknown>;
   toolChoiceOverride?: 'auto' | 'required' | 'none';
   /** per-run grounding enforcement 覆盖（AP-3）；透传至 runtime.execute → reactLoop。 */
-  groundingEnforcement?: 'off' | 'guard';
+  groundingEnforcement?: GroundingEnforcement;
   contextWindow?: unknown;
   trace?: unknown;
   memoryCoordinator?: unknown;
