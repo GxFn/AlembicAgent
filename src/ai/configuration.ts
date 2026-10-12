@@ -406,7 +406,20 @@ export function embedProviderOptions(env: ConfigEnvironment = process.env) {
   };
 }
 
-/** 保留同步 UI 配置投影，返回声明值与 key 存在性，不返回任何凭据。 */
+/**
+ * 保留同步 UI 配置投影，返回声明值与 key 存在性，不返回任何凭据。
+ *
+ * 声明投影，不代表就绪；就绪请用 Core isAiEnvReady / 宿主 AiRuntimeStatus。
+ * - provider 只原样回显 ALEMBIC_AI_PROVIDER，未声明时为 'auto'；'none' 不是任何合法
+ *   provider 身份，本函数不会自行产出它，因此 `provider && provider !== 'none'` 之类的
+ *   判断实际恒为真，不能当作“AI 已配置”。
+ * - provider 不做身份校验，也不做自动发现：声明了 key 型 provider 但缺 key 时照样回显；
+ *   Agent 侧的实际选择由 detectProvider/createProvider 决定。
+ * - hasKey/keys 只统计四个 key 型 provider 的 key 是否存在（trim 后非空），
+ *   ollama 这类无需 key 的 provider 不在其中，所以 hasKey 同样不是就绪信号。
+ * 宿主 status/health 需要就绪结论时，应使用 Core isAiEnvReady(collectAiEnv(env))，
+ * 或已初始化容器的 getAiRuntimeStatus；本投影只用于展示声明值。
+ */
 export function aiConfigInfo(env: ConfigEnvironment = process.env) {
   const hasKey = (id: ProviderId) => !!env[providerConfig(id).keyEnvVar]?.trim();
   const keys = {
