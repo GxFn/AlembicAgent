@@ -117,37 +117,50 @@ function formatResult(result: PackageResult): string {
   return parts.join('\n');
 }
 
-/** 尝试解析 raw 输出，失败返回 null */
+/**
+ * 严格入口：格式不符返回 null，解析器自身缺陷（异常）直接抛出。
+ * 只供 OutputCompressor 使用（不经 parsers/index.ts 公开），由压缩器经 reportParserError 归类为 parser-error；
+ * 解析器模块按分层契约没有运行时依赖、不能自己写日志，所以异常必须交给压缩器记录。
+ */
+export function parseStrict(raw: string): string | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+
+  // 计数行可能出现在稍后失败的安装中；不能只摘出早期计数并吞掉失败事实。
+  if (/^\s*(?:npm\s+(?:ERR!|error)(?:\s|$)|ERR_PNPM_|error\b)/im.test(raw)) {
+    return null;
+  }
+  // 漏洞行是安装结果里最不能丢的事实：除已作为 WARN 收进 warnings 的行外，任何提到漏洞
+  // 却不是已识别审计摘要的行，都说明格式超出本解析器认知，整体交回原文。
+  if (
+    raw
+      .split('\n')
+      .some(
+        (line) =>
+          VULNERABILITY_WORD_RE.test(line) && !WARN_RE.test(line) && !NPM_AUDIT_RE.test(line)
+      )
+  ) {
+    return null;
+  }
+  // Yarn 的 YN0000 是普通日志级别，Fetched 也不是新增安装数；缺乏明确计数时保留原文。
+  const result = tryNpm(raw) ?? tryPnpm(raw);
+  if (!result) {
+    return null;
+  }
+
+  return formatResult(result);
+}
+
+/**
+ * 尝试解析 raw 输出，失败返回 null。
+ * 公开契约：从不抛错，内部异常同样返回 null；需要区分“格式不符”与“解析器缺陷”的调用方使用 parseStrict。
+ */
 export function parse(raw: string): string | null {
   try {
-    if (!raw || raw.trim().length === 0) {
-      return null;
-    }
-
-    // 计数行可能出现在稍后失败的安装中；不能只摘出早期计数并吞掉失败事实。
-    if (/^\s*(?:npm\s+(?:ERR!|error)(?:\s|$)|ERR_PNPM_|error\b)/im.test(raw)) {
-      return null;
-    }
-    // 漏洞行是安装结果里最不能丢的事实：除已作为 WARN 收进 warnings 的行外，任何提到漏洞
-    // 却不是已识别审计摘要的行，都说明格式超出本解析器认知，整体交回原文。
-    if (
-      raw
-        .split('\n')
-        .some(
-          (line) =>
-            VULNERABILITY_WORD_RE.test(line) && !WARN_RE.test(line) && !NPM_AUDIT_RE.test(line)
-        )
-    ) {
-      return null;
-    }
-    // Yarn 的 YN0000 是普通日志级别，Fetched 也不是新增安装数；缺乏明确计数时保留原文。
-    const result = tryNpm(raw) ?? tryPnpm(raw);
-    if (!result) {
-      return null;
-    }
-
-    return formatResult(result);
+    return parseStrict(raw);
   } catch (err: unknown) {
+    // 公开 parse* 没有诊断通道（解析器不能依赖日志模块）；经 OutputCompressor 调用时走 parseStrict，异常会被记录为 parser-error。
     void err;
     return null;
   }

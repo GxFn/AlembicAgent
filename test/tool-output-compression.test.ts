@@ -2,6 +2,7 @@ import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   OutputCompressor,
+  parseGitDiffOutput,
   parseGitStatusOutput,
   parseLintOutput,
   parsePackageOutput,
@@ -32,6 +33,14 @@ async function terminalOutput(command: string, stdout: string, stderr = '', budg
     actor: { role: 'agent' },
     source: { kind: 'runtime', name: 'compression-fixture' },
   });
+}
+
+/**
+ * 专用解析器摘要的期望文本：首行固定为 '[summarized by <parser>; raw <N> chars]'，N 是被摘要的
+ * stdout 字符数。terminal 装配时会 trimEnd stdout，所以按 trimEnd 后的长度计算。
+ */
+function summarized(parser: string, stdout: string, body: string): string {
+  return `[summarized by ${parser}; raw ${stdout.trimEnd().length} chars]\n${body}`;
 }
 
 describe('terminal output fidelity and budgets', () => {
@@ -187,13 +196,17 @@ describe('test failure details in stdout', () => {
 
   it('names every pytest failure from the short test summary', async () => {
     expect((await terminalOutput('pytest', PYTEST_FULL)).text).toBe(
-      [
-        'Tests: 2 passed, 2 failed, 4 total',
-        '',
-        '[failures]',
-        'FAIL test_a.py::test_x: assert 1 == 2',
-        "FAIL test_a.py::test_y: KeyError: 'k'",
-      ].join('\n')
+      summarized(
+        'test-output',
+        PYTEST_FULL,
+        [
+          'Tests: 2 passed, 2 failed, 4 total',
+          '',
+          '[failures]',
+          'FAIL test_a.py::test_x: assert 1 == 2',
+          "FAIL test_a.py::test_y: KeyError: 'k'",
+        ].join('\n')
+      )
     );
   });
 
@@ -266,13 +279,17 @@ describe('test failure details in stdout', () => {
 
   it('names every numbered mocha failure and counts pending tests', async () => {
     expect((await terminalOutput('mocha', MOCHA_SPEC)).text).toBe(
-      [
-        'Tests: 1 passed, 2 failed, 1 skipped, 4 total',
-        '',
-        '[failures]',
-        'FAIL suite bad: Error: boom',
-        'FAIL suite worse: AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: | 1 !== 2 | + expected - actual',
-      ].join('\n')
+      summarized(
+        'test-output',
+        MOCHA_SPEC,
+        [
+          'Tests: 1 passed, 2 failed, 1 skipped, 4 total',
+          '',
+          '[failures]',
+          'FAIL suite bad: Error: boom',
+          'FAIL suite worse: AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: | 1 !== 2 | + expected - actual',
+        ].join('\n')
+      )
     );
   });
 
@@ -362,18 +379,22 @@ describe('lint output from real formatters', () => {
 
   it('keeps file, line and rule details from multi-file ESLint stylish output', async () => {
     expect((await terminalOutput('eslint .', ESLINT_STYLISH)).text).toBe(
-      [
-        '4 errors, 3 warnings',
-        '',
-        'Top issues:',
-        '  /repo/src/a.js:1: Unexpected var, use let or const instead (no-var)',
-        "  /repo/src/a.js:1: 'a' is assigned a value but never used (no-unused-vars)",
-        '  /repo/src/a.js:1: Missing semicolon (semi)',
-        '  /repo/src/a.js:2: Unexpected var, use let or const instead (no-var)',
-        "  /repo/src/a.js:2: 'b' is assigned a value but never used (no-unused-vars)",
-        "  /repo/src/b.js:1: 'unused' is assigned a value but never used (no-unused-vars)",
-        "  /repo/src/b.js:2: Expected '===' and instead saw '==' (eqeqeq)",
-      ].join('\n')
+      summarized(
+        'lint-output',
+        ESLINT_STYLISH,
+        [
+          '4 errors, 3 warnings',
+          '',
+          'Top issues:',
+          '  /repo/src/a.js:1: Unexpected var, use let or const instead (no-var)',
+          "  /repo/src/a.js:1: 'a' is assigned a value but never used (no-unused-vars)",
+          '  /repo/src/a.js:1: Missing semicolon (semi)',
+          '  /repo/src/a.js:2: Unexpected var, use let or const instead (no-var)',
+          "  /repo/src/a.js:2: 'b' is assigned a value but never used (no-unused-vars)",
+          "  /repo/src/b.js:1: 'unused' is assigned a value but never used (no-unused-vars)",
+          "  /repo/src/b.js:2: Expected '===' and instead saw '==' (eqeqeq)",
+        ].join('\n')
+      )
     );
   });
 
@@ -441,7 +462,7 @@ describe('directory output structure', () => {
     ['ls -R .', '.:\npackage.json\nsrc\n\n./src:\na.ts\nnested\n\n./src/nested:\nb.ts'],
   ])('retains the real hierarchy from %s', async (command, stdout) => {
     expect((await terminalOutput(command, stdout)).text).toBe(
-      'package.json\nsrc/\n  a.ts\n  nested/\n    b.ts'
+      summarized('tree', stdout, 'package.json\nsrc/\n  a.ts\n  nested/\n    b.ts')
     );
   });
 
@@ -487,7 +508,7 @@ describe('directory output structure', () => {
       'a.ts\nempty/\nsrc/\n  b.ts',
     ],
   ])('keeps the directory marker of empty entries listed by %s', async (command, stdout, expected) => {
-    expect((await terminalOutput(command, stdout)).text).toBe(expected);
+    expect((await terminalOutput(command, stdout)).text).toBe(summarized('tree', stdout, expected));
   });
 
   it.each([
@@ -507,7 +528,7 @@ describe('directory output structure', () => {
       'src/\n  a.ts\n(2 entries under dist omitted)',
     ],
   ])('announces entries filtered out of %s', async (command, stdout, expected) => {
-    expect((await terminalOutput(command, stdout)).text).toBe(expected);
+    expect((await terminalOutput(command, stdout)).text).toBe(summarized('tree', stdout, expected));
   });
 
   it.each([
@@ -523,7 +544,7 @@ describe('directory output structure', () => {
       'node_modules/\n  x/\n    index.js\n    package.json',
     ],
   ])('stops filtering when %s names an ignored directory', async (command, stdout, expected) => {
-    expect((await terminalOutput(command, stdout)).text).toBe(expected);
+    expect((await terminalOutput(command, stdout)).text).toBe(summarized('tree', stdout, expected));
   });
 });
 
@@ -559,6 +580,9 @@ describe('directory filter diagnostics', () => {
   });
 
   it('records why an all-ignored listing falls back to raw output', async () => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
     const warn = vi
       .spyOn(Logger.getInstance(), 'warn')
       .mockImplementation(() => Logger.getInstance());
@@ -566,9 +590,13 @@ describe('directory filter diagnostics', () => {
     expect(await new OutputCompressor().compress(stdout, { command: "find . -name '*.js'" })).toBe(
       stdout
     );
-    const messages = warn.mock.calls.map(([message]) => String(message));
+    // 全部条目被忽略名过滤是预期路径，不是故障：记 info，warn 只留给 parser-error 与加载失败。
+    const messages = info.mock.calls.map(([message]) => String(message));
     expect(messages).toContain(
       '[OutputCompressor] parser=tree; fallback=generic; reason=all-entries-ignored'
+    );
+    expect(warn.mock.calls.map(([message]) => String(message)).join('\n')).not.toContain(
+      'all-entries-ignored'
     );
   });
 });
@@ -615,7 +643,7 @@ describe('git status facts', () => {
     const stdout =
       'On branch main\nUntracked files:\n\tnew.ts\n\nnothing added to commit but untracked files present (use "git add" to track)';
     expect((await terminalOutput('git status', stdout)).text).toBe(
-      'branch: main\nuntracked(1): new.ts'
+      summarized('git-status', stdout, 'branch: main\nuntracked(1): new.ts')
     );
   });
 
@@ -639,7 +667,11 @@ describe('git status facts', () => {
       'no changes added to commit (use "git add" and/or "git commit -a")',
     ].join('\n');
     expect((await terminalOutput('git status', stdout)).text).toBe(
-      "branch: main; Your branch is ahead of 'origin/main' by 1 commit.\nmodified(1): src/kept.ts\ndeleted(1): src/old.ts"
+      summarized(
+        'git-status',
+        stdout,
+        "branch: main; Your branch is ahead of 'origin/main' by 1 commit.\nmodified(1): src/kept.ts\ndeleted(1): src/old.ts"
+      )
     );
   });
 
@@ -660,7 +692,9 @@ describe('git status facts', () => {
     const expected =
       'staged(2): d.ts, g.ts\ndeleted(1): c.ts\nrenamed(1): a.ts -> b.ts\ncopied(1): e.ts -> f.ts\ntypechanged(1): link.ts';
     expect(parseGitStatusOutput(porcelain)).toBe(expected);
-    expect((await terminalOutput('git status', human)).text).toBe(`branch: main\n${expected}`);
+    expect((await terminalOutput('git status', human)).text).toBe(
+      summarized('git-status', human, `branch: main\n${expected}`)
+    );
   });
 
   it('recognizes a detached HEAD instead of falling back for the whole status', async () => {
@@ -672,7 +706,7 @@ describe('git status facts', () => {
       'no changes added to commit (use "git add" and/or "git commit -a")',
     ].join('\n');
     expect((await terminalOutput('git status', stdout)).text).toBe(
-      'branch: HEAD detached at abc1234\nmodified(1): a.ts'
+      summarized('git-status', stdout, 'branch: HEAD detached at abc1234\nmodified(1): a.ts')
     );
   });
 
@@ -700,12 +734,12 @@ describe('git status facts', () => {
   it('reports a lone intent-to-add entry instead of an empty summary', async () => {
     const result = await terminalOutput('git status --short', ' A new.ts');
     expect(result.status).toBe('success');
-    expect(result.text).toBe('intent-to-add(1): new.ts');
+    expect(result.text).toBe(summarized('git-status', ' A new.ts', 'intent-to-add(1): new.ts'));
   });
 
   it('keeps an intent-to-add entry next to other worktree changes', async () => {
     expect((await terminalOutput('git status --short', ' A new.ts\n M b.ts')).text).toBe(
-      'modified(1): b.ts\nintent-to-add(1): new.ts'
+      summarized('git-status', ' A new.ts\n M b.ts', 'modified(1): b.ts\nintent-to-add(1): new.ts')
     );
     expect(parseGitStatusOutput('## main\n A new.ts')).toBe(
       'branch: main\nintent-to-add(1): new.ts'
@@ -751,9 +785,12 @@ describe('git diff facts', () => {
   it('counts +++ and --- as changed content inside a hunk, not file headers', async () => {
     const stdout =
       'diff --git a/a.ts b/a.ts\nindex 1111111..2222222 100644\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n---previous;\n+++next;\n unchanged';
-    expect((await terminalOutput('git diff', stdout)).text).toBe(
-      '1 files changed, +1/-1 lines\n\na.ts: +1/-1'
+    // 预算内 git diff 保留补丁原文；计数摘要只在超预算时出现，这里用 25 token（100 字符）的预算触发。
+    expect(stdout.length).toBeGreaterThan(100);
+    expect((await terminalOutput('git diff', stdout, '', 25)).text).toBe(
+      summarized('git-diff', stdout, '1 files changed, +1/-1 lines\n\na.ts: +1/-1')
     );
+    expect((await terminalOutput('git diff', stdout)).text).toBe(stdout);
   });
 
   it.each([
@@ -772,7 +809,7 @@ describe('git diff facts', () => {
       ' 4 files changed, 12 insertions(+), 1 deletion(-)',
       '',
     ].join('\n');
-    expect((await terminalOutput('git diff --stat main', stdout)).text).toBe(
+    expect(parseGitDiffOutput(stdout)).toBe(
       [
         '4 files changed, 12 insertions(+), 1 deletion(-)',
         '',
@@ -782,13 +819,14 @@ describe('git diff facts', () => {
         'src/{old => new}.ts | 0',
       ].join('\n')
     );
+    // 预算内 terminal 原样保留 --stat 输出（git-diff 属于预算内保留原文的解析器）。
+    expect((await terminalOutput('git diff --stat main', stdout)).text).toBe(stdout.trimEnd());
   });
 
   it('keeps the git diff --shortstat summary unchanged', async () => {
     const stdout = ' 2 files changed, 3 insertions(+), 1 deletion(-)\n';
-    expect((await terminalOutput('git diff --shortstat', stdout)).text).toBe(
-      '2 files changed, 3 insertions(+), 1 deletion(-)'
-    );
+    expect(parseGitDiffOutput(stdout)).toBe('2 files changed, 3 insertions(+), 1 deletion(-)');
+    expect((await terminalOutput('git diff --shortstat', stdout)).text).toBe(stdout.trimEnd());
   });
 
   it.each([
@@ -816,7 +854,10 @@ describe('git log facts', () => {
     const result = await terminalOutput('git log', stdout);
     expect(result.text).toContain('Actual Author: Actual subject');
     expect(result.text).not.toContain('abcdef1');
-    expect(result.text.split('\n')).toHaveLength(1);
+    // 首行是摘要标记，其后只有一条提交。
+    const lines = result.text.split('\n');
+    expect(lines[0]).toBe(`[summarized by git-log; raw ${stdout.length} chars]`);
+    expect(lines).toHaveLength(2);
   });
 
   it('announces omitted entries after the twenty-commit display cap', async () => {
@@ -848,7 +889,8 @@ describe('public compression entrypoints and initialization', () => {
       compressor.compress('?? fresh.ts', { command: 'git status' }),
       compressor.compress('?? fresh.ts', { command: 'git status' }),
     ]);
-    expect(outputs).toEqual(['untracked(1): fresh.ts', 'untracked(1): fresh.ts']);
+    const expected = summarized('git-status', '?? fresh.ts', 'untracked(1): fresh.ts');
+    expect(outputs).toEqual([expected, expected]);
   });
   it.each([
     'UU',
@@ -887,5 +929,239 @@ describe('public compression entrypoints and initialization', () => {
 
     expect(parsed).toContain('modified');
     expect(compressed).toContain('modified');
+  });
+});
+
+/**
+ * 压缩策略（I07）：预算内不改写事实。git-diff 预算内保留补丁原文；generic 路径预算内只去 ANSI，
+ * 超预算才折叠重复行；所有专用解析器摘要首行带 '[summarized by <parser>; raw <N> chars]'。
+ */
+describe('compression policy within and over budget', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // 约 290 字符的真实单文件补丁：宿主默认 8000 token 预算下必须原样可见。
+  const SMALL_PATCH = [
+    'diff --git a/src/a.ts b/src/a.ts',
+    'index 1111111..2222222 100644',
+    '--- a/src/a.ts',
+    '+++ b/src/a.ts',
+    '@@ -1,3 +1,4 @@',
+    ' export function total(items: number[]): number {',
+    '-  return items.length;',
+    '+  // sum the values instead of counting them',
+    '+  return items.reduce((sum, item) => sum + item, 0);',
+    ' }',
+  ].join('\n');
+
+  it('keeps a small git diff patch verbatim under the host budget', async () => {
+    expect(SMALL_PATCH.length).toBeGreaterThan(250);
+    // 解析器本身能摘要这段补丁；预算内保留原文是压缩策略的选择，不是解析失败的回退。
+    expect(parseGitDiffOutput(SMALL_PATCH)).toBe('1 files changed, +2/-1 lines\n\nsrc/a.ts: +2/-1');
+    expect((await terminalOutput('git diff src/a.ts', SMALL_PATCH, '', 8000)).text).toBe(
+      SMALL_PATCH
+    );
+  });
+
+  it('records a debug note when git diff keeps the raw patch within budget', async () => {
+    const debug = vi
+      .spyOn(Logger.getInstance(), 'debug')
+      .mockImplementation(() => Logger.getInstance());
+    const output = await new OutputCompressor().compress(SMALL_PATCH, {
+      command: 'git diff src/a.ts',
+      tokenBudget: 8000,
+    });
+    expect(output).toBe(SMALL_PATCH);
+    expect(debug.mock.calls.map(([message]) => String(message))).toContain(
+      `[OutputCompressor] parser=git-diff; raw-kept=within-budget; chars=${SMALL_PATCH.length}; budget=32000`
+    );
+  });
+
+  it('marks an over-budget git diff summary with the parser name and raw size', async () => {
+    const bigPatch = [
+      'diff --git a/src/big.ts b/src/big.ts',
+      'new file mode 100644',
+      'index 0000000..1111111',
+      '--- /dev/null',
+      '+++ b/src/big.ts',
+      '@@ -0,0 +1,400 @@',
+      ...Array.from({ length: 400 }, (_, index) => `+export const value${index} = ${index};`),
+    ].join('\n');
+    expect(bigPatch.length).toBeGreaterThan(4000);
+    const text = (await terminalOutput('git diff', bigPatch, '', 1000)).text;
+    expect(text.split('\n')[0]).toBe(`[summarized by git-diff; raw ${bigPatch.length} chars]`);
+    expect(text).toBe(
+      summarized('git-diff', bigPatch, '1 files changed, +400/-0 lines\n\nsrc/big.ts: +400/-0')
+    );
+  });
+
+  it('puts the summary marker before the summary and keeps stderr after it', async () => {
+    const output = await new OutputCompressor().compress(
+      '?? fresh.ts\n\n[stderr]\nwarning: fixture',
+      { command: 'git status' }
+    );
+    expect(output).toBe(
+      '[summarized by git-status; raw 11 chars]\nuntracked(1): fresh.ts\n\n[stderr]\nwarning: fixture'
+    );
+  });
+
+  it.each([
+    ['blank-line runs', 'a\n\n\n\n\nb'],
+    ['repeated closing braces', 'x\n  }\n  }\n  }\n  }\ny'],
+  ])('leaves %s untouched when generic output fits the budget', async (_label, stdout) => {
+    expect((await terminalOutput('cat notes.txt', stdout)).text).toBe(stdout);
+  });
+
+  it('still collapses repeated lines once generic output exceeds the budget', async () => {
+    const stdout = `${'tick\n'.repeat(400)}done`;
+    expect((await terminalOutput('cat build.log', stdout, '', 40)).text).toBe(
+      'tick\n  (repeated 399 times)\ndone'
+    );
+  });
+});
+
+/**
+ * 回退可观测（I12，压缩器部分）：解析器内部异常归类为 parser-error 并带错误类名；空输出跳过解析器且
+ * 不记回退；格式不认识和复合命令属于预期路径记 info；warn 只留给 parser-error 与加载失败。
+ */
+describe('compressor fallback diagnostics', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const DEFECT_SENTINEL = 'fixture-parser-defect';
+
+  /**
+   * 模拟解析器内部缺陷：所有解析器入口第一步都对原文调用 trim()，让含哨兵串的第一次 trim 抛 TypeError。
+   * 只抛一次，后续 generic 路径照常运行；不含哨兵的字符串不受影响。
+   */
+  function armParserDefect(): void {
+    const originalTrim = String.prototype.trim;
+    let armed = true;
+    vi.spyOn(String.prototype, 'trim').mockImplementation(function (this: string): string {
+      if (armed && String(this).includes(DEFECT_SENTINEL)) {
+        armed = false;
+        throw new TypeError('fixture parser defect');
+      }
+      return originalTrim.call(this);
+    });
+  }
+
+  function spyLogs() {
+    const silence = () => Logger.getInstance();
+    return {
+      warn: vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(silence),
+      info: vi.spyOn(Logger.getInstance(), 'info').mockImplementation(silence),
+      debug: vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(silence),
+    };
+  }
+
+  const messagesOf = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.map(([message]) => String(message));
+
+  it.each([
+    ['git status', 'git-status'],
+    ['git diff', 'git-diff'],
+    ['git log', 'git-log'],
+    ['vitest run', 'test-output'],
+    ['eslint .', 'lint-output'],
+    ['rg needle', 'grep'],
+    ['find .', 'tree'],
+    ['npm install', 'package'],
+  ])('reports an internal %s parser defect as parser-error', async (command, parser) => {
+    const compressor = new OutputCompressor();
+    // 先完成解析器加载，确保哨兵只在解析器内部被 trim。
+    await compressor.compress('warm-up', { command: 'git status' });
+    const logs = spyLogs();
+    armParserDefect();
+    // 5 token（20 字符）预算让 git-diff 也越过“预算内保留原文”而真正调用解析器。
+    const output = await compressor.compress(`${DEFECT_SENTINEL}/a.ts\nsecond line`, {
+      command,
+      tokenBudget: 5,
+    });
+    expect(output.length).toBeLessThanOrEqual(20);
+    expect(messagesOf(logs.warn)).toContain(
+      `[OutputCompressor] parser=${parser}; fallback=generic; reason=parser-error; error=TypeError`
+    );
+    const all = [...messagesOf(logs.warn), ...messagesOf(logs.info)].join('\n');
+    expect(all).not.toContain('unrecognized-output');
+    // 诊断只带解析器名与错误类名，不带输出原文或异常消息。
+    expect(all).not.toContain(DEFECT_SENTINEL);
+    expect(all).not.toContain('fixture parser defect');
+  });
+
+  it('keeps the public parse contract of never throwing on an internal defect', () => {
+    armParserDefect();
+    expect(parseGitStatusOutput(`${DEFECT_SENTINEL}.ts`)).toBeNull();
+  });
+
+  it.each([
+    ['git status', '[no output]'],
+    ['git diff', '[no output]'],
+    ['git status', '[stderr]\nfatal: not a git repository'],
+    ['rg needle', '[stderr]\nrg: missing.ts: No such file or directory'],
+  ])('skips the %s parser for empty stdout without a fallback diagnostic', async (command, raw) => {
+    const compressor = new OutputCompressor();
+    await compressor.compress('warm-up', { command: 'git status' });
+    const logs = spyLogs();
+    expect(await compressor.compress(raw, { command })).toBe(raw);
+    expect([...messagesOf(logs.warn), ...messagesOf(logs.info)].join('\n')).not.toContain(
+      'fallback=generic'
+    );
+    expect(messagesOf(logs.debug).join('\n')).toContain('parser-skipped=empty-stdout');
+  });
+
+  it('logs unrecognized output at info level and keeps warn for real faults', async () => {
+    const compressor = new OutputCompressor();
+    await compressor.compress('warm-up', { command: 'git status' });
+    const logs = spyLogs();
+    const stdout = 'On branch main\nnothing to commit, working tree clean';
+    expect(await compressor.compress(stdout, { command: 'git status' })).toBe(stdout);
+    expect(messagesOf(logs.info)).toContain(
+      '[OutputCompressor] parser=git-status; fallback=generic; reason=unrecognized-output'
+    );
+    expect(messagesOf(logs.warn)).toEqual([]);
+  });
+
+  it('logs a compound-command fallback at info level', async () => {
+    const compressor = new OutputCompressor();
+    await compressor.compress('warm-up', { command: 'git status' });
+    const logs = spyLogs();
+    expect(await compressor.compress('?? a.ts', { command: 'git status | cat' })).toBe('?? a.ts');
+    expect(messagesOf(logs.info)).toContain(
+      '[OutputCompressor] parser=git-status; fallback=generic; reason=compound-command'
+    );
+    expect(messagesOf(logs.warn)).toEqual([]);
+  });
+
+  it('records parsers-not-loaded when compressSync runs before loading and recovers after it', async () => {
+    vi.resetModules();
+    const { OutputCompressor: FreshCompressor } = await import(
+      '../src/tools/runtime/compressor/OutputCompressor.js'
+    );
+    // 重置模块后压缩器拿到的是新的日志模块实例，必须在同一注册表里取 Logger 再打桩。
+    const { default: FreshLogger } = await import('@alembic/core/logging');
+    const warn = vi
+      .spyOn(FreshLogger.getInstance(), 'warn')
+      .mockImplementation(() => FreshLogger.getInstance());
+    const compressor = new FreshCompressor();
+    // 加载前：本次只能走 generic，原文保留，并记一条 parsers-not-loaded。
+    expect(compressor.compressSync('?? fresh.ts', { command: 'git status' })).toBe('?? fresh.ts');
+    // 不会命中专用解析器的命令不算错过，不记诊断。
+    expect(compressor.compressSync('plain text', { command: 'cat notes.txt' })).toBe('plain text');
+    const notLoaded = () =>
+      warn.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes('parsers-not-loaded'));
+    expect(notLoaded()).toEqual([
+      '[OutputCompressor] parser=git-status; fallback=generic; reason=parsers-not-loaded',
+    ]);
+    // 同步入口已顺带启动加载；等同一个加载 Promise 完成后，同步调用恢复专用解析且不再记诊断。
+    await compressor.compress('plain text', { command: 'cat notes.txt' });
+    expect(compressor.compressSync('?? fresh.ts', { command: 'git status' })).toBe(
+      summarized('git-status', '?? fresh.ts', 'untracked(1): fresh.ts')
+    );
+    expect(notLoaded()).toHaveLength(1);
   });
 });

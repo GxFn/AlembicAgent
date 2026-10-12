@@ -266,7 +266,9 @@ function omissionNotice(state: ListingState): string {
 
 /**
  * 按命令上下文解析目录列表：命令显式指向被忽略名时关闭过滤，被过滤条目在结尾给计数提示。
- * 供 OutputCompressor 使用；公开的 parse 等价于不带命令上下文（始终过滤）的调用。
+ * 严格入口，只供 OutputCompressor 使用：格式不符返回 text=null，解析器自身缺陷（异常）直接抛出，
+ * 由压缩器经 reportParserError 归类为 parser-error（解析器模块按分层契约不能自己写日志）。
+ * 公开的 parse 等价于不带命令上下文（始终过滤）且吞掉异常的调用。
  */
 export function parseInContext(raw: string, command: string): TreeListingResult {
   const filterDisabled = commandTargetsIgnoredName(command);
@@ -276,43 +278,52 @@ export function parseInContext(raw: string, command: string): TreeListingResult 
     omittedNames: [],
     filterDisabled,
   };
-  try {
-    if (!raw || raw.trim().length === 0) {
-      return unrecognized;
-    }
-
-    // 先按真实格式分派；宽泛的“树行”正则曾把 find 路径和 tree footer 当成文件。
-    const filter = !filterDisabled;
-    const state = /[│├└]/.test(raw)
-      ? tryTreeCommand(raw, filter)
-      : /^(?:\.|\.\/.*|.*\/.*):$/m.test(raw)
-        ? tryLsR(raw, filter)
-        : tryFindOutput(raw, filter);
-    if (!state) {
-      return unrecognized;
-    }
-
-    const omitted = {
-      omittedEntries: state.omittedEntries,
-      omittedNames: state.omittedNames,
-      filterDisabled,
-    };
-    // 全部条目都被过滤时没有可展示的树，交回原文（统计仍返回，供调用方记录准确的回退原因）。
-    const lines = state.root.children.size > 0 ? renderTree(state.root, 0) : [];
-    if (lines.length === 0) {
-      return { text: null, ...omitted };
-    }
-    if (state.omittedEntries > 0) {
-      lines.push(omissionNotice(state));
-    }
-    return { text: lines.join('\n'), ...omitted };
-  } catch (err: unknown) {
-    void err;
+  if (!raw || raw.trim().length === 0) {
     return unrecognized;
   }
+
+  // 先按真实格式分派；宽泛的“树行”正则曾把 find 路径和 tree footer 当成文件。
+  const filter = !filterDisabled;
+  const state = /[│├└]/.test(raw)
+    ? tryTreeCommand(raw, filter)
+    : /^(?:\.|\.\/.*|.*\/.*):$/m.test(raw)
+      ? tryLsR(raw, filter)
+      : tryFindOutput(raw, filter);
+  if (!state) {
+    return unrecognized;
+  }
+
+  const omitted = {
+    omittedEntries: state.omittedEntries,
+    omittedNames: state.omittedNames,
+    filterDisabled,
+  };
+  // 全部条目都被过滤时没有可展示的树，交回原文（统计仍返回，供调用方记录准确的回退原因）。
+  const lines = state.root.children.size > 0 ? renderTree(state.root, 0) : [];
+  if (lines.length === 0) {
+    return { text: null, ...omitted };
+  }
+  if (state.omittedEntries > 0) {
+    lines.push(omissionNotice(state));
+  }
+  return { text: lines.join('\n'), ...omitted };
 }
 
-/** 尝试解析 raw 输出，失败返回 null */
-export function parse(raw: string): string | null {
+/** 不带命令上下文的严格入口：异常直接抛出，供压缩器统一归类为 parser-error。 */
+export function parseStrict(raw: string): string | null {
   return parseInContext(raw, '').text;
+}
+
+/**
+ * 尝试解析 raw 输出，失败返回 null。
+ * 公开契约：从不抛错，内部异常同样返回 null；需要区分“格式不符”与“解析器缺陷”的调用方使用 parseStrict。
+ */
+export function parse(raw: string): string | null {
+  try {
+    return parseStrict(raw);
+  } catch (err: unknown) {
+    // 公开 parse* 没有诊断通道（解析器不能依赖日志模块）；经 OutputCompressor 调用时走严格入口，异常会被记录为 parser-error。
+    void err;
+    return null;
+  }
 }

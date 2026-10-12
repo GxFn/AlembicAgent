@@ -140,21 +140,34 @@ function formatEntries(entries: LogEntry[]): string {
     : rendered;
 }
 
-/** 尝试解析 raw 输出，失败返回 null */
+/**
+ * 严格入口：格式不符返回 null，解析器自身缺陷（异常）直接抛出。
+ * 只供 OutputCompressor 使用（不经 parsers/index.ts 公开），由压缩器经 reportParserError 归类为 parser-error；
+ * 解析器模块按分层契约没有运行时依赖、不能自己写日志，所以异常必须交给压缩器记录。
+ */
+export function parseStrict(raw: string): string | null {
+  if (!raw || raw.trim().length === 0) {
+    return null;
+  }
+
+  // 已出现完整格式的标题时，失败不能再由oneline正则部分接管。
+  const entries = /^commit\s/m.test(raw) ? parseFullFormat(raw) : parseOneline(raw);
+  if (entries && entries.length > 0) {
+    return formatEntries(entries);
+  }
+
+  return null;
+}
+
+/**
+ * 尝试解析 raw 输出，失败返回 null。
+ * 公开契约：从不抛错，内部异常同样返回 null；需要区分“格式不符”与“解析器缺陷”的调用方使用 parseStrict。
+ */
 export function parse(raw: string): string | null {
   try {
-    if (!raw || raw.trim().length === 0) {
-      return null;
-    }
-
-    // 已出现完整格式的标题时，失败不能再由oneline正则部分接管。
-    const entries = /^commit\s/m.test(raw) ? parseFullFormat(raw) : parseOneline(raw);
-    if (entries && entries.length > 0) {
-      return formatEntries(entries);
-    }
-
-    return null;
+    return parseStrict(raw);
   } catch (err: unknown) {
+    // 公开 parse* 没有诊断通道（解析器不能依赖日志模块）；经 OutputCompressor 调用时走 parseStrict，异常会被记录为 parser-error。
     void err;
     return null;
   }

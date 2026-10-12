@@ -3,6 +3,8 @@
  *
  * 文本清理工具: ANSI 控制字符去除 + 连续重复行折叠。
  * 用于终端输出的显示清理；需要真实计数的解析器先消费未折叠的行集合。
+ * 重复行折叠会改写原文（插入的标记行与内容无法区分），OutputCompressor 只在超预算时才调用 cleanOutput，
+ * 预算内只用 stripAnsi。
  */
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape sequences require matching control characters
@@ -16,6 +18,7 @@ export function stripAnsi(text: string): string {
 /**
  * 折叠连续重复行。
  * 例如: 10 行 "." → 第一行 + "(repeated 9 times)"
+ * 标记行是普通文本，调用方不能把折叠结果当作文件原文（例如据此构造精确匹配的编辑片段）。
  */
 export function collapseRepeats(text: string, threshold = 3): string {
   const lines = text.split('\n');
@@ -76,7 +79,7 @@ export function truncateOutput(text: string, maxChars: number): string {
   return `${head}${marker}${tail}`;
 }
 
-/** 完整清理流水线: stripAnsi → collapseRepeats */
+/** 完整清理流水线: stripAnsi → collapseRepeats（有损：只适合超预算时的压缩，不适合预算内的原文展示） */
 export function cleanOutput(text: string): string {
   return collapseRepeats(stripAnsi(text));
 }
