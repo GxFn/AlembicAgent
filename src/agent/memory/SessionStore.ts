@@ -32,7 +32,7 @@ import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { stableStringify } from '#shared/serialization.js';
-import { truncateToTokenBudget } from '#shared/tokenUtils.js';
+import { estimateTokens, truncateToTokenBudget } from '#shared/tokenUtils.js';
 import type { SessionStoreNormalization, SessionStoreSerialized } from './SessionStoreSchema.js';
 import {
   normalizeDimensionDigest,
@@ -171,6 +171,15 @@ export interface SessionStoreConfig {
   fileCount?: number;
   modules?: string[];
   [key: string]: unknown;
+}
+
+/** buildContextForDimension 的段落类别；拼接顺序即截断优先级（见该方法注释）。 */
+type SessionContextBlockKind = 'header' | 'crossRefs' | 'reflections' | 'dimensions' | 'files';
+
+/** 会话上下文中可整体判定保留与否的一段文本，仅用于截断诊断。 */
+interface SessionContextBlock {
+  kind: SessionContextBlockKind;
+  text: string;
 }
 
 /** 工具参数 */
@@ -518,7 +527,16 @@ export class SessionStore implements Disposable {
   /**
    * 构建给 Analyst 的跨维度上下文
    *
-   * @param [focusKeywordsOrOpts] 关键词数组或 options 对象
+   * 段落按模型价值优先级装配，再整体按 tokenBudget 尾部截断（C44）：
+   *   1. 索引头：前序维度索引与证据检索提示（短）；
+   *   2. 其他维度写给当前维度的建议（§3 crossRefs）与 Tier 反思（§4，含 suggestionsForNextTier）——
+   *      前序维度专门写给本维度、或对后续维度的综合结论，相关度最高；
+   *   3. 前序维度发现（§1，已按 focusKeywords 命中数排序，同分保持历史顺序）；
+   *   4. 已读文件清单（§2）——可经 memory.get_previous_evidence 按需检索，价值最低。
+   * 旧顺序把 §3/§4 放在维度循环与文件清单之后，前序维度达到 8 个左右时会被 analyst 默认
+   * 1400 token 的会话预算整段裁掉。顺序不区分是否传入预算：无预算时内容不变，只是段落顺序一致。
+   *
+   * @param [focusKeywordsOrOpts] 关键词数组或 options 对象；数组形式等价于不限预算
    */
   buildContextForDimension(
     currentDimId: string,
@@ -534,7 +552,6 @@ export class SessionStore implements Disposable {
       tokenBudget = focusKeywordsOrOpts.tokenBudget ?? Infinity;
     }
 
-    const parts: string[] = [];
     const completedDims = [...this.#dimensionReports.entries()].filter(
       ([id]) => id !== currentDimId
     );
@@ -566,25 +583,47 @@ export class SessionStore implements Disposable {
       return '';
     }
 
-    parts.push('## 前序维度分析成果（避免重复探索）');
+    // 每个 block 是一段可整体判定“保留 / 部分保留 / 丢弃”的文本，只用于截断诊断；拼接顺序即优先级。
+    const blocks: SessionContextBlock[] = [];
+    const headerLines = ['## 前序维度分析成果（避免重复探索）'];
     if (completedDims.length > 0) {
-      parts.push(
+      headerLines.push(
         `前序维度索引: ${completedDims
           .slice(0, 5)
           .map(([id]) => id)
           .join(', ')}${completedDims.length > 5 ? ` (+${completedDims.length - 5})` : ''}`
       );
-      parts.push('详细来源可用 memory.get_previous_evidence 按关键词检索。');
+      headerLines.push('详细来源可用 memory.get_previous_evidence 按关键词检索。');
+    }
+    blocks.push({ kind: 'header', text: headerLines.join('\n') });
+
+    // §3: 跨维度引用建议（优先级最高：其他维度专门写给当前维度的结论）
+    const relevantCrossRefs = this.#crossReferences.filter((cr) => cr.to === currentDimId);
+    if (relevantCrossRefs.length > 0) {
+      blocks.push({
+        kind: 'crossRefs',
+        text: [
+          `### 其他维度对 ${currentDimId} 的建议`,
+          ...relevantCrossRefs.map((cr) => `- [来自 ${cr.from}] ${cr.detail}`),
+        ].join('\n'),
+      });
     }
 
-    // §1: 前序维度的关键发现
+    // §4: Tier Reflection（与 crossRefs 同级，紧随其后；文本与 getRelevantReflections 完全一致，
+    // 调用方据此做“是否已注入”的去重判定）
+    const reflections = this.getRelevantReflections(currentDimId);
+    if (reflections) {
+      blocks.push({ kind: 'reflections', text: reflections });
+    }
+
+    // §1: 前序维度的关键发现（completedDims 已按关键词相关度排序）
     for (const [dimId, report] of completedDims) {
-      parts.push(`### ${dimId}`);
+      const lines = [`### ${dimId}`];
 
       if (report.digest?.summary) {
-        parts.push(report.digest.summary);
+        lines.push(report.digest.summary);
       } else if (report.analysisText) {
-        parts.push(`${report.analysisText.substring(0, 300)}…`);
+        lines.push(`${report.analysisText.substring(0, 300)}…`);
       }
 
       let findings: Finding[] | undefined = report.findings;
@@ -598,58 +637,46 @@ export class SessionStore implements Disposable {
 
       const relevantFindings = this.#selectRelevantFindings(findings, focusKeywords, 5);
       if (relevantFindings.length > 0) {
-        parts.push('**具体发现**:');
+        lines.push('**具体发现**:');
         for (const f of relevantFindings) {
           let line = `- [${f.importance}/10] ${f.finding}`;
           if (f.evidence) {
             line += ` _(${f.evidence})_`;
           }
-          parts.push(line);
+          lines.push(line);
         }
       }
 
       const candidates = this.#submittedCandidates.get(dimId) || [];
       if (candidates.length > 0) {
-        parts.push(
+        lines.push(
           `已提交 ${candidates.length} 个候选: ${candidates.map((c) => c.title).join(', ')}`
         );
       }
+      blocks.push({ kind: 'dimensions', text: lines.join('\n') });
     }
 
-    // §2: 已读文件汇总
+    // §2: 已读文件汇总（优先级最低，放在最后，预算不足时最先被裁掉）
     const allReadFiles = this.getAllReferencedFiles();
     if (allReadFiles.size > 0) {
-      parts.push(`### 前序维度已扫描的文件 (${allReadFiles.size} 个)`);
-      const fileList = [...allReadFiles].slice(0, 30).join(', ');
-      parts.push(fileList);
+      const lines = [
+        `### 前序维度已扫描的文件 (${allReadFiles.size} 个)`,
+        [...allReadFiles].slice(0, 30).join(', '),
+      ];
       if (allReadFiles.size > 30) {
-        parts.push(`…还有 ${allReadFiles.size - 30} 个文件`);
+        lines.push(`…还有 ${allReadFiles.size - 30} 个文件`);
       }
-    }
-
-    // §3: 跨维度引用建议
-    const relevantCrossRefs = this.#crossReferences.filter((cr) => cr.to === currentDimId);
-    if (relevantCrossRefs.length > 0) {
-      parts.push(`### 其他维度对 ${currentDimId} 的建议`);
-      for (const cr of relevantCrossRefs) {
-        parts.push(`- [来自 ${cr.from}] ${cr.detail}`);
-      }
-    }
-
-    // §4: Tier Reflection
-    const reflections = this.getRelevantReflections(currentDimId);
-    if (reflections) {
-      parts.push(reflections);
+      blocks.push({ kind: 'files', text: lines.join('\n') });
     }
 
     // Token 预算裁剪
-    const text = parts.join('\n');
+    const text = blocks.map((block) => block.text).join('\n');
     // tokenBudget 来自宿主 opts 且未经校验；NaN 等非法值由 tokenUtils 按 0 处理并经此 logger 报告。
     const result = truncateToTokenBudget(text, tokenBudget, undefined, (level, message) =>
       this.#log(level, `[SessionStore] ${message}`)
     );
     if (result !== text) {
-      this.#logger.debug(`[SessionStore] context truncated to ${tokenBudget} estimated tokens`);
+      this.#logContextTruncation(currentDimId, tokenBudget, text, result, blocks);
     }
     return result;
   }
@@ -1083,10 +1110,57 @@ export class SessionStore implements Disposable {
   // 私有方法
   // ═══════════════════════════════════════════════════════
 
-  #log(level: 'info' | 'warn', message: string): void {
+  #log(level: 'info' | 'warn' | 'debug', message: string): void {
     observeSafely(
       () => this.#logger[level](message),
       () => undefined
+    );
+  }
+
+  /**
+   * 会话上下文被预算截断时，按段落类别报告保留情况（kept/total，部分保留单列），
+   * 让诊断能看出丢掉的是低优先级的文件清单/维度发现，还是连跨维度建议与反思都没放下。
+   * 只记录类别计数、预算与估算 token，不含记忆正文。
+   */
+  #logContextTruncation(
+    currentDimId: string,
+    tokenBudget: number,
+    text: string,
+    result: string,
+    blocks: SessionContextBlock[]
+  ): void {
+    // 截断结果 = 原文前缀 + 截断标记；取公共前缀长度作为保留字符数（标记首字符偶与原文重合只影响边界判定）。
+    let kept = 0;
+    while (kept < result.length && kept < text.length && result[kept] === text[kept]) {
+      kept++;
+    }
+    const tally = new Map<
+      SessionContextBlockKind,
+      { total: number; kept: number; partial: number }
+    >();
+    let offset = 0;
+    for (const block of blocks) {
+      const end = offset + block.text.length;
+      const entry = tally.get(block.kind) ?? { total: 0, kept: 0, partial: 0 };
+      entry.total++;
+      if (end <= kept) {
+        entry.kept++;
+      } else if (offset < kept) {
+        entry.partial++;
+      }
+      tally.set(block.kind, entry);
+      offset = end + 1; // join('\n') 的分隔符
+    }
+    const summary = [...tally.entries()]
+      .map(
+        ([kind, entry]) =>
+          `${kind}=${entry.kept}/${entry.total}${entry.partial > 0 ? ` (+${entry.partial} partial)` : ''}`
+      )
+      .join(' ');
+    this.#log(
+      'debug',
+      `[SessionStore] context for "${currentDimId}" truncated to ${tokenBudget} estimated tokens ` +
+        `(raw ${estimateTokens(text)}); kept by priority: ${summary}`
     );
   }
 

@@ -15,6 +15,7 @@
 
 import { getDimensionSOP } from '@alembic/core/dimensions';
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
+import { estimateTokens, truncateToTokenBudget } from '#shared/tokenUtils.js';
 import {
   allocateMemoryBudget,
   DEFAULT_MEMORY_BUDGET,
@@ -78,9 +79,25 @@ interface DimensionDigestLike {
 
 /** EpisodicMemory (SessionStore) 最小接口 */
 interface EpisodicMemoryLike {
-  buildContextForDimension(dimId: string, focusKeywords: string[]): string | null;
+  /**
+   * 以对象形式传入会话预算（C44）：SessionStore 在自己的投影内按
+   * 「跨维度建议/反思 > 相关维度发现 > 文件清单」装配后截断；忽略预算的旧端口由外层兜底截断。
+   */
+  buildContextForDimension(
+    dimId: string,
+    options: { focusKeywords: string[]; tokenBudget: number }
+  ): string | null;
   getRelevantReflections(dimId: string): string | null;
 }
+
+/**
+ * truncateToTokenBudget 的默认截断标记（SessionStore 用它裁剪会话投影）。端口已在预算内裁剪时，
+ * 外层 projectMemorySection 不会再改动文本、也就不会发出截断诊断，所以这里按标记识别端口侧截断。
+ * 只有“以标记结尾且已落在本次会话预算内”才算端口按本预算裁剪：按别的（更大）预算裁剪过的旧端口
+ * 仍走外层兜底截断与反思补注入。预算小于标记本身（约 7 token）时 tokenUtils 退化为单个 '…'，
+ * 此时会话段几乎为空，由 SessionStore 自身的截断日志覆盖，不在这里猜测。
+ */
+const SESSION_BUDGET_TRUNCATION_MARK = '…(truncated due to budget)';
 
 /** PersistentMemory 最小接口 */
 type SemanticMemoryLike = MemoryPromptPort;
@@ -426,17 +443,46 @@ note_finding({ finding: "发现描述", evidenceRefs: ["E-1"], importance: 8 })
       return parts.join('\n\n');
     }
     if (episodicMemory && memoryBudget.sessionStore > 0) {
-      const emContext = episodicMemory.buildContextForDimension(
-        dimConfig.id,
-        dimConfig.focusKeywords || []
-      );
+      const sessionBudget = memoryBudget.sessionStore;
+      // C44: 把会话预算交给 SessionStore，让它按优先级装配后截断；数组形式不带预算，
+      // 只能靠外层尾部截断，排在末尾的跨维度建议与 Tier 反思会最先被裁掉。
+      const emContext =
+        episodicMemory.buildContextForDimension(dimConfig.id, {
+          focusKeywords: dimConfig.focusKeywords || [],
+          tokenBudget: sessionBudget,
+        }) || '';
+      const portTruncated =
+        emContext.endsWith(SESSION_BUDGET_TRUNCATION_MARK) &&
+        estimateTokens(emContext) <= sessionBudget;
+      if (portTruncated) {
+        reportMemoryRead(memoryOptions, {
+          phase: 'session',
+          status: 'truncated',
+          reason: 'session-priority-budget',
+          budget: sessionBudget,
+        });
+      }
+      // 反思去重比对实际注入文本：遵守预算的端口返回值就是注入内容；忽略预算的旧端口
+      // 按外层同一预算尾部截断后再比对，避免“全文含反思、注入时却被裁掉”仍被判为已注入。
+      const injected = truncateToTokenBudget(emContext, sessionBudget);
+      const reflections = episodicMemory.getRelevantReflections(dimConfig.id);
+      if (reflections && !injected.includes(reflections)) {
+        if (portTruncated) {
+          // 端口已把反思排在同一预算的最高优先级仍放不下：另起一段补注入只会挤掉同级的
+          // 跨维度建议或被外层裁掉，因此不补注入，只报告反思超出会话预算。
+          reportMemoryRead(memoryOptions, {
+            phase: 'session',
+            status: 'truncated',
+            reason: 'reflections-over-budget',
+            budget: sessionBudget,
+          });
+        } else {
+          // 端口投影不含反思（旧端口），或反思落在会被外层裁掉的尾部：按优先级放在会话上下文之前补注入。
+          historyParts.push('## 跨维度综合洞察', reflections);
+        }
+      }
       if (emContext) {
         historyParts.push(emContext);
-      }
-      // SessionStore 已在自己的投影中包含反思；旧端口可能没有，兼容补充但不重复注入。
-      const reflections = episodicMemory.getRelevantReflections(dimConfig.id);
-      if (reflections && !emContext?.includes(reflections)) {
-        historyParts.push('## 跨维度综合洞察', reflections);
       }
     } else if (dimensionContext && memoryBudget.sessionStore > 0) {
       const snapshot = dimensionContext.buildContextForDimension(dimConfig.id);

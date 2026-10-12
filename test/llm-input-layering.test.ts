@@ -1,4 +1,5 @@
 import { buildEvidenceStarters } from '@alembic/core/host-agent-workflows';
+import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
@@ -43,6 +44,7 @@ import {
 import { selectLlmInputTools, validateLlmInputSize } from '../src/agent/runtime/llmInput.js';
 import { allowsToolCallsUnderForcedNone } from '../src/agent/runtime/ProviderToolChoicePolicy.js';
 import type { UnifiedMessage } from '../src/ai/contracts.js';
+import { estimateTokens } from '../src/shared/tokenUtils.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
@@ -2932,3 +2934,211 @@ describe('Analyst prompt points finding review at real data paths (C53)', () => 
     expect(prompt).toContain('evidence({ action: "get" })');
   });
 });
+
+describe('Analyst session memory keeps cross-dimension advice within the budget (C44)', () => {
+  const CURRENT_DIM = 'agent-guidelines';
+  const CROSS_REF = 'CROSSREF_FOR_CURRENT_DIM：核对 withTransaction 的事务边界';
+  const NEXT_TIER = 'NEXT_TIER_SUGGESTION：后续维度优先核对重试幂等';
+
+  /** 真实 SessionStore：每个前序维度 5 条带证据的中文发现、6 个已读文件与一段 digest 摘要。 */
+  function seededSession(dimCount: number, reflection: Partial<TierReflectionInput> = {}) {
+    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    for (let i = 0; i < dimCount; i++) {
+      const dimId = `dim-${i}`;
+      store.storeDimensionReport(dimId, {
+        analysisText: `维度 ${i} 的完整分析正文`,
+        findings: Array.from({ length: 5 }, (_, j) => ({
+          finding: `维度 ${i} 发现 ${j}：服务层经仓储接口访问数据库，并在事务内完成多表写入，避免部分提交`,
+          evidence: `src/module${i}/service${j}.ts:${10 + j}`,
+          importance: 8 - j,
+        })),
+        referencedFiles: Array.from({ length: 6 }, (_, j) => `src/module${i}/file${j}.ts`),
+      });
+      store.addDimensionDigest(dimId, {
+        summary: `维度 ${i} 摘要：${'该维度确认了分层架构、仓储模式与事务边界的一致用法，并记录了例外与权衡。'.repeat(2)}`,
+        ...(i === 0 ? { crossRefs: { [CURRENT_DIM]: CROSS_REF } } : {}),
+      });
+    }
+    store.addTierReflection(0, {
+      tierIndex: 0,
+      completedDimensions: ['dim-0'],
+      topFindings: [],
+      crossDimensionPatterns: ['CROSS_PATTERN：事务边界集中在仓储层'],
+      suggestionsForNextTier: [NEXT_TIER],
+      ...reflection,
+    });
+    return store;
+  }
+
+  async function analyzePrompt(sessionStore: unknown) {
+    const build = INSIGHT_PRESET.strategy.stages[0].promptBuilder;
+    if (!build) {
+      throw new Error('Analyst prompt builder missing');
+    }
+    const warn = vi.fn();
+    const prompt = await build({
+      dimConfig: { id: CURRENT_DIM, label: 'Agent 指南', focusKeywords: ['事务'] },
+      projectInfo: { name: 'fixture', lang: 'typescript', fileCount: 3 },
+      sessionStore,
+      diagnostics: { warn },
+    });
+    return { prompt: String(prompt), warn };
+  }
+
+  it.each([
+    8, 10, 12,
+  ])('keeps crossRefs and suggestionsForNextTier in the real Analyst prompt with %i prior dimensions', async (dimCount) => {
+    const store = seededSession(dimCount);
+    try {
+      // 前提：未截断的会话投影确实超过 analyst 默认会话预算 floor(4000×0.35)=1400。
+      expect(estimateTokens(store.buildContextForDimension(CURRENT_DIM, ['事务']))).toBeGreaterThan(
+        1400
+      );
+      const { prompt, warn } = await analyzePrompt(store);
+      expect(prompt).toContain(`- [来自 dim-0] ${CROSS_REF}`);
+      expect(prompt).toContain(NEXT_TIER);
+      // 反思只注入一次：去重比对的是实际注入文本。
+      expect(prompt.split(NEXT_TIER)).toHaveLength(2);
+      // 文件清单优先级最低，预算不足时先于维度发现被裁掉。
+      expect(prompt).not.toContain('前序维度已扫描的文件');
+      expect(prompt).toContain('### dim-0');
+      // 截断仍可观测：会话段发出 truncated 诊断并带预算。
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'memory_session_truncated', stage: 'analyze' })
+      );
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('assembles crossRefs and reflections before dimension findings and files under a budget', () => {
+    const store = seededSession(10);
+    try {
+      const context = store.buildContextForDimension(CURRENT_DIM, {
+        focusKeywords: ['事务'],
+        tokenBudget: 1400,
+      });
+      expect(estimateTokens(context)).toBeLessThanOrEqual(1400);
+      expect(context).toContain(`- [来自 dim-0] ${CROSS_REF}`);
+      expect(context).toContain(NEXT_TIER);
+      expect(context).toContain('truncated due to budget');
+      expect(context).not.toContain('前序维度已扫描的文件');
+      const cross = context.indexOf('### 其他维度对');
+      const reflection = context.indexOf('### Tier 1 综合洞察');
+      const firstDim = context.indexOf('### dim-');
+      expect(cross).toBeGreaterThan(-1);
+      expect(reflection).toBeGreaterThan(cross);
+      expect(firstDim).toBeGreaterThan(reflection);
+      // 数组形式（无预算）保持兼容：全部段落都在，文件清单排在最后。
+      const full = store.buildContextForDimension(CURRENT_DIM, ['事务']);
+      expect(full).toContain(NEXT_TIER);
+      expect(full).toContain(`- [来自 dim-0] ${CROSS_REF}`);
+      expect(full.indexOf('### 前序维度已扫描的文件')).toBeGreaterThan(
+        full.lastIndexOf('### dim-')
+      );
+      expect(full).not.toContain('truncated due to budget');
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('logs which priority blocks survived when SessionStore truncates its projection', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const store = seededSession(10);
+    try {
+      store.buildContextForDimension(CURRENT_DIM, { focusKeywords: ['事务'], tokenBudget: 1400 });
+      const messages = debug.mock.calls.map(([message]) => String(message));
+      const truncation = messages.find((message) =>
+        message.includes(`context for "${CURRENT_DIM}" truncated to 1400 estimated tokens`)
+      );
+      expect(truncation).toBeDefined();
+      // 高优先级段落完整保留，文件清单整段丢弃；日志只含类别计数，不含记忆正文。
+      expect(truncation).toContain('header=1/1');
+      expect(truncation).toContain('crossRefs=1/1');
+      expect(truncation).toContain('reflections=1/1');
+      expect(truncation).toContain('files=0/1');
+      expect(truncation).toMatch(/dimensions=\d+\/10/);
+      expect(truncation).not.toContain(CROSS_REF);
+      // 未超预算时不发截断诊断。
+      debug.mockClear();
+      store.buildContextForDimension(CURRENT_DIM, {
+        focusKeywords: ['事务'],
+        tokenBudget: Infinity,
+      });
+      expect(debug.mock.calls.some(([message]) => String(message).includes('truncated to'))).toBe(
+        false
+      );
+    } finally {
+      debug.mockRestore();
+      store.dispose();
+    }
+  });
+
+  it('re-injects reflections when a port truncated to a larger budget than the analyst session budget', async () => {
+    // 旧端口按自己更大的预算裁剪过（以同一标记结尾），但仍超出本次 1400 预算：不能当作“端口已按本预算
+    // 优先级装配”，反思排在其尾部会被外层裁掉，必须补注入到会话上下文之前。
+    const oversized = `## 旧端口会话上下文\n${'LEGACY_HISTORY '.repeat(2000)}\n### Tier 1 综合洞察\n**对后续维度的建议**:\n- ${NEXT_TIER}\n…(truncated due to budget)`;
+    const port = {
+      buildContextForDimension: () => oversized,
+      getRelevantReflections: () => `### Tier 1 综合洞察\n**对后续维度的建议**:\n- ${NEXT_TIER}`,
+    };
+    const { prompt, warn } = await analyzePrompt(port);
+    expect(prompt).toContain('## 跨维度综合洞察');
+    expect(prompt.split(NEXT_TIER)).toHaveLength(2);
+    expect(prompt.indexOf(NEXT_TIER)).toBeLessThan(prompt.indexOf('LEGACY_HISTORY'));
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'reflections-over-budget' })
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'memory_session_truncated', message: 'section-token-budget' })
+    );
+  });
+
+  it('reports reflections that alone exceed the session budget instead of re-injecting them', async () => {
+    const store = seededSession(2, {
+      crossDimensionPatterns: Array.from(
+        { length: 80 },
+        (_, i) => `OVERSIZED_PATTERN ${i}：${'跨维度模式描述'.repeat(6)}`
+      ),
+    });
+    try {
+      const { prompt, warn } = await analyzePrompt(store);
+      // 反思放不下时不得另起一段重复注入（只会挤掉同级的跨维度建议或被外层裁掉）。
+      expect(prompt).not.toContain('## 跨维度综合洞察');
+      expect(prompt.split('OVERSIZED_PATTERN 0：')).toHaveLength(2);
+      expect(prompt).toContain(`- [来自 dim-0] ${CROSS_REF}`);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: 'memory_session_truncated',
+          message: 'reflections-over-budget',
+        })
+      );
+    } finally {
+      store.dispose();
+    }
+  });
+
+  it('places supplementary reflections from a port without them ahead of its oversized context', async () => {
+    const buildContextForDimension = vi.fn(
+      () => `## 旧端口会话上下文\n${'LEGACY_HISTORY '.repeat(2000)}`
+    );
+    const legacy = {
+      buildContextForDimension,
+      getRelevantReflections: () => `### Tier 1 综合洞察\n**对后续维度的建议**:\n- ${NEXT_TIER}`,
+    };
+    const { prompt, warn } = await analyzePrompt(legacy);
+    expect(buildContextForDimension).toHaveBeenCalledWith(CURRENT_DIM, {
+      focusKeywords: ['事务'],
+      tokenBudget: 1400,
+    });
+    expect(prompt).toContain('## 跨维度综合洞察');
+    expect(prompt.split(NEXT_TIER)).toHaveLength(2);
+    expect(prompt.indexOf(NEXT_TIER)).toBeLessThan(prompt.indexOf('LEGACY_HISTORY'));
+    // 忽略预算的端口由外层兜底截断，并发出原有 section-token-budget 诊断。
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'memory_session_truncated', message: 'section-token-budget' })
+    );
+  });
+});
+
+type TierReflectionInput = Parameters<SessionStore['addTierReflection']>[1];
