@@ -3005,3 +3005,152 @@ describe('service cancellation and snapshot ownership', () => {
     });
   });
 });
+
+describe('AgentRuntime state transitions observability and reset (I39)', () => {
+  function textHarness() {
+    const chat = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    return { chat, ...harness(chat) };
+  }
+
+  it('idle abort() only logs: no AGENT_ABORTED and the next execute reports completed', async () => {
+    const { runtime } = textHarness();
+    const info = vi.fn();
+    runtime.logger = { info, warn: vi.fn() };
+    const aborted = vi.fn();
+    const onAbort = (event: { payload?: { agentId?: string } }) => {
+      if (event.payload?.agentId === runtime.id) {
+        aborted(event);
+      }
+    };
+    runtime.bus.on(AgentEvents.AGENT_ABORTED, onAbort);
+    try {
+      runtime.abort('idle cancel');
+      expect(aborted).not.toHaveBeenCalled();
+      expect(runtime.state.phase).toBe('idle');
+      expect(info).toHaveBeenCalledWith(
+        expect.stringContaining('abort ignored'),
+        expect.objectContaining({ runtimeId: runtime.id, reason: 'idle cancel', phase: 'idle' })
+      );
+      const result = await runtime.execute(new AgentMessage({ content: 'task' }));
+      expect(result.reply).toBe('done');
+      expect(result.state?.phase).toBe('completed');
+      expect(aborted).not.toHaveBeenCalled();
+    } finally {
+      runtime.bus.off(AgentEvents.AGENT_ABORTED, onAbort);
+    }
+  });
+
+  it('resets a reused runtime to idle per execute and keeps existing state subscribers', async () => {
+    const failure = new Error('first run failed');
+    const single = new SingleStrategy();
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockImplementation((rt, message, opts) => single.execute(rt, message, opts));
+    const chat = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    const { runtime } = harness(chat, 2, { strategy: { execute } as never });
+    const info = vi.fn();
+    runtime.logger = { info, warn: vi.fn() };
+    const transitions: Array<{ from: string; to: string; event: string }> = [];
+    runtime.state.on('transition', (event: { from: string; to: string; event: string }) => {
+      transitions.push({ from: event.from, to: event.to, event: event.event });
+    });
+    const completedOnce = vi.fn();
+    runtime.state.once('phase:completed', completedOnce);
+
+    await expect(runtime.execute(new AgentMessage({ content: 'first' }))).rejects.toBe(failure);
+    expect(runtime.state.phase).toBe('failed');
+
+    const result = await runtime.execute(new AgentMessage({ content: 'second' }));
+    expect(result.state?.phase).toBe('completed');
+    // 复位后只保留构造时的初始数据，上一次失败的 error 不混入本次结果。
+    expect(result.state?.data).not.toHaveProperty('error');
+    expect(result.state?.history?.[0]).toMatchObject({ phase: 'idle' });
+    expect(info).toHaveBeenCalledWith(
+      expect.stringContaining('state reset to idle'),
+      expect.objectContaining({ runtimeId: runtime.id, previousPhase: 'failed' })
+    );
+    // 订阅者在复位后继续收到本次运行的转移；once 订阅仍只触发一次。
+    expect(transitions).toEqual([
+      { from: 'idle', to: 'failed', event: 'error' },
+      { from: 'idle', to: 'planning', event: 'start' },
+      { from: 'planning', to: 'executing', event: 'plan_ready' },
+      { from: 'executing', to: 'completed', event: 'finish' },
+    ]);
+    expect(completedOnce).toHaveBeenCalledOnce();
+
+    await runtime.execute(new AgentMessage({ content: 'third' }));
+    expect(completedOnce).toHaveBeenCalledOnce();
+    expect(transitions.at(-1)).toEqual({ from: 'executing', to: 'completed', event: 'finish' });
+  });
+
+  it('logs an illegal transition at debug level with the event and current phase', async () => {
+    const { runtime } = textHarness();
+    const debug = vi.fn();
+    const logger = { info: vi.fn(), warn: vi.fn(), debug };
+    runtime.logger = logger;
+    await runtime.reactLoop('first stage');
+    expect(runtime.state.phase).toBe('executing');
+    expect(debug).not.toHaveBeenCalled();
+    // 第二个阶段的 'start'/'plan_ready' 从 executing 出发属于预期的非法转移：跳过但必须可定位。
+    await runtime.reactLoop('second stage');
+    expect(runtime.state.phase).toBe('executing');
+    expect(debug).toHaveBeenCalledWith(
+      expect.stringContaining('state transition skipped'),
+      expect.objectContaining({ runtimeId: runtime.id, event: 'start', phase: 'executing' })
+    );
+    expect(debug).toHaveBeenCalledWith(
+      expect.stringContaining('state transition skipped'),
+      expect.objectContaining({ event: 'plan_ready', phase: 'executing' })
+    );
+  });
+
+  it('warns when a state observer throws without leaking its message and keeps executing', async () => {
+    const { runtime } = textHarness();
+    const warn = vi.fn();
+    runtime.logger = { info: vi.fn(), warn };
+    runtime.state.on('phase:planning', () => {
+      throw new Error('observer private payload');
+    });
+    const result = await runtime.execute(new AgentMessage({ content: 'task' }));
+    expect(result.reply).toBe('done');
+    // 观察者在 'start' 转移后抛错：阶段已切换，后续转移照常进行。
+    expect(result.state?.phase).toBe('completed');
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('state transition observer failed'),
+      expect.objectContaining({
+        runtimeId: runtime.id,
+        event: 'start',
+        fromPhase: 'idle',
+        toPhase: 'planning',
+      })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('observer private payload');
+  });
+
+  it('keeps the original failure when both a state observer and the diagnostic logger throw', async () => {
+    const failure = new Error('original strategy failure');
+    const { runtime } = harness(vi.fn(), 2, {
+      strategy: {
+        execute: async () => {
+          throw failure;
+        },
+      } as never,
+    });
+    runtime.logger = {
+      info: () => {
+        throw new Error('info sink down');
+      },
+      warn: () => {
+        throw new Error('warn sink down');
+      },
+    };
+    runtime.state.on('transition', () => {
+      throw new Error('observer failed');
+    });
+    // 空闲 abort 的诊断日志与转移观察者的 warn 都经隔离：诊断通道失败不能改写业务结果。
+    expect(() => runtime.abort('idle cancel')).not.toThrow();
+    await expect(runtime.execute(new AgentMessage({ content: 'task' }))).rejects.toBe(failure);
+    expect(runtime.state.phase).toBe('failed');
+  });
+});

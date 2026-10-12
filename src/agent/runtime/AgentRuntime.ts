@@ -77,7 +77,7 @@ import {
   type ToolCallHook,
   type ToolMetadata,
 } from './AgentRuntimeTypes.js';
-import { AgentState } from './AgentState.js';
+import { AgentPhase, AgentState } from './AgentState.js';
 import { evaluateAnalyzeTextGroundingGate } from './AnalyzeGroundingGuard.js';
 import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
@@ -298,9 +298,7 @@ export class AgentRuntime {
       memoryConfig: this.memoryConfig,
     });
 
-    this.state = new AgentState({
-      initialData: { runtimeId: this.id, preset: this.presetName },
-    });
+    this.state = this.#createInitialState();
 
     this.bus.publish(
       AgentEvents.AGENT_CREATED,
@@ -355,6 +353,8 @@ export class AgentRuntime {
 
   async #executeRun(message: AgentMessage, opts: Record<string, unknown>): Promise<AgentResult> {
     this.#abortEventPublished = false;
+    // I39：状态机与计数器同为 per-run 状态，复用实例时先复位，避免上一次终态吞掉本次 start/finish。
+    this.#resetStateForRun();
     this.startTime = Date.now();
     this.iterationCount = 0;
     this.toolCallHistory = [];
@@ -2457,9 +2457,32 @@ export class AgentRuntime {
 
   // ─── 公共工具方法 ────────────────────────────
 
-  /** 中止执行 */
+  /**
+   * 中止执行。
+   *
+   * 只取消当前 execute() 的执行边界。没有活动执行时（尚未运行、已经结束，或只直接调用了
+   * reactLoop 而未经 execute）没有可取消的对象：旧实现仍把状态机转到 aborted 并发布
+   * AGENT_ABORTED，导致同一实例下一次成功执行的 start/finish 全被丢弃、结果报告 aborted（I39）。
+   * 现在这种调用只记日志，不转移状态、不发布事件。
+   */
   abort(reason = 'User aborted') {
-    this.#executionAbortController?.abort(new Error(reason));
+    const controller = this.#executionAbortController;
+    if (!controller) {
+      const phase = this.state.phase;
+      const abortEventPublished = this.#abortEventPublished;
+      observeSafely(
+        () =>
+          this.logger.info('[AgentRuntime] abort ignored: no active execution', {
+            runtimeId: this.id,
+            reason,
+            phase,
+            abortEventPublished,
+          }),
+        () => undefined
+      );
+      return;
+    }
+    controller.abort(new Error(reason));
     if (this.#abortEventPublished) {
       return;
     }
@@ -2511,19 +2534,119 @@ export class AgentRuntime {
 
   // ─── 私有方法 ────────────────────────────────
 
+  /** 构造 runtime 自有的状态机；初始数据只含实例身份，不带任何一次运行的 payload。 */
+  #createInitialState(): AgentState {
+    return new AgentState({
+      initialData: { runtimeId: this.id, preset: this.presetName },
+    });
+  }
+
   /**
-   * 安全状态转移 — 忽略不合法转移而不是抛异常。
+   * 每次 execute() 开始时把状态机复位到 idle（I39）。
    *
-   * Pipeline/FanOut 场景下 reactLoop() 被多次调用,
-   * 第 2+ 次调用时状态已不在 IDLE，直接 send('start') 会抛错。
-   * 此方法在转移不合法时静默跳过，保证多阶段执行不中断。
+   * 状态机只在构造时创建，而默认转移图没有回到 idle 的边：复用同一实例时，上一次的终态
+   * （completed/failed/aborted）或直接 reactLoop 留下的 executing/reflecting 会让本次的
+   * 'start'/'finish' 全部成为非法转移，result.state 报告上一次的阶段。AgentState 不提供
+   * reset，所以新建实例；新实例只保留构造时的初始数据，上一次的 prompt/reply/error 不混入本次结果。
+   *
+   * `runtime.state` 是公开字段，调用方可能已订阅 'transition'/'phase:*'：把旧实例上的监听器按
+   * 原顺序迁到新实例，once 订阅仍以 once 注册，避免复位后订阅被静默丢弃。
+   * phase 仍为 idle 说明从未发生转移（默认转移图回不到 idle），直接短路不做任何事。
+   * 已知边界：调用方若把 `state` 换成带自定义转移的 AgentState，复位后只保留默认转移图。
+   */
+  #resetStateForRun() {
+    const previous = this.state;
+    if (previous.phase === AgentPhase.IDLE) {
+      return;
+    }
+    const next = this.#createInitialState();
+    next.setMaxListeners(previous.getMaxListeners());
+    let migratedListeners = 0;
+    for (const eventName of previous.eventNames()) {
+      for (const raw of previous.rawListeners(eventName)) {
+        // rawListeners 对 once 订阅返回 Node 的包装函数（带 .listener 指向原函数）；
+        // 包装函数绑定旧实例，直接迁移会在新实例上留下失效包装，因此取原函数重新 once 注册。
+        const original: unknown = Reflect.get(raw, 'listener');
+        if (typeof original === 'function') {
+          next.once(eventName, original as (...args: unknown[]) => void);
+        } else {
+          next.on(eventName, raw as (...args: unknown[]) => void);
+        }
+        migratedListeners++;
+      }
+    }
+    previous.removeAllListeners();
+    this.state = next;
+    const previousPhase = previous.phase;
+    observeSafely(
+      () =>
+        this.logger.info('[AgentRuntime] state reset to idle before execute', {
+          runtimeId: this.id,
+          previousPhase,
+          migratedListeners,
+        }),
+      () => undefined
+    );
+  }
+
+  /**
+   * 安全状态转移 — 状态机只是执行过程的可观测投影，任何转移结果都不能中断执行。
+   *
+   * AgentState.send 遇到没有匹配的转移或 guard 拒绝时返回 false，并不抛错。Pipeline/FanOut
+   * 场景下 reactLoop() 被多次调用，第 2+ 个阶段的 'start'/'plan_ready' 从 executing/reflecting
+   * 出发就是这种预期的非法转移：按 debug 记录事件名与当前阶段后跳过，保证多阶段执行不中断。
+   *
+   * send 真正会抛出的是转移 action 或 'transition'/'phase:*' 观察者的异常：此时阶段已经切换，
+   * 记 warn（只记错误类型，不记观察者的错误内容）后继续执行，保持“观察者失败不影响业务结果”。
    */
   #safeTransition(event: string, payload: Record<string, unknown> = {}) {
+    const fromPhase = this.state.phase;
+    let transitioned: boolean;
     try {
-      this.state.send(event, payload);
-    } catch {
-      // 转移不合法 — 在多阶段场景中这是预期行为，静默跳过
+      transitioned = this.state.send(event, payload);
+    } catch (err: unknown) {
+      const toPhase = this.state.phase;
+      const errorType = err instanceof Error ? err.name : typeof err;
+      observeSafely(
+        () =>
+          this.logger.warn('[AgentRuntime] state transition observer failed; execution continues', {
+            runtimeId: this.id,
+            event,
+            fromPhase,
+            toPhase,
+            errorType,
+          }),
+        () => undefined
+      );
+      return;
     }
+    if (!transitioned) {
+      this.#logDebug('[AgentRuntime] state transition skipped: not allowed from current phase', {
+        runtimeId: this.id,
+        event,
+        phase: fromPhase,
+        availableEvents: this.state.availableEvents(),
+      });
+    }
+  }
+
+  /**
+   * debug 级诊断。`runtime.logger` 的公开类型只承诺 info/warn（测试与宿主可注入只有这两个方法的对象）：
+   * 注入对象提供 debug 时用它；否则退回 Core 全局 Logger 的 debug（受 ALEMBIC_LOG_LEVEL 过滤）。
+   * 诊断通道失败不能影响执行，统一经 observeSafely 隔离。
+   */
+  #logDebug(message: string, meta: Record<string, unknown>) {
+    const logger: Pick<Console, 'info' | 'warn'> & Partial<Pick<Console, 'debug'>> = this.logger;
+    observeSafely(
+      () => {
+        if (typeof logger.debug === 'function') {
+          logger.debug(message, meta);
+          return;
+        }
+        Logger.getInstance().debug(message, meta);
+      },
+      () => undefined
+    );
   }
 
   /**
