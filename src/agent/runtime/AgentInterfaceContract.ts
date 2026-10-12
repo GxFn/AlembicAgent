@@ -160,6 +160,15 @@ export const AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY = Object.freeze({
   refFields: ['artifacts', 'resources'],
 } as const satisfies AgentInterfaceOrdinaryOutputPolicy);
 
+/**
+ * D25 失败分类策略：静态契约清单，不是运行时投影的描述。
+ *
+ * ordinaryOutputField 只声明“普通输出里承载分类的字段名叫 failureTaxonomy”。运行时只有在调用方
+ * 显式传入 projectToolResultOrdinaryOutput(envelope, { failureTaxonomy }) 时才附带该字段；
+ * 现有生产投影调用点（runtimeBridge、AgentTaskHandlers、presenter）都不传，
+ * ToolResultEnvelope 本身也没有该字段，所以模型与宿主看到的普通输出默认不带分类。
+ * 是否真正接线属于待决事项⑤（契约归属），本清单不据此改变取值。
+ */
 export const AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY = Object.freeze({
   demandKey: 'alembic-interface-contract-d25-error-problem-taxonomy-2026-06-10',
   coreTaxonomyVersion: CORE_FAILURE_TAXONOMY_VERSION,
@@ -174,6 +183,11 @@ export const AGENT_INTERFACE_D25_FAILURE_TAXONOMY_POLICY = Object.freeze({
   ],
 } as const satisfies AgentInterfaceFailureTaxonomyPolicy);
 
+/**
+ * 结果分支 fixture：静态契约样例，供宿主回放测试（Alembic test/unit/GenerateProjection.test.ts）
+ * 和本仓库自检使用。fixture 上的 failureTaxonomy 只说明“若调用方显式附带分类，应是哪一条”，
+ * 运行时普通输出默认不带该字段（见上方 D25 策略注释）。
+ */
 const BRANCH_FIXTURES = [
   {
     branch: 'success',
@@ -325,6 +339,10 @@ const BRANCH_FIXTURES = [
     observabilityKeys: ['area', 'owner', 'status', 'failureStage'],
   },
   {
+    // 已知不一致（I42，暂不改值）：Core 中 capability-mismatch 的 agentBranch 是 'failure'、
+    // status 是 'blocked'（D25 entries 投影出的 toolStatus 为 'blocked'），而本 fixture 的
+    // toolStatus 为 null。修正取值并在 validateBranchFixtures 增加 branch/toolStatus 交叉检查
+    // 依赖待决事项②，且须宿主回放测试同步确认，因此这里只记录、不改。
     branch: 'host-adapter',
     title: 'Host adapter ownership is explicit and Plugin host-agent routes are unsupported here.',
     registryRows: ['I02', 'I18'],
@@ -374,6 +392,14 @@ export function getAgentInterfaceContractBranch(
   return ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.find((item) => item.branch === branch) ?? null;
 }
 
+/**
+ * 契约清单自检：只校验静态清单内部的一致性（必需分支/行齐全、fixture 不暴露隐藏或禁止字段、
+ * 分类 stableId 与 failureKind 对应、D25 条目覆盖 Core 必需种类等），返回失败描述，空数组表示通过。
+ *
+ * 它不代表运行时行为：不检查生产投影是否真的附带 failureTaxonomy，也不比对 fixture 的
+ * branch 与分类 agentBranch、fixture toolStatus 与 D25 条目 toolStatus 是否一致。
+ * 宿主回放测试直接调用本函数，增强检查会改变其结论，须随待决事项②一起决定。
+ */
 export function validateAgentInterfaceContract(): string[] {
   const failures: string[] = [];
   validateRequiredCoverage(failures);

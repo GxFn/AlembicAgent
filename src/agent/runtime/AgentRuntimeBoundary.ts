@@ -77,10 +77,13 @@ const BOUNDARY_ENTRIES = [
     hostOwns: ['user-facing invocation', 'product-specific prompt routing', 'model selection UI'],
   },
   {
+    // area id 'tool-v2' 是冻结的公开标识，不代表存在第二套工具系统：V1/V2 已于 2026-06-19
+    // 收敛为 src/tools/kernel 单一契约 + src/tools/runtime 实现。只更新 summary 文本，id 不改。
     area: 'tool-v2',
     owner: 'agent',
     publicSubpath: '@alembic/agent/tools/runtime',
-    summary: 'Tool V2 router, capability catalog, cache, compressor, adapter, and handlers.',
+    summary:
+      'Unified tool runtime on the single kernel contract: ToolRouter, capability catalog, cache, compressor, adapter, and handlers; the area id is a frozen identifier.',
     agentOwns: ['ToolRouter', 'ToolRouterAdapter', 'tool cache and compressor contracts'],
     hostOwns: ['ToolContextFactory inputs', 'external executor wiring', 'UI or daemon surfaces'],
   },

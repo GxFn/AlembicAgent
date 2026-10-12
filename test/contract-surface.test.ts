@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Logger from '@alembic/core/logging';
@@ -10,6 +10,7 @@ import * as prompts from '../src/agent/prompts/index.js';
 import * as runtime from '../src/agent/runtime/index.js';
 import * as service from '../src/agent/service/index.js';
 import * as tasks from '../src/agent/tasks/index.js';
+import { PROVIDER_CONFIGS } from '../src/ai/registry/ProviderConfig.js';
 import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
@@ -153,13 +154,40 @@ describe('explicit AlembicAgent contract subpaths', () => {
       'session',
       'tool',
     ]);
+    // 前 5 项是既有公开名单（次序不变）；其后是 I42 补齐的、src 中实际读取的开关。
     expect(responsibility.featureFlags.map((flag) => flag.name)).toEqual([
       'ALEMBIC_AI_PROVIDER',
       'ALEMBIC_AI_MODEL',
       'ALEMBIC_AI_MAX_CONCURRENCY',
       'ALEMBIC_EMBED_PROVIDER',
       'ALEMBIC_DEEPSEEK_REASONING_EFFORT',
+      'ALEMBIC_EMBED_MODEL',
+      'ALEMBIC_OPENAI_API_STYLE',
+      'ALEMBIC_GEMINI_MAX_CONCURRENCY',
+      'ALEMBIC_AI_PROXY',
+      'ALEMBIC_GOOGLE_PROXY_HTTPS',
+      'ALEMBIC_GOOGLE_PROXY_HTTP',
+      'ALEMBIC_OPENAI_PROXY_HTTPS',
+      'ALEMBIC_OPENAI_PROXY_HTTP',
+      'ALEMBIC_DEEPSEEK_PROXY_HTTPS',
+      'ALEMBIC_DEEPSEEK_PROXY_HTTP',
+      'ALEMBIC_CLAUDE_PROXY_HTTPS',
+      'ALEMBIC_CLAUDE_PROXY_HTTP',
+      'ALEMBIC_OLLAMA_PROXY_HTTPS',
+      'ALEMBIC_OLLAMA_PROXY_HTTP',
+      'ALEMBIC_AGENT_ENABLE_L4_COMPACTION',
+      'ALEMBIC_MCP_MODE',
+      'ALEMBIC_BOOTSTRAP_CONCURRENCY',
+      'ALEMBIC_MODULE_MINING_CONCURRENCY',
     ]);
+    expect(
+      responsibility.featureFlags.find((flag) => flag.name === 'ALEMBIC_AGENT_ENABLE_L4_COMPACTION')
+    ).toMatchObject({
+      owner: 'agent-runtime',
+      productionRelevant: true,
+      defaultValue: 'unset',
+      allowedValues: ['1'],
+    });
     expect(
       responsibility.featureFlags.find((flag) => flag.name === 'ALEMBIC_AI_MAX_CONCURRENCY')
     ).toMatchObject({
@@ -176,6 +204,19 @@ describe('explicit AlembicAgent contract subpaths', () => {
       forbiddenOwner: 'agent-runtime',
       allowedAccessRefs: ['src/ai/AiProvider.ts'],
     });
+  });
+
+  it('describes the frozen tool-v2 area as the single unified tool runtime', () => {
+    // area id 'tool-v2' 是冻结的公开标识（见仓库 CLAUDE.md），只有 summary 文本随事实更新。
+    const entry = runtime.getAgentRuntimeBoundaryEntry('tool-v2');
+
+    expect(entry).toMatchObject({
+      area: 'tool-v2',
+      owner: 'agent',
+      publicSubpath: '@alembic/agent/tools/runtime',
+    });
+    expect(entry?.summary).toMatch(/unified tool runtime/i);
+    expect(entry?.summary).not.toMatch(/v2/i);
   });
 
   it('exposes prompt builders and budget helpers', () => {
@@ -674,6 +715,258 @@ describe('AlembicAgent public interface contract', () => {
       owner: 'host',
       publicSubpath: null,
     });
+  });
+
+  it('attaches failureTaxonomy to ordinary output only when the caller passes it explicitly', () => {
+    // D25 分支 fixture 是静态契约清单：生产投影调用点都不传 failureTaxonomy，
+    // 普通输出因此不带该字段；只有调用方显式传入时才附带（I42 注释所述事实）。
+    const envelope: ToolResultEnvelope = { ...blockedEnvelope(), ok: false, status: 'error' };
+    const fixtureTaxonomy = getAgentInterfaceContractBranch('failure')?.failureTaxonomy ?? null;
+
+    expect(fixtureTaxonomy).not.toBeNull();
+    expect(projectToolResultOrdinaryOutput(envelope)).not.toHaveProperty('failureTaxonomy');
+    expect(
+      projectToolResultOrdinaryOutput(envelope, { failureTaxonomy: fixtureTaxonomy })
+        .failureTaxonomy
+    ).toEqual(fixtureTaxonomy);
+  });
+});
+
+/** 一个源文件里的 ALEMBIC_* 环境变量读取：静态可解析的名字，以及模板拼装名字的动态站点原文。 */
+interface AlembicEnvReadScan {
+  readonly staticNames: ReadonlySet<string>;
+  readonly dynamicSites: readonly string[];
+}
+
+const ALEMBIC_ENV_NAME = /^ALEMBIC_[A-Z0-9_]+$/;
+
+/** 读取接收方：process.env，或 configuration/concurrency 注入的 env 参数（默认值就是 process.env）。 */
+function isEnvReceiver(expression: ts.Expression): boolean {
+  if (ts.isIdentifier(expression)) {
+    return expression.text === 'env';
+  }
+  if (ts.isPropertyAccessExpression(expression)) {
+    return expression.name.text === 'env';
+  }
+  return false;
+}
+
+/**
+ * 用 TypeScript 解析器（只看语法、天然跳过注释）找出环境变量读取点。识别的形态：
+ * - `process.env.ALEMBIC_X` / `env.ALEMBIC_X`；
+ * - `process.env['ALEMBIC_X']` / `env['ALEMBIC_X']`；
+ * - profile 并发声明 `{ env: 'ALEMBIC_X' }`（AgentRunCoordinator 以 process.env[concurrency.env] 读取）；
+ * - 以 `ALEMBIC_` 开头的模板字符串：名字在运行时拼装，记为动态站点，必须在下方展开表登记。
+ * 经常量变量间接传入的新读取不在识别范围内，新增时需要同步扩展这里。
+ */
+function scanAlembicEnvReads(fileName: string, sourceText: string): AlembicEnvReadScan {
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    sourceText,
+    ts.ScriptTarget.ES2022,
+    true,
+    ts.ScriptKind.TS
+  );
+  const staticNames = new Set<string>();
+  const dynamicSites: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      isEnvReceiver(node.expression) &&
+      ALEMBIC_ENV_NAME.test(node.name.text)
+    ) {
+      staticNames.add(node.name.text);
+    } else if (
+      ts.isElementAccessExpression(node) &&
+      isEnvReceiver(node.expression) &&
+      ts.isStringLiteralLike(node.argumentExpression) &&
+      ALEMBIC_ENV_NAME.test(node.argumentExpression.text)
+    ) {
+      staticNames.add(node.argumentExpression.text);
+    } else if (
+      ts.isPropertyAssignment(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === 'env' &&
+      ts.isStringLiteralLike(node.initializer) &&
+      ALEMBIC_ENV_NAME.test(node.initializer.text)
+    ) {
+      staticNames.add(node.initializer.text);
+    } else if (
+      ts.isTemplateExpression(node) &&
+      /^ALEMBIC_[A-Z0-9_]*$/.test(node.head.text) &&
+      node.templateSpans.every((span) => /^[A-Z0-9_]*$/.test(span.literal.text))
+    ) {
+      // 只有字面部分全是变量名字符的模板才像在拼装变量名；`ALEMBIC_X_INVALID: ${message}`
+      // 这类错误码消息不算读取点。
+      dynamicSites.push(node.getText(sourceFile));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return { staticNames, dynamicSites };
+}
+
+/** provider 维度变量的标签：与 LLMTransport.resolveProxyUrl 一样取 providerId 的大写。 */
+const PROVIDER_ENV_TAGS = PROVIDER_CONFIGS.map((config) => config.id.toUpperCase());
+
+/**
+ * 动态站点展开表：文件 → 模板原文 → 实际可能读取的变量名。未登记的动态站点让校验失败，
+ * 避免运行时拼装的新开关绕过清单。
+ */
+const DYNAMIC_ALEMBIC_ENV_EXPANSIONS: Readonly<
+  Record<string, Readonly<Record<string, readonly string[]>>>
+> = {
+  'src/ai/configuration.ts': {
+    // scopedModel(env, owner)：owner 的类型是 'AI' | 'EMBED'。
+    '`ALEMBIC_${owner}_PROVIDER`': ['ALEMBIC_AI_PROVIDER', 'ALEMBIC_EMBED_PROVIDER'],
+    '`ALEMBIC_${owner}_MODEL`': ['ALEMBIC_AI_MODEL', 'ALEMBIC_EMBED_MODEL'],
+    // providerKeyEnv 只拼装缺凭据错误提示里的变量名，不读取环境变量。
+    '`ALEMBIC_${providerId.toUpperCase()}_API_KEY`': [],
+  },
+  'src/ai/transport/LLMTransport.ts': {
+    '`ALEMBIC_${tag}_PROXY_HTTPS`': PROVIDER_ENV_TAGS.map((tag) => `ALEMBIC_${tag}_PROXY_HTTPS`),
+    '`ALEMBIC_${tag}_PROXY_HTTP`': PROVIDER_ENV_TAGS.map((tag) => `ALEMBIC_${tag}_PROXY_HTTP`),
+  },
+};
+
+/**
+ * 连接配置不是行为开关，不进入 featureFlags：provider 注册表登记的凭据/端点变量
+ * （PROVIDER_CONFIGS.keyEnvVar/baseUrlEnvVar），以及 embedding 专用的凭据/端点变量。
+ */
+const CONNECTION_SETTING_ENV_NAMES: ReadonlySet<string> = new Set([
+  ...PROVIDER_CONFIGS.flatMap((config) => [config.keyEnvVar, config.baseUrlEnvVar]).filter(
+    (name): name is string => typeof name === 'string' && name !== ''
+  ),
+  'ALEMBIC_EMBED_API_KEY',
+  'ALEMBIC_EMBED_BASE_URL',
+]);
+
+interface SrcAlembicEnvReads {
+  /** 仓库相对路径 → 该文件读取的变量名（含动态站点展开）。 */
+  readonly byFile: ReadonlyMap<string, ReadonlySet<string>>;
+  /** 变量名 → 读取它的文件。 */
+  readonly byName: ReadonlyMap<string, readonly string[]>;
+  readonly unregisteredDynamicSites: readonly string[];
+}
+
+function listSourceFiles(directory: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const fullPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listSourceFiles(fullPath));
+    } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts')) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function collectSrcAlembicEnvReads(): SrcAlembicEnvReads {
+  const byFile = new Map<string, Set<string>>();
+  const byName = new Map<string, string[]>();
+  const unregisteredDynamicSites: string[] = [];
+  for (const fullPath of listSourceFiles(path.join(REPO_ROOT, 'src'))) {
+    const relativePath = path.relative(REPO_ROOT, fullPath).split(path.sep).join('/');
+    const scan = scanAlembicEnvReads(relativePath, readFileSync(fullPath, 'utf8'));
+    const names = new Set(scan.staticNames);
+    for (const site of scan.dynamicSites) {
+      const expansion = DYNAMIC_ALEMBIC_ENV_EXPANSIONS[relativePath]?.[site];
+      if (expansion === undefined) {
+        unregisteredDynamicSites.push(`${relativePath}: ${site}`);
+        continue;
+      }
+      for (const name of expansion) {
+        names.add(name);
+      }
+    }
+    if (names.size === 0) {
+      continue;
+    }
+    byFile.set(relativePath, names);
+    for (const name of names) {
+      byName.set(name, [...(byName.get(name) ?? []), relativePath]);
+    }
+  }
+  return { byFile, byName, unregisteredDynamicSites };
+}
+
+describe('AG2 runtime responsibility feature flags match real environment reads (I42)', () => {
+  const featureFlags = ALEMBIC_AGENT_RUNTIME_BOUNDARY.responsibility.featureFlags;
+
+  it('recognises every supported env read form and ignores comments and non-env strings', () => {
+    const scan = scanAlembicEnvReads(
+      'probe.ts',
+      [
+        '// process.env.ALEMBIC_IN_COMMENT',
+        '/* env.ALEMBIC_IN_BLOCK_COMMENT */',
+        'const a = process.env.ALEMBIC_DIRECT;',
+        'const b = env.ALEMBIC_INJECTED;',
+        "const c = process.env['ALEMBIC_BRACKET'];",
+        "const d = { concurrency: { env: 'ALEMBIC_PROFILE', default: 2 } };",
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: 探针源码文本里的模板字面量，不是模板串。
+        'const e = env[`ALEMBIC_${owner}_MODEL`];',
+        "const f = new Error('ALEMBIC_ERROR_CODE');",
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: 探针源码文本里的模板字面量，不是模板串。
+        'const h = new Error(`ALEMBIC_ERROR_CODE: ${message}`);',
+        'const g = config.ALEMBIC_NOT_ENV;',
+      ].join('\n')
+    );
+
+    expect([...scan.staticNames].sort()).toEqual([
+      'ALEMBIC_BRACKET',
+      'ALEMBIC_DIRECT',
+      'ALEMBIC_INJECTED',
+      'ALEMBIC_PROFILE',
+    ]);
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: 期望的是动态站点的源码原文。
+    expect(scan.dynamicSites).toEqual(['`ALEMBIC_${owner}_MODEL`']);
+  });
+
+  it('points every featureFlag sourceRef at an existing src file that reads the flag', () => {
+    const reads = collectSrcAlembicEnvReads();
+    const problems: string[] = [];
+
+    for (const flag of featureFlags) {
+      if (flag.sourceRefs.length === 0) {
+        problems.push(`${flag.name}: no sourceRefs`);
+      }
+      for (const ref of flag.sourceRefs) {
+        if (!existsSync(path.join(REPO_ROOT, ref))) {
+          problems.push(`${flag.name}: sourceRef ${ref} does not exist`);
+        } else if (!reads.byFile.get(ref)?.has(flag.name)) {
+          problems.push(`${flag.name}: sourceRef ${ref} does not read it`);
+        }
+      }
+    }
+
+    expect(problems).toEqual([]);
+  });
+
+  it('keeps every ALEMBIC_* environment read in src inside the featureFlags manifest', () => {
+    const reads = collectSrcAlembicEnvReads();
+    const manifestNames = new Set<string>(featureFlags.map((flag) => flag.name));
+    const unlisted = [...reads.byName.entries()]
+      .filter(([name]) => !manifestNames.has(name) && !CONNECTION_SETTING_ENV_NAMES.has(name))
+      .map(([name, files]) => `${name} (${files.join(', ')})`)
+      .sort();
+
+    expect(reads.unregisteredDynamicSites).toEqual([]);
+    expect(unlisted).toEqual([]);
+    // 防空转：扫描器必须真的覆盖到已知的各类读取形态（process.env.X、注入 env.X、
+    // profile 并发声明、按 provider 拼装的动态名字）。
+    expect(reads.byName.get('ALEMBIC_AGENT_ENABLE_L4_COMPACTION')).toContain(
+      'src/agent/runtime/BudgetController.ts'
+    );
+    expect(reads.byName.get('ALEMBIC_AI_MAX_CONCURRENCY')).toContain(
+      'src/ai/shared/concurrency.ts'
+    );
+    expect(reads.byName.get('ALEMBIC_BOOTSTRAP_CONCURRENCY')).toContain(
+      'src/agent/profiles/definitions/generate.profile.ts'
+    );
+    expect(reads.byName.get('ALEMBIC_OPENAI_PROXY_HTTPS')).toContain(
+      'src/ai/transport/LLMTransport.ts'
+    );
   });
 });
 
