@@ -1086,6 +1086,17 @@ export class PipelineStrategy extends Strategy {
     return true;
   }
 
+  /**
+   * analysis_retry 的会话预算压制判定。
+   *
+   * 口径（I02 方案 A）：阶段会话预算 maxSessionInputTokens 表达“一次阶段执行内”的 input 消耗，
+   * 与 BudgetController（每个 reactLoop 以构造时累计为基线）一致。因此这里比较的是重试目标阶段
+   * 最近一次执行回执的 tokenUsage.input（reactLoop 返回的 loop 级用量，即阶段内消耗），
+   * 不再用 ctx.totalTokenUsage——后者是整条管线累计，含前序阶段、微阶段与历次尝试，
+   * 会让“前面阶段用得多”或“重试过一次”就误判目标阶段预算耗尽。
+   * 语义：目标阶段上一次执行已用掉 ≥ 阈值的自身预算仍未过门，整段重跑不再值得，降级终止。
+   * 分母选择保持原样（retryBudget 声明的会话预算优先，其次 stage.budget）。
+   */
   #getRetryBudgetSuppression(
     retryTargetStage: PipelineStage,
     gate: GateConfig,
@@ -1099,15 +1110,42 @@ export class PipelineStrategy extends Strategy {
     }
 
     const threshold = numberFromUnknown(gate.retryBudgetExhaustedRatio) ?? 0.9;
-    const ratio = ctx.totalTokenUsage.input / maxSessionInputTokens;
-    if (ratio < threshold) {
+    const stageName = retryTargetStage.name;
+    // #executeStage 以 stage.name 写入最近一次尝试的回执（summary_rewrite 只替换 reply，保留 tokenUsage）。
+    const receipt = ctx.phaseResults[stageName] as StageResult | undefined;
+    const receiptInput = numberFromUnknown(receipt?.tokenUsage?.input);
+    // 回执缺 tokenUsage（宿主 runtime 未上报或阶段未真正执行）时按阶段内 0 消耗处理：
+    // 没有证据证明目标阶段耗尽了自身预算，就不压制重跑；日志写明该回退。
+    const stageInput = receiptInput !== undefined && receiptInput > 0 ? receiptInput : 0;
+    const ratio = stageInput / maxSessionInputTokens;
+    const suppress = ratio >= threshold;
+    _pipelineLogger().info(
+      `[PipelineStrategy] retry budget check for "${stageName}": stage input ${stageInput}/${maxSessionInputTokens} (${Math.round(
+        ratio * 100
+      )}%) vs threshold ${Math.round(threshold * 100)}% → ${suppress ? 'suppress' : 'allow'} retry` +
+        ` (scale=stage-internal last run; pipeline input total ${ctx.totalTokenUsage.input}` +
+        (receiptInput === undefined
+          ? '; retry target has no token usage on its last receipt, treated as 0'
+          : '') +
+        ')',
+      {
+        stage: stageName,
+        stageInput,
+        maxSessionInputTokens,
+        threshold,
+        pipelineInputTotal: ctx.totalTokenUsage.input,
+        receiptUsageMissing: receiptInput === undefined,
+        decision: suppress ? 'suppress' : 'allow',
+      }
+    );
+    if (!suppress) {
       return null;
     }
 
     return {
       reason: `Analysis retry suppressed because session input budget is exhausted (${Math.round(
         ratio * 100
-      )}% of maxSessionInputTokens=${maxSessionInputTokens}).`,
+      )}% of maxSessionInputTokens=${maxSessionInputTokens}; stage "${stageName}" last-run input=${stageInput}, pipeline input total=${ctx.totalTokenUsage.input}).`,
     };
   }
 
@@ -1266,6 +1304,8 @@ export class PipelineStrategy extends Strategy {
         timeoutMs: gate.recordRepairTimeoutMs ?? 90_000,
         maxTokens: gate.recordRepairMaxTokens ?? 2048,
         temperature: 0.2,
+        // 阶段内口径（I02）：BudgetController 以本 loop 构造时的运行累计为基线计量，
+        // analyze 已用的 input 不计入这 12k。
         maxSessionInputTokens: 12_000,
         maxSessionTokens: 16_000,
       },
@@ -1318,6 +1358,7 @@ export class PipelineStrategy extends Strategy {
         timeoutMs: (gate.summaryRewriteTimeoutMs as number | undefined) ?? 120_000,
         maxTokens: (gate.summaryRewriteMaxTokens as number | undefined) ?? 4096,
         temperature: 0.3,
+        // 阶段内口径（I02）：同 record_repair，只计本微阶段自身的 input。
         maxSessionInputTokens: 24_000,
         maxSessionTokens: 30_000,
       },

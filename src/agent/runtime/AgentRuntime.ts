@@ -850,6 +850,11 @@ export class AgentRuntime {
 
     ctx.exitController = createExitController(ctx, this.policies);
 
+    // 阶段会话预算口径（I02 方案 A）：budget.maxSessionInputTokens 是本 loop（一次阶段执行）内的
+    // input 预算。BudgetController 在这里构造时把运行级 this.tokenUsage 的当前值记为基线，
+    // 比值/压力/遥测只看本 loop 的增量；消耗仍写回 this.tokenUsage，运行级总账不变。
+    // createExitController 的 session 屏蔽只看“阶段是否声明了 maxSessionInputTokens”，
+    // 与 BudgetController.hasSessionBudget 读同一字段，口径一致，不受基线影响。
     ctx.budgetController = new BudgetController({
       maxSessionInputTokens: (budget.maxSessionInputTokens as number) || 0,
       maxSessionTokens: budget.maxSessionTokens as number | undefined,
@@ -888,6 +893,8 @@ export class AgentRuntime {
   #shouldExit(ctx: LoopContext): boolean {
     const ec = ctx.exitController;
     if (ec) {
+      // Policy（BudgetPolicy）的 session 上限是 profile 级配置，按整次运行累计判定，故传运行级
+      // this.tokenUsage；阶段会话预算（阶段内口径）由 BudgetController 预检负责，不经这里。
       const signal = ec.checkBeforeIteration(ctx, this.tokenUsage);
       if (signal.action === 'exit' || signal.action === 'graceful_exit') {
         this.logger.info(

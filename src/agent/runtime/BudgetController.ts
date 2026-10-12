@@ -9,7 +9,13 @@
  *   5. TurnTelemetry 遥测 (emitTurnTelemetry)
  *
  * 生命周期: 每次 reactLoop 创建一个，绑定到 LoopContext。
- * 跨 stage 共享: cumulativeUsage 使用 AgentRuntime.tokenUsage 引用。
+ * 跨 stage 共享: cumulativeUsage 使用 AgentRuntime.tokenUsage 引用，本 loop 的消耗照常写回。
+ *
+ * 会话预算口径（I02 方案 A）: maxSessionInputTokens 是“本 loop（一次阶段执行）内”的 input 预算。
+ * 构造时把共享累计器的当前值记为基线，sessionUsageRatio、预检比值、sessionPressure、
+ * TurnTelemetry、getSessionSummary、下一次调用估算与 L4 硬停都只看“累计 − 基线”。
+ * 否则 record_repair(12k)/summary_rewrite(24k) 这类微阶段会拿 analyze 已用的几十万 input
+ * 去比自己的小预算，首轮比值就是数十倍：压力钳到 1、工具配额落到最低档、开启 L4 时一次失败即硬停。
  *
  * @module BudgetController
  */
@@ -29,13 +35,17 @@ export interface TokenUsageAccumulator {
 }
 
 export interface BudgetControllerConfig {
-  /** Session 级 input token 总限额 (0 = 不限制，退化为 no-op) */
+  /**
+   * 本 loop（阶段）内的 input token 预算 (0 = 不限制，退化为 no-op)。
+   * 与“cumulativeUsage.input − 构造时基线”比较，不与整次运行累计比较。
+   */
   maxSessionInputTokens: number;
   /** Session 级 total token 总限额 (input + output) */
   maxSessionTokens?: number;
   /**
    * AgentRuntime.tokenUsage 的引用（非拷贝！）。
    * 跨 pipeline stage 共享：analyze 写入的值，produce 可读到。
+   * 构造时的值是本 loop 的会话预算基线；本 loop 的消耗仍累加写回该引用。
    */
   cumulativeUsage: TokenUsageAccumulator;
   /** ContextWindow 引用 (Per-call 压缩) */
@@ -116,6 +126,12 @@ const L4_REPEAT_FAILURE_HARD_STOP_RATIO = 1.0;
 export class BudgetController {
   readonly #maxSessionInputTokens: number;
   readonly #cumulativeUsage: TokenUsageAccumulator;
+  /**
+   * 构造时共享累计器的快照（baselineInput 即 #baselineUsage.input）。
+   * 本 loop 的会话预算消耗 = 累计 − 基线；其余字段的基线只用于 getSessionSummary，
+   * 让 summary 的 token 总量与 totalIterations 一样都是本 loop 口径。
+   */
+  readonly #baselineUsage: Readonly<TokenUsageAccumulator>;
   readonly #contextWindow: ContextWindow | null;
   readonly #baseSystemPromptLength: number;
   readonly #toolSchemaCount: number;
@@ -131,6 +147,7 @@ export class BudgetController {
   #l4FailureCount = 0;
   #l4DisabledLogged = false;
   #noSessionBudgetLogged = false;
+  #negativeStageDeltaLogged = false;
   #lastProjectedSessionUsageRatio = 0;
   #consecutiveZeroCacheHits = 0;
 
@@ -149,6 +166,7 @@ export class BudgetController {
   constructor(config: BudgetControllerConfig) {
     this.#maxSessionInputTokens = config.maxSessionInputTokens;
     this.#cumulativeUsage = config.cumulativeUsage;
+    this.#baselineUsage = { ...config.cumulativeUsage };
     this.#contextWindow = config.contextWindow;
     this.#baseSystemPromptLength = config.baseSystemPromptLength;
     this.#toolSchemaCount = config.toolSchemaCount;
@@ -171,7 +189,7 @@ export class BudgetController {
     if (!this.hasSessionBudget) {
       return 0;
     }
-    return this.#cumulativeUsage.input / this.#maxSessionInputTokens;
+    return this.#stageInputTokens() / this.#maxSessionInputTokens;
   }
 
   /**
@@ -219,7 +237,8 @@ export class BudgetController {
       this.#logger.warn('[BudgetController] L4 compaction request suppressed during cooldown');
     }
 
-    const usedInputTokens = this.#cumulativeUsage.input;
+    // 阶段内口径：只计本 loop 的消耗，前序阶段写入共享累计器的量在基线里。
+    const usedInputTokens = this.#stageInputTokens();
     const estimated = this.#estimateNextCallTokens(iteration);
     const projected = usedInputTokens + estimated;
     const ratio = projected / this.#maxSessionInputTokens;
@@ -243,7 +262,7 @@ export class BudgetController {
     const isAggressive = ratio > AGGRESSIVE_COMPRESS_THRESHOLD;
     const label = isAggressive ? '激进压缩' : '压缩';
     this.#logger.info(
-      `[BudgetController] ⚠ session 预检: ${usedInputTokens} used + ~${estimated} est = ${projected}/${this.#maxSessionInputTokens} (${(ratio * 100).toFixed(1)}%) → ${label}`
+      `[BudgetController] ⚠ session 预检: stage ${usedInputTokens} used + ~${estimated} est = ${projected}/${this.#maxSessionInputTokens} (${(ratio * 100).toFixed(1)}%) → ${label} (run total ${this.#cumulativeUsage.input}, stage baseline ${this.#baselineUsage.input})`
     );
 
     const compaction = this.#runExtraCompaction();
@@ -483,10 +502,13 @@ export class BudgetController {
     const inTok = u.inputTokens || 0;
     const cacheRate = inTok > 0 ? ((u.cacheHitTokens || 0) / inTok) * 100 : 0;
     const sessionBudget = this.#maxSessionInputTokens;
+    // session= 是本 loop（阶段）内口径，与预算比较；run= 是整次运行累计，便于对账。
+    const stageInput = this.#stageInputTokens();
+    const runPart = `run=${this.#cumulativeUsage.input}`;
     const sessionPart =
       sessionBudget > 0
-        ? `session=${this.#cumulativeUsage.input}/${sessionBudget} (${((this.#cumulativeUsage.input / sessionBudget) * 100).toFixed(1)}%)`
-        : `session=${this.#cumulativeUsage.input} (unlimited)`;
+        ? `session=${stageInput}/${sessionBudget} (${((stageInput / sessionBudget) * 100).toFixed(1)}%) ${runPart}`
+        : `session=${stageInput} (unlimited) ${runPart}`;
 
     this.#logger.info(
       `[TurnTelemetry] iter=${iteration} | ` +
@@ -508,14 +530,15 @@ export class BudgetController {
     }
   }
 
+  /** 本 loop 口径的汇总：token 总量与 totalIterations、峰值比值一样只计本 loop。 */
   getSessionSummary(): SessionBudgetSummary {
-    const totalInput = this.#cumulativeUsage.input;
-    const totalCache = this.#cumulativeUsage.cacheHit;
+    const totalInput = this.#stageInputTokens();
+    const totalCache = this.#stageDelta('cacheHit');
     return {
       totalIterations: this.#iterationCount,
       totalInputTokens: totalInput,
-      totalOutputTokens: this.#cumulativeUsage.output,
-      totalReasoningTokens: this.#cumulativeUsage.reasoning,
+      totalOutputTokens: this.#stageDelta('output'),
+      totalReasoningTokens: this.#stageDelta('reasoning'),
       avgCacheHitRate: totalInput > 0 ? totalCache / totalInput : 0,
       peakSessionUsageRatio: this.#peakSessionUsageRatio,
       maxCompactionLevel: this.#maxCompactionLevel,
@@ -528,6 +551,31 @@ export class BudgetController {
    *  内部方法
    * ═══════════════════════════════════════════════════════ */
 
+  /** 本 loop（阶段）内已消耗的 input：共享累计 − 构造时基线。 */
+  #stageInputTokens(): number {
+    return this.#stageDelta('input');
+  }
+
+  /**
+   * 共享累计器某字段相对构造时基线的增量。
+   * 只有本类会在 loop 内写入该引用，增量正常情况下不会为负；钳到 0 只是防御
+   * （例如宿主在 loop 中途把累计器字段改小），避免负数比值把压力误判为 0 以下。
+   * 触发时每个 loop 记一次 warn，写明字段、当前值与基线。
+   */
+  #stageDelta(field: keyof TokenUsageAccumulator): number {
+    const delta = this.#cumulativeUsage[field] - this.#baselineUsage[field];
+    if (delta < 0) {
+      if (!this.#negativeStageDeltaLogged) {
+        this.#negativeStageDeltaLogged = true;
+        this.#logger.warn(
+          `[BudgetController] shared token accumulator fell below this loop's baseline (${field}: ${this.#cumulativeUsage[field]} < baseline ${this.#baselineUsage[field]}); in-stage usage clamped to 0`
+        );
+      }
+      return 0;
+    }
+    return delta;
+  }
+
   #estimateNextCallTokens(iteration: number): number {
     if (this.#lastRoundInputTokens > 0) {
       return this.#lastRoundInputTokens;
@@ -538,8 +586,10 @@ export class BudgetController {
         this.#toolSchemaCount
       );
     }
-    if (iteration > 1 && this.#cumulativeUsage.input > 0) {
-      return Math.ceil(this.#cumulativeUsage.input / (iteration - 1));
+    // 均值估算也用阶段内口径：iteration 是本 loop 的轮次，分子必须是本 loop 的消耗。
+    const stageInput = this.#stageInputTokens();
+    if (iteration > 1 && stageInput > 0) {
+      return Math.ceil(stageInput / (iteration - 1));
     }
     return DEFAULT_ESTIMATE;
   }
