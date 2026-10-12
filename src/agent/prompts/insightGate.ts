@@ -10,6 +10,7 @@
  *   → ../evaluation/gateEvaluators.ts
  * 本文件只保留纯 prompt 文本构建:
  * - buildRetryPrompt(拆前 :781)
+ * - buildAnalyzeRetryPrompt(C53:scan 管线与 insight 预设 analyze 阶段共用的门重试提示，内部 helper)
  * - buildRecordRepairPrompt(拆前 :853)+stringifyRecordRepairEvidenceMap(拆前 :814)
  * - buildSummaryRewritePrompt(拆前 :915)
  *
@@ -18,8 +19,9 @@
  * (门控产出与本文件路由判定同一符号)——退化成本地字面量副本会让深度 retry 与
  * 记忆修复路由在运行期静默失效(编译仍绿)。
  *
- * ⚠️ 公开面:本文件经 prompts/index.ts `export *` 进入 @alembic/agent/prompts 冻结名集，
- * 新增 helper 一律不导出(名集膨胀=签名门红)。
+ * ⚠️ 公开面:prompts/index.ts 按名 re-export 本文件的 buildRetryPrompt/buildRecordRepairPrompt/
+ * buildSummaryRewritePrompt 进入 @alembic/agent/prompts 冻结名集。其余导出(如 buildAnalyzeRetryPrompt)
+ * 只供 agent 内部阶段工厂跨文件复用，不得加进那份名单(名集膨胀=签名门红)。
  *
  * @module insightGate
  */
@@ -99,6 +101,35 @@ export function buildRetryPrompt(reason: string) {
     (hints as Record<string, string>)[reason] ||
     '请更深入地分析代码，引用至少 3 个具体文件，每个发现都要有代码证据。'
   );
+}
+
+/**
+ * C53: analyze 阶段的门重试提示——scan 管线(evaluation/stageBuilders)与 insight 预设
+ * (profiles/presets/insightPreset)的 analyze.retryPromptBuilder 都委托这里，避免两份拷贝分叉。
+ *
+ * 提示 = 上一轮 analyze 回复 + 质量门失败原因 + buildRetryPrompt 的分支提示，口径与收敛前逐字一致：
+ * - 上一轮回复缺失(analyze 阶段没有结果或 reply 为空)时以空串开头，只靠失败原因与提示引导重挖；
+ * - reason 缺失时模板沿用旧插值(`undefined`)，提示按空原因路由到通用深挖文案。
+ * 两条降级路径都打观测日志，便于区分「带上一轮分析重试」与「无上一轮分析重试」。
+ *
+ * ⚠️ 内部 helper：不加入 prompts/index.ts 的按名 re-export(见文件头公开面说明)。
+ *
+ * @param retryCtx PipelineStrategy 传入的门重试上下文(phaseResults._retryContext)
+ * @param prev PipelineStrategy 的 phaseResults；只读取其中 analyze 阶段的 reply
+ */
+export function buildAnalyzeRetryPrompt(
+  retryCtx: { reason?: string },
+  prev: Record<string, unknown>
+) {
+  const prevAnalysis = (prev.analyze as { reply?: string } | undefined)?.reply || '';
+  const retryHint = buildRetryPrompt(retryCtx.reason ?? '');
+  logPromptPath(
+    `[InsightGate] analyze retry prompt: ` +
+      `path=${prevAnalysis ? 'with-previous-analysis' : 'no-previous-analysis'} ` +
+      `(prevAnalysisChars=${String(prevAnalysis).length}; ` +
+      `reason=${retryCtx.reason === undefined ? 'missing' : JSON.stringify(String(retryCtx.reason).slice(0, 120))})`
+  );
+  return `${prevAnalysis}\n\n⚠️ 上述分析未通过质量检查: ${retryCtx.reason}\n\n${retryHint}`;
 }
 
 /** 修复类提示里文件清单的上限(与拆分前一致)。 */

@@ -17,6 +17,12 @@ export {
 } from '../evaluation/index.js';
 export * from './insightAnalyst.js';
 export * from './insightEvolver.js';
-export * from './insightGate.js';
+// C53: insightGate 按名 re-export 冻结的三个修复类提示构建器；同文件的内部 helper
+// (buildAnalyzeRetryPrompt，供 scan 管线与 insight 预设共用)不得经 `export *` 漏上公开名集。
+export {
+  buildRecordRepairPrompt,
+  buildRetryPrompt,
+  buildSummaryRewritePrompt,
+} from './insightGate.js';
 export * from './insightProducer.js';
 export * from './scanPrompts.js';

@@ -16,7 +16,7 @@ import {
   ANALYST_SYSTEM_PROMPT,
   buildAnalystPrompt,
 } from '../../prompts/insightAnalyst.js';
-import { buildRetryPrompt } from '../../prompts/insightGate.js';
+import { buildAnalyzeRetryPrompt } from '../../prompts/insightGate.js';
 import {
   buildProducerPromptV2,
   PRODUCER_BUDGET,
@@ -116,15 +116,12 @@ export const INSIGHT_PRESET = {
                 }),
             }
           ),
+        // C53: 与 scan 管线共用 insightGate 的内部构建器，两条管线的 analyze 重试提示不再分叉。
         retryPromptBuilder: (
           retryCtx: { reason?: string },
           _origPrompt: string,
           prev: Record<string, unknown>
-        ) => {
-          const prevAnalysis = (prev.analyze as { reply?: string } | undefined)?.reply || '';
-          const retryHint = buildRetryPrompt(retryCtx.reason ?? '');
-          return `${prevAnalysis}\n\n⚠️ 上述分析未通过质量检查: ${retryCtx.reason}\n\n${retryHint}`;
-        },
+        ) => buildAnalyzeRetryPrompt(retryCtx, prev),
         // onToolCall: 由 orchestrator 按维度注入
       },
 

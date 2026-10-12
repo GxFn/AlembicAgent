@@ -2,7 +2,7 @@
  * 阶段名是 runtime/host 共享标识，保持 analyze/quality_gate/produce/rejection_gate。 */
 
 import { ANALYST_SYSTEM_PROMPT } from '../prompts/insightAnalyst.js';
-import { buildRetryPrompt } from '../prompts/insightGate.js';
+import { buildAnalyzeRetryPrompt } from '../prompts/insightGate.js';
 import { buildCodeContextSection } from '../prompts/insightProducer.js';
 import { buildProducerFindingsSection } from '../prompts/producerFindings.js';
 import { buildProducerRetryPrompt } from '../prompts/producerRetry.js';
@@ -132,15 +132,12 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
       timeoutMs: 300_000, // 5 min (与冷启动对齐)
     },
     systemPrompt: ANALYST_SYSTEM_PROMPT,
+    // C53: 与 insight 预设共用 insightGate 的内部构建器；保留原参数标注，阶段对象的推断类型不变。
     retryPromptBuilder: (
       retryCtx: { reason?: string },
       _origPrompt: string,
       prev: Record<string, PhaseResult>
-    ) => {
-      const prevAnalysis = prev.analyze?.reply || '';
-      const retryHint = buildRetryPrompt(retryCtx.reason ?? '');
-      return `${prevAnalysis}\n\n⚠️ 上述分析未通过质量检查: ${retryCtx.reason}\n\n${retryHint}`;
-    },
+    ) => buildAnalyzeRetryPrompt(retryCtx, prev),
   };
 
   // ── Stage 2: Quality Gate ──
