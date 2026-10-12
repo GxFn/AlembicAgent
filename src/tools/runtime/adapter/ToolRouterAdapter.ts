@@ -266,7 +266,12 @@ export class ToolRouterAdapter implements ToolRouterContract {
     };
     // 先保留 handler 的执行真值，再单独归一显示数据。宿主已写成功后的循环/BigInt/
     // getter 等不能使 JSON.stringify 抛出并落入 execute 的失败分支，更不能重试写入。
-    // 内部信封保留业务字段；普通输出的私有字段规则仍由 presenter 的默认投影执行。
+    // 这里显式传 forbiddenFields: []，只做显示归一（不可序列化值降级、节点预算），不删除任何
+    // 字段，内部信封保留业务字段。D23 普通输出禁用字段并没有在下游对结构化结果补上：带默认
+    // 禁用列表的投影只出现在 presentToolResult（目前没有生产调用方），以及 runtimeBridge 与
+    // AgentTaskHandlers 对不带 structuredContent 的纯文本信封的投影；有 structuredContent 时
+    // 它们直接返回原值。结构化结果是否也要执行 D23 待决（L3-C02），决定前不要假设私有字段
+    // 已被清理。
     const display = projectToolResultOrdinaryOutput(envelope, { forbiddenFields: [] });
     envelope.structuredContent = display.structuredContent;
     if (result.ok) {

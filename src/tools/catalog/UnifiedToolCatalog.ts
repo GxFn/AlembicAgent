@@ -1,14 +1,22 @@
 /**
- * UnifiedToolCatalog — 统一工具目录 (单源真相)
+ * UnifiedToolCatalog — 继承 CapabilityCatalog 的能力清单目录（以下为 2026-10 核对的当前事实）。
  *
- * 合并 `CapabilityCatalog`（manifest 查询）和 `ToolRegistry`（handler 查询）。
- * 继承 `CapabilityCatalog` 以保持对 `ToolRouter` 的兼容。
+ * 生产用途：宿主把它注册为 `toolRegistry` 单例，只用继承来的 `register(manifest)` 存放
+ * Dashboard/Skill manifest。它不参与工具执行，也不提供模型 schema：
+ *   - 运行时工具执行只走 ToolRouterAdapter → ToolRouter → ActionHandler，ToolRouter 不读取任何 catalog；
+ *   - 模型 schema 由宿主注册为 `capabilityCatalog` 的 RuntimeCapabilityCatalog 提供，不经本类。
+ *   - 生产中读取本实例的只有两处：AgentRuntime/AgentRuntimeBuilder 的 getRouter 兜底（恒为 null，
+ *     见下）和 duplicateCache 的 getManifest。后者按运行时工具 id 查询，而运行时工具不在这里
+ *     注册，所以目前查不到（去留待决，见 L3-C08）。存进来的 Dashboard/Skill manifest 没有读取方。
  *
- * 内部存储 `ToolDefinition`，对外暴露：
- *   - getManifest(id) — 返回 ToolCapabilityManifest（兼容 GovernanceEngine）
- *   - getHandler(id) — 返回 handler function
- *   - getInternalTool(id) — 兼容 InternalToolHandlerStore
- *   - toToolSchemas(ids?, model?) — 支持 per-model 描述覆盖
+ * 兼容公开面（在冻结签名清单内，生产中没有消费者，收窄与否待决）：
+ *   - registerDefinition/getDefinition/getHandler：按 ToolDefinition 注册并取 handler，只有测试使用；
+ *   - getInternalTool：实现 InternalToolHandlerStore，只有测试调用；owner 固定写成 'core'；
+ *   - setRouter/getRouter：src 与宿主都没有 setRouter 调用，AgentRuntime/AgentRuntimeBuilder
+ *     里的 getRouter 兜底在生产中因此恒为 null。
+ *
+ * lazy 展开状态（markExpanded 等）存在本实例上，不按运行隔离，同一实例被多次运行共用时
+ * 会跨运行累积；宿主 schema 查询不经本类，所以这份状态在生产中不影响模型看到的 schema。
  *
  * @module tools/catalog/UnifiedToolCatalog
  */
@@ -29,7 +37,7 @@ import type {
 } from '#tools/kernel/manifest.js';
 import type { ToolSchemaProjection, ToolSchemaQuery } from '#tools/kernel/toolSchema.js';
 
-// ── Types inlined from deleted ToolDefinition.ts ──
+// ── ToolDefinition 兼容公开面的类型（只服务 registerDefinition 路径，生产中没有注册方） ──
 
 export type ToolHandler = (
   args: Record<string, unknown>,
@@ -144,7 +152,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     this.registerDefinitions(defs);
   }
 
-  // ── Router binding (replaces ToolRegistry.setRouter/getRouter) ──
+  // ── Router 绑定（兼容公开面）：src 与宿主都没有 setRouter 调用，生产中 getRouter 恒为 null ──
 
   setRouter(router: ToolRouterContract | null): void {
     this.#router = router;
@@ -160,7 +168,8 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     if (this.#defs.has(def.id)) {
       throw new Error(`Tool '${def.id}' already registered in UnifiedToolCatalog`);
     }
-    // Also register as CapabilityManifest for backward compatibility
+    // 同时登记一份由定义推导的 manifest，让继承来的 getManifest/list/querySchemas 能看到它；
+    // 推导时 owner 固定为 'core'，不代表真实归属。
     super.register(definitionToManifest(def));
     this.#defs.set(def.id, def);
   }
@@ -188,7 +197,7 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     return this.#defs.get(id) ?? null;
   }
 
-  // ── InternalToolHandlerStore compatibility ──
+  // ── InternalToolHandlerStore 兼容实现：接口没有生产读取方，本方法只有测试调用 ──
 
   getInternalTool(name: string): InternalToolHandlerEntry | null {
     const def = this.#defs.get(name);
@@ -214,19 +223,22 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
   // ── Per-model Schema Projection ──
 
   /**
-   * Override parent's toToolSchemas to support per-model description overrides.
-   * When `model` is provided, tool descriptions are matched against modelOverrides.
+   * 新增的包装方法（不是父类 toToolSchemas 的覆盖）：等价于
+   * querySchemas({ selection: ids, model, mode: 'full' })。
+   * 传入 model 时，按注册定义的 modelOverrides 匹配描述与参数覆盖。
    */
   toToolSchemasForModel(ids?: readonly string[] | null, model?: string): ToolSchemaProjection[] {
     return this.querySchemas({ selection: ids, model, mode: 'full' }).schemas;
   }
 
-  // ── Lazy Loading: lightweight / mixed schema projection ──
+  // ── lazy 投影：lightweight / mixed ──
+  // 展开状态挂在实例上，不按运行隔离；只有调用方之后再查询 mixed schema 时才会体现。
+  // 运行时每次 reactLoop 只查询一次 schema，“按轮展开”在当前调用链上不成立。
 
-  /** Tools that have been "expanded" (used by the agent — full schema shown). */
+  /** 已展开的工具 id（mixed 投影时这些工具给完整 schema）；实例级状态。 */
   readonly #expandedToolIds = new Set<string>();
 
-  /** Mark a tool as expanded (called after the tool is used in a round). */
+  /** 标记一个工具为已展开；只影响本实例此后的 mixed 查询。 */
   markExpanded(toolId: string): void {
     this.#expandedToolIds.add(toolId);
   }
@@ -243,25 +255,20 @@ export class UnifiedToolCatalog extends CapabilityCatalog implements InternalToo
     this.#expandedToolIds.clear();
   }
 
-  /**
-   * Lightweight schema: name + one-line description only (no parameters).
-   * Used for tools the agent hasn't touched yet to reduce token overhead.
-   */
+  /** 轻量 schema：只给名称和首行描述（最多 120 字符），参数为空对象。 */
   toLightweightSchemas(ids?: readonly string[] | null): ToolSchemaProjection[] {
     return this.querySchemas({ selection: ids, mode: 'lightweight' }).schemas;
   }
 
   /**
-   * Mixed schema projection:
-   *   - Expanded tools → full schema (with optional model override)
-   *   - Not-yet-used tools → lightweight (name + description only)
+   * mixed 投影：
+   *   - 已展开的工具 → 完整 schema（传入 model 时应用 modelOverrides）；
+   *   - 未展开的工具 → 轻量 schema（名称加首行描述）。
+   * 没有经过测量的 token 节省数据，这里不给比例。
    *
-   * This reduces the total token cost of tool schemas from ~50-80% to ~20-30%
-   * in large toolsets (30+ tools).
-   *
-   * @param ids - Allowed tool IDs
-   * @param model - Current model name for per-model overrides
-   * @param firstRound - If true, all tools get full schema (first iteration)
+   * @param ids - 允许的工具 id；null/undefined 表示目录内全部可见工具
+   * @param model - 当前模型名，用于匹配 modelOverrides
+   * @param firstRound - 为 true 时所有工具都给完整 schema
    */
   toMixedSchemas(
     ids?: readonly string[] | null,

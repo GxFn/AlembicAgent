@@ -60,7 +60,15 @@ export interface ParsedToolCall {
   params: Record<string, unknown>;
 }
 
-/** 结果元信息 — 对 LLM 不可见，供 ContextWindow 消费 */
+/**
+ * 结果元信息 — 对 LLM 不可见，供 ContextWindow 消费。
+ *
+ * ok 与 resultStatus 的组合规则（沿用上一轮台账 r03/r04 的决定）：ToolResult.ok 是旧兼容标记，
+ * 显式 resultStatus 优先，消费方判定结果时以 resultStatus 为准（adapter 归一后即信封的
+ * status），不应只看 ok。ok:true 可以与非 success 状态并存：例如 terminal 非零退出码返回
+ * ok:true 加 resultStatus:'error'，code 搜索在取消或超时前已有匹配时返回 ok:true 加
+ * 'timeout'/'aborted'/'partial'。缺省 resultStatus 时，adapter 才按 ok 归一为 success/error。
+ */
 export interface ToolResultMeta {
   /** producer/路由层确认的结果状态，优先于旧 ok 标记；缺省时 adapter 才按 ok 归一化。 */
   resultStatus?: ToolResultStatus;

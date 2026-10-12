@@ -1,7 +1,15 @@
 /**
- * Tool request + router contract — the call request, execution request, and the
- * ToolRouterContract implemented by both the Agent tool router and the
- * host-surface router. Canonical home (formerly src/tools/core/ToolContracts.ts).
+ * 工具调用请求与路由契约：ToolCallRequest、ToolExecutionRequest 与 ToolRouterContract。
+ *
+ * 当前事实（2026-10 核对 Agent 与宿主源码）：
+ * - ToolRouterContract 当前唯一实现是 ToolRouterAdapter；宿主的 toolRouter 单例就是它，
+ *   宿主没有第二个路由实现。
+ * - 生产调用链只用到契约上的 execute 与 releaseScope；契约上的 explain、executeChildCall 在
+ *   Agent 与宿主中都没有调用方（ToolRouterAdapter.executeChildCall 只是委托 execute；内部
+ *   ToolRouter.explain 是另一个方法），是否改为可选待决（L3-C09）。
+ * - ToolCallRequest.governance 没有读取方，传入的 gatewayAction 等不会触发任何门禁；
+ *   ToolExecutionAdapter 与 ToolExecutionPreviewRequest 没有实现者。宿主 dashboard 操作只
+ *   使用 ToolExecutionRequest 的形状。
  */
 
 import type {
