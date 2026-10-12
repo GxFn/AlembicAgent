@@ -192,7 +192,11 @@ class DurableSemanticReviewRuntimeService implements DurableSemanticReviewRuntim
       );
     }
 
-    const cancellation = createCancellation(input.abortSignal, this.#timeoutMs);
+    const cancellation = createCancellation(
+      input.abortSignal,
+      this.#timeoutMs,
+      this.#state.diagnostics
+    );
     let authoritativeLedgerEntries: ReadonlyMap<string, EvidenceEntry>;
     try {
       const currentSnapshot = this.#state.evidence.ledger.strictSnapshot();
@@ -849,9 +853,19 @@ function requireExecutionContext(
   return context;
 }
 
+/**
+ * 内部 AbortController 的 reason 不变式：只会是 Error 实例。
+ *
+ * 宿主可以用任意值（字符串、null、普通对象）取消父 signal；如果原样转发，throwIfAborted /
+ * raceWithAbort 会把非 Error 值抛进 Core gateway 回调（invokeReviewer / loadEvidenceAuthority）
+ * 和 witness authority port，违反“只抛 Error 实例”的规则，Core 读 err.message 也会拿到
+ * undefined。因此父 signal 的 reason 在进入内部 controller 前统一归一；对外仍由
+ * classifyRuntimeFailure 映射为 CANCELLED，错误码不变。
+ */
 function createCancellation(
   parentSignal: AbortSignal | undefined,
-  timeoutMs: number
+  timeoutMs: number,
+  diagnostics?: DiagnosticsCollector
 ): {
   readonly abortSignal: AbortSignal;
   readonly cleanup: () => void;
@@ -861,7 +875,8 @@ function createCancellation(
   const controller = new AbortController();
   let termination: ExecutionContext['termination'] = 'active';
   let listener: ((value: ExecutionContext['termination']) => void) | null = null;
-  const update = (value: ExecutionContext['termination'], reason: unknown) => {
+  // reason 收窄为 Error：内部 signal.reason 由此成为 Error，下游无需再做 `??` 兜底。
+  const update = (value: ExecutionContext['termination'], reason: Error) => {
     if (termination !== 'active') {
       return;
     }
@@ -869,8 +884,10 @@ function createCancellation(
     listener?.(value);
     controller.abort(reason);
   };
+  // 只有 parentSignal 存在时才会注册或立即调用该回调；已 aborted 的 signal 一定带 reason
+  // （不传参时为 DOMException AbortError，它本身是 Error，原样保留）。
   const onParentAbort = () =>
-    update('cancelled', parentSignal?.reason ?? new Error('semantic review cancelled'));
+    update('cancelled', normalizeParentAbortReason(parentSignal?.reason, diagnostics));
   if (parentSignal?.aborted) {
     onParentAbort();
   } else {
@@ -908,19 +925,39 @@ function createCancellation(
   };
 }
 
+/**
+ * 父 signal 取消原因归一：Error（含 DOMException）保持同一实例；其它值包装为
+ * Error('semantic review cancelled', { cause: 原值 })，原值留在 cause 链上供宿主排查。
+ * 包装属于兼容转译路径，记录诊断告警（只写类型，不写宿主提供的原值内容）。
+ */
+function normalizeParentAbortReason(reason: unknown, diagnostics?: DiagnosticsCollector): Error {
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const reasonType = reason === null ? 'null' : typeof reason;
+  diagnostics?.warn({
+    code: 'durable_semantic_review_abort_reason_normalized',
+    stage: RUNTIME_STAGE,
+    message: `Parent abort reason was a non-Error value (type=${reasonType}); wrapped as Error('semantic review cancelled') with the original value as cause before aborting the durable semantic review.`,
+  });
+  return new Error('semantic review cancelled', { cause: reason });
+}
+
+// throwIfAborted 与 raceWithAbort 接收的 signal 只会是 createCancellation 创建的内部 signal，
+// 其 reason 已由 update/normalizeParentAbortReason 保证为 Error，可直接抛出，不再需要兜底。
 function throwIfAborted(context: ExecutionContext): void {
   if (context.abortSignal.aborted) {
-    throw context.abortSignal.reason ?? new Error('semantic review aborted');
+    throw context.abortSignal.reason;
   }
 }
 
 async function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) {
     void operation.catch(() => undefined);
-    throw signal.reason ?? new Error('semantic review aborted');
+    throw signal.reason;
   }
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason ?? new Error('semantic review aborted'));
+    const onAbort = () => reject(signal.reason);
     signal.addEventListener('abort', onAbort, { once: true });
     operation.then(
       (value) => {

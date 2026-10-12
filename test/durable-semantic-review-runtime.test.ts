@@ -26,6 +26,7 @@ import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.
 import {
   createDurableSemanticReviewRuntime,
   type DurableSemanticReviewExecuteInputV1,
+  DurableSemanticReviewRuntimeError,
   type SemanticReviewWitnessAuthorityBundleV1,
   type SemanticReviewWitnessAuthorityLookupV1,
 } from '../src/evaluation.js';
@@ -55,6 +56,49 @@ const WORKFLOW_RUN_ID = 'strict-workflow:agent-durable-semantic-review';
 const EVALUATOR_RUN_ID = 'agent-evaluator:durable-semantic-review';
 
 const temporaryRoots = new Set<string>();
+
+// C41：Core gateway 会原样透传 Agent 回调（reviewerHost.invoke / evidenceStore.load）抛出的值。
+// 这里用纯透传包装记录回调实际 reject 的值，用于断言取消原因进入 Core 之前已经归一为 Error；
+// 包装不改变返回值和异常，其它用例的行为与真实 Core gateway 相同。
+const coreGatewayCallbackRejections = vi.hoisted(
+  () => [] as { readonly callback: 'invoke' | 'load'; readonly value: unknown }[]
+);
+
+vi.mock('@alembic/core/host-agent-workflows', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@alembic/core/host-agent-workflows')>();
+  type GatewayInput = Parameters<
+    typeof original.createAgentSemanticDispositionReviewDurableGatewayV5
+  >[0];
+  return {
+    ...original,
+    createAgentSemanticDispositionReviewDurableGatewayV5: (input: GatewayInput) =>
+      original.createAgentSemanticDispositionReviewDurableGatewayV5({
+        ...input,
+        reviewerHost: {
+          ...input.reviewerHost,
+          invoke: async (call) => {
+            try {
+              return await input.reviewerHost.invoke(call);
+            } catch (err: unknown) {
+              coreGatewayCallbackRejections.push({ callback: 'invoke', value: err });
+              throw err;
+            }
+          },
+        },
+        evidenceStore: {
+          ...input.evidenceStore,
+          load: async (call) => {
+            try {
+              return await input.evidenceStore.load(call);
+            } catch (err: unknown) {
+              coreGatewayCallbackRejections.push({ callback: 'load', value: err });
+              throw err;
+            }
+          },
+        },
+      }),
+  };
+});
 
 afterEach(() => {
   for (const root of temporaryRoots) {
@@ -842,6 +886,132 @@ describe('DurableSemanticReviewRuntime', () => {
     ).rejects.toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_TIMEOUT' });
     expect(timedFixture.diagnostics.toJSON().timedOutStages).toContain('durable-semantic-review');
     expect(timedFixture.ledgerAuthority.read.strictSnapshot()).toEqual(timedSnapshot);
+  });
+
+  it('normalizes a string parent abort reason into an Error before the Core reviewer callback rejects', async () => {
+    coreGatewayCallbackRejections.length = 0;
+    const fixture = createFixture();
+    const snapshotBefore = fixture.ledgerAuthority.read.strictSnapshot();
+    const invoke = vi.fn(() => new Promise<string>(() => undefined));
+    const runtime = await createRuntime(fixture, { invoke, timeoutMs: 60_000 });
+    const controller = new AbortController();
+
+    const pending = runtime.execute({
+      semanticRequest: fixture.semanticRequest,
+      abortSignal: controller.signal,
+    });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+    controller.abort('user stop');
+    const error: unknown = await pending.then(
+      () => new Error('expected durable semantic review cancellation'),
+      (err: unknown) => err
+    );
+
+    expect(error).toBeInstanceOf(DurableSemanticReviewRuntimeError);
+    expect(error).toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_CANCELLED' });
+    const cause = (error as DurableSemanticReviewRuntimeError).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect(cause).toMatchObject({ message: 'semantic review cancelled', cause: 'user stop' });
+
+    await vi.waitFor(() => expect(coreGatewayCallbackRejections).toHaveLength(1));
+    const [rejection] = coreGatewayCallbackRejections;
+    expect(rejection?.callback).toBe('invoke');
+    expect(rejection?.value).toBeInstanceOf(Error);
+    expect(rejection?.value).toBe(cause);
+    expect(fixture.diagnostics.toJSON()).toMatchObject({
+      efficiency: { cancelReason: 'durable-semantic-review-cancelled' },
+      warnings: [
+        expect.objectContaining({
+          code: 'durable_semantic_review_abort_reason_normalized',
+          stage: 'durable-semantic-review',
+        }),
+      ],
+    });
+    expect(fixture.ledgerAuthority.read.strictSnapshot()).toEqual(snapshotBefore);
+  });
+
+  it('normalizes a null parent abort reason before the witness authority port and Core load callback observe it', async () => {
+    coreGatewayCallbackRejections.length = 0;
+    const fixture = createFixture();
+    const observedLookups: SemanticReviewWitnessAuthorityLookupV1[] = [];
+    const resolve = vi.fn((lookup: SemanticReviewWitnessAuthorityLookupV1) => {
+      observedLookups.push(lookup);
+      return new Promise<SemanticReviewWitnessAuthorityBundleV1 | null>(() => undefined);
+    });
+    const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const runtime = await createRuntime(fixture, { invoke, resolve, timeoutMs: 60_000 });
+    const controller = new AbortController();
+
+    const pending = runtime.execute({
+      semanticRequest: fixture.semanticRequest,
+      abortSignal: controller.signal,
+    });
+    await vi.waitFor(() => expect(resolve).toHaveBeenCalledOnce());
+    controller.abort(null);
+    const error: unknown = await pending.then(
+      () => new Error('expected durable semantic review cancellation'),
+      (err: unknown) => err
+    );
+
+    expect(error).toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_CANCELLED' });
+    const cause = (error as DurableSemanticReviewRuntimeError).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect(cause).toMatchObject({ message: 'semantic review cancelled', cause: null });
+    // witness authority port 拿到的是 runtime 内部 signal，它的 reason 也必须是同一个 Error。
+    expect(observedLookups[0]?.abortSignal.reason).toBe(cause);
+
+    await vi.waitFor(() => expect(coreGatewayCallbackRejections).toHaveLength(1));
+    const [rejection] = coreGatewayCallbackRejections;
+    expect(rejection?.callback).toBe('load');
+    expect(rejection?.value).toBe(cause);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('keeps CANCELLED with an Error cause chain when the parent signal was already aborted', async () => {
+    coreGatewayCallbackRejections.length = 0;
+    const objectFixture = createFixture();
+    const objectInvoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const objectRuntime = await createRuntime(objectFixture, { invoke: objectInvoke });
+    const objectReason = { hostReason: 'shutdown' };
+
+    const objectError: unknown = await objectRuntime
+      .execute({
+        semanticRequest: objectFixture.semanticRequest,
+        abortSignal: AbortSignal.abort(objectReason),
+      })
+      .then(
+        () => new Error('expected durable semantic review cancellation'),
+        (err: unknown) => err
+      );
+    expect(objectError).toMatchObject({ code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_CANCELLED' });
+    const objectCause = (objectError as DurableSemanticReviewRuntimeError).cause;
+    expect(objectCause).toBeInstanceOf(Error);
+    expect((objectCause as Error).cause).toBe(objectReason);
+    expect(objectInvoke).not.toHaveBeenCalled();
+    expect(coreGatewayCallbackRejections).toHaveLength(0);
+    expect(objectFixture.diagnostics.toJSON().warnings).toContainEqual(
+      expect.objectContaining({ code: 'durable_semantic_review_abort_reason_normalized' })
+    );
+
+    // Error（含 DOMException AbortError）原因保持同一实例，不包装、不记归一化告警。
+    const errorFixture = createFixture();
+    const errorRuntime = await createRuntime(errorFixture, {});
+    const hostError = new Error('host requested stop');
+    const preservedError: unknown = await errorRuntime
+      .execute({
+        semanticRequest: errorFixture.semanticRequest,
+        abortSignal: AbortSignal.abort(hostError),
+      })
+      .then(
+        () => new Error('expected durable semantic review cancellation'),
+        (err: unknown) => err
+      );
+    expect(preservedError).toMatchObject({
+      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_CANCELLED',
+      cause: hostError,
+    });
+    expect((preservedError as DurableSemanticReviewRuntimeError).cause).toBe(hostError);
+    expect(errorFixture.diagnostics.toJSON().warnings).toEqual([]);
   });
 
   it('rejects a caller-selected reviewer load and producer self-review', async () => {
