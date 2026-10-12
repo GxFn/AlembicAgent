@@ -20,12 +20,14 @@ import {
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
+import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
 import { buildSubmissionInput } from '../src/tools/runtime/handlers/knowledge/input.js';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
 import { validateToolParameters } from '../src/tools/runtime/parameters.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
+import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
 
 function makeProject() {
@@ -798,7 +800,10 @@ describe('Agent Recipe production profile adapter', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  test('keeps a Core commit confirmed after cancellation and skips new post-commit work', async () => {
+  test.each([
+    ['with', true],
+    ['without', false],
+  ])('keeps a Core commit confirmed after cancellation %s a session store and skips new post-commit work', async (_label, withStore) => {
     const controller = new AbortController();
     const fake = fakePort(readyReport);
     const evaluateReadiness = vi.fn(async () => readyReport);
@@ -815,7 +820,7 @@ describe('Agent Recipe production profile adapter', () => {
         },
         evaluateReadiness,
       },
-      sessionStore: { save },
+      ...(withStore ? { sessionStore: { save } } : {}),
     } as never);
     expect(result.ok).toBe(true);
     expect(result.data).toMatchObject({
@@ -825,6 +830,13 @@ describe('Agent Recipe production profile adapter', () => {
       readinessStatus: 'unavailable',
     });
     expect(result._meta?.degraded).toBe(true);
+    // I43：createOrStage 等待期间取消、Core 仍确认写入时，与 knowledge.manage 一样标注
+    // KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT；readiness 是被跳过而非读取故障。
+    expect(result._meta?.diagnosticWarnings?.map((warning) => warning.code)).toEqual([
+      'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT',
+      'KNOWLEDGE_READINESS_SKIPPED_AFTER_ABORT',
+      ...(withStore ? ['KNOWLEDGE_SESSION_SAVE_SKIPPED'] : []),
+    ]);
     expect(fake.calls).toHaveLength(1);
     expect(evaluateReadiness).not.toHaveBeenCalled();
     expect(save).not.toHaveBeenCalled();
@@ -2339,6 +2351,262 @@ describe('knowledge submit input normalization', () => {
       expect(rest).toEqual([]);
       expect(message).toContain(JSON.stringify(originalTitle));
       expect(message).toContain(`project=${projectName}`);
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+/** I43：Core 每一种去向都要映射成模型可路由、日志可复盘的结果，不再落入无痕兜底。 */
+describe('knowledge submit outcome mapping', () => {
+  const MERGED_PROPOSAL = {
+    index: 0,
+    proposalId: 'proposal-7',
+    type: 'merge',
+    targetRecipeId: 'recipe-existing',
+    targetTitle: 'Existing ImportType rule',
+    status: 'pending',
+    expiresAt: 1_900_000_000_000,
+    message: 'Candidate merged into a proposal for the existing recipe',
+  };
+  const SEMANTIC_REVIEW = {
+    index: 0,
+    title: 'ImportType keeps type-only dependencies out of runtime output',
+    relatedRecipe: { id: 'recipe-related', title: 'Related import rule', similarity: 0.52 },
+    reason: 'moderate overlap without new dimensions',
+  };
+
+  /** 只替换 Core 去向列表；其余字段保持 RecipeProductionResult 的真实形状。 */
+  function outcomePort(outcome: Record<string, unknown>) {
+    const evaluateReadiness = vi.fn(async () => readyReport);
+    const calls: RecipeProductionInput[] = [];
+    return {
+      calls,
+      evaluateReadiness,
+      port: {
+        async createOrStage(input: RecipeProductionInput, context: ProducerContext) {
+          calls.push(input);
+          return {
+            created: [],
+            rejected: [],
+            merged: [],
+            blocked: [],
+            duplicates: [],
+            supersedeProposal: null,
+            production: { capability: context.capability, source: context.source },
+            ...outcome,
+          };
+        },
+        evaluateReadiness,
+        async publish() {
+          throw new Error('Agent submit must never publish');
+        },
+      },
+    };
+  }
+
+  function spyLogs() {
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const messages = (spy: typeof warn) => spy.mock.calls.map(([message]) => String(message));
+    return {
+      warnings: () => messages(warn),
+      infos: () => messages(info),
+      restore: () => {
+        warn.mockRestore();
+        info.mockRestore();
+      },
+    };
+  }
+
+  test('maps a Core consolidation proposal to merged_into_proposal with a warn trace and no persisted count', async () => {
+    const projectRoot = makeProject();
+    const fake = outcomePort({
+      merged: [MERGED_PROPOSAL],
+      pendingSemanticReview: [SEMANTIC_REVIEW],
+    });
+    const save = vi.fn();
+    const log = spyLogs();
+    try {
+      const params = submitParams();
+      const result = await handleKnowledge('submit', params, {
+        projectRoot,
+        recipeGateway: fake.port,
+        sessionStore: { save },
+      } as never);
+      expect(fake.calls).toHaveLength(1);
+      expect(result.ok).toBe(true);
+      expect(result.data).toMatchObject({
+        status: 'merged_into_proposal',
+        proposalId: 'proposal-7',
+        proposalType: 'merge',
+        targetRecipeId: 'recipe-existing',
+        targetTitle: 'Existing ImportType rule',
+        message: MERGED_PROPOSAL.message,
+        codeEvidence: expect.any(Object),
+        pendingSemanticReview: [SEMANTIC_REVIEW],
+      });
+      // 已转为提案：不是新候选，不做 readiness/会话投影，也不能被计为已持久化提交。
+      expect(result.data).not.toHaveProperty('result');
+      expect(result._meta?.degraded).toBeUndefined();
+      expect(fake.evaluateReadiness).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      expect(
+        isPersistedSubmission({ tool: 'knowledge', args: { action: 'submit', params }, result })
+      ).toBe(false);
+      const [trace, ...rest] = log.warnings().filter((message) => message.includes('proposal-7'));
+      expect(rest).toEqual([]);
+      expect(trace).toContain('[knowledge.submit]');
+      expect(trace).toContain(`"${params.title}"`);
+      expect(trace).toContain('recipe-existing');
+      expect(trace).toContain('merge');
+      expect(log.infos().some((message) => message.includes('Related import rule'))).toBe(true);
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('marks a consolidation proposal confirmed after cancellation as a completed mutation', async () => {
+    const projectRoot = makeProject();
+    const controller = new AbortController();
+    const fake = outcomePort({ merged: [MERGED_PROPOSAL] });
+    const log = spyLogs();
+    try {
+      const result = await handleKnowledge('submit', submitParams(), {
+        projectRoot,
+        abortSignal: controller.signal,
+        recipeGateway: {
+          ...fake.port,
+          createOrStage: async (input: RecipeProductionInput, context: ProducerContext) => {
+            const committed = await fake.port.createOrStage(input, context);
+            controller.abort();
+            return committed;
+          },
+        },
+      } as never);
+      // Core 已写入提案：取消不能把回执翻成失败，只能标注“取消后仍完成的写入”。
+      expect(result.ok).toBe(true);
+      expect(result.data).toMatchObject({
+        status: 'merged_into_proposal',
+        proposalId: 'proposal-7',
+      });
+      expect(result._meta).toMatchObject({ degraded: true });
+      expect(result._meta?.diagnosticWarnings?.map((warning) => warning.code)).toEqual([
+        'KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT',
+      ]);
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('attaches Core pendingSemanticReview to a created receipt', async () => {
+    const projectRoot = makeProject();
+    const fake = outcomePort({
+      created: [
+        { index: 0, id: 'recipe-1', title: SEMANTIC_REVIEW.title, lifecycle: 'pending', raw: {} },
+      ],
+      pendingSemanticReview: [{ ...SEMANTIC_REVIEW, newRecipeId: 'recipe-1' }],
+    });
+    const log = spyLogs();
+    try {
+      const result = await handleKnowledge('submit', submitParams(), {
+        projectRoot,
+        recipeGateway: fake.port,
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(result.data).toMatchObject({
+        status: 'created',
+        id: 'recipe-1',
+        lifecycle: 'pending',
+        pendingSemanticReview: [{ ...SEMANTIC_REVIEW, newRecipeId: 'recipe-1' }],
+      });
+      // 语义复核是 Core 附注而非降级：Core 已完整确认创建。
+      expect(result._meta?.degraded).toBeUndefined();
+      const traces = log.infos().filter((message) => message.includes('semantic review'));
+      expect(traces).toHaveLength(1);
+      expect(traces[0]).toContain('Related import rule');
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['an empty outcome', {}],
+    ['absent outcome lists', { created: undefined, duplicates: undefined, merged: undefined }],
+  ])('returns a degraded traced receipt instead of a bare processed result for %s', async (_label, outcome) => {
+    const projectRoot = makeProject();
+    const fake = outcomePort(outcome);
+    const log = spyLogs();
+    try {
+      const params = submitParams();
+      const result = await handleKnowledge('submit', params, {
+        projectRoot,
+        recipeGateway: fake.port,
+      } as never);
+      expect(fake.calls).toHaveLength(1);
+      // Core 可能已写入：不改为 fail，避免诱导重复提交；但必须降级并留痕。
+      expect(result.ok).toBe(true);
+      expect(result.data).toMatchObject({
+        status: 'processed',
+        message: expect.stringContaining('do not resubmit'),
+      });
+      expect(result._meta).toMatchObject({
+        degraded: true,
+        diagnosticWarnings: [
+          expect.objectContaining({ code: 'KNOWLEDGE_SUBMIT_OUTCOME_UNRECOGNIZED' }),
+        ],
+      });
+      const traces = log.warnings().filter((message) => message.includes('unrecognized'));
+      expect(traces).toHaveLength(1);
+      expect(traces[0]).toContain(`"${params.title}"`);
+      expect(traces[0]).toContain('created' in outcome ? 'created=absent' : 'created=0');
+      expect(
+        isPersistedSubmission({ tool: 'knowledge', args: { action: 'submit', params }, result })
+      ).toBe(false);
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('the producer prompt routes every non-created ok status the submit handler returns', async () => {
+    const projectRoot = makeProject();
+    const log = spyLogs();
+    try {
+      const statuses: string[] = [];
+      for (const outcome of [
+        {
+          duplicates: [
+            {
+              index: 0,
+              title: SEMANTIC_REVIEW.title,
+              similarTo: [{ file: '', title: 'Existing ImportType rule', similarity: 0.91 }],
+            },
+          ],
+        },
+        { merged: [MERGED_PROPOSAL] },
+      ]) {
+        const result = await handleKnowledge('submit', submitParams(), {
+          projectRoot,
+          recipeGateway: outcomePort(outcome).port,
+        } as never);
+        expect(result.ok).toBe(true);
+        statuses.push(String((result.data as { status?: unknown }).status));
+      }
+      expect(statuses).toEqual(['duplicate_blocked', 'merged_into_proposal']);
+      const fragment = new GenerateProduce().promptFragment;
+      for (const status of statuses) {
+        expect(fragment).toContain(status);
+      }
+      const mergedRoute = fragment
+        .split('\n')
+        .find((line) => line.includes('merged_into_proposal'));
+      expect(mergedRoute).toContain('勿改写重提');
     } finally {
       log.restore();
       fs.rmSync(projectRoot, { recursive: true, force: true });

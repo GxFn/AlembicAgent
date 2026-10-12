@@ -76,6 +76,8 @@ You have no tools and no persistence, admission, query, or review authority. Ret
   找到支撑条目并引用；找不到证据的断言直接放弃。被拒后改标题重提同一断言无效
 - 提交返回 duplicate_blocked 时按 similar 列表路由：与已有知识实质相同→跳过换下一个 finding；
   你的证据更全/更新且确有增量→带 supersedes:<已有条目 id> 重提一次，否则不要反复提交
+- 提交返回 merged_into_proposal 时，候选已并入提案，勿改写重提：Core 已把它转为对已有条目
+  （targetRecipeId）的整合提案，该 finding 已处理完毕（不算新候选），直接换下一个 finding
 - 不调用 knowledge.detail、meta.tools 或 meta.plan
 
 ${RECIPE_PRODUCTION_PROFILE_PROMPT}

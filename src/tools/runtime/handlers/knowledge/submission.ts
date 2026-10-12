@@ -2,12 +2,22 @@
 
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
-import { fail, ok, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
+import { fail, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
 import { prepareSubmission, recordRejectAndDirective } from './authoring.js';
 import { AGENT_RUNTIME_SOURCE, type RecipeGatewayLike } from './contracts.js';
 import { pickString, uniqueStrings, validateSubmitParams } from './input.js';
-import { abortedKnowledgeResult } from './operation.js';
-import { completeCreatedSubmission } from './submissionResult.js';
+import { abortedKnowledgeResult, completedMutationMeta } from './operation.js';
+import {
+  classifyProductionOutcome,
+  completeCreatedSubmission,
+  consolidationBlockedResult,
+  duplicateBlockedResult,
+  gatewayRejectedResult,
+  mergedIntoProposalResult,
+  pendingSemanticReviewOf,
+  type SubmissionTrace,
+  unrecognizedOutcomeResult,
+} from './submissionResult.js';
 
 export async function handleSubmit(
   params: Record<string, unknown>,
@@ -72,86 +82,49 @@ export async function handleSubmit(
       }
     );
 
-    if (result.created.length > 0) {
-      return await completeCreatedSubmission(
-        {
-          created: result.created[0],
-          production: result.production,
-          item,
-          codeEvidence: preparedProduction.codeEvidence,
-        },
-        gateway,
-        ctx
-      );
-    }
+    const trace: SubmissionTrace = {
+      title: String(item.title ?? ''),
+      dimensionId: String(effectiveDimensionId ?? ''),
+      codeEvidence: preparedProduction.codeEvidence,
+    };
+    const pendingSemanticReview = pendingSemanticReviewOf(result, trace);
 
-    // gateway 层三类非 created 结果统一留痕（run-8 复盘缺口：查重/拒绝/blocked 全静默，
-    // 报告 rejected 计数与日志拒因对不上号——饱和 KB 下 duplicate 是主要暗拒来源）。
-    if (result.duplicates.length > 0) {
-      Logger.getInstance().warn(
-        `[knowledge.submit] gateway duplicate for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): similar to ${result.duplicates
-          .map((d) => `"${d.title}"`)
-          .slice(0, 3)
-          .join(', ')}`
-      );
-      return ok({
-        status: 'duplicate_blocked',
-        codeEvidence: preparedProduction.codeEvidence,
-        similar: result.duplicates.map((d) => ({
-          title: d.title,
-          similarity: d.similarTo?.[0]?.similarity ?? 0,
-          similarTo: d.similarTo ?? [],
-        })),
-      });
+    // 以 Core 去向键集中映射（映射与穷举检查在 submissionResult.ts）：gateway 层四类非 created
+    // 去向（查重/整合提案/拒绝/blocked）都要留痕（run-8 复盘缺口：非 created 结果全静默，报告
+    // rejected 计数与日志拒因对不上号——饱和 KB 下 duplicate 是主要暗拒来源）；没有可识别去向时
+    // 走降级兜底。Core 确认写入（created/merged）时若回执到达前已取消，按 knowledge.manage 同口径
+    // 附 KNOWLEDGE_MUTATION_COMPLETED_AFTER_ABORT；只在这两类分支计算，避免给未写入的去向误记。
+    const outcome = classifyProductionOutcome(result);
+    switch (outcome) {
+      case 'created':
+        return await completeCreatedSubmission(
+          {
+            created: result.created[0],
+            production: result.production,
+            item,
+            codeEvidence: preparedProduction.codeEvidence,
+            pendingSemanticReview,
+            mutationAbortWarnings: completedMutationMeta(ctx, 'submit')?.diagnosticWarnings,
+          },
+          gateway,
+          ctx
+        );
+      case 'duplicates':
+        return duplicateBlockedResult(result.duplicates, trace);
+      case 'merged':
+        return mergedIntoProposalResult(
+          result.merged[0],
+          trace,
+          pendingSemanticReview,
+          completedMutationMeta(ctx, 'submit')?.diagnosticWarnings
+        );
+      case 'rejected':
+        return gatewayRejectedResult(result.rejected[0], trace);
+      case 'blocked':
+        return consolidationBlockedResult(result.blocked[0], trace);
+      case null:
+        return unrecognizedOutcomeResult(result, trace);
     }
-
-    if (result.rejected.length > 0) {
-      const rejected = result.rejected[0];
-      const firstErrors = Array.isArray(rejected.errors) ? rejected.errors.slice(0, 2) : [];
-      Logger.getInstance().warn(
-        `[knowledge.submit] gateway rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${String(rejected.reason ?? '')}${firstErrors.length > 0 ? ` — ${firstErrors.join(' | ').slice(0, 220)}` : ''}`
-      );
-      const details = [
-        `Rejected: ${rejected.reason}`,
-        ...(Array.isArray(rejected.errors) ? rejected.errors : []),
-        ...(Array.isArray(rejected.warnings)
-          ? rejected.warnings.map((warning) => `warning: ${warning}`)
-          : []),
-      ].join('\n');
-      return preparedProduction.codeEvidence.accepted
-        ? fail(details)
-        : {
-            ok: false,
-            data: {
-              status: 'rejected',
-              reason: 'unsafe-core-code-removed',
-              message: details,
-              codeEvidence: preparedProduction.codeEvidence,
-            },
-            error: details,
-          };
-    }
-
-    if (result.blocked.length > 0) {
-      Logger.getInstance().warn(
-        `[knowledge.submit] gateway blocked by consolidation "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')})`
-      );
-      const message = `Blocked by consolidation: ${(result.blocked[0] as { title?: string }).title ?? 'unknown'}`;
-      return preparedProduction.codeEvidence.accepted
-        ? fail(message)
-        : {
-            ok: false,
-            data: {
-              status: 'consolidation-blocked',
-              reason: 'unsafe-core-code-removed',
-              message,
-              codeEvidence: preparedProduction.codeEvidence,
-            },
-            error: message,
-          };
-    }
-
-    return ok({ status: 'processed', result, codeEvidence: preparedProduction.codeEvidence });
   } catch (err: unknown) {
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String(params.title ?? '')}" (exception): ${err instanceof Error ? err.message : String(err)}`
