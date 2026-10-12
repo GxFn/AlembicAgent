@@ -16,15 +16,17 @@ import {
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { readToolObservation } from '../utils/toolOutcomes.js';
+import { parseNumberedReadDisplay } from './EvidenceCollector.js';
 import type { EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
 
 /** 空读诊断里列出的成员样本上限：越界批量读可能涉及很多文件，debug 行只列前几个避免刷屏。 */
 const EMPTY_READ_LOG_SAMPLE = 5;
 
 /**
- * 跳过落账的诊断出口（L7-P12 / C14）。空读不落账是有意的短路：没有可引用的原文，
+ * 跳过落账或降级落账的诊断出口。空读不落账是有意的短路（L7-P12 / C14）：没有可引用的原文，
  * 落账只会产生一条“file 在场但内容为空”的证据，被 note_finding 判 verified 并抬高 RECORD 配额。
- * 走 debug 级别——越界读本身已由 code handler 的 code_read_range_beyond_eof 警告告知模型，
+ * 截断展示降级 file-only 也走这里（L7-P13 / C10）。
+ * 走 debug 级别——越界读与截断本身已由 code handler / router 的诊断告知模型，
  * 这里只给排查用的痕迹；观察者失败不能影响采集。
  */
 function logEvidenceSkip(message: string): void {
@@ -121,35 +123,29 @@ function asFileList(value: unknown): FileItem[] {
 /**
  * read 工具 content 是模型显示形态（`N|` 行号前缀，range 模式还带 '... [omitted]' 尾行）。
  * 台账存 verbatim 原文——freshness 重切用原文切片比哈希，存显示形态会天生 stale
- * （run-13 EVIDENCE_STALE ×11 事故根因）。仅当每个非空行都带前缀才剥（防误伤原文里的竖线）。
+ * （run-13 EVIDENCE_STALE ×11 事故根因）。
+ *
+ * 解析规则与 EvidenceCollector 共用 parseNumberedReadDisplay（L7-P13 / C10）：每一行都是行号连续的
+ * `N|` 前缀才算源码切片，否则返回 null，由调用方诚实降级 file-only。Capture 在其上再叠加
+ * “截断即降级”：clamp / 路由截断的展示即使 head 可解析也返回 null——被截掉的部分无法由台账原文
+ * 重切核对，借 head 坐标落 range 会制造一段并不完整的“连续切片”。这条降级记 debug。
  */
 function stripReadDisplayDecorations(
-  content: string
+  content: string,
+  context: string
 ): { content: string; range: EvidenceRange } | null {
-  const lines = content.split('\n');
-  const body =
-    lines.length > 0 && /^\.\.\. \[\d+ lines omitted/.test(lines[lines.length - 1] ?? '')
-      ? lines.slice(0, -1)
-      : lines;
-  if (body.length === 0) {
+  const parsed = parseNumberedReadDisplay(content);
+  if (!parsed) {
     return null;
   }
-  const stripped: string[] = [];
-  let start = 0;
-  for (const line of body) {
-    const m = /^(\d+)\|(.*)$/.exec(line);
-    const lineNumber = m ? Number(m[1]) : 0;
-    if (!m || !Number.isSafeInteger(lineNumber) || lineNumber < 1) {
-      return null;
-    }
-    if (stripped.length === 0) {
-      start = lineNumber;
-    } else if (lineNumber !== start + stripped.length) {
-      return null;
-    }
-    stripped.push(m[2]);
+  if (parsed.truncated) {
+    logEvidenceSkip(
+      `[EvidenceCapture] truncated read display recorded file-only: ${context} ` +
+        `parsedHeadLines=${parsed.startLine}-${parsed.endLine}`
+    );
+    return null;
   }
-  return { content: stripped.join('\n'), range: { start, end: start + stripped.length - 1 } };
+  return { content: parsed.content, range: { start: parsed.startLine, end: parsed.endLine } };
 }
 
 interface MatchItem {
@@ -207,7 +203,10 @@ function normalizeDrafts(
         // 尾行），range 取工具项自带坐标（range 模式 startLine/endLine；full 模式 1..lineCount）
         // ——freshness 原文重切与存储哈希由此同尺。outline/delta/unchanged 是派生视图非切片，
         // 诚实降级 file-only（不参与 freshness，verified 判据按 file 在场已放行）。
-        const raw = stripReadDisplayDecorations(file.content);
+        const raw = stripReadDisplayDecorations(
+          file.content,
+          `tool=${tool} callId=${call.id} shape=batch path=${file.path}`
+        );
         // L7-P12 / C14：空成员（越界 range 的 '' 或剥前缀后为空，如空文件 `1|`）没有可引用原文。
         // 此前它以 file-only、content '' 落账，被当成“文件在场”的核实依据；现在跳过并记 debug，
         // 同批其余成员照常落账。按内容判定，不看 mode——任何视图的空内容都不是证据。
@@ -277,7 +276,12 @@ function normalizeDrafts(
       const textContent = typeof envelope.text === 'string' ? envelope.text : '';
       // 尾随换行会产生空末行、让全行 N| 校验失败——剥掉再判(不影响 verbatim 语义)。
       const trimmed = textContent.replace(/\n+$/, '');
-      const raw = trimmed ? stripReadDisplayDecorations(trimmed) : null;
+      const raw = trimmed
+        ? stripReadDisplayDecorations(
+            trimmed,
+            `tool=${tool} callId=${call.id} shape=single path=${singlePath}`
+          )
+        : null;
       // L7-P12 / C14：空读没有可引用原文——越界 range 时 handler 返回 ''（适配器信封 text 与
       // structuredContent 都是 ''），或剥 N| 前缀后为空（空文件 `1|`）。此前前者落进通用兜底被
       // JSON.stringify 成 '""'、后者以显示形态 file-only 落账，都成了“文件在场”的证据并计入

@@ -167,7 +167,8 @@ function recordedFindingFixture(count: number) {
       toolCalls: findings.map((finding) => ({
         tool: 'code',
         args: { action: 'read', path: finding.evidence.split(':')[0] },
-        result: '12|public enum NetworkError: Error {\n13| case invalidURL(String)\n}',
+        // 真实 code.read 展示态每一行都带连续 `N|` 前缀（L7-P13：残缺展示不再进入源码片段）。
+        result: '12|public enum NetworkError: Error {\n13| case invalidURL(String)\n14|}',
       })),
     },
     activeContext: {
@@ -253,7 +254,7 @@ describe('evidence recording quality gate actions', () => {
           args: { action: 'read', params: { path: 'src/foo.ts' } },
           result: {
             path: 'src/foo.ts',
-            content: 'export function runtimeBoundary() { return true; }',
+            content: '10|export function runtimeBoundary() { return true; }',
             startLine: 10,
           },
         },
@@ -262,7 +263,7 @@ describe('evidence recording quality gate actions', () => {
           args: { action: 'read', params: { path: 'src/bar.ts' } },
           result: {
             path: 'src/bar.ts',
-            content: 'export function producerBoundary() { return true; }',
+            content: '20|export function producerBoundary() { return true; }',
             startLine: 20,
           },
         },
@@ -271,7 +272,7 @@ describe('evidence recording quality gate actions', () => {
           args: { action: 'read', params: { path: 'src/baz.ts' } },
           result: {
             path: 'src/baz.ts',
-            content: 'export function dashboardBoundary() { return true; }',
+            content: '30|export function dashboardBoundary() { return true; }',
             startLine: 30,
           },
         },

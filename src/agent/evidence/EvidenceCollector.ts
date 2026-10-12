@@ -34,72 +34,122 @@ const DEFAULT_SNIPPET_BUDGET = 32_000;
 /** 可复制 graph 引用的总量上限（防 prompt 膨胀） */
 const MAX_GRAPH_EVIDENCE = 8;
 
-// ── 读取内容净化（证据保真核心） ─────────────────────────────────
+// ── 读取展示态解析（证据保真核心；EvidenceCollector 与 EvidenceCapture 共用） ─────────
 //
 // evidenceMap 的片段会被 Producer 渲染成「可逐字复制的 coreCode」，其内容必须与源文件的
-// 引用行范围逐字对照（Core snippet-match 门禁判据 = 去空白子串包含）。而 code.read 的返回
-// 是「给模型看的展示态」，含三类非源码杂质，直接入库会毒化整条照抄链路：
-//   1. 范围读每行带 `42|` 行号前缀（code.ts readSingleFile 的 slice 渲染）；
-//   2. 范围读省略后缀 `... [N lines omitted; use startLine/endLine for more]`；
-//   3. batch clamp 截断标记 batch/router 的显式截断标记，且标记后
-//      的 tail 与 head 不连续，绝不能拼进同一片段。
-// 这里在采集端一次性还原为纯源码，并用行号前缀校准 startLine（范围读的返回体不带
-// startLine 字段，前缀是唯一可靠行号来源）。
+// 引用行范围逐字对照（Core snippet-match 门禁判据 = 去空白子串包含）；证据台账（EvidenceCapture）
+// 存的原文还要参与 freshness 重切比哈希。而 code.read 的返回是「给模型看的展示态」：
+//   1. 全文读 / 范围读每一行（包括空行）都带 `42|` 行号前缀（code.ts readSingleFile 渲染）；
+//   2. 范围读可能带省略尾行 `... [N lines omitted; use startLine/endLine for more]`；
+//   3. batch clamp / 路由截断按字符切出 head + 说明 + tail，tail 与 head 不连续，head 的最后
+//      一段可能是残行，甚至是下一行的行号残片（如 `17`）；
+//   4. 单 path 回执是纯字符串，mode 已丢失：DeltaCache 重读的 `[unchanged since last read]`、
+//      `[delta: N hunk(s)]` 差分、AST 大纲与头尾预览都只能从内容形态上识别为“不是源码切片”。
+// 因此只认一种形态：去掉截断说明及其后的 tail（并丢弃 head 可能残缺的末行）、去掉省略尾行后，
+// 剩余每一行都是行号连续的 `N|` 前缀。不满足即整体返回 null（不做“首行无前缀就原样收下”的宽松兜底）。
 
-/** 范围读行号前缀：`42|code` */
+/** 行号前缀：`42|code`。只匹配前缀，行体按原样切出（CRLF 文件行尾的 `\r` 也是源码的一部分）。 */
 const READ_LINE_PREFIX_RE = /^(\d+)\|/;
 
-/** 范围读省略后缀标记行 */
-const READ_OMITTED_SUFFIX_RE =
-  /\n?\.\.\. \[\d+ lines omitted; use startLine\/endLine for more\]\s*$/;
+/** 范围读省略尾行（只可能是最后一行；带行号前缀的源码行不会以 `... [` 开头）。 */
+const READ_OMITTED_SUFFIX_LINE_RE = /^\.\.\. \[\d+ lines omitted\b/;
 
-/** batch clamp 截断标记（其后的 tail 与 head 不连续，只保留 head） */
+/**
+ * batch clamp（code.ts batchReadClampNotice）与路由截断（router.ts truncationNotice）的说明，两者都以
+ * 固定的 `\n\n` 开头。带行号前缀的展示里不会出现连续两个换行，所以首个匹配就是真正的截断点。
+ */
 const READ_CLAMP_MARKER_RE =
-  /\n*\.\.\. \[\d+ chars truncated(?: for batch read budget|, exceeded \d+ token limit)\] \.\.\.[\s\S]*$/;
+  /\n\n\.\.\. \[\d+ chars truncated(?: for batch read budget|, exceeded \d+ token limit)\] \.\.\./;
 
-/** 净化结果：纯源码内容 + 从行号前缀校准出的起始行（无前缀时为 null） */
-interface SanitizedReadSnippet {
+/** 严格解析出的连续源码切片（行号闭区间 + 剥掉前缀后的逐字原文）。 */
+export interface NumberedReadDisplay {
+  /** 剥掉 `N|` 前缀后的逐字源码（行间以 `\n` 连接）。 */
   content: string;
-  startLineFromPrefix: number | null;
+  startLine: number;
+  endLine: number;
+  /**
+   * 原展示带截断说明：已丢弃说明之后的 tail 与 head 的最后一段（可能残缺）。Collector 取剩下的完整行；
+   * Capture 据此整体降级 file-only（被截掉的部分无法由台账原文重切核对）。
+   */
+  truncated: boolean;
 }
 
 /**
- * 把 code.read 的展示态内容还原为可与源文件逐字对照的纯代码。
- * 返回 null 表示内容不可保真采集（净化后为空）。
+ * 把 code.read 的展示态严格解析成连续源码切片；不是行号连续的 `N|` 源码展示时返回 null。
+ *
+ * 规则（L7-P13 / C10，Collector 与 Capture 同口径）：
+ * - 有截断说明：只保留说明之前的 head，并丢弃 head 按 `\n` 切分后的最后一段——head 以换行结尾时
+ *   这一段是空串，否则它可能是残行或行号残片，宁可少一行也不收残片；
+ * - 无截断说明：最后一行是省略尾行时剔除；
+ * - 剩余每一行都必须是 `N|` 前缀且行号从首行起逐行 +1，否则返回 null（派生视图、差分、大纲、
+ *   头尾预览与无前缀文本都在这里被拒绝）。
+ * 纯函数、无日志：调用方按各自语义决定拒绝时的诊断与降级路径。
  */
-function sanitizeReadSnippet(raw: string): SanitizedReadSnippet | null {
-  let text = String(raw);
-  // 单 path 的旧返回口是纯字符串，mode 已丢失；识别宿主自身的 outline/头尾预览模板。
-  // 这些显示内容不是连续源码，即使夹有 N| 行也不能整体重新认证为 source snippet。
-  if (
-    /^\/\/ .+ — \d+ lines \(showing head \+ tail\)/.test(text) ||
-    /File has \d+ lines\. Showing outline\. Use startLine\/endLine to read specific sections\.\s*$/.test(
-      text
-    )
-  ) {
+export function parseNumberedReadDisplay(display: string): NumberedReadDisplay | null {
+  let body = String(display);
+  const clamp = READ_CLAMP_MARKER_RE.exec(body);
+  const truncated = clamp !== null;
+  if (clamp) {
+    body = body.slice(0, clamp.index);
+  }
+  const lines = body.split('\n');
+  if (truncated) {
+    lines.pop();
+  } else if (READ_OMITTED_SUFFIX_LINE_RE.test(lines[lines.length - 1] ?? '')) {
+    lines.pop();
+  }
+  if (lines.length === 0) {
     return null;
   }
-  // clamp 头尾拼接：只保留 head（源文件逐字前缀），丢弃标记与不连续的 tail。
-  text = text.replace(READ_CLAMP_MARKER_RE, '');
-  // 范围读省略后缀：剔除标记行本身。
-  text = text.replace(READ_OMITTED_SUFFIX_RE, '');
-  if (!text.trim()) {
-    return null;
+  const stripped: string[] = [];
+  let startLine = 0;
+  for (const line of lines) {
+    const prefix = READ_LINE_PREFIX_RE.exec(line);
+    const lineNumber = prefix ? Number(prefix[1]) : 0;
+    if (!prefix || !Number.isSafeInteger(lineNumber) || lineNumber < 1) {
+      return null;
+    }
+    if (stripped.length === 0) {
+      startLine = lineNumber;
+    } else if (lineNumber !== startLine + stripped.length) {
+      return null;
+    }
+    stripped.push(line.slice(prefix[0].length));
   }
-
-  const lines = text.split('\n');
-  const firstMatch = lines[0]?.match(READ_LINE_PREFIX_RE);
-  if (!firstMatch) {
-    return { content: text, startLineFromPrefix: null };
-  }
-  // 首行带行号前缀 → 视为范围读渲染，逐行剥前缀并用首行行号校准 startLine。
-  // 个别行（空行等）可能无前缀，原样保留。
-  const stripped = lines.map((line) => line.replace(READ_LINE_PREFIX_RE, ''));
   return {
     content: stripped.join('\n'),
-    startLineFromPrefix: Number(firstMatch[1]),
+    startLine,
+    endLine: startLine + stripped.length - 1,
+    truncated,
   };
 }
+
+/**
+ * 展示被 parseNumberedReadDisplay 拒绝时，给探索日志一个可读的原因（只按形态归类，不影响判定）。
+ * 单 path 回执的 mode 已丢失，这里按 DeltaCache / 大纲 / 头尾预览的固定文案识别常见派生视图。
+ */
+function describeRejectedReadDisplay(display: string): string {
+  const head = display.trimStart();
+  if (head.startsWith('[unchanged since last read]')) {
+    return 'delta-cache unchanged placeholder';
+  }
+  if (/^\[delta: \d+ hunk\(s\)\]/.test(head)) {
+    return 'delta-cache diff view';
+  }
+  if (
+    /^\/\/ .+ — \d+ lines \(showing head \+ tail\)/.test(head) ||
+    /File has \d+ lines\. Showing outline\./.test(display)
+  ) {
+    return 'outline view';
+  }
+  if (READ_CLAMP_MARKER_RE.test(display)) {
+    return 'truncated display without a complete numbered line';
+  }
+  return 'not consecutive N| numbered source lines';
+}
+
+/** 一次读取里写进探索日志的展示说明最多列几条（batch 可能涉及很多文件）。 */
+const MAX_READ_NOTES_IN_LOG = 3;
 
 /** code.search 字符串输出的匹配行：`path:42: content`（formatSearchOutput 契约） */
 const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
@@ -358,6 +408,12 @@ export class EvidenceCollector {
   /** 当前已使用的片段字符数 */
   #snippetCharsUsed = 0;
 
+  /**
+   * 本次 processToolCall 中读取展示的采集说明（未入片段的原因、截断时保留的完整行），
+   * 写进该调用的探索日志 resultSummary；每次调用开始时清空。
+   */
+  #readNotes: string[] = [];
+
   /** @param [options.snippetBudget=32000] 代码片段总字符预算 */
   constructor(options: EvidenceCollectorOptions = {}) {
     this.#snippetBudget = options.snippetBudget ?? DEFAULT_SNIPPET_BUDGET;
@@ -388,10 +444,11 @@ export class EvidenceCollector {
       result !== '' &&
       !(typeof result === 'string' && this.#isErrorString(result));
     let extractionFailed = false;
+    const action = (args.action as string) || '';
+    this.#readNotes = [];
 
     // 按工具类型提取证据
     if (hasResult) {
-      const action = (args.action as string) || '';
       try {
         switch (tool) {
           case 'code':
@@ -413,14 +470,27 @@ export class EvidenceCollector {
       }
     }
 
-    // 所有工具调用都记入探索日志
+    // 所有工具调用都记入探索日志；读取展示被拒绝或截断时把原因写在摘要前，便于排查片段为何缺席。
     this.#explorationLog.push({
       round,
       tool,
       intent: this.#inferIntent(tool, args),
-      resultSummary: `${!hasResult ? '[unconfirmed result; evidence skipped] ' : extractionFailed ? '[evidence extraction failed] ' : ''}${this.#summarizeResult(tool, result)}`,
-      effective: hasResult && !extractionFailed && this.#isEffective(tool, result),
+      resultSummary: `${!hasResult ? '[unconfirmed result; evidence skipped] ' : extractionFailed ? '[evidence extraction failed] ' : ''}${this.#formatReadNotes()}${this.#summarizeResult(tool, result)}`,
+      effective: hasResult && !extractionFailed && this.#isEffective(tool, action, result),
     });
+  }
+
+  /** 把本次调用的读取展示说明压成探索日志前缀（最多列 MAX_READ_NOTES_IN_LOG 条，其余计数）。 */
+  #formatReadNotes(): string {
+    if (this.#readNotes.length === 0) {
+      return '';
+    }
+    const shown = this.#readNotes.slice(0, MAX_READ_NOTES_IN_LOG);
+    const more =
+      this.#readNotes.length > MAX_READ_NOTES_IN_LOG
+        ? `; +${this.#readNotes.length - MAX_READ_NOTES_IN_LOG} more`
+        : '';
+    return `[${shown.join('; ')}${more}] `;
   }
 
   /**
@@ -496,17 +566,18 @@ export class EvidenceCollector {
 
   // ─── 工具特化提取 ─────────────────────────────────────
 
-  /** code.read — 提取代码片段（批量 result.files / 单文件 result.content），入库前统一净化保真 */
+  /** code.read — 提取代码片段（批量 result.files / 单文件 result.content），入库前统一严格解析保真 */
   #extractFileEvidence(args: ToolCallArgs, result: ToolResult) {
     const argPath = args.path || args.filePath;
 
-    // 字符串结果 — 可能是错误消息或直接内容
+    // 字符串结果 — 单 path 回执（mode 已丢失），可能是源码展示，也可能是 DeltaCache 占位/差分或大纲；
+    // 由严格解析判定，不合格的不入片段（L7-P13 / C10）。
     if (typeof result === 'string') {
       if (this.#isErrorString(result)) {
         return;
       }
       if (argPath) {
-        this.#addSanitizedSnippet(argPath, result, args.startLine || 1);
+        this.#addSanitizedSnippet(argPath, result);
       }
       return;
     }
@@ -525,7 +596,7 @@ export class EvidenceCollector {
           f.content &&
           !this.#isNonSourceReadMode(f.mode, f.outlineSource)
         ) {
-          this.#addSanitizedSnippet(filePath, f.content, f.startLine || 1);
+          this.#addSanitizedSnippet(filePath, f.content);
         }
       }
       return;
@@ -538,7 +609,7 @@ export class EvidenceCollector {
     }
     const filePath = result.path || result.filePath || argPath;
     if (filePath && result.content) {
-      this.#addSanitizedSnippet(filePath, result.content, result.startLine || args.startLine || 1);
+      this.#addSanitizedSnippet(filePath, result.content);
     }
   }
 
@@ -553,17 +624,26 @@ export class EvidenceCollector {
     );
   }
 
-  /** 净化 code.read 展示态内容后入库；行号前缀存在时以前缀校准 startLine（比参数更可靠） */
-  #addSanitizedSnippet(filePath: string, rawContent: string, fallbackStartLine: number) {
-    const sanitized = sanitizeReadSnippet(rawContent);
-    if (!sanitized) {
+  /**
+   * 严格解析 code.read 展示态后入库；startLine 一律取行号前缀（范围读的返回体与参数都可能不可靠）。
+   * 解析失败（派生视图、无前缀、行号不连续）或剥前缀后只剩空白时跳过，并在探索日志注明原因；
+   * 截断展示只收 head 的完整行，同样注明保留的行区间。
+   */
+  #addSanitizedSnippet(filePath: string, rawContent: string) {
+    const parsed = parseNumberedReadDisplay(rawContent);
+    if (!parsed || !parsed.content.trim()) {
+      const reason = parsed
+        ? 'empty source after stripping N| prefixes'
+        : describeRejectedReadDisplay(rawContent);
+      this.#readNotes.push(`read display not collected: ${filePath} (${reason})`);
       return;
     }
-    this.#addCodeSnippet(
-      filePath,
-      sanitized.content,
-      sanitized.startLineFromPrefix ?? fallbackStartLine
-    );
+    if (parsed.truncated) {
+      this.#readNotes.push(
+        `read display truncated: ${filePath} kept complete lines ${parsed.startLine}-${parsed.endLine}`
+      );
+    }
+    this.#addCodeSnippet(filePath, parsed.content, parsed.startLine);
   }
 
   /** code.search — 提取匹配 + 负空间信号（字符串输出 / 批量 batchResults / 单模式 matches） */
@@ -998,12 +1078,21 @@ export class EvidenceCollector {
   }
 
   /** 判断工具调用是否有效 (获取到新信息) */
-  #isEffective(tool: string | undefined, result: ToolResult) {
+  #isEffective(tool: string | undefined, action: string, result: ToolResult) {
     if (!result) {
       return false;
     }
     if (typeof result === 'string') {
-      return !this.#isErrorString(result) && result.length > 10;
+      if (this.#isErrorString(result)) {
+        return false;
+      }
+      // code.read 的字符串回执与片段采集同口径：只有能严格解析出非空源码切片才算获取到新信息；
+      // DeltaCache 重读占位/差分、大纲等派生视图不再因“长度 > 10”被记为有效探索（L7-P13 / C10）。
+      if (tool === 'code' && action === 'read') {
+        const parsed = parseNumberedReadDisplay(result);
+        return parsed !== null && parsed.content.trim().length > 0;
+      }
+      return result.length > 10;
     }
     if (typeof result !== 'object') {
       return true;

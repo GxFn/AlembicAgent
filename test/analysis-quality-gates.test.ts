@@ -159,7 +159,8 @@ describe('analysis evidence provenance at real gate boundaries', () => {
             args: { action: 'read', params: { filePaths: ['src/good.ts', 'src/denied.ts'] } },
             result: {
               files: [
-                { path: 'src/good.ts', content: 'const ready = true;' },
+                // 真实 batch 成员的展示态每行都带 `N|` 前缀（L7-P13：无前缀文本不再被当成源码片段）。
+                { path: 'src/good.ts', content: '1|const ready = true;' },
                 { path: 'src/denied.ts', error: 'denied' },
               ],
             },

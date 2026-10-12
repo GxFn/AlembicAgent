@@ -924,6 +924,100 @@ function makeOwnershipFixture() {
   };
 }
 
+// ─── L7-P13 / C10：EvidenceCapture 复用共享严格展示剥离器，保留“不合格即降级 file-only” ───
+// Collector 对 clamp 截断只取 head 的完整行；台账则仍把截断展示整体降级为 file-only（不落 range、
+// 不参与 freshness），因为被截掉的尾部无法从台账原文重切核对。
+describe('L7-P13 C10 共享严格展示剥离器（Capture 口径）', () => {
+  test('batch clamp 截断成员仍诚实降级 file-only：不借 head 坐标落 range，正文保持模型所见展示', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = makeLedger();
+      const clamped =
+        '1|const first = 1;\n2|const second = 2;\n3|const thi' +
+        '\n\n... [512 chars truncated for batch read budget] ...\n\n' +
+        '40|const last = 40;';
+      const entries = captureEvidenceFromEnvelope(
+        ledger,
+        {
+          name: 'code',
+          args: { action: 'read', params: { filePaths: ['src/big.ts'] } },
+          id: 'clamped-batch',
+        },
+        makeEnvelope({
+          text: 'batch',
+          structuredContent: {
+            files: [
+              { ok: true, path: 'src/big.ts', content: clamped, mode: 'full', truncated: true },
+            ],
+          },
+        })
+      );
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.file).toBe('src/big.ts');
+      expect(entries[0]?.range).toBeUndefined();
+      expect(entries[0]?.content).toBe(clamped);
+      // 降级是有意的分叉，必须留下可排查的诊断痕迹（触发条件 + 路径 + 选择）。
+      expect(
+        debug.mock.calls
+          .map((call) => String(call[0]))
+          .some(
+            (m) =>
+              m.includes('truncated read display recorded file-only') &&
+              m.includes('src/big.ts') &&
+              m.includes('clamped-batch')
+          )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('单 path delta 差分视图降级 file-only（不按 N| 切片落 range）', () => {
+    const ledger = makeLedger();
+    const delta =
+      '[delta: 1 hunk(s)]\n@@ line 3 @@\n- export const v2 = 2;\n+ export const v2 = 999;';
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      { name: 'code', args: { action: 'read', params: { path: 'src/b.ts' } }, id: 'delta-single' },
+      makeEnvelope({ text: delta, structuredContent: delta })
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.file).toBe('src/b.ts');
+    expect(entries[0]?.range).toBeUndefined();
+  });
+
+  test('CRLF 源文件的 N| 展示按逐字原文落 range，freshness 与磁盘原文同尺', () => {
+    const ledger = makeLedger();
+    const rawFile = 'export const a = 1;\r\nexport const b = 2;\r\n';
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      {
+        name: 'code',
+        args: { action: 'read', params: { filePaths: ['src/crlf.ts'] } },
+        id: 'crlf-batch',
+      },
+      makeEnvelope({
+        text: 'batch',
+        structuredContent: {
+          files: [
+            {
+              ok: true,
+              path: 'src/crlf.ts',
+              content: '1|export const a = 1;\r\n2|export const b = 2;\r\n3|',
+              lineCount: 3,
+              mode: 'full',
+            },
+          ],
+        },
+      })
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.range).toEqual({ start: 1, end: 3 });
+    expect(entries[0]?.content).toBe(rawFile);
+    expect(ledger.checkFreshness(entries[0]?.id ?? '', rawFile)).toBe('fresh');
+  });
+});
+
 describe('I25 submitted* Set 所有权：只有 submitDedup 在确认创建后登记', () => {
   // create_failed 对应 Core rejected(reason=create_failed)；其余三类是 Core 的 blocked/merged/duplicates 去向。
   test.each([

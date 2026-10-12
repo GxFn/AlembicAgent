@@ -32,6 +32,7 @@ import {
   buildProducerPromptV2,
 } from '../src/agent/prompts/insightProducer.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { DeltaCache } from '../src/tools/runtime/cache/DeltaCache.js';
 import {
   formatRecipeAuthoringViolations,
   runInProcessRecipeAuthoringGate,
@@ -185,7 +186,7 @@ describe('EvidenceCollector 采集端保真 (B1-B4)', () => {
     expect(snippet?.content).not.toContain('omitted');
   });
 
-  it('B4: clamp 截断标记后的 tail 被丢弃，只保留逐字前缀 head；unchanged/delta 模式跳过采集', () => {
+  it('B4: clamp 截断标记后的 tail 被丢弃，只保留逐字前缀 head 的完整行；unchanged/delta 模式跳过采集', () => {
     const collector = new EvidenceCollector();
     const full = fileLines('gamma', 1, 20);
     const head = fileLines('gamma', 1, 6);
@@ -197,7 +198,8 @@ describe('EvidenceCollector 采集端保真 (B1-B4)', () => {
         files: [
           {
             path: 'src/gamma.ts',
-            content: `${head}\n\n... [999 chars truncated for batch read budget] ...\n\n${fileLines('gamma', 15, 20)}`,
+            // 真实 clamp 按字符切 head：切点落在第 7 行中间，残行必须丢弃（L7-P13 / C10）。
+            content: `${rangeReadDisplay('gamma', 1, 6)}\n7|export const gam\n\n... [999 chars truncated for batch read budget] ...\n\n${rangeReadDisplay('gamma', 15, 20)}`,
             truncated: true,
           },
           { path: 'src/beta.ts', content: 'stale placeholder', mode: 'unchanged' },
@@ -207,6 +209,7 @@ describe('EvidenceCollector 采集端保真 (B1-B4)', () => {
     const { evidenceMap } = collector.build();
     const gamma = evidenceMap.get('src/gamma.ts')?.codeSnippets[0];
     expect(gamma?.content).toBe(head);
+    expect(gamma).toMatchObject({ startLine: 1, endLine: 6 });
     expect(gamma?.content).not.toContain('truncated');
     // head 必须是原文件全文的逐字前缀（保真判据）。
     expect(full.startsWith(gamma?.content ?? '__missing__')).toBe(true);
@@ -238,7 +241,7 @@ describe('端到端保真闭环：工具返回 → 采集 → 渲染 → 照抄�
       args: { action: 'read', filePaths: ['src/gamma.ts'] },
       result: {
         mode: 'batch',
-        files: [{ path: 'src/gamma.ts', content: fileLines('gamma', 1, 20) }],
+        files: [{ path: 'src/gamma.ts', mode: 'full', content: rangeReadDisplay('gamma', 1, 20) }],
       },
     });
     const { evidenceMap } = collector.build();
@@ -326,7 +329,7 @@ describe('R1 锚点驱动证据补齐（真机根因：头部窗口盖不住 fin
     collector.processToolCall({
       tool: 'code',
       args: { action: 'read', path: 'src/alpha.ts' },
-      result: { path: 'src/alpha.ts', content: fileLines('alpha', 1, 3), lineCount: 20 },
+      result: { path: 'src/alpha.ts', content: rangeReadDisplay('alpha', 1, 3), lineCount: 20 },
     });
     collector.groundFindingRefs(
       [
@@ -374,7 +377,11 @@ describe('R1 锚点驱动证据补齐（真机根因：头部窗口盖不住 fin
         {
           tool: 'code',
           args: { action: 'read', path: 'src/alpha.ts' },
-          result: { path: 'src/alpha.ts', content: fileLines('alpha', 1, 3), lineCount: 20 },
+          result: {
+            path: 'src/alpha.ts',
+            content: rangeReadDisplay('alpha', 1, 3),
+            lineCount: 20,
+          },
         },
         {
           tool: 'code',
@@ -793,8 +800,14 @@ it('router head-tail display truncation never joins distant source lines in a co
     result:
       '1|const first = 1;\n2|const second = 2;\n\n... [5000 chars truncated, exceeded 300 token limit] ...\n\n88|const distant = 88;',
   });
-  expect(collector.build().evidenceMap.get('src/a.ts')?.codeSnippets[0]?.content).toBe(
-    'const first = 1;\nconst second = 2;'
+  // 路由截断按字符切 head：说明前的最后一段无法判断是否完整，按 L7-P13 / C10 规则丢弃；
+  // head 以换行结尾时末行完整的情形见下方 L7-P13 用例。
+  const { evidenceMap, explorationLog } = collector.build();
+  expect(evidenceMap.get('src/a.ts')?.codeSnippets).toEqual([
+    { startLine: 1, endLine: 1, content: 'const first = 1;' },
+  ]);
+  expect(explorationLog[0]?.resultSummary).toContain(
+    'read display truncated: src/a.ts kept complete lines 1-1'
   );
 });
 
@@ -1014,4 +1027,207 @@ it('L4-P13: a rare later pattern stays visible to the collector beside a common 
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+// ─── L7-P13 / C10（module-review-2026-10-01 U47-F1、U47-F3）：共享严格展示剥离器 ───
+// 单 path code.read 的回执是纯字符串（mode 已丢失），DeltaCache 重读时它是 '[unchanged since last read]'
+// 或 '[delta: N hunk(s)]' 差分，不是源码；batch clamp 按字符切 head，切点可能落在下一行 `N|` 前缀中间。
+// 两者都不能进入“可逐字复制”的片段：采集端只认每行都是连续 `N|` 前缀的展示，截断时丢弃可能残缺的末行。
+describe('L7-P13 C10 共享严格展示剥离器', () => {
+  /** 与宿主 ToolScopeResources 一致：每个视图一个共享 DeltaCache，经真实 ToolRouterAdapter 读取。 */
+  function deltaRouter(root: string) {
+    const deltaCache = new DeltaCache(200);
+    return new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 8000, deltaCache }) },
+    });
+  }
+
+  async function readVia(router: ToolRouterAdapter, args: Record<string, unknown>) {
+    return router.execute({
+      toolId: 'code',
+      args,
+      surface: 'runtime',
+      actor: { user: 'test' },
+      source: { kind: 'runtime' },
+    });
+  }
+
+  const sourceLines = (count: number) =>
+    Array.from({ length: count }, (_, i) => `export const v${i} = ${i};`);
+
+  it('单 path unchanged 重读：占位文本不入片段、不算有效探索、探索日志注明原因、不挡锚点补读', async () => {
+    const root = createTempProject('collector-unchanged-');
+    const lines = sourceLines(40);
+    writeFileSync(path.join(root, 'a.ts'), lines.join('\n'));
+    const router = deltaRouter(root);
+    const args = { action: 'read', params: { path: 'a.ts' } };
+    const first = await readVia(router, args);
+    const second = await readVia(router, args);
+    // 前提：真实链路的重读回执就是占位字符串（mode 在 handler 的 ok(result.content) 处丢失）。
+    expect(second.structuredContent).toBe('[unchanged since last read]');
+
+    const collector = new EvidenceCollector();
+    collector.processToolCall(
+      { tool: 'code', args, result: first.structuredContent as string, envelope: first },
+      0
+    );
+    collector.processToolCall(
+      { tool: 'code', args, result: second.structuredContent as string, envelope: second },
+      1
+    );
+    const { evidenceMap, explorationLog } = collector.build();
+    // 只有首读的真实源码片段；占位文本不占名额、不伪装成第 1 行源码。
+    expect(evidenceMap.get('a.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 30, content: lines.slice(0, 30).join('\n') },
+    ]);
+    expect(explorationLog[0]?.effective).toBe(true);
+    expect(explorationLog[1]?.effective).toBe(false);
+    expect(explorationLog[1]?.resultSummary).toContain('not collected');
+    expect(explorationLog[1]?.resultSummary).toContain('unchanged');
+    expect(buildCodeContextSection(evidenceMap) ?? '').not.toContain('[unchanged since last read]');
+
+    // 只喂重读：不产生片段，第 1 行锚点仍会补读（占位片段不再“覆盖”第 1 行）。
+    const rereadOnly = new EvidenceCollector();
+    rereadOnly.processToolCall(
+      { tool: 'code', args, result: second.structuredContent as string, envelope: second },
+      0
+    );
+    expect(rereadOnly.build().evidenceMap.get('a.ts')?.codeSnippets ?? []).toEqual([]);
+    const reader = vi.fn<SnippetRangeReader>((_file, start, end) => ({
+      content: lines.slice(start - 1, end).join('\n'),
+      endLine: end,
+    }));
+    rereadOnly.groundFindingRefs([{ finding: 'f', evidence: 'see a.ts:1-3' }], reader);
+    expect(reader).toHaveBeenCalledWith('a.ts', 1, 3);
+    expect(rereadOnly.build().evidenceMap.get('a.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 3, content: lines.slice(0, 3).join('\n') },
+    ]);
+  });
+
+  it('单 path delta 重读：差分视图不当成第 1 行起的源码，不算有效探索', async () => {
+    const root = createTempProject('collector-delta-');
+    const lines = sourceLines(40);
+    writeFileSync(path.join(root, 'b.ts'), lines.join('\n'));
+    const router = deltaRouter(root);
+    const args = { action: 'read', params: { path: 'b.ts' } };
+    await readVia(router, args);
+    lines[2] = 'export const v2 = 999;';
+    writeFileSync(path.join(root, 'b.ts'), lines.join('\n'));
+    const second = await readVia(router, args);
+    expect(String(second.structuredContent)).toMatch(/^\[delta: \d+ hunk\(s\)\]/);
+
+    const collector = new EvidenceCollector();
+    collector.processToolCall(
+      { tool: 'code', args, result: second.structuredContent as string, envelope: second },
+      0
+    );
+    const { evidenceMap, explorationLog } = collector.build();
+    expect(evidenceMap.get('b.ts')?.codeSnippets ?? []).toEqual([]);
+    expect(explorationLog[0]?.effective).toBe(false);
+    expect(explorationLog[0]?.resultSummary).toContain('not collected');
+    expect(explorationLog[0]?.resultSummary).toContain('delta');
+  });
+
+  it('batch clamp 切点落在 N| 前缀中间：片段不以行号残片结尾，endLine 只算完整行', async () => {
+    const root = createTempProject('collector-clamp-prefix-');
+    mkdirSync(path.join(root, 'src'));
+    // 选 pad 使 5 文件批读（tokenBudget 1000 → 单文件 200 token）的 head 切点落在某行行号数字之后、'|' 之前。
+    const makeLines = (pad: number) =>
+      Array.from({ length: 60 }, (_, i) => `export const value${i + 1} = '${'x'.repeat(pad)}';`);
+    const files = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'];
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 1000 }) },
+    });
+    const args = { action: 'read', params: { filePaths: files } };
+    let picked: { lines: string[]; head: string; data: unknown; envelope: unknown } | null = null;
+    for (let pad = 1; pad < 40 && !picked; pad += 1) {
+      const lines = makeLines(pad);
+      for (const file of files) {
+        writeFileSync(path.join(root, file), lines.join('\n'));
+      }
+      const envelope = await readVia(router, args);
+      const data = envelope.structuredContent as {
+        files: Array<{ path: string; content: string; truncated?: boolean }>;
+      };
+      const content = data.files[0]?.content ?? '';
+      const head = content.split('\n\n... [')[0] ?? '';
+      if (data.files[0]?.truncated && /^\d+$/.test(head.split('\n').at(-1) ?? '')) {
+        picked = { lines, head, data, envelope };
+      }
+    }
+    // 前提：确实构造出了“切点落在前缀数字之后”的真实 clamp 回执。
+    expect(picked).not.toBeNull();
+    const { lines, head } = picked as NonNullable<typeof picked>;
+    const completeLines = head.split('\n').length - 1;
+    expect(completeLines).toBeLessThanOrEqual(30);
+
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args,
+      result: picked?.data as Record<string, unknown>,
+      envelope: picked?.envelope as { ok?: boolean; status?: string },
+    });
+    const snippet = collector.build().evidenceMap.get('src/a.ts')?.codeSnippets[0];
+    expect(snippet).toBeDefined();
+    expect(snippet?.content.split('\n').at(-1)).not.toMatch(/^\d+$/);
+    expect(snippet?.startLine).toBe(1);
+    expect(snippet?.endLine).toBe(completeLines);
+    // 逐字：片段正文恰好是源文件第 startLine..endLine 行。
+    expect(snippet?.content).toBe(lines.slice(0, completeLines).join('\n'));
+  });
+
+  it('截断 head 以换行结尾时末行完整、照常保留；head 只剩残行时整段不入片段', () => {
+    const notice = '\n\n... [5000 chars truncated, exceeded 300 token limit] ...\n\n';
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', params: { path: 'src/a.ts' } },
+      result: `1|const first = 1;\n2|const second = 2;\n${notice}88|const distant = 88;`,
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', params: { path: 'src/b.ts' } },
+      result: `1|const only = ${notice}88|const distant = 88;`,
+    });
+    const { evidenceMap, explorationLog } = collector.build();
+    expect(evidenceMap.get('src/a.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 2, content: 'const first = 1;\nconst second = 2;' },
+    ]);
+    expect(evidenceMap.get('src/b.ts')?.codeSnippets ?? []).toEqual([]);
+    expect(explorationLog[1]?.effective).toBe(false);
+    expect(explorationLog[1]?.resultSummary).toContain('not collected');
+  });
+
+  it('无行号前缀或行号不连续的展示不入片段（不再把首行当第 1 行源码）', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', params: { path: 'src/plain.ts' } },
+      result: 'export const plain = 1;\nexport const other = 2;',
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', params: { path: 'src/gap.ts' } },
+      result: '1|export const a = 1;\n80|export const far = 80;',
+    });
+    const { evidenceMap, explorationLog } = collector.build();
+    expect(evidenceMap.get('src/plain.ts')?.codeSnippets ?? []).toEqual([]);
+    expect(evidenceMap.get('src/gap.ts')?.codeSnippets ?? []).toEqual([]);
+    expect(explorationLog.map((entry) => entry.effective)).toEqual([false, false]);
+  });
+
+  it('CRLF 源文件的 N| 展示仍按逐字源码采集（行尾 \\r 保留）', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', params: { path: 'src/crlf.ts' } },
+      result: '1|export const a = 1;\r\n2|export const b = 2;\r\n3|',
+    });
+    const { evidenceMap, explorationLog } = collector.build();
+    expect(evidenceMap.get('src/crlf.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 3, content: 'export const a = 1;\r\nexport const b = 2;\r\n' },
+    ]);
+    expect(explorationLog[0]?.effective).toBe(true);
+  });
 });
