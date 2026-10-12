@@ -10,14 +10,32 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** 维度允许的 knowledgeType 列表：只收非空字符串，去空白、去重并保持宿主给定顺序（首项即回落值）。 */
+function allowedKnowledgeTypeList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const types = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return [...new Set(types)];
+}
+
 /**
  * 模型描述只广告 canonical evidenceRefs；执行保留历史 sources 输入，由 authoring
  * 在真实台账中推导并校验 refs。这里只共享字段形状，绝不伪造 refs 或重复业务推导。
  * 调用者拿到自有副本，静态注册表和同轮其他 schema 不受变体影响。
+ *
+ * I37：model 用途在当前维度给出 allowedKnowledgeTypes 时，为 knowledgeType 广告一个可选 enum，
+ * 让模型在本维度允许的类型中自选。execution 用途刻意不加该 enum：执行面按静态注册表编译并缓存，
+ * 不知道当前维度；列表外或缺失的值不拒收，而由提交归一化（handlers/knowledge/input.ts）回落到
+ * 列表第一个并打诊断——这是本字段广告面与执行面唯一有意的差异。
  */
 export function dimensionSubmitParameters(
   schema: Record<string, unknown>,
-  purpose: 'model' | 'execution'
+  purpose: 'model' | 'execution',
+  options: { allowedKnowledgeTypes?: unknown } = {}
 ): Record<string, unknown> | null {
   if (!record(schema.properties) || !record(schema.properties.reasoning)) {
     return null;
@@ -49,6 +67,15 @@ export function dimensionSubmitParameters(
       description:
         'Evidence-breadth self-declaration. Use "narrow" when evidence spans <3 distinct files (single-file/local rule).',
     };
+    const allowedKnowledgeTypes = allowedKnowledgeTypeList(options.allowedKnowledgeTypes);
+    // 没有可用列表（非维度运行或维度未声明）时不广告：提交归一化此时也不限制 knowledgeType。
+    if (allowedKnowledgeTypes.length > 0) {
+      properties.knowledgeType = {
+        type: 'string',
+        enum: allowedKnowledgeTypes,
+        description: `Knowledge type of this candidate: pick the best fit from the current dimension's allowed types. Optional; an omitted or unlisted value falls back to "${allowedKnowledgeTypes[0]}" with a host diagnostic.`,
+      };
+    }
   }
   return params;
 }

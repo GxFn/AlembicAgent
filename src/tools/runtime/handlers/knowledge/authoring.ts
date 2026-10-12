@@ -95,7 +95,17 @@ export async function prepareSubmission(
     item: initialItem,
     effectiveDimensionId,
     isBootstrap,
+    normalizationNotes,
   } = buildSubmissionInput(params, ctx);
+  // I37/I38：归一化模块按 layer contract 不持有日志端口；它产生的标题前缀改写与 knowledgeType
+  // 回落（含原值、替换值、dimensionId）在这里按级别落日志，保证每次改写都可回溯。
+  for (const note of normalizationNotes) {
+    if (note.level === 'warn') {
+      Logger.getInstance().warn(note.message);
+    } else {
+      Logger.getInstance().info(note.message);
+    }
+  }
   let item = initialItem;
 
   // P1.4b in-process flatten (CG-4)：在 Core production port 之前，把 in-process 提交

@@ -884,9 +884,13 @@ export const DEPTH_SLOT_KEYS: string[] = Object.keys(DEPTH_SLOT_PROPS);
  * 变体命中时仍只改自己的克隆并返回克隆，不原地改入参，避免调用方持有的投影被悄悄改写。
  * 仅匹配单动作 submit 展开形态（params.properties.reasoning 在场）；多动作摘要形态与非 knowledge
  * 工具原样返回入参对象。
+ * I37：options.allowedKnowledgeTypes 为当前维度的允许列表（AgentRuntime 取自 sharedState._dimensionMeta，
+ * 与工具运行时 runtime.dimensionMeta 同源）；非空时变体额外广告可选 knowledgeType enum，由模型自选。
+ * 列表外或缺失的值由提交归一化回落并留诊断，执行面不据此拒收。
  */
 export function applyDimensionSubmitSchemaVariant(
-  schemas: Array<Record<string, unknown>>
+  schemas: Array<Record<string, unknown>>,
+  options: { allowedKnowledgeTypes?: unknown } = {}
 ): Array<Record<string, unknown>> {
   return schemas.map((schema) => {
     if (schema.name !== 'knowledge') {
@@ -898,7 +902,7 @@ export function applyDimensionSubmitSchemaVariant(
         | Record<string, unknown>
         | undefined
     )?.params as Record<string, unknown> | undefined;
-    const variant = params ? dimensionSubmitParameters(params, 'model') : null;
+    const variant = params ? dimensionSubmitParameters(params, 'model', options) : null;
     if (!variant) {
       return schema;
     }

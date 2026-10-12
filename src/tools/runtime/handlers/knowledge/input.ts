@@ -91,20 +91,75 @@ export function pickString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }
 
-function stripProjectNamePrefix(title: string, projectRoot: string) {
+/**
+ * I38：去掉模型照搬的「项目名 + 分隔符」标题前缀（如 /p/web 下 "web 的路由约定" → "路由约定"）。
+ * 项目名之后必须紧跟分隔符或串尾——以项目名开头的普通单词（WebSocket、Apis、AlembicCore、
+ * KingfisherManager）是真实类名，提示词也要求标题使用真实类名，不能被截断。
+ * 纯函数：只返回投影结果；projectName 仅在真正发生改写时给出，供调用方生成改写诊断。
+ * 去掉后为空（标题就是项目名本身）时保留原标题。
+ */
+function stripProjectNamePrefix(
+  title: string,
+  projectRoot: string | undefined
+): { title: string; projectName: string | null } {
   if (!title || !projectRoot) {
-    return title;
+    return { title, projectName: null };
   }
   const projectName = path.basename(projectRoot);
   if (!projectName || projectName.length < 2) {
-    return title;
+    return { title, projectName: null };
   }
-  const prefix = new RegExp(
-    `^${projectName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[的—–-]?\\s*`,
-    'i'
-  );
+  const escaped = projectName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // 前瞻要求项目名后是空白、「的」、破折号、半/全角冒号或连字符，或者标题到此结束；
+  // 随后再吞掉一个可选分隔符及两侧空白。
+  const prefix = new RegExp(`^${escaped}(?=$|[\\s的—–:：-])\\s*[的—–:：-]?\\s*`, 'i');
   const stripped = title.replace(prefix, '');
-  return stripped.length > 0 ? stripped : title;
+  if (stripped.length === 0 || stripped === title) {
+    return { title, projectName: null };
+  }
+  return { title: stripped, projectName };
+}
+
+/**
+ * 归一化过程中发生的改写或回落。本模块按 layer contract 不持有日志端口，只产出诊断文本；
+ * 调用方（authoring.ts 的 prepareSubmission）按 level 落日志。
+ */
+export interface SubmissionNormalizationNote {
+  level: 'info' | 'warn';
+  message: string;
+}
+
+/**
+ * I37：维度运行的 knowledgeType 由模型在本维度 allowedKnowledgeTypes 内自选（维度 submit schema
+ * 广告同一列表的可选 enum）。列表内的值原样采用；缺失或不在列表内时回落列表第一个并给出诊断——
+ * 列表外的值不拒收，避免一个分类字段浪费提交轮次，也绝不写入配置外类型。
+ * 没有维度允许列表时不做限制：沿用模型值，缺失时取既有默认 code-pattern。
+ */
+function resolveKnowledgeType(
+  requestedValue: unknown,
+  allowedKnowledgeTypes: string[],
+  diagnostics: { dimensionId: string | undefined; title: unknown }
+): { knowledgeType: string; note: SubmissionNormalizationNote | null } {
+  const requested = pickString(requestedValue);
+  if (allowedKnowledgeTypes.length === 0) {
+    return { knowledgeType: requested ?? 'code-pattern', note: null };
+  }
+  if (requested && allowedKnowledgeTypes.includes(requested)) {
+    return { knowledgeType: requested, note: null };
+  }
+  const fallback = allowedKnowledgeTypes[0];
+  const context = `dim=${diagnostics.dimensionId ?? ''}; allowed=[${allowedKnowledgeTypes.join(', ')}] for "${String(diagnostics.title ?? '')}"`;
+  // 模型给了列表外的值：替换会改变它表达的分类意图，用 warn 便于回溯类型分布变化；缺失只是默认取值，用 info。
+  const note: SubmissionNormalizationNote = requested
+    ? {
+        level: 'warn',
+        message: `[knowledge.submit] knowledgeType ${JSON.stringify(requested)} is not allowed; replaced with ${JSON.stringify(fallback)} (${context})`,
+      }
+    : {
+        level: 'info',
+        message: `[knowledge.submit] knowledgeType missing; defaulted to ${JSON.stringify(fallback)} (${context})`,
+      };
+  return { knowledgeType: fallback, note };
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -213,8 +268,18 @@ export function buildSubmissionInput(
   params: Record<string, unknown>,
   ctx: Pick<ToolContext, 'projectRoot' | 'runtime'>
 ) {
+  const normalizationNotes: SubmissionNormalizationNote[] = [];
+  // I38：标题改写只投影到 item，不改调用方 params（调用方日志、止损计数与上游记录保持模型原值）。
+  let title = params.title;
   if (params.title) {
-    params.title = stripProjectNamePrefix(String(params.title), ctx.projectRoot);
+    const projection = stripProjectNamePrefix(String(params.title), ctx.projectRoot);
+    title = projection.title;
+    if (projection.projectName) {
+      normalizationNotes.push({
+        level: 'info',
+        message: `[knowledge.submit] project-name prefix stripped from title: ${JSON.stringify(String(params.title))} → ${JSON.stringify(projection.title)} (project=${projection.projectName})`,
+      });
+    }
   }
 
   const dimMeta = (ctx.runtime?.dimensionMeta as DimensionMetaLike | null | undefined) ?? null;
@@ -232,9 +297,22 @@ export function buildSubmissionInput(
   const normalizedSourceRefs = uniqueStrings(
     normalizeStringArray(params.sourceRefs ?? params.filePaths ?? normalizedSources)
   );
-  const allowedKnowledgeType = normalizeStringArray(dimMeta?.allowedKnowledgeTypes)[0];
-  const effectiveKnowledgeType =
-    allowedKnowledgeType ?? pickString(params.knowledgeType) ?? 'code-pattern';
+  // 与维度 submit schema 的 enum 同口径：去空白、去重后的允许列表。
+  const allowedKnowledgeTypes = uniqueStrings(
+    normalizeStringArray(dimMeta?.allowedKnowledgeTypes).map((type) => type.trim())
+  );
+  const knowledgeTypeResolution = resolveKnowledgeType(
+    params.knowledgeType,
+    allowedKnowledgeTypes,
+    {
+      dimensionId: effectiveDimensionId,
+      title,
+    }
+  );
+  if (knowledgeTypeResolution.note) {
+    normalizationNotes.push(knowledgeTypeResolution.note);
+  }
+  const effectiveKnowledgeType = knowledgeTypeResolution.knowledgeType;
   const effectiveCategory = pickString(params.category) ?? 'Utility';
   const effectiveLanguage =
     pickString(params.language) ??
@@ -257,7 +335,7 @@ export function buildSubmissionInput(
   // 拒收治理：refs 机械自推断需在展开前改写 reasoning——item 为可重绑定
   const item = {
     ...params,
-    title: params.title as string,
+    title: title as string,
     description,
     content,
     kind: params.kind as string,
@@ -281,5 +359,5 @@ export function buildSubmissionInput(
       ? { dimensionId: dimMeta.id, outputType: pickString(dimMeta.outputType) ?? 'candidate' }
       : null,
   };
-  return { item, effectiveDimensionId, isBootstrap };
+  return { item, effectiveDimensionId, isBootstrap, normalizationNotes };
 }

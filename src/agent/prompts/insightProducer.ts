@@ -190,6 +190,26 @@ function buildProducerSubmitFieldContract(): string {
 // ──────────────────────────────────────────────────────────────────
 
 /**
+ * I37：维度约束里的 knowledgeType 说明。维度声明了允许列表时由模型按候选内容自选并填入
+ * params.knowledgeType（维度 submit schema 同时广告同一列表的可选 enum）；缺失或不在列表内时
+ * 宿主回落列表第一个并记录诊断（tools/runtime/handlers/knowledge/input.ts）。无列表时不限制。
+ */
+function describeKnowledgeTypeConstraint(allowedKnowledgeTypes: string[] | undefined): string {
+  const allowed = [
+    ...new Set(
+      (allowedKnowledgeTypes || [])
+        .filter((type): type is string => typeof type === 'string')
+        .map((type) => type.trim())
+        .filter((type) => type.length > 0)
+    ),
+  ];
+  if (allowed.length === 0) {
+    return '- 允许的 knowledgeType: (all)';
+  }
+  return `- knowledgeType: 按候选内容从本维度允许的类型中自选一个填入 params.knowledgeType（允许: ${allowed.join(', ')}）；缺失或不在列表内时宿主回落为 ${allowed[0]} 并记录诊断`;
+}
+
+/**
  * 构建 Producer Prompt (v1 — 用于 AnalysisReport)
  *
  * @param dimConfig { id, label, allowedKnowledgeTypes, outputType }
@@ -211,7 +231,7 @@ export function buildProducerPrompt(
 
   parts.push(`维度约束:
 - dimensionId: ${dimConfig.id}
-- 允许的 knowledgeType: ${(dimConfig.allowedKnowledgeTypes || []).join(', ') || '(all)'}
+${describeKnowledgeTypeConstraint(dimConfig.allowedKnowledgeTypes)}
 - category: 只能填写业务/组件分类（View/Service/Tool/Model/Network/Storage/UI/Utility），不要填写维度 ID
 - 提交时必须让 knowledge 工具携带 dimensionId=${dimConfig.id}；不要用 category 或 knowledgeType 表示维度归属`);
 
@@ -355,7 +375,7 @@ export function buildProducerPromptV2(
     : '';
   parts.push(`维度约束:
 - dimensionId: ${dimConfig.id}
-- 允许的 knowledgeType: ${(dimConfig.allowedKnowledgeTypes || []).join(', ') || '(all)'}
+${describeKnowledgeTypeConstraint(dimConfig.allowedKnowledgeTypes)}
 - category: 只能填写业务/组件分类（View/Service/Tool/Model/Network/Storage/UI/Utility），不要填写维度 ID
 - 提交时必须让 knowledge 工具携带 dimensionId=${dimConfig.id}；不要用 category 或 knowledgeType 表示维度归属${rangeHint}`);
 

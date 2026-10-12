@@ -1042,8 +1042,12 @@ export class AgentRuntime {
     }
     // M1a：维度运行（证据台账在场）时对 knowledge.submit 施加契约面变体——
     // evidenceRefs 必填、sources 降述、scope 自声明；广告面与运行时闸一致（E4/run-6 双教训钉）。
+    // I37：knowledgeType 可选 enum 取当前维度的允许列表；runtimeBridge 把同一 _dimensionMeta
+    // 交给工具运行时，提交归一化据此采用列表内的模型值或回落列表第一个。
     const base = ctx.evidenceLedger
-      ? applyDimensionSubmitSchemaVariant(ctx.toolSchemas)
+      ? applyDimensionSubmitSchemaVariant(ctx.toolSchemas, {
+          allowedKnowledgeTypes: ctx.sharedState?._dimensionMeta?.allowedKnowledgeTypes,
+        })
       : ctx.toolSchemas;
     return withDirectNoteFindingSchema(base, canUseDirectNoteFinding(ctx));
   }

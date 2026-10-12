@@ -20,9 +20,12 @@ import {
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
+import { buildSubmissionInput } from '../src/tools/runtime/handlers/knowledge/input.js';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
+import { validateToolParameters } from '../src/tools/runtime/parameters.js';
+import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 import { createTempProject } from './helpers/tempProject.js';
 
 function makeProject() {
@@ -2121,6 +2124,224 @@ describe('Agent Recipe production profile adapter', () => {
       }
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+/**
+ * I37/I38：提交输入归一化。knowledgeType 在维度允许列表内由模型自选，列表外或缺失回落
+ * allowed[0] 并留诊断；去项目名前缀要求项目名后紧跟分隔符或串尾，且只投影到 item、不改调用方 params。
+ * 归一化模块按 layer contract 不持有日志端口，诊断随 normalizationNotes 返回，由 prepareSubmission 落日志。
+ */
+describe('knowledge submit input normalization', () => {
+  const ARCHITECTURE_TYPES = ['architecture', 'module-dependency', 'boundary-constraint'];
+
+  function dimensionContext(allowedKnowledgeTypes: unknown, projectRoot = 'workspace/project') {
+    return {
+      projectRoot,
+      runtime: {
+        dimensionMeta: { id: 'architecture', outputType: 'candidate', allowedKnowledgeTypes },
+      },
+    } as never;
+  }
+
+  function notesAbout(notes: Array<{ level: string; message: string }>, topic: string) {
+    return notes.filter((note) => note.message.includes(topic));
+  }
+
+  function spyLogger() {
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const messages = (spy: typeof info) => spy.mock.calls.map(([message]) => String(message));
+    return {
+      infoAbout: (topic: string) => messages(info).filter((message) => message.includes(topic)),
+      warnAbout: (topic: string) => messages(warn).filter((message) => message.includes(topic)),
+      restore: () => {
+        info.mockRestore();
+        warn.mockRestore();
+      },
+    };
+  }
+
+  test('keeps a model-selected knowledgeType that the dimension allows', () => {
+    const { item, normalizationNotes } = buildSubmissionInput(
+      submitParams({ knowledgeType: 'boundary-constraint' }),
+      dimensionContext(ARCHITECTURE_TYPES)
+    );
+    expect(item.knowledgeType).toBe('boundary-constraint');
+    expect(notesAbout(normalizationNotes, 'knowledgeType')).toEqual([]);
+  });
+
+  test('replaces an unlisted knowledgeType with the first allowed type and reports both values', () => {
+    const { item, normalizationNotes } = buildSubmissionInput(
+      submitParams({ knowledgeType: 'code-pattern' }),
+      dimensionContext(ARCHITECTURE_TYPES)
+    );
+    expect(item.knowledgeType).toBe('architecture');
+    const [note, ...rest] = notesAbout(normalizationNotes, 'knowledgeType');
+    expect(rest).toEqual([]);
+    expect(note.level).toBe('warn');
+    expect(note.message).toContain('"code-pattern"');
+    expect(note.message).toContain('"architecture"');
+    expect(note.message).toContain('dim=architecture');
+  });
+
+  test('defaults a missing knowledgeType to the first allowed type and reports the fallback', () => {
+    for (const knowledgeType of [undefined, '   ']) {
+      const { item, normalizationNotes } = buildSubmissionInput(
+        submitParams({ knowledgeType }),
+        dimensionContext(ARCHITECTURE_TYPES)
+      );
+      expect(item.knowledgeType).toBe('architecture');
+      const [note, ...rest] = notesAbout(normalizationNotes, 'knowledgeType');
+      expect(rest).toEqual([]);
+      expect(note.level).toBe('info');
+      expect(note.message).toContain('missing');
+      expect(note.message).toContain('"architecture"');
+      expect(note.message).toContain('dim=architecture');
+    }
+  });
+
+  test('keeps the model knowledgeType when no dimension restricts it', () => {
+    const unrestricted = buildSubmissionInput(
+      submitParams({ knowledgeType: 'boundary-constraint' }),
+      { projectRoot: 'workspace/project', runtime: {} } as never
+    );
+    expect(unrestricted.item.knowledgeType).toBe('boundary-constraint');
+    const emptyList = buildSubmissionInput(
+      submitParams({ knowledgeType: 'boundary-constraint' }),
+      dimensionContext([])
+    );
+    expect(emptyList.item.knowledgeType).toBe('boundary-constraint');
+    expect(notesAbout(unrestricted.normalizationNotes, 'knowledgeType')).toEqual([]);
+    expect(notesAbout(emptyList.normalizationNotes, 'knowledgeType')).toEqual([]);
+  });
+
+  test.each([
+    ['WebSocket 重连退避策略', 'workspace/web'],
+    ['Apis 分页约定', 'workspace/api'],
+    ['AlembicCore 包入口约束', 'workspace/Alembic'],
+    ['KingfisherManager 缓存策略', 'workspace/Kingfisher'],
+    ['web', 'workspace/web'],
+  ])('keeps title %s when it only starts with the project name', (title, projectRoot) => {
+    const params = submitParams({ title });
+    const { item, normalizationNotes } = buildSubmissionInput(params, {
+      projectRoot,
+      runtime: {},
+    } as never);
+    expect(item.title).toBe(title);
+    expect(params.title).toBe(title);
+    expect(notesAbout(normalizationNotes, 'project-name prefix')).toEqual([]);
+  });
+
+  test.each([
+    ['web 的路由约定', 'workspace/web', '路由约定'],
+    ['Web - 路由约定', 'workspace/web', '路由约定'],
+    ['Alembic：包入口约束', 'workspace/Alembic', '包入口约束'],
+    ['alembic 包入口约束', 'workspace/Alembic', '包入口约束'],
+  ])('strips the separated project-name prefix from %s as a reported projection', (title, projectRoot, expected) => {
+    const params = submitParams({ title });
+    const { item, normalizationNotes } = buildSubmissionInput(params, {
+      projectRoot,
+      runtime: {},
+    } as never);
+    expect(item.title).toBe(expected);
+    // 纯投影：调用方 params 保持模型原值，改写只出现在归一化后的 item 上。
+    expect(params.title).toBe(title);
+    const [note, ...rest] = notesAbout(normalizationNotes, 'project-name prefix');
+    expect(rest).toEqual([]);
+    expect(note.level).toBe('info');
+    expect(note.message).toContain(JSON.stringify(title));
+    expect(note.message).toContain(JSON.stringify(expected));
+    expect(note.message).toContain(path.basename(projectRoot));
+  });
+
+  test('dimension execution schema accepts an unlisted knowledgeType so the submit fallback stays reachable', () => {
+    const params = submitParams({
+      knowledgeType: 'not-a-dimension-type',
+      reasoning: { whyStandard: 'x', evidenceRefs: ['E-1'], confidence: 0.9 },
+    });
+    expect(
+      validateToolParameters(
+        { tool: 'knowledge', action: 'submit', params },
+        TOOL_REGISTRY.knowledge.actions.submit,
+        { evidenceLedger: {} } as never
+      )
+    ).toBeNull();
+  });
+
+  test.each([
+    { requested: 'boundary-constraint', stored: 'boundary-constraint', level: null },
+    { requested: 'code-pattern', stored: 'architecture', level: 'warn' },
+    { requested: undefined, stored: 'architecture', level: 'info' },
+  ])('stores knowledgeType $requested as $stored through a cold-start dimension submit', async ({
+    requested,
+    stored,
+    level,
+  }) => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const log = spyLogger();
+    try {
+      const result = await handleKnowledge('submit', submitParams({ knowledgeType: requested }), {
+        projectRoot,
+        recipeGateway: fake.port,
+        sessionStore: null,
+        runtime: {
+          dimensionMeta: { id: 'architecture', allowedKnowledgeTypes: ARCHITECTURE_TYPES },
+        },
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0].input.items[0]).toMatchObject({
+        knowledgeType: stored,
+        dimensionId: 'architecture',
+      });
+      // prepareSubmission 把归一化诊断按级别落日志：替换走 warn，缺失回落走 info，列表内不留痕。
+      const warned = log.warnAbout('knowledgeType');
+      const informed = log.infoAbout('knowledgeType');
+      expect(warned).toHaveLength(level === 'warn' ? 1 : 0);
+      expect(informed).toHaveLength(level === 'info' ? 1 : 0);
+      for (const message of [...warned, ...informed]) {
+        expect(message).toContain(`"${stored}"`);
+        expect(message).toContain('dim=architecture');
+        if (requested) {
+          expect(message).toContain(`"${requested}"`);
+        }
+      }
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('logs the stripped title prefix and stores the projection without mutating the call params', async () => {
+    const projectRoot = makeProject();
+    const projectName = path.basename(projectRoot);
+    const fake = fakePort(readyReport);
+    const log = spyLogger();
+    const originalTitle = `${projectName} 的 ImportType keeps type-only dependencies out of runtime output`;
+    const params = submitParams({ title: originalTitle });
+    try {
+      const result = await handleKnowledge('submit', params, {
+        projectRoot,
+        recipeGateway: fake.port,
+        sessionStore: null,
+        runtime: { sharedState: {} },
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(fake.calls[0].input.items[0]).toMatchObject({
+        title: 'ImportType keeps type-only dependencies out of runtime output',
+      });
+      expect(params.title).toBe(originalTitle);
+      const [message, ...rest] = log.infoAbout('project-name prefix');
+      expect(rest).toEqual([]);
+      expect(message).toContain(JSON.stringify(originalTitle));
+      expect(message).toContain(`project=${projectName}`);
+    } finally {
+      log.restore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   });
 });
