@@ -24,6 +24,7 @@ import {
   type ToolDiagnosticWarning,
   type ToolResult,
 } from '#tools/kernel/registry.js';
+import { currentSearchCacheGeneration, invalidateSearchCache } from './searchCacheGeneration.js';
 
 export async function handle(
   action: string,
@@ -57,9 +58,8 @@ interface SearchMatch {
   context?: string[];
 }
 
-// 缓存实例由宿主按读取视图复用；旧 get/set-only 端口也能逻辑失效，无需新增 clear 合同。
-// generation 只进入本工具的缓存 key；旧条目的容量/TTL 仍由宿主管理。
-const searchCacheGenerations = new WeakMap<NonNullable<ToolContext['searchCache']>, number>();
+// 缓存实例由宿主按读取视图复用；失效代数与推进逻辑在 ./searchCacheGeneration.ts，code.write 与
+// terminal.exec 共用（L4-P15 / I05）。generation 只进入本工具的缓存 key；旧条目的容量仍由宿主管理。
 
 /** 单个 pattern 的搜索结果；matches 保持引擎的遍历顺序，total 是该 pattern 的观察下界。 */
 interface PatternSearchOutcome {
@@ -111,6 +111,10 @@ async function handleSearch(
   const failures: Array<{ pattern: string; reason: string }> = [];
   let halted: SearchHalt | undefined;
   const warnings: ToolDiagnosticWarning[] = [];
+  // L4-P15 / I05：直接由 SearchCache 提供结果的 pattern 数。全部命中才把整次调用标成 cached，
+  // 部分命中只附 code_search_cache_hit 诊断——宿主据 _meta.cached 填 envelope.cache.hit，
+  // runtimeBridge 据此区分 cacheHit / cacheMiss，不能把一次真实搜索算成命中。
+  let cacheHits = 0;
 
   for (let index = 0; index < patterns.length; index++) {
     const pattern = patterns[index];
@@ -123,9 +127,10 @@ async function handleSearch(
       break;
     }
 
+    // 每个 pattern 查缓存时读取当时的代数：调用进行中有写盘失效时，后续 pattern 不再命中旧条目。
     const cacheKey = JSON.stringify([
       ctx.projectRoot,
-      ctx.searchCache ? (searchCacheGenerations.get(ctx.searchCache) ?? 0) : 0,
+      currentSearchCacheGeneration(ctx.searchCache),
       pattern,
       glob ?? null,
       regex,
@@ -136,6 +141,7 @@ async function handleSearch(
     if (cached) {
       const cachedResult = cached as { matches: SearchMatch[]; total: number };
       outcomes.push({ pattern, matches: cachedResult.matches, total: cachedResult.total });
+      cacheHits++;
       continue;
     }
 
@@ -201,6 +207,13 @@ async function handleSearch(
   if (scanned) {
     pushFallbackScanWarnings(warnings, scanned, unreadableFiles, glob);
   }
+  const allCached = reportSearchCacheHits(
+    cacheHits,
+    patterns.length,
+    // 诊断里的代数便于对照 code.write / terminal.exec 的 search cache invalidated 日志。
+    currentSearchCacheGeneration(ctx.searchCache),
+    warnings
+  );
   const deduped = mergeRoundRobin(outcomes, maxResults);
   const totalCount = outcomes.reduce((sum, outcome) => sum + outcome.total, 0);
   if (deduped.length === 0 && failures.length > 0 && !halted) {
@@ -257,6 +270,8 @@ async function handleSearch(
     });
   }
   const result = ok(data, {
+    // 全部 pattern 都由缓存提供才算整次命中；部分命中已在 warnings 里带 code_search_cache_hit。
+    ...(allCached ? { cached: true } : {}),
     // Adapter 的真实展示为缩进 JSON，预算必须使用同一序列化格式。
     tokensEstimate: estimateTokens(JSON.stringify(data, null, 2)),
     durationMs: Date.now() - startMs,
@@ -269,6 +284,42 @@ async function handleSearch(
   return incomplete && deduped.length === 0
     ? { ...result, ok: false, error: `code.search ${incomplete.status}: ${incomplete.reason}` }
     : result;
+}
+
+/**
+ * 搜索缓存命中的可观测输出（L4-P15 / I05）。返回是否整次命中（全部 pattern 都由缓存提供）。
+ * - 全部命中：由调用方设 _meta.cached=true，这里只记 debug；
+ * - 部分命中：追加 code_search_cache_hit 诊断（命中数/总数与代数），整次调用仍按未命中报告；
+ * - 无命中：不输出任何东西。
+ * 诊断只含计数与代数，不回显 pattern（pattern 已在请求参数里，宿主可自行对照）。
+ */
+function reportSearchCacheHits(
+  hits: number,
+  total: number,
+  generation: number,
+  warnings: ToolDiagnosticWarning[]
+): boolean {
+  if (hits === 0) {
+    return false;
+  }
+  const allCached = hits === total;
+  const summary = `Served ${hits} of ${total} pattern(s) from the search cache (generation ${generation})`;
+  observeSafely(
+    () =>
+      Logger.getInstance().debug(
+        `[code.search] cache hit; hits=${hits}; patterns=${total}; generation=${generation}; path=${allCached ? 'whole-hit' : 'partial-hit'}`
+      ),
+    () => undefined
+  );
+  if (!allCached) {
+    warnings.push({
+      code: 'code_search_cache_hit',
+      message: `${summary}; the remaining pattern(s) ran a fresh search, so the call is not reported as cached.`,
+      stage: 'code.search',
+      tool: 'code',
+    });
+  }
+  return allCached;
 }
 
 /**
@@ -977,6 +1028,9 @@ async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Pr
     forgetFullRead(result.path, ctx);
   }
   return ok(result.content, {
+    // L4-P15 / I05：只有 unchanged（内容来自 DeltaCache 的已展示版本）算缓存命中；delta 模式重新读盘
+    // 并比对了内容，不算命中。
+    ...(result.mode === 'unchanged' ? { cached: true } : {}),
     tokensEstimate: result.tokensEstimate,
     ...(willTruncate
       ? {
@@ -1080,7 +1134,10 @@ async function handleBatchRead(
     };
   }
 
-  return ok(data, { tokensEstimate });
+  // 与 code.search 的“全部 pattern 命中”同一口径：每个请求的文件都返回 unchanged 才算整次命中；
+  // 任何失败、full、range、delta 都意味着本次真的读取并交付了新内容。
+  const allUnchanged = files.every((file) => file.ok && file.mode === 'unchanged');
+  return ok(data, { tokensEstimate, ...(allUnchanged ? { cached: true } : {}) });
 }
 
 async function readSingleFile(
@@ -1571,10 +1628,7 @@ async function handleWrite(params: Record<string, unknown>, ctx: ToolContext): P
     // 最后一个可取消点已过；写入开始后以真实 IO 回执为准，不用迟到取消伪造回滚。
     if (ctx.searchCache) {
       // 失败也可能已经改过磁盘；在真正尝试写入时失效，不能等成功回执后才撤销旧命中。
-      searchCacheGenerations.set(
-        ctx.searchCache,
-        (searchCacheGenerations.get(ctx.searchCache) ?? 0) + 1
-      );
+      invalidateSearchCache(ctx.searchCache, 'code.write', 'write-started');
     }
     await fs.writeFile(resolved.absPath, content, 'utf-8');
   } catch (err: unknown) {

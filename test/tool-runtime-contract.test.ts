@@ -18,6 +18,11 @@ import { EvidenceCollector } from '../src/agent/evidence/EvidenceCollector.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import type { SessionStore } from '../src/agent/memory/SessionStore.js';
+import type {
+  ToolMetadata,
+  ToolPipelineContext,
+} from '../src/agent/runtime/toolPipeline/contracts.js';
+import { executeRuntimeToolCall } from '../src/agent/runtime/toolPipeline/runtimeBridge.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
 import {
@@ -4012,5 +4017,189 @@ describe('L4-P30 scan_production evidence self-rescue channel (I44)', () => {
       return !isToolActionAllowed(capability.allowedTools, tool, action);
     });
     expect(notAdmitted).toEqual([]);
+  });
+});
+
+// ─── L4-P15 code.search / code.read 缓存命中可观测（I05：U12-F6、U14-F11）──────────────
+// 搜索缓存命中时 handler 曾只 continue、从不设 _meta.cached，ToolRouterAdapter 因此把 envelope.cache.hit
+// 恒填 false，runtimeBridge 再把真实命中记成 cacheMiss；code.read 的 unchanged 同样被记成未命中。
+// 这里经 runtimeBridge.executeRuntimeToolCall 真实路由（真实 rg、真实 SearchCache / DeltaCache），钉住：
+// 全部 pattern 命中 → cache.hit=true 且不记 cacheMiss；部分命中 → code_search_cache_hit 诊断但不算整次命中；
+// code.read 只有 unchanged 算命中，delta 不算；code.write 推进失效代数并留下可定位日志。
+describe('L4-P15 code tool cache hit observability (I05)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  async function makeCacheProject(): Promise<string> {
+    const root = await mkdtemp(join(baseRoot, 'p15-cache-'));
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src/a.ts'), 'export const alphaNeedle = 1;\n');
+    await writeFile(join(root, 'src/b.ts'), 'export const betaNeedle = 2;\n');
+    return root;
+  }
+
+  /** 同一组缓存服务一串调用：与宿主按读取视图复用 SearchCache / DeltaCache 一致。 */
+  function createBridge(resources: Omit<ToolContext, 'tokenBudget'>) {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ ...resources, tokenBudget: 8000 }) },
+    });
+    const context = {
+      runtime: { id: 'p15-runtime', presetName: 'p15-preset', policies: {}, toolRouter: adapter },
+      loopCtx: { allowedToolIds: ['code'], allowedToolActions: {}, iteration: 1 },
+      iteration: 1,
+    } as unknown as ToolPipelineContext;
+    let sequence = 0;
+    return async (args: Record<string, unknown>) => {
+      const metadata: ToolMetadata = {
+        cacheHit: false,
+        blocked: false,
+        isNew: false,
+        durationMs: 0,
+      };
+      sequence++;
+      await executeRuntimeToolCall(
+        { id: `p15-${sequence}`, name: 'code', args },
+        context,
+        metadata
+      );
+      if (!metadata.envelope) {
+        throw new Error('runtime bridge produced no envelope');
+      }
+      return { envelope: metadata.envelope, metadata };
+    };
+  }
+
+  const searchArgs = (patterns: string[]) => ({
+    action: 'search',
+    params: { patterns, contextLines: 0 },
+  });
+  const codes = (warnings: ReadonlyArray<{ code: string }> | undefined): string[] =>
+    (warnings ?? []).map((warning) => warning.code);
+
+  it('reports a repeated all-pattern search as a cache hit so the runtime bridge stops counting a miss', async () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const root = await makeCacheProject();
+    const searchCache = new SearchCache();
+    const set = vi.spyOn(searchCache, 'set');
+    const call = createBridge({ projectRoot: root, searchCache });
+    const args = searchArgs(['alphaNeedle', 'betaNeedle']);
+
+    const first = await call(args);
+    expect(first.envelope.status).toBe('success');
+    expect(first.envelope.cache).toEqual({ hit: false, policy: 'session' });
+    expect(first.metadata.cacheMiss).toBe(true);
+    expect(set).toHaveBeenCalledTimes(2);
+
+    const second = await call(args);
+    expect(second.envelope.status).toBe('success');
+    expect(second.envelope.cache).toEqual({ hit: true, policy: 'session' });
+    expect(second.metadata.cacheHit).toBe(true);
+    expect(second.metadata.cacheMiss).toBeUndefined();
+    expect(second.envelope.structuredContent).toEqual(first.envelope.structuredContent);
+    // 整次命中不再搜索，也不额外带部分命中诊断。
+    expect(set).toHaveBeenCalledTimes(2);
+    expect(codes(second.envelope.diagnostics?.warnings)).not.toContain('code_search_cache_hit');
+  });
+
+  it('marks a partially cached search with code_search_cache_hit without claiming a whole hit', async () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const root = await makeCacheProject();
+    const call = createBridge({ projectRoot: root, searchCache: new SearchCache() });
+    await call(searchArgs(['alphaNeedle']));
+
+    const partial = await call(searchArgs(['alphaNeedle', 'betaNeedle']));
+    expect(partial.envelope.status).toBe('success');
+    expect(partial.envelope.cache?.hit).toBe(false);
+    expect(partial.metadata.cacheMiss).toBe(true);
+    expect(partial.envelope.diagnostics?.degraded).toBe(false);
+    expect(partial.envelope.structuredContent).toMatchObject({ total: 2, shown: 2 });
+    const warning = (partial.envelope.diagnostics?.warnings ?? []).find(
+      (entry) => entry.code === 'code_search_cache_hit'
+    );
+    expect(warning).toMatchObject({ stage: 'code.search', tool: 'code' });
+    expect(warning?.message).toContain('1 of 2');
+
+    // 两个 pattern 此后都已缓存：同一调用再来一次就是整次命中。
+    const whole = await call(searchArgs(['alphaNeedle', 'betaNeedle']));
+    expect(whole.envelope.cache?.hit).toBe(true);
+    expect(whole.metadata.cacheMiss).toBeUndefined();
+  });
+
+  it('counts only unchanged code.read results as cache hits, never delta re-reads', async () => {
+    const root = await makeCacheProject();
+    const lines = Array.from({ length: 30 }, (_, index) => `export const line${index} = ${index};`);
+    await writeFile(join(root, 'src/c.ts'), lines.join('\n'));
+    const call = createBridge({ projectRoot: root, deltaCache: new DeltaCache() });
+    const read = { action: 'read', params: { path: 'src/c.ts' } };
+
+    const first = await call(read);
+    expect(first.envelope.ok).toBe(true);
+    expect(first.envelope.cache?.hit).toBe(false);
+    expect(first.metadata.cacheMiss).toBe(true);
+
+    const unchanged = await call(read);
+    expect(unchanged.envelope.structuredContent).toBe('[unchanged since last read]');
+    expect(unchanged.envelope.cache).toEqual({ hit: true, policy: 'session' });
+    expect(unchanged.metadata.cacheHit).toBe(true);
+    expect(unchanged.metadata.cacheMiss).toBeUndefined();
+
+    const edited = [...lines];
+    edited[15] = 'export const line15 = -1;';
+    await writeFile(join(root, 'src/c.ts'), edited.join('\n'));
+    const delta = await call(read);
+    expect(String(delta.envelope.structuredContent)).toMatch(/^\[delta: 1 hunk\(s\)\]/);
+    expect(delta.envelope.cache?.hit).toBe(false);
+    expect(delta.metadata.cacheMiss).toBe(true);
+  });
+
+  it('treats a batch read as a hit only when every requested file is unchanged', async () => {
+    const root = await makeCacheProject();
+    const call = createBridge({ projectRoot: root, deltaCache: new DeltaCache() });
+    const batch = (filePaths: string[]) => ({ action: 'read', params: { filePaths } });
+
+    expect((await call(batch(['src/a.ts', 'src/b.ts']))).envelope.cache?.hit).toBe(false);
+    const repeated = await call(batch(['src/a.ts', 'src/b.ts']));
+    expect(repeated.envelope.cache?.hit).toBe(true);
+    expect(repeated.metadata.cacheMiss).toBeUndefined();
+
+    // 一个 unchanged 加一个失败的文件不是整次命中。
+    const mixed = await call(batch(['src/a.ts', 'src/missing.ts']));
+    expect(mixed.envelope.ok).toBe(true);
+    expect(mixed.envelope.cache?.hit).toBe(false);
+  });
+
+  it('invalidates cached searches on code.write and logs the invalidation without file content', async () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const root = await makeCacheProject();
+    const call = createBridge({
+      projectRoot: root,
+      searchCache: new SearchCache(),
+      deltaCache: new DeltaCache(),
+    });
+    expect((await call(searchArgs(['alphaNeedle']))).envelope.structuredContent).toMatchObject({
+      total: 1,
+    });
+    await call({ action: 'read', params: { path: 'src/a.ts' } });
+    const written = await call({
+      action: 'write',
+      params: { path: 'src/a.ts', content: 'export const renamedSecretValue = 1;\n' },
+    });
+    expect(written.envelope.ok).toBe(true);
+
+    const lines = info.mock.calls
+      .map((args) => String(args[0]))
+      .filter((line) => line.includes('search cache invalidated'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('source=code.write');
+    expect(lines[0]).toContain('generation=1');
+    expect(lines[0]).not.toContain('renamedSecretValue');
+
+    const after = await call(searchArgs(['alphaNeedle']));
+    expect(after.envelope.cache?.hit).toBe(false);
+    expect(after.envelope.structuredContent).toMatchObject({ total: 0 });
   });
 });

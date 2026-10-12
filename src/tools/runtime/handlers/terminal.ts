@@ -31,6 +31,13 @@
  *           opts.intent，仍按固定 profile 执行。没有声明 intent 时 opts 与旧版完全相同；宿主不读
  *           该字段时行为不变。命令最终没有进沙箱（宿主报告降级或走 plain exec）时，声明的 intent
  *           必然没生效，结果里追加 terminal_intent_not_enforced 诊断。
+ *
+ * 搜索缓存失效（L4-P15 / I05）: 执行器一旦被调用（Seatbelt 执行器或显式许可的 plain exec），在它 settle
+ *           之后推进 code.search 的缓存代数（./searchCacheGeneration.ts，与 code.write 共用），并记
+ *           search cache invalidated 日志。成功、非零退出、137 强杀、超时、执行器抛错一律推进：进程可能
+ *           已经（部分）写盘，allowlist 里的 npm/vitest/eslint 也会写格式化结果、产物或缓存文件，按命令
+ *           判断“只读”不可靠。参数无效、安全规则、allowlist、缺沙箱、cwd 越界在调用执行器之前就返回，
+ *           不推进。不做 mtime/TTL 失效（待决事项①）。
  */
 
 import { exec } from 'node:child_process';
@@ -54,6 +61,7 @@ import {
   type ToolResultMeta,
 } from '#tools/kernel/registry.js';
 import { stripAnsi } from '../compressor/strip.js';
+import { invalidateSearchCache } from './searchCacheGeneration.js';
 import { checkTerminalCommandAllowlist, checkTerminalCommandSafety } from './terminalSafety.js';
 
 const execAsync = promisify(exec);
@@ -177,7 +185,7 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
   const inputWarnings: ToolDiagnosticWarning[] = timeoutWarning ? [timeoutWarning] : [];
 
   try {
-    const { stdout, stderr, exitCode, diagnostics, warnings } = await execInSandboxOrDirect(
+    const { stdout, stderr, exitCode, diagnostics, warnings } = await execAndInvalidateSearchCache(
       command,
       cwd,
       timeout,
@@ -376,6 +384,33 @@ function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'tim
     return 'error';
   }
   return isDeadlineAbort(signal) ? 'timeout' : 'aborted';
+}
+
+/**
+ * 调用执行器，并在它 settle 之后（finally）推进 code.search 的缓存代数（L4-P15 / I05）。
+ * 放在 settle 之后而不是调用之前：执行期间并发的 code.search 以旧代数写入的条目，也会在这里一并失效。
+ * outcome 只记退出码或抛错的错误类名，不含命令原文、路径或输出；失效日志由 invalidateSearchCache 输出，
+ * 日志失败不影响执行结果。
+ */
+async function execAndInvalidateSearchCache(
+  command: string,
+  cwd: string,
+  timeout: number,
+  ctx: ToolContext,
+  intent: TerminalExecIntent | undefined
+): Promise<TerminalExecutionResult> {
+  // 默认值只在 finally 前既没返回也没进 catch 时生效（理论上不可达），仍保证日志有确定取值。
+  let outcome = 'unknown';
+  try {
+    const result = await execInSandboxOrDirect(command, cwd, timeout, ctx, intent);
+    outcome = `exit=${result.exitCode}`;
+    return result;
+  } catch (err: unknown) {
+    outcome = `executor-threw:${errorNameOf(err)}`;
+    throw err;
+  } finally {
+    invalidateSearchCache(ctx.searchCache, 'terminal.exec', outcome);
+  }
 }
 
 /**

@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
@@ -15,7 +24,12 @@ import {
 } from '../src/tools/runtime/handlers/terminalSafety.js';
 
 import type { ToolAuditEntry, ToolContext } from '../src/tools/runtime/index.js';
-import { Evolution, OutputCompressor, ToolRouter } from '../src/tools/runtime/index.js';
+import {
+  Evolution,
+  OutputCompressor,
+  SearchCache,
+  ToolRouter,
+} from '../src/tools/runtime/index.js';
 
 let projectRoot: string;
 beforeAll(() => {
@@ -2020,6 +2034,198 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expect(lines.join('\n')).not.toContain('secret-value');
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+// ─── L4-P15 terminal.exec 之后失效 code.search 缓存（I05：U12-F2）─────────────────────────
+// 搜索缓存的失效代数曾是 code.ts 私有 WeakMap，只有 code.write 推进；terminal.exec（sed -i、格式化器、
+// codegen，乃至 allowlist 里会写缓存文件的 npm/vitest/eslint）写盘后同一视图的 code.search 仍返回旧行号。
+// 决策：执行器一旦被调用（成功、非零退出、强杀、抛错都算）就推进代数并记 search cache invalidated 日志；
+// 安全规则、allowlist、缺沙箱、cwd 越界拦截而未启动进程的不推进，同一视图的搜索继续命中缓存。
+describe('terminal.exec invalidates the code.search cache once the executor runs (L4-P15)', () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const root of roots) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  const ORIGINAL = 'one\ntwo\nthree\n';
+  const REWRITTEN = 'one\nfour\nthree\n';
+
+  function makeSearchProject(): string {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'agent-p15-terminal-')));
+    roots.push(root);
+    writeFileSync(path.join(root, 'small.ts'), ORIGINAL);
+    return root;
+  }
+
+  async function searchTwo(router: ToolRouter, ctx: ToolContext) {
+    const result = await router.execute(
+      { tool: 'code', action: 'search', params: { patterns: ['two'], contextLines: 0 } },
+      ctx
+    );
+    expect(result.ok).toBe(true);
+    return {
+      total: (result.data as { total: number }).total,
+      cached: result._meta?.cached,
+    };
+  }
+
+  function invalidationLines(info: { mock: { calls: unknown[][] } }): string[] {
+    return info.mock.calls
+      .map((args) => String(args[0]))
+      .filter((line) => line.includes('search cache invalidated'));
+  }
+
+  type InvokedMode = 'exit0' | 'exit1' | 'exit137' | 'throw' | 'timeout' | 'plain-exec';
+
+  it.each<InvokedMode>([
+    'exit0',
+    'exit1',
+    'exit137',
+    'throw',
+    'timeout',
+    'plain-exec',
+  ])('re-runs code.search after the executor was invoked (%s)', async (mode) => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      const root = makeSearchProject();
+      const searchCache = new SearchCache();
+      const router = new ToolRouter();
+      const searchCtx: ToolContext = { projectRoot: root, tokenBudget: 4000, searchCache };
+      expect(await searchTwo(router, searchCtx)).toEqual({ total: 1, cached: false });
+
+      const controller = new AbortController();
+      let executions = 0;
+      // 执行器桩先真实改写磁盘，再按模式给出退出结局：进程可能在失败/强杀/超时前已经写过盘。
+      const sandboxExecutor = {
+        exec: async () => {
+          executions++;
+          writeFileSync(path.join(root, 'small.ts'), REWRITTEN);
+          if (mode === 'exit0' || mode === 'exit1' || mode === 'exit137') {
+            return { stdout: 'done', stderr: '', exitCode: Number(mode.slice(4)) };
+          }
+          if (mode === 'timeout') {
+            controller.abort(new DOMException('fixture deadline', 'TimeoutError'));
+          }
+          throw new Error('fixture executor failed after writing');
+        },
+      };
+      const command = "sed -i '' s/two/four/ small.ts";
+      const terminalCtx: ToolContext =
+        mode === 'plain-exec'
+          ? { projectRoot: root, tokenBudget: 4000, searchCache, allowUnsandboxedTerminal: true }
+          : {
+              projectRoot: root,
+              tokenBudget: 4000,
+              searchCache,
+              sandboxExecutor,
+              abortSignal: controller.signal,
+            };
+      const terminal = await runTerminalExec(
+        mode === 'plain-exec' ? "printf 'one\\nfour\\nthree\\n' > small.ts" : command,
+        terminalCtx
+      );
+      expect(terminal.ok).toBe(true);
+      expect(readFileSync(path.join(root, 'small.ts'), 'utf8')).toBe(REWRITTEN);
+      expect(executions).toBe(mode === 'plain-exec' ? 0 : 1);
+
+      // 同一 SearchCache 上的下一次搜索必须重新执行，看到的是磁盘上的新内容。
+      expect(await searchTwo(router, searchCtx)).toEqual({ total: 0, cached: false });
+
+      const lines = invalidationLines(info);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('source=terminal.exec');
+      expect(lines[0]).toContain('generation=1');
+      expect(lines[0]).not.toContain('small.ts');
+      expect(lines[0]).not.toContain('sed');
+    } finally {
+      info.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  type BlockedCase = {
+    name: string;
+    command: string;
+    params?: Record<string, unknown>;
+    evolution?: boolean;
+    withExecutor: boolean;
+  };
+
+  it.each<BlockedCase>([
+    {
+      name: 'dangerous-command rule',
+      command: 'sudo sed -i s/two/four/ small.ts',
+      withExecutor: true,
+    },
+    {
+      name: 'Evolution allowlist',
+      command: 'sed -i s/two/four/ small.ts',
+      evolution: true,
+      withExecutor: true,
+    },
+    {
+      name: 'missing sandbox executor',
+      command: 'sed -i s/two/four/ small.ts',
+      withExecutor: false,
+    },
+    {
+      name: 'cwd outside the project',
+      command: 'sed -i s/two/four/ small.ts',
+      params: { cwd: '../..' },
+      withExecutor: true,
+    },
+  ])('keeps the cached search when $name blocks the command before execution', async ({
+    command,
+    params,
+    evolution,
+    withExecutor,
+  }) => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      const root = makeSearchProject();
+      const searchCache = new SearchCache();
+      const router = new ToolRouter();
+      const searchCtx: ToolContext = { projectRoot: root, tokenBudget: 4000, searchCache };
+      expect(await searchTwo(router, searchCtx)).toEqual({ total: 1, cached: false });
+
+      let executions = 0;
+      const terminal = await runTerminalExec(
+        command,
+        {
+          projectRoot: root,
+          tokenBudget: 4000,
+          searchCache,
+          ...(withExecutor
+            ? {
+                sandboxExecutor: {
+                  exec: async () => {
+                    executions++;
+                    return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+                  },
+                },
+              }
+            : {}),
+        },
+        params,
+        evolution ? new ToolRouter({ capability: new Evolution().toDef() }) : router
+      );
+      expect(terminal.ok).toBe(false);
+      expect(executions).toBe(0);
+
+      // 进程从未启动：缓存代数不变，同一视图的搜索继续命中，并如实标记 cached。
+      expect(await searchTwo(router, searchCtx)).toEqual({ total: 1, cached: true });
+      expect(invalidationLines(info)).toEqual([]);
+    } finally {
+      info.mockRestore();
+      vi.unstubAllEnvs();
     }
   });
 });
