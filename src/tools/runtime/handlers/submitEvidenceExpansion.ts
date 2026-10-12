@@ -19,6 +19,7 @@ import { type OperationOptions, runOperation } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import { extractJSON } from '#shared/structuredOutput.js';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
+import { classifyUnresolvedEvidenceRef } from './evidence.js';
 
 export type SubmitExpansionResult =
   // resolvedRefs=成功解析的台账引用数（含无 file 的 search/structure/terminal 条目）；
@@ -75,6 +76,11 @@ export function expandEvidenceRefsForSubmit(
   for (const ref of refs) {
     const entry = ledger.get(ref);
     if (!entry) {
+      // I21：基础 id 存在但子区间越界/落在截断尾部时给出可用区间，不再误报为 id 不存在
+      const failure = classifyUnresolvedEvidenceRef(ledger, ref, 'knowledge.submit');
+      if (failure.detail) {
+        return { ok: false, error: `Validation failed: reasoning.evidenceRefs ${failure.detail}` };
+      }
       const recent = ledger
         .listRecent(3)
         .map((candidate) => (candidate.file ? `${candidate.id}=${candidate.file}` : candidate.id))

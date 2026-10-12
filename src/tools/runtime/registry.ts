@@ -362,7 +362,7 @@ const KNOWLEDGE_SPEC: ToolSpec = {
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                  'Evidence ledger entry ids from [evidence] annotations (e.g. ["E-3","E-7@5-12"]). sources are mechanically expanded and freshness-checked; coreCode is never backfilled and must match a bounded citation.',
+                  'Evidence ledger entry ids from [evidence] annotations (e.g. ["E-3","E-7@5-12"]). Sub-range coordinates: entries with a file range use file line numbers inside that range; entries without a range use 1-based line numbers within the entry. sources are mechanically expanded and freshness-checked; coreCode is never backfilled and must match a bounded citation.',
               },
               confidence: { type: 'number' },
             },
@@ -587,7 +587,7 @@ const MEMORY_SPEC: ToolSpec = {
             items: { type: 'string' },
             minItems: 1,
             description:
-              'Evidence ledger entry ids cited from [evidence] annotations in tool results, e.g. ["E-3", "E-7@5-12"]. Hand-written file:line strings are rejected.',
+              'Evidence ledger entry ids cited from [evidence] annotations in tool results, e.g. ["E-3", "E-7@5-12"]. Sub-range coordinates: entries with a file range use file line numbers inside that range; entries without a range use 1-based line numbers within the entry. Hand-written file:line strings are rejected.',
           },
           excerpt: {
             type: 'string',
@@ -702,13 +702,14 @@ const EVIDENCE_SPEC: ToolSpec = {
     get: {
       summary: 'Retrieve a captured evidence entry verbatim by id',
       description:
-        'Read back the verbatim content of an evidence-ledger entry cited from [evidence] annotations in tool results. Accepts "E-3" or a sub-range "E-3@5-12". Read-only; never touches the file system.',
+        'Read back the verbatim content of an evidence-ledger entry cited from [evidence] annotations in tool results. Accepts "E-3" or a sub-range "E-3@start-end": entries with a file range (e.g. E-3=lib/a.ts:200-450) take file line numbers inside that range ("E-3@319-360"); entries without a range take 1-based line numbers within the entry. Lines cut off by the ledger entry cap are not retrievable. Read-only; never touches the file system.',
       params: {
         type: 'object',
         properties: {
           ref: {
             type: 'string',
-            description: 'Entry id, optionally with 1-indexed sub-range: "E-3" / "E-3@5-12"',
+            description:
+              'Entry id, optionally with a sub-range: "E-3" / "E-3@start-end". Entries with a file range use file line numbers inside that range; entries without a range use 1-based line numbers within the entry.',
           },
         },
         required: ['ref'],

@@ -14,6 +14,7 @@ import {
   type ToolContext,
   type ToolResult,
 } from '#tools/kernel/registry.js';
+import { classifyUnresolvedEvidenceRef, EVIDENCE_SUBRANGE_COORDINATE_NOTE } from './evidence.js';
 
 /**
  * P4/C10: 把 note_finding 的可选结构化深度槽(designIntent/boundaries/failureModes/tradeoffs)序列化成
@@ -112,7 +113,7 @@ async function handleNoteFinding(
         ? '（收到旧版 "evidence" 自由文本参数——该形态已退役）'
         : '';
     return fail(
-      `note_finding 需要 "evidenceRefs"：引用工具返回尾部 [evidence] 标注过的台账条目 id（如 ["E-3","E-7@5-12"]）${legacyHint}。手写 file:line 不再被接受。`
+      `note_finding 需要 "evidenceRefs"：引用工具返回尾部 [evidence] 标注过的台账条目 id（如 ["E-3","E-7@5-12"]；子区间坐标: ${EVIDENCE_SUBRANGE_COORDINATE_NOTE}）${legacyHint}。手写 file:line 不再被接受。`
     );
   }
 
@@ -138,6 +139,11 @@ async function handleNoteFinding(
     for (const ref of refs) {
       const entry = ledger.get(ref);
       if (!entry) {
+        // I21：基础 id 存在但子区间越界/落在截断尾部时给出可用区间，不再误报为 id 不存在
+        const failure = classifyUnresolvedEvidenceRef(ledger, ref, 'memory.note_finding');
+        if (failure.detail) {
+          return fail(`evidenceRefs ${failure.detail}`);
+        }
         const recent = ledger
           .listRecent(3)
           .map((item) => (item.file ? `${item.id}=${item.file}` : item.id))
