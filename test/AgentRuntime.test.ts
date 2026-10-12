@@ -1622,3 +1622,149 @@ describe('I06 record-only stage keeps its final round recordable', () => {
     expect(calls[2]?.messages).not.toContain('note_finding({ finding');
   });
 });
+
+describe('I08 local LLM input assembly defects are not provider errors', () => {
+  // 本地装配缺陷注入点：pipelinePhase=analyze 让 #callLLM 走 provider 输入预算投影，
+  // 投影委托给注入的 ContextWindow；只有这一步抛 TypeError，模拟确定性的本地缺陷（重试必然再失败）。
+  function createAssemblyDefectRun(source: 'user' | 'system') {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    const info = vi.fn();
+    const warn = vi.fn();
+    runtime.logger = { info, warn };
+    const contextWindow = new ContextWindow();
+    const projection = vi
+      .spyOn(contextWindow, 'compactForProviderInputBudget')
+      .mockImplementation(() => {
+        throw new TypeError('local assembly defect');
+      });
+    let settled = false;
+    const pending = runtime
+      .reactLoop('hello', {
+        source,
+        contextWindow,
+        context: { pipelinePhase: 'analyze' },
+        budgetOverride: { maxIterations: 3, timeoutMs: 60_000 },
+      })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    return { chatWithTools, warn, projection, pending, isSettled: () => settled };
+  }
+
+  it.each([
+    'user',
+    'system',
+  ] as const)('terminates a %s run as runtime_defect without provider retry, breaker strike or forced summary', async (source) => {
+    const run = createAssemblyDefectRun(source);
+    try {
+      // 旧实现会把本地缺陷当 provider 错误进入 2s 重试等待（计时器）；这里只冲刷微任务、
+      // 不让出事件循环，正确实现必须在没有任何重试等待的情况下直接结束。
+      for (let i = 0; i < 400 && !run.isSettled(); i++) {
+        await Promise.resolve();
+      }
+      expect(run.isSettled()).toBe(true);
+      const result = await run.pending;
+
+      // 装配只执行一次：不重试同一输入，provider 与强制摘要都不被调用。
+      expect(run.projection).toHaveBeenCalledOnce();
+      expect(run.chatWithTools).not.toHaveBeenCalled();
+      const diagnostics = result.diagnostics;
+      expect(diagnostics?.aiErrorCount).toBe(0);
+      expect(diagnostics?.efficiency?.cancelReason).toBe('runtime_defect');
+      expect(diagnostics?.efficiency?.forcedSummary).toBe(false);
+      expect(diagnostics?.degraded).toBe(true);
+      const codes = (diagnostics?.warnings ?? []).map((warning) => warning.code);
+      expect(codes).toContain('llm_input_assembly_failed');
+      expect(codes).not.toContain('ai_error');
+      expect(diagnostics?.warnings).toContainEqual({
+        code: 'llm_input_assembly_failed',
+        message: expect.stringContaining('TypeError: local assembly defect'),
+      });
+      expect(result.reply).not.toContain('AI 服务暂时不可用');
+      if (source === 'system') {
+        expect(result.reply).toContain('[run stopped: runtime_defect]');
+      } else {
+        expect(result.reply).toContain('TypeError: local assembly defect');
+      }
+
+      // 运行日志带错误名与堆栈，且不再记成 AI 调用失败。
+      const assemblyLog = run.warn.mock.calls.find(([message]) =>
+        String(message).includes('LLM input assembly failed')
+      );
+      expect(assemblyLog?.[1]).toMatchObject({
+        code: 'llm_input_assembly_failed',
+        errorName: 'TypeError',
+        error: 'local assembly defect',
+        stack: expect.stringContaining('local assembly defect'),
+      });
+      const loggedMessages = run.warn.mock.calls.map(([message]) => String(message));
+      expect(loggedMessages.some((message) => message.includes('AI call failed'))).toBe(false);
+      expect(loggedMessages.some((message) => message.includes('LLM call failed'))).toBe(false);
+    } finally {
+      // 断言失败时也等运行收尾，避免悬挂的循环泄漏到后续用例。
+      await run.pending;
+    }
+  });
+
+  it('records the provider rejection text when the provider rejects with a non-Error value', async () => {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    const warn = vi.fn();
+    runtime.logger = { info: vi.fn(), warn };
+    chatWithTools.mockRejectedValue('provider rejected with plain string');
+    // 重试等待来自 node:timers/promises，不受 vi 假计时器控制；这里如实等待一次 2s 重试。
+    const result = await runtime.reactLoop('hello', {
+      budgetOverride: { maxIterations: 3, timeoutMs: 60_000 },
+    });
+    // 真正的 provider 错误仍走 2-strike：两次调用、两次 ai_error、cancelReason=provider_error。
+    expect(chatWithTools).toHaveBeenCalledTimes(2);
+    expect(result.diagnostics?.aiErrorCount).toBe(2);
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('provider_error');
+    const aiErrorMessages = (result.diagnostics?.warnings ?? [])
+      .filter((warning) => warning.code === 'ai_error')
+      .map((warning) => warning.message);
+    expect(aiErrorMessages).toEqual([
+      'provider rejected with plain string',
+      'provider rejected with plain string',
+    ]);
+    expect(result.reply).toContain('AI 服务暂时不可用（provider rejected with plain string）');
+    // 运行日志同样记录归一后的文本，并标明这是非 Error 的 rejection。
+    const failureLog = warn.mock.calls.find(([message]) =>
+      String(message).includes('LLM call failed')
+    );
+    expect(failureLog?.[1]).toMatchObject({
+      error: 'provider rejected with plain string',
+      nonErrorRejection: true,
+    });
+    expect(
+      warn.mock.calls.some(
+        ([message]) =>
+          String(message).includes('AI call failed (attempt 1)') &&
+          String(message).endsWith(': provider rejected with plain string')
+      )
+    ).toBe(true);
+  });
+
+  it.each([
+    ['Error with code', Object.assign(new Error('breaker tripped'), { code: 'CIRCUIT_OPEN' })],
+    ['plain object', { code: 'CIRCUIT_OPEN', message: 'breaker tripped' }],
+  ])('keeps circuit-open detection for a provider rejection shaped as %s', async (_label, rejection) => {
+    const { runtime, chatWithTools } = createRuntimeForReactLoop();
+    runtime.logger = { info: vi.fn(), warn: vi.fn() };
+    chatWithTools.mockRejectedValue(rejection);
+
+    const result = await runtime.reactLoop('hello', {
+      budgetOverride: { maxIterations: 3, timeoutMs: 60_000 },
+    });
+
+    // 熔断立即退出：只调用一次 provider，不等待重试。
+    expect(chatWithTools).toHaveBeenCalledOnce();
+    expect(result.diagnostics?.aiErrorCount).toBe(1);
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('provider_circuit_open');
+    expect(result.diagnostics?.warnings).toContainEqual({
+      code: 'ai_error',
+      message: 'breaker tripped',
+    });
+    expect(result.reply).toContain('AI 服务暂时不可用（breaker tripped）');
+  });
+});

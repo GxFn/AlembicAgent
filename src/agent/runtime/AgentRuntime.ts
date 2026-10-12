@@ -160,6 +160,20 @@ interface RuntimeToolContract {
   ids: string[];
 }
 
+/** 本地装配完成、即将发给 provider 的输入（I08：装配与 provider 调用分属两个异常边界）。 */
+interface LlmDispatchInput {
+  effectiveToolChoice: string;
+  messages: ReturnType<typeof buildLlmInputAssembly>['providerMessages'];
+  /** observe-only 的 provider tool-choice mode，供工具抑制判定使用。 */
+  providerToolChoiceMode: string | null;
+  tools: ReturnType<typeof selectLlmInputTools>['tools'];
+}
+
+/** I08：本地输入装配失败的诊断码；与 provider 的 ai_error 区分，宿主据此判断是运行缺陷而非上游故障。 */
+const LLM_INPUT_ASSEMBLY_FAILED_CODE = 'llm_input_assembly_failed';
+/** I08：本地运行缺陷终止的 cancelReason；不与 provider_error / provider_circuit_open 混用。 */
+const RUNTIME_DEFECT_CANCEL_REASON = 'runtime_defect';
+
 // 单个模块级 ALS 随 runtime 模块存活，避免每个短命 Agent 实例创建需 disable 的 ALS。
 // owner 校验使嵌套的另一个 runtime 有自己的 run，不会误继承父 runtime 的工具会话。
 const toolResourceRun = new AsyncLocalStorage<{
@@ -1193,127 +1207,48 @@ export class AgentRuntime {
       return null;
     }
 
-    let llmResult: LLMResult;
-    // provider tool-choice mode（observe-only）：在 try 内随 effectiveToolChoice 计算一次，
-    // 跨 try/catch 携带到工具抑制判定，替代「写入 PCV burn 再读回」的 R4 往返。
-    let providerToolChoiceMode: string | null = null;
+    // I08：异常边界按来源拆成两段。输入装配是纯本地确定性步骤，异常只可能是运行时缺陷，
+    // 用同一输入重试必然再失败；它不能进入 provider 的 2-strike / 熔断 / 重试恢复链路。
+    let dispatchInput: LlmDispatchInput | null;
     try {
-      const inputTools = selectLlmInputTools(
-        { tracker: ctx.tracker, context: ctx.context },
-        this.#modelRef,
+      dispatchInput = this.#assembleLlmInput(
+        ctx,
         toolChoice,
-        toolSchemas
-      );
-      const { tools: unifiedTools, effectiveToolChoice, providerDecisionMode } = inputTools;
-      providerToolChoiceMode = inputTools.observedToolChoiceMode;
-
-      const inputStageProfile = resolveLlmInputStageProfile(ctx, toolChoice, effectiveToolChoice);
-      const providerInputBudget = resolveProviderInputBudget(inputStageProfile);
-      const inputProjection = providerInputBudget
-        ? ctx.messages.compactForProviderInputBudget({
-            ...providerInputBudget,
-            stageProfile: inputStageProfile,
-          })
-        : null;
-
-      // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
-      const projected =
-        ctx.messages.toProjectedMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
-      const llmInputAssembly = buildLlmInputAssembly({
-        ctx,
+        toolSchemas,
+        effectiveSystemPrompt,
         dynamicContext,
-        effectiveToolChoice,
-        inputProjection: inputProjection ? { ...inputProjection } : null,
-        messages: projected,
-        modelRef: this.#modelRef,
-        requestedToolChoice: toolChoice,
-        systemPrompt: effectiveSystemPrompt,
-        tools: unifiedTools,
-      });
-      recordPcvInputAssembly(ctx.pcvNodeEvidence, llmInputAssembly, {
-        deepseekV4ToolChoiceMode: providerToolChoiceMode, // provider-name-ok: recorded evidence field key
-        effectiveToolChoice,
-        iteration: ctx.iteration,
-        modelRef: this.#modelRef,
-        requestedToolChoice: toolChoice,
-      });
-      const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
-      // 上限来源随 loop 在 #initLoop 解析；诊断消息与日志都带 limitSource，宿主能区分
-      // “模型窗口偏小”（model-registry）、“显式覆盖”（explicit）与“未登记模型的 128k 默认”（default）。
-      const providerInputLimit = this.#providerInputLimits.get(ctx);
-      const llmInputValidation = validateLlmInputSize(
-        ctx.budget,
-        llmInputMeasurement,
-        providerInputLimit?.source
+        llmTrace
       );
-      if (!llmInputValidation.ok) {
-        ctx.diagnostics?.warn({
-          code: llmInputValidation.code,
-          message: llmInputValidation.message,
-        });
-        this.logger.warn(
-          `[AgentRuntime] LLM input rejected ${formatLoopTrace(llmTrace)}: ${llmInputValidation.message}`,
-          {
-            ...llmTrace,
-            code: llmInputValidation.code,
-            estimatedTokens: llmInputValidation.estimatedTokens,
-            maxTokens: llmInputValidation.maxTokens,
-            limitSource: llmInputValidation.limitSource,
-            registryModelId: providerInputLimit?.registryModelId ?? null,
-            contextWindow: providerInputLimit?.contextWindow ?? null,
-            outputReserveTokens: providerInputLimit?.outputReserveTokens ?? null,
-          }
-        );
-        if (!ctx.isSystem) {
-          ctx.lastReply = `抱歉，当前请求输入过长（${llmInputValidation.estimatedTokens}/${llmInputValidation.maxTokens} tokens）。请缩短输入后重试。`;
-        }
-        return null;
-      }
-      const unifiedMessages = llmInputAssembly.providerMessages;
-      const llmInputProcessEvent = buildAgentProcessEvent(
-        ctx,
-        projectLlmInputEvent(llmInputAssembly, llmInputMeasurement, {
-          trace: llmTrace,
-          modelRef: this.#modelRef,
-          dynamicContext,
-          requestedToolChoice: toolChoice,
-          effectiveToolChoice,
-        })
-      );
-      this.#hookSystem.emitSync('llm:call:before', {
-        iteration: ctx.iteration,
-        toolChoice: effectiveToolChoice,
-        processEvent: llmInputProcessEvent,
-      });
-      this.#emitProcessProgress(llmInputProcessEvent);
+    } catch (assemblyErr: unknown) {
+      return this.#handleLlmInputAssemblyFailure(ctx, assemblyErr, llmTrace, llmStartedAt);
+    }
+    if (!dispatchInput) {
+      // 输入超限已在装配阶段写入诊断与回复，这里只结束本轮。
+      return null;
+    }
+    const { effectiveToolChoice, messages: unifiedMessages, tools: unifiedTools } = dispatchInput;
+    // provider tool-choice mode（observe-only）：装配阶段随 effectiveToolChoice 计算一次，
+    // 携带到工具抑制判定，替代「写入 PCV burn 再读回」的 R4 往返。
+    const providerToolChoiceMode = dispatchInput.providerToolChoiceMode;
 
-      // 冷启动链路里第一轮经常最慢；必须先打印“请求已发出”的结构化日志，
-      // 否则 Dashboard 只能看到 filling，不知道是在等模型、走重试还是已经被 abort。
-      this.logger.info(`[AgentRuntime] LLM call start ${formatLoopTrace(llmTrace)}`, {
+    // 方案①：统一经 aiProvider.chatWithTools 调用；provider 内部已委托 LLMGateway + Transport，
+    // 不再保留 runtime 级 gateway/provider 双分支（横切能力由 provider 背后的 gateway 统一承担）。
+    // Hook、进度和日志都是可执行的宿主回调；最后一个观察点之后再次确认取消，
+    // 不能依赖默认gateway替任意注入provider阻止已经取消的调用。
+    if (ctx.abortSignal?.aborted) {
+      ctx.diagnostics?.recordCancelReason('abort_signal');
+      recordAbortRecoveryDiagnostic(ctx, 'AbortSignal was aborted before provider dispatch');
+      this.logger.info(`[AgentRuntime] LLM dispatch cancelled ${formatLoopTrace(llmTrace)}`, {
         ...llmTrace,
-        messageCount: unifiedMessages.length,
-        hasDynamicContext: Boolean(dynamicContext),
-        deepseekV4ToolChoiceMode: providerDecisionMode, // provider-name-ok: recorded evidence field key
-        requestedToolChoice: toolChoice,
-        effectiveToolChoice,
-        toolSchemaCount: unifiedTools?.length || 0,
-        timeoutMs: ctx.budget.timeoutMs || null,
-        maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
+        abortReason: stringifyAbortReason(ctx.abortSignal.reason),
       });
+      return null;
+    }
 
-      // 方案①：统一经 aiProvider.chatWithTools 调用；provider 内部已委托 LLMGateway + Transport，
-      // 不再保留 runtime 级 gateway/provider 双分支（横切能力由 provider 背后的 gateway 统一承担）。
-      // Hook、进度和日志都是可执行的宿主回调；最后一个观察点之后再次确认取消，
-      // 不能依赖默认gateway替任意注入provider阻止已经取消的调用。
-      if (ctx.abortSignal?.aborted) {
-        ctx.diagnostics?.recordCancelReason('abort_signal');
-        recordAbortRecoveryDiagnostic(ctx, 'AbortSignal was aborted before provider dispatch');
-        this.logger.info(`[AgentRuntime] LLM dispatch cancelled ${formatLoopTrace(llmTrace)}`, {
-          ...llmTrace,
-          abortReason: stringifyAbortReason(ctx.abortSignal.reason),
-        });
-        return null;
-      }
+    // provider 错误边界只包住真正的 provider 调用（含成功后清零连续错误计数）：
+    // 只有这里的异常才计入 consecutiveAiErrors、记 ai_error 并走重试 / 熔断恢复。
+    let llmResult: LLMResult;
+    try {
       llmResult = (await this.aiProvider.chatWithTools(ctx.prompt, {
         messages: unifiedMessages,
         toolSchemas: unifiedTools,
@@ -1325,14 +1260,17 @@ export class AgentRuntime {
       })) as LLMResult;
       ctx.consecutiveAiErrors = 0;
     } catch (aiErr: unknown) {
+      const normalized = normalizeAiError(aiErr);
       this.logger.warn(`[AgentRuntime] LLM call failed ${formatLoopTrace(llmTrace)}`, {
         ...llmTrace,
         durationMs: Date.now() - llmStartedAt,
-        error: aiErr instanceof Error ? aiErr.message : String(aiErr),
+        error: normalized.message,
+        errorCode: normalized.code ?? null,
+        nonErrorRejection: !(aiErr instanceof Error),
         abortSignal: ctx.abortSignal?.aborted === true,
         abortReason: stringifyAbortReason(ctx.abortSignal?.reason),
       });
-      return this.#handleAiError(ctx, aiErr as AiError);
+      return this.#handleAiError(ctx, aiErr);
     }
 
     // 累计 Token (BudgetController 管理 runtime 级, LoopContext 管理 loop 级)
@@ -1440,10 +1378,184 @@ export class AgentRuntime {
   }
 
   /**
+   * LLM 输入装配（I08 本地边界）— 工具可见性、provider 输入预算投影、消息装配、PCV 输入记录、
+   * 测量与上限校验，以及发出前的 Hook / 进度 / 启动日志观察点。全程不触达 provider：
+   * 这里抛出的任何异常都是本地运行时缺陷，由 #callLLM 交给 #handleLlmInputAssemblyFailure，
+   * 不能计入 provider 错误。
+   *
+   * @returns 发送给 provider 的输入；输入超限时返回 null（诊断与回复已写入）
+   */
+  #assembleLlmInput(
+    ctx: LoopContext,
+    toolChoice: string,
+    toolSchemas: Array<Record<string, unknown>>,
+    effectiveSystemPrompt: string,
+    dynamicContext: string | null,
+    llmTrace: Record<string, unknown>
+  ): LlmDispatchInput | null {
+    const inputTools = selectLlmInputTools(
+      { tracker: ctx.tracker, context: ctx.context },
+      this.#modelRef,
+      toolChoice,
+      toolSchemas
+    );
+    const { tools: unifiedTools, effectiveToolChoice, providerDecisionMode } = inputTools;
+    const providerToolChoiceMode = inputTools.observedToolChoiceMode;
+
+    const inputStageProfile = resolveLlmInputStageProfile(ctx, toolChoice, effectiveToolChoice);
+    const providerInputBudget = resolveProviderInputBudget(inputStageProfile);
+    const inputProjection = providerInputBudget
+      ? ctx.messages.compactForProviderInputBudget({
+          ...providerInputBudget,
+          stageProfile: inputStageProfile,
+        })
+      : null;
+
+    // 构建 LLM 输入消息 — projected messages + ephemeral runtime input layer
+    const projected =
+      ctx.messages.toProjectedMessages() as import('#ai/AiProvider.js').UnifiedMessage[];
+    const llmInputAssembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext,
+      effectiveToolChoice,
+      inputProjection: inputProjection ? { ...inputProjection } : null,
+      messages: projected,
+      modelRef: this.#modelRef,
+      requestedToolChoice: toolChoice,
+      systemPrompt: effectiveSystemPrompt,
+      tools: unifiedTools,
+    });
+    recordPcvInputAssembly(ctx.pcvNodeEvidence, llmInputAssembly, {
+      deepseekV4ToolChoiceMode: providerToolChoiceMode, // provider-name-ok: recorded evidence field key
+      effectiveToolChoice,
+      iteration: ctx.iteration,
+      modelRef: this.#modelRef,
+      requestedToolChoice: toolChoice,
+    });
+    const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
+    // 上限来源随 loop 在 #initLoop 解析；诊断消息与日志都带 limitSource，宿主能区分
+    // “模型窗口偏小”（model-registry）、“显式覆盖”（explicit）与“未登记模型的 128k 默认”（default）。
+    const providerInputLimit = this.#providerInputLimits.get(ctx);
+    const llmInputValidation = validateLlmInputSize(
+      ctx.budget,
+      llmInputMeasurement,
+      providerInputLimit?.source
+    );
+    if (!llmInputValidation.ok) {
+      ctx.diagnostics?.warn({
+        code: llmInputValidation.code,
+        message: llmInputValidation.message,
+      });
+      this.logger.warn(
+        `[AgentRuntime] LLM input rejected ${formatLoopTrace(llmTrace)}: ${llmInputValidation.message}`,
+        {
+          ...llmTrace,
+          code: llmInputValidation.code,
+          estimatedTokens: llmInputValidation.estimatedTokens,
+          maxTokens: llmInputValidation.maxTokens,
+          limitSource: llmInputValidation.limitSource,
+          registryModelId: providerInputLimit?.registryModelId ?? null,
+          contextWindow: providerInputLimit?.contextWindow ?? null,
+          outputReserveTokens: providerInputLimit?.outputReserveTokens ?? null,
+        }
+      );
+      if (!ctx.isSystem) {
+        ctx.lastReply = `抱歉，当前请求输入过长（${llmInputValidation.estimatedTokens}/${llmInputValidation.maxTokens} tokens）。请缩短输入后重试。`;
+      }
+      return null;
+    }
+    const unifiedMessages = llmInputAssembly.providerMessages;
+    const llmInputProcessEvent = buildAgentProcessEvent(
+      ctx,
+      projectLlmInputEvent(llmInputAssembly, llmInputMeasurement, {
+        trace: llmTrace,
+        modelRef: this.#modelRef,
+        dynamicContext,
+        requestedToolChoice: toolChoice,
+        effectiveToolChoice,
+      })
+    );
+    this.#hookSystem.emitSync('llm:call:before', {
+      iteration: ctx.iteration,
+      toolChoice: effectiveToolChoice,
+      processEvent: llmInputProcessEvent,
+    });
+    this.#emitProcessProgress(llmInputProcessEvent);
+
+    // 冷启动链路里第一轮经常最慢；必须先打印“请求已发出”的结构化日志，
+    // 否则 Dashboard 只能看到 filling，不知道是在等模型、走重试还是已经被 abort。
+    this.logger.info(`[AgentRuntime] LLM call start ${formatLoopTrace(llmTrace)}`, {
+      ...llmTrace,
+      messageCount: unifiedMessages.length,
+      hasDynamicContext: Boolean(dynamicContext),
+      deepseekV4ToolChoiceMode: providerDecisionMode, // provider-name-ok: recorded evidence field key
+      requestedToolChoice: toolChoice,
+      effectiveToolChoice,
+      toolSchemaCount: unifiedTools?.length || 0,
+      timeoutMs: ctx.budget.timeoutMs || null,
+      maxTokens: ctx.budget.maxTokens ?? (ctx.isSystem ? 8192 : 4096),
+    });
+
+    return {
+      effectiveToolChoice,
+      messages: unifiedMessages,
+      providerToolChoiceMode,
+      tools: unifiedTools,
+    };
+  }
+
+  /**
+   * 本地输入装配失败（I08）— 按运行缺陷终止本次循环：
+   *   - 不计入 consecutiveAiErrors、不记 ai_error、不重试（同一输入必然再失败）、不触发熔断语义；
+   *   - 诊断记 llm_input_assembly_failed + cancelReason=runtime_defect 并标记 degraded，
+   *     #finalize 据 runtime_defect 抑制强制摘要，provider 一次都不会被调用；
+   *   - 日志带错误名与堆栈，宿主能直接定位本地缺陷，而不是误判为上游 AI 服务故障。
+   * 诊断先于日志写入：即使宿主 logger 本身抛错，终态归类也已落盘。
+   */
+  #handleLlmInputAssemblyFailure(
+    ctx: LoopContext,
+    assemblyErr: unknown,
+    llmTrace: Record<string, unknown>,
+    llmStartedAt: number
+  ): null {
+    const normalized = normalizeAiError(assemblyErr);
+    const errorName = assemblyErr instanceof Error ? assemblyErr.name : typeof assemblyErr;
+    const summary = `${errorName}: ${normalized.message}`;
+    ctx.diagnostics?.warn({
+      code: LLM_INPUT_ASSEMBLY_FAILED_CODE,
+      message: `LLM input assembly failed before provider dispatch (${summary}); run terminated as ${RUNTIME_DEFECT_CANCEL_REASON} without provider retry`,
+    });
+    ctx.diagnostics?.recordCancelReason(RUNTIME_DEFECT_CANCEL_REASON);
+    ctx.diagnostics?.markDegraded();
+    this.logger.warn(
+      `[AgentRuntime] LLM input assembly failed — runtime defect, provider not called, no retry ${formatLoopTrace(llmTrace)}: ${summary}`,
+      {
+        ...llmTrace,
+        code: LLM_INPUT_ASSEMBLY_FAILED_CODE,
+        cancelReason: RUNTIME_DEFECT_CANCEL_REASON,
+        durationMs: Date.now() - llmStartedAt,
+        errorName,
+        error: normalized.message,
+        stack: assemblyErr instanceof Error ? (assemblyErr.stack ?? null) : null,
+        consecutiveAiErrors: ctx.consecutiveAiErrors,
+      }
+    );
+    if (!ctx.isSystem) {
+      ctx.lastReply = `抱歉，运行时在组装模型请求时发生内部错误（${summary}），本次请求已终止且未发送给 AI 服务。请反馈该问题。`;
+    }
+    return null;
+  }
+
+  /**
    * AI 错误处理 — 熔断器感知 + 2-strike 策略
+   *
+   * 只接收 provider 调用（chatWithTools）抛出的异常；本地输入装配缺陷由
+   * #handleLlmInputAssemblyFailure 单独归类。provider 可能 reject 任意值（字符串、普通对象），
+   * 入口先归一为 { message, code }，避免把 'undefined' 写进 ai_error 诊断或让熔断码判断失效。
    * @returns continueResult() 或 null (退出)
    */
-  async #handleAiError(ctx: LoopContext, aiErr: AiError): Promise<LLMResult | null> {
+  async #handleAiError(ctx: LoopContext, rawError: unknown): Promise<LLMResult | null> {
+    const aiErr = normalizeAiError(rawError);
     const trace = describeLoopCall(ctx, this.#modelRef);
     // AbortError — 外部中止信号已触发，不计入错误计数，立即退出
     if (ctx.abortSignal?.aborted) {
@@ -2078,6 +2190,16 @@ export class AgentRuntime {
       return {
         code: 'abort_signal',
         message: 'Run was aborted before a normal summary could be produced',
+      };
+    }
+
+    // I08：本地输入装配缺陷终止的运行不再发强制摘要（摘要请求同样不会修复本地缺陷）；
+    // 放在超时判定之前，避免超时分支把 runtime_defect 改写成 stage_timeout。
+    if (cancelReason === RUNTIME_DEFECT_CANCEL_REASON) {
+      return {
+        code: RUNTIME_DEFECT_CANCEL_REASON,
+        message:
+          'LLM input assembly failed locally before provider dispatch; summary request suppressed',
       };
     }
 
@@ -2718,6 +2840,35 @@ function summarizeFunctionCallSources(calls: Array<{ id?: string }>): Record<str
     counts[source] = (counts[source] || 0) + 1;
   }
   return counts;
+}
+
+/**
+ * 异常归一（I08）：provider 可能 reject 任意值，本地缺陷也可能抛非 Error。
+ * - Error：取 message；code 只接受字符串（如 gateway 的 CIRCUIT_OPEN）。
+ * - 普通对象：兼容带字符串 message / code 的错误形状（旧实现靠 `as AiError` 隐式读取，这里显式保留，
+ *   熔断码判断不因 provider 抛普通对象而失效）。
+ * - 其他值：String(value)，不再把 'undefined' 写进诊断。
+ */
+function normalizeAiError(error: unknown): Pick<AiError, 'message' | 'code'> {
+  const record =
+    error !== null && typeof error === 'object' ? (error as Record<string, unknown>) : null;
+  const code = typeof record?.code === 'string' ? record.code : undefined;
+  if (error instanceof Error) {
+    return { message: error.message, code };
+  }
+  if (typeof record?.message === 'string') {
+    return { message: record.message, code };
+  }
+  return { message: describeNonErrorValue(error), code };
+}
+
+/** String() 对无原型对象等值会抛错；归一路径本身不能再抛，否则错误恢复链路会被打断。 */
+function describeNonErrorValue(value: unknown): string {
+  try {
+    return String(value);
+  } catch (stringifyErr: unknown) {
+    return `[unprintable ${typeof value}: ${stringifyErr instanceof Error ? stringifyErr.message : 'String() failed'}]`;
+  }
 }
 
 function stringifyAbortReason(reason: unknown): string | null {
