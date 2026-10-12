@@ -247,17 +247,41 @@ export function toTokenUsage(
     context.protocol === 'google'
       ? raw?.promptTokenCount
       : (raw?.input_tokens ?? raw?.prompt_tokens);
-  const reportedOutput =
+  let reportedOutput =
     context.protocol === 'google'
       ? raw?.candidatesTokenCount
       : (raw?.output_tokens ?? raw?.completion_tokens);
+  // 仅限 Google：Gemini REST 是 proto3 JSON，零值整型字段会被整项省略。思考把输出预算
+  // 用尽、没有可见候选（典型为 finishReason=MAX_TOKENS）时，响应只带 prompt/thoughts/total，
+  // 但 prompt 与思考 token 已经计费。此时 prompt 与 thoughts 都是数字，足以证明这是一次
+  // 已上报用量的响应，缺失的 candidatesTokenCount 记为可见输出 0；outputTokens 仍取 SDK 的
+  // outputTokens.total（= candidates + thoughts）。thoughts 也缺失时没有计费证据，仍走下方
+  // 「未上报即 null」；其他协议的缺失字段不做任何推断。
+  if (
+    context.protocol === 'google' &&
+    typeof reportedInput === 'number' &&
+    (reportedOutput === undefined || reportedOutput === null) &&
+    typeof raw?.thoughtsTokenCount === 'number'
+  ) {
+    Logger.getInstance().warn(
+      `[ai-sdk] usage_candidates_missing provider=${context.provider} protocol=google prompt=${reportedInput} thoughts=${raw.thoughtsTokenCount}; visible output treated as 0, outputTokens taken from SDK output total`
+    );
+    reportedOutput = 0;
+  }
   if (typeof reportedInput !== 'number' || typeof reportedOutput !== 'number') {
+    // 「未上报」与真实 0 必须区分：不猜测缺失的计数，但这次调用不会进入预算/成本统计，需留诊断。
+    Logger.getInstance().warn(
+      `[ai-sdk] usage_unreported provider=${context.provider} protocol=${context.protocol} input=${usageFieldState(reportedInput)} output=${usageFieldState(reportedOutput)}; usage omitted, budget not recorded for this call`
+    );
     return null;
   }
   const inputTokens = result.usage.inputTokens.total;
   const outputTokens = result.usage.outputTokens.total;
   // SDK 会为缺失的可选细分补 0；本仓保留「未上报」与真实 0 的区别。
   if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number') {
+    Logger.getInstance().warn(
+      `[ai-sdk] usage_unreported provider=${context.provider} protocol=${context.protocol} sdk_input_total=${usageFieldState(inputTokens)} sdk_output_total=${usageFieldState(outputTokens)}; usage omitted, budget not recorded for this call`
+    );
     return null;
   }
   const inputDetails = raw?.input_tokens_details ?? raw?.prompt_tokens_details;
@@ -305,6 +329,14 @@ export function toTokenUsage(
     return null;
   }
   return usage;
+}
+
+/** 诊断里只描述计数字段的形态（已上报/缺失/非数字），不输出原始值。 */
+function usageFieldState(value: unknown): 'reported' | 'missing' | 'non-numeric' {
+  if (value === undefined || value === null) {
+    return 'missing';
+  }
+  return typeof value === 'number' ? 'reported' : 'non-numeric';
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

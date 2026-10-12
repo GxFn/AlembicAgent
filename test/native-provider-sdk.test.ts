@@ -1010,6 +1010,174 @@ describe('native SDK provider contracts', () => {
   });
 });
 
+describe('SDK token usage normalization', () => {
+  // Gemini REST 走 proto3 JSON：思考把输出预算用尽、没有可见候选时，零值的
+  // candidatesTokenCount 可能整项省略，而 prompt 与思考 token 已经上报并计费。
+  function geminiThinkingExhausted(usageMetadata: Record<string, number>) {
+    return {
+      candidates: [{ content: { role: 'model', parts: [] }, finishReason: 'MAX_TOKENS' }],
+      usageMetadata,
+    };
+  }
+
+  function warnings(warn: { mock: { calls: unknown[][] } }): string[] {
+    return warn.mock.calls.map(([message]) => String(message));
+  }
+
+  function observedGemini() {
+    const provider = new GoogleGeminiProvider({
+      apiKey: 'test-key',
+      model: 'gemini-2.5-flash',
+      maxRetries: 0,
+    });
+    const usages: unknown[] = [];
+    provider._onTokenUsage = (usage) => {
+      usages.push(usage);
+    };
+    return { provider, usages };
+  }
+
+  it('records billed Gemini prompt and thinking tokens when thinking exhausts the output budget', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(
+          geminiThinkingExhausted({
+            promptTokenCount: 120,
+            thoughtsTokenCount: 16,
+            totalTokenCount: 136,
+          })
+        )
+      )
+    );
+    const { provider, usages } = observedGemini();
+
+    const result = await provider.chatWithTools('hello', { maxTokens: 16 });
+
+    expect(result).toMatchObject({ text: null, finishReason: 'MAX_TOKENS' });
+    expect(result.usage).toEqual({
+      inputTokens: 120,
+      outputTokens: 16,
+      totalTokens: 136,
+      reasoningTokens: 16,
+    });
+    expect(usages).toEqual([
+      expect.objectContaining({ inputTokens: 120, outputTokens: 16, reasoningTokens: 16 }),
+    ]);
+    const messages = warnings(warn);
+    const candidatesMissing = messages.filter((message) =>
+      message.includes('[ai-sdk] usage_candidates_missing')
+    );
+    expect(candidatesMissing).toHaveLength(1);
+    expect(candidatesMissing[0]).toContain('provider=google');
+    expect(candidatesMissing[0]).toContain('prompt=120');
+    expect(candidatesMissing[0]).toContain('thoughts=16');
+    expect(messages.some((message) => message.includes('usage_unreported'))).toBe(false);
+  });
+
+  it('keeps an explicit Gemini zero candidate count on the reported path without the missing-field warning', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(
+          geminiThinkingExhausted({
+            promptTokenCount: 120,
+            candidatesTokenCount: 0,
+            thoughtsTokenCount: 16,
+            totalTokenCount: 136,
+          })
+        )
+      )
+    );
+    const { provider, usages } = observedGemini();
+
+    await expect(provider.chatWithTools('hello', { maxTokens: 16 })).resolves.toMatchObject({
+      usage: { inputTokens: 120, outputTokens: 16, totalTokens: 136, reasoningTokens: 16 },
+    });
+    expect(usages).toHaveLength(1);
+    expect(warnings(warn).some((message) => message.includes('usage_candidates_missing'))).toBe(
+      false
+    );
+  });
+
+  it.each([
+    {
+      label: 'no thinking count to prove the response was billed',
+      usageMetadata: { promptTokenCount: 120, totalTokenCount: 120 },
+      input: 'reported',
+      output: 'missing',
+    },
+    {
+      label: 'no prompt count',
+      usageMetadata: { thoughtsTokenCount: 16, totalTokenCount: 16 },
+      input: 'missing',
+      output: 'missing',
+    },
+  ])('keeps Gemini usage unreported with a diagnostic when there is $label', async ({
+    usageMetadata,
+    input,
+    output,
+  }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(geminiThinkingExhausted(usageMetadata)))
+    );
+    const { provider, usages } = observedGemini();
+
+    await expect(provider.chatWithTools('hello', { maxTokens: 16 })).resolves.toMatchObject({
+      finishReason: 'MAX_TOKENS',
+      usage: null,
+    });
+    expect(usages).toEqual([]);
+    const messages = warnings(warn);
+    expect(messages.some((message) => message.includes('usage_candidates_missing'))).toBe(false);
+    expect(messages).toContainEqual(
+      expect.stringContaining(
+        `[ai-sdk] usage_unreported provider=google protocol=google input=${input} output=${output}`
+      )
+    );
+  });
+
+  it('keeps other protocols unreported instead of inferring output from reasoning details', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({
+          choices: [
+            { index: 0, finish_reason: 'length', message: { role: 'assistant', content: '' } },
+          ],
+          usage: { prompt_tokens: 12, completion_tokens_details: { reasoning_tokens: 4 } },
+        })
+      )
+    );
+    const provider = new DeepSeekProvider({
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      maxRetries: 0,
+    });
+    const usages: unknown[] = [];
+    provider._onTokenUsage = (usage) => {
+      usages.push(usage);
+    };
+
+    await expect(provider.chatWithTools('hello', { maxTokens: 16 })).resolves.toMatchObject({
+      usage: null,
+    });
+    expect(usages).toEqual([]);
+    const messages = warnings(warn);
+    expect(messages.some((message) => message.includes('usage_candidates_missing'))).toBe(false);
+    expect(messages).toContainEqual(
+      expect.stringContaining(
+        '[ai-sdk] usage_unreported provider=deepseek protocol=deepseek input=reported output=missing'
+      )
+    );
+  });
+});
+
 describe('SDK error normalization diagnostics', () => {
   function diagnostics(warn: { mock: { calls: unknown[][] } }): string[] {
     return warn.mock.calls
