@@ -5,6 +5,7 @@
  */
 
 import type { ToolDecisionResultStatus } from './decision.js';
+import type { TerminalCommandAllowlist } from './registry.js';
 import type { ToolResultEnvelope } from './result.js';
 import type { ToolActionAllowlist } from './toolSchema.js';
 
@@ -157,6 +158,14 @@ export interface ToolScopeRelease {
 export interface ToolRuntimeCallContext {
   /** 当前阶段允许集合，由 runtime 投影；仅可收窄宿主/router 配置，不来自模型参数。 */
   allowedTools?: ToolActionAllowlist;
+  /**
+   * 当前能力声明的终端隔离意图（L4-P38 / I47），由 runtimeBridge 只为 terminal 调用从
+   * loopCtx.capabilities 投影（mergeTerminalIntents 按维度取最严格值），不来自模型参数。
+   * 生产宿主的 ToolRouterAdapter 不带 capability，这是 intent 到达 terminal handler 的唯一生产
+   * 入口；handler 再与 ToolContext.commandAllowlist.intent 合并，作为 sandboxExecutor.exec 的
+   * opts.intent 交给宿主。只能追加限制、不能放宽；未声明时不出现该键。
+   */
+  terminalIntent?: TerminalCommandAllowlist['intent'];
   agentId?: string;
   resourceScope?: ToolResourceScope;
   presetName?: string;

@@ -30,6 +30,7 @@ import { isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { buildEvidenceCandidatesHint } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
+import { handle as handleTerminal } from '../src/tools/runtime/handlers/terminal.js';
 import type {
   DeltaCacheLike,
   MemoryCoordinatorLike,
@@ -603,6 +604,278 @@ describe('tool runtime adapters and public contracts', () => {
     expect(capability.promptFragment).toContain('npm test');
     expect(capability.promptFragment).toContain('不提交新知识');
     expect(capability.promptFragment).not.toContain('不使用终端工具');
+  });
+
+  describe('terminal intent forwarding to the host sandbox executor (L4-P38 / I47)', () => {
+    type CapturedExecOpts = Record<string, unknown> & { intent?: Record<string, unknown> };
+
+    function capturingExecutor(
+      reply: (opts: CapturedExecOpts) => {
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+        diagnostics?: { sandboxed?: boolean; fallbackUsed?: boolean; degradeReason?: string };
+      } = () => ({ stdout: 'ok\n', stderr: '', exitCode: 0 })
+    ) {
+      const calls: Array<{ command: string; opts: CapturedExecOpts }> = [];
+      const exec = vi.fn(async (command: string, opts: CapturedExecOpts) => {
+        calls.push({ command, opts });
+        return reply(opts);
+      });
+      return { calls, exec };
+    }
+
+    function evolutionRouter() {
+      return new ToolRouter({ capability: new Evolution().toDef() });
+    }
+
+    function terminalCall(router: ToolRouter, command: string) {
+      const parsed = router.parseToolCall('terminal', { action: 'exec', params: { command } });
+      if ('error' in parsed) {
+        throw new Error(parsed.error);
+      }
+      return parsed;
+    }
+
+    it('forwards the Evolution read-only intent through terminal.exec opts as a per-call copy', async () => {
+      const capability = new Evolution().toDef();
+      const router = new ToolRouter({ capability });
+      const { calls, exec } = capturingExecutor((opts) => {
+        // 宿主改动收到的 intent 不能回写 capability 常量。
+        if (opts.intent) {
+          opts.intent.filesystem = 'project-write';
+        }
+        return { stdout: 'clean\n', stderr: '', exitCode: 0 };
+      });
+
+      const result = await router.execute(terminalCall(router, 'git status'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+
+      expect(result.ok).toBe(true);
+      expect(exec).toHaveBeenCalledOnce();
+      expect(calls[0].opts).toMatchObject({
+        cwd: baseRoot,
+        projectRoot: baseRoot,
+        intent: { network: 'none', filesystem: 'project-write' },
+      });
+      expect(capability.commandAllowlist?.intent).toEqual({
+        network: 'none',
+        filesystem: 'read-only',
+      });
+      expect(new Evolution().toDef().commandAllowlist?.intent).toEqual({
+        network: 'none',
+        filesystem: 'read-only',
+      });
+      // 当前宿主不读 intent 时结果不变：没有额外诊断。
+      expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+    });
+
+    it('merges runtime.terminalIntent with the router capability allowlist by the strictest value', async () => {
+      const warn = vi.spyOn(Logger.getInstance(), 'warn');
+      try {
+        const router = new ToolRouter({
+          capability: {
+            ...new Evolution().toDef(),
+            commandAllowlist: { bins: ['git'], intent: { network: 'none' } },
+          },
+        });
+        const { calls, exec } = capturingExecutor();
+
+        // 生产链路投影来的 runtime.terminalIntent 与 router 注入的 allowlist 各声明一个维度：两者都保留。
+        await router.execute(terminalCall(router, 'git status'), {
+          ...baseToolContext(),
+          sandboxExecutor: { exec },
+          runtime: { terminalIntent: { filesystem: 'read-only' } },
+        });
+        expect(calls[0].opts.intent).toEqual({ network: 'none', filesystem: 'read-only' });
+
+        // runtime 侧的类型外取值不能放宽 allowlist 已声明的 network:'none'，并留下含来源的 warn。
+        const loosened = {
+          terminalIntent: { network: 'full' },
+        } as unknown as ToolContext['runtime'];
+        await router.execute(terminalCall(router, 'git status'), {
+          ...baseToolContext(),
+          sandboxExecutor: { exec },
+          runtime: loosened,
+        });
+        expect(calls[1].opts.intent).toEqual({ network: 'none' });
+        expect(
+          warn.mock.calls.some((args) =>
+            String(args[0]).includes('runtime.terminalIntent field=network value="full"')
+          )
+        ).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('keeps the executor opts unchanged when no capability declares an intent', async () => {
+      const router = new ToolRouter();
+      const { calls, exec } = capturingExecutor();
+
+      const result = await router.execute(terminalCall(router, 'node -v'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+
+      expect(result.ok).toBe(true);
+      expect(Object.keys(calls[0].opts).sort()).toEqual(
+        ['cwd', 'projectRoot', 'signal', 'timeout'].sort()
+      );
+      expect('intent' in calls[0].opts).toBe(false);
+    });
+
+    it('forwards only recognized intent values from a host-injected allowlist', async () => {
+      const warn = vi.spyOn(Logger.getInstance(), 'warn');
+      try {
+        const { calls, exec } = capturingExecutor();
+        const malformed = {
+          bins: ['ls'],
+          intent: { network: 'full', filesystem: 'read-only', extra: true },
+        } as unknown as ToolContext['commandAllowlist'];
+        const partial = await handleTerminal(
+          'exec',
+          { command: 'ls' },
+          { ...baseToolContext(), sandboxExecutor: { exec }, commandAllowlist: malformed }
+        );
+        expect(partial.ok).toBe(true);
+        expect(calls[0].opts.intent).toEqual({ filesystem: 'read-only' });
+
+        const unrecognized = {
+          bins: ['ls'],
+          intent: { network: 'host', filesystem: 'rw' },
+        } as unknown as ToolContext['commandAllowlist'];
+        await handleTerminal(
+          'exec',
+          { command: 'ls' },
+          { ...baseToolContext(), sandboxExecutor: { exec }, commandAllowlist: unrecognized }
+        );
+        expect('intent' in calls[1].opts).toBe(false);
+
+        // 不可 JSON 序列化的取值（BigInt、循环引用）只能让 intent 被丢弃，不能让 terminal.exec 崩溃。
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        const unserializable = {
+          bins: ['ls'],
+          intent: { network: 10n, filesystem: circular },
+        } as unknown as ToolContext['commandAllowlist'];
+        const survived = await handleTerminal(
+          'exec',
+          { command: 'ls' },
+          { ...baseToolContext(), sandboxExecutor: { exec }, commandAllowlist: unserializable }
+        );
+        expect(survived.ok).toBe(true);
+        expect('intent' in calls[2].opts).toBe(false);
+
+        const warnings = warn.mock.calls.map((args) => String(args[0]));
+        expect(warnings.some((line) => line.includes('terminal intent value ignored'))).toBe(true);
+        expect(warnings.some((line) => line.includes('field=network value="full"'))).toBe(true);
+        expect(warnings.some((line) => line.includes('field=network value=10'))).toBe(true);
+        expect(warnings.some((line) => line.includes('field=filesystem value=<object>'))).toBe(
+          true
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it.each([
+      {
+        label: 'non-zero exit',
+        reply: () => ({ stdout: '', stderr: 'fail\n', exitCode: 1 }),
+        status: 'error',
+      },
+      {
+        label: 'forced kill with partial output',
+        reply: () => ({ stdout: 'partial\n', stderr: '', exitCode: 137 }),
+        status: 'error',
+      },
+    ])('forwards intent on the $label path as well', async ({ reply, status }) => {
+      const router = evolutionRouter();
+      const { calls, exec } = capturingExecutor(reply);
+
+      const result = await router.execute(terminalCall(router, 'npm test'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+
+      expect(result._meta?.resultStatus).toBe(status);
+      expect(calls[0].opts.intent).toEqual({ network: 'none', filesystem: 'read-only' });
+    });
+
+    it('never reaches the executor when the allowlist or a pre-abort rejects the command', async () => {
+      const router = evolutionRouter();
+      const { exec } = capturingExecutor();
+
+      const denied = await router.execute(terminalCall(router, 'rm -rf build'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+      expect(denied.ok).toBe(false);
+
+      const controller = new AbortController();
+      controller.abort();
+      const aborted = await router.execute(terminalCall(router, 'git status'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+        abortSignal: controller.signal,
+      });
+      expect(aborted.ok).toBe(false);
+      expect(exec).not.toHaveBeenCalled();
+    });
+
+    it('reports the declared intent as not enforced when the host sandbox degrades to unsandboxed', async () => {
+      const router = evolutionRouter();
+      const { calls, exec } = capturingExecutor(() => ({
+        stdout: 'ok\n',
+        stderr: '',
+        exitCode: 0,
+        diagnostics: {
+          sandboxed: false,
+          fallbackUsed: true,
+          degradeReason: 'seatbelt_unavailable',
+        },
+      }));
+
+      const result = await router.execute(terminalCall(router, 'git status'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+
+      expect(calls[0].opts.intent).toEqual({ network: 'none', filesystem: 'read-only' });
+      expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+        code: 'terminal_sandbox_fallback',
+      });
+      expect(result._meta?.diagnosticWarnings).toContainEqual({
+        code: 'terminal_intent_not_enforced',
+        message:
+          'declared intent network=none filesystem=read-only was not applied: command ran unsandboxed (degradeReason=seatbelt_unavailable)',
+        stage: 'terminal.exec',
+        tool: 'terminal',
+      });
+    });
+
+    it('reports the declared intent as not enforced on the explicit unsandboxed plain-exec path', async () => {
+      const result = await handleTerminal(
+        'exec',
+        { command: 'ls' },
+        {
+          ...baseToolContext(),
+          allowUnsandboxedTerminal: true,
+          commandAllowlist: new Evolution().toDef().commandAllowlist,
+        }
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result._meta?.diagnosticWarnings).toContainEqual(
+        expect.objectContaining({
+          code: 'terminal_intent_not_enforced',
+          message: expect.stringContaining('degradeReason=missing_sandbox_executor'),
+        })
+      );
+    });
   });
 
   it('exports generic delta and search cache contracts', () => {

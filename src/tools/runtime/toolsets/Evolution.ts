@@ -6,14 +6,17 @@ import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
 import { RuntimeCapability } from './RuntimeCapability.js';
 
 /**
- * Evolution 取证用的终端 allowlist。真正生效的只有 bins：agent 层 accessGates 用
+ * Evolution 取证用的终端 allowlist。Agent 侧执行的是 bins：agent 层 accessGates 用
  * checkTerminalCommandAllowlist 检查（含写类参数与子命令约束）；router 把 capability 的
  * commandAllowlist 注入 ToolContext 时，terminal handler 再用同一函数查一次。
  *
- * intent 仅声明、当前不执行：src 内没有代码读取它，terminal.exec 也不把它交给 sandboxExecutor，
- * 宿主沙箱不会因此断网或只读挂载；npm test、vitest run 等允许的命令仍可能联网或写缓存/快照。
- * 若要让 intent 生效，需要宿主按它选择沙箱 profile（跨仓），或删除/改名该字段（kernel 公开类型变更），
- * 两条路都待决定，不要在本处单方面改语义。
+ * intent 经执行端口透传给宿主（L4-P38）：生产宿主的 ToolRouterAdapter 不带 capability，本能力只在
+ * loopCtx.capabilities 上，由 runtimeBridge 把这里的 intent 投影成 terminal 调用的
+ * request.runtime.terminalIntent；terminal.exec 再把 { network:'none', filesystem:'read-only' } 作为
+ * sandboxExecutor.exec 的 opts.intent 交给宿主（带 capability 的 ToolRouter 经 commandAllowlist 得到
+ * 同一结果）。生效取决于宿主是否读取 opts.intent：当前 Alembic SandboxExecutorBridge 尚未读取，
+ * 仍按固定的可写项目目录 profile 执行，npm test、vitest run 等允许的命令那时仍可能写缓存/快照。
+ * 命令没有进沙箱时结果带 terminal_intent_not_enforced 诊断。
  */
 const EVOLUTION_READONLY_TERMINAL_ALLOWLIST: TerminalCommandAllowlist = {
   bins: [

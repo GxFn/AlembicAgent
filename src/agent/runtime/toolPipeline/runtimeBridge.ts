@@ -1,9 +1,11 @@
 /** 唯一宿主路由边界：装配请求、保留共享对象身份、归一化 envelope 和异常。 */
 import {
+  mergeTerminalIntents,
   projectToolResultOrdinaryOutput,
   type ToolCallRequest,
   type ToolResultEnvelope,
   type ToolResultStatus,
+  type ToolRuntimeCallContext,
   toolResultInternals,
 } from '#tools/kernel/index.js';
 import { SafetyPolicy } from '../../policies/index.js';
@@ -141,6 +143,7 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
   const { runtime, loopCtx } = context;
   const executableCall = toExecutableToolCall(call);
   const safetyPolicy = runtime.policies.get?.(SafetyPolicy) || null;
+  const terminalIntent = resolveLoopTerminalIntent(executableCall.name, context);
 
   return {
     toolId: executableCall.name,
@@ -186,8 +189,61 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       evidenceLedger: loopCtx.evidenceLedger || null,
       dimensionScopeId: resolveDimensionScopeId(loopCtx),
       currentRound: loopCtx.iteration || 0,
+      // 未声明时不出现该键：没有隔离意图的运行，请求形状与旧版完全一致。
+      ...(terminalIntent ? { terminalIntent } : {}),
     },
   };
+}
+
+const TERMINAL_INTENT_VALUE_IGNORED_CODE = 'TERMINAL_INTENT_VALUE_IGNORED';
+
+/**
+ * 终端隔离意图的生产投影（L4-P38 / I47）。生产宿主构造 ToolRouterAdapter 时不带 capability，
+ * router 不会把 capability 的 commandAllowlist 注入 handler ctx，当前能力只在 loopCtx.capabilities 上；
+ * 所以由这里读取每个能力的 commandAllowlist.intent，按 mergeTerminalIntents 的规则（按维度取最严格值，
+ * 与 accessGates 对多个能力的 bins 逐个检查一致）合并成一份，经 request.runtime.terminalIntent 交给
+ * 路由，terminal handler 再作为 sandboxExecutor.exec 的 opts.intent 交给宿主。
+ *
+ * 只为 terminal 调用投影：其它工具不消费该字段，不扩大请求面。无法识别的取值被丢弃（不能放宽其它
+ * 能力的声明），并同时写 runtime.logger 与诊断，记录能力名、字段与取值。
+ */
+function resolveLoopTerminalIntent(
+  toolName: string,
+  { runtime, loopCtx }: ToolExecContext
+): ToolRuntimeCallContext['terminalIntent'] {
+  if (toolName !== 'terminal') {
+    return undefined;
+  }
+  const declarations = (loopCtx.capabilities ?? []).map((capability, index) => {
+    const declared = capability as { name?: unknown; commandAllowlist?: { intent?: unknown } };
+    const name = typeof declared?.name === 'string' ? declared.name : `#${index}`;
+    return { source: `capability=${name}`, intent: declared?.commandAllowlist?.intent };
+  });
+  const { intent, ignored } = mergeTerminalIntents(declarations);
+  for (const entry of ignored) {
+    const message =
+      `Ignored terminal intent value ${entry}; only network:'none' and filesystem:'read-only' ` +
+      'are forwarded to the sandbox executor.';
+    loopCtx.diagnostics?.warn({
+      code: TERMINAL_INTENT_VALUE_IGNORED_CODE,
+      message,
+      tool: 'terminal',
+    });
+    warnSafely(runtime, `[ToolPipeline] ${TERMINAL_INTENT_VALUE_IGNORED_CODE}: ${message}`);
+  }
+  return intent;
+}
+
+/** 宿主日志器失败（同步抛错或异步拒绝）不能让工具请求装配失败；诊断已另行记录。 */
+function warnSafely(runtime: ToolExecContext['runtime'], message: string): void {
+  try {
+    const pending: unknown = runtime.logger?.warn(message);
+    if (pending && typeof (pending as { then?: unknown }).then === 'function') {
+      void Promise.resolve(pending).catch(() => undefined);
+    }
+  } catch (err: unknown) {
+    void err;
+  }
 }
 
 function resolvePipelineSourceName({ runtime, loopCtx }: ToolExecContext): string {

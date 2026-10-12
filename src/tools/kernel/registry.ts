@@ -155,7 +155,13 @@ export interface ToolContext {
   /** 安全策略 — terminal handler 可选引用 */
   safetyPolicy?: unknown;
 
-  /** Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入；未注入时默认拒绝执行。 */
+  /**
+   * Seatbelt 沙箱执行器 — terminal handler 通过 DI 注入；未注入时默认拒绝执行。
+   * 调用形如 exec(command, { cwd, projectRoot, timeout, signal?, intent? })；intent 由 terminal handler
+   * 合并 runtime.terminalIntent（生产链路：runtimeBridge 按 loopCtx.capabilities 投影）与
+   * commandAllowlist.intent（带 capability 的 ToolRouter 注入）得到，只在当前能力声明了隔离意图时
+   * 出现。宿主可据此选择沙箱 profile；当前 Alembic SandboxExecutorBridge 尚未读取该字段。
+   */
   sandboxExecutor?: unknown;
 
   /**
@@ -252,20 +258,98 @@ export interface CapabilityDef {
 /**
  * capability 级终端命令正向白名单。
  *
- * 实际执行的约束只有 bins：agent 层 accessGates 与（ToolContext 注入了 commandAllowlist 时的）
- * terminal handler 都只把 bins 交给 checkTerminalCommandAllowlist（bin 白名单 + 写类参数/子命令约束）。
+ * Agent 侧执行的约束是 bins：agent 层 accessGates 与（ToolContext 注入了 commandAllowlist 时的）
+ * terminal handler 都把 bins 交给 checkTerminalCommandAllowlist（bin 白名单 + 写类参数/子命令约束）。
+ * intent 不在 Agent 侧执行，而是透传给宿主执行端口（见下）。
  */
 export interface TerminalCommandAllowlist {
   bins: readonly string[];
   /**
-   * 仅声明、当前不执行：src 内没有代码读取 intent，terminal.exec 也不把它传给 sandboxExecutor，
-   * 宿主沙箱不会据此切换到断网或只读 profile。allowlist 里的 npm/node/vitest 等命令仍可能联网
-   * 或写文件，不能把这里的 network:'none' / filesystem:'read-only' 当成已生效的隔离保证。
+   * 隔离意图，经执行端口透传给宿主（L4-P38 / I47），两条入口都到达 sandboxExecutor：
+   * - 生产链路（宿主构造不带 capability 的 ToolRouterAdapter）：runtimeBridge 从
+   *   loopCtx.capabilities 读取每个能力的 commandAllowlist.intent，经 mergeTerminalIntents 合并后
+   *   写入 terminal 调用的 ToolCallRequest.runtime.terminalIntent；ToolRouterAdapter 把 runtime 并入
+   *   ToolContext。
+   * - 带 capability 的 ToolRouter：router 把本 allowlist 注入 ToolContext.commandAllowlist。
+   * terminal.exec 再把这两个来源按同一规则合并，复制后作为 sandboxExecutor.exec(command, opts)
+   * 的可选字段 opts.intent 交给宿主；无法识别的取值丢弃并打 warn，命令最终没有进沙箱时结果带
+   * terminal_intent_not_enforced 诊断。
+   * 生效与否取决于宿主是否读取 opts.intent：当前 Alembic 宿主的 SandboxExecutorBridge 尚未读取
+   * 该字段（跨仓改造待派发），仍按固定的可写项目目录 profile 执行，此时 npm/node/vitest 等命令
+   * 仍可能写文件；不能把这里的声明当成 Agent 侧已兑现的隔离保证。
    */
   intent?: {
     network?: 'none';
     filesystem?: 'read-only';
   };
+}
+
+/** 交给宿主执行端口的隔离意图，取值集合与 TerminalCommandAllowlist.intent 相同。 */
+type TerminalIntent = NonNullable<TerminalCommandAllowlist['intent']>;
+
+/**
+ * 合并多个来源声明的终端隔离意图（L4-P38 / I47）。runtimeBridge（loopCtx.capabilities 的每个能力）
+ * 与 terminal handler（ToolContext.commandAllowlist 与 runtime.terminalIntent）共用这一条规则。
+ *
+ * 合并规则：按维度取最严格值。每个维度只有一个受限取值（network:'none'、filesystem:'read-only'），
+ * 缺省表示该来源未声明限制，所以任一来源声明了受限取值，合并结果就带上它，任何来源都不能放宽
+ * 另一个来源的声明。这与 accessGates 要求命令逐个通过每个能力的 bins 一致（多个能力同时生效）。
+ *
+ * 声明可能来自用 JS 接线的宿主或能力：非对象、数组、未知字段或类型外取值一律丢弃，不猜成更宽或
+ * 更严的 profile，并通过 ignored 返回“来源 + 字段 + 取值”描述，由调用方打 warn / 诊断（kernel 不
+ * 直接写日志）。每次返回新对象，宿主改动它不会回写能力常量；没有可识别取值时 intent 为 undefined。
+ */
+export function mergeTerminalIntents(
+  declarations: ReadonlyArray<{ source: string; intent: unknown }>
+): { intent: TerminalIntent | undefined; ignored: string[] } {
+  const intent: TerminalIntent = {};
+  const ignored: string[] = [];
+  for (const { source, intent: declared } of declarations) {
+    if (declared === undefined || declared === null) {
+      continue;
+    }
+    if (typeof declared !== 'object' || Array.isArray(declared)) {
+      ignored.push(
+        `${source} intent is ${Array.isArray(declared) ? 'array' : typeof declared}, expected object`
+      );
+      continue;
+    }
+    for (const [field, value] of Object.entries(declared) as Array<[string, unknown]>) {
+      if (value === undefined) {
+        continue;
+      }
+      if (field === 'network' && value === 'none') {
+        intent.network = value;
+      } else if (field === 'filesystem' && value === 'read-only') {
+        intent.filesystem = value;
+      } else {
+        ignored.push(`${source} field=${field} value=${describeTerminalIntentValue(value)}`);
+      }
+    }
+  }
+  return {
+    intent: intent.network !== undefined || intent.filesystem !== undefined ? intent : undefined,
+    ignored,
+  };
+}
+
+/**
+ * 描述被丢弃的 intent 取值。不用 JSON.stringify 处理任意值：BigInt 或循环引用会抛错，而合并发生在
+ * 工具执行的关键路径上，诊断本身不能让调用崩溃。
+ */
+function describeTerminalIntentValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (
+    value === null ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint'
+  ) {
+    return String(value);
+  }
+  return `<${Array.isArray(value) ? 'array' : typeof value}>`;
 }
 
 /* ------------------------------------------------------------------ */

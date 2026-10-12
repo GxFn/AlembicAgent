@@ -3,7 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 /**
- * tools/runtime 注释的事实守卫（L4-P1：I29 注释漂移、I47 intent 仅声明）。
+ * tools/runtime 注释的事实守卫（L4-P1：I29 注释漂移；L4-P38：I47 intent 经执行端口透传）。
  *
  * 与 tool-contract-comments.test.ts 同一套思路：一是锁住已证伪的旧说法不回流到注释；
  * 二是核对注释里陈述的“当前事实”在源码里仍然成立。第二类失败说明调用链变了，
@@ -139,7 +139,7 @@ describe('tools/runtime comments describe current facts (L4-P1)', () => {
     expect(text).not.toMatch(/\*\/\s*\n\/\*\*/);
   });
 
-  it('TerminalCommandAllowlist.intent is documented as declaration-only, and nothing consumes it', () => {
+  it('TerminalCommandAllowlist.intent comments describe the production forwarding chain truthfully', () => {
     const kernel = readSource('src/tools/kernel/registry.ts');
     const intentStart = kernel.indexOf('export interface TerminalCommandAllowlist');
     expect(intentStart).toBeGreaterThanOrEqual(0);
@@ -147,27 +147,81 @@ describe('tools/runtime comments describe current facts (L4-P1)', () => {
       kernel.lastIndexOf('/**', intentStart),
       kernel.indexOf('\n}', intentStart)
     );
-    expect(allowlistDecl).toContain('仅声明');
-    expect(allowlistDecl).toContain('当前不执行');
+    // 旧说法（仅声明、当前不执行）已证伪，不得回流；新说法写明生产入口、透传出口与宿主现状。
+    expect(allowlistDecl).not.toContain('仅声明');
+    expect(allowlistDecl).not.toContain('当前不执行');
     expect(allowlistDecl).toContain('bins');
+    expect(allowlistDecl).toContain('opts.intent');
+    expect(allowlistDecl).toContain('透传给宿主');
+    expect(allowlistDecl).toContain('loopCtx.capabilities');
+    expect(allowlistDecl).toContain('runtime.terminalIntent');
+    expect(allowlistDecl).toContain('terminal_intent_not_enforced');
+    // 宿主 SandboxExecutorBridge 目前不读 opts.intent：注释必须如实写出，不能宣称隔离已生效。
+    expect(allowlistDecl).toContain('尚未读取');
+
+    const sandboxDoc = docBlockBefore(kernel, '  sandboxExecutor?: unknown;');
+    expect(sandboxDoc).not.toBeNull();
+    expect(sandboxDoc).toContain('runtime.terminalIntent');
+    expect(sandboxDoc).toContain('loopCtx.capabilities');
+    expect(sandboxDoc).toContain('尚未读取');
 
     const evolution = readSource('src/tools/runtime/toolsets/Evolution.ts');
     const evolutionDoc = docBlockBefore(evolution, 'const EVOLUTION_READONLY_TERMINAL_ALLOWLIST');
     expect(evolutionDoc).not.toBeNull();
-    expect(evolutionDoc).toContain('仅声明');
-    expect(evolutionDoc).toContain('当前不执行');
+    expect(evolutionDoc).not.toContain('仅声明');
+    expect(evolutionDoc).not.toContain('当前不执行');
+    expect(evolutionDoc).toContain('opts.intent');
+    expect(evolutionDoc).toContain('透传给宿主');
+    expect(evolutionDoc).toContain('loopCtx.capabilities');
+    expect(evolutionDoc).toContain('尚未读取');
 
-    // 事实核对：src 内没有任何代码读取 allowlist 的 intent；执行器入参也不带 intent。
+    // 事实核对一：读取 allowlist intent 的代码只有两处——生产链路的 runtimeBridge（从
+    // loopCtx.capabilities 投影）与 terminal handler（合并两个来源后交给执行器）。
+    // 只看代码行：注释里提到 commandAllowlist.intent 不算读取。
+    const codeOnly = (source: string) =>
+      source
+        .split('\n')
+        .filter((line) => !/^\s*(?:\*|\/\*|\/\/)/.test(line))
+        .join('\n');
     const intentReaders = sourceFiles()
-      .filter(({ text: source }) => /(?:[Aa]llowlist|ALLOWLIST)\??\.intent\b/.test(source))
-      .map(({ file }) => file);
-    expect(intentReaders).toEqual([]);
-    const terminal = readSource('src/tools/runtime/handlers/terminal.ts');
+      .filter(({ text: source }) =>
+        /(?:[Aa]llowlist|ALLOWLIST)\??\.intent\b/.test(codeOnly(source))
+      )
+      .map(({ file }) => file)
+      .sort();
+    expect(intentReaders).toEqual([
+      'src/agent/runtime/toolPipeline/runtimeBridge.ts',
+      'src/tools/runtime/handlers/terminal.ts',
+    ]);
+
+    // 事实核对二：生产链路的每一跳都在。宿主的 ToolRouterAdapter 不带 capability，
+    // intent 只能经 request.runtime 到达 handler。
+    const bridge = codeOnly(readSource('src/agent/runtime/toolPipeline/runtimeBridge.ts'));
+    expect(bridge).toMatch(/loopCtx\.capabilities \?\? \[\]\)\.map\(/);
+    expect(bridge).toMatch(/mergeTerminalIntents\(declarations\)/);
+    expect(bridge).toMatch(/\.\.\.\(terminalIntent \? \{ terminalIntent \} : \{\}\)/);
+    const adapter = codeOnly(readSource('src/tools/runtime/adapter/ToolRouterAdapter.ts'));
+    expect(adapter).toMatch(/\.\.\.\(request\.runtime \? \{ runtime: request\.runtime \} : \{\}\)/);
+    const terminal = codeOnly(readSource('src/tools/runtime/handlers/terminal.ts'));
     expect(terminal).toMatch(
       /checkTerminalCommandAllowlist\(command, ctx\.commandAllowlist\.bins\)/
     );
+    expect(terminal).toMatch(/resolveTerminalIntent\(ctx\)/);
+    expect(terminal).toMatch(/intent: ctx\.runtime\?\.terminalIntent/);
+    expect(terminal).toMatch(/intent: ctx\.commandAllowlist\?\.intent/);
     expect(terminal).toMatch(
-      /executor\.exec\(command, \{\s*cwd,\s*projectRoot: ctx\.projectRoot,\s*timeout,\s*signal: ctx\.abortSignal,\s*\}\)/
+      /executor\.exec\(command, \{\s*cwd,\s*projectRoot: ctx\.projectRoot,\s*timeout,\s*signal: ctx\.abortSignal,\s*\.\.\.\(intent \? \{ intent \} : \{\}\),\s*\}\)/
+    );
+
+    // 事实核对三：生产形态的行为覆盖存在（真实 pipeline + 不带 capability 的 adapter，断言执行器
+    // 收到 opts.intent）。源码形状守卫只能定位调用链，到达性由该文件的行为测试证明。
+    const productionTest = readSource('test/tool-pipeline-terminal-intent.test.ts');
+    expect(productionTest).toContain(
+      'new ToolRouterAdapter({ contextFactory: { create: () => toolContext } })'
+    );
+    expect(productionTest).toContain('createToolPipeline().execute(terminalCall(');
+    expect(productionTest).toContain(
+      "expect(calls[0]?.opts.intent).toEqual({ network: 'none', filesystem: 'read-only' });"
     );
   });
 

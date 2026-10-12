@@ -14,18 +14,31 @@
  *           悄悄变成继承宿主环境变量的无沙箱执行。只有 ToolContext.allowUnsandboxedTerminal
  *           === true 时才降级为 plain exec，并在结果里标注 unsandboxed。
  *           可用性快照（availability.ts）按同一条件隐藏 terminal.exec，两处判定必须保持一致。
+ *
+ * 隔离意图（L4-P38 / I47）: 当前能力声明的 intent（例如 Evolution 的 network:'none' /
+ *           filesystem:'read-only'）经归一化后作为 exec opts 的可选字段 intent 交给宿主执行端口。
+ *           生产链路上宿主的 ToolRouterAdapter 不带 capability，intent 来自 ctx.runtime.terminalIntent
+ *           （runtimeBridge 按 loopCtx.capabilities 投影）；带 capability 的 ToolRouter 另经
+ *           ctx.commandAllowlist.intent 提供，两者按最严格取值合并（见 resolveTerminalIntent）。
+ *           Agent 侧只负责透传，真正的隔离由宿主执行；当前 Alembic SandboxExecutorBridge 尚未读取
+ *           opts.intent，仍按固定 profile 执行。没有声明 intent 时 opts 与旧版完全相同；宿主不读
+ *           该字段时行为不变。命令最终没有进沙箱（宿主报告降级或走 plain exec）时，声明的 intent
+ *           必然没生效，结果里追加 terminal_intent_not_enforced 诊断。
  */
 
 import { exec } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import Logger from '@alembic/core/logging';
 import { isDeadlineAbort } from '#shared/operation.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
+  mergeTerminalIntents,
   ok,
+  type TerminalCommandAllowlist,
   type ToolAuditEntry,
   type ToolContext,
   type ToolResult,
@@ -133,12 +146,17 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
     );
   }
 
+  // 只在命令已通过安全与 allowlist 检查、确定要交给执行器时才归一化 intent：被拒绝的命令
+  // 不会触达宿主，也就不需要为它的 intent 打日志。
+  const intent = resolveTerminalIntent(ctx);
+
   try {
     const { stdout, stderr, exitCode, diagnostics } = await execInSandboxOrDirect(
       command,
       cwd,
       timeout,
-      ctx
+      ctx,
+      intent
     );
 
     if (exitCode === 137) {
@@ -175,7 +193,8 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
                 },
               ],
             },
-            diagnostics
+            diagnostics,
+            intent
           )
         ),
         'failure'
@@ -197,7 +216,8 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
             durationMs,
             ...(exitCode !== 0 ? { resultStatus: 'error' } : {}),
           },
-          diagnostics
+          diagnostics,
+          intent
         )
       ),
       exitCode === 0 ? 'success' : 'failure'
@@ -250,21 +270,26 @@ function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'tim
  * 优先使用 Seatbelt 沙箱执行；没有可调用的 exec 时只有调用方已通过显式许可检查才会走到 plain exec。
  *
  * ctx.sandboxExecutor 由 ToolContextFactory 从 DI 容器注入，
- * 类型为 { exec(cmd, opts): Promise<{stdout,stderr,exitCode}> }
+ * 类型为 { exec(cmd, opts): Promise<{stdout,stderr,exitCode}> }；opts 带 cwd/projectRoot/timeout/signal，
+ * 当前能力声明了隔离意图时再带可选的 intent（来源与合并规则见 resolveTerminalIntent）。
+ * plain exec 降级路径没有沙箱可以承接 intent，由 terminalMeta 报 terminal_intent_not_enforced。
  */
 async function execInSandboxOrDirect(
   command: string,
   cwd: string,
   timeout: number,
-  ctx: ToolContext
+  ctx: ToolContext,
+  intent: TerminalExecIntent | undefined
 ): Promise<TerminalExecutionResult> {
   const executor = ctx.sandboxExecutor;
   if (isSandboxExecutor(executor)) {
+    // intent 只在有可识别取值时出现：没有声明时 opts 与旧版完全一致，旧宿主不读它时行为也不变。
     const result = await executor.exec(command, {
       cwd,
       projectRoot: ctx.projectRoot,
       timeout,
       signal: ctx.abortSignal,
+      ...(intent ? { intent } : {}),
     });
     return {
       ...result,
@@ -322,10 +347,24 @@ function isSandboxExecutor(value: unknown): value is SandboxExecutorLike {
   );
 }
 
+/**
+ * 交给宿主执行端口的隔离意图，取值集合与 kernel TerminalCommandAllowlist.intent 相同。
+ * 宿主可读取它来选择沙箱 profile；读不读、怎么落地归宿主（当前 Alembic SandboxExecutorBridge
+ * 尚未读取，仍固定可写项目目录 profile，跨仓改造待派发）。
+ */
+type TerminalExecIntent = NonNullable<TerminalCommandAllowlist['intent']>;
+
 interface SandboxExecutorLike {
   exec(
     command: string,
-    opts: { cwd: string; projectRoot: string; timeout: number; signal?: AbortSignal }
+    opts: {
+      cwd: string;
+      projectRoot: string;
+      timeout: number;
+      signal?: AbortSignal;
+      /** 可选：capability 声明的隔离意图；未声明时不出现该键。 */
+      intent?: TerminalExecIntent;
+    }
   ): Promise<{
     stdout: string;
     stderr: string;
@@ -369,26 +408,83 @@ function resolveTerminalCwd(
   }
 }
 
+/**
+ * 把执行诊断并入结果元信息。
+ * - fallbackUsed：追加 terminal_sandbox_fallback（既有行为）。
+ * - 声明了 intent 但命令没有进沙箱（sandboxed=false，宿主降级或 plain exec）：追加
+ *   terminal_intent_not_enforced，写明声明的取值与降级原因。沙箱内执行时 Agent 无法得知宿主
+ *   是否按 intent 选了 profile，不追加任何诊断，保持“宿主不读 intent 时行为不变”。
+ */
 function terminalMeta(
   base: Partial<ToolResultMeta>,
-  diagnostics: TerminalExecutionDiagnostics
+  diagnostics: TerminalExecutionDiagnostics,
+  intent?: TerminalExecIntent
 ): Partial<ToolResultMeta> {
-  if (!diagnostics.fallbackUsed) {
+  // 命令没有进沙箱时声明的 intent 必然没有生效；sandboxed=true 时无从得知宿主是否采用，不报。
+  const unenforcedIntent = intent !== undefined && !diagnostics.sandboxed ? intent : undefined;
+  if (!diagnostics.fallbackUsed && unenforcedIntent === undefined) {
     return base;
   }
   return {
     ...base,
-    fallbackUsed: true,
+    ...(diagnostics.fallbackUsed ? { fallbackUsed: true } : {}),
     diagnosticWarnings: [
       ...(base.diagnosticWarnings ?? []),
-      {
-        code: 'terminal_sandbox_fallback',
-        message: formatTerminalDiagnostic(diagnostics),
-        stage: 'terminal.exec',
-        tool: 'terminal',
-      },
+      ...(diagnostics.fallbackUsed
+        ? [
+            {
+              code: 'terminal_sandbox_fallback',
+              message: formatTerminalDiagnostic(diagnostics),
+              stage: 'terminal.exec',
+              tool: 'terminal',
+            },
+          ]
+        : []),
+      ...(unenforcedIntent !== undefined
+        ? [
+            {
+              code: 'terminal_intent_not_enforced',
+              message:
+                `declared intent ${formatTerminalIntent(unenforcedIntent)} was not applied: ` +
+                `command ran unsandboxed (degradeReason=${diagnostics.degradeReason ?? 'unknown'})`,
+              stage: 'terminal.exec',
+              tool: 'terminal',
+            },
+          ]
+        : []),
     ],
   };
+}
+
+/**
+ * 把当前能力声明的隔离意图归一化成交给宿主的 exec opts.intent（L4-P38 / I47）。
+ * 两个来源按 kernel mergeTerminalIntents 的同一规则合并（按维度取最严格值，任何来源都不能放宽另一个）：
+ * - ctx.runtime.terminalIntent：生产链路。宿主构造的 ToolRouterAdapter 不带 capability，由
+ *   runtimeBridge 从 loopCtx.capabilities 投影到 request.runtime，adapter 再把 runtime 并入 ctx。
+ * - ctx.commandAllowlist.intent：带 capability 的 ToolRouter 注入的 allowlist。
+ * 两者都可能来自用 JS 接线的宿主：无法识别的字段或取值一律丢弃并打 warn（含来源、字段、取值），
+ * 不把它猜成更宽或更严的 profile。合并结果每次都是新对象，宿主改动它不会回写能力常量；没有任何
+ * 可识别取值时返回 undefined，exec opts 不出现 intent 键，与旧版一致。
+ * 这里只做透传前的校验；网络与文件系统隔离是否生效由宿主沙箱决定。
+ */
+function resolveTerminalIntent(ctx: ToolContext): TerminalExecIntent | undefined {
+  const { intent, ignored } = mergeTerminalIntents([
+    { source: 'runtime.terminalIntent', intent: ctx.runtime?.terminalIntent },
+    { source: 'commandAllowlist', intent: ctx.commandAllowlist?.intent },
+  ]);
+  for (const entry of ignored) {
+    Logger.getInstance().warn(
+      `[terminal.exec] terminal intent value ignored: ${entry}; only network:'none' and filesystem:'read-only' are forwarded to the sandbox executor`
+    );
+  }
+  return intent;
+}
+
+function formatTerminalIntent(intent: TerminalExecIntent): string {
+  return [
+    ...(intent.network !== undefined ? [`network=${intent.network}`] : []),
+    ...(intent.filesystem !== undefined ? [`filesystem=${intent.filesystem}`] : []),
+  ].join(' ');
 }
 
 function withTerminalDiagnostics(text: string, diagnostics: TerminalExecutionDiagnostics): string {
