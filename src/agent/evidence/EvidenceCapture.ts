@@ -64,6 +64,11 @@ interface FileItem {
   path: string;
   content: string;
   mode?: string;
+  /**
+   * code.read 大纲视图的来源（L4-P17）：'ast' 或 'head-tail'。头尾预览保持 mode:'outline'，
+   * 带此字段的条目一律是派生视图，即使 mode 缺席也不能按连续源码切片落 range。
+   */
+  outlineSource?: string;
   startLine?: number;
   endLine?: number;
   lineCount?: number;
@@ -178,14 +183,21 @@ function normalizeDrafts(
         // 诚实降级 file-only（不参与 freshness，verified 判据按 file 在场已放行）。
         const raw = stripReadDisplayDecorations(file.content);
         const mode = file.mode ?? '';
-        if (raw !== null && (mode === 'range' || mode === 'full' || mode === '')) {
+        // outlineSource 与 mode==='outline' 同义（AST 大纲或头尾预览）：两者任一出现都按派生视图处理，
+        // 不取内容坐标、也不借用请求区间——头尾预览的 N| 行首尾不连续，落 range 会让 freshness 误判。
+        const derivedOutline = file.outlineSource !== undefined;
+        if (
+          raw !== null &&
+          !derivedOutline &&
+          (mode === 'range' || mode === 'full' || mode === '')
+        ) {
           return { tool, callId: call.id, file: file.path, range: raw.range, content: raw.content };
         }
         return {
           tool,
           callId: call.id,
           file: file.path,
-          ...(!mode && requestedRange
+          ...(!mode && !derivedOutline && requestedRange
             ? {
                 range: {
                   start: requestedRange.start,

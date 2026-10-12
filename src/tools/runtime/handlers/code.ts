@@ -997,6 +997,135 @@ function fallbackIncomplete(
 
 const MAX_BATCH_READ_FILES = 5;
 
+/** 不带区间时整读的行数上限；超过时返回 AST 大纲（可用时）或头尾预览。 */
+const FULL_READ_MAX_LINES = 500;
+
+/** 头尾预览保留的头部/尾部行数（预览模板被 EvidenceCollector 按固定文案识别，格式变更需同步）。 */
+const HEAD_TAIL_PREVIEW_HEAD = 30;
+const HEAD_TAIL_PREVIEW_TAIL = 15;
+
+/**
+ * batch 中因取消而未读取的文件的固定错误文案；状态归类与诊断都按它识别。
+ * 期限到达与宿主/用户取消共用同一文案（data 形状与取值不变），两者只在 resultStatus、
+ * code_read_batch_partial 诊断与汇总日志里区分（见 cancellationStatus）。
+ */
+const BATCH_READ_ABORTED = 'Read aborted';
+
+/** 取消归类：期限 → timeout，其余取消原因（宿主/用户停止）→ aborted。 */
+type CancellationStatus = 'timeout' | 'aborted';
+
+/**
+ * code.read batch 与 code.structure 的取消归类，与 code.search（searchAbortStatus）和 terminal 同一
+ * 口径（L1-P2 / isDeadlineAbort）：runOperation 运行/阶段期限或 AbortSignal.timeout 触发的取消
+ * 回执 timeout，宿主或用户主动取消回执 aborted。只在 signal 已中止后调用。
+ */
+function cancellationStatus(signal: AbortSignal | undefined): CancellationStatus {
+  return isDeadlineAbort(signal) ? 'timeout' : 'aborted';
+}
+
+/** 诊断里最多点名的文件数；其余只计数，避免诊断随批量规模膨胀。 */
+const READ_DIAGNOSTIC_PATH_SAMPLE = 5;
+
+/**
+ * 按源码行切分（I18）：只以 LF 为行界，内容以换行结尾时去掉 split 产生的末尾空串。
+ *
+ * - 恰好 500 行且以换行结尾的文件计为 500 行（旧实现 split('\n') 计成 501 行，被降级为头尾预览，
+ *   整读还会多出一个空的 `501|` 行）；
+ * - CRLF 文件只去掉“结尾换行产生的空行”，每行保留 CR 字节：Core EvidenceLedger 约定 code.read
+ *   行段“以 LF 分行、保留 CR 字节”（StrictFactExecution.selectFrozenEvidenceBytes），Agent 的
+ *   EvidenceLedgerStore.checkFreshness 也按 split('\n') 重切原文；展示内容一旦去掉 CR，带 range
+ *   的证据就会与冻结字节和新鲜度切片不一致。
+ * - deltaCache 与写前新鲜度指纹仍对原始 content 计算，不经过本函数。
+ */
+function splitSourceLines(content: string): string[] {
+  const lines = content.split('\n');
+  if (lines.length > 1 && content.endsWith('\n')) {
+    lines.pop();
+  }
+  return lines;
+}
+
+/** 经校验的行区间参数；undefined 表示调用方未给出该参数。 */
+interface ReadRange {
+  startLine?: number;
+  endLine?: number;
+  maxLines?: number;
+}
+
+/**
+ * 显式 startLine/endLine 必须是正整数（I19）。schema 只声明 type:'number'，Ajv 放行负数与小数：
+ * endLine:-1 曾经变成 slice(start-1, -1) 的反向切片，startLine:1.5 会产生 `1.5|` 这种不存在的行号。
+ * startLine > endLine 明确报错，不再静默返回空串；maxLines 沿用原有的宽松归一化。
+ */
+function normalizeReadRange(
+  params: Record<string, unknown>
+): { ok: true; value: ReadRange } | { ok: false; error: string } {
+  const range: ReadRange = {};
+  for (const name of ['startLine', 'endLine'] as const) {
+    const value = params[name];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+      const shown = typeof value === 'number' ? String(value) : typeof value;
+      return {
+        ok: false,
+        error: `code.read ${name} must be a positive integer (1-based line number); got ${shown}`,
+      };
+    }
+    range[name] = value;
+  }
+  if (
+    range.startLine !== undefined &&
+    range.endLine !== undefined &&
+    range.startLine > range.endLine
+  ) {
+    return {
+      ok: false,
+      error: `code.read startLine (${range.startLine}) must not exceed endLine (${range.endLine})`,
+    };
+  }
+  const maxLines = normalizePositiveInteger(params.maxLines);
+  if (maxLines !== undefined) {
+    range.maxLines = maxLines;
+  }
+  return { ok: true, value: range };
+}
+
+function hasReadRange(range: ReadRange): boolean {
+  return (
+    range.startLine !== undefined || range.endLine !== undefined || range.maxLines !== undefined
+  );
+}
+
+/**
+ * >500 行文件 AST 大纲不可用的原因（I17）：
+ * - analyzer-missing：宿主没有注入 astAnalyzer（当前生产宿主的主路径）；
+ * - no-definitions：analyzer 返回空结果（语言不支持或文件没有可列出的声明）；
+ * - analyzer-error：analyzer 抛错，错误类名与消息进入诊断与日志，不再被吞成“不可用”。
+ */
+type OutlineFallbackReason = 'analyzer-missing' | 'no-definitions' | 'analyzer-error';
+
+const OUTLINE_FALLBACK_DESCRIPTIONS: Readonly<Record<OutlineFallbackReason, string>> = {
+  'analyzer-missing': 'no AST analyzer is bound',
+  'no-definitions':
+    'the AST analyzer returned no definitions (unsupported language or no declarations)',
+  'analyzer-error': 'the AST analyzer threw',
+};
+
+/** 一次头尾预览降级的事实，只进诊断与日志，不进模型可见的 data。 */
+interface OutlineFallbackRecord {
+  path: string;
+  lineCount: number;
+  reason: OutlineFallbackReason;
+  errorName?: string;
+}
+
+/** 单次 code.read 调用（单读或 batch）收集的诊断事实，由调用方转成 diagnosticWarnings。 */
+interface ReadDiagnosticsSink {
+  outlineFallbacks: OutlineFallbackRecord[];
+}
+
 async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const filePath = normalizeOptionalString(params.path);
   const filePathsResult = normalizeFilePaths(params.filePaths);
@@ -1009,15 +1138,24 @@ async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Pr
     return fail('code.read accepts either path or filePaths, not both');
   }
 
-  if (filePaths.length > 0) {
-    return handleBatchRead(filePaths, params, ctx);
-  }
-
-  if (!filePath) {
+  if (!filePath && filePaths.length === 0) {
     return fail('code.read requires path or filePaths[]');
   }
 
-  const result = await readSingleFile(filePath, params, ctx);
+  // 区间在分派前只校验一次：batch 里所有文件共用同一区间，非法区间不应变成逐文件的重复失败。
+  const rangeResult = normalizeReadRange(params);
+  if (!rangeResult.ok) {
+    return fail(rangeResult.error);
+  }
+  const range = rangeResult.value;
+
+  // 走到这里时 path 与 filePaths 恰有一个：没有 path 就一定是 batch。
+  if (!filePath) {
+    return handleBatchRead(filePaths, range, ctx);
+  }
+
+  const sink: ReadDiagnosticsSink = { outlineFallbacks: [] };
+  const result = await readSingleFile(filePath, range, ctx, sink);
   if (!result.ok) {
     return fail(result.error);
   }
@@ -1027,23 +1165,27 @@ async function handleRead(params: Record<string, unknown>, ctx: ToolContext): Pr
     // Router 的 action 配额也是有损边界；采用它注入的单源规格，避免第二次读取只剩 unchanged。
     forgetFullRead(result.path, ctx);
   }
+  const warnings: ToolDiagnosticWarning[] = [];
+  if (willTruncate) {
+    warnings.push({
+      code: 'code_read_partial_view',
+      message:
+        'Read output exceeds the action limit; only the file-version fingerprint is retained. Use a line range to retrieve omitted content.',
+      tool: 'code',
+    });
+  }
+  pushOutlineFallbackWarning(warnings, sink.outlineFallbacks);
+  pushRangeBeyondEofWarning(warnings, [result]);
+  // 头尾预览是有意的降级视图：标 degraded/fallbackUsed 让 trace 与诊断汇总看得见，
+  // 但不把单读改成 partial（预览已明确说明只展示头尾），resultStatus 仍由 router 截断决定。
+  const outlineFallback = sink.outlineFallbacks.length > 0;
   return ok(result.content, {
     // L4-P15 / I05：只有 unchanged（内容来自 DeltaCache 的已展示版本）算缓存命中；delta 模式重新读盘
     // 并比对了内容，不算命中。
     ...(result.mode === 'unchanged' ? { cached: true } : {}),
     tokensEstimate: result.tokensEstimate,
-    ...(willTruncate
-      ? {
-          diagnosticWarnings: [
-            {
-              code: 'code_read_partial_view',
-              message:
-                'Read output exceeds the action limit; only the file-version fingerprint is retained. Use a line range to retrieve omitted content.',
-              tool: 'code',
-            },
-          ],
-        }
-      : {}),
+    ...(outlineFallback ? { degraded: true, fallbackUsed: true } : {}),
+    ...(warnings.length > 0 ? { diagnosticWarnings: warnings } : {}),
   });
 }
 
@@ -1064,6 +1206,13 @@ interface ReadSingleSuccess {
   startLine?: number;
   endLine?: number;
   mode: 'full' | 'range' | 'outline' | 'delta' | 'unchanged';
+  /**
+   * mode==='outline' 时骨架的真实来源（I17 决策：保持 mode 取值不变，另加字段区分）：
+   * 'ast' 是 Tree-sitter 大纲，'head-tail' 是 analyzer 不可用时的头尾预览。
+   */
+  outlineSource?: 'ast' | 'head-tail';
+  /** outlineSource==='head-tail' 时 AST 大纲不可用的原因。 */
+  outlineReason?: OutlineFallbackReason;
 }
 
 interface ReadSingleFailure {
@@ -1074,9 +1223,13 @@ interface ReadSingleFailure {
 
 type ReadSingleResult = ReadSingleSuccess | ReadSingleFailure;
 
+type BatchReadFile =
+  | (ReadSingleSuccess & { truncated?: boolean; originalTokensEstimate?: number })
+  | ReadSingleFailure;
+
 async function handleBatchRead(
   filePaths: string[],
-  params: Record<string, unknown>,
+  range: ReadRange,
   ctx: ToolContext
 ): Promise<ToolResult> {
   if (filePaths.length > MAX_BATCH_READ_FILES) {
@@ -1085,17 +1238,20 @@ async function handleBatchRead(
 
   const maxOutputTokens = Math.max(1000, Math.min(ctx.tokenBudget || 5000, 5000));
   const perFileTokenBudget = Math.max(200, Math.floor((maxOutputTokens - 250) / filePaths.length));
-  const files: Array<
-    | (ReadSingleSuccess & { truncated?: boolean; originalTokensEstimate?: number })
-    | ReadSingleFailure
-  > = [];
+  const files: BatchReadFile[] = [];
+  const sink: ReadDiagnosticsSink = { outlineFallbacks: [] };
+  // 第一次观察到取消时按原因归类一次（signal 的 reason 中止后不再变化）。
+  let cancelled: CancellationStatus | undefined;
 
   for (const batchPath of filePaths) {
     if (ctx.abortSignal?.aborted) {
-      files.push({ ok: false, path: batchPath, error: 'Read aborted' });
+      // 取消后不再发起新的读取：剩余文件逐个写成 Read aborted，结束后按取消原因统一归类为
+      // timeout（期限）或 aborted（宿主/用户取消）并点名。
+      cancelled ??= cancellationStatus(ctx.abortSignal);
+      files.push({ ok: false, path: batchPath, error: BATCH_READ_ABORTED });
       continue;
     }
-    const result = await readSingleFile(batchPath, params, ctx);
+    const result = await readSingleFile(batchPath, range, ctx, sink);
     if (!result.ok) {
       files.push(result);
       continue;
@@ -1124,30 +1280,225 @@ async function handleBatchRead(
     },
   };
   const tokensEstimate = estimateTokens(JSON.stringify(data));
+  const completeness = describeBatchCompleteness(files, sink, perFileTokenBudget, cancelled);
 
   if (succeeded === 0) {
+    // 全部失败仍是 ok:false；若是取消造成的，显式声明 timeout/aborted 并带上点名诊断。
+    const cancelledStatus = completeness.cancelled > 0 ? completeness.resultStatus : undefined;
+    reportBatchReadStatus(cancelledStatus ?? 'error', completeness.counts);
     return {
       ok: false,
       data,
       error: `code.read batch failed: ${failed}/${filePaths.length} files failed`,
-      _meta: { cached: false, durationMs: 0, tokensEstimate },
+      _meta: {
+        cached: false,
+        durationMs: 0,
+        tokensEstimate,
+        ...(cancelledStatus
+          ? { resultStatus: cancelledStatus, diagnosticWarnings: completeness.warnings }
+          : {}),
+      },
     };
   }
 
   // 与 code.search 的“全部 pattern 命中”同一口径：每个请求的文件都返回 unchanged 才算整次命中；
   // 任何失败、full、range、delta 都意味着本次真的读取并交付了新内容。
   const allUnchanged = files.every((file) => file.ok && file.mode === 'unchanged');
-  return ok(data, { tokensEstimate, ...(allUnchanged ? { cached: true } : {}) });
+  // I17：部分失败、取消、截断不再报成完整成功；ok 与 data 形状保持不变（部分成功仍可用）。
+  if (completeness.resultStatus) {
+    reportBatchReadStatus(completeness.resultStatus, completeness.counts);
+  }
+  return ok(data, {
+    tokensEstimate,
+    ...(allUnchanged ? { cached: true } : {}),
+    ...(completeness.degraded ? { degraded: true } : {}),
+    ...(completeness.resultStatus ? { resultStatus: completeness.resultStatus } : {}),
+    ...(sink.outlineFallbacks.length > 0 ? { fallbackUsed: true } : {}),
+    ...(completeness.warnings.length > 0 ? { diagnosticWarnings: completeness.warnings } : {}),
+  });
+}
+
+/**
+ * batch 结果的完整性归类（I17）：
+ * - 任一文件因取消写成 Read aborted → 按取消原因归类：期限 → timeout，宿主/用户取消 → aborted；
+ * - 否则有失败文件或被单文件预算截断的文件 → partial；
+ * - 头尾预览只标 degraded/fallbackUsed，不改变状态（与单读一致）。
+ * 诊断只含项目相对路径与计数，不含文件原文或宿主绝对路径（逐文件错误仍在 data 里）。
+ */
+function describeBatchCompleteness(
+  files: readonly BatchReadFile[],
+  sink: ReadDiagnosticsSink,
+  perFileTokenBudget: number,
+  observedCancel: CancellationStatus | undefined
+): {
+  resultStatus?: 'partial' | CancellationStatus;
+  degraded: boolean;
+  cancelled: number;
+  warnings: ToolDiagnosticWarning[];
+  counts: BatchReadCounts;
+} {
+  // Read aborted 只由取消分支写入，observedCancel 此时必然已归类；缺席时按宿主取消兜底。
+  const cancelStatus: CancellationStatus = observedCancel ?? 'aborted';
+  const abortedPaths: string[] = [];
+  const failedPaths: string[] = [];
+  const truncatedPaths: string[] = [];
+  for (const file of files) {
+    if (!file.ok) {
+      (file.error === BATCH_READ_ABORTED ? abortedPaths : failedPaths).push(file.path);
+    } else if (file.truncated) {
+      truncatedPaths.push(file.path);
+    }
+  }
+  const warnings: ToolDiagnosticWarning[] = [];
+  const succeeded = files.length - abortedPaths.length - failedPaths.length;
+  if (abortedPaths.length > 0 || failedPaths.length > 0) {
+    const parts = [`code.read batch returned ${succeeded}/${files.length} files.`];
+    if (failedPaths.length > 0) {
+      parts.push(`Failed (see files[].error): ${samplePaths(failedPaths)}.`);
+    }
+    if (abortedPaths.length > 0) {
+      const cause =
+        cancelStatus === 'timeout' ? 'Deadline reached before reading' : 'Cancelled before reading';
+      parts.push(
+        `${cause} ${abortedPaths.length} file(s): ${samplePaths(abortedPaths)}; they were not read, not found missing.`
+      );
+    }
+    warnings.push({
+      code: 'code_read_batch_partial',
+      message: parts.join(' '),
+      stage: 'code.read',
+      tool: 'code',
+    });
+  }
+  if (truncatedPaths.length > 0) {
+    warnings.push({
+      code: 'code_read_partial_view',
+      message: `Batch per-file budget (${perFileTokenBudget} tokens) truncated ${truncatedPaths.length} file(s): ${samplePaths(truncatedPaths)}. Use startLine/endLine to retrieve omitted content.`,
+      stage: 'code.read',
+      tool: 'code',
+    });
+  }
+  pushOutlineFallbackWarning(warnings, sink.outlineFallbacks);
+  pushRangeBeyondEofWarning(warnings, files);
+
+  const resultStatus =
+    abortedPaths.length > 0
+      ? cancelStatus
+      : failedPaths.length > 0 || truncatedPaths.length > 0
+        ? 'partial'
+        : undefined;
+  const degraded = resultStatus !== undefined || sink.outlineFallbacks.length > 0;
+  return {
+    resultStatus,
+    degraded,
+    cancelled: abortedPaths.length,
+    warnings,
+    counts: {
+      requested: files.length,
+      succeeded,
+      failed: failedPaths.length,
+      cancelled: abortedPaths.length,
+      truncated: truncatedPaths.length,
+      outlineFallbacks: sink.outlineFallbacks.length,
+    },
+  };
+}
+
+interface BatchReadCounts {
+  requested: number;
+  succeeded: number;
+  failed: number;
+  /** 因取消（期限或宿主/用户停止）而未读取的文件数；归类见汇总日志的 status。 */
+  cancelled: number;
+  truncated: number;
+  outlineFallbacks: number;
+}
+
+/** batch 非完整结局（partial/timeout/aborted/全部失败）的汇总日志：只含状态与计数，不含路径或原文。 */
+function reportBatchReadStatus(
+  status: 'partial' | CancellationStatus | 'error',
+  counts: BatchReadCounts
+): void {
+  const message =
+    `[code.read] batch status=${status} requested=${counts.requested} succeeded=${counts.succeeded} ` +
+    `failed=${counts.failed} cancelled=${counts.cancelled} truncated=${counts.truncated} ` +
+    `outlineFallbacks=${counts.outlineFallbacks}`;
+  observeSafely(
+    () => Logger.getInstance().info(message),
+    () => undefined
+  );
+}
+
+function samplePaths(paths: readonly string[]): string {
+  const sample = paths.slice(0, READ_DIAGNOSTIC_PATH_SAMPLE).join(', ');
+  const more =
+    paths.length > READ_DIAGNOSTIC_PATH_SAMPLE
+      ? ` and ${paths.length - READ_DIAGNOSTIC_PATH_SAMPLE} more`
+      : '';
+  return `${sample}${more}`;
+}
+
+/** 头尾预览降级的诊断（I17）：点名文件、原因与（analyzer 抛错时的）错误类名。 */
+function pushOutlineFallbackWarning(
+  warnings: ToolDiagnosticWarning[],
+  fallbacks: readonly OutlineFallbackRecord[]
+): void {
+  if (fallbacks.length === 0) {
+    return;
+  }
+  const described = fallbacks
+    .slice(0, READ_DIAGNOSTIC_PATH_SAMPLE)
+    .map(
+      (fallback) =>
+        `${fallback.path} (${fallback.lineCount} lines, reason=${fallback.reason}: ${OUTLINE_FALLBACK_DESCRIPTIONS[fallback.reason]}${fallback.errorName ? ` ${fallback.errorName}` : ''})`
+    )
+    .join('; ');
+  const more =
+    fallbacks.length > READ_DIAGNOSTIC_PATH_SAMPLE
+      ? `; and ${fallbacks.length - READ_DIAGNOSTIC_PATH_SAMPLE} more`
+      : '';
+  warnings.push({
+    code: 'code_read_outline_fallback',
+    message: `AST outline unavailable; returned a head/tail preview (first ${HEAD_TAIL_PREVIEW_HEAD} and last ${HEAD_TAIL_PREVIEW_TAIL} lines) instead: ${described}${more}. Use startLine/endLine to read specific sections.`,
+    stage: 'code.read',
+    tool: 'code',
+  });
+}
+
+/** startLine 超过文件行数时返回空区间（I19），用警告说明“文件没有这么多行”，而不是静默空串。 */
+function pushRangeBeyondEofWarning(
+  warnings: ToolDiagnosticWarning[],
+  files: readonly (BatchReadFile | ReadSingleResult)[]
+): void {
+  const beyond = files.filter(
+    (file): file is ReadSingleSuccess =>
+      file.ok &&
+      file.mode === 'range' &&
+      file.startLine !== undefined &&
+      file.startLine > file.lineCount
+  );
+  if (beyond.length === 0) {
+    return;
+  }
+  const described = beyond
+    .slice(0, READ_DIAGNOSTIC_PATH_SAMPLE)
+    .map((file) => `${file.path} (startLine ${file.startLine}, file has ${file.lineCount} lines)`)
+    .join('; ');
+  warnings.push({
+    code: 'code_read_range_beyond_eof',
+    message: `Requested startLine is past the end of file; returned an empty range: ${described}.`,
+    stage: 'code.read',
+    tool: 'code',
+  });
 }
 
 async function readSingleFile(
   filePath: string,
-  params: Record<string, unknown>,
-  ctx: ToolContext
+  range: ReadRange,
+  ctx: ToolContext,
+  sink: ReadDiagnosticsSink
 ): Promise<ReadSingleResult> {
-  const startLine = params.startLine as number | undefined;
-  const endLine = params.endLine as number | undefined;
-  const maxLines = normalizePositiveInteger(params.maxLines);
+  const { startLine, endLine, maxLines } = range;
 
   const resolved = resolveProjectFilePath(filePath, ctx.projectRoot);
   if (!resolved.ok) {
@@ -1162,10 +1513,11 @@ async function readSingleFile(
     return { ok: false, path: resolved.relPath, error: `Cannot read file: ${msg}` };
   }
 
-  const lines = content.split('\n');
+  const lines = splitSourceLines(content);
   const lineCount = lines.length;
 
-  const isFullRead = !startLine && !endLine && !maxLines && lineCount <= 500;
+  const ranged = hasReadRange(range);
+  const isFullRead = !ranged && lineCount <= FULL_READ_MAX_LINES;
   if (ctx.deltaCache && isFullRead) {
     const delta = ctx.deltaCache.check(resolved.relPath, content);
     // 文件指纹相同不代表该区间已展示；范围补读必须返回真实源码。
@@ -1194,16 +1546,17 @@ async function readSingleFile(
     ctx.deltaCache?.set(resolved.relPath, undefined, content);
   }
 
-  if (startLine || endLine || maxLines) {
-    const start = Math.max(1, startLine ?? 1);
+  if (ranged) {
+    const start = startLine ?? 1;
     const maxLineEnd = maxLines ? start + maxLines - 1 : lineCount;
     const end = Math.min(lineCount, endLine ?? maxLineEnd);
+    // start > lineCount 时切片为空：返回空区间，由调用方附 code_read_range_beyond_eof 警告。
     const slice = lines
       .slice(start - 1, end)
       .map((l, i) => `${start + i}|${l}`)
       .join('\n');
     const suffix =
-      end < lineCount && maxLines && !endLine
+      end < lineCount && maxLines && endLine === undefined
         ? `\n... [${lineCount - end} lines omitted; use startLine/endLine for more]`
         : '';
     const contentSlice = `${slice}${suffix}`;
@@ -1219,7 +1572,7 @@ async function readSingleFile(
     };
   }
 
-  if (lineCount <= 500) {
+  if (lineCount <= FULL_READ_MAX_LINES) {
     const numbered = lines.map((l, i) => `${i + 1}|${l}`).join('\n');
     return {
       ok: true,
@@ -1231,57 +1584,90 @@ async function readSingleFile(
     };
   }
 
-  const outline = await generateOutlineForRead(resolved.absPath, resolved.relPath, lineCount, ctx);
+  const outline = await generateOutlineForRead(resolved.absPath, resolved.relPath, lines, ctx);
+  if (outline.source === 'head-tail') {
+    sink.outlineFallbacks.push({
+      path: resolved.relPath,
+      lineCount,
+      reason: outline.reason,
+      ...(outline.errorName ? { errorName: outline.errorName } : {}),
+    });
+  }
   return {
     ok: true,
     path: resolved.relPath,
-    content: outline,
+    content: outline.content,
     lineCount,
-    tokensEstimate: estimateTokens(outline),
+    tokensEstimate: estimateTokens(outline.content),
     mode: 'outline',
+    outlineSource: outline.source,
+    ...(outline.source === 'head-tail' ? { outlineReason: outline.reason } : {}),
   };
 }
 
+type ReadOutline =
+  | { source: 'ast'; content: string }
+  | { source: 'head-tail'; content: string; reason: OutlineFallbackReason; errorName?: string };
+
+/**
+ * >500 行文件的展示：优先 AST 大纲；analyzer 缺席、无定义或抛错时退回头尾预览（I17）。
+ * 预览直接使用 readSingleFile 已读到的行，不再二次读盘（避免与 deltaCache 登记的版本不一致）。
+ * 每次退回都记日志：analyzer 抛错是需要排查的异常，记 warn 并带错误类名与消息；
+ * 缺席/无定义是已知能力边界（当前生产宿主未注入 analyzer），记 debug 避免刷屏。
+ */
 async function generateOutlineForRead(
   absPath: string,
   relPath: string,
-  lineCount: number,
+  lines: readonly string[],
   ctx: ToolContext
-): Promise<string> {
-  try {
-    const outline = await buildAstOutline(absPath, relPath, ctx);
-    if (outline) {
-      return `${outline}\n\nFile has ${lineCount} lines. Showing outline. Use startLine/endLine to read specific sections.`;
-    }
-  } catch {
-    // AST 不可用，使用头尾预览
+): Promise<ReadOutline> {
+  const lineCount = lines.length;
+  const ast = await buildAstOutline(absPath, relPath, ctx, lineCount);
+  if (ast.kind === 'outline') {
+    return {
+      source: 'ast',
+      content: `${ast.text}\n\nFile has ${lineCount} lines. Showing outline. Use startLine/endLine to read specific sections.`,
+    };
   }
 
-  const content = await fs.readFile(absPath, 'utf-8');
-  const lines = content.split('\n');
-  const headCount = 30;
-  const tailCount = 15;
+  const errorName = ast.kind === 'error' ? ast.errorName : undefined;
+  const logLine =
+    `[code.read] path=${relPath}; outline_fallback reason=${ast.reason} lineCount=${lineCount} ` +
+    `selected=head-tail${ast.kind === 'error' ? ` error=${ast.errorName}: ${ast.errorMessage}` : ''}`;
+  observeSafely(
+    () =>
+      ast.kind === 'error'
+        ? Logger.getInstance().warn(logLine)
+        : Logger.getInstance().debug(logLine),
+    () => undefined
+  );
 
   const head = lines
-    .slice(0, headCount)
+    .slice(0, HEAD_TAIL_PREVIEW_HEAD)
     .map((l, i) => `${i + 1}|${l}`)
     .join('\n');
   const tail = lines
-    .slice(-tailCount)
-    .map((l, i) => `${lineCount - tailCount + i + 1}|${l}`)
+    .slice(-HEAD_TAIL_PREVIEW_TAIL)
+    .map((l, i) => `${lineCount - HEAD_TAIL_PREVIEW_TAIL + i + 1}|${l}`)
     .join('\n');
 
-  return [
+  const content = [
     `// ${relPath} — ${lineCount} lines (showing head + tail)`,
     '',
     head,
     '',
-    `  ... [${lineCount - headCount - tailCount} lines omitted] ...`,
+    `  ... [${lineCount - HEAD_TAIL_PREVIEW_HEAD - HEAD_TAIL_PREVIEW_TAIL} lines omitted] ...`,
     '',
     tail,
     '',
     'Use startLine/endLine to read specific sections.',
   ].join('\n');
+  return {
+    source: 'head-tail',
+    content,
+    reason: ast.reason,
+    ...(errorName ? { errorName } : {}),
+  };
 }
 
 /* ================================================================== */
@@ -1309,24 +1695,48 @@ async function handleOutline(
   }
 
   const outline = await buildAstOutline(resolved.absPath, resolved.relPath, ctx);
-  if (outline) {
-    return ok(outline, { tokensEstimate: estimateTokens(outline) });
+  if (outline.kind === 'outline') {
+    return ok(outline.text, { tokensEstimate: estimateTokens(outline.text) });
   }
 
+  // I17：analyzer 抛错与“不可用/不支持”分开报告，抛错带错误类名与消息并记 warn，便于定位。
+  if (outline.kind === 'error') {
+    const message = `[code.outline] path=${resolved.relPath}; reason=${outline.reason} error=${outline.errorName}: ${outline.errorMessage}`;
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+    return fail(
+      `Cannot generate outline for ${filePath} — AST analyzer threw ${outline.errorName}: ${outline.errorMessage}`
+    );
+  }
   return fail(
-    `Cannot generate outline for ${filePath} — AST analyzer not available or language not supported`
+    outline.reason === 'analyzer-missing'
+      ? `Cannot generate outline for ${filePath} — AST analyzer not available`
+      : `Cannot generate outline for ${filePath} — AST analyzer returned no definitions (language not supported or no declarations)`
   );
 }
 
 /**
+ * AST 大纲的三种结局（I17）：成功、能力边界内的“不可用”（未注入 analyzer / 无定义）、
+ * analyzer 抛错。旧实现用裸 catch 把抛错吞成 null，与“不可用”无法区分。
+ */
+type AstOutlineOutcome =
+  | { kind: 'outline'; text: string }
+  | { kind: 'unavailable'; reason: 'analyzer-missing' | 'no-definitions' }
+  | { kind: 'error'; reason: 'analyzer-error'; errorName: string; errorMessage: string };
+
+/**
  * 通过 AstAnalyzer 生成文件骨架。
  * AstAnalyzer 接口来自 lib/core/AstAnalyzer.ts。
+ * lineCount 由 code.read 传入（已按 splitSourceLines 计数）；code.outline 不传时按需读取一次。
  */
 async function buildAstOutline(
   absPath: string,
   relPath: string,
-  ctx: ToolContext
-): Promise<string | null> {
+  ctx: ToolContext,
+  knownLineCount?: number
+): Promise<AstOutlineOutcome> {
   const analyzer = ctx.astAnalyzer as
     | {
         analyzeFile?: (filePath: string) => Promise<AstFileResult | null>;
@@ -1334,32 +1744,55 @@ async function buildAstOutline(
     | undefined;
 
   if (!analyzer?.analyzeFile) {
-    return null;
+    return { kind: 'unavailable', reason: 'analyzer-missing' };
   }
 
+  let result: AstFileResult | null;
   try {
-    const result = await analyzer.analyzeFile(absPath);
-    if (!result || !result.definitions || result.definitions.length === 0) {
-      return null;
-    }
-
-    const content = await fs.readFile(absPath, 'utf-8');
-    const lineCount = content.split('\n').length;
-    const lang = detectLanguage(relPath);
-
-    const outlineLines = [`// ${lineCount} lines, ${lang}, Tree-sitter AST`, ''];
-
-    for (const def of result.definitions) {
-      const indent = '  '.repeat(def.depth ?? 0);
-      const lineRange = def.endLine ? `[${def.startLine}-${def.endLine}]` : `[${def.startLine}]`;
-      const signature = def.signature ?? def.name;
-      outlineLines.push(`${indent}${signature} ${lineRange}`);
-    }
-
-    return outlineLines.join('\n');
-  } catch {
-    return null;
+    result = await analyzer.analyzeFile(absPath);
+  } catch (err: unknown) {
+    // analyzer 抛错：保留错误类名与消息，由调用方写进诊断并记 warn，不再伪装成“不可用”。
+    return {
+      kind: 'error',
+      reason: 'analyzer-error',
+      errorName: err instanceof Error ? err.name : typeof err,
+      errorMessage: errorMessage(err, String(err)),
+    };
   }
+  if (!result || !Array.isArray(result.definitions) || result.definitions.length === 0) {
+    return { kind: 'unavailable', reason: 'no-definitions' };
+  }
+
+  let lineCount = knownLineCount;
+  if (lineCount === undefined) {
+    try {
+      lineCount = splitSourceLines(await fs.readFile(absPath, 'utf-8')).length;
+    } catch (err: unknown) {
+      // 计行读盘失败不是 analyzer 的错：大纲已生成，只是头部行数未知；记 debug 后照常返回大纲。
+      const message = `[code.outline] path=${relPath}; line count unavailable (${errorMessage(err, 'read failed')}); outline header omits it`;
+      observeSafely(
+        () => Logger.getInstance().debug(message),
+        () => undefined
+      );
+    }
+  }
+
+  const lang = detectLanguage(relPath);
+  const outlineLines = [
+    lineCount === undefined
+      ? `// ${lang}, Tree-sitter AST`
+      : `// ${lineCount} lines, ${lang}, Tree-sitter AST`,
+    '',
+  ];
+
+  for (const def of result.definitions) {
+    const indent = '  '.repeat(def.depth ?? 0);
+    const lineRange = def.endLine ? `[${def.startLine}-${def.endLine}]` : `[${def.startLine}]`;
+    const signature = def.signature ?? def.name;
+    outlineLines.push(`${indent}${signature} ${lineRange}`);
+  }
+
+  return { kind: 'outline', text: outlineLines.join('\n') };
 }
 
 interface AstFileResult {
@@ -1377,21 +1810,137 @@ interface AstFileResult {
 /*  code.structure                                                     */
 /* ================================================================== */
 
+/**
+ * code.structure 输出的条目上限（含根行，I20）：router 对 structure 的展示配额是 2000 token，
+ * 约合 400 行紧凑树；收满即停止遍历（不再发起新的 readdir），不必遍历完整个大仓库再被截断。
+ */
+const STRUCTURE_MAX_ENTRIES = 400;
+
+/**
+ * 一次 code.structure 遍历的共享状态（I20）：取消信号、条目计数与上限、不可读子目录。
+ * 取消与上限都只在“发起下一次 readdir / 追加下一行”前检查，已构造的部分树原样返回。
+ */
+interface StructureWalk {
+  readonly signal?: AbortSignal;
+  readonly maxEntries: number;
+  entries: number;
+  truncated: boolean;
+  /**
+   * 遍历被取消时的归类（与 code.search / terminal 同一口径）：期限 → timeout，宿主/用户取消 → aborted；
+   * 未取消为 undefined。第一次观察到取消时写入，之后不再变化。
+   */
+  cancelled?: CancellationStatus;
+  /** readdir 失败的子目录（项目相对路径）；根目录失败直接抛错，整次调用失败。 */
+  unreadableDirs: string[];
+}
+
 async function handleStructure(
   params: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
   const directory = (params.directory as string) || '.';
   const depth = Math.min((params.depth as number) || 3, 5);
+  const walk: StructureWalk = {
+    ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
+    maxEntries: STRUCTURE_MAX_ENTRIES,
+    entries: 0,
+    truncated: false,
+    unreadableDirs: [],
+  };
 
+  let lines: string[];
   try {
     const absDir = resolveProjectPath(ctx.projectRoot, directory).absolute;
     const canonicalRoot = resolveProjectPath(ctx.projectRoot, '.').absolute;
-    const tree = await buildDirectoryTree(absDir, canonicalRoot, depth, 0);
-    return ok(tree, { tokensEstimate: estimateTokens(tree) });
+    lines = await buildDirectoryTree(absDir, canonicalRoot, depth, 0, walk);
   } catch (err: unknown) {
     return fail(`Cannot list structure: ${err instanceof Error ? err.message : String(err)}`);
   }
+
+  reportStructureWalk(directory, walk);
+  if (walk.cancelled && lines.length === 0) {
+    // 根目录都还没列出就被取消：没有可返回的部分树，按失败报告并显式声明 timeout/aborted。
+    const reason =
+      walk.cancelled === 'timeout'
+        ? 'reached its deadline before listing'
+        : 'aborted before listing';
+    return {
+      ...fail(`code.structure ${reason} ${directory}`),
+      _meta: { cached: false, tokensEstimate: 0, durationMs: 0, resultStatus: walk.cancelled },
+    };
+  }
+
+  // 模型看不到信封诊断：截断与取消在树尾追加一行标记，说明下面缺了什么。
+  if (walk.truncated) {
+    lines.push(
+      `... [structure truncated at ${walk.maxEntries} entries; list a narrower directory or a smaller depth for the rest]`
+    );
+  }
+  if (walk.cancelled === 'timeout') {
+    lines.push(
+      '... [structure listing reached its deadline before completion; the tree above is partial]'
+    );
+  } else if (walk.cancelled === 'aborted') {
+    lines.push('... [structure listing aborted before completion; the tree above is partial]');
+  }
+  const tree = lines.join('\n');
+  const warnings = structureWarnings(walk);
+  const resultStatus =
+    walk.cancelled ??
+    (walk.truncated || walk.unreadableDirs.length > 0 ? ('partial' as const) : undefined);
+  return ok(tree, {
+    tokensEstimate: estimateTokens(tree),
+    ...(resultStatus ? { degraded: true, resultStatus } : {}),
+    ...(warnings.length > 0 ? { diagnosticWarnings: warnings } : {}),
+  });
+}
+
+function structureWarnings(walk: StructureWalk): ToolDiagnosticWarning[] {
+  const warnings: ToolDiagnosticWarning[] = [];
+  if (walk.cancelled) {
+    const cause = walk.cancelled === 'timeout' ? 'reached its deadline' : 'aborted';
+    warnings.push({
+      code: 'code_structure_incomplete',
+      message: `Directory listing ${cause} before completion after ${walk.entries} entries; directories not yet visited are missing from the tree.`,
+      stage: 'code.structure',
+      tool: 'code',
+    });
+  }
+  if (walk.truncated) {
+    warnings.push({
+      code: 'code_structure_truncated',
+      message: `Directory listing stopped at ${walk.maxEntries} entries; later entries were not listed. Use a narrower directory or a smaller depth.`,
+      stage: 'code.structure',
+      tool: 'code',
+    });
+  }
+  if (walk.unreadableDirs.length > 0) {
+    warnings.push({
+      code: 'code_structure_unreadable',
+      message: `Could not read ${plural(walk.unreadableDirs.length, 'subdirectory', 'subdirectories')} (shown as <unreadable>): ${samplePaths(walk.unreadableDirs)}.`,
+      stage: 'code.structure',
+      tool: 'code',
+    });
+  }
+  return warnings;
+}
+
+/** 遍历降级（取消、截断、不可读子目录）记一条汇总日志；完整遍历不打日志。 */
+function reportStructureWalk(directory: string, walk: StructureWalk): void {
+  if (!walk.cancelled && !walk.truncated && walk.unreadableDirs.length === 0) {
+    return;
+  }
+  const message =
+    `[code.structure] directory=${JSON.stringify(directory)} entries=${walk.entries} ` +
+    `cap=${walk.maxEntries} truncated=${walk.truncated} cancelled=${walk.cancelled ?? 'none'} ` +
+    `unreadableDirs=${walk.unreadableDirs.length}`;
+  observeSafely(
+    () =>
+      walk.unreadableDirs.length > 0
+        ? Logger.getInstance().warn(message)
+        : Logger.getInstance().info(message),
+    () => undefined
+  );
 }
 
 /**
@@ -1409,16 +1958,57 @@ const STRUCTURE_IGNORED_DIRS: ReadonlySet<string> = new Set([
   '.swiftpm',
 ]);
 
+/** 占用一个输出条目名额；名额用尽时标记截断并返回 false（调用方停止追加与遍历）。 */
+function takeStructureEntry(walk: StructureWalk): boolean {
+  if (walk.entries >= walk.maxEntries) {
+    walk.truncated = true;
+    return false;
+  }
+  walk.entries++;
+  return true;
+}
+
+/** 已取消或已截断：不再发起新的 readdir，也不再追加条目。取消原因在第一次观察到时归类。 */
+function structureWalkStopped(walk: StructureWalk): boolean {
+  if (walk.cancelled === undefined && walk.signal?.aborted) {
+    walk.cancelled = cancellationStatus(walk.signal);
+  }
+  return walk.cancelled !== undefined || walk.truncated;
+}
+
 async function buildDirectoryTree(
   absDir: string,
   projectRoot: string,
   maxDepth: number,
-  currentDepth: number
-): Promise<string> {
-  const entries = await fs.readdir(absDir, { withFileTypes: true });
+  currentDepth: number,
+  walk: StructureWalk
+): Promise<string[]> {
   const relDir = path.relative(projectRoot, absDir) || '.';
-  const lines: string[] = currentDepth === 0 ? [`${relDir}/`] : [];
   const indent = '  '.repeat(currentDepth + (currentDepth === 0 ? 0 : 1));
+  if (structureWalkStopped(walk)) {
+    return [];
+  }
+
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(absDir, { withFileTypes: true });
+  } catch (err: unknown) {
+    if (currentDepth === 0) {
+      // 请求的目录本身读不了：没有可展示的树，交给外层按失败处理。
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+    // 子目录读不了（如 EACCES）：只把该节点标成 <unreadable>，兄弟目录照常列出，诊断点名。
+    walk.unreadableDirs.push(relDir);
+    return takeStructureEntry(walk) ? [`${indent}<unreadable>`] : [];
+  }
+
+  const lines: string[] = [];
+  if (currentDepth === 0) {
+    if (!takeStructureEntry(walk)) {
+      return lines;
+    }
+    lines.push(`${relDir}/`);
+  }
 
   const dirs: string[] = [];
   const files: string[] = [];
@@ -1440,25 +2030,31 @@ async function buildDirectoryTree(
   files.sort();
 
   for (const dir of dirs) {
+    if (structureWalkStopped(walk) || !takeStructureEntry(walk)) {
+      return lines;
+    }
     lines.push(`${indent}${dir}/`);
     if (currentDepth < maxDepth - 1) {
-      const subTree = await buildDirectoryTree(
-        path.join(absDir, dir),
-        projectRoot,
-        maxDepth,
-        currentDepth + 1
+      lines.push(
+        ...(await buildDirectoryTree(
+          path.join(absDir, dir),
+          projectRoot,
+          maxDepth,
+          currentDepth + 1,
+          walk
+        ))
       );
-      if (subTree) {
-        lines.push(subTree);
-      }
     }
   }
 
   for (const file of files) {
+    if (structureWalkStopped(walk) || !takeStructureEntry(walk)) {
+      return lines;
+    }
     lines.push(`${indent}${file}`);
   }
 
-  return lines.join('\n');
+  return lines;
 }
 
 /* ================================================================== */

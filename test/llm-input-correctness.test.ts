@@ -573,6 +573,14 @@ describe('LLM input correctness fixture', () => {
       expect(batch.ok).toBe(true);
       expect(batch.error).toBeUndefined();
       expect(JSON.stringify(batch)).not.toContain('Missing required param "path"');
+      // L4-P17：部分失败仍是 ok:true 且 data 形状不变，但结果状态如实报告为 partial 并点名失败文件。
+      expect(batch._meta?.resultStatus).toBe('partial');
+      expect(batch._meta?.degraded).toBe(true);
+      const partialWarning = batch._meta?.diagnosticWarnings?.find(
+        (warning) => warning.code === 'code_read_batch_partial'
+      );
+      expect(partialWarning?.message).toContain('src/missing.ts');
+      expect(partialWarning?.message).toContain('../outside.ts');
 
       const data = batch.data as BatchReadData;
       expect(data.mode).toBe('batch');
@@ -602,6 +610,8 @@ describe('LLM input correctness fixture', () => {
         toolContext(root, deltaCache)
       );
       expect(first.ok).toBe(true);
+      expect(first._meta?.resultStatus).toBeUndefined();
+      expect(first._meta?.diagnosticWarnings).toBeUndefined();
 
       const second = await router.execute(
         { tool: 'code', action: 'read', params: { filePaths: ['src/a.ts', 'src/b.ts'] } },
@@ -625,6 +635,10 @@ describe('LLM input correctness fixture', () => {
       const cappedData = capped.data as BatchReadData;
       const cappedFile = cappedData.files[0];
       expect(capped.ok).toBe(true);
+      expect(capped._meta?.resultStatus).toBe('partial');
+      expect(capped._meta?.diagnosticWarnings?.map((warning) => warning.code)).toContain(
+        'code_read_partial_view'
+      );
       expect(cappedFile?.truncated).toBe(true);
       expect(cappedFile?.originalTokensEstimate).toBeGreaterThan(
         cappedData.summary.perFileTokenBudget

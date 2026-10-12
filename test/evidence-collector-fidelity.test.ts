@@ -21,10 +21,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
+import { captureEvidenceFromEnvelope } from '../src/agent/evidence/EvidenceCapture.js';
 import {
   EvidenceCollector,
   type SnippetRangeReader,
 } from '../src/agent/evidence/EvidenceCollector.js';
+import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import {
   buildCodeContextSection,
   buildProducerPromptV2,
@@ -825,6 +827,13 @@ it('real single-path outline output cannot become a verbatim collector source sn
   });
   expect(envelope.ok).toBe(true);
   expect(envelope.text).toContain('showing head + tail');
+  // L4-P17：宿主未注入 analyzer 时头尾预览是降级视图，信封诊断必须说清，状态仍是 success。
+  expect(envelope.status).toBe('success');
+  expect(envelope.diagnostics?.degraded).toBe(true);
+  expect(envelope.diagnostics?.fallbackUsed).toBe(true);
+  expect(envelope.diagnostics?.warnings.map((warning) => warning.code)).toContain(
+    'code_read_outline_fallback'
+  );
   const collector = new EvidenceCollector();
   collector.processToolCall({
     tool: 'code',
@@ -833,6 +842,137 @@ it('real single-path outline output cannot become a verbatim collector source sn
     envelope,
   });
   expect(collector.build().evidenceMap.get('large.ts')?.codeSnippets ?? []).toEqual([]);
+});
+
+// L4-P17（module-review-2026-10-01 I17）：头尾预览保持 mode:'outline'，另加 outlineSource/outlineReason。
+// 采集端除 mode 外也读取 outlineSource：带它的条目是派生视图，不能成为逐字源码片段或带 range 的台账条目。
+it('L4-P17: a real batch head/tail preview carries outlineSource and stays a derived view for both collectors', async () => {
+  const dataRoot = createTempProject('collector-head-tail-');
+  writeFileSync(
+    path.join(dataRoot, 'large.ts'),
+    Array.from({ length: 550 }, (_, i) => `export const value${i} = ${i};`).join('\n')
+  );
+  const router = new ToolRouterAdapter({
+    contextFactory: { create: () => ({ projectRoot: dataRoot, tokenBudget: 8000 }) },
+  });
+  const args = { action: 'read', params: { filePaths: ['large.ts'] } };
+  const envelope = await router.execute({
+    toolId: 'code',
+    args,
+    surface: 'runtime',
+    actor: { user: 'test' },
+    source: { kind: 'runtime' },
+  });
+  expect(envelope.ok).toBe(true);
+  expect(envelope.status).toBe('success');
+  const data = envelope.structuredContent as {
+    files: Array<{ mode?: string; outlineSource?: string; outlineReason?: string }>;
+  };
+  expect(data.files[0]).toMatchObject({
+    mode: 'outline',
+    outlineSource: 'head-tail',
+    outlineReason: 'analyzer-missing',
+  });
+
+  const collector = new EvidenceCollector();
+  collector.processToolCall({ tool: 'code', args, result: data, envelope });
+  expect(collector.build().evidenceMap.get('large.ts')?.codeSnippets ?? []).toEqual([]);
+
+  const ledger = new EvidenceLedgerStore({
+    dataRoot,
+    jobId: 'job_p17',
+    sessionId: 'sess_p17',
+    dimensionId: 'p17',
+  });
+  const entries = captureEvidenceFromEnvelope(
+    ledger,
+    { id: 'c-p17', name: 'code', args },
+    envelope
+  );
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.file).toBe('large.ts');
+  expect(entries[0]?.range).toBeUndefined();
+});
+
+it('L4-P17: an outlineSource item without mode is never treated as a contiguous source slice', () => {
+  const file = {
+    ok: true,
+    path: 'src/a.ts',
+    content: '1|export const a = 1;\n2|export const b = 2;',
+    outlineSource: 'head-tail',
+  };
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args: { action: 'read', params: { filePaths: ['src/a.ts'], startLine: 1, endLine: 2 } },
+    result: { files: [file] },
+  });
+  expect(collector.build().evidenceMap.get('src/a.ts')?.codeSnippets ?? []).toEqual([]);
+
+  const ledger = new EvidenceLedgerStore({
+    dataRoot: createTempProject('capture-outline-source-'),
+    jobId: 'job_p17',
+    sessionId: 'sess_p17',
+    dimensionId: 'p17',
+  });
+  const entries = captureEvidenceFromEnvelope(
+    ledger,
+    {
+      id: 'c-p17-mode-less',
+      name: 'code',
+      args: { action: 'read', params: { filePaths: ['src/a.ts'], startLine: 1, endLine: 2 } },
+    },
+    { ok: true, text: '', structuredContent: { mode: 'batch', files: [file] } }
+  );
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.range).toBeUndefined();
+});
+
+// L4-P17（I17）：batch 部分失败改报 partial 后，成功读取的文件仍是真实源码——partial 不在失败状态集合里，
+// 两个采集端都必须照常采集成功文件（带 range 的台账条目与逐字片段），失败文件不产生条目。
+it('L4-P17: a partial batch read still captures the successfully read files in both collectors', async () => {
+  const dataRoot = createTempProject('collector-partial-batch-');
+  writeFileSync(path.join(dataRoot, 'ok.ts'), 'export const alpha = 1;\nexport const beta = 2;\n');
+  const router = new ToolRouterAdapter({
+    contextFactory: { create: () => ({ projectRoot: dataRoot, tokenBudget: 8000 }) },
+  });
+  const args = { action: 'read', params: { filePaths: ['ok.ts', 'missing.ts'] } };
+  const envelope = await router.execute({
+    toolId: 'code',
+    args,
+    surface: 'runtime',
+    actor: { user: 'test' },
+    source: { kind: 'runtime' },
+  });
+  expect(envelope.ok).toBe(true);
+  expect(envelope.status).toBe('partial');
+
+  const ledger = new EvidenceLedgerStore({
+    dataRoot,
+    jobId: 'job_p17_partial',
+    sessionId: 'sess_p17_partial',
+    dimensionId: 'p17-partial',
+  });
+  const entries = captureEvidenceFromEnvelope(
+    ledger,
+    { id: 'c-p17-partial', name: 'code', args },
+    envelope
+  );
+  expect(entries.map((entry) => [entry.file, entry.range])).toEqual([
+    ['ok.ts', { start: 1, end: 2 }],
+  ]);
+  expect(entries[0]?.content).toBe('export const alpha = 1;\nexport const beta = 2;');
+
+  const collector = new EvidenceCollector();
+  collector.processToolCall({
+    tool: 'code',
+    args,
+    result: envelope.structuredContent,
+    envelope,
+  });
+  const evidenceMap = collector.build().evidenceMap;
+  expect(evidenceMap.get('ok.ts')?.codeSnippets.length ?? 0).toBeGreaterThan(0);
+  expect(evidenceMap.has('missing.ts')).toBe(false);
 });
 
 // L4-P13（module-review-2026-10-01 I13）：批量 pattern 中靠后的稀有符号曾被前面常见 pattern 的命中

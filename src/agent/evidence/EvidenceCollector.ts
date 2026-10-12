@@ -256,12 +256,15 @@ interface ToolResultObject {
     content?: string;
     startLine?: number;
     mode?: string;
+    /** code.read 大纲视图来源（'ast' | 'head-tail'，L4-P17）；带它即派生视图。 */
+    outlineSource?: string;
   }>;
   path?: string;
   filePath?: string;
   content?: string;
   startLine?: number;
   mode?: string;
+  outlineSource?: string;
   matches?: SearchMatch[];
   batchResults?: Record<string, { matches?: SearchMatch[] }>;
   className?: string;
@@ -520,7 +523,7 @@ export class EvidenceCollector {
           readToolObservation({ result: f }).ok &&
           filePath &&
           f.content &&
-          !this.#isNonSourceReadMode(f.mode)
+          !this.#isNonSourceReadMode(f.mode, f.outlineSource)
         ) {
           this.#addSanitizedSnippet(filePath, f.content, f.startLine || 1);
         }
@@ -530,7 +533,7 @@ export class EvidenceCollector {
 
     // 单文件: result.content。deltaCache 的 unchanged/delta 模式返回占位/差分文本而非
     // 完整源码，行号也无从对齐，跳过采集（该文件首次全文读时已采）。
-    if (this.#isNonSourceReadMode(result.mode)) {
+    if (this.#isNonSourceReadMode(result.mode, result.outlineSource)) {
       return;
     }
     const filePath = result.path || result.filePath || argPath;
@@ -539,9 +542,15 @@ export class EvidenceCollector {
     }
   }
 
-  /** deltaCache 命中的读取模式：内容不是完整源码，不可作照抄证据 */
-  #isNonSourceReadMode(mode: unknown): boolean {
-    return mode === 'unchanged' || mode === 'delta' || mode === 'outline';
+  /**
+   * 内容不是连续源码、不可作照抄证据的读取视图：deltaCache 的 unchanged/delta 占位，以及
+   * 大纲视图。大纲按 mode==='outline' 或 outlineSource（L4-P17：AST 大纲 / 头尾预览，
+   * 头尾预览保持 mode:'outline'）任一识别，mode 缺席时也不会把头尾拼接当成源码片段。
+   */
+  #isNonSourceReadMode(mode: unknown, outlineSource?: unknown): boolean {
+    return (
+      mode === 'unchanged' || mode === 'delta' || mode === 'outline' || outlineSource !== undefined
+    );
   }
 
   /** 净化 code.read 展示态内容后入库；行号前缀存在时以前缀校准 startLine（比参数更可靠） */

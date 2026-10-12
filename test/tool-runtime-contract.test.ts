@@ -32,6 +32,7 @@ import {
   type ToolResultTrust,
 } from '../src/tools/kernel/index.js';
 import { isToolActionAllowed } from '../src/tools/kernel/toolSelection.js';
+import { handle as handleCode } from '../src/tools/runtime/handlers/code.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { buildEvidenceCandidatesHint } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
@@ -4201,5 +4202,661 @@ describe('L4-P15 code tool cache hit observability (I05)', () => {
     const after = await call(searchArgs(['alphaNeedle']));
     expect(after.envelope.cache?.hit).toBe(false);
     expect(after.envelope.structuredContent).toMatchObject({ total: 0 });
+  });
+});
+
+// L4-P17（module-review-2026-10-01 I17/I18/I19/I20）：code.read 的头尾预览降级、batch 部分结果、
+// 行切分与行区间校验，以及 code.structure 的取消、上限与不可读子目录。
+describe('L4-P17 code.read/structure degraded, partial and boundary results', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  interface P17BatchFile {
+    ok: boolean;
+    path: string;
+    content?: string;
+    error?: string;
+    mode?: string;
+    lineCount?: number;
+    startLine?: number;
+    endLine?: number;
+    truncated?: boolean;
+    outlineSource?: string;
+    outlineReason?: string;
+  }
+  interface P17BatchData {
+    mode: 'batch';
+    files: P17BatchFile[];
+    summary: { requested: number; succeeded: number; failed: number; partialFailure: boolean };
+  }
+
+  const codes = (warnings: ReadonlyArray<{ code: string }> | undefined) =>
+    (warnings ?? []).map((warning) => warning.code);
+  const warningOf = (
+    warnings: ReadonlyArray<{ code: string; message: string }> | undefined,
+    code: string
+  ) => (warnings ?? []).find((warning) => warning.code === code);
+
+  function readRequestP17(
+    params: Record<string, unknown>,
+    abortSignal?: AbortSignal
+  ): ToolCallRequest {
+    return {
+      toolId: 'code',
+      args: { action: 'read', params },
+      surface: 'runtime',
+      actor: { user: 'test' },
+      source: { kind: 'runtime' },
+      ...(abortSignal ? { abortSignal } : {}),
+    };
+  }
+
+  function structureRequest(
+    params: Record<string, unknown>,
+    abortSignal?: AbortSignal
+  ): ToolCallRequest {
+    return {
+      toolId: 'code',
+      args: { action: 'structure', params },
+      surface: 'runtime',
+      actor: { user: 'test' },
+      source: { kind: 'runtime' },
+      ...(abortSignal ? { abortSignal } : {}),
+    };
+  }
+
+  function adapterFor(root: string, extra: Partial<ToolContext> = {}) {
+    return new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 5000, ...extra }) },
+    });
+  }
+
+  async function largeFileProject(name: string, lines = 1200): Promise<string> {
+    const root = await mkdtemp(join(baseRoot, `p17-${name}-`));
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(
+      join(root, 'src/big.ts'),
+      Array.from(
+        { length: lines },
+        (_, index) => `export const v${index + 1} = ${index + 1};`
+      ).join('\n')
+    );
+    await writeFile(join(root, 'src/small.ts'), 'export const small = 1;\n');
+    return root;
+  }
+
+  describe('I17 outline source and head/tail fallback', () => {
+    it('flags a 1200-line single read without an analyzer as a head/tail fallback (analyzer-missing)', async () => {
+      const root = await largeFileProject('missing');
+      const envelope = await adapterFor(root).execute(readRequestP17({ path: 'src/big.ts' }));
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('success');
+      expect(String(envelope.structuredContent)).toContain('showing head + tail');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      expect(envelope.diagnostics?.fallbackUsed).toBe(true);
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_read_outline_fallback');
+      expect(warning?.message).toContain('reason=analyzer-missing');
+      expect(warning?.message).toContain('src/big.ts');
+    });
+
+    it('labels batch head/tail previews with outlineSource and reason while keeping mode outline', async () => {
+      const root = await largeFileProject('batch-missing');
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts', 'src/small.ts'] } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(result.ok).toBe(true);
+      const data = result.data as P17BatchData;
+      expect(data.files[0]).toMatchObject({
+        ok: true,
+        mode: 'outline',
+        outlineSource: 'head-tail',
+        outlineReason: 'analyzer-missing',
+      });
+      expect(data.files[1]?.outlineSource).toBeUndefined();
+      expect(result._meta?.fallbackUsed).toBe(true);
+      expect(result._meta?.degraded).toBe(true);
+      // 头尾预览是有意的降级视图，不把整次批量读改成 partial。
+      expect(result._meta?.resultStatus).toBeUndefined();
+      expect(codes(result._meta?.diagnosticWarnings)).toContain('code_read_outline_fallback');
+    });
+
+    it('reports an analyzer exception as analyzer-error with the error class instead of swallowing it', async () => {
+      const root = await largeFileProject('throws');
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const astAnalyzer = {
+        analyzeFile: async () => {
+          throw new TypeError('parser crashed');
+        },
+      };
+      const envelope = await adapterFor(root, { astAnalyzer }).execute(
+        readRequestP17({ path: 'src/big.ts' })
+      );
+      expect(envelope.ok).toBe(true);
+      expect(String(envelope.structuredContent)).toContain('showing head + tail');
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_read_outline_fallback');
+      expect(warning?.message).toContain('reason=analyzer-error');
+      expect(warning?.message).toContain('TypeError');
+      const logs = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('[code.read]') && line.includes('analyzer-error'));
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain('parser crashed');
+
+      const outline = await new ToolRouter().execute(
+        { tool: 'code', action: 'outline', params: { path: 'src/big.ts' } },
+        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+      );
+      expect(outline.ok).toBe(false);
+      expect(outline.error).toContain('AST analyzer threw TypeError');
+      expect(outline.error).not.toContain('not available');
+    });
+
+    it('reports an analyzer without definitions as no-definitions', async () => {
+      const root = await largeFileProject('empty-defs');
+      const astAnalyzer = { analyzeFile: async () => ({ definitions: [] }) };
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
+        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+      );
+      const data = result.data as P17BatchData;
+      expect(data.files[0]).toMatchObject({
+        outlineSource: 'head-tail',
+        outlineReason: 'no-definitions',
+      });
+      expect(
+        warningOf(result._meta?.diagnosticWarnings, 'code_read_outline_fallback')?.message
+      ).toContain('reason=no-definitions');
+    });
+
+    it('marks a real AST outline as outlineSource ast without fallback diagnostics', async () => {
+      const root = await largeFileProject('ast');
+      const astAnalyzer = {
+        analyzeFile: async () => ({
+          definitions: [{ name: 'v1', kind: 'variable', startLine: 1, endLine: 1, depth: 0 }],
+        }),
+      };
+      const batch = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
+        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+      );
+      const file = (batch.data as P17BatchData).files[0];
+      expect(file).toMatchObject({ mode: 'outline', outlineSource: 'ast' });
+      expect(file?.outlineReason).toBeUndefined();
+      expect(file?.content).toContain('// 1200 lines, TypeScript, Tree-sitter AST');
+      expect(batch._meta?.fallbackUsed).toBeUndefined();
+      expect(batch._meta?.degraded).toBeUndefined();
+      expect(codes(batch._meta?.diagnosticWarnings)).not.toContain('code_read_outline_fallback');
+
+      const single = await adapterFor(root, { astAnalyzer }).execute(
+        readRequestP17({ path: 'src/big.ts' })
+      );
+      expect(String(single.structuredContent)).toContain('File has 1200 lines. Showing outline.');
+      expect(single.diagnostics?.degraded).toBe(false);
+      expect(single.diagnostics?.fallbackUsed).toBe(false);
+    });
+  });
+
+  describe('I17 batch partial and aborted status', () => {
+    it('reports a batch with a missing file as partial while keeping ok and the data shape', async () => {
+      const root = await largeFileProject('batch-partial', 10);
+      const envelope = await adapterFor(root).execute(
+        readRequestP17({ filePaths: ['src/small.ts', 'src/missing.ts'] })
+      );
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('partial');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      const data = envelope.structuredContent as P17BatchData;
+      expect(data.summary).toMatchObject({
+        requested: 2,
+        succeeded: 1,
+        failed: 1,
+        partialFailure: true,
+      });
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_read_batch_partial');
+      expect(warning?.message).toContain('src/missing.ts');
+      expect(warning?.message).toContain('1/2');
+    });
+
+    it('reports a batch whose file was clamped by the per-file budget as partial', async () => {
+      const root = await mkdtemp(join(baseRoot, 'p17-batch-clamp-'));
+      await writeFile(join(root, 'wide.ts'), 'a'.repeat(5000));
+      const envelope = await new ToolRouterAdapter({
+        contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 1000 }) },
+      }).execute(readRequestP17({ filePaths: ['wide.ts'] }));
+      expect(envelope.ok).toBe(true);
+      expect((envelope.structuredContent as P17BatchData).files[0]?.truncated).toBe(true);
+      expect(envelope.status).toBe('partial');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      expect(
+        warningOf(envelope.diagnostics?.warnings, 'code_read_partial_view')?.message
+      ).toContain('wide.ts');
+    });
+
+    it('reports a batch cancelled after the first file as aborted with the skipped files named', async () => {
+      const root = await largeFileProject('batch-abort', 10);
+      await writeFile(join(root, 'src/third.ts'), 'export const third = 3;\n');
+      const controller = new AbortController();
+      // 读完第一个文件后由 deltaCache 写入钩子触发取消：后续文件必须写成 'Read aborted'。
+      const deltaCache: DeltaCacheLike = {
+        get: () => undefined,
+        set: () => {
+          controller.abort(new Error('user stopped the run'));
+        },
+        check: (_path, content) => {
+          controller.abort(new Error('user stopped the run'));
+          return { mode: 'full', content, lineCount: content.split('\n').length };
+        },
+      };
+      const envelope = await adapterFor(root, { deltaCache }).execute(
+        readRequestP17(
+          { filePaths: ['src/small.ts', 'src/big.ts', 'src/third.ts'] },
+          controller.signal
+        )
+      );
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('aborted');
+      const data = envelope.structuredContent as P17BatchData;
+      expect(data.files.map((file) => [file.ok, file.error])).toEqual([
+        [true, undefined],
+        [false, 'Read aborted'],
+        [false, 'Read aborted'],
+      ]);
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_read_batch_partial');
+      expect(warning?.message).toContain('src/big.ts');
+      expect(warning?.message).toContain('src/third.ts');
+      expect(warning?.message.toLowerCase()).toContain('cancel');
+    });
+
+    // 与 L1-P2（code.search / terminal）同一口径：期限（runOperation 运行/阶段期限或 AbortSignal.timeout，
+    // reason.name === 'TimeoutError'）回执 timeout，宿主或用户取消回执 aborted。
+    it('reports a batch stopped by the run deadline after the first file as timeout, not aborted', async () => {
+      const root = await largeFileProject('batch-deadline', 10);
+      await writeFile(join(root, 'src/third.ts'), 'export const third = 3;\n');
+      const controller = new AbortController();
+      const expireDeadline = () => {
+        controller.abort(new DOMException('fixture deadline', 'TimeoutError'));
+      };
+      const deltaCache: DeltaCacheLike = {
+        get: () => undefined,
+        set: expireDeadline,
+        check: (_path, content) => {
+          expireDeadline();
+          return { mode: 'full', content, lineCount: content.split('\n').length };
+        },
+      };
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      const envelope = await adapterFor(root, { deltaCache }).execute(
+        readRequestP17(
+          { filePaths: ['src/small.ts', 'src/big.ts', 'src/third.ts'] },
+          controller.signal
+        )
+      );
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('timeout');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      const data = envelope.structuredContent as P17BatchData;
+      expect(data.files.map((file) => file.ok)).toEqual([true, false, false]);
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_read_batch_partial');
+      expect(warning?.message).toContain('src/big.ts');
+      expect(warning?.message).toContain('src/third.ts');
+      expect(warning?.message.toLowerCase()).toContain('deadline');
+      const statusLogs = info.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.startsWith('[code.read] batch status='));
+      expect(statusLogs).toEqual([expect.stringContaining('batch status=timeout')]);
+    });
+
+    it.each([
+      ['timeout', () => new DOMException('fixture deadline', 'TimeoutError')],
+      ['aborted', () => new Error('host stopped the run')],
+    ] as const)('classifies a batch cancelled before any file was read as %s by the abort cause', async (status, reason) => {
+      const root = await largeFileProject(`batch-precancel-${status}`, 10);
+      const controller = new AbortController();
+      controller.abort(reason());
+      // 直接调用 handler：router/adapter 在调度前会拦下已取消的调用，这里锁定 handler 自身的归类。
+      const result = await handleCode(
+        'read',
+        { filePaths: ['src/small.ts', 'src/big.ts'] },
+        { projectRoot: root, tokenBudget: 5000, abortSignal: controller.signal }
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('2/2 files failed');
+      expect(result._meta?.resultStatus).toBe(status);
+      expect(codes(result._meta?.diagnosticWarnings)).toContain('code_read_batch_partial');
+    });
+
+    it('keeps a complete batch read as a plain success without diagnostics', async () => {
+      const root = await largeFileProject('batch-ok', 10);
+      const envelope = await adapterFor(root).execute(
+        readRequestP17({ filePaths: ['src/small.ts', 'src/big.ts'] })
+      );
+      expect(envelope.status).toBe('success');
+      expect(envelope.diagnostics?.degraded).toBe(false);
+      expect(envelope.diagnostics?.warnings).toEqual([]);
+    });
+  });
+
+  describe('I18 source line splitting', () => {
+    it('reads exactly 500 newline-terminated lines in full without a phantom 501st line', async () => {
+      const root = await mkdtemp(join(baseRoot, 'p17-500-'));
+      const source = `${Array.from({ length: 500 }, (_, index) => `line ${index + 1}`).join('\n')}\n`;
+      await writeFile(join(root, 'five.ts'), source);
+      const router = new ToolRouter();
+      const single = await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'five.ts' } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      const text = String(single.data);
+      expect(text).not.toContain('showing head + tail');
+      expect(text.startsWith('1|line 1\n')).toBe(true);
+      expect(text.endsWith('500|line 500')).toBe(true);
+      expect(text).not.toContain('501|');
+
+      const batch = await router.execute(
+        { tool: 'code', action: 'read', params: { filePaths: ['five.ts'] } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect((batch.data as P17BatchData).files[0]).toMatchObject({ mode: 'full', lineCount: 500 });
+    });
+
+    it('counts CRLF lines without a trailing empty line and keeps the CR bytes the evidence contract preserves', async () => {
+      const root = await mkdtemp(join(baseRoot, 'p17-crlf-'));
+      await writeFile(join(root, 'crlf.ts'), 'const a = 1;\r\nconst b = 2;\r\nconst c = 3;\r\n');
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { filePaths: ['crlf.ts'] } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      const file = (result.data as P17BatchData).files[0];
+      expect(file).toMatchObject({ mode: 'full', lineCount: 3 });
+      expect(file?.content).not.toContain('4|');
+      // 契约来源（总控 2026-10-11 决定：保留 CR）：Core EvidenceLedger 约定 code.read 行段按 LF 分行、
+      // 保留 CR 字节（AlembicCore StrictFactExecution.selectFrozenEvidenceBytes），Agent 的
+      // EvidenceLedgerStore.checkFreshness 也按 split('\n') 重切原文。splitSourceLines 只去掉结尾换行
+      // 产生的空行；去掉 CR 会让带 range 的证据与冻结字节、新鲜度切片不一致。
+      expect(file?.content).toBe('1|const a = 1;\r\n2|const b = 2;\r\n3|const c = 3;\r');
+    });
+
+    it('keeps CRLF range reads byte-aligned with the evidence ledger freshness slice', async () => {
+      const root = await mkdtemp(join(baseRoot, 'p17-crlf-range-'));
+      const source = 'const a = 1;\r\nconst b = 2;\r\nconst c = 3;\r\n';
+      await writeFile(join(root, 'crlf.ts'), source);
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { path: 'crlf.ts', startLine: 2, endLine: 3 } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(result.data).toBe('2|const b = 2;\r\n3|const c = 3;\r');
+      // 去掉展示用的 N| 前缀后即区间原文；按同一区间登记后，用原文件做新鲜度检查必须是 fresh。
+      const slice = String(result.data)
+        .split('\n')
+        .map((line) => line.replace(/^\d+\|/, ''))
+        .join('\n');
+      const ledger = new EvidenceLedgerStore({
+        dataRoot: await mkdtemp(join(baseRoot, 'p17-crlf-ledger-')),
+        jobId: 'job_p17_crlf',
+        sessionId: 'sess_p17_crlf',
+        dimensionId: 'p17-crlf',
+      });
+      const entry = ledger.append({
+        tool: 'code.read',
+        callId: 'c-crlf',
+        file: 'crlf.ts',
+        range: { start: 2, end: 3 },
+        content: slice,
+      });
+      expect(ledger.checkFreshness(entry.id, source)).toBe('fresh');
+    });
+  });
+
+  describe('I19 startLine/endLine validation', () => {
+    it.each([
+      [{ startLine: 10, endLine: -1 }, 'endLine'],
+      [{ startLine: 1.5, endLine: 3 }, 'startLine'],
+      [{ startLine: 0 }, 'startLine'],
+      [{ startLine: 2, endLine: 2.5 }, 'endLine'],
+    ])('rejects a non-positive-integer range %j', async (range, field) => {
+      const root = await largeFileProject('range-invalid', 20);
+      const router = new ToolRouter();
+      const single = await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'src/big.ts', ...range } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(single.ok).toBe(false);
+      expect(single.error).toContain('positive integer');
+      expect(single.error).toContain(field);
+      const batch = await router.execute(
+        {
+          tool: 'code',
+          action: 'read',
+          params: { filePaths: ['src/big.ts', 'src/small.ts'], ...range },
+        },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(batch.ok).toBe(false);
+      expect(batch.error).toContain('positive integer');
+    });
+
+    it('rejects startLine greater than endLine', async () => {
+      const root = await largeFileProject('range-order', 20);
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { path: 'src/big.ts', startLine: 9, endLine: 3 } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('startLine (9) must not exceed endLine (3)');
+    });
+
+    it('returns an empty range with a warning when startLine is past the end of the file', async () => {
+      const root = await largeFileProject('range-eof', 20);
+      const router = new ToolRouter();
+      const single = await router.execute(
+        {
+          tool: 'code',
+          action: 'read',
+          params: { path: 'src/big.ts', startLine: 30, endLine: 40 },
+        },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(single.ok).toBe(true);
+      expect(single.data).toBe('');
+      expect(
+        warningOf(single._meta?.diagnosticWarnings, 'code_read_range_beyond_eof')?.message
+      ).toContain('20 lines');
+
+      const batch = await router.execute(
+        {
+          tool: 'code',
+          action: 'read',
+          params: { filePaths: ['src/big.ts'], startLine: 30 },
+        },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(batch.ok).toBe(true);
+      expect((batch.data as P17BatchData).files[0]?.content).toBe('');
+      expect(codes(batch._meta?.diagnosticWarnings)).toContain('code_read_range_beyond_eof');
+    });
+
+    it('keeps valid ranges numbered with integer line prefixes', async () => {
+      const root = await largeFileProject('range-ok', 20);
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'read', params: { path: 'src/big.ts', startLine: 2, endLine: 3 } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(result.data).toBe('2|export const v2 = 2;\n3|export const v3 = 3;');
+    });
+  });
+
+  describe('I20 code.structure cancellation, cap and unreadable subdirectories', () => {
+    async function structureProject(name: string): Promise<string> {
+      const root = await mkdtemp(join(baseRoot, `p17-structure-${name}-`));
+      await mkdir(join(root, 'alpha', 'deep'), { recursive: true });
+      await mkdir(join(root, 'beta'), { recursive: true });
+      await writeFile(join(root, 'alpha', 'a.ts'), 'a\n');
+      await writeFile(join(root, 'alpha', 'deep', 'd.ts'), 'd\n');
+      await writeFile(join(root, 'beta', 'b.ts'), 'b\n');
+      await writeFile(join(root, 'root.ts'), 'r\n');
+      return root;
+    }
+
+    it('returns the partial tree when cancelled during the walk and stops reading directories', async () => {
+      const root = await structureProject('abort');
+      const fsPromises = (await import('node:fs/promises')).default;
+      const originalReaddir = fsPromises.readdir.bind(fsPromises);
+      const controller = new AbortController();
+      const visited: string[] = [];
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(((
+        target: Parameters<typeof fsPromises.readdir>[0],
+        options?: Parameters<typeof fsPromises.readdir>[1]
+      ) => {
+        const dir = String(target);
+        visited.push(dir.slice(root.length) || '/');
+        if (dir.endsWith('/alpha')) {
+          controller.abort(new Error('user stopped the run'));
+        }
+        return originalReaddir(target, options);
+      }) as typeof fsPromises.readdir);
+      const envelope = await adapterFor(root).execute(structureRequest({}, controller.signal));
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('aborted');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      const tree = String(envelope.structuredContent);
+      // 按深度优先顺序截在取消点：取消前已列出的节点保留，之后的条目（alpha 的内容、beta、根文件）不再追加。
+      expect(tree.split('\n')[0]).toBe('./');
+      expect(tree).toContain('alpha/');
+      expect(tree).not.toContain('d.ts');
+      expect(tree).not.toContain('beta/');
+      expect(tree).not.toContain('root.ts');
+      expect(tree).toContain('aborted before completion');
+      expect(visited).toEqual(['/', '/alpha']);
+      expect(codes(envelope.diagnostics?.warnings)).toContain('code_structure_incomplete');
+    });
+
+    it('reports a walk stopped by the run deadline as timeout with the partial tree', async () => {
+      const root = await structureProject('deadline');
+      const fsPromises = (await import('node:fs/promises')).default;
+      const originalReaddir = fsPromises.readdir.bind(fsPromises);
+      const controller = new AbortController();
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(((
+        target: Parameters<typeof fsPromises.readdir>[0],
+        options?: Parameters<typeof fsPromises.readdir>[1]
+      ) => {
+        if (String(target).endsWith('/alpha')) {
+          controller.abort(new DOMException('fixture deadline', 'TimeoutError'));
+        }
+        return originalReaddir(target, options);
+      }) as typeof fsPromises.readdir);
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      const envelope = await adapterFor(root).execute(structureRequest({}, controller.signal));
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('timeout');
+      expect(envelope.diagnostics?.degraded).toBe(true);
+      const tree = String(envelope.structuredContent);
+      expect(tree).toContain('alpha/');
+      expect(tree).not.toContain('beta/');
+      expect(tree).toContain('deadline');
+      expect(tree).not.toContain('aborted before completion');
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_structure_incomplete');
+      expect(warning?.message.toLowerCase()).toContain('deadline');
+      const walkLogs = info.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.startsWith('[code.structure]'));
+      expect(walkLogs).toEqual([expect.stringContaining('cancelled=timeout')]);
+    });
+
+    it.each([
+      ['timeout', () => new DOMException('fixture deadline', 'TimeoutError')],
+      ['aborted', () => new Error('host stopped the run')],
+    ] as const)('classifies a walk cancelled before the root listing as %s by the abort cause', async (status, reason) => {
+      const root = await structureProject(`precancel-${status}`);
+      const controller = new AbortController();
+      controller.abort(reason());
+      // 直接调用 handler：router/adapter 在调度前会拦下已取消的调用，这里锁定 handler 自身的归类。
+      const result = await handleCode(
+        'structure',
+        {},
+        { projectRoot: root, tokenBudget: 5000, abortSignal: controller.signal }
+      );
+      expect(result.ok).toBe(false);
+      expect(result._meta?.resultStatus).toBe(status);
+      expect(result.error).toContain(status === 'timeout' ? 'deadline' : 'aborted');
+    });
+
+    it('marks an unreadable subdirectory as <unreadable> instead of failing the whole tree', async () => {
+      const root = await structureProject('eacces');
+      const fsPromises = (await import('node:fs/promises')).default;
+      const originalReaddir = fsPromises.readdir.bind(fsPromises);
+      vi.spyOn(fsPromises, 'readdir').mockImplementation(((
+        target: Parameters<typeof fsPromises.readdir>[0],
+        options?: Parameters<typeof fsPromises.readdir>[1]
+      ) => {
+        if (String(target).endsWith('/alpha')) {
+          return Promise.reject(
+            Object.assign(new Error(`EACCES: permission denied, scandir '${String(target)}'`), {
+              code: 'EACCES',
+            })
+          );
+        }
+        return originalReaddir(target, options);
+      }) as typeof fsPromises.readdir);
+      const envelope = await adapterFor(root).execute(structureRequest({}));
+      expect(envelope.ok).toBe(true);
+      expect(envelope.status).toBe('partial');
+      const lines = String(envelope.structuredContent).split('\n');
+      const alphaIndex = lines.indexOf('alpha/');
+      expect(alphaIndex).toBeGreaterThan(0);
+      expect(lines[alphaIndex + 1]?.trim()).toBe('<unreadable>');
+      expect(lines).toContain('beta/');
+      expect(lines.some((line) => line.trim() === 'b.ts')).toBe(true);
+      const warning = warningOf(envelope.diagnostics?.warnings, 'code_structure_unreadable');
+      expect(warning?.message).toContain('alpha');
+      expect(warning?.message).not.toContain(root);
+    });
+
+    it('still fails when the requested root directory itself cannot be listed', async () => {
+      const root = await structureProject('root-missing');
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'structure', params: { directory: 'nope' } },
+        { projectRoot: root, tokenBudget: 5000 }
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('Cannot list structure');
+    });
+
+    it('stops walking at the entry cap and reports code_structure_truncated', async () => {
+      const root = await mkdtemp(join(baseRoot, 'p17-structure-cap-'));
+      await mkdir(join(root, 'zz-late'), { recursive: true });
+      await writeFile(join(root, 'zz-late', 'late.ts'), 'late\n');
+      await Promise.all(
+        Array.from({ length: 450 }, (_, index) =>
+          writeFile(join(root, `f${String(index).padStart(3, '0')}.ts`), 'x\n')
+        )
+      );
+      const fsPromises = (await import('node:fs/promises')).default;
+      const readdir = vi.spyOn(fsPromises, 'readdir');
+      const result = await new ToolRouter().execute(
+        { tool: 'code', action: 'structure', params: {} },
+        { projectRoot: root, tokenBudget: 100_000 }
+      );
+      expect(result.ok).toBe(true);
+      expect(result._meta?.resultStatus).toBe('partial');
+      expect(result._meta?.degraded).toBe(true);
+      const lines = String(result.data).split('\n');
+      const entries = lines.filter((line) => !line.startsWith('... ['));
+      expect(entries.length).toBeLessThanOrEqual(400);
+      expect(lines[lines.length - 1]).toContain('truncated at 400 entries');
+      expect(codes(result._meta?.diagnosticWarnings)).toContain('code_structure_truncated');
+      // 目录先于文件列出：zz-late/ 已展开，但上限之后不再发起新的 readdir。
+      expect(readdir.mock.calls.length).toBeLessThanOrEqual(2);
+    });
+  });
+
+  it('describes the head/tail fallback in the code.read registry entry', () => {
+    expect(TOOL_REGISTRY.code.actions.read.description).toContain(
+      'AST outline when available, otherwise head/tail preview'
+    );
   });
 });

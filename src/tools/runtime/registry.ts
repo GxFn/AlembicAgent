@@ -163,7 +163,7 @@ const CODE_SPEC: ToolSpec = {
     read: {
       summary: 'Read file content (single path or batch filePaths)',
       description:
-        'Read one file with path or up to 5 files with filePaths. Uses adaptive strategy: ranges/maxLines return numbered slices, ≤500 lines returns full text, >500 lines returns AST outline. Delta cache returns "[unchanged]" for re-reads. Batch reads return per-file results and tolerate partial failure.',
+        'Read one file with path or up to 5 files with filePaths. Uses adaptive strategy: ranges/maxLines return numbered slices, ≤500 lines returns full text, >500 lines returns AST outline when available, otherwise head/tail preview. Delta cache returns "[unchanged]" for re-reads. Batch reads return per-file results and tolerate partial failure.',
       params: {
         type: 'object',
         properties: {
