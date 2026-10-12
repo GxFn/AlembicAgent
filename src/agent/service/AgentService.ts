@@ -7,7 +7,10 @@ import {
   type AgentProfileCompiler,
   createDefaultProfileCompiler,
 } from '../profiles/AgentProfileCompiler.js';
-import { readRuntimeFailureSnapshot } from '../runtime/AgentExecutionTimeoutError.js';
+import {
+  isAgentExecutionTimeoutError,
+  readRuntimeFailureSnapshot,
+} from '../runtime/AgentExecutionTimeoutError.js';
 import { AgentMessage, Channel } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 import type {
@@ -193,18 +196,24 @@ export class AgentService {
         diagnostics: result.diagnostics || null,
       };
     } catch (err: unknown) {
+      // 快照只按 owner 读取：注入的包装 AgentRuntimeLike 不是登记者时读不到（failureSnapshot='none'）。
       const partial = readRuntimeFailureSnapshot(runtime, err);
+      const classified = classifyRunError(err);
       this.#log('warn', `[AgentService] runtime execute failed ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
         error: err instanceof Error ? err.message : String(err),
-        status: inferErrorStatus(err),
+        status: classified.status,
+        errorClassification: classified.basis,
+        errorName: err instanceof Error ? err.name : typeof err,
+        errorCode: readErrorCode(err),
+        failureSnapshot: partial ? 'owner-bound' : 'none',
       });
       return {
         runId: runtime.id || randomUUID(),
         profileId: compiledProfile.id,
         reply: err instanceof Error ? err.message : String(err),
-        status: inferErrorStatus(err),
+        status: classified.status,
         phases: partial?.phases,
         toolCalls: partial?.toolCalls || [],
         usage: {
@@ -356,18 +365,45 @@ function inferRunStatus(result: Awaited<ReturnType<AgentRuntimeLike['execute']>>
   return result.reply?.trim() ? 'success' : 'error';
 }
 
-function inferErrorStatus(err: unknown): AgentRunStatus {
+/** 失败归类依据，随 warn 日志输出，便于区分结构化分支与文案兜底。 */
+type RunErrorClassificationBasis =
+  | 'agent_execution_timeout'
+  | 'abort_error'
+  | 'blocked_text'
+  | 'unclassified';
+
+/**
+ * 把 Runtime 抛出的失败归为宿主可见的 AgentRunStatus。
+ * - 'timeout' 只认运行级硬超时（AgentExecutionTimeoutError 或其稳定 code）。宿主把 status='timeout'
+ *   当作可恢复的生产者超时，文案含 timeout 的普通 Error（策略、闸门、宿主锁等）一律不再算超时。
+ * - 'aborted' 只认 name==='AbortError'（与 createLlmAbortError 的取消契约一致：判定只看 name，
+ *   DOMException 的 code 是数字 20，不可靠）；文案含 abort 的普通 Error 不再算取消。
+ * - 'blocked' 暂保留文案匹配：Runtime 目前没有会抛出的结构化“拒绝”错误
+ *   （策略拒绝走 validateBefore 的 policy_rejected 诊断，由 inferRunStatus 归类），本包不改这条口径。
+ */
+function classifyRunError(err: unknown): {
+  status: AgentRunStatus;
+  basis: RunErrorClassificationBasis;
+} {
+  if (isAgentExecutionTimeoutError(err)) {
+    return { status: 'timeout', basis: 'agent_execution_timeout' };
+  }
+  if (err instanceof Error && err.name === 'AbortError') {
+    return { status: 'aborted', basis: 'abort_error' };
+  }
   const message = err instanceof Error ? err.message : String(err);
-  if (/timeout/i.test(message)) {
-    return 'timeout';
-  }
-  if (/abort/i.test(message)) {
-    return 'aborted';
-  }
   if (/forbidden|blocked|denied/i.test(message)) {
-    return 'blocked';
+    return { status: 'blocked', basis: 'blocked_text' };
   }
-  return 'error';
+  return { status: 'error', basis: 'unclassified' };
+}
+
+function readErrorCode(err: unknown): string | number | null {
+  if (!(err instanceof Error)) {
+    return null;
+  }
+  const code = (err as Error & { code?: unknown }).code;
+  return typeof code === 'string' || typeof code === 'number' ? code : null;
 }
 
 function promptContextFor(input: AgentRunInput): Record<string, unknown> {

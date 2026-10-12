@@ -15,6 +15,10 @@ import {
 import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
 import { buildProducerRetryPrompt } from '../src/agent/prompts/producerRetry.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
+import {
+  AgentExecutionTimeoutError,
+  readRuntimeFailureSnapshot,
+} from '../src/agent/runtime/AgentExecutionTimeoutError.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';
@@ -3152,5 +3156,220 @@ describe('AgentRuntime state transitions observability and reset (I39)', () => {
     expect(() => runtime.abort('idle cancel')).not.toThrow();
     await expect(runtime.execute(new AgentMessage({ content: 'task' }))).rejects.toBe(failure);
     expect(runtime.state.phase).toBe('failed');
+  });
+});
+
+describe('structured run error classification and timeout snapshot ownership (I32)', () => {
+  // 先登记一条已确认工具调用与 token，再挂起直到执行边界取消；用来区分“谁的快照被采用”。
+  function confirmingStrategyUntilAbort() {
+    return {
+      execute: (
+        runtime: AgentRuntime,
+        _message: AgentMessage,
+        options: { abortSignal: AbortSignal }
+      ) => {
+        runtime.toolCallHistory.push({
+          tool: 'meta',
+          args: {},
+          result: { confirmed: true },
+          durationMs: 1,
+        });
+        runtime.tokenUsage.input += 7;
+        runtime.tokenUsage.output += 3;
+        return new Promise((resolve) => {
+          options.abortSignal.addEventListener('abort', () => resolve(stageOutput('late reply')), {
+            once: true,
+          });
+        });
+      },
+    } as never;
+  }
+
+  function failureLog(warn: { mock: { calls: unknown[][] } }) {
+    const call = warn.mock.calls.find(
+      ([message]) => typeof message === 'string' && message.includes('runtime execute failed')
+    );
+    return call?.[1] as Record<string, unknown> | undefined;
+  }
+
+  it.each([
+    {
+      label: 'a plain Error whose text mentions timeout',
+      failure: new Error('upstream timeout'),
+      status: 'error',
+      classification: 'unclassified',
+    },
+    {
+      label: 'a plain gate Error whose text mentions a lock timeout',
+      failure: new Error('host lock acquire timeout'),
+      status: 'error',
+      classification: 'unclassified',
+    },
+    {
+      label: 'a plain Error whose text mentions abort',
+      failure: new Error('request aborted by host gate'),
+      status: 'error',
+      classification: 'unclassified',
+    },
+    {
+      label: 'an Error named AbortError',
+      failure: Object.assign(new Error('cancelled by host'), { name: 'AbortError' }),
+      status: 'aborted',
+      classification: 'abort_error',
+    },
+    {
+      label: 'a DOMException AbortError',
+      failure: new DOMException('stop requested', 'AbortError'),
+      status: 'aborted',
+      classification: 'abort_error',
+    },
+    {
+      label: 'an Error carrying the structured execution timeout code',
+      failure: Object.assign(new Error('deadline reached'), { code: 'AGENT_EXECUTION_TIMEOUT' }),
+      status: 'timeout',
+      classification: 'agent_execution_timeout',
+    },
+    {
+      label: 'a plain Error whose text says denied (blocked text rule unchanged)',
+      failure: new Error('write denied by host'),
+      status: 'blocked',
+      classification: 'blocked_text',
+    },
+  ])('classifies $label thrown by the strategy as $status', async ({
+    failure,
+    status,
+    classification,
+  }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { service, input } = harness(vi.fn(), 2, {
+      strategy: {
+        execute: async () => {
+          throw failure;
+        },
+      } as never,
+    });
+    const result = await service.run(input);
+    expect(result.status).toBe(status);
+    expect(result.reply).toBe(failure.message);
+    // 归类依据进日志：看得出走了哪条结构化分支，以及错误的 name/code。
+    expect(failureLog(warn)).toMatchObject({ status, errorClassification: classification });
+  });
+
+  it('a real hard timeout keeps timeout status with a stable name and code and its own snapshot', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, service, input } = harness(vi.fn(), 2, {
+      strategy: confirmingStrategyUntilAbort(),
+    });
+    const direct = runtime.execute(new AgentMessage({ content: 'task' }), { timeoutMs: 10 }).then(
+      () => null,
+      (err: unknown) => err
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    const failure = await direct;
+    expect(failure).toBeInstanceOf(AgentExecutionTimeoutError);
+    expect(failure).toMatchObject({
+      name: 'AgentExecutionTimeoutError',
+      code: 'AGENT_EXECUTION_TIMEOUT',
+      message: 'Agent timeout after 10ms',
+    });
+    const partial = (failure as AgentExecutionTimeoutError).partialResult;
+    // 本 Runtime 抛出的超时：采用自己的快照并按 owner 登记。
+    expect(readRuntimeFailureSnapshot(runtime, failure)).toBe(partial);
+    expect(partial.toolCalls).toHaveLength(1);
+    // 不在登记表中的 owner（包装对象等）一律读不到，不再回退采用 error.partialResult。
+    expect(readRuntimeFailureSnapshot({}, failure)).toBeNull();
+
+    const pending = service.run({ ...input, execution: { timeoutMs: 10 } });
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await pending;
+    expect(result).toMatchObject({
+      status: 'timeout',
+      reply: 'Agent timeout after 10ms',
+      usage: { inputTokens: 7, outputTokens: 3 },
+    });
+    expect(result.toolCalls).toHaveLength(1);
+    expect(failureLog(warn)).toMatchObject({
+      status: 'timeout',
+      errorClassification: 'agent_execution_timeout',
+      errorName: 'AgentExecutionTimeoutError',
+      errorCode: 'AGENT_EXECUTION_TIMEOUT',
+      failureSnapshot: 'owner-bound',
+    });
+  });
+
+  it('an outer runtime neither adopts nor rewrites a nested runtime timeout snapshot', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime: inner } = harness(vi.fn(), 2, { strategy: confirmingStrategyUntilAbort() });
+    let innerFailure: unknown;
+    const {
+      runtime: outer,
+      service,
+      input,
+    } = harness(vi.fn(), 2, {
+      strategy: {
+        execute: async () => {
+          try {
+            return await inner.execute(new AgentMessage({ content: 'child' }), { timeoutMs: 10 });
+          } catch (err: unknown) {
+            innerFailure = err;
+            throw err;
+          }
+        },
+      } as never,
+    });
+    const outerWarn = vi.fn();
+    outer.logger = { info: vi.fn(), warn: outerWarn };
+    const pending = service.run({ ...input, execution: { timeoutMs: 1000 } });
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await pending;
+
+    expect(innerFailure).toBeInstanceOf(AgentExecutionTimeoutError);
+    const innerPartial = (innerFailure as AgentExecutionTimeoutError).partialResult;
+    // 子 Runtime 的硬超时仍是结构化超时错误。
+    expect(result.status).toBe('timeout');
+    // 外层只登记自己的快照：子运行的工具调用与 token 不被当成外层的已确认工作。
+    expect(result.toolCalls).toEqual([]);
+    expect(result.usage).toMatchObject({ inputTokens: 0, outputTokens: 0 });
+    expect(readRuntimeFailureSnapshot(outer, innerFailure)).not.toBe(innerPartial);
+    // 子运行快照不被外层原地改写（diagnostics 仍是子运行自己的 runtime_timeout）。
+    expect(readRuntimeFailureSnapshot(inner, innerFailure)).toBe(innerPartial);
+    expect(innerPartial.toolCalls).toHaveLength(1);
+    expect(innerPartial.tokenUsage).toMatchObject({ input: 7, output: 3 });
+    expect(innerPartial.diagnostics?.warnings).toContainEqual(
+      expect.objectContaining({ code: 'runtime_timeout' })
+    );
+    expect(outerWarn).toHaveBeenCalledWith(
+      expect.stringContaining('foreign execution timeout snapshot not adopted'),
+      expect.objectContaining({ runtimeId: outer.id, errorCode: 'AGENT_EXECUTION_TIMEOUT' })
+    );
+  });
+
+  it('a wrapper runtime gets no failure snapshot for a timeout raised by the runtime it wraps', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime: inner, input } = harness(vi.fn(), 2, {
+      strategy: confirmingStrategyUntilAbort(),
+    });
+    const wrapper: AgentRuntimeLike = {
+      id: 'wrapper',
+      execute: (message, opts) => inner.execute(message, opts as Record<string, unknown>),
+    };
+    const service = new AgentService({ runtimeBuilder: { build: () => wrapper } });
+    const pending = service.run({ ...input, execution: { timeoutMs: 10 } });
+    await vi.advanceTimersByTimeAsync(10);
+    const result = await pending;
+    // 与非超时失败一致：包装对象不是快照 owner，只返回错误本身。
+    expect(result).toMatchObject({
+      status: 'timeout',
+      toolCalls: [],
+      usage: { inputTokens: 0, outputTokens: 0, iterations: 0 },
+      diagnostics: null,
+    });
+    expect(failureLog(warn)).toMatchObject({
+      status: 'timeout',
+      failureSnapshot: 'none',
+    });
   });
 });

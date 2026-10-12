@@ -59,8 +59,10 @@ import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
 import { AgentEventBus, AgentEvents } from './AgentEventBus.js';
 import {
-  AgentExecutionTimeoutError,
   bindRuntimeFailureSnapshot,
+  createOwnedExecutionTimeoutError,
+  isAgentExecutionTimeoutError,
+  readOwnedExecutionTimeoutSnapshot,
 } from './AgentExecutionTimeoutError.js';
 import type { AgentMessage } from './AgentMessage.js';
 import {
@@ -429,7 +431,8 @@ export class AgentRuntime {
           message:
             'Execution deadline reached; confirmed receipts retained and in-flight operations may require readback',
         });
-        throw new AgentExecutionTimeoutError(timeoutMs, snapshot());
+        // 经唯一入口创建：登记 owner=this，catch 与 AgentService 只采用本 Runtime 自己抛出的超时快照。
+        throw createOwnedExecutionTimeoutError(this, timeoutMs, snapshot());
       }
       if (outcome.status === 'error') {
         throw outcome.error instanceof Error
@@ -510,10 +513,25 @@ export class AgentRuntime {
       const error =
         err instanceof Error ? err : new Error('Agent execution failed', { cause: err });
       this.#safeTransition('error', { error: error.message });
-      const partial =
-        error instanceof AgentExecutionTimeoutError
-          ? error.partialResult
-          : completedResult || snapshot();
+      // 只采用本 Runtime 抛出的硬超时快照；嵌套 Runtime 冒上来的超时错误按普通失败处理，
+      // 用本边界自己的快照，既不把子运行的工具调用/用量当作自己的，也不原地改写子运行快照。
+      const ownTimeoutSnapshot = readOwnedExecutionTimeoutSnapshot(this, error);
+      if (!ownTimeoutSnapshot && isAgentExecutionTimeoutError(error)) {
+        observeSafely(
+          () =>
+            this.logger.warn(
+              '[AgentRuntime] foreign execution timeout snapshot not adopted; using this runtime snapshot',
+              {
+                runtimeId: this.id,
+                errorName: error.name,
+                errorCode: error.code,
+                path: completedResult ? 'completed-result' : 'runtime-snapshot',
+              }
+            ),
+          () => undefined
+        );
+      }
+      const partial = ownTimeoutSnapshot ?? completedResult ?? snapshot();
       partial.state = this.state.toJSON();
       partial.durationMs = Date.now() - this.startTime;
       partial.diagnostics = diagnostics.toJSON();
