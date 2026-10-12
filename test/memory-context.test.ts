@@ -2,6 +2,7 @@ import fs, { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from '
 import os, { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
 import { pathGuard, WriteZone } from '@alembic/core/io';
+import Logger from '@alembic/core/logging';
 import { WorkspaceResolver } from '@alembic/core/workspace';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,7 +12,11 @@ import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js
 // MemoryRetriever 未从 src/index.ts barrel 导出 → 必须走直接路径（barrel 路径会编译失败）。
 import { MemoryRetriever } from '../src/agent/memory/MemoryRetriever.js';
 import { PersistentMemory } from '../src/agent/memory/PersistentMemory.js';
-import type { DimensionReportInput } from '../src/agent/memory/SessionStore.js';
+import type {
+  DimensionDigest,
+  DimensionReportInput,
+  TierReflection,
+} from '../src/agent/memory/SessionStore.js';
 import {
   ConversationStore,
   MEMORY_STORE_REQUIRED_COLUMNS,
@@ -817,6 +822,260 @@ describe('SessionStore', () => {
 
     store.dispose();
     restored.dispose();
+  });
+});
+
+describe('SessionStore dimension write contract', () => {
+  /** 截获 SessionStore 打出的 warn，返回拼接后的文本，用于断言降级诊断带有 dimId、字段与原始类型。 */
+  function captureWarnings() {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    return () => warn.mock.calls.map((call) => String(call[0])).join('\n');
+  }
+
+  it('keeps an earlier digest and its crossRefs when a resumed report omits digest', () => {
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      // 宿主续跑顺序：先从 dimension checkpoint 恢复 digest，再存一份不带 digest 的报告恢复 analysisText。
+      s.addDimensionDigest('a', { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } });
+      s.storeDimensionReport('a', {
+        analysisText: 'restored analysis text',
+        findings: [],
+        referencedFiles: ['src/a.ts'],
+        candidatesSummary: [],
+      });
+      expect(s.getDimensionReport('a')).toMatchObject({
+        analysisText: 'restored analysis text',
+        referencedFiles: ['src/a.ts'],
+        digest: { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } },
+      });
+      const context = s.buildContextForDimension('b');
+      expect(context).toContain('DIGEST-A');
+      expect(context).toContain('- [来自 a] look at X');
+      expect(s.buildContextSnapshot('b').previousDimensions.a.crossRefs).toEqual({
+        b: 'look at X',
+      });
+      // 再次省略 digest 仍沿用同一份 digest；派生 crossRefs 按一代重建，不会累加。
+      s.storeDimensionReport('a', { analysisText: 'second generation' });
+      expect(s.getStats().crossReferences).toBe(1);
+      expect(s.getDimensionReport('a')?.digest?.summary).toBe('DIGEST-A');
+    } finally {
+      s.dispose();
+    }
+  });
+
+  it('clears the digest and its crossRefs only when a report passes digest: null', () => {
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.addDimensionDigest('a', { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } });
+      s.storeDimensionReport('a', { analysisText: 'fresh analysis', digest: null });
+      expect(s.getDimensionReport('a')?.digest).toBeNull();
+      expect(s.getStats().crossReferences).toBe(0);
+      const context = s.buildContextForDimension('b');
+      expect(context).not.toContain('DIGEST-A');
+      expect(context).not.toContain('look at X');
+      expect(context).toContain('fresh analysis');
+      // 显式给出新 digest 时整代替换：旧建议不残留，只保留新 digest 派生的 crossRefs。
+      s.addDimensionDigest('a', { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } });
+      s.storeDimensionReport('a', { digest: { summary: 'NEW', crossRefs: { c: 'see c' } } });
+      expect(s.buildContextForDimension('b')).not.toContain('look at X');
+      expect(s.buildContextForDimension('c')).toContain('- [来自 a] see c');
+      expect(s.getStats().crossReferences).toBe(1);
+    } finally {
+      s.dispose();
+    }
+  });
+
+  it('normalizes a malformed AI digest at addDimensionDigest with a located warning', () => {
+    const warnings = captureWarnings();
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.storeDimensionReport('a', { analysisText: 'analysis of a' });
+      s.addDimensionDigest('a', {
+        summary: { text: 'object summary' },
+        candidateCount: 'many',
+        keyFindings: 'abc',
+        crossRefs: { b: { reason: 'object detail' }, c: 'valid reference' },
+        gaps: ['missing coverage', 3],
+      } as unknown as DimensionDigest);
+      expect(s.getDimensionReport('a')?.digest).toEqual({
+        summary: '',
+        keyFindings: [],
+        crossRefs: { c: 'valid reference' },
+        gaps: ['missing coverage'],
+      });
+      expect(s.buildContextForDimension('b')).not.toContain('[object Object]');
+      expect(s.buildContextForDimension('c')).toContain('- [来自 a] valid reference');
+      expect(() => SessionStore.fromJSON(s.toJSON()).dispose()).not.toThrow();
+      const text = warnings();
+      expect(text).toContain('addDimensionDigest "a"');
+      expect(text).toContain('digest.summary (object');
+      expect(text).toContain('digest.candidateCount (string');
+      expect(text).toContain('digest.keyFindings (string');
+      expect(text).toContain('digest.crossRefs.b (object');
+      expect(text).toContain('digest.gaps[1] (number');
+    } finally {
+      vi.restoreAllMocks();
+      s.dispose();
+    }
+  });
+
+  it('restores a digest for a dimension without a report when keyFindings is not an array', () => {
+    const warnings = captureWarnings();
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.addDimensionDigest('fresh', {
+        summary: 'S',
+        keyFindings: 'abc',
+      } as unknown as DimensionDigest);
+      expect(s.getDimensionReport('fresh')).toMatchObject({
+        dimId: 'fresh',
+        analysisText: 'S',
+        findings: [],
+        digest: { summary: 'S', keyFindings: [] },
+      });
+      s.addDimensionDigest('mixed', {
+        keyFindings: [
+          'plain finding',
+          { finding: 'structured finding', importance: 7 },
+          { finding: 3 },
+          null,
+        ],
+      } as unknown as DimensionDigest);
+      expect(s.getDimensionReport('mixed')?.findings.map((f) => f.finding)).toEqual([
+        'plain finding',
+        'structured finding',
+      ]);
+      expect(s.getDimensionReport('mixed')?.digest?.keyFindings).toEqual([
+        'plain finding',
+        { finding: 'structured finding', importance: 7 },
+      ]);
+      expect(() => SessionStore.fromJSON(s.toJSON()).dispose()).not.toThrow();
+      const text = warnings();
+      expect(text).toContain('addDimensionDigest "fresh"');
+      expect(text).toContain('digest.keyFindings[2] (object');
+      expect(text).toContain('digest.keyFindings[3] (null');
+    } finally {
+      vi.restoreAllMocks();
+      s.dispose();
+    }
+  });
+
+  // 每行包一层数组：it.each 会把数组行展开成参数，裸 ['x'] 会被当成字符串 'x'。
+  it.each([
+    [null],
+    ['summary text'],
+    [['x']],
+    [42],
+  ])('rejects the unnormalizable digest %j with an Error before mutating state', (bad) => {
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.addDimensionDigest('a', { summary: 'kept', crossRefs: { b: 'kept reference' } });
+      const before = s.toJSON();
+      expect(() => s.addDimensionDigest('a', bad as unknown as DimensionDigest)).toThrow(
+        'SessionStore schema: digest must be an object'
+      );
+      expect(s.toJSON()).toEqual(before);
+    } finally {
+      s.dispose();
+    }
+  });
+
+  it('normalizes a malformed tier reflection at addTierReflection and keeps it round-trippable', () => {
+    const warnings = captureWarnings();
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.addTierReflection(1, {
+        completedDimensions: 'a',
+        topFindings: [{ finding: 'kept finding', importance: 8 }, null, { finding: {} }],
+        crossDimensionPatterns: ['shared pattern', 1],
+        suggestionsForNextTier: null,
+      } as unknown as TierReflection);
+      expect(s.getTierReflections()).toEqual([
+        {
+          tierIndex: 1,
+          completedDimensions: [],
+          topFindings: [{ finding: 'kept finding', importance: 8 }],
+          crossDimensionPatterns: ['shared pattern'],
+          suggestionsForNextTier: [],
+        },
+      ]);
+      expect(s.getRelevantReflections('next')).toContain('### Tier 2 综合洞察');
+      expect(() => SessionStore.fromJSON(s.toJSON()).dispose()).not.toThrow();
+      const text = warnings();
+      expect(text).toContain('addTierReflection tierIndex=1');
+      expect(text).toContain('tierReflection.tierIndex (undefined');
+      expect(text).toContain('tierReflection.completedDimensions (string');
+      expect(text).toContain('tierReflection.topFindings[1] (null');
+      expect(text).toContain('tierReflection.topFindings[2] (object');
+      expect(text).toContain('tierReflection.crossDimensionPatterns[1] (number');
+      expect(text).toContain('tierReflection.suggestionsForNextTier (null');
+      expect(() => s.addTierReflection(2, null as unknown as TierReflection)).toThrow(
+        'SessionStore schema: tier reflection must be an object'
+      );
+      expect(s.getTierReflections()).toHaveLength(1);
+    } finally {
+      vi.restoreAllMocks();
+      s.dispose();
+    }
+  });
+
+  it.each([
+    { dimensionReports: { a: { completedAt: 'yesterday' } } },
+    { dimensionReports: { a: { analysisText: { text: 'object' } } } },
+    { dimensionReports: { a: { analysisText: null } } },
+    { dimensionReports: { a: { dimId: 42 } } },
+    { dimensionReports: { a: { dimId: 'b' } } },
+    { projectContext: 'fixture-project' },
+  ])('rejects snapshots whose present fields have the wrong type: %j', (snapshot) => {
+    expect(() => SessionStore.fromJSON(snapshot)).toThrow('SessionStore schema');
+  });
+
+  it('still fills defaults for missing report fields in legacy snapshots', () => {
+    const restored = SessionStore.fromJSON({ dimensionReports: { a: {} } });
+    try {
+      expect(restored.getDimensionReport('a')).toEqual({
+        dimId: 'a',
+        completedAt: 0,
+        analysisText: '',
+        findings: [],
+        referencedFiles: [],
+        candidatesSummary: [],
+        workingMemoryDistilled: null,
+        digest: null,
+      });
+    } finally {
+      restored.dispose();
+    }
+  });
+
+  it('refuses a type-corrupted checkpoint and reports non-Error load failures by value', async () => {
+    const warnings = captureWarnings();
+    const root = makeTempRoot('session-typed-checkpoint');
+    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const restored = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      s.storeDimensionReport('a', { analysisText: 'live state' });
+      await s.saveCheckpoint(root);
+      const checkpoint = join(root, '.asd/bootstrap-checkpoint/session-store.json');
+      const data = JSON.parse(readFileSync(checkpoint, 'utf-8'));
+      data.dimensionReports.a.completedAt = 'yesterday';
+      writeFileSync(checkpoint, JSON.stringify(data));
+      expect(await restored.loadCheckpoint(root)).toBe(false);
+      expect(restored.getCompletedDimensions()).toEqual([]);
+      expect(warnings()).toContain(
+        'Failed to load checkpoint: SessionStore schema: invalid completedAt'
+      );
+      vi.spyOn(fs, 'readFileSync').mockImplementation(() => {
+        // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖 loadCheckpoint catch 的类型守卫分支。
+        throw 'disk unavailable';
+      });
+      expect(await restored.loadCheckpoint(root)).toBe(false);
+      expect(warnings()).toContain('Failed to load checkpoint: disk unavailable');
+    } finally {
+      vi.restoreAllMocks();
+      s.dispose();
+      restored.dispose();
+    }
   });
 });
 

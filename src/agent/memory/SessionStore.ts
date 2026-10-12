@@ -33,8 +33,12 @@ import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { stableStringify } from '#shared/serialization.js';
 import { truncateToTokenBudget } from '#shared/tokenUtils.js';
-import type { SessionStoreSerialized } from './SessionStoreSchema.js';
-import { validateSessionStoreShape } from './SessionStoreSchema.js';
+import type { SessionStoreNormalization, SessionStoreSerialized } from './SessionStoreSchema.js';
+import {
+  normalizeDimensionDigest,
+  normalizeTierReflection,
+  validateSessionStoreShape,
+} from './SessionStoreSchema.js';
 
 // ── 类型定义 ──
 
@@ -130,6 +134,10 @@ export interface DimensionReportInput {
   referencedFiles?: string[];
   candidatesSummary?: CandidateSummary[];
   workingMemoryDistilled?: WorkingMemoryDistilled | null;
+  /**
+   * 三态语义（见 SessionStore.storeDimensionReport）：
+   * 缺省（undefined）= 沿用该维度已有 digest；null = 显式清空；对象 = 整体替换（严格校验）。
+   */
   digest?: DimensionDigest | null;
 }
 
@@ -218,7 +226,17 @@ export class SessionStore implements Disposable {
   // §1: 维度报告 (from EpisodicMemory)
   // ═══════════════════════════════════════════════════════
 
-  /** 维度完成后存储完整报告 */
+  /**
+   * 维度完成后存储完整报告（整代替换：报告、本维 evidence 索引与 from=dimId 的 crossRefs 一起换代）。
+   *
+   * digest 三态：
+   *   - 缺省（input.digest === undefined）：沿用该维度已有 digest，并按它重建 from=dimId 的 crossRefs；
+   *   - 显式 null：清空 digest 及其派生 crossRefs；
+   *   - 对象：整体替换，按快照规则严格校验，不合规抛 Error 且不改动现有状态。
+   * 缺省沿用的原因：宿主续跑先 addDimensionDigest 恢复 checkpoint digest、再存不带 digest 的报告
+   * 恢复 analysisText，首跑顺序则相反；若缺省即清空，续跑会丢失 digest 与前序维度给后续维度的建议，
+   * 续跑 prompt 与首跑不一致。
+   */
   storeDimensionReport(dimId: string, input: DimensionReportInput) {
     const report = structuredClone(input);
     // findings 统一形状: { finding: string, evidence: string, importance: number }
@@ -236,6 +254,22 @@ export class SessionStore implements Disposable {
       importance: f.importance || 5,
     }));
 
+    const previousDigest = this.#dimensionReports.get(dimId)?.digest ?? null;
+    const digestOmitted = report.digest === undefined;
+    // 显式分支保留历史的 `|| null`：非对象的假值（如 ''）仍视为清空，不额外引入新的抛错路径。
+    const digest = digestOmitted ? previousDigest : report.digest || null;
+    // 记录本次 digest 走了哪条分支，写进存储日志，续跑排查时能看出 digest 是沿用、替换还是被清空。
+    let digestAction: 'retained' | 'replaced' | 'cleared' | 'none' = 'none';
+    if (digestOmitted) {
+      if (previousDigest) {
+        digestAction = 'retained';
+      }
+    } else if (digest) {
+      digestAction = 'replaced';
+    } else if (previousDigest) {
+      digestAction = 'cleared';
+    }
+
     const nextReport = validateSessionStoreShape({
       dimensionReports: {
         [dimId]: {
@@ -246,10 +280,11 @@ export class SessionStore implements Disposable {
           referencedFiles: report.referencedFiles || [],
           candidatesSummary: report.candidatesSummary || [],
           workingMemoryDistilled: report.workingMemoryDistilled || null,
-          digest: report.digest || null,
+          digest,
         },
       },
     }).dimensionReports[dimId];
+    // 校验通过后才开始改状态：坏报告抛错时旧一代报告与索引保持不变。
     // 报告及其派生索引是一代数据；只删本维报告产生的索引，保留独立追加证据。
     for (const [file, entries] of this.#evidenceStore) {
       const kept = entries.filter((entry) => entry.reportDimId !== dimId);
@@ -280,25 +315,15 @@ export class SessionStore implements Disposable {
       }
     }
 
-    // 从 digest 中提取 crossRefs
-    if (report.digest?.crossRefs) {
-      for (const [targetDim, detail] of Object.entries(report.digest.crossRefs)) {
-        if (detail) {
-          this.#crossReferences.push({
-            from: dimId,
-            to: targetDim,
-            relation: 'suggests',
-            detail: String(detail),
-          });
-        }
-      }
-    }
+    // 从本代 digest（含缺省沿用的旧 digest）重建 crossRefs；上面已删掉 from=dimId 的旧索引，不会累加。
+    this.#pushDigestCrossRefs(dimId, nextReport.digest);
 
     this.#log(
       'info',
       `[SessionStore] Stored report for "${dimId}": ` +
         `${report.findings?.length || 0} findings, ` +
-        `${report.referencedFiles?.length || 0} files`
+        `${report.referencedFiles?.length || 0} files, ` +
+        `digest=${digestAction}`
     );
   }
 
@@ -373,59 +398,72 @@ export class SessionStore implements Disposable {
   // §4: DimensionDigest 兼容层
   // ═══════════════════════════════════════════════════════
 
+  /**
+   * 挂载维度 digest：已有报告时只替换其 digest，否则建一份仅含 digest 的报告（续跑恢复路径）。
+   *
+   * 入口归一化：digest 来自宿主 parseDimensionDigest 透传的 AI 回复或宿主未校验的 dimension
+   * checkpoint，可能出现 crossRefs 值为对象、keyFindings 为字符串等偏离。先经
+   * normalizeDimensionDigest 修复（逐项 warn，写明 dimId、字段与原始类型），保证 prompt 中不出现
+   * `[object Object]`、无报告分支不抛原生 TypeError、入库状态能通过自身 fromJSON。
+   * 整体不是对象时无法归一化，抛 Error，且在任何状态改动之前抛出。
+   */
   addDimensionDigest(dimId: string, input: DimensionDigest) {
-    const digest = structuredClone(input);
-    this.#crossReferences = this.#crossReferences.filter((ref) => ref.from !== dimId);
+    const { digest, normalizations } = normalizeDimensionDigest(structuredClone(input));
+    this.#warnNormalizations(`addDimensionDigest "${dimId}"`, normalizations);
     const existing = this.#dimensionReports.get(dimId);
-    if (existing) {
-      existing.digest = digest;
-    } else {
-      this.#dimensionReports.set(dimId, {
-        dimId,
-        completedAt: Date.now(),
-        analysisText: digest.summary || '',
-        findings: (digest.keyFindings || []).map((f) => ({
-          finding: typeof f === 'string' ? f : (f as Finding).finding || '',
-          evidence: '',
-          importance: 5,
-        })),
-        referencedFiles: [],
-        candidatesSummary: [],
-        workingMemoryDistilled: null,
-        digest,
-      });
-    }
-    // 提取 crossRefs
-    if (digest.crossRefs) {
-      for (const [targetDim, detail] of Object.entries(digest.crossRefs)) {
-        if (detail) {
-          const exists = this.#crossReferences.some(
-            (cr) => cr.from === dimId && cr.to === targetDim
-          );
-          if (!exists) {
-            this.#crossReferences.push({
-              from: dimId,
-              to: targetDim,
-              relation: 'suggests',
-              detail: String(detail),
-            });
-          }
-        }
-      }
-    }
+    const nextReport: DimensionReport = existing
+      ? { ...existing, digest }
+      : validateSessionStoreShape({
+          dimensionReports: {
+            [dimId]: {
+              dimId,
+              completedAt: Date.now(),
+              analysisText: digest.summary || '',
+              findings: (digest.keyFindings || []).map((f) => ({
+                finding: typeof f === 'string' ? f : f.finding,
+                evidence: '',
+                importance: 5,
+              })),
+              referencedFiles: [],
+              candidatesSummary: [],
+              workingMemoryDistilled: null,
+              digest,
+            },
+          },
+        }).dimensionReports[dimId];
+    // 以上全部成功后才改状态：digest 换代时 from=dimId 的 crossRefs 一起换代。
+    this.#crossReferences = this.#crossReferences.filter((ref) => ref.from !== dimId);
+    this.#dimensionReports.set(dimId, nextReport);
+    this.#pushDigestCrossRefs(dimId, digest);
+    this.#log(
+      'info',
+      `[SessionStore] Digest for "${dimId}": ` +
+        `${existing ? 'attached to existing report' : 'created digest-only report'}, ` +
+        `${Object.keys(digest.crossRefs ?? {}).length} crossRefs`
+    );
   }
 
   // ═══════════════════════════════════════════════════════
   // §5: Tier Reflection
   // ═══════════════════════════════════════════════════════
 
-  addTierReflection(tierIndex: number, reflection: TierReflection) {
-    this.#tierReflections.push(structuredClone(reflection));
+  /**
+   * 追加一条 Tier 反思。与 digest 一样先经 normalizeTierReflection 归一化（逐项 warn），
+   * 保证反思数组始终能通过自身 fromJSON；反思缺 tierIndex 时以参数 tierIndex 补齐。
+   * 整体不是对象时抛 Error，反思数组保持不变。
+   */
+  addTierReflection(tierIndex: number, input: TierReflection) {
+    const { reflection, normalizations } = normalizeTierReflection(
+      structuredClone(input),
+      tierIndex
+    );
+    this.#warnNormalizations(`addTierReflection tierIndex=${tierIndex}`, normalizations);
+    this.#tierReflections.push(reflection);
     this.#log(
       'info',
       `[SessionStore] Tier ${tierIndex + 1} reflection: ` +
-        `${reflection.topFindings?.length || 0} top findings, ` +
-        `${reflection.crossDimensionPatterns?.length || 0} patterns`
+        `${reflection.topFindings.length} top findings, ` +
+        `${reflection.crossDimensionPatterns.length} patterns`
     );
   }
 
@@ -847,7 +885,12 @@ export class SessionStore implements Disposable {
       this.#log('info', `[SessionStore] Checkpoint loaded: ${this.#dimensionReports.size} reports`);
       return true;
     } catch (err: unknown) {
-      this.#log('warn', `[SessionStore] Failed to load checkpoint: ${(err as Error).message}`);
+      // 恢复失败（文件读写、JSON 解析或快照校验）一律降级为“无检查点”，由调用方重跑相应维度；
+      // 非 Error 抛出值按原值输出，避免日志只剩 undefined。
+      this.#log(
+        'warn',
+        `[SessionStore] Failed to load checkpoint: ${err instanceof Error ? err.message : String(err)}`
+      );
       return false;
     }
   }
@@ -1045,6 +1088,30 @@ export class SessionStore implements Disposable {
       () => this.#logger[level](message),
       () => undefined
     );
+  }
+
+  /**
+   * 把写入口归一化产生的降级记录汇总成一条 warn：入口 + 维度/层标识 + 每个字段的原始类型与动作。
+   * 一次调用只打一行，避免 AI 产出大量坏条目时刷屏，同时仍能逐字段定位。
+   */
+  #warnNormalizations(entry: string, normalizations: SessionStoreNormalization[]): void {
+    if (normalizations.length === 0) {
+      return;
+    }
+    const details = normalizations.map((n) => `${n.field} (${n.rawType} → ${n.action})`).join('; ');
+    this.#log(
+      'warn',
+      `[SessionStore] ${entry}: normalized ${normalizations.length} malformed field(s): ${details}`
+    );
+  }
+
+  /** digest 派生的 crossRefs 索引；调用方负责先删掉 from=dimId 的旧一代。值已由 schema 保证为字符串，空串跳过。 */
+  #pushDigestCrossRefs(dimId: string, digest: DimensionDigest | null): void {
+    for (const [targetDim, detail] of Object.entries(digest?.crossRefs ?? {})) {
+      if (detail) {
+        this.#crossReferences.push({ from: dimId, to: targetDim, relation: 'suggests', detail });
+      }
+    }
   }
 
   /** 从 findings 中选择与当前焦点最相关的 */

@@ -22,6 +22,8 @@ L4 使用结构化记忆包，成功替换前重新核对消息快照与读取�
 
 `SessionStore.storeDimensionReport()` 在校验完整新报告后替换该报告及其派生证据、交叉引用；独立 `addEvidence()` 数据保留。检查点中的 `reportDimId` 标识派生索引归属，普通证据查询会移除此内部字段。旧快照通过原报告匹配已有索引，旧 `E-id=path` 键归一到真实路径。查询、Producer 投影和 `toJSON()` 返回独立快照；顶层项目便捷配置与 `projectContext` 合并，显式 `projectContext` 优先。
 
+报告输入的 `digest` 为三态：缺省时沿用该维度已有 digest 并按它重建交叉引用（续跑先恢复 digest、再恢复报告文本时不丢失），显式 `null` 才清空，对象则严格校验后整体替换。`addDimensionDigest()` 与 `addTierReflection()` 的输入来自 AI 回复或宿主检查点，入口先归一化（非字符串的 crossRefs 值、非法 keyFindings/gaps/topFindings 项丢弃，类型错误的数组字段置为空数组，非字符串 summary 置为空串，非数字 candidateCount 删除），每次调用汇总一条含维度/层、字段与原始类型的 warn；整体不是对象时抛出 Error 且不改动状态。快照恢复（`fromJSON()`、`loadCheckpoint()`）对缺失字段补默认值，字段存在但类型错误或报告 `dimId` 与键不一致时拒绝恢复。
+
 检查点先写同目录临时文件，再 rename 替换目标；写入或重命名失败保留上次有效文件并抛出错误。注入 WriteZone 时写入、重命名与清理走同一边界。`MemoryCoordinator.checkpoint()` 仍是记录失败诊断的兼容便利入口，需要确认持久化的宿主应直接等待 `saveCheckpoint()`。这提供原子文件替换，不宣称跨进程事务或断电持久性。
 
 `ConversationStore` 使用同一个 data zone 读取和写入；损坏的 JSONL 记录逐条跳过并报告，合法相邻记录保留。读取预算包含截断标记，过长摘要不挤掉最近消息；摘要生成期间的对话变更会使旧结果失效。
