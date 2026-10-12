@@ -171,6 +171,41 @@ interface ProjectionState {
   warningCodes: Set<string>;
 }
 
+/**
+ * 显示投影（presentToolResult、普通输出）的节点预算。它只约束“给人/模型看的那一份”，
+ * 不能作用到规范 structuredContent 上：规范化入口传入无上限预算（L3-C01）。
+ */
+const DISPLAY_NODE_BUDGET = 4096;
+
+/**
+ * 嵌套深度上限。两条路径都保留：它是递归栈安全护栏（过深结构会让 JSON.stringify 自身抛
+ * RangeError），超限位置写带内标记并记 TOOL_RESULT_DISPLAY_LIMIT，不会静默丢数据。
+ */
+const MAX_NESTING_DEPTH = 64;
+
+const DISPLAY_LIMIT_MARKER = '[unavailable: display limit]';
+
+/**
+ * 规范 structuredContent 的 JSON 安全化入口（L3-P06）。
+ *
+ * - 只处理会让 JSON.stringify 抛错或执行宿主代码的值：循环引用、accessor、自有 toJSON、
+ *   BigInt/symbol/function、Date 与非普通原型；不删除任何字段（forbiddenFields 为空），
+ *   也不施加显示节点预算，因此 handler 返回多大的结构，宿主 /agent/tool 就拿到多大的数据。
+ * - 唯一保留的上限是 MAX_NESTING_DEPTH 栈安全护栏，超限处写带内标记并产生警告码。
+ * - status 由调用方按 handler 执行真值决定，这里不降级为 partial（决策：不引入 HTTP 206）。
+ *
+ * 用 default 导出是有意的：kernel/index.ts 与 tools/index.ts 都以 `export *` 再导出本模块，
+ * 而 `export *` 不转发 default，所以它只供包内 ToolRouterAdapter 使用，不进入任何公开出口
+ * （签名检查的出口与绑定数不变）。
+ */
+export default function normalizeToolResultContent(value: unknown): {
+  value: unknown;
+  warningCodes: string[];
+} {
+  const sanitized = sanitizeOrdinaryValue(value, [], Number.POSITIVE_INFINITY);
+  return { value: sanitized.value, warningCodes: uniqueStrings(sanitized.warningCodes) };
+}
+
 export function projectToolResultOrdinaryOutput<T = unknown>(
   envelope: ToolResultEnvelope<T>,
   options: ToolResultOrdinaryOutputProjectionOptions = {}
@@ -281,12 +316,16 @@ function summarizeToolResultDiagnostics(
   };
 }
 
-function sanitizeOrdinaryValue(value: unknown, forbiddenFields: readonly string[]): SanitizedValue {
+function sanitizeOrdinaryValue(
+  value: unknown,
+  forbiddenFields: readonly string[],
+  nodeBudget: number = DISPLAY_NODE_BUDGET
+): SanitizedValue {
   const forbiddenKeys = new Set(forbiddenFields.filter((field) => !field.includes('.')));
   const forbiddenPaths = new Set(forbiddenFields.filter((field) => field.includes('.')));
   const state: ProjectionState = {
     ancestors: new Set(),
-    remaining: 4096,
+    remaining: nodeBudget,
     redactedFields: [],
     warningCodes: new Set(),
   };
@@ -307,10 +346,10 @@ function sanitizeOrdinaryNode(
   depth: number,
   reserved = false
 ): unknown {
-  // 显示投影不是业务执行。循环、过深/过宽结构只能降级显示，不能使已确认写入变失败。
-  if (depth > 64 || (!reserved && state.remaining-- <= 0)) {
+  // 显示投影与规范化都不是业务执行。循环、过深/过宽结构只能带内降级，不能使已确认写入变失败。
+  if (depth > MAX_NESTING_DEPTH || (!reserved && state.remaining-- <= 0)) {
     state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
-    return '[unavailable: display limit]';
+    return DISPLAY_LIMIT_MARKER;
   }
   if (
     value === null ||
@@ -348,13 +387,21 @@ function sanitizeOrdinaryNode(
       state.warningCodes.add('TOOL_RESULT_DISPLAY_NORMALIZED');
     }
     const out: Record<string, unknown> | unknown[] = array ? [] : {};
+    // 数组下标只物化到预算能覆盖的位置（+1 用于触发耗尽判断）；无上限预算时即全长。
     const keys = array
-      ? Array.from({ length: Math.min(value.length, state.remaining + 1) }, (_, i) => String(i))
+      ? Array.from({ length: Math.min(value.length, Math.max(0, state.remaining) + 1) }, (_, i) =>
+          String(i)
+        )
       : Object.keys(value);
     const pending: Array<{ key: string; value: object; path: string[] }> = [];
+    // handled：已占用预算的键数；对数组而言等于已展示的下标数。
+    let handled = 0;
+    // exhaustedAt：预算耗尽时第一个未展示（且未被 D23 删除）的键在 keys 中的位置。
+    let exhaustedAt = -1;
     // 先为当前层的自有数据预留节点，再进入子树；前面的超大详情不能吞掉后面的
     // 纯量回执字段。此规则不识别业务 id/status，也不改变原字段的插入次序。
-    for (const key of keys) {
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index] as string;
       const childPath = array ? path : [...path, key];
       const dottedPath = childPath.join('.');
       if (!array && (forbiddenKeys.has(key) || forbiddenPaths.has(dottedPath))) {
@@ -362,10 +409,11 @@ function sanitizeOrdinaryNode(
         continue;
       }
       if (state.remaining <= 0) {
-        state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
+        exhaustedAt = index;
         break;
       }
       state.remaining--;
+      handled++;
       const property = Object.getOwnPropertyDescriptor(value, key);
       let child: unknown;
       if (property && !('value' in property)) {
@@ -377,7 +425,7 @@ function sanitizeOrdinaryNode(
         continue;
       } else if (property?.value !== null && typeof property?.value === 'object') {
         pending.push({ key, value: property.value, path: childPath });
-        child = '[unavailable: display limit]';
+        child = DISPLAY_LIMIT_MARKER;
       } else {
         child = sanitizeOrdinaryNode(
           property?.value,
@@ -389,17 +437,41 @@ function sanitizeOrdinaryNode(
           true
         );
       }
-      // __proto__ 也是合法 JSON 数据键；普通赋值会改变新对象的原型。
-      Object.defineProperty(out, key, {
-        value: array && child === undefined ? null : child,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
+      defineDataEntry(out, key, array && child === undefined ? null : child);
+    }
+    // 预算耗尽不能静默：被截掉的部分必须在数据本身里可见（L3-C01）。
+    const omitted = array
+      ? value.length - handled
+      : exhaustedAt < 0
+        ? 0
+        : countDisplayableKeys(keys, exhaustedAt, path, forbiddenKeys, forbiddenPaths);
+    if (omitted > 0) {
+      state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
+      if (handled === 0) {
+        // 进入容器时预算已耗尽：整个位置写占位，而不是返回看似真实的空 {} / []。
+        return DISPLAY_LIMIT_MARKER;
+      }
+      if (array) {
+        // 数组末尾追加省略计数；已展示前缀的下标与原数组一致。
+        defineDataEntry(
+          out,
+          String(handled),
+          `[unavailable: display limit, ${omitted} remaining items omitted]`
+        );
+      } else {
+        // 对象在第一个未展示的键上写剩余字段数（含该键自身），不臆造新键名。
+        defineDataEntry(
+          out,
+          keys[exhaustedAt] as string,
+          `[unavailable: display limit, ${omitted} remaining fields omitted]`
+        );
+      }
     }
     for (const child of pending) {
-      Object.defineProperty(out, child.key, {
-        value: sanitizeOrdinaryNode(
+      defineDataEntry(
+        out,
+        child.key,
+        sanitizeOrdinaryNode(
           child.value,
           child.path,
           forbiddenKeys,
@@ -407,11 +479,8 @@ function sanitizeOrdinaryNode(
           state,
           depth + 1,
           true
-        ),
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
+        )
+      );
     }
     return out;
   } catch (err: unknown) {
@@ -421,6 +490,34 @@ function sanitizeOrdinaryNode(
   } finally {
     state.ancestors.delete(value);
   }
+}
+
+/** __proto__ 也是合法 JSON 数据键；普通赋值会改变新对象的原型，所以统一用 defineProperty。 */
+function defineDataEntry(out: Record<string, unknown> | unknown[], key: string, value: unknown) {
+  Object.defineProperty(out, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/** 预算耗尽后本应展示却被省略的键数：D23 删除的键本来就不展示，不计入省略数。 */
+function countDisplayableKeys(
+  keys: readonly string[],
+  from: number,
+  path: readonly string[],
+  forbiddenKeys: ReadonlySet<string>,
+  forbiddenPaths: ReadonlySet<string>
+): number {
+  let count = 0;
+  for (let index = from; index < keys.length; index++) {
+    const key = keys[index] as string;
+    if (!forbiddenKeys.has(key) && !forbiddenPaths.has([...path, key].join('.'))) {
+      count++;
+    }
+  }
+  return count;
 }
 
 function projectArtifactRef(ref: ToolArtifactRef): ToolArtifactRef {

@@ -19,7 +19,8 @@ import type {
   ToolScopeRelease,
 } from '#tools/kernel/index.js';
 import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
-import { projectToolResultOrdinaryOutput } from '#tools/kernel/result.js';
+// default 导出不经 kernel/tools 的 `export *` 进入公开出口，只供本 adapter 做规范化。
+import normalizeToolResultContent from '#tools/kernel/result.js';
 import { toolAdmissionFailure } from '../admission.js';
 import { ToolRouter } from '../router.js';
 
@@ -54,6 +55,26 @@ function emptyDiagnostics(): ToolResultDiagnostics {
 function elapsedMs(monotonicStart: number): number {
   return Math.round(performance.now() - monotonicStart);
 }
+
+/**
+ * 规范化警告文案（L3-P06）。旧文案对所有警告码都写“display was normalized; the confirmed
+ * execution outcome is retained”，在内容被截断时会让读者以为结构化数据完好。新文案只陈述
+ * 事实：status 仍是 handler 的执行真值，而 structuredContent 在带内标记处被改写或不完整。
+ * 规范化不再施加节点预算，所以 TOOL_RESULT_DISPLAY_LIMIT 在这里只可能来自嵌套深度护栏。
+ */
+const NORMALIZATION_WARNING_MESSAGES: Readonly<Record<string, string>> = {
+  TOOL_RESULT_DISPLAY_LIMIT:
+    'Tool result nesting exceeded the depth limit; deeper values were replaced in place with "[unavailable: display limit]", so structuredContent is incomplete at those markers. Status still reports the handler outcome.',
+  TOOL_RESULT_DISPLAY_CYCLE:
+    'Circular references in the tool result were replaced in place with "[unavailable: circular reference]". Status still reports the handler outcome.',
+  TOOL_RESULT_DISPLAY_UNSUPPORTED:
+    'Non-JSON values in the tool result (for example BigInt, non-finite numbers, symbols, functions, accessors, toJSON hooks or unreadable objects) were replaced with "[unavailable: ...]" markers or dropped. Status still reports the handler outcome.',
+  TOOL_RESULT_DISPLAY_NORMALIZED:
+    'Tool result objects with a custom prototype or Date toJSON were converted to plain JSON (own enumerable fields and native Date ISO strings kept). Status still reports the handler outcome.',
+};
+
+const NORMALIZATION_WARNING_FALLBACK_MESSAGE =
+  'Tool result structuredContent was rewritten for JSON safety; see the in-band "[unavailable: ...]" markers. Status still reports the handler outcome.';
 
 const DEFAULT_TRUST: ToolResultTrust = {
   source: 'internal',
@@ -264,36 +285,39 @@ export class ToolRouterAdapter implements ToolRouterContract {
       diagnostics: diagnosticsFromResult(result, toolId),
       trust: { ...DEFAULT_TRUST, containsUntrustedText: !result.ok },
     };
-    // 先保留 handler 的执行真值，再单独归一显示数据。宿主已写成功后的循环/BigInt/
+    // 先保留 handler 的执行真值，再单独做 JSON 安全化。宿主已写成功后的循环/BigInt/
     // getter 等不能使 JSON.stringify 抛出并落入 execute 的失败分支，更不能重试写入。
-    // 这里显式传 forbiddenFields: []，只做显示归一（不可序列化值降级、节点预算），不删除任何
-    // 字段，内部信封保留业务字段。D23 普通输出禁用字段并没有在下游对结构化结果补上：带默认
-    // 禁用列表的投影只出现在 presentToolResult（目前没有生产调用方），以及 runtimeBridge 与
-    // AgentTaskHandlers 对不带 structuredContent 的纯文本信封的投影；有 structuredContent 时
-    // 它们直接返回原值。结构化结果是否也要执行 D23 待决（L3-C02），决定前不要假设私有字段
-    // 已被清理。
-    const display = projectToolResultOrdinaryOutput(envelope, { forbiddenFields: [] });
-    envelope.structuredContent = display.structuredContent;
+    // 规范化（L3-P06）只处理循环、accessor、toJSON、BigInt、Date、原型，不删除任何字段，
+    // 也不施加 4096 显示节点预算：宿主 /agent/tool 拿到的是完整数据，status 仍是 handler
+    // 真值（不降为 partial）。显示预算只留给 projectToolResultOrdinaryOutput/presentToolResult，
+    // 模型路径另有 limitToolResult 字符配额。D23 普通输出禁用字段也没有在下游对结构化结果
+    // 补上：带默认禁用列表的投影只出现在 presentToolResult（目前没有生产调用方），以及
+    // runtimeBridge 与 AgentTaskHandlers 对不带 structuredContent 的纯文本信封的投影；有
+    // structuredContent 时它们直接返回原值。结构化结果是否也要执行 D23 待决（L3-C02），
+    // 决定前不要假设私有字段已被清理。
+    const normalized = normalizeToolResultContent(result.data);
+    envelope.structuredContent = normalized.value;
     if (result.ok) {
       envelope.text =
-        typeof display.structuredContent === 'string'
-          ? display.structuredContent
-          : (JSON.stringify(display.structuredContent, null, 2) ?? '[no tool result]');
+        typeof normalized.value === 'string'
+          ? normalized.value
+          : (JSON.stringify(normalized.value, null, 2) ?? '[no tool result]');
     }
     const originalCodes = new Set(envelope.diagnostics.warnings.map((warning) => warning.code));
-    const displayWarnings = display.diagnosticSummary.warningCodes
+    // 每个警告码说明内容在哪里、被改写成了什么；它们就是本降级路径的诊断事件。
+    const normalizationWarnings = normalized.warningCodes
       .filter((code) => !originalCodes.has(code))
       .map((code) => ({
         code,
-        message: 'Tool result display was normalized; the confirmed execution outcome is retained.',
+        message: NORMALIZATION_WARNING_MESSAGES[code] ?? NORMALIZATION_WARNING_FALLBACK_MESSAGE,
         stage: 'result-display',
         tool: toolId,
       }));
-    if (displayWarnings.length > 0) {
+    if (normalizationWarnings.length > 0) {
       envelope.diagnostics = {
         ...envelope.diagnostics,
         degraded: true,
-        warnings: [...envelope.diagnostics.warnings, ...displayWarnings],
+        warnings: [...envelope.diagnostics.warnings, ...normalizationWarnings],
       };
     }
     return envelope;

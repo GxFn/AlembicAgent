@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -932,6 +933,69 @@ function knowledgeResultBoundary(
   return knowledgeAdapter(injected)(action, params);
 }
 
+/** 10 个纯量字段的 staging 复核记录；400 条约 4400 个节点，超过 4096 的显示预算。 */
+function reviewQueueRecord(index: number) {
+  return {
+    id: `staging-${index}`,
+    title: `Staged recipe ${index}`,
+    lifecycle: 'staging',
+    kind: 'recipe',
+    trigger: `trigger-${index}`,
+    doClause: 'Use the shared fixture port',
+    dontClause: 'Do not bypass the port',
+    whenClause: 'When reviewing staged knowledge',
+    confidence: 0.5,
+    sourceCount: index % 3,
+  };
+}
+
+function isEmptyRecord(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0
+  );
+}
+
+function isEqualRecord(value: unknown, expected: unknown): boolean {
+  return isDeepStrictEqual(value, expected);
+}
+
+/** 被截断的数组：已展示部分是原数组前缀，末尾一项写明剩余未展示的条数。 */
+function expectOmittedItemCount(displayed: unknown[], original: readonly unknown[]) {
+  const marker = displayed.at(-1);
+  const match = /^\[unavailable: display limit, (\d+) remaining items omitted\]$/.exec(
+    String(marker)
+  );
+  expect(typeof marker).toBe('string');
+  expect(match).not.toBeNull();
+  const shown = displayed.slice(0, -1);
+  expect(shown.length).toBeGreaterThan(0);
+  expect(shown).toEqual(original.slice(0, shown.length));
+  expect(shown.length + Number(match?.[1])).toBe(original.length);
+}
+
+/** 被截断的对象：已展示字段是原字段前缀，第一个未展示字段写明剩余（含自身）字段数。 */
+function expectRemainingFieldMarker(value: unknown, original: Record<string, unknown>) {
+  expect(value !== null && typeof value === 'object' && !Array.isArray(value)).toBe(true);
+  const entries = Object.entries(value as Record<string, unknown>);
+  const originalKeys = Object.keys(original);
+  const markerIndex = entries.length - 1;
+  expect(markerIndex).toBeGreaterThan(0);
+  entries.slice(0, markerIndex).forEach(([key, child], index) => {
+    expect(key).toBe(originalKeys[index]);
+    expect(child).toEqual(original[key]);
+  });
+  const [markerKey, marker] = entries[markerIndex] ?? [];
+  expect(markerKey).toBe(originalKeys[markerIndex]);
+  const match = /^\[unavailable: display limit, (\d+) remaining fields omitted\]$/.exec(
+    String(marker)
+  );
+  expect(match).not.toBeNull();
+  expect(markerIndex + Number(match?.[1])).toBe(originalKeys.length);
+}
+
 describe('tool result ordinary output', () => {
   it('sanitizes the JSON text projection as well as structuredContent', () => {
     const envelope = createEnvelopeForStatus('success');
@@ -1178,11 +1242,6 @@ describe('tool result ordinary output', () => {
       },
       code: 'TOOL_RESULT_DISPLAY_LIMIT',
     },
-    {
-      label: 'over-wide detail',
-      detail: () => Array.from({ length: 11000 }, () => 1),
-      code: 'TOOL_RESULT_DISPLAY_LIMIT',
-    },
   ])('retains a confirmed publish with a bounded safe display for $label', async ({
     detail,
     code,
@@ -1213,11 +1272,172 @@ describe('tool result ordinary output', () => {
       diagnostics: { degraded: true },
     });
     expect(envelope.diagnostics.warnings.map((warning) => warning.code)).toContain(code);
+    // 规范化诊断只能描述内容被如何改写，不能再声称结果完好。
+    for (const warning of envelope.diagnostics.warnings) {
+      expect(warning.message).not.toContain('outcome is retained');
+    }
     expect(() => JSON.stringify(envelope)).not.toThrow();
     const serialized = JSON.stringify(projectToolResultOrdinaryOutput(envelope));
     expect(serialized).not.toContain('synthetic-display-secret');
     expect(serialized.length).toBeLessThan(100_000);
     expect(presentToolResult(envelope)).toContain('receipt-fixture');
+  });
+
+  it('describes depth-limited canonical content as incomplete at its in-band markers', async () => {
+    let detail: Record<string, unknown> = { leaf: true };
+    for (let depth = 0; depth < 1000; depth++) {
+      detail = { child: detail };
+    }
+    const envelope = await knowledgeResultBoundary(
+      {
+        recipeGateway: {
+          evaluateReadiness: async () => ({ ready: true, violations: [] }),
+          publish: async () => ({ detail, id: 'receipt-fixture', lifecycle: 'active' }),
+        },
+      },
+      'manage',
+      { operation: 'publish', id: 'receipt-fixture' }
+    );
+    const warning = envelope.diagnostics.warnings.find(
+      (entry) => entry.code === 'TOOL_RESULT_DISPLAY_LIMIT'
+    );
+    expect(envelope).toMatchObject({ ok: true, status: 'success' });
+    expect(warning).toMatchObject({ stage: 'result-display', tool: 'knowledge' });
+    expect(warning?.message).toContain('[unavailable: display limit]');
+    expect(warning?.message).toContain('incomplete');
+    expect(JSON.stringify(envelope.structuredContent)).toContain('[unavailable: display limit]');
+  });
+
+  it('keeps an over-wide confirmed publish complete in the canonical envelope', async () => {
+    const detail = Array.from({ length: 11000 }, () => 1);
+    const publish = vi.fn(async () => ({ detail, id: 'receipt-fixture', lifecycle: 'active' }));
+    const envelope = await knowledgeResultBoundary(
+      {
+        recipeGateway: {
+          evaluateReadiness: async () => ({ ready: true, violations: [] }),
+          publish,
+        },
+      },
+      'manage',
+      { operation: 'publish', id: 'receipt-fixture' }
+    );
+    expect(publish).toHaveBeenCalledOnce();
+    // 规范信封只做 JSON 安全化：宽度不受显示节点预算影响，status/degraded 反映 handler 真值。
+    expect(envelope).toMatchObject({
+      ok: true,
+      status: 'success',
+      structuredContent: {
+        id: 'receipt-fixture',
+        lifecycle: 'active',
+        status: 'published',
+        record: { id: 'receipt-fixture', lifecycle: 'active', detail },
+      },
+      diagnostics: { degraded: false, warnings: [] },
+    });
+    expect(JSON.parse(envelope.text)).toMatchObject({ record: { detail } });
+
+    // 显示投影仍受预算约束，但截断处必须带内可见：数组末尾写省略计数。
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    expect(projected.status).toBe('success');
+    expect(projected.diagnosticSummary).toMatchObject({ degraded: true });
+    expect(projected.diagnosticSummary.warningCodes).toContain('TOOL_RESULT_DISPLAY_LIMIT');
+    const displayed = (projected.structuredContent as { record: { detail: unknown[] } }).record
+      .detail;
+    expectOmittedItemCount(displayed, detail);
+    expect(JSON.stringify(projected).length).toBeLessThan(100_000);
+    expect(presentToolResult(envelope)).toContain('receipt-fixture');
+    expect(presentToolResult(envelope)).toMatch(/remaining items omitted/);
+  });
+
+  it('returns every review-queue record intact from the adapter beyond the display budget', async () => {
+    const queue = Array.from({ length: 400 }, (_, index) => reviewQueueRecord(index));
+    const listReviewQueue = vi.fn(async () => queue);
+    const envelope = await knowledgeResultBoundary(
+      { stagingManager: { listReviewQueue, recordReview: async () => undefined } },
+      'manage',
+      { operation: 'review-queue' }
+    );
+    expect(listReviewQueue).toHaveBeenCalledOnce();
+    expect(envelope).toMatchObject({ ok: true, status: 'success' });
+    const content = envelope.structuredContent as { queue: unknown[]; count: number };
+    expect(content.count).toBe(400);
+    expect(content.queue).toHaveLength(400);
+    expect(content.queue.filter(isEmptyRecord)).toHaveLength(0);
+    expect(content.queue).toEqual(queue);
+    expect(JSON.parse(envelope.text)).toEqual({ queue, count: 400 });
+    expect(envelope.diagnostics).toMatchObject({ degraded: false, warnings: [] });
+  });
+
+  it('marks budget-exhausted records in band instead of projecting silent empty objects', () => {
+    const queue = Array.from({ length: 400 }, (_, index) => reviewQueueRecord(index));
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = { queue, count: queue.length };
+    envelope.text = JSON.stringify(envelope.structuredContent, null, 2);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    expect(projected.status).toBe('success');
+    expect(projected.diagnosticSummary.degraded).toBe(true);
+    expect(projected.diagnosticSummary.warningCodes).toContain('TOOL_RESULT_DISPLAY_LIMIT');
+    for (const displayed of [
+      (projected.structuredContent as { queue: unknown[] }).queue,
+      (JSON.parse(projected.text) as { queue: unknown[] }).queue,
+    ]) {
+      // 数组长度保留原始条数；每个位置要么完整，要么在被截断处带有显式标记。
+      expect(displayed).toHaveLength(queue.length);
+      expect(displayed.filter(isEmptyRecord)).toHaveLength(0);
+      let complete = 0;
+      let partial = 0;
+      let unavailable = 0;
+      displayed.forEach((item, index) => {
+        if (item === '[unavailable: display limit]') {
+          unavailable++;
+          return;
+        }
+        if (isEqualRecord(item, queue[index])) {
+          complete++;
+          return;
+        }
+        partial++;
+        expectRemainingFieldMarker(item, queue[index]);
+      });
+      expect(complete).toBeGreaterThan(0);
+      expect(unavailable).toBeGreaterThan(0);
+      expect(complete + partial + unavailable).toBe(queue.length);
+    }
+  });
+
+  it('ends an over-budget array display with the omitted item count', () => {
+    const items = Array.from({ length: 11000 }, (_, index) => index);
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = { items };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    expect(projected.diagnosticSummary.warningCodes).toContain('TOOL_RESULT_DISPLAY_LIMIT');
+    expectOmittedItemCount((projected.structuredContent as { items: unknown[] }).items, items);
+    expectOmittedItemCount((JSON.parse(projected.text) as { items: unknown[] }).items, items);
+  });
+
+  it('marks the first omitted field of an over-budget object with the remaining count', () => {
+    const wide: Record<string, number> = {};
+    for (let index = 0; index < 5000; index++) {
+      wide[`field${index}`] = index;
+    }
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = { wide, empty: {}, none: [] };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+    const content = projected.structuredContent as {
+      wide: Record<string, unknown>;
+      empty: unknown;
+      none: unknown;
+    };
+    expect(projected.diagnosticSummary.warningCodes).toContain('TOOL_RESULT_DISPLAY_LIMIT');
+    expectRemainingFieldMarker(content.wide, wide);
+    // 真实的空容器不是截断，必须原样保留。
+    expect(content.empty).toEqual({});
+    expect(content.none).toEqual([]);
   });
 
   it('preserves native Date serialization without running host getters or custom toJSON', async () => {
