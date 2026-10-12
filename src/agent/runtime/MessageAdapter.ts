@@ -6,16 +6,29 @@ import type { LlmContinuation } from '#ai/contracts.js';
  *   - ContextWindowAdapter: 委托给 ContextWindow 实例 (bootstrap/system 场景)
  *   - SimpleArrayAdapter: 裸数组模式 (对话场景)
  *
- * 两个实现对外暴露完全相同的 API，
- * 使得 reactLoop 及其提取方法无需关心底层消息存储方式。
+ * 两个实现对外暴露相同的 API，并共享 context 层的消息语义纯函数（ContextWindow.ts）：
+ * runtime nudge 只保留最新一条、knowledge submit 参数按 provider 历史压缩（同步处理续接）、
+ * 工具结果元数据只留布尔 persistedSubmission、toMessages 返回快照、token 估算同一口径。
+ * 差异只在压缩能力：裸数组模式不压缩，provider 输入预算只如实测量并在超限时告警。
+ * 这样 reactLoop 及其提取方法无需关心底层消息存储方式。
  *
  * @module core/MessageAdapter
  */
 
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { isToolResultEnvelope } from '#tools/kernel/index.js';
-import type { ContextWindow } from '../context/ContextWindow.js';
-import { limitToolResult } from '../context/ContextWindow.js';
+import type { ContextWindow, ToolCallInfo } from '../context/ContextWindow.js';
+import {
+  createRuntimeNudgeMessage,
+  dropStaleRuntimeNudges,
+  estimateProviderHistoryTokens,
+  isOverProviderInputBudget,
+  limitToolResult,
+  prepareToolCallsForProviderHistory,
+  resolveProviderInputBudgetLimits,
+  toolResultHistoryMetadata,
+} from '../context/ContextWindow.js';
 import { readRejectedEnvelopeText, TOOL_ENVELOPE_SHAPE_REJECTED } from './toolReceipt.js';
 
 export interface ProviderInputBudgetProjection {
@@ -35,16 +48,18 @@ interface ToolCallRecord {
   args: Record<string, unknown>;
 }
 
-/** 聊天消息 */
+/** 聊天消息（裸数组模式；形状与 ContextWindow 的 ContextMessage 对齐） */
 interface ChatMessage {
   role: 'user' | 'assistant' | 'tool';
   content: string | null;
   reasoningContent?: string | null;
   continuation?: LlmContinuation;
-  toolCalls?: ToolCallRecord[];
+  /** provider 历史形状：knowledge submit 参数已压缩，args 可能被改写。 */
+  toolCalls?: ToolCallInfo[];
   toolCallId?: string;
   name?: string;
-  metadata?: { persistedSubmission?: boolean };
+  /** kind 只标记 runtime nudge（供下一次 nudge 替换）；persistedSubmission 只接受布尔值。 */
+  metadata?: { persistedSubmission?: boolean; kind?: 'runtime_nudge' };
 }
 
 // ─────────────────────────────────────────────
@@ -108,8 +123,8 @@ export class MessageAdapter {
   }
 
   /**
-   * 导出当前消息列表 (供 LLM 调用)
-   * @returns >}
+   * 导出当前消息列表的快照（浅拷贝数组）。
+   * 调用方对返回数组的 push/splice/排序不影响适配器内部历史；消息对象本身仍是共享引用，不得原地修改。
    */
   toMessages(): unknown[] {
     throw new Error('not implemented');
@@ -144,19 +159,46 @@ export class MessageAdapter {
     throw new Error('not implemented');
   }
 
-  compactForProviderInputBudget(_opts?: {
+  /**
+   * 阶段 provider 输入预算投影 — 无压缩能力的适配器（基类默认实现，SimpleArrayAdapter 沿用）。
+   *
+   * 不压缩，但必须如实测量：token 与 ContextWindow 同一口径（estimateProviderHistoryTokens），
+   * 不能写 0 冒充“测得很小”。超出阶段预算时返回 reason='adapter-without-compaction:<stageProfile>'
+   * 并记 warn，说明预算未被执行、投影原样发送；level 恒为 0、removed 恒为 0。
+   * opts.reason 只对能压缩的窗口有意义（覆盖压缩原因文本），这里不采用。
+   */
+  compactForProviderInputBudget(opts?: {
     maxProjectedMessages?: number;
     maxProjectedTokens?: number;
     reason?: string;
     stageProfile?: string;
   }): ProviderInputBudgetProjection {
+    const projected = this.toProjectedMessages();
+    const messageCount = projected.length;
+    const projectedTokens = estimateProviderHistoryTokens(projected);
+    const overBudget = isOverProviderInputBudget(messageCount, projectedTokens, opts);
+    let reason: string | null = null;
+    if (overBudget) {
+      const stageProfile = opts?.stageProfile || 'generic';
+      const { maxProjectedMessages, maxProjectedTokens } = resolveProviderInputBudgetLimits(opts);
+      reason = `adapter-without-compaction:${stageProfile}`;
+      // 跳过路径诊断：只写适配器类名、阶段、计数与估算，不写消息正文。日志失败不影响本轮 LLM 输入装配。
+      const adapterName = this.constructor.name;
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            `[MessageAdapter] ${reason}: adapter=${adapterName} has no compaction, stageProfile=${stageProfile} messages=${messageCount}/${maxProjectedMessages} tokens≈${projectedTokens}/${maxProjectedTokens}; provider input budget not enforced, projection sent unchanged`
+          ),
+        () => undefined
+      );
+    }
     return {
-      afterMessageCount: this.toProjectedMessages().length,
-      afterProjectedTokens: 0,
-      beforeMessageCount: this.toProjectedMessages().length,
-      beforeProjectedTokens: 0,
+      afterMessageCount: messageCount,
+      afterProjectedTokens: projectedTokens,
+      beforeMessageCount: messageCount,
+      beforeProjectedTokens: projectedTokens,
       level: 0,
-      reason: null,
+      reason,
       removed: 0,
     };
   }
@@ -274,7 +316,9 @@ export class ContextWindowAdapter extends MessageAdapter {
   }
 
   toMessages() {
-    return this.#ctxWin.toMessages();
+    // ContextWindow.toMessages 返回内部活数组；适配器层统一返回快照，与 SimpleArrayAdapter 别名语义一致，
+    // 避免调用方改写数组绕过 L3 折叠边界与 runtime nudge 维护。
+    return [...this.#ctxWin.toMessages()];
   }
 
   toProjectedMessages() {
@@ -308,10 +352,11 @@ export class ContextWindowAdapter extends MessageAdapter {
 // ─────────────────────────────────────────────
 
 /**
- * 简单数组消息管理 — 对话场景。
+ * 简单数组消息管理 — 对话场景（以及未注入 contextWindow 的严格阶段）。
  *
- * 不做任何压缩，getToolResultQuota 返回固定 8000。
- * compactIfNeeded 始终返回 no-op。
+ * 不做任何压缩，getToolResultQuota 返回固定 8000，compactIfNeeded 始终返回 no-op；
+ * compactForProviderInputBudget 沿用基类：如实测量 token，超出阶段预算时告警并标明未执行。
+ * 消息语义（nudge 替换、submit 参数压缩、工具结果元数据）与 ContextWindow 共用同一组纯函数。
  */
 export class SimpleArrayAdapter extends MessageAdapter {
   #messages: ChatMessage[] = [];
@@ -341,14 +386,23 @@ export class SimpleArrayAdapter extends MessageAdapter {
     reasoningContent?: string | null,
     continuation?: LlmContinuation
   ) {
+    // 与 ContextWindow 共用：knowledge submit 参数压缩为标识字段；参数被改写时不保存续接并剥离签名。
+    const history = prepareToolCallsForProviderHistory(calls, continuation);
     const msg: ChatMessage = {
       role: 'assistant',
       content: text,
-      toolCalls: calls,
+      toolCalls: history.toolCalls,
       reasoningContent: reasoningContent ?? '',
     };
-    if (continuation) {
-      msg.continuation = structuredClone(continuation);
+    if (history.continuationDropDiagnostic) {
+      const diagnostic = history.continuationDropDiagnostic;
+      // 一次性诊断：只在追加时记录一次；不含推理正文、参数正文或签名。日志失败不影响追加。
+      observeSafely(
+        () => Logger.getInstance().info(`[MessageAdapter] ${diagnostic}`),
+        () => undefined
+      );
+    } else if (history.continuation) {
+      msg.continuation = history.continuation;
     }
     this.#messages.push(msg);
   }
@@ -359,17 +413,21 @@ export class SimpleArrayAdapter extends MessageAdapter {
     content: string,
     metadata?: { persistedSubmission?: boolean }
   ) {
+    const historyMetadata = toolResultHistoryMetadata(metadata);
     this.#messages.push({
       role: 'tool',
       toolCallId: callId,
       name,
       content,
-      ...(metadata ? { metadata: { ...metadata } } : {}),
+      ...(historyMetadata ? { metadata: historyMetadata } : {}),
     });
   }
 
   appendUserNudge(text: string) {
-    this.#messages.push({ role: 'user', content: text });
+    // 与 ContextWindow 相同：先移除旧 runtime nudge（首条 prompt 保留），模型只看到最新运行时指令。
+    // 裸数组模式没有 L3 折叠边界，无需移动阈值。
+    this.#messages = dropStaleRuntimeNudges(this.#messages).kept;
+    this.#messages.push(createRuntimeNudgeMessage(text));
   }
 
   toMessages() {

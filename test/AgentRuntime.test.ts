@@ -422,6 +422,16 @@ describe('agent runtime forced summary suppression', () => {
           }
         : null
     );
+    // 只在首轮给 reflection nudge：两种消息适配器都只保留最新一条 runtime nudge，
+    // 第二轮若再追加 reflection 会替换掉回合末的 transition nudge，模型就看不到它。
+    const getNudge = vi.fn(() =>
+      getNudge.mock.calls.length === 1
+        ? {
+            type: 'reflection',
+            text: 'Reflect on current evidence with token=visibleNudgeSecret12345',
+          }
+        : null
+    );
     const tracker = {
       phase: 'EXPLORE',
       pipelineType: 'analyst',
@@ -431,10 +441,7 @@ describe('agent runtime forced summary suppression', () => {
       totalSubmits: 0,
       tick: vi.fn(),
       shouldExit: vi.fn(() => false),
-      getNudge: vi.fn(() => ({
-        type: 'reflection',
-        text: 'Reflect on current evidence with token=visibleNudgeSecret12345',
-      })),
+      getNudge,
       getPhaseContext: vi.fn(() => null),
       getToolChoice: vi.fn(() => 'auto'),
       recordToolCall: vi.fn(() => ({ isNew: true })),

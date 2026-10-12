@@ -40,8 +40,8 @@ import {
 
 // ─── 类型定义 ──────────────────────────────────────────
 
-/** 工具调用信息 */
-interface ToolCallInfo {
+/** 工具调用信息（provider 历史里保存的形状；MessageAdapter 的裸数组模式共用此类型）。 */
+export interface ToolCallInfo {
   id: string;
   name: string;
   args?: Record<string, unknown>;
@@ -320,20 +320,15 @@ export class ContextWindow {
    * 独立命名以便审计和搜索。
    */
   appendUserNudge(content: string) {
-    let removedBeforeCollapse = 0;
-    this.#messages = this.#messages.filter((message, index) => {
-      if (index === 0) {
-        return true;
-      }
-      const keep = message.metadata?.kind !== 'runtime_nudge';
-      if (!keep && index < this.#collapseThreshold) {
-        removedBeforeCollapse++;
-      }
-      return keep;
-    });
+    // 过滤规则与 SimpleArrayAdapter 共用（dropStaleRuntimeNudges），保证两种消息存储只保留最新运行时指令。
+    const { kept, removedBeforeCollapse } = dropStaleRuntimeNudges(
+      this.#messages,
+      this.#collapseThreshold
+    );
+    this.#messages = kept;
     // L3 使用绝对索引；移除旧 nudge 后必须移动边界，不能额外隐藏仍可见的工具调用。
     this.#collapseThreshold -= removedBeforeCollapse;
-    this.#messages.push({ role: 'user', content, metadata: { kind: 'runtime_nudge' } });
+    this.#messages.push(createRuntimeNudgeMessage(content));
   }
 
   /**
@@ -348,34 +343,22 @@ export class ContextWindow {
     reasoningContent?: string | null,
     continuation?: LlmContinuation
   ) {
-    const historyCalls = toolCalls.map(compactToolCallForProviderHistory);
-    // compactToolCallForProviderHistory 只在 knowledge submit 时返回新的 args 对象；
-    // 引用变化即“参数被实际改写”，其余工具（含 knowledge 非 submit 动作）原样保留。
-    const rewrittenCallIds = historyCalls
-      .filter((call, index) => call.args !== toolCalls[index]?.args)
-      .map((call) => call.id);
-    // 跨层契约：续接的 projectionHash 由 Transport 按捕获时的完整工具参数计算。本窗口改写参数后，
-    // 回放必然判 projection_binding_changed，且该消息常驻历史，会在之后每次请求重复告警并丢推理。
-    // 谁改写投影谁处理续接：这里直接不保存续接（原生签名/回放块随之放弃），保留 reasoningContent
-    // （DeepSeek 推理是未签名文本，可独立回传），并剥离调用上的 Gemini thoughtSignature——签名绑定
-    // 改写前的投影，被拒时本来也不会发送，这一轮按无签名历史发送（与改写前的实际请求一致）。
-    const dropContinuation = continuation !== undefined && rewrittenCallIds.length > 0;
+    // 参数压缩与续接取舍由 prepareToolCallsForProviderHistory 统一决定（SimpleArrayAdapter 共用），
+    // 两种消息存储发给 provider 的历史调用形状一致。
+    const history = prepareToolCallsForProviderHistory(toolCalls, continuation);
     const msg: ContextMessage = {
       role: 'assistant',
       content: text || null,
-      toolCalls: dropContinuation ? historyCalls.map(withoutThoughtSignature) : historyCalls,
+      toolCalls: history.toolCalls,
       // V4 要求: 带 tool_calls 的 assistant 消息的 reasoning_content 必须保留
       // 始终存储此字段（即使为空），确保后续 API 调用不会丢失
       reasoningContent: reasoningContent ?? '',
     };
-    if (continuation && dropContinuation) {
+    if (history.continuationDropDiagnostic) {
       // 一次性诊断：只在追加时记录一次；不含推理正文、参数正文或签名，只记录身份与调用 id。
-      this.#log(
-        'info',
-        `[ContextWindow] continuation_dropped reason=compacted_args provider=${continuation.provider} model=${continuation.model} kind=${continuation.kind} callIds=${formatCallIds(rewrittenCallIds)}; tool-call args compacted for provider history, native continuation discarded, reasoningContent retained, thought signatures omitted`
-      );
-    } else if (continuation) {
-      msg.continuation = structuredClone(continuation);
+      this.#log('info', `[ContextWindow] ${history.continuationDropDiagnostic}`);
+    } else if (history.continuation) {
+      msg.continuation = history.continuation;
     }
     this.#messages.push(msg);
   }
@@ -391,14 +374,13 @@ export class ContextWindow {
     content: string,
     metadata?: { persistedSubmission?: boolean }
   ) {
+    const historyMetadata = toolResultHistoryMetadata(metadata);
     this.#messages.push({
       role: 'tool',
       toolCallId,
       name,
       content,
-      ...(typeof metadata?.persistedSubmission === 'boolean'
-        ? { metadata: { persistedSubmission: metadata.persistedSubmission } }
-        : {}),
+      ...(historyMetadata ? { metadata: historyMetadata } : {}),
     });
   }
 
@@ -480,14 +462,24 @@ export class ContextWindow {
   compactForProviderInputBudget(
     options: ProviderInputBudgetOptions = {}
   ): ProviderInputBudgetResult {
-    const maxProjectedMessages = options.maxProjectedMessages ?? 44;
-    const maxProjectedTokens = options.maxProjectedTokens ?? 16_000;
+    const { maxProjectedMessages, maxProjectedTokens } = resolveProviderInputBudgetLimits(options);
     const beforeMessageCount = this.toProjectedMessages().length;
     const beforeProjectedTokens = this.estimateProjectedTokens();
-    const shouldCompact =
-      beforeMessageCount > maxProjectedMessages || beforeProjectedTokens > maxProjectedTokens;
+    const shouldCompact = isOverProviderInputBudget(
+      beforeMessageCount,
+      beforeProjectedTokens,
+      options
+    );
 
     if (!shouldCompact || this.#messages.length <= 4) {
+      if (shouldCompact) {
+        // 短路：超出阶段预算但消息不足 5 条，L1-L3 都无可压缩的历史轮次（严格单轮阶段常见），
+        // 投影原样发送。返回结构保持 level=0/reason=null，只补一条诊断说明预算未被执行的原因。
+        this.#log(
+          'info',
+          `[ContextWindow] provider input budget skipped: stageProfile=${options.stageProfile || 'generic'} messages=${beforeMessageCount}/${maxProjectedMessages} tokens≈${beforeProjectedTokens}/${maxProjectedTokens}; only ${this.#messages.length} message(s), no compactable history, projection sent unchanged`
+        );
+      }
       return {
         afterMessageCount: beforeMessageCount,
         afterProjectedTokens: beforeProjectedTokens,
@@ -909,23 +901,8 @@ export class ContextWindow {
   }
 
   #estimateMessagesTokens(messages: ContextMessage[]) {
-    let total = 0;
-    for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
-      if (m.content) {
-        total += estimateTokensFast(m.content);
-      }
-      if (m.reasoningContent && m.continuation?.kind !== 'content-replay-v1') {
-        total += estimateTokensFast(m.reasoningContent);
-      }
-      if (m.continuation) {
-        total += estimateTokensFast(JSON.stringify(m.continuation));
-      }
-      if (m.toolCalls) {
-        total += estimateTokensFast(JSON.stringify(m.toolCalls));
-      }
-    }
-    return total;
+    // 估算口径与 MessageAdapter 裸数组模式共用 estimateProviderHistoryTokens，诊断数值可直接对比。
+    return estimateProviderHistoryTokens(messages);
   }
 
   /** 获取 token 使用率：发给模型的投影视图占预算的比例（可能大于 1）。 */
@@ -1134,6 +1111,161 @@ export class ContextWindow {
     }
     return starts;
   }
+}
+
+// ─── provider 历史语义纯函数（ContextWindow 与 MessageAdapter 裸数组模式共用）────────
+// 只在 context 层按名导出，不进入 `@alembic/agent/context` 公开子路径（index.ts 是按名导出，不含这些）。
+// 两种消息存储必须给模型同一份历史语义：只保留最新 runtime nudge、knowledge submit 参数按 provider
+// 历史压缩并同步处理续接、工具结果元数据只留布尔 persistedSubmission、token 估算与阶段预算默认值同一口径。
+
+const RUNTIME_NUDGE_KIND = 'runtime_nudge';
+/** 阶段未给上限时的 provider 输入预算默认值（与历史 compactForProviderInputBudget 默认一致）。 */
+const DEFAULT_PROVIDER_INPUT_MAX_MESSAGES = 44;
+const DEFAULT_PROVIDER_INPUT_MAX_TOKENS = 16_000;
+
+/** 构造运行时 nudge：metadata.kind 让下一次 nudge 能识别并替换它；provider 序列化不读取 metadata。 */
+export function createRuntimeNudgeMessage(content: string): {
+  role: 'user';
+  content: string;
+  metadata: { kind: typeof RUNTIME_NUDGE_KIND };
+} {
+  return { role: 'user', content, metadata: { kind: RUNTIME_NUDGE_KIND } };
+}
+
+/**
+ * 移除历史中已过期的 runtime nudge，返回新数组，不改入参。
+ * 首条消息（原始 prompt）永远保留；collapseThreshold 是 L3 折叠边界的绝对索引（-1 表示未折叠），
+ * removedBeforeCollapse 供调用方前移边界，避免额外隐藏仍可见的工具调用。
+ */
+export function dropStaleRuntimeNudges<T extends { metadata?: { kind?: unknown } }>(
+  messages: readonly T[],
+  collapseThreshold = -1
+): { kept: T[]; removed: number; removedBeforeCollapse: number } {
+  let removed = 0;
+  let removedBeforeCollapse = 0;
+  const kept = messages.filter((message, index) => {
+    if (index === 0 || message.metadata?.kind !== RUNTIME_NUDGE_KIND) {
+      return true;
+    }
+    removed++;
+    if (index < collapseThreshold) {
+      removedBeforeCollapse++;
+    }
+    return false;
+  });
+  return { kept, removed, removedBeforeCollapse };
+}
+
+/** prepareToolCallsForProviderHistory 的结果：写入历史的调用、可保留的续接与一次性诊断文本。 */
+export interface ProviderHistoryToolCalls {
+  toolCalls: ToolCallInfo[];
+  /** 可写入历史的续接（已 structuredClone）；参数被改写或本来就没有续接时为 undefined。 */
+  continuation: LlmContinuation | undefined;
+  /** 参数被实际改写的调用 id（目前只有 knowledge submit）。 */
+  rewrittenCallIds: string[];
+  /** 续接因参数改写被丢弃时的诊断正文（不含推理、参数正文或签名），调用方加前缀后记一次日志。 */
+  continuationDropDiagnostic: string | null;
+}
+
+/**
+ * 把本轮工具调用整理成 provider 历史形状：knowledge submit 只保留标识字段，其余调用原样保留。
+ *
+ * 跨层契约：续接的 projectionHash 由 Transport 按捕获时的完整工具参数计算。参数被改写后，
+ * 回放必然判 projection_binding_changed，且该消息常驻历史，会在之后每次请求重复告警并丢推理。
+ * 谁改写投影谁处理续接：这里直接不保存续接（原生签名/回放块随之放弃），调用方保留 reasoningContent
+ * （DeepSeek 推理是未签名文本，可独立回传），并剥离调用上的 Gemini thoughtSignature——签名绑定
+ * 改写前的投影，被拒时本来也不会发送，这一轮按无签名历史发送（与改写前的实际请求一致）。
+ */
+export function prepareToolCallsForProviderHistory(
+  toolCalls: readonly ToolCallInfo[],
+  continuation?: LlmContinuation
+): ProviderHistoryToolCalls {
+  const historyCalls = toolCalls.map(compactToolCallForProviderHistory);
+  // compactToolCallForProviderHistory 只在 knowledge submit 时返回新的 args 对象；
+  // 引用变化即“参数被实际改写”，其余工具（含 knowledge 非 submit 动作）原样保留。
+  const rewrittenCallIds = historyCalls
+    .filter((call, index) => call.args !== toolCalls[index]?.args)
+    .map((call) => call.id);
+  if (continuation && rewrittenCallIds.length > 0) {
+    return {
+      toolCalls: historyCalls.map(withoutThoughtSignature),
+      continuation: undefined,
+      rewrittenCallIds,
+      continuationDropDiagnostic: `continuation_dropped reason=compacted_args provider=${continuation.provider} model=${continuation.model} kind=${continuation.kind} callIds=${formatCallIds(rewrittenCallIds)}; tool-call args compacted for provider history, native continuation discarded, reasoningContent retained, thought signatures omitted`,
+    };
+  }
+  return {
+    toolCalls: historyCalls,
+    continuation: continuation ? structuredClone(continuation) : undefined,
+    rewrittenCallIds,
+    continuationDropDiagnostic: null,
+  };
+}
+
+/**
+ * 工具结果写入历史时只保留 Runtime 已确认的布尔 persistedSubmission；其它字段或非布尔值不进历史，
+ * 提交标题提取（#extractCompactedSubmits）因此只信任这一种确认来源。
+ */
+export function toolResultHistoryMetadata(metadata?: {
+  persistedSubmission?: unknown;
+}): { persistedSubmission: boolean } | undefined {
+  return typeof metadata?.persistedSubmission === 'boolean'
+    ? { persistedSubmission: metadata.persistedSubmission }
+    : undefined;
+}
+
+/**
+ * provider 可见历史的 token 估算（ContextWindow 的唯一口径，裸数组适配器同样使用）。
+ * 入参按未知形状防御读取：非对象消息跳过，只计 content、未被回放块覆盖的 reasoningContent、
+ * 续接 JSON 与工具调用 JSON。
+ */
+export function estimateProviderHistoryTokens(messages: readonly unknown[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if (!isRecord(message)) {
+      continue;
+    }
+    const { content, reasoningContent, continuation, toolCalls } = message;
+    if (typeof content === 'string' && content) {
+      total += estimateTokensFast(content);
+    }
+    const continuationKind = isRecord(continuation) ? continuation.kind : undefined;
+    if (
+      typeof reasoningContent === 'string' &&
+      reasoningContent &&
+      continuationKind !== 'content-replay-v1'
+    ) {
+      total += estimateTokensFast(reasoningContent);
+    }
+    if (continuation) {
+      total += estimateTokensFast(JSON.stringify(continuation));
+    }
+    if (toolCalls) {
+      total += estimateTokensFast(JSON.stringify(toolCalls));
+    }
+  }
+  return total;
+}
+
+/** 解析阶段 provider 输入预算上限；未给出的上限取默认值。 */
+export function resolveProviderInputBudgetLimits(options: ProviderInputBudgetOptions = {}): {
+  maxProjectedMessages: number;
+  maxProjectedTokens: number;
+} {
+  return {
+    maxProjectedMessages: options.maxProjectedMessages ?? DEFAULT_PROVIDER_INPUT_MAX_MESSAGES,
+    maxProjectedTokens: options.maxProjectedTokens ?? DEFAULT_PROVIDER_INPUT_MAX_TOKENS,
+  };
+}
+
+/** 投影是否超出阶段 provider 输入预算（消息数或 token 任一超限）。 */
+export function isOverProviderInputBudget(
+  messageCount: number,
+  projectedTokens: number,
+  options: ProviderInputBudgetOptions = {}
+): boolean {
+  const { maxProjectedMessages, maxProjectedTokens } = resolveProviderInputBudgetLimits(options);
+  return messageCount > maxProjectedMessages || projectedTokens > maxProjectedTokens;
 }
 
 /** 运行时调用对象可能携带 Gemini thoughtSignature（ToolCallInfo 未声明该字段）；丢弃续接时一并剥离。 */

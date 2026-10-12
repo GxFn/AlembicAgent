@@ -4,6 +4,7 @@ import fs, { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'nod
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Logger from '@alembic/core/logging';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/ContextWindow.js';
 import { captureEvidenceFromEnvelope } from '../src/agent/evidence/EvidenceCapture.js';
@@ -12,7 +13,15 @@ import { BudgetPolicy, PolicyEngine } from '../src/agent/policies/index.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';
+import { resolveProviderInputBudget } from '../src/agent/runtime/llmInput.js';
+import {
+  ContextWindowAdapter,
+  createMessageAdapter,
+  type MessageAdapter,
+  SimpleArrayAdapter,
+} from '../src/agent/runtime/MessageAdapter.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
+import type { LlmContinuation } from '../src/ai/contracts.js';
 import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
@@ -849,5 +858,269 @@ describe('runtime-owned tool resource lifecycle', () => {
     expect(scopes).toHaveLength(2);
     expect(Number.isSafeInteger(scopes[0]?.revision)).toBe(true);
     expect(scopes[1]?.revision).toBeGreaterThan(scopes[0]?.revision ?? -1);
+  });
+});
+
+/**
+ * I16：SimpleArrayAdapter（无 contextWindow 的对话/严格阶段）与 ContextWindowAdapter 必须给模型同样的
+ * 消息语义——只保留最新 runtime nudge、knowledge submit 参数按 provider 历史压缩、工具结果元数据只留
+ * 布尔 persistedSubmission、toMessages 返回快照；Simple 不压缩，但预算投影必须如实测量并在超限时告警。
+ */
+describe('message adapter semantic parity', () => {
+  const adapters = (): Array<[string, () => MessageAdapter]> => [
+    ['simple', () => createMessageAdapter(null)],
+    ['context-window', () => createMessageAdapter(new ContextWindow(100_000))],
+  ];
+  const submitCall = (id: string) => ({
+    id,
+    name: 'knowledge',
+    args: {
+      action: 'submit',
+      params: {
+        title: 'Coordinator owns feature flags',
+        kind: 'rule',
+        content: { markdown: 'large candidate body '.repeat(200) },
+      },
+    },
+  });
+  const continuationFor = (callId: string): LlmContinuation => ({
+    provider: 'deepseek',
+    model: 'deepseek-v4-pro',
+    connection: 'fixture-connection',
+    kind: 'content-replay-v1',
+    parts: [
+      { type: 'reasoning', text: 'native reasoning' },
+      { type: 'tool-call', id: callId },
+    ],
+    projectionHash: 'captured-before-compaction',
+  });
+  const logLines = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.map(([entry]) => String(entry));
+  const projectedShape = (adapter: MessageAdapter) =>
+    (adapter.toProjectedMessages() as Array<{ role: string; content?: string | null }>).map(
+      ({ role, content }) => ({ role, content })
+    );
+
+  it('createMessageAdapter selects the adapter by contextWindow presence', () => {
+    expect(createMessageAdapter(null)).toBeInstanceOf(SimpleArrayAdapter);
+    expect(createMessageAdapter(new ContextWindow())).toBeInstanceOf(ContextWindowAdapter);
+  });
+
+  it.each(
+    adapters()
+  )('%s keeps only the latest runtime nudge after consecutive nudges', (_label, make) => {
+    const adapter = make();
+    adapter.appendUserMessage('task');
+    adapter.appendUserNudge('nudge-1');
+    adapter.appendAssistantText('working');
+    adapter.appendUserNudge('nudge-2');
+    adapter.appendUserNudge('nudge-3');
+    expect(projectedShape(adapter)).toEqual([
+      { role: 'user', content: 'task' },
+      { role: 'assistant', content: 'working' },
+      { role: 'user', content: 'nudge-3' },
+    ]);
+  });
+
+  it('gives both adapters the same projected history for an identical nudge sequence', () => {
+    const [simple, windowed] = adapters().map(([, make]) => make());
+    for (const adapter of [simple, windowed]) {
+      adapter.appendUserMessage('task');
+      adapter.appendUserNudge('stage nudge');
+      adapter.appendAssistantWithToolCalls(null, [
+        { id: 'c1', name: 'code', args: { action: 'read' } },
+      ]);
+      adapter.appendToolResult('c1', 'code', 'source');
+      adapter.appendUserNudge('grounding nudge');
+    }
+    expect(projectedShape(simple)).toEqual(projectedShape(windowed));
+    expect(projectedShape(simple).filter((message) => message.content?.endsWith('nudge'))).toEqual([
+      { role: 'user', content: 'grounding nudge' },
+    ]);
+  });
+
+  it('compacts knowledge submit args identically in both adapters and drops the stale continuation', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const stored = adapters().map(([, make]) => {
+      const adapter = make();
+      adapter.appendUserMessage('submit');
+      adapter.appendAssistantWithToolCalls(
+        null,
+        [{ ...submitCall('submit-1'), thoughtSignature: 'sig_call' } as never],
+        'kept reasoning',
+        continuationFor('submit-1')
+      );
+      return (
+        adapter.toMessages() as Array<{
+          continuation?: unknown;
+          reasoningContent?: string | null;
+          toolCalls?: Array<{ args?: Record<string, unknown> }>;
+        }>
+      )[1];
+    });
+    const [simple, windowed] = stored;
+    expect(simple?.toolCalls).toEqual(windowed?.toolCalls);
+    expect(simple?.toolCalls?.[0]?.args).toMatchObject({
+      action: 'submit',
+      providerHistoryCompacted: true,
+      params: { title: 'Coordinator owns feature flags', kind: 'rule' },
+    });
+    expect(JSON.stringify(simple?.toolCalls)).not.toContain('large candidate body');
+    expect(JSON.stringify(simple?.toolCalls)).not.toContain('sig_call');
+    // 参数改写后续接的投影摘要必然失配：两种适配器都不保存续接，只保留 reasoningContent。
+    expect(simple?.continuation).toBeUndefined();
+    expect(simple?.reasoningContent).toBe('kept reasoning');
+    const dropped = logLines(info).filter((line) => line.includes('continuation_dropped'));
+    expect(dropped).toHaveLength(2);
+    expect(dropped.some((line) => line.startsWith('[MessageAdapter]'))).toBe(true);
+    expect(dropped.every((line) => line.includes('reason=compacted_args'))).toBe(true);
+  });
+
+  it('keeps non-submit tool calls and their continuation untouched in the simple adapter', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const adapter = createMessageAdapter(null);
+    const call = { id: 'read-1', name: 'code', args: { action: 'read', params: { path: 'a.ts' } } };
+    adapter.appendUserMessage('read');
+    adapter.appendAssistantWithToolCalls(null, [call], 'reasoning', continuationFor('read-1'));
+    const stored = (
+      adapter.toMessages() as Array<{ continuation?: unknown; toolCalls?: unknown[] }>
+    )[1];
+    expect(stored?.toolCalls).toEqual([call]);
+    expect(stored?.continuation).toMatchObject({ kind: 'content-replay-v1' });
+    expect(logLines(info).join('\n')).not.toContain('continuation_dropped');
+  });
+
+  it('keeps only boolean persistedSubmission tool-result metadata in both adapters', () => {
+    const results = adapters().map(([, make]) => {
+      const adapter = make();
+      adapter.appendUserMessage('task');
+      adapter.appendAssistantWithToolCalls(null, [submitCall('s1'), submitCall('s2')]);
+      adapter.appendToolResult('s1', 'knowledge', 'ok', {
+        persistedSubmission: true,
+        leaked: 'extra',
+      } as never);
+      adapter.appendToolResult('s2', 'knowledge', 'ok', {
+        persistedSubmission: 'yes',
+      } as never);
+      return (adapter.toMessages() as Array<{ metadata?: unknown }>)
+        .slice(2)
+        .map((message) => message.metadata);
+    });
+    expect(results[0]).toEqual([{ persistedSubmission: true }, undefined]);
+    expect(results[0]).toEqual(results[1]);
+  });
+
+  it.each(
+    adapters()
+  )('%s toMessages returns a snapshot that callers cannot use to rewrite history', (_label, make) => {
+    const adapter = make();
+    adapter.appendUserMessage('task');
+    adapter.appendAssistantText('answer');
+    const snapshot = adapter.toMessages();
+    snapshot.push({ role: 'user', content: 'injected' });
+    snapshot.splice(0, 1);
+    expect(projectedShape(adapter)).toEqual([
+      { role: 'user', content: 'task' },
+      { role: 'assistant', content: 'answer' },
+    ]);
+    expect(adapter.toMessages()).toHaveLength(2);
+  });
+
+  it('measures the simple projection truthfully and warns when a stage budget cannot be enforced', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const budget = resolveProviderInputBudget('produce');
+    expect(budget).not.toBeNull();
+    const simple = createMessageAdapter(null);
+    const reference = new ContextWindow(1_000_000);
+    for (const sink of [simple, reference]) {
+      sink.appendUserMessage(`strict produce input ${'x'.repeat(200_000)}`);
+    }
+    const expectedTokens = reference.estimateProjectedTokens();
+    expect(expectedTokens).toBeGreaterThan(budget?.maxProjectedTokens ?? 0);
+
+    const projection = simple.compactForProviderInputBudget({ ...budget, stageProfile: 'produce' });
+    expect(projection).toEqual({
+      afterMessageCount: 1,
+      afterProjectedTokens: expectedTokens,
+      beforeMessageCount: 1,
+      beforeProjectedTokens: expectedTokens,
+      level: 0,
+      reason: 'adapter-without-compaction:produce',
+      removed: 0,
+    });
+    const warned = logLines(warn).filter((line) => line.includes('adapter-without-compaction'));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('stageProfile=produce');
+    expect(warned[0]).toContain(`tokens≈${expectedTokens}/${budget?.maxProjectedTokens}`);
+    expect(warned[0]).toContain(`messages=1/${budget?.maxProjectedMessages}`);
+    expect(warned[0]).not.toContain('xxxx');
+  });
+
+  it('reports real tokens without a warning when the simple projection is within budget', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const simple = createMessageAdapter(null);
+    const reference = new ContextWindow(100_000);
+    for (const sink of [simple, reference]) {
+      sink.appendUserMessage('short analyze prompt');
+      sink.appendAssistantWithToolCalls('looking', [{ id: 'c1', name: 'code', args: { q: 1 } }]);
+      sink.appendToolResult('c1', 'code', 'result');
+    }
+    const projection = simple.compactForProviderInputBudget({
+      ...resolveProviderInputBudget('analyze'),
+      stageProfile: 'analyze',
+    });
+    expect(projection).toMatchObject({
+      afterProjectedTokens: reference.estimateProjectedTokens(),
+      beforeProjectedTokens: reference.estimateProjectedTokens(),
+      beforeMessageCount: 3,
+      level: 0,
+      reason: null,
+      removed: 0,
+    });
+    expect(projection.beforeProjectedTokens).toBeGreaterThan(0);
+    expect(logLines(warn).join('\n')).not.toContain('adapter-without-compaction');
+  });
+
+  it('keeps the simple adapter usable when the warning sink throws', () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      throw new Error('log sink failed');
+    });
+    const simple = createMessageAdapter(null);
+    simple.appendUserMessage('y'.repeat(100_000));
+    expect(
+      simple.compactForProviderInputBudget({
+        maxProjectedMessages: 20,
+        maxProjectedTokens: 10,
+        stageProfile: 'record',
+      })
+    ).toMatchObject({ level: 0, reason: 'adapter-without-compaction:record' });
+  });
+
+  it('logs why the context window leaves an over-budget short history uncompacted', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const window = new ContextWindow(1_000_000);
+    window.appendUserMessage(`strict analyze input ${'z'.repeat(200_000)}`);
+    const tokens = window.estimateProjectedTokens();
+    const projection = window.compactForProviderInputBudget({
+      ...resolveProviderInputBudget('analyze'),
+      stageProfile: 'analyze',
+    });
+    // 返回结构不变（level=0、reason=null）；只补一条诊断说明预算为何没有执行。
+    expect(projection).toMatchObject({
+      beforeProjectedTokens: tokens,
+      afterProjectedTokens: tokens,
+      level: 0,
+      reason: null,
+    });
+    const skipped = logLines(info).filter((line) => line.includes('provider input budget skipped'));
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toContain('stageProfile=analyze');
+    expect(skipped[0]).toContain(`tokens≈${tokens}/16000`);
+    expect(skipped[0]).not.toContain('zzzz');
+    info.mockClear();
+    const small = new ContextWindow(1_000_000);
+    small.appendUserMessage('short');
+    small.compactForProviderInputBudget({ maxProjectedMessages: 44, maxProjectedTokens: 16_000 });
+    expect(logLines(info).join('\n')).not.toContain('provider input budget skipped');
   });
 });
