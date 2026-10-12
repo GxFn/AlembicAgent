@@ -917,3 +917,120 @@ describe('context usage follows the provider-visible projection', () => {
     expect(saturated.needsL4Compaction()).toBe(true);
   });
 });
+
+/**
+ * ContextWindow 改写 knowledge submit 参数后，原生续接的投影摘要不可能再匹配；
+ * 改写方负责丢弃续接、保留 reasoningContent，并只在追加时留一次诊断。
+ */
+describe('provider-history compaction and native continuation', () => {
+  const continuationFor = (callId: string, provider = 'deepseek', model = 'deepseek-v4-pro') =>
+    ({
+      provider,
+      model,
+      connection: 'fixture-connection',
+      kind: 'content-replay-v1',
+      parts: [
+        { type: 'reasoning', text: 'native reasoning '.repeat(400) },
+        { type: 'tool-call', id: callId },
+      ],
+      projectionHash: 'captured-before-compaction',
+    }) as const;
+  const submitCall = (id: string) => ({
+    id,
+    name: 'knowledge',
+    args: {
+      action: 'submit',
+      params: { title: 'Feature coordinator ownership', content: { markdown: 'body '.repeat(80) } },
+    },
+  });
+
+  function infoLines(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map(([entry]) => String(entry));
+  }
+
+  it('drops the continuation of a compacted submit round while keeping reasoning and one diagnostic', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('submit');
+    window.appendAssistantWithToolCalls(
+      null,
+      [{ ...submitCall('submit-1'), thoughtSignature: 'sig_call' } as never],
+      'kept reasoning',
+      continuationFor('submit-1', 'google', 'gemini-3-flash-preview')
+    );
+    const stored = window.toMessages()[1];
+    expect(stored?.continuation).toBeUndefined();
+    expect(stored?.reasoningContent).toBe('kept reasoning');
+    expect(stored?.toolCalls?.[0]?.args).toMatchObject({ providerHistoryCompacted: true });
+    // 签名绑定改写前的投影；没有续接后不能再随调用回传。
+    expect(JSON.stringify(stored?.toolCalls)).not.toContain('sig_call');
+    window.toProjectedMessages();
+    window.estimateTokens();
+    const dropped = [...infoLines(info), ...infoLines(warn)].filter((line) =>
+      line.includes('continuation_dropped')
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason=compacted_args');
+    expect(dropped[0]).toContain('provider=google');
+    expect(dropped[0]).toContain('model=gemini-3-flash-preview');
+    expect(dropped[0]).toContain('submit-1');
+    expect(dropped[0]).not.toContain('kept reasoning');
+    expect(dropped[0]).not.toContain('body body');
+  });
+
+  it.each([
+    { label: 'non-knowledge tool', call: { id: 'lookup-1', name: 'lookup', args: { q: 'x' } } },
+    {
+      label: 'knowledge read action',
+      call: { id: 'read-1', name: 'knowledge', args: { action: 'search', query: 'x' } },
+    },
+  ])('keeps the continuation when the $label args are not rewritten', ({ call }) => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('lookup');
+    window.appendAssistantWithToolCalls(
+      null,
+      [{ ...call, thoughtSignature: 'sig_call' } as never],
+      'kept reasoning',
+      continuationFor(call.id)
+    );
+    const stored = window.toMessages()[1];
+    expect(stored?.continuation).toMatchObject({ kind: 'content-replay-v1', provider: 'deepseek' });
+    expect(JSON.stringify(stored?.toolCalls)).toContain('sig_call');
+    expect(infoLines(info).join('\n')).not.toContain('continuation_dropped');
+  });
+
+  it('no longer counts a discarded continuation in the provider-visible token estimate', () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const withContinuation = new ContextWindow(48_000);
+    const withoutContinuation = new ContextWindow(48_000);
+    for (const window of [withContinuation, withoutContinuation]) {
+      window.appendUserMessage('submit');
+    }
+    withContinuation.appendAssistantWithToolCalls(
+      null,
+      [submitCall('submit-1')],
+      'kept reasoning',
+      continuationFor('submit-1')
+    );
+    withoutContinuation.appendAssistantWithToolCalls(
+      null,
+      [submitCall('submit-1')],
+      'kept reasoning'
+    );
+    expect(withContinuation.estimateTokens()).toBe(withoutContinuation.estimateTokens());
+    // 发送面：没有续接时 DeepSeek 回传保留的 reasoningContent，与估算口径一致。
+    const prompt = toSdkPrompt(
+      withContinuation.toProjectedMessages() as Parameters<typeof toSdkPrompt>[0],
+      undefined,
+      'deepseek',
+      'deepseek-v4-pro',
+      'deepseek',
+      'fixture-connection'
+    );
+    const assistant = prompt.find((entry) => entry.role === 'assistant');
+    expect(assistant?.content).toContainEqual({ type: 'reasoning', text: 'kept reasoning' });
+    expect(JSON.stringify(assistant?.content)).not.toContain('native reasoning');
+  });
+});

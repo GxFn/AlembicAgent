@@ -23,6 +23,7 @@ import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { sdkProjectionHash } from '../src/ai/transport/sdkContext.js';
 import { replaySdkContinuation } from '../src/ai/transport/sdkContinuation.js';
 import { normalizeSdkError } from '../src/ai/transport/sdkErrors.js';
+import { toSdkPrompt } from '../src/ai/transport/sdkProtocol.js';
 import { CapabilityCatalog } from '../src/tools/catalog/CapabilityCatalog.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { Capability } from '../src/tools/runtime/toolsets/Capability.js';
@@ -1399,5 +1400,332 @@ describe('SDK continuation projection hash failures', () => {
     expect(messages[0]).toContain('reason=projection_hash_failed');
     expect(messages[0]).toContain('error=TypeError');
     expect(messages[0]).not.toContain('projection_binding_changed');
+  });
+});
+
+/**
+ * Agent 层改写历史（knowledge submit 参数压缩、单轮工具调用截断）后，原生续接的投影摘要
+ * 必然失配：改写方必须丢弃续接（保留 reasoningContent），ai 层在身份一致时回传 DeepSeek 推理。
+ */
+describe('agent history rewrites and native continuation', () => {
+  type DeepSeekBody = {
+    messages: Array<{
+      role: string;
+      reasoning_content?: string;
+      tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+    }>;
+  };
+  type GoogleBody = { contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> };
+
+  const submitArgs = {
+    action: 'submit',
+    params: {
+      title: 'Feature coordinator ownership',
+      kind: 'pattern',
+      content: { markdown: 'large candidate body '.repeat(40) },
+      reasoning: { sources: ['Sources/App/Feature.swift'] },
+    },
+  };
+
+  function deepSeekToolResponse(
+    calls: Array<{ id: string; name: string; args: Record<string, unknown> }>,
+    reasoning: string
+  ) {
+    return {
+      choices: [
+        {
+          index: 0,
+          finish_reason: 'tool_calls',
+          message: {
+            role: 'assistant',
+            content: '',
+            reasoning_content: reasoning,
+            tool_calls: calls.map((call) => ({
+              id: call.id,
+              type: 'function',
+              function: { name: call.name, arguments: JSON.stringify(call.args) },
+            })),
+          },
+        },
+      ],
+    };
+  }
+
+  function logLines(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map(([entry]) => String(entry));
+  }
+
+  it('keeps DeepSeek reasoning for a knowledge submit round the agent compacted, without repeated warnings', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const bodies: DeepSeekBody[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse(
+          bodies.length === 1
+            ? deepSeekToolResponse(
+                [{ id: 'submit-1', name: 'knowledge', args: submitArgs }],
+                'submit_reasoning'
+              )
+            : providers[2].text()
+        );
+      })
+    );
+    const provider = new DeepSeekProvider({
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      maxRetries: 0,
+    });
+    const toolSchemas = [{ name: 'knowledge', parameters: { type: 'object' } }];
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('submit the candidate');
+    const first = await provider.chatWithTools('', {
+      messages: window.toProjectedMessages() as UnifiedMessage[],
+      toolSchemas,
+    });
+    expect(first.continuation).toMatchObject({ kind: 'content-replay-v1', provider: 'deepseek' });
+    window.appendAssistantWithToolCalls(
+      first.text,
+      (first.functionCalls || []).map((call) => ({ ...call, args: { ...call.args } })),
+      first.reasoningContent,
+      first.continuation
+    );
+    window.appendToolResult('submit-1', 'knowledge', 'submitted');
+    // 两次后续请求：被改写的消息常驻历史，诊断只能在追加时出现一次，不能每次请求重复告警。
+    for (const followUp of ['continue', 'continue again']) {
+      await provider.chatWithTools('', {
+        messages: [
+          ...window.toProjectedMessages(),
+          { role: 'user', content: followUp },
+        ] as UnifiedMessage[],
+        toolSchemas,
+      });
+    }
+    for (const body of bodies.slice(1)) {
+      const assistant = body.messages.find((message) => message.role === 'assistant');
+      expect(assistant?.reasoning_content).toBe('submit_reasoning');
+      expect(assistant?.tool_calls?.[0]?.function.arguments).toContain('providerHistoryCompacted');
+    }
+    const warnings = logLines(warn);
+    expect(warnings.filter((line) => line.includes('continuation_filtered'))).toEqual([]);
+    expect(warnings.join('\n')).not.toContain('projection_binding_changed');
+    const dropped = [...warnings, ...logLines(info)].filter((line) =>
+      line.includes('continuation_dropped')
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason=compacted_args');
+    expect(dropped[0]).toContain('provider=deepseek');
+    expect(dropped[0]).toContain('model=deepseek-v4-pro');
+    expect(dropped[0]).toContain('submit-1');
+    expect(dropped[0]).not.toContain('submit_reasoning');
+    expect(dropped[0]).not.toContain('large candidate body');
+  });
+
+  it.each([
+    'context-window',
+    'simple-array',
+  ])('keeps DeepSeek reasoning after the runtime truncates a nine-call round (%s history)', async (mode) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    class LookupCapability extends Capability {
+      get name() {
+        return 'fixture';
+      }
+      get promptFragment() {
+        return '';
+      }
+      get tools() {
+        return ['lookup'];
+      }
+      get allowedTools(): unknown {
+        return { lookup: ['invoke'] };
+      }
+    }
+    const catalog = new CapabilityCatalog([
+      {
+        id: 'lookup',
+        title: 'Lookup',
+        description: 'fixture',
+        lifecycle: 'active',
+        inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+      } as never,
+    ]);
+    const execute = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      toolId: 'lookup',
+      callId: 'host_fixture',
+      startedAt: new Date().toISOString(),
+      durationMs: 0,
+      text: 'found',
+      structuredContent: { observed: true },
+    }));
+    const calls = Array.from({ length: 9 }, (_, index) => ({
+      id: `c${index}`,
+      name: 'lookup',
+      args: { q: `x${index}` },
+    }));
+    const bodies: DeepSeekBody[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse(
+          bodies.length === 1 ? deepSeekToolResponse(calls, 'batch_reasoning') : providers[2].text()
+        );
+      })
+    );
+    const runtime = new AgentRuntime({
+      aiProvider: new DeepSeekProvider({
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        maxRetries: 0,
+      }),
+      container: { get: () => catalog },
+      toolRegistry: new RuntimeCapabilityCatalog() as never,
+      toolRouter: { execute } as never,
+      strategy: new SingleStrategy(),
+      capabilities: [new LookupCapability()],
+    });
+    await runtime.reactLoop(
+      'look up everything',
+      mode === 'context-window' ? { contextWindow: new ContextWindow(48_000) } : {}
+    );
+    expect(execute).toHaveBeenCalledTimes(8);
+    expect(bodies).toHaveLength(2);
+    const assistant = bodies[1].messages.find((message) => message.role === 'assistant');
+    expect(assistant?.tool_calls).toHaveLength(8);
+    expect(assistant?.reasoning_content).toBe('batch_reasoning');
+    const warnings = logLines(warn);
+    expect(warnings.filter((line) => line.includes('continuation_filtered'))).toEqual([]);
+    expect(warnings.join('\n')).not.toContain('tool_projection_changed');
+    const dropped = [...warnings, ...logLines(info)].filter((line) =>
+      line.includes('continuation_dropped')
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason=truncated_calls');
+    expect(dropped[0]).toContain('provider=deepseek');
+    expect(dropped[0]).toContain('model=deepseek-v4-pro');
+    expect(dropped[0]).toContain('c8');
+    expect(dropped[0]).not.toContain('batch_reasoning');
+  });
+
+  it('sends a compacted Gemini round as unsigned history without repeated continuation warnings', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const parts = [
+      { text: 'private reasoning', thought: true, thoughtSignature: 'sig_thinking' },
+      {
+        functionCall: { id: 'g1', name: 'knowledge', args: submitArgs },
+        thoughtSignature: 'sig_call',
+      },
+    ];
+    const bodies: GoogleBody[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return jsonResponse({
+          candidates: [
+            {
+              content: { role: 'model', parts: bodies.length === 1 ? parts : [{ text: 'done' }] },
+              finishReason: 'STOP',
+            },
+          ],
+        });
+      })
+    );
+    const provider = new GoogleGeminiProvider({
+      apiKey: 'test-key',
+      model: 'gemini-3-flash-preview',
+      maxRetries: 0,
+    });
+    const toolSchemas = [{ name: 'knowledge', parameters: { type: 'object' } }];
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('submit the candidate');
+    const first = await provider.chatWithTools('', {
+      messages: window.toProjectedMessages() as UnifiedMessage[],
+      toolSchemas,
+    });
+    expect(first.continuation).toMatchObject({ kind: 'content-replay-v1', provider: 'google' });
+    window.appendAssistantWithToolCalls(
+      first.text,
+      (first.functionCalls || []).map((call) => ({ ...call, args: { ...call.args } })),
+      first.reasoningContent,
+      first.continuation
+    );
+    window.appendToolResult('g1', 'knowledge', 'submitted');
+    for (const followUp of ['continue', 'continue again']) {
+      await provider.chatWithTools('', {
+        messages: [
+          ...window.toProjectedMessages(),
+          { role: 'user', content: followUp },
+        ] as UnifiedMessage[],
+        toolSchemas,
+      });
+    }
+    for (const body of bodies.slice(1)) {
+      const model = body.contents.find((message) => message.role === 'model');
+      // 签名绑定捕获时的原投影；参数被改写后原签名不得随历史发送。
+      expect(JSON.stringify(model?.parts)).not.toMatch(/sig_thinking|sig_call/);
+      expect(JSON.stringify(model?.parts)).toContain('providerHistoryCompacted');
+    }
+    const warnings = logLines(warn);
+    expect(warnings.filter((line) => line.includes('continuation_filtered'))).toEqual([]);
+    const dropped = [...warnings, ...logLines(info)].filter((line) =>
+      line.includes('continuation_dropped')
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('reason=compacted_args');
+    expect(dropped[0]).toContain('provider=google');
+    expect(dropped[0]).toContain('model=gemini-3-flash-preview');
+    expect(dropped[0]).toContain('g1');
+    expect(dropped[0]).not.toMatch(/sig_thinking|sig_call|private reasoning/);
+  });
+
+  it('falls back to unsigned DeepSeek reasoning only when a rejected continuation still matches the current identity', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const message = (connection: string): UnifiedMessage => ({
+      role: 'assistant',
+      content: '',
+      reasoningContent: 'kept_reasoning',
+      toolCalls: [{ id: 'c1', name: 'lookup', args: { q: 'changed' } }],
+      continuation: {
+        provider: 'deepseek',
+        model: 'deepseek-v4-pro',
+        connection,
+        kind: 'content-replay-v1',
+        parts: [
+          { type: 'reasoning', text: 'kept_reasoning' },
+          { type: 'tool-call', id: 'c1' },
+        ],
+        // 摘要来自捕获时的原投影；当前参数已被外部改写，回放必然被拒。
+        projectionHash: 'captured-before-rewrite',
+      },
+    });
+    const assistantOf = (connection: string) =>
+      toSdkPrompt(
+        [{ role: 'user', content: 'go' }, message(connection)],
+        undefined,
+        'deepseek',
+        'deepseek-v4-pro',
+        'deepseek',
+        'current-connection'
+      ).find((entry) => entry.role === 'assistant');
+
+    const sameIdentity = assistantOf('current-connection');
+    expect(sameIdentity?.content).toContainEqual({ type: 'reasoning', text: 'kept_reasoning' });
+    expect(logLines(warn).join('\n')).toContain('projection_binding_changed');
+    expect(logLines(info).join('\n')).toContain('reasoning_fallback');
+
+    warn.mockClear();
+    info.mockClear();
+    const otherConnection = assistantOf('other-connection');
+    expect(JSON.stringify(otherConnection?.content)).not.toContain('kept_reasoning');
+    expect(logLines(warn).join('\n')).toContain('identity_mismatch');
+    expect(logLines(info).join('\n')).not.toContain('reasoning_fallback');
   });
 });

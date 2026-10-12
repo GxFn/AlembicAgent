@@ -215,8 +215,24 @@ export function toSdkPrompt(
           continue;
         }
       }
-      if (provider === 'deepseek' && !message.continuation && message.reasoningContent != null) {
-        content.push({ type: 'reasoning', text: message.reasoningContent });
+      // DeepSeek 推理是未签名文本：没有续接（旧历史，或 Agent 改写历史时已丢弃续接）就直接回传；
+      // 续接存在但回放被拒（投影被改写等）时，只有续接身份仍是当前 provider/model/connection，
+      // 才回退回传同一连接产出的 reasoningContent。跨连接/跨模型的推理依旧不回传。
+      // replay 存在（部分回放）时推理已在回放块里，不重复追加。
+      if (provider === 'deepseek' && !replay && message.reasoningContent != null) {
+        const continuation = message.continuation;
+        if (!continuation) {
+          content.push({ type: 'reasoning', text: message.reasoningContent });
+        } else if (
+          continuation.provider === provider &&
+          continuation.model === model &&
+          continuation.connection === connection
+        ) {
+          Logger.getInstance().info(
+            `[ai-sdk] reasoning_fallback provider=${provider} model=${model} kind=${continuation.kind} chars=${message.reasoningContent.length}; native replay rejected for a same-identity continuation, unsigned reasoningContent replayed`
+          );
+          content.push({ type: 'reasoning', text: message.reasoningContent });
+        }
       }
       if (message.content) {
         content.push({ type: 'text', text: message.content });

@@ -320,15 +320,33 @@ export class ContextWindow {
     reasoningContent?: string | null,
     continuation?: LlmContinuation
   ) {
+    const historyCalls = toolCalls.map(compactToolCallForProviderHistory);
+    // compactToolCallForProviderHistory 只在 knowledge submit 时返回新的 args 对象；
+    // 引用变化即“参数被实际改写”，其余工具（含 knowledge 非 submit 动作）原样保留。
+    const rewrittenCallIds = historyCalls
+      .filter((call, index) => call.args !== toolCalls[index]?.args)
+      .map((call) => call.id);
+    // 跨层契约：续接的 projectionHash 由 Transport 按捕获时的完整工具参数计算。本窗口改写参数后，
+    // 回放必然判 projection_binding_changed，且该消息常驻历史，会在之后每次请求重复告警并丢推理。
+    // 谁改写投影谁处理续接：这里直接不保存续接（原生签名/回放块随之放弃），保留 reasoningContent
+    // （DeepSeek 推理是未签名文本，可独立回传），并剥离调用上的 Gemini thoughtSignature——签名绑定
+    // 改写前的投影，被拒时本来也不会发送，这一轮按无签名历史发送（与改写前的实际请求一致）。
+    const dropContinuation = continuation !== undefined && rewrittenCallIds.length > 0;
     const msg: ContextMessage = {
       role: 'assistant',
       content: text || null,
-      toolCalls: toolCalls.map(compactToolCallForProviderHistory),
+      toolCalls: dropContinuation ? historyCalls.map(withoutThoughtSignature) : historyCalls,
       // V4 要求: 带 tool_calls 的 assistant 消息的 reasoning_content 必须保留
       // 始终存储此字段（即使为空），确保后续 API 调用不会丢失
       reasoningContent: reasoningContent ?? '',
     };
-    if (continuation) {
+    if (continuation && dropContinuation) {
+      // 一次性诊断：只在追加时记录一次；不含推理正文、参数正文或签名，只记录身份与调用 id。
+      this.#log(
+        'info',
+        `[ContextWindow] continuation_dropped reason=compacted_args provider=${continuation.provider} model=${continuation.model} kind=${continuation.kind} callIds=${formatCallIds(rewrittenCallIds)}; tool-call args compacted for provider history, native continuation discarded, reasoningContent retained, thought signatures omitted`
+      );
+    } else if (continuation) {
       msg.continuation = structuredClone(continuation);
     }
     this.#messages.push(msg);
@@ -847,6 +865,8 @@ export class ContextWindow {
    *
    * SDK 续接块完整计数；旧 reasoningContent 也不能只计最近两轮，
    * 因为适配器可能仍需回传更早的内容。相同内容不与 replay 块重复计数。
+   * 参数被压缩（或调用被截断）的轮次不保存续接，因此只计实际会回传的 reasoningContent，
+   * 不再按已失效的续接 JSON 估算。
    */
   estimateTokens() {
     return this.#estimateMessagesTokens(this.toProjectedMessages());
@@ -1086,6 +1106,20 @@ export class ContextWindow {
     }
     return starts;
   }
+}
+
+/** 运行时调用对象可能携带 Gemini thoughtSignature（ToolCallInfo 未声明该字段）；丢弃续接时一并剥离。 */
+function withoutThoughtSignature(call: ToolCallInfo): ToolCallInfo {
+  const { thoughtSignature: _signature, ...rest } = call as ToolCallInfo & {
+    thoughtSignature?: unknown;
+  };
+  return rest;
+}
+
+/** 诊断里的调用 id 列表封顶，避免单轮大量调用撑爆日志行。 */
+function formatCallIds(ids: string[]): string {
+  const shown = ids.slice(0, 8).join(',');
+  return ids.length > 8 ? `${shown},+${ids.length - 8}` : shown;
 }
 
 function compactToolCallForProviderHistory(call: ToolCallInfo): ToolCallInfo {

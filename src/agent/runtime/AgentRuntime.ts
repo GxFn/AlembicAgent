@@ -1454,11 +1454,30 @@ export class AgentRuntime {
     }
 
     // 追加 assistant 消息（含 DeepSeek V4 reasoningContent 透传）
+    let historyCalls = activeCalls.map((call) => ({ ...call, args: { ...call.args } }));
+    let historyContinuation = llmResult.continuation;
+    if (truncatedCalls.length > 0 && llmResult.continuation) {
+      // 跨层契约：续接按 Transport 捕获时的完整调用集合绑定投影；截断后历史里少了调用，回放必判
+      // tool_projection_changed，且该消息常驻历史，会在之后每次请求重复告警并丢掉同轮推理。
+      // 截断方负责续接：两种消息适配器都不再收到续接，保留 reasoningContent（DeepSeek 推理未签名，
+      // 可独立回传），并剥离 Gemini thoughtSignature（签名绑定截断前的整轮投影，被拒时本来也不发送）。
+      const dropped = llmResult.continuation;
+      historyContinuation = undefined;
+      historyCalls = historyCalls.map(({ thoughtSignature: _signature, ...call }) => call);
+      // 一次性诊断：只在追加历史时记录一次；不含推理正文、参数或签名，callIds 为未执行的调用（封顶 8 个）。
+      const droppedIds = truncatedCalls.slice(0, 8).map((call) => call.id);
+      if (truncatedCalls.length > 8) {
+        droppedIds.push(`+${truncatedCalls.length - 8}`);
+      }
+      this.logger.info(
+        `[AgentRuntime] continuation_dropped reason=truncated_calls provider=${dropped.provider} model=${dropped.model} kind=${dropped.kind} kept=${activeCalls.length} truncated=${truncatedCalls.length} callIds=${droppedIds.join(',')}; tool calls truncated before history, native continuation discarded, reasoningContent retained, thought signatures omitted`
+      );
+    }
     messages.appendAssistantWithToolCalls(
       llmResult.text || null,
-      activeCalls.map((call) => ({ ...call, args: { ...call.args } })),
+      historyCalls,
       llmResult.reasoningContent,
-      llmResult.continuation
+      historyContinuation
     );
 
     let roundSubmitCount = 0;
