@@ -353,6 +353,386 @@ describe('MemoryStore', () => {
   });
 });
 
+/**
+ * 生成两两几乎不重叠、且不含否定词的确定性随机正文（Park-Miller 序列，固定种子），
+ * 用于把较早写入的记忆挤出“最近更新的 50 行”候选窗口。
+ */
+function unrelatedMemoryContents(count: number): string[] {
+  let seed = 20261001;
+  const next = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  const word = () =>
+    Array.from({ length: 7 }, () => String.fromCharCode(97 + Math.floor(next() * 26))).join('');
+  return Array.from({ length: count }, () => Array.from({ length: 5 }, word).join(' '));
+}
+
+describe('MemoryStore dedupe similarity, candidate window and maintenance (L6-P3)', () => {
+  const ZUSTAND_FACT = 'The project uses Zustand for global state management';
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('adds unrelated Cyrillic and Korean memories instead of folding them into one duplicate', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const consolidator = new MemoryConsolidator(store);
+      const contents = [
+        'используй табы вместо пробелов',
+        'пиши тесты на русском',
+        '탭 대신 공백을 사용하세요',
+        '테스트는 한국어로 작성하세요',
+      ];
+      const stats = consolidator.consolidate(
+        contents.map((content) => ({ type: 'preference', content, importance: 6 }))
+      );
+      expect(stats).toMatchObject({ added: 4, updated: 0, merged: 0 });
+      expect(
+        store
+          .getAllActive()
+          .map((row) => row.content)
+          .sort()
+      ).toEqual([...contents].sort());
+
+      // 完全相同（仅大小写与空白不同）的西里尔文复述仍判为 UPDATE。
+      const restated = consolidator.consolidate([
+        { type: 'preference', content: '  Используй табы вместо пробелов ', importance: 8 },
+      ]);
+      expect(restated).toMatchObject({ added: 0, updated: 1, merged: 0 });
+      expect(store.size()).toBe(4);
+      expect(
+        store.getAllActive().find((row) => row.content === 'используй табы вместо пробелов')
+      ).toMatchObject({ importance: 8, access_count: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('appends unrelated Cyrillic memories separately and still dedupes an identical one', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const retriever = new MemoryRetriever(store);
+      retriever.append({ content: 'используй табы вместо пробелов', importance: 5 });
+      retriever.append({ content: 'пиши тесты на русском', importance: 5 });
+      expect(store.size()).toBe(2);
+
+      retriever.append({ content: 'используй табы вместо пробелов', importance: 9 });
+      expect(store.size()).toBe(2);
+      expect(
+        store.getAllActive().find((row) => row.content === 'используй табы вместо пробелов')
+      ).toMatchObject({ importance: 9 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('consolidates a restatement of the earliest memory as UPDATE after 60 newer unrelated memories', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const consolidator = new MemoryConsolidator(store);
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      expect(
+        consolidator.consolidate([{ type: 'fact', content: ZUSTAND_FACT, importance: 5 }])
+      ).toMatchObject({ added: 1 });
+
+      vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+      expect(
+        consolidator.consolidate(
+          unrelatedMemoryContents(60).map((content) => ({ type: 'fact', content, importance: 5 }))
+        )
+      ).toMatchObject({ added: 60, updated: 0, merged: 0 });
+
+      // 目标行是 61 行里最早更新的一行，早已不在“最近 50 行”内；固化必须仍能看到它。
+      vi.setSystemTime(new Date('2026-01-01T00:02:00.000Z'));
+      const stats = consolidator.consolidate([
+        { type: 'fact', content: ZUSTAND_FACT, importance: 7 },
+      ]);
+      expect(stats).toMatchObject({ added: 0, updated: 1, merged: 0 });
+      expect(store.size()).toBe(61);
+      expect(
+        store.getAllActive({ type: 'fact' }).find((row) => row.content === ZUSTAND_FACT)
+      ).toMatchObject({ importance: 7, access_count: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('dedupes inside one consolidation batch larger than the old 50-row window', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const stats = new MemoryConsolidator(store).consolidate([
+        { type: 'fact', content: ZUSTAND_FACT, importance: 5 },
+        ...unrelatedMemoryContents(60).map((content) => ({ type: 'fact', content, importance: 5 })),
+        { type: 'fact', content: ZUSTAND_FACT, importance: 6 },
+      ]);
+      expect(stats).toMatchObject({ added: 61, updated: 1, merged: 0 });
+      expect(store.size()).toBe(61);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('replaces a contradicted earliest memory after 60 newer unrelated memories', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const consolidator = new MemoryConsolidator(store);
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const { id } = store.add({
+        type: 'fact',
+        content: 'Use a transaction to update persistent memories',
+      });
+
+      vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+      for (const content of unrelatedMemoryContents(60)) {
+        store.add({ type: 'fact', content });
+      }
+
+      // 矛盾检测与去重共用候选窗口：最早一行掉出“最近 50 行”后仍必须被就地改写，而不是新增一条矛盾记忆。
+      vi.setSystemTime(new Date('2026-01-01T00:02:00.000Z'));
+      const stats = consolidator.consolidate([
+        { type: 'fact', content: 'Do not use a transaction to update persistent memories' },
+      ]);
+      expect(stats).toMatchObject({ added: 0, updated: 0, merged: 0, replaced: 1 });
+      expect(store.size()).toBe(61);
+      expect(store.get(id)?.content).toBe('Do not use a transaction to update persistent memories');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('appends a restatement of the earliest memory as a duplicate after 60 newer unrelated memories', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const retriever = new MemoryRetriever(store);
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      retriever.append({ content: ZUSTAND_FACT, type: 'preference', importance: 5 });
+
+      vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+      for (const content of unrelatedMemoryContents(60)) {
+        retriever.append({ content, type: 'preference', importance: 5 });
+      }
+      expect(store.size()).toBe(61);
+
+      vi.setSystemTime(new Date('2026-01-01T00:02:00.000Z'));
+      retriever.append({ content: ZUSTAND_FACT, type: 'preference', importance: 9 });
+      expect(store.size()).toBe(61);
+      expect(store.getAllActive().find((row) => row.content === ZUSTAND_FACT)).toMatchObject({
+        importance: 9,
+        access_count: 1,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps the default 50-row candidate window and logs when a window truncates', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      store.add({ type: 'fact', content: ZUSTAND_FACT });
+      vi.setSystemTime(new Date('2026-01-01T00:01:00.000Z'));
+      for (const content of unrelatedMemoryContents(60)) {
+        store.add({ type: 'fact', content });
+      }
+
+      const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+      // 默认窗口保持 50：检索 / search 行为不变，最早一行不参与比较。
+      expect(store.getCandidates('fact')).toHaveLength(50);
+      expect(
+        store.findSimilar(ZUSTAND_FACT, null, 3).find((row) => row.content === ZUSTAND_FACT)
+      ).toBeUndefined();
+      expect(
+        debug.mock.calls.some((call) => String(call[0]).includes('candidate window truncated'))
+      ).toBe(true);
+
+      // 显式窗口覆盖全部活跃行时能找到最早一行，且不再报告截断。
+      debug.mockClear();
+      expect(store.findSimilar(ZUSTAND_FACT, null, 3, { candidateWindow: 500 })[0]).toMatchObject({
+        content: ZUSTAND_FACT,
+        similarity: 1,
+      });
+      expect(
+        debug.mock.calls.some((call) => String(call[0]).includes('candidate window truncated'))
+      ).toBe(false);
+      expect(store.getCandidates(null, 10)).toHaveLength(10);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('counts only rows whose importance actually drops as archived and applies forget thresholds', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const ids = {
+        floor: store.add({ content: 'archive floor importance one', importance: 1 }).id,
+        lowered: store.add({ content: 'archive candidate importance two', importance: 2 }).id,
+        aboveBand: store.add({ content: 'archive skip importance three', importance: 3 }).id,
+        recent: store.add({ content: 'recently accessed importance two', importance: 2 }).id,
+        forgotten: store.add({ content: 'stale unimportant memory note', importance: 6 }).id,
+        retained: store.add({ content: 'stale important memory note', importance: 7 }).id,
+      };
+      const daysAgo = (days: number) => new Date(Date.now() - days * 86400_000).toISOString();
+      const setAccess = db.prepare(
+        'UPDATE semantic_memories SET last_accessed_at = ? WHERE id = ?'
+      );
+      setAccess.run(daysAgo(40), ids.floor);
+      setAccess.run(daysAgo(40), ids.lowered);
+      setAccess.run(daysAgo(40), ids.aboveBand);
+      setAccess.run(daysAgo(5), ids.recent);
+      setAccess.run(daysAgo(100), ids.forgotten);
+      setAccess.run(daysAgo(100), ids.retained);
+
+      expect(store.compact()).toEqual({ expired: 0, forgotten: 1, archived: 1, remaining: 5 });
+      expect(store.get(ids.floor)?.importance).toBe(1);
+      expect(store.get(ids.lowered)?.importance).toBe(1);
+      expect(store.get(ids.aboveBand)?.importance).toBe(3);
+      expect(store.get(ids.recent)?.importance).toBe(2);
+      expect(store.get(ids.forgotten)).toBeNull();
+      expect(store.get(ids.retained)?.importance).toBe(7);
+
+      // 已在下限 1 的行值不变，重复 compact 不能再计入 archived。
+      expect(store.compact()).toEqual({ expired: 0, forgotten: 0, archived: 0, remaining: 5 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('evicts the least important, least accessed, oldest memories across sources when over capacity', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      for (let i = 0; i < 499; i++) {
+        store.add({
+          content: `capacity filler memory ${i}`,
+          importance: 5,
+          source: i % 2 === 0 ? 'bootstrap' : 'user',
+        });
+      }
+      const lowestImportance = store.add({
+        content: 'lowest importance user note',
+        importance: 1,
+        source: 'user',
+      }).id;
+      const neverAccessed = store.add({
+        content: 'importance two never accessed',
+        importance: 2,
+        source: 'bootstrap',
+      }).id;
+      const olderAccessed = store.add({
+        content: 'importance two accessed older',
+        importance: 2,
+        source: 'user',
+      }).id;
+      const newerAccessed = store.add({
+        content: 'importance two accessed newer',
+        importance: 2,
+        source: 'bootstrap',
+      }).id;
+      const setAccessed = db.prepare(
+        'UPDATE semantic_memories SET access_count = 3, updated_at = ? WHERE id = ?'
+      );
+      setAccessed.run('2020-01-01T00:00:00.000Z', olderAccessed);
+      setAccessed.run('2021-01-01T00:00:00.000Z', newerAccessed);
+      expect(store.size()).toBe(503);
+
+      store.enforceCapacity();
+      expect(store.size()).toBe(500);
+      expect(store.get(lowestImportance)).toBeNull();
+      expect(store.get(neverAccessed)).toBeNull();
+      expect(store.get(olderAccessed)).toBeNull();
+      expect(store.get(newerAccessed)).not.toBeNull();
+
+      store.enforceCapacity();
+      expect(store.size()).toBe(500);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('warns with the memory id but no content when touchAccess cannot update access statistics', () => {
+    const db = new Database(':memory:');
+    const store = new MemoryStore(db);
+    const { id } = store.add({ content: 'access tracked private memory', source: 'user' });
+    db.close();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+
+    expect(() => store.touchAccess(id)).not.toThrow();
+    const message = warn.mock.calls
+      .map((call) => String(call[0]))
+      .find((text) => text.includes('touchAccess'));
+    expect(message).toBeDefined();
+    expect(message).toContain(id);
+    expect(message).not.toContain('access tracked private memory');
+  });
+
+  it('falls back to string arrays and warns when stored JSON list fields drift', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({ content: 'structured field drift memory', tags: ['keep'] });
+      db.prepare(
+        'UPDATE semantic_memories SET tags = ?, related_entities = ?, related_memories = ? WHERE id = ?'
+      ).run('{"tag":"x"}', '[1,"Entity"]', 'not json', id);
+      const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+
+      expect(store.get(id)).toMatchObject({
+        tags: [],
+        relatedEntities: ['Entity'],
+        relatedMemories: [],
+      });
+      const messages = warn.mock.calls.map((call) => String(call[0]));
+      for (const field of ['tags', 'relatedEntities', 'relatedMemories']) {
+        expect(messages.some((text) => text.includes(field) && text.includes(id))).toBe(true);
+      }
+      expect(messages.some((text) => text.includes('structured field drift memory'))).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('merges into a memory whose related_memories JSON is not an array without aborting', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({
+        type: 'fact',
+        content: 'Agent memory owns semantic recall and prompt retrieval',
+      });
+      db.prepare('UPDATE semantic_memories SET related_memories = ? WHERE id = ?').run('{}', id);
+      vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+
+      const stats = new MemoryConsolidator(store).consolidate([
+        {
+          type: 'fact',
+          content: 'Agent memory owns semantic recall and prompt ranking',
+          importance: 6,
+        },
+      ]);
+      expect(stats).toMatchObject({ added: 0, updated: 0, merged: 1 });
+      const merged = store.get(id);
+      expect(merged?.content).toContain('prompt ranking');
+      expect(merged?.relatedMemories).toEqual([expect.stringMatching(/^merged:\d+$/)]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe('MemoryCoordinator', () => {
   it('keeps the complete request budget stable across concurrent reconfiguration', async () => {
     let release!: (value: string) => void;

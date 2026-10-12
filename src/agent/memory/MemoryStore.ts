@@ -6,8 +6,8 @@
  *   - 基本 CRUD: add, update, delete, get
  *   - 批量查询: getAllActive, size, getStats
  *   - 访问计数: touchAccess
- *   - 容量控制: enforceCapacity
- *   - 维护: compact
+ *   - 容量控制: enforceCapacity（由 MemoryConsolidator.consolidate 在事务末尾调用）
+ *   - 维护: compact（过期清理 + 遗忘 + 归档，不做容量控制）
  *   - 统计: getStats, clearBootstrapMemories
  *
  * 设计原则:
@@ -29,11 +29,13 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 import {
   ensureSemanticMemorySchema,
   type SemanticMemorySqliteDatabase,
 } from '@alembic/core/memory';
 import { jaccardSimilarity, tokenizeForSimilarity } from '@alembic/core/search';
+import { observeSafely } from '#shared/observers.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 
@@ -158,8 +160,21 @@ export class MemoryStoreWriteError extends Error {
 
 // ─── 常量 ──────────────────────────────────────────────
 
-/** 最大记忆条数 (防止无限膨胀) */
-const MAX_MEMORIES = 500;
+/**
+ * 最大记忆条数 (防止无限膨胀)。
+ *
+ * 同时是固化（MemoryConsolidator）与 append 去重的相似候选窗口：去重必须能看到容量内的全部活跃行，
+ * 否则一次 bootstrap 写过 50 条后更早的记忆掉出比较范围，重复与矛盾陈述会被直接 ADD（C29）。
+ * 只在模块内共享，不经 memory barrel 对外导出。
+ */
+export const MEMORY_STORE_MAX_MEMORIES = 500;
+const MAX_MEMORIES = MEMORY_STORE_MAX_MEMORIES;
+
+/**
+ * 相似候选默认窗口：最近更新的 50 行。
+ * 检索侧（search 等）保持这一既有行为；需要完整去重的调用方显式传 candidateWindow。
+ */
+const DEFAULT_SIMILARITY_CANDIDATE_WINDOW = 50;
 
 /** 自然遗忘阈值 */
 const ARCHIVE_DAYS = 30;
@@ -345,8 +360,19 @@ export class MemoryStore {
     return rows.map(MemoryStore.#normalizeRow);
   }
 
-  /** 获取候选记忆 (用于相似度搜索) */
-  getCandidates(type: string | null): MemoryRow[] {
+  /**
+   * 获取候选记忆 (用于相似度搜索)
+   *
+   * @param type 过滤 type (null=全部)
+   * @param candidateWindow 按 updated_at 倒序最多取多少行；默认 50 保持检索侧既有行为，
+   *   固化与 append 去重传 MEMORY_STORE_MAX_MEMORIES 以覆盖容量内全部活跃行（C29）。
+   *   非正数 / 非有限值回退到默认窗口并记 warn。
+   */
+  getCandidates(
+    type: string | null,
+    candidateWindow: number = DEFAULT_SIMILARITY_CANDIDATE_WINDOW
+  ): MemoryRow[] {
+    const window = MemoryStore.#normalizeCandidateWindow(candidateWindow);
     const now = new Date().toISOString();
     const conditions = ['(expires_at IS NULL OR expires_at > ?)'];
     const params: unknown[] = [now];
@@ -355,16 +381,24 @@ export class MemoryStore {
       params.push(type);
     }
 
+    // 多取一行只为判断窗口是否截断；截断意味着更早的活跃行不参与相似度比较，必须留诊断。
     const rows = this.#db
       .prepare(`
         SELECT *
         FROM semantic_memories
         WHERE ${conditions.join(' AND ')}
         ORDER BY updated_at DESC
-        LIMIT 50
+        LIMIT ?
       `)
-      .all(...params);
+      .all(...params, window + 1);
 
+    if (rows.length > window) {
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] similarity candidate window truncated: compared the ${window} most recently updated active rows (type=${type ?? '*'}); older active rows were not compared`
+      );
+      return rows.slice(0, window).map(MemoryStore.#normalizeRow);
+    }
     return rows.map(MemoryStore.#normalizeRow);
   }
 
@@ -379,8 +413,14 @@ export class MemoryStore {
           WHERE id = ?
         `)
         .run(new Date().toISOString(), id);
-    } catch {
-      /* non-critical */
+    } catch (err: unknown) {
+      // 访问计数是检索 / prompt 注入的副作用，失败不打断主流程；但 access_count 与
+      // last_accessed_at 不再前进会让 compact 把仍在使用的记忆按“90 天未访问”遗忘，
+      // 因此必须留 warn。只记 id 与错误类别，不记正文。
+      logMemoryStore(
+        'warn',
+        `[MemoryStore] touchAccess skipped for ${id}: access statistics not updated (${describeError(err)})`
+      );
     }
   }
 
@@ -399,8 +439,9 @@ export class MemoryStore {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 执行维护: 清理过期记忆 + 容量控制
-   * @returns }
+   * 执行维护: 清理过期 + 遗忘 + 归档。
+   * 容量控制不在这里，由 MemoryConsolidator.consolidate 事务末尾的 enforceCapacity 负责。
+   * @returns { expired, forgotten, archived, remaining }
    */
   compact() {
     const now = new Date().toISOString();
@@ -425,7 +466,9 @@ export class MemoryStore {
         .run(forgetThreshold);
       stats.forgotten = forgottenResult.changes;
 
-      // 归档：降低重要性
+      // 归档：降低重要性。
+      // importance 已在下限 1 的行 MAX(1, importance - 1) 后值不变，但 SQLite changes 仍会计入，
+      // 导致每次 compact 都把同一批行重复报告为 archived；只匹配真正会下降的行（C34）。
       const archiveThreshold = new Date(nowMs - ARCHIVE_DAYS * 86400_000).toISOString();
       const archiveResult = this.#db
         .prepare(`
@@ -433,6 +476,7 @@ export class MemoryStore {
           SET importance = MAX(1, importance - 1)
           WHERE last_accessed_at < ?
             AND importance < 3
+            AND importance > 1
         `)
         .run(archiveThreshold);
       stats.archived = archiveResult.changes;
@@ -518,20 +562,52 @@ export class MemoryStore {
    * @param content 搜索文本
    * @param type 过滤 type (null=全部)
    * @param limit 返回条数
+   * @param options.candidateWindow 参与比较的最近更新行数，默认 50（见 getCandidates）
+   * @param options.tokenCache 调用方持有的分词缓存（key 为小写正文）。一次 consolidate 内
+   *   每条候选都要与最多 MEMORY_STORE_MAX_MEMORIES 行比较，缓存避免同一正文被反复分词；
+   *   key 是正文本身，行被 UPDATE / MERGE 改写后自然换 key，不会读到旧分词。
    * @returns 带 similarity 和 related_memories_raw 字段的 raw rows
    */
-  findSimilar(content: string, type: string | null, limit: number): MemoryRow[] {
-    const candidates = this.getCandidates(type);
+  findSimilar(
+    content: string,
+    type: string | null,
+    limit: number,
+    options: { candidateWindow?: number; tokenCache?: Map<string, Set<string>> } = {}
+  ): MemoryRow[] {
+    const { candidateWindow, tokenCache } = options;
+    const candidates = this.getCandidates(type, candidateWindow);
     const lowerContent = content.toLowerCase();
-    const contentTokens = tokenizeForSimilarity(lowerContent) as Set<string>;
+    const contentTokens = MemoryStore.#tokensFor(lowerContent, tokenCache);
 
+    let exactFallbacks = 0;
+    let exactMatches = 0;
     const scored = candidates
       .map((row) => {
-        const similarity = MemoryStore.computeSimilarity(contentTokens, lowerContent, row.content);
-        return { ...row, similarity, related_memories_raw: row.related_memories };
+        const lowerRow = (row.content || '').toLowerCase();
+        const { score, exactFallback } = MemoryStore.#scoreSimilarity(
+          contentTokens,
+          lowerContent,
+          MemoryStore.#tokensFor(lowerRow, tokenCache),
+          lowerRow
+        );
+        if (exactFallback) {
+          exactFallbacks++;
+          if (score > 0) {
+            exactMatches++;
+          }
+        }
+        return { ...row, similarity: score, related_memories_raw: row.related_memories };
       })
       .filter((r) => r.similarity > 0.1)
       .sort((a, b) => b.similarity - a.similarity);
+
+    if (exactFallbacks > 0) {
+      // 一次查询只汇总记一条，避免非拉丁文字项目里逐行刷日志；不记正文。
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] findSimilar exact-match fallback: ${exactFallbacks}/${candidates.length} candidates had no comparable tokens on either side (matched=${exactMatches}, type=${type ?? '*'})`
+      );
+    }
 
     return scored.slice(0, limit);
   }
@@ -542,18 +618,77 @@ export class MemoryStore {
    */
   static computeSimilarity(tokensA: Set<string>, lowerA: string, contentB: string): number {
     const lowerB = (contentB || '').toLowerCase();
-    const tokensB = tokenizeForSimilarity(lowerB);
+    const { score, exactFallback } = MemoryStore.#scoreSimilarity(
+      tokensA,
+      lowerA,
+      tokenizeForSimilarity(lowerB),
+      lowerB
+    );
+    if (exactFallback) {
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] computeSimilarity exact-match fallback: neither side has comparable tokens (score=${score})`
+      );
+    }
+    return score;
+  }
 
+  /**
+   * 相似度打分核心。exactFallback 标记“双方都没有可比 token、退化为精确比较”的分支，
+   * 由调用方决定如何记诊断（单次调用记一条，批量查询汇总记一条）。
+   */
+  static #scoreSimilarity(
+    tokensA: Set<string>,
+    lowerA: string,
+    tokensB: Set<string>,
+    lowerB: string
+  ): { score: number; exactFallback: boolean } {
     if (tokensA.size === 0 && tokensB.size === 0) {
-      return 1.0;
+      // Core 分词只保留拉丁字母、数字与 CJK 字符，西里尔文、韩文、假名、纯符号文本两侧都没有 token，
+      // Jaccard 无从计算。旧实现在这里返回 1.0，任意两段此类文本都被判为重复，新记忆被静默丢弃（C30）。
+      // 现在退化为归一化（NFC、合并空白、去首尾空白；调用方已小写）后的精确比较：
+      // 完全相同仍判为重复，其余一律视为不相似。
+      const exact =
+        MemoryStore.#normalizeForExactMatch(lowerA) === MemoryStore.#normalizeForExactMatch(lowerB);
+      return { score: exact ? 1 : 0, exactFallback: true };
     }
     if (tokensA.size === 0 || tokensB.size === 0) {
-      return 0.0;
+      return { score: 0, exactFallback: false };
     }
 
     const jaccard = jaccardSimilarity(tokensA, tokensB);
     const containsBonus = lowerA.includes(lowerB) || lowerB.includes(lowerA) ? 0.3 : 0;
-    return Math.min(1.0, jaccard + containsBonus);
+    return { score: Math.min(1.0, jaccard + containsBonus), exactFallback: false };
+  }
+
+  static #normalizeForExactMatch(lower: string): string {
+    return lower.normalize('NFC').replace(/\s+/g, ' ').trim();
+  }
+
+  /** 分词；传入缓存时按小写正文复用结果。 */
+  static #tokensFor(lower: string, cache: Map<string, Set<string>> | undefined): Set<string> {
+    if (!cache) {
+      return tokenizeForSimilarity(lower);
+    }
+    const cached = cache.get(lower);
+    if (cached) {
+      return cached;
+    }
+    const tokens = tokenizeForSimilarity(lower);
+    cache.set(lower, tokens);
+    return tokens;
+  }
+
+  /** 候选窗口归一化：非有限或小于 1 的值回退默认窗口并记 warn，避免 LIMIT 收到 NaN / 负数。 */
+  static #normalizeCandidateWindow(candidateWindow: number): number {
+    if (Number.isFinite(candidateWindow) && candidateWindow >= 1) {
+      return Math.floor(candidateWindow);
+    }
+    logMemoryStore(
+      'warn',
+      `[MemoryStore] invalid similarity candidate window ${String(candidateWindow)}; using default ${DEFAULT_SIMILARITY_CANDIDATE_WINDOW}`
+    );
+    return DEFAULT_SIMILARITY_CANDIDATE_WINDOW;
   }
 
   /** 创建 transaction wrapper */
@@ -578,21 +713,73 @@ export class MemoryStore {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       expiresAt: row.expires_at,
-      relatedEntities: MemoryStore.safeParseJSON(row.related_entities, []),
-      relatedMemories: MemoryStore.safeParseJSON(row.related_memories, []),
+      relatedEntities: MemoryStore.#parseStringArray(
+        row.related_entities,
+        'relatedEntities',
+        row.id
+      ),
+      relatedMemories: MemoryStore.#parseStringArray(
+        row.related_memories,
+        'relatedMemories',
+        row.id
+      ),
       sourceDimension: row.source_dimension,
       sourceEvidence: row.source_evidence,
       bootstrapSession: row.bootstrap_session,
-      tags: MemoryStore.safeParseJSON(row.tags, []),
+      tags: MemoryStore.#parseStringArray(row.tags, 'tags', row.id),
     };
   }
 
   static safeParseJSON<T>(str: string | null | undefined, fallback: T): T {
-    try {
-      return str ? JSON.parse(str) : fallback;
-    } catch {
+    if (!str) {
       return fallback;
     }
+    try {
+      return JSON.parse(str);
+    } catch (err: unknown) {
+      // 调用方不知道字段名与行 id，这里只记错误类别与输入长度，不记原文（可能含记忆正文）。
+      logMemoryStore(
+        'warn',
+        `[MemoryStore] safeParseJSON fell back to the default value: ${describeError(err)} (input length=${str.length})`
+      );
+      return fallback;
+    }
+  }
+
+  /**
+   * 解析 JSON 字符串数组字段（related_entities / related_memories / tags）。
+   * 解析失败或形状不是数组时回退 []，数组中的非字符串元素被丢弃；两种情况都记 warn（带字段与行 id，不带正文），
+   * 防止 '{}' 之类的合法 JSON 以非数组形态流出，破坏 string[] 契约或让 MERGE 的展开写回直接抛错。
+   */
+  static #parseStringArray(raw: string | null | undefined, field: string, id: string): string[] {
+    if (!raw) {
+      return [];
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err: unknown) {
+      logMemoryStore(
+        'warn',
+        `[MemoryStore] ${field} of ${id} is not valid JSON; using [] (${describeError(err)})`
+      );
+      return [];
+    }
+    if (!Array.isArray(parsed)) {
+      logMemoryStore(
+        'warn',
+        `[MemoryStore] ${field} of ${id} is not a JSON array (got ${parsed === null ? 'null' : typeof parsed}); using []`
+      );
+      return [];
+    }
+    const strings = parsed.filter((item): item is string => typeof item === 'string');
+    if (strings.length !== parsed.length) {
+      logMemoryStore(
+        'warn',
+        `[MemoryStore] ${field} of ${id} dropped ${parsed.length - strings.length} non-string item(s)`
+      );
+    }
+    return strings;
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -675,6 +862,32 @@ export function assertMemoryStoreSchemaShape(db: SqliteDatabase): void {
       `MemoryStore schema tripwire: ${MEMORY_STORE_SEMANTIC_TABLE} missing columns: ${missing.join(', ')}`
     );
   }
+}
+
+/**
+ * MemoryStore 没有注入 logger（构造签名保持不变），诊断统一走 Core Logger。
+ * 日志通道自身失败不能升级为存储失败，所以经 observeSafely 隔离。
+ */
+function logMemoryStore(level: 'warn' | 'debug', message: string): void {
+  observeSafely(
+    () => {
+      const logger = Logger.getInstance();
+      if (level === 'warn') {
+        logger.warn(message);
+      } else {
+        logger.debug(message);
+      }
+    },
+    () => undefined
+  );
+}
+
+/** 只取错误类别（name 与 SQLite code），不取 message，避免把 SQL 参数或正文带进日志。 */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    return 'code' in err && typeof err.code === 'string' ? `${err.name}/${err.code}` : err.name;
+  }
+  return typeof err;
 }
 
 function hasMemoryStoreSemanticTable(db: SqliteDatabase): boolean {

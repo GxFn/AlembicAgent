@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { WriteZone } from '@alembic/core/io';
 import { observeSafely } from '#shared/observers.js';
-import { MemoryStore } from './MemoryStore.js';
+import { MEMORY_STORE_MAX_MEMORIES, MemoryStore } from './MemoryStore.js';
 
 // ─── 类型定义 ──────────────────────────────────────────
 
@@ -107,6 +107,13 @@ export class MemoryConsolidator {
       );
     }
 
+    // 去重与矛盾检测必须看到容量内的全部活跃行（不是检索默认的最近 50 行，C29）；
+    // 分词缓存只活在本次 consolidate 内，每条候选与最多 MEMORY_STORE_MAX_MEMORIES 行比较时复用分词结果。
+    const similarityScope = {
+      candidateWindow: MEMORY_STORE_MAX_MEMORIES,
+      tokenCache: new Map<string, Set<string>>(),
+    };
+
     const runConsolidate = this.#store.transaction(() => {
       // 冲突替换、普通合并与容量淘汰属于同一持久化操作，任何写失败都整体回滚。
       if (replacePrevious) {
@@ -125,13 +132,18 @@ export class MemoryConsolidator {
         }
 
         // 前一候选已在同一事务内写入；冲突判断必须看到它，不能整批预判后再写。
-        if (this.#resolveConflict(candidate, content)) {
+        if (this.#resolveConflict(candidate, content, similarityScope)) {
           replaced++;
           continue;
         }
 
         // 搜索相似记忆 (同 type 优先)
-        const similar = this.#store.findSimilar(content, candidate.type ?? null, 3);
+        const similar = this.#store.findSimilar(
+          content,
+          candidate.type ?? null,
+          3,
+          similarityScope
+        );
 
         if (similar.length === 0) {
           this.#store.add({ ...candidate, bootstrapSession });
@@ -154,7 +166,9 @@ export class MemoryConsolidator {
         } else if ((topMatch.similarity ?? 0) >= SIMILARITY_MERGE) {
           // MERGE: 相关但不同 → 合并信息
           const mergedContent = `${topMatch.content}; ${content}`.substring(0, 500);
-          const existingRelated = MemoryStore.safeParseJSON(topMatch.related_memories_raw, []);
+          // findSimilar 的 related_memories_raw 与 related_memories 同源；经 deserialize 解析可保证得到
+          // string[]（非数组 JSON 回退 [] 并记 warn），否则 '{}' 之类的值在下方展开时会抛错并回滚整批固化。
+          const existingRelated = MemoryStore.deserialize(topMatch).relatedMemories;
           this.#store.update(topMatch.id, {
             content: mergedContent,
             importance: Math.max(topMatch.importance, candidate.importance || 5),
@@ -268,10 +282,15 @@ export class MemoryConsolidator {
    * 发现否定/肯定矛盾时就地改写旧记忆并返回 true（调用方据此计 replaced 且不再写入）。
    *
    * 调用方已保证 content 去空白且 ≥5 字；查询异常会先记日志再重抛，由外层事务整体回滚。
+   * similarityScope 与主路径共用同一候选窗口和分词缓存。
    */
-  #resolveConflict(candidate: CandidateMemory, content: string): boolean {
+  #resolveConflict(
+    candidate: CandidateMemory,
+    content: string,
+    similarityScope: { candidateWindow: number; tokenCache: Map<string, Set<string>> }
+  ): boolean {
     try {
-      const similar = this.#store.findSimilar(content, null, 3);
+      const similar = this.#store.findSimilar(content, null, 3, similarityScope);
       for (const row of similar) {
         const existing = MemoryStore.deserialize(row);
         if (existing.type !== (candidate.type || 'fact')) {

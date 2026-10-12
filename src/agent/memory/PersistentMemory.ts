@@ -167,7 +167,10 @@ export class PersistentMemory {
     return this.#store.size(opts);
   }
 
-  /** 维护: 过期清理 + 容量控制 */
+  /**
+   * 维护: 过期清理 + 遗忘 + 归档。
+   * 不做容量控制：容量上限由 consolidate 事务末尾的 enforceCapacity 负责。
+   */
   compact() {
     const stats = this.#store.compact();
     this.#log(

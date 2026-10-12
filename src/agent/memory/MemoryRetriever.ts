@@ -23,7 +23,7 @@ import {
   reportMemoryRead,
 } from './MemoryReadPolicy.js';
 import type { DeserializedMemory, MemoryRow } from './MemoryStore.js';
-import { MemoryStore } from './MemoryStore.js';
+import { MEMORY_STORE_MAX_MEMORIES, MemoryStore } from './MemoryStore.js';
 
 // ─── 常量 (Generative Agents 三维打分) ────────────────
 
@@ -338,8 +338,11 @@ export class MemoryRetriever {
       return;
     }
 
-    // 去重: 检查是否已有高相似度记忆
-    const similar = this.#store.findSimilar(content, entry.type ?? null, 1);
+    // 去重: 检查是否已有高相似度记忆。
+    // 候选窗口覆盖容量内全部活跃行：默认的“最近 50 行”会让超过 50 条后的旧同义记忆被重复写入（C29）。
+    const similar = this.#store.findSimilar(content, entry.type ?? null, 1, {
+      candidateWindow: MEMORY_STORE_MAX_MEMORIES,
+    });
     if (similar.length > 0 && (similar[0].similarity ?? 0) >= SIMILARITY_UPDATE) {
       if (entry.importance !== undefined && entry.importance > (similar[0].importance ?? 5)) {
         this.#store.update(similar[0].id, { importance: entry.importance });
