@@ -552,12 +552,147 @@ describe('evolution gate receipt contracts', () => {
     });
   });
 
+  // I51：status 兼容回退只属于无生产者的旧工具名；knowledge.manage 回执的事实只有 Core outcome。
+  // 生产 handler 总会同时写 status 与 outcome，缺 outcome 的 manage 回执只可能来自外部 toolCalls，
+  // 此时必须无结论并留下可定位的诊断，而不是把 evolution_skipped（重复提案）记成“验证仍有效”。
+  const captureToolOutcomeLogs = () => {
+    const logs: Array<{ level: string; message: string; meta: Record<string, unknown> }> = [];
+    const logger = Logger.getInstance();
+    const capture = (level: string) => (message: unknown, meta?: unknown) => {
+      logs.push({
+        level,
+        message: String(message),
+        meta: meta && typeof meta === 'object' ? (meta as Record<string, unknown>) : {},
+      });
+    };
+    const spies = [
+      vi.spyOn(logger, 'info').mockImplementation(capture('info')),
+      vi.spyOn(logger, 'warn').mockImplementation(capture('warn')),
+    ];
+    return {
+      diagnostics: () => logs.filter((entry) => entry.message.includes('[toolOutcomes]')),
+      restore: () => {
+        for (const spy of spies) {
+          spy.mockRestore();
+        }
+      },
+    };
+  };
+
+  it.each([
+    { operation: 'evolve', status: 'evolution_skipped' },
+    { operation: 'evolve', status: 'evolution_proposed' },
+    { operation: 'evolve', status: 'evolution_proposal_upgraded' },
+    { operation: 'deprecate', status: 'deprecated' },
+    { operation: 'deprecate', status: 'deprecation_proposed' },
+    { operation: 'skip_evolution', status: 'evolution_verified' },
+  ])('does not translate a status-only knowledge.manage $operation/$status receipt', ({
+    operation,
+    status,
+  }) => {
+    const logs = captureToolOutcomeLogs();
+    try {
+      const calls = [manage('recipe-1', operation, { status })];
+      expect(collectEvolutionDecisionIds(calls, expectedIds)).toEqual(new Set());
+      expect(evolutionGateEvaluator({ toolCalls: calls }, null, context)).toMatchObject({
+        action: 'retry',
+        artifact: {
+          processed: 0,
+          totalRecipes: 3,
+          pendingIds: expectedIds,
+          evolved: 0,
+          deprecated: 0,
+          skipped: 0,
+        },
+      });
+      expect(
+        projectEvolutionAuditResult({ reply: '', toolCalls: calls, iterations: 1 })
+      ).toMatchObject({ proposed: 0, deprecated: 0, skipped: 0 });
+      const diagnostics = logs.diagnostics();
+      expect(diagnostics.length).toBeGreaterThan(0);
+      for (const entry of diagnostics) {
+        expect(entry).toMatchObject({
+          level: 'warn',
+          meta: {
+            path: 'knowledge-manage-missing-outcome',
+            tool: 'knowledge',
+            action: 'manage',
+            operation,
+            target: 'recipe-1',
+            status,
+            outcome: null,
+          },
+        });
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+
+  it('keeps the status compatibility translation for legacy evolution tool names only', () => {
+    const logs = captureToolOutcomeLogs();
+    try {
+      const legacySkip = {
+        tool: 'skip_evolution',
+        args: { recipeId: 'recipe-1' },
+        result: { status: 'evolution_skipped' },
+        durationMs: 0,
+      };
+      expect(collectEvolutionDecisionIds([legacySkip], ['recipe-1'])).toEqual(
+        new Set(['recipe-1'])
+      );
+      expect(
+        projectEvolutionAuditResult({ reply: '', toolCalls: [legacySkip], iterations: 1 })
+      ).toMatchObject({ proposed: 0, deprecated: 0, skipped: 1 });
+      const diagnostics = logs.diagnostics();
+      expect(diagnostics.length).toBeGreaterThan(0);
+      for (const entry of diagnostics) {
+        expect(entry).toMatchObject({
+          level: 'info',
+          meta: {
+            path: 'legacy-tool-status',
+            tool: 'skip_evolution',
+            operation: 'skip_evolution',
+            target: 'recipe-1',
+            status: 'evolution_skipped',
+            outcome: 'verified',
+          },
+        });
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+
+  it('reads production-shaped knowledge.manage receipts by Core outcome without compatibility diagnostics', () => {
+    const logs = captureToolOutcomeLogs();
+    try {
+      const calls = [
+        // 重复提案：status 与旧兼容表里的 evolution_skipped 同名，但 Core outcome=skipped 才是事实。
+        manage('recipe-1', 'evolve', { status: 'evolution_skipped', outcome: 'skipped' }),
+        manage('recipe-2', 'skip_evolution', { status: 'evolution_verified', outcome: 'verified' }),
+        manage('recipe-3', 'deprecate', { status: 'deprecated', outcome: 'immediately-executed' }),
+      ];
+      expect(collectEvolutionDecisionIds(calls, expectedIds)).toEqual(
+        new Set(['recipe-2', 'recipe-3'])
+      );
+      expect(evolutionGateEvaluator({ toolCalls: calls }, null, context)).toMatchObject({
+        action: 'retry',
+        artifact: { processed: 2, pendingIds: ['recipe-1'], deprecated: 1, skipped: 1 },
+      });
+      expect(logs.diagnostics()).toEqual([]);
+    } finally {
+      logs.restore();
+    }
+  });
+
   it('deduplicates cumulative receipts, ignores unrelated ids and requires replacement lineage', () => {
     const calls = [
       manage('recipe-1', 'skip_evolution', { outcome: 'verified' }),
       manage('recipe-1', 'skip_evolution', { outcome: 'verified' }),
-      manage('recipe-2', 'deprecate', { status: 'deprecated' }),
-      manage('unrelated', 'evolve', { status: 'evolution_proposed' }),
+      // 生产形状回执（status + Core outcome）：unrelated 必须由 expectedIds 过滤掉，而不是因缺 outcome。
+      manage('recipe-2', 'deprecate', { status: 'deprecated', outcome: 'immediately-executed' }),
+      manage('unrelated', 'evolve', { status: 'evolution_proposed', outcome: 'proposal-created' }),
       {
         tool: 'knowledge',
         args: { action: 'submit' },

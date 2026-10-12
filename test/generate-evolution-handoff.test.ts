@@ -146,7 +146,8 @@ describe('evolution gate decision breakdown', () => {
   it('reports per-recipe outcomes that add up to the processed count', () => {
     const calls = [
       manage('recipe-1', 'evolve', { outcome: 'proposal-created' }),
-      manage('recipe-2', 'deprecate', { status: 'deprecated' }),
+      // knowledge.manage 回执以 Core outcome 为准（生产 handler 同时写 status 与 outcome）。
+      manage('recipe-2', 'deprecate', { status: 'deprecated', outcome: 'immediately-executed' }),
       manage('recipe-3', 'skip_evolution', { outcome: 'verified' }),
     ];
     expect(evolutionGateEvaluator({ toolCalls: calls }, null, context)).toMatchObject({
@@ -169,7 +170,8 @@ describe('evolution gate decision breakdown', () => {
       // 先提案后又 skip：提案已经落库，不能被后来的「仍然有效」盖掉。
       manage('recipe-2', 'evolve', { outcome: 'proposal-created' }),
       manage('recipe-2', 'skip_evolution', { outcome: 'verified' }),
-      manage('unrelated', 'deprecate', { status: 'deprecated' }),
+      // 带 Core outcome 的有效回执，必须由清单过滤掉，而不是因缺 outcome 被丢弃。
+      manage('unrelated', 'deprecate', { status: 'deprecated', outcome: 'immediately-executed' }),
       manage('recipe-3', 'evolve', { error: 'fixture failure' }),
     ];
     expect(evolutionGateEvaluator({ toolCalls: calls }, null, context)).toMatchObject({

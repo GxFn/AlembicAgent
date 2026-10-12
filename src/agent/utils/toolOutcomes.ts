@@ -1,3 +1,8 @@
+import Logger from '@alembic/core/logging';
+
+// 惰性取 Core 日志单例：本模块是回执语义单源，导入时不做任何初始化工作。
+const logger = () => Logger.getInstance();
+
 /** 工具请求、传输结果与业务结果分开归一；请求被执行不等于候选已入库。 */
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -78,7 +83,11 @@ export function hasPersistedCandidate(call: unknown): boolean {
 type EvolutionOperation = 'evolve' | 'deprecate' | 'skip_evolution';
 type EvolutionOutcome = 'proposal' | 'deprecated' | 'verified';
 
-const LEGACY_EVOLUTION_TOOLS: Record<string, EvolutionOperation> = {
+/**
+ * 旧进化工具名 → 操作。registry、宿主与 Core 当前都没有这些工具的生产者，只为外部传入的旧形状
+ * toolCalls 保留；只有命中这张表的回执才允许走下面的 status 兼容回退。
+ */
+const LEGACY_EVOLUTION_TOOLS: Readonly<Record<string, EvolutionOperation>> = {
   propose_evolution: 'evolve',
   confirm_deprecation: 'deprecate',
   skip_evolution: 'skip_evolution',
@@ -88,20 +97,40 @@ function isEvolutionOperation(value: unknown): value is EvolutionOperation {
   return value === 'evolve' || value === 'deprecate' || value === 'skip_evolution';
 }
 
+/** 旧工具名回执的 status 兼容转译；新形状的 knowledge.manage 回执不得使用。 */
+function legacyStatusOutcome(status: unknown): EvolutionOutcome | null {
+  const value = String(status);
+  if (
+    ['evolution_proposed', 'evolution_proposal_upgraded', 'deprecation_proposed'].includes(value)
+  ) {
+    return 'proposal';
+  }
+  if (value === 'deprecated') {
+    return 'deprecated';
+  }
+  return ['evolution_verified', 'evolution_skipped', 'verified'].includes(value)
+    ? 'verified'
+    : null;
+}
+
 /** 一次成功的进化决策回执：目标 Recipe、Agent 选择的操作、Core 确认的结果。 */
 function readEvolutionReceipt(
   call: unknown
 ): { target: string; operation: EvolutionOperation; outcome: EvolutionOutcome } | null {
   const { tool, action, params, result, ok } = readToolObservation(call);
-  const operation =
-    tool === 'knowledge' && action === 'manage' ? params.operation : LEGACY_EVOLUTION_TOOLS[tool];
+  const isManage = tool === 'knowledge' && action === 'manage';
+  // Object.hasOwn 防止 'constructor' 之类的原型键被当成旧工具名。
+  const legacyOperation = Object.hasOwn(LEGACY_EVOLUTION_TOOLS, tool)
+    ? LEGACY_EVOLUTION_TOOLS[tool]
+    : undefined;
+  const operation = isManage ? params.operation : legacyOperation;
   const target = params.id ?? params.recipeId;
   if (!ok || typeof target !== 'string' || !target || !isEvolutionOperation(operation)) {
     return null;
   }
-  let outcome: EvolutionOutcome | null;
   // Core outcome 是事实；不得让兼容 status 把 skipped 重新提升成成功提案。
   if (typeof result.outcome === 'string' && result.outcome) {
+    let outcome: EvolutionOutcome | null;
     if (result.outcome === 'proposal-created' || result.outcome === 'proposal-upgraded') {
       outcome = 'proposal';
     } else if (result.outcome === 'immediately-executed') {
@@ -109,21 +138,41 @@ function readEvolutionReceipt(
     } else {
       outcome = result.outcome === 'verified' ? 'verified' : null;
     }
-  } else if (
-    ['evolution_proposed', 'evolution_proposal_upgraded', 'deprecation_proposed'].includes(
-      String(result.status)
-    )
-  ) {
-    outcome = 'proposal';
-  } else if (result.status === 'deprecated') {
-    outcome = 'deprecated';
-  } else {
-    outcome = ['evolution_verified', 'evolution_skipped', 'verified'].includes(
-      String(result.status)
-    )
-      ? 'verified'
-      : null;
+    return outcome ? { target, operation, outcome } : null;
   }
+  const status = typeof result.status === 'string' ? result.status : null;
+  if (isManage) {
+    // knowledge.manage 的生产 handler 总会写 outcome；缺 outcome 说明回执来自外部或契约漂移。
+    // status 不能代替 outcome：evolve 遇到 Core skipped（重复提案）时 status 正是 evolution_skipped，
+    // 若按旧表转译会被记成“验证仍有效”。这里短路为无结论，由门禁把该 Recipe 留在待决清单里。
+    logger().warn(
+      `[toolOutcomes] evolution receipt rejected: knowledge.manage receipt has no Core outcome (operation=${operation}, target=${target}, status=${status ?? 'none'}); status compatibility is limited to legacy tool names, decision left undecided`,
+      {
+        path: 'knowledge-manage-missing-outcome',
+        tool,
+        action,
+        operation,
+        target,
+        status,
+        outcome: null,
+      }
+    );
+    return null;
+  }
+  // 只有旧工具名走到这里：按旧 status 兼容转译，并记录走了兼容路径，便于确认是否仍有旧形状来源。
+  const outcome = legacyStatusOutcome(result.status);
+  logger().info(
+    `[toolOutcomes] legacy evolution tool status translated (tool=${tool}, operation=${operation}, target=${target}, status=${status ?? 'none'}, outcome=${outcome ?? 'none'})`,
+    {
+      path: 'legacy-tool-status',
+      tool,
+      action,
+      operation,
+      target,
+      status,
+      outcome,
+    }
+  );
   return outcome ? { target, operation, outcome } : null;
 }
 

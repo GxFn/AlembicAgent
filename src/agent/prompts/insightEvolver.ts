@@ -5,7 +5,9 @@
  *   - 接收当前维度的**全部**现有 Recipe（不仅是衰退的）
  *   - 使用工具读取真实代码，验证每个 Recipe 的真实性
  *   - 通过**附加提案**（Proposal）驱动状态变更，不创建新 Recipe
- *   - 三种决策: propose_evolution / confirm_deprecation / skip_evolution
+ *   - 三种决策: knowledge.manage 的 operation = evolve / deprecate / skip_evolution
+ *     （旧工具名 propose_evolution / confirm_deprecation / skip_evolution 已无生产者，
+ *     只在 utils/toolOutcomes.ts 的兼容路径里按 status 读取；manage 回执只认 Core outcome）
  *
  * 被 PipelineStrategy 的 evolution preset 引用。
  * 按维度隔离：每个维度的 Evolve Stage 只处理属于该维度的 Recipe。
