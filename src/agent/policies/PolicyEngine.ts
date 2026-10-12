@@ -97,6 +97,12 @@ const CODE_PATH_KEYS = ['path', 'filePath', 'directory'] as const;
 const FILE_SCOPE_PATH_RULE = 'SAFETY_FILE_SCOPE_PATH';
 const FILE_SCOPE_SEARCH_RULE = 'SAFETY_FILE_SCOPE_SEARCH';
 
+/**
+ * requireApprovalFor 命中时的规则码（L5-P45 / I18）：全链路没有人工审批、挂起或重放通道，命中即硬拒绝。
+ * 规则码同样只写进 reason 文本，让模型与运营方看出这是策略禁用而不是等待中的审批请求。
+ */
+const APPROVAL_UNAVAILABLE_RULE = 'safety-approval-unavailable';
+
 function validateSafetyToolCall(
   safety: SafetyPolicy,
   toolName: string,
@@ -104,7 +110,8 @@ function validateSafetyToolCall(
 ) {
   if (toolName === 'terminal') {
     // 生产 terminal 只有 {action:'exec', params:{command}}；没有 params 对象时按平铺参数保守检查。
-    // fileScope 不覆盖 terminal（见 SafetyPolicy 注释），这里只执行命令黑名单。
+    // fileScope 不覆盖 terminal（见 SafetyPolicy 注释），这里只执行命令检查：checkCommand 先跑与
+    // terminal handler 同源的危险命令规则，再叠加 DANGEROUS_COMMANDS 与自定义黑名单；原因里带规则码。
     const terminalParams =
       args?.params && typeof args.params === 'object'
         ? (args.params as Record<string, unknown>)
@@ -125,7 +132,14 @@ function validateSafetyToolCall(
   }
 
   if (safety.needsApproval(toolName)) {
-    return { ok: false, reason: `[SafetyPolicy] 工具 "${toolName}" 需要人工确认` };
+    // 没有审批通道：不能告诉模型“需要人工确认”，否则模型会等待或反复重试同一工具直到预算耗尽。
+    // 拒绝原因经 runtimeSafetyGate 写入 warn 日志与 TOOL_POLICY_DENIED 诊断。
+    return {
+      ok: false,
+      reason:
+        `[SafetyPolicy] 工具禁用 [${APPROVAL_UNAVAILABLE_RULE}]: 工具 "${toolName}" 被安全策略禁止` +
+        `（requireApprovalFor 要求人工审批，但当前无人工审批通道）；本次调用已直接拒绝，等待或重试同一工具不会改变结果`,
+    };
   }
 
   return { ok: true };
