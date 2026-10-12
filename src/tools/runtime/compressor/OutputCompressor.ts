@@ -14,10 +14,24 @@ import { cleanOutput, stripAnsi, truncateOutput } from './strip.js';
 
 type Parser = (raw: string) => string | null;
 
+/**
+ * 需要命令上下文的解析结果（目前只有 tree）：除文本外带回有意跳过的条目统计，
+ * 由压缩器统一记录诊断；解析器模块按分层契约不能自己打日志。
+ */
+interface ContextualParseResult {
+  text: string | null;
+  omittedEntries: number;
+  omittedNames: readonly string[];
+  filterDisabled: boolean;
+}
+
+type ContextualParser = (raw: string, command: string) => ContextualParseResult;
+
 interface ParserEntry {
   pattern: RegExp;
   name: string;
   parse: Parser;
+  parseInContext?: ContextualParser;
 }
 
 const parsers: ParserEntry[] = [];
@@ -30,6 +44,14 @@ function reportFallback(parser: string, reason: string): void {
       Logger.getInstance().warn(
         `[OutputCompressor] parser=${parser}; fallback=generic; reason=${reason}`
       ),
+    () => undefined
+  );
+}
+
+/** 记录解析器有意跳过/关闭过滤的路径；只写解析器名、固定忽略名与计数，不写命令或输出原文。 */
+function reportParserNote(parser: string, note: string): void {
+  observeSafely(
+    () => Logger.getInstance().info(`[OutputCompressor] parser=${parser}; ${note}`),
     () => undefined
   );
 }
@@ -65,7 +87,8 @@ async function loadParsers(): Promise<void> {
       'test-output',
       3,
     ],
-    [/^(eslint|biome|tsc|npx\s+tsc)\b/, 'lint-output', 4],
+    // biome 不在此列：真实 pretty 诊断写在 stderr、严重级别在框线块内，由 generic 路径保留原文。
+    [/^(eslint|tsc|npx\s+tsc)\b/, 'lint-output', 4],
     [/^(rg|grep|ag|ack)\b/, 'grep', 5],
     [/^(ls|find|tree)\b/, 'tree', 6],
     [/^(npm|pnpm|yarn|bun)\s+(install|add|remove|update)\b/, 'package', 7],
@@ -74,7 +97,11 @@ async function loadParsers(): Promise<void> {
   for (const [pattern, name, idx] of PARSER_PATTERNS) {
     const m = modules[idx];
     if (m.status === 'fulfilled' && typeof m.value?.parse === 'function') {
-      parsers.push({ pattern, name, parse: m.value.parse });
+      const parseInContext =
+        'parseInContext' in m.value && typeof m.value.parseInContext === 'function'
+          ? m.value.parseInContext
+          : undefined;
+      parsers.push({ pattern, name, parse: m.value.parse, parseInContext });
     } else {
       reportFallback(name, 'parser-load-unavailable');
     }
@@ -127,15 +154,39 @@ export class OutputCompressor {
         const stdout = stderrOnly ? '' : separator >= 0 ? plain.slice(0, separator) : plain;
         const stderr = stderrOnly ? plain : separator >= 0 ? plain.slice(separator + 2) : '';
         try {
-          const result = entry.parse(stdout);
+          const outcome = entry.parseInContext
+            ? entry.parseInContext(stdout, command)
+            : {
+                text: entry.parse(stdout),
+                omittedEntries: 0,
+                omittedNames: [],
+                filterDisabled: false,
+              };
+          if (outcome.filterDisabled) {
+            reportParserNote(
+              entry.name,
+              'ignored-name-filter=off; reason=command-targets-ignored-name'
+            );
+          }
+          const result = outcome.text;
           if (result !== null) {
+            if (outcome.omittedEntries > 0) {
+              reportParserNote(
+                entry.name,
+                `omitted=${outcome.omittedEntries}; names=${outcome.omittedNames.join(',')}`
+              );
+            }
             const combined = stderr ? `${result}\n\n${stderr}` : result;
             if (combined.length <= maxChars) {
               return combined;
             }
             return truncateOutput(combined, maxChars);
           }
-          reportFallback(entry.name, 'unrecognized-output');
+          // 条目全被忽略名过滤时没有可展示的树，原因与“格式无法识别”不同，分开记录。
+          reportFallback(
+            entry.name,
+            outcome.omittedEntries > 0 ? 'all-entries-ignored' : 'unrecognized-output'
+          );
         } catch (err: unknown) {
           void err;
           reportFallback(entry.name, 'parser-error');

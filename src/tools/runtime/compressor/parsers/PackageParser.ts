@@ -14,7 +14,13 @@ interface PackageResult {
 const NPM_ADDED_RE = /added\s+(\d+)\s+packages?/;
 const NPM_REMOVED_RE = /removed\s+(\d+)\s+packages?/;
 const NPM_CHANGED_RE = /changed\s+(\d+)\s+packages?/;
-const NPM_AUDIT_RE = /(\d+)\s+vulnerabilit(?:y|ies)/;
+/**
+ * npm 审计摘要：'N vulnerabilities'、单一级别时的 'N moderate severity vulnerabilities'，
+ * 以及多级别时的括号明细 'N vulnerabilities (1 low, 2 high)'。
+ */
+const NPM_AUDIT_RE =
+  /(\d+)\s+(?:(?:info|low|moderate|high|critical)\s+severity\s+)?vulnerabilit(?:y|ies)(?:\s*\([^)]*\))?/i;
+const VULNERABILITY_WORD_RE = /vulnerabilit/i;
 
 const PNPM_ADDED_RE = /Packages:\s+\+(\d+)/;
 const PNPM_REMOVED_RE = /Packages:.*-(\d+)/;
@@ -33,17 +39,17 @@ function tryNpm(raw: string): PackageResult | null {
   }
 
   const warnings: string[] = [];
+  const extra: string[] = [];
   for (const line of raw.split('\n')) {
     const warnMatch = WARN_RE.exec(line);
     if (warnMatch) {
       warnings.push(warnMatch[1].trim());
+      continue;
     }
-  }
-
-  const audit = NPM_AUDIT_RE.exec(raw);
-  const extra: string[] = [];
-  if (audit) {
-    extra.push(`${audit[0]}`);
+    const audit = NPM_AUDIT_RE.exec(line);
+    if (audit && !extra.includes(audit[0])) {
+      extra.push(audit[0]);
+    }
   }
 
   return {
@@ -120,6 +126,18 @@ export function parse(raw: string): string | null {
 
     // 计数行可能出现在稍后失败的安装中；不能只摘出早期计数并吞掉失败事实。
     if (/^\s*(?:npm\s+(?:ERR!|error)(?:\s|$)|ERR_PNPM_|error\b)/im.test(raw)) {
+      return null;
+    }
+    // 漏洞行是安装结果里最不能丢的事实：除已作为 WARN 收进 warnings 的行外，任何提到漏洞
+    // 却不是已识别审计摘要的行，都说明格式超出本解析器认知，整体交回原文。
+    if (
+      raw
+        .split('\n')
+        .some(
+          (line) =>
+            VULNERABILITY_WORD_RE.test(line) && !WARN_RE.test(line) && !NPM_AUDIT_RE.test(line)
+        )
+    ) {
       return null;
     }
     // Yarn 的 YN0000 是普通日志级别，Fetched 也不是新增安装数；缺乏明确计数时保留原文。

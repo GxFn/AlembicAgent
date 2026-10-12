@@ -1,6 +1,9 @@
 /**
  * @module tools/runtime/compressor/parsers/LintOutputParser
- * 解析 eslint/biome/tsc 输出为紧凑结构化格式。
+ * 解析 eslint/tsc 输出为紧凑结构化格式。
+ *
+ * Biome 的真实 pretty 输出把严重级别放在标题行之后的框线块里，且诊断写在 stderr；
+ * 这里不再维护 Biome 专用解析，biome 命令由 OutputCompressor 交给 generic 路径保留原文。
  */
 
 interface LintResult {
@@ -20,11 +23,14 @@ const MAX_ISSUES = 10;
 
 const ESLINT_SUMMARY_RE = /(\d+)\s+problems?\s+\((\d+)\s+errors?,\s+(\d+)\s+warnings?\)/;
 const ESLINT_LINE_RE = /^\s*(.+?):(\d+):\d+\s+(error|warning)\s+(.+?)(?:\s{2,}|\t)(.+)$/;
+/**
+ * ESLint 默认 stylish 的问题行：缩进的 `行:列  级别  消息  规则`。
+ * 列之间至少两个空格；解析错误等致命问题没有规则列，消息直接到行尾。
+ */
+const ESLINT_STYLISH_ISSUE_RE = /^\s+(\d+):\d+\s+(error|warning)\s+(.+?)(?:\s{2,}(\S+))?$/;
 
 const TSC_LINE_RE = /^(.+?)\((\d+),\d+\):\s+error\s+(TS\d+):\s+(.+)$/;
 const TSC_LINE_ALT_RE = /^(.+?):(\d+):\d+\s+-\s+error\s+(TS\d+):\s+(.+)$/;
-
-const BIOME_DIAG_RE = /^(.+?):(\d+):\d+\s+(error|warning|info)\[(.+?)]\s+(.+)$/;
 
 function tryEslint(raw: string): LintResult | null {
   const summaryMatch = ESLINT_SUMMARY_RE.exec(raw);
@@ -32,32 +38,73 @@ function tryEslint(raw: string): LintResult | null {
   let errors = 0;
   let warnings = 0;
 
+  // 展示只存十条，计数必须遍历完整输入。
+  const record = (file: string, line: string, severity: 'error' | 'warning', message: string) => {
+    if (severity === 'error') {
+      errors++;
+    } else {
+      warnings++;
+    }
+    if (issues.length < MAX_ISSUES) {
+      issues.push({ file, line, severity, message });
+    }
+  };
+
+  // stylish 状态机：不缩进的非空行是文件头，其后缩进的问题行归属该文件；
+  // 空行结束当前文件块，摘要行之后（如 --fix 提示、--max-warnings 提示）不再解析。
+  let currentFile: string | null = null;
+  let afterSummary = false;
   for (const line of raw.split('\n')) {
-    const m = ESLINT_LINE_RE.exec(line);
-    if (m) {
-      if (m[3] === 'error') {
-        errors++;
-      } else {
-        warnings++;
+    if (line.trim().length === 0) {
+      currentFile = null;
+      continue;
+    }
+    if (afterSummary) {
+      continue;
+    }
+    if (ESLINT_SUMMARY_RE.test(line)) {
+      afterSummary = true;
+      currentFile = null;
+      continue;
+    }
+
+    const stylish = ESLINT_STYLISH_ISSUE_RE.exec(line);
+    if (stylish) {
+      // 没有文件头的问题行无法归属文件，说明不是可识别的 stylish 结构，整体交回原文。
+      if (currentFile === null) {
+        return null;
       }
-      if (issues.length >= MAX_ISSUES) {
-        continue;
-      }
-      issues.push({
-        file: m[1],
-        line: m[2],
-        severity: m[3] as 'error' | 'warning',
-        message: `${m[4]} (${m[5]})`,
-      });
+      const severity = stylish[2] === 'error' ? 'error' : 'warning';
+      const message = stylish[4] ? `${stylish[3]} (${stylish[4]})` : stylish[3];
+      record(currentFile, stylish[1], severity, message);
+      continue;
+    }
+
+    // 既有的单行 'file:line:col 级别 消息  规则' 形态继续支持；它自带文件名，不依赖文件头。
+    const single = ESLINT_LINE_RE.exec(line);
+    if (single) {
+      record(
+        single[1],
+        single[2],
+        single[3] === 'error' ? 'error' : 'warning',
+        `${single[4]} (${single[5]})`
+      );
+      continue;
+    }
+
+    if (!/^\s/.test(line)) {
+      currentFile = line.trim();
     }
   }
 
   if (summaryMatch) {
-    return {
-      errors: parseInt(summaryMatch[2], 10),
-      warnings: parseInt(summaryMatch[3], 10),
-      issues,
-    };
+    const summaryErrors = parseInt(summaryMatch[2], 10);
+    const summaryWarnings = parseInt(summaryMatch[3], 10);
+    // 摘要命中却没有明细，或明细与摘要计数对不上：只给计数会让调用方以为信息完整，交回原文。
+    if (errors + warnings === 0 || errors !== summaryErrors || warnings !== summaryWarnings) {
+      return null;
+    }
+    return { errors: summaryErrors, warnings: summaryWarnings, issues };
   }
 
   if (issues.length > 0) {
@@ -103,46 +150,6 @@ function tryTsc(raw: string): LintResult | null {
   return { errors: errorCount, warnings: 0, issues };
 }
 
-function tryBiome(raw: string): LintResult | null {
-  const issues: LintIssue[] = [];
-  let errors = 0;
-  let warnings = 0;
-
-  for (const line of raw.split('\n')) {
-    const m = BIOME_DIAG_RE.exec(line.trim());
-    if (m) {
-      // 展示只存十条，计数必须遍历完整输入；info 不属于 warning，未知摘要交回原文。
-      if (m[3] === 'info') {
-        return null;
-      }
-      if (m[3] === 'error') {
-        errors++;
-      } else {
-        warnings++;
-      }
-      if (issues.length >= MAX_ISSUES) {
-        continue;
-      }
-      issues.push({
-        file: m[1],
-        line: m[2],
-        severity: m[3] === 'error' ? 'error' : 'warning',
-        message: `${m[5]} (${m[4]})`,
-      });
-    }
-  }
-
-  if (issues.length === 0) {
-    return null;
-  }
-
-  return {
-    errors,
-    warnings,
-    issues,
-  };
-}
-
 function formatResult(result: LintResult): string {
   const parts: string[] = [`${result.errors} errors, ${result.warnings} warnings`];
 
@@ -168,7 +175,7 @@ export function parse(raw: string): string | null {
       return null;
     }
 
-    const result = tryEslint(raw) ?? tryTsc(raw) ?? tryBiome(raw);
+    const result = tryEslint(raw) ?? tryTsc(raw);
     if (!result) {
       return null;
     }

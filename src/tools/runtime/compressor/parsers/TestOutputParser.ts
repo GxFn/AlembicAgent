@@ -9,9 +9,16 @@ interface TestResult {
   skipped: number;
   total: number;
   failures: FailureInfo[];
+  /**
+   * 失败明细写在哪条流：pytest/mocha 把失败名与断言写在 stdout，摘要必须带上它们；
+   * vitest/jest 把失败详情写在 stderr，OutputCompressor 会原样保留 stderr，stdout 只剩计数不算丢失。
+   */
+  failureDetails: 'stdout' | 'stderr';
 }
 
 interface FailureInfo {
+  /** pytest 的 setup/teardown/收集错误单独标 ERROR，其余失败标 FAIL。 */
+  label: 'FAIL' | 'ERROR';
   name: string;
   message: string;
 }
@@ -27,8 +34,19 @@ const JEST_SUMMARY_RE =
 const PYTEST_SUMMARY_RE =
   /^=+\s+((?:\d+\s+(?:passed|failed|skipped|errors?|xfailed|xpassed|deselected|warnings?)(?:,\s*|\s+))+).*?=+$/gm;
 
-const MOCHA_PASSING_RE = /(\d+)\s+passing/;
-const MOCHA_FAILING_RE = /(\d+)\s+failing/;
+const MOCHA_PASSING_RE = /^\s*(\d+)\s+passing\b/m;
+const MOCHA_FAILING_RE = /^\s*(\d+)\s+failing\b/m;
+const MOCHA_PENDING_RE = /^\s*(\d+)\s+pending\b/m;
+/** mocha 在 'N failing' 之后按 '  1) 标题' 编号列出失败块；标题跨多行，最后一行以 ':' 结尾。 */
+const MOCHA_FAILURE_HEADER_RE = /^\s+(\d+)\) (.+)$/;
+const MAX_FAILURE_DETAIL_LINES = 3;
+
+/**
+ * pytest short test summary 行：'FAILED <nodeid> - <message>' 或 'ERROR <nodeid> - <message>'。
+ * nodeid 可能含空格（参数化 id），以第一个 ' - ' 为界；要求关键字后紧跟非空白，
+ * 避免把捕获日志里的 'ERROR    root:...' 当成失败。
+ */
+const PYTEST_FAILURE_LINE_RE = /^(FAILED|ERROR) (\S.*?)(?: - (.*))?$/;
 
 const FAIL_BLOCK_RE =
   /(?:FAIL|✕|✗|×|FAILED)\s+(.+?)(?:\n|\r\n)([\s\S]*?)(?=\n(?:FAIL|✕|✗|×|FAILED|Tests:|Test Suites:|$))/g;
@@ -52,12 +70,74 @@ function extractFailures(raw: string): FailureInfo[] {
         .split('\n')
         .map((l) => l.trim())
         .filter((l) => l.length > 0)
-        .slice(0, 3)
+        .slice(0, MAX_FAILURE_DETAIL_LINES)
         .join(' | ');
-      failures.push({ name, message: detail || 'unknown error' });
+      failures.push({ label: 'FAIL', name, message: detail || 'unknown error' });
     }
   }
 
+  return failures;
+}
+
+/** 逐行读取 pytest short test summary；每条 FAILED/ERROR 都保留（同一节点的 call 失败与 teardown 错误分别计数）。 */
+function extractPytestFailures(raw: string): FailureInfo[] {
+  const failures: FailureInfo[] = [];
+  for (const line of raw.split('\n')) {
+    const m = PYTEST_FAILURE_LINE_RE.exec(line.trimEnd());
+    if (m) {
+      failures.push({
+        label: m[1] === 'ERROR' ? 'ERROR' : 'FAIL',
+        name: m[2].trim(),
+        message: m[3]?.trim() || 'unknown error',
+      });
+    }
+  }
+  return failures;
+}
+
+/**
+ * 解析 mocha 'N failing' 之后的编号失败块。
+ * 返回 null 表示块结构无法识别（标题没有以 ':' 收尾），调用方应交回原文；
+ * 块数是否等于 'N failing' 由 parse 统一核对，不足时同样交回原文。
+ */
+function extractMochaFailures(raw: string): FailureInfo[] | null {
+  const lines = raw.split('\n');
+  const failingIndex = lines.findIndex((line) => MOCHA_FAILING_RE.test(line));
+  if (failingIndex < 0) {
+    return [];
+  }
+
+  // 只认从 1 开始连续递增的编号，避免把断言消息或 diff 里的 '2) ...' 当成新的失败块。
+  const blocks: string[][] = [];
+  for (const line of lines.slice(failingIndex + 1)) {
+    const header = MOCHA_FAILURE_HEADER_RE.exec(line);
+    if (header && Number(header[1]) === blocks.length + 1) {
+      blocks.push([header[2]]);
+      continue;
+    }
+    blocks.at(-1)?.push(line);
+  }
+
+  const failures: FailureInfo[] = [];
+  for (const block of blocks) {
+    // 标题按 titlePath 分行缩进，最后一行以 ':' 结尾；之后是错误消息、diff 与堆栈。
+    const titleEnd = block.findIndex((line) => line.trimEnd().endsWith(':'));
+    if (titleEnd < 0) {
+      return null;
+    }
+    const name = block
+      .slice(0, titleEnd + 1)
+      .map((line) => line.trim())
+      .join(' ')
+      .replace(/:$/, '');
+    const detail = block
+      .slice(titleEnd + 1)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !/^at\s/.test(line))
+      .slice(0, MAX_FAILURE_DETAIL_LINES)
+      .join(' | ');
+    failures.push({ label: 'FAIL', name, message: detail || 'unknown error' });
+  }
   return failures;
 }
 
@@ -70,6 +150,7 @@ function tryVitest(raw: string): TestResult | null {
       skipped: m[3] ? parseInt(m[3], 10) : 0,
       total: parseInt(m[4], 10),
       failures: extractFailures(raw),
+      failureDetails: 'stderr',
     };
   }
 
@@ -81,6 +162,7 @@ function tryVitest(raw: string): TestResult | null {
       skipped: m[2] ? parseInt(m[2], 10) : 0,
       total: parseInt(m[3], 10),
       failures: [],
+      failureDetails: 'stderr',
     };
   }
 
@@ -98,7 +180,14 @@ function tryJest(raw: string): TestResult | null {
   const passed = m[3] ? parseInt(m[3], 10) : 0;
   const total = parseInt(m[4], 10);
 
-  return { passed, failed, skipped, total, failures: extractFailures(raw) };
+  return {
+    passed,
+    failed,
+    skipped,
+    total,
+    failures: extractFailures(raw),
+    failureDetails: 'stderr',
+  };
 }
 
 function tryPytest(raw: string): TestResult | null {
@@ -126,7 +215,8 @@ function tryPytest(raw: string): TestResult | null {
     failed: failed + errors,
     skipped,
     total: passed + failed + skipped + errors,
-    failures: extractFailures(raw),
+    failures: extractPytestFailures(raw),
+    failureDetails: 'stdout',
   };
 }
 
@@ -139,26 +229,37 @@ function tryMocha(raw: string): TestResult | null {
   const passed = parseInt(passingMatch[1], 10);
   const failingMatch = MOCHA_FAILING_RE.exec(raw);
   const failed = failingMatch ? parseInt(failingMatch[1], 10) : 0;
+  // pending（it.skip / 无实现的 it）不计入 passing/failing，必须单独计入 skipped 与 total。
+  const pendingMatch = MOCHA_PENDING_RE.exec(raw);
+  const skipped = pendingMatch ? parseInt(pendingMatch[1], 10) : 0;
+  const failures = extractMochaFailures(raw);
+  if (failures === null) {
+    return null;
+  }
 
   return {
     passed,
     failed,
-    skipped: 0,
-    total: passed + failed,
-    failures: extractFailures(raw),
+    skipped,
+    total: passed + failed + skipped,
+    failures,
+    failureDetails: 'stdout',
   };
 }
 
 function formatResult(result: TestResult): string {
-  const parts: string[] = [
-    `Tests: ${result.passed} passed, ${result.failed} failed, ${result.total} total`,
-  ];
+  const counts = [`${result.passed} passed`, `${result.failed} failed`];
+  // skipped 非零时必须列出，否则 total 与 passed+failed 的差额无从解释；为零时省略，保持原摘要文本。
+  if (result.skipped > 0) {
+    counts.push(`${result.skipped} skipped`);
+  }
+  const parts: string[] = [`Tests: ${counts.join(', ')}, ${result.total} total`];
 
   if (result.failures.length > 0) {
     parts.push('');
     parts.push('[failures]');
     for (const f of result.failures) {
-      parts.push(`FAIL ${f.name}: ${f.message}`);
+      parts.push(`${f.label} ${f.name}: ${f.message}`);
     }
   }
 
@@ -177,6 +278,7 @@ export function parse(raw: string): string | null {
       (raw.match(/^\s*Tests(?:\s|:)/gm)?.length ?? 0) > 1 ||
       (raw.match(/^\s*\d+\s+passing\b/gm)?.length ?? 0) > 1 ||
       (raw.match(/^\s*\d+\s+failing\b/gm)?.length ?? 0) > 1 ||
+      (raw.match(/^\s*\d+\s+pending\b/gm)?.length ?? 0) > 1 ||
       /^\s*Errors\s+[1-9]\d*\s+errors?\b/m.test(raw)
     ) {
       return null;
@@ -190,6 +292,11 @@ export function parse(raw: string): string | null {
       result.passed + result.failed + result.skipped !== result.total ||
       (result.failed === 0 && /^\s*Test (?:Files|Suites:).*\bfailed\b/m.test(raw))
     ) {
+      return null;
+    }
+    // 失败明细写在 stdout 的框架：计数里有失败却没提取到同样多的失败名，只给计数会让调用方
+    // 以为信息完整；统一交回原文（OutputCompressor 记录 unrecognized-output 回退）。
+    if (result.failureDetails === 'stdout' && result.failures.length !== result.failed) {
       return null;
     }
     return formatResult(result);
