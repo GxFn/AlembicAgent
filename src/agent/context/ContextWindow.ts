@@ -687,7 +687,7 @@ export class ContextWindow {
           role: 'user',
           content: formatL4MemorySummary(summary.text || '', memoryPackage),
           metadata: {
-            kind: 'l4_memory_summary',
+            kind: L4_MEMORY_SUMMARY_KIND,
             source: 'l4_memory_package/v1',
           },
         },
@@ -703,10 +703,20 @@ export class ContextWindow {
 
       return { level: 4, removed, usage: summary.usage };
     } catch (err: unknown) {
-      this.#log(
-        'warn',
-        `[ContextWindow] L4 auto-compact failed: ${err instanceof Error ? err.message : String(err)}`
-      );
+      const errorName = err instanceof Error ? err.name : typeof err;
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      // 取消归类：provider 收到 abortSignal 后通常直接 reject（本仓 createLlmAbortError 抛 AbortError），
+      // 走不到上面“resolve 之后才发现 abort”的分支。这是调用方取消，不是摘要失败；以调用方 signal
+      // 的状态为准（provider 自身超时等未经调用方 signal 的 AbortError 仍按失败处理），返回 cancelled，
+      // BudgetController 据此不累加 L4 失败计数、不触发预算耗尽硬停。历史未被改写。
+      if (opts.abortSignal?.aborted) {
+        this.#log(
+          'warn',
+          `[ContextWindow] L4 compact cancelled during generation: abort signal fired and provider rejected (${errorName}: ${errorMessage}); history unchanged`
+        );
+        return { level: 4, removed: 0, failed: true, cancelled: true };
+      }
+      this.#log('warn', `[ContextWindow] L4 auto-compact failed: ${errorMessage}`);
       return { level: 4, removed: 0, failed: true };
     }
   }
@@ -720,6 +730,7 @@ export class ContextWindow {
     const TRUNCATE_THRESHOLD = 2000;
     const TRUNCATE_TO = 500;
     let truncated = 0;
+    let evidencePreserved = 0;
 
     const lastRoundStart = this.#findLastToolRoundStart();
     if (lastRoundStart < 0) {
@@ -731,7 +742,19 @@ export class ContextWindow {
       if (msg.role === 'tool' && msg.content && msg.content.length > TRUNCATE_THRESHOLD) {
         // A-1：纯头截断 → 首+尾保留，保住扫描类 result 尾部的错误汇总 / match 计数 /
         // 结尾结构；snipHeadTail 内部保证 head+marker+tail ≤ TRUNCATE_TO，跨周期幂等。
-        msg.content = snipHeadTail(msg.content, TRUNCATE_TO, L1_SNIP_MARKER_TAG);
+        // L1 原地改写 #messages，投影无法再恢复被截掉的内容，所以 `[evidence] E-n=…` 尾注
+        // 必须与 limitToolResult 入口用同一个保尾注截断（摘尾注封顶 800 → 正文按剩余预算截 →
+        // 接回）。正文截断结果（含 marker）≤ max(200, 500 - 尾注长)，尾注 ≤ 801，接回后总长
+        // ≤ max(500, 200 + 801)，仍低于 TRUNCATE_THRESHOLD，下一周期不会再截（幂等）。
+        const preserved = truncatePreservingEvidenceTail(
+          msg.content,
+          TRUNCATE_TO,
+          (body, bodyBudget) => snipHeadTail(body, bodyBudget, L1_SNIP_MARKER_TAG)
+        );
+        if (preserved !== null) {
+          evidencePreserved++;
+        }
+        msg.content = preserved ?? snipHeadTail(msg.content, TRUNCATE_TO, L1_SNIP_MARKER_TAG);
         truncated++;
       }
     }
@@ -742,7 +765,8 @@ export class ContextWindow {
       const ratio = this.getTokenUsageRatio();
       this.#log(
         'info',
-        `[ContextWindow] L1 compact: truncated ${truncated} tool results | ` +
+        `[ContextWindow] L1 compact: truncated ${truncated} tool results ` +
+          `(${evidencePreserved} with [evidence] tail preserved) | ` +
           `tokens≈${afterTokens}/${this.#tokenBudget} (${(ratio * 100).toFixed(1)}%)`
       );
     }
@@ -827,11 +851,17 @@ export class ContextWindow {
     this.#invalidateReadView('l3_collapse');
     this.#extractCompactedSubmits(1, keepFrom);
     this.#collapseThreshold = keepFrom;
-    this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}`);
+    // 折叠区里的 L4 记忆摘要由 toProjectedMessages 原样钉住，这里只记录数量供诊断。
+    const pinnedMemory = this.#messages.slice(1, keepFrom).filter(isPinnedRuntimeMemory).length;
+    const pinnedNote =
+      pinnedMemory > 0
+        ? `, ${pinnedMemory} runtime memory summary message(s) pinned ahead of the collapsed marker`
+        : '';
+    this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}${pinnedNote}`);
     this.#log(
       'info',
       `[ContextWindow] L3 collapse: projection threshold at index ${keepFrom}, ` +
-        `${this.#messages.length - keepFrom} messages visible in projection | ` +
+        `${this.#messages.length - keepFrom} messages visible in projection${pinnedNote} | ` +
         `provider-visible tokens≈${this.estimateTokens()}/${this.#tokenBudget}, ` +
         `retained history tokens≈${retainedTokens}`
     );
@@ -850,6 +880,11 @@ export class ContextWindow {
    * 当 L3 collapse 激活时，将 #collapseThreshold 之前的消息
    * 折叠为一条摘要行，减少 token 消耗。
    * 当未激活时，返回原始消息。
+   *
+   * L4 记忆摘要（metadata.kind=l4_memory_summary）是 L4 花 token 保下来的运行记忆（早期发现、
+   * phase、证据路径）。L4 成功后它固定在 index 1，下一次 L3 的折叠区必然包含它；若随折叠区一起
+   * 并进 "[Collapsed: …]"，模型就再也看不到这些记忆。因此折叠区内的记忆摘要原样钉在 messages[0]
+   * 之后、折叠摘要之前，且不计入折叠轮次/结果数（与 L2 保护带 metadata.kind 消息的语义一致）。
    */
   toProjectedMessages(): ContextMessage[] {
     if (this.#collapseThreshold < 0) {
@@ -860,8 +895,18 @@ export class ContextWindow {
     }
 
     const collapsedRegion = this.#messages.slice(1, this.#collapseThreshold);
-    const toolRounds = collapsedRegion.filter((m) => m.role === 'assistant' && m.toolCalls).length;
-    const toolResults = collapsedRegion.filter((m) => m.role === 'tool').length;
+    const pinnedMemory = collapsedRegion.filter(isPinnedRuntimeMemory);
+    const foldedRegion =
+      pinnedMemory.length > 0
+        ? collapsedRegion.filter((m) => !isPinnedRuntimeMemory(m))
+        : collapsedRegion;
+    if (pinnedMemory.length > 0 && foldedRegion.length === 0) {
+      // 边界前只有被钉住的记忆摘要，没有可折叠内容：投影即原始消息，不再插入
+      // "[Collapsed: 0 tool rounds…]"，避免折叠反而让投影多出一条消息。
+      return this.#messages;
+    }
+    const toolRounds = foldedRegion.filter((m) => m.role === 'assistant' && m.toolCalls).length;
+    const toolResults = foldedRegion.filter((m) => m.role === 'tool').length;
     const submitTitles = [...this.#compactedSubmits];
 
     const summaryParts = [`[Collapsed: ${toolRounds} tool rounds, ${toolResults} results]`];
@@ -871,6 +916,7 @@ export class ContextWindow {
 
     return [
       this.#messages[0],
+      ...pinnedMemory,
       { role: 'user' as const, content: summaryParts.join('\n') },
       ...this.#messages.slice(this.#collapseThreshold),
     ];
@@ -1156,6 +1202,16 @@ export class ContextWindow {
 // 历史压缩并同步处理续接、工具结果元数据只留布尔 persistedSubmission、token 估算与阶段预算默认值同一口径。
 
 const RUNTIME_NUDGE_KIND = 'runtime_nudge';
+/** L4 记忆摘要的 metadata.kind；compactL4 成功后写入 index 1。 */
+const L4_MEMORY_SUMMARY_KIND = 'l4_memory_summary';
+
+/**
+ * L3 投影必须原样保留的运行记忆消息（目前只有 L4 记忆摘要）。
+ * runtime_nudge 不在此列：它由 appendUserNudge 自行替换，旧引导本就应随历史折叠。
+ */
+function isPinnedRuntimeMemory(message: ContextMessage): boolean {
+  return message.metadata?.kind === L4_MEMORY_SUMMARY_KIND;
+}
 /** 阶段未给上限时的 provider 输入预算默认值（与历史 compactForProviderInputBudget 默认一致）。 */
 const DEFAULT_PROVIDER_INPUT_MAX_MESSAGES = 44;
 const DEFAULT_PROVIDER_INPUT_MAX_TOKENS = 16_000;
@@ -1437,6 +1493,14 @@ const L1_SNIP_MARKER_TAG = 'compaction snip';
 /** limit 层 marker 词根 —— 与 read 入口 / L1 层均不同 */
 const LIMIT_SNIP_MARKER_TAG = 'tool-result snip';
 
+/** 模块级纯函数（limit 系列）没有实例 logger；降级诊断走全局 Logger，日志故障不影响截断结果。 */
+function logContextDiagnostic(message: string): void {
+  observeSafely(
+    () => Logger.getInstance().info(message),
+    () => undefined
+  );
+}
+
 /**
  * 把长字符串截断为 head + 独立 marker + tail，并保证幂等：
  * keepHead + marker.length + safeTail ≤ budget。
@@ -1448,17 +1512,23 @@ const LIMIT_SNIP_MARKER_TAG = 'tool-result snip';
  *
  * 注：keepTail 改用 const（规格示例为 let，但本仓 biome useConst=error 且 keepTail 从不重赋值，
  * 仅 keepHead/safeTail/overflow 重赋值保留 let），行为与规格逐字一致。
+ *
+ * marker 中的省略数用于审计，必须等于最终实际省略量（text.length - keepHead - safeTail）。
+ * 但省略数要等收缩结束才知道，而收缩量又取决于 marker 长度：这里先按 text.length 的位数
+ * 预留 marker 长度做预算（省略数 ≤ text.length，预留是上界），收缩完成后再用最终保留量
+ * 生成真实 marker；真实 marker 不长于预留，keepHead+marker.length+safeTail ≤ budget 仍成立
+ * （marker 本身长于 budget 的极小 budget 除外，与原实现相同）。
  */
 function snipHeadTail(text: string, budget: number, tag: string): string {
   let keepHead = Math.floor(budget * 0.8); // CG-2：头 80%
   const keepTail = Math.floor(budget * 0.15); // CG-2：尾 15%
-  const omitted = text.length - keepHead - keepTail;
-  // marker 含原文长度与省略数（便于审计），用真实 marker.length 入预算。
-  const marker = `\n... [${tag}: ${omitted} of ${text.length} chars omitted] ...\n`;
+  const buildMarker = (omitted: number) =>
+    `\n... [${tag}: ${omitted} of ${text.length} chars omitted] ...\n`;
+  const reservedMarkerLength = buildMarker(text.length).length;
   // 幂等守卫：先收缩 safeTail；若 keepHead+marker 仍超 budget，再收缩 keepHead，
   // 保证 keepHead+marker.length+safeTail ≤ budget 在任意 budget 下成立。
   let safeTail = keepTail;
-  let overflow = keepHead + marker.length + safeTail - budget;
+  let overflow = keepHead + reservedMarkerLength + safeTail - budget;
   if (overflow > 0) {
     const tailCut = Math.min(safeTail, overflow);
     safeTail -= tailCut;
@@ -1471,6 +1541,8 @@ function snipHeadTail(text: string, budget: number, tag: string): string {
   if (keepHead + safeTail >= text.length) {
     return text;
   }
+  // 收缩完成后按最终保留量重算省略数，审计数字与实际截掉的字符数一致。
+  const marker = buildMarker(text.length - keepHead - safeTail);
   const head = text.slice(0, keepHead);
   const tail = safeTail > 0 ? text.slice(-safeTail) : '';
   return `${head}${marker}${tail}`;
@@ -1495,17 +1567,45 @@ function snipHeadTail(text: string, budget: number, tag: string): string {
  * 尾注只有 ~200 字，任何配额档都保得起；确定性修复，全 provider 生效。
  */
 const EVIDENCE_TAIL_RE = /\n\n\[evidence\] [^\n]*$/;
+/** 尾注封顶长度：防病态超长尾注吃光配额。 */
+const EVIDENCE_TAIL_MAX_CHARS = 800;
+/** 摘下尾注后正文的最低预算：尾注再长也给正文留下可读的首尾片段。 */
+const EVIDENCE_BODY_MIN_CHARS = 200;
+
+/**
+ * 保尾注截断：limitToolResult 入口与 #compactL1 共用（C02）。
+ * 有 `[evidence]` 尾注时先摘下（封顶 800 字），正文按 max(200, budget - 尾注长) 交给 truncateBody，
+ * 再原样接回尾注；没有尾注时返回 null，由调用方走原截断逻辑。
+ * 接回的尾注仍以 "\n\n[evidence] " 开头且不含换行（封顶时末尾补 "…"），下一轮仍能被
+ * EVIDENCE_TAIL_RE 识别，二次截断幂等。
+ */
+function truncatePreservingEvidenceTail(
+  text: string,
+  budget: number,
+  truncateBody: (body: string, bodyBudget: number) => string
+): string | null {
+  const tailMatch = text.match(EVIDENCE_TAIL_RE);
+  if (!tailMatch) {
+    return null;
+  }
+  const annotation =
+    tailMatch[0].length > EVIDENCE_TAIL_MAX_CHARS
+      ? `${tailMatch[0].slice(0, EVIDENCE_TAIL_MAX_CHARS)}…`
+      : tailMatch[0];
+  const body = text.slice(0, text.length - tailMatch[0].length);
+  const bodyBudget = Math.max(EVIDENCE_BODY_MIN_CHARS, budget - annotation.length);
+  return `${truncateBody(body, bodyBudget)}${annotation}`;
+}
 
 export function limitToolResult(toolName: string, result: unknown, quota: ToolResultQuota) {
   if (typeof result === 'string') {
-    const tailMatch = result.match(EVIDENCE_TAIL_RE);
-    if (tailMatch) {
-      const annotation =
-        tailMatch[0].length > 800 ? `${tailMatch[0].slice(0, 800)}…` : tailMatch[0];
-      const body = result.slice(0, result.length - tailMatch[0].length);
-      const bodyQuota = Math.max(200, (quota.maxChars ?? 4000) - annotation.length);
-      const limitedBody = limitToolResultBody(toolName, body, { ...quota, maxChars: bodyQuota });
-      return `${typeof limitedBody === 'string' ? limitedBody : JSON.stringify(limitedBody)}${annotation}`;
+    const preserved = truncatePreservingEvidenceTail(
+      result,
+      quota.maxChars ?? 4000,
+      (body, bodyBudget) => limitToolResultBody(toolName, body, { ...quota, maxChars: bodyBudget })
+    );
+    if (preserved !== null) {
+      return preserved;
     }
   }
   return limitToolResultBody(toolName, result, quota);
@@ -1548,7 +1648,7 @@ function limitToolResultBody(toolName: string, result: unknown, quota: ToolResul
         // A-1b：V1 batch 搜索纯头 → 首+尾；marker=LIMIT_SNIP_MARKER_TAG。
         return raw.length > maxChars ? snipHeadTail(raw, maxChars, LIMIT_SNIP_MARKER_TAG) : raw;
       }
-      return limitSearchResult(result, maxMatches, maxChars);
+      return limitSearchResult(result as SearchResultLike, maxMatches, maxChars);
     }
 
     // batchResults 已在上面统一处理；这里只剩单个文件内容。
@@ -1569,18 +1669,12 @@ function limitToolResultBody(toolName: string, result: unknown, quota: ToolResul
  *
  * code (search) 返回格式:
  *   { matches: [{ file, line, code, context, score }], total, searchedFiles }
+ *
+ * 唯一调用点（limitToolResultBody）只在 result 是带 matches 的非 null 对象时进入，
+ * 原先的字符串 / 非对象分支不可达，已删除并把参数收窄为 SearchResultLike。
  */
-function limitSearchResult(result: unknown, maxMatches: number, maxChars: number) {
-  if (typeof result === 'string') {
-    return result.length > maxChars ? `${result.substring(0, maxChars)}\n... [truncated]` : result;
-  }
-
-  if (!result || typeof result !== 'object') {
-    return JSON.stringify(result || {});
-  }
-
-  // 深拷贝避免修改原对象
-  const src = result as SearchResultLike;
+function limitSearchResult(src: SearchResultLike, maxMatches: number, maxChars: number) {
+  // 浅拷贝外层与每个匹配项，避免修改原对象
   const limited: SearchResultLike = { ...src };
   if (Array.isArray(limited.matches)) {
     limited.matches = limited.matches.slice(0, maxMatches).map((m: SearchMatch) => {
@@ -1606,7 +1700,8 @@ function limitSearchResult(result: unknown, maxMatches: number, maxChars: number
 
   const str = JSON.stringify(limited);
   if (str.length > maxChars) {
-    return `${str.substring(0, maxChars)}\n... [truncated]`;
+    // 与同文件 A-1b 其余分支一致：纯头截断 → 首+尾，保住末尾的 total/searchedFiles/_note 汇总。
+    return snipHeadTail(str, maxChars, LIMIT_SNIP_MARKER_TAG);
   }
   return str;
 }
@@ -1674,6 +1769,18 @@ function limitFileContent(result: unknown, maxChars: number) {
         break;
       }
       head += `${line}\n`;
+    }
+    if (head === '') {
+      // 降级：首行就超过头部预算（压缩 JS/JSON 等单行超长内容），按整行切会让正文全丢、只剩 marker。
+      // 退化为字符级首+尾截断，保住开头与结尾；整行切分的可读性在这种输入下本就不存在。
+      const firstLineLength = lines[0]?.length ?? 0;
+      logContextDiagnostic(
+        `[ContextWindow] limitFileContent: file content head+tail fell back to char-level snip ` +
+          `(first line ${firstLineLength} chars > head budget ${headBudget}, ` +
+          `total ${limited.content.length} chars, maxChars ${maxChars})`
+      );
+      limited.content = snipHeadTail(limited.content, maxChars, LIMIT_SNIP_MARKER_TAG);
+      return JSON.stringify(limited);
     }
     let tail = '';
     for (let i = lines.length - 1; i >= 0; i--) {

@@ -1266,3 +1266,273 @@ describe('provider-history compaction and native continuation', () => {
     expect(JSON.stringify(assistant?.content)).not.toContain('native reasoning');
   });
 });
+
+/**
+ * L6-P14：压缩保留运行记忆与证据。
+ * - C01：L4 记忆摘要位于 index 1，后续 L3 折叠不能把它折进 "[Collapsed: …]"；
+ * - C02：L1 截断旧工具结果时保留 `[evidence] E-n=…` 尾注，且跨周期幂等；
+ * - C03：provider 因 abort reject 时 compactL4 归为 cancelled，而不是 L4 失败；
+ * - C07：snipHeadTail 收缩后 marker 中的省略字数等于实际省略量；
+ * - C08：V1 结构化搜索结果末尾截断改为首+尾；单行超长文件内容退化为字符级首+尾截断。
+ */
+describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
+  const EVIDENCE_TAIL = /\n\n\[evidence\] [^\n]*$/;
+  const evidenceAnnotation =
+    '\n\n[evidence] E-12=src/agent/runtime/AgentRuntime.ts:10-80; E-13=src/agent/context/ContextWindow.ts:1-50';
+
+  async function windowWithL4Summary(): Promise<ContextWindow> {
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('produce goal');
+    window.appendAssistantWithToolCalls(null, [
+      { id: 'early', name: 'code', args: { action: 'read' } },
+    ]);
+    window.appendToolResult('early', 'code', 'early observation');
+    window.appendAssistantText('early reasoning');
+    const result = await window.compactL4({
+      chatWithTools: async () => ({ text: 'compacted summary' }),
+    });
+    expect(result.failed).not.toBe(true);
+    expect(window.toMessages()[1]?.metadata?.kind).toBe('l4_memory_summary');
+    return window;
+  }
+
+  function appendRounds(window: ContextWindow, rounds: number, from = 0) {
+    for (let index = from; index < from + rounds; index++) {
+      window.appendAssistantWithToolCalls(null, [
+        { id: `round-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      window.appendToolResult(`round-${index}`, 'code', `round ${index} ${'y'.repeat(300)}`);
+    }
+  }
+
+  it('C01 keeps the L4 memory summary in the projection after a provider-budget L3 collapse', async () => {
+    const window = await windowWithL4Summary();
+    appendRounds(window, 10);
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+
+    // produce 阶段真实预算：20 条 / 12000 token；L4 后再追加 10 轮即超出消息数上限。
+    const result = window.compactForProviderInputBudget({
+      maxProjectedMessages: 20,
+      maxProjectedTokens: 12_000,
+      stageProfile: 'produce',
+    });
+    const projected = window.toProjectedMessages();
+
+    expect(result.level).toBe(3);
+    expect(projected[0]?.content).toBe('produce goal');
+    expect(projected[1]?.metadata?.kind).toBe('l4_memory_summary');
+    expect(String(projected[1]?.content)).toContain('[[L4 Memory Summary]]');
+    // 折叠摘要只统计真正被折叠的工具轮次，记忆摘要不计入。
+    expect(String(projected[2]?.content)).toContain('[Collapsed: 8 tool rounds, 8 results]');
+    expect(projected.filter((m) => m.metadata?.kind === 'l4_memory_summary')).toHaveLength(1);
+    expect(JSON.stringify(projected)).toContain('round 9');
+    expect(result.afterMessageCount).toBe(projected.length);
+    expect(
+      info.mock.calls.some(([message]) =>
+        String(message).includes('1 runtime memory summary message(s) pinned')
+      )
+    ).toBe(true);
+  });
+
+  it('C01 keeps the L4 memory summary when it is the only message before the collapse boundary', async () => {
+    const window = await windowWithL4Summary();
+    appendRounds(window, 2);
+    const result = window.compactForProviderInputBudget({
+      maxProjectedMessages: 3,
+      maxProjectedTokens: 100_000,
+    });
+    const projected = window.toProjectedMessages();
+
+    expect(result.level).toBe(3);
+    expect(projected.some((m) => m.metadata?.kind === 'l4_memory_summary')).toBe(true);
+    expect(JSON.stringify(projected)).toContain('round 0');
+    expect(JSON.stringify(projected)).toContain('round 1');
+    // 边界前只有被钉住的摘要：折叠不能让投影多出一条 "[Collapsed: 0 …]"。
+    expect(projected).toHaveLength(window.toMessages().length);
+    expect(JSON.stringify(projected)).not.toContain('[Collapsed:');
+  });
+
+  it('C02 keeps the complete [evidence] tail when L1 snips an old tool result, idempotently', () => {
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('analyze prompt');
+    // 走真实入口：先经 limitToolResult（正常档 6000 配额）写入，尾注此时完整。
+    const raw = limitToolResult('code', `HEAD_SIGNAL\n${'x'.repeat(5000)}${evidenceAnnotation}`, {
+      maxChars: 6000,
+    });
+    expect(raw.endsWith(evidenceAnnotation)).toBe(true);
+    window.appendAssistantWithToolCalls(null, [{ id: 'old', name: 'code', args: {} }]);
+    window.appendToolResult('old', 'code', raw);
+    window.appendAssistantWithToolCalls(null, [{ id: 'new', name: 'code', args: {} }]);
+    window.appendToolResult('new', 'code', 'short recent result');
+
+    window.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const afterFirst = window.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(afterFirst).toContain('compaction snip');
+    expect(afterFirst).toContain('HEAD_SIGNAL');
+    expect(afterFirst.endsWith(evidenceAnnotation)).toBe(true);
+    expect(EVIDENCE_TAIL.test(afterFirst)).toBe(true);
+    expect(afterFirst.length).toBeLessThan(2000);
+
+    for (let cycle = 0; cycle < 3; cycle++) {
+      window.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    }
+    const afterFourth = window.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(afterFourth).toBe(afterFirst);
+  });
+
+  it('C02 keeps the [evidence] tail of the visible second-to-last round under a provider budget', () => {
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('record prompt');
+    for (const id of ['r1', 'r2', 'r3']) {
+      window.appendAssistantWithToolCalls(null, [{ id, name: 'code', args: { action: 'read' } }]);
+      const annotation = id === 'r2' ? evidenceAnnotation : '';
+      window.appendToolResult(id, 'code', `${id}:${'z'.repeat(5000)}${annotation}`);
+    }
+
+    const result = window.compactForProviderInputBudget({
+      maxProjectedMessages: 4,
+      maxProjectedTokens: 100_000,
+      stageProfile: 'record',
+    });
+    const projected = window.toProjectedMessages();
+    const r2 = projected.find((m) => m.toolCallId === 'r2');
+
+    expect(result.level).toBe(3);
+    expect(projected.some((m) => m.toolCallId === 'r1')).toBe(false);
+    expect(String(r2?.content)).toContain('compaction snip');
+    expect(String(r2?.content).endsWith(evidenceAnnotation)).toBe(true);
+  });
+
+  it('C02 caps a pathological evidence tail at 800 chars and stays under the L1 threshold', () => {
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('analyze prompt');
+    const hugeAnnotation = `\n\n[evidence] ${'E-1=src/a.ts:1-2; '.repeat(200)}`.trimEnd();
+    window.appendAssistantWithToolCalls(null, [{ id: 'old', name: 'code', args: {} }]);
+    window.appendToolResult('old', 'code', `${'q'.repeat(3000)}${hugeAnnotation}`);
+    window.appendAssistantWithToolCalls(null, [{ id: 'new', name: 'code', args: {} }]);
+    window.appendToolResult('new', 'code', 'short recent result');
+
+    window.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const afterFirst = window.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    expect(afterFirst).toContain('[evidence] E-1=src/a.ts:1-2');
+    expect(EVIDENCE_TAIL.test(afterFirst)).toBe(true);
+    expect(afterFirst.length).toBeLessThan(2000);
+    window.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    expect(window.toMessages().find((m) => m.toolCallId === 'old')?.content).toBe(afterFirst);
+  });
+
+  it('C03 reports cancelled when the provider rejects because the abort signal fired', async () => {
+    const window = new ContextWindow(10_000);
+    window.appendUserMessage('initial prompt');
+    window.appendUserMessage('older context to compact');
+    const before = structuredClone(window.toMessages());
+    const abortController = new AbortController();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+
+    const result = await window.compactL4(
+      {
+        chatWithTools: vi.fn(async () => {
+          abortController.abort();
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          throw err;
+        }),
+      },
+      { abortSignal: abortController.signal }
+    );
+
+    expect(result).toEqual({ level: 4, removed: 0, failed: true, cancelled: true });
+    expect(window.toMessages()).toEqual(before);
+    const lines = warn.mock.calls.map(([message]) => String(message));
+    expect(lines.some((line) => line.includes('L4 compact cancelled during generation'))).toBe(
+      true
+    );
+    expect(lines.some((line) => line.includes('L4 auto-compact failed'))).toBe(false);
+  });
+
+  it('C03 still reports a plain provider failure without cancelled', async () => {
+    const window = new ContextWindow(10_000);
+    window.appendUserMessage('initial prompt');
+    window.appendUserMessage('older context to compact');
+    const result = await window.compactL4(
+      {
+        chatWithTools: vi.fn(async () => {
+          throw new Error('provider unavailable');
+        }),
+      },
+      { abortSignal: new AbortController().signal }
+    );
+    expect(result).toEqual({ level: 4, removed: 0, failed: true });
+  });
+
+  function parseSnipMarker(out: string, tag: string) {
+    const match = out.match(
+      new RegExp(`\\n\\.\\.\\. \\[${tag}: (\\d+) of (\\d+) chars omitted\\] \\.\\.\\.\\n`)
+    );
+    expect(match).not.toBeNull();
+    return {
+      omitted: Number(match?.[1]),
+      total: Number(match?.[2]),
+      markerLength: match?.[0].length ?? 0,
+    };
+  }
+
+  it.each([
+    500, 200, 120, 80,
+  ])('C07 marker omitted count equals the actually omitted chars at budget %i', (budget) => {
+    const raw = `H${'a'.repeat(5103)}T`;
+    const out = limitToolResult('shell', raw, { maxChars: budget });
+    const { omitted, total, markerLength } = parseSnipMarker(out, 'tool-result snip');
+    expect(total).toBe(raw.length);
+    expect(omitted).toBe(raw.length - (out.length - markerLength));
+    expect(out.length).toBeLessThanOrEqual(budget);
+  });
+
+  it('C07 L1 compaction marker reports the actually omitted chars', () => {
+    const window = new ContextWindow(48_000);
+    window.appendUserMessage('analyze prompt');
+    const raw = `H${'b'.repeat(5103)}T`;
+    window.appendAssistantWithToolCalls(null, [{ id: 'old', name: 'code', args: {} }]);
+    window.appendToolResult('old', 'code', raw);
+    window.appendAssistantWithToolCalls(null, [{ id: 'new', name: 'code', args: {} }]);
+    window.appendToolResult('new', 'code', 'short recent result');
+    window.compactForProviderInputBudget({ maxProjectedMessages: 1, maxProjectedTokens: 1 });
+    const out = window.toMessages().find((m) => m.toolCallId === 'old')?.content ?? '';
+    const { omitted, markerLength } = parseSnipMarker(out, 'compaction snip');
+    expect(omitted).toBe(raw.length - (out.length - markerLength));
+    expect(out.length).toBeLessThanOrEqual(500);
+  });
+
+  it('C08 snips an oversized V1 structured search result head+tail instead of head-only', () => {
+    const input = {
+      matches: Array.from({ length: 3 }, (_, line) => ({
+        file: `src/f${line}.ts`,
+        line,
+        code: 'c'.repeat(400),
+      })),
+      total: 3,
+      searchedFiles: 99,
+    };
+    const out = limitToolResult('code', input, { maxChars: 600, maxMatches: 15 });
+    expect(out).toContain('tool-result snip');
+    expect(out).not.toContain('[truncated]');
+    expect(out).toContain('"searchedFiles":99}');
+    expect(out.length).toBeLessThanOrEqual(600);
+  });
+
+  it('C08 degrades single-line oversized file content to char-level head+tail with a diagnostic', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const content = `HEAD_LINE_START${'m'.repeat(5000)}TAIL_LINE_END`;
+    const out = limitToolResult('code', { content }, { maxChars: 600 });
+    const parsed = JSON.parse(out) as { content: string };
+    expect(parsed.content).toContain('HEAD_LINE_START');
+    expect(parsed.content).toContain('TAIL_LINE_END');
+    expect(parsed.content).toContain('tool-result snip');
+    expect(parsed.content.length).toBeLessThanOrEqual(600);
+    expect(
+      info.mock.calls.some(([message]) =>
+        String(message).includes('file content head+tail fell back to char-level snip')
+      )
+    ).toBe(true);
+  });
+});
