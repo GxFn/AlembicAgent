@@ -41,7 +41,7 @@ import {
   STRATEGY_PRODUCER,
   targetProducerSubmitCount,
 } from './exploration/ExplorationStrategies.js';
-import { NudgeGenerator } from './exploration/NudgeGenerator.js';
+import { NUDGE_DIRECTIVE_TEXTS, NudgeGenerator } from './exploration/NudgeGenerator.js';
 import type { ActiveTrace } from './exploration/PlanTracker.js';
 import { PlanTracker } from './exploration/PlanTracker.js';
 import { isSearchAction, SignalDetector } from './exploration/SignalDetector.js';
@@ -489,17 +489,19 @@ export class ExplorationTracker {
 
       // Analyst 管线: Markdown 分析报告
       // Bootstrap 管线: dimensionDigest JSON
+      // 固定指令句取自 NUDGE_DIRECTIVE_TEXTS：cleanFinalAnswer 按同一份原句识别并清除模型回显，
+      // 这里改写文字必须改常量表，不能内联新句子，否则回显会残留在最终答复里。
       const nudge =
         this.#pipelineType === 'analyst'
-          ? `请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式，包含具体文件路径、类名和代码模式，至少涵盖 3 个核心发现。\n\n` +
-            `**现在开始输出你的分析报告。**\n` +
-            `⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。`
+          ? `${NUDGE_DIRECTIVE_TEXTS.trackerAnalystReportLead}\n\n` +
+            `${NUDGE_DIRECTIVE_TEXTS.trackerStartReport}\n` +
+            NUDGE_DIRECTIVE_TEXTS.trackerNoCopyAnalysis
           : this.#pipelineType === 'producer'
-            ? `请**停止调用工具**，直接输出候选生产总结。说明已提交候选数量、被拒绝或跳过的原因，以及是否还有需要 Analyst 补证的输入缺口。\n` +
-              `⚠️ 严禁在回复中复制本条指令文字，只输出你自己的总结。`
-            : `请在回复中直接输出 dimensionDigest JSON 总结（用 \`\`\`json 包裹）：\n` +
-              `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结(100-200字)","candidateCount":${submitCount},"keyFindings":["关键发现"],"crossRefs":{},"gaps":["未覆盖方面"],"remainingTasks":[{"signal":"未处理的信号/主题","reason":"未完成原因","priority":"high|medium|low","searchHints":["建议搜索词"]}]}}\n\`\`\`\n> 如果所有信号都已覆盖，remainingTasks 留空数组 \`[]\`。\n` +
-              `⚠️ 严禁在回复中复制本条指令文字，只输出 JSON。`;
+            ? `${NUDGE_DIRECTIVE_TEXTS.trackerProducerSummaryLead}\n` +
+              NUDGE_DIRECTIVE_TEXTS.trackerNoCopySummary
+            : `${NUDGE_DIRECTIVE_TEXTS.trackerDigestLead}\n` +
+              `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结(100-200字)","candidateCount":${submitCount},"keyFindings":["关键发现"],"crossRefs":{},"gaps":["未覆盖方面"],"remainingTasks":[{"signal":"未处理的信号/主题","reason":"未完成原因","priority":"high|medium|low","searchHints":["建议搜索词"]}]}}\n\`\`\`\n${NUDGE_DIRECTIVE_TEXTS.trackerRemainingTasksNote}\n` +
+              NUDGE_DIRECTIVE_TEXTS.noCopyJson;
       return {
         isFinalAnswer: false,
         needsDigestNudge: true,

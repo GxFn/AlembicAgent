@@ -14,7 +14,8 @@
  * 设计原则:
  *   - 无状态（flags 从外部传入并返回更新）
  *   - 接受 state 快照，无循环依赖
- *   - Nudge 文本内联（未来可外置为 i18n JSON 模板）
+ *   - Nudge 文本内联（未来可外置为 i18n JSON 模板）；收尾/强制退出/防复制类固定指令句
+ *     统一登记在 NUDGE_DIRECTIVE_TEXTS，finalAnswer 按同一份原句识别模型回显
  *
  * @module NudgeGenerator
  */
@@ -71,6 +72,68 @@ const BOOTSTRAP_NUDGE_BUDGET = 4;
 /** Bootstrap 常规 nudge 的最小间隔轮次。 */
 const BOOTSTRAP_NUDGE_TTL_ROUNDS = 2;
 
+// ─── 注入指令原句（注入侧与清理侧单源） ─────────────────
+
+/**
+ * Runtime 注入给模型的固定指令原句（不含任何插值）。
+ *
+ * 边界：这些句子只由 NudgeGenerator / ExplorationTracker 写进模型上下文，模型偶尔会把它们原样
+ * 回显到最终答复。runtime/finalAnswer.ts 的 cleanFinalAnswer 只按本表逐句精确识别回显，不再用
+ * “行首祈使词 + 行尾关键词”的宽正则猜测，因此正常答复里的“请确保…工具”等建议句不会被误删。
+ *
+ * 维护规则：
+ *   - 修改收尾/强制退出/防复制类指令文字时只改这里，注入与清理自动同步；
+ *   - 新增此类固定指令必须登记到本表，否则模型回显会残留在答复中；
+ *   - 只登记不含插值的整句；带轮次、数量、工具名插值的句子只登记其固定部分。
+ *
+ * 本表不经公开子路径导出，只供 agent 内部注入侧与 finalAnswer 清理侧共用。
+ */
+export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
+  // ── 防复制护栏（convergence / budget_warning / RECORD / SUMMARIZE / reflection 共用） ──
+  noCopyBehavior: '⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。',
+  noCopyAnalysisOnly: '⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字，只输出你自己的分析内容。',
+  noCopyReflection: '⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字，用你自己的分析内容回答。',
+  noCopyJson: '⚠️ 严禁在回复中复制本条指令文字，只输出 JSON。',
+
+  // ── SUMMARIZE 阶段转换 nudge（buildTransitionNudge） ──
+  analystSummarizeLead: '你已完成结构化记录。请**停止调用工具**，直接输出你的**完整分析报告**。',
+  startReportStopTools: '**现在开始输出你的分析报告。不要再调用任何工具。**',
+  scanSummarizeStopTools: '请**停止调用工具**，直接输出你的分析总结（Markdown 格式）。',
+  stopToolsTextOnly: '⚠️ 不要再调用任何工具，直接输出文本。',
+  producerSummarizeLead:
+    '你已完成候选生产阶段。请**停止调用工具**，直接输出生产总结（Markdown 格式）。',
+  bootstrapSummarizeLead:
+    '你已完成分析探索。请在回复中直接输出 dimensionDigest JSON（用 ```json 包裹），包含以下字段：',
+  bootstrapRemainingTasksNote:
+    '> 如果所有信号都已覆盖，remainingTasks 留空数组 `[]`。如果有未来得及处理的信号，请在此标记，系统会在下次运行时续传。',
+
+  // ── 强制退出 nudge（#generateForceExit） ──
+  forceExitStopToolsReport: '你必须**立即停止工具调用**，在回复中输出你的**分析总结报告**。',
+  forceExitStartSummary: '**现在开始输出分析总结，不要再进行新的搜索或阅读。**',
+  forceExitNoCopyAnalysis: '⛔ 严禁在回复中复制或引用本条指令的任何文字，只输出你自己的分析。',
+  forceExitStopTools: '你必须**立即停止工具调用**。',
+  forceExitScanOutput: '请直接输出你的分析总结（Markdown 格式），列出已发现和未覆盖的关键模式。',
+  forceExitStopToolsTextOnly: '⛔ 不要再调用任何工具，直接输出文本。',
+  forceExitDigestOutput:
+    '请在回复中直接输出 dimensionDigest JSON 总结（用 ```json 包裹），不要再调用任何工具。',
+  forceExitRemainingTasksNote: '> remainingTasks: 列出未来得及处理的信号。已覆盖则留空 `[]`。',
+  forceExitNoCopyJson: '⛔ 严禁在回复中复制本条指令文字，只输出 JSON。',
+
+  // ── ExplorationTracker.onTextResponse 终结 nudge ──
+  trackerAnalystReportLead:
+    '请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式，包含具体文件路径、类名和代码模式，至少涵盖 3 个核心发现。',
+  trackerStartReport: '**现在开始输出你的分析报告。**',
+  trackerNoCopyAnalysis: '⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。',
+  trackerProducerSummaryLead:
+    '请**停止调用工具**，直接输出候选生产总结。说明已提交候选数量、被拒绝或跳过的原因，以及是否还有需要 Analyst 补证的输入缺口。',
+  trackerNoCopySummary: '⚠️ 严禁在回复中复制本条指令文字，只输出你自己的总结。',
+  trackerDigestLead: '请在回复中直接输出 dimensionDigest JSON 总结（用 ```json 包裹）：',
+  trackerRemainingTasksNote: '> 如果所有信号都已覆盖，remainingTasks 留空数组 `[]`。',
+} as const);
+
+/** 文件内简写：注入侧按名引用指令原句 */
+const DIRECTIVE = NUDGE_DIRECTIVE_TEXTS;
+
 export class NudgeGenerator {
   // ── 一次性 flags（生命周期内最多触发一次的 nudge） ──
   #convergenceNudged = false;
@@ -117,7 +180,7 @@ export class NudgeGenerator {
             `Producer 阶段已连续 ${m.roundsSinceSubmit} 轮没有有效新提交。` +
             `如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出总结 JSON；` +
             `否则只调用 ${state.submitToolName} 提交尚未提交且不重复的候选。\n` +
-            `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
+            DIRECTIVE.noCopyBehavior,
         });
       }
       return this.#emitNudge(state, {
@@ -126,7 +189,7 @@ export class NudgeGenerator {
           `你已经充分探索了项目代码（${m.uniqueFiles.size} 个文件，${m.uniquePatterns.size} 次不同搜索，${m.uniqueQueries.size} 次结构化查询）。` +
           `最近 ${m.roundsSinceNewInfo} 轮没有发现新信息，建议开始撰写分析总结。\n` +
           `如果你确信还有重要方面未覆盖，可以继续探索（剩余 ${b.maxIterations - m.iteration} 轮）；否则请直接输出你的分析发现。\n` +
-          `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
+          DIRECTIVE.noCopyBehavior,
       });
     }
 
@@ -142,7 +205,7 @@ export class NudgeGenerator {
         text:
           `📌 进度提醒：你已使用 ${m.iteration}/${b.maxIterations} 轮次（${Math.round((m.iteration / b.maxIterations) * 100)}%）。` +
           `请确保核心方面已覆盖，开始准备总结。剩余 ${b.maxIterations - m.iteration} 轮，优先填补最重要的分析空白。\n` +
-          `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`,
+          DIRECTIVE.noCopyBehavior,
       });
     }
 
@@ -174,7 +237,7 @@ export class NudgeGenerator {
         `本阶段不要输出自然语言正文，必须只调用 note_finding({ finding, evidenceRefs, importance }) 记录核心发现；按当前证据量至少记录 ${targetFindingCount} 条，每次工具调用记录 1 条发现。\n` +
         `note_finding 是 QualityGate 的重要质量依据；evidenceRefs 只能引用工具返回尾部 [evidence] 标注的台账条目 id（如 ["E-3","E-7@5-12"]），手写 file:line 会被拒收。缺少或不足会导致 QualityGate retry。\n` +
         `importance ≥7 的发现必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs——为什么这样设计/边界在哪/越界会怎样/换来了什么），内容须与引用证据一致；带深度槽的发现按 1.5 条计入配额，读不到真实证据的槽位留空。\n` +
-        `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字。`
+        DIRECTIVE.noCopyBehavior
       );
     }
 
@@ -183,38 +246,38 @@ export class NudgeGenerator {
       // Analyst 管线: 纯文本分析报告
       if (pipelineType === 'analyst') {
         return (
-          `你已完成结构化记录。请**停止调用工具**，直接输出你的**完整分析报告**。\n\n` +
+          `${DIRECTIVE.analystSummarizeLead}\n\n` +
           `要求：\n` +
           `- 用 Markdown 格式组织内容（二级/三级标题）\n` +
           `- 核心「已确认」章节只能来自已记录的 note_finding；不要把未调用 note_finding 的模式、信号或候选主题写成核心发现\n` +
           `- 每个核心发现都要对应一条已记录 note_finding，并给出证据（文件路径 + 代码片段或行为描述）\n` +
           `- 如有未结构化记录的信号，只能在末尾用「## 待探索」或「## 未结构化记录」列出，不能混入已确认核心章节\n\n` +
-          `**现在开始输出你的分析报告。不要再调用任何工具。**\n` +
-          `⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字，只输出你自己的分析内容。`
+          `${DIRECTIVE.startReportStopTools}\n` +
+          DIRECTIVE.noCopyAnalysisOnly
         );
       }
       // Scan 管线: 纯文本总结
       if (pipelineType === 'scan') {
         return (
           `你已通过 knowledge({ action: "submit" }) 提交了 ${submitCount} 个知识候选。` +
-          `请**停止调用工具**，直接输出你的分析总结（Markdown 格式）。\n` +
-          `⚠️ 不要再调用任何工具，直接输出文本。`
+          `${DIRECTIVE.scanSummarizeStopTools}\n` +
+          DIRECTIVE.stopToolsTextOnly
         );
       }
       // Producer: 候选生产总结，不产出 bootstrap dimensionDigest
       if (pipelineType === 'producer') {
         return (
-          `你已完成候选生产阶段。请**停止调用工具**，直接输出生产总结（Markdown 格式）。\n` +
+          `${DIRECTIVE.producerSummarizeLead}\n` +
           `说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充结构化发现。\n` +
           `不要从 Analyst 最终 Markdown 摘要里新增候选主题；未结构化记录的主题只能列为 Analyst 输入缺口。\n` +
-          `⚠️ 不要再调用任何工具，直接输出文本。`
+          DIRECTIVE.stopToolsTextOnly
         );
       }
       // Bootstrap: 使用 dimensionDigest JSON (供维度编排消费)
       return (
-        `你已完成分析探索。请在回复中直接输出 dimensionDigest JSON（用 \`\`\`json 包裹），包含以下字段：\n` +
-        `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结(100-200字)","candidateCount":${submitCount},"keyFindings":["关键发现"],"crossRefs":{},"gaps":["未覆盖方面"],"remainingTasks":[{"signal":"未处理的信号/主题","reason":"未完成原因(如:提交上限已达)","priority":"high|medium|low","searchHints":["建议搜索词"]}]}}\n\`\`\`\n> 如果所有信号都已覆盖，remainingTasks 留空数组 \`[]\`。如果有未来得及处理的信号，请在此标记，系统会在下次运行时续传。\n` +
-        `⚠️ 严禁在回复中复制本条指令文字，只输出 JSON。`
+        `${DIRECTIVE.bootstrapSummarizeLead}\n` +
+        `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结(100-200字)","candidateCount":${submitCount},"keyFindings":["关键发现"],"crossRefs":{},"gaps":["未覆盖方面"],"remainingTasks":[{"signal":"未处理的信号/主题","reason":"未完成原因(如:提交上限已达)","priority":"high|medium|low","searchHints":["建议搜索词"]}]}}\n\`\`\`\n${DIRECTIVE.bootstrapRemainingTasksNote}\n` +
+        DIRECTIVE.noCopyJson
       );
     }
 
@@ -285,13 +348,13 @@ export class NudgeGenerator {
       return {
         type: 'force_exit',
         text:
-          `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。你必须**立即停止工具调用**，在回复中输出你的**分析总结报告**。\n\n` +
+          `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。${DIRECTIVE.forceExitStopToolsReport}\n\n` +
           `要求：\n` +
           `- 用自然语言 Markdown 格式\n` +
           `- 核心已确认发现只能来自已记录的 note_finding，并包含具体文件路径、类名、代码模式\n` +
           `- 未调用 note_finding 的信号只能在「## 未覆盖」或「## 未结构化记录」章节列出\n\n` +
-          `**现在开始输出分析总结，不要再进行新的搜索或阅读。**\n` +
-          `⛔ 严禁在回复中复制或引用本条指令的任何文字，只输出你自己的分析。`,
+          `${DIRECTIVE.forceExitStartSummary}\n` +
+          DIRECTIVE.forceExitNoCopyAnalysis,
       };
     }
     // Scan 管线: 纯文本总结, 不需要 dimensionDigest
@@ -299,19 +362,19 @@ export class NudgeGenerator {
       return {
         type: 'force_exit',
         text:
-          `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。你必须**立即停止工具调用**。\n\n` +
+          `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。${DIRECTIVE.forceExitStopTools}\n\n` +
           `已通过 knowledge({ action: "submit" }) 提交了 ${submitCount} 个知识候选。` +
-          `请直接输出你的分析总结（Markdown 格式），列出已发现和未覆盖的关键模式。\n` +
-          `⛔ 不要再调用任何工具，直接输出文本。`,
+          `${DIRECTIVE.forceExitScanOutput}\n` +
+          DIRECTIVE.forceExitStopToolsTextOnly,
       };
     }
     // Bootstrap 策略: 使用 dimensionDigest JSON (供维度编排消费)
     return {
       type: 'force_exit',
       text:
-        `⚠️ 你已使用 ${m.iteration}/${b.maxIterations} 轮次，**必须立即结束**。请在回复中直接输出 dimensionDigest JSON 总结（用 \`\`\`json 包裹），不要再调用任何工具。\n` +
-        `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结","candidateCount":${submitCount},"keyFindings":["发现"],"crossRefs":{},"gaps":["缺口"],"remainingTasks":[{"signal":"未处理信号","reason":"轮次耗尽","priority":"high","searchHints":["搜索词"]}]}}\n\`\`\`\n> remainingTasks: 列出未来得及处理的信号。已覆盖则留空 \`[]\`。\n` +
-        `⛔ 严禁在回复中复制本条指令文字，只输出 JSON。`,
+        `⚠️ 你已使用 ${m.iteration}/${b.maxIterations} 轮次，**必须立即结束**。${DIRECTIVE.forceExitDigestOutput}\n` +
+        `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结","candidateCount":${submitCount},"keyFindings":["发现"],"crossRefs":{},"gaps":["缺口"],"remainingTasks":[{"signal":"未处理信号","reason":"轮次耗尽","priority":"high","searchHints":["搜索词"]}]}}\n\`\`\`\n${DIRECTIVE.forceExitRemainingTasksNote}\n` +
+        DIRECTIVE.forceExitNoCopyJson,
     };
   }
 
@@ -390,7 +453,7 @@ export class NudgeGenerator {
       parts.push(`\n请评估:\n1. 已提交的候选是否覆盖了核心发现？\n2. 是否有高价值知识点被遗漏？`);
     }
 
-    parts.push(`\n⚠️ 以上是行为指令，严禁在回复中复制或引用这段文字，用你自己的分析内容回答。`);
+    parts.push(`\n${DIRECTIVE.noCopyReflection}`);
     const reflectionText = parts.join('\n');
     trace?.setReflection?.(reflectionText);
 
