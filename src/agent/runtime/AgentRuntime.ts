@@ -34,11 +34,13 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import Logger from '@alembic/core/logging';
+import type { ModelDef } from '#ai/registry/ModelDefs.js';
 import {
   isTextCompatToolCallId,
   NATIVE_TOOL_CALL_SOURCE,
   TEXT_COMPAT_CALL_SOURCE,
 } from '#ai/registry/ModelQuirks.js';
+import { getModelRegistry } from '#ai/registry/ModelRegistry.js';
 import { observeSafely } from '#shared/observers.js';
 import { runOperation } from '#shared/operation.js';
 import { queryToolSchemas } from '#tools/catalog/schemaQuery.js';
@@ -89,7 +91,9 @@ import { continueResult, LLMResultType } from './LLMResultType.js';
 import { LoopContext } from './LoopContext.js';
 import {
   LLM_INPUT_TOO_LARGE_CODE,
+  type ProviderInputLimitResolution,
   resolveProviderInputBudget,
+  resolveProviderInputLimit,
   selectLlmInputTools,
   validateLlmInputSize,
 } from './llmInput.js';
@@ -198,6 +202,11 @@ export class AgentRuntime {
   #groundingEnforcement: GroundingEnforcement;
   /** 统一事件钩子系统 */
   #hookSystem: HookSystem;
+  /**
+   * 每个 loop 的输入上限解析结果（I14 来源诊断）。按 LoopContext 弱引用保存：同一 runtime 可能
+   * 并发跑多个 reactLoop，不能用单个实例字段；也不往公开的 budget/LoopContext 上加字段。
+   */
+  #providerInputLimits = new WeakMap<LoopContext, ProviderInputLimitResolution>();
   #executionAbortController: AbortController | null = null;
   #abortEventPublished = false;
 
@@ -702,12 +711,26 @@ export class AgentRuntime {
     messages.appendUserMessage(prompt);
 
     // 预算
-    const budget = budgetOverride ||
+    const baseBudget = budgetOverride ||
       this.policies.getBudget() || {
         maxIterations: 20,
         maxTokens: 4096,
         temperature: 0.7,
       };
+    // 输入长度上限（I14）：显式 maxProviderInputTokens 优先，其次模型注册表 contextWindow 减输出预留，
+    // 都没有时保留 128k 默认。注册表来源写进本 loop 的预算副本（不改调用方传入的 budgetOverride
+    // 或策略返回的对象），输入长度守卫因此按模型真实窗口拒绝，而不是让小窗口模型在 provider 侧失败。
+    // 输出预留与 #callLLM 的实际请求同口径：budget.maxTokens ?? (system ? 8192 : 4096)。
+    const providerInputLimit = resolveProviderInputLimit({
+      budget: baseBudget,
+      registeredModel: lookupRegisteredModelDef(this.#modelRef),
+      defaultMaxOutputTokens: source === 'system' ? 8192 : 4096,
+    });
+    const budget =
+      providerInputLimit.source === 'model-registry'
+        ? { ...baseBudget, maxProviderInputTokens: providerInputLimit.maxTokens }
+        : baseBudget;
+    this.#logProviderInputLimit(providerInputLimit);
 
     // 系统源: 注入轮次预算 (委托 SystemPromptBuilder)
     baseSystemPrompt = SystemPromptBuilder.injectBudget(baseSystemPrompt, {
@@ -850,6 +873,7 @@ export class AgentRuntime {
       abortSignal: (abortSignal as AbortSignal) || null,
       diagnostics: diagnosticsCollector,
     });
+    this.#providerInputLimits.set(ctx, providerInputLimit);
 
     ctx.exitController = createExitController(ctx, this.policies);
 
@@ -1199,7 +1223,14 @@ export class AgentRuntime {
         requestedToolChoice: toolChoice,
       });
       const llmInputMeasurement = measureLlmInputAssembly(llmInputAssembly);
-      const llmInputValidation = validateLlmInputSize(ctx.budget, llmInputMeasurement);
+      // 上限来源随 loop 在 #initLoop 解析；诊断消息与日志都带 limitSource，宿主能区分
+      // “模型窗口偏小”（model-registry）、“显式覆盖”（explicit）与“未登记模型的 128k 默认”（default）。
+      const providerInputLimit = this.#providerInputLimits.get(ctx);
+      const llmInputValidation = validateLlmInputSize(
+        ctx.budget,
+        llmInputMeasurement,
+        providerInputLimit?.source
+      );
       if (!llmInputValidation.ok) {
         ctx.diagnostics?.warn({
           code: llmInputValidation.code,
@@ -1212,6 +1243,10 @@ export class AgentRuntime {
             code: llmInputValidation.code,
             estimatedTokens: llmInputValidation.estimatedTokens,
             maxTokens: llmInputValidation.maxTokens,
+            limitSource: llmInputValidation.limitSource,
+            registryModelId: providerInputLimit?.registryModelId ?? null,
+            contextWindow: providerInputLimit?.contextWindow ?? null,
+            outputReserveTokens: providerInputLimit?.outputReserveTokens ?? null,
           }
         );
         if (!ctx.isSystem) {
@@ -2248,6 +2283,43 @@ export class AgentRuntime {
   }
 
   /**
+   * 记录本 loop 输入上限的来源（I14）。每个 loop 一条 info，写清选择路径与关键输入；
+   * 两个降级分支额外 warn：显式值非法被忽略、输出预留吃掉整个窗口而跳过预留。
+   * default 来源说明 modelRef 未在注册表登记（或 provider 未知），守卫保留与模型无关的 128k。
+   */
+  #logProviderInputLimit(limit: ProviderInputLimitResolution) {
+    if (limit.invalidExplicitValue !== undefined) {
+      this.logger.warn(
+        '[AgentRuntime] explicit maxProviderInputTokens ignored: not a positive finite number',
+        {
+          modelRef: this.#modelRef,
+          invalidExplicitValue: limit.invalidExplicitValue,
+          fallbackSource: limit.source,
+        }
+      );
+    }
+    if (limit.outputReserveSkipped) {
+      this.logger.warn(
+        '[AgentRuntime] provider input limit skipped output reserve: reserve >= model context window',
+        {
+          modelRef: this.#modelRef,
+          registryModelId: limit.registryModelId ?? null,
+          contextWindow: limit.contextWindow ?? null,
+          maxProviderInputTokens: limit.maxTokens,
+        }
+      );
+    }
+    this.logger.info('[AgentRuntime] provider input limit resolved', {
+      modelRef: this.#modelRef,
+      source: limit.source,
+      maxProviderInputTokens: limit.maxTokens,
+      registryModelId: limit.registryModelId ?? null,
+      contextWindow: limit.contextWindow ?? null,
+      outputReserveTokens: limit.outputReserveTokens ?? null,
+    });
+  }
+
+  /**
    * 收集所有 Agent Skill 的工具白名单。
    * 空 tools 表示该技能不开放工具；全量工具必须通过显式 action space 表达。
    */
@@ -2549,6 +2621,25 @@ function recordAbortRecoveryDiagnostic(ctx: LoopContext, message: string): void 
     code: 'ABORT_RECOVERY_RECORDED',
     message,
   });
+}
+
+/**
+ * 按 modelRef 查模型注册表，供输入长度上限（I14）使用，口径与 LLMGateway / ContextWindow 一致：
+ * - 'provider:apiModelId' 只经 registry.resolve：provider 先归一别名；未知 provider（含部署选择 auto）
+ *   返回 undefined，不跨 provider 猜测，也不用 resolveOrCreate 的动态 128k 定义冒充“可信注册值”；
+ * - 无 provider 前缀的裸 apiModelId 用 findByApiModelId（内置表保证 apiModelId 全局唯一）。
+ * 查不到时由 resolveProviderInputLimit 保留 128k 默认，#logProviderInputLimit 记录 source=default。
+ */
+function lookupRegisteredModelDef(modelRef: string): ModelDef | undefined {
+  if (!modelRef) {
+    return undefined;
+  }
+  const registry = getModelRegistry();
+  const separator = modelRef.indexOf(':');
+  if (separator > 0) {
+    return registry.resolve(modelRef.slice(0, separator), modelRef.slice(separator + 1));
+  }
+  return registry.findByApiModelId(modelRef);
 }
 
 function readPositiveBudgetNumber(value: unknown): number | null {
