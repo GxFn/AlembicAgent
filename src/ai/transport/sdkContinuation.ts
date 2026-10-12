@@ -92,9 +92,9 @@ export function replaySdkContinuation(
       () => Logger.getInstance().warn(message),
       () => undefined
     );
-  const reject = (reason: string) => {
+  const reject = (reason: string, detail = '') => {
     warn(
-      `[ai-sdk] continuation_filtered provider=${context.provider} model=${context.model} reason=${reason}; native metadata omitted`
+      `[ai-sdk] continuation_filtered provider=${context.provider} model=${context.model} reason=${reason}${detail}; native metadata omitted`
     );
     return undefined;
   };
@@ -121,7 +121,10 @@ export function replaySdkContinuation(
         return true;
       }
     } catch (err: unknown) {
-      void err;
+      // 当前投影无法序列化（如工具参数含 BigInt/循环引用）不是“投影被改动”；单独归类以免排障方向错误。
+      // 仍按拒绝处理：无法证明绑定一致时不得回传原生元数据。只记录错误类名，不记录参数内容。
+      reject('projection_hash_failed', ` error=${err instanceof Error ? err.name : 'unknown'}`);
+      return false;
     }
     reject('projection_binding_changed');
     return false;

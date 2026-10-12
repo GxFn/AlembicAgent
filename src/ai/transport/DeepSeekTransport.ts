@@ -160,7 +160,18 @@ export class DeepSeekTransport extends LLMTransport {
       { Authorization: `Bearer ${this.apiKey}` },
       opts.abortSignal
     );
-    const items = Array.isArray(data.data) ? data.data : [];
+    if (!Array.isArray(data.data)) {
+      // 2xx 但缺少 data 数组属于上游/代理返回坏 body，与 SDK 路径同归 LLM_INVALID_RESPONSE；
+      // 不再按空数组继续，否则会被误报成“数量不符”。诊断只记录形状类别，不记录正文。
+      const shape = data.data === null ? 'null' : typeof data.data;
+      Logger.getInstance().warn(
+        `[DeepSeekTransport] embedding_data_missing dataType=${shape} requested=${texts.length}; classified LLM_INVALID_RESPONSE`
+      );
+      throw Object.assign(new Error(`${this.providerId} embedding response has no data array`), {
+        code: 'LLM_INVALID_RESPONSE',
+      });
+    }
+    const items: unknown[] = data.data;
     if (items.length !== texts.length) {
       throw new Error('Embedding count does not match input count');
     }

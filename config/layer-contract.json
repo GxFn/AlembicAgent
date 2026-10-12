@@ -150,7 +150,12 @@
         "src/ai/transport/sdkProtocol.ts",
         "src/ai/transport/sdkContext.ts"
       ],
-      "src/ai/transport/sdkErrors.ts": ["@ai-sdk/provider", "src/ai/errors.ts"],
+      "src/ai/transport/sdkErrors.ts": [
+        "@ai-sdk/provider",
+        "@alembic/core/logging",
+        "src/shared/observers.ts",
+        "src/ai/errors.ts"
+      ],
       "src/tools/kernel/toolSchema.ts": [],
       "src/tools/kernel/toolSelection.ts": [],
       "src/tools/kernel/availability.ts": [],

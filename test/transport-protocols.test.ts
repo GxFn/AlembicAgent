@@ -1,9 +1,12 @@
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { resolveModelQuirks } from '../src/ai/registry/ModelQuirks.js';
+import { classifyLlmError } from '../src/ai/shared/errorClassify.js';
 import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
+import { __testingProxyDispatcherCache } from '../src/ai/transport/LLMTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { jsonResponse, mockJsonFetch as mockFetch, responsesText } from './helpers/mockFetch.js';
 
@@ -660,6 +663,169 @@ describe('DeepSeek compatibility POST failure metadata', () => {
     expect((error as Error).message).not.toContain('cleanup diagnostic unavailable');
     expect(cancel).toHaveBeenCalledOnce();
     expect(fetch).toHaveBeenCalledOnce();
+  });
+});
+
+describe('DeepSeek compatibility POST 2xx body validation', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function stubRawResponse(body: string | null, contentType: string) {
+    const fetchMock = vi.fn(
+      async () => new Response(body, { status: 200, headers: { 'content-type': contentType } })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it.each([
+    {
+      label: 'html login page',
+      body: '<html><head>PRIVATE_GATEWAY_LOGIN</head></html>',
+      contentType: 'text/html',
+      reason: 'invalid_json',
+    },
+    { label: 'JSON null', body: 'null', contentType: 'application/json', reason: 'not_object' },
+    { label: 'JSON array', body: '[]', contentType: 'application/json', reason: 'not_object' },
+    { label: 'empty body', body: '', contentType: 'application/json', reason: 'invalid_json' },
+  ])('classifies a 2xx $label body as LLM_INVALID_RESPONSE without leaking the body', async ({
+    body,
+    contentType,
+    reason,
+  }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    stubRawResponse(body, contentType);
+    const transport = new DeepSeekTransport({
+      apiKey: 'fixture',
+      baseUrl: 'https://embedding.invalid/v1',
+    });
+
+    const error = await transport.embed(['fixture']).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).name).toBe('Error');
+    expect(error).toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
+    expect((error as Error).message).toContain('HTTP 200');
+    expect((error as Error).message).not.toContain('<html');
+    expect((error as Error).message).not.toContain('PRIVATE_GATEWAY_LOGIN');
+    expect((error as Error).message).not.toContain('embedding.invalid');
+    expect((error as { cause?: unknown }).cause).toBeUndefined();
+    // 与 SDK 路径的 2xx 坏 body 语义对齐：计入熔断，但不重试。
+    expect(classifyLlmError(error)).toMatchObject({ isServerError: true, isRetryable: false });
+    const messages = warn.mock.calls.map(([message]) => String(message));
+    const diagnostic = messages.find((message) => message.includes('invalid_response_body'));
+    expect(diagnostic).toContain('provider=deepseek');
+    expect(diagnostic).toContain('status=200');
+    expect(diagnostic).toContain(`contentType=${contentType}`);
+    expect(diagnostic).toContain(`reason=${reason}`);
+    expect(messages.join('\n')).not.toContain('PRIVATE_GATEWAY_LOGIN');
+    expect(messages.join('\n')).not.toContain('embedding.invalid');
+  });
+
+  it.each([
+    { label: 'missing', payload: { object: 'list' } },
+    { label: 'null', payload: { data: null } },
+    { label: 'object', payload: { data: { index: 0, embedding: [1] } } },
+  ])('classifies a JSON object with $label data as LLM_INVALID_RESPONSE', async ({ payload }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(payload))
+    );
+    const transport = new DeepSeekTransport({ apiKey: 'fixture' });
+
+    const error = await transport.embed(['fixture']).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
+    expect((error as Error).message).not.toContain('Embedding count does not match');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('embedding_data_missing'));
+  });
+
+  it('does not retry a 2xx bad body through the gateway', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const fetchMock = stubRawResponse('<html>PRIVATE_GATEWAY_LOGIN</html>', 'text/html');
+    const gateway = new LLMGateway({
+      providers: { deepseek: { apiKey: 'fixture' } },
+      maxRetries: 2,
+    });
+
+    await expect(gateway.embed('deepseek:deepseek-chat', ['fixture'])).rejects.toMatchObject({
+      code: 'LLM_INVALID_RESPONSE',
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a mid-body stream failure out of the invalid-response classification', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(
+                  Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+                );
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          )
+      )
+    );
+    const transport = new DeepSeekTransport({ apiKey: 'fixture' });
+
+    const error = await transport.embed(['fixture']).catch((err: unknown) => err);
+
+    // 读取正文时的连接中断仍是网络事实，不能被改写成上游坏 body。
+    expect(error).toBeInstanceOf(Error);
+    expect((error as { code?: string }).code).not.toBe('LLM_INVALID_RESPONSE');
+    expect(classifyLlmError(error)).toMatchObject({ isNetworkError: true, isRetryable: true });
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('invalid_response_body'));
+  });
+});
+
+describe('LLMTransport proxy dispatcher cleanup diagnostics', () => {
+  afterEach(() => {
+    __testingProxyDispatcherCache.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('records a debug diagnostic without proxy URL or credentials when dispatcher close fails', async () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    __testingProxyDispatcherCache.set('http://PRIVATE_USER:PRIVATE_PASS@proxy.invalid:8080', {
+      close: () => Promise.reject(new TypeError('PRIVATE_CLOSE_DETAIL')),
+    });
+
+    __testingProxyDispatcherCache.clear();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const messages = debug.mock.calls.map(([message]) => String(message));
+    const diagnostic = messages.find((message) =>
+      message.includes('proxy_dispatcher_close_failed')
+    );
+    expect(diagnostic).toContain('[LLMTransport] proxy_dispatcher_close_failed');
+    expect(diagnostic).toContain('reason=TypeError');
+    expect(messages.join('\n')).not.toMatch(
+      /PRIVATE_USER|PRIVATE_PASS|proxy\.invalid|PRIVATE_CLOSE_DETAIL/
+    );
+  });
+
+  it('stays silent when dispatcher close succeeds', async () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    __testingProxyDispatcherCache.set('http://proxy.invalid:8080', {
+      close: () => Promise.resolve(),
+    });
+
+    __testingProxyDispatcherCache.clear();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(debug).not.toHaveBeenCalledWith(
+      expect.stringContaining('proxy_dispatcher_close_failed')
+    );
   });
 });
 

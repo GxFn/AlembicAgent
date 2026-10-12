@@ -1,3 +1,10 @@
+import {
+  APICallError,
+  InvalidArgumentError,
+  InvalidPromptError,
+  TypeValidationError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/ContextWindow.js';
@@ -10,8 +17,12 @@ import { ClaudeProvider } from '../src/ai/providers/ClaudeProvider.js';
 import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
 import { GoogleGeminiProvider } from '../src/ai/providers/GoogleGeminiProvider.js';
 import { OpenAiProvider } from '../src/ai/providers/OpenAiProvider.js';
+import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
 import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
+import { sdkProjectionHash } from '../src/ai/transport/sdkContext.js';
+import { replaySdkContinuation } from '../src/ai/transport/sdkContinuation.js';
+import { normalizeSdkError } from '../src/ai/transport/sdkErrors.js';
 import { CapabilityCatalog } from '../src/tools/catalog/CapabilityCatalog.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { Capability } from '../src/tools/runtime/toolsets/Capability.js';
@@ -996,5 +1007,229 @@ describe('native SDK provider contracts', () => {
         cacheHitTokens: 2,
       },
     });
+  });
+});
+
+describe('SDK error normalization diagnostics', () => {
+  function diagnostics(warn: { mock: { calls: unknown[][] } }): string[] {
+    return warn.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('sdk_error_normalized'));
+  }
+
+  it('records the rejected argument name for a local SDK rejection without prompt text', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const normalized = normalizeSdkError(
+      new InvalidArgumentError({
+        argument: 'temperature',
+        message: 'PRIVATE_PROMPT_TEXT temperature out of range',
+      }),
+      'deepseek'
+    );
+
+    expect(normalized).toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    expect(normalized.message).toBe('deepseek SDK request rejected (AI_InvalidArgumentError)');
+    // 不挂原始 SDK 错误：reliability 首次失败日志会打印 cause.message。
+    expect(normalized.cause).toBeUndefined();
+    const [diagnostic, ...rest] = diagnostics(warn);
+    expect(rest).toEqual([]);
+    expect(diagnostic).toContain('provider=deepseek');
+    expect(diagnostic).toContain('kind=request_rejected');
+    expect(diagnostic).toContain('code=LLM_INVALID_REQUEST');
+    expect(diagnostic).toContain('error=AI_InvalidArgumentError');
+    expect(diagnostic).toContain('argument=temperature');
+    expect(diagnostic).not.toContain('PRIVATE_PROMPT_TEXT');
+  });
+
+  it('records only the class name for an invalid prompt', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const normalized = normalizeSdkError(
+      new InvalidPromptError({
+        prompt: { messages: [{ role: 'user', content: 'PRIVATE_PROMPT_TEXT' }] },
+        message: 'PRIVATE_PROMPT_TEXT is invalid',
+      }),
+      'claude'
+    );
+
+    expect(normalized).toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    expect(normalized.cause).toBeUndefined();
+    const [diagnostic] = diagnostics(warn);
+    expect(diagnostic).toContain('provider=claude');
+    expect(diagnostic).toContain('error=AI_InvalidPromptError');
+    expect(warn.mock.calls.flat().map(String).join('\n')).not.toContain('PRIVATE_PROMPT_TEXT');
+  });
+
+  it('records the unsupported functionality as a sanitized single token', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const normalized = normalizeSdkError(
+      new UnsupportedFunctionalityError({ functionality: 'toolChoice none\nforged=1' }),
+      'google'
+    );
+
+    expect(normalized).toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    const [diagnostic] = diagnostics(warn);
+    expect(diagnostic).toContain('error=AI_UnsupportedFunctionalityError');
+    expect(diagnostic).toContain('functionality=toolChoice_none_forged_1');
+    expect(diagnostic).not.toContain('\n');
+  });
+
+  it('records the validated field path of a response rejection without the value', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const normalized = normalizeSdkError(
+      new TypeValidationError({
+        value: { body: 'PRIVATE_RESPONSE_BODY' },
+        cause: new Error('PRIVATE_CAUSE_DETAIL'),
+        context: { field: 'choices[0].message', entityName: 'lookup', entityId: 'PRIVATE_ID' },
+      }),
+      'deepseek'
+    );
+
+    expect(normalized).toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
+    expect(normalized.message).toBe('deepseek SDK response rejected (AI_TypeValidationError)');
+    expect(normalized.cause).toBeUndefined();
+    const [diagnostic] = diagnostics(warn);
+    expect(diagnostic).toContain('kind=response_rejected');
+    expect(diagnostic).toContain('code=LLM_INVALID_RESPONSE');
+    expect(diagnostic).toContain('error=AI_TypeValidationError');
+    expect(diagnostic).toContain('field=choices[0].message');
+    expect(diagnostic).toContain('entity=lookup');
+    expect(diagnostic).not.toMatch(/PRIVATE_RESPONSE_BODY|PRIVATE_CAUSE_DETAIL|PRIVATE_ID/);
+  });
+
+  it('records status and nested validation class for a 2xx SDK response validation failure', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const normalized = normalizeSdkError(
+      new APICallError({
+        message: 'Invalid JSON response PRIVATE_RESPONSE_BODY',
+        url: 'https://PRIVATE_HOST.invalid/v1/chat/completions',
+        requestBodyValues: { messages: ['PRIVATE_PROMPT_TEXT'] },
+        statusCode: 200,
+        responseBody: 'PRIVATE_RESPONSE_BODY',
+        cause: new TypeValidationError({
+          value: { body: 'PRIVATE_RESPONSE_BODY' },
+          cause: new Error('PRIVATE_CAUSE_DETAIL'),
+          context: { field: 'choices' },
+        }),
+      }),
+      'deepseek'
+    );
+
+    expect(normalized).toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
+    expect(normalized.message).toBe('deepseek SDK response validation failed (HTTP 200)');
+    expect(normalized.cause).toBeUndefined();
+    const [diagnostic] = diagnostics(warn);
+    expect(diagnostic).toContain('kind=response_validation_failed');
+    expect(diagnostic).toContain('status=200');
+    expect(diagnostic).toContain('error=AI_APICallError');
+    expect(diagnostic).toContain('cause=AI_TypeValidationError');
+    expect(diagnostic).toContain('field=choices');
+    expect(warn.mock.calls.flat().map(String).join('\n')).not.toMatch(
+      /PRIVATE_RESPONSE_BODY|PRIVATE_PROMPT_TEXT|PRIVATE_HOST|PRIVATE_CAUSE_DETAIL/
+    );
+  });
+
+  it('leaves HTTP failures and non-SDK errors to their existing classification without a diagnostic', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const passthrough = new Error('caller cancelled');
+    expect(normalizeSdkError(passthrough, 'openai')).toBe(passthrough);
+    expect(
+      normalizeSdkError(
+        new APICallError({
+          message: 'server error',
+          url: 'https://fixture.invalid/v1',
+          requestBodyValues: {},
+          statusCode: 503,
+        }),
+        'openai'
+      )
+    ).toMatchObject({ status: 503 });
+    expect(diagnostics(warn)).toEqual([]);
+  });
+
+  it('diagnoses a real DeepSeek 2xx protocol violation at the adapter boundary', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({
+          choices: [{ not_a_message: 'PRIVATE_RESPONSE_BODY' }],
+          usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 },
+        })
+      )
+    );
+    const transport = new DeepSeekTransport({ apiKey: 'test-key' });
+
+    await expect(
+      transport.chat({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] })
+    ).rejects.toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
+    const [diagnostic] = diagnostics(warn);
+    expect(diagnostic).toContain('provider=deepseek');
+    expect(diagnostic).toContain('status=200');
+    expect(warn.mock.calls.flat().map(String).join('\n')).not.toContain('PRIVATE_RESPONSE_BODY');
+  });
+});
+
+describe('SDK continuation projection hash failures', () => {
+  const context = {
+    provider: 'google',
+    model: 'gemini-3-flash-preview',
+    connection: 'fixture-connection',
+    protocol: 'google',
+  } as const;
+
+  function replayMessage(args: Record<string, unknown>): UnifiedMessage {
+    const continuation: LlmContinuation = {
+      provider: context.provider,
+      model: context.model,
+      connection: context.connection,
+      kind: 'content-replay-v1',
+      parts: [{ type: 'tool-call', id: 'call-1' }],
+    };
+    const message: UnifiedMessage = {
+      role: 'assistant',
+      content: '',
+      toolCalls: [{ id: 'call-1', name: 'lookup', args }],
+      continuation,
+    };
+    return message;
+  }
+
+  it('replays when the captured projection hash still matches', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const message = replayMessage({ q: 'x' });
+    if (!message.continuation) {
+      throw new Error('fixture has no continuation');
+    }
+    message.continuation.projectionHash = sdkProjectionHash(message, message.continuation);
+
+    expect(replaySdkContinuation(message, context)).toMatchObject({ complete: true });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'BigInt', args: () => ({ q: 1n }) },
+    {
+      label: 'circular reference',
+      args: () => {
+        const args: Record<string, unknown> = {};
+        args.self = args;
+        return args;
+      },
+    },
+  ])('classifies an unhashable $label projection as projection_hash_failed', ({ args }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const message = replayMessage(args());
+    if (!message.continuation) {
+      throw new Error('fixture has no continuation');
+    }
+    message.continuation.projectionHash = 'captured-hash';
+
+    expect(replaySdkContinuation(message, context)).toBeUndefined();
+    const messages = warn.mock.calls.map(([entry]) => String(entry));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('continuation_filtered');
+    expect(messages[0]).toContain('reason=projection_hash_failed');
+    expect(messages[0]).toContain('error=TypeError');
+    expect(messages[0]).not.toContain('projection_binding_changed');
   });
 });

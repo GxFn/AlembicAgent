@@ -60,9 +60,13 @@ function closeProxyDispatcher(dispatcher: unknown | null): void {
   }
   const disposable = dispatcher as { close?: () => unknown; destroy?: () => unknown };
   // undici 的关闭方法返回 Promise；清理失败只影响资源诊断，不能逃逸为未处理拒绝。
+  // 诊断只记录错误类名：代理 URL 可能内嵌凭据，关闭错误 message 也可能回显代理地址。
   observeSafely(
     () => (typeof disposable.close === 'function' ? disposable.close() : disposable.destroy?.()),
-    () => undefined
+    (err: unknown) =>
+      Logger.getInstance().debug(
+        `[LLMTransport] proxy_dispatcher_close_failed reason=${err instanceof Error ? err.name : 'unknown'}; pooled proxy connections may not have been released`
+      )
   );
 }
 
@@ -190,6 +194,34 @@ function borrowProxyDispatcher(proxyUrl: string): ProxyDispatcherEntry {
     }
   })().then(resolveInitialization, rejectInitialization);
   return entry;
+}
+
+/**
+ * 2xx 坏正文与 SDK 路径（sdkErrors 的 2xx 分支）同语义：code=LLM_INVALID_RESPONSE、不带 status，
+ * 因而计入熔断但不重试。错误消息和诊断都不拼接正文或 URL，只记录 provider、状态码、content-type 与失败类别。
+ * 模块私有函数而非类成员：LLMTransport 是公开导出类，不扩展其 protected 面。
+ */
+function invalidResponseBodyError(
+  providerId: string,
+  res: Response,
+  reason: 'invalid_json' | 'not_object'
+): Error {
+  const contentType = (res.headers.get('content-type') || '')
+    .split(';')[0]
+    .trim()
+    .replace(/[^\w.+/-]+/g, '_')
+    .slice(0, 80);
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[LLMTransport] invalid_response_body provider=${providerId} status=${res.status} contentType=${contentType || 'none'} reason=${reason}; body withheld, classified LLM_INVALID_RESPONSE`
+      ),
+    () => undefined
+  );
+  return Object.assign(
+    new Error(`${providerId} response body is not a JSON object (HTTP ${res.status})`),
+    { code: 'LLM_INVALID_RESPONSE' }
+  );
 }
 
 // ─── Transport Request ──────────────────────────────────
@@ -360,7 +392,26 @@ export abstract class LLMTransport {
         throw err;
       }
 
-      return (await res.json()) as Record<string, unknown>;
+      // 先读完正文再单独解析：读流失败（连接中断等）仍按原网络错误上抛并保留其分类，
+      // 只有“2xx 但正文不是 JSON 对象”才归为上游坏 body。
+      const text = await res.text();
+      let parsed: unknown;
+      let invalidReason: 'invalid_json' | 'not_object' | undefined;
+      try {
+        parsed = JSON.parse(text);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          invalidReason = 'not_object';
+        }
+      } catch (err: unknown) {
+        // 任何解析失败都表示正文不是 JSON。原生 SyntaxError 的 message 会带出正文片段，
+        // 且按类名会被误判为程序员错误；因此不透传、不记录它，只保留失败类别并在下方打诊断。
+        void err;
+        invalidReason = 'invalid_json';
+      }
+      if (invalidReason !== undefined) {
+        throw invalidResponseBodyError(this.providerId, res, invalidReason);
+      }
+      return parsed as Record<string, unknown>;
     }, externalSignal);
   }
 
