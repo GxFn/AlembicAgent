@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { STRATEGY_PRODUCER } from '../src/agent/context/exploration/ExplorationStrategies.js';
 import type { EvidenceEntry } from '../src/agent/evidence/EvidenceCollector.js';
+import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
@@ -18,6 +19,7 @@ import {
   AgentRuntime,
   buildLlmInputAssembly,
   createMessageAdapter,
+  DiagnosticsCollector,
   LoopContext,
   measureLlmInputAssembly,
   measurePromptText,
@@ -994,8 +996,10 @@ describe('LLM input layering', () => {
 
     const providerLayer = capture.messageBatches[0]?.at(-1)?.content || '';
     expect(providerLayer).toContain('producerSubmitLedger');
-    expect(providerLayer).toContain('"requiredFieldsComplete":true');
-    expect(providerLayer).toContain('"payloadStored":true');
+    // 台账为每条一行的紧凑文本（I09），字段名与 policy 行引用的权威字段一致。
+    expect(providerLayer).toContain(
+      '- created "Feature coordinator ownership" requiredFieldsComplete=true payloadStored=true sourceCount=2'
+    );
     expect(providerLayer).toContain('do not infer missing fields from compacted provider history');
   });
 
@@ -1674,5 +1678,366 @@ describe('provider input dispatch boundaries', () => {
       expect(contract).toContain(prohibited);
       expect(assembly.inputLayerMessage?.content).not.toContain(readPolicy);
     }
+  });
+});
+
+// I09：章节预算必须先保住权威事实（台账 / policy / 证据 ref），只在行边界截断并先丢低优先级遥测行；
+// 去重只登记最终保留的行，诊断口径区分“去重”与“预算截断”。这些用例使用真实 ExplorationTracker /
+// ActiveContext 指标形状，而不是零值桩，避免再次出现“测试通过但生产截断台账”的缺口。
+describe('LLM input section budget keeps authoritative facts first (I09)', () => {
+  const REALISTIC_LEDGER_TITLES = [
+    'RouteMiddleware 洋葱中间件模型',
+    'ModuleManager 两阶段模块生命周期注册',
+    'Repository layer owns the persistence boundary',
+    'FeatureCoordinator owns navigation state',
+    'EventBus removes the topic after the last handler',
+  ];
+
+  function ledgerEntry(title: string, index: number) {
+    // 与 toolPipeline/submissionLedger.ts recordProducerSubmitLedger 的真实写入形状一致。
+    return {
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      lifecycle: 'pending',
+      payloadStored: true,
+      readiness: { ready: true, violationCodes: [], warningCodes: [] },
+      retrievalProfilePresent: true,
+      requiredFieldsComplete: index % 2 === 0,
+      sourceCount: (index % 3) + 1,
+      status: 'created',
+      title,
+      trigger: `@ledger-trigger-${index}`,
+    };
+  }
+
+  function realProducerLoop({
+    titles,
+    pipelinePhase = 'produce',
+    diagnostics = null,
+  }: {
+    titles: string[];
+    pipelinePhase?: string;
+    diagnostics?: DiagnosticsCollector | null;
+  }) {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'producer' },
+      { maxIterations: 12, pipelineType: 'producer' }
+    );
+    if (!tracker) {
+      throw new Error('Real producer tracker must resolve for system source');
+    }
+    for (let round = 0; round < 4; round++) {
+      tracker.tick();
+    }
+    const trace = new ActiveContext();
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('produce knowledge candidates');
+    const ctx = new LoopContext({
+      allowedToolIds: ['knowledge'],
+      baseSystemPrompt: PRODUCER_SYSTEM_PROMPT,
+      budget: { maxIterations: 12 },
+      capabilities: [],
+      context: { dimensionId: 'design-patterns', pipelinePhase },
+      diagnostics,
+      messages,
+      prompt: 'produce knowledge candidates',
+      sharedState: {
+        _producerSubmitLedger: {
+          createdCount: titles.length,
+          entries: titles.map((title, index) => ledgerEntry(title, index)),
+          targetSubmits: titles.length + 1,
+        },
+      },
+      source: 'system',
+      toolSchemas: [{ name: 'knowledge', parameters: { type: 'object' } }],
+      tracker,
+      trace,
+    });
+    return { ctx, messages };
+  }
+
+  function assembleProducer(ctx: LoopContext, messages: ReturnType<typeof createMessageAdapter>) {
+    return buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: PRODUCER_SYSTEM_PROMPT,
+      tools: [{ name: 'knowledge', parameters: { type: 'object' } }],
+    });
+  }
+
+  function evidenceContextOf(assembly: ReturnType<typeof buildLlmInputAssembly>) {
+    return assembly.sections.find((section) => section.id === 'evidenceContext')?.content ?? '';
+  }
+
+  it.each([
+    'produce',
+    'summarize',
+  ])('keeps every ledger title and the ledger policy visible to the provider in %s', (pipelinePhase) => {
+    const { ctx, messages } = realProducerLoop({ titles: REALISTIC_LEDGER_TITLES, pipelinePhase });
+    const assembly = assembleProducer(ctx, messages);
+    const providerLayer = assembly.inputLayerMessage?.content ?? '';
+
+    expect(assembly.stageProfile).toBe(pipelinePhase);
+    for (const title of REALISTIC_LEDGER_TITLES) {
+      expect(providerLayer).toContain(JSON.stringify(title));
+    }
+    expect(providerLayer).toContain(
+      'producerSubmitLedgerPolicy: treat payloadStored and requiredFieldsComplete as authoritative runtime facts'
+    );
+    expect(providerLayer).toContain('requiredFieldsComplete=true');
+    expect(providerLayer).toContain('payloadStored=true');
+    expect(providerLayer).not.toContain('entriesOmitted');
+    // 台账为每条一行的紧凑文本，不再是可能被拦腰截断的 JSON。
+    expect(evidenceContextOf(assembly)).not.toContain('"entries":[');
+    // produce/summarize 阶段省略空 planProgress（producer 策略不做规划）。
+    expect(evidenceContextOf(assembly)).not.toContain('planProgress:');
+  });
+
+  it('keeps the newest ledger entries and reports entriesOmitted when the ledger exceeds the budget', () => {
+    const titles = Array.from(
+      { length: 25 },
+      (_, index) => `Generated candidate #${String(index + 1).padStart(2, '0')} ownership rule`
+    );
+    const diagnostics = new DiagnosticsCollector();
+    const { ctx, messages } = realProducerLoop({ titles, diagnostics });
+    const assembly = assembleProducer(ctx, messages);
+    const evidence = evidenceContextOf(assembly);
+    const omittedMatch = /entriesOmitted=(\d+)/.exec(evidence);
+    const shownTitles = titles.filter((title) => evidence.includes(JSON.stringify(title)));
+
+    expect(omittedMatch).not.toBeNull();
+    expect(shownTitles.length).toBeGreaterThan(0);
+    expect(shownTitles.length + Number(omittedMatch?.[1])).toBe(titles.length);
+    // 最新优先：最后提交的条目一定可见，最早的条目最先被省略。
+    expect(evidence).toContain(JSON.stringify(titles[24]));
+    expect(evidence).not.toContain(JSON.stringify(titles[0]));
+    expect(shownTitles).toEqual(titles.slice(titles.length - shownTitles.length));
+    expect(evidence).toContain('producerSubmitLedgerPolicy:');
+    // 每条台账行都完整（以 sourceCount=N 结尾），不会在字段中间断开。
+    const entryLines = evidence.split('\n').filter((line) => line.startsWith('- '));
+    expect(entryLines).toHaveLength(shownTitles.length);
+    for (const line of entryLines) {
+      expect(line).toMatch(/ sourceCount=\d+$/);
+    }
+    expect(assembly.metadata.inputCompaction).toMatchObject({
+      producerSubmitLedger: {
+        entriesOmitted: Number(omittedMatch?.[1]),
+        shownEntries: shownTitles.length,
+        totalEntries: titles.length,
+      },
+    });
+    expect(
+      diagnostics
+        .toJSON()
+        .warnings.filter((warning) => warning.code === 'llm_input_section_budgeted')
+    ).not.toHaveLength(0);
+  });
+
+  it('drops low-priority telemetry lines before authoritative evidence refs in analyze', () => {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 12, pipelineType: 'analyst' }
+    );
+    if (!tracker) {
+      throw new Error('Real analyst tracker must resolve for system source');
+    }
+    tracker.tick();
+    const refs = Array.from(
+      { length: 32 },
+      (_, index) => `src/mod${index}/feature.ts:${index + 1}`
+    );
+    const diagnostics = new DiagnosticsCollector();
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Analyze architecture for the design-patterns dimension.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: ANALYST_SYSTEM_PROMPT,
+      budget: { maxIterations: 12 },
+      capabilities: [],
+      context: {
+        deterministicEvidenceRefs: refs,
+        dimensionId: 'design-patterns',
+        pipelinePhase: 'analyze',
+      },
+      diagnostics,
+      messages,
+      prompt: 'Analyze architecture for the design-patterns dimension.',
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker,
+      trace: new ActiveContext(),
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: ANALYST_SYSTEM_PROMPT,
+      tools: [{ name: 'code', description: 'Read source files' }],
+    });
+    const evidence = evidenceContextOf(assembly);
+
+    expect(assembly.stageProfile).toBe('analyze');
+    expect(assembly.metadata.deterministicEvidenceRefs).toEqual(refs);
+    for (const ref of refs) {
+      expect(evidence).toContain(ref);
+    }
+    expect(evidence).not.toContain('traceStats:');
+    expect(evidence.length).toBeLessThanOrEqual(1400);
+    expect(assembly.metadata.inputCompaction).toMatchObject({
+      budgetedSectionIds: ['evidenceContext'],
+      dedupedSectionIds: [],
+      budgetedSections: [
+        expect.objectContaining({
+          droppedLowPriorityLines: expect.arrayContaining(['traceStats']),
+          sectionId: 'evidenceContext',
+        }),
+      ],
+    });
+    expect(diagnostics.toJSON().warnings).toContainEqual(
+      expect.objectContaining({ code: 'llm_input_section_budgeted', stage: 'analyze' })
+    );
+  });
+
+  it('keeps a line in a later section when the budget cut it from an earlier section', () => {
+    const constraint =
+      'Hard constraint: authorization failures in the payment client must never be retried.';
+    const filler =
+      'Background context about the payment module, its collaborators and retry policy. '.repeat(
+        18
+      );
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Analyze payment behavior.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: 'Analyst identity prompt',
+      budget: { maxIterations: 1 },
+      capabilities: [],
+      context: { dimensionId: 'payments', pipelinePhase: 'analyze' },
+      messages,
+      prompt: `${filler.trim()}\n${constraint}`,
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker: createTracker({ phase: 'SCAN', pipelineType: 'analyst' }) as never,
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: `Observation ledger:\n${constraint}`,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: 'Analyst identity prompt',
+      tools: [{ name: 'code', description: 'Read source files' }],
+    });
+    const taskContext =
+      assembly.sections.find((section) => section.id === 'taskContext')?.content ?? '';
+    const dynamicContext =
+      assembly.sections.find((section) => section.id === 'dynamicContext')?.content ?? '';
+
+    expect(assembly.metadata.inputCompaction).toMatchObject({
+      budgetedSectionIds: ['taskContext'],
+    });
+    expect(taskContext).not.toContain(constraint);
+    expect(dynamicContext).toContain(constraint);
+    expect(assembly.inputLayerMessage?.content).toContain(constraint);
+    expect(
+      (assembly.metadata.inputCompaction as { dedupedSectionIds: string[] }).dedupedSectionIds
+    ).not.toContain('dynamicContext');
+  });
+
+  it('does not report blank-line normalization or truncation alone as deduplication', () => {
+    const normalized = assembly([], 'Alpha observation\n\n\nBeta observation');
+    expect(normalized.metadata.inputCompaction).toMatchObject({
+      budgetedSectionIds: [],
+      dedupedSectionIds: [],
+    });
+
+    const lines = Array.from(
+      { length: 40 },
+      (_, index) =>
+        `Observation ${index}: payment module fact number ${index} recorded by the observer.`
+    );
+    const budgeted = assembly([], lines.join('\n'));
+    const dynamicContext =
+      budgeted.sections.find((section) => section.id === 'dynamicContext')?.content ?? '';
+    const keptLines = dynamicContext.split('\n');
+    const marker = keptLines.pop();
+
+    expect(budgeted.metadata.inputCompaction).toMatchObject({
+      budgetedSectionIds: ['dynamicContext'],
+      dedupedSectionIds: [],
+      budgetedSections: [
+        {
+          keptChars: dynamicContext.length,
+          originalChars: lines.join('\n').length,
+          sectionId: 'dynamicContext',
+        },
+      ],
+    });
+    // 行边界截断：除最后的截断标记外，每一行都是完整的原始行。
+    expect(marker).toMatch(/^\.\.\.\(truncated/);
+    expect(keptLines.length).toBeGreaterThan(0);
+    for (const line of keptLines) {
+      expect(lines).toContain(line);
+    }
+  });
+
+  it('reuses the resolved stage profile for grounding policy instead of re-resolving without toolChoice', () => {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Summarize the analysis.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: 'Analyst identity prompt',
+      budget: { maxIterations: 1 },
+      capabilities: [],
+      context: {
+        deterministicEvidenceRefs: ['Sources/App/Feature.swift:12'],
+        pipelinePhase: 'final_summary',
+      },
+      groundingEnforcement: 'guard',
+      messages,
+      prompt: 'Summarize the analysis.',
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker: createTracker({ phase: 'SCAN', pipelineType: 'analyst' }) as never,
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'none',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'none',
+      systemPrompt: 'Analyst identity prompt',
+      tools: [],
+    });
+
+    expect(assembly.stageProfile).toBe('summarize');
+    expect(assembly.metadata.groundingPolicy).toBeNull();
+    expect(evidenceContextOf(assembly)).not.toContain('evidenceGroundingPolicy:');
+  });
+
+  it('emits the section budget diagnostic once per collector and section', () => {
+    const titles = Array.from(
+      { length: 25 },
+      (_, index) => `Repeated candidate #${String(index + 1).padStart(2, '0')} ownership rule`
+    );
+    const diagnostics = new DiagnosticsCollector();
+    const { ctx, messages } = realProducerLoop({ titles, diagnostics });
+    assembleProducer(ctx, messages);
+    assembleProducer(ctx, messages);
+    const warnings = diagnostics
+      .toJSON()
+      .warnings.filter((warning) => warning.code === 'llm_input_section_budgeted');
+
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(new Set(warnings.map((warning) => warning.message)).size).toBe(warnings.length);
+    expect(warnings.every((warning) => warning.stage === 'produce')).toBe(true);
   });
 });

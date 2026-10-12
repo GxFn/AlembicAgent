@@ -1,4 +1,5 @@
 import type { ToolSchema, UnifiedMessage } from '#ai/AiProvider.js';
+import type { AgentDiagnosticWarning } from './AgentRuntimeTypes.js';
 import { buildAnalyzeGroundingPolicy } from './AnalyzeGroundingGuard.js';
 import type { LoopContext } from './LoopContext.js';
 import { extractSourceRefsFromValue } from './PcvNodeEvidenceRecorder.js';
@@ -33,11 +34,74 @@ export interface LLMInputAssembly {
   tools?: ToolSchema[];
 }
 
+/**
+ * evidenceContext 内的低优先级遥测行。预算不足时按此顺序（越靠前越先）整行丢弃，
+ * 之后才会动台账 / policy / 证据 ref 等权威事实行。
+ */
+const EVIDENCE_TELEMETRY_DROP_ORDER = [
+  'traceStats',
+  'planProgress',
+  'trackerMetrics',
+  'toolCallsSoFar',
+] as const;
+type EvidenceTelemetryKey = (typeof EVIDENCE_TELEMETRY_DROP_ORDER)[number];
+
+/**
+ * 装配内部使用的章节草稿。lowPriorityLines 只服务预算决策（完整行文本 → 遥测键），
+ * compactInputLayerSections 返回前会剥掉它，不进入公开的 LLMInputSection 形状。
+ */
+interface DraftInputLayerSection extends LLMInputSection {
+  lowPriorityLines?: ReadonlyMap<string, EvidenceTelemetryKey>;
+}
+
+/** 单个章节的预算截断记录；随 metadata.inputCompaction.budgetedSections 进入 llm.input 过程事件。 */
+interface LLMInputSectionBudgetRecord {
+  sectionId: LLMInputSectionId;
+  maxChars: number;
+  /** 章节原始字符数（去重与预算之前）。 */
+  originalChars: number;
+  /** 最终发给 provider 的字符数（含截断标记）。 */
+  keptChars: number;
+  /** 被预算整行丢弃的行数（低优先级遥测行 + 尾部截掉的行；不含被截成半行的那一行）。 */
+  droppedLines: number;
+  droppedLowPriorityLines: EvidenceTelemetryKey[];
+  /** 是否有一行因为单行超出剩余预算而被截成前缀。 */
+  partialLine: boolean;
+}
+
 interface LLMInputCompactionResult {
   budgetedSectionIds: LLMInputSectionId[];
+  budgetedSections: LLMInputSectionBudgetRecord[];
+  dedupedLineCounts: Partial<Record<LLMInputSectionId, number>>;
   dedupedSectionIds: LLMInputSectionId[];
   sections: LLMInputSection[];
 }
+
+/** 台账投影结果：记录按预算保留了多少条，供 metadata 与诊断使用。 */
+interface ProducerSubmitLedgerProjection {
+  budgetChars: number;
+  entriesOmitted: number;
+  shownEntries: number;
+  totalEntries: number;
+}
+
+interface EvidenceContextBuild {
+  ledger: ProducerSubmitLedgerProjection | null;
+  omittedEmptyTelemetry: EvidenceTelemetryKey[];
+  section: DraftInputLayerSection;
+}
+
+/** 截断标记预留字符数（含换行）；实际标记形如 `...(truncated: 12 line(s) omitted and 1 line cut by 1400-char section budget)`。 */
+const TRUNCATION_MARKER_RESERVE = 80;
+/** 剩余预算至少这么多时，才把放不下的那一行截成前缀；否则整行丢弃，避免留下无意义的碎片。 */
+const MIN_PARTIAL_LINE_CHARS = 120;
+/** 台账最多展示的条目数（即使预算还够），与旧实现的 20 条上限一致。 */
+const MAX_PRODUCER_LEDGER_ENTRIES = 20;
+/** 单条台账标题的展示上限，防止一条超长标题吃掉整个章节预算。 */
+const MAX_PRODUCER_LEDGER_TITLE_CHARS = 120;
+const PRODUCER_SUBMIT_LEDGER_POLICY =
+  'producerSubmitLedgerPolicy: treat payloadStored and requiredFieldsComplete as authoritative runtime facts; do not infer missing fields from compacted provider history.';
+const SECTION_BUDGET_DIAGNOSTIC_CODE = 'llm_input_section_budgeted';
 
 export interface BuildLlmInputAssemblyOptions {
   ctx: LoopContext;
@@ -62,14 +126,17 @@ export function buildLlmInputAssembly({
   systemPrompt,
   tools,
 }: BuildLlmInputAssemblyOptions): LLMInputAssembly {
+  // 阶段画像在本次装配中只解析一次（带 toolChoice），grounding 判定与章节预算都复用它，
+  // 避免无 toolChoice 的二次解析把 summary-only 阶段误判成 analyze 并注入 grounding 政策。
   const stageProfile = resolveLlmInputStageProfile(ctx, requestedToolChoice, effectiveToolChoice);
   const providerHistoryMessages = projectMessagesForStage(messages, stageProfile);
-  const groundingContext = buildGroundingContext(ctx, modelRef);
+  const groundingContext = buildGroundingContext(ctx, modelRef, stageProfile);
   // 两个可见章节共享实际Scan补证权限，避免阶段说明允许读、工具说明却随后禁止。
   const scanReadAllowed =
     stringValue(valueAt(ctx.tracker, 'pipelineType')) === 'scan' &&
     ctx.allowedToolIds?.includes('code') &&
     (!ctx.allowedToolActions?.code || ctx.allowedToolActions.code.includes('read'));
+  const evidenceContext = buildEvidenceContextSection(ctx, groundingContext, stageProfile);
   const rawInputLayerSections = [
     buildStagePolicySection(stageProfile, ctx, scanReadAllowed),
     buildToolContractSection(
@@ -80,11 +147,29 @@ export function buildLlmInputAssembly({
       scanReadAllowed
     ),
     buildTaskContextSection(ctx, modelRef, providerHistoryMessages),
-    buildEvidenceContextSection(ctx, groundingContext),
+    evidenceContext.section,
     buildDynamicContextSection(dynamicContext),
-  ].filter((section): section is LLMInputSection => Boolean(section?.content.trim()));
-  const inputCompaction = compactInputLayerSections(rawInputLayerSections, stageProfile);
+  ].filter((section): section is DraftInputLayerSection => Boolean(section?.content.trim()));
+  const inputCompaction = compactInputLayerSections(
+    rawInputLayerSections,
+    stageProfile,
+    ctx.diagnostics
+  );
   const inputLayerSections = inputCompaction.sections;
+  if (evidenceContext.ledger && evidenceContext.ledger.entriesOmitted > 0) {
+    // 台账按“最新优先”只保留预算内的条目；被省略的条数已写进 provider 文本（entriesOmitted=N），
+    // 这里再留一条运行级诊断，便于排查模型为何看不到较早的提交。
+    const ledger = evidenceContext.ledger;
+    warnSectionBudgetOnce(ctx.diagnostics, `${stageProfile}:evidenceContext:ledger`, {
+      code: SECTION_BUDGET_DIAGNOSTIC_CODE,
+      message:
+        `Producer submit ledger kept the newest ${ledger.shownEntries} of ${ledger.totalEntries} entries ` +
+        `(entriesOmitted=${ledger.entriesOmitted}) to fit the ${ledger.budgetChars}-char ${stageProfile} evidenceContext budget ` +
+        `and the ${MAX_PRODUCER_LEDGER_ENTRIES}-entry cap. ` +
+        'Later rounds are recorded in llm.input metadata.inputCompaction.producerSubmitLedger.',
+      stage: stageProfile,
+    });
+  }
 
   const sections: LLMInputSection[] = [
     {
@@ -124,6 +209,13 @@ export function buildLlmInputAssembly({
       inputCompaction: {
         budgetedSectionIds: inputCompaction.budgetedSectionIds,
         dedupedSectionIds: inputCompaction.dedupedSectionIds,
+        // 以下为只增字段：区分“去重删行”与“预算截断”，并记录台账保留口径。
+        budgetedSections: inputCompaction.budgetedSections,
+        dedupedLineCounts: inputCompaction.dedupedLineCounts,
+        ...(evidenceContext.ledger ? { producerSubmitLedger: evidenceContext.ledger } : {}),
+        ...(evidenceContext.omittedEmptyTelemetry.length > 0
+          ? { omittedEmptyTelemetry: evidenceContext.omittedEmptyTelemetry }
+          : {}),
       },
       inputProjection: inputProjection || null,
     },
@@ -277,8 +369,8 @@ export function resolveLlmInputStageProfile(
   if (
     trackerPhase === 'SUMMARIZE' ||
     pipelinePhase.includes('summarize') ||
-    (effectiveToolChoice === 'none' &&
-      (trackerPhase === 'SUMMARIZE' || pipelinePhase.includes('summary')))
+    // 只有“阶段名含 summary 且本轮禁止工具”才额外视为 summarize；trackerPhase 已由第一项覆盖。
+    (effectiveToolChoice === 'none' && pipelinePhase.includes('summary'))
   ) {
     return 'summarize';
   }
@@ -431,11 +523,21 @@ function normalizePromptPresence(text: string | null | undefined): string {
     .trim();
 }
 
+/**
+ * evidenceContext 的行顺序就是预算优先级：
+ * 1. 权威事实在前——grounding 政策、Producer 台账政策行（先于台账本身）、台账、record-repair 路径、证据 ref；
+ * 2. 运行遥测在后——toolCallsSoFar / trackerMetrics / traceStats / planProgress，预算不足时最先整行丢弃。
+ * 台账本身按本章节预算估算可容纳的条目数（最新优先），保证台账与政策行不会被章节截断拦腰切开。
+ */
 function buildEvidenceContextSection(
   ctx: LoopContext,
-  groundingContext: GroundingContext
-): LLMInputSection {
+  groundingContext: GroundingContext,
+  stageProfile: LLMInputStageProfile
+): EvidenceContextBuild {
   const lines: string[] = [];
+  const lowPriorityLines = new Map<string, EvidenceTelemetryKey>();
+  const omittedEmptyTelemetry: EvidenceTelemetryKey[] = [];
+  const sectionBudget = sectionBudgetFor(stageProfile, 'evidenceContext');
   const metrics = safeCall<Record<string, unknown>>(() => ctx.tracker?.getMetrics?.());
   const traceStats = safeCall<Record<string, unknown>>(() => ctx.trace?.getStats?.());
   const planProgress = safeCall<Record<string, unknown>>(() => ctx.tracker?.getPlanProgress?.());
@@ -444,17 +546,19 @@ function buildEvidenceContextSection(
     : Array.isArray(ctx.sharedState?._recordRepairEvidencePaths)
       ? ctx.sharedState._recordRepairEvidencePaths
       : null;
-  const producerSubmitLedger = compactProducerSubmitLedger(ctx.sharedState?._producerSubmitLedger);
 
-  lines.push(`toolCallsSoFar: ${ctx.toolCalls.length}`);
-  if (metrics) {
-    lines.push(`trackerMetrics: ${safeJson(metrics)}`);
+  if (groundingContext.policy) {
+    lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
   }
-  if (traceStats) {
-    lines.push(`traceStats: ${safeJson(traceStats)}`);
-  }
-  if (planProgress) {
-    lines.push(`planProgress: ${safeJson(planProgress)}`);
+  const usedChars = lines.reduce((total, line) => total + line.length + 1, 0);
+  const ledger = projectProducerSubmitLedger(
+    ctx.sharedState?._producerSubmitLedger,
+    // 台账可用预算 = 章节预算 - 已在其前面的权威行 - 截断标记预留；遥测行排在后面，可被整行丢弃。
+    sectionBudget - usedChars - TRUNCATION_MARKER_RESERVE,
+    sectionBudget
+  );
+  if (ledger) {
+    lines.push(PRODUCER_SUBMIT_LEDGER_POLICY, ...ledger.lines);
   }
   if (evidencePaths?.length) {
     lines.push(`recordRepairEvidencePaths: ${evidencePaths.map(String).join(', ')}`);
@@ -467,60 +571,133 @@ function buildEvidenceContextSection(
   if (groundingContext.evidenceStarterRefs.length > 0) {
     lines.push(`evidenceStarterRefs: ${groundingContext.evidenceStarterRefs.join(', ')}`);
   }
-  if (groundingContext.policy) {
-    lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
+
+  const pushTelemetry = (key: EvidenceTelemetryKey, text: string) => {
+    lines.push(text);
+    lowPriorityLines.set(text, key);
+  };
+  pushTelemetry('toolCallsSoFar', `toolCallsSoFar: ${ctx.toolCalls.length}`);
+  if (metrics) {
+    pushTelemetry('trackerMetrics', `trackerMetrics: ${safeJson(metrics)}`);
   }
-  if (producerSubmitLedger) {
-    lines.push(`producerSubmitLedger: ${safeJson(producerSubmitLedger)}`);
-    lines.push(
-      'producerSubmitLedgerPolicy: treat payloadStored and requiredFieldsComplete as authoritative runtime facts; do not infer missing fields from compacted provider history.'
-    );
+  if (traceStats) {
+    pushTelemetry('traceStats', `traceStats: ${safeJson(traceStats)}`);
+  }
+  if (planProgress) {
+    // produce/summarize 不做规划，全零的 planProgress 只占预算不含信息；省略情况记入 metadata。
+    if (
+      (stageProfile === 'produce' || stageProfile === 'summarize') &&
+      isEmptyTelemetryRecord(planProgress)
+    ) {
+      omittedEmptyTelemetry.push('planProgress');
+    } else {
+      pushTelemetry('planProgress', `planProgress: ${safeJson(planProgress)}`);
+    }
   }
 
   return {
-    id: 'evidenceContext',
-    title: 'Evidence context',
-    content: lines.join('\n'),
-    providerVisible: true,
-    staticCacheable: false,
+    ledger: ledger?.projection ?? null,
+    omittedEmptyTelemetry,
+    section: {
+      id: 'evidenceContext',
+      title: 'Evidence context',
+      content: lines.join('\n'),
+      providerVisible: true,
+      staticCacheable: false,
+      lowPriorityLines,
+    },
   };
 }
 
-function compactProducerSubmitLedger(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+function isEmptyTelemetryRecord(value: Record<string, unknown>): boolean {
+  return Object.values(value).every(
+    (item) =>
+      item === null ||
+      item === undefined ||
+      item === 0 ||
+      item === false ||
+      item === '' ||
+      (Array.isArray(item) && item.length === 0)
+  );
+}
+
+/**
+ * 把 sharedState._producerSubmitLedger 投影成每条一行的紧凑文本（最新优先）。
+ * 只保留模型判断“哪些候选已创建、字段是否完整”所需的字段，去掉 uuid id 等噪声；
+ * 标题经 JSON 转义保证单行。条目按可用预算贪心装入，放不下的较早条目以 entriesOmitted=N 明示。
+ */
+function projectProducerSubmitLedger(
+  value: unknown,
+  availableChars: number,
+  sectionBudget: number
+): { lines: string[]; projection: ProducerSubmitLedgerProjection } | null {
+  if (!isRecord(value)) {
     return null;
   }
-  const ledger = value as {
-    createdCount?: unknown;
-    entries?: unknown;
-    targetSubmits?: unknown;
-  };
-  const entries = Array.isArray(ledger.entries)
-    ? ledger.entries
-        .filter(
-          (entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object'
-        )
-        .slice(0, 20)
-        .map((entry) =>
-          pickDefined({
-            id: entry.id,
-            payloadStored: entry.payloadStored,
-            requiredFieldsComplete: entry.requiredFieldsComplete,
-            sourceCount: entry.sourceCount,
-            status: entry.status,
-            title: entry.title,
-            trigger: entry.trigger,
-          })
-        )
-    : [];
+  const entries = Array.isArray(value.entries) ? value.entries.filter(isRecord) : [];
   if (entries.length === 0) {
     return null;
   }
-  return pickDefined({
-    createdCount: ledger.createdCount,
-    entries,
-    targetSubmits: ledger.targetSubmits,
-  });
+  const totalEntries = entries.length;
+  const headerFor = (omitted: number) =>
+    [
+      'producerSubmitLedger:',
+      typeof value.createdCount === 'number' ? `createdCount=${value.createdCount}` : null,
+      typeof value.targetSubmits === 'number' ? `targetSubmits=${value.targetSubmits}` : null,
+      `entries=${totalEntries}`,
+      'order=newest-first',
+      omitted > 0 ? `entriesOmitted=${omitted} (older entries not shown)` : null,
+    ]
+      .filter(Boolean)
+      .join(' ');
+  // 用“全部省略”时的表头长度做上界估算，表头数字位数变化不会让最终文本超出预算。
+  let remaining =
+    availableChars -
+    (PRODUCER_SUBMIT_LEDGER_POLICY.length + 1) -
+    (headerFor(totalEntries).length + 1);
+  const entryLines: string[] = [];
+  // 台账按提交顺序追加（同名替换保留原位），所以从数组尾部开始取就是最新优先。
+  for (let index = entries.length - 1; index >= 0; index--) {
+    if (entryLines.length >= MAX_PRODUCER_LEDGER_ENTRIES) {
+      break;
+    }
+    const line = formatProducerLedgerEntry(entries[index]);
+    if (line.length + 1 > remaining) {
+      break;
+    }
+    entryLines.push(line);
+    remaining -= line.length + 1;
+  }
+  const entriesOmitted = totalEntries - entryLines.length;
+  return {
+    lines: [headerFor(entriesOmitted), ...entryLines],
+    projection: {
+      budgetChars: sectionBudget,
+      entriesOmitted,
+      shownEntries: entryLines.length,
+      totalEntries,
+    },
+  };
+}
+
+function formatProducerLedgerEntry(entry: Record<string, unknown>): string {
+  const status = (stringValue(entry.status) || 'unknown').replace(/\s+/g, '_').slice(0, 32);
+  const rawTitle = stringValue(entry.title) || 'unknown';
+  const title =
+    rawTitle.length > MAX_PRODUCER_LEDGER_TITLE_CHARS
+      ? `${rawTitle.slice(0, MAX_PRODUCER_LEDGER_TITLE_CHARS)}…`
+      : rawTitle;
+  return [
+    `- ${status}`,
+    JSON.stringify(title),
+    `requiredFieldsComplete=${ledgerFlag(entry.requiredFieldsComplete)}`,
+    `payloadStored=${ledgerFlag(entry.payloadStored)}`,
+    `sourceCount=${typeof entry.sourceCount === 'number' ? entry.sourceCount : 'unknown'}`,
+  ].join(' ');
+}
+
+function ledgerFlag(value: unknown): string {
+  return typeof value === 'boolean' ? String(value) : 'unknown';
 }
 
 interface GroundingContext {
@@ -529,7 +706,11 @@ interface GroundingContext {
   policy: string | null;
 }
 
-function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingContext {
+function buildGroundingContext(
+  ctx: LoopContext,
+  modelRef: string,
+  stageProfile: LLMInputStageProfile
+): GroundingContext {
   const evidenceStarters = ctx.context?.evidenceStarters;
   const evidenceStarterRefs = uniqueStrings(extractSourceRefsFromValue(evidenceStarters)).slice(
     0,
@@ -550,8 +731,9 @@ function buildGroundingContext(ctx: LoopContext, modelRef: string): GroundingCon
   // CP1 grounding-policy 注入仅在 grounding enforcement = 'guard' 时生效（AP-3 切默认）；
   // 默认 'off' 下 analyze 全路径都不注入政策文本（PCV observe-only）。
   // PD5：deterministicEvidenceRefs / evidenceStarterRefs 注入不随此开关，始终保留为默认 analyze 上下文。
+  // stageProfile 由 buildLlmInputAssembly 带 toolChoice 解析一次后传入，与 provider 看到的 stagePolicy 一致。
   const policy =
-    ctx.groundingEnforcement === 'guard' && resolveLlmInputStageProfile(ctx) === 'analyze'
+    ctx.groundingEnforcement === 'guard' && stageProfile === 'analyze'
       ? buildAnalyzeGroundingPolicy(modelRef, deterministicEvidenceRefs.length)
       : null;
   return { deterministicEvidenceRefs, evidenceStarterRefs, policy };
@@ -570,27 +752,219 @@ function buildDynamicContextSection(dynamicContext: string | null): LLMInputSect
   };
 }
 
+/**
+ * 章节压缩：跨章节逐行去重 + 章节字符预算。顺序与口径：
+ * 1. 去重只“判定”不“登记”：与之前章节（或本章节更早的行）逐字相同的长行被删除；
+ * 2. 预算在行边界上执行：先按 EVIDENCE_TELEMETRY_DROP_ORDER 整行丢低优先级遥测行，仍超出才从尾部整行截断；
+ *    只有剩余预算足够时才把放不下的那一行截成前缀；
+ * 3. 只把最终完整保留的行登记进 seenBlocks——被预算截掉的行不会让后续章节里的同一行被误删。
+ * dedupedSectionIds 只统计真实删除了重复行的章节；预算截断单独记录在 budgetedSections 并发诊断。
+ */
 function compactInputLayerSections(
-  sections: LLMInputSection[],
-  stageProfile: LLMInputStageProfile
+  sections: DraftInputLayerSection[],
+  stageProfile: LLMInputStageProfile,
+  diagnostics: LoopContext['diagnostics'] | undefined
 ): LLMInputCompactionResult {
   const seenBlocks = new Set<string>();
   const dedupedSectionIds: LLMInputSectionId[] = [];
+  const dedupedLineCounts: Partial<Record<LLMInputSectionId, number>> = {};
   const budgetedSectionIds: LLMInputSectionId[] = [];
-  const compacted = sections.map((section) => {
-    const content = compactRepeatedBlocks(section.content, seenBlocks);
-    let nextContent = content;
-    const maxChars = sectionBudgetFor(stageProfile, section.id);
-    if (nextContent.length > maxChars) {
-      nextContent = limitText(nextContent, maxChars);
-      budgetedSectionIds.push(section.id);
-    }
-    if (nextContent !== section.content) {
+  const budgetedSections: LLMInputSectionBudgetRecord[] = [];
+  const compacted = sections.map((draft) => {
+    const { lowPriorityLines, ...section } = draft;
+    const deduped = compactRepeatedBlocks(section.content, seenBlocks);
+    if (deduped.droppedLines > 0) {
       dedupedSectionIds.push(section.id);
+      dedupedLineCounts[section.id] = deduped.droppedLines;
     }
-    return { ...section, content: nextContent };
+    const maxChars = sectionBudgetFor(stageProfile, section.id);
+    const budgeted = applySectionBudget(deduped.paragraphs, maxChars, lowPriorityLines);
+    for (const line of budgeted.keptLines) {
+      if (line.key) {
+        seenBlocks.add(line.key);
+      }
+    }
+    if (budgeted.record) {
+      const record: LLMInputSectionBudgetRecord = {
+        sectionId: section.id,
+        maxChars,
+        originalChars: section.content.length,
+        keptChars: budgeted.content.length,
+        ...budgeted.record,
+      };
+      budgetedSectionIds.push(section.id);
+      budgetedSections.push(record);
+      // 同一诊断收集器（通常即一次 loop）里同阶段同章节只告警一次，避免每轮都刷 warning；
+      // 每一轮的截断细节仍完整记录在 llm.input 过程事件的 metadata.inputCompaction.budgetedSections。
+      warnSectionBudgetOnce(diagnostics, `${stageProfile}:${section.id}:lines`, {
+        code: SECTION_BUDGET_DIAGNOSTIC_CODE,
+        message:
+          `LLM input section ${section.id} exceeded the ${maxChars}-char ${stageProfile} budget ` +
+          `(${record.originalChars} -> ${record.keptChars} chars): dropped low-priority lines ` +
+          `[${record.droppedLowPriorityLines.join(', ') || 'none'}], dropped ${record.droppedLines} line(s) in total` +
+          `${record.partialLine ? ', cut one line to a prefix' : ''}. ` +
+          'Later rounds are recorded in llm.input metadata.inputCompaction.budgetedSections.',
+        stage: stageProfile,
+      });
+    }
+    return { ...section, content: budgeted.content };
   });
-  return { budgetedSectionIds, dedupedSectionIds, sections: compacted };
+  return {
+    budgetedSectionIds,
+    budgetedSections,
+    dedupedLineCounts,
+    dedupedSectionIds,
+    sections: compacted,
+  };
+}
+
+interface CompactionLine {
+  /** 去重键；短行（< 48 字符）为 null，不参与去重。 */
+  key: string | null;
+  text: string;
+}
+
+interface SectionBudgetResult {
+  content: string;
+  /** 最终完整保留的行（被截成前缀的行不算），只有它们会登记进 seenBlocks。 */
+  keptLines: CompactionLine[];
+  record: Pick<
+    LLMInputSectionBudgetRecord,
+    'droppedLines' | 'droppedLowPriorityLines' | 'partialLine'
+  > | null;
+}
+
+function renderParagraphs(paragraphs: CompactionLine[][]): string {
+  return paragraphs
+    .filter((lines) => lines.length > 0)
+    .map((lines) => lines.map((line) => line.text).join('\n'))
+    .join('\n\n');
+}
+
+function applySectionBudget(
+  paragraphs: CompactionLine[][],
+  maxChars: number,
+  lowPriorityLines: ReadonlyMap<string, EvidenceTelemetryKey> | undefined
+): SectionBudgetResult {
+  const content = renderParagraphs(paragraphs);
+  if (content.length <= maxChars) {
+    return { content, keptLines: paragraphs.flat(), record: null };
+  }
+
+  // 第一步：整行丢弃低优先级遥测行（按固定顺序，够了就停）。
+  let working = paragraphs.map((lines) => [...lines]);
+  const droppedLowPriorityLines: EvidenceTelemetryKey[] = [];
+  let droppedLines = 0;
+  if (lowPriorityLines && lowPriorityLines.size > 0) {
+    for (const telemetryKey of EVIDENCE_TELEMETRY_DROP_ORDER) {
+      if (renderParagraphs(working).length <= maxChars) {
+        break;
+      }
+      const before = working.reduce((total, lines) => total + lines.length, 0);
+      working = working.map((lines) =>
+        lines.filter((line) => lowPriorityLines.get(line.text) !== telemetryKey)
+      );
+      const removed = before - working.reduce((total, lines) => total + lines.length, 0);
+      if (removed > 0) {
+        droppedLowPriorityLines.push(telemetryKey);
+        droppedLines += removed;
+      }
+    }
+  }
+  const afterLowPriority = renderParagraphs(working);
+  if (afterLowPriority.length <= maxChars) {
+    return {
+      content: afterLowPriority,
+      keptLines: working.flat(),
+      record: { droppedLines, droppedLowPriorityLines, partialLine: false },
+    };
+  }
+
+  // 第二步：仍超出时从尾部按行截断，为截断标记预留空间。
+  const limit = Math.max(0, maxChars - TRUNCATION_MARKER_RESERVE);
+  const keptParagraphs: CompactionLine[][] = [];
+  const keptLines: CompactionLine[] = [];
+  let length = 0;
+  let hasKeptLine = false;
+  let partialLine = false;
+  let stopped = false;
+  let tailDropped = 0;
+  for (const lines of working.filter((paragraphLines) => paragraphLines.length > 0)) {
+    if (stopped) {
+      tailDropped += lines.length;
+      continue;
+    }
+    const paragraphLines: CompactionLine[] = [];
+    for (const line of lines) {
+      if (stopped) {
+        tailDropped++;
+        continue;
+      }
+      // 行间分隔：段内 '\n'，新段落 '\n\n'，首行无分隔。
+      const separator = !hasKeptLine ? 0 : paragraphLines.length > 0 ? 1 : 2;
+      if (length + separator + line.text.length <= limit) {
+        paragraphLines.push(line);
+        keptLines.push(line);
+        length += separator + line.text.length;
+        hasKeptLine = true;
+        continue;
+      }
+      stopped = true;
+      const remaining = limit - length - separator;
+      if (remaining >= MIN_PARTIAL_LINE_CHARS) {
+        // 单行放不下但剩余预算可观：保留前缀（不登记去重键，完整行在后续章节出现时仍保留）。
+        const prefix = cutLineAtSoftBoundary(line.text, remaining);
+        paragraphLines.push({ key: null, text: prefix });
+        length += separator + prefix.length;
+        partialLine = true;
+      } else {
+        tailDropped++;
+      }
+    }
+    if (paragraphLines.length > 0) {
+      keptParagraphs.push(paragraphLines);
+    }
+  }
+  droppedLines += tailDropped;
+  const marker = `...(truncated: ${tailDropped} line(s) omitted${partialLine ? ' and 1 line cut' : ''} by ${maxChars}-char section budget)`;
+  const kept = renderParagraphs(keptParagraphs);
+  return {
+    content: kept ? `${kept}\n${marker}` : marker,
+    keptLines,
+    record: { droppedLines, droppedLowPriorityLines, partialLine },
+  };
+}
+
+/** 把一行截成不超过 maxChars 的前缀，尽量停在逗号或空格处，并以 … 标明被截断。 */
+function cutLineAtSoftBoundary(text: string, maxChars: number): string {
+  const hard = text.slice(0, Math.max(0, maxChars - 1));
+  const boundary = Math.max(hard.lastIndexOf(', '), hard.lastIndexOf(' '));
+  const cut = boundary >= Math.floor(hard.length * 0.6) ? hard.slice(0, boundary) : hard;
+  return `${cut.trimEnd()}…`;
+}
+
+/** 每个诊断收集器已发出的章节预算告警键；WeakMap 随收集器（即一次 loop）回收。 */
+const emittedSectionBudgetWarnings = new WeakMap<object, Set<string>>();
+
+function warnSectionBudgetOnce(
+  diagnostics: LoopContext['diagnostics'] | undefined,
+  key: string,
+  warning: AgentDiagnosticWarning
+): void {
+  // 鸭子类型 ctx（测试或宿主注入）可能没有诊断收集器；此时截断信息只保留在 metadata 中。
+  if (!diagnostics || typeof diagnostics.warn !== 'function') {
+    return;
+  }
+  let emitted = emittedSectionBudgetWarnings.get(diagnostics);
+  if (!emitted) {
+    emitted = new Set<string>();
+    emittedSectionBudgetWarnings.set(diagnostics, emitted);
+  }
+  if (emitted.has(key)) {
+    return;
+  }
+  emitted.add(key);
+  diagnostics.warn(warning);
 }
 
 function sectionBudgetFor(
@@ -613,33 +987,41 @@ function sectionBudgetFor(
   return defaultBudgets[sectionId] ?? 2400;
 }
 
-function compactRepeatedBlocks(text: string, seenBlocks: Set<string>): string {
-  const paragraphs = text.split(/\n{2,}/);
-  const compactedParagraphs: string[] = [];
-  for (const paragraph of paragraphs) {
-    const lines = paragraph.split('\n');
-    const compactedLines: string[] = [];
-    let paragraphDropped = false;
-    for (const line of lines) {
+/**
+ * 跨章节逐行去重：只读判定 seenBlocks（之前章节最终保留的行），本章节内的重复用局部集合判定。
+ * 这里不登记 seenBlocks——要等预算决定哪些行最终保留后，由 compactInputLayerSections 登记。
+ * droppedLines 只统计真实删除的重复行；空段落 / 多余空行的规整不计入去重口径。
+ */
+function compactRepeatedBlocks(
+  text: string,
+  seenBlocks: ReadonlySet<string>
+): { droppedLines: number; paragraphs: CompactionLine[][] } {
+  const localBlocks = new Set<string>();
+  const paragraphs: CompactionLine[][] = [];
+  let droppedLines = 0;
+  for (const paragraph of text.split(/\n{2,}/)) {
+    const compactedLines: CompactionLine[] = [];
+    for (const line of paragraph.split('\n')) {
       const key = normalizeCompactionBlock(line);
-      if (key && hasSeenCompactionBlock(key, seenBlocks)) {
-        paragraphDropped = lines.length === 1;
+      if (key && (seenBlocks.has(key) || localBlocks.has(key))) {
+        droppedLines++;
         continue;
       }
-      compactedLines.push(line);
+      compactedLines.push({ key, text: line });
       if (key) {
-        seenBlocks.add(key);
+        localBlocks.add(key);
       }
     }
-    if (!paragraphDropped && compactedLines.join('\n').trim()) {
-      compactedParagraphs.push(compactedLines.join('\n'));
+    if (
+      compactedLines
+        .map((line) => line.text)
+        .join('\n')
+        .trim()
+    ) {
+      paragraphs.push(compactedLines);
     }
   }
-  return compactedParagraphs.join('\n\n');
-}
-
-function hasSeenCompactionBlock(key: string, seenBlocks: Set<string>): boolean {
-  return seenBlocks.has(key);
+  return { droppedLines, paragraphs };
 }
 
 function normalizeCompactionBlock(text: string): string | null {
@@ -672,16 +1054,6 @@ function safeJson(value: unknown): string {
   } catch {
     return '"[unserializable]"';
   }
-}
-
-function pickDefined(values: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(values)) {
-    if (value !== undefined && value !== null && value !== '') {
-      result[key] = value;
-    }
-  }
-  return result;
 }
 
 function limitText(text: string, maxChars: number): string {
