@@ -1,10 +1,12 @@
 /** 严格分析上下文、epoch推进与扩展日程；保持现有hash格式和Core日程裁决。 */
+import Logger from '@alembic/core/logging';
 import {
   type AnalysisScheduleExpansionRowV1,
   createFinalExpandedMiningScheduleReceiptV1,
   type FinalExpandedMiningScheduleReceiptV1,
   validateAnalysisScheduleExpansionV1,
 } from '@alembic/core/production';
+import { observeSafely } from '#shared/observers.js';
 import {
   assertSameIds,
   fail,
@@ -391,8 +393,14 @@ export class StrictAnalysisExpansionPortV1 {
     return row;
   }
 
-  /** Core 生成并校验回执后，先核对调用者的预期再提交状态；无参调用保持兼容。 */
+  /**
+   * Core 生成并校验回执后，先核对调用者的预期再提交状态；无参调用保持兼容。
+   * 无参路径（C26）：唯一宿主当前在 Agent transition 校验之前无参封口，跳过了预期 hash 核对，
+   * 所以每次都记录兼容诊断；核对会推迟到 Agent 门随后的 seal(expectedHash)（已封口时比对缓存日程）。
+   * 宿主改用预览日程后才可删除无参签名，在此之前不得收窄。
+   */
   seal(expectedFinalScheduleHash?: string) {
+    const alreadyFinal = this.#finalSchedule !== null;
     const schedule =
       this.#finalSchedule ??
       createFinalExpandedMiningScheduleReceiptV1({
@@ -407,6 +415,27 @@ export class StrictAnalysisExpansionPortV1 {
       fail('STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH');
     }
     this.#finalSchedule = schedule;
+    if (expectedFinalScheduleHash === undefined) {
+      // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，封口结果不因诊断失败而回滚。
+      observeSafely(
+        () =>
+          Logger.getInstance().info(
+            '[StrictAnalysisExpansionPort] seal without expected schedule hash (compatibility path)',
+            {
+              component: 'StrictAnalysisExpansionPortV1',
+              compatibility: 'no-argument-seal',
+              reason: 'caller-omitted-expected-final-schedule-hash',
+              selectedPath: 'commit-without-expected-hash-check',
+              alreadyFinal,
+              baselineScheduleHash: this.#input.baselineScheduleHash,
+              finalExpandedScheduleHash: schedule.finalExpandedScheduleHash,
+              expansionReceiptCount: this.#receipts.length,
+              followUpCheck: 'agent-gate-seal-with-expected-hash',
+            }
+          ),
+        () => undefined
+      );
+    }
     return schedule;
   }
 

@@ -23,12 +23,19 @@ export interface StrictProductionRuntimePortV1 {
   readonly expansionPort: StrictAnalysisExpansionPortV1;
   readonly readAnalysisEpoch: () => StrictAnalysisEpochSnapshotV1;
   readonly buildProducerInput: (analysisArtifact: unknown) => Readonly<Record<string, unknown>>;
+  /**
+   * options.signal 是本次门评估的取消信号（PipelineStrategy runOperation 提供）。宿主应在 enroll
+   * 扩展、执行事实查询或改写 state 之前检查它；参数可选，只声明前两个参数的旧宿主仍可赋值。
+   */
   readonly validateAnalystResult: (
     source: unknown,
-    observedEpoch: StrictAnalysisEpochSnapshotV1
+    observedEpoch: StrictAnalysisEpochSnapshotV1,
+    options?: { readonly signal?: AbortSignal }
   ) => StrictAnalysisGateOutcomeV1 | Promise<StrictAnalysisGateOutcomeV1>;
+  /** options.signal 语义同 validateAnalystResult；宿主不响应时 Agent 侧仍在调用前后失败关闭。 */
   readonly reviewProducerResult: (
-    source: unknown
+    source: unknown,
+    options?: { readonly signal?: AbortSignal }
   ) => StrictProductionGateResultV1 | Promise<StrictProductionGateResultV1>;
 }
 
@@ -98,7 +105,11 @@ export function buildStrictProductionPipelineStagesV1() {
           strategyContext: Record<string, unknown>
         ) =>
           invokeGatePort(
-            () => readStrictPort(strategyContext).reviewProducerResult(source),
+            () =>
+              readStrictPort(strategyContext).reviewProducerResult(
+                source,
+                readStrictPortCallOptions(strategyContext, 'G2', 'reviewProducerResult')
+              ),
             strategyContext
           ),
         strictGate: {
@@ -137,6 +148,38 @@ function assertStrictGateActive(context: Record<string, unknown>): void {
   if ((context.abortSignal as AbortSignal | undefined)?.aborted) {
     throw new Error('STRICT_PRODUCTION_ABORTED');
   }
+}
+
+/**
+ * 构造宿主端口调用选项：把门评估的 abortSignal 原样透传给宿主，让宿主能在取消后停止 enroll、
+ * 事实查询和 state 改写（C25）。宿主可以忽略它，所以调用前后的 assertStrictGateActive 仍是
+ * Agent 侧的最终保证。没有取消作用域（直接调用 evaluator）时传空选项；值不是 AbortSignal 时
+ * 不把伪造对象交给宿主，而是不带 signal 调用并记录诊断，避免宿主在其上调用 addEventListener 崩溃。
+ */
+function readStrictPortCallOptions(
+  context: Record<string, unknown>,
+  gate: 'G1' | 'G2',
+  port: 'validateAnalystResult' | 'reviewProducerResult'
+): { readonly signal?: AbortSignal } {
+  const signal = context.abortSignal;
+  if (signal === undefined) {
+    return Object.freeze({});
+  }
+  if (signal instanceof AbortSignal) {
+    return Object.freeze({ signal });
+  }
+  observeSafely(
+    () =>
+      Logger.getInstance().warn('[StrictProductionStages] strict port abort signal not forwarded', {
+        gate,
+        port,
+        reason: 'abort-signal-not-an-AbortSignal',
+        receivedType: signal === null ? 'null' : typeof signal,
+        selectedPath: 'call-port-without-signal',
+      }),
+    () => undefined
+  );
+  return Object.freeze({});
 }
 
 /** G2 的宿主回执先归一化，再交给 Pipeline 生成 Core typed return；truthy 值不是通过。 */
@@ -191,7 +234,11 @@ async function invokeStrictAnalysisGate(
     const strict = readStrictPort(strategyContext);
     const before = readStrictAnalysisEpoch(strict);
     assertStrictGateActive(strategyContext);
-    const rawOutcome = await strict.validateAnalystResult(source, before);
+    const rawOutcome = await strict.validateAnalystResult(
+      source,
+      before,
+      readStrictPortCallOptions(strategyContext, 'G1', 'validateAnalystResult')
+    );
     assertStrictGateActive(strategyContext);
     if (rawOutcome?.kind !== 'StrictAnalysisGateOutcomeV1' || rawOutcome.schemaVersion !== 1) {
       throw new Error('STRICT_ANALYSIS_GATE_OUTCOME_UNTYPED');
