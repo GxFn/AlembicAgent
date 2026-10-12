@@ -18,12 +18,15 @@ import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import {
   AgentRuntime,
   buildLlmInputAssembly,
+  buildPcvNodeEvidenceProcessMetadata,
   createMessageAdapter,
+  createPcvNodeEvidence,
   DiagnosticsCollector,
   LoopContext,
   measureLlmInputAssembly,
   measurePromptText,
   type ProgressEvent,
+  recordPcvInputAssembly,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
 import type { UnifiedMessage } from '../src/ai/contracts.js';
@@ -2039,5 +2042,308 @@ describe('LLM input section budget keeps authoritative facts first (I09)', () =>
     expect(warnings.length).toBeGreaterThan(0);
     expect(new Set(warnings.map((warning) => warning.message)).size).toBe(warnings.length);
     expect(warnings.every((warning) => warning.stage === 'produce')).toBe(true);
+  });
+});
+
+describe('analyze deterministic evidence refs stay visible and auditable (I10)', () => {
+  const COORDINATOR_FILES = Array.from(
+    { length: 15 },
+    (_, index) => `Sources/AppFeature/Coordinators/FeatureCoordinator${index}.swift`
+  );
+  const REFS_LINE_PREFIX = 'deterministicEvidenceRefs: ';
+
+  // 生产形状：宿主 DimensionRuntimeBuilder 用 Core buildEvidenceStarters 生成 evidenceStarters，
+  // architecture 维度 + guard 审计（5 条维度违规 + 5 条跨文件违规 × 2 文件 = 15 个路径型 ref）。
+  function coreEvidenceStarters() {
+    const starters = buildEvidenceStarters(
+      { id: 'architecture', label: 'Architecture' },
+      {
+        guardAudit: {
+          files: COORDINATOR_FILES.slice(0, 5).map((filePath) => ({
+            filePath,
+            violations: [{ ruleId: 'architecture-layer', message: 'architecture layer violation' }],
+          })),
+          crossFileViolations: Array.from({ length: 5 }, (_, index) => ({
+            ruleId: 'layer-penetration',
+            message: 'layer penetration',
+            locations: [
+              { filePath: COORDINATOR_FILES[5 + index * 2] },
+              { filePath: COORDINATOR_FILES[6 + index * 2] },
+            ],
+          })),
+        },
+      }
+    );
+    if (!starters?.guardViolations || !starters.crossFileViolations) {
+      throw new Error('Core evidence starters must include guard and cross-file violations');
+    }
+    return starters;
+  }
+
+  function assembleCoreAnalyze({
+    groundingEnforcement,
+    referencedFiles,
+    diagnostics = null,
+  }: {
+    groundingEnforcement: 'off' | 'guard';
+    referencedFiles?: string[];
+    diagnostics?: DiagnosticsCollector | null;
+  }) {
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 24, pipelineType: 'analyst' }
+    );
+    if (!tracker) {
+      throw new Error('Real analyst tracker must resolve for system source');
+    }
+    tracker.tick();
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Analyze architecture for the architecture dimension.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: ANALYST_SYSTEM_PROMPT,
+      budget: { maxIterations: 24 },
+      capabilities: [],
+      context: {
+        dimensionId: 'architecture',
+        evidenceStarters: coreEvidenceStarters(),
+        pipelinePhase: 'analyze',
+        ...(referencedFiles ? { referencedFiles } : {}),
+      },
+      diagnostics,
+      groundingEnforcement,
+      messages,
+      prompt: 'Analyze architecture for the architecture dimension.',
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker,
+      trace: new ActiveContext(),
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: ANALYST_SYSTEM_PROMPT,
+      tools: [{ name: 'code', description: 'Read source files' }],
+    });
+    const evidence = createPcvNodeEvidence(ctx);
+    recordPcvInputAssembly(evidence, assembly, {
+      effectiveToolChoice: 'auto',
+      iteration: 1,
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+    });
+    return { assembly, evidence };
+  }
+
+  function sectionContent(assembly: ReturnType<typeof buildLlmInputAssembly>, id: string) {
+    return assembly.sections.find((section) => section.id === id)?.content ?? '';
+  }
+
+  /** provider 实际看到的 ref 列表：解析 evidenceContext 中 deterministicEvidenceRefs 行的条目。 */
+  function providerVisibleRefEntries(evidenceContext: string): string[] {
+    const line = evidenceContext.split('\n').find((item) => item.startsWith(REFS_LINE_PREFIX));
+    return line ? line.slice(REFS_LINE_PREFIX.length).split(', ') : [];
+  }
+
+  function occurrences(text: string, needle: string): number {
+    return text.split(needle).length - 1;
+  }
+
+  it('keeps the guard policy and every Core starter ref visible without a duplicated starter list', () => {
+    const { assembly, evidence } = assembleCoreAnalyze({ groundingEnforcement: 'guard' });
+    const refs = assembly.metadata.deterministicEvidenceRefs as string[];
+    const policy = assembly.metadata.groundingPolicy as string | null;
+    const stagePolicy = sectionContent(assembly, 'stagePolicy');
+    const evidenceContext = sectionContent(assembly, 'evidenceContext');
+
+    expect(assembly.stageProfile).toBe('analyze');
+    expect(refs).toHaveLength(15);
+    // 生产 analyze 路径：starter 列表与 deterministic 列表是同一列表。
+    expect(assembly.metadata.evidenceStarterRefs).toEqual(refs);
+    // CP1 政策文本移入 stagePolicy 章节，不再与 ref 列表争 evidenceContext 预算。
+    expect(typeof policy).toBe('string');
+    expect(stagePolicy).toContain(`evidenceGroundingPolicy: ${policy}`);
+    expect(evidenceContext).not.toContain('evidenceGroundingPolicy:');
+    expect(assembly.inputLayerMessage?.content).toContain(`evidenceGroundingPolicy: ${policy}`);
+    // 每个 ref 在 evidenceContext 中只出现一次（不再重复输出 starter 列表）。
+    expect(providerVisibleRefEntries(evidenceContext)).toEqual(refs);
+    for (const ref of refs) {
+      expect(occurrences(evidenceContext, ref)).toBe(1);
+    }
+    expect(evidenceContext.length).toBeLessThanOrEqual(1400);
+    // 只增字段：可见 ref 与 provider 文本一致，原字段含义不变。
+    expect(assembly.metadata.visibleDeterministicEvidenceRefs).toEqual(refs);
+    expect(assembly.metadata.omittedDeterministicEvidenceRefCount).toBe(0);
+    expect(evidence.groundingLedger[0]).toMatchObject({
+      deterministicEvidenceRefs: refs,
+      evidenceStarterRefs: refs,
+      omittedDeterministicEvidenceRefCount: 0,
+      visibleDeterministicEvidenceRefs: refs,
+    });
+  });
+
+  it('cuts deterministic refs at entry boundaries and records only the visible prefix', () => {
+    const referencedFiles = Array.from(
+      { length: 17 },
+      (_, index) =>
+        `Sources/AppFeature/Features/Checkout/CheckoutFlowViewModel${index}.swift:${index + 10}`
+    );
+    const diagnostics = new DiagnosticsCollector();
+    const { assembly, evidence } = assembleCoreAnalyze({
+      diagnostics,
+      groundingEnforcement: 'guard',
+      referencedFiles,
+    });
+    const refs = assembly.metadata.deterministicEvidenceRefs as string[];
+    const visible = assembly.metadata.visibleDeterministicEvidenceRefs as string[];
+    const omitted = assembly.metadata.omittedDeterministicEvidenceRefCount as number;
+    const evidenceContext = sectionContent(assembly, 'evidenceContext');
+    const entries = providerVisibleRefEntries(evidenceContext);
+
+    // 原字段仍是完整列表（宿主 observe-only 统计按名消费，含义不变）。
+    expect(refs).toHaveLength(32);
+    expect(refs.slice(0, 15)).toEqual(assembly.metadata.evidenceStarterRefs);
+    // 条目边界截断：provider 文本里的每个条目都是完整 ref，且恰好等于 metadata 记录的可见集合。
+    expect(entries).toEqual(visible);
+    expect(entries.every((entry) => refs.includes(entry))).toBe(true);
+    expect(visible.length).toBeGreaterThan(0);
+    expect(visible.length).toBeLessThan(refs.length);
+    expect(visible).toEqual(refs.slice(0, visible.length));
+    expect(omitted).toBe(refs.length - visible.length);
+    expect(evidenceContext).toContain(
+      `deterministicEvidenceRefsOmitted: ${omitted} of ${refs.length}`
+    );
+    expect(evidenceContext).not.toContain('…');
+    expect(evidenceContext.length).toBeLessThanOrEqual(1400);
+    // CP4 nudge 引用前 8 条 ref，它们必须对模型可见。
+    for (const ref of refs.slice(0, 8)) {
+      expect(visible).toContain(ref);
+    }
+    expect(sectionContent(assembly, 'stagePolicy')).toContain('evidenceGroundingPolicy:');
+    expect(diagnostics.toJSON().warnings).toContainEqual(
+      expect.objectContaining({
+        code: 'llm_input_section_budgeted',
+        message: expect.stringContaining(
+          `deterministicEvidenceRefs showed ${visible.length} of 32`
+        ),
+        stage: 'analyze',
+      })
+    );
+    // PCV grounding 台账：原字段记完整列表，新增字段记实际可见集合与省略数。
+    expect(evidence.groundingLedger[0]).toMatchObject({
+      deterministicEvidenceRefs: refs,
+      omittedDeterministicEvidenceRefCount: omitted,
+      visibleDeterministicEvidenceRefs: visible,
+    });
+    expect(buildPcvNodeEvidenceProcessMetadata(evidence).groundingLedger[0]).toMatchObject({
+      omittedDeterministicEvidenceRefCount: omitted,
+      visibleDeterministicEvidenceRefs: visible,
+    });
+  });
+
+  it('keeps the policy out of every section in off mode while still recording visible refs', () => {
+    const { assembly, evidence } = assembleCoreAnalyze({ groundingEnforcement: 'off' });
+    const refs = assembly.metadata.deterministicEvidenceRefs as string[];
+
+    expect(assembly.metadata.groundingPolicy).toBeNull();
+    expect(assembly.inputLayerMessage?.content).not.toContain('evidenceGroundingPolicy:');
+    expect(providerVisibleRefEntries(sectionContent(assembly, 'evidenceContext'))).toEqual(refs);
+    expect(assembly.metadata.visibleDeterministicEvidenceRefs).toEqual(refs);
+    expect(evidence.groundingLedger[0]).toMatchObject({
+      omittedDeterministicEvidenceRefCount: 0,
+      visibleDeterministicEvidenceRefs: refs,
+    });
+  });
+
+  it('never reports refs as visible when section compaction removed the refs line', () => {
+    const refs = ['Sources/App/Feature.swift:12', 'Sources/App/FeatureStore.swift:40'];
+    // 异常路径：同一 ref 行已在更早章节（taskContext 的 prompt）出现，evidenceContext 中的 ref 行被跨章节去重。
+    const echoedRefsLine = `deterministicEvidenceRefs: ${refs.join(', ')}`;
+    const diagnostics = new DiagnosticsCollector();
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Analyze the feature boundary.');
+    const ctx = new LoopContext({
+      allowedToolIds: ['code'],
+      baseSystemPrompt: 'Analyst identity prompt',
+      budget: { maxIterations: 1 },
+      capabilities: [],
+      context: { deterministicEvidenceRefs: refs, pipelinePhase: 'analyze' },
+      diagnostics,
+      messages,
+      prompt: echoedRefsLine,
+      source: 'system',
+      toolSchemas: [{ name: 'code', description: 'Read source files' }],
+      tracker: createTracker({ phase: 'SCAN', pipelineType: 'analyst' }) as never,
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt: 'Analyst identity prompt',
+      tools: [{ name: 'code', description: 'Read source files' }],
+    });
+    const evidence = createPcvNodeEvidence(ctx);
+    recordPcvInputAssembly(evidence, assembly, { iteration: 1, modelRef: 'unit-model' });
+
+    expect(sectionContent(assembly, 'taskContext')).toContain(echoedRefsLine);
+    expect(providerVisibleRefEntries(sectionContent(assembly, 'evidenceContext'))).toEqual([]);
+    expect(assembly.metadata.deterministicEvidenceRefs).toEqual(refs);
+    expect(assembly.metadata.visibleDeterministicEvidenceRefs).toEqual([]);
+    expect(assembly.metadata.omittedDeterministicEvidenceRefCount).toBe(2);
+    expect(diagnostics.toJSON().warnings).toContainEqual(
+      expect.objectContaining({
+        code: 'llm_input_section_budgeted',
+        message: expect.stringContaining(
+          'deterministicEvidenceRefs planned 2 visible refs but only 0 survived'
+        ),
+        stage: 'analyze',
+      })
+    );
+    expect(evidence.groundingLedger[0]).toMatchObject({
+      deterministicEvidenceRefs: refs,
+      omittedDeterministicEvidenceRefCount: 2,
+      visibleDeterministicEvidenceRefs: [],
+    });
+  });
+
+  it('leaves the visible-ref ledger fields absent for assemblies that do not report them', () => {
+    const { assembly, evidence } = assembleCoreAnalyze({ groundingEnforcement: 'off' });
+    const legacyEvidence = createPcvNodeEvidence(
+      new LoopContext({
+        budget: { maxIterations: 1 },
+        capabilities: [],
+        context: { pipelinePhase: 'analyze' },
+        messages: createMessageAdapter(null),
+        prompt: 'legacy',
+        source: 'system',
+      })
+    );
+    const {
+      visibleDeterministicEvidenceRefs: _visible,
+      omittedDeterministicEvidenceRefCount: _omitted,
+      ...legacyMetadata
+    } = assembly.metadata;
+    recordPcvInputAssembly(legacyEvidence, { ...assembly, metadata: legacyMetadata });
+
+    expect(evidence.groundingLedger[0].visibleDeterministicEvidenceRefs).toEqual(
+      assembly.metadata.deterministicEvidenceRefs
+    );
+    // 缺省表示“未知”，绝不拿完整列表冒充可见集合。
+    expect(legacyEvidence.groundingLedger[0].deterministicEvidenceRefs).toEqual(
+      assembly.metadata.deterministicEvidenceRefs
+    );
+    expect(legacyEvidence.groundingLedger[0]).not.toHaveProperty(
+      'visibleDeterministicEvidenceRefs'
+    );
+    expect(legacyEvidence.groundingLedger[0]).not.toHaveProperty(
+      'omittedDeterministicEvidenceRefCount'
+    );
   });
 });

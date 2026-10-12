@@ -85,7 +85,24 @@ interface ProducerSubmitLedgerProjection {
   totalEntries: number;
 }
 
+/**
+ * deterministicEvidenceRefs 的章节投影（I10）：按条目边界装入 evidenceContext 预算后“计划展示”的前缀。
+ * 最终是否真的对 provider 可见，以章节压缩之后的文本为准（见 resolveDeterministicEvidenceRefVisibility）。
+ */
+interface DeterministicEvidenceRefProjection {
+  budgetChars: number;
+  plannedVisibleRefs: string[];
+  totalRefs: number;
+}
+
+/** 本轮 provider 实际可见的 deterministicEvidenceRefs；写入 metadata 与 PCV grounding 台账的只增字段。 */
+interface DeterministicEvidenceRefVisibility {
+  omittedCount: number;
+  visibleRefs: string[];
+}
+
 interface EvidenceContextBuild {
+  deterministicRefs: DeterministicEvidenceRefProjection | null;
   ledger: ProducerSubmitLedgerProjection | null;
   omittedEmptyTelemetry: EvidenceTelemetryKey[];
   section: DraftInputLayerSection;
@@ -102,6 +119,9 @@ const MAX_PRODUCER_LEDGER_TITLE_CHARS = 120;
 const PRODUCER_SUBMIT_LEDGER_POLICY =
   'producerSubmitLedgerPolicy: treat payloadStored and requiredFieldsComplete as authoritative runtime facts; do not infer missing fields from compacted provider history.';
 const SECTION_BUDGET_DIAGNOSTIC_CODE = 'llm_input_section_budgeted';
+/** evidenceContext 中 ref 列表行的固定前缀；可见性解析与宿主按文本查找都依赖它，不要改名。 */
+const DETERMINISTIC_REFS_LINE_PREFIX = 'deterministicEvidenceRefs: ';
+const DETERMINISTIC_REFS_SEPARATOR = ', ';
 
 export interface BuildLlmInputAssemblyOptions {
   ctx: LoopContext;
@@ -138,7 +158,7 @@ export function buildLlmInputAssembly({
     (!ctx.allowedToolActions?.code || ctx.allowedToolActions.code.includes('read'));
   const evidenceContext = buildEvidenceContextSection(ctx, groundingContext, stageProfile);
   const rawInputLayerSections = [
-    buildStagePolicySection(stageProfile, ctx, scanReadAllowed),
+    buildStagePolicySection(stageProfile, ctx, scanReadAllowed, groundingContext.policy),
     buildToolContractSection(
       stageProfile,
       requestedToolChoice,
@@ -156,6 +176,13 @@ export function buildLlmInputAssembly({
     ctx.diagnostics
   );
   const inputLayerSections = inputCompaction.sections;
+  // 可见 ref 以压缩后的最终章节文本为准：metadata / PCV 台账只能记录模型真正看到的条目。
+  const deterministicRefVisibility = resolveDeterministicEvidenceRefVisibility(
+    evidenceContext.deterministicRefs,
+    inputLayerSections.find((section) => section.id === 'evidenceContext')?.content ?? '',
+    stageProfile,
+    ctx.diagnostics
+  );
   if (evidenceContext.ledger && evidenceContext.ledger.entriesOmitted > 0) {
     // 台账按“最新优先”只保留预算内的条目；被省略的条数已写进 provider 文本（entriesOmitted=N），
     // 这里再留一条运行级诊断，便于排查模型为何看不到较早的提交。
@@ -195,8 +222,12 @@ export function buildLlmInputAssembly({
       inputSectionIds: sections.map((section) => section.id),
       inputStageProfile: stageProfile,
       inputLayerAppended: Boolean(inputLayerMessage),
+      // deterministicEvidenceRefs / evidenceStarterRefs 保持“注入候选的完整列表”原含义（宿主按名消费）；
+      // 以下两个只增字段记录 provider 实际可见的前缀与被预算省略的条数（I10）。
       deterministicEvidenceRefs: groundingContext.deterministicEvidenceRefs,
       evidenceStarterRefs: groundingContext.evidenceStarterRefs,
+      visibleDeterministicEvidenceRefs: deterministicRefVisibility.visibleRefs,
+      omittedDeterministicEvidenceRefCount: deterministicRefVisibility.omittedCount,
       groundingPolicy: groundingContext.policy,
       staticSectionIds: sections
         .filter((section) => section.staticCacheable)
@@ -399,7 +430,8 @@ export function resolveLlmInputStageProfile(
 function buildStagePolicySection(
   stageProfile: LLMInputStageProfile,
   ctx: LoopContext,
-  scanReadAllowed: boolean
+  scanReadAllowed: boolean,
+  groundingPolicy: string | null
 ): LLMInputSection {
   const phase =
     stringValue(valueAt(ctx.tracker, 'phase')) || stringValue(ctx.context?.pipelinePhase);
@@ -426,10 +458,19 @@ function buildStagePolicySection(
     generic: 'Follow the current task prompt and runtime tool contract.',
   };
 
+  // CP1 grounding 政策（仅 analyze + guard 时非空）放在 stagePolicy 章节，而不是 evidenceContext：
+  // evidenceContext 受 1400 字符预算约束，政策行曾被 ref 列表挤出预算，导致 guard 模式下模型看不到规则、
+  // CP4 却照常按规则阻断（I10）。stagePolicy 内容很短、远低于其章节预算，从结构上保证政策对 provider 可见。
+  const groundingPolicyLine = groundingPolicy
+    ? `evidenceGroundingPolicy: ${groundingPolicy}`
+    : null;
+
   return {
     id: 'stagePolicy',
     title: 'Stage policy',
-    content: [profileLine, bodyByProfile[stageProfile]].filter(Boolean).join('\n'),
+    content: [profileLine, bodyByProfile[stageProfile], groundingPolicyLine]
+      .filter(Boolean)
+      .join('\n'),
     providerVisible: true,
     staticCacheable: false,
   };
@@ -525,9 +566,10 @@ function normalizePromptPresence(text: string | null | undefined): string {
 
 /**
  * evidenceContext 的行顺序就是预算优先级：
- * 1. 权威事实在前——grounding 政策、Producer 台账政策行（先于台账本身）、台账、record-repair 路径、证据 ref；
+ * 1. 权威事实在前——Producer 台账政策行（先于台账本身）、台账、record-repair 路径、证据 ref；
  * 2. 运行遥测在后——toolCallsSoFar / trackerMetrics / traceStats / planProgress，预算不足时最先整行丢弃。
- * 台账本身按本章节预算估算可容纳的条目数（最新优先），保证台账与政策行不会被章节截断拦腰切开。
+ * 台账与证据 ref 都按本章节剩余预算在条目边界上装入（台账最新优先、ref 保持原顺序），
+ * 保证它们不会被章节截断拦腰切开。grounding 政策不在本章节，见 buildStagePolicySection。
  */
 function buildEvidenceContextSection(
   ctx: LoopContext,
@@ -547,14 +589,10 @@ function buildEvidenceContextSection(
       ? ctx.sharedState._recordRepairEvidencePaths
       : null;
 
-  if (groundingContext.policy) {
-    lines.push(`evidenceGroundingPolicy: ${groundingContext.policy}`);
-  }
-  const usedChars = lines.reduce((total, line) => total + line.length + 1, 0);
   const ledger = projectProducerSubmitLedger(
     ctx.sharedState?._producerSubmitLedger,
     // 台账可用预算 = 章节预算 - 已在其前面的权威行 - 截断标记预留；遥测行排在后面，可被整行丢弃。
-    sectionBudget - usedChars - TRUNCATION_MARKER_RESERVE,
+    sectionBudget - linesFootprint(lines) - TRUNCATION_MARKER_RESERVE,
     sectionBudget
   );
   if (ledger) {
@@ -563,13 +601,15 @@ function buildEvidenceContextSection(
   if (evidencePaths?.length) {
     lines.push(`recordRepairEvidencePaths: ${evidencePaths.map(String).join(', ')}`);
   }
-  if (groundingContext.deterministicEvidenceRefs.length > 0) {
-    lines.push(
-      `deterministicEvidenceRefs: ${groundingContext.deterministicEvidenceRefs.join(', ')}`
-    );
-  }
-  if (groundingContext.evidenceStarterRefs.length > 0) {
-    lines.push(`evidenceStarterRefs: ${groundingContext.evidenceStarterRefs.join(', ')}`);
+  // ref 可用预算 = 章节预算 - 已在其前面的权威行；遥测行排在后面，超预算时先被整行丢弃，
+  // 因此装入预算内的 ref 行不会再被尾部截断切开。
+  const deterministicRefs = projectDeterministicEvidenceRefs(
+    groundingContext,
+    sectionBudget - linesFootprint(lines),
+    sectionBudget
+  );
+  if (deterministicRefs) {
+    lines.push(...deterministicRefs.lines);
   }
 
   const pushTelemetry = (key: EvidenceTelemetryKey, text: string) => {
@@ -596,6 +636,7 @@ function buildEvidenceContextSection(
   }
 
   return {
+    deterministicRefs: deterministicRefs?.projection ?? null,
     ledger: ledger?.projection ?? null,
     omittedEmptyTelemetry,
     section: {
@@ -698,6 +739,137 @@ function formatProducerLedgerEntry(entry: Record<string, unknown>): string {
 
 function ledgerFlag(value: unknown): string {
   return typeof value === 'boolean' ? String(value) : 'unknown';
+}
+
+/** 一组行在章节里占用的字符数（每行按“行内容 + 换行”计，略保守）。 */
+function linesFootprint(lines: readonly string[]): number {
+  return lines.reduce((total, line) => total + line.length + 1, 0);
+}
+
+/**
+ * 把 deterministicEvidenceRefs 投影成章节行（I10）：
+ * - ref 列表只输出一次。buildGroundingContext 把 starter ref 放在 deterministic 列表最前面
+ *   （uniqueStrings 保序，starter 上限 24 < 列表上限 32），starter 列表恒为其前缀，
+ *   所以只用一行短标注说明前几条来自 evidence starters，不再重复输出整条 starter 列表。
+ * - 放不下全部条目时，按原顺序在条目边界上贪心装入前缀，并用一行 deterministicEvidenceRefsOmitted
+ *   明示省略条数，不再让章节截断把某条 ref 切成半截。
+ */
+function projectDeterministicEvidenceRefs(
+  groundingContext: GroundingContext,
+  availableChars: number,
+  sectionBudget: number
+): { lines: string[]; projection: DeterministicEvidenceRefProjection } | null {
+  const refs = groundingContext.deterministicEvidenceRefs;
+  if (refs.length === 0) {
+    return null;
+  }
+  const starterCount = groundingContext.evidenceStarterRefs.length;
+  const starterNote = (count: number): string | null =>
+    count > 0
+      ? `evidenceStarterRefs: the first ${count} deterministicEvidenceRefs above come from evidence starters (not repeated)`
+      : null;
+  const omittedNote = (omitted: number): string | null =>
+    omitted > 0
+      ? `deterministicEvidenceRefsOmitted: ${omitted} of ${refs.length} refs not shown (${sectionBudget}-char evidenceContext budget, cut at entry boundaries)`
+      : null;
+  const render = (shown: readonly string[]): string[] =>
+    [
+      shown.length > 0
+        ? `${DETERMINISTIC_REFS_LINE_PREFIX}${shown.join(DETERMINISTIC_REFS_SEPARATOR)}`
+        : null,
+      starterNote(Math.min(starterCount, shown.length)),
+      omittedNote(refs.length - shown.length),
+    ].filter((line): line is string => Boolean(line));
+
+  let shown: string[] = refs;
+  if (linesFootprint(render(refs)) > availableChars) {
+    // 按标注行的最长形态预留（条数位数不超过总数 / starter 数的位数），再从头装入完整条目。
+    let remaining =
+      availableChars -
+      (DETERMINISTIC_REFS_LINE_PREFIX.length + 1) -
+      linesFootprint(
+        [starterNote(starterCount), omittedNote(refs.length)].filter((line): line is string =>
+          Boolean(line)
+        )
+      );
+    shown = [];
+    for (const ref of refs) {
+      const cost = ref.length + (shown.length > 0 ? DETERMINISTIC_REFS_SEPARATOR.length : 0);
+      if (cost > remaining) {
+        break;
+      }
+      shown.push(ref);
+      remaining -= cost;
+    }
+  }
+  return {
+    lines: render(shown),
+    projection: {
+      budgetChars: sectionBudget,
+      plannedVisibleRefs: shown,
+      totalRefs: refs.length,
+    },
+  };
+}
+
+/**
+ * 以压缩后的最终 evidenceContext 文本为准解析 provider 实际可见的 ref（I10）。
+ * 只认 ref 行里与计划条目逐字相同的完整条目；被截成前缀（带 …）或整行被去重 / 截掉的条目都不算可见。
+ * 省略时发一次章节预算诊断；计划内条目在压缩中丢失属于异常路径，单独告警便于定位。
+ */
+function resolveDeterministicEvidenceRefVisibility(
+  projection: DeterministicEvidenceRefProjection | null,
+  finalEvidenceContext: string,
+  stageProfile: LLMInputStageProfile,
+  diagnostics: LoopContext['diagnostics'] | undefined
+): DeterministicEvidenceRefVisibility {
+  if (!projection) {
+    return { omittedCount: 0, visibleRefs: [] };
+  }
+  const planned = new Set(projection.plannedVisibleRefs);
+  const refsLine = finalEvidenceContext
+    .split('\n')
+    .find((line) => line.startsWith(DETERMINISTIC_REFS_LINE_PREFIX));
+  const visibleRefs = refsLine
+    ? refsLine
+        .slice(DETERMINISTIC_REFS_LINE_PREFIX.length)
+        .split(DETERMINISTIC_REFS_SEPARATOR)
+        .filter((entry) => planned.has(entry))
+    : [];
+  const omittedCount = projection.totalRefs - visibleRefs.length;
+  if (visibleRefs.length < projection.plannedVisibleRefs.length) {
+    // 装入预算的 ref 行理论上不会被压缩切掉；出现说明前面的权威行（如超长 recordRepairEvidencePaths）
+    // 已超出章节预算，或同一行已在更早章节出现而被去重。
+    warnSectionBudgetOnce(
+      diagnostics,
+      `${stageProfile}:evidenceContext:deterministicEvidenceRefs:compaction`,
+      {
+        code: SECTION_BUDGET_DIAGNOSTIC_CODE,
+        message:
+          `deterministicEvidenceRefs planned ${projection.plannedVisibleRefs.length} visible refs but only ` +
+          `${visibleRefs.length} survived ${stageProfile} evidenceContext compaction ` +
+          `(refs line ${refsLine ? 'cut' : 'dropped or deduplicated'}). ` +
+          'The surviving set is recorded in llm.input metadata.visibleDeterministicEvidenceRefs.',
+        stage: stageProfile,
+      }
+    );
+  }
+  if (omittedCount > 0) {
+    warnSectionBudgetOnce(
+      diagnostics,
+      `${stageProfile}:evidenceContext:deterministicEvidenceRefs`,
+      {
+        code: SECTION_BUDGET_DIAGNOSTIC_CODE,
+        message:
+          `deterministicEvidenceRefs showed ${visibleRefs.length} of ${projection.totalRefs} refs ` +
+          `(omitted=${omittedCount}) within the ${projection.budgetChars}-char ${stageProfile} evidenceContext budget, ` +
+          'cut at entry boundaries. Every round records its visible set in llm.input ' +
+          'metadata.visibleDeterministicEvidenceRefs and the PCV grounding ledger.',
+        stage: stageProfile,
+      }
+    );
+  }
+  return { omittedCount, visibleRefs };
 }
 
 interface GroundingContext {

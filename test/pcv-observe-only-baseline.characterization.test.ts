@@ -317,6 +317,8 @@ describe('PCV observe-only characterization — AP-3 两模式（默认 off / gu
           (section) => section.id === 'evidenceContext'
         );
         expect(evidenceSection?.content ?? '').not.toContain('evidenceGroundingPolicy:');
+        // I10：政策行已移入 stagePolicy；off 模式下整个 provider 输入层都不得出现政策文本。
+        expect(assembly.inputLayerMessage?.content ?? '').not.toContain('evidenceGroundingPolicy:');
       });
 
       it('PD5：默认 off 下证据 ref 列表仍注入（deterministicEvidenceRefs 不随开关）', () => {
@@ -351,10 +353,15 @@ describe('PCV observe-only characterization — AP-3 两模式（默认 off / gu
         expect(policy).toContain('Cite the relevant deterministicEvidenceRefs');
         // 非 DeepSeek 模型不含 provider 子句。
         expect(policy).not.toContain('DeepSeek V4 cannot rely');
+        // I10：政策行位于 stagePolicy 章节（不受 evidenceContext 预算截断），不再出现在 evidenceContext。
+        const stagePolicySection = assembly.sections.find(
+          (section) => section.id === 'stagePolicy'
+        );
         const evidenceSection = assembly.sections.find(
           (section) => section.id === 'evidenceContext'
         );
-        expect(evidenceSection?.content).toContain('evidenceGroundingPolicy:');
+        expect(stagePolicySection?.content).toContain(`evidenceGroundingPolicy: ${policy}`);
+        expect(evidenceSection?.content ?? '').not.toContain('evidenceGroundingPolicy:');
       });
 
       it('guard + DeepSeek V4 modelRef 追加 provider 专属子句（按 modelRef 参数化）', () => {
@@ -387,6 +394,7 @@ describe('PCV observe-only characterization — AP-3 两模式（默认 off / gu
       expect(guard.metadata.groundingPolicy).toBeNull();
       const evidenceSection = guard.sections.find((section) => section.id === 'evidenceContext');
       expect(evidenceSection?.content ?? '').not.toContain('evidenceGroundingPolicy:');
+      expect(guard.inputLayerMessage?.content ?? '').not.toContain('evidenceGroundingPolicy:');
     });
   });
 

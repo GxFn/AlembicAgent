@@ -67,6 +67,11 @@ export interface PcvBurnGroundingLedgerEntry {
   evidenceToolCallDelta: number;
   functionCallNames: string[];
   iteration: number;
+  /**
+   * I10 只增字段：被 evidenceContext 预算省略、模型本轮看不到的 deterministicEvidenceRefs 条数。
+   * 与 visibleDeterministicEvidenceRefs 成对出现；装配未提供时缺省（表示“未知”，不是“全部可见”）。
+   */
+  omittedDeterministicEvidenceRefCount?: number;
   outputSourceRefs: string[];
   pipelineType: string | null;
   reasoningTokens: number;
@@ -81,6 +86,11 @@ export interface PcvBurnGroundingLedgerEntry {
   toolSchemaNames: string[];
   toolSchemasVisible?: boolean;
   trackerPhase: string | null;
+  /**
+   * I10 只增字段：本轮 provider 实际可见的 deterministicEvidenceRefs（按条目边界截断后的前缀）。
+   * deterministicEvidenceRefs 原字段仍记录完整注入候选列表，含义不变；审计“模型见过哪些 ref”应读本字段。
+   */
+  visibleDeterministicEvidenceRefs?: string[];
 }
 
 export interface PcvNodeLedgerRef {
@@ -363,6 +373,22 @@ export function recordPcvInputAssembly(
   const staticSectionIds = stringArray(assembly.metadata.staticSectionIds);
   const deterministicEvidenceRefs = stringArray(assembly.metadata.deterministicEvidenceRefs);
   const evidenceStarterRefs = stringArray(assembly.metadata.evidenceStarterRefs);
+  // I10：buildLlmInputAssembly 总会给出 provider 实际可见的 ref 与省略数；手工构造或旧形状的装配不带这两个字段，
+  // 此时台账不写它们（缺省 = 未知），绝不拿完整列表冒充“可见”。
+  const visibleRefsValue = assembly.metadata.visibleDeterministicEvidenceRefs;
+  const omittedRefCountValue = assembly.metadata.omittedDeterministicEvidenceRefCount;
+  const deterministicRefVisibility: Pick<
+    PcvBurnGroundingLedgerEntry,
+    'omittedDeterministicEvidenceRefCount' | 'visibleDeterministicEvidenceRefs'
+  > =
+    Array.isArray(visibleRefsValue) &&
+    typeof omittedRefCountValue === 'number' &&
+    Number.isFinite(omittedRefCountValue)
+      ? {
+          omittedDeterministicEvidenceRefCount: Math.max(0, omittedRefCountValue),
+          visibleDeterministicEvidenceRefs: stringArray(visibleRefsValue),
+        }
+      : {};
   const trackerPhase = stringValue(assembly.metadata.trackerPhase);
   const pipelineType = stringValue(assembly.metadata.pipelineType);
   const modelRef = options.modelRef || null;
@@ -424,6 +450,7 @@ export function recordPcvInputAssembly(
     toolSchemaNames,
     toolSchemasVisible: forcedToolChoiceQuirk ? toolSchemaNames.length > 0 : undefined,
     trackerPhase,
+    ...deterministicRefVisibility,
   });
 }
 
@@ -1556,6 +1583,9 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
       functionCallNames: [...entry.functionCallNames],
       outputSourceRefs: [...entry.outputSourceRefs],
       toolSchemaNames: [...entry.toolSchemaNames],
+      ...(entry.visibleDeterministicEvidenceRefs
+        ? { visibleDeterministicEvidenceRefs: [...entry.visibleDeterministicEvidenceRefs] }
+        : {}),
     })),
     inputAssembly: evidence.inputAssembly
       ? {
