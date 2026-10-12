@@ -27,7 +27,11 @@ export interface ReliabilityOptions {
   maxRetries?: number;
   /** 触发熔断的连续服务端失败次数，默认 5。 */
   circuitThreshold?: number;
-  /** 并发上限，默认取 ALEMBIC_AI_MAX_CONCURRENCY 或 4。 */
+  /**
+   * 并发上限。LLMGateway 总是传入已按 provider 解析好的数字（google 默认 2 并尊重
+   * ALEMBIC_GEMINI_MAX_CONCURRENCY），这里只再校验一次；label 只是日志标签，不参与解析，
+   * 因此直接构造且不传值时取 ALEMBIC_AI_MAX_CONCURRENCY 或 4。
+   */
   maxConcurrency?: number | string;
   /** 标签，用于日志（通常为 provider 名）。 */
   label?: string;

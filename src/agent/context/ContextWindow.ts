@@ -224,8 +224,12 @@ export class ContextWindow {
    *   - 小窗口 (≥16k):  预算 12000
    *   - 微窗口 (<16k):  预算 = 窗口 × 0.7（留 30% 给 prompt/tool schema）
    *
+   * 上下文窗口来源: provider 提示（opts.provider，其次 ALEMBIC_AI_PROVIDER）为具体 provider 时
+   * 按 ModelRegistry.resolve 查询（别名先归一）；缺失或为 'auto' 时按 findByApiModelId 查询；
+   * 注册表未命中才回退 MODEL_CONTEXT_WINDOWS 正则表，最后是 32k 保守默认。
+   *
    * @param modelName 模型名称，如 'gemini-3-flash-preview', 'gpt-5.4-mini'
-   * @param [opts] - isSystem 为 true 时给予更高预算
+   * @param [opts] - isSystem 为 true 时给予更高预算；provider 为调用方已知的 provider 身份
    * @returns 建议的 token 预算
    */
   static resolveTokenBudget(
@@ -237,16 +241,29 @@ export class ContextWindow {
     // 1. 查找模型上下文窗口大小
     //    优先从 ModelRegistry 查询（声明式数据源），回退到旧的正则匹配
     let contextSize = 32_000;
+    // 诊断用：source=registry|regex|default 表示窗口取自哪里；lookup 表示注册表按哪种键查询。
+    let source: 'registry' | 'regex' | 'default' = 'default';
+    let lookup: 'provider' | 'apiModelId' | 'none' = 'none';
     if (modelName) {
       const registry = getModelRegistry();
-      const providerHint = provider || process.env.ALEMBIC_AI_PROVIDER || '';
-      const regDef = providerHint ? registry.resolve(providerHint, modelName) : undefined;
+      const providerHint = (provider || process.env.ALEMBIC_AI_PROVIDER || '').trim();
+      // 'auto' 是部署选择而非 ProviderId；缺失或为 auto 时按裸 apiModelId 查注册表
+      // （内置表保证 apiModelId 全局唯一，不会命中别家模型）。具体 provider 提示仍是权威：
+      // 先经注册表归一别名再按 provider 查，未命中不跨 provider 猜测，直接回退正则表。
+      const byProvider = providerHint !== '' && providerHint.toLowerCase() !== 'auto';
+      lookup = byProvider ? 'provider' : 'apiModelId';
+      const regDef = byProvider
+        ? registry.resolve(providerHint, modelName)
+        : registry.findByApiModelId(modelName);
       if (regDef) {
         contextSize = regDef.contextWindow;
+        source = 'registry';
       } else {
+        // 降级路径：注册表未登记该模型时用正则表估算；正则也不匹配则保留 32k 保守默认。
         for (const [pattern, size] of ContextWindow.MODEL_CONTEXT_WINDOWS) {
           if ((pattern as RegExp).test(modelName)) {
             contextSize = size as number;
+            source = 'regex';
             break;
           }
         }
@@ -266,6 +283,17 @@ export class ContextWindow {
     } else {
       budget = Math.floor(contextSize * (isSystem ? 0.75 : 0.65));
     }
+
+    // 预算来源诊断：区分注册表命中、正则降级与保守默认，便于追溯“预算偏大/偏小”的根因。
+    // 模型名来自配置/环境，只写截断并去掉控制字符后的值，避免伪造日志行。
+    const modelLabel = modelName ? modelName.slice(0, 64).replace(/[^\w.:/-]/g, '?') : '(empty)';
+    observeSafely(
+      () =>
+        Logger.getInstance().debug(
+          `[ContextWindow] token_budget_source source=${source} lookup=${lookup} model=${modelLabel} contextWindow=${contextSize} system=${isSystem} budget=${budget}`
+        ),
+      () => undefined
+    );
 
     return budget;
   }

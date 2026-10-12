@@ -107,7 +107,11 @@ export interface GatewayConfig {
   maxRetries?: number;
   /** 触发熔断的连续服务端失败次数（默认 5）。 */
   circuitThreshold?: number;
-  /** 并发上限（默认 ALEMBIC_AI_MAX_CONCURRENCY 或 4）。 */
+  /**
+   * 并发上限。显式提供时对所有 provider 生效；未提供时按 provider 分别解析：
+   * google 取 ALEMBIC_GEMINI_MAX_CONCURRENCY → ALEMBIC_AI_MAX_CONCURRENCY → 2，
+   * 其余 provider 取 ALEMBIC_AI_MAX_CONCURRENCY → 4。构造时解析并冻结。
+   */
   maxConcurrency?: number | string;
   /**
    * Token 用量回调 — 每次成功调用后触发，驱动全局预算 / 成本统计。
@@ -121,6 +125,8 @@ export interface GatewayConfig {
 export class LLMGateway {
   #transports = new Map<ProviderId, LLMTransport>();
   #controllers = new Map<ProviderId, ReliabilityController>();
+  /** 每个 provider 在构造时冻结的并发上限及其来源（provider-config / environment / conservative-default）。 */
+  #concurrency = new Map<ProviderId, ReturnType<typeof resolveConcurrency>>();
   #config: GatewayConfig;
   /** 未显式配置的 provider 在构造时产生的配置诊断，等首次创建其 Transport 时再输出。 */
   #deferredConfigLogs = new Map<ProviderId, DeferredConfigLog[]>();
@@ -130,9 +136,15 @@ export class LLMGateway {
     // 冻结仍覆盖全部 provider；但只有 config.providers 里显式出现的 provider 立即输出配置告警，
     // 其他 provider（例如 DeepSeek Provider 的 Gateway 里的 openai）的告警暂存，避免无关刷屏。
     const explicit = config.providers ?? {};
+    // 并发上限按 provider 解析并在构造时冻结，与 AiProvider facade 同一口径（facade 总是显式传值）。
+    // 旧实现不带 provider 解析一次再分给所有控制器，直接构造时 google 拿到 4 且忽略
+    // ALEMBIC_GEMINI_MAX_CONCURRENCY。显式值不读环境变量；非法值（显式或环境）在构造时以
+    // LLM_INVALID_REQUEST 拒绝（resolveConcurrency 自带 warn 诊断），不把坏值带进排队。
+    for (const { id } of PROVIDER_CONFIGS) {
+      this.#concurrency.set(id, resolveConcurrency(config.maxConcurrency, id));
+    }
     this.#config = {
       ...config,
-      maxConcurrency: resolveConcurrency(config.maxConcurrency).value,
       providers: Object.fromEntries(
         PROVIDER_CONFIGS.map(({ id }) => [
           id,
@@ -508,13 +520,28 @@ export class LLMGateway {
     if (controller) {
       return controller;
     }
+    // 构造时已为 PROVIDER_CONFIGS 中每个 provider 冻结上限；providerId 来自注册表的 ProviderId，
+    // 正常必定命中。万一缺失（新增 ProviderId 未进 PROVIDER_CONFIGS）按该 provider 现场解析，并记 warn。
+    let concurrency = this.#concurrency.get(providerId);
+    if (!concurrency) {
+      concurrency = resolveConcurrency(this.#config.maxConcurrency, providerId);
+      this.#concurrency.set(providerId, concurrency);
+      this.#log(
+        'warn',
+        `[LLMGateway] concurrency_unfrozen provider=${providerId}; resolved at first use maxConcurrency=${concurrency.value} source=${concurrency.source}`
+      );
+    }
     controller = new ReliabilityController({
       maxRetries: this.#config.maxRetries,
       circuitThreshold: this.#config.circuitThreshold,
-      maxConcurrency: this.#config.maxConcurrency,
+      maxConcurrency: concurrency.value,
       label: providerId,
       onLog: (level, message) => this.#log(level, message),
     });
+    this.#log(
+      'debug',
+      `[LLMGateway] reliability_controller provider=${providerId} maxConcurrency=${concurrency.value} source=${concurrency.source}`
+    );
     this.#controllers.set(providerId, controller);
     return controller;
   }

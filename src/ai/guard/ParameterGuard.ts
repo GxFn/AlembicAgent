@@ -18,6 +18,11 @@ import type { ModelDef, ParameterConstraints } from '../registry/ModelDefs.js';
 
 export interface GuardedParams {
   temperature?: number;
+  /**
+   * topP / topK 目前在生产路径不可达：GatewayRequest 与 TransportRequest 都没有这两个字段，
+   * LLMGateway 调用 guard() 时也不传入，因此注册表里的 topP/topK 声明（如 Claude Opus 4.7）
+   * 当前不生效。保留它们是因为 ParameterGuard 是公开类，宿主单测与直接调用方仍按此合同使用。
+   */
   topP?: number;
   topK?: number;
   maxTokens?: number;
@@ -71,6 +76,7 @@ export class ParameterGuard {
     const c = model.parameterConstraints;
 
     ParameterGuard.#guardTemperature(model, c, rawParams, result);
+    // topP/topK 只服务直接调用 guard() 的调用方；Gateway 请求没有这两个入口（见 GuardedParams 注释）。
     ParameterGuard.#guardTopP(c, rawParams, result);
     ParameterGuard.#guardTopK(c, rawParams, result);
     ParameterGuard.#guardToolChoice(model, c, rawParams, result);
@@ -163,6 +169,10 @@ export class ParameterGuard {
       });
       return;
     }
+    // disabledWhen 只按模型的静态推理模式判断（reasoning.mode==='thinking'），不感知单次请求是否
+    // 真的开启 thinking：DeepSeek/Claude 按请求切换 thinking 的行为由各 Transport 处理，不在这里。
+    // 当前内置模型表没有任何 disabledWhen 声明（只有测试夹具使用），生产路径不会进入此分支；
+    // 字段作为公开 ParameterRule 合同保留，供运行时 register() 的自定义模型声明。
     const isThinking = model.reasoning.supported && model.reasoning.mode === 'thinking';
     if (rule.disabledWhen === 'thinking' && isThinking) {
       out.filtered.push({

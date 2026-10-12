@@ -258,6 +258,72 @@ describe('effective AI connection configuration', () => {
     expect(peak).toBe(1);
   });
 
+  // 直接构造 Gateway 且未显式给 maxConcurrency 时，每个 provider 按自己的默认值与环境变量解析
+  // （与 AiProvider facade 同一口径）：Google 默认 2 并尊重 ALEMBIC_GEMINI_MAX_CONCURRENCY，
+  // 其他 provider 不受 Gemini 变量影响；显式值对所有 provider 生效；上限在构造时冻结。
+  it.each([
+    { gemini: undefined, global: undefined, explicit: undefined, google: 2, openai: 4 },
+    { gemini: '3', global: undefined, explicit: undefined, google: 3, openai: 4 },
+    { gemini: undefined, global: '1', explicit: undefined, google: 1, openai: 1 },
+    { gemini: '3', global: '1', explicit: undefined, google: 3, openai: 1 },
+    { gemini: '3', global: '1', explicit: 5, google: 5, openai: 5 },
+  ])('resolves gateway concurrency per provider (gemini=$gemini global=$global explicit=$explicit)', async ({
+    gemini,
+    global,
+    explicit,
+    google,
+    openai,
+  }) => {
+    vi.stubEnv('ALEMBIC_GEMINI_MAX_CONCURRENCY', gemini);
+    vi.stubEnv('ALEMBIC_AI_MAX_CONCURRENCY', global);
+    const gateway = new LLMGateway({
+      providers: { google: { apiKey: 'fixture-key' }, openai: { apiKey: 'fixture-key' } },
+      maxRetries: 0,
+      ...(explicit === undefined ? {} : { maxConcurrency: explicit }),
+    });
+    vi.stubEnv('ALEMBIC_GEMINI_MAX_CONCURRENCY', '9');
+    vi.stubEnv('ALEMBIC_AI_MAX_CONCURRENCY', '9');
+    const active = { google: 0, openai: 0 };
+    const peak = { google: 0, openai: 0 };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url) => {
+        const provider = String(url).includes('generativelanguage') ? 'google' : 'openai';
+        peak[provider] = Math.max(peak[provider], ++active[provider]);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active[provider]--;
+        return provider === 'google'
+          ? jsonResponse({
+              candidates: [
+                { content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' },
+              ],
+            })
+          : jsonResponse({ choices: [{ index: 0, message: { content: 'ok' } }] });
+      })
+    );
+    await Promise.all([
+      ...Array.from({ length: 6 }, () =>
+        gateway.chat({ modelRef: 'google:gemini-3-flash-preview', prompt: 'ping' })
+      ),
+      ...Array.from({ length: 6 }, () =>
+        gateway.chat({ modelRef: 'openai:gpt-4o', prompt: 'ping' })
+      ),
+    ]);
+    expect(peak).toEqual({ google, openai });
+  });
+
+  it('rejects an invalid Gemini concurrency variable at gateway construction unless a limit is explicit', () => {
+    vi.stubEnv('ALEMBIC_GEMINI_MAX_CONCURRENCY', 'invalid');
+    expect(() => new LLMGateway()).toThrow(
+      expect.objectContaining({
+        code: 'LLM_INVALID_REQUEST',
+        message: expect.stringContaining('maxConcurrency'),
+      })
+    );
+    // 显式上限不读取环境变量，因此不受该环境值影响（facade 路径即如此）。
+    expect(() => new LLMGateway({ maxConcurrency: 2 })).not.toThrow();
+  });
+
   it.each([
     'provider',
     'gateway',

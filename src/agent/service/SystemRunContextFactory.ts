@@ -28,8 +28,25 @@ export class SystemRunContextFactory {
 
   createContextWindow(opts: { isSystem?: boolean } = {}) {
     const modelName = this.#aiProvider?.model || '';
-    const tokenBudget = ContextWindow.resolveTokenBudget(modelName, opts);
+    const tokenBudget = ContextWindow.resolveTokenBudget(modelName, {
+      ...opts,
+      provider: this.#providerHint(),
+    });
     return new ContextWindow(tokenBudget);
+  }
+
+  /**
+   * 运行时 provider 身份（AiProvider.name，如 'google'）作为预算查询的 provider 提示，
+   * 优先于 ALEMBIC_AI_PROVIDER：部署常用 'auto'，或与实际创建的 provider 不一致。
+   * 公开选项类型只声明 model（宿主按 { model } 注入），这里按运行时形状读取 name，
+   * 不扩大公开类型；缺失或非字符串时返回 undefined，由 ContextWindow 退回环境变量或 apiModelId 查询。
+   */
+  #providerHint(): string | undefined {
+    const provider = this.#aiProvider;
+    if (provider && 'name' in provider && typeof provider.name === 'string' && provider.name) {
+      return provider.name;
+    }
+    return undefined;
   }
 
   createSystemContext({

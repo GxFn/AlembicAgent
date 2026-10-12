@@ -73,6 +73,10 @@ export interface ReasoningSpec {
 
 export interface ParameterConstraints {
   temperature?: ParameterRule<number>;
+  /**
+   * topP / topK 声明目前只是数据：GatewayRequest 没有这两个入口，Gateway 调用 ParameterGuard 时
+   * 不传入，因此生产请求不会按它们过滤或钳制（只有直接调用 ParameterGuard.guard 的调用方生效）。
+   */
   topP?: ParameterRule<number>;
   topK?: ParameterRule<number>;
   toolChoice?: ParameterRule<string>;
@@ -83,7 +87,11 @@ export interface ParameterRule<T> {
   allowed: boolean;
   /** 过滤该参数时写入诊断日志的具体原因 */
   reason?: string;
-  /** 条件禁用 (如 'thinking' = thinking 模式下不允许) */
+  /**
+   * 条件禁用（如 'thinking' = thinking 模式下不允许）。ParameterGuard 只对 toolChoice 读取它，
+   * 并且按模型静态的 reasoning.mode 判断，不感知单次请求是否开启 thinking。内置模型表目前
+   * 没有声明它，留作运行时 register() 的自定义模型使用。
+   */
   disabledWhen?: string;
   defaultValue?: T;
   min?: T;

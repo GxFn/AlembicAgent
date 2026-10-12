@@ -439,6 +439,76 @@ describe('ModelRegistry data invariants', () => {
     }
   });
 
+  // provider 入口归一：resolve/resolveOrCreate 与 AiFactory、Gateway 共用 canonicalProvider 口径，
+  // 别名与大小写差异命中同一注册定义；未知 provider 不再经 as 强转拼出畸形 ProviderId。
+  it('normalizes provider aliases at resolve/resolveOrCreate entrypoints', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const registry = new ModelRegistry();
+      const gemini = registry.get('google:gemini-3-flash-preview');
+      const opus = registry.get('claude:claude-opus-4-7');
+      expect(gemini).toBeDefined();
+      expect(opus).toBeDefined();
+      expect(registry.resolve('gemini', 'gemini-3-flash-preview')).toBe(gemini);
+      expect(registry.resolve(' Google ', 'gemini-3-flash-preview')).toBe(gemini);
+      expect(registry.getContextWindow('google-gemini', 'gemini-3-flash-preview')).toBe(
+        gemini?.contextWindow
+      );
+      expect(registry.resolveOrCreate('anthropic', 'claude-opus-4-7')).toBe(opus);
+      // 别名走动态兜底时，定义里的 provider 与 id 都是归一后的 ProviderId，而不是原始别名。
+      expect(registry.resolveOrCreate('Anthropic', 'claude-alias-dynamic-fixture')).toMatchObject({
+        id: 'claude:claude-alias-dynamic-fixture',
+        provider: 'claude',
+        apiModelId: 'claude-alias-dynamic-fixture',
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('returns undefined from resolve and rejects resolveOrCreate for unknown providers with a diagnostic', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const registry = new ModelRegistry();
+      // 'auto' 只是部署选择，不是 ProviderId：查询 API 返回 undefined，由调用方改走 apiModelId 查询或回退。
+      expect(registry.resolve('auto', 'gemini-3-flash-preview')).toBeUndefined();
+      expect(registry.getContextWindow('bogus', 'gemini-3-flash-preview')).toBeUndefined();
+      const shortCircuits = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('unknown_provider op=resolve '));
+      expect(shortCircuits.length).toBeGreaterThan(0);
+      expect(shortCircuits[0]).toContain('value=auto');
+
+      const sizeBefore = registry.size;
+      expect(() => registry.resolveOrCreate('bogus', 'any-model')).toThrow(
+        expect.objectContaining({
+          code: 'LLM_INVALID_REQUEST',
+          message: expect.stringContaining('Unknown AI provider'),
+        })
+      );
+      // 拒绝路径不造动态定义、不写注册表，也不输出 dynamic_model_def 告警。
+      expect(registry.size).toBe(sizeBefore);
+      const warnings = warn.mock.calls.map((call) => String(call[0]));
+      expect(warnings.some((message) => message.includes('dynamic_model_def'))).toBe(false);
+      expect(
+        warnings.some((message) =>
+          message.includes('unknown_provider op=resolveOrCreate value=bogus')
+        )
+      ).toBe(true);
+      // 诊断值经截断与去控制字符处理，不能借换行伪造日志行。
+      expect(() => registry.resolveOrCreate('evil\nprovider-name-way-too-long', 'm')).toThrow(
+        /Unknown AI provider/
+      );
+      const sanitized = warn.mock.calls.map((call) => String(call[0])).at(-1) ?? '';
+      expect(sanitized).not.toContain('\n');
+      expect(sanitized).toContain('len=');
+    } finally {
+      warn.mockRestore();
+      debug.mockRestore();
+    }
+  });
+
   it('keeps defaultEffort inside the reasoningEffort allowlist when one is declared', () => {
     for (const m of builtins) {
       const allowed = m.parameterConstraints.reasoningEffort?.allowedValues;

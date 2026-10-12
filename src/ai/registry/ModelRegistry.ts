@@ -1,18 +1,30 @@
 /**
  * ModelRegistry — 模型能力注册中心
  *
- * 统一管理所有 LLM 模型的能力声明、约束条件和容量信息。
- * 替代 ContextWindow.MODEL_CONTEXT_WINDOWS 正则表和各 Provider 中的硬编码判断。
+ * 集中保存各 LLM 模型的能力声明、参数约束与容量信息（内置表 + 运行时 register）。
+ * 它还没有成为唯一事实源：ContextWindow 在注册表未命中时仍回退自有 MODEL_CONTEXT_WINDOWS
+ * 正则表，ParameterGuard 只接收 Gateway 解析好的 ModelDef、不自己查询注册表。
  *
- * 消费方:
- *   - ContextWindow: 查询上下文窗口
- *   - ParameterGuard: 查询参数约束
- *   - Host UI / Routes: 查询可用模型列表
- *   - Provider: 查询模型推理能力
+ * 当前真实消费方（按调用的 API 列出）:
+ *   - LLMGateway: get / findByApiModelId / resolveOrCreate —— 把 modelRef 解析成 ModelDef，
+ *     交给 ParameterGuard 与 Transport。
+ *   - ContextWindow.resolveTokenBudget: resolve（有具体 provider 提示时）/ findByApiModelId
+ *     （无提示或 'auto' 时）—— 取 contextWindow 计算 token 预算，未命中才回退正则表。
+ *   - ModelQuirks: get / findByApiModelId —— DeepSeek V4 家族等模型特性判定。
+ *   - 宿主 Alembic lib/http/routes/ai.ts（/api/v1/ai/providers）: listByProvider —— 列出可选模型。
+ *   - listActive / findByCapability / getContextWindow / register / size 没有生产调用方，
+ *     宿主单测（test/unit/LlmRegistryAndGuard.test.ts）直接断言它们，作为公开查询 API 保留。
+ *
+ * provider 入口口径：resolve / resolveOrCreate（及经 resolve 的 getContextWindow）先用
+ * configuration.canonicalProvider 归一别名与大小写（gemini → google、anthropic → claude），
+ * 与 AiFactory、LLMGateway 的 provider 身份一致。未知值（包括部署选择 'auto'）：resolve 返回
+ * undefined 并打 debug 诊断；resolveOrCreate 打 warn 后抛 code=LLM_INVALID_REQUEST，
+ * 不再为非法 provider 造出动态定义。
  */
 
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import { canonicalProvider } from '../configuration.js';
 import type { ModelDef, ProviderId } from './ModelDefs.js';
 import { CLAUDE_MODELS } from './models/claude.js';
 import { DEEPSEEK_MODELS } from './models/deepseek.js';
@@ -31,6 +43,29 @@ const ALL_BUILTIN_MODELS: ModelDef[] = [
 // 惰性取 Core logger 单例，避免模块导入期副作用（与 LLMGateway 一致）。
 const logger = () => Logger.getInstance();
 
+/** 未知 provider 诊断最多保留的前缀长度（与 configuration 的 unknown_provider 诊断同一口径）。 */
+const UNKNOWN_PROVIDER_LOG_LIMIT = 16;
+
+/**
+ * 诊断与错误消息只写截断、去控制字符后的前缀：provider 值可能来自环境变量、被误填成凭据，
+ * 也不能借换行伪造日志行。非字符串（JS 调用方）只写类型说明。
+ */
+function providerLogValue(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    return '(invalid type)';
+  }
+  const safe = raw.slice(0, UNKNOWN_PROVIDER_LOG_LIMIT).replace(/[^\w.:-]/g, '?');
+  return raw.length > UNKNOWN_PROVIDER_LOG_LIMIT ? `${safe}…(len=${raw.length})` : safe;
+}
+
+/**
+ * provider 入口归一：别名与大小写差异按 configuration.canonicalProvider 归一（与 AiFactory、
+ * LLMGateway 同一口径）。非字符串入参（JS 调用方）视为未知，避免 canonicalProvider 内部 trim 抛 TypeError。
+ */
+function toProviderId(provider: unknown): ProviderId | undefined {
+  return typeof provider === 'string' ? canonicalProvider(provider) : undefined;
+}
+
 export class ModelRegistry {
   #models = new Map<string, ModelDef>();
   /**
@@ -38,6 +73,11 @@ export class ModelRegistry {
    * 因此同一未登记模型在进程内只告警一次；独立 new 出来的注册表各自计数。
    */
   #warnedDynamicIds = new Set<string>();
+  /**
+   * resolve 遇到未知 provider 时已输出过 debug 诊断的值（按截断后的诊断值去重）。
+   * 查询 API 的“查不到”是正常合同，只记一次，避免 ContextWindow 等高频调用方刷屏。
+   */
+  #notedUnknownProviders = new Set<string>();
 
   constructor() {
     for (const def of ALL_BUILTIN_MODELS) {
@@ -60,36 +100,61 @@ export class ModelRegistry {
     return undefined;
   }
 
-  /** 模糊查找: (provider='openai', apiModelId='gpt-5.5') → ModelDef */
+  /**
+   * 模糊查找: (provider='openai', apiModelId='gpt-5.5') → ModelDef
+   *
+   * provider 先归一（'gemini' → 'google'、'Anthropic' → 'claude'）。未知值（包括部署选择 'auto'）
+   * 短路返回 undefined 并输出一次 debug 诊断：调用方据此改走 findByApiModelId 或自己的兜底。
+   */
   resolve(provider: string, apiModelId: string): ModelDef | undefined {
-    // 先尝试直接组合
-    const direct = this.#models.get(`${provider}:${apiModelId}`);
-    if (direct) {
-      return direct;
-    }
-    // 回退到遍历匹配
-    for (const m of this.#models.values()) {
-      if (m.provider === provider && m.apiModelId === apiModelId) {
-        return m;
+    const providerId = toProviderId(provider);
+    if (!providerId) {
+      const value = providerLogValue(provider);
+      if (!this.#notedUnknownProviders.has(value)) {
+        this.#notedUnknownProviders.add(value);
+        observeSafely(
+          () =>
+            logger().debug(
+              `[ModelRegistry] unknown_provider op=resolve value=${value}; lookup short-circuited, returns undefined`
+            ),
+          () => undefined
+        );
       }
+      return undefined;
     }
-    return undefined;
+    return this.#lookup(providerId, apiModelId);
   }
 
   /**
    * 智能解析 — 兼容旧配置
    *
-   * 优先级: 精确匹配 → provider+model 组合 → 动态定义
+   * 优先级: provider 归一 → 精确 id → provider+model 遍历匹配 → 动态定义。
+   * 未知 provider 直接拒绝（code=LLM_INVALID_REQUEST，不重试、不计熔断）：
+   * 旧实现会用 as 强转拼出 provider 非法的动态定义，下游再按该 provider 取 Transport 时才失败。
    */
   resolveOrCreate(provider: string, apiModelId: string): ModelDef {
-    const registered = this.resolve(provider, apiModelId);
+    const providerId = toProviderId(provider);
+    if (!providerId) {
+      const value = providerLogValue(provider);
+      observeSafely(
+        () =>
+          logger().warn(
+            `[ModelRegistry] unknown_provider op=resolveOrCreate value=${value}; rejected, no dynamic definition created`
+          ),
+        () => undefined
+      );
+      throw Object.assign(new Error(`Unknown AI provider: ${value}`), {
+        code: 'LLM_INVALID_REQUEST',
+      });
+    }
+    const registered = this.#lookup(providerId, apiModelId);
     if (registered) {
       return registered;
     }
     // 降级路径：未登记模型拿到保守默认（固定 contextWindow / maxOutputTokens），
     // 调用方请求的 maxTokens 会被 ParameterGuard 截到该上限。按 id 去重 warn 一次，
     // 让“输出被截断 → JSON 解析失败”能追溯到“模型未登记”这一根因。
-    const def = this.createDynamicDef(provider as ProviderId, apiModelId);
+    const def = this.createDynamicDef(providerId, apiModelId);
     if (!this.#warnedDynamicIds.has(def.id)) {
       this.#warnedDynamicIds.add(def.id);
       const message = `[ModelRegistry] dynamic_model_def model=${def.id} contextWindow=${def.contextWindow} maxOutputTokens=${def.maxOutputTokens}; path=conservative_defaults (model not registered)`;
@@ -99,6 +164,20 @@ export class ModelRegistry {
       );
     }
     return def;
+  }
+
+  /** 已归一 provider 下的查找：先按 'provider:apiModelId' 直取，再遍历兼容 id 形状不同的运行时注册。 */
+  #lookup(providerId: ProviderId, apiModelId: string): ModelDef | undefined {
+    const direct = this.#models.get(`${providerId}:${apiModelId}`);
+    if (direct) {
+      return direct;
+    }
+    for (const m of this.#models.values()) {
+      if (m.provider === providerId && m.apiModelId === apiModelId) {
+        return m;
+      }
+    }
+    return undefined;
   }
 
   /** 列出指定 provider 的所有模型 */
@@ -116,7 +195,7 @@ export class ModelRegistry {
     return [...this.#models.values()].filter((m) => m.capabilities[cap] && !m.deprecated);
   }
 
-  /** 获取上下文窗口 (替代 ContextWindow.MODEL_CONTEXT_WINDOWS) */
+  /** 获取上下文窗口（经 resolve，provider 同样先归一；ContextWindow 未命中注册表时仍回退其正则表）。 */
   getContextWindow(provider: string, apiModelId: string): number | undefined {
     return this.resolve(provider, apiModelId)?.contextWindow;
   }
