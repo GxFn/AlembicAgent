@@ -121,6 +121,26 @@ const MIN_TOOL_CHARS = 400;
 const L4_HARD_STOP_RATIO = 1.3;
 const L4_REPEAT_FAILURE_HARD_STOP_RATIO = 1.0;
 
+/** 日志里 L4 异常原文的展示上限。 */
+const MAX_L4_ERROR_CHARS = 300;
+
+function describeL4Error(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = err.message || err.name;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  return text.length > MAX_L4_ERROR_CHARS ? `${text.slice(0, MAX_L4_ERROR_CHARS)}…` : text;
+}
+
 /* ── BudgetController ──────────────────────────────────── */
 
 export class BudgetController {
@@ -363,15 +383,9 @@ export class BudgetController {
         this.#cumulativeUsage.output += outputTokens;
         addLoopTokenUsage?.({ inputTokens, outputTokens });
       }
-      const effectivePressure = Math.max(
-        this.sessionUsageRatio,
-        this.#lastProjectedSessionUsageRatio
-      );
+      const effectivePressure = this.#effectiveL4Pressure();
       const hardStop =
-        l4Result.failed &&
-        !l4Result.cancelled &&
-        (effectivePressure >= L4_HARD_STOP_RATIO ||
-          (this.#l4FailureCount >= 2 && effectivePressure >= L4_REPEAT_FAILURE_HARD_STOP_RATIO));
+        l4Result.failed && !l4Result.cancelled && this.#isL4HardStop(effectivePressure);
       if (hardStop) {
         this.#logger.warn(
           `[BudgetController] L4 failure under runaway session pressure (${(effectivePressure * 100).toFixed(1)}%); hard-stopping current run`
@@ -386,20 +400,44 @@ export class BudgetController {
       };
       this.#trackCompaction(result);
       return result;
-    } catch (err) {
+    } catch (err: unknown) {
+      // 异常路径（memory package 提供方或 compactL4 本身抛错）与“返回 failed”是同一种 L4 失败：
+      // 计数、冷却、hardStop 判定和压缩统计都必须与正常失败路径一致，否则连续抛错时压力在
+      // 1.0–1.3 之间不会硬停，而返回 failed 时会硬停。
       this.#l4FailureCount++;
       this.#l4RetryCooldownChecks = 1;
-      this.#logger.warn(`[BudgetController] L4 compaction failed: ${err}`);
-      return {
-        level: 0,
+      const effectivePressure = this.#effectiveL4Pressure();
+      const hardStop = this.#isL4HardStop(effectivePressure);
+      this.#logger.warn(
+        `[BudgetController] L4 compaction threw (failure #${this.#l4FailureCount}, pressure ${(effectivePressure * 100).toFixed(1)}%): ${describeL4Error(err)}; ${
+          hardStop ? 'hard-stopping current run' : 'cooling down for one preflight check'
+        }`
+      );
+      const result: CompactionResult = {
+        level: 4,
         removed: 0,
         failed: true,
-        ...(Math.max(this.sessionUsageRatio, this.#lastProjectedSessionUsageRatio) >=
-        L4_HARD_STOP_RATIO
-          ? { hardStop: true, reason: 'l4_compaction_failed_budget_exhausted' }
-          : {}),
+        ...(hardStop ? { hardStop: true, reason: 'l4_compaction_failed_budget_exhausted' } : {}),
       };
+      this.#trackCompaction(result);
+      return result;
     }
+  }
+
+  /** L4 硬停判定使用的压力：本 loop 已用比值与最近一次预检投影比值取大。 */
+  #effectiveL4Pressure(): number {
+    return Math.max(this.sessionUsageRatio, this.#lastProjectedSessionUsageRatio);
+  }
+
+  /**
+   * L4 失败后的硬停判定（返回 failed 与抛异常两条路径共用）：
+   * 压力 ≥ 1.3 立即硬停；连续失败 ≥ 2 次且压力 ≥ 1.0 也硬停。调用前失败计数必须已经累加。
+   */
+  #isL4HardStop(effectivePressure: number): boolean {
+    return (
+      effectivePressure >= L4_HARD_STOP_RATIO ||
+      (this.#l4FailureCount >= 2 && effectivePressure >= L4_REPEAT_FAILURE_HARD_STOP_RATIO)
+    );
   }
 
   /* ═══════════════════════════════════════════════════════

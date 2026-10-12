@@ -1107,8 +1107,18 @@ export class AgentRuntime {
     if (budgetCtrl.pendingL4) {
       const l4Result = await budgetCtrl.executeL4IfPending(
         this.aiProvider as unknown as Parameters<typeof budgetCtrl.executeL4IfPending>[0],
-        (u) => ctx.addTokenUsage(u)
+        (u) => {
+          ctx.addTokenUsage(u);
+          // L4 摘要是一次独立的 provider 调用，用量也要进入运行诊断，
+          // 否则 diagnostics.efficiency.tokenUsage 会比 loop 实际消耗偏低。
+          ctx.diagnostics?.recordTokenUsage(u);
+        }
       );
+      // L4 真正替换了历史时计入压缩统计（maxCompactionLevel / totalCompactedItems），
+      // 否则诊断里看不出 L4 是否发生过；失败或取消时 removed=0，不记。
+      if (l4Result.removed > 0) {
+        ctx.diagnostics?.recordCompaction({ level: l4Result.level, removed: l4Result.removed });
+      }
       if (l4Result.cancelled || ctx.abortSignal?.aborted) {
         ctx.diagnostics?.recordCancelReason('abort_signal');
         ctx.diagnostics?.warn({

@@ -100,12 +100,70 @@ function getEfficiencyCache(ctx: ToolExecContext): Map<string, CachedToolResult>
   return shared._toolEfficiencyCache;
 }
 
-function cloneCacheValue<T>(value: T): T {
+const TOOL_CACHE_CLONE_FAILED_CODE = 'TOOL_CACHE_CLONE_FAILED';
+/** 诊断里错误原文的展示上限。 */
+const MAX_CLONE_ERROR_CHARS = 200;
+
+type CacheCloneOutcome =
+  | { ok: true; entry: CachedToolResult }
+  | { ok: false; part: 'result' | 'envelope'; reason: string };
+
+/**
+ * 缓存条目整体复制。缓存与调用方之间必须是独立副本：evidenceCapture 等后续中间件会就地改写
+ * 返回值和 meta.envelope，共享引用会把这些标注写回缓存，命中时出现重复标注。
+ * 因此复制失败（函数、Symbol 等不可克隆成员）时不能退回原引用，而是报告失败由调用方跳过缓存。
+ */
+function cloneCacheEntry(source: CachedToolResult): CacheCloneOutcome {
+  let result: unknown;
   try {
-    return structuredClone(value);
-  } catch {
-    return value;
+    result = structuredClone(source.result);
+  } catch (err: unknown) {
+    return { ok: false, part: 'result', reason: describeCloneError(err) };
   }
+  if (!source.envelope) {
+    return { ok: true, entry: { result } };
+  }
+  try {
+    return { ok: true, entry: { result, envelope: structuredClone(source.envelope) } };
+  } catch (err: unknown) {
+    return { ok: false, part: 'envelope', reason: describeCloneError(err) };
+  }
+}
+
+function describeCloneError(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = err.message || err.name;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  return text.length > MAX_CLONE_ERROR_CHARS ? `${text.slice(0, MAX_CLONE_ERROR_CHARS)}…` : text;
+}
+
+function warnCacheCloneFailed(
+  call: ToolCall,
+  ctx: ToolExecContext,
+  failure: { part: 'result' | 'envelope'; reason: string },
+  stage: 'store' | 'hit'
+): void {
+  const action = getToolAction(call);
+  const target = action ? `${call.name}.${action}` : call.name;
+  const consequence =
+    stage === 'store'
+      ? 'the result was returned uncached and a repeat call will execute again'
+      : 'the cached entry was evicted and the call executes again';
+  ctx.loopCtx.diagnostics?.warn({
+    code: TOOL_CACHE_CLONE_FAILED_CODE,
+    tool: call.name,
+    message: `Session cache ${stage === 'store' ? 'store' : 'reuse'} skipped for ${target}: structuredClone of the ${failure.part} failed (${failure.reason}); ${consequence}.`,
+  });
 }
 
 function resolveProjectSnapshotId(ctx: ToolExecContext): string | null {
@@ -156,20 +214,29 @@ export const deterministicDuplicateGuard = {
     meta.cacheEligible = true;
     const key = buildCacheKey(call, ctx);
     meta.cacheKey = key;
-    const cached = getEfficiencyCache(ctx).get(key);
+    const cache = getEfficiencyCache(ctx);
+    const cached = cache.get(key);
     if (!cached) {
+      return undefined;
+    }
+    // 先复制再标记命中：复制失败（只可能来自缓存被外部写入了不可克隆条目）时按未命中处理，
+    // 剔除该条目并告警，调用照常执行；绝不把缓存内对象的引用交给调用方。
+    const copy = cloneCacheEntry(cached);
+    if (!copy.ok) {
+      cache.delete(key);
+      warnCacheCloneFailed(call, ctx, copy, 'hit');
       return undefined;
     }
     meta.cacheHit = true;
     meta.duplicateShortCircuit = true;
-    if (cached.envelope) {
+    if (copy.entry.envelope) {
       meta.envelope = {
-        ...cloneCacheValue(cached.envelope),
+        ...copy.entry.envelope,
         durationMs: 0,
         cache: { hit: true, policy: 'session' },
       };
     }
-    return { result: cloneCacheValue(cached.result) };
+    return { result: copy.entry.result };
   },
   after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
     if (!meta.cacheEligible || !meta.cacheKey || meta.blocked || meta.duplicateShortCircuit) {
@@ -179,10 +246,17 @@ export const deterministicDuplicateGuard = {
     if (!readToolObservation({ ...call, result, envelope: meta.envelope }).ok) {
       return;
     }
-    getEfficiencyCache(ctx).set(meta.cacheKey, {
-      result: cloneCacheValue(result),
-      ...(meta.envelope ? { envelope: cloneCacheValue(meta.envelope) } : {}),
+    const copy = cloneCacheEntry({
+      result,
+      ...(meta.envelope ? { envelope: meta.envelope } : {}),
     });
+    if (copy.ok) {
+      getEfficiencyCache(ctx).set(meta.cacheKey, copy.entry);
+    } else {
+      // 不可克隆的结果不入缓存（旧实现退回共享引用，会被后续中间件就地改写污染）。
+      warnCacheCloneFailed(call, ctx, copy, 'store');
+    }
+    // 本次查找确实未命中；是否成功入缓存不改变 miss 统计口径。
     if (!meta.cacheHit) {
       meta.cacheMiss = true;
     }

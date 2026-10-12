@@ -586,9 +586,26 @@ function buildEvidenceContextSection(
   const lowPriorityLines = new Map<string, EvidenceTelemetryKey>();
   const omittedEmptyTelemetry: EvidenceTelemetryKey[] = [];
   const sectionBudget = sectionBudgetFor(stageProfile, 'evidenceContext');
-  const metrics = safeCall<Record<string, unknown>>(() => ctx.tracker?.getMetrics?.());
-  const traceStats = safeCall<Record<string, unknown>>(() => ctx.trace?.getStats?.());
-  const planProgress = safeCall<Record<string, unknown>>(() => ctx.tracker?.getPlanProgress?.());
+  // tracker / trace 可能是宿主注入的鸭子类型对象：探针抛错时省略对应遥测行，并经诊断报告来源与原因。
+  const probe = { diagnostics: ctx.diagnostics, stageProfile };
+  const metrics = safeCall<Record<string, unknown>>(
+    () => ctx.tracker?.getMetrics?.(),
+    probe,
+    'tracker.getMetrics',
+    'trackerMetrics'
+  );
+  const traceStats = safeCall<Record<string, unknown>>(
+    () => ctx.trace?.getStats?.(),
+    probe,
+    'trace.getStats',
+    'traceStats'
+  );
+  const planProgress = safeCall<Record<string, unknown>>(
+    () => ctx.tracker?.getPlanProgress?.(),
+    probe,
+    'tracker.getPlanProgress',
+    'planProgress'
+  );
   const evidencePaths = Array.isArray(ctx.context?.recordRepairEvidencePaths)
     ? ctx.context.recordRepairEvidencePaths
     : Array.isArray(ctx.sharedState?._recordRepairEvidencePaths)
@@ -624,10 +641,13 @@ function buildEvidenceContextSection(
   };
   pushTelemetry('toolCallsSoFar', `toolCallsSoFar: ${ctx.toolCalls.length}`);
   if (metrics) {
-    pushTelemetry('trackerMetrics', `trackerMetrics: ${safeJson(metrics)}`);
+    pushTelemetry(
+      'trackerMetrics',
+      `trackerMetrics: ${safeJson(metrics, probe, 'trackerMetrics')}`
+    );
   }
   if (traceStats) {
-    pushTelemetry('traceStats', `traceStats: ${safeJson(traceStats)}`);
+    pushTelemetry('traceStats', `traceStats: ${safeJson(traceStats, probe, 'traceStats')}`);
   }
   if (planProgress) {
     // produce/summarize 不做规划，全零的 planProgress 只占预算不含信息；省略情况记入 metadata。
@@ -637,7 +657,10 @@ function buildEvidenceContextSection(
     ) {
       omittedEmptyTelemetry.push('planProgress');
     } else {
-      pushTelemetry('planProgress', `planProgress: ${safeJson(planProgress)}`);
+      pushTelemetry(
+        'planProgress',
+        `planProgress: ${safeJson(planProgress, probe, 'planProgress')}`
+      );
     }
   }
 
@@ -1218,20 +1241,113 @@ function formatProviderInputLayer(sections: LLMInputSection[]): string | null {
   ].join('\n\n');
 }
 
-function safeCall<T>(fn: () => T | null | undefined): T | null {
+const CONTEXT_PROBE_FAILED_CODE = 'llm_input_context_probe_failed';
+/** 诊断里错误原文的展示上限；完整堆栈不进入运行诊断。 */
+const MAX_PROBE_ERROR_CHARS = 200;
+
+/** evidenceContext 遥测探针的诊断上下文；diagnostics 缺省（鸭子类型 ctx）时只降级、不报告。 */
+interface EvidenceContextProbe {
+  diagnostics: LoopContext['diagnostics'] | undefined;
+  stageProfile: LLMInputStageProfile;
+}
+
+/** 每个诊断收集器已报告过的探针失败键；同一 loop 内重复失败只报一次，避免每轮刷屏。 */
+const emittedContextProbeWarnings = new WeakMap<object, Set<string>>();
+
+/**
+ * 读取 tracker / trace 遥测。宿主注入的鸭子类型对象可能在读取时抛错：
+ * 此时降级为“省略该遥测行”（返回 null），并发 llm_input_context_probe_failed，
+ * 消息里写明探针来源、被省略的行和错误原文，排查时能看出模型为何缺少阶段进度信息。
+ */
+function safeCall<T>(
+  fn: () => T | null | undefined,
+  probe: EvidenceContextProbe,
+  source: string,
+  telemetryKey: EvidenceTelemetryKey
+): T | null {
   try {
     return fn() ?? null;
-  } catch {
+  } catch (err: unknown) {
+    warnContextProbeFailed(
+      probe,
+      source,
+      `${source} threw; the ${telemetryKey} line was omitted from the ${probe.stageProfile} evidenceContext`,
+      err
+    );
     return null;
   }
 }
 
-function safeJson(value: unknown): string {
+/**
+ * 遥测 JSON 化。指标里含 BigInt、toJSON 抛错等不可序列化成员时，仍保留旧的占位文本
+ * （provider 输入形状不变），同时发诊断说明是哪一行、因何退化。
+ */
+function safeJson(
+  value: unknown,
+  probe: EvidenceContextProbe,
+  telemetryKey: EvidenceTelemetryKey
+): string {
   try {
     return JSON.stringify(value);
-  } catch {
+  } catch (err: unknown) {
+    warnContextProbeFailed(
+      probe,
+      `serialize:${telemetryKey}`,
+      `${telemetryKey} could not be serialized; the line was replaced with "[unserializable]" in the ${probe.stageProfile} evidenceContext`,
+      err
+    );
     return '"[unserializable]"';
   }
+}
+
+function warnContextProbeFailed(
+  probe: EvidenceContextProbe,
+  source: string,
+  detail: string,
+  err: unknown
+): void {
+  const { diagnostics, stageProfile } = probe;
+  if (!diagnostics || typeof diagnostics.warn !== 'function') {
+    return;
+  }
+  let emitted = emittedContextProbeWarnings.get(diagnostics);
+  if (!emitted) {
+    emitted = new Set<string>();
+    emittedContextProbeWarnings.set(diagnostics, emitted);
+  }
+  const key = `${stageProfile}:${source}`;
+  if (emitted.has(key)) {
+    return;
+  }
+  emitted.add(key);
+  diagnostics.warn({
+    code: CONTEXT_PROBE_FAILED_CODE,
+    message:
+      `LLM input evidenceContext probe failed (${source}): ${detail}. ` +
+      `Error: ${describeProbeError(err)}. Reported once per diagnostics collector and stage.`,
+    stage: stageProfile,
+  });
+}
+
+/** 非 Error 的抛出值也可能 String() 失败，此时给固定描述；结果截断到展示上限。 */
+function describeProbeError(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = err.message || err.name;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  return singleLine.length > MAX_PROBE_ERROR_CHARS
+    ? `${singleLine.slice(0, MAX_PROBE_ERROR_CHARS)}…`
+    : singleLine;
 }
 
 function limitText(text: string, maxChars: number): string {

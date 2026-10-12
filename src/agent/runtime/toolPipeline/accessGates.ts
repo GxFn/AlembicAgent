@@ -30,13 +30,38 @@ const TOOL_ARGS_TOO_LARGE_CODE = 'TOOL_ARGS_TOO_LARGE';
 
 const TOOL_PARAMETER_DENIED_CODE = 'TOOL_PARAMETER_DENIED';
 
-function measureToolArgBytes(call: ToolCall): { ok: true; bytes: number } | { ok: false } {
+/** 诊断里序列化错误原文的展示上限。 */
+const MAX_SERIALIZATION_ERROR_CHARS = 200;
+
+function measureToolArgBytes(
+  call: ToolCall
+): { ok: true; bytes: number } | { ok: false; reason: string } {
   try {
     const serialized = String(stableStringify(call.args) ?? '');
     return { ok: true, bytes: new TextEncoder().encode(serialized).length };
-  } catch {
-    return { ok: false };
+  } catch (err: unknown) {
+    // BigInt、循环引用（栈溢出）、toJSON 抛错等都会落到这里；原因随诊断带出，便于区分模型参数缺陷与宿主注入问题。
+    return { ok: false, reason: describeSerializationError(err) };
   }
+}
+
+function describeSerializationError(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = `${err.name}: ${err.message}`;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  return text.length > MAX_SERIALIZATION_ERROR_CHARS
+    ? `${text.slice(0, MAX_SERIALIZATION_ERROR_CHARS)}…`
+    : text;
 }
 
 // ─────────────────────────────────────────────
@@ -104,7 +129,8 @@ export const toolArgumentBoundsGate = {
     if (!measurement.ok) {
       ctx.loopCtx.diagnostics?.warn({
         code: TOOL_ARGS_INVALID_CODE,
-        message: `Tool ${call.name} arguments could not be serialized for validation`,
+        tool: call.name,
+        message: `Tool ${call.name} arguments could not be serialized for validation (${measurement.reason}); the call was blocked before execution.`,
       });
       return {
         blocked: true,

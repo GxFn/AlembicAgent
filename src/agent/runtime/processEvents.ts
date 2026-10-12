@@ -445,6 +445,9 @@ export function isDeveloperVisibleReflectionNudge(type: string): boolean {
   );
 }
 
+/** 退化文本中错误原因的展示上限。 */
+const MAX_DEVELOPER_DATA_ERROR_CHARS = 160;
+
 function stringifyDeveloperData(value: unknown): string {
   try {
     if (value === undefined) {
@@ -452,8 +455,39 @@ function stringifyDeveloperData(value: unknown): string {
     }
     return JSON.stringify(sanitizeDeveloperData(value), null, 2);
   } catch (err: unknown) {
-    void err;
-    return redactDeveloperText(String(value));
+    // 退化路径：BigInt、toJSON 抛错等让 JSON 化失败。本模块是纯投影、不持有日志与诊断通道，
+    // 所以把失败原因直接写进开发者可见文本，时间线上能看出为何只剩字符串形式而不是结构化参数。
+    return redactDeveloperText(
+      `[developer data not serializable: ${describeDeveloperDataError(err)}] ${stringifyFallback(value)}`
+    );
+  }
+}
+
+function describeDeveloperDataError(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = `${err.name}: ${err.message}`;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  return text.length > MAX_DEVELOPER_DATA_ERROR_CHARS
+    ? `${text.slice(0, MAX_DEVELOPER_DATA_ERROR_CHARS)}…`
+    : text;
+}
+
+/** 无原型对象等会让 String() 也抛错；此时退回类型描述，保证投影本身绝不抛出。 */
+function stringifyFallback(value: unknown): string {
+  try {
+    return String(value);
+  } catch (err: unknown) {
+    return `[${typeof value}: ${err instanceof Error ? err.message : 'not printable'}]`;
   }
 }
 

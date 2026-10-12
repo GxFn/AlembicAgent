@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 
 /** 兼容决策只观察阶段及指标；不取得预算、消息写口或整个循环状态。 */
@@ -89,6 +90,7 @@ export function allowsToolCallsUnderForcedNone(mode: string | null | undefined):
  * DeepSeek V4 analyze 首轮判定（analyst/analyze 下的 SCAN，或零证据的 EXPLORE）。
  * 行为对等迁出自 `AgentRuntime.isDeepSeekV4AnalyzeFirstGroundingBurn`；
  * analyze grounding gate（AP-2 领地）亦复用此首轮判定。
+ * I47：EXPLORE 下 tracker.getMetrics 抛错时判为不适格并告警（旧实现按零证据放行且无日志）。
  */
 export function isAnalyzeFirstBurnGuardEligible(
   ctx: ProviderToolChoiceContext,
@@ -108,19 +110,68 @@ export function isAnalyzeFirstBurnGuardEligible(
   if (trackerPhase === 'SCAN') {
     return true;
   }
-  const metrics = safeCall<Record<string, unknown>>(() => ctx.tracker?.getMetrics?.());
+  // 只有 EXPLORE 需要看指标；其它阶段结论与指标无关，不再调用 tracker.getMetrics。
+  if (trackerPhase !== 'EXPLORE') {
+    return false;
+  }
+  const metricsRead = readTrackerMetrics(ctx);
+  if (!metricsRead.ok) {
+    // 保守降级：指标读不到时不能当成“零证据首轮”放行（那会在 requestedToolChoice=none 时
+    // 把 schema 改为可见 + auto，并让 AnalyzeGroundingGuard 按首轮阻断）。判为不适格并告警，
+    // 日志里带 modelRef / 阶段 / 错误原文，便于定位注入 tracker 的缺陷。
+    Logger.getInstance().warn(
+      '[ProviderToolChoicePolicy] tracker.getMetrics threw; analyze first-burn guard treated as ineligible',
+      {
+        modelRef,
+        trackerPhase,
+        pipelineType: pipelineType || null,
+        pipelinePhase: pipelinePhase || null,
+        error: metricsRead.error,
+      }
+    );
+    return false;
+  }
+  const metrics = metricsRead.metrics;
   const evidenceToolCallCount = Number(metrics?.evidenceToolCallCount || 0);
   const memoryFindingCount = Number(metrics?.memoryFindingCount || 0);
-  return trackerPhase === 'EXPLORE' && evidenceToolCallCount === 0 && memoryFindingCount === 0;
+  return evidenceToolCallCount === 0 && memoryFindingCount === 0;
 }
 
-// ── module-private helpers（与 AgentRuntime 同形；本仓惯例为每模块自带小工具）─────────────
-function safeCall<T>(fn: () => T | null | undefined): T | null {
+// ── module-private helpers（本仓惯例为每模块自带小工具）─────────────
+
+/** 诊断里错误原文的展示上限。 */
+const MAX_METRICS_ERROR_CHARS = 200;
+
+type TrackerMetricsRead =
+  | { ok: true; metrics: Record<string, unknown> | null }
+  | { ok: false; error: string };
+
+/** 读取 tracker 指标；区分“没有指标”（ok + null）与“读取抛错”（ok=false + 错误原文）。 */
+function readTrackerMetrics(ctx: ProviderToolChoiceContext): TrackerMetricsRead {
   try {
-    return fn() ?? null;
-  } catch {
-    return null;
+    return { ok: true, metrics: ctx.tracker?.getMetrics?.() ?? null };
+  } catch (err: unknown) {
+    return { ok: false, error: describeMetricsError(err) };
   }
+}
+
+function describeMetricsError(err: unknown): string {
+  let text: string;
+  if (err instanceof Error) {
+    text = err.message || err.name;
+  } else {
+    try {
+      text = String(err);
+    } catch (stringifyErr: unknown) {
+      text =
+        stringifyErr instanceof Error
+          ? `unprintable ${typeof err} (${stringifyErr.message})`
+          : `unprintable ${typeof err}`;
+    }
+  }
+  return text.length > MAX_METRICS_ERROR_CHARS
+    ? `${text.slice(0, MAX_METRICS_ERROR_CHARS)}…`
+    : text;
 }
 
 function stringValue(value: unknown): string | undefined {

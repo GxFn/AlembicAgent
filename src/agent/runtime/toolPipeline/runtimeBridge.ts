@@ -107,7 +107,21 @@ export async function executeRuntimeToolCall(
   // 单调时钟：墙钟回拨不能让 metadata.durationMs 变负（L3-C03）；取整保持整数毫秒。
   const t0 = performance.now();
   try {
-    const request = buildRuntimeToolCallRequest(call, context);
+    // 请求装配（policies.get / SafetyPolicy / allowedToolActions 投影等）是 Agent 侧逻辑，
+    // 与宿主路由执行分开捕获：装配失败归类为 TOOL_REQUEST_ASSEMBLY_FAILED，宿主根本没有被调用；
+    // 混在一起时运维只能看到“宿主执行失败”，无法区分 Agent 装配缺陷与宿主路由故障。
+    let request: ToolCallRequest;
+    try {
+      request = buildRuntimeToolCallRequest(call, context);
+    } catch (err: unknown) {
+      const error = describeBridgeError(err);
+      reportBridgeFailure(context, {
+        code: TOOL_REQUEST_ASSEMBLY_FAILED_CODE,
+        tool: call.name,
+        message: `Agent-side request assembly for ${call.name} failed before host dispatch: ${truncateBridgeError(error)}`,
+      });
+      return { error };
+    }
     // SafetyPolicy及请求装配可能执行宿主代码；最后一道取消检查必须位于真实路由入口前。
     if (request.abortSignal?.aborted) {
       metadata.blocked = true;
@@ -118,25 +132,57 @@ export async function executeRuntimeToolCall(
       });
       return { status: 'aborted', error: 'Tool call cancelled before host dispatch' };
     }
-    const routed = await context.runtime.toolRouter.execute(request);
-    const envelope = redactModelBoundEnvelope(call, context, routed);
-    recordExecutedEnvelope(call, context, metadata, envelope);
-    return projectPipelineToolResult(envelope);
-  } catch (err: unknown) {
-    const error =
-      err instanceof Error && err.message
-        ? err.message
-        : typeof err === 'string' && err
-          ? err
-          : 'Tool execution failed';
-    context.loopCtx.diagnostics?.warn({
-      code: 'TOOL_HOST_EXECUTION_FAILED',
-      message: `Host execution of ${call.name} failed before returning an envelope.`,
-    });
-    return { error };
+    try {
+      const routed = await context.runtime.toolRouter.execute(request);
+      const envelope = redactModelBoundEnvelope(call, context, routed);
+      recordExecutedEnvelope(call, context, metadata, envelope);
+      return projectPipelineToolResult(envelope);
+    } catch (err: unknown) {
+      const error = describeBridgeError(err);
+      reportBridgeFailure(context, {
+        code: TOOL_HOST_EXECUTION_FAILED_CODE,
+        tool: call.name,
+        message: `Host execution of ${call.name} failed before returning an envelope: ${truncateBridgeError(error)}`,
+      });
+      return { error };
+    }
   } finally {
     metadata.durationMs = Math.round(performance.now() - t0);
   }
+}
+
+const TOOL_REQUEST_ASSEMBLY_FAILED_CODE = 'TOOL_REQUEST_ASSEMBLY_FAILED';
+const TOOL_HOST_EXECUTION_FAILED_CODE = 'TOOL_HOST_EXECUTION_FAILED';
+/** 诊断里错误原文的展示上限；返回给模型的 error 不截断（保持原返回值）。 */
+const MAX_REPORTED_BRIDGE_ERROR_CHARS = 300;
+
+/** 模型可见的错误文本（与旧实现同源同规则）：Error.message → 非空字符串 → 固定兜底。 */
+function describeBridgeError(err: unknown): string {
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  if (typeof err === 'string' && err) {
+    return err;
+  }
+  return 'Tool execution failed';
+}
+
+function truncateBridgeError(error: string): string {
+  return error.length > MAX_REPORTED_BRIDGE_ERROR_CHARS
+    ? `${error.slice(0, MAX_REPORTED_BRIDGE_ERROR_CHARS)}…`
+    : error;
+}
+
+/** 有诊断收集器时写诊断；没有时降级到 runtime.logger（宿主日志器失败不影响返回值）。 */
+function reportBridgeFailure(
+  context: ToolExecContext,
+  warning: { code: string; tool: string; message: string }
+): void {
+  if (context.loopCtx.diagnostics) {
+    context.loopCtx.diagnostics.warn(warning);
+    return;
+  }
+  warnSafely(context.runtime, `[ToolPipeline] ${warning.code}: ${warning.message}`);
 }
 
 function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): ToolCallRequest {
