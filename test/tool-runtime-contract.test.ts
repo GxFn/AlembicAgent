@@ -1882,6 +1882,300 @@ describe('L4-P13 code.search multi-pattern completeness and count semantics', ()
   });
 });
 
+// ─── L4-P14 无 rg 时 code.search fallback 与 rg 语义对齐 ─────────────────────────────
+// 来源：module-review-2026-10-01 I14（U14-F5）。fallback 曾把 glob 当扩展名列表（'src/**/*.ts' 变成
+// 'src//.ts' 后只比文件名），路径型 glob 静默 0 命中且被当作完整结果；5000 文件上限只退出当前递归层
+// 且不标 incomplete；子目录 readdir 失败让整个 fallback 失败、读文件失败静默跳过；忽略集与 rg 的
+// --glob 不同（多跳过 Packages）且不读 .gitignore。这里用 PATH='' 制造 rg 缺席走真实 fallback/fs 路径，
+// 同一夹具再交给真实 rg 对照，钉住宿主可见的命中集合、partial 状态与诊断。
+type SearchEnvelope = Awaited<ReturnType<ToolRouterAdapter['execute']>>;
+
+describe('L4-P14 code.search fallback semantics without ripgrep', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** 夹具：每个文件只有一行 needle；被忽略/隐藏/命中的文件分布覆盖 rg 的 override、.gitignore 与隐藏规则。 */
+  async function makeGlobProject(options: { gitRepo: boolean }): Promise<string> {
+    const root = await mkdtemp(join(baseRoot, 'p14-glob-'));
+    if (options.gitRepo) {
+      // rg 只在 git 仓库内应用 .gitignore；空的 .git 目录就足以让 rg 与 fallback 都认定为仓库。
+      await mkdir(join(root, '.git'));
+    }
+    await writeFile(join(root, '.gitignore'), 'out/\ngenerated\n*.log\n!keep.log\n');
+    const files = [
+      'src/top.ts',
+      'src/a/mid.ts',
+      'src/a/b/deep.ts',
+      'src/a/b/deep.js',
+      'src/generated/g.ts',
+      'lib/src/nested.ts',
+      'root.ts',
+      'out/gen.ts',
+      'trace.log',
+      'keep.log',
+      'node_modules/x/m.ts',
+      'Packages/Local/p.ts',
+      '.hidden/h.ts',
+    ];
+    for (const file of files) {
+      await mkdir(join(root, file, '..'), { recursive: true });
+      await writeFile(join(root, file), 'needle\n');
+    }
+    return root;
+  }
+
+  async function searchNeedle(
+    root: string,
+    params: Record<string, unknown>,
+    engine: 'fallback' | 'rg'
+  ): Promise<SearchEnvelope> {
+    vi.unstubAllEnvs();
+    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+    if (engine === 'fallback') {
+      vi.stubEnv('PATH', '');
+    }
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+    });
+    return router.execute(
+      searchRequest({ patterns: ['needle'], maxResults: 50, contextLines: 0, ...params })
+    );
+  }
+
+  function hitFiles(result: SearchEnvelope): string[] {
+    const data = result.structuredContent as SearchData | null;
+    return [...new Set((data?.matches ?? []).map((match) => match.file))].sort();
+  }
+
+  it.each([
+    ['src/**/*.ts', ['src/a/b/deep.ts', 'src/a/mid.ts', 'src/top.ts']],
+    [
+      'src/**',
+      ['src/a/b/deep.js', 'src/a/b/deep.ts', 'src/a/mid.ts', 'src/generated/g.ts', 'src/top.ts'],
+    ],
+    ['src/*.ts', ['src/top.ts']],
+    ['/src/*.ts', ['src/top.ts']],
+    ['**/src/*.ts', ['lib/src/nested.ts', 'src/top.ts']],
+    [
+      '*.ts',
+      [
+        'Packages/Local/p.ts',
+        'lib/src/nested.ts',
+        'root.ts',
+        'src/a/b/deep.ts',
+        'src/a/mid.ts',
+        'src/top.ts',
+      ],
+    ],
+    ['!*.ts', ['keep.log', 'src/a/b/deep.js']],
+    ['*.log', ['keep.log', 'trace.log']],
+    [
+      undefined,
+      [
+        'Packages/Local/p.ts',
+        'keep.log',
+        'lib/src/nested.ts',
+        'root.ts',
+        'src/a/b/deep.js',
+        'src/a/b/deep.ts',
+        'src/a/mid.ts',
+        'src/top.ts',
+      ],
+    ],
+  ] as Array<
+    [string | undefined, string[]]
+  >)('matches glob %s like ripgrep when rg is absent', async (glob, expected) => {
+    const root = await makeGlobProject({ gitRepo: true });
+    const params = glob === undefined ? {} : { glob };
+    const fallback = await searchNeedle(root, params, 'fallback');
+    expect(fallback.ok).toBe(true);
+    expect(fallback.status).toBe('success');
+    expect(fallback.diagnostics?.fallbackUsed).toBe(true);
+    expect(fallback.diagnostics?.degraded).toBe(false);
+    expect(fallback.diagnostics?.warnings ?? []).toContainEqual(
+      expect.objectContaining({ code: 'code_search_fallback' })
+    );
+    expect(hitFiles(fallback)).toEqual(expected);
+    expect((fallback.structuredContent as SearchData).incomplete).toBeUndefined();
+
+    // 同一夹具交给真实 rg 对照；环境没有 rg 时上面的显式期望已覆盖语义。
+    const rg = await searchNeedle(root, params, 'rg');
+    if (rg.diagnostics?.fallbackUsed !== true) {
+      expect(hitFiles(rg)).toEqual(hitFiles(fallback));
+    }
+  });
+
+  it('applies the project-root .gitignore only inside a git repository, as rg does', async () => {
+    const outside = await makeGlobProject({ gitRepo: false });
+    const fallback = await searchNeedle(outside, {}, 'fallback');
+    expect(hitFiles(fallback)).toEqual([
+      'Packages/Local/p.ts',
+      'keep.log',
+      'lib/src/nested.ts',
+      'out/gen.ts',
+      'root.ts',
+      'src/a/b/deep.js',
+      'src/a/b/deep.ts',
+      'src/a/mid.ts',
+      'src/generated/g.ts',
+      'src/top.ts',
+      'trace.log',
+    ]);
+    const rg = await searchNeedle(outside, {}, 'rg');
+    if (rg.diagnostics?.fallbackUsed !== true) {
+      expect(hitFiles(rg)).toEqual(hitFiles(fallback));
+    }
+    const inside = await makeGlobProject({ gitRepo: true });
+    const ignored = hitFiles(await searchNeedle(inside, {}, 'fallback'));
+    expect(ignored).not.toContain('out/gen.ts');
+    expect(ignored).not.toContain('src/generated/g.ts');
+    expect(ignored).not.toContain('trace.log');
+    expect(ignored).toContain('keep.log');
+  });
+
+  it('stops at the global fallback file cap and reports the unsatisfied pattern as partial', async () => {
+    const root = await mkdtemp(join(baseRoot, 'p14-cap-'));
+    await writeFile(join(root, 'a-hit.ts'), 'needle first\n');
+    await mkdir(join(root, 'bulk'));
+    const names = Array.from({ length: 5001 }, (_, i) => `f${String(i).padStart(4, '0')}.ts`);
+    for (let start = 0; start < names.length; start += 500) {
+      await Promise.all(
+        names
+          .slice(start, start + 500)
+          .map((name) => writeFile(join(root, 'bulk', name), 'filler\n'))
+      );
+    }
+    // 排序遍历下这是最后一个候选文件，落在全局上限之外，不能被搜到。
+    await writeFile(join(root, 'bulk', 'f5000.ts'), 'needle beyond the cap\n');
+    vi.stubEnv('PATH', '');
+    const router = new ToolRouterAdapter({
+      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+    });
+
+    const result = await router.execute(searchRequest({ patterns: ['needle'], contextLines: 0 }));
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe('partial');
+    expect(result.diagnostics?.degraded).toBe(true);
+    expect(result.diagnostics?.fallbackUsed).toBe(true);
+    const data = result.structuredContent as SearchData;
+    expect(data.incomplete).toBe(true);
+    expect(data.matches).toEqual([{ file: 'a-hit.ts', line: 1, content: 'needle first' }]);
+    const warning = (result.diagnostics?.warnings ?? []).find(
+      (w) => w.code === 'code_search_incomplete'
+    );
+    expect(warning?.message).toContain('fallback file cap');
+    expect(warning?.message).toContain('"needle"');
+
+    // 收满 maxResults 即请求已满足（与 rg 提前收尾同义）：上限之后的文件本就不会再读，不标 partial。
+    const satisfied = await router.execute(
+      searchRequest({ patterns: ['needle'], maxResults: 1, contextLines: 0 })
+    );
+    expect(satisfied.status).toBe('success');
+    expect((satisfied.structuredContent as SearchData).incomplete).toBeUndefined();
+  }, 60_000);
+
+  it.skipIf(process.getuid?.() === 0)(
+    'counts unreadable subdirectories and files in a warning instead of failing or hiding them',
+    async () => {
+      const root = await mkdtemp(join(baseRoot, 'p14-unreadable-'));
+      await mkdir(join(root, 'ok'));
+      await mkdir(join(root, 'locked'));
+      await writeFile(join(root, 'ok', 'a.ts'), 'needle visible\n');
+      await writeFile(join(root, 'ok', 'secret.ts'), 'needle hidden by mode\n');
+      await writeFile(join(root, 'locked', 'b.ts'), 'needle locked\n');
+      await chmod(join(root, 'locked'), 0o000);
+      await chmod(join(root, 'ok', 'secret.ts'), 0o000);
+      try {
+        vi.stubEnv('PATH', '');
+        const router = new ToolRouterAdapter({
+          contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+        });
+        const result = await router.execute(
+          searchRequest({ patterns: ['needle'], contextLines: 0 })
+        );
+        expect(result.ok).toBe(true);
+        expect(result.status).toBe('partial');
+        expect((result.structuredContent as SearchData).matches).toEqual([
+          { file: 'ok/a.ts', line: 1, content: 'needle visible' },
+        ]);
+        const warnings = result.diagnostics?.warnings ?? [];
+        const unreadable = warnings.find((w) => w.code === 'code_search_fallback_unreadable');
+        expect(unreadable?.message).toContain('1 directory');
+        expect(unreadable?.message).toContain('1 file');
+        expect(unreadable?.message).toContain('locked');
+        expect(unreadable?.message).toContain('ok/secret.ts');
+        expect(warnings).toContainEqual(
+          expect.objectContaining({ code: 'code_search_incomplete' })
+        );
+      } finally {
+        await chmod(join(root, 'locked'), 0o755);
+        await chmod(join(root, 'ok', 'secret.ts'), 0o644);
+      }
+    }
+  );
+
+  it.each([
+    ['aborted', () => new Error('host stopped the fallback scan')],
+    ['timeout', () => Object.assign(new Error('fallback deadline'), { name: 'TimeoutError' })],
+  ] as Array<
+    ['aborted' | 'timeout', () => Error]
+  >)('classifies cancellation during the fallback scan as %s and stops walking', async (status, reason) => {
+    const root = await mkdtemp(join(baseRoot, `p14-cancel-${status}-`));
+    await mkdir(join(root, 'sub', 'deeper'), { recursive: true });
+    await writeFile(join(root, 'a.ts'), 'needle a\n');
+    await writeFile(join(root, 'sub', 'b.ts'), 'needle b\n');
+    await writeFile(join(root, 'sub', 'deeper', 'c.ts'), 'needle c\n');
+    const fsPromises = (await import('node:fs/promises')).default;
+    const originalReaddir = fsPromises.readdir.bind(fsPromises);
+    const controller = new AbortController();
+    const visited: string[] = [];
+    // 只在遍历进入 sub 时触发取消，其余照常交给真实 readdir；断言遍历不会再进入更深的目录。
+    const readdir = vi.spyOn(fsPromises, 'readdir').mockImplementation(((
+      target: Parameters<typeof fsPromises.readdir>[0],
+      options?: Parameters<typeof fsPromises.readdir>[1]
+    ) => {
+      const dir = String(target);
+      visited.push(dir.slice(root.length) || '/');
+      if (dir.endsWith('/sub')) {
+        controller.abort(reason());
+      }
+      return originalReaddir(target, options);
+    }) as typeof fsPromises.readdir);
+    try {
+      vi.stubEnv('PATH', '');
+      const router = new ToolRouterAdapter({
+        contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+      });
+      const result = await router.execute(
+        searchRequest({ patterns: ['needle', 'never-run'], contextLines: 0 }, controller.signal)
+      );
+      expect(result.status).toBe(status);
+      expect(result.ok).toBe(false);
+      expect(visited).toEqual(['/', '/sub']);
+      const warning = (result.diagnostics?.warnings ?? []).find(
+        (w) => w.code === 'code_search_incomplete'
+      );
+      expect(warning?.message).toContain('Search cancelled during the in-process fallback.');
+      expect(warning?.message).toContain('"never-run"');
+    } finally {
+      readdir.mockRestore();
+    }
+  });
+
+  it('rejects a glob shape the fallback cannot evaluate instead of reporting zero hits', async () => {
+    const root = await makeGlobProject({ gitRepo: true });
+    const result = await searchNeedle(root, { glob: 'src\\*.ts' }, 'fallback');
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe('error');
+    expect(result.text).toContain('cannot evaluate glob');
+    expect(result.diagnostics?.fallbackUsed).toBe(true);
+    expect(result.diagnostics?.warnings ?? []).toContainEqual(
+      expect.objectContaining({ code: 'code_search_fallback_glob_unsupported' })
+    );
+  });
+});
+
 // ─── L3-P12 工具输出 token 上限统一为 shared 口径 ─────────────────────────────────
 // 来源：module-review-2026-10-01 L3-C12（U09-F4）。kernel 的 estimateTokens 曾按 len/4 估算，
 // 对 CJK 低估约一倍：maxOutputTokens=3000 的 action 能放过约 12000 个汉字（shared 口径约 6000

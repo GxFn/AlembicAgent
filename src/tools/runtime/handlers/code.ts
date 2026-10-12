@@ -8,6 +8,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import type { Dirent } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -98,6 +99,11 @@ async function handleSearch(
   const outcomes: PatternSearchOutcome[] = [];
   const startMs = Date.now();
   let fellBack = false;
+  // I14：fallback 文件清单在本次调用的所有 pattern 间共享（只遍历一次，上限与忽略规则一致）；
+  // 读失败的文件按路径去重，循环结束后统一写入诊断。
+  let fallbackScan: Promise<FallbackScan> | undefined;
+  let scanned: FallbackScan | undefined;
+  const unreadableFiles = new Set<string>();
   let rejectedPaths = 0;
   // I13：输出超限 / rg 非零退出只影响单个 pattern（affected），引擎异常且无命中记为 failures；
   // 两者都继续执行后续 pattern。只有 timeout/aborted（halted）才中断循环，并记下未执行的 pattern。
@@ -146,13 +152,25 @@ async function handleSearch(
         }
         fallback = true;
         fellBack = true;
-        warnings.push({
-          code: 'code_search_fallback',
-          message: 'ripgrep is unavailable (ENOENT); using the in-process search fallback.',
-          stage: 'code.search',
-          tool: 'code',
-        });
-        result = await fallbackRegexSearch(pattern, ctx.projectRoot, opts);
+        if (!fallbackScan) {
+          // 首个回退的 pattern 才遍历文件并报告 fallback；后续 pattern 复用同一清单，不重复诊断。
+          warnings.push({
+            code: 'code_search_fallback',
+            message: FALLBACK_NOTICE,
+            stage: 'code.search',
+            tool: 'code',
+          });
+          fallbackScan = scanFallbackFiles(ctx.projectRoot, glob, ctx.abortSignal);
+        }
+        // 根目录不可读时这里抛错，由外层 catch 记为该 pattern 失败。
+        scanned = await fallbackScan;
+        result = await fallbackRegexSearch(
+          pattern,
+          ctx.projectRoot,
+          opts,
+          scanned,
+          unreadableFiles
+        );
       }
       outcomes.push({ pattern, matches: result.matches, total: result.total });
       rejectedPaths += result.rejectedPaths ?? 0;
@@ -180,10 +198,27 @@ async function handleSearch(
     }
   }
 
+  if (scanned) {
+    pushFallbackScanWarnings(warnings, scanned, unreadableFiles, glob);
+  }
   const deduped = mergeRoundRobin(outcomes, maxResults);
   const totalCount = outcomes.reduce((sum, outcome) => sum + outcome.total, 0);
   if (deduped.length === 0 && failures.length > 0 && !halted) {
-    return fail(`code.search failed: ${describePatternIssues(failures)}`);
+    const failed = fail(`code.search failed: ${describePatternIssues(failures)}`);
+    if (!fellBack && warnings.length === 0) {
+      return failed;
+    }
+    // 失败也要带上 fallback 诊断（例如 glob 超出 fallback 能力），宿主才能分辨是哪条路径拒绝的。
+    return {
+      ...failed,
+      _meta: {
+        cached: false,
+        tokensEstimate: 0,
+        durationMs: Date.now() - startMs,
+        ...(fellBack ? { fallbackUsed: true } : {}),
+        ...(warnings.length > 0 ? { diagnosticWarnings: warnings } : {}),
+      },
+    };
   }
   const incomplete = describeIncompleteSearch(halted, affected, failures, maxResults);
 
@@ -423,24 +458,35 @@ function searchAbortStatus(signal: AbortSignal): 'timeout' | 'aborted' {
   return isDeadlineAbort(signal) ? 'timeout' : 'aborted';
 }
 
-/** ripgrep 排除的噪音目录 — 与 IGNORED_DIRS 对齐 */
-const RG_EXCLUDE_GLOBS = [
-  '!.git',
-  '!node_modules',
-  '!.build',
-  '!dist',
-  '!build',
-  '!.next',
-  '!__pycache__',
-  '!.venv',
-  '!venv',
-  '!Pods',
-  '!Carthage',
-  '!.gradle',
-  '!DerivedData',
-  '!coverage',
-  '!.turbo',
-];
+/**
+ * code.search 的单一忽略集，rg 与 in-process fallback 共用：按名字在任意层级排除的噪音目录。
+ * rg 侧由它生成 `--glob !<name>`；fallback 把同一串 --glob 当作 override 规则求值（见
+ * buildFallbackOverrides），两个引擎不再各维护一份名单（I14：旧 fallback 用的 IGNORED_DIRS 多出
+ * Packages/.idea/.vscode 等，与 rg 不一致）。
+ * 隐藏项（名字以 . 开头）不靠这里排除：rg 默认跳过隐藏项，fallback 复刻同一条内建规则。
+ * 刻意不含 Packages：本地 Swift Package（Packages/<Name>/Sources/...）是真实源码，rg 一直搜索它；
+ * code.structure 的展示名单 STRUCTURE_IGNORED_DIRS 另行隐藏它。
+ */
+const SEARCH_IGNORED_NAMES = [
+  '.git',
+  'node_modules',
+  '.build',
+  'dist',
+  'build',
+  '.next',
+  '__pycache__',
+  '.venv',
+  'venv',
+  'Pods',
+  'Carthage',
+  '.gradle',
+  'DerivedData',
+  'coverage',
+  '.turbo',
+] as const;
+
+/** ripgrep 的排除参数：由 SEARCH_IGNORED_NAMES 生成，顺序与内容和旧的手写列表完全一致。 */
+const RG_EXCLUDE_GLOBS: readonly string[] = SEARCH_IGNORED_NAMES.map((name) => `!${name}`);
 
 async function ripgrepSearch(
   pattern: string,
@@ -759,11 +805,25 @@ class RipgrepJsonStream {
   }
 }
 
+/**
+ * 在共享的 fallback 文件清单上执行一个 pattern。完整性与 rg 对齐：
+ * - 收满 maxResults 即请求已满足（与 rg 提前收尾同义），清单之外的文件本就不会再读，不标 partial；
+ * - 没收满时，清单被全局上限截断、有子目录读不了或本 pattern 有文件读失败，都意味着有内容没搜，
+ *   标 partial（rg 在同样情况下非零退出，spawnRg 也按 partial/失败处理），不能当作完整的“没找到”；
+ * - glob 超出 fallback 能力时直接抛错，由调用方记为失败，而不是报告 0 命中。
+ */
 async function fallbackRegexSearch(
   pattern: string,
   cwd: string,
-  opts: SearchOptions
+  opts: SearchOptions,
+  scan: FallbackScan,
+  unreadableFiles: Set<string>
 ): Promise<RipgrepResult> {
+  if (scan.globUnsupported !== undefined) {
+    throw new Error(
+      `In-process fallback cannot evaluate glob ${JSON.stringify(opts.glob)}: ${scan.globUnsupported}`
+    );
+  }
   const matches: SearchMatch[] = [];
   let searchRe: RegExp;
   try {
@@ -775,11 +835,11 @@ async function fallbackRegexSearch(
     );
   }
 
-  const files = await collectFiles(cwd, opts.glob, opts.signal);
   let total = 0;
   let rejectedPaths = 0;
+  let unreadable = 0;
 
-  for (const file of files) {
+  for (const file of scan.files) {
     if (opts.signal?.aborted) {
       break;
     }
@@ -824,8 +884,19 @@ async function fallbackRegexSearch(
           }
         }
       }
-    } catch {
-      // 读取失败跳过
+    } catch (err: unknown) {
+      if (hasErrorCode(err, 'EISDIR')) {
+        // 指向目录的符号链接：rg 默认不跟随目录链接，这里同样不展开，不算读失败。
+        const message = `[code.search] fallback skipped symlinked directory ${JSON.stringify(file)} (not followed, as with ripgrep).`;
+        observeSafely(
+          () => Logger.getInstance().debug(message),
+          () => undefined
+        );
+        continue;
+      }
+      // 读失败计数：没收满时本 pattern 标 partial，路径在循环后统一点名（同一文件跨 pattern 去重）。
+      unreadable++;
+      unreadableFiles.add(file);
     }
   }
 
@@ -833,15 +904,40 @@ async function fallbackRegexSearch(
     matches,
     total,
     ...(rejectedPaths > 0 ? { rejectedPaths } : {}),
-    ...(opts.signal?.aborted
-      ? {
-          incomplete: {
-            status: searchAbortStatus(opts.signal),
-            reason: 'Search cancelled during the in-process fallback.',
-          },
-        }
-      : {}),
+    ...fallbackIncomplete(opts, matches.length, scan, unreadable),
   };
+}
+
+/** fallback 单个 pattern 的完整性判定（规则见 fallbackRegexSearch 注释）。 */
+function fallbackIncomplete(
+  opts: SearchOptions,
+  collected: number,
+  scan: FallbackScan,
+  unreadableFiles: number
+): Pick<RipgrepResult, 'incomplete'> {
+  if (opts.signal?.aborted) {
+    return {
+      incomplete: {
+        status: searchAbortStatus(opts.signal),
+        reason: 'Search cancelled during the in-process fallback.',
+      },
+    };
+  }
+  if (collected >= opts.maxResults) {
+    return {};
+  }
+  const gaps: string[] = [];
+  if (scan.capped) {
+    gaps.push(
+      `fallback file cap: listing stopped at ${FALLBACK_FILE_CAP} candidate files, so later files were not searched`
+    );
+  }
+  if (scan.unreadableDirs.length > 0 || unreadableFiles > 0) {
+    gaps.push(
+      `fallback could not read ${plural(scan.unreadableDirs.length, 'directory', 'directories')} and ${plural(unreadableFiles, 'file', 'files')}`
+    );
+  }
+  return gaps.length > 0 ? { incomplete: { status: 'partial', reason: gaps.join('; ') } } : {};
 }
 
 /* ================================================================== */
@@ -1241,26 +1337,17 @@ async function handleStructure(
   }
 }
 
-const IGNORED_DIRS = new Set([
-  'node_modules',
-  '.git',
+/**
+ * code.structure 展示目录树时隐藏的目录：以 code.search 的单一忽略集为底，再加只为展示降噪的名字。
+ * 成员与旧 IGNORED_DIRS 完全相同（结构展示行为不变）；Packages 等只在这里隐藏，不进入搜索忽略集，
+ * 因为本地 Swift Package 是真实源码，搜索必须覆盖。
+ */
+const STRUCTURE_IGNORED_DIRS: ReadonlySet<string> = new Set([
+  ...SEARCH_IGNORED_NAMES,
   '.svn',
   '.hg',
-  '.build',
-  'dist',
-  'build',
-  '.next',
-  '__pycache__',
-  '.venv',
-  'venv',
-  'Pods',
-  'Carthage',
-  '.gradle',
-  'DerivedData',
   '.idea',
   '.vscode',
-  'coverage',
-  '.turbo',
   'Packages',
   '.swiftpm',
 ]);
@@ -1284,7 +1371,7 @@ async function buildDirectoryTree(
       continue;
     }
     if (entry.isDirectory()) {
-      if (!IGNORED_DIRS.has(entry.name)) {
+      if (!STRUCTURE_IGNORED_DIRS.has(entry.name)) {
         dirs.push(entry.name);
       }
     } else {
@@ -1704,39 +1791,391 @@ function reportBatchReadClamp(
   );
 }
 
-async function collectFiles(cwd: string, glob?: string, signal?: AbortSignal): Promise<string[]> {
-  const files: string[] = [];
-  const extensions = glob
-    ? glob
-        .replace(/\*/g, '')
-        .split(',')
-        .map((e) => e.trim())
-    : null;
+/* ================================================================== */
+/*  code.search in-process fallback（rg 缺席时）                        */
+/* ================================================================== */
 
-  async function walk(dir: string, relDir: string): Promise<void> {
-    if (signal?.aborted) {
+/**
+ * fallback 候选文件的全局上限：遍历收集到这么多候选文件后整体硬停（旧实现只退出当前递归层，
+ * 其他层继续收集且从不标 incomplete）。没收满 maxResults 的 pattern 据此标 partial。
+ */
+const FALLBACK_FILE_CAP = 5000;
+
+/** 诊断里最多点名的不可读路径数；其余只计数，避免诊断随大仓库膨胀。 */
+const FALLBACK_UNREADABLE_SAMPLE = 5;
+
+/** rg 缺席时给模型和宿主的说明：fallback 的方言与能力边界都在这里写明。 */
+const FALLBACK_NOTICE =
+  'ripgrep is unavailable (ENOENT); using the in-process search fallback ' +
+  '(JavaScript RegExp dialect, ripgrep-style globs via path.matchesGlob, ' +
+  `project-root .gitignore only, at most ${FALLBACK_FILE_CAP} candidate files).`;
+
+/**
+ * 一条 gitignore 风格的 glob 规则。rg 的 --glob 与 .gitignore 用同一套写法：
+ * - 以 ! 开头：在 override（--glob）里表示排除，在 .gitignore 里表示重新纳入；
+ * - 以 / 结尾：只匹配目录；
+ * - 开头或中间含 /：相对项目根匹配完整相对路径；否则匹配任意层级的名字（basename）。
+ */
+interface FallbackGlobRule {
+  negated: boolean;
+  dirOnly: boolean;
+  anchored: boolean;
+  /** 去掉 !、首尾 / 之后的 pattern。 */
+  pattern: string;
+  /** 不含通配元字符：按字符串精确比较（大小写敏感，与 rg 一致），不经 matchesGlob。 */
+  literal: boolean;
+}
+
+/** 一次 fallback 搜索的筛选规则：override 与根 .gitignore 都已编译。 */
+interface FallbackFilter {
+  /** rg 的 --glob 序列：单一忽略集生成的排除项 + 用户 glob（排在最后，最后命中者生效）。 */
+  overrides: FallbackGlobRule[];
+  /** override 中存在白名单（非 ! 开头）glob：没命中任何 override 的文件一律跳过。 */
+  hasWhitelist: boolean;
+  gitignore: FallbackGlobRule[];
+}
+
+/**
+ * 一次 code.search 调用内所有 pattern 共享的 fallback 文件清单：只遍历一次，上限、不可读目录与
+ * 忽略规则对每个 pattern 一致，诊断也只报一次。
+ */
+interface FallbackScan {
+  /** 候选文件（项目相对 POSIX 路径），目录内按名字排序的深度优先顺序，结果可复现。 */
+  files: string[];
+  /** 遍历在 FALLBACK_FILE_CAP 处全局硬停：还有候选文件没有进入清单。 */
+  capped: boolean;
+  /** readdir 失败的子目录（项目相对路径）；根目录失败直接抛错，由调用方记为 pattern 失败。 */
+  unreadableDirs: string[];
+  /** 用户 glob 超出 fallback 能力时的原因；此时不遍历，调用方必须显式拒绝而不是报 0 命中。 */
+  globUnsupported?: string;
+}
+
+const GLOB_META_RE = /[*?[\]{}]/;
+/** minimatch 会把 @(...)/!(...) 等当 extglob 解释，rg 的 globset 不支持这种写法，两边语义会分叉。 */
+const EXTGLOB_RE = /[?*+@!]\(/;
+
+function hasErrorCode(err: unknown, code: string): boolean {
+  return err instanceof Error && 'code' in err && err.code === code;
+}
+
+function errorMessage(err: unknown, fallbackText: string): string {
+  return err instanceof Error ? err.message : fallbackText;
+}
+
+/**
+ * 把一条 gitignore 风格 glob 编译成规则；超出 fallback 能力的形状返回原因，由调用方决定显式拒绝
+ * （用户 glob）还是跳过并计数（.gitignore 行）。能力边界：
+ * - 反斜杠：rg 当转义符，Node 的 matchesGlob 当路径分隔符，语义不同；
+ * - extglob 组：minimatch 支持而 rg 不支持；
+ * - 含通配符但运行时没有 path.matchesGlob（Node.js < 22.5）。
+ */
+function compileFallbackGlob(raw: string): { rule: FallbackGlobRule } | { unsupported: string } {
+  let body = raw;
+  const negated = body.startsWith('!');
+  if (negated) {
+    body = body.slice(1);
+  }
+  if (body.includes('\\')) {
+    return { unsupported: 'backslash escapes are not supported by the in-process matcher' };
+  }
+  if (EXTGLOB_RE.test(body)) {
+    return { unsupported: 'extglob groups such as @(...) are not ripgrep glob syntax' };
+  }
+  const dirOnly = body.endsWith('/');
+  body = body.replace(/\/+$/, '');
+  const anchored = body.includes('/');
+  body = body.replace(/^\/+/, '');
+  if (!body) {
+    return { unsupported: 'the glob is empty after removing "!" and leading/trailing "/"' };
+  }
+  const literal = !GLOB_META_RE.test(body);
+  if (!literal) {
+    if (typeof path.posix.matchesGlob !== 'function') {
+      return {
+        unsupported:
+          'path.matchesGlob is unavailable in this Node.js runtime (needs 22.5 or later)',
+      };
+    }
+    try {
+      path.posix.matchesGlob('probe', body);
+    } catch (err: unknown) {
+      return {
+        unsupported: `path.matchesGlob rejected the pattern (${errorMessage(err, 'invalid pattern')})`,
+      };
+    }
+  }
+  return { rule: { negated, dirOnly, anchored, pattern: body, literal } };
+}
+
+/**
+ * 规则是否命中一个目录项。无分隔符的规则只比名字：gitignore 语义下它匹配任意层级，而通配符不跨 /，
+ * 比名字与比完整路径等价。注意 Node 的 matchesGlob 在 macOS/Windows 上大小写不敏感、且通配符不匹配
+ * 以 . 开头的段，与 rg 略有出入；字面量规则（包括整个单一忽略集）走精确比较，与 rg 一致。
+ */
+function fallbackRuleMatches(
+  rule: FallbackGlobRule,
+  relPath: string,
+  name: string,
+  isDir: boolean
+): boolean {
+  if (rule.dirOnly && !isDir) {
+    return false;
+  }
+  const subject = rule.anchored ? relPath : name;
+  return rule.literal ? subject === rule.pattern : path.posix.matchesGlob(subject, rule.pattern);
+}
+
+/** gitignore 语义：最后一条命中的规则生效，所以从后往前找第一条命中。 */
+function lastMatchingRule(
+  rules: readonly FallbackGlobRule[],
+  relPath: string,
+  name: string,
+  isDir: boolean
+): FallbackGlobRule | undefined {
+  for (let index = rules.length - 1; index >= 0; index--) {
+    if (fallbackRuleMatches(rules[index], relPath, name, isDir)) {
+      return rules[index];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 复刻 rg（ignore crate）对单个目录项的判定顺序：
+ * 1. override（单一忽略集生成的排除项 + 用户 glob，最后命中者生效）：命中 `!x` 跳过，命中 `x` 纳入，
+ *    并越过 .gitignore 与隐藏规则（所以 `src/**` 会纳入被 .gitignore 的 src/generated）；
+ * 2. 存在白名单 glob 而文件没命中任何 override：跳过；目录仍要下钻，否则 `*.ts` 会剪掉所有目录；
+ * 3. 根 .gitignore（最后命中者生效，`!x` 重新纳入）；
+ * 4. 名字以 . 开头的隐藏项，未被 .gitignore 重新纳入时跳过。
+ */
+function fallbackEntrySelected(
+  filter: FallbackFilter,
+  relPath: string,
+  name: string,
+  isDir: boolean
+): boolean {
+  const override = lastMatchingRule(filter.overrides, relPath, name, isDir);
+  if (override) {
+    return !override.negated;
+  }
+  if (!isDir && filter.hasWhitelist) {
+    return false;
+  }
+  const ignore = lastMatchingRule(filter.gitignore, relPath, name, isDir);
+  if (ignore) {
+    return ignore.negated;
+  }
+  return !name.startsWith('.');
+}
+
+/** 与 rg 一致：只有项目根或其祖先存在 .git 时才应用 .gitignore。 */
+async function isInsideGitRepository(root: string): Promise<boolean> {
+  let dir = path.resolve(root);
+  while (true) {
+    try {
+      await fs.stat(path.join(dir, '.git'));
+      return true;
+    } catch (err: unknown) {
+      // 不存在或无权限都视为此层没有 .git，继续向上找。
+      void err;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return false;
+    }
+    dir = parent;
+  }
+}
+
+interface RootGitignore {
+  rules: FallbackGlobRule[];
+  /** 超出 fallback 能力而没有应用的 .gitignore 行；少应用只会多搜（超集），不会漏搜。 */
+  skipped: string[];
+  state: 'applied' | 'absent' | 'not-a-git-repo' | 'unreadable';
+}
+
+/**
+ * 读取项目根的 .gitignore（fallback 的最低能力；rg 还会读嵌套 .gitignore、.ignore、.rgignore 和
+ * 全局 excludes，fallback 不读，差异写在 FALLBACK_NOTICE 里）。
+ */
+async function loadRootGitignore(root: string): Promise<RootGitignore> {
+  if (!(await isInsideGitRepository(root))) {
+    return { rules: [], skipped: [], state: 'not-a-git-repo' };
+  }
+  let content: string;
+  try {
+    content = await fs.readFile(path.join(root, '.gitignore'), 'utf-8');
+  } catch (err: unknown) {
+    if (hasErrorCode(err, 'ENOENT')) {
+      return { rules: [], skipped: [], state: 'absent' };
+    }
+    // 读不到 .gitignore 只会让 fallback 多搜，不会漏搜：记日志后不带规则继续。
+    const message = `[code.search] fallback could not read the project-root .gitignore; searching without it: ${errorMessage(err, 'read failed')}`;
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+    return { rules: [], skipped: [], state: 'unreadable' };
+  }
+  const rules: FallbackGlobRule[] = [];
+  const skipped: string[] = [];
+  for (const raw of content.split(/\r?\n/)) {
+    if (!raw || raw.startsWith('#')) {
+      continue;
+    }
+    // gitignore 忽略行尾空格；被反斜杠转义的空格属于反斜杠写法，下面按不支持跳过。
+    const line = raw.replace(/ +$/, '');
+    if (!line) {
+      continue;
+    }
+    const compiled = compileFallbackGlob(line);
+    if ('unsupported' in compiled) {
+      skipped.push(line);
+      continue;
+    }
+    rules.push(compiled.rule);
+  }
+  return { rules, skipped, state: 'applied' };
+}
+
+/**
+ * 编译 fallback 的 override 序列：与 rg 收到的 --glob 参数同序（单一忽略集在前，用户 glob 在后）。
+ * 用户 glob 超出能力时返回原因，调用方显式拒绝。
+ */
+function buildFallbackOverrides(
+  glob: string | undefined
+): { overrides: FallbackGlobRule[]; hasWhitelist: boolean } | { unsupported: string } {
+  const sources = glob ? [...RG_EXCLUDE_GLOBS, glob] : [...RG_EXCLUDE_GLOBS];
+  const overrides: FallbackGlobRule[] = [];
+  for (const source of sources) {
+    const compiled = compileFallbackGlob(source);
+    if ('unsupported' in compiled) {
+      return { unsupported: compiled.unsupported };
+    }
+    overrides.push(compiled.rule);
+  }
+  return { overrides, hasWhitelist: overrides.some((rule) => !rule.negated) };
+}
+
+/**
+ * 按 rg 的忽略语义列出 fallback 候选文件。符号链接沿用旧行为作为候选（读取前经 resolveProjectPath
+ * 校验仍在项目内），FIFO/socket/设备文件不列入（读 FIFO 会阻塞）。
+ */
+async function scanFallbackFiles(
+  root: string,
+  glob: string | undefined,
+  signal?: AbortSignal
+): Promise<FallbackScan> {
+  const built = buildFallbackOverrides(glob);
+  if ('unsupported' in built) {
+    const message = `[code.search] fallback rejected glob ${JSON.stringify(glob)}: ${built.unsupported}`;
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+    return { files: [], capped: false, unreadableDirs: [], globUnsupported: built.unsupported };
+  }
+  const gitignore = await loadRootGitignore(root);
+  const filter: FallbackFilter = { ...built, gitignore: gitignore.rules };
+  const files: string[] = [];
+  const unreadableDirs: string[] = [];
+  let capped = false;
+
+  async function walk(absDir: string, relDir: string): Promise<void> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(absDir, { withFileTypes: true });
+    } catch (err: unknown) {
+      if (!relDir) {
+        // 项目根都读不了：整个 fallback 无法执行，交给调用方按 pattern 失败处理。
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+      // 子目录读不了：记下来继续遍历；没收满的 pattern 会标 partial，诊断点名这些目录。
+      unreadableDirs.push(relDir);
       return;
     }
-    const entries = await fs.readdir(dir, { withFileTypes: true });
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     for (const entry of entries) {
-      if (signal?.aborted) {
+      if (capped || signal?.aborted) {
         return;
       }
-      if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith('.')) {
+      const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+      const isDir = entry.isDirectory();
+      if (!fallbackEntrySelected(filter, relPath, entry.name, isDir)) {
         continue;
       }
-      const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        await walk(path.join(dir, entry.name), relPath);
-      } else if (!extensions || extensions.some((ext) => entry.name.endsWith(ext))) {
-        files.push(relPath);
-        if (files.length >= 5000) {
-          return;
-        }
+      if (isDir) {
+        await walk(path.join(absDir, entry.name), relPath);
+        continue;
       }
+      if (!entry.isFile() && !entry.isSymbolicLink()) {
+        continue;
+      }
+      if (files.length >= FALLBACK_FILE_CAP) {
+        // 全局硬停：已经确认还有候选文件在上限之外。
+        capped = true;
+        return;
+      }
+      files.push(relPath);
     }
   }
 
-  await walk(cwd, '');
-  return files;
+  await walk(root, '');
+  const degraded = capped || unreadableDirs.length > 0 || gitignore.skipped.length > 0;
+  const summary =
+    `[code.search] in-process fallback scan: candidates=${files.length} capped=${capped} ` +
+    `cap=${FALLBACK_FILE_CAP} unreadableDirs=${unreadableDirs.length} gitignore=${gitignore.state} ` +
+    `gitignoreRules=${gitignore.rules.length} skippedGitignoreRules=${gitignore.skipped.length} ` +
+    `glob=${JSON.stringify(glob ?? null)} aborted=${signal?.aborted === true}`;
+  observeSafely(
+    () => (degraded ? Logger.getInstance().warn(summary) : Logger.getInstance().info(summary)),
+    () => undefined
+  );
+  return { files, capped, unreadableDirs };
+}
+
+function plural(count: number, singular: string, pluralForm: string): string {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+/**
+ * fallback 扫描与读取的诊断（每次调用只报一次）：glob 超出能力、不可读目录与文件。
+ * 不可读项是否让某个 pattern 变成 partial 由 fallbackRegexSearch 决定，这里只负责点名与计数。
+ */
+function pushFallbackScanWarnings(
+  warnings: ToolDiagnosticWarning[],
+  scan: FallbackScan,
+  unreadableFiles: ReadonlySet<string>,
+  glob: string | undefined
+): void {
+  if (scan.globUnsupported !== undefined) {
+    warnings.push({
+      code: 'code_search_fallback_glob_unsupported',
+      message: `In-process fallback cannot evaluate glob ${JSON.stringify(glob)}: ${scan.globUnsupported}. Nothing was searched; install ripgrep or use a glob without that syntax.`,
+      stage: 'code.search',
+      tool: 'code',
+    });
+  }
+  const dirs = scan.unreadableDirs.length;
+  const files = unreadableFiles.size;
+  if (dirs === 0 && files === 0) {
+    return;
+  }
+  const unreadable = [...scan.unreadableDirs.map((dir) => `${dir}/`), ...unreadableFiles];
+  const sample = unreadable.slice(0, FALLBACK_UNREADABLE_SAMPLE).join(', ');
+  const more =
+    unreadable.length > FALLBACK_UNREADABLE_SAMPLE
+      ? ` and ${unreadable.length - FALLBACK_UNREADABLE_SAMPLE} more`
+      : '';
+  const message = `In-process fallback could not read ${plural(dirs, 'directory', 'directories')} and ${plural(files, 'file', 'files')}; their contents were not searched: ${sample}${more}.`;
+  warnings.push({
+    code: 'code_search_fallback_unreadable',
+    message,
+    stage: 'code.search',
+    tool: 'code',
+  });
+  observeSafely(
+    () => Logger.getInstance().warn(`[code.search] ${message}`),
+    () => undefined
+  );
 }
