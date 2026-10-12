@@ -1015,3 +1015,212 @@ it('keeps storage permissive after finding references are validated by the memor
   context.noteKeyFinding('类型导入保持隔离', 'E-1=lib/types/agent.d.ts:1-7', 8);
   expect(context.scratchpadSize).toBe(1);
 });
+
+describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () => {
+  const PLAN =
+    '我的探索计划：\n1. 阅读 src/a.ts 入口模块\n2. 搜索 FooService 的调用方\n3. 查看 BarRepository 的实现';
+  const REPLAN = '更新计划：\n1. 直接提交 FooService 相关候选\n2. 输出 dimensionDigest 收尾';
+  const REFLECTION =
+    '反思如下，基于目前的工作：\n1. 最重要的发现是 X 使用 Y 模式\n2. 尚未覆盖 Z 模块的实现\n3. 下一步阅读 W 文件确认细节';
+
+  function planDescriptions(context: ActiveContext): string[] {
+    return context.getPlan()?.steps.map((step) => step.description) ?? [];
+  }
+
+  function debugMessages(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('lets an authorized response in the nudge round override the plan and logs the override', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const context = new ActiveContext();
+    context.startRound(1);
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+    context.endRound();
+
+    context.startRound(9);
+    context.expectPlan();
+    context.setThought(REPLAN);
+    expect(context.extractAndSetPlan(REPLAN, 9)).toBe(true);
+
+    expect(planDescriptions(context)).toEqual([
+      '直接提交 FooService 相关候选',
+      '输出 dimensionDigest 收尾',
+    ]);
+    expect(context.getPlanHistory()).toHaveLength(1);
+    expect(context.getPlan()?.lastUpdatedAtIteration).toBe(9);
+    expect(
+      debugMessages(debug).some((m) => m.includes('plan overridden under authorization'))
+    ).toBe(true);
+  });
+
+  it('rejects an unauthorized numbered reflection answer when a plan already exists and logs the rejection', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    expect(context.extractAndSetPlan(REFLECTION, 5)).toBe(false);
+
+    expect(planDescriptions(context).join('|')).toContain('FooService');
+    expect(context.getPlanHistory()).toHaveLength(0);
+    expect(
+      debugMessages(debug).some((m) => m.includes('plan update rejected without authorization'))
+    ).toBe(true);
+  });
+
+  it('consumes authorization on the first text response even when it carries no plan', () => {
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+    context.startRound(6);
+    context.expectPlan();
+    expect(
+      context.extractAndSetPlan('好的，我会继续沿着当前方向调查剩余模块，先读取相关文件再说。', 6)
+    ).toBe(false);
+    context.endRound();
+
+    context.startRound(10);
+    expect(context.extractAndSetPlan(REFLECTION, 10)).toBe(false);
+    expect(planDescriptions(context).join('|')).not.toContain('最重要的发现');
+  });
+
+  it('expires authorization after a tool-only response round and logs the expiry', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    // 第 9 轮：重规划 nudge 授权，模型只返回工具调用（运行时不会调用 extractAndSetPlan）
+    context.startRound(9);
+    context.expectPlan();
+    context.recordToolCall(
+      'code',
+      { action: 'search', pattern: 'Foo' },
+      { total: 0, matches: [] },
+      false
+    );
+    context.endRound();
+
+    // 第 10 轮：反思 nudge 的陈述句编号回答不能借用已过期的授权
+    context.startRound(10);
+    context.setThought(REFLECTION);
+    expect(context.extractAndSetPlan(REFLECTION, 10)).toBe(false);
+
+    expect(planDescriptions(context).join('|')).not.toContain('最重要的发现');
+    expect(context.getPlanHistory()).toHaveLength(0);
+    expect(debugMessages(debug).some((m) => m.includes('plan authorization expired'))).toBe(true);
+  });
+
+  it('carries authorization across a round without any model response (LLM retry)', () => {
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    context.startRound(9);
+    context.expectPlan();
+    // LLM 调用失败后重试：本轮没有文本也没有工具动作
+    context.endRound();
+
+    context.startRound(10);
+    context.setThought(REPLAN);
+    expect(context.extractAndSetPlan(REPLAN, 10)).toBe(true);
+    expect(planDescriptions(context)).toEqual([
+      '直接提交 FooService 相关候选',
+      '输出 dimensionDigest 收尾',
+    ]);
+  });
+
+  it('does not leak a pending authorization across clear()', () => {
+    const context = new ActiveContext();
+    context.setPlan(PLAN, 1);
+    context.expectPlan();
+    context.clear();
+    context.setPlan(PLAN, 1);
+
+    expect(context.extractAndSetPlan(REFLECTION, 3)).toBe(false);
+    expect(planDescriptions(context).join('|')).toContain('FooService');
+  });
+
+  it('accepts a one-step plan when authorized or when a plan marker is present', () => {
+    // 授权轮：提示词“不超过 3 步/1-3 条”允许只给 1 步，且文本可以直接以编号开头
+    const authorized = new ActiveContext();
+    authorized.startRound(1);
+    authorized.expectPlan();
+    expect(authorized.extractAndSetPlan('1. 读取 FooService 并提交候选', 1)).toBe(true);
+    expect(planDescriptions(authorized)).toEqual(['读取 FooService 并提交候选']);
+
+    // 未授权但命中计划标记
+    const marked = new ActiveContext();
+    expect(
+      marked.extractAndSetPlan(
+        '我的探索计划：\n1. 读取 FooService 并提交 dimension 候选\n\n接下来开始执行。',
+        1
+      )
+    ).toBe(true);
+    expect(planDescriptions(marked)).toEqual(['读取 FooService 并提交 dimension 候选']);
+
+    // 授权重规划只给 1 步
+    const replanned = new ActiveContext();
+    replanned.setPlan(PLAN, 1);
+    replanned.startRound(9);
+    replanned.expectPlan();
+    expect(
+      replanned.extractAndSetPlan('更新计划：\n1. 直接提交 FooService 相关候选并输出 digest', 9)
+    ).toBe(true);
+    expect(planDescriptions(replanned)).toEqual(['直接提交 FooService 相关候选并输出 digest']);
+    expect(replanned.getPlanHistory()).toHaveLength(1);
+  });
+
+  it('keeps rejecting single numbered items without authorization or marker, and question-only lists', () => {
+    const unanchored = new ActiveContext();
+    expect(
+      unanchored.extractAndSetPlan(
+        '这里补充一点背景说明，供后续参考：\n1. FooService 的实现位于 src/foo.ts 中',
+        2
+      )
+    ).toBe(false);
+    expect(unanchored.getPlan()).toBeNull();
+
+    const question = new ActiveContext();
+    question.startRound(1);
+    question.expectPlan();
+    expect(question.extractAndSetPlan('探索计划：\n1. 最重要的发现是什么？', 1)).toBe(false);
+    expect(question.getPlan()).toBeNull();
+
+    const looseQuestions = new ActiveContext();
+    expect(
+      looseQuestions.extractAndSetPlan(
+        '请评估:\n\n1. 最重要的发现是什么？\n\n2. 还有哪些模块尚未覆盖？\n\n3. 下一步阅读 W 文件',
+        5
+      )
+    ).toBe(false);
+    expect(looseQuestions.getPlan()).toBeNull();
+  });
+
+  it('keeps collecting list items separated by blank lines and stops at the end of the list', () => {
+    const loose = new ActiveContext();
+    loose.startRound(1);
+    loose.expectPlan();
+    expect(
+      loose.extractAndSetPlan(
+        '探索计划：\n\n1. 读取 FooService 的实现文件\n\n2. 搜索 BarRepository 的调用方\n\n3. 提交 dimension 候选与 digest\n\n完成后输出总结。\n\n- 风险：模块较多需要取舍',
+        1
+      )
+    ).toBe(true);
+    expect(planDescriptions(loose)).toEqual([
+      '读取 FooService 的实现文件',
+      '搜索 BarRepository 的调用方',
+      '提交 dimension 候选与 digest',
+    ]);
+
+    // 编号列表后空行接另一种列表（风险清单）不并入计划
+    const mixed = new ActiveContext();
+    expect(
+      mixed.extractAndSetPlan(
+        '探索计划：\n1. 读取 FooService 的实现文件\n2. 搜索 BarRepository 的调用方\n\n- 风险：模块较多需要取舍\n- 风险：可能缺少测试',
+        1
+      )
+    ).toBe(true);
+    expect(planDescriptions(mixed)).toEqual([
+      '读取 FooService 的实现文件',
+      '搜索 BarRepository 的调用方',
+    ]);
+  });
+});

@@ -658,6 +658,69 @@ interface Plan {
   lastUpdatedAtIteration: number;
 }
 
+/**
+ * expectPlan 发出的计划覆盖授权。授权只对「下一次模型响应」有效，避免重规划 nudge 的授权
+ * 悬挂到若干轮之后，被反思 nudge 的陈述句编号回答借用来覆盖计划：
+ *   - extractAndSetPlan 入口一次性消费，无论这次文本能否解析出计划；
+ *   - 授权轮里模型只返回工具调用（运行时不调用 extractAndSetPlan）时，在 endRound 过期；
+ *   - 该轮完全没有模型响应（LLM 失败后重试）时保留到下一轮，重试的回答仍可更新计划。
+ * 授权只存在于内存，不进入 toJSON 快照；clear() 一并清除。
+ */
+interface PlanAuthorization {
+  /** 授权发出时的活动轮次；在轮次之外授权时为 null，只靠一次性消费约束 */
+  round: Round | null;
+  iteration: number | null;
+  /** 授权发出时该轮已有的动作数与思考文本，用来只统计授权之后的模型响应 */
+  actionsAtGrant: number;
+  thoughtAtGrant: string | null;
+}
+
+/** 计划文本解析被拒绝的原因（只用于诊断日志） */
+type PlanExtractionRejectReason =
+  | 'empty'
+  | 'too-short'
+  | 'no-list'
+  | 'insufficient-steps'
+  | 'mostly-questions';
+
+type PlanExtraction =
+  | { ok: true; planText: string; stepCount: number; markerMatched: boolean }
+  | {
+      ok: false;
+      reason: PlanExtractionRejectReason;
+      listItemCount: number;
+      markerMatched: boolean;
+    };
+
+/** 只在响应开头这么多字符内寻找计划 */
+const PLAN_SEARCH_WINDOW_CHARS = 2000;
+
+/** 无授权且无计划标记时，文本至少这么长才按编号列表提取计划（沿用原阈值，过滤极短闲聊） */
+const MIN_UNANCHORED_PLAN_TEXT_LENGTH = 30;
+
+/** 计划步骤描述至少要超过这么多字符才算有效步骤（与 #parsePlanSteps 的落盘规则一致） */
+const MIN_PLAN_STEP_DESCRIPTION_CHARS = 5;
+
+const PLAN_MARKERS = [
+  /(?:探索|分析)?计划[:：\s]/i,
+  /(?:my\s+)?plan[:：\s]/i,
+  /步骤[:：\s]/i,
+  /以下是.*(?:计划|步骤)/i,
+];
+
+/** 计划列表项：编号（`1.` / `1)`）或无序符号（`-` / `*`）开头 */
+const PLAN_LIST_ITEM_RE = /^\s*(?:\d+[.)]\s+|[-*]\s+)/;
+const PLAN_NUMBERED_ITEM_RE = /^\s*\d+[.)]\s+/;
+/** 落盘解析用的步骤正则（编号后空白可省略），与列表识别略宽松，保持历史语义 */
+const PLAN_STEP_LINE_RE = /^\s*(?:\d+[.)]\s*|[-*]\s+)(.+)/;
+/** 无计划标记时的兜底（历史语义）：换行后出现的 `1.` / `1)` 列表 */
+const PLAN_FIRST_ITEM_AFTER_NEWLINE_RE = /\n\s*1[.)]\s+/;
+/**
+ * 授权轮的兜底：额外允许文本直接以 `1.` / `1)` 开头。授权轮的回答本就是在回应计划提示，
+ * 1 步计划常写成单行“1. xxx”；未授权路径不放宽，避免扩大对普通编号回答的捕获面。
+ */
+const PLAN_FIRST_ITEM_AUTHORIZED_RE = /(?:^|\n)\s*1[.)]\s+/;
+
 interface Observation {
   toolName: string;
   args?: Record<string, unknown>;
@@ -733,8 +796,8 @@ export class ActiveContext {
   // ── 子区 3: Plan (从 ReasoningTrace 继承) ──
   #plan: Plan | null = null;
   #planHistory: Plan[] = [];
-  /** 是否期待下一次响应包含计划 (由 ExplorationTracker 设置) */
-  #expectingPlan = false;
+  /** 下一次模型响应可覆盖已有计划的授权 (由 PlanTracker 经 expectPlan 设置；见 PlanAuthorization) */
+  #planAuthorization: PlanAuthorization | null = null;
 
   // ── 严格生产链：只保存 Core 证据台账/PC-F 收据的不可变语义投影 ──
   #strictAnalysisContext: StrictAnalysisContextProjectionV1 | null = null;
@@ -791,6 +854,7 @@ export class ActiveContext {
   /** 结束当前轮次 */
   endRound() {
     if (this.#currentRound) {
+      this.#settlePlanAuthorizationAtRoundEnd(this.#currentRound);
       this.#currentRound.endTime = Date.now();
       this.#rounds.push(this.#currentRound);
       this.#currentRound = null;
@@ -953,41 +1017,88 @@ export class ActiveContext {
   /**
    * 从 AI 响应文本中提取计划，自动调用 setPlan/updatePlan
    *
-   * 防御措施: 已存在计划时，仅在 #expectingPlan 为 true 时才覆盖。
+   * 防御措施: 已存在计划时，仅在 expectPlan 授权下才覆盖。
    * 这防止 reflection 回复中的编号列表（非计划的回应文本）污染已有计划。
-   * ExplorationTracker 在发送 plan elicitation / replan 时调用 expectPlan() 授权更新。
+   * PlanTracker 在发送 plan elicitation / replan 时调用 expectPlan() 授权更新；
+   * 授权只覆盖下一次模型响应（入口一次性消费，工具轮结束即过期，见 PlanAuthorization）。
+   *
+   * 解析规则：至少 2 条有效步骤；授权轮或命中计划标记时允许 1 步计划（与 PlanTracker
+   * “不超过 3 步/1-3 条”提示一致）。列表项之间的空行不会截断列表；问句占多数的列表仍被拒绝。
    *
    * @param text AI 完整响应文本
    * @param iteration 当前轮次
    * @returns 是否成功提取到计划
    */
   extractAndSetPlan(text: string, iteration: number) {
-    const planText = this.#extractPlanFromText(text);
-    if (!planText) {
+    // 授权一次性消费：无论这次文本能否解析出计划，授权都只覆盖这一次响应，
+    // 否则提取失败（散文/无列表）后授权会一直悬挂到之后的反思回答。
+    const authorization = this.#planAuthorization;
+    this.#planAuthorization = null;
+    const authorized = authorization !== null;
+
+    const extraction = this.#extractPlanFromText(text, authorized);
+    if (!extraction.ok) {
+      // 普通散文（无标记、无列表、未授权）是每个文本轮的常态，不记日志；
+      // 只有“像计划却被拒绝”或“授权被消费却没得到计划”才值得定位。
+      if (authorized || extraction.markerMatched || extraction.listItemCount > 0) {
+        this.#debugPlan(
+          `plan extraction rejected at iteration ${iteration}: reason=${extraction.reason}, ` +
+            `listItems=${extraction.listItemCount}, marker=${extraction.markerMatched}, authorized=${authorized}` +
+            (authorized
+              ? `; authorization granted at iteration ${authorization.iteration ?? 'n/a'} consumed without a plan`
+              : '')
+        );
+      }
       return false;
     }
 
     // Guard: 已有计划时，仅在 expectPlan 授权下才覆盖
     // 防止 reflection/convergence 回复中的编号列表被误捕获为 plan
-    if (this.#plan && !this.#expectingPlan) {
+    if (this.#plan && !authorized) {
+      this.#debugPlan(
+        `plan update rejected without authorization at iteration ${iteration}: ` +
+          `kept ${this.#plan.steps.length}-step plan from iteration ${this.#plan.lastUpdatedAtIteration}, ` +
+          `ignored ${extraction.stepCount}-step list (marker=${extraction.markerMatched})`
+      );
       return false;
     }
 
-    this.#expectingPlan = false;
     if (this.#plan) {
-      this.#updatePlan(planText, iteration);
+      const previousStepCount = this.#plan.steps.length;
+      this.#updatePlan(extraction.planText, iteration);
+      this.#debugPlan(
+        `plan overridden under authorization at iteration ${iteration} ` +
+          `(granted at iteration ${authorization?.iteration ?? 'n/a'}): ` +
+          `${previousStepCount} -> ${extraction.stepCount} steps`
+      );
     } else {
-      this.#setPlan(planText, iteration);
+      this.#setPlan(extraction.planText, iteration);
+      this.#debugPlan(
+        `plan set at iteration ${iteration}: ${extraction.stepCount} steps ` +
+          `(authorized=${authorized}, marker=${extraction.markerMatched})`
+      );
     }
     return true;
   }
 
   /**
    * 标记「下一次响应可能包含计划」— 授权 extractAndSetPlan 覆盖已有计划
-   * 由 ExplorationTracker 在发送 plan elicitation / replan nudge 时调用。
+   * 由 PlanTracker 在发送 plan elicitation / replan nudge 时调用（发生在本轮 LLM 调用之前）。
+   * 重复调用以最近一次为准。
    */
   expectPlan() {
-    this.#expectingPlan = true;
+    const round = this.#currentRound;
+    this.#planAuthorization = {
+      round,
+      iteration: round?.iteration ?? null,
+      actionsAtGrant: round?.actions.length ?? 0,
+      thoughtAtGrant: round?.thought ?? null,
+    };
+    this.#debugPlan(
+      round
+        ? `plan authorization granted at iteration ${round.iteration}; valid for the next model response`
+        : 'plan authorization granted outside an active round; valid for the next extractAndSetPlan call only'
+    );
   }
 
   /** 直接设置计划 (公开接口，供 ExplorationTracker 和测试使用) */
@@ -1305,6 +1416,8 @@ export class ActiveContext {
     this.#compressedObservations.length = 0;
     this.#plan = null;
     this.#planHistory.length = 0;
+    // 悬挂的计划授权属于被清空的会话，不能泄漏给之后重新建立的计划
+    this.#planAuthorization = null;
     this.#totalObservations = 0;
     this.#strictAnalysisContext = null;
   }
@@ -1786,12 +1899,12 @@ export class ActiveContext {
     const lines = text.split('\n');
     const steps: PlanStep[] = [];
     for (const line of lines) {
-      const m = line.match(/^\s*(?:\d+[.)]\s*|[-*]\s+)(.+)/);
-      if (m && m[1].trim().length > 5) {
+      const description = planStepDescription(line);
+      if (description) {
         steps.push({
-          description: m[1].trim(),
+          description,
           status: 'pending',
-          keywords: this.#extractKeywords(m[1]),
+          keywords: this.#extractKeywords(description),
         });
       }
     }
@@ -1806,59 +1919,97 @@ export class ActiveContext {
     return [...new Set([...quoted, ...camelCase, ...acronyms])];
   }
 
-  /** 从 AI 响应文本中提取"计划"部分 */
-  #extractPlanFromText(text: string): string | null {
-    if (!text || text.length < 30) {
-      return null;
+  /**
+   * 从 AI 响应文本中提取"计划"部分
+   *
+   * @param authorized 本次响应是否处于 expectPlan 授权下；授权轮允许 1 步计划与极短文本
+   */
+  #extractPlanFromText(text: string, authorized: boolean): PlanExtraction {
+    if (!text || text.trim() === '') {
+      return { ok: false, reason: 'empty', listItemCount: 0, markerMatched: false };
     }
 
-    const searchArea = text.substring(0, 2000);
-
-    const planMarkers = [
-      /(?:探索|分析)?计划[:：\s]/i,
-      /(?:my\s+)?plan[:：\s]/i,
-      /步骤[:：\s]/i,
-      /以下是.*(?:计划|步骤)/i,
-    ];
+    const searchArea = text.substring(0, PLAN_SEARCH_WINDOW_CHARS);
 
     let planStart = -1;
-    for (const marker of planMarkers) {
+    let markerMatched = false;
+    for (const marker of PLAN_MARKERS) {
       const match = searchArea.match(marker);
       if (match && match.index !== undefined) {
         planStart = match.index + match[0].length;
+        markerMatched = true;
         break;
       }
     }
 
+    // 极短文本门槛只约束“既无授权也无计划标记”的兜底路径：授权轮里模型可能只回一行
+    // “1. 读取 X 并提交候选”，那正是提示词允许的 1 步计划。
+    if (!authorized && !markerMatched && text.length < MIN_UNANCHORED_PLAN_TEXT_LENGTH) {
+      return { ok: false, reason: 'too-short', listItemCount: 0, markerMatched };
+    }
+
     if (planStart === -1) {
-      const listMatch = searchArea.match(/\n\s*1[.)]\s+/);
+      // 兜底：换行后的 `1.` 列表；授权轮额外允许文本直接以 `1.` 开头（没有前导换行）
+      const listMatch = searchArea.match(
+        authorized ? PLAN_FIRST_ITEM_AUTHORIZED_RE : PLAN_FIRST_ITEM_AFTER_NEWLINE_RE
+      );
       if (listMatch && listMatch.index !== undefined) {
         planStart = listMatch.index;
       }
     }
 
     if (planStart === -1) {
-      return null;
+      return { ok: false, reason: 'no-list', listItemCount: 0, markerMatched };
     }
 
-    const remaining = searchArea.substring(planStart);
-    const lines = remaining.split('\n');
+    const lines = searchArea.substring(planStart).split('\n');
     const planLines: string[] = [];
-    let inList = false;
+    /** 列表以编号还是无序符号开头；空行之后只接续同一类列表项 */
+    let numberedList: boolean | null = null;
 
-    for (const line of lines) {
-      if (/^\s*(?:\d+[.)]\s+|[-*]\s+)/.test(line)) {
-        inList = true;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (PLAN_LIST_ITEM_RE.test(line)) {
+        if (numberedList === null) {
+          numberedList = PLAN_NUMBERED_ITEM_RE.test(line);
+        }
         planLines.push(line);
-      } else if (inList && line.trim() === '') {
-        break;
-      } else if (inList) {
-        break;
+        continue;
       }
+      if (numberedList === null) {
+        // 列表开始前的说明行（如标记所在行的剩余文字）直接跳过
+        continue;
+      }
+      if (line.trim() === '') {
+        // Markdown 松散列表在项之间插空行：向后看下一非空行，仍是同类列表项才继续收集，
+        // 否则列表到此结束（避免把列表后的风险清单等另一段列表并入计划）。
+        const next = lines.slice(i + 1).find((candidate) => candidate.trim() !== '');
+        if (
+          next !== undefined &&
+          PLAN_LIST_ITEM_RE.test(next) &&
+          PLAN_NUMBERED_ITEM_RE.test(next) === numberedList
+        ) {
+          continue;
+        }
+      }
+      break;
     }
 
-    if (planLines.length < 2) {
-      return null;
+    if (planLines.length === 0) {
+      return { ok: false, reason: 'no-list', listItemCount: 0, markerMatched };
+    }
+
+    // 有效步骤与 #parsePlanSteps 的落盘规则一致；描述过短的列表项不会成为计划步骤。
+    // 授权轮或命中计划标记时允许 1 步计划；否则仍要求至少 2 步，避免把任意单条编号句当计划。
+    const stepCount = planLines.filter((line) => planStepDescription(line) !== null).length;
+    const minSteps = authorized || markerMatched ? 1 : 2;
+    if (stepCount < minSteps) {
+      return {
+        ok: false,
+        reason: 'insufficient-steps',
+        listItemCount: planLines.length,
+        markerMatched,
+      };
     }
 
     // 防御: 拒绝 "大部分是疑问句" 的编号列表
@@ -1866,11 +2017,68 @@ export class ActiveContext {
     // 不是真正的探索计划，不能捕获为 plan steps
     const questionCount = planLines.filter((l) => /[？?]\s*$/.test(l.trim())).length;
     if (questionCount > planLines.length * 0.5) {
-      return null;
+      return {
+        ok: false,
+        reason: 'mostly-questions',
+        listItemCount: planLines.length,
+        markerMatched,
+      };
     }
 
-    return planLines.join('\n').trim();
+    return { ok: true, planText: planLines.join('\n').trim(), stepCount, markerMatched };
   }
+
+  /**
+   * 轮次结束时结算计划授权：授权后模型已经响应（工具调用或文本）却没有消费授权，说明这次响应
+   * 不是计划，授权就此过期；该轮没有任何模型响应（LLM 失败重试）时保留给下一次响应。
+   */
+  #settlePlanAuthorizationAtRoundEnd(round: Round) {
+    const authorization = this.#planAuthorization;
+    if (!authorization) {
+      return;
+    }
+    const isGrantRound = authorization.round === round;
+    const baselineActions = isGrantRound ? authorization.actionsAtGrant : 0;
+    const baselineThought = isGrantRound ? authorization.thoughtAtGrant : null;
+    const newActions = round.actions.length - baselineActions;
+    const respondedWithText = round.thought !== null && round.thought !== baselineThought;
+    if (newActions > 0 || respondedWithText) {
+      this.#planAuthorization = null;
+      this.#debugPlan(
+        `plan authorization expired at end of iteration ${round.iteration} ` +
+          `(granted at iteration ${authorization.iteration ?? 'n/a'}): model responded with ` +
+          `${newActions > 0 ? `${newActions} tool action(s)` : 'text'} and no plan was extracted; ` +
+          'later list responses are treated as unauthorized'
+      );
+      return;
+    }
+    this.#debugPlan(
+      `plan authorization kept after iteration ${round.iteration} ` +
+        `(granted at iteration ${authorization.iteration ?? 'n/a'}): no model response recorded in this round, ` +
+        'still valid for the next response'
+    );
+  }
+
+  /** 计划授权/解析的诊断日志；日志通道失败不能影响计划状态 */
+  #debugPlan(message: string) {
+    observeSafely(
+      () => this.#logger.debug(`[ActiveContext] ${message}`),
+      () => undefined
+    );
+  }
+}
+
+/**
+ * 计划行的有效步骤描述：编号或无序符号之后、去掉首尾空白且超过
+ * MIN_PLAN_STEP_DESCRIPTION_CHARS 个字符；不是有效步骤时返回 null。
+ */
+function planStepDescription(line: string): string | null {
+  const match = line.match(PLAN_STEP_LINE_RE);
+  if (!match) {
+    return null;
+  }
+  const description = match[1].trim();
+  return description.length > MIN_PLAN_STEP_DESCRIPTION_CHARS ? description : null;
 }
 
 function extractSearches(
