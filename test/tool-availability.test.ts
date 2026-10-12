@@ -1,9 +1,18 @@
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import type { ToolAvailabilitySnapshot } from '../src/tools/kernel/availability.js';
+import type {
+  ToolAvailabilityContext,
+  ToolAvailabilitySnapshot,
+  ToolUnavailableReason,
+} from '../src/tools/kernel/availability.js';
+import type { ToolContext } from '../src/tools/kernel/registry.js';
 import type { ToolCallRequest } from '../src/tools/kernel/request.js';
 import type { ToolActionAllowlist } from '../src/tools/kernel/toolSchema.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 import { ToolRouter } from '../src/tools/runtime/router.js';
 
 function request(
@@ -662,5 +671,393 @@ describe('host service availability description', () => {
     expect(runView.actions.memory).toEqual(
       expect.arrayContaining(['save', 'recall', 'get_previous_evidence'])
     );
+  });
+});
+
+/** 某个 tool/action 在快照里的全部不可用条目（含 operation 级分支条目）。 */
+function reasonsFor(
+  snapshot: ToolAvailabilitySnapshot,
+  tool: string,
+  action: string
+): ToolUnavailableReason[] {
+  return (snapshot.unavailable ?? []).filter(
+    (entry) => entry.tool === tool && entry.action === action
+  );
+}
+
+/** 生产宿主的 SandboxExecutorBridge 是类实例，exec 在原型上；快照必须按方法事实识别它。 */
+class PrototypeSandboxExecutor {
+  async exec() {
+    return { stdout: '', stderr: '', exitCode: 0 };
+  }
+}
+
+describe('availability snapshot matches handler rejection conditions', () => {
+  it.each([
+    { kind: 'no executor', context: {} },
+    { kind: 'executor without exec', context: { sandboxExecutor: {} } },
+    { kind: 'non-function exec', context: { sandboxExecutor: { exec: 'not-callable' } } },
+    {
+      kind: 'truthy non-boolean permit',
+      context: { allowUnsandboxedTerminal: 'yes' as unknown as boolean },
+    },
+  ])('hides terminal.exec when the handler would block it ($kind)', ({ context }) => {
+    const snapshot = ToolRouter.describeAvailability({ sessionStoreAvailable: true, ...context });
+    expect(snapshot.actions.terminal).toEqual([]);
+    expect(reasonsFor(snapshot, 'terminal', 'exec')).toEqual([
+      {
+        tool: 'terminal',
+        action: 'exec',
+        reason: 'sandboxExecutor.exec is unavailable and allowUnsandboxedTerminal is not true',
+      },
+    ]);
+  });
+
+  it.each([
+    { kind: 'plain executor', context: { sandboxExecutor: { exec: vi.fn() } } },
+    { kind: 'class executor', context: { sandboxExecutor: new PrototypeSandboxExecutor() } },
+    { kind: 'explicit permit', context: { allowUnsandboxedTerminal: true } },
+    {
+      kind: 'explicit permit with malformed executor',
+      context: { sandboxExecutor: {}, allowUnsandboxedTerminal: true },
+    },
+  ])('keeps terminal.exec when the handler would run it ($kind)', ({ context }) => {
+    const snapshot = ToolRouter.describeAvailability({ sessionStoreAvailable: true, ...context });
+    expect(snapshot.actions.terminal).toEqual(['exec']);
+    expect(reasonsFor(snapshot, 'terminal', 'exec')).toEqual([]);
+  });
+
+  it.each([
+    { kind: 'no session store', context: {} },
+    { kind: 'declared unavailable', context: { sessionStoreAvailable: false } },
+    {
+      kind: 'store without recall',
+      context: { sessionStore: { save: vi.fn() } as unknown as ToolContext['sessionStore'] },
+    },
+  ])('hides meta.review when submissions cannot be recalled ($kind)', ({ context }) => {
+    const snapshot = ToolRouter.describeAvailability(context);
+    expect(snapshot.actions.meta).toEqual(['tools', 'plan']);
+    expect(reasonsFor(snapshot, 'meta', 'review')).toEqual([
+      { tool: 'meta', action: 'review', reason: 'sessionStore.recall is unavailable' },
+    ]);
+  });
+
+  it.each([
+    { kind: 'declared available', context: { sessionStoreAvailable: true } },
+    {
+      kind: 'bound store',
+      context: { sessionStore: { save: vi.fn(), recall: vi.fn(() => []) } },
+    },
+  ])('keeps meta.review when submissions can be recalled ($kind)', ({ context }) => {
+    const snapshot = ToolRouter.describeAvailability(context);
+    expect(snapshot.actions.meta).toEqual(['tools', 'plan', 'review']);
+    expect(reasonsFor(snapshot, 'meta', 'review')).toEqual([]);
+  });
+
+  it('reports every knowledge.search kind the production search engine drops', () => {
+    const search = vi.fn();
+    const snapshot = ToolRouter.describeAvailability({
+      searchEngine: { search, supportedKinds: ['all'] },
+      sessionStoreAvailable: true,
+    });
+    expect(search).not.toHaveBeenCalled();
+    expect(snapshot.actions.knowledge).toContain('search');
+    expect(snapshot.actions.knowledge).toContain('prime');
+    expect(snapshot.parameters?.knowledge?.search?.kind).toEqual(['all']);
+    expect(reasonsFor(snapshot, 'knowledge', 'search')).toEqual([
+      {
+        tool: 'knowledge',
+        action: 'search',
+        operation: 'recipe',
+        reason: 'knowledge.search kind=recipe is not in searchEngine.supportedKinds',
+      },
+      {
+        tool: 'knowledge',
+        action: 'search',
+        operation: 'candidate',
+        reason: 'knowledge.search kind=candidate is not in searchEngine.supportedKinds',
+      },
+    ]);
+  });
+
+  it('does not report kinds when the search engine declares no supportedKinds', () => {
+    const snapshot = ToolRouter.describeAvailability({
+      searchEngine: { search: vi.fn() },
+      sessionStoreAvailable: true,
+    });
+    expect(snapshot.actions.knowledge).toContain('search');
+    expect(snapshot.parameters?.knowledge?.search).toBeUndefined();
+    expect(reasonsFor(snapshot, 'knowledge', 'search')).toEqual([]);
+  });
+
+  it('separates a disjoint supportedKinds declaration from a missing search method', () => {
+    const disjoint = ToolRouter.describeAvailability({
+      searchEngine: { search: vi.fn(), supportedKinds: ['vector'] },
+      sessionStoreAvailable: true,
+    });
+    expect(disjoint.actions.knowledge).not.toContain('search');
+    const disjointReasons = reasonsFor(disjoint, 'knowledge', 'search');
+    const actionLevel = disjointReasons.filter((entry) => entry.operation === undefined);
+    expect(actionLevel).toHaveLength(1);
+    expect(actionLevel[0]?.reason).not.toBe('searchEngine.search is unavailable');
+    expect(actionLevel[0]?.reason).toBe(
+      'searchEngine.supportedKinds does not intersect knowledge.search kind (recipe, candidate, all)'
+    );
+    expect(
+      disjointReasons.filter((entry) => entry.operation !== undefined).map((e) => e.operation)
+    ).toEqual(['recipe', 'candidate', 'all']);
+
+    const noMethod = ToolRouter.describeAvailability({
+      searchEngine: { supportedKinds: ['all'] },
+      sessionStoreAvailable: true,
+    });
+    expect(noMethod.actions.knowledge).not.toContain('search');
+    expect(reasonsFor(noMethod, 'knowledge', 'search')).toEqual([
+      { tool: 'knowledge', action: 'search', reason: 'searchEngine.search is unavailable' },
+    ]);
+  });
+});
+
+/** 全部宿主方法都已接线的上下文；新增 check 时这里必须同步补上对应方法，否则守护用例变红。 */
+function fullyWiredContext(): ToolAvailabilityContext {
+  const method = vi.fn();
+  return {
+    astAnalyzer: { analyzeFile: method },
+    projectGraph: {
+      getOverview: method,
+      getClassInfo: method,
+      getProtocolInfo: method,
+      getClassHierarchy: method,
+      getCallers: method,
+      getCallees: method,
+      getMethodOverrides: method,
+      getCategoryMap: method,
+      searchEntities: method,
+    },
+    codeEntityGraph: {
+      queryEntity: method,
+      queryCallGraph: method,
+      impactAnalysis: method,
+      search: method,
+    },
+    knowledgeRead: { getById: method } as unknown as ToolContext['knowledgeRead'],
+    knowledgeManagement: { update: method, reject: method, score: method, validate: method },
+    searchEngine: { search: method },
+    recipeGateway: { createOrStage: method, evaluateReadiness: method, publish: method },
+    stagingManager: { recordReview: method, listReviewQueue: method },
+    proposalGateway: { submit: method },
+    sessionStoreAvailable: true,
+    sandboxExecutor: { exec: method },
+    memoryCoordinator: { noteFinding: method } as unknown as ToolContext['memoryCoordinator'],
+    runtime: { evidenceLedger: { get: method, listRecent: method, search: method } },
+  } as ToolAvailabilityContext;
+}
+
+describe('availability snapshot stays inside the tool registry', () => {
+  /** 每个 tool/action/parameter/branch 名都必须来自 TOOL_REGISTRY，硬编码拼错不能静默漏检。 */
+  function expectRegistered(snapshot: ToolAvailabilitySnapshot) {
+    for (const [tool, actions] of Object.entries(snapshot.actions)) {
+      expect(Object.hasOwn(TOOL_REGISTRY, tool), `actions.${tool}`).toBe(true);
+      for (const action of actions ?? []) {
+        expect(Object.hasOwn(TOOL_REGISTRY[tool].actions, action), `${tool}.${action}`).toBe(true);
+      }
+    }
+    for (const [tool, byAction] of Object.entries(snapshot.parameters ?? {})) {
+      for (const [action, byParameter] of Object.entries(byAction)) {
+        const properties = TOOL_REGISTRY[tool]?.actions[action]?.params.properties as
+          | Record<string, { enum?: unknown }>
+          | undefined;
+        for (const [parameter, values] of Object.entries(byParameter)) {
+          const declared = properties?.[parameter]?.enum;
+          expect(Array.isArray(declared), `${tool}.${action}.${parameter}`).toBe(true);
+          for (const value of values) {
+            expect(declared, `${tool}.${action}.${parameter}=${value}`).toContain(value);
+          }
+        }
+      }
+    }
+    for (const entry of snapshot.unavailable ?? []) {
+      expect(Object.hasOwn(TOOL_REGISTRY, entry.tool), `unavailable ${entry.tool}`).toBe(true);
+      const action = entry.action ?? '';
+      expect(
+        Object.hasOwn(TOOL_REGISTRY[entry.tool].actions, action),
+        `unavailable ${entry.tool}.${action}`
+      ).toBe(true);
+      if (entry.operation !== undefined) {
+        const properties = Object.values(
+          TOOL_REGISTRY[entry.tool].actions[action].params.properties as Record<
+            string,
+            { enum?: unknown }
+          >
+        );
+        expect(
+          properties.some(
+            (property) => Array.isArray(property.enum) && property.enum.includes(entry.operation)
+          ),
+          `unavailable ${entry.tool}.${action} operation=${entry.operation}`
+        ).toBe(true);
+      }
+      if (entry.operation === undefined) {
+        // 动作级不可用条目必须真的把该动作从快照里移除，否则提示与 schema 会再次漂移。
+        expect(snapshot.actions[entry.tool] ?? [], `${entry.tool}.${action} removed`).not.toContain(
+          action
+        );
+      }
+    }
+  }
+
+  it.each([
+    { kind: 'catalog-only, nothing wired', context: {} },
+    { kind: 'known run, nothing wired', context: { runtime: {} } },
+    {
+      kind: 'known run, disjoint search kinds',
+      context: { runtime: {}, searchEngine: { search: vi.fn(), supportedKinds: ['vector'] } },
+    },
+    { kind: 'fully wired', context: fullyWiredContext() },
+  ])('names only registered tools, actions, parameters and branches ($kind)', ({ context }) => {
+    expectRegistered(ToolRouter.describeAvailability(context as ToolAvailabilityContext));
+  });
+
+  it('reports nothing unavailable and keeps every registered action when the host is fully wired', () => {
+    const snapshot = ToolRouter.describeAvailability(fullyWiredContext());
+    expect(snapshot.unavailable).toEqual([]);
+    for (const [tool, actions] of Object.entries(snapshot.actions)) {
+      expect(actions, tool).toEqual(Object.keys(TOOL_REGISTRY[tool].actions));
+    }
+    // 每个被 check 过的工具都必须出现在快照里，保证上面的逐项断言真的覆盖了 terminal/meta。
+    expect(Object.keys(snapshot.actions)).toEqual(
+      expect.arrayContaining([
+        'code',
+        'graph',
+        'knowledge',
+        'memory',
+        'evidence',
+        'meta',
+        'terminal',
+      ])
+    );
+  });
+});
+
+describe('handlers report the unavailability the snapshot hides', () => {
+  function withRoot<T>(run: (root: string) => Promise<T>): Promise<T> {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'agent-availability-')));
+    return run(root).finally(() => rmSync(root, { recursive: true, force: true }));
+  }
+
+  async function execute(
+    tool: string,
+    action: string,
+    params: Record<string, unknown>,
+    ctx: ToolContext
+  ) {
+    const router = new ToolRouter();
+    const parsed = router.parseToolCall(tool, { action, params });
+    if ('error' in parsed) {
+      throw new Error(parsed.error);
+    }
+    return router.execute(parsed, ctx);
+  }
+
+  it('blocks terminal.exec before starting a process when the injected executor has no exec method', async () => {
+    await withRoot(async (root) => {
+      const marker = path.join(root, 'executed.marker');
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`
+      )}`;
+      const result = await execute(
+        'terminal',
+        'exec',
+        { command },
+        { projectRoot: root, tokenBudget: 4000, sandboxExecutor: {} }
+      );
+      expect(existsSync(marker)).toBe(false);
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('no sandbox executor');
+      expect(result._meta?.resultStatus).toBe('blocked');
+      expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+        code: 'terminal_sandbox_required',
+        message: expect.stringContaining('sandboxExecutor has no exec method'),
+        stage: 'terminal.exec',
+        tool: 'terminal',
+      });
+    });
+  });
+
+  it('labels the unsandboxed fallback when the host permits it but the injected executor has no exec method', async () => {
+    await withRoot(async (root) => {
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        "process.stdout.write('ran')"
+      )}`;
+      const result = await execute(
+        'terminal',
+        'exec',
+        { command },
+        {
+          projectRoot: root,
+          tokenBudget: 4000,
+          sandboxExecutor: {},
+          allowUnsandboxedTerminal: true,
+        }
+      );
+      expect(result.ok).toBe(true);
+      expect(String(result.data)).toContain('ran');
+      expect(String(result.data)).toContain('[unsandboxed:sandbox_executor_missing_exec]');
+      expect(result._meta?.fallbackUsed).toBe(true);
+      expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+        code: 'terminal_sandbox_fallback',
+        message: 'sandboxed=false fallbackUsed=true degradeReason=sandbox_executor_missing_exec',
+      });
+    });
+  });
+
+  it('marks meta.review degraded with META_REVIEW_STORE_MISSING when no session store is bound', async () => {
+    const result = await execute(
+      'meta',
+      'review',
+      {},
+      { projectRoot: process.cwd(), tokenBudget: 4000 }
+    );
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual({ count: 0, message: expect.stringContaining('No session store') });
+    expect(result._meta?.degraded).toBe(true);
+    expect(result._meta?.diagnosticWarnings).toEqual([
+      {
+        code: 'META_REVIEW_STORE_MISSING',
+        message: expect.stringContaining('No session store'),
+        stage: 'meta.review',
+        tool: 'meta',
+      },
+    ]);
+  });
+
+  it('marks meta.review degraded when the bound session store cannot recall', async () => {
+    const result = await execute(
+      'meta',
+      'review',
+      {},
+      {
+        projectRoot: process.cwd(),
+        tokenBudget: 4000,
+        sessionStore: { save: vi.fn() } as unknown as ToolContext['sessionStore'],
+      }
+    );
+    expect(result.ok).toBe(true);
+    expect(result._meta?.degraded).toBe(true);
+    expect(result._meta?.diagnosticWarnings?.[0]?.code).toBe('META_REVIEW_STORE_MISSING');
+  });
+
+  it('reviews recalled submissions without degradation when a session store is bound', async () => {
+    const recall = vi.fn(() => [{ key: 'submission-1', content: 'candidate body' }]);
+    const result = await execute(
+      'meta',
+      'review',
+      {},
+      { projectRoot: process.cwd(), tokenBudget: 4000, sessionStore: { save: vi.fn(), recall } }
+    );
+    expect(recall).toHaveBeenCalledWith(undefined, { tags: ['submission'], limit: 50 });
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ count: 1 });
+    expect(result._meta?.degraded).toBeUndefined();
   });
 });

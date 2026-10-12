@@ -38,11 +38,16 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
       unavailable.push({ tool, action, reason });
     }
   };
+  /**
+   * 按注册枚举逐分支收窄：被剔除的分支各推一条 operation 级 unavailable，全缺时移除整个动作。
+   * reasons 允许调用方说明“为什么缺”（例如宿主声明的 supportedKinds），默认按“未绑定宿主能力”描述。
+   */
   const branches = (
     tool: string,
     action: string,
     parameter: string,
-    supported: Record<string, boolean>
+    supported: Record<string, boolean>,
+    reasons: { branch?: (value: string) => string; none?: (values: string[]) => string } = {}
   ) => {
     const values = enumValues(tool, action, parameter);
     const available = values.filter((value) => supported[value] === true);
@@ -53,7 +58,9 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
           tool,
           action,
           operation: value,
-          reason: `${tool}.${action} ${parameter}=${value} has no bound host capability`,
+          reason:
+            reasons.branch?.(value) ??
+            `${tool}.${action} ${parameter}=${value} has no bound host capability`,
         });
       }
     }
@@ -61,7 +68,7 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
       tool,
       action,
       available.length > 0,
-      `${tool}.${action} has no available ${parameter} branch`
+      reasons.none?.(values) ?? `${tool}.${action} has no available ${parameter} branch`
     );
   };
 
@@ -103,14 +110,21 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
   const kinds = Array.isArray(declaredKinds)
     ? enumValues('knowledge', 'search', 'kind').filter((kind) => declaredKinds.includes(kind))
     : null;
-  check(
-    'knowledge',
-    'search',
-    canSearch && (kinds === null || kinds.length > 0),
-    'searchEngine.search is unavailable'
-  );
-  if (kinds) {
-    (parameters.knowledge ??= {}).search = { kind: kinds };
+  if (!canSearch) {
+    // 没有 search 方法时整个动作不可用；不再逐个 kind 列分支，避免把接线缺口误报成 kind 不支持。
+    check('knowledge', 'search', false, 'searchEngine.search is unavailable');
+  } else if (kinds !== null) {
+    // 宿主声明了 supportedKinds：复用 branches() 为每个被剔除的 kind 推 operation 级条目，
+    // 让运行诊断与系统提示都能看到（生产宿主固定 ['all']，recipe/candidate 不再被静默剔除）。
+    // 全不相交时原因写明是 supportedKinds 与注册枚举不相交，而不是 search 方法缺失。
+    branches('knowledge', 'search', 'kind', Object.fromEntries(kinds.map((kind) => [kind, true])), {
+      branch: (kind) => `knowledge.search kind=${kind} is not in searchEngine.supportedKinds`,
+      none: (values) =>
+        `searchEngine.supportedKinds does not intersect knowledge.search kind (${values.join(', ')})`,
+    });
+  } else {
+    // 未声明 supportedKinds：沿用“全部 kind 可用”的旧语义，不写 parameters 收窄，也不推分支条目。
+    initialize('knowledge');
   }
   check(
     'knowledge',
@@ -148,6 +162,17 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
     ctx.sessionStoreAvailable ?? hasMethod(ctx.sessionStore, method);
   check('memory', 'save', sessionMethod('save'), 'sessionStore.save is unavailable');
   check('memory', 'recall', sessionMethod('recall'), 'sessionStore.recall is unavailable');
+  // meta.review 只读 sessionStore.recall 汇总本会话提交；与 memory.recall 同一事实，缺失时不再广告。
+  // handler 侧仍保留 degraded + META_REVIEW_STORE_MISSING 兜底，覆盖宿主声明与实际注入不一致的情况。
+  check('meta', 'review', sessionMethod('recall'), 'sessionStore.recall is unavailable');
+  // terminal handler 在无可调用 exec 且宿主未显式许可时 fail-closed（terminal_sandbox_required）；
+  // 快照按同一条件收窄，避免模型对必然被拒绝的 terminal.exec 白耗一轮。许可只认字面量 true。
+  check(
+    'terminal',
+    'exec',
+    hasMethod(ctx.sandboxExecutor, 'exec') || ctx.allowUnsandboxedTerminal === true,
+    'sandboxExecutor.exec is unavailable and allowUnsandboxedTerminal is not true'
+  );
   if (ctx.runtime !== undefined) {
     // 静态目录不能把“还未创建的 loop 资源”说成缺失；当前运行提供 metadata 时才能判断。
     const coordinator = ctx.memoryCoordinator ?? ctx.runtime.memoryCoordinator;
@@ -171,6 +196,7 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
       'EvidenceLedger.search is unavailable for this run'
     );
   }
-  // terminal.exec 的原生/fallback、memory.get_previous_evidence 的无前序证据分支继续由 handler 负责。
+  // memory.get_previous_evidence 的“无前序证据”分支属于单次调用结果，继续由 handler 负责；
+  // allowUnsandboxedTerminal 许可下的普通子进程降级也由 terminal handler 在结果中记录诊断。
   return { actions, parameters, unavailable };
 }

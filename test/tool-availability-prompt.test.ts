@@ -52,9 +52,10 @@ function hostServices(graph: 'none' | 'partial' | 'full'): ToolAvailabilityConte
 
 async function captureLlmInput(
   graph: 'none' | 'partial' | 'full',
-  loopOptions: Record<string, unknown> = {}
+  loopOptions: Record<string, unknown> = {},
+  wiring: { capability?: string; services?: Partial<ToolAvailabilityContext> } = {}
 ) {
-  const services = hostServices(graph);
+  const services = { ...hostServices(graph), ...wiring.services };
   const availability = (runtime?: unknown) =>
     ToolRouter.describeAvailability({ ...services, runtime: runtime as never });
   const catalog = new RuntimeCapabilityCatalog({ availability });
@@ -69,7 +70,7 @@ async function captureLlmInput(
         getAvailability: availability,
       },
     }),
-    capabilities: [CapabilityRegistry.create('code_analysis')],
+    capabilities: [CapabilityRegistry.create(wiring.capability ?? 'code_analysis')],
     policies: new PolicyEngine([new BudgetPolicy({ maxIterations: 3, timeoutMs: 5000 })]),
   });
   const result = await runtime.reactLoop('analyze the project', loopOptions);
@@ -132,6 +133,87 @@ describe('system prompt reflects host tool availability', () => {
       ? systemPrompt.slice(systemPrompt.indexOf(NOTICE_HEADING))
       : '';
     expect(notice).not.toContain('graph');
+  });
+});
+
+/** 生产宿主（../Alembic ToolContextFactory）的接线形状：注入沙箱执行器、会话存储可用、搜索只支持 all。 */
+const productionLikeWiring: Partial<ToolAvailabilityContext> = {
+  sandboxExecutor: { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) },
+  searchEngine: { search: async () => [], supportedKinds: ['all'] },
+  sessionStoreAvailable: true,
+};
+
+function noticeOf(systemPrompt: string): string {
+  return systemPrompt.includes(NOTICE_HEADING)
+    ? systemPrompt.slice(systemPrompt.indexOf(NOTICE_HEADING))
+    : '';
+}
+
+describe('system prompt follows the conditions handlers actually enforce', () => {
+  it('drops terminal.exec and says so when no sandbox executor is bound', async () => {
+    const { systemPrompt, toolNames, diagnostics } = await captureLlmInput('full');
+
+    // handler 在无执行器且未许可时 fail-closed；schema 与提示必须同步，不再诱导模型白调一轮。
+    expect(toolNames).not.toContain('terminal');
+    expect(noticeOf(systemPrompt)).toContain('- terminal（整个工具不可用）');
+    expect(diagnostics?.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: 'tool_host_unavailable',
+          tool: 'terminal',
+          message: 'sandboxExecutor.exec is unavailable and allowUnsandboxedTerminal is not true',
+        }),
+      ])
+    );
+  });
+
+  it('keeps terminal.exec silent when the host injects a sandbox executor or explicitly permits it', async () => {
+    for (const services of [productionLikeWiring, { allowUnsandboxedTerminal: true }]) {
+      const { systemPrompt, toolNames } = await captureLlmInput('full', {}, { services });
+      expect(toolNames).toContain('terminal');
+      expect(noticeOf(systemPrompt)).not.toContain('terminal');
+    }
+  });
+
+  it('lists the knowledge.search kinds a production search engine drops without hiding search', async () => {
+    const { systemPrompt, toolNames, diagnostics } = await captureLlmInput(
+      'full',
+      {},
+      { capability: 'scan_analyze', services: productionLikeWiring }
+    );
+
+    expect(toolNames).toEqual(expect.arrayContaining(['knowledge', 'terminal']));
+    const notice = noticeOf(systemPrompt);
+    expect(notice).toContain('- knowledge.search：以下分支不可用——candidate、recipe');
+    expect(notice).not.toContain('- knowledge（整个工具不可用）');
+    expect(notice).not.toContain('terminal');
+    expect(diagnostics?.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: 'tool_host_unavailable',
+          tool: 'knowledge',
+          message: 'knowledge.search kind=recipe is not in searchEngine.supportedKinds',
+        }),
+      ])
+    );
+  });
+
+  it('drops meta.review when the session store cannot recall submissions', async () => {
+    const hidden = await captureLlmInput(
+      'full',
+      {},
+      { capability: 'knowledge_production', services: { sessionStoreAvailable: false } }
+    );
+    expect(hidden.toolNames).not.toContain('meta');
+    expect(noticeOf(hidden.systemPrompt)).toContain('- meta（整个工具不可用）');
+
+    const wired = await captureLlmInput(
+      'full',
+      {},
+      { capability: 'knowledge_production', services: productionLikeWiring }
+    );
+    expect(wired.toolNames).toContain('meta');
+    expect(noticeOf(wired.systemPrompt)).not.toContain('meta');
   });
 });
 

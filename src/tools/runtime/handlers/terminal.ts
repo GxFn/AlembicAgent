@@ -7,9 +7,10 @@
  * 执行流程: 安全检查 → cwd 校验 → Seatbelt 沙箱执行 → OutputCompressor 压缩 → token budget 截断
  *
  * 沙箱集成: 通过 ToolContext.sandboxExecutor 注入 SandboxExecutor。
- *           未注入时默认拒绝执行（fail-closed）：宿主漏接线不应悄悄变成继承宿主环境变量的
- *           无沙箱执行。只有 ToolContext.allowUnsandboxedTerminal === true 时才降级为
- *           plain exec，并在结果里标注 unsandboxed。
+ *           未注入或注入对象没有可调用的 exec 时默认拒绝执行（fail-closed）：宿主漏接线不应
+ *           悄悄变成继承宿主环境变量的无沙箱执行。只有 ToolContext.allowUnsandboxedTerminal
+ *           === true 时才降级为 plain exec，并在结果里标注 unsandboxed。
+ *           可用性快照（availability.ts）按同一条件隐藏 terminal.exec，两处判定必须保持一致。
  */
 
 import { exec } from 'node:child_process';
@@ -31,6 +32,8 @@ import { checkTerminalCommandAllowlist, checkTerminalCommandSafety } from './ter
 
 const execAsync = promisify(exec);
 const SANDBOX_FALLBACK_REASON = 'missing_sandbox_executor';
+/** 宿主注入了 sandboxExecutor 但它没有可调用的 exec：与“未注入”区分，便于定位接线错误。 */
+const SANDBOX_INVALID_REASON = 'sandbox_executor_missing_exec';
 const SANDBOX_REQUIRED_MESSAGE =
   'Terminal execution unavailable: no sandbox executor is configured for this host. ' +
   'Continue with code/graph/knowledge tools instead.';
@@ -95,9 +98,13 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
     );
   }
 
-  // 执行器缺失且宿主没有显式许可：在启动任何进程之前拒绝。blocked 状态让 adapter 把它记入
-  // blockedTools，诊断里写明触发条件，宿主能据此发现接线缺口。
-  if (!ctx.sandboxExecutor && ctx.allowUnsandboxedTerminal !== true) {
+  // 执行器缺失（或注入对象没有可调用的 exec）且宿主没有显式许可：在启动任何进程之前拒绝。
+  // 判定按 exec 方法存在性而非对象真值，与可用性快照的 terminal.exec 检查同一事实。blocked 状态
+  // 让 adapter 把它记入 blockedTools，诊断里写明触发条件，宿主能据此发现接线缺口。
+  if (!isSandboxExecutor(ctx.sandboxExecutor) && ctx.allowUnsandboxedTerminal !== true) {
+    const executorState =
+      // 假值（未注入/null/false）沿用旧的“缺失”口径；其余是注入了却没有可调用 exec 的接线错误。
+      !ctx.sandboxExecutor ? 'sandboxExecutor missing' : 'sandboxExecutor has no exec method';
     return finish(
       {
         ok: false,
@@ -111,8 +118,7 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
           diagnosticWarnings: [
             {
               code: 'terminal_sandbox_required',
-              message:
-                'sandboxExecutor missing and allowUnsandboxedTerminal is not true; command was not started',
+              message: `${executorState} and allowUnsandboxedTerminal is not true; command was not started`,
               stage: 'terminal.exec',
               tool: 'terminal',
             },
@@ -234,7 +240,7 @@ function terminalFailureStatus(signal?: AbortSignal): 'error' | 'aborted' | 'tim
 }
 
 /**
- * 优先使用 Seatbelt 沙箱执行；未注入时只有调用方已通过显式许可检查才会走到 plain exec。
+ * 优先使用 Seatbelt 沙箱执行；没有可调用的 exec 时只有调用方已通过显式许可检查才会走到 plain exec。
  *
  * ctx.sandboxExecutor 由 ToolContextFactory 从 DI 容器注入，
  * 类型为 { exec(cmd, opts): Promise<{stdout,stderr,exitCode}> }
@@ -245,8 +251,8 @@ async function execInSandboxOrDirect(
   timeout: number,
   ctx: ToolContext
 ): Promise<TerminalExecutionResult> {
-  const executor = ctx.sandboxExecutor as SandboxExecutorLike | undefined;
-  if (executor) {
+  const executor = ctx.sandboxExecutor;
+  if (isSandboxExecutor(executor)) {
     const result = await executor.exec(command, {
       cwd,
       projectRoot: ctx.projectRoot,
@@ -262,11 +268,12 @@ async function execInSandboxOrDirect(
     };
   }
 
-  // 降级: plain exec（sandboxExecutor 未注入，且 allowUnsandboxedTerminal === true）
+  // 降级: plain exec（没有可调用的 sandboxExecutor.exec，且调用方已确认 allowUnsandboxedTerminal === true）。
+  // degradeReason 区分“未注入”和“注入了但没有 exec”，结果文本与 terminal_sandbox_fallback 诊断都会带出它。
   const diagnostics = {
     sandboxed: false,
     fallbackUsed: true,
-    degradeReason: SANDBOX_FALLBACK_REASON,
+    degradeReason: executor ? SANDBOX_INVALID_REASON : SANDBOX_FALLBACK_REASON,
   };
   try {
     const { stdout, stderr } = await execAsync(command, {
@@ -297,6 +304,15 @@ interface TerminalExecutionResult {
   stderr: string;
   exitCode: number;
   diagnostics: TerminalExecutionDiagnostics;
+}
+
+/** 只按 exec 方法存在性认定执行器；与 availability.ts 的 hasMethod(sandboxExecutor, 'exec') 对齐。 */
+function isSandboxExecutor(value: unknown): value is SandboxExecutorLike {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as { exec?: unknown }).exec === 'function'
+  );
 }
 
 interface SandboxExecutorLike {

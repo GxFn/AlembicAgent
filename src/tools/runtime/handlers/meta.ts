@@ -117,11 +117,31 @@ async function handleReview(
   _params: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  if (!ctx.sessionStore) {
-    return ok({ message: 'No session store — cannot review submissions' });
+  const store = ctx.sessionStore;
+  // 可用性快照在 sessionStore.recall 不可用时已隐藏 meta.review；这里是宿主声明与实际注入不一致时的
+  // 兜底。与 meta.plan 的 META_PLAN_NOT_PERSISTED 对齐：返回 degraded + 诊断，而不是裸 ok，
+  // 让模型和运行诊断能区分“本会话没有提交”（count 0、无降级）和“复查能力不可用”。
+  if (!store || typeof store.recall !== 'function') {
+    const message = store
+      ? 'No session store recall is bound — cannot review submissions'
+      : 'No session store — cannot review submissions';
+    return ok(
+      { count: 0, message },
+      {
+        degraded: true,
+        diagnosticWarnings: [
+          {
+            code: 'META_REVIEW_STORE_MISSING',
+            message,
+            stage: 'meta.review',
+            tool: 'meta',
+          },
+        ],
+      }
+    );
   }
 
-  const submissions = ctx.sessionStore.recall(undefined, { tags: ['submission'], limit: 50 });
+  const submissions = store.recall(undefined, { tags: ['submission'], limit: 50 });
 
   if (submissions.length === 0) {
     return ok({ message: 'No submissions found in this session', count: 0 });
