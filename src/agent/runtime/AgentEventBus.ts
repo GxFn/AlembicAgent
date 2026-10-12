@@ -7,6 +7,10 @@
  *   - 事件元信息与通配监听
  *   - 支持 request/reply 模式（Agent 间 RPC）
  *
+ * 生产使用现状（L5-P41 / I30 / U20-F8，待决事项②）：生产代码只经 publish 发布、经继承的
+ * EventEmitter `bus.on` 订阅（如 pipeline attempt 统计 TOOL_CALL_START）。subscribe() 与
+ * request()/reply 当前只有测试调用，没有生产消费者；②决定是否收窄前保持原样。
+ *
  * @module AgentEventBus
  */
 
@@ -21,7 +25,12 @@ interface PendingReply {
   cancel: (reason: Error) => void;
 }
 
-/** 标准事件类型 */
+/**
+ * 标准事件类型。
+ *
+ * 发布方是唯一真相源：HookSystem 的 llm:call:* 与 step:completed 桥接也引用这里的常量。
+ * 标注“当前运行时未发出”的常量在 src 内没有发布方，订阅它们不会收到事件（待决事项②决定收窄或接线）。
+ */
 export const AgentEvents = Object.freeze({
   // ── 生命周期 ──
   AGENT_CREATED: 'agent:created',
@@ -35,19 +44,22 @@ export const AgentEvents = Object.freeze({
   TOOL_CALL_END: 'tool:call:end',
   LLM_CALL_START: 'llm:call:start',
   LLM_CALL_END: 'llm:call:end',
+  /** 当前运行时未发出：只由 HookSystem 的 agent:exit 桥接发布，而运行时从不分发 agent:exit。 */
   STEP_COMPLETED: 'step:completed',
 
-  // ── Agent 间交互 ──
+  // ── Agent 间交互（当前运行时均未发出，也无订阅方） ──
   HANDOFF_REQUEST: 'handoff:request',
   HANDOFF_ACCEPT: 'handoff:accept',
   HANDOFF_RESULT: 'handoff:result',
 
   // ── 进度 ──
   PROGRESS: 'progress',
+  /** 当前运行时未发出：思考进度走 PROGRESS（progress 事件的 type='thinking'），不走本 topic。 */
   THINKING: 'thinking',
+  /** 当前运行时未发出。 */
   STREAM_DELTA: 'stream:delta',
 
-  // ── 外部触发 ──
+  // ── 外部触发（当前运行时均未发出，也无订阅方） ──
   USER_INPUT: 'user:input',
   SCAN_REQUEST: 'scan:request',
 });

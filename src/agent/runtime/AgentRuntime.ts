@@ -628,10 +628,16 @@ export class AgentRuntime {
         ctx.trace?.startRound(ctx.iteration);
         roundOpen = Boolean(ctx.trace);
 
-        this.#hookSystem.emitSync('agent:iteration:before', {
-          iteration: ctx.iteration,
-          phase: ctx.tracker?.phase,
-        });
+        // 所有钩子分发都带上本 loop 的诊断落点：钩子失败额外写入 AgentDiagnostics.warnings
+        // （hook_handler_failed）。按分发传入而非挂在 HookSystem 实例上，并发 loop 互不串记。
+        this.#hookSystem.emitSync(
+          'agent:iteration:before',
+          {
+            iteration: ctx.iteration,
+            phase: ctx.tracker?.phase,
+          },
+          { diagnostics: ctx.diagnostics }
+        );
 
         // 退出判定 (tracker + policy)
         if (this.#shouldExit(ctx)) {
@@ -670,11 +676,15 @@ export class AgentRuntime {
           // 让之后的无证据文本轮重新获得完整阻断额度。
           ctx.consecutiveGroundingBlocks = 0;
           const exitAfterTools = await this.#processToolCalls(ctx, llmResult, closeRound);
-          this.#hookSystem.emitSync('agent:iteration:after', {
-            iteration: ctx.iteration,
-            hadToolCalls: true,
-            hadText: !!llmResult.text,
-          });
+          this.#hookSystem.emitSync(
+            'agent:iteration:after',
+            {
+              iteration: ctx.iteration,
+              hadToolCalls: true,
+              hadText: !!llmResult.text,
+            },
+            { diagnostics: ctx.diagnostics }
+          );
           if (exitAfterTools) {
             break;
           }
@@ -682,11 +692,15 @@ export class AgentRuntime {
         }
 
         // 分支: 纯文本回复
-        this.#hookSystem.emitSync('agent:iteration:after', {
-          iteration: ctx.iteration,
-          hadToolCalls: false,
-          hadText: true,
-        });
+        this.#hookSystem.emitSync(
+          'agent:iteration:after',
+          {
+            iteration: ctx.iteration,
+            hadToolCalls: false,
+            hadText: true,
+          },
+          { diagnostics: ctx.diagnostics }
+        );
         if (this.#processTextResponse(ctx, llmResult, closeRound)) {
           break;
         }
@@ -1341,14 +1355,18 @@ export class AgentRuntime {
         ...llmOutputCompleteness,
       },
     });
-    this.#hookSystem.emitSync('llm:call:after', {
-      iteration: ctx.iteration,
-      hasToolCalls: !!llmResult.functionCalls?.length,
-      hasText: !!llmResult.text,
-      inputTokens: llmResult.usage?.inputTokens,
-      outputTokens: llmResult.usage?.outputTokens,
-      processEvent: llmOutputProcessEvent,
-    });
+    this.#hookSystem.emitSync(
+      'llm:call:after',
+      {
+        iteration: ctx.iteration,
+        hasToolCalls: !!llmResult.functionCalls?.length,
+        hasText: !!llmResult.text,
+        inputTokens: llmResult.usage?.inputTokens,
+        outputTokens: llmResult.usage?.outputTokens,
+        processEvent: llmOutputProcessEvent,
+      },
+      { diagnostics: ctx.diagnostics }
+    );
     this.#emitProcessProgress(llmOutputProcessEvent);
     this.logger.info(`[AgentRuntime] LLM call complete ${formatLoopTrace(llmTrace)}`, {
       ...llmTrace,
@@ -1507,11 +1525,15 @@ export class AgentRuntime {
         effectiveToolChoice,
       })
     );
-    this.#hookSystem.emitSync('llm:call:before', {
-      iteration: ctx.iteration,
-      toolChoice: effectiveToolChoice,
-      processEvent: llmInputProcessEvent,
-    });
+    this.#hookSystem.emitSync(
+      'llm:call:before',
+      {
+        iteration: ctx.iteration,
+        toolChoice: effectiveToolChoice,
+        processEvent: llmInputProcessEvent,
+      },
+      { diagnostics: ctx.diagnostics }
+    );
     this.#emitProcessProgress(llmInputProcessEvent);
 
     // 冷启动链路里第一轮经常最慢；必须先打印“请求已发出”的结构化日志，
@@ -1769,12 +1791,19 @@ export class AgentRuntime {
       );
 
       // HookSystem: tool:execute:before
-      const hookAllowed = await this.#hookSystem.emit('tool:execute:before', {
-        toolId: fc.name,
-        args: fc.args,
-        callId: fc.id,
-        processEvent: toolStartProcessEvent,
-      });
+      // 顺序说明（L5-P41 / I30）：tool_call 进度与 TOOL_CALL_START 已在上面发出，钩子失败写进
+      // processEvent.metadata.hookErrors 时宿主记录器已看过该事件；因此失败另经运行期诊断
+      // （hook_handler_failed）可靠上报。调整“先钩子后事件”会改变宿主可见事件顺序，需另行确认。
+      const hookAllowed = await this.#hookSystem.emit(
+        'tool:execute:before',
+        {
+          toolId: fc.name,
+          args: fc.args,
+          callId: fc.id,
+          processEvent: toolStartProcessEvent,
+        },
+        { diagnostics: ctx.diagnostics }
+      );
       if (ctx.abortSignal?.aborted) {
         ctx.diagnostics?.recordCancelReason('abort_signal');
         return true;
@@ -1949,13 +1978,17 @@ export class AgentRuntime {
       );
 
       // HookSystem: tool:execute:after
-      this.#hookSystem.emitSync('tool:execute:after', {
-        toolId: fc.name,
-        ok: toolSucceeded,
-        durationMs,
-        callId: fc.id,
-        processEvent: toolEndProcessEvent,
-      });
+      this.#hookSystem.emitSync(
+        'tool:execute:after',
+        {
+          toolId: fc.name,
+          ok: toolSucceeded,
+          durationMs,
+          callId: fc.id,
+          processEvent: toolEndProcessEvent,
+        },
+        { diagnostics: ctx.diagnostics }
+      );
 
       // 追加 tool result
       messages.appendToolResult(fc.id, fc.name, resultStr, {
@@ -2457,11 +2490,15 @@ export class AgentRuntime {
       }
     }
 
-    this.#hookSystem.emitSync('agent:finalize', {
-      reply: ctx.lastReply,
-      iterations: ctx.iteration,
-      toolCallCount: ctx.toolCalls.length,
-    });
+    this.#hookSystem.emitSync(
+      'agent:finalize',
+      {
+        reply: ctx.lastReply,
+        iterations: ctx.iteration,
+        toolCallCount: ctx.toolCalls.length,
+      },
+      { diagnostics: ctx.diagnostics }
+    );
 
     const result = ctx.buildResult();
     const cancelReason = result.diagnostics?.efficiency?.cancelReason;

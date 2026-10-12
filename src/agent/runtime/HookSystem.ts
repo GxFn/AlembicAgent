@@ -9,6 +9,8 @@
  *   - 可组合：支持 sync 和 async hook
  *   - 可拦截：tool:execute:before 支持 block（返回 false 阻止执行）
  *   - 兼容：通过默认 hook 桥接 AgentEventBus，避免重复发布工具事件
+ *   - 可诊断：钩子失败除了进入本实例 getDiagnostics() 与日志，还可按单次分发写入调用方传入的
+ *     运行期诊断（AgentDiagnostics.warnings，code=`hook_handler_failed`）
  *
  * @module agent/runtime/HookSystem
  */
@@ -16,20 +18,36 @@
 import Logger from '@alembic/core/logging';
 import { isThenable, observeSafely } from '#shared/observers.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
-import type { AgentProgressProcessEvent } from './AgentRuntimeTypes.js';
+import { AgentEvents } from './AgentEventBus.js';
+import type { AgentDiagnosticWarning, AgentProgressProcessEvent } from './AgentRuntimeTypes.js';
 
 // ── Hook Events ──
 
+/**
+ * 公开钩子事件。
+ *
+ * 契约漂移登记（L5-P41 / I30，待决事项②）：`agent:exit`、`context:compact:before`、
+ * `context:compact:after`、`exploration:phase_transition`、`exploration:budget_warning`
+ * 这 5 个事件**当前运行时未发出**——AgentRuntime 只分发 agent:iteration:*、llm:call:*、
+ * tool:execute:* 与 agent:finalize。订阅它们类型检查能通过，但处理器永远不会被调用。
+ * ②决定前保留类型以免外部订阅方在类型层断裂；②确认收窄则删除，确认接线则在退出、压缩与
+ * 阶段转换处补发。
+ */
 export type HookEvent =
   | 'agent:iteration:before'
   | 'agent:iteration:after'
+  /** 当前运行时未发出（待决事项②）；registerDefaultHooks 的 step:completed 桥接因此不会触发。 */
   | 'agent:exit'
   | 'agent:finalize'
   | 'tool:execute:before'
   | 'tool:execute:after'
+  /** 当前运行时未发出（待决事项②）；压缩事实见 AgentDiagnostics.efficiency 的压缩计数。 */
   | 'context:compact:before'
+  /** 当前运行时未发出（待决事项②）。 */
   | 'context:compact:after'
+  /** 当前运行时未发出（待决事项②）。 */
   | 'exploration:phase_transition'
+  /** 当前运行时未发出（待决事项②）。 */
   | 'exploration:budget_warning'
   | 'llm:call:before'
   | 'llm:call:after';
@@ -39,6 +57,7 @@ export type HookEvent =
 export interface HookPayloadMap {
   'agent:iteration:before': { iteration: number; phase?: string };
   'agent:iteration:after': { iteration: number; hadToolCalls: boolean; hadText: boolean };
+  /** 当前运行时未发出（待决事项②）。 */
   'agent:exit': { reason: string; iteration: number; detail?: string };
   'agent:finalize': { reply: string; iterations: number; toolCallCount: number };
   'tool:execute:before': {
@@ -54,6 +73,7 @@ export interface HookPayloadMap {
     callId: string;
     processEvent?: AgentProgressProcessEvent;
   };
+  /** 以下 4 个 payload 对应的事件当前运行时未发出（待决事项②）。 */
   'context:compact:before': { level: number; usage: number };
   'context:compact:after': { level: number; removed: number; usage: number };
   'exploration:phase_transition': { from: string; to: string; iteration: number };
@@ -84,6 +104,9 @@ export interface HookErrorDiagnostic {
   message: string;
   mode: 'async' | 'sync';
 }
+
+/** 运行期诊断里钩子失败的 warning code；与 HookErrorDiagnostic.code 分属两个落点。 */
+const HOOK_HANDLER_FAILED_WARNING = 'hook_handler_failed';
 
 interface HookEntry<E extends HookEvent = HookEvent> {
   event: E;
@@ -168,9 +191,16 @@ export class HookSystem {
    * For 'tool:execute:before': if any handler returns false, the tool execution is blocked.
    * Handlers are awaited in order; only blocking events interpret a false result.
    *
+   * @param dispatch - 可选的单次分发上下文。`diagnostics` 是本次分发所属运行的诊断落点（通常是
+   *   loop 的 DiagnosticsCollector）；钩子失败时额外写一条 `hook_handler_failed` warning。按分发
+   *   传入而不是挂在实例上：同一 runtime 可并发跑多个 loop，共享字段会把失败记到别的运行。
    * @returns For blocking events, returns false if any handler blocked. Otherwise true.
    */
-  async emit<E extends HookEvent>(event: E, payload: HookPayloadMap[E]): Promise<boolean> {
+  async emit<E extends HookEvent>(
+    event: E,
+    payload: HookPayloadMap[E],
+    dispatch: { diagnostics?: { warn(warning: AgentDiagnosticWarning): void } | null } = {}
+  ): Promise<boolean> {
     const list = this.#hooks.get(event);
     if (!list || list.length === 0) {
       return true;
@@ -192,7 +222,7 @@ export class HookSystem {
           blocked = true;
         }
       } catch (err: unknown) {
-        this.#recordHookError(event, entry, err, 'async', payload);
+        this.#recordHookError(event, entry, err, 'async', payload, dispatch.diagnostics);
       }
     }
 
@@ -202,8 +232,13 @@ export class HookSystem {
   /**
    * Synchronous emit — for performance-critical hooks where async is unnecessary.
    * Does not wait or support blocking; observer promises are monitored for rejection.
+   * `dispatch.diagnostics` 语义同 emit；异步拒绝晚于本次调用返回时仍写入同一落点。
    */
-  emitSync<E extends HookEvent>(event: E, payload: HookPayloadMap[E]): void {
+  emitSync<E extends HookEvent>(
+    event: E,
+    payload: HookPayloadMap[E],
+    dispatch: { diagnostics?: { warn(warning: AgentDiagnosticWarning): void } | null } = {}
+  ): void {
     const list = this.#hooks.get(event);
     if (!list || list.length === 0) {
       return;
@@ -215,7 +250,7 @@ export class HookSystem {
       }
       observeSafely(
         () => entry.handler(payload as never),
-        (err) => this.#recordHookError(event, entry, err, 'sync', payload)
+        (err) => this.#recordHookError(event, entry, err, 'sync', payload, dispatch.diagnostics)
       );
     }
   }
@@ -254,7 +289,8 @@ export class HookSystem {
     entry: HookEntry,
     err: unknown,
     mode: 'async' | 'sync',
-    payload: HookPayloadMap[E]
+    payload: HookPayloadMap[E],
+    sink?: { warn(warning: AgentDiagnosticWarning): void } | null
   ): void {
     // 错误附件或日志端口自身失败不能重新中断已经隔离的观察者分发。
     observeSafely(
@@ -269,6 +305,16 @@ export class HookSystem {
         };
         this.#hookErrors.push(diagnostic);
         attachHookDiagnosticToProcessEvent(payload, diagnostic);
+        // 运行期诊断落点单独隔离：调用方 sink 抛错不能吞掉下面的日志，也不能中断后续钩子。
+        if (sink) {
+          observeSafely(
+            () => sink.warn(toRunWarning(diagnostic, payload)),
+            () =>
+              this.#logger.warn(
+                `[HookSystem] run diagnostics sink rejected hook_handler_failed on ${event} (${entry.id}); hookSystem.getDiagnostics() still holds it`
+              )
+          );
+        }
         return this.#logger.warn(
           `[HookSystem] hook error on ${event} (${entry.id}): ${diagnostic.message}`
         );
@@ -276,6 +322,20 @@ export class HookSystem {
       () => undefined
     );
   }
+}
+
+/**
+ * 把钩子失败投影为运行期 warning。钩子失败只被隔离、不阻断（抛错的 tool:execute:before 不等于
+ * 返回 false），所以 message 写明“已隔离、运行继续”；message 复用已脱敏的诊断文本。
+ * 工具钩子带上 toolId，便于宿主按工具归因。
+ */
+function toRunWarning(diagnostic: HookErrorDiagnostic, payload: unknown): AgentDiagnosticWarning {
+  const toolId = (payload as { toolId?: unknown } | null)?.toolId;
+  return {
+    code: HOOK_HANDLER_FAILED_WARNING,
+    message: `Hook ${diagnostic.hookId} failed on ${diagnostic.event} (${diagnostic.mode} dispatch); handler isolated, run continues: ${diagnostic.message}`,
+    ...(typeof toolId === 'string' ? { tool: toolId } : {}),
+  };
 }
 
 function attachHookDiagnosticToProcessEvent(
@@ -316,9 +376,10 @@ export function registerDefaultHooks(
     return;
   }
 
+  // 发布名统一取 AgentEvents 常量：常量改值时桥接跟随，订阅常量的消费者不会静默收不到事件。
   hookSystem.on('llm:call:before', (p) => {
     bus.publish(
-      'llm:call:start',
+      AgentEvents.LLM_CALL_START,
       {
         agentId,
         iteration: p.iteration,
@@ -331,7 +392,7 @@ export function registerDefaultHooks(
 
   hookSystem.on('llm:call:after', (p) => {
     bus.publish(
-      'llm:call:end',
+      AgentEvents.LLM_CALL_END,
       {
         hasToolCalls: p.hasToolCalls,
         hasText: p.hasText,
@@ -342,9 +403,11 @@ export function registerDefaultHooks(
     );
   });
 
+  // 当前是死桥接（待决事项②）：运行时从不分发 agent:exit，AgentEvents.STEP_COMPLETED 因此不会出现。
+  // ②确认收窄则连同 agent:exit 一并删除；确认接线则在退出路径补发 agent:exit 后此处自然生效。
   hookSystem.on('agent:exit', (p) => {
     bus.publish(
-      'step:completed',
+      AgentEvents.STEP_COMPLETED,
       {
         reason: p.reason,
         iteration: p.iteration,
