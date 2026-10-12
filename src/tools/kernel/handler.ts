@@ -2,8 +2,20 @@
  * Internal tool handler contract — handler signature, handler context, and the
  * internal tool handler store. Canonical home (formerly
  * src/tools/core/InternalToolHandler.ts).
+ *
+ * 兼容层登记（L3-C08，2026-10 核对的当前事实）：
+ *   - 消费者：本文件的 InternalToolHandler* 类型只被 UnifiedToolCatalog 的兼容方法
+ *     getInternalTool（只有测试调用）使用；contextFromToolCall 在 src 与宿主中都没有调用方。
+ *     生产工具执行只走 ToolRouterAdapter → ToolRouter → ActionHandler，不经过本层。
+ *   - 保留原因：这些名字经 src/tools/index.ts 进入根 facade，属于冻结的公开签名清单
+ *     （config/agent-public-api-signatures.json）；是否收窄公开面属于待决事项②，决定前不删除。
+ *   - 移除条件：②确认收窄后，与 UnifiedToolCatalog.getInternalTool/InternalToolHandlerStore
+ *     一起删除，并同步更新签名清单；若②决定保留，本登记继续有效。
+ *   - 回落诊断：contextFromToolCall 在 projectRoot 为空时仍回落到 process.cwd()（保持兼容），
+ *     但会经 Logger.warn 报告回落字段、工具与调用标识，避免在错误目录静默读写。
  */
 
+import Logger from '@alembic/core/logging';
 import type { ToolCallContext, ToolServiceContracts, ToolServiceLocator } from './context.js';
 
 export interface InternalToolLogger {
@@ -63,6 +75,7 @@ export interface InternalToolHandlerStore {
 
 export function contextFromToolCall(requestContext: ToolCallContext): InternalToolHandlerContext {
   const runtime = requestContext.runtime;
+  reportCwdFallback(requestContext);
   return {
     container: toServiceLocator(requestContext.services),
     serviceContracts: requestContext.serviceContracts,
@@ -98,6 +111,31 @@ export function contextFromToolCall(requestContext: ToolCallContext): InternalTo
       ? { _dimensionScopeId: runtime.dimensionScopeId }
       : {}),
   };
+}
+
+/**
+ * process.cwd() 回落诊断：返回值保持旧行为（兼容公开函数），只补一条可定位的 warn。
+ *
+ * 判定与 contextFromToolCall 的取值顺序一致：
+ *   - projectRoot：请求上下文的 projectRoot 为空时回落到 cwd；
+ *   - dataRoot：runtime.dataRoot 是字符串时优先使用它（不回落）；否则依次取请求的 dataRoot、
+ *     projectRoot，两者都为空时才回落到 cwd。
+ * daemon 的 cwd 不一定是项目根，回落后 handler 可能在错误目录读写，所以必须留痕。
+ * 日志只写字段名、工具 id、调用 id 与来源名，不写解析出的绝对路径。
+ */
+function reportCwdFallback(requestContext: ToolCallContext): void {
+  if (requestContext.projectRoot) {
+    return;
+  }
+  const runtimeDataRoot = requestContext.runtime?.dataRoot;
+  const dataRootFallsBack = typeof runtimeDataRoot !== 'string' && !requestContext.dataRoot;
+  const fields = dataRootFallsBack ? 'projectRoot,dataRoot' : 'projectRoot';
+  Logger.getInstance().warn(
+    `[contextFromToolCall] legacy handler context fallback: ToolCallContext.projectRoot is empty; ` +
+      `fields=${fields}; resolved=process.cwd(); tool=${requestContext.toolId || '(unknown)'}; ` +
+      `callId=${requestContext.callId || '(unknown)'}; source=${requestContext.source?.name || requestContext.source?.kind || '(unknown)'}; ` +
+      'pass an explicit projectRoot so handlers do not read or write relative to the process directory'
+  );
 }
 
 function toServiceLocator(container: unknown): ToolServiceLocator {

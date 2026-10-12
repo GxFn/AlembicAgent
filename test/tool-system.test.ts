@@ -5,10 +5,13 @@ import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
+  CapabilityCatalog,
+  contextFromToolCall,
   isToolResultEnvelope,
   presentToolResult,
   projectToolResultOrdinaryOutput,
   TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
+  type ToolCallContext,
   type ToolCapabilityManifest,
   type ToolDefinition,
   type ToolResultEnvelope,
@@ -953,6 +956,158 @@ describe('UnifiedToolCatalog', () => {
     catalog.register(createManifest());
     expect(() => catalog.registerDefinition(definition)).toThrow();
     expect(catalog.getHandler('demo.echo')).toBeNull();
+  });
+});
+
+/**
+ * L3-C11：CapabilityListFilter.lifecycle 的类型包含 'disabled'，显式请求时必须能列出禁用项；
+ * 不带 lifecycle 的调用（包括 querySchemas 内部的 this.list()）仍然排除禁用项。
+ */
+describe('CapabilityCatalog.list filters', () => {
+  function fixtureCatalog<T extends CapabilityCatalog>(catalog: T): T {
+    catalog.registerAll([
+      createManifest({ id: 'cap.active', lifecycle: 'active', surfaces: ['runtime', 'http'] }),
+      createManifest({ id: 'cap.disabled', lifecycle: 'disabled', surfaces: ['runtime'] }),
+      createManifest({ id: 'cap.disabled-http', lifecycle: 'disabled', surfaces: ['http'] }),
+      createManifest({ id: 'cap.deprecated', lifecycle: 'deprecated', surfaces: ['mcp'] }),
+    ]);
+    return catalog;
+  }
+  const ids = (manifests: ToolCapabilityManifest[]) => manifests.map(({ id }) => id);
+
+  it('returns disabled manifests when lifecycle disabled is requested explicitly', () => {
+    const catalog = fixtureCatalog(new CapabilityCatalog());
+    expect(ids(catalog.list({ lifecycle: 'disabled' }))).toEqual([
+      'cap.disabled',
+      'cap.disabled-http',
+    ]);
+    // 显式请求其他生命周期时只返回该生命周期，不会混入禁用项。
+    expect(ids(catalog.list({ lifecycle: 'deprecated' }))).toEqual(['cap.deprecated']);
+    expect(ids(catalog.list({ lifecycle: 'active' }))).toEqual(['cap.active']);
+  });
+
+  it('keeps excluding disabled manifests without an explicit lifecycle filter and in schema queries', () => {
+    const catalog = fixtureCatalog(new CapabilityCatalog());
+    expect(ids(catalog.list())).toEqual(['cap.active', 'cap.deprecated']);
+    expect(ids(catalog.list({ lifecycle: undefined }))).toEqual(['cap.active', 'cap.deprecated']);
+    expect(ids(catalog.list({ surface: 'runtime' }))).toEqual(['cap.active']);
+    expect(ids(catalog.list({ ids: ['cap.disabled', 'cap.active'] }))).toEqual(['cap.active']);
+    // 模型可见 schema 不能因为 list 修正而暴露禁用能力。
+    expect(catalog.querySchemas().schemas.map(({ name }) => name)).toEqual([
+      'cap.active',
+      'cap.deprecated',
+    ]);
+    expect(catalog.querySchemas({ selection: ['cap.disabled'] }).schemas).toEqual([]);
+  });
+
+  it('combines surface, lifecycle and ids filters', () => {
+    const catalog = fixtureCatalog(new CapabilityCatalog());
+    expect(ids(catalog.list({ lifecycle: 'disabled', surface: 'http' }))).toEqual([
+      'cap.disabled-http',
+    ]);
+    expect(
+      ids(catalog.list({ lifecycle: 'disabled', ids: ['cap.disabled', 'cap.active'] }))
+    ).toEqual(['cap.disabled']);
+    expect(
+      ids(catalog.list({ lifecycle: 'disabled', surface: 'mcp', ids: ['cap.disabled'] }))
+    ).toEqual([]);
+    expect(
+      ids(catalog.list({ surface: 'http', ids: ['cap.active', 'cap.disabled-http'] }))
+    ).toEqual(['cap.active']);
+    expect(ids(catalog.list({ ids: [] }))).toEqual([]);
+    expect(ids(catalog.list({ ids: null }))).toEqual(['cap.active', 'cap.deprecated']);
+  });
+
+  it('applies the same filter semantics to UnifiedToolCatalog', () => {
+    const catalog = fixtureCatalog(new UnifiedToolCatalog());
+    expect(ids(catalog.list({ lifecycle: 'disabled' }))).toEqual([
+      'cap.disabled',
+      'cap.disabled-http',
+    ]);
+    expect(ids(catalog.list())).toEqual(['cap.active', 'cap.deprecated']);
+  });
+});
+
+/**
+ * L3-C08（保留方案下的内部收敛）：contextFromToolCall 的 process.cwd() 回落必须打出可定位的 warn，
+ * 返回值保持兼容（仍然回落到 cwd），不改公开函数的签名与结果。
+ */
+describe('contextFromToolCall legacy handler context', () => {
+  function callContext(overrides: Partial<ToolCallContext> = {}): ToolCallContext {
+    return {
+      callId: 'call-ctx-1',
+      toolId: 'demo.echo',
+      surface: 'runtime',
+      actor: { role: 'developer', user: 'ctx-test-user' },
+      source: { kind: 'runtime', name: 'ctx-test-source' },
+      projectRoot: '',
+      services: { get: () => undefined as never },
+      ...overrides,
+    };
+  }
+
+  it('warns with tool, call and fallback fields when projectRoot is empty', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const context = contextFromToolCall(callContext());
+      // 兼容行为不变：仍然回落到进程 cwd。
+      expect(context.projectRoot).toBe(process.cwd());
+      expect(context.dataRoot).toBe(process.cwd());
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain('[contextFromToolCall]');
+      expect(message).toContain('process.cwd()');
+      expect(message).toContain('fields=projectRoot,dataRoot');
+      expect(message).toContain('tool=demo.echo');
+      expect(message).toContain('callId=call-ctx-1');
+      expect(message).toContain('source=ctx-test-source');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('reports only projectRoot when dataRoot is supplied by the request or the runtime', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const fromRequest = contextFromToolCall(callContext({ dataRoot: 'fixture-data-root' }));
+      expect(fromRequest.dataRoot).toBe('fixture-data-root');
+      const fromRuntime = contextFromToolCall(
+        callContext({ runtime: { dataRoot: 'fixture-runtime-data-root' } })
+      );
+      expect(fromRuntime.dataRoot).toBe('fixture-runtime-data-root');
+      expect(warn).toHaveBeenCalledTimes(2);
+      for (const [message] of warn.mock.calls) {
+        expect(String(message)).toContain('fields=projectRoot;');
+        expect(String(message)).not.toContain('dataRoot');
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not warn when projectRoot is provided', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const context = contextFromToolCall(callContext({ projectRoot: 'fixture-project-root' }));
+      expect(context.projectRoot).toBe('fixture-project-root');
+      expect(context.dataRoot).toBe('fixture-project-root');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps the compatibility registration in handler.ts true: no src caller and a recorded removal condition', () => {
+    const handlerFile = path.join('src', 'tools', 'kernel', 'handler.ts');
+    const text = readFileSync(path.join(process.cwd(), handlerFile), 'utf8');
+    expect(text).toContain('兼容层登记');
+    expect(text).toContain('移除条件');
+    // 事实核对：头注释声称 contextFromToolCall 在 src 中没有调用方；一旦出现调用方，需要同步改登记。
+    const callers = walkSource(path.join(process.cwd(), 'src'))
+      .filter((filePath) => path.relative(process.cwd(), filePath) !== handlerFile)
+      .filter((filePath) => /\bcontextFromToolCall\s*\(/.test(readFileSync(filePath, 'utf8')))
+      .map((filePath) => path.relative(process.cwd(), filePath));
+    expect(callers).toEqual([]);
   });
 });
 

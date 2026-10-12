@@ -52,6 +52,15 @@ export class CapabilityCatalog implements ToolSchemaQueryPort {
     return this.#manifests.get(id) || null;
   }
 
+  /**
+   * 按 surface/lifecycle/ids 过滤已注册的 manifest（多个条件同时生效，取交集）。
+   *
+   * 禁用项的可见性：
+   *   - 调用方显式传入 lifecycle 时只按该值相等过滤，所以 list({ lifecycle: 'disabled' })
+   *     返回禁用项，这与 CapabilityListFilter.lifecycle 的类型承诺一致（L3-C11）；
+   *   - 没有传 lifecycle 时默认排除 disabled。querySchemas 内部用无参 this.list()，
+   *     因此模型可见的 schema 仍然不会包含禁用能力。
+   */
   list(filter: CapabilityListFilter = {}) {
     const ids = filter.ids ? new Set(filter.ids) : null;
     return [...this.#manifests.values()].filter((manifest) => {
@@ -64,7 +73,9 @@ export class CapabilityCatalog implements ToolSchemaQueryPort {
       if (filter.surface && !manifest.surfaces.includes(filter.surface)) {
         return false;
       }
-      return manifest.lifecycle !== 'disabled';
+      // 与上面的 lifecycle 相等检查使用同一个“已显式请求”判定（非空值）：JS 调用方传入
+      // null/'' 时既不做 lifecycle 过滤，也不放出禁用项，保持与无参调用一致。
+      return Boolean(filter.lifecycle) || manifest.lifecycle !== 'disabled';
     });
   }
 
