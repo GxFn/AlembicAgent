@@ -3,6 +3,7 @@ import type { AgentDiagnosticWarning } from './AgentRuntimeTypes.js';
 import { buildAnalyzeGroundingPolicy } from './AnalyzeGroundingGuard.js';
 import type { LoopContext } from './LoopContext.js';
 import { extractSourceRefsFromValue } from './PcvNodeEvidenceRecorder.js';
+import { isRecordOnlyStage } from './toolPipeline/callNormalization.js';
 
 export type LLMInputSectionId =
   | 'identity'
@@ -391,10 +392,16 @@ export function resolveLlmInputStageProfile(
   const trackerPhase = upperString(valueAt(ctx.tracker, 'phase'));
   const pipelineType = lowerString(valueAt(ctx.tracker, 'pipelineType'));
   const pipelinePhase = lowerString(ctx.context?.pipelinePhase);
-  const recordRepairOnly =
-    ctx.sharedState?._recordRepairOnly === true || ctx.context?.recordRepairOnly === true;
 
-  if (recordRepairOnly || trackerPhase === 'RECORD' || pipelinePhase.includes('record_repair')) {
+  // I06：record 画像与 schema 广告面、recordRepairOnlyGate 执行门共用 isRecordOnlyStage，
+  // 凡是执行门按 record-only 收窄的轮次，模型看到的阶段说明一定是 record。
+  // 画像只决定提示文案与输入预算、不做权限判断，所以额外保留两条更宽的归类：任意 tracker 的
+  // RECORD 相（目前只有 analyst 策略有 RECORD）与 pipelinePhase 含 record_repair 的阶段名。
+  if (
+    isRecordOnlyStage(ctx) ||
+    trackerPhase === 'RECORD' ||
+    pipelinePhase.includes('record_repair')
+  ) {
     return 'record';
   }
   if (

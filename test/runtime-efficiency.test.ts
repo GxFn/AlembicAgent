@@ -12,6 +12,8 @@ import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import {
   createToolPipeline,
   DiagnosticsCollector,
+  recordRepairOnlyGate,
+  resolveLlmInputStageProfile,
   ToolExecutionPipeline,
 } from '../src/agent/runtime/index.js';
 import {
@@ -1275,5 +1277,188 @@ describe('evolution decision-only gate', () => {
     );
     expect(result.metadata.blocked).toBe(false);
     expect(executions()).toBe(1);
+  });
+});
+
+describe('I06 record-only stage execution gate', () => {
+  type RecordOnlyCase = {
+    sharedState?: Record<string, unknown>;
+    context?: Record<string, unknown>;
+    tracker?: { pipelineType: string; phase: string } | null;
+  };
+
+  function recordOnlyFixture(input: RecordOnlyCase) {
+    const diagnostics = new DiagnosticsCollector();
+    const dispatched: string[] = [];
+    const runtime = createRuntime(createManifest({ id: 'noop' }), async (request) => {
+      dispatched.push(`${request.toolId}.${String(request.args?.action ?? '')}`);
+      return createEnvelope(request, dispatched.length);
+    });
+    const loopCtx = {
+      allowedToolIds: ['code', 'terminal', 'graph', 'memory', 'evidence', 'knowledge'],
+      abortSignal: null,
+      context: input.context ?? {},
+      diagnostics,
+      iteration: 1,
+      memoryCoordinator: null,
+      sharedState: input.sharedState ?? {},
+      source: 'system',
+      toolCalls: [],
+      tracker: input.tracker
+        ? { ...input.tracker, recordToolCall: () => ({ isNew: false }) }
+        : null,
+      trace: null,
+    } as unknown as LoopContext;
+    return { context: { runtime, loopCtx, iteration: 1 }, diagnostics, dispatched, loopCtx };
+  }
+
+  function blockedReason(result: unknown): string {
+    if (result && typeof result === 'object' && 'error' in result) {
+      return String((result as { error?: unknown }).error ?? '');
+    }
+    return '';
+  }
+
+  const analystRecord = { tracker: { pipelineType: 'analyst', phase: 'RECORD' } };
+
+  it.each([
+    {
+      label: 'code.search',
+      call: { name: 'code', args: { action: 'search', params: { patterns: ['Foo'] } } },
+    },
+    {
+      label: 'terminal.exec',
+      call: { name: 'terminal', args: { action: 'exec', params: { command: 'ls' } } },
+    },
+    {
+      label: 'memory.save',
+      call: { name: 'memory', args: { action: 'save', params: { key: 'k', content: 'v' } } },
+    },
+    {
+      label: 'graph.query',
+      call: {
+        name: 'graph',
+        args: { action: 'query', params: { type: 'callers', entity: 'Foo' } },
+      },
+    },
+    {
+      label: 'knowledge.submit',
+      call: { name: 'knowledge', args: { action: 'submit', params: { title: 'T' } } },
+    },
+  ])('blocks analyst RECORD $label at execution and names the trigger in diagnostics', async ({
+    call,
+  }) => {
+    const { context, diagnostics, dispatched } = recordOnlyFixture(analystRecord);
+    const output = await createToolPipeline().execute(
+      { id: 'record-out-of-scope', ...call },
+      context
+    );
+
+    expect(output.metadata.blocked).toBe(true);
+    expect(dispatched).toEqual([]);
+    const reason = blockedReason(output.result);
+    expect(reason).toContain('note_finding');
+    expect(reason).toContain('trigger: analyst RECORD phase');
+    expect(diagnostics.toJSON().blockedTools).toEqual([{ tool: call.name, reason }]);
+  });
+
+  it.each([
+    {
+      label: 'direct note_finding',
+      call: { name: 'note_finding', args: { finding: 'F', evidenceRefs: ['E-1'], importance: 8 } },
+      expected: 'memory.note_finding',
+    },
+    {
+      label: 'memory.note_finding',
+      call: {
+        name: 'memory',
+        args: { action: 'note_finding', params: { finding: 'F', evidenceRefs: ['E-1'] } },
+      },
+      expected: 'memory.note_finding',
+    },
+    {
+      label: 'evidence.get',
+      call: { name: 'evidence', args: { action: 'get', params: { ref: 'E-1' } } },
+      expected: 'evidence.get',
+    },
+    {
+      label: 'evidence.search',
+      call: { name: 'evidence', args: { action: 'search', params: { query: 'Foo' } } },
+      expected: 'evidence.search',
+    },
+  ])('lets analyst RECORD $label through to the router', async ({ call, expected }) => {
+    const { context, diagnostics, dispatched } = recordOnlyFixture(analystRecord);
+    const output = await createToolPipeline().execute({ id: 'record-allowed', ...call }, context);
+
+    expect(output.metadata.blocked).toBe(false);
+    expect(dispatched).toEqual([expected]);
+    expect(diagnostics.toJSON().blockedTools).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: 'sharedState flag',
+      input: { sharedState: { _recordRepairOnly: true } },
+      trigger: 'sharedState._recordRepairOnly',
+    },
+    {
+      label: 'context flag only',
+      input: { context: { recordRepairOnly: true } },
+      trigger: 'context.recordRepairOnly',
+    },
+  ])('blocks record_repair exploration via the $label and names the trigger', async ({
+    input,
+    trigger,
+  }) => {
+    const { context, diagnostics, dispatched } = recordOnlyFixture(input);
+    const output = await createToolPipeline().execute(
+      { id: 'repair-read', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
+      context
+    );
+
+    expect(output.metadata.blocked).toBe(true);
+    expect(dispatched).toEqual([]);
+    const reason = blockedReason(output.result);
+    expect(reason).toContain('Record repair is note_finding-only');
+    expect(reason).toContain(`trigger: ${trigger}`);
+    expect(diagnostics.toJSON().blockedTools).toEqual([{ tool: 'code', reason }]);
+  });
+
+  it('keeps the record-only execution gate and the record input profile on one predicate', () => {
+    const cases: RecordOnlyCase[] = [
+      analystRecord,
+      { sharedState: { _recordRepairOnly: true } },
+      { context: { recordRepairOnly: true } },
+      { tracker: { pipelineType: 'analyst', phase: 'VERIFY' } },
+      { tracker: { pipelineType: 'producer', phase: 'PRODUCE' } },
+      { context: { pipelinePhase: 'analyze' } },
+      {},
+    ];
+    const codeRead = {
+      id: 'probe',
+      name: 'code',
+      args: { action: 'read', params: { path: 'a.ts' } },
+    };
+    const observed = cases.map((input) => {
+      const { context, loopCtx } = recordOnlyFixture(input);
+      const verdict = recordRepairOnlyGate.before(codeRead, context as never);
+      return {
+        gateBlocks: verdict?.blocked === true,
+        recordProfile: resolveLlmInputStageProfile(loopCtx, 'auto', 'auto') === 'record',
+      };
+    });
+
+    expect(observed.map((entry) => entry.gateBlocks)).toEqual([
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(observed.map((entry) => entry.recordProfile)).toEqual(
+      observed.map((entry) => entry.gateBlocks)
+    );
   });
 });

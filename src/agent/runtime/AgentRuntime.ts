@@ -118,6 +118,10 @@ import {
 } from './processEvents.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 import { createToolPipeline } from './ToolExecutionPipeline.js';
+import {
+  isRecordOnlyStage,
+  resolveRecordOnlyStageTrigger,
+} from './toolPipeline/callNormalization.js';
 import { takeToolPipelineFailure } from './toolPipeline/engine.js';
 import {
   createToolReceipt,
@@ -1014,7 +1018,13 @@ export class AgentRuntime {
 
     // 动态 toolChoice
     const forceSummaryAt = Math.max(2, Math.ceil(maxIterations * 0.8));
-    const forceSummary = !tracker && ctx.iteration >= forceSummaryAt;
+    const forceSummaryReached = !tracker && ctx.iteration >= forceSummaryAt;
+    // I06：record-only 阶段（tracker=null 时只可能是 record_repair 微阶段）不进入强制摘要轮。
+    // 该阶段 maxIterations 很小（默认 3），80% 阈值正好落在最后一轮：强制 'none' 会让本轮 note_finding
+    // 被当作 tool_choice_violation 丢弃，可记录轮次从 3 降到 2。其终止已由 ExitController 的
+    // checkAfterToolCalls（iteration>=max）与 checkBeforeLLM（iteration>max）保证，末轮保留 record-only 工具面。
+    const recordOnlyTrigger = forceSummaryReached ? resolveRecordOnlyStageTrigger(ctx) : null;
+    const forceSummary = forceSummaryReached && !recordOnlyTrigger;
     let toolChoice: string;
     if (ctx.toolChoiceOverride && ctx.iteration === 1) {
       toolChoice = ctx.toolChoiceOverride;
@@ -1022,6 +1032,11 @@ export class AgentRuntime {
       toolChoice = tracker.getToolChoice();
     } else {
       toolChoice = ctx.toolSchemas.length > 0 ? (forceSummary ? 'none' : 'auto') : 'none';
+    }
+    if (recordOnlyTrigger) {
+      this.logger.info(
+        `[AgentRuntime] force-summary skipped for record-only stage (trigger=${recordOnlyTrigger}) at iter ${ctx.iteration}/${maxIterations}; forceSummaryAt=${forceSummaryAt}, toolChoice=${toolChoice}, toolSchemas=${ctx.toolSchemas.length}; loop end stays with ExitController maxIterations`
+      );
     }
 
     const toolSchemas = this.#getIterationToolSchemas(ctx, toolChoice);
@@ -1056,8 +1071,12 @@ export class AgentRuntime {
       }
     }
     if (forceSummary) {
+      // I06：强制摘要轮的 toolChoice 恒为 'none'（见上方分支），且 tracker=null 时不存在 provider 的
+      // “none 下保留工具可见”例外（ProviderToolChoicePolicy 只对 SCAN/EXPLORE 首轮生效），
+      // 本轮返回的任何工具调用都会按 tool_choice_violation 丢弃。提示因此不能再要求“只允许使用 note_finding”，
+      // 只要求直接输出总结；需要补记录的 record-only 阶段已在上方豁免强制摘要。
       dynamicParts.push(
-        '[系统提示] 已进入最后阶段，请停止调用探索工具，基于已有信息输出总结。若任务要求结构化记录且尚未记录，只允许使用 note_finding({ finding, evidenceRefs, importance }) 补齐核心发现（evidenceRefs 引用工具返回 [evidence] 标注的条目 id）。'
+        '[系统提示] 已进入最后阶段，本轮不接受任何工具调用（包括 note_finding），请基于已有信息直接输出总结。'
       );
     }
     const dynamicContext = dynamicParts.length > 0 ? dynamicParts.join('\n\n') : null;
@@ -1081,13 +1100,9 @@ export class AgentRuntime {
   }
 
   #getIterationToolSchemas(ctx: LoopContext, toolChoice: string): Array<Record<string, unknown>> {
-    const tracker = ctx.tracker;
-    const recordRepairOnly =
-      ctx.sharedState?._recordRepairOnly === true || ctx.context?.recordRepairOnly === true;
-    if (
-      toolChoice !== 'none' &&
-      (recordRepairOnly || (tracker?.pipelineType === 'analyst' && tracker.phase === 'RECORD'))
-    ) {
+    // I06：record-only 判定与 recordRepairOnlyGate 执行门共用 isRecordOnlyStage，
+    // 广告面收窄到 note_finding + evidence 的轮次，执行门也按同一结论阻断越界调用。
+    if (toolChoice !== 'none' && isRecordOnlyStage(ctx)) {
       if (
         !ctx.toolSchemas.some((schema) => schema.name === 'memory') ||
         !canUseDirectNoteFinding(ctx)

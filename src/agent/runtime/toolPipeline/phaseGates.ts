@@ -1,5 +1,11 @@
-/** 场景动作约束：Evolution、record repair、Analyst VERIFY 与 Producer；不拥有路由与记账。 */
-import { getToolAction, getToolParams, isDirectNoteFindingCall } from './callNormalization.js';
+/** 场景动作约束：Evolution、record-only（record repair 与 Analyst RECORD）、Analyst VERIFY 与 Producer；不拥有路由与记账。 */
+import {
+  getToolAction,
+  getToolParams,
+  isDirectNoteFindingCall,
+  type RecordOnlyStageTrigger,
+  resolveRecordOnlyStageTrigger,
+} from './callNormalization.js';
 import type {
   BeforeVerdict,
   ToolCall,
@@ -77,16 +83,31 @@ const PRODUCER_MEMORY_ACTIONS = new Set(['recall']);
 
 const PRODUCER_META_ACTIONS = new Set(['review']);
 
+const RECORD_ONLY_ALLOWED_SURFACE =
+  'is note_finding-only (plus read-only evidence.get/search). Use note_finding({ finding, evidenceRefs, importance }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.';
+
 /**
- * RecordRepairOnlyGate — QualityGate record_repair 阶段的动作级守卫。
+ * 阻断文案同时进入模型可见结果与 diagnostics.blockedTools（engine 以 error 作为 reason），
+ * 因此在末尾写明命中的 record-only 触发谓词，宿主能区分 record_repair 微阶段与 analyst RECORD 相。
+ */
+function recordOnlyBlockedError(trigger: RecordOnlyStageTrigger): string {
+  const subject = trigger === 'analyst RECORD phase' ? 'Analyst RECORD' : 'Record repair';
+  return `${subject} ${RECORD_ONLY_ALLOWED_SURFACE} (record-only stage trigger: ${trigger})`;
+}
+
+/**
+ * RecordRepairOnlyGate — record-only 阶段（QualityGate record_repair 微阶段与 analyst RECORD 相）的动作级守卫。
  *
- * record_repair 只能把既有分析证据补写进 memory，不允许继续探索、
- * 运行终端、提交知识或写入普通 memory.save。
+ * record-only 阶段只能把既有分析证据补写进 memory，不允许继续探索、运行终端、提交知识或写入普通
+ * memory.save。是否处于 record-only 由 resolveRecordOnlyStageTrigger 单源判定（I06），与
+ * AgentRuntime 的 schema 广告面（note_finding + evidence）保持一致：广告面收窄的轮次，执行门同样收窄，
+ * 不再只依赖上游 provider 的工具名校验兜底。
  */
 export const recordRepairOnlyGate = {
   name: 'recordRepairOnlyGate',
   before(call: ToolCall, ctx: ToolExecContext): BeforeVerdict | undefined {
-    if (ctx.loopCtx.sharedState?._recordRepairOnly !== true) {
+    const trigger = resolveRecordOnlyStageTrigger(ctx.loopCtx);
+    if (!trigger) {
       return undefined;
     }
 
@@ -99,12 +120,10 @@ export const recordRepairOnlyGate = {
       return undefined;
     }
 
+    // 阻断原因（含触发谓词）由执行引擎统一写入 diagnostics.blockedTools。
     return {
       blocked: true,
-      result: {
-        error:
-          'Record repair is note_finding-only (plus read-only evidence.get/search). Use note_finding({ finding, evidenceRefs, importance }) to record verified findings; code/graph/terminal/knowledge and memory.save are disabled.',
-      },
+      result: { error: recordOnlyBlockedError(trigger) },
     };
   },
 };

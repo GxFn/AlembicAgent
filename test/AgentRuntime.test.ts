@@ -1432,3 +1432,193 @@ describe('runtime safety evaluation to host dispatch', () => {
     }
   });
 });
+
+describe('I06 record-only stage keeps its final round recordable', () => {
+  type CapturedLlmCall = { toolChoice: unknown; tools: string[]; messages: string };
+
+  // 复刻 PipelineStrategy#runRecordRepairStage 传给 runLoop 的选项：maxIterations=3、tracker=null、
+  // sharedState/context 同时带 recordRepairOnly、toolChoiceOverride='auto'、source=system。
+  function createRecordRepairRuntime() {
+    const calls: CapturedLlmCall[] = [];
+    const chatWithTools = vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+      const schemas = Array.isArray(opts.toolSchemas)
+        ? (opts.toolSchemas as Array<{ name: string }>)
+        : [];
+      calls.push({
+        toolChoice: opts.toolChoice,
+        tools: schemas.map((schema) => schema.name),
+        messages: JSON.stringify(opts.messages ?? []),
+      });
+      if (schemas.length === 0) {
+        // finalize 的强制摘要不带工具；只有它返回文本。
+        return {
+          text: 'repair summary',
+          functionCalls: [],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        };
+      }
+      return {
+        text: '',
+        functionCalls: [
+          {
+            id: `finding-${calls.length}`,
+            name: 'note_finding',
+            args: { finding: `finding-${calls.length}`, evidenceRefs: ['E-1'], importance: 8 },
+          },
+        ],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      };
+    });
+    const routed: Array<{ toolId: string; action: unknown }> = [];
+    const execute = vi.fn(async (request: { toolId: string; args?: Record<string, unknown> }) => {
+      routed.push({ toolId: request.toolId, action: request.args?.action });
+      return createToolEnvelope(request.toolId, 'recorded', {
+        importance: 8,
+        message: 'recorded',
+        recorded: true,
+        target: 'activeContext',
+      });
+    });
+    const catalog = new RuntimeCapabilityCatalog();
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: {
+        get: (name: string) => (name === 'capabilityCatalog' ? catalog : null),
+      } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    return { runtime, calls, routed };
+  }
+
+  it('does not force toolChoice none on the last record_repair round and records its note_finding', async () => {
+    const { runtime, calls, routed } = createRecordRepairRuntime();
+
+    const result = await runtime.reactLoop('repair missing findings', {
+      capabilityOverride: [],
+      additionalToolsOverride: ['memory', 'evidence'],
+      budgetOverride: { maxIterations: 3, maxTokens: 2048, temperature: 0.2, timeoutMs: 90_000 },
+      sharedState: { _recordRepairOnly: true, _recordRepairEvidencePaths: [] },
+      context: {
+        recordRepairOnly: true,
+        recordRepairEvidencePaths: [],
+        pipelinePhase: 'quality_gate_record_repair',
+      },
+      source: 'system',
+      tracker: null,
+      toolChoiceOverride: 'auto',
+    } as never);
+
+    const loopCalls = calls.slice(0, 3);
+    // 三个循环轮次全部保持 record-only 工具面与 auto；第 3 轮不再被强制成摘要轮。
+    expect(loopCalls.map((call) => call.toolChoice)).toEqual(['auto', 'auto', 'auto']);
+    expect(loopCalls.map((call) => call.tools)).toEqual([
+      ['note_finding', 'evidence'],
+      ['note_finding', 'evidence'],
+      ['note_finding', 'evidence'],
+    ]);
+    for (const call of loopCalls) {
+      expect(call.messages).not.toContain('已进入最后阶段');
+    }
+    // 第 3 轮的 note_finding 真正到达路由，没有被 tool_choice_violation 丢弃。
+    expect(routed.filter((entry) => entry.action === 'note_finding')).toHaveLength(3);
+    const warningCodes = (result.diagnostics?.warnings ?? []).map((warning) => warning.code);
+    expect(warningCodes).not.toContain('tool_choice_violation');
+    expect(loopCalls[2]?.messages).toContain('requestedToolChoice: auto');
+    // 只剩 finalize 的一次收尾摘要（无工具），不再有循环内 toolChoice=none 的强制摘要轮。
+    expect(calls.filter((call) => call.tools.length === 0)).toHaveLength(1);
+    expect(calls.at(-1)?.tools).toEqual([]);
+    expect(calls).toHaveLength(4);
+  });
+
+  it('logs the skipped force-summary round with the record-only trigger', async () => {
+    const { runtime } = createRecordRepairRuntime();
+    const info = vi.fn();
+    runtime.logger = { info, warn: vi.fn() };
+
+    await runtime.reactLoop('repair missing findings', {
+      capabilityOverride: [],
+      additionalToolsOverride: ['memory', 'evidence'],
+      budgetOverride: { maxIterations: 3, maxTokens: 2048, temperature: 0.2, timeoutMs: 90_000 },
+      sharedState: { _recordRepairOnly: true },
+      context: { recordRepairOnly: true, pipelinePhase: 'quality_gate_record_repair' },
+      source: 'system',
+      tracker: null,
+      toolChoiceOverride: 'auto',
+    } as never);
+
+    const skipLogs = info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('force-summary skipped'));
+    expect(skipLogs).toHaveLength(1);
+    expect(skipLogs[0]).toContain('trigger=sharedState._recordRepairOnly');
+    expect(skipLogs[0]).toContain('iter 3/3');
+    expect(skipLogs[0]).toContain('toolChoice=auto');
+  });
+
+  it('does not promise note_finding in a force-summary round whose toolChoice is none', async () => {
+    const calls: CapturedLlmCall[] = [];
+    const chatWithTools = vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+      const schemas = Array.isArray(opts.toolSchemas)
+        ? (opts.toolSchemas as Array<{ name: string }>)
+        : [];
+      calls.push({
+        toolChoice: opts.toolChoice,
+        tools: schemas.map((schema) => schema.name),
+        messages: JSON.stringify(opts.messages ?? []),
+      });
+      if (calls.length < 3) {
+        return {
+          text: '',
+          functionCalls: [
+            {
+              id: `recall-${calls.length}`,
+              name: 'memory',
+              args: { action: 'recall', params: {} },
+            },
+          ],
+          usage: { inputTokens: 1, outputTokens: 1 },
+        };
+      }
+      return {
+        text: 'final summary',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      };
+    });
+    const execute = vi.fn(async (request: { toolId: string }) =>
+      createToolEnvelope(request.toolId, 'recalled', { recalled: true })
+    );
+    const catalog = new RuntimeCapabilityCatalog();
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: {
+        get: (name: string) => (name === 'capabilityCatalog' ? catalog : null),
+      } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+
+    await runtime.reactLoop('analyze without tracker', {
+      capabilityOverride: [],
+      additionalToolsOverride: ['memory'],
+      budgetOverride: { maxIterations: 3, timeoutMs: 1000 },
+      context: { pipelinePhase: 'analyze' },
+      source: 'system',
+      tracker: null,
+    } as never);
+
+    // 非 record-only 的无 tracker 循环保持原有强制摘要：第 3 轮请求 toolChoice=none，
+    // Gateway 契约下 none 轮不发送任何 schema（provider 也收不到 toolChoice）。
+    expect(calls[2]?.tools).toEqual([]);
+    expect(calls[2]?.messages).toContain('requestedToolChoice: none');
+    expect(calls[2]?.messages).toContain('已进入最后阶段');
+    // none 轮的工具调用会被丢弃，提示不能再要求“只允许使用 note_finding”。
+    expect(calls[2]?.messages).not.toContain('只允许使用 note_finding');
+    expect(calls[2]?.messages).not.toContain('note_finding({ finding');
+  });
+});
