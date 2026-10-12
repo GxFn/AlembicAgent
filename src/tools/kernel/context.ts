@@ -102,10 +102,16 @@ export interface ToolDiagnosticsRecorder {
  * 证据台账只读端口（Wave A E3/E4）——结构化 LIKE 型，避免 kernel→agent 反向依赖
  * （同 MemoryCoordinatorLike 先例）。note_finding 录入校验、近似候选提示与
  * evidence.get/search 只读取回共用。
+ *
+ * 条目上的可选 `tool` 是采集来源的证据工具 id（如 'code.search'、'terminal.exec'），
+ * EvidenceLedgerStore 条目本就携带。提交侧展开只对 code.search 条目把内容里的 `NN:`
+ * 前缀当作文件行号；不提供 tool 的实现一律按「来源未知」保守处理（只给裸文件标签）。
+ * listRecent/searchByFile 按采集序（旧→新）返回，调用方据此取最新条目。
  */
 export interface EvidenceLedgerLike {
   get(ref: string): {
     id: string;
+    tool?: string;
     file?: string;
     range?: { start: number; end: number };
     content: string;
@@ -115,14 +121,15 @@ export interface EvidenceLedgerLike {
     limit?: number
   ): Array<{
     id: string;
+    tool?: string;
     file?: string;
     range?: { start: number; end: number };
     content: string;
   }>;
   listRecent(
     limit?: number
-  ): Array<{ id: string; file?: string; range?: { start: number; end: number } }>;
-  /** 按文件路径片段检索（refs 机械自推断用）；可选——旧实现缺席时推断静默跳过 */
+  ): Array<{ id: string; tool?: string; file?: string; range?: { start: number; end: number } }>;
+  /** 按文件路径片段（子串）检索（refs 机械自推断用）；可选——旧实现缺席时推断静默跳过 */
   searchByFile?(
     fragment: string,
     limit?: number

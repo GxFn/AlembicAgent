@@ -48,6 +48,51 @@ function uniqueMerge(base: unknown, extra: string[]): string[] {
   return out;
 }
 
+/** 唯一会把内容 `NN:` 前缀当作文件行号的采集来源（EvidenceCapture 按文件分组的命中行）。 */
+const LINE_PREFIXED_SEARCH_TOOL = 'code.search';
+
+/**
+ * file-有-range-无 条目的 source 标签（I34）。
+ *
+ * - code.search 分组条目（M2/P1b）：content 每行 "NN: text" 是采集真值——机械派生首 K=2 个
+ *   命中行为 file:NN-NN 标签，search 证据升为一等公民（可直接过 LINE 门）；没有行号前缀时
+ *   退回裸文件标签。
+ * - 其余 file-only 条目（terminal.exec 输出归属到命令里的仓内路径、code.read 的
+ *   outline/delta/unchanged 降级视图）以及不提供 tool 的台账实现：内容里的 `NN:` 不是
+ *   文件行号（例如 `cat openapi.yaml` 的 `404:` 数字键），派生会伪造 file:404-404，
+ *   导致 SOURCE_REF_LINE_OUT_OF_RANGE 误拒或持久化错误行号——只给裸文件标签交下游门禁裁决。
+ *   代价：`grep -n` 单文件终端输出也不再自动得到行号标签（与 producer 提示词
+ *   「search/terminal 类条目需手填 file:line」一致）。
+ */
+function fileOnlyEntryLabels(
+  entry: { id: string; tool?: string; content: string },
+  file: string
+): string[] {
+  if (entry.tool !== LINE_PREFIXED_SEARCH_TOOL) {
+    Logger.getInstance().debug(
+      `[knowledge.submit] evidence ref ${entry.id} (tool=${entry.tool ?? 'unknown'}) is file-only without range; line labels are derived only from ${LINE_PREFIXED_SEARCH_TOOL} entries — expanded as bare file label ${file}`
+    );
+    return [file];
+  }
+  const hitLines: string[] = [];
+  for (const line of entry.content.split('\n')) {
+    const hit = /^(\d+):/.exec(line.trim());
+    if (hit) {
+      hitLines.push(`${file}:${hit[1]}-${hit[1]}`);
+      if (hitLines.length >= 2) {
+        break;
+      }
+    }
+  }
+  if (hitLines.length === 0) {
+    Logger.getInstance().debug(
+      `[knowledge.submit] evidence ref ${entry.id} (tool=${LINE_PREFIXED_SEARCH_TOOL}) has no "NN:" hit-line prefix — expanded as bare file label ${file}`
+    );
+    return [file];
+  }
+  return hitLines;
+}
+
 export function expandEvidenceRefsForSubmit(
   item: Record<string, unknown>,
   options: { ledger: EvidenceLedgerLike | null | undefined; projectRoot: string }
@@ -109,24 +154,7 @@ export function expandEvidenceRefsForSubmit(
       }
       labels.push(`${entry.file}:${entry.range.start}-${entry.range.end}`);
     } else if (entry.file) {
-      // M2/P1b：file-有-range-无（per-file search 条目，content 每行 "NN: text" 是采集真值）——
-      // 机械派生首 K=2 个命中行为 file:NN-NN 标签，search 证据升为一等公民（可直接过 LINE 门）。
-      // 无行号前缀的 file-only 条目保持旧行为（裸文件标签，交下游门禁裁决）。
-      const hitLines: string[] = [];
-      for (const line of entry.content.split('\n')) {
-        const hit = /^(\d+):/.exec(line.trim());
-        if (hit) {
-          hitLines.push(`${entry.file}:${hit[1]}-${hit[1]}`);
-          if (hitLines.length >= 2) {
-            break;
-          }
-        }
-      }
-      if (hitLines.length > 0) {
-        labels.push(...hitLines);
-      } else {
-        labels.push(entry.file);
-      }
+      labels.push(...fileOnlyEntryLabels(entry, entry.file));
     }
     // 无 file 条目（graph/terminal）：合法引用但不产出 source 标签——门禁的证据下限由带文件条目满足
   }
@@ -148,8 +176,23 @@ export function expandEvidenceRefsForSubmit(
 export interface SubmissionSanitizeResult {
   item: Record<string, unknown>;
   corrected: string[];
+  /** 真实从候选里移除的坏引用（同列表还有可解析引用时才会丢）；去重。 */
   dropped: string[];
+  /**
+   * 全丢回退时原样保留、交门禁裁决的无法解析引用（I33）。它们没有被移除，
+   * 不能计入 dropped / evidence_sanitized；去重（sources 与 sourceRefs 同一路径只记一次）。
+   */
+  retainedUnresolved: string[];
   scopedNarrow: boolean;
+}
+
+/** 按首次出现顺序并入，已存在的值跳过——同一来源常同时出现在 sources 与 sourceRefs。 */
+function appendUnique(target: string[], values: readonly string[]): void {
+  for (const value of values) {
+    if (!target.includes(value)) {
+      target.push(value);
+    }
+  }
 }
 
 function ledgerDistinctFiles(ledger: EvidenceLedgerLike): string[] {
@@ -174,7 +217,8 @@ function basenameOf(filePath: string): string {
  * scope 收窄。E6 真机显示残余拒因全是「模型自由度」失误，非证据缺失：
  * - 路径自动矫正：手写 source 的文件在 projectRoot 解析失败时，用台账 distinct 文件做
  *   basename 唯一匹配改写（多仓前缀陷阱的机械解——台账路径就是采集时的真实形态）；
- *   无法唯一匹配的坏引用在「仍有其它可解析引用」时丢弃（否则保留，交门禁给权威拒绝）。
+ *   无法唯一匹配的坏引用在「仍有其它可解析引用」时丢弃（记 dropped）；否则整列表保留，
+ *   交门禁给权威拒绝（记 retainedUnresolved，不算丢弃）。
  * - scope 收窄：rule/pattern 且 distinct 引用文件 <3 且未声明 narrow 时自动 scope='narrow'
  *   ——作用域由证据广度推导，比模型断言的全项目范围更诚实；门禁语义不动
  *   （narrow 本就是 EVIDENCE_FLOOR 的合法通道，gateRules requiresMultiFileEvidence 读 item.scope）。
@@ -185,7 +229,7 @@ export function sanitizeSubmissionEvidence(
 ): SubmissionSanitizeResult {
   const ledger = options.ledger;
   if (!ledger) {
-    return { item, corrected: [], dropped: [], scopedNarrow: false };
+    return { item, corrected: [], dropped: [], retainedUnresolved: [], scopedNarrow: false };
   }
   const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
   const files = ledgerDistinctFiles(ledger);
@@ -197,11 +241,14 @@ export function sanitizeSubmissionEvidence(
 
   const corrected: string[] = [];
   const dropped: string[] = [];
+  const retainedUnresolved: string[] = [];
   const sanitizeList = (raw: unknown): string[] => {
     const list = Array.isArray(raw)
       ? raw.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
       : [];
     const kept: string[] = [];
+    // 本列表的待丢弃项先记局部：是否真的丢取决于列表里是否还有可解析引用（见下方回退）。
+    const droppedHere: string[] = [];
     for (const source of list) {
       const match = /^(.*?)(:\d+(?:-\d+)?)?$/.exec(source.trim());
       const filePart = match?.[1] ?? source;
@@ -219,11 +266,18 @@ export function sanitizeSubmissionEvidence(
           corrected.push(`${source}→${candidates[0]}${rangePart}`);
         }
       } else {
-        dropped.push(source);
+        droppedHere.push(source);
       }
     }
-    // 全部被丢时保留原列表——不能让净化把候选清成零证据（门禁的拒绝信息更权威）
-    return kept.length > 0 ? kept : list;
+    if (kept.length > 0) {
+      appendUnique(dropped, droppedHere);
+      return kept;
+    }
+    // 全部无法解析时保留原列表——不能让净化把候选清成零证据（门禁的拒绝信息更权威）。
+    // 这些引用一条都没被移除，只记 retainedUnresolved（I33）：计入 dropped 会让日志与
+    // evidence_sanitized 统计把「原样交门禁」误报成「净化丢弃了证据」。
+    appendUnique(retainedUnresolved, droppedHere);
+    return list;
   };
 
   // 行号机械回填（run-7 M2）：无标签引用（search 类）放行后，手写 source 常缺 :line 触发
@@ -286,6 +340,7 @@ export function sanitizeSubmissionEvidence(
   return {
     corrected,
     dropped,
+    retainedUnresolved,
     scopedNarrow: needsNarrow,
     item: {
       ...item,
@@ -596,13 +651,23 @@ export async function repairStyleViolations(
  * 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：refs 缺席但手写 sources 命中台账
  * 同文件条目时，机械回填 evidenceRefs——模型引用了真实采集过的文件却忘（或不会）抄 E-id，
  * 此前直接 EVIDENCE_REFS_REQUIRED 硬拒烧一回合再自救。推断只映射到真实条目
- * （exact file 匹配，每文件取首条，上限 5），事实面零发明；回填后仍走展开+新鲜度全链。
+ * （exact file 匹配，每文件一条，上限 5），事实面零发明；回填后仍走展开+新鲜度全链。
+ *
+ * 条目选择（I33）：searchByFile 是子串匹配，前几条可能全被 app.tsx、其它前缀的同名文件占满，
+ * 所以取全量命中后先精确过滤；同文件多条时优先最新的带区间条目（可做新鲜度终检、展开为
+ * 真实引用区间——run 中途文件变更后重读的新条目也由此胜出），没有带区间条目才取最新的
+ * file-only 条目。
  */
 export function inferEvidenceRefsFromSources(
   item: Record<string, unknown>,
   ledger: EvidenceLedgerLike | null | undefined
 ): string[] {
   if (!ledger?.searchByFile) {
+    return [];
+  }
+  // 扫描上限取台账全量条目数：小上限会让子串干扰项挤掉精确条目（I33）。
+  const scanLimit = ledger.stats().entries;
+  if (scanLimit === 0) {
     return [];
   }
   const reasoning = (item.reasoning ?? {}) as Record<string, unknown>;
@@ -618,12 +683,27 @@ export function inferEvidenceRefsFromSources(
       continue;
     }
     seenFiles.add(filePart);
-    const hit = ledger.searchByFile(filePart, 5).find((entry) => entry.file === filePart);
-    if (hit) {
-      inferred.push(hit.id);
-      if (inferred.length >= 5) {
-        break;
-      }
+    // searchByFile 按采集序（旧→新）返回，findLast 即「最新」。
+    const substringHits = ledger.searchByFile(filePart, scanLimit);
+    const exact = substringHits.filter((entry) => entry.file === filePart);
+    const latestRanged = exact.findLast((entry) => entry.range !== undefined);
+    const chosen = latestRanged ?? exact[exact.length - 1];
+    if (!chosen) {
+      // 跳过留痕：该手写来源没有同路径台账条目（子串命中不算——推断只映射精确文件）。
+      Logger.getInstance().debug(
+        `[knowledge.submit] evidenceRefs inference skipped ${filePart}: no exact-file ledger entry (${substringHits.length} substring hits ignored)`
+      );
+      continue;
+    }
+    if (exact.length > 1 || !latestRanged) {
+      // 有取舍才留痕：多条同文件条目里选了哪条、是否退到 file-only 条目。
+      Logger.getInstance().debug(
+        `[knowledge.submit] evidenceRefs inference for ${filePart}: picked ${chosen.id} (${latestRanged ? 'newest ranged entry' : 'newest file-only entry, no ranged entry captured'}) among ${exact.length} exact-file entries`
+      );
+    }
+    inferred.push(chosen.id);
+    if (inferred.length >= 5) {
+      break;
     }
   }
   return inferred;
@@ -641,31 +721,41 @@ export function buildEvidenceCandidatesHint(ledger: EvidenceLedgerLike | null | 
   if (stats.distinctFiles === 0) {
     return '';
   }
-  // 优先展示带文件区间的条目（可直接照抄 id 且能机械展开出 sources）；无区间条目只作文件名兜底。
+  // I33：listRecent 按采集序（旧→新）返回尾部，倒序后从新到旧扫描——同一文件常先被
+  // code.search（file-only）再被 code.read（带区间）采集，先到先得会让旧的无区间条目占位。
+  const recent = [...ledger.listRecent(50)].reverse();
+  // 第一遍：每个文件取最新的带区间条目（可直接照抄 id 且能机械展开出 sources），最多 5 个文件。
   const ranged: string[] = [];
-  const files: string[] = [];
-  const seen = new Set<string>();
-  for (const candidate of ledger.listRecent(50)) {
-    if (!candidate.file || seen.has(candidate.file)) {
-      continue;
-    }
-    seen.add(candidate.file);
-    if (candidate.range && ranged.length < 5) {
-      ranged.push(
-        `${candidate.id}=${candidate.file}:${candidate.range.start}-${candidate.range.end}`
-      );
-    } else if (files.length < 5) {
-      files.push(candidate.file);
-    }
+  const shownFiles = new Set<string>();
+  for (const candidate of recent) {
     if (ranged.length >= 5) {
       break;
     }
+    if (!candidate.file || !candidate.range || shownFiles.has(candidate.file)) {
+      continue;
+    }
+    shownFiles.add(candidate.file);
+    ranged.push(
+      `${candidate.id}=${candidate.file}:${candidate.range.start}-${candidate.range.end}`
+    );
+  }
+  // 第二遍：其余文件（没有带区间条目，或带区间条目超出展示上限）只补裸文件名兜底，同样新→旧，最多 5 个。
+  const files: string[] = [];
+  for (const candidate of recent) {
+    if (files.length >= 5) {
+      break;
+    }
+    if (!candidate.file || shownFiles.has(candidate.file)) {
+      continue;
+    }
+    shownFiles.add(candidate.file);
+    files.push(candidate.file);
   }
   if (ranged.length === 0 && files.length === 0) {
     return '';
   }
-  const rangedPart = ranged.length > 0 ? ` 可直接引用的带区间条目: ${ranged.join('; ')}。` : '';
-  const filesPart =
-    files.length > 0 ? ` 其余可引用文件(共 ${stats.distinctFiles} 个): ${files.join(', ')}。` : '';
-  return ` 📎${rangedPart}${filesPart} 用 memory.recall 查看 findings 携带的 [E-x] 或 evidence.search 查条目 id，以 reasoning.evidenceRefs 引用（优先带文件区间的条目；引用 id 最稳，不要凭记忆手写路径）。`;
+  const rangedPart =
+    ranged.length > 0 ? ` 可直接引用的带区间条目(最新优先): ${ranged.join('; ')}。` : '';
+  const filesPart = files.length > 0 ? ` 其它可引用文件: ${files.join(', ')}。` : '';
+  return ` 📎 台账共 ${stats.distinctFiles} 个可引用文件。${rangedPart}${filesPart} 用 memory.recall 查看 findings 携带的 [E-x] 或 evidence.search 查条目 id，以 reasoning.evidenceRefs 引用（优先带文件区间的条目；引用 id 最稳，不要凭记忆手写路径）。`;
 }

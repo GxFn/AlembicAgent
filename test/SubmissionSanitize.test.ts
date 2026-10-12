@@ -7,9 +7,13 @@ import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import type { EvidenceLedgerLike } from '../src/tools/kernel/context.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import {
+  buildEvidenceCandidatesHint,
   buildViolationRepairTemplates,
+  expandEvidenceRefsForSubmit,
+  inferEvidenceRefsFromSources,
   repairStyleViolations,
   sanitizeSubmissionEvidence,
 } from '../src/tools/runtime/handlers/submitEvidenceExpansion.js';
@@ -82,6 +86,8 @@ describe('sanitizeSubmissionEvidence（E7）', () => {
       'AlembicAgent/src/index.ts:1',
     ]);
     expect(withGood.dropped).toEqual(['Never/Existed/agent.ts:1-7']);
+    // 真实丢弃不进 retainedUnresolved
+    expect(withGood.retainedUnresolved).toEqual([]);
 
     const allBad = sanitizeSubmissionEvidence(
       {
@@ -94,6 +100,25 @@ describe('sanitizeSubmissionEvidence（E7）', () => {
     expect((allBad.item.reasoning as { sources: string[] }).sources).toEqual([
       'Never/Existed/zzz.ts:1',
     ]);
+  });
+
+  test('I33 全丢回退：原列表原样交门禁，dropped 为空、retainedUnresolved 记录且同路径不重复', () => {
+    const { projectRoot, ledger } = makeWorkspace();
+    const allBad = sanitizeSubmissionEvidence(
+      {
+        kind: 'fact',
+        sourceRefs: ['Never/Existed/zzz.ts:1'],
+        reasoning: { sources: ['Never/Existed/zzz.ts:1'] },
+      },
+      { ledger, projectRoot }
+    );
+    expect((allBad.item.reasoning as { sources: string[] }).sources).toEqual([
+      'Never/Existed/zzz.ts:1',
+    ]);
+    expect(allBad.item.sourceRefs).toEqual(['Never/Existed/zzz.ts:1']);
+    // 一条都没丢——不能记成 dropped（日志与 evidence_sanitized 统计据此判定）
+    expect(allBad.dropped).toEqual([]);
+    expect(allBad.retainedUnresolved).toEqual(['Never/Existed/zzz.ts:1']);
   });
 
   test('证据驱动 scope 收窄：rule 证据 <3 文件自动 narrow；已声明/fact/≥3 不动', () => {
@@ -710,6 +735,27 @@ describe('M2 采集形态（search 一等公民 + terminal 归属）', () => {
     );
     expect(entries).toHaveLength(1);
     expect(entries[0].file).toBe('config/layer-contract.json');
+    // I34：terminal 输出里的数字键（YAML/JSON 的 "404:"）不是源文件行号——
+    // 归属到文件的 terminal 条目展开时只产出裸文件标签，不再伪造 file:404-404。
+    const yaml = captureEvidenceFromEnvelope(
+      ledger,
+      {
+        id: 'c-t-yaml',
+        name: 'terminal',
+        args: { action: 'exec', command: 'cat config/http-status.yaml' },
+      } as never,
+      { ok: true, text: 'statuses:\n  200: OK\n  404: Not Found' } as never
+    );
+    expect(yaml).toHaveLength(1);
+    expect(yaml[0].file).toBe('config/http-status.yaml');
+    const expanded = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { evidenceRefs: [yaml[0].id] } },
+      { ledger, projectRoot: '/no-fs-touch' }
+    );
+    expect(expanded.ok).toBe(true);
+    if (expanded.ok) {
+      expect(expanded.expandedSources).toEqual(['config/http-status.yaml']);
+    }
     // 绝对路径/URL 不归属
     const none = captureEvidenceFromEnvelope(
       ledger,
@@ -721,5 +767,281 @@ describe('M2 采集形态（search 一等公民 + terminal 归属）', () => {
       { ok: true, text: 'ok' } as never
     );
     expect(none[0]?.file).toBeUndefined();
+  });
+});
+
+function makeP19Ledger(prefix: string): EvidenceLedgerStore {
+  return new EvidenceLedgerStore({
+    dataRoot: createTempProject(prefix),
+    jobId: 'j-p19',
+    sessionId: 's-p19',
+    dimensionId: 'ts-js-module',
+  });
+}
+
+describe('L4-P19 I33：候选提示与引用推断的台账条目选择', () => {
+  test('候选提示：先 search 后 read 同一文件时展示带区间的 read 条目 E-x=file:start-end', () => {
+    const ledger = makeP19Ledger('p19-hint-');
+    ledger.append({
+      tool: 'code.search',
+      callId: 's1',
+      file: 'lib/a.ts',
+      content: '3: const x = 1;',
+    });
+    ledger.append({
+      tool: 'code.read',
+      callId: 'r1',
+      file: 'lib/a.ts',
+      range: { start: 3, end: 4 },
+      content: 'const x = 1;\nconst y = 2;',
+    });
+    const hint = buildEvidenceCandidatesHint(ledger);
+    expect(hint).toContain('E-2=lib/a.ts:3-4');
+    expect(hint).toContain('台账共 1 个可引用文件');
+    // 已有带区间条目的文件不再作为裸文件名重复出现
+    expect(hint).not.toContain('其它可引用文件');
+    expect(hint).toContain('reasoning.evidenceRefs');
+  });
+
+  test('候选提示：超过 5 个带区间文件时展示最新 5 个，其余文件只补裸文件名', () => {
+    const ledger = makeP19Ledger('p19-hint-many-');
+    for (let i = 0; i < 8; i += 1) {
+      ledger.append({
+        tool: 'code.read',
+        callId: `r${i}`,
+        file: `lib/f${i}.ts`,
+        range: { start: 1, end: 2 },
+        content: 'a\nb',
+      });
+    }
+    const hint = buildEvidenceCandidatesHint(ledger);
+    for (let i = 3; i < 8; i += 1) {
+      expect(hint).toContain(`E-${i + 1}=lib/f${i}.ts:1-2`);
+    }
+    for (let i = 0; i < 3; i += 1) {
+      expect(hint).not.toContain(`E-${i + 1}=lib/f${i}.ts`);
+      expect(hint).toContain(`lib/f${i}.ts`);
+    }
+    expect(hint).toContain('台账共 8 个可引用文件');
+    // 最新优先：f7 排在 f3 之前
+    expect(hint.indexOf('lib/f7.ts')).toBeLessThan(hint.indexOf('lib/f3.ts'));
+  });
+
+  test('引用推断：台账先有 5 条子串命中时仍推断出精确的 src/app.ts', () => {
+    const ledger = makeP19Ledger('p19-infer-');
+    for (const file of [
+      'src/app.tsx',
+      'packages/web/src/app.ts',
+      'apps/admin/src/app.ts',
+      'legacy/src/app.tsx',
+      'src/app.ts.orig',
+    ]) {
+      ledger.append({
+        tool: 'code.read',
+        callId: file,
+        file,
+        range: { start: 1, end: 1 },
+        content: 'x',
+      });
+    }
+    ledger.append({
+      tool: 'code.read',
+      callId: 'exact',
+      file: 'src/app.ts',
+      range: { start: 1, end: 2 },
+      content: 'a\nb',
+    });
+    expect(
+      inferEvidenceRefsFromSources({ reasoning: { sources: ['src/app.ts:1-2'] } }, ledger)
+    ).toEqual(['E-6']);
+  });
+
+  test('引用推断：同文件多条目优先最新带区间条目，其次最新 file-only 条目', () => {
+    const ledger = makeP19Ledger('p19-infer-latest-');
+    ledger.append({ tool: 'code.search', callId: 's1', file: 'lib/a.ts', content: '3: x' }); // E-1
+    ledger.append({
+      tool: 'code.read',
+      callId: 'r1',
+      file: 'lib/a.ts',
+      range: { start: 1, end: 3 },
+      content: 'a\nb\nc',
+    }); // E-2
+    ledger.append({
+      tool: 'code.read',
+      callId: 'r2',
+      file: 'lib/a.ts',
+      range: { start: 5, end: 6 },
+      content: 'e\nf',
+    }); // E-3：最新带区间条目
+    ledger.append({ tool: 'code.search', callId: 's2', file: 'lib/a.ts', content: '9: y' }); // E-4：更新但无区间
+    ledger.append({ tool: 'code.search', callId: 's3', file: 'lib/b.ts', content: '1: p' }); // E-5
+    ledger.append({ tool: 'code.search', callId: 's4', file: 'lib/b.ts', content: '2: q' }); // E-6：最新 file-only
+    expect(
+      inferEvidenceRefsFromSources(
+        { reasoning: { sources: ['lib/a.ts:5-6', 'lib/b.ts', 'lib/a.ts:1-3'] } },
+        ledger
+      )
+    ).toEqual(['E-3', 'E-6']);
+  });
+
+  test('引用推断：每文件一条、总数上限 5', () => {
+    const ledger = makeP19Ledger('p19-infer-cap-');
+    const sources: string[] = [];
+    for (let i = 0; i < 7; i += 1) {
+      ledger.append({
+        tool: 'code.read',
+        callId: `r${i}`,
+        file: `lib/g${i}.ts`,
+        range: { start: 1, end: 1 },
+        content: 'x',
+      });
+      sources.push(`lib/g${i}.ts:1-1`);
+    }
+    expect(inferEvidenceRefsFromSources({ reasoning: { sources } }, ledger)).toEqual([
+      'E-1',
+      'E-2',
+      'E-3',
+      'E-4',
+      'E-5',
+    ]);
+  });
+});
+
+describe('L4-P19 I33：全丢回退在 authoring 单独留痕，不计 evidence_sanitized', () => {
+  test('引用有效但手写 sources 全部无法解析：日志写 retainedUnresolved，不写 dropped，不计数', async () => {
+    const { handle: handleKnowledge } = await import('../src/tools/runtime/handlers/knowledge.js');
+    const projectRoot = createTempProject('p19-auth-');
+    const ledger = makeP19Ledger('p19-auth-data-');
+    // 无 file 的 terminal 条目：引用可解析（resolvedRefs=1）但展不出 source 标签
+    ledger.append({ tool: 'terminal.exec', callId: 't1', content: 'npm ls output' });
+    const sharedState: Record<string, unknown> = {};
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      const ctx = {
+        recipeGateway: {
+          createOrStage: async () => {
+            throw new Error('gateway must not be reached in this fixture');
+          },
+        },
+        projectRoot,
+        runtime: { evidenceLedger: ledger, sharedState },
+        sessionStore: null,
+      } as unknown as Parameters<typeof handleKnowledge>[2];
+      await handleKnowledge(
+        'submit',
+        {
+          title: '终端输出证据候选',
+          description: '模块使用 import type 声明类型级导入，编译后擦除。',
+          content: {
+            markdown: '## 类型导入隔离\n\n模块统一使用 import type 声明类型级导入。',
+            rationale: '类型与运行时依赖解耦。',
+          },
+          kind: 'fact',
+          trigger: 'typescript type import',
+          whenClause: '当模块只消费类型不消费运行时值时',
+          doClause: 'Use import type for type-only imports',
+          dontClause: 'Do not use a value import for type-only usage',
+          reasoning: {
+            whyStandard: 'w',
+            sources: ['Never/Existed/zzz.ts:1'],
+            confidence: 0.9,
+            evidenceRefs: ['E-1'],
+          },
+        },
+        ctx
+      );
+      const messages = [...info.mock.calls, ...warn.mock.calls].map(([message]) => String(message));
+      expect(
+        messages.some(
+          (message) =>
+            message.includes('retainedUnresolved=[Never/Existed/zzz.ts:1]') &&
+            message.includes('终端输出证据候选')
+        )
+      ).toBe(true);
+      expect(messages.some((message) => message.includes('evidence sanitized for'))).toBe(false);
+      const counters = sharedState._sessionCounters as
+        | { submitRepairStats?: Record<string, number> }
+        | undefined;
+      expect(counters?.submitRepairStats?.evidence_sanitized).toBeUndefined();
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('L4-P19 I34：file-only 条目只有 code.search 派生命中行标签', () => {
+  test('terminal.exec 条目内容含 "404:" 时只产出裸文件标签，并留 debug 诊断', () => {
+    const ledger = makeP19Ledger('p19-term-');
+    ledger.append({
+      tool: 'terminal.exec',
+      callId: 't1',
+      file: 'src/http/statusText.ts',
+      content: "export const statusText = {\n  200: 'OK',\n  404: 'Not Found',\n};",
+    });
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      const out = expandEvidenceRefsForSubmit(
+        { title: 't', reasoning: { evidenceRefs: ['E-1'] } },
+        { ledger, projectRoot: '/no-fs-touch' }
+      );
+      expect(out.ok).toBe(true);
+      if (out.ok) {
+        expect(out.expandedSources).toEqual(['src/http/statusText.ts']);
+        expect(out.resolvedRefs).toBe(1);
+      }
+      expect(
+        debug.mock.calls.some(([message]) => {
+          const text = String(message);
+          return (
+            text.includes('E-1') &&
+            text.includes('terminal.exec') &&
+            text.includes('bare file label')
+          );
+        })
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('code.read 降级视图（file-only）同样不按 "NN:" 派生行号', () => {
+    const ledger = makeP19Ledger('p19-read-view-');
+    ledger.append({
+      tool: 'code.read',
+      callId: 'r1',
+      file: 'lib/a.ts',
+      content: '12: function a() {}\n40: function b() {}',
+    });
+    const out = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { evidenceRefs: ['E-1'] } },
+      { ledger, projectRoot: '/no-fs-touch' }
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.expandedSources).toEqual(['lib/a.ts']);
+    }
+  });
+
+  test('台账实现不提供 tool 字段时保守退化为裸文件标签', () => {
+    const entry = { id: 'E-1', file: 'lib/a.ts', content: '3: export const a = 1;' };
+    const ledger: EvidenceLedgerLike = {
+      get: (ref) => (ref === 'E-1' ? entry : null),
+      search: () => [entry],
+      listRecent: () => [entry],
+      stats: () => ({ entries: 1, distinctFiles: 1 }),
+      checkFreshness: () => 'unknown',
+    };
+    const out = expandEvidenceRefsForSubmit(
+      { title: 't', reasoning: { evidenceRefs: ['E-1'] } },
+      { ledger, projectRoot: '/no-fs-touch' }
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      expect(out.expandedSources).toEqual(['lib/a.ts']);
+    }
   });
 });

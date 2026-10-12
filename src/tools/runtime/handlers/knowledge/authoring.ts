@@ -222,6 +222,13 @@ export async function prepareSubmission(
       `[knowledge.submit] evidence sanitized for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): corrected=[${sanitized.corrected.join(', ')}] dropped=[${sanitized.dropped.join(', ')}] scopedNarrow=${sanitized.scopedNarrow}`
     );
   }
+  if (sanitized.retainedUnresolved.length > 0) {
+    // I33：全丢回退——这些手写引用既不在 projectRoot 也无法用台账唯一矫正，但净化没有移除它们
+    // （避免清成零证据），原样交门禁给权威裁决。单独留痕，不计 evidence_sanitized（不是修复命中）。
+    Logger.getInstance().info(
+      `[knowledge.submit] evidence sanitize fallback for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): no cited source resolvable on disk or via ledger, kept unchanged for the gate: retainedUnresolved=[${sanitized.retainedUnresolved.join(', ')}]`
+    );
+  }
 
   let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
     sanitized.item,
