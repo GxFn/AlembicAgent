@@ -612,6 +612,9 @@ export class AgentRuntime {
 
         // 分支: 有 Tool Call
         if ((llmResult.functionCalls?.length ?? 0) > 0) {
+          // I38：工具轮是非阻断轮（grounding gate 只评估文本轮），清零连续 grounding 阻断计数，
+          // 让之后的无证据文本轮重新获得完整阻断额度。
+          ctx.consecutiveGroundingBlocks = 0;
           const exitAfterTools = await this.#processToolCalls(ctx, llmResult, closeRound);
           this.#hookSystem.emitSync('agent:iteration:after', {
             iteration: ctx.iteration,
@@ -1843,8 +1846,10 @@ export class AgentRuntime {
       const groundingGate =
         ctx.groundingEnforcement === 'guard'
           ? evaluateAnalyzeTextGroundingGate(ctx, this.#modelRef)
-          : { block: false, nudge: '', reason: '' };
-      if (groundingGate.block) {
+          : null;
+      if (groundingGate?.block) {
+        // I38：只有真正阻断（nudge + rollbackTick）才累加连续阻断计数；gate 据此在达到上限后放行。
+        ctx.consecutiveGroundingBlocks++;
         messages.appendAssistantText(
           llmResult.text || '',
           llmResult.reasoningContent,
@@ -1858,7 +1863,7 @@ export class AgentRuntime {
           stage: ctx.context?.pipelinePhase as string | undefined,
         });
         this.logger.warn(
-          `[AgentRuntime] invalid-no-evidence analyze burn blocked: ${groundingGate.reason}`
+          `[AgentRuntime] invalid-no-evidence analyze burn blocked (${ctx.consecutiveGroundingBlocks}/${groundingGate.blockLimit}): ${groundingGate.reason}`
         );
         this.#emitProcessProgress(
           buildSemanticNudgeProcessEvent(
@@ -1872,6 +1877,26 @@ export class AgentRuntime {
         );
         closeRound();
         return false;
+      }
+      if (groundingGate?.limitReached) {
+        // I38 降级放行：本轮仍是 invalid-no-evidence，但同一连续段内已阻断到上限。继续阻断只会反复
+        // rollbackTick、让 tracker 轮次停在原地（循环只能靠超时 / token 预算 / abort 结束），因此不再
+        // nudge / rollback，记诊断后按普通文本轮走下面的 endRound/onTextResponse。
+        // 计数不清零：同一连续段内后续的无证据文本轮继续放行，直到出现非阻断轮才重新开放阻断额度。
+        const limitDetail =
+          `consecutiveBlocks=${groundingGate.consecutiveBlocks} limit=${groundingGate.blockLimit} ` +
+          `phase=${tracker.phase} iteration=${ctx.iteration} modelRef=${this.#modelRef}`;
+        ctx.diagnostics?.warn({
+          code: 'grounding_block_limit_reached',
+          message: `Analyze grounding guard released an invalid-no-evidence text burn after reaching the consecutive block limit (${limitDetail}).`,
+          stage: ctx.context?.pipelinePhase as string | undefined,
+        });
+        this.logger.warn(
+          `[AgentRuntime] grounding block limit reached — releasing invalid-no-evidence analyze burn as a normal text round (${limitDetail})`
+        );
+      } else {
+        // 非阻断轮（gate 未判 invalid-no-evidence、guard 不适格或 enforcement=off）：清零连续阻断计数。
+        ctx.consecutiveGroundingBlocks = 0;
       }
       // 文本轮次也需要更新 tracker 指标 — 否则 roundsSinceNewInfo / consecutiveIdleRounds
       // 不递增，metrics 驱动的阶段转换永远不触发（根因: 工具路径 endRound 被调用但文本路径被跳过）

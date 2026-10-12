@@ -5,7 +5,7 @@
  *   - 注入依赖 (messages, tracker, trace, memoryCoordinator, sharedState；sharedState 会被工具管线
  *     用 ??= 惰性创建并写入)
  *   - 循环状态 (iteration, lastReply, toolCalls, tokenUsage；toolCalls/tokenUsage 是本次 loop 的累计值)
- *   - 错误恢复 (consecutiveAiErrors, consecutiveEmptyResponses)
+ *   - 错误恢复 (consecutiveAiErrors, consecutiveEmptyResponses, consecutiveGroundingBlocks)
  *   - 构造期配置 (source, budget, capabilities, baseSystemPrompt, toolSchemas, prompt 等)
  *   - 构造后由 AgentRuntime.#initLoop 挂接的控制器 (exitController, budgetController)
  *
@@ -154,6 +154,15 @@ export class LoopContext {
 
   /** 连续空响应计数 */
   consecutiveEmptyResponses = 0;
+
+  /**
+   * 连续 analyze grounding 阻断计数（I38；只在 groundingEnforcement='guard' 时被写入）。
+   * 写入方是 AgentRuntime：guard 真正阻断（nudge + rollbackTick）时 +1；gate 判定不阻断的文本轮、
+   * 工具轮都清零。达到 AnalyzeGroundingGuard 的上限后 gate 改为放行，计数停在上限值直到被清零，
+   * 防止不合作模型让 tracker 轮次永远回滚、循环只能靠超时 / token 预算 / abort 结束。
+   * 默认 'off' 下永远为 0。
+   */
+  consecutiveGroundingBlocks = 0;
 
   // ─── 构造期配置 ───
   // 由 LoopContextConfig 注入；AgentRuntime 构造 ctx 后不再改写这些字段（字段本身仍是公开可写的）。
