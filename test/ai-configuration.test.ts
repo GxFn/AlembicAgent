@@ -8,7 +8,7 @@ import {
   getProviderWithFallback,
 } from '../src/ai/AiFactory.js';
 import type { AiProvider } from '../src/ai/AiProvider.js';
-import { normalizeOllamaBaseUrl } from '../src/ai/configuration.js';
+import { normalizeOllamaBaseUrl, resolveConnection } from '../src/ai/configuration.js';
 import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
 import { ClaudeProvider } from '../src/ai/providers/ClaudeProvider.js';
 import { DeepSeekProvider } from '../src/ai/providers/DeepSeekProvider.js';
@@ -524,6 +524,111 @@ describe('provider identity resolution boundary', () => {
     expect(() => createProvider({ provider: 'openia' })).toThrow(
       rejected('Unknown AI provider: openia')
     );
+  });
+});
+
+// 凭据口径边界：detectProvider/availableFallbacks/aiConfigInfo 用 trim 后的值判断 key 是否存在，
+// 请求路径（resolveConnection）必须同口径，否则纯空白 key 会绕过 API_KEY_MISSING 变成上游 401。
+describe('API key whitespace normalization', () => {
+  const trimLogs = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((msg) => msg.includes('[ai-config] api_key_whitespace_trimmed'));
+
+  it('treats a whitespace-only environment key as missing and rejects with API_KEY_MISSING before any request', async () => {
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', ' \t  ');
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse({ choices: [{ index: 0, message: { content: 'unexpected' } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    // 与发现路径同口径：纯空白等于未配置。
+    expect(resolveConnection('openai').apiKey).toBe('');
+    await expect(
+      createProvider({ provider: 'openai', maxRetries: 0 }).chat('ping')
+    ).rejects.toMatchObject({ code: 'API_KEY_MISSING' });
+    await expect(
+      new LLMGateway({ providers: { openai: {} }, maxRetries: 0 }).chat({
+        modelRef: 'openai:gpt-4o',
+        prompt: 'ping',
+      })
+    ).rejects.toMatchObject({ code: 'API_KEY_MISSING' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    const logs = trimLogs(debug);
+    expect(logs.length).toBeGreaterThan(0);
+    expect(
+      logs.every((msg) =>
+        msg.includes(
+          'api_key_whitespace_trimmed provider=openai source=env var=ALEMBIC_OPENAI_API_KEY result=missing'
+        )
+      )
+    ).toBe(true);
+  });
+
+  it('trims surrounding whitespace from environment and explicit keys before the request and logs without the value', async () => {
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', '  fixture-padded-env-key\t');
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse({ choices: [{ index: 0, message: { content: 'ok' } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(resolveConnection('openai').apiKey).toBe('fixture-padded-env-key');
+    await expect(createProvider({ provider: 'openai', maxRetries: 0 }).chat('ping')).resolves.toBe(
+      'ok'
+    );
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('authorization')).toBe(
+      'Bearer fixture-padded-env-key'
+    );
+
+    expect(resolveConnection('openai', { apiKey: ' fixture-padded-explicit-key ' }).apiKey).toBe(
+      'fixture-padded-explicit-key'
+    );
+    await expect(
+      createProvider({
+        provider: 'openai',
+        apiKey: ' fixture-padded-explicit-key ',
+        maxRetries: 0,
+      }).chat('ping')
+    ).resolves.toBe('ok');
+    expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get('authorization')).toBe(
+      'Bearer fixture-padded-explicit-key'
+    );
+
+    const logs = trimLogs(debug);
+    expect(logs.some((msg) => msg.includes('provider=openai source=env'))).toBe(true);
+    expect(logs.some((msg) => msg.includes('provider=openai source=config'))).toBe(true);
+    expect(logs.every((msg) => msg.includes('result=trimmed'))).toBe(true);
+    // 诊断只写 provider/来源/结果，不能写出 key 值。
+    expect(logs.join('\n')).not.toContain('fixture-padded');
+  });
+
+  it('keeps an explicit empty or whitespace-only key as explicitly disabled instead of inheriting the environment key', async () => {
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', 'fixture-ambient-key');
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse({ choices: [{ index: 0, message: { content: 'unexpected' } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    for (const apiKey of ['', '   ']) {
+      expect(resolveConnection('openai', { apiKey }).apiKey).toBe('');
+      await expect(
+        createProvider({ provider: 'openai', apiKey, maxRetries: 0 }).chat('ping')
+      ).rejects.toMatchObject({ code: 'API_KEY_MISSING' });
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    // 显式空串本身不触发 trim 诊断；显式纯空白记录为显式禁用。
+    const logs = trimLogs(debug);
+    expect(logs.length).toBeGreaterThan(0);
+    expect(
+      logs.every((msg) =>
+        msg.includes(
+          'api_key_whitespace_trimmed provider=openai source=config result=explicit_disabled'
+        )
+      )
+    ).toBe(true);
   });
 });
 

@@ -126,6 +126,41 @@ function scopedModel(
   return env[`ALEMBIC_${owner}_MODEL`] || undefined;
 }
 
+/**
+ * 请求路径的凭据口径与 detectProvider/availableFallbacks/aiConfigInfo 保持一致：先 trim 再判断存在性。
+ * 返回 undefined 表示该来源没有提供 key，由调用方继续取下一个来源。
+ * - env 来源：trim 后为空视为缺失（返回 undefined），最终落到 Ollama 占位或 ''，
+ *   由 LLMTransport.requireApiKey 抛宿主可识别的 API_KEY_MISSING，而不是把空白发给上游得到 401。
+ * - config 来源：trim 后为空仍返回 ''，保留“显式空串 = 显式禁用”语义，不能重新吸入进程凭据。
+ * 诊断只写 provider、来源、变量名和结果状态，不写 key 值或长度。
+ */
+function normalizeApiKey(
+  raw: string | undefined,
+  origin: { source: 'config' } | { source: 'env'; envVar: string },
+  providerId: ProviderId,
+  logger: AiLogger
+): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed === raw) {
+    return raw;
+  }
+  const missing = trimmed === '' && origin.source === 'env';
+  const result = trimmed !== '' ? 'trimmed' : missing ? 'missing' : 'explicit_disabled';
+  const where = origin.source === 'env' ? ` var=${origin.envVar}` : '';
+  try {
+    logger.debug?.(
+      `[ai-config] api_key_whitespace_trimmed provider=${providerId} source=${origin.source}${where} result=${result}`
+    );
+  } catch (err: unknown) {
+    // 纯诊断：日志通道失败不能让一次可恢复的归一化变成构造失败，也不改变取值结果。
+    void err;
+  }
+  return missing ? undefined : trimmed;
+}
+
 export interface ResolveConnectionOptions {
   /**
    * 配置诊断（invalid_api_style、endpoint 归一化等）的接收方，默认 Core Logger。
@@ -172,10 +207,23 @@ export function resolveConnection(
   }
   return {
     ...config,
-    // undefined 继承环境；空 key 是显式禁用，不能重新吸入进程凭据。
+    // undefined 继承环境；空 key（含 trim 后为空的显式值）是显式禁用，不能重新吸入进程凭据。
+    // 环境变量 key 纯空白等于未配置，落到下方默认值后由 requireApiKey 报 API_KEY_MISSING。
     apiKey:
-      configString(config.apiKey, 'apiKey') ??
-      (defaults.keyEnvVar ? env[defaults.keyEnvVar] : undefined) ??
+      normalizeApiKey(
+        configString(config.apiKey, 'apiKey'),
+        { source: 'config' },
+        providerId,
+        logger
+      ) ??
+      (defaults.keyEnvVar
+        ? normalizeApiKey(
+            env[defaults.keyEnvVar],
+            { source: 'env', envVar: defaults.keyEnvVar },
+            providerId,
+            logger
+          )
+        : undefined) ??
       (providerId === 'ollama' ? 'ollama' : ''),
     baseUrl,
     embedModel:
