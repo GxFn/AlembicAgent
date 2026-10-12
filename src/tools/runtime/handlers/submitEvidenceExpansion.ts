@@ -587,10 +587,6 @@ export async function repairStyleViolations(
 }
 
 /**
- * INSUFFICIENT_EVIDENCE 拒绝反馈增强（E5）：告诉模型台账里真实可引用的 distinct 文件
- * （此前只说 "add 3 distinct files" 不说去哪找——修不动的拒绝即无效拒绝）。
- */
-/**
  * 拒收治理（2026-07-05 用户裁定"证据足够尽量收"）：refs 缺席但手写 sources 命中台账
  * 同文件条目时，机械回填 evidenceRefs——模型引用了真实采集过的文件却忘（或不会）抄 E-id，
  * 此前直接 EVIDENCE_REFS_REQUIRED 硬拒烧一回合再自救。推断只映射到真实条目
@@ -627,6 +623,10 @@ export function inferEvidenceRefsFromSources(
   return inferred;
 }
 
+/**
+ * INSUFFICIENT_EVIDENCE 拒绝反馈增强（E5）：告诉模型台账里真实可引用的 distinct 文件
+ * （此前只说 "add 3 distinct files" 不说去哪找——修不动的拒绝即无效拒绝）。
+ */
 export function buildEvidenceCandidatesHint(ledger: EvidenceLedgerLike | null | undefined): string {
   if (!ledger) {
     return '';

@@ -3,7 +3,18 @@
  *
  * 工具注册表 — 单一真相源。
  * 所有工具 metadata、action 参数 schema、handler 函数在此声明式定义。
- * 新增工具/action 只需在此文件加一行。
+ *
+ * 新增工具/action 不是“只在此文件加一行”：下列位置按动作名硬编码，不会自动跟随本表，
+ * 漏改时新动作会在宿主缺服务时不被收窄、被阶段策略拦下或落到 handler 的 Unknown action 分支。
+ *   - 本文件：ToolSpec.actions 里声明 params schema 与 handler 接线（handleXxx('<action>', ...)）；
+ *   - handlers/<tool>.ts：handle() 的 switch 分发要认这个动作名；
+ *   - availability.ts：describeToolAvailability 按动作/分支映射宿主服务方法，决定缺服务时是否收窄；
+ *   - toolsets/*.ts：各能力 allowedTools 白名单；参数级限制在 kernel/toolSelection.ts 的
+ *     CAPABILITY_PARAMETER_ALLOWLISTS；
+ *   - agent/runtime/toolPipeline/phaseGates.ts：Evolution、record repair、Analyst VERIFY、Producer
+ *     等阶段的动作集合；新动作若需要直呼别名（如 note_finding → memory.note_finding），
+ *     还要改同目录的 callNormalization.ts；
+ *   - test/：可用性、schema 投影、阶段策略与 handler 的对应用例。
  */
 
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
@@ -867,8 +878,11 @@ export const DEPTH_SLOT_KEYS: string[] = Object.keys(DEPTH_SLOT_PROPS);
  * run-8 首拒的结构性根源：schema required:['sources'] 与运行时闸（EVIDENCE_REFS_REQUIRED
  * 要求 evidenceRefs）相反，schema 在主动逼模型手写 sources。变体深拷贝后改写：
  * reasoning.required=['evidenceRefs']、sources 降述为自动展开、新增 scope 自声明枚举。
- * 绝不修改注册表静态原件——lightweight schema 按引用直达 provider。
- * 仅匹配单动作 submit 展开形态（params.properties.reasoning 在场）；多动作摘要形态原样返回。
+ * 绝不修改注册表静态原件：上游投影（selection.ts createToolRegistryView、本文件
+ * actionScopedParamsSchema）已对 action.params 深拷贝，传进来的 schema 本身不再与注册表共享引用；
+ * 变体命中时仍只改自己的克隆并返回克隆，不原地改入参，避免调用方持有的投影被悄悄改写。
+ * 仅匹配单动作 submit 展开形态（params.properties.reasoning 在场）；多动作摘要形态与非 knowledge
+ * 工具原样返回入参对象。
  */
 export function applyDimensionSubmitSchemaVariant(
   schemas: Array<Record<string, unknown>>

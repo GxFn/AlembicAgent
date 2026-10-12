@@ -5,6 +5,16 @@
 import type { TerminalCommandAllowlist } from '#tools/kernel/registry.js';
 import { RuntimeCapability } from './RuntimeCapability.js';
 
+/**
+ * Evolution 取证用的终端 allowlist。真正生效的只有 bins：agent 层 accessGates 用
+ * checkTerminalCommandAllowlist 检查（含写类参数与子命令约束）；router 把 capability 的
+ * commandAllowlist 注入 ToolContext 时，terminal handler 再用同一函数查一次。
+ *
+ * intent 仅声明、当前不执行：src 内没有代码读取它，terminal.exec 也不把它交给 sandboxExecutor，
+ * 宿主沙箱不会因此断网或只读挂载；npm test、vitest run 等允许的命令仍可能联网或写缓存/快照。
+ * 若要让 intent 生效，需要宿主按它选择沙箱 profile（跨仓），或删除/改名该字段（kernel 公开类型变更），
+ * 两条路都待决定，不要在本处单方面改语义。
+ */
 const EVOLUTION_READONLY_TERMINAL_ALLOWLIST: TerminalCommandAllowlist = {
   bins: [
     'git',

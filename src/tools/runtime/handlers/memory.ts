@@ -127,8 +127,9 @@ async function handleNoteFinding(
   // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存，降级显式标注。
   const ledger = ctx.runtime?.evidenceLedger;
   let resolvedLabels: string;
-  // M3（VERIFY 机械化）：verified=至少一个引用解析到带 file+range 的条目（read 类采集）。
-  // 全为 search/structure/terminal 类引用的发现是"未核实线索"——配额不计、producer 不作
+  // M3（VERIFY 机械化）：verified=至少一个引用解析到有文件归属（entry.file 在场）的台账条目，
+  // 带不带 range 都算——read 条目与 per-file search 条目都可定位、可复核。只引用无文件归属条目
+  // （structure/graph/terminal 等无路径采集）的发现是"未核实线索"——配额不计、producer 不作
   // "已确认"渲染；VERIFY 相 nudge 引导 code.read 补采后重记。无台账运行保持 undefined（不参与判定）。
   let verified: boolean | undefined;
   if (ledger) {
@@ -145,11 +146,9 @@ async function handleNoteFinding(
           `evidenceRefs 无法解析: "${ref}" 不在证据台账（只能引用工具返回里 [evidence] 标注的条目 id）。近期条目: ${recent || '(台账为空——先用 code/graph 工具采集证据)'}`
         );
       }
-      // 4/0 复盘放宽（2026-07-04）：file 在场即 verified——per-file search 条目（行号前缀
-      // content，P1b 可机械展开精确行）与 read 条目都是可定位可复核证据；原 file+range 判据
-      // 在"全 batch read+per-file search"的真实台账上把 findings 全判 unverified，级联
-      // producer 已确认区清零→候选义务归零→全拒。真正 unverified=无 file 条目
-      // （structure/graph/terminal 无路径）。
+      // 判据见上方 M3 注释。为何不再要求 range（4/0 复盘放宽，2026-07-04）：per-file search 条目
+      // 的 content 带行号前缀，P1b 可机械展开精确行；原 file+range 判据在"全 batch read+per-file
+      // search"的真实台账上把 findings 全判 unverified，级联 producer 已确认区清零→候选义务归零→全拒。
       if (entry.file) {
         verified = true;
       }

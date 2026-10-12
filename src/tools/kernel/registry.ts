@@ -249,8 +249,19 @@ export interface CapabilityDef {
   commandAllowlist?: TerminalCommandAllowlist;
 }
 
+/**
+ * capability 级终端命令正向白名单。
+ *
+ * 实际执行的约束只有 bins：agent 层 accessGates 与（ToolContext 注入了 commandAllowlist 时的）
+ * terminal handler 都只把 bins 交给 checkTerminalCommandAllowlist（bin 白名单 + 写类参数/子命令约束）。
+ */
 export interface TerminalCommandAllowlist {
   bins: readonly string[];
+  /**
+   * 仅声明、当前不执行：src 内没有代码读取 intent，terminal.exec 也不把它传给 sandboxExecutor，
+   * 宿主沙箱不会据此切换到断网或只读 profile。allowlist 里的 npm/node/vitest 等命令仍可能联网
+   * 或写文件，不能把这里的 network:'none' / filesystem:'read-only' 当成已生效的隔离保证。
+   */
   intent?: {
     network?: 'none';
     filesystem?: 'read-only';

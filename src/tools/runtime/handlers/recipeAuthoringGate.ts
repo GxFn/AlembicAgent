@@ -10,9 +10,12 @@
  *   - host-agent 路径（AlembicPlugin tool-router）已在 P1.4 接到 validateAgainst；
  *   - in-process 路径（本仓库 handleSubmit）此前只跑 length-only 的 validateSubmitParams +
  *     Core stage-3，stage-1/stage-2 从不在 in-process 执行（CG-4 gap）。
+ *   本模块所说的“host 侧 / host-agent 路径”专指 AlembicPlugin（lib/recipe-pipeline/curate/
+ *   recipe-evidence-gate.ts 的 createSourceRefResolver），不是 Alembic 主仓库宿主；后者代码里没有
+ *   另一份 resolver，Agent 运行时内的 knowledge.submit 走的就是本模块的 in-process 路径。
  *
  * profile 轴（§12.3，Core 8771524 已上线）：
- *   - cold-start：完整门禁，逐字节等同 host-agent 冷启动（含 3-distinct-files 证据下限 +
+ *   - cold-start：完整门禁，与 host-agent 冷启动用同一份 Core 规则（含 3-distinct-files 证据下限 +
  *     session-scope），是携带 bootstrap dimension 的 in-process 提交所走的档位；
  *   - opportunistic：运行期机会式 in-process AI 开发（无 session / 无 dimension）的「声明式更轻
  *     门槛」 —— 保留全部内容门禁（verb 白名单、✅❌ 对比、markdown 下限）+ 廉价来源接地
@@ -21,8 +24,9 @@
  *
  * §C.11 端口边界：Core domain spec 保持纯（零 node:fs / node:path），把两处运行时耦合留给宿主注入。
  * 在 in-process 路径里：
- *   - sourceRefResolver：由本模块用 node:fs / node:path 实现，逐字节复刻 host 侧
- *     createSourceRefResolver 的分支与文案，保证「同一来源引用在 in-process 与 host 得到一致裁决」；
+ *   - sourceRefResolver：由本模块用 node:fs / node:path 实现，以 AlembicPlugin 的
+ *     createSourceRefResolver 为基线保持相同的分支顺序、违规码与文案，并在其之上多一道符号链接
+ *     越界判定（详见 createInProcessSourceRefResolver），二者不是逐字节一致；
  *   - sessionScope：in-process **不注入** —— 与 P1-Plugin「session-scope 留 host 侧前置」的决策一致；
  *     opportunistic 本就关闭 session-scope，故无冲突；cold-start in-process 也只做 fs 接地，不做
  *     session 作用域（in-process 无 bootstrap session 对象可校验）。
@@ -38,10 +42,15 @@ import {
 import { resolveProjectPath } from '#shared/projectPath.js';
 
 /**
- * in-process fs 来源接地端口。逐字节复刻 host 侧 §C.11 resolver 的归一化、越界判定与文案，
- * 让 in-process 与 host-agent 对同一 `path:line` / `path:start-end` 引用产出完全一致的
- * SOURCE_REF_INVALID / SOURCE_REF_NOT_FOUND / SOURCE_REF_LINE_OUT_OF_RANGE，或同样的
+ * in-process fs 来源接地端口。以 AlembicPlugin recipe-evidence-gate 的 §C.11 resolver 为基线：
+ * 路径归一化、词法越界判定、违规码与文案保持一致，对同一 `path:line` / `path:start-end` 引用
+ * 产出相同的 SOURCE_REF_INVALID / SOURCE_REF_NOT_FOUND / SOURCE_REF_LINE_OUT_OF_RANGE，或同样的
  * `{ rangeText, sourcePath }`，供 Core 纯 snippet / floor 谓词消费（两路打平的接地一致性基础）。
+ *
+ * 与 Plugin 版的有意差异（不是漂移，不得为“逐字节一致”而回退）：文件存在后再经
+ * resolveProjectPath 做符号链接越界判定——项目内的符号链接指向项目根之外时，按
+ * SOURCE_REF_INVALID（resolves outside）拒绝，而不是读取根外文件；通过时 evidence.filePath
+ * 是解析后的真实路径（realpath），sourcePath 仍是模型引用的仓库相对路径。
  */
 export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
   return ({
@@ -135,7 +144,10 @@ export function createInProcessSourceRefResolver(): RecipeSourceRefResolver {
   };
 }
 
-/** 与 host 侧 isInsideRoot 同实现：判定 target 是否在 root 内（含 root 自身）。 */
+/**
+ * 与 AlembicPlugin recipe-evidence-gate 的 isInsideRoot 同实现：按词法判定 target 是否在 root 内
+ * （含 root 自身）。它不解析符号链接，符号链接越界由 resolver 里的 resolveProjectPath 另行判定。
+ */
 function isInsideRoot(root: string, target: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -147,8 +159,9 @@ function isInsideRoot(root: string, target: string): boolean {
  * （stage:'all', path:'in-process'）并注入 in-process fs resolver。返回 Core 原样的违规对象数组
  * （空数组表示通过）。
  *
- * 注意：本门禁是 gateway.create（Core stage-3 UnifiedValidator）之前的前置统一裁决；stage:'all'
- * 会包含 stage-3，与 gateway 内的 Core stage-3 同源（P1.3 已 re-point），结论一致、只是更早短路。
+ * 注意：本门禁是实际写路径 recipeGateway.createOrStage（handlers/knowledge/submission.ts 调用，
+ * 宿主 gateway 内跑 Core stage-3 UnifiedValidator）之前的前置统一裁决；stage:'all' 会包含 stage-3，
+ * 与 gateway 内的 Core stage-3 同源（P1.3 已 re-point），结论一致、只是更早短路。
  */
 export function runInProcessRecipeAuthoringGate(
   item: Record<string, unknown>,

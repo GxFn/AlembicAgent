@@ -4,7 +4,10 @@
  * 终端执行工具 — 在 Seatbelt 沙箱中执行命令，返回结构化压缩输出。
  * Actions: exec
  *
- * 执行流程: 安全检查 → cwd 校验 → Seatbelt 沙箱执行 → OutputCompressor 压缩 → token budget 截断
+ * 执行流程: cwd 校验 → 危险命令预检 → capability allowlist（注入时）→ 执行器 fail-closed 判定
+ *           → Seatbelt 沙箱执行 → OutputCompressor 压缩
+ *           ctx.tokenBudget 只作为压缩器自身的预算交给 compressor；按 action.maxOutputTokens 的最终
+ *           截断由 router.enforceOutputLimit 在本 handler 返回后执行，不属于本流程。
  *
  * 沙箱集成: 通过 ToolContext.sandboxExecutor 注入 SandboxExecutor。
  *           未注入或注入对象没有可调用的 exec 时默认拒绝执行（fail-closed）：宿主漏接线不应
