@@ -385,21 +385,22 @@ function combineOutput(stdout: string, stderr: string): string {
   return parts.join('\n\n') || '[no output]';
 }
 
+/**
+ * cwd 根约束只委托 resolveProjectPath（L1-P7 / L1-I5）：它先做双根词法预检查（项目根或其 realpath），
+ * 再以 realpath 包含检查为唯一放行权威。这里不再保留单根词法检查：返回给执行端口的 cwd 是 realpath，
+ * 项目根是 symlink 时模型原样回传该 cwd 会被单根检查误判越界并反复重试。
+ * 越界、根外 symlink、悬空 symlink 的拒绝原因都来自 resolveProjectPath 的错误文本，统一拼在
+ * `cwd must be within project root: <root>; ` 之后，经 handleExec 的 finish(..., 'failure') 进入审计。
+ */
 function resolveTerminalCwd(
   rawCwd: unknown,
   projectRoot: string
 ): { ok: true; cwd: string } | { ok: false; error: string } {
   const root = path.resolve(projectRoot);
-  const requested = typeof rawCwd === 'string' && rawCwd.length > 0 ? rawCwd : undefined;
-  const cwd = requested
-    ? path.resolve(path.isAbsolute(requested) ? requested : path.join(root, requested))
-    : root;
-  const relative = path.relative(root, cwd);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    return { ok: false, error: `cwd must be within project root: ${root}` };
-  }
+  // 未提供 cwd 时解析项目根自身；相对 cwd 按项目根解析、绝对 cwd 原样参与检查，与旧实现一致。
+  const requested = typeof rawCwd === 'string' && rawCwd.length > 0 ? rawCwd : '.';
   try {
-    return { ok: true, cwd: resolveProjectPath(root, cwd).absolute };
+    return { ok: true, cwd: resolveProjectPath(root, requested).absolute };
   } catch (err: unknown) {
     return {
       ok: false,

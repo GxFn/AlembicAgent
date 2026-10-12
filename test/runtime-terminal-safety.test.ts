@@ -391,6 +391,91 @@ describe('runtime terminal.exec safety', () => {
       rmSync(outer, { recursive: true, force: true });
     }
   });
+
+  // L1-P7 / L1-I5：projectRoot 是 symlink（root=link→real）时 terminal 返回给执行端口的 cwd 是 realpath。
+  // 模型把它原样回传给下一次 terminal.exec 时不得被判为越界；越界、根外 symlink、悬空 symlink 仍被拒。
+  describe.skipIf(process.platform === 'win32')('cwd under a symlinked project root', () => {
+    function createSymlinkedRoot() {
+      const outer = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'terminal-cwd-symroot-')));
+      const real = path.join(outer, 'real');
+      mkdirSync(path.join(real, 'src'), { recursive: true });
+      const link = path.join(outer, 'link');
+      symlinkSync(real, link);
+      return { outer, real, link };
+    }
+
+    function recordingContext(projectRoot: string, calls: string[]) {
+      return baseToolContext({
+        projectRoot,
+        sandboxExecutor: {
+          exec: async (_command: string, opts: { cwd: string }) => {
+            calls.push(opts.cwd);
+            return { stdout: opts.cwd, stderr: '', exitCode: 0 };
+          },
+        },
+      });
+    }
+
+    it('accepts the realpath cwd it returned when the model passes it back', async () => {
+      const { outer, real, link } = createSymlinkedRoot();
+      const calls: string[] = [];
+      try {
+        const first = await runTerminalExec('pwd', recordingContext(link, calls), { cwd: 'src' });
+        expect(first.ok).toBe(true);
+        expect(calls).toEqual([path.join(real, 'src')]);
+
+        const second = await runTerminalExec('pwd', recordingContext(link, calls), {
+          cwd: calls[0],
+        });
+        expect(second.error).toBeUndefined();
+        expect(second.ok).toBe(true);
+
+        const rootDefault = await runTerminalExec('pwd', recordingContext(link, calls));
+        expect(rootDefault.ok).toBe(true);
+        const rootEcho = await runTerminalExec('pwd', recordingContext(link, calls), {
+          cwd: calls[2],
+        });
+        expect(rootEcho.ok).toBe(true);
+        expect(calls).toEqual([path.join(real, 'src'), path.join(real, 'src'), real, real]);
+      } finally {
+        rmSync(outer, { recursive: true, force: true });
+      }
+    });
+
+    it('still rejects escapes, outside aliases and dangling links before execution', async () => {
+      const { outer, real, link } = createSymlinkedRoot();
+      mkdirSync(path.join(outer, 'outside-dir'));
+      // 根外别名指向根内：realpath 在根内，但请求路径不在任一根的词法范围内，必须拒绝。
+      symlinkSync(real, path.join(outer, 'alias'));
+      // 根内 symlink 指向根外：真实绝对路径能通过双根预检查，必须由 realRoot 权威检查拦下。
+      symlinkSync(path.join(outer, 'outside-dir'), path.join(real, 'out'));
+      symlinkSync(path.join(outer, 'nowhere'), path.join(real, 'dangling'));
+      mkdirSync(path.join(outer, 'real-sibling'));
+      const calls: string[] = [];
+      try {
+        for (const cwd of [
+          '..',
+          '../outside-dir',
+          outer,
+          path.join(outer, 'outside-dir'),
+          path.join(outer, 'real-sibling'),
+          path.join(outer, 'alias', 'src'),
+          'out',
+          path.join(real, 'out'),
+          'dangling',
+          path.join(real, 'dangling'),
+        ]) {
+          const result = await runTerminalExec('pwd', recordingContext(link, calls), { cwd });
+          expect(result.ok, cwd).toBe(false);
+          expect(result.error, cwd).toContain(`cwd must be within project root: ${link}`);
+        }
+        expect(calls).toEqual([]);
+      } finally {
+        rmSync(outer, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('blocks sudo spacing and quoted bypass attempts before execution', async () => {
     const commands = ['sudo\twhoami', '"sudo" whoami', "'sudo' whoami", '/usr/bin/sudo whoami'];
 

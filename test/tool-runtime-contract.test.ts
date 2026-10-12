@@ -1390,6 +1390,75 @@ describe('B-1 write-freshness gate (read-before-write / TOCTOU)', () => {
       expect(String(result.data).split('\n')[0]).toBe('./');
     });
   });
+
+  // L1-P7 / L1-I5：checkout 是 symlink 时，code 工具解析出的是 realpath。模型回传真实绝对路径
+  // 不得被词法根预检查误拒；根外别名与 ../ 越界仍被拒（放宽的只是预检查，realRoot 仍是权威）。
+  it('reads and writes real absolute paths under a symlinked checkout', async () => {
+    await withWriteFixture(async (outer) => {
+      await symlink(join(outer, 'src'), join(outer, 'checkout'));
+      const realSrc = await realpath(join(outer, 'src'));
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(join(outer, 'checkout'));
+
+      const read = await router.execute(
+        { tool: 'code', action: 'read', params: { path: join(realSrc, 'a.ts') } },
+        ctx
+      );
+      expect(read.error).toBeUndefined();
+      expect(read.ok).toBe(true);
+      expect(String(read.data)).toContain('export const a = 1;');
+
+      const write = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: join(realSrc, 'created.ts'), content: 'export const c = 1;\n' },
+        },
+        ctx
+      );
+      expect(write.error).toBeUndefined();
+      expect(write.ok).toBe(true);
+      expect(await readFile(join(outer, 'src/created.ts'), 'utf8')).toBe('export const c = 1;\n');
+    });
+  });
+
+  it('rejects outside aliases and ../ escapes from a symlinked checkout', async () => {
+    await withWriteFixture(async (outer) => {
+      await symlink(join(outer, 'src'), join(outer, 'checkout'));
+      // 根外别名指向根内：realpath 落在根内，但请求路径不在 checkout 或其 realpath 的词法范围内。
+      await symlink(join(outer, 'src'), join(outer, 'alias'));
+      await writeFile(join(outer, 'secret.txt'), 'secret\n');
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(join(outer, 'checkout'));
+
+      for (const filePath of [
+        join(outer, 'alias', 'a.ts'),
+        '../secret.txt',
+        join(await realpath(outer), 'secret.txt'),
+      ]) {
+        const read = await router.execute(
+          { tool: 'code', action: 'read', params: { path: filePath } },
+          ctx
+        );
+        expect(read.ok, filePath).toBe(false);
+        expect(read.error, filePath).toContain('outside project root');
+      }
+
+      const write = await router.execute(
+        {
+          tool: 'code',
+          action: 'write',
+          params: { path: join(outer, 'alias', 'via-alias.ts'), content: 'x' },
+        },
+        ctx
+      );
+      expect(write.ok).toBe(false);
+      await expect(readFile(join(outer, 'src/via-alias.ts'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+  });
+
   it.each([
     20, 600,
   ])('serves requested ranges after a cached read of %i lines', async (lineCount) => {
