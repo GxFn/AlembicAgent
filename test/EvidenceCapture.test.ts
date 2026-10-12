@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { UnifiedValidator } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
 import { describe, expect, test, vi } from 'vitest';
 import {
   appendEvidenceAnnotation,
@@ -438,6 +439,241 @@ test('keeps confirmed evidence annotations when the next batch append fails', ()
       message: expect.stringContaining('persisted=1'),
     })
   );
+});
+
+// ─── L7-P12 / C14：空读（越界 range、剥前缀后为空）不落账，通用兜底不把空串序列化成 '""' ───
+describe('L7-P12 C14 空读不落账', () => {
+  type AfterParams = Parameters<typeof evidenceCapture.after>;
+
+  /** 走真实 evidenceCapture 中间件：观察标注、台账统计与 tracker 刷新三者是否保持不变。 */
+  function runMiddleware(
+    ledger: EvidenceLedgerStore,
+    call: { name: string; args: Record<string, unknown>; id: string },
+    envelope: { ok: boolean; text: string; structuredContent?: unknown }
+  ) {
+    const noteLedgerStats = vi.fn();
+    const warn = vi.fn();
+    evidenceCapture.after(
+      call as AfterParams[0],
+      null,
+      {
+        loopCtx: { evidenceLedger: ledger, diagnostics: { warn }, tracker: { noteLedgerStats } },
+      } as unknown as AfterParams[2],
+      { envelope } as unknown as AfterParams[3]
+    );
+    return { noteLedgerStats, warn };
+  }
+
+  /** 预置一条真实条目：断言“stats 不变”而不是“stats 为零”，排除空台账的偶然通过。 */
+  function seededLedger() {
+    const ledger = makeLedger();
+    ledger.append({
+      tool: 'code.read',
+      callId: 'seed',
+      file: 'src/seed.ts',
+      range: { start: 1, end: 1 },
+      content: 'seed',
+    });
+    return ledger;
+  }
+
+  function debugMessages(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map((args) => String(args[0]));
+  }
+
+  test('单 path 越界 range（适配器信封 text 与 structuredContent 均为空串）不落账、不标注、stats 不变并记 debug', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = seededLedger();
+      const before = ledger.stats();
+      const call = {
+        name: 'code',
+        args: { action: 'read', params: { path: 'src/a.ts', startLine: 900, endLine: 950 } },
+        id: 'eof-single',
+      };
+      // ToolRouterAdapter 对 handler 返回的 '' 设 structuredContent=''、text=''、ok=true。
+      expect(
+        captureEvidenceFromEnvelope(ledger, call, makeEnvelope({ text: '', structuredContent: '' }))
+      ).toEqual([]);
+      const envelope = makeEnvelope({ text: '', structuredContent: '' });
+      const { noteLedgerStats, warn } = runMiddleware(ledger, call, envelope);
+      expect(envelope.text).toBe('');
+      expect(envelope.text).not.toContain('[evidence]');
+      expect(noteLedgerStats).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+      expect(ledger.stats()).toEqual(before);
+      const messages = debugMessages(debug);
+      expect(
+        messages.some(
+          (m) =>
+            m.includes('empty read not recorded') &&
+            m.includes('src/a.ts') &&
+            m.includes('900') &&
+            m.includes('950')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('单 path 剥 N| 前缀后为空（空文件 `1|`）同样不落账并记 debug', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = seededLedger();
+      const before = ledger.stats();
+      const entries = captureEvidenceFromEnvelope(
+        ledger,
+        { name: 'code', args: { action: 'read', params: { path: 'src/empty.ts' } }, id: 'empty-1' },
+        makeEnvelope({ text: '1|\n', structuredContent: '1|\n' })
+      );
+      expect(entries).toEqual([]);
+      expect(ledger.stats()).toEqual(before);
+      expect(
+        debugMessages(debug).some(
+          (m) => m.includes('empty read not recorded') && m.includes('src/empty.ts')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('批量越界 range 成员跳过，同批非空成员照常落账（range 取项坐标）', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = seededLedger();
+      const entries = captureEvidenceFromEnvelope(
+        ledger,
+        {
+          name: 'code',
+          args: {
+            action: 'read',
+            params: { filePaths: ['src/big.ts', 'src/ok.ts'], startLine: 3 },
+          },
+          id: 'eof-batch-mixed',
+        },
+        makeEnvelope({
+          text: 'batch',
+          structuredContent: {
+            files: [
+              {
+                ok: true,
+                path: 'src/big.ts',
+                content: '',
+                lineCount: 2,
+                startLine: 3,
+                endLine: 2,
+                mode: 'range',
+              },
+              {
+                ok: true,
+                path: 'src/ok.ts',
+                content: '3|kept line',
+                lineCount: 9,
+                startLine: 3,
+                endLine: 3,
+                mode: 'range',
+              },
+            ],
+          },
+        })
+      );
+      expect(entries.map((e) => e.file)).toEqual(['src/ok.ts']);
+      expect(entries[0]).toMatchObject({ range: { start: 3, end: 3 }, content: 'kept line' });
+      expect(ledger.stats()).toEqual({ entries: 2, distinctFiles: 2 });
+      expect(
+        debugMessages(debug).some(
+          (m) =>
+            m.includes('empty read not recorded') &&
+            m.includes('src/big.ts') &&
+            !m.includes('src/ok.ts')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('批量成员全部为空（越界 range、剥前缀后为空）：不落账、不标注、stats 不变', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = seededLedger();
+      const before = ledger.stats();
+      const envelope = makeEnvelope({
+        text: 'batch',
+        structuredContent: {
+          files: [
+            {
+              ok: true,
+              path: 'src/big.ts',
+              content: '',
+              lineCount: 20,
+              startLine: 30,
+              endLine: 20,
+              mode: 'range',
+            },
+            { ok: true, path: 'src/empty.ts', content: '1|', lineCount: 1, mode: 'full' },
+          ],
+        },
+      });
+      const { noteLedgerStats } = runMiddleware(
+        ledger,
+        {
+          name: 'code',
+          args: { action: 'read', params: { filePaths: ['src/big.ts', 'src/empty.ts'] } },
+          id: 'eof-batch-all',
+        },
+        envelope
+      );
+      expect(envelope.text).toBe('batch');
+      expect(noteLedgerStats).not.toHaveBeenCalled();
+      expect(ledger.stats()).toEqual(before);
+      const messages = debugMessages(debug);
+      expect(
+        messages.some(
+          (m) =>
+            m.includes('empty read not recorded') &&
+            m.includes('src/big.ts') &&
+            m.includes('src/empty.ts')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('通用兜底：字符串 structuredContent 用原串（不 JSON 加引号）；空串不落账并记 debug', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = seededLedger();
+      const raw = captureEvidenceFromEnvelope(
+        ledger,
+        { name: 'terminal', args: { action: 'exec', params: { command: 'ls' } }, id: 'str-sc' },
+        makeEnvelope({ text: '', structuredContent: 'total 8\npackage.json' })
+      );
+      expect(raw).toHaveLength(1);
+      expect(raw[0].content).toBe('total 8\npackage.json');
+      const before = ledger.stats();
+
+      const emptyEnvelope = makeEnvelope({ text: '', structuredContent: '' });
+      const { noteLedgerStats } = runMiddleware(
+        ledger,
+        { name: 'terminal', args: { action: 'exec', params: { command: 'true' } }, id: 'empty-sc' },
+        emptyEnvelope
+      );
+      expect(emptyEnvelope.text).toBe('');
+      expect(noteLedgerStats).not.toHaveBeenCalled();
+      expect(ledger.stats()).toEqual(before);
+      expect(
+        debugMessages(debug).some(
+          (m) => m.includes('empty result not recorded') && m.includes('terminal.exec')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
 });
 
 // ─── I25（L5-P21）：submitted* Set 所有权——只有 submitDedup 在确认创建后登记 ───

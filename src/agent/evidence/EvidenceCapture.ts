@@ -13,8 +13,31 @@ import {
   type EvidenceToolId,
   isEvidenceToolId,
 } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { readToolObservation } from '../utils/toolOutcomes.js';
 import type { EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
+
+/** 空读诊断里列出的成员样本上限：越界批量读可能涉及很多文件，debug 行只列前几个避免刷屏。 */
+const EMPTY_READ_LOG_SAMPLE = 5;
+
+/**
+ * 跳过落账的诊断出口（L7-P12 / C14）。空读不落账是有意的短路：没有可引用的原文，
+ * 落账只会产生一条“file 在场但内容为空”的证据，被 note_finding 判 verified 并抬高 RECORD 配额。
+ * 走 debug 级别——越界读本身已由 code handler 的 code_read_range_beyond_eof 警告告知模型，
+ * 这里只给排查用的痕迹；观察者失败不能影响采集。
+ */
+function logEvidenceSkip(message: string): void {
+  observeSafely(
+    () => Logger.getInstance().debug(message),
+    () => undefined
+  );
+}
+
+/** 诊断用的行号描述：只回显整数坐标，缺席或非法写 '-'（不做区间推断）。 */
+function describeLineHint(value: unknown): string {
+  return typeof value === 'number' && Number.isInteger(value) ? String(value) : '-';
+}
 
 /** 管道 ToolCall 的采集视图（name 是工具族名如 'code'，action 在 args 里） */
 export interface EvidenceCaptureCall {
@@ -160,7 +183,8 @@ function asMatchList(value: unknown): MatchItem[] {
  * - code.search：按文件分组每组一条，行号内嵌 `<line>: <content>` 自描述——命中非连续，
  *   刻意不设 range（range 语义是连续区间，误设会让子区间切片错位）；
  * - 其它证据工具（outline/structure/graph/terminal）：单条，结构化结果确定性序列化，
- *   结构缺席回退模型可见文本。
+ *   结构缺席回退模型可见文本；字符串结构化结果用原串。
+ * - 空读/空结果（越界 range、剥前缀后为空、空串结果）不产生草稿，只记 debug（L7-P12 / C14）。
  */
 function normalizeDrafts(
   tool: EvidenceToolId,
@@ -176,12 +200,24 @@ function normalizeDrafts(
     const files = asFileList(data?.files);
     if (Array.isArray(data?.files)) {
       const requestedRange = extractRequestedRange(call.args);
-      return files.map((file) => {
+      const drafts: EvidenceEntryDraft[] = [];
+      const emptyMembers: string[] = [];
+      for (const file of files) {
         // run-13 EVIDENCE_STALE 事故根修：台账存 verbatim 原文（剥 `N|` 显示前缀与 omitted
         // 尾行），range 取工具项自带坐标（range 模式 startLine/endLine；full 模式 1..lineCount）
         // ——freshness 原文重切与存储哈希由此同尺。outline/delta/unchanged 是派生视图非切片，
         // 诚实降级 file-only（不参与 freshness，verified 判据按 file 在场已放行）。
         const raw = stripReadDisplayDecorations(file.content);
+        // L7-P12 / C14：空成员（越界 range 的 '' 或剥前缀后为空，如空文件 `1|`）没有可引用原文。
+        // 此前它以 file-only、content '' 落账，被当成“文件在场”的核实依据；现在跳过并记 debug，
+        // 同批其余成员照常落账。按内容判定，不看 mode——任何视图的空内容都不是证据。
+        if (file.content.length === 0 || (raw !== null && raw.content.length === 0)) {
+          emptyMembers.push(
+            `${file.path}(mode=${file.mode ?? '-'} startLine=${describeLineHint(file.startLine)} ` +
+              `endLine=${describeLineHint(file.endLine)} lineCount=${describeLineHint(file.lineCount)})`
+          );
+          continue;
+        }
         const mode = file.mode ?? '';
         // outlineSource 与 mode==='outline' 同义（AST 大纲或头尾预览）：两者任一出现都按派生视图处理，
         // 不取内容坐标、也不借用请求区间——头尾预览的 N| 行首尾不连续，落 range 会让 freshness 误判。
@@ -191,9 +227,16 @@ function normalizeDrafts(
           !derivedOutline &&
           (mode === 'range' || mode === 'full' || mode === '')
         ) {
-          return { tool, callId: call.id, file: file.path, range: raw.range, content: raw.content };
+          drafts.push({
+            tool,
+            callId: call.id,
+            file: file.path,
+            range: raw.range,
+            content: raw.content,
+          });
+          continue;
         }
-        return {
+        drafts.push({
           tool,
           callId: call.id,
           file: file.path,
@@ -209,8 +252,20 @@ function normalizeDrafts(
               }
             : {}),
           content: file.content,
-        };
-      });
+        });
+      }
+      if (emptyMembers.length > 0) {
+        const sample = emptyMembers.slice(0, EMPTY_READ_LOG_SAMPLE).join('; ');
+        const more =
+          emptyMembers.length > EMPTY_READ_LOG_SAMPLE
+            ? ` (+${emptyMembers.length - EMPTY_READ_LOG_SAMPLE} more)`
+            : '';
+        logEvidenceSkip(
+          `[EvidenceCapture] empty read not recorded: tool=${tool} callId=${call.id} shape=batch ` +
+            `skipped=${emptyMembers.length}/${files.length} recorded=${drafts.length} members=${sample}${more}`
+        );
+      }
+      return drafts;
     }
     // P1-A F3：单 path read 返回纯文本(无 structuredContent.files)——此前落入通用兜底，
     // 而兜底只查 call.args.path(真实调用形态是 args.params.path)→ 落成无 file 条目 →
@@ -221,23 +276,35 @@ function normalizeDrafts(
     if (singlePath) {
       const textContent = typeof envelope.text === 'string' ? envelope.text : '';
       // 尾随换行会产生空末行、让全行 N| 校验失败——剥掉再判(不影响 verbatim 语义)。
-      const raw = textContent ? stripReadDisplayDecorations(textContent.replace(/\n+$/, '')) : null;
-      if (raw !== null && raw.content.length > 0) {
+      const trimmed = textContent.replace(/\n+$/, '');
+      const raw = trimmed ? stripReadDisplayDecorations(trimmed) : null;
+      // L7-P12 / C14：空读没有可引用原文——越界 range 时 handler 返回 ''（适配器信封 text 与
+      // structuredContent 都是 ''），或剥 N| 前缀后为空（空文件 `1|`）。此前前者落进通用兜底被
+      // JSON.stringify 成 '""'、后者以显示形态 file-only 落账，都成了“文件在场”的证据并计入
+      // RECORD 配额。这里短路：不落账、不追加 [evidence] 标注，只记 debug 供排查。
+      if (!trimmed || (raw !== null && raw.content.length === 0)) {
+        logEvidenceSkip(
+          `[EvidenceCapture] empty read not recorded: tool=${tool} callId=${call.id} shape=single ` +
+            `path=${singlePath} startLine=${describeLineHint(singleParams?.startLine)} ` +
+            `endLine=${describeLineHint(singleParams?.endLine)} ` +
+            `reason=${trimmed ? 'empty-after-strip' : 'empty-text'}`
+        );
+        return [];
+      }
+      if (raw !== null) {
         return [
           { tool, callId: call.id, file: singlePath, range: raw.range, content: raw.content },
         ];
       }
-      if (textContent) {
-        // outline/delta 等派生视图：诚实降级 file-only(不参与 freshness，verified 按 file 在场放行)。
-        return [
-          {
-            tool,
-            callId: call.id,
-            file: singlePath,
-            content: textContent,
-          },
-        ];
-      }
+      // outline/delta 等派生视图：诚实降级 file-only(不参与 freshness，verified 按 file 在场放行)。
+      return [
+        {
+          tool,
+          callId: call.id,
+          file: singlePath,
+          content: textContent,
+        },
+      ];
     }
   }
 
@@ -297,12 +364,23 @@ function normalizeDrafts(
       }
     }
   }
+  // L7-P12 / C14：字符串 structuredContent 就是模型所见文本本身（适配器的 text 取同一字符串），
+  // 直接用原串；此前对它 JSON.stringify，空串会变成 '""' 被当成一条有内容的证据落账。
+  // 只有对象/数组等结构化结果才确定性序列化。
+  const structured = envelope.structuredContent;
   const content =
     envelope.text ||
-    (envelope.structuredContent !== undefined
-      ? JSON.stringify(data ?? envelope.structuredContent)
-      : '');
+    (typeof structured === 'string'
+      ? structured
+      : structured !== undefined
+        ? JSON.stringify(data ?? structured)
+        : '');
   if (!content) {
+    // 结果为空（空文本且无结构化内容或结构化内容是空串）：没有可引用的原文，不落账。
+    logEvidenceSkip(
+      `[EvidenceCapture] empty result not recorded: tool=${tool} callId=${call.id} shape=fallback ` +
+        `file=${file ?? '-'} structured=${structured === undefined ? 'absent' : typeof structured}`
+    );
     return [];
   }
   return [{ tool, callId: call.id, ...(file ? { file } : {}), content }];
