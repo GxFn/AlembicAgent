@@ -20,8 +20,20 @@ import type { EvidenceCollectorResult } from '../evidence/EvidenceCollector.js';
  */
 const DEPTH_RETRY_MIN_GROUNDED_DIMS = 2;
 
-/** 深度缺口 retry 的 reason 前缀(buildRetryPrompt 据此路由到深度重挖分支，后接缺口维度名)。 */
+/**
+ * 深度缺口 retry 的 reason 前缀(buildRetryPrompt 据此路由到深度重挖分支)。前缀后接二选一：
+ * 缺口维度名(作者本就用小节组织)或下方 GENERIC_DEPTH_GAP_HINT(自由叙述)。
+ */
 export const DEPTH_GAP_REASON = 'Depth dimensions lack grounded evidence';
+
+/**
+ * 自由叙述模式下的通用深挖指令(applyDepthRetryGate 在接地核心维度为 0 时拼在 DEPTH_GAP_REASON 之后)。
+ * 它同时是 insightGate.buildRetryPrompt 的分支判定键：命中即走「正文补写接地深度断言」文案，
+ * 不再把它当维度名列出、也不把作者推回四个深度槽(2026-07-02 双轨决策)。门控与提示必须 import
+ * 同一符号——退化成两侧字面量副本时，一侧改字就会让提示静默落回维度名分支(编译仍绿)。
+ */
+export const GENERIC_DEPTH_GAP_HINT =
+  'add grounded depth claims (cause/cost/exception/contrast, each with a real (来源: file:line))' as const;
 
 // ──────────────────────────────────────────────────────────────────
 // 类型定义
@@ -395,11 +407,9 @@ export function applyDepthRetryGate(
       .filter((k) => k !== 'multiSourceCorroboration')
       .map((k) => DEPTH_DIMENSIONS.find((d) => d.key === k)?.label ?? k);
     // 自由叙述模式下缺口不再按维度名报(那会把作者推回四问模板)，改报通用深挖指令；
-    // 仅当作者本就在用小节组织(groundedCore>0)时才报维度名帮助定位。
-    const gapHint =
-      groundedCore.length > 0
-        ? missingLabels.join(' / ')
-        : 'add grounded depth claims (cause/cost/exception/contrast, each with a real (来源: file:line))';
+    // 仅当作者本就在用小节组织(groundedCore>0)时才报维度名帮助定位。通用指令用导出常量，
+    // buildRetryPrompt 以同一符号判定分支。
+    const gapHint = groundedCore.length > 0 ? missingLabels.join(' / ') : GENERIC_DEPTH_GAP_HINT;
     // 深度断言缺口分流：findings 已充足=写作问题(把已验证发现组织成含接地深度断言的
     // 文本，summary_rewrite 单调用可修)；findings 不足=证据问题(必须回 analyze 重挖)。
     const action =

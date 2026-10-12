@@ -13,21 +13,37 @@
  * - buildRecordRepairPrompt(拆前 :853)+stringifyRecordRepairEvidenceMap(拆前 :814)
  * - buildSummaryRewritePrompt(拆前 :915)
  *
- * ⚠️ 路由常量契约:DEPTH_GAP_REASON/REQUIRED_MEMORY_FINDING_SUGGESTION/
+ * ⚠️ 路由常量契约:DEPTH_GAP_REASON/GENERIC_DEPTH_GAP_HINT/REQUIRED_MEMORY_FINDING_SUGGESTION/
  * INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION 必须 import 自 evaluation/qualityGates
  * (门控产出与本文件路由判定同一符号)——退化成本地字面量副本会让深度 retry 与
  * 记忆修复路由在运行期静默失效(编译仍绿)。
  *
+ * ⚠️ 公开面:本文件经 prompts/index.ts `export *` 进入 @alembic/agent/prompts 冻结名集，
+ * 新增 helper 一律不导出(名集膨胀=签名门红)。
+ *
  * @module insightGate
  */
 
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import {
   DEPTH_GAP_REASON,
+  GENERIC_DEPTH_GAP_HINT,
   getArtifactMemoryFindingCount,
   INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION,
   type NormalizedFinding,
   REQUIRED_MEMORY_FINDING_SUGGESTION,
 } from '../evaluation/qualityGates.js';
+
+const logger = () => Logger.getInstance();
+
+/** 观测日志只做旁路记录：日志器异常不得打断提示构建(observeSafely 吞掉观察者错误)。 */
+function logPromptPath(message: string) {
+  observeSafely(
+    () => logger().info(message),
+    () => undefined
+  );
+}
 
 /**
  * 构建重试提示
@@ -41,6 +57,24 @@ export function buildRetryPrompt(reason: string) {
       .slice(DEPTH_GAP_REASON.length)
       .replace(/^[:：]\s*/, '')
       .trim();
+    // C55: missing 有两种来源——门控在作者用小节组织时报缺口维度名；自由叙述(接地核心维度为 0)时
+    // 报通用深挖指令 GENERIC_DEPTH_GAP_HINT。通用指令(或空)不是维度名：不能列成「以下深度维度」，
+    // 也不能要求逐槽填 designIntent/boundaries/failureModes/tradeoffs(那正是用户否决的四问填表)，
+    // 改为引导在正文里补写带真实来源的深度断言——与深度门双轨中 groundedSignalCount 认可的形态一致。
+    if (!missing || missing === GENERIC_DEPTH_GAP_HINT) {
+      logPromptPath(
+        `[InsightGate] retry prompt: depth-gap branch=generic-claims (missing=${missing ? 'generic-hint' : 'empty'})`
+      );
+      return (
+        '分析中的深度断言缺少真实代码接地。不要凭空补写、不要改措辞充数——回到分析(Analyst)段，' +
+        '用 code({ action: "read" }) / graph({ action: "query" }) 回到核心发现的相关实现，' +
+        '在分析正文中为核心发现补写接地深度断言(因果/代价/例外/对照)，每条句内带真实 (来源: file:line)；' +
+        '挖到的角度恰好对应某个深度槽时，再顺手在 note_finding 中填该槽。读不到真实证据就不写。'
+      );
+    }
+    logPromptPath(
+      `[InsightGate] retry prompt: depth-gap branch=dimension-names (missing=${JSON.stringify(missing)})`
+    );
     return (
       `以下深度维度缺少真实代码接地${missing ? `：${missing}` : ''}。` +
       '不要凭空补写、不要改措辞充数——回到分析(Analyst)段，用 code({ action: "read" }) / graph({ action: "query" }) ' +
@@ -65,6 +99,95 @@ export function buildRetryPrompt(reason: string) {
     (hints as Record<string, string>)[reason] ||
     '请更深入地分析代码，引用至少 3 个具体文件，每个发现都要有代码证据。'
   );
+}
+
+/** 修复类提示里文件清单的上限(与拆分前一致)。 */
+const PROMPT_FILE_LIST_LIMIT = 30;
+
+/** 接地文件段标题：只有真实读取/片段投影过的文件可作为来源。 */
+const GROUNDED_FILES_HEADER = '已读取接地的文件（可作为来源）:';
+/** 仅提及段标题：正文提及或搜索命中、但未读取的路径。 */
+const MENTIONED_ONLY_FILES_HEADER = '仅提及、未读取（禁止作为引用）:';
+/** 旧工件段标题：宿主旧工件没有 groundedFiles 字段，无法区分提及与接地。 */
+const LEGACY_FILES_HEADER = '引用文件（旧工件未区分接地，仅可引用其中确实读取过的文件）:';
+
+/** 修复/重写提示的文件清单：可引用来源与仅提及路径分开。 */
+interface PromptFileSets {
+  /** 可作为来源的文件：新工件取 groundedFiles；旧工件兼容回退 referencedFiles。 */
+  citable: string[];
+  /** referencedFiles 中不在 groundedFiles 里的路径(文本提及/搜索命中)，禁止作为来源。 */
+  mentionedOnly: string[];
+  /** true = 工件没有可用的 groundedFiles 数组，citable 来自未区分接地的 referencedFiles。 */
+  legacyUngrounded: boolean;
+}
+
+function toStringList(value: unknown) {
+  return Array.isArray(value)
+    ? (value as unknown[]).filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
+/**
+ * C54: 解析修复类提示可引用的文件。
+ *
+ * evaluation/analysisArtifact 的 referencedFiles 含正文提及路径与搜索命中(只为旧消费者保留)，
+ * 真正接地的是 groundedFiles(真实读取/片段投影)——质量门 reviewInsightDepth 也只认后者。
+ * 因此：
+ * - 有 groundedFiles 数组 → 只有它可引用；即便为空也不回退 referencedFiles(否则提及路径会被重新
+ *   洗成「已验证」)，提及路径单列为禁止引用。
+ * - 无 groundedFiles 数组(宿主旧工件) → 兼容回退 referencedFiles，标题注明未区分接地。
+ * 三条路径都打观测日志，便于按 stage 追查重写/补记时模型看到的来源口径。
+ */
+function resolvePromptFileSets(
+  record: { groundedFiles?: unknown; referencedFiles?: unknown },
+  stage: 'record_repair' | 'summary_rewrite'
+): PromptFileSets {
+  const referenced = toStringList(record.referencedFiles);
+  if (!Array.isArray(record.groundedFiles)) {
+    logPromptPath(
+      `[InsightGate] ${stage} prompt: artifact has no groundedFiles; falling back to referencedFiles ` +
+        `as a legacy ungrounded list (path=legacy-referenced-files; referenced=${referenced.length})`
+    );
+    return {
+      citable: referenced.slice(0, PROMPT_FILE_LIST_LIMIT),
+      mentionedOnly: [],
+      legacyUngrounded: true,
+    };
+  }
+  const grounded = toStringList(record.groundedFiles);
+  const groundedSet = new Set(grounded);
+  const mentionedOnly = referenced.filter((file) => !groundedSet.has(file));
+  logPromptPath(
+    `[InsightGate] ${stage} prompt: citable files from groundedFiles ` +
+      `(path=${grounded.length > 0 ? 'grounded' : 'no-grounded'}; grounded=${grounded.length}; ` +
+      `mentionedOnly=${mentionedOnly.length})`
+  );
+  return {
+    citable: grounded.slice(0, PROMPT_FILE_LIST_LIMIT),
+    mentionedOnly: mentionedOnly.slice(0, PROMPT_FILE_LIST_LIMIT),
+    legacyUngrounded: false,
+  };
+}
+
+/**
+ * 渲染文件清单段。notes.emptyLegacy 只用于旧工件且清单为空的情形(保持旧工件原有口径)；
+ * 新工件接地清单为空时明确告知只能引用已有发现/证据，不得把正文提及路径当来源。
+ */
+function renderPromptFileSections(
+  files: PromptFileSets,
+  notes: { emptyGrounded: string; emptyLegacy: string }
+) {
+  const list = (items: string[]) => items.map((file) => `- ${file}`).join('\n');
+  if (files.legacyUngrounded) {
+    return `${LEGACY_FILES_HEADER}\n${files.citable.length > 0 ? list(files.citable) : notes.emptyLegacy}`;
+  }
+  const groundedSection = `${GROUNDED_FILES_HEADER}\n${
+    files.citable.length > 0 ? list(files.citable) : notes.emptyGrounded
+  }`;
+  if (files.mentionedOnly.length === 0) {
+    return groundedSection;
+  }
+  return `${groundedSection}\n\n${MENTIONED_ONLY_FILES_HEADER}\n${list(files.mentionedOnly)}`;
 }
 
 function stringifyRecordRepairEvidenceMap(evidenceMap: unknown) {
@@ -117,12 +240,26 @@ export function buildRecordRepairPrompt({
   const record = (artifact || {}) as {
     analysisText?: string;
     findings?: NormalizedFinding[];
-    referencedFiles?: string[];
+    referencedFiles?: unknown;
+    groundedFiles?: unknown;
     evidenceMap?: unknown;
   };
   const memoryFindingCount = getArtifactMemoryFindingCount(artifact);
   const missing = Math.max(1, minFindings - memoryFindingCount);
-  const files = Array.isArray(record.referencedFiles) ? record.referencedFiles.slice(0, 30) : [];
+  const fileSets = resolvePromptFileSets(record, 'record_repair');
+  const fileSections = renderPromptFileSections(fileSets, {
+    emptyGrounded: '- （无已读取接地的文件；只能引用下方已有发现与证据摘要中的台账来源）',
+    emptyLegacy: '- （无显式文件清单，请只使用分析正文中出现的文件路径）',
+  });
+  // 只有区分了接地的新工件才渲染「仅提及」段；旧工件不引用不存在的段落。
+  const mentionedOnlyRule = fileSets.legacyUngrounded
+    ? ''
+    : '\n- 「仅提及、未读取」的路径只是正文提及或搜索命中，不是证据，不得作为发现的来源';
+  // 无 evidenceMap(V1 报告)时：区分了接地的工件不能再让模型「用正文里的路径」——正文含仅提及路径；
+  // 旧工件保持原口径。
+  const noEvidenceMapNote = fileSets.legacyUngrounded
+    ? '- （无 evidenceMap，使用分析正文中的文件路径和行号）'
+    : '- （无 evidenceMap；只能引用上方已读取接地的文件与台账 E-id，正文中仅提及的路径不可作为来源）';
   const existingFindings = Array.isArray(record.findings) ? record.findings.slice(0, 8) : [];
   const evidenceMapText = stringifyRecordRepairEvidenceMap(record.evidenceMap);
 
@@ -135,13 +272,12 @@ export function buildRecordRepairPrompt({
 硬性规则:
 - 使用 note_finding({ finding, evidenceRefs, importance }) 记录；可用 evidence.search/get 查回已采集证据及其 E-id
 - 每次工具调用只记录一条发现，直到补齐至少 ${minFindings} 条结构化发现
-- evidenceRefs 必须使用工具实际返回的台账 E-id，不得把 file:line 字符串当成引用 id
+- evidenceRefs 必须使用工具实际返回的台账 E-id，不得把 file:line 字符串当成引用 id${mentionedOnlyRule}
 - 禁止调用 code、graph、terminal、knowledge 或任何探索/提交工具
 - 不要把 Markdown 正文当作完成结果
 - 如果无法调用 note_finding，本阶段必须失败并回到调用链修复；不要输出 JSON、Markdown 或其它替代格式
 
-已验证文件:
-${files.length > 0 ? files.map((file) => `- ${file}`).join('\n') : '- （无显式文件清单，请只使用分析正文中出现的文件路径）'}
+${fileSections}
 
 已有发现摘要:
 ${
@@ -153,7 +289,7 @@ ${
 }
 
 证据摘要:
-${evidenceMapText || '- （无 evidenceMap，使用分析正文中的文件路径和行号）'}
+${evidenceMapText || noEvidenceMapNote}
 
 分析正文（只读依据，不要继续探索）:
 ${String(record.analysisText || '').slice(0, 8000)}`;
@@ -165,7 +301,8 @@ ${String(record.analysisText || '').slice(0, 8000)}`;
  * 触发前提：证据面已达标(findings/文件引用充足)，只有分析写作不过门(文本短、缺结构、
  * 缺接地深度断言——典型是 analyze 超时打断总结)。该阶段零工具、单次调用：把已验证发现
  * 组织成结构化深度分析文本，成本是整段 analysis_retry 重挖的零头。
- * 防编造与 record_repair 同一立场：引用只可来自下方注入的已验证文件/证据，禁止新增。
+ * 防编造与 record_repair 同一立场：引用只可来自下方注入的已验证发现与已读取接地的文件，禁止新增；
+ * 上一稿正文里出现、但不在接地清单中的路径(文本提及/搜索命中)不得作为来源(C54)。
  */
 export function buildSummaryRewritePrompt(options: {
   reason: string;
@@ -174,12 +311,20 @@ export function buildSummaryRewritePrompt(options: {
   const record = (options.artifact || {}) as {
     analysisText?: unknown;
     findings?: Array<{ finding?: unknown; evidence?: unknown; importance?: unknown }>;
-    referencedFiles?: unknown[];
+    referencedFiles?: unknown;
+    groundedFiles?: unknown;
   };
   const findings = Array.isArray(record.findings) ? record.findings.slice(0, 24) : [];
-  const files = Array.isArray(record.referencedFiles)
-    ? record.referencedFiles.filter((f): f is string => typeof f === 'string').slice(0, 30)
-    : [];
+  const fileSets = resolvePromptFileSets(record, 'summary_rewrite');
+  const fileSections = renderPromptFileSections(fileSets, {
+    emptyGrounded: '-（无已读取接地的文件；只能引用上方已验证发现中的来源）',
+    emptyLegacy: '-（使用上一稿正文中出现的路径）',
+  });
+  // 硬性规则里的文件清单名与实际渲染的段落一致：新工件=已读取接地的文件，旧工件=引用文件。
+  const fileListName = fileSets.legacyUngrounded ? '引用文件' : '已读取接地的文件';
+  const groundingRule = fileSets.legacyUngrounded
+    ? ''
+    : '\n- 上一稿正文或「仅提及、未读取」清单里出现、但不在「已读取接地的文件」清单中的路径不得作为 (来源: …)';
   const prevText = String(record.analysisText || '').slice(0, 2000);
 
   return `QualityGate 判定你的探索证据已经达标（${findings.length} 条已验证发现），唯一不通过的是分析写作本身。
@@ -187,9 +332,9 @@ export function buildSummaryRewritePrompt(options: {
 失败原因: ${options.reason || 'analysis text too short or lacks grounded depth claims'}
 
 本阶段是纯写作重组，不是重新分析:
-- 只根据下方「已验证发现」和「已验证文件」写出完整的结构化深度分析
+- 只根据下方「已验证发现」和「${fileListName}」写出完整的结构化深度分析
 - 用 ## 小节组织；每个核心论断句内带 (来源: 文件路径:行号)
-- 引用只能使用下方发现/文件中出现的路径与行号，禁止引入任何新文件、新行号、新事实
+- 引用只能使用下方发现/${fileListName}中出现的路径与行号，禁止引入任何新文件、新行号、新事实${groundingRule}
 - 写出深度：解释为什么这样设计(因果)、代价/权衡、边界或例外，各自落在真实来源上
 - 全文不少于 600 字中文；直接输出分析全文，不要解释这次重写
 
@@ -205,8 +350,7 @@ ${
     : '-（无结构化发现，使用下方文件与上一稿正文）'
 }
 
-已验证文件:
-${files.length > 0 ? files.map((file) => `- ${file}`).join('\n') : '-（使用上一稿正文中出现的路径）'}
+${fileSections}
 
 上一稿正文（可吸收其内容，但必须重写扩充）:
 ${prevText || '（上一稿为空）'}`;

@@ -410,8 +410,13 @@ note_finding({ finding: "发现描述", evidenceRefs: ["E-1"], importance: 8 })
 如果当前维度需要产出候选知识，最终至少记录 3 条 note_finding；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止；若确认不足 3 条，请记录所有已确认发现，并在最终报告说明不足原因。
 最终 Markdown 报告只能围绕已记录的 note_finding 展开；不要把未调用 note_finding 的信号写成核心发现或候选义务。未记录的信号只能放入待探索/未结构化记录说明。
 缺少 note_finding(...) 或数量不足会直接影响 QualityGate 评分并触发 retry。`);
+  // C53: note_finding 写入 ActiveContext scratchpad(每轮以「📌 已确认的关键发现」注入工作上下文)，
+  // 不写工具上下文的 sessionStore，所以 memory recall tags=finding 必然空返回、白耗一轮并误导模型
+  // 以为尚未记录。这里只指向真实入口：回执计数/工作上下文、前序维度证据、已采证据台账。
   parts.push(
-    '使用 memory({ action: "recall", params: { tags: ["finding"] } }) 回顾已记录的发现，避免重复分析。'
+    '已记录的发现无需另行查询：note_finding 的回执会给出当前累计条数，已记录内容由系统保留在工作上下文的「📌 已确认的关键发现」中，记录前对照它避免重复。' +
+      '查前序维度对同一文件/类的分析证据用 memory({ action: "get_previous_evidence", params: { query: "类名/文件名" } })；' +
+      '查回已采集证据及其 E-id 用 evidence({ action: "search" }) / evidence({ action: "get" })。'
   );
 
   // §6 前序维度分析摘要 (Tier 2+ 才有)

@@ -2910,3 +2910,25 @@ describe('Analyst budget tiers and rescan sections (C35)', () => {
     expect(prompt).toContain('"Old pattern" — 衰退原因: 未知');
   });
 });
+
+describe('Analyst prompt points finding review at real data paths (C53)', () => {
+  it('does not steer recorded-finding review to memory.recall tags=finding', async () => {
+    // note_finding 写入 ActiveContext scratchpad，不写 ctx.sessionStore；recall tags=finding 必然空返回。
+    const prompt = await buildAnalystPrompt(
+      { id: 'architecture', label: 'Architecture', outputType: 'candidate' },
+      { name: 'fixture', lang: 'typescript', fileCount: 3 },
+      null,
+      null,
+      null,
+      null
+    );
+    expect(prompt).not.toContain('action: "recall"');
+    expect(prompt).not.toContain('tags: ["finding"]');
+    // 指向真实入口：回执计数 + 工作上下文保留、前序维度证据、已采证据台账。
+    expect(prompt).toContain('note_finding 的回执会给出当前累计条数');
+    expect(prompt).toContain('📌 已确认的关键发现');
+    expect(prompt).toContain('memory({ action: "get_previous_evidence", params: { query:');
+    expect(prompt).toContain('evidence({ action: "search" })');
+    expect(prompt).toContain('evidence({ action: "get" })');
+  });
+});
