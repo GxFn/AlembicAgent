@@ -15,14 +15,7 @@ import {
   createCausalRepairNodeV1,
   type StrictProducerLineageReceiptV1,
 } from './lineage.js';
-import {
-  fail,
-  freeze,
-  hashCanonical,
-  hashCoreCanonical,
-  normalizeIds,
-  requireText,
-} from './primitives.js';
+import { fail, freeze, hashCanonical, hashCoreCanonical, requireText } from './primitives.js';
 
 export interface FullAuthoredProjectionV1 {
   readonly title: string;
@@ -103,6 +96,7 @@ export interface CreateStrictProducerExpressionSetInputV1 {
 export function createStrictProducerExpressionSetV1(
   input: CreateStrictProducerExpressionSetInputV1
 ): StrictProducerExpressionSetV1 {
+  assertStrictProducerInputShape(input);
   rejectProducerCallerLineageFields(input);
   assertStrictProducerLineageIntegrity(input.lineage);
   requireText(input.modelHash, 'STRICT_PRODUCER_MODEL_HASH_REQUIRED');
@@ -149,6 +143,33 @@ export function createStrictProducerExpressionSetV1(
     repairNode,
   };
   return freeze({ ...semantic, setHash: hashCanonical(semantic) });
+}
+
+const PRODUCER_INPUT_SHAPE_INVALID = 'STRICT_PRODUCER_INPUT_SHAPE_INVALID';
+
+/**
+ * 建集入口的容器形状守卫（C24）。宿主 parseProducerOutput 只断言 proposals 是数组、元素原样
+ * `as` 传入；这里在任何解引用之前拒绝非对象根与非对象 zeroDisposition，元素形状在
+ * normalizeStrictProducerProposals 中逐个检查。zeroDisposition 缺省（undefined）沿用既有语义，
+ * 与 null 一样表示无零处置。
+ */
+function assertStrictProducerInputShape(input: CreateStrictProducerExpressionSetInputV1): void {
+  if (!isPlainRecord(input)) {
+    fail(PRODUCER_INPUT_SHAPE_INVALID, 'input');
+  }
+  const zeroDisposition: unknown = input.zeroDisposition;
+  if (
+    zeroDisposition !== null &&
+    zeroDisposition !== undefined &&
+    !isPlainRecord(zeroDisposition)
+  ) {
+    fail(PRODUCER_INPUT_SHAPE_INVALID, 'zeroDisposition');
+  }
+}
+
+/** 普通 JSON 对象：非 null、非数组。 */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function rejectProducerCallerLineageFields(input: CreateStrictProducerExpressionSetInputV1): void {
@@ -201,13 +222,12 @@ function validateProducerExpressionCardinality(
 function normalizeStrictProducerProposals(
   input: readonly StrictProducerProposalInputV1[]
 ): StrictProducerProposalV1[] {
-  const expressionIds = normalizeIds(
-    input.map((proposal) => proposal.expressionId),
-    'expressionIds'
-  );
-  if (expressionIds.length !== input.length) {
-    fail('STRICT_PRODUCER_EXPRESSION_DUPLICATE');
-  }
+  input.forEach((proposal, index) => {
+    if (!isPlainRecord(proposal)) {
+      fail(PRODUCER_INPUT_SHAPE_INVALID, `proposals[${index}]`);
+    }
+  });
+  assertStrictProducerExpressionIds(input);
   for (const proposal of input) {
     if (!['draft', 'merge', 'duplicate'].includes(proposal.kind)) {
       fail('STRICT_PRODUCER_KIND_INVALID', proposal.expressionId);
@@ -237,6 +257,32 @@ function normalizeStrictProducerProposals(
       }),
     }))
     .sort((left, right) => left.expressionId.localeCompare(right.expressionId, 'en'));
+}
+
+/**
+ * expressionId 原样进入 authoredFingerprintHash、setHash 与 Core 终态收据，宿主按原值关联终态
+ * （C33）。因此不静默 trim（会改变已持久化哈希的身份口径），而是拒绝非字符串、空白与首尾空白，
+ * 再以原值判重并给出专用重复码；不再借用 normalizeIds 的通用 STRICT_ID_SET_INVALID。
+ */
+function assertStrictProducerExpressionIds(input: readonly StrictProducerProposalInputV1[]): void {
+  const seen = new Set<string>();
+  const expressionIds = input.map((proposal, index) => {
+    const expressionId: unknown = proposal.expressionId;
+    if (
+      typeof expressionId !== 'string' ||
+      expressionId.trim().length === 0 ||
+      expressionId !== expressionId.trim()
+    ) {
+      fail('STRICT_PRODUCER_EXPRESSION_ID_INVALID', `proposals[${index}]`);
+    }
+    return expressionId;
+  });
+  for (const expressionId of expressionIds) {
+    if (seen.has(expressionId)) {
+      fail('STRICT_PRODUCER_EXPRESSION_DUPLICATE', expressionId);
+    }
+    seen.add(expressionId);
+  }
 }
 
 function createStrictProducerZeroDisposition(
@@ -416,6 +462,29 @@ function assertStrictProducerExpressionSetIntegrity(set: StrictProducerExpressio
     (set.version === 1) !== (set.parentSetId === null)
   ) {
     fail('STRICT_PRODUCER_PARENT_SET_DEPTH_MISMATCH');
+  }
+  assertStrictProducerRepairNodeStructure(set);
+}
+
+/**
+ * 表达集修复节点与 lineage 的结构绑定（C32）。节点自身的派生身份已由
+ * assertCausalRepairNodeIntegrity 复核；这里再约束它在表达集里的位置：
+ * - 表达集只由 Producer 阶段创建，stage 必须是 producer；
+ * - 修复链同一 lineage（前驱 lineageHash 已由 STRICT_PRODUCER_PREDECESSOR_BINDING_CHANGED 绑定），
+ *   createCausalRepairNodeV1 对首版取 [knowledgeRootId]、对修复版继承前驱 rootIds，所以任何版本的
+ *   rootIds 都必须恰为 [lineage.knowledgeRootId]，否则子集合会继承指向不存在根的伪造 rootIds；
+ * - 首版没有前驱节点；修复版恰有一个前驱节点（单前驱链）。前驱节点 ID 与父集合节点逐一相等
+ *   需要父集合在场，由 createStrictProducerExpressionSetV1 以 [parentSet.repairNode] 构造保证。
+ */
+function assertStrictProducerRepairNodeStructure(set: StrictProducerExpressionSetV1): void {
+  const { repairNode } = set;
+  if (
+    repairNode.stage !== 'producer' ||
+    repairNode.rootIds.length !== 1 ||
+    repairNode.rootIds[0] !== set.lineage.knowledgeRootId ||
+    repairNode.parentNodeIds.length !== (set.version === 1 ? 0 : 1)
+  ) {
+    fail('STRICT_PRODUCER_PARENT_SET_REPAIR_STRUCTURE_MISMATCH');
   }
 }
 

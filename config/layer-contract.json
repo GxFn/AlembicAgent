@@ -301,7 +301,9 @@
         "src/agent/production/strict/primitives.ts"
       ],
       "src/agent/production/strict/analyst.ts": [
+        "@alembic/core/logging",
         "@alembic/core/production",
+        "src/shared/observers.ts",
         "src/agent/production/strict/primitives.ts"
       ],
       "src/agent/production/strict/lineage.ts": [

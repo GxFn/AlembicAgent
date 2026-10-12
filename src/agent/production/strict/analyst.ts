@@ -1,4 +1,5 @@
 /** Analyst语义回执、重建验证与fixpoint；外层hash相同不替代Core事实再验证。 */
+import Logger from '@alembic/core/logging';
 import {
   type AnalysisFixpointReceiptV1,
   assertKnowledgeDispositionReviewV1,
@@ -20,6 +21,7 @@ import {
   type ObservationPopulationInputV1,
   type ObservationPopulationV1,
 } from '@alembic/core/production';
+import { observeSafely } from '#shared/observers.js';
 import {
   assertSameIds,
   fail,
@@ -128,10 +130,19 @@ export interface StrictAnalystEpochV1 {
   readonly epochHash: string;
 }
 
+/** 模型 JSON 形状不合法（缺容器、元素非对象等）的统一错误码，detail 为字段路径。 */
+const ANALYST_INPUT_SHAPE_INVALID = 'STRICT_ANALYST_INPUT_SHAPE_INVALID';
+
 export function validateStrictAnalystEpochV1(
   input: StrictAnalystEpochInputV1
 ): StrictAnalystEpochV1 {
+  if (!isPlainRecord(input)) {
+    fail(ANALYST_INPUT_SHAPE_INVALID, 'input');
+  }
+  // 封印段的 review context hash 先于容器形状校验：缺整段宿主封印（跨仓第二步前的纯提案）时，
+  // 仍按既有码报告“缺封印”，而不是报告其中某个回执容器缺失。
   requireCoreHash(input.currentAnalysisFixpointHash, 'STRICT_ANALYST_REVIEW_CONTEXT_HASH_INVALID');
+  assertStrictAnalystInputShape(input);
   rejectLegacySemanticAuthority(input);
   const { executionReceipts, knownFactIds, population } = validateStrictPopulationAuthority(input);
   const clusterSet = createStrictClusterSet(input, population);
@@ -160,6 +171,90 @@ export function validateStrictAnalystEpochV1(
     producerEligibleHypotheses,
   };
   return freeze({ ...semantic, epochHash: hashCanonical(semantic) });
+}
+
+/**
+ * 模型 JSON 进入核心校验前的形状守卫（C24）。宿主 parseAnalystEnvelope 只做类型断言，TS 类型在
+ * 运行时约束不到模型输出；这里只核对 Agent 自己会解引用的容器与元素形状，字段语义仍交给后续
+ * 校验与 Core 构造器裁决。失败抛 `STRICT_ANALYST_INPUT_SHAPE_INVALID: <字段路径>`，G1 的 reject
+ * reason 因此能区分“模型输出格式不合法”与“语义/权威不一致”，而不是一条无码 TypeError。
+ * 宿主封印段（dispositionReview、dispositionReviews）一并检查容器形状，回执内容仍由 Core 断言。
+ */
+function assertStrictAnalystInputShape(input: StrictAnalystEpochInputV1): void {
+  requireRecordArray(input.clusterInputs, 'clusterInputs');
+  requireRecordArray(input.nonClusteredDispositions, 'nonClusteredDispositions');
+  requireRecordArray(input.inductionInputs, 'inductionInputs').forEach((induction, index) => {
+    const path = `inductionInputs[${index}]`;
+    requireRecordArray(induction.hypotheses, `${path}.hypotheses`).forEach(
+      (hypothesis, hypothesisIndex) => {
+        requireArray(
+          hypothesis.premiseFactIds,
+          `${path}.hypotheses[${hypothesisIndex}].premiseFactIds`
+        );
+      }
+    );
+  });
+  requireRecordArray(input.falsificationInputs, 'falsificationInputs').forEach(
+    (falsification, index) => {
+      const path = `falsificationInputs[${index}]`;
+      // counterqueryApplicability 会被 Object.hasOwn 与展开读取，非对象时 Core 之前就会抛 TypeError。
+      if (!isPlainRecord(falsification.counterqueryApplicability)) {
+        fail(ANALYST_INPUT_SHAPE_INVALID, `${path}.counterqueryApplicability`);
+      }
+      requireArray(falsification.enrolledCounterqueryIds, `${path}.enrolledCounterqueryIds`);
+      requireRecordArray(falsification.executions, `${path}.executions`).forEach(
+        (execution, executionIndex) => {
+          requireArray(
+            execution.counterexampleFactIds,
+            `${path}.executions[${executionIndex}].counterexampleFactIds`
+          );
+        }
+      );
+      if (!isPlainRecord(falsification.dispositionReview)) {
+        fail(ANALYST_INPUT_SHAPE_INVALID, `${path}.dispositionReview`);
+      }
+    }
+  );
+  requireRecordArray(input.hypothesisDispositions, 'hypothesisDispositions').forEach(
+    (disposition, index) => {
+      const path = `hypothesisDispositions[${index}]`;
+      const { hypothesisId, causalParentHypothesisId } = disposition;
+      if (typeof hypothesisId !== 'string' || hypothesisId.trim().length === 0) {
+        fail(ANALYST_INPUT_SHAPE_INVALID, `${path}.hypothesisId`);
+      }
+      // 契约是“narrowed 时给出，否则省略”；null 视同省略（投影时归一并记录诊断），其他类型拒绝。
+      if (
+        causalParentHypothesisId !== undefined &&
+        causalParentHypothesisId !== null &&
+        typeof causalParentHypothesisId !== 'string'
+      ) {
+        fail(ANALYST_INPUT_SHAPE_INVALID, `${path}.causalParentHypothesisId`);
+      }
+    }
+  );
+  requireRecordArray(input.dispositionReviews, 'dispositionReviews');
+}
+
+/** 普通 JSON 对象：非 null、非数组。模型 JSON 解码后只会出现这类对象。 */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requireArray(value: unknown, path: string): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    fail(ANALYST_INPUT_SHAPE_INVALID, path);
+  }
+  return value;
+}
+
+function requireRecordArray(value: unknown, path: string): readonly Record<string, unknown>[] {
+  const rows = requireArray(value, path);
+  rows.forEach((row, index) => {
+    if (!isPlainRecord(row)) {
+      fail(ANALYST_INPUT_SHAPE_INVALID, `${path}[${index}]`);
+    }
+  });
+  return rows as readonly Record<string, unknown>[];
 }
 
 function validateStrictPopulationAuthority(input: StrictAnalystEpochInputV1): {
@@ -322,8 +417,9 @@ function resolveStrictHypothesisDispositions(
   readonly dispositions: readonly StrictHypothesisDispositionV1[];
   readonly producerEligibleHypotheses: readonly ProducerEligibleHypothesisV1[];
 } {
+  const projected = projectStrictHypothesisDispositions(input.hypothesisDispositions);
   // 外部解码结果不受 TS union 约束；非法标签不能绕过 unknown 的 fixpoint 失败路径。
-  for (const disposition of input.hypothesisDispositions) {
+  for (const disposition of projected) {
     if (!['survived', 'narrowed', 'refuted', 'unknown'].includes(disposition.status)) {
       fail('STRICT_ANALYST_HYPOTHESIS_DISPOSITION_INVALID', disposition.hypothesisId);
     }
@@ -332,7 +428,7 @@ function resolveStrictHypothesisDispositions(
     falsifications.map((receipt) => [receipt.hypothesisId, receipt])
   );
   // 处置顺序决定 hypothesisDispositions 与 producerEligibleHypotheses 的顺序并进入 epochHash，固定 en。
-  const dispositions = [...input.hypothesisDispositions].sort((left, right) =>
+  const dispositions = [...projected].sort((left, right) =>
     left.hypothesisId.localeCompare(right.hypothesisId, 'en')
   );
   if (
@@ -373,6 +469,63 @@ function resolveStrictHypothesisDispositions(
     }
   }
   return { dispositions, producerEligibleHypotheses };
+}
+
+const HYPOTHESIS_DISPOSITION_CONTRACT_FIELDS: ReadonlySet<string> = new Set([
+  'hypothesisId',
+  'status',
+  'causalParentHypothesisId',
+]);
+
+/**
+ * 处置行只投影契约字段后才进入 epoch 与 epochHash（C24）：模型附加的 notes 等自由文本不改变同一
+ * 语义 epoch 的哈希。合法行（只含契约字段）投影前后逐字节相同，哈希不变；显式 null 的
+ * causalParentHypothesisId 按“省略”处理（JSON.stringify 原本就丢弃 undefined，null 则会进入哈希）。
+ * 发生丢字段或 null 归一时记录诊断，便于追查模型输出偏离契约；诊断不参与裁决。
+ * 形状（hypothesisId 为非空字符串、causalParentHypothesisId 为字符串/null/缺省）已由
+ * assertStrictAnalystInputShape 在入口保证。
+ */
+function projectStrictHypothesisDispositions(
+  rows: readonly StrictHypothesisDispositionV1[]
+): StrictHypothesisDispositionV1[] {
+  const droppedFields = new Set<string>();
+  const nullParentHypothesisIds: string[] = [];
+  const projected = rows.map((row): StrictHypothesisDispositionV1 => {
+    for (const key of Object.keys(row)) {
+      if (!HYPOTHESIS_DISPOSITION_CONTRACT_FIELDS.has(key)) {
+        droppedFields.add(key);
+      }
+    }
+    const parent: unknown = row.causalParentHypothesisId;
+    if (parent === null) {
+      nullParentHypothesisIds.push(row.hypothesisId);
+    }
+    return {
+      hypothesisId: row.hypothesisId,
+      status: row.status,
+      ...(typeof parent === 'string' ? { causalParentHypothesisId: parent } : {}),
+    };
+  });
+  if (droppedFields.size > 0 || nullParentHypothesisIds.length > 0) {
+    // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，投影结果不因诊断失败而改变。
+    observeSafely(
+      () =>
+        Logger.getInstance().info(
+          '[StrictAnalyst] hypothesis dispositions projected to contract fields',
+          {
+            component: 'validateStrictAnalystEpochV1',
+            reason: 'model-output-outside-disposition-contract',
+            selectedPath: 'project-contract-fields',
+            droppedFields: [...droppedFields].sort(),
+            nullParentHypothesisIds: [...nullParentHypothesisIds].sort(),
+            rowCount: rows.length,
+            followUpCheck: 'epoch-hash-covers-contract-fields-only',
+          }
+        ),
+      () => undefined
+    );
+  }
+  return projected;
 }
 
 export interface CreateStrictAnalysisFixpointInputV1 {

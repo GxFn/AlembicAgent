@@ -72,6 +72,19 @@ const REQUIRED_CONTEXT_TEXT_FIELDS = [
   'sourceRevisionVectorHash',
 ] as const;
 
+/**
+ * 尚未产生时为 null、产生后为 Core hash/修订号的字段。只接受 null 或非空字符串：undefined 会在
+ * hashCanonical 中被丢键，与 null 产生不同的 contextHash，并让 retry 校验（`!== null`）把“缺字段”
+ * 误报成“已达 fixpoint”；数字或空串也不是合法 hash。宿主当前只传 null 或 Core hash。
+ */
+const NULLABLE_CONTEXT_HASH_FIELDS = [
+  'expansionHeadHash',
+  'finalExpandedScheduleHash',
+  'analysisFixpointHash',
+  'privateCorpusRevision',
+  'hypothesisExpressionSetHash',
+] as const;
+
 const CONTEXT_ARRAY_FIELDS = [
   'questionIds',
   'factQueryObligationIds',
@@ -92,6 +105,11 @@ export function createStrictAnalysisContextProjectionV1(
 ): StrictAnalysisContextProjectionV1 {
   for (const field of REQUIRED_CONTEXT_TEXT_FIELDS) {
     requireText(input[field], `STRICT_CONTEXT_${field.toUpperCase()}_REQUIRED`);
+  }
+  for (const field of NULLABLE_CONTEXT_HASH_FIELDS) {
+    if (input[field] !== null) {
+      requireText(input[field], `STRICT_CONTEXT_${field.toUpperCase()}_INVALID`);
+    }
   }
   if (input.derivedFindingCount !== 0) {
     fail('STRICT_CONTEXT_DERIVED_FINDING_FORBIDDEN');

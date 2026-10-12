@@ -9,6 +9,7 @@ import {
   type StrictAnalysisContextProjectionV1,
   type StrictAnalysisEpochSnapshotV1,
   type StrictAnalysisGateOutcomeV1,
+  validateStrictAnalysisEpochTransitionV1,
 } from '../src/agent/production/StrictProductionPipeline.js';
 import { buildStrictAnalystPrompt } from '../src/agent/production/StrictProductionPrompts.js';
 import {
@@ -1259,5 +1260,298 @@ describe('strict Analyst prompt population projection', () => {
         selectedPath: 'render-null-identity-fields',
       })
     );
+  });
+});
+
+// C27：上下文投影的 5 个可空 hash 字段只接受 null 或非空字符串。undefined 曾被投影接受，
+// 随后在 retry 校验里因 `undefined !== null` 被误报为“已达 fixpoint”；数字与空串也曾进入 contextHash。
+describe('strict analysis context nullable hash fields', () => {
+  const NULLABLE_CONTEXT_FIELDS = [
+    'expansionHeadHash',
+    'finalExpandedScheduleHash',
+    'analysisFixpointHash',
+    'privateCorpusRevision',
+    'hypothesisExpressionSetHash',
+  ] as const;
+
+  it.each(
+    NULLABLE_CONTEXT_FIELDS.flatMap((field) => [
+      [field, 'undefined', undefined],
+      [field, 'an empty string', ''],
+      [field, 'a blank string', '   '],
+      [field, 'a number', 42],
+    ])
+  )('rejects %s given %s with a field-specific code', (field, _label, value) => {
+    expect(() => createContext({ [field]: value } as never)).toThrow(
+      new RegExp(`^STRICT_CONTEXT_${field.toUpperCase()}_INVALID$`, 'u')
+    );
+  });
+
+  it('rejects a context whose nullable field key is missing entirely', () => {
+    const { schemaVersion: _version, contextHash: _hash, ...input } = createContext();
+    const { analysisFixpointHash: _omitted, ...withoutField } = input;
+    expect(() => createStrictAnalysisContextProjectionV1(withoutField as never)).toThrow(
+      /^STRICT_CONTEXT_ANALYSISFIXPOINTHASH_INVALID$/u
+    );
+  });
+
+  it('keeps null and non-empty values and the existing context hash format', () => {
+    // 合法输入的 contextHash 与收紧前逐字节一致（钉住收紧前在 HEAD 上计算的值）。
+    expect(createContext().contextHash).toBe(
+      'bab0b87ca4778c9cbc1cf1929c28c32e85d54a112283c2d14571798c1527aa76'
+    );
+    const filled = createContext({
+      expansionHeadHash: 'head-1',
+      finalExpandedScheduleHash: 'final-1',
+      analysisFixpointHash: 'fixpoint-1',
+      privateCorpusRevision: 'revision-1',
+      hypothesisExpressionSetHash: 'expression-set-1',
+    });
+    expect(filled).toMatchObject({
+      expansionHeadHash: 'head-1',
+      finalExpandedScheduleHash: 'final-1',
+      analysisFixpointHash: 'fixpoint-1',
+      privateCorpusRevision: 'revision-1',
+      hypothesisExpressionSetHash: 'expression-set-1',
+    });
+    expect(filled.contextHash).toBe(
+      '47a762b363cbcc109bc9a6785ee5940a2035d0d1756b0c0c0224ed7891bc4f17'
+    );
+  });
+
+  it('fails an undefined final schedule at snapshot re-validation instead of a misleading retry code', () => {
+    const initial = createInitialEpoch();
+    const { schemaVersion: _version, snapshotHash: _hash, ...input } = initial;
+    expect(() =>
+      createStrictAnalysisEpochSnapshotV1({
+        ...input,
+        context: { ...initial.context, finalExpandedScheduleHash: undefined } as never,
+      })
+    ).toThrow(/^STRICT_CONTEXT_FINALEXPANDEDSCHEDULEHASH_INVALID$/u);
+  });
+});
+
+// C29（U49-F10）：直接调用 validateStrictAnalysisEpochTransitionV1 覆盖 fail-closed 分支；
+// 经 G1 evaluator 的同名分支由 strict-production-stages-gate-classification.test.ts 覆盖。
+describe('strict analysis epoch transition fail-closed branches', () => {
+  const LIMITS = { maxEpochs: 3, maxObligations: 3 };
+
+  function snapshotInput(snapshot: StrictAnalysisEpochSnapshotV1) {
+    const { schemaVersion: _version, snapshotHash: _hash, ...input } = snapshot;
+    return input;
+  }
+
+  function rejectOutcome(observed: StrictAnalysisEpochSnapshotV1) {
+    return createStrictAnalysisGateOutcomeV1({
+      action: 'reject',
+      reasonCode: 'analyst-rejected',
+      observedEpochHash: observed.snapshotHash,
+    });
+  }
+
+  function retryEpoch(input: {
+    terminalObligationIds: readonly string[];
+    outstandingObligationIds: readonly string[];
+    finalExpandedScheduleHash?: string | null;
+  }): StrictAnalysisEpochSnapshotV1 {
+    const before = createInitialEpoch();
+    const advanced = nextContext(before.context, {
+      expansionHeadHash: 'head-2',
+      obligationId: 'counter-1',
+      factId: 'fact-counter',
+      witnessId: 'witness-counter',
+      populationHash: 'population-2',
+    });
+    const { schemaVersion: _version, contextHash: _hash, ...contextInput } = advanced;
+    return createStrictAnalysisEpochSnapshotV1({
+      epoch: 2,
+      context: createStrictAnalysisContextProjectionV1({
+        ...contextInput,
+        finalExpandedScheduleHash: input.finalExpandedScheduleHash ?? null,
+      }),
+      populations: [{ populationId: 'population-main', revision: 2 }],
+      terminalObligationIds: input.terminalObligationIds,
+      outstandingObligationIds: input.outstandingObligationIds,
+    });
+  }
+
+  function retryOutcome(observed: StrictAnalysisEpochSnapshotV1) {
+    return createStrictAnalysisGateOutcomeV1({
+      action: 'analysis_retry',
+      reasonCode: 'counterquery-executed',
+      observedEpochHash: observed.snapshotHash,
+      enrolledObligationIds: ['counter-1'],
+      executedObligationIds: ['counter-1'],
+    });
+  }
+
+  it('accepts an unchanged reject and a well-formed retry as controls', () => {
+    const before = createInitialEpoch();
+    expect(
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after: before,
+        outcome: rejectOutcome(before),
+        limits: LIMITS,
+      })
+    ).toMatchObject({ action: 'reject', reasonCode: 'analyst-rejected' });
+    const after = retryEpoch({
+      terminalObligationIds: ['base-1', 'counter-1'],
+      outstandingObligationIds: [],
+    });
+    expect(
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: retryOutcome(before),
+        limits: LIMITS,
+      })
+    ).toMatchObject({ action: 'analysis_retry', enrolledObligationIds: ['counter-1'] });
+  });
+
+  it.each([
+    {
+      label: 'epoch beyond maxEpochs',
+      before: () =>
+        createStrictAnalysisEpochSnapshotV1({ ...snapshotInput(createInitialEpoch()), epoch: 2 }),
+      limits: { maxEpochs: 1, maxObligations: 3 },
+    },
+    {
+      label: 'obligations beyond maxObligations',
+      before: () =>
+        createStrictAnalysisEpochSnapshotV1({
+          epoch: 1,
+          context: createContext({ factQueryObligationIds: ['base-1', 'base-2'] }),
+          populations: [],
+          terminalObligationIds: ['base-1', 'base-2'],
+          outstandingObligationIds: [],
+        }),
+      limits: { maxEpochs: 3, maxObligations: 1 },
+    },
+  ])('rejects an entry snapshot with $label', ({ before, limits }) => {
+    const snapshot = before();
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before: snapshot,
+        after: snapshot,
+        outcome: rejectOutcome(snapshot),
+        limits,
+      })
+    ).toThrow(/^STRICT_ANALYSIS_LOOP_LIMIT_INVALID_AT_ENTRY$/u);
+  });
+
+  it('rejects a reject outcome whose after snapshot was mutated', () => {
+    const before = createInitialEpoch();
+    const after = createStrictAnalysisEpochSnapshotV1({
+      ...snapshotInput(before),
+      populations: [...before.populations, { populationId: 'population-shadow', revision: 2 }],
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: rejectOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(/^STRICT_ANALYSIS_REJECT_MUTATED_EPOCH$/u);
+  });
+
+  it.each([
+    ['runId', { runId: 'run-replaced' }],
+    ['sourceRevisionVectorHash', { sourceRevisionVectorHash: 'vector-replaced' }],
+    ['privateCorpusRevision', { privateCorpusRevision: 'revision-late' }],
+    ['hypothesisExpressionSetHash', { hypothesisExpressionSetHash: 'expression-set-late' }],
+  ] as const)('rejects %s identity drift between snapshots', (field, overrides) => {
+    const before = createInitialEpoch();
+    const after = createStrictAnalysisEpochSnapshotV1({
+      ...snapshotInput(before),
+      context: createContext(overrides),
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: rejectOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(new RegExp(`^STRICT_ANALYSIS_EPOCH_IDENTITY_DRIFT: ${field}$`, 'u'));
+  });
+
+  it.each([
+    ['FACTIDS', { factIds: [] }],
+    ['WITNESSIDS', { witnessIds: [] }],
+    ['POPULATIONHASHES', { populationHashes: [] }],
+    ['EVIDENCEENTRYIDS', { evidenceEntryIds: [] }],
+    ['QUESTIONIDS', { questionIds: [] }],
+  ] as const)('rejects a context array %s that is not append-only', (code, overrides) => {
+    const before = createInitialEpoch();
+    const after = createStrictAnalysisEpochSnapshotV1({
+      ...snapshotInput(before),
+      context: createContext(overrides),
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: rejectOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(new RegExp(`^STRICT_ANALYSIS_${code}_NOT_APPEND_ONLY$`, 'u'));
+  });
+
+  it('rejects removed fact query obligations as not append-only', () => {
+    const before = createStrictAnalysisEpochSnapshotV1({
+      epoch: 1,
+      context: createContext({ factQueryObligationIds: ['base-1', 'base-2'] }),
+      populations: [],
+      terminalObligationIds: ['base-1', 'base-2'],
+      outstandingObligationIds: [],
+    });
+    const after = createStrictAnalysisEpochSnapshotV1({
+      ...snapshotInput(before),
+      context: createContext({ factQueryObligationIds: ['base-1'] }),
+      terminalObligationIds: ['base-1'],
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: rejectOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(/^STRICT_ANALYSIS_FACTQUERYOBLIGATIONIDS_NOT_APPEND_ONLY$/u);
+  });
+
+  it('rejects a retry that moves a terminal obligation back to outstanding', () => {
+    const before = createInitialEpoch();
+    const after = retryEpoch({
+      terminalObligationIds: ['counter-1'],
+      outstandingObligationIds: ['base-1'],
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: retryOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(/^STRICT_ANALYSIS_TERMINAL_OBLIGATIONS_NOT_APPEND_ONLY$/u);
+  });
+
+  it('reports retry after a real sealed schedule hash as retry-after-fixpoint', () => {
+    const before = createInitialEpoch();
+    const after = retryEpoch({
+      terminalObligationIds: ['base-1', 'counter-1'],
+      outstandingObligationIds: [],
+      finalExpandedScheduleHash: 'final-sealed',
+    });
+    expect(() =>
+      validateStrictAnalysisEpochTransitionV1({
+        before,
+        after,
+        outcome: retryOutcome(before),
+        limits: LIMITS,
+      })
+    ).toThrow(/^STRICT_ANALYSIS_RETRY_AFTER_FIXPOINT_FORBIDDEN$/u);
   });
 });

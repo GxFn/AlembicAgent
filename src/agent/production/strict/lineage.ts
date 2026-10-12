@@ -447,14 +447,68 @@ export function assertStrictProducerLineageIntegrity(
   }
 }
 
+const CAUSAL_REPAIR_STAGES: ReadonlySet<string> = new Set(['analyst', 'producer', 'reviewer']);
+
+/** createCausalRepairNodeV1 的修复深度上限（超过即 STRICT_CAUSAL_REPAIR_LIMIT）。 */
+const MAX_SEMANTIC_REPAIR_DEPTH = 2;
+
+/**
+ * 跨进程复核因果修复节点（C32）。nodeHash 只证明“内容与外层 hash 一致”，调用者可以改写字段后
+ * 重算 nodeHash 自证；因此还要按 createCausalRepairNodeV1 的派生规则逐项复核：
+ * - stage 必须属于公开枚举（analyst/producer/reviewer；后两者当前无产出方，保留为公开类型）；
+ * - rootIds 非空，rootIds/parentNodeIds 必须是 normalizeIds 的规范形（创建时就以该形态写入）；
+ * - 深度与前驱一致：无前驱即深度 0，有前驱即深度 ≥1，且不超过创建时的修复上限；
+ * - 必填 hash 字段与创建时同码校验；
+ * - nodeId 由 rootIds/parentNodeIds/stage/lineageHash/inputHash/outputHash 复算，不接受调用者自选。
+ * 与父表达集的结构绑定（rootIds 指向 lineage 根、单前驱链）由 expressions.ts 在表达集层复核。
+ */
 export function assertCausalRepairNodeIntegrity(node: CausalRepairNodeV1): void {
   const { nodeHash, ...semantic } = node;
   if (node.schemaVersion !== 1 || hashCanonical(semantic) !== nodeHash) {
     fail('STRICT_CAUSAL_NODE_HASH_MISMATCH');
   }
-  normalizeIds(node.rootIds, 'causalRootIds');
-  normalizeIds(node.parentNodeIds, 'causalParentNodeIds');
-  if (!Number.isSafeInteger(node.semanticRepairDepth) || node.semanticRepairDepth < 0) {
+  if (!CAUSAL_REPAIR_STAGES.has(node.stage)) {
+    fail('STRICT_CAUSAL_STAGE_INVALID');
+  }
+  const rootIds = normalizeIds(node.rootIds, 'causalRootIds');
+  if (rootIds.length === 0 || !sameOrderedIds(rootIds, node.rootIds)) {
+    fail('STRICT_CAUSAL_ROOT_IDS_INVALID');
+  }
+  const parentNodeIds = normalizeIds(node.parentNodeIds, 'causalParentNodeIds');
+  if (!sameOrderedIds(parentNodeIds, node.parentNodeIds)) {
+    fail('STRICT_CAUSAL_PARENT_NODE_IDS_INVALID');
+  }
+  if (
+    !Number.isSafeInteger(node.semanticRepairDepth) ||
+    node.semanticRepairDepth < 0 ||
+    node.semanticRepairDepth > MAX_SEMANTIC_REPAIR_DEPTH ||
+    (parentNodeIds.length === 0) !== (node.semanticRepairDepth === 0)
+  ) {
     fail('STRICT_CAUSAL_REPAIR_DEPTH_INVALID');
   }
+  for (const [field, value] of Object.entries({
+    inputHash: node.inputHash,
+    outputHash: node.outputHash,
+    evidenceHash: node.evidenceHash,
+    modelHash: node.modelHash,
+    reasonHash: node.reasonHash,
+  })) {
+    requireText(value, `STRICT_CAUSAL_${field.toUpperCase()}_REQUIRED`);
+  }
+  const expectedNodeId = hashCanonical({
+    kind: 'strict-causal-repair-node-v1',
+    rootIds: node.rootIds,
+    parentNodeIds: node.parentNodeIds,
+    stage: node.stage,
+    lineageHash: node.lineageHash,
+    inputHash: node.inputHash,
+    outputHash: node.outputHash,
+  });
+  if (expectedNodeId !== node.nodeId) {
+    fail('STRICT_CAUSAL_NODE_ID_MISMATCH');
+  }
+}
+
+function sameOrderedIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
