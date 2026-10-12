@@ -23,6 +23,7 @@ import type {
 } from './contracts.js';
 import { throwIfLlmCancelled } from './errors.js';
 import type { GatewayConfig, LLMGateway } from './gateway/LLMGateway.js';
+import { getProviderConfig } from './registry/ProviderConfig.js';
 import { resolveConcurrency } from './shared/concurrency.js';
 import { parseSchemaOutput, prepareStructuredValidation } from './shared/schemaValidation.js';
 import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
@@ -30,6 +31,20 @@ import { extractJSON as sharedExtractJSON } from './shared/structuredOutput.js';
 // 保留原公共入口：外部消费者无需随内部依赖分层更换导入路径。
 export type * from './contracts.js';
 export { createMissingApiKeyError, type MissingApiKeyError } from './errors.js';
+
+/**
+ * probe 的独立期限（毫秒）。宿主“测试连接”不传 abortSignal，若继承 provider 的 300s 超时与 3 次重试，
+ * 黑洞代理下约 20 分钟才返回。取 30s 而非 15s：给 Ollama 冷加载模型和 thinking 模型的首个 token 留余量。
+ */
+const PROBE_TIMEOUT_MS = 30_000;
+
+/** probe 专用 Gateway 的重试上限：探测只回答“此刻能否连通”，失败应立即带原因返回而不是退避重放。 */
+const PROBE_MAX_RETRIES = 0;
+
+/** 取消类错误（本仓 AbortError 归一化结果，或不合作子类原样抛出的 TimeoutError）。 */
+function isCancellationError(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
+}
 
 export class AiProvider {
   _circuitThreshold: number;
@@ -52,6 +67,12 @@ export class AiProvider {
 
   /** 协议下沉 transport 后，本 provider 专属的 LLMGateway 实例（lazy 构造）。 */
   #gateway: LLMGateway | null = null;
+
+  /**
+   * 只供 probe 使用的私有 LLMGateway（lazy 构造）：连接配置与主 Gateway 相同，但 maxRetries=0。
+   * 熔断、并发闸门与主 Gateway 互相独立——探测失败不计入业务请求的熔断，也不占业务并发槽。
+   */
+  #probeGateway: LLMGateway | null = null;
 
   /** 默认 chatWithTools 纯文本降级是否已告警（每实例一次）。 */
   #textDegradeWarned = false;
@@ -137,12 +158,59 @@ export class AiProvider {
   }
 
   /**
-   * 探测 provider 是否可用（轻量级 API 调用验证连接性）
-   * 子类可覆盖实现更具体的探测逻辑
+   * 探测 provider 是否可用（轻量级 API 调用验证连接性）。子类可覆盖实现更具体的探测逻辑。
+   *
+   * - 期限：调用方 abortSignal 与 AbortSignal.timeout(PROBE_TIMEOUT_MS) 经 AbortSignal.any 合成。
+   *   期限触发抛 code=PROBE_DEADLINE_EXCEEDED（消息含期限毫秒数）并 warn `probe_deadline_exceeded`；
+   *   调用方主动取消优先，仍抛 AbortError，不归为期限失败。
+   * - 内置 provider（name 是已登记的 ProviderId）走私有 probe Gateway：零重试、用量来源记为 'probe'。
+   *   Transport 的 runOperation 在信号触发时先确定终态，即使 fetch 不响应 abort 也按期返回。
+   * - 直接继承基类、只实现 chat() 的自定义子类没有 Gateway 路由，仍走它自己的 chat()：
+   *   重试与用量归子类自己管，期限只能经合成信号协作生效（子类忽略信号时无法强制中断）。
+   * - 失败一律带原因抛出（宿主会把 message 展示给用户），不像 Gateway.probe 那样吞成 false。
    */
   async probe(opts: LlmCallOptions = {}) {
-    const result = await this.chat('ping', { maxTokens: 16, temperature: 0, ...opts });
-    return !!result;
+    const callerSignal = opts.abortSignal;
+    // 已取消的调用不武装期限、不发请求。
+    throwIfLlmCancelled(callerSignal);
+    const deadline = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+    const signal = callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline;
+    const viaGateway = getProviderConfig(this.name) !== undefined;
+    if (!viaGateway) {
+      this._log(
+        'debug',
+        `[${this.name}] probe_path=subclass_chat reason=provider_not_gateway_routed deadlineMs=${PROBE_TIMEOUT_MS}; retries and usage source governed by subclass chat()`
+      );
+    }
+    try {
+      const text = viaGateway
+        ? await (await this.#getProbeGateway()).chat({
+            modelRef: this._modelRef,
+            prompt: 'ping',
+            maxTokens: 16,
+            temperature: 0,
+            usageSource: 'probe',
+            abortSignal: signal,
+          })
+        : await this.chat('ping', { maxTokens: 16, temperature: 0, abortSignal: signal });
+      return !!text;
+    } catch (err: unknown) {
+      // 只有“期限已到、调用方未取消、且失败本身是取消类错误”才归为期限失败；
+      // 与期限竞速先到的真实错误（HTTP 状态、缺 key 等）原样抛出，保留更具体的原因。
+      if (deadline.aborted && !callerSignal?.aborted && isCancellationError(err)) {
+        this._log(
+          'warn',
+          `[${this.name}] probe_deadline_exceeded deadlineMs=${PROBE_TIMEOUT_MS} path=${viaGateway ? 'probe_gateway' : 'subclass_chat'} retries=${viaGateway ? PROBE_MAX_RETRIES : 'subclass'}; probe rejected with PROBE_DEADLINE_EXCEEDED`
+        );
+        throw Object.assign(
+          new Error(
+            `${this.name} probe did not complete within the ${PROBE_TIMEOUT_MS}ms deadline`
+          ),
+          { code: 'PROBE_DEADLINE_EXCEEDED' }
+        );
+      }
+      throw err;
+    }
   }
 
   /** 检查是否支持 embedding */
@@ -298,6 +366,29 @@ export class AiProvider {
     if (this.#gateway) {
       return this.#gateway;
     }
+    this.#gateway = new LLMGateway(this.#gatewayConfig(this.maxRetries));
+    return this.#gateway;
+  }
+
+  /**
+   * lazy 构造只供 probe 使用的私有 Gateway：连接与主 Gateway 相同，重试固定为 PROBE_MAX_RETRIES。
+   * 不复用主 Gateway，也不给 GatewayRequest 增加公开的单次重试字段。
+   */
+  async #getProbeGateway(): Promise<LLMGateway> {
+    if (this.#probeGateway) {
+      return this.#probeGateway;
+    }
+    const { LLMGateway } = await import('./gateway/LLMGateway.js');
+    // 与 _getGateway 相同：并发首次探测等待动态加载后再核对，保证共享同一实例。
+    if (this.#probeGateway) {
+      return this.#probeGateway;
+    }
+    this.#probeGateway = new LLMGateway(this.#gatewayConfig(PROBE_MAX_RETRIES));
+    return this.#probeGateway;
+  }
+
+  /** 主 Gateway 与 probe Gateway 共用的配置；只有重试上限由调用方决定。 */
+  #gatewayConfig(maxRetries: number): GatewayConfig {
     // this.name 即 ProviderId（openai/claude/deepseek/google/ollama）。
     const providers = {
       [this.name]: {
@@ -307,15 +398,14 @@ export class AiProvider {
         ...this._transportExtras,
       },
     } as GatewayConfig['providers'];
-    this.#gateway = new LLMGateway({
+    return {
       providers,
       timeout: this.timeout,
-      maxRetries: this.maxRetries,
+      maxRetries,
       circuitThreshold: this._circuitThreshold,
       maxConcurrency: this._maxConcurrency,
       onUsage: (usage) => this._emitTokenUsage(usage, usage.source),
-    });
-    return this.#gateway;
+    };
   }
 
   /** 委托 gateway 的文本对话（支持历史消息）；横切能力由 gateway 统一处理。 */

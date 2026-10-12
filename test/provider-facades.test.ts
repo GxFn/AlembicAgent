@@ -460,6 +460,204 @@ describe('DeepSeekProvider V4 tool calls', () => {
   });
 });
 
+describe('AiProvider.probe deadline, retry budget and usage source', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * vitest fake timers 不接管 Node 内置的 AbortSignal.timeout（其计时器走内部 timers 模块）。
+   * 这里把它替换为同语义（reason 为 TimeoutError 的 DOMException）、由可推进的 setTimeout 驱动的信号，
+   * 让 30 秒期限在测试里不必真实等待；spy 同时记录 probe 实际武装的期限毫秒数。
+   */
+  function driveTimeoutSignalsWithFakeTimers() {
+    return vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+      const controller = new AbortController();
+      setTimeout(
+        () =>
+          controller.abort(
+            new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+          ),
+        ms
+      );
+      return controller.signal;
+    });
+  }
+
+  function captureLogger() {
+    return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  }
+
+  type Settled = { done: boolean; value?: boolean; error?: unknown };
+
+  function track(promise: Promise<boolean>): Settled {
+    const state: Settled = { done: false };
+    promise.then(
+      (value) => {
+        state.done = true;
+        state.value = value;
+      },
+      (error: unknown) => {
+        state.done = true;
+        state.error = error;
+      }
+    );
+    return state;
+  }
+
+  it('fails a never-responding probe at the 30s deadline after exactly one attempt', async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = driveTimeoutSignalsWithFakeTimers();
+    // 黑洞代理：请求发出后永不应答，也不响应 abort。
+    const fetchMock = vi.fn(() => new Promise<Response>(() => undefined));
+    vi.stubGlobal('fetch', fetchMock);
+    // 默认配置：timeout=300s、maxRetries=3；探测不得继承这两项。
+    const provider = new OpenAiProvider({ apiKey: 'test-key', model: 'gpt-4o' });
+    const logger = captureLogger();
+    provider.logger = logger;
+
+    const state = track(provider.probe());
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(state.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(state.done).toBe(true);
+    expect(state.error).toBeInstanceOf(Error);
+    expect(state.error).toMatchObject({ code: 'PROBE_DEADLINE_EXCEEDED' });
+    expect((state.error as Error).name).not.toBe('AbortError');
+    expect((state.error as Error).message).toContain('30000ms');
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('[openai] probe_deadline_exceeded deadlineMs=30000')
+    );
+    // 期限之后再推进到旧路径的约 20 分钟：没有任何后台重试。
+    await vi.advanceTimersByTimeAsync(1_300_000);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry a retryable probe failure even when the provider allows retries', async () => {
+    vi.useFakeTimers();
+    driveTimeoutSignalsWithFakeTimers();
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ error: { message: 'fixture overloaded' } }, 503)
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new OpenAiProvider({ apiKey: 'test-key', model: 'gpt-4o', maxRetries: 3 });
+    provider.logger = captureLogger();
+
+    const state = track(provider.probe());
+    // 足够覆盖旧路径 3 次指数退避（2s/4s/8s + 抖动），但不触达 30s 期限。
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(state.done).toBe(true);
+    expect(state.error).toMatchObject({ status: 503 });
+    expect(state.error).not.toMatchObject({ code: 'PROBE_DEADLINE_EXCEEDED' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(provider.maxRetries).toBe(3);
+  });
+
+  it('keeps caller cancellation as AbortError while the probe deadline is armed', async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = driveTimeoutSignalsWithFakeTimers();
+    let transportSignal: AbortSignal | null | undefined;
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      transportSignal = init?.signal;
+      return new Promise<Response>(() => undefined);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const provider = new OpenAiProvider({ apiKey: 'test-key', model: 'gpt-4o' });
+    const logger = captureLogger();
+    provider.logger = logger;
+    const controller = new AbortController();
+
+    const state = track(provider.probe({ abortSignal: controller.signal }));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(state.done).toBe(false);
+    controller.abort(new Error('host cancelled the connection test'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(state.done).toBe(true);
+    expect(state.error).toMatchObject({
+      name: 'AbortError',
+      message: 'host cancelled the connection test',
+    });
+    expect(state.error).not.toMatchObject({ code: 'PROBE_DEADLINE_EXCEEDED' });
+    expect(transportSignal?.aborted).toBe(true);
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('probe_deadline_exceeded');
+  });
+
+  it('reports a successful probe usage with source probe', async () => {
+    const fetchMock = mockFetch(
+      {},
+      {
+        choices: [
+          { index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 },
+      }
+    );
+    const provider = new OpenAiProvider({ apiKey: 'test-key', model: 'gpt-4o' });
+    const observer = vi.fn();
+    provider._onTokenUsage = observer;
+
+    await expect(provider.probe()).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observer).toHaveBeenCalledExactlyOnceWith({
+      inputTokens: 4,
+      outputTokens: 1,
+      totalTokens: 5,
+      provider: 'openai',
+      model: 'gpt-4o',
+      source: 'probe',
+    });
+  });
+
+  it('keeps a direct subclass probe on its own chat() and still bounds it by the deadline', async () => {
+    vi.useFakeTimers();
+    driveTimeoutSignalsWithFakeTimers();
+    const provider = new HangingTextProvider();
+    const logger = captureLogger();
+    provider.logger = logger;
+
+    const state = track(provider.probe());
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(provider.chatCalls).toHaveLength(1);
+    expect(provider.chatCalls[0]).toMatchObject({
+      prompt: 'ping',
+      context: { maxTokens: 16, temperature: 0 },
+    });
+    expect(state.error).toMatchObject({ code: 'PROBE_DEADLINE_EXCEEDED' });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('[custom-hanging] probe_deadline_exceeded deadlineMs=30000')
+    );
+  });
+});
+
+// 直接继承 AiProvider 的自定义 provider：chat() 只在收到取消信号时结束，模拟黑洞端点。
+class HangingTextProvider extends AiProvider {
+  readonly chatCalls: Array<{ prompt: string; context: ChatContext }> = [];
+
+  constructor() {
+    super({});
+    this.name = 'custom-hanging';
+  }
+
+  async chat(prompt: string, context: ChatContext = {}): Promise<string> {
+    this.chatCalls.push({ prompt, context });
+    const signal = context.abortSignal;
+    return new Promise<string>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  }
+}
+
 // 直接继承 AiProvider 的自定义 provider：不设置 logger，也不覆写 chatWithTools。
 class TextOnlyProvider extends AiProvider {
   readonly chatCalls: Array<{ prompt: string; context: ChatContext }> = [];
