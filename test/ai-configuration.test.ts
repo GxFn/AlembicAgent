@@ -427,6 +427,106 @@ describe('effective AI connection configuration', () => {
   });
 });
 
+// provider 身份解析边界：'auto' 在发现/投影中表示“未指定”，构造入口必须与之一致；
+// 未知身份要带稳定 code 并留下 [ai-config] 诊断，宿主才能定位拼写错误等启动失败。
+describe('provider identity resolution boundary', () => {
+  const messages = (spy: { mock: { calls: unknown[][] } }, marker: string) =>
+    spy.mock.calls.map((call) => String(call[0])).filter((msg) => msg.includes(marker));
+
+  it('lets createProvider() discover the provider when ALEMBIC_AI_PROVIDER=auto instead of rejecting the identity', () => {
+    vi.stubEnv('ALEMBIC_AI_PROVIDER', 'auto');
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+
+    // 无任何凭据：抛宿主可识别的未配置错误，而不是把 'auto' 当成未知 provider。
+    let missing: unknown;
+    try {
+      createProvider();
+    } catch (err: unknown) {
+      missing = err;
+    }
+    expect(missing).toBeInstanceOf(Error);
+    expect(missing).toMatchObject({
+      code: 'API_KEY_MISSING',
+      provider: 'auto',
+      hostAction: 'configure-provider-credential',
+    });
+    expect((missing as Error).message).not.toMatch(/Unknown AI provider/);
+    expect(messages(warn, 'auto_provider_unconfigured')).toHaveLength(1);
+    expect(messages(warn, 'unknown_provider')).toEqual([]);
+
+    // 有凭据：与 autoDetectProvider 得出同一身份；显式 model / provider 仍优先。
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', 'fixture-openai-key');
+    const discovered = createProvider();
+    expect(discovered).toBeInstanceOf(OpenAiProvider);
+    expect(discovered.model).toBe(autoDetectProvider()?.model);
+    expect(createProvider({ model: 'explicit-model' }).model).toBe('explicit-model');
+    expect(createProvider({ provider: 'deepseek' })).toBeInstanceOf(DeepSeekProvider);
+  });
+
+  it('treats ALEMBIC_EMBED_PROVIDER=auto as no dedicated embedding provider', () => {
+    vi.stubEnv('ALEMBIC_EMBED_PROVIDER', 'auto');
+    vi.stubEnv('ALEMBIC_OPENAI_API_KEY', 'fixture-openai-key');
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+
+    expect(createEmbedProvider()).toBeNull();
+    expect(messages(debug, '[ai-config] embed_provider_auto_ignored')).toHaveLength(1);
+    expect(messages(warn, 'unknown_provider')).toEqual([]);
+  });
+
+  it('rejects an unknown provider identity with a stable code after a truncated unknown_provider diagnostic', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const rejected = (message: string) =>
+      expect.objectContaining({ code: 'LLM_INVALID_REQUEST', message });
+
+    // 环境拼写错误：工厂与自动发现两条宿主入口都带 code，并记录来源 env。
+    vi.stubEnv('ALEMBIC_AI_PROVIDER', 'openia');
+    expect(() => createProvider()).toThrow(rejected('Unknown AI provider: openia'));
+    expect(() => autoDetectProvider()).toThrow(rejected('Unknown AI provider: openia'));
+    expect(messages(warn, '[ai-config] unknown_provider source=env value=openia')).toHaveLength(2);
+    vi.stubEnv('ALEMBIC_AI_PROVIDER', undefined);
+
+    // 独立 embedding 身份同样来自环境。
+    vi.stubEnv('ALEMBIC_EMBED_PROVIDER', 'openia');
+    expect(() => createEmbedProvider()).toThrow(rejected('Unknown AI provider: openia'));
+    expect(
+      messages(warn, 'unknown_provider source=env value=openia var=ALEMBIC_EMBED_PROVIDER')
+    ).toHaveLength(1);
+    vi.stubEnv('ALEMBIC_EMBED_PROVIDER', undefined);
+
+    // 调用方显式身份：来源为 config；Gateway 的 provider 前缀解析共用同一边界。
+    expect(() => createProvider({ provider: 'constructor' })).toThrow(
+      rejected('Unknown AI provider: constructor')
+    );
+    expect(() => createProvider({ provider: 42 })).toThrow(
+      rejected('Unknown AI provider: (invalid type)')
+    );
+    await expect(
+      new LLMGateway({ maxRetries: 0 }).chat({ modelRef: 'unknown:model', prompt: 'ping' })
+    ).rejects.toMatchObject({ code: 'LLM_INVALID_REQUEST' });
+    expect(messages(warn, 'unknown_provider source=config value=constructor')).toHaveLength(1);
+    expect(messages(warn, 'unknown_provider source=config value=(invalid type)')).toHaveLength(1);
+    expect(messages(warn, 'unknown_provider source=config value=unknown')).toHaveLength(1);
+
+    // 误填的长值只写截断后的前缀，避免把整段可能的凭据写进日志；错误消息文本保持既有合同。
+    const misplaced = 'fixture-misplaced-credential-value';
+    expect(() => createProvider({ provider: misplaced })).toThrow(
+      rejected(`Unknown AI provider: ${misplaced}`)
+    );
+    const truncated = messages(warn, 'unknown_provider source=config value=fixture-misplace');
+    expect(truncated).toHaveLength(1);
+    expect(truncated[0]).not.toContain('credential');
+
+    // 诊断通道失败不能改变错误归类。
+    warn.mockImplementation(() => {
+      throw new Error('fixture log failure');
+    });
+    expect(() => createProvider({ provider: 'openia' })).toThrow(
+      rejected('Unknown AI provider: openia')
+    );
+  });
+});
+
 describe('embedding capacity configuration and public hints', () => {
   it.each([
     ['openai', OpenAiProvider, 4],

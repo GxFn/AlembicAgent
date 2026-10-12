@@ -16,12 +16,14 @@ import {
   detectProvider,
   embedProviderOptions,
 } from './configuration.js';
+import { createMissingApiKeyError } from './errors.js';
 import { ClaudeProvider } from './providers/ClaudeProvider.js';
 import { DeepSeekProvider } from './providers/DeepSeekProvider.js';
 import { GoogleGeminiProvider } from './providers/GoogleGeminiProvider.js';
 import { OllamaProvider } from './providers/OllamaProvider.js';
 import { OpenAiProvider } from './providers/OpenAiProvider.js';
 import type { ProviderId } from './registry/ModelDefs.js';
+import { PROVIDER_CONFIGS } from './registry/ProviderConfig.js';
 import { classifyLlmError } from './shared/errorClassify.js';
 
 const PROVIDER_MAP: Record<ProviderId, ProviderClass> = {
@@ -44,6 +46,30 @@ type ProviderClass =
  * @param options {provider, model, apiKey, baseUrl}
  */
 export function createProvider(options: Record<string, unknown> = {}) {
+  const requested = process.env.ALEMBIC_AI_PROVIDER;
+  // 'auto' 在发现与 UI 投影中都表示“未指定”；未显式传 provider 时与 detectProvider 得出同一身份，
+  // 而不是把它当作未知 provider 拒绝。显式 provider 始终优先，configuredProvider 保持严格。
+  if (!options.provider && requested?.trim().toLowerCase() === 'auto') {
+    const selected = detectProvider();
+    if (!selected) {
+      const keyEnvVars = PROVIDER_CONFIGS.filter(({ keyEnvVar }) => keyEnvVar).map(
+        ({ keyEnvVar }) => keyEnvVar
+      );
+      Logger.getInstance().warn(
+        `[AiFactory] auto_provider_unconfigured entry=createProvider candidates=${keyEnvVars.length}; rejecting with API_KEY_MISSING`
+      );
+      // 复用统一缺 key 错误：宿主已按 code=API_KEY_MISSING 渲染配置指引，不走未知身份分支。
+      throw createMissingApiKeyError(
+        'AI Provider（auto 自动发现）',
+        keyEnvVars.join(' / '),
+        'auto'
+      );
+    }
+    Logger.getInstance().debug(
+      `[AiFactory] auto_provider_resolved entry=createProvider provider=${selected.provider}`
+    );
+    return new PROVIDER_MAP[selected.provider]({ ...options });
+  }
   const id = configuredProvider(options.provider);
   return new PROVIDER_MAP[id]({ ...options });
 }

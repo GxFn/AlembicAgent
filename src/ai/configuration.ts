@@ -222,16 +222,71 @@ export function resolveProviderSettings(
   };
 }
 
+/** 未知身份诊断最多保留的前缀长度；已知身份及常见拼写错误都在此范围内。 */
+const UNKNOWN_PROVIDER_LOG_LIMIT = 16;
+
+/**
+ * 身份来源只区分调用方显式值（config）与环境变量（env）。env 时附上变量名，
+ * 运维才能区分是 ALEMBIC_AI_PROVIDER 还是 ALEMBIC_EMBED_PROVIDER 拼错。
+ */
+type ProviderIdentitySource =
+  | { source: 'config' }
+  | { source: 'env'; envVar: 'ALEMBIC_AI_PROVIDER' | 'ALEMBIC_EMBED_PROVIDER' };
+
+/** 日志只写截断、去控制字符后的前缀：该字段可能被误填成凭据，也不能借换行伪造日志行。 */
+function providerLogValue(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    return '(invalid type)';
+  }
+  const safe = raw.slice(0, UNKNOWN_PROVIDER_LOG_LIMIT).replace(/[^\w.:-]/g, '?');
+  return raw.length > UNKNOWN_PROVIDER_LOG_LIMIT ? `${safe}…(len=${raw.length})` : safe;
+}
+
+/**
+ * 严格身份解析：未知值不做任何猜测或降级（Gateway 的 'provider:model' 前缀解析也依赖它）。
+ * 拒绝前先输出 unknown_provider 诊断，错误复用本地输入错误 code（不重试、不计熔断）；
+ * 消息文本保留既有 'Unknown AI provider: ...' 合同，宿主按消息匹配的逻辑不受影响。
+ */
+function strictProviderId(raw: unknown, origin: ProviderIdentitySource): ProviderId {
+  const id = typeof raw === 'string' ? canonicalProvider(raw) : undefined;
+  if (id) {
+    return id;
+  }
+  const where = origin.source === 'env' ? ` var=${origin.envVar}` : '';
+  try {
+    Logger.getInstance().warn(
+      `[ai-config] unknown_provider source=${origin.source} value=${providerLogValue(raw)}${where}; construction rejected`
+    );
+  } catch (err: unknown) {
+    // 诊断通道（日志）自身失败时只吞掉日志异常：它不能把配置错误替换成日志错误、
+    // 也不能改变下面抛出错误的 code，否则宿主拿不到稳定的 LLM_INVALID_REQUEST。
+    // 本文件的 file boundary 不允许引入 #shared/observers，因此在此就地兜底。
+    void err;
+  }
+  throw Object.assign(
+    new Error(`Unknown AI provider: ${typeof raw === 'string' ? raw : '(invalid type)'}`),
+    { code: 'LLM_INVALID_REQUEST' }
+  );
+}
+
+/**
+ * 显式值优先，其次 ALEMBIC_AI_PROVIDER，最后默认 google。'auto' 在这里仍是未知身份：
+ * 需要自动发现的入口（createProvider、detectProvider）在调用本函数前自行分支。
+ */
 export function configuredProvider(
   value: unknown,
   env: ConfigEnvironment = process.env
 ): ProviderId {
-  const raw = value || env.ALEMBIC_AI_PROVIDER || 'google';
-  const id = typeof raw === 'string' ? canonicalProvider(raw) : undefined;
-  if (!id) {
-    throw new Error(`Unknown AI provider: ${typeof raw === 'string' ? raw : '(invalid type)'}`);
+  if (value) {
+    return strictProviderId(value, { source: 'config' });
   }
-  return id;
+  if (env.ALEMBIC_AI_PROVIDER) {
+    return strictProviderId(env.ALEMBIC_AI_PROVIDER, {
+      source: 'env',
+      envVar: 'ALEMBIC_AI_PROVIDER',
+    });
+  }
+  return 'google';
 }
 
 export function detectProvider(
@@ -240,7 +295,8 @@ export function detectProvider(
   const requested = env.ALEMBIC_AI_PROVIDER;
   let missingPrimary = false;
   if (requested && requested.trim().toLowerCase() !== 'auto') {
-    const id = configuredProvider(requested, env);
+    // 不把环境值当作显式参数传入，unknown_provider 诊断才会如实标注 source=env。
+    const id = configuredProvider(undefined, env);
     const descriptor = providerConfig(id);
     if (!descriptor.keyEnvVar || env[descriptor.keyEnvVar]?.trim()) {
       return { provider: id };
@@ -279,7 +335,18 @@ export function embedProviderOptions(env: ConfigEnvironment = process.env) {
   if (!env.ALEMBIC_EMBED_PROVIDER) {
     return null;
   }
-  const provider = configuredProvider(env.ALEMBIC_EMBED_PROVIDER, env);
+  if (env.ALEMBIC_EMBED_PROVIDER.trim().toLowerCase() === 'auto') {
+    // 与 scopedModel/aiConfigInfo 一致：'auto' 等于未指定独立 embedding provider，
+    // embedding 跟随主 provider（ALEMBIC_EMBED_MODEL 仍由 scopedModel 作用于主 provider）。
+    Logger.getInstance().debug(
+      '[ai-config] embed_provider_auto_ignored; no dedicated embedding provider, embedding follows the main provider'
+    );
+    return null;
+  }
+  const provider = strictProviderId(env.ALEMBIC_EMBED_PROVIDER, {
+    source: 'env',
+    envVar: 'ALEMBIC_EMBED_PROVIDER',
+  });
   const model = env.ALEMBIC_EMBED_MODEL || EMBEDDING_MODELS[provider];
   return {
     provider,
