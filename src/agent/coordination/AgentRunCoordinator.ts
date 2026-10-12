@@ -1,3 +1,5 @@
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { createLimit } from '../../shared/concurrency.js';
 import type {
   AgentConcurrencyPlan,
@@ -17,6 +19,30 @@ type Merger = (
   profile: CompiledAgentProfile
 ) => AgentRunResult;
 type ChildRunRecord = { childInput: AgentRunInput; result: AgentRunResult };
+
+/**
+ * 停止事实的来源。tier 整批取消与 child 跳过都要带上它，宿主才能区分：
+ * - abortSignal / shouldAbort：用户或宿主主动取消，属于正常收尾；
+ * - prior-failure：兄弟 child 的回调（检查点等）或取消探针已失败，后续不再派发；
+ * - shouldAbort-error：tier 级取消探针自身抛错，按失败处理并整批取消。
+ */
+type CoordinationStopReason = 'abortSignal' | 'shouldAbort' | 'prior-failure' | 'shouldAbort-error';
+
+/**
+ * 生效并发度及其来源。env 非法时静默回退 default 曾经没有任何痕迹（I21），
+ * 这里把“来源 + 回退原因 + 原始值”一起带出来供日志使用；返回的 value 与旧逻辑完全一致。
+ */
+type ConcurrencyResolution = {
+  value: number;
+  source: 'number' | 'env' | 'default';
+  env?: string;
+  rawValue?: string;
+  fallbackReason?: 'env-unset' | 'env-invalid' | 'plan-unset';
+};
+
+const LOG_PREFIX = '[AgentRunCoordinator]';
+/** env 原始值只用于诊断，截断避免把异常长的配置串整段写进日志。 */
+const MAX_LOGGED_ENV_VALUE_LENGTH = 32;
 
 export class AgentRunCoordinator {
   #partitioners = new Map<string, Partitioner>();
@@ -80,39 +106,140 @@ async function runChildren(
   parentInput: AgentRunInput,
   profile: CompiledAgentProfile
 ) {
-  const limit = createLimit(resolveConcurrency(concurrencyPlan.concurrency));
+  const startedAt = Date.now();
+  const tiered = concurrencyPlan.mode === 'tiered';
+  const concurrency = resolveConcurrency(concurrencyPlan.concurrency);
+  if (concurrency.fallbackReason === 'env-invalid') {
+    // env 存在但不是正整数：沿用旧行为回退 default，但必须留下 warn，否则宿主日志里的并发度与实际不符。
+    logCoordination(
+      'warn',
+      `concurrency env invalid, falling back to default profile=${profile.id} env=${concurrency.env} fallback=${concurrency.value}`,
+      {
+        profileId: profile.id,
+        env: concurrency.env,
+        rawValue: concurrency.rawValue,
+        fallback: concurrency.value,
+      }
+    );
+  }
+  const limit = createLimit(concurrency.value);
+  const tiers = tiered ? groupByTier(childInputs) : [childInputs.map((_, index) => index)];
+  // child → tierIndex 只用于日志定位；parallel 模式没有 tier 语义，不记录 tierIndex。
+  const tierIndexByChild = new Map<number, number>();
+  if (tiered) {
+    for (const [tierIndex, tier] of tiers.entries()) {
+      for (const index of tier) {
+        tierIndexByChild.set(index, tierIndex);
+      }
+    }
+  }
+  const describeChild = (input: AgentRunInput, index: number) => {
+    const dimId = resolveDimensionId(input);
+    const tierIndex = tierIndexByChild.get(index);
+    return {
+      childIndex: index,
+      childId: resolveChildLogId(input, index),
+      ...(dimId ? { dimId } : {}),
+      ...(tierIndex !== undefined ? { tierIndex } : {}),
+    };
+  };
+  logCoordination(
+    'info',
+    `coordination start profile=${profile.id} mode=${concurrencyPlan.mode} children=${childInputs.length} concurrency=${concurrency.value}(${concurrency.source})`,
+    {
+      profileId: profile.id,
+      mode: concurrencyPlan.mode,
+      partitioner: concurrencyPlan.partitioner || null,
+      merge: concurrencyPlan.merge || null,
+      childCount: childInputs.length,
+      concurrency: concurrency.value,
+      concurrencySource: concurrency.source,
+      ...(concurrency.env ? { concurrencyEnv: concurrency.env } : {}),
+      ...(concurrency.rawValue !== undefined ? { concurrencyEnvValue: concurrency.rawValue } : {}),
+      ...(concurrency.fallbackReason
+        ? { concurrencyFallbackReason: concurrency.fallbackReason }
+        : {}),
+      ...(tiered
+        ? {
+            tierCount: tiers.length,
+            tierSizes: tiers.map((tier) => ({
+              tier: resolveTier(childInputs[tier[0]]),
+              childCount: tier.length,
+            })),
+          }
+        : {}),
+    }
+  );
   const records: ChildRunRecord[] = [];
   const failures: Array<{ hook: string; childId?: string; tierIndex?: number; message: string }> =
     [];
+  // 被跳过（未派发）的 child 下标，只用于最终汇总日志；按下标排序输出，避免并发时序导致日志顺序不稳定。
+  const skippedChildren = new Set<number>();
   let firstError: unknown;
   const fail = (
     hook: string,
     err: unknown,
-    details: { childId?: string; tierIndex?: number } = {}
+    details: { childId?: string; tierIndex?: number } = {},
+    logContext: Record<string, unknown> = {}
   ) => {
     if (failures.length === 0) {
       firstError = err;
     }
-    failures.push({ hook, ...details, message: err instanceof Error ? err.message : String(err) });
+    const message = err instanceof Error ? err.message : String(err);
+    failures.push({ hook, ...details, message });
+    // 回调/取消探针失败会让后续 child 全部按 prior-failure 跳过；这里是整条连带取消的根因，必须 warn。
+    // coordinationFailures 的 childId 只认 dimId（契约不变）；日志标识优先用 logContext（含 moduleId/下标回退）。
+    const childLabel =
+      typeof logContext.childId === 'string' ? logContext.childId : details.childId;
+    logCoordination(
+      'warn',
+      `coordination hook failed profile=${profile.id} hook=${hook}${childLabel ? ` child=${childLabel}` : ''}${details.tierIndex !== undefined ? ` tier=${details.tierIndex}` : ''}`,
+      {
+        profileId: profile.id,
+        hook,
+        ...logContext,
+        ...stripUndefined(details),
+        error: message,
+      }
+    );
   };
-  const runOneChild = async (index: number, forceAbort = false): Promise<ChildRunRecord> => {
+  const logChildSkipped = (input: AgentRunInput, index: number, reason: CoordinationStopReason) => {
+    skippedChildren.add(index);
+    const child = describeChild(input, index);
+    logCoordination(
+      isFailureStopReason(reason) ? 'warn' : 'info',
+      `child skipped profile=${profile.id} child=${child.childId} reason=${reason}`,
+      { profileId: profile.id, ...child, reason }
+    );
+  };
+  const runOneChild = async (
+    index: number,
+    forcedStop?: CoordinationStopReason
+  ): Promise<ChildRunRecord> => {
     const planned = childInputs[index];
     let childInput = planned;
     let result: AgentRunResult;
     let started = false;
     // 回调可能保存检查点，失败后不能重试它或继续派发尚未开始的子任务。
-    if (forceAbort || failures.length > 0) {
+    if (forcedStop || failures.length > 0) {
       result = createChildAbortedResult(childInput);
+      logChildSkipped(childInput, index, forcedStop ?? 'prior-failure');
     } else {
       try {
-        if ((await shouldAbort(parentInput)) || failures.length > 0) {
+        const preStop =
+          (await resolveAbortReason(parentInput)) ?? (failures.length > 0 ? 'prior-failure' : null);
+        if (preStop) {
           result = createChildAbortedResult(childInput);
+          logChildSkipped(childInput, index, preStop);
         } else {
           childInput = await resolveLazyChildInput(planned, parentInput);
-          const aborted = await shouldAbort(parentInput);
           // shouldAbort/懒构造均可挂起；恢复后必须重新读取停止事实，不能用 await 前的值。
-          if (aborted || failures.length > 0) {
+          const stop =
+            (await resolveAbortReason(parentInput)) ??
+            (failures.length > 0 ? 'prior-failure' : null);
+          if (stop) {
             result = createChildAbortedResult(childInput);
+            logChildSkipped(childInput, index, stop);
           } else {
             started = true;
             result = await runChild(childInput);
@@ -120,6 +247,17 @@ async function runChildren(
         }
       } catch (err: unknown) {
         result = createChildErrorResult(childInput, err);
+        // pre-dispatch：取消探针或懒构造抛错，child 从未运行；run：child 执行本身抛错。两者都降级为 error 结果。
+        logCoordination(
+          'warn',
+          `child degraded to error result profile=${profile.id} child=${resolveChildLogId(childInput, index)} stage=${started ? 'run' : 'pre-dispatch'}`,
+          {
+            profileId: profile.id,
+            ...describeChild(childInput, index),
+            stage: started ? 'run' : 'pre-dispatch',
+            error: err instanceof Error ? err.message : String(err),
+          }
+        );
       }
     }
     const record = { childInput, result };
@@ -128,49 +266,104 @@ async function runChildren(
       try {
         await parentInput.context.coordination?.onChildResult?.({ childInput, result, profile });
       } catch (err: unknown) {
-        fail('onChildResult', err, { childId: resolveDimensionId(childInput) || undefined });
+        fail(
+          'onChildResult',
+          err,
+          { childId: resolveDimensionId(childInput) || undefined },
+          describeChild(childInput, index)
+        );
       }
+    } else if (parentInput.context.coordination?.onChildResult) {
+      // 已有失败且该 child 未启动：不再通知宿主（避免在失败后继续写检查点），但要留下跳过痕迹。
+      logCoordination(
+        'warn',
+        `coordination hook skipped profile=${profile.id} hook=onChildResult child=${resolveChildLogId(childInput, index)} reason=prior-failure`,
+        {
+          profileId: profile.id,
+          hook: 'onChildResult',
+          ...describeChild(childInput, index),
+          reason: 'prior-failure',
+        }
+      );
     }
     return record;
   };
-  const tiers =
-    concurrencyPlan.mode === 'tiered'
-      ? groupByTier(childInputs)
-      : [childInputs.map((_, index) => index)];
   for (const [tierIndex, tier] of tiers.entries()) {
-    if (concurrencyPlan.mode === 'tiered') {
-      let cancelled = failures.length > 0;
-      if (!cancelled) {
+    if (tiered) {
+      let stopReason: CoordinationStopReason | null = failures.length > 0 ? 'prior-failure' : null;
+      if (!stopReason) {
         try {
-          cancelled = await shouldAbort(parentInput);
+          stopReason = await resolveAbortReason(parentInput);
         } catch (err: unknown) {
           fail('shouldAbort', err, { tierIndex });
-          cancelled = true;
+          stopReason = 'shouldAbort-error';
         }
       }
-      if (cancelled) {
-        await Promise.all(
-          tiers
-            .slice(tierIndex)
-            .flat()
-            .map((index) => runOneChild(index, true))
+      if (stopReason) {
+        const reason = stopReason;
+        const remaining = tiers.slice(tierIndex).flat();
+        logCoordination(
+          isFailureStopReason(reason) ? 'warn' : 'info',
+          `tier cancelled profile=${profile.id} tier=${tierIndex} reason=${reason} remainingChildren=${remaining.length}`,
+          {
+            profileId: profile.id,
+            tierIndex,
+            reason,
+            remainingTierCount: tiers.length - tierIndex,
+            remainingChildCount: remaining.length,
+            childIds: remaining.map((index) => resolveChildLogId(childInputs[index], index)),
+          }
         );
+        await Promise.all(remaining.map((index) => runOneChild(index, reason)));
         break;
       }
+      logCoordination(
+        'info',
+        `tier start profile=${profile.id} tier=${tierIndex} children=${tier.length}`,
+        {
+          profileId: profile.id,
+          tierIndex,
+          tier: resolveTier(childInputs[tier[0]]),
+          childCount: tier.length,
+          childIds: tier.map((index) => resolveChildLogId(childInputs[index], index)),
+        }
+      );
     }
+    const tierStartedAt = Date.now();
     // 单个 callback 的拒绝不会让 Promise.all 早退；已开始的 child 仍需结算真实回执。
     const runs = await Promise.all(tier.map((child) => limit(() => runOneChild(child))));
-    if (concurrencyPlan.mode === 'tiered' && failures.length === 0) {
-      try {
-        await parentInput.context.coordination?.onTierComplete?.({
-          tierIndex,
-          childInputs: runs.map((run) => run.childInput),
-          results: runs.map((run) => run.result),
-          profile,
-        });
-      } catch (err: unknown) {
-        fail('onTierComplete', err, { tierIndex });
+    if (tiered) {
+      if (failures.length === 0) {
+        try {
+          await parentInput.context.coordination?.onTierComplete?.({
+            tierIndex,
+            childInputs: runs.map((run) => run.childInput),
+            results: runs.map((run) => run.result),
+            profile,
+          });
+        } catch (err: unknown) {
+          fail('onTierComplete', err, { tierIndex });
+        }
+      } else if (parentInput.context.coordination?.onTierComplete) {
+        // tier 内已有失败：不宣告该 tier 完成（宿主据此推进阶段），只记录跳过原因。
+        logCoordination(
+          'warn',
+          `coordination hook skipped profile=${profile.id} hook=onTierComplete tier=${tierIndex} reason=prior-failure`,
+          { profileId: profile.id, hook: 'onTierComplete', tierIndex, reason: 'prior-failure' }
+        );
       }
+      logCoordination(
+        'info',
+        `tier complete profile=${profile.id} tier=${tierIndex} children=${runs.length}`,
+        {
+          profileId: profile.id,
+          tierIndex,
+          childCount: runs.length,
+          durationMs: Date.now() - tierStartedAt,
+          statusCounts: countStatuses(runs.map((run) => run.result)),
+          failureCount: failures.length,
+        }
+      );
     }
   }
   const results = childInputs.map((_, index) => {
@@ -180,7 +373,23 @@ async function runChildren(
     }
     return record.result;
   });
+  const skippedChildIds = [...skippedChildren]
+    .sort((left, right) => left - right)
+    .map((index) => resolveChildLogId(childInputs[index], index));
   if (failures.length > 0) {
+    // 宿主只记录 err.message；这里把全部失败 hook 与被跳过的 child 汇总成一条 warn，便于定位缺失维度。
+    logCoordination(
+      'warn',
+      `coordination failed profile=${profile.id} failures=${failures.length} skipped=${skippedChildIds.length}`,
+      {
+        profileId: profile.id,
+        mode: concurrencyPlan.mode,
+        durationMs: Date.now() - startedAt,
+        failures: failures.map((failure) => ({ ...failure })),
+        skippedChildIds,
+        statusCounts: countStatuses(results),
+      }
+    );
     // 保持父 run 抛错（宿主据此停止 finalize）；附带原始 child 状态供恢复/读回，不能冒充成功。
     const partialResult = { ...defaultMerge(results, profile), status: 'error' as const };
     throw Object.assign(
@@ -193,15 +402,77 @@ async function runChildren(
       }
     );
   }
+  logCoordination(
+    'info',
+    `coordination complete profile=${profile.id} status=${aggregateStatus(results)} children=${results.length}`,
+    {
+      profileId: profile.id,
+      mode: concurrencyPlan.mode,
+      status: aggregateStatus(results),
+      childCount: results.length,
+      statusCounts: countStatuses(results),
+      skippedChildIds,
+      durationMs: Date.now() - startedAt,
+    }
+  );
   return results;
 }
 
-async function shouldAbort(input: AgentRunInput) {
+/**
+ * 读取停止事实并给出来源；返回 null 表示继续。语义与旧的布尔版 shouldAbort 相同：
+ * 先看 abortSignal，再询问宿主 shouldAbort，并在 await 之后重新读取 abortSignal。
+ * shouldAbort 抛错原样上抛，由调用方决定按 child 降级（error 结果）还是 tier 级失败。
+ */
+async function resolveAbortReason(
+  input: AgentRunInput
+): Promise<'abortSignal' | 'shouldAbort' | null> {
   if (input.execution?.abortSignal?.aborted) {
-    return true;
+    return 'abortSignal';
   }
   const requested = await input.execution?.shouldAbort?.();
-  return input.execution?.abortSignal?.aborted === true || requested === true;
+  if (requested === true) {
+    return 'shouldAbort';
+  }
+  if (input.execution?.abortSignal?.aborted === true) {
+    return 'abortSignal';
+  }
+  return null;
+}
+
+function isFailureStopReason(reason: CoordinationStopReason) {
+  return reason === 'prior-failure' || reason === 'shouldAbort-error';
+}
+
+/** 日志通道失败不能改变调度结果：observeSafely 吞掉同步异常与 rejected promise。 */
+function logCoordination(level: 'info' | 'warn', event: string, metadata: Record<string, unknown>) {
+  observeSafely(
+    () => Logger.getInstance()[level](`${LOG_PREFIX} ${event}`, metadata),
+    () => undefined
+  );
+}
+
+/**
+ * 日志用的 child 标识：bootstrap 维度用 dimId，module-mining 用 moduleId，都没有时退回下标。
+ * 绝对路径形态的 moduleId 不写入日志（避免泄露本机路径），同样退回下标。
+ */
+function resolveChildLogId(input: AgentRunInput, index: number) {
+  const dimId = resolveDimensionId(input);
+  if (dimId) {
+    return dimId;
+  }
+  const moduleId = stringValue(input.params?.moduleId);
+  if (moduleId && !/^(?:[\\/]|[A-Za-z]:[\\/])/.test(moduleId)) {
+    return moduleId;
+  }
+  return `child-${index}`;
+}
+
+function countStatuses(results: AgentRunResult[]) {
+  const counts: Partial<Record<AgentRunResult['status'], number>> = {};
+  for (const result of results) {
+    counts[result.status] = (counts[result.status] ?? 0) + 1;
+  }
+  return counts;
 }
 
 function createChildErrorResult(input: AgentRunInput, err: unknown): AgentRunResult {
@@ -271,15 +542,29 @@ async function resolveLazyChildInput(plannedInput: AgentRunInput, parentInput: A
   return factory({ plannedInput, parentInput });
 }
 
-function resolveConcurrency(concurrency: AgentConcurrencyPlan['concurrency']) {
+function resolveConcurrency(
+  concurrency: AgentConcurrencyPlan['concurrency']
+): ConcurrencyResolution {
   if (typeof concurrency === 'number') {
-    return concurrency;
+    return { value: concurrency, source: 'number' };
   }
   if (concurrency?.env) {
-    const parsed = Number.parseInt(process.env[concurrency.env] || '', 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : concurrency.default;
+    const raw = process.env[concurrency.env];
+    const rawValue = raw ? raw.slice(0, MAX_LOGGED_ENV_VALUE_LENGTH) : undefined;
+    const parsed = Number.parseInt(raw || '', 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return { value: parsed, source: 'env', env: concurrency.env, rawValue };
+    }
+    // 未设置属于正常默认；设置了却解析不出正整数（如 'abc'、'0'）才是需要 warn 的静默降级。
+    return {
+      value: concurrency.default,
+      source: 'default',
+      env: concurrency.env,
+      rawValue,
+      fallbackReason: raw ? 'env-invalid' : 'env-unset',
+    };
   }
-  return 1;
+  return { value: 1, source: 'default', fallbackReason: 'plan-unset' };
 }
 
 function groupByTier(childInputs: AgentRunInput[]) {
@@ -315,11 +600,17 @@ function resolveDimensionId(input: AgentRunInput) {
   return undefined;
 }
 
-function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile): AgentRunResult {
-  const status =
+/** 父状态取 child 中最严重的非成功状态；defaultMerge 与完成日志共用同一规则。 */
+function aggregateStatus(results: AgentRunResult[]): AgentRunResult['status'] {
+  return (
     (['error', 'aborted', 'timeout', 'blocked'] as const).find((candidate) =>
       results.some((result) => result.status === candidate)
-    ) ?? 'success';
+    ) ?? 'success'
+  );
+}
+
+function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile): AgentRunResult {
+  const status = aggregateStatus(results);
   return {
     runId: `${profile.id}:parent`,
     profileId: profile.id,
