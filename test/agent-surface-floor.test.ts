@@ -1,5 +1,5 @@
 import Logger from '@alembic/core/logging';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   evolutionGateEvaluator,
   producerRejectionGateEvaluator,
@@ -884,6 +884,254 @@ describe('pipeline quality decision adapters', () => {
     }).execute({ id: 'pipeline', reactLoop: loop }, new AgentMessage({ content: 'analyze' }));
     expect(result.outcome).not.toBe('completed');
     expect(loop).toHaveBeenCalledOnce();
+  });
+});
+
+// ─── C58(L6-P24，与 L5-P30/I36 同一问题的跨层配套回归)：超时零工具 fast retry 复用原阶段提示 ───
+// fast retry 是「首轮硬超时且确认零工具调用」后用 retryBudget 的同阶段重跑，不是门拒绝重试。
+// 阶段上的 retryPromptBuilder 只服务门重试：insight/scan 的 produce 生成「你的 N 个提交被拒绝了」修复
+// 清单，insight analyze 生成「上述分析未通过质量检查」；fast retry 时本阶段结果尚未写入 phaseResults、
+// 重跑前 ContextWindow 又会被清空，若仍调用它，模型只会拿到「0 个提交被拒绝」或空分析，原阶段的发现
+// 与 evidence refs 全部丢失。这里用工厂装配出的真实阶段(真实 promptBuilder / retryPromptBuilder)锁住：
+// 重跑提示 = 首轮缓存的完整阶段提示 + 超时说明，retryPromptBuilder 不被调用，诊断与日志记录提示来源。
+describe('pipeline fast retry reuses the original stage prompt (C58)', () => {
+  type StageConfig = Record<string, unknown> & { name: string };
+  type PipelineWarning = { code: string; stage?: string; message: string };
+  type PromptBuilderFn = (ctx: Record<string, unknown>) => unknown;
+  type RetryPromptBuilderFn = (
+    retryCtx: { reason?: string; artifact?: unknown },
+    content: string,
+    phaseResults: Record<string, unknown>
+  ) => string;
+
+  const FINDING = 'UserRepository 统一经 BaseRepository.withTransaction 写库';
+  const EVIDENCE_REF = 'src/repo/UserRepository.ts:12-30';
+  const EVIDENCE_ID = 'E-7@12-30';
+  const TIMEOUT_NOTICE = '上一次尝试超时且未调用任何工具';
+  const dimConfig = { id: 'code-pattern', label: '代码模式', outputType: 'dual' };
+  const projectInfo = { name: 'demo-app', lang: 'typescript', fileCount: 3 };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * timeoutPhase 首轮返回 timedOut 且零工具(满足 canFastRetry)，重跑正常返回；其他阶段正常完成并带
+   * 一次工具调用。按阶段记录每次 reactLoop 收到的 prompt。
+   */
+  function fastRetryRuntime(timeoutPhase: string) {
+    const calls: Array<{ phase: string; prompt: string }> = [];
+    let timeoutPhaseRuns = 0;
+    const runtime = {
+      id: `fast-retry-${timeoutPhase}`,
+      reactLoop: vi.fn(async (prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        calls.push({ phase, prompt });
+        const base = {
+          reply: `${phase} output`,
+          toolCalls: [] as Array<Record<string, unknown>>,
+          iterations: 1,
+          tokenUsage: { input: 1, output: 1 },
+        };
+        if (phase === timeoutPhase) {
+          timeoutPhaseRuns += 1;
+          return timeoutPhaseRuns === 1
+            ? { ...base, reply: '', timedOut: true }
+            : { ...base, reply: `${phase} output after fast retry` };
+        }
+        return {
+          ...base,
+          toolCalls: [
+            {
+              tool: 'code',
+              args: { action: 'read', path: 'src/repo/UserRepository.ts' },
+              result: 'contents',
+            },
+          ],
+        };
+      }),
+    };
+    const promptsOf = (phase: string) =>
+      calls.filter((call) => call.phase === phase).map((call) => call.prompt);
+    return { runtime, promptsOf };
+  }
+
+  /** quality_gate 交给 produce 的 AnalysisArtifact：结构化发现 + 带行号的 evidenceMap。 */
+  function analysisArtifact() {
+    return {
+      analysisText: `## 数据访问\n${FINDING}（来源: ${EVIDENCE_REF}）`,
+      referencedFiles: ['src/repo/UserRepository.ts', 'src/repo/BaseRepository.ts'],
+      findings: [{ finding: FINDING, evidence: EVIDENCE_REF, importance: 8 }],
+      evidenceMap: new Map([
+        [
+          'src/repo/UserRepository.ts',
+          {
+            filePath: 'src/repo/UserRepository.ts',
+            codeSnippets: [
+              {
+                startLine: 12,
+                endLine: 30,
+                content: 'return this.withTransaction(async (tx) => tx.insert(user));',
+              },
+            ],
+            summary: 'UserRepository 写库入口',
+            role: 'implementation',
+          },
+        ],
+      ]),
+      negativeSignals: [],
+    };
+  }
+
+  function silenceLogger() {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    return info;
+  }
+
+  const fastRetryWarnings = (diagnostics: unknown) =>
+    (
+      ((diagnostics as { warnings?: unknown[] } | undefined)?.warnings ?? []) as PipelineWarning[]
+    ).filter((warning) => warning.code === 'pipeline_stage_fast_retry');
+
+  /** 分叉留痕：诊断与 info 日志都能看出触发原因、提示来源，以及 retryPromptBuilder 被绕过。 */
+  function expectFastRetryTrace(
+    diagnostics: unknown,
+    info: ReturnType<typeof silenceLogger>,
+    stage: string
+  ) {
+    const warnings = fastRetryWarnings(diagnostics);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ stage });
+    expect(warnings[0].message).toContain('reason=stage_hard_timeout_zero_tools');
+    expect(warnings[0].message).toContain('promptSource=stage_cached');
+    expect(warnings[0].message).toContain('retryPromptBuilder=bypassed');
+    expect(
+      info.mock.calls.some((call) => {
+        const text = String(call[0]);
+        return (
+          text.includes(`Stage "${stage}" confirmed no tools`) &&
+          text.includes('promptSource=stage_cached') &&
+          text.includes('retryPromptBuilder=bypassed')
+        );
+      })
+    ).toBe(true);
+  }
+
+  it.each([
+    { factory: 'generateDimensionPipeline', params: {} },
+    { factory: 'scanPipeline', params: { task: 'extract' } },
+  ] as const)('$factory produce: hard timeout with zero tools retries with the cached producer prompt, findings and evidence refs intact', async ({
+    factory,
+    params,
+  }) => {
+    const info = silenceLogger();
+    const stages = new AgentStageFactoryRegistry().build(factory, { params }) as StageConfig[];
+    const produce = stages.find((stage) => stage.name === 'produce');
+    if (!produce) {
+      throw new Error(`${factory} did not assemble a produce stage`);
+    }
+    // 生产配置确实同时带 retryBudget(触发 fast retry)与面向拒绝的 retryPromptBuilder。
+    expect(produce.retryBudget).toBeTruthy();
+    expect(typeof produce.retryPromptBuilder).toBe('function');
+    const retryPromptBuilder = vi.fn(produce.retryPromptBuilder as RetryPromptBuilderFn);
+    const promptBuilder = vi.fn(produce.promptBuilder as PromptBuilderFn);
+    const resetForNewStage = vi.fn();
+    const artifact = analysisArtifact();
+    const { runtime, promptsOf } = fastRetryRuntime('produce');
+
+    const output = await new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality_gate',
+          gate: { evaluator: () => ({ action: 'pass', pass: true, artifact }), maxRetries: 1 },
+        },
+        { ...produce, promptBuilder, retryPromptBuilder },
+      ],
+    }).execute(runtime, new AgentMessage({ content: 'mine code-pattern' }), {
+      strategyContext: { dimConfig, projectInfo },
+      contextWindow: { resetForNewStage, tokenCount: 0 },
+    });
+
+    const prompts = promptsOf('produce');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain(FINDING);
+    expect(prompts[0]).toContain(EVIDENCE_REF);
+    // 重跑前 ContextWindow 被清空，重跑提示必须原样承载首轮完整阶段提示，再附超时说明。
+    expect(resetForNewStage).toHaveBeenCalled();
+    expect(prompts[1]).toContain(prompts[0]);
+    expect(prompts[1]).toContain(FINDING);
+    expect(prompts[1]).toContain(EVIDENCE_REF);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    expect(prompts[1]).not.toContain('个提交被拒绝了');
+    expect(prompts[1]).not.toContain('Stage hard timeout');
+    expect(retryPromptBuilder).not.toHaveBeenCalled();
+    // 复用首轮缓存，不重复调用 promptBuilder(工厂的 producer promptBuilder 还会分配记忆预算)。
+    expect(promptBuilder).toHaveBeenCalledTimes(1);
+    expect(output.reply).toBe('produce output after fast retry');
+    expect((output.phases.produce as { timedOut?: boolean }).timedOut).toBeUndefined();
+    expectFastRetryTrace(output.diagnostics, info, 'produce');
+  });
+
+  it('insight analyze: hard timeout with zero tools retries with the cached analyst prompt instead of the gate-rejection retry prompt', async () => {
+    const info = silenceLogger();
+    const [analyze] = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: false },
+    }) as StageConfig[];
+    expect(analyze?.name).toBe('analyze');
+    expect(typeof analyze.retryPromptBuilder).toBe('function');
+    const retryPromptBuilder = vi.fn(analyze.retryPromptBuilder as RetryPromptBuilderFn);
+    const promptBuilder = vi.fn(analyze.promptBuilder as PromptBuilderFn);
+    const resetForNewStage = vi.fn();
+    // 前序维度发现(含 evidence ref)经 sessionStore 进入 Analyst 提示；分析起点证据带文件行号。
+    const sessionStore = {
+      buildContextForDimension: () =>
+        `## 前序维度发现\n- ${FINDING}（evidenceRefs: ${EVIDENCE_ID}）`,
+      getRelevantReflections: () => null,
+    };
+    const evidenceStarters = {
+      'repository-transaction': {
+        hint: 'Repository 写库集中在 withTransaction',
+        data: [EVIDENCE_REF],
+        strength: 80,
+      },
+    };
+    const { runtime, promptsOf } = fastRetryRuntime('analyze');
+
+    const output = await new PipelineStrategy({
+      stages: [
+        {
+          ...analyze,
+          promptBuilder,
+          retryPromptBuilder,
+          // 预设 analyze 未声明 retryBudget；宿主为它配置 retryBudget 时同样进入 fast retry 分支。
+          retryBudget: { maxIterations: 6, temperature: 0.4, timeoutMs: 240_000 },
+        },
+      ],
+    }).execute(runtime, new AgentMessage({ content: 'analyze code-pattern' }), {
+      strategyContext: { dimConfig, projectInfo, sessionStore, evidenceStarters },
+      contextWindow: { resetForNewStage, tokenCount: 0 },
+    });
+
+    const prompts = promptsOf('analyze');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain(FINDING);
+    expect(prompts[0]).toContain(EVIDENCE_ID);
+    expect(prompts[0]).toContain(EVIDENCE_REF);
+    expect(resetForNewStage).toHaveBeenCalled();
+    expect(prompts[1]).toContain(prompts[0]);
+    expect(prompts[1]).toContain(FINDING);
+    expect(prompts[1]).toContain(EVIDENCE_ID);
+    expect(prompts[1]).toContain(EVIDENCE_REF);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    // 门重试专用文案：空分析 + 「未通过质量检查: Stage hard timeout…」不得出现在 fast retry 提示里。
+    expect(prompts[1]).not.toContain('未通过质量检查');
+    expect(prompts[1]).not.toContain('Stage hard timeout');
+    expect(retryPromptBuilder).not.toHaveBeenCalled();
+    expect(promptBuilder).toHaveBeenCalledTimes(1);
+    expect(output.reply).toBe('analyze output after fast retry');
+    expectFastRetryTrace(output.diagnostics, info, 'analyze');
   });
 });
 
