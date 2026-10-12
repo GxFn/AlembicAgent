@@ -15,12 +15,18 @@ import {
   ToolExecutionPipeline,
 } from '../src/agent/runtime/index.js';
 import {
+  createPcvNodeEvidence,
+  recordPcvToolResult,
+} from '../src/agent/runtime/PcvNodeEvidenceRecorder.js';
+import {
   eventBusPublisher,
   progressEmitter,
   submitDedup,
   trackerSignal,
 } from '../src/agent/runtime/ToolExecutionPipeline.js';
 import { takeToolPipelineFailure } from '../src/agent/runtime/toolPipeline/engine.js';
+import { createToolReceipt, projectToolReceipt } from '../src/agent/runtime/toolReceipt.js';
+import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
 import { Evolution } from '../src/tools/runtime/toolsets/Evolution.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -214,7 +220,9 @@ describe('tool pipeline lifecycle', () => {
       );
 
     expect(execute).not.toHaveBeenCalled();
-    expect(result.result).toBe(payload);
+    // I44：成功形的 blocked 结果被 engine 包装为失败 payload，原对象只保留在 data 里（身份不变）。
+    expect(result.result).toEqual({ error: 'blocked', status: 'blocked', data: payload });
+    expect((result.result as { data?: unknown }).data).toBe(payload);
     expect(emitProgress).toHaveBeenCalledWith(
       'tool_end',
       expect.objectContaining({ status: 'error' })
@@ -224,6 +232,114 @@ describe('tool pipeline lifecycle', () => {
       expect.objectContaining({ success: false }),
       { source: runtime.id }
     );
+  });
+
+  it('makes the runtime receipt and PCV read a success-shaped blocked verdict as failure', async () => {
+    const execute = vi.fn();
+    const diagnostics = new DiagnosticsCollector();
+    const loopCtx = createLoopContext(diagnostics);
+    const payload = { recorded: true, target: 'activeContext' };
+    const call = {
+      id: 'note',
+      name: 'note_finding',
+      args: { finding: 'boundary', evidence: 'src/a.ts:1', importance: 8 },
+    };
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'customGate', before: () => ({ blocked: true, result: payload }) })
+      .execute(call, {
+        runtime: createRuntime(createManifest(), execute),
+        loopCtx,
+        iteration: 1,
+      });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.metadata.blocked).toBe(true);
+    // AgentRuntime 用同一组函数判定：createToolReceipt → readToolObservation(receipt).ok。
+    const receipt = createToolReceipt(call, result.result, result.metadata);
+    const toolSucceeded = readToolObservation(receipt).ok;
+    expect(toolSucceeded).toBe(false);
+    const pcv = createPcvNodeEvidence(loopCtx);
+    recordPcvToolResult(pcv, call, result.result, result.metadata.envelope, { toolSucceeded });
+    expect(pcv.findingRefs.accepted).toHaveLength(0);
+    expect(pcv.findingRefs.rejected).toEqual([expect.objectContaining({ reason: 'blocked' })]);
+    const snapshot = diagnostics.toJSON();
+    expect(snapshot.blockedTools).toEqual([{ tool: 'note_finding', reason: 'blocked' }]);
+    expect(snapshot.warnings).toEqual([
+      expect.objectContaining({
+        code: 'TOOL_BLOCKED_RESULT_NORMALIZED',
+        tool: 'note_finding',
+        message: expect.stringContaining('customGate'),
+      }),
+    ]);
+  });
+
+  it.each([
+    'knowledge',
+    'graph',
+    'memory',
+    'terminal',
+    'code',
+  ])('projects a blocked %s verdict without result as a failure instead of throwing', async (tool) => {
+    const diagnostics = new DiagnosticsCollector();
+    const call = { id: 'blocked', name: tool, args: { action: 'exec' } };
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'customGate', before: () => ({ blocked: true }) })
+      .execute(call, {
+        runtime: createRuntime(createManifest(), vi.fn()),
+        loopCtx: createLoopContext(diagnostics),
+        iteration: 1,
+      });
+
+    expect(result.result).toEqual({ error: 'blocked', status: 'blocked' });
+    const receipt = createToolReceipt(call, result.result, result.metadata);
+    expect(readToolObservation(receipt).ok).toBe(false);
+    const projection = projectToolReceipt(receipt, { maxChars: 4000, maxMatches: 10 });
+    expect(projection.text).toContain('blocked');
+    expect(diagnostics.toJSON().warnings).toEqual([
+      expect.objectContaining({ code: 'TOOL_BLOCKED_RESULT_NORMALIZED', tool }),
+    ]);
+  });
+
+  it.each([
+    { label: 'error field', result: { error: 'denied by gate' } },
+    { label: 'failure status', result: { status: 'blocked', reason: 'stage' } },
+    { label: 'ok false', result: { ok: false, message: 'nope' } },
+    { label: 'null', result: null },
+  ])('keeps a blocked verdict that already expresses failure ($label) unchanged', async ({
+    result: blockedResult,
+  }) => {
+    const diagnostics = new DiagnosticsCollector();
+    const call = { id: 'blocked', name: 'code', args: { action: 'read' } };
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'builtInLike', before: () => ({ blocked: true, result: blockedResult }) })
+      .execute(call, {
+        runtime: createRuntime(createManifest(), vi.fn()),
+        loopCtx: createLoopContext(diagnostics),
+        iteration: 1,
+      });
+
+    expect(result.result).toBe(blockedResult);
+    expect(readToolObservation(createToolReceipt(call, result.result, result.metadata)).ok).toBe(
+      false
+    );
+    expect(diagnostics.toJSON().warnings).toEqual([]);
+  });
+
+  it('falls back to the runtime logger when no diagnostics collector records the normalization', async () => {
+    const warn = vi.fn();
+    const runtime = createRuntime(createManifest(), vi.fn());
+    Object.assign(runtime, { logger: { info: () => undefined, warn } });
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    Object.assign(loopCtx, { diagnostics: null });
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'customGate', before: () => ({ blocked: true, result: { kept: 1 } }) })
+      .execute(
+        { id: 'read', name: 'code', args: { action: 'read' } },
+        { runtime, loopCtx, iteration: 1 }
+      );
+
+    expect(result.result).toEqual({ error: 'blocked', status: 'blocked', data: { kept: 1 } });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('TOOL_BLOCKED_RESULT_NORMALIZED'));
   });
 
   it('captures evidence before memory, tracker and trace consume the same envelope', async () => {
@@ -341,7 +457,21 @@ describe('tool pipeline lifecycle', () => {
     expect(execute).not.toHaveBeenCalled();
     expect(laterBefore).not.toHaveBeenCalled();
     expect(after).toHaveBeenCalledTimes(2);
-    expect(result.result).toBe('result' in verdict ? verdict.result : undefined);
+    if (blocked) {
+      // I44：blocked 且没有 result 时 engine 补上失败 payload，避免回执投影对 undefined 抛 TypeError。
+      expect(result.result).toEqual({ error: 'blocked', status: 'blocked' });
+    } else {
+      // 非 blocked 短路保持中间件给出的原值身份（null/0/false/'' 都是合法结果）。
+      expect(result.result).toBe('result' in verdict ? verdict.result : undefined);
+    }
+    // after 钩子看到的是与返回值同一份（已归一的）结果。
+    expect(after).toHaveBeenCalledWith(
+      expect.anything(),
+      result.result,
+      expect.anything(),
+      result.metadata
+    );
+    // 非 blocked 短路仍隐式记为缓存命中：删除该语义依赖待决事项②，本包暂不改。
     expect(result.metadata).toMatchObject({ blocked, cacheHit: !blocked });
   });
   it.each([

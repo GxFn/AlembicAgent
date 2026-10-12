@@ -177,7 +177,7 @@
         "src/agent/runtime/toolPipeline/submissionLedger.ts"
       ],
       "src/agent/runtime/toolPipeline/contracts.ts": [],
-      "src/agent/runtime/toolPipeline/engine.ts": [],
+      "src/agent/runtime/toolPipeline/engine.ts": ["src/agent/utils/toolOutcomes.ts"],
       "src/agent/runtime/toolPipeline/callNormalization.ts": ["src/tools/runtime/registry.ts"],
       "src/agent/runtime/toolPipeline/runtimeBridge.ts": [
         "src/tools/kernel/index.ts",
