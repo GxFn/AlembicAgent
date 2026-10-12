@@ -372,10 +372,13 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             required: ['sources'],
           },
           retrievalProfile: RETRIEVAL_PROFILE_INPUT_SCHEMA,
+          // I42：2026-07-04 软门不阻断裁定后，全软违规会自动作为 styleAdvisories 随候选入库，
+          // 本字段不再决定放行；它只把理由随 reasoning.styleWaiver 落库并跳过自动风格修复。
+          // 描述不得再承诺"带理由重提即可通过"，否则模型会白花一个提交回合去申辩。
           waiverJustification: {
             type: 'string',
             description:
-              'Style-rule appeal only: if a submit was rejected purely by soft style rules (imperative-verb whitelist, contrast example, title genericity, markdown length) and you have a legitimate reason to keep your wording, resubmit unchanged with a >=20-char justification here. It passes with your reason attached for human review. Never applicable to evidence/duplicate/required-structure rejections.',
+              'Optional. Soft style findings (imperative-verb whitelist, contrast example, title genericity, markdown length) never block a submit on their own: they are stored with the candidate as style advisories for human review, so do not resubmit just to add this field. Supply a >=20-char reason only when you deliberately keep wording a soft rule flags; the reason is stored with the candidate for human review and skips the automatic style repair (a few per session; beyond that it is ignored and the findings are stored as advisories). It has no effect on evidence, duplicate or required-structure rejections, which must be fixed.',
           },
         },
         required: [

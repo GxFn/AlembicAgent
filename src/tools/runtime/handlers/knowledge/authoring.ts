@@ -4,6 +4,7 @@ import {
   applyStyleWaiver,
   getImperativeVerbAllowlist,
   isSoftAuthoringViolation,
+  STYLE_WAIVER_MIN_JUSTIFICATION,
   STYLE_WAIVER_SESSION_LIMIT,
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
@@ -378,20 +379,23 @@ export async function prepareSubmission(
       }
     }
   }
-  // 软规则一次申辩制(2026-07-02 用户决策)：门禁规则分两性——硬规则是事实与接地
-  // (伪造锚点/重复/必填结构，放行即污染知识库，不可申辩)；软规则是写作风格判断
-  // (祈使动词白名单/对比示例/标题泛化/长度)，LLM 可能有正当理由(如项目惯用语)。
-  // 软规则全拒时反复猜措辞是最长的提交回合尾巴；改为：LLM 带 ≥20 字 waiverJustification
-  // 重新提交即放行，理由随 reasoning.styleWaiver 落库，由 Dashboard 人工审核终裁。
-  // 每会话 waiver 上限 5 次防滥用；混有硬违规时申辩无效(先修事实错误)。
+  // 软规则 waiver(2026-07-02 引入，2026-07-04"软门不阻断"裁定后语义收窄，I42)：
+  // 门禁规则分两性——硬规则是事实与接地(伪造锚点/重复/必填结构，放行即污染知识库，
+  // waiver 无效，先修事实错误)；软规则是写作风格判断(祈使动词白名单/对比示例/标题泛化/长度)。
+  // 软门不阻断之后，全软违规无论带不带理由都会在下方 advisory 分层随候选入库，所以 waiver
+  // 不再决定放行，只剩两点作用：①理由随 reasoning.styleWaiver 落库(代替 styleAdvisories)，
+  // 由 Dashboard 人工审核终裁；②跳过本次自动风格修复子调用，保留模型刻意选择的措辞。
+  // Core 的 STYLE_WAIVER_SESSION_LIMIT 因此只是"每会话可跳过自动修复的次数额度"：超额后
+  // 理由被忽略，候选照常走修复子调用与 advisory 入库，不会因此被拒。
   if (gateViolations.length > 0) {
-    // waiver 每会话上限的累计宿主必须跨调用稳定(sessionCounterBox)——挂 ctx.runtime 时
-    // 每次调用都从 0 起算,上限 5 形同虚设(与修复层计数同因,门0 真跑后根修)。
+    // 额度累计宿主必须跨调用稳定(sessionCounterBox)——挂 ctx.runtime 时每次调用都从 0
+    // 起算，额度形同虚设(与修复层计数同因，门0 真跑后根修)。
     const waiverBox = sessionCounterBox(ctx.runtime);
     const waiverTotal = Number(waiverBox?.styleWaiverTotal) || 0;
+    const justification = pickString(params.waiverJustification);
     const waiver = applyStyleWaiver({
       violations: gateViolations,
-      justification: pickString(params.waiverJustification),
+      justification,
       sessionWaiverTotal: waiverTotal,
       item: effectiveItem,
     });
@@ -402,9 +406,20 @@ export async function prepareSubmission(
         waiverBox.styleWaiverTotal = waiverTotal + 1;
       }
       Logger.getInstance().warn(
-        `[knowledge.submit] style waiver accepted (${waiver.waivedCodes.join(', ')}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}), session waivers=${waiverTotal + 1}/${STYLE_WAIVER_SESSION_LIMIT} — pending human review`
+        `[knowledge.submit] style waiver recorded (${waiver.waivedCodes.join(', ')}) for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): justification stored as reasoning.styleWaiver, auto style repair skipped (repair-skip waivers used this session: ${waiverTotal + 1}, allowance ${STYLE_WAIVER_SESSION_LIMIT}; soft findings never block either way) — pending human review`
       );
       gateViolations = [];
+    } else if (justification) {
+      // 带了理由却未生效是静默分叉：可能是含硬违规、理由过短或会话额度已用尽。只记录 Core
+      // 判定的关键输入，不在此复刻判定；后续路径按是否残留硬违规分别是拒绝或修复+advisory。
+      const hardCount = gateViolations.filter((v) => !isSoftAuthoringViolation(v.code)).length;
+      const nextPath =
+        hardCount > 0
+          ? 'regular rejection path (hard violations are never waivable)'
+          : 'auto style repair when its per-title budget allows, then non-blocking style advisories for what remains';
+      Logger.getInstance().info(
+        `[knowledge.submit] style waiver not applied for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): hardViolations=${hardCount}, justificationChars=${justification.length} (min ${STYLE_WAIVER_MIN_JUSTIFICATION}), sessionWaivers=${waiverTotal} (allowance ${STYLE_WAIVER_SESSION_LIMIT}); continuing with ${nextPath}`
+      );
     }
   }
   // E7-R（接受率 100% 最后一级）：纯风格类拒绝→一次 schema 收窄的修复子调用后重跑门禁

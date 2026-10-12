@@ -1148,6 +1148,154 @@ describe('Agent Recipe production profile adapter', () => {
     }
   });
 
+  // I42（2026-07-04 软门不阻断裁定后的 waiver 契约）：软违规本来就会作为 advisory 入库，
+  // waiverJustification 只负责附理由并跳过自动修复；描述不得再承诺"带理由重提即可通过"。
+  const WAIVER_REASON =
+    'Project convention keeps the declarative doClause wording used across this module.';
+
+  test('describes waiverJustification as an optional reason that skips auto repair, not a resubmit-to-pass appeal', () => {
+    const description =
+      TOOL_REGISTRY.knowledge.actions.submit.params.properties?.waiverJustification?.description ??
+      '';
+    // 旧描述的"原样重提即放行"承诺会让模型多花一个提交回合。
+    expect(description).not.toMatch(/resubmit unchanged/iu);
+    expect(description).not.toMatch(/\bit passes\b/iu);
+    // 新描述：软违规本身不阻断、以 advisory 入库；字段只附理由并跳过自动修复。
+    expect(description).toMatch(/never block/iu);
+    expect(description).toMatch(/advisor/iu);
+    expect(description).toMatch(/do not resubmit/iu);
+    expect(description).toMatch(/skips the automatic style repair/iu);
+    // 硬违规（证据/重复/必填结构）不受该字段影响的边界保留。
+    expect(description).toMatch(/evidence, duplicate or required-structure/iu);
+  });
+
+  test('stores a waiver justification and skips the auto style repair without logging a pass cap', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const counters: Record<string, unknown> = {};
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      const result = await handleKnowledge(
+        'submit',
+        { ...softOnlyLongParams(), waiverJustification: WAIVER_REASON },
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState: { _sessionCounters: counters }, aiProvider: { chat } },
+        } as never
+      );
+      expect(result.ok).toBe(true);
+      // waiver 的真实作用之一：跳过修复子调用。
+      expect(chat).not.toHaveBeenCalled();
+      const reasoning = storedItem(fake).reasoning as {
+        styleWaiver?: { codes: string[]; justification: string };
+        styleAdvisories?: string[];
+      };
+      expect(reasoning.styleWaiver?.justification).toBe(WAIVER_REASON);
+      expect(reasoning.styleWaiver?.codes).toEqual(
+        expect.arrayContaining(['DO_CLAUSE_NON_IMPERATIVE', 'CONTENT_CONTRAST_MISSING'])
+      );
+      expect(reasoning.styleAdvisories).toBeUndefined();
+      expect(counters.styleWaiverTotal).toBe(1);
+      const waiverLog = warn.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes('[knowledge.submit] style waiver'));
+      expect(waiverLog).toBeDefined();
+      expect(waiverLog).toContain('auto style repair skipped');
+      // 上限只决定是否跳过修复，不决定放行；日志不得再呈现 "session waivers=x/5" 式的放行上限。
+      expect(waiverLog).not.toMatch(/session waivers=\d+\/\d+/u);
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('ignores the justification once the session waiver allowance is used up and still stores soft findings as advisories', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const counters: Record<string, unknown> = { styleWaiverTotal: 5 };
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      const result = await handleKnowledge(
+        'submit',
+        { ...softOnlyLongParams(), waiverJustification: WAIVER_REASON },
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState: { _sessionCounters: counters }, aiProvider: { chat } },
+        } as never
+      );
+      // 超出额度后候选照样入库：上限从不决定放行，只让理由失效、恢复自动修复。
+      expect(result.ok).toBe(true);
+      expect(chat).toHaveBeenCalledTimes(1);
+      const reasoning = storedItem(fake).reasoning as {
+        styleWaiver?: unknown;
+        styleAdvisories?: string[];
+      };
+      expect(reasoning.styleWaiver).toBeUndefined();
+      expect((reasoning.styleAdvisories ?? []).join(' ')).toContain('DO_CLAUSE_NON_IMPERATIVE');
+      expect(counters.styleWaiverTotal).toBe(5);
+      // 理由被忽略的路径必须可观测：看得出额度已用尽、以及候选接下来走 advisory 而非拒绝。
+      const notApplied = info.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes('style waiver not applied'));
+      expect(notApplied).toBeDefined();
+      expect(notApplied).toContain('sessionWaivers=5');
+      expect(notApplied).toContain('allowance 5');
+      expect(notApplied).toContain('non-blocking style advisories');
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps rejecting a hard violation even with a justification and logs the ignored waiver', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const counters: Record<string, unknown> = {};
+    const base = softOnlyLongParams();
+    const markdown = (base.content as { markdown: string }).markdown;
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      // 正文里的未背书关系断言（“调用方”）触发硬违规 GRAPH_REF_INVALID，与软违规并存。
+      const result = await handleKnowledge(
+        'submit',
+        {
+          ...base,
+          content: {
+            ...(base.content as object),
+            markdown: `${markdown}\n绕过调用方直接用值导入会产生运行时导入边。`,
+          },
+          waiverJustification: WAIVER_REASON,
+        },
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState: { _sessionCounters: counters }, aiProvider: { chat } },
+        } as never
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('GRAPH_REF_INVALID');
+      expect(fake.calls).toHaveLength(0);
+      expect(counters.styleWaiverTotal).toBeUndefined();
+      const notApplied = info.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes('style waiver not applied'));
+      expect(notApplied).toBeDefined();
+      expect(notApplied).toMatch(/hardViolations=[1-9]/u);
+      expect(notApplied).toContain('regular rejection path');
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('shares the per-title style repair budget across runtime projections and phase copies', async () => {
     const projectRoot = makeProject();
     const sharedState = { _sessionCounters: {} };
