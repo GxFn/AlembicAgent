@@ -87,7 +87,8 @@ export class MemoryConsolidator {
   /**
    * 智能固化: 先执行冲突检测 (Mem0 风格)，再执行 ADD / UPDATE / MERGE / NOOP
    *
-   * @returns }
+   * @returns 固化统计 ConsolidateStats：added / updated / merged / skipped 计数；
+   *   发生矛盾替换时另带 replaced
    */
   consolidate(
     candidateMemories: CandidateMemory[],
@@ -191,7 +192,8 @@ export class MemoryConsolidator {
   /**
    * 从旧版 Memory.js JSONL 文件迁移数据到 SQLite
    *
-   * @returns >}
+   * @returns 迁移结果 { migrated, skipped, error? }：migrated = 新增 + 合并条数；
+   *   迁移整体失败时 migrated/skipped 为 0 并带 error
    */
   async migrateFromLegacy(
     projectRoot: string,

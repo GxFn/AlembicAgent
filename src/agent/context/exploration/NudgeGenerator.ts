@@ -5,14 +5,18 @@
  * 按优先级队列生成每轮最多一条 nudge 注入 AI 上下文。
  *
  * 优先级 (高→低):
- *   1. force_exit — 轮次耗尽
+ *   1. force_exit — 轮次耗尽（经 ExplorationTracker 不可达：gracefulExitRound 只在转入终结阶段时设置，
+ *      而 getNudge 在终结阶段直接返回 null；分支保留为公开兼容面，直接调用 generate 时仍会生效。
+ *      生产中轮次耗尽的收尾文本来自 ExplorationTracker 终结 nudge 与 runtime/forcedSummary）
  *   2. convergence — 信息饱和
  *   3. budget_warning — 75% 预算消耗
  *   4. reflection — 周期反思 / 停滞反思
  *   5. (planning — 由 PlanTracker 处理)
  *
  * 设计原则:
- *   - 无状态（flags 从外部传入并返回更新）
+ *   - 有状态，每次运行一个实例：类内持有一次性标志（convergence / budget_warning 各最多一次）
+ *     与 bootstrap 限流计数（条数上限 + 最小间隔轮次）；不要跨 tracker 或跨运行复用同一实例，
+ *     否则一次性 nudge 会被上一次运行的标志吞掉（ExplorationTracker 构造时各自 new 一个）
  *   - 接受 state 快照，无循环依赖
  *   - Nudge 文本内联（未来可外置为 i18n JSON 模板）；收尾/强制退出/防复制类固定指令句
  *     统一登记在 NUDGE_DIRECTIVE_TEXTS，finalAnswer 按同一份原句识别模型回显
@@ -154,7 +158,8 @@ export class NudgeGenerator {
    *
    * @param state 从 ExplorationTracker 传入的状态快照
    * @param trace ActiveContext 实例 (反思用)
-   * @returns |null}
+   * @returns 本轮 nudge { type, text }（type 为 force_exit / convergence / budget_warning /
+   *   reflection 之一）；无需引导或被 bootstrap 限流抑制时返回 null
    */
   generate(state: NudgeState, trace: ExplorationTrace | null) {
     const {
@@ -167,7 +172,8 @@ export class NudgeGenerator {
       isTerminalPhase,
     } = state;
 
-    // 1. 强制退出（graceful exit 后每轮都重复发出，确保 LLM 不再调用工具）
+    // 1. 强制退出（graceful exit 后每轮都重复发出，确保 LLM 不再调用工具）。
+    //    经 ExplorationTracker.getNudge 不可达（终结阶段先返回 null），见文件头说明。
     if (gracefulExitRound != null && m.iteration >= gracefulExitRound) {
       return this.#generateForceExit(m, b, strategy, pipelineType);
     }
@@ -404,7 +410,8 @@ export class NudgeGenerator {
 
   /**
    * 检查是否需要触发反思 + 生成反思 nudge
-   * @returns |null}
+   * @returns 反思 nudge { type: 'reflection', text }（同时写入 trace.setReflection）；
+   *   终结阶段、未到触发条件或 trace 无近期摘要时返回 null
    */
   #checkReflection(state: NudgeState, trace: ExplorationTrace | null) {
     const { phase, metrics: m, budget: b, strategy, isTerminalPhase, pipelineType } = state;

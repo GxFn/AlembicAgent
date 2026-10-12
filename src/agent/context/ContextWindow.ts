@@ -11,8 +11,11 @@ import type { LlmContinuation } from '#ai/contracts.js';
  * 设计不变量:
  *   1. messages[0] 始终是原始 user prompt（不可删除）
  *   2. assistant(toolCalls) 与其 tool results 是原子单元（不可拆分）
- *   3. 每次 AI 调用前自动压缩到 TOKEN_BUDGET 以内
- *   4. 不通过追加 user 消息来控制 AI 行为（由 ExplorationTracker 管理）
+ *   3. 每次 AI 调用前按用量尽量压缩（L1→L2→L3）；L3 至少保留最近两轮工具调用，
+ *      因此不保证投影严格落入 tokenBudget 以内（最近两轮本身偏大时仍可能超出）
+ *   4. 运行时引导只通过单条 runtime_nudge user 消息（appendUserNudge）：新 nudge 追加前
+ *      先移除旧的 runtime_nudge，历史中始终最多保留一条；引导内容由 ExplorationTracker 与
+ *      AgentRuntime 的门控（grounding、digest 等）产生，本类只负责存放
  *   5. 「用量」只有一个口径：发给模型的投影视图（toProjectedMessages）。用量比例、
  *      工具结果配额、压缩触发和 L4 判定都读这一个口径；L3 折叠后保留的原始历史
  *      不计入用量，只通过 estimateRetainedTokens() 供诊断观察。
@@ -107,7 +110,11 @@ interface ToolResultQuota {
 
 /** Compaction configuration — per-pipeline overrides */
 export interface CompactionConfig {
-  /** [L0, L1, L2, L3, L4] usage ratio thresholds */
+  /**
+   * [L0, L1, L2, L3, L4] usage ratio thresholds。
+   * 注意：第 0 位（L0）当前不被任何代码读取——compactIfNeeded 只用 t1..t3，needsL4Compaction 只用 t4，
+   * getToolResultQuota 使用独立的固定阶梯（0.5/0.7/0.85/0.95）。保留五元组形状只是为了不改公开类型。
+   */
   thresholds?: [number, number, number, number, number];
   /** Whether to enable L4 LLM-based summary (scan pipelines may disable) */
   enableL4LLM?: boolean;
@@ -135,7 +142,10 @@ const DEFAULT_THRESHOLDS: [number, number, number, number, number] = [0.4, 0.55,
 export class ContextWindow {
   /** 统一格式消息 */
   #messages: ContextMessage[] = [];
-  /** token 预算（默认 24000，约对应 Gemini 的安全阈值） */
+  /**
+   * token 预算：构造参数缺省为 24000；运行时（SystemRunContextFactory）通常传入
+   * resolveTokenBudget 按模型上下文窗口算出的值。
+   */
   #tokenBudget;
   /** 被压缩掉的轮次摘要（用于 digest 生成） */
   #compactionLog: string[] = [];
@@ -217,12 +227,12 @@ export class ContextWindow {
   /**
    * 根据模型名称解析合适的 ContextWindow token 预算。
    *
-   * 策略: 取模型最大上下文窗口的一个安全分片，
-   *   - 超大窗口 (≥400k): 预算 48000（1M 级模型可容纳更多上下文）
-   *   - 大窗口 (≥200k): 预算 32000（tool schemas + system prompt 占显著空间）
-   *   - 中窗口 (≥64k):  预算 24000
-   *   - 小窗口 (≥16k):  预算 12000
-   *   - 微窗口 (<16k):  预算 = 窗口 × 0.7（留 30% 给 prompt/tool schema）
+   * 策略: 取模型最大上下文窗口的一个安全分片，按 isSystem 分两套档位（system / 非 system）:
+   *   - 超大窗口 (≥400k): 48000 / 36000（1M 级模型可容纳更多上下文）
+   *   - 大窗口 (≥200k):   32000 / 24000（tool schemas + system prompt 占显著空间）
+   *   - 中窗口 (≥64k):    24000 / 20000
+   *   - 小窗口 (≥16k):    14000 / 12000
+   *   - 微窗口 (<16k):    窗口 × 0.75 / 窗口 × 0.65（向下取整，余量留给 prompt/tool schema）
    *
    * 上下文窗口来源: provider 提示（opts.provider，其次 ALEMBIC_AI_PROVIDER）为具体 provider 时
    * 按 ModelRegistry.resolve 查询（别名先归一）；缺失或为 'auto' 时按 findByApiModelId 查询；
@@ -315,9 +325,9 @@ export class ContextWindow {
   }
 
   /**
-   * 追加阶段过渡引导消息 — 轻量级 user 消息，用于在 ExplorationTracker 阶段转换时
-   * 向 AI 明确传达新阶段的行为期望。与 appendUserMessage 功能相同，
-   * 独立命名以便审计和搜索。
+   * 追加运行时引导消息 — 带 runtime_nudge 标记的 user 消息，用于阶段转换等时机向 AI
+   * 明确传达行为期望。与 appendUserMessage 不同：追加前先移除历史中旧的 runtime_nudge
+   * （并同步修正 L3 折叠边界），保证同一时刻最多只有一条运行时引导（设计不变量 4）。
    */
   appendUserNudge(content: string) {
     // 过滤规则与 SimpleArrayAdapter 共用（dropStaleRuntimeNudges），保证两种消息存储只保留最新运行时指令。
@@ -406,10 +416,11 @@ export class ContextWindow {
   // ─── 压缩 API ─────────────────────────────────────────
 
   /**
-   * 在每次 AI 调用前调用 — 根据 token 使用率执行 5 层递进压缩
+   * 在每次 AI 调用前调用 — 根据 token 使用率同步执行 L1→L3 递进压缩（L4 另由 compactL4 异步处理）
    *
-   * 5 层策略:
-   *   L0 (≥0.40): Budget Reduction — getToolResultQuota 降档（隐式，不在此处执行）
+   * 递进策略（括号内为 DEFAULT_THRESHOLDS 缺省值）:
+   *   L0: 不存在对应动作。thresholds[0] 当前不被读取；工具结果配额由 getToolResultQuota
+   *       的独立固定阶梯（0.5/0.7/0.85/0.95）决定，与 thresholds 无关
    *   L1 (≥0.55): Snip — 截断旧 tool result
    *   L2 (≥0.70): Merge — 合并同角色消息、去重 submit 记录
    *   L3 (≥0.82): Collapse — 读时投影 (#collapseThreshold)
@@ -419,7 +430,9 @@ export class ContextWindow {
    * 使用率按投影视图计算：L3 折叠后投影低于阈值时本方法是 no-op，
    * 直到新增轮次把投影重新推过阈值才会再次折叠。
    *
-   * @returns } 压缩结果
+   * @returns 压缩结果 { level, removed }：level 为本次执行到的最高层级（0 表示用量未达 L1
+   *   阈值或消息不超过 4 条）；removed 为各层累计处理条数——L1 截断的工具结果数 + L2 合并的
+   *   消息数，L3 只移动投影边界、不计数
    */
   compactIfNeeded() {
     const [, t1, t2, t3] = this.#thresholds;

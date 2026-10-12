@@ -805,7 +805,12 @@ export class ActiveContext {
   // ── 配置 ──
   /** 保留最近 N 轮原始观察 */
   #maxRecentRounds: number;
-  /** 轻量模式 (User Chat: 仅 RT 功能，禁用 WM 压缩/Scratchpad) */
+  /**
+   * 轻量模式：跳过 WM 滑动窗口（不累计 totalObservations、不保留也不压缩观察，observe() 直接返回）
+   * 并让 buildContext() 返回空串。Scratchpad 不受影响：noteKeyFinding 照常写入，distill().keyFindings
+   * 照常带出。能传入该选项的生产入口只有 MemoryCoordinator.createDimensionScope（config.lightweight），
+   * 而当前 src 与宿主的调用都不传它，所以生产中恒为 false。
+   */
   #lightweight: boolean;
   /** 总观察计数 */
   #totalObservations = 0;
@@ -814,7 +819,8 @@ export class ActiveContext {
 
   /**
    * @param [options.maxRecentRounds=3] 保留最近 N 轮原始结果 (WM 滑动窗口)
-   * @param [options.lightweight=false] 轻量模式: 跳过 WM 的压缩/Scratchpad 逻辑 (D5)
+   * @param [options.lightweight=false] 轻量模式 (D5): 跳过 WM 滑动窗口与 buildContext 输出；
+   *   Scratchpad（noteKeyFinding / distill().keyFindings）仍照常工作
    */
   constructor(options: ActiveContextOptions = {}) {
     const maxRecentRounds = options.maxRecentRounds ?? 3;
@@ -1309,7 +1315,12 @@ export class ActiveContext {
     };
   }
 
-  /** 统计指标 (ExplorationTracker.getQualityMetrics 使用) */
+  /**
+   * 轮次统计指标（轮数、思考/反思条数、工具调用与观察计数、耗时）。
+   * 生产读取方: NudgeGenerator 反思 nudge 的累计工具调用数、LLMInputAssembly 的 traceStats 遥测、
+   * PcvNodeEvidenceRecorder 的观察台账可读性探针，以及本类 distill() / toJSON() 的 stats 字段。
+   * PlanTracker / ExplorationTracker.getQualityMetrics 也会读取，但这两个方法当前无生产调用方。
+   */
   getStats() {
     return {
       totalRounds: this.#rounds.length,

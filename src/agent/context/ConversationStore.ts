@@ -5,12 +5,15 @@
  * - 每个对话一个 JSONL 文件: .asd/conversations/{id}.jsonl
  * - 索引文件: .asd/conversations/index.json
  * - 按 category 隔离: 'user'(Dashboard) / 'system'(agent runtime)
- * - Token 预算: 超限时自动生成摘要压缩旧轮次
+ * - Token 预算: load 超限时只做截断——保留开头的 [对话摘要]（如有且放得下）与最新消息
+ *   （最新一条本身超预算时按预算截断其内容），丢弃中间旧消息并在预算放得下时插入一条
+ *   [上下文截断] 标记；不会自动生成摘要。
+ *   摘要只在显式调用 summarize() 时生成（需要 AI Provider，当前无生产调用方）
  * - 静默降级: 持久化失败不影响核心功能
  *
  * Token 计算策略:
- *   采用字符数近似估算 (1 token ≈ 3.5 字符中文 / ≈ 4 字符英文)
- *   简单高效，无需额外依赖
+ *   估算口径以 shared/tokenUtils.estimateTokens 为准（码位高于 U+2E80 的字符，含 CJK，
+ *   每字符 0.5 token；其余字符 0.25 token，即约 2 / 4 字符一个 token），本文件不另设比例
  *
  * 文件结构:
  *   .asd/conversations/
@@ -155,7 +158,7 @@ export class ConversationStore {
    *   - 保留最新的消息
    *
    * @param [opts.tokenBudget] token 预算
-   * @returns []}
+   * @returns 预算内的消息列表 { role, content }[]；文件不存在、为空或读取失败时返回空数组
    */
   load(conversationId: string, { tokenBudget = DEFAULT_TOKEN_BUDGET } = {}) {
     try {
@@ -291,7 +294,7 @@ export class ConversationStore {
    * 清理过期对话
    * @param [opts.maxAgeDays=30] 超过此天数的对话将被删除
    * @param [opts.category] 只清理特定类别
-   * @returns }
+   * @returns 清理结果 { deleted }：本次删除的对话数
    */
   cleanup({
     maxAgeDays = 30,

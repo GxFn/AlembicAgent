@@ -4,8 +4,8 @@
  * W6-d(A1)拆分:原 1,328 行三分混装已按归属拆出——
  * - 工件构建(sanitizeAnalysisText/buildAnalysisReport/buildAnalysisArtifact 等)
  *   → ../evaluation/analysisArtifact.ts
- * - 质量评估器(buildQualityScores/analysisQualityGate/applyDepthRetryGate/
- *   applyDepthRetryGate 等) → ../evaluation/qualityGates.ts
+ * - 质量评估器(buildQualityScores/analysisQualityGate/applyDepthRetryGate 等)
+ *   → ../evaluation/qualityGates.ts
  * - gate.evaluator 适配器(insightGateEvaluator/evolutionGateEvaluator)
  *   → ../evaluation/gateEvaluators.ts
  * 本文件只保留纯 prompt 文本构建:

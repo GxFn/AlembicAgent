@@ -5,14 +5,18 @@
  * - Producer System Prompt
  * - 工具白名单
  * - 预算常量
- * - Prompt 构建器 (v1 + v2)
+ * - Prompt 构建器：生产路径只用 v2 buildProducerPromptV2；v1 buildProducerPrompt 仅因公开面冻结
+ *   保留，无生产调用方（也不渲染结构化发现与代码证据）
  * - 代码上下文注入 (evidenceMap → prompt section)
  *
  * W6-d(A1)拆分:拒绝率门控 producerRejectionGateEvaluator(拆前 :655)及其
  * 私有类型 ReactLoopResult/ToolCallRecord/GateStrategyContext(拆前 :59-75)
  * 已迁往 ../evaluation/gateEvaluators.ts。
  *
- * 被 PipelineStrategy 的 bootstrap preset 直接引用。
+ * 引用方: profiles/presets/insightPreset（冷启动 insight Producer 阶段使用
+ * PRODUCER_SYSTEM_PROMPT / PRODUCER_BUDGET / buildProducerPromptV2）与
+ * evaluation/stageBuilders（scan Producer 复用 buildCodeContextSection）；
+ * 其余导出经 prompts/index 的 export * 进入公开面。
  * 不再包含任何 Agent 类 — Agent 由 AgentRuntime + PipelineStrategy 驱动。
  *
  * @module insightProducer
@@ -566,11 +570,17 @@ function truncateCodeVerbatim(content: string, maxChars: number): string {
 // ──────────────────────────────────────────────────────────────────
 
 /**
- * 从 evidenceMap 构建 Producer 证据引用段。
+ * 从 evidenceMap 构建 Producer 证据引用段（refs-first，有界）。
  *
- * Package N 将 Producer 证据所有权收敛为 refs-first：这里不再注入大段代码正文。
- * Producer 不再补读源码；这样避免 live history 同时保留 direct code replay、
- * 额外 code.read 和 submit payload。
+ * - 条目按片段数降序遍历，直到累计 1600 字符预算用尽；每个非文档条目的前 3 个代码片段渲染为
+ *   可逐字复制的 `path:起行-止行` 引用；文档类条目和没有行号片段的条目降为「背景文件」
+ *   （最多列 8 个），明确不可用作 sourceRefs。
+ * - 在 1600 字符的总预算内，为每个已渲染条目最多 3 个片段各注入不超过 220 字符的
+ *   逐字代码前缀（「可复制 coreCode」），供候选照抄以通过 snippet-match 门禁；
+ *   因此这里仍会注入短代码正文，只是不注入大段全文。
+ * - 冷启动 insight Producer（buildProducerPromptV2）与 scan Producer（evaluation/stageBuilders）
+ *   共用本函数；是否允许 Producer 再用 code.read 补读源码，由各自的系统提示与工具白名单决定，
+ *   不由本函数决定。
  */
 export function buildCodeContextSection(
   evidenceMap: Map<string, EvidenceEntry> | null | undefined,

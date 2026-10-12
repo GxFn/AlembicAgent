@@ -187,7 +187,7 @@ export class SessionStore implements Disposable {
   // ── 子系统 2: ReadOnlyCache (from ToolResultCache) ──
   #searchCache = new Map<string, SearchCacheEntry>();
   #fileCache = new Map<string, SearchCacheEntry>();
-  /** } */
+  /** 只读缓存的命中 / 未命中 / 淘汰计数，经 getStats().cache 暴露，clearCache() 归零 */
   #cacheStats = { hits: 0, misses: 0, evictions: 0 };
   #ttlMs;
   #cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -329,7 +329,10 @@ export class SessionStore implements Disposable {
     return (this.#evidenceStore.get(filePath) || []).map(publicEvidence);
   }
 
-  /** @returns >} */
+  /**
+   * 按文件路径或 finding 文本（不区分大小写的子串匹配）检索证据，可按 dimId 过滤。
+   * @returns 命中列表 { filePath, evidence }[]，按 evidence.importance 降序（缺省按 5 计）
+   */
   searchEvidence(query: string, dimId?: string) {
     const results: { filePath: string; evidence: Finding }[] = [];
     const lowerQuery = query.toLowerCase();
@@ -426,11 +429,21 @@ export class SessionStore implements Disposable {
     );
   }
 
-  /** 获取所有 TierReflection (F17: EpisodicConsolidator 需要) */
+  /**
+   * 获取所有 TierReflection 的深拷贝。EpisodicConsolidator 读取反思时优先调用它
+   * （只克隆反思数组），缺失该方法的鸭子类型宿主才回退到 toJSON() 整体快照。
+   */
   getTierReflections() {
     return structuredClone(this.#tierReflections);
   }
 
+  /**
+   * 把全部 TierReflection 渲染成 Markdown 段落（核心发现、跨维度模式、对后续维度的建议）。
+   *
+   * 注意：名称里的 "Relevant" 名不副实——当前不做相关性过滤，currentDimId 未被使用，
+   * 返回的是所有 tier 的反思；参数仅为保持公开签名而保留。调用方需要自行去重或裁剪。
+   * @returns 渲染后的 Markdown；没有任何反思时返回 null
+   */
   getRelevantReflections(currentDimId: string): string | null {
     if (this.#tierReflections.length === 0) {
       return null;
@@ -631,7 +644,8 @@ export class SessionStore implements Disposable {
 
   /**
    * 获取维度的蒸馏上下文 (供 Producer 使用)
-   * @returns |null}
+   * @returns 维度蒸馏上下文 { keyFindings, toolCallSummary, referencedFiles } 的深拷贝；
+   *   该维度尚无报告时返回 null
    */
   getDistilledForProducer(dimId: string) {
     const report = this.#dimensionReports.get(dimId);

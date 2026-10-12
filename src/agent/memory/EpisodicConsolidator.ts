@@ -180,17 +180,19 @@ export class EpisodicConsolidator {
   ) {
     const t0 = Date.now();
 
-    // 提取成功后才触及存储；全量清理交给 consolidate 的事务，失败保留上一代记忆。
-    // 2. 从 findings 提取 fact 记忆
+    // 提取成功后才触及存储。旧 bootstrap 记忆的清理不是本方法的独立步骤：替换路径由
+    // MemoryConsolidator 在 consolidate 的同一事务内完成（见下方 clearPreviousBootstrap），
+    // 失败保留上一代记忆。
+    // 1. 从 findings 提取 fact 记忆
     const findingMemories = this.#extractFromFindings(sessionStore);
 
-    // 3. 从 Tier Reflections 提取 insight 记忆
+    // 2. 从 Tier Reflections 提取 insight 记忆
     const insightMemories = this.#extractFromReflections(sessionStore);
 
-    // 4. 从 analysisText 提取文本中的事实
+    // 3. 从 analysisText 提取文本中的事实
     const textFactMemories = this.#extractFromAnalysisText(sessionStore);
 
-    // 5. 合并所有候选, 使用 consolidate 去重
+    // 4. 合并所有候选, 使用 consolidate 去重
     const allCandidates = [...findingMemories, ...insightMemories, ...textFactMemories];
 
     // ── 结构化统计日志 ──
@@ -413,7 +415,7 @@ export class EpisodicConsolidator {
   /**
    * 从分析文本中正则提取项目级事实和洞察
    *
-   * 仅提取高置信度的简短陈述 (≤100 字), 避免噪音。
+   * 仅提取高置信度的简短陈述（匹配文本 10–120 字符，超出范围的丢弃）, 避免噪音。
    */
   #extractFromAnalysisText(sessionStore: SessionStoreLike) {
     const memories: CandidateMemoryEntry[] = [];

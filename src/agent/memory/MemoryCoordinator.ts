@@ -2,9 +2,10 @@
  * MemoryCoordinator — 记忆系统统一协调器
  *
  * 设计原则 (CoALA / MemGPT / Generative Agents / Mem0):
- *   - Single Coordinator: 所有记忆操作通过此模块路由
+ *   - 协调而非唯一入口: 本类装配运行时记忆 prompt、管理维度 scope 与 SessionStore 缓存；
+ *     并非所有记忆读写都经此路由（例如 insightAnalyst 直接经 readPersistentMemorySection
+ *     读取 PersistentMemory，持久记忆的去重/合并/冲突解决在 MemoryConsolidator 内完成）
  *   - Budget-Aware Injection: 记忆注入受统一 token 预算管控
- *   - Extract-Update Write Path: 写入经去重/合并/冲突解决
  *   - Graceful Degradation: 任意子系统故障不影响核心执行
  *
  * 生命周期:
@@ -258,7 +259,9 @@ export class MemoryCoordinator {
 
   /**
    * 构建静态记忆 prompt (execute 入口调用一次)
-   * 包含: PersistentMemory + ConversationLog + SessionStore 上下文
+   * 包含: PersistentMemory + SessionStore 上下文。不读取 ConversationLog：
+   * 分配给 conversationLog 的份额只计入静态预算，未用部分作为 surplus 转给同 mode 的
+   * 动态（工作记忆）prompt。
    *
    * @param [options.mode] 'user' | 'analyst' | 'producer'
    * @param [options.taskContext] 当前任务描述 (用于 relevance 打分)
@@ -373,7 +376,8 @@ export class MemoryCoordinator {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 记录工具调用观察 (合并 WM.observe + TRC.set)
+   * 记录工具调用观察：只把非缓存命中的工具结果写入 SessionStore 缓存；
+   * ActiveContext 的轮次/观察记录由 trace.recordToolCall() 负责，不在此处写入。
    * @param round 当前迭代轮次
    * @param [cacheHit=false] 本次是否缓存命中
    */
@@ -583,8 +587,9 @@ export class MemoryCoordinator {
   }
 
   /**
-   * 完成会话: 触发 Consolidator
-   * @returns |null>}
+   * 完成会话：只清空当前 scope 指针，不删除已建 scope，也不触发 Consolidator 固化
+   * （固化由宿主另行调用 EpisodicConsolidator）。
+   * @returns 恒为 { consolidated: 0 }；内部异常时返回 null 并记 warn
    */
   async completeSession(): Promise<{ consolidated: number } | null> {
     try {
@@ -615,7 +620,10 @@ export class MemoryCoordinator {
     return this.#sessionStore || null;
   }
 
-  /** 检索前序维度的代码证据 — V2 memory.get_previous_evidence 桥接 */
+  /**
+   * 检索前序维度的代码证据 — memory.get_previous_evidence 的旧接口；
+   * handler 优先调用 searchEvidenceWithDiagnostics，只有替身/旧宿主才走这里。
+   */
   searchEvidence(query: string, dimId?: string): MemoryEvidenceSearchHit[] {
     return this.searchEvidenceWithDiagnostics(query, dimId).results;
   }

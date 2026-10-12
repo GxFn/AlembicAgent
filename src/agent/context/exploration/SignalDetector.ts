@@ -1,26 +1,36 @@
 import { stableStringify } from '#shared/serialization.js';
 import { readToolObservation, successfulReadPaths } from '../../utils/toolOutcomes.js';
 /**
- * SignalDetector — V2 工具调用信号检测器
+ * SignalDetector — 工具调用信号检测器
  *
  * 检测每次工具调用是否产生了新信息（新文件、新搜索模式、新查询目标）。
  *
- * V2 参数契约:
- *   - code.read / code.outline: params.path (单文件)
+ * 参数契约:
+ *   - code.read: params.path / params.filePaths（只计 successfulReadPaths 认定成功读取的路径，
+ *     批量部分失败的成员不算新文件）
+ *   - code.outline: params.path (单文件)
  *   - code.search: params.pattern / params.patterns (搜索模式)
  *   - code.structure: params.directory (目录)
  *   - code.write: params.path (写入目标)
  *   - graph.query: params.type + params.entity
+ *   - graph.overview: 无 entity，按 action + type 去重
  *   - terminal.exec: params.command
  *
- * 搜索结果为紧凑文本格式，从中提取文件路径:
+ * code.search 结果:
+ *   主路径读取结构化结果的 matches[].file（code.search handler 返回结构化 matches）；
+ *   结果为纯文本字符串时才回退到 extractFilesFromSearchText 解析文本中的文件路径:
  *   "file.swift:42: content" → 提取 "file.swift"
  *
  * @module SignalDetector
  */
 
-// ─── 搜索工具白名单（用于判断"搜索轮次"）───────────────
+// ─── 搜索工具白名单 ───────────────
 
+/**
+ * 历史公开常量：只按工具名粗分（code / graph 全部 action 都算），会把 code.read、
+ * graph.overview 等非搜索 action 也计入。本仓内部不读取它——搜索轮次判定使用口径更窄的
+ * isSearchAction（只认 code.search 与 graph.query）。保留仅因公开面冻结，不要用它判定搜索轮次。
+ */
 export const SEARCH_TOOLS = new Set(['code', 'graph']);
 
 /** 判断是否为搜索 action（更精确的搜索轮次判定） */
@@ -103,7 +113,7 @@ export class SignalDetector {
 
   // ─── 内部检测方法 ──────────────────────────────
 
-  /** code.search — 从 params + 文本结果中提取信号 */
+  /** code.search — 从 params（搜索模式）+ 结果（结构化 matches 或纯文本回退）中提取信号 */
   #detectSearchSignal(args: Record<string, unknown>, result: unknown): boolean {
     let foundNew = false;
 
@@ -123,8 +133,8 @@ export class SignalDetector {
       }
     }
 
-    // V2 搜索结果是紧凑文本，从中提取文件路径
-    // 格式: "file.swift:42: content" 或 "── file.swift ──"
+    // 回退路径：结果为纯文本字符串时（非结构化 handler 输出或调用方已投影成文本），
+    // 从文本中提取文件路径。格式: "file.swift:42: content" 或 "── file.swift ──"
     if (typeof result === 'string') {
       const files = extractFilesFromSearchText(result);
       for (const f of files) {
@@ -135,6 +145,7 @@ export class SignalDetector {
       }
     }
 
+    // 主路径：code.search handler 返回结构化 matches[]，直接读取每条匹配的 file。
     if (result && typeof result === 'object') {
       const record = result as Record<string, unknown>;
       const matches = Array.isArray(record.matches) ? record.matches : [];
@@ -214,7 +225,7 @@ export class SignalDetector {
 // ─── 辅助函数 ──────────────────────────────
 
 /**
- * 从 V2 紧凑搜索文本中提取文件路径。
+ * 从纯文本搜索结果中提取文件路径（code.search 结构化 matches 不可用时的回退解析）。
  *
  * 支持格式:
  *   "── path/to/file.ext ──" (分隔线)
