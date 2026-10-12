@@ -22,7 +22,7 @@ import {
   readMemoryValue,
   reportMemoryRead,
 } from './MemoryReadPolicy.js';
-import type { DeserializedMemory } from './MemoryStore.js';
+import type { DeserializedMemory, MemoryRow } from './MemoryStore.js';
 import { MemoryStore } from './MemoryStore.js';
 
 // ─── 常量 (Generative Agents 三维打分) ────────────────
@@ -34,6 +34,16 @@ const WEIGHT_RELEVANCE = 0.5;
 
 /** Recency 半衰期 (天) — 7 天未访问的记忆分数下降一半 */
 const RECENCY_HALF_LIFE_DAYS = 7;
+
+/**
+ * 无 query 渲染的排序：重要性主导，访问热度只做有界加成。
+ * 热度按 log1p(access_count) 归一化并在 HEAT_SATURATION_ACCESS_COUNT 次访问处封顶；
+ * 重要性按 importance/10 计（一档 = 0.1），热度最大加成 0.05 只相当于半档重要性，
+ * 因此热度只在同档重要性内决定先后，翻转不了整档差距：被反复注入的 importance=5
+ * 记忆（写入默认值）压不住新加入的 importance=7 记忆（固化对跨维度发现、决策的常用值）。
+ */
+const NO_QUERY_HEAT_MAX_BONUS = 0.05;
+const HEAT_SATURATION_ACCESS_COUNT = 15;
 
 /** 相似度阈值 (用于 append 去重) */
 const SIMILARITY_UPDATE = 0.85;
@@ -139,7 +149,18 @@ export class MemoryRetriever {
 
     // 向量检索: 嵌入 query，然后与存储的 embedding 做余弦相似度
     let queryVec: number[] | null = null;
-    if (this.#embeddingFn) {
+    const storedVectorCount = this.#embeddingStore?.size ?? 0;
+    if (this.#embeddingFn && storedVectorCount === 0) {
+      // 前置判断：sidecar 不存在或一条向量都没有时，query 向量不可能参与打分，
+      // 嵌入它只会白占读取 deadline（远程 provider 还要计费）。直接走纯词汇排序，
+      // 每次读取报一次跳过原因，区分“未配置 sidecar”与“sidecar 为空（尚未回填）”。
+      // sidecar 非空但没有与当前正文匹配的向量时仍按原路径嵌入，避免逐行预检多算一轮 hash。
+      reportMemoryRead(options, {
+        phase: 'embedding',
+        status: 'stale',
+        reason: this.#embeddingStore ? 'no-stored-vectors' : 'no-embedding-store',
+      });
+    } else if (this.#embeddingFn) {
       const embeddingFn = this.#embeddingFn;
       const result = await readMemoryValue(
         (signal) => embeddingFn(query, { abortSignal: signal, inputKind: 'query' }),
@@ -181,10 +202,14 @@ export class MemoryRetriever {
         m.content
       );
 
-      // 向量相关性: 从 embeddingStore 查找 embedding 做余弦相似度
+      // 向量相关性: 从 embeddingStore 查找 embedding 做余弦相似度。
+      // 没有 query 向量（未配置、已跳过或嵌入失败）时存储向量无从比较，
+      // 不再逐行做正文 sha256 校验，也不产生逐行 content-version-mismatch 噪声。
       const deserialized = MemoryStore.deserialize(m);
       let vectorRelevance = 0;
-      const storedEmbedding = this.#embeddingStore?.get(m.id, m.content) ?? null;
+      const storedEmbedding = queryVec
+        ? (this.#embeddingStore?.get(m.id, m.content) ?? null)
+        : null;
       const usableVector = queryVec && isMemoryVector(storedEmbedding, queryVec.length);
       if (queryVec && storedEmbedding && !usableVector) {
         reportMemoryRead(options, {
@@ -245,15 +270,14 @@ export class MemoryRetriever {
     if (query) {
       memories = await this.#rank(query, { ...options, limit, source });
     } else {
+      // 无 query 时按“重要性为主、有界热度为辅”排序；下方会对实际注入的行 touchAccess，
+      // 热度若无上限就会自我强化成固定 top-N，挤掉后加入的高重要性记忆。
       memories = this.#store
         .getAllActive({ source })
-        .sort((a, b) => {
-          const scoreA = (a.importance || 5) * 0.6 + (a.access_count || 0) * 0.4;
-          const scoreB = (b.importance || 5) * 0.6 + (b.access_count || 0) * 0.4;
-          return scoreB - scoreA;
-        })
+        .map((row) => ({ row, score: MemoryRetriever.#noQueryScore(row) }))
+        .sort((a, b) => b.score - a.score)
         .slice(0, limit)
-        .map((m) => MemoryStore.deserialize(m));
+        .map(({ row }) => MemoryStore.deserialize(row));
     }
 
     if (memories.length === 0) {
@@ -489,6 +513,21 @@ export class MemoryRetriever {
     }
     const ageDays = (now - ts) / 86400_000;
     return ageDays > STALE_MEMORY_DAYS ? STALE_MEMORY_PREFIX : '';
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Private: 无 query 排序（有界热度）
+  // ═══════════════════════════════════════════════════════════
+
+  /** importance 归一化为主项；access_count 经 log1p 压缩并封顶，非法或负值按 0 计。 */
+  static #noQueryScore(m: MemoryRow): number {
+    const importance = (m.importance || 5) / 10;
+    const accessCount =
+      typeof m.access_count === 'number' && Number.isFinite(m.access_count)
+        ? Math.max(0, m.access_count)
+        : 0;
+    const heat = Math.min(1, Math.log1p(accessCount) / Math.log1p(HEAT_SATURATION_ACCESS_COUNT));
+    return importance + NO_QUERY_HEAT_MAX_BONUS * heat;
   }
 
   // ═══════════════════════════════════════════════════════════

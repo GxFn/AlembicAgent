@@ -39,6 +39,21 @@ afterEach(() => {
   }
 });
 
+/**
+ * 预置一条与被测记忆无关的向量，让 sidecar 非空。
+ * 检索只有在 sidecar 至少存有一条向量时才会发起 query embedding；需要覆盖 embedding
+ * 取消、超时、非法向量与重新确认路径的用例用它打开该分支。直接写文件再加载，不登记 flush timer。
+ */
+function seededEmbeddingStore(label: string) {
+  const root = makeTempRoot(label);
+  const filePath = join(root, 'vectors.json');
+  writeFileSync(
+    filePath,
+    JSON.stringify({ schemaVersion: 2, embeddings: { 'unrelated-seed': { vector: [1, 0] } } })
+  );
+  return new MemoryEmbeddingStore(root, { filePath });
+}
+
 describe('MemoryStore', () => {
   it('labels query and document embedding calls while preserving cancellation', async () => {
     const db = new Database(':memory:');
@@ -87,6 +102,7 @@ describe('MemoryStore', () => {
       const store = new MemoryStore(db);
       const { id } = store.add({ content: 'obsolete decision' });
       const retriever = new MemoryRetriever(store, {
+        embeddingStore: seededEmbeddingStore('embedding-revalidate'),
         embeddingFn: async () => {
           store.update(id, { content: 'current decision' });
           return [1, 0];
@@ -108,6 +124,7 @@ describe('MemoryStore', () => {
       store.add({ content: 'transaction boundary' });
       const diagnostics: unknown[] = [];
       const results = await new MemoryRetriever(store, {
+        embeddingStore: seededEmbeddingStore('embedding-invalid-query'),
         embeddingFn: async () => vector,
       }).retrieve('transaction', { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) });
       expect(Number.isFinite(results[0]._score)).toBe(true);
@@ -141,7 +158,10 @@ describe('MemoryStore', () => {
         controller.abort();
         return [1, 0];
       });
-      const retriever = new MemoryRetriever(store, { embeddingFn });
+      const retriever = new MemoryRetriever(store, {
+        embeddingFn,
+        embeddingStore: seededEmbeddingStore('embedding-late-cancel'),
+      });
       expect(await retriever.retrieve('transaction', { abortSignal: controller.signal })).toEqual(
         []
       );
@@ -159,6 +179,7 @@ describe('MemoryStore', () => {
       store.add({ content: 'transaction isolation', source: 'user' });
       const diagnostics: unknown[] = [];
       const retriever = new MemoryRetriever(store, {
+        embeddingStore: seededEmbeddingStore('embedding-deadline'),
         embeddingFn: () =>
           new Promise((resolve) => {
             release = resolve;
@@ -957,6 +978,254 @@ describe('MemoryEmbeddingStore', () => {
     const recovered = new MemoryEmbeddingStore(root, { filePath });
 
     expect(recovered.size).toBe(0);
+  });
+  it('does not load or overwrite a profile-bound sidecar from an unbound store', () => {
+    const root = makeTempRoot('embedding-unbound');
+    const sidecar = join(root, '.asd/context/memory_embeddings.json');
+    const bound = new MemoryEmbeddingStore(root, { profileId: 'model-a' });
+    bound.set('m1', [1, 0], 'c1');
+    bound.dispose();
+
+    const diagnostics: unknown[] = [];
+    const unbound = new MemoryEmbeddingStore(root, {
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    // 未绑定实例无法证明自己与文件处于同一向量空间：不加载，并给出可观测信号。
+    expect(unbound.size).toBe(0);
+    expect(unbound.get('m1')).toBeNull();
+    expect(diagnostics).toContainEqual({
+      phase: 'embedding',
+      status: 'stale',
+      reason: 'embedding-profile-unbound',
+    });
+
+    unbound.set('m2', [0, 1], 'c2');
+    unbound.gc(new Set(['m2']));
+    unbound.dispose();
+    expect(diagnostics).toContainEqual({
+      phase: 'backfill',
+      status: 'invalid',
+      reason: 'sidecar-write-skipped:embedding-profile-unbound',
+    });
+    const persisted = JSON.parse(readFileSync(sidecar, 'utf8'));
+    expect(persisted.profileId).toBe('model-a');
+    expect(Object.keys(persisted.embeddings)).toEqual(['m1']);
+
+    const reopened = new MemoryEmbeddingStore(root, { profileId: 'model-a' });
+    expect(reopened.get('m1', 'c1')).toEqual([1, 0]);
+    reopened.dispose();
+  });
+  it('rechecks the on-disk profile before an unbound store writes over a sidecar bound later', () => {
+    const root = makeTempRoot('embedding-unbound-late');
+    const sidecar = join(root, '.asd/context/memory_embeddings.json');
+    const diagnostics: unknown[] = [];
+    // 构造时文件尚不存在；随后另一个带 profile 的实例先写盘。
+    const unbound = new MemoryEmbeddingStore(root, {
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const bound = new MemoryEmbeddingStore(root, { profileId: 'model-a' });
+    bound.set('m1', [1, 0], 'c1');
+    bound.dispose();
+
+    unbound.set('m2', [0, 1], 'c2');
+    unbound.flushSync();
+    expect(diagnostics).toContainEqual(
+      expect.objectContaining({ reason: 'sidecar-write-skipped:embedding-profile-unbound' })
+    );
+    expect(JSON.parse(readFileSync(sidecar, 'utf8')).profileId).toBe('model-a');
+    // 写盘被拒绝不影响进程内缓存的读取；dirty 保留，文件解除绑定后仍可再次 flush。
+    expect(unbound.get('m2', 'c2')).toEqual([0, 1]);
+    rmSync(sidecar);
+    unbound.dispose();
+    expect(JSON.parse(readFileSync(sidecar, 'utf8'))).toEqual({
+      schemaVersion: 2,
+      embeddings: { m2: { vector: [0, 1], contentHash: expect.any(String) } },
+    });
+  });
+  it('still replaces a corrupt sidecar from an unbound store and reports the failed binding check', () => {
+    const root = makeTempRoot('embedding-unbound-corrupt');
+    const filePath = join(root, 'vectors.json');
+    const diagnostics: unknown[] = [];
+    const unbound = new MemoryEmbeddingStore(root, {
+      filePath,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    unbound.set('m1', [1, 0], 'c1');
+    // 损坏文件无法证明已绑定任何 profile：沿用原有覆盖恢复路径，但留下核对失败的诊断。
+    writeFileSync(filePath, '{not-json');
+    unbound.dispose();
+    expect(diagnostics).toEqual([
+      {
+        phase: 'backfill',
+        status: 'stale',
+        reason: 'sidecar-binding-check-failed:invalid-json',
+      },
+    ]);
+    expect(new MemoryEmbeddingStore(root, { filePath }).get('m1', 'c1')).toEqual([1, 0]);
+  });
+});
+
+describe('MemoryRetriever vector sidecar gate', () => {
+  function seedMemories(db: ConstructorParameters<typeof MemoryStore>[0]) {
+    const store = new MemoryStore(db);
+    const lexical = store.add({ content: 'transaction isolation level', source: 'bootstrap' });
+    const semantic = store.add({ content: 'database locking strategy', source: 'bootstrap' });
+    return { store, lexical, semantic };
+  }
+
+  it('skips the query embedding and reports no-stored-vectors when the sidecar is empty', async () => {
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-empty-gate'), {
+      profileId: 'model-a',
+    });
+    try {
+      const { store } = seedMemories(db);
+      const embeddingFn = vi.fn(async () => [1, 0]);
+      const retriever = new MemoryRetriever(store, { embeddingFn, embeddingStore: embeddings });
+      const lexicalOnly = await new MemoryRetriever(store).retrieve('transaction');
+      const diagnostics: unknown[] = [];
+
+      const section = await retriever.toPromptSection({
+        query: 'transaction',
+        source: 'bootstrap',
+        onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      });
+      const results = await retriever.retrieve('transaction', {
+        onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      });
+
+      expect(embeddings.size).toBe(0);
+      expect(embeddingFn).not.toHaveBeenCalled();
+      expect(section).toContain('transaction isolation level');
+      expect(results.map((m) => [m.id, m._relevance])).toEqual(
+        lexicalOnly.map((m) => [m.id, m._relevance])
+      );
+      // 每次读取只报一次跳过原因，而不是逐行报告。
+      expect(diagnostics).toEqual([
+        { phase: 'embedding', status: 'stale', reason: 'no-stored-vectors' },
+        { phase: 'embedding', status: 'stale', reason: 'no-stored-vectors' },
+      ]);
+    } finally {
+      embeddings.dispose();
+      db.close();
+    }
+  });
+
+  it('skips the query embedding when no embedding store is configured', async () => {
+    const db = new Database(':memory:');
+    try {
+      const { store, lexical } = seedMemories(db);
+      const embeddingFn = vi.fn(async () => [1, 0]);
+      const diagnostics: unknown[] = [];
+      const results = await new MemoryRetriever(store, { embeddingFn }).retrieve('transaction', {
+        onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      });
+      expect(embeddingFn).not.toHaveBeenCalled();
+      expect(results[0].id).toBe(lexical.id);
+      expect(diagnostics).toEqual([
+        { phase: 'embedding', status: 'stale', reason: 'no-embedding-store' },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps hybrid vector ranking when the sidecar holds content-bound vectors', async () => {
+    const db = new Database(':memory:');
+    const embeddings = new MemoryEmbeddingStore(makeTempRoot('embedding-hybrid'), {
+      profileId: 'model-a',
+    });
+    try {
+      const { store, lexical, semantic } = seedMemories(db);
+      embeddings.set(lexical.id, [0, 1], 'transaction isolation level');
+      embeddings.set(semantic.id, [1, 0], 'database locking strategy');
+      const embeddingFn = vi.fn(async () => [1, 0]);
+      const diagnostics: unknown[] = [];
+      const results = await new MemoryRetriever(store, {
+        embeddingFn,
+        embeddingStore: embeddings,
+      }).retrieve('transaction', { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) });
+
+      expect(embeddingFn.mock.calls.map((call) => call[1]?.inputKind)).toEqual(['query']);
+      // 词汇上不相关、但向量完全匹配的记忆排第一：0.6 * 1 + 0.4 * 0。
+      expect(results[0].id).toBe(semantic.id);
+      expect(results[0]._relevance).toBeCloseTo(0.6);
+      expect(results[1].id).toBe(lexical.id);
+      expect(results[1]._relevance).toBeCloseTo(0.4);
+      expect(diagnostics).toEqual([]);
+    } finally {
+      embeddings.dispose();
+      db.close();
+    }
+  });
+
+  it('does not hash rows against the sidecar when no query vector is available', async () => {
+    const db = new Database(':memory:');
+    try {
+      const { store, lexical, semantic } = seedMemories(db);
+      const root = makeTempRoot('embedding-no-query-vector');
+      const filePath = join(root, 'vectors.json');
+      // 旧版（无正文 hash）条目：按正文读取时每行都会判为 content-version-mismatch。
+      writeFileSync(filePath, JSON.stringify({ [lexical.id]: [1, 0], [semantic.id]: [0, 1] }));
+      const diagnostics: unknown[] = [];
+      const onDiagnostic = (diagnostic: unknown) => diagnostics.push(diagnostic);
+      // 逐行 get(id, content) 的诊断走 sidecar 自己的观察者，因此两侧都要接上。
+      const embeddings = new MemoryEmbeddingStore(root, { filePath, onDiagnostic });
+      const results = await new MemoryRetriever(store, { embeddingStore: embeddings }).retrieve(
+        'transaction',
+        { onDiagnostic }
+      );
+      expect(results[0].id).toBe(lexical.id);
+      expect(diagnostics).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('MemoryRetriever no-query ranking', () => {
+  it('lets a new high-importance memory into the top-N after repeated injections', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      for (let i = 0; i < 15; i++) {
+        store.add({ content: `routine note ${i}`, importance: 5, source: 'user' });
+      }
+      const retriever = new MemoryRetriever(store);
+      // 每次无 query 渲染都会对注入行 touchAccess；访问热度必须有上界，不能自我强化成固定 top-N。
+      for (let round = 0; round < 20; round++) {
+        await retriever.toPromptSection({ source: 'user' });
+      }
+      // 热度已饱和的默认重要性记忆不能压住只高两档、从未被注入过的新记忆。
+      store.add({ content: 'NEW_PRIORITY_DECISION', importance: 7, source: 'user' });
+
+      const section = await retriever.toPromptSection({ source: 'user' });
+      expect(section).toContain('NEW_PRIORITY_DECISION');
+      expect(section).toContain('## 项目记忆 (15 条最相关)');
+      expect(section.split('\n')[2]).toContain('NEW_PRIORITY_DECISION');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('still prefers frequently injected memories among equal importance', async () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const hot = store.add({ content: 'HOT_NOTE', importance: 5, source: 'user' });
+      store.add({ content: 'COLD_NOTE', importance: 5, source: 'user' });
+      for (let i = 0; i < 4; i++) {
+        store.touchAccess(hot.id);
+      }
+      const section = await new MemoryRetriever(store).toPromptSection({
+        source: 'user',
+        limit: 1,
+      });
+      expect(section).toContain('HOT_NOTE');
+      expect(section).not.toContain('COLD_NOTE');
+    } finally {
+      db.close();
+    }
   });
 });
 
