@@ -21,6 +21,11 @@ export * from './presenter.js';
 export * from './registry.js';
 export * from './request.js';
 export * from './result.js';
+// 包内专用（L3-P07）：result.ts 的 default（规范化函数，其上挂 D23 清理入口
+// redactPrivateFields）不被上面的 `export *` 转发；runtimeBridge 受文件边界约束只能从本桶
+// 导入，所以在这里具名转发。本桶不在任何公开出口链上（tools/index.ts 与包入口逐文件再导出
+// kernel，不经过本文件），不改变公开绑定。
+export { default as toolResultInternals } from './result.js';
 export * from './routing.js';
 export type {
   ToolActionAllowlist,

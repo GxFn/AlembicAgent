@@ -21,7 +21,8 @@ import type {
   ToolScopeRelease,
 } from '#tools/kernel/index.js';
 import type { CapabilityDef, ToolContext, ToolResult } from '#tools/kernel/registry.js';
-// default 导出不经 kernel/tools 的 `export *` 进入公开出口，只供本 adapter 做规范化。
+// default 导出不经 kernel/tools 的 `export *` 进入公开出口；本 adapter 只用它做 JSON 安全化，
+// 它上面的 D23 私有字段清理入口由 runtimeBridge/AgentTaskHandlers 经 kernel 桶的包内转发使用。
 import normalizeToolResultContent from '#tools/kernel/result.js';
 import { toolAdmissionFailure } from '../admission.js';
 import { ToolRouter } from '../router.js';
@@ -344,11 +345,14 @@ export class ToolRouterAdapter implements ToolRouterContract {
     // 规范化（L3-P06）只处理循环、accessor、toJSON、BigInt、Date、原型，不删除任何字段，
     // 也不施加 4096 显示节点预算：宿主 /agent/tool 拿到的是完整数据，status 仍是 handler
     // 真值（不降为 partial）。显示预算只留给 projectToolResultOrdinaryOutput/presentToolResult，
-    // 模型路径另有 limitToolResult 字符配额。D23 普通输出禁用字段也没有在下游对结构化结果
-    // 补上：带默认禁用列表的投影只出现在 presentToolResult（目前没有生产调用方），以及
-    // runtimeBridge 与 AgentTaskHandlers 对不带 structuredContent 的纯文本信封的投影；有
-    // structuredContent 时它们直接返回原值。结构化结果是否也要执行 D23 待决（L3-C02），
-    // 决定前不要假设私有字段已被清理。
+    // 模型路径另有 limitToolResult 字符配额。
+    // D23 普通输出禁用字段不在这里执行（L3-C02 决策）：本信封就是宿主 /agent/tool 的响应体，
+    // 宿主 HTTP 出口不执行 D23（cross-repo 决定），所以这里不删除任何字段。D23 的执行点在
+    // 下游：秘密/私有字段由 runtimeBridge（模型历史、返回值）与 AgentTaskHandlers（任务输出、
+    // AI 提示、错误）在使用前对 structuredContent 与 JSON text 一并清理（任意深度、按规范化
+    // 名字），旧信封顶层字段只由普通输出投影 projectToolResultOrdinaryOutput（runtimeBridge 与
+    // AgentTaskHandlers 对纯文本信封的投影）在根路径删除；presentToolResult（目前没有生产调用方）
+    // 走同一投影。
     const normalized = normalizeToolResultContent(result.data);
     envelope.structuredContent = normalized.value;
     if (result.ok) {

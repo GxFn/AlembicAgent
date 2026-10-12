@@ -4,6 +4,7 @@ import {
   type ToolCallRequest,
   type ToolResultEnvelope,
   type ToolResultStatus,
+  toolResultInternals,
 } from '#tools/kernel/index.js';
 import { SafetyPolicy } from '../../policies/index.js';
 import { toExecutableToolCall } from './callNormalization.js';
@@ -21,11 +22,79 @@ const BLOCKING_ENVELOPE_STATUSES = new Set<ToolResultStatus>([
   'timeout',
 ]);
 
+/**
+ * 返回值投影。传入的必须是已经过 redactModelBoundEnvelope 的信封：structuredContent 已删除
+ * D23 秘密/私有字段（任意深度），业务字段（含根 message）原样保留；纯文本信封再走默认
+ * 普通输出投影（秘密字段任意深度 + 旧信封字段只在根路径）。
+ */
 function projectPipelineToolResult(envelope: ToolResultEnvelope): unknown {
   if (envelope.structuredContent !== undefined) {
     return envelope.structuredContent;
   }
   return projectToolResultOrdinaryOutput(envelope);
+}
+
+/** 诊断里最多列出的私有字段路径数与单条长度；路径只含键名，不含任何值。 */
+const MAX_REPORTED_PRIVATE_FIELD_PATHS = 10;
+const MAX_REPORTED_PRIVATE_FIELD_PATH_LENGTH = 120;
+
+/**
+ * D23 真实出口（L3-C02/L3-P07）。模型历史读 metadata.envelope.text（projectToolReceipt），
+ * 记忆、证据、观察者与 PCV 读返回值和 envelope.structuredContent，所以必须在写入 metadata
+ * 之前清理整份信封，只清理返回值挡不住私有字段。宿主 /agent/tool 不经过本函数，规范信封
+ * 原样保留在 ToolRouterAdapter 的响应里（宿主 HTTP 出口不执行 D23）。
+ *
+ * 没有私有字段时返回同一信封对象；有改写时写诊断（无诊断收集器时降级到 runtime.logger），
+ * 只记字段路径与警告码，不记字段值。
+ */
+function redactModelBoundEnvelope(
+  call: ToolCall,
+  context: ToolExecContext,
+  envelope: ToolResultEnvelope
+): ToolResultEnvelope {
+  const redaction = toolResultInternals.redactPrivateFields(envelope);
+  if (redaction.envelope === envelope) {
+    return envelope;
+  }
+  const { redactedFields, warningCodes } = redaction;
+  const shownPaths = redactedFields
+    .slice(0, MAX_REPORTED_PRIVATE_FIELD_PATHS)
+    .map((path) => path.slice(0, MAX_REPORTED_PRIVATE_FIELD_PATH_LENGTH));
+  const morePaths = redactedFields.length - shownPaths.length;
+  const warning =
+    redactedFields.length > 0
+      ? {
+          code: 'TOOL_RESULT_PRIVATE_FIELDS_REDACTED',
+          tool: call.name,
+          message:
+            `Removed ${redactedFields.length} private field(s) from the ${call.name} result before it reached the model: ` +
+            `${shownPaths.join(', ')}${morePaths > 0 ? ` (+${morePaths} more)` : ''}` +
+            `${warningCodes.length > 0 ? `; normalization: ${warningCodes.join(', ')}` : ''}.`,
+        }
+      : {
+          // 没有命中私有键名，但结果含 toJSON/accessor/非普通原型/超深容器：原对象在下游
+          // JSON.stringify 时可能重新带出私有字段，因此改用 JSON 安全副本。
+          code: 'TOOL_RESULT_PRIVATE_FIELD_SCAN_NORMALIZED',
+          tool: call.name,
+          message: `Replaced the ${call.name} result with a JSON-safe copy before it reached the model (${warningCodes.join(', ')}).`,
+        };
+  if (context.loopCtx.diagnostics) {
+    context.loopCtx.diagnostics.warn(warning);
+  } else {
+    try {
+      const pending: unknown = context.runtime.logger?.warn(
+        `[ToolPipeline] ${warning.code}: ${warning.message}`
+      );
+      if (pending && typeof (pending as { then?: unknown }).then === 'function') {
+        // 异步日志器的拒绝同样不能升级为未处理拒绝。
+        void Promise.resolve(pending).catch(() => undefined);
+      }
+    } catch (err: unknown) {
+      // 宿主日志器失败不能让已确认的工具结果变成执行失败；清理本身已经完成。
+      void err;
+    }
+  }
+  return redaction.envelope;
 }
 
 export async function executeRuntimeToolCall(
@@ -47,7 +116,8 @@ export async function executeRuntimeToolCall(
       });
       return { status: 'aborted', error: 'Tool call cancelled before host dispatch' };
     }
-    const envelope = await context.runtime.toolRouter.execute(request);
+    const routed = await context.runtime.toolRouter.execute(request);
+    const envelope = redactModelBoundEnvelope(call, context, routed);
     recordExecutedEnvelope(call, context, metadata, envelope);
     return projectPipelineToolResult(envelope);
   } catch (err: unknown) {

@@ -5,7 +5,13 @@
  * calls and, for relation discovery, delegate to AgentService.run().
  */
 
-import { projectToolResultOrdinaryOutput, type ToolResultEnvelope } from '#tools/kernel/index.js';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
+import {
+  projectToolResultOrdinaryOutput,
+  type ToolResultEnvelope,
+  toolResultInternals,
+} from '#tools/kernel/index.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
 export interface TaskAiProvider {
@@ -300,9 +306,14 @@ async function invokeTaskTool<T = Record<string, unknown>>(
   params: Record<string, unknown>,
   validateResult?: (result: unknown) => result is T
 ): Promise<T> {
-  const envelope = await context.invokeToolEnvelope(toolName, params);
-  // 仅完整成功回执能进入任务推断。partial/取消/拒绝都不是“检查通过”；错误保留原
-  // envelope供宿主诊断，不新增recommendation值或把错误投影成空候选/零违规。
+  const envelope = redactTaskToolEnvelope(
+    context,
+    toolName,
+    await context.invokeToolEnvelope(toolName, params)
+  );
+  // 仅完整成功回执能进入任务推断。partial/取消/拒绝都不是“检查通过”；错误保留
+  // envelope（有私有字段时是清理后的副本，否则是宿主原信封）供宿主诊断，不新增
+  // recommendation值或把错误投影成空候选/零违规。
   if (envelope.ok !== true || envelope.status !== 'success') {
     throw new Error(
       `Task tool ${toolName} did not complete successfully (${envelope.status}): ${envelope.text}`,
@@ -362,9 +373,76 @@ function isGuardCheckResult(value: unknown): value is GuardCheckResult {
   );
 }
 
+/**
+ * 传入的信封已经过 redactTaskToolEnvelope：structuredContent 已删除 D23 秘密/私有字段，
+ * 业务字段（违规 message 等）原样保留；纯文本信封走默认普通输出投影。
+ */
 function projectTaskToolEnvelope(envelope: ToolResultEnvelope): unknown {
   if (envelope.structuredContent !== undefined) {
     return envelope.structuredContent;
   }
   return projectToolResultOrdinaryOutput(envelope);
+}
+
+/** 诊断里最多列出的私有字段路径数与单条长度；路径只含键名，不含任何值。 */
+const MAX_REPORTED_PRIVATE_FIELD_PATHS = 10;
+const MAX_REPORTED_PRIVATE_FIELD_PATH_LENGTH = 120;
+
+interface TaskWarnLogger {
+  warn(message: string, meta?: Record<string, unknown>): unknown;
+}
+
+function isTaskWarnLogger(value: unknown): value is TaskWarnLogger {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as { warn?: unknown }).warn === 'function'
+  );
+}
+
+/**
+ * D23 任务出口（L3-C02/L3-P07）。宿主路由返回的规范信封带完整 structuredContent；它会成为
+ * 任务输出、AI 提示和错误消息/错误 cause，所以先删除秘密/私有字段（任意深度）。没有私有
+ * 字段时返回同一信封对象（错误 cause 仍是宿主原信封）；有改写时记录告警，只含字段路径。
+ * 宿主未注入可用日志器时降级到 Core 共享 Logger，保证清理路径可定位。
+ */
+function redactTaskToolEnvelope(
+  context: TaskContext,
+  toolName: string,
+  envelope: ToolResultEnvelope
+): ToolResultEnvelope {
+  const redaction = toolResultInternals.redactPrivateFields(envelope);
+  if (redaction.envelope === envelope) {
+    return envelope;
+  }
+  const { redactedFields, warningCodes } = redaction;
+  const shownPaths = redactedFields
+    .slice(0, MAX_REPORTED_PRIVATE_FIELD_PATHS)
+    .map((path) => path.slice(0, MAX_REPORTED_PRIVATE_FIELD_PATH_LENGTH));
+  const code =
+    redactedFields.length > 0
+      ? 'TOOL_RESULT_PRIVATE_FIELDS_REDACTED'
+      : 'TOOL_RESULT_PRIVATE_FIELD_SCAN_NORMALIZED';
+  const coreLogger = Logger.getInstance();
+  const logger = isTaskWarnLogger(context.logger) ? context.logger : coreLogger;
+  const meta = {
+    code,
+    tool: toolName,
+    redactedFieldCount: redactedFields.length,
+    redactedFields: shownPaths,
+    warningCodes,
+  };
+  // 宿主日志器同步抛错或异步拒绝都不能改变任务结果；清理本身已经完成。宿主日志器失败时
+  // 改记到 Core 共享 Logger（只记字段路径与计数，不记日志器错误内容），保证清理路径可定位。
+  observeSafely(
+    () => logger.warn(`[AgentTask] ${code}: ${toolName} result rewritten before task use`, meta),
+    () =>
+      logger === coreLogger
+        ? undefined
+        : coreLogger.warn(
+            `[AgentTask] ${code}: ${toolName} result rewritten before task use (host logger failed)`,
+            meta
+          )
+  );
+  return redaction.envelope;
 }

@@ -100,6 +100,37 @@ function collectObjectKeys(value: unknown, prefix: string[] = []): string[] {
   });
 }
 
+/** D23 第二组：旧信封顶层字段，只在根路径匹配（L3-C02）。 */
+const LEGACY_ENVELOPE_ROOT_FIELDS = new Set(['success', 'errorCode', 'message', 'data.result']);
+
+/**
+ * D23 拆分语义的断言：秘密/私有字段在任意深度都不得出现；旧信封字段只要求不出现在
+ * 普通输出根与 structuredContent 根（嵌套的 error.message 等是业务字段，必须保留）。
+ */
+function expectNoD23Fields(projected: { structuredContent?: unknown }) {
+  const structured = isPlainRecord(projected.structuredContent)
+    ? projected.structuredContent
+    : undefined;
+  const deepKeys = new Set(collectObjectKeys(projected));
+  for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
+    if (!LEGACY_ENVELOPE_ROOT_FIELDS.has(field)) {
+      expect(deepKeys.has(field)).toBe(false);
+    } else if (field.includes('.')) {
+      // 'data.result' 只指 structuredContent 根下 data 对象里的 result。
+      const [head = '', tail = ''] = field.split('.');
+      const container = structured?.[head];
+      expect(isPlainRecord(container) && Object.hasOwn(container, tail)).toBe(false);
+    } else {
+      expect(Object.keys(projected)).not.toContain(field);
+      expect(Object.keys(structured ?? {})).not.toContain(field);
+    }
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function createEnvelopeForStatus(status: ToolResultEnvelope['status']): ToolResultEnvelope {
   const ok = status === 'success' || status === 'partial';
   return {
@@ -1007,6 +1038,261 @@ describe('tool result ordinary output', () => {
     expect(JSON.stringify(output)).not.toContain('synthetic-sensitive-value');
   });
 
+  it('removes legacy envelope fields only at the structured root (L3-C02)', () => {
+    const envelope = createEnvelopeForStatus('error');
+    envelope.structuredContent = {
+      success: false,
+      errorCode: 'LEGACY_CODE',
+      message: 'legacy root message',
+      data: { result: 'legacy data result', kept: true },
+      error: { code: 403, message: 'permission denied' },
+      items: [{ message: 'item message', success: true, errorCode: 'ITEM' }],
+      nested: { data: { result: 'nested data result' } },
+    };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    const expected = {
+      data: { kept: true },
+      error: { code: 403, message: 'permission denied' },
+      items: [{ message: 'item message', success: true, errorCode: 'ITEM' }],
+      nested: { data: { result: 'nested data result' } },
+    };
+    expect(projected.structuredContent).toEqual(expected);
+    expect(JSON.parse(projected.text)).toEqual(expected);
+    expect(projected.diagnosticSummary.redactedFields).toEqual([
+      'data.result',
+      'errorCode',
+      'message',
+      'success',
+    ]);
+  });
+
+  it('matches legacy root names by normalized spelling but never below the root', () => {
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      Success: true,
+      error_code: 'LEGACY_CODE',
+      MESSAGE: 'legacy root message',
+      'data.result': 'flattened legacy result',
+      Data: { Result: 'legacy data result' },
+      nested: { Message: 'kept nested message', success: 'kept nested success' },
+    };
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected.structuredContent).toEqual({
+      Data: {},
+      nested: { Message: 'kept nested message', success: 'kept nested success' },
+    });
+  });
+
+  it('keeps legacy names inside a root array, which is never a legacy envelope', () => {
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = [{ message: 'row message', success: true }];
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected.structuredContent).toEqual([{ message: 'row message', success: true }]);
+    expect(projected.diagnosticSummary.redactedFieldCount).toBe(0);
+  });
+
+  it('keeps nested error.message in the JSON text of a text-only failure envelope', () => {
+    const envelope: ToolResultEnvelope = { ...createEnvelopeForStatus('error') };
+    delete envelope.structuredContent;
+    envelope.text = '{"error":{"code":403,"message":"permission denied"}}';
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected.text).toContain('permission denied');
+    expect(presentToolResult(envelope)).toContain('permission denied');
+    expect(projected.diagnosticSummary.redactedFieldCount).toBe(0);
+  });
+
+  it('removes private fields by normalized name at any depth and inside wrappers', () => {
+    const secret = 'synthetic-private-value';
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      id: 'kept-id',
+      api_key: secret,
+      'API-KEY': secret,
+      'x-api-key': secret,
+      openaiApiKey: secret,
+      'provider.apiKey': secret,
+      apiKeys: [secret],
+      Thread_Id: secret,
+      threadIds: [secret],
+      'reasoning-content': secret,
+      ReasoningContent: secret,
+      THOUGHT_SIGNATURE: secret,
+      'hidden-reasoning': secret,
+      host_credential: secret,
+      raw_provider_request: { prompt: secret },
+      'Raw-Provider-Response': { body: secret },
+      LegacyCompatibility: { note: secret },
+      items: [
+        { wrapper: { result: { apiKey: secret, label: 'kept label' } } },
+        [[{ threadId: secret }]],
+      ],
+    };
+    envelope.text = JSON.stringify(envelope.structuredContent, null, 2);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(JSON.stringify(projected)).not.toContain(secret);
+    expect(presentToolResult(envelope)).not.toContain(secret);
+    expect(projected.structuredContent).toEqual({
+      id: 'kept-id',
+      items: [{ wrapper: { result: { label: 'kept label' } } }, [[{}]]],
+    });
+    expect(projected.diagnosticSummary.redactedFields).toEqual(
+      expect.arrayContaining([
+        'api_key',
+        'x-api-key',
+        'items.wrapper.result.apiKey',
+        'items.threadId',
+      ])
+    );
+  });
+
+  it('keeps business fields whose names only resemble private fields', () => {
+    const envelope = createEnvelopeForStatus('success');
+    const business = {
+      reasoning: { sources: ['src/a.ts:1-3'], whyStandard: 'kept rationale' },
+      reasoningSources: ['src/b.ts:4-5'],
+      reasoningConfidence: 0.8,
+      raw: 'src/raw.ts:1',
+      rawScore: 0.42,
+      rawContent: 'kept raw content',
+      thread: 'kept thread label',
+      keyword: 'kept keyword',
+      violation: { code: 'V1', message: 'kept violation message', nextAction: 'fix it' },
+    };
+    envelope.structuredContent = business;
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected.structuredContent).toEqual(business);
+    expect(projected.diagnosticSummary.redactedFieldCount).toBe(0);
+  });
+
+  it('treats nested object paths that spell a private field as that field (L3-C02)', () => {
+    // 扁平键 "thread.id" 已按规范化命中；嵌套的 {thread:{id}} 是同一路径的等价写法，必须一并覆盖。
+    const secret = 'synthetic-nested-private-value';
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      thread: { id: secret, title: 'kept thread title' },
+      provider: { api: { key: secret }, name: 'kept provider' },
+      'provider.api': { key: secret },
+      api: [{ key: secret, kept: true }],
+      raw: { provider: { response: { body: secret } }, path: 'src/raw.ts:1' },
+      reasoning: { content: secret, sources: ['src/a.ts:1-3'] },
+      host: { credential: secret },
+      thought: { signature: secret },
+      hidden: { reasoning: secret },
+      legacy: { compatibility: secret },
+      'Thread-': { ID: secret },
+      session: { thread: { ids: [secret] } },
+    };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(JSON.stringify(projected)).not.toContain(secret);
+    expect(presentToolResult(envelope)).not.toContain(secret);
+    expect(projected.structuredContent).toEqual({
+      thread: { title: 'kept thread title' },
+      provider: { api: {}, name: 'kept provider' },
+      'provider.api': {},
+      api: [{ kept: true }],
+      raw: { provider: {}, path: 'src/raw.ts:1' },
+      reasoning: { sources: ['src/a.ts:1-3'] },
+      host: {},
+      thought: {},
+      hidden: {},
+      legacy: {},
+      'Thread-': {},
+      session: { thread: {} },
+    });
+    expect(projected.diagnosticSummary.redactedFields).toEqual(
+      expect.arrayContaining([
+        'thread.id',
+        'provider.api.key',
+        'api.key',
+        'raw.provider.response',
+        'reasoning.content',
+        'session.thread.ids',
+      ])
+    );
+  });
+
+  it('folds diacritics and compatibility forms before comparing private names', () => {
+    const secret = 'synthetic-folded-private-value';
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      apí_këy: secret,
+      'THRÉAD-ID': secret,
+      ｔｈｒｅａｄ＿ｉｄ: secret,
+      'reasoning\u200bContent': secret,
+      'thought\u00adSignature': secret,
+      kept: 'kept value',
+    };
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(JSON.stringify(projected)).not.toContain(secret);
+    expect(projected.structuredContent).toEqual({ kept: 'kept value' });
+  });
+
+  it('keeps caller-supplied forbidden names and dotted paths on their own semantics', () => {
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      message: 'root message stays when the caller does not list it',
+      items: [{ secretNote: 'removed by path', kept: 1 }],
+      nested: { secret_note: 'removed by name', other: 2 },
+    };
+
+    const custom = projectToolResultOrdinaryOutput(envelope, {
+      forbiddenFields: ['items.secretNote', 'secretNote'],
+    });
+    const none = projectToolResultOrdinaryOutput(envelope, { forbiddenFields: [] });
+
+    // 自定义点号路径保持原语义（从根起按对象键，数组下标不入路径）；自定义名字任意深度、
+    // 按规范化名字比较；未列出的旧信封字段不被删除。
+    expect(custom.structuredContent).toEqual({
+      message: 'root message stays when the caller does not list it',
+      items: [{ kept: 1 }],
+      nested: { other: 2 },
+    });
+    expect(none.structuredContent).toEqual(envelope.structuredContent);
+    expect(none.diagnosticSummary.redactedFieldCount).toBe(0);
+  });
+
+  it('never echoes a value that was folded into a removed private key name', () => {
+    // 键名里拼进值（等号、冒号、空格、点号写法）时，删除后也不能经 redactedFields 原样带出。
+    const secret = 'synthetic-keyname-secret';
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      [`apiKey=${secret}`]: true,
+      [`threadId: ${secret}`]: true,
+      [`apiKey.${secret}`]: true,
+      [`x-api-key ${secret}`]: true,
+      nested: { [`reasoning_content=${secret}`]: 1, kept: 'kept value' },
+      openaiApiKey: 'synthetic-plain-name-value',
+    };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(JSON.stringify(projected)).not.toContain(secret);
+    expect(JSON.stringify(projected)).not.toContain('synthetic-plain-name-value');
+    expect(projected.structuredContent).toEqual({ nested: { kept: 'kept value' } });
+    expect(projected.diagnosticSummary.redactedFields).toEqual(
+      expect.arrayContaining(['[private field]', 'nested.[private field]', 'openaiApiKey'])
+    );
+  });
+
   it('recognizes and presents result envelopes without a retired router dependency', () => {
     const envelope = createEnvelopeForStatus('success');
 
@@ -1017,7 +1303,6 @@ describe('tool result ordinary output', () => {
   it('projects ordinary result output without diagnostics or forbidden private fields', () => {
     const envelope = createEnvelopeForStatus('success');
     const projected = projectToolResultOrdinaryOutput(envelope);
-    const projectedKeys = new Set(collectObjectKeys(projected));
 
     expect(projected).toMatchObject({
       ok: true,
@@ -1039,9 +1324,7 @@ describe('tool result ordinary output', () => {
       },
     });
     expect(projected).not.toHaveProperty('diagnostics');
-    for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
-      expect(projectedKeys.has(field)).toBe(false);
-    }
+    expectNoD23Fields(projected);
   });
 
   it('projects text-only envelopes as canonical ordinary output', () => {
@@ -1077,7 +1360,6 @@ describe('tool result ordinary output', () => {
     const projected = projectToolResultOrdinaryOutput(envelope, {
       failureTaxonomy: fixture?.failureTaxonomy,
     });
-    const projectedKeys = new Set(collectObjectKeys(projected));
 
     expect(projected.failureTaxonomy).toMatchObject({
       kind: 'provider-error',
@@ -1091,20 +1373,15 @@ describe('tool result ordinary output', () => {
       branch: 'error',
       publicValue: 'kept',
     });
-    for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
-      expect(projectedKeys.has(field)).toBe(false);
-    }
+    expectNoD23Fields(projected);
   });
 
   it('projects every Agent contract branch without collapsing result status semantics', () => {
     const projectedStatuses = ALEMBIC_AGENT_INTERFACE_CONTRACT.branches.map((fixture) => {
       const status = fixture.toolStatus ?? 'error';
       const projected = projectToolResultOrdinaryOutput(createEnvelopeForStatus(status));
-      const projectedKeys = new Set(collectObjectKeys(projected));
 
-      for (const field of TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS) {
-        expect(projectedKeys.has(field)).toBe(false);
-      }
+      expectNoD23Fields(projected);
       expect(projected.diagnosticSummary.warningCodes).toEqual([`${status}-warning`]);
       expect(projected.diagnosticSummary.redactedFieldCount).toBeGreaterThan(0);
 

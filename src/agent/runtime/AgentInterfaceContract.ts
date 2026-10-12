@@ -121,6 +121,22 @@ export const AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS = Object.freeze([
 export const AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS =
   TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS;
 
+/**
+ * D23 普通输出策略（L3-C02 决策后的实际执行面）。forbiddenFields 的值与次序不变，匹配分两组：
+ *
+ * - 秘密/私有字段（apiKey、hostCredential、threadId、reasoningContent/reasoning_content、
+ *   thoughtSignature、hiddenReasoning、rawProviderRequest/Response、legacyCompatibility）：
+ *   任意深度、按规范化名字（大小写、kebab/snake/camel、全角与附加符号、零宽字符、点号扁平键、
+ *   复数与前缀写法）匹配，嵌套对象路径（{thread:{id}}、{provider:{api:{key}}}）与扁平写法
+ *   视为同一字段。只看字段名，不解析字段值里的文本或 JSON 字符串。
+ *   它同时约束结构化结果：runtimeBridge 在写入模型历史前、AgentTaskHandlers 在任务使用前，
+ *   都会清理 structuredContent 与 JSON 形式的 text，并在有删除时写诊断/告警。
+ * - 旧信封顶层字段（success、errorCode、message、data.result）：只在根路径匹配，只由普通输出
+ *   投影（projectToolResultOrdinaryOutput / presentToolResult）执行；嵌套 error.message 与工具
+ *   业务字段 message 保留，模型路径上的结构化结果不删除它们。
+ *
+ * 宿主 HTTP 出口（/agent/tool 返回的规范信封）不执行 D23，属于 cross-repo 决定，不在本契约内。
+ */
 export const AGENT_INTERFACE_D23_ORDINARY_OUTPUT_POLICY = Object.freeze({
   demandKey: 'alembic-interface-contract-d23-agent-result-diagnostic-content-cleanup-2026-06-10',
   forbiddenFields: AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,

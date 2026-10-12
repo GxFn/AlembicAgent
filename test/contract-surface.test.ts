@@ -19,7 +19,9 @@ import {
   denyToolDecision,
   getAgentInterfaceContractBranch,
   getAgentInterfaceFailureTaxonomyEntry,
+  projectToolResultOrdinaryOutput,
   supportsAgentRuntimeRoute,
+  type ToolResultEnvelope,
   validateAgentInterfaceContract,
 } from '../src/index.js';
 
@@ -312,6 +314,67 @@ describe('AlembicAgent public interface contract', () => {
         'redactedFieldCount',
       ])
     );
+  });
+
+  it('fixes the D23 split: private fields at any depth, legacy envelope fields only at the root', () => {
+    // 导出常量的值与次序不变（公开常量）；变化的是匹配语义（L3-C02 决策）。
+    expect([...AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS]).toEqual([
+      'success',
+      'errorCode',
+      'message',
+      'data.result',
+      'legacyCompatibility',
+      'rawProviderRequest',
+      'rawProviderResponse',
+      'reasoningContent',
+      'reasoning_content',
+      'thoughtSignature',
+      'hiddenReasoning',
+      'apiKey',
+      'hostCredential',
+      'threadId',
+    ]);
+    const envelope: ToolResultEnvelope = {
+      ok: false,
+      toolId: 'contract.d23',
+      callId: 'contract-d23',
+      startedAt: '2026-10-11T00:00:00.000Z',
+      durationMs: 1,
+      status: 'error',
+      text: '{"error":{"code":403,"message":"permission denied","thread_id":"contract-private"}}',
+      structuredContent: {
+        success: false,
+        message: 'legacy root message',
+        error: { message: 'nested business message', apiKey: 'contract-private' },
+        items: [{ message: 'item message', 'x-api-key': 'contract-private' }],
+      },
+      diagnostics: {
+        degraded: false,
+        fallbackUsed: false,
+        warnings: [],
+        timedOutStages: [],
+        blockedTools: [],
+        truncatedToolCalls: 0,
+        emptyResponses: 0,
+        aiErrorCount: 0,
+        gateFailures: [],
+      },
+      trust: {
+        source: 'internal',
+        sanitized: true,
+        containsUntrustedText: false,
+        containsSecrets: false,
+      },
+    };
+
+    const projected = projectToolResultOrdinaryOutput(envelope);
+
+    expect(projected.structuredContent).toEqual({
+      error: { message: 'nested business message' },
+      items: [{ message: 'item message' }],
+    });
+    expect(projected.text).toContain('permission denied');
+    expect(JSON.stringify(projected)).not.toContain('contract-private');
   });
 
   it('exposes the D25 Core-derived failure taxonomy policy', () => {
