@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -602,6 +604,236 @@ describe('L4 memory package', () => {
       ok: false,
       missing: expect.arrayContaining(['phase:RECORD', 'key_findings', 'evidence_refs']),
     });
+  });
+});
+
+/**
+ * L4 记忆包的校验与渲染边界：中文发现按字符二元组判断覆盖，失败状态不再被平凡的布尔末段命中；
+ * 未决问题进入渲染文本并随 L4 替换保留；蒸馏摘要不被同一批调用的原始回执挤掉；
+ * distill() 抛错时在包内留下 distill_failed，并由 ContextWindow 打 warn。
+ */
+describe('L4 memory package validation and rendering', () => {
+  function cjkFindingPackage() {
+    return buildL4MemoryPackage({
+      phase: 'RECORD',
+      activeContext: {
+        distill: () => ({
+          keyFindings: [
+            {
+              finding: '依赖注入通过构造函数完成，避免全局单例',
+              evidence: 'src/a.ts:3',
+              importance: 8,
+            },
+          ],
+        }),
+      },
+      diagnostics: { degraded: true },
+    });
+  }
+
+  it('accepts faithful Chinese paraphrases of a Chinese finding in a degraded run', () => {
+    const pkg = cjkFindingPackage();
+    expect(
+      validateL4Summary(
+        'RECORD 阶段：依赖通过构造器注入，不使用全局单例；证据 src/a.ts，已降级',
+        pkg
+      )
+    ).toEqual({ ok: true, missing: [] });
+    // 没有任何 4 字原句窗口重合，只靠二元组覆盖率判断。
+    expect(
+      validateL4Summary('RECORD：构造器注入依赖已完成，规避全局共享单例；src/a.ts；运行已降级', pkg)
+    ).toEqual({ ok: true, missing: [] });
+    // 只命中个别常见二元组的笼统中文摘要仍然不算覆盖。
+    expect(validateL4Summary('RECORD 本阶段完成了分析，证据 src/a.ts，已降级', pkg)).toMatchObject({
+      ok: false,
+      missing: ['key_findings'],
+    });
+  });
+
+  it('does not let a trivial boolean word satisfy the failure state check', () => {
+    const pkg = buildL4MemoryPackage({
+      phase: 'RECORD',
+      activeContext: {
+        distill: () => ({
+          keyFindings: [
+            {
+              finding: 'Record repair writes validated findings',
+              evidence: 'src/repair.ts:20',
+              importance: 9,
+            },
+          ],
+        }),
+      },
+      diagnostics: { degraded: true },
+    });
+
+    expect(validateL4Summary('RECORD Record repair src/repair.ts code.read is true', pkg)).toEqual({
+      ok: false,
+      missing: ['failure_state'],
+    });
+    expect(validateL4Summary('RECORD Record repair src/repair.ts degraded run', pkg)).toEqual({
+      ok: true,
+      missing: [],
+    });
+    expect(validateL4Summary('RECORD Record repair src/repair.ts 已降级', pkg)).toEqual({
+      ok: true,
+      missing: [],
+    });
+  });
+
+  it('ignores English stop words when matching key findings', () => {
+    const pkg = buildL4MemoryPackage({
+      activeContext: {
+        distill: () => ({
+          keyFindings: [{ finding: 'This should have been wired with the gateway adapter' }],
+        }),
+      },
+    });
+
+    expect(validateL4Summary('Summary: this should have been done with care', pkg)).toEqual({
+      ok: false,
+      missing: ['key_findings'],
+    });
+    expect(validateL4Summary('Summary: the gateway adapter is wired', pkg)).toEqual({
+      ok: true,
+      missing: [],
+    });
+  });
+
+  it('renders unresolved questions and keeps them through an L4 replacement', async () => {
+    const question = 'Q-ZETA-42 是否需要重新扫描 vendor 目录？';
+    const pkg = buildL4MemoryPackage({ unresolvedQuestions: [question] });
+    const rendered = renderL4MemoryPackage(pkg);
+    expect(rendered).toContain('## Unresolved Questions');
+    expect(rendered).toContain(question);
+    expect(rendered.indexOf('## Unresolved Questions')).toBeLessThan(
+      rendered.indexOf('## Failure / Degraded State')
+    );
+    expect(renderL4MemoryPackage(buildL4MemoryPackage({}))).toContain(
+      '## Unresolved Questions\n- none'
+    );
+
+    const contextWindow = new ContextWindow(10_000);
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('older context to compact');
+    let instructions = '';
+    let sentContent = '';
+    const aiProvider = {
+      chatWithTools: vi.fn(async (prompt: string, opts: Record<string, unknown>) => {
+        instructions = prompt;
+        sentContent = String((opts.messages as Array<Record<string, unknown>>)[0]?.content);
+        return { text: 'generic summary' };
+      }),
+    };
+
+    const result = await contextWindow.compactL4(aiProvider, {
+      memoryPackage: { phase: 'unknown', unresolvedQuestions: [question] },
+    });
+
+    expect(result.failed).not.toBe(true);
+    expect(sentContent).toContain(question);
+    expect(instructions).toContain('finding id');
+    expect(instructions).toContain('Failure / Degraded State');
+    expect(instructions).toContain('Unresolved Questions');
+    expect(String(contextWindow.toMessages()[1].content)).toContain(question);
+  });
+
+  it('keeps the distilled tool summary next to many successful raw receipts', () => {
+    const toolCalls: Array<Record<string, unknown>> = Array.from({ length: 20 }, (_, index) => ({
+      tool: 'code',
+      args: { action: 'search', query: `query-${index}` },
+      result: `raw success body ${index}`,
+    }));
+    toolCalls.push({
+      tool: 'code',
+      args: { action: 'read', path: 'src/denied.ts' },
+      result: { ok: false, error: 'denied' },
+    });
+
+    const pkg = buildL4MemoryPackage({
+      activeContext: {
+        distill: () => ({
+          toolCallSummary: ['[code] distilled read of src/host.ts', '[graph] distilled callers'],
+        }),
+      },
+      toolCalls,
+    });
+
+    expect(pkg.toolResultSummary).toEqual(
+      expect.arrayContaining(['[code] distilled read of src/host.ts', '[graph] distilled callers'])
+    );
+    expect(pkg.toolResultSummary.some((line) => line.includes('raw success body'))).toBe(false);
+    expect(
+      pkg.toolResultSummary.some((line) => line.includes('failed') && line.includes('denied'))
+    ).toBe(true);
+  });
+
+  it('splits the tool summary budget between distilled entries and failed receipts', () => {
+    const distilled = Array.from({ length: 20 }, (_, index) => `[code] distilled-${index}`);
+    const toolCalls = Array.from({ length: 10 }, (_, index) => ({
+      tool: 'code',
+      args: { action: 'read', path: `src/f${index}.ts` },
+      result: { ok: false, error: `failure-${index}` },
+    }));
+
+    const pkg = buildL4MemoryPackage({
+      activeContext: { distill: () => ({ toolCallSummary: distilled }) },
+      toolCalls,
+    });
+
+    expect(pkg.toolResultSummary).toHaveLength(12);
+    expect(pkg.toolResultSummary.slice(0, 8)).toEqual(distilled.slice(-8));
+    expect(pkg.toolResultSummary.slice(8).every((line) => line.includes('failed'))).toBe(true);
+    expect(pkg.toolResultSummary.at(-1)).toContain('failure-9');
+  });
+
+  it('records a throwing distill as distill_failed and warns before the L4 summary', async () => {
+    const throwingContext = {
+      distill: () => {
+        throw new Error('STRICT_CONTEXT_HASH_MISMATCH');
+      },
+    };
+    const pkg = buildL4MemoryPackage({ activeContext: throwingContext });
+    expect(pkg.failureState[0]).toBe('distill_failed=STRICT_CONTEXT_HASH_MISMATCH');
+    expect(renderL4MemoryPackage(pkg)).toContain('distill_failed=STRICT_CONTEXT_HASH_MISMATCH');
+    expect(validateL4Summary('笼统摘要', pkg)).toMatchObject({
+      ok: false,
+      missing: ['failure_state'],
+    });
+
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const contextWindow = new ContextWindow(10_000);
+    contextWindow.appendUserMessage('initial prompt');
+    contextWindow.appendUserMessage('older context to compact');
+    const result = await contextWindow.compactL4(
+      { chatWithTools: vi.fn(async () => ({ text: '蒸馏失败，摘要只基于近期消息。' })) },
+      { memoryPackage: { phase: 'unknown', activeContext: throwingContext } }
+    );
+
+    expect(result.failed).not.toBe(true);
+    expect(warn.mock.calls.some(([message]) => String(message).includes('distill_failed'))).toBe(
+      true
+    );
+  });
+
+  // 编码守卫：L4 校验启发式（4 字窗口、二元组覆盖率、平凡末段过滤、键/同义词回退）
+  // 只靠注释解释。写入工具曾把这些中文注释落盘成字面 \uXXXX 转义，biome 与 tsc 都不会报。
+  // 这里只检查注释行，代码里的正则或字符串若确需 \u 转义不受影响。
+  it.each([
+    'src/agent/context/l4MemoryPackage.ts',
+    'src/agent/context/ContextWindow.ts',
+  ])('keeps the comments in %s as readable characters, not \\uXXXX escapes', (rel) => {
+    const source = readFileSync(path.join(process.cwd(), rel), 'utf8');
+    const escapedCommentLines = source
+      .split('\n')
+      .map((line, index) => ({ line: index + 1, text: line.trim() }))
+      .filter(
+        ({ text }) =>
+          (text.startsWith('//') || text.startsWith('/*') || text.startsWith('*')) &&
+          /\\u[0-9a-fA-F]{4}/.test(text)
+      )
+      .map(({ line }) => line);
+    expect(escapedCommentLines).toEqual([]);
   });
 });
 

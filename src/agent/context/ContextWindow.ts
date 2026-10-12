@@ -35,6 +35,7 @@ import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import {
   buildL4MemoryPackage,
   formatL4MemorySummary,
+  L4_DISTILL_FAILED_STATE_KEY,
   type L4MemoryPackage,
   type L4MemoryPackageInput,
   renderL4MemoryPackage,
@@ -593,12 +594,35 @@ export class ContextWindow {
               (opts.memoryPackage as L4MemoryPackageInput | undefined)?.recentMessages ||
               this.#messages.slice(1),
           });
+    // distill 失败时包内只剩近期消息与原始回执，摘要质量明显下降；包本身无 logger，在这里留 warn。
+    const distillFailure = memoryPackage.failureState.find((state) =>
+      state.startsWith(`${L4_DISTILL_FAILED_STATE_KEY}=`)
+    );
+    if (distillFailure) {
+      this.#log(
+        'warn',
+        `[ContextWindow] L4 memory package degraded: ActiveContext.distill() failed (${distillFailure}); ` +
+          'key findings, plan, stats and distilled tool summary are empty, summary input falls back ' +
+          'to recent messages and raw tool receipts'
+      );
+    }
+    this.#log(
+      'info',
+      `[ContextWindow] L4 memory package ready: phase=${memoryPackage.phase}, ` +
+        `findings=${memoryPackage.keyFindings.length}, evidenceRefs=${memoryPackage.evidenceRefs.length}, ` +
+        `toolSummaries=${memoryPackage.toolResultSummary.length}, ` +
+        `unresolvedQuestions=${Array.isArray(memoryPackage.unresolvedQuestions) ? memoryPackage.unresolvedQuestions.length : 0}, ` +
+        `failureState=${memoryPackage.failureState.length}`
+    );
     const originalMessages = JSON.stringify(this.#messages);
     const originalRevision = this.#readViewRevision;
     const renderedPackage = renderL4MemoryPackage(memoryPackage);
+    // 校验器认可 finding id、失败状态的键/值/中文同义词；提示里要求原样保留这些锚点，
+    // 让中文改写摘要不因措辞差异被误拒。未决问题另由 formatL4MemorySummary 确定性带过替换。
     const summaryPrompt = [
       '请将下面的 L4 Memory Package 压缩成稳定的运行记忆摘要。',
-      '必须保留 phase、stageStatus、关键 finding、证据路径/行号、失败或降级状态。',
+      '必须保留 phase、stageStatus、关键 finding、证据路径/行号、失败或降级状态和未决问题。',
+      '原样保留 finding id（如 finding-1）、Failure / Degraded State 各行（如 degraded=true）和 Unresolved Questions 各条。',
       '不要新增事实，不要输出工具调用，不要引用原始 Chat Completions 协议消息。',
       '用中文输出，不超过 500 字；保留包中的英文 phase/status/path 原文。',
     ]
