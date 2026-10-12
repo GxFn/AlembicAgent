@@ -117,18 +117,23 @@ export class AgentRunCoordinator {
     if (mergeName && !merger) {
       throw new Error(`Unknown agent run merger: "${mergeName}"`);
     }
+    // 协调 run 的墙钟起点（I23）：父结果 usage.durationMs、失败时的 partialResult 与协调日志共用这一起点，
+    // 保证宿主同一条日志里的墙钟 durationMs 与父 usage.durationMs 口径一致。
+    const startedAt = Date.now();
     const childInputs = partitioner(input, profile);
     const childResults = await runChildren(
       childInputs,
       profile.concurrency,
       runChild,
       input,
-      profile
+      profile,
+      startedAt
     );
 
-    return merger
+    const merged = merger
       ? merger(childResults, input, profile, childInputs)
       : defaultMerge(childResults, profile);
+    return applyParentTiming(merged, childResults, startedAt);
   }
 }
 
@@ -137,9 +142,9 @@ async function runChildren(
   concurrencyPlan: AgentConcurrencyPlan,
   runChild: ChildRunner,
   parentInput: AgentRunInput,
-  profile: CompiledAgentProfile
+  profile: CompiledAgentProfile,
+  startedAt: number
 ) {
-  const startedAt = Date.now();
   const tiered = concurrencyPlan.mode === 'tiered';
   const concurrency = resolveConcurrency(concurrencyPlan.concurrency);
   if (concurrency.fallbackReason === 'env-invalid') {
@@ -493,7 +498,11 @@ async function runChildren(
       }
     );
     // 保持父 run 抛错（宿主据此停止 finalize）；附带原始 child 状态供恢复/读回，不能冒充成功。
-    const partialResult = { ...defaultMerge(results, profile), status: 'error' as const };
+    // partialResult 与成功路径同一耗时口径：usage.durationMs 为墙钟，child 累计放 phases.childDurationMsTotal。
+    const partialResult = {
+      ...applyParentTiming(defaultMerge(results, profile), results, startedAt),
+      status: 'error' as const,
+    };
     throw Object.assign(
       new Error(`Agent coordination consumption failed: ${failures[0].message}`, {
         cause: firstError,
@@ -862,6 +871,37 @@ function aggregateStatus(results: AgentRunResult[]): AgentRunResult['status'] {
   );
 }
 
+/**
+ * merger（内置与宿主注册的自定义 merger）拿不到协调开始时间，usage.durationMs 只能给出 child 累计值；
+ * 这里是父结果离开协调器前唯一的耗时改写点（I23）：
+ * - usage.durationMs 改为协调 run 的墙钟耗时，与非协调 run（AgentService 的 Date.now() - startedAt）同口径；
+ *   并发/分 tier 时 child 耗时之和会高估墙钟，与宿主同一条日志里的墙钟 durationMs 互相矛盾。
+ * - 各 child usage.durationMs 之和保留在 phases.childDurationMsTotal，依赖累计值的分析改读这里。
+ * - tokens/iterations 本来就是累加量，merger 的值原样保留；merger 自己的其余 phases 也原样保留。
+ */
+function applyParentTiming(
+  merged: AgentRunResult,
+  childResults: AgentRunResult[],
+  startedAt: number
+): AgentRunResult {
+  return {
+    ...merged,
+    phases: {
+      ...toRecord(merged.phases),
+      childDurationMsTotal: sumChildDurationMs(childResults),
+    },
+    usage: { ...merged.usage, durationMs: Date.now() - startedAt },
+  };
+}
+
+function sumChildDurationMs(results: AgentRunResult[]) {
+  return results.reduce((sum, result) => sum + result.usage.durationMs, 0);
+}
+
+/**
+ * 默认合并：tokens/iterations 按 child 累加。usage.durationMs 在这里只是 child 累计值的占位，
+ * run() 与失败路径都会经 applyParentTiming 改写为墙钟耗时后再交给宿主。
+ */
 function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile): AgentRunResult {
   const status = aggregateStatus(results);
   return {
@@ -878,7 +918,7 @@ function defaultMerge(results: AgentRunResult[], profile: CompiledAgentProfile):
       inputTokens: results.reduce((sum, result) => sum + result.usage.inputTokens, 0),
       outputTokens: results.reduce((sum, result) => sum + result.usage.outputTokens, 0),
       iterations: results.reduce((sum, result) => sum + result.usage.iterations, 0),
-      durationMs: results.reduce((sum, result) => sum + result.usage.durationMs, 0),
+      durationMs: sumChildDurationMs(results),
     },
     diagnostics: null,
   };
