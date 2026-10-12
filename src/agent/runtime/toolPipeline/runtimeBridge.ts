@@ -160,6 +160,14 @@ function recordExecutedEnvelope(
   envelope: ToolResultEnvelope
 ): void {
   metadata.envelope = envelope;
+  // 逐调用轨迹（L3-C05）：只有拿到路由信封才有 callId/status/durationMs 可记录；
+  // 发起前取消与路由抛错两条无信封路径不记条目，由各自的 TOOL_HOST_* warning 定位。
+  // 所有状态（含 error/blocked/timeout）都按信封原样记录；collector 按 callId 去重，
+  // 父子运行合并诊断时不会重复。缺省 diagnostics（宿主未注入收集器）时静默跳过。
+  context.loopCtx.diagnostics?.recordToolCallEnvelope(envelope, {
+    surface: 'runtime',
+    source: resolvePipelineSourceName(context),
+  });
   metadata.cacheHit = envelope.cache?.hit === true;
   if (envelope.cache && envelope.cache.policy !== 'none' && envelope.cache.hit !== true) {
     metadata.cacheMiss = true;
