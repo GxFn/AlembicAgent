@@ -1,6 +1,7 @@
 /** 新查询端口的唯一消费入口；旧方法探测保留在这一处兼容，不散落在 Runtime。 */
 import Logger from '@alembic/core/logging';
 import { isThenable, observeSafely } from '#shared/observers.js';
+import type { ToolUnavailableReason } from '#tools/kernel/availability.js';
 import type {
   ToolActionAllowlist,
   ToolSchemaProjection,
@@ -10,6 +11,7 @@ import type {
 } from '#tools/kernel/toolSchema.js';
 import {
   intersectToolActions,
+  isToolActionAllowed,
   selectToolActions,
   snapshotToolActionAllowlist,
   snapshotToolSelection,
@@ -60,6 +62,10 @@ function readSchemas(value: unknown, error: string): QueriedSchema[] {
   if (!Array.isArray(value)) {
     throw new Error(error);
   }
+  // provider 要求工具名唯一；重名声明还可能带互相矛盾的动作枚举，投影与 allowedTools
+  // 合并后也无法判断该信哪一条。整份宿主结果按 fail-closed 拒绝，新旧端口共用此检查，
+  // 未被当前阶段选中的重名同样拒绝，与畸形条目的处理口径一致。
+  const seen = new Set<string>();
   // Array.from 固定成员并保留 holes 的 undefined 事实，不能用 every 跳过坏条目。
   return Array.from(value, (schema: unknown) => {
     if (!record(schema)) {
@@ -71,6 +77,10 @@ function readSchemas(value: unknown, error: string): QueriedSchema[] {
     if (typeof name !== 'string' || !record(parameters)) {
       throw new Error(error);
     }
+    if (seen.has(name)) {
+      throw new Error(`${error}: duplicate tool schema '${name}'`);
+    }
+    seen.add(name);
     return { name, parameters, source: schema };
   });
 }
@@ -193,6 +203,52 @@ function projectQueryResult(
   };
 }
 
+/**
+ * 不可用原因只描述“本阶段请求了、但宿主没接线”的工具/动作；schemas 与 allowedTools 已按
+ * 调用前 selection 重新收窄，unavailable 也不能信任宿主自行过滤，否则系统提示和
+ * tool_host_unavailable 诊断会出现阶段未请求的工具。
+ * 规则与 RuntimeCapabilityCatalog 相同：先把 selection 归一化成完整 allowlist，再用
+ * isToolActionAllowed 判断 tool/action。泛型宿主没有注册动作全集，因此归一化用
+ * selectToolActions（normalizeToolActions 内部同一选择步骤），不按注册动作求交：
+ * null/undefined 全部保留；tool id 数组只按 tool 保留；allowlist 要求显式键、
+ * 非空动作集，且条目 action 缺省或在列表内。
+ */
+function scopeUnavailableReasons(
+  selection: ToolSelection,
+  reasons: readonly ToolUnavailableReason[]
+): ToolUnavailableReason[] {
+  const scope = selectToolActions(
+    selection,
+    reasons.map(({ tool }) => tool)
+  );
+  const kept: ToolUnavailableReason[] = [];
+  const dropped: ToolUnavailableReason[] = [];
+  for (const reason of reasons) {
+    if (isToolActionAllowed(scope, reason.tool, reason.action)) {
+      kept.push(reason);
+    } else {
+      dropped.push(reason);
+    }
+  }
+  if (dropped.length > 0) {
+    // 宿主违约返回了范围外条目：跳过它们并留痕；日志失败不能改变已过滤的结果。
+    // 日志只写 tool/action 标识，不写宿主 reason 原文，避免把宿主内部细节带进日志。
+    const selectionKind =
+      selection == null ? 'unrestricted' : Array.isArray(selection) ? 'ids' : 'allowlist';
+    const droppedEntries = dropped
+      .map(({ tool, action }) => (action === undefined ? tool : `${tool}.${action}`))
+      .join(',');
+    observeSafely(
+      () =>
+        Logger.getInstance().info(
+          `[ToolSchemaQuery] unavailable_out_of_selection_filtered; dropped=${dropped.length} kept=${kept.length} selection=${selectionKind} droppedEntries=${droppedEntries}; host reasons outside the caller selection are not surfaced to prompt or diagnostics`
+        ),
+      () => undefined
+    );
+  }
+  return kept;
+}
+
 export function queryToolSchemas(
   catalog: unknown,
   query: ToolSchemaQuery,
@@ -209,7 +265,9 @@ export function queryToolSchemas(
     const result = readModernResult(catalog.querySchemas(portQuery));
     return {
       ...projectQueryResult(selection, result.schemas, result.allowedTools),
-      ...(result.unavailable !== undefined ? { unavailable: result.unavailable } : {}),
+      ...(result.unavailable !== undefined
+        ? { unavailable: scopeUnavailableReasons(selection, result.unavailable) }
+        : {}),
     };
   }
   const schemas = queryLegacySchemas(catalog, portQuery, onLegacy);

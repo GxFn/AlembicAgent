@@ -28,6 +28,12 @@ export interface ToolSchemaQuery {
 export interface ToolSchemaQueryResult {
   schemas: ToolSchemaProjection[];
   allowedTools: ToolActionAllowlist;
+  /**
+   * 限定在 query.selection 内：只列本次请求了、但宿主没接线的工具/动作/分支。
+   * selection 为 null/undefined 时不限制；tool id 数组按 tool 限定；allowlist 要求条目
+   * 的 tool 是显式非空键，且 action 缺省或在该键的动作列表内。queryToolSchemas 会按
+   * 调用前的 selection 快照再过滤一次，范围外条目不会进入系统提示和诊断。
+   */
   unavailable?: ToolUnavailableReason[];
 }
 

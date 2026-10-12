@@ -717,6 +717,129 @@ describe('runtime schema query port', () => {
   });
 
   it.each([
+    { port: 'modern', prefix: 'Invalid ToolSchemaQueryPort result' },
+    { port: 'toToolSchemas', prefix: 'Invalid legacy schema result from toToolSchemas' },
+    { port: 'toMixedSchemas', prefix: 'Invalid legacy schema result from toMixedSchemas' },
+  ] as const)('rejects duplicate schema names from the $port port before dispatch', async ({
+    port,
+    prefix,
+  }) => {
+    // 两条同名声明的动作枚举互相矛盾；provider 只能拒绝整次请求或让模型看到两套合同。
+    const schemas = [
+      { name: 'code', parameters: { type: 'object', properties: { action: { enum: ['read'] } } } },
+      {
+        name: 'code',
+        parameters: { type: 'object', properties: { action: { enum: ['write'] } } },
+      },
+    ];
+    const catalog =
+      port === 'modern'
+        ? { querySchemas: () => ({ schemas, allowedTools: { code: null } }) }
+        : { [port]: () => schemas };
+    expect(() =>
+      queryToolSchemas(catalog, { selection: { code: ['read'] } }, () => undefined)
+    ).toThrow(`${prefix}: duplicate tool schema 'code'`);
+    const { runtime, execute, chatWithTools } = runtimeWith(catalog);
+    await expect(runtime.reactLoop('reject duplicate schema names')).rejects.toThrow(
+      "duplicate tool schema 'code'"
+    );
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a duplicate host schema name even when the stage did not select that tool', () => {
+    const graph = { name: 'graph', parameters: { type: 'object' } };
+    const catalog = {
+      querySchemas: () => ({
+        schemas: [{ name: 'code', parameters: { type: 'object' } }, graph, { ...graph }],
+        allowedTools: { code: null, graph: null },
+      }),
+    };
+    // 宿主整份结果已违约；与畸形条目一致按 fail-closed 拒绝，而不是只信任被选中的那一部分。
+    expect(() => queryToolSchemas(catalog, { selection: ['code'] }, () => undefined)).toThrow(
+      "Invalid ToolSchemaQueryPort result: duplicate tool schema 'graph'"
+    );
+  });
+
+  it.each<{ label: string; selection: ToolSelection; kept: string[] }>([
+    { label: 'action allowlist', selection: { code: ['read'] }, kept: ['code', 'code.read'] },
+    { label: 'tool ids', selection: ['code'], kept: ['code', 'code.read', 'code.write'] },
+    { label: 'disabled tool', selection: { code: [], memory: null }, kept: ['memory'] },
+    {
+      label: 'unrestricted',
+      selection: null,
+      kept: ['memory', 'code', 'code.read', 'code.write'],
+    },
+  ])('scopes modern unavailable reasons to the caller $label selection', ({ selection, kept }) => {
+    const unavailable = [
+      { tool: 'memory', reason: 'store missing' },
+      { tool: 'code', reason: 'workspace detached' },
+      { tool: 'code', action: 'read', reason: 'reader missing', hint: 'extension' },
+      { tool: 'code', action: 'write', reason: 'writer missing' },
+    ];
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const result = queryToolSchemas(
+        {
+          querySchemas: () => ({
+            schemas: [{ name: 'code', parameters: { type: 'object' } }],
+            allowedTools: { code: null, memory: null },
+            unavailable,
+          }),
+        },
+        { selection },
+        () => undefined
+      );
+      expect(
+        result.unavailable?.map(({ tool, action }) => (action ? `${tool}.${action}` : tool))
+      ).toEqual(kept);
+      if (kept.includes('code.read')) {
+        // 保留的条目仍携带宿主扩展字段，过滤不改写条目内容。
+        expect(result.unavailable).toContainEqual(unavailable[2]);
+      }
+      const dropped = unavailable.length - kept.length;
+      if (dropped > 0) {
+        expect(info).toHaveBeenCalledTimes(1);
+        expect(info).toHaveBeenCalledWith(
+          expect.stringContaining('unavailable_out_of_selection_filtered')
+        );
+        expect(info).toHaveBeenCalledWith(expect.stringContaining(`dropped=${dropped}`));
+      } else {
+        expect(info).not.toHaveBeenCalled();
+      }
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('keeps the filtered unavailable result when the scope log itself throws', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => {
+      throw new Error('synthetic logger unavailable');
+    });
+    try {
+      const result = queryToolSchemas(
+        {
+          querySchemas: () => ({
+            schemas: [{ name: 'code', parameters: { type: 'object' } }],
+            allowedTools: { code: null },
+            unavailable: [
+              { tool: 'memory', reason: 'store missing' },
+              { tool: 'code', action: 'write', reason: 'writer missing' },
+            ],
+          }),
+        },
+        { selection: { code: ['read'] } },
+        () => undefined
+      );
+      expect(result.unavailable).toEqual([]);
+      expect(result.allowedTools).toEqual({ code: ['read'] });
+      expect(info).toHaveBeenCalled();
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it.each([
     { port: 'modern', sparse: false },
     { port: 'modern', sparse: true },
     { port: 'legacy', sparse: false },
