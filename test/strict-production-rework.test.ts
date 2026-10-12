@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import Logger from '@alembic/core/logging';
-import { hashKnowledgeClusterV1 } from '@alembic/core/production';
+import {
+  createAnalysisReviewContextHashV1,
+  createFinalExpandedMiningScheduleReceiptV1,
+  hashKnowledgeClusterV1,
+} from '@alembic/core/production';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFrozenEvidenceProjection } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import {
@@ -13,6 +17,8 @@ import {
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
   type StrictAnalysisContextProjectionV1,
+  type StrictAnalystEpochInputV1,
+  type StrictAnalystEpochV1,
   type StrictProducerExpressionSetV1,
   type StrictProducerLineageReceiptV1,
   validateStrictAnalystEpochV1,
@@ -21,6 +27,7 @@ import { assertStrictAnalystEpochIntegrity } from '../src/agent/production/stric
 import { assertCausalRepairNodeIntegrity } from '../src/agent/production/strict/lineage.js';
 import { hashCanonical } from '../src/agent/production/strict/primitives.js';
 import {
+  createExecutionReceipt,
   createReview,
   createSingleHypothesisEpochFixture,
   STRICT_SOURCE_REVISION,
@@ -888,24 +895,33 @@ describe('strict Analyst and Producer model input shape guards', () => {
   });
 
   it('keeps contract-shaped dispositions untouched and does not log', () => {
-    const { epochInput } = createSingleHypothesisEpochFixture();
+    const semantic = createSingleHypothesisEpochFixture();
     const info = vi.spyOn(Logger.getInstance(), 'info');
-    const epoch = validateStrictAnalystEpochV1({
-      ...epochInput,
-      hypothesisDispositions: [
-        {
-          hypothesisId: 'hypothesis-handler',
-          status: 'narrowed',
-          causalParentHypothesisId: 'hypothesis-root',
-        },
-      ],
-    });
+    // narrowed 的父假设必须是本 epoch 内真实存在且仍成立的假设（C23），这里用同 cluster 的 survived 根假设。
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [
+          { hypothesisId: 'hypothesis-handler', outcome: 'not-required' },
+          { hypothesisId: 'hypothesis-root', outcome: 'not-required' },
+        ],
+        [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: 'hypothesis-root',
+          },
+          { hypothesisId: 'hypothesis-root', status: 'survived' },
+        ]
+      )
+    );
     expect(epoch.hypothesisDispositions).toEqual([
       {
         hypothesisId: 'hypothesis-handler',
         status: 'narrowed',
         causalParentHypothesisId: 'hypothesis-root',
       },
+      { hypothesisId: 'hypothesis-root', status: 'survived' },
     ]);
     expect(epoch.producerEligibleHypotheses[0]).toMatchObject({
       status: 'narrowed',
@@ -1367,5 +1383,478 @@ describe('strict lineage, expression receipt and Analyst disposition fail-closed
         dispositionReviews: [semantic.dispositionReview, foreignReview],
       })
     ).toThrow(/^STRICT_ANALYST_DISPOSITION_REVIEW_BINDING_MISMATCH$/u);
+  });
+});
+
+type StrictSemanticFixture = ReturnType<typeof createSingleHypothesisEpochFixture>;
+type StrictFalsificationOutcome = 'not-required' | 'refuted' | 'unknown';
+
+/**
+ * 在单假设夹具的同一 review context 上为任意假设生成宿主封印的 falsification 输入：
+ * - not-required：不登记反查，verdict 为 not-required（与夹具原有假设相同）；
+ * - refuted：以 handler 执行收据作反查并命中 population 内的 fact-handler；
+ * - unknown：登记 handler 反查但不执行，verdict 为 unknown。
+ * cluster set 不随假设数量变化，因此夹具的 currentAnalysisFixpointHash 仍可直接用于 fixpoint。
+ */
+function createFalsificationFor(
+  semantic: StrictSemanticFixture,
+  hypothesisId: string,
+  outcome: StrictFalsificationOutcome
+): StrictAnalystEpochInputV1['falsificationInputs'][number] {
+  const receipt = semantic.executionReceipt;
+  const enrolledCounterqueryIds = outcome === 'not-required' ? [] : [receipt.obligationId];
+  const executions =
+    outcome === 'refuted'
+      ? [
+          {
+            counterqueryId: receipt.obligationId,
+            obligationId: receipt.obligationId,
+            executionReceipt: receipt,
+            counterexampleFactIds: ['fact-handler'],
+          },
+        ]
+      : [];
+  const counterqueryApplicability =
+    outcome === 'not-required'
+      ? { status: 'not-required' as const, reasonCode: 'bounded-api-contract' }
+      : { status: 'required' as const, reasonCode: `counterquery-${outcome}` };
+  const dispositionReview = createReview({
+    reviewKind: 'falsification',
+    currentAnalysisFixpointHash: semantic.currentAnalysisFixpointHash,
+    populationHash: semantic.population.populationHash,
+    proposal: {
+      reviewKind: 'falsification',
+      populationHash: semantic.population.populationHash,
+      hypothesisId,
+      enrolledCounterqueryIds,
+      executions: executions.map((execution) => ({
+        counterqueryId: execution.counterqueryId,
+        obligationId: execution.obligationId,
+        executionReceiptHash: execution.executionReceipt.receiptHash,
+        executionOutputHash: execution.executionReceipt.outputHash,
+        denominatorHash: execution.executionReceipt.denominatorHash,
+        counterexampleFactIds: execution.counterexampleFactIds,
+      })),
+      counterqueryApplicability,
+    },
+    executionReceipts: [receipt],
+    finalExpandedSchedule: semantic.finalExpandedSchedule,
+    terminalObligations: semantic.terminalObligations,
+  });
+  return {
+    hypothesisId,
+    enrolledCounterqueryIds,
+    executions,
+    counterqueryApplicability,
+    dispositionReview,
+  };
+}
+
+/** 同一 cluster 上的多假设 epoch 输入：每个假设各有一条 falsification 与对应的封印审查回执。 */
+function createMultiHypothesisEpochInput(
+  semantic: StrictSemanticFixture,
+  rows: readonly { readonly hypothesisId: string; readonly outcome: StrictFalsificationOutcome }[],
+  hypothesisDispositions: StrictAnalystEpochInputV1['hypothesisDispositions']
+): StrictAnalystEpochInputV1 {
+  const [induction] = semantic.epochInput.inductionInputs;
+  if (!induction) {
+    throw new Error('TEST_STRICT_SEMANTIC_FIXTURE_INCOMPLETE');
+  }
+  const falsificationInputs = rows.map((row) =>
+    createFalsificationFor(semantic, row.hypothesisId, row.outcome)
+  );
+  return {
+    ...semantic.epochInput,
+    inductionInputs: [
+      {
+        ...induction,
+        hypotheses: rows.map((row) => ({
+          hypothesisId: row.hypothesisId,
+          statement: `Handlers preserve the typed Result envelope (${row.hypothesisId})`,
+          premiseFactIds: ['fact-handler'],
+        })),
+      },
+    ],
+    falsificationInputs,
+    hypothesisDispositions,
+    dispositionReviews: falsificationInputs.map((row) => row.dispositionReview),
+  };
+}
+
+/** 改写 epoch 的语义字段后按外层规则重算 epochHash，模拟跨进程收到的“自证”篡改 epoch。 */
+function resealEpoch(
+  epoch: StrictAnalystEpochV1,
+  overrides: Partial<StrictAnalystEpochV1>
+): StrictAnalystEpochV1 {
+  const { epochHash: _hash, ...semantic } = { ...epoch, ...overrides };
+  return { ...semantic, epochHash: hashCanonical(semantic) };
+}
+
+describe('strict Analyst premise and counterexample facts stay within the population (C22)', () => {
+  function withPremises(
+    semantic: StrictSemanticFixture,
+    knownFactIds: readonly string[],
+    premiseFactIds: readonly string[]
+  ): StrictAnalystEpochInputV1 {
+    const [induction] = semantic.epochInput.inductionInputs;
+    if (!induction) {
+      throw new Error('TEST_STRICT_SEMANTIC_FIXTURE_INCOMPLETE');
+    }
+    return {
+      ...semantic.epochInput,
+      knownFactIds,
+      inductionInputs: [
+        {
+          ...induction,
+          hypotheses: [
+            {
+              hypothesisId: 'hypothesis-handler',
+              statement: 'Handlers preserve the typed Result envelope',
+              premiseFactIds,
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  it('rejects at first validation a premise fact the host knows but the population lacks', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    // 修复前：首次校验通过，直到 fixpoint/lineage 重建才误报 STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED。
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        withPremises(semantic, ['fact-handler', 'fact-extra'], ['fact-handler', 'fact-extra'])
+      )
+    ).toThrow(/^STRICT_ANALYST_HYPOTHESIS_FACT_OUTSIDE_POPULATION: hypothesis-handler$/u);
+  });
+
+  it('keeps reporting a premise fact the host never executed as invented', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        withPremises(semantic, ['fact-handler'], ['fact-handler', 'fact-ghost'])
+      )
+    ).toThrow(/^STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED: hypothesis-handler$/u);
+  });
+
+  it('accepts a wider host fact set whose premises stay in the population and seals it at fixpoint', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const baseline = validateStrictAnalystEpochV1(semantic.epochInput);
+    const epoch = validateStrictAnalystEpochV1(
+      withPremises(semantic, ['fact-handler', 'fact-extra'], ['fact-handler'])
+    );
+    expect(epoch.epochHash).toBe(baseline.epochHash);
+    expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [epoch],
+      })
+    ).not.toThrow();
+  });
+
+  it('rejects at first validation a counterexample fact outside the population', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    // 反查是独立登记的 obligation，其收据产出的 fact-counter 宿主已知，但不是 population 观测事实。
+    const counterReceipt = createExecutionReceipt({
+      name: 'counter',
+      emittedFactIds: ['fact-counter'],
+    });
+    const receipts = [semantic.executionReceipt, counterReceipt];
+    const finalExpandedSchedule = createFinalExpandedMiningScheduleReceiptV1({
+      baselineScheduleHash: `sha256:${'a'.repeat(64)}`,
+      baselineObligationIds: receipts.map((receipt) => receipt.obligationId),
+      expansionReceipts: [],
+    });
+    const terminalObligations = receipts.map((receipt) => ({
+      obligationId: receipt.obligationId,
+      disposition: receipt.disposition,
+      terminalReceiptId: receipt.terminalReceiptId,
+    }));
+    const currentAnalysisFixpointHash = createAnalysisReviewContextHashV1({
+      finalExpandedScheduleHash: finalExpandedSchedule.finalExpandedScheduleHash,
+      terminalObligations,
+      populationHashes: [semantic.population.populationHash],
+      clusterSetHashes: [semantic.clusterSet.clusterSetHash],
+    });
+    const enrolledCounterqueryIds = [counterReceipt.obligationId];
+    const executions = [
+      {
+        counterqueryId: counterReceipt.obligationId,
+        obligationId: counterReceipt.obligationId,
+        executionReceipt: counterReceipt,
+        counterexampleFactIds: ['fact-counter'],
+      },
+    ];
+    const counterqueryApplicability = {
+      status: 'required' as const,
+      reasonCode: 'counterquery-executed',
+    };
+    const dispositionReview = createReview({
+      reviewKind: 'falsification',
+      currentAnalysisFixpointHash,
+      populationHash: semantic.population.populationHash,
+      proposal: {
+        reviewKind: 'falsification',
+        populationHash: semantic.population.populationHash,
+        hypothesisId: 'hypothesis-handler',
+        enrolledCounterqueryIds,
+        executions: executions.map((execution) => ({
+          counterqueryId: execution.counterqueryId,
+          obligationId: execution.obligationId,
+          executionReceiptHash: counterReceipt.receiptHash,
+          executionOutputHash: counterReceipt.outputHash,
+          denominatorHash: counterReceipt.denominatorHash,
+          counterexampleFactIds: execution.counterexampleFactIds,
+        })),
+        counterqueryApplicability,
+      },
+      executionReceipts: [counterReceipt],
+      finalExpandedSchedule,
+      terminalObligations,
+    });
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        currentAnalysisFixpointHash,
+        knownFactIds: ['fact-handler', 'fact-counter'],
+        enrolledObligationIds: receipts.map((receipt) => receipt.obligationId),
+        falsificationInputs: [
+          {
+            hypothesisId: 'hypothesis-handler',
+            enrolledCounterqueryIds,
+            executions,
+            counterqueryApplicability,
+            dispositionReview,
+          },
+        ],
+        hypothesisDispositions: [{ hypothesisId: 'hypothesis-handler', status: 'refuted' }],
+        dispositionReviews: [dispositionReview],
+      })
+    ).toThrow(/^STRICT_ANALYST_COUNTEREXAMPLE_FACT_OUTSIDE_POPULATION: hypothesis-handler$/u);
+  });
+
+  it('accepts a population counterexample and rebuilds the refuted epoch with the same facts', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome: 'refuted' }],
+        [{ hypothesisId: 'hypothesis-handler', status: 'refuted' }]
+      )
+    );
+    expect(epoch.falsifications[0]?.verdict).toBe('refuted');
+    expect(epoch.producerEligibleHypotheses).toEqual([]);
+    expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+  });
+});
+
+describe('strict Analyst causal parent hypotheses stay inside the epoch (C23)', () => {
+  const ROOT_AND_HANDLER = (rootOutcome: StrictFalsificationOutcome) =>
+    [
+      { hypothesisId: 'hypothesis-handler', outcome: 'not-required' },
+      { hypothesisId: 'hypothesis-root', outcome: rootOutcome },
+    ] as const;
+
+  it.each([
+    ['an empty', ''],
+    ['a whitespace-only', ' '],
+    ['a tab-only', '\t'],
+  ])('rejects a narrowed hypothesis with %s parent id', (_label, parent) => {
+    const { epochInput } = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...epochInput,
+        hypothesisDispositions: [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: parent,
+          },
+        ],
+      })
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_BLANK: hypothesis-handler$/u);
+  });
+
+  it('rejects a narrowed hypothesis that names itself as its causal parent', () => {
+    const { epochInput } = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...epochInput,
+        hypothesisDispositions: [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: 'hypothesis-handler',
+          },
+        ],
+      })
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_SELF_REFERENCE: hypothesis-handler$/u);
+  });
+
+  it.each([
+    ['a parent outside this epoch', 'ghost-hypothesis'],
+    ['a padded parent id that only matches after trimming', ' hypothesis-root '],
+  ])('rejects a narrowed hypothesis with %s', (_label, parent) => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        createMultiHypothesisEpochInput(semantic, ROOT_AND_HANDLER('not-required'), [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: parent,
+          },
+          { hypothesisId: 'hypothesis-root', status: 'survived' },
+        ])
+      )
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u);
+  });
+
+  it.each([
+    'refuted',
+    'unknown',
+  ] as const)('rejects a narrowed hypothesis whose parent is %s', (parentStatus) => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        createMultiHypothesisEpochInput(semantic, ROOT_AND_HANDLER(parentStatus), [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: 'hypothesis-root',
+          },
+          { hypothesisId: 'hypothesis-root', status: parentStatus },
+        ])
+      )
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_INELIGIBLE: hypothesis-handler$/u);
+  });
+
+  it.each([
+    ['an in-epoch', 'hypothesis-root'],
+    ['a dangling', 'ghost-hypothesis'],
+  ])('rejects a survived hypothesis that carries %s causal parent', (_label, parent) => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        createMultiHypothesisEpochInput(semantic, ROOT_AND_HANDLER('not-required'), [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'survived',
+            causalParentHypothesisId: parent,
+          },
+          { hypothesisId: 'hypothesis-root', status: 'survived' },
+        ])
+      )
+    ).toThrow(/^STRICT_ANALYST_SURVIVED_CAUSAL_PARENT_FORBIDDEN: hypothesis-handler$/u);
+  });
+
+  it('validates a causal parent carried by a refuted hypothesis the same way', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        createMultiHypothesisEpochInput(
+          semantic,
+          [{ hypothesisId: 'hypothesis-handler', outcome: 'refuted' }],
+          [
+            {
+              hypothesisId: 'hypothesis-handler',
+              status: 'refuted',
+              causalParentHypothesisId: 'ghost-hypothesis',
+            },
+          ]
+        )
+      )
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u);
+  });
+
+  it('accepts a narrowing chain over surviving in-epoch parents and seals it at fixpoint', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [
+          { hypothesisId: 'hypothesis-handler', outcome: 'not-required' },
+          { hypothesisId: 'hypothesis-middle', outcome: 'not-required' },
+          { hypothesisId: 'hypothesis-root', outcome: 'not-required' },
+        ],
+        [
+          {
+            hypothesisId: 'hypothesis-handler',
+            status: 'narrowed',
+            causalParentHypothesisId: 'hypothesis-middle',
+          },
+          {
+            hypothesisId: 'hypothesis-middle',
+            status: 'narrowed',
+            causalParentHypothesisId: 'hypothesis-root',
+          },
+          { hypothesisId: 'hypothesis-root', status: 'survived' },
+        ]
+      )
+    );
+    expect(
+      epoch.producerEligibleHypotheses.map((hypothesis) => [
+        hypothesis.hypothesisId,
+        hypothesis.status,
+        hypothesis.causalParentHypothesisId ?? null,
+      ])
+    ).toEqual([
+      ['hypothesis-handler', 'narrowed', 'hypothesis-middle'],
+      ['hypothesis-middle', 'narrowed', 'hypothesis-root'],
+      ['hypothesis-root', 'survived', null],
+    ]);
+    expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [epoch],
+      })
+    ).not.toThrow();
+  });
+
+  it('rejects a resealed epoch whose causal parent was rewritten to a dangling id', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(semantic, ROOT_AND_HANDLER('not-required'), [
+        {
+          hypothesisId: 'hypothesis-handler',
+          status: 'narrowed',
+          causalParentHypothesisId: 'hypothesis-root',
+        },
+        { hypothesisId: 'hypothesis-root', status: 'survived' },
+      ])
+    );
+    const dangling = 'ghost-hypothesis';
+    const tampered = resealEpoch(epoch, {
+      hypothesisDispositions: epoch.hypothesisDispositions.map((row) =>
+        row.hypothesisId === 'hypothesis-handler'
+          ? { ...row, causalParentHypothesisId: dangling }
+          : row
+      ),
+      producerEligibleHypotheses: epoch.producerEligibleHypotheses.map((row) =>
+        row.hypothesisId === 'hypothesis-handler'
+          ? { ...row, causalParentHypothesisId: dangling }
+          : row
+      ),
+    });
+    // 外层 epochHash 已按篡改内容重算；重建必须重新执行父假设校验，而不是接受自证哈希。
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(
+      /^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u
+    );
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [tampered],
+      })
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u);
+    // Producer lineage 入口在任何绑定检查之前先做 epoch 完整性重建，悬空父假设到不了 hypothesisHash。
+    const { lineageInput } = createLineageFixture();
+    expect(() =>
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
+    ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u);
   });
 });

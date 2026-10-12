@@ -47,6 +47,10 @@ export interface StrictInductionInputV1 {
 export interface StrictHypothesisDispositionV1 {
   readonly hypothesisId: string;
   readonly status: 'survived' | 'narrowed' | 'refuted' | 'unknown';
+  /**
+   * narrowed 必填、survived 禁止携带；给出时必须是本 epoch 内另一个非 refuted/unknown 假设的
+   * 原样 ID（C23，校验见 assertStrictCausalParent）。
+   */
   readonly causalParentHypothesisId?: string;
 }
 
@@ -83,7 +87,11 @@ export interface StrictAnalystEpochInputV1 {
    * 不输出；createStrictAnalysisFixpointV1 会用完整 schedule/population/cluster 集重新计算并对账。
    */
   readonly currentAnalysisFixpointHash: string;
-  /** 宿主权威：已执行的全部 factId，覆盖模型回传的同名字段。 */
+  /**
+   * 宿主权威：已执行的全部 factId，覆盖模型回传的同名字段。population 事实必须是它的子集；
+   * 假设 premiseFactIds 与反查 counterexampleFactIds 还必须落在 population 事实内（C22），
+   * 这样 epoch 不携带本集合也能在重建时按同一口径复核。
+   */
   readonly knownFactIds: readonly string[];
   /** 宿主权威：已登记的全部 obligationId，覆盖模型回传的同名字段。 */
   readonly enrolledObligationIds: readonly string[];
@@ -145,10 +153,14 @@ export function validateStrictAnalystEpochV1(
   assertStrictAnalystInputShape(input);
   rejectLegacySemanticAuthority(input);
   const { executionReceipts, knownFactIds, population } = validateStrictPopulationAuthority(input);
+  const facts: StrictAnalystFactAuthority = {
+    knownFactIds,
+    populationFactIds: collectStrictPopulationFactIds(population),
+  };
   const clusterSet = createStrictClusterSet(input, population);
-  const inductions = createStrictInductions(input, population, clusterSet, knownFactIds);
+  const inductions = createStrictInductions(input, population, clusterSet, facts);
   const hypotheses = indexStrictHypotheses(inductions);
-  const falsifications = createStrictFalsifications(input, hypotheses, knownFactIds);
+  const falsifications = createStrictFalsifications(input, hypotheses, facts);
   const dispositionReviews = validateDispositionReviewConservation(
     input,
     population.populationHash
@@ -296,6 +308,51 @@ function validateStrictPopulationAuthority(input: StrictAnalystEpochInputV1): {
   return { executionReceipts, knownFactIds, population };
 }
 
+/**
+ * 假设前提与反查反例的两层事实口径（C22）：
+ * - knownFactIds：宿主权威（已执行的全部 factId），不在其中即模型杜撰，沿用 *_FACT_INVENTED；
+ * - populationFactIds：canonical population 四类观测的 factId 并集，是 epoch 自身携带、重建时
+ *   唯一能复算的事实集合。宿主已知但不在 population 的事实以 *_FACT_OUTSIDE_POPULATION 拒绝，
+ *   保证首次校验与 rebuildStrictAnalystEpoch 的重建同口径，不再出现“首次通过、重建才报杜撰”。
+ */
+interface StrictAnalystFactAuthority {
+  readonly knownFactIds: ReadonlySet<string>;
+  readonly populationFactIds: ReadonlySet<string>;
+}
+
+/**
+ * population 事实全集：accepted/duplicate/excluded/error 四类观测的 factId（inspectedNoPattern
+ * 观测不携带事实）。首次校验与重建共用此函数，读取的都是 canonical population（即 epoch.population）。
+ */
+function collectStrictPopulationFactIds(population: ObservationPopulationV1): ReadonlySet<string> {
+  return new Set([
+    ...population.observations.flatMap((row) => row.factIds),
+    ...population.duplicateObservations.flatMap((row) => row.factIds),
+    ...population.excludedObservations.flatMap((row) => row.factIds),
+    ...population.errorObservations.flatMap((row) => row.factIds),
+  ]);
+}
+
+/**
+ * 先按宿主权威判“杜撰”，再按 population 判“越出 population”：population 事实已在
+ * validateStrictPopulationAuthority 中确认是 knownFactIds 的子集，所以真正未执行的事实仍得到
+ * 原有的 *_FACT_INVENTED 码，只有宿主已知但不属于 population 的事实才得到新码。
+ * 非字符串元素在两个集合中都查不到，按杜撰拒绝。
+ */
+function assertFactsWithinPopulation(
+  factIds: readonly string[],
+  facts: StrictAnalystFactAuthority,
+  codes: { readonly invented: string; readonly outsidePopulation: string },
+  detail: string
+): void {
+  if (factIds.some((factId) => !facts.knownFactIds.has(factId))) {
+    fail(codes.invented, detail);
+  }
+  if (factIds.some((factId) => !facts.populationFactIds.has(factId))) {
+    fail(codes.outsidePopulation, detail);
+  }
+}
+
 function createStrictClusterSet(
   input: StrictAnalystEpochInputV1,
   population: ObservationPopulationV1
@@ -310,7 +367,7 @@ function createStrictInductions(
   input: StrictAnalystEpochInputV1,
   population: ObservationPopulationV1,
   clusterSet: KnowledgeClusterSetV1,
-  knownFactIds: ReadonlySet<string>
+  facts: StrictAnalystFactAuthority
 ): InductionReceiptV1[] {
   const clustersByMechanism = new Map<string, KnowledgeClusterSetV1['clusters'][number]>();
   for (const cluster of clusterSet.clusters) {
@@ -325,9 +382,15 @@ function createStrictInductions(
       fail('STRICT_ANALYST_INDUCTION_CLUSTER_UNKNOWN', induction.mechanismKey);
     }
     for (const hypothesis of induction.hypotheses) {
-      if (hypothesis.premiseFactIds.some((factId) => !knownFactIds.has(factId))) {
-        fail('STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED', hypothesis.hypothesisId);
-      }
+      assertFactsWithinPopulation(
+        hypothesis.premiseFactIds,
+        facts,
+        {
+          invented: 'STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED',
+          outsidePopulation: 'STRICT_ANALYST_HYPOTHESIS_FACT_OUTSIDE_POPULATION',
+        },
+        hypothesis.hypothesisId
+      );
     }
     return createInductionReceiptV1({
       populationHash: population.populationHash,
@@ -373,7 +436,7 @@ function indexStrictHypotheses(
 function createStrictFalsifications(
   input: StrictAnalystEpochInputV1,
   hypotheses: ReadonlyMap<string, HypothesisV1>,
-  knownFactIds: ReadonlySet<string>
+  facts: StrictAnalystFactAuthority
 ): FalsificationReceiptV1[] {
   const externallyEnrolled = new Set(
     normalizeIds(input.enrolledObligationIds, 'enrolledObligationIds')
@@ -385,13 +448,15 @@ function createStrictFalsifications(
     if (candidate.enrolledCounterqueryIds.some((id) => !externallyEnrolled.has(id))) {
       fail('STRICT_ANALYSIS_QUERY_UNENROLLED', candidate.hypothesisId);
     }
-    if (
-      candidate.executions.some((execution) =>
-        execution.counterexampleFactIds.some((factId) => !knownFactIds.has(factId))
-      )
-    ) {
-      fail('STRICT_ANALYST_COUNTEREXAMPLE_FACT_INVENTED', candidate.hypothesisId);
-    }
+    assertFactsWithinPopulation(
+      candidate.executions.flatMap((execution) => execution.counterexampleFactIds),
+      facts,
+      {
+        invented: 'STRICT_ANALYST_COUNTEREXAMPLE_FACT_INVENTED',
+        outsidePopulation: 'STRICT_ANALYST_COUNTEREXAMPLE_FACT_OUTSIDE_POPULATION',
+      },
+      candidate.hypothesisId
+    );
     return createFalsificationReceiptV1({
       ...candidate,
       counterqueryApplicability: {
@@ -438,6 +503,9 @@ function resolveStrictHypothesisDispositions(
   ) {
     fail('STRICT_ANALYST_HYPOTHESIS_DISPOSITION_CONSERVATION');
   }
+  // 守恒已保证处置行与本 epoch 假设一一对应；父假设的状态取其处置行声明的状态（该状态在本循环
+  // 中逐行与 falsification verdict 对账，任一行不一致整个 epoch 都会失败关闭）。
+  const statusByHypothesis = new Map(dispositions.map((row) => [row.hypothesisId, row.status]));
   const producerEligibleHypotheses: ProducerEligibleHypothesisV1[] = [];
   for (const disposition of dispositions) {
     const hypothesis = hypotheses.get(disposition.hypothesisId);
@@ -451,24 +519,80 @@ function resolveStrictHypothesisDispositions(
     if (disposition.status === 'unknown' && falsification.verdict !== 'unknown') {
       fail('STRICT_ANALYST_UNKNOWN_MISMATCH', disposition.hypothesisId);
     }
-    if (disposition.status === 'survived' || disposition.status === 'narrowed') {
-      if (falsification.verdict !== 'survived' && falsification.verdict !== 'not-required') {
-        fail('STRICT_ANALYST_PRODUCER_ELIGIBILITY_INVALID', disposition.hypothesisId);
-      }
-      if (disposition.status === 'narrowed' && !disposition.causalParentHypothesisId) {
-        fail('STRICT_ANALYST_NARROWING_PARENT_REQUIRED', disposition.hypothesisId);
-      }
+    const producerEligible = disposition.status === 'survived' || disposition.status === 'narrowed';
+    if (
+      producerEligible &&
+      falsification.verdict !== 'survived' &&
+      falsification.verdict !== 'not-required'
+    ) {
+      fail('STRICT_ANALYST_PRODUCER_ELIGIBILITY_INVALID', disposition.hypothesisId);
+    }
+    // 父假设校验放在 verdict 对账之后，保持既有错误码的报告顺序（先 eligibility，再父假设）。
+    assertStrictCausalParent(disposition, statusByHypothesis);
+    if (producerEligible) {
       producerEligibleHypotheses.push({
         ...hypothesis,
         status: disposition.status,
         dispositionReviewReceiptId: falsification.dispositionReviewReceiptId,
-        ...(disposition.causalParentHypothesisId
+        // 走到这里时 survived 必无父 ID、narrowed 必有已校验的父 ID。
+        ...(disposition.causalParentHypothesisId !== undefined
           ? { causalParentHypothesisId: disposition.causalParentHypothesisId }
           : {}),
       });
     }
   }
   return { dispositions, producerEligibleHypotheses };
+}
+
+/** 被证伪或未决的假设不能作为任何收窄的来源。 */
+const CAUSAL_PARENT_INELIGIBLE_STATUSES: ReadonlySet<StrictHypothesisDispositionV1['status']> =
+  new Set(['refuted', 'unknown']);
+
+/**
+ * 因果父假设校验（C23）。causalParentHypothesisId 是模型输出（宿主 parseAnalystEnvelope 只做类型
+ * 断言），会随 producerEligibleHypotheses 进入 Producer 输入、lineage 的 hypothesisHash 与
+ * knowledgeRootId，并随 hypothesisDispositions 进入 epochHash 与持久化 epoch，所以封印前必须确认
+ * 它指向本 epoch 内真实、仍成立的另一个假设：
+ * - 缺省（null 已在投影时归一为缺省）：narrowed 必填，沿用 STRICT_ANALYST_NARROWING_PARENT_REQUIRED；
+ * - survived 携带父 ID：契约是“仅 narrowed 时给出”，按 STRICT_ANALYST_SURVIVED_CAUSAL_PARENT_FORBIDDEN
+ *   拒绝而不是静默丢弃，让 G1 把这类偏离契约的输出退回模型；
+ * - 空串或纯空白：STRICT_ANALYST_CAUSAL_PARENT_BLANK；
+ * - 指向自身：STRICT_ANALYST_CAUSAL_PARENT_SELF_REFERENCE；
+ * - 不在本 epoch 假设集合内：STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN。按原值精确比较、不 trim，带首尾
+ *   空白的 ID 视为不存在。只认本 epoch：跨 epoch 父假设需要调用方传入此前的假设集合，属于公开
+ *   输入类型变更，未采纳；
+ * - 父假设为 refuted/unknown：STRICT_ANALYST_CAUSAL_PARENT_INELIGIBLE。
+ * refuted/unknown 行若携带父 ID，同样按后四条校验（父 ID 同样进入 epochHash）。重建
+ * （assertStrictAnalystEpochIntegrity）会重新执行本校验，改写父 ID 后重算 epochHash 无法自证。
+ * 本层只拒绝自引用，不判定多跳环（h1→h2→h1）。
+ */
+function assertStrictCausalParent(
+  disposition: StrictHypothesisDispositionV1,
+  statusByHypothesis: ReadonlyMap<string, StrictHypothesisDispositionV1['status']>
+): void {
+  const { hypothesisId, status, causalParentHypothesisId: parent } = disposition;
+  if (parent === undefined) {
+    if (status === 'narrowed') {
+      fail('STRICT_ANALYST_NARROWING_PARENT_REQUIRED', hypothesisId);
+    }
+    return;
+  }
+  if (status === 'survived') {
+    fail('STRICT_ANALYST_SURVIVED_CAUSAL_PARENT_FORBIDDEN', hypothesisId);
+  }
+  if (parent.trim().length === 0) {
+    fail('STRICT_ANALYST_CAUSAL_PARENT_BLANK', hypothesisId);
+  }
+  if (parent === hypothesisId) {
+    fail('STRICT_ANALYST_CAUSAL_PARENT_SELF_REFERENCE', hypothesisId);
+  }
+  const parentStatus = statusByHypothesis.get(parent);
+  if (parentStatus === undefined) {
+    fail('STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN', hypothesisId);
+  }
+  if (CAUSAL_PARENT_INELIGIBLE_STATUSES.has(parentStatus)) {
+    fail('STRICT_ANALYST_CAUSAL_PARENT_INELIGIBLE', hypothesisId);
+  }
 }
 
 const HYPOTHESIS_DISPOSITION_CONTRACT_FIELDS: ReadonlySet<string> = new Set([
@@ -592,19 +716,19 @@ export function assertStrictAnalystEpochIntegrity(epoch: StrictAnalystEpochV1): 
 }
 
 /**
- * epochHash 不是 authority。跨进程收到 epoch 后必须把 population/cluster/induction/
- * falsification/review 全部送回公开 Core constructors，避免调用者重算外层 hash 自证。
+ * epochHash 不是 authority。跨进程收到 epoch 后把 population/cluster/induction/falsification/
+ * review 全部送回公开 Core constructors，并重跑本文件的结构校验（含 C23 父假设校验），只改内容、
+ * 重算外层 hash 的 epoch 因此无法自证。
+ *
+ * 重建复核的范围只有结构一致性与 Core 构造器不变量，不复核宿主的外部权威：epoch 不携带
+ * knownFactIds/enrolledObligationIds，只能从 epoch 自身推导——
+ * - 已知事实取 population 事实全集。首次校验已要求前提与反例事实落在 population 内（C22），
+ *   因此对合法 epoch 两次校验同口径；这里查的是“是否属于 population”，不是“宿主是否执行过”。
+ * - 已登记 obligation 取 executionReceipts 与 falsification 自带的 enrolledCounterqueryIds，
+ *   STRICT_ANALYSIS_QUERY_UNENROLLED 在重建中必然通过，反查登记的真实性只由首次校验对宿主集合把关。
  */
 function rebuildStrictAnalystEpoch(epoch: StrictAnalystEpochV1): StrictAnalystEpochV1 {
-  const knownFactIds = new Set([
-    ...epoch.population.observations.flatMap((row) => row.factIds),
-    ...epoch.population.duplicateObservations.flatMap((row) => row.factIds),
-    ...epoch.population.excludedObservations.flatMap((row) => row.factIds),
-    ...epoch.population.errorObservations.flatMap((row) => row.factIds),
-    ...epoch.falsifications.flatMap((receipt) =>
-      receipt.executions.flatMap((execution) => execution.counterexampleFactIds)
-    ),
-  ]);
+  const knownFactIds = collectStrictPopulationFactIds(epoch.population);
   const enrolledObligationIds = new Set([
     ...epoch.executionReceipts.map((receipt) => receipt.obligationId),
     ...epoch.falsifications.flatMap((receipt) => receipt.enrolledCounterqueryIds),
