@@ -17,6 +17,7 @@ import {
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
+import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { type ToolContext, ToolRouterAdapter } from '../src/tools/runtime/index.js';
 
 function walkSource(dir: string, acc: string[] = []): string[] {
@@ -423,6 +424,152 @@ describe('knowledge host ports through ToolRouterAdapter', () => {
     expect(result.structuredContent).toMatchObject({
       knowledge: [{ title: 'Search-only recipe' }],
     });
+    // search-only 是能力降级：必须对模型可见，且 guidance 不能承诺拿不到的 do/dont 条款。
+    expect(result.diagnostics).toMatchObject({
+      degraded: true,
+      warnings: [expect.objectContaining({ code: 'KNOWLEDGE_PRIME_SEARCH_ONLY' })],
+    });
+    const guidance = (result.structuredContent as { guidance: string }).guidance;
+    expect(guidance).not.toMatch(/doClause|dontClause/);
+  });
+
+  it('keeps the do/dont guidance and no search-only warning when prime reads details', async () => {
+    const result = await knowledgeAdapter({
+      searchEngine: { search: async () => [{ id: 'recipe', title: 'Recipe', score: 1 }] },
+      knowledgeRead: {
+        getById: async () => ({ id: 'recipe', doClause: 'Use it.', dontClause: 'Skip it.' }),
+      },
+    })('prime', { taskGoal: 'Edit the module' });
+    expect(result.ok).toBe(true);
+    expect(result.diagnostics.degraded).toBe(false);
+    expect(result.diagnostics.warnings).toEqual([]);
+    expect((result.structuredContent as { guidance: string }).guidance).toContain('doClause');
+  });
+
+  it('does not promise do/dont clauses when every prime detail read failed', async () => {
+    const result = await knowledgeAdapter({
+      searchEngine: { search: async () => [{ id: 'recipe', title: 'Recipe', score: 1 }] },
+      knowledgeRead: {
+        getById: async () => {
+          throw new Error('fixture detail failure');
+        },
+      },
+    })('prime', { taskGoal: 'Edit the module' });
+    expect(result.ok).toBe(true);
+    expect(result.diagnostics.degraded).toBe(true);
+    expect((result.structuredContent as { guidance: string }).guidance).not.toMatch(
+      /doClause|dontClause/
+    );
+  });
+
+  it.each([
+    { limit: -5, expected: 1, normalized: true },
+    { limit: 0, expected: 1, normalized: true },
+    { limit: 2.7, expected: 2, normalized: true },
+    { limit: 500, expected: 50, normalized: true },
+    { limit: 20, expected: 20, normalized: false },
+    { limit: undefined, expected: 10, normalized: false },
+  ])('clamps knowledge.search limit $limit to $expected before calling the host', async ({
+    limit,
+    expected,
+    normalized,
+  }) => {
+    const search = vi.fn(async () => [{ id: 'recipe', title: 'Recipe', score: 1 }]);
+    const result = await knowledgeAdapter({ searchEngine: { search } })('search', {
+      query: '  recipe  ',
+      ...(limit === undefined ? {} : { limit }),
+    });
+    expect(result.ok).toBe(true);
+    expect(search).toHaveBeenCalledExactlyOnceWith('recipe', {
+      limit: expected,
+      kind: 'all',
+      category: undefined,
+    });
+    const codes = result.diagnostics.warnings.map((warning) => warning.code);
+    if (normalized) {
+      expect(codes).toEqual(['KNOWLEDGE_SEARCH_LIMIT_NORMALIZED']);
+    } else {
+      expect(codes).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['search', { query: '   ' }, 'knowledge.search requires query'],
+    ['detail', { id: '  ' }, 'knowledge.detail requires id'],
+  ])('rejects a blank %s identifier before reaching any host port', async (action, params, message) => {
+    const search = vi.fn(async () => []);
+    const getById = vi.fn(async () => ({ id: 'recipe' }));
+    const result = await knowledgeAdapter({ searchEngine: { search }, knowledgeRead: { getById } })(
+      action,
+      params
+    );
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain(message);
+    expect(search).not.toHaveBeenCalled();
+    expect(getById).not.toHaveBeenCalled();
+  });
+
+  it('passes a trimmed detail id to the explicit read port', async () => {
+    const getById = vi.fn(async () => ({ id: 'recipe' }));
+    const result = await knowledgeAdapter({ knowledgeRead: { getById } })('detail', {
+      id: ' recipe ',
+    });
+    expect(result.ok).toBe(true);
+    expect(getById).toHaveBeenCalledExactlyOnceWith('recipe');
+  });
+
+  // router 的 Ajv 准入已经拒绝这些形状；这里直接打 handler，守住绕过 router 的调用面。
+  it.each([
+    ['search', { query: ['a'] }, 'knowledge.search query must be a string (received array)'],
+    ['search', { query: 123 }, 'knowledge.search query must be a string (received number)'],
+    [
+      'search',
+      { query: 'recipe', kind: ['recipe'] },
+      'knowledge.search kind must be a string (received array)',
+    ],
+    [
+      'search',
+      { query: 'recipe', category: 7 },
+      'knowledge.search category must be a string (received number)',
+    ],
+    ['detail', { id: 123 }, 'knowledge.detail id must be a string (received number)'],
+    [
+      'detail',
+      { id: { value: 'recipe' } },
+      'knowledge.detail id must be a string (received object)',
+    ],
+  ])('returns a parameter error for a non-string %s argument', async (action, params, message) => {
+    const search = vi.fn(async () => []);
+    const getById = vi.fn(async () => ({ id: 'recipe' }));
+    const result = await handleKnowledge(action, params, {
+      projectRoot: process.cwd(),
+      searchEngine: { search },
+      knowledgeRead: { getById },
+    });
+    expect(result).toMatchObject({ ok: false, error: message });
+    expect(search).not.toHaveBeenCalled();
+    expect(getById).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['NaN', Number.NaN],
+    ['string', '20'],
+  ])('falls back to the default knowledge.search limit for a %s limit with a diagnostic', async (_label, limit) => {
+    const search = vi.fn(async () => []);
+    const result = await handleKnowledge(
+      'search',
+      { query: 'recipe', limit },
+      { projectRoot: process.cwd(), searchEngine: { search } }
+    );
+    expect(result.ok).toBe(true);
+    expect(search).toHaveBeenCalledExactlyOnceWith('recipe', {
+      limit: 10,
+      kind: 'all',
+      category: undefined,
+    });
+    expect(result._meta?.diagnosticWarnings).toEqual([
+      expect.objectContaining({ code: 'KNOWLEDGE_SEARCH_LIMIT_NORMALIZED' }),
+    ]);
   });
 
   it('keeps prime search results while diagnosing a failed detail enrichment', async () => {
