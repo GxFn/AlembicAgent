@@ -50,7 +50,20 @@ export interface QualityReport {
 }
 
 export const REQUIRED_MEMORY_FINDING_SUGGESTION = 'Required note_finding calls are missing';
-export const INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION = 'At least 3 note_finding calls are required';
+
+/**
+ * note_finding 条数下限：与 summary_rewrite 分流、PipelineStrategy record_repair 底线以及宿主
+ * dimension_complete 证据门同取 Core DIMENSION_COMPLETION_FLOOR.minKeyFindings(C-3 单源)。
+ * 此前这里写死 3：Core 调高底线时质量门会放过 3..floor-1 条 findings，三处口径静默分裂(L7-P17/C48)。
+ */
+const MIN_MEMORY_FINDINGS = DIMENSION_COMPLETION_FLOOR.minKeyFindings;
+
+/**
+ * 「findings 不足」建议文本。它同时是 insightGate.buildRetryPrompt 的路由键，必须保持为模块级
+ * 常量(两侧 import 同一符号)，文案中的数字由同一 Core floor 拼出，判定与提示不会各写一份。
+ */
+export const INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION =
+  `At least ${MIN_MEMORY_FINDINGS} note_finding calls are required` as const;
 
 /** 门控选项 */
 export interface GateOptions {
@@ -165,7 +178,7 @@ export function buildQualityScores(
   // 文本兼容转译。产出方式必须看 AgentRuntime note_finding source 日志。
   if (memoryFindingCount === 0) {
     suggestions.push(REQUIRED_MEMORY_FINDING_SUGGESTION);
-  } else if (memoryFindingCount < 3) {
+  } else if (memoryFindingCount < MIN_MEMORY_FINDINGS) {
     suggestions.push(INSUFFICIENT_MEMORY_FINDINGS_SUGGESTION);
   }
   if (scores.coherenceScore < 50) {
@@ -278,6 +291,10 @@ function applyGateThresholds(qualityReport: QualityReport, options: GateOptions 
 function analysisQualityGateV1(report: GateableReport, options: GateOptions = {}): GateResult {
   const needsCandidates = options.outputType === 'dual' || options.outputType === 'candidate';
   const groundedFiles = report.groundedFiles ?? report.referencedFiles;
+  // V1 只服务没有 qualityReport 的兼容工件(无 activeContext 时 buildAnalysisReport 的产物)，
+  // 阈值是该路径的历史判定口径：候选档 400 字刻意不取 Core DIMENSION_COMPLETION_FLOOR.minAnalysisChars
+  // (500，宿主维度完成证据门的分析文本底线)——这里只决定「回炉重挖/重写还是放行」，不是维度完成判定。
+  // 改成 500 会把 400..499 字的现有分析从 pass 变为 retry，属于判定变化，须另行确认后再收敛(L7-P17/C48)。
   const minChars = needsCandidates ? 400 : 200;
   const minFileRefs = needsCandidates ? 3 : 2;
   // V1 的「文本短/缺结构」同属写作类失败：findings 已记录充足时改走 summary_rewrite。

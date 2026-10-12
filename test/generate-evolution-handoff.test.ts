@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { evolutionGateEvaluator } from '../src/agent/evaluation/gateEvaluators.js';
+import {
+  EVOLUTION_GATE_STAGE,
+  evolutionGateEvaluator,
+  readEvolutionGateArtifact,
+} from '../src/agent/evaluation/gateEvaluators.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -202,5 +206,72 @@ describe('evolution gate decision breakdown', () => {
       action: 'pass',
       artifact: { processed: 1, evolved: 1, deprecated: 0, skipped: 0 },
     });
+  });
+});
+
+// L7-P17(C55)：分析提示按阶段名读取进化门产物；产物来自 phaseResults(可被宿主重组或截断)，
+// 任何畸形形状都必须读成 null(省略「Evolution 结果」小节)，不能把 NaN/负数/数组喂进分析提示。
+describe('readEvolutionGateArtifact malformed input', () => {
+  const VALID = {
+    processed: 2,
+    totalRecipes: 3,
+    pendingIds: ['recipe-3'],
+    evolved: 1,
+    deprecated: 0,
+    skipped: 1,
+  };
+  const withArtifact = (artifact: unknown) => ({ [EVOLUTION_GATE_STAGE]: { artifact } });
+  const withoutField = (key: keyof typeof VALID) => {
+    const { [key]: _omitted, ...rest } = VALID;
+    return rest;
+  };
+
+  it('reads a well-formed artifact and drops non-string pending ids', () => {
+    expect(
+      readEvolutionGateArtifact(
+        withArtifact({ ...VALID, pendingIds: ['recipe-3', 7, null, 'recipe-4'] })
+      )
+    ).toEqual({ ...VALID, pendingIds: ['recipe-3', 'recipe-4'] });
+  });
+
+  it('keeps counts but treats a non-array pendingIds as empty', () => {
+    expect(readEvolutionGateArtifact(withArtifact({ ...VALID, pendingIds: 'recipe-3' }))).toEqual({
+      ...VALID,
+      pendingIds: [],
+    });
+  });
+
+  it.each([
+    { label: 'undefined phaseResults', phaseResults: undefined },
+    { label: 'null phaseResults', phaseResults: null },
+    { label: 'string phaseResults', phaseResults: 'evolution_gate' },
+    { label: 'number phaseResults', phaseResults: 42 },
+    { label: 'array phaseResults', phaseResults: [withArtifact(VALID)] },
+    { label: 'evolution stage absent', phaseResults: { quality_gate: { artifact: VALID } } },
+    { label: 'gate result is a string', phaseResults: { [EVOLUTION_GATE_STAGE]: 'pass' } },
+    { label: 'artifact missing', phaseResults: { [EVOLUTION_GATE_STAGE]: { action: 'pass' } } },
+    { label: 'artifact null', phaseResults: withArtifact(null) },
+    { label: 'artifact is a string', phaseResults: withArtifact('processed=3') },
+    { label: 'artifact is an array', phaseResults: withArtifact([VALID]) },
+    { label: 'processed missing', phaseResults: withArtifact(withoutField('processed')) },
+    { label: 'totalRecipes missing', phaseResults: withArtifact(withoutField('totalRecipes')) },
+    { label: 'evolved missing', phaseResults: withArtifact(withoutField('evolved')) },
+    { label: 'deprecated missing', phaseResults: withArtifact(withoutField('deprecated')) },
+    { label: 'skipped missing', phaseResults: withArtifact(withoutField('skipped')) },
+    { label: 'negative processed', phaseResults: withArtifact({ ...VALID, processed: -1 }) },
+    { label: 'negative skipped', phaseResults: withArtifact({ ...VALID, skipped: -2 }) },
+    {
+      label: 'NaN totalRecipes',
+      phaseResults: withArtifact({ ...VALID, totalRecipes: Number.NaN }),
+    },
+    { label: 'NaN evolved', phaseResults: withArtifact({ ...VALID, evolved: Number.NaN }) },
+    {
+      label: 'infinite deprecated',
+      phaseResults: withArtifact({ ...VALID, deprecated: Number.POSITIVE_INFINITY }),
+    },
+    { label: 'numeric string count', phaseResults: withArtifact({ ...VALID, processed: '2' }) },
+    { label: 'array count', phaseResults: withArtifact({ ...VALID, evolved: [1] }) },
+  ])('returns null for $label', ({ phaseResults }) => {
+    expect(readEvolutionGateArtifact(phaseResults)).toBeNull();
   });
 });

@@ -2,8 +2,10 @@ import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   evolutionGateEvaluator,
+  insightGateEvaluator,
   producerRejectionGateEvaluator,
 } from '../src/agent/evaluation/gateEvaluators.js';
+import { buildScanPipelineStages } from '../src/agent/evaluation/stageBuilders.js';
 import {
   BudgetPolicy,
   Policy,
@@ -884,6 +886,156 @@ describe('pipeline quality decision adapters', () => {
     }).execute({ id: 'pipeline', reactLoop: loop }, new AgentMessage({ content: 'analyze' }));
     expect(result.outcome).not.toBe('completed');
     expect(loop).toHaveBeenCalledOnce();
+  });
+});
+
+// ─── L7-P17(C50/C51)：scan 管线装配入口校验与恒定的工具驱动形态 ───
+// buildScanPipelineStages 经 ./prompts 公开；此前默认参数 `{} as ScanPipelineOpts` 让无参/缺字段调用
+// 静默产出没有 rejection_gate、没有 produce 系统提示的残缺管线。签名不变(opts 仍可省略)，但入口
+// 必须以带字段名的 Error 拒绝，而不是把缺口留到运行期低质量输出才暴露。
+describe('scan pipeline stage assembly (L7-P17)', () => {
+  type ScanOpts = Parameters<typeof buildScanPipelineStages>[0];
+  const validOpts = (task: 'extract' | 'summarize') => ({
+    task,
+    producePrompt: 'scan producer system prompt',
+    analyzeCaps: ['code_analysis'],
+    produceCaps: ['scan_production'],
+  });
+
+  it('rejects an empty options object with an Error naming the missing fields', () => {
+    expect(() => buildScanPipelineStages({} as ScanOpts)).toThrow(Error);
+    expect(() => buildScanPipelineStages({} as ScanOpts)).toThrow(/opts\.task/);
+    expect(() => buildScanPipelineStages({} as ScanOpts)).toThrow(/opts\.producePrompt/);
+  });
+
+  it('rejects a call without options instead of assembling a partial pipeline', () => {
+    expect(() => buildScanPipelineStages()).toThrow(/opts\.task/);
+    expect(() => buildScanPipelineStages(null as unknown as ScanOpts)).toThrow(
+      /buildScanPipelineStages.*opts/
+    );
+  });
+
+  it.each([
+    { label: 'unknown task', opts: { ...validOpts('extract'), task: 'relations' }, field: 'task' },
+    {
+      label: 'blank producePrompt',
+      opts: { ...validOpts('extract'), producePrompt: '   ' },
+      field: 'producePrompt',
+    },
+    {
+      label: 'non-string producePrompt',
+      opts: { ...validOpts('summarize'), producePrompt: 42 },
+      field: 'producePrompt',
+    },
+  ])('rejects $label with the field name', ({ opts, field }) => {
+    expect(() => buildScanPipelineStages(opts as unknown as ScanOpts)).toThrow(
+      new RegExp(`opts\\.${field}`)
+    );
+  });
+
+  it.each([
+    'extract',
+    'summarize',
+  ] as const)('assembles the full tool-driven 4-stage pipeline for %s', (task) => {
+    const stages = buildScanPipelineStages(validOpts(task));
+    expect(stages.map((stage) => stage.name)).toEqual([
+      'analyze',
+      'quality_gate',
+      'produce',
+      'rejection_gate',
+    ]);
+    const produce = stages[2] as Record<string, unknown>;
+    expect(produce.systemPrompt).toBe('scan producer system prompt');
+    expect(produce.submitToolName).toBe('knowledge');
+    expect(typeof produce.retryPromptBuilder).toBe('function');
+    expect(produce.retryBudget).toMatchObject({
+      maxIterations: task === 'summarize' ? 3 : 5,
+      timeoutMs: task === 'summarize' ? 60_000 : 120_000,
+    });
+  });
+
+  it('keeps the scan rejection gate pinned to knowledge submissions', () => {
+    const stages = buildScanPipelineStages(validOpts('extract'));
+    const rejectionGate = stages[3] as {
+      gate: {
+        evaluator: (
+          source: unknown,
+          phaseResults: unknown,
+          ctx: Record<string, unknown>
+        ) => {
+          action: string;
+        };
+      };
+    };
+    const rejectedSubmit = {
+      tool: 'knowledge',
+      args: { action: 'submit' },
+      result: { status: 'rejected' },
+    };
+    // 宿主 strategyContext 透传的 submitToolNames 不能把 scan 拒绝率门改成统计别的工具。
+    expect(
+      rejectionGate.gate.evaluator(
+        { toolCalls: [rejectedSubmit, rejectedSubmit] },
+        {},
+        { submitToolNames: ['other_submit_tool'] }
+      ).action
+    ).toBe('retry');
+  });
+});
+
+// ─── L7-P17(C52)：空 analyze 回复的 degrade 分支也要留 [QualityGate] 观测行 ───
+// 判定不变(仍 degrade + artifact=null)；新增日志区分 analyze 没有阶段结果、超时、中止与正常结束但回复为空。
+describe('insight quality gate empty-reply degrade observability (L7-P17)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const qualityGateLines = (info: { mock: { calls: unknown[][] } }) =>
+    info.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('[QualityGate]'));
+
+  it.each([
+    {
+      label: 'empty reply after a finished analyze stage',
+      source: { reply: '', toolCalls: [{ tool: 'code' }, { tool: 'graph' }] },
+      expected: ['source=empty_reply', 'toolCalls=2'],
+    },
+    {
+      label: 'missing analyze stage result',
+      source: undefined,
+      expected: ['source=missing', 'toolCalls=0'],
+    },
+    {
+      label: 'timed out analyze stage',
+      source: { reply: '', toolCalls: [{ tool: 'code' }], timedOut: true },
+      expected: ['source=timed_out', 'toolCalls=1'],
+    },
+    {
+      label: 'aborted analyze stage',
+      source: { reply: '', toolCalls: [], aborted: true },
+      expected: ['source=aborted', 'toolCalls=0'],
+    },
+  ])('logs the degrade decision for $label', ({ source, expected }) => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const result = insightGateEvaluator(source, {}, { dimId: 'architecture' });
+    expect(result).toEqual({ action: 'degrade', reason: 'No analysis output', artifact: null });
+    const lines = qualityGateLines(info);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('[QualityGate] dim="architecture" action=degrade');
+    expect(lines[0]).toContain('reason="No analysis output"');
+    for (const fragment of expected) {
+      expect(lines[0]).toContain(fragment);
+    }
+  });
+
+  it('keeps the degrade decision when the logger itself fails', () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    expect(insightGateEvaluator({ reply: '' }, {}, { dimId: 'architecture' })).toEqual({
+      action: 'degrade',
+      reason: 'No analysis output',
+      artifact: null,
+    });
   });
 });
 

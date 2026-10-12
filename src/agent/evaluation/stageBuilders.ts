@@ -109,16 +109,18 @@ function readPromptDiagnostics(value: unknown): PromptDiagnosticsSink | null {
  * @param [opts.analyzeMaxIter=24] Analyze 最大迭代
  * @returns PipelineStrategy stages 数组
  */
-export function buildScanPipelineStages(
-  {
+export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
+  // 公开签名保持 opts 可省略(改为必填属于公开参数可选性变化，待公开面收窄决定)；但缺 opts、
+  // task 不在 {extract, summarize} 或 producePrompt 为空时，入口直接抛带字段名的 Error，
+  // 不再像旧的 `{} as ScanPipelineOpts` 默认值那样静默装配出缺 rejection_gate/系统提示的残缺管线。
+  const {
     task,
     producePrompt,
     analyzeCaps,
     produceCaps,
     files,
     analyzeMaxIter = 24,
-  }: ScanPipelineOpts = {} as ScanPipelineOpts
-) {
+  } = assertScanPipelineOpts(opts);
   // ── Stage 1: Analyze ──
   const analyzeStage = {
     name: 'analyze',
@@ -155,10 +157,9 @@ export function buildScanPipelineStages(
   };
 
   // ── Stage 3: Produce ──
-  // extract 和 summarize 都是工具驱动 (knowledge)
-  const isToolDriven = task === 'extract' || task === 'summarize';
+  // extract 和 summarize 都是工具驱动 (knowledge)：入口已把 task 限定在这两值，produce 恒带
+  // retryBudget/retryPromptBuilder，管线恒带 rejection_gate，不再保留恒真的 isToolDriven 分支。
   const isSummarize = task === 'summarize';
-  const submitToolNames = isToolDriven ? ['knowledge'] : [];
 
   const produceStage = {
     name: 'produce',
@@ -182,50 +183,86 @@ export function buildScanPipelineStages(
       return buildScanProducerPrompt(ctx, files, task);
     },
     // retry 配置 (拒绝率过高时缩减预算)
-    ...(isToolDriven
-      ? {
-          retryBudget: {
-            maxIterations: isSummarize ? 3 : 5,
-            temperature: 0.3,
-            timeoutMs: isSummarize ? 60_000 : 120_000,
-          },
-          retryPromptBuilder: (
-            retryCtx: { reason?: string },
-            _origPrompt: string,
-            prev: Record<string, PhaseResult>
-          ) => {
-            return buildProducerRetryPrompt(prev.produce);
-          },
-        }
-      : {}),
+    retryBudget: {
+      maxIterations: isSummarize ? 3 : 5,
+      temperature: 0.3,
+      timeoutMs: isSummarize ? 60_000 : 120_000,
+    },
+    retryPromptBuilder: (
+      retryCtx: { reason?: string },
+      _origPrompt: string,
+      prev: Record<string, PhaseResult>
+    ) => {
+      return buildProducerRetryPrompt(prev.produce);
+    },
   };
 
-  const stages: Record<string, unknown>[] = [analyzeStage, qualityGateStage, produceStage];
+  // ── Stage 4: Rejection Gate ──
+  const rejectionGateStage = {
+    name: 'rejection_gate',
+    gate: {
+      evaluator: (
+        source: unknown,
+        phaseResults: Record<string, unknown>,
+        ctx: Record<string, unknown>
+      ) =>
+        producerRejectionGateEvaluator(
+          source as Parameters<typeof producerRejectionGateEvaluator>[0],
+          phaseResults,
+          {
+            ...ctx,
+            // scan 只经 knowledge 提交；固定覆盖宿主 strategyContext 可能透传的 submitToolNames，
+            // 拒绝率始终只统计 knowledge.submit 回执(与原装配行为一致)。
+            submitToolNames: ['knowledge'],
+          }
+        ),
+      maxRetries: 1,
+    },
+  };
 
-  // ── Stage 4: Rejection Gate (仅工具驱动模式) ──
-  if (isToolDriven) {
-    stages.push({
-      name: 'rejection_gate',
-      gate: {
-        evaluator: (
-          source: unknown,
-          phaseResults: Record<string, unknown>,
-          ctx: Record<string, unknown>
-        ) =>
-          producerRejectionGateEvaluator(
-            source as Parameters<typeof producerRejectionGateEvaluator>[0],
-            phaseResults,
-            {
-              ...ctx,
-              submitToolNames,
-            }
-          ),
-        maxRetries: 1,
-      },
-    });
-  }
-
+  const stages: Record<string, unknown>[] = [
+    analyzeStage,
+    qualityGateStage,
+    produceStage,
+    rejectionGateStage,
+  ];
   return stages;
+}
+
+/** scan 管线支持的任务；与 ScanPipelineOpts.task 同集合，供运行期校验(JS/宿主调用方不经类型检查)。 */
+const SCAN_PIPELINE_TASKS: ReadonlySet<string> = new Set(['extract', 'summarize']);
+
+/**
+ * buildScanPipelineStages 入口校验：一次列出所有问题字段，抛带字段名的 Error。
+ * 只校验决定管线形态的两项(task 决定预算与提交上限，producePrompt 是 produce 系统提示)；
+ * 其余字段沿用原有宽松语义。抛错本身即诊断信号(含字段名与实际值类型)，不做降级装配。
+ */
+function assertScanPipelineOpts(opts: ScanPipelineOpts | undefined): ScanPipelineOpts {
+  if (!opts || typeof opts !== 'object') {
+    throw new Error(
+      `buildScanPipelineStages: opts is required (got ${opts === null ? 'null' : typeof opts}); ` +
+        'expected opts.task ("extract" | "summarize") and a non-empty opts.producePrompt'
+    );
+  }
+  const problems: string[] = [];
+  const task: unknown = opts.task;
+  if (typeof task !== 'string' || !SCAN_PIPELINE_TASKS.has(task)) {
+    problems.push(
+      `opts.task must be "extract" or "summarize" (got ${typeof task === 'string' ? `"${task.slice(0, 40)}"` : typeof task})`
+    );
+  }
+  const producePrompt: unknown = opts.producePrompt;
+  if (typeof producePrompt !== 'string' || producePrompt.trim().length === 0) {
+    problems.push(
+      `opts.producePrompt must be a non-empty string (got ${
+        typeof producePrompt === 'string' ? 'blank string' : typeof producePrompt
+      })`
+    );
+  }
+  if (problems.length > 0) {
+    throw new Error(`buildScanPipelineStages: invalid opts: ${problems.join('; ')}`);
+  }
+  return opts;
 }
 
 // ──────────────────────────────────────────────────────────────────

@@ -108,6 +108,31 @@ export function applyModuleCoverageGate<
   };
 }
 
+/**
+ * 空回复时 analyze 源的状态归类，只用于 [QualityGate] 观测行：
+ * - missing：源阶段没有留下对象形结果(阶段未执行或结果被替换)
+ * - aborted / timed_out：阶段结果自带的中止、超时标记(中止优先于超时，二者都优先于普通空回复)
+ * - empty_reply：阶段正常结束但回复为空
+ * 阶段抛错时 PipelineStrategy 直接抛出，不会走到门评估器，因此这里没有 error 分类。
+ */
+function describeEmptyAnalysisSource(source: unknown): {
+  sourceState: 'missing' | 'aborted' | 'timed_out' | 'empty_reply';
+  toolCallCount: number;
+} {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return { sourceState: 'missing', toolCallCount: 0 };
+  }
+  const record = source as { toolCalls?: unknown; aborted?: unknown; timedOut?: unknown };
+  const toolCallCount = Array.isArray(record.toolCalls) ? record.toolCalls.length : 0;
+  if (record.aborted === true) {
+    return { sourceState: 'aborted', toolCallCount };
+  }
+  if (record.timedOut === true) {
+    return { sourceState: 'timed_out', toolCallCount };
+  }
+  return { sourceState: 'empty_reply', toolCallCount };
+}
+
 export function insightGateEvaluator(
   source: unknown,
   phaseResults: Record<string, unknown>,
@@ -122,12 +147,25 @@ export function insightGateEvaluator(
     sharedState._analystGraphEvidence = [];
     sharedState._analystGroundedRanges = {};
   }
-  if (!(source as AnalystResult | null | undefined)?.reply) {
-    return { action: 'degrade', reason: 'No analysis output', artifact: null };
-  }
-
   const { projectGraph, activeContext, dimId, outputType, needsCandidates, projectRoot } =
     strategyContext as InsightGateStrategyContext;
+
+  if (!(source as AnalystResult | null | undefined)?.reply) {
+    // 空回复短路：判定保持 degrade + artifact=null(PipelineStrategy 据此终止本维度)。这里只补
+    // [QualityGate] 观测行，与其他门动作同一前缀，便于按维度追踪「为什么没有分析」。
+    // PCV 质量门证据目前只挂在 artifact.pcvNodeEvidence 上；本分支 artifact 必须为 null，
+    // 补证据需要新的承载字段，属于公开返回形状变化，暂不在此添加。
+    const { sourceState, toolCallCount } = describeEmptyAnalysisSource(source);
+    observeSafely(
+      () =>
+        logger().info(
+          `[QualityGate] dim="${dimId}" action=degrade reason="No analysis output" ` +
+            `source=${sourceState} toolCalls=${toolCallCount}`
+        ),
+      () => undefined
+    );
+    return { action: 'degrade', reason: 'No analysis output', artifact: null };
+  }
 
   const artifact = activeContext
     ? buildAnalysisArtifact(source as AnalystResult, dimId as string, projectGraph, activeContext, {
@@ -392,13 +430,13 @@ interface GateStrategyContext {
 export function producerRejectionGateEvaluator(
   source: ReactLoopResult | null | undefined,
   _phaseResults: unknown,
-  _strategyContext: GateStrategyContext = {}
+  strategyContext: GateStrategyContext = {}
 ) {
   if (!source?.toolCalls) {
     return { action: 'pass', reason: '' };
   }
 
-  const names = _strategyContext.submitToolNames ?? ['knowledge'];
+  const names = strategyContext.submitToolNames ?? ['knowledge'];
   const submitCalls = (source.toolCalls || []).filter((call) => {
     const { tool } = readToolObservation(call);
     return names.includes(tool) && (tool !== 'knowledge' || isKnowledgeSubmit(call));
