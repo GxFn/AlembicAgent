@@ -822,7 +822,8 @@ describe('availability snapshot matches handler rejection conditions', () => {
 function fullyWiredContext(): ToolAvailabilityContext {
   const method = vi.fn();
   return {
-    astAnalyzer: { analyzeFile: method },
+    // I16：code.outline 只按 kernel 的 outlineFile 端口判定，旧 astAnalyzer 鸭子类型不再参与广告。
+    outlineFile: method,
     projectGraph: {
       getOverview: method,
       getClassInfo: method,

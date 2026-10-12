@@ -72,12 +72,17 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
     );
   };
 
-  // read 的 AST 是可选增强，outline 则必须有真实 analyzer；不误删可降级的文件读取。
+  // read 的 AST 是可选增强（缺端口时退回头尾预览），outline 则必须有宿主绑定的 outlineFile 端口；
+  // 不误删可降级的文件读取。I16：只按 kernel 的 outlineFile 端口判定。旧 astAnalyzer.analyzeFile
+  // 鸭子类型只能证明“有这个方法名”，证明不了签名——按 Core analyzeFile(source, lang) 接线时它
+  // 会被判为可用却恒失败——所以即使在场也不广告，原因里点名这一跳过，便于宿主排查。
   check(
     'code',
     'outline',
-    hasMethod(ctx.astAnalyzer, 'analyzeFile'),
-    'astAnalyzer.analyzeFile is unavailable'
+    typeof ctx.outlineFile === 'function',
+    hasMethod(ctx.astAnalyzer, 'analyzeFile')
+      ? 'outlineFile is unavailable; legacy astAnalyzer.analyzeFile is bound but not advertised (its signature cannot be verified)'
+      : 'outlineFile is unavailable'
   );
   check(
     'graph',

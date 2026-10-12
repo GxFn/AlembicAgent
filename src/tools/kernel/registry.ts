@@ -105,6 +105,29 @@ export interface ToolResult {
 /* ------------------------------------------------------------------ */
 
 /**
+ * AST 大纲中的一条声明，由宿主的 {@link ToolContext.outlineFile} 适配 Core 摘要后给出。
+ * 宿主数据进入 handler 前会逐条校验：name/kind 非空字符串、startLine 正整数，否则丢弃并记日志；
+ * 可选字段不合法时按缺省处理。
+ */
+export interface OutlineDefinition {
+  name: string;
+  /**
+   * 声明种类。code.outline 的 kinds 过滤按它匹配（不区分大小写），过滤词汇是
+   * class/function/interface/type/method/enum；其他取值（如 variable、property）照常展示，
+   * 但不会被任何 kinds 过滤选中。
+   */
+  kind: string;
+  /** 1-based 起始行。 */
+  startLine: number;
+  /** 1-based 结束行（含）；缺省时只展示起始行。 */
+  endLine?: number;
+  /** 展示用签名；缺省时展示 name。 */
+  signature?: string;
+  /** 嵌套深度，顶层为 0；缺省按 0。code.outline 的 maxDepth=N 只保留 depth < N 的声明。 */
+  depth?: number;
+}
+
+/**
  * Handler 执行上下文 — 通过 DI 注入外部依赖。
  *
  * 设计约束:
@@ -160,7 +183,27 @@ export interface ToolContext {
   /** 进化决策网关 — knowledge.manage(evolve/deprecate/skip_evolution) 的唯一写入口 */
   proposalGateway?: unknown;
 
-  /** AST 分析器 — code handler 内部 cast 为 AstAnalyzerLike */
+  /**
+   * AST 大纲端口（L4-P36 / I16，待决事项⑤已定：Agent 声明端口、宿主适配）。code.outline 与
+   * >500 行 code.read 的骨架优先经由这里取得（下方 astAnalyzer 只是缺省时的已弃用兼容入口）；
+   * availability 只按本端口广告 code.outline。
+   *
+   * - absPath 是已通过项目根校验的绝对路径，relPath 是项目相对路径（用于按扩展名映射语言与日志）；
+   * - 宿主负责读源码、按扩展名映射 lang、调用 Core analyzeFile(source, lang)，再把类/方法等适配成
+   *   OutlineDefinition[]；Core 不为此新增端口，Agent 也不猜测 Core 摘要的形状；
+   * - 语言不支持或文件没有可列出的声明返回 null 或空数组（handler 记为 no-definitions）；
+   *   解析异常直接抛错（handler 记为 analyzer-error 并带错误类名），不要吞成 null。
+   */
+  outlineFile?: (absPath: string, relPath: string) => Promise<OutlineDefinition[] | null>;
+
+  /**
+   * 已弃用的 AST 分析器鸭子类型 analyzeFile(absPath) => Promise<{ definitions }>（I16）。
+   * 它与 Core analyzeFile(source, lang) 的真实签名不一致，生产宿主也从未注册，所以 availability
+   * 不再据此广告 code.outline；handler 只在 outlineFile 缺省时把它当兼容入口调用并记日志。
+   * 消费者：仍按旧鸭子类型注入的宿主/测试夹具（唯一生产宿主 ToolContextFactory 透传 tryGet 结果，
+   * 实际恒为 undefined）。移除条件：宿主改为注册 outlineFile 并停止透传本字段后，删除本字段与
+   * code handler 的 legacy-astAnalyzer 分支（类型收窄随待决事项⑤的后续收尾，由 AlembicAgent 负责）。
+   */
   astAnalyzer?: unknown;
 
   /** 安全策略 — terminal handler 可选引用 */

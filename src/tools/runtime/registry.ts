@@ -27,7 +27,7 @@ import type { ToolAvailabilitySnapshot } from '#tools/kernel/availability.js';
 import { KNOWLEDGE_SEARCH_DEFAULT_KIND } from '#tools/kernel/knowledge.js';
 import type { ToolRegistry, ToolSpec } from '#tools/kernel/registry.js';
 import type { ToolSelection } from '#tools/kernel/toolSchema.js';
-import { handle as handleCode } from './handlers/code.js';
+import { handle as handleCode, OUTLINE_FILTER_KINDS } from './handlers/code.js';
 import { handle as handleEvidence } from './handlers/evidence.js';
 import { handle as handleGraph } from './handlers/graph.js';
 import { handle as handleKnowledge } from './handlers/knowledge.js';
@@ -189,8 +189,10 @@ const CODE_SPEC: ToolSpec = {
     },
     outline: {
       summary: 'File AST skeleton (Tree-sitter)',
+      // I16：kinds/maxDepth 由 handler 真正执行，过滤时输出头部写明“showing x of y”，过滤后为空也有说明；
+      // 本动作只在宿主绑定 outlineFile 端口时出现在可用快照里。kinds 枚举与 handler 校验共用 OUTLINE_FILTER_KINDS。
       description:
-        'Extract file structural skeleton using Tree-sitter AST: classes, functions, interfaces, types with line ranges.',
+        'Extract file structural skeleton using Tree-sitter AST: classes, functions, interfaces, types with line ranges. kinds and maxDepth narrow the list; a filtered outline states how many definitions it shows out of the total.',
       params: {
         type: 'object',
         properties: {
@@ -199,11 +201,14 @@ const CODE_SPEC: ToolSpec = {
             type: 'array',
             items: {
               type: 'string',
-              enum: ['class', 'function', 'interface', 'type', 'method', 'enum'],
+              enum: [...OUTLINE_FILTER_KINDS],
             },
             description: 'Filter: class/function/interface/type/method/enum',
           },
-          maxDepth: { type: 'number', description: 'Max nesting depth' },
+          maxDepth: {
+            type: 'number',
+            description: 'Max nesting levels to keep (1 = top-level declarations only)',
+          },
         },
         required: ['path'],
       },

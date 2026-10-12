@@ -4,7 +4,7 @@
  * 代码智能工具 — Agent 与项目源码交互的统一入口。
  * Actions: search, read, outline, structure, write
  *
- * 引擎: ripgrep (搜索), Tree-sitter via AstAnalyzer (骨架), fs (读写)
+ * 引擎: ripgrep (搜索), 宿主 outlineFile 端口（宿主调 Core Tree-sitter analyzeFile，骨架）, fs (读写)
  */
 
 import { spawn } from 'node:child_process';
@@ -19,6 +19,7 @@ import { resolveProjectPath } from '#shared/projectPath.js';
 import {
   estimateTokens,
   fail,
+  type OutlineDefinition,
   ok,
   type ToolContext,
   type ToolDiagnosticWarning,
@@ -1100,14 +1101,14 @@ function hasReadRange(range: ReadRange): boolean {
 
 /**
  * >500 行文件 AST 大纲不可用的原因（I17）：
- * - analyzer-missing：宿主没有注入 astAnalyzer（当前生产宿主的主路径）；
+ * - analyzer-missing：宿主没有绑定 outlineFile 端口（也没有旧 astAnalyzer 兼容入口；当前生产宿主的主路径）；
  * - no-definitions：analyzer 返回空结果（语言不支持或文件没有可列出的声明）；
  * - analyzer-error：analyzer 抛错，错误类名与消息进入诊断与日志，不再被吞成“不可用”。
  */
 type OutlineFallbackReason = 'analyzer-missing' | 'no-definitions' | 'analyzer-error';
 
 const OUTLINE_FALLBACK_DESCRIPTIONS: Readonly<Record<OutlineFallbackReason, string>> = {
-  'analyzer-missing': 'no AST analyzer is bound',
+  'analyzer-missing': 'no AST outline port (outlineFile) is bound',
   'no-definitions':
     'the AST analyzer returned no definitions (unsupported language or no declarations)',
   'analyzer-error': 'the AST analyzer threw',
@@ -1683,6 +1684,12 @@ async function handleOutline(
     return fail('code.outline requires path');
   }
 
+  // 过滤参数先于读盘校验：非法 kinds/maxDepth 明确报错，不静默输出全部定义（I16 / U14-F10）。
+  const filterResult = normalizeOutlineFilter(params, filePath);
+  if (!filterResult.ok) {
+    return fail(filterResult.error);
+  }
+
   const resolved = resolveProjectFilePath(filePath, ctx.projectRoot);
   if (!resolved.ok) {
     return fail(resolved.error);
@@ -1694,7 +1701,13 @@ async function handleOutline(
     return fail(`File not found: ${filePath}`);
   }
 
-  const outline = await buildAstOutline(resolved.absPath, resolved.relPath, ctx);
+  const outline = await buildAstOutline(
+    resolved.absPath,
+    resolved.relPath,
+    ctx,
+    undefined,
+    filterResult.value
+  );
   if (outline.kind === 'outline') {
     return ok(outline.text, { tokensEstimate: estimateTokens(outline.text) });
   }
@@ -1712,13 +1725,89 @@ async function handleOutline(
   }
   return fail(
     outline.reason === 'analyzer-missing'
-      ? `Cannot generate outline for ${filePath} — AST analyzer not available`
+      ? `Cannot generate outline for ${filePath} — AST analyzer not available (the host has not bound the outlineFile port)`
       : `Cannot generate outline for ${filePath} — AST analyzer returned no definitions (language not supported or no declarations)`
   );
 }
 
 /**
- * AST 大纲的三种结局（I17）：成功、能力边界内的“不可用”（未注入 analyzer / 无定义）、
+ * code.outline 的 kinds 过滤词汇（单源）：registry 的 outline.params.kinds 枚举从这里取值，
+ * handler 用同一份列表校验直接调用（绕过 router 的 Ajv）时的输入。
+ */
+export const OUTLINE_FILTER_KINDS: readonly string[] = [
+  'class',
+  'function',
+  'interface',
+  'type',
+  'method',
+  'enum',
+];
+
+/**
+ * code.outline 的过滤条件（I16 / U14-F10）。只由 code.outline 构造；code.read 的 >500 行骨架
+ * 不过滤（它没有这两个参数，过滤会让模型误以为文件只有这些声明）。
+ * - kinds：保留 kind（小写比较）在集合内的声明；
+ * - maxDepth：保留 depth < maxDepth 的声明，1 表示只看顶层（与 code.structure 的 depth 口径一致）。
+ */
+interface OutlineFilter {
+  kinds?: readonly string[];
+  maxDepth?: number;
+}
+
+function normalizeOutlineFilter(
+  params: Record<string, unknown>,
+  filePath: string
+): { ok: true; value: OutlineFilter | undefined } | { ok: false; error: string } {
+  const filter: OutlineFilter = {};
+  const kinds = params.kinds;
+  if (kinds !== undefined && kinds !== null) {
+    const allowed = OUTLINE_FILTER_KINDS.join(', ');
+    if (!Array.isArray(kinds)) {
+      return {
+        ok: false,
+        error: `code.outline kinds must be an array of: ${allowed}; got ${typeof kinds}`,
+      };
+    }
+    const unknown = kinds.filter(
+      (kind) => typeof kind !== 'string' || !OUTLINE_FILTER_KINDS.includes(kind)
+    );
+    if (unknown.length > 0) {
+      return {
+        ok: false,
+        error: `code.outline kinds must be an array of: ${allowed}; got ${unknown.map((kind) => JSON.stringify(kind)).join(', ')}`,
+      };
+    }
+    if (kinds.length > 0) {
+      filter.kinds = [...new Set(kinds as string[])];
+    } else {
+      // 模型常把可选数组填成 []：schema 与 Ajv 都放行，语义上等同“不按种类过滤”，不当成“什么都不要”。
+      const message = `[code.outline] path=${filePath}; kinds=[] treated as no kind filter`;
+      observeSafely(
+        () => Logger.getInstance().debug(message),
+        () => undefined
+      );
+    }
+  }
+  const maxDepth = params.maxDepth;
+  if (maxDepth !== undefined && maxDepth !== null) {
+    // schema 只声明 type:'number'，Ajv 放行 0、负数与小数；这里与 code.read 的行号一样要求正整数。
+    if (typeof maxDepth !== 'number' || !Number.isSafeInteger(maxDepth) || maxDepth < 1) {
+      const shown = typeof maxDepth === 'number' ? String(maxDepth) : typeof maxDepth;
+      return {
+        ok: false,
+        error: `code.outline maxDepth must be a positive integer (1 = top-level declarations only); got ${shown}`,
+      };
+    }
+    filter.maxDepth = maxDepth;
+  }
+  return {
+    ok: true,
+    value: filter.kinds !== undefined || filter.maxDepth !== undefined ? filter : undefined,
+  };
+}
+
+/**
+ * AST 大纲的三种结局（I17）：成功、能力边界内的“不可用”（未绑定端口 / 无定义）、
  * analyzer 抛错。旧实现用裸 catch 把抛错吞成 null，与“不可用”无法区分。
  */
 type AstOutlineOutcome =
@@ -1727,29 +1816,132 @@ type AstOutlineOutcome =
   | { kind: 'error'; reason: 'analyzer-error'; errorName: string; errorMessage: string };
 
 /**
- * 通过 AstAnalyzer 生成文件骨架。
- * AstAnalyzer 接口来自 lib/core/AstAnalyzer.ts。
+ * 本次调用实际使用的大纲来源（I16）：
+ * - outlineFile：kernel 声明、宿主绑定的端口（宿主读源码并调用 Core analyzeFile(source, lang) 后适配）；
+ * - legacy-astAnalyzer：已弃用的 analyzeFile(absPath) => { definitions } 鸭子类型，只在端口缺省时兼容调用，
+ *   availability 不据此广告 code.outline；移除条件见 kernel ToolContext.astAnalyzer 的说明。
+ */
+type OutlinePortName = 'outlineFile' | 'legacy-astAnalyzer';
+
+function resolveOutlinePort(
+  absPath: string,
+  relPath: string,
+  ctx: ToolContext
+): { port: OutlinePortName; run: () => Promise<unknown> } | null {
+  const outlineFile = ctx.outlineFile;
+  if (typeof outlineFile === 'function') {
+    return { port: 'outlineFile', run: async () => outlineFile(absPath, relPath) };
+  }
+  const legacy = ctx.astAnalyzer;
+  if (
+    legacy === null ||
+    (typeof legacy !== 'object' && typeof legacy !== 'function') ||
+    typeof (legacy as { analyzeFile?: unknown }).analyzeFile !== 'function'
+  ) {
+    return null;
+  }
+  const analyzeFile = (legacy as { analyzeFile: (filePath: string) => unknown }).analyzeFile;
+  return {
+    port: 'legacy-astAnalyzer',
+    run: async () => {
+      // 兼容转译：旧鸭子类型返回 { definitions }，这里取出数组交给统一的逐条校验。
+      const result = await analyzeFile.call(legacy, absPath);
+      if (result === null || typeof result !== 'object') {
+        return null;
+      }
+      return (result as { definitions?: unknown }).definitions ?? null;
+    },
+  };
+}
+
+/**
+ * 端口返回值是宿主数据，进入大纲前逐条校验（I16）：非数组按“无定义”处理；name/kind 非空字符串、
+ * startLine 正整数的条目才保留；可选字段不合法时按缺省处理（endLine 早于 startLine 视同缺省）。
+ */
+function normalizeOutlineDefinitions(
+  raw: unknown
+): { definitions: OutlineDefinition[]; dropped: number } | null {
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const definitions: OutlineDefinition[] = [];
+  let dropped = 0;
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') {
+      dropped++;
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const { name, kind, startLine, endLine, signature, depth } = record;
+    if (
+      typeof name !== 'string' ||
+      name.trim() === '' ||
+      typeof kind !== 'string' ||
+      kind.trim() === '' ||
+      typeof startLine !== 'number' ||
+      !Number.isSafeInteger(startLine) ||
+      startLine < 1
+    ) {
+      dropped++;
+      continue;
+    }
+    definitions.push({
+      name,
+      kind,
+      startLine,
+      ...(typeof endLine === 'number' && Number.isSafeInteger(endLine) && endLine >= startLine
+        ? { endLine }
+        : {}),
+      ...(typeof signature === 'string' && signature.trim() !== '' ? { signature } : {}),
+      ...(typeof depth === 'number' && Number.isSafeInteger(depth) && depth >= 0 ? { depth } : {}),
+    });
+  }
+  return { definitions, dropped };
+}
+
+function outlineFilterLabel(filter: OutlineFilter): string {
+  return [
+    filter.kinds ? `kinds=${filter.kinds.join(',')}` : '',
+    filter.maxDepth !== undefined ? `maxDepth=${filter.maxDepth}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function matchesOutlineFilter(def: OutlineDefinition, filter: OutlineFilter): boolean {
+  if (filter.kinds && !filter.kinds.includes(def.kind.toLowerCase())) {
+    return false;
+  }
+  return filter.maxDepth === undefined || (def.depth ?? 0) < filter.maxDepth;
+}
+
+/**
+ * 通过宿主绑定的 outlineFile 端口（或已弃用的 astAnalyzer 兼容入口）生成文件骨架。
  * lineCount 由 code.read 传入（已按 splitSourceLines 计数）；code.outline 不传时按需读取一次。
+ * filter 只由 code.outline 传入；过滤后为空时仍返回大纲（kind:'outline'），正文说明过滤掉了多少条。
  */
 async function buildAstOutline(
   absPath: string,
   relPath: string,
   ctx: ToolContext,
-  knownLineCount?: number
+  knownLineCount?: number,
+  filter?: OutlineFilter
 ): Promise<AstOutlineOutcome> {
-  const analyzer = ctx.astAnalyzer as
-    | {
-        analyzeFile?: (filePath: string) => Promise<AstFileResult | null>;
-      }
-    | undefined;
-
-  if (!analyzer?.analyzeFile) {
+  const resolvedPort = resolveOutlinePort(absPath, relPath, ctx);
+  if (!resolvedPort) {
     return { kind: 'unavailable', reason: 'analyzer-missing' };
   }
+  if (resolvedPort.port === 'legacy-astAnalyzer') {
+    const message = `[code.outline] path=${relPath}; port=legacy-astAnalyzer (deprecated analyzeFile(absPath) duck type; bind ToolContext.outlineFile instead)`;
+    observeSafely(
+      () => Logger.getInstance().debug(message),
+      () => undefined
+    );
+  }
 
-  let result: AstFileResult | null;
+  let raw: unknown;
   try {
-    result = await analyzer.analyzeFile(absPath);
+    raw = await resolvedPort.run();
   } catch (err: unknown) {
     // analyzer 抛错：保留错误类名与消息，由调用方写进诊断并记 warn，不再伪装成“不可用”。
     return {
@@ -1759,9 +1951,22 @@ async function buildAstOutline(
       errorMessage: errorMessage(err, String(err)),
     };
   }
-  if (!result || !Array.isArray(result.definitions) || result.definitions.length === 0) {
+  const normalized = normalizeOutlineDefinitions(raw);
+  if (normalized && normalized.dropped > 0) {
+    // 宿主适配器给出了不合格条目：属于宿主侧缺陷，记 warn 并带计数，合格条目照常展示。
+    const message =
+      `[code.outline] path=${relPath}; port=${resolvedPort.port} dropped=${normalized.dropped} of ` +
+      `${normalized.dropped + normalized.definitions.length} malformed definitions ` +
+      '(need non-empty name/kind and a positive integer startLine)';
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+  }
+  if (!normalized || normalized.definitions.length === 0) {
     return { kind: 'unavailable', reason: 'no-definitions' };
   }
+  const definitions = normalized.definitions;
 
   let lineCount = knownLineCount;
   if (lineCount === undefined) {
@@ -1782,10 +1987,32 @@ async function buildAstOutline(
     lineCount === undefined
       ? `// ${lang}, Tree-sitter AST`
       : `// ${lineCount} lines, ${lang}, Tree-sitter AST`,
-    '',
   ];
 
-  for (const def of result.definitions) {
+  const shown = filter
+    ? definitions.filter((def) => matchesOutlineFilter(def, filter))
+    : definitions;
+  if (filter) {
+    // 过滤生效时在头部写明条件与“显示 x / 共 y”，模型不会把过滤结果误当成文件的全部声明。
+    outlineLines.push(
+      `// filter ${outlineFilterLabel(filter)}: showing ${shown.length} of ${definitions.length} definitions`
+    );
+  }
+  outlineLines.push('');
+
+  if (shown.length === 0) {
+    const message = `[code.outline] path=${relPath}; filter ${outlineFilterLabel(filter ?? {})} matched 0 of ${definitions.length} definitions; returning an explained empty outline`;
+    observeSafely(
+      () => Logger.getInstance().debug(message),
+      () => undefined
+    );
+    outlineLines.push(
+      `(No definitions match the filter. Remove or widen kinds/maxDepth to see the other ${definitions.length} definitions.)`
+    );
+    return { kind: 'outline', text: outlineLines.join('\n') };
+  }
+
+  for (const def of shown) {
     const indent = '  '.repeat(def.depth ?? 0);
     const lineRange = def.endLine ? `[${def.startLine}-${def.endLine}]` : `[${def.startLine}]`;
     const signature = def.signature ?? def.name;
@@ -1793,17 +2020,6 @@ async function buildAstOutline(
   }
 
   return { kind: 'outline', text: outlineLines.join('\n') };
-}
-
-interface AstFileResult {
-  definitions: Array<{
-    name: string;
-    kind: string;
-    startLine: number;
-    endLine?: number;
-    signature?: string;
-    depth?: number;
-  }>;
 }
 
 /* ================================================================== */
