@@ -832,7 +832,172 @@ describe('coordination public contracts', () => {
       },
     });
   });
+
+  it.each([
+    {
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
+      params: { dimensions: [{ id: 'a' }, { dimId: 'a' }] },
+      unitId: 'a',
+    },
+    {
+      partitioner: 'projectContextModules',
+      merge: 'moduleMiningResults',
+      params: { modules: [{ moduleId: 'utils' }, { modulePath: 'utils' }] },
+      unitId: 'utils',
+    },
+  ])('rejects duplicate fan-out unit ids from $partitioner before any child runs', async (fixture) => {
+    const input = baseRunInput([]);
+    input.params = fixture.params;
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    await expect(
+      new AgentRunCoordinator().run(
+        input,
+        parallelCoordinationProfile(2, fixture.partitioner, fixture.merge),
+        runChild
+      )
+    ).rejects.toThrow(`duplicate fan-out unit id: ${fixture.unitId}`);
+    expect(runChild).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
+      params: { dimensions: [{ id: 'a' }, { id: 'b' }] },
+    },
+    {
+      partitioner: 'projectContextModules',
+      merge: 'moduleMiningResults',
+      params: { modules: [{ moduleId: 'a' }, { moduleId: 'b' }] },
+    },
+  ])('does not hand parent coordination hooks to $partitioner children', async (fixture) => {
+    const input = baseRunInput([]);
+    input.params = fixture.params;
+    const parentCallbacks: string[] = [];
+    const childOnChildResult = vi.fn();
+    input.context.coordination = {
+      onChildResult: ({ childInput }) => {
+        parentCallbacks.push(String(childInput.params?.dimId ?? childInput.params?.moduleId));
+      },
+    };
+    // 宿主按单元提供的专属 context 也不能把 coordination 回调塞给 child。
+    input.context.childContexts = {
+      a: { coordination: { onChildResult: childOnChildResult } },
+    };
+    const childContexts: AgentRunInput['context'][] = [];
+    await new AgentRunCoordinator().run(
+      input,
+      parallelCoordinationProfile(1, fixture.partitioner, fixture.merge),
+      async (child) => {
+        childContexts.push(child.context);
+        return childResult(child);
+      }
+    );
+    expect(childContexts).toHaveLength(2);
+    for (const context of childContexts) {
+      expect(context.coordination).toBeUndefined();
+      expect(Object.hasOwn(context, 'coordination')).toBe(false);
+    }
+    expect(childOnChildResult).not.toHaveBeenCalled();
+    expect(parentCallbacks).toEqual(['a', 'b']);
+  });
+
+  it.each([
+    { merge: 'generateSessionResults', idKey: 'dimId', resultsKey: 'dimensionResults' },
+    { merge: 'moduleMiningResults', idKey: 'moduleId', resultsKey: 'moduleResults' },
+  ])('keys $merge results by the partitioned child unit id', async (fixture) => {
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      context: { source: 'internal' },
+    };
+    const children = ['x', 'y'].map(
+      (unitId): AgentRunInput => ({
+        ...input,
+        params: { [fixture.idKey]: unitId },
+      })
+    );
+    const coordinator = new AgentRunCoordinator().registerPartitioner('explicit', () => children);
+    const result = await coordinator.run(
+      input,
+      parallelCoordinationProfile(1, 'explicit', fixture.merge),
+      async (child) => {
+        const unitId = String(child.params?.[fixture.idKey]);
+        return {
+          ...childResult(child),
+          runId: `${unitId}:run`,
+          phases:
+            unitId === 'y'
+              ? {
+                  _pipelineOutcome: {
+                    outcome: 'abandoned',
+                    stage: 'quality_gate',
+                    action: 'degrade',
+                    reason: 'weak evidence',
+                  },
+                }
+              : {},
+        };
+      }
+    );
+    const phases = result?.phases as Record<string, unknown>;
+    expect(Object.keys(phases[fixture.resultsKey] as Record<string, unknown>)).toEqual(['x', 'y']);
+    expect(phases[fixture.resultsKey]).toMatchObject({
+      x: { runId: 'x:run' },
+      y: { runId: 'y:run' },
+    });
+    const abandonedKey =
+      fixture.resultsKey === 'dimensionResults' ? 'abandonedDimensions' : 'abandonedModules';
+    expect(phases[abandonedKey]).toEqual([
+      { unitId: 'y', stage: 'quality_gate', action: 'degrade', reason: 'weak evidence' },
+    ]);
+  });
+
+  it('aggregates abandoned bootstrap dimensions into the parent result', async () => {
+    const result = await new AgentRunCoordinator().run(
+      baseRunInput([
+        { id: 'a', tier: 0 },
+        { id: 'b', tier: 0 },
+      ]),
+      coordinationProfile(),
+      async (child) => ({
+        ...childResult(child),
+        phases:
+          child.params?.dimId === 'b'
+            ? {
+                _pipelineOutcome: {
+                  outcome: 'abandoned',
+                  stage: 'quality_gate',
+                  action: 'degrade',
+                  reason: 'weak evidence',
+                },
+              }
+            : {},
+      })
+    );
+    expect(result?.phases?.abandonedDimensions).toEqual([
+      { unitId: 'b', stage: 'quality_gate', action: 'degrade', reason: 'weak evidence' },
+    ]);
+  });
 });
+
+function parallelCoordinationProfile(
+  concurrency: number,
+  partitioner = 'generateSessionDimensions',
+  merge = 'generateSessionResults'
+): CompiledAgentProfile {
+  return {
+    ...coordinationProfile(),
+    concurrency: {
+      mode: 'parallel',
+      concurrency,
+      partitioner,
+      merge,
+      childProfile: 'child-profile',
+    },
+  };
+}
 
 function coordinationLatch<T>() {
   return Promise.withResolvers<T>();
@@ -986,6 +1151,313 @@ describe('coordination asynchronous admission', () => {
       { tool: 'knowledge', result: { id: 'confirmed-1' } },
       { tool: 'knowledge', result: { id: 'confirmed-2' } },
     ]);
+  });
+
+  it('resolves a lazy child input factory only when that child executes', async () => {
+    const input = baseRunInput([
+      { id: 'overview', tier: 0 },
+      { id: 'api', tier: 1 },
+    ]);
+    const factory = vi.fn(({ plannedInput }: { plannedInput: AgentRunInput }) => ({
+      ...plannedInput,
+      context: {
+        ...plannedInput.context,
+        promptContext: { ...(plannedInput.context.promptContext || {}), createdLazily: true },
+      },
+    }));
+    input.context.childInputFactories = { overview: factory };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const run = new AgentRunCoordinator().run(input, coordinationProfile(), runChild);
+    // 分区阶段只产出计划输入，工厂必须等到该 child 真正拿到额度开工时才调用。
+    expect(factory).not.toHaveBeenCalled();
+    await run;
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(factory.mock.calls[0][0].plannedInput.params?.dimId).toBe('overview');
+    expect(runChild.mock.calls[0][0].context.promptContext).toMatchObject({ createdLazily: true });
+    expect(runChild.mock.calls[1][0].context.promptContext).not.toHaveProperty('createdLazily');
+  });
+
+  it('records an aborted child when cancellation is requested while its factory runs', async () => {
+    const input = baseRunInput([{ id: 'overview', tier: 0 }]);
+    let lazyResolved = false;
+    input.execution = { shouldAbort: () => lazyResolved };
+    input.context.childInputFactories = {
+      overview: ({ plannedInput }) => {
+        lazyResolved = true;
+        return plannedInput;
+      },
+    };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const result = await new AgentRunCoordinator().run(input, coordinationProfile(), runChild);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(result?.status).toBe('aborted');
+    expect(result?.phases?.dimensionResults).toEqual({
+      overview: expect.objectContaining({ runId: 'overview:aborted', status: 'aborted' }),
+    });
+  });
+
+  it('converts a throwing child input factory into that child error result', async () => {
+    const input = baseRunInput([{ id: 'overview', tier: 0 }]);
+    const events: string[] = [];
+    input.context.childInputFactories = {
+      overview: () => {
+        throw new Error('scope failed');
+      },
+    };
+    input.context.coordination = {
+      onChildResult: ({ childInput, result }) => {
+        events.push(`${childInput.params?.dimId}:${result.status}:${result.reply}`);
+      },
+    };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const result = await new AgentRunCoordinator().run(input, coordinationProfile(), runChild);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(events).toEqual(['overview:error:scope failed']);
+    expect(result).toMatchObject({
+      status: 'error',
+      phases: { dimensionResults: { overview: { status: 'error', reply: 'scope failed' } } },
+    });
+  });
+
+  it('calls the next lazy factory only after the previous child settles at concurrency 1', async () => {
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    const events: string[] = [];
+    input.context.childInputFactories = Object.fromEntries(
+      ['a', 'b', 'c'].map((dimId) => [
+        dimId,
+        ({ plannedInput }: { plannedInput: AgentRunInput }) => {
+          events.push(`factory:${dimId}`);
+          return plannedInput;
+        },
+      ])
+    );
+    input.context.coordination = {
+      onChildResult: ({ childInput }) => {
+        events.push(`settled:${childInput.params?.dimId}`);
+      },
+    };
+    await new AgentRunCoordinator().run(input, parallelCoordinationProfile(1), async (child) => {
+      const dimId = String(child.params?.dimId);
+      events.push(`run:${dimId}:start`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      events.push(`run:${dimId}:end`);
+      return childResult(child);
+    });
+    expect(events).toEqual(
+      ['a', 'b', 'c'].flatMap((dimId) => [
+        `factory:${dimId}`,
+        `run:${dimId}:start`,
+        `run:${dimId}:end`,
+        `settled:${dimId}`,
+      ])
+    );
+  });
+
+  it('settles a malformed factory product as that child error after siblings settle', async () => {
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }]);
+    const releaseSibling = coordinationLatch<void>();
+    const events: string[] = [];
+    input.context.childInputFactories = {
+      // 模拟违反 AgentChildInputFactory 类型的 JS 宿主：产物缺 message 与 context。
+      a: () => ({ profile: { id: 'c' } }) as unknown as AgentRunInput,
+    };
+    input.context.coordination = {
+      onChildResult: ({ childInput, result }) => {
+        events.push(`cb:${childInput.params?.dimId}:${result.status}`);
+      },
+    };
+    const ran: string[] = [];
+    const settled = new AgentRunCoordinator()
+      .run(input, parallelCoordinationProfile(2), async (child) => {
+        // 与 AgentService.validateRunInput 一致：缺 message.content 时 child run 抛错。
+        if (!child.message?.content) {
+          throw new Error('AgentRunInput.message.content is required');
+        }
+        const dimId = String(child.params?.dimId);
+        ran.push(dimId);
+        if (dimId === 'b') {
+          await releaseSibling.promise;
+          events.push('b-finished');
+        }
+        return childResult(child);
+      })
+      .then(
+        (value) => {
+          events.push('settled');
+          return { value, error: undefined };
+        },
+        (error: unknown) => {
+          events.push('rejected');
+          return { value: undefined, error };
+        }
+      );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseSibling.resolve();
+    const outcome = await settled;
+    expect(outcome.error).toBeUndefined();
+    expect(events).toEqual(['cb:a:error', 'b-finished', 'cb:b:success', 'settled']);
+    expect(ran).toEqual(['b']);
+    expect(outcome.value).toMatchObject({
+      status: 'error',
+      phases: {
+        dimensionResults: {
+          a: {
+            runId: 'a:error',
+            status: 'error',
+            reply: expect.stringContaining('childInputFactories[a] returned invalid AgentRunInput'),
+          },
+          b: { status: 'success' },
+        },
+      },
+    });
+  });
+
+  it.each([
+    'error',
+    'aborted',
+  ] as const)('derives the %s receipt identity from the planned child, not the factory product', async (status) => {
+    const input = baseRunInput([{ id: 'a' }]);
+    let lazyResolved = false;
+    input.execution = { shouldAbort: () => status === 'aborted' && lazyResolved };
+    input.context.childInputFactories = {
+      a: ({ plannedInput }) => {
+        lazyResolved = true;
+        return {
+          ...plannedInput,
+          profile: { id: 'renamed-profile' },
+          params: { ...plannedInput.params, dimId: 'renamed' },
+          message: {
+            ...plannedInput.message,
+            metadata: { ...plannedInput.message.metadata, dimension: 'renamed' },
+          },
+        };
+      },
+    };
+    const result = await new AgentRunCoordinator().run(
+      input,
+      parallelCoordinationProfile(1),
+      async () => {
+        throw new Error('child exploded');
+      }
+    );
+    expect(result?.status).toBe(status);
+    expect(result?.phases?.dimensionResults).toEqual({
+      a: expect.objectContaining({
+        runId: `a:${status}`,
+        profileId: 'child-profile',
+        status,
+        phases: expect.objectContaining({ dimId: 'a' }),
+      }),
+    });
+  });
+
+  it('reports an unreadable custom-partitioner child as a coordination failure, not a raw TypeError', async () => {
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      context: { source: 'internal' },
+    };
+    // 自定义 partitioner 产出缺 message 的 child：读取 dimId/tier 的辅助函数都会抛 TypeError。
+    const malformed = { profile: { id: 'child' }, context: { source: 'internal' } };
+    const coordinator = new AgentRunCoordinator().registerPartitioner(
+      'malformed',
+      () => [{ ...input, params: { dimId: 'normal' } }, malformed] as AgentRunInput[]
+    );
+    const profile = {
+      id: 'parent',
+      concurrency: { mode: 'parallel', concurrency: 2, partitioner: 'malformed' },
+    } as CompiledAgentProfile;
+    const error = await coordinator
+      .run(input, profile, async (child) => childResult(child))
+      .then(
+        () => null,
+        (err: unknown) => err
+      );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: expect.stringContaining('Agent coordination consumption failed'),
+      coordinationFailures: [expect.objectContaining({ hook: 'runOneChild' })],
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ status: expect.any(String) }),
+            expect.objectContaining({ runId: 'child:error', status: 'error' }),
+          ],
+        },
+      },
+    });
+  });
+
+  it('settles every started sibling before rejecting on an unexpected child settlement error', async () => {
+    const input: AgentRunInput = {
+      profile: { id: 'parent' },
+      message: { content: 'review' },
+      context: { source: 'internal' },
+    };
+    const normal: AgentRunInput = { ...input, params: { dimId: 'normal' } };
+    // 模拟派发之后才出现的意外异常：normal 开跑后，hostile 的 params 变得不可读，
+    // 让 hostile 在 error 降级的日志定位处抛出 settleChild 之外的异常。
+    let armed = false;
+    const hostile: AgentRunInput = { ...input };
+    Object.defineProperty(hostile, 'params', {
+      enumerable: true,
+      get() {
+        if (armed) {
+          throw new Error('hostile params');
+        }
+        return { dimId: 'hostile' };
+      },
+    });
+    const normalStarted = coordinationLatch<void>();
+    const releaseSibling = coordinationLatch<void>();
+    const events: string[] = [];
+    const coordinator = new AgentRunCoordinator().registerPartitioner('hostile', () => [
+      normal,
+      hostile,
+    ]);
+    const profile = {
+      id: 'parent',
+      concurrency: { mode: 'parallel', concurrency: 2, partitioner: 'hostile' },
+    } as CompiledAgentProfile;
+    const settled = coordinator
+      .run(input, profile, async (child) => {
+        if (child === normal) {
+          armed = true;
+          normalStarted.resolve();
+          await releaseSibling.promise;
+          events.push('normal-finished');
+          return childResult(child);
+        }
+        await normalStarted.promise;
+        throw new Error('hostile run failed');
+      })
+      .then(
+        () => ({ error: undefined }),
+        (error: unknown) => {
+          events.push('rejected');
+          return { error };
+        }
+      );
+    await normalStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseSibling.resolve();
+    const outcome = await settled;
+    expect(events).toEqual(['normal-finished', 'rejected']);
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(outcome.error).toMatchObject({
+      message: expect.stringContaining('Agent coordination consumption failed: hostile params'),
+      coordinationFailures: [expect.objectContaining({ hook: 'runOneChild' })],
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ status: 'success' }),
+            expect.objectContaining({ status: 'error', reply: 'hostile params' }),
+          ],
+        },
+      },
+    });
   });
 });
 

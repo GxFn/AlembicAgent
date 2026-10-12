@@ -13,12 +13,20 @@ import type {
 
 type ChildRunner = (input: AgentRunInput) => Promise<AgentRunResult>;
 type Partitioner = (input: AgentRunInput, profile: CompiledAgentProfile) => AgentRunInput[];
+/**
+ * childInputs 是 partitioner 的计划产物（与 results 按下标一一对应），是单元 id 的唯一来源：
+ * 内置 merger 直接读 childInput.params.dimId/moduleId 作为结果键，不再从父 params 重新推导一份。
+ * Merger 不是公开导出类型；只接收前三个参数的已注册 merger 仍然兼容。
+ */
 type Merger = (
   results: AgentRunResult[],
   input: AgentRunInput,
-  profile: CompiledAgentProfile
+  profile: CompiledAgentProfile,
+  childInputs: AgentRunInput[]
 ) => AgentRunResult;
 type ChildRunRecord = { childInput: AgentRunInput; result: AgentRunResult };
+/** 回执身份（dimId/profileId）只从 partitioner 的计划输入推导，不信任懒构造工厂的产物。 */
+type ChildReceiptIdentity = { dimId?: string; profileId: string };
 
 /**
  * 停止事实的来源。tier 整批取消与 child 跳过都要带上它，宿主才能区分：
@@ -95,7 +103,9 @@ export class AgentRunCoordinator {
       profile
     );
 
-    return merger ? merger(childResults, input, profile) : defaultMerge(childResults, profile);
+    return merger
+      ? merger(childResults, input, profile, childInputs)
+      : defaultMerge(childResults, profile);
   }
 }
 
@@ -212,48 +222,51 @@ async function runChildren(
       { profileId: profile.id, ...child, reason }
     );
   };
-  const runOneChild = async (
+  const settleChild = async (
     index: number,
     forcedStop?: CoordinationStopReason
   ): Promise<ChildRunRecord> => {
     const planned = childInputs[index];
+    // 身份、日志定位与 error/aborted 回执一律从计划输入推导：工厂产物可能畸形或改写 dimId，
+    // 用它推导会让回执键与 merger/宿主回调的单元 id 对不上，畸形时还会在 catch 里二次抛 TypeError。
+    const identity = plannedChildIdentity(planned);
     let childInput = planned;
     let result: AgentRunResult;
     let started = false;
     // 回调可能保存检查点，失败后不能重试它或继续派发尚未开始的子任务。
     if (forcedStop || failures.length > 0) {
-      result = createChildAbortedResult(childInput);
-      logChildSkipped(childInput, index, forcedStop ?? 'prior-failure');
+      result = createChildAbortedResult(identity);
+      logChildSkipped(planned, index, forcedStop ?? 'prior-failure');
     } else {
       try {
         const preStop =
           (await resolveAbortReason(parentInput)) ?? (failures.length > 0 ? 'prior-failure' : null);
         if (preStop) {
-          result = createChildAbortedResult(childInput);
-          logChildSkipped(childInput, index, preStop);
+          result = createChildAbortedResult(identity);
+          logChildSkipped(planned, index, preStop);
         } else {
-          childInput = await resolveLazyChildInput(planned, parentInput);
+          childInput = await resolveLazyChildInput(identity.dimId, planned, parentInput);
           // shouldAbort/懒构造均可挂起；恢复后必须重新读取停止事实，不能用 await 前的值。
           const stop =
             (await resolveAbortReason(parentInput)) ??
             (failures.length > 0 ? 'prior-failure' : null);
           if (stop) {
-            result = createChildAbortedResult(childInput);
-            logChildSkipped(childInput, index, stop);
+            result = createChildAbortedResult(identity);
+            logChildSkipped(planned, index, stop);
           } else {
             started = true;
             result = await runChild(childInput);
           }
         }
       } catch (err: unknown) {
-        result = createChildErrorResult(childInput, err);
-        // pre-dispatch：取消探针或懒构造抛错，child 从未运行；run：child 执行本身抛错。两者都降级为 error 结果。
+        result = createChildErrorResult(identity, err);
+        // pre-dispatch：取消探针或懒构造抛错（含工厂产物校验失败），child 从未运行；run：child 执行本身抛错。两者都降级为 error 结果。
         logCoordination(
           'warn',
-          `child degraded to error result profile=${profile.id} child=${resolveChildLogId(childInput, index)} stage=${started ? 'run' : 'pre-dispatch'}`,
+          `child degraded to error result profile=${profile.id} child=${resolveChildLogId(planned, index)} stage=${started ? 'run' : 'pre-dispatch'}`,
           {
             profileId: profile.id,
-            ...describeChild(childInput, index),
+            ...describeChild(planned, index),
             stage: started ? 'run' : 'pre-dispatch',
             error: err instanceof Error ? err.message : String(err),
           }
@@ -269,24 +282,51 @@ async function runChildren(
         fail(
           'onChildResult',
           err,
-          { childId: resolveDimensionId(childInput) || undefined },
-          describeChild(childInput, index)
+          { childId: identity.dimId || undefined },
+          describeChild(planned, index)
         );
       }
     } else if (parentInput.context.coordination?.onChildResult) {
       // 已有失败且该 child 未启动：不再通知宿主（避免在失败后继续写检查点），但要留下跳过痕迹。
       logCoordination(
         'warn',
-        `coordination hook skipped profile=${profile.id} hook=onChildResult child=${resolveChildLogId(childInput, index)} reason=prior-failure`,
+        `coordination hook skipped profile=${profile.id} hook=onChildResult child=${resolveChildLogId(planned, index)} reason=prior-failure`,
         {
           profileId: profile.id,
           hook: 'onChildResult',
-          ...describeChild(childInput, index),
+          ...describeChild(planned, index),
           reason: 'prior-failure',
         }
       );
     }
     return record;
+  };
+  /**
+   * runOneChild 永不 reject：Promise.all 一旦因某个 child 早退，父 run 会先于仍在运行的兄弟 child settle，
+   * 兄弟随后才写检查点（宿主此时已进入失败收口）。settleChild 之外的意外异常（如自定义 partitioner
+   * 产出无法读取的输入）记为 runOneChild 协调失败：后续未开工的 child 按 prior-failure 跳过，
+   * 父 run 在全部已开工 child 结算后抛带 partialResult 的协调错误。
+   */
+  const runOneChild = async (
+    index: number,
+    forcedStop?: CoordinationStopReason
+  ): Promise<ChildRunRecord> => {
+    try {
+      return await settleChild(index, forcedStop);
+    } catch (err: unknown) {
+      fail('runOneChild', err, {}, { childIndex: index });
+      const existing = records[index];
+      if (existing) {
+        return existing;
+      }
+      // 计划输入本身不可读，回执身份不能再从它推导，只能给出不带 dimId 的兜底 error 回执。
+      const record = {
+        childInput: childInputs[index],
+        result: createChildErrorResult({ profileId: 'unknown' }, err),
+      };
+      records[index] = record;
+      return record;
+    }
   };
   for (const [tierIndex, tier] of tiers.entries()) {
     if (tiered) {
@@ -475,12 +515,18 @@ function countStatuses(results: AgentRunResult[]) {
   return counts;
 }
 
-function createChildErrorResult(input: AgentRunInput, err: unknown): AgentRunResult {
+function plannedChildIdentity(planned: AgentRunInput): ChildReceiptIdentity {
+  return { dimId: resolveDimensionId(planned), profileId: profileIdForResult(planned) };
+}
+
+function createChildErrorResult(
+  { dimId, profileId }: ChildReceiptIdentity,
+  err: unknown
+): AgentRunResult {
   const message = err instanceof Error ? err.message : String(err);
-  const dimId = resolveDimensionId(input);
   return {
     runId: `${dimId || 'child'}:error`,
-    profileId: profileIdForResult(input),
+    profileId,
     reply: message,
     status: 'error',
     phases: {
@@ -498,11 +544,10 @@ function createChildErrorResult(input: AgentRunInput, err: unknown): AgentRunRes
   };
 }
 
-function createChildAbortedResult(input: AgentRunInput): AgentRunResult {
-  const dimId = resolveDimensionId(input);
+function createChildAbortedResult({ dimId, profileId }: ChildReceiptIdentity): AgentRunResult {
   return {
     runId: `${dimId || 'child'}:aborted`,
-    profileId: profileIdForResult(input),
+    profileId,
     reply: 'child-run-aborted',
     status: 'aborted',
     phases: {
@@ -533,13 +578,49 @@ function profileIdForResult(input: AgentRunInput) {
   return 'unknown';
 }
 
-async function resolveLazyChildInput(plannedInput: AgentRunInput, parentInput: AgentRunInput) {
-  const dimId = resolveDimensionId(plannedInput);
-  const factory = dimId ? parentInput.context.childInputFactories?.[dimId] : undefined;
+async function resolveLazyChildInput(
+  dimId: string | undefined,
+  plannedInput: AgentRunInput,
+  parentInput: AgentRunInput
+) {
+  const factories = parentInput.context.childInputFactories;
+  // 只认宿主自有键：dimId 为 'constructor'/'toString' 时不能误取到 Object.prototype 上的函数当工厂。
+  const factory =
+    dimId && factories && Object.hasOwn(factories, dimId) ? factories[dimId] : undefined;
   if (!factory) {
     return plannedInput;
   }
-  return factory({ plannedInput, parentInput });
+  if (typeof factory !== 'function') {
+    throw new Error(`childInputFactories[${dimId}] is not a function`);
+  }
+  const produced = await factory({ plannedInput, parentInput });
+  // 工厂产物是宿主输入，进入执行前先校验（与 AgentService.validateRunInput 的必填项对齐）。
+  // 不合格时抛错落入 runOneChild 的 catch，成为该 child 的 error 回执，而不是带着畸形输入去执行。
+  const missing = describeMissingRunInputFields(produced);
+  if (missing.length > 0) {
+    throw new Error(
+      `childInputFactories[${dimId}] returned invalid AgentRunInput: missing ${missing.join(', ')}`
+    );
+  }
+  return produced;
+}
+
+/** 返回 AgentRunInput 缺失的必填项；参数按 unknown 处理，因为 JS 宿主可以绕过类型约束。 */
+function describeMissingRunInputFields(value: unknown): string[] {
+  if (!isRecord(value)) {
+    return ['input object'];
+  }
+  const missing: string[] = [];
+  if (!isRecord(value.profile)) {
+    missing.push('profile');
+  }
+  if (!isRecord(value.message) || !stringValue(value.message.content)) {
+    missing.push('message.content');
+  }
+  if (!isRecord(value.context) || !stringValue(value.context.source)) {
+    missing.push('context.source');
+  }
+  return missing;
 }
 
 function resolveConcurrency(
@@ -638,9 +719,14 @@ function partitionBootstrapSessionDimensions(
   const dimensions = Array.isArray(input.params?.dimensions) ? input.params.dimensions : [];
   const baseParams = omitKeys(input.params || {}, ['dimensions', 'children']);
   const childProfileId = profile.concurrency?.childProfile || 'generate-dimension';
-  return dimensions.map((rawDimension, index) => {
-    const dimension = toRecord(rawDimension);
-    const dimId = stringValue(dimension.dimId) || stringValue(dimension.id) || `dimension-${index}`;
+  const dimensionRecords = dimensions.map((rawDimension) => toRecord(rawDimension));
+  const unitIds = dimensionRecords.map(
+    (dimension, index) =>
+      stringValue(dimension.dimId) || stringValue(dimension.id) || `dimension-${index}`
+  );
+  assertUniqueFanOutUnitIds('generateSessionDimensions', unitIds, profile);
+  return dimensionRecords.map((dimension, index) => {
+    const dimId = unitIds[index];
     const label = stringValue(dimension.label) || dimId;
     const childContext = input.context.childContexts?.[dimId] || {};
     const childMessage = toRecord(dimension.message);
@@ -684,6 +770,9 @@ function partitionBootstrapSessionDimensions(
         ...childContext,
         childContexts: undefined,
         childInputFactories: undefined,
+        // coordination 回调只属于父级协调层（宿主用它写父 run 的检查点）；child 若再 fan-out，
+        // 孙级结算会以孙级 id 调用父级回调，造成错写或重复写，所以 child context 一律不继承。
+        coordination: undefined,
         promptContext,
       }) as unknown as AgentRunContext,
       execution: input.execution,
@@ -717,14 +806,18 @@ function partitionProjectIndexScopedModules(
     'dimId',
   ]);
   const childProfileId = profile.concurrency?.childProfile || 'module-mining-dimension';
-  return modules.map((rawModule, index) => {
-    const moduleRecord = toRecord(rawModule);
-    const moduleId =
+  const moduleRecords = modules.map((rawModule) => toRecord(rawModule));
+  const unitIds = moduleRecords.map(
+    (moduleRecord, index) =>
       stringValue(moduleRecord.moduleId) ||
       stringValue(moduleRecord.id) ||
       stringValue(moduleRecord.modulePath) ||
       stringValue(moduleRecord.path) ||
-      `module-${index}`;
+      `module-${index}`
+  );
+  assertUniqueFanOutUnitIds('projectContextModules', unitIds, profile);
+  return moduleRecords.map((moduleRecord, index) => {
+    const moduleId = unitIds[index];
     const moduleName =
       stringValue(moduleRecord.moduleName) ||
       stringValue(moduleRecord.name) ||
@@ -808,6 +901,8 @@ function partitionProjectIndexScopedModules(
         ...childContext,
         childContexts: undefined,
         childInputFactories: undefined,
+        // 同 bootstrap 分区：父级 coordination 回调不下发给 child，避免嵌套 fan-out 时孙级写父级检查点。
+        coordination: undefined,
         promptContext,
         strategyContext,
       }) as unknown as AgentRunContext,
@@ -815,6 +910,57 @@ function partitionProjectIndexScopedModules(
       presentation: input.presentation,
     };
   });
+}
+
+/**
+ * 单元 id 是 fan-out 的主键：childContexts/childInputFactories 按它取值，merger 按它建
+ * dimensionResults/moduleResults，宿主 onChildResult 按它写检查点。重复 id 会让 Object.fromEntries
+ * 后写覆盖前写，失败单元从宿主 failedDimensionIds 中消失，两个 child 还会共享同一份专属 context 与工厂。
+ * 因此在派发任何 child 之前直接拒绝；不自动加后缀，因为后缀 id 宿主无法按原 id 回读。
+ */
+function assertUniqueFanOutUnitIds(
+  partitioner: string,
+  unitIds: string[],
+  profile: CompiledAgentProfile
+) {
+  const firstIndexById = new Map<string, number>();
+  for (const [index, unitId] of unitIds.entries()) {
+    const firstIndex = firstIndexById.get(unitId);
+    if (firstIndex === undefined) {
+      firstIndexById.set(unitId, index);
+      continue;
+    }
+    logCoordination(
+      'warn',
+      `fan-out rejected profile=${profile.id} partitioner=${partitioner} reason=duplicate-unit-id`,
+      {
+        profileId: profile.id,
+        partitioner,
+        reason: 'duplicate-unit-id',
+        unitId,
+        firstIndex,
+        duplicateIndex: index,
+        unitCount: unitIds.length,
+      }
+    );
+    throw new Error(
+      `duplicate fan-out unit id: ${unitId} (${partitioner} entries ${firstIndex} and ${index})`
+    );
+  }
+}
+
+/**
+ * merger 的结果键直接读 partitioner 写进 childInput.params 的单元 id（单一来源）；
+ * 自定义 partitioner 未写该键时退回按下标命名，与旧的缺省命名一致。
+ */
+function readFanOutUnitIds(
+  childInputs: AgentRunInput[],
+  key: 'dimId' | 'moduleId',
+  fallbackPrefix: 'dimension' | 'module'
+) {
+  return childInputs.map(
+    (childInput, index) => stringValue(childInput.params?.[key]) || `${fallbackPrefix}-${index}`
+  );
 }
 
 /**
@@ -846,14 +992,11 @@ function collectAbandonedUnits(
 
 function mergeBootstrapSessionResults(
   results: AgentRunResult[],
-  input: AgentRunInput,
-  profile: CompiledAgentProfile
+  _input: AgentRunInput,
+  profile: CompiledAgentProfile,
+  childInputs: AgentRunInput[]
 ): AgentRunResult {
-  const dimensions = Array.isArray(input.params?.dimensions) ? input.params.dimensions : [];
-  const dimensionIds = dimensions.map((dimension, index) => {
-    const record = toRecord(dimension);
-    return stringValue(record.dimId) || stringValue(record.id) || `dimension-${index}`;
-  });
+  const dimensionIds = readFanOutUnitIds(childInputs, 'dimId', 'dimension');
   const abandonedDimensions = collectAbandonedUnits(results, dimensionIds);
   return {
     ...defaultMerge(results, profile),
@@ -869,20 +1012,11 @@ function mergeBootstrapSessionResults(
 
 function mergeProjectIndexScopedModuleResults(
   results: AgentRunResult[],
-  input: AgentRunInput,
-  profile: CompiledAgentProfile
+  _input: AgentRunInput,
+  profile: CompiledAgentProfile,
+  childInputs: AgentRunInput[]
 ): AgentRunResult {
-  const modules = Array.isArray(input.params?.modules) ? input.params.modules : [];
-  const moduleIds = modules.map((moduleInput, index) => {
-    const moduleRecord = toRecord(moduleInput);
-    return (
-      stringValue(moduleRecord.moduleId) ||
-      stringValue(moduleRecord.id) ||
-      stringValue(moduleRecord.modulePath) ||
-      stringValue(moduleRecord.path) ||
-      `module-${index}`
-    );
-  });
+  const moduleIds = readFanOutUnitIds(childInputs, 'moduleId', 'module');
   const abandonedModules = collectAbandonedUnits(results, moduleIds);
   return {
     ...defaultMerge(results, profile),
