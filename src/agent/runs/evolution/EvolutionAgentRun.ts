@@ -1,4 +1,5 @@
 import type { EvolutionCandidateReason } from '@alembic/core/evolution';
+import type { AuditHint, ExistingRecipeForEvolution } from '../../prompts/insightEvolver.js';
 import type { ToolCallEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentService } from '../../service/AgentService.js';
 import {
@@ -16,18 +17,17 @@ export interface EvolutionAuditRecipe {
   trigger: string;
   content?: { markdown?: string; rationale?: string; coreCode?: string };
   sourceRefs?: string[];
-  auditHint?: {
-    relevanceScore: number;
-    verdict: string;
-    evidence: {
-      triggerStillMatches: boolean;
-      symbolsAlive: number;
-      depsIntact: boolean;
-      codeFilesExist: number;
-    };
-    decayReasons: string[];
-  } | null;
-  /** diff-based 影响证据（增量 rescan 管线提供） */
+  /**
+   * 静态审计 hint，复用 Evolver 提示的 AuditHint：evidence.symbolsAlive / codeFilesExist 是计数
+   * （与 Core RelevanceAuditResult.evidence 同义），不是 0..1 比例。
+   */
+  auditHint?: AuditHint | null;
+  /**
+   * diff-based 影响证据（增量 rescan 管线提供，此时 auditHint 为 null）。
+   * 与 Core EvolutionAuditRecipe.impactEvidence 同形；buildEvolverPrompt 把它渲染为
+   * 「变更影响（仅供定位）」。ExistingRecipeForEvolution.impactEvidence 的 reason 放宽为 string，
+   * runEvolutionAudit 里的 satisfies 检查保证两份声明不再漂移。
+   */
   impactEvidence?: {
     reason: EvolutionCandidateReason;
     affectedFiles: string[];
@@ -80,7 +80,8 @@ export async function runEvolutionAudit({
   }
 
   const strategyContext = {
-    existingRecipes: recipes,
+    // 编译期对齐：审计输入必须能原样作为 Evolver 提示的 existingRecipes（含 impactEvidence）。
+    existingRecipes: recipes satisfies ExistingRecipeForEvolution[],
     dimensionId,
     dimensionLabel,
     projectOverview,

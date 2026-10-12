@@ -7,14 +7,25 @@ import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
+import { EVOLUTION_PRESET } from '../src/agent/profiles/presets/evolutionPreset.js';
 import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
-import { ANALYST_SYSTEM_PROMPT, buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
+import {
+  ANALYST_SYSTEM_PROMPT,
+  buildAnalystPrompt,
+  computeAnalystBudget,
+} from '../src/agent/prompts/insightAnalyst.js';
+import {
+  buildEvolverPrompt,
+  EVOLVER_SYSTEM_PROMPT,
+  type EvolutionContext,
+} from '../src/agent/prompts/insightEvolver.js';
 import {
   buildCodeContextSection,
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
 import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
+import type { EvolutionAuditRecipe } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
 import {
   AgentRuntime,
   buildLlmInputAssembly,
@@ -2636,5 +2647,266 @@ describe('tool visibility matches the gateway toolChoice=none contract (I13)', (
       requestedToolChoice: 'none',
       toolSchemasVisible: false,
     });
+  });
+});
+
+// C52：Evolver 提示必须按 Core 审计证据（计数）与增量 rescan 影响证据的真实语义渲染。
+function evolverContext(
+  existingRecipes: EvolutionContext['existingRecipes'],
+  extra: Record<string, unknown> = {}
+): EvolutionContext {
+  return {
+    existingRecipes,
+    dimensionId: 'architecture',
+    dimensionLabel: 'Architecture',
+    projectOverview: { primaryLang: 'typescript', fileCount: 12, modules: [] },
+    ...extra,
+  };
+}
+
+function auditCheckLine(prompt: string): string {
+  return prompt.split('\n').find((line) => line.includes('Trigger:')) ?? '';
+}
+
+describe('Evolver prompt renders Core audit counts and impact evidence (C52)', () => {
+  it('renders Core count evidence as counts instead of impossible percentages', () => {
+    const prompt = buildEvolverPrompt(
+      null,
+      null,
+      evolverContext([
+        {
+          id: 'recipe-decayed',
+          title: 'Decayed recipe',
+          trigger: '@decayed',
+          sourceRefs: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'],
+          auditHint: {
+            relevanceScore: 25,
+            verdict: 'decay',
+            // Core RelevanceAuditResult.evidence：activeCount=1、existCount=3，均为计数。
+            evidence: {
+              triggerStillMatches: true,
+              symbolsAlive: 1,
+              depsIntact: false,
+              codeFilesExist: 3,
+            },
+            decayReasons: ['SourceRef 1/4 active'],
+          },
+        },
+      ])
+    );
+
+    const line = auditCheckLine(prompt);
+    expect(line).toContain('Trigger: ✅');
+    expect(line).toContain('符号存活: 1');
+    expect(line).toContain('依赖: ❌');
+    expect(line).toContain('代码文件存在: 3/4');
+    expect(line).not.toContain('%');
+    expect(prompt).not.toContain('100%');
+    expect(prompt).not.toContain('300%');
+    expect(prompt).toContain('评分: 25/100 → decay');
+    expect(prompt).toContain('预检原因: SourceRef 1/4 active');
+  });
+
+  it('renders missing host evidence as unknown and records one diagnostic', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const prompt = buildEvolverPrompt(
+      null,
+      null,
+      evolverContext(
+        [
+          {
+            id: 'recipe-watch',
+            title: 'Watched recipe',
+            trigger: '@watch',
+            auditHint: {
+              relevanceScore: 60,
+              verdict: 'watch',
+              // 宿主在 auditEvidence 缺失时传入 {}（RescanContext 投影）。
+              evidence: {} as never,
+              decayReasons: [],
+            },
+          },
+        ],
+        { diagnostics }
+      )
+    );
+
+    const line = auditCheckLine(prompt);
+    expect(line).toContain('Trigger: 未知');
+    expect(line).toContain('符号存活: 未知');
+    expect(line).toContain('依赖: 未知');
+    expect(line).toContain('代码文件存在: 未知');
+    expect(line).not.toContain('❌');
+    expect(prompt).not.toContain('NaN');
+    const warnings = diagnostics
+      .toJSON()
+      .warnings.filter((warning) => warning.code === 'evolver_audit_evidence_unknown');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ stage: 'evolve' });
+    expect(warnings[0].message).toContain('recipe-watch');
+    expect(warnings[0].message).toContain('symbolsAlive');
+  });
+
+  it('renders incremental rescan impact evidence through the real evolution preset prompt', () => {
+    // 增量 rescan 的真实输入形状：auditHint=null，impactEvidence 由 Core toEvolutionAuditRecipe 填好。
+    const recipe: EvolutionAuditRecipe = {
+      id: 'recipe-impacted',
+      title: 'Impacted recipe',
+      trigger: '@impacted',
+      sourceRefs: ['src/keep.ts', 'src/gone-1.ts'],
+      auditHint: null,
+      impactEvidence: {
+        reason: 'source-deleted-partial',
+        affectedFiles: [
+          'src/gone-1.ts',
+          'src/gone-2.ts',
+          'src/gone-3.ts',
+          'src/gone-4.ts',
+          'src/gone-5.ts',
+          'src/gone-6.ts',
+          'src/gone-7.ts',
+        ],
+        impactScore: 0.7,
+        matchedTokens: ['ImpactTokenAlpha', 'ImpactTokenBeta'],
+      },
+    };
+    const build = EVOLUTION_PRESET.strategy.stages[0].promptBuilder;
+    if (!build) {
+      throw new Error('Evolver prompt builder missing');
+    }
+    const prompt = build({
+      existingRecipes: [recipe],
+      dimensionId: 'all',
+      dimensionLabel: '全量进化审计',
+      projectOverview: { primaryLang: 'typescript', fileCount: 12, modules: [] },
+    });
+
+    expect(prompt).toContain('变更影响（仅供定位');
+    expect(prompt).toContain('source-deleted-partial');
+    expect(prompt).toContain('0.70');
+    for (const file of recipe.impactEvidence?.affectedFiles.slice(0, 5) ?? []) {
+      expect(prompt).toContain(file);
+    }
+    expect(prompt).not.toContain('src/gone-6.ts');
+    expect(prompt).not.toContain('src/gone-7.ts');
+    expect(prompt).toContain('及其他 2 个受影响文件');
+    expect(prompt).toContain('ImpactTokenAlpha');
+    expect(prompt).toContain('ImpactTokenBeta');
+    expect(prompt).not.toContain('系统预检提示');
+    expect(EVOLVER_SYSTEM_PROMPT).toContain('impactEvidence');
+  });
+
+  it('omits the impact section when a recipe carries no impact evidence', () => {
+    const prompt = buildEvolverPrompt(
+      null,
+      null,
+      evolverContext([{ id: 'recipe-plain', title: 'Plain', trigger: '@plain' }])
+    );
+    expect(prompt).not.toContain('变更影响（仅供定位');
+  });
+
+  it('keeps valid impact fields and reports malformed ones instead of throwing', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const prompt = buildEvolverPrompt(
+      null,
+      null,
+      evolverContext(
+        [
+          {
+            id: 'recipe-partial-impact',
+            title: 'Partial impact',
+            trigger: '@partial',
+            // 外部输入可能不符合类型：affectedFiles 非数组、impactScore 非有限数。
+            impactEvidence: {
+              reason: 'source-missing',
+              affectedFiles: 'src/not-an-array.ts',
+              impactScore: Number.NaN,
+              matchedTokens: ['PartialToken', 42],
+            } as never,
+          },
+          {
+            id: 'recipe-garbage-impact',
+            title: 'Garbage impact',
+            trigger: '@garbage',
+            impactEvidence: 'not-an-object' as never,
+          },
+        ],
+        { diagnostics }
+      )
+    );
+
+    expect(prompt).toContain('source-missing');
+    expect(prompt).toContain('PartialToken');
+    expect(prompt).not.toContain('src/not-an-array.ts');
+    expect(prompt).not.toContain('NaN');
+    expect(prompt).not.toContain('not-an-object');
+    const warnings = diagnostics
+      .toJSON()
+      .warnings.filter((warning) => warning.code === 'evolver_impact_evidence_invalid');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain('recipe-partial-impact');
+    expect(warnings[0].message).toContain('affectedFiles');
+    expect(warnings[0].message).toContain('impactScore');
+    expect(warnings[0].message).toContain('recipe-garbage-impact');
+  });
+});
+
+// C35：Analyst 预算档位与 rescan 小节是影响提示的关键分支，锁定其公式与文案分叉。
+describe('Analyst budget tiers and rescan sections (C35)', () => {
+  it.each([
+    [0, 24],
+    [40, 24],
+    [70, 28],
+    [100, 32],
+    [150, 36],
+    [500, 40],
+  ])('scales the project-tier budget for %i files to %i iterations', (fileCount, iterations) => {
+    const budget = computeAnalystBudget(fileCount, 20_000);
+    const perRoundInput = Math.ceil(20_000 * 0.6);
+    expect(budget).toMatchObject({
+      maxIterations: iterations,
+      searchBudget: Math.round(iterations * 0.75),
+      timeoutMs: Math.round((iterations / 24) * 480_000),
+      maxSessionInputTokens: iterations * perRoundInput,
+      maxSessionTokens: Math.ceil(iterations * perRoundInput * 1.35),
+    });
+  });
+
+  const rescanBase = {
+    existingRecipes: [{ title: 'Existing pattern', trigger: '@existing' }],
+    gap: 2,
+    existing: 1,
+  };
+
+  async function analystPromptWith(rescanContext: Record<string, unknown>) {
+    return buildAnalystPrompt(
+      { id: 'architecture', label: 'Architecture' },
+      { name: 'fixture', lang: 'typescript', fileCount: 3 },
+      null,
+      null,
+      null,
+      null,
+      rescanContext as Parameters<typeof buildAnalystPrompt>[6]
+    );
+  }
+
+  it('asks only for verification in verify-only rescan mode', async () => {
+    const prompt = await analystPromptWith({ ...rescanBase, executionMode: 'verify-only' });
+    expect(prompt).toContain('增量扫描模式');
+    expect(prompt).toContain('只验证受影响或衰退的已有知识是否仍然成立');
+    expect(prompt).not.toContain('专注发现上述 Recipe');
+  });
+
+  it('asks for uncovered patterns in produce rescan mode and lists decaying recipes', async () => {
+    const prompt = await analystPromptWith({
+      ...rescanBase,
+      executionMode: 'produce',
+      createBudget: 1,
+      decayingRecipes: [{ title: 'Old pattern', trigger: '@old' }],
+    });
+    expect(prompt).toContain('本次创建预算 1 个');
+    expect(prompt).toContain('专注发现上述 Recipe');
+    expect(prompt).not.toContain('只验证受影响或衰退的已有知识');
+    expect(prompt).toContain('"Old pattern" — 衰退原因: 未知');
   });
 });
