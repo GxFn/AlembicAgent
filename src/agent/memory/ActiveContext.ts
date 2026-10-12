@@ -40,15 +40,68 @@ import type { DistilledContext } from './MemoryFlushContract.js';
 // ═══════════════════════════════════════════════════════════
 
 /**
+ * 压缩策略看到的调用上下文：params 已把 { action, params: {...} } 嵌套形态与扁平形态归一，
+ * ok 是信封的执行真值（非信封结果视为成功）。单文件读取的载荷只有源码字符串，路径只能从这里取。
+ */
+interface CompressCall {
+  params: Record<string, unknown>;
+  ok: boolean;
+}
+
+/**
+ * DeltaCache（src/tools/runtime/cache/DeltaCache.ts）对“内容未变且此前全文可见”的重读返回的占位文本。
+ * 它不是一行源码：按行计数会把重读误报成“1 行”的文件。
+ */
+const DELTA_UNCHANGED_PLACEHOLDER = '[unchanged since last read]';
+
+/** DeltaCache 指纹变化但逐行比较没有差异时的占位文本（computeSimpleDiff 的空 diff）。 */
+const DELTA_NO_VISIBLE_CHANGES = '[no visible changes]';
+
+/**
+ * 以下标记全部来自 code.read 的展示态模板（src/tools/runtime/handlers/code.ts 与 router.ts），
+ * 单文件读取的载荷只剩这个字符串，模式与文件总行数只能从这些标记里读，展示行数绝不是文件行数：
+ *   - DeltaCache 增量重读：首行 `[delta: K hunk(s)]`，其后是 @@ 变更块，不是源码；
+ *   - >500 行无范围读取：AST 大纲以 `File has N lines. Showing outline. …` 结尾，
+ *     无 AST 时退回头尾预览，首行 `// <path> — N lines (showing head + tail)`；
+ *   - maxLines 范围读：末尾 `... [N lines omitted; …]`，N 是展示末行之后的行数，标记行本身不是源码；
+ *   - Router 按 maxOutputTokens 的头尾截断：中间插入 `... [N chars truncated, exceeded M token limit] ...`，
+ *     标记前后的内容不连续，标记之后的首行可能只是半行。
+ */
+const READ_DELTA_HEADER_RE = /^\[delta: (\d+) hunk\(s\)\]/;
+const READ_HEAD_TAIL_HEADER_RE = /^\/\/ .+ — (\d+) lines \(showing head \+ tail\)/;
+const READ_OUTLINE_FOOTER_RE =
+  /\nFile has (\d+) lines\. Showing outline\. Use startLine\/endLine to read specific sections\.\s*$/;
+const READ_OMITTED_SUFFIX_RE =
+  /\n?\.\.\. \[(\d+) lines omitted; use startLine\/endLine for more\]\s*$/;
+const READ_ROUTER_TRUNCATION_RE =
+  /\n\n\.\.\. \[\d+ chars truncated, exceeded \d+ token limit\] \.\.\.\n\n/;
+/** handler 给每个源码行加的行号前缀 `42|`；全文读与范围读的每一行都带它。 */
+const READ_LINE_PREFIX_RE = /^(\d+)\|/;
+
+/** graph 查询里描述实体本身的类型；其余 type（callers/callees/impact/search/hierarchy…）是列表型回答。 */
+const GRAPH_ENTITY_QUERY_TYPES = new Set(['class', 'protocol']);
+
+/** graph 回答对象里不是查询结果的数组字段：图引用与未解析候选只是辅助信息，不计入结果条数。 */
+const GRAPH_AUXILIARY_LIST_KEYS = new Set(['graphRefs', 'candidates']);
+
+/** 列表型 graph 摘要展示的前几项；蒸馏行还会截到 150 字符，多列无益。 */
+const GRAPH_LEADING_ITEMS = 3;
+
+/**
  * 工具特化压缩策略 — 不同工具返回不同结构，压缩时保留最有价值的部分。
  *
  * 策略收到的是业务载荷（unwrapObservedResult 已拆开 ToolResultEnvelope：structuredContent
  * 优先，其次模型可见 text），不是信封本身；纯文本形态（如 "N matches (showing M)…"）按字符串截断，
- * 首行即匹配计数会落在摘要前 150 字符内。
+ * 首行即匹配计数会落在摘要前 150 字符内。第二个参数是归一后的调用参数与执行真值。
  */
 const TOOL_COMPRESS_STRATEGIES = {
-  code(result: unknown) {
+  code(result: unknown, call: CompressCall) {
     if (typeof result !== 'object' || result === null) {
+      // 单文件 code.read 成功时 handler 返回 ok(result.content)：载荷就是源码字符串，没有 path 字段。
+      // 只有执行成功且确为 read 时才按文件事实摘要；失败回执的载荷是错误文本，必须原样保留。
+      if (typeof result === 'string' && call.ok && stringFrom(call.params.action) === 'read') {
+        return summarizeSingleFileRead(result, call.params);
+      }
       return String(result).substring(0, 600);
     }
     const r = result as Record<string, unknown>;
@@ -57,17 +110,21 @@ const TOOL_COMPRESS_STRATEGIES = {
       line: number;
     }>;
     const batchResults = (r.batchResults || {}) as Record<string, Record<string, unknown>>;
+    // 适配器的搜索投影恒为 { total, shown, matches }：零命中 { total:0, matches:[] } 与预算耗尽
+    // { total:N, shown:0, matches:[] } 也是搜索事实（零命中能避免模型重复搜索），不能落到原始 JSON。
+    const isSearchProjection =
+      typeof r.total === 'number' && Number.isFinite(r.total) && Array.isArray(r.matches);
 
-    // search action: 有 matches 或 batchResults；适配器投影为 { total, shown, matches }，
-    // total 是观察到的总命中数，matches 可能因预算只展示一部分。
-    if (matches.length > 0 || Object.keys(batchResults).length > 0) {
+    // search action: 有 matches、batchResults 或计数投影；total 是观察到的总命中数，
+    // matches 可能因预算只展示一部分（shown）。
+    if (matches.length > 0 || isSearchProjection || Object.keys(batchResults).length > 0) {
       const lines: string[] = [];
-      if (matches.length > 0) {
+      if (matches.length > 0 || isSearchProjection) {
         const total = typeof r.total === 'number' ? r.total : matches.length;
+        const shown =
+          typeof r.shown === 'number' && Number.isFinite(r.shown) ? r.shown : matches.length;
         lines.push(
-          total > matches.length
-            ? `搜索到 ${total} 个匹配（显示 ${matches.length}）`
-            : `搜索到 ${total} 个匹配`
+          total > shown ? `搜索到 ${total} 个匹配（显示 ${shown}）` : `搜索到 ${total} 个匹配`
         );
         const fileGroups: Record<string, number[]> = {};
         for (const m of matches) {
@@ -133,12 +190,47 @@ const TOOL_COMPRESS_STRATEGIES = {
     const outer = result as Record<string, unknown>;
     // graph handler 的投影是 { type, entity, result } 或 { type, entity, message }：
     // 宿主查询体在 result 里，实体名在外层 entity；裸结果（旧形态）则直接是查询体。
-    const r = objectFrom(outer.result) ?? outer;
+    const body = outer.result;
     const entity = stringFrom(outer.entity);
-    if (!objectFrom(outer.result) && typeof outer.message === 'string' && entity) {
-      return `图谱 ${stringFrom(outer.type) || 'query'} ${entity}: ${outer.message}`;
+    const type = stringFrom(outer.type);
+    if (body == null && typeof outer.message === 'string' && entity) {
+      return `图谱 ${type || 'query'} ${entity}: ${outer.message}`;
+    }
+    const label = `图谱 ${type || 'query'} ${entity || '?'}`;
+
+    // 宿主没能把实体落到声明上（not-found/ambiguous）是回答不是故障，但也不是“类 <entity>”。
+    const answer = objectFrom(body);
+    if (answer && !Array.isArray(answer) && answer.resolved === false) {
+      const candidates = Array.isArray(answer.candidates) ? answer.candidates.length : 0;
+      return [
+        `${label}: 未解析 (${stringFrom(answer.reason) || 'unresolved'})`,
+        ...(stringFrom(answer.message)
+          ? [`  ${limitLedgerText(stringFrom(answer.message), 200)}`]
+          : []),
+        ...(candidates > 0 ? [`  候选 ${candidates} 个`] : []),
+      ].join('\n');
     }
 
+    // callers/callees/impact/search 等是列表型回答：裸数组直接计数，宿主对象则按其中的结果数组计数，
+    // 不能套用类查询模板（那会给出误导性的“类 <entity>”并丢掉全部结果）。
+    const list = Array.isArray(body) ? body : Array.isArray(result) ? result : null;
+    if (list) {
+      return summarizeGraphLists(label, [['', list]]);
+    }
+    if (answer && type && !GRAPH_ENTITY_QUERY_TYPES.has(type)) {
+      const lists = Object.entries(answer).filter(
+        (entry): entry is [string, unknown[]] =>
+          Array.isArray(entry[1]) && !GRAPH_AUXILIARY_LIST_KEYS.has(entry[0])
+      );
+      if (lists.length > 0) {
+        return summarizeGraphLists(label, lists);
+      }
+    }
+    if (body != null && typeof body !== 'object') {
+      return `${label}: ${String(body).substring(0, 300)}`;
+    }
+
+    const r = answer ?? outer;
     // hierarchy query: 有 classes 或 hierarchy 数组
     const classes = r.classes || r.hierarchy;
     if (Array.isArray(classes)) {
@@ -166,6 +258,232 @@ const TOOL_COMPRESS_STRATEGIES = {
   },
 };
 
+/**
+ * 单文件读取摘要：路径来自调用参数（载荷里没有）。“(N 行)”只用于确知是文件总行数的情形，
+ * 与 batch 分支的 lineCount 同义；其余读取模式按 handler 自己的标记标注视图：
+ *   - DeltaCache 未变化/增量重读 → 标注重读结论，不按占位或 diff 文本计行；
+ *   - 大纲/头尾预览 → 总行数取自 handler 标记（共 N 行），并写明视图；
+ *   - 范围/maxLines 读取 → 写明展示区间 L<首>-<末> 与展示行数，省略后缀不计入；
+ *   - Router 截断 → 只报告能从可见内容确证的事实，并标注“输出超限截断”。
+ */
+function summarizeSingleFileRead(content: string, params: Record<string, unknown>): string {
+  const filePath = stringFrom(params.path) || stringFrom(params.filePath) || '?';
+  const label = `文件 ${filePath}`;
+  const trimmed = content.trim();
+  if (trimmed === DELTA_UNCHANGED_PLACEHOLDER) {
+    return `${label} (自上次读取未变化)`;
+  }
+  if (trimmed === DELTA_NO_VISIBLE_CHANGES) {
+    return `${label} (自上次读取有变更，无可见行差异)`;
+  }
+
+  // 模板首行/结尾标记在 Router 头尾截断后仍保留，截断只追加标注。
+  const truncation = READ_ROUTER_TRUNCATION_RE.exec(content);
+  const truncatedNote = truncation ? '，输出超限截断' : '';
+  const delta = READ_DELTA_HEADER_RE.exec(content);
+  if (delta) {
+    return `${label} (自上次读取有变更，增量 ${delta[1]} 处${truncatedNote})`;
+  }
+  const preview = READ_HEAD_TAIL_HEADER_RE.exec(content);
+  if (preview) {
+    return `${label} (共 ${preview[1]} 行，头尾预览${truncatedNote})`;
+  }
+  const outline = READ_OUTLINE_FOOTER_RE.exec(content);
+  if (outline) {
+    return `${label} (共 ${outline[1]} 行，大纲${truncatedNote})`;
+  }
+
+  // 剩下的是带行号前缀的源码：全文读（≤500 行且不带范围）或范围/maxLines 读。
+  const view = readNumberedView(content, truncation);
+  const isRange = isRangeReadParams(params) || view.omittedAfter !== null;
+  if (!isRange && view.first === 1) {
+    // 全文读的内容从第 1 行连续写到文件末行：未截断时展示行数即文件行数（与 handler 的 lineCount 一致）；
+    // 截断后末行仍在尾部，末行号就是总行数。末行号与计数对不上说明形状漂移，交给下面的区间描述。
+    if (!view.truncated && view.last !== null && view.shown === view.last) {
+      return `${label} (${view.shown} 行)`;
+    }
+    if (view.truncated) {
+      return view.last !== null
+        ? `${label} (共 ${view.last} 行，输出超限截断，仅展示头尾)`
+        : `${label} (输出超限截断，仅展示头尾)`;
+    }
+  }
+  if (view.first !== null) {
+    if (!isRange) {
+      // 不带范围参数却不是从第 1 行连续到末行：与 handler 全文模板不符，降级为只描述展示区间。
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            `[ActiveContext] single-file read summary fell back to displayed range: full-read template mismatch; path=${filePath} first=${view.first} last=${view.last} shown=${view.shown} truncated=${view.truncated}`
+          ),
+        () => undefined
+      );
+    }
+    return summarizeDisplayedRange(label, view, isRange);
+  }
+  if (!view.truncated && trimmed === '') {
+    // 起始行超出文件末尾的范围读：handler 返回空串，这同样是事实（该区间无内容）。
+    return isRange
+      ? `${label} (范围读取 ${describeRequestedRange(params)}，无内容)`
+      : `${label} (无内容)`;
+  }
+
+  // 没有任何行号前缀也不匹配任何模板：载荷不是 code.read 的已知展示态（宿主直连或模板漂移）。
+  // 只能如实写“展示 N 行”，并留下诊断以便对齐 handler 模板。
+  const displayed = content.split('\n').length;
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[ActiveContext] single-file read summary fell back to displayed lines: no line-number prefix or read template marker; path=${filePath} displayedLines=${displayed} truncated=${view.truncated}`
+      ),
+    () => undefined
+  );
+  return `${label} (展示 ${displayed} 行)`;
+}
+
+/** 带行号前缀的读取内容拆解：首/末行号、展示行数（截断时未知）、maxLines 省略的后续行数。 */
+interface NumberedReadView {
+  first: number | null;
+  last: number | null;
+  shown: number | null;
+  omittedAfter: number | null;
+  truncated: boolean;
+}
+
+/**
+ * 只信任“真正的行首”：内容开头一定是行首；Router 截断标记之后的第一段可能是半行，
+ * 所以尾部只看其后的完整行。省略后缀单独解析，不计入展示行。
+ */
+function readNumberedView(content: string, truncation: RegExpExecArray | null): NumberedReadView {
+  let head = truncation ? content.slice(0, truncation.index) : content;
+  let tail = truncation ? content.slice(truncation.index + truncation[0].length) : null;
+  let omittedAfter: number | null = null;
+  const lastPart = tail ?? head;
+  const omitted = READ_OMITTED_SUFFIX_RE.exec(lastPart);
+  if (omitted) {
+    omittedAfter = Number(omitted[1]);
+    const stripped = lastPart.slice(0, omitted.index);
+    if (tail !== null) {
+      tail = stripped;
+    } else {
+      head = stripped;
+    }
+  }
+
+  const headLines = head.split('\n');
+  const first = lineNumberOf(headLines[0]);
+  if (tail === null) {
+    const numbered = headLines.filter((line) => READ_LINE_PREFIX_RE.test(line)).length;
+    return {
+      first,
+      last: lineNumberOf(headLines[headLines.length - 1]),
+      shown: numbered,
+      omittedAfter,
+      truncated: false,
+    };
+  }
+  const tailLines = tail.split('\n');
+  return {
+    first,
+    last: tailLines.length >= 2 ? lineNumberOf(tailLines[tailLines.length - 1]) : null,
+    shown: null,
+    omittedAfter,
+    truncated: true,
+  };
+}
+
+function lineNumberOf(line: string | undefined): number | null {
+  const matched = line === undefined ? null : READ_LINE_PREFIX_RE.exec(line);
+  return matched ? Number(matched[1]) : null;
+}
+
+/**
+ * 范围/展示区间摘要：区间取自内容里的行号（handler 已把 endLine 夹到文件末尾，比调用参数更真）；
+ * maxLines 省略后缀给出末行之后还有多少行，文件总行数 = 末行号 + 省略行数。
+ */
+function summarizeDisplayedRange(label: string, view: NumberedReadView, isRange: boolean): string {
+  const span = view.last !== null ? `L${view.first}-${view.last}` : `L${view.first} 起`;
+  const kind = isRange ? '范围读取' : '展示区间';
+  const shown = view.truncated ? '输出超限截断，仅展示头尾' : `展示 ${view.shown} 行`;
+  const total =
+    view.omittedAfter !== null && view.last !== null
+      ? `，文件共 ${view.last + view.omittedAfter} 行`
+      : '';
+  return `${label} ${span} (${kind}，${shown}${total})`;
+}
+
+/** 与 readSingleFile 同口径：startLine/endLine 为真值或 maxLines 是正数时走范围分支。 */
+function isRangeReadParams(params: Record<string, unknown>): boolean {
+  return (
+    Boolean(params.startLine) ||
+    Boolean(params.endLine) ||
+    positiveLineCount(params.maxLines) !== null
+  );
+}
+
+/** 空结果时只能复述请求区间：start 缺省为 1；endLine 优先，其次 maxLines 推出的末行。 */
+function describeRequestedRange(params: Record<string, unknown>): string {
+  const start = positiveLineCount(params.startLine) ?? 1;
+  const end = positiveLineCount(params.endLine);
+  const maxLines = positiveLineCount(params.maxLines);
+  if (end !== null) {
+    return `L${start}-${end}`;
+  }
+  return maxLines !== null ? `L${start}-${start + maxLines - 1}` : `L${start} 起`;
+}
+
+function positiveLineCount(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const count = Math.floor(value);
+  return count > 0 ? count : null;
+}
+
+/**
+ * 列表型 graph 回答：单个结果数组写“N 条结果”；宿主对象带多个结果数组（impact 的文件/符号/测试，
+ * hierarchy 的父/子类型）时逐个计数。前几项取自第一个非空数组。
+ */
+function summarizeGraphLists(label: string, lists: Array<[string, unknown[]]>): string {
+  const header =
+    lists.length === 1
+      ? `${label}: ${lists[0][1].length} 条结果`
+      : `${label}: ${lists.map(([key, items]) => `${key} ${items.length} 条`).join('、')}`;
+  const leading = lists.find(([, items]) => items.length > 0)?.[1] ?? [];
+  return [
+    header,
+    ...leading.slice(0, GRAPH_LEADING_ITEMS).map((item) => `  ${describeGraphItem(item)}`),
+  ].join('\n');
+}
+
+/** graph 列表项的一行描述：优先名字与位置（宿主事实为 name + location 或 file + line），否则截断 JSON。 */
+function describeGraphItem(item: unknown): string {
+  const entry = objectFrom(item);
+  if (!entry || Array.isArray(entry)) {
+    return limitLedgerText(String(item), 120);
+  }
+  const name =
+    stringFrom(entry.name) ||
+    stringFrom(entry.qualifiedName) ||
+    stringFrom(entry.symbol) ||
+    stringFrom(entry.className) ||
+    stringFrom(entry.caller) ||
+    stringFrom(entry.callee) ||
+    stringFrom(entry.entity) ||
+    stringFrom(entry.id);
+  const file = stringFrom(entry.file) || stringFrom(entry.filePath);
+  const location =
+    stringFrom(entry.location) ||
+    (file && typeof entry.line === 'number' ? `${file}:${entry.line}` : file);
+  if (name) {
+    return limitLedgerText(location ? `${name} (${location})` : name, 120);
+  }
+  if (location) {
+    return limitLedgerText(location, 120);
+  }
+  return limitLedgerText(JSON.stringify(entry) ?? String(item), 120);
+}
+
 /** 默认压缩 — 截断到 maxChars；undefined/函数等 stringify 不出字符串时退回 String()。 */
 function defaultCompress(result: unknown, maxChars = 600) {
   const str =
@@ -174,6 +492,56 @@ function defaultCompress(result: unknown, maxChars = 600) {
     return str;
   }
   return `${str.substring(0, maxChars)}…(truncated)`;
+}
+
+/**
+ * 最后一层兜底：JSON 序列化已失败。对象只读自有键名（Object.keys 不触发 getter）并附上失败原因，
+ * 原始值走 String()；任何一步再抛错都退回固定占位文本，保证绝不抛出。
+ */
+function lastResortCompress(payload: unknown, reason: string, maxChars = 600): string {
+  const brief = limitLedgerText(reason.replace(/\s+/g, ' ').trim(), 120);
+  let text: string;
+  if (payload !== null && (typeof payload === 'object' || typeof payload === 'function')) {
+    let keys: string;
+    try {
+      keys = Object.keys(payload).slice(0, 8).join(',');
+    } catch (err: unknown) {
+      keys = `?(${err instanceof Error ? err.message : 'keys unavailable'})`;
+    }
+    text = `[unserializable ${typeof payload} keys=${keys}: ${brief}]`;
+  } else {
+    try {
+      text = String(payload);
+    } catch (err: unknown) {
+      text = `[unserializable ${typeof payload}: ${err instanceof Error ? err.message : brief}]`;
+    }
+  }
+  return text.length <= maxChars ? text : `${text.substring(0, maxChars)}…(truncated)`;
+}
+
+/** 诊断用的错误原因；非 Error 的抛出值也可能 String() 失败，此时给固定描述。 */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  try {
+    return String(err);
+  } catch (stringifyErr: unknown) {
+    return stringifyErr instanceof Error
+      ? `unprintable error (${stringifyErr.message})`
+      : 'unprintable error';
+  }
+}
+
+/** 调用参数归一：模型调用形如 { action, params: {...} }，宿主直连可能是扁平参数；嵌套字段优先。 */
+function flattenCallParams(args: Record<string, unknown> | undefined): Record<string, unknown> {
+  const outer = objectFrom(args);
+  if (!outer || Array.isArray(outer)) {
+    return {};
+  }
+  const { params: nested, ...rest } = outer;
+  const inner = objectFrom(nested);
+  return inner && !Array.isArray(inner) ? { ...rest, ...inner } : rest;
 }
 
 /** 读取结果的行数：handler 已给 lineCount 时直接用，否则按 content 换行计数；都没有则 null。 */
@@ -1077,26 +1445,13 @@ export class ActiveContext {
    * @returns }
    */
   #compressObservation(observation: Observation): CompressedObservation {
-    const strategy = (TOOL_COMPRESS_STRATEGIES as Record<string, (result: unknown) => string>)[
-      observation.toolName
-    ];
     // 先拆信封再压缩：策略按业务载荷编写，生产传入的却总是 ToolResultEnvelope。
     const { envelope, payload } = unwrapObservedResult(observation.result);
-    let summary: string;
-    try {
-      summary = strategy ? strategy(payload) : defaultCompress(payload);
-    } catch (err: unknown) {
-      // 策略只认识已知业务形状；形状漂移时退回通用截断，并留下可定位的降级记录。
-      const reason = err instanceof Error ? err.message : String(err);
-      observeSafely(
-        () =>
-          this.#logger.warn(
-            `[ActiveContext] compress strategy failed tool=${observation.toolName} round=${observation.round} reason=${reason}; fallback=defaultCompress`
-          ),
-        () => undefined
-      );
-      summary = defaultCompress(payload);
-    }
+    const call: CompressCall = {
+      params: flattenCallParams(observation.args),
+      ok: envelope ? envelope.ok : true,
+    };
+    let summary = this.#summarizePayload(observation, payload, call);
     if (envelope && !envelope.ok) {
       // 失败回执的载荷通常只是错误文本；状态前缀让蒸馏摘要与宿主拼接的文本能分辨失败/阻断/超时。
       summary = `[${envelope.status}] ${summary}`;
@@ -1105,8 +1460,68 @@ export class ActiveContext {
       toolName: observation.toolName,
       round: observation.round,
       summary,
-      ledgerItems: this.#extractObservationLedgerItems(observation, summary),
+      ledgerItems: this.#extractLedgerItemsSafely(observation, summary),
     };
+  }
+
+  /**
+   * 摘要三层降级，任何一层都不能让 recordToolCall/observe/distill 抛错：
+   *   1. 工具特化策略（只认识已知业务形状）；
+   *   2. defaultCompress 通用 JSON 截断（无策略的工具从这里开始）；
+   *   3. lastResortCompress：JSON 也失败（BigInt、循环引用、抛错 getter）时只读自有键名生成占位文本。
+   * 每次降级都留下可定位的 warn：工具、轮次、失败原因与选择的下一层。
+   */
+  #summarizePayload(observation: Observation, payload: unknown, call: CompressCall): string {
+    const strategy = (
+      TOOL_COMPRESS_STRATEGIES as Record<string, (result: unknown, call: CompressCall) => string>
+    )[observation.toolName];
+    if (strategy) {
+      try {
+        return strategy(payload, call);
+      } catch (err: unknown) {
+        // 策略只认识已知业务形状；形状漂移时退回通用截断，并留下可定位的降级记录。
+        const reason = describeError(err);
+        observeSafely(
+          () =>
+            this.#logger.warn(
+              `[ActiveContext] compress strategy failed tool=${observation.toolName} round=${observation.round} reason=${reason}; fallback=defaultCompress`
+            ),
+          () => undefined
+        );
+      }
+    }
+    try {
+      return defaultCompress(payload);
+    } catch (err: unknown) {
+      // 只有绕过适配器直连 recordToolCall/observe 的宿主才会交来不可序列化的值（适配器已替换为占位符）。
+      const reason = describeError(err);
+      observeSafely(
+        () =>
+          this.#logger.warn(
+            `[ActiveContext] default compress failed tool=${observation.toolName} round=${observation.round} payloadType=${typeof payload} reason=${reason}; fallback=string`
+          ),
+        () => undefined
+      );
+      return lastResortCompress(payload, reason);
+    }
+  }
+
+  /** 台账提取读取载荷字段（ok/error/status/files…）；抛错 getter 不能让整个观察记录失败。 */
+  #extractLedgerItemsSafely(observation: Observation, summary: string): ObservationLedgerItem[] {
+    try {
+      return this.#extractObservationLedgerItems(observation, summary);
+    } catch (err: unknown) {
+      const reason = describeError(err);
+      observeSafely(
+        () =>
+          this.#logger.warn(
+            `[ActiveContext] observation ledger extraction failed tool=${observation.toolName} round=${observation.round} reason=${reason}; fallback=summary-only`
+          ),
+        () => undefined
+      );
+      // 空条目让 #buildObservationLedgerSection 退回按摘要生成的 evidence 条目。
+      return [];
+    }
   }
 
   #buildObservationLedgerSection(tokenBudget: number): string | null {

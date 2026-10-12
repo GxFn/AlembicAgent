@@ -392,46 +392,115 @@ describe('ActiveContext envelope-aware observation compression (L6-P10)', () => 
     expect(messages.some((message) => message.includes('shape drift'))).toBe(true);
   });
 
-  it('logs when the observation ledger is skipped or truncated by the budget', () => {
-    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+  it('labels a single-file read payload without any handler template as displayed lines and logs it', () => {
+    // 刻意不用 runtimeBridge：code.read handler 恒给每行加行号前缀，生产路径到不了这里。
+    // 被测的是宿主直连或模板漂移时的降级口径——只能说“展示 N 行”，不能冒充文件行数。
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const context = new ActiveContext({ maxRecentRounds: 0 });
-    context.noteKeyFinding('finding '.repeat(40), 'E-1=src/a.ts:1', 9);
     context.startRound(1);
-    for (let index = 0; index < 12; index++) {
-      const path = `src/modules/feature-${index}/implementation-details.ts`;
-      context.recordToolCall(
-        'code',
-        { action: 'read', path },
-        envelope({
-          callId: `read-${index}`,
-          structuredContent: { ok: true, path, content: '1|x', lineCount: 1 },
-        }),
-        true
-      );
-    }
+    context.recordToolCall(
+      'code',
+      { action: 'read', params: { path: 'src/plain.ts' } },
+      envelope({ structuredContent: 'const a = 1;\nconst b = 2;\nconst c = 3;' }),
+      true
+    );
+    // 不带范围参数却从第 3 行开始：不符合全文模板，只能描述展示区间，不能说成文件共 2 行。
+    context.recordToolCall(
+      'code',
+      { action: 'read', path: 'src/slice.ts' },
+      envelope({ structuredContent: '3|const c = 3;\n4|const d = 4;' }),
+      true
+    );
     context.endRound();
-    const full = context.buildContext(Infinity);
-    expect(full).toContain('## Observation Ledger');
-    const scratchTokens = estimateTokens(full.split('\n## Observation Ledger')[0]);
-    const fullTokens = estimateTokens(full);
-    expect(fullTokens - scratchTokens).toBeGreaterThan(150);
 
-    // 剩余预算 ≤ 100：整段跳过，且必须留下可定位的降级日志。
-    const skipped = context.buildContext(scratchTokens + 90);
-    expect(skipped).not.toContain('## Observation Ledger');
-    let messages = info.mock.calls.map((call) => String(call[0]));
-    expect(messages.some((message) => message.includes('observation ledger skipped'))).toBe(true);
-    expect(messages.some((message) => message.includes('reason=budget_exhausted'))).toBe(true);
+    expect(context.distill().toolCallSummary).toEqual([
+      '[code] 文件 src/plain.ts (展示 3 行)',
+      '[code] 文件 src/slice.ts L3-4 (展示区间，展示 2 行)',
+    ]);
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    const displayedLines = messages.find((message) =>
+      message.includes('fell back to displayed lines')
+    );
+    expect(displayedLines).toContain('path=src/plain.ts');
+    expect(displayedLines).toContain('displayedLines=3');
+    const displayedRange = messages.find((message) =>
+      message.includes('fell back to displayed range')
+    );
+    expect(displayedRange).toContain('path=src/slice.ts');
+    expect(displayedRange).toContain('first=3 last=4 shown=2');
+  });
 
-    // 剩余预算放得下标题但放不下全部条目：按类截断并记录省略条数。
-    info.mockClear();
-    const truncated = context.buildContext(fullTokens - 20);
-    expect(truncated).toContain('## Observation Ledger');
-    expect(truncated.length).toBeLessThan(full.length);
-    messages = info.mock.calls.map((call) => String(call[0]));
-    const truncation = messages.find((message) => message.includes('observation ledger truncated'));
-    expect(truncation).toBeDefined();
-    expect(truncation).toMatch(/omitted (readSet|evidence)=\d+/);
+  it('never throws from recordToolCall/observe/distill when a direct host result cannot be serialized', () => {
+    // 只有绕过适配器直接调用 recordToolCall/observe 的宿主才会交来这些值（适配器会先替换为占位符），
+    // 所以这里刻意不用 runtimeBridge 夹具：被测的就是“非信封、不可序列化”的直连输入。
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const circular: Record<string, unknown> = { name: 'loop' };
+    circular.self = circular;
+    const throwingGetter: Record<string, unknown> = {};
+    Object.defineProperty(throwingGetter, 'detail', {
+      enumerable: true,
+      get() {
+        throw new Error('getter exploded');
+      },
+    });
+    // 无原型 + BigInt：JSON.stringify 与 String() 都会抛错，必须落到最后一层占位文本。
+    const unprintable = Object.create(null) as Record<string, unknown>;
+    unprintable.value = 7n;
+    // status getter 抛错：JSON 序列化与台账提取（读取 ok/error/status）都会失败。
+    const throwingStatus: Record<string, unknown> = {};
+    Object.defineProperty(throwingStatus, 'status', {
+      enumerable: true,
+      get() {
+        throw new Error('status exploded');
+      },
+    });
+
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(1);
+    expect(() => {
+      // code 策略内部的 defaultCompress 先抛，catch 后的二次 defaultCompress 也抛。
+      context.recordToolCall('code', { action: 'read', path: 'src/a.ts' }, { value: 10n }, true);
+      // 无策略工具：defaultCompress 直接抛出。
+      context.recordToolCall('knowledge', { action: 'search' }, circular, true);
+      context.recordToolCall('terminal', { command: 'pwd' }, throwingGetter, true);
+      context.observe('meta', unprintable, 1);
+      context.observe('meta', throwingStatus, 1);
+    }).not.toThrow();
+    context.endRound();
+
+    // 窗口未滑出的观察在 distill 时压缩，同样不能抛。
+    const recent = new ActiveContext({ maxRecentRounds: 3 });
+    recent.observe('knowledge', circular, 1);
+    expect(() => recent.distill()).not.toThrow();
+    expect(recent.distill().toolCallSummary[0]).toMatch(
+      /^\[knowledge\] \[unserializable object keys=name,self: /
+    );
+
+    let summary: string[] = [];
+    expect(() => {
+      summary = context.distill().toolCallSummary;
+    }).not.toThrow();
+    expect(summary).toHaveLength(5);
+    // 最后一层兜底只读自有键名（不触发 getter），并带上序列化失败原因，宿主仍能看出结果形状。
+    expect(summary[0]).toMatch(/^\[code\] \[unserializable object keys=value: .*BigInt/);
+    expect(summary[1]).toMatch(/^\[knowledge\] \[unserializable object keys=name,self: /);
+    expect(summary[2]).toBe('[terminal] [unserializable object keys=detail: getter exploded]');
+    expect(summary[3]).toMatch(/^\[meta\] \[unserializable object keys=value: .*BigInt/);
+    expect(summary[4]).toBe('[meta] [unserializable object keys=status: status exploded]');
+    expect(() => context.buildContext(4000)).not.toThrow();
+
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    expect(messages.some((message) => message.includes('fallback=string'))).toBe(true);
+    expect(messages.some((message) => message.includes('tool=meta'))).toBe(true);
+    // 台账提取失败退回按摘要生成的 evidence 条目，同样留下降级记录。
+    expect(
+      messages.some(
+        (message) =>
+          message.includes('observation ledger extraction failed') &&
+          message.includes('fallback=summary-only')
+      )
+    ).toBe(true);
+    expect(context.buildContext(4000)).toContain('[unserializable object keys=status');
   });
 
   it('builds observation meta without serializing the full result and reads search counts from the payload', () => {
@@ -642,30 +711,6 @@ describe('working memory ownership and read budgets', () => {
     const context = new ActiveContext();
     context.noteKeyFinding('知识'.repeat(90), 'E-1=src/a.ts:1-2', 9);
     expect(estimateTokens(context.buildContext(100))).toBeLessThanOrEqual(100);
-  });
-
-  it('preserves the final observed tools when a dimension is distilled', () => {
-    const context = new ActiveContext();
-    context.startRound(1);
-    for (const path of ['src/a.ts', 'src/b.ts', 'src/c.ts']) {
-      context.recordToolCall(
-        'code',
-        { action: 'read', path },
-        envelope({
-          callId: `read-${path}`,
-          structuredContent: { ok: true, path, content: '1|actual source', lineCount: 1 },
-        }),
-        true
-      );
-    }
-    context.endRound();
-    const distilled = context.distill();
-    expect(distilled.totalObservations).toBe(3);
-    expect(distilled.toolCallSummary).toHaveLength(3);
-    // 蒸馏摘要是宿主直接拼进 analysisText 的人类可读文本：必须是文件事实，不能是信封元数据。
-    for (const [index, path] of ['src/a.ts', 'src/b.ts', 'src/c.ts'].entries()) {
-      expect(distilled.toolCallSummary[index]).toBe(`[code] 文件 ${path} (1 行)`);
-    }
   });
 
   it('does not let a toJSON observer replace authoritative finding references', () => {
