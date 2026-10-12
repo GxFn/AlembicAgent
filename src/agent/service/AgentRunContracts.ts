@@ -55,6 +55,13 @@ export interface AgentConcurrencyPlan {
   partitioner?: string;
   childProfile?: string;
   merge?: string;
+  /**
+   * fan-out 协调的取消策略声明。AgentRunCoordinator 目前只实现 'stop-new'：
+   * 在 tier 边界和每个 child 派发前检查 abortSignal / shouldAbort，已开始的 child 不被协调器打断，
+   * 尚未派发的 child（含同 tier 中排队的）记为 aborted。
+   * 'cancel-running' 与 'finish-tier' 尚未实现：声明后协调器记一条 warn 诊断，并仍按 stop-new 调度。
+   * 枚举是否收窄属于待决的公开面决策，在此之前保留现有取值以免破坏外部按枚举赋值的调用方。
+   */
   abortPolicy?: 'stop-new' | 'cancel-running' | 'finish-tier';
 }
 

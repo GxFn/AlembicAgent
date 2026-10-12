@@ -155,6 +155,7 @@ async function runChildren(
       }
     );
   }
+  logUnimplementedAbortPolicy(concurrencyPlan, profile);
   const limit = createLimit(concurrency.value);
   const tiers = tiered ? groupByTier(childInputs) : [childInputs.map((_, index) => index)];
   // child → tierIndex 只用于日志定位；parallel 模式没有 tier 语义，不记录 tierIndex。
@@ -575,6 +576,36 @@ async function resolveAbortReason(
     return 'abortSignal';
   }
   return null;
+}
+
+/**
+ * 协调器唯一实现的取消策略是 stop-new（I20）：tier 边界与每个 child 派发前（含懒构造之后）检查停止事实，
+ * 已开始的 child 不由协调器打断，尚未派发的 child（含同 tier 中排队的）写 aborted 回执。
+ * 声明 'cancel-running'（打断运行中 child）或 'finish-tier'（当前 tier 跑完再停）时，
+ * 调度逻辑不据此分叉、仍按 stop-new 执行——这是一条降级路径，不能静默：每次协调记一条 warn，
+ * 写明声明值与实际生效值，宿主据此发现 profile 声明与实际取消语义不符。
+ * 只记诊断、不改调度，也不抛错：抛错会让已声明这些值的外部 profile 直接失败，属于行为变化。
+ */
+function logUnimplementedAbortPolicy(
+  concurrencyPlan: AgentConcurrencyPlan,
+  profile: CompiledAgentProfile
+) {
+  // 运行时可能拿到 JSON 等非类型化来源的值，这里按 unknown 处理，任何非 stop-new 的声明都算未实现。
+  const declared: unknown = concurrencyPlan.abortPolicy;
+  if (declared === undefined || declared === 'stop-new') {
+    return;
+  }
+  const effective = 'stop-new';
+  logCoordination(
+    'warn',
+    `abortPolicy not implemented, scheduling as stop-new profile=${profile.id} declared=${String(declared)} effective=${effective}`,
+    {
+      profileId: profile.id,
+      mode: concurrencyPlan.mode,
+      declaredAbortPolicy: declared,
+      effectiveAbortPolicy: effective,
+    }
+  );
 }
 
 /** 与 AgentService preflight 相同的期限归一：只有有限正数才构成检查期限，否则不限时（只与 signal 竞速）。 */
