@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
@@ -1029,7 +1030,8 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
     'eslint . --max-warnings 0',
     'biome check src',
     'biome ci src',
-    'find . -name *.ts -not -path ./node_modules/*',
+    // 以 glob 字符开头的 -name 模式需加引号（L4-P7b allowlist-shell-glob-option）；'./' 开头的路径模式不受影响。
+    "find . -name '*.ts' -not -path ./node_modules/*",
     'find src -type f -newer package.json',
     'cat package.json',
     'ls -la src',
@@ -1100,6 +1102,831 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
       expect(result.ok, command).toBe(true);
     }
     expect(calls).toEqual(commands);
+  });
+});
+
+// L4-P7a：7ac8836 之后的对抗审计确认，黑名单只按字面拼写比较会被同一 bin 的等价拼写绕过
+// （tsc 单横线长选项、jest kebab/camel、包管理器自身配置项等）。这里的用例按 bin 构造等价拼写，
+// 并给短选项簇（ls -fls、grep -i、rg -u）与 git blame --incremental 补放行对照。
+describe('Evolution read-only allowlist normalized option policies (L4-P7a)', () => {
+  const evolutionBins = new Evolution().commandAllowlist.bins;
+
+  it.each([
+    // 1) tsc：单横线长选项、大小写不敏感、短别名 -i（incremental）都写 tsbuildinfo / 配置 / 诊断文件。
+    {
+      command: 'tsc --noEmit -incremental -tsBuildInfoFile package.json',
+      rule: 'allowlist-write-like-arg',
+    },
+    { command: 'tsc -init --noEmit', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit -generateTrace trace', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc -build --noEmit', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit -i', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit -B', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --TSBuildInfoFile=x', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit -generateCpuProfile prof', rule: 'allowlist-write-like-arg' },
+    { command: 'tsc --noEmit --composite', rule: 'allowlist-write-like-arg' },
+    // tsc 布尔选项后跟 false 会关闭它；后出现的单横线 -noEmit false 覆盖前面的 --noEmit 并真实产出 JS。
+    { command: 'tsc --noEmit -noEmit false', rule: 'allowlist-tsc-noemit' },
+    { command: 'tsc --noEmit --NOEMIT false -p tsconfig.json', rule: 'allowlist-tsc-noemit' },
+    // @file 让 tsc 从文件读取参数，静态检查看不到其中的 --noEmit false / --outDir。
+    { command: 'tsc --noEmit @scripts/args.txt', rule: 'allowlist-tsc-response-file' },
+    // 2) biome check/ci：报告与日志文件写任意路径。
+    {
+      command: 'biome check --reporter=json --reporter-file=package.json src',
+      rule: 'allowlist-write-like-arg',
+    },
+    { command: 'biome check --reporter-file package.json src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --reporterFile=package.json src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome ci --log-file=out.log src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --log-path=logs src', rule: 'allowlist-write-like-arg' },
+    { command: 'biome check --unsafe src', rule: 'allowlist-write-like-arg' },
+    // 3) rg --hostname-bin 无参执行任意可执行文件（配合 --hyperlink-format 触发）；--pre 同类。
+    {
+      command: 'rg --hostname-bin=./scripts/x.sh --hyperlink-format=file --color=always Recipe src',
+      rule: 'allowlist-exec-like-arg',
+    },
+    { command: 'rg --hostname-bin ./scripts/x.sh Recipe src', rule: 'allowlist-exec-like-arg' },
+    { command: 'rg --hostname_bin=./x.sh Recipe src', rule: 'allowlist-exec-like-arg' },
+    { command: 'rg --hostnameBin=./x.sh Recipe src', rule: 'allowlist-exec-like-arg' },
+    { command: 'rg --pre ./script Recipe src', rule: 'allowlist-exec-like-arg' },
+    // 4) 包管理器在 '--' 之前的自身选项只放行小白名单；npm 的 nopt 还接受前缀缩写与短选项簇。
+    {
+      command: 'npm test --script-shell=./scripts/evil.sh',
+      rule: 'allowlist-package-manager-option',
+    },
+    {
+      command: 'npm test --script-shell ./scripts/evil.sh',
+      rule: 'allowlist-package-manager-option',
+    },
+    {
+      command: 'npm test --scriptShell=./scripts/evil.sh',
+      rule: 'allowlist-package-manager-option',
+    },
+    { command: 'npm test --script-sh=./scripts/evil.sh', rule: 'allowlist-package-manager-option' },
+    {
+      command: 'npm run lint:x --script-shell=./scripts/evil.sh',
+      rule: 'allowlist-package-manager-option',
+    },
+    {
+      command: 'npm test --node-options=--require=./x.cjs',
+      rule: 'allowlist-package-manager-option',
+    },
+    { command: 'npm test --userconfig=./evil.npmrc', rule: 'allowlist-package-manager-option' },
+    { command: 'npm test --globalconfig=./evil.npmrc', rule: 'allowlist-package-manager-option' },
+    { command: 'npm test -sw ./x', rule: 'allowlist-package-manager-option' },
+    { command: 'pnpm test --script-shell=./x.sh', rule: 'allowlist-package-manager-option' },
+    { command: 'yarn test --use-yarnrc=./evil.yarnrc', rule: 'allowlist-package-manager-option' },
+    // 4) '--' 之后（以及之前的位置参数）交给测试运行器规则：运行器未知，按 vitest/jest/node --test
+    // 与 lint/typecheck 脚本的并集从严判定。
+    { command: 'npm test -- --config=scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- -c scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- --import=data:text/javascript,1', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- -r ./x.cjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- --execArgv=--import=./x.mjs', rule: 'allowlist-exec-like-arg' },
+    // node --test --run <script> 会改跑 package.json 里的任意脚本（实测 build 被执行）。
+    { command: 'npm test -- --run build', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm run lint -- -o out.txt', rule: 'allowlist-write-like-arg' },
+    { command: 'npm run lint -- --format=./scripts/evil.js', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- --reporter ./scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'npm test -- --watchAll', rule: 'allowlist-runner-option' },
+    { command: 'npm test -- -t scripts/release.mjs', rule: 'allowlist-runner-option-value' },
+    // test 脚本是 node --test 时，透传的位置参数就是被执行的文件（实测执行）。
+    { command: 'npm test -- scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'npm test scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'pnpm test -- scripts/release.mjs', rule: 'allowlist-test-path' },
+    // 5) node --test 的位置参数只允许测试文件；glob 交替/转义/字符类与路径穿越都不能把非测试文件带进来。
+    { command: 'node --test scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test -- scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test test/../scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test scripts/**', rule: 'allowlist-test-path' },
+    { command: "node --test 'test/{../scripts}/release.mjs'", rule: 'allowlist-test-path' },
+    { command: "node --test 'scripts/release.{mjs,test.js}'", rule: 'allowlist-test-path' },
+    { command: "node --test 'scripts/release.mjs?(.test.js)'", rule: 'allowlist-test-path' },
+    { command: "node --test 'scripts/release[.test.]mjs'", rule: 'allowlist-test-path' },
+    { command: 'node --test /tmp/x/test/a.test.mjs', rule: 'allowlist-test-path' },
+    {
+      command: 'node --test --test-name-pattern foo scripts/release.mjs',
+      rule: 'allowlist-test-path',
+    },
+    // 以 '.' 开头且含 * / ? 的段会被宿主 /bin/sh 展开成 '..'（macOS bash 3.2 实测
+    // sh -c 'node --test test/.?/scripts/release.mjs' 执行了 scripts/release.mjs），
+    // 与已拦截的 test/../scripts/release.mjs 等价；引号或转义写法同样拒绝，不依赖 shell 是否展开。
+    { command: 'node --test test/.?/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test test/.*/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test test/..*/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test .?/Test/x.mjs', rule: 'allowlist-test-path' },
+    { command: "node --test 'test/.?/scripts/release.mjs'", rule: 'allowlist-test-path' },
+    { command: 'node --test test/\\.?/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'node --test test/.?', rule: 'allowlist-test-path' },
+    { command: 'npm test -- test/.?/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'npm test test/.?/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'pnpm test -- test/.*/scripts/release.mjs', rule: 'allowlist-test-path' },
+    { command: 'yarn test -- tests/.?/scripts/release.mjs', rule: 'allowlist-test-path' },
+    // 宿主 sh 把未加引号、位于词首的 '#' 当作注释起点，其后的词不会传给命令：
+    // 'tsc # --noEmit' 实际执行裸 tsc 并写出 JS，静态解析却会数到一个有效的 --noEmit。
+    { command: 'tsc # --noEmit', rule: 'allowlist-shell-comment' },
+    { command: 'tsc -p tsconfig.json # -noEmit', rule: 'allowlist-shell-comment' },
+    { command: 'vitest # run', rule: 'allowlist-shell-comment' },
+    { command: 'tsc "" # --noEmit', rule: 'allowlist-shell-comment' },
+    { command: 'node # --test test/a.test.mjs', rule: 'allowlist-shell-comment' },
+    // sh 只按空格与制表符分词；NBSP、\v、\f 等其它空白在本检查里会切词，在 sh 里却并进同一个词：
+    // 'tsc a.ts b.ts<NBSP>--noEmit' 让 tsc 只收到两个文件参数并写出 a.js（实测）。
+    { command: 'tsc a.ts b.ts --noEmit', rule: 'allowlist-shell-whitespace' },
+    { command: 'tsc a.ts b.ts\v--noEmit', rule: 'allowlist-shell-whitespace' },
+    { command: 'tsc a.ts b.ts\f--noEmit', rule: 'allowlist-shell-whitespace' },
+    { command: 'tsc a.ts　--noEmit', rule: 'allowlist-shell-whitespace' },
+    // 6) vitest：blob/html reporter 不带 --outputFile 也落盘；自定义 reporter/pool/environment/diff
+    // 是模块路径会被加载执行；--execArgv/-c 同理。
+    { command: 'vitest run --reporter=blob', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --reporter blob', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --reporter=html', rule: 'allowlist-write-like-arg' },
+    { command: 'npm test -- --reporter=blob', rule: 'allowlist-write-like-arg' },
+    { command: 'npm test -- --reporter blob', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --reporter=./scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    {
+      command: 'vitest run --execArgv=--import=data:text/javascript,1',
+      rule: 'allowlist-exec-like-arg',
+    },
+    { command: 'vitest run -c scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --config=scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --typecheck.checker=./x.sh', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --environment=./scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --pool=./scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --diff=./scripts/evil.mjs', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --root ../..', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --dir /', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run --experimental.fsModuleCache', rule: 'allowlist-exec-like-arg' },
+    { command: 'vitest run -u', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --update', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run -tu', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --clear-cache', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --attachments-dir=out', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --output-file=out.json', rule: 'allowlist-write-like-arg' },
+    { command: 'vitest run --api', rule: 'allowlist-network-like-arg' },
+    { command: 'vitest run --ui', rule: 'allowlist-network-like-arg' },
+    { command: 'vitest run --inspect-brk', rule: 'allowlist-network-like-arg' },
+    { command: 'vitest run --someUnknownFlag', rule: 'allowlist-vitest-option' },
+    { command: 'vitest init browser --run', rule: 'allowlist-vitest-run' },
+    { command: 'vitest -t x init --run', rule: 'allowlist-vitest-run' },
+    // 7) jest：yargs 接受 kebab/camel 互换、collectCoverage 别名、可传 JSON 的 --config，
+    // 以及大量会加载模块或改写测试文件集合的选项。
+    { command: 'jest --cache-directory=src', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --clear-cache', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --output-file=package.json', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --collectCoverage', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --collect-coverage', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --updateSnapshot', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --update-snapshot', rule: 'allowlist-write-like-arg' },
+    { command: 'jest -u', rule: 'allowlist-write-like-arg' },
+    { command: 'jest -iu', rule: 'allowlist-write-like-arg' },
+    { command: 'jest --config \'{"collectCoverage":true}\'', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest -c jest.evil.js', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest --setupFiles=./scripts/x.js', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest --setup-files-after-env=./scripts/x.js', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest --testRegex=scripts/release', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest --test-runner=./scripts/x.js', rule: 'allowlist-exec-like-arg' },
+    { command: 'jest --watchAll', rule: 'allowlist-jest-option' },
+    // 同一结构下其余 bin 的等价拼写：eslint 配置/formatter/插件会被加载执行，cache/suppress 写盘。
+    { command: 'eslint -c scripts/evil.mjs src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --config=scripts/evil.mjs src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint -f ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --format=./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --rulesdir scripts src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --plugin evil src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --outputFile=out.txt src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint -xo out.txt src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --cache-strategy content src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --suppress-all src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --prune-suppressions src', rule: 'allowlist-write-like-arg' },
+    // find 主表达式是单横线长名；git diff 写类参数的 kebab/大小写变体。
+    { command: 'find . -fprint out', rule: 'allowlist-write-like-arg' },
+    { command: 'find . -Delete', rule: 'allowlist-write-like-arg' },
+    { command: 'git log -p --output out.patch', rule: 'allowlist-write-like-arg' },
+    { command: 'git diff --ext_diff HEAD', rule: 'allowlist-exec-like-arg' },
+    // 宿主 /bin/sh 会做花括号展开：未加引号的 {a,b} 能在静态检查之后拼出被拒绝的选项名
+    // （实测 sh -c 'echo --{hostname-bin=./x.sh,hyperlink-format=file}' 输出两个独立选项）。
+    {
+      command: 'rg --{hostname-bin=./x.sh,hyperlink-format=file} --color=always Recipe src',
+      rule: 'allowlist-shell-brace-expansion',
+    },
+    {
+      command: 'tsc --noEmit -{incremental,p} tsconfig.json',
+      rule: 'allowlist-shell-brace-expansion',
+    },
+    {
+      command: 'eslint --{output-file,quiet}=out.txt src',
+      rule: 'allowlist-shell-brace-expansion',
+    },
+  ])('blocks equivalent spelling $command with $rule', ({ command, rule }) => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(rule);
+      expect(result.block.reason).not.toBe('');
+    }
+  });
+
+  it.each([
+    // 短选项簇与跨 bin 同名参数：只有本 bin 的表才生效，ls -fls / grep -i / rg -u 不被误判。
+    'ls -fls',
+    'ls -lai src',
+    'grep -i Recipe src/index.ts',
+    'grep -rni recipe src',
+    'rg -u Recipe src',
+    'rg -uu -i Recipe src',
+    'rg -o -i Recipe src',
+    'rg --hyperlink-format=file Recipe src',
+    'git blame --incremental src/index.ts',
+    'git log -i --grep=fix',
+    'git diff --no-ext-diff HEAD~1',
+    'git log -p --output-indicator-new=+',
+    // 以 glob 字符开头的模式要加引号（L4-P7b：未加引号时会被宿主 sh 展开成仓库里的文件名）。
+    "find . -name '*.test.ts' -type f",
+    // 引号或反斜杠里的花括号不会被 shell 展开，仍是普通 literal。
+    "git log --format='{%h}' -n3",
+    'rg "\\{" src',
+    'rg \\{ src',
+    // tsc 的单横线/大小写等价拼写对 --noEmit 同样成立。
+    'tsc -noEmit',
+    'tsc --noemit -p tsconfig.json',
+    'tsc --noEmit -p tsconfig.json --pretty false',
+    'tsc --noEmit -noEmit true',
+    'biome check --reporter=json src',
+    'biome ci --diagnostic-level=error src',
+    'eslint -f stylish src',
+    'eslint src --format=json',
+    'eslint --fix-dry-run src',
+    // jest / vitest 的只读参数与过滤写法。
+    'jest -i',
+    'jest -t parses',
+    'jest --runInBand --ci',
+    'jest --testNamePattern=foo src/a.test.js',
+    'jest --test-name-pattern foo',
+    'vitest run -t foo',
+    'vitest run terminal-safety',
+    'vitest run init',
+    'vitest run --project=unit',
+    'vitest related src/a.ts --run',
+    'vitest run --no-color --reporter=verbose',
+    'vitest run --pool=forks --environment=jsdom',
+    'vitest run --silent=passed-only --bail 1',
+    'vitest --run --reporter dot',
+    // 包管理器白名单内的自身选项，以及 '--' 之后测试运行器的只读参数。
+    'npm test --silent',
+    'npm test -s',
+    'npm test --if-present',
+    'npm test --silent -- --reporter=dot',
+    'npm run lint:check -s',
+    'pnpm test -- test/a.test.ts',
+    'yarn test -- --testNamePattern=foo',
+    'npm test -- -t=parses',
+    'npm test -- --bail 1',
+    'npm test -- --maxWorkers=2 --reporter dot test/a.test.ts',
+    'npm test -- tests/unit/a.mjs src/__tests__/b.mjs',
+    'npm test test/a.test.ts',
+    // node --test 的测试文件位置参数：测试名后缀、测试目录、目录本身与只含 * 的 glob。
+    'node --test tests/unit/a.mjs',
+    'node --test src/__tests__/a.mjs',
+    'node --test src/a.spec.mjs',
+    'node --test test/**/*.test.mjs',
+    "node --test '**/*.test.mjs'",
+    'node --test test',
+    'node --test ./test/a.test.mjs',
+    // 不以 '.' 开头的 glob 段、以 '.' 开头但不含 glob 的段都不会展开成 '.' / '..'。
+    'node --test test/.fixtures/a.test.mjs',
+    'node --test test/*/a.test.mjs',
+    'npm test -- test/*.test.ts',
+    // 引号内、反斜杠转义或位于词中的 '#' 不开始 shell 注释；制表符是 sh 的分词符。
+    "rg '#' src",
+    'rg "#" src',
+    'rg \\#todo src',
+    'rg foo#bar src',
+    "git log --grep='#123'",
+    'git log --grep=fix#1',
+    "rg ''#todo src",
+    'tsc\t--noEmit\t-p\ttsconfig.json',
+  ])('still allows read-only command %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it('applies bin-specific short options only to their own bin when callers allowlist other bins', () => {
+    // sed 不在 Evolution allowlist 里，但 checkTerminalCommandAllowlist 对调用方给出的 bins 通用：
+    // -i 是 sed 的原地改写（-i.bak、-Ei 簇、BSD -I 同义），不能因为挪出共享表而失效。
+    for (const command of ['sed -i.bak s/a/b/ f', 'sed -Ei s/a/b/ f', 'sed --in-place s/a/b/ f']) {
+      const result = checkTerminalCommandAllowlist(command, ['sed']);
+      expect(result.safe, command).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule, command).toBe('allowlist-write-like-arg');
+      }
+    }
+    expect(checkTerminalCommandAllowlist('sed -n p f', ['sed'])).toEqual({ safe: true });
+  });
+
+  it('logs every allowlist rejection with its rule id and without the raw option value', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = checkTerminalCommandAllowlist(
+        'npm test --script-shell=./scripts/secret-token-123.sh',
+        evolutionBins
+      );
+      expect(result.safe).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain('allowlist-package-manager-option');
+      expect(message).toContain('bin=npm');
+      expect(message).not.toContain('secret-token-123');
+
+      warn.mockClear();
+      expect(checkTerminalCommandAllowlist('git log -n3', evolutionBins)).toEqual({ safe: true });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps allowlist decisions when the logger itself throws', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+      throw new Error('synthetic logger unavailable');
+    });
+    try {
+      const result = checkTerminalCommandAllowlist(
+        'rg --hostname-bin=./x.sh Recipe',
+        evolutionBins
+      );
+      expect(result.safe).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule).toBe('allowlist-exec-like-arg');
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs the shell-level rejections with their rule ids', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const cases = [
+        { command: 'tsc # --noEmit', rule: 'allowlist-shell-comment', bin: 'tsc' },
+        { command: 'tsc a.ts b.ts --noEmit', rule: 'allowlist-shell-whitespace' },
+        {
+          command: 'node --test test/.?/scripts/release.mjs',
+          rule: 'allowlist-test-path',
+          bin: 'node',
+        },
+      ];
+      for (const { command, rule, bin } of cases) {
+        warn.mockClear();
+        const result = checkTerminalCommandAllowlist(command, evolutionBins);
+        expect(result.safe, command).toBe(false);
+        expect(warn, command).toHaveBeenCalledTimes(1);
+        const message = String(warn.mock.calls[0]?.[0]);
+        expect(message, command).toContain(`rule=${rule}`);
+        if (bin) {
+          expect(message, command).toContain(`bin=${bin}`);
+        }
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'models the host /bin/sh word list behind the comment and whitespace rules',
+    () => {
+      // 差分对照：把命令名换成 printf，观察宿主 sh 真实交给命令的参数。被拒写法在 sh 里丢词或并词，
+      // 与静态解析不一致；放行的对照写法在 sh 里与静态解析看到的参数一致。
+      const shellArgv = (rest: string) =>
+        execFileSync('/bin/sh', ['-c', `printf '[%s]' ${rest}`], { encoding: 'utf8' });
+      expect(shellArgv('# --noEmit')).toBe('[]');
+      expect(shellArgv('-p tsconfig.json # -noEmit')).toBe('[-p][tsconfig.json]');
+      expect(shellArgv('"" # --noEmit')).toBe('[]');
+      expect(shellArgv('a.ts b.ts --noEmit')).toBe('[a.ts][b.ts --noEmit]');
+      expect(shellArgv('a.ts b.ts\v--noEmit')).toBe('[a.ts][b.ts\v--noEmit]');
+      expect(shellArgv("'#' src")).toBe('[#][src]');
+      expect(shellArgv('\\#todo src')).toBe('[#todo][src]');
+      expect(shellArgv('foo#bar src')).toBe('[foo#bar][src]');
+      expect(shellArgv("''#todo src")).toBe('[#todo][src]');
+      expect(shellArgv("--grep='#123'")).toBe('[--grep=#123]');
+      expect(shellArgv('--noEmit\t-p\ttsconfig.json')).toBe('[--noEmit][-p][tsconfig.json]');
+    }
+  );
+
+  // L4-P7a 返工：复查指出 eslint -f/--format 的值校验在空格写法下只取“不以 '-' 开头”的下一个 token。
+  // eslint 的 optionator 只把“横线 + 字母”开头的 token 当选项，其余（-/..、--/..、-1/..）都会被当作值；
+  // 选项名也只取 [A-Za-z][-A-Za-z0-9]*，其后的 '_'、'/'、':' 等字符在没有 '=' 紧随时被静默丢弃。
+  // ESLint 9.39.4 实测：下列 -f/--format 写法都执行了 evil 文件，--output-file_x 写出了文件，--fix_x 即 --fix。
+  it.each([
+    { command: 'eslint -f -/../lib/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --format --/../lib/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint -f -1/../lib/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint -f=json --format -/../lib/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --format/x ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --format_x ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --format:x=json ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --config_x ./scripts/evil.mjs src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --plugin:x evil src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --mcp/x', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --rulesdir_x scripts src', rule: 'allowlist-exec-like-arg' },
+    { command: 'eslint --fix_x src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --fix/x src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --output-file_x package.json src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --o/x package.json src', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --init_x', rule: 'allowlist-write-like-arg' },
+    { command: 'eslint --inspect-config_x', rule: 'allowlist-network-like-arg' },
+    // 包管理器 '--' 之后再出现的 '--' 让其后的 token 全部成为位置参数：node --test 会把 -t 当作测试文件执行。
+    { command: 'npm test -- -- -t', rule: 'allowlist-test-path' },
+    { command: 'npm test -- -- --help', rule: 'allowlist-test-path' },
+    { command: 'pnpm test -- --silent -- -v', rule: 'allowlist-test-path' },
+    // cac 不校验未声明的点号子键：白名单只放行 vitest CLI 声明过的 sequence/expect 子键。
+    { command: 'vitest run --sequence.sequencer=./x.mjs', rule: 'allowlist-vitest-option' },
+    { command: 'vitest run --expect.custom=./x.mjs', rule: 'allowlist-vitest-option' },
+    { command: 'npm test -- --sequence.sequencer=./x.mjs', rule: 'allowlist-runner-option' },
+  ])('blocks rework-review equivalent spelling $command with $rule', ({ command, rule }) => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(rule);
+    }
+  });
+
+  it.each([
+    // 规整写法与只读的同前缀选项：--fix-dry-run 的名字段是 fix-dry-run，不是 --fix 加尾巴。
+    'eslint -f json --max-warnings 0 src',
+    'eslint --format json src',
+    'eslint -f=stylish src',
+    'eslint --fix-dry-run --fix-type problem src',
+    'eslint --no-fix src',
+    'eslint --rule=no-console:error src',
+    'npm test -- -- test/a.test.ts',
+    'node --test --test-name-pattern=foo_bar test/a.test.mjs',
+    'git log --format=%h_%s -n3',
+    'git log -p --output-indicator-new=+',
+    'rg --pre-glob=*.gz Recipe src',
+    'vitest run --sequence.shuffle.files --sequence.hooks=list --sequence.setupFiles=list',
+    'vitest run --expect.requireAssertions --expect.poll.timeout=100',
+  ])('still allows plain read-only spelling %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it('treats GNU getopt_long abbreviations of sed --in-place as in-place edits', () => {
+    // GNU sed 接受无歧义的长选项前缀（--in、--in-pl 都等于 --in-place）；sed 不在 Evolution allowlist，
+    // 但调用方给出 sed 时同一结构必须成立。
+    for (const command of ['sed --in=bak s/a/b/ f', 'sed --in-pl s/a/b/ f', 'sed --i s/a/b/ f']) {
+      const result = checkTerminalCommandAllowlist(command, ['sed']);
+      expect(result.safe, command).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule, command).toBe('allowlist-write-like-arg');
+      }
+    }
+    expect(checkTerminalCommandAllowlist('sed --quiet -n p f', ['sed'])).toEqual({ safe: true });
+  });
+
+  it('blocks the audited bypasses before the sandbox executor through the Evolution router', async () => {
+    const commands = [
+      'eslint -f -/../lib/evil.js src',
+      'eslint --format/x ./scripts/evil.js src',
+      'eslint --fix_x src',
+      'tsc --noEmit -incremental -tsBuildInfoFile package.json',
+      'tsc --noEmit -noEmit false',
+      'tsc # --noEmit',
+      'tsc a.ts b.ts --noEmit',
+      'node --test test/.?/scripts/release.mjs',
+      'npm test -- test/.?/scripts/release.mjs',
+      'biome check --reporter=json --reporter-file=package.json src',
+      'rg --hostname-bin=./scripts/x.sh --hyperlink-format=file --color=always Recipe src',
+      'npm test --script-shell=./scripts/evil.sh',
+      'npm test -- scripts/release.mjs',
+      'node --test scripts/release.mjs',
+      'vitest run --reporter=blob',
+      'npm test -- --reporter=blob',
+      'jest --cache-directory=src',
+      'jest --config \'{"collectCoverage":true}\'',
+    ];
+    for (const command of commands) {
+      let executorCalls = 0;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        new ToolRouter({ capability: new Evolution().toDef() })
+      );
+      expect(result.ok, command).toBe(false);
+      expect(result.error, command).toMatch(
+        /Command blocked by allowlist: .+ \(allowlist-[a-z-]+\)/
+      );
+      expect(executorCalls, command).toBe(0);
+    }
+  });
+});
+
+// L4-P7b：L4-P7a 三轮复查的阻塞项与整体再查一轮发现的绕过。每组都按同一向量构造等价写法：
+// 引号/转义/空格与内联取值、包管理器透传形式，并给不该误伤的写法补放行对照。
+describe('Evolution read-only allowlist rework after third-round review (L4-P7b)', () => {
+  const evolutionBins = new Evolution().commandAllowlist.bins;
+  const blockedRule = (command: string): string | null => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    return result.safe ? null : result.block.rule;
+  };
+
+  // (4) vitest 4.1.6 的 ReportersMap 没有 basic；未知名字会被 loadCustomReporterModule 当模块 import 执行。
+  // Object 原型上的名字（toString、constructor）在 vitest 的 `name in ReportersMap` 判断里也算命中，
+  // 白名单按集合精确比较，不受影响；大小写不同的名字同样不是内置 reporter。
+  it.each([
+    'vitest run --reporter=basic',
+    'vitest run --reporter basic',
+    'vitest --run --reporter basic',
+    'vitest run --reporter=dot --reporter=basic',
+    'npm test -- --reporter=basic',
+    'npm test -- --reporter basic',
+    'pnpm test -- --reporter basic',
+    'yarn test -- --reporter=basic',
+    'vitest run --reporter=toString',
+    'vitest run --reporter constructor',
+    'vitest run --reporter=__proto__',
+    'vitest run --reporter=Default',
+    'vitest run --reporter=dot,basic',
+  ])('rejects the non-builtin vitest reporter in %s', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-exec-like-arg');
+  });
+
+  it('keeps the vitest reporter allowlist in sync with the installed vitest ReportersMap', async () => {
+    // 已安装 vitest 的内置 reporter 表：放行的名字必须都在表里；表里的名字要么放行，要么按写盘拒绝
+    // （blob、github-actions），绝不能落到“当模块加载执行”的分支；html 不在表里，单独按写盘拒绝。
+    const { ReportersMap } = await import('vitest/node');
+    const builtins = Object.keys(ReportersMap);
+    const readonlyReporters = [
+      'default',
+      'agent',
+      'minimal',
+      'verbose',
+      'dot',
+      'json',
+      'tap',
+      'tap-flat',
+      'junit',
+      'tree',
+      'hanging-process',
+    ];
+    for (const name of readonlyReporters) {
+      expect(builtins, name).toContain(name);
+      for (const command of [
+        `vitest run --reporter=${name}`,
+        `vitest run --reporter ${name}`,
+        `npm test -- --reporter=${name}`,
+        `npm test -- --reporter ${name}`,
+      ]) {
+        expect(checkTerminalCommandAllowlist(command, evolutionBins), command).toEqual({
+          safe: true,
+        });
+      }
+    }
+    for (const name of builtins.filter((builtin) => !readonlyReporters.includes(builtin))) {
+      expect(blockedRule(`vitest run --reporter=${name}`), name).toBe('allowlist-write-like-arg');
+    }
+    expect(builtins).not.toContain('basic');
+    expect(blockedRule('vitest run --reporter=html')).toBe('allowlist-write-like-arg');
+  });
+
+  // (3) eslint -f/--format：空格与内联取值、短/长名、包管理器透传，都只放行内置 formatter 名；
+  // 路径、包名（含作用域包）、大小写变体与以 '-' 开头的值一律按“加载执行模块”拒绝。
+  const nonBuiltinFormatters = [
+    './scripts/evil.js',
+    'scripts/evil.js',
+    'evil',
+    '@scope/formatter',
+    'json/../../scripts/evil.js',
+    'JSON',
+    '-/../scripts/evil.js',
+  ];
+  it.each(
+    nonBuiltinFormatters.flatMap((value) => [
+      `eslint -f ${value} src`,
+      `eslint -f=${value} src`,
+      `eslint --format ${value} src`,
+      `eslint --format=${value} src`,
+      `eslint src -f json --format ${value}`,
+      `npm run lint -- -f ${value}`,
+      `npm run lint -- --format ${value}`,
+      `npm run lint -- --format=${value}`,
+    ])
+  )('rejects the non-builtin eslint formatter in %s', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-exec-like-arg');
+  });
+
+  it.each([
+    'stylish',
+    'json',
+    'json-with-metadata',
+    'html',
+  ])('allows the builtin eslint formatter %s in both value spellings', (name) => {
+    for (const command of [
+      `eslint -f ${name} src`,
+      `eslint -f=${name} src`,
+      `eslint --format ${name} src`,
+      `eslint --format=${name} src`,
+    ]) {
+      expect(checkTerminalCommandAllowlist(command, evolutionBins), command).toEqual({
+        safe: true,
+      });
+    }
+  });
+
+  // (1) 以 '.' 开头且含 * / ? 的路径段能展开成 '.' 或 '..'：引号、转义、大小写、目录本身与透传形式的等价写法。
+  it.each([
+    'node --test test/.?/scripts/release.mjs',
+    'node --test test/".?"/scripts/release.mjs',
+    'node --test test/"."?/scripts/release.mjs',
+    'node --test test/.??/scripts/release.mjs',
+    'node --test test/.?*/scripts/release.mjs',
+    'node --test test/.*.*/scripts/release.mjs',
+    'node --test TEST/.?/scripts/release.mjs',
+    'node --test __tests__/.*/scripts/release.mjs',
+    'node --test ./test/./.?/scripts/release.mjs',
+    'node --test test/a.test.mjs test/.?/scripts/release.mjs',
+    'node --test --test-name-pattern=x test/.*/scripts/release.mjs',
+    'npm test -- --bail 1 test/.?/scripts/release.mjs',
+    'npm test -- -- test/.?/scripts/release.mjs',
+    'npm run test:unit -- tests/.*/scripts/release.mjs',
+    'pnpm test tests/.?/scripts/release.mjs',
+  ])('rejects the dot-prefixed glob segment in %s', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-test-path');
+  });
+
+  // (2) 宿主 sh 的词首 '#' 注释：制表符之后、命令开头、引号紧邻之后的空格之后都算词首。
+  it.each([
+    'tsc\t# --noEmit',
+    '# tsc --noEmit',
+    'tsc -p tsconfig.json\t#-noEmit',
+    "tsc '' #--noEmit",
+    'tsc -p tsconfig.json #',
+    'vitest #run',
+    'node --test #test/a.test.mjs',
+    'npm test # -- --reporter=dot',
+  ])('rejects the unquoted word-start comment in %s', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-shell-comment');
+  });
+
+  it.each([
+    "tsc --noEmit -p 'tsconfig.json#x'",
+    'tsc --noEmit -p "#tsconfig.json"',
+    'rg "a #b" src',
+    "rg 'TODO #' src",
+    'rg \\#\\# src',
+    'rg a#b#c src',
+    "rg ''#x src",
+    'rg ""#x src',
+    'git log --grep=#1 -n3',
+  ])('still allows quoted, escaped and mid-word # in %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  // 整体再查一轮：宿主 sh 的路径名展开把未加引号的 glob 换成匹配的文件名，文件名可以以 '-' 开头。
+  // 以 glob 字符开头（或以 '-' 开头、'=' 之前含 glob 字符）的词展开后可能变成任意选项：仓库里放一个名为
+  // '--pre=sh' 的文件，'rg Recipe *' 就会以 sh 执行每个被搜索的文件（rg 15.1.0 实测）。
+  it.each([
+    'rg Recipe *',
+    'rg Recipe -- *',
+    'rg -n Recipe *.ts',
+    'grep -rn Recipe ?eadme.md',
+    'cat [a-z]*.md',
+    'ls *',
+    'wc -l *.ts',
+    'rg Recipe ""*',
+    "rg Recipe ''?",
+    'rg -*',
+    'rg --pre*',
+    'tsc --noEmit -?ncremental',
+    'tsc --noEmit --*',
+    'tsc --noEmit *.ts',
+    'find . -name *.test.ts -type f',
+    'node --test *.test.mjs',
+    'node --test **/*.test.mjs',
+    'npm test -- *.test.ts',
+    'npm test -- -*',
+    'vitest run -u*',
+    'eslint -*/x src',
+    'jest --*=1',
+  ])('rejects the unquoted glob that can expand to an option in %s', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-shell-glob-option');
+  });
+
+  it.each([
+    'rg Recipe ./*',
+    'rg Recipe src/*',
+    'rg Recipe src/*.ts',
+    'wc -l src/*.ts',
+    'ls ./*.md',
+    'ls \\*',
+    "rg -g '*.ts' Recipe src",
+    'rg -g "*.ts" Recipe src',
+    'rg --glob=*.ts Recipe src',
+    'rg --pre-glob=*.gz Recipe src',
+    "find . -name '*.test.ts' -type f",
+    'find . -name \\*.test.ts -type f',
+    "node --test '**/*.test.mjs'",
+    'node --test ./**/*.test.mjs',
+    'node --test test/*.test.mjs',
+    'npm test -- test/*.test.ts',
+    'npm test -- --testNamePattern=*',
+    'rg x*y src',
+    'cat README*',
+  ])('still allows the glob that cannot expand to an option in %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'models the host /bin/sh pathname expansion behind the glob-option rule',
+    () => {
+      // 差分对照：目录里有一个名为 '--pre=sh' 的文件时，sh 把 '*' 展开成这个“选项”，'./*' 展开成路径。
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'alembic-glob-option-'));
+      try {
+        writeFileSync(path.join(dir, '--pre=sh'), '');
+        writeFileSync(path.join(dir, 'a.txt'), '');
+        const shellArgv = (rest: string) =>
+          execFileSync('/bin/sh', ['-c', `printf '[%s]' ${rest}`], { cwd: dir, encoding: 'utf8' });
+        // 展开结果的排序取决于 locale 排序规则，只断言成员。
+        expect(shellArgv('*')).toContain('[--pre=sh]');
+        expect(shellArgv('./*')).toContain('[./--pre=sh]');
+        expect(shellArgv('./*')).not.toContain('[--pre=sh]');
+        expect(shellArgv("'*'")).toBe('[*]');
+        expect(shellArgv('--glob=*')).toBe('[--glob=*]');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  // 合并 HEAD 词法器后的回归点：双引号内 '\x'（x 不是 $ ` " \）在 sh 里保留反斜杠。旧词法器会把
+  // "\-\-noEmit" 读成 --noEmit 并放行，sh 交给 tsc 的却是文件名 '\-\-noEmit'，tsc 照常写出 JS。
+  it.skipIf(process.platform === 'win32')(
+    'keeps POSIX double-quote backslash semantics from the shared shell lexer',
+    () => {
+      expect(blockedRule('tsc "\\-\\-noEmit"')).toBe('allowlist-tsc-noemit');
+      expect(blockedRule('tsc -p tsconfig.json "\\-noEmit"')).toBe('allowlist-tsc-noemit');
+      expect(
+        execFileSync('/bin/sh', ['-c', `printf '[%s]' "\\-\\-noEmit"`], { encoding: 'utf8' })
+      ).toBe('[\\-\\-noEmit]');
+    }
+  );
+
+  // NUL 会截断交给 /bin/sh 的 C 字符串：'tsc -p tsconfig.json<NUL> --noEmit' 静态看到 --noEmit，
+  // 真实执行只剩 'tsc -p tsconfig.json'。其它 C0 控制字符同样不该出现在只读取证命令里。
+  it.each([
+    'tsc -p tsconfig.json\u0000 --noEmit',
+    'node --test test/a.test.mjs\u0000 scripts/release.mjs',
+    'rg Recipe\u001b src',
+    'rg Recipe\u007f src',
+  ])('rejects control characters in %j', (command) => {
+    expect(blockedRule(command), command).toBe('allowlist-shell-control-char');
+  });
+
+  it('blocks the third-round bypasses before the sandbox executor and logs their rule ids', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const cases = [
+        { command: 'vitest run --reporter=basic', rule: 'allowlist-exec-like-arg' },
+        { command: 'npm test -- --reporter basic', rule: 'allowlist-exec-like-arg' },
+        { command: 'eslint --format ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
+        { command: 'node --test test/"."?/scripts/release.mjs', rule: 'allowlist-test-path' },
+        { command: 'tsc\t# --noEmit', rule: 'allowlist-shell-comment' },
+        { command: 'rg Recipe *', rule: 'allowlist-shell-glob-option' },
+        { command: 'tsc -p tsconfig.json\u0000 --noEmit', rule: 'allowlist-shell-control-char' },
+      ];
+      for (const { command, rule } of cases) {
+        warn.mockClear();
+        let executorCalls = 0;
+        const result = await runTerminalExec(
+          command,
+          baseToolContext({
+            sandboxExecutor: {
+              exec: async () => {
+                executorCalls++;
+                return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+              },
+            },
+          }),
+          {},
+          new ToolRouter({ capability: new Evolution().toDef() })
+        );
+        expect(result.ok, command).toBe(false);
+        expect(result.error, command).toContain(`(${rule})`);
+        expect(executorCalls, command).toBe(0);
+        const messages = warn.mock.calls.map((call) => String(call[0]));
+        expect(
+          messages.some((message) => message.includes(`rule=${rule}`)),
+          command
+        ).toBe(true);
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

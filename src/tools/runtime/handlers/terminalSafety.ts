@@ -18,6 +18,7 @@
  */
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 
 export const DENIED_BINS = new Set([
   'sudo',
@@ -48,92 +49,746 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
 
 const READONLY_PACKAGE_SCRIPTS = new Set(['test', 'lint', 'build:check', 'typecheck']);
 const READONLY_BIOME_COMMANDS = new Set(['check', 'ci']);
-// 只读 allowlist 的写类参数黑名单。比较前先小写，并按 writeLikeOptionName 取选项名：
-// 带 '=' 的写法取 '=' 之前的部分（--output=x、--generatetrace=x 都命中同一条目）；
-// cac（vitest）/ yargs（jest）的点号写法再取 '.' 之前的部分，所以 --outputFile.json=x、
-// --outputFile.json x 与 --outputFile=x 一样命中 '--outputfile'，不会因为子键写法绕过。
-// 这里只放不会与其它只读 bin 的同名只读参数冲突的条目；会冲突的短参数放在 BIN_WRITE_LIKE_ARGS。
-const WRITE_LIKE_ARGS = new Set([
-  '--fix',
-  '--write',
-  '-i',
-  '--in-place',
-  '-u',
-  '--update',
-  '--updatesnapshot',
-  '--update-snapshot',
-  // find：-delete/-exec*/-ok* 执行或删除，-fprint*/-fls 把结果写进文件。
-  '-delete',
-  '-exec',
-  '-execdir',
-  '-ok',
-  '-okdir',
-  '-fprint',
-  '-fprint0',
-  '-fprintf',
-  '-fls',
-  '--pre',
-  '--output',
-  '--ext-diff',
-  '--textconv',
-  // eslint：-o/--output-file 写报告，--cache* 写 .eslintcache，--init 生成配置并安装依赖。
-  '--output-file',
-  '--cache',
-  '--cache-location',
-  '--cache-file',
-  '--init',
-  // jest/vitest：--outputFile（含 vitest 多 reporter 的 --outputFile.<reporter>=path 点号写法）写结果，
-  // --cacheDirectory 写缓存目录，--clearCache 删除缓存。
-  '--outputfile',
-  '--cachedirectory',
-  '--clearcache',
-  // tsc：--init 写 tsconfig，-b/--build 与 --incremental/--tsBuildInfoFile 即使带 --noEmit 也写 tsbuildinfo，
-  // --generateTrace/--generateCpuProfile 写诊断文件。
-  '--build',
-  '--incremental',
-  '--tsbuildinfofile',
-  '--generatetrace',
-  '--generatecpuprofile',
-  // biome 1.x：--apply/--apply-unsafe 等价于写回修复。
-  '--apply',
-  '--apply-unsafe',
+
+/*
+ * 只读 allowlist 的选项判定（L4-P07 → L4-P7a）
+ *
+ * 7ac8836 只按字面拼写比较黑名单，审计用同一 bin 的等价拼写全部绕过：tsc 的单横线长选项
+ * （-incremental）、jest 的 kebab/camel 互换（--cache-directory）、biome/rg/npm 未登记的写盘或执行选项。
+ * 这里改成结构化判定：
+ * 1. parseOption 按 bin 无关的规则规范化选项名：去掉前导一或两个横线，去掉 '=' 之后的值与 '.' 之后的
+ *    子键，再把 kebab/snake/camel 折叠成无分隔小写（--cache-directory、--cacheDirectory、-cacheDirectory
+ *    都得到 cachedirectory）；黑名单与白名单都按规范化后的名字比较。
+ *    eslint 的 optionator 另有一套切名规则：选项名只取 [A-Za-z][-A-Za-z0-9]*，名字之后的 '_'、'/'、':' 等
+ *    字符在没有 '=' 紧随时被静默丢弃（--fix_x 即 --fix，--format/x 等于 --format 并取下一个 token 为值）。
+ *    所以黑名单同时按“名字段”（stem）比较；其它 bin 的解析器（rg、biome、git、tsc 实测）会把这类 token
+ *    当未知选项报错退出，多拦一次不损失只读能力。值类选项（reporter/formatter 等）只接受规整写法，
+ *    空格写法的值取紧随其后的 token，不论它是否以 '-' 开头（optionator 把 -/..、--/..、-1/.. 都当值）。
+ * 2. BIN_DASH_SYNTAX 记录每个 bin 怎样解释单横线多字符 token：tsc/find/node 当长选项名
+ *    （tsc -incremental、find -delete），其余 getopt/yargs/cac/optionator 风格的 bin 当短选项簇逐字母比较
+ *    （ls -fls、grep -in、rg -uu 不会被当成某个长选项名误判）。未知 bin 两种解释都查。
+ * 3. 写盘/执行类条目按 bin 分表（BIN_OPTION_TABLES），跨 bin 同名但含义不同的参数不再进共享表：
+ *    git blame --incremental、ls -fls、grep -i、rg -u 都是只读参数。
+ * 4. 测试运行器（vitest/jest/node --test）与包管理器自身选项改为白名单；包管理器 '--' 之后交给
+ *    运行器无关的透传规则：运行器未知，所以取 vitest/jest/node --test 以及 lint/typecheck 脚本的并集从严判定。
+ * 5. 宿主经 '/bin/sh -c' 执行命令，shell 层变换会让真实 argv 偏离本检查看到的词：未加引号的花括号展开、
+ *    词首 '#' 注释（丢掉其后的词）、空格/制表符以外的空白（本检查切词、sh 不切）、NUL 等控制字符（NUL 截断
+ *    交给 sh 的 C 字符串）、能展开成以 '-' 开头的文件名的未加引号 glob（仓库里名为 '--pre=sh' 的文件让
+ *    'rg Recipe *' 多出一个执行选项），以及测试路径里以 '.' 开头的 glob 段（展开成 '..'）。
+ *    这些写法一律拒绝，而不是尝试模拟 shell 展开结果。
+ * 这些都只是静态 literal 检查；npm test 等命令仍会执行仓库自身代码，真正只读要靠宿主只读沙箱（L4-P38）。
+ */
+
+/** 选项风险类别：写盘、加载/执行模型挑选的模块或可执行文件、开端口/起服务。类别决定拒绝规则 id。 */
+type OptionRisk = 'write' | 'exec' | 'network';
+
+const OPTION_RISK_RULES: Readonly<Record<OptionRisk, string>> = {
+  write: 'allowlist-write-like-arg',
+  exec: 'allowlist-exec-like-arg',
+  network: 'allowlist-network-like-arg',
+};
+
+const OPTION_RISK_LABELS: Readonly<Record<OptionRisk, string>> = {
+  write: 'Write-like',
+  exec: 'Module/executable-loading',
+  network: 'Network/server',
+};
+
+/** 值需要校验的选项：返回 null 表示该值只读安全，否则返回风险类别。 */
+type OptionValueCheck = (value: string) => OptionRisk | null;
+
+interface OptionTable {
+  /** 规范化名 → 风险。单字母条目在短选项簇语法下逐字母比较（不区分大小写，BSD sed -I 与 -i 同义）。 */
+  names: ReadonlyMap<string, OptionRisk>;
+  /** 规范化名前缀族，例如 --coverage* 与 eslint --cache* / --suppress*。 */
+  prefixes: ReadonlyArray<readonly [string, OptionRisk]>;
+  /** 规范化点号全路径，例如 vitest --typecheck.checker（只封子键，--typecheck.only 仍放行）。 */
+  paths: ReadonlyMap<string, OptionRisk>;
+  /** 值需要校验的选项（reporter、formatter、environment 等可以是模块路径）。 */
+  values: ReadonlyMap<string, OptionValueCheck>;
+  /**
+   * GNU getopt_long 接受无歧义的长选项前缀：[完整规范化名, 最短无歧义前缀长度, 风险]。
+   * 例如 GNU sed 的 --in、--in-pl 都等于 --in-place。
+   */
+  abbreviations: ReadonlyArray<readonly [string, number, OptionRisk]>;
+}
+
+/** 单横线多字符 token 的解释方式：cluster=短选项簇，long=长选项名，unknown=两种都查。 */
+type DashSyntax = 'cluster' | 'long' | 'unknown';
+
+const BIN_DASH_SYNTAX = new Map<string, DashSyntax>([
+  ['tsc', 'long'],
+  ['find', 'long'],
+  ['node', 'long'],
+  ...[
+    'git',
+    'rg',
+    'grep',
+    'ls',
+    'cat',
+    'head',
+    'tail',
+    'wc',
+    'jest',
+    'vitest',
+    'eslint',
+    'biome',
+    'npm',
+    'pnpm',
+    'yarn',
+    'sed',
+  ].map((bin) => [bin, 'cluster'] as const),
 ]);
-// 按选项名前缀匹配的写类参数族：jest 的 --coverage、--coverageDirectory、--coverageReporters 等
-// 都会把覆盖率报告写进项目目录；--coverage=false 之类的显式关闭写法也一并拒绝（默认即不开覆盖率）。
-// vitest 的 --coverage.enabled 等点号写法经 writeLikeOptionName 归一为 '--coverage' 后同样命中。
-const WRITE_LIKE_ARG_PREFIXES = ['--coverage'];
-// 只对特定 bin 生效的写类短参数：eslint -o 是输出文件，tsc -b 是 build 模式。
-// rg/grep -o（only-matching）与 jest -o/-b（onlyChanged/bail）是只读参数，不能被共享黑名单误伤。
-const BIN_WRITE_LIKE_ARGS = new Map<string, ReadonlySet<string>>([
-  ['eslint', new Set(['-o'])],
-  ['tsc', new Set(['-b'])],
+
+function riskOptionTable(spec: {
+  names?: Record<OptionRisk, readonly string[]>;
+  prefixes?: ReadonlyArray<readonly [string, OptionRisk]>;
+  paths?: ReadonlyArray<readonly [string, OptionRisk]>;
+  values?: ReadonlyArray<readonly [string, OptionValueCheck]>;
+  abbreviations?: ReadonlyArray<readonly [string, number, OptionRisk]>;
+}): OptionTable {
+  const names = new Map<string, OptionRisk>();
+  for (const risk of ['write', 'exec', 'network'] as const) {
+    for (const name of spec.names?.[risk] ?? []) {
+      names.set(name, risk);
+    }
+  }
+  return {
+    names,
+    prefixes: spec.prefixes ?? [],
+    paths: new Map(spec.paths ?? []),
+    values: new Map(spec.values ?? []),
+    abbreviations: spec.abbreviations ?? [],
+  };
+}
+
+/** 多张表合并成一张（先出现的条目优先），用于运行器未知的透传规则。 */
+function mergeOptionTables(tables: readonly OptionTable[]): OptionTable {
+  const names = new Map<string, OptionRisk>();
+  const paths = new Map<string, OptionRisk>();
+  const values = new Map<string, OptionValueCheck>();
+  const prefixes: Array<readonly [string, OptionRisk]> = [];
+  const abbreviations: Array<readonly [string, number, OptionRisk]> = [];
+  for (const table of tables) {
+    for (const [key, risk] of table.names) {
+      if (!names.has(key)) {
+        names.set(key, risk);
+      }
+    }
+    for (const [key, risk] of table.paths) {
+      if (!paths.has(key)) {
+        paths.set(key, risk);
+      }
+    }
+    for (const [key, check] of table.values) {
+      if (!values.has(key)) {
+        values.set(key, check);
+      }
+    }
+    prefixes.push(...table.prefixes);
+    abbreviations.push(...table.abbreviations);
+  }
+  return { names, prefixes, paths, values, abbreviations };
+}
+
+function builtinValueCheck(
+  allowed: ReadonlySet<string>,
+  overrides: ReadonlyMap<string, OptionRisk> = new Map()
+): OptionValueCheck {
+  // 非内置名会被当作包名或模块路径加载执行；比较保持大小写敏感，与各工具的解析一致。
+  return (value) => overrides.get(value) ?? (allowed.has(value) ? null : 'exec');
+}
+
+// vitest 内置 reporter，按已安装的 vitest 4.1.6 源码核对（dist/chunks/index.*.js 的 ReportersMap：default、
+// agent、minimal、blob、verbose、dot、json、tap、tap-flat、junit、tree、hanging-process、github-actions；
+// html 由 createReporters 单独加载 @vitest/ui）。不在表里的名字（包括 vitest 3 才有、4.x 已移除的 basic）
+// 会被 loadCustomReporterModule 当作模块从项目根解析并 import 执行，所以这里只列表内名字。
+// blob/html 不带 --outputFile 也会落盘，github-actions 在 CI 下写 job summary，三者按写盘拒绝。
+// 升级 vitest 时以测试里对 vitest/node 导出的 ReportersMap 的同步断言为准。
+const VITEST_READONLY_REPORTERS = new Set([
+  'default',
+  'agent',
+  'minimal',
+  'verbose',
+  'dot',
+  'json',
+  'tap',
+  'tap-flat',
+  'junit',
+  'tree',
+  'hanging-process',
 ]);
-// node 在只读 allowlist 中只允许 test runner 模式，并且选项采用白名单：
+const VITEST_WRITING_REPORTERS = new Map<string, OptionRisk>([
+  ['blob', 'write'],
+  ['html', 'write'],
+  ['github-actions', 'write'],
+]);
+const VITEST_BUILTIN_ENVIRONMENTS = new Set(['node', 'jsdom', 'happy-dom', 'edge-runtime']);
+const VITEST_BUILTIN_POOLS = new Set(['threads', 'forks', 'vmThreads', 'vmForks']);
+// ESLint 8/9 的内置 formatter；其余名字会解析成 eslint-formatter-* 包或路径并加载执行。
+// ESLint 9 对这些名字同样先尝试项目 node_modules 里的 eslint-formatter-<name> 包，那属于项目已安装的代码
+// （与配置文件加载插件同类），不是模型挑选的文件；真正隔离仍靠宿主只读沙箱（L4-P38）。
+const ESLINT_BUILTIN_FORMATTERS = new Set([
+  'stylish',
+  'json',
+  'json-with-metadata',
+  'html',
+  'checkstyle',
+  'compact',
+  'jslint-xml',
+  'junit',
+  'tap',
+  'unix',
+  'visualstudio',
+]);
+// 自定义 reporter 是模块路径或包名，node 会加载并执行它；只放行 Node 内置 reporter 名。
+const NODE_TEST_BUILTIN_REPORTERS = new Set(['tap', 'spec', 'dot', 'junit', 'lcov']);
+
+const vitestReporterCheck = builtinValueCheck(VITEST_READONLY_REPORTERS, VITEST_WRITING_REPORTERS);
+
+/** 对所有 bin 生效的写类选项：这些名字在任何只读 bin 上都没有只读含义。 */
+const GENERIC_OPTION_TABLE = riskOptionTable({
+  names: {
+    write: [
+      'fix',
+      'write',
+      'output',
+      'outputfile',
+      'update',
+      'updatesnapshot',
+      'inplace',
+      'init',
+      'cachedirectory',
+      'clearcache',
+    ],
+    exec: [],
+    network: [],
+  },
+  // jest/vitest 的 --coverage*、jest 的 collectCoverage（官方描述为 --coverage 的别名）都会写覆盖率报告；
+  // --coverage=false 这类显式关闭写法也一并拒绝（默认即不开覆盖率）。
+  prefixes: [
+    ['coverage', 'write'],
+    ['collectcoverage', 'write'],
+  ],
+});
+
+const TSC_OPTION_TABLE = riskOptionTable({
+  // tsc：-b/--build 与 -i/--incremental/--tsBuildInfoFile/--composite 即使带 --noEmit 也写 tsbuildinfo，
+  // --generateTrace/--generateCpuProfile 写诊断文件（--init 在通用表里）。tsc 选项名大小写不敏感。
+  names: {
+    write: [
+      'build',
+      'b',
+      'incremental',
+      'i',
+      'tsbuildinfofile',
+      'generatetrace',
+      'generatecpuprofile',
+      'composite',
+    ],
+    exec: [],
+    network: [],
+  },
+});
+
+const FIND_OPTION_TABLE = riskOptionTable({
+  // find：-delete 删除、-fprint*/-fls 把结果写进文件，-exec*/-ok* 执行任意命令。
+  names: {
+    write: ['delete', 'fprint', 'fprint0', 'fprintf', 'fls'],
+    exec: ['exec', 'execdir', 'ok', 'okdir'],
+    network: [],
+  },
+});
+
+const GIT_OPTION_TABLE = riskOptionTable({
+  // git diff/log/show：--ext-diff 与 --textconv 运行仓库配置的外部程序（--output 在通用表里）。
+  // 只读的 blame --incremental 只是输出格式，不在任何表里。
+  names: { write: [], exec: ['extdiff', 'textconv'], network: [] },
+});
+
+const RG_OPTION_TABLE = riskOptionTable({
+  // ripgrep：--pre 对每个文件执行预处理程序；≥14 的 --hostname-bin 配合 --hyperlink-format 无参执行任意可执行文件。
+  names: { write: [], exec: ['pre', 'hostnamebin'], network: [] },
+});
+
+const ESLINT_OPTION_TABLE = riskOptionTable({
+  // eslint：-o/--output-file 写报告，--cache* 写缓存，--suppress*/--prune-suppressions 写 suppressions 文件；
+  // -c/--config、--plugin、--parser、--rulesdir 与非内置 -f/--format 都会加载执行模块。
+  names: {
+    write: ['o', 'prunesuppressions'],
+    exec: ['c', 'config', 'plugin', 'parser', 'rulesdir', 'resolvepluginsrelativeto', 'mcp'],
+    network: ['inspectconfig'],
+  },
+  prefixes: [
+    ['cache', 'write'],
+    ['suppress', 'write'],
+  ],
+  values: [
+    ['f', builtinValueCheck(ESLINT_BUILTIN_FORMATTERS)],
+    ['format', builtinValueCheck(ESLINT_BUILTIN_FORMATTERS)],
+  ],
+});
+
+const BIOME_OPTION_TABLE = riskOptionTable({
+  // biome 2.x check/ci：--reporter-file/--log-file/--log-path 写任意路径；--write/--fix（通用表）、
+  // --unsafe 与 biome 1.x 的 --apply/--apply-unsafe 写回修复。
+  names: {
+    write: ['unsafe', 'apply', 'applyunsafe', 'reporterfile', 'logfile', 'logpath'],
+    exec: [],
+    network: [],
+  },
+});
+
+const SED_OPTION_TABLE = riskOptionTable({
+  // sed 不在 Evolution allowlist，但本函数对调用方给出的 bins 通用：-i/-I 原地改写（含 -i.bak、-Ei 簇）。
+  // sed 脚本里的 w/e 命令不在这里解析，sed 本身不应进入只读 allowlist。
+  names: { write: ['i'], exec: [], network: [] },
+  // GNU sed 的长选项里只有 --in-place 以 i 开头，--i、--in、--in-pl … 都是它的无歧义缩写。
+  abbreviations: [['inplace', 1, 'write']],
+});
+
+const VITEST_OPTION_TABLE = riskOptionTable({
+  // vitest 4.1 的 --help 全量核对：-u 更新快照、--attachmentsDir 写附件；-c/--config、--execArgv、--diff、
+  // --root/--dir（可指向项目外的配置或测试集）、--experimental（含自定义 vcsProvider 与模块缓存）会加载执行
+  // 或改写执行范围；--ui/--api/--browser/--inspect 开端口或浏览器。reporter/environment/pool 只放行内置名。
+  names: {
+    write: ['u', 'attachmentsdir'],
+    exec: ['c', 'config', 'execargv', 'diff', 'root', 'r', 'dir', 'experimental'],
+    network: ['ui', 'open', 'api', 'browser', 'inspect', 'inspectbrk', 'standalone'],
+  },
+  paths: [
+    ['typecheck.checker', 'exec'],
+    ['typecheck.tsconfig', 'exec'],
+  ],
+  values: [
+    ['reporter', vitestReporterCheck],
+    ['environment', builtinValueCheck(VITEST_BUILTIN_ENVIRONMENTS)],
+    ['pool', builtinValueCheck(VITEST_BUILTIN_POOLS)],
+  ],
+});
+
+const JEST_OPTION_TABLE = riskOptionTable({
+  // jest（yargs）：-u 更新快照；以下选项加载执行模块，或改写测试文件集合/模块解析，让任意文件被当作测试执行。
+  // 其余未进白名单的选项由 JEST_ALLOWED_OPTIONS 兜底拒绝。
+  names: {
+    write: ['u'],
+    exec: [
+      'c',
+      'config',
+      'globalsetup',
+      'globalteardown',
+      'testenvironment',
+      'env',
+      'testrunner',
+      'runner',
+      'reporters',
+      'transform',
+      'resolver',
+      'testsequencer',
+      'snapshotserializers',
+      'snapshotresolver',
+      'prettierpath',
+      'filter',
+      'testresultsprocessor',
+      'preset',
+      'projects',
+      'rootdir',
+      'roots',
+      'modulenamemapper',
+      'modulepaths',
+      'moduledirectories',
+      'testmatch',
+      'testregex',
+      'haste',
+      'watchplugins',
+      'dependencyextractor',
+    ],
+    network: [],
+  },
+  prefixes: [['setupfiles', 'exec']],
+});
+
+const BIN_OPTION_TABLES = new Map<string, OptionTable>([
+  ['tsc', TSC_OPTION_TABLE],
+  ['find', FIND_OPTION_TABLE],
+  ['git', GIT_OPTION_TABLE],
+  ['rg', RG_OPTION_TABLE],
+  ['eslint', ESLINT_OPTION_TABLE],
+  ['biome', BIOME_OPTION_TABLE],
+  ['sed', SED_OPTION_TABLE],
+  ['vitest', VITEST_OPTION_TABLE],
+  ['jest', JEST_OPTION_TABLE],
+]);
+
+// node 在只读 allowlist 中只允许 test runner 模式，并且选项采用白名单（名字按 parseOption 规范化，
+// Node 本身接受 '_' 与 '-' 互换，其余拼写 node 会直接报 bad option，不会放大能力）：
 // - 标志选项：--test、--test-only
 // - 需要值的只读选项：--test-name-pattern / --test-skip-pattern（进程内正则）、
 //   --test-concurrency / --test-timeout（数字）、--test-reporter（仅内置 reporter 名）
 // 其余 node 选项一律拒绝；其中 eval/print 与预加载类单独归类，便于诊断定位。
-const NODE_TEST_FLAG_OPTIONS = new Set(['--test', '--test-only']);
+const NODE_TEST_FLAG_OPTIONS = new Set(['test', 'testonly']);
 const NODE_TEST_VALUE_OPTIONS = new Set([
-  '--test-name-pattern',
-  '--test-skip-pattern',
-  '--test-concurrency',
-  '--test-timeout',
-  '--test-reporter',
+  'testnamepattern',
+  'testskippattern',
+  'testconcurrency',
+  'testtimeout',
+  'testreporter',
 ]);
-// 自定义 reporter 是模块路径或包名，node 会加载并执行它；只放行 Node 内置 reporter 名。
-const NODE_TEST_BUILTIN_REPORTERS = new Set(['tap', 'spec', 'dot', 'junit', 'lcov']);
-const NODE_EVAL_OPTIONS = new Set(['-e', '-p', '--eval', '--print']);
+const NODE_EVAL_OPTIONS = new Set(['e', 'p', 'pe', 'eval', 'print']);
 // 预加载/导入类选项会在任何测试文件之前执行模型自写（data: URL）或仓库内的任意模块。
 const NODE_PRELOAD_OPTIONS = new Set([
-  '-r',
-  '--require',
-  '--import',
-  '--loader',
-  '--experimental-loader',
-  '--env-file',
-  '--env-file-if-exists',
+  'r',
+  'require',
+  'import',
+  'loader',
+  'experimentalloader',
+  'envfile',
+  'envfileifexists',
 ]);
+
+const NODE_PASSTHROUGH_TABLE = riskOptionTable({
+  // 透传给 node --test 时：eval/预加载与 --run（实测 node --test --run build 会改跑 package.json 脚本）执行代码，
+  // --test-global-setup 加载模块；reporter destination、覆盖率、快照更新与失败重跑状态写盘。
+  names: {
+    write: [
+      'testreporterdestination',
+      'experimentaltestcoverage',
+      'testupdatesnapshots',
+      'testrerunfailures',
+    ],
+    exec: [...NODE_EVAL_OPTIONS, ...NODE_PRELOAD_OPTIONS, 'run', 'testglobalsetup'],
+    network: [],
+  },
+  values: [['testreporter', builtinValueCheck(NODE_TEST_BUILTIN_REPORTERS)]],
+});
+
+// 包管理器 '--' 之后的参数会原样交给 test/lint/typecheck 脚本里的工具，脚本内容在这里不可见：
+// 拒绝表取通用表与 vitest/jest/node --test、eslint/tsc/biome 的并集（按“未知 bin”语法同时查长名与短选项簇，
+// 因为 tsc/node 把 -incremental 当长名，而 jest/vitest 把 -iu 当簇）。
+const PASSTHROUGH_OPTION_TABLE = mergeOptionTables([
+  GENERIC_OPTION_TABLE,
+  VITEST_OPTION_TABLE,
+  JEST_OPTION_TABLE,
+  NODE_PASSTHROUGH_TABLE,
+  ESLINT_OPTION_TABLE,
+  TSC_OPTION_TABLE,
+  BIOME_OPTION_TABLE,
+]);
+
+/** 白名单条目：value 决定透传时下一个 token 是否被当作值；subkeys 是允许的点号子键。 */
+interface AllowedOption {
+  value: 'none' | 'number' | 'enum' | 'pattern';
+  subkeys?: ReadonlySet<string>;
+}
+
+function allowedOptions(spec: {
+  none?: readonly string[];
+  number?: readonly string[];
+  enum?: readonly string[];
+  pattern?: readonly string[];
+  subkeys?: ReadonlyArray<readonly [string, ReadonlySet<string>]>;
+}): ReadonlyMap<string, AllowedOption> {
+  const result = new Map<string, AllowedOption>();
+  for (const value of ['none', 'number', 'enum', 'pattern'] as const) {
+    for (const name of spec[value] ?? []) {
+      result.set(name, { value });
+    }
+  }
+  for (const [name, subkeys] of spec.subkeys ?? []) {
+    result.set(name, { value: result.get(name)?.value ?? 'none', subkeys });
+  }
+  return result;
+}
+
+const VITEST_TYPECHECK_SUBKEYS = new Set([
+  'enabled',
+  'only',
+  'allowjs',
+  'ignoresourceerrors',
+  'spawntimeout',
+]);
+const VITEST_RETRY_SUBKEYS = new Set(['count', 'delay', 'condition']);
+// 只放行 vitest 4.1 CLI 声明过的子键：cac 不校验未声明的点号子键，--sequence.sequencer=./x.mjs 会原样
+// 进入配置（今天只会让 new Sequencer 抛 TypeError），不能让白名单依赖这种偶然。
+const VITEST_SEQUENCE_SUBKEYS = new Set(['shuffle', 'concurrent', 'seed', 'hooks', 'setupfiles']);
+const VITEST_EXPECT_SUBKEYS = new Set(['requireassertions', 'poll']);
+
+// vitest 直接调用时的选项白名单（位置参数是过滤器，只会选中 include 匹配的测试文件，不受限）。
+const VITEST_ALLOWED_OPTIONS = allowedOptions({
+  none: [
+    'run',
+    'silent',
+    'hideskippedtests',
+    'passwithnotests',
+    'logheapusage',
+    'detectasyncleaks',
+    'allowonly',
+    'dangerouslyignoreunhandlederrors',
+    'expandsnapshotdiff',
+    'disableconsoleintercept',
+    'printconsoletrace',
+    'includetasklocation',
+    'globals',
+    'dom',
+    'isolate',
+    'noisolate',
+    'fileparallelism',
+    'nofileparallelism',
+    'clearscreen',
+    'noclearscreen',
+    'color',
+    'nocolor',
+    'stricttags',
+    'nostricttags',
+    'listtags',
+    'changed',
+    'help',
+    'h',
+    'version',
+    'v',
+  ],
+  number: [
+    'bail',
+    'shard',
+    'testtimeout',
+    'hooktimeout',
+    'teardowntimeout',
+    'slowtestthreshold',
+    'maxconcurrency',
+    'maxworkers',
+    'vmmemorylimit',
+  ],
+  enum: ['reporter', 'environment', 'pool', 'configloader'],
+  pattern: ['t', 'testnamepattern', 'project', 'mode', 'tagsfilter'],
+  subkeys: [
+    ['typecheck', VITEST_TYPECHECK_SUBKEYS],
+    ['sequence', VITEST_SEQUENCE_SUBKEYS],
+    ['expect', VITEST_EXPECT_SUBKEYS],
+    ['retry', VITEST_RETRY_SUBKEYS],
+  ],
+});
+const VITEST_SHORT_OPTIONS = new Set(['t', 'v', 'h']);
+// vitest 的这些子命令不跑测试或会写文件（init 生成配置、list --json 写结果、bench 跑基准并可落盘）。
+const VITEST_NON_RUN_SUBCOMMANDS = new Set(['init', 'bench', 'list', 'dev', 'watch', 'serve']);
+
+// jest 直接调用时的选项白名单：只收只读的选测/输出/诊断参数，加载模块或改写测试集合的参数一律不在内。
+const JEST_ALLOWED_OPTIONS = allowedOptions({
+  none: [
+    'ci',
+    'json',
+    'verbose',
+    'silent',
+    'b',
+    'runinband',
+    'i',
+    'o',
+    'onlychanged',
+    'f',
+    'onlyfailures',
+    'lastcommit',
+    'findrelatedtests',
+    'listtests',
+    'passwithnotests',
+    'detectopenhandles',
+    'detectleaks',
+    'forceexit',
+    'nostacktrace',
+    'errorondeprecated',
+    'e',
+    'expand',
+    'colors',
+    'color',
+    'showconfig',
+    'clearmocks',
+    'resetmocks',
+    'restoremocks',
+    'showseed',
+    'randomize',
+    'debug',
+    'usestderr',
+    'testlocationinresults',
+    'nocache',
+    'nowatchman',
+    'injectglobals',
+    'runtestsbypath',
+    'all',
+    'logheapusage',
+    'help',
+    'h',
+    'version',
+    'v',
+  ],
+  number: [
+    'bail',
+    'w',
+    'maxworkers',
+    'testtimeout',
+    'seed',
+    'shard',
+    'maxconcurrency',
+    'workeridlememorylimit',
+    'openhandlestimeout',
+    'testfailureexitcode',
+  ],
+  pattern: [
+    't',
+    'testnamepattern',
+    'testpathpattern',
+    'testpathpatterns',
+    'testpathignorepatterns',
+    'changedsince',
+    'selectprojects',
+    'ignoreprojects',
+  ],
+});
+const JEST_SHORT_OPTIONS = new Set(['t', 'b', 'i', 'o', 'f', 'e', 'w', 'v', 'h']);
+
+// 包管理器 '--' 之后（以及之前的位置参数）的运行器无关白名单：每一项在 vitest、jest、node --test 以及
+// eslint/tsc/biome 下都是只读含义。free-form 值（pattern）必须用 '=' 内联，否则无法区分它是值还是会被
+// 某个运行器当作文件执行的位置参数；数字/枚举值可以用空格写法。
+const PASSTHROUGH_ALLOWED_OPTIONS = allowedOptions({
+  none: [
+    'silent',
+    'ci',
+    'json',
+    'verbose',
+    'passwithnotests',
+    'logheapusage',
+    'allowonly',
+    'hideskippedtests',
+    'detectopenhandles',
+    'forceexit',
+    'nostacktrace',
+    'errorondeprecated',
+    'expand',
+    'color',
+    'colors',
+    'nocolor',
+    'nocolors',
+    'listtests',
+    'showconfig',
+    'clearmocks',
+    'resetmocks',
+    'restoremocks',
+    'randomize',
+    'showseed',
+    'usestderr',
+    'runinband',
+    'onlychanged',
+    'lastcommit',
+    'detectasyncleaks',
+    'expandsnapshotdiff',
+    'disableconsoleintercept',
+    'printconsoletrace',
+    'includetasklocation',
+    'isolate',
+    'noisolate',
+    'fileparallelism',
+    'nofileparallelism',
+    'globals',
+    'dom',
+    'nocache',
+    'testonly',
+    'help',
+    'h',
+    'version',
+    'v',
+  ],
+  number: [
+    'testtimeout',
+    'hooktimeout',
+    'teardowntimeout',
+    'slowtestthreshold',
+    'maxworkers',
+    'maxconcurrency',
+    'bail',
+    'retry',
+    'seed',
+    'testconcurrency',
+    'shard',
+  ],
+  enum: ['reporter', 'environment', 'testreporter'],
+  pattern: [
+    't',
+    'testnamepattern',
+    'testskippattern',
+    'testpathpattern',
+    'testpathpatterns',
+    'testpathignorepatterns',
+    'tagsfilter',
+  ],
+  subkeys: [
+    ['typecheck', VITEST_TYPECHECK_SUBKEYS],
+    ['sequence', VITEST_SEQUENCE_SUBKEYS],
+  ],
+});
+const PASSTHROUGH_SHORT_OPTIONS = new Set(['t', 'v', 'h']);
+const PASSTHROUGH_NUMBER_VALUE = /^(?:\d+(?:\.\d+)?%?|\d+\/\d+)$/;
+
+// 包管理器在 '--' 之前的自身选项：npm/pnpm/yarn 的配置项（--script-shell、--node-options、--userconfig、
+// --globalconfig、yarn --use-yarnrc …）会换掉执行脚本的 shell 或注入预加载模块；npm 的 nopt 还接受前缀缩写
+// 与短选项簇，所以只放行这张小白名单，其余一律拒绝。
+const PACKAGE_MANAGER_LONG_OPTIONS = new Set(['silent', 'ifpresent']);
+const PACKAGE_MANAGER_SHORT_OPTIONS = new Set(['s']);
+
+// tsc 里确定不取值的常见布尔选项：--noEmit 紧跟在这些选项之后才算真实生效。其它选项（--outDir、--locale、
+// 未来新增的字符串选项）会把下一个 token 当作值吞掉，`tsc --outDir --noEmit` 实际照常产出 JS。
+const TSC_FLAG_OPTIONS = new Set([
+  'noemit',
+  'pretty',
+  'strict',
+  'skiplibcheck',
+  'skipdefaultlibcheck',
+  'listfiles',
+  'listfilesonly',
+  'listemittedfiles',
+  'explainfiles',
+  'traceresolution',
+  'diagnostics',
+  'extendeddiagnostics',
+  'noerrortruncation',
+  'preservewatchoutput',
+  'watch',
+  'w',
+  'showconfig',
+  'all',
+  'help',
+  'h',
+  'version',
+  'v',
+  'allowjs',
+  'checkjs',
+  'declaration',
+  'd',
+  'declarationmap',
+  'sourcemap',
+  'nocheck',
+  'noimplicitany',
+  'strictnullchecks',
+  'noemitonerror',
+  'nounusedlocals',
+  'nounusedparameters',
+  'noimplicitreturns',
+  'nouncheckedindexedaccess',
+  'esmoduleinterop',
+  'isolatedmodules',
+  'resolvejsonmodule',
+  'experimentaldecorators',
+  'emitdecoratormetadata',
+  'forceconsistentcasinginfilenames',
+  'exactoptionalpropertytypes',
+  'verbatimmodulesyntax',
+]);
+
+// 测试文件位置参数（node --test 与包管理器透传）：文件名含 .test. / .spec.，或位于 test/、tests/、__tests__/ 目录。
+const TEST_DIRECTORY_SEGMENTS = new Set(['test', 'tests', '__tests__']);
+const TEST_FILE_NAME = /\.(?:test|spec)\./i;
+// node --test 的位置参数是 glob：花括号/extglob/字符类可以把字面 .test. 变成可选，反斜杠是转义；
+// 这些字符一律拒绝，只保留不会删除字面字符的 * 与 ?（以 '.' 开头的段除外，见 describeTestPathViolation）。
+const TEST_PATH_GLOB_ALTERNATION = /[{}()[\]!\\]/;
+// 以 '.' 开头且含 * / ? 的路径段：sh 的路径名展开要求显式写出前导 '.'，写出之后 '.?'、'.*'、'..*'
+// 就能匹配 '.' 与 '..'（macOS /bin/sh 即 bash 3.2 实测 test/.?/scripts/release.mjs 执行了 scripts/release.mjs）。
+const TEST_PATH_DOT_GLOB_SEGMENT = /^\.[^/]*[*?]/;
 
 type SafetyVerdict = { safe: true } | { safe: false; block: TerminalSafetyBlock };
 
@@ -1360,24 +2015,98 @@ export function checkTerminalCommandAllowlist(
   command: string,
   bins: readonly string[]
 ): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
+  const { bin, result } = evaluateTerminalCommandAllowlist(command, bins);
+  if (!result.safe) {
+    // 每个拒绝分支都在这一处留日志：规则 id + bin + 原因。原因里 '=' 之后的选项值已被省略，只有被校验的
+    // reporter/formatter 这类模块名值会截断回显，便于定位；日志不回显整条命令（审计侧只记命令哈希），
+    // 避免把模型写进参数的凭据或路径带进诊断旁路。
+    logAllowlistBlock(bin, result.block);
+  }
+  return result;
+}
+
+type AllowlistResult = { safe: true } | { safe: false; block: TerminalSafetyBlock };
+
+function evaluateTerminalCommandAllowlist(
+  command: string,
+  bins: readonly string[]
+): { bin: string; result: AllowlistResult } {
   if (containsShellMeta(command)) {
     return {
-      safe: false,
-      block: {
-        rule: 'allowlist-shell-meta',
-        reason: 'Shell meta characters are blocked for read-only terminal.exec allowlists',
-      },
+      bin: '[unparsed]',
+      result: readonlyBlock(
+        'allowlist-shell-meta',
+        'Shell meta characters are blocked for read-only terminal.exec allowlists'
+      ),
+    };
+  }
+  if (NON_SHELL_BLANK_WHITESPACE.test(command)) {
+    // 本检查的词法器按 JS 的 \s 切词，宿主 sh 只按空格与制表符切词：NBSP、\v、\f、全角空格等在 sh 里
+    // 留在同一个词内。'tsc a.ts b.ts<NBSP>--noEmit' 在这里数到一个有效的 --noEmit，sh 却把
+    // 'b.ts<NBSP>--noEmit' 当作一个文件名交给 tsc，tsc 照常写出 a.js（实测）。分词结果不一致就无法静态判定，直接拒绝。
+    return {
+      bin: '[unparsed]',
+      result: readonlyBlock(
+        'allowlist-shell-whitespace',
+        'Whitespace other than spaces and tabs is blocked for read-only terminal.exec allowlists because the host shell does not split words on it'
+      ),
+    };
+  }
+  if (hasShellControlChar(command)) {
+    // NUL 截断交给 /bin/sh 的 C 字符串：'tsc -p tsconfig.json<NUL> --noEmit' 在这里数到 --noEmit，
+    // 真正执行的却只有 'tsc -p tsconfig.json'（Node 的 spawn 今天会拒绝 NUL，但这里不依赖宿主执行器的实现）。
+    // 其它 C0 控制字符与 DEL 在 sh 里是普通词字符，取证命令里不会出现，一并拒绝，免得终端回显或日志被控制序列污染。
+    return {
+      bin: '[unparsed]',
+      result: readonlyBlock(
+        'allowlist-shell-control-char',
+        'Control characters (NUL, escape and other C0 controls) are blocked for read-only terminal.exec allowlists'
+      ),
     };
   }
 
   const words = parseSimpleShellWords(command);
   if (!words.ok) {
     return {
-      safe: false,
-      block: {
-        rule: 'allowlist-unparseable-command',
-        reason: words.error,
-      },
+      bin: '[unparsed]',
+      result: readonlyBlock('allowlist-unparseable-command', words.error),
+    };
+  }
+  if (hasUnquotedBrace(command)) {
+    // 宿主 /bin/sh（macOS 上是 bash）会做花括号展开：`--{hostname-bin=./x.sh,hyperlink-format=file}`
+    // 在本检查看来是一个未知选项，执行时却展开成两个独立选项。静态 literal 检查无法跟踪展开结果，直接拒绝；
+    // 引号或反斜杠里的花括号不会展开，不受影响。
+    return {
+      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      result: readonlyBlock(
+        'allowlist-shell-brace-expansion',
+        'Unquoted brace expansion is blocked for read-only terminal.exec allowlists; quote literal braces'
+      ),
+    };
+  }
+  if (hasUnquotedComment(command)) {
+    // sh 把未加引号、位于词首的 '#' 当作注释起点，其后的词都不会交给命令：'tsc # --noEmit' 实际执行裸 tsc
+    // 并写出 JS，'vitest # run' 实际进入 watch 模式，而静态解析仍会数到 --noEmit / run。
+    // 引号内、反斜杠转义或位于词中的 '#'（'#'、\#todo、foo#bar、--grep=#1）是普通 literal，不受影响。
+    return {
+      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      result: readonlyBlock(
+        'allowlist-shell-comment',
+        'Unquoted "#" at the start of a word starts a shell comment and is blocked for read-only terminal.exec allowlists; quote a literal "#"'
+      ),
+    };
+  }
+  if (hasOptionLikeGlob(command)) {
+    // sh 的路径名展开把未加引号的 glob 词换成匹配到的文件名，文件名可以以 '-' 开头：仓库里放一个名为
+    // '--pre=sh' 的文件，'rg Recipe *' 实际收到 --pre=sh 并用 sh 执行每个被搜索的文件（rg 15.1.0 实测）。
+    // 静态检查看到的只是 '*'，无法判定展开结果，所以凡是展开后可能以 '-' 开头的 glob 词一律拒绝；
+    // 加引号交给工具自己的 glob（-g '*.ts'、node --test '**/*.test.mjs'），或加 './' 前缀（./*）即可放行。
+    return {
+      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      result: readonlyBlock(
+        'allowlist-shell-glob-option',
+        'Unquoted glob that the host shell may expand into an option-like file name (a word starting with a glob character, or an option word with a glob before "=") is blocked for read-only terminal.exec allowlists; quote the pattern or prefix the path with "./"'
+      ),
     };
   }
 
@@ -1387,48 +2116,145 @@ export function checkTerminalCommandAllowlist(
     // （或先前被写入的文件）会顶替系统命令，绕过 git/node 等子命令的只读约束；
     // node_modules/.bin/<tool> 也一并拒绝，等价入口是 npm run <script> 或裸 <tool>。
     return {
-      safe: false,
-      block: {
-        rule: 'allowlist-path-qualified-bin',
-        reason: `Path-qualified executable is blocked for read-only terminal allowlists: ${rawBin}`,
-      },
+      bin: rawBin,
+      result: readonlyBlock(
+        'allowlist-path-qualified-bin',
+        `Path-qualified executable is blocked for read-only terminal allowlists: ${rawBin}`
+      ),
     };
   }
   const bin = (rawBin ?? '').toLowerCase();
   const allowedBins = new Set(bins.map((item) => item.toLowerCase()));
   if (!bin || !allowedBins.has(bin)) {
     return {
-      safe: false,
-      block: {
-        rule: 'allowlist-denied-bin',
-        reason: `Command "${bin || '[empty]'}" is not in the read-only terminal allowlist`,
-      },
+      bin: bin || '[empty]',
+      result: readonlyBlock(
+        'allowlist-denied-bin',
+        `Command "${bin || '[empty]'}" is not in the read-only terminal allowlist`
+      ),
     };
   }
 
-  const writeLikeArg = findWriteLikeArg(bin, args);
-  if (writeLikeArg) {
-    // 原因里带上归一后的选项名：点号/内联值写法（--outputFile.json=x）与条目（--outputfile）
-    // 字面不同，审计日志要能看出是哪条黑名单规则把它折叠过去的。
-    const matched =
-      writeLikeArg.option === writeLikeArg.arg.toLowerCase()
-        ? ''
-        : ` (matched option ${writeLikeArg.option})`;
-    return {
-      safe: false,
-      block: {
-        rule: 'allowlist-write-like-arg',
-        reason: `Write-like terminal argument is blocked: ${writeLikeArg.arg}${matched}`,
-      },
-    };
+  const deniedOption = findDeniedOption(bin, args);
+  if (deniedOption) {
+    return { bin, result: deniedOptionBlock(bin, deniedOption) };
   }
 
-  return checkReadonlySubcommand(bin, args);
+  return { bin, result: checkReadonlySubcommand(bin, args) };
 }
 
 export function containsShellMeta(value: string): boolean {
   // 换行可启动第二条命令；变量展开可拼出被禁止的选项，均不能当普通参数放行。
   return /[\r\n;&|<>`$]/.test(value);
+}
+
+// 宿主 sh 只把空格与制表符当作词间空白（换行/回车已由 containsShellMeta 拒绝）；其余被 JS \s 匹配的空白
+// （NBSP、\v、\f、U+2000 系列、全角空格、BOM 等）在 sh 里属于词的一部分。
+const NON_SHELL_BLANK_WHITESPACE = /[^\S \t]/;
+
+/** 只有不在引号内、未被反斜杠转义的 '{' 会触发 shell 花括号展开。 */
+function hasUnquotedBrace(command: string): boolean {
+  return someUnquotedChar(command, (char) => char === '{');
+}
+
+/** 只有不在引号内、未被转义、且位于词首的 '#' 会开始 shell 注释；词中的 '#'（foo#bar、''#x）是普通字符。 */
+function hasUnquotedComment(command: string): boolean {
+  return someUnquotedChar(command, (char, { atWordStart }) => char === '#' && atWordStart);
+}
+
+// sh 路径名展开的模式字符；'[' 没有配对的 ']' 时其实是字面量，这里不区分，一律按 glob 处理（从严）。
+const SHELL_GLOB_CHARS = new Set(['*', '?', '[']);
+
+/**
+ * NUL（截断交给 sh 的 C 字符串）、其余 C0 控制字符与 DEL。0x09-0x0d 不在这里：\t 是 sh 的分词符，
+ * \n/\r 由 containsShellMeta 拒绝，\v/\f 由 NON_SHELL_BLANK_WHITESPACE 拒绝。按码点比较而不是写成
+ * 含控制字符的正则，避免 lint 的 noControlCharactersInRegex 与不可见字符混进源码。
+ */
+function hasShellControlChar(command: string): boolean {
+  for (let index = 0; index < command.length; index++) {
+    const code = command.charCodeAt(index);
+    if (code <= 0x08 || (code >= 0x0e && code <= 0x1f) || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 路径名展开后可能以 '-' 开头的 glob 词：sh 把整个词换成匹配到的路径，每个结果都以第一个未加引号 glob 字符
+ * 之前的字面前缀开头，前缀之后的部分来自目录项名（可以是 '--pre=sh' 这种文件名）。所以：
+ * - 前缀为空（*.ts、""*、?eadme.md）：结果可以是任意文件名，包括以 '-' 开头的“选项”；
+ * - 前缀以 '-' 开头且不含 '='（-*、--pre*、-u*）：结果仍是选项，但选项名（或短选项簇的字母）
+ *   由文件名决定；前缀里已有 '='（--glob=*.ts、--testNamePattern=*）时选项名已固定，只有值随文件名变化。
+ * 其余前缀（src/*、./*、README*）展开后以该前缀开头，不会变成选项。引号内与转义的 glob 字符不展开。
+ * 双引号内 '\x'（x 非 $ ` " \）在 sh 里保留反斜杠，这里把它当成 x：只会让前缀更像选项，判定更严。
+ */
+function hasOptionLikeGlob(command: string): boolean {
+  return someUnquotedChar(
+    command,
+    (char, { wordPrefix }) =>
+      SHELL_GLOB_CHARS.has(char) &&
+      (wordPrefix === '' || (wordPrefix.startsWith('-') && !wordPrefix.includes('=')))
+  );
+}
+
+interface UnquotedCharContext {
+  /** 该字符前面是命令开头或未加引号的空格/制表符（引号与转义字符也会让当前词开始）。 */
+  atWordStart: boolean;
+  /** 当前词在该字符之前的字面文本：去掉引号、保留引号内与转义的字符。 */
+  wordPrefix: string;
+}
+
+/**
+ * 与 parseSimpleShellWords 相同的引号/转义状态机，逐个检查“不在引号内、未被反斜杠转义”的字符，
+ * 并告诉 predicate 该字符是否位于词首，以及当前词在它之前的字面前缀。
+ * 引号字符本身与被转义的字符都会让当前词开始，所以 "" # 里的 '#' 位于词首，''#x 里的 '#' 不在词首
+ * （但 ''#x 里 '#' 之前的字面前缀仍为空）。
+ */
+function someUnquotedChar(
+  command: string,
+  predicate: (char: string, context: UnquotedCharContext) => boolean
+): boolean {
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let atWordStart = true;
+  let wordPrefix = '';
+  for (const char of command) {
+    if (escaped) {
+      escaped = false;
+      atWordStart = false;
+      wordPrefix += char;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (!quote && (char === '"' || char === "'")) {
+      quote = char;
+      atWordStart = false;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        wordPrefix += char;
+      }
+      continue;
+    }
+    if (char === ' ' || char === '\t') {
+      atWordStart = true;
+      wordPrefix = '';
+      continue;
+    }
+    if (predicate(char, { atWordStart, wordPrefix })) {
+      return true;
+    }
+    atWordStart = false;
+    wordPrefix += char;
+  }
+  return false;
 }
 
 /** 词法器给每个词的静态视图。 */
@@ -2019,46 +2845,180 @@ function readAnsiCNumericEscape(
   };
 }
 
+/** 规范化后的选项 token。 */
+interface ParsedOption {
+  raw: string;
+  /** 去掉前导横线、'=' 之后的值与 '.' 之后的子键，再折叠 kebab/snake/camel 后的无分隔小写名。 */
+  name: string;
+  /**
+   * 名字段：'=' 之前开头连续的 [A-Za-z0-9-] 字符，按同样规则折叠。optionator（eslint）只认这一段，
+   * 其后的 '_'、'/'、':'、'.' 等字符在没有 '=' 紧随时被丢弃：--fix_x 即 --fix，--output-file_x 即 --output-file。
+   */
+  stem: string;
+  /** '=' 之前只由 [A-Za-z0-9-] 组成：各解析器对它的名字与值归属一致。值即模块的选项只接受这种写法。 */
+  plain: boolean;
+  /** 按 '.' 分段各自规范化后的全路径（--typecheck.checker → typecheck.checker）。 */
+  path: string;
+  /** '=' 之后的内联值。 */
+  inlineValue: string | undefined;
+  /** 单横线 token 在 '=' 之前的原始字符，按短选项簇解释时逐字母比较；双横线 token 为 null。 */
+  letters: string[] | null;
+}
+
 /**
- * 返回第一个写类参数；匹配结果同时带回归一后的选项名，便于在拒绝原因里看出
- * '=' 内联值与 '.' 点号子键是如何被折叠到黑名单条目上的。
+ * 选项名规范化：去掉前导一或两个横线；先切 '=' 再切 '.'，避免把值里的路径点号当成子键；
+ * 每段小写并去掉 '-'/'_'。cac（vitest，实测 --outputFile.tap=./tap.txt）与 yargs（jest）都把 --opt.key
+ * 解析成 --opt 的子字段，写类/执行类选项的目标仍由首段决定，所以按 name 判定；--sequence.shuffle、
+ * --typecheck.only 这类只读子键由白名单的 subkeys 单独放行。stem/plain 见 ParsedOption。
  */
-function findWriteLikeArg(bin: string, args: string[]): { arg: string; option: string } | null {
-  const binSpecific = BIN_WRITE_LIKE_ARGS.get(bin);
-  for (const arg of args) {
-    const normalized = arg.toLowerCase();
-    if (!normalized.startsWith('-')) {
-      // 黑名单条目都是选项；操作数（路径、模式）由各 bin 自己解释，不在这里判定。
+function parseOption(arg: string): ParsedOption | null {
+  if (!arg.startsWith('-') || arg === '-' || arg === '--') {
+    return null;
+  }
+  const singleDash = !arg.startsWith('--');
+  const body = arg.replace(/^-+/, '');
+  const equalsIndex = body.indexOf('=');
+  const key = equalsIndex < 0 ? body : body.slice(0, equalsIndex);
+  const segments = key.split('.').map((segment) => segment.toLowerCase().replace(/[-_]/g, ''));
+  const stemRun = /^[A-Za-z0-9-]*/.exec(key)?.[0] ?? '';
+  return {
+    raw: arg,
+    name: segments[0] ?? '',
+    stem: stemRun.toLowerCase().replace(/-/g, ''),
+    plain: stemRun.length > 0 && stemRun === key,
+    path: segments.join('.'),
+    inlineValue: equalsIndex < 0 ? undefined : body.slice(equalsIndex + 1),
+    letters: singleDash ? [...key] : null,
+  };
+}
+
+/** 黑名单的长名候选：完整规范化名，以及与之不同时的 optionator 名字段；空名不参与比较。 */
+function optionNameCandidates(option: ParsedOption): string[] {
+  return [option.name, option.stem].filter(
+    (candidate, index, all) => candidate !== '' && all.indexOf(candidate) === index
+  );
+}
+
+interface DeniedOption {
+  arg: string;
+  matched: string;
+  risk: OptionRisk;
+  value?: string;
+}
+
+/** 通用表 + 本 bin 专属表；返回第一个写盘/执行/联网类选项。操作数（路径、模式）由各 bin 自己解释。 */
+function findDeniedOption(bin: string, args: readonly string[]): DeniedOption | null {
+  const syntax = BIN_DASH_SYNTAX.get(bin) ?? 'unknown';
+  const binTable = BIN_OPTION_TABLES.get(bin);
+  const tables = binTable ? [GENERIC_OPTION_TABLE, binTable] : [GENERIC_OPTION_TABLE];
+  for (let index = 0; index < args.length; index++) {
+    const option = parseOption(args[index]);
+    if (!option) {
       continue;
     }
-    const option = writeLikeOptionName(normalized);
-    if (WRITE_LIKE_ARGS.has(option) || binSpecific?.has(option)) {
-      return { arg, option };
-    }
-    if (WRITE_LIKE_ARG_PREFIXES.some((prefix) => option.startsWith(prefix))) {
-      return { arg, option };
+    for (const table of tables) {
+      const denied = matchOptionTable(table, option, syntax, args[index + 1]);
+      if (denied) {
+        return denied;
+      }
     }
   }
   return null;
 }
 
-/**
- * 从已小写的参数里取选项名：先去掉 '=' 之后的内联值，再去掉 '.' 之后的点号子键。
- * cac（vitest 4 实测 --outputFile.tap=./tap.txt）与 yargs（jest）都把 --opt.key 解析成 --opt 的子字段，
- * 对写类选项来说目标文件/目录仍由同一个选项决定，所以按首段判定；--sequence.shuffle、--typecheck.only
- * 这类只读选项的首段不在黑名单里，不会被误伤。先切 '=' 再切 '.'，避免把值里的路径点号当成子键。
- */
-function writeLikeOptionName(normalized: string): string {
-  const equalsIndex = normalized.indexOf('=');
-  const withoutValue = equalsIndex < 0 ? normalized : normalized.slice(0, equalsIndex);
-  const dotIndex = withoutValue.indexOf('.');
-  return dotIndex < 0 ? withoutValue : withoutValue.slice(0, dotIndex);
+function matchOptionTable(
+  table: OptionTable,
+  option: ParsedOption,
+  syntax: DashSyntax,
+  next: string | undefined
+): DeniedOption | null {
+  // 双横线 token 一律按长名比较；单横线 token 在 cluster 语法下只逐字母比较（ls -fls 不是 find 的 -fls），
+  // 在 long 语法下只按长名比较（tsc -incremental），未知 bin 两种都查。
+  const wholeName = option.letters === null || syntax !== 'cluster';
+  const clusterLetters = option.letters !== null && syntax !== 'long' ? option.letters : [];
+  // 长名候选：完整规范化名（node 的 '_' 与 '-' 互换、jest 的 kebab/camel）与 optionator 的名字段。
+  const candidates = wholeName ? optionNameCandidates(option) : [];
+  for (const candidate of candidates) {
+    const risk =
+      table.names.get(candidate) ??
+      table.prefixes.find(([prefix]) => candidate.startsWith(prefix))?.[1] ??
+      table.abbreviations.find(
+        ([full, minLength]) => candidate.length >= minLength && full.startsWith(candidate)
+      )?.[2];
+    if (risk) {
+      return { arg: option.raw, matched: candidate, risk };
+    }
+  }
+  if (wholeName) {
+    const risk = [...table.paths].find(
+      ([key]) => option.path === key || option.path.startsWith(`${key}.`)
+    )?.[1];
+    if (risk) {
+      return { arg: option.raw, matched: option.path, risk };
+    }
+  }
+  for (const letter of clusterLetters) {
+    const risk = table.names.get(letter.toLowerCase());
+    if (risk) {
+      return { arg: option.raw, matched: `-${letter}`, risk };
+    }
+  }
+  const valueKey = wholeName
+    ? candidates.find((candidate) => table.values.has(candidate))
+    : clusterLetters.length === 1
+      ? clusterLetters[0].toLowerCase()
+      : undefined;
+  const check = valueKey === undefined ? undefined : table.values.get(valueKey);
+  if (valueKey !== undefined && check) {
+    if (!option.plain) {
+      // reporter/formatter 这类值即模块的选项只接受规整写法。点号子键、'_' 或其它尾随字符会让解析器之间
+      // 对“值在哪里”产生分歧（optionator 把 --format/x=json 的 '=json' 丢掉、改取下一个 token），
+      // 值的去向无法静态判定，按执行类拒绝。
+      return { arg: option.raw, matched: valueKey, risk: 'exec' };
+    }
+    // 空格写法：只要还有下一个 token 就按值校验，不论它是否以 '-' 开头。optionator 只把“横线 + 字母”
+    // 开头的 token 当选项，-/../x.js、--/../x.js、-1/../x.js 都会成为 formatter 值，path.resolve 再把
+    // '-/..' 抵消掉（ESLint 9.39.4 实测执行了 x.js）。下一个 token 真是选项时工具本身会报缺值或把它当布尔，
+    // 从严拒绝不损失只读能力；没有下一个 token 时工具自己报缺值，这里不替它补判。
+    const value = option.inlineValue ?? next;
+    const risk = value === undefined ? null : check(value);
+    if (risk) {
+      return { arg: option.raw, matched: valueKey, risk, value };
+    }
+  }
+  if (clusterLetters.length > 1) {
+    const valueLetter = clusterLetters.find((letter) => table.values.has(letter.toLowerCase()));
+    if (valueLetter) {
+      // 取值的短选项藏在簇里（eslint -qf x）时值的归属依赖解析器细节，保守拒绝。
+      return { arg: option.raw, matched: `-${valueLetter}`, risk: 'exec' };
+    }
+  }
+  return null;
 }
 
-function checkReadonlySubcommand(
-  bin: string,
-  args: string[]
-): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
+function deniedOptionBlock(
+  context: string,
+  denied: DeniedOption
+): { safe: false; block: TerminalSafetyBlock } {
+  const value = denied.value === undefined ? '' : ` with value ${truncateForReason(denied.value)}`;
+  return readonlyBlock(
+    OPTION_RISK_RULES[denied.risk],
+    `${OPTION_RISK_LABELS[denied.risk]} terminal argument is blocked for ${context}: ` +
+      `${describeOptionToken(denied.arg)} (matched option ${denied.matched}${value})`
+  );
+}
+
+/** 原因与日志只保留选项名部分：'=' 之后的值可能是路径或凭据，不回显。 */
+function describeOptionToken(arg: string): string {
+  const equalsIndex = arg.indexOf('=');
+  return truncateForReason(equalsIndex < 0 ? arg : `${arg.slice(0, equalsIndex + 1)}…`);
+}
+
+function truncateForReason(value: string): string {
+  return value.length > 120 ? `${value.slice(0, 120)}…` : value;
+}
+
+function checkReadonlySubcommand(bin: string, args: string[]): AllowlistResult {
   switch (bin) {
     case 'git':
       return checkGitSubcommand(args);
@@ -2067,32 +3027,60 @@ function checkReadonlySubcommand(
     case 'yarn':
       return checkPackageManagerSubcommand(bin, args);
     case 'tsc':
-      return hasEffectiveNoEmit(args)
-        ? { safe: true }
-        : readonlyBlock('allowlist-tsc-noemit', 'tsc must include --noEmit');
+      return checkTscArguments(args);
     case 'node':
       return checkNodeSubcommand(args);
     case 'biome':
       return checkBiomeSubcommand(args);
     case 'vitest':
-      return args.length === 0 || args.includes('run') || args.includes('--run')
-        ? { safe: true }
-        : readonlyBlock('allowlist-vitest-run', 'vitest must use run mode');
+      return checkVitestSubcommand(args);
+    case 'jest':
+      return checkJestArguments(args);
     default:
       return { safe: true };
   }
 }
 
+function checkTscArguments(args: string[]): AllowlistResult {
+  const responseFile = args.find((arg) => arg.startsWith('@'));
+  if (responseFile !== undefined) {
+    // tsc 把 @file 展开成文件里的参数，--noEmit false、--outDir 之类在静态检查里不可见。
+    return readonlyBlock(
+      'allowlist-tsc-response-file',
+      `tsc response files are blocked in read-only mode: ${truncateForReason(responseFile)}`
+    );
+  }
+  return hasEffectiveNoEmit(args)
+    ? { safe: true }
+    : readonlyBlock(
+        'allowlist-tsc-noemit',
+        'tsc must include an effective --noEmit (not followed by false, not consumed as the value of a preceding option)'
+      );
+}
+
+/**
+ * 模拟 tsc 的布尔选项解析：-noEmit / --noemit 与 --noEmit 同义（tsc 选项名大小写不敏感、单双横线等价），
+ * 后跟 true/false 时会消费该值，最后一次出现生效。紧跟在可能取值的选项之后的 --noEmit 会被那个选项吞成值，
+ * 不计入；'=' 内联写法 tsc 不支持，保守视为未生效。
+ */
 function hasEffectiveNoEmit(args: string[]): boolean {
   let noEmit = false;
   for (let index = 0; index < args.length; index++) {
-    if (args[index] === '--noEmit') {
-      noEmit = args[index + 1] !== 'false';
-      if (args[index + 1] === 'true' || args[index + 1] === 'false') {
-        index++;
-      }
-    } else if (args[index].startsWith('--noEmit=')) {
+    const option = parseOption(args[index]);
+    if (!option || option.path !== 'noemit') {
+      continue;
+    }
+    if (option.inlineValue !== undefined) {
       return false;
+    }
+    const previous = index > 0 ? parseOption(args[index - 1]) : null;
+    if (previous && previous.inlineValue === undefined && !TSC_FLAG_OPTIONS.has(previous.name)) {
+      continue;
+    }
+    const next = args[index + 1];
+    noEmit = next !== 'false';
+    if (next === 'true' || next === 'false') {
+      index++;
     }
   }
   return noEmit;
@@ -2109,44 +3097,240 @@ function checkGitSubcommand(args: string[]) {
   );
 }
 
-function checkPackageManagerSubcommand(bin: string, args: string[]) {
+function checkPackageManagerSubcommand(bin: string, args: string[]): AllowlistResult {
   const first = args[0]?.toLowerCase();
-  if (first === 'test') {
-    return { safe: true } as const;
-  }
-  if (first !== 'run') {
+  let scriptArgsStart = 1;
+  if (first === 'run') {
+    const script = args[1]?.toLowerCase();
+    if (
+      !script ||
+      !(
+        READONLY_PACKAGE_SCRIPTS.has(script) ||
+        script.startsWith('test:') ||
+        (script.startsWith('lint:') && !script.includes('fix'))
+      )
+    ) {
+      return readonlyBlock(
+        'allowlist-package-manager-script',
+        `${bin} run ${script ?? '[missing]'} is not an allowed read-only script`
+      );
+    }
+    scriptArgsStart = 2;
+  } else if (first !== 'test') {
     return readonlyBlock(
       'allowlist-package-manager-subcommand',
       `${bin} ${first ?? '[missing]'} is not a read-only test/lint/build command`
     );
   }
 
-  const script = args[1]?.toLowerCase();
-  if (
-    script &&
-    (READONLY_PACKAGE_SCRIPTS.has(script) ||
-      script.startsWith('test:') ||
-      (script.startsWith('lint:') && !script.includes('fix')))
-  ) {
-    return { safe: true } as const;
+  const separator = args.indexOf('--', scriptArgsStart);
+  const ownEnd = separator < 0 ? args.length : separator;
+  for (let index = scriptArgsStart; index < ownEnd; index++) {
+    const arg = args[index];
+    if (arg.startsWith('-')) {
+      const ownOptionBlock = checkPackageManagerOwnOption(bin, arg);
+      if (ownOptionBlock) {
+        return ownOptionBlock;
+      }
+      continue;
+    }
+    // '--' 之前的位置参数同样会被追加给脚本（npm/pnpm/yarn 都如此），与 '--' 之后一样按测试文件规则判定。
+    const violation = describeTestPathViolation(arg);
+    if (violation) {
+      return testPathBlock(`${bin} script`, arg, violation);
+    }
+  }
+  return separator < 0 ? { safe: true } : checkRunnerPassthrough(bin, args.slice(separator + 1));
+}
+
+function checkPackageManagerOwnOption(
+  bin: string,
+  arg: string
+): { safe: false; block: TerminalSafetyBlock } | null {
+  const option = parseOption(arg);
+  if (option && option.path === option.name) {
+    if (PACKAGE_MANAGER_LONG_OPTIONS.has(option.name)) {
+      return null;
+    }
+    // nopt 会把单横线 token 拆成短选项簇（-sw = -s -w <value>），所以每个字母都必须在白名单内。
+    if (
+      option.letters !== null &&
+      option.inlineValue === undefined &&
+      option.letters.length > 0 &&
+      option.letters.every((letter) => PACKAGE_MANAGER_SHORT_OPTIONS.has(letter))
+    ) {
+      return null;
+    }
   }
   return readonlyBlock(
-    'allowlist-package-manager-script',
-    `${bin} run ${script ?? '[missing]'} is not an allowed read-only script`
+    'allowlist-package-manager-option',
+    `${bin} option before "--" is not in the read-only allowlist (--silent, -s, --if-present): ${describeOptionToken(arg)}`
   );
 }
 
-function checkNodeSubcommand(args: string[]) {
+/**
+ * 包管理器 '--' 之后交给脚本的参数。脚本内容不可见，运行器可能是 vitest、jest、node --test，
+ * 也可能是 lint/typecheck 脚本里的 eslint/tsc/biome：拒绝表取它们的并集给出具体规则，
+ * 再用运行器无关白名单兜底；位置参数在 node --test / mocha 这类运行器下就是被执行的文件，按测试文件规则判定。
+ */
+function checkRunnerPassthrough(bin: string, args: string[]): AllowlistResult {
+  const context = `${bin} script arguments`;
+  // 透传参数里再出现的 '--' 结束运行器自身的选项解析：vitest(mri)、jest(yargs)、node --test 都把其后的
+  // token 当位置参数，node --test 会把 '-t'、'--help' 这类名字当测试文件执行，所以其后一律按测试文件规则判定。
+  let positionalOnly = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--' && !positionalOnly) {
+      positionalOnly = true;
+      continue;
+    }
+    if (positionalOnly || !arg.startsWith('-')) {
+      const violation = describeTestPathViolation(arg);
+      if (violation) {
+        return testPathBlock(context, arg, violation);
+      }
+      continue;
+    }
+    const option = parseOption(arg);
+    const denied =
+      option && matchOptionTable(PASSTHROUGH_OPTION_TABLE, option, 'unknown', args[index + 1]);
+    if (denied) {
+      return deniedOptionBlock(context, denied);
+    }
+    const allowed =
+      option &&
+      lookupAllowedOption(PASSTHROUGH_ALLOWED_OPTIONS, PASSTHROUGH_SHORT_OPTIONS, option, false);
+    if (!option || !allowed) {
+      return readonlyBlock(
+        'allowlist-runner-option',
+        `${context} option is not in the read-only test-runner allowlist: ${describeOptionToken(arg)}`
+      );
+    }
+    const next = args[index + 1];
+    if (
+      option.inlineValue !== undefined ||
+      allowed.value === 'none' ||
+      next === undefined ||
+      next.startsWith('-')
+    ) {
+      continue;
+    }
+    if (allowed.value === 'pattern') {
+      // free-form 值用空格写法时，无法区分它是选项值还是会被某个运行器当作文件执行的位置参数。
+      return readonlyBlock(
+        'allowlist-runner-option-value',
+        `${context} option ${option.raw} must pass its value inline (${option.raw}=<value>)`
+      );
+    }
+    if (allowed.value === 'number' && !PASSTHROUGH_NUMBER_VALUE.test(next)) {
+      // 不是数字就不当作值消费，下一轮按位置参数（测试文件规则）判定。
+      continue;
+    }
+    // 数字值与已由拒绝表校验过的枚举值（reporter/environment/test-reporter）。
+    index++;
+  }
+  return { safe: true };
+}
+
+/** 白名单查找；单横线 token 的每个字母都必须在短选项白名单内（数字视为附带的数值）。 */
+function lookupAllowedOption(
+  allowed: ReadonlyMap<string, AllowedOption>,
+  shorts: ReadonlySet<string>,
+  option: ParsedOption,
+  allowClusters: boolean
+): AllowedOption | null {
+  if (option.letters !== null) {
+    const letters = option.letters.filter((letter) => !/\d/.test(letter));
+    if (letters.length === 0 || (!allowClusters && letters.length !== 1)) {
+      return null;
+    }
+    if (!letters.every((letter) => shorts.has(letter))) {
+      return null;
+    }
+    // yargs/mri 只让簇里最后一个字母消费后续 token。
+    return allowed.get(letters[letters.length - 1]) ?? { value: 'none' };
+  }
+  const entry = allowed.get(option.name);
+  if (!entry) {
+    return null;
+  }
+  if (option.path !== option.name) {
+    const subkey = option.path.slice(option.name.length + 1).split('.')[0];
+    if (!entry.subkeys?.has(subkey)) {
+      return null;
+    }
+  }
+  return entry;
+}
+
+function checkVitestSubcommand(args: string[]): AllowlistResult {
+  let runFlag = false;
+  for (const arg of args) {
+    if (arg === '--' || !arg.startsWith('-')) {
+      // vitest 的位置参数是文件名过滤器，只会选中 include 匹配的测试文件。
+      continue;
+    }
+    const option = parseOption(arg);
+    if (
+      !option ||
+      !lookupAllowedOption(VITEST_ALLOWED_OPTIONS, VITEST_SHORT_OPTIONS, option, true)
+    ) {
+      return readonlyBlock(
+        'allowlist-vitest-option',
+        `vitest option is not in the read-only allowlist: ${describeOptionToken(arg)}`
+      );
+    }
+    runFlag ||= option.letters === null && option.path === 'run';
+  }
+  if (args.length === 0) {
+    return { safe: true };
+  }
+  const first = args[0].toLowerCase();
+  const positionals = args.filter((arg) => !arg.startsWith('-')).map((arg) => arg.toLowerCase());
+  // 首个 token 是 run 时其后的 init/list 只是过滤器；否则任何非运行子命令名都可能被 cac 当作命令。
+  const nonRun =
+    first === 'run' ? undefined : positionals.find((arg) => VITEST_NON_RUN_SUBCOMMANDS.has(arg));
+  if (nonRun) {
+    return readonlyBlock('allowlist-vitest-run', `vitest ${nonRun} is not a read-only test run`);
+  }
+  if (first === 'related' && !runFlag) {
+    return readonlyBlock('allowlist-vitest-run', 'vitest related must use --run');
+  }
+  return first === 'run' || runFlag || positionals.includes('run')
+    ? { safe: true }
+    : readonlyBlock('allowlist-vitest-run', 'vitest must use run mode');
+}
+
+function checkJestArguments(args: string[]): AllowlistResult {
+  for (const arg of args) {
+    if (arg === '--' || !arg.startsWith('-')) {
+      // jest 的位置参数是测试路径正则，只在 testMatch 选中的测试文件里过滤。
+      continue;
+    }
+    const option = parseOption(arg);
+    if (!option || !lookupAllowedOption(JEST_ALLOWED_OPTIONS, JEST_SHORT_OPTIONS, option, true)) {
+      return readonlyBlock(
+        'allowlist-jest-option',
+        `jest option is not in the read-only allowlist: ${describeOptionToken(arg)}`
+      );
+    }
+  }
+  return { safe: true };
+}
+
+function checkNodeSubcommand(args: string[]): AllowlistResult {
   // Node 24 实测：进入 --test 模式后，出现在测试路径之后、甚至 '--' 之后的 node 选项（如 --require）
   // 仍然生效，所以白名单必须覆盖 argv 里每一个以 '-' 开头的 token，而不只是前导选项段。
   // 反过来，--test 本身必须出现在第一个位置参数之前：否则 node 把该位置参数当脚本直接执行，
   // --test 只是脚本收到的 argv（'node scripts/x.mjs --test'）。
   let sawTest = false;
   let sawPositional = false;
+  const positionals: string[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (!arg.startsWith('-')) {
       sawPositional = true;
+      positionals.push(arg);
       continue;
     }
     if (arg === '--') {
@@ -2154,30 +3338,33 @@ function checkNodeSubcommand(args: string[]) {
       sawPositional = true;
       continue;
     }
-    const equalsIndex = arg.indexOf('=');
-    const inlineValue = equalsIndex < 0 ? undefined : arg.slice(equalsIndex + 1);
-    // Node 接受下划线与连字符互换的拼写（--test_only 等价于 --test-only），归一后再比对白名单。
-    // 大小写归一只影响本检查的分类；node 自身对 --TEST 这类拼写会直接报 bad option，不会放大能力。
-    const option = (equalsIndex < 0 ? arg : arg.slice(0, equalsIndex))
-      .toLowerCase()
-      .replace(/_/g, '-');
-    if (NODE_EVAL_OPTIONS.has(option)) {
-      return readonlyBlock('allowlist-node-eval', 'node eval/print modes are blocked');
-    }
-    if (NODE_PRELOAD_OPTIONS.has(option)) {
+    // 名字经 parseOption 规范化：node 接受 '_' 与 '-' 互换（--test_only 等价于 --test-only）；
+    // 大小写与驼峰归一只影响本检查的分类，node 自身对 --TEST 这类拼写会直接报 bad option，不会放大能力。
+    const option = parseOption(arg);
+    if (!option || option.name === '' || option.path !== option.name) {
       return readonlyBlock(
-        'allowlist-node-preload',
-        `node preload/import option is blocked in read-only mode: ${option}`
+        'allowlist-node-option',
+        `node option is not in the read-only --test allowlist: ${describeOptionToken(arg)}`
       );
     }
-    if (NODE_TEST_FLAG_OPTIONS.has(option)) {
-      if (inlineValue !== undefined) {
+    const name = option.name;
+    if (NODE_EVAL_OPTIONS.has(name)) {
+      return readonlyBlock('allowlist-node-eval', 'node eval/print modes are blocked');
+    }
+    if (NODE_PRELOAD_OPTIONS.has(name)) {
+      return readonlyBlock(
+        'allowlist-node-preload',
+        `node preload/import option is blocked in read-only mode: ${describeOptionToken(arg)}`
+      );
+    }
+    if (NODE_TEST_FLAG_OPTIONS.has(name)) {
+      if (option.inlineValue !== undefined) {
         return readonlyBlock(
           'allowlist-node-option',
-          `node option ${option} does not take a value`
+          `node option ${describeOptionToken(arg)} does not take a value`
         );
       }
-      if (option === '--test') {
+      if (name === 'test') {
         if (sawPositional) {
           return readonlyBlock(
             'allowlist-node-test',
@@ -2188,21 +3375,21 @@ function checkNodeSubcommand(args: string[]) {
       }
       continue;
     }
-    if (NODE_TEST_VALUE_OPTIONS.has(option)) {
-      let value = inlineValue;
+    if (NODE_TEST_VALUE_OPTIONS.has(name)) {
+      let value = option.inlineValue;
       if (value === undefined) {
         // 空格写法：值必须是紧随其后、且不以 '-' 开头的 token，避免把下一个选项当成值吞掉。
         const next = args[index + 1];
         if (next === undefined || next.startsWith('-')) {
           return readonlyBlock(
             'allowlist-node-option-value',
-            `node option ${option} requires a value`
+            `node option ${arg} requires a value`
           );
         }
         value = next;
         index++;
       }
-      const valueBlock = checkNodeTestOptionValue(option, value);
+      const valueBlock = checkNodeTestOptionValue(name, arg, value);
       if (valueBlock) {
         return valueBlock;
       }
@@ -2210,21 +3397,31 @@ function checkNodeSubcommand(args: string[]) {
     }
     return readonlyBlock(
       'allowlist-node-option',
-      `node option is not in the read-only --test allowlist: ${arg}`
+      `node option is not in the read-only --test allowlist: ${describeOptionToken(arg)}`
     );
   }
   if (!sawTest) {
     return readonlyBlock('allowlist-node-test', 'node is only allowed with --test');
   }
-  return { safe: true } as const;
+  // --test 模式下位置参数就是被执行的文件（node --test scripts/release.mjs 会运行该脚本顶层代码），
+  // 与已拦截的 node scripts/release.mjs --test 是同一向量：只允许测试文件。
+  for (const positional of positionals) {
+    const violation = describeTestPathViolation(positional);
+    if (violation) {
+      return testPathBlock('node --test', positional, violation);
+    }
+  }
+  return { safe: true };
 }
 
 /** 白名单内需要值的 node --test 选项，值本身也要是只读形态。 */
 function checkNodeTestOptionValue(
-  option: string,
+  name: string,
+  arg: string,
   value: string
 ): { safe: false; block: TerminalSafetyBlock } | null {
-  if (option === '--test-reporter') {
+  const label = describeOptionToken(arg);
+  if (name === 'testreporter') {
     // 非内置名会被 node 当成模块说明符加载执行；比较保持大小写敏感，与 node 的解析一致。
     return NODE_TEST_BUILTIN_REPORTERS.has(value)
       ? null
@@ -2232,15 +3429,15 @@ function checkNodeTestOptionValue(
           'allowlist-node-option-value',
           `node --test-reporter only accepts built-in reporters (${[
             ...NODE_TEST_BUILTIN_REPORTERS,
-          ].join(', ')}): ${value}`
+          ].join(', ')}): ${truncateForReason(value)}`
         );
   }
-  if (option === '--test-concurrency' || option === '--test-timeout') {
+  if (name === 'testconcurrency' || name === 'testtimeout') {
     return /^\d+(?:\.\d+)?$/.test(value)
       ? null
       : readonlyBlock(
           'allowlist-node-option-value',
-          `node option ${option} requires a non-negative number: ${value}`
+          `node option ${label} requires a non-negative number: ${truncateForReason(value)}`
         );
   }
   // --test-name-pattern / --test-skip-pattern 是进程内正则，只影响选测，不涉及写文件或加载模块。
@@ -2248,8 +3445,58 @@ function checkNodeTestOptionValue(
     ? null
     : readonlyBlock(
         'allowlist-node-option-value',
-        `node option ${option} requires a non-empty value`
+        `node option ${label} requires a non-empty value`
       );
+}
+
+/**
+ * 测试文件位置参数：文件名含 .test. / .spec.，或位于 test/、tests/、__tests__/ 目录（含目录本身）。
+ * 只做字面判定，不访问文件系统：拒绝绝对路径/家目录、'..' 段，以及 node glob 中能把字面 .test. 变成
+ * 可选的花括号、extglob、字符类与转义；* 与 ? 不能删除字面字符，保留，但以 '.' 开头的段里的 * / ?
+ * 能匹配 '.' 与 '..'，与字面 '..' 同样拒绝。
+ */
+function describeTestPathViolation(value: string): string | null {
+  if (TEST_PATH_GLOB_ALTERNATION.test(value)) {
+    return 'glob alternation, extglob, character classes and escapes are not allowed';
+  }
+  if (value.startsWith('/') || value.startsWith('~') || /^[A-Za-z]:/.test(value)) {
+    return 'absolute or home-relative paths are not allowed';
+  }
+  const rawSegments = value.split('/');
+  // 宿主 sh（未加引号时）与 node 自身的 glob（加引号时）都可能展开这一段；不推断它会匹配什么，
+  // 也不区分是否加了引号，只要能展开成 '.' / '..' 就按父目录段拒绝。
+  if (rawSegments.some((segment) => TEST_PATH_DOT_GLOB_SEGMENT.test(segment))) {
+    return 'dot-prefixed glob segments (.?, .*) can expand to "." or ".." and are not allowed';
+  }
+  const segments = rawSegments.filter((segment) => segment !== '' && segment !== '.');
+  if (segments.includes('..')) {
+    return 'parent-directory segments are not allowed';
+  }
+  const last = segments[segments.length - 1];
+  if (last === undefined) {
+    return 'not a test file';
+  }
+  if (segments.slice(0, -1).some((segment) => TEST_DIRECTORY_SEGMENTS.has(segment.toLowerCase()))) {
+    return null;
+  }
+  if (segments.length === 1 && TEST_DIRECTORY_SEGMENTS.has(last.toLowerCase())) {
+    return null;
+  }
+  if (TEST_FILE_NAME.test(last)) {
+    return null;
+  }
+  return 'only *.test.* / *.spec.* files or paths under test/, tests/, __tests__/ are allowed';
+}
+
+function testPathBlock(
+  context: string,
+  arg: string,
+  violation: string
+): { safe: false; block: TerminalSafetyBlock } {
+  return readonlyBlock(
+    'allowlist-test-path',
+    `${context} positional argument must be a test file: ${truncateForReason(arg)} (${violation})`
+  );
 }
 
 function checkBiomeSubcommand(args: string[]) {
@@ -2265,4 +3512,15 @@ function checkBiomeSubcommand(args: string[]) {
 
 function readonlyBlock(rule: string, reason: string): { safe: false; block: TerminalSafetyBlock } {
   return { safe: false, block: { rule, reason } };
+}
+
+function logAllowlistBlock(bin: string, block: TerminalSafetyBlock): void {
+  // 日志失败不能改变放行/拒绝结论，也不能把观察失败升级为业务失败。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[terminalSafety] read-only allowlist blocked command: rule=${block.rule} bin=${bin} reason=${block.reason}`
+      ),
+    () => undefined
+  );
 }
