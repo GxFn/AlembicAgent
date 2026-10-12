@@ -214,12 +214,136 @@ describe('git status facts', () => {
   it('does not turn a human status footer into an untracked filename', async () => {
     const stdout =
       'On branch main\nUntracked files:\n\tnew.ts\n\nnothing added to commit but untracked files present (use "git add" to track)';
-    expect((await terminalOutput('git status', stdout)).text).toBe('untracked(1): new.ts');
+    expect((await terminalOutput('git status', stdout)).text).toBe(
+      'branch: main\nuntracked(1): new.ts'
+    );
   });
 
   it('keeps an unknown status line instead of reporting a partial file list as complete', async () => {
     const stdout = ' M tracked.ts\nunexpected: incomplete status';
     expect((await terminalOutput('git status', stdout)).text).toContain(stdout);
+  });
+
+  it('reports an unstaged human-format deletion as deleted and keeps the branch line', async () => {
+    const stdout = [
+      'On branch main',
+      "Your branch is ahead of 'origin/main' by 1 commit.",
+      '  (use "git push" to publish your local commits)',
+      '',
+      'Changes not staged for commit:',
+      '  (use "git add/rm <file>..." to update what will be committed)',
+      '  (use "git restore <file>..." to discard changes in working directory)',
+      '\tdeleted:    src/old.ts',
+      '\tmodified:   src/kept.ts',
+      '',
+      'no changes added to commit (use "git add" and/or "git commit -a")',
+    ].join('\n');
+    expect((await terminalOutput('git status', stdout)).text).toBe(
+      "branch: main; Your branch is ahead of 'origin/main' by 1 commit.\nmodified(1): src/kept.ts\ndeleted(1): src/old.ts"
+    );
+  });
+
+  it('buckets staged human-format changes by change type like the porcelain format', async () => {
+    const human = [
+      'On branch main',
+      'Changes to be committed:',
+      '  (use "git restore --staged <file>..." to unstage)',
+      '\tnew file:   d.ts',
+      '\trenamed:    a.ts -> b.ts',
+      '\tdeleted:    c.ts',
+      '\tcopied:     e.ts -> f.ts',
+      '\ttypechange: link.ts',
+      '\tmodified:   g.ts',
+      '',
+    ].join('\n');
+    const porcelain = 'A  d.ts\nR  a.ts -> b.ts\nD  c.ts\nC  e.ts -> f.ts\nT  link.ts\nM  g.ts';
+    const expected =
+      'staged(2): d.ts, g.ts\ndeleted(1): c.ts\nrenamed(1): a.ts -> b.ts\ncopied(1): e.ts -> f.ts\ntypechanged(1): link.ts';
+    expect(parseGitStatusOutput(porcelain)).toBe(expected);
+    expect((await terminalOutput('git status', human)).text).toBe(`branch: main\n${expected}`);
+  });
+
+  it('recognizes a detached HEAD instead of falling back for the whole status', async () => {
+    const stdout = [
+      'HEAD detached at abc1234',
+      'Changes not staged for commit:',
+      '\tmodified:   a.ts',
+      '',
+      'no changes added to commit (use "git add" and/or "git commit -a")',
+    ].join('\n');
+    expect((await terminalOutput('git status', stdout)).text).toBe(
+      'branch: HEAD detached at abc1234\nmodified(1): a.ts'
+    );
+  });
+
+  it('keeps both lines of a diverged branch notice', () => {
+    const stdout = [
+      'On branch main',
+      "Your branch and 'origin/main' have diverged,",
+      'and have 1 and 2 different commits each, respectively.',
+      '  (use "git pull" if you want to integrate the remote branch with yours)',
+      '',
+      'Untracked files:',
+      '\tnew.ts',
+    ].join('\n');
+    expect(parseGitStatusOutput(stdout)).toBe(
+      "branch: main; Your branch and 'origin/main' have diverged, and have 1 and 2 different commits each, respectively.\nuntracked(1): new.ts"
+    );
+  });
+
+  it('keeps the porcelain branch header requested with --branch', () => {
+    expect(parseGitStatusOutput('## main...origin/main [ahead 1]\n M a.ts')).toBe(
+      'branch: main...origin/main [ahead 1]\nmodified(1): a.ts'
+    );
+  });
+
+  it('reports a lone intent-to-add entry instead of an empty summary', async () => {
+    const result = await terminalOutput('git status --short', ' A new.ts');
+    expect(result.status).toBe('success');
+    expect(result.text).toBe('intent-to-add(1): new.ts');
+  });
+
+  it('keeps an intent-to-add entry next to other worktree changes', async () => {
+    expect((await terminalOutput('git status --short', ' A new.ts\n M b.ts')).text).toBe(
+      'modified(1): b.ts\nintent-to-add(1): new.ts'
+    );
+    expect(parseGitStatusOutput('## main\n A new.ts')).toBe(
+      'branch: main\nintent-to-add(1): new.ts'
+    );
+  });
+
+  it('reports a human-format unstaged new file as intent-to-add', () => {
+    const stdout = [
+      'On branch main',
+      'Changes not staged for commit:',
+      '  (use "git add <file>..." to update what will be committed)',
+      '\tnew file:   new.ts',
+      '\tmodified:   b.ts',
+    ].join('\n');
+    expect(parseGitStatusOutput(stdout)).toBe(
+      'branch: main\nmodified(1): b.ts\nintent-to-add(1): new.ts'
+    );
+  });
+
+  it.each([
+    [
+      'an unmerged section',
+      'On branch main\nYou have unmerged paths.\n  (fix conflicts and run "git commit")\n\nUnmerged paths:\n  (use "git add <file>..." to mark resolution)\n\tboth modified:   a.ts',
+    ],
+    [
+      'a branch notice without any file entry',
+      'On branch main\nnothing to commit, working tree clean',
+    ],
+    [
+      'an unknown change type',
+      'On branch main\nChanges not staged for commit:\n\tunknown:    a.ts',
+    ],
+    [
+      'an indented entry outside any section',
+      'On branch main\nUntracked files:\n\ta.ts\n\nnothing added to commit but untracked files present\n\tstray.ts',
+    ],
+  ])('falls back to the raw status for %s', (_label, stdout) => {
+    expect(parseGitStatusOutput(stdout)).toBeNull();
   });
 });
 
@@ -237,6 +361,51 @@ describe('git diff facts', () => {
     'diff --git a/a.bin b/a.bin\nindex 1111111..2222222 100644\nBinary files a/a.bin and b/a.bin differ',
   ])('keeps incomplete or non-text patches as raw output', async (stdout) => {
     expect((await terminalOutput('git diff', stdout)).text).toContain(stdout);
+  });
+
+  it('keeps every per-file line of git diff --stat next to the summary', async () => {
+    const stdout = [
+      ' src/a.ts         |  3 ++-',
+      ' src/b.ts         | 10 ++++++++++',
+      ' assets/logo.png  | Bin 0 -> 1234 bytes',
+      ' src/{old => new}.ts | 0',
+      ' 4 files changed, 12 insertions(+), 1 deletion(-)',
+      '',
+    ].join('\n');
+    expect((await terminalOutput('git diff --stat main', stdout)).text).toBe(
+      [
+        '4 files changed, 12 insertions(+), 1 deletion(-)',
+        '',
+        'src/a.ts | 3 ++-',
+        'src/b.ts | 10 ++++++++++',
+        'assets/logo.png | Bin 0 -> 1234 bytes',
+        'src/{old => new}.ts | 0',
+      ].join('\n')
+    );
+  });
+
+  it('keeps the git diff --shortstat summary unchanged', async () => {
+    const stdout = ' 2 files changed, 3 insertions(+), 1 deletion(-)\n';
+    expect((await terminalOutput('git diff --shortstat', stdout)).text).toBe(
+      '2 files changed, 3 insertions(+), 1 deletion(-)'
+    );
+  });
+
+  it.each([
+    [
+      'a per-file count that disagrees with the summary',
+      ' src/a.ts | 3 ++-\n 2 files changed, 3 insertions(+), 1 deletion(-)',
+    ],
+    [
+      'an unrecognized line around the stat block',
+      ' src/a.ts | 3 ++-\n ...\n 2 files changed, 3 insertions(+), 1 deletion(-)',
+    ],
+    [
+      'text after the summary line',
+      ' src/a.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-)\n create mode 100644 src/a.ts',
+    ],
+  ])('keeps git diff --stat raw output for %s', async (_label, stdout) => {
+    expect((await terminalOutput('git diff --stat', stdout)).text).toContain(stdout);
   });
 });
 
