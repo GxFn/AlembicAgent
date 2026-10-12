@@ -3,7 +3,7 @@
 import { getSystemInjectedFields } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { fail, ok, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
-import { prepareSubmission } from './authoring.js';
+import { prepareSubmission, recordRejectAndDirective } from './authoring.js';
 import { AGENT_RUNTIME_SOURCE, type RecipeGatewayLike } from './contracts.js';
 import { pickString, uniqueStrings, validateSubmitParams } from './input.js';
 import { abortedKnowledgeResult } from './operation.js';
@@ -27,7 +27,13 @@ export async function handleSubmit(
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String(params.title ?? '')}" (pre-check): ${validationError}`
     );
-    return fail(`Validation failed: ${validationError}`);
+    // I39：必填项拒绝也消耗提交回合——计入会话 total（不计 streak），到顶时附预算上限指令。
+    const stopDirective = recordRejectAndDirective(
+      ctx.runtime,
+      pickString(params.dimensionId) ?? pickString(ctx.runtime?.dimensionScopeId),
+      'required-fields'
+    );
+    return fail(`Validation failed: ${validationError}${stopDirective}`);
   }
 
   try {

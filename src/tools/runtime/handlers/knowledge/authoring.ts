@@ -24,6 +24,7 @@ import { abortedKnowledgeResult } from './operation.js';
 import {
   bumpSubmitRepairStat,
   readTitleAttempt,
+  recordSubmitReject,
   sessionCounterBox,
   writeTitleAttempt,
 } from './sessionState.js';
@@ -35,6 +36,81 @@ import {
 
 type SubmissionInput = ReturnType<typeof buildSubmissionInput>;
 type AuthoringViolationLike = { code: string };
+
+/**
+ * F3 拒绝止损覆盖的拒绝种类（I39）。只统计"模型可通过改提交内容修正"的拒绝：
+ * gateway 未接线、取消等宿主/运行态拒绝不计入，下游 Core 写入结果（重复/blocked）也不计入
+ * （提交成败由 gateway 判定，与止损无关）。
+ * - evidence-expansion：evidenceRefs 展开失败（无法解析、EVIDENCE_STALE 等）；
+ * - evidence-refs-required：台账在场但 evidenceRefs 未解析出任何条目；
+ * - authoring-gate：权威门禁硬违规；
+ * - title-hard-stop：同标题已尝试 3 次的 terminal 拒绝；
+ * - required-fields：handleSubmit 的 validateSubmitParams 必填项/结构前检拒绝。
+ */
+export type SubmitRejectKind =
+  | 'evidence-expansion'
+  | 'evidence-refs-required'
+  | 'authoring-gate'
+  | 'title-hard-stop'
+  | 'required-fields';
+
+/**
+ * 只计 total、不计 streak 的拒绝种类（维护者裁定：计入 total 的保守默认）。同标题硬止损本身
+ * 已是 terminal 拒绝且按标题计数，必填项前检是结构性缺字段——两者都不代表"同一候选在门禁上
+ * 反复被拒"，计入 streak 会让"换候选"档 STOP 过早触发；但都消耗提交回合，必须计入总预算。
+ */
+const STREAK_EXEMPT_REJECT_KINDS: ReadonlySet<SubmitRejectKind> = new Set<SubmitRejectKind>([
+  'title-hard-stop',
+  'required-fields',
+]);
+/** 连续拒绝达到该值时附"换候选"档 STOP。 */
+const REJECT_STREAK_STOP_THRESHOLD = 3;
+/** 会话累计拒绝达到该值时附"停止提交"档 STOP（优先于连续档）。 */
+const REJECT_TOTAL_BUDGET = 12;
+const REJECT_BUDGET_DIRECTIVE =
+  ' 🛑 STOP: 本会话提交拒绝已达预算上限——禁止再调用 knowledge submit，立即输出最终总结，把未通过的候选列为 blocker（这不算失败）。';
+const REJECT_STREAK_DIRECTIVE =
+  ' 🛑 STOP: 已连续多次被拒——立即放弃当前候选（不要再改写重试它），换下一条【不同】候选继续提交；若没有其他候选，直接输出最终总结并把本条列为 blocker。';
+
+/**
+ * F3 拒绝止损：真机 ts-js-module 曾因「拒绝→重试」循环烧穿 produce 阶段 900s（stage_timeout
+ * 连坐 session abort 下游 8 维度）。每个模型可修的拒绝分支都经此累加会话计数，并按档位返回
+ * 需拼进拒绝消息的 STOP 指令，让模型跳过修不动的候选、及时收束——预算换覆盖，而不是死磕单条。
+ * I39：此前只有最终门禁分支计数，expansion 失败与 EVIDENCE_REFS_REQUIRED 直接 return，
+ * 换标题即可绕过同标题止损，3/12 两档都触发不了。
+ * 计数宿主是 sessionCounterBox（跨调用稳定）；无计数盒（非管线直调）时跳过计数并留 debug 诊断，
+ * 拒绝消息保持原样（观测与止损不影响拒绝本身）。
+ */
+export function recordRejectAndDirective(
+  runtime: unknown,
+  dimensionId: string | undefined,
+  kind: SubmitRejectKind
+): string {
+  const countsTowardStreak = !STREAK_EXEMPT_REJECT_KINDS.has(kind);
+  const counts = recordSubmitReject(runtime, countsTowardStreak);
+  if (!counts) {
+    Logger.getInstance().debug(
+      `[knowledge.submit] reject stop-loss skipped (kind=${kind}, dim=${String(dimensionId ?? '')}): no session counter box (runtime.sharedState absent)`
+    );
+    return '';
+  }
+  let directive = '';
+  let tier = '';
+  if (counts.total >= REJECT_TOTAL_BUDGET) {
+    directive = REJECT_BUDGET_DIRECTIVE;
+    tier = 'session-budget';
+  } else if (countsTowardStreak && counts.streak >= REJECT_STREAK_STOP_THRESHOLD) {
+    // 豁免种类不追加"换候选"档：硬止损文案已要求换候选，必填项拒绝只需补字段。
+    directive = REJECT_STREAK_DIRECTIVE;
+    tier = 'abandon-candidate';
+  }
+  if (directive) {
+    Logger.getInstance().warn(
+      `[knowledge.submit] reject stop-loss engaged (kind=${kind}, dim=${String(dimensionId ?? '')}): streak=${counts.streak}, total=${counts.total}, tier=${tier}`
+    );
+  }
+  return directive;
+}
 
 /**
  * I32 修复采纳判定：修复子调用的定位是「在不改变事实的前提下改进软违规」，不是在通过与
@@ -138,10 +214,16 @@ export async function prepareSubmission(
       Logger.getInstance().warn(
         `[knowledge.submit] hard stop-loss: "${titleKey}" already attempted ${tried} times (dim=${String(effectiveDimensionId ?? '')})`
       );
+      // I39：硬止损消耗提交回合，计入会话 total（不计 streak），total 到顶时附预算上限指令。
+      const stopDirective = recordRejectAndDirective(
+        ctx.runtime,
+        effectiveDimensionId,
+        'title-hard-stop'
+      );
       return {
         status: 'rejected',
         result: fail(
-          `🛑 候选 "${titleKey}" 已尝试 ${tried} 次未通过——本会话禁止再提交该标题。立即换一个【不同的】发现提交，或输出最终总结并把它列为 blocker。`
+          `🛑 候选 "${titleKey}" 已尝试 ${tried} 次未通过——本会话禁止再提交该标题。立即换一个【不同的】发现提交，或输出最终总结并把它列为 blocker。${stopDirective}`
         ),
       };
     }
@@ -182,7 +264,13 @@ export async function prepareSubmission(
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${expansion.error}`
     );
-    return { status: 'rejected', result: fail(expansion.error) };
+    // I39：证据展开失败同样是"拒绝→重试"循环的入口，计入 streak/total 并按档位附 STOP。
+    const stopDirective = recordRejectAndDirective(
+      ctx.runtime,
+      effectiveDimensionId,
+      'evidence-expansion'
+    );
+    return { status: 'rejected', result: fail(`${expansion.error}${stopDirective}`) };
   }
   if (expansion.expandedSources.length > 0) {
     Logger.getInstance().info(
@@ -201,10 +289,16 @@ export async function prepareSubmission(
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): EVIDENCE_REFS_REQUIRED`
     );
+    // I39：换标题重提会绕过同标题硬止损，必须计入 streak/total，第 3 次起附 STOP。
+    const stopDirective = recordRejectAndDirective(
+      ctx.runtime,
+      effectiveDimensionId,
+      'evidence-refs-required'
+    );
     return {
       status: 'rejected',
       result: fail(
-        `Validation failed: EVIDENCE_REFS_REQUIRED: 维度运行的候选必须以 reasoning.evidenceRefs 引用台账条目 id（先 memory.recall 查看 findings 携带的 [E-x] 标注，优先引用带文件区间的条目）——手写 sources 不能作为唯一证据。改标题重提同一断言不会通过：补上 evidenceRefs，或该断言没有台账证据支撑时直接放弃。${hint}`
+        `Validation failed: EVIDENCE_REFS_REQUIRED: 维度运行的候选必须以 reasoning.evidenceRefs 引用台账条目 id（先 memory.recall 查看 findings 携带的 [E-x] 标注，优先引用带文件区间的条目）——手写 sources 不能作为唯一证据。改标题重提同一断言不会通过：补上 evidenceRefs，或该断言没有台账证据支撑时直接放弃。${hint}${stopDirective}`
       ),
     };
   }
@@ -240,10 +334,12 @@ export async function prepareSubmission(
     );
   }
 
-  let effectiveItem: Record<string, unknown> = normalizeBareSourceRefs(
-    sanitized.item,
-    sharedStateForSubmit
-  );
+  const bareNormalized = normalizeBareSourceRefs(sanitized.item, sharedStateForSubmit);
+  if (bareNormalized.changed) {
+    // I39：F4f 是确定性代修层，必须进修复层计量（改写日志由 normalizeBareSourceRefs 落）。
+    bumpSubmitRepairStat(ctx.runtime, 'bare_refs_normalized');
+  }
+  let effectiveItem: Record<string, unknown> = bareNormalized.item;
   let preparedProduction = prepareRecipeProductionItem(effectiveItem, ctx.projectRoot);
   effectiveItem = preparedProduction.item as Record<string, unknown>;
   if (!preparedProduction.codeEvidence.accepted) {
@@ -411,31 +507,14 @@ export async function prepareSubmission(
     Logger.getInstance().warn(
       `[knowledge.submit] rejected "${String((item as { title?: unknown }).title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): ${detail}`
     );
-    // F3 拒绝止损：真机 ts-js-module 曾因「拒绝→重试」循环烧穿 produce 阶段 900s（stage_timeout
-    // 连坐 session abort 下游 8 维度）。在 runtime 上维护连续/累计拒绝计数，按档位在拒绝消息里
-    // 附加 STOP 指令，让模型跳过修不动的候选、及时收束——预算换覆盖，而不是死磕单条。
-    // 止损计数宿主同 waiver:必须用 sessionCounterBox——此前挂 ctx.runtime(每调用一次性
-    // 投影对象),streak/total 每次从 0 起算,3/12 档位从未触发,900s 烧穿护栏实际失效。
-    const stopLossBox = sessionCounterBox(ctx.runtime);
-    let stopDirective = '';
-    if (stopLossBox) {
-      const streak = (Number(stopLossBox.gateRejectStreak) || 0) + 1;
-      const total = (Number(stopLossBox.gateRejectTotal) || 0) + 1;
-      stopLossBox.gateRejectStreak = streak;
-      stopLossBox.gateRejectTotal = total;
-      if (total >= 12) {
-        stopDirective =
-          ' 🛑 STOP: 本会话门禁拒绝已达预算上限——禁止再调用 knowledge submit，立即输出最终总结，把未通过的候选列为 blocker（这不算失败）。';
-      } else if (streak >= 3) {
-        stopDirective =
-          ' 🛑 STOP: 已连续多次被拒——立即放弃当前候选（不要再改写重试它），换下一条【不同】候选继续提交；若没有其他候选，直接输出最终总结并把本条列为 blocker。';
-      }
-      if (stopDirective) {
-        Logger.getInstance().warn(
-          `[knowledge.submit] reject stop-loss engaged (dim=${String(effectiveDimensionId ?? '')}): streak=${streak}, total=${total}`
-        );
-      }
-    }
+    // F3 拒绝止损（与证据类拒绝共用 recordRejectAndDirective）：计数宿主同 waiver，必须用
+    // sessionCounterBox——此前挂 ctx.runtime(每调用一次性投影对象),streak/total 每次从 0 起算,
+    // 3/12 档位从未触发,900s 烧穿护栏实际失效。
+    const stopDirective = recordRejectAndDirective(
+      ctx.runtime,
+      effectiveDimensionId,
+      'authoring-gate'
+    );
     // E7：风格/措辞类违规附「照抄即过」修复模板（动词白名单来自 Core 单源）
     const repairTemplates = buildViolationRepairTemplates(
       gateViolations,

@@ -23,6 +23,7 @@ import type {
 } from '../src/agent/service/AgentRunContracts.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
+import { SUBMIT_REPAIR_STAT_KEYS } from '../src/tools/runtime/handlers/knowledge/sessionState.js';
 
 /** 最小 PipelineRuntime：只提供 reactLoop(策略对 runtime 的唯一硬依赖)。 */
 function createFakeRuntime(replies: string[] = ['stage output long enough to be a reply']) {
@@ -249,12 +250,17 @@ describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
 
   it('sharedState._sessionCounters 盒里的修复计数投影为 submitRepairs(repair-hit-rate 观测面)', async () => {
     const { runtime } = createFakeRuntime();
+    // 样例键必须是 handler 真实写入的修复层键(I39：此前用了不存在的 core_code_backfilled，
+    // 掩盖了计量口径漂移)；登记表 SUBMIT_REPAIR_STAT_KEYS 是键的单一来源。
+    expect(SUBMIT_REPAIR_STAT_KEYS).toEqual(
+      expect.arrayContaining(['unsafe_core_code_removed', 'style_waiver'])
+    );
     const sharedState: Record<string, unknown> = {
       _sessionCounters: {
         submitRepairStats: {
-          core_code_backfilled: 2,
+          unsafe_core_code_removed: 2,
           style_waiver: 1,
-          // 形状防御：非正数不投影。
+          // 形状防御：非正数不投影(该键故意不在登记表内)。
           bogus: 0,
         },
       },
@@ -267,7 +273,7 @@ describe('PipelineStrategy — 管线结局一等化(_pipelineOutcome)', () => {
 
     expect(pipelineOutcome(result)).toEqual({
       outcome: 'completed',
-      submitRepairs: { core_code_backfilled: 2, style_waiver: 1 },
+      submitRepairs: { unsafe_core_code_removed: 2, style_waiver: 1 },
     });
   });
 

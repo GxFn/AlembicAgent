@@ -80,16 +80,18 @@ function readRefRangeCode(
  * F4f：裸路径 sourceRefs（无 `:行号`）用 Analyst 接地范围规范化为 `path:start-end`。
  * 范围投影经 sharedState._analystGroundedRanges 注入（insightGateEvaluator 写入），来自
  * evidenceMap 真实片段——裸路径候选由此获得 F4b/F4d 可用的行号锚，非任意指派。
+ * 返回 changed 供调用方计入修复层计量（I39：此前只打 info，repair-hit-rate 中 F4f 恒为 0，
+ * 会被误判为死枝）；未改写时原样返回同一 item 引用。
  */
 export function normalizeBareSourceRefs(
   item: Record<string, unknown>,
   sharedState: Record<string, unknown> | null
-): Record<string, unknown> {
+): { item: Record<string, unknown>; changed: boolean } {
   const ranges = sharedState?._analystGroundedRanges as
     | Record<string, Array<{ start: number; end: number }>>
     | undefined;
   if (!Array.isArray(item.sourceRefs)) {
-    return item;
+    return { item, changed: false };
   }
   let changed = false;
   const normalizeRef = (ref: unknown): unknown => {
@@ -110,12 +112,12 @@ export function normalizeBareSourceRefs(
     ? (reasoning.sources as unknown[]).map(normalizeRef)
     : reasoning.sources;
   if (!changed) {
-    return item;
+    return { item, changed: false };
   }
   Logger.getInstance().info(
     `[knowledge.submit] bare source refs normalized from analyst grounded ranges for "${String(item.title ?? '')}"`
   );
-  return { ...item, sourceRefs, reasoning: { ...reasoning, sources } };
+  return { item: { ...item, sourceRefs, reasoning: { ...reasoning, sources } }, changed: true };
 }
 
 /**
