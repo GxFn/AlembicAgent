@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
   evolutionGateEvaluator,
@@ -1458,6 +1459,331 @@ describe('coordination asynchronous admission', () => {
         },
       },
     });
+  });
+});
+
+/**
+ * 在给定真实时间内等待 promise 结算；超时返回 settled=false，避免回归时测试整段挂到 testTimeout。
+ */
+async function settleWithin<T>(
+  promise: Promise<T>,
+  ms: number
+): Promise<{ settled: true; value?: T; error?: unknown } | { settled: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<{ settled: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ settled: false }), ms);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => ({ settled: true as const, value }),
+        (error: unknown) => ({ settled: true as const, error })
+      ),
+      guard,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// I19：协调器的取消探针必须与 abortSignal / timeoutMs 竞速，且探针抛错在 parallel、tiered、
+// child 级与 tier 级都统一归为协调失败（父 run 抛带 partialResult 的协调错误），不再记成 child error。
+describe('coordination cancellation check racing and classification', () => {
+  it('ends a parallel run as aborted when abortSignal fires while an async shouldAbort hangs', async () => {
+    const controller = new AbortController();
+    const entered = coordinationLatch<void>();
+    const shouldAbort = vi.fn(() => {
+      entered.resolve();
+      return new Promise<boolean>(() => {});
+    });
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }]);
+    input.execution = { abortSignal: controller.signal, shouldAbort };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const run = new AgentRunCoordinator().run(input, parallelCoordinationProfile(1), runChild);
+    await entered.promise;
+    controller.abort();
+    const outcome = await settleWithin(run, 1000);
+    expect(outcome).toMatchObject({ settled: true, value: { status: 'aborted' } });
+    expect(runChild).not.toHaveBeenCalled();
+    expect(shouldAbort).toHaveBeenCalledTimes(1);
+    expect(outcome.settled && outcome.value?.phases?.dimensionResults).toEqual({
+      a: expect.objectContaining({ status: 'aborted', reply: 'child-run-aborted' }),
+      b: expect.objectContaining({ status: 'aborted', reply: 'child-run-aborted' }),
+    });
+  });
+
+  it.each([
+    'parallel',
+    'tiered',
+  ] as const)('bounds each hanging %s shouldAbort check by execution.timeoutMs', async (mode) => {
+    const shouldAbort = vi.fn(() => new Promise<boolean>(() => {}));
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }]);
+    input.execution = { shouldAbort, timeoutMs: 20 };
+    const onChildResult = vi.fn();
+    input.context.coordination = { onChildResult };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const profile = mode === 'parallel' ? parallelCoordinationProfile(1) : coordinationProfile();
+    const outcome = await settleWithin(
+      new AgentRunCoordinator().run(input, profile, runChild),
+      1000
+    );
+    // 超时视为“请求取消”：child 记 aborted 回执并照常通知宿主，不构成协调失败。
+    expect(outcome).toMatchObject({ settled: true, value: { status: 'aborted' } });
+    expect(outcome.settled && outcome.error).toBeFalsy();
+    expect(runChild).not.toHaveBeenCalled();
+    expect(onChildResult).toHaveBeenCalledTimes(2);
+    // tiered 在 tier 边界检查一次即整批取消；parallel 每个 child 各自一次有界检查。
+    expect(shouldAbort).toHaveBeenCalledTimes(mode === 'parallel' ? 2 : 1);
+  });
+
+  it.each([
+    {
+      mode: 'parallel',
+      hook: 'sync throw',
+      failure: { hook: 'shouldAbort', childId: 'a' },
+    },
+    {
+      mode: 'parallel',
+      hook: 'async reject',
+      failure: { hook: 'shouldAbort', childId: 'a' },
+    },
+    {
+      mode: 'tiered',
+      hook: 'sync throw',
+      failure: { hook: 'shouldAbort', tierIndex: 0 },
+    },
+  ] as const)('raises the coordination error for a $mode predicate $hook and stops calling the hook', async ({
+    mode,
+    hook,
+    failure,
+  }) => {
+    const shouldAbort = vi.fn((): boolean | Promise<boolean> => {
+      if (hook === 'async reject') {
+        return Promise.reject(new Error('predicate broken'));
+      }
+      throw new Error('predicate broken');
+    });
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }, { id: 'c' }]);
+    input.execution = { shouldAbort };
+    const onChildResult = vi.fn();
+    input.context.coordination = { onChildResult };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const profile = mode === 'parallel' ? parallelCoordinationProfile(1) : coordinationProfile();
+    const error = await new AgentRunCoordinator().run(input, profile, runChild).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: predicate broken',
+      coordinationFailures: [expect.objectContaining(failure)],
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ status: 'aborted', runId: 'a:aborted' }),
+            expect.objectContaining({ status: 'aborted', runId: 'b:aborted' }),
+            expect.objectContaining({ status: 'aborted', runId: 'c:aborted' }),
+          ],
+        },
+      },
+    });
+    expect((error as { coordinationFailures: unknown[] }).coordinationFailures).toHaveLength(1);
+    expect(shouldAbort).toHaveBeenCalledTimes(1);
+    expect(runChild).not.toHaveBeenCalled();
+    // 谓词故障不是维度失败：宿主不应收到任何 error 回执（否则会 consumeDimensionError）。
+    expect(onChildResult.mock.calls.map(([event]) => event.result.status)).not.toContain('error');
+  });
+
+  it('classifies a tiered predicate that starts failing at a child check as a coordination failure', async () => {
+    let calls = 0;
+    const input = baseRunInput([
+      { id: 'a', tier: 0 },
+      { id: 'b', tier: 0 },
+      { id: 'c', tier: 1 },
+    ]);
+    input.execution = {
+      shouldAbort: () => {
+        calls++;
+        if (calls >= 2) {
+          throw new Error('predicate broken');
+        }
+        return false;
+      },
+    };
+    const childStatuses: string[] = [];
+    input.context.coordination = {
+      onChildResult: ({ childInput, result }) => {
+        childStatuses.push(`${childInput.params?.dimId}:${result.status}`);
+      },
+    };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const error = await new AgentRunCoordinator().run(input, coordinationProfile(), runChild).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: predicate broken',
+      coordinationFailures: [{ hook: 'shouldAbort', childId: 'a', message: 'predicate broken' }],
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ status: 'aborted' }),
+            expect.objectContaining({ status: 'aborted' }),
+            expect.objectContaining({ status: 'aborted' }),
+          ],
+        },
+      },
+    });
+    // tier 检查 1 次 + child a 检查 1 次；坏 hook 之后不再被调用。
+    expect(calls).toBe(2);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(childStatuses).toEqual([]);
+  });
+
+  it('classifies a predicate failing after lazy child construction as a coordination failure', async () => {
+    let calls = 0;
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }]);
+    input.execution = {
+      shouldAbort: async () => {
+        calls++;
+        if (calls === 2) {
+          throw new Error('post-factory predicate broken');
+        }
+        return false;
+      },
+    };
+    const factory = vi.fn(({ plannedInput }: { plannedInput: AgentRunInput }) => plannedInput);
+    input.context.childInputFactories = { a: factory, b: factory };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const error = await new AgentRunCoordinator()
+      .run(input, parallelCoordinationProfile(1), runChild)
+      .then(
+        () => null,
+        (err: unknown) => err
+      );
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: post-factory predicate broken',
+      coordinationFailures: [{ hook: 'shouldAbort', childId: 'a' }],
+      partialResult: {
+        phases: {
+          childResults: [
+            expect.objectContaining({ runId: 'a:aborted', status: 'aborted' }),
+            expect.objectContaining({ runId: 'b:aborted', status: 'aborted' }),
+          ],
+        },
+      },
+    });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(calls).toBe(2);
+    expect(runChild).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'timeout',
+    'aborted',
+    'error',
+  ] as const)('logs a locatable %s cancellation check outcome', async (outcome) => {
+    const logs: Array<{ level: string; message: string; meta: Record<string, unknown> }> = [];
+    const logger = Logger.getInstance();
+    const capture = (level: string) => (message: unknown, meta?: unknown) => {
+      logs.push({
+        level,
+        message: String(message),
+        meta: meta && typeof meta === 'object' ? (meta as Record<string, unknown>) : {},
+      });
+    };
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(capture('info'));
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(capture('warn'));
+    try {
+      const controller = new AbortController();
+      const entered = coordinationLatch<void>();
+      const input = baseRunInput([{ id: 'a' }]);
+      input.execution = {
+        abortSignal: controller.signal,
+        timeoutMs: outcome === 'timeout' ? 20 : undefined,
+        shouldAbort: () => {
+          entered.resolve();
+          if (outcome === 'error') {
+            throw new Error('predicate broken');
+          }
+          return new Promise<boolean>(() => {});
+        },
+      };
+      const run = new AgentRunCoordinator()
+        .run(input, parallelCoordinationProfile(1), async (child) => childResult(child))
+        .catch(() => null);
+      await entered.promise;
+      if (outcome === 'aborted') {
+        controller.abort();
+      }
+      await settleWithin(run, 1000);
+      const coordinatorLogs = logs.filter((log) => log.message.startsWith('[AgentRunCoordinator]'));
+      const expected = {
+        timeout: {
+          level: 'warn',
+          message: expect.stringContaining('cancellation check timed out'),
+          meta: expect.objectContaining({
+            checkpoint: 'child-pre-dispatch',
+            childId: 'a',
+            outcome: 'timeout',
+            timeoutMs: 20,
+          }),
+        },
+        aborted: {
+          level: 'info',
+          message: expect.stringContaining('cancellation check interrupted by abortSignal'),
+          meta: expect.objectContaining({
+            checkpoint: 'child-pre-dispatch',
+            childId: 'a',
+            outcome: 'aborted',
+          }),
+        },
+        error: {
+          level: 'warn',
+          message: expect.stringContaining('coordination hook failed'),
+          meta: expect.objectContaining({
+            hook: 'shouldAbort',
+            checkpoint: 'child-pre-dispatch',
+            childId: 'a',
+            error: 'predicate broken',
+          }),
+        },
+      }[outcome];
+      expect(coordinatorLogs).toContainEqual(expected);
+      const skipReason = {
+        timeout: 'shouldAbort-timeout',
+        aborted: 'abortSignal',
+        error: 'shouldAbort-error',
+      }[outcome];
+      expect(coordinatorLogs).toContainEqual({
+        level: outcome === 'aborted' ? 'info' : 'warn',
+        message: expect.stringContaining(`child skipped profile=parent-profile child=a`),
+        meta: expect.objectContaining({ reason: skipReason }),
+      });
+    } finally {
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('wraps a non-Error predicate rejection into an Error before classifying it', async () => {
+    const input = baseRunInput([{ id: 'a' }]);
+    input.execution = { shouldAbort: () => Promise.reject('raw string failure') };
+    const error = await new AgentRunCoordinator()
+      .run(input, parallelCoordinationProfile(1), async (child) => childResult(child))
+      .then(
+        () => null,
+        (err: unknown) => err
+      );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: Agent cancellation check failed',
+      coordinationFailures: [{ hook: 'shouldAbort', childId: 'a' }],
+    });
+    expect((error as Error).cause).toBeInstanceOf(Error);
+    expect(((error as Error).cause as Error).cause).toBe('raw string failure');
   });
 });
 

@@ -1,5 +1,6 @@
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import { runOperation } from '#shared/operation.js';
 import { createLimit } from '../../shared/concurrency.js';
 import type {
   AgentConcurrencyPlan,
@@ -31,10 +32,32 @@ type ChildReceiptIdentity = { dimId?: string; profileId: string };
 /**
  * 停止事实的来源。tier 整批取消与 child 跳过都要带上它，宿主才能区分：
  * - abortSignal / shouldAbort：用户或宿主主动取消，属于正常收尾；
+ * - shouldAbort-timeout：宿主取消探针在单次检查期限（execution.timeoutMs）内没有回答，
+ *   按“请求取消”收尾（与 AgentService preflight 一致），不算协调失败，但要 warn；
  * - prior-failure：兄弟 child 的回调（检查点等）或取消探针已失败，后续不再派发；
- * - shouldAbort-error：tier 级取消探针自身抛错，按失败处理并整批取消。
+ * - shouldAbort-error：取消探针自身抛错（tier 级或 child 级），按协调失败处理并停止派发。
  */
-type CoordinationStopReason = 'abortSignal' | 'shouldAbort' | 'prior-failure' | 'shouldAbort-error';
+type CoordinationStopReason =
+  | 'abortSignal'
+  | 'shouldAbort'
+  | 'shouldAbort-timeout'
+  | 'prior-failure'
+  | 'shouldAbort-error';
+
+/** resolveAbortReason 能直接给出的停止来源（探针抛错由调用方归类为 shouldAbort-error）。 */
+type AbortCheckReason = 'abortSignal' | 'shouldAbort' | 'shouldAbort-timeout';
+
+/**
+ * 一次取消检查发生的位置，只用于日志定位：tier 边界检查带 tierIndex，
+ * child 检查带 childId（与其余日志同一标识规则）以及是在懒构造之前还是之后。
+ */
+type CancellationCheckScope = {
+  profileId: string;
+  checkpoint: 'tier' | 'child-pre-dispatch' | 'child-post-lazy';
+  tierIndex?: number;
+  childIndex?: number;
+  childId?: string;
+};
 
 /**
  * 生效并发度及其来源。env 非法时静默回退 default 曾经没有任何痕迹（I21），
@@ -217,7 +240,7 @@ async function runChildren(
     skippedChildren.add(index);
     const child = describeChild(input, index);
     logCoordination(
-      isFailureStopReason(reason) ? 'warn' : 'info',
+      stopReasonLogLevel(reason),
       `child skipped profile=${profile.id} child=${child.childId} reason=${reason}`,
       { profileId: profile.id, ...child, reason }
     );
@@ -233,25 +256,56 @@ async function runChildren(
     let childInput = planned;
     let result: AgentRunResult;
     let started = false;
+    // 该 child 自身的停止来源；只用于 onChildResult 跳过日志区分“自身探针故障”与“兄弟先失败”。
+    let childStop: CoordinationStopReason | null = null;
+    /**
+     * child 级取消检查。探针抛错不是该 child 的执行失败：单独捕获并 fail('shouldAbort')，
+     * 该 child 写 aborted 回执，后续 child 因 failures>0 按 prior-failure 跳过、不再调用坏 hook，
+     * 父 run 与 tier 级检查、AgentService preflight 一致地抛协调错误（附 partialResult）。
+     * 懒构造与 runChild 的异常不经过这里，仍由外层 catch 归为该 child 的 error 结果。
+     */
+    const checkChildStop = async (
+      checkpoint: 'child-pre-dispatch' | 'child-post-lazy'
+    ): Promise<CoordinationStopReason | null> => {
+      try {
+        // 定位信息惰性求值且只在日志通道内读取：读计划输入失败不能被误记成探针故障。
+        const reason = await resolveAbortReason(parentInput, () => ({
+          profileId: profile.id,
+          checkpoint,
+          childIndex: index,
+          childId: resolveChildLogId(planned, index),
+          ...(tierIndexByChild.has(index) ? { tierIndex: tierIndexByChild.get(index) } : {}),
+        }));
+        return reason ?? (failures.length > 0 ? 'prior-failure' : null);
+      } catch (err: unknown) {
+        fail(
+          'shouldAbort',
+          err,
+          { childId: identity.dimId || undefined },
+          { ...describeChild(planned, index), checkpoint }
+        );
+        return 'shouldAbort-error';
+      }
+    };
     // 回调可能保存检查点，失败后不能重试它或继续派发尚未开始的子任务。
     if (forcedStop || failures.length > 0) {
       result = createChildAbortedResult(identity);
-      logChildSkipped(planned, index, forcedStop ?? 'prior-failure');
+      childStop = forcedStop ?? 'prior-failure';
+      logChildSkipped(planned, index, childStop);
     } else {
       try {
-        const preStop =
-          (await resolveAbortReason(parentInput)) ?? (failures.length > 0 ? 'prior-failure' : null);
+        const preStop = await checkChildStop('child-pre-dispatch');
         if (preStop) {
           result = createChildAbortedResult(identity);
+          childStop = preStop;
           logChildSkipped(planned, index, preStop);
         } else {
           childInput = await resolveLazyChildInput(identity.dimId, planned, parentInput);
           // shouldAbort/懒构造均可挂起；恢复后必须重新读取停止事实，不能用 await 前的值。
-          const stop =
-            (await resolveAbortReason(parentInput)) ??
-            (failures.length > 0 ? 'prior-failure' : null);
+          const stop = await checkChildStop('child-post-lazy');
           if (stop) {
             result = createChildAbortedResult(identity);
+            childStop = stop;
             logChildSkipped(planned, index, stop);
           } else {
             started = true;
@@ -260,7 +314,8 @@ async function runChildren(
         }
       } catch (err: unknown) {
         result = createChildErrorResult(identity, err);
-        // pre-dispatch：取消探针或懒构造抛错（含工厂产物校验失败），child 从未运行；run：child 执行本身抛错。两者都降级为 error 结果。
+        // pre-dispatch：懒构造抛错（含工厂产物校验失败），child 从未运行；run：child 执行本身抛错。
+        // 两者都降级为 error 结果；取消探针抛错已在 checkChildStop 中归为协调失败，不会走到这里。
         logCoordination(
           'warn',
           `child degraded to error result profile=${profile.id} child=${resolveChildLogId(planned, index)} stage=${started ? 'run' : 'pre-dispatch'}`,
@@ -288,14 +343,16 @@ async function runChildren(
       }
     } else if (parentInput.context.coordination?.onChildResult) {
       // 已有失败且该 child 未启动：不再通知宿主（避免在失败后继续写检查点），但要留下跳过痕迹。
+      // 若失败正是该 child 自己的取消探针抛错，原因写 shouldAbort-error，便于和兄弟连带跳过区分。
+      const skipReason = childStop === 'shouldAbort-error' ? 'shouldAbort-error' : 'prior-failure';
       logCoordination(
         'warn',
-        `coordination hook skipped profile=${profile.id} hook=onChildResult child=${resolveChildLogId(planned, index)} reason=prior-failure`,
+        `coordination hook skipped profile=${profile.id} hook=onChildResult child=${resolveChildLogId(planned, index)} reason=${skipReason}`,
         {
           profileId: profile.id,
           hook: 'onChildResult',
           ...describeChild(planned, index),
-          reason: 'prior-failure',
+          reason: skipReason,
         }
       );
     }
@@ -333,7 +390,11 @@ async function runChildren(
       let stopReason: CoordinationStopReason | null = failures.length > 0 ? 'prior-failure' : null;
       if (!stopReason) {
         try {
-          stopReason = await resolveAbortReason(parentInput);
+          stopReason = await resolveAbortReason(parentInput, () => ({
+            profileId: profile.id,
+            checkpoint: 'tier',
+            tierIndex,
+          }));
         } catch (err: unknown) {
           fail('shouldAbort', err, { tierIndex });
           stopReason = 'shouldAbort-error';
@@ -343,7 +404,7 @@ async function runChildren(
         const reason = stopReason;
         const remaining = tiers.slice(tierIndex).flat();
         logCoordination(
-          isFailureStopReason(reason) ? 'warn' : 'info',
+          stopReasonLogLevel(reason),
           `tier cancelled profile=${profile.id} tier=${tierIndex} reason=${reason} remainingChildren=${remaining.length}`,
           {
             profileId: profile.id,
@@ -459,28 +520,108 @@ async function runChildren(
 }
 
 /**
- * 读取停止事实并给出来源；返回 null 表示继续。语义与旧的布尔版 shouldAbort 相同：
- * 先看 abortSignal，再询问宿主 shouldAbort，并在 await 之后重新读取 abortSignal。
- * shouldAbort 抛错原样上抛，由调用方决定按 child 降级（error 结果）还是 tier 级失败。
+ * 读取停止事实并给出来源；返回 null 表示继续。先看 abortSignal，再询问宿主 shouldAbort，
+ * 并在探针结束后重新读取 abortSignal。
+ *
+ * 可协调 profile 在 AgentService 中不经过 runOperation preflight，协调器是这条路径上唯一的取消闸门，
+ * 所以宿主探针必须与 AgentService preflight 用同一套 runOperation 语义竞速：
+ * - abortSignal 在探针挂起期间触发 → 立即按 abortSignal 停止，不再等待宿主 promise；
+ * - execution.timeoutMs（有限正数）作为单次检查期限，到期 → shouldAbort-timeout（按请求取消收尾）；
+ * - 探针抛错/拒绝 → 归一为 Error 上抛，由调用方统一记为 shouldAbort 协调失败。
+ * 不合作的宿主 promise 可能仍在后台挂着，但它迟到的结果不会再影响本次协调。
  */
 async function resolveAbortReason(
-  input: AgentRunInput
-): Promise<'abortSignal' | 'shouldAbort' | null> {
-  if (input.execution?.abortSignal?.aborted) {
+  input: AgentRunInput,
+  describeScope: () => CancellationCheckScope
+): Promise<AbortCheckReason | null> {
+  const execution = input.execution;
+  if (execution?.abortSignal?.aborted) {
     return 'abortSignal';
   }
-  const requested = await input.execution?.shouldAbort?.();
-  if (requested === true) {
+  const hook = execution?.shouldAbort;
+  if (!hook) {
+    return null;
+  }
+  const timeoutMs = resolveCheckTimeoutMs(execution.timeoutMs);
+  // 不把 runOperation 的内部 signal 传给宿主 hook：公开契约是无参 () => boolean | Promise<boolean>。
+  const check = await runOperation(() => hook(), {
+    abortSignal: execution.abortSignal,
+    timeoutMs,
+  });
+  if (check.status === 'error') {
+    throw check.error instanceof Error
+      ? check.error
+      : new Error('Agent cancellation check failed', { cause: check.error });
+  }
+  if (check.status === 'aborted') {
+    // 探针挂起期间父 signal 触发：竞速胜出，按 abortSignal 停止（正常取消，info）。
+    logCancellationCheck('info', 'cancellation check interrupted by abortSignal', describeScope, {
+      outcome: 'aborted',
+    });
+    return 'abortSignal';
+  }
+  if (check.status === 'timeout') {
+    // 宿主探针在单次检查期限内没有回答：按请求取消收尾，避免父 run 永久挂起；探针异常慢需要 warn。
+    logCancellationCheck('warn', 'cancellation check timed out', describeScope, {
+      outcome: 'timeout',
+      timeoutMs,
+    });
+    return 'shouldAbort-timeout';
+  }
+  if (check.status === 'ok' && check.value === true) {
     return 'shouldAbort';
   }
-  if (input.execution?.abortSignal?.aborted === true) {
+  if (execution.abortSignal?.aborted === true) {
     return 'abortSignal';
   }
   return null;
 }
 
+/** 与 AgentService preflight 相同的期限归一：只有有限正数才构成检查期限，否则不限时（只与 signal 竞速）。 */
+function resolveCheckTimeoutMs(timeout: unknown): number | undefined {
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : undefined;
+}
+
+/**
+ * 取消检查结局的日志。定位信息（describeScope）在 observeSafely 内求值：
+ * 即使读取 child 计划输入抛错，也只丢失这条日志，不改变检查结果与调度。
+ */
+function logCancellationCheck(
+  level: 'info' | 'warn',
+  event: string,
+  describeScope: () => CancellationCheckScope,
+  extra: { outcome: 'aborted' | 'timeout'; timeoutMs?: number }
+) {
+  observeSafely(
+    () => {
+      const scope = describeScope();
+      const location = [
+        `profile=${scope.profileId}`,
+        `checkpoint=${scope.checkpoint}`,
+        scope.childId ? `child=${scope.childId}` : '',
+        scope.tierIndex !== undefined ? `tier=${scope.tierIndex}` : '',
+        extra.timeoutMs !== undefined ? `timeoutMs=${extra.timeoutMs}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ');
+      return Logger.getInstance()[level](`${LOG_PREFIX} ${event} ${location}`, {
+        ...stripUndefined(scope),
+        ...stripUndefined(extra),
+      });
+    },
+    () => undefined
+  );
+}
+
 function isFailureStopReason(reason: CoordinationStopReason) {
   return reason === 'prior-failure' || reason === 'shouldAbort-error';
+}
+
+/** 失败类停止与探针超时都要 warn；用户/宿主正常取消只记 info。 */
+function stopReasonLogLevel(reason: CoordinationStopReason): 'info' | 'warn' {
+  return isFailureStopReason(reason) || reason === 'shouldAbort-timeout' ? 'warn' : 'info';
 }
 
 /** 日志通道失败不能改变调度结果：observeSafely 吞掉同步异常与 rejected promise。 */

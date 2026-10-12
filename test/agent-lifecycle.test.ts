@@ -7,6 +7,11 @@ import { buildScanPipelineStages } from '../src/agent/evaluation/stageBuilders.j
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
+import {
+  AgentProfileCompiler,
+  AgentProfileRegistry,
+  AgentStageFactoryRegistry,
+} from '../src/agent/profiles/index.js';
 import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
 import { buildProducerRetryPrompt } from '../src/agent/prompts/producerRetry.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
@@ -2837,6 +2842,85 @@ describe('service cancellation and snapshot ownership', () => {
       decision.resolve(true);
       await pending;
     }
+  });
+  // I19：可协调 profile 不经 AgentService preflight 直接进入协调器，协调器的取消探针必须给出与
+  // 非协调路径一致的语义：挂起的异步探针能被 abortSignal 打断，探针抛错以错误（而非 error 结果）抛出。
+  function coordinatedService(mode: 'parallel' | 'tiered') {
+    const compiler = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry([
+        {
+          id: 'fan-parent',
+          title: 'Fan Parent',
+          serviceKind: 'system-analysis',
+          lifecycle: 'active',
+          basePreset: 'chat',
+          concurrency: {
+            mode,
+            concurrency: 1,
+            partitioner: 'generateSessionDimensions',
+            merge: 'generateSessionResults',
+            childProfile: 'fan-child',
+          },
+        },
+      ]),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    });
+    const build = vi.fn(() => ({ id: 'fixture', execute: vi.fn(async () => ({ reply: 'ran' })) }));
+    const service = new AgentService({ runtimeBuilder: { build }, profileCompiler: compiler });
+    const coordinatedInput = (execution: AgentRunInput['execution']): AgentRunInput => ({
+      profile: { id: 'fan-parent' },
+      message: { content: 'fan out' },
+      params: { dimensions: [{ id: 'a' }, { id: 'b' }] },
+      context: { source: 'internal' },
+      execution,
+    });
+    return { service, build, coordinatedInput };
+  }
+  it('a coordinated run ends as aborted when abortSignal fires during a hanging async shouldAbort', async () => {
+    const { service, build, coordinatedInput } = coordinatedService('parallel');
+    const controller = new AbortController();
+    const entered = Promise.withResolvers<void>();
+    let result: AgentRunResult | undefined;
+    const pending = service
+      .run(
+        coordinatedInput({
+          abortSignal: controller.signal,
+          shouldAbort: () => {
+            entered.resolve();
+            return new Promise<boolean>(() => {});
+          },
+        })
+      )
+      .then((value) => {
+        result = value;
+        return value;
+      });
+    await entered.promise;
+    controller.abort();
+    await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    expect(result?.status).toBe('aborted');
+    expect(build).not.toHaveBeenCalled();
+  });
+  it.each([
+    'parallel',
+    'tiered',
+  ] as const)('a coordinated %s run rethrows a failing shouldAbort as the coordination error', async (mode) => {
+    const { service, build, coordinatedInput } = coordinatedService(mode);
+    const shouldAbort = vi.fn(() => {
+      throw new Error('predicate broken');
+    });
+    const error = await service.run(coordinatedInput({ shouldAbort })).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: predicate broken',
+      coordinationFailures: [expect.objectContaining({ hook: 'shouldAbort' })],
+      partialResult: { status: 'error' },
+    });
+    expect(shouldAbort).toHaveBeenCalledTimes(1);
+    expect(build).not.toHaveBeenCalled();
   });
   it('two real runtimes throwing the same Error keep their own confirmed receipts', async () => {
     const shared = new Error('shared post-execution policy error');
