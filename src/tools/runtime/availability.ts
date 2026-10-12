@@ -4,7 +4,7 @@ import type {
   ToolAvailabilitySnapshot,
   ToolUnavailableReason,
 } from '#tools/kernel/availability.js';
-import { TOOL_REGISTRY } from './registry.js';
+import { GRAPH_QUERY_HOST_READERS, TOOL_REGISTRY } from './registry.js';
 
 function hasMethod(value: unknown, method: string): boolean {
   return (
@@ -85,21 +85,20 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
     hasMethod(ctx.projectGraph, 'getOverview'),
     'projectGraph.getOverview is unavailable'
   );
-  branches('graph', 'query', 'type', {
-    class:
-      hasMethod(ctx.projectGraph, 'getClassInfo') || hasMethod(ctx.codeEntityGraph, 'queryEntity'),
-    protocol: hasMethod(ctx.projectGraph, 'getProtocolInfo'),
-    hierarchy: hasMethod(ctx.projectGraph, 'getClassHierarchy'),
-    callers:
-      hasMethod(ctx.projectGraph, 'getCallers') || hasMethod(ctx.codeEntityGraph, 'queryCallGraph'),
-    callees:
-      hasMethod(ctx.projectGraph, 'getCallees') || hasMethod(ctx.codeEntityGraph, 'queryCallGraph'),
-    overrides: hasMethod(ctx.projectGraph, 'getMethodOverrides'),
-    extensions: hasMethod(ctx.projectGraph, 'getCategoryMap'),
-    impact: hasMethod(ctx.codeEntityGraph, 'impactAnalysis'),
-    search:
-      hasMethod(ctx.codeEntityGraph, 'search') || hasMethod(ctx.projectGraph, 'searchEntities'),
-  });
+  // graph.query 的 type 分支与 graph handler 共用 GRAPH_QUERY_HOST_READERS：任一读取器的方法在场即可用，
+  // 不再在这里手抄方法名。legacy 条目（旧宿主兼容入口，已弃用）照常参与判定，唯一生产宿主不提供它们，
+  // 所以生产快照会收窄掉 overrides/extensions；删除这些条目等待决事项③，消费者与移除条件见该常量。
+  branches(
+    'graph',
+    'query',
+    'type',
+    Object.fromEntries(
+      Object.entries(GRAPH_QUERY_HOST_READERS).map(([type, readers]) => [
+        type,
+        readers.some((reader) => hasMethod(ctx[reader.port], reader.method)),
+      ])
+    )
+  );
 
   const reader = ctx.knowledgeRead !== undefined ? ctx.knowledgeRead : ctx.knowledgeRepo;
   const manager =
@@ -126,6 +125,8 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
     // 未声明 supportedKinds：沿用“全部 kind 可用”的旧语义，不写 parameters 收窄，也不推分支条目。
     initialize('knowledge');
   }
+  // prime 的“未注入任何读取端口也可用”是 search-only 旧宿主兼容分支（已弃用，handler 侧带
+  // KNOWLEDGE_PRIME_SEARCH_ONLY 诊断）。待决事项③确认单宿主后改为要求 knowledgeRead，与 handler 同步收窄。
   check(
     'knowledge',
     'prime',

@@ -203,9 +203,24 @@ export async function prepareSubmission(
   if (submitCounters && titleKey) {
     // 从第一轮起都可能拿到 {...base}：字典归属稳定盒，不能在临时顶层懒创建。
     // 旧宿主的顶层字典按原引用接入一次；顶层继续作为兼容别名，不复制或重置预算。
-    const attempts = (recordValue(submitCounters._submitTitleAttempts) ??
-      recordValue(sharedStateForSubmit?._submitTitleAttempts) ??
-      {}) as Record<string, number>;
+    //
+    // sharedState 顶层 _submitTitleAttempts 是旧宿主兼容别名（已弃用 deprecated，待决事项③未答复，暂不删除）：
+    // - 消费者：预写顶层字典的旧宿主或测试替身。唯一生产宿主 ../Alembic 既不预写也不读取它，
+    //   生产中顶层值只会来自下面这次回写；计数的归属始终是 _sessionCounters 盒。
+    // - 移除条件：待决事项③确认单宿主后，删除顶层读取与回写，并删掉 config/implicit-keys.json 中
+    //   该键的顶层回落说明；盒内计数保留不变。
+    // - 决定前，顶层字典被接入计数盒时记一条 info 日志（每个盒最多一次：接入后盒内已有字典），
+    //   事后据此核对是否真有宿主预写。
+    const boxedAttempts = recordValue(submitCounters._submitTitleAttempts);
+    const legacyAttempts = boxedAttempts
+      ? undefined
+      : recordValue(sharedStateForSubmit?._submitTitleAttempts);
+    if (legacyAttempts) {
+      Logger.getInstance().info(
+        `[knowledge.submit] adopted legacy top-level sharedState._submitTitleAttempts into _sessionCounters (compat alias, deprecated; titles=${Object.keys(legacyAttempts).length}, dim=${String(effectiveDimensionId ?? '')})`
+      );
+    }
+    const attempts = (boxedAttempts ?? legacyAttempts ?? {}) as Record<string, number>;
     submitCounters._submitTitleAttempts = attempts;
     if (sharedStateForSubmit) {
       sharedStateForSubmit._submitTitleAttempts = attempts;

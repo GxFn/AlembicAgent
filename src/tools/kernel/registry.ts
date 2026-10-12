@@ -122,10 +122,16 @@ export interface ToolContext {
 
   // ── 重量级 DI 服务 (duck-typed, 真实接口见各 handler) ──
 
-  /** AST 图谱 — graph handler 内部 cast 为 ProjectGraphLike */
+  /**
+   * AST 项目图谱。graph handler 与 availability 都按 GRAPH_QUERY_HOST_READERS 查找方法，
+   * 不做类型 cast；overview 另读 getOverview。
+   */
   projectGraph?: unknown;
 
-  /** 代码实体图谱 — graph handler 内部 cast 为 CodeEntityGraphLike */
+  /**
+   * 代码实体图谱。唯一生产宿主只提供 impactAnalysis；queryEntity/queryCallGraph/search 是
+   * GRAPH_QUERY_HOST_READERS 中标为 legacy 的旧宿主兼容入口（已弃用，移除条件见该常量）。
+   */
   codeEntityGraph?: unknown;
 
   /** 知识搜索引擎 — knowledge 查询先检查运行时 search 能力。 */
@@ -140,7 +146,12 @@ export interface ToolContext {
   /** 显式知识管理端口；缺少具体方法必须报告不可用，不回落原始仓储。 */
   knowledgeManagement?: KnowledgeManagementPort;
 
-  /** 旧宿主兼容入口；仅对应的显式端口未提供时使用，不能冒充 Core 管理服务。 */
+  /**
+   * 旧宿主兼容入口；仅对应的显式端口未提供时使用，不能冒充 Core 管理服务。
+   * knowledge.prime/detail 在 knowledgeRead 缺省时回落到这里，两者都缺时 prime 只做 search-only
+   * （带 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断）。唯一生产宿主通过 knowledgeRead 提供详情、不注入本字段；
+   * 待决事项③确认单宿主后，prime 改为强制要求 knowledgeRead。
+   */
   knowledgeRepo?: unknown;
 
   /** staging 复核通道 — knowledge.manage(review) cast 为 StagingManagerLike（recordReview）。 */
@@ -353,6 +364,110 @@ function describeTerminalIntentValue(value: unknown): string {
 }
 
 /* ------------------------------------------------------------------ */
+/*  graph.query 宿主读取表（graph handler 与 availability 共用）        */
+/* ------------------------------------------------------------------ */
+
+/** graph 工具读取的宿主端口，即 ToolContext 上的同名字段。 */
+export type GraphHostPort = 'projectGraph' | 'codeEntityGraph';
+
+/** graph.query 的 query type；必须与 runtime registry 中 graph.query 的 type 枚举逐项同序。 */
+export type GraphQueryType =
+  | 'class'
+  | 'protocol'
+  | 'hierarchy'
+  | 'callers'
+  | 'callees'
+  | 'overrides'
+  | 'extensions'
+  | 'impact'
+  | 'search';
+
+/** 某个 query type 的一条宿主读取路径。 */
+export interface GraphQueryHostReader {
+  readonly port: GraphHostPort;
+  readonly method: string;
+  /** 按 (entity, limit) 组装宿主方法实参；实参形状属于宿主端口契约，不随 handler 改写。 */
+  readonly args: (entity: string, limit: number) => unknown[];
+  /** 旧宿主兼容入口（已弃用 deprecated）：唯一生产宿主不提供该方法，见下方常量的移除条件。 */
+  readonly legacy?: true;
+}
+
+function graphReaders(...readers: GraphQueryHostReader[]): readonly GraphQueryHostReader[] {
+  return Object.freeze(readers.map((reader) => Object.freeze(reader)));
+}
+
+const entityOnly = (entity: string): unknown[] => [entity];
+const entityAndLimit = (entity: string, limit: number): unknown[] => [entity, limit];
+
+/**
+ * graph.query 的“query type → 宿主方法”单一来源，数组顺序即读取优先级：handler 依次读取，
+ * 前一条缺失或返回空时才进入下一条，并记 GRAPH_QUERY_FALLBACK；availability 只要任一条的方法在场
+ * 就广告该分支。此前 graph handler 与 availability 各抄一份方法名，需要手工同步。
+ * test/tool-runtime-legacy-host-compat.test.ts 守护本表与 runtime registry 枚举一致、两处消费方都从这里派生。
+ *
+ * legacy 条目是旧宿主兼容入口（待决事项③未答复，暂不删除，只标注）：
+ * - 消费者：未迁移到 ProjectGraphPorts 形态的旧宿主与测试替身（tool-system、tool-availability 等测试的
+ *   全接线替身）。唯一生产宿主 ../Alembic 的 ProjectGraphPorts 只提供 getOverview/getClassInfo/
+ *   getProtocolInfo/getClassHierarchy/getCallers/getCallees/searchEntities 与 impactAnalysis，所以
+ *   availability 在生产中隐藏 overrides/extensions，class/callers/callees/search 只走主读取器。
+ * - 移除条件：待决事项③确认 ../Alembic 是唯一宿主后，删除全部 legacy 条目，并把只剩 legacy 读取器的
+ *   overrides/extensions 从本表、GraphQueryType 与 runtime registry 枚举一并去掉（模型可见 schema 收窄），
+ *   同步改写依赖旧端口的测试替身。
+ */
+export const GRAPH_QUERY_HOST_READERS: Readonly<
+  Record<GraphQueryType, readonly GraphQueryHostReader[]>
+> = Object.freeze({
+  class: graphReaders(
+    { port: 'projectGraph', method: 'getClassInfo', args: entityOnly },
+    {
+      port: 'codeEntityGraph',
+      method: 'queryEntity',
+      args: (entity) => [entity, 'class'],
+      legacy: true,
+    }
+  ),
+  protocol: graphReaders({ port: 'projectGraph', method: 'getProtocolInfo', args: entityOnly }),
+  hierarchy: graphReaders({ port: 'projectGraph', method: 'getClassHierarchy', args: entityOnly }),
+  callers: graphReaders(
+    { port: 'projectGraph', method: 'getCallers', args: entityAndLimit },
+    {
+      port: 'codeEntityGraph',
+      method: 'queryCallGraph',
+      args: (entity, limit) => [entity, 'callers', limit],
+      legacy: true,
+    }
+  ),
+  callees: graphReaders(
+    { port: 'projectGraph', method: 'getCallees', args: entityAndLimit },
+    {
+      port: 'codeEntityGraph',
+      method: 'queryCallGraph',
+      args: (entity, limit) => [entity, 'callees', limit],
+      legacy: true,
+    }
+  ),
+  overrides: graphReaders({
+    port: 'projectGraph',
+    method: 'getMethodOverrides',
+    args: entityOnly,
+    legacy: true,
+  }),
+  extensions: graphReaders({
+    port: 'projectGraph',
+    method: 'getCategoryMap',
+    args: entityOnly,
+    legacy: true,
+  }),
+  impact: graphReaders({ port: 'codeEntityGraph', method: 'impactAnalysis', args: entityAndLimit }),
+  // 与 class/callers/callees 一致：项目图优先。生产宿主的实体图只有 impactAnalysis，若实体图在前，
+  // 每次 search 都会被诊断为 primary-unavailable 回退。
+  search: graphReaders(
+    { port: 'projectGraph', method: 'searchEntities', args: entityAndLimit },
+    { port: 'codeEntityGraph', method: 'search', args: entityAndLimit, legacy: true }
+  ),
+});
+
+/* ------------------------------------------------------------------ */
 /*  DI 接口 (Lightweight)                                              */
 /* ------------------------------------------------------------------ */
 
@@ -367,6 +482,14 @@ export interface MemoryNoteFindingResult {
 }
 
 export interface MemoryCoordinatorLike {
+  /**
+   * 记录关键发现，应返回 MemoryNoteFindingResult。
+   *
+   * 返回 string 的回执形态已弃用（deprecated，旧宿主兼容）：memory handler 按“⚠ 前缀=失败”转译，
+   * 并在结果上附 MEMORY_NOTE_FINDING_LEGACY_STRING_RECEIPT 诊断。仓内 MemoryCoordinator 与唯一生产
+   * 宿主（直接转交 runtime.memoryCoordinator）只返回对象回执。待决事项③确认单宿主后，本签名收窄为
+   * 只返回 MemoryNoteFindingResult（类型层公开契约收窄，需同步宿主类型检查）。
+   */
   noteFinding(
     finding: string,
     evidence: string,

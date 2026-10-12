@@ -9,6 +9,8 @@
  *   - 本文件：ToolSpec.actions 里声明 params schema 与 handler 接线（handleXxx('<action>', ...)）；
  *   - handlers/<tool>.ts：handle() 的 switch 分发要认这个动作名；
  *   - availability.ts：describeToolAvailability 按动作/分支映射宿主服务方法，决定缺服务时是否收窄；
+ *     graph.query 的 type 分支例外：方法表在 kernel 的 GRAPH_QUERY_HOST_READERS，graph handler 与
+ *     availability 共用，新增 query type 须同时改该表与下方枚举（test/tool-runtime-legacy-host-compat.test.ts 守护）；
  *   - toolsets/*.ts：各能力 allowedTools 白名单；参数级限制在 kernel/toolSelection.ts 的
  *     CAPABILITY_PARAMETER_ALLOWLISTS；
  *   - agent/runtime/toolPipeline/phaseGates.ts：Evolution、record repair、Analyst VERIFY、Producer
@@ -34,6 +36,11 @@ import { handle as handleMeta } from './handlers/meta.js';
 import { handle as handleTerminal } from './handlers/terminal.js';
 import { DIMENSION_SUBMIT_REQUIREMENT_NOTE, dimensionSubmitParameters } from './parameters.js';
 import { createToolRegistryView } from './selection.js';
+
+// availability.ts 的文件边界（config/layer-contract.json）只允许运行时导入本注册表；graph.query 的
+// 宿主读取表经此转出，使 availability 与 graph handler 读同一份 kernel 常量。runtime/index 只按名
+// 转出本模块的公开绑定，这条转出不进入包的公开出口。
+export { GRAPH_QUERY_HOST_READERS } from '#tools/kernel/registry.js';
 
 /**
  * P4/C10: note_finding 的结构化深度槽，从 Core DEPTH_DIMENSIONS 单源渲染(与深度契约/裁判/评分/指引同源)。
@@ -510,6 +517,10 @@ const GRAPH_SPEC: ToolSpec = {
         properties: {
           type: {
             type: 'string',
+            // 与 kernel GRAPH_QUERY_HOST_READERS 的键逐项同序（守护测试见文件头）。overrides/extensions
+            // 只有旧宿主兼容读取器（getMethodOverrides/getCategoryMap，已弃用），唯一生产宿主不提供，
+            // availability 在生产中会把它们从快照里收窄掉；待决事项③确认单宿主后从本枚举删除
+            // （模型可见 schema 收窄），决定前保持不变。
             enum: [
               'class',
               'protocol',

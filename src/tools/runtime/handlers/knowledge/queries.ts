@@ -242,6 +242,10 @@ export async function handlePrime(
   if (!isSearchEngine(engine)) {
     return fail('Search engine not available');
   }
+  // knowledgeRead 缺省时回落 knowledgeRepo、两者都缺时 search-only，都是旧宿主兼容入口（已弃用，
+  // 待决事项③未答复，暂不删除）。消费者：未注入 knowledgeRead 的旧宿主与测试替身；唯一生产宿主通过
+  // knowledgeRead 提供详情、从不注入 knowledgeRepo。移除条件：待决事项③确认单宿主后，prime 强制要求
+  // knowledgeRead，缺失时直接返回 KNOWLEDGE_READ_PORT_UNAVAILABLE，删除 knowledgeRepo 回落与 search-only 分支。
   const port = ctx.knowledgeRead !== undefined ? 'knowledgeRead' : 'knowledgeRepo';
   const repo = ctx[port];
   const canRead = isKnowledgeReadPort(repo);

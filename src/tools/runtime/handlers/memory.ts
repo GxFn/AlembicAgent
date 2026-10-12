@@ -189,14 +189,25 @@ async function handleNoteFinding(
     typeof ctx.runtime?.dimensionScopeId === 'string' && ctx.runtime.dimensionScopeId.trim()
       ? ctx.runtime.dimensionScopeId
       : undefined;
-  const result = normalizeNoteFindingResult(
+  const { result, warnings: receiptWarnings } = normalizeNoteFindingResult(
     ctx.memoryCoordinator.noteFinding(finding, evidenceWithDepth, importance, round, scopeId, refs),
     importance,
+    round,
     scopeId
   );
 
   if (!result.recorded || result.target !== 'activeContext') {
-    return fail(result.message);
+    const failure = fail(result.message);
+    // 旧宿主字符串回执被判为失败时也要留下兼容转译诊断；对象回执保持原来不带 _meta 的失败形状。
+    if (receiptWarnings.length > 0) {
+      failure._meta = {
+        cached: false,
+        tokensEstimate: 0,
+        durationMs: 0,
+        diagnosticWarnings: receiptWarnings,
+      };
+    }
+    return failure;
   }
 
   if (!ledger) {
@@ -211,12 +222,17 @@ async function handleNoteFinding(
           stage: 'memory.note_finding',
           tool: 'memory',
         },
+        ...receiptWarnings,
       ],
     });
   }
 
   // M3：verified 随结果外露——tracker 据此计 verifiedFindingCount（配额只认核实过的发现）
-  return ok(verified === undefined ? result : { ...result, verified });
+  // 兼容转译只加诊断、不标 degraded：回执内容已完整转交，降级与否由上面的台账分支决定。
+  return ok(
+    verified === undefined ? result : { ...result, verified },
+    receiptWarnings.length > 0 ? { diagnosticWarnings: receiptWarnings } : undefined
+  );
 }
 
 /**
@@ -232,21 +248,53 @@ function resolveFindingRound(ctx: ToolContext): number {
     : 0;
 }
 
+/** 诊断里回显的旧回执预览上限：足够辨认来源，又不把宿主的长文本整段灌进诊断。 */
+const LEGACY_RECEIPT_PREVIEW_CHARS = 80;
+
+/**
+ * 把 noteFinding 回执归一成对象回执。
+ *
+ * 字符串回执分支是旧宿主兼容入口（已弃用 deprecated，待决事项③未答复，暂不删除）：
+ * - 消费者：仍返回字符串回执的旧宿主或测试替身。仓内 MemoryCoordinator 只返回对象回执；唯一生产宿主
+ *   ../Alembic 的 ToolContextFactory 直接转交 runtime.memoryCoordinator（即同一个 MemoryCoordinator）。
+ * - 转译规则是启发式：以“⚠”开头记为失败，其余记为已写入 ActiveContext。正常消息若恰好以“⚠”开头
+ *   会被误判为失败，所以每次转译都附 MEMORY_NOTE_FINDING_LEGACY_STRING_RECEIPT 诊断（含判定结果与
+ *   回执预览），事后可据此核对是否仍有旧宿主、是否发生误判。
+ * - 移除条件：待决事项③确认单宿主后删除本分支，并把 MemoryCoordinatorLike.noteFinding 收窄为只返回
+ *   MemoryNoteFindingResult（类型层公开契约收窄，需同步宿主类型检查）。
+ */
 function normalizeNoteFindingResult(
-  result: MemoryNoteFindingResult | string,
+  receipt: MemoryNoteFindingResult | string,
   importance: number,
+  round: number,
   scopeId?: string
-): MemoryNoteFindingResult {
-  if (typeof result !== 'string') {
-    return result;
+): { result: MemoryNoteFindingResult; warnings: ToolDiagnosticWarning[] } {
+  if (typeof receipt !== 'string') {
+    return { result: receipt, warnings: [] };
   }
-  const recorded = !result.startsWith('⚠');
+  const recorded = !receipt.startsWith('⚠');
+  // 按码点截断，不把 emoji 等代理对切成半个字符。
+  const chars = Array.from(receipt);
+  const preview =
+    chars.length > LEGACY_RECEIPT_PREVIEW_CHARS
+      ? `${chars.slice(0, LEGACY_RECEIPT_PREVIEW_CHARS).join('')}…`
+      : receipt;
   return {
-    recorded,
-    target: recorded ? 'activeContext' : 'error',
-    importance,
-    message: result,
-    ...(scopeId ? { scopeId } : {}),
+    result: {
+      recorded,
+      target: recorded ? 'activeContext' : 'error',
+      importance,
+      message: receipt,
+      ...(scopeId ? { scopeId } : {}),
+    },
+    warnings: [
+      {
+        code: 'MEMORY_NOTE_FINDING_LEGACY_STRING_RECEIPT',
+        message: `MemoryCoordinator.noteFinding returned a legacy string receipt; translated by the "⚠"-prefix heuristic (path=legacy-string-receipt; recorded=${recorded}; round=${round}; receipt=${JSON.stringify(preview)})`,
+        stage: 'memory.note_finding',
+        tool: 'memory',
+      },
+    ],
   };
 }
 

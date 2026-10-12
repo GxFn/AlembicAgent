@@ -155,7 +155,7 @@
     "_submitTitleAttempts": {
       "container": "sharedState",
       "writers": ["agent"],
-      "purpose": "knowledge.submit 按标题的提交尝试次数，优先放在 _sessionCounters 盒内，回落 sharedState。"
+      "purpose": "knowledge.submit 按标题的提交尝试次数，归属 _sessionCounters 盒内。sharedState 顶层同名键是旧宿主兼容别名（已弃用：唯一生产宿主既不预写也不读取，顶层值只来自 agent 回写；被接入计数盒时 authoring.ts 记 info 日志）。待决事项③确认单宿主后删除顶层读写与这里的顶层回落说明。"
     },
     "_toolEfficiencyCache": {
       "container": "sharedState",

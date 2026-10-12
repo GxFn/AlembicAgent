@@ -3,35 +3,21 @@ import { runOperation } from '#shared/operation.js';
 import {
   estimateTokens,
   fail,
+  GRAPH_QUERY_HOST_READERS,
+  type GraphQueryType,
   ok,
   type ToolContext,
   type ToolResult,
 } from '#tools/kernel/registry.js';
 
-type QueryType =
-  | 'class'
-  | 'protocol'
-  | 'hierarchy'
-  | 'callers'
-  | 'callees'
-  | 'overrides'
-  | 'extensions'
-  | 'impact'
-  | 'search';
-const QUERY_TYPES = new Set<QueryType>([
-  'class',
-  'protocol',
-  'hierarchy',
-  'callers',
-  'callees',
-  'overrides',
-  'extensions',
-  'impact',
-  'search',
-]);
 interface GraphRead {
   source: string;
   invoke: () => unknown;
+}
+
+/** query type 合法性只认共享读取表的自有键；不在本文件另抄一份类型清单。 */
+function isQueryType(value: unknown): value is GraphQueryType {
+  return typeof value === 'string' && Object.hasOwn(GRAPH_QUERY_HOST_READERS, value);
 }
 
 /** 校验方法而不试调用；保留实例 this，兼容同步 Core 图谱与异步宿主端口。 */
@@ -50,45 +36,20 @@ function reader(
     : undefined;
 }
 
+/**
+ * 读取路径、优先级与实参形状全部来自 kernel 的 GRAPH_QUERY_HOST_READERS（availability 共用同一张表）。
+ * 表中 legacy 条目是旧宿主兼容入口：照常读取，命中时由 readGraph 记 GRAPH_QUERY_FALLBACK 并带出
+ * path=codeEntityGraph.<method>，足以事后核对是否仍有旧宿主；消费者与移除条件（待决事项③）见该常量注释。
+ */
 function queryReaders(
-  type: QueryType,
+  type: GraphQueryType,
   entity: string,
   limit: number,
   ctx: ToolContext
 ): Array<GraphRead | undefined> {
-  const project = (method: string, args: unknown[] = [entity]) =>
-    reader('projectGraph', ctx.projectGraph, method, args);
-  const entities = (method: string, args: unknown[]) =>
-    reader('codeEntityGraph', ctx.codeEntityGraph, method, args);
-  switch (type) {
-    case 'class':
-      return [project('getClassInfo'), entities('queryEntity', [entity, 'class'])];
-    case 'protocol':
-      return [project('getProtocolInfo')];
-    case 'hierarchy':
-      return [project('getClassHierarchy')];
-    case 'callers':
-      return [
-        project('getCallers', [entity, limit]),
-        entities('queryCallGraph', [entity, 'callers', limit]),
-      ];
-    case 'callees':
-      return [
-        project('getCallees', [entity, limit]),
-        entities('queryCallGraph', [entity, 'callees', limit]),
-      ];
-    case 'overrides':
-      return [project('getMethodOverrides')];
-    case 'extensions':
-      return [project('getCategoryMap')];
-    case 'impact':
-      return [entities('impactAnalysis', [entity, limit])];
-    case 'search':
-      // 与 class/callers/callees 一致：项目图优先。生产宿主的实体图端口只有 impactAnalysis，
-      // 若实体图在前，每次 search 都会被诊断为 primary-unavailable 回退。codeEntityGraph.search
-      // 仅为旧宿主形态保留的备用端口，是否删除取决于单宿主假设的决定，这里不删。
-      return [project('searchEntities', [entity, limit]), entities('search', [entity, limit])];
-  }
+  return GRAPH_QUERY_HOST_READERS[type].map((spec) =>
+    reader(spec.port, ctx[spec.port], spec.method, spec.args(entity, limit))
+  );
 }
 
 async function readGraph(
@@ -185,8 +146,10 @@ export async function handle(
       return fail(`Unknown graph action: ${action}`);
     }
     const type = params.type;
-    if (typeof type !== 'string' || !QUERY_TYPES.has(type as QueryType)) {
-      return fail(`Invalid query type: ${String(type)}. Valid: ${[...QUERY_TYPES].join(', ')}`);
+    if (!isQueryType(type)) {
+      return fail(
+        `Invalid query type: ${String(type)}. Valid: ${Object.keys(GRAPH_QUERY_HOST_READERS).join(', ')}`
+      );
     }
     const entity = typeof params.entity === 'string' ? params.entity : '';
     if (!entity) {
@@ -194,7 +157,7 @@ export async function handle(
     }
     const limit = Math.min((typeof params.limit === 'number' ? params.limit : 20) || 20, 100);
     return await readGraph(
-      queryReaders(type as QueryType, entity, limit, ctx),
+      queryReaders(type, entity, limit, ctx),
       ctx,
       `query(${type})`,
       (value) =>

@@ -1407,6 +1407,53 @@ describe('Agent Recipe production profile adapter', () => {
     );
   });
 
+  // I23（待决事项③未答复）：顶层别名是旧宿主兼容通道，暂不删除；被接入计数盒时必须留日志，
+  // 事后据此核对是否真有宿主预写顶层字典。盒内已有字典（生产形态）时不走兼容通道、不记日志。
+  test.each([
+    { shape: 'legacy top-level dictionary only', boxed: false, expectedLogs: 1 },
+    { shape: 'session counter box already owns the dictionary', boxed: true, expectedLogs: 0 },
+  ])('logs the legacy _submitTitleAttempts alias adoption only for the $shape shape', async ({
+    boxed,
+    expectedLogs,
+  }) => {
+    const projectRoot = makeProject();
+    const attempts: Record<string, number> = {};
+    const sharedState: Record<string, unknown> = boxed
+      ? { _sessionCounters: { _submitTitleAttempts: attempts } }
+      : { _submitTitleAttempts: attempts, _sessionCounters: {} };
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const fake = fakePort(readyReport);
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        await handleKnowledge(
+          'submit',
+          submitParams({ doClause: 'ImportType is needed for type-only dependencies.' }),
+          {
+            projectRoot,
+            recipeGateway: fake.port,
+            runtime: { sharedState, aiProvider: { chat } },
+          } as never
+        );
+      }
+      const adoptions = info.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes('legacy top-level sharedState._submitTitleAttempts'));
+      expect(adoptions).toHaveLength(expectedLogs);
+      if (expectedLogs > 0) {
+        expect(adoptions[0]).toContain('compat alias');
+      }
+      // 计数语义不变：两种形态都共用同一份字典并累计两次尝试。
+      const box = sharedState._sessionCounters as Record<string, unknown>;
+      expect(box._submitTitleAttempts).toBe(attempts);
+      expect(Object.values(attempts)).toEqual([2]);
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('uses the same prepared gate for explicit and analyst-injected graph refs', async () => {
     const projectRoot = makeProject();
     const graphRefs = ['sourceGraph:verified-callers'];
