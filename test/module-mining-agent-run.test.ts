@@ -1,5 +1,5 @@
 import { buildCanonicalCoverageLedgerModuleId } from '@alembic/core/host-agent-workflows';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
 import { SCOPED_MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module-mining/ScopedModuleMiningProfile.js';
 import { runModuleMining as runModuleMiningFromIndex } from '../src/agent/runs/index.js';
@@ -8,6 +8,8 @@ import {
   runScopedModuleMining,
 } from '../src/agent/runs/module-mining/ScopedModuleMiningAgentRun.js';
 import type {
+  AgentRunInput,
+  AgentRunResult,
   AgentRuntimeBuildOptions,
   AgentRuntimeLike,
   AgentRuntimeRunOptions,
@@ -340,3 +342,210 @@ it('keeps generated split identity distinct from a real existing Core module ide
   expect(Object.keys(result.phases?.moduleResults as object)).toHaveLength(3);
   expect(children.flatMap((c) => c.files).sort()).toEqual([...files, existingFile].sort());
 });
+
+// L8-C01：宿主取消/期限信号必须能经 runModuleMining 进入父 execution，由 coordinator 在每个 child
+// 派发前、AgentRuntime 在运行中消费；不传信号时父 execution 与旧形状逐字节一致。
+describe('runModuleMining cancellation and deadline signals', () => {
+  const threeModules = [
+    { moduleId: 'core', moduleName: 'Core', ownedFiles: ['src/core.ts'] },
+    { moduleId: 'ui', moduleName: 'UI', ownedFiles: ['src/ui.ts'] },
+    { moduleId: 'cli', moduleName: 'CLI', ownedFiles: ['src/cli.ts'] },
+  ];
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('starts no child and fails with an aborted partial result when the signal is already aborted', async () => {
+    const executions: RuntimeExecution[] = [];
+    const controller = new AbortController();
+    controller.abort(new Error('host cancelled the moduleMining job'));
+    let failure: unknown;
+    try {
+      await runModuleMining({
+        agentService: createService(executions),
+        modules: threeModules,
+        projectFacts: { project: 'cancelled' },
+        budget: { totalRecipeBudget: 3 },
+        abortSignal: controller.signal,
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(executions).toHaveLength(0);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/failed with status aborted/u);
+    expect(failure).toMatchObject({
+      partialResult: {
+        status: 'aborted',
+        phases: {
+          moduleResults: {
+            core: { status: 'aborted', reply: 'child-run-aborted' },
+            ui: { status: 'aborted', reply: 'child-run-aborted' },
+            cli: { status: 'aborted', reply: 'child-run-aborted' },
+          },
+        },
+      },
+    });
+  });
+
+  it('stops dispatching later children once shouldAbort turns true after the first child', async () => {
+    vi.stubEnv('ALEMBIC_MODULE_MINING_CONCURRENCY', '1');
+    const executions: RuntimeExecution[] = [];
+    const shouldAbort = vi.fn(() => executions.length >= 1);
+    let failure: unknown;
+    try {
+      await runModuleMining({
+        agentService: createService(executions),
+        modules: threeModules,
+        projectFacts: { project: 'cancel-mid-run' },
+        shouldAbort,
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(shouldAbort).toHaveBeenCalled();
+    expect(executions.map((execution) => execution.metadata.moduleId)).toEqual(['core']);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).toMatchObject({
+      partialResult: {
+        status: 'aborted',
+        phases: {
+          moduleResults: {
+            core: { status: 'success', reply: 'mined:core' },
+            ui: { status: 'aborted', reply: 'child-run-aborted' },
+            cli: { status: 'aborted', reply: 'child-run-aborted' },
+          },
+        },
+      },
+    });
+    expect((failure as { partialResult: { status: string } }).partialResult.status).not.toBe(
+      'success'
+    );
+  });
+
+  it('forwards the abort signal and deadline to child runtimes and stops after a mid-run abort', async () => {
+    vi.stubEnv('ALEMBIC_MODULE_MINING_CONCURRENCY', '1');
+    const executions: RuntimeExecution[] = [];
+    const controller = new AbortController();
+    const agentService = new AgentService({
+      runtimeBuilder: {
+        build(profile: CompiledAgentProfile): AgentRuntimeLike {
+          return {
+            id: `runtime:${profile.id}`,
+            async execute(message, options) {
+              executions.push({
+                profileId: profile.id,
+                content: message.content,
+                metadata: message.metadata || {},
+                options,
+              });
+              // 宿主在第一个 child 运行期间取消 job。
+              controller.abort(new Error('host cancelled during first child'));
+              return {
+                reply: `mined:${String(message.metadata?.moduleId)}`,
+                tokenUsage: { input: 1, output: 1 },
+                iterations: 1,
+                durationMs: 1,
+              };
+            },
+          };
+        },
+      },
+    });
+
+    await expect(
+      runModuleMining({
+        agentService,
+        modules: threeModules,
+        projectFacts: { project: 'abort-mid-run' },
+        abortSignal: controller.signal,
+        timeoutMs: 45_000,
+      })
+    ).rejects.toMatchObject({ partialResult: { status: 'aborted' } });
+
+    expect(executions).toHaveLength(1);
+    expect(executions[0]?.options?.abortSignal).toBe(controller.signal);
+    expect(executions[0]?.options?.timeoutMs).toBe(45_000);
+  });
+
+  it('keeps the parent execution exactly as before when no signal is passed', async () => {
+    const budget = { analystTokens: 9000, totalRecipeBudget: 6 };
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput) => {
+      calls.push(input);
+      return successRunResult();
+    });
+
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts: { project: 'regression' },
+      budget,
+    });
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts: { project: 'regression-no-budget' },
+    });
+
+    expect(calls[0]?.execution).toEqual({ budgetOverride: budget });
+    expect(Object.keys(calls[0]?.execution ?? {})).toEqual(['budgetOverride']);
+    expect(calls[1]?.execution).toEqual({});
+    expect(Object.keys(calls[0] ?? {})).toEqual([
+      'profile',
+      'params',
+      'message',
+      'context',
+      'execution',
+      'presentation',
+    ]);
+  });
+
+  it('merges the three signals into the parent execution without leaking them into params', async () => {
+    const budget = { totalRecipeBudget: 2 };
+    const controller = new AbortController();
+    const shouldAbort = () => false;
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput) => {
+      calls.push(input);
+      return successRunResult();
+    });
+
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts: { project: 'passthrough' },
+      budget,
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 30_000,
+    });
+
+    expect(calls[0]?.execution).toEqual({
+      budgetOverride: budget,
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 30_000,
+    });
+    expect(calls[0]?.execution?.abortSignal).toBe(controller.signal);
+    expect(calls[0]?.execution?.shouldAbort).toBe(shouldAbort);
+    expect(calls[0]?.params).not.toHaveProperty('abortSignal');
+    expect(calls[0]?.params).not.toHaveProperty('shouldAbort');
+    expect(calls[0]?.params).not.toHaveProperty('timeoutMs');
+  });
+});
+
+function successRunResult(): AgentRunResult {
+  return {
+    runId: 'module-mining-parent',
+    profileId: 'module-mining-session',
+    reply: 'ok',
+    status: 'success',
+    toolCalls: [],
+    usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+    diagnostics: null,
+  };
+}

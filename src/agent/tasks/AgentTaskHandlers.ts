@@ -27,6 +27,12 @@ export interface TaskContext {
   aiProvider?: TaskAiProvider;
   container: { get(name: string): unknown };
   logger?: unknown;
+  /**
+   * 宿主可选的任务取消信号（L8-C01，例如 HTTP 请求断开）。传入时转给关系发现 run 的
+   * execution.abortSignal 与 AI 直调的 abortSignal；未传时各调用参数与旧版一致。
+   * 工具调用（invokeToolEnvelope）不经过这里，其取消由宿主自己的路由负责。
+   */
+  signal?: AbortSignal;
 }
 
 export interface CandidateInput {
@@ -116,9 +122,16 @@ ${highSim.map((s: DuplicateEntry) => `- ${s.title} (相似度: ${s.similarity})`
 请回答: DUPLICATE（真正重复）/ SIMILAR（相似但不同，建议保留并标注关系）/ UNIQUE（误判，可放心提交）
 只回答一个词。`;
     try {
-      const raw = await aiProvider.chat(verdictPrompt, { temperature: 0, maxTokens: 20 });
+      const raw = await aiProvider.chat(
+        verdictPrompt,
+        withTaskSignal(context, { temperature: 0, maxTokens: 20 })
+      );
       aiVerdict = (raw || '').trim().toUpperCase().split(/\s/)[0];
-    } catch {
+    } catch (err: unknown) {
+      // 宿主取消不是“可选 AI 判定失败”：不能降级成 review_suggested 冒充检查完成。
+      if (context.signal?.aborted) {
+        throw taskAbortedError(context, 'check_and_submit', 'ai-verdict', err);
+      }
       /* optional AI verdict */
     }
   }
@@ -146,7 +159,8 @@ export async function taskDiscoverAllRelations(context: TaskContext, { batchSize
     return { discovered: 0, message: 'AI Provider 未配置（Mock 模式），跳过关系发现。' };
   }
 
-  return runRelationDiscovery({ agentService, batchSize });
+  // 中止后的关系发现 run 由 runRelationDiscovery 以 runFailure 抛出，不会返回可写图的 relations。
+  return runRelationDiscovery({ agentService, batchSize, abortSignal: context.signal });
 }
 
 export async function taskFullEnrich(
@@ -281,12 +295,19 @@ ${code.substring(0, 3000)}
 请用 JSON 数组格式返回建议: [{"violation": "...", "suggestion": "...", "fixExample": "..."}]`;
 
       suggestions =
-        (await aiProvider.chatWithStructuredOutput(prompt, {
-          openChar: '[',
-          closeChar: ']',
-          temperature: 0.3,
-        })) || [];
-    } catch {
+        (await aiProvider.chatWithStructuredOutput(
+          prompt,
+          withTaskSignal(context, {
+            openChar: '[',
+            closeChar: ']',
+            temperature: 0.3,
+          })
+        )) || [];
+    } catch (err: unknown) {
+      // 宿主取消时整个扫描失败，不能返回 suggestions=null 的“已完成”结果。
+      if (context.signal?.aborted) {
+        throw taskAbortedError(context, 'guard_full_scan', 'ai-suggestions', err);
+      }
       /* AI suggestions are optional */
     }
   }
@@ -298,6 +319,45 @@ ${code.substring(0, 3000)}
     violations: checkResult.violations,
     suggestions,
   };
+}
+
+/**
+ * 只在宿主传入 signal 时追加 abortSignal，保证未传信号的 AI 调用选项与旧版逐项一致。
+ */
+function withTaskSignal(
+  context: TaskContext,
+  opts: Record<string, unknown>
+): Record<string, unknown> {
+  return context.signal ? { ...opts, abortSignal: context.signal } : opts;
+}
+
+/**
+ * 任务被宿主信号取消时的统一出口：记录取消诊断（任务、步骤、取消原因、底层错误），
+ * 再返回带 cause 的 Error 由调用方抛出。日志器选择与 redactTaskToolEnvelope 一致：
+ * 优先宿主注入的 warn 日志器，失败或缺失时退回 Core 共享 Logger。
+ */
+function taskAbortedError(context: TaskContext, task: string, step: string, err: unknown): Error {
+  const reason: unknown = context.signal?.reason;
+  const meta = {
+    code: 'AGENT_TASK_ABORTED',
+    task,
+    step,
+    reason: reason instanceof Error ? reason.message : typeof reason === 'string' ? reason : null,
+    error: err instanceof Error ? err.message : String(err),
+  };
+  const coreLogger = Logger.getInstance();
+  const logger = isTaskWarnLogger(context.logger) ? context.logger : coreLogger;
+  observeSafely(
+    () => logger.warn(`[AgentTask] ${task} aborted by task signal during ${step}`, meta),
+    () =>
+      logger === coreLogger
+        ? undefined
+        : coreLogger.warn(
+            `[AgentTask] ${task} aborted by task signal during ${step} (host logger failed)`,
+            meta
+          )
+  );
+  return new Error(`Agent task ${task} aborted during ${step}`, { cause: err });
 }
 
 async function invokeTaskTool<T = Record<string, unknown>>(

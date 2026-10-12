@@ -10,6 +10,7 @@ import {
 } from '@alembic/core/plans';
 import type { AgentService } from '../../service/AgentService.js';
 import { runFailure } from '../result.js';
+import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 
 export interface PlanContextProjectionV1 {
   readonly schemaVersion: 1;
@@ -28,7 +29,11 @@ export interface PlanContextProjectionV1 {
   };
 }
 
-export interface RunStrictPlanAgentInput {
+/**
+ * abortSignal / shouldAbort / timeoutMs：宿主可选的取消与期限信号（L8-C01）。每次认知调用（含因果
+ * 语义修复）都携带同一组信号；中止后的调用状态不是 success，按 STRICT_PLAN_RUN_FAILED 抛出，不进入修复。
+ */
+export interface RunStrictPlanAgentInput extends SystemTaskRunSignals {
   readonly agentService: Pick<AgentService, 'run'>;
   readonly contextProjection: PlanContextProjectionV1;
   readonly validateReceipt: (receipt: PlanCognitionReceiptV1) => void | Promise<void>;
@@ -42,6 +47,9 @@ export async function runStrictPlanAgent({
   agentService,
   contextProjection,
   validateReceipt,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: RunStrictPlanAgentInput): Promise<PlanCognitionReceiptV1> {
   validateStrictPlanContext(contextProjection);
   const semanticRepairLimit = Math.min(contextProjection.hardCaps.semanticRepairLimit, 2);
@@ -54,26 +62,28 @@ export async function runStrictPlanAgent({
       repairReason,
       parentInvocationId: repairs.at(-1)?.invocationId ?? initial?.invocationId ?? null,
     });
-    const result = await agentService.run({
-      profile: { id: 'plan-selection' },
-      params: { generationStage: contextProjection.generationStage },
-      message: {
-        role: 'internal',
-        content: prompt,
-        metadata: {
-          task: 'strict-plan-cognition',
-          generationStage: contextProjection.generationStage,
-          semanticRepairAttempt: attempt,
+    const result = await agentService.run(
+      buildSystemTaskRunInput({
+        profileId: 'plan-selection',
+        params: { generationStage: contextProjection.generationStage },
+        message: {
+          role: 'internal',
+          content: prompt,
+          metadata: {
+            task: 'strict-plan-cognition',
+            generationStage: contextProjection.generationStage,
+            semanticRepairAttempt: attempt,
+          },
         },
-      },
-      context: {
-        source: 'system-workflow',
-        runtimeSource: 'system',
-        promptContext: { strictPlanContext: contextProjection },
-      },
-      execution: { toolChoiceOverride: 'none' },
-      presentation: { responseShape: 'system-task-result' },
-    });
+        context: {
+          source: 'system-workflow',
+          runtimeSource: 'system',
+          promptContext: { strictPlanContext: contextProjection },
+        },
+        execution: { toolChoiceOverride: 'none' },
+        signals: { abortSignal, shouldAbort, timeoutMs },
+      })
+    );
     if (result.status !== 'success') {
       throw runFailure(
         result,
@@ -139,7 +149,8 @@ export async function runStrictPlanAgent({
   throw new Error('PLAN_SEMANTIC_REPAIR_LIMIT');
 }
 
-export interface RunPlanAgentInput {
+/** abortSignal / shouldAbort / timeoutMs：宿主可选的取消与期限信号（L8-C01），与 toolChoiceOverride 一起并入 execution。 */
+export interface RunPlanAgentInput extends SystemTaskRunSignals {
   agentService: Pick<AgentService, 'run'>;
   generationStage: PlanStageId;
   projectContextFacts: unknown;
@@ -149,23 +160,28 @@ export async function runPlanAgent({
   agentService,
   generationStage,
   projectContextFacts,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: RunPlanAgentInput): Promise<PlanSelection> {
-  const result = await agentService.run({
-    profile: { id: 'plan-selection' },
-    params: { generationStage, projectContextFacts },
-    message: {
-      role: 'internal',
-      content: buildPlanSelectionPrompt({ generationStage, projectContextFacts }),
-      metadata: { task: 'plan-selection', generationStage },
-    },
-    context: {
-      source: 'system-workflow',
-      runtimeSource: 'system',
-      promptContext: { generationStage, projectContextFacts },
-    },
-    execution: { toolChoiceOverride: 'none' },
-    presentation: { responseShape: 'system-task-result' },
-  });
+  const result = await agentService.run(
+    buildSystemTaskRunInput({
+      profileId: 'plan-selection',
+      params: { generationStage, projectContextFacts },
+      message: {
+        role: 'internal',
+        content: buildPlanSelectionPrompt({ generationStage, projectContextFacts }),
+        metadata: { task: 'plan-selection', generationStage },
+      },
+      context: {
+        source: 'system-workflow',
+        runtimeSource: 'system',
+        promptContext: { generationStage, projectContextFacts },
+      },
+      execution: { toolChoiceOverride: 'none' },
+      signals: { abortSignal, shouldAbort, timeoutMs },
+    })
+  );
 
   if (result.status !== 'success') {
     throw runFailure(

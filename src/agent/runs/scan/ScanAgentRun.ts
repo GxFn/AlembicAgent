@@ -3,6 +3,7 @@ import type { FileCacheEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentRunInput, AgentRunSource } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import type { SystemRunContextFactory } from '../../service/SystemRunContextFactory.js';
+import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 import { projectScanRunResult, type ScanKnowledgeProjection } from './ScanRunProjection.js';
 
 interface ScanTaskConfig {
@@ -16,7 +17,8 @@ export interface ScanAgentFileInput {
   language?: string;
 }
 
-export interface RunScanAgentTaskOptions {
+/** abortSignal / shouldAbort / timeoutMs：宿主可选的取消与期限信号（L8-C01），只在传入时并入 execution。 */
+export interface RunScanAgentTaskOptions extends SystemTaskRunSignals {
   agentService: AgentService;
   systemRunContextFactory: SystemRunContextFactory;
   label?: string;
@@ -38,6 +40,9 @@ export async function runScanAgentTask({
   comprehensive = false,
   source = 'system-workflow',
   onParseError,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: RunScanAgentTaskOptions): Promise<ScanKnowledgeProjection> {
   const taskConfig = Object.hasOwn(SCAN_TASK_CONFIGS, task)
     ? (SCAN_TASK_CONFIGS as Record<string, ScanTaskConfig>)[task]
@@ -58,25 +63,29 @@ export async function runScanAgentTask({
     lang: lang || undefined,
   });
 
-  const runResult = await agentService.run({
-    profile: { id: task === 'summarize' ? 'scan-summarize' : 'scan-extract' },
-    params: { task, label: runLabel, comprehensive, files: fileCache },
-    message: {
-      role: 'internal',
-      content: `分析 "${runLabel}" 的 ${fileCache?.length || 0} 个源文件。${comprehensive ? '请进行深度分析。' : ''}`,
-      metadata: { label: runLabel, task },
-    },
-    context: {
-      source,
-      runtimeSource: 'system',
-      lang: lang || null,
-      fileCache,
-      systemRunContext: systemCtx.systemRunContext as AgentRunInput['context']['systemRunContext'],
-      strategyContext: systemCtx,
-      promptContext: { dimensionScopeId: systemCtx.scopeId as string },
-    },
-    presentation: { responseShape: 'system-task-result' },
-  });
+  // 中止/超时后的 run 状态不是 success，由 projectScanRunResult 投影成带 error 的结果，不冒充成功。
+  const runResult = await agentService.run(
+    buildSystemTaskRunInput({
+      profileId: task === 'summarize' ? 'scan-summarize' : 'scan-extract',
+      params: { task, label: runLabel, comprehensive, files: fileCache },
+      message: {
+        role: 'internal',
+        content: `分析 "${runLabel}" 的 ${fileCache?.length || 0} 个源文件。${comprehensive ? '请进行深度分析。' : ''}`,
+        metadata: { label: runLabel, task },
+      },
+      context: {
+        source,
+        runtimeSource: 'system',
+        lang: lang || null,
+        fileCache,
+        systemRunContext:
+          systemCtx.systemRunContext as AgentRunInput['context']['systemRunContext'],
+        strategyContext: systemCtx,
+        promptContext: { dimensionScopeId: systemCtx.scopeId as string },
+      },
+      signals: { abortSignal, shouldAbort, timeoutMs },
+    })
+  );
 
   return projectScanRunResult({
     label: runLabel,

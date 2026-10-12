@@ -20,11 +20,13 @@ import {
 import {
   collectEvolutionDecisionIds,
   projectEvolutionAuditResult,
+  runEvolutionAudit,
 } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
 import {
   projectRelationDiscoveryResult,
   runRelationDiscovery,
 } from '../src/agent/runs/relation/RelationAgentRun.js';
+import { runScanAgentTask } from '../src/agent/runs/scan/ScanAgentRun.js';
 import { runTranslationJson } from '../src/agent/runs/translation/TranslationAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import type { ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
@@ -35,9 +37,16 @@ import type {
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
 import type { AgentService } from '../src/agent/service/AgentService.js';
-import { AgentRunCoordinator } from '../src/agent/service/index.js';
+import { AgentRunCoordinator, SystemRunContextFactory } from '../src/agent/service/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
+import {
+  type TaskContext,
+  taskCheckAndSubmit,
+  taskDiscoverAllRelations,
+  taskGuardFullScan,
+} from '../src/agent/tasks/index.js';
+import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 
 const projectRoot = '/tmp/alembic-agent-surface-floor';
 
@@ -1102,4 +1111,333 @@ describe('run projection outcomes', () => {
 
 it('keeps the preset strategy when an optional override is explicitly undefined', () => {
   expect(getPreset('insight', { strategy: undefined }).strategyInstance.name).toBe('pipeline');
+});
+
+// L8-C01：其余 run helper 与 TaskContext 必须把宿主取消/期限信号原样并入 execution（或 AI 直调
+// 选项）；不传信号时输入形状与旧版逐字节一致（这些 helper 旧版没有 execution 键）。
+describe('run helper and task context cancellation signals', () => {
+  function capturedRun(status: AgentRunStatus = 'success', reply = 'finished') {
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput): Promise<AgentRunResult> => {
+      calls.push(input);
+      return {
+        runId: 'signal-fixture',
+        profileId: input.profile.id ?? 'unknown',
+        reply,
+        status,
+        toolCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+        diagnostics: null,
+      };
+    });
+    return { calls, service: { run } as unknown as AgentService };
+  }
+  function signals() {
+    const controller = new AbortController();
+    const shouldAbort = vi.fn(() => false);
+    return { controller, shouldAbort, timeoutMs: 12_345 };
+  }
+  const evolutionRecipe = { id: 'recipe-1', title: 'Recipe', trigger: '@recipe' };
+  const overview = { primaryLang: 'ts', fileCount: 1, modules: ['core'] };
+
+  it('forwards signals from runEvolutionAudit and surfaces an aborted run as a failure', async () => {
+    const { calls, service } = capturedRun('aborted', 'Agent run aborted before execution');
+    const { controller, shouldAbort, timeoutMs } = signals();
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: [evolutionRecipe],
+        projectOverview: overview,
+        abortSignal: controller.signal,
+        shouldAbort,
+        timeoutMs,
+      })
+    ).rejects.toMatchObject({ partialResult: { status: 'aborted' } });
+    expect(calls[0]?.execution).toEqual({
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs,
+    });
+  });
+
+  it('keeps runEvolutionAudit input without an execution key when no signal is passed', async () => {
+    const { calls, service } = capturedRun('aborted');
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: [evolutionRecipe],
+        projectOverview: overview,
+      })
+    ).rejects.toBeInstanceOf(Error);
+    expect(calls[0]).not.toHaveProperty('execution');
+    expect(Object.keys(calls[0] ?? {})).toEqual([
+      'profile',
+      'params',
+      'message',
+      'context',
+      'presentation',
+    ]);
+  });
+
+  it('forwards signals from runRelationDiscovery and keeps the old shape without them', async () => {
+    const withSignals = capturedRun('aborted');
+    const { controller, shouldAbort, timeoutMs } = signals();
+    await expect(
+      runRelationDiscovery({
+        agentService: withSignals.service,
+        batchSize: 5,
+        abortSignal: controller.signal,
+        shouldAbort,
+        timeoutMs,
+      })
+    ).rejects.toMatchObject({ partialResult: { status: 'aborted' } });
+    expect(withSignals.calls[0]?.execution).toEqual({
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs,
+    });
+    expect(withSignals.calls[0]?.params).toEqual({ batchSize: 5 });
+
+    const withoutSignals = capturedRun('success', '{"analyzed":0,"relations":[]}');
+    await runRelationDiscovery({ agentService: withoutSignals.service });
+    expect(withoutSignals.calls[0]).not.toHaveProperty('execution');
+  });
+
+  it('forwards signals from runScanAgentTask without touching the system run context', async () => {
+    const withSignals = capturedRun('success', '{}');
+    const { controller, shouldAbort, timeoutMs } = signals();
+    await runScanAgentTask({
+      agentService: withSignals.service,
+      systemRunContextFactory: new SystemRunContextFactory(),
+      label: 'signals',
+      files: [{ name: 'a.ts', content: 'export const a = 1;' }],
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs,
+    });
+    expect(withSignals.calls[0]?.execution).toEqual({
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs,
+    });
+    expect(withSignals.calls[0]?.context).toMatchObject({
+      source: 'system-workflow',
+      runtimeSource: 'system',
+    });
+
+    const withoutSignals = capturedRun('success', '{}');
+    await runScanAgentTask({
+      agentService: withoutSignals.service,
+      systemRunContextFactory: new SystemRunContextFactory(),
+      label: 'no-signals',
+    });
+    expect(withoutSignals.calls[0]).not.toHaveProperty('execution');
+  });
+
+  it('forwards signals from runTranslationJson and keeps the original text on an aborted run', async () => {
+    const withSignals = capturedRun('aborted', 'Agent run aborted before execution');
+    const { controller, timeoutMs } = signals();
+    await expect(
+      runTranslationJson({
+        agentService: withSignals.service,
+        summary: '原文',
+        usageGuide: '用法',
+        abortSignal: controller.signal,
+        timeoutMs,
+      })
+    ).resolves.toEqual({
+      summaryEn: '原文',
+      usageGuideEn: '用法',
+      error: 'Agent run aborted before execution',
+    });
+    expect(withSignals.calls[0]?.execution).toEqual({ abortSignal: controller.signal, timeoutMs });
+
+    const withoutSignals = capturedRun('success', '{"summaryEn":"s","usageGuideEn":"u"}');
+    await runTranslationJson({ agentService: withoutSignals.service, summary: '原文' });
+    expect(withoutSignals.calls[0]).not.toHaveProperty('execution');
+  });
+
+  function taskEnvelope(structuredContent: unknown): ToolResultEnvelope {
+    return {
+      ok: true,
+      status: 'success',
+      toolId: 'task-tool',
+      callId: 'task-tool-call',
+      startedAt: '2026-10-11T00:00:00.000Z',
+      durationMs: 1,
+      text: 'ok',
+      structuredContent,
+      diagnostics: {
+        degraded: false,
+        fallbackUsed: false,
+        warnings: [],
+        timedOutStages: [],
+        blockedTools: [],
+        truncatedToolCalls: 0,
+        emptyResponses: 0,
+        aiErrorCount: 0,
+        gateFailures: [],
+      },
+      trust: {
+        source: 'internal',
+        sanitized: true,
+        containsUntrustedText: false,
+        containsSecrets: false,
+      },
+    };
+  }
+  function taskContext(
+    structuredContent: unknown,
+    overrides: Partial<TaskContext> = {}
+  ): TaskContext & { warn: ReturnType<typeof vi.fn> } {
+    const warn = vi.fn();
+    return {
+      invokeToolEnvelope: vi.fn(async () => taskEnvelope(structuredContent)),
+      container: { get: () => undefined },
+      logger: { warn },
+      ...overrides,
+      warn,
+    };
+  }
+  const similarCandidates = { similar: [{ title: 'Existing', similarity: 0.92 }] };
+
+  it('forwards the task signal to runRelationDiscovery from taskDiscoverAllRelations', async () => {
+    const withSignal = capturedRun('success', '{"analyzed":0,"relations":[]}');
+    const controller = new AbortController();
+    await taskDiscoverAllRelations(
+      taskContext(
+        {},
+        {
+          container: { get: () => withSignal.service },
+          signal: controller.signal,
+        }
+      ),
+      { batchSize: 7 }
+    );
+    expect(withSignal.calls[0]?.execution).toEqual({ abortSignal: controller.signal });
+    expect(withSignal.calls[0]?.params).toEqual({ batchSize: 7 });
+
+    const withoutSignal = capturedRun('success', '{"analyzed":0,"relations":[]}');
+    await taskDiscoverAllRelations(
+      taskContext({}, { container: { get: () => withoutSignal.service } })
+    );
+    expect(withoutSignal.calls[0]).not.toHaveProperty('execution');
+  });
+
+  it('passes the task signal to the duplicate verdict AI call and keeps options unchanged without it', async () => {
+    const controller = new AbortController();
+    const chat = vi.fn(async () => 'UNIQUE');
+    const chatWithStructuredOutput = vi.fn(async () => []);
+    await taskCheckAndSubmit(
+      taskContext(similarCandidates, {
+        aiProvider: { chat, chatWithStructuredOutput },
+        signal: controller.signal,
+      }),
+      { candidate: { title: 'Candidate', code: 'x' } }
+    );
+    expect(chat).toHaveBeenCalledWith(expect.any(String), {
+      temperature: 0,
+      maxTokens: 20,
+      abortSignal: controller.signal,
+    });
+
+    const plainChat = vi.fn(async () => 'UNIQUE');
+    await taskCheckAndSubmit(
+      taskContext(similarCandidates, {
+        aiProvider: { chat: plainChat, chatWithStructuredOutput },
+      }),
+      { candidate: { title: 'Candidate', code: 'x' } }
+    );
+    expect(plainChat).toHaveBeenCalledWith(expect.any(String), { temperature: 0, maxTokens: 20 });
+  });
+
+  it('fails check_and_submit with a logged abort instead of a degraded recommendation', async () => {
+    const controller = new AbortController();
+    const abortError = new Error('This operation was aborted');
+    abortError.name = 'AbortError';
+    const chat = vi.fn(async () => {
+      controller.abort(new Error('client disconnected'));
+      throw abortError;
+    });
+    const context = taskContext(similarCandidates, {
+      aiProvider: { chat, chatWithStructuredOutput: vi.fn(async () => []) },
+      signal: controller.signal,
+    });
+
+    await expect(
+      taskCheckAndSubmit(context, { candidate: { title: 'Candidate', code: 'x' } })
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/check_and_submit aborted/u),
+      cause: abortError,
+    });
+    expect(context.warn).toHaveBeenCalledWith(
+      expect.stringContaining('check_and_submit'),
+      expect.objectContaining({ code: 'AGENT_TASK_ABORTED', task: 'check_and_submit' })
+    );
+  });
+
+  it('keeps the optional AI verdict fallback for non-cancellation failures', async () => {
+    const chat = vi.fn(async () => {
+      throw new Error('provider unavailable');
+    });
+    await expect(
+      taskCheckAndSubmit(
+        taskContext(similarCandidates, {
+          aiProvider: { chat, chatWithStructuredOutput: vi.fn(async () => []) },
+        }),
+        { candidate: { title: 'Candidate', code: 'x' } }
+      )
+    ).resolves.toMatchObject({ aiVerdict: null, recommendation: 'review_suggested' });
+  });
+
+  it('passes the task signal to guard suggestions and fails the scan when it is cancelled', async () => {
+    const violations = { violationCount: 1, violations: [{ severity: 'error', message: 'bad' }] };
+    const controller = new AbortController();
+    const chatWithStructuredOutput = vi.fn(async () => [{ violation: 'bad', suggestion: 'fix' }]);
+    await taskGuardFullScan(
+      taskContext(violations, {
+        aiProvider: { chat: vi.fn(async () => ''), chatWithStructuredOutput },
+        signal: controller.signal,
+      }),
+      { code: 'const a = 1;', language: 'ts' }
+    );
+    expect(chatWithStructuredOutput).toHaveBeenCalledWith(expect.any(String), {
+      openChar: '[',
+      closeChar: ']',
+      temperature: 0.3,
+      abortSignal: controller.signal,
+    });
+
+    const plainStructured = vi.fn(async () => []);
+    await taskGuardFullScan(
+      taskContext(violations, {
+        aiProvider: { chat: vi.fn(async () => ''), chatWithStructuredOutput: plainStructured },
+      }),
+      { code: 'const a = 1;', language: 'ts' }
+    );
+    expect(plainStructured).toHaveBeenCalledWith(expect.any(String), {
+      openChar: '[',
+      closeChar: ']',
+      temperature: 0.3,
+    });
+
+    const cancelled = new AbortController();
+    const cancelledContext = taskContext(violations, {
+      aiProvider: {
+        chat: vi.fn(async () => ''),
+        chatWithStructuredOutput: vi.fn(async () => {
+          cancelled.abort();
+          throw new Error('aborted');
+        }),
+      },
+      signal: cancelled.signal,
+    });
+    await expect(
+      taskGuardFullScan(cancelledContext, { code: 'const a = 1;', language: 'ts' })
+    ).rejects.toThrow(/guard_full_scan aborted/u);
+    expect(cancelledContext.warn).toHaveBeenCalledWith(
+      expect.stringContaining('guard_full_scan'),
+      expect.objectContaining({ code: 'AGENT_TASK_ABORTED', task: 'guard_full_scan' })
+    );
+  });
 });

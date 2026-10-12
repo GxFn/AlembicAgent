@@ -4,6 +4,7 @@ import { computeModuleAnalystBudget } from '../../prompts/insightAnalyst.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import { runFailure } from '../result.js';
+import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 import {
   buildModuleContextMap,
   type ModuleLikeRecord,
@@ -20,7 +21,12 @@ export interface ScopedMiningModule {
   [key: string]: unknown;
 }
 
-export interface RunScopedModuleMiningInput {
+/**
+ * abortSignal / shouldAbort / timeoutMs 为宿主可选的取消与期限信号（L8-C01）：原样并入父 run 的
+ * execution，coordinator 在每个模块 child 派发前检查、并把同一 execution 交给 child runtime。
+ * 未传时父 execution 与旧版完全一致（只含 budgetOverride，无 budget 时为空对象）。
+ */
+export interface RunScopedModuleMiningInput extends SystemTaskRunSignals {
   agentService: Pick<AgentService, 'run'>;
   modules: ScopedMiningModule[];
   projectFacts: unknown;
@@ -36,45 +42,50 @@ export async function runScopedModuleMining({
   budget,
   scaleCap,
   concurrency,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: RunScopedModuleMiningInput): Promise<AgentRunResult> {
   const selectedModules = selectScopedIndexModulesForRun(modules, scaleCap);
-  const result = await agentService.run({
-    profile: { id: 'module-mining-session' },
-    params: stripUndefined({
-      modules: selectedModules,
-      projectFacts,
-      budget,
-      scaleCap,
-      concurrency,
-    }),
-    message: {
-      role: 'internal',
-      content: buildProjectIndexScopedModulePrompt({
+  const result = await agentService.run(
+    buildSystemTaskRunInput({
+      profileId: 'module-mining-session',
+      params: stripUndefined({
         modules: selectedModules,
         projectFacts,
         budget,
+        scaleCap,
+        concurrency,
       }),
-      metadata: {
-        task: 'module-mining',
-        generationStage: 'moduleMining',
-        moduleCount: selectedModules.length,
+      message: {
+        role: 'internal',
+        content: buildProjectIndexScopedModulePrompt({
+          modules: selectedModules,
+          projectFacts,
+          budget,
+        }),
+        metadata: {
+          task: 'module-mining',
+          generationStage: 'moduleMining',
+          moduleCount: selectedModules.length,
+        },
       },
-    },
-    context: {
-      source: 'system-workflow',
-      runtimeSource: 'system',
-      promptContext: stripUndefined({
-        generationStage: 'moduleMining',
-        projectFacts,
-        budget,
-        moduleCount: selectedModules.length,
+      context: {
+        source: 'system-workflow',
+        runtimeSource: 'system',
+        promptContext: stripUndefined({
+          generationStage: 'moduleMining',
+          projectFacts,
+          budget,
+          moduleCount: selectedModules.length,
+        }),
+      },
+      execution: stripUndefined({
+        budgetOverride: budget,
       }),
-    },
-    execution: stripUndefined({
-      budgetOverride: budget,
-    }),
-    presentation: { responseShape: 'system-task-result' },
-  });
+      signals: { abortSignal, shouldAbort, timeoutMs },
+    })
+  );
 
   if (result.status !== 'success') {
     throw runFailure(

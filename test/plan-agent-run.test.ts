@@ -2,7 +2,12 @@ import { readFileSync } from 'node:fs';
 import type { PlanModuleBinding, PlanStageId } from '@alembic/core/plans';
 import { describe, expect, it, vi } from 'vitest';
 import { AgentProfileRegistry } from '../src/agent/profiles/AgentProfileRegistry.js';
-import { parsePlanSelection, runPlanAgent } from '../src/agent/runs/plan/PlanAgentRun.js';
+import {
+  type PlanContextProjectionV1,
+  parsePlanSelection,
+  runPlanAgent,
+  runStrictPlanAgent,
+} from '../src/agent/runs/plan/PlanAgentRun.js';
 import type { AgentRunInput, AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
@@ -308,5 +313,185 @@ describe('runPlanAgent', () => {
 
     expect(source).not.toMatch(/from ['"].*(repository|ledger|tools)\b/u);
     expect(source).not.toContain('sharedState');
+  });
+});
+
+// L8-C01：Plan helper 必须把宿主取消/期限信号原样并入 execution，并保留 toolChoiceOverride=none；
+// 不传信号时 execution 仍只有 toolChoiceOverride。
+describe('plan helpers cancellation and deadline signals', () => {
+  const strictContext: PlanContextProjectionV1 = {
+    schemaVersion: 1,
+    generationStage: 'coldStart',
+    factsHash: 'facts-hash',
+    catalogHash: 'catalog-hash',
+    sourceRevisionVectorHash: 'revision-hash',
+    sourceArtifactHash: 'artifact-hash',
+    modelHash: 'model-hash',
+    promptHash: 'prompt-hash',
+    projectContextFacts: { project: 'fixture' },
+    frozenCapabilityIds: ['facts.syntax'],
+    frozenQueryFamilyIds: ['syntax-patterns'],
+    hardCaps: { semanticRepairLimit: 2 },
+  };
+  const minimalStrictIntent = {
+    generationStage: 'coldStart',
+    projectProfile: {},
+    dimensions: [],
+    scale: { depthLevels: [] },
+    moduleBindings: [],
+    plannedNextActions: [],
+    evidenceRefs: [],
+    investigationDecomposition: { questions: [] },
+    budgetStrategy: { schemaVersion: 1 },
+  };
+
+  it('forwards abortSignal, shouldAbort and timeoutMs from runPlanAgent into execution', async () => {
+    const calls: AgentRunInput[] = [];
+    const controller = new AbortController();
+    const shouldAbort = vi.fn(() => false);
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult(selectionJson({ dimensions: ['api'] }));
+      },
+    };
+
+    await runPlanAgent({
+      agentService,
+      generationStage: 'coldStart',
+      projectContextFacts: { project: 'fixture' },
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 20_000,
+    });
+
+    expect(calls[0]?.execution).toEqual({
+      toolChoiceOverride: 'none',
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 20_000,
+    });
+    expect(calls[0]?.params).toEqual({
+      generationStage: 'coldStart',
+      projectContextFacts: { project: 'fixture' },
+    });
+  });
+
+  it('keeps runPlanAgent execution exactly { toolChoiceOverride: none } without signals', async () => {
+    const calls: AgentRunInput[] = [];
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult(selectionJson({ dimensions: ['api'] }));
+      },
+    };
+
+    await runPlanAgent({ agentService, generationStage: 'coldStart', projectContextFacts: {} });
+
+    expect(calls[0]?.execution).toEqual({ toolChoiceOverride: 'none' });
+    expect(Object.keys(calls[0] ?? {})).toEqual([
+      'profile',
+      'params',
+      'message',
+      'context',
+      'execution',
+      'presentation',
+    ]);
+  });
+
+  it('does not call the provider and fails as aborted when the plan signal is already aborted', async () => {
+    const chatWithTools = vi.fn(async () => ({
+      text: selectionJson({ dimensions: ['api'] }),
+      functionCalls: [],
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    const agentService = new AgentService({
+      runtimeBuilder: new AgentRuntimeBuilder({
+        aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+        container: {},
+        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+      }),
+    });
+    const controller = new AbortController();
+    controller.abort(new Error('host cancelled plan'));
+
+    await expect(
+      runPlanAgent({
+        agentService,
+        generationStage: 'coldStart',
+        projectContextFacts: { project: 'fixture' },
+        abortSignal: controller.signal,
+      })
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/Plan agent failed with status aborted/u),
+      partialResult: { status: 'aborted' },
+    });
+    expect(chatWithTools).not.toHaveBeenCalled();
+  });
+
+  it('forwards the same signals to every strict plan attempt including causal repairs', async () => {
+    const calls: AgentRunInput[] = [];
+    const controller = new AbortController();
+    const shouldAbort = vi.fn(() => false);
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult(JSON.stringify(minimalStrictIntent));
+      },
+    };
+    let validations = 0;
+
+    await runStrictPlanAgent({
+      agentService,
+      contextProjection: strictContext,
+      validateReceipt: () => {
+        validations += 1;
+        if (validations === 1) {
+          throw new Error('PLAN_REQUIRED_LENS_UNSCHEDULED: repair once');
+        }
+      },
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 15_000,
+    });
+
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.execution).toEqual({
+        toolChoiceOverride: 'none',
+        abortSignal: controller.signal,
+        shouldAbort,
+        timeoutMs: 15_000,
+      });
+    }
+  });
+
+  it('surfaces an aborted strict plan attempt as STRICT_PLAN_RUN_FAILED without repairing', async () => {
+    const calls: AgentRunInput[] = [];
+    const controller = new AbortController();
+    controller.abort();
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return agentRunResult('Agent run aborted before execution', 'aborted');
+      },
+    };
+
+    await expect(
+      runStrictPlanAgent({
+        agentService,
+        contextProjection: strictContext,
+        validateReceipt: () => undefined,
+        abortSignal: controller.signal,
+      })
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/^STRICT_PLAN_RUN_FAILED: aborted/u),
+      partialResult: { status: 'aborted' },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.execution).toEqual({
+      toolChoiceOverride: 'none',
+      abortSignal: controller.signal,
+    });
   });
 });

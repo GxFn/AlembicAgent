@@ -8,6 +8,7 @@ import {
   readToolObservation,
 } from '../../utils/toolOutcomes.js';
 import { runFailure } from '../result.js';
+import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 
 export interface EvolutionAuditRecipe {
   id: string;
@@ -57,6 +58,9 @@ export async function runEvolutionAudit({
   dimensionId = 'all',
   dimensionLabel = '全量进化审计',
   proposalSource,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: {
   agentService: AgentService;
   recipes: EvolutionAuditRecipe[];
@@ -65,7 +69,7 @@ export async function runEvolutionAudit({
   dimensionLabel?: string;
   /** 传给 evolution-tools 的 source 字段（通过 sharedState 透传） */
   proposalSource?: string;
-}): Promise<EvolutionAuditResult> {
+} & SystemTaskRunSignals): Promise<EvolutionAuditResult> {
   if (recipes.length === 0) {
     return { proposed: 0, deprecated: 0, skipped: 0, toolCalls: 0, iterations: 0, reply: '' };
   }
@@ -82,21 +86,25 @@ export async function runEvolutionAudit({
     projectOverview,
     sharedState,
   };
-  const result = await agentService.run({
-    profile: { id: 'evolution-audit' },
-    params: { recipes, projectOverview, dimensionId, dimensionLabel },
-    message: {
-      role: 'internal',
-      content: `请验证 ${recipes.length} 条 Recipe 的源码真实性并提交进化决策。`,
-      metadata: { task: 'evolution-audit', dimensionId, dimensionLabel },
-    },
-    context: {
-      source: 'system-workflow',
-      runtimeSource: 'system',
-      strategyContext,
-    },
-    presentation: { responseShape: 'system-task-result' },
-  });
+  // 宿主取消/期限信号（L8-C01）只在传入时并入 execution；中止后的 run 状态不是 success，
+  // 由下方 runFailure 原样抛出，不会被计成审计完成。
+  const result = await agentService.run(
+    buildSystemTaskRunInput({
+      profileId: 'evolution-audit',
+      params: { recipes, projectOverview, dimensionId, dimensionLabel },
+      message: {
+        role: 'internal',
+        content: `请验证 ${recipes.length} 条 Recipe 的源码真实性并提交进化决策。`,
+        metadata: { task: 'evolution-audit', dimensionId, dimensionLabel },
+      },
+      context: {
+        source: 'system-workflow',
+        runtimeSource: 'system',
+        strategyContext,
+      },
+      signals: { abortSignal, shouldAbort, timeoutMs },
+    })
+  );
 
   if (result.status !== 'success') {
     throw runFailure(

@@ -1,6 +1,7 @@
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import { runFailure } from '../result.js';
+import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 
 export interface RelationDiscoveryResult extends Record<string, unknown> {
   analyzed: number;
@@ -10,24 +11,30 @@ export interface RelationDiscoveryResult extends Record<string, unknown> {
 export async function runRelationDiscovery({
   agentService,
   batchSize = 20,
+  abortSignal,
+  shouldAbort,
+  timeoutMs,
 }: {
   agentService: AgentService;
   batchSize?: number;
-}): Promise<RelationDiscoveryResult> {
-  const result = await agentService.run({
-    profile: { id: 'relation-discovery' },
-    params: { batchSize },
-    message: {
-      role: 'internal',
-      content: `探索知识库中所有知识条目之间的语义关系。每批分析约 ${batchSize} 条知识。`,
-      metadata: { task: 'relation-discovery', batchSize },
-    },
-    context: {
-      source: 'system-workflow',
-      runtimeSource: 'system',
-    },
-    presentation: { responseShape: 'system-task-result' },
-  });
+} & SystemTaskRunSignals): Promise<RelationDiscoveryResult> {
+  // 宿主取消/期限信号（L8-C01）只在传入时并入 execution；中止后的 run 由投影抛出，不会写图。
+  const result = await agentService.run(
+    buildSystemTaskRunInput({
+      profileId: 'relation-discovery',
+      params: { batchSize },
+      message: {
+        role: 'internal',
+        content: `探索知识库中所有知识条目之间的语义关系。每批分析约 ${batchSize} 条知识。`,
+        metadata: { task: 'relation-discovery', batchSize },
+      },
+      context: {
+        source: 'system-workflow',
+        runtimeSource: 'system',
+      },
+      signals: { abortSignal, shouldAbort, timeoutMs },
+    })
+  );
 
   return projectRelationDiscoveryResult(result);
 }
