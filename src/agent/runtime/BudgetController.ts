@@ -2,7 +2,7 @@
  * BudgetController — 预算决策 + 压缩触发 + 遥测
  *
  * 从 AgentRuntime 抽离的独立模块，职责:
- *   1. Session token 预算预检 (checkBeforeLLMCall)
+ *   1. 阶段会话 input 预算预检 (checkBeforeLLMCall)：只触发压缩与 L4 挂起，不做终止或 SUMMARIZE 决策
  *   2. 压缩触发 (runCompactionCycle / executeL4IfPending)
  *   3. Token 追踪 (recordLLMUsage / cumulativeUsage)
  *   4. 工具预算分摊 (getToolBudget / recordToolCharsUsed)
@@ -16,6 +16,13 @@
  * TurnTelemetry、getSessionSummary、下一次调用估算与 L4 硬停都只看“累计 − 基线”。
  * 否则 record_repair(12k)/summary_rewrite(24k) 这类微阶段会拿 analyze 已用的几十万 input
  * 去比自己的小预算，首轮比值就是数十倍：压力钳到 1、工具配额落到最低档、开启 L4 时一次失败即硬停。
+ *
+ * 不在本类职责内（I03，避免“统一管理”的误读）:
+ *   - 终止决策：会话预算只触发压缩；退出由 ExitController（maxIterations / 有效超时 / policy）负责。
+ *   - maxSessionTokens（input+output 总量上限）与 tracker：配置里收下但不消费。阶段预算里的
+ *     maxSessionTokens 目前没有执行者；策略层 BudgetPolicy.maxSessionTokens 由 ExitController 经
+ *     validateDuring 按运行累计执行。两个配置字段属 runtime 公开类型，删除待公开面收窄（事项②）。
+ *   - SessionBudgetSummary.forcedSummarize 恒为 false（本类从不触发强制摘要），同样待事项②处理。
  *
  * @module BudgetController
  */
@@ -40,7 +47,10 @@ export interface BudgetControllerConfig {
    * 与“cumulativeUsage.input − 构造时基线”比较，不与整次运行累计比较。
    */
   maxSessionInputTokens: number;
-  /** Session 级 total token 总限额 (input + output) */
+  /**
+   * Session 级 total token 总限额 (input + output)。当前不被消费：构造函数不读取，本类只执行
+   * maxSessionInputTokens 的压缩触发。字段属 runtime 公开类型，删除待事项②。
+   */
   maxSessionTokens?: number;
   /**
    * AgentRuntime.tokenUsage 的引用（非拷贝！）。
@@ -50,7 +60,10 @@ export interface BudgetControllerConfig {
   cumulativeUsage: TokenUsageAccumulator;
   /** ContextWindow 引用 (Per-call 压缩) */
   contextWindow: ContextWindow | null;
-  /** ExplorationTracker 引用 (forceTerminal) */
+  /**
+   * ExplorationTracker 引用。当前不被消费：本类不调用 forceTerminal、不做 SUMMARIZE 决策
+   * （token 超限的 grace 与 forceTerminal 由 ExitController 触发）。字段属 runtime 公开类型，删除待事项②。
+   */
   tracker: ExplorationTracker | null;
   /** 基础系统提示词长度（用于 ContextWindow 估算） */
   baseSystemPromptLength: number;
@@ -109,6 +122,7 @@ export interface SessionBudgetSummary {
   peakSessionUsageRatio: number;
   maxCompactionLevel: number;
   totalCompactedItems: number;
+  /** 恒为 false：BudgetController 从不触发强制摘要（见模块头注释）；字段属公开类型，删除待事项②。 */
   forcedSummarize: boolean;
 }
 
@@ -176,6 +190,7 @@ export class BudgetController {
   #peakSessionUsageRatio = 0;
   #maxCompactionLevel = 0;
   #totalCompactedItems = 0;
+  /** 只读占位：本类没有任何写入方，getSessionSummary 恒报告 false。 */
   #forcedSummarize = false;
 
   // per-round tool budget state
@@ -217,11 +232,11 @@ export class BudgetController {
    *
    * 职责链:
    *   1. 估算下一轮 input token
-   *   2. 计算 projected session 使用率
+   *   2. 计算 projected session 使用率（阶段内口径）
    *   3. 同步 sessionPressure 到 ContextWindow
-   *   4. 按阈值决定动作 (normal/compress/summarize)
+   *   4. 按阈值决定动作 (normal/compress)
    *   5. 如果 compress: 触发 compaction cycle + 可选 L4 标记
-   *   6. 如果 summarize: 触发 forceTerminal
+   * 不做 summarize / forceTerminal / 终止决策：超预算只会更积极地压缩，退出由 ExitController 负责。
    */
   checkBeforeLLMCall(iteration: number): PreLLMCheckResult {
     const noopResult: PreLLMCheckResult = {

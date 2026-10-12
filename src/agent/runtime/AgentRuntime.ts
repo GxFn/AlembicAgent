@@ -81,7 +81,11 @@ import { AgentState } from './AgentState.js';
 import { evaluateAnalyzeTextGroundingGate } from './AnalyzeGroundingGuard.js';
 import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
-import { createExitController } from './ExitController.js';
+import {
+  createExitController,
+  readPolicyTimeoutMs,
+  resolveEffectiveTimeoutMs,
+} from './ExitController.js';
 import { cleanFinalAnswer } from './finalAnswer.js';
 import {
   describeDeclaredMode,
@@ -2209,11 +2213,17 @@ export class AgentRuntime {
       };
     }
 
+    // 与 createExitController 的 P2 判定用同一个有效超时（阶段超时与策略超时的较小正值，I03）：
+    // 其它原因退出时若已超过更短的策略超时，同样按 stage_timeout 抑制强制摘要，
+    // 不再出现“ExitController 视为已超时、这里却只看阶段超时而多发一次摘要请求”的口径分裂。
+    const effectiveTimeoutMs = resolveEffectiveTimeoutMs(
+      ctx.budget.timeoutMs,
+      readPolicyTimeoutMs(this.policies)
+    );
     if (
       cancelReason === 'stage_timeout' ||
       (diagnostics?.timedOutStages?.length ?? 0) > 0 ||
-      (Number(ctx.budget.timeoutMs) > 0 &&
-        Date.now() - ctx.loopStartTime >= Number(ctx.budget.timeoutMs))
+      (effectiveTimeoutMs > 0 && Date.now() - ctx.loopStartTime >= effectiveTimeoutMs)
     ) {
       ctx.diagnostics?.recordCancelReason('stage_timeout');
       return {

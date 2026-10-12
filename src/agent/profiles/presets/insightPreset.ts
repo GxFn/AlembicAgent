@@ -190,8 +190,11 @@ export const INSIGHT_PRESET = {
         maxTokens: config?.maxTokens ?? 4096,
         temperature: config?.temperature ?? 0.3,
         timeoutMs: config?.timeoutMs ?? 3_600_000,
-        // Session token 限制由 BudgetController 统一管理
-        // (基于 computeAnalystBudget 动态计算，与 contextWindowBudget 对齐)
+        // 不在策略层设会话字段（maxSessionTokens / maxSessionInputTokens）：会话预算归阶段预算。
+        // analyze 阶段预算声明 maxSessionInputTokens（ANALYST_BUDGET 默认值，或 computeAnalystBudget
+        // 动态计算、与 contextWindowBudget 对齐）；BudgetController 按阶段内消耗执行，但只触发压缩，
+        // 不负责终止（终止靠 maxIterations / 超时），PipelineStrategy 的重试判定读同一口径。
+        // 阶段预算里的 maxSessionTokens 目前没有执行者（BudgetController 不消费），去留待事项②。
       }),
     (config?: PolicyFactoryConfig) =>
       new QualityGatePolicy({

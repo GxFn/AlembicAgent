@@ -1,5 +1,11 @@
 import { BudgetPolicy } from './BudgetPolicy.js';
-import type { Policy, PolicyContext, PolicyResult, StepState } from './Policy.js';
+import type {
+  Policy,
+  PolicyContext,
+  PolicyDuringDecision,
+  PolicyResult,
+  StepState,
+} from './Policy.js';
 import { SafetyPolicy } from './SafetyPolicy.js';
 
 export class PolicyEngine {
@@ -27,7 +33,12 @@ export class PolicyEngine {
     return { ok: true };
   }
 
-  validateDuring(stepState: StepState) {
+  /**
+   * 按注册顺序评估，首个拒绝即返回（拒绝里的结构化 code 原样透传）。
+   * 运行时若需要跳过某些可由阶段预算接管的 code 并继续评估后续策略，由 createExitController
+   * 基于 policies 逐条评估完成，不改变这里的短路语义。
+   */
+  validateDuring(stepState: StepState): PolicyDuringDecision {
     for (const policy of this.#policies) {
       const result = policy.validateDuring(stepState);
       if (!result.ok) {

@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { BudgetPolicy, type Policy, SafetyPolicy } from '../policies/index.js';
 import type {
   AgentActionSpace,
@@ -189,6 +190,7 @@ function compilePolicyDeclarations(policies: unknown[] | undefined) {
     }
     if (policy.type === 'budget') {
       const { type: _type, ...config } = policy;
+      warnPolicySessionFields(config);
       return new BudgetPolicy(config);
     }
     if (policy.type === 'safety') {
@@ -197,6 +199,34 @@ function compilePolicyDeclarations(policies: unknown[] | undefined) {
     }
     return policy as unknown as Policy;
   });
+}
+
+/** 策略层会话字段：会话预算归阶段预算 + BudgetController，这两个字段待公开面收窄（事项②）时删除。 */
+const POLICY_SESSION_FIELDS = ['maxSessionTokens', 'maxSessionInputTokens'] as const;
+
+/**
+ * 声明式 budget 策略带会话字段时编译期告警（I03）。字段与运行行为保持不变（删除属于事项②），
+ * 告警只让调用方看见口径差异：
+ *   - 两个字段都按整次运行累计判定，而 BudgetController 执行的阶段会话预算按阶段内消耗；
+ *   - maxSessionInputTokens 的拒绝在阶段预算未声明 maxSessionInputTokens 的循环里被屏蔽
+ *     （运行时写 policy_session_limit_bypassed 诊断）；
+ *   - BudgetController 不执行 maxSessionTokens，策略层配置时由 BudgetPolicy 照常按运行累计停止。
+ * 每个 budget 声明告警一次，不抛错、不改写配置。
+ */
+function warnPolicySessionFields(config: Record<string, unknown>) {
+  const present = POLICY_SESSION_FIELDS.filter((field) => config[field] !== undefined);
+  if (present.length === 0) {
+    return;
+  }
+  const declared = present.map((field) => `${field}=${String(config[field])}`).join(', ');
+  Logger.getInstance().warn(
+    `[AgentProfileCompiler] policy_session_fields_deprecated: budget policy declares ${declared}. ` +
+      'Session budgets belong to stage budgets executed by BudgetController (in-stage consumption); ' +
+      'policy-level session fields are checked against run-level cumulative usage and are scheduled for removal. ' +
+      'maxSessionInputTokens rejections are bypassed in loops whose stage budget declares no maxSessionInputTokens ' +
+      '(diagnostic policy_session_limit_bypassed); maxSessionTokens is not executed by BudgetController and stays ' +
+      'enforced by BudgetPolicy at run level until removal.'
+  );
 }
 
 function additionalToolsFromActionSpace(actionSpace: AgentActionSpace) {
