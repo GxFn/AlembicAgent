@@ -208,31 +208,80 @@ describe('policy public contracts', () => {
     expect(new SafetyPolicy().validateBefore({ message: { sender: { id: 'anyone' } } }).ok).toBe(
       true
     );
+    // 生产形状：terminal 只有 {action:'exec', params:{command}}；code 的路径已由 runtimeSafetyGate
+    // 按项目根解析成绝对路径；审批断言使用真实工具名。
     const engine = new PolicyEngine([
-      new SafetyPolicy({ fileScope: projectRoot, requireApprovalFor: ['write_project_file'] }),
+      new SafetyPolicy({ fileScope: projectRoot, requireApprovalFor: ['knowledge'] }),
     ]);
 
-    expect(engine.validateToolCall('terminal', { bin: 'sudo', args: ['whoami'] })).toMatchObject({
+    expect(
+      engine.validateToolCall('terminal', {
+        action: 'exec',
+        params: { command: 'sudo whoami' },
+      })
+    ).toMatchObject({
       ok: false,
       reason: expect.stringContaining('命令拦截'),
     });
     expect(
-      engine.validateToolCall('code', { params: { path: `${projectRoot}/src/index.ts` } })
+      engine.validateToolCall('code', {
+        action: 'read',
+        params: { path: `${projectRoot}/src/index.ts` },
+      })
     ).toEqual({ ok: true });
-    expect(engine.validateToolCall('code', { params: { path: '/tmp/outside.ts' } })).toMatchObject({
+    expect(
+      engine.validateToolCall('code', { action: 'read', params: { path: '/tmp/outside.ts' } })
+    ).toMatchObject({
       ok: false,
       reason: expect.stringContaining('路径拦截'),
     });
-    expect(engine.validateToolCall('code', { path: `${projectRoot}-other/file.ts` }).ok).toBe(
-      false
-    );
     expect(
       engine.validateToolCall('code', {
-        filePaths: [`${projectRoot}/safe.ts`, `${projectRoot}-other/file.ts`],
+        action: 'write',
+        params: { path: `${projectRoot}-other/file.ts`, content: 'x' },
       }).ok
     ).toBe(false);
     expect(
-      engine.validateToolCall('write_project_file', { filePath: `${projectRoot}/a.ts` })
+      engine.validateToolCall('code', {
+        action: 'read',
+        params: { filePaths: [`${projectRoot}/safe.ts`, `${projectRoot}-other/file.ts`] },
+      }).ok
+    ).toBe(false);
+    // code.structure 的 directory 与其它路径参数同等检查。
+    expect(
+      engine.validateToolCall('code', {
+        action: 'structure',
+        params: { directory: `${projectRoot}-other` },
+      })
+    ).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('SAFETY_FILE_SCOPE_PATH'),
+    });
+    expect(
+      engine.validateToolCall('code', {
+        action: 'structure',
+        params: { directory: `${projectRoot}/src` },
+      })
+    ).toEqual({ ok: true });
+    // code.search 的搜索根恒为项目根（由 runtimeSafetyGate 放进 params.directory）：
+    // 项目根不在 fileScope 内时带规则码拒绝，在 scope 内时放行。
+    expect(
+      engine.validateToolCall('code', {
+        action: 'search',
+        params: { patterns: ['token'], directory: '/tmp' },
+      })
+    ).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('SAFETY_FILE_SCOPE_SEARCH'),
+    });
+    expect(
+      engine.validateToolCall('code', {
+        action: 'search',
+        params: { patterns: ['token'], directory: projectRoot },
+      })
+    ).toEqual({ ok: true });
+    expect(
+      engine.validateToolCall('knowledge', { action: 'submit', params: { title: 'x' } })
     ).toMatchObject({
       ok: false,
       reason: expect.stringContaining('需要人工确认'),
@@ -256,13 +305,19 @@ describe('policy public contracts', () => {
       );
     }
     expect(pattern.lastIndex).toBe(3);
-    expect(engine.validateToolCall('meta', {}).ok).toBe(false);
-    expect(engine.validateToolCall('code', { path: `${projectRoot}-other/file.ts` }).ok).toBe(
-      false
-    );
-    expect(engine.validateToolCall('code', { path: `${projectRoot}/..notes/file.ts` }).ok).toBe(
-      true
-    );
+    expect(engine.validateToolCall('meta', { action: 'tools', params: {} }).ok).toBe(false);
+    expect(
+      engine.validateToolCall('code', {
+        action: 'read',
+        params: { path: `${projectRoot}-other/file.ts` },
+      }).ok
+    ).toBe(false);
+    expect(
+      engine.validateToolCall('code', {
+        action: 'read',
+        params: { path: `${projectRoot}/..notes/file.ts` },
+      }).ok
+    ).toBe(true);
   });
 
   it('keeps reasonless and empty-reply quality failures visible', () => {

@@ -83,57 +83,44 @@ export class PolicyEngine {
   }
 }
 
+/**
+ * code 工具里按文件系统路径解释的参数键（与 runtimeSafetyGate 解析的键一致）。
+ * handler 实际读取 path / filePaths / directory；filePath 不是 code handler 的参数，
+ * 但它表达的仍是路径，保留检查只会多拒绝、不会放过越界路径。
+ */
+const CODE_PATH_KEYS = ['path', 'filePath', 'directory'] as const;
+
+/**
+ * fileScope 拒绝原因里的规则码：只写进 reason 文本（不新增返回字段），
+ * 供日志检索与模型区分“路径越界”和“code.search 不可用”。
+ */
+const FILE_SCOPE_PATH_RULE = 'SAFETY_FILE_SCOPE_PATH';
+const FILE_SCOPE_SEARCH_RULE = 'SAFETY_FILE_SCOPE_SEARCH';
+
 function validateSafetyToolCall(
   safety: SafetyPolicy,
   toolName: string,
   args: Record<string, unknown>
 ) {
-  const terminalParams =
-    args?.params && typeof args.params === 'object'
-      ? (args.params as Record<string, unknown>)
-      : args;
-  const command =
-    typeof terminalParams.command === 'string'
-      ? terminalParams.command
-      : typeof args?.bin === 'string'
-        ? formatTerminalExecForSafetyPolicy(args)
-        : null;
-  if (toolName === 'terminal' && command !== null) {
-    const check = safety.checkCommand(command);
-    if (!check.safe) {
-      return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
+  if (toolName === 'terminal') {
+    // 生产 terminal 只有 {action:'exec', params:{command}}；没有 params 对象时按平铺参数保守检查。
+    // fileScope 不覆盖 terminal（见 SafetyPolicy 注释），这里只执行命令黑名单。
+    const terminalParams =
+      args?.params && typeof args.params === 'object'
+        ? (args.params as Record<string, unknown>)
+        : (args ?? {});
+    if (typeof terminalParams.command === 'string') {
+      const check = safety.checkCommand(terminalParams.command);
+      if (!check.safe) {
+        return { ok: false, reason: `[SafetyPolicy] 命令拦截: ${check.reason}` };
+      }
     }
   }
 
-  if (toolName === 'write_project_file' && args?.filePath) {
-    const check = safety.checkFilePath(args.filePath as string);
-    if (!check.safe) {
-      return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
-    }
-  }
-
-  const filePathsToCheck: string[] = [];
   if (toolName === 'code') {
-    const p = (args?.params || args) as Record<string, unknown>;
-    if (typeof p?.path === 'string') {
-      filePathsToCheck.push(p.path);
-    }
-    if (typeof p?.filePath === 'string') {
-      filePathsToCheck.push(p.filePath);
-    }
-    if (Array.isArray(p?.filePaths)) {
-      filePathsToCheck.push(
-        ...(p.filePaths as unknown[]).filter(
-          (filePath): filePath is string => typeof filePath === 'string'
-        )
-      );
-    }
-  }
-
-  for (const filePath of filePathsToCheck) {
-    const check = safety.checkFilePath(filePath);
-    if (!check.safe) {
-      return { ok: false, reason: `[SafetyPolicy] 路径拦截: ${check.reason}` };
+    const denial = checkCodeFileScope(safety, args ?? {});
+    if (denial) {
+      return denial;
     }
   }
 
@@ -144,9 +131,82 @@ function validateSafetyToolCall(
   return { ok: true };
 }
 
-function formatTerminalExecForSafetyPolicy(args: Record<string, unknown>) {
-  const commandArgs = Array.isArray(args.args)
-    ? args.args.filter((arg): arg is string => typeof arg === 'string')
-    : [];
-  return [args.bin as string, ...commandArgs].join(' ');
+/**
+ * code 工具的 fileScope 检查（L5-P18 / I17）。
+ *
+ * 路径约定：调用方先把路径类参数按项目根解析成绝对路径（生产由 runtimeSafetyGate 完成，并把
+ * structure 的缺省目录和 search 的搜索根写进 params.directory）；直接调用本引擎时，相对路径按
+ * 进程 cwd 解析，与 SafetyPolicy.checkFilePath 一致。
+ *
+ * 等价写法全部检查：args.params（router 实际交给 handler 的参数）与顶层平铺键（router 会丢弃，
+ * 但任一处越界都拒绝），path / filePath / directory 以及 filePaths 的每一项。
+ */
+function checkCodeFileScope(
+  safety: SafetyPolicy,
+  args: Record<string, unknown>
+): { ok: boolean; reason: string } | null {
+  const params = isPlainRecord(args.params) ? args.params : {};
+  const action = String(args.action ?? params.action ?? params.operation ?? '');
+  const handlerDirectory = nonEmptyString(params.directory);
+
+  if (action === 'search') {
+    // code.search 没有路径参数，handler 恒以项目根为搜索根。按 L5-P18 决策：项目根不在 fileScope
+    // 内（fileScope 窄于项目根）时直接拒绝，不收窄搜索根；模型给的 directory/glob 不改变搜索根，
+    // 生产路径上 params.directory 由 runtimeSafetyGate 覆盖为项目根。
+    const searchRoot = handlerDirectory ?? '.';
+    const check = safety.checkFilePath(searchRoot);
+    if (!check.safe) {
+      return {
+        ok: false,
+        reason:
+          `[SafetyPolicy] 搜索拦截 [${FILE_SCOPE_SEARCH_RULE}]: code.search 只能从项目根 "${searchRoot}" 开始搜索，` +
+          `fileScope 窄于项目根时不可用（${check.reason}）；请改用 code.structure / code.read 访问 fileScope 内的路径`,
+      };
+    }
+  }
+
+  const candidates = [...collectCodePaths(params, 'params.'), ...collectCodePaths(args, '')];
+  if (action === 'structure' && handlerDirectory === null) {
+    // handler 对缺省或空串 directory 列出项目根（'.'），缺省值同样要在 scope 内。
+    candidates.push({ param: 'params.directory (default ".")', value: '.' });
+  }
+  for (const candidate of candidates) {
+    const check = safety.checkFilePath(candidate.value);
+    if (!check.safe) {
+      return {
+        ok: false,
+        reason: `[SafetyPolicy] 路径拦截 [${FILE_SCOPE_PATH_RULE}]: ${candidate.param}: ${check.reason}`,
+      };
+    }
+  }
+  return null;
+}
+
+function collectCodePaths(
+  source: Record<string, unknown>,
+  prefix: string
+): Array<{ param: string; value: string }> {
+  const found: Array<{ param: string; value: string }> = [];
+  for (const key of CODE_PATH_KEYS) {
+    const value = source[key];
+    if (typeof value === 'string') {
+      found.push({ param: `${prefix}${key}`, value });
+    }
+  }
+  if (Array.isArray(source.filePaths)) {
+    source.filePaths.forEach((filePath: unknown, index: number) => {
+      if (typeof filePath === 'string') {
+        found.push({ param: `${prefix}filePaths[${index}]`, value: filePath });
+      }
+    });
+  }
+  return found;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }

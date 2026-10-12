@@ -30,6 +30,11 @@ const TOOL_ARGS_TOO_LARGE_CODE = 'TOOL_ARGS_TOO_LARGE';
 
 const TOOL_PARAMETER_DENIED_CODE = 'TOOL_PARAMETER_DENIED';
 
+const TOOL_POLICY_DENIED_CODE = 'TOOL_POLICY_DENIED';
+
+/** code 工具里按文件系统路径解释的参数键；与 PolicyEngine 的 fileScope 检查收集的键一致。 */
+const CODE_PATH_KEYS = ['path', 'filePath', 'directory'] as const;
+
 /** 诊断里序列化错误原文的展示上限。 */
 const MAX_SERIALIZATION_ERROR_CHARS = 200;
 
@@ -166,27 +171,27 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
   before(call, ctx) {
     const executable = toExecutableToolCall(call);
     const params = getToolParams(executable);
-    const policyParams = { ...params };
-    if (executable.name === 'code' && ctx.runtime.projectRoot) {
-      for (const key of ['path', 'filePath']) {
-        if (typeof policyParams[key] === 'string') {
-          policyParams[key] = path.resolve(ctx.runtime.projectRoot, policyParams[key]);
-        }
-      }
-      if (Array.isArray(policyParams.filePaths)) {
-        policyParams.filePaths = policyParams.filePaths.map((file) =>
-          typeof file === 'string' ? path.resolve(ctx.runtime.projectRoot, file) : file
-        );
-      }
-    }
-    const policy = ctx.runtime.policies.validateToolCall?.(executable.name, {
-      ...executable.args,
-      params: policyParams,
-    });
+    const action = getToolAction(executable);
+    const policy = ctx.runtime.policies.validateToolCall?.(
+      executable.name,
+      buildPolicyArgs(executable, params, action, ctx.runtime.projectRoot)
+    );
     if (policy && !policy.ok) {
+      // 运行时策略拒绝发生在宿主调度之前：日志与诊断记下工具、动作和策略原因（SafetyPolicy 的
+      // 原因带规则码，如 SAFETY_FILE_SCOPE_PATH / SAFETY_FILE_SCOPE_SEARCH），端口零调用。
+      const reason = policy.reason || 'Tool call denied by runtime policy';
+      const label = `${executable.name}.${action || '(no action)'}`;
+      ctx.runtime.logger?.warn(
+        `[ToolPipeline] ⛔ ${label} denied by runtime policy — blocked before host dispatch: ${reason}`
+      );
+      ctx.loopCtx.diagnostics?.warn({
+        code: TOOL_POLICY_DENIED_CODE,
+        tool: executable.name,
+        message: `Runtime policy denied ${label} before host dispatch: ${reason}`,
+      });
       return {
         blocked: true,
-        result: { error: policy.reason || 'Tool call denied by runtime policy' },
+        result: { error: reason },
       };
     }
     if (executable.name === 'terminal' && typeof params.command === 'string') {
@@ -205,7 +210,6 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
     // router.explain 的同一检查覆盖不到生产路径，所以这里按 loopCtx.capabilities 的能力名再执行
     // 一次内部常量表（evolution_analysis 的 knowledge.manage 只开放 evolve/deprecate/skip_evolution）。
     // 拒绝发生在宿主调度之前：端口零调用，并留下含 capability/operation/id 的日志与诊断。
-    const action = getToolAction(executable);
     for (const capability of ctx.loopCtx.capabilities ?? []) {
       const capabilityName = (capability as { name?: unknown }).name;
       if (typeof capabilityName !== 'string') {
@@ -240,6 +244,70 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
     return undefined;
   },
 };
+
+/**
+ * 组装交给运行时策略（PolicyEngine.validateToolCall）的参数（L5-P18 / I17）。
+ *
+ * 非 code 工具保持原样：params 取 getToolParams 视角。
+ *
+ * code 工具按 handler 真正会访问的路径构造：
+ * - router.parseToolCall 只把 args.params（缺省 {}）交给 handler，平铺在顶层的键到不了 handler，
+ *   所以 params 只取 args.params 对象；顶层平铺的路径键也按项目根解析后保留，策略层两处都检查，
+ *   任一写法越界都拒绝（只会多拒绝，不会放过）。
+ * - path / filePath / directory / filePaths 按 projectRoot 解析；`..`、`./`、尾斜杠、绝对路径都在
+ *   这里规范成同一个绝对路径，再由 SafetyPolicy 做包含判断。
+ * - code.structure 的 directory 缺省或为空串时 handler 列出项目根，这里把项目根写进 directory。
+ * - code.search 没有路径参数，handler 恒以项目根为搜索根：directory 一律覆盖为项目根，模型自带的
+ *   directory 不能把搜索根“说”进 fileScope。
+ * 没有 projectRoot 时不做解析，缺省目录写成 '.'，由策略按进程 cwd 解析（与直接调用引擎一致）。
+ */
+function buildPolicyArgs(
+  executable: ToolCall,
+  params: Record<string, unknown>,
+  action: string,
+  projectRoot: string | undefined
+): Record<string, unknown> {
+  if (executable.name !== 'code') {
+    return { ...executable.args, params: { ...params } };
+  }
+  const rawParams = executable.args.params;
+  const handlerParams: Record<string, unknown> =
+    rawParams !== null && typeof rawParams === 'object' && !Array.isArray(rawParams)
+      ? { ...(rawParams as Record<string, unknown>) }
+      : {};
+  const policyParams = resolveCodePathParams(handlerParams, projectRoot);
+  const root = projectRoot ? path.resolve(projectRoot) : '.';
+  const directory = handlerParams.directory;
+  if (action === 'structure' && (typeof directory !== 'string' || directory.length === 0)) {
+    policyParams.directory = root;
+  }
+  if (action === 'search') {
+    policyParams.directory = root;
+  }
+  return { ...resolveCodePathParams(executable.args, projectRoot), params: policyParams };
+}
+
+function resolveCodePathParams(
+  source: Record<string, unknown>,
+  projectRoot: string | undefined
+): Record<string, unknown> {
+  const resolved = { ...source };
+  if (!projectRoot) {
+    return resolved;
+  }
+  for (const key of CODE_PATH_KEYS) {
+    const value = resolved[key];
+    if (typeof value === 'string') {
+      resolved[key] = path.resolve(projectRoot, value);
+    }
+  }
+  if (Array.isArray(resolved.filePaths)) {
+    resolved.filePaths = resolved.filePaths.map((file: unknown) =>
+      typeof file === 'string' ? path.resolve(projectRoot, file) : file
+    );
+  }
+  return resolved;
+}
 
 function isActionAllowed(loopCtx: ToolLoopPort, toolName: string, actionName: string): boolean {
   const allowedNames = new Set(loopCtx?.allowedToolIds || []);
