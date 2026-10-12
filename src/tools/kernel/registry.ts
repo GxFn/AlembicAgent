@@ -6,6 +6,7 @@
  * implementation module.
  */
 
+import { estimateTokens as estimateSharedTokens } from '#shared/tokenUtils.js';
 import type { ToolAvailabilitySnapshot } from './availability.js';
 import type { ToolRuntimeCallContext } from './context.js';
 import type { KnowledgeManagementPort, KnowledgeReadPort } from './knowledge.js';
@@ -352,7 +353,14 @@ export function fail(error: string): ToolResult {
   return { ok: false, data: null, error };
 }
 
-/** 简易 token 估算（1 token ≈ 4 chars） */
+/**
+ * 工具层 token 估算，委托 shared/tokenUtils 的共同口径：按 Unicode 字符计，首个 UTF-16 码元
+ * 高于 U+2E80 的字符（CJK、emoji 等）每字 0.5，其余每字 0.25，合计向上取整。
+ *
+ * 曾按 len/4 估算，对中文低估约一倍：maxOutputTokens 的实际放行量变成声明值的两倍，
+ * _meta.tokensEstimate 也与记忆层、上下文预算的估算对不上。这里保留函数导出（名与种类不变），
+ * Router 截断、handler 的 tokensEstimate 和记忆层由此使用同一把尺子。
+ */
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  return estimateSharedTokens(text);
 }

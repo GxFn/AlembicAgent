@@ -6,6 +6,8 @@
  * 流程: 参数解析 → Schema 校验 → Capability 权限检查 → 并发控制 → Handler 分发 → 输出截断
  */
 
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type {
   ToolAvailabilityContext,
   ToolAvailabilitySnapshot,
@@ -278,7 +280,7 @@ export class ToolRouter {
         }
 
         if (action.maxOutputTokens && result.ok) {
-          enforceOutputLimit(result, action.maxOutputTokens);
+          enforceOutputLimit(result, action.maxOutputTokens, `${call.tool}.${call.action}`);
         }
 
         return result;
@@ -461,22 +463,124 @@ function isParamObject(value: unknown): value is Record<string, unknown> {
 /*  输出 token 截断 — 按 action.maxOutputTokens 强制执行                */
 /* ------------------------------------------------------------------ */
 
-function enforceOutputLimit(result: ToolResult, maxTokens: number): void {
+/**
+ * 头尾保留比例沿用原实现：头部 80%、尾部 15%，其余 5% 原本就是给截断说明的余量。
+ * ASCII 在新旧口径下都是每字 0.25 token，所以常规上限下 ASCII 输出的截断位置保持不变；
+ * 统一口径后只有 CJK、emoji 等字符的输出会截得更短，这正是 maxOutputTokens 的字面含义。
+ */
+const OUTPUT_HEAD_RATIO = 0.8;
+const OUTPUT_TAIL_RATIO = 0.15;
+/** shared 口径下每个字符至少 0.25 token：预算 B 内最多容纳 4B 个字符，用来收窄二分上界。 */
+const MAX_CHARS_PER_TOKEN = 4;
+
+/**
+ * 截断说明的固定格式。ActiveContext 与 EvidenceCollector 用正则识别这段说明来判断输出被
+ * 路由层截断，格式变更必须同步两处；省略数按 Unicode 字符计。
+ */
+function truncationNotice(omittedChars: number, maxTokens: number): string {
+  return `\n\n... [${omittedChars} chars truncated, exceeded ${maxTokens} token limit] ...\n\n`;
+}
+
+/**
+ * 按 shared token 口径（经 kernel estimateTokens 委托）把字符串结果裁到 maxTokens 以内。
+ *
+ * - 按 Array.from 的 Unicode 字符切分头尾，边界不会落在 UTF-16 代理对中间；
+ * - 截断说明自身计入预算：头 + 说明 + 尾的估算不超过 maxTokens（估算向上取整满足次可加性，
+ *   各段预算之和不超限即整体不超限）；
+ * - 说明本身就超过上限时（只会出现在配置了极小 maxOutputTokens 的 action 上）不再附带原文，
+ *   只保留说明，让下游仍能识别截断，并经 Logger.warn 报告该降级。
+ * 非字符串结果（如 code.search 的结构化 matches）由 handler 自行按同一口径投影，这里不处理。
+ */
+function enforceOutputLimit(result: ToolResult, maxTokens: number, toolLabel: string): void {
   if (typeof result.data !== 'string') {
     return;
   }
-  const tokens = estimateTokens(result.data);
-  if (tokens <= maxTokens) {
+  const text = result.data;
+  const originalTokens = estimateTokens(text);
+  if (originalTokens <= maxTokens) {
     return;
   }
-  const maxChars = maxTokens * 4;
-  const headChars = Math.floor(maxChars * 0.8);
-  const tailChars = Math.floor(maxChars * 0.15);
-  const head = result.data.slice(0, headChars);
-  const tail = result.data.slice(-tailChars);
-  const omitted = result.data.length - headChars - tailChars;
-  result.data = `${head}\n\n... [${omitted} chars truncated, exceeded ${maxTokens} token limit] ...\n\n${tail}`;
+  const chars = Array.from(text);
+  // 说明里的省略数用全文字符数作上界预留：实际省略数的位数只会更少，预留的 token 一定够用。
+  const noticeTokens = estimateTokens(truncationNotice(chars.length, maxTokens));
+  const contentBudget = Math.max(0, maxTokens - noticeTokens);
+  // 常规上限下 5% 余量足以容纳说明；上限很小时先保头部，再把剩余预算给尾部。
+  const headBudget = Math.min(Math.floor(maxTokens * OUTPUT_HEAD_RATIO), contentBudget);
+  const tailBudget = Math.min(
+    Math.floor(maxTokens * OUTPUT_TAIL_RATIO),
+    contentBudget - headBudget
+  );
+  const headCount = countCharsWithinBudget(chars, headBudget, 'head');
+  const tailCount = countCharsWithinBudget(chars, tailBudget, 'tail');
+  // 头尾预算之和不超过 maxTokens，而全文估算超过它，所以头尾不会重叠，省略数至少为 1。
+  const omittedChars = chars.length - headCount - tailCount;
+  const head = chars.slice(0, headCount).join('');
+  const tail = chars.slice(chars.length - tailCount).join('');
+  const truncated = `${head}${truncationNotice(omittedChars, maxTokens)}${tail}`;
+  result.data = truncated;
+  const finalTokens = estimateTokens(truncated);
   if (result._meta) {
-    result._meta.tokensEstimate = estimateTokens(result.data as string);
+    result._meta.tokensEstimate = finalTokens;
   }
+  // 只有说明本身超限时结果才会仍超过 maxTokens（见上方预算推导），据此区分常规截断与降级。
+  reportOutputTruncation(finalTokens > maxTokens ? 'warn' : 'debug', {
+    toolLabel,
+    maxTokens,
+    originalTokens,
+    finalTokens,
+    headCount,
+    tailCount,
+    omittedChars,
+  });
+}
+
+/** 二分求在 budget 内能保留的最多字符数；estimateTokens 随字符数单调不减，二分结果即最大值。 */
+function countCharsWithinBudget(
+  chars: readonly string[],
+  budget: number,
+  side: 'head' | 'tail'
+): number {
+  let low = 0;
+  let high = Math.min(chars.length, budget * MAX_CHARS_PER_TOKEN);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const slice = side === 'head' ? chars.slice(0, mid) : chars.slice(chars.length - mid);
+    if (estimateTokens(slice.join('')) <= budget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low;
+}
+
+/**
+ * 截断诊断只记录计数，不写入输出原文（可能含源码、命令输出或凭据）。常规截断记 debug；
+ * 说明本身超过上限属于配置降级，记 warn（reason=notice_exceeds_limit），结果仍超过 maxTokens。
+ * 经 observeSafely 隔离日志异常，诊断失败不能把一次成功的工具调用变成失败。
+ */
+function reportOutputTruncation(
+  level: 'debug' | 'warn',
+  facts: {
+    toolLabel: string;
+    maxTokens: number;
+    originalTokens: number;
+    finalTokens: number;
+    headCount: number;
+    tailCount: number;
+    omittedChars: number;
+  }
+): void {
+  const reason = level === 'warn' ? 'notice_exceeds_limit' : 'output_exceeds_limit';
+  const path = level === 'warn' ? 'notice_only' : 'head_tail';
+  const message =
+    `[ToolRouter] tool=${facts.toolLabel}; output_truncated reason=${reason} path=${path} ` +
+    `maxOutputTokens=${facts.maxTokens} originalTokens=${facts.originalTokens} ` +
+    `finalTokens=${facts.finalTokens} keptHeadChars=${facts.headCount} ` +
+    `keptTailChars=${facts.tailCount} omittedChars=${facts.omittedChars}`;
+  observeSafely(
+    () =>
+      level === 'warn' ? Logger.getInstance().warn(message) : Logger.getInstance().debug(message),
+    () => undefined
+  );
 }

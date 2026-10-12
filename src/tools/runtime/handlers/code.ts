@@ -1566,27 +1566,121 @@ function resolveProjectFilePath(
   }
 }
 
+/** batch 单文件截断的头尾比例沿用原实现：头部 80%、尾部 15%，截断说明从剩余预算里扣。 */
+const BATCH_CLAMP_HEAD_RATIO = 0.8;
+const BATCH_CLAMP_TAIL_RATIO = 0.15;
+/** shared 口径下每个字符至少 0.25 token：预算 B 内最多容纳 4B 个字符，用来收窄二分上界。 */
+const BATCH_CLAMP_MAX_CHARS_PER_TOKEN = 4;
+
+/**
+ * batch 单文件截断说明的固定格式。EvidenceCollector 的 READ_CLAMP_MARKER_RE 用 `\d+` 识别它，
+ * 省略数必须是非负整数（按 Unicode 字符计），格式变更必须同步采集端。
+ */
+function batchReadClampNotice(omittedChars: number): string {
+  return `\n\n... [${omittedChars} chars truncated for batch read budget] ...\n\n`;
+}
+
+/**
+ * 按 shared token 口径（kernel estimateTokens 委托 shared/tokenUtils）把单文件展示内容裁到
+ * 单文件预算以内，与 Router 的 maxOutputTokens 截断同一把尺子。
+ *
+ * - 是否截断按展示内容本身的估算判断：除 unchanged 占位外 tokensEstimate 就是该估算，
+ *   以内容为准才能保证下面的不重叠推导成立；
+ * - 头尾按 Array.from 的 Unicode 字符切分，边界不会落在 UTF-16 代理对中间；
+ * - 截断说明计入预算：头、说明、尾各自的估算之和不超过 tokenBudget（向上取整满足次可加性）；
+ * - 头尾预算之和不超过 tokenBudget，而全文估算超过它，所以头尾不会重叠，省略数至少为 1。
+ *   旧实现按 4 码元/token 切头尾，CJK 文件在 2B~3.8B 字符区间会重叠并写出负省略数。
+ */
 function clampReadResult(
   result: ReadSingleSuccess,
   tokenBudget: number
 ): ReadSingleSuccess & { truncated?: boolean; originalTokensEstimate?: number } {
-  if (result.tokensEstimate <= tokenBudget) {
+  const contentTokens = estimateTokens(result.content);
+  if (contentTokens <= tokenBudget) {
     return result;
   }
-  const maxChars = tokenBudget * 4;
-  const headChars = Math.floor(maxChars * 0.8);
-  const tailChars = Math.floor(maxChars * 0.15);
-  const head = result.content.slice(0, headChars);
-  const tail = result.content.slice(-tailChars);
-  const omitted = result.content.length - headChars - tailChars;
-  const content = `${head}\n\n... [${omitted} chars truncated for batch read budget] ...\n\n${tail}`;
+  const chars = Array.from(result.content);
+  // 说明里的省略数以全文字符数作上界预留：实际省略数位数只会更少，预留的 token 一定够用。
+  const noticeTokens = estimateTokens(batchReadClampNotice(chars.length));
+  const contentBudget = Math.max(0, tokenBudget - noticeTokens);
+  const headBudget = Math.min(Math.floor(tokenBudget * BATCH_CLAMP_HEAD_RATIO), contentBudget);
+  const tailBudget = Math.min(
+    Math.floor(tokenBudget * BATCH_CLAMP_TAIL_RATIO),
+    contentBudget - headBudget
+  );
+  const headCount = countClampCharsWithinBudget(chars, headBudget, 'head');
+  const tailCount = countClampCharsWithinBudget(chars, tailBudget, 'tail');
+  const omittedChars = chars.length - headCount - tailCount;
+  const head = chars.slice(0, headCount).join('');
+  const tail = chars.slice(chars.length - tailCount).join('');
+  const content = `${head}${batchReadClampNotice(omittedChars)}${tail}`;
+  const tokensEstimate = estimateTokens(content);
+  reportBatchReadClamp(tokensEstimate > tokenBudget ? 'warn' : 'debug', {
+    path: result.path,
+    tokenBudget,
+    originalTokens: contentTokens,
+    finalTokens: tokensEstimate,
+    headCount,
+    tailCount,
+    omittedChars,
+  });
   return {
     ...result,
     content,
-    tokensEstimate: estimateTokens(content),
+    tokensEstimate,
     truncated: true,
     originalTokensEstimate: result.tokensEstimate,
   };
+}
+
+/** 二分求 budget 内能保留的最多字符数；estimateTokens 随字符数单调不减，二分结果即最大值。 */
+function countClampCharsWithinBudget(
+  chars: readonly string[],
+  budget: number,
+  side: 'head' | 'tail'
+): number {
+  let low = 0;
+  let high = Math.min(chars.length, budget * BATCH_CLAMP_MAX_CHARS_PER_TOKEN);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const slice = side === 'head' ? chars.slice(0, mid) : chars.slice(chars.length - mid);
+    if (estimateTokens(slice.join('')) <= budget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low;
+}
+
+/**
+ * batch 单文件截断诊断：只记录项目相对路径与计数，不写入文件原文。常规截断记 debug；
+ * 说明本身超过单文件预算（只可能出现在极小预算上，当前单文件预算下限 200）属于降级，记 warn，
+ * 此时结果只含说明、仍超过预算。经 observeSafely 隔离日志异常，诊断失败不影响读取结果。
+ */
+function reportBatchReadClamp(
+  level: 'debug' | 'warn',
+  facts: {
+    path: string;
+    tokenBudget: number;
+    originalTokens: number;
+    finalTokens: number;
+    headCount: number;
+    tailCount: number;
+    omittedChars: number;
+  }
+): void {
+  const reason = level === 'warn' ? 'notice_exceeds_budget' : 'per_file_budget';
+  const message =
+    `[code.read] path=${facts.path}; batch_clamp reason=${reason} ` +
+    `perFileTokenBudget=${facts.tokenBudget} originalTokens=${facts.originalTokens} ` +
+    `finalTokens=${facts.finalTokens} keptHeadChars=${facts.headCount} ` +
+    `keptTailChars=${facts.tailCount} omittedChars=${facts.omittedChars}`;
+  observeSafely(
+    () =>
+      level === 'warn' ? Logger.getInstance().warn(message) : Logger.getInstance().debug(message),
+    () => undefined
+  );
 }
 
 async function collectFiles(cwd: string, glob?: string, signal?: AbortSignal): Promise<string[]> {

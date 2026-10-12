@@ -13,14 +13,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { EvidenceCollector } from '../src/agent/evidence/EvidenceCollector.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
 import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
   Evolution,
+  estimateTokens as estimateToolTokens,
+  ok as okToolResult,
   SearchCache,
   ToolRouter,
   ToolRouterAdapter,
@@ -1623,5 +1627,310 @@ describe('L4-P13 code.search multi-pattern completeness and count semantics', ()
     expect(warning?.message).toContain('"never-run"');
     expect(warning?.message).toContain('"never-run-either"');
     expect(set).not.toHaveBeenCalled();
+  });
+});
+
+// ─── L3-P12 工具输出 token 上限统一为 shared 口径 ─────────────────────────────────
+// 来源：module-review-2026-10-01 L3-C12（U09-F4）。kernel 的 estimateTokens 曾按 len/4 估算，
+// 对 CJK 低估约一倍：maxOutputTokens=3000 的 action 能放过约 12000 个汉字（shared 口径约 6000
+// token），_meta.tokensEstimate 与记忆层估算也对不上。Router 截断又按 UTF-16 码元切分，可能切断
+// 代理对，截断说明本身也没有计入预算。这里经真实 ToolRouter.execute 钉住宿主可见行为：
+// handler 用 spy 替身返回构造好的文本，只验证路由层的输出上限，不触达文件系统。
+describe('L3-P12 tool output limit uses the shared token estimate', () => {
+  /** Router 截断说明的固定格式；ActiveContext/EvidenceCollector 依赖同一格式识别截断。 */
+  const NOTICE = /\n\n\.\.\. \[(\d+) chars truncated, exceeded (\d+) token limit\] \.\.\.\n\n/;
+  /** 非 u 模式按码元匹配：未配对的高位或低位代理即为被切断的字符。 */
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function runSearchWithOutput(text: string) {
+    vi.spyOn(TOOL_REGISTRY.code.actions.search, 'handler').mockResolvedValue(
+      okToolResult(text, { tokensEstimate: estimateToolTokens(text) })
+    );
+    return new ToolRouter().execute(
+      { tool: 'code', action: 'search', params: { patterns: ['fixture'] } },
+      baseToolContext()
+    );
+  }
+
+  /** 拆出截断结果的头、尾和说明，并断言头尾分别是原文按字符的前缀与后缀。 */
+  function splitTruncated(original: string, data: unknown) {
+    expect(typeof data).toBe('string');
+    const output = String(data);
+    const match = NOTICE.exec(output);
+    expect(match, 'router truncation notice').not.toBeNull();
+    const notice = match?.[0] ?? '';
+    const head = output.slice(0, match?.index ?? 0);
+    const tail = output.slice((match?.index ?? 0) + notice.length);
+    expect(original.startsWith(head)).toBe(true);
+    expect(original.endsWith(tail)).toBe(true);
+    const totalChars = Array.from(original).length;
+    const keptChars = Array.from(head).length + Array.from(tail).length;
+    return {
+      output,
+      head,
+      tail,
+      omitted: Number(match?.[1]),
+      limit: Number(match?.[2]),
+      totalChars,
+      keptChars,
+    };
+  }
+
+  it('estimates tool tokens with the shared CJK-aware rule', () => {
+    const samples = [
+      '',
+      'plain ascii output',
+      '汉'.repeat(12000),
+      `mixed 中文 output ${'😀'.repeat(3)}`,
+    ];
+    for (const sample of samples) {
+      expect(estimateToolTokens(sample), JSON.stringify(sample.slice(0, 20))).toBe(
+        estimateSharedTokens(sample)
+      );
+    }
+    expect(estimateToolTokens('汉'.repeat(12000))).toBe(6000);
+  });
+
+  it('truncates 12000 Chinese characters under code.search maxOutputTokens=3000', async () => {
+    expect(TOOL_REGISTRY.code.actions.search.maxOutputTokens).toBe(3000);
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    const text = '汉'.repeat(12000);
+    const result = await runSearchWithOutput(text);
+    expect(result.ok).toBe(true);
+    const parts = splitTruncated(text, result.data);
+    expect(parts.limit).toBe(3000);
+    expect(parts.head.length).toBeGreaterThan(0);
+    expect(parts.tail.length).toBeGreaterThan(0);
+    expect(parts.omitted).toBe(parts.totalChars - parts.keptChars);
+    expect(estimateSharedTokens(parts.output)).toBeLessThanOrEqual(3000);
+    expect(result._meta?.tokensEstimate).toBe(estimateSharedTokens(parts.output));
+    // 常规截断留 debug 诊断：只含计数，不含输出原文。
+    const messages = debug.mock.calls
+      .map((call) => String(call[0]))
+      .filter((message) => message.includes('[ToolRouter]'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('tool=code.search');
+    expect(messages[0]).toContain('reason=output_exceeds_limit');
+    expect(messages[0]).toContain('originalTokens=6000');
+    expect(messages[0]).toContain(`omittedChars=${parts.omitted}`);
+    expect(messages[0]).not.toContain('汉');
+  });
+
+  it('never cuts a surrogate pair when an emoji-ending output is truncated', async () => {
+    // 单个 ASCII 前缀让 emoji 代理对从奇数码元位置开始，按码元切头部必然留下孤立高位代理。
+    const text = `a${'😀'.repeat(8000)}`;
+    const result = await runSearchWithOutput(text);
+    const parts = splitTruncated(text, result.data);
+    expect(LONE_SURROGATE.test(parts.output)).toBe(false);
+    expect(parts.output.endsWith('😀')).toBe(true);
+    expect(parts.omitted).toBe(parts.totalChars - parts.keptChars);
+    expect(estimateSharedTokens(parts.output)).toBeLessThanOrEqual(3000);
+    expect(result._meta?.tokensEstimate).toBe(estimateSharedTokens(parts.output));
+  });
+
+  it('counts the truncation notice inside a small maxOutputTokens budget', async () => {
+    const action = TOOL_REGISTRY.code.actions.search;
+    const original = action.maxOutputTokens;
+    try {
+      // 100 token 时原先 80%/15% 头尾之外的 5% 余量装不下截断说明，说明必须从头尾预算里扣除。
+      action.maxOutputTokens = 100;
+      const text = 'x'.repeat(1000);
+      const result = await runSearchWithOutput(text);
+      const parts = splitTruncated(text, result.data);
+      expect(parts.limit).toBe(100);
+      expect(parts.head.length).toBeGreaterThan(0);
+      expect(parts.omitted).toBe(parts.totalChars - parts.keptChars);
+      expect(estimateSharedTokens(parts.output)).toBeLessThanOrEqual(100);
+    } finally {
+      action.maxOutputTokens = original;
+    }
+  });
+
+  it('keeps the existing head and tail positions for ASCII output', async () => {
+    // ASCII 在两种口径下都是每字 0.25 token；统一口径只应让 CJK 输出变短，ASCII 截断位置不变。
+    const text = Array.from({ length: 20000 }, (_, index) =>
+      String.fromCharCode(97 + (index % 26))
+    ).join('');
+    const result = await runSearchWithOutput(text);
+    const parts = splitTruncated(text, result.data);
+    expect(parts.head).toBe(text.slice(0, 9600));
+    expect(parts.tail).toBe(text.slice(-1800));
+    expect(parts.omitted).toBe(8600);
+    expect(estimateSharedTokens(parts.output)).toBeLessThanOrEqual(3000);
+  });
+
+  it('reports a warning when the notice alone exceeds the configured limit', async () => {
+    const action = TOOL_REGISTRY.code.actions.search;
+    const original = action.maxOutputTokens;
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      action.maxOutputTokens = 5;
+      const text = 'y'.repeat(400);
+      const result = await runSearchWithOutput(text);
+      const parts = splitTruncated(text, result.data);
+      // 说明本身已超限：不再附带任何原文片段，只留可被下游识别的截断说明。
+      expect(parts.head).toBe('');
+      expect(parts.tail).toBe('');
+      expect(parts.omitted).toBe(400);
+      expect(result._meta?.tokensEstimate).toBe(estimateSharedTokens(parts.output));
+      const messages = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('[ToolRouter]'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain('tool=code.search');
+      expect(messages[0]).toContain('reason=notice_exceeds_limit');
+      expect(messages[0]).toContain('maxOutputTokens=5');
+      expect(messages[0]).not.toContain('yyyy');
+    } finally {
+      action.maxOutputTokens = original;
+    }
+  });
+});
+
+// ─── L3-P12 返工：batch code.read 单文件截断与 shared 口径对齐 ─────────────────────────
+// 复查阻塞（L3-C12 返工）：kernel estimateTokens 改为 shared 口径后，clampReadResult 仍按
+// 4 字符/token 的 UTF-16 码元切头尾。CJK 文件字符数落在单文件预算 B 的 2B~3.8B 之间时，shared
+// 估算超过 B 触发截断，但 floor(3.2B) + floor(0.6B) 码元的头尾超过全文而重叠：省略数为负
+// （EvidenceCollector 的 \d+ 标记正则不匹配）、内容反而变长并重复尾部。这里经真实
+// ToolRouter.execute + 磁盘夹具钉住：头尾按 Unicode 字符互不重叠、省略数 ≥ 1、说明计入预算、
+// 不切断代理对，且证据采集仍只取逐字前缀。
+describe('L3-P12 batch code.read clamp uses the shared token estimate', () => {
+  /** batch clamp 说明的固定格式；EvidenceCollector 的 READ_CLAMP_MARKER_RE 依赖它识别截断。 */
+  const BATCH_NOTICE = /\n\n\.\.\. \[(\d+) chars truncated for batch read budget\] \.\.\.\n\n/;
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  interface BatchFile {
+    ok: boolean;
+    path: string;
+    content?: string;
+    tokensEstimate?: number;
+    truncated?: boolean;
+    originalTokensEstimate?: number;
+  }
+  interface BatchData {
+    mode: 'batch';
+    files: BatchFile[];
+    summary: { perFileTokenBudget: number };
+  }
+
+  /** 两文件 batch：tokenBudget=5000 → 单文件预算 floor((5000-250)/2)=2375。 */
+  async function batchRead(name: string, source: string) {
+    const root = await mkdtemp(join(baseRoot, `l3p12-batch-${name}-`));
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src/big.ts'), source);
+    await writeFile(join(root, 'src/small.ts'), 'export const small = 1;\n');
+    const result = await new ToolRouter().execute(
+      { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts', 'src/small.ts'] } },
+      { projectRoot: root, tokenBudget: 5000 }
+    );
+    expect(result.ok).toBe(true);
+    const data = result.data as BatchData;
+    const big = data.files.find((file) => file.path === 'src/big.ts');
+    expect(big?.ok).toBe(true);
+    return { result, data, big: big as BatchFile };
+  }
+
+  /** code.read 全文模式的展示态：每行带 `N|` 行号前缀。 */
+  function numbered(source: string): string {
+    return source
+      .split('\n')
+      .map((line, index) => `${index + 1}|${line}`)
+      .join('\n');
+  }
+
+  function splitClamped(original: string, content: string) {
+    const match = BATCH_NOTICE.exec(content);
+    expect(match, 'batch clamp notice with a non-negative omitted count').not.toBeNull();
+    const head = content.slice(0, match?.index ?? 0);
+    const tail = content.slice((match?.index ?? 0) + (match?.[0].length ?? 0));
+    expect(original.startsWith(head)).toBe(true);
+    expect(original.endsWith(tail)).toBe(true);
+    const totalChars = Array.from(original).length;
+    const keptChars = Array.from(head).length + Array.from(tail).length;
+    return { head, tail, omitted: Number(match?.[1]), totalChars, keptChars };
+  }
+
+  it('clamps a mostly-CJK file between 2B and 3.8B chars without overlapping head and tail', async () => {
+    // 100 行 × (3 字符注释头 + 60 汉字)：约 6400 字符、shared 估算约 3100 token，落在
+    // 单文件预算 2375 的 2B~3.8B 区间；旧码元切法在这里头尾重叠、说明的省略数为负。
+    const source = Array.from({ length: 100 }, () => `// ${'汉字测试'.repeat(15)}`).join('\n');
+    const display = numbered(source);
+    expect(estimateSharedTokens(display)).toBeGreaterThan(2375);
+    expect(Array.from(display).length).toBeLessThan(2375 * 3.8);
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      const { data, big } = await batchRead('cjk', source);
+      expect(data.summary.perFileTokenBudget).toBe(2375);
+      expect(big.truncated).toBe(true);
+      const content = big.content ?? '';
+      const parts = splitClamped(display, content);
+      expect(parts.omitted).toBeGreaterThanOrEqual(1);
+      expect(parts.omitted).toBe(parts.totalChars - parts.keptChars);
+      expect(parts.head.length).toBeGreaterThan(0);
+      expect(parts.tail.length).toBeGreaterThan(0);
+      expect(content.length).toBeLessThan(display.length);
+      // 说明计入单文件预算，tokensEstimate 与原始估算都使用 shared 口径。
+      expect(estimateSharedTokens(content)).toBeLessThanOrEqual(2375);
+      expect(big.tokensEstimate).toBe(estimateSharedTokens(content));
+      expect(big.originalTokensEstimate).toBe(estimateSharedTokens(display));
+      // 截断诊断只含计数与相对路径，不含原文。
+      const messages = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('[code.read]') && message.includes('batch_clamp'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain('path=src/big.ts');
+      expect(messages[0]).toContain(`omittedChars=${parts.omitted}`);
+      expect(messages[0]).not.toContain('汉');
+
+      // 证据采集仍识别截断：只保留源文件逐字前缀，不把说明或不连续的尾部当作源码。
+      const collector = new EvidenceCollector();
+      collector.processToolCall({
+        tool: 'code',
+        args: { action: 'read', filePaths: ['src/big.ts', 'src/small.ts'] },
+        result: data,
+      });
+      const snippet = collector.build().evidenceMap.get('src/big.ts')?.codeSnippets[0];
+      expect(snippet).toBeDefined();
+      expect(snippet?.content).not.toContain('truncated');
+      expect(source.startsWith(snippet?.content ?? '__missing__')).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it('never cuts a surrogate pair when an emoji file is clamped', async () => {
+    // 行首 ASCII 让 emoji 代理对落在奇偶交错的码元位置，按码元切头尾必然留下孤立代理。
+    const source = Array.from(
+      { length: 300 },
+      (_, index) => `${'a'.repeat(index % 2)}${'😀'.repeat(60)}`
+    ).join('\n');
+    const display = numbered(source);
+    const { big } = await batchRead('emoji', source);
+    expect(big.truncated).toBe(true);
+    const content = big.content ?? '';
+    const parts = splitClamped(display, content);
+    expect(LONE_SURROGATE.test(content)).toBe(false);
+    expect(content.endsWith('😀')).toBe(true);
+    expect(parts.omitted).toBe(parts.totalChars - parts.keptChars);
+    expect(estimateSharedTokens(content)).toBeLessThanOrEqual(2375);
+    expect(big.tokensEstimate).toBe(estimateSharedTokens(content));
+  });
+
+  it('leaves a CJK file within the per-file budget untouched', async () => {
+    // 约 4400 字符、shared 估算约 2100 token：未超单文件预算，不截断、不打截断诊断。
+    const source = Array.from({ length: 70 }, () => `// ${'汉字测试'.repeat(15)}`).join('\n');
+    const display = numbered(source);
+    expect(estimateSharedTokens(display)).toBeLessThanOrEqual(2375);
+    const { big } = await batchRead('fits', source);
+    expect(big.truncated).toBeUndefined();
+    expect(big.content).toBe(display);
+    expect(big.tokensEstimate).toBe(estimateSharedTokens(display));
   });
 });
