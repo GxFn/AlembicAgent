@@ -84,7 +84,10 @@ function queryReaders(
     case 'impact':
       return [entities('impactAnalysis', [entity, limit])];
     case 'search':
-      return [entities('search', [entity, limit]), project('searchEntities', [entity, limit])];
+      // 与 class/callers/callees 一致：项目图优先。生产宿主的实体图端口只有 impactAnalysis，
+      // 若实体图在前，每次 search 都会被诊断为 primary-unavailable 回退。codeEntityGraph.search
+      // 仅为旧宿主形态保留的备用端口，是否删除取决于单宿主假设的决定，这里不删。
+      return [project('searchEntities', [entity, limit]), entities('search', [entity, limit])];
   }
 }
 

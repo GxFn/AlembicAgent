@@ -769,11 +769,9 @@ describe('graph and plan host outcomes', () => {
     const fallback = vi.fn(async () => ({ name: 'Fixture', found: true }));
     const result = await execute(
       {
-        // search 的历史优先级与 class/call graph 相反：先查实体图，再查项目图。
-        projectGraph:
-          type === 'search' ? { searchEntities: fallback } : { [primaryName]: async () => null },
-        codeEntityGraph:
-          type === 'search' ? { search: async () => null } : { [secondaryName]: fallback },
+        // search 与 class/call graph 一致：项目图优先，实体图只是旧宿主形态的备用端口。
+        projectGraph: { [primaryName]: async () => null },
+        codeEntityGraph: { [secondaryName]: fallback },
       },
       'graph',
       { action: 'query', params: { type, entity: 'Fixture' } }
@@ -784,6 +782,76 @@ describe('graph and plan host outcomes', () => {
       structuredContent: { result: { found: true } },
       diagnostics: { fallbackUsed: true },
     });
+    expect(result.diagnostics.warnings).toEqual([
+      expect.objectContaining({
+        code: 'GRAPH_QUERY_FALLBACK',
+        stage: `query(${type})`,
+        message: `path=codeEntityGraph.${secondaryName}; reason=primary-returned-no-result`,
+      }),
+    ]);
+  });
+
+  it('reads graph search from the project graph without a fallback on the production host shape', async () => {
+    // 唯一生产宿主的实体图端口只有 impactAnalysis；search 走项目图主路径，不能每次都被标成回退。
+    const searchEntities = vi.fn(async (query: string) => ({
+      query,
+      results: [{ name: 'Fixture', kind: 'class', location: 'src/fixture.ts:1' }],
+    }));
+    const impactAnalysis = vi.fn();
+    const result = await execute(
+      { projectGraph: { searchEntities }, codeEntityGraph: { impactAnalysis } },
+      'graph',
+      { action: 'query', params: { type: 'search', entity: 'Fixture', limit: 5 } }
+    );
+    expect(searchEntities).toHaveBeenCalledExactlyOnceWith('Fixture', 5);
+    expect(impactAnalysis).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      structuredContent: { type: 'search', result: { results: [{ name: 'Fixture' }] } },
+      diagnostics: { fallbackUsed: false },
+    });
+    expect(result.diagnostics.warnings).toEqual([]);
+  });
+
+  it('prefers the project graph search over the legacy entity graph search when both are wired', async () => {
+    const searchEntities = vi.fn(() => ({ results: [{ name: 'FromProjectGraph' }] }));
+    const legacySearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
+    const result = await execute(
+      { projectGraph: { searchEntities }, codeEntityGraph: { search: legacySearch } },
+      'graph',
+      { action: 'query', params: { type: 'search', entity: 'Fixture' } }
+    );
+    expect(searchEntities).toHaveBeenCalledOnce();
+    expect(legacySearch).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      structuredContent: { result: { results: [{ name: 'FromProjectGraph' }] } },
+      diagnostics: { fallbackUsed: false },
+    });
+    expect(result.diagnostics.warnings).toEqual([]);
+  });
+
+  it('keeps the legacy entity graph search reachable and reports it as a fallback', async () => {
+    // 旧宿主备用端口暂不删除（留待单宿主假设决定）；只有它可用时仍可查询，并如实标记主端口缺失。
+    const legacySearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
+    const result = await execute(
+      { projectGraph: {}, codeEntityGraph: { search: legacySearch } },
+      'graph',
+      { action: 'query', params: { type: 'search', entity: 'Fixture' } }
+    );
+    expect(legacySearch).toHaveBeenCalledExactlyOnceWith('Fixture', 20);
+    expect(result).toMatchObject({
+      ok: true,
+      structuredContent: { result: { results: [{ name: 'FromEntityGraph' }] } },
+      diagnostics: { fallbackUsed: true },
+    });
+    expect(result.diagnostics.warnings).toEqual([
+      expect.objectContaining({
+        code: 'GRAPH_QUERY_FALLBACK',
+        stage: 'query(search)',
+        message: 'path=codeEntityGraph.search; reason=primary-unavailable',
+      }),
+    ]);
   });
 
   it('distinguishes an unavailable graph method from a valid empty query', async () => {
