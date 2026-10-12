@@ -36,7 +36,21 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function createLineageFixture() {
+const HANDLER_CONTENT = 'export function handle(): Result<void> { return Result.ok(); }';
+
+function evidenceEntry(evidenceEntryId: string, content = HANDLER_CONTENT, startLine = 1) {
+  return {
+    evidenceEntryId,
+    relativePath: 'src/handler.ts',
+    blobHash: 'blob-handler',
+    contentHash: sha256(content),
+    startLine,
+    endLine: startLine + content.split('\n').length - 1,
+    content,
+  };
+}
+
+function createLineageFixture(evidenceEntries = [evidenceEntry('E-1')]) {
   const semantic = createSingleHypothesisEpochFixture();
   const epoch = validateStrictAnalystEpochV1(semantic.epochInput);
   const analysisFixpoint = createStrictAnalysisFixpointV1({
@@ -72,32 +86,22 @@ function createLineageFixture() {
     hypothesisIds: ['hypothesis-handler'],
     falsificationReceiptHashes: epoch.falsifications.map((receipt) => receipt.receiptHash),
     dispositionReviewIds: [semantic.dispositionReview.reviewReceiptId],
-    evidenceEntryIds: ['E-1'],
+    evidenceEntryIds: evidenceEntries.map((entry) => entry.evidenceEntryId),
     derivedFindingCount: 0,
   });
-  const content = 'export function handle(): Result<void> { return Result.ok(); }';
   const evidence = createFrozenEvidenceProjection({
     sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
-    entries: [
-      {
-        evidenceEntryId: 'E-1',
-        relativePath: 'src/handler.ts',
-        blobHash: 'blob-handler',
-        contentHash: sha256(content),
-        startLine: 1,
-        endLine: 1,
-        content,
-      },
-    ],
+    entries: evidenceEntries,
   });
-  const lineage = createStrictProducerLineageReceiptV1({
+  const lineageInput = {
     context,
     epoch,
     analysisFixpoint,
     hypothesisId: 'hypothesis-handler',
     evidence,
-  });
-  return { analysisFixpoint, lineage, semantic, context };
+  };
+  const lineage = createStrictProducerLineageReceiptV1(lineageInput);
+  return { analysisFixpoint, lineage, lineageInput, semantic, context };
 }
 
 function createSet(
@@ -569,5 +573,126 @@ describe('R07 strict Producer actual model input boundary', () => {
         authored,
       })
     ).toMatchObject({ cardinality: 1, version: 1 });
+  });
+});
+
+/**
+ * C31：评审侧 createFrozenEvidenceProjection 与 lineage 侧完整性复核共用同一份规范化与哈希。
+ * 交叉用例保证宿主经评审冻结的投影在 Producer lineage 中逐字节复核通过；两侧仍保留各自的
+ * 既有错误码，宿主日志可据此区分“创建时拒绝”和“跨进程复核拒绝”。
+ */
+describe('frozen evidence projection is canonicalized once for reviewer and Producer lineage', () => {
+  type EvidenceEntry = ReturnType<typeof evidenceEntry>;
+
+  function tamperLineageEvidence(mutate: (entries: EvidenceEntry[]) => EvidenceEntry[]) {
+    const { lineageInput } = createLineageFixture([evidenceEntry('E-1'), evidenceEntry('E-2')]);
+    return () =>
+      createStrictProducerLineageReceiptV1({
+        ...lineageInput,
+        evidence: {
+          ...lineageInput.evidence,
+          entries: mutate(lineageInput.evidence.entries.map((entry) => ({ ...entry }))),
+        },
+      });
+  }
+
+  function reviewerProjection(entries: readonly EvidenceEntry[]) {
+    return () =>
+      createFrozenEvidenceProjection({ sourceRevisionVectorHash: STRICT_SOURCE_REVISION, entries });
+  }
+
+  it('accepts every reviewer-frozen projection in the Producer lineage regardless of input order', () => {
+    const entries = [
+      evidenceEntry('E-z', 'const z = 1;', 9),
+      evidenceEntry('E-aa', 'const aa = 1;\nconst ab = 2;', 3),
+      evidenceEntry('E-1'),
+      evidenceEntry('E-b', 'const b = 1;', 5),
+    ];
+    const forward = createLineageFixture(entries);
+    const reversed = createLineageFixture([...entries].reverse());
+
+    expect(forward.lineageInput.evidence.entries.map((entry) => entry.evidenceEntryId)).toEqual([
+      'E-1',
+      'E-aa',
+      'E-b',
+      'E-z',
+    ]);
+    expect(reversed.lineageInput.evidence.projectionHash).toBe(
+      forward.lineageInput.evidence.projectionHash
+    );
+    expect(forward.lineage.evidenceProjectionHash).toBe(
+      forward.lineageInput.evidence.projectionHash
+    );
+    expect(reversed.lineage.lineageHash).toBe(forward.lineage.lineageHash);
+  });
+
+  it.each([
+    [
+      'content that no longer matches its hash',
+      (entries: EvidenceEntry[]) => [{ ...entries[0], content: 'tampered' } as EvidenceEntry],
+      /^STRICT_REVIEW_EVIDENCE_CONTENT_HASH_MISMATCH: E-1$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_CONTENT_HASH_MISMATCH: E-1$/u,
+    ],
+    [
+      'a line range that does not cover the content',
+      (entries: EvidenceEntry[]) => [
+        { ...evidenceEntry('E-1', 'line 1\nline 2'), endLine: 1 },
+        ...entries.slice(1),
+      ],
+      /^STRICT_REVIEW_EVIDENCE_RANGE_CONTENT_MISMATCH: E-1$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID: E-1$/u,
+    ],
+    [
+      'a non-positive start line',
+      (entries: EvidenceEntry[]) => [{ ...entries[0], startLine: 0 } as EvidenceEntry],
+      /^STRICT_REVIEW_EVIDENCE_RANGE_INVALID: E-1$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID: E-1$/u,
+    ],
+    [
+      'a blank relative path',
+      (entries: EvidenceEntry[]) => [{ ...entries[0], relativePath: ' ' } as EvidenceEntry],
+      /^STRICT_REVIEW_RELATIVEPATH_REQUIRED$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_RELATIVEPATH_REQUIRED$/u,
+    ],
+    [
+      'a duplicated evidence id',
+      (entries: EvidenceEntry[]) => [evidenceEntry('E-2'), ...entries.slice(1)],
+      /^STRICT_REVIEW_EVIDENCE_ID_DUPLICATE$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_ID_DUPLICATE$/u,
+    ],
+    [
+      'non-string content',
+      (entries: EvidenceEntry[]) => [
+        { ...entries[0], content: 42 as unknown as string } as EvidenceEntry,
+        ...entries.slice(1),
+      ],
+      /^STRICT_REVIEW_EVIDENCE_CONTENT_HASH_MISMATCH: E-1$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_CONTENT_HASH_MISMATCH: E-1$/u,
+    ],
+    [
+      'a non-string evidence id',
+      (entries: EvidenceEntry[]) => [
+        ...entries.slice(1),
+        { ...entries[0], evidenceEntryId: 7 as unknown as string } as EvidenceEntry,
+      ],
+      /^STRICT_REVIEW_EVIDENCEENTRYID_REQUIRED$/u,
+      /^STRICT_PRODUCER_LINEAGE_EVIDENCE_EVIDENCEENTRYID_REQUIRED$/u,
+    ],
+  ] as const)('keeps each side error code for %s', (_label, mutate, reviewerCode, lineageCode) => {
+    const entries = [evidenceEntry('E-1'), evidenceEntry('E-2')];
+    expect(reviewerProjection(mutate(entries.map((entry) => ({ ...entry }))))).toThrow(
+      reviewerCode
+    );
+    expect(tamperLineageEvidence(mutate)).toThrow(lineageCode);
+  });
+
+  it('rejects a recomputed projection hash that does not match the canonical entries', () => {
+    const { lineageInput } = createLineageFixture([evidenceEntry('E-1'), evidenceEntry('E-2')]);
+    expect(() =>
+      createStrictProducerLineageReceiptV1({
+        ...lineageInput,
+        evidence: { ...lineageInput.evidence, projectionHash: 'caller-recomputed' },
+      })
+    ).toThrow(/^STRICT_PRODUCER_LINEAGE_EVIDENCE_PROJECTION_HASH_MISMATCH$/u);
   });
 });

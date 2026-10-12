@@ -221,6 +221,8 @@ function normalizeStrictProducerProposals(
       fail('STRICT_PRODUCER_REPRESENTATIVE_REQUIRED', proposal.expressionId);
     }
   }
+  // 提案顺序进入 authoredFingerprintHash 与 setHash（hashCanonical 不排数组）：按 expressionId 以
+  // 固定的 en 排序规则排列，不随进程默认区域变化；en/zh 环境下与历史顺序一致。
   return [...input]
     .map((proposal) => ({
       expressionId: proposal.expressionId,
@@ -234,7 +236,7 @@ function normalizeStrictProducerProposals(
         authored: proposal.authored,
       }),
     }))
-    .sort((left, right) => left.expressionId.localeCompare(right.expressionId));
+    .sort((left, right) => left.expressionId.localeCompare(right.expressionId, 'en'));
 }
 
 function createStrictProducerZeroDisposition(

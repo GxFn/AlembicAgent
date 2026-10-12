@@ -190,8 +190,10 @@ function validateStrictPopulationAuthority(input: StrictAnalystEpochInputV1): {
   if (population.completion !== 'complete') {
     fail('STRICT_ANALYST_POPULATION_INCOMPLETE');
   }
+  // 数组元素顺序直接进入 epochHash（hashCanonical 只排对象键）：与键排序同样固定 en 排序规则，
+  // 不随进程默认区域变化；en/zh 环境下与历史顺序一致。
   const executionReceipts = [...(input.population.executionReceipts ?? [])].sort((left, right) =>
-    left.obligationId.localeCompare(right.obligationId)
+    left.obligationId.localeCompare(right.obligationId, 'en')
   );
   if (executionReceipts.length === 0) {
     fail('STRICT_ANALYST_EXECUTION_RECEIPTS_REQUIRED');
@@ -329,8 +331,9 @@ function resolveStrictHypothesisDispositions(
   const falsificationByHypothesis = new Map(
     falsifications.map((receipt) => [receipt.hypothesisId, receipt])
   );
+  // 处置顺序决定 hypothesisDispositions 与 producerEligibleHypotheses 的顺序并进入 epochHash，固定 en。
   const dispositions = [...input.hypothesisDispositions].sort((left, right) =>
-    left.hypothesisId.localeCompare(right.hypothesisId)
+    left.hypothesisId.localeCompare(right.hypothesisId, 'en')
   );
   if (
     new Set(dispositions.map((row) => row.hypothesisId)).size !== dispositions.length ||
@@ -626,8 +629,9 @@ function validateDispositionReviewConservation(
       fail('STRICT_ANALYST_DISPOSITION_REVIEW_REBOUND', reviewReceiptId);
     }
   }
+  // review ledger 顺序进入 epochHash，固定 en 排序规则，不随进程默认区域变化。
   return [...declared].sort((left, right) =>
-    left.reviewReceiptId.localeCompare(right.reviewReceiptId)
+    left.reviewReceiptId.localeCompare(right.reviewReceiptId, 'en')
   );
 }
 

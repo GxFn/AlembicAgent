@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import type { FullAuthoredProjectionV1 } from '../production/StrictProductionPipeline.js';
+import {
+  canonicalizeStrictEvidenceProjection,
+  type StrictEvidenceProjectionErrorCodesV1,
+} from '../production/strict/lineage.js';
 
 export type { JudgeCalibrationRecordV1 } from './MiningJudge.js';
 export { computeJudgeCalibration } from './MiningJudge.js';
@@ -130,50 +134,34 @@ const AXIS_SCORE_BY_VERDICT: Readonly<
   Record<IndependentReviewAxisV1['verdict'], IndependentReviewAxisV1['score']>
 > = { pass: 2, narrow: 1, fail: 0 };
 
+/**
+ * 评审侧冻结证据投影的既有错误码。规范化本身由 strict lineage 的
+ * canonicalizeStrictEvidenceProjection 单源实现，这里只保留评审侧的错误码口径。
+ */
+const REVIEW_EVIDENCE_PROJECTION_CODES: StrictEvidenceProjectionErrorCodesV1 = {
+  fieldRequiredPrefix: 'STRICT_REVIEW_',
+  rangeInvalid: 'STRICT_REVIEW_EVIDENCE_RANGE_INVALID',
+  contentHashMismatch: 'STRICT_REVIEW_EVIDENCE_CONTENT_HASH_MISMATCH',
+  rangeContentMismatch: 'STRICT_REVIEW_EVIDENCE_RANGE_CONTENT_MISMATCH',
+  idDuplicate: 'STRICT_REVIEW_EVIDENCE_ID_DUPLICATE',
+};
+
 export function createFrozenEvidenceProjection(input: {
   readonly sourceRevisionVectorHash: string;
   readonly entries: readonly Omit<FrozenEvidenceEntryV1, never>[];
 }): FrozenEvidenceProjectionV1 {
   requireText(input.sourceRevisionVectorHash, 'STRICT_REVIEW_SOURCE_VECTOR_REQUIRED');
+  // 评审侧拒绝空投影；lineage 复核侧目前接受空投影，口径差异是登记的开放问题，不在此统一。
   if (input.entries.length === 0) {
     fail('STRICT_REVIEW_EVIDENCE_REQUIRED');
   }
-  const entries = [...input.entries]
-    .map((entry) => {
-      for (const [field, value] of Object.entries({
-        evidenceEntryId: entry.evidenceEntryId,
-        relativePath: entry.relativePath,
-        blobHash: entry.blobHash,
-        contentHash: entry.contentHash,
-      })) {
-        requireText(value, `STRICT_REVIEW_${field.toUpperCase()}_REQUIRED`);
-      }
-      if (
-        !Number.isSafeInteger(entry.startLine) ||
-        !Number.isSafeInteger(entry.endLine) ||
-        entry.startLine < 1 ||
-        entry.endLine < entry.startLine
-      ) {
-        fail('STRICT_REVIEW_EVIDENCE_RANGE_INVALID', entry.evidenceEntryId);
-      }
-      if (sha256(entry.content) !== entry.contentHash) {
-        fail('STRICT_REVIEW_EVIDENCE_CONTENT_HASH_MISMATCH', entry.evidenceEntryId);
-      }
-      if (entry.content.split('\n').length !== entry.endLine - entry.startLine + 1) {
-        fail('STRICT_REVIEW_EVIDENCE_RANGE_CONTENT_MISMATCH', entry.evidenceEntryId);
-      }
-      return { ...entry };
-    })
-    .sort((left, right) => left.evidenceEntryId.localeCompare(right.evidenceEntryId));
-  if (new Set(entries.map((entry) => entry.evidenceEntryId)).size !== entries.length) {
-    fail('STRICT_REVIEW_EVIDENCE_ID_DUPLICATE');
-  }
-  const semantic = {
-    schemaVersion: 1 as const,
-    sourceRevisionVectorHash: input.sourceRevisionVectorHash,
-    entries,
-  };
-  return freeze({ ...semantic, projectionHash: hashCanonical(semantic) });
+  // 规范化、en 固定排序与哈希和 Producer lineage 复核共用同一实现，保证这里冻结的
+  // projectionHash 在 createStrictProducerLineageReceiptV1 中逐字节复核通过。
+  const { semantic, projectionHash } = canonicalizeStrictEvidenceProjection(
+    input,
+    REVIEW_EVIDENCE_PROJECTION_CODES
+  );
+  return freeze({ ...semantic, projectionHash });
 }
 
 /**

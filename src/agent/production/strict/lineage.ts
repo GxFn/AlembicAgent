@@ -270,6 +270,112 @@ export function createCausalRepairNodeV1(input: CreateCausalRepairNodeInputV1): 
   return freeze({ ...semantic, nodeHash: hashCanonical(semantic) });
 }
 
+type StrictEvidenceProjectionEntryV1 = StrictProducerEvidenceProjectionV1['entries'][number];
+
+/**
+ * 证据投影规范化的错误码表。评审侧（evaluation 的 createFrozenEvidenceProjection，创建并冻结
+ * 投影）与 lineage 侧（assertEvidenceProjectionIntegrity，跨进程复核投影）共用同一份规范化与
+ * 哈希，但各自保留既有错误码：宿主和测试靠错误码区分“创建时拒绝”还是“复核时拒绝”。
+ */
+export interface StrictEvidenceProjectionErrorCodesV1 {
+  /** 必填文本字段缺失时的前缀，后接大写字段名与 `_REQUIRED`（例如 `EVIDENCEENTRYID_REQUIRED`）。 */
+  readonly fieldRequiredPrefix: string;
+  /** 行号不是安全整数、起始行小于 1 或结束行早于起始行。 */
+  readonly rangeInvalid: string;
+  /** content 不是字符串或其 sha256 与 contentHash 不一致。 */
+  readonly contentHashMismatch: string;
+  /** content 的行数与 [startLine, endLine] 覆盖的行数不一致。 */
+  readonly rangeContentMismatch: string;
+  /** 规范化后 evidenceEntryId 重复。 */
+  readonly idDuplicate: string;
+}
+
+/**
+ * 冻结证据投影的唯一规范化与哈希实现（评审创建与 lineage 复核共用，避免两份实现各自调整
+ * 排序或字段后让宿主产出的 projectionHash 在 lineage 复核失败）。
+ *
+ * - 先按输入顺序逐条校验，再排序：排序前保证 evidenceEntryId 是非空字符串，畸形条目得到带码
+ *   错误而不是比较器里的 TypeError。
+ * - 条目按 evidenceEntryId 以固定的 en 排序规则排列：hashCanonical 不排数组，元素顺序直接进入
+ *   projectionHash；en/zh 环境下 ASCII 标识符顺序与历史结果逐字节一致，同时不再随进程默认
+ *   区域（da/hu/lt 等）变化。码元序迁移不在本次范围内。
+ * - 条目做浅拷贝后进入哈希，额外字段保持历史行为（一并进入哈希）。
+ * - 是否允许空 entries 由调用方决定：评审侧拒绝空投影（STRICT_REVIEW_EVIDENCE_REQUIRED），
+ *   lineage 侧目前接受（见 assertEvidenceProjectionIntegrity 的说明），本函数不替两侧统一口径。
+ */
+export function canonicalizeStrictEvidenceProjection(
+  input: {
+    readonly sourceRevisionVectorHash: string;
+    readonly entries: readonly StrictEvidenceProjectionEntryV1[];
+  },
+  codes: StrictEvidenceProjectionErrorCodesV1
+): {
+  readonly semantic: {
+    readonly schemaVersion: 1;
+    readonly sourceRevisionVectorHash: string;
+    readonly entries: StrictEvidenceProjectionEntryV1[];
+  };
+  readonly projectionHash: string;
+} {
+  const entries = input.entries
+    .map((entry) => {
+      for (const [field, value] of Object.entries({
+        evidenceEntryId: entry.evidenceEntryId,
+        relativePath: entry.relativePath,
+        blobHash: entry.blobHash,
+        contentHash: entry.contentHash,
+      })) {
+        requireText(value, `${codes.fieldRequiredPrefix}${field.toUpperCase()}_REQUIRED`);
+      }
+      if (
+        !Number.isSafeInteger(entry.startLine) ||
+        !Number.isSafeInteger(entry.endLine) ||
+        entry.startLine < 1 ||
+        entry.endLine < entry.startLine
+      ) {
+        fail(codes.rangeInvalid, entry.evidenceEntryId);
+      }
+      // 非字符串 content 无法复现 contentHash，按内容哈希不一致带码拒绝，而不是让 createHash 抛无码 TypeError。
+      if (
+        typeof entry.content !== 'string' ||
+        createHash('sha256').update(entry.content).digest('hex') !== entry.contentHash
+      ) {
+        fail(codes.contentHashMismatch, entry.evidenceEntryId);
+      }
+      if (entry.content.split('\n').length !== entry.endLine - entry.startLine + 1) {
+        fail(codes.rangeContentMismatch, entry.evidenceEntryId);
+      }
+      return { ...entry };
+    })
+    .sort((left, right) => left.evidenceEntryId.localeCompare(right.evidenceEntryId, 'en'));
+  if (new Set(entries.map((entry) => entry.evidenceEntryId)).size !== entries.length) {
+    fail(codes.idDuplicate);
+  }
+  const semantic = {
+    schemaVersion: 1 as const,
+    sourceRevisionVectorHash: input.sourceRevisionVectorHash,
+    entries,
+  };
+  return { semantic, projectionHash: hashCanonical(semantic) };
+}
+
+/** lineage 复核侧的既有错误码；行范围与内容行数不一致历来共用 RANGE_INVALID。 */
+const LINEAGE_EVIDENCE_PROJECTION_CODES: StrictEvidenceProjectionErrorCodesV1 = {
+  fieldRequiredPrefix: 'STRICT_PRODUCER_LINEAGE_EVIDENCE_',
+  rangeInvalid: 'STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID',
+  contentHashMismatch: 'STRICT_PRODUCER_LINEAGE_EVIDENCE_CONTENT_HASH_MISMATCH',
+  rangeContentMismatch: 'STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID',
+  idDuplicate: 'STRICT_PRODUCER_LINEAGE_EVIDENCE_ID_DUPLICATE',
+};
+
+/**
+ * 跨进程复核冻结证据投影：用与评审创建侧相同的规范化重算 projectionHash，调用方不能重算外层
+ * hash 自证。
+ *
+ * 开放问题：评审侧拒绝空 entries，这里仍接受空投影（保持现状，未做决定前不收窄）；实际空投影
+ * 会在随后的 context evidenceEntryIds 绑定处按 STRICT_PRODUCER_LINEAGE_EVIDENCE_BINDING_MISMATCH
+ * 失败，除非 context 也声明了空证据集合。
+ */
 function assertEvidenceProjectionIntegrity(evidence: StrictProducerEvidenceProjectionV1): void {
   if (evidence.schemaVersion !== 1) {
     fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_VERSION_MISMATCH');
@@ -278,41 +384,11 @@ function assertEvidenceProjectionIntegrity(evidence: StrictProducerEvidenceProje
     evidence.sourceRevisionVectorHash,
     'STRICT_PRODUCER_LINEAGE_EVIDENCE_SOURCE_REQUIRED'
   );
-  const entries = [...evidence.entries].sort((left, right) =>
-    left.evidenceEntryId.localeCompare(right.evidenceEntryId)
+  const { projectionHash } = canonicalizeStrictEvidenceProjection(
+    evidence,
+    LINEAGE_EVIDENCE_PROJECTION_CODES
   );
-  for (const entry of entries) {
-    for (const [field, value] of Object.entries({
-      evidenceEntryId: entry.evidenceEntryId,
-      relativePath: entry.relativePath,
-      blobHash: entry.blobHash,
-      contentHash: entry.contentHash,
-    })) {
-      requireText(value, `STRICT_PRODUCER_LINEAGE_EVIDENCE_${field.toUpperCase()}_REQUIRED`);
-    }
-    const contentHash = createHash('sha256').update(entry.content).digest('hex');
-    if (contentHash !== entry.contentHash) {
-      fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_CONTENT_HASH_MISMATCH', entry.evidenceEntryId);
-    }
-    if (
-      !Number.isSafeInteger(entry.startLine) ||
-      !Number.isSafeInteger(entry.endLine) ||
-      entry.startLine < 1 ||
-      entry.endLine < entry.startLine ||
-      entry.content.split('\n').length !== entry.endLine - entry.startLine + 1
-    ) {
-      fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_RANGE_INVALID', entry.evidenceEntryId);
-    }
-  }
-  if (new Set(entries.map((entry) => entry.evidenceEntryId)).size !== entries.length) {
-    fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_ID_DUPLICATE');
-  }
-  const semantic = {
-    schemaVersion: 1 as const,
-    sourceRevisionVectorHash: evidence.sourceRevisionVectorHash,
-    entries,
-  };
-  if (hashCanonical(semantic) !== evidence.projectionHash) {
+  if (projectionHash !== evidence.projectionHash) {
     fail('STRICT_PRODUCER_LINEAGE_EVIDENCE_PROJECTION_HASH_MISMATCH');
   }
 }
