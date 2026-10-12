@@ -169,6 +169,175 @@ describe('ClaudeTransport Anthropic protocol translation', () => {
 });
 
 /**
+ * ClaudeTransport 的结构化输出与错误归一化守护（L2-I40）。
+ * ClaudeTransport 强制 structuredOutputMode='outputFormat'：只走 Anthropic 原生结构化输出，
+ * 不让 SDK 隐式追加名为 json 的格式化工具。错误路径经 normalizeSdkError 转成本仓
+ * status/retryAfterMs/code 合同，供可靠性控制器做退避与熔断。SDK 升级若改变请求体字段
+ * 或错误分支，这里会先失败。全部使用 mock fetch，不依赖真实 key。
+ */
+describe('ClaudeTransport structured output and error normalization', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const verdictSchema = {
+    type: 'object',
+    properties: { ok: { type: 'boolean' } },
+    required: ['ok'],
+  };
+
+  function sentToolNames(capture: { body?: Record<string, unknown> }): string[] {
+    const tools = (capture.body?.tools ?? []) as Array<Record<string, unknown>>;
+    return tools.map((tool) => String(tool.name));
+  }
+
+  /**
+   * Anthropic 原生结构化输出在 @ai-sdk/anthropic 4.0.58 的线格式是 output_config.format
+   * （type=json_schema）；早期 beta 叫顶层 output_format。断言以当前 SDK 实际字段为准，
+   * SDK 改名或改回 jsonTool 降级时这里失败，提示同步检查 ClaudeTransport 的 providerOptions。
+   */
+  function sentOutputFormat(capture: { body?: Record<string, unknown> }): unknown {
+    const outputConfig = capture.body?.output_config as Record<string, unknown> | undefined;
+    return outputConfig?.format;
+  }
+
+  // 第二个模型在 SDK 能力表中不支持原生结构化输出：若 ClaudeTransport 不再显式指定
+  // outputFormat、退回 SDK 默认 auto，它会被静默降级为 json 工具，这一行负责捕获该回归。
+  it.each([
+    { label: 'SDK-native model', model: 'claude-sonnet-4-6' },
+    { label: 'model SDK auto mode would downgrade', model: 'claude-sonnet-4-20250514' },
+  ])('declares Anthropic native output_config.format for json+schema without a synthetic json tool ($label)', async ({
+    model,
+  }) => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockClaudeFetch(capture, {
+      content: [{ type: 'text', text: '{"ok":true}' }],
+      usage: { input_tokens: 3, output_tokens: 2 },
+    });
+    const transport = new ClaudeTransport({ apiKey: 'k' });
+
+    // chatStructured 是真实消费入口：它以 responseFormat='json' + schema 调 chat，再本地校验。
+    const value = await transport.chatStructured({
+      model,
+      messages: [{ role: 'user', content: 'verdict?' }],
+      schema: verdictSchema,
+      maxTokens: 128,
+    });
+
+    expect(value).toEqual({ ok: true });
+    expect(sentOutputFormat(capture)).toMatchObject({
+      type: 'json_schema',
+      schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+    });
+    // 原生模式下不得出现 SDK jsonTool 降级的格式化工具，也不强制 tool_choice。
+    expect(sentToolNames(capture)).not.toContain('json');
+    expect(capture.body?.tools).toBeUndefined();
+    expect(capture.body?.tool_choice).toBeUndefined();
+  });
+
+  it('keeps caller tools untouched when json+schema is combined with tool declarations', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockClaudeFetch(capture, {
+      content: [{ type: 'text', text: '{"ok":false}' }],
+      usage: { input_tokens: 4, output_tokens: 2 },
+    });
+    const transport = new ClaudeTransport({ apiKey: 'k' });
+
+    const result = await transport.chatWithTools({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'verdict with tools' }],
+      tools: [{ name: 'code', parameters: { type: 'object', properties: {} } }],
+      responseFormat: 'json',
+      schema: verdictSchema,
+      maxTokens: 128,
+    });
+
+    expect(sentOutputFormat(capture)).toMatchObject({ type: 'json_schema' });
+    // 工具列表只含调用方声明的工具；SDK 不得追加 json 工具把结构化输出变成工具循环。
+    expect(sentToolNames(capture)).toEqual(['code']);
+    expect(result.text).toBe('{"ok":false}');
+    expect(result.functionCalls).toBeNull();
+  });
+
+  it.each([
+    {
+      label: '429 with retry-after seconds',
+      status: 429,
+      headers: { 'retry-after': '2' } as Record<string, string>,
+      retryAfterMs: 2000,
+    },
+    {
+      label: '503 without retry hint',
+      status: 503,
+      headers: {} as Record<string, string>,
+      retryAfterMs: undefined,
+    },
+  ])('normalizes SDK APICallError $label into the reliability error contract', async ({
+    status,
+    headers,
+    retryAfterMs,
+  }) => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        {
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'PRIVATE_PROVIDER_RESPONSE' },
+        },
+        status,
+        headers
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new ClaudeTransport({
+      apiKey: 'fixture',
+      baseUrl: 'https://anthropic.invalid/v1',
+    });
+
+    const error = await transport
+      .chatWithTools({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'rate limited' }],
+        maxTokens: 64,
+      })
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ status, code: 'LLM_API_ERROR' });
+    expect((error as { retryAfterMs?: number }).retryAfterMs).toBe(retryAfterMs);
+    // 归一化错误不复制 SDK message：响应正文与请求 URL 都不得进入普通错误文本。
+    expect((error as Error).message).toBe(`claude API request failed (HTTP ${status})`);
+    expect((error as Error).message).not.toContain('PRIVATE_PROVIDER_RESPONSE');
+    expect((error as Error).message).not.toContain('anthropic.invalid');
+    // provider doGenerate 自身不重试；退避交给可靠性控制器，因此只发一次请求。
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a pre-cancelled abortSignal with AbortError before any HTTP request', async () => {
+    const fetchMock = mockClaudeFetch({});
+    const controller = new AbortController();
+    controller.abort();
+    const transport = new ClaudeTransport({ apiKey: 'k' });
+
+    const error = await transport
+      .chatWithTools({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'never sent' }],
+        responseFormat: 'json',
+        schema: verdictSchema,
+        maxTokens: 64,
+        abortSignal: controller.signal,
+      })
+      .catch((err: unknown) => err);
+
+    expect(error).toMatchObject({ name: 'AbortError' });
+    // 取消不能被归一化成 LLM_API_ERROR，否则可靠性层会把调用方取消误计为上游故障。
+    expect(error).not.toMatchObject({ code: 'LLM_API_ERROR' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * GoogleTransport carries the Gemini REST contract, which diverges sharply from
  * the OpenAI/Anthropic shapes and had no dedicated test: contents use role
  * user/model, tool results ride as functionResponse parts, tool_choice maps to
