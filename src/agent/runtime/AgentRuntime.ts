@@ -83,7 +83,12 @@ import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
 import { createExitController } from './ExitController.js';
 import { cleanFinalAnswer } from './finalAnswer.js';
-import { produceForcedSummary } from './forcedSummary.js';
+import {
+  describeDeclaredMode,
+  type ForcedSummaryMode,
+  isForcedSummaryMode,
+  produceForcedSummary,
+} from './forcedSummary.js';
 import { HookSystem, registerDefaultHooks } from './HookSystem.js';
 import { buildLlmInputAssembly, resolveLlmInputStageProfile } from './LLMInputAssembly.js';
 import { measureLlmInputAssembly } from './LLMInputMeasurement.js';
@@ -2265,13 +2270,87 @@ export class AgentRuntime {
     return `[run stopped: ${suppression.code}] ${suppression.message}`;
   }
 
+  /**
+   * 强制摘要契约选择（I11 / L5-P26）。优先级：
+   *   1. 调用方显式声明 context.summaryMode（PipelineStrategy 只为自身构造的 summary_rewrite /
+   *      record_repair 微阶段传 'none'；待决事项④的阶段策略对象落地后由它提供）——非法值记 warn 后忽略；
+   *   2. 非 system 源 → user（旧推断不变）；
+   *   3. 有 tracker → 按 tracker.pipelineType：analyst → analyst-report、producer → producer-summary、
+   *      其余（bootstrap）→ dimension-digest（scan 在 #finalize 中先行短路）；
+   *   4. 无 tracker 的 record_repair 微阶段标记（recordRepairOnly）→ none：该微阶段由门内联调用，
+   *      只负责 note_finding 补写，正文不进入管线最终 reply；
+   *   5. 其余无 tracker 的 system 源保持旧推断 dimension-digest（严格链、进化首轮与补写轮等待④统一）。
+   *      进化补写轮（sharedState._evolutionDecisionOnly）刻意不映射为 none：它是进化管线最后一个主阶段，
+   *      reply 就是管线最终 reply，AgentService.inferRunStatus 以空 reply 判 error，必须产出非空摘要。
+   * trigger 只用于日志与诊断，说明选择依据。
+   */
+  #resolveForcedSummaryMode(ctx: LoopContext): { mode: ForcedSummaryMode; trigger: string } {
+    const declared = ctx.context?.summaryMode;
+    if (declared !== undefined) {
+      if (isForcedSummaryMode(declared)) {
+        return { mode: declared, trigger: 'context.summaryMode' };
+      }
+      this.logger.warn(
+        `[AgentRuntime] finalize: ignoring invalid context.summaryMode=${describeDeclaredMode(declared)} — selecting by tracker/stage markers`
+      );
+    }
+    if (!ctx.isSystem) {
+      return { mode: 'user', trigger: `source=${ctx.source || 'user'}` };
+    }
+    const tracker = ctx.tracker;
+    if (tracker) {
+      const pipelineType = tracker.pipelineType;
+      if (pipelineType === 'analyst') {
+        return { mode: 'analyst-report', trigger: 'tracker.pipelineType=analyst' };
+      }
+      if (pipelineType === 'producer') {
+        return { mode: 'producer-summary', trigger: 'tracker.pipelineType=producer' };
+      }
+      return {
+        mode: 'dimension-digest',
+        trigger: `tracker.pipelineType=${pipelineType || 'unknown'}`,
+      };
+    }
+    if (ctx.sharedState?._recordRepairOnly === true) {
+      return { mode: 'none', trigger: 'sharedState._recordRepairOnly' };
+    }
+    if (ctx.context?.recordRepairOnly === true) {
+      return { mode: 'none', trigger: 'context.recordRepairOnly' };
+    }
+    if (ctx.sharedState?._evolutionDecisionOnly === true) {
+      // 进化补写轮走原推断（见上方第 5 条）；trigger 单独标出，日志里能区分补写轮与普通系统源。
+      return {
+        mode: 'dimension-digest',
+        trigger:
+          'legacy-default(system, no tracker; evolution decision-only retry keeps inference)',
+      };
+    }
+    return { mode: 'dimension-digest', trigger: 'legacy-default(system, no tracker)' };
+  }
+
   /** 循环退出后处理 — 强制摘要 + 构建返回值 */
   async #finalize(ctx: LoopContext) {
     // 强制摘要 — 循环结束后无文本回复时，生成摘要
     // 覆盖所有场景: 系统管线、tracker 管线、用户对话(有/无工具调用)
     if (!ctx.lastReply) {
+      // 抑制判定先于模式选择执行：它会登记 stage_timeout 等停止原因，result.timedOut 依赖这一副作用。
       const suppression = this.#getForcedSummarySuppression(ctx);
-      if (suppression) {
+      const summaryMode = this.#resolveForcedSummaryMode(ctx);
+      if (summaryMode.mode === 'none') {
+        // I11：无 tracker 的系统微阶段（只有 summary_rewrite / record_repair）不产出摘要，
+        // 任何无文本退出（含被抑制的停止）都返回空 reply——PipelineStrategy 据此走
+        // “重写无可用文本 → analysis_retry”，不会把兜底 JSON 或停止文案当作分析正文写回。
+        // 停止原因保留在诊断里，不进入 reply。
+        ctx.lastReply = '';
+        const stopDetail = suppression ? `; stop=${suppression.code}: ${suppression.message}` : '';
+        this.logger.info(
+          `[AgentRuntime] finalize: forced summary suppressed — summaryMode=none (trigger=${summaryMode.trigger}), empty reply returned (iter=${ctx.iteration}, toolCalls=${ctx.toolCalls.length}${stopDetail})`
+        );
+        ctx.diagnostics?.warn({
+          code: 'forced_summary_suppressed',
+          message: `Stage declares summaryMode=none (trigger=${summaryMode.trigger}); no forced summary requested and the reply is left empty${stopDetail}`,
+        });
+      } else if (suppression) {
         ctx.lastReply = this.#buildSuppressedSummaryReply(suppression);
         ctx.diagnostics?.warn({
           code: 'forced_summary_suppressed',
@@ -2282,6 +2361,9 @@ export class AgentRuntime {
         const recipeCount = ctx.toolCalls.filter(isPersistedSubmission).length;
         ctx.lastReply = `[scan complete: ${recipeCount} recipes collected]`;
       } else if (ctx.toolCalls.length > 0 || ctx.tracker || ctx.isSystem) {
+        this.logger.info(
+          `[AgentRuntime] finalize: forced summary mode=${summaryMode.mode} (trigger=${summaryMode.trigger})`
+        );
         const forcedResult = await produceForcedSummary({
           aiProvider: this.aiProvider,
           source: ctx.source,
@@ -2294,6 +2376,7 @@ export class AgentRuntime {
           maxTokens: ctx.budget.maxTokens,
           temperature: ctx.budget.temperature,
           abortSignal: ctx.abortSignal ?? undefined,
+          summaryMode: summaryMode.mode,
         });
         ctx.lastReply = forcedResult.reply;
         ctx.diagnostics?.recordForcedSummary();

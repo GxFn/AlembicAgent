@@ -86,7 +86,8 @@ const BOOTSTRAP_NUDGE_TTL_ROUNDS = 2;
  *   - 新增此类固定指令必须登记到本表，否则模型回显会残留在答复中；
  *   - 只登记不含插值的整句；带轮次、数量、工具名插值的句子只登记其固定部分。
  *
- * 本表不经公开子路径导出，只供 agent 内部注入侧与 finalAnswer 清理侧共用。
+ * 本表不经公开子路径导出，只供 agent 内部注入侧（含 runtime/forcedSummary 的 producer-summary
+ * 提示）与 finalAnswer 清理侧共用。
  */
 export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
   // ── 防复制护栏（convergence / budget_warning / RECORD / SUMMARIZE / reflection 共用） ──
@@ -102,6 +103,11 @@ export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
   stopToolsTextOnly: '⚠️ 不要再调用任何工具，直接输出文本。',
   producerSummarizeLead:
     '你已完成候选生产阶段。请**停止调用工具**，直接输出生产总结（Markdown 格式）。',
+  // Producer 生产总结的内容要求（I11）：SUMMARIZE 转换、producer 强制退出 nudge 与
+  // forcedSummary 的 producer-summary 模式共用，保证三处收尾契约都是同一份 Markdown 生产总结。
+  producerSummaryScope: '说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充结构化发现。',
+  producerSummaryNoNewTopics:
+    '不要从 Analyst 最终 Markdown 摘要里新增候选主题；未结构化记录的主题只能列为 Analyst 输入缺口。',
   bootstrapSummarizeLead:
     '你已完成分析探索。请在回复中直接输出 dimensionDigest JSON（用 ```json 包裹），包含以下字段：',
   bootstrapRemainingTasksNote:
@@ -113,6 +119,8 @@ export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
   forceExitNoCopyAnalysis: '⛔ 严禁在回复中复制或引用本条指令的任何文字，只输出你自己的分析。',
   forceExitStopTools: '你必须**立即停止工具调用**。',
   forceExitScanOutput: '请直接输出你的分析总结（Markdown 格式），列出已发现和未覆盖的关键模式。',
+  forceExitProducerOutput:
+    '请直接输出候选生产总结（Markdown 格式），不要输出 dimensionDigest JSON。',
   forceExitStopToolsTextOnly: '⛔ 不要再调用任何工具，直接输出文本。',
   forceExitDigestOutput:
     '请在回复中直接输出 dimensionDigest JSON 总结（用 ```json 包裹），不要再调用任何工具。',
@@ -268,8 +276,8 @@ export class NudgeGenerator {
       if (pipelineType === 'producer') {
         return (
           `${DIRECTIVE.producerSummarizeLead}\n` +
-          `说明已提交候选数量、拒绝或跳过原因，以及是否需要 Analyst 补充结构化发现。\n` +
-          `不要从 Analyst 最终 Markdown 摘要里新增候选主题；未结构化记录的主题只能列为 Analyst 输入缺口。\n` +
+          `${DIRECTIVE.producerSummaryScope}\n` +
+          `${DIRECTIVE.producerSummaryNoNewTopics}\n` +
           DIRECTIVE.stopToolsTextOnly
         );
       }
@@ -365,6 +373,22 @@ export class NudgeGenerator {
           `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。${DIRECTIVE.forceExitStopTools}\n\n` +
           `已通过 knowledge({ action: "submit" }) 提交了 ${submitCount} 个知识候选。` +
           `${DIRECTIVE.forceExitScanOutput}\n` +
+          DIRECTIVE.forceExitStopToolsTextOnly,
+      };
+    }
+    // Producer 管线（I11）：与 SUMMARIZE 转换、tracker 终结 nudge、forcedSummary 的 producer-summary
+    // 模式一致，输出 Markdown 生产总结。此前落入下方 bootstrap 分支，强制退出时要求 dimensionDigest
+    // JSON，producer 的收尾形状随退出方式而变。
+    if (pipelineType === 'producer') {
+      return {
+        type: 'force_exit',
+        text:
+          `⚠️ **轮次耗尽** (${m.iteration}/${b.maxIterations})。${DIRECTIVE.forceExitStopTools}\n\n` +
+          `已提交 ${submitCount} 个候选。\n` +
+          // 固定指令句独占一行，模型整行回显时 cleanFinalAnswer 能按登记原句识别并清除。
+          `${DIRECTIVE.forceExitProducerOutput}\n` +
+          `${DIRECTIVE.producerSummaryScope}\n` +
+          `${DIRECTIVE.producerSummaryNoNewTopics}\n` +
           DIRECTIVE.forceExitStopToolsTextOnly,
       };
     }

@@ -89,6 +89,7 @@ import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/i
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector, isDegradeGateAction } from '../runtime/DiagnosticsCollector.js';
+import type { ForcedSummaryMode } from '../runtime/forcedSummary.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
 import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import { runStageAttempt, type StageAttemptScope } from './pipeline/attempt.js';
@@ -238,6 +239,22 @@ function producerStructuredFindingTarget(artifact: unknown): number {
  * producer 按这个名字从 phaseResults 读取，而不是读「最近一个带产物的门」。
  */
 const ANALYSIS_GATE_STAGE = 'quality_gate';
+
+/**
+ * I11（L5-P26）：本类自己构造的修复微阶段 → 强制摘要模式。
+ *
+ * summary_rewrite / record_repair 微阶段没有 tracker，正文要么只用于写回 analyze（rewrite），
+ * 要么无消费方（repair）；它们无文本退出时不能再由 Runtime 按旧推断补一份 dimensionDigest 兜底，
+ * 否则 rewrite 的兜底 JSON 会被当作可用文本覆盖 analyze 正文、绕过 analysis_retry。
+ * 过渡实现：阶段策略对象（待决事项④）落地前不在阶段配置上新增公开字段，而是私有登记
+ * #runRecordRepairStage / #runSummaryRewriteStage 构造的阶段对象；#runPreparedStage 据此在
+ * runLoop context 中显式传 summaryMode，AgentRuntime.#finalize 优先采用该显式声明。
+ *
+ * 只登记这两个微阶段：它们由门内联调用，不会成为 lastMainStageName，reply 不进入管线最终 reply。
+ * 进化补写轮（decisionOnlyOnRetry 的重试）不是微阶段——它是被门跳回重跑的主阶段，reply 就是
+ * 管线最终 reply，AgentService.inferRunStatus 以空 reply 判 error，所以不在此登记、保持原推断。
+ */
+const MICRO_STAGE_SUMMARY_MODES = new WeakMap<PipelineStage, ForcedSummaryMode>();
 
 /** 按门名读取分析产物的结果：status 区分「门没跑 / 门没留产物 / 产物形状不符」，供诊断定位。 */
 type AnalysisGateArtifactRead =
@@ -880,8 +897,12 @@ export class PipelineStrategy extends Strategy {
             return 'break';
           }
         } else {
+          // 重写微阶段声明 summaryMode=none：模型失败、空回复或被抑制（超时/输入过大）时 reply 为空，
+          // 在这里转 analysis_retry，而不是把兜底文本写回 analyze。
           _pipelineLogger().info(
-            `[PipelineStrategy] summary_rewrite produced no usable text for "${stage.name}" — falling back to analysis_retry`
+            `[PipelineStrategy] summary_rewrite produced no usable text for "${stage.name}" — falling back to analysis_retry ` +
+              `(sourceStage=${sourceName}, sourceFound=${Boolean(source)}, replyChars=${newReply.length}, ` +
+              `timedOut=${rewriteResult?.timedOut === true}, iterations=${rewriteResult?.iterations ?? 0})`
           );
         }
       }
@@ -1507,6 +1528,8 @@ export class PipelineStrategy extends Strategy {
         }),
     };
 
+    MICRO_STAGE_SUMMARY_MODES.set(repairStage, 'none');
+
     try {
       return await this.#executeStage(runtime, message, repairStage, ctx, bus);
     } finally {
@@ -1555,6 +1578,8 @@ export class PipelineStrategy extends Strategy {
           artifact: gateResult.artifact as Record<string, unknown> | null,
         }),
     };
+
+    MICRO_STAGE_SUMMARY_MODES.set(rewriteStage, 'none');
 
     try {
       return await this.#executeStage(runtime, message, rewriteStage, ctx, bus);
@@ -2186,6 +2211,18 @@ export class PipelineStrategy extends Strategy {
             }
           : baseSharedState;
 
+    const summaryMode = this.#stageSummaryMode(stage);
+    if (summaryMode) {
+      _pipelineLogger().debug(
+        `[PipelineStrategy] Stage "${stage.name}" declares summaryMode=${summaryMode} (repair micro-stage)`
+      );
+    } else if (decisionOnly) {
+      // 进化补写轮刻意不声明：它是最后一个主阶段，无文本退出时须由 Runtime 原推断产出非空 reply。
+      _pipelineLogger().debug(
+        `[PipelineStrategy] Stage "${stage.name}" evolution decision-only retry — no summaryMode declared, runtime keeps inferred forced summary so the final pipeline reply stays non-empty`
+      );
+    }
+
     return scope.runLoop(stagePrompt, {
       history: message.history,
       context: {
@@ -2205,6 +2242,8 @@ export class PipelineStrategy extends Strategy {
             }
           : {}),
         ...(dimensionScopeId ? { dimensionScopeId } : {}),
+        // 显式摘要契约放在最后，覆盖宿主消息上下文里的同名键：微阶段的“不产出摘要”不能被改写。
+        ...(summaryMode ? { summaryMode } : {}),
       },
       capabilityOverride: stage.capabilities,
       additionalToolsOverride: stage.additionalTools,
@@ -2218,6 +2257,15 @@ export class PipelineStrategy extends Strategy {
       source: strategyContext.source || null,
       toolChoiceOverride: stage.toolChoiceOverride || null,
     });
+  }
+
+  /**
+   * 本阶段需显式声明的强制摘要模式（I11）；null 表示不声明，由 AgentRuntime 按 tracker/阶段标记选择。
+   * 只有本类构造的 summary_rewrite / record_repair 微阶段 → 'none'。进化补写轮（decisionOnlyOnRetry
+   * 的重试）不声明：其 reply 是管线最终 reply，必须由原推断产出非空摘要（见 MICRO_STAGE_SUMMARY_MODES）。
+   */
+  #stageSummaryMode(stage: PipelineStage): ForcedSummaryMode | null {
+    return MICRO_STAGE_SUMMARY_MODES.get(stage) ?? null;
   }
 
   /** 质量门控评估 (向后兼容: 阈值模式) */
