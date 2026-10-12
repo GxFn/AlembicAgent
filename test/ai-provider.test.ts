@@ -25,7 +25,7 @@ import {
   ParameterGuard,
   PROVIDER_CONFIGS,
 } from '../src/index.js';
-import { mockJsonFetch } from './helpers/mockFetch.js';
+import { jsonResponse, mockJsonFetch } from './helpers/mockFetch.js';
 
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) {
@@ -376,6 +376,88 @@ describe('ParameterGuard', () => {
       },
       { param: 'topP', reason: '该模型不支持 topP', originalValue: 0.5 },
     ]);
+  });
+});
+
+// I13：Runtime 在 toolChoice=none 时不再把 schema 交给 provider（chatWithTools 收到 toolSchemas/toolChoice 均为空，
+// facade 默认补 'auto'）。旧路径是“带 schema + toolChoice='none'”，由 Gateway/Transport 丢弃 tools。
+// 这里锁定两种调用形状在厂商 HTTP 请求上完全一致，证明对齐只改变 Runtime 诊断，不改变 provider 实际收到的内容。
+describe('toolChoice=none wire parity between retained and hidden tool schemas', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const chatCompletionsText = (model: string) => ({
+    id: 'chatcmpl-fixture',
+    object: 'chat.completion',
+    created: 1,
+    model,
+    choices: [
+      { index: 0, message: { role: 'assistant', content: 'summary' }, finish_reason: 'stop' },
+    ],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const cases = [
+    {
+      name: 'openai',
+      create: () => new OpenAiProvider({ apiKey: 'test-key', model: 'gpt-4o', maxRetries: 0 }),
+      response: () => chatCompletionsText('gpt-4o'),
+    },
+    {
+      name: 'deepseek-chat',
+      create: () =>
+        new DeepSeekProvider({ apiKey: 'test-key', model: 'deepseek-chat', maxRetries: 0 }),
+      response: () => chatCompletionsText('deepseek-chat'),
+    },
+    {
+      name: 'claude',
+      create: () =>
+        new ClaudeProvider({ apiKey: 'test-key', model: 'claude-sonnet-4-6', maxRetries: 0 }),
+      response: () => ({
+        id: 'msg_fixture',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-sonnet-4-6',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        content: [{ type: 'text', text: 'summary' }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+    },
+  ];
+
+  it.each(cases)('$name sends the same request whether or not hidden schemas were passed', async ({
+    create,
+    response,
+  }) => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+        return jsonResponse(response());
+      })
+    );
+    const provider = create();
+    const messages = [{ role: 'user' as const, content: 'Summarize the recorded findings.' }];
+    const common = { messages, systemPrompt: 'Summary identity', maxTokens: 64, temperature: 0.3 };
+
+    // 旧 Runtime 形状：schema 随调用传入，toolChoice='none'。
+    await provider.chatWithTools('', {
+      ...common,
+      toolSchemas: [
+        { name: 'knowledge', description: 'Submit knowledge', parameters: { type: 'object' } },
+      ],
+      toolChoice: 'none',
+    });
+    // 新 Runtime 形状：none 下 selectLlmInputTools 不选 schema，Runtime 也不传 toolChoice。
+    await provider.chatWithTools('', common);
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).not.toHaveProperty('tools');
+    expect(bodies[0]).not.toHaveProperty('tool_choice');
+    expect(bodies[1]).toEqual(bodies[0]);
   });
 });
 

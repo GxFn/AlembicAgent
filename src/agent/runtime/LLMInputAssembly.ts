@@ -483,6 +483,8 @@ function buildToolContractSection(
   tools: ToolSchema[] | undefined,
   scanReadAllowed: boolean
 ): LLMInputSection {
+  // tools 必须是本轮实际发给 provider 的工具（selectLlmInputTools 已按 Gateway 的 none 契约剔除），
+  // 因此 availableTools 与下面的 summarize 文案只描述真正发出的 schema。
   const toolNames = (tools || []).map((tool) => tool.name).filter(Boolean);
   const base = [
     `requestedToolChoice: ${requestedToolChoice || 'unspecified'}`,
@@ -495,7 +497,11 @@ function buildToolContractSection(
       'Allowed tools must support evidence gathering, verification, or structured finding capture. Avoid repeated searches and prefer batch reads for known files.',
     record:
       'Only note_finding and read-only evidence.get/search are valid in this stage. If no note_finding schema is available, explain that structured recording is blocked.',
-    summarize: 'No tool calls are valid. Ignore any retained tool schemas and return text only.',
+    // 正常 summarize（toolChoice=none）本轮不发送任何 schema；只有 tracker 在 SUMMARIZE 仍放开工具时
+    // 才会有 schema 随调用发出，此时明确要求忽略它们，而不是暗示存在“保留下来的” schema。
+    summarize: toolNames.length
+      ? 'No tool calls are valid. Ignore the tool schemas exposed in this call and return text only.'
+      : 'No tool calls are valid and no tool schemas are sent in this call. Return text only.',
     produce: scanReadAllowed
       ? 'Use submission tools for candidate creation. Only code.read of already referenced files may supplement evidence; do not start new search, graph, or terminal exploration.'
       : 'Use submission tools for candidate creation. code.read, search, graph, terminal, and broad exploration are out of scope for Producer.',

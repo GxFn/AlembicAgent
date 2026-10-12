@@ -29,6 +29,8 @@ import {
   recordPcvInputAssembly,
   SystemPromptBuilder,
 } from '../src/agent/runtime/index.js';
+import { selectLlmInputTools, validateLlmInputSize } from '../src/agent/runtime/llmInput.js';
+import { allowsToolCallsUnderForcedNone } from '../src/agent/runtime/ProviderToolChoicePolicy.js';
 import type { UnifiedMessage } from '../src/ai/contracts.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
@@ -819,14 +821,15 @@ describe('LLM input layering', () => {
     const capture: {
       messageBatches: Array<Array<{ content?: string }>>;
       systemPrompt?: string;
-      toolSchemas?: Array<Record<string, unknown>>;
+      toolSchemaBatches: Array<Array<Record<string, unknown>> | undefined>;
     } = {
       messageBatches: [],
+      toolSchemaBatches: [],
     };
     const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
       capture.systemPrompt = opts?.systemPrompt as string;
       capture.messageBatches.push((opts?.messages as Array<{ content?: string }>) || []);
-      capture.toolSchemas = opts?.toolSchemas as Array<Record<string, unknown>>;
+      capture.toolSchemaBatches.push(opts?.toolSchemas as Array<Record<string, unknown>>);
       return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
     });
     const runtime = createRuntime({
@@ -875,7 +878,13 @@ describe('LLM input layering', () => {
     expect(providerLayer).not.toContain('sourceRefPolicy: strict');
     expect(providerLayer).not.toContain('canonicalSourceRefIndex');
     expect(providerLayer).not.toContain('graph({ action');
-    expect(capture.toolSchemas?.map((schema) => schema.name)).toEqual(['code', 'knowledge']);
+    // PRODUCE 轮带 Producer 投影后的工具；最后的 SUMMARIZE 轮 toolChoice=none，按 Gateway 契约不再携带 schema（I13）。
+    expect(capture.toolSchemaBatches[0]?.map((schema) => schema.name)).toEqual([
+      'code',
+      'knowledge',
+    ]);
+    expect(capture.toolSchemaBatches.length).toBeGreaterThan(1);
+    expect(capture.toolSchemaBatches.at(-1)).toBeUndefined();
     expect(llmInput?.metadata).toMatchObject({
       inputStageProfile: 'produce',
       inputProjection: {
@@ -893,16 +902,18 @@ describe('LLM input layering', () => {
       toolSchemas?: Array<Record<string, unknown>>;
     } = {};
     const chatWithTools = vi.fn(async (_prompt: string, opts?: Record<string, unknown>) => {
-      capture.toolSchemas = opts?.toolSchemas as Array<Record<string, unknown>>;
+      // 只取第一次真正携带工具的调用：收尾 SUMMARIZE 轮 toolChoice=none，按 Gateway 契约不再发送 schema（I13）。
+      capture.toolSchemas ??= opts?.toolSchemas as Array<Record<string, unknown>> | undefined;
       return { text: 'done', functionCalls: [], usage: { inputTokens: 1, outputTokens: 1 } };
     });
     const runtime = createRuntime({
       capabilityCatalog: new RuntimeCapabilityCatalog(),
       chatWithTools,
     });
+    // maxIterations=1 时唯一一轮就是 toolChoice=none 的收尾轮；给 2 轮才能观察到 PRODUCE 轮的工具投影。
     const tracker = ExplorationTracker.resolve(
       { source: 'system', strategy: 'producer' },
-      { maxIterations: 1, pipelineType: 'producer' }
+      { maxIterations: 2, pipelineType: 'producer' }
     );
 
     await runtime.reactLoop('produce knowledge candidates', {
@@ -911,9 +922,10 @@ describe('LLM input layering', () => {
       context: { pipelinePhase: 'produce' },
       systemPromptOverride: PRODUCER_SYSTEM_PROMPT,
       tracker: tracker as never,
-      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
     });
 
+    expect(capture.toolSchemas?.length).toBeGreaterThan(0);
     const byName = new Map(capture.toolSchemas?.map((schema) => [schema.name, schema]) || []);
     const knowledgeParams = byName.get('knowledge')?.parameters as {
       properties?: {
@@ -2345,5 +2357,284 @@ describe('analyze deterministic evidence refs stay visible and auditable (I10)',
     expect(legacyEvidence.groundingLedger[0]).not.toHaveProperty(
       'omittedDeterministicEvidenceRefCount'
     );
+  });
+});
+
+// I13：Gateway 对所有 provider 在 toolChoice=none 时都不发送 tools（LLMGateway.chatWithTools），
+// Runtime 的工具选择、输入装配、测量与 PCV 必须只描述实际发送的工具；DeepSeek V4 首轮“保留可见”
+// 例外只有在本轮确实有 schema 时才成立。
+describe('tool visibility matches the gateway toolChoice=none contract (I13)', () => {
+  const visibilitySchemas: Array<Record<string, unknown>> = Array.from(
+    { length: 6 },
+    (_, index) => ({
+      name: `tool_${index}`,
+      description: 'x'.repeat(800),
+      parameters: {
+        type: 'object',
+        properties: { q: { type: 'string', description: 'y'.repeat(400) } },
+      },
+    })
+  );
+  const nonQuirkModels = [
+    'claude-sonnet-4-5',
+    'claude:claude-sonnet-4-6',
+    'gpt-4o',
+    'openai:gpt-5.5',
+    'deepseek-chat',
+  ];
+
+  function summarizeLoop() {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('Summarize the production results.');
+    const ctx = new LoopContext({
+      budget: { maxIterations: 1 },
+      capabilities: [],
+      context: { pipelinePhase: 'produce' },
+      messages,
+      prompt: 'Summarize the production results.',
+      source: 'system',
+      toolSchemas: visibilitySchemas,
+      tracker: createTracker({ phase: 'SUMMARIZE', pipelineType: 'producer' }) as never,
+    });
+    return { ctx, messages };
+  }
+
+  function assembleSummarize(modelRef: string) {
+    const { ctx, messages } = summarizeLoop();
+    const selection = selectLlmInputTools(
+      { tracker: ctx.tracker, context: ctx.context },
+      modelRef,
+      'none',
+      visibilitySchemas
+    );
+    const assembled = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: selection.effectiveToolChoice,
+      messages: messages.toMessages(),
+      modelRef,
+      requestedToolChoice: 'none',
+      systemPrompt: 'Producer identity prompt',
+      tools: selection.tools,
+    });
+    return { assembled, selection };
+  }
+
+  it.each(
+    nonQuirkModels
+  )('hides tool schemas for %s when the stage requests toolChoice=none', (modelRef) => {
+    const { selection } = assembleSummarize(modelRef);
+    expect(selection.tools).toBeUndefined();
+    expect(selection.effectiveToolChoice).toBe('none');
+    expect(selection.providerDecisionMode).toBeNull();
+    expect(selection.observedToolChoiceMode).toBeNull();
+  });
+
+  it.each([
+    'gemini-2.5-pro',
+    'deepseek-v4-flash',
+  ])('keeps the quirk providers (%s) on the same hidden-schema result', (modelRef) => {
+    const { selection } = assembleSummarize(modelRef);
+    expect(selection.tools).toBeUndefined();
+    expect(selection.effectiveToolChoice).toBe('none');
+  });
+
+  it.each(
+    nonQuirkModels
+  )('measures and describes only the tools actually sent for %s under toolChoice=none', (modelRef) => {
+    const { assembled } = assembleSummarize(modelRef);
+    const measurement = measureLlmInputAssembly(assembled);
+    const withoutTools = measureLlmInputAssembly({ ...assembled, tools: undefined });
+    const toolContract =
+      assembled.sections.find((section) => section.id === 'toolContract')?.content ?? '';
+
+    expect(assembled.tools).toBeUndefined();
+    expect(measurement.toolSchemaEstimatedTokens).toBe(0);
+    expect(measurement.estimatedTokens).toBe(withoutTools.estimatedTokens);
+    expect(toolContract).toContain('availableTools: (none)');
+    expect(toolContract).not.toMatch(/tool_\d/);
+    // summarize 合同不能再暗示“保留了 schema”：本轮根本没有 schema 发出。
+    expect(toolContract).not.toContain('retained');
+    expect(toolContract).toContain('No tool calls are valid');
+  });
+
+  it('does not reject a near-limit summary input because of schemas the gateway never sends', () => {
+    const { assembled } = assembleSummarize('claude-sonnet-4-5');
+    const withoutTools = measureLlmInputAssembly({ ...assembled, tools: undefined });
+    // 上限只比“无 schema”估算多一点；旧行为把 6 个 schema（约 1900 token）计入后会误判 LLM_INPUT_TOO_LARGE。
+    const verdict = validateLlmInputSize(
+      { maxProviderInputTokens: withoutTools.estimatedTokens + 50 },
+      measureLlmInputAssembly(assembled)
+    );
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it('records no tool schema names in PCV input evidence when toolChoice=none hides them', () => {
+    const { ctx } = summarizeLoop();
+    const { assembled, selection } = assembleSummarize('gpt-4o');
+    const evidence = createPcvNodeEvidence(ctx);
+    recordPcvInputAssembly(evidence, assembled, {
+      deepseekV4ToolChoiceMode: selection.observedToolChoiceMode,
+      effectiveToolChoice: selection.effectiveToolChoice,
+      iteration: 1,
+      modelRef: 'gpt-4o',
+      requestedToolChoice: 'none',
+    });
+    expect(evidence.inputAssembly?.toolSchemaNames).toEqual([]);
+    expect(evidence.groundingLedger[0]?.toolSchemaNames).toEqual([]);
+  });
+
+  it('keeps tool schemas and the requested choice when the stage allows tools', () => {
+    const { ctx } = summarizeLoop();
+    const policyContext = { tracker: ctx.tracker, context: ctx.context };
+    for (const requested of ['auto', 'required']) {
+      const selection = selectLlmInputTools(
+        policyContext,
+        'claude-sonnet-4-5',
+        requested,
+        visibilitySchemas
+      );
+      expect(selection.tools).toBe(visibilitySchemas);
+      expect(selection.effectiveToolChoice).toBe(requested);
+    }
+    const empty = selectLlmInputTools(policyContext, 'claude-sonnet-4-5', 'auto', []);
+    expect(empty.tools).toBeUndefined();
+    expect(empty.effectiveToolChoice).toBe('none');
+  });
+
+  describe('DeepSeek V4 analyze first burn exception', () => {
+    const firstBurnContext = {
+      tracker: {
+        phase: 'SCAN',
+        pipelineType: 'analyst',
+        getMetrics: () => ({ evidenceToolCallCount: 0, memoryFindingCount: 0 }),
+      },
+      context: { pipelinePhase: 'analyze' },
+    };
+
+    it('keeps schemas visible with effective auto when the first burn has schemas', () => {
+      const selection = selectLlmInputTools(
+        firstBurnContext,
+        'deepseek-v4-flash',
+        'none',
+        visibilitySchemas
+      );
+      expect(selection.tools).toBe(visibilitySchemas);
+      expect(selection.effectiveToolChoice).toBe('auto');
+      expect(selection.providerDecisionMode).toBe('tools-visible-no-forced-tool-choice');
+      expect(selection.observedToolChoiceMode).toBe('tools-visible-no-forced-tool-choice');
+      expect(allowsToolCallsUnderForcedNone(selection.observedToolChoiceMode)).toBe(true);
+    });
+
+    it('falls back to the hidden none branch when the first burn has no schemas', () => {
+      const selection = selectLlmInputTools(firstBurnContext, 'deepseek-v4-flash', 'none', []);
+      expect(selection.tools).toBeUndefined();
+      expect(selection.effectiveToolChoice).toBe('none');
+      expect(selection.observedToolChoiceMode).toBe('schemas-hidden-no-tool-choice');
+      // 决策侧 mode 也不能再宣称“工具可见”，否则 LLM call start 日志与实际请求矛盾。
+      expect(selection.providerDecisionMode).not.toBe('tools-visible-no-forced-tool-choice');
+      expect(selection.providerDecisionMode).toBe('tools-visible-skipped-no-schemas');
+      expect(allowsToolCallsUnderForcedNone(selection.observedToolChoiceMode)).toBe(false);
+    });
+  });
+
+  it('sends no schemas and no forced choice to a Claude provider during SUMMARIZE', async () => {
+    const progress: ProgressEvent[] = [];
+    const captured: Array<Record<string, unknown>> = [];
+    const chatWithTools = vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+      captured.push(opts);
+      return {
+        text: 'summary done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      };
+    });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'claude', model: 'claude-sonnet-4-6', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      container: {
+        get: (name: string) =>
+          name === 'capabilityCatalog'
+            ? {
+                toToolSchemas: () => [
+                  {
+                    name: 'knowledge',
+                    description: 'Knowledge submission',
+                    parameters: { type: 'object' },
+                  },
+                ],
+              }
+            : undefined,
+      } as never,
+      capabilities: [],
+      additionalTools: ['knowledge'],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      modelRef: 'claude:claude-sonnet-4-6',
+      onProgress: (event) => progress.push(event),
+    });
+    const result = await runtime.reactLoop('summarize production', {
+      source: 'system',
+      context: { pipelinePhase: 'produce' },
+      tracker: createTracker({
+        phase: 'SUMMARIZE',
+        pipelineType: 'producer',
+        toolChoice: 'none',
+      }) as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    expect(chatWithTools).toHaveBeenCalledOnce();
+    expect(captured[0]?.toolSchemas).toBeUndefined();
+    expect(captured[0]?.toolChoice).toBeUndefined();
+    const llmInput = getLlmInput(progress);
+    expect(llmInput?.metadata?.toolSchemaNames).toEqual([]);
+    expect(llmInput?.metadata?.effectiveToolChoice).toBe('none');
+    expect(
+      (llmInput?.metadata?.inputSizeEstimate as Record<string, unknown> | undefined)?.toolSchemas
+    ).toBe(0);
+    expect(result.pcvNodeEvidence.inputAssembly?.toolSchemaNames).toEqual([]);
+    const providerLayer = String(
+      (captured[0]?.messages as Array<{ content?: string }> | undefined)?.at(-1)?.content ?? ''
+    );
+    expect(providerLayer).toContain('availableTools: (none)');
+  });
+
+  it('suppresses tool calls as a toolChoice=none violation when the V4 first burn had no schemas', async () => {
+    const execute = vi.fn();
+    const chatWithTools = vi.fn(async () => ({
+      text: 'I will read the file first.',
+      functionCalls: [{ id: 'c1', name: 'code', args: { action: 'read', path: 'src/a.ts' } }],
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'deepseek', model: 'deepseek-v4-flash', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+      modelRef: 'deepseek:deepseek-v4-flash',
+    });
+    const result = await runtime.reactLoop('analyze first burn without tools', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze' },
+      tracker: createTracker({ phase: 'SCAN', pipelineType: 'analyst' }) as never,
+      budgetOverride: { maxIterations: 1, timeoutMs: 1000 },
+    });
+
+    const firstCallOptions = (chatWithTools.mock.calls[0] as unknown[] | undefined)?.[1] as
+      | Record<string, unknown>
+      | undefined;
+    expect(firstCallOptions?.toolSchemas).toBeUndefined();
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.diagnostics?.warnings).toContainEqual(
+      expect.objectContaining({ code: 'tool_choice_violation' })
+    );
+    expect(result.pcvNodeEvidence.groundingLedger[0]).toMatchObject({
+      deepseekV4ToolChoiceMode: 'schemas-hidden-no-tool-choice',
+      effectiveToolChoice: 'none',
+      requestedToolChoice: 'none',
+      toolSchemasVisible: false,
+    });
   });
 });
