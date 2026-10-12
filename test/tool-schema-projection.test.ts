@@ -1246,3 +1246,92 @@ describe('runtime schema query port', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 });
+
+describe('runtime lazy schema state across runs', () => {
+  // 两个都带必填参数 q 的通用工具：用来观察“未用过的工具”在第 2 次运行中是否丢失参数 schema。
+  function requiredQueryDefinition(id: string): ToolDefinition {
+    return {
+      ...genericDefinition(),
+      id,
+      title: id,
+      description: `${id} tool`,
+      inputSchema: {
+        type: 'object',
+        required: ['q'],
+        properties: { q: { type: 'string' } },
+      },
+      modelOverrides: {},
+    };
+  }
+
+  class PairCapability extends ReadCapability {
+    override get tools() {
+      return ['tool_a', 'tool_b'];
+    }
+    override get allowedTools(): unknown {
+      return { tool_a: ['invoke'], tool_b: ['invoke'] };
+    }
+  }
+
+  const fullSchemas = [
+    {
+      name: 'tool_a',
+      description: 'tool_a tool',
+      parameters: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } },
+    },
+    {
+      name: 'tool_b',
+      description: 'tool_b tool',
+      parameters: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } },
+    },
+  ];
+
+  it('keeps complete schemas for unused tools when one catalog serves two runs', async () => {
+    const catalog = new UnifiedToolCatalog([
+      requiredQueryDefinition('tool_a'),
+      requiredQueryDefinition('tool_b'),
+    ]);
+    const query = vi.spyOn(catalog, 'querySchemas');
+
+    const first = runtimeWith(catalog, new PairCapability());
+    first.chatWithTools
+      .mockReset()
+      .mockResolvedValueOnce({
+        functionCalls: [{ id: 'use-a', name: 'tool_a', args: { q: 'x' } }],
+      })
+      .mockResolvedValue({ text: 'done' });
+    await first.runtime.reactLoop('first run');
+    expect(first.execute).toHaveBeenCalledTimes(1);
+    expect(first.chatWithTools.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of first.chatWithTools.mock.calls) {
+      expect(call[1].toolSchemas).toEqual(fullSchemas);
+    }
+
+    const second = runtimeWith(catalog, new PairCapability());
+    second.chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
+    await second.runtime.reactLoop('second run');
+    // 第 2 次运行里 tool_b 从未被调用过，仍须保留必填参数 q，而不是降级为空对象 schema。
+    expect(second.chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(fullSchemas);
+    expect(query.mock.calls.map(([request]) => request.firstRound)).toEqual([true, true]);
+    // 运行时不再把运行内用过的工具写回进程级目录单例。
+    expect(catalog.expandedCount).toBe(0);
+  });
+
+  it('requests complete schemas even when a host already marked catalog tools as expanded', async () => {
+    const catalog = new UnifiedToolCatalog([
+      requiredQueryDefinition('tool_a'),
+      requiredQueryDefinition('tool_b'),
+    ]);
+    // 宿主或其他调用方直接操作公开的 lazy 方法时，运行时也不能据此把未展开工具降级。
+    catalog.markExpanded('tool_a');
+    const query = vi.spyOn(catalog, 'querySchemas');
+    const { runtime, chatWithTools } = runtimeWith(catalog, new PairCapability());
+    chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
+    await runtime.reactLoop('pre-expanded catalog');
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0]?.[0]).toMatchObject({ mode: 'mixed', firstRound: true });
+    expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(fullSchemas);
+    // 类方法语义不变：运行时没有重置或改写宿主自己登记的展开状态。
+    expect(catalog.expandedCount).toBe(1);
+  });
+});

@@ -1726,10 +1726,10 @@ export class AgentRuntime {
       );
     }
 
-    // Lazy Loading: mark used tools as expanded for future rounds
-    if (roundToolNames.length > 0) {
-      this.#markToolsExpanded(roundToolNames);
-    }
+    // 不再把本轮用过的工具写回 container 的 capabilityCatalog（markExpanded）。
+    // 该目录是进程级单例、展开状态从不重置，而 schema 每次运行只在 #initLoop 查询一次：
+    // 运行内写入不会生效，跨运行却会让下一次运行中未用过的工具丢失参数 schema。
+    // 原因与替代行为见 #queryToolSchemas 的 firstRound 注释。
 
     // ExplorationTracker: endRound → 检查阶段转换
     if (tracker) {
@@ -2253,7 +2253,6 @@ export class AgentRuntime {
     const catalog = (this.container as { get?: (name: string) => unknown } | null)?.get?.(
       'capabilityCatalog'
     );
-    const expandedCount = (catalog as { expandedCount?: number } | undefined)?.expandedCount ?? 0;
     return queryToolSchemas(
       catalog,
       {
@@ -2263,7 +2262,14 @@ export class AgentRuntime {
         // catalog 的旧直接调用只拿到裸字符串，不能在那里猜测 provider 身份。
         apiModelId: model.slice(model.indexOf(':') + 1),
         mode: 'mixed',
-        firstRound: expandedCount === 0,
+        // 固定 firstRound:true，不再用目录单例的 expandedCount 推导：
+        // 1) schema 每次运行只查询一次并在全部轮次复用，运行内的 lazy 展开本来就不会生效；
+        // 2) capabilityCatalog 是跨运行共享的进程级实例，其展开状态从不重置，按它推导会让
+        //    后续运行中未用过的工具被投影成空参数 schema（必填参数丢失且没有诊断）。
+        // 因此每次运行都向目录要完整 schema，与实际的运行内行为一致。
+        // RuntimeCapabilityCatalog 本就忽略 firstRound；UnifiedToolCatalog 的 lazy 公开方法语义不变，
+        // 只是运行时不再读写它的实例级展开状态（是否改造成运行作用域属于待决事项）。
+        firstRound: true,
         runtime,
       },
       (method) => {
@@ -2272,18 +2278,6 @@ export class AgentRuntime {
         );
       }
     );
-  }
-
-  /** Mark tools as expanded after use (for lazy loading) */
-  #markToolsExpanded(toolNames: string[]): void {
-    const catalog = (this.container as { get?: (name: string) => unknown } | null)?.get?.(
-      'capabilityCatalog'
-    ) as { markExpanded?(id: string): void } | undefined;
-    if (catalog?.markExpanded) {
-      for (const name of toolNames) {
-        catalog.markExpanded(name);
-      }
-    }
   }
 
   /** 解析 capability 名称为实例 (Pipeline 阶段覆盖时调用) */
