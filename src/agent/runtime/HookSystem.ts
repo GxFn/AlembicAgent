@@ -302,9 +302,10 @@ function attachHookDiagnosticToProcessEvent(
  * Call this during AgentRuntime initialization.
  *
  * Bridges HookSystem → AgentEventBus for backward compatibility.
- * Pipeline middleware (allowlistGate, observationRecord, trackerSignal,
- * traceRecord, submitDedup) remain in ToolExecutionPipeline because they
- * need synchronous access to tool results and loop state.
+ * Pipeline middleware (allowlistGate and the other gates, evidenceCapture,
+ * trackerSignal, traceRecord, submitDedup) remain in ToolExecutionPipeline
+ * because they need synchronous access to tool results and loop state.
+ * 默认装配顺序以 createToolPipeline 为准；observationRecord 已移出默认装配（L5-P47 / I45）。
  */
 export function registerDefaultHooks(
   hookSystem: HookSystem,

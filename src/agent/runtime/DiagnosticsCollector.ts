@@ -276,6 +276,12 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
     });
   }
 
+  /**
+   * 逐调用轨迹（AgentDiagnostics.toolCalls）的生产写入方是 runtimeBridge 的 recordExecutedEnvelope：
+   * 每个拿到路由信封的 runtime 调用都会经 loopCtx.diagnostics 写入这里，所以它不是空通道
+   * （L5-P47 / I45 核对；LightweightRouter 删除后的接线见 runtimeBridge）。ToolDiagnosticsRecorder
+   * 端口与 toolCalls 字段是否继续公开，随待决事项②决定。
+   */
   recordToolCallEnvelope(
     envelope: ToolResultEnvelope,
     context: {

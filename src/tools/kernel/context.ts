@@ -172,7 +172,15 @@ export interface ToolRuntimeCallContext {
   iteration?: number;
   /** 证据台账（Wave A E3）；缺席=非维度场景，note_finding 降级为不校验直存 */
   evidenceLedger?: EvidenceLedgerLike | null;
+  /**
+   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：router、handler、宿主与 Core 都不读取，
+   * 工具权限校验在 Agent 侧 runtimeSafetyGate 完成。字段删除属于公开类型收窄，随待决事项②处理。
+   */
   policyValidator?: ToolPolicyValidator | null;
+  /**
+   * 当前无消费者（L5-P47 / I45）：router、handler、宿主与 Core 都不读取，宿主侧没有第二层结果缓存。
+   * runtimeBridge 仍把 memoryCoordinator 投影到这里，去留随待决事项①（SessionStore 工具缓存去留）决定。
+   */
   cache?: ToolResultCacheProvider | null;
   diagnostics?: ToolDiagnosticsRecorder | null;
   logger?: unknown;
@@ -188,9 +196,17 @@ export interface ToolRuntimeCallContext {
   submittedTitles?: Set<string> | null;
   submittedPatterns?: Set<string> | null;
   submittedTriggers?: Set<string> | null;
+  /**
+   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：没有读取者，旧投影每次调用都对全部
+   * 历史做 O(n) 重映射。字段删除属于公开类型收窄，随待决事项②处理。
+   */
   sessionToolCalls?: Array<{ tool: string; params?: Record<string, unknown> }> | null;
   bootstrapDedup?: unknown;
   memoryCoordinator?: unknown;
+  /**
+   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：与 iteration 重复且没有读取者，
+   * 轮次请读 iteration。字段删除属于公开类型收窄，随待决事项②处理。
+   */
   currentRound?: number;
   dimensionScopeId?: string | null;
 }

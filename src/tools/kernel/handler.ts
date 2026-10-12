@@ -49,9 +49,17 @@ export interface InternalToolHandlerContext {
   _validator?: unknown;
   _submittedTitles?: Set<string>;
   _submittedPatterns?: Set<string>;
+  /**
+   * @deprecated 不再由 contextFromToolCall 填充（L5-P47 / I45）：没有任何 handler 读取，
+   * runtimeBridge 也不再投影 runtime.sessionToolCalls。字段删除属于公开类型收窄，随待决事项②处理。
+   */
   _sessionToolCalls?: Array<{ tool: string; params?: Record<string, unknown> }>;
   _bootstrapDedup?: unknown;
   _memoryCoordinator?: unknown;
+  /**
+   * @deprecated 不再由 contextFromToolCall 填充（L5-P47 / I45）：没有读取者，轮次请用
+   * toolCallContext.runtime.iteration。字段删除属于公开类型收窄，随待决事项②处理。
+   */
   _currentRound?: number;
   _dimensionScopeId?: string;
 }
@@ -101,12 +109,10 @@ export function contextFromToolCall(requestContext: ToolCallContext): InternalTo
     ...(runtime?.submittedPatterns instanceof Set
       ? { _submittedPatterns: runtime.submittedPatterns }
       : {}),
-    ...(Array.isArray(runtime?.sessionToolCalls)
-      ? { _sessionToolCalls: runtime.sessionToolCalls }
-      : {}),
+    // _sessionToolCalls / _currentRound 不再映射（L5-P47 / I45）：handler 中没有读取者，
+    // runtimeBridge 也不再投影对应的 runtime 字段。
     ...(runtime?.bootstrapDedup ? { _bootstrapDedup: runtime.bootstrapDedup } : {}),
     ...(runtime?.memoryCoordinator ? { _memoryCoordinator: runtime.memoryCoordinator } : {}),
-    ...(typeof runtime?.currentRound === 'number' ? { _currentRound: runtime.currentRound } : {}),
     ...(typeof runtime?.dimensionScopeId === 'string'
       ? { _dimensionScopeId: runtime.dimensionScopeId }
       : {}),

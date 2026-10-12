@@ -1,4 +1,7 @@
-/** 执行结果的观察链：证据先落账，再供 memory、tracker、trace 消费；可选事件保持独立。 */
+/**
+ * 执行结果的观察链：证据先落账，再供 tracker、trace 消费；可选事件保持独立。
+ * observationRecord（memory 观察）已移出默认装配（L5-P47 / I45），只在显式装配时运行。
+ */
 import {
   appendEvidenceAnnotation,
   captureEvidenceFromEnvelope,
@@ -19,9 +22,9 @@ function isSuccessfulToolObservation(call: ToolCall, result: unknown, meta: Tool
 /**
  * EvidenceCapture — 证据台账采集（Wave A E2）
  *
- * after（必须排在 observationRecord/traceRecord 之前）：证据类工具成功返回时自动落台账，
- * 并把 `[evidence] E-x=file:range` 标注追加进 envelope.text——模型看到的文本、记忆观察、
- * 推理链留痕三者一致，模型从第一眼即以条目 ID 认知证据。
+ * after（必须排在 trackerSignal/traceRecord 之前；显式装配 observationRecord 时也排在它之前）：
+ * 证据类工具成功返回时自动落台账，并把 `[evidence] E-x=file:range` 标注追加进 envelope.text——
+ * 模型看到的文本、推理链留痕（及显式装配时的记忆观察）一致，模型从第一眼即以条目 ID 认知证据。
  * loopCtx.evidenceLedger 缺席（非维度场景）时零行为；采集部分失败保留已确认标注，不能宣称零落账。
  */
 export const evidenceCapture = {
@@ -55,9 +58,14 @@ export const evidenceCapture = {
 };
 
 /**
- * ObservationRecord — MemoryCoordinator 观察记录
+ * ObservationRecord — MemoryCoordinator 观察记录（不在默认装配）
  *
- * after: 记录工具执行观察
+ * after: 把工具结果交给 MemoryCoordinator.recordObservation，后者唯一的效果是写 SessionStore
+ * 工具缓存。生产中这是空操作（L5-P47 / I45）：宿主路由总带信封，这里以 cacheHit=true 调用，
+ * MemoryCoordinator 跳过写入；无信封的结果只来自门拦截、宿主抛错或发起前取消，都带 error，
+ * SessionStore 拒收。因此 createToolPipeline 不再装配它。
+ * 公开导出的去留依赖待决事项②，SessionStore 工具缓存的去留依赖事项①；决定前保留本实现，
+ * 显式装配时行为与旧版一致。
  */
 export const observationRecord = {
   name: 'observationRecord',
@@ -111,6 +119,9 @@ export const traceRecord = {
  *
  * NOTE: 默认管道不包含此中间件，因为 tool_end 事件需要 resultStr.length，
  * 而 resultStr 在管道外部计算。由 #processToolCalls 直接处理。
+ * 收窄登记（L5-P47 / I45，待决事项②）：与 Runtime 自发的 tool_end 已漂移——这里在失败时优先取
+ * envelope.text，Runtime 只在 !envelope.ok 时取信封文本，且事件不带 resultSize/processEvent。宿主零引用；
+ * ②确认收窄则删除，保留则改为与 Runtime 同源的错误选择。
  */
 export const progressEmitter = {
   name: 'progressEmitter',
@@ -136,6 +147,9 @@ export const progressEmitter = {
  *
  * NOTE: 默认管道不包含此中间件。由 #processToolCalls 直接处理，
  * 与原始 reactLoop 保持完全一致的事件顺序。
+ * 收窄登记（L5-P47 / I45，待决事项②）：事件名是字面量而非 AgentEvents 常量，且不带
+ * processEvent，与 Runtime 的 TOOL_CALL_START/END 形状不同。宿主零引用；
+ * ②确认收窄则删除，保留则改为引用 AgentEvents 常量并补齐字段。
  */
 export const eventBusPublisher = {
   name: 'eventBusPublisher',

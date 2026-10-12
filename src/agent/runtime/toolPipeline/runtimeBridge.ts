@@ -185,6 +185,12 @@ function reportBridgeFailure(
   warnSafely(context.runtime, `[ToolPipeline] ${warning.code}: ${warning.message}`);
 }
 
+/**
+ * 宿主请求投影。只投影有读取者的字段（L5-P47 / I45）：policyValidator（权限校验由 Agent 侧
+ * runtimeSafetyGate 完成）、sessionToolCalls（每次调用对全部历史做 O(n) 重映射）与 currentRound
+ * （与 iteration 重复）在 src/tools、宿主与 Core 中都没有读取者，已不再投影；
+ * ToolRuntimeCallContext 上对应的可选字段是否收窄依赖待决事项②，这里不改类型。
+ */
 function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): ToolCallRequest {
   const { runtime, loopCtx } = context;
   const executableCall = toExecutableToolCall(call);
@@ -214,7 +220,9 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       resourceScope: loopCtx.resourceScope,
       presetName: runtime.presetName,
       iteration: loopCtx.iteration || 0,
-      policyValidator: runtime.policies,
+      // 当前无消费者：src/tools、宿主与 Core 都不读取 runtime.cache，宿主侧没有第二层结果缓存；
+      // 把 memoryCoordinator 放在这里只是旧投影的残留。字段去留随待决事项①（SessionStore
+      // 工具缓存去留）一起决定，决定前保持原样投影，不改变宿主收到的请求形状。
       cache: loopCtx.memoryCoordinator || null,
       diagnostics: loopCtx.diagnostics || null,
       safetyPolicy,
@@ -229,12 +237,10 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       submittedTitles: loopCtx.sharedState?.submittedTitles || null,
       submittedPatterns: loopCtx.sharedState?.submittedPatterns || null,
       submittedTriggers: loopCtx.sharedState?.submittedTriggers || null,
-      sessionToolCalls: projectSessionToolCalls(loopCtx),
       bootstrapDedup: loopCtx.sharedState?._bootstrapDedup || null,
       memoryCoordinator: loopCtx.memoryCoordinator || null,
       evidenceLedger: loopCtx.evidenceLedger || null,
       dimensionScopeId: resolveDimensionScopeId(loopCtx),
-      currentRound: loopCtx.iteration || 0,
       // 未声明时不出现该键：没有隔离意图的运行，请求形状与旧版完全一致。
       ...(terminalIntent ? { terminalIntent } : {}),
     },
@@ -307,22 +313,6 @@ function resolveProjectLanguage(loopCtx: ToolLoopPort): string | null {
 function resolveDimensionScopeId(loopCtx: ToolLoopPort): string | null {
   const scopeId = loopCtx.sharedState?._dimensionScopeId;
   return typeof scopeId === 'string' ? scopeId : null;
-}
-
-function projectSessionToolCalls(
-  loopCtx: ToolLoopPort
-): Array<{ tool: string; params?: Record<string, unknown> }> | null {
-  if (!Array.isArray(loopCtx.toolCalls)) {
-    return null;
-  }
-
-  return loopCtx.toolCalls.map((entry: { tool?: string; args?: unknown }) => ({
-    tool: String(entry.tool || ''),
-    params:
-      entry.args && typeof entry.args === 'object'
-        ? (entry.args as Record<string, unknown>)
-        : undefined,
-  }));
 }
 
 function recordExecutedEnvelope(

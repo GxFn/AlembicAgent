@@ -85,7 +85,8 @@ describe('Runtime operation boundary', () => {
     const close = vi.spyOn(trace, 'endRound').mockImplementation(() => {
       throw closeFailure;
     });
-    vi.spyOn(memory, 'recordObservation').mockImplementation(() => {
+    // 默认管道的 postprocessing 观察者（observationRecord 已移出默认装配，L5-P47 / I45）。
+    vi.spyOn(trace, 'recordToolCall').mockImplementation(() => {
       throw primaryFailure;
     });
     const chat = vi
@@ -267,8 +268,8 @@ describe('Runtime operation boundary', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
+  // memory 不再是默认 postprocessing 观察者：observationRecord 已移出默认装配（L5-P47 / I45）。
   it.each([
-    'memory',
     'tracker',
     'trace',
   ] as const)('retains the returned host receipt when default %s postprocessing fails', async (port) => {
@@ -283,12 +284,9 @@ describe('Runtime operation boundary', () => {
     if (!tracker) {
       throw new Error('Tracker fixture must resolve');
     }
+    const recordObservation = vi.spyOn(memory, 'recordObservation');
     const after =
-      port === 'memory'
-        ? vi.spyOn(memory, 'recordObservation')
-        : port === 'trace'
-          ? vi.spyOn(trace, 'recordToolCall')
-          : vi.spyOn(tracker, 'recordToolCall');
+      port === 'trace' ? vi.spyOn(trace, 'recordToolCall') : vi.spyOn(tracker, 'recordToolCall');
     after.mockImplementation(() => {
       throw failure;
     });
@@ -317,6 +315,7 @@ describe('Runtime operation boundary', () => {
       });
       expect(execute).toHaveBeenCalledOnce();
       expect(after).toHaveBeenCalledOnce();
+      expect(recordObservation).not.toHaveBeenCalled();
       expect(chat).toHaveBeenCalledOnce();
       expect(result.status).toBe('error');
       expect(result.reply).toBe(failure.message);
@@ -330,6 +329,7 @@ describe('Runtime operation boundary', () => {
       expect(runtime.toolCallHistory[0].envelope).toBe(await execute.mock.results[0].value);
     } finally {
       after.mockRestore();
+      recordObservation.mockRestore();
       memory.dispose();
       vi.useRealTimers();
     }

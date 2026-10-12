@@ -349,7 +349,7 @@ describe('tool pipeline lifecycle', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('TOOL_BLOCKED_RESULT_NORMALIZED'));
   });
 
-  it('captures evidence before memory, tracker and trace consume the same envelope', async () => {
+  it('captures evidence before tracker and trace consume the same envelope', async () => {
     const order: string[] = [];
     const ledger = new EvidenceLedgerStore({
       dataRoot: createTempProject('pipeline-order-'),
@@ -365,12 +365,9 @@ describe('tool pipeline lifecycle', () => {
     const loopCtx = createLoopContext(new DiagnosticsCollector());
     loopCtx.evidenceLedger = ledger;
     // 这些观察端口只替代外部消费者；台账、默认工厂与 envelope 流转使用真实实现。
-    loopCtx.memoryCoordinator = {
-      recordObservation: (_name: string, _args: unknown, envelope: ToolResultEnvelope) => {
-        expect(envelope.text).toContain('[evidence]');
-        order.push('memory');
-      },
-    } as never;
+    // observationRecord 已移出默认装配（L5-P47 / I45）：memory 观察端口不再被默认管道调用。
+    const recordObservation = vi.fn();
+    loopCtx.memoryCoordinator = { recordObservation } as never;
     loopCtx.tracker = {
       noteLedgerStats: () => {
         order.push('ledger');
@@ -397,7 +394,8 @@ describe('tool pipeline lifecycle', () => {
       { runtime, loopCtx, iteration: 1 }
     );
     expect(result.metadata.envelope?.text).toContain('[evidence]');
-    expect(order).toEqual(['ledger', 'memory', 'tracker', 'trace']);
+    expect(order).toEqual(['ledger', 'tracker', 'trace']);
+    expect(recordObservation).not.toHaveBeenCalled();
   });
   it('awaits before hooks and invokes after hooks in registration order', async () => {
     const events: string[] = [];
