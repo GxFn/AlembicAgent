@@ -51,9 +51,15 @@ function stringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
+/**
+ * 去重后排序的结果写进 retrievalProfile.provenance（evidenceRefs / sourceFieldRefs），Core 的
+ * profileHash / documentSetHash 依赖这个顺序。排序规则固定为 en，不随进程默认区域变化：
+ * 英文、中文环境下与历史顺序一致，其他区域（如 hu、da、sv）也得到同一顺序。是否改为码元序
+ * 及已持久化哈希的迁移另行决定。
+ */
 function distinctSorted(values: string[]): string[] {
   return [...new Set(values.map(text).filter(Boolean))].sort((left, right) =>
-    left.localeCompare(right)
+    left.localeCompare(right, 'en')
   );
 }
 

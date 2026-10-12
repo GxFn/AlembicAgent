@@ -15,12 +15,19 @@
  *     resolver 下，host-agent 路径与 in-process 路径的 validateAgainst 裁决逐字节一致（path 标签
  *     不得改变裁决）。
  */
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
-  isSoftAuthoringViolation as coreSoftViolation,
-  applyStyleWaiver as coreStyleWaiver,
   type RecipeAuthoringProfile,
   type RecipeAuthoringViolation,
   renderGuidance,
@@ -33,10 +40,7 @@ import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
-import {
-  applyStyleWaiver,
-  isSoftAuthoringViolation,
-} from '../src/tools/runtime/handlers/knowledge.js';
+import * as knowledgeHandler from '../src/tools/runtime/handlers/knowledge.js';
 import {
   createInProcessSourceRefResolver,
   formatRecipeAuthoringViolations,
@@ -678,6 +682,28 @@ describe('P4 in-process wrapper parity — runInProcessRecipeAuthoringGate == di
 });
 
 it('reuses the Core style waiver authority without a second rule implementation', () => {
-  expect(applyStyleWaiver).toBe(coreStyleWaiver);
-  expect(isSoftAuthoringViolation).toBe(coreSoftViolation);
+  // 软规则判定与风格豁免只有 Core 一份实现：authoring 路径直接从 Core 包入口导入；knowledge
+  // handler 入口不再转发这两个函数（那份重导出没有生产消费者，只会让人误以为存在外部兼容面）。
+  expect(Object.keys(knowledgeHandler)).toEqual(['handle']);
+
+  const srcRoot = fileURLToPath(new URL('../src', import.meta.url));
+  const authoring = readFileSync(
+    path.join(srcRoot, 'tools/runtime/handlers/knowledge/authoring.ts'),
+    'utf8'
+  );
+  const coreImport = authoring.match(/import\s*\{([^}]*)\}\s*from '@alembic\/core\/knowledge';/u);
+  expect(coreImport?.[1]).toMatch(/\bapplyStyleWaiver\b/u);
+  expect(coreImport?.[1]).toMatch(/\bisSoftAuthoringViolation\b/u);
+
+  const sourceFiles = (directory: string): string[] =>
+    readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+      const target = path.join(directory, entry.name);
+      return entry.isDirectory() ? sourceFiles(target) : target.endsWith('.ts') ? [target] : [];
+    });
+  const secondImplementation =
+    /\b(?:function\s+|(?:const|let|var)\s+)(?:applyStyleWaiver|isSoftAuthoringViolation)\b/u;
+  const redefined = sourceFiles(srcRoot)
+    .filter((file) => secondImplementation.test(readFileSync(file, 'utf8')))
+    .map((file) => path.relative(srcRoot, file));
+  expect(redefined).toEqual([]);
 });

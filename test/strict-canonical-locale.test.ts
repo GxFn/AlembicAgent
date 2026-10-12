@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { hashCanonical } from '../src/agent/production/strict/primitives.js';
+import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 
 /**
  * 仓内自用规范哈希的区域无关性钉子。
@@ -88,5 +89,65 @@ describe('agent-internal canonical hashes do not depend on the process locale', 
       expect(sorter, file).toContain("left.localeCompare(right, 'en')");
       expect(sorter, file).not.toMatch(/localeCompare\(right\)/u);
     }
+  });
+});
+
+/**
+ * 配方检索 profile 的 provenance 排序同样进入哈希：evidenceRefs / sourceFieldRefs 原样写进
+ * Core retrievalProfile，Core 的 profileHash / documentSetHash 依赖它们的顺序。排序器不固定
+ * 区域时，同一配方在不同默认区域的进程（守护进程与交互进程）里重新撰写会得到不同哈希，向量
+ * 索引把未变化的配方判为过期。这里与 sortCanonical 一样固定为 en 排序规则；是否改为码元序
+ * 以及已持久化哈希的迁移另行决定。
+ */
+describe('recipe production provenance order does not depend on the process locale', () => {
+  const ADAPTER_FILE = 'tools/runtime/handlers/recipeProductionAdapter.ts';
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('pins the collation in every localeCompare of the recipe production adapter', () => {
+    const source = readFileSync(path.join(SRC_ROOT, ADAPTER_FILE), 'utf8');
+    const calls = source.match(/\.localeCompare\([^)]*\)/gu) ?? [];
+
+    // 至少要有 distinctSorted 这一处；每一处都必须显式传 'en'，不允许回落进程默认区域。
+    expect(calls.length, ADAPTER_FILE).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call, ADAPTER_FILE).toMatch(/,\s*'en'\s*\)$/u);
+    }
+  });
+
+  it.each([
+    'hu',
+    'da',
+    'lt',
+  ])('keeps the sourceFieldRefs order when the process default collation is %s', (locale) => {
+    // 这些键在 hu/da/lt 下与 en 的相对顺序不同（`cs`/`cz`、`aa`/`z`、`iz`/`y`），足以暴露未固定区域的排序。
+    const rawItem = {
+      title: 'Locale pinned provenance',
+      retrievalProfile: {
+        primaryLanguage: 'en',
+        summary: { primary: 'p', technicalEnglish: 't' },
+        provenance: {
+          sourceFieldRefs: ['field:cz', 'field:cs', 'field:z', 'field:aa', 'field:y', 'field:iz'],
+        },
+      },
+    };
+    const sourceFieldRefs = () =>
+      prepareRecipeProductionItem(rawItem, SRC_ROOT).item.retrievalProfile?.provenance
+        .sourceFieldRefs;
+    const baseline = sourceFieldRefs();
+    expect(baseline).toEqual([
+      'field:aa',
+      'field:cs',
+      'field:cz',
+      'field:iz',
+      'field:y',
+      'field:z',
+    ]);
+
+    simulateDefaultLocale(locale);
+
+    expect(sourceFieldRefs()).toEqual(baseline);
   });
 });

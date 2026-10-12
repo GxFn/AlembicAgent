@@ -79,8 +79,10 @@ async function handleSearch(
   params: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const patterns =
-    (params.patterns as string[]) ?? (params.pattern ? [params.pattern as string] : []);
+  // 只读 patterns[]：schema 把 patterns 列为 required，router 的 Ajv 阶段已拒绝只带单数 pattern
+  // 的调用，所以这里不保留单数回退。缺失或非数组（只可能来自绕过 router 的直调）与空数组一样
+  // 返回明确的 fail，不会把字符串逐字符当成多个 pattern 搜索。
+  const patterns = Array.isArray(params.patterns) ? (params.patterns as string[]) : [];
   if (patterns.length === 0) {
     return fail('code.search requires patterns[]');
   }

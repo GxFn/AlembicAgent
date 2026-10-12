@@ -1,11 +1,9 @@
-/** 知识工具统一路由；原 handle 与 Core 风格规则重导出入口保持兼容。 */
+/** 知识工具统一路由：按 action 分派到 knowledge/ 下的查询、提交与管理实现。 */
 import { fail, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
 import { handleManage } from './knowledge/management.js';
 import { abortedKnowledgeResult } from './knowledge/operation.js';
 import { handleDetail, handlePrime, handleSearch } from './knowledge/queries.js';
 import { handleSubmit } from './knowledge/submission.js';
-
-export { applyStyleWaiver, isSoftAuthoringViolation } from '@alembic/core/knowledge';
 
 export async function handle(
   action: string,
