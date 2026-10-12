@@ -8,7 +8,10 @@ import { createDeepSeek, type DeepSeekProvider as DeepSeekSdkProvider } from '@a
 import type { LanguageModelV4GenerateResult } from '@ai-sdk/provider';
 import Logger from '@alembic/core/logging';
 import type { LlmCallOptions, UnifiedMessage } from '../contracts.js';
-import { parseDeepSeekTextToolCalls } from '../deepseekToolCallCompat.js';
+import {
+  type DeepSeekTextToolCallInspection,
+  inspectDeepSeekTextToolCalls,
+} from '../deepseekToolCallCompat.js';
 import { resolveDeepSeekV4Family } from '../registry/ModelQuirks.js';
 import { normalizeToolTranscriptForChatCompletions } from '../toolTranscript.js';
 import {
@@ -20,6 +23,53 @@ import {
 import { type SdkCallContext, sdkConnection } from './sdkContext.js';
 import { normalizeSdkError } from './sdkErrors.js';
 import { isRecord, sdkCallOptions, sdkResponse } from './sdkProtocol.js';
+
+const MAX_LOGGED_DROPPED_NAMES = 8;
+const MAX_LOGGED_NAME_LENGTH = 64;
+
+/**
+ * 兼容桥丢弃诊断。未知工具名、未闭合、嵌套、围栏样例、块外 invoke 不转译是既定行为，保持不变；
+ * 这里只在文本含 `<function_calls` 且转译为空或有丢弃时告警，让运维区分“模型没调工具”与
+ * “调了但被兼容桥丢弃”。只记录原因、选择路径、丢弃的工具名（截断并 JSON 转义）与 finishReason，
+ * 不记录参数正文或消息内容。
+ */
+function warnCompatDrops(
+  text: string,
+  inspection: DeepSeekTextToolCallInspection,
+  finishReason: string | undefined
+): void {
+  const { calls, diagnostics } = inspection;
+  if (!text.includes('<function_calls')) {
+    return;
+  }
+  const reasons: string[] = [];
+  if (diagnostics.droppedUnknownNames.length) {
+    reasons.push('unknown_tool_name');
+  }
+  if (diagnostics.unclosedBlock) {
+    reasons.push('unclosed_block');
+  }
+  if (diagnostics.nestedBlocksSkipped) {
+    reasons.push('nested_block_skipped');
+  }
+  if (!reasons.length) {
+    if (calls.length) {
+      // 全部转译成功、没有任何丢弃：由 compatibility_text_tool_calls 日志覆盖，不重复告警。
+      return;
+    }
+    // 只有围栏样例/行内标记（无完整声明块），或声明块内没有可解析的 invoke（invoke 在块外等）。
+    reasons.push(diagnostics.declaredBlocks ? 'no_parsable_invoke' : 'no_declared_block');
+  }
+  const names = diagnostics.droppedUnknownNames
+    .slice(0, MAX_LOGGED_DROPPED_NAMES)
+    .map((name) => name.slice(0, MAX_LOGGED_NAME_LENGTH));
+  // path=text_kept：没有可执行调用，文本原样作为模型输出返回；
+  // path=partial_translation：已转译的调用继续执行，未转译部分随文本一起被替换掉。
+  const path = calls.length ? 'partial_translation' : 'text_kept';
+  Logger.getInstance().warn(
+    `[DeepSeekTransport] compatibility_text_tool_calls_dropped reasons=${reasons.join(',')} path=${path} translated=${calls.length} declaredBlocks=${diagnostics.declaredBlocks} droppedUnknownNames=${JSON.stringify(names)} droppedUnknownCount=${diagnostics.droppedUnknownNames.length} unclosedBlock=${diagnostics.unclosedBlock} nestedBlocksSkipped=${diagnostics.nestedBlocksSkipped} finishReason=${finishReason ?? 'unknown'}`
+  );
+}
 
 export class DeepSeekTransport extends LLMTransport {
   readonly #client: DeepSeekSdkProvider;
@@ -51,8 +101,9 @@ export class DeepSeekTransport extends LLMTransport {
       request.messages.map((message) => ({ ...message }))
     );
     if (normalized.normalizedCount) {
+      // droppedContinuations：转写后的 assistant 消息不再回放原生续接，在此一并说明，替代回放层的误导性告警。
       Logger.getInstance().warn(
-        `[DeepSeekTransport] normalized ${normalized.normalizedCount} incomplete tool transcript messages before request`
+        `[DeepSeekTransport] normalized ${normalized.normalizedCount} incomplete tool transcript messages before request droppedContinuations=${normalized.droppedContinuationCount}`
       );
     }
     // 纯本仓投影仅保留 UnifiedMessage 或生成同合同的 user/assistant 文本；不是厂商 JSON 断言。
@@ -118,10 +169,12 @@ export class DeepSeekTransport extends LLMTransport {
         .filter((part) => part.type === 'text')
         .map((part) => part.text)
         .join('');
-      const compatCalls = parseDeepSeekTextToolCalls(
+      const inspection = inspectDeepSeekTextToolCalls(
         text,
         request.tools?.map((tool) => tool.name)
       );
+      const compatCalls = inspection.calls;
+      warnCompatDrops(text, inspection, result.finishReason.raw ?? result.finishReason.unified);
       if (compatCalls.length) {
         Logger.getInstance().warn(
           `[DeepSeekTransport] compatibility_text_tool_calls count=${compatCalls.length}; validating translated arguments`

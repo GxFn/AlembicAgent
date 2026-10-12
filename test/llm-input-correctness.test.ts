@@ -1,11 +1,15 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { buildAnalystPrompt } from '../src/agent/prompts/index.js';
-import type { UnifiedMessage } from '../src/ai/contracts.js';
-import { parseDeepSeekTextToolCalls } from '../src/ai/deepseekToolCallCompat.js';
+import type { LlmContinuation, UnifiedMessage } from '../src/ai/contracts.js';
+import {
+  inspectDeepSeekTextToolCalls,
+  parseDeepSeekTextToolCalls,
+} from '../src/ai/deepseekToolCallCompat.js';
 import { isTextCompatToolCallId } from '../src/ai/registry/ModelQuirks.js';
 import { normalizeToolTranscriptForChatCompletions } from '../src/ai/toolTranscript.js';
 import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
@@ -22,7 +26,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function deepSeekReply(content: string) {
+function deepSeekReply(content: string, finishReason = 'stop') {
   return {
     id: 'fixture',
     created: 1,
@@ -30,7 +34,7 @@ function deepSeekReply(content: string) {
     choices: [
       {
         index: 0,
-        finish_reason: 'stop',
+        finish_reason: finishReason,
         message: { role: 'assistant', content, reasoning_content: 'fixture' },
       },
     ],
@@ -121,6 +125,235 @@ describe('DeepSeek text tool declaration boundary', () => {
       tools: [codeTool],
     });
     expect(result.functionCalls?.[0].args.snippet).toBe(snippet);
+  });
+});
+
+const readFileInvoke = codeInvoke.replace('name="code"', 'name="read_file"');
+
+/** 经真实 DeepSeekTransport 走一遍兼容桥，收集丢弃诊断告警；fetch 由 mockJsonFetch 截获。 */
+async function runCompatTranslation(text: string, finishReason = 'stop') {
+  const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+  mockJsonFetch({}, deepSeekReply(text, finishReason));
+  const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+    model: 'deepseek-v4-pro',
+    messages: [{ role: 'user', content: 'fixture' }],
+    tools: [codeTool],
+  });
+  const dropWarnings = warn.mock.calls
+    .map(([entry]) => String(entry))
+    .filter((entry) => entry.includes('compatibility_text_tool_calls_dropped'));
+  return { result, dropWarnings };
+}
+
+describe('DeepSeek text tool compat drop diagnostics', () => {
+  it('reports unknown tool names from the parser without changing the dropped result', () => {
+    const text = `<function_calls>${readFileInvoke}</function_calls>`;
+    expect(parseDeepSeekTextToolCalls(text, ['code'])).toEqual([]);
+    expect(inspectDeepSeekTextToolCalls(text, ['code'])).toEqual({
+      calls: [],
+      diagnostics: {
+        declaredBlocks: 1,
+        droppedUnknownNames: ['read_file'],
+        unclosedBlock: false,
+        nestedBlocksSkipped: 0,
+      },
+    });
+  });
+
+  it('warns with dropped names and finishReason but never the argument body', async () => {
+    const text = `<function_calls>${readFileInvoke}</function_calls>`;
+    const { result, dropWarnings } = await runCompatTranslation(text);
+    // 有意行为不变：未知工具名不转译，文本原样作为模型输出返回。
+    expect(result.functionCalls).toBeNull();
+    expect(result.text).toBe(text);
+    expect(dropWarnings).toHaveLength(1);
+    const [warning] = dropWarnings;
+    expect(warning).toContain('reasons=unknown_tool_name');
+    expect(warning).toContain('path=text_kept');
+    expect(warning).toContain('translated=0');
+    expect(warning).toContain('droppedUnknownNames=["read_file"]');
+    expect(warning).toContain('finishReason=stop');
+    expect(warning).not.toContain('declared.ts');
+    expect(warning).not.toContain('<parameter');
+  });
+
+  it('warns unclosedBlock when the declaration is cut off by the output budget', async () => {
+    const text = `<function_calls>${codeInvoke}`;
+    expect(inspectDeepSeekTextToolCalls(text, ['code']).diagnostics).toEqual({
+      declaredBlocks: 0,
+      droppedUnknownNames: [],
+      unclosedBlock: true,
+      nestedBlocksSkipped: 0,
+    });
+    const { result, dropWarnings } = await runCompatTranslation(text, 'length');
+    expect(result.functionCalls).toBeNull();
+    expect(result.text).toBe(text);
+    expect(dropWarnings).toHaveLength(1);
+    expect(dropWarnings[0]).toContain('reasons=unclosed_block');
+    expect(dropWarnings[0]).toContain('unclosedBlock=true');
+    expect(dropWarnings[0]).toContain('finishReason=length');
+    expect(dropWarnings[0]).not.toContain('declared.ts');
+  });
+
+  it('warns nestedBlocksSkipped when a declaration contains another declaration', async () => {
+    const text = `<function_calls><function_calls>${codeInvoke}</function_calls></function_calls>`;
+    expect(inspectDeepSeekTextToolCalls(text, ['code']).diagnostics).toMatchObject({
+      declaredBlocks: 0,
+      unclosedBlock: false,
+      nestedBlocksSkipped: 1,
+    });
+    const { result, dropWarnings } = await runCompatTranslation(text);
+    expect(result.functionCalls).toBeNull();
+    expect(dropWarnings).toHaveLength(1);
+    expect(dropWarnings[0]).toContain('reasons=nested_block_skipped');
+    expect(dropWarnings[0]).toContain('nestedBlocksSkipped=1');
+  });
+
+  it('warns partial translation when a known call is kept and an unknown one dropped', async () => {
+    const text = `<function_calls>${codeInvoke}${readFileInvoke}</function_calls>`;
+    const { result, dropWarnings } = await runCompatTranslation(text);
+    expect(result.functionCalls).toEqual([
+      {
+        id: 'call_deepseek_compat_1',
+        name: 'code',
+        args: { action: 'read', params: { path: 'declared.ts' } },
+      },
+    ]);
+    expect(dropWarnings).toHaveLength(1);
+    expect(dropWarnings[0]).toContain('path=partial_translation');
+    expect(dropWarnings[0]).toContain('translated=1');
+    expect(dropWarnings[0]).toContain('droppedUnknownNames=["read_file"]');
+  });
+
+  it.each([
+    {
+      name: 'invoke before declaration',
+      text: `${codeInvoke}\n<function_calls></function_calls>`,
+      reason: 'no_parsable_invoke',
+    },
+    {
+      name: 'invoke after declaration',
+      text: `<function_calls></function_calls>\n${codeInvoke}`,
+      reason: 'no_parsable_invoke',
+    },
+    {
+      name: 'fenced example',
+      text: `\`\`\`xml\n<function_calls>${codeInvoke}</function_calls>\n\`\`\``,
+      reason: 'no_declared_block',
+    },
+    {
+      name: 'unclosed fenced example',
+      text: `\`\`\`xml\n<function_calls>${codeInvoke}</function_calls>`,
+      reason: 'no_declared_block',
+    },
+  ])('keeps $name as text and records reason $reason', async ({ text, reason }) => {
+    const { result, dropWarnings } = await runCompatTranslation(text);
+    expect(result.functionCalls).toBeNull();
+    expect(result.text).toBe(text);
+    expect(dropWarnings).toHaveLength(1);
+    expect(dropWarnings[0]).toContain(`reasons=${reason}`);
+    expect(dropWarnings[0]).toContain('path=text_kept');
+  });
+
+  it('diagnoses an inline mention that swallows a later declaration (translation unchanged)', async () => {
+    // 行内反引号提及打开了外层块，使后续合法声明被判为嵌套；是否把行内提及视为样例属于
+    // 正确性变化，需单独评审，本包只保证这种丢弃可被诊断。
+    const text = `I will use the \`<function_calls>\` syntax now.\n<function_calls>${codeInvoke}</function_calls>`;
+    const { result, dropWarnings } = await runCompatTranslation(text);
+    expect(result.functionCalls).toBeNull();
+    expect(dropWarnings).toHaveLength(1);
+    expect(dropWarnings[0]).toContain('unclosedBlock=true');
+  });
+
+  it.each([
+    {
+      name: 'a fully translated declaration',
+      text: `<function_calls>${codeInvoke}</function_calls>`,
+    },
+    { name: 'plain text without declarations', text: 'done' },
+  ])('does not warn about drops for $name', async ({ text }) => {
+    const { dropWarnings } = await runCompatTranslation(text);
+    expect(dropWarnings).toEqual([]);
+  });
+});
+
+describe('tool transcript continuation cleanup', () => {
+  const continuation: LlmContinuation = {
+    provider: 'deepseek',
+    model: 'deepseek-v4-pro',
+    connection: 'fixture-connection',
+    projectionHash: 'fixture-hash',
+    kind: 'content-replay-v1',
+    parts: [
+      { type: 'reasoning', text: 'retained thought' },
+      { type: 'tool-call', id: 'first' },
+      { type: 'tool-call', id: 'second' },
+    ],
+  };
+
+  function roundWith(replies: string[]): UnifiedMessage[] {
+    return [
+      {
+        role: 'assistant',
+        content: null,
+        reasoningContent: 'retained thought',
+        continuation,
+        toolCalls: ['first', 'second'].map((id) => ({
+          id,
+          name: 'code',
+          args: { action: 'read', params: { path: 'fixture.ts' } },
+        })),
+      },
+      ...replies.map(
+        (id): UnifiedMessage => ({
+          role: 'tool',
+          name: 'code',
+          toolCallId: id,
+          content: 'observed result',
+        })
+      ),
+      { role: 'user', content: 'continue' },
+    ];
+  }
+
+  it('drops the native continuation when an incomplete round is converted to text', () => {
+    const normalized = normalizeToolTranscriptForChatCompletions(
+      roundWith(['first']).map((message) => ({ ...message }))
+    );
+    expect(normalized.normalizedCount).toBe(2);
+    expect(normalized.droppedContinuationCount).toBe(1);
+    expect(normalized.messages[0]?.content).toContain('tool calls converted to text');
+    expect(normalized.messages[0]).not.toHaveProperty('continuation');
+  });
+
+  it('keeps the native continuation on complete rounds', () => {
+    const normalized = normalizeToolTranscriptForChatCompletions(
+      roundWith(['first', 'second']).map((message) => ({ ...message }))
+    );
+    expect(normalized.normalizedCount).toBe(0);
+    expect(normalized.droppedContinuationCount).toBe(0);
+    expect(normalized.messages[0]?.continuation).toEqual(continuation);
+  });
+
+  it('stops misattributed continuation_filtered warnings for converted rounds', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const capture: { body?: Record<string, unknown> } = {};
+    mockJsonFetch(capture, deepSeekReply('done'));
+    const result = await new DeepSeekTransport({ apiKey: 'fixture-key' }).chatWithTools({
+      model: 'deepseek-v4-pro',
+      messages: roundWith(['first']),
+      tools: [codeTool],
+    });
+    expect(result.text).toBe('done');
+    const warnings = warn.mock.calls.map(([entry]) => String(entry));
+    expect(warnings.filter((entry) => entry.includes('continuation_filtered'))).toEqual([]);
+    const transcriptWarning = warnings.find((entry) =>
+      entry.includes('incomplete tool transcript messages')
+    );
+    expect(transcriptWarning).toContain('normalized 2');
+    expect(transcriptWarning).toContain('droppedContinuations=1');
+    const sent = capture.body?.messages as Array<Record<string, unknown>>;
+    expect(sent.find((message) => message.role === 'assistant')?.tool_calls).toBeUndefined();
   });
 });
 

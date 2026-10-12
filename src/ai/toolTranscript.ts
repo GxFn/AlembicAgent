@@ -11,6 +11,8 @@ type MessageRecord = Record<string, unknown>;
 export interface ToolTranscriptNormalizationResult {
   messages: MessageRecord[];
   normalizedCount: number;
+  /** 转写为文本的 assistant 消息上被丢弃的原生续接数量；转写后的消息不再能回放原生元数据。 */
+  droppedContinuationCount: number;
 }
 
 function toolCallsOf(message: MessageRecord): MessageRecord[] {
@@ -55,6 +57,10 @@ function cloneWithoutToolCalls(message: MessageRecord): MessageRecord {
   delete clone.toolCalls;
   delete clone.reasoning_content;
   delete clone.reasoningContent;
+  // 转写后的消息已不是原生协议回执：续接里的 tool-call/文本投影与新正文必然不一致，
+  // 回放层每次都会拒绝并以 continuation_filtered 告警（错误归因为投影被改动）。
+  // 在改写点直接丢弃，丢弃数量由调用方汇总进转写告警，不再产生误导性的续接告警。
+  delete clone.continuation;
   return clone;
 }
 
@@ -120,11 +126,11 @@ function isCompleteImmediateToolRound(
  * remain valid after context slicing.
  */
 export function normalizeToolTranscriptForChatCompletions(
-  messages: readonly MessageRecord[],
-  opts: { forceToolFree?: boolean } = {}
+  messages: readonly MessageRecord[]
 ): ToolTranscriptNormalizationResult {
   const normalized: MessageRecord[] = [];
   let normalizedCount = 0;
+  let droppedContinuationCount = 0;
 
   for (let index = 0; index < messages.length; ) {
     const message = messages[index] || {};
@@ -139,9 +145,12 @@ export function normalizeToolTranscriptForChatCompletions(
         cursor++;
       }
 
-      if (!opts.forceToolFree && isCompleteImmediateToolRound(message, toolMessages)) {
+      if (isCompleteImmediateToolRound(message, toolMessages)) {
         normalized.push({ ...message }, ...toolMessages.map((toolMessage) => ({ ...toolMessage })));
       } else {
+        if (message.continuation !== undefined) {
+          droppedContinuationCount++;
+        }
         normalized.push(assistantToolCallsAsText(message));
         normalized.push(...toolMessages.map((toolMessage) => toolResultAsUserMessage(toolMessage)));
         normalizedCount += 1 + toolMessages.length;
@@ -161,5 +170,5 @@ export function normalizeToolTranscriptForChatCompletions(
     index++;
   }
 
-  return { messages: normalized, normalizedCount };
+  return { messages: normalized, normalizedCount, droppedContinuationCount };
 }
