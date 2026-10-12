@@ -16,14 +16,19 @@ import Logger from '@alembic/core/logging';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EvidenceCollector } from '../src/agent/evidence/EvidenceCollector.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
+import type { SessionStore } from '../src/agent/memory/SessionStore.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
-import type { ToolCallRequest } from '../src/tools/kernel/index.js';
+import type { EvidenceLedgerLike, ToolCallRequest } from '../src/tools/kernel/index.js';
 import { buildSnippetRepairHint } from '../src/tools/runtime/handlers/knowledge/sources.js';
+import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import type {
   DeltaCacheLike,
+  MemoryCoordinatorLike,
   ToolContext,
   ToolContextFactoryContract,
+  ToolResult,
 } from '../src/tools/runtime/index.js';
 import {
   DeltaCache,
@@ -2512,5 +2517,267 @@ describe('L4-P04 router and parameter diagnostics', () => {
         'base'
       )
     ).toContain('unknown format "uri"');
+  });
+});
+
+describe('memory handler degraded diagnostics and finding rounds (L4-P21)', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const QUERY = 'AuthService boundary';
+
+  function previousEvidence(memoryCoordinator?: MemoryCoordinatorLike): Promise<ToolResult> {
+    return new ToolRouter().execute(
+      { tool: 'memory', action: 'get_previous_evidence', params: { query: QUERY, dimId: 'api' } },
+      { ...baseToolContext(), ...(memoryCoordinator ? { memoryCoordinator } : {}) }
+    );
+  }
+
+  function codesOf(result: ToolResult): string[] {
+    return (result._meta?.diagnosticWarnings ?? []).map((warning) => warning.code);
+  }
+
+  function messageOf(result: ToolResult): string {
+    return String((result.data as { message?: unknown }).message);
+  }
+
+  function sessionStoreWith(searchEvidence: SessionStore['searchEvidence']): SessionStore {
+    // 只替身 searchEvidenceWithDiagnostics 实际读取的方法；其余 SessionStore 能力本用例不触达。
+    return { searchEvidence } as unknown as SessionStore;
+  }
+
+  function fileLedger(): EvidenceLedgerLike {
+    const entry = {
+      id: 'E-1',
+      file: 'src/auth/AuthService.ts',
+      content: 'export class AuthService {}',
+    };
+    return {
+      get: (ref) => (ref === 'E-1' ? entry : null),
+      search: () => [entry],
+      listRecent: () => [entry],
+      stats: () => ({ entries: 1, distinctFiles: 1 }),
+      checkFreshness: () => 'unknown',
+    };
+  }
+
+  function recordingCoordinator() {
+    const noteFinding = vi.fn<MemoryCoordinatorLike['noteFinding']>(() => ({
+      recorded: true,
+      target: 'activeContext',
+      importance: 5,
+      message: 'recorded',
+    }));
+    return { noteFinding };
+  }
+
+  it('reports a run without a SessionStore as degraded MEMORY_EVIDENCE_STORE_MISSING, not as "no previous evidence"', async () => {
+    const result = await previousEvidence(new MemoryCoordinator());
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ count: 0, items: [] });
+    expect(result._meta?.degraded).toBe(true);
+    expect(codesOf(result)).toEqual(['MEMORY_EVIDENCE_STORE_MISSING']);
+    expect(result._meta?.diagnosticWarnings?.[0]).toMatchObject({
+      tool: 'memory',
+      stage: 'memory.get_previous_evidence',
+    });
+    expect(messageOf(result)).toContain(QUERY);
+    expect(messageOf(result)).toContain('没有前序证据存储');
+    expect(messageOf(result)).not.toContain('没有找到');
+  });
+
+  it('reports a failing evidence search as degraded MEMORY_EVIDENCE_SEARCH_FAILED with the original detail', async () => {
+    const logger = Logger.getInstance();
+    vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const coordinator = new MemoryCoordinator({
+      sessionStore: sessionStoreWith(() => {
+        throw new Error('fixture evidence index exploded');
+      }),
+    });
+
+    const result = await previousEvidence(coordinator);
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ count: 0, items: [] });
+    expect(result._meta?.degraded).toBe(true);
+    expect(codesOf(result)).toEqual(['MEMORY_EVIDENCE_SEARCH_FAILED']);
+    expect(result._meta?.diagnosticWarnings?.[0]?.message).toContain(
+      'fixture evidence index exploded'
+    );
+    expect(messageOf(result)).toContain('检索失败');
+    expect(messageOf(result)).not.toContain('没有找到');
+  });
+
+  it.each([
+    ['no MemoryCoordinator', undefined],
+    ['a MemoryCoordinator without evidence search', recordingCoordinator()],
+  ])('reports %s as degraded MEMORY_EVIDENCE_COORDINATOR_MISSING', async (_label, coordinator) => {
+    const result = await previousEvidence(coordinator);
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({ count: 0, items: [] });
+    expect(result._meta?.degraded).toBe(true);
+    expect(codesOf(result)).toEqual(['MEMORY_EVIDENCE_COORDINATOR_MISSING']);
+    expect(messageOf(result)).toContain(QUERY);
+    expect(messageOf(result)).not.toContain('没有找到');
+  });
+
+  it('keeps a real empty search and real hits undegraded on both coordinator shapes', async () => {
+    const hit = {
+      filePath: 'src/auth/AuthService.ts',
+      evidence: { dimId: 'api', importance: 8, finding: 'AuthService owns the token boundary' },
+    };
+    const empty = await previousEvidence(
+      new MemoryCoordinator({ sessionStore: sessionStoreWith(() => []) })
+    );
+    expect(empty.ok).toBe(true);
+    expect(empty._meta?.degraded).not.toBe(true);
+    expect(codesOf(empty)).toEqual([]);
+    expect(messageOf(empty)).toContain('没有找到');
+
+    const searchEvidence = vi.fn(() => [hit]);
+    const found = await previousEvidence(
+      new MemoryCoordinator({ sessionStore: sessionStoreWith(searchEvidence) })
+    );
+    expect(searchEvidence).toHaveBeenCalledWith(QUERY, 'api');
+    expect(found._meta?.degraded).not.toBe(true);
+    expect(found.data).toMatchObject({ count: 1 });
+    expect(String((found.data as { summary?: unknown }).summary)).toContain(hit.filePath);
+
+    // 只实现旧 searchEvidence 的宿主替身保持原行为：不臆造降级。
+    const legacy = await previousEvidence({
+      ...recordingCoordinator(),
+      searchEvidence: () => [hit],
+    });
+    expect(legacy._meta?.degraded).not.toBe(true);
+    expect(legacy.data).toMatchObject({ count: 1 });
+  });
+
+  it('normalizes host-shaped diagnostic searches without hiding degradation', async () => {
+    const hit = {
+      filePath: 'src/auth/AuthService.ts',
+      evidence: { finding: 'AuthService owns the token boundary' },
+    };
+    const hostCoordinator = (search: () => unknown): MemoryCoordinatorLike => ({
+      ...recordingCoordinator(),
+      // 宿主返回值未必符合端口类型；这里故意绕过类型来模拟宿主越界输出。
+      searchEvidenceWithDiagnostics: search as NonNullable<
+        MemoryCoordinatorLike['searchEvidenceWithDiagnostics']
+      >,
+      // 有诊断版时不得回落旧 searchEvidence；被调用即说明分叉选错。
+      searchEvidence: () => {
+        throw new Error('legacy searchEvidence must not be used');
+      },
+    });
+
+    const malformed = await previousEvidence(hostCoordinator(() => ({ ok: true })));
+    expect(malformed.ok).toBe(true);
+    expect(malformed._meta?.degraded).toBe(true);
+    expect(codesOf(malformed)).toEqual(['MEMORY_EVIDENCE_SEARCH_FAILED']);
+    expect(malformed._meta?.diagnosticWarnings?.[0]?.message).toContain('malformed');
+
+    const silentStoreMissing = await previousEvidence(
+      hostCoordinator(() => ({
+        ok: true,
+        degraded: true,
+        reason: 'session-store-missing',
+        results: [],
+        diagnostics: [],
+      }))
+    );
+    expect(silentStoreMissing._meta?.degraded).toBe(true);
+    expect(codesOf(silentStoreMissing)).toEqual(['MEMORY_EVIDENCE_STORE_MISSING']);
+    expect(messageOf(silentStoreMissing)).toContain('没有前序证据存储');
+
+    const partial = await previousEvidence(
+      hostCoordinator(() => ({
+        ok: false,
+        degraded: true,
+        reason: 'host-index-partial',
+        results: [hit],
+        diagnostics: [{ code: 'HOST_EVIDENCE_INDEX_PARTIAL', message: 'shard 2 offline' }],
+      }))
+    );
+    expect(partial.ok).toBe(true);
+    expect(partial.data).toMatchObject({ count: 1 });
+    expect(String((partial.data as { summary?: unknown }).summary)).toContain(hit.filePath);
+    expect(String((partial.data as { summary?: unknown }).summary)).toContain('降级');
+    expect(partial._meta?.degraded).toBe(true);
+    expect(codesOf(partial)).toEqual(['HOST_EVIDENCE_INDEX_PARTIAL']);
+    expect(partial._meta?.diagnosticWarnings?.[0]?.message).toContain('shard 2 offline');
+  });
+
+  it('lifts the evidence-store degradation onto the adapter envelope diagnostics', async () => {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({ ...baseToolContext(), memoryCoordinator: new MemoryCoordinator() }),
+      },
+    });
+    const envelope = await adapter.execute({
+      toolId: 'memory',
+      args: { action: 'get_previous_evidence', params: { query: QUERY } },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime', name: 'vitest' },
+    });
+
+    expect(envelope.ok).toBe(true);
+    expect(envelope.diagnostics?.degraded).toBe(true);
+    expect((envelope.diagnostics?.warnings ?? []).map((warning) => warning.code)).toContain(
+      'MEMORY_EVIDENCE_STORE_MISSING'
+    );
+  });
+
+  it('marks note_finding without an evidence ledger as degraded MEMORY_FINDING_UNVERIFIED_NO_LEDGER', async () => {
+    const coordinator = recordingCoordinator();
+    const params = { finding: 'AuthService owns tokens', evidenceRefs: ['E-1'] };
+    const router = new ToolRouter();
+
+    const unledgered = await router.execute(
+      { tool: 'memory', action: 'note_finding', params },
+      { ...baseToolContext(), memoryCoordinator: coordinator }
+    );
+    expect(unledgered.ok).toBe(true);
+    expect(unledgered.data).toMatchObject({ recorded: true, target: 'activeContext' });
+    // 无台账运行保持 verified 缺省（不参与核实判定），降级只出现在诊断上。
+    expect(unledgered.data).not.toHaveProperty('verified');
+    expect(unledgered._meta?.degraded).toBe(true);
+    expect(codesOf(unledgered)).toEqual(['MEMORY_FINDING_UNVERIFIED_NO_LEDGER']);
+    expect(unledgered._meta?.diagnosticWarnings?.[0]).toMatchObject({
+      tool: 'memory',
+      stage: 'memory.note_finding',
+    });
+
+    const ledgered = await router.execute(
+      { tool: 'memory', action: 'note_finding', params },
+      {
+        ...baseToolContext(),
+        memoryCoordinator: coordinator,
+        runtime: { evidenceLedger: fileLedger() },
+      }
+    );
+    expect(ledgered.ok).toBe(true);
+    expect(ledgered.data).toMatchObject({ verified: true });
+    expect(ledgered._meta?.degraded).not.toBe(true);
+    expect(codesOf(ledgered)).toEqual([]);
+  });
+
+  it('records the runtime loop iteration as the finding round and ignores a model-supplied round', async () => {
+    const coordinator = recordingCoordinator();
+    const params = { finding: 'AuthService owns tokens', evidenceRefs: ['E-1'], round: 99 };
+
+    await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: coordinator,
+      runtime: { iteration: 7, evidenceLedger: fileLedger() },
+    });
+    expect(coordinator.noteFinding.mock.calls[0]?.[3]).toBe(7);
+
+    // 非 runtime 表面（无 loop 轮次）记 0，模型自填的 round 不再被采信。
+    await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: coordinator,
+    });
+    expect(coordinator.noteFinding.mock.calls[1]?.[3]).toBe(0);
   });
 });

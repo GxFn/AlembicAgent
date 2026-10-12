@@ -9,9 +9,11 @@ import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
 import {
   estimateTokens,
   fail,
+  type MemoryCoordinatorLike,
   type MemoryNoteFindingResult,
   ok,
   type ToolContext,
+  type ToolDiagnosticWarning,
   type ToolResult,
 } from '#tools/kernel/registry.js';
 import { classifyUnresolvedEvidenceRef, EVIDENCE_SUBRANGE_COORDINATE_NOTE } from './evidence.js';
@@ -118,14 +120,15 @@ async function handleNoteFinding(
   }
 
   const importance = Math.min(10, Math.max(1, (params.importance as number) || 5));
-  const round = (params.round as number) || 0;
+  const round = resolveFindingRound(ctx);
 
   if (!ctx.memoryCoordinator) {
     return fail('memory.note_finding requires an active MemoryCoordinator and ActiveContext');
   }
 
   // 录入即校验（纯台账查询，零 fs 成本）：任一 ref 无效→整条拒收并附近期真实条目提示，
-  // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存，降级显式标注。
+  // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存：evidence 文本标
+  // unverified，结果再带 _meta.degraded + MEMORY_FINDING_UNVERIFIED_NO_LEDGER，运行诊断可定位这类写入。
   const ledger = ctx.runtime?.evidenceLedger;
   let resolvedLabels: string;
   // M3（VERIFY 机械化）：verified=至少一个引用解析到有文件归属（entry.file 在场）的台账条目，
@@ -196,8 +199,37 @@ async function handleNoteFinding(
     return fail(result.message);
   }
 
+  if (!ledger) {
+    // I26/U15-F6：无台账分支已写入但未校验。verified 保持缺省（不参与核实判定、数据形状不变），
+    // 降级只走结果诊断：adapter 把它提升到信封 diagnostics，事后按诊断即可定位未校验写入。
+    return ok(result, {
+      degraded: true,
+      diagnosticWarnings: [
+        {
+          code: 'MEMORY_FINDING_UNVERIFIED_NO_LEDGER',
+          message: `No evidence ledger is bound to this run; evidenceRefs [${refs.join(', ')}] were recorded without verification (path=unverified-direct-write; round=${round})`,
+          stage: 'memory.note_finding',
+          tool: 'memory',
+        },
+      ],
+    });
+  }
+
   // M3：verified 随结果外露——tracker 据此计 verifiedFindingCount（配额只认核实过的发现）
   return ok(verified === undefined ? result : { ...result, verified });
+}
+
+/**
+ * I26/U15-F7：发现的轮次是运行时事实——AgentRuntime 的 loop iteration 经 runtimeBridge 投影到
+ * ctx.runtime.iteration。不再读 schema 未声明、模型可控的 params.round（曾使轮次恒为 0，或被模型编造）。
+ * 非 runtime 表面（宿主直调、没有 agent loop）没有轮次，记 0，与 runtimeBridge 对缺省 iteration
+ * 取 0 的口径一致；这不是降级，ActiveContext 只用 round 标注发现先后。
+ */
+function resolveFindingRound(ctx: ToolContext): number {
+  const iteration = ctx.runtime?.iteration;
+  return typeof iteration === 'number' && Number.isInteger(iteration) && iteration >= 0
+    ? iteration
+    : 0;
 }
 
 function normalizeNoteFindingResult(
@@ -218,9 +250,20 @@ function normalizeNoteFindingResult(
   };
 }
 
+const PREVIOUS_EVIDENCE_STAGE = 'memory.get_previous_evidence';
+
+type PreviousEvidenceHit = ReturnType<NonNullable<MemoryCoordinatorLike['searchEvidence']>>[number];
+
 /**
- * memory.get_previous_evidence — 检索前序维度对特定文件/类/模式的分析证据。
- * 桥接 MemoryCoordinator.searchEvidence()，避免跨维度重复搜索。
+ * memory.get_previous_evidence — 检索前序维度对特定文件/类/模式的分析证据，避免跨维度重复搜索。
+ *
+ * I26/U15-F5：未接线、存储缺失、检索失败都不能说成“没有前序证据”（与 graph handler“未接线不当成空”
+ * 同一原则）。分叉：
+ * - 协调器缺失或不提供任何检索方法 → ok + degraded + MEMORY_EVIDENCE_COORDINATOR_MISSING；
+ * - 协调器提供 searchEvidenceWithDiagnostics（Agent MemoryCoordinator 已实现）→ 优先调用，降级时
+ *   ok + degraded + 原诊断码（MEMORY_EVIDENCE_STORE_MISSING / MEMORY_EVIDENCE_SEARCH_FAILED）；
+ * - 只提供旧 searchEvidence 的宿主/替身 → 原行为（它无法区分“空”与“降级”，不臆造诊断）。
+ * 降级仍返回 ok：前序证据只是省一次搜索的捷径，模型应继续自行搜索，而不是把本轮当作工具错误。
  */
 async function handleGetPreviousEvidence(
   params: Record<string, unknown>,
@@ -231,23 +274,134 @@ async function handleGetPreviousEvidence(
     return fail('memory.get_previous_evidence requires "query" param');
   }
   const dimId = params.dimId as string | undefined;
+  const coordinator = ctx.memoryCoordinator;
 
-  if (!ctx.memoryCoordinator?.searchEvidence) {
-    return ok({
-      count: 0,
-      items: [],
-      message: `没有找到与 "${query}" 相关的前序证据。建议自行搜索。`,
-    });
+  if (coordinator && typeof coordinator.searchEvidenceWithDiagnostics === 'function') {
+    const search = normalizeEvidenceSearch(
+      coordinator.searchEvidenceWithDiagnostics(query, dimId),
+      query,
+      dimId
+    );
+    if (search.warnings.length === 0) {
+      return formatPreviousEvidence(query, search.results);
+    }
+    if (search.results.length > 0) {
+      // 部分结果：宿主实现可能在降级时仍带回命中，命中照常给出，降级只走诊断。
+      return formatPreviousEvidence(query, search.results, search.warnings);
+    }
+    return degradedPreviousEvidence(search.message, search.warnings);
   }
 
-  const results = ctx.memoryCoordinator.searchEvidence(query, dimId);
+  if (coordinator && typeof coordinator.searchEvidence === 'function') {
+    return formatPreviousEvidence(query, coordinator.searchEvidence(query, dimId));
+  }
 
+  const detail = coordinator
+    ? 'MemoryCoordinator exposes neither searchEvidenceWithDiagnostics nor searchEvidence'
+    : 'No MemoryCoordinator is bound to this tool call';
+  return degradedPreviousEvidence(
+    `本次运行没有接入前序证据检索（记忆协调器未接线），无法确认是否存在与 "${query}" 相关的前序证据——这不代表前序维度没有相关证据。建议自行搜索。`,
+    [evidenceWarning('MEMORY_EVIDENCE_COORDINATOR_MISSING', detail, query, dimId)]
+  );
+}
+
+/** 把 searchEvidenceWithDiagnostics 的宿主返回值归一成命中 + 诊断；形状不合法按检索失败处理。 */
+function normalizeEvidenceSearch(
+  raw: unknown,
+  query: string,
+  dimId: string | undefined
+): { results: PreviousEvidenceHit[]; warnings: ToolDiagnosticWarning[]; message: string } {
+  const failedMessage = `前序证据检索失败，无法确认是否存在与 "${query}" 相关的前序证据——这不代表前序维度没有相关证据。建议自行搜索。`;
+  if (!isRecord(raw) || !Array.isArray(raw.results)) {
+    return {
+      results: [],
+      warnings: [
+        evidenceWarning(
+          'MEMORY_EVIDENCE_SEARCH_FAILED',
+          'searchEvidenceWithDiagnostics returned a malformed result (expected { results: [] })',
+          query,
+          dimId
+        ),
+      ],
+      message: failedMessage,
+    };
+  }
+  // 命中条目沿用端口类型契约（与旧 searchEvidence 路径同等信任），这里只归一外层形状与降级信号。
+  const results = raw.results as PreviousEvidenceHit[];
+  const failed = raw.ok === false;
+  if (!failed && raw.degraded !== true) {
+    return { results, warnings: [], message: '' };
+  }
+
+  const warnings: ToolDiagnosticWarning[] = [];
+  for (const item of Array.isArray(raw.diagnostics) ? raw.diagnostics : []) {
+    if (isRecord(item) && typeof item.code === 'string' && item.code) {
+      const message = typeof item.message === 'string' ? item.message : '';
+      warnings.push(evidenceWarning(item.code, message, query, dimId));
+    }
+  }
+  if (warnings.length === 0) {
+    // 宿主只给了降级标志、没带诊断：按 reason/ok 补一个稳定码，不让降级在结果上隐身。
+    const code =
+      !failed && raw.reason === 'session-store-missing'
+        ? 'MEMORY_EVIDENCE_STORE_MISSING'
+        : 'MEMORY_EVIDENCE_SEARCH_FAILED';
+    const reason = typeof raw.reason === 'string' ? raw.reason : 'unspecified';
+    warnings.push(
+      evidenceWarning(
+        code,
+        `searchEvidenceWithDiagnostics reported a degraded search without diagnostics (reason=${reason})`,
+        query,
+        dimId
+      )
+    );
+  }
+
+  const storeMissing =
+    !failed && warnings.some((warning) => warning.code === 'MEMORY_EVIDENCE_STORE_MISSING');
+  return {
+    results,
+    warnings,
+    message: storeMissing
+      ? `本次运行没有前序证据存储（SessionStore 未接入），无法检索与 "${query}" 相关的前序证据——这不代表前序维度没有相关证据。建议自行搜索。`
+      : failedMessage,
+  };
+}
+
+function evidenceWarning(
+  code: string,
+  message: string,
+  query: string,
+  dimId: string | undefined
+): ToolDiagnosticWarning {
+  // 诊断里带上关键输入，事后能看出哪次检索、按哪个维度过滤时降级。
+  return {
+    code,
+    message: `${message} (query="${query}"; dimId=${dimId ?? '*'})`,
+    stage: PREVIOUS_EVIDENCE_STAGE,
+    tool: 'memory',
+  };
+}
+
+function degradedPreviousEvidence(message: string, warnings: ToolDiagnosticWarning[]): ToolResult {
+  return ok({ count: 0, items: [], message }, { degraded: true, diagnosticWarnings: warnings });
+}
+
+function formatPreviousEvidence(
+  query: string,
+  results: PreviousEvidenceHit[],
+  warnings: ToolDiagnosticWarning[] = []
+): ToolResult {
+  const degradedMeta = warnings.length > 0 ? { degraded: true, diagnosticWarnings: warnings } : {};
   if (results.length === 0) {
-    return ok({
-      count: 0,
-      items: [],
-      message: `没有找到与 "${query}" 相关的前序证据。建议自行搜索。`,
-    });
+    return ok(
+      {
+        count: 0,
+        items: [],
+        message: `没有找到与 "${query}" 相关的前序证据。建议自行搜索。`,
+      },
+      degradedMeta
+    );
   }
 
   const lines = [`📋 前序维度证据 (匹配 "${query}", ${results.length} 条):`];
@@ -260,12 +414,19 @@ async function handleGetPreviousEvidence(
   if (results.length > 8) {
     lines.push(`  …还有 ${results.length - 8} 条证据`);
   }
+  if (warnings.length > 0) {
+    lines.push('  ⚠ 前序证据检索处于降级状态，以上结果可能不完整');
+  }
 
   const formatted = lines.join('\n');
   return ok(
     { count: results.length, summary: formatted },
-    { tokensEstimate: estimateTokens(formatted) }
+    { tokensEstimate: estimateTokens(formatted), ...degradedMeta }
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 async function handleRecall(

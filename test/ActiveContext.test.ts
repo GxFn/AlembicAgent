@@ -576,10 +576,11 @@ describe('memory.note_finding ActiveContext contract', () => {
 
     const result = await handleMemory(
       'note_finding',
-      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8, round: 3 },
+      { finding: 'Verified boundary', evidenceRefs: ['E-1'], importance: 8 },
       createBaseContext({
         memoryCoordinator: { noteFinding },
-        runtime: { dimensionScopeId: 'architecture:analyst' } as never,
+        // L4-P21：round 取运行时 loop iteration，不再读模型参数 params.round
+        runtime: { dimensionScopeId: 'architecture:analyst', iteration: 3 } as never,
       })
     );
 

@@ -300,6 +300,28 @@ export interface MemoryCoordinatorLike {
     filePath: string;
     evidence: { dimId?: string; importance?: number; finding: string };
   }>;
+
+  /**
+   * 带降级诊断的前序证据检索（L4-P21，可选）。get_previous_evidence 优先调用它，以便把
+   * “本次运行没有前序证据存储”（MEMORY_EVIDENCE_STORE_MISSING）和“检索失败”
+   * （MEMORY_EVIDENCE_SEARCH_FAILED）如实报成降级，而不是说成“没有前序证据”。
+   * 只实现 searchEvidence 的旧宿主/替身不受影响（handler 回到旧路径）。
+   * 字段刻意比 Agent MemoryCoordinator 的返回类型宽（code/reason 为 string），
+   * 让 kernel 不反向依赖 agent，宿主也可以带自己的诊断码。
+   */
+  searchEvidenceWithDiagnostics?(
+    query: string,
+    dimId?: string
+  ): {
+    ok: boolean;
+    degraded: boolean;
+    reason: string | null;
+    results: Array<{
+      filePath: string;
+      evidence: { dimId?: string; importance?: number; finding: string };
+    }>;
+    diagnostics: Array<{ code: string; message: string; reason?: string }>;
+  };
 }
 
 /** DeltaCache 最小接口 */
