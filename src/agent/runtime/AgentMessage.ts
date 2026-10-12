@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 
 /** Reply callback type */
 type ReplyFn = (text: string) => Promise<void>;
@@ -83,6 +84,7 @@ interface InternalMessageOptions {
   parentAgentId?: string;
   dimension?: string;
   phase?: string;
+  /** 附加元数据；与 parentAgentId/dimension/phase 同名的键会被显式且非 undefined 的选项覆盖 */
   metadata?: Record<string, unknown>;
   /** Extra pass-through keys (e.g. 'source') */
   [key: string]: unknown;
@@ -100,6 +102,56 @@ interface McpRequest {
   toolName?: string;
   mode?: string;
   metadata?: Record<string, unknown>;
+}
+
+/** internal() 中可由调用方显式传入、并优先于 opts.metadata 同名键的字段 */
+const INTERNAL_EXPLICIT_METADATA_KEYS = ['parentAgentId', 'dimension', 'phase'] as const;
+
+/** 只描述值的类型，诊断日志里不输出 metadata 原值（可能很大或含用户内容）。 */
+function describeValueType(value: unknown) {
+  if (value === null) {
+    return 'null';
+  }
+  return Array.isArray(value) ? 'array' : typeof value;
+}
+
+/**
+ * 合并 internal() 的 metadata：先展开 opts.metadata，再由显式且非 undefined 的选项覆盖。
+ *
+ * 旧顺序让 opts.metadata 覆盖显式字段：FanOutStrategy 子消息同时传 dimension: item.id 与
+ * metadata.dimension: item，结果 metadata.dimension 变成整个 FanOutItem 对象，而
+ * AgentRunCoordinator.resolveDimensionId 与 AgentService 只接受字符串维度，维度归属因此丢失。
+ * 显式值为 undefined（未传）时保留 metadata 中的同名值，避免“未传”抹掉调用方元数据。
+ * 三个键先以 undefined 占位，保持与旧实现一致的键集合与顺序。
+ */
+function mergeInternalMetadata(opts: InternalMessageOptions): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    parentAgentId: undefined,
+    dimension: undefined,
+    phase: undefined,
+    ...opts.metadata,
+  };
+  const overridden: string[] = [];
+  for (const key of INTERNAL_EXPLICIT_METADATA_KEYS) {
+    const explicit = opts[key];
+    if (explicit === undefined) {
+      continue;
+    }
+    const previous = metadata[key];
+    if (previous !== undefined && previous !== explicit) {
+      overridden.push(
+        `${key} (metadata ${describeValueType(previous)} -> explicit ${describeValueType(explicit)})`
+      );
+    }
+    metadata[key] = explicit;
+  }
+  if (overridden.length > 0) {
+    // 冲突覆盖是确定的合并规则而非错误；记 debug 诊断，便于追查哪个调用方传入了冲突元数据。
+    Logger.getInstance().debug(
+      `[AgentMessage] internal(): explicit options override conflicting metadata keys: ${overridden.join(', ')}`
+    );
+  }
+  return metadata;
 }
 
 /** 通信渠道枚举 */
@@ -217,6 +269,9 @@ export class AgentMessage {
 
   /**
    * Agent 间内部消息
+   *
+   * metadata 合并顺序：先展开 opts.metadata，再由显式且非 undefined 的
+   * parentAgentId/dimension/phase 覆盖（见 mergeInternalMetadata）。
    * @param content 消息内容
    */
   static internal(content: string, opts: InternalMessageOptions = {}) {
@@ -228,12 +283,7 @@ export class AgentMessage {
         id: opts.sourceAgentId || 'system',
         type: 'agent',
       },
-      metadata: {
-        parentAgentId: opts.parentAgentId,
-        dimension: opts.dimension,
-        phase: opts.phase,
-        ...opts.metadata,
-      },
+      metadata: mergeInternalMetadata(opts),
     });
   }
 

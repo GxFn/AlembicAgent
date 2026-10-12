@@ -25,7 +25,7 @@ import { AgentService } from '../src/agent/service/AgentService.js';
 import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
-import type { StrategyRuntime } from '../src/agent/strategies/Strategy.js';
+import { Strategy, type StrategyRuntime } from '../src/agent/strategies/Strategy.js';
 import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
@@ -1384,6 +1384,77 @@ it('does not start pre-cancelled fanout items', async () => {
     { items, abortSignal: controller.signal }
   );
   expect(reactLoop).not.toHaveBeenCalled();
+});
+
+describe('AgentMessage.internal metadata merge order (I24)', () => {
+  it('lets explicit non-undefined options override conflicting metadata keys', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const message = AgentMessage.internal('probe', {
+      parentAgentId: 'parent-explicit',
+      dimension: 'dim-explicit',
+      phase: 'analyze',
+      metadata: {
+        parentAgentId: 'parent-stale',
+        dimension: { id: 'dim-object', label: 'object' },
+        phase: 'stale-phase',
+        extra: 'kept',
+      },
+    });
+    expect(message.metadata).toEqual({
+      parentAgentId: 'parent-explicit',
+      dimension: 'dim-explicit',
+      phase: 'analyze',
+      extra: 'kept',
+    });
+    // 冲突覆盖留下 debug 诊断：只记键名与值类型，不记原值。
+    expect(debug).toHaveBeenCalledTimes(1);
+    expect(String(debug.mock.calls[0]?.[0])).toContain(
+      'dimension (metadata object -> explicit string)'
+    );
+    expect(String(debug.mock.calls[0]?.[0])).not.toContain('dim-object');
+  });
+
+  it('keeps metadata values when the explicit option is absent or undefined', () => {
+    const absent = AgentMessage.internal('probe', {
+      metadata: { dimension: 'from-metadata', phase: 'produce', parentAgentId: 'meta-parent' },
+    });
+    expect(absent.metadata).toEqual({
+      parentAgentId: 'meta-parent',
+      dimension: 'from-metadata',
+      phase: 'produce',
+    });
+    const explicitUndefined = AgentMessage.internal('probe', {
+      dimension: undefined,
+      phase: undefined,
+      metadata: { dimension: 'from-metadata', phase: 'produce' },
+    });
+    expect(explicitUndefined.metadata.dimension).toBe('from-metadata');
+    expect(explicitUndefined.metadata.phase).toBe('produce');
+  });
+
+  it('hands fanout child messages a string metadata.dimension equal to the item id', async () => {
+    const seen: Record<string, unknown>[] = [];
+    class RecordingItemStrategy extends Strategy {
+      override get name() {
+        return 'recording-item';
+      }
+      override async execute(_runtime: StrategyRuntime, message: AgentMessage) {
+        seen.push(message.metadata);
+        return stageResult;
+      }
+    }
+    await new FanOutStrategy({ itemStrategy: new RecordingItemStrategy() }).execute(
+      { id: 'fanout', reactLoop: async () => stageResult },
+      new AgentMessage({
+        content: 'dimension probe',
+        metadata: { dimension: 'parent-dimension', lang: 'zh' },
+      }),
+      { items }
+    );
+    // AgentRunCoordinator.resolveDimensionId 与 AgentService 只接受字符串维度；子消息必须携带 item.id。
+    expect(seen.map((metadata) => metadata.dimension)).toEqual(['a', 'b']);
+    expect(seen[0]).toMatchObject({ lang: 'zh', parentAgentId: 'fanout' });
+  });
 });
 
 function deferred() {
