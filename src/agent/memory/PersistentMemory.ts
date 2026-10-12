@@ -252,7 +252,3 @@ export class PersistentMemory {
     }
   }
 }
-
-// ── 向后兼容 ──
-export { PersistentMemory as ProjectSemanticMemory };
-export default PersistentMemory;

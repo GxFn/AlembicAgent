@@ -191,7 +191,10 @@ export class SignalDetector {
   #detectGraphSignal(args: Record<string, unknown>): boolean {
     const action = (args?.action as string) || '';
     const type = (args?.type as string) || '';
-    const entity = String(args.entity || args.className || args.protocolName || args.name || '');
+    // 只读 graph handler 实际消费的字符串 entity：graph.query 缺 entity 直接失败（失败观察在 detect
+    // 入口已返回 false），没有写入方产生 className/protocolName/name 别名；graph.overview 不接受
+    // entity，夹带的旧别名或非字符串值不改变 handler 结果，按参数契约只按 action + type 去重。
+    const entity = typeof args?.entity === 'string' ? args.entity : '';
     const qKey = `graph:${action}:${type}:${entity}`;
     if (!this.#metrics.uniqueQueries.has(qKey)) {
       this.#metrics.uniqueQueries.add(qKey);

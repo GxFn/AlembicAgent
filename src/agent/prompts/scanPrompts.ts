@@ -100,5 +100,3 @@ ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
   },
 };
-
-export default SCAN_TASK_CONFIGS;
