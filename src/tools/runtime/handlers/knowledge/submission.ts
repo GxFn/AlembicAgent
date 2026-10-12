@@ -65,9 +65,14 @@ export async function handleSubmit(
         items: [effectiveItem],
         options: {
           supersedes: pickString(params.supersedes),
-          existingTitles: ctx.runtime?.submittedTitles ?? undefined,
-          existingTriggers: ctx.runtime?.submittedTriggers ?? undefined,
-          existingFingerprints: ctx.runtime?.submittedPatterns ?? undefined,
+          // I25：submitted* 是宿主注入、跨维度共享的去重状态，只能由 submitDedup 在确认创建后登记。
+          // Core UnifiedValidator 持有传入 Set 的引用，并在字段校验通过后立即 recordSubmission，
+          // 早于判重/合并/阻断与真实写入；若交出共享 Set，create_failed/blocked/merged/duplicates
+          // 也会占位，导致同标题重试与其他维度同 trigger 被误判重复。这里只交副本：Core 读到同样
+          // 的已登记内容做跨调用去重，批内登记落在副本上随调用丢弃（本调用每次只提交单条）。
+          existingTitles: gatewayDedupSnapshot(ctx.runtime?.submittedTitles),
+          existingTriggers: gatewayDedupSnapshot(ctx.runtime?.submittedTriggers),
+          existingFingerprints: gatewayDedupSnapshot(ctx.runtime?.submittedPatterns),
           systemInjectedFields: uniqueStrings([
             ...(isBootstrap ? getSystemInjectedFields() : []),
             'coreCode',
@@ -131,4 +136,12 @@ export async function handleSubmit(
     );
     return fail(`Submit failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * 给 Core gateway 的去重快照：复制宿主共享 Set，Core 的写入不回流到调用方状态。
+ * 宿主未注入（非维度场景）时保持 undefined，由 Core 自建空集合，与修复前一致。
+ */
+function gatewayDedupSnapshot(shared: Set<string> | null | undefined): Set<string> | undefined {
+  return shared ? new Set(shared) : undefined;
 }
