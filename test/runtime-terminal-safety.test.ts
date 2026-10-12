@@ -6,14 +6,16 @@ import Logger from '@alembic/core/logging';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { runOperation } from '../src/shared/operation.js';
+import { estimateTokens } from '../src/shared/tokenUtils.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { handle as handleTerminal } from '../src/tools/runtime/handlers/terminal.js';
 import {
   checkTerminalCommandAllowlist,
   checkTerminalCommandSafety,
 } from '../src/tools/runtime/handlers/terminalSafety.js';
 
-import type { ToolContext } from '../src/tools/runtime/index.js';
-import { Evolution, ToolRouter } from '../src/tools/runtime/index.js';
+import type { ToolAuditEntry, ToolContext } from '../src/tools/runtime/index.js';
+import { Evolution, OutputCompressor, ToolRouter } from '../src/tools/runtime/index.js';
 
 let projectRoot: string;
 beforeAll(() => {
@@ -1563,6 +1565,462 @@ describe('terminal.exec dangerous-command blacklist: wrappers, find -exec and su
       expect(result.ok, command).toBe(true);
     }
     expect(calls).toEqual(commands);
+  });
+});
+
+/**
+ * L4-P12：terminal handler 的预算对齐（I11）、审计分类与执行器结果归一（I35）、timeout 归一（I19）
+ * 与附属步骤失败可观测（I12 terminal 部分）。宿主生产配置是 tokenBudget=8000 + OutputCompressor，
+ * 而 terminal.exec 的 maxOutputTokens=4000；这里按该配置走真实 router → terminal → compressor 链路。
+ */
+describe('terminal.exec budget, audit classification and input normalization (L4-P12)', () => {
+  const ROUTER_NOTICE_RE = /chars truncated, exceeded \d+ token limit/;
+  const COMPRESSOR_MARKER = '[output truncated]';
+  const LONE_SURROGATE_RE =
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+  /** 互不相同的行，避免 generic 路径的重复行折叠改变长度。 */
+  function uniqueLines(prefix: string, totalChars: number): string {
+    const lines: string[] = [];
+    let length = 0;
+    for (let index = 0; length < totalChars; index++) {
+      const line = `${prefix}-${String(index).padStart(5, '0')} ${'x'.repeat(48)}`;
+      lines.push(line);
+      length += line.length + 1;
+    }
+    return lines.join('\n');
+  }
+
+  function occurrences(text: string, needle: string): number {
+    return text.split(needle).length - 1;
+  }
+
+  function hostContext(
+    exec: (command: string, opts: { timeout: number }) => Promise<unknown>,
+    overrides: Partial<ToolContext> = {}
+  ): ToolContext {
+    return baseToolContext({
+      tokenBudget: 8000,
+      compressor: new OutputCompressor(),
+      sandboxExecutor: {
+        exec: exec as NonNullable<ToolContext['sandboxExecutor']>['exec'],
+      },
+      ...overrides,
+    });
+  }
+
+  it('keeps one truncation marker and the [stderr] tail under the host 8000 budget', async () => {
+    const stdout = uniqueLines('build', 30_000);
+    const stderr = ['STDERR-HEAD failure summary', uniqueLines('stderr', 2_600), 'STDERR-END'].join(
+      '\n'
+    );
+    const result = await runTerminalExec(
+      'cat build.log',
+      hostContext(async () => ({ stdout, stderr, exitCode: 0 }))
+    );
+
+    expect(result.ok).toBe(true);
+    const text = String(result.data);
+    expect(text).not.toMatch(ROUTER_NOTICE_RE);
+    expect(occurrences(text, COMPRESSOR_MARKER)).toBe(1);
+    expect(text).toContain('[stderr]\nSTDERR-HEAD failure summary');
+    expect(text.endsWith('STDERR-END')).toBe(true);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(4000);
+    const codes = result._meta?.diagnosticWarnings?.map((warning) => warning.code) ?? [];
+    expect(codes).not.toContain('tool_output_truncated');
+    expect(codes).toContain('terminal_output_compressed');
+    expect(result._meta?.degraded).toBe(true);
+  });
+
+  it('reserves room for the exit prefix and unsandboxed suffix so the router does not cut again', async () => {
+    const stdout = uniqueLines('log', 43_000);
+    const result = await runTerminalExec(
+      'cat build.log',
+      hostContext(async () => ({
+        stdout,
+        stderr: '',
+        exitCode: 1,
+        diagnostics: {
+          sandboxed: false,
+          fallbackUsed: true,
+          degradeReason: 'seatbelt_unavailable',
+        },
+      }))
+    );
+
+    const text = String(result.data);
+    expect(text.startsWith('[exit 1]\n')).toBe(true);
+    expect(text.endsWith('degradeReason=seatbelt_unavailable')).toBe(true);
+    expect(text).not.toMatch(ROUTER_NOTICE_RE);
+    expect(occurrences(text, COMPRESSOR_MARKER)).toBe(1);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(4000);
+    expect(result._meta?.resultStatus).toBe('error');
+    const compressed = result._meta?.diagnosticWarnings?.find(
+      (warning) => warning.code === 'terminal_output_compressed'
+    );
+    expect(compressed?.message).toMatch(/hostBudget=8000 actionLimit=4000 reserve=\d+/);
+    expect(compressed?.message).not.toContain('log-00000');
+  });
+
+  it('keeps code points intact when the router truncates output without a compressor', async () => {
+    // router 头部按 3200 token（12800 个 ASCII 字符）切；emoji 的两个代理半字跨在该切点两侧。
+    const stdout = `${'a'.repeat(12_799)}😀${'b'.repeat(7_200)}`;
+    const result = await runTerminalExec(
+      'cat emoji.log',
+      baseToolContext({
+        tokenBudget: 8000,
+        sandboxExecutor: { exec: async () => ({ stdout, stderr: '', exitCode: 0 }) },
+      })
+    );
+    const text = String(result.data);
+    expect(text).toMatch(ROUTER_NOTICE_RE);
+    expect(LONE_SURROGATE_RE.test(text)).toBe(false);
+    expect(estimateTokens(text)).toBeLessThanOrEqual(4000);
+  });
+
+  it('writes a stable audit classification for every failure path without the command text', async () => {
+    const audits: Array<{ label: string; command: string; entry: ToolAuditEntry }> = [];
+    async function audited(
+      label: string,
+      command: string,
+      ctx: Partial<ToolContext>,
+      params: Record<string, unknown> = {},
+      router = new ToolRouter()
+    ) {
+      const entries: ToolAuditEntry[] = [];
+      await runTerminalExec(
+        command,
+        baseToolContext({ auditSink: { log: (entry) => entries.push(entry) }, ...ctx }),
+        params,
+        router
+      );
+      expect(entries, label).toHaveLength(1);
+      audits.push({ label, command, entry: entries[0] as ToolAuditEntry });
+    }
+    const replying = (reply: () => Promise<unknown>) => ({
+      sandboxExecutor: { exec: reply as NonNullable<ToolContext['sandboxExecutor']>['exec'] },
+    });
+
+    await audited(
+      'missing command',
+      '',
+      replying(async () => ({ stdout: '', stderr: '', exitCode: 0 }))
+    );
+    await audited(
+      'cwd outside root',
+      'pwd',
+      replying(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      { cwd: '/' }
+    );
+    await audited(
+      'security block',
+      'sudo whoami',
+      replying(async () => ({ stdout: '', stderr: '', exitCode: 0 }))
+    );
+    await audited(
+      'allowlist block',
+      'npm install',
+      replying(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      {},
+      new ToolRouter({ capability: new Evolution().toDef() })
+    );
+    await audited('sandbox required', 'pwd', {});
+    await audited(
+      'non-zero exit',
+      'npm test',
+      replying(async () => ({ stdout: 'fail', stderr: '', exitCode: 2 }))
+    );
+    await audited(
+      'forced kill',
+      'npm test',
+      replying(async () => ({ stdout: 'partial', stderr: '', exitCode: 137 }))
+    );
+    await audited(
+      'executor threw',
+      'npm test',
+      replying(async () => {
+        throw new Error('executor crashed while running npm test');
+      })
+    );
+    await audited(
+      'success',
+      'pwd',
+      replying(async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }))
+    );
+
+    const securityRule = checkTerminalCommandSafety('sudo whoami');
+    const allowlistRule = checkTerminalCommandAllowlist(
+      'npm install',
+      new Evolution().commandAllowlist.bins
+    );
+    expect(securityRule.safe).toBe(false);
+    expect(allowlistRule.safe).toBe(false);
+    const errors = Object.fromEntries(audits.map(({ label, entry }) => [label, entry.error]));
+    expect(errors).toEqual({
+      'missing command': 'invalid:missing_command',
+      'cwd outside root': 'blocked:cwd_outside_root',
+      'security block': `blocked:${securityRule.safe ? '' : securityRule.block.rule}`,
+      'allowlist block': `blocked-allowlist:${allowlistRule.safe ? '' : allowlistRule.block.rule}`,
+      'sandbox required': 'blocked:terminal_sandbox_required',
+      'non-zero exit': 'exit:2',
+      'forced kill': 'interrupted:error',
+      'executor threw': 'executor-threw:error',
+      success: undefined,
+    });
+    const failures = audits.filter(({ label }) => label !== 'success');
+    expect(new Set(failures.map(({ entry }) => entry.error)).size).toBe(failures.length);
+    for (const { label, command, entry } of failures) {
+      expect(entry.result, label).toBe('failure');
+      expect(entry.error, label).toMatch(/^[a-z-]+:[\w.-]+$/);
+      if (command) {
+        expect(JSON.stringify(entry), label).not.toContain(command);
+      }
+    }
+    expect(audits.find(({ label }) => label === 'success')?.entry).not.toHaveProperty('error');
+  });
+
+  it.each([
+    { label: 'negative', timeout: -1 },
+    { label: 'zero', timeout: 0 },
+    { label: 'sub-millisecond', timeout: 0.5 },
+  ])('falls back to the default timeout instead of interrupting at once for a $label timeout', async ({
+    timeout,
+  }) => {
+    const seen: number[] = [];
+    // 模拟宿主沙箱：opts.timeout 到期即强杀（137）；命令本身 20ms 后正常结束。
+    const exec = (_command: string, opts: { timeout: number }) =>
+      new Promise((resolve) => {
+        seen.push(opts.timeout);
+        const kill = setTimeout(
+          () => resolve({ stdout: '', stderr: '', exitCode: 137 }),
+          Math.max(1, opts.timeout)
+        );
+        setTimeout(() => {
+          clearTimeout(kill);
+          resolve({ stdout: 'done', stderr: '', exitCode: 0 });
+        }, 20);
+      });
+    const result = await runTerminalExec('npm test', hostContext(exec), { timeout });
+
+    expect(seen).toEqual([30_000]);
+    expect(result.data).toBe('done');
+    expect(result._meta?.resultStatus).toBeUndefined();
+    expect(result._meta?.diagnosticWarnings).toContainEqual({
+      code: 'terminal_timeout_normalized',
+      message: `timeout=${String(timeout)} (number) is not a finite number of milliseconds >= 1; using default 30000`,
+      stage: 'terminal.exec',
+      tool: 'terminal',
+    });
+  });
+
+  it.each([
+    { label: 'NaN', timeout: Number.NaN, shown: 'NaN (number)' },
+    { label: 'Infinity', timeout: Number.POSITIVE_INFINITY, shown: 'Infinity (number)' },
+    { label: 'a string', timeout: '60s', shown: '<string>' },
+  ])('normalizes a $label timeout that bypassed schema validation', async ({ timeout, shown }) => {
+    const seen: number[] = [];
+    const result = await handleTerminal(
+      'exec',
+      { command: 'npm test', timeout },
+      hostContext(async (_command, opts) => {
+        seen.push(opts.timeout);
+        return { stdout: 'done', stderr: '', exitCode: 0 };
+      })
+    );
+    expect(seen).toEqual([30_000]);
+    expect(result._meta?.diagnosticWarnings).toContainEqual(
+      expect.objectContaining({
+        code: 'terminal_timeout_normalized',
+        message: expect.stringContaining(`timeout=${shown}`),
+      })
+    );
+  });
+
+  it('keeps valid timeouts, flooring fractions and clamping to the documented maximum', async () => {
+    const seen: number[] = [];
+    const ctx = hostContext(async (_command, opts) => {
+      seen.push(opts.timeout);
+      return { stdout: 'done', stderr: '', exitCode: 0 };
+    });
+    const results = [
+      await runTerminalExec('npm test', ctx, {}),
+      await runTerminalExec('npm test', ctx, { timeout: 1500.7 }),
+      await runTerminalExec('npm test', ctx, { timeout: 300_000 }),
+    ];
+    expect(seen).toEqual([30_000, 1500, 120_000]);
+    for (const result of results) {
+      expect(
+        result._meta?.diagnosticWarnings?.some((w) => w.code === 'terminal_timeout_normalized')
+      ).not.toBe(true);
+    }
+  });
+
+  it('reports the effective timeout when a forced kill interrupts the command', async () => {
+    const result = await runTerminalExec(
+      'npm test',
+      hostContext(async () => ({ stdout: 'partial', stderr: '', exitCode: 137 })),
+      { timeout: 5000 }
+    );
+    expect(result._meta?.diagnosticWarnings).toContainEqual(
+      expect.objectContaining({
+        code: 'terminal_execution_interrupted',
+        message:
+          'exitCode=137; status=error; reason=unknown-termination; output=partial; timeoutMs=5000',
+      })
+    );
+  });
+
+  it('reports a numeric exit code when plain exec exceeds its output buffer', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'alembic-agent-terminal-maxbuffer-'));
+    const entries: ToolAuditEntry[] = [];
+    try {
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+        "process.stdout.write('y'.repeat(2 * 1024 * 1024))"
+      )}`;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          projectRoot: root,
+          allowUnsandboxedTerminal: true,
+          auditSink: { log: (entry) => entries.push(entry) },
+        })
+      );
+
+      const text = String(result.data);
+      expect(text.startsWith('[exit 1]\n')).toBe(true);
+      expect(text).not.toContain('[exit ERR_');
+      expect(result._meta?.resultStatus).toBe('error');
+      expect(result._meta?.diagnosticWarnings).toContainEqual(
+        expect.objectContaining({
+          code: 'terminal_exit_code_normalized',
+          message: expect.stringContaining('code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER'),
+        })
+      );
+      expect(entries.map((entry) => entry.error)).toEqual(['exit:1']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: 'string exit code and missing stdout',
+      reply: { stderr: 'warn', exitCode: '0' },
+      expectedText: '[exit 1]\n[stderr]\nwarn',
+      fields: 'stdout=undefined exitCode=string',
+    },
+    {
+      label: 'forced kill without output fields',
+      reply: { exitCode: 137 },
+      expectedText: '[command interrupted]',
+      fields: 'stdout=undefined stderr=undefined',
+    },
+    {
+      label: 'non-object result',
+      reply: undefined,
+      expectedText: '[exit 1]\n[no output]',
+      fields: 'result=undefined',
+    },
+  ])('normalizes a malformed executor result: $label', async ({ reply, expectedText, fields }) => {
+    const result = await runTerminalExec(
+      'npm test',
+      hostContext(async () => reply)
+    );
+    expect(result.ok).toBe(true);
+    expect(result.data).toBe(expectedText);
+    expect(result._meta?.diagnosticWarnings).toContainEqual(
+      expect.objectContaining({
+        code: 'terminal_executor_result_normalized',
+        message: expect.stringContaining(fields),
+      })
+    );
+    expect(
+      result._meta?.diagnosticWarnings?.some((w) => w.code === 'terminal_execution_failed')
+    ).toBe(false);
+  });
+
+  it('surfaces a compressor failure as a diagnostic and keeps the cleaned output', async () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        baseToolContext({
+          compressor: {
+            compress: () => {
+              throw new TypeError('compressor exploded on secret-token-123');
+            },
+          },
+          sandboxExecutor: {
+            exec: async () => ({ stdout: '\u001b[32mok\u001b[0m', stderr: '', exitCode: 0 }),
+          },
+        })
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+      expect(result._meta?.fallbackUsed).toBe(true);
+      expect(result._meta?.diagnosticWarnings).toContainEqual({
+        code: 'terminal_compressor_failed',
+        message: 'compressor threw TypeError; returned ANSI-stripped raw output',
+        stage: 'terminal.exec',
+        tool: 'terminal',
+      });
+      const lines = warn.mock.calls.map((args) => String(args[0]));
+      expect(lines.some((line) => line.includes('terminal_compressor_failed'))).toBe(true);
+      expect(lines.join('\n')).not.toContain('secret-token-123');
+      expect(lines.join('\n')).not.toContain('npm test');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('treats a non-string compressor result as a compressor failure', async () => {
+    const result = await runTerminalExec(
+      'npm test',
+      baseToolContext({
+        compressor: {
+          compress: () => ({ summary: 'not text' }) as unknown as string,
+        },
+        sandboxExecutor: { exec: async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }) },
+      })
+    );
+    expect(result.data).toBe('ok');
+    expect(result._meta?.diagnosticWarnings).toContainEqual(
+      expect.objectContaining({
+        code: 'terminal_compressor_failed',
+        message: 'compressor returned object; returned ANSI-stripped raw output',
+      })
+    );
+  });
+
+  it('logs audit sink failures with the command hash only', async () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const command = 'npm test -- --token=secret-value';
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          auditSink: {
+            log: () => {
+              throw new Error('audit store offline');
+            },
+          },
+          sandboxExecutor: { exec: async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }) },
+        })
+      );
+      expect(result.ok).toBe(true);
+      const lines = warn.mock.calls.map((args) => String(args[0]));
+      const line = lines.find((entry) => entry.includes('audit sink failed'));
+      expect(line).toBeDefined();
+      expect(line).toContain(`commandHash=${sha256(command)}`);
+      expect(line).toContain('error=Error');
+      expect(lines.join('\n')).not.toContain('secret-value');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

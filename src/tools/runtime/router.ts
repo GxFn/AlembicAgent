@@ -510,6 +510,12 @@ function truncationNotice(omittedChars: number, maxTokens: number): string {
  * - 说明本身就超过上限时（只会出现在配置了极小 maxOutputTokens 的 action 上）不再附带原文，
  *   只保留说明，让下游仍能识别截断，并经 Logger.warn 报告该降级。
  * 非字符串结果（如 code.search 的结构化 matches）由 handler 自行按同一口径投影，这里不处理。
+ *
+ * 与 terminal.exec 的分工（L4-P12 / I11）：terminal handler 已按 min(ctx.tokenBudget, maxOutputTokens)
+ * 扣除前后缀后交给 OutputCompressor，压缩器的头尾截断是实际生效的那次；这里只兜底（压缩器缺失或失败、
+ * 非 ASCII 输出按字符预算压缩后估算仍超限）。这里不改用 compressor/strip 的 truncateOutput：它按
+ * UTF-16 字符计预算、标记格式不同，而本函数的说明格式被 ActiveContext / EvidenceCollector 按正则识别，
+ * 且按 Unicode 字符切分本身已不会留下孤立代理半字。
  */
 function enforceOutputLimit(result: ToolResult, maxTokens: number, call: ParsedToolCall): void {
   if (typeof result.data !== 'string') {

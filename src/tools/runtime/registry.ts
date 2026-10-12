@@ -254,13 +254,18 @@ const TERMINAL_SPEC: ToolSpec = {
     exec: {
       summary: 'Execute a shell command',
       description:
-        'Run a command in the project directory. Output is automatically compressed (git status, test results, lint output, etc.).',
+        'Run a command in the project directory. Output is automatically compressed (git status, test results, lint output, etc.); long output keeps its head and tail within the output limit.',
       params: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'Command to execute (e.g. "git status")' },
           cwd: { type: 'string', description: 'Working directory (default: project root)' },
-          timeout: { type: 'number', description: 'Timeout in ms (default 30000, max 120000)' },
+          // 只改描述不收紧 schema（L4-P12 决策）：非法值由 handler 归一为默认值并附 terminal_timeout_normalized。
+          timeout: {
+            type: 'number',
+            description:
+              'Timeout in milliseconds, not seconds (default 30000, max 120000; values below 1 fall back to 30000)',
+          },
         },
         required: ['command'],
       },
