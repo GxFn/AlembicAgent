@@ -104,7 +104,9 @@ export function isGeoOrProviderError(err: unknown) {
     cause: details.cause,
   });
   // 先用真实状态/网络事实排除暂时故障和取消，不能被错误正文中的 blocked/forbidden 覆盖。
-  if (classification.isAbort || classification.isRetryable || status === 408) {
+  // 暂时故障（429 / 408 / 5xx / 网络错误）的唯一口径在 classifyLlmError.isRetryable，
+  // 这里不再单列状态码；408（代理/网关请求超时）因此同样不触发 provider fallback。
+  if (classification.isAbort || classification.isRetryable) {
     return false;
   }
   // SDK 会脱敏原厂错误正文；已知 403 仍是权限/地区限制，不依赖保留下来的文案。

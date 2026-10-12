@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createLlmAbortError } from '../src/ai/errors.js';
 import { classifyLlmError } from '../src/ai/shared/errorClassify.js';
+import { ReliabilityController } from '../src/ai/shared/reliability.js';
 import { extractJSON, repairTruncatedArray } from '../src/ai/shared/structuredOutput.js';
 import { createLimit } from '../src/shared/concurrency.js';
 import { isThenable, observeSafely } from '../src/shared/observers.js';
@@ -830,6 +831,80 @@ describe('shared/errorClassify classifyLlmError', () => {
     const c = classifyLlmError({ status: 400 });
     expect(c.isRetryable).toBe(false);
     expect(c.isServerError).toBe(false);
+  });
+
+  it('treats HTTP 408 (proxy/gateway request timeout) as a retryable transient server fault', () => {
+    // 408 是代理或网关在请求路径上超时：服务端在途，不是请求本身的问题，与 5xx 同属暂时故障。
+    const c = classifyLlmError({ status: 408, message: 'Request Timeout' });
+    expect(c.status).toBe(408);
+    expect(c.isRetryable).toBe(true);
+    expect(c.isServerError).toBe(true);
+    // 有 HTTP status 就不是网络级错误，也不是取消或模型输出错误。
+    expect(c.isNetworkError).toBe(false);
+    expect(c.isAbort).toBe(false);
+    expect(c.isModelOutputError).toBe(false);
+  });
+
+  it.each([
+    400, 401, 403, 404, 409, 413, 422,
+  ])('keeps neighbouring 4xx status %s non-retryable after the 408 rule', (status) => {
+    const c = classifyLlmError({ status });
+    expect(c.isRetryable).toBe(false);
+    expect(c.isServerError).toBe(false);
+  });
+
+  it('lets local input error codes override a 408 status', () => {
+    // 本地输入错误优先：即使包装层带了 408，也不能重试或计入熔断。
+    const c = classifyLlmError({ status: 408, code: 'LLM_INVALID_REQUEST' });
+    expect(c.isRetryable).toBe(false);
+    expect(c.isServerError).toBe(false);
+  });
+
+  it('ReliabilityController retries a 408 and recovers on the next attempt', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const logs: Array<{ level: string; message: string }> = [];
+    const controller = new ReliabilityController({
+      maxRetries: 2,
+      circuitThreshold: 1,
+      label: 'fixture',
+      onLog: (level, message) => logs.push({ level, message }),
+    });
+    const timeout = Object.assign(new Error('fixture proxy timeout'), { status: 408 });
+    const execute = vi.fn().mockRejectedValueOnce(timeout).mockResolvedValue('recovered');
+    await expect(controller.run(execute, 2, 1)).resolves.toBe('recovered');
+    expect(execute).toHaveBeenCalledTimes(2);
+    // 重试成功后熔断保持闭合，失败计数清零。
+    expect(controller.circuitState).toBe('CLOSED');
+    expect(controller.circuitFailures).toBe(0);
+    expect(logs.some((entry) => entry.message.includes('attempt 1 failed'))).toBe(true);
+  });
+
+  it('ReliabilityController retries 408 up to maxRetries and counts the exhausted failure', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const logs: Array<{ level: string; message: string }> = [];
+    const controller = new ReliabilityController({
+      maxRetries: 2,
+      circuitThreshold: 1,
+      label: 'fixture',
+      onLog: (level, message) => logs.push({ level, message }),
+    });
+    const timeout = Object.assign(new Error('fixture proxy timeout'), { status: 408 });
+    const execute = vi.fn().mockRejectedValue(timeout);
+    await expect(controller.run(execute, 2, 1)).rejects.toBe(timeout);
+    // 首次 + maxRetries 次重试。
+    expect(execute).toHaveBeenCalledTimes(3);
+    // 耗尽后按服务端故障计入熔断：阈值 1 时直接打开。
+    expect(controller.circuitState).toBe('OPEN');
+    const terminal = logs.filter((entry) =>
+      entry.message.includes('[reliability] fixture terminal')
+    );
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]?.level).toBe('warn');
+    expect(terminal[0]?.message).toContain('reason=retries-exhausted');
+    expect(terminal[0]?.message).toContain('status=408');
+    expect(terminal[0]?.message).toContain('retryable=true');
+    expect(terminal[0]?.message).toContain('counted=true');
+    expect(controller.activeRequests).toBe(0);
   });
 
   it('separates rejected model output from service failures', () => {

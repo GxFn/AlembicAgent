@@ -11,7 +11,10 @@
  * 分类阈值是当前的权威口径，可以随错误语义演进修正（修改时同步更新 reliability / AiFactory 测试）。
  * 各「排除类」的理由见 classifyLlmError 内注释：本地输入错误（LLM_INVALID_REQUEST /
  * API_KEY_MISSING）不重试也不熔断；模型输出错误（LLM_INVALID_TOOL_CALL）不熔断；
- * 程序员错误（TypeError 等）不计入熔断；4xx（非 429）是请求本身问题，不熔断。
+ * 程序员错误（TypeError 等）不计入熔断；4xx（非 408/429）是请求本身问题，不熔断。
+ *
+ * 「暂时故障」只在本模块定义一次：429 / 408 / 5xx / 网络级错误。AiFactory 的 fallback 判定
+ * 直接复用 isRetryable 排除暂时故障，不再单列状态码，避免两处口径再次漂移。
  */
 
 /** LLM 调用错误的通用形状（不同厂商 SDK / fetch 抛出的错误字段并集）。 */
@@ -34,9 +37,9 @@ export interface ErrorClassification {
   isAbort: boolean;
   /** 网络级错误：无 HTTP status，底层连接失败。 */
   isNetworkError: boolean;
-  /** 是否值得重试：429 / 5xx / 网络错误。 */
+  /** 是否值得重试：429 / 408 / 5xx / 网络错误。 */
   isRetryable: boolean;
-  /** 是否服务端错误（用于熔断计数）：网络错误 / 429 / 5xx / 无 status。 */
+  /** 是否服务端错误（用于熔断计数）：网络错误 / 429 / 408 / 5xx / 无 status。 */
   isServerError: boolean;
   /** 服务已应答但模型输出不可执行（如工具参数非法）；不重试，也不计入熔断。 */
   isModelOutputError: boolean;
@@ -79,8 +82,16 @@ export function classifyLlmError(err: unknown): ErrorClassification {
       RETRYABLE_NETWORK_CODES.has(e.code || '') ||
       RETRYABLE_NETWORK_CODES.has(causeCode));
 
+  // HTTP 408 Request Timeout 通常由请求路径上的代理或网关（反向代理、企业出口、云负载均衡）
+  // 在等待上游时超时返回，请求本身合法、上游可能只是暂时慢；它与 5xx 一样属于暂时故障：
+  // 值得按 maxRetries 退避重试，耗尽后计入熔断（连续 408 说明该 provider 链路不可用）。
+  // 它不是 provider 级限制，AiFactory 据 isRetryable 排除后不会触发 provider fallback。
+  // 若 408 被当作普通 4xx，就会出现「既不重试也不降级」，一次代理超时直接失败。
+  const isTransientTimeout = status === 408;
+
   const isLocalInputError = e.code === 'LLM_INVALID_REQUEST' || e.code === 'API_KEY_MISSING';
-  const isRetryable = !isLocalInputError && (status === 429 || status >= 500 || isNetworkError);
+  const isRetryable =
+    !isLocalInputError && (status === 429 || isTransientTimeout || status >= 500 || isNetworkError);
 
   // 模型输出被本地拒绝（LlmResponseError）：请求已被服务正常处理，坏的是模型给出的内容。
   // 它是模型行为而不是服务可用性信号——计入熔断会让一个模型的坏输出把同 provider 的其他
@@ -96,12 +107,17 @@ export function classifyLlmError(err: unknown): ErrorClassification {
     e.name === 'SyntaxError' ||
     e.name === 'RangeError';
 
-  // 客户端错误 (4xx 非 429) 不应触发熔断 — 那是请求本身的问题。无 status 的错误默认按服务端
-  // 故障兜底（保留对未知网络错误的检测），但排除上面的程序员错误与模型输出错误。
+  // 客户端错误 (4xx 非 408/429) 不应触发熔断 — 那是请求本身的问题。408 见上方 isTransientTimeout
+  // 的说明，按暂时故障计数。无 status 的错误默认按服务端故障兜底（保留对未知网络错误的检测），
+  // 但排除上面的程序员错误与模型输出错误。
   const isServerError =
     !isLocalInputError &&
     !isModelOutputError &&
-    (isNetworkError || status === 429 || status >= 500 || (!e.status && !isProgrammerError));
+    (isNetworkError ||
+      status === 429 ||
+      isTransientTimeout ||
+      status >= 500 ||
+      (!e.status && !isProgrammerError));
 
   return {
     isAbort,
