@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
 import { AgentRunCoordinator } from '../src/agent/coordination/AgentRunCoordinator.js';
 import { producerRejectionGateEvaluator } from '../src/agent/evaluation/gateEvaluators.js';
+import { buildScanPipelineStages } from '../src/agent/evaluation/stageBuilders.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { BudgetPolicy, Policy, PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
+import { INSIGHT_PRESET } from '../src/agent/profiles/presets/insightPreset.js';
 import { buildProducerRetryPrompt } from '../src/agent/prompts/producerRetry.js';
 import { AgentEventBus, AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
@@ -2221,6 +2223,263 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
         return text.includes('producer stage') && text.includes('finalize');
       })
     ).toBe(true);
+  });
+});
+
+// ─── I36(L5-P30，与 L8-P04 同一问题)：fast retry 复用阶段提示 ───
+// fast retry 是「首次尝试硬超时且确认零工具调用」后的同阶段重跑，不是门拒绝重试。此前阶段只要带
+// retryPromptBuilder(insight/scan 的 produce 都带，面向 rejection_gate 的「N 个提交被拒绝」修复清单)，
+// fast retry 就用它的输出整体替换已构建的阶段提示，且随后清空 ContextWindow——模型只看到「你的 0 个
+// 提交被拒绝了」，拿不到 quality_gate 的 findings、维度配置与证据入口。修复后 fast retry 始终复用首次
+// 尝试缓存的阶段提示并追加一段超时提示；缓存为空时重新构建；retryPromptBuilder 只留给门重试。
+describe('PipelineStrategy — fast retry 复用阶段提示(I36)', () => {
+  type Warning = { code: string; stage?: string; message: string };
+  const FINDINGS_TEXT = 'UserRepository 统一经 BaseRepository.withTransaction 写库';
+  const TIMEOUT_NOTICE = '上一次尝试超时且未调用任何工具';
+
+  /**
+   * produce 首次尝试硬超时且零工具(满足 canFastRetry)；recoverOnRetry=false 时重跑也零工具超时，
+   * 否则重跑正常返回。记录每次 reactLoop 的阶段与 prompt。
+   */
+  function fastRetryRuntime(options: { recoverOnRetry?: boolean } = {}) {
+    const recoverOnRetry = options.recoverOnRetry ?? true;
+    const calls: Array<{ phase: string; prompt: string }> = [];
+    let produceRuns = 0;
+    const runtime = {
+      id: 'fast-retry-prompt-runtime',
+      reactLoop: vi.fn(async (prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        calls.push({ phase, prompt });
+        if (phase === 'produce') {
+          produceRuns += 1;
+          return produceRuns === 1 || !recoverOnRetry
+            ? { ...stageOutput(''), timedOut: true }
+            : stageOutput('produce output after fast retry');
+        }
+        return {
+          ...stageOutput(`${phase} output`),
+          toolCalls: [{ tool: 'read', args: { path: 'src/a.ts' }, result: 'contents' }],
+        };
+      }),
+    };
+    const producePrompts = () =>
+      calls.filter((call) => call.phase === 'produce').map((call) => call.prompt);
+    return { runtime, producePrompts };
+  }
+
+  /** 与 insightPreset 同形的 analyze → quality_gate(带 AnalysisArtifact) → produce；produce 的提示来自门产物。 */
+  function stagesWithProduce(produceExtras: Record<string, unknown>) {
+    return [
+      { name: 'analyze', budget: { timeoutMs: 480_000 } },
+      {
+        name: 'quality_gate',
+        gate: {
+          evaluator: () => ({
+            action: 'pass',
+            pass: true,
+            artifact: { findings: [{ finding: FINDINGS_TEXT }] },
+          }),
+          maxRetries: 1,
+        },
+      },
+      {
+        name: 'produce',
+        budget: { maxIterations: 24, temperature: 0.3, timeoutMs: 900_000, maxSubmits: 10 },
+        ...produceExtras,
+      },
+    ];
+  }
+
+  const producePromptFromArtifact = (ctx: Record<string, unknown>) => {
+    const findings =
+      (ctx.gateArtifact as { findings?: Array<{ finding: string }> } | null)?.findings || [];
+    return `【阶段任务】把下列发现提交为知识候选:\n${findings.map((item) => `- ${item.finding}`).join('\n')}`;
+  };
+
+  const fastRetryWarnings = (diagnostics: { warnings?: unknown[] } | undefined) =>
+    ((diagnostics?.warnings ?? []) as Warning[]).filter(
+      (warning) => warning.code === 'pipeline_stage_fast_retry'
+    );
+
+  // 真实生产配置里的 produce retryPromptBuilder / retryBudget：insight 预设与 scan-extract 管线。
+  const insightProduce = (INSIGHT_PRESET.strategy.stages as Array<Record<string, unknown>>).find(
+    (stage) => stage.name === 'produce'
+  ) as Record<string, unknown>;
+  const scanProduce = buildScanPipelineStages({
+    task: 'extract',
+    producePrompt: 'scan producer system prompt',
+    analyzeCaps: [],
+    produceCaps: [],
+  }).find((stage) => stage.name === 'produce') as Record<string, unknown>;
+
+  it.each([
+    { label: 'insight preset produce', produce: insightProduce },
+    { label: 'scan-extract produce', produce: scanProduce },
+  ])('$label：首次硬超时零工具 → 重跑提示=原阶段提示+超时追加段，不调用面向拒绝的 retryPromptBuilder', async ({
+    produce,
+  }) => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    expect(typeof produce.retryPromptBuilder).toBe('function');
+    expect(produce.retryBudget).toBeTruthy();
+    const retryPromptBuilder = vi.fn(produce.retryPromptBuilder as (...args: unknown[]) => string);
+    const promptBuilder = vi.fn(producePromptFromArtifact);
+    const resetForNewStage = vi.fn();
+    const { runtime, producePrompts } = fastRetryRuntime();
+
+    const output = await new PipelineStrategy({
+      stages: stagesWithProduce({
+        promptBuilder,
+        retryBudget: produce.retryBudget,
+        retryPromptBuilder,
+      }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }), {
+      contextWindow: { resetForNewStage, tokenCount: 0 },
+    });
+
+    const prompts = producePrompts();
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain(FINDINGS_TEXT);
+    // ContextWindow 在重跑前被清空，完整阶段提示必须原样承载全部上下文，再追加超时提示。
+    expect(prompts[1].startsWith(prompts[0])).toBe(true);
+    expect(prompts[1]).toContain(FINDINGS_TEXT);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    expect(prompts[1]).not.toContain('个提交被拒绝了');
+    expect(retryPromptBuilder).not.toHaveBeenCalled();
+    // 复用缓存，不重复调用(可能有副作用或较慢的)promptBuilder。
+    expect(promptBuilder).toHaveBeenCalledTimes(1);
+    expect(resetForNewStage).toHaveBeenCalled();
+    expect(output.reply).toBe('produce output after fast retry');
+    expect((output.phases.produce as { timedOut?: boolean }).timedOut).toBeUndefined();
+    // 分叉留痕：诊断与日志都能看出触发原因、提示来源，以及 retryPromptBuilder 被绕过。
+    const warnings = fastRetryWarnings(output.diagnostics);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ stage: 'produce' });
+    expect(warnings[0].message).toContain('reason=stage_hard_timeout_zero_tools');
+    expect(warnings[0].message).toContain('promptSource=stage_cached');
+    expect(warnings[0].message).toContain('retryPromptBuilder=bypassed');
+    expect(
+      infoLog.mock.calls.some((call) => {
+        const text = String(call[0]);
+        return (
+          text.includes('fast-retrying') &&
+          text.includes('promptSource=stage_cached') &&
+          text.includes('retryPromptBuilder=bypassed')
+        );
+      })
+    ).toBe(true);
+  });
+
+  it('没有 retryPromptBuilder 的阶段：重跑提示同样是缓存阶段提示+超时追加段', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const { runtime, producePrompts } = fastRetryRuntime();
+    const output = await new PipelineStrategy({
+      stages: stagesWithProduce({
+        promptBuilder: producePromptFromArtifact,
+        retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 },
+      }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    const prompts = producePrompts();
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].startsWith(prompts[0])).toBe(true);
+    expect(prompts[1]).toContain(FINDINGS_TEXT);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    const warnings = fastRetryWarnings(output.diagnostics);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain('promptSource=stage_cached');
+    expect(warnings[0].message).toContain('retryPromptBuilder=absent');
+  });
+
+  it('首次尝试的阶段提示为空 → 重新构建阶段提示再追加超时段，不发送只有超时提示的空任务', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const retryPromptBuilder = vi.fn(() => buildProducerRetryPrompt(undefined));
+    // 首次构建得到空提示(例如宿主上下文尚未就绪)，重建时拿到完整阶段提示。
+    const promptBuilder = vi
+      .fn()
+      .mockReturnValueOnce('')
+      .mockImplementation(producePromptFromArtifact);
+    const { runtime, producePrompts } = fastRetryRuntime();
+    const output = await new PipelineStrategy({
+      stages: stagesWithProduce({
+        promptBuilder,
+        retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 },
+        retryPromptBuilder,
+      }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    const prompts = producePrompts();
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toBe('');
+    expect(promptBuilder).toHaveBeenCalledTimes(2);
+    expect(prompts[1]).toContain(FINDINGS_TEXT);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    expect(prompts[1]).not.toContain('个提交被拒绝了');
+    expect(retryPromptBuilder).not.toHaveBeenCalled();
+    const warnings = fastRetryWarnings(output.diagnostics);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain('promptSource=stage_rebuilt');
+    expect(warnings[0].message).toContain('retryPromptBuilder=bypassed');
+  });
+
+  it('重跑仍零工具超时 → 只 fast retry 一次，最终回执保持 timedOut，诊断只记一次', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, producePrompts } = fastRetryRuntime({ recoverOnRetry: false });
+    const output = await new PipelineStrategy({
+      stages: stagesWithProduce({
+        promptBuilder: producePromptFromArtifact,
+        retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 },
+        retryPromptBuilder: () => buildProducerRetryPrompt(undefined),
+      }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    const prompts = producePrompts();
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(FINDINGS_TEXT);
+    expect(prompts[1]).toContain(TIMEOUT_NOTICE);
+    expect((output.phases.produce as { timedOut?: boolean }).timedOut).toBe(true);
+    expect(output.outcome).toBe('failed');
+    expect(fastRetryWarnings(output.diagnostics)).toHaveLength(1);
+  });
+
+  it('门判 retry 的拒绝重试仍走 retryPromptBuilder，不追加超时提示也不写 fast retry 诊断', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const calls: Array<{ phase: string; prompt: string }> = [];
+    const runtime = {
+      id: 'gate-retry-prompt-runtime',
+      reactLoop: vi.fn(async (prompt: string, opts?: Record<string, unknown>) => {
+        const phase = String((opts?.context as Record<string, unknown> | undefined)?.pipelinePhase);
+        calls.push({ phase, prompt });
+        return {
+          ...stageOutput(`${phase} output`),
+          toolCalls: [{ tool: 'read', args: { path: 'src/a.ts' }, result: 'contents' }],
+        };
+      }),
+    };
+    const rejectionGate = vi
+      .fn()
+      .mockReturnValueOnce({ action: 'retry', pass: false, reason: 'rejected too many' })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const output = await new PipelineStrategy({
+      stages: [
+        ...stagesWithProduce({
+          promptBuilder: producePromptFromArtifact,
+          retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 },
+          retryPromptBuilder: (retryCtx: { reason?: string }) =>
+            `GATE_RETRY_PROMPT: ${retryCtx.reason}`,
+        }),
+        { name: 'rejection_gate', gate: { evaluator: rejectionGate, maxRetries: 1 } },
+      ],
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    const prompts = calls.filter((call) => call.phase === 'produce').map((call) => call.prompt);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain(FINDINGS_TEXT);
+    expect(prompts[1]).toBe('GATE_RETRY_PROMPT: rejected too many');
+    expect(prompts[1]).not.toContain(TIMEOUT_NOTICE);
+    expect(fastRetryWarnings(output.diagnostics)).toHaveLength(0);
   });
 });
 

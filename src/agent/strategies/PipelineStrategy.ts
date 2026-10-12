@@ -53,6 +53,12 @@
  * 族、retry_exhausted、其他非通过) / completed 连同 abandonInfo 写入 phaseResults._pipelineOutcome，
  * 供父 run 聚合 abandonedModules。修复微阶段的结果也写入 phaseResults，不能据插入顺序猜最后主阶段。
  *
+ * fast retry（I36）：非严格链、非门重试的阶段若声明了 retryBudget，首次尝试硬超时且确认零工具调用
+ *   时用 retryBudget 同阶段重跑一次。重跑前清空 ContextWindow，因此提示必须是首次尝试缓存的完整
+ *   阶段提示（为空时重建）再追加超时提示段；retryPromptBuilder 只服务门重试，这里不调用。每次 fast
+ *   retry 写 diagnostics.warn(pipeline_stage_fast_retry) + info 日志（原因、提示来源、是否绕过
+ *   retryPromptBuilder、retryBudget）。
+ *
  * 其他特性：Stage 支持 promptBuilder(context)、systemPrompt、onToolCall；per-stage 硬超时；
  * 阶段隔离 (ContextWindow/ExplorationTracker 状态)。
  *
@@ -140,6 +146,11 @@ interface PipelineStage {
   capabilities?: CapabilityRef[];
   additionalTools?: string[];
   promptBuilder?: (ctx: Record<string, unknown>) => Promise<string> | string;
+  /**
+   * 只服务门重试：门判 analysis_retry/retry 写入 phaseResults._retryContext 后，回退到本阶段重跑时
+   * 由 #buildStagePrompt 使用。硬超时零工具的 fast retry 不调用它（I36），而是复用原阶段提示并
+   * 追加超时提示。
+   */
   retryPromptBuilder?: (
     retryCtx: { reason?: string; artifact?: unknown },
     content: string,
@@ -364,6 +375,19 @@ interface StageContextWindow {
 // AD4: lazy logger accessor — the Core logger singleton materializes on first
 // use instead of at module import (no import-time work; same singleton).
 const _pipelineLogger = () => Logger.getInstance();
+
+/**
+ * I36：fast retry（首次尝试硬超时且确认零工具调用后、用 retryBudget 的同阶段重跑）追加在完整
+ * 阶段提示之后的提示段。它只说明「上次超时、直接开工」；任务本身（门产物 findings、维度配置、
+ * 证据入口等）仍由原阶段提示承载——重跑前 ContextWindow 会被清空，不能只发这一段。
+ */
+const FAST_RETRY_TIMEOUT_NOTICE =
+  '【超时重试】上一次尝试超时且未调用任何工具。请不要先输出长篇规划，直接开始调用工具完成上面的阶段任务。';
+
+/** 在阶段提示末尾追加 fast retry 超时提示；阶段提示为空时只能发送提示段本身（调用方另行留痕）。 */
+function appendFastRetryNotice(stagePrompt: string): string {
+  return stagePrompt ? `${stagePrompt}\n\n${FAST_RETRY_TIMEOUT_NOTICE}` : FAST_RETRY_TIMEOUT_NOTICE;
+}
 
 export class PipelineStrategy extends Strategy {
   #stages: PipelineStage[];
@@ -1545,15 +1569,30 @@ export class PipelineStrategy extends Strategy {
             abortSignal: scope.signal,
             diagnostics: scope.diagnostics,
           };
-          const prompt = fastRetry
-            ? stage.retryPromptBuilder
-              ? stage.retryPromptBuilder(
-                  { reason: 'Stage hard timeout with 0 tool calls', artifact: null },
-                  message.content,
-                  phaseResults
-                )
-              : stagePrompt
-            : await this.#buildStagePrompt(stage, message, phaseResults, attemptContext, ctx);
+          // I36：fast retry 是超时重跑，不是门拒绝重试。始终复用首次尝试缓存的完整阶段提示并追加
+          // 超时提示段；不调用面向拒绝原因的 retryPromptBuilder（insight/scan 的 produce 用它生成
+          // 「N 个提交被拒绝」修复清单，且首次尝试时 phaseResults[stage] 尚未写入，会得到「0 个提交
+          // 被拒绝」并丢掉 findings、维度配置与证据入口）。缓存为空时在本次 attempt 的期限内重建。
+          let prompt: string;
+          if (fastRetry) {
+            const basePrompt =
+              stagePrompt ||
+              (await this.#buildStagePrompt(stage, message, phaseResults, attemptContext, ctx));
+            if (!basePrompt && !scope.signal.aborted) {
+              _pipelineLogger().warn(
+                `[PipelineStrategy] Stage "${stage.name}" fast retry rebuilt an empty stage prompt — sending the timeout notice alone (cachedPromptChars=0, rebuiltPromptChars=0)`
+              );
+            }
+            prompt = appendFastRetryNotice(basePrompt);
+          } else {
+            prompt = await this.#buildStagePrompt(
+              stage,
+              message,
+              phaseResults,
+              attemptContext,
+              ctx
+            );
+          }
           // 不合作的准备任务即使晚到，也不能重置上下文或启动一次新的工具循环。
           if (scope.signal.aborted) {
             return { reply: '', toolCalls: [], iterations: 0, tokenUsage: { input: 0, output: 0 } };
@@ -1610,9 +1649,23 @@ export class PipelineStrategy extends Strategy {
 
     let attempt = await executeAttempt(effectiveBudget, false);
     if (!strictProduction && !isRetry && retryBudget && attempt.canFastRetry) {
+      // I36：提示来源与 executeAttempt 的 fastRetry 分支同一判据——缓存的阶段提示非空则复用，
+      // 否则重建；阶段若声明了 retryPromptBuilder，这里明确记为 bypassed（它只服务门重试）。
+      const promptSource = stagePrompt ? 'stage_cached' : 'stage_rebuilt';
+      const retryPromptBuilderState = stage.retryPromptBuilder ? 'bypassed' : 'absent';
+      const fastRetryDetail =
+        `reason=stage_hard_timeout_zero_tools promptSource=${promptSource} ` +
+        `retryPromptBuilder=${retryPromptBuilderState} cachedPromptChars=${stagePrompt.length} ` +
+        `retryBudget.maxIterations=${retryBudget.maxIterations ?? '∞'} ` +
+        `retryBudget.timeoutMs=${retryBudget.timeoutMs ?? '∞'}`;
       _pipelineLogger().info(
-        `[PipelineStrategy] Stage "${stage.name}" confirmed no tools — fast-retrying with retryBudget`
+        `[PipelineStrategy] Stage "${stage.name}" confirmed no tools — fast-retrying with retryBudget (${fastRetryDetail})`
       );
+      ctx.diagnostics.warn({
+        code: 'pipeline_stage_fast_retry',
+        stage: stage.name,
+        message: `First attempt hit the hard timeout with zero tool calls; re-running once with the stage prompt plus a timeout notice (${fastRetryDetail}).`,
+      });
       bus.publish(AgentEvents.PROGRESS, { type: 'pipeline_stage_fast_retry', stage: stage.name });
       attempt = await executeAttempt(retryBudget, true);
     }
@@ -1672,7 +1725,11 @@ export class PipelineStrategy extends Strategy {
   // Private: Helpers
   // ═══════════════════════════════════════════════════════════
 
-  /** 构建阶段 prompt (优先级: retryPromptBuilder > promptBuilder > promptTransform > 原始) */
+  /**
+   * 构建阶段 prompt (优先级: 门重试的 retryPromptBuilder > promptBuilder > promptTransform > 原始)。
+   * retryPromptBuilder 只在存在 phaseResults._retryContext（门重试）时使用；fast retry 复用首次
+   * 尝试缓存的结果，缓存为空时才回到这里重建（I36）。
+   */
   async #buildStagePrompt(
     stage: PipelineStage,
     message: AgentMessage,
