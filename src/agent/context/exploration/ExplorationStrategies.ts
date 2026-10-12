@@ -159,7 +159,10 @@ function hasCoveredProducerSubmitTarget(m: ExplorationMetrics, b: ExplorationBud
   return target > 0 && m.submitCount >= target;
 }
 
-/** 追踪 trace 接口（ActiveContext 子集） */
+/**
+ * 追踪 trace 接口（ActiveContext 子集）——NudgeGenerator、PlanTracker 与 ExplorationTracker 共用的唯一
+ * trace 端口（L6-P16/C19：取代 PlanTracker 另立的 ActiveTrace 与三处强转）。
+ */
 export interface ExplorationTrace {
   getRecentSummary?(
     count: number
@@ -172,7 +175,17 @@ export interface ExplorationTrace {
   } | null;
   expectPlan?(): void;
   getPlanStepsMutable?(): Array<{ description: string; status: string; keywords?: string[] }>;
-  getCurrentRoundActions?(): Array<{ tool: string; params?: Record<string, unknown> }>;
+  getCurrentRoundActions?(): Array<{
+    tool: string;
+    params?: Record<string, unknown>;
+    /**
+     * 工具回执是否成功。PlanTracker 只跳过 ok===false 的动作；缺席（旧 addAction 无回执）按成功处理，
+     * 因此按本端口实现 trace 时必须如实填写失败，否则失败的读取会完成计划步骤。
+     */
+    ok?: boolean;
+    /** code.read 真正读到的文件（批量读取中失败成员不在其中）；存在时优先于请求参数里的路径。 */
+    successfulReadPaths?: string[];
+  }>;
 }
 
 // ─── 内置策略 ────────────────────────────────────────────

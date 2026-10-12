@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  createGenerateStrategy,
+  type ExplorationStrategy,
+  type ExplorationTrace,
   effectiveMemoryFindingCount,
   STRATEGY_ANALYST,
   STRATEGY_PRODUCER,
@@ -1059,5 +1064,426 @@ describe('phase gates stay aligned with handlers and capability allowlists', () 
     );
     expect(output.metadata.blocked).toBe(false);
     expect(dispatched).toEqual(['graph.query']);
+  });
+});
+
+/**
+ * L6-P16（C16–C19）：PlanTracker 的偏差 replan 只由“连续 3 轮计划外探索动作”触发，deviationScore
+ * 退为“自上次计划起的计划外动作占比”诊断值；语义回退不再让搜索完成总结步骤，也不把 Node.js/e.g
+ * 当文件目标；记录类与失败动作不计入偏离；replan 被抑制时要能看到原因；trace 端口只有 ExplorationTrace。
+ */
+type PlanCall = [tool: string, args: Record<string, unknown>, result: unknown];
+
+function planCheckState(
+  iteration: number,
+  overrides: {
+    phase?: string;
+    maxIterations?: number;
+    replanInterval?: number;
+    pipelineType?: 'scan' | 'bootstrap' | 'analyst' | 'producer';
+  } = {}
+) {
+  return {
+    phase: overrides.phase ?? 'EXPLORE',
+    metrics: { iteration },
+    budget: { maxIterations: overrides.maxIterations ?? 24 },
+    strategy: { replanInterval: overrides.replanInterval ?? 8 },
+    pipelineType: overrides.pipelineType ?? 'analyst',
+    isTerminalPhase: false,
+  };
+}
+
+function runPlanRound(
+  plans: PlanTracker,
+  trace: ActiveContext,
+  iteration: number,
+  calls: PlanCall[]
+) {
+  trace.startRound(iteration);
+  for (const [tool, args, result] of calls) {
+    trace.recordToolCall(tool, args, result, true);
+  }
+  plans.updatePlanProgress(trace);
+}
+
+const offPlanRead: PlanCall = [
+  'code',
+  { action: 'read', params: { path: 'src/unrelated.ts' } },
+  'export const unrelated = 1;',
+];
+const recordedFinding: PlanCall = [
+  'memory',
+  {
+    action: 'note_finding',
+    params: { finding: 'Auth guard wraps every route', evidenceRefs: ['E-1'], importance: 5 },
+  },
+  { recorded: true, target: 'activeContext', verified: true },
+];
+const failedPlannedRead: PlanCall = [
+  'code',
+  { action: 'read', params: { path: 'src/auth.ts' } },
+  { error: 'permission denied' },
+];
+
+function stepStatuses(trace: ActiveContext) {
+  return trace.getPlan()?.steps.map((step) => step.status);
+}
+
+describe('PlanTracker deviation metric (L6-P16 C16)', () => {
+  it('does not raise a deviation replan while every round completes one planned step', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 项目结构概览',
+        '2. 搜索 auth 相关代码',
+        '3. 阅读 src/auth.ts',
+        '4. 分析类继承关系',
+        '5. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    const onPlanRounds: PlanCall[] = [
+      ['code', { action: 'structure', params: {} }, { tree: ['src'] }],
+      ['code', { action: 'search', params: { pattern: 'auth' } }, { total: 1, matches: [] }],
+      ['code', { action: 'read', params: { path: 'src/auth.ts' } }, 'export class Auth {}'],
+      ['graph', { action: 'query', params: { type: 'class', entity: 'Auth' } }, { name: 'Auth' }],
+    ];
+    onPlanRounds.forEach((call, index) => {
+      const iteration = index + 2;
+      runPlanRound(plans, trace, iteration, [call]);
+      // 按计划推进的每一轮都不是偏差：旧公式把“未完成比例”当偏差，第 3 轮就会发“计划偏差检查”。
+      expect(plans.checkPlanning(planCheckState(iteration + 1), trace)).toBeNull();
+    });
+    expect(stepStatuses(trace)).toEqual(['done', 'done', 'done', 'done', 'pending']);
+    expect(plans.progress).toMatchObject({
+      coveredSteps: 4,
+      totalSteps: 5,
+      deviationScore: 0,
+      unplannedActions: 0,
+      consecutiveOffPlan: 0,
+    });
+    // 未完成度只交给周期触发：createdAtIteration=1 + replanInterval=8 → 第 9 轮才回顾计划。
+    expect(plans.checkPlanning(planCheckState(8), trace)).toBeNull();
+    expect(plans.checkPlanning(planCheckState(9), trace)?.text).toContain('📋 计划进度回顾');
+    // adherence 与 completion 不再恒等：全部动作都在计划内，adherence=100，completion=80。
+    const quality = plans.getQualityMetrics(trace);
+    expect(quality.breakdown.planAdherence).toBe(100);
+    expect(quality.breakdown.planCompletion).toBe(80);
+  });
+
+  it('fires a deviation replan only after three consecutive off-plan exploration rounds', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    runPlanRound(plans, trace, 2, [offPlanRead]);
+    expect(plans.checkPlanning(planCheckState(3), trace)).toBeNull();
+    runPlanRound(plans, trace, 3, [offPlanRead]);
+    expect(plans.checkPlanning(planCheckState(4), trace)).toBeNull();
+    runPlanRound(plans, trace, 4, [offPlanRead]);
+    const replan = plans.checkPlanning(planCheckState(5), trace);
+    expect(replan?.text).toContain('📋 计划偏差检查');
+    expect(replan?.text).toContain('连续 3 轮偏离');
+    // deviationScore 只作诊断：3 个可计动作全部在计划外。
+    expect(plans.progress).toMatchObject({
+      consecutiveOffPlan: 3,
+      unplannedActions: 3,
+      deviationScore: 1,
+    });
+  });
+
+  it('does not carry the deviation score or off-plan streak across a replan', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    for (const iteration of [2, 3, 4]) {
+      runPlanRound(plans, trace, iteration, [offPlanRead]);
+    }
+    expect(plans.checkPlanning(planCheckState(5), trace)?.text).toContain('计划偏差检查');
+    trace.updatePlan('1. 阅读 src/unrelated.ts\n2. 阅读 src/billing.ts', 5);
+    runPlanRound(plans, trace, 5, [offPlanRead]);
+    expect(plans.progress).toMatchObject({
+      coveredSteps: 1,
+      totalSteps: 2,
+      deviationScore: 0,
+      unplannedActions: 0,
+      consecutiveOffPlan: 0,
+    });
+    expect(plans.getQualityMetrics(trace).breakdown.planAdherence).toBe(100);
+  });
+});
+
+describe('PlanTracker step matching (L6-P16 C17)', () => {
+  it('does not let code.search complete the summary step of the elicitation example plan', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 获取项目概览和目录结构，识别核心模块',
+        '2. 搜索网络请求相关类，分析请求模式',
+        '3. 搜索错误处理和响应解析模式',
+        '4. 深入阅读 3-5 个典型实现文件，确认关键细节',
+        '5. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'search', params: { pattern: 'request' } }, { total: 0, matches: [] }],
+      ['code', { action: 'search', params: { pattern: 'error' } }, { total: 0, matches: [] }],
+      ['code', { action: 'search', params: { pattern: 'parse' } }, { total: 0, matches: [] }],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'done', 'done', 'pending', 'pending']);
+  });
+
+  it('does not complete steps through single-character or substring keyword hits', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 按类型分类整理所有发现\n2. Check thread safety of workers', 1);
+    runPlanRound(plans, trace, 2, [
+      ['graph', { action: 'query', params: { type: 'class', entity: 'Alpha' } }, { name: 'Alpha' }],
+      ['code', { action: 'read', params: { path: 'src/worker.ts' } }, 'export class Worker {}'],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+  });
+
+  it('keeps multi-character class and word-bounded English keywords working', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 梳理 Vue.js 组件的类继承关系\n2. Read the worker entry file', 1);
+    runPlanRound(plans, trace, 2, [
+      [
+        'graph',
+        { action: 'query', params: { type: 'class', entity: 'Widget' } },
+        { name: 'Widget' },
+      ],
+      ['code', { action: 'read', params: { path: 'src/worker.ts' } }, 'export class Worker {}'],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['done', 'done']);
+  });
+
+  it.each([
+    '1. 搜索 Node.js 服务端路由注册模式\n2. 总结分析发现结果',
+    '1. 搜索路由注册入口（e.g. express router）\n2. 总结分析发现结果',
+  ])('lets a search complete a step that names a technology instead of a file: %s', (plan) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(plan, 1);
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'search', params: { pattern: 'router.get' } }, { total: 0, matches: [] }],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+  });
+
+  it('treats file targets as a soft, prioritising signal for non-read tools', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 搜索 src/auth.ts 中的认证逻辑\n2. 搜索 src/billing.ts 中的计费逻辑', 1);
+    runPlanRound(plans, trace, 2, [
+      [
+        'code',
+        { action: 'search', params: { pattern: 'charge', path: 'src/billing.ts' } },
+        { total: 0, matches: [] },
+      ],
+    ]);
+    // 参数点名了第 2 步的文件目标：优先完成第 2 步，而不是按顺序落到第 1 步。
+    expect(stepStatuses(trace)).toEqual(['pending', 'done']);
+    runPlanRound(plans, trace, 3, [
+      ['code', { action: 'search', params: { pattern: 'login' } }, { total: 0, matches: [] }],
+    ]);
+    // 非 read 工具不再被文件目标硬性排除，仍可经语义回退完成第 1 步。
+    expect(stepStatuses(trace)).toEqual(['done', 'done']);
+  });
+
+  it('keeps note_finding-only and failed-read rounds out of the off-plan streak', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    for (const iteration of [2, 3, 4]) {
+      runPlanRound(plans, trace, iteration, [recordedFinding]);
+    }
+    for (const iteration of [5, 6, 7]) {
+      runPlanRound(plans, trace, iteration, [failedPlannedRead]);
+    }
+    expect(plans.progress).toMatchObject({ consecutiveOffPlan: 0, unplannedActions: 0 });
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.checkPlanning(planCheckState(8, { phase: 'VERIFY' }), trace)).toBeNull();
+  });
+
+  it('holds (not resets) the off-plan streak across a round without countable actions', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    runPlanRound(plans, trace, 2, [offPlanRead]);
+    runPlanRound(plans, trace, 3, [offPlanRead]);
+    runPlanRound(plans, trace, 4, [recordedFinding, failedPlannedRead]);
+    expect(plans.progress.consecutiveOffPlan).toBe(2);
+    expect(plans.checkPlanning(planCheckState(5), trace)).toBeNull();
+    runPlanRound(plans, trace, 5, [offPlanRead]);
+    expect(plans.checkPlanning(planCheckState(6), trace)?.text).toContain('连续 3 轮偏离');
+  });
+});
+
+describe('PlanTracker suppressed replans are observable (L6-P16 C18)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const fixedPlanTrace: ExplorationTrace = {
+    expectPlan: () => undefined,
+    getPlan: () => ({
+      createdAtIteration: 1,
+      steps: [{ description: 'Read runtime entry', status: 'pending' }],
+    }),
+  };
+
+  it('reports cooldown, replan cap and late-bootstrap suppressions to the caller', () => {
+    const seen: Array<{ reason: string; iteration: number; replanCount: number }> = [];
+    const record = (suppression: { reason: string; iteration: number; replanCount: number }) => {
+      seen.push({
+        reason: suppression.reason,
+        iteration: suppression.iteration,
+        replanCount: suppression.replanCount,
+      });
+    };
+    const analyst = new PlanTracker();
+    const state = (iteration: number) => planCheckState(iteration, { replanInterval: 1 });
+    expect(analyst.checkPlanning(state(2), fixedPlanTrace, record)?.type).toBe('planning');
+    expect(analyst.checkPlanning(state(3), fixedPlanTrace, record)).toBeNull();
+    expect(analyst.checkPlanning(state(5), fixedPlanTrace, record)?.type).toBe('planning');
+    expect(analyst.checkPlanning(state(8), fixedPlanTrace, record)).toBeNull();
+    const bootstrap = new PlanTracker();
+    expect(
+      bootstrap.checkPlanning(
+        planCheckState(7, { pipelineType: 'bootstrap', maxIterations: 10, replanInterval: 1 }),
+        fixedPlanTrace,
+        record
+      )
+    ).toBeNull();
+    // 没有任何触发条件时返回 null 不是抑制，不应上报。
+    expect(new PlanTracker().checkPlanning(planCheckState(3), fixedPlanTrace, record)).toBeNull();
+    expect(seen).toEqual([
+      { reason: 'cooldown', iteration: 3, replanCount: 1 },
+      { reason: 'replan_cap', iteration: 8, replanCount: 2 },
+      { reason: 'bootstrap_late', iteration: 7, replanCount: 0 },
+    ]);
+  });
+
+  it('logs every suppression reason at debug through ExplorationTracker', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const quietAnalyst: ExplorationStrategy = {
+      ...STRATEGY_ANALYST,
+      phases: ['EXPLORE', 'SUMMARIZE'],
+      transitions: {},
+      enableReflection: false,
+      replanInterval: 1,
+    };
+    const analyst = new ExplorationTracker(quietAnalyst, { maxIterations: 40 });
+    const analystNudges: Array<string | null> = [];
+    for (let i = 1; i <= 6; i++) {
+      analyst.tick();
+      analystNudges.push(analyst.getNudge(fixedPlanTrace)?.type ?? null);
+    }
+    // 1=计划征集，2=replan#1，3/4=冷却，5=replan#2，6=配额已满。
+    expect(analystNudges).toEqual(['planning', 'planning', null, null, 'planning', null]);
+
+    const quietBootstrap: ExplorationStrategy = {
+      ...createGenerateStrategy(),
+      enableReflection: false,
+      replanInterval: 12,
+    };
+    const bootstrap = new ExplorationTracker(quietBootstrap, { maxIterations: 20 });
+    for (let i = 1; i <= 13; i++) {
+      bootstrap.tick();
+      const nudge = bootstrap.getNudge(fixedPlanTrace);
+      expect(nudge?.type ?? null).toBe(i === 1 ? 'planning' : null);
+    }
+
+    const suppressedLogs = debug.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('replan suppressed'));
+    expect(suppressedLogs).toHaveLength(4);
+    expect(suppressedLogs[0]).toContain('reason=cooldown');
+    expect(suppressedLogs[0]).toContain('iteration=3');
+    expect(suppressedLogs[0]).toContain('replanCount=1/2');
+    expect(suppressedLogs[0]).toContain('triggers=periodic');
+    expect(suppressedLogs[1]).toContain('reason=cooldown');
+    expect(suppressedLogs[2]).toContain('reason=replan_cap');
+    expect(suppressedLogs[2]).toContain('iteration=6');
+    expect(suppressedLogs[3]).toContain('reason=bootstrap_late');
+    expect(suppressedLogs[3]).toContain('iteration=13');
+    expect(suppressedLogs[3]).toContain('replanCount=0/1');
+  });
+});
+
+describe('PlanTracker skipped actions are observable (L6-P16 C17)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs failed and non-exploration actions excluded from plan statistics at debug', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    t.tick();
+    trace.startRound(1);
+    trace.recordToolCall(...recordedFinding, false);
+    trace.recordToolCall(...failedPlannedRead, false);
+    t.updatePlanProgress(trace);
+    const skippedLogs = debug.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('plan progress skipped'));
+    expect(skippedLogs).toHaveLength(1);
+    expect(skippedLogs[0]).toContain('skipped 1 failed and 1 non-exploration action(s)');
+    expect(skippedLogs[0]).toContain('counted=0');
+    expect(skippedLogs[0]).toContain('held: no countable action this round');
+    expect(t.getPlanProgress().consecutiveOffPlan).toBe(0);
+  });
+});
+
+describe('PlanTracker trace port (L6-P16 C19)', () => {
+  it('drives PlanTracker through the public ExplorationTrace port, honouring failed reads', () => {
+    const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];
+    let actions: ReturnType<NonNullable<ExplorationTrace['getCurrentRoundActions']>> = [
+      {
+        tool: 'code',
+        params: { action: 'read', params: { path: 'src/auth.ts' } },
+        ok: false,
+        successfulReadPaths: [],
+      },
+    ];
+    const trace: ExplorationTrace = {
+      getPlan: () => ({ createdAtIteration: 1, steps }),
+      getPlanStepsMutable: () => steps,
+      getCurrentRoundActions: () => actions,
+    };
+    const plans = new PlanTracker();
+    plans.updatePlanProgress(trace);
+    expect(steps[0].status).toBe('pending');
+    expect(plans.progress.consecutiveOffPlan).toBe(0);
+    actions = [
+      {
+        tool: 'code',
+        params: { action: 'read', params: { path: 'src/auth.ts' } },
+        ok: true,
+        successfulReadPaths: ['src/auth.ts'],
+      },
+    ];
+    plans.updatePlanProgress(trace);
+    expect(steps[0].status).toBe('done');
+  });
+
+  it('keeps a single trace port without the duplicated ActiveTrace type or casts', () => {
+    const planTrackerSource = readFileSync(
+      new URL('../src/agent/context/exploration/PlanTracker.ts', import.meta.url),
+      'utf8'
+    );
+    const explorationTrackerSource = readFileSync(
+      new URL('../src/agent/context/ExplorationTracker.ts', import.meta.url),
+      'utf8'
+    );
+    expect(planTrackerSource).not.toMatch(/\bActiveTrace\b/);
+    expect(explorationTrackerSource).not.toMatch(/\bActiveTrace\b/);
+    expect(explorationTrackerSource).not.toMatch(/trace as \w+/);
   });
 });

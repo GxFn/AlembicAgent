@@ -42,7 +42,6 @@ import {
   targetProducerSubmitCount,
 } from './exploration/ExplorationStrategies.js';
 import { NUDGE_DIRECTIVE_TEXTS, NudgeGenerator } from './exploration/NudgeGenerator.js';
-import type { ActiveTrace } from './exploration/PlanTracker.js';
 import { PlanTracker } from './exploration/PlanTracker.js';
 import { isSearchAction, SignalDetector } from './exploration/SignalDetector.js';
 
@@ -300,7 +299,22 @@ export class ExplorationTracker {
     if (this.#strategy.enablePlanning) {
       const planningNudge = this.#planTracker.checkPlanning(
         this.#buildNudgeState(),
-        trace as ActiveTrace | null
+        trace,
+        (suppression) => {
+          // replan 触发已成立但被配额/后段/冷却抑制：返回值仍是 null，这里留下短路原因供排查“偏离却未纠偏”。
+          observeSafely(
+            () =>
+              this.#logger.debug(
+                `[ExplorationTracker] 📋 planning replan suppressed: reason=${suppression.reason}, ` +
+                  `triggers=${suppression.triggers.join('+')}, iteration=${suppression.iteration}, ` +
+                  `replanCount=${suppression.replanCount}/${suppression.maxReplans}, ` +
+                  `lastReplanIteration=${suppression.lastReplanIteration ?? 'none'}, ` +
+                  `consecutiveOffPlan=${suppression.consecutiveOffPlan}, ` +
+                  `pipeline=${suppression.pipelineType}, phase=${suppression.phase ?? 'unknown'} — no planning nudge this round`
+              ),
+            () => undefined
+          );
+        }
       );
       if (planningNudge) {
         this.#logger.info(
@@ -655,7 +669,23 @@ export class ExplorationTracker {
     if (!this.#strategy.enablePlanning) {
       return;
     }
-    this.#planTracker.updatePlanProgress(trace as ActiveTrace | null);
+    const evaluation = this.#planTracker.updatePlanProgress(trace);
+    const skipped =
+      (evaluation?.skippedFailedActions ?? 0) + (evaluation?.skippedNonExplorationActions ?? 0);
+    if (evaluation && skipped > 0) {
+      // 失败动作与记录类动作被排除出计划匹配/偏离统计；本轮若无可计动作，偏离连击保持不变。
+      observeSafely(
+        () =>
+          this.#logger.debug(
+            `[ExplorationTracker] plan progress skipped ${evaluation.skippedFailedActions} failed and ` +
+              `${evaluation.skippedNonExplorationActions} non-exploration action(s) at iteration ${this.#metrics.iteration} ` +
+              `(only successful code/graph/terminal exploration counts); counted=${evaluation.countedActions}, ` +
+              `matched=${evaluation.matchedActions}, consecutiveOffPlan=${evaluation.consecutiveOffPlan}` +
+              (evaluation.streakHeld ? ' (held: no countable action this round)' : '')
+          ),
+        () => undefined
+      );
+    }
   }
 
   /**
@@ -663,7 +693,7 @@ export class ExplorationTracker {
    * @returns }
    */
   getQualityMetrics(trace: ExplorationTrace | null) {
-    return this.#planTracker.getQualityMetrics(trace as ActiveTrace | null);
+    return this.#planTracker.getQualityMetrics(trace);
   }
 
   // ─── 阶段路由内部方法 ──────────────────────────────────
