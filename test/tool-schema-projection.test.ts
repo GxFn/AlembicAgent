@@ -1334,4 +1334,124 @@ describe('runtime lazy schema state across runs', () => {
     // 类方法语义不变：运行时没有重置或改写宿主自己登记的展开状态。
     expect(catalog.expandedCount).toBe(1);
   });
+
+  // 以下用例对应 L5 审阅 I15：pipeline 每个阶段在同一个 runtime 上各跑一次 reactLoop，
+  // 每个循环只在 #initLoop 查询一次 schema；前一阶段用过的工具不能让后一阶段降级未用工具。
+  it('keeps complete schemas in a later stage loop of the same runtime after an earlier loop used a tool', async () => {
+    const catalog = new UnifiedToolCatalog([
+      requiredQueryDefinition('tool_a'),
+      requiredQueryDefinition('tool_b'),
+    ]);
+    const query = vi.spyOn(catalog, 'querySchemas');
+    const { runtime, execute, chatWithTools } = runtimeWith(catalog, new PairCapability());
+    chatWithTools
+      .mockReset()
+      .mockResolvedValueOnce({
+        functionCalls: [{ id: 'stage-1-a', name: 'tool_a', args: { q: 'x' } }],
+      })
+      .mockResolvedValue({ text: 'done' });
+    await runtime.reactLoop('stage 1 loop');
+    expect(execute).toHaveBeenCalledTimes(1);
+    const secondLoopStart = chatWithTools.mock.calls.length;
+
+    await runtime.reactLoop('stage 2 loop');
+    // 第 2 个循环首轮：tool_b 从未被调用，也必须带着必填参数 q 发给 provider。
+    expect(chatWithTools.mock.calls[secondLoopStart]?.[1].toolSchemas).toEqual(fullSchemas);
+    // 每个循环恰好查询一次，且都要完整 schema；运行时不向目录写展开状态。
+    expect(query.mock.calls.map(([request]) => [request.mode, request.firstRound])).toEqual([
+      ['mixed', true],
+      ['mixed', true],
+    ]);
+    expect(catalog.expandedCount).toBe(0);
+  });
+
+  it('leaves the production RuntimeCapabilityCatalog expansion state untouched and its output unchanged', async () => {
+    // 生产宿主把 RuntimeCapabilityCatalog 注册为 capabilityCatalog；它忽略 mode/firstRound，
+    // 修复后运行时既不再读取也不再累积它的 expandedCount（此前每次运行都会往单例里加工具名）。
+    const catalog = new RuntimeCapabilityCatalog();
+    const query = vi.spyOn(catalog, 'querySchemas');
+    const first = runtimeWith(catalog);
+    await first.runtime.reactLoop('production catalog first run');
+    // 无可用性限制时 graph.overview 与 code.read 都会执行；两者此前都会被写进展开集合。
+    expect(first.execute.mock.calls.map(([call]) => call.toolId)).toEqual(['graph', 'code']);
+    expect(catalog.expandedCount).toBe(0);
+
+    const second = runtimeWith(catalog);
+    await second.runtime.reactLoop('production catalog second run');
+    expect(catalog.expandedCount).toBe(0);
+    expect(query.mock.calls.map(([request]) => request?.firstRound)).toEqual([true, true]);
+    // 生产输出不随运行次数变化：两次运行发给 provider 的首轮 schema 完全一致。
+    const firstSchemas = first.chatWithTools.mock.calls[0]?.[1].toolSchemas;
+    expect(firstSchemas?.map((schema: { name: string }) => schema.name)).toEqual(['code', 'graph']);
+    expect(second.chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(firstSchemas);
+  });
+
+  it('keeps the legacy mixed-first selection order and forwards firstRound=true on every run', async () => {
+    // 旧 mixed 宿主：同时提供 mixed 与完整端口，并自带实例级展开状态（与旧目录形状一致）。
+    // firstRound=false 时它只给空参数 schema，用来暴露“按展开状态推导 firstRound”的回归。
+    const expanded = new Set<string>();
+    const pick = (actions: ToolActionAllowlist) =>
+      fullSchemas.filter((schema) => Object.hasOwn(actions, schema.name));
+    const legacy = {
+      toMixedSchemasForActions: vi.fn(
+        (actions: ToolActionAllowlist, _model?: string, firstRound?: boolean) =>
+          pick(actions).map((schema) =>
+            firstRound || expanded.has(schema.name)
+              ? schema
+              : {
+                  name: schema.name,
+                  description: schema.description,
+                  parameters: { type: 'object', properties: {} },
+                }
+          )
+      ),
+      toToolSchemasForActions: vi.fn((actions: ToolActionAllowlist) => pick(actions)),
+      markExpanded: vi.fn((id: string) => {
+        expanded.add(id);
+      }),
+      get expandedCount() {
+        return expanded.size;
+      },
+    };
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    try {
+      const first = runtimeWith(legacy, new PairCapability());
+      first.chatWithTools
+        .mockReset()
+        .mockResolvedValueOnce({
+          functionCalls: [{ id: 'legacy-a', name: 'tool_a', args: { q: 'x' } }],
+        })
+        .mockResolvedValue({ text: 'done' });
+      await first.runtime.reactLoop('legacy first run');
+      expect(first.execute).toHaveBeenCalledTimes(1);
+
+      const second = runtimeWith(legacy, new PairCapability());
+      second.chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
+      await second.runtime.reactLoop('legacy second run');
+
+      expect(second.chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(fullSchemas);
+      // 运行时保持 mode:'mixed'：旧宿主仍按 mixed 优先的既有顺序选中 toMixedSchemasForActions，
+      // 第三个参数 firstRound 每次都是 true，不会退到完整端口，也不报告 full→mixed 降级。
+      expect(legacy.toMixedSchemasForActions.mock.calls.map((call) => call[2])).toEqual([
+        true,
+        true,
+      ]);
+      expect(legacy.toToolSchemasForActions).not.toHaveBeenCalled();
+      expect(legacy.markExpanded).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('legacy_mode_degraded'));
+
+      // 对照：若运行时改成 mode:'full'，同一个旧宿主会改选完整端口，选择顺序随之变化；
+      // 这是运行时固定 firstRound:true 而不切换 mode 的原因（两者给出的 schema 相同）。
+      const diagnostic = vi.fn();
+      const full = queryToolSchemas(
+        legacy,
+        { selection: { tool_a: ['invoke'], tool_b: ['invoke'] }, mode: 'full' },
+        diagnostic
+      );
+      expect(diagnostic).toHaveBeenCalledWith('toToolSchemasForActions');
+      expect(full.schemas).toEqual(fullSchemas);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

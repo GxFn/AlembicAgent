@@ -1938,7 +1938,8 @@ export class AgentRuntime {
     }
 
     // 不再把本轮用过的工具写回 container 的 capabilityCatalog（markExpanded）。
-    // 该目录是进程级单例、展开状态从不重置，而 schema 每次运行只在 #initLoop 查询一次：
+    // 该目录是进程级单例、展开状态从不重置，而 schema 每个循环（每次运行、每个 pipeline 阶段）
+    // 只在 #initLoop 查询一次：
     // 运行内写入不会生效，跨运行却会让下一次运行中未用过的工具丢失参数 schema。
     // 原因与替代行为见 #queryToolSchemas 的 firstRound 注释。
 
@@ -2546,6 +2547,13 @@ export class AgentRuntime {
         // 因此每次运行都向目录要完整 schema，与实际的运行内行为一致。
         // RuntimeCapabilityCatalog 本就忽略 firstRound；UnifiedToolCatalog 的 lazy 公开方法语义不变，
         // 只是运行时不再读写它的实例级展开状态（是否改造成运行作用域属于待决事项）。
+        // 这里刻意保留 mode:'mixed' 而不改成 mode:'full'（两种写法都能拿到完整 schema）：
+        // queryLegacySchemas 在 full 下会让同时提供两类方法的旧宿主改选 toToolSchemas*，
+        // 旧端口的选择顺序随之变化；mixed + firstRound:true 保持 toMixedSchemas* 优先的既有顺序，
+        // 新端口（CapabilityCatalog/UnifiedToolCatalog）在 firstRound:true 下同样给完整投影。
+        // “每次运行”也包括 pipeline 各阶段：每个阶段在同一 runtime 上各跑一次 reactLoop，
+        // 各自经 #initLoop 查询一次，前一阶段用过哪些工具不影响后一阶段的 schema。
+        // 回归见 test/tool-schema-projection.test.ts 的 runtime lazy schema state across runs。
         firstRound: true,
         runtime,
       },
