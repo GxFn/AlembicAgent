@@ -115,6 +115,11 @@ export interface GateableReport {
  *   breadthScore (20%) — 工具使用广度
  *   evidenceScore (30%) — 证据充分性
  *   coherenceScore (20%) — 分析连贯性
+ *
+ * options.derivedFindingCount 是 findings 中“由分析文本小节派生”的条数（analysisArtifact 在没有
+ * note_finding 时的降级投影）。派生 findings 不是记录的发现（L7-P16/C07）：不计入 evidence 的数量
+ * 加分，也不计入 coherence 的 findings 加分；findings 全部为派生时 evidence 沿用无 findings 分支的
+ * 40 分上限。未声明该选项的调用方按全部为记录发现计分（口径不变）。
  */
 export function buildQualityScores(
   analysisText: string,
@@ -141,14 +146,25 @@ export function buildQualityScores(
   const evidencedFindings = (findings || []).filter(
     (f) => f.evidence && f.evidence.length > 0
   ).length;
-  if (findingCount > 0) {
+  // 派生条数夹在 [0, findingCount]：非法值按 0（全部视为记录发现）处理。
+  const derivedFindingCount = Math.min(
+    findingCount,
+    typeof options.derivedFindingCount === 'number' && Number.isFinite(options.derivedFindingCount)
+      ? Math.max(0, Math.floor(options.derivedFindingCount))
+      : 0
+  );
+  // 记录发现 = findings 中非派生的条数（analysisArtifact 里即 ActiveContext 的 memory findings）。
+  const recordedFindingCount = findingCount - derivedFindingCount;
+  if (recordedFindingCount > 0) {
+    // 两类混合时无法逐条区分来源：证据比例按全部 findings 算，数量加分只计记录发现。
     scores.evidenceScore = Math.min(
       100,
-      (evidencedFindings / findingCount) * 60 + findingCount * 10
+      (evidencedFindings / findingCount) * 60 + recordedFindingCount * 10
     );
   } else {
     // LLM didn't call note_finding — derive partial score from analysis text quality
-    // so a substantial analysis doesn't get zero just because note_finding wasn't used
+    // so a substantial analysis doesn't get zero just because note_finding wasn't used.
+    // 纯派生 findings 也走这里：它们只是文本投影，不能把 evidence 抬过 40 分上限（C07）。
     const textLen = analysisText?.length || 0;
     const hasFileRefs = uniqueFilesRead > 0;
     scores.evidenceScore = Math.min(
@@ -167,7 +183,8 @@ export function buildQualityScores(
     (textLen > 500 ? 40 : textLen / 12.5) +
       (hasHeaders ? 20 : 0) +
       (hasLists ? 20 : 0) +
-      (findingCount >= 3 ? 20 : findingCount * 7)
+      // findings 加分只计记录发现：派生 findings 本就来自同一段文本的小节，再加分是重复计数。
+      (recordedFindingCount >= 3 ? 20 : recordedFindingCount * 7)
   );
 
   const totalScore = Math.round(

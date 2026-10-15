@@ -6,6 +6,7 @@ import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { resolveProjectPath } from '#shared/projectPath.js';
+import { NUDGE_DIRECTIVE_TEXTS } from '../context/exploration/NudgeGenerator.js';
 import {
   EvidenceCollector,
   type SnippetRangeReader,
@@ -60,9 +61,49 @@ const FILE_REF_RE =
 // AnalysisReport 构建
 // ──────────────────────────────────────────────────────────────────
 
+function escapeRegExp(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 反思 nudge（NudgeGenerator #checkReflection）的固定收尾句。原始回显（未经 cleanFinalAnswer）里块在
+ * 这句之后结束。直接引用注入侧同一份原句，文案改动时清理规则自动同步。
+ *
+ * 注意：生产链上这句话通常已经不在了——AgentRuntime 以 cleanFinalAnswer(llmResult.text) 作为最终答复，
+ * cleanFinalAnswer 按 NUDGE_DIRECTIVE_TEXTS 逐行删掉这类指令回显，gateEvaluators 再把清理后的答复交给
+ * buildAnalysisArtifact。因此块的终止绝不能只靠这句话，见下方 REFLECTION_BLOCK_STOP。
+ */
+const REFLECTION_BLOCK_END = escapeRegExp(NUDGE_DIRECTIVE_TEXTS.noCopyReflection);
+
+/**
+ * 反思模板里能作为段落首行的行：思考方向 / 行动效率 / 累计 / 计划进度 / 评估问题的引导行，以及防复制
+ * 收尾句。反思块内部的每个段落都以其中之一开头（NudgeGenerator #checkReflection 的 parts 拼接）。
+ */
+const REFLECTION_PARAGRAPH_HEAD = String.raw`(?:你最近的思考方向|行动效率|累计|请评估)[:：]|📋\s*计划进度|${REFLECTION_BLOCK_END}`;
+
+/** 反思模板段落内部的续行：缩进的思考方向条目（`  1. …`）与编号的评估问题（`1. …`）。 */
+const REFLECTION_CONTINUATION_LINE = String.raw`[ \t]+\S|\d+\.\s`;
+
+/**
+ * 反思块 / 思考方向块的终止条件（L7-P16/C06 防过度清理）。惰性块体在最早满足下列任一条件处结束：
+ *   1. 防复制收尾句（原始回显）：连同这句一起删除后结束；
+ *   2. 下一行不是模板行（不是空行、段落引导行或段落续行）：真实标题、下一个 📊 块、正文行都在这里
+ *      截断，包括紧跟在块后、没有空行分隔的正文；
+ *   3. 空行之后的段落不以模板引导行开头：编号列表、缩进内容等 Analyst 自己的段落在这里截断
+ *      （模板里编号 / 缩进行只出现在段落内部，从不作为段落首行）；
+ *   4. 文本结尾（不用 m 模式下的 `$`，否则惰性匹配停在第一个行尾）。
+ * 空行判定容忍 `\r`（CRLF 文本里的空行是 `\r\n`），与标题行尾的 `[ \t\r]*` 一致。
+ * 这些条件只会让块变短：模型改写过的回显最多残留噪声（单行规则还会再清一遍模板行），
+ * 不会把块后的真实分析一并删掉。
+ */
+const REFLECTION_BLOCK_STOP = String.raw`(?:${REFLECTION_BLOCK_END}|(?=\n(?![ \t\r]*\n|${REFLECTION_PARAGRAPH_HEAD}|${REFLECTION_CONTINUATION_LINE})|\n[ \t\r]*\n(?![ \t\r]*\n|${REFLECTION_PARAGRAPH_HEAD})|(?![\s\S])))`;
+
 /**
  * 清理 Analyst 分析文本中可能泄漏的系统 nudge / graceful exit 指令。
  * 这些内容如果传给 Producer，会干扰其正常工作流。
+ *
+ * 多行块规则的终止条件（L7-P16/C06）：块正则保留 m 标志只为让 `^` 锚定行首；“文本结尾”必须写成
+ * `(?![\s\S])`——m 模式下 `$` 在每个行尾都成立，惰性的 `[\s\S]*?` 会停在块的第一个行尾，只删首行。
  */
 export function sanitizeAnalysisText(text: string) {
   if (!text) {
@@ -77,17 +118,29 @@ export function sanitizeAnalysisText(text: string) {
     /```json\s*\n\s*\{\s*"dimensionDigest"\s*:[\s\S]*?\n```/g,
     /^-{2,3}\s*\n\s*第\s*\d+\/\d+\s*轮[^\n]*\n(-{2,3}\s*\n)?/gm,
     /^-{3}\s*$/gm,
-    /^#{1,3}\s*(?:计划偏差分析|最终总结阶段|执行计划|下一步计划|分析计划)\s*\n[\s\S]*?(?=\n#{1,3}\s|\n\n(?=[^#\s-]))/gm,
+    // 计划类小节：到下一个标题、空行后的正文段落，或文本结尾（位于结尾的计划小节此前完全不删）。
+    /^#{1,3}\s*(?:计划偏差分析|最终总结阶段|执行计划|下一步计划|分析计划)\s*\n[\s\S]*?(?=\n#{1,3}\s|\n\n(?=[^#\s-])|(?![\s\S]))/gm,
     /^\(提示[:：][^)]*\)\s*\n?/gm,
     /^(?:Wait,|Let me|I'll stop here|I will stop|I need to|I should|I have enough)[^\n]*\n?/gm,
     /^[-•]\s*尝试使用\s*`[^`]+`[^\n]*\n?/gm,
     /^💡\s*提示[:：]?\s*\n?/gm,
     /^请(?:继续|接续)[。.]?\s*$/gm,
-    /📊\s*中期反思\s*\([^)]*\):?\s*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划|第\s*\d)|\n(?=📊)|$))/gm,
-    /^你最近的思考方向:\s*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划|第\s*\d)|\n(?=📊)|$))/gm,
-    /^#{1,3}\s*探索计划\s*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划)|\n\n(?=[^#\s\d-])|\n(?=📊)|$))/gm,
+    // 反思块（周期的中期反思与停滞反思，同出 NudgeGenerator #checkReflection）：标题行只吃到行尾，
+    // 块体按 REFLECTION_BLOCK_STOP 结束——生产输入已被 cleanFinalAnswer 删掉防复制收尾句，块必须能在
+    // 模板之后的第一处非模板内容停下，块后的无标题正文（Analyst 提示词允许不带格式）原样保留。
+    new RegExp(
+      String.raw`📊[ \t]*(?:中期|停滞)反思[ \t]*\([^)\n]*\)[:：]?[ \t\r]*(?=\n|(?![\s\S]))[\s\S]*?${REFLECTION_BLOCK_STOP}`,
+      'gm'
+    ),
+    // 只回显“你最近的思考方向”段落时同样按 REFLECTION_BLOCK_STOP 结束。
+    new RegExp(
+      String.raw`^你最近的思考方向:[ \t\r]*(?=\n|(?![\s\S]))[\s\S]*?${REFLECTION_BLOCK_STOP}`,
+      'gm'
+    ),
+    /^#{1,3}\s*探索计划\s*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划)|\n\n(?=[^#\s\d-])|\n(?=📊)|(?![\s\S])))/gm,
     /^\s*\d+\.\s+#{1,3}\s*探索计划[^\n]*\n(?:\d+\.\s+\*{0,2}[^\n]*\n?)*/gm,
-    /^#{1,3}\s*第\s*\d+\s*轮[:：][^\n]*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划|第\s*\d)|\n\n(?=#{1,3}\s)|\n(?=📊)|$))/gm,
+    // 轮次小节：与探索计划小节同口径，空行后的正文段落也是终止点，结尾的轮次小节不会吞掉其后的正文。
+    /^#{1,3}\s*第\s*\d+\s*轮[:：][^\n]*\n(?:[\s\S]*?(?=\n#{1,3}\s(?!探索计划|第\s*\d)|\n\n(?=#{1,3}\s)|\n\n(?=[^#\s\d-])|\n(?=📊)|(?![\s\S])))/gm,
     /^行动效率[:：][^\n]*\n?/gm,
     /^累计[:：]\s*\d+\s*文件[^\n]*\n?/gm,
     /^📋\s*计划进度[:：][^\n]*\n?/gm,
@@ -138,23 +191,51 @@ function shouldSkipDerivedFindingTitle(title: string) {
   return /^(?:待探索|总结|结论|概览|项目概览|分析报告|探索计划|执行计划)$/i.test(title.trim());
 }
 
+/** 文本派生 findings 的诊断计数（只进日志，不进入工件返回值）。 */
+interface DerivedFindingStats {
+  /** 参与派生判定的小节数（不含按标题跳过的小节）。 */
+  sections: number;
+  /** 这些小节正文里提及的文件引用数（同一小节内去重）。 */
+  mentionedRefs: number;
+  /** 不在接地集合里、被过滤掉的提及数（只提及未读取的文件）。 */
+  filteredMentions: number;
+  /** 有文件提及但没有任何接地引用、因而不派生的小节数。 */
+  sectionsWithoutGroundedRef: number;
+}
+
+/**
+ * 降级派生：Analyst 没有记 note_finding 时，把“标题 + 正文引用了已接地文件”的 Markdown 小节投影成
+ * findings。接地原则（L7-P16/C07）：只认派生前的接地集合——真实读取并在 evidenceMap 留下片段的文件；
+ * 正文提及不是证据，接地集合为空时一条都不派生（此前 knownFiles 为空即全部放行，且已知集合来自含
+ * 正文提及的 referencedFiles，过滤恒真）。evidence 只列接地文件，被过滤的提及数进入 stats 供诊断日志。
+ */
 function deriveFindingsFromAnalysisText(
   analysisText: string,
-  knownReferencedFiles: string[]
-): NormalizedFinding[] {
-  const knownFiles = new Set(knownReferencedFiles);
+  groundedFiles: ReadonlySet<string>
+): { findings: NormalizedFinding[]; stats: DerivedFindingStats } {
   const findings: NormalizedFinding[] = [];
+  const stats: DerivedFindingStats = {
+    sections: 0,
+    mentionedRefs: 0,
+    filteredMentions: 0,
+    sectionsWithoutGroundedRef: 0,
+  };
 
   for (const section of splitMarkdownSections(analysisText)) {
     const title = section.title.replace(/^\d+(?:\.\d+)*[、.)\s-]*/, '').trim();
     if (!title || shouldSkipDerivedFindingTitle(title)) {
       continue;
     }
+    stats.sections += 1;
 
-    const fileRefs = extractFileRefs(section.body).filter(
-      (ref) => knownFiles.size === 0 || knownFiles.has(ref)
-    );
+    const mentioned = extractFileRefs(section.body);
+    const fileRefs = mentioned.filter((ref) => groundedFiles.has(ref));
+    stats.mentionedRefs += mentioned.length;
+    stats.filteredMentions += mentioned.length - fileRefs.length;
     if (fileRefs.length === 0) {
+      if (mentioned.length > 0) {
+        stats.sectionsWithoutGroundedRef += 1;
+      }
       continue;
     }
 
@@ -169,7 +250,36 @@ function deriveFindingsFromAnalysisText(
     }
   }
 
-  return findings;
+  return { findings, stats };
+}
+
+/**
+ * 派生降级路径的诊断日志：派生条数、接地集合大小与被过滤的提及。接地集合为空时标
+ * skipped=no-grounded-files（无接地不派生），有接地但没有小节引用它时标 skipped=no-grounded-mentions。
+ * 派生 findings 只是文本投影，buildQualityScores 不给它们 evidence / coherence 加分。
+ */
+function reportDerivedFindings(
+  stats: DerivedFindingStats,
+  derivedCount: number,
+  groundedFileCount: number,
+  dimensionId: string
+) {
+  const skipped =
+    groundedFileCount === 0
+      ? ', skipped=no-grounded-files'
+      : derivedCount === 0
+        ? ', skipped=no-grounded-mentions'
+        : '';
+  observeSafely(
+    () =>
+      logger().info(
+        `[AnalysisArtifact] derived findings: derived=${derivedCount}, groundedFiles=${groundedFileCount}, ` +
+          `sections=${stats.sections}, mentionedRefs=${stats.mentionedRefs}, ` +
+          `filteredMentions=${stats.filteredMentions}, ` +
+          `sectionsWithoutGroundedRef=${stats.sectionsWithoutGroundedRef}${skipped} (dim=${dimensionId})`
+      ),
+    () => undefined
+  );
 }
 
 /**
@@ -329,33 +439,91 @@ function buildReportFromEvidence(
 // ──────────────────────────────────────────────────────────────────
 
 /**
- * projectRoot 内的只读行范围端口（R1 锚点补齐用）。逐字读取 [startLine, endLine] 源码，
- * endLine 超文件末尾时收缩为实际末行；相对路径逃逸 / 绝对路径 / 文件缺失返回 null——
- * 绝不让补齐流程读到项目外内容或编造证据。
+ * 读盘端口返回 null 的原因计数（L7-P16/C43），各项之和对应 collector 的 anchorReaderMiss。
+ * 只在闭包内累计并并入 anchor grounding 日志，不进入工件返回值。
  */
-function createFsSnippetRangeReader(projectRoot: string): SnippetRangeReader {
-  return (filePath, startLine, endLine) => {
+interface SnippetReaderMisses {
+  /** 绝对路径 / `..` 逃逸，或 resolveProjectPath 的 Access denied（根内 symlink 指向根外等）。 */
+  outsideRoot: number;
+  /** ENOENT / ENOTDIR，或目标不是普通文件。 */
+  missing: number;
+  /** 起始行 < 1 或超过文件行数。 */
+  outOfRange: number;
+  /** 行范围内只有空白。 */
+  emptyRange: number;
+  /** 其它读取异常（权限不足等）。 */
+  readError: number;
+}
+
+/** 从 unknown 异常里取 Node errno code（不是 errno 异常时为 undefined）。 */
+function errnoCode(err: unknown): string | undefined {
+  if (err instanceof Error && 'code' in err && typeof err.code === 'string') {
+    return err.code;
+  }
+  return undefined;
+}
+
+/** 读盘异常归类：缺失与根外拒绝是可预期的未命中，其余都算读取错误。 */
+function classifyReaderError(err: unknown): 'missing' | 'outsideRoot' | 'readError' {
+  const code = errnoCode(err);
+  if (code === 'ENOENT' || code === 'ENOTDIR') {
+    return 'missing';
+  }
+  // resolveProjectPath 的越界 / 不可解析拒绝统一以 “Access denied” 开头（src/shared/projectPath.ts）。
+  if (err instanceof Error && err.message.startsWith('Access denied')) {
+    return 'outsideRoot';
+  }
+  return 'readError';
+}
+
+/**
+ * projectRoot 内的只读行范围端口（R1 锚点补齐用）。逐字读取 [startLine, endLine] 源码，
+ * endLine 超文件末尾时收缩为实际末行；相对路径逃逸 / 绝对路径 / 文件缺失 / symlink 逃逸返回 null——
+ * 绝不让补齐流程读到项目外内容或编造证据。每次返回 null 都按原因计入 misses（C43），调用方把计数
+ * 并入 anchor grounding 日志，越界拒绝与读取错误不再被静默吞掉。
+ */
+function createFsSnippetRangeReader(projectRoot: string): {
+  reader: SnippetRangeReader;
+  misses: SnippetReaderMisses;
+} {
+  const misses: SnippetReaderMisses = {
+    outsideRoot: 0,
+    missing: 0,
+    outOfRange: 0,
+    emptyRange: 0,
+    readError: 0,
+  };
+  const reader: SnippetRangeReader = (filePath, startLine, endLine) => {
     try {
       const normalized = path.posix.normalize(String(filePath).replaceAll('\\', '/'));
       if (path.isAbsolute(normalized) || normalized === '..' || normalized.startsWith('../')) {
+        misses.outsideRoot += 1;
         return null;
       }
       const absPath = resolveProjectPath(projectRoot, normalized).absolute;
       if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+        misses.missing += 1;
         return null;
       }
       const lines = fs.readFileSync(absPath, 'utf-8').split('\n');
       if (startLine < 1 || startLine > lines.length) {
+        misses.outOfRange += 1;
         return null;
       }
       const effectiveEnd = Math.min(endLine, lines.length);
       const content = lines.slice(startLine - 1, effectiveEnd).join('\n');
-      return content.trim() ? { content, endLine: effectiveEnd } : null;
-    } catch {
-      // 只读补齐失败静默跳过：证据缺失优于错误证据。
+      if (!content.trim()) {
+        misses.emptyRange += 1;
+        return null;
+      }
+      return { content, endLine: effectiveEnd };
+    } catch (err: unknown) {
+      // 只读补齐失败跳过（证据缺失优于错误证据），但按原因计数，供 anchor grounding 日志定位。
+      misses[classifyReaderError(err)] += 1;
       return null;
     }
   };
+  return { reader, misses };
 }
 
 /** 统计 collector 当前片段总数（锚点补齐前后对照用） */
@@ -422,11 +590,25 @@ export function buildAnalysisArtifact(
         importance: f.importance,
       }));
   if (!opts.strictColdStart && findings.length === 0) {
-    // 降级路径基于 referencedFiles 派生（evidenceMap keys 在此场景与其同源，见下方 allFiles 合并）。
-    findings = deriveFindingsFromAnalysisText(baseReport.analysisText, [
-      ...new Set(baseReport.referencedFiles),
-    ]);
+    // 降级路径（没有 note_finding）：只按派生前接地集合派生（L7-P16/C07）。referencedFiles 含正文提及，
+    // 而小节正文来自同一段文本，拿它过滤恒真；接地集合 = baseReport.groundedFiles 并上此刻 evidenceMap
+    // 中有片段的 key（两者同源于同一 collector，并集只防两处投影将来分叉）。必须在下方锚点补读之前取，
+    // 补读读到的磁盘片段不能反过来为派生 findings 自证接地。
+    const derivationGrounding = new Set(baseReport.groundedFiles);
+    for (const [filePath, entry] of collector.build().evidenceMap) {
+      if (entry.codeSnippets.length > 0) {
+        derivationGrounding.add(filePath);
+      }
+    }
+    const derived = deriveFindingsFromAnalysisText(baseReport.analysisText, derivationGrounding);
+    findings = derived.findings;
     derivedFindingCount = findings.length;
+    reportDerivedFindings(
+      derived.stats,
+      derivedFindingCount,
+      derivationGrounding.size,
+      dimensionId
+    );
   }
 
   // R1 锚点驱动证据补齐：findings 引用的 path:line 锚点若不在已采片段覆盖内（典型：全文读
@@ -435,7 +617,8 @@ export function buildAnalysisArtifact(
   if (!opts.strictColdStart && opts.projectRoot) {
     const beforeSnippets = countSnippets(collector);
     const beforeDiagnostics = collector.diagnostics();
-    collector.groundFindingRefs(findings, createFsSnippetRangeReader(opts.projectRoot));
+    const { reader, misses } = createFsSnippetRangeReader(opts.projectRoot);
+    collector.groundFindingRefs(findings, reader);
     const afterSnippets = countSnippets(collector);
     const afterDiagnostics = collector.diagnostics();
     postHocLiveReadCount = Math.max(0, afterSnippets - beforeSnippets);
@@ -447,15 +630,21 @@ export function buildAnalysisArtifact(
       afterDiagnostics[key] - beforeDiagnostics[key];
     // 残余根因分辨日志（下列计数按锚点，一条 finding 可带多个锚点）：
     // anchored=0 → Analyst 没写行号锚（依从性缺口在上游）；
-    // anchored>0 且 grounded=0 → 看同行计数：readerMiss（路径越界 / 文件缺失 / 行号超界 / 读取失败）、
+    // anchored>0 且 grounded=0 → 看同行计数：readerMiss 及其方括号内的读盘端口分类（C43：outsideRoot
+    //   路径越界或 symlink 逃逸被拒 / missing 文件缺失 / outOfRange 行号超界 / emptyRange 空范围 /
+    //   readError 其它读取失败）、
     //   droppedByFileCap / droppedByBudget / droppedOversize（每文件名额或片段预算挡住补读）、
     //   alreadyCovered（起始行已有片段覆盖）、docSkipped（文档锚点按设计不补）、invalidRange（行号无效）；
     // grounded>0 仍被拒 → Producer 没照抄。
+    const readerMissDetail =
+      `[outsideRoot=${misses.outsideRoot}, missing=${misses.missing}, outOfRange=${misses.outOfRange}, ` +
+      `emptyRange=${misses.emptyRange}, readError=${misses.readError}]`;
     observeSafely(
       () =>
         logger().info(
           `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, ` +
-            `groundedSnippets=+${afterSnippets - beforeSnippets}, readerMiss=${grounding('anchorReaderMiss')}, ` +
+            `groundedSnippets=+${afterSnippets - beforeSnippets}, readerMiss=${grounding('anchorReaderMiss')} ` +
+            `${readerMissDetail}, ` +
             `alreadyCovered=${grounding('anchorAlreadyCovered')}, docSkipped=${grounding('anchorDocSkipped')}, ` +
             `invalidRange=${grounding('anchorInvalidRange')}, droppedByFileCap=${grounding('droppedByFileCap')}, ` +
             `droppedByBudget=${grounding('droppedByBudget')}, droppedOversize=${grounding('droppedOversize')} ` +

@@ -181,14 +181,24 @@ describe('evidence recording quality gate actions', () => {
   it.each([0, 1, 3])('keeps derived markdown separate from %s recorded findings', (count) => {
     const { source, activeContext } = recordedFindingFixture(count);
     const artifact = buildAnalysisArtifact(source, 'error-resilience', null, activeContext);
+    // L7-P16(C07)：派生只认派生前接地集合(真实读取并留下片段的文件)。fixture 只读了 3 个文件，
+    // 第三个小节只提及未读的 AuthMiddleware/CacheMiddleware，不再派生；剩下 2 条派生 findings。
     expect(artifact.metadata).toMatchObject({
       memoryFindingCount: count,
-      derivedFindingCount: count === 0 ? 3 : 0,
+      derivedFindingCount: count === 0 ? 2 : 0,
     });
-    expect(artifact.findings).toHaveLength(count || 3);
+    expect(artifact.findings).toHaveLength(count || 2);
     if (count === 0) {
+      const groundedFiles = new Set(artifact.groundedFiles);
       expect(artifact.findings[0].evidence).toContain('NetworkError.swift');
-      expect(artifact.qualityReport.scores.evidenceScore).toBeGreaterThanOrEqual(50);
+      for (const finding of artifact.findings) {
+        for (const ref of finding.evidence.split(', ')) {
+          expect(groundedFiles.has(ref), ref).toBe(true);
+        }
+      }
+      expect(artifact.findings.map((finding) => finding.finding)).not.toContain('中间件错误恢复');
+      // 纯派生 findings 不计入 evidence 加分：沿用无 note_finding 时的 40 分上限。
+      expect(artifact.qualityReport.scores.evidenceScore).toBeLessThanOrEqual(40);
       expect(artifact.qualityReport.suggestions).toContain(MISSING_FINDINGS);
       expect(analysisQualityGate(artifact, { outputType: 'candidate' })).toMatchObject({
         pass: false,

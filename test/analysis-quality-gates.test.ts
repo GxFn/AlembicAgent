@@ -19,6 +19,7 @@ import {
 import {
   analysisQualityGate,
   applyDepthRetryGate,
+  buildQualityScores,
   DEPTH_GAP_REASON,
   GENERIC_DEPTH_GAP_HINT,
 } from '../src/agent/evaluation/qualityGates.js';
@@ -668,5 +669,143 @@ describe('insightGateEvaluator 候选模式单一判据 (L7-P18/C09)', () => {
     } finally {
       infoLog.mockRestore();
     }
+  });
+});
+
+// ─── L7-P16(C07)：派生 findings 只基于派生前接地集合，纯派生 findings 不抬高 evidence / coherence ───
+// 此前派生过滤用 referencedFiles(含正文提及)当已知集合，而小节正文来自同一段文本，过滤恒真：零读取时
+// 3 个「## 小节 + 未读路径」就派生出 3 条“有证据”的 findings，evidenceScore 0→90、totalScore 2→37。
+describe('派生 findings 接地与评分口径 (L7-P16/C07)', () => {
+  const noRecordedFindings = { distill: () => ({ keyFindings: [], toolCallSummary: [] }) };
+  const ghostSections = [
+    '## 认证流程',
+    '逻辑在 src/ghost/auth.ts 中实现。',
+    '## 缓存策略',
+    '见 src/ghost/cache.ts',
+    '## 路由',
+    'src/ghost/router.ts 负责分发',
+  ].join('\n');
+  // 真实 code.read 展示态每行带 `N|` 前缀(L7-P13)，才会成为可接地的源码片段。
+  const readCall = (filePath: string) => ({
+    tool: 'code',
+    args: { action: 'read', path: filePath },
+    result: Array.from({ length: 5 }, (_, i) => `${i + 1}|export const v${i} = ${i};`).join('\n'),
+  });
+
+  function infoLines(run: () => void): string[] {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      run();
+      return info.mock.calls.map(([entry]) => String(entry));
+    } finally {
+      info.mockRestore();
+    }
+  }
+
+  it('零读取时只提及未读文件的小节不派生 findings，evidenceScore 不因小节标题上升', () => {
+    let artifact: ReturnType<typeof buildAnalysisArtifact> | undefined;
+    const lines = infoLines(() => {
+      artifact = buildAnalysisArtifact(
+        { reply: ghostSections, toolCalls: [] },
+        'architecture',
+        null,
+        noRecordedFindings
+      );
+    });
+    const headerless = buildAnalysisArtifact(
+      { reply: ghostSections.replace(/^## .*$/gm, ''), toolCalls: [] },
+      'architecture',
+      null,
+      noRecordedFindings
+    );
+    expect(artifact?.metadata.derivedFindingCount).toBe(0);
+    expect(artifact?.findings).toEqual([]);
+    expect(artifact?.groundedFiles).toEqual([]);
+    expect(artifact?.qualityReport.scores.evidenceScore).toBe(0);
+    expect(artifact?.qualityReport.scores.evidenceScore).toBe(
+      headerless.qualityReport.scores.evidenceScore
+    );
+    // 无接地不派生必须留下可追查的诊断：跳过原因与被跳过的提及数。
+    const derivation = lines.find((line) => line.includes('[AnalysisArtifact] derived findings'));
+    expect(derivation).toContain('skipped=no-grounded-files');
+    expect(derivation).toContain('derived=0');
+    expect(derivation).toContain('mentionedRefs=3');
+    expect(derivation).toContain('(dim=architecture)');
+  });
+
+  it('有真实读取时只把接地文件派生为 findings，未读提及被过滤并计数', () => {
+    const reply = [
+      '## 认证流程',
+      '逻辑在 src/real/auth.ts 与 src/ghost/auth.ts 之间切换。',
+      '## 缓存策略',
+      '见 src/ghost/cache.ts',
+      '## 路由',
+      'src/real/router.ts 负责分发',
+    ].join('\n');
+    let artifact: ReturnType<typeof buildAnalysisArtifact> | undefined;
+    const lines = infoLines(() => {
+      artifact = buildAnalysisArtifact(
+        { reply, toolCalls: [readCall('src/real/auth.ts'), readCall('src/real/router.ts')] },
+        'architecture',
+        null,
+        noRecordedFindings
+      );
+    });
+    expect(artifact?.metadata).toMatchObject({ memoryFindingCount: 0, derivedFindingCount: 2 });
+    expect(artifact?.findings).toEqual([
+      { finding: '认证流程', evidence: 'src/real/auth.ts', importance: 6 },
+      { finding: '路由', evidence: 'src/real/router.ts', importance: 6 },
+    ]);
+    // 文本提及仍保留给旧消费者，但不进入派生证据。
+    expect(artifact?.referencedFiles).toEqual(expect.arrayContaining(['src/ghost/cache.ts']));
+    const derivation = lines.find((line) => line.includes('[AnalysisArtifact] derived findings'));
+    expect(derivation).toContain('derived=2');
+    expect(derivation).toContain('groundedFiles=2');
+    expect(derivation).toContain('filteredMentions=2');
+    expect(derivation).toContain('sectionsWithoutGroundedRef=1');
+  });
+
+  it('纯派生 findings 的 evidence 沿用 40 分上限，coherence 只计 memory findings 加分', () => {
+    const evidence = {
+      evidenceMap: new Map(),
+      explorationLog: [],
+      negativeSignals: [],
+      graphEvidence: [],
+    } as Parameters<typeof buildQualityScores>[2];
+    const text = `## 小节\n${'分析正文。'.repeat(150)}\n- 要点 src/a.ts`;
+    const findings = [
+      { finding: 'A', evidence: 'src/a.ts', importance: 6 },
+      { finding: 'B', evidence: 'src/b.ts', importance: 6 },
+      { finding: 'C', evidence: 'src/c.ts', importance: 6 },
+    ];
+    const none = buildQualityScores(text, [], evidence, { memoryFindingCount: 0 });
+    const derived = buildQualityScores(text, findings, evidence, {
+      memoryFindingCount: 0,
+      derivedFindingCount: findings.length,
+    });
+    const recorded = buildQualityScores(text, findings, evidence, {
+      memoryFindingCount: findings.length,
+      derivedFindingCount: 0,
+    });
+    // 派生 findings 不计入 evidence 加分：与“没有 findings”同一文本分支，且不超过 40。
+    expect(derived.scores.evidenceScore).toBe(none.scores.evidenceScore);
+    expect(derived.scores.evidenceScore).toBeLessThanOrEqual(40);
+    expect(derived.scores.coherenceScore).toBe(none.scores.coherenceScore);
+    expect(derived.totalScore).toBe(none.totalScore);
+    expect(derived.suggestions).toContain('Findings lack file-level evidence');
+    // note_finding 记录的发现口径不变：比例 60 + 每条 10，coherence 满 3 条加 20。
+    expect(recorded.scores.evidenceScore).toBe(90);
+    expect(recorded.scores.coherenceScore).toBe(none.scores.coherenceScore + 20);
+  });
+
+  it('未声明 derivedFindingCount 的旧调用方按记录发现计分(兼容口径不变)', () => {
+    const evidence = {
+      evidenceMap: new Map(),
+      explorationLog: [],
+      negativeSignals: [],
+      graphEvidence: [],
+    } as Parameters<typeof buildQualityScores>[2];
+    const findings = [{ finding: 'A', evidence: 'src/a.ts', importance: 6 }];
+    expect(buildQualityScores('text', findings, evidence).scores.evidenceScore).toBe(70);
   });
 });
