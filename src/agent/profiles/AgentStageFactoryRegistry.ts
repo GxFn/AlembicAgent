@@ -103,9 +103,6 @@ export class AgentStageFactoryRegistry {
       const prescreenDone = params.prescreenDone === true;
       const terminalCapability = resolveGenerateTerminalToolset();
       const terminalPolicyHints = buildGenerateTerminalPolicyHints(terminalCapability);
-      const memoryCoordinator = context?.memoryCoordinator as
-        | { allocateBudget?: (role: string) => void }
-        | undefined;
       const rescanContext = strategyContext?.rescanContext as
         | { gap?: number; createBudget?: number }
         | null
@@ -187,10 +184,11 @@ export class AgentStageFactoryRegistry {
               },
             }
           : {}),
-        promptBuilder: (ctx: Record<string, unknown>) => {
-          memoryCoordinator?.allocateBudget?.('producer');
-          return presetProduce.promptBuilder?.(withTerminalPromptContext(ctx));
-        },
+        // 不再调用 memoryCoordinator.allocateBudget('producer')（L6-P12/C39）：AgentRuntime 已按
+        // pipelinePhase 显式传 mode 装配动态记忆，该调用是空操作；而 coordinator 由所有维度共享，
+        // allocateBudget 会改写全局模式并清空所有 scope 的预算快照，并行维度下有跨 scope 污染风险。
+        promptBuilder: (ctx: Record<string, unknown>) =>
+          presetProduce.promptBuilder?.(withTerminalPromptContext(ctx)),
       };
 
       if (hasExistingRecipes && !prescreenDone) {

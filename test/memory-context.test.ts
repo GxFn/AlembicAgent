@@ -20,6 +20,7 @@ import type {
   DimensionReportInput,
   TierReflection,
 } from '../src/agent/memory/SessionStore.js';
+import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import {
   ConversationStore,
   MEMORY_STORE_REQUIRED_COLUMNS,
@@ -31,6 +32,8 @@ import {
   SessionStore,
 } from '../src/index.js';
 import { estimateTokens } from '../src/shared/tokenUtils.js';
+import type { MemoryCoordinatorLike, ToolContext } from '../src/tools/kernel/index.js';
+import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 
 const tempRoots: string[] = [];
 
@@ -1530,6 +1533,228 @@ describe('MemoryCoordinator', () => {
         operation: 'persistentMemory.append',
       }),
     ]);
+  });
+});
+
+// L6-P12（C40/C39/C25/C35）：会话级 coordinator 被多个维度共享时，缺省 scopeId 不能静默落到
+// “最近创建的 scope”；producer 阶段不再改写共享预算；静默 catch 与证据降级要能在日志里定位。
+// 日志断言经 Logger 单例 spy（coordinator 构造时经 getInstance 取到同一实例）。
+describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function spyLogger() {
+    const logger = Logger.getInstance();
+    return {
+      warn: vi.spyOn(logger, 'warn').mockImplementation(() => undefined),
+      debug: vi.spyOn(logger, 'debug').mockImplementation(() => undefined),
+      info: vi.spyOn(logger, 'info').mockImplementation(() => undefined),
+    };
+  }
+
+  function messagesOf(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('rejects noteFinding without scopeId when two scopes are active and warns with the scope count', () => {
+    const log = spyLogger();
+    const coordinator = new MemoryCoordinator();
+    const dimA = coordinator.createDimensionScope('dimA:analyst');
+    const dimB = coordinator.createDimensionScope('dimB:analyst');
+
+    const rejected = coordinator.noteFinding('AuthService owns session refresh', 'E-1', 7, 3);
+
+    expect(rejected).toMatchObject({ recorded: false, target: 'missing-active-context' });
+    expect(rejected.message).toContain('2');
+    expect(rejected).not.toHaveProperty('scopeId');
+    expect(dimA.scratchpadSize).toBe(0);
+    expect(dimB.scratchpadSize).toBe(0);
+    const warning = messagesOf(log.warn).find((message) => message.includes('noteFinding'));
+    expect(warning).toContain('scopes=2');
+    expect(warning).toContain('scopeId');
+
+    // 显式 scopeId 不受守卫影响，仍写进指定维度。
+    const explicit = coordinator.noteFinding(
+      'AuthService owns session refresh',
+      'E-1',
+      7,
+      3,
+      'dimA:analyst'
+    );
+    expect(explicit).toMatchObject({
+      recorded: true,
+      target: 'activeContext',
+      scopeId: 'dimA:analyst',
+    });
+    expect(dimA.scratchpadSize).toBe(1);
+    expect(dimB.scratchpadSize).toBe(0);
+    coordinator.dispose();
+  });
+
+  it('keeps the single-scope implicit fallback writable and logs implicit-current-scope at debug', () => {
+    const log = spyLogger();
+    const coordinator = new MemoryCoordinator();
+    const only = coordinator.createDimensionScope('solo:analyst');
+
+    const recorded = coordinator.noteFinding(
+      'Repository writes go through withTransaction',
+      'E-2',
+      6,
+      1
+    );
+    expect(recorded).toMatchObject({ recorded: true, target: 'activeContext' });
+    expect(only.scratchpadSize).toBe(1);
+    expect(coordinator.buildDynamicMemoryPrompt({ mode: 'analyst' })).toContain('withTransaction');
+
+    const implicit = messagesOf(log.debug).filter((message) =>
+      message.includes('implicit-current-scope')
+    );
+    expect(implicit.some((message) => message.includes('noteFinding'))).toBe(true);
+    expect(implicit.some((message) => message.includes('solo:analyst'))).toBe(true);
+    expect(messagesOf(log.warn).filter((message) => message.includes('scopeId'))).toEqual([]);
+    // 公开 getActiveContext() 无参语义不变：仍回退到最近创建的 scope。
+    expect(coordinator.getActiveContext()).toBe(only);
+    coordinator.dispose();
+  });
+
+  it('returns an empty dynamic memory prompt without scopeId when several scopes are active', () => {
+    const log = spyLogger();
+    const coordinator = new MemoryCoordinator();
+    coordinator.createDimensionScope('dimA:analyst');
+    coordinator.createDimensionScope('dimB:analyst');
+    coordinator.noteFinding('dimB private working memory', 'E-3', 8, 1, 'dimB:analyst');
+
+    expect(coordinator.buildDynamicMemoryPrompt({ mode: 'analyst' })).toBe('');
+    const warning = messagesOf(log.warn).find((message) =>
+      message.includes('buildDynamicMemoryPrompt')
+    );
+    expect(warning).toContain('scopes=2');
+    expect(
+      coordinator.buildDynamicMemoryPrompt({ mode: 'analyst', scopeId: 'dimB:analyst' })
+    ).toContain('dimB private working memory');
+    // 公开 getActiveContext() 无参语义不变（只在内部调用点加守卫）。
+    expect(coordinator.getActiveContext()?.scratchpadSize).toBe(1);
+    coordinator.dispose();
+  });
+
+  it('locates the missing-SessionStore degradation in logs when get_previous_evidence runs through the handler', async () => {
+    const log = spyLogger();
+    const coordinator = new MemoryCoordinator({ mode: 'bootstrap' });
+    const ctx: ToolContext = {
+      projectRoot: makeTempRoot('p12-evidence'),
+      tokenBudget: 4000,
+      memoryCoordinator: coordinator,
+    };
+
+    const first = await handleMemory('get_previous_evidence', { query: 'Foo', dimId: 'api' }, ctx);
+    const second = await handleMemory('get_previous_evidence', { query: 'Bar' }, ctx);
+
+    expect(first._meta?.degraded).toBe(true);
+    expect(second._meta?.degraded).toBe(true);
+    // 每个 coordinator 至多一次 warn，后续命中降为 debug，避免 scan 每轮刷屏。
+    const warnings = messagesOf(log.warn).filter((message) =>
+      message.includes('MEMORY_EVIDENCE_STORE_MISSING')
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('query="Foo"');
+    const debugs = messagesOf(log.debug).filter((message) =>
+      message.includes('MEMORY_EVIDENCE_STORE_MISSING')
+    );
+    expect(debugs.some((message) => message.includes('query="Bar"'))).toBe(true);
+    coordinator.dispose();
+  });
+
+  it('does not reset the shared memory budget from the generate producer stage promptBuilder', () => {
+    const coordinator = new MemoryCoordinator({ mode: 'bootstrap' });
+    const allocateBudget = vi.spyOn(coordinator, 'allocateBudget');
+    const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true },
+      context: { memoryCoordinator: coordinator },
+    }) as Array<{ name: string; promptBuilder?: (ctx: Record<string, unknown>) => unknown }>;
+    const produce = stages.find((stage) => stage.name === 'produce');
+    expect(typeof produce?.promptBuilder).toBe('function');
+
+    try {
+      produce?.promptBuilder?.({});
+    } catch (err: unknown) {
+      // 预设 produce 在缺少 quality_gate 分析交接时失败关闭；本用例只关心是否改写了共享预算。
+      expect(err).toBeInstanceOf(Error);
+    }
+
+    expect(allocateBudget).not.toHaveBeenCalled();
+    coordinator.dispose();
+  });
+
+  it('logs swallowed conversation summary and dispose failures instead of dropping them', async () => {
+    const log = spyLogger();
+    const coordinator = new MemoryCoordinator({
+      conversationLog: {
+        load: () => Array.from({ length: 12 }, () => ({ role: 'user', content: 'x' })),
+        summarize: async () => {
+          // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖摘要失败 catch 的类型守卫分支。
+          throw 'summary provider offline';
+        },
+      },
+    });
+    await coordinator.onConversationUpdated('conv-1', { name: 'mock-provider' });
+    const summaryWarning = messagesOf(log.warn).find((message) =>
+      message.includes('onConversationUpdated')
+    );
+    expect(summaryWarning).toContain('conv-1');
+    expect(summaryWarning).toContain('summary provider offline');
+
+    const scope = coordinator.createDimensionScope('dimA:analyst');
+    vi.spyOn(scope, 'clear').mockImplementation(() => {
+      throw new Error('clear exploded');
+    });
+    coordinator.dispose();
+    const disposeWarning = messagesOf(log.warn).find((message) => message.includes('dispose'));
+    expect(disposeWarning).toContain('dimA:analyst');
+    expect(disposeWarning).toContain('clear exploded');
+    expect(coordinator.getActiveContext('dimA:analyst')).toBeNull();
+  });
+
+  it('reports non-Error throws by value in noteFinding receipts instead of "undefined"', () => {
+    spyLogger();
+    const coordinator = new MemoryCoordinator();
+    const scope = coordinator.createDimensionScope('dimA:analyst');
+    vi.spyOn(scope, 'noteKeyFinding').mockImplementation(() => {
+      // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖 noteFinding catch 的类型守卫分支。
+      throw 'scratchpad locked';
+    });
+
+    const result = coordinator.noteFinding('finding', 'E-4', 5, 1, 'dimA:analyst');
+
+    expect(result).toMatchObject({ recorded: false, target: 'error', scopeId: 'dimA:analyst' });
+    expect(result.message).toContain('scratchpad locked');
+    expect(result.message).not.toContain('undefined');
+    coordinator.dispose();
+  });
+
+  it('reports the persistent read error class without leaking the error message', async () => {
+    spyLogger();
+    const diagnostics: Array<{ phase: string; status: string; reason: string }> = [];
+    const section = await readPersistentMemorySection(
+      {
+        toPromptSection: () => {
+          throw new TypeError('secret memory body leaked');
+        },
+      },
+      { tokenBudget: 100, onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }
+    );
+
+    expect(section.content).toBe('');
+    expect(diagnostics).toEqual([
+      { phase: 'persistent', status: 'error', reason: 'section-unavailable:TypeError' },
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain('secret');
+  });
+
+  it('stays assignable to the tool kernel MemoryCoordinatorLike port', () => {
+    const port: MemoryCoordinatorLike = new MemoryCoordinator();
+    expect(typeof port.noteFinding).toBe('function');
+    expect(typeof port.searchEvidenceWithDiagnostics).toBe('function');
   });
 });
 

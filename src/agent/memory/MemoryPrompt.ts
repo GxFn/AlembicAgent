@@ -102,10 +102,16 @@ export async function readPersistentMemorySection(
     { ...options, deadlineAt }
   );
   if (result.status !== 'ok') {
+    // error 时只附错误类别（err.name），不带消息正文：诊断不能泄漏记忆内容，但要能区分是数据库、
+    // 渲染还是 embedding 出错。timeout/aborted 没有错误对象，保持原 reason。
+    const errorClass =
+      result.status === 'error'
+        ? `:${result.error instanceof Error ? result.error.name : 'unknown'}`
+        : '';
     reportMemoryRead(options, {
       phase: 'persistent',
       status: result.status,
-      reason: 'section-unavailable',
+      reason: `section-unavailable${errorClass}`,
     });
     return projectMemorySection('persistent', '', budget);
   }

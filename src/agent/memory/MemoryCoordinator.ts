@@ -168,6 +168,8 @@ export class MemoryCoordinator {
 
   #logger: ReturnType<typeof Logger.getInstance>;
   #writeFailures: MemoryWriteFailureDiagnostic[] = [];
+  /** session-store-missing 降级每个 coordinator 只 warn 一次，之后记 debug（scan 每次调用都会命中）。 */
+  #evidenceStoreMissingWarned = false;
 
   /**
    * @param [config.persistentMemory] PersistentMemory 实例
@@ -325,7 +327,8 @@ export class MemoryCoordinator {
 
   /**
    * 构建动态记忆 prompt (每轮调用)
-   * 包含: ActiveContext / WorkingMemory 上下文
+   * 包含: ActiveContext / WorkingMemory 上下文。scopeId 缺省且多 scope 并存时返回 '' 并 warn，
+   * 不注入别的维度的工作记忆。
    */
   buildDynamicMemoryPrompt(options: StaticMemoryOptions = {}): string {
     const snapshot = this.#promptBudgets.get(options.scopeId ?? '');
@@ -349,7 +352,7 @@ export class MemoryCoordinator {
         return '';
       }
 
-      const ac = this.getActiveContext(options.scopeId);
+      const { ac } = this.#resolveScopedContext(options.scopeId, 'buildDynamicMemoryPrompt');
       if (!ac) {
         return '';
       }
@@ -357,10 +360,7 @@ export class MemoryCoordinator {
       return projectMemorySection('working', ac.buildContext(acBudget) || '', acBudget, options)
         .content;
     } catch (err: unknown) {
-      this.#log(
-        'warn',
-        `[MemoryCoordinator] buildDynamicMemoryPrompt error: ${(err as Error).message}`
-      );
+      this.#log('warn', `[MemoryCoordinator] buildDynamicMemoryPrompt error: ${errorMessage(err)}`);
       return '';
     }
   }
@@ -417,7 +417,8 @@ export class MemoryCoordinator {
   /**
    * 记录关键发现 (从 note_finding handler 调用)
    * @param importance 1-10
-   * @param [scopeId] 显式指定 scope (并行安全)
+   * @param [scopeId] 显式指定 scope (并行安全)；缺省时只有单 scope 才回退到当前 scope，
+   *   多 scope 并存时拒绝写入（recorded=false、target='missing-active-context'）并 warn
    * @returns 结构化写入结果；只有 recorded=true 才能被 QualityGate 计入 note_finding
    */
   noteFinding(
@@ -429,7 +430,16 @@ export class MemoryCoordinator {
     evidenceRefs?: string[]
   ): MemoryNoteFindingResult {
     try {
-      const ac = this.getActiveContext(scopeId);
+      const { ac, ambiguousScopes } = this.#resolveScopedContext(scopeId, 'noteFinding');
+      if (ambiguousScopes > 0) {
+        // 多 scope 并存且未指定 scopeId：拒绝写入（不回退到“最近创建的 scope”），以免发现记进其它维度。
+        return {
+          recorded: false,
+          target: 'missing-active-context',
+          importance,
+          message: `当前有 ${ambiguousScopes} 个工作记忆 scope 并存且未指定 scopeId，note_finding 拒绝写入以免记进其它维度`,
+        };
+      }
       if (ac) {
         ac.noteKeyFinding(finding, evidence, importance, round, evidenceRefs);
         return {
@@ -449,12 +459,13 @@ export class MemoryCoordinator {
         ...(scopeId ? { scopeId } : {}),
       };
     } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] noteFinding error: ${(err as Error).message}`);
+      const message = errorMessage(err);
+      this.#log('warn', `[MemoryCoordinator] noteFinding error: ${message}`);
       return {
         recorded: false,
         target: 'error',
         importance,
-        message: `记录发现失败: ${(err as Error).message}`,
+        message: `记录发现失败: ${message}`,
         ...(scopeId ? { scopeId } : {}),
       };
     }
@@ -609,7 +620,7 @@ export class MemoryCoordinator {
       }
       this.#log('debug', `[MemoryCoordinator] scope completed: ${scopeId}`);
     } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] completeDimension error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] completeDimension error: ${errorMessage(err)}`);
     }
   }
 
@@ -624,7 +635,7 @@ export class MemoryCoordinator {
       this.#log('info', '[MemoryCoordinator] session completed');
       return { consolidated: 0 };
     } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] completeSession error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] completeSession error: ${errorMessage(err)}`);
       return null;
     }
   }
@@ -658,6 +669,14 @@ export class MemoryCoordinator {
   /** 检索前序维度代码证据，并在读路径降级时返回稳定诊断。 */
   searchEvidenceWithDiagnostics(query: string, dimId?: string): MemoryEvidenceSearchResult {
     if (!this.#sessionStore) {
+      // scan 链路的 coordinator 不带 SessionStore，每次 get_previous_evidence 都走这里：首次 warn 让运维
+      // 能定位“能力缺失而非真的没有证据”，之后记 debug，避免同一会话刷屏。结果诊断照常返回给 handler。
+      const level = this.#evidenceStoreMissingWarned ? 'debug' : 'warn';
+      this.#evidenceStoreMissingWarned = true;
+      this.#log(
+        level,
+        `[MemoryCoordinator] searchEvidence degraded (MEMORY_EVIDENCE_STORE_MISSING): SessionStore is not configured; path=session-store-missing; query="${query}"; dimId=${dimId ?? '*'}`
+      );
       return {
         ok: true,
         degraded: true,
@@ -683,7 +702,7 @@ export class MemoryCoordinator {
         diagnostics: [],
       };
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       this.#log(
         'warn',
         `[MemoryCoordinator] searchEvidence degraded (MEMORY_EVIDENCE_SEARCH_FAILED): ${message}`
@@ -734,8 +753,12 @@ export class MemoryCoordinator {
       if (messages.length >= 12) {
         await this.#conversationLog.summarize(conversationId, { aiProvider });
       }
-    } catch {
-      // 摘要失败不影响主流程
+    } catch (err: unknown) {
+      // 摘要是旁路：失败时跳过本次摘要、不影响主流程，下次对话更新会再尝试；只告警并带上对话 id。
+      this.#log(
+        'warn',
+        `[MemoryCoordinator] onConversationUpdated summary skipped: conversation=${conversationId}; ${errorMessage(err)}`
+      );
     }
   }
 
@@ -750,7 +773,7 @@ export class MemoryCoordinator {
         await this.#sessionStore.saveCheckpoint(projectRoot);
       }
     } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] checkpoint error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] checkpoint error: ${errorMessage(err)}`);
     }
   }
 
@@ -762,7 +785,7 @@ export class MemoryCoordinator {
       }
       return false;
     } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] restore error: ${(err as Error).message}`);
+      this.#log('warn', `[MemoryCoordinator] restore error: ${errorMessage(err)}`);
       return false;
     }
   }
@@ -774,11 +797,15 @@ export class MemoryCoordinator {
   dispose() {
     this.#promptBudgets.clear();
     this._lastSurplus = 0;
-    for (const ac of this.#activeContexts.values()) {
+    for (const [scopeId, ac] of this.#activeContexts) {
       try {
         ac.clear();
-      } catch {
-        /* non-critical */
+      } catch (err: unknown) {
+        // 清理失败不阻断释放：下面仍会丢弃整张 scope 表，这里只告警说明哪个 scope 未能先行清空。
+        this.#log(
+          'warn',
+          `[MemoryCoordinator] dispose: clearing scope ${scopeId} failed, scope dropped anyway; ${errorMessage(err)}`
+        );
       }
     }
     this.#activeContexts.clear();
@@ -789,6 +816,40 @@ export class MemoryCoordinator {
   // ═══════════════════════════════════════════════════════════
   // 私有方法
   // ═══════════════════════════════════════════════════════════
+
+  /**
+   * 内部调用点（noteFinding、动态记忆 prompt）的 scope 守卫。
+   * 会话级 coordinator 由多个维度共享，#currentScopeId 只是“最近创建的 scope”，并行维度下回退到它
+   * 会把发现或工作记忆写进/读自别的维度。分叉：
+   * - 显式 scopeId → 直接取该 scope（不存在则 ac=null，由调用方按“未初始化”处理）；
+   * - 未指定且多个 scope 并存 → 不回退，ac=null、ambiguousScopes=并存数，并 warn（含 scope 数）；
+   * - 未指定且至多一个 scope → 保留回退到当前 scope 的旧行为，命中时记 debug 'implicit-current-scope'。
+   * 公开 getActiveContext() 无参语义保持不变，守卫只加在内部调用点。
+   */
+  #resolveScopedContext(
+    scopeId: string | undefined,
+    operation: string
+  ): { ac: ActiveContext | null; ambiguousScopes: number } {
+    if (scopeId) {
+      return { ac: this.getActiveContext(scopeId), ambiguousScopes: 0 };
+    }
+    const scopeCount = this.#activeContexts.size;
+    if (scopeCount > 1) {
+      this.#log(
+        'warn',
+        `[MemoryCoordinator] ${operation} rejected: scopeId required when multiple scopes are active (scopes=${scopeCount}; current=${this.#currentScopeId ?? 'none'}; path=ambiguous-implicit-scope)`
+      );
+      return { ac: null, ambiguousScopes: scopeCount };
+    }
+    const ac = this.getActiveContext();
+    if (ac) {
+      this.#log(
+        'debug',
+        `[MemoryCoordinator] ${operation} implicit-current-scope: scopeId omitted, using the only active scope ${this.#currentScopeId}`
+      );
+    }
+    return { ac, ambiguousScopes: 0 };
+  }
 
   #recordMemoryWriteFailure(err: unknown, operation: 'persistentMemory.append'): void {
     const diagnostic: MemoryWriteFailureDiagnostic = {
