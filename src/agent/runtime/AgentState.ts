@@ -8,7 +8,8 @@
  *   - 内置事件发射（状态变更通知）
  *
  * 设计原则:
- *   1. 不可变更新 — 每次 transition 返回新 state snapshot
+ *   1. 快照脱钩 — data/history getter 与 toJSON() 都返回拷贝，fromJSON() 复制传入的 history；
+ *      外部持有的快照不会被后续 transition 追加，也不能反向写穿内部状态（I40）
  *   2. 可溯源 — 保留完整状态历史（可选）
  *   3. 可序列化 — state 可 JSON 化，支持持久化/恢复
  *
@@ -196,12 +197,19 @@ export class AgentState extends EventEmitter {
       .map((t) => t.event);
   }
 
-  /** 导出为可序列化对象 */
+  /**
+   * 导出为可序列化对象。
+   *
+   * 返回 data/history 的浅拷贝（与 data/history getter 一致）：AgentRuntime 把它写进 result.state，
+   * 旧实现直接返回内部引用，execute 返回后状态机上的任何转移（例如通配 abort/error）都会把记录
+   * 追加进已返回结果的 history，调用方改动快照也会写穿内部状态（I40）。
+   * 浅拷贝已足够：send() 每次 push 新条目并以新对象替换 #data，从不原地修改已有条目或 data 对象。
+   */
   toJSON() {
     return {
       phase: this.#phase,
-      data: this.#data,
-      history: this.#history,
+      data: { ...this.#data },
+      history: [...this.#history],
     };
   }
 
@@ -217,7 +225,8 @@ export class AgentState extends EventEmitter {
       keepHistory: opts.keepHistory ?? true,
     });
     if (snapshot.history) {
-      state.#history = snapshot.history;
+      // 复制调用方的数组：恢复后的状态机继续转移时不能追加进调用方仍持有的快照（I40）。
+      state.#history = [...snapshot.history];
     }
     return state;
   }
