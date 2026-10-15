@@ -9,8 +9,10 @@
  *   - pass                    → 'continue'，进入下一阶段（非终态）
  *   - analysis_retry / retry  → 回退到前一执行阶段重跑（非终态）；次数上限 gate.maxRetries；
  *                               会话输入预算压制时转 degraded_budget_exhausted（终态）；次数耗尽记
- *                               retryExhausted + abandonInfo(retry_exhausted)，再按 skipOnFail 决定是否继续
- *   - record_repair           → 跑记录补写微阶段后重评（非终态）；上限 gate.maxRecordRepairRetries；
+ *                               retryExhausted + abandonInfo(retry_exhausted)，再按 skipOnFail 决定是否继续；
+ *                               回退目标是 producer 阶段时，先把它即将被覆盖的回执工具调用并入
+ *                               phaseResults._priorAttempts_<stage>（C08），拒绝率门在重试轮按各次尝试合计判断
+ *   - record_repair          → 跑记录补写微阶段后重评（非终态）；上限 gate.maxRecordRepairRetries；
  *                               仍不通过转 degraded_no_findings（终态）
  *   - summary_rewrite         → 跑零工具重写微阶段后重评（非终态）；上限 gate.maxSummaryRewriteRetries；
  *                               重写后仍判 summary_rewrite 或产出为空则转 analysis_retry 路径
@@ -944,6 +946,11 @@ export class PipelineStrategy extends Strategy {
             }
             return 'break';
           }
+          // C08(L7-P18)：重跑 producer 会以第二轮回执覆盖 phaseResults[produce]，首轮已落库的候选
+          // 随之从门的视野里消失；先把本轮回执并入 _priorAttempts_<stage>，供裁决它的拒绝率门按合计判断。
+          if (this.#isProducerStage(retryTargetStage)) {
+            this.#preservePriorProducerAttempt(retryTargetStage, stage, ctx);
+          }
           phaseResults._retryContext = {
             reason: gateResult.reason,
             artifact: gateResult.artifact,
@@ -1027,6 +1034,56 @@ export class PipelineStrategy extends Strategy {
       return 'break';
     }
     return 'continue';
+  }
+
+  /**
+   * C08(L7-P18)：门判 retry、即将回跳重跑 producer 阶段时，把该阶段当前回执的工具调用并入内部键
+   * `_priorAttempts_<stage>`：`{ attempts, toolCalls }`(attempts 为已被覆盖的尝试数，toolCalls 按尝试顺序
+   * 拼接)。#executeStage 以 phaseResults[stage.name] 写入最近一次尝试的回执，重跑后首轮已持久化的提交
+   * 不再出现在门的 source 里；producerRejectionGateEvaluator 在重试轮读这里，按各次尝试合计判断。
+   * 不改 useCumulativeToolCalls：ctx.totalToolCalls 会混入 analyze/evolve 等阶段(含 supersedes 提交)。
+   * 只收 producer 阶段：分析阶段重跑本就以最后一次为准，回执也大得多。phaseResults[stage.name] 仍只
+   * 表示最后一次尝试(宿主按它读取 produce 回执的口径不变)；总账 toolCalls 本来就含全部尝试。
+   */
+  #preservePriorProducerAttempt(
+    producerStage: PipelineStage,
+    gateStage: PipelineStage,
+    ctx: PipelineContext
+  ): void {
+    const stageName = producerStage.name;
+    const receipt = ctx.phaseResults[stageName] as StageResult | undefined;
+    const receiptToolCalls = Array.isArray(receipt?.toolCalls) ? receipt.toolCalls : [];
+    const existing = ctx.phaseResults[`_priorAttempts_${stageName}`];
+    const previous =
+      existing && typeof existing === 'object' && !Array.isArray(existing)
+        ? (existing as { attempts?: unknown; toolCalls?: unknown })
+        : null;
+    const previousToolCalls = Array.isArray(previous?.toolCalls) ? previous.toolCalls : [];
+    const previousAttempts =
+      typeof previous?.attempts === 'number' &&
+      Number.isInteger(previous.attempts) &&
+      previous.attempts > 0
+        ? previous.attempts
+        : 0;
+    const attempts = previousAttempts + 1;
+    const toolCalls = [...previousToolCalls, ...receiptToolCalls];
+    ctx.phaseResults[`_priorAttempts_${stageName}`] = { attempts, toolCalls };
+    const persistedSubmits = receiptToolCalls.filter(isPersistedSubmission).length;
+    // 留痕：触发条件(门判 retry 回跳 producer)、选择路径(保存即将被覆盖的回执)、关键输入(本轮工具调用与
+    // 已持久化提交数)、后续校验依据(门在重试轮按 _priorAttempts_<stage> 合计判断)。
+    _pipelineLogger().info(
+      `[PipelineStrategy] Gate "${gateStage.name || 'gate'}" retries producer stage "${stageName}" — ` +
+        `preserving attempt #${attempts} receipt under _priorAttempts_${stageName} before it is overwritten ` +
+        `(receiptFound=${Boolean(receipt)}, toolCalls=${receiptToolCalls.length}, ` +
+        `persistedKnowledgeSubmits=${persistedSubmits}, preservedToolCalls=${toolCalls.length})`,
+      {
+        gate: gateStage.name || 'gate',
+        stage: stageName,
+        attempts,
+        toolCalls: receiptToolCalls.length,
+        persistedKnowledgeSubmits: persistedSubmits,
+      }
+    );
   }
 
   /** skipOnFail 缺省/true 时非通过门 'break'；显式 false 才继续执行后续阶段。 */

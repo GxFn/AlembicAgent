@@ -170,6 +170,11 @@
     }
   },
   "prefixes": {
+    "_priorAttempts_": {
+      "container": "phaseResults",
+      "writers": ["agent"],
+      "purpose": "后接 producer 阶段名：门判 retry 回跳重跑该阶段前，PipelineStrategy 把即将被覆盖的回执工具调用并入 { attempts, toolCalls }；producerRejectionGateEvaluator 在重试轮按各次尝试合计的已持久化候选判定（L7-P18/C08）。"
+    },
     "_recordRepairRetries_": {
       "container": "phaseResults",
       "writers": ["agent"],

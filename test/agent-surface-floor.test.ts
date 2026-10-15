@@ -2874,3 +2874,235 @@ describe('run helper and task context cancellation signals', () => {
     );
   });
 });
+
+// ─── L7-P18(C08/C55)：拒绝率门在重试轮按各次 produce 尝试合计的已持久化候选判定 ───
+// #executeStage 以 phaseResults.produce 写入最近一次尝试的回执；门若只看最后一次，首轮已落库的候选
+// 会从视野里消失，重试轮再被拒 2 次即 retry_exhausted → outcome=abandoned。PipelineStrategy 在门判 retry
+// 回跳 producer 前把即将被覆盖的回执并入 _priorAttempts_produce，门在重试轮按合计判断：合计有已持久化
+// 候选即 pass 并在 reason 记录拒绝/成功数；合计为 0 时保持单次判据，F2 的 retry_exhausted 语义不变。
+describe('producer rejection gate counts prior produce attempts (L7-P18)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const persistedSubmit = (index: number) => ({
+    tool: 'knowledge',
+    args: { action: 'submit', title: `persisted-${index}` },
+    result: { status: 'created', id: `candidate-${index}`, lifecycle: 'pending' },
+  });
+  const rejectedSubmit = (index: number) => ({
+    tool: 'knowledge',
+    args: { action: 'submit', title: `rejected-${index}` },
+    result: { status: 'rejected', reason: 'duplicate' },
+  });
+
+  /** 真实装配里的两种 rejection_gate：insight preset(冷启动 generate-dimension 复用)与 scan 管线。 */
+  const rejectionGateStage = (kind: 'insight' | 'scan') => {
+    const stages =
+      kind === 'insight'
+        ? (PRESETS.insight.strategy.stages as Array<Record<string, unknown>>)
+        : buildScanPipelineStages({
+            task: 'extract',
+            producePrompt: 'scan producer system prompt',
+            analyzeCaps: ['code_analysis'],
+            produceCaps: ['scan_production'],
+          });
+    const gate = stages.find((stage) => stage.name === 'rejection_gate');
+    if (!gate) {
+      throw new Error(`${kind} pipeline has no rejection_gate`);
+    }
+    // 不能靠 useCumulativeToolCalls：它会混入 analyze/evolve 等其他阶段的提交。
+    expect((gate.gate as Record<string, unknown>).useCumulativeToolCalls).toBeUndefined();
+    expect((gate.gate as Record<string, unknown>).maxRetries).toBe(1);
+    return gate;
+  };
+
+  async function runProduceRounds(
+    gateStage: Record<string, unknown>,
+    rounds: Array<Array<Record<string, unknown>>>
+  ) {
+    let produceRuns = 0;
+    const reactLoop = vi.fn(async () => {
+      const toolCalls = rounds[Math.min(produceRuns, rounds.length - 1)];
+      produceRuns += 1;
+      return {
+        reply: `produce attempt ${produceRuns}`,
+        toolCalls,
+        tokenUsage: { input: 1, output: 1 },
+        iterations: 1,
+      };
+    });
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'produce' }, gateStage as never],
+    }).execute({ id: 'p18-rejection', reactLoop }, new AgentMessage({ content: 'produce' }));
+    return { reactLoop, result, phases: result.phases as Record<string, unknown> };
+  }
+
+  it.each([
+    'insight',
+    'scan',
+  ] as const)('%s: 首轮持久化 2 个、重试轮再拒 2 个 → 不判 abandoned，门 pass 并在 reason 记录合计拒绝/成功数', async (kind) => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const firstRound = [
+      persistedSubmit(1),
+      persistedSubmit(2),
+      rejectedSubmit(1),
+      rejectedSubmit(2),
+      rejectedSubmit(3),
+    ];
+    const retryRound = [rejectedSubmit(4), rejectedSubmit(5)];
+
+    const { reactLoop, result, phases } = await runProduceRounds(rejectionGateStage(kind), [
+      firstRound,
+      retryRound,
+    ]);
+
+    // 首轮拒绝占优仍触发一次拒绝重试(首轮判据不变)。
+    expect(reactLoop).toHaveBeenCalledTimes(2);
+    // 重试轮按合计判定：已有 2 个落库候选 → pass，不再被 retry_exhausted 判成 abandoned。
+    expect(result.outcome).toBe('completed');
+    expect(phases._retries_rejection_gate).toBe(1);
+    expect(phases._pipelineOutcome).toMatchObject({ outcome: 'completed' });
+    expect(phases._pipelineOutcome).not.toHaveProperty('action');
+    const gate = phases.rejection_gate as { pass: boolean; action: string; reason: string };
+    expect(gate).toMatchObject({ pass: true, action: 'pass' });
+    expect(gate.reason).toContain('5 rejections vs 2 successes');
+    expect(gate.reason).toContain('2 produce attempts');
+    expect(gate.reason).toContain('latest attempt: 2 rejections vs 0 successes');
+    // 首轮回执保存在内部键；phases.produce 仍只表示最后一次尝试(宿主读取口径不变)。
+    expect(phases._priorAttempts_produce).toEqual({ attempts: 1, toolCalls: firstRound });
+    expect((phases.produce as { toolCalls: unknown[] }).toolCalls).toEqual(retryRound);
+    expect(result.toolCalls).toHaveLength(firstRound.length + retryRound.length);
+
+    const lines = infoLog.mock.calls.map((call) => String(call[0]));
+    expect(
+      lines.some(
+        (line) =>
+          line.includes('_priorAttempts_produce') &&
+          line.includes('persistedKnowledgeSubmits=2') &&
+          line.includes('toolCalls=5')
+      )
+    ).toBe(true);
+    expect(
+      lines.some(
+        (line) =>
+          line.includes('[RejectionGate]') &&
+          line.includes('action=pass') &&
+          line.includes('perAttemptAction=retry')
+      )
+    ).toBe(true);
+  });
+
+  it('合计没有已持久化候选 → 重试轮仍被拒即 retry_exhausted / abandoned(F2 语义不变)', async () => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const { reactLoop, result, phases } = await runProduceRounds(rejectionGateStage('insight'), [
+      [rejectedSubmit(1), rejectedSubmit(2), rejectedSubmit(3)],
+      [rejectedSubmit(4), rejectedSubmit(5)],
+    ]);
+
+    expect(reactLoop).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe('abandoned');
+    expect(phases._pipelineOutcome).toMatchObject({
+      outcome: 'abandoned',
+      stage: 'rejection_gate',
+      action: 'retry_exhausted',
+    });
+    expect(phases.rejection_gate).toMatchObject({
+      pass: false,
+      action: 'retry',
+      reason: '2 rejections vs 0 successes',
+    });
+    expect(phases._priorAttempts_produce).toMatchObject({ attempts: 1 });
+    expect(
+      infoLog.mock.calls
+        .map((call) => String(call[0]))
+        .some(
+          (line) =>
+            line.includes('[RejectionGate]') &&
+            line.includes('no persisted candidates') &&
+            line.includes('action=retry')
+        )
+    ).toBe(true);
+  });
+
+  it('只保存 producer 的先前尝试：分析阶段被门重跑不写 _priorAttempts_<stage>', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const gate = vi
+      .fn()
+      .mockReturnValueOnce({ action: 'analysis_retry', reason: 'thin analysis' })
+      .mockReturnValue({ action: 'pass' });
+    const reactLoop = vi.fn(async () => ({
+      reply: 'analysis',
+      toolCalls: [{ tool: 'code', args: { action: 'read', path: 'src/a.ts' }, result: 'ok' }],
+      tokenUsage: { input: 1, output: 1 },
+      iterations: 1,
+    }));
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze' }, { name: 'quality_gate', gate: { evaluator: gate } }],
+    }).execute({ id: 'p18-analyze', reactLoop }, new AgentMessage({ content: 'analyze' }));
+
+    expect(reactLoop).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe('completed');
+    expect(
+      Object.keys(result.phases as object).some((key) => key.startsWith('_priorAttempts_'))
+    ).toBe(false);
+  });
+
+  it('首轮(没有先前尝试)判据不变：拒绝占优且 ≥2 才 retry，reason 只报本次计数', () => {
+    const source = {
+      toolCalls: [persistedSubmit(1), rejectedSubmit(1), rejectedSubmit(2)],
+    };
+    expect(producerRejectionGateEvaluator(source, { produce: source })).toEqual({
+      action: 'retry',
+      reason: '2 rejections vs 1 successes',
+    });
+    expect(
+      producerRejectionGateEvaluator({ toolCalls: [persistedSubmit(1), rejectedSubmit(1)] }, {})
+    ).toEqual({ action: 'pass', reason: '' });
+  });
+
+  it('重试轮只按源阶段同名的先前尝试累计；累计模式的副本源与畸形内部键不重复计入', () => {
+    const warnLog = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const retrySource = { toolCalls: [rejectedSubmit(4), rejectedSubmit(5)] };
+    const prior = { attempts: 1, toolCalls: [persistedSubmit(1), rejectedSubmit(1)] };
+
+    // 源阶段 = phaseResults 里与 source 同一引用的阶段；读它的 _priorAttempts_<stage>。
+    expect(
+      producerRejectionGateEvaluator(retrySource, {
+        produce: retrySource,
+        _priorAttempts_produce: prior,
+      })
+    ).toMatchObject({ action: 'pass' });
+
+    // 其他阶段的先前尝试不计入。
+    expect(
+      producerRejectionGateEvaluator(retrySource, {
+        produce: retrySource,
+        _priorAttempts_evolve: prior,
+      }).action
+    ).toBe('retry');
+
+    // useCumulativeToolCalls 交给门的是副本(已含全部尝试)：找不到同一引用，不再叠加先前尝试。
+    const cumulativeCopy = { ...retrySource };
+    expect(
+      producerRejectionGateEvaluator(cumulativeCopy, {
+        produce: retrySource,
+        _priorAttempts_produce: prior,
+      }).action
+    ).toBe('retry');
+
+    // 畸形内部键：退回单次判据并留 warn 日志。
+    expect(
+      producerRejectionGateEvaluator(retrySource, {
+        produce: retrySource,
+        _priorAttempts_produce: { attempts: 'one', toolCalls: 'not-an-array' },
+      }).action
+    ).toBe('retry');
+    expect(
+      warnLog.mock.calls
+        .map((call) => String(call[0]))
+        .some((line) => line.includes('[RejectionGate]') && line.includes('_priorAttempts_produce'))
+    ).toBe(true);
+  });
+});

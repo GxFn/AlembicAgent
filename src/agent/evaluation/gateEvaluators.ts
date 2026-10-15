@@ -123,11 +123,51 @@ function describeEmptyAnalysisSource(source: unknown): {
 }
 
 /**
+ * C09(L7-P18)：insight 质量门的候选模式单一判据，基础门的候选档与深度接地门共用这一个结果。
+ * - needsCandidates 是布尔时以它为准：冷启动宿主按维度计划显式写入(含 false)。
+ * - 否则按 outputType∈{candidate,dual} 判定：scan 的 SystemRunContextFactory.createSystemContext
+ *   只写 outputType:'candidate'，不写 needsCandidates。
+ * 此前基础门按 outputType 走候选档、深度门只看 needsCandidates，scan 只得到一半候选门(深度门被跳过)。
+ * source 只用于 [QualityGate] 观测行，说明判据来自哪个字段；非布尔的 needsCandidates 视为未写入，
+ * 观测行另记 needsCandidatesIgnored，便于发现宿主写错类型。
+ */
+function resolveCandidateOutputMode(
+  needsCandidates: unknown,
+  outputType: unknown
+): {
+  isCandidateOutput: boolean;
+  source: 'needsCandidates' | 'outputType';
+  ignoredNeedsCandidates: boolean;
+} {
+  if (typeof needsCandidates === 'boolean') {
+    return {
+      isCandidateOutput: needsCandidates,
+      source: 'needsCandidates',
+      ignoredNeedsCandidates: false,
+    };
+  }
+  return {
+    isCandidateOutput: outputType === 'candidate' || outputType === 'dual',
+    source: 'outputType',
+    ignoredNeedsCandidates: needsCandidates !== undefined && needsCandidates !== null,
+  };
+}
+
+/** [QualityGate] 观测行里的候选模式片段：档位 + 判据来源(+ 被忽略的非布尔 needsCandidates)。 */
+function describeCandidateMode(mode: ReturnType<typeof resolveCandidateOutputMode>): string {
+  return (
+    `candidateMode=${mode.isCandidateOutput ? 'candidate' : 'analysis'}(source=${mode.source})` +
+    (mode.ignoredNeedsCandidates ? ' needsCandidatesIgnored=non-boolean' : '')
+  );
+}
+
+/**
  * 面向 PipelineStrategy gate.evaluator 的包装函数。
  *
  * 将 PipelineStrategy 的 (source, phaseResults, strategyContext) 签名
  * 适配到 buildAnalysisArtifact + analysisQualityGate 调用链：基础质量门之上依次叠加
- * applyDepthRetryGate(深度接地)与 applyModuleCoverageGate(模块覆盖度)。
+ * applyDepthRetryGate(深度接地)与 applyModuleCoverageGate(模块覆盖度)。基础门的候选档与是否叠加
+ * 深度门共用 resolveCandidateOutputMode 的单一判据(needsCandidates 布尔优先，否则 outputType)。
  * 副作用：每次评估都会先清空再重写 sharedState._analystGraphEvidence / _analystGroundedRanges，
  * 供同轮 knowledge.submit handler 使用(不授予新的生产权限)。
  *
@@ -182,16 +222,19 @@ export function insightGateEvaluator(
     : buildAnalysisReport(source as AnalystResult, dimId as string, projectGraph);
 
   // P4/C9: 基础质量门 → 叠加深度接地 retry(仅候选生成且已通过时；见 applyDepthRetryGate)。
+  // C09(L7-P18)：两个门用同一个候选判据。analysisQualityGate 只区分 candidate/dual 与其他，
+  // 所以非候选统一传 'analysis'；scan(只写 outputType:'candidate')因此也执行深度接地门。
+  const candidateMode = resolveCandidateOutputMode(needsCandidates, outputType);
 
   // F4g graph-retry 已删除(P1-B-4)：它靠"命令模型调 graph"，DeepSeek 实测不从(retry 只把
   // 维度拖成 error)。替代者是下方 applyModuleCoverageGate——判据来自确定性事实(实读/接地
   // 了哪些文件)，与 provider 意愿无关。关系声明的 graph 背书仍走 F4e 注入/submit 拒绝反馈。
   let gate = applyDepthRetryGate(
     analysisQualityGate(artifact, {
-      outputType: needsCandidates ? 'candidate' : outputType || 'analysis',
+      outputType: candidateMode.isCandidateOutput ? 'candidate' : 'analysis',
     }),
     artifact as Record<string, unknown>,
-    Boolean(needsCandidates)
+    candidateMode.isCandidateOutput
   );
   // P1-B-4：provider 中立覆盖度门。模块够大而 Analyst 接地的 owned 文件过少 → 定向 retry
   // (点名未读文件)。retry 耗尽走 F2 retry_exhausted 一等出口，不会死循环。
@@ -251,7 +294,7 @@ export function insightGateEvaluator(
           `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} ` +
             `total=${qr.totalScore} depth=${qr.scores.depthScore} breadth=${qr.scores.breadthScore} ` +
             `evidence=${qr.scores.evidenceScore} coherence=${qr.scores.coherenceScore} ` +
-            `memoryFindings=${memoryFindingCount}` +
+            `memoryFindings=${memoryFindingCount} ${describeCandidateMode(candidateMode)}` +
             (qr.suggestions.length > 0 ? ` suggestions=[${qr.suggestions.join('; ')}]` : '')
         ),
       () => undefined
@@ -260,7 +303,8 @@ export function insightGateEvaluator(
     observeSafely(
       () =>
         logger().info(
-          `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} reason="${gate.reason || 'v1-rules'}" (v1 fallback)`
+          `[QualityGate] dim="${dimId}" action=${gate.pass ? 'pass' : gate.action} reason="${gate.reason || 'v1-rules'}" ` +
+            `${describeCandidateMode(candidateMode)} (v1 fallback)`
         ),
       () => undefined
     );
@@ -426,18 +470,90 @@ interface GateStrategyContext {
   [key: string]: unknown;
 }
 
+/** 一组工具调用里提交类调用的已持久化/未持久化计数。 */
+function countSubmissions(
+  toolCalls: readonly unknown[],
+  names: readonly string[]
+): { success: number; rejected: number } {
+  const submitCalls = toolCalls.filter((call) => {
+    const { tool } = readToolObservation(call);
+    return names.includes(tool) && (tool !== 'knowledge' || isKnowledgeSubmit(call));
+  });
+  const success = submitCalls.filter(hasPersistedCandidate).length;
+  return { success, rejected: submitCalls.length - success };
+}
+
+/**
+ * 读取源阶段被门重试覆盖前的先前尝试(C08/L7-P18)。
+ *
+ * PipelineStrategy 在门判 retry、回跳重跑 producer 阶段前，把即将被 phaseResults[<stage>] 覆盖的回执
+ * 工具调用并入内部键 `_priorAttempts_<stage>`：`{ attempts, toolCalls }`。评估器不知道源阶段名，按引用
+ * 找：phaseResults 中与 source 是同一对象的阶段键就是源阶段。门配置了 useCumulativeToolCalls 时传入的是
+ * 已含全部尝试的副本，找不到同一引用，这里返回 null，避免把先前尝试重复计入。
+ * 内部键形状不符时返回 null 并记 warn 日志：退回只看本次尝试的旧判据，不猜测。
+ */
+function readPriorSourceAttempts(
+  source: object,
+  phaseResults: unknown
+): { stageName: string; attempts: number; toolCalls: readonly unknown[] } | null {
+  if (!phaseResults || typeof phaseResults !== 'object' || Array.isArray(phaseResults)) {
+    return null;
+  }
+  const record = phaseResults as Record<string, unknown>;
+  const stageName = Object.keys(record).find(
+    (key) => !key.startsWith('_') && record[key] === source
+  );
+  if (!stageName) {
+    return null;
+  }
+  const prior = record[`_priorAttempts_${stageName}`];
+  if (prior === undefined) {
+    return null;
+  }
+  const attempts =
+    prior && typeof prior === 'object' ? (prior as { attempts?: unknown }).attempts : undefined;
+  const toolCalls =
+    prior && typeof prior === 'object' ? (prior as { toolCalls?: unknown }).toolCalls : undefined;
+  if (
+    typeof attempts !== 'number' ||
+    !Number.isInteger(attempts) ||
+    attempts < 1 ||
+    !Array.isArray(toolCalls)
+  ) {
+    observeSafely(
+      () =>
+        logger().warn(
+          `[RejectionGate] source="${stageName}" ignoring malformed _priorAttempts_${stageName} ` +
+            `(attempts=${typeof attempts === 'number' ? attempts : typeof attempts}, ` +
+            `toolCalls=${Array.isArray(toolCalls) ? 'array' : typeof toolCalls}); ` +
+            'judging the latest attempt only'
+        ),
+      () => undefined
+    );
+    return null;
+  }
+  return { stageName, attempts, toolCalls };
+}
+
 /**
  * Producer 拒绝率门控 — 面向 PipelineStrategy gate.evaluator
  *
  * 当 produce 阶段的提交拒绝率过高时触发 retry。
  *
+ * 首轮(没有先前尝试)：本次尝试的提交拒绝数大于成功数且拒绝 ≥2 时为 retry。
+ * 重试轮(C08/L7-P18，源阶段带 `_priorAttempts_<stage>`)：phaseResults[<stage>] 只剩最后一次尝试的回执，
+ * 首轮已落库的候选不在其中；这里按先前尝试与本次尝试合计的已持久化候选判断——合计 > 0 即 pass，reason
+ * 记合计与本次的拒绝/成功数(不新增质量告警状态)；合计为 0 时仍按本次尝试的判据，重试轮再被拒照旧 retry，
+ * 由 PipelineStrategy 记 retry_exhausted / abandoned。
+ *
  * @param source produce 阶段的 reactLoop 返回值
- * @returns `{ action, reason }`：提交拒绝数大于成功数且拒绝 ≥2 时为 retry(reason 写明两者计数)，
- *   否则(含 source 无 toolCalls)为 pass、reason 为空串。
+ * @param phaseResults 阶段结果表；重试轮从中读取源阶段的先前尝试
+ * @returns `{ action, reason }`：retry 时 reason 写明本次拒绝/成功数；重试轮合计有已持久化候选时为 pass
+ *   且 reason 写明合计与本次计数；其余(含 source 无 toolCalls)为 pass、reason 为空串。
  */
 export function producerRejectionGateEvaluator(
   source: ReactLoopResult | null | undefined,
-  _phaseResults: unknown,
+  phaseResults: unknown,
   strategyContext: GateStrategyContext = {}
 ) {
   if (!source?.toolCalls) {
@@ -445,15 +561,45 @@ export function producerRejectionGateEvaluator(
   }
 
   const names = strategyContext.submitToolNames ?? ['knowledge'];
-  const submitCalls = (source.toolCalls || []).filter((call) => {
-    const { tool } = readToolObservation(call);
-    return names.includes(tool) && (tool !== 'knowledge' || isKnowledgeSubmit(call));
-  });
-  const success = submitCalls.filter(hasPersistedCandidate).length;
-  const rejected = submitCalls.length - success;
+  const { success, rejected } = countSubmissions(source.toolCalls || [], names);
+  const perAttempt =
+    rejected > success && rejected >= 2
+      ? { action: 'retry', reason: `${rejected} rejections vs ${success} successes` }
+      : { action: 'pass', reason: '' };
 
-  if (rejected > success && rejected >= 2) {
-    return { action: 'retry', reason: `${rejected} rejections vs ${success} successes` };
+  const prior = readPriorSourceAttempts(source, phaseResults);
+  if (!prior) {
+    return perAttempt;
   }
-  return { action: 'pass', reason: '' };
+
+  const priorCounts = countSubmissions(prior.toolCalls, names);
+  const totalSuccess = success + priorCounts.success;
+  const totalRejected = rejected + priorCounts.rejected;
+  const totalAttempts = prior.attempts + 1;
+  const counts =
+    `cumulative ${totalRejected} rejections vs ${totalSuccess} successes across ` +
+    `${totalAttempts} ${prior.stageName} attempts ` +
+    `(latest attempt: ${rejected} rejections vs ${success} successes)`;
+  if (totalSuccess > 0) {
+    // 分叉留痕：触发条件(重试轮且先前尝试已有落库候选)、选择路径(pass，覆盖单次判据)、关键输入(合计与本次计数)。
+    observeSafely(
+      () =>
+        logger().info(
+          `[RejectionGate] source="${prior.stageName}" retry round: ${counts}; ` +
+            `persisted candidates exist → action=pass (perAttemptAction=${perAttempt.action})`
+        ),
+      () => undefined
+    );
+    return { action: 'pass', reason: `${counts}; persisted candidates exist` };
+  }
+  // 合计没有已持久化候选：保持单次尝试判据(F2：retry 耗尽如实报 abandoned)。
+  observeSafely(
+    () =>
+      logger().info(
+        `[RejectionGate] source="${prior.stageName}" retry round: ${counts}; ` +
+          `no persisted candidates across attempts → latest-attempt rule action=${perAttempt.action}`
+      ),
+    () => undefined
+  );
+  return perAttempt;
 }

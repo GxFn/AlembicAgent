@@ -28,6 +28,7 @@ import {
   buildRetryPrompt,
   buildSummaryRewritePrompt,
 } from '../src/agent/prompts/insightGate.js';
+import { SystemRunContextFactory } from '../src/agent/service/SystemRunContextFactory.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 
 const PASS = { pass: true } as const;
@@ -559,4 +560,113 @@ it('V1 gate uses explicit grounding while preserving the legacy report contract'
   });
   const { groundedFiles: _grounded, ...legacy } = report;
   expect(analysisQualityGate(legacy, { outputType: 'candidate' }).pass).toBe(true);
+});
+
+// ─── L7-P18(C09)：insight 质量门的候选模式单一判据 ───
+// scan 的 SystemRunContextFactory.createSystemContext 只写 outputType:'candidate'、不写 needsCandidates。
+// 此前基础门按 outputType 走候选档，深度接地门只看 needsCandidates 而放行——判据分裂。现在派生单一判据：
+// needsCandidates 是布尔时以它为准，否则 outputType∈{candidate,dual}，同时决定基础门档位与深度门。
+describe('insightGateEvaluator 候选模式单一判据 (L7-P18/C09)', () => {
+  const readFiles = ['src/a.ts', 'src/b.ts', 'src/c.ts'];
+  // 深度分节全部挂在没读过的 src/ghost.ts 上；核心发现引用真实读过的文件，基础门可过。
+  const reply = [
+    '## 设计意图',
+    '见 src/ghost.ts:5。',
+    '## 边界与前置条件',
+    '见 src/ghost.ts:9。',
+    '## 核心发现',
+    `1. 模块 src/a.ts:1 与 src/b.ts:2 以及 src/c.ts:3 协同实现注册表。${'说明文字'.repeat(120)}`,
+  ].join('\n');
+  // 真实 code.read 展示态每行带 `N|` 前缀(L7-P13：无前缀文本不算源码片段，不能接地)。
+  const content = Array.from(
+    { length: 5 },
+    (_, i) => `${i + 1}|export const value${i} = ${i};`
+  ).join('\n');
+  const source = {
+    reply,
+    toolCalls: readFiles.map((path) => ({
+      tool: 'code',
+      args: { action: 'read', path },
+      result: { ok: true, status: 'ok', content, path },
+    })),
+  };
+
+  /** 与 ScanAgentRun 相同：strategyContext 就是 createSystemContext 的投影(真实 activeContext)。 */
+  function scanShapedContext(overrides: Record<string, unknown> = {}) {
+    const ctx = new SystemRunContextFactory().createSystemContext({
+      label: 'extract:p18',
+      trackerStrategy: 'analyst',
+    }) as Record<string, unknown>;
+    // 模拟 Analyst 已记下 3 条 note_finding(scan 系统提示同样要求 ≥3 条)，findings 充足。
+    const activeContext = ctx.activeContext as { distill: () => Record<string, unknown> };
+    const distill = activeContext.distill.bind(activeContext);
+    activeContext.distill = () => ({
+      ...distill(),
+      keyFindings: readFiles.map((file, index) => ({
+        finding: `发现 ${index} 位于 ${file}`,
+        evidence: `${file}:${index + 1}`,
+        importance: 8,
+      })),
+    });
+    return { ...ctx, ...overrides };
+  }
+
+  it('真实 createSystemContext 形状(outputType=candidate、无 needsCandidates)执行深度接地门', () => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const ctx = scanShapedContext();
+      expect(ctx.outputType).toBe('candidate');
+      expect(ctx).not.toHaveProperty('needsCandidates');
+
+      const result = insightGateEvaluator(source, {}, ctx);
+      expect(result.action).toBe('summary_rewrite');
+      expect(result.reason).toContain(DEPTH_GAP_REASON);
+      // 判据来源进入 [QualityGate] 观测行：看得出候选档是由 outputType 推出的。
+      expect(
+        infoLog.mock.calls
+          .map((call) => String(call[0]))
+          .some(
+            (line) =>
+              line.includes('[QualityGate]') &&
+              line.includes('action=summary_rewrite') &&
+              line.includes('candidateMode=candidate(source=outputType)')
+          )
+      ).toBe(true);
+    } finally {
+      infoLog.mockRestore();
+    }
+  });
+
+  it('outputType=dual 且未写 needsCandidates 同样执行深度接地门', () => {
+    const result = insightGateEvaluator(source, {}, scanShapedContext({ outputType: 'dual' }));
+    expect(result.action).toBe('summary_rewrite');
+    expect(result.reason).toContain(DEPTH_GAP_REASON);
+  });
+
+  it('needsCandidates 显式值优先：true 时 outputType=analysis 也执行深度门，false 时不叠加深度门', () => {
+    expect(
+      insightGateEvaluator(
+        source,
+        {},
+        scanShapedContext({ outputType: 'analysis', needsCandidates: true })
+      ).action
+    ).toBe('summary_rewrite');
+
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const analysisOnly = insightGateEvaluator(
+        source,
+        {},
+        scanShapedContext({ outputType: 'candidate', needsCandidates: false })
+      );
+      expect(analysisOnly.action).toBe('pass');
+      expect(
+        infoLog.mock.calls
+          .map((call) => String(call[0]))
+          .some((line) => line.includes('candidateMode=analysis(source=needsCandidates)'))
+      ).toBe(true);
+    } finally {
+      infoLog.mockRestore();
+    }
+  });
 });
