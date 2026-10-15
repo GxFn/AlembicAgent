@@ -16,6 +16,8 @@
  * @module EvidenceCollector
  */
 
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { readToolObservation } from '../utils/toolOutcomes.js';
 
 // ── 常量 ──────────────────────────────────────────────────────────
@@ -23,8 +25,15 @@ import { readToolObservation } from '../utils/toolOutcomes.js';
 /** 单个代码片段最大行数 */
 const MAX_SNIPPET_LINES = 30;
 
-/** 每个文件最多保留的代码片段数 */
+/**
+ * 每个文件最多保留的代码片段数。search 单行与连续片段（全文 / 范围读、锚点补读）共用这一名额，
+ * 但优先级不同（L7-P15 / C11，见 #addCodeSnippet）：连续片段入库时替换它完整覆盖的 search 单行并回收
+ * 字符预算；锚点补读遇到名额已满时还可挤掉最早的、未被本批任何锚点引用的 search 单行。
+ */
 const MAX_SNIPPETS_PER_FILE = 3;
+
+/** 锚点补齐替换 / 挤掉 / 尾段补读的日志里每类最多列出的条目数（其余只计数）。 */
+const MAX_GROUNDING_EVENTS_IN_LOG = 5;
 
 /** 每个搜索模式最多保留的匹配条目 */
 const MAX_SEARCH_MATCHES = 5;
@@ -356,7 +365,10 @@ interface EvidenceCollectorDiagnostics {
   droppedOversize: number;
   /** groundFindingRefs：只读端口返回 null / 空内容（路径越界、文件缺失、行号超界）的锚点数。 */
   anchorReaderMiss: number;
-  /** groundFindingRefs：起始行已被既有片段覆盖、未补读的锚点数。 */
+  /**
+   * groundFindingRefs：引用区间（范围锚点为 [起始行, 截止行]，单行锚点即该行）已被既有连续片段完整覆盖、
+   * 未补读的锚点数。search 单行不算覆盖：连续补读会替换它（L7-P15 / C11）。
+   */
   anchorAlreadyCovered: number;
   /** groundFindingRefs：文档类路径（md 等）按设计不补读的锚点数。 */
   anchorDocSkipped: number;
@@ -368,6 +380,44 @@ interface EvidenceCollectorDiagnostics {
 
 /** graph 回执里按数组读取的结构清单字段。 */
 type GraphListField = 'protocols' | 'methods' | 'conformers' | 'properties';
+
+/**
+ * 片段来源（L7-P15 / C11）：search 单行命中，或连续片段——全文 / 范围读（read）与锚点补读（anchor）。
+ * 只在 Collector 内部区分（search 单行经 #searchSnippets 标记），不进入 CodeSnippet 公开类型。
+ */
+type SnippetSource = 'search' | 'read' | 'anchor';
+
+/** 行号闭区间 [startLine, endLine]。 */
+type LineRange = readonly [number, number];
+
+/** #addCodeSnippet 入库成功的片段区间，及被替换（absorbed）或挤掉（evicted）的 search 单行行号，供调用方写说明 / 日志。 */
+interface SnippetAdmission {
+  startLine: number;
+  endLine: number;
+  absorbedSearchLines: number[];
+  evictedSearchLines: number[];
+}
+
+/** groundFindingRefs 从 finding.evidence 解析出的一个代码锚点。 */
+interface FindingAnchor {
+  filePath: string;
+  startLine: number;
+  /** 引用截止行：范围锚点为 cap 后的截止行，单行锚点即起始行；覆盖判定按 [startLine, citedEnd]。 */
+  citedEnd: number;
+  /** 补读请求的截止行：范围锚点同 citedEnd，单行锚点向下扩 ANCHOR_CONTEXT_LINES 行上下文。 */
+  requestedEnd: number;
+}
+
+/** 一组片段的字符数（预算按 content 长度计，与 #snippetCharsUsed 同口径）。 */
+function snippetChars(snippets: readonly CodeSnippet[]): number {
+  return snippets.reduce((sum, snippet) => sum + snippet.content.length, 0);
+}
+
+/** 诊断用的有界列表：最多列 limit 条，其余写成 `+N more`。 */
+function boundedList(items: readonly string[], limit: number): string {
+  const shown = items.slice(0, limit).join('; ');
+  return items.length > limit ? `${shown}; +${items.length - limit} more` : shown;
+}
 
 /**
  * graph 清单成员的展示名：字符串原样；对象取 name / selector；其余（null、数字等畸形成员）记为 '?'，
@@ -482,6 +532,18 @@ export class EvidenceCollector {
 
   /** 负空间信号 */
   #negativeSignals: NegativeSignal[] = [];
+
+  /**
+   * 负空间信号去重键（L7-P15 / C12）：范围（glob）+ 模式。只按模式去重时，窄范围零命中会压住
+   * 同模式的全项目结论；NegativeSignal 公开类型不加 scope 字段（决定②），范围只体现在 implication 文案。
+   */
+  #negativeSignalKeys = new Set<string>();
+
+  /**
+   * search 单行片段的身份标记（L7-P15 / C11）：连续片段入库时只替换 / 挤掉这类片段，read 与锚点片段
+   * 从不被替换。用 WeakSet 而不是在 CodeSnippet 上加字段，避免改变公开类型与 Producer 看到的片段形状。
+   */
+  #searchSnippets = new WeakSet<CodeSnippet>();
 
   /**
    * graph 证据（R2）：Analyst 每次真实 graph 工具调用物化一条可复制 ref。门禁对关系声明
@@ -641,13 +703,69 @@ export class EvidenceCollector {
   /**
    * 锚点驱动证据补齐：把 findings 引用的 `path:line` 锚点补成可照抄的精确片段。
    *
-   * 对每条 finding.evidence 中的锚点引用，若 evidenceMap 尚无覆盖该行的片段，经注入的
-   * 只读端口从磁盘读取该范围的逐字源码入库（行号与内容天然对齐）。端口返回 null（路径
-   * 越界 / 文件缺失 / 行号超界）时跳过——绝不编造证据；预算与每文件片段数沿用
-   * #addCodeSnippet 的既有约束。每类跳过都计入 diagnostics()（anchorReaderMiss / anchorAlreadyCovered /
-   * anchorDocSkipped / anchorInvalidRange / dropped*），供 anchor grounding 日志区分根因（C13）。
+   * 覆盖判定按锚点的完整引用区间（L7-P15 / C11）：范围锚点看 [起始行, 截止行]，单行锚点看该行；
+   * 只有既有连续片段（全文 / 范围读、锚点补读）算覆盖，search 单行不算——连续补读会替换它。
+   * - 区间已被完整覆盖：不补读（anchorAlreadyCovered）；
+   * - 起始行未覆盖：经注入的只读端口读取整段（单行锚点向下扩 ANCHOR_CONTEXT_LINES 行上下文）；
+   * - 起始行已覆盖、区间后段缺失：只补读从首个缺失行到截止行的尾段，不重复读已覆盖的前段。
+   * 端口返回 null（路径越界 / 文件缺失 / 行号超界）时跳过——绝不编造证据；预算与每文件名额沿用
+   * #addCodeSnippet，名额已满时可挤掉最早的、未被本批任何锚点引用的 search 单行。每类跳过都计入
+   * diagnostics()（anchorReaderMiss / anchorAlreadyCovered / anchorDocSkipped / anchorInvalidRange /
+   * dropped*）；替换、挤掉与尾段补读汇总成一条 `[EvidenceCollector] anchor grounding` 日志。
    */
   groundFindingRefs(findings: FindingRefLike[], readRange: SnippetRangeReader) {
+    const anchors = this.#parseFindingAnchors(findings);
+    // 本批全部锚点的引用区间（按文件）：某个锚点挤名额时，不挤掉落在别的锚点引用区间里的 search 单行——
+    // 那一行可能是另一个锚点在补读失败（读不到 / 超预算）时仅剩的证据。
+    const citedRangesByFile = new Map<string, LineRange[]>();
+    for (const anchor of anchors) {
+      const ranges = citedRangesByFile.get(anchor.filePath) ?? [];
+      ranges.push([anchor.startLine, anchor.citedEnd]);
+      citedRangesByFile.set(anchor.filePath, ranges);
+    }
+
+    const tailReads: string[] = [];
+    const absorbed: string[] = [];
+    const evicted: string[] = [];
+    for (const anchor of anchors) {
+      const { filePath, startLine, citedEnd, requestedEnd } = anchor;
+      const firstGap = this.#firstUncoveredLine(filePath, startLine, citedEnd);
+      if (firstGap === null) {
+        this.#diagnostics.anchorAlreadyCovered += 1;
+        continue;
+      }
+      // 起始行未覆盖时 firstGap 就是起始行（读整段）；否则只读缺失尾段 [firstGap, requestedEnd]。
+      const range = readRange(filePath, firstGap, requestedEnd);
+      if (!range?.content?.trim()) {
+        this.#diagnostics.anchorReaderMiss += 1;
+        continue;
+      }
+      // 预算 / 名额 / 超预算导致的丢弃由 #addCodeSnippet 计数。
+      const admission = this.#addCodeSnippet(filePath, range.content, firstGap, 'anchor', {
+        protectedRanges: citedRangesByFile.get(filePath),
+      });
+      if (!admission) {
+        continue;
+      }
+      if (firstGap > startLine) {
+        tailReads.push(`${filePath}:${firstGap}-${requestedEnd} (cited ${startLine}-${citedEnd})`);
+      }
+      if (admission.absorbedSearchLines.length > 0) {
+        absorbed.push(`${filePath}:${admission.absorbedSearchLines.join(',')}`);
+      }
+      if (admission.evictedSearchLines.length > 0) {
+        evicted.push(`${filePath}:${admission.evictedSearchLines.join(',')}`);
+      }
+    }
+    this.#reportGroundingReplacements(tailReads, absorbed, evicted);
+  }
+
+  /**
+   * 解析 findings 里的代码锚点：行号无效 / 区间倒序计入 anchorInvalidRange，文档锚点计入 anchorDocSkipped，
+   * 其余按出现顺序返回（不去重：同一锚点被多条发现引用时，第二次自然判为已覆盖）。
+   */
+  #parseFindingAnchors(findings: FindingRefLike[]): FindingAnchor[] {
+    const anchors: FindingAnchor[] = [];
     for (const finding of findings) {
       const evidence = typeof finding?.evidence === 'string' ? finding.evidence : '';
       if (!evidence) {
@@ -665,37 +783,65 @@ export class EvidenceCollector {
           this.#diagnostics.anchorDocSkipped += 1;
           continue;
         }
-        // 带范围的锚点用原范围（cap 单片段行数上限）；单行锚点向下扩展少量上下文，
-        // 让「可复制 coreCode」不至于薄到一行。
-        const requestedEnd = match[3]
+        // 带范围的锚点用原范围（cap 单片段行数上限），引用区间即补读区间；单行锚点只引用该行，
+        // 补读时向下扩展少量上下文，让「可复制 coreCode」不至于薄到一行。
+        const citedEnd = match[3]
           ? Math.min(Number(match[3]), startLine + MAX_SNIPPET_LINES - 1)
-          : startLine + ANCHOR_CONTEXT_LINES - 1;
-        if (requestedEnd < startLine) {
+          : startLine;
+        if (citedEnd < startLine) {
           this.#diagnostics.anchorInvalidRange += 1;
           continue;
         }
-        if (this.#hasSnippetCovering(filePath, startLine)) {
-          this.#diagnostics.anchorAlreadyCovered += 1;
-          continue;
-        }
-        const range = readRange(filePath, startLine, requestedEnd);
-        if (!range?.content?.trim()) {
-          this.#diagnostics.anchorReaderMiss += 1;
-          continue;
-        }
-        // 预算 / 名额 / 超预算导致的丢弃由 #addCodeSnippet 计数。
-        this.#addCodeSnippet(filePath, range.content, startLine);
+        const requestedEnd = match[3] ? citedEnd : startLine + ANCHOR_CONTEXT_LINES - 1;
+        anchors.push({ filePath, startLine, citedEnd, requestedEnd });
       }
     }
+    return anchors;
   }
 
-  /** evidenceMap 中是否已有片段覆盖该文件的指定行 */
+  /**
+   * 锚点补齐的替换路径诊断：尾段补读、被连续补读替换的 search 单行、为腾名额被挤掉的 search 单行。
+   * 三者都为空时不打日志（常态无噪声）；挤掉意味着丢了一条 search 命中，所以走 info 而不是 debug。
+   * 观察者失败不影响补齐结果。
+   */
+  #reportGroundingReplacements(tailReads: string[], absorbed: string[], evicted: string[]) {
+    if (tailReads.length === 0 && absorbed.length === 0 && evicted.length === 0) {
+      return;
+    }
+    const line =
+      '[EvidenceCollector] anchor grounding replaced search lines / read missing tails: ' +
+      `tailReads=${boundedList(tailReads, MAX_GROUNDING_EVENTS_IN_LOG) || '-'}, ` +
+      `absorbed=${boundedList(absorbed, MAX_GROUNDING_EVENTS_IN_LOG) || '-'}, ` +
+      `evicted=${boundedList(evicted, MAX_GROUNDING_EVENTS_IN_LOG) || '-'}`;
+    observeSafely(
+      () => Logger.getInstance().info(line),
+      () => undefined
+    );
+  }
+
+  /** evidenceMap 中是否已有片段（任意来源）覆盖该文件的指定行 */
   #hasSnippetCovering(filePath: string, line: number): boolean {
     const entry = this.#evidenceMap.get(filePath);
     if (!entry) {
       return false;
     }
     return entry.codeSnippets.some((s) => s.startLine <= line && line <= s.endLine);
+  }
+
+  /**
+   * [startLine, endLine] 内首个未被连续片段覆盖的行；全部覆盖时返回 null。search 单行不算覆盖：
+   * 连续补读会替换它（区间 ≤ MAX_SNIPPET_LINES 行、每文件 ≤ MAX_SNIPPETS_PER_FILE 片，逐行判定足够）。
+   */
+  #firstUncoveredLine(filePath: string, startLine: number, endLine: number): number | null {
+    const continuous = (this.#evidenceMap.get(filePath)?.codeSnippets ?? []).filter(
+      (snippet) => !this.#searchSnippets.has(snippet)
+    );
+    for (let line = startLine; line <= endLine; line += 1) {
+      if (!continuous.some((s) => s.startLine <= line && line <= s.endLine)) {
+        return line;
+      }
+    }
+    return null;
   }
 
   // ─── 工具特化提取 ─────────────────────────────────────
@@ -777,15 +923,39 @@ export class EvidenceCollector {
         `read display truncated: ${filePath} kept complete lines ${parsed.startLine}-${parsed.endLine}`
       );
     }
-    this.#addCodeSnippet(filePath, parsed.content, parsed.startLine);
+    const admission = this.#addCodeSnippet(filePath, parsed.content, parsed.startLine, 'read');
+    // 连续读取替换了它完整覆盖的 search 单行（C11）：在探索日志注明被替换的行与取代它们的片段区间。
+    if (admission && admission.absorbedSearchLines.length > 0) {
+      this.#callNotes.push(
+        `search lines replaced by read: ${filePath}:${admission.absorbedSearchLines.join(',')} -> ${admission.startLine}-${admission.endLine}`
+      );
+    }
   }
 
   /**
    * code.search — 提取匹配 + 负空间信号。现行 handler 回执是结构化 `{ total, shown, matches }`，
    * 走下方单列表分支；字符串输出与批量 batchResults 两个分支只为旧轨迹 / 旧宿主保留（各自登记见分支旁）。
+   * 命中行已被既有片段覆盖时不再生成单行片段（C11），本次调用跳过的命中汇总成一条采集说明。
    */
   #extractSearchEvidence(args: ToolCallArgs, result: ToolResult, complete = true) {
+    const coveredHits = new Map<string, number[]>();
+    this.#collectSearchEvidence(args, result, complete, coveredHits);
+    if (coveredHits.size > 0) {
+      const hits = [...coveredHits].map(([file, lines]) => `${file}:${lines.join(',')}`);
+      this.#callNotes.push(`search hits already covered: ${hits.join(', ')}`);
+    }
+  }
+
+  /** #extractSearchEvidence 的分支主体；coveredHits 收集因已被覆盖而跳过的命中（文件 → 行号）。 */
+  #collectSearchEvidence(
+    args: ToolCallArgs,
+    result: ToolResult,
+    complete: boolean,
+    coveredHits: Map<string, number[]>
+  ) {
     const patterns = this.#extractSearchPatterns(args);
+    // glob 限定范围（C12）：零命中只说明“该范围内没有”，负信号按范围标注，不写成全项目口径。
+    const scope = this.#searchScope(args);
 
     // 兼容分支：旧字符串回执（登记见 parseSearchOutputText）。
     if (typeof result === 'string') {
@@ -795,15 +965,13 @@ export class EvidenceCollector {
         // `0 matches (showing 0)` 是已退役 formatSearchOutput 的零命中文本，消费方与原因同
         // parseSearchOutputText；移除条件：随字符串分支一起删除（决定③）。
         if (complete && /^\s*0 matches \(showing 0\)\s*$/.test(result)) {
-          for (const pattern of patterns) {
-            this.#addNegativeSignal(pattern);
-          }
+          this.#recordZeroHitPatterns(patterns, scope);
         }
         return;
       }
       const searchNote = this.#mergedSearchNote(patterns);
       for (const m of parsed.slice(0, MAX_SEARCH_MATCHES)) {
-        this.#addSearchMatch(m, searchNote);
+        this.#addSearchMatch(m, searchNote, coveredHits);
       }
       return;
     }
@@ -829,11 +997,11 @@ export class EvidenceCollector {
         }
         if (subMatches.length === 0) {
           if (complete && this.#isCompleteEmptySearch(sub)) {
-            this.#addNegativeSignal(pattern);
+            this.#recordZeroHitPatterns([pattern], scope);
           }
         } else {
           for (const m of subMatches.slice(0, MAX_SEARCH_MATCHES)) {
-            this.#addSearchMatch(m, pattern);
+            this.#addSearchMatch(m, pattern, coveredHits);
           }
         }
       }
@@ -843,15 +1011,43 @@ export class EvidenceCollector {
     // 单列表 matches：现行结构化回执（多个 pattern 也合并在同一列表）及旧版单模式对象回执。
     if (matches.length === 0) {
       if (complete && this.#isCompleteEmptySearch(result)) {
-        for (const p of patterns) {
-          this.#addNegativeSignal(p);
-        }
+        this.#recordZeroHitPatterns(patterns, scope);
       }
     } else {
       const searchNote = this.#mergedSearchNote(patterns);
       for (const m of matches.slice(0, MAX_SEARCH_MATCHES)) {
-        this.#addSearchMatch(m, searchNote);
+        this.#addSearchMatch(m, searchNote, coveredHits);
       }
+    }
+  }
+
+  /**
+   * code.search 的范围限定（L7-P15 / C12）：args.glob 非空时返回规范化的范围文本，否则 undefined（全项目口径）。
+   * schema 里 glob 是字符串；绕过 router 的直调若传了数组，按逗号拼接，其它非空值按 String 转写——
+   * 范围无法确认时宁可标注成“限定范围”，也不把它当成全项目零命中。
+   */
+  #searchScope(args: ToolCallArgs): string | undefined {
+    const raw: unknown = args.glob;
+    if (raw === undefined || raw === null) {
+      return undefined;
+    }
+    const text = Array.isArray(raw) ? raw.map((item) => String(item)).join(', ') : String(raw);
+    const scope = text.trim();
+    return scope ? scope : undefined;
+  }
+
+  /**
+   * 记录一次确认完成的零命中搜索的负空间信号。带范围时只写“未在 <glob> 范围内找到”，并在探索日志
+   * 注明这是范围限定零命中、不是全项目负证据（C12）。
+   */
+  #recordZeroHitPatterns(patterns: string[], scope: string | undefined) {
+    for (const pattern of patterns) {
+      this.#addNegativeSignal(pattern, scope);
+    }
+    if (scope !== undefined && patterns.length > 0) {
+      this.#callNotes.push(
+        `zero hits scoped to glob ${scope}: ${patterns.map((p) => `"${p}"`).join(', ')} (not project-wide negative evidence)`
+      );
     }
   }
 
@@ -1043,46 +1239,118 @@ export class EvidenceCollector {
    * 向 evidenceMap 添加代码片段 (带预算控制)。三类容量丢弃分别计入 diagnostics()（C13）：
    * 预算已用尽（droppedByBudget）、所在文件名额已满（droppedByFileCap）、单片段放不下剩余预算
    * （droppedOversize）；空路径 / 空内容不是容量问题，不计数。
+   *
+   * 来源优先级（L7-P15 / C11）：
+   * - 连续片段（read / anchor）入库时替换它完整覆盖的 search 单行，并回收这些单行占用的字符预算——
+   *   被替换的行逐字包含在新片段里，不丢证据；替换与片段到达顺序无关（读在前时 search 命中按覆盖去重，
+   *   结果一致）；
+   * - 名额仍满时只有锚点补读（anchor）可以再挤掉最早的、不落在 protectedRanges（本批锚点引用区间）里的
+   *   search 单行；全文 / 范围读不挤掉未覆盖的命中，按名额丢弃；search 单行从不替换别的片段。
+   * 替换 / 挤掉只在新片段确定能入库（名额与预算都通过）后才提交，失败时既有片段原样保留。
+   *
+   * @returns 入库成功时返回片段区间与被替换 / 挤掉的 search 单行行号；被丢弃或内容为空时返回 null。
    */
-  #addCodeSnippet(filePath: string, content: string, startLine = 1, analystNote?: string) {
+  #addCodeSnippet(
+    filePath: string,
+    content: string,
+    startLine: number,
+    source: SnippetSource,
+    options: { analystNote?: string; protectedRanges?: readonly LineRange[] } = {}
+  ): SnippetAdmission | null {
     if (!filePath || !content) {
-      return;
-    }
-    if (this.#snippetCharsUsed >= this.#snippetBudget) {
-      this.#diagnostics.droppedByBudget += 1;
-      return;
-    }
-
-    const entry = this.#evidenceMap.get(filePath);
-    if ((entry?.codeSnippets.length ?? 0) >= MAX_SNIPPETS_PER_FILE) {
-      this.#diagnostics.droppedByFileCap += 1;
-      return;
+      return null;
     }
 
     const lines = String(content).split('\n');
     const trimmed = lines.slice(0, MAX_SNIPPET_LINES);
     const snippetContent = trimmed.join('\n');
     if (!snippetContent) {
-      return;
+      return null;
+    }
+    const endLine = startLine + trimmed.length - 1;
+    const existing = this.#evidenceMap.get(filePath)?.codeSnippets ?? [];
+
+    // 连续片段完整覆盖的 search 单行：随新片段入库被替换，字符预算一并回收。
+    const absorbed =
+      source === 'search'
+        ? []
+        : existing.filter(
+            (s) => this.#searchSnippets.has(s) && startLine <= s.startLine && s.endLine <= endLine
+          );
+    let reclaimed = snippetChars(absorbed);
+    if (this.#snippetCharsUsed - reclaimed >= this.#snippetBudget) {
+      this.#diagnostics.droppedByBudget += 1;
+      return null;
     }
 
-    // 预算检查：剩余预算放不下这一片（预算尚未用尽）。
-    if (this.#snippetCharsUsed + snippetContent.length > this.#snippetBudget) {
+    let remaining = existing.length - absorbed.length;
+    const evicted: CodeSnippet[] = [];
+    if (remaining >= MAX_SNIPPETS_PER_FILE && source === 'anchor') {
+      // 锚点补读挤名额：按入库顺序挑最早的 search 单行，跳过已被替换的与落在本批锚点引用区间里的。
+      const protectedRanges = options.protectedRanges ?? [];
+      for (const s of existing) {
+        if (remaining < MAX_SNIPPETS_PER_FILE) {
+          break;
+        }
+        const isProtected = protectedRanges.some(
+          ([from, to]) => s.startLine <= to && from <= s.endLine
+        );
+        if (!this.#searchSnippets.has(s) || absorbed.includes(s) || isProtected) {
+          continue;
+        }
+        evicted.push(s);
+        remaining -= 1;
+      }
+    }
+    if (remaining >= MAX_SNIPPETS_PER_FILE) {
+      this.#diagnostics.droppedByFileCap += 1;
+      return null;
+    }
+    reclaimed += snippetChars(evicted);
+
+    // 预算检查：扣除被替换 / 挤掉的字符后，剩余预算仍放不下这一片（预算尚未用尽）。
+    if (this.#snippetCharsUsed - reclaimed + snippetContent.length > this.#snippetBudget) {
       this.#diagnostics.droppedOversize += 1;
-      return;
+      return null;
     }
 
-    this.#getOrCreateEntry(filePath).codeSnippets.push({
+    // 提交：原地移除被替换 / 挤掉的单行（不换数组引用），再追加新片段。
+    const entry = this.#getOrCreateEntry(filePath);
+    const replaced = new Set<CodeSnippet>([...absorbed, ...evicted]);
+    for (let i = entry.codeSnippets.length - 1; i >= 0; i -= 1) {
+      const snippet = entry.codeSnippets[i];
+      if (snippet && replaced.has(snippet)) {
+        entry.codeSnippets.splice(i, 1);
+      }
+    }
+    const snippet: CodeSnippet = {
       startLine,
-      endLine: startLine + trimmed.length - 1,
+      endLine,
       content: snippetContent,
-      ...(analystNote ? { analystNote } : {}),
-    });
-    this.#snippetCharsUsed += snippetContent.length;
+      ...(options.analystNote ? { analystNote: options.analystNote } : {}),
+    };
+    entry.codeSnippets.push(snippet);
+    if (source === 'search') {
+      this.#searchSnippets.add(snippet);
+    }
+    this.#snippetCharsUsed += snippetContent.length - reclaimed;
+    return {
+      startLine,
+      endLine,
+      absorbedSearchLines: absorbed.map((s) => s.startLine),
+      evictedSearchLines: evicted.map((s) => s.startLine),
+    };
   }
 
-  /** 向 evidenceMap 添加搜索匹配（searchNote 缺席时片段不带 analystNote，见 #mergedSearchNote） */
-  #addSearchMatch(match: SearchMatch, searchNote: string | undefined) {
+  /**
+   * 向 evidenceMap 添加搜索匹配（searchNote 缺席时片段不带 analystNote，见 #mergedSearchNote）。
+   * 命中行已被任意既有片段覆盖时跳过并记入 coveredHits（C11），由调用方汇总成一条采集说明。
+   */
+  #addSearchMatch(
+    match: SearchMatch,
+    searchNote: string | undefined,
+    coveredHits: Map<string, number[]>
+  ) {
     if (!match?.file) {
       return;
     }
@@ -1095,9 +1363,12 @@ export class EvidenceCollector {
       return;
     }
 
-    const entry = this.#evidenceMap.get(match.file);
-    // 去重: 同一行不重复添加；随后与 read 共用片段数量和字符预算。
-    if (entry?.codeSnippets.some((s) => s.startLine === match.line)) {
+    // 去重按覆盖判定（C11）：命中行已在任意既有片段（全文 / 范围读窗口、锚点片段或同一行的 search 单行）
+    // 之内就不再生成单行片段——冗余单行只会占掉每文件名额与字符预算。
+    if (this.#hasSnippetCovering(match.file, match.line)) {
+      const lines = coveredHits.get(match.file) ?? [];
+      lines.push(match.line);
+      coveredHits.set(match.file, lines);
       return;
     }
 
@@ -1108,26 +1379,32 @@ export class EvidenceCollector {
     if (!singleLine.trim()) {
       return;
     }
-    this.#addCodeSnippet(
-      match.file,
-      singleLine,
-      match.line,
-      searchNote === undefined ? undefined : `search: "${searchNote}"`
-    );
+    this.#addCodeSnippet(match.file, singleLine, match.line, 'search', {
+      analystNote: searchNote === undefined ? undefined : `search: "${searchNote}"`,
+    });
   }
 
-  /** 添加负空间信号 (去重) */
-  #addNegativeSignal(pattern: string) {
+  /**
+   * 添加负空间信号（按范围 + 模式去重）。scope 为 glob 限定范围（C12）：带范围时 implication 写
+   * “未在 <glob> 范围内找到”，不写全项目口径；同模式的范围信号与全项目信号互不压制。
+   */
+  #addNegativeSignal(pattern: string, scope?: string) {
     if (!pattern) {
       return;
     }
-    if (this.#negativeSignals.some((ns) => ns.searchPattern === pattern)) {
+    const key =
+      scope === undefined ? `project\u0000${pattern}` : `glob\u0000${scope}\u0000${pattern}`;
+    if (this.#negativeSignalKeys.has(key)) {
       return;
     }
+    this.#negativeSignalKeys.add(key);
     this.#negativeSignals.push({
       searchPattern: pattern,
       result: 'not_found',
-      implication: `未在项目中找到 "${pattern}" 相关模式`,
+      implication:
+        scope === undefined
+          ? `未在项目中找到 "${pattern}" 相关模式`
+          : `未在 ${scope} 范围内找到 "${pattern}" 相关模式`,
     });
   }
 

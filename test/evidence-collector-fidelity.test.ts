@@ -1613,3 +1613,276 @@ describe('L7-P14 采集诊断计数与宿主结果归一化', () => {
     }
   });
 });
+
+describe('L7-P15 片段名额、锚点区间覆盖与范围化负信号', () => {
+  /** 60 行合成文件 src/wide.ts 的行 n 文本（不落盘；读取展示与锚点端口都由它逐字生成）。 */
+  function wideLines(startLine: number, endLine: number): string {
+    return Array.from(
+      { length: endLine - startLine + 1 },
+      (_, i) => `export const wide${startLine + i} = ${startLine + i};`
+    ).join('\n');
+  }
+
+  /** code.read 的 `N|` 展示态（全文读 1-60 时 Collector 只留头 MAX_SNIPPET_LINES=30 行窗口）。 */
+  function wideDisplay(startLine: number, endLine: number): string {
+    return wideLines(startLine, endLine)
+      .split('\n')
+      .map((line, i) => `${startLine + i}|${line}`)
+      .join('\n');
+  }
+
+  /** 记录每次请求区间的只读端口（60 行内逐字返回，越界视为读不到）。 */
+  function makeWideReader() {
+    const calls: Array<[string, number, number]> = [];
+    const reader: SnippetRangeReader = (filePath, startLine, endLine) => {
+      calls.push([filePath, startLine, endLine]);
+      if (filePath !== 'src/wide.ts' || startLine < 1 || startLine > 60) {
+        return null;
+      }
+      const effectiveEnd = Math.min(endLine, 60);
+      return { content: wideLines(startLine, effectiveEnd), endLine: effectiveEnd };
+    };
+    return { reader, calls };
+  }
+
+  function searchCall(lines: number[], extraParams: Record<string, unknown> = {}) {
+    return {
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['wide'], ...extraParams } },
+      result: {
+        total: lines.length,
+        shown: lines.length,
+        matches: lines.map((line) => ({
+          file: 'src/wide.ts',
+          line,
+          content: wideLines(line, line),
+        })),
+      },
+    };
+  }
+
+  function rangesOf(collector: EvidenceCollector): Array<[number, number]> {
+    return (collector.build().evidenceMap.get('src/wide.ts')?.codeSnippets ?? []).map((s) => [
+      s.startLine,
+      s.endLine,
+    ]);
+  }
+
+  it('C11: search 单行先占满名额后，全文读替换其覆盖的单行并回收预算，窗口外锚点仍入库', () => {
+    // 预算恰好容纳「全文读窗口 + 锚点片段」：被替换的 search 单行若不回收字符，锚点会因超预算被丢。
+    const budget = wideLines(1, 30).length + wideLines(40, 47).length;
+    const collector = new EvidenceCollector({ snippetBudget: budget });
+    collector.processToolCall(searchCall([3, 9, 20]));
+    expect(rangesOf(collector)).toEqual([
+      [3, 3],
+      [9, 9],
+      [20, 20],
+    ]);
+
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/wide.ts' },
+      result: wideDisplay(1, 60),
+    });
+    const { reader, calls } = makeWideReader();
+    collector.groundFindingRefs(
+      [{ finding: '窗口外常量', evidence: '见 src/wide.ts:40', importance: 9 }],
+      reader
+    );
+
+    const { evidenceMap, explorationLog } = collector.build();
+    expect(evidenceMap.get('src/wide.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 30, content: wideLines(1, 30) },
+      { startLine: 40, endLine: 47, content: wideLines(40, 47) },
+    ]);
+    expect(calls).toEqual([['src/wide.ts', 40, 47]]);
+    expect(collector.diagnostics()).toMatchObject({
+      droppedByFileCap: 0,
+      droppedByBudget: 0,
+      droppedOversize: 0,
+    });
+    // 替换路径写进该次读取的探索日志：哪些 search 单行被哪段连续片段取代。
+    expect(explorationLog[1]?.resultSummary).toContain(
+      'search lines replaced by read: src/wide.ts:3,9,20 -> 1-30'
+    );
+  });
+
+  it('C11: 名额满且不覆盖任何 search 单行的范围读仍按名额丢弃（读取不挤掉别的命中）', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall(searchCall([3, 9, 20]));
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/wide.ts' },
+      result: wideDisplay(40, 45),
+    });
+    expect(rangesOf(collector)).toEqual([
+      [3, 3],
+      [9, 9],
+      [20, 20],
+    ]);
+    expect(collector.diagnostics().droppedByFileCap).toBe(1);
+  });
+
+  it('C11: 连续片段放不进预算时不提交替换：被覆盖的 search 单行原样保留', () => {
+    const collector = new EvidenceCollector({ snippetBudget: wideLines(1, 1).length + 40 });
+    collector.processToolCall(searchCall([1]));
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/wide.ts' },
+      result: wideDisplay(1, 30),
+    });
+    expect(collector.build().evidenceMap.get('src/wide.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 1, content: wideLines(1, 1), analystNote: 'search: "wide"' },
+    ]);
+    expect(collector.diagnostics().droppedOversize).toBe(1);
+  });
+
+  it('C11: 读在前时被覆盖行的 search 命中不再生成冗余单行，后续锚点仍有名额', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/wide.ts' },
+      result: wideDisplay(1, 60),
+    });
+    collector.processToolCall(searchCall([12, 15]));
+    const { reader } = makeWideReader();
+    collector.groundFindingRefs(
+      [{ finding: '窗口外常量', evidence: '见 src/wide.ts:45', importance: 9 }],
+      reader
+    );
+    expect(rangesOf(collector)).toEqual([
+      [1, 30],
+      [45, 52],
+    ]);
+    expect(collector.build().explorationLog[1]?.resultSummary).toContain(
+      'search hits already covered: src/wide.ts:12,15'
+    );
+  });
+
+  it('C11: search 单行占满名额后只做锚点补读：挤掉最早的、未被任何锚点引用的单行', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      // 第二条锚点 :20 读出的 8 行放不进预算：若第一条锚点先挤掉被它引用的单行 20，该锚点会一无所有。
+      const budget =
+        wideLines(20, 20).length + wideLines(9, 9).length + wideLines(40, 47).length + 10;
+      const collector = new EvidenceCollector({ snippetBudget: budget });
+      collector.processToolCall(searchCall([20, 3, 9]));
+      const { reader } = makeWideReader();
+      collector.groundFindingRefs(
+        [
+          { finding: '窗口外常量', evidence: '见 src/wide.ts:40', importance: 9 },
+          { finding: '命中行常量', evidence: '见 src/wide.ts:20', importance: 8 },
+        ],
+        reader
+      );
+      expect(rangesOf(collector)).toEqual([
+        [20, 20],
+        [9, 9],
+        [40, 47],
+      ]);
+      expect(collector.diagnostics()).toMatchObject({ droppedOversize: 1, droppedByFileCap: 0 });
+      const line = info.mock.calls
+        .map(([entry]) => String(entry))
+        .find((entry) => entry.includes('[EvidenceCollector] anchor grounding'));
+      expect(line).toContain('evicted=src/wide.ts:3');
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('C11: 已有 1-12 片段加 10-25 锚点只补读缺失尾段 13-25；区间已完整覆盖的锚点不补读', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/wide.ts' },
+      result: wideDisplay(1, 12),
+    });
+    const { reader, calls } = makeWideReader();
+    collector.groundFindingRefs(
+      [{ finding: '跨窗口区段', evidence: '见 src/wide.ts:10-25', importance: 9 }],
+      reader
+    );
+    expect(collector.build().evidenceMap.get('src/wide.ts')?.codeSnippets).toEqual([
+      { startLine: 1, endLine: 12, content: wideLines(1, 12) },
+      { startLine: 13, endLine: 25, content: wideLines(13, 25) },
+    ]);
+    expect(calls).toEqual([['src/wide.ts', 13, 25]]);
+
+    collector.groundFindingRefs(
+      [{ finding: '已覆盖区段', evidence: '见 src/wide.ts:2-20', importance: 8 }],
+      reader
+    );
+    expect(calls).toHaveLength(1);
+    expect(collector.diagnostics().anchorAlreadyCovered).toBe(1);
+  });
+
+  it('C11: 只被 search 单行覆盖的锚点仍补读连续片段，并替换该单行', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall(searchCall([40]));
+    const { reader } = makeWideReader();
+    collector.groundFindingRefs(
+      [{ finding: '命中行常量', evidence: '见 src/wide.ts:40', importance: 9 }],
+      reader
+    );
+    expect(collector.build().evidenceMap.get('src/wide.ts')?.codeSnippets).toEqual([
+      { startLine: 40, endLine: 47, content: wideLines(40, 47) },
+    ]);
+  });
+
+  it('C12: glob 限定的零命中只记范围化负信号，不写全项目口径；范围纳入去重键', () => {
+    const collector = new EvidenceCollector();
+    const zeroHits = { total: 0, shown: 0, matches: [] };
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['Repository'], glob: '*.swift' } },
+      result: zeroHits,
+    });
+    expect(collector.build().negativeSignals).toEqual([
+      {
+        searchPattern: 'Repository',
+        result: 'not_found',
+        implication: '未在 *.swift 范围内找到 "Repository" 相关模式',
+      },
+    ]);
+    expect(collector.build().explorationLog[0]?.resultSummary).toContain(
+      'zero hits scoped to glob *.swift'
+    );
+
+    // 同范围重复不重复记；同模式的全项目零命中不再被窄范围信号压住。
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['Repository'], glob: '*.swift' } },
+      result: zeroHits,
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['Repository'] } },
+      result: zeroHits,
+    });
+    const implications = collector.build().negativeSignals.map((ns) => ns.implication);
+    expect(implications).toEqual([
+      '未在 *.swift 范围内找到 "Repository" 相关模式',
+      '未在项目中找到 "Repository" 相关模式',
+    ]);
+  });
+
+  it('C12: 字符串零命中回执与旧 batchResults 回执同样按 glob 标注范围', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['Repository'], glob: '*.swift' } },
+      result: '0 matches (showing 0)\n\n',
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['Store'], glob: 'Sources/**' } },
+      result: { batchResults: { Store: { matches: [] } } },
+    });
+    const { negativeSignals } = collector.build();
+    expect(negativeSignals.map((ns) => ns.implication)).toEqual([
+      '未在 *.swift 范围内找到 "Repository" 相关模式',
+      '未在 Sources/** 范围内找到 "Store" 相关模式',
+    ]);
+    expect(negativeSignals.some((ns) => ns.implication.includes('未在项目中找到'))).toBe(false);
+  });
+});
