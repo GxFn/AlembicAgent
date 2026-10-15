@@ -4,6 +4,7 @@
  * 内部子系统:
  *   1. DimensionReports — 跨维度分析报告 + 结构化证据 + 交叉引用 (from EpisodicMemory)
  *   2. ReadOnlyCache — 只读工具结果缓存 (from ToolResultCache, 排除副作用工具 B3 fix)
+ *      生产中没有写入者也没有读取者 (C64)，详见 §8；去留待决事项①。
  *
  * 替代关系:
  *   EpisodicMemory.js → 全部维度报告/证据/反思逻辑
@@ -727,6 +728,16 @@ export class SessionStore implements Disposable {
 
   // ═══════════════════════════════════════════════════════
   // §8: 只读缓存 (from ToolResultCache, B3 fix)
+  //
+  // 生产不可达 (C64)：缓存链路随 Agent 工具管道的重复调用去重 (duplicateCache) 演进失去了写入者——
+  //   - 写入：唯一生产写入路径 observationRecord → MemoryCoordinator.recordObservation 已移出默认工具
+  //     管道 (L5-P47)，旧链路有信封时又总以 cacheHit=true 调用而跳过写入；
+  //   - 读取：MemoryCoordinator.getCachedResult 代理与 kernel ToolResultCacheProvider 端口都没有调用方，
+  //     宿主也不直接调用本节方法或 get/set 别名。
+  // 因此生产中缓存恒空，getStats().cache 恒为零命中 (宿主 SessionResultConsumer 只读它打印统计)。
+  // 另注意：read 命中返回改写后的 {content, path, cached: true}，与工具原始结果形状不同。
+  // 删除 (连同别名、cacheStats、可选清扫 timer、Coordinator 代理与 kernel 契约，属公开面变更) 还是在
+  // ToolRouter 读路径接线并统一返回形状，取决于待决事项①；决定前不改缓存本体与公开签名。
   // ═══════════════════════════════════════════════════════
 
   /** 只复用同一完整请求；路径、范围和搜索选项都参与缓存键。 */
@@ -801,12 +812,12 @@ export class SessionStore implements Disposable {
     }
   }
 
-  /** 兼容 ToolResultCache.get() */
+  /** 兼容 ToolResultCache.get()；Agent src 与宿主均无调用方 (C64)，去留随事项①。 */
   get(toolName: string, args: ToolArgs): unknown | null {
     return this.getCachedResult(toolName, args);
   }
 
-  /** 兼容 ToolResultCache.set() */
+  /** 兼容 ToolResultCache.set()；Agent src 与宿主均无调用方 (C64)，去留随事项①。 */
   set(toolName: string, args: ToolArgs, result: unknown) {
     this.cacheToolResult(toolName, args, result);
   }
@@ -1049,7 +1060,10 @@ export class SessionStore implements Disposable {
     return files;
   }
 
-  /** 获取统计数据 (合并维度 + 缓存统计, F12) */
+  /**
+   * 获取统计数据 (合并维度 + 缓存统计, F12)。
+   * cache 子对象在生产中恒为零 (缓存无写入者，见 §8 / C64)；字段属公开返回形状，去留随事项①。
+   */
   getStats() {
     const totalFindings = [...this.#dimensionReports.values()].reduce(
       (sum, r) => sum + r.findings.length,

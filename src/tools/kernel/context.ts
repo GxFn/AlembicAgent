@@ -83,6 +83,14 @@ export interface ToolPolicyValidator {
   validateToolCall(toolName: string, args: Record<string, unknown>): ToolPolicyDecision;
 }
 
+/**
+ * 工具结果缓存端口（ToolRuntimeCallContext.cache 的类型）。
+ *
+ * 契约只有类型、没有读取方（C64）：router 与 handler 从不调用 getCachedResult / cacheToolResult，
+ * 重复调用去重由 Agent 工具管道的 duplicateCache 承担；runtimeBridge 投影进来的 MemoryCoordinator 背后的
+ * SessionStore 只读缓存在生产中也没有写入者。删除本契约（公开类型变更，需同步签名冻结文件）还是在
+ * ToolRouter 读路径接线，取决于待决事项①；决定前保持签名不变。
+ */
 export interface ToolResultCacheProvider {
   getCachedResult(toolName: string, args: Record<string, unknown>): unknown | null | undefined;
   cacheToolResult?(toolName: string, args: Record<string, unknown>, result: unknown): void;
