@@ -25,6 +25,7 @@ import {
   buildProducerPromptV2,
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
+import { buildProducerFindingsSection } from '../src/agent/prompts/producerFindings.js';
 import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import type { EvolutionAuditRecipe } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
 import {
@@ -45,6 +46,7 @@ import { selectLlmInputTools, validateLlmInputSize } from '../src/agent/runtime/
 import { allowsToolCallsUnderForcedNone } from '../src/agent/runtime/ProviderToolChoicePolicy.js';
 import type { UnifiedMessage } from '../src/ai/contracts.js';
 import { estimateTokens } from '../src/shared/tokenUtils.js';
+import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
@@ -1516,8 +1518,12 @@ describe('R06 prompt boundary facts', () => {
       snippet('docs/design.md', 'A source reference to a historical note.')
     );
     const prompt = buildProducerPromptV2(a, promptDimension, { name: 'fixture' });
-    expect(prompt).toContain('背景文件');
+    // L6-P22 / C61：带区间的文档条目保留 path:起-止，但只进 provenance 节，不成为可复制代码引用。
+    expect(prompt).toContain('文档 provenance 引用');
+    expect(prompt).toContain('docs/design.md:1-3');
+    expect(prompt).not.toMatch(/^- docs\/design\.md/m);
     expect(prompt).not.toContain('可复制 coreCode(来源 docs/design.md');
+    expect(prompt).not.toContain('A source reference to a historical note.');
   });
 });
 
@@ -3142,3 +3148,189 @@ describe('Analyst session memory keeps cross-dimension advice within the budget 
 });
 
 type TierReflectionInput = Parameters<SessionStore['addTierReflection']>[1];
+
+// ──────────────────────────────────────────────────────────────────
+// L6-P22：Producer 证据段两遍渲染（C60）、文档 provenance 分节（C61）、无台账发现分流（C62）
+// ──────────────────────────────────────────────────────────────────
+
+/** EvidenceCollector 满额形态：每文件 3 个片段、每片段 30 行（MAX_SNIPPETS_PER_FILE × MAX_SNIPPET_LINES）。 */
+function saturatedEvidenceEntry(filePath: string, summary = ''): EvidenceEntry {
+  const codeSnippets = [0, 1, 2].map((block) => {
+    const startLine = block * 30 + 1;
+    const content = Array.from(
+      { length: 30 },
+      (_, offset) =>
+        `export const value${startLine + offset} = computeValue(${startLine + offset}); // ${filePath}`
+    ).join('\n');
+    return { startLine, endLine: startLine + 29, content };
+  });
+  return { filePath, summary, codeSnippets };
+}
+
+function saturatedEvidenceMap(count: number): Map<string, EvidenceEntry> {
+  return new Map(
+    Array.from({ length: count }, (_, index) => {
+      const filePath = `src/feature/module${index}.ts`;
+      return [filePath, saturatedEvidenceEntry(filePath)] as [string, EvidenceEntry];
+    })
+  );
+}
+
+function fileRefs(filePath: string): string {
+  return `${filePath}:1-30, ${filePath}:31-60, ${filePath}:61-90`;
+}
+
+describe('Producer evidence refs render every evidence file before code (L6-P22 C60)', () => {
+  it('keeps the ref line and first copy-ready coreCode of each of three saturated files', () => {
+    const section = buildCodeContextSection(saturatedEvidenceMap(3)) ?? '';
+    for (let index = 0; index < 3; index++) {
+      const filePath = `src/feature/module${index}.ts`;
+      expect(section).toContain(`- ${fileRefs(filePath)}`);
+      expect(section).toContain(`可复制 coreCode(来源 ${filePath}:1-30): `);
+    }
+  });
+
+  it('lists all five saturated files, rotates code across them and notes unexpanded snippets', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const section = buildCodeContextSection(saturatedEvidenceMap(5)) ?? '';
+      for (let index = 0; index < 5; index++) {
+        const filePath = `src/feature/module${index}.ts`;
+        expect(section).toContain(`- ${fileRefs(filePath)}`);
+        // 轮转：每个文件先拿到首片段，才轮到任何文件的第 2、3 片段。
+        expect(section).toContain(`可复制 coreCode(来源 ${filePath}:1-30): `);
+      }
+      expect(section).not.toContain('可复制 coreCode(来源 src/feature/module0.ts:61-90)');
+      expect(section).toMatch(/另有 5 个证据文件因预算未展开部分可复制 coreCode/);
+      expect(info).toHaveBeenCalledWith(
+        expect.stringContaining('[producer-evidence-refs] budget-exhausted')
+      );
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('counts files dropped by the ref budget without listing their bare paths', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const map = saturatedEvidenceMap(20);
+      const section = buildCodeContextSection(map) ?? '';
+      const listed = [...map.keys()].filter((filePath) => section.includes(`${filePath}:1-30`));
+      const dropped = map.size - listed.length;
+      expect(listed.length).toBeGreaterThanOrEqual(3);
+      expect(dropped).toBeGreaterThan(0);
+      expect(section).toContain(`另有 ${dropped} 个证据文件因引用预算未列出`);
+      const droppedPath = [...map.keys()].find((filePath) => !listed.includes(filePath)) ?? '';
+      expect(section).not.toContain(droppedPath);
+      expect(info).toHaveBeenCalledWith(expect.stringContaining(`refsDropped=${dropped}`));
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('stays silent when every ref and snippet fits the budget', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const section =
+        buildCodeContextSection(
+          new Map([
+            ['src/a.ts', snippet('src/a.ts', 'export const a = 1;')],
+            ['src/b.ts', snippet('src/b.ts', 'export const b = 2;')],
+          ])
+        ) ?? '';
+      expect(section).toContain('可复制 coreCode(来源 src/a.ts:1-3): export const a = 1;');
+      expect(section).toContain('可复制 coreCode(来源 src/b.ts:1-3): export const b = 2;');
+      expect(section).not.toContain('另有');
+      expect(info).not.toHaveBeenCalledWith(expect.stringContaining('[producer-evidence-refs]'));
+    } finally {
+      info.mockRestore();
+    }
+  });
+});
+
+describe('Producer doc evidence keeps exact ranges for retrieval-profile provenance (L6-P22 C61)', () => {
+  it('renders a doc snippet range as provenance only, never as copy-ready coreCode', () => {
+    const map = new Map<string, EvidenceEntry>([
+      [
+        'docs/architecture.md',
+        {
+          filePath: 'docs/architecture.md',
+          summary: 'Architecture notes',
+          codeSnippets: [{ startLine: 10, endLine: 30, content: 'DOC_BODY_NOT_FOR_CORE_CODE' }],
+        },
+      ],
+      ['docs/overview.md', { filePath: 'docs/overview.md', summary: 'Overview', codeSnippets: [] }],
+      ['src/a.ts', snippet('src/a.ts', 'export const a = 1;')],
+    ]);
+    const section = buildCodeContextSection(map) ?? '';
+    const lines = section.split('\n');
+    const provenance = lines.find((line) => line.includes('docs/architecture.md:10-30')) ?? '';
+    expect(provenance).toContain('retrieval-profile');
+    expect(provenance).toContain('reasoning.sources');
+    expect(provenance).toContain('不可作 coreCode');
+    expect(provenance).toContain('不计入');
+    expect(section).not.toMatch(/^- docs\//m);
+    expect(section).not.toContain('可复制 coreCode(来源 docs/');
+    expect(section).not.toContain('DOC_BODY_NOT_FOR_CORE_CODE');
+    // 只有真正没有片段的条目才写“无行号”。
+    const background = lines.find((line) => line.startsWith('背景文件')) ?? '';
+    expect(background).toContain('docs/overview.md');
+    expect(background).not.toContain('docs/architecture.md');
+    expect(section).toContain('- src/a.ts:1-3');
+  });
+});
+
+describe('Producer finding triage only demotes ledger verification failures (L6-P22 C62)', () => {
+  it('keeps a no-ledger note_finding in the confirmed section end to end', async () => {
+    const recorded: string[] = [];
+    const memoryCoordinator = {
+      noteFinding(_finding: string, evidence: string, importance: number) {
+        recorded.push(evidence);
+        return {
+          recorded: true,
+          target: 'activeContext' as const,
+          importance,
+          message: 'recorded',
+          scratchpadSize: recorded.length,
+        };
+      },
+    };
+    const result = await handleMemory(
+      'note_finding',
+      { finding: 'No-ledger boundary finding', evidenceRefs: ['E-3'], importance: 7 },
+      { projectRoot: 'fixture', tokenBudget: 1000, memoryCoordinator } as never
+    );
+    expect(result.ok).toBe(true);
+    expect(recorded[0]).toContain('E-3');
+    expect(recorded[0]).toContain('no evidence ledger');
+    expect(recorded[0]).not.toMatch(/unverified:/i);
+    const section =
+      buildProducerFindingsSection([
+        { finding: 'No-ledger boundary finding', evidence: recorded[0], importance: 7 },
+      ]) ?? '';
+    expect(section).not.toContain('未核实线索');
+    expect(section.split('## 关键发现 (Analyst 已确认)')[1]).toContain(
+      'No-ledger boundary finding'
+    );
+  });
+
+  it('treats only the bracketed ledger marker as unverified', () => {
+    const section =
+      buildProducerFindingsSection([
+        {
+          finding: 'Legacy no-ledger finding',
+          evidence: 'E-1 (unverified: no evidence ledger in this run)',
+          importance: 6,
+        },
+        {
+          finding: 'Ledger-unresolved finding',
+          evidence: 'E-2 [unverified: 证据均无文件归属]',
+          importance: 9,
+        },
+      ]) ?? '';
+    const [confirmed = '', pending = ''] = section.split('### ⚠️ 未核实线索');
+    expect(confirmed).toContain('Legacy no-ledger finding');
+    expect(confirmed).not.toContain('Ledger-unresolved finding');
+    expect(pending).toContain('Ledger-unresolved finding');
+  });
+});

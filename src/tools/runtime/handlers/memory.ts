@@ -127,8 +127,8 @@ async function handleNoteFinding(
   }
 
   // 录入即校验（纯台账查询，零 fs 成本）：任一 ref 无效→整条拒收并附近期真实条目提示，
-  // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存：evidence 文本标
-  // unverified，结果再带 _meta.degraded + MEMORY_FINDING_UNVERIFIED_NO_LEDGER，运行诊断可定位这类写入。
+  // 逼模型在还有 code 工具的阶段修正。台账缺席（非维度场景）降级为不校验直存：evidence 文本标注
+  // “本次运行无证据台账”，结果再带 _meta.degraded + MEMORY_FINDING_UNVERIFIED_NO_LEDGER，运行诊断可定位这类写入。
   const ledger = ctx.runtime?.evidenceLedger;
   let resolvedLabels: string;
   // M3（VERIFY 机械化）：verified=至少一个引用解析到有文件归属（entry.file 在场）的台账条目，
@@ -174,7 +174,9 @@ async function handleNoteFinding(
       ? labels.join('; ')
       : `${labels.join('; ')} [unverified: 证据均无文件归属——用 code.read 补采关键文件后重记]`;
   } else {
-    resolvedLabels = `${refs.join('; ')} (unverified: no evidence ledger in this run)`;
+    // L6-P22 / C62：无台账标注刻意不含 `unverified:`——Producer 只把 `[unverified:` 方括号标记（台账校验
+    // 失败）降为未核实线索；无台账不参与核实判定，与上方 verified 保持 undefined 的语义一致。
+    resolvedLabels = `${refs.join('; ')} (no evidence ledger in this run; refs not ledger-checked)`;
   }
 
   const excerpt =

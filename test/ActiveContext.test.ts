@@ -585,10 +585,10 @@ describe('memory.note_finding ActiveContext contract', () => {
     );
 
     expect(result.ok).toBe(true);
-    // E3：无台账 ctx 走降级直存分支（unverified 标注），refs 作第 6 参透传
+    // E3：无台账 ctx 走降级直存分支（无台账标注；L6-P22/C62 起不含 `unverified:`），refs 作第 6 参透传
     expect(noteFinding).toHaveBeenCalledWith(
       'Verified boundary',
-      'E-1 (unverified: no evidence ledger in this run)',
+      'E-1 (no evidence ledger in this run; refs not ledger-checked)',
       8,
       3,
       'architecture:analyst',
@@ -987,7 +987,7 @@ describe('note_finding evidenceRefs 硬切（E3，E0 钉 1 反转）', () => {
     expect(recorded).toHaveLength(0);
   });
 
-  test('无台账场景（非维度 run）：降级直存并显式标注 unverified', async () => {
+  test('无台账场景（非维度 run）：降级直存并显式标注无台账（不与台账校验失败标记混淆）', async () => {
     const { ctx, recorded } = makeCtx(null);
     const result = await handleMemory(
       'note_finding',
@@ -996,7 +996,9 @@ describe('note_finding evidenceRefs 硬切（E3，E0 钉 1 反转）', () => {
     );
     expect(result.ok).toBe(true);
     expect(recorded[0].evidence).toContain('E-3');
-    expect(recorded[0].evidence).toContain('unverified: no evidence ledger');
+    expect(recorded[0].evidence).toContain('no evidence ledger in this run');
+    // L6-P22 / C62：无台账不参与核实判定，标注不得含 Producer 用来识别台账校验失败的 `unverified:`。
+    expect(recorded[0].evidence).not.toMatch(/unverified:/i);
   });
 
   test('refs 流转：scratchpad 条目与 distill 投影携带 evidenceRefs（防御性拷贝）', () => {

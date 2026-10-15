@@ -5,8 +5,11 @@ export function buildProducerFindingsSection(
   if (findings.length === 0) {
     return null;
   }
+  // 只认台账校验失败的方括号标记 `[unverified: …]`（memory.note_finding 在台账在场、但引用均无文件归属时
+  // 写入）。无台账运行不参与核实判定（verified 缺省，探索配额按已核实计），旧版本写入的圆括号
+  // `(unverified: no evidence ledger …)` 也属于无台账标记，不得据此把发现降为未核实线索（L6-P22 / C62）。
   const unverified = (finding: { evidence?: string }) =>
-    /[[(]unverified:/i.test(finding.evidence || '');
+    /\[unverified:/i.test(finding.evidence || '');
   const confirmed = findings
     .filter((finding) => !unverified(finding))
     .sort((a, b) => (b.importance ?? 5) - (a.importance ?? 5));

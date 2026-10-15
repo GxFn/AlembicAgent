@@ -478,7 +478,7 @@ describe('F1/F2 证据源约束（md 是线索不是证据）+ 路径截断修�
     expect(evidenceMap.get('src/alpha.ts')?.codeSnippets[0]?.startLine).toBe(15);
   });
 
-  it('F1b: md 文件的 evidence entry 渲染为背景文件，绝不进可复制 ref 列表', () => {
+  it('F1b: md 文件的 evidence entry 只作 provenance 引用，绝不进可复制 ref 列表', () => {
     const section =
       buildCodeContextSection(
         new Map([
@@ -493,10 +493,14 @@ describe('F1/F2 证据源约束（md 是线索不是证据）+ 路径截断修�
           evidenceEntryForFidelity('alpha', 2, 4),
         ])
       ) ?? '';
-    // md 有 snippet 也降级背景；代码文件正常渲染。
-    expect(section).toContain('背景文件');
-    expect(section).toContain('wakeflow-ledger/designs/arch-findings.md');
-    expect(section).not.toContain('arch-findings.md:23-23');
+    // L6-P22 / C61：md 有 snippet 时保留区间，但只进「文档 provenance 引用」节（retrieval-profile
+    // provenance 专用）——不成为「- 」可复制 ref、不输出可复制 coreCode、不泄露文档正文；代码文件正常渲染。
+    const provenance =
+      section.split('\n').find((line) => line.includes('arch-findings.md:23-23')) ?? '';
+    expect(provenance).toContain('文档 provenance 引用');
+    expect(provenance).toContain('不可作 coreCode');
+    expect(section).not.toMatch(/^- wakeflow-ledger\//m);
+    expect(section).not.toContain('可复制 coreCode(来源 wakeflow-ledger/');
     expect(section).not.toContain('audit finding');
     expect(section).toContain('src/alpha.ts:2-4');
   });

@@ -23,8 +23,14 @@
  */
 
 import { describeSubmitToolFields, renderGuidance } from '@alembic/core/knowledge';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
-import { type EvidenceEntry, isDocEvidencePath } from '../evidence/EvidenceCollector.js';
+import {
+  type CodeSnippet,
+  type EvidenceEntry,
+  isDocEvidencePath,
+} from '../evidence/EvidenceCollector.js';
 import { buildProducerFindingsSection } from './producerFindings.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -569,15 +575,78 @@ function truncateCodeVerbatim(content: string, maxChars: number): string {
 // 代码上下文注入 (Producer v2 辅助)
 // ──────────────────────────────────────────────────────────────────
 
+/** 证据段总预算（字符）：引用行与「可复制 coreCode」行共用。 */
+const CODE_CONTEXT_BUDGET = 1600;
+
 /**
- * 从 evidenceMap 构建 Producer 证据引用段（refs-first，有界）。
+ * 第一遍引用行的单独上限。引用行先于代码渲染，保证 rule/pattern 的「至少 3 个不同文件」有素材；
+ * 上限低于总预算，给第二遍的代码片段至少留出 CODE_CONTEXT_BUDGET - CODE_CONTEXT_REF_BUDGET 字符。
+ */
+const CODE_CONTEXT_REF_BUDGET = 960;
+
+/** 每个条目最多渲染的片段数（与 EvidenceCollector 每文件片段上限一致）。 */
+const MAX_RENDERED_SNIPPETS = 3;
+
+/** 每个片段注入的逐字代码前缀上限（字符）。 */
+const CORE_CODE_PREFIX_CHARS = 220;
+
+/** 文档 provenance 节、背景文件节与省略提示里最多列出的路径数。 */
+const MAX_LISTED_PATHS = 8;
+
+/** 已进入第一遍引用列表的代码证据条目及其在第二遍分到的代码行。 */
+interface RenderedEvidenceEntry {
+  entry: EvidenceEntry;
+  snippets: CodeSnippet[];
+  groundedRefs: string[];
+  refLine: string;
+  codeLines: string[];
+}
+
+/** 引用行的两种形态：紧凑形态只有 path:起-止 与 role；引用预算有余量时升级为带摘要的完整形态。 */
+function renderEvidenceRefLine(
+  entry: EvidenceEntry,
+  groundedRefs: readonly string[],
+  knownSummaries: ReadonlySet<string> | undefined,
+  withSummary: boolean
+): string {
+  const role = entry.role ? ` (${entry.role})` : '';
+  const summary =
+    withSummary && entry.summary && !knownSummaries?.has(entry.summary)
+      ? ` — ${limitText(entry.summary, 140)}`
+      : '';
+  return `- ${groundedRefs.join(', ')}${role}${summary}`;
+}
+
+/** 列表超出展示上限时只列前若干项，并写明未列出的数量（不静默截断）。 */
+function listPathsBounded(paths: readonly string[], separator = ', '): string {
+  const shown = paths.slice(0, MAX_LISTED_PATHS).join(separator);
+  const hidden = paths.length - MAX_LISTED_PATHS;
+  return hidden > 0 ? `${shown}（另有 ${hidden} 个未列出）` : shown;
+}
+
+/** 证据段的截断/降级诊断：只做旁路记录，日志器异常不得打断提示构建。 */
+function logEvidenceSectionDegraded(message: string): void {
+  observeSafely(
+    () => Logger.getInstance().info(message),
+    () => undefined
+  );
+}
+
+/**
+ * 从 evidenceMap 构建 Producer 证据引用段（refs-first，有界，两遍渲染）。
  *
- * - 条目按片段数降序遍历，直到累计 1600 字符预算用尽；每个非文档条目的前 3 个代码片段渲染为
- *   可逐字复制的 `path:起行-止行` 引用；文档类条目和没有行号片段的条目降为「背景文件」
- *   （最多列 8 个），明确不可用作 sourceRefs。
- * - 在 1600 字符的总预算内，为每个已渲染条目最多 3 个片段各注入不超过 220 字符的
- *   逐字代码前缀（「可复制 coreCode」），供候选照抄以通过 snippet-match 门禁；
- *   因此这里仍会注入短代码正文，只是不注入大段全文。
+ * - 分流：非文档且带行号片段的条目进入「可逐字复制」列表；带行号片段的文档条目单独成
+ *   「文档 provenance 引用」节，保留 `path:起-止` 但只可写入 reasoning.sources 作为 retrieval-profile
+ *   事实的 provenance，不输出可复制 coreCode、不计入 rule/pattern 的代码证据（L6-P22 / C61）；
+ *   没有任何行号片段的条目（含文档）才降为「背景文件(无行号)」，明确不可用作 sourceRefs。
+ * - 第一遍（L6-P22 / C60）：条目按片段数降序，先为每个代码条目渲染一行不带摘要的紧凑引用
+ *   `path:起-止`（每条最多 3 个片段），引用行有单独上限 CODE_CONTEXT_REF_BUDGET，放不下才整条省略；
+ *   再用引用预算余量按顺序补上摘要。覆盖优先，3 个满额文件（3 片段 × 30 行）的引用一定都在场。
+ * - 第二遍：用总预算 CODE_CONTEXT_BUDGET 扣除引用行后的剩余预算，按条目轮转注入「可复制 coreCode」
+ *   （每个文件先注入首片段，再轮到第 2、3 片段），每片段不超过 220 字符的逐字源码前缀，
+ *   供候选照抄以通过 snippet-match 门禁；代码行仍紧跟所属条目的引用行。
+ * - 预算耗尽时在段尾写明「另有 N 个证据文件因预算未展开…」与「因引用预算未列出」的数量，
+ *   并打 info 诊断（触发条件、条目数、两遍预算用量、被省略的路径），不再静默丢弃。
  * - 冷启动 insight Producer（buildProducerPromptV2）与 scan Producer（evaluation/stageBuilders）
  *   共用本函数；是否允许 Producer 再用 code.read 补读源码，由各自的系统提示与工具白名单决定，
  *   不由本函数决定。
@@ -594,34 +663,31 @@ export function buildCodeContextSection(
     '## 📄 Analyst evidence refs (bounded)',
     // 关键:证据 ref 直接呈现为门禁要求的 `path:起-止行` 形态，Producer 应把它们【逐字复制】进 sourceRefs
     // 与 content.markdown 的 (来源: path:行号)，务必带行号。rule/pattern 候选至少引用 3 个不同文件。
-    '下面每条是可【逐字复制】的接地引用(path:起行-止行)。把它们直接用作 sourceRefs 与 (来源: path:行号)，务必带行号；rule/pattern 至少引 3 个不同文件。缺精确短代码片段时用 Analyst 摘要完成候选或在总结列为 blocker，不要编造路径或行号。',
+    // 只有「- 」开头的行是可复制代码引用；段尾的文档 provenance 节与背景文件节各自写明用途限制。
+    '下面以「- 」开头的每条是可【逐字复制】的接地引用(path:起行-止行)。把它们直接用作 sourceRefs 与 (来源: path:行号)，务必带行号；rule/pattern 至少引 3 个不同文件。缺精确短代码片段时用 Analyst 摘要完成候选或在总结列为 blocker，不要编造路径或行号。',
   ];
-  let totalChars = 0;
-  const BUDGET = 1600;
 
   const sortedEntries = [...evidenceMap.values()]
     .filter((e) => e.filePath || e.summary || e.codeSnippets.length > 0)
     .sort((a, b) => b.codeSnippets.length - a.codeSnippets.length);
 
-  // 无行号片段的条目不能混进「可逐字复制」列表：裸路径被照抄进 sourceRefs 必触发
+  // 分流。无行号片段的条目不能混进「可逐字复制」列表：裸路径被照抄进 sourceRefs 必触发
   // SOURCE_REF_LINE_MISSING。降级为背景文件，显式告知不可用作 sourceRefs。
   const backgroundFiles: string[] = [];
-
+  // 文档类文件(md 等)绝不进可复制代码列表：协作/设计文档是二手描述，渲染成可复制 ref + coreCode 会诱导
+  // 模型提交「抄文档」候选（真机 architecture 维度曾因此 10 提交全拒）。但带精确区间的文档引用是
+  // retrieval profile 契约允许的 provenance（RECIPE_PRODUCTION_PROFILE_PROMPT），所以保留区间、单独成节。
+  const docProvenanceRefs: string[] = [];
+  const codeCandidates: Array<{
+    entry: EvidenceEntry;
+    snippets: CodeSnippet[];
+    groundedRefs: string[];
+  }> = [];
   for (const entry of sortedEntries) {
-    if (totalChars >= BUDGET) {
-      break;
-    }
-
-    // 文档类文件(md 等)一律降级背景：协作/设计文档是二手描述，渲染成可复制 ref 会诱导模型
-    // 提交「抄文档」候选（真机 architecture 维度曾因此 10 提交全拒）。
-    if (isDocEvidencePath(entry.filePath)) {
-      backgroundFiles.push(entry.filePath);
-      continue;
-    }
     // 旧写法 `path [L42-58]` 与门禁 SOURCE_REF_RE(`path:42-58`)不符，DeepSeek 常只复制路径、丢掉
-    // `[L42-58]`，触发 SOURCE_REF_LINE_MISSING(本次拒绝首因)。改为把每个行范围渲染成 `path:起-止`，
+    // `[L42-58]`，触发 SOURCE_REF_LINE_MISSING。改为把每个行范围渲染成 `path:起-止`，
     // 使证据引用可被逐字复制进候选、直接过门禁的行号与 snippet 匹配判据。
-    const snippets = entry.codeSnippets.slice(0, 3);
+    const snippets = entry.codeSnippets.slice(0, MAX_RENDERED_SNIPPETS);
     const groundedRefs = snippets.map(
       (snippet) => `${entry.filePath}:${snippet.startLine}-${snippet.endLine}`
     );
@@ -629,31 +695,123 @@ export function buildCodeContextSection(
       backgroundFiles.push(entry.filePath);
       continue;
     }
-    const refText = groundedRefs.join(', ');
-    const summary =
-      entry.summary && !knownSummaries?.has(entry.summary)
-        ? ` — ${limitText(entry.summary, 140)}`
-        : '';
-    const line = `- ${refText}${entry.role ? ` (${entry.role})` : ''}${summary}`;
-    parts.push(line);
-    totalChars += line.length;
-    // 每个片段都注入短代码正文，供 coreCode 逐字复制以过 snippet-match 门禁(旧 refs-first 只给 ref
-    // 不给代码 → SNIPPET_MISMATCH)。只注入首片段不够：R1 锚点补齐的深处片段常排在头部窗口之后，
-    // 而它才是 finding 真正引用的代码。截断保持 refs-first 的 token 约束。
-    for (const snippet of snippets) {
-      if (!snippet?.content?.trim() || totalChars >= BUDGET) {
-        break;
-      }
-      const code = truncateCodeVerbatim(snippet.content, 220);
-      const codeLine = `    可复制 coreCode(来源 ${entry.filePath}:${snippet.startLine}-${snippet.endLine}): ${code}`;
-      parts.push(codeLine);
-      totalChars += codeLine.length;
+    if (isDocEvidencePath(entry.filePath)) {
+      docProvenanceRefs.push(groundedRefs.join(', '));
+      continue;
+    }
+    codeCandidates.push({ entry, snippets, groundedRefs });
+  }
+
+  // 第一遍：引用行，覆盖优先。1a 先为每个条目放紧凑行（只有 path:起-止 与 role，不带摘要），放不下
+  // 才省略整条；首条永远保留，与旧实现“首条必渲染”的口径一致，避免超长路径让整段为空。
+  // 1b 再用引用预算的余量按顺序把紧凑行升级为带摘要的完整行——摘要只是辅助说明，不能挤掉别的文件引用。
+  const rendered: RenderedEvidenceEntry[] = [];
+  const refsDroppedPaths: string[] = [];
+  let refChars = 0;
+  for (const candidate of codeCandidates) {
+    const compact = renderEvidenceRefLine(
+      candidate.entry,
+      candidate.groundedRefs,
+      knownSummaries,
+      false
+    );
+    if (rendered.length > 0 && refChars + compact.length > CODE_CONTEXT_REF_BUDGET) {
+      refsDroppedPaths.push(candidate.entry.filePath);
+      continue;
+    }
+    rendered.push({
+      entry: candidate.entry,
+      snippets: candidate.snippets,
+      groundedRefs: candidate.groundedRefs,
+      refLine: compact,
+      codeLines: [],
+    });
+    refChars += compact.length;
+  }
+  let summariesDropped = 0;
+  for (const item of rendered) {
+    const full = renderEvidenceRefLine(item.entry, item.groundedRefs, knownSummaries, true);
+    const extra = full.length - item.refLine.length;
+    if (extra <= 0) {
+      continue;
+    }
+    if (refChars + extra <= CODE_CONTEXT_REF_BUDGET) {
+      item.refLine = full;
+      refChars += extra;
+    } else {
+      summariesDropped++;
     }
   }
 
+  // 第二遍：剩余预算按条目轮转注入可复制 coreCode。每个片段都可能是 finding 真正引用的代码
+  // （R1 锚点补齐的深处片段常排在头部窗口之后），轮转保证预算先覆盖更多文件而不是被前两个
+  // 满额文件吃光。沿用旧实现“先判预算再追加”的口径：最后一行可略超预算，代码截断保持逐字前缀。
+  const codeBudget = Math.max(0, CODE_CONTEXT_BUDGET - refChars);
+  let codeChars = 0;
+  let expandedSnippets = 0;
+  rounds: for (let round = 0; round < MAX_RENDERED_SNIPPETS; round++) {
+    for (const item of rendered) {
+      const snippet = item.snippets[round];
+      if (!snippet?.content?.trim()) {
+        continue;
+      }
+      if (codeChars >= codeBudget) {
+        break rounds;
+      }
+      const code = truncateCodeVerbatim(snippet.content, CORE_CODE_PREFIX_CHARS);
+      const codeLine = `    可复制 coreCode(来源 ${item.entry.filePath}:${snippet.startLine}-${snippet.endLine}): ${code}`;
+      item.codeLines.push(codeLine);
+      codeChars += codeLine.length;
+      expandedSnippets++;
+    }
+  }
+
+  // 有正文却因预算没注入代码的片段：它们的引用仍在上面，但不能据此编写 coreCode。
+  // 提示里只给数量——这些文件的引用行已在上方，重复列路径只会挤占提示预算。
+  const unexpandedFiles: string[] = [];
+  let expandableSnippets = 0;
+  for (const item of rendered) {
+    parts.push(item.refLine, ...item.codeLines);
+    const withContent = item.snippets.filter((snippet) => snippet?.content?.trim()).length;
+    expandableSnippets += withContent;
+    if (item.codeLines.length < withContent) {
+      unexpandedFiles.push(item.entry.filePath);
+    }
+  }
+
+  if (unexpandedFiles.length > 0) {
+    parts.push(
+      `另有 ${unexpandedFiles.length} 个证据文件因预算未展开部分可复制 coreCode（${expandableSnippets - expandedSnippets} 个片段只列引用）：这些引用仍可逐字用作 sourceRefs/(来源:)；coreCode 只能逐字复制上方已展开的片段，不要为未展开的引用编写代码。`
+    );
+  }
+  if (refsDroppedPaths.length > 0) {
+    // 不列出被省略文件的裸路径：裸路径被照抄进 sourceRefs 必触发 SOURCE_REF_LINE_MISSING。
+    parts.push(
+      `另有 ${refsDroppedPaths.length} 个证据文件因引用预算未列出：不要凭记忆为它们手写路径或行号。`
+    );
+  }
+  if (docProvenanceRefs.length > 0) {
+    parts.push(
+      `文档 provenance 引用(仅可逐字写入 reasoning.sources，作为 retrieval-profile 事实的 provenance；不可作 coreCode，不计入 rule/pattern 的 3 文件代码证据): ${listPathsBounded(docProvenanceRefs, '; ')}`
+    );
+  }
   if (backgroundFiles.length > 0) {
     parts.push(
-      `背景文件(无行号证据，绝不可用作 sourceRefs/(来源:)): ${backgroundFiles.slice(0, 8).join(', ')}`
+      `背景文件(无行号证据，绝不可用作 sourceRefs/(来源:)): ${listPathsBounded(backgroundFiles)}`
+    );
+  }
+
+  const listOverflow =
+    Math.max(0, docProvenanceRefs.length - MAX_LISTED_PATHS) +
+    Math.max(0, backgroundFiles.length - MAX_LISTED_PATHS);
+  if (
+    refsDroppedPaths.length > 0 ||
+    summariesDropped > 0 ||
+    unexpandedFiles.length > 0 ||
+    listOverflow > 0
+  ) {
+    logEvidenceSectionDegraded(
+      `[producer-evidence-refs] budget-exhausted codeEntries=${codeCandidates.length} refsListed=${rendered.length} refsDropped=${refsDroppedPaths.length} summariesDropped=${summariesDropped} codeExpanded=${expandedSnippets}/${expandableSnippets} unexpandedFiles=${unexpandedFiles.length} refChars=${refChars}/${CODE_CONTEXT_REF_BUDGET} codeChars=${codeChars}/${codeBudget} docProvenance=${docProvenanceRefs.length} background=${backgroundFiles.length} listOverflow=${listOverflow} droppedPaths=[${refsDroppedPaths.slice(0, MAX_LISTED_PATHS).join(', ')}] unexpandedPaths=[${unexpandedFiles.slice(0, MAX_LISTED_PATHS).join(', ')}]`
     );
   }
 
