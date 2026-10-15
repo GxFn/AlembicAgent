@@ -64,6 +64,7 @@
     ],
     "runtimeImports": {
       "src/agent/evidence/loopLedger.ts": [
+        "@alembic/core/dimensions",
         "src/shared/observers.ts",
         "src/agent/evidence/EvidenceLedgerStore.ts",
         "src/agent/evidence/ProductionEvidenceLedgerAuthority.ts"

@@ -1,3 +1,4 @@
+import { SYNTHESIS_DIM_IDS } from '@alembic/core/dimensions';
 import { observeSafely } from '#shared/observers.js';
 import { type EvidenceLedgerStore, seedLedgerFromJobSiblings } from './EvidenceLedgerStore.js';
 import {
@@ -54,7 +55,9 @@ export function openLoopEvidence(options: {
     });
     const store = resolveProductionEvidenceLedgerStore(authority);
     // 仅合成维度空台账 seed 兄弟证据；后续循环 hydrate 到非空台账后不重复写入。
-    if (dimensionId === 'cross-dimension-synthesis' && store.stats().entries === 0) {
+    // 合成维度集合以 Core 公开的 SYNTHESIS_DIM_IDS 为单源，Core 新增或改名合成维度时这里同步生效。
+    const isSynthesisDimension = SYNTHESIS_DIM_IDS.some((id) => id === dimensionId);
+    if (isSynthesisDimension && store.stats().entries === 0) {
       const seeded = seedLedgerFromJobSiblings(store, {
         dataRoot: options.dataRoot,
         jobId,
@@ -67,10 +70,14 @@ export function openLoopEvidence(options: {
         )
       );
     }
-    observe('schema-ready', () =>
-      options.logger.info(
-        '[AgentRuntime] dimension submit schema variant active (evidenceRefs required, per-iteration)'
-      )
+    // 这里只陈述台账事实。submit schema 变体是否生效取决于之后的 schema 投影，
+    // 由 AgentRuntime 在投影完成后按实际结果记录，不能在打开台账时提前断言。
+    observe('opened', () =>
+      options.logger.info('[EvidenceLedger] production ledger opened', {
+        jobId,
+        dimensionId,
+        entries: store.stats().entries,
+      })
     );
     return store;
   } catch (err: unknown) {

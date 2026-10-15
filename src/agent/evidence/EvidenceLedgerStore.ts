@@ -12,15 +12,22 @@
  * - 单条 content 超 EVIDENCE_ENTRY_MAX_CHARS 保头截断并附显式标记；contentHash 按
  *   「落盘后内容」计算——E5 新鲜度终检重切同范围、同截断策略后比对，保证同一把尺；
  * - 构造时文件已存在则回读（run 中断重建/断点续跑场景），不合法行整条丢弃（宽进严出），
- *   seq 续接最大序号不重号。
+ *   seq 续接最大序号不重号；contentHash 只认 canonical `sha256:<hex>`，历史 domain-separated
+ *   裸 hex 与任意错哈希同样按 authority 污染丢弃（生产打开即 fail closed，不存在兼容保留）；
+ * - 追加前若文件末字节不是换行（上次短写留下残行），先补一个换行再写，新条目自成一行，
+ *   残行仍由 hydrate 记为 line-N:json 供 strict/生产闸门 fail closed。
  */
 import { createHash } from 'node:crypto';
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   statSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -79,10 +86,6 @@ export interface EvidenceContentTransformation {
  */
 export function hashEvidenceContent(content: string): string {
   return `sha256:${createHash('sha256').update(content).digest('hex')}`;
-}
-
-function hashLegacyEvidenceContent(content: string): string {
-  return createHash('sha256').update(`evidence-ledger:v1:${content}`).digest('hex');
 }
 
 /** 确定性序列化：顶层 key 字母序 + 单行——保证 JSONL 可重放与字节级比对 */
@@ -431,10 +434,11 @@ export class EvidenceLedgerStore {
         continue;
       }
       if (parsed.contentHash !== hashEvidenceContent(parsed.content)) {
+        // 任何非 canonical 哈希（含历史 domain-separated 裸 hex）都按 authority 污染整行丢弃。
+        // 两处生产构造点（production authority 打开、兄弟台账 seed）都会对该问题 fail closed，
+        // 旧哈希“记问题但保留在宽松视图”的兼容分支从未在生产生效，因此不再保留。
         this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:authority`);
-        if (parsed.contentHash !== hashLegacyEvidenceContent(parsed.content)) {
-          continue;
-        }
+        continue;
       }
       if (this.#entries.has(parsed.id)) {
         this.#hydrateIntegrityIssues.push(`line-${lineIndex + 1}:duplicate-id`);
@@ -469,7 +473,66 @@ export class EvidenceLedgerStore {
       mkdirSync(dirname(this.filePath), { recursive: true });
       this.#dirReady = true;
     }
+    this.#terminatePartialTail(entry.id);
     appendFileSync(this.filePath, `${stableStringifyEntry(entry)}\n`, 'utf8');
+  }
+
+  /**
+   * 残行收尾：上次 append 若因 ENOSPC/EDQUOT/EIO 短写后抛错，文件尾会留下没有换行的半行。
+   * 循环采集路径（EvidenceCapture → append）不经 capture facet 的健康闸门，若直接追加，
+   * 新条目会被拼进半行变成一整条坏 JSON：本实例已回执给模型的 E-n 在重开后读不到。
+   * 这里只在文件非空且末字节不是 '\n' 时补一个换行，让新条目独占一行；残行本身保持原样，
+   * hydrate 仍把它记为 line-N:json，strict snapshot 与生产闸门照旧 fail closed。
+   * 补写失败直接抛出，由 append 按写失败处理（不消耗序号，下次调用重新检查）。
+   */
+  #terminatePartialTail(nextEvidenceId: string): void {
+    if (!existsSync(this.filePath)) {
+      return;
+    }
+    const fd = openSync(this.filePath, 'r');
+    let size = 0;
+    let endsWithNewline = true;
+    try {
+      size = fstatSync(fd).size;
+      if (size > 0) {
+        const last = Buffer.alloc(1);
+        // 读不到字节（stat 后被并发截断）时视为无需补写，不凭空制造空行。
+        const bytesRead = readSync(fd, last, 0, 1, size - 1);
+        endsWithNewline = bytesRead === 0 || last[0] === 0x0a;
+      }
+    } finally {
+      closeSync(fd);
+    }
+    if (endsWithNewline) {
+      return;
+    }
+    const diagnostic = {
+      filePath: this.filePath,
+      reason: 'last-byte-not-newline',
+      fileSize: size,
+      evidenceId: nextEvidenceId,
+    };
+    try {
+      appendFileSync(this.filePath, '\n', 'utf8');
+    } catch (err: unknown) {
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            '[EvidenceLedger] partial tail line detected before append; newline padding failed',
+            { ...diagnostic, error: err instanceof Error ? err.message : String(err) }
+          ),
+        () => undefined
+      );
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          '[EvidenceLedger] partial tail line detected before append; newline padded',
+          diagnostic
+        ),
+      () => undefined
+    );
   }
 }
 
@@ -509,7 +572,9 @@ export function seedLedgerFromJobSiblings(
     return 0;
   }
   let seeded = 0;
-  for (const name of readdirSync(dir)) {
+  // 按文件名码元序遍历：seed 依此顺序 append 分配连续 E-n，readdirSync 的目录序随文件系统
+  // 而变（APFS、ext4 哈希序等），不排序会让同一组兄弟台账在不同机器上得到不同的 E-n 映射。
+  for (const name of [...readdirSync(dir)].sort()) {
     if (!name.endsWith('.jsonl') || name === `${options.selfDimensionId}.jsonl`) {
       continue;
     }

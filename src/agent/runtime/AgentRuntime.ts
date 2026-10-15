@@ -985,6 +985,9 @@ export class AgentRuntime {
           'capabilities resolved tool ids but schema projection is empty (container capabilityCatalog missing/miswired?)',
       });
     }
+    if (evidenceLedger) {
+      this.#logDimensionSubmitSchemaVariant(evidenceLedger, toolSchemas);
+    }
 
     const ctx = new LoopContext({
       resourceRunId: toolResourceRun.getStore()?.runId,
@@ -1233,6 +1236,37 @@ export class AgentRuntime {
       dynamicContext,
       compactResult: mergedCompact,
     };
+  }
+
+  /**
+   * 维度运行（台账在场）的 submit schema 变体只能在投影之后判断：变体由 #getIterationToolSchemas
+   * 每轮对投影施加，只命中单动作 knowledge.submit 展开形态；投影里没有 knowledge（分析阶段、
+   * 宿主未接线）或只有多动作摘要形态时变体不生效。这里用同一个 applyDimensionSubmitSchemaVariant
+   * 试算一次（命中时返回克隆、未命中返回原对象），据此如实记录 active / not applied，
+   * 不再由打开台账处无条件声称 active。record-only 轮次会进一步收窄广告面，日志措辞说明这一点。
+   * 日志只是旁路观察：观察器失败不能改变运行结果。
+   */
+  #logDimensionSubmitSchemaVariant(
+    evidenceLedger: { readonly filePath: string },
+    toolSchemas: Array<Record<string, unknown>>
+  ): void {
+    const applied = applyDimensionSubmitSchemaVariant(toolSchemas).some(
+      (schema, index) => schema !== toolSchemas[index]
+    );
+    const meta = {
+      dimensionId: basename(evidenceLedger.filePath, '.jsonl'),
+      knowledgeProjected: toolSchemas.some((schema) => schema.name === 'knowledge'),
+    };
+    observeSafely(
+      () =>
+        this.logger.info(
+          applied
+            ? '[AgentRuntime] dimension submit schema variant active (evidenceRefs required on knowledge.submit; record-only iterations narrow the surface)'
+            : '[AgentRuntime] dimension submit schema variant not applied: projection has no single-action knowledge.submit schema',
+          meta
+        ),
+      () => undefined
+    );
   }
 
   #getIterationToolSchemas(ctx: LoopContext, toolChoice: string): Array<Record<string, unknown>> {

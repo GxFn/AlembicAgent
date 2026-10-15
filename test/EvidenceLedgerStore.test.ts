@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, test, vi } from 'vitest';
 import {
   EVIDENCE_TRUNCATION_MARKER,
@@ -218,8 +219,8 @@ describe('EvidenceLedgerStore', () => {
       corrupt: (entry: Record<string, unknown>) => '{not-json',
     },
     {
+      // 历史 domain-separated 裸 hex 不再有兼容保留：与任意错哈希一样整行丢弃并记 authority 问题。
       name: 'legacy content hash',
-      retainsForCompatibility: true,
       corrupt: (entry: Record<string, unknown>) =>
         JSON.stringify({
           ...entry,
@@ -238,7 +239,7 @@ describe('EvidenceLedgerStore', () => {
       name: 'duplicate id',
       corrupt: (entry: Record<string, unknown>) => JSON.stringify(entry),
     },
-  ])('strict snapshot 对 $name hydrate 污染失败关闭', ({ corrupt, retainsForCompatibility }) => {
+  ])('strict snapshot 对 $name hydrate 污染失败关闭', ({ corrupt }) => {
     const { dataRoot, store } = makeStore();
     store.append({ tool: 'code.read', callId: 'c1', file: 'lib/a.ts', content: 'a' });
     const entry = JSON.parse(fs.readFileSync(store.filePath, 'utf8').trim()) as Record<
@@ -254,9 +255,8 @@ describe('EvidenceLedgerStore', () => {
       dimensionId: 'ts-js-module',
     });
     expect(resumed.get('E-1')?.content).toBe('a');
-    if (retainsForCompatibility) {
-      expect(resumed.get('E-2')?.content).toBe('a');
-    }
+    // 污染行一律不进入宽松查询视图（含旧哈希行）；只有合法首行可读。
+    expect(resumed.get('E-2')).toBeNull();
     expect(() => resumed.listStrictSnapshotEntries()).toThrow(
       'EVIDENCE_LEDGER_STRICT_SNAPSHOT_INVALID'
     );
@@ -525,4 +525,130 @@ test('production ledger stores fully masked tool output while preserving freshne
   expect(JSON.parse(persisted.content)).toEqual({ stdout: 'password="[redacted]"', normal: 7 });
   expect(entry.content).toBe(persisted.content);
   expect(store.checkFreshness(entry.id, source)).toBe('fresh');
+});
+
+describe('EvidenceLedgerStore partial tail repair', () => {
+  it('pads a short-written tail line so the next appended entry survives a reopen', () => {
+    const coordinates = ledgerCoordinates();
+    const store = new EvidenceLedgerStore(coordinates);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    store.append({ tool: 'code.read', callId: 'first', content: 'first' });
+    // 正常收尾的文件不需要补换行，也不应产生诊断。
+    expect(warn).not.toHaveBeenCalled();
+    // 模拟 ENOSPC/EIO 等短写：上一次写入只落下半行，没有结尾换行。
+    fs.appendFileSync(store.filePath, '{"callId":"partial","capt', 'utf8');
+
+    const second = store.append({ tool: 'code.read', callId: 'second', content: 'second' });
+
+    expect(second.id).toBe('E-2');
+    expect(fs.readFileSync(store.filePath, 'utf8').split('\n')).toHaveLength(4);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('partial tail line'),
+      expect.objectContaining({
+        filePath: store.filePath,
+        reason: 'last-byte-not-newline',
+        evidenceId: 'E-2',
+      })
+    );
+    const reopened = new EvidenceLedgerStore(coordinates);
+    expect(reopened.get('E-2')).toMatchObject({ callId: 'second', content: 'second' });
+    // 残行本身仍是可见的完整性问题：strict / production 路径继续 fail closed。
+    expect(() => reopened.listStrictSnapshotEntries()).toThrow('line-2:json');
+  });
+
+  it('pads a tail entry whose JSON landed without its newline instead of concatenating', () => {
+    const coordinates = ledgerCoordinates();
+    const store = new EvidenceLedgerStore(coordinates);
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const first = store.append({ tool: 'code.read', callId: 'first', content: 'first' });
+    // 条目 JSON 完整落盘但结尾换行丢失：补换行后两条都应在重开时可读。
+    fs.writeFileSync(store.filePath, JSON.stringify(first), 'utf8');
+
+    const second = new EvidenceLedgerStore(coordinates).append({
+      tool: 'code.read',
+      callId: 'second',
+      content: 'second',
+    });
+
+    expect(second.id).toBe('E-2');
+    const reopened = new EvidenceLedgerStore(coordinates);
+    expect(reopened.listStrictSnapshotEntries().map((entry) => entry.callId)).toEqual([
+      'first',
+      'second',
+    ]);
+  });
+});
+
+describe('seedLedgerFromJobSiblings ordering', () => {
+  it('seeds sibling ledgers in ascending dimension-name order regardless of directory order', () => {
+    const coordinates = ledgerCoordinates();
+    for (const dimensionId of ['zeta', 'alpha', 'mid']) {
+      new EvidenceLedgerStore({ ...coordinates, dimensionId }).append({
+        tool: 'code.read',
+        callId: `${dimensionId}-read`,
+        content: `${dimensionId} content`,
+      });
+    }
+    const jobDir = path.join(coordinates.dataRoot, '.asd', 'evidence-ledger', coordinates.jobId);
+    const readdir = fs.readdirSync;
+    // 固定一个非字典序的目录序，模拟不同文件系统的 readdir 返回顺序。
+    vi.spyOn(fs, 'readdirSync').mockImplementation(((dir: fs.PathLike, ...args: unknown[]) => {
+      const names = Reflect.apply(readdir, fs, [dir, ...args]) as string[];
+      return String(dir) === jobDir ? [...names].sort().reverse() : names;
+    }) as typeof fs.readdirSync);
+    syncBuiltinESMExports();
+    const target = new EvidenceLedgerStore({ ...coordinates, dimensionId: 'synthesis' });
+
+    expect(
+      seedLedgerFromJobSiblings(target, { ...coordinates, selfDimensionId: 'synthesis' })
+    ).toBe(3);
+
+    expect(target.listRecent(10).map((entry) => [entry.id, entry.callId])).toEqual([
+      ['E-1', 'seed:alpha:E-1'],
+      ['E-2', 'seed:mid:E-1'],
+      ['E-3', 'seed:zeta:E-1'],
+    ]);
+  });
+});
+
+describe('EvidenceLedgerStore partial tail repair failure', () => {
+  it('fails the append without consuming an id when the newline padding cannot be written', () => {
+    const coordinates = ledgerCoordinates();
+    const store = new EvidenceLedgerStore(coordinates);
+    store.append({ tool: 'code.read', callId: 'first', content: 'first' });
+    fs.appendFileSync(store.filePath, '{"callId":"partial"', 'utf8');
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const append = fs.appendFileSync;
+    const spy = vi.spyOn(fs, 'appendFileSync').mockImplementation(((
+      file: fs.PathOrFileDescriptor,
+      data: string | Uint8Array,
+      ...args: unknown[]
+    ) => {
+      if (String(file) === store.filePath && data === '\n') {
+        throw new Error('fixture ENOSPC while padding');
+      }
+      return Reflect.apply(append, fs, [file, data, ...args]);
+    }) as typeof fs.appendFileSync);
+    syncBuiltinESMExports();
+
+    expect(() =>
+      store.append({ tool: 'code.read', callId: 'blocked', content: 'blocked' })
+    ).toThrow('fixture ENOSPC while padding');
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('newline padding failed'),
+      expect.objectContaining({
+        filePath: store.filePath,
+        reason: 'last-byte-not-newline',
+        evidenceId: 'E-2',
+        error: 'fixture ENOSPC while padding',
+      })
+    );
+
+    spy.mockRestore();
+    syncBuiltinESMExports();
+    // 补写恢复后重试：序号未被失败调用消耗，条目独占一行且重开可读。
+    const retried = store.append({ tool: 'code.read', callId: 'retried', content: 'retried' });
+    expect(retried.id).toBe('E-2');
+    expect(new EvidenceLedgerStore(coordinates).get('E-2')?.callId).toBe('retried');
+  });
 });

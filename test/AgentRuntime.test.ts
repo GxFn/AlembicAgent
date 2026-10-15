@@ -10,6 +10,7 @@ import { produceForcedSummary } from '../src/agent/runtime/forcedSummary.js';
 import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
+import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
 
 function createRuntimeForReactLoop() {
   const chatWithTools = vi.fn(async () => ({
@@ -25,6 +26,22 @@ function createRuntimeForReactLoop() {
     strategy: { name: 'unused', execute: vi.fn() } as never,
   });
   return { runtime, chatWithTools };
+}
+
+/**
+ * 只暴露给定 schema 的旧式 capabilityCatalog 端口：让 additionalTools 中的工具真实进入本轮投影，
+ * 用于驱动“投影后才判定”的 submit schema 变体日志。
+ */
+function createSchemaCatalogContainer(schemas: Array<Record<string, unknown>>) {
+  return {
+    get: (name: string) =>
+      name === 'capabilityCatalog'
+        ? {
+            toToolSchemas: (ids?: readonly string[] | null) =>
+              schemas.filter((schema) => ids?.includes(String(schema.name))),
+          }
+        : undefined,
+  };
 }
 
 function createExitingTracker() {
@@ -249,6 +266,9 @@ describe('agent runtime forced summary suppression', () => {
     const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-ledger-'));
     const chatWithTools = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
     const releaseScope = vi.fn();
+    // submit schema 变体日志只在投影真含单动作 knowledge.submit 时输出；schema-info 模式必须
+    // 提供该投影，否则观察器根本不会被调用，用例就测不到“观察器失败不改变运行结果”。
+    const schemaInfo = mode === 'valid-schema-info';
     const runtime = new AgentRuntime({
       id: 'session:agent-runtime-ledger',
       dataRoot,
@@ -256,17 +276,26 @@ describe('agent runtime forced summary suppression', () => {
       aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
       toolRegistry: { getManifest: () => null } as never,
       toolRouter: { execute: vi.fn(), releaseScope } as never,
+      ...(schemaInfo
+        ? {
+            container: createSchemaCatalogContainer(
+              generateLightweightSchemas({ knowledge: ['submit'] })
+            ),
+            additionalTools: ['knowledge'],
+          }
+        : {}),
       capabilities: [],
       strategy: { name: 'unused', execute: vi.fn() } as never,
     });
+    let observerFailures = 0;
     runtime.logger = {
       info: (message) => {
         if (
-          (mode === 'valid-schema-info' &&
-            String(message).includes('dimension submit schema variant active')) ||
+          (schemaInfo && String(message).includes('dimension submit schema variant active')) ||
           (mode === 'valid-seed-info' &&
             String(message).includes('[EvidenceLedger] synthesis seeded'))
         ) {
+          observerFailures += 1;
           throw new Error('Initialization info observer failed');
         }
       },
@@ -298,12 +327,119 @@ describe('agent runtime forced summary suppression', () => {
       } else {
         expect((await pending).reply).toBe('done');
         expect(chatWithTools).toHaveBeenCalledOnce();
+        // 有效模式下目标观察器必须真的被触发并失败过一次，结果仍保持成功。
+        expect(observerFailures).toBe(1);
       }
       expect(releaseScope).toHaveBeenCalledWith({ runId: expect.any(String) });
     } finally {
       rmSync(dataRoot, { force: true, recursive: true });
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    { name: 'no knowledge tool', tools: null, active: false, knowledgeProjected: false },
+    {
+      name: 'multi-action knowledge summary',
+      tools: { knowledge: null },
+      active: false,
+      knowledgeProjected: true,
+    },
+    {
+      name: 'single-action knowledge.submit',
+      tools: { knowledge: ['submit'] },
+      active: true,
+      knowledgeProjected: true,
+    },
+  ])('reports the dimension submit schema variant as active only when the projection applies it ($name)', async ({
+    tools,
+    active,
+    knowledgeProjected,
+  }) => {
+    const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-variant-log-'));
+    const chatWithTools = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    const runtime = new AgentRuntime({
+      id: 'session:agent-runtime-variant-log',
+      dataRoot,
+      jobId: 'job:agent-runtime-variant-log',
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn(), releaseScope: vi.fn() } as never,
+      ...(tools
+        ? {
+            container: createSchemaCatalogContainer(generateLightweightSchemas(tools)),
+            additionalTools: ['knowledge'],
+          }
+        : {}),
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    const infos: Array<{ message: string; meta: unknown }> = [];
+    runtime.logger = {
+      info: (message, meta) => {
+        infos.push({ message: String(message), meta });
+      },
+      warn: () => undefined,
+    };
+    try {
+      const result = await runtime.reactLoop('initialize dimension', {
+        source: 'system',
+        sharedState: {
+          _bootstrapSessionId: 'job:agent-runtime-variant-log',
+          _dimensionMeta: { id: 'valid-dimension' },
+        },
+        budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+      });
+      expect(result.reply).toBe('done');
+      const variantLogs = infos.filter(({ message }) => message.includes('schema variant'));
+      expect(variantLogs).toEqual([
+        {
+          message: active
+            ? '[AgentRuntime] dimension submit schema variant active (evidenceRefs required on knowledge.submit; record-only iterations narrow the surface)'
+            : '[AgentRuntime] dimension submit schema variant not applied: projection has no single-action knowledge.submit schema',
+          meta: { dimensionId: 'valid-dimension', knowledgeProjected },
+        },
+      ]);
+      // 台账打开日志只陈述事实（job、维度、条目数），不再代替 schema 投影做结论。
+      expect(infos).toContainEqual({
+        message: '[EvidenceLedger] production ledger opened',
+        meta: {
+          jobId: 'job:agent-runtime-variant-log',
+          dimensionId: 'valid-dimension',
+          entries: 0,
+        },
+      });
+    } finally {
+      rmSync(dataRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('does not log the dimension submit schema variant for runs without an evidence ledger', async () => {
+    const chatWithTools = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn(), releaseScope: vi.fn() } as never,
+      container: createSchemaCatalogContainer(
+        generateLightweightSchemas({ knowledge: ['submit'] })
+      ),
+      additionalTools: ['knowledge'],
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    const messages: string[] = [];
+    runtime.logger = {
+      info: (message) => {
+        messages.push(String(message));
+      },
+      warn: () => undefined,
+    };
+    const result = await runtime.reactLoop('plain run', {
+      source: 'system',
+      budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+    });
+    expect(result.reply).toBe('done');
+    expect(messages.filter((message) => message.includes('schema variant'))).toEqual([]);
   });
 
   it('rejects oversized LLM input before calling the provider', async () => {
