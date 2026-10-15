@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
@@ -255,7 +256,48 @@ const MAX_SOURCE_REFS = 80;
 const MAX_EVENT_SOURCE_REFS = 24;
 const MAX_GROUNDING_LEDGER = 32;
 const MAX_EVENT_GROUNDING_LEDGER = 8;
+/**
+ * I27：sourceRefDiagnostics 的条数上限。长分析运行里每次 code.read 的 import 路径、配置文件名都可能未命中
+ * 来源身份索引；不设上限时诊断随运行线性增长，每个进程事件都要全量克隆、规范化并序列化（探针 1200 条约 120KB）。
+ * 超出上限的不同诊断只计数，计数以 `dropped-source-ref-diagnostics:<n>` 写进 missingLinkReasons（见下方常量）。
+ */
+const MAX_SOURCE_REF_DIAGNOSTICS = 64;
+/** 进程事件只带摘要诊断的前若干条（与 sourceRefs 80→24 同一思路）；完整的有界列表留在运行结果的摘要里。 */
+const MAX_EVENT_SOURCE_REF_DIAGNOSTICS = 16;
+/** I27 聚合原因：存在未能解析到项目范围来源身份的引用（逐条明细见 sourceRefDiagnostics）。 */
+const UNRESOLVED_SOURCE_REFS_REASON = 'unresolved-source-refs';
+/** I27 聚合原因：存在按 basename 无法唯一定位的歧义引用。 */
+const AMBIGUOUS_SOURCE_REFS_REASON = 'ambiguous-source-refs';
+/**
+ * I27 截断计数原因的前缀，后接因上限被丢弃的不同诊断条数。PcvNodeEvidenceSummary 是公开导出类型，
+ * 本包不新增公开字段，因此丢弃计数借既有的 missingLinkReasons 承载；每个节点至多一条，随计数原位替换，
+ * 也让计数能随摘要序列化保留（反序列化后由 readDroppedSourceRefDiagnosticCount 恢复）。
+ */
+const DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX = 'dropped-source-ref-diagnostics:';
 const PCV_SOURCE_REF_INDEX = new WeakMap<PcvNodeEvidenceSummary, PcvProjectScopeSourceRefIndex>();
+
+/** 运行诊断出口：只取 LoopContext.diagnostics 的 warn，避免记录器依赖完整的 DiagnosticsCollector。 */
+type PcvDiagnosticSink = Pick<NonNullable<LoopContext['diagnostics']>, 'warn'>;
+
+/**
+ * I27：sourceRefDiagnostics 的侧表状态，不进入证据对象本身（证据是公开、可序列化的快照形状）。
+ * - keys：见过的诊断键，含已存入和因上限丢弃的，O(1) 去重，并让丢弃计数只统计不同条目；
+ * - dropped：因上限丢弃的不同诊断条数；
+ * - sink：只有 createPcvNodeEvidence 创建的运行期证据持有运行诊断出口；摘要克隆、质量门证据为 null，退回 Core Logger；
+ * - truncationReported / eventTruncationReported：两类截断各只上报一次，避免每个进程事件刷屏。
+ */
+interface PcvSourceRefDiagnosticState {
+  dropped: number;
+  eventTruncationReported: boolean;
+  keys: Set<string>;
+  sink: PcvDiagnosticSink | null;
+  truncationReported: boolean;
+}
+
+const PCV_SOURCE_REF_DIAGNOSTIC_STATE = new WeakMap<
+  PcvNodeEvidenceSummary,
+  PcvSourceRefDiagnosticState
+>();
 
 export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary {
   const dimensionMeta = asRecord(ctx.sharedState?._dimensionMeta);
@@ -345,6 +387,14 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
       trackerPhase,
     },
   };
+  // 运行期证据持有本次运行的诊断出口，诊断截断可直接进入运行诊断（LoopContext 先设 diagnostics 再建证据）。
+  PCV_SOURCE_REF_DIAGNOSTIC_STATE.set(evidence, {
+    dropped: 0,
+    eventTruncationReported: false,
+    keys: new Set<string>(),
+    sink: ctx.diagnostics ?? null,
+    truncationReported: false,
+  });
   attachPcvSourceRefIndex(evidence, ctx.context, ctx.sharedState);
   evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(evidence, rawRepairEvidencePaths);
   probeObservationLedger(ctx, evidence);
@@ -639,6 +689,8 @@ export function buildPcvNodeEvidenceSummary(
   options: { requireQualityGate?: boolean } = {}
 ): PcvNodeEvidenceSummary {
   const summary = cloneEvidence(evidence);
+  // 记录路径已按上限写入；这里兜住外部传入（宿主重组或旧形状）的超限摘要，保证输出始终有界。
+  enforceSourceRefDiagnosticCap(summary);
   normalizePcvEvidenceSourceRefs(summary);
   summary.sourceRefs = uniqueStrings(summary.sourceRefs).slice(0, MAX_SOURCE_REFS);
   summary.ledgerRefs = dedupeBy(summary.ledgerRefs, (item) => item.ref);
@@ -655,6 +707,13 @@ export function buildPcvNodeEvidenceProcessMetadata(
   evidence: PcvNodeEvidenceSummary
 ): PcvNodeEvidenceProcessMetadata {
   const summary = buildPcvNodeEvidenceSummary(evidence);
+  const sourceRefDiagnostics = summary.sourceRefDiagnostics.slice(
+    0,
+    MAX_EVENT_SOURCE_REF_DIAGNOSTICS
+  );
+  if (summary.sourceRefDiagnostics.length > sourceRefDiagnostics.length) {
+    reportEventSourceRefDiagnosticTruncation(evidence, summary.sourceRefDiagnostics.length);
+  }
   return {
     acceptedFindingRefs: summary.findingRefs.accepted.map((finding) => finding.ref),
     chainNodeId: summary.chainNodeId,
@@ -675,7 +734,7 @@ export function buildPcvNodeEvidenceProcessMetadata(
     rejectedFindingRefs: summary.findingRefs.rejected.map((finding) => finding.ref),
     repair: summary.repair,
     schemaVersion: 1,
-    sourceRefDiagnostics: summary.sourceRefDiagnostics,
+    sourceRefDiagnostics,
     sourceRefs: summary.sourceRefs.slice(0, MAX_EVENT_SOURCE_REFS),
     stageIdentity: summary.stageIdentity,
   };
@@ -1304,9 +1363,9 @@ function pushUniqueRejectedFinding(
 
 /**
  * I28：失败调用的参数路径不进入节点 sourceRefs（见 recordPcvToolResult），在 sourceRefDiagnostics 里记
- * `{ reason: 'failed-tool-call', status: 'missing' }` 留审计。刻意不镜像到 missingLinkReasons：
- * 同一路径之后可能被成功读取并正常链接，镜像成 missing-source-ref 会与 sourceRefs 自相矛盾；
- * 节点是否缺来源仍由派生原因 missing-source-refs 表达。
+ * `{ reason: 'failed-tool-call', status: 'missing' }` 留审计。刻意不记聚合原因 unresolved-source-refs：
+ * 同一路径之后可能被成功读取并正常链接，记成未解析会与 sourceRefs 自相矛盾；
+ * 节点是否缺来源仍由派生原因 missing-source-refs 表达。这些诊断同样受 I27 的条数上限与丢弃计数约束。
  */
 function recordFailedCallSourceRefs(
   evidence: PcvNodeEvidenceSummary,
@@ -1356,6 +1415,12 @@ function findProjectScopeSourceRefIndex(source: unknown): PcvProjectScopeSourceR
   return candidates.find(isProjectScopeSourceRefIndex) ?? null;
 }
 
+/**
+ * I27 已知缺口（待决事项③，本包不接线）：唯一生产宿主只注入 projectScopeSourceIdentityMap /
+ * _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），下面这些候选键在生产中没有写入方，
+ * 只有测试经 sourceIdentities / _sourceIdentities 注入；因此生产中来源身份索引为空、规范化走无索引分支。
+ * 接线宿主真实形状（含相对/绝对路径解析）与删除这些别名随事项③的决定一并处理，决定前保持原样。
+ */
 function collectCanonicalSourceIdentities(source: unknown): PcvCanonicalSourceIdentity[] {
   const record = asRecord(source);
   const candidates = [
@@ -1530,36 +1595,190 @@ function splitSourceRefLineSuffix(ref: string): { lineSuffix: string; path: stri
   };
 }
 
+/**
+ * I27：规范化未命中时，逐条明细进有上限的 sourceRefDiagnostics，missingLinkReasons 只记聚合原因
+ * （unresolved-source-refs / ambiguous-source-refs）。此前逐路径镜像成 `${status}-source-ref:${input}`，
+ * 原因集合随未命中引用线性膨胀，宿主报告按字符串取并集后被逐路径噪声淹没。
+ * 聚合原因在诊断因上限被丢弃时照样记录，“存在歧义/未解析引用”这一事实不会随截断丢失。
+ */
 function recordSourceRefDiagnostic(
   evidence: PcvNodeEvidenceSummary,
   diagnostic: PcvSourceRefDiagnostic
 ): void {
-  if (!pushSourceRefDiagnostic(evidence, diagnostic)) {
-    return;
-  }
-  evidence.missingLinkReasons = uniqueStrings([
-    ...evidence.missingLinkReasons,
-    `${diagnostic.status}-source-ref:${diagnostic.input}`,
-  ]);
+  pushSourceRefDiagnostic(evidence, diagnostic);
+  addMissingLinkReason(
+    evidence,
+    diagnostic.status === 'ambiguous' ? AMBIGUOUS_SOURCE_REFS_REASON : UNRESOLVED_SOURCE_REFS_REASON
+  );
 }
 
-/** 按 input/reason/status 去重写入 sourceRefDiagnostics；返回是否新增（已存在时不重复记录）。 */
+function addMissingLinkReason(evidence: PcvNodeEvidenceSummary, reason: string): void {
+  if (!evidence.missingLinkReasons.includes(reason)) {
+    evidence.missingLinkReasons = [...evidence.missingLinkReasons, reason];
+  }
+}
+
+/**
+ * 按 input/reason/status 去重写入 sourceRefDiagnostics（Set 键，O(1)）。已满 MAX_SOURCE_REF_DIAGNOSTICS 时
+ * 不再存入，只把这条不同诊断计入丢弃数；见过的键（含已丢弃的）不会重复计数。
+ */
 function pushSourceRefDiagnostic(
   evidence: PcvNodeEvidenceSummary,
   diagnostic: PcvSourceRefDiagnostic
-): boolean {
-  if (
-    evidence.sourceRefDiagnostics.some(
-      (item) =>
-        item.input === diagnostic.input &&
-        item.reason === diagnostic.reason &&
-        item.status === diagnostic.status
-    )
-  ) {
-    return false;
+): void {
+  const state = getSourceRefDiagnosticState(evidence);
+  const key = sourceRefDiagnosticKey(diagnostic);
+  if (state.keys.has(key)) {
+    return;
+  }
+  state.keys.add(key);
+  if (evidence.sourceRefDiagnostics.length >= MAX_SOURCE_REF_DIAGNOSTICS) {
+    recordDroppedSourceRefDiagnostics(evidence, state, 1, diagnostic.input);
+    return;
   }
   evidence.sourceRefDiagnostics.push(diagnostic);
-  return true;
+}
+
+/** 去重键。入参也可能是外部摘要里未经逐项校验的条目，非字符串字段按空串处理，不抛错。 */
+function sourceRefDiagnosticKey(
+  diagnostic: Partial<Record<keyof PcvSourceRefDiagnostic, unknown>>
+): string {
+  const part = (value: unknown) => (typeof value === 'string' ? value : '');
+  return `${part(diagnostic.status)}\u0000${part(diagnostic.reason)}\u0000${part(diagnostic.input)}`;
+}
+
+/**
+ * 取证据的诊断侧表状态。没有状态的证据来自反序列化摘要、fallback 或宿主传入的对象：键从已存诊断重建，
+ * 丢弃数从持久原因恢复。已丢弃条目的键不随摘要序列化，反序列化后再遇到同一引用会再计一次——只影响计数精度，
+ * 不影响上限；这一点在这里显式接受，而不是为精确计数新增公开字段。
+ */
+function getSourceRefDiagnosticState(
+  evidence: PcvNodeEvidenceSummary
+): PcvSourceRefDiagnosticState {
+  const existing = PCV_SOURCE_REF_DIAGNOSTIC_STATE.get(evidence);
+  if (existing) {
+    return existing;
+  }
+  const dropped = readDroppedSourceRefDiagnosticCount(evidence.missingLinkReasons);
+  const state: PcvSourceRefDiagnosticState = {
+    dropped,
+    eventTruncationReported: false,
+    keys: new Set(
+      (evidence.sourceRefDiagnostics || []).map((item) => sourceRefDiagnosticKey(asRecord(item)))
+    ),
+    sink: null,
+    // 恢复出的计数说明截断已在产生该摘要的运行里上报过，不再重复上报。
+    truncationReported: dropped > 0,
+  };
+  PCV_SOURCE_REF_DIAGNOSTIC_STATE.set(evidence, state);
+  return state;
+}
+
+function readDroppedSourceRefDiagnosticCount(reasons: readonly string[] | undefined): number {
+  for (const reason of reasons || []) {
+    if (
+      typeof reason !== 'string' ||
+      !reason.startsWith(DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX)
+    ) {
+      continue;
+    }
+    const count = Number(reason.slice(DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX.length));
+    if (Number.isSafeInteger(count) && count > 0) {
+      return count;
+    }
+  }
+  return 0;
+}
+
+/**
+ * 记一次（或一批）因上限丢弃的诊断：累加计数，原位替换唯一的计数原因，并在首次截断时上报一次诊断。
+ * firstDroppedInput 只用于上报文案，帮助定位从哪条引用开始被截断。
+ */
+function recordDroppedSourceRefDiagnostics(
+  evidence: PcvNodeEvidenceSummary,
+  state: PcvSourceRefDiagnosticState,
+  count: number,
+  firstDroppedInput: string | null
+): void {
+  state.dropped += count;
+  // 外部传入的摘要可能夹带非字符串原因（结构守卫只校验是数组）；这里只替换计数原因，其余原样留给
+  // buildMissingLinkReasons 的 uniqueStrings 统一过滤，不在此处抛错。
+  evidence.missingLinkReasons = [
+    ...evidence.missingLinkReasons.filter(
+      (reason) =>
+        typeof reason !== 'string' ||
+        !reason.startsWith(DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX)
+    ),
+    `${DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX}${state.dropped}`,
+  ];
+  if (state.truncationReported) {
+    return;
+  }
+  state.truncationReported = true;
+  reportPcvSourceRefDiagnostic(evidence, state, {
+    code: 'pcv_source_ref_diagnostics_truncated',
+    message: limitText(
+      `sourceRefDiagnostics for PCV node ${evidence.nodeId} reached the cap of ${MAX_SOURCE_REF_DIAGNOSTICS}; ` +
+        `further distinct diagnostics are counted in missingLinkReasons ` +
+        `(${DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX}<n>) instead of stored` +
+        (firstDroppedInput ? `; first dropped input: ${firstDroppedInput}` : ''),
+      400
+    ),
+  });
+}
+
+/** 摘要输出前兜底截断：外部传入的超限诊断列表只保留前 MAX_SOURCE_REF_DIAGNOSTICS 条，其余计入丢弃数。 */
+function enforceSourceRefDiagnosticCap(evidence: PcvNodeEvidenceSummary): void {
+  const overflow = evidence.sourceRefDiagnostics.length - MAX_SOURCE_REF_DIAGNOSTICS;
+  if (overflow <= 0) {
+    return;
+  }
+  // 先建状态（键覆盖截断前的全部条目），被截掉的条目之后再出现也不会重复计数。
+  const state = getSourceRefDiagnosticState(evidence);
+  const firstDroppedInput =
+    evidence.sourceRefDiagnostics[MAX_SOURCE_REF_DIAGNOSTICS]?.input ?? null;
+  evidence.sourceRefDiagnostics = evidence.sourceRefDiagnostics.slice(
+    0,
+    MAX_SOURCE_REF_DIAGNOSTICS
+  );
+  recordDroppedSourceRefDiagnostics(evidence, state, overflow, firstDroppedInput);
+}
+
+/**
+ * 进程事件投影只带前 MAX_EVENT_SOURCE_REF_DIAGNOSTICS 条诊断；首次发生时对该节点证据上报一次，
+ * 说明完整的有界列表在运行结果的 pcvNodeEvidence 摘要里。状态挂在调用方传入的证据（运行期为 ctx.pcvNodeEvidence）上。
+ */
+function reportEventSourceRefDiagnosticTruncation(
+  evidence: PcvNodeEvidenceSummary,
+  total: number
+): void {
+  const state = getSourceRefDiagnosticState(evidence);
+  if (state.eventTruncationReported) {
+    return;
+  }
+  state.eventTruncationReported = true;
+  reportPcvSourceRefDiagnostic(evidence, state, {
+    code: 'pcv_process_event_source_ref_diagnostics_truncated',
+    message:
+      `process events for PCV node ${evidence.nodeId} carry the first ${MAX_EVENT_SOURCE_REF_DIAGNOSTICS} ` +
+      `of ${total} sourceRefDiagnostics; the full bounded list stays in the run result pcvNodeEvidence summary`,
+  });
+}
+
+/** 有运行诊断出口时进运行诊断；没有（摘要克隆、质量门证据）时退回 Core Logger，保证截断总有可见记录。 */
+function reportPcvSourceRefDiagnostic(
+  evidence: PcvNodeEvidenceSummary,
+  state: PcvSourceRefDiagnosticState,
+  warning: { code: string; message: string }
+): void {
+  if (state.sink) {
+    state.sink.warn({
+      ...warning,
+      stage: evidence.stageIdentity.pipelinePhase ?? undefined,
+    });
+    return;
+  }
+  Logger.getInstance().warn(`[PcvNodeEvidence] ${warning.code}: ${warning.message}`);
 }
 
 function isProjectScopeSourceRefIndex(value: unknown): value is PcvProjectScopeSourceRefIndex {
@@ -1789,6 +2008,17 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
   const sourceRefIndex = PCV_SOURCE_REF_INDEX.get(evidence);
   if (sourceRefIndex) {
     PCV_SOURCE_REF_INDEX.set(cloned, sourceRefIndex);
+  }
+  const diagnosticState = PCV_SOURCE_REF_DIAGNOSTIC_STATE.get(evidence);
+  if (diagnosticState) {
+    // 键集合按值复制：克隆（摘要、质量门基底）后续记录的诊断不能回写原证据的去重状态。
+    // 复制成本是 O(不同诊断键数)，只复制引用，不序列化；有界的是对外输出与事件负载。
+    // 克隆不持有运行诊断出口，避免同一截断事实被多个副本重复上报。
+    PCV_SOURCE_REF_DIAGNOSTIC_STATE.set(cloned, {
+      ...diagnosticState,
+      keys: new Set(diagnosticState.keys),
+      sink: null,
+    });
   }
   return cloned;
 }

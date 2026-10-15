@@ -897,8 +897,12 @@ describe('agent runtime forced summary suppression', () => {
         }),
       ])
     );
-    expect(pcvEvidence.missingLinkReasons).toContain('ambiguous-source-ref:index.ts:3');
-    expect(pcvEvidence.missingLinkReasons).toContain(
+    // I27：missingLinkReasons 只带聚合原因，逐路径明细只在 sourceRefDiagnostics 里。
+    expect(pcvEvidence.missingLinkReasons).toEqual(
+      expect.arrayContaining(['ambiguous-source-refs', 'unresolved-source-refs'])
+    );
+    expect(pcvEvidence.missingLinkReasons).not.toContain('ambiguous-source-ref:index.ts:3');
+    expect(pcvEvidence.missingLinkReasons).not.toContain(
       'missing-source-ref:AlembicCore/src/core/database.ts'
     );
     expect(toolEnd?.metadata?.pcvNodeEvidence).toMatchObject({

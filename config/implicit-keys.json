@@ -125,7 +125,7 @@
     "_sourceIdentities": {
       "container": "sharedState",
       "writers": ["agent"],
-      "purpose": "规范来源身份。PipelineStrategy 从多个别名解析后写入阶段 sharedState；PCV 记录器读取。"
+      "purpose": "规范来源身份。PipelineStrategy 从多个别名解析后写入阶段 sharedState；PCV 记录器读取。上游未接线（I27，待决事项③）：PipelineStrategy 读取的 7 个别名在宿主侧没有写入方，唯一宿主只注入 projectScopeSourceIdentityMap / _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），本仓不识别，所以生产中本通道从不被写入值，PCV 来源规范化不生效，只有测试经别名注入。保留到事项③决定：接线宿主真实形状并删除其余别名，或确定由宿主事后归一化并删除 Agent 侧索引与别名。本通道有 agent 写入点，lint 不允许在有写入方的通道上登记 unwiredReason，因此上游未接线的原因记在这里。"
     },
     "_strictAnalysisLoopReceipt": {
       "container": "phaseResults",

@@ -2177,6 +2177,11 @@ export class PipelineStrategy extends Strategy {
       baseSharedState?._pcvChainNodes ??
       baseSharedState?.pcvChainNodes ??
       null;
+    // I27 已知缺口（待决事项③，本包不接线、不删除）：下面 stageNodeMap 的 3 个别名与 sourceIdentities 的
+    // 7 个别名在生产中都没有写入方。唯一宿主只注入 projectScopeSourceIdentityMap /
+    // _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），这里不识别，所以生产中
+    // sourceIdentities 恒为 null，下方的 _sourceIdentities 浅拷贝与上下文投影不生效，PCV 记录器拿不到来源身份；
+    // 只有测试经这些别名注入。接线宿主真实形状并删除别名随事项③的决定处理，决定前保持原样。
     const stageNodeMap =
       messageContext?.stageNodeMap ??
       strategyContext.stageNodeMap ??

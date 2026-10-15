@@ -459,9 +459,11 @@ describe('evidence recording quality gate actions', () => {
         expect.objectContaining({ input: 'index.ts:4', status: 'ambiguous' }),
       ])
     );
-    expect(evidence.missingLinkReasons).toEqual(
-      expect.arrayContaining(['ambiguous-source-ref:index.ts'])
-    );
+    // I27：缺失原因只保留聚合原因；逐路径明细留在 sourceRefDiagnostics，不再镜像进 missingLinkReasons。
+    expect(evidence.missingLinkReasons).toEqual(expect.arrayContaining(['ambiguous-source-refs']));
+    expect(
+      evidence.missingLinkReasons.some((reason) => reason.startsWith('ambiguous-source-ref:'))
+    ).toBe(false);
   });
 });
 
@@ -1238,5 +1240,232 @@ describe('PCV evidence detail corrections (I28)', () => {
         message: expect.stringContaining('ledger closed'),
       }),
     ]);
+  });
+});
+
+// I27：PCV 来源诊断上限先行。宿主真实形状 projectScopeSourceIdentityMap 的接线依赖待决事项③，
+// 这里仍经已识别的 sourceIdentities 通道注入身份索引，只验证诊断上限、去重计数、原因聚合与进程事件截断。
+describe('PCV source ref diagnostics cap (I27)', () => {
+  const sourceIdentities = [
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'Alembic',
+      projectScopeId: 'workspace',
+      sourcePath: 'lib/bootstrap.ts',
+    }),
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'AlembicCore',
+      projectScopeId: 'workspace',
+      sourcePath: 'index.ts',
+    }),
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'AlembicPlugin',
+      projectScopeId: 'workspace',
+      sourcePath: 'index.ts',
+    }),
+  ];
+
+  function createIndexedLoop(diagnostics = new DiagnosticsCollector()) {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('review code');
+    return new LoopContext({
+      messages,
+      capabilities: [],
+      baseSystemPrompt: 'review',
+      allowedToolIds: ['code'],
+      toolSchemas: [],
+      source: 'system',
+      budget: { maxIterations: 1 },
+      prompt: 'review code',
+      context: { pipelinePhase: 'analyze', dimensionId: 'probe', sourceIdentities },
+      diagnostics,
+    });
+  }
+
+  /** 每轮一次成功的 code.read：参数路径可解析，回执正文带 perRound 个项目范围外（不可解析）的路径。 */
+  function recordUnresolvedReads(ctx: LoopContext, rounds: number, perRound: number) {
+    for (let round = 0; round < rounds; round++) {
+      const paths = Array.from(
+        { length: perRound },
+        (_, index) => `vendor/missing/r${round}/file${index}.ts`
+      );
+      recordPcvToolResult(
+        ctx.pcvNodeEvidence,
+        {
+          id: `read-${round}`,
+          name: 'code',
+          args: { action: 'read', params: { path: 'Alembic/lib/bootstrap.ts' } },
+        },
+        { content: paths.join('\n') },
+        undefined,
+        { toolSucceeded: true }
+      );
+    }
+  }
+
+  function warningCount(diagnostics: DiagnosticsCollector, code: string): number {
+    return diagnostics.toJSON().warnings.filter((warning) => warning.code === code).length;
+  }
+
+  it('caps stored diagnostics at 64, counts distinct drops and aggregates missing link reasons', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const ctx = createIndexedLoop(diagnostics);
+    recordUnresolvedReads(ctx, 20, 60);
+    // 重放前两轮同一批未命中引用：Set 去重覆盖已丢弃的条目，丢弃计数不得再增长。
+    recordUnresolvedReads(ctx, 2, 60);
+
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).toEqual(['Alembic/lib/bootstrap.ts']);
+    expect(summary.sourceRefDiagnostics).toHaveLength(64);
+    expect(summary.sourceRefDiagnostics[0]).toEqual({
+      input: 'vendor/missing/r0/file0.ts',
+      reason: 'not-found',
+      status: 'missing',
+    });
+    expect(summary.missingLinkReasons).toContain('unresolved-source-refs');
+    expect(summary.missingLinkReasons).toContain('dropped-source-ref-diagnostics:1136');
+    expect(
+      summary.missingLinkReasons.filter((reason) => reason.startsWith('dropped-source-ref-'))
+    ).toHaveLength(1);
+    expect(
+      summary.missingLinkReasons.some((reason) => reason.startsWith('missing-source-ref:'))
+    ).toBe(false);
+    expect(summary.missingLinkReasons.length).toBeLessThanOrEqual(8);
+
+    const metadata = buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence);
+    expect(metadata.sourceRefDiagnostics.length).toBeLessThanOrEqual(64);
+    expect(metadata.sourceRefDiagnostics).toEqual(summary.sourceRefDiagnostics.slice(0, 16));
+    expect(metadata.missingLinkReasons).toEqual(summary.missingLinkReasons);
+    expect(JSON.stringify(metadata).length).toBeLessThan(8_000);
+
+    // 每个进程事件都会重建元数据；两类截断诊断对同一节点证据各只报一次。
+    buildPcvNodeEvidenceProcessMetadata(ctx.pcvNodeEvidence);
+    expect(warningCount(diagnostics, 'pcv_source_ref_diagnostics_truncated')).toBe(1);
+    expect(warningCount(diagnostics, 'pcv_process_event_source_ref_diagnostics_truncated')).toBe(1);
+    expect(
+      diagnostics
+        .toJSON()
+        .warnings.find((warning) => warning.code === 'pcv_source_ref_diagnostics_truncated')
+        ?.message
+    ).toContain('vendor/missing/r1/file4.ts');
+  });
+
+  it('keeps the ambiguous aggregate when the ambiguous diagnostic itself is dropped', () => {
+    const ctx = createIndexedLoop();
+    recordUnresolvedReads(ctx, 2, 40);
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      {
+        id: 'read-ambiguous',
+        name: 'code',
+        args: { action: 'read', params: { path: 'index.ts:9' } },
+      },
+      { content: 'export {};' },
+      undefined,
+      { toolSucceeded: true }
+    );
+
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefDiagnostics).toHaveLength(64);
+    expect(summary.sourceRefDiagnostics.some((item) => item.input === 'index.ts:9')).toBe(false);
+    expect(summary.missingLinkReasons).toEqual(
+      expect.arrayContaining([
+        'ambiguous-source-refs',
+        'unresolved-source-refs',
+        'dropped-source-ref-diagnostics:17',
+      ])
+    );
+  });
+
+  it('records failed-call diagnostics without the unresolved aggregate (I28 semantics kept)', () => {
+    const ctx = createIndexedLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      { id: 'read-blocked', name: 'code', args: { action: 'read', params: { path: 'src/x.ts' } } },
+      { error: 'Tool call blocked by hook' },
+      undefined,
+      { toolSucceeded: false }
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: 'src/x.ts', reason: 'failed-tool-call', status: 'missing' },
+    ]);
+    expect(summary.missingLinkReasons).not.toContain('unresolved-source-refs');
+    expect(summary.missingLinkReasons).toContain('missing-source-refs');
+  });
+
+  it('keeps the cap and restores the dropped count when a serialized summary feeds the gate', () => {
+    const ctx = createIndexedLoop();
+    recordUnresolvedReads(ctx, 2, 40);
+    const serialized = JSON.parse(JSON.stringify(ctx.buildResult().pcvNodeEvidence));
+    expect(serialized.missingLinkReasons).toContain('dropped-source-ref-diagnostics:16');
+
+    const quality = buildPcvQualityGateEvidence({
+      source: { pcvNodeEvidence: serialized },
+      artifact: {
+        referencedFiles: ['Alembic/lib/bootstrap.ts', 'vendor/extra/a.ts', 'vendor/extra/b.ts'],
+      },
+      dimId: 'probe',
+      gate: { pass: true, action: 'pass' },
+      sharedState: { _sourceIdentities: sourceIdentities },
+    });
+    expect(quality.sourceRefDiagnostics).toHaveLength(64);
+    expect(quality.missingLinkReasons).toContain('dropped-source-ref-diagnostics:18');
+    expect(
+      quality.missingLinkReasons.filter((reason) => reason.startsWith('dropped-source-ref-'))
+    ).toHaveLength(1);
+  });
+
+  it('trims an over-cap source summary and counts the trimmed diagnostics', () => {
+    const ctx = createIndexedLoop();
+    const overCap = {
+      ...ctx.buildResult().pcvNodeEvidence,
+      sourceRefDiagnostics: Array.from({ length: 100 }, (_, index) => ({
+        input: `external/${index}.ts`,
+        reason: 'not-found',
+        status: 'missing' as const,
+      })),
+    };
+    const quality = buildPcvQualityGateEvidence({
+      source: { pcvNodeEvidence: overCap },
+      artifact: { referencedFiles: ['Alembic/lib/bootstrap.ts'] },
+      dimId: 'probe',
+      gate: { pass: true, action: 'pass' },
+      sharedState: { _sourceIdentities: sourceIdentities },
+    });
+    expect(quality.sourceRefDiagnostics).toHaveLength(64);
+    expect(quality.sourceRefDiagnostics[63]?.input).toBe('external/63.ts');
+    expect(quality.missingLinkReasons).toContain('dropped-source-ref-diagnostics:36');
+  });
+
+  it('tolerates malformed reasons and diagnostic entries in an over-cap source summary', () => {
+    const ctx = createIndexedLoop();
+    const base = ctx.buildResult().pcvNodeEvidence;
+    // 结构守卫只校验这两个字段是数组；条目本身可能是宿主重组后的任意值，截断与计数不能因此抛错。
+    const malformed: Record<string, unknown> = {
+      ...base,
+      missingLinkReasons: [...base.missingLinkReasons, 42],
+      sourceRefDiagnostics: [
+        null,
+        ...Array.from({ length: 70 }, (_, index) => ({
+          input: `external/${index}.ts`,
+          reason: 'not-found',
+          status: 'missing',
+        })),
+      ],
+    };
+    const build = () =>
+      buildPcvQualityGateEvidence({
+        source: { pcvNodeEvidence: malformed },
+        artifact: { referencedFiles: ['Alembic/lib/bootstrap.ts'] },
+        dimId: 'probe',
+        gate: { pass: true, action: 'pass' },
+        sharedState: { _sourceIdentities: sourceIdentities },
+      });
+    expect(build).not.toThrow();
+    const quality = build();
+    expect(quality.missingLinkReasons).not.toContain('invalid-source-pcv-evidence');
+    expect(quality.sourceRefDiagnostics).toHaveLength(64);
+    expect(quality.missingLinkReasons).toContain('dropped-source-ref-diagnostics:7');
+    expect(quality.missingLinkReasons.every((reason) => typeof reason === 'string')).toBe(true);
   });
 });
