@@ -18,6 +18,7 @@ import {
 import {
   collectSourceFileReceipts,
   createEvaluationRecipeGateway,
+  formatJudgeDiagnostic,
 } from '../scripts/lib/mining-eval-runtime.mjs';
 import {
   assertFrozenJudgeModelLoadReceiptV1,
@@ -501,5 +502,231 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
         provider,
       })
     ).toThrow(/STRICT_FIXTURE_SOURCE_HASH_MISMATCH/u);
+  });
+});
+
+/* ── L7-P24：离线 judge 单行来源与诊断（C17 / C44） ─────────────────────────────────────────
+ * C17：生产门禁（Core SOURCE_REF_RE、recipeProductionAdapter、verifyJudgeCitations）都接受 file:N，
+ * judge 切片与校准收据也必须接受，否则单行来源被静默丢弃、judge 被迫按“无证据”判 reject；
+ * 先过滤后截断，无效来源不能占用 maxSlices 名额。
+ * C44：被跳过的来源、无可读切片、裁决解析失败都要带原因码上报，脚本逐条打印。 */
+describe('mining-judge — 单行来源与跳过/解析诊断(L7-P24)', () => {
+  function makeProject(): string {
+    const root = mkdtempSync(join(tmpdir(), 'judge-p24-'));
+    tempRoots.push(root);
+    writeFileSync(join(root, 'file.ts'), 'l1\nl2\nl3\nl4\nl5\n');
+    return root;
+  }
+
+  const UPHOLD_CITING_LINE_3 = JSON.stringify({
+    entailment: 'entailed',
+    trivial: false,
+    actionable: true,
+    scopeCorrect: true,
+    verdict: 'uphold',
+    citedLines: ['file.ts:3'],
+    reason: 'supported',
+  });
+
+  it('slices a single-line file:N source as start=end', () => {
+    const root = makeProject();
+    expect(sliceEvidenceForJudge({ reasoning: { sources: ['file.ts:3'] } }, root)).toEqual([
+      { file: 'file.ts', start: 3, end: 3, body: '3|l3' },
+    ]);
+  });
+
+  it('keeps a judge verdict citing a single-line source valid', async () => {
+    const verdict = await judgeCandidate({
+      candidate: { reasoning: { sources: ['file.ts:3'] } },
+      projectRoot: makeProject(),
+      chat: async () => UPHOLD_CITING_LINE_3,
+    });
+    expect(verdict).toMatchObject({ verdict: 'uphold' });
+    expect(verdict?.invalidCitation).toBeUndefined();
+  });
+
+  it('filters unusable sources before applying the slice budget', () => {
+    const root = makeProject();
+    const skipped: [unknown, string][] = [];
+    const slices = sliceEvidenceForJudge(
+      { reasoning: { sources: ['nope', 7, 'missing.ts:1-2', 'file.ts:2-3', 'file.ts:4'] } },
+      root,
+      { maxSlices: 1, onSkip: (source: unknown, reason: string) => skipped.push([source, reason]) }
+    );
+    expect(slices.map((slice) => `${slice.file}:${slice.start}-${slice.end}`)).toEqual([
+      'file.ts:2-3',
+    ]);
+    expect(skipped).toEqual([
+      ['nope', 'FORMAT'],
+      [7, 'FORMAT'],
+      ['missing.ts:1-2', 'READ_FAILED'],
+      ['file.ts:4', 'LIMIT'],
+    ]);
+  });
+
+  it('reports every source as LIMIT when the slice budget itself is invalid', () => {
+    const skipped: [unknown, string, string][] = [];
+    const slices = sliceEvidenceForJudge(
+      { reasoning: { sources: ['file.ts:1-2', 'file.ts:3'] } },
+      makeProject(),
+      {
+        maxSlices: 0,
+        onSkip: (source: unknown, reason: string, detail: string) =>
+          skipped.push([source, reason, detail]),
+      }
+    );
+    expect(slices).toEqual([]);
+    expect(skipped).toEqual([
+      ['file.ts:1-2', 'LIMIT', expect.stringContaining('invalid slice budget')],
+      ['file.ts:3', 'LIMIT', expect.stringContaining('invalid slice budget')],
+    ]);
+  });
+
+  it.each([
+    ['file.ts:0-2', 'FORMAT'],
+    ['file.ts:4-2', 'FORMAT'],
+    ['file.ts', 'FORMAT'],
+    ['file.ts:99', 'OUT_OF_RANGE'],
+    ['missing.ts:1', 'READ_FAILED'],
+    ['../file.ts:1-2', 'READ_DENIED'],
+    ['linked.ts:1-2', 'READ_DENIED'],
+    ['absolute', 'ABSOLUTE'],
+  ])('reports skipped source %s with reason %s', (rawSource, reason) => {
+    const outer = makeProject();
+    const root = join(outer, 'project');
+    mkdirSync(root);
+    writeFileSync(join(root, 'file.ts'), 'l1\nl2\nl3\nl4\nl5\n');
+    symlinkSync(join(outer, 'file.ts'), join(root, 'linked.ts'));
+    const source = rawSource === 'absolute' ? `${join(root, 'file.ts')}:1-2` : rawSource;
+    const skipped: { source: unknown; reason: string; detail: string }[] = [];
+    const slices = sliceEvidenceForJudge({ reasoning: { sources: [source] } }, root, {
+      onSkip: (skippedSource: unknown, skipReason: string, detail: string) =>
+        skipped.push({ source: skippedSource, reason: skipReason, detail }),
+    });
+    expect(slices).toEqual([]);
+    expect(skipped).toEqual([{ source, reason, detail: expect.any(String) }]);
+    // 诊断细节只给错误码/边界原因，不回显本机绝对路径。
+    expect(skipped[0]?.detail).not.toContain(outer);
+  });
+
+  it('reports parse failures with JSON_PARSE / FIELD_MISSING / VERDICT_AXIS_CONFLICT', () => {
+    const failures: [string, string][] = [];
+    const onFailure = (reason: string, detail: string) => failures.push([reason, detail]);
+    expect(parseJudgeVerdict('not json', { onFailure })).toBeNull();
+    expect(parseJudgeVerdict('{"verdict": "uphold", truncated', { onFailure })).toBeNull();
+    expect(parseJudgeVerdict('{"verdict": uphold}', { onFailure })).toBeNull();
+    expect(parseJudgeVerdict(42, { onFailure })).toBeNull();
+    expect(parseJudgeVerdict('{"verdict":"maybe"}', { onFailure })).toBeNull();
+    expect(
+      parseJudgeVerdict(
+        JSON.stringify({
+          entailment: 'not_entailed',
+          trivial: true,
+          actionable: false,
+          scopeCorrect: false,
+          verdict: 'uphold',
+          citedLines: ['file.ts:2'],
+          reason: 'contradiction',
+        }),
+        { onFailure }
+      )
+    ).toBeNull();
+    expect(failures.map(([reason]) => reason)).toEqual([
+      'JSON_PARSE',
+      'JSON_PARSE',
+      'JSON_PARSE',
+      'JSON_PARSE',
+      'FIELD_MISSING',
+      'VERDICT_AXIS_CONFLICT',
+    ]);
+    // FIELD_MISSING 点名缺失/非法字段，便于区分截断与模型漏字段。
+    expect(failures[4]?.[1]).toContain('verdict');
+    expect(failures[4]?.[1]).toContain('citedLines');
+    expect(failures[5]?.[1]).toContain('entailment=not_entailed');
+    // 合法裁决不触发失败回调。
+    const before = failures.length;
+    expect(parseJudgeVerdict(UPHOLD_CITING_LINE_3, { onFailure })).toMatchObject({
+      verdict: 'uphold',
+    });
+    expect(failures).toHaveLength(before);
+  });
+
+  it('judgeCandidate surfaces skipped sources, no-readable-slices and parse failures', async () => {
+    const diagnostics: Record<string, unknown>[] = [];
+    const verdict = await judgeCandidate({
+      candidate: { reasoning: { sources: ['missing.ts:1-2', 'file.ts:99'] } },
+      projectRoot: makeProject(),
+      chat: async () => '{"verdict":"reject"}',
+      onDiagnostic: (diagnostic: Record<string, unknown>) => diagnostics.push(diagnostic),
+    });
+    expect(verdict).toBeNull();
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        kind: 'slice-skipped',
+        source: 'missing.ts:1-2',
+        reasonCode: 'READ_FAILED',
+      }),
+      expect.objectContaining({
+        kind: 'slice-skipped',
+        source: 'file.ts:99',
+        reasonCode: 'OUT_OF_RANGE',
+      }),
+      { kind: 'no-readable-slices', sourceCount: 2 },
+      expect.objectContaining({ kind: 'verdict-parse-failed', reasonCode: 'FIELD_MISSING' }),
+    ]);
+  });
+
+  it('judgeCandidate stays silent when every source slices and the verdict parses', async () => {
+    const diagnostics: unknown[] = [];
+    const verdict = await judgeCandidate({
+      candidate: { reasoning: { sources: ['file.ts:2-4'] } },
+      projectRoot: makeProject(),
+      chat: async () => UPHOLD_CITING_LINE_3,
+      onDiagnostic: (diagnostic: unknown) => diagnostics.push(diagnostic),
+    });
+    expect(verdict).toMatchObject({ verdict: 'uphold' });
+    expect(diagnostics).toEqual([]);
+  });
+
+  it('collects calibration receipts for single-line sources', () => {
+    const root = makeProject();
+    const rows = collectSourceFileReceipts(
+      [{ candidate: { reasoning: { sources: ['file.ts:3'] } } }],
+      join(root, 'samples.json')
+    );
+    expect(rows).toEqual([
+      {
+        projectRoot: '.',
+        relativePath: 'file.ts',
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      },
+    ]);
+  });
+
+  it('renders judge diagnostics as one log line per event for both evaluator scripts', () => {
+    expect(
+      formatJudgeDiagnostic({
+        kind: 'slice-skipped',
+        source: 'src/a.ts:3',
+        reasonCode: 'OUT_OF_RANGE',
+        detail: 'start 3 > 2 lines',
+      })
+    ).toBe('slice-skipped reason=OUT_OF_RANGE source="src/a.ts:3" detail="start 3 > 2 lines"');
+    expect(formatJudgeDiagnostic({ kind: 'no-readable-slices', sourceCount: 2 })).toContain(
+      'no-readable-slices declaredSources=2'
+    );
+    expect(
+      formatJudgeDiagnostic({
+        kind: 'verdict-parse-failed',
+        reasonCode: 'JSON_PARSE',
+        detail: 'no JSON object in response',
+      })
+    ).toBe('verdict-parse-failed reason=JSON_PARSE detail="no JSON object in response"');
+    expect(formatJudgeDiagnostic({ kind: 'other' })).toContain('unknown-diagnostic');
+    for (const relativePath of ['scripts/eval-mining.mjs', 'scripts/eval-judge-calibration.mjs']) {
+      const source = readFileSync(join(process.cwd(), relativePath), 'utf8');
+      expect(source).toContain('onDiagnostic');
+      expect(source).toContain('formatJudgeDiagnostic(diagnostic)');
+    }
   });
 });

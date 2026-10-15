@@ -23,7 +23,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collectSourceFileReceipts } from './lib/mining-eval-runtime.mjs';
+import { collectSourceFileReceipts, formatJudgeDiagnostic } from './lib/mining-eval-runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const args = parseArgs(process.argv.slice(2));
@@ -118,6 +118,10 @@ for (const [index, sample] of exported.entries()) {
           maxTokens: 800,
         });
         return String(result?.text ?? '');
+      },
+      // 逐条打印被跳过的来源、无可读切片与裁决解析失败：judge=n/a 或缺证据 reject 的样本可复核原因。
+      onDiagnostic: (diagnostic) => {
+        console.warn(`[judge-calibration] #${index} judge ${formatJudgeDiagnostic(diagnostic)}`);
       },
     });
   } catch (err) {

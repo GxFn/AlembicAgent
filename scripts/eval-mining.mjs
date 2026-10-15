@@ -29,7 +29,10 @@ import {
   renderReportMarkdown,
   scoreFixture,
 } from './lib/mining-eval-core.mjs';
-import { createEvaluationRecipeGateway } from './lib/mining-eval-runtime.mjs';
+import {
+  createEvaluationRecipeGateway,
+  formatJudgeDiagnostic,
+} from './lib/mining-eval-runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -340,7 +343,7 @@ async function runFixture(fixture) {
   let judgeVerdicts = null;
   if (judgeEnabled && created.length > 0) {
     judgeVerdicts = [];
-    for (const candidate of created) {
+    for (const [candidateIndex, candidate] of created.entries()) {
       try {
         const verdict = await judgeCandidate({
           candidate,
@@ -351,6 +354,12 @@ async function runFixture(fixture) {
               maxTokens: 800,
             });
             return String(result?.text ?? '');
+          },
+          // 逐条打印被跳过的来源、无可读切片与裁决解析失败，区分“缺证据的 reject”与真实 reject。
+          onDiagnostic: (diagnostic) => {
+            console.warn(
+              `[eval:mining] judge ${fixture.id}#${candidateIndex} ${formatJudgeDiagnostic(diagnostic)}`
+            );
           },
         });
         judgeVerdicts.push(verdict);

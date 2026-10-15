@@ -21,6 +21,47 @@ export interface MiningJudgeVerdictV1 {
   readonly invalidCitation?: true;
 }
 
+/**
+ * judge 切片跳过原因码（离线评估诊断面，L7-P24 / C44）：
+ * - FORMAT：不是字符串、不是 file:N / file:start-end、或行号区间非法（start<1、end<start）；
+ * - ABSOLUTE：绝对路径来源，judge 只接受相对项目根的路径；
+ * - OUT_OF_RANGE：起始行超出文件行数；
+ * - READ_DENIED：项目根边界拒绝（越界、根外 symlink）或操作系统读权限拒绝；
+ * - READ_FAILED：文件缺失、是目录等其余读取失败；
+ * - LIMIT：已切满 maxSlices（后续来源不再读取），或切片预算本身非法（全部来源短路）。
+ */
+export type MiningJudgeSliceSkipReasonV1 =
+  | 'FORMAT'
+  | 'ABSOLUTE'
+  | 'OUT_OF_RANGE'
+  | 'READ_DENIED'
+  | 'READ_FAILED'
+  | 'LIMIT';
+
+/** judge 回复解析失败原因码：JSON 缺失/截断、四轴字段缺失或非法、uphold 与四轴自相矛盾。 */
+export type MiningJudgeVerdictParseFailureV1 =
+  | 'JSON_PARSE'
+  | 'FIELD_MISSING'
+  | 'VERDICT_AXIS_CONFLICT';
+
+/**
+ * judgeCandidate 的可选诊断事件。只供离线评估脚本打印，不进入裁决或校准口径；
+ * 'no-readable-slices' 用来把“没有可读证据导致的 reject”与“证据确实被驳倒的 reject”区分开。
+ */
+export type MiningJudgeDiagnosticV1 =
+  | {
+      readonly kind: 'slice-skipped';
+      readonly source: string;
+      readonly reasonCode: MiningJudgeSliceSkipReasonV1;
+      readonly detail: string;
+    }
+  | { readonly kind: 'no-readable-slices'; readonly sourceCount: number }
+  | {
+      readonly kind: 'verdict-parse-failed';
+      readonly reasonCode: MiningJudgeVerdictParseFailureV1;
+      readonly detail: string;
+    };
+
 export interface JudgeCalibrationRecordV1 {
   readonly humanDecision: 'uphold' | 'narrow' | 'trivial' | 'reject';
   readonly judgeVerdict:
@@ -58,7 +99,16 @@ export interface FrozenJudgeModelLoadReceiptV1 {
 export function sliceEvidenceForJudge(
   candidate: unknown,
   projectRoot: string,
-  options: { readonly maxSlices?: number; readonly maxLines?: number } = {}
+  options: {
+    readonly maxSlices?: number;
+    readonly maxLines?: number;
+    /** 每个未切出片段的来源回调一次；只做诊断，不改变切片结果。 */
+    readonly onSkip?: (
+      source: unknown,
+      reasonCode: MiningJudgeSliceSkipReasonV1,
+      detail: string
+    ) => void;
+  } = {}
 ): MiningJudgeEvidenceSliceV1[] {
   const maxSlices = options.maxSlices ?? 6;
   const maxLines = options.maxLines ?? 60;
@@ -68,53 +118,136 @@ export function sliceEvidenceForJudge(
     !Number.isSafeInteger(maxLines) ||
     maxLines < 1
   ) {
+    // 非法切片预算时整体短路为空切片；逐条按 LIMIT 上报，让“预算配置错误”与“来源本身不可用”可区分。
+    for (const source of readDeclaredSources(candidate)) {
+      options.onSkip?.(
+        source,
+        'LIMIT',
+        `invalid slice budget maxSlices=${maxSlices} maxLines=${maxLines}`
+      );
+    }
     return [];
   }
-  const reasoning = readRecord(readRecord(candidate).reasoning);
-  const sources = Array.isArray(reasoning.sources) ? reasoning.sources : [];
   const slices: MiningJudgeEvidenceSliceV1[] = [];
-  for (const source of sources.slice(0, maxSlices)) {
-    if (typeof source !== 'string') {
+  for (const source of readDeclaredSources(candidate)) {
+    // 先过滤后截断：只有真正切出的片段占用 maxSlices 名额，格式错、越界或读不到的来源
+    // 不再挤掉后面的合法来源；切满之后的来源按 LIMIT 上报，不再读取文件。
+    if (slices.length >= maxSlices) {
+      options.onSkip?.(source, 'LIMIT', `slice budget maxSlices=${maxSlices} reached`);
       continue;
     }
-    const match = /^(.+?):(\d+)-(\d+)$/u.exec(source.trim());
-    if (!match) {
-      continue;
-    }
-    const [, file, startRaw, endRaw] = match;
-    const start = Number(startRaw);
-    const requestedEnd = Number(endRaw);
-    if (
-      !file ||
-      isAbsolute(file) ||
-      !Number.isSafeInteger(start) ||
-      !Number.isSafeInteger(requestedEnd) ||
-      start < 1 ||
-      requestedEnd < start
-    ) {
-      continue;
-    }
-    const end = Math.min(requestedEnd, start + maxLines - 1);
-    try {
-      const resolved = resolveProjectPath(projectRoot, file);
-      const lines = readFileSync(resolved.absolute, 'utf8').split('\n');
-      if (start < 1 || start > lines.length) {
-        continue;
-      }
-      const boundedEnd = Math.min(end, lines.length);
-      const body = lines
-        .slice(start - 1, boundedEnd)
-        .map((line, offset) => `${start + offset}|${line}`)
-        .join('\n');
-      slices.push({ file, start, end: boundedEnd, body });
-    } catch (err: unknown) {
+    // 读取与分类在 readSourceSlice 内完成，回调放在其 try 之外：调用方回调抛错不会被误归类为读失败。
+    const outcome = readSourceSlice(source, projectRoot, maxLines);
+    if (outcome.ok) {
+      slices.push(outcome.slice);
+    } else {
       // Missing evidence remains absent; the refute-first reviewer then fails closed.
-      if (!(err instanceof Error)) {
-        throw new Error('MINING_JUDGE_EVIDENCE_READ_FAILED');
-      }
+      options.onSkip?.(source, outcome.reasonCode, outcome.detail);
     }
   }
   return slices;
+}
+
+type SourceSliceOutcome =
+  | { readonly ok: true; readonly slice: MiningJudgeEvidenceSliceV1 }
+  | {
+      readonly ok: false;
+      readonly reasonCode: Exclude<MiningJudgeSliceSkipReasonV1, 'LIMIT'>;
+      readonly detail: string;
+    };
+
+function readSourceSlice(
+  source: unknown,
+  projectRoot: string,
+  maxLines: number
+): SourceSliceOutcome {
+  if (typeof source !== 'string') {
+    return { ok: false, reasonCode: 'FORMAT', detail: `source is ${describeValueType(source)}` };
+  }
+  // 与 Core SOURCE_REF_RE、recipeProductionAdapter、knowledge sources 解析和 verifyJudgeCitations 同口径：
+  // file:N 单行来源合法，缺 end 时按 start 取单行（C17）。scripts/lib/mining-eval-runtime.mjs 的
+  // collectSourceFileReceipts 使用同一正则，修改时两处同步。
+  const match = /^(.+?):(\d+)(?:-(\d+))?$/u.exec(source.trim());
+  if (!match) {
+    return { ok: false, reasonCode: 'FORMAT', detail: 'expected file:line or file:start-end' };
+  }
+  const [, file, startRaw, endRaw] = match;
+  const start = Number(startRaw);
+  const requestedEnd = endRaw === undefined ? start : Number(endRaw);
+  if (
+    !file ||
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    start < 1 ||
+    requestedEnd < start
+  ) {
+    return {
+      ok: false,
+      reasonCode: 'FORMAT',
+      detail: `invalid line range ${start}-${requestedEnd}`,
+    };
+  }
+  if (isAbsolute(file)) {
+    return { ok: false, reasonCode: 'ABSOLUTE', detail: 'absolute paths are not project-relative' };
+  }
+  let lines: string[];
+  try {
+    const resolved = resolveProjectPath(projectRoot, file);
+    lines = readFileSync(resolved.absolute, 'utf8').split('\n');
+  } catch (err: unknown) {
+    if (!(err instanceof Error)) {
+      // 文件端口只应抛 Error；非 Error 视为不变量破坏，保留原值作 cause 后中止本候选的裁决。
+      throw new Error('MINING_JUDGE_EVIDENCE_READ_FAILED', { cause: err });
+    }
+    return { ok: false, reasonCode: classifyReadError(err), detail: describeReadError(err) };
+  }
+  if (start > lines.length) {
+    return {
+      ok: false,
+      reasonCode: 'OUT_OF_RANGE',
+      detail: `start line ${start} exceeds ${lines.length} lines`,
+    };
+  }
+  const boundedEnd = Math.min(requestedEnd, start + maxLines - 1, lines.length);
+  const body = lines
+    .slice(start - 1, boundedEnd)
+    .map((line, offset) => `${start + offset}|${line}`)
+    .join('\n');
+  return { ok: true, slice: { file, start, end: boundedEnd, body } };
+}
+
+/**
+ * resolveProjectPath 的根目录边界拒绝（越界、根外 symlink、悬空 symlink）统一以 'Access denied'
+ * 开头且不带 fs code；EACCES/EPERM 是操作系统层面的读权限拒绝。两者归为 READ_DENIED，
+ * 其余（ENOENT、EISDIR 等）归为 READ_FAILED。
+ */
+function classifyReadError(err: Error): 'READ_DENIED' | 'READ_FAILED' {
+  const code = readErrorCode(err);
+  if (code === 'EACCES' || code === 'EPERM' || err.message.startsWith('Access denied')) {
+    return 'READ_DENIED';
+  }
+  return 'READ_FAILED';
+}
+
+/** fs 错误的 message 带本机绝对路径，诊断只回报错误码；边界拒绝的 message 本身不含路径。 */
+function describeReadError(err: Error): string {
+  return readErrorCode(err) ?? err.message;
+}
+
+function readErrorCode(err: Error): string | null {
+  return 'code' in err && typeof err.code === 'string' ? err.code : null;
+}
+
+function readDeclaredSources(candidate: unknown): readonly unknown[] {
+  const reasoning = readRecord(readRecord(candidate).reasoning);
+  return Array.isArray(reasoning.sources) ? reasoning.sources : [];
+}
+
+function describeValueType(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  return Array.isArray(value) ? 'array' : typeof value;
 }
 
 /** Context-isolated four-axis prompt retained for the existing mining evaluator. */
@@ -156,49 +289,80 @@ export function buildJudgePrompt(
   ].join('\n');
 }
 
-export function parseJudgeVerdict(text: unknown): MiningJudgeVerdictV1 | null {
-  if (typeof text !== 'string') {
+const JUDGE_VERDICTS = ['uphold', 'narrow', 'trivial', 'reject'] as const;
+const JUDGE_ENTAILMENTS = ['entailed', 'partial', 'not_entailed'] as const;
+
+export function parseJudgeVerdict(
+  text: unknown,
+  options: {
+    /** 解析失败时回调一次原因码；只做诊断，返回值仍是保守的 null。 */
+    readonly onFailure?: (reasonCode: MiningJudgeVerdictParseFailureV1, detail: string) => void;
+  } = {}
+): MiningJudgeVerdictV1 | null {
+  const rejectVerdict = (reasonCode: MiningJudgeVerdictParseFailureV1, detail: string): null => {
+    options.onFailure?.(reasonCode, detail.slice(0, 200));
     return null;
+  };
+  if (typeof text !== 'string') {
+    return rejectVerdict('JSON_PARSE', `response is ${describeValueType(text)}, not text`);
   }
   const match = text.match(/\{[\s\S]*\}/u);
   if (!match) {
-    return null;
+    return rejectVerdict('JSON_PARSE', 'no JSON object in response');
   }
+  let raw: unknown;
   try {
-    const parsed = readRecord(JSON.parse(match[0]));
-    const verdict = parsed.verdict;
-    // 四轴是既有输出合同，不用类型转换/过滤把不完整裁决“修成”有效结果。
-    if (
-      typeof verdict !== 'string' ||
-      !['uphold', 'narrow', 'trivial', 'reject'].includes(verdict) ||
-      typeof parsed.entailment !== 'string' ||
-      !['entailed', 'partial', 'not_entailed'].includes(parsed.entailment) ||
-      typeof parsed.trivial !== 'boolean' ||
-      typeof parsed.actionable !== 'boolean' ||
-      typeof parsed.scopeCorrect !== 'boolean' ||
-      typeof parsed.reason !== 'string' ||
-      !Array.isArray(parsed.citedLines) ||
-      parsed.citedLines.some((line) => typeof line !== 'string' || !line.trim()) ||
-      (verdict === 'uphold' &&
-        (parsed.entailment !== 'entailed' ||
-          parsed.trivial ||
-          !parsed.actionable ||
-          !parsed.scopeCorrect))
-    ) {
-      return null;
-    }
-    return {
-      entailment: parsed.entailment,
-      trivial: parsed.trivial === true,
-      actionable: parsed.actionable === true,
-      scopeCorrect: parsed.scopeCorrect === true,
-      verdict: verdict as MiningJudgeVerdictV1['verdict'],
-      citedLines: parsed.citedLines as string[],
-      reason: parsed.reason,
-    };
-  } catch {
-    return null;
+    raw = JSON.parse(match[0]);
+  } catch (err: unknown) {
+    // 截断或夹杂非 JSON 文本：保留解析器消息，便于区分输出截断与格式漂移。
+    return rejectVerdict('JSON_PARSE', err instanceof Error ? err.message : String(err));
   }
+  const parsed = readRecord(raw);
+  // 四轴是既有输出合同，不用类型转换/过滤把不完整裁决“修成”有效结果。
+  const verdict = JUDGE_VERDICTS.find((value) => value === parsed.verdict);
+  const entailment = JUDGE_ENTAILMENTS.find((value) => value === parsed.entailment);
+  const trivial = typeof parsed.trivial === 'boolean' ? parsed.trivial : undefined;
+  const actionable = typeof parsed.actionable === 'boolean' ? parsed.actionable : undefined;
+  const scopeCorrect = typeof parsed.scopeCorrect === 'boolean' ? parsed.scopeCorrect : undefined;
+  const reason = typeof parsed.reason === 'string' ? parsed.reason : undefined;
+  const rawCitedLines: unknown = parsed.citedLines;
+  const citedLines =
+    Array.isArray(rawCitedLines) &&
+    rawCitedLines.every((line): line is string => typeof line === 'string' && line.trim() !== '')
+      ? rawCitedLines
+      : undefined;
+  if (
+    verdict === undefined ||
+    entailment === undefined ||
+    trivial === undefined ||
+    actionable === undefined ||
+    scopeCorrect === undefined ||
+    reason === undefined ||
+    citedLines === undefined
+  ) {
+    const invalidFields = Object.entries({
+      verdict,
+      entailment,
+      trivial,
+      actionable,
+      scopeCorrect,
+      citedLines,
+      reason,
+    })
+      .filter(([, value]) => value === undefined)
+      .map(([field]) => field);
+    return rejectVerdict('FIELD_MISSING', `missing or invalid: ${invalidFields.join(', ')}`);
+  }
+  if (
+    verdict === 'uphold' &&
+    (entailment !== 'entailed' || trivial || !actionable || !scopeCorrect)
+  ) {
+    return rejectVerdict(
+      'VERDICT_AXIS_CONFLICT',
+      `uphold contradicts axes: entailment=${entailment} trivial=${trivial} actionable=${actionable} scopeCorrect=${scopeCorrect}`
+    );
+  }
+  return { entailment, trivial, actionable, scopeCorrect, verdict, citedLines, reason };
 }
 
 export function verifyJudgeCitations(
@@ -227,16 +391,51 @@ export async function judgeCandidate(input: {
   readonly candidate: unknown;
   readonly projectRoot: string;
   readonly chat: (prompt: string) => Promise<string>;
+  /** 可选诊断回调：被跳过的来源、无可读切片、裁决解析失败逐条上报，不改变裁决结果。 */
+  readonly onDiagnostic?: (diagnostic: MiningJudgeDiagnosticV1) => void;
 }): Promise<MiningJudgeVerdictV1 | null> {
-  const slices = sliceEvidenceForJudge(input.candidate, input.projectRoot);
+  const report = input.onDiagnostic;
+  const slices = sliceEvidenceForJudge(input.candidate, input.projectRoot, {
+    onSkip: (source, reasonCode, detail) =>
+      report?.(
+        freeze({ kind: 'slice-skipped', source: describeSource(source), reasonCode, detail })
+      ),
+  });
+  if (slices.length === 0) {
+    // 提示里会写“no readable slices”，judge 按规则倾向 reject；单独上报，
+    // 让报告能把“缺证据的 reject”与“证据被驳倒的 reject”分开。
+    report?.(
+      freeze({
+        kind: 'no-readable-slices',
+        sourceCount: readDeclaredSources(input.candidate).length,
+      })
+    );
+  }
   const prompt = buildJudgePrompt(input.candidate, slices);
-  const verdict = parseJudgeVerdict(await input.chat(prompt));
+  const verdict = parseJudgeVerdict(await input.chat(prompt), {
+    onFailure: (reasonCode, detail) =>
+      report?.(freeze({ kind: 'verdict-parse-failed', reasonCode, detail })),
+  });
   if (!verdict) {
     return null;
   }
   return verifyJudgeCitations(verdict, slices)
     ? verdict
     : freeze({ ...verdict, invalidCitation: true as const });
+}
+
+/** 诊断里的来源统一成可打印字符串；非字符串来源用 JSON 表示，便于在日志里定位原值。 */
+function describeSource(source: unknown): string {
+  if (typeof source === 'string') {
+    return source;
+  }
+  try {
+    return JSON.stringify(source) ?? String(source);
+  } catch (err: unknown) {
+    // BigInt、循环引用等无法 JSON 化的来源只记录类型：诊断本身不能让裁决中断。
+    const errorName = err instanceof Error ? err.name : 'unknown error';
+    return `<unserializable ${describeValueType(source)}: ${errorName}>`;
+  }
 }
 
 /** One production-owned implementation for both strict evaluation and legacy mining scripts. */
