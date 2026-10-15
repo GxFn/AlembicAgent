@@ -144,7 +144,9 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
   // insightGateEvaluator 读取 strategyContext.activeContext:
   //   - 有 activeContext → buildAnalysisArtifact (完整: findings/evidenceMap/negativeSignals)
   //   - 无 activeContext → buildAnalysisReport (降级: 仅文本 + 文件列表)
-  // buildSystemContext 通过 trace 设置 activeContext，确保走完整路径
+  // activeContext 由 SystemRunContextFactory.createSystemContext 按维度创建
+  // (MemoryCoordinator.createDimensionScope) 并随 strategyContext 注入，正常走完整路径。
+  // 缺失时 PipelineStrategy 才以 strategyContext.trace 别名兜底，并记 pipeline_context_warning 诊断。
   const qualityGateStage = {
     name: 'quality_gate',
     gate: {

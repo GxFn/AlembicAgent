@@ -40,17 +40,6 @@ interface InsightGateStrategyContext {
 }
 
 /**
- * 面向 PipelineStrategy gate.evaluator 的包装函数。
- *
- * 将 PipelineStrategy 的 (source, phaseResults, strategyContext) 签名
- * 适配到 buildAnalysisArtifact + analysisQualityGate 调用链。
- *
- * @param source 前一阶段 (analyze) 的 reactLoop 返回值
- * @param phaseResults 所有阶段结果
- * @param strategyContext orchestrator 注入的运行时上下文
- * @returns }
- */
-/**
  * P1-B-4(挖掘质量升级)：provider 中立的模块覆盖度门——applyGraphRetryGate 的替代者。
  * 旧门"命令模型调 graph"(DeepSeek 实测不从,已删)；本门判据是确定性事实：
  * artifact.referencedFiles=Analyst 真实读过/接地过的文件。模块 ownedFiles 够多(≥minModuleFiles)
@@ -133,6 +122,24 @@ function describeEmptyAnalysisSource(source: unknown): {
   return { sourceState: 'empty_reply', toolCallCount };
 }
 
+/**
+ * 面向 PipelineStrategy gate.evaluator 的包装函数。
+ *
+ * 将 PipelineStrategy 的 (source, phaseResults, strategyContext) 签名
+ * 适配到 buildAnalysisArtifact + analysisQualityGate 调用链：基础质量门之上依次叠加
+ * applyDepthRetryGate(深度接地)与 applyModuleCoverageGate(模块覆盖度)。
+ * 副作用：每次评估都会先清空再重写 sharedState._analystGraphEvidence / _analystGroundedRanges，
+ * 供同轮 knowledge.submit handler 使用(不授予新的生产权限)。
+ *
+ * @param source 前一阶段 (analyze) 的 reactLoop 返回值
+ * @param phaseResults 所有阶段结果(本评估器不读取，保留以匹配 gate.evaluator 签名)
+ * @param strategyContext PipelineStrategy 展开注入的运行时上下文(activeContext / projectGraph /
+ *   dimId / outputType / needsCandidates / projectRoot / sharedState / moduleContext 等)
+ * @returns `{ action, reason, artifact }`：action 为 pass，或门给出的 analysis_retry /
+ *   record_repair / summary_rewrite / degrade(门未给动作时退回 retry)；空回复短路为
+ *   degrade 且 artifact=null。否则 artifact 在有 activeContext 时是 AnalysisArtifact，
+ *   无 activeContext 时是降级的 AnalysisReport，两者都带 pcvNodeEvidence 与对应 metadata。
+ */
 export function insightGateEvaluator(
   source: unknown,
   phaseResults: Record<string, unknown>,
@@ -425,7 +432,8 @@ interface GateStrategyContext {
  * 当 produce 阶段的提交拒绝率过高时触发 retry。
  *
  * @param source produce 阶段的 reactLoop 返回值
- * @returns }
+ * @returns `{ action, reason }`：提交拒绝数大于成功数且拒绝 ≥2 时为 retry(reason 写明两者计数)，
+ *   否则(含 source 无 toolCalls)为 pass、reason 为空串。
  */
 export function producerRejectionGateEvaluator(
   source: ReactLoopResult | null | undefined,

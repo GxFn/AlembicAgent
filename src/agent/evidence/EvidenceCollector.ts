@@ -1,10 +1,11 @@
 /**
- * EvidenceCollector.js — 从 Analyst 工具调用中收集结构化证据
+ * EvidenceCollector.ts — 从 Analyst 工具调用中收集结构化证据
  *
  * Bootstrap 质量门控核心组件: 将 Analyst 阶段的 toolCall 序列转化为
- * 类型化的证据地图、探索日志和负空间信号，供 Producer 阶段直接引用。
+ * 类型化的证据地图、探索日志、负空间信号和可复制 graph 引用，供 Producer 阶段直接引用。
  *
- * 被 evaluation 质量门(原 insightGate) (buildAnalysisArtifact) 调用。
+ * 由 evaluation/analysisArtifact.ts 的 buildAnalysisArtifact / buildAnalysisReport 调用
+ * （质量门 insightGateEvaluator 经它们取得证据）。
  *
  * 设计原则:
  * - 不保留原始工具返回值 (体积过大)
@@ -151,7 +152,7 @@ function describeRejectedReadDisplay(display: string): string {
 /** 一次读取里写进探索日志的展示说明最多列几条（batch 可能涉及很多文件）。 */
 const MAX_READ_NOTES_IN_LOG = 3;
 
-/** code.search 字符串输出的匹配行：`path:42: content`（formatSearchOutput 契约） */
+/** 旧版 code.search 字符串回执的匹配行 `path:42: content`（兼容登记见 parseSearchOutputText） */
 const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
 
 // ── 锚点驱动证据补齐（groundFindingRefs） ────────────────────────
@@ -183,7 +184,8 @@ const ANCHOR_CONTEXT_LINES = 8;
 
 /**
  * 只读行范围端口：返回 [startLine, endLine] 的逐字源码与实际截止行（endLine 超文件末尾时
- * 收缩），路径越界 / 文件缺失 / 空范围返回 null。由调用方（insightGate）注入 fs 实现。
+ * 收缩），路径越界 / 文件缺失 / 空范围返回 null。由调用方（analysisArtifact 的
+ * createFsSnippetRangeReader）注入 fs 实现。
  */
 export type SnippetRangeReader = (
   filePath: string,
@@ -199,9 +201,20 @@ export interface FindingRefLike {
 }
 
 /**
- * 解析 code.search 的字符串输出（`N matches (showing M)\n\npath:line: content`...）。
- * search handler 最终 ok() 的 data 就是这个格式化字符串（不是 {matches} 对象），
- * 不解析它 search 证据就 100% 进不了 evidenceMap。契约由 evidence-collector 测试钉住。
+ * 旧轨迹 / 旧宿主字符串回执的兼容解析：`N matches (showing M)\n\npath:line: content`...。
+ *
+ * 现状：code.search handler 自 Wave M2（b87e784）起返回结构化 `{ total, shown, matches }`
+ * （模型可见文本随 adapter 约定变为 JSON），formatSearchOutput 已退役；processToolCall 优先读
+ * envelope.structuredContent，现行回执走 #extractSearchEvidence 的对象分支。只有 structuredContent
+ * 与 result 都缺失、退到 envelope.text（现为 JSON）时才会进到这里，此时通常解析不出命中，
+ * 也不会记负空间信号（不会把它误判成“没找到”）。
+ *
+ * 兼容登记（仓库规则：兼容代码须写明消费方、原因与移除条件）：
+ * - 消费方：M2 之前录制的旧轨迹 / 回放，以及仍以纯文本回执 search 的旧宿主；
+ *   test/evidence-collector-fidelity.test.ts 的字符串回执用例钉住这一形态。
+ * - 原因：这类回执里 search 命中只以 `path:line: content` 文本存在，不解析就进不了 evidenceMap。
+ * - 移除条件：决定③确认只支持当前单宿主、且不再回放 M2 之前的轨迹后，删除本函数、
+ *   #extractSearchEvidence 的字符串分支与零命中文本负信号，并把相应测试改为结构化回执。
  */
 function parseSearchOutputText(text: string): SearchMatch[] {
   const matches: SearchMatch[] = [];
@@ -316,6 +329,7 @@ interface ToolResultObject {
   mode?: string;
   outlineSource?: string;
   matches?: SearchMatch[];
+  /** 旧宿主 / 旧轨迹的多模式搜索回执；现行 handler 不再产出（兼容登记见 #extractSearchEvidence）。 */
   batchResults?: Record<string, { matches?: SearchMatch[] }>;
   className?: string;
   superClass?: string;
@@ -494,13 +508,11 @@ export class EvidenceCollector {
   }
 
   /**
-   * 构建收集结果
+   * 构建收集结果（形状与 EvidenceCollectorResult 一致）。
    *
-   * @returns {{
-   *   evidenceMap: Map<string, EvidenceEntry>,
-   *   explorationLog: ExplorationEntry[],
-   *   negativeSignals: NegativeSignal[]
-   * }}
+   * @returns evidenceMap（文件 → 代码片段 / 结构摘要）、explorationLog（每次工具调用一条）、
+   *   negativeSignals（确认完成的零命中搜索）与 graphEvidence（各次真实 graph 调用轮流选出的
+   *   可复制引用，最多 MAX_GRAPH_EVIDENCE 条，见 #selectGraphEvidence）。
    */
   build() {
     return {
@@ -646,14 +658,20 @@ export class EvidenceCollector {
     this.#addCodeSnippet(filePath, parsed.content, parsed.startLine);
   }
 
-  /** code.search — 提取匹配 + 负空间信号（字符串输出 / 批量 batchResults / 单模式 matches） */
+  /**
+   * code.search — 提取匹配 + 负空间信号。现行 handler 回执是结构化 `{ total, shown, matches }`，
+   * 走下方单列表分支；字符串输出与批量 batchResults 两个分支只为旧轨迹 / 旧宿主保留（各自登记见分支旁）。
+   */
   #extractSearchEvidence(args: ToolCallArgs, result: ToolResult, complete = true) {
     const patterns = this.#extractSearchPatterns(args);
 
+    // 兼容分支：旧字符串回执（登记见 parseSearchOutputText）。
     if (typeof result === 'string') {
       const parsed = parseSearchOutputText(result);
       if (parsed.length === 0) {
         // 只有明确完成的零命中回执才是负证据；错误、预算省略和未知文本都不是“没找到”。
+        // `0 matches (showing 0)` 是已退役 formatSearchOutput 的零命中文本，消费方与原因同
+        // parseSearchOutputText；移除条件：随字符串分支一起删除（决定③）。
         if (complete && /^\s*0 matches \(showing 0\)\s*$/.test(result)) {
           for (const pattern of patterns) {
             this.#addNegativeSignal(pattern);
@@ -675,7 +693,12 @@ export class EvidenceCollector {
     const matches = result.matches || [];
     const batchResults = result.batchResults || {};
 
-    // 批量搜索
+    // 批量搜索（兼容登记）：
+    // - 消费方：旧宿主 / 旧轨迹的多模式回执 `{ batchResults: { [pattern]: { matches } } }`；本仓
+    //   code.search handler 已把多个 pattern 合并为一个 matches 列表，仓内无生产来源。
+    // - 原因：保留旧回执按模式记录的命中与负空间信号。
+    // - 移除条件：决定③确认只支持当前单宿主、且不再回放旧轨迹后，删除本分支及
+    //   #summarizeResult / #isEffective 中对 batchResults 的读取。
     if (Object.keys(batchResults).length > 0) {
       for (const [pattern, sub] of Object.entries(batchResults)) {
         const subMatches = (sub as { matches?: SearchMatch[] }).matches || [];
@@ -695,7 +718,7 @@ export class EvidenceCollector {
       return;
     }
 
-    // 单模式搜索
+    // 单列表 matches：现行结构化回执（多个 pattern 也合并在同一列表）及旧版单模式对象回执。
     if (matches.length === 0) {
       if (complete && this.#isCompleteEmptySearch(result)) {
         for (const p of patterns) {
@@ -1123,9 +1146,5 @@ export class EvidenceCollector {
     }
   }
 }
-
-// ──────────────────────────────────────────────────────────────────
-// 类型定义 (JSDoc)
-// ──────────────────────────────────────────────────────────────────
 
 export default EvidenceCollector;

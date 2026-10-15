@@ -67,7 +67,19 @@ export function hashCanonical(value: unknown): string {
  * 键按 UTF-16 码元序（`Array.prototype.sort` 默认序）排列，与 Core 的
  * `Object.keys().sort()` 相同，不随运行环境的 locale/ICU 变化。不能借用下方仓内
  * `hashCanonical` 的排序规则顺序：两者在 `refs`/`refSet` 这类键对上不同。
- * Core 尚未从公开子路径导出该实现；导出后应改为直接消费，删除这份镜像。
+ *
+ * Core 已在稳定公开子路径 `@alembic/core/project-context-foundation` 导出 `hashCanonicalJson`
+ * （宿主 StrictAnalysisRuntime 已从该子路径消费）。这里仍保留镜像，真实理由：
+ * - config/layer-contract.json 只允许本文件运行时依赖 `node:crypto`；改为委托须先为本文件登记该
+ *   Core 子路径，并确认 project-context foundation facade 适合承载 strict 层的通用规范哈希
+ *   （或请 Core 在 `./production` 再导出）；
+ * - 委托会改变非 JSON 值的处理（见下），属于内部行为变化，随 C30 完整修复与规范哈希收敛
+ *   （决定⑥）一并落地，不在注释修正中顺带进行。
+ * 已知差异：非有限数（NaN/±Infinity）在镜像里经 JSON.stringify 写成 null，Core 抛 TypeError；
+ * 函数/symbol 成员在镜像里被省略（数组内写成 null），Core 同样抛 TypeError；bigint 两侧都抛错。
+ * -0、值为 undefined 的成员与 `__proto__` 键两侧一致。strict 载荷进入哈希前已校验，正常不会
+ * 触发这些差异；test/strict-core-canonical-mirror.test.ts 直接对照 Core 实现并钉住非有限数差异，
+ * Core 规范规则变化时先在那里失败，而不是在跨仓复核时静默分叉。
  */
 export function hashCoreCanonical(value: unknown): string {
   return `sha256:${createHash('sha256')

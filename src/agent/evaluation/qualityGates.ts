@@ -223,7 +223,8 @@ export function getArtifactMemoryFindingCount(artifact: unknown) {
  * - v1: 使用 4 条规则
  *
  * @param [options.outputType] 'analysis' | 'dual' | 'candidate'
- * @returns }
+ * @returns GateResult：放行时为 `{ pass: true }`；否则带 reason 与 action
+ *   (analysis_retry / record_repair / summary_rewrite / degrade)。
  */
 export function analysisQualityGate(report: GateableReport, options: GateOptions = {}): GateResult {
   // memoryFindingCount 优先取调用方显式值，否则从 artifact.metadata 读——两个子门与
@@ -388,11 +389,9 @@ export function applyDepthRetryGate(
   const depthReview = reviewInsightDepth(artifact);
   const groundedCore = depthReview.grounded.filter((k) => k !== 'multiSourceCorroboration');
   // 双轨(2026-07-02 用户决策)：自由叙述里的接地深度断言(groundedSignalCount)与小节维度
-  // 覆盖取较高者——深挖写作不再被迫用 `## 四问小节` 组织。
-  const groundedSignals =
-    typeof (depthReview as { groundedSignalCount?: number }).groundedSignalCount === 'number'
-      ? (depthReview as { groundedSignalCount: number }).groundedSignalCount
-      : 0;
+  // 覆盖取较高者——深挖写作不再被迫用 `## 四问小节` 组织。Core DepthReviewResult 的
+  // groundedSignalCount 是必填 number(reviewRecipeDepth 唯一返回路径恒赋值，最小为 0)，直接读取。
+  const groundedSignals = depthReview.groundedSignalCount;
   const depthUnits = Math.max(groundedCore.length, groundedSignals);
   const attempted =
     depthReview.ungroundedClaims.length > 0 || groundedCore.length > 0 || groundedSignals > 0;
