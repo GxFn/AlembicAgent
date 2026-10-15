@@ -748,19 +748,21 @@ function assertExecuteInput(input: DurableSemanticReviewExecuteInputV1): void {
   }
 }
 
+/**
+ * execute 阶段只比较“请求携带的 reviewer 回执”与“可信 bootstrap 回执”：请求回执随每个
+ * semantic request 变化，只能在运行期校验。provider 与可信回执是否一致属于创建后不变的
+ * bootstrap 静态不变量，已由 isValidReviewerBootstrap 在 create 阶段以 BOOTSTRAP_INVALID
+ * 拦截（C42），这里不再重复比较。
+ */
 function assertReviewerLoadBinding(
   request: SemanticDispositionReviewRequestV1,
   reviewer: RuntimeState['reviewer']
 ): void {
   const requestReceipt = request.calibration.reviewerModelLoadReceipt;
-  if (
-    reviewer.provider.name !== reviewer.modelLoadReceipt.providerId ||
-    reviewer.provider.model !== reviewer.modelLoadReceipt.modelId ||
-    !sameReviewerModelLoadReceipt(requestReceipt, reviewer.modelLoadReceipt)
-  ) {
+  if (!sameReviewerModelLoadReceipt(requestReceipt, reviewer.modelLoadReceipt)) {
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_REVIEWER_LOAD_MISMATCH',
-      'Request/provider reviewer identity does not match the trusted bootstrap load receipt.'
+      'The request reviewer model-load receipt does not match the trusted bootstrap load receipt.'
     );
   }
 }
@@ -792,9 +794,18 @@ function validateBootstrap(input: DurableSemanticReviewRuntimeBootstrapV1): void
     !Number.isSafeInteger(candidate.timeoutMs) ||
     (candidate.timeoutMs ?? 0) <= 0
   ) {
+    // 回执缺失或与 provider 不一致是 C42 前移到 create 阶段的配置错误；修复前它要到每次
+    // execute 才以 REVIEWER_LOAD_MISMATCH 暴露。消息里写明触发字段与两侧身份，宿主不必再
+    // 对照回执排查；其它不完整配置（含整个 reviewer 段缺失）保持原有通用消息。
+    const receiptIssue =
+      candidate?.reviewer && typeof candidate.reviewer === 'object'
+        ? describeReviewerModelLoadReceiptIssue(candidate.reviewer)
+        : null;
     throw runtimeError(
       'ALEMBIC_AGENT_SEMANTIC_REVIEW_BOOTSTRAP_INVALID',
-      'Trusted runtime bootstrap is incomplete or invalid.'
+      receiptIssue === null
+        ? 'Trusted runtime bootstrap is incomplete or invalid.'
+        : `Trusted runtime bootstrap is incomplete or invalid: ${receiptIssue}.`
     );
   }
 }
@@ -819,8 +830,44 @@ function isValidReviewerBootstrap(
     isNonEmptyString(input?.evaluatorRunId) &&
     (input?.createInvocationId === undefined || typeof input.createInvocationId === 'function') &&
     (input?.maxTokens === undefined ||
-      (Number.isSafeInteger(input.maxTokens) && input.maxTokens > 0))
+      (Number.isSafeInteger(input.maxTokens) && input.maxTokens > 0)) &&
+    describeReviewerModelLoadReceiptIssue(input) === null
   );
+}
+
+/**
+ * C42：provider 与可信 model-load receipt 的一致性是 bootstrap 静态不变量。回执必须存在，
+ * 且 providerId/modelId 与 provider.name/model 完全一致；否则 runtime 绑定的是一个与真实
+ * 调用模型不同的回执，Core attestation 的 reviewer lineage 将失真，必须在 create 阶段拒绝。
+ * 回执其余字段（版本、方法、runtimeConfigHash、loadReceiptHash）由 Core gateway 在创建时
+ * 校验，这里不重复。返回 null 表示一致，否则返回可直接拼进错误消息的诊断说明（只包含
+ * provider/model 标识，不包含凭据位置或其它宿主配置）。
+ */
+function describeReviewerModelLoadReceiptIssue(
+  input: DurableSemanticReviewRuntimeBootstrapV1['reviewer'] | undefined
+): string | null {
+  const receipt: unknown = input?.modelLoadReceipt;
+  if (receipt === null || typeof receipt !== 'object') {
+    return 'reviewer.modelLoadReceipt is missing or not an object';
+  }
+  const { providerId, modelId } = receipt as Partial<SemanticDispositionReviewerModelLoadReceiptV1>;
+  const providerName: unknown = input?.provider?.name;
+  const providerModel: unknown = input?.provider?.model;
+  if (providerName === providerId && providerModel === modelId) {
+    return null;
+  }
+  return (
+    `reviewer provider identity (name=${identityLabel(providerName)}, model=${identityLabel(providerModel)}) ` +
+    `does not match reviewer.modelLoadReceipt (providerId=${identityLabel(providerId)}, modelId=${identityLabel(modelId)})`
+  );
+}
+
+// 诊断消息里的身份标签：非字符串值只写类型，避免 String() 在无原型对象上抛错或泄露对象内容。
+function identityLabel(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return `<${value === null ? 'null' : typeof value}>`;
 }
 
 function isValidEvidenceBootstrap(

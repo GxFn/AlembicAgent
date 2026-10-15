@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { createHash, generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync, type KeyObject } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -1015,17 +1015,31 @@ describe('DurableSemanticReviewRuntime', () => {
   });
 
   it('rejects a caller-selected reviewer load and producer self-review', async () => {
+    // C42：这里覆盖的是“请求携带的 reviewer 回执 ≠ 可信 bootstrap 回执”，它随每个请求变化，
+    // 必须留在 execute 阶段比较；provider 与可信回执本身一致，因此 create 阶段应当成功。
+    // provider 与可信回执不一致属于 bootstrap 静态不变量，由下方 create 阶段用例覆盖。
     const loadMismatchFixture = createFixture({
       modelLoadReceipt: createModelLoadReceipt({ modelId: 'model:caller-selected' }),
     });
+    const loadMismatchInvoke = vi.fn(async (prompt: string) =>
+      passingDecisionFromCompiledPrompt(prompt)
+    );
+    const loadMismatchResolve = vi.fn(async () =>
+      authorityBundleFor(loadMismatchFixture, loadMismatchFixture.evidenceEntry.id)
+    );
     const trustedRuntime = await createRuntime(loadMismatchFixture, {
       trustedModelLoadReceipt: createModelLoadReceipt(),
+      invoke: loadMismatchInvoke,
+      resolve: loadMismatchResolve,
     });
     await expect(
       trustedRuntime.execute({ semanticRequest: loadMismatchFixture.semanticRequest })
     ).rejects.toMatchObject({
       code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_REVIEWER_LOAD_MISMATCH',
+      message: expect.stringContaining('request reviewer model-load receipt'),
     });
+    expect(loadMismatchResolve).not.toHaveBeenCalled();
+    expect(loadMismatchInvoke).not.toHaveBeenCalled();
 
     const selfReviewFixture = createFixture();
     const selfReviewRuntime = await createRuntime(selfReviewFixture, {
@@ -1036,6 +1050,74 @@ describe('DurableSemanticReviewRuntime', () => {
     ).rejects.toMatchObject({
       code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_NOT_INDEPENDENT',
     });
+  });
+
+  // C42：provider 与可信 model-load receipt 一致（且回执存在）是 bootstrap 静态不变量。
+  // 这类配置错误必须在 create 阶段以 BOOTSTRAP_INVALID 失败，并且发生在触碰密钥托管、
+  // 证据 authority 与 provider 之前；不能像修复前那样创建成功、直到每次 execute 才以
+  // REVIEWER_LOAD_MISMATCH 暴露。消息需写明触发字段与两侧身份，便于宿主直接定位。
+  it.each<{
+    readonly name: string;
+    readonly providerIdentity?: { readonly name?: string; readonly model?: string };
+    readonly reviewerExtras?: Record<string, unknown>;
+    readonly detail: string;
+  }>([
+    {
+      name: 'the provider id diverges from the trusted model-load receipt',
+      providerIdentity: { name: 'provider:caller-selected' },
+      detail:
+        'reviewer provider identity (name=provider:caller-selected, model=model:reviewer) does not match reviewer.modelLoadReceipt (providerId=provider:reviewer, modelId=model:reviewer)',
+    },
+    {
+      name: 'the provider model diverges from the trusted model-load receipt',
+      providerIdentity: { model: 'model:caller-selected' },
+      detail:
+        'reviewer provider identity (name=provider:reviewer, model=model:caller-selected) does not match reviewer.modelLoadReceipt (providerId=provider:reviewer, modelId=model:reviewer)',
+    },
+    {
+      name: 'the trusted model-load receipt is missing',
+      reviewerExtras: { modelLoadReceipt: undefined },
+      detail: 'reviewer.modelLoadReceipt is missing or not an object',
+    },
+    {
+      name: 'the trusted model-load receipt is null',
+      reviewerExtras: { modelLoadReceipt: null },
+      detail: 'reviewer.modelLoadReceipt is missing or not an object',
+    },
+    {
+      name: 'the trusted model-load receipt is not an object',
+      reviewerExtras: { modelLoadReceipt: 'provider:reviewer/model:reviewer' },
+      detail: 'reviewer.modelLoadReceipt is missing or not an object',
+    },
+  ])('fails closed at create with BOOTSTRAP_INVALID when $name', async ({
+    providerIdentity,
+    reviewerExtras,
+    detail,
+  }) => {
+    const fixture = createFixture();
+    const loadPrivateKey = vi.fn(async () => generateKeyPairSync('ed25519').privateKey);
+    const invoke = vi.fn(async (prompt: string) => passingDecisionFromCompiledPrompt(prompt));
+    const resolve = vi.fn(async () => authorityBundleFor(fixture, fixture.evidenceEntry.id));
+
+    const error = await createRuntime(fixture, {
+      ...(providerIdentity ? { providerIdentity } : {}),
+      ...(reviewerExtras ? { reviewerExtras } : {}),
+      loadPrivateKey,
+      invoke,
+      resolve,
+    }).then(
+      () => null,
+      (err: unknown) => err
+    );
+
+    expect(error).toBeInstanceOf(DurableSemanticReviewRuntimeError);
+    expect(error).toMatchObject({
+      code: 'ALEMBIC_AGENT_SEMANTIC_REVIEW_BOOTSTRAP_INVALID',
+      message: expect.stringContaining(detail),
+    });
+    expect(loadPrivateKey).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it('rejects partial provider output and attestations from an alternate trust policy', async () => {
@@ -1532,6 +1614,11 @@ async function createRuntime(
     readonly keyId?: string;
     readonly ledger?: unknown;
     readonly evidenceExtras?: Record<string, unknown>;
+    // C42：分别覆盖 provider 身份与 reviewer 段字段，用来构造 provider 与可信 model-load
+    // receipt 不一致、或 receipt 缺失的 bootstrap；默认 provider 身份取自可信 receipt。
+    readonly providerIdentity?: { readonly name?: string; readonly model?: string };
+    readonly reviewerExtras?: Record<string, unknown>;
+    readonly loadPrivateKey?: () => Promise<KeyObject>;
   }
 ) {
   const { privateKey } = generateKeyPairSync('ed25519');
@@ -1540,12 +1627,12 @@ async function createRuntime(
     signingKey: {
       trustRootId: options.trustRootId ?? 'semantic-review-trust:agent-runtime',
       keyId: options.keyId ?? 'semantic-review-key:agent-runtime',
-      loadPrivateKey: async () => privateKey,
+      loadPrivateKey: options.loadPrivateKey ?? (async () => privateKey),
     },
     reviewer: {
       provider: {
-        name: modelLoadReceipt.providerId,
-        model: modelLoadReceipt.modelId,
+        name: options.providerIdentity?.name ?? modelLoadReceipt.providerId,
+        model: options.providerIdentity?.model ?? modelLoadReceipt.modelId,
         chatWithTools: async (prompt) => ({
           text: await (options.invoke ?? passingDecisionFromCompiledPrompt)(prompt),
           functionCalls: null,
@@ -1556,6 +1643,7 @@ async function createRuntime(
       evaluatorRunId: options.evaluatorRunId ?? EVALUATOR_RUN_ID,
       createInvocationId:
         options.createInvocationId ?? (() => 'reviewer-invocation:durable-semantic-review:1'),
+      ...options.reviewerExtras,
     },
     evidence: {
       ledger: (options.ledger ?? fixture.ledgerAuthority.read) as never,
