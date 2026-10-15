@@ -24,6 +24,10 @@ export interface SystemRunContext extends Record<string, unknown> {
   scopeId: string;
   contextWindow?: ContextWindow | null;
   tracker?: ExplorationTracker | null;
+  /**
+   * activeContext 的别名：经 createSystemRunContext 构造时二者是同一对象
+   * （仅已废弃的 allowDistinctActiveContext 能放行不同对象）。字段去留随待决事项②决定。
+   */
   trace: ActiveContext | null;
   activeContext: ActiveContext | null;
   memoryCoordinator: MemoryCoordinator;
@@ -55,6 +59,10 @@ export interface BuildSystemRunContextOptions {
   submitToolName?: string;
   pipelineType?: PipelineType;
   dimensionMeta?: SystemRunDimensionMeta;
+  /**
+   * @deprecated 无调用方（仓库内与宿主均未使用）。不设时 trace 必须与 activeContext 同一对象，
+   * 两字段事实上互为别名；设为 true 会让二者语义分叉且无测试覆盖。随待决事项②“公开面收窄”删除。
+   */
   allowDistinctActiveContext?: boolean;
   extraFields?: Record<string, unknown>;
 }

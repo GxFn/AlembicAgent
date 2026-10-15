@@ -2491,14 +2491,15 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] finalize: forced summary mode=${summaryMode.mode} (trigger=${summaryMode.trigger})`
         );
+        // I49：不再传 contextWindow / tokenUsage 两个已废弃的兼容输入——摘要只读有界工具回执，
+        // 不重放累积上下文；用量由下面按返回值统一记入 BudgetController 与本 loop，
+        // 不经调用方累加器（此前传入的 this.tokenUsage 从未被函数读取或改写）。
         const forcedResult = await produceForcedSummary({
           aiProvider: this.aiProvider,
           source: ctx.source,
           toolCalls: ctx.toolCalls,
           tracker: ctx.tracker ?? undefined,
-          contextWindow: ctx.contextWindow,
           prompt: ctx.prompt,
-          tokenUsage: this.tokenUsage,
           systemPrompt: ctx.baseSystemPrompt,
           maxTokens: ctx.budget.maxTokens,
           temperature: ctx.budget.temperature,

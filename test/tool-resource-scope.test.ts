@@ -841,6 +841,8 @@ describe('runtime-owned tool resource lifecycle', () => {
     expect(callsBefore).toHaveLength(2);
   });
 
+  // 守卫 ContextWindowAdapter 的旧 duck-typed 窗口兼容分支（登记见 MessageAdapter.ts 的 #legacyReadView）。
+  // 这是该分支唯一的入口；待决事项③确认只接受真实 ContextWindow 后，与分支同一提交删除本用例。
   it('keeps old context windows usable while disabling unsafe delta reuse', async () => {
     const window = new ContextWindow();
     const legacyWindow = new Proxy(window, {

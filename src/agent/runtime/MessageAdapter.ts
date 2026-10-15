@@ -12,7 +12,12 @@ import type { LlmContinuation } from '#ai/contracts.js';
  * 差异只在压缩能力：裸数组模式不压缩，provider 输入预算只如实测量并在超限时告警。
  * 这样 reactLoop 及其提取方法无需关心底层消息存储方式。
  *
- * @module core/MessageAdapter
+ * 兼容成员（I49）：formatToolResult、getToolResultQuota、compactIfNeeded 与
+ * ContextWindowAdapter.contextWindow getter 经 @alembic/agent/runtime 公开，但运行时不使用——
+ * 工具结果配额走 BudgetController + projectToolReceipt，常规压缩走 BudgetController → ContextWindow，
+ * 强制摘要不读上下文窗口。它们已标为废弃（deprecated 标签），随待决事项②“公开面收窄”删除。
+ *
+ * @module agent/runtime/MessageAdapter
  */
 
 import Logger from '@alembic/core/logging';
@@ -66,7 +71,15 @@ interface ChatMessage {
 //  Base class (接口定义 + JSDoc)
 // ─────────────────────────────────────────────
 
-/** @abstract */
+/**
+ * 消息适配器基类（概念上的抽象类）。
+ *
+ * 目前是普通 class：未覆盖的方法在运行时抛 'not implemented'，tsc 不会提示子类漏实现。
+ * 改为 TypeScript abstract class 会让外部 `new MessageAdapter()` 变成编译错误，属于公开面变更，
+ * 随待决事项②“公开面收窄”处理；在此之前新增子类必须覆盖全部 throw 'not implemented' 的方法。
+ *
+ * @abstract
+ */
 export class MessageAdapter {
   #readViewRevision = 0;
 
@@ -138,22 +151,30 @@ export class MessageAdapter {
     return this.toMessages();
   }
 
-  /** 重置到仅保留初始 prompt (错误恢复) */
+  /**
+   * 错误恢复：仅保留首条消息，其余历史清空。
+   * 注意首条不一定是本次任务 prompt：AgentRuntime 先追加 history 再追加 prompt，
+   * 有 history 时保留的是 history 首条（无 history 时才是本次 prompt）。
+   */
   resetToPromptOnly() {
     throw new Error('not implemented');
   }
 
   /**
-   * 获取工具结果限额
-   * @returns }
+   * 获取工具结果限额。
+   * @deprecated 兼容保留、运行时不使用：真实工具结果配额由 BudgetController + projectToolReceipt 处理。
+   *   随待决事项②“公开面收窄”删除。
+   * @returns `{ maxChars, maxMatches }` 单次工具结果的字符与匹配条数上限
    */
   getToolResultQuota(): { maxChars: number; maxMatches: number } {
     throw new Error('not implemented');
   }
 
   /**
-   * 压缩检查 — 如果消息过多则自动压缩
-   * @returns }
+   * 压缩检查 — 如果消息过多则自动压缩。
+   * @deprecated 兼容保留、运行时不使用：常规压缩由 BudgetController 直接调用 ContextWindow.compactIfNeeded。
+   *   随待决事项②“公开面收窄”删除。
+   * @returns `{ level, removed }` 本次触发的压缩级别（0 表示未压缩）与移除的消息数
    */
   compactIfNeeded(): { level: number; removed: number } {
     throw new Error('not implemented');
@@ -205,6 +226,8 @@ export class MessageAdapter {
 
   /**
    * 格式化工具结果字符串 (统一 limitToolResult 调用)
+   * @deprecated 兼容保留、运行时不使用：真实工具结果进入历史前走 projectToolReceipt（读结果被裁剪时由
+   *   AgentRuntime 失效已读视图），本方法不会失效已读视图，不能当作生效的裁剪路径。随待决事项②“公开面收窄”删除。
    * @param rawResult 工具原始返回值
    */
   formatToolResult(toolName: string, rawResult: unknown) {
@@ -253,6 +276,20 @@ function looksLikeToolResultEnvelope(value: unknown): boolean {
  */
 export class ContextWindowAdapter extends MessageAdapter {
   #ctxWin;
+  /**
+   * 旧 duck-typed 窗口读视图兼容分支（临时兼容代码登记，I49 / U26-F6）：
+   * - 消费者：经 createMessageAdapter / ContextWindowAdapter 公开入口传入、没有合法
+   *   readViewRevision 的非标准窗口。当前没有生产消费者——唯一生产来源
+   *   SystemRunContextFactory.createContextWindow 与宿主都创建真实 ContextWindow（总有 readViewRevision），
+   *   只有 test/tool-resource-scope.test.ts 的 Proxy 用例能进入此分支。
+   * - 原因：这类窗口无法证明压缩后仍保留工具全文，增量复用（delta reuse）不安全；与其拒绝窗口，
+   *   不如保持工具可用、只禁用增量复用（构造时 warn 一次）。
+   * - 行为：readViewRevision getter 每次读取都自增，是有意让每次请求换视图，不是副作用缺陷。
+   * - 移除条件：待决事项③“单宿主假设与旧宿主兼容分支”确认只接受真实 ContextWindow 后，删除本分支，
+   *   构造参数收紧为必须带 readViewRevision。
+   * - 清理触发点：③ 的决定落地时，同一提交删除本字段、getter 中的兼容路径与上述 Proxy 用例。
+   * - 负责：AlembicAgent（runtime/MessageAdapter 所有者）。
+   */
   readonly #legacyReadView: boolean;
 
   constructor(ctxWin: ContextWindow) {
@@ -267,14 +304,19 @@ export class ContextWindowAdapter extends MessageAdapter {
     }
   }
 
-  /** 获取底层 ContextWindow 实例 (供 forcedSummary 等外部逻辑使用) */
+  /**
+   * 获取底层 ContextWindow 实例。
+   * @deprecated 兼容保留、运行时不使用：强制摘要不读上下文窗口，AgentRuntime 直接持有 ctx.contextWindow。
+   *   随待决事项②“公开面收窄”删除。
+   */
   get contextWindow() {
     return this.#ctxWin;
   }
 
   get readViewRevision(): number {
     if (this.#legacyReadView) {
-      // 旧 duck-typed window 不能证明压缩后仍保留全文；每次请求换视图，保持工具可用。
+      // 兼容分支（登记见 #legacyReadView）：旧 duck-typed window 不能证明压缩后仍保留全文；
+      // 每次读取自增、每次请求换视图，保持工具可用但禁用增量复用。
       this.invalidateReadView();
       return super.readViewRevision;
     }
@@ -329,10 +371,12 @@ export class ContextWindowAdapter extends MessageAdapter {
     this.#ctxWin.resetToPromptOnly();
   }
 
+  /** @deprecated 兼容保留、运行时不使用，见 MessageAdapter.getToolResultQuota。 */
   getToolResultQuota() {
     return this.#ctxWin.getToolResultQuota();
   }
 
+  /** @deprecated 兼容保留、运行时不使用，见 MessageAdapter.compactIfNeeded。 */
   compactIfNeeded() {
     return this.#ctxWin.compactIfNeeded();
   }
@@ -354,8 +398,9 @@ export class ContextWindowAdapter extends MessageAdapter {
 /**
  * 简单数组消息管理 — 对话场景（以及未注入 contextWindow 的严格阶段）。
  *
- * 不做任何压缩，getToolResultQuota 返回固定 8000，compactIfNeeded 始终返回 no-op；
- * compactForProviderInputBudget 沿用基类：如实测量 token，超出阶段预算时告警并标明未执行。
+ * 不做任何压缩；compactForProviderInputBudget 沿用基类：如实测量 token，超出阶段预算时告警并标明未执行。
+ * 兼容成员 getToolResultQuota（固定 8000 字符）与 compactIfNeeded（恒 no-op）运行时不使用，
+ * 改这里的配额不会影响真实工具结果裁剪（真实路径是 BudgetController + projectToolReceipt）。
  * 消息语义（nudge 替换、submit 参数压缩、工具结果元数据）与 ContextWindow 共用同一组纯函数。
  */
 export class SimpleArrayAdapter extends MessageAdapter {
@@ -435,6 +480,7 @@ export class SimpleArrayAdapter extends MessageAdapter {
   }
 
   resetToPromptOnly() {
+    // 仅保留首条消息：有 history 时是 history 首条，不是本次任务 prompt（见基类说明）。
     const first = this.#messages[0];
     this.invalidateReadView();
     this.#messages.length = 0;
@@ -443,10 +489,12 @@ export class SimpleArrayAdapter extends MessageAdapter {
     }
   }
 
+  /** @deprecated 兼容保留、运行时不使用，见 MessageAdapter.getToolResultQuota。 */
   getToolResultQuota() {
     return { maxChars: 8000, maxMatches: 20 };
   }
 
+  /** @deprecated 兼容保留、运行时不使用，见 MessageAdapter.compactIfNeeded。 */
   compactIfNeeded() {
     return { level: 0, removed: 0 };
   }

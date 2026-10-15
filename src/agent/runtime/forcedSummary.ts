@@ -93,9 +93,16 @@ interface ForcedSummaryOpts {
   source?: string;
   toolCalls?: ToolCallRecord[];
   tracker?: { iteration?: number; pipelineType?: string };
+  /**
+   * @deprecated 兼容输入，函数不读取：摘要只用有界工具回执视图，不重放累积上下文。
+   * AgentRuntime 已停止传入（I49）；随待决事项②“公开面收窄”删除。
+   */
   contextWindow?: unknown;
   prompt: string;
-  /** Compatibility input; usage is returned rather than mutating this accumulator. */
+  /**
+   * @deprecated 兼容输入，函数不读取也不改写：本次摘要用量经返回值 tokenUsage 交给调用方统一累计。
+   * AgentRuntime 已停止传入（I49）；随待决事项②“公开面收窄”删除。
+   */
   tokenUsage?: TokenUsage;
   systemPrompt?: string;
   maxTokens?: number;
@@ -159,11 +166,13 @@ function resolveSummaryMode(
  * @param [opts.source] 'user' | 'system'
  * @param opts.toolCalls 工具调用记录
  * @param [opts.tracker] ExplorationTracker 实例
- * @param [opts.contextWindow] 保留的兼容输入；摘要使用独立的有界观察视图
+ * @param [opts.contextWindow] 已废弃的兼容输入，不读取；摘要使用独立的有界观察视图
  * @param opts.prompt 原始用户 prompt
- * @param [opts.tokenUsage] 保留的兼容输入；用量返回给调用方统一累计
+ * @param [opts.tokenUsage] 已废弃的兼容输入，不读取也不改写；用量经返回值交给调用方统一累计
  * @param [opts.summaryMode] 显式摘要契约；不传时按 source + tracker.pipelineType 推断
- * @returns }>}
+ * @returns `{ reply, tokenUsage, degraded }`：reply 为摘要正文（none 模式为空串，取消时为停止文案），
+ *   tokenUsage 为本次摘要调用的用量（input/output/reasoning/cacheHit），degraded 表示模型失败或
+ *   返回空文本后改用了按模式选择形状的兜底文本
  */
 export async function produceForcedSummary({
   abortSignal,
@@ -445,4 +454,8 @@ function buildToolContextForUserSummary(toolCalls: ToolCallRecord[]) {
   return sections.join('\n\n') || '（工具调用记录为空）';
 }
 
+/**
+ * @deprecated 默认导出没有消费者（runtime 公开子路径与仓库内都只用命名导出 produceForcedSummary）；
+ * 请改用命名导入。随待决事项②“公开面收窄”删除。
+ */
 export default produceForcedSummary;
