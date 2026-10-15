@@ -7,7 +7,10 @@ import { WorkspaceResolver } from '@alembic/core/workspace';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EpisodicConsolidator } from '../src/agent/memory/EpisodicConsolidator.js';
-import { MemoryConsolidator } from '../src/agent/memory/MemoryConsolidator.js';
+import {
+  type CandidateMemory,
+  MemoryConsolidator,
+} from '../src/agent/memory/MemoryConsolidator.js';
 import { readPersistentMemorySection } from '../src/agent/memory/MemoryPrompt.js';
 // MemoryRetriever 未从 src/index.ts barrel 导出 → 必须走直接路径（barrel 路径会编译失败）。
 import { MemoryRetriever } from '../src/agent/memory/MemoryRetriever.js';
@@ -728,6 +731,584 @@ describe('MemoryStore dedupe similarity, candidate window and maintenance (L6-P3
       expect(merged?.content).toContain('prompt ranking');
       expect(merged?.relatedMemories).toEqual([expect.stringMatching(/^merged:\d+$/)]);
     } finally {
+      db.close();
+    }
+  });
+});
+
+describe('MemoryConsolidator write-path correctness (L6-P4)', () => {
+  /** 收集注入 logger 的 info 文本；宿主只注入 info，debug/warn 都会回退到这里。 */
+  function captureLogger() {
+    const messages: string[] = [];
+    return { messages, logger: { info: (msg: string) => messages.push(msg) } };
+  }
+
+  /** 52 字的重复短语：重复不增加 token 集合，用于构造接近 500 字、相似度仍落在 MERGE 区间的正文。 */
+  const CONSOLIDATION_PHRASE = 'memory consolidation keeps related findings together';
+  const repeatPhrase = (times: number) => Array(times).fill(CONSOLIDATION_PHRASE).join(' ');
+
+  it('keeps consistent findings from different dimensions that merely mention avoid', () => {
+    const db = new Database(':memory:');
+    const memory = new PersistentMemory(db);
+    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      session.storeDimensionReport('arch-layers', {
+        findings: [
+          {
+            finding: 'Avoid direct database access from controllers',
+            evidence: 'src/controllers/UserController.ts:10',
+            importance: 8,
+          },
+        ],
+      });
+      session.storeDimensionReport('data-access', {
+        findings: [
+          {
+            finding: 'Controllers use the service layer for database access',
+            evidence: 'src/services/UserService.ts:20',
+            importance: 4,
+          },
+        ],
+      });
+      const result = new EpisodicConsolidator(memory, { logger: { info() {} } }).consolidate(
+        session,
+        { bootstrapSession: 'run-1' }
+      );
+      expect(result.total).toMatchObject({ added: 2, updated: 0, merged: 0 });
+      expect(result.total).not.toHaveProperty('replaced');
+      const store = new MemoryStore(db);
+      const rows = store
+        .getAllActive()
+        .map((row) => MemoryStore.deserialize(row))
+        .sort((a, b) => a.content.localeCompare(b.content));
+      expect(
+        rows.map(({ content, sourceDimension, sourceEvidence, importance }) => ({
+          content,
+          sourceDimension,
+          sourceEvidence,
+          importance,
+        }))
+      ).toEqual([
+        {
+          content: 'Avoid direct database access from controllers',
+          sourceDimension: 'arch-layers',
+          sourceEvidence: 'src/controllers/UserController.ts:10',
+          importance: 8,
+        },
+        {
+          content: 'Controllers use the service layer for database access',
+          sourceDimension: 'data-access',
+          sourceEvidence: 'src/services/UserService.ts:20',
+          importance: 4,
+        },
+      ]);
+
+      // 中文“禁止 + 共享 2 个词”与话题几乎无关的 deprecated 陈述同样不能互相覆盖。
+      const pairs: Array<[string, string]> = [
+        [
+          '禁止在 View 层直接调用 NetworkManager 发起请求',
+          'ViewModel 统一通过 NetworkManager 发起请求',
+        ],
+        [
+          'The legacy fetchUser API is deprecated in favor of UserRepository.load',
+          'UserRepository.load caches user records in memory',
+        ],
+      ];
+      for (const [first, second] of pairs) {
+        const { messages, logger } = captureLogger();
+        const stats = new MemoryConsolidator(store, { logger }).consolidate([
+          { type: 'fact', content: first, sourceDimension: 'dim-a', importance: 7 },
+          { type: 'fact', content: second, sourceDimension: 'dim-b', importance: 5 },
+        ]);
+        expect(stats).toMatchObject({ added: 2, updated: 0, merged: 0 });
+        expect(stats).not.toHaveProperty('replaced');
+        // 旧判定会覆盖的“一方含否定词”相似对，现在只进汇总诊断计数，便于回看漏判风险。
+        expect(
+          messages.some(
+            (msg) =>
+              msg.includes('Consolidation:') &&
+              /opposite-polarity pairs below contradiction gate=[1-9]/.test(msg)
+          )
+        ).toBe(true);
+      }
+      expect(store.size()).toBe(6);
+    } finally {
+      session.dispose();
+      db.close();
+    }
+  });
+
+  it('keeps a same-batch contradiction from another dimension as a separate memory with a diagnostic', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { messages, logger } = captureLogger();
+      const stats = new MemoryConsolidator(store, { logger }).consolidate(
+        [
+          {
+            type: 'fact',
+            content: 'Avoid global mutable singletons in the payment module',
+            sourceDimension: 'architecture',
+            importance: 7,
+          },
+          {
+            type: 'fact',
+            content: 'Use global mutable singletons in the payment module',
+            sourceDimension: 'performance',
+            importance: 5,
+          },
+        ],
+        { bootstrapSession: 'run-1' }
+      );
+      // 不覆盖，也不把正反两句 MERGE 成一条：同批不同维度的“矛盾”改为各自保留。
+      expect(stats).toMatchObject({ added: 2, updated: 0, merged: 0 });
+      expect(stats).not.toHaveProperty('replaced');
+      expect(
+        store
+          .getAllActive()
+          .map((row) => [row.content, row.source_dimension])
+          .sort()
+      ).toEqual([
+        ['Avoid global mutable singletons in the payment module', 'architecture'],
+        ['Use global mutable singletons in the payment module', 'performance'],
+      ]);
+      const diagnostic = messages.find((msg) => msg.includes('kept as a separate memory'));
+      expect(diagnostic).toBeDefined();
+      expect(diagnostic).toContain('architecture');
+      expect(diagnostic).toContain('performance');
+
+      // 同一维度的正反陈述仍按矛盾替换（与“同句加否定”用例同一语义）。
+      const sameDimension = new MemoryConsolidator(store).consolidate(
+        [
+          {
+            type: 'fact',
+            content: 'Use lazy loading for the invoice reports screen',
+            sourceDimension: 'performance',
+          },
+          {
+            type: 'fact',
+            content: 'Avoid lazy loading for the invoice reports screen',
+            sourceDimension: 'performance',
+          },
+        ],
+        { bootstrapSession: 'run-1' }
+      );
+      expect(sameDimension).toMatchObject({ added: 1, replaced: 1 });
+      expect(store.getAllActive().map((row) => row.content)).toContain(
+        'Avoid lazy loading for the invoice reports screen'
+      );
+      expect(store.getAllActive().map((row) => row.content)).not.toContain(
+        'Use lazy loading for the invoice reports screen'
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it('replaces a cross-generation contradiction and moves source metadata to the new statement', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({
+        type: 'fact',
+        content: 'Use a transaction to update persistent memories',
+        sourceDimension: 'storage',
+        sourceEvidence: 'src/old/Store.ts:3',
+        tags: ['storage'],
+        relatedEntities: ['OldStore'],
+        bootstrapSession: 'run-1',
+        importance: 6,
+      });
+      const { messages, logger } = captureLogger();
+      const stats = new MemoryConsolidator(store, { logger }).consolidate(
+        [
+          {
+            type: 'fact',
+            content: 'Do not use a transaction to update persistent memories',
+            sourceDimension: 'persistence',
+            sourceEvidence: 'src/new/Writer.ts:9',
+            tags: ['persistence'],
+            relatedEntities: ['Writer'],
+            importance: 8,
+          },
+        ],
+        { bootstrapSession: 'run-2' }
+      );
+      expect(stats).toMatchObject({ added: 0, updated: 0, merged: 0, replaced: 1 });
+      expect(store.get(id)).toMatchObject({
+        content: 'Do not use a transaction to update persistent memories',
+        sourceDimension: 'persistence',
+        sourceEvidence: 'src/new/Writer.ts:9',
+        tags: ['storage', 'persistence'],
+        relatedEntities: ['OldStore', 'Writer'],
+        importance: 8,
+      });
+      expect(
+        messages.some((msg) => msg.includes('Consolidation:') && msg.includes('↺1 REPLACE'))
+      ).toBe(true);
+
+      // 新陈述没有证据时清掉旧证据：旧证据指向被推翻的那句话，留着就是来源错配。
+      new MemoryConsolidator(store).consolidate(
+        [{ type: 'fact', content: 'Use a transaction to update persistent memories' }],
+        { bootstrapSession: 'run-3' }
+      );
+      expect(store.get(id)).toMatchObject({
+        content: 'Use a transaction to update persistent memories',
+        sourceDimension: null,
+        sourceEvidence: null,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('does not fold an untyped candidate into a memory of another type', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const insight = 'Agent memory owns semantic recall and prompt retrieval';
+      const { id } = store.add({ type: 'insight', content: insight });
+      const stats = new MemoryConsolidator(store).consolidate([
+        { content: 'Agent memory owns semantic recall and prompt ranking', importance: 6 },
+      ]);
+      // 无 type 候选按 fact 处理：既不跨类型 MERGE 进 insight 行，也不在写入时换成别的缺省类型。
+      expect(stats).toMatchObject({ added: 1, updated: 0, merged: 0 });
+      expect(store.get(id)?.content).toBe(insight);
+      expect(store.getAllActive({ type: 'fact' }).map((row) => row.content)).toEqual([
+        'Agent memory owns semantic recall and prompt ranking',
+      ]);
+    } finally {
+      db.close();
+    }
+
+    // type 为空字符串与缺省同义：同样只在 fact 行里找相似记忆，写入时也落为 fact。
+    const emptyTypeDb = new Database(':memory:');
+    try {
+      const store = new MemoryStore(emptyTypeDb);
+      const insight = 'Agent memory owns semantic recall and prompt retrieval';
+      const { id } = store.add({ type: 'insight', content: insight });
+      const stats = new MemoryConsolidator(store).consolidate([
+        { type: '', content: 'Agent memory owns semantic recall and prompt scoring' },
+      ]);
+      expect(stats).toMatchObject({ added: 1, updated: 0, merged: 0 });
+      expect(store.get(id)?.content).toBe(insight);
+      expect(store.getAllActive({ type: 'fact' }).map((row) => row.content)).toEqual([
+        'Agent memory owns semantic recall and prompt scoring',
+      ]);
+    } finally {
+      emptyTypeDb.close();
+    }
+  });
+
+  it('unions provenance on UPDATE, keeps the highest importance and bumps access_count', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const content = 'The project uses Zustand for global state management';
+      const { id } = store.add({
+        type: 'fact',
+        content,
+        sourceDimension: 'state',
+        tags: ['state'],
+        relatedEntities: ['StoreProvider'],
+        importance: 7,
+      });
+      const consolidator = new MemoryConsolidator(store);
+      expect(
+        consolidator.consolidate([
+          {
+            type: 'fact',
+            content,
+            sourceDimension: 'ui',
+            sourceEvidence: 'src/ui/App.tsx:4',
+            tags: ['ui', 'state'],
+            relatedEntities: ['App', 'StoreProvider'],
+            importance: 5,
+          },
+        ])
+      ).toMatchObject({ added: 0, updated: 1, merged: 0 });
+      expect(store.get(id)).toMatchObject({
+        content,
+        importance: 7,
+        accessCount: 1,
+        // 单值来源字段：已有值保留，空值才补；多值字段取并集，后到维度经 tags 可追溯。
+        sourceDimension: 'state',
+        sourceEvidence: 'src/ui/App.tsx:4',
+        tags: ['state', 'ui'],
+        relatedEntities: ['StoreProvider', 'App'],
+      });
+
+      consolidator.consolidate([
+        {
+          type: 'fact',
+          content,
+          sourceDimension: 'routing',
+          sourceEvidence: 'src/routing/Router.tsx:8',
+          tags: ['routing'],
+          importance: 9,
+        },
+      ]);
+      expect(store.get(id)).toMatchObject({
+        importance: 9,
+        accessCount: 2,
+        sourceDimension: 'state',
+        sourceEvidence: 'src/ui/App.tsx:4',
+        tags: ['state', 'ui', 'routing'],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('unions tags and related entities on MERGE without overwriting existing provenance', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const { id } = store.add({
+        type: 'fact',
+        content: 'Agent memory owns semantic recall and prompt retrieval',
+        sourceDimension: 'memory',
+        sourceEvidence: 'src/a/Recall.ts:1',
+        tags: ['memory'],
+        relatedEntities: ['Recall'],
+        importance: 5,
+      });
+      const stats = new MemoryConsolidator(store).consolidate([
+        {
+          type: 'fact',
+          content: 'Agent memory owns semantic recall and prompt ranking',
+          sourceDimension: 'ranking',
+          sourceEvidence: 'src/b/Rank.ts:2',
+          tags: ['ranking'],
+          relatedEntities: ['Rank'],
+          importance: 6,
+        },
+      ]);
+      expect(stats).toMatchObject({ added: 0, updated: 0, merged: 1 });
+      expect(store.get(id)).toMatchObject({
+        content:
+          'Agent memory owns semantic recall and prompt retrieval; Agent memory owns semantic recall and prompt ranking',
+        importance: 6,
+        sourceDimension: 'memory',
+        sourceEvidence: 'src/a/Recall.ts:1',
+        tags: ['memory', 'ranking'],
+        relatedEntities: ['Recall', 'Rank'],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('downgrades MERGE to ADD when the merged text would exceed 500 characters', () => {
+    const candidate = `${CONSOLIDATION_PHRASE} with zetaunique markers`;
+    const cases = [
+      { label: 'near the limit', existing: repeatPhrase(9), candidate },
+      {
+        label: 'partial truncation',
+        existing: repeatPhrase(6),
+        candidate: `${repeatPhrase(4)} with zetaunique markers`,
+      },
+    ];
+    for (const { label, existing, candidate: incoming } of cases) {
+      const db = new Database(':memory:');
+      try {
+        const store = new MemoryStore(db);
+        const { id } = store.add({ type: 'fact', content: existing });
+        const { messages, logger } = captureLogger();
+        const stats = new MemoryConsolidator(store, { logger }).consolidate([
+          { type: 'fact', content: incoming, sourceDimension: 'dim-b', importance: 6 },
+        ]);
+        expect(stats, label).toMatchObject({ added: 1, updated: 0, merged: 0 });
+        expect(store.get(id)?.content, label).toBe(existing);
+        expect(
+          store.getAllActive().map((row) => row.content),
+          label
+        ).toContain(incoming);
+        const downgrade = messages.find((msg) => msg.includes('MERGE→ADD'));
+        expect(downgrade, label).toBeDefined();
+        expect(downgrade, label).toContain(`existing=${existing.length}`);
+        expect(downgrade, label).toContain(`candidate=${incoming.length}`);
+        expect(downgrade, label).toMatch(/sim=0\.\d\d/);
+      } finally {
+        db.close();
+      }
+    }
+
+    // 合并后恰好 500 字仍允许 MERGE，新候选完整保留。
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const existing = repeatPhrase(8);
+      const incoming = `${CONSOLIDATION_PHRASE} with zetaunique marker`;
+      expect(existing.length + 2 + incoming.length).toBe(500);
+      const { id } = store.add({ type: 'fact', content: existing });
+      expect(
+        new MemoryConsolidator(store).consolidate([{ type: 'fact', content: incoming }])
+      ).toMatchObject({ added: 0, merged: 1 });
+      expect(store.get(id)?.content).toBe(`${existing}; ${incoming}`);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('counts an over-long MERGE whose candidate is already contained as UPDATE', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const sentence = 'Session store keeps dimension digests for later tiers';
+      const existing = `${sentence}. ${Array(5)
+        .fill('checkpoint writer persists bootstrap progress atomically under workspace quotas')
+        .join('. ')}`;
+      expect(existing.length + 2 + sentence.length).toBeGreaterThan(500);
+      const { id } = store.add({ type: 'fact', content: existing, importance: 4 });
+      const stats = new MemoryConsolidator(store).consolidate([
+        { type: 'fact', content: sentence, tags: ['session'], importance: 6 },
+      ]);
+      // 候选已被已有行吸收：不重复 ADD，也不计 merged。
+      expect(stats).toMatchObject({ added: 0, updated: 1, merged: 0 });
+      expect(store.size()).toBe(1);
+      expect(store.get(id)).toMatchObject({
+        content: existing,
+        importance: 6,
+        accessCount: 1,
+        tags: ['session'],
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps every finding when one batch repeatedly merges into the same topic', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const words = [
+        'alpha',
+        'bravo',
+        'charlie',
+        'delta',
+        'echo',
+        'foxtrot',
+        'golf',
+        'hotel',
+        'india',
+        'juliet',
+        'kilo',
+        'lima',
+      ];
+      const markers = words.map((word) => `${word}zq${word.length}`);
+      const stats = new MemoryConsolidator(store).consolidate(
+        words.map((word, index) => ({
+          type: 'fact',
+          content: `The completion step persists dimension findings into semantic memory after each bootstrap run for ${markers[index]} and ${word}unit`,
+          importance: 6,
+        }))
+      );
+      const contents = store.getAllActive().map((row) => row.content);
+      for (const marker of markers) {
+        expect(contents.some((content) => content.includes(marker))).toBe(true);
+      }
+      expect(contents.every((content) => content.length <= 500)).toBe(true);
+      expect(stats.updated).toBe(0);
+      expect(stats.added + stats.merged).toBe(words.length);
+      expect(stats.added).toBeGreaterThan(1);
+      expect(stats.added).toBe(contents.length);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('drops malformed candidate provenance with warnings and caps merged lists without losing existing items', () => {
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const content = 'The project uses Zustand for global state management';
+      const existingTags = Array.from({ length: 19 }, (_, index) => `tag-${index}`);
+      const { id } = store.add({ type: 'fact', content, tags: existingTags });
+      const messages: string[] = [];
+      const logger = {
+        info: (msg: string) => messages.push(`info ${msg}`),
+        warn: (msg: string) => messages.push(`warn ${msg}`),
+        debug: (msg: string) => messages.push(`debug ${msg}`),
+      };
+      // 运行时来自 JS 调用方的畸形字段：类型层面不可能，这里经 unknown 构造（测试边界，非生产代码）。
+      const malformed = {
+        type: 'fact',
+        content,
+        sourceDimension: 42,
+        relatedEntities: 'NotAnArray',
+        tags: ['tag-0', 'extra-a', 7, '', 'extra-b'],
+      } as unknown as CandidateMemory;
+      expect(new MemoryConsolidator(store, { logger }).consolidate([malformed])).toMatchObject({
+        updated: 1,
+      });
+      const row = store.get(id);
+      // 已有 19 个 tag 全部保留，新增项只补到上限 20。
+      expect(row?.tags).toEqual([...existingTags, 'extra-a']);
+      expect(row?.relatedEntities).toEqual([]);
+      expect(row?.sourceDimension).toBeNull();
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(
+            /^warn .*Candidate sourceDimension ignored: expected a string, got number/
+          ),
+          expect.stringMatching(
+            /^warn .*Candidate relatedEntities ignored: expected a string array, got string/
+          ),
+          expect.stringMatching(/^warn .*Candidate tags dropped 2 non-string or empty item\(s\)/),
+          expect.stringMatching(new RegExp(`^debug .*tags of ${id} reached 20 items; dropped 1`)),
+        ])
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it('reports replaced counts in the Episodic summary log and receipt', () => {
+    const db = new Database(':memory:');
+    const { messages, logger } = captureLogger();
+    const memory = new PersistentMemory(db, { logger });
+    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    try {
+      const { id } = memory.add({
+        type: 'fact',
+        content: 'Use a transaction to update persistent memories',
+        source: 'bootstrap',
+        sourceDimension: 'runtime',
+        bootstrapSession: 'run-1',
+      });
+      session.storeDimensionReport('runtime', {
+        findings: [
+          {
+            finding: 'Do not use a transaction to update persistent memories',
+            evidence: 'src/runtime/Tx.ts:7',
+            importance: 8,
+          },
+        ],
+      });
+      const result = new EpisodicConsolidator(memory, { logger }).consolidate(session, {
+        bootstrapSession: 'run-2',
+      });
+      expect(result.total).toMatchObject({ added: 0, updated: 0, merged: 0, replaced: 1 });
+      expect(memory.get(id)).toMatchObject({
+        content: 'Do not use a transaction to update persistent memories',
+        sourceDimension: 'runtime',
+        sourceEvidence: 'src/runtime/Tx.ts:7',
+        tags: ['runtime'],
+      });
+      expect(
+        messages.some(
+          (msg) =>
+            msg.includes('[Consolidator] Consolidation complete') && msg.includes('↺1 REPLACE')
+        )
+      ).toBe(true);
+      expect(
+        messages.some(
+          (msg) => msg.includes('[MemoryConsolidator] Consolidation:') && msg.includes('↺1 REPLACE')
+        )
+      ).toBe(true);
+    } finally {
+      session.dispose();
       db.close();
     }
   });

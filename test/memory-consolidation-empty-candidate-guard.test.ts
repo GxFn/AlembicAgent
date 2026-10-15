@@ -357,7 +357,8 @@ describe('MemoryConsolidator empty-candidate double guard (C26 / C33)', () => {
       compact: vi.fn(),
       enforceCapacity: vi.fn(),
       findSimilar: vi.fn(() => opts.similar ?? []),
-      add: vi.fn(),
+      // 与 MemoryStore.add 的返回契约一致：固化用返回的 id 判定“同批”行（L6-P4）。
+      add: vi.fn(() => ({ id: 'added-1', action: 'ADD' })),
       update: vi.fn(),
     };
     return store;
@@ -407,9 +408,15 @@ describe('MemoryConsolidator empty-candidate double guard (C26 / C33)', () => {
     expect(stats).toEqual({ added: 1, updated: 0, merged: 0, skipped: 0 });
     expect(store.clearBootstrapMemories).toHaveBeenCalledTimes(1);
     expect(store.compact).toHaveBeenCalledTimes(1);
+    // 写入前候选已归一化：type 缺省落为 fact，来源与列表字段为空值（L6-P4 / C28）。
     expect(store.add).toHaveBeenCalledWith({
       content: 'brand new bootstrap fact for this generation',
       source: 'bootstrap',
+      type: 'fact',
+      sourceDimension: null,
+      sourceEvidence: null,
+      tags: [],
+      relatedEntities: [],
       bootstrapSession: 'gen-2',
     });
     const staged = lines.filter((l) => l.message.includes('Bootstrap replacement staged'));

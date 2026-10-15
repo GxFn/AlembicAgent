@@ -139,6 +139,13 @@ export interface MemoryUpdates {
   relatedEntities?: string[];
   relatedMemories?: string[];
   tags?: string[];
+  /**
+   * 来源维度。undefined 表示不改；null 或空串清空该列。
+   * 固化的矛盾替换会把它同步为新陈述的来源，否则行内容与来源维度错配（C27）。
+   */
+  sourceDimension?: string | null;
+  /** 来源证据（文件:行）。语义同 sourceDimension：undefined 不改，null 或空串清空。 */
+  sourceEvidence?: string | null;
 }
 
 export class MemoryStoreWriteError extends Error {
@@ -300,6 +307,15 @@ export class MemoryStore {
     if (updates.tags !== undefined) {
       setClauses.push('tags = ?');
       params.push(JSON.stringify(updates.tags));
+    }
+    // 来源列与 add 的写法一致：空串归一为 NULL，避免出现“有值但为空”的第三种状态。
+    if (updates.sourceDimension !== undefined) {
+      setClauses.push('source_dimension = ?');
+      params.push(updates.sourceDimension || null);
+    }
+    if (updates.sourceEvidence !== undefined) {
+      setClauses.push('source_evidence = ?');
+      params.push(updates.sourceEvidence || null);
     }
 
     if (setClauses.length === 0) {

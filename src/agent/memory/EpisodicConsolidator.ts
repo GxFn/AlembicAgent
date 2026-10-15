@@ -52,6 +52,11 @@ interface ConsolidateResult {
   updated: number;
   merged: number;
   skipped: number;
+  /**
+   * 矛盾替换（就地改写已有记忆）的次数；MemoryConsolidator 只在 > 0 时给出。
+   * 替换是破坏性写入，回执与完成日志都要带上，否则汇总层面看不到覆盖了多少条（C32）。
+   */
+  replaced?: number;
 }
 
 /** 候选记忆条目 */
@@ -243,7 +248,7 @@ export class EpisodicConsolidator {
       'info',
       `[Consolidator] Consolidation complete in ${durationMs}ms: ` +
         `+${result.added} ADD, ~${result.updated} UPDATE, ⊕${result.merged} MERGE, ` +
-        `=${result.skipped} SKIP`
+        `↺${result.replaced ?? 0} REPLACE, =${result.skipped} SKIP`
     );
 
     return {
