@@ -219,9 +219,15 @@ export class AgentMessage {
   }
 
   // ─── Transport 工厂方法 ─────────────────────
+  // fromHttp/fromCli/fromMcp 均已 @deprecated：去留待全局事项②决定，决定前保留以免公开签名变化。
 
   /**
    * 从 HTTP 请求构建
+   *
+   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
+   * 身份风险：sender.id 直接取请求体 `body.userId`（其次 req.ip），未经宿主鉴权，调用方可自报身份，
+   * 从而伪造 SafetyPolicy `allowedSenders` 白名单；`body.prompt`/`history` 也不做形状校验。
+   * 若必须接 HTTP，请由宿主完成鉴权后用 `new AgentMessage({ sender })` 显式传入已鉴权身份。
    * @param req Express request
    * @param [replyFn] SSE 或 JSON 回复
    */
@@ -251,6 +257,10 @@ export class AgentMessage {
 
   /**
    * 从 CLI 输入构建
+   *
+   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
+   * 身份风险：sender 固定为 `cli-user`，未传 sessionId 时所有调用共用 `cli-session`，不同调用方之间
+   * 无法区分身份与会话；SafetyPolicy 白名单只能整体放行或拒绝 `cli-user`。
    * @param input 命令行输入
    */
   static fromCli(input: string, opts: CliOptions = {}) {
@@ -289,6 +299,10 @@ export class AgentMessage {
 
   /**
    * 从宿主注入的 MCP-like 请求构建；不实现 Codex MCP server 或插件路由。
+   *
+   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
+   * 身份风险：sender.id 直接取请求里的 `clientId`（缺省 `mcp-client`），未经宿主鉴权，调用方可自报身份
+   * 伪造 SafetyPolicy 白名单；`mcpReq.metadata` 会覆盖 toolName/arguments/mode 等同名键。
    * @param mcpReq normalized tool call request
    * @param [replyFn] 回复函数
    */

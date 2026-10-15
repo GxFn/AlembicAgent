@@ -479,9 +479,14 @@ export class AgentRuntime {
         reply: result.reply?.slice(0, 100),
       });
 
-      // 回复给原始渠道
+      // 回复给原始渠道：运行结论（finish/abort）已在上面确定，回写只是投递，失败不改判结论。
       if (message.replyFn && result.reply) {
-        await message.reply(result.reply);
+        await this.#deliverReply(
+          message,
+          result.reply,
+          diagnostics,
+          cancelled ? 'abort' : 'finish'
+        );
       }
 
       result.state = this.state.toJSON();
@@ -549,6 +554,54 @@ export class AgentRuntime {
       if (this.#executionAbortController === abortController) {
         this.#executionAbortController = null;
       }
+    }
+  }
+
+  /**
+   * replyFn 回写（I41/P42）。
+   *
+   * 调用时机在状态机 finish/abort 之后、AGENT_COMPLETED/AGENT_ABORTED 发布之前：此时运行结论已经确定，
+   * replyFn 只负责把回复投递回原始渠道。旧实现直接 await，replyFn 抛错会落入 execute 的 catch，
+   * 把已完成的结果改判为 failed 并发布 AGENT_FAILED。这里隔离投递失败：记 reply_delivery_failed
+   * 诊断（错误信息经脱敏，不记录回复正文）和 warn 日志，然后按原结论继续。
+   *
+   * 已知边界：replyFn 挂起仍会阻塞 execute 返回。为回写施加剩余期限/取消属于 transport 面的“保留路线”，
+   * 而 transport 工厂与 replyFn 回写的去留待全局事项②决定（推荐删除路线），本处不扩展该约束。
+   */
+  async #deliverReply(
+    message: AgentMessage,
+    reply: string,
+    diagnostics: DiagnosticsCollector,
+    outcome: 'finish' | 'abort'
+  ): Promise<void> {
+    try {
+      await message.reply(reply);
+    } catch (err: unknown) {
+      // 非 Error 拒绝值只接受字符串原文；其它类型只记类型，避免 String() 对异常对象再次抛错。
+      const rawMessage =
+        err instanceof Error
+          ? err.message
+          : typeof err === 'string'
+            ? err
+            : `non-Error rejection (${err === null ? 'null' : typeof err})`;
+      const errorMessage = redactDeveloperText(rawMessage);
+      diagnostics.warn({
+        code: 'reply_delivery_failed',
+        message: `replyFn delivery failed; run outcome kept as ${outcome}: ${errorMessage}`,
+      });
+      observeSafely(
+        () =>
+          this.logger.warn('[AgentRuntime] reply delivery failed; run outcome unchanged', {
+            runtimeId: this.id,
+            messageId: message.id,
+            channel: message.channel,
+            outcome,
+            replyLength: reply.length,
+            errorType: err instanceof Error ? err.name : typeof err,
+            error: errorMessage,
+          }),
+        () => undefined
+      );
     }
   }
 
