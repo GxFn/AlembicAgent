@@ -78,7 +78,10 @@
       ],
       "src/agent/runtime/processEvents.ts": ["src/agent/utils/Redaction.ts"],
       "src/agent/prompts/producerFindings.ts": [],
-      "src/agent/prompts/producerRetry.ts": ["src/agent/utils/toolOutcomes.ts"],
+      "src/agent/prompts/producerRetry.ts": [
+        "@alembic/core/knowledge",
+        "src/agent/utils/toolOutcomes.ts"
+      ],
       "src/agent/runs/result.ts": [],
       "src/ai/AiProviderManager.ts": [
         "@alembic/core/logging",

@@ -1,4 +1,5 @@
 import { buildEvidenceStarters } from '@alembic/core/host-agent-workflows';
+import { describeSubmitToolFields, isSoftAuthoringViolation } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
@@ -26,6 +27,12 @@ import {
   PRODUCER_SYSTEM_PROMPT,
 } from '../src/agent/prompts/insightProducer.js';
 import { buildProducerFindingsSection } from '../src/agent/prompts/producerFindings.js';
+import {
+  buildProducerRetryPrompt,
+  PRODUCER_SUBMIT_FIELD_CONTRACT,
+  PRODUCER_SUBMIT_HARD_GATES,
+  PRODUCER_SUBMIT_STYLE_ADVISORIES,
+} from '../src/agent/prompts/producerRetry.js';
 import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import type { EvolutionAuditRecipe } from '../src/agent/runs/evolution/EvolutionAgentRun.js';
 import {
@@ -460,6 +467,11 @@ describe('LLM input layering', () => {
       expect(prompt).toContain('global synonyms');
       expect(prompt).toContain('provider/vector');
       expect(prompt).toContain('non-whole-file bounded range');
+    }
+    // L6-P23（C59）：冷启动与增量扫描 Producer 的 knowledge.submit 字段清单也是同一份
+    // （Core describeSubmitToolFields 单源），不再各自手写。
+    for (const prompt of [coldStart, incremental]) {
+      expect(prompt).toContain(PRODUCER_SUBMIT_FIELD_CONTRACT);
     }
   });
 
@@ -3332,5 +3344,128 @@ describe('Producer finding triage only demotes ledger verification failures (L6-
     expect(confirmed).toContain('Legacy no-ledger finding');
     expect(confirmed).not.toContain('Ledger-unresolved finding');
     expect(pending).toContain('Ledger-unresolved finding');
+  });
+});
+
+/**
+ * L6-P23（C59）：Producer / Scan 的 knowledge.submit 字段合同此前有三份手写副本并已漂移——
+ * 重试提示要 content.pattern（门禁逐字比对，非逐字即 SNIPPET_MISMATCH 硬拒）且漏 whenClause /
+ * dontClause；scan extract 的来源示例是裸路径（SOURCE_REF_LINE_MISSING 反例）；summarize 要求
+ * 优先 pattern 却不提 scope: "narrow"；系统提示把祈使动词等软规则写成「必被拒」。
+ */
+describe('Producer/Scan submit field contract stays single-sourced (L6-P23 C59)', () => {
+  /** Core gateRules.ts 的 SOURCE_REF_RE 同形副本（Core 未导出该正则）：path:行 或 path:起-止。 */
+  const CORE_SOURCE_REF_RE = /^(.+?):(\d+)(?:-(\d+))?$/;
+  /** 提示里点名的门禁违规码（全大写、至少一个下划线）。 */
+  function gateCodesIn(text: string): string[] {
+    return [...new Set(text.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g) ?? [])];
+  }
+  const STYLE_HEADER = '风格建议——不阻断提交';
+
+  it('retry prompt drops content.pattern and reuses the shared field contract with whenClause/dontClause', () => {
+    const prompt = buildProducerRetryPrompt(undefined);
+    const fields = describeSubmitToolFields();
+
+    expect(prompt).toContain('你的 0 个提交被拒绝了');
+    // content.pattern 会被门禁当逐字证据探针，重试提示不得再要求模型补它。
+    expect(prompt).not.toContain('content.pattern');
+    expect(prompt).not.toMatch(/pattern:\s*"/);
+    expect(prompt).toContain('{ markdown: "...", rationale: "..." }');
+    expect(typeof PRODUCER_SUBMIT_FIELD_CONTRACT).toBe('string');
+    expect(prompt).toContain(PRODUCER_SUBMIT_FIELD_CONTRACT);
+    for (const key of ['whenClause', 'dontClause', 'doClause', 'trigger', 'content.rationale']) {
+      expect(prompt).toContain(`- ${key}: ${fields[key]}`);
+    }
+    // 长度 / 代码块只是风格建议：必须出现在「不阻断」分组里，而不是硬性清单里。
+    const styleAt = prompt.indexOf(STYLE_HEADER);
+    expect(styleAt).toBeGreaterThan(0);
+    expect(prompt.indexOf('STAGE3_MARKDOWN_TOO_SHORT')).toBeGreaterThan(styleAt);
+    expect(prompt.slice(0, styleAt)).not.toMatch(/≥\s*200/);
+    expect(prompt).toContain(PRODUCER_SUBMIT_HARD_GATES);
+    expect(prompt).toContain(PRODUCER_SUBMIT_STYLE_ADVISORIES);
+  });
+
+  it('cold-start Producer prompt renders the same field contract the retry and scan prompts use', () => {
+    const prompt = buildProducerPromptV2(
+      {
+        analysisText: 'FeatureCoordinator owns navigation state.',
+        evidenceMap: new Map(),
+        findings: [
+          {
+            evidence: 'Sources/App/Feature.swift:12',
+            finding: 'FeatureCoordinator owns navigation state.',
+            importance: 9,
+          },
+        ],
+        negativeSignals: [],
+        referencedFiles: ['Sources/App/Feature.swift'],
+      },
+      { id: 'design-patterns', label: 'Design Patterns' },
+      { name: 'Demo' }
+    );
+    expect(prompt).toContain(PRODUCER_SUBMIT_FIELD_CONTRACT);
+    expect(PRODUCER_SUBMIT_FIELD_CONTRACT).toContain('- whenClause:');
+    expect(PRODUCER_SUBMIT_FIELD_CONTRACT).toContain('- dontClause:');
+    expect(PRODUCER_SUBMIT_FIELD_CONTRACT).not.toContain('content.pattern');
+    // Core 字段说明缺失时合同会渲染成「- key: 」空行；在测试期拦住，而不是让提示静默缺说明。
+    expect(PRODUCER_SUBMIT_FIELD_CONTRACT).not.toMatch(/^- [\w.]+: (?:；|$)/m);
+    expect(PRODUCER_SUBMIT_FIELD_CONTRACT).toMatch(/- coreCode: [^\n]*逐字/);
+    for (const config of Object.values(SCAN_TASK_CONFIGS)) {
+      expect(config.producePrompt).toContain(PRODUCER_SUBMIT_FIELD_CONTRACT);
+    }
+  });
+
+  it('scan reasoning.sources examples carry a line range accepted by the Core SOURCE_REF_RE', () => {
+    const examples: string[] = [];
+    for (const config of Object.values(SCAN_TASK_CONFIGS)) {
+      for (const match of config.producePrompt.matchAll(
+        /reasoning\.sources[^[\n]*(\[[^\]\n]*\])/g
+      )) {
+        examples.push(...(JSON.parse(match[1] ?? '[]') as string[]));
+      }
+    }
+    // extract 提示必须给出示例，且每个示例都能过门禁的 path:start-end 解析。
+    expect(examples.length).toBeGreaterThan(0);
+    for (const sourceRef of examples) {
+      expect(sourceRef).toMatch(CORE_SOURCE_REF_RE);
+    }
+  });
+
+  it('summarize defaults single-file evidence to fact and requires scope: "narrow" for single-file pattern/rule', () => {
+    const prompt = SCAN_TASK_CONFIGS.summarize.producePrompt;
+    expect(prompt).not.toContain('优先 pattern');
+    expect(prompt).toMatch(/单文件证据默认 kind=fact/);
+    expect(prompt).toContain('scope: "narrow"');
+    expect(prompt).toMatch(/项目内真实文件[^\n]*path:起行-止行/);
+  });
+
+  it('splits hard gates from non-blocking style advisories in line with Core soft/hard grading', () => {
+    const hardCodes = gateCodesIn(PRODUCER_SUBMIT_HARD_GATES);
+    const styleCodes = gateCodesIn(PRODUCER_SUBMIT_STYLE_ADVISORIES);
+    expect(hardCodes).toEqual(
+      expect.arrayContaining([
+        'SOURCE_REF_LINE_MISSING',
+        'INSUFFICIENT_EVIDENCE',
+        'SNIPPET_MISMATCH',
+      ])
+    );
+    expect(styleCodes).toEqual(
+      expect.arrayContaining(['DO_CLAUSE_NON_IMPERATIVE', 'CONTENT_CONTRAST_MISSING'])
+    );
+    expect(hardCodes.filter((code) => isSoftAuthoringViolation(code))).toEqual([]);
+    expect(styleCodes.filter((code) => !isSoftAuthoringViolation(code))).toEqual([]);
+    expect(PRODUCER_SUBMIT_STYLE_ADVISORIES).toContain(STYLE_HEADER);
+
+    // 系统提示：硬约束块只列硬门；祈使动词等软规则归入「不阻断」分组。
+    const styleAt = PRODUCER_SYSTEM_PROMPT.indexOf(STYLE_HEADER);
+    const hardAt = PRODUCER_SYSTEM_PROMPT.indexOf('过门禁硬约束');
+    expect(hardAt).toBeGreaterThan(0);
+    expect(styleAt).toBeGreaterThan(hardAt);
+    const hardBlock = PRODUCER_SYSTEM_PROMPT.slice(hardAt, styleAt);
+    expect(hardBlock).not.toContain('祈使');
+    expect(hardBlock).not.toContain('必被拒');
+    expect(gateCodesIn(hardBlock).filter((code) => isSoftAuthoringViolation(code))).toEqual([]);
+    expect(PRODUCER_SYSTEM_PROMPT).toContain(PRODUCER_SUBMIT_STYLE_ADVISORIES);
+    expect(PRODUCER_SYSTEM_PROMPT.indexOf('DO_CLAUSE_NON_IMPERATIVE')).toBeGreaterThan(styleAt);
   });
 });

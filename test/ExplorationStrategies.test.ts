@@ -16,6 +16,11 @@ import { ExplorationTracker } from '../src/agent/context/index.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
+import {
+  PRODUCER_SUBMIT_FIELD_CONTRACT,
+  PRODUCER_SUBMIT_HARD_GATES,
+  PRODUCER_SUBMIT_STYLE_ADVISORIES,
+} from '../src/agent/prompts/producerRetry.js';
 import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
@@ -889,6 +894,13 @@ describe('independent R06 repaired-boundary cases', () => {
       expect(config.producePrompt).not.toContain('禁止补读源码');
       expect(config.producePrompt).not.toContain('仅可从已有 evidence 台账检索支撑');
       expect(config.producePrompt).not.toContain('未开放的 evidence');
+      // L6-P23（C59）：scan 的字段清单与门禁分级复用 Producer 共享合同，不再手写第二份；
+      // 共享合同也不得夹带 insight 的「不补读源码」限制（scan 允许 code.read 补读已定位文件）。
+      expect(config.producePrompt).toContain(PRODUCER_SUBMIT_FIELD_CONTRACT);
+      expect(config.producePrompt).toContain(PRODUCER_SUBMIT_HARD_GATES);
+      expect(config.producePrompt).toContain(PRODUCER_SUBMIT_STYLE_ADVISORIES);
+      expect(config.producePrompt).not.toContain('必填: trigger');
+      expect(config.producePrompt).not.toContain('不补读源码');
     }
     expect(SCAN_TASK_CONFIGS.extract.producePrompt).toContain('evidence.search');
   });

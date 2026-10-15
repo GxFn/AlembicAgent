@@ -7,10 +7,30 @@
  * 局部类型拆前 :23-68)已迁往 ../evaluation/stageBuilders.ts。
  * 本文件只保留纯文本任务配置 SCAN_TASK_CONFIGS。
  *
+ * L6-P23（C59）：knowledge.submit 字段清单与软硬门禁分级不再在这里手写，统一拼接
+ * ./producerRetry.ts 的共享合同（字段说明取自 Core describeSubmitToolFields），与冷启动
+ * Producer、拒绝重试提示逐字一致；本文件只保留 scan 自己的任务语义与工作流程。
+ *
  * @module scanPrompts
  */
 
 import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
+import {
+  PRODUCER_SUBMIT_FIELD_CONTRACT,
+  PRODUCER_SUBMIT_HARD_GATES,
+  PRODUCER_SUBMIT_STYLE_ADVISORIES,
+} from './producerRetry.js';
+
+/**
+ * scan 两个任务共用的提交合同段：硬门 / 风格建议分级 + 字段清单。scan 在 dimensionScopeId=scan:<label>
+ * 下按 cold-start 档位过门禁（3 文件下限、path:start-end 来源都生效），提示必须让模型事先知道，
+ * 而不是靠拒绝消息反推。共享段不含 insight 的「不补读源码」限制，scan 的 code.read 补读权限不变。
+ */
+const SCAN_SUBMIT_CONTRACT = [
+  PRODUCER_SUBMIT_HARD_GATES,
+  PRODUCER_SUBMIT_STYLE_ADVISORIES,
+  PRODUCER_SUBMIT_FIELD_CONTRACT,
+].join('\n\n');
 
 /**
  * task → Produce 阶段配置 (extract + summarize)
@@ -30,9 +50,9 @@ export const SCAN_TASK_CONFIGS = {
 每个候选必须:
 1. 有清晰的标题 (描述知识点的核心，使用项目真实类名，不以项目名开头)
 2. 有项目特写风格的正文 (content.markdown 字段，结合代码展示)
-3. 标注相关文件的完整相对路径 + 行号 (reasoning.sources，如 ["Packages/ModuleName/Sources/.../FileName.swift"])
+3. 标注相关文件的完整相对路径 + 行区间 (reasoning.sources，如 ["Packages/ModuleName/Sources/.../FileName.swift:42-58"]；裸路径会被门禁拒绝)
 4. 选择正确的 kind (rule/pattern/fact)
-5. 提供完整的 Cursor 交付字段 (trigger, doClause, whenClause 等)
+5. 按下方 knowledge.submit 字段合同填写全部必填交付字段 (trigger、whenClause、doClause、dontClause 等)
 6. 标注所属模块/包名（特别是来自本地子包的知识）
 
 ## 「项目特写」写作要求（content.markdown）
@@ -60,6 +80,8 @@ content.markdown 字段必须是「项目特写」：
 容错规则:
 - 证据不足时只用 code.read 补读 Analyst 已定位的文件；无法核实则列为 blocker，不编造来源，也不尝试路径变体。
 - 失败或未核实的发现不能变成已确认候选；保留已成功提交的实际回执。
+
+${SCAN_SUBMIT_CONTRACT}
 
 ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
@@ -92,9 +114,12 @@ ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
 ## 关键规则
 - 单文件通常提交 1 个候选，除非代码明确包含多个独立知识点
 - 台账在场时 params.reasoning.evidenceRefs 必填，使用真实 E-id；无台账按当前 schema 提供真实来源
-- kind 选择: 优先 pattern（代码模式）或 fact（技术事实）
-- 必填: trigger (@kebab-case)、doClause (英文祈使句)、content.rationale
-- content.markdown 必须包含代码块，展示核心实现
+- kind 选择: 单文件证据默认 kind=fact（技术事实）；只有确属该文件局部的模式/规则才用 pattern/rule，并且必须在 params 中显式声明 scope: "narrow"——rule/pattern 默认要求至少 3 个不同文件，否则会被门禁拒绝
+- 来源必须指向项目内真实文件并带行区间（reasoning.sources / (来源: …) 写 path:起行-止行）；找不到真实文件来源时不编造路径，列为 blocker
+- 必填字段以下方 knowledge.submit 字段合同为准（含 whenClause、dontClause、content.rationale）
+- content.markdown 应包含代码块，展示核心实现
+
+${SCAN_SUBMIT_CONTRACT}
 
 ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),

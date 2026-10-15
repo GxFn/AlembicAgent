@@ -22,7 +22,7 @@
  * @module insightProducer
  */
 
-import { describeSubmitToolFields, renderGuidance } from '@alembic/core/knowledge';
+import { renderGuidance } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
@@ -32,6 +32,12 @@ import {
   isDocEvidencePath,
 } from '../evidence/EvidenceCollector.js';
 import { buildProducerFindingsSection } from './producerFindings.js';
+// L6-P23（C59）：字段合同与软硬门禁分级的单源在 producerRetry（不在公开 barrel 内），冷启动、
+// scan 与拒绝重试三处提示共用，避免再出现手写副本漂移。
+import {
+  PRODUCER_SUBMIT_FIELD_CONTRACT,
+  PRODUCER_SUBMIT_STYLE_ADVISORIES,
+} from './producerRetry.js';
 
 // ──────────────────────────────────────────────────────────────────
 // 本地类型定义
@@ -110,15 +116,18 @@ export const PRODUCER_SYSTEM_PROMPT = `你是知识管理专家。你会收到�
 - 禁止: 不要搜索新文件、不要做额外分析、不要使用终端工具，专注于格式化和提交
 - 【跨维度去重】每条候选必须聚焦当前维度独有的视角，不得将同一知识点换个说法重复提交。相同的类/模式只在最相关的维度出现一次，宁可少提交也不要充数
 
-🚨 过门禁硬约束（不满足必被拒，白白浪费提交轮次；按此逐条自检后再 submit）:
+🚨 过门禁硬约束（不满足即拒，白白浪费提交轮次；按此逐条自检后再 submit）:
 - 展示性 sourceRefs / content.markdown 的 (来源: …) 必须【逐字复制】上面 Analyst evidence refs 里的「path:起行-止行」，务必带行号——绝不能只写路径（否则 SOURCE_REF_LINE_MISSING）。
 - rule / pattern 候选必须引用【至少 3 个不同文件】的 path:行（evidence refs 已给多个，选最相关的 3+ 个）；确实只涉及单文件时，才在 params 里显式加 scope: "narrow"（否则 INSUFFICIENT_EVIDENCE）。
 - coreCode 必须【逐字复制】上面「可复制 coreCode」提供的真实代码（它是接地证据位，凭空写会 SNIPPET_MISMATCH）；确无对应代码时省略 coreCode。
-- content.markdown 的代码块是「项目特写」的**范式模板**：以证据代码为素材提炼出可直接复用的规范形态（可去噪、简化、突出模式骨架），配 (来源: path:行号) 标注——绝不要整段粘贴项目原文充当正文代码（原文混乱无序，无范式意义）。
-- doClause 必须以英文祈使动词开头（use / prefer / require / keep / validate / ensure / return / follow / …，见上方门禁 45 词白名单）；dontClause 以 "Do not …" 开头（否则 DO_CLAUSE_NON_IMPERATIVE）。
+- content.markdown 的代码块可以提炼，但绝不能是 operation() / doThing / foo / TODO 之类占位代码（否则 PLACEHOLDER_EVIDENCE）。
+- doClause 与 dontClause 都必须非空（否则 DO_CLAUSE_REQUIRED / DONT_CLAUSE_REQUIRED）；措辞要求见下方风格建议。
 - 「依赖 / 分层 / 边界 / 上下游」等架构描述可正常使用（接地由 sourceRefs/coreCode 覆盖）。只有【具体调用链断言】（调用链 / 调用方 / 被调用 / caller / callee / invokes）需要 graph 背书：若下方提供了「可复制 graphRefs」，逐字复制相关条目进 reasoning.graphRefs；没有提供就不要写调用链断言，改为描述边界与结构。绝不自行编造 graphRefs（否则 GRAPH_REF_INVALID）。
 - sourceRefs / (来源:) 必须指向真实项目文件；精确 bounded 文档引用可为 retrieval profile 事实提供 provenance，但文档绝不可作为 coreCode 证据。coreCode 只能来自真实源码或配置文件的合格 bounded range。
 - 拒绝消息含 🛑 STOP 时必须立即遵守：放弃当前候选换下一条，或直接输出最终总结——绝不对同一候选第三次重试。
+
+${PRODUCER_SUBMIT_STYLE_ADVISORIES}
+- content.markdown 的代码块是「项目特写」的**范式模板**：以证据代码为素材提炼出可直接复用的规范形态（可去噪、简化、突出模式骨架），配 (来源: path:行号) 标注——不要整段粘贴项目原文充当正文代码（原文混乱无序，无范式意义）。
 
 容错规则:
 - 直接使用分析文本中已有的代码和描述来提交候选
@@ -157,9 +166,8 @@ export const PRODUCER_BUDGET = {
 // 规则上界（含 3-file 证据下限），与它实际面对的门禁一致。
 const STYLE_GUIDE = renderGuidance('in-process', undefined, 'cold-start').text;
 
-// 字段说明同样取自 Core spec 的 describeSubmitToolFields（FieldSpec 唯一来源）。必填与可选分组
-// 由 Agent 当前 submit schema 决定，避免把可选 coreCode 错标为必填。
-const PRODUCER_SUBMIT_FIELD_CONTRACT = buildProducerSubmitFieldContract();
+// 字段清单 PRODUCER_SUBMIT_FIELD_CONTRACT 改由 ./producerRetry.ts 单源提供（Core describeSubmitToolFields
+// 渲染说明、Agent schema/门禁决定必填与可选分组），与 scan 提示和拒绝重试提示逐字一致。
 
 // Core 字段说明仍是单一来源；阶段接线说明由 Agent 持有，不能把通用补读建议带入禁补读阶段。
 const PRODUCER_SUBMIT_REQUIREMENTS = `提交要求（以本次工具 schema 为准）:
@@ -169,31 +177,6 @@ const PRODUCER_SUBMIT_REQUIREMENTS = `提交要求（以本次工具 schema 为�
 4. 无台账的兼容运行按当前 schema 提供真实 sources / reasoning.sources；不要编造 E-id。来源采用完整相对路径及已验证行号。
 5. description 中文简述 ≤80 字，引用真实类名；content 必须同时包含 markdown 与 rationale。kind 仅 rule/pattern/fact。
 6. trigger、whenClause、doClause、dontClause 按字段说明填写；coreCode 可选且只能逐字复制已提供的合格代码片段。`;
-
-/** 从 Core spec 的字段描述表渲染 Producer 字段清单（说明 spec-sourced，分组 schema-sourced）。 */
-function buildProducerSubmitFieldContract(): string {
-  const fields = describeSubmitToolFields();
-  const requiredKeys = [
-    'title',
-    'description',
-    'content.markdown',
-    'content.rationale',
-    'kind',
-    'trigger',
-    'whenClause',
-    'doClause',
-    'dontClause',
-  ];
-  return [
-    '## knowledge.submit 必填字段（字段说明取自 Core RecipeAuthoringSpec，避免与门禁漂移）',
-    ...requiredKeys.map((key) => `- ${key}: ${fields[key] ?? ''}`),
-    '## knowledge.submit 证据字段（按本轮 schema 选择）',
-    '- reasoning.evidenceRefs: 维度台账在场时必填，使用真实工具返回的条目 ID；无台账时按当前 schema 提供 sources / reasoning.sources。',
-    `- reasoning.sources: ${fields['reasoning.sources'] ?? ''}；无台账兼容运行直接填写，维度台账运行的来源由宿主依据 reasoning.evidenceRefs 展开。`,
-    '## knowledge.submit 可选字段',
-    `- coreCode: ${fields.coreCode ?? ''}`,
-  ].join('\n');
-}
 
 // ──────────────────────────────────────────────────────────────────
 // Prompt 构建
