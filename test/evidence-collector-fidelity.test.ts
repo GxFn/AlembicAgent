@@ -19,6 +19,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import Logger from '@alembic/core/logging';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import { captureEvidenceFromEnvelope } from '../src/agent/evidence/EvidenceCapture.js';
@@ -1233,5 +1234,382 @@ describe('L7-P13 C10 共享严格展示剥离器', () => {
       { startLine: 1, endLine: 3, content: 'export const a = 1;\r\nexport const b = 2;\r\n' },
     ]);
     expect(explorationLog[0]?.effective).toBe(true);
+  });
+});
+
+// ─── L7-P14（module-review-2026-10-01 C13 / C56 / C57）：采集诊断计数与宿主结果归一化 ───
+// C13：提取异常的类型与消息、预算 / 每文件名额 / 单片段超预算导致的丢弃、锚点补齐的各类跳过都要可定位：
+//      Collector 维护私有计数，经 diagnostics() 暴露（不进 build() 返回值），analysisArtifact 并入日志。
+// C56：graph 宿主回执先记 graphRefs 再算结构摘要，非数组字段只丢该字段并计数，不再一处畸形丢光引用、留空壳。
+// C57：code.search 把多个模式的命中合并成一个列表、不标来源，多模式时不再把命中标成第一个模式。
+describe('L7-P14 采集诊断计数与宿主结果归一化', () => {
+  /** 与临时项目逐字一致的行范围端口（只认 src/alpha|beta|gamma.ts，其余视为读取失败）。 */
+  const projectReader: SnippetRangeReader = (filePath, startLine, endLine) => {
+    const m = filePath.match(/^src\/(alpha|beta|gamma)\.ts$/);
+    if (!m || startLine < 1 || startLine > 20) {
+      return null;
+    }
+    const effectiveEnd = Math.min(endLine, 20);
+    return {
+      content: fileLines(m[1] as 'alpha' | 'beta' | 'gamma', startLine, effectiveEnd),
+      endLine: effectiveEnd,
+    };
+  };
+
+  /** 读入 alpha 的三段互不重叠的范围，占满每文件片段名额（MAX_SNIPPETS_PER_FILE=3）。 */
+  function fillAlphaFileCap(collector: EvidenceCollector) {
+    for (const [start, end] of [
+      [1, 2],
+      [4, 5],
+      [7, 8],
+    ] as const) {
+      collector.processToolCall({
+        tool: 'code',
+        args: { action: 'read', path: 'src/alpha.ts' },
+        result: rangeReadDisplay('alpha', start, end),
+      });
+    }
+  }
+
+  it('C56: 畸形 protocols 不再吞掉同一回执里合法的宿主 graphRefs，字段被忽略并计数', () => {
+    const hostRef =
+      'graph:extends CachedStore -> Store [relation-site:root:src/cached.ts:extends:Store:L3-L3:0123456789abcdef]';
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'graph',
+      args: { action: 'query', params: { type: 'class', entity: 'Store' } },
+      envelope: {
+        ok: true,
+        status: 'success',
+        structuredContent: {
+          type: 'class',
+          entity: 'Store',
+          result: {
+            className: 'Store',
+            filePath: 'src/store.ts',
+            superClass: 'Base',
+            protocols: 'P',
+            methods: ['read', null, { selector: 'write:' }],
+            graphRefs: [hostRef],
+          },
+        },
+      },
+    });
+    const { graphEvidence, evidenceMap, explorationLog } = collector.build();
+    expect(graphEvidence).toEqual([hostRef]);
+    // 结构摘要照常落地：畸形字段只丢自己，不留只有 role 的空壳条目。
+    const entry = evidenceMap.get('src/store.ts');
+    expect(entry?.role).toBe('class-definition');
+    expect(entry?.summary).toContain('Class: Store');
+    expect(entry?.summary).toContain('Extends: Base');
+    expect(entry?.summary).toContain('Methods(3): read, ?, write:');
+    expect(entry?.summary).not.toContain('Implements');
+    expect(explorationLog[0]?.resultSummary).not.toContain('[evidence extraction failed');
+    expect(explorationLog[0]?.resultSummary).toContain('graph field ignored: protocols (string)');
+    expect(explorationLog[0]?.effective).toBe(true);
+    const diagnostics = collector.diagnostics();
+    expect(diagnostics.malformedHostFields).toBe(1);
+    expect(diagnostics.extractionErrors).toEqual([]);
+  });
+
+  it('C56: 旧直连协议回执的 conformers / methods 不是数组时只丢该字段，结构引用照旧拼出', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'graph',
+      args: { action: 'query', protocolName: 'Readable' },
+      result: {
+        protocolName: 'Readable',
+        filePath: 'src/readable.ts',
+        methods: { read: true },
+        conformers: 'Store',
+      },
+    });
+    const { graphEvidence, evidenceMap, explorationLog } = collector.build();
+    expect(graphEvidence).toEqual([
+      'graph:protocol Readable (src/readable.ts) — Protocol: Readable',
+    ]);
+    expect(evidenceMap.get('src/readable.ts')).toMatchObject({
+      role: 'protocol-definition',
+      summary: 'Protocol: Readable',
+    });
+    expect(explorationLog[0]?.resultSummary).toContain('graph field ignored: methods (object)');
+    expect(explorationLog[0]?.resultSummary).toContain('graph field ignored: conformers (string)');
+    expect(collector.diagnostics().malformedHostFields).toBe(2);
+  });
+
+  it('C56: 结构摘要阶段抛错只丢摘要：宿主引用照收，不留只有 role 的空壳条目', () => {
+    const hostRef =
+      'graph:extends CachedStore -> Store [relation-site:root:src/cached.ts:extends:Store:L3-L3:0123456789abcdef]';
+    const payload = {
+      className: 'Store',
+      filePath: 'src/store.ts',
+      graphRefs: [hostRef],
+      get properties(): unknown[] {
+        throw new RangeError('properties view unavailable');
+      },
+    };
+    const collector = new EvidenceCollector();
+    collector.processToolCall(
+      {
+        tool: 'graph',
+        args: { action: 'query', params: { type: 'class', entity: 'Store' } },
+        envelope: {
+          ok: true,
+          status: 'success',
+          structuredContent: { type: 'class', entity: 'Store', result: payload },
+        },
+      },
+      2
+    );
+    const { graphEvidence, evidenceMap, explorationLog } = collector.build();
+    expect(graphEvidence).toEqual([hostRef]);
+    expect(evidenceMap.has('src/store.ts')).toBe(false);
+    expect(explorationLog[0]?.resultSummary).toContain(
+      '[evidence extraction failed: RangeError: properties view unavailable]'
+    );
+    expect(explorationLog[0]?.effective).toBe(false);
+    expect(collector.diagnostics().extractionErrors).toEqual([
+      {
+        round: 2,
+        tool: 'graph',
+        action: 'query',
+        message: 'RangeError: properties view unavailable',
+      },
+    ]);
+  });
+
+  it('C13: 过长或多行的异常消息压成单行并截断，不撑大探索日志', () => {
+    const collector = new EvidenceCollector();
+    const longMessage = `line one\n${'x'.repeat(400)}`;
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { pattern: 'needle' } },
+      result: {
+        matches: [
+          {
+            file: 'src/a.ts',
+            line: 3,
+            get content(): string {
+              throw new Error(longMessage);
+            },
+          },
+        ],
+      },
+    });
+    const [error] = collector.diagnostics().extractionErrors;
+    expect(error?.message.startsWith('Error: line one xxx')).toBe(true);
+    expect(error?.message).not.toContain('\n');
+    expect(error?.message.endsWith('…')).toBe(true);
+    expect(error?.message.length).toBe(161);
+    expect(collector.build().explorationLog[0]?.resultSummary).toContain(
+      `[evidence extraction failed: ${error?.message}]`
+    );
+  });
+
+  it('C13: 提取异常的类型与消息写进探索日志并计入诊断，不再只剩一个前缀', () => {
+    const collector = new EvidenceCollector();
+    const explodingMatch = {
+      file: 'src/a.ts',
+      line: 3,
+      get content(): string {
+        throw new TypeError('host payload exploded');
+      },
+    };
+    collector.processToolCall(
+      {
+        tool: 'code',
+        args: { action: 'search', params: { pattern: 'needle' } },
+        result: { matches: [explodingMatch] },
+      },
+      4
+    );
+    const { explorationLog, evidenceMap } = collector.build();
+    expect(evidenceMap.size).toBe(0);
+    expect(explorationLog[0]?.resultSummary).toContain(
+      '[evidence extraction failed: TypeError: host payload exploded]'
+    );
+    expect(explorationLog[0]?.effective).toBe(false);
+    expect(collector.diagnostics().extractionErrors).toEqual([
+      { round: 4, tool: 'code', action: 'search', message: 'TypeError: host payload exploded' },
+    ]);
+  });
+
+  it('C13: 名额已满、预算耗尽、单片段超预算的丢弃分别计数', () => {
+    const capped = new EvidenceCollector();
+    fillAlphaFileCap(capped);
+    capped.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { pattern: 'alpha14' } },
+      result: {
+        matches: [{ file: 'src/alpha.ts', line: 15, content: fileLines('alpha', 15, 15) }],
+      },
+    });
+    expect(capped.build().evidenceMap.get('src/alpha.ts')?.codeSnippets).toHaveLength(3);
+    expect(capped.diagnostics()).toMatchObject({
+      droppedByFileCap: 1,
+      droppedByBudget: 0,
+      droppedOversize: 0,
+    });
+
+    // 首个片段恰好用尽 23 字符预算：之后的片段算预算耗尽；更小预算下放不进的片段算超预算。
+    const exhausted = new EvidenceCollector({ snippetBudget: fileLines('beta', 1, 1).length });
+    exhausted.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/beta.ts' },
+      result: rangeReadDisplay('beta', 1, 1),
+    });
+    exhausted.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/gamma.ts' },
+      result: rangeReadDisplay('gamma', 1, 1),
+    });
+    expect(exhausted.diagnostics()).toMatchObject({ droppedByBudget: 1, droppedOversize: 0 });
+
+    const oversize = new EvidenceCollector({ snippetBudget: 10 });
+    oversize.processToolCall({
+      tool: 'code',
+      args: { action: 'read', path: 'src/beta.ts' },
+      result: rangeReadDisplay('beta', 1, 2),
+    });
+    expect(oversize.build().evidenceMap.get('src/beta.ts')?.codeSnippets ?? []).toEqual([]);
+    expect(oversize.diagnostics()).toMatchObject({ droppedByBudget: 0, droppedOversize: 1 });
+  });
+
+  it('C13: 锚点补齐区分端口读不到、已覆盖、文档锚点、无效区间与名额已满', () => {
+    const collector = new EvidenceCollector();
+    fillAlphaFileCap(collector);
+    collector.groundFindingRefs(
+      [
+        { finding: '名额已满', evidence: '深层见 src/alpha.ts:15-17', importance: 9 },
+        { finding: '已覆盖', evidence: '头部见 src/alpha.ts:2', importance: 8 },
+        { finding: '读不到', evidence: '见 src/missing.ts:4', importance: 7 },
+        { finding: '文档', evidence: '见 docs/design.md:3', importance: 6 },
+        { finding: '倒序区间', evidence: '见 src/beta.ts:9-3', importance: 5 },
+      ],
+      projectReader
+    );
+    expect(collector.diagnostics()).toMatchObject({
+      droppedByFileCap: 1,
+      anchorAlreadyCovered: 1,
+      anchorReaderMiss: 1,
+      anchorDocSkipped: 1,
+      anchorInvalidRange: 1,
+    });
+    // diagnostics() 不进入 build() 返回值；每次返回独立快照。
+    expect(Object.keys(collector.build())).toEqual([
+      'evidenceMap',
+      'explorationLog',
+      'negativeSignals',
+      'graphEvidence',
+    ]);
+    const snapshot = collector.diagnostics();
+    snapshot.extractionErrors.push({ round: 0, tool: 'x', action: 'y', message: 'z' });
+    snapshot.droppedByFileCap = 99;
+    expect(collector.diagnostics().extractionErrors).toEqual([]);
+    expect(collector.diagnostics().droppedByFileCap).toBe(1);
+  });
+
+  it('C57: 多模式合并命中不再标成第一个模式；单模式与按模式分组的旧回执照旧标注', () => {
+    const collector = new EvidenceCollector();
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['alpha1', 'beta1'] } },
+      result: { matches: [{ file: 'src/beta.ts', line: 2, content: fileLines('beta', 2, 2) }] },
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['alpha1', 'gamma1'] } },
+      result: `1 matches (showing 1)\n\nsrc/gamma.ts:2: ${fileLines('gamma', 2, 2)}`,
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { pattern: 'alpha1' } },
+      result: { matches: [{ file: 'src/alpha.ts', line: 2, content: fileLines('alpha', 2, 2) }] },
+    });
+    collector.processToolCall({
+      tool: 'code',
+      args: { action: 'search', params: { patterns: ['beta5', 'gamma5'] } },
+      result: {
+        batchResults: {
+          gamma5: {
+            matches: [{ file: 'src/gamma.ts', line: 6, content: fileLines('gamma', 6, 6) }],
+          },
+        },
+      },
+    });
+    const { evidenceMap } = collector.build();
+    expect(evidenceMap.get('src/beta.ts')?.codeSnippets[0]).toEqual({
+      startLine: 2,
+      endLine: 2,
+      content: fileLines('beta', 2, 2),
+    });
+    expect(evidenceMap.get('src/gamma.ts')?.codeSnippets[0]).toEqual({
+      startLine: 2,
+      endLine: 2,
+      content: fileLines('gamma', 2, 2),
+    });
+    expect(evidenceMap.get('src/alpha.ts')?.codeSnippets[0]?.analystNote).toBe('search: "alpha1"');
+    expect(evidenceMap.get('src/gamma.ts')?.codeSnippets[1]?.analystNote).toBe('search: "gamma5"');
+  });
+
+  it('C13: buildAnalysisArtifact 把采集诊断与锚点补齐的丢弃原因并入日志', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const fillCalls = [
+        [1, 2],
+        [4, 5],
+        [7, 8],
+      ].map(([start, end]) => ({
+        tool: 'code',
+        args: { action: 'read', path: 'src/alpha.ts' },
+        result: rangeReadDisplay('alpha', start as number, end as number),
+      }));
+      const explodingCall = {
+        tool: 'code',
+        args: { action: 'search', params: { pattern: 'needle' } },
+        result: {
+          matches: [
+            {
+              file: 'src/a.ts',
+              line: 3,
+              get content(): string {
+                throw new Error('host payload exploded');
+              },
+            },
+          ],
+        },
+      };
+      buildAnalysisArtifact(
+        { reply: 'Alpha exports.', toolCalls: [...fillCalls, explodingCall] },
+        'architecture',
+        null,
+        {
+          distill: () => ({
+            keyFindings: [
+              { finding: '名额已满', evidence: 'src/alpha.ts:15-17', importance: 9 },
+              { finding: '读不到', evidence: 'src/missing.ts:4', importance: 7 },
+            ],
+            toolCallSummary: [],
+          }),
+        },
+        { projectRoot }
+      );
+      const warnings = warn.mock.calls.map(([entry]) => String(entry));
+      const collection = warnings.find((line) => line.includes('evidence collection'));
+      expect(collection).toContain('extractionErrors=1');
+      expect(collection).toContain('code.search: Error: host payload exploded');
+      expect(collection).toContain('(dim=architecture)');
+      const grounding = info.mock.calls
+        .map(([entry]) => String(entry))
+        .find((line) => line.includes('anchor grounding'));
+      expect(grounding).toContain('groundedSnippets=+0');
+      expect(grounding).toContain('readerMiss=1');
+      expect(grounding).toContain('droppedByFileCap=1');
+      expect(grounding).toContain('droppedByBudget=0');
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+    }
   });
 });

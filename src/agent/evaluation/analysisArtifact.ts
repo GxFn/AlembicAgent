@@ -188,16 +188,63 @@ export function buildAnalysisReport(
     analystResult,
     dimensionId,
     projectGraph,
-    collectToolEvidence(analystResult.toolCalls || [])
+    collectToolEvidence(analystResult.toolCalls || [], dimensionId)
   );
 }
 
-function collectToolEvidence(toolCalls: ToolCall[]): EvidenceCollector {
+/** Collector 采集诊断快照（只在本模块用于日志，不进入报告 / 工件返回值）。 */
+type CollectorDiagnostics = ReturnType<EvidenceCollector['diagnostics']>;
+
+/** 采集诊断日志里最多列出的提取异常条数（其余只计数）。 */
+const MAX_EXTRACTION_ERRORS_IN_LOG = 3;
+
+function collectToolEvidence(toolCalls: ToolCall[], dimensionId: string): EvidenceCollector {
   const collector = new EvidenceCollector();
   toolCalls.forEach((call, index) => {
     collector.processToolCall(call, index);
   });
+  reportCollectionDiagnostics(collector.diagnostics(), toolCalls.length, dimensionId);
   return collector;
+}
+
+/**
+ * 工具调用采集阶段的诊断日志（L7-P14 / C13）：Collector 吞掉的提取异常、被忽略的畸形 graph 字段，
+ * 以及预算 / 每文件名额 / 单片段超预算导致的丢弃。全为 0 时不打日志（常态无噪声）。
+ * 提取异常与畸形宿主字段说明宿主回执不符合契约 → warn；只有容量丢弃是预算控制的预期结果 → info。
+ */
+function reportCollectionDiagnostics(
+  diagnostics: CollectorDiagnostics,
+  toolCallCount: number,
+  dimensionId: string
+) {
+  const {
+    extractionErrors,
+    malformedHostFields,
+    droppedByBudget,
+    droppedByFileCap,
+    droppedOversize,
+  } = diagnostics;
+  const abnormal = extractionErrors.length > 0 || malformedHostFields > 0;
+  if (!abnormal && droppedByBudget + droppedByFileCap + droppedOversize === 0) {
+    return;
+  }
+  const listed = extractionErrors
+    .slice(0, MAX_EXTRACTION_ERRORS_IN_LOG)
+    .map((entry) => `#${entry.round} ${entry.tool}.${entry.action}: ${entry.message}`);
+  const more =
+    extractionErrors.length > MAX_EXTRACTION_ERRORS_IN_LOG
+      ? `; +${extractionErrors.length - MAX_EXTRACTION_ERRORS_IN_LOG} more`
+      : '';
+  const errorDetail = listed.length > 0 ? ` [${listed.join('; ')}${more}]` : '';
+  const line =
+    `[AnalysisArtifact] evidence collection diagnostics: toolCalls=${toolCallCount}, ` +
+    `extractionErrors=${extractionErrors.length}${errorDetail}, malformedHostFields=${malformedHostFields}, ` +
+    `droppedByBudget=${droppedByBudget}, droppedByFileCap=${droppedByFileCap}, ` +
+    `droppedOversize=${droppedOversize} (dim=${dimensionId})`;
+  observeSafely(
+    () => (abnormal ? logger().warn(line) : logger().info(line)),
+    () => undefined
+  );
 }
 
 /** V1 报告和 V2 工件共用同一采集投影，outline/失败/截断结果不能变成接地事实。 */
@@ -345,7 +392,7 @@ export function buildAnalysisArtifact(
   // 严格路径的语义只来自 Core 投影；legacy reply/tool trace 不得变成第二证据面。
   const toolCalls = opts.strictColdStart ? [] : analystResult.toolCalls || [];
 
-  const collector = collectToolEvidence(toolCalls);
+  const collector = collectToolEvidence(toolCalls, dimensionId);
   const baseReport = buildReportFromEvidence(
     opts.strictColdStart ? { ...analystResult, reply: '', toolCalls: [] } : analystResult,
     dimensionId,
@@ -387,18 +434,32 @@ export function buildAnalysisArtifact(
   let postHocLiveReadCount = 0;
   if (!opts.strictColdStart && opts.projectRoot) {
     const beforeSnippets = countSnippets(collector);
+    const beforeDiagnostics = collector.diagnostics();
     collector.groundFindingRefs(findings, createFsSnippetRangeReader(opts.projectRoot));
     const afterSnippets = countSnippets(collector);
+    const afterDiagnostics = collector.diagnostics();
     postHocLiveReadCount = Math.max(0, afterSnippets - beforeSnippets);
     const anchoredFindings = findings.filter(
       (f) => typeof f.evidence === 'string' && /\.[A-Za-z]\w*:\d+/.test(f.evidence)
     ).length;
-    // 残余根因分辨日志：anchored=0 → Analyst 没写行号锚（依从性缺口在上游）；
-    // anchored>0 且 grounded=0 → 锚点路径解析失败；grounded>0 仍被拒 → Producer 没照抄。
+    // 补齐阶段自己的跳过 / 丢弃：前后两次诊断快照求差，不混入工具调用采集阶段的计数。
+    const grounding = (key: Exclude<keyof CollectorDiagnostics, 'extractionErrors'>) =>
+      afterDiagnostics[key] - beforeDiagnostics[key];
+    // 残余根因分辨日志（下列计数按锚点，一条 finding 可带多个锚点）：
+    // anchored=0 → Analyst 没写行号锚（依从性缺口在上游）；
+    // anchored>0 且 grounded=0 → 看同行计数：readerMiss（路径越界 / 文件缺失 / 行号超界 / 读取失败）、
+    //   droppedByFileCap / droppedByBudget / droppedOversize（每文件名额或片段预算挡住补读）、
+    //   alreadyCovered（起始行已有片段覆盖）、docSkipped（文档锚点按设计不补）、invalidRange（行号无效）；
+    // grounded>0 仍被拒 → Producer 没照抄。
     observeSafely(
       () =>
         logger().info(
-          `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, groundedSnippets=+${afterSnippets - beforeSnippets} (dim=${dimensionId})`
+          `[AnalysisArtifact] anchor grounding: findings=${findings.length}, anchored=${anchoredFindings}, ` +
+            `groundedSnippets=+${afterSnippets - beforeSnippets}, readerMiss=${grounding('anchorReaderMiss')}, ` +
+            `alreadyCovered=${grounding('anchorAlreadyCovered')}, docSkipped=${grounding('anchorDocSkipped')}, ` +
+            `invalidRange=${grounding('anchorInvalidRange')}, droppedByFileCap=${grounding('droppedByFileCap')}, ` +
+            `droppedByBudget=${grounding('droppedByBudget')}, droppedOversize=${grounding('droppedOversize')} ` +
+            `(dim=${dimensionId})`
         ),
       () => undefined
     );

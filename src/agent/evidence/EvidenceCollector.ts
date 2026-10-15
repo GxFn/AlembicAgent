@@ -149,8 +149,29 @@ function describeRejectedReadDisplay(display: string): string {
   return 'not consecutive N| numbered source lines';
 }
 
-/** 一次读取里写进探索日志的展示说明最多列几条（batch 可能涉及很多文件）。 */
-const MAX_READ_NOTES_IN_LOG = 3;
+/** 一次工具调用写进探索日志的采集说明最多列几条（batch 读取可能涉及很多文件）。 */
+const MAX_CALL_NOTES_IN_LOG = 3;
+
+/** 提取异常写进探索日志与诊断的消息最多保留的字符数（防止宿主异常文本撑大 Producer 提示）。 */
+const MAX_EXTRACTION_ERROR_CHARS = 160;
+
+/**
+ * 把提取阶段吞掉的异常压成一行可定位的说明：`<类型>: <消息>`（非 Error 值按 String 转写）。
+ * 只用于诊断展示，不参与任何判定；转写本身失败时退回固定文案，不让诊断通道再抛错。
+ */
+function describeExtractionError(err: unknown): string {
+  let text: string;
+  try {
+    text = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  } catch (stringifyErr: unknown) {
+    void stringifyErr;
+    text = 'unprintable thrown value';
+  }
+  const singleLine = text.replace(/\s+/g, ' ').trim();
+  return singleLine.length > MAX_EXTRACTION_ERROR_CHARS
+    ? `${singleLine.slice(0, MAX_EXTRACTION_ERROR_CHARS)}…`
+    : singleLine;
+}
 
 /** 旧版 code.search 字符串回执的匹配行 `path:42: content`（兼容登记见 parseSearchOutputText） */
 const SEARCH_OUTPUT_LINE_RE = /^(.+?):(\d+): (.*)$/;
@@ -311,6 +332,63 @@ interface EvidenceCollectorOptions {
   snippetBudget?: number;
 }
 
+/** processToolCall 吞掉的一次提取异常（round 为调用序号，message 已压成单行并截断）。 */
+interface EvidenceExtractionError {
+  round: number;
+  tool: string;
+  action: string;
+  message: string;
+}
+
+/**
+ * 采集诊断计数（L7-P14 / C13）：区分“证据为什么没落地”。只经 diagnostics() 读取，不进入 build()
+ * 返回值与任何公开类型；由 analysisArtifact 并入采集日志与 anchor grounding 日志。
+ * 计数按锚点 / 片段累计（一条 finding 可能带多个锚点），与 build() 的片段数是两个口径。
+ */
+interface EvidenceCollectorDiagnostics {
+  /** processToolCall 中被捕获的提取异常（类型 + 消息），对应探索日志的 `[evidence extraction failed: …]`。 */
+  extractionErrors: EvidenceExtractionError[];
+  /** 片段预算已用尽后到达、直接丢弃的片段数。 */
+  droppedByBudget: number;
+  /** 所在文件已有 MAX_SNIPPETS_PER_FILE 个片段而丢弃的片段数。 */
+  droppedByFileCap: number;
+  /** 预算尚有余量但单个片段放不下剩余预算而丢弃的片段数。 */
+  droppedOversize: number;
+  /** groundFindingRefs：只读端口返回 null / 空内容（路径越界、文件缺失、行号超界）的锚点数。 */
+  anchorReaderMiss: number;
+  /** groundFindingRefs：起始行已被既有片段覆盖、未补读的锚点数。 */
+  anchorAlreadyCovered: number;
+  /** groundFindingRefs：文档类路径（md 等）按设计不补读的锚点数。 */
+  anchorDocSkipped: number;
+  /** groundFindingRefs：行号无效（< 1）或区间倒序、无法补读的锚点数。 */
+  anchorInvalidRange: number;
+  /** graph 宿主回执里本应是数组、实际不是而被忽略的清单字段数（protocols / methods / conformers / properties）。 */
+  malformedHostFields: number;
+}
+
+/** graph 回执里按数组读取的结构清单字段。 */
+type GraphListField = 'protocols' | 'methods' | 'conformers' | 'properties';
+
+/**
+ * graph 清单成员的展示名：字符串原样；对象取 name / selector；其余（null、数字等畸形成员）记为 '?'，
+ * 与旧实现“取不到名字就写 ?”的口径一致，只是不再对 null 成员抛错。
+ */
+function graphMemberName(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value && typeof value === 'object') {
+    const { name, selector } = value as { name?: unknown; selector?: unknown };
+    if (typeof name === 'string' && name) {
+      return name;
+    }
+    if (typeof selector === 'string' && selector) {
+      return selector;
+    }
+  }
+  return '?';
+}
+
 /** 工具结果对象 (所有可能的结果属性联合) */
 interface ToolResultObject {
   files?: Array<{
@@ -423,10 +501,23 @@ export class EvidenceCollector {
   #snippetCharsUsed = 0;
 
   /**
-   * 本次 processToolCall 中读取展示的采集说明（未入片段的原因、截断时保留的完整行），
-   * 写进该调用的探索日志 resultSummary；每次调用开始时清空。
+   * 本次 processToolCall 的采集说明（读取展示未入片段的原因、截断时保留的完整行、被忽略的畸形
+   * graph 字段），写进该调用的探索日志 resultSummary；每次调用开始时清空。
    */
-  #readNotes: string[] = [];
+  #callNotes: string[] = [];
+
+  /** 采集诊断计数（C13），整个 Collector 生命周期累计；只经 diagnostics() 取快照。 */
+  #diagnostics: EvidenceCollectorDiagnostics = {
+    extractionErrors: [],
+    droppedByBudget: 0,
+    droppedByFileCap: 0,
+    droppedOversize: 0,
+    anchorReaderMiss: 0,
+    anchorAlreadyCovered: 0,
+    anchorDocSkipped: 0,
+    anchorInvalidRange: 0,
+    malformedHostFields: 0,
+  };
 
   /** @param [options.snippetBudget=32000] 代码片段总字符预算 */
   constructor(options: EvidenceCollectorOptions = {}) {
@@ -457,9 +548,9 @@ export class EvidenceCollector {
       result != null &&
       result !== '' &&
       !(typeof result === 'string' && this.#isErrorString(result));
-    let extractionFailed = false;
+    let extractionError: string | null = null;
     const action = (args.action as string) || '';
-    this.#readNotes = [];
+    this.#callNotes = [];
 
     // 按工具类型提取证据
     if (hasResult) {
@@ -478,31 +569,43 @@ export class EvidenceCollector {
           // note_finding → WorkingMemory 已处理，不在此重复采集
         }
       } catch (err: unknown) {
-        // 采集降级必须留在探索日志，不能把有返回体等同于成功证据。
-        extractionFailed = true;
-        void err;
+        // 采集降级必须留在探索日志，不能把有返回体等同于成功证据。异常类型与消息一并写进
+        // resultSummary 前缀并计入诊断（C13）：宿主回执畸形时据此定位字段与错误类别；
+        // 已在异常前落地的片段 / 引用保留（它们各自已通过校验），本次调用整体记为无效探索。
+        extractionError = describeExtractionError(err);
+        this.#diagnostics.extractionErrors.push({
+          round,
+          tool,
+          action,
+          message: extractionError,
+        });
       }
     }
 
-    // 所有工具调用都记入探索日志；读取展示被拒绝或截断时把原因写在摘要前，便于排查片段为何缺席。
+    // 所有工具调用都记入探索日志；读取展示被拒绝或截断、graph 字段被忽略时把原因写在摘要前，便于排查证据为何缺席。
+    const statusPrefix = !hasResult
+      ? '[unconfirmed result; evidence skipped] '
+      : extractionError !== null
+        ? `[evidence extraction failed: ${extractionError}] `
+        : '';
     this.#explorationLog.push({
       round,
       tool,
       intent: this.#inferIntent(tool, args),
-      resultSummary: `${!hasResult ? '[unconfirmed result; evidence skipped] ' : extractionFailed ? '[evidence extraction failed] ' : ''}${this.#formatReadNotes()}${this.#summarizeResult(tool, result)}`,
-      effective: hasResult && !extractionFailed && this.#isEffective(tool, action, result),
+      resultSummary: `${statusPrefix}${this.#formatCallNotes()}${this.#summarizeResult(tool, result)}`,
+      effective: hasResult && extractionError === null && this.#isEffective(tool, action, result),
     });
   }
 
-  /** 把本次调用的读取展示说明压成探索日志前缀（最多列 MAX_READ_NOTES_IN_LOG 条，其余计数）。 */
-  #formatReadNotes(): string {
-    if (this.#readNotes.length === 0) {
+  /** 把本次调用的采集说明压成探索日志前缀（最多列 MAX_CALL_NOTES_IN_LOG 条，其余计数）。 */
+  #formatCallNotes(): string {
+    if (this.#callNotes.length === 0) {
       return '';
     }
-    const shown = this.#readNotes.slice(0, MAX_READ_NOTES_IN_LOG);
+    const shown = this.#callNotes.slice(0, MAX_CALL_NOTES_IN_LOG);
     const more =
-      this.#readNotes.length > MAX_READ_NOTES_IN_LOG
-        ? `; +${this.#readNotes.length - MAX_READ_NOTES_IN_LOG} more`
+      this.#callNotes.length > MAX_CALL_NOTES_IN_LOG
+        ? `; +${this.#callNotes.length - MAX_CALL_NOTES_IN_LOG} more`
         : '';
     return `[${shown.join('; ')}${more}] `;
   }
@@ -524,12 +627,25 @@ export class EvidenceCollector {
   }
 
   /**
+   * 采集诊断快照（L7-P14 / C13）：提取异常、预算 / 名额 / 超预算丢弃、锚点补齐各类跳过与畸形 graph
+   * 字段的累计计数。刻意不并入 build() 返回值（不改证据结果形状）；每次返回独立副本，调用方可在
+   * groundFindingRefs 前后各取一次求差，得到补齐阶段自己的丢弃原因。
+   */
+  diagnostics(): EvidenceCollectorDiagnostics {
+    return {
+      ...this.#diagnostics,
+      extractionErrors: this.#diagnostics.extractionErrors.map((entry) => ({ ...entry })),
+    };
+  }
+
+  /**
    * 锚点驱动证据补齐：把 findings 引用的 `path:line` 锚点补成可照抄的精确片段。
    *
    * 对每条 finding.evidence 中的锚点引用，若 evidenceMap 尚无覆盖该行的片段，经注入的
    * 只读端口从磁盘读取该范围的逐字源码入库（行号与内容天然对齐）。端口返回 null（路径
-   * 越界 / 文件缺失 / 行号超界）时静默跳过——绝不编造证据；预算与每文件片段数沿用
-   * #addCodeSnippet 的既有约束。
+   * 越界 / 文件缺失 / 行号超界）时跳过——绝不编造证据；预算与每文件片段数沿用
+   * #addCodeSnippet 的既有约束。每类跳过都计入 diagnostics()（anchorReaderMiss / anchorAlreadyCovered /
+   * anchorDocSkipped / anchorInvalidRange / dropped*），供 anchor grounding 日志区分根因（C13）。
    */
   groundFindingRefs(findings: FindingRefLike[], readRange: SnippetRangeReader) {
     for (const finding of findings) {
@@ -541,10 +657,12 @@ export class EvidenceCollector {
         const filePath = match[1] ?? '';
         const startLine = Number(match[2]);
         if (!filePath || !Number.isFinite(startLine) || startLine < 1) {
+          this.#diagnostics.anchorInvalidRange += 1;
           continue;
         }
         // 文档锚点不补：md 行不是代码证据，补了只会诱导 Producer 引用二手描述。
         if (isDocEvidencePath(filePath)) {
+          this.#diagnostics.anchorDocSkipped += 1;
           continue;
         }
         // 带范围的锚点用原范围（cap 单片段行数上限）；单行锚点向下扩展少量上下文，
@@ -553,15 +671,19 @@ export class EvidenceCollector {
           ? Math.min(Number(match[3]), startLine + MAX_SNIPPET_LINES - 1)
           : startLine + ANCHOR_CONTEXT_LINES - 1;
         if (requestedEnd < startLine) {
+          this.#diagnostics.anchorInvalidRange += 1;
           continue;
         }
         if (this.#hasSnippetCovering(filePath, startLine)) {
+          this.#diagnostics.anchorAlreadyCovered += 1;
           continue;
         }
         const range = readRange(filePath, startLine, requestedEnd);
         if (!range?.content?.trim()) {
+          this.#diagnostics.anchorReaderMiss += 1;
           continue;
         }
+        // 预算 / 名额 / 超预算导致的丢弃由 #addCodeSnippet 计数。
         this.#addCodeSnippet(filePath, range.content, startLine);
       }
     }
@@ -647,11 +769,11 @@ export class EvidenceCollector {
       const reason = parsed
         ? 'empty source after stripping N| prefixes'
         : describeRejectedReadDisplay(rawContent);
-      this.#readNotes.push(`read display not collected: ${filePath} (${reason})`);
+      this.#callNotes.push(`read display not collected: ${filePath} (${reason})`);
       return;
     }
     if (parsed.truncated) {
-      this.#readNotes.push(
+      this.#callNotes.push(
         `read display truncated: ${filePath} kept complete lines ${parsed.startLine}-${parsed.endLine}`
       );
     }
@@ -679,7 +801,7 @@ export class EvidenceCollector {
         }
         return;
       }
-      const searchNote = patterns[0] || '?';
+      const searchNote = this.#mergedSearchNote(patterns);
       for (const m of parsed.slice(0, MAX_SEARCH_MATCHES)) {
         this.#addSearchMatch(m, searchNote);
       }
@@ -726,11 +848,24 @@ export class EvidenceCollector {
         }
       }
     } else {
-      const searchNote = patterns[0] || '?';
+      const searchNote = this.#mergedSearchNote(patterns);
       for (const m of matches.slice(0, MAX_SEARCH_MATCHES)) {
         this.#addSearchMatch(m, searchNote);
       }
     }
+  }
+
+  /**
+   * 合并命中列表的来源模式标注（L7-P14 / C57）：code.search 把多个模式的命中去重合并成一个列表、
+   * 不标注每条命中来自哪个模式，所以只有单模式（或无模式参数，沿用 '?'）时才能如实标注；多模式时
+   * 返回 undefined，片段不写 analystNote，而不是把所有命中都归到第一个模式。按模式分组的
+   * batchResults 旧回执能准确归属，不走这里。删除 CodeSnippet.analystNote 字段属公开类型变化，随决定②。
+   */
+  #mergedSearchNote(patterns: string[]): string | undefined {
+    if (patterns.length > 1) {
+      return undefined;
+    }
+    return patterns[0] || '?';
   }
 
   /** 完整空数组是旧版已完成回执；显式部分/省略状态始终优先。 */
@@ -752,11 +887,18 @@ export class EvidenceCollector {
    * 两种回执：graph 工具的包装形态 { type, entity, result }，以及旧的直连形态（结果本身）。
    * 宿主随结果给出 graphRefs 时，那就是关系事实的规范写法，原样收下；宿主不说这种写法
    * （旧形态）时才由这里按类 / 协议的结构结论拼一条。
+   *
+   * 顺序（L7-P14 / C56）：graph handler 只包装、不校验字段形状，所以先记宿主 graphRefs（已逐条
+   * 过滤成非空字符串），再算结构摘要——摘要阶段即使因畸形回执失败，也只丢摘要，不连带丢掉合法引用。
    */
   #extractGraphEvidence(args: ToolCallArgs, result: ToolResult) {
     const payload = unwrapGraphResult(result);
     if (!payload || payload.resolved === false) {
       return;
+    }
+    const hostRefs = hostGraphRefs(payload);
+    if (hostRefs) {
+      this.#recordGraphEvidence(hostRefs);
     }
     const isProtocol = Boolean(
       args.protocolName || args.type === 'protocol' || payload.protocolName
@@ -764,12 +906,28 @@ export class EvidenceCollector {
     const summaryRef = isProtocol
       ? this.#extractProtocolEvidence(args, payload)
       : this.#extractClassEvidence(args, payload);
-    const hostRefs = hostGraphRefs(payload);
-    if (hostRefs) {
-      this.#recordGraphEvidence(hostRefs);
-    } else if (summaryRef) {
+    // 宿主说图引用写法时（即使过滤后为空组）不再另拼结构引用，与旧行为一致。
+    if (!hostRefs && summaryRef) {
       this.#recordGraphEvidence([summaryRef]);
     }
+  }
+
+  /**
+   * graph 回执清单字段的形状守卫：缺席（undefined / null）视为空清单；不是数组时忽略该字段，
+   * 计入 diagnostics().malformedHostFields 并在本次调用的探索日志注明字段名与实际类型——
+   * 只丢这一段摘要，不让 `.join` / `.slice` 抛错把整次 graph 采集打成提取失败（C56）。
+   */
+  #graphListField(result: ToolResultObject, field: GraphListField): unknown[] {
+    const value: unknown = result[field];
+    if (value === undefined || value === null) {
+      return [];
+    }
+    if (Array.isArray(value)) {
+      return value;
+    }
+    this.#diagnostics.malformedHostFields += 1;
+    this.#callNotes.push(`graph field ignored: ${field} (${typeof value})`);
+    return [];
   }
 
   /** 类结构 → evidenceMap；返回按结构结论拼出的 graph 引用（旧形态的宿主用它） */
@@ -781,27 +939,28 @@ export class EvidenceCollector {
     }
     const className = result.className || args.className || args.entity;
 
-    const entry = this.#getOrCreateEntry(filePath);
-    entry.role = entry.role || 'class-definition';
-
+    // 先把摘要算完（清单字段经形状守卫）再建条目：摘要阶段失败时不会留下只有 role 的空壳条目（C56）。
+    const protocols = this.#graphListField(result, 'protocols');
+    const methods = this.#graphListField(result, 'methods');
+    const properties = this.#graphListField(result, 'properties');
     const parts = [`Class: ${className}`];
     if (result.superClass) {
       parts.push(`Extends: ${result.superClass}`);
     }
-    if (result.protocols?.length) {
-      parts.push(`Implements: ${result.protocols.join(', ')}`);
+    if (protocols.length) {
+      parts.push(`Implements: ${protocols.map(graphMemberName).join(', ')}`);
     }
-    if (result.methods?.length) {
-      const names = result.methods
-        .slice(0, 5)
-        .map((m) => (typeof m === 'string' ? m : m.name || m.selector || '?'));
-      parts.push(`Methods(${result.methods.length}): ${names.join(', ')}`);
+    if (methods.length) {
+      const names = methods.slice(0, 5).map(graphMemberName);
+      parts.push(`Methods(${methods.length}): ${names.join(', ')}`);
     }
-    if (result.properties?.length) {
-      parts.push(`Props: ${result.properties.length}`);
+    if (properties.length) {
+      parts.push(`Props: ${properties.length}`);
     }
-
     const classSummary = parts.join(' | ');
+
+    const entry = this.#getOrCreateEntry(filePath);
+    entry.role = entry.role || 'class-definition';
     entry.summary = entry.summary ? `${entry.summary}; ${classSummary}` : classSummary;
     // 真实 graph 查询的结构结论，供关系声明引用。
     return `graph:class ${className} (${filePath}) — ${classSummary.replaceAll('|', '·')}`;
@@ -815,18 +974,20 @@ export class EvidenceCollector {
       return undefined;
     }
 
+    // 与类结构同序：清单字段先过形状守卫、摘要算完再建条目（C56）。
+    const methods = this.#graphListField(result, 'methods');
+    const conformers = this.#graphListField(result, 'conformers');
+    const parts = [`Protocol: ${protocolName}`];
+    if (methods.length) {
+      parts.push(`Methods: ${methods.length}`);
+    }
+    if (conformers.length) {
+      parts.push(`Conformers: ${conformers.slice(0, 5).map(graphMemberName).join(', ')}`);
+    }
+    const summary = parts.join(' | ');
+
     const entry = this.#getOrCreateEntry(filePath);
     entry.role = entry.role || 'protocol-definition';
-
-    const parts = [`Protocol: ${protocolName}`];
-    if (result.methods?.length) {
-      parts.push(`Methods: ${result.methods.length}`);
-    }
-    if (result.conformers?.length) {
-      parts.push(`Conformers: ${result.conformers.slice(0, 5).join(', ')}`);
-    }
-
-    const summary = parts.join(' | ');
     entry.summary = entry.summary ? `${entry.summary}; ${summary}` : summary;
     return `graph:protocol ${protocolName} (${filePath}) — ${summary.replaceAll('|', '·')}`;
   }
@@ -878,17 +1039,23 @@ export class EvidenceCollector {
     return entry;
   }
 
-  /** 向 evidenceMap 添加代码片段 (带预算控制) */
+  /**
+   * 向 evidenceMap 添加代码片段 (带预算控制)。三类容量丢弃分别计入 diagnostics()（C13）：
+   * 预算已用尽（droppedByBudget）、所在文件名额已满（droppedByFileCap）、单片段放不下剩余预算
+   * （droppedOversize）；空路径 / 空内容不是容量问题，不计数。
+   */
   #addCodeSnippet(filePath: string, content: string, startLine = 1, analystNote?: string) {
     if (!filePath || !content) {
       return;
     }
     if (this.#snippetCharsUsed >= this.#snippetBudget) {
+      this.#diagnostics.droppedByBudget += 1;
       return;
     }
 
     const entry = this.#evidenceMap.get(filePath);
     if ((entry?.codeSnippets.length ?? 0) >= MAX_SNIPPETS_PER_FILE) {
+      this.#diagnostics.droppedByFileCap += 1;
       return;
     }
 
@@ -899,8 +1066,9 @@ export class EvidenceCollector {
       return;
     }
 
-    // 预算检查
+    // 预算检查：剩余预算放不下这一片（预算尚未用尽）。
     if (this.#snippetCharsUsed + snippetContent.length > this.#snippetBudget) {
+      this.#diagnostics.droppedOversize += 1;
       return;
     }
 
@@ -913,8 +1081,8 @@ export class EvidenceCollector {
     this.#snippetCharsUsed += snippetContent.length;
   }
 
-  /** 向 evidenceMap 添加搜索匹配 */
-  #addSearchMatch(match: SearchMatch, searchNote: string) {
+  /** 向 evidenceMap 添加搜索匹配（searchNote 缺席时片段不带 analystNote，见 #mergedSearchNote） */
+  #addSearchMatch(match: SearchMatch, searchNote: string | undefined) {
     if (!match?.file) {
       return;
     }
@@ -940,7 +1108,12 @@ export class EvidenceCollector {
     if (!singleLine.trim()) {
       return;
     }
-    this.#addCodeSnippet(match.file, singleLine, match.line, `search: "${searchNote}"`);
+    this.#addCodeSnippet(
+      match.file,
+      singleLine,
+      match.line,
+      searchNote === undefined ? undefined : `search: "${searchNote}"`
+    );
   }
 
   /** 添加负空间信号 (去重) */
@@ -1086,7 +1259,9 @@ export class EvidenceCollector {
           return `${(graph.classes || graph.hierarchy || []).length} classes`;
         }
         if (graph.className) {
-          return `class ${graph.className}${graph.superClass ? ` < ${graph.superClass}` : ''}, ${graph.methods?.length || 0} methods`;
+          // methods 与采集端同口径：不是数组（畸形宿主字段）时按 0 个方法计，不把字符串长度当方法数。
+          const methodCount = Array.isArray(graph.methods) ? graph.methods.length : 0;
+          return `class ${graph.className}${graph.superClass ? ` < ${graph.superClass}` : ''}, ${methodCount} methods`;
         }
         // 其余查询（调用方、层级、影响面、搜索、概览）：报出各清单的条数与图引用数。
         const counts = Object.entries(graph)
