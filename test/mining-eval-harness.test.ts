@@ -393,6 +393,108 @@ describe('mining-judge — 切片/解析/引用机械校验(确定性)', () => {
     expect(calibration.promotionEligible).toBe(false);
   });
 
+  it('computeJudgeCalibration：无效裁决集中在人工负例时覆盖率门拦截晋级(L7-P25 / C16)', () => {
+    const uphold = { verdict: 'uphold' };
+    const reject = { verdict: 'reject' };
+    // 核实探针原样：25 uphold/uphold + 5 reject/reject 有效；30 条人工 reject 但 judge 解析失败(null)，
+    // 10 条人工 reject 而 judge 错放 uphold 却因引用越界被剔除。有效子集各比例满分，
+    // 但 40 个负例里 judge 一个有效裁决都没给出——不能据此晋级。
+    const records = [
+      ...Array.from({ length: 25 }, () => ({ humanDecision: 'uphold', judgeVerdict: uphold })),
+      ...Array.from({ length: 5 }, () => ({ humanDecision: 'reject', judgeVerdict: reject })),
+      ...Array.from({ length: 30 }, () => ({ humanDecision: 'reject', judgeVerdict: null })),
+      ...Array.from({ length: 10 }, () => ({
+        humanDecision: 'reject',
+        judgeVerdict: { verdict: 'uphold', invalidCitation: true },
+      })),
+    ];
+    const calibration = computeJudgeCalibration(records);
+    // 无效裁决仍不进入一致率分母(既有口径保持)。
+    expect(calibration).toMatchObject({ total: 70, judged: 30, agreementRate: 1 });
+    expect(calibration.negativeSubset).toMatchObject({ total: 5, caught: 5, recall: 1 });
+    expect(calibration.promotionEligible).toBe(false);
+  });
+
+  it('computeJudgeCalibration：整体覆盖率达标但负例有效覆盖率 <90% 仍不得晋级', () => {
+    const uphold = { verdict: 'uphold' };
+    const reject = { verdict: 'reject' };
+    // 整体覆盖 300/312≈96% 过门；人工负例 42 条只有 30 条有效(≈71%)——无效集中在负例。
+    const records = [
+      ...Array.from({ length: 270 }, () => ({ humanDecision: 'uphold', judgeVerdict: uphold })),
+      ...Array.from({ length: 30 }, () => ({ humanDecision: 'reject', judgeVerdict: reject })),
+      ...Array.from({ length: 12 }, () => ({ humanDecision: 'narrow', judgeVerdict: null })),
+    ];
+    const calibration = computeJudgeCalibration(records);
+    expect(calibration).toMatchObject({ total: 312, judged: 300, agreementRate: 1, kappa: 1 });
+    expect(calibration.promotionEligible).toBe(false);
+  });
+
+  it('computeJudgeCalibration：覆盖率与负例覆盖率恰为 90% 可晋级，低于 90% 不可晋级', () => {
+    const uphold = { verdict: 'uphold' };
+    const reject = { verdict: 'reject' };
+    // 40 条：36 有效(覆盖 90%)；人工负例 10 条中 9 条有效(负例覆盖 90%)。
+    const atFloor = [
+      ...Array.from({ length: 27 }, () => ({ humanDecision: 'uphold', judgeVerdict: uphold })),
+      ...Array.from({ length: 3 }, () => ({ humanDecision: 'uphold', judgeVerdict: null })),
+      ...Array.from({ length: 9 }, () => ({ humanDecision: 'reject', judgeVerdict: reject })),
+      { humanDecision: 'trivial', judgeVerdict: { verdict: 'reject', invalidCitation: true } },
+    ];
+    expect(computeJudgeCalibration(atFloor)).toMatchObject({
+      total: 40,
+      judged: 36,
+      promotionEligible: true,
+    });
+    // 再多 1 条正例无效 → 覆盖 36/41≈87.8% <90%。
+    expect(
+      computeJudgeCalibration([...atFloor, { humanDecision: 'uphold', judgeVerdict: null }])
+        .promotionEligible
+    ).toBe(false);
+    // 再多 1 条负例无效 → 整体 36/41 与负例 9/11 同时跌破门限。
+    expect(
+      computeJudgeCalibration([...atFloor, { humanDecision: 'reject', judgeVerdict: null }])
+        .promotionEligible
+    ).toBe(false);
+  });
+
+  it('computeJudgeCalibration：拼错或缺失的 humanDecision 立即抛错并附索引，而不是静默计为负例', () => {
+    const uphold = { verdict: 'uphold' };
+    // 四个合法标签都应被接受(不抛错)。
+    expect(() =>
+      computeJudgeCalibration(
+        ['uphold', 'narrow', 'trivial', 'reject'].map((humanDecision) => ({
+          humanDecision,
+          judgeVerdict: uphold,
+        })) as Parameters<typeof computeJudgeCalibration>[0]
+      )
+    ).not.toThrow();
+    const dirty = [
+      { humanDecision: 'uphold', judgeVerdict: uphold },
+      { humanDecision: 'reject', judgeVerdict: uphold },
+      { humanDecision: 'upheld', judgeVerdict: uphold },
+      { humanDecision: 'uphold', judgeVerdict: null },
+      { humanDecision: 'Reject', judgeVerdict: uphold },
+      { humanDecision: '', judgeVerdict: uphold },
+      { judgeVerdict: uphold },
+    ] as unknown as Parameters<typeof computeJudgeCalibration>[0];
+    let thrown: unknown;
+    try {
+      computeJudgeCalibration(dirty);
+    } catch (err: unknown) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = thrown instanceof Error ? thrown.message : '';
+    expect(message).toMatch(/^JUDGE_CALIBRATION_HUMAN_DECISION_INVALID:/);
+    // 一次列出全部非法记录的索引与原值，便于一次修完导出数据。
+    expect(message).toContain('count=4');
+    expect(message).toContain('records[2]="upheld"');
+    expect(message).toContain('records[4]="Reject"');
+    expect(message).toContain('records[5]=""');
+    expect(message).toContain('records[6]=undefined');
+    expect(message).not.toContain('records[0]');
+    expect(message).not.toContain('records[1]');
+  });
+
   it('judgeCandidate：注入 chat；越界引用 → invalidCitation 标记(裁决按无效处理)', async () => {
     const root = makeProject();
     const good = await judgeCandidate({

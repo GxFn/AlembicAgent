@@ -438,6 +438,59 @@ function describeSource(source: unknown): string {
   }
 }
 
+/** 人工复核结论的合法取值（与 JudgeCalibrationRecordV1.humanDecision 类型一致）。 */
+const JUDGE_CALIBRATION_HUMAN_DECISIONS: ReadonlySet<unknown> = new Set([
+  'uphold',
+  'narrow',
+  'trivial',
+  'reject',
+]);
+
+/**
+ * 晋级门的覆盖率下限（L7-P25 / C16，默认 0.9）：
+ * - 有效裁决覆盖率 = 有效裁决数 / 全部样本数；
+ * - 负例有效覆盖率 = 有效裁决的人工负例数 / 全部人工负例数（人工负例 = humanDecision !== 'uphold'，
+ *   含 judge 解析失败返回 null 与 invalidCitation 的记录）。
+ * 无效裁决仍不进入一致率、kappa、负类召回的分母（既有口径），但无效集中出现时
+ * （尤其集中在负例、掩盖 judge 错放负例）由这两道门挡住，不能靠剔除难例晋级。
+ * 门限暂为模块内常量；返回 coverage 字段与 options 可配置项待决策确认后再开放到公开面。
+ */
+const JUDGE_CALIBRATION_MIN_COVERAGE = 0.9;
+const JUDGE_CALIBRATION_MIN_NEGATIVE_COVERAGE = 0.9;
+/** 非法标签报错里最多逐条列出的记录数，避免整份脏导出把错误消息撑爆。 */
+const JUDGE_CALIBRATION_INVALID_LABEL_LIST_LIMIT = 10;
+
+/**
+ * 入口校验人工标签：离线标注错误必须立即修数据，不能被静默当成负例
+ * （拼错的 'upheld' 或缺失标签曾被计入负例，既拉低召回也可能虚增负例数凑够 minNegatives）。
+ * 一次列出全部非法记录（上限见常量）的索引与原值，便于一次修完导出文件。
+ */
+function assertJudgeCalibrationHumanDecisions(records: readonly unknown[]): void {
+  const invalid: string[] = [];
+  for (const [index, record] of records.entries()) {
+    const humanDecision = readRecord(record).humanDecision;
+    if (!JUDGE_CALIBRATION_HUMAN_DECISIONS.has(humanDecision)) {
+      invalid.push(`records[${index}]=${describeHumanDecision(humanDecision)}`);
+    }
+  }
+  if (invalid.length === 0) {
+    return;
+  }
+  const listed = invalid.slice(0, JUDGE_CALIBRATION_INVALID_LABEL_LIST_LIMIT);
+  const omitted = invalid.length - listed.length;
+  throw new Error(
+    `JUDGE_CALIBRATION_HUMAN_DECISION_INVALID:count=${invalid.length};${listed.join(',')}${
+      omitted > 0 ? `,...+${omitted} more` : ''
+    }`
+  );
+}
+
+/** 字符串标签加引号显示（区分空串与缺失），其余值沿用来源诊断的可打印化，并截断过长原值。 */
+function describeHumanDecision(value: unknown): string {
+  const described = typeof value === 'string' ? JSON.stringify(value) : describeSource(value);
+  return described.length > 80 ? `${described.slice(0, 77)}...` : described;
+}
+
 /** One production-owned implementation for both strict evaluation and legacy mining scripts. */
 export function computeJudgeCalibration(
   records: readonly JudgeCalibrationRecordV1[],
@@ -448,6 +501,8 @@ export function computeJudgeCalibration(
     readonly minNegatives?: number;
   } = {}
 ) {
+  // 先校验标签再计算：非法标签抛 JUDGE_CALIBRATION_HUMAN_DECISION_INVALID，不做静默降级。
+  assertJudgeCalibrationHumanDecisions(records);
   const promotionFloor = options.promotionFloor ?? 0.8;
   const kappaFloor = options.kappaFloor ?? 0.6;
   const negativeRecallFloor = options.negativeRecallFloor ?? 0.6;
@@ -475,6 +530,15 @@ export function computeJudgeCalibration(
   const negatives = judged.filter((record) => !humanKeep(record));
   const negativesCaught = negatives.filter((record) => !judgeKeep(record));
   const negativeRecall = negatives.length > 0 ? negativesCaught.length / negatives.length : null;
+  // 覆盖率只参与晋级判定，不改变上面各比例的分母；全部样本/全部人工负例为 0 时记为 null（不过门）。
+  const coverage = records.length > 0 ? judged.length / records.length : null;
+  const humanNegativeTotal = records.filter((record) => !humanKeep(record)).length;
+  const negativeCoverage = humanNegativeTotal > 0 ? negatives.length / humanNegativeTotal : null;
+  const coverageSufficient =
+    coverage !== null &&
+    coverage >= JUDGE_CALIBRATION_MIN_COVERAGE &&
+    negativeCoverage !== null &&
+    negativeCoverage >= JUDGE_CALIBRATION_MIN_NEGATIVE_COVERAGE;
   return freeze({
     total: records.length,
     judged: judged.length,
@@ -497,6 +561,7 @@ export function computeJudgeCalibration(
       negatives.length >= minNegatives &&
       negativeRecall !== null &&
       negativeRecall >= negativeRecallFloor &&
+      coverageSufficient &&
       !(overgenRate !== null && overgenRate < promotionFloor),
   });
 }
