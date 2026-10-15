@@ -2511,6 +2511,217 @@ describe('ConversationStore', () => {
   });
 });
 
+// L6-P19：ConversationStore 持久化健壮性（C45 LRU 淘汰、C46 索引告警与原子写、C47 未知 id 自动登记、
+// C25 三处静默 catch 改为留痕）。日志断言经 Logger 单例 spy，store 内部同样通过 getInstance 取到它。
+describe('ConversationStore persistence robustness (L6-P19)', () => {
+  const conversationsDir = (root: string) => join(root, '.asd', 'conversations');
+  function captureConversationLogs() {
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    return {
+      info: () => info.mock.calls.map((call) => String(call[0])),
+      warn: () => warn.mock.calls.map((call) => String(call[0])),
+    };
+  }
+
+  it('keeps an actively used conversation in the index and on disk after 100 newer creates', () => {
+    const root = makeTempRoot('conversation-lru');
+    const store = new ConversationStore(root);
+    const logs = captureConversationLogs();
+    const active = store.create({ title: 'long running' });
+    store.append(active, { role: 'user', content: 'first turn' });
+    const older: string[] = [];
+    for (let index = 0; index < 99; index++) {
+      older.push(store.create());
+    }
+    store.append(active, { role: 'assistant', content: 'still chatting' });
+    // 最近活跃的对话排在列表首位，而不是停留在创建顺序的尾部。
+    expect(store.list({ limit: 1 })[0]?.id).toBe(active);
+    for (let index = 0; index < 50; index++) {
+      store.create();
+    }
+
+    const ids = store.list({ limit: 1000 }).map((entry) => entry.id);
+    expect(ids).toHaveLength(100);
+    expect(ids).toContain(active);
+    expect(existsSync(join(conversationsDir(root), `${active}.jsonl`))).toBe(true);
+    expect(store.load(active)).toEqual([
+      { role: 'user', content: 'first turn' },
+      { role: 'assistant', content: 'still chatting' },
+    ]);
+    // 淘汰的是最久未活跃的 50 个，而不是创建最早却仍在使用的对话。
+    expect(older.slice(0, 50).filter((id) => ids.includes(id))).toEqual([]);
+    expect(older.slice(50).every((id) => ids.includes(id))).toBe(true);
+    const evictions = logs.info().filter((message) => message.includes('evicted conversation'));
+    expect(evictions).toHaveLength(50);
+    expect(evictions.some((message) => message.includes(older[0]))).toBe(true);
+  });
+
+  it('warns when the index cannot be parsed instead of silently resetting it', () => {
+    const root = makeTempRoot('conversation-index-corrupt');
+    const store = new ConversationStore(root);
+    store.create();
+    writeFileSync(join(conversationsDir(root), 'index.json'), '[{"id":"trunc');
+    const logs = captureConversationLogs();
+    const id = store.create();
+    expect(store.list()).toMatchObject([{ id }]);
+    expect(logs.warn().some((message) => message.includes('index unreadable'))).toBe(true);
+  });
+
+  it('warns with the number of index entries dropped by validation', () => {
+    const root = makeTempRoot('conversation-index-filter');
+    mkdirSync(conversationsDir(root), { recursive: true });
+    const valid = {
+      id: 'kept-entry',
+      category: 'user',
+      title: 'kept',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      messageCount: 1,
+      hasSummary: false,
+    };
+    writeFileSync(
+      join(conversationsDir(root), 'index.json'),
+      JSON.stringify([valid, { ...valid, id: '../escape' }, { id: 'no-fields' }, 'not-an-entry'])
+    );
+    const store = new ConversationStore(root);
+    const logs = captureConversationLogs();
+    expect(store.list().map((entry) => entry.id)).toEqual(['kept-entry']);
+    expect(logs.warn().some((message) => message.includes('dropped 3 invalid index entr'))).toBe(
+      true
+    );
+  });
+
+  it('keeps the previous index intact when an index write is interrupted', () => {
+    const root = makeTempRoot('conversation-index-atomic');
+    const store = new ConversationStore(root);
+    const first = store.create({ title: 'kept' });
+    const indexPath = join(conversationsDir(root), 'index.json');
+    const before = readFileSync(indexPath, 'utf8');
+    const realWrite = fs.writeFileSync;
+    // 模拟写索引过程中进程被杀：目标文件只落下前半截内容后抛错。
+    const writes = vi.spyOn(fs, 'writeFileSync').mockImplementation(((
+      file: fs.PathOrFileDescriptor,
+      data: unknown,
+      ...rest: unknown[]
+    ) => {
+      if (path.basename(String(file)).startsWith('index.json')) {
+        Reflect.apply(realWrite, fs, [file, String(data).slice(0, 12), ...rest]);
+        throw new Error('simulated crash during index write');
+      }
+      return Reflect.apply(realWrite, fs, [file, data, ...rest]);
+    }) as typeof fs.writeFileSync);
+    const logs = captureConversationLogs();
+    store.create({ title: 'interrupted' });
+    writes.mockRestore();
+
+    expect(readFileSync(indexPath, 'utf8')).toBe(before);
+    expect(store.list().map((entry) => entry.id)).toEqual([first]);
+    expect(fs.readdirSync(conversationsDir(root)).filter((name) => name.endsWith('.tmp'))).toEqual(
+      []
+    );
+    expect(logs.warn().some((message) => message.includes('index save failed'))).toBe(true);
+  });
+
+  it('registers an unknown conversation id on append so it is listed and bounded by eviction', () => {
+    const root = makeTempRoot('conversation-unknown-id');
+    const store = new ConversationStore(root);
+    const logs = captureConversationLogs();
+    const question = `client question ${'x'.repeat(80)}`;
+    store.append('client-made-id', { role: 'user', content: question });
+    store.append('client-made-id', { role: 'assistant', content: 'answer' });
+
+    expect(store.list()).toMatchObject([
+      {
+        id: 'client-made-id',
+        category: 'user',
+        title: question.substring(0, 60),
+        messageCount: 2,
+        hasSummary: false,
+      },
+    ]);
+    expect(
+      logs
+        .info()
+        .some((message) => message.includes('registered') && message.includes('client-made-id'))
+    ).toBe(true);
+
+    // 自动登记的条目与 create 共用容量上限：100 个更新的对话之后它被淘汰，文件一并删除。
+    for (let index = 0; index < 100; index++) {
+      store.create();
+    }
+    expect(store.list({ limit: 1000 }).map((entry) => entry.id)).not.toContain('client-made-id');
+    expect(existsSync(join(conversationsDir(root), 'client-made-id.jsonl'))).toBe(false);
+  });
+
+  it('derives the registered entry from an existing orphan history file', () => {
+    const root = makeTempRoot('conversation-orphan');
+    mkdirSync(conversationsDir(root), { recursive: true });
+    writeFileSync(
+      join(conversationsDir(root), 'orphan.jsonl'),
+      `${JSON.stringify({ role: 'assistant', content: 'greeting' })}\n${JSON.stringify({
+        role: 'user',
+        content: 'orphan question',
+      })}\n`
+    );
+    const store = new ConversationStore(root);
+    store.append('orphan', { role: 'assistant', content: 'late reply' });
+    expect(store.list()).toMatchObject([
+      { id: 'orphan', category: 'user', title: 'orphan question', messageCount: 3 },
+    ]);
+  });
+
+  it('registers unknown conversation ids inside an injected data zone', () => {
+    const projectRoot = makeTempRoot('conversation-unknown-zone-project');
+    const dataRoot = makeTempRoot('conversation-unknown-zone-data');
+    const zone = new WriteZone({
+      projectRoot,
+      dataRoot,
+      knowledgeBaseDir: 'Alembic',
+      ghost: true,
+    } as never);
+    const store = new ConversationStore(projectRoot, zone);
+    store.append('zone-client-id', { role: 'user', content: 'zone question' });
+    expect(store.list()).toMatchObject([
+      { id: 'zone-client-id', title: 'zone question', messageCount: 1 },
+    ]);
+    expect(store.load('zone-client-id')).toEqual([{ role: 'user', content: 'zone question' }]);
+  });
+
+  it('logs why conversation history is empty when the file is missing or unreadable', () => {
+    const root = makeTempRoot('conversation-load-failure');
+    const store = new ConversationStore(root);
+    const id = store.create();
+    const logs = captureConversationLogs();
+    expect(store.load(id)).toEqual([]);
+    expect(
+      logs.info().some((message) => message.includes(id) && message.includes('no history file'))
+    ).toBe(true);
+    // 历史路径是目录时读取失败（EISDIR），load 仍返回空数组但必须留下 warn。
+    mkdirSync(join(conversationsDir(root), `${id}.jsonl`), { recursive: true });
+    expect(store.load(id)).toEqual([]);
+    expect(
+      logs.warn().some((message) => message.includes(id) && message.includes('history read failed'))
+    ).toBe(true);
+  });
+
+  it('warns when a conversation history file cannot be deleted', () => {
+    const root = makeTempRoot('conversation-delete-failure');
+    const store = new ConversationStore(root);
+    const id = store.create();
+    const blocked = join(conversationsDir(root), `${id}.jsonl`);
+    mkdirSync(blocked, { recursive: true });
+    writeFileSync(join(blocked, 'keep'), 'x');
+    const logs = captureConversationLogs();
+    store.delete(id);
+    expect(store.list()).toEqual([]);
+    expect(
+      logs.warn().some((message) => message.includes(id) && message.includes('delete failed'))
+    ).toBe(true);
+  });
+});
+
 // ─── A-2 召回记忆陈旧度标注（render-only，§8 Phase 2 / CG-1）────────────────────
 // fixture 硬约束：经真 store.add → getAllActive/deserialize 路径构造（不手搓 camelCase 字面量，
 // 使大小写漂移直接红）；用 raw-row UPDATE 改 updated_at/last_accessed_at 造"旧"记忆。

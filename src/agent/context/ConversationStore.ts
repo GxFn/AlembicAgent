@@ -9,7 +9,13 @@
  *   （最新一条本身超预算时按预算截断其内容），丢弃中间旧消息并在预算放得下时插入一条
  *   [上下文截断] 标记；不会自动生成摘要。
  *   摘要只在显式调用 summarize() 时生成（需要 AI Provider，当前无生产调用方）
- * - 静默降级: 持久化失败不影响核心功能
+ * - 降级不中断: 持久化失败不影响核心功能，但每条降级路径都必须留下 warn/info 日志
+ *   （读取失败、删除失败、索引不可解析、索引条目被过滤、索引写入失败），便于定位“历史为空”的原因
+ * - 索引顺序 = 最近活跃优先（LRU）: create 与 append 都把条目移到头部；超过
+ *   MAX_CONVERSATIONS 时淘汰 updatedAt 最旧的条目并删除其 JSONL，每次淘汰记 info
+ * - 未登记的 conversationId: append 会自动登记（category 'user'），使其受同一容量上限约束，
+ *   不再产生索引外、永不清理的孤儿文件
+ * - 索引写入: 无 WriteZone 时先写同目录临时文件再 rename，进程中途被杀也不会留下半截索引
  *
  * Token 计算策略:
  *   估算口径以 shared/tokenUtils.estimateTokens 为准（码位高于 U+2E80 的字符，含 CJK，
@@ -57,6 +63,23 @@ interface AiProvider {
 
 const DEFAULT_TOKEN_BUDGET = 12000; // ~12K tokens 留给历史, 其余给系统提示词和当前消息
 const MAX_CONVERSATIONS = 100; // 索引最多保留 100 个对话
+const TITLE_MAX_CHARS = 60; // 标题取首条 user 消息的前 60 个字符
+
+/** 把 unknown 错误归一成可打印的 "Name: message"，避免 `(err as Error)` 强转 */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    // Node 文件系统错误带 code（ENOENT/EACCES/EISDIR…），一并打印以区分“丢失”与“无权限”
+    const code = 'code' in err && typeof err.code === 'string' ? `[${err.code}]` : '';
+    return `${err.name}${code}: ${err.message}`;
+  }
+  return String(err);
+}
+
+/** updatedAt 转成可比较的毫秒数；无法解析的时间按最旧处理，使其优先被淘汰 */
+function activityTime(entry: ConversationEntry): number {
+  const time = Date.parse(entry.updatedAt);
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
 
 export class ConversationStore {
   #dir;
@@ -99,31 +122,28 @@ export class ConversationStore {
 
     const index = this.#loadIndex();
     index.unshift(entry);
-
-    // 限制索引大小
-    if (index.length > MAX_CONVERSATIONS) {
-      const removed = index.splice(MAX_CONVERSATIONS);
-      // 清理旧对话文件
-      for (const old of removed) {
-        this.#deleteConversationFile(old.id);
-      }
-    }
-
+    this.#evictOverflow(index, 'create');
     this.#saveIndex(index);
     return id;
   }
 
   /**
    * 追加消息到对话
+   *
+   * 索引维护（LRU）：已登记的条目更新 updatedAt / messageCount 后移到索引头部；
+   * 未登记的 id（宿主把请求体里的 conversationId 原样传入，可能已被淘汰、删除或由客户端生成）
+   * 自动登记为 category 'user' 的新条目，同样放到头部并受 MAX_CONVERSATIONS 淘汰约束。
+   * id 本身已由 #conversationPath 做路径字符校验，非法 id 在写文件前就被拒绝。
    * @param message
    */
   append(conversationId: string, message: ConversationMessage) {
     try {
       const filePath = this.#conversationPath(conversationId);
+      const now = new Date().toISOString();
       const line = JSON.stringify({
         role: message.role,
         content: message.content,
-        ts: new Date().toISOString(),
+        ts: now,
       });
       if (this.#wz) {
         this.#wz.appendFile(this.#wz.runtime(`conversations/${conversationId}.jsonl`), `${line}\n`);
@@ -134,18 +154,28 @@ export class ConversationStore {
 
       // 更新索引
       const index = this.#loadIndex();
-      const entry = index.find((e: ConversationEntry) => e.id === conversationId);
-      if (entry) {
-        entry.updatedAt = new Date().toISOString();
+      const position = index.findIndex((e: ConversationEntry) => e.id === conversationId);
+      let entry: ConversationEntry;
+      if (position >= 0) {
+        // 已登记：从原位置取出，稍后放回头部，使索引保持“最近活跃优先”
+        [entry] = index.splice(position, 1);
+        entry.updatedAt = now;
         entry.messageCount = (entry.messageCount || 0) + 1;
         // 用首条用户消息作为标题
         if (!entry.title && message.role === 'user') {
-          entry.title = message.content.substring(0, 60);
+          entry.title = message.content.substring(0, TITLE_MAX_CHARS);
         }
-        this.#saveIndex(index);
+      } else {
+        entry = this.#registerUnknown(conversationId, filePath, message, now);
       }
+      index.unshift(entry);
+      this.#evictOverflow(index, position >= 0 ? 'append' : 'append-register');
+      this.#saveIndex(index);
     } catch (err: unknown) {
-      this.#log('warn', `[ConversationStore] append failed: ${(err as Error).message}`);
+      this.#log(
+        'warn',
+        `[ConversationStore] append failed for conversation ${conversationId}: ${describeError(err)}`
+      );
     }
   }
 
@@ -164,6 +194,11 @@ export class ConversationStore {
     try {
       const filePath = this.#conversationPath(conversationId);
       if (!fs.existsSync(filePath)) {
+        // 新对话或已被淘汰/删除：记 info 以便与下方“读取失败”的 warn 区分
+        this.#log(
+          'info',
+          `[ConversationStore] no history file for conversation ${conversationId}; starting with empty history`
+        );
         return [];
       }
 
@@ -175,13 +210,18 @@ export class ConversationStore {
       const messages = this.#parseMessages(raw).map(({ role, content }) => ({ role, content }));
 
       return this.#fitWithinBudget(messages, tokenBudget);
-    } catch {
+    } catch (err: unknown) {
+      // 非法 id、权限不足（EACCES）、路径是目录（EISDIR）等：降级为空历史，但必须留痕
+      this.#log(
+        'warn',
+        `[ConversationStore] history read failed for conversation ${conversationId}; returning empty history: ${describeError(err)}`
+      );
       return [];
     }
   }
 
   /**
-   * 对话列表
+   * 对话列表（最近活跃优先：create / append 都会把条目移到头部）
    * @param [opts.category] 按类别过滤
    */
   list({ category, limit = 20 }: { category?: 'user' | 'system'; limit?: number } = {}) {
@@ -285,7 +325,10 @@ export class ConversationStore {
       );
       return true;
     } catch (err: unknown) {
-      this.#log('warn', `[ConversationStore] summarize failed: ${(err as Error).message}`);
+      this.#log(
+        'warn',
+        `[ConversationStore] summarize failed for conversation ${conversationId}: ${describeError(err)}`
+      );
       return false;
     }
   }
@@ -445,6 +488,84 @@ export class ConversationStore {
     return path.join(this.#dir, `${id}.jsonl`);
   }
 
+  /**
+   * 容量淘汰（create / append / append 自动登记共用）
+   *
+   * 调用方已把本次写入的条目放在 index[0]；该条目不参与淘汰，避免一次写入删掉自己刚写的历史。
+   * 其余条目按 updatedAt 降序（最近活跃优先）稳定排序，超出 MAX_CONVERSATIONS 的尾部即
+   * 最久未活跃的对话：从索引移除并删除 JSONL，每个都记 info（id、updatedAt、触发原因）。
+   * 正常情况下 LRU 维护已保证顺序；排序用于兼容旧版按创建顺序写出的索引。
+   */
+  #evictOverflow(index: ConversationEntry[], trigger: 'create' | 'append' | 'append-register') {
+    if (index.length <= MAX_CONVERSATIONS) {
+      return;
+    }
+    const [current, ...rest] = index;
+    // Array.prototype.sort 是稳定排序：同一毫秒内写入的条目保持原有 LRU 相对顺序
+    rest.sort((a, b) => {
+      const left = activityTime(a);
+      const right = activityTime(b);
+      if (left === right) {
+        return 0;
+      }
+      return right > left ? 1 : -1;
+    });
+    const evicted = rest.splice(MAX_CONVERSATIONS - 1);
+    index.splice(0, index.length, current, ...rest);
+    for (const old of evicted) {
+      this.#log(
+        'info',
+        `[ConversationStore] evicted conversation ${old.id} (updatedAt=${old.updatedAt}) on ${trigger}: index exceeded ${MAX_CONVERSATIONS} conversations, least recently active entry removed with its history file`
+      );
+      this.#deleteConversationFile(old.id);
+    }
+  }
+
+  /**
+   * append 遇到索引外的 id 时构造新条目。
+   *
+   * 历史文件可能早已存在（旧版本留下的孤儿文件，或被外部写入），因此按文件实际内容
+   * 计算 messageCount，并取首条 user 消息前 60 字作为标题；读不到时退回只计本条消息。
+   */
+  #registerUnknown(
+    id: string,
+    filePath: string,
+    message: ConversationMessage,
+    now: string
+  ): ConversationEntry {
+    let messageCount = 1;
+    let title = message.role === 'user' ? message.content.substring(0, TITLE_MAX_CHARS) : '';
+    let hasSummary = false;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8').trim();
+      const history = raw ? this.#parseMessages(raw) : [];
+      if (history.length > 0) {
+        messageCount = history.length;
+        const firstUser = history.find((m) => m.role === 'user');
+        title = firstUser ? firstUser.content.substring(0, TITLE_MAX_CHARS) : '';
+        hasSummary = history[0].role === 'system' && history[0].content.startsWith('[对话摘要]');
+      }
+    } catch (err: unknown) {
+      this.#log(
+        'warn',
+        `[ConversationStore] could not read history of unregistered conversation ${id}; registering with the appended message only: ${describeError(err)}`
+      );
+    }
+    this.#log(
+      'info',
+      `[ConversationStore] registered unknown conversation ${id} on append (category=user, messageCount=${messageCount}): id was not in the index`
+    );
+    return {
+      id,
+      category: 'user',
+      title,
+      createdAt: now,
+      updatedAt: now,
+      messageCount,
+      hasSummary,
+    };
+  }
+
   #deleteConversationFile(id: string) {
     try {
       const filePath = this.#conversationPath(id);
@@ -458,53 +579,98 @@ export class ConversationStore {
           fs.unlinkSync(filePath);
         }
       }
-    } catch {
-      /* ignore */
+    } catch (err: unknown) {
+      // 删除失败不阻断索引更新，但文件会残留在目录里，必须留痕以便人工清理
+      this.#log(
+        'warn',
+        `[ConversationStore] history file delete failed for conversation ${id}; file may remain on disk: ${describeError(err)}`
+      );
     }
   }
 
-  #loadIndex() {
+  #loadIndex(): ConversationEntry[] {
+    let value: unknown;
     try {
-      if (fs.existsSync(this.#indexPath)) {
-        const value: unknown = JSON.parse(fs.readFileSync(this.#indexPath, 'utf-8'));
-        if (!Array.isArray(value)) {
-          this.#log('warn', '[ConversationStore] invalid index shape; using an empty index');
-          return [];
-        }
-        return value.filter(
-          (entry): entry is ConversationEntry =>
-            entry &&
-            typeof entry === 'object' &&
-            typeof entry.id === 'string' &&
-            entry.id.length > 0 &&
-            !/[/\\\0]/u.test(entry.id) &&
-            typeof entry.title === 'string' &&
-            typeof entry.createdAt === 'string' &&
-            typeof entry.updatedAt === 'string' &&
-            (entry.category === 'user' || entry.category === 'system') &&
-            Number.isFinite(entry.messageCount) &&
-            typeof entry.hasSummary === 'boolean'
-        );
+      if (!fs.existsSync(this.#indexPath)) {
+        // 首次使用：没有索引文件是正常状态，不记日志
+        return [];
       }
-    } catch {
-      /* corrupt — reset */
+      value = JSON.parse(fs.readFileSync(this.#indexPath, 'utf-8'));
+    } catch (err: unknown) {
+      // 索引截断/损坏或不可读：只能以空索引继续，下一次写入会覆盖旧索引，旧条目从列表中消失
+      // 且其 JSONL 不再受淘汰/cleanup 管理，因此必须 warn 以便定位。
+      this.#log(
+        'warn',
+        `[ConversationStore] index unreadable; continuing with an empty index (existing entries will be dropped on next save): ${describeError(err)}`
+      );
+      return [];
     }
-    return [];
+    if (!Array.isArray(value)) {
+      this.#log('warn', '[ConversationStore] invalid index shape; using an empty index');
+      return [];
+    }
+    const entries = value.filter(
+      (entry): entry is ConversationEntry =>
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.id === 'string' &&
+        entry.id.length > 0 &&
+        !/[/\\\0]/u.test(entry.id) &&
+        typeof entry.title === 'string' &&
+        typeof entry.createdAt === 'string' &&
+        typeof entry.updatedAt === 'string' &&
+        (entry.category === 'user' || entry.category === 'system') &&
+        Number.isFinite(entry.messageCount) &&
+        typeof entry.hasSummary === 'boolean'
+    );
+    const dropped = value.length - entries.length;
+    if (dropped > 0) {
+      this.#log(
+        'warn',
+        `[ConversationStore] dropped ${dropped} invalid index entr${dropped === 1 ? 'y' : 'ies'} (kept ${entries.length}); they will be removed from the index on next save`
+      );
+    }
+    return entries;
   }
 
   #saveIndex(index: ConversationEntry[]) {
+    const payload = JSON.stringify(index, null, 2);
+    if (this.#wz) {
+      // WriteZone 分支沿用 Core 的写入原语（守卫 + 写文件）；原子性由 Core 侧决定，不在本包范围
+      try {
+        this.#wz.writeFile(this.#wz.runtime('conversations/index.json'), payload);
+      } catch (err: unknown) {
+        this.#log('warn', `[ConversationStore] index save failed: ${describeError(err)}`);
+      }
+      return;
+    }
+    // 无 WriteZone（宿主生产路径）：先写同目录临时文件再 rename。rename 在同一文件系统内是原子的，
+    // 写到一半被杀只会留下临时文件，旧索引保持完整；临时文件名带 pid，避免多进程互相覆盖。
+    const tempPath = `${this.#indexPath}.${process.pid}.tmp`;
     try {
-      if (this.#wz) {
-        this.#wz.writeFile(
-          this.#wz.runtime('conversations/index.json'),
-          JSON.stringify(index, null, 2)
-        );
-      } else {
-        fs.mkdirSync(this.#dir, { recursive: true });
-        fs.writeFileSync(this.#indexPath, JSON.stringify(index, null, 2), 'utf-8');
+      fs.mkdirSync(this.#dir, { recursive: true });
+      fs.writeFileSync(tempPath, payload, 'utf-8');
+      fs.renameSync(tempPath, this.#indexPath);
+    } catch (err: unknown) {
+      this.#log(
+        'warn',
+        `[ConversationStore] index save failed; previous index left in place: ${describeError(err)}`
+      );
+      this.#removeTempIndex(tempPath);
+    }
+  }
+
+  /** 写索引失败后清理临时文件；清理本身失败只记 warn，不影响调用方 */
+  #removeTempIndex(tempPath: string) {
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
       }
     } catch (err: unknown) {
-      this.#log('warn', `[ConversationStore] index save failed: ${(err as Error).message}`);
+      this.#log(
+        'warn',
+        `[ConversationStore] could not remove temporary index file after failed save: ${describeError(err)}`
+      );
     }
   }
 }
