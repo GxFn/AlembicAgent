@@ -17,8 +17,11 @@
  *     等阶段的动作集合；新动作若需要直呼别名（如 note_finding → memory.note_finding），
  *     还要改同目录的 callNormalization.ts；
  *   - adapter/ToolRouterAdapter.ts：信封 trust 的来源派生表（TOOL_RESULT_SOURCES、
- *     UNTRUSTED_SUCCESS_SCOPES）；返回仓库文件、命令输出或知识库内容的新工具/动作要登记，
- *     否则其成功结果会被标成 Agent 自写的可信文本（L4-P05）；
+ *     UNTRUSTED_SUCCESS_SCOPES、AGENT_AUTHORED_SUCCESS_SCOPES）；每个新工具/动作都要在两张
+ *     成功分类表之一显式登记：返回仓库文件、命令输出、知识库内容或台账采集原文的（如
+ *     evidence.*）进不可信表，只有 Agent 自写结果才逐个动作进可信表（L4-P05/L4-P5c）。
+ *     漏登记时成功结果按不可信处理并打 tool_trust_unclassified_action 告警，
+ *     test/tool-runtime-contract.test.ts 的 L4-P5c 用例遍历本表逐个核对分类；
  *   - test/：可用性、schema 投影、阶段策略与 handler 的对应用例。
  */
 

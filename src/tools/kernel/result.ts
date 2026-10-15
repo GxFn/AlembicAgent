@@ -297,8 +297,9 @@ export interface ToolResultTrust {
    */
   sanitized: boolean;
   /**
-   * true 表示内容可能含非 Agent 自写的文本（仓库文件、命令输出、知识库内容、回显模型参数或
-   * 宿主异常的失败文案），只能当数据处理，不能当指令执行。失败结果一律为 true。
+   * true 表示内容可能含非 Agent 自写的文本（仓库文件、命令输出、知识库内容、经证据台账取回的
+   * 这些原文、回显模型参数或宿主异常的失败文案），只能当数据处理，不能当指令执行。失败结果一律
+   * 为 true；成功结果只有在生产方显式登记为 Agent 自写时才为 false，未登记的按 true 处理。
    */
   containsUntrustedText: boolean;
   /**
