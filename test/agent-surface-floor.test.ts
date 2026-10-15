@@ -33,6 +33,7 @@ import {
 import { runScanAgentTask } from '../src/agent/runs/scan/ScanAgentRun.js';
 import { runTranslationJson } from '../src/agent/runs/translation/TranslationAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import type { ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
 import type {
   AgentRunInput,
@@ -40,7 +41,7 @@ import type {
   AgentRunStatus,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
-import type { AgentService } from '../src/agent/service/AgentService.js';
+import { AgentService } from '../src/agent/service/AgentService.js';
 import { AgentRunCoordinator, SystemRunContextFactory } from '../src/agent/service/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
@@ -817,6 +818,124 @@ describe('profile public contracts', () => {
       strategy: { type: 'pipeline', stages: [{ name: 'scan', limit: 7 }] },
     });
     expect(compiled.policies?.[0]).toBeInstanceOf(BudgetPolicy);
+  });
+});
+
+describe('relation-discovery run deadline covers its stage windows (L8-P02)', () => {
+  // PipelineStrategy 的 executeAttempt 给每次阶段尝试的期限是 stage.budget.timeoutMs + 60s
+  // forced-summary 缓冲；整次期限（BudgetPolicy.timeoutMs → AgentRuntime.execute）必须容得下
+  // 全部阶段窗口，否则 explore 偏晚正常结束时 synthesize 会被整次期限截断。
+  const STAGE_ATTEMPT_GRACE_MS = 60_000;
+
+  type RelationStage = {
+    name: string;
+    budget: { timeoutMs: number; maxIterations?: number };
+    capabilities?: unknown[];
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function compileRelationDiscovery() {
+    const compiled = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry(),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    }).compile({ id: 'relation-discovery' });
+    const budget = compiled.policies?.find((policy) => policy instanceof BudgetPolicy);
+    if (!(budget instanceof BudgetPolicy)) {
+      throw new Error('relation-discovery must compile a BudgetPolicy');
+    }
+    const strategy = compiled.strategy as { type: string; stages: RelationStage[] };
+    return { compiled, budget, strategy };
+  }
+
+  it('declares a run deadline no shorter than the sum of its stage attempt windows', () => {
+    const { budget, strategy } = compileRelationDiscovery();
+    expect(strategy.type).toBe('pipeline');
+    expect(strategy.stages.map((stage) => stage.name)).toEqual(['explore', 'synthesize']);
+    const stageWindows = strategy.stages.reduce(
+      (sum, stage) => sum + stage.budget.timeoutMs + STAGE_ATTEMPT_GRACE_MS,
+      0
+    );
+    expect(budget.timeoutMs).toBeGreaterThanOrEqual(stageWindows);
+  });
+
+  it('leaves the iteration cap to the stage budgets instead of a masked profile value', () => {
+    const { budget, strategy } = compileRelationDiscovery();
+    // 每个阶段都自带 maxIterations，阶段预算作为 budgetOverride 完全替代 policy 预算；
+    // profile 再声明 maxIterations 只会形成不生效的假声明。policy 的缺省轮数不能低于阶段上限，
+    // 否则按已完成轮数判定的 policy_stop 会先于阶段自己的 iteration_exhausted 截断阶段。
+    for (const stage of strategy.stages) {
+      expect(stage.budget.maxIterations).toBeGreaterThan(0);
+      expect(stage.budget.maxIterations).toBeLessThanOrEqual(budget.maxIterations);
+    }
+    const declared = new AgentProfileRegistry()
+      .require('relation-discovery')
+      .defaults?.policies?.find((policy) => policy.type === 'budget');
+    expect(declared).toBeDefined();
+    expect(declared).not.toHaveProperty('maxIterations');
+  });
+
+  it('returns relations when explore finishes late inside its window and synthesize uses its full window', async () => {
+    vi.useFakeTimers();
+    // explore 在 300s 阶段预算内发起最后一轮、340s 正常给出最终回复（未超阶段窗口 360s），
+    // synthesize 用 90s（未超阶段窗口 120s）：两阶段都在各自窗口内，整次运行应成功。
+    const llmDelaysMs = [340_000, 90_000];
+    let llmCalls = 0;
+    const chatWithTools = vi.fn(async () => {
+      const delay = llmDelaysMs[llmCalls] ?? 1_000;
+      llmCalls += 1;
+      const call = llmCalls;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return call === 1
+        ? { text: 'explore summary: A depends_on B', functionCalls: [] }
+        : {
+            text: '{"analyzed":2,"relations":[{"from":"A","to":"B","type":"depends_on"}]}',
+            functionCalls: [],
+          };
+    });
+    const service = new AgentService({
+      runtimeBuilder: {
+        build: (profile) => {
+          const compiled = profile as CompiledAgentProfile;
+          const strategy = compiled.strategy as { stages: RelationStage[] };
+          return new AgentRuntime({
+            aiProvider: { name: 'relation-deadline', model: 'fixture', chatWithTools } as never,
+            toolRegistry: { getManifest: () => null } as never,
+            toolRouter: { execute: vi.fn() } as never,
+            capabilities: [],
+            projectRoot,
+            // 本用例只验证期限：剥掉阶段能力，阶段预算与整次期限仍取自编译出的 profile。
+            strategy: new PipelineStrategy({
+              stages: strategy.stages.map((stage) => ({ ...stage, capabilities: [] })) as never,
+            }),
+            policies: new PolicyEngine((compiled.policies ?? []) as Policy[]),
+          });
+        },
+      },
+    });
+
+    let settled = false;
+    const pending = runRelationDiscovery({ agentService: service }).then(
+      (value) => {
+        settled = true;
+        return { ok: true as const, value };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { ok: false as const, error };
+      }
+    );
+    for (let second = 0; second < 700 && !settled; second += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    const outcome = await pending;
+
+    expect(llmCalls).toBe(2);
+    expect(outcome.ok ? outcome.value.relations : String(outcome.error)).toEqual([
+      { from: 'A', to: 'B', type: 'depends_on' },
+    ]);
   });
 });
 
