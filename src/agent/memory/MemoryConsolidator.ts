@@ -281,6 +281,8 @@ export class MemoryConsolidator {
    *
    * @returns 迁移结果 { migrated, skipped, error? }：migrated = 新增 + 合并条数；
    *   迁移整体失败时 migrated/skipped 为 0 并带 error
+   * @deprecated 唯一调用方 PersistentMemory.migrateFromLegacy 也无人调用（wz 参数从未传入）；
+   *   若事项②决定保留，需先补坏行/改名失败的诊断与输入校验。随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   async migrateFromLegacy(
     projectRoot: string,

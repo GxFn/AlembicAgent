@@ -8,7 +8,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import type { Dirent } from 'node:fs';
+import { type Dirent, realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -2278,34 +2278,44 @@ async function buildDirectoryTree(
 /* ================================================================== */
 
 /**
- * code.write 受保护路径规则（L4-P16 / I15）。
+ * code.write 受保护路径规则（L4-P16 / I15，L4-P16c 补修）。
  *
  * 旧实现只认根目录、区分大小写、按 '/' 前缀匹配 ['.git','node_modules','.env']，
  * `.env.local`、子目录 `.env`、嵌套 node_modules、macOS 上 `.GIT/config` 都能写穿。
- * 现在改为按路径段判定：路径按 '/' 与平台分隔符拆段，每段统一小写后比较，任一段命中即拒绝：
+ * 现在改为按路径段判定：路径按 '/' 与平台分隔符拆段，每段归一后比较，任一段命中即拒绝：
  *   - git-metadata：段等于 `.git`（含子目录里的 .git，如子模块/嵌套仓库）；
  *   - dependency-directory：段等于 `node_modules`（含 monorepo 子包里的依赖目录）；
  *   - env-file：段匹配 /^\.env(\..+)?$/（`.env`、`.env.local`、`.env.production.local` 等）。
  * `.env.example` 与 `.env.sample` 是约定入库、不含密钥的模板名，按决策显式放行。
- * 统一小写是为了覆盖 macOS/Windows 默认大小写不敏感的文件系统：`.GIT/config` 实际写的就是
- * `.git/config`；在大小写敏感的文件系统上这只会多拒一个同名异写路径，属于偏严的安全取舍。
+ *
+ * 每段按两种归一各判一次，任一命中即拒绝（见 protectedSegmentRule）：
+ *   - lowercase：toLowerCase，覆盖 macOS/Windows 默认大小写不敏感文件系统上的 ASCII 异写，
+ *     `.GIT/config` 实际写的就是 `.git/config`；
+ *   - unicode-fold：APFS 按 Unicode 大小写折叠比较文件名，`node_moduleſ`（U+017F 长 s）与
+ *     node_modules 是同一目录，只做 toLowerCase 会放行（L4-P16c）。
+ * 在大小写敏感的文件系统上这两种归一只会多拒同名异写的路径，属于偏严的安全取舍。
  */
 type ProtectedPathRule = 'git-metadata' | 'dependency-directory' | 'env-file';
+/** 命中的是哪种归一：lowercase 是 ASCII 大小写，unicode-fold 是只有 Unicode 折叠后才命中的异写。 */
+type ProtectedSegmentMatch = 'lowercase' | 'unicode-fold';
 
 const PROTECTED_ENV_FILE_PATTERN = /^\.env(\..+)?$/;
 const PROTECTED_ENV_TEMPLATE_NAMES: ReadonlySet<string> = new Set(['.env.example', '.env.sample']);
 
-/** 命中详情：path 是命中视图下相对项目根的路径，segment 保留原始大小写便于排查。 */
+/** 命中详情：path 是命中视图下相对项目根的路径，segment 保留原始拼写便于排查。 */
 interface ProtectedPathHit {
   rule: ProtectedPathRule;
+  match: ProtectedSegmentMatch;
   segment: string;
   path: string;
   /** requested：模型请求的词法路径；resolved：symlink 解析后的真实落盘路径。 */
   view: 'requested' | 'resolved';
+  /** path 相对的根：lexical 是调用方给的项目根，real 是它的 realpath（见 requestedViewRelPath）。 */
+  root: 'lexical' | 'real';
 }
 
-function protectedSegmentRule(segment: string): ProtectedPathRule | undefined {
-  const normalized = segment.toLowerCase();
+/** 对已归一的段名判定规则；模板名放行只认归一后的精确名字。 */
+function classifyNormalizedSegment(normalized: string): ProtectedPathRule | undefined {
   if (normalized === '.git') {
     return 'git-metadata';
   }
@@ -2321,48 +2331,146 @@ function protectedSegmentRule(segment: string): ProtectedPathRule | undefined {
   return undefined;
 }
 
+/**
+ * 大小写不敏感文件系统等价类的保守近似（超集）：
+ * - NFKC：先做兼容分解再组合，`ſ`(U+017F)→s、`K`(U+212A 开尔文)→K、`ﬁ`→fi，也覆盖 APFS 的
+ *   规范等价（NFKC 包含 NFD 的规范分解）；
+ * - toUpperCase().toLowerCase()：JS 没有原生 casefold，大写往返覆盖 `ß`→ss 这类只靠
+ *   toLowerCase 折不到的完全折叠。
+ * 对 .git / node_modules / .env 这几个纯 ASCII 目标，凡是文件系统折叠后与它们相等的拼写，
+ * 这里都会折到同一个 ASCII 串；反过来会多折一些文件系统并不等同的拼写（如全角字母、`ı`），
+ * 只会多拒，不会少拒。
+ */
+function foldSegmentForCaseInsensitiveFs(segment: string): string {
+  return segment.normalize('NFKC').toUpperCase().toLowerCase();
+}
+
+/**
+ * 两种归一各判一次，任一命中即拒绝。分开判而不是只判折叠结果，是为了保证折叠只增加拒绝：
+ * `.env.ſample` 折叠后是放行的模板名 `.env.sample`，但按原拼写它是普通的 `.env.*` 段，
+ * 在大小写敏感的文件系统上是另一个文件，仍按 env-file 拒绝。
+ */
+function protectedSegmentRule(
+  segment: string
+): { rule: ProtectedPathRule; match: ProtectedSegmentMatch } | undefined {
+  const lowered = segment.toLowerCase();
+  const lowercaseRule = classifyNormalizedSegment(lowered);
+  if (lowercaseRule) {
+    return { rule: lowercaseRule, match: 'lowercase' };
+  }
+  const folded = foldSegmentForCaseInsensitiveFs(segment);
+  if (folded === lowered) {
+    return undefined;
+  }
+  const foldedRule = classifyNormalizedSegment(folded);
+  return foldedRule ? { rule: foldedRule, match: 'unicode-fold' } : undefined;
+}
+
 function findProtectedSegment(
   relPath: string,
-  view: ProtectedPathHit['view']
+  view: ProtectedPathHit['view'],
+  root: ProtectedPathHit['root']
 ): ProtectedPathHit | undefined {
   // 同时按 '/' 与 path.sep 拆段：POSIX 上两者相同；Windows 上模型可能混用两种分隔符。
   const segments = relPath.split('/').flatMap((part) => part.split(path.sep));
   for (const segment of segments) {
-    const rule = protectedSegmentRule(segment);
-    if (rule) {
-      return { rule, segment, path: relPath, view };
+    const hit = protectedSegmentRule(segment);
+    if (hit) {
+      return { ...hit, segment, path: relPath, view, root };
     }
   }
   return undefined;
 }
 
+/** 相对路径是否落在根内（按段判断，与 #shared/projectPath 的包含口径一致）。 */
+function isRelPathWithinRoot(relPath: string): boolean {
+  return !(relPath === '..' || relPath.startsWith(`..${path.sep}`) || path.isAbsolute(relPath));
+}
+
+/**
+ * requested 视图的相对路径要相对“实际容纳请求的那个根”计算，与 resolveProjectPath 的双根预检查
+ * 同一口径（L4-P16c）：
+ * - 请求落在词法根内：相对词法根，与旧行为一致；
+ * - 否则（46f25bc 起，symlink 项目根下的真实绝对路径会被放行）：相对 realpath(根)。若仍相对
+ *   词法根，会得到 `../<真实根各段>/...`，真实根路径含 .git / node_modules / .env* 段时，所有
+ *   普通文件都会被误拒为受保护路径。
+ * realpath 用 JS 版 realpathSync，与 resolveProjectPath 保持同一拼写口径（native 版会改写大小写，
+ * 和模型回传的 absolute 对不上）。根无法解析或请求不在 realpath 根内（与 resolveProjectFilePath
+ * 刚放行的结果矛盾，只可能是并发改动根目录）时降级回词法相对路径：它的段是“真实根各段 + 请求段”
+ * 的超集，只会多拒，不会少拒；降级打 warn 日志。
+ */
+function requestedViewRelPath(
+  filePath: string,
+  projectRoot: string
+): { relPath: string; root: ProtectedPathHit['root'] } {
+  const lexicalRoot = path.resolve(projectRoot);
+  const requested = path.resolve(lexicalRoot, filePath);
+  const lexicalRelPath = path.relative(lexicalRoot, requested);
+  if (isRelPathWithinRoot(lexicalRelPath)) {
+    return { relPath: lexicalRelPath, root: 'lexical' };
+  }
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(lexicalRoot);
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    reportRequestedViewFallback(lexicalRelPath, `realpath_failed: ${reason}`);
+    return { relPath: lexicalRelPath, root: 'lexical' };
+  }
+  const realRelPath = path.relative(realRoot, requested);
+  if (!isRelPathWithinRoot(realRelPath)) {
+    reportRequestedViewFallback(lexicalRelPath, 'outside_real_root');
+    return { relPath: lexicalRelPath, root: 'lexical' };
+  }
+  observeSafely(
+    () =>
+      Logger.getInstance().debug(
+        `[code.write] requested view anchored at real project root; reason=outside_lexical_root; path=${realRelPath}`
+      ),
+    () => undefined
+  );
+  return { relPath: realRelPath, root: 'real' };
+}
+
+function reportRequestedViewFallback(lexicalRelPath: string, reason: string): void {
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[code.write] requested view fallback to lexical root; reason=${reason}; path=${lexicalRelPath}; protected-path check stays on the stricter lexical segments`
+      ),
+    () => undefined
+  );
+}
+
 /**
  * 两个视图都要查：
- * - requested（词法路径）：`.env -> config/secrets.txt` 这类 symlink 的真实目标是普通文件名，
+ * - requested（请求路径）：`.env -> config/secrets.txt` 这类 symlink 的真实目标是普通文件名，
  *   只查真实路径会放行对 `.env` 的写入；
  * - resolved（realpath 后的路径）：`alias -> packages/x/.env.local` 这类别名的请求名无害，
- *   只查词法路径会写穿受保护文件。
- * resolveProjectFilePath 已保证两者都在项目根内，这里只做段匹配，不重复包含校验。
+ *   只查请求路径会写穿受保护文件。
+ * resolveProjectFilePath 已做包含校验（resolved 视图相对 realpath 根且在根内）；requested 视图
+ * 的根按 requestedViewRelPath 选取，这里只做段匹配，不重复包含校验。
  */
 function checkProtectedWritePath(
   filePath: string,
   projectRoot: string,
   resolvedRelPath: string
 ): ProtectedPathHit | undefined {
-  const lexicalRoot = path.resolve(projectRoot);
-  const requestedRelPath = path.relative(lexicalRoot, path.resolve(lexicalRoot, filePath));
+  const requested = requestedViewRelPath(filePath, projectRoot);
   return (
-    findProtectedSegment(requestedRelPath, 'requested') ??
-    findProtectedSegment(resolvedRelPath, 'resolved')
+    findProtectedSegment(requested.relPath, 'requested', requested.root) ??
+    findProtectedSegment(resolvedRelPath, 'resolved', 'real')
   );
 }
 
 /**
  * 受保护路径拒绝回执：blocked 状态让 adapter 记入 blockedTools，诊断与日志写明命中视图、
- * 路径、原始段与规则，不记录待写内容；写入从未开始。
+ * 路径所相对的根、原始段、归一方式与规则，不记录待写内容；写入从未开始。
  */
 function protectedPathDenial(hit: ProtectedPathHit): ToolResult {
-  const detail = `path=${hit.path}; view=${hit.view}; segment=${hit.segment}; rule=${hit.rule}`;
+  const detail =
+    `path=${hit.path}; view=${hit.view}; root=${hit.root}; segment=${hit.segment}; ` +
+    `match=${hit.match}; rule=${hit.rule}`;
   observeSafely(
     () => Logger.getInstance().warn(`[code.write] ${detail}; result=denied; write=not-started`),
     () => undefined

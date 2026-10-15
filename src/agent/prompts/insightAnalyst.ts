@@ -182,18 +182,58 @@ ${DEPTH_CAPTURE_INSTRUCTION}
 用自然语言描述你的理解，不需要特定格式。`;
 
 // ──────────────────────────────────────────────────────────────────
-// Analyst 可用工具白名单 — 只做探索，不做提交
+// Analyst 工具名单（历史常量）
 // ──────────────────────────────────────────────────────────────────
 
+/**
+ * 早期的 Analyst 工具白名单。
+ * @deprecated 无任何消费者，且与真实工具面不一致：analyze 阶段的可用工具由
+ *   tools/runtime/toolsets/GenerateAnalyze 与阶段 additionalTools 决定，不读本常量。
+ *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+ */
 export const ANALYST_TOOLS = ['code', 'graph', 'terminal', 'memory', 'meta'];
 
 // ──────────────────────────────────────────────────────────────────
 // Analyst 预算 — 使用 analyst 策略（自由探索，无阶段约束）
 // ──────────────────────────────────────────────────────────────────
 
-/** 默认 Analyst 预算（24 轮基线） */
+/** 宿主未提供 contextWindowBudget 时的每轮上下文预算估算（token/轮，保守值） */
+const DEFAULT_ANALYST_ROUND_CONTEXT_BUDGET = 15_000;
+/** 每轮实际 input 占上下文预算的加权平均：早期轮次 ~40%，后期接近上限 ~70% */
+const ANALYST_AVG_INPUT_USAGE_RATIO = 0.6;
+/** 会话总量 = input × 1.35（output 约占 input 的 30-40%） */
+const ANALYST_SESSION_TOTAL_RATIO = 1.35;
+
+/**
+ * 迭代数 → 会话 token 上限（静态兜底与 computeAnalystBudget 共用的唯一估算口径）。
+ * @param contextWindowBudget ContextWindow 的 tokenBudget；缺省或为 0 时按 15000 token/轮 估算
+ */
+function analystSessionTokenCaps(
+  maxIter: number,
+  contextWindowBudget?: number
+): { maxSessionTokens: number; maxSessionInputTokens: number } {
+  const cwBudget = contextWindowBudget || DEFAULT_ANALYST_ROUND_CONTEXT_BUDGET;
+  const avgInputPerRound = Math.ceil(cwBudget * ANALYST_AVG_INPUT_USAGE_RATIO);
+  const maxSessionInputTokens = maxIter * avgInputPerRound;
+  return {
+    maxSessionTokens: Math.ceil(maxSessionInputTokens * ANALYST_SESSION_TOTAL_RATIO),
+    maxSessionInputTokens,
+  };
+}
+
+/** 静态 Analyst 预算的 24 轮基线 */
+const ANALYST_BASELINE_ITERATIONS = 24;
+const ANALYST_BASELINE_SESSION = analystSessionTokenCaps(ANALYST_BASELINE_ITERATIONS);
+
+/**
+ * 默认 Analyst 预算（24 轮基线）。
+ *
+ * 宿主生产路径总是用 computeAnalystBudget 的结果覆盖（经 _computedBudget 合并进 analyze 阶段预算）；
+ * 本常量只在没有动态预算时作为 insightPreset analyze 阶段的兜底。会话 token 上限与
+ * computeAnalystBudget(≤40 文件、未提供 contextWindowBudget) 同源（C57 统一口径）。
+ */
 export const ANALYST_BUDGET = {
-  maxIterations: 24,
+  maxIterations: ANALYST_BASELINE_ITERATIONS,
   searchBudget: 18,
   searchBudgetGrace: 10,
   maxSubmits: 0,
@@ -201,16 +241,14 @@ export const ANALYST_BUDGET = {
   idleRoundsToExit: 2,
   /**
    * Session-level total token cap (input + output).
-   * 默认基于中等上下文模型(~24k budget): 24 × 24000 × 0.6 × 1.35 ≈ 466k
-   * 会被 computeAnalystBudget 根据 contextWindowBudget 动态覆盖。
+   * 24 轮 × ceil(15000 × 0.6) × 1.35 = 291,600；有动态预算时被 computeAnalystBudget 覆盖。
    */
-  maxSessionTokens: Math.ceil(24 * 24_000 * 0.6 * 1.35),
+  maxSessionTokens: ANALYST_BASELINE_SESSION.maxSessionTokens,
   /**
    * Session-level input token cap.
-   * 默认基于中等上下文模型(~24k budget): 24 × 24000 × 0.6 ≈ 345k
-   * 会被 computeAnalystBudget 根据 contextWindowBudget 动态覆盖。
+   * 24 轮 × ceil(15000 × 0.6) = 216,000；有动态预算时被 computeAnalystBudget 覆盖。
    */
-  maxSessionInputTokens: Math.ceil(24 * 24_000 * 0.6),
+  maxSessionInputTokens: ANALYST_BASELINE_SESSION.maxSessionInputTokens,
 };
 
 /**
@@ -280,14 +318,11 @@ function analystBudgetForIterations(
   maxIter: number,
   contextWindowBudget?: number
 ): typeof ANALYST_BUDGET & { timeoutMs: number } {
-  // Session token 预算: 基于 ContextWindow budget 动态计算
-  // 每轮 input token ≈ contextWindowBudget × avgUsageRatio
-  // 早期轮次 usage 较低(~40%), 后期接近上限(~70%), 取加权平均 ~60%
-  const cwBudget = contextWindowBudget || 15_000;
-  const avgInputPerRound = Math.ceil(cwBudget * 0.6);
-  const maxSessionInputTokens = maxIter * avgInputPerRound;
-  // output 约占 input 的 30-40%
-  const maxSessionTokens = Math.ceil(maxSessionInputTokens * 1.35);
+  // Session token 预算: 每轮 input ≈ contextWindowBudget × 60%，与静态 ANALYST_BUDGET 同一口径
+  const { maxSessionTokens, maxSessionInputTokens } = analystSessionTokenCaps(
+    maxIter,
+    contextWindowBudget
+  );
 
   return {
     ...ANALYST_BUDGET,

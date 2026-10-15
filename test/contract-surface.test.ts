@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1090,5 +1091,368 @@ describe('strict production public facades', () => {
         '@alembic/agent/evaluation/StrictProductionFixtureEvaluation.js',
       ])
     );
+  });
+});
+
+/* ── L6-P25：公开面废弃登记与签名快照同步（C63 / C15 / C48 / C66） ─────────────────────────
+ * 用户决策（待决事项②④尚未答复）：C63 清单中无生产消费者的公开 API 本轮只加 @deprecated，
+ * 删除留到事项②“公开面收窄”批次（每项删除前附 src/test/宿主生产/宿主测试零引用扫描）；
+ * memory 子路径新增 SessionStore 数据类型的纯类型导出。这里锁住：
+ *   - 运行时名字与种类不变：context/memory/prompts 源码入口与签名快照逐项一致（含 signatureHash）；
+ *   - 签名文件 deprecatedPendingNarrowing 登记与源码 JSDoc 双向一致（不多标、不漏标）；
+ *   - 新增的类型导出只在类型层可见，可直接用于 SessionStore 的写入方法。
+ */
+
+interface DeprecatedBindingRecord {
+  readonly name: string;
+  readonly kind: string;
+  readonly exports: readonly string[];
+  readonly deprecatedAt: string;
+}
+
+interface DeprecatedTypeRecord {
+  readonly name: string;
+  readonly exports: readonly string[];
+  readonly deprecatedAt: string;
+}
+
+interface DeprecatedMembersRecord {
+  readonly owner: string;
+  readonly source: string;
+  readonly members: readonly string[];
+}
+
+interface DeprecationRecord {
+  readonly description: string;
+  readonly removalPrecondition: string;
+  readonly bindings: readonly DeprecatedBindingRecord[];
+  readonly types: readonly DeprecatedTypeRecord[];
+  readonly members: readonly DeprecatedMembersRecord[];
+}
+
+interface SignatureEntry {
+  readonly name: string;
+  readonly kind: string;
+}
+
+const PUBLIC_ENTRY_SOURCES = {
+  '.': 'src/index.ts',
+  './context': 'src/agent/context/index.ts',
+  './memory': 'src/agent/memory/index.ts',
+  './prompts': 'src/agent/prompts/index.ts',
+} as const;
+
+type PublicEntry = keyof typeof PUBLIC_ENTRY_SOURCES;
+const NARROWED_SUBPATHS = ['./context', './memory', './prompts'] as const;
+
+function readDeprecationRecord(): DeprecationRecord {
+  const signatures = readRepoJson('config/agent-public-api-signatures.json');
+  return signatures.deprecatedPendingNarrowing as DeprecationRecord;
+}
+
+function snapshotEntries(exportPath: string): {
+  exportCount: number;
+  signatureHash: string;
+  entries: SignatureEntry[];
+} {
+  const signatures = readRepoJson('config/agent-public-api-signatures.json');
+  const all = signatures.stableExportSignatures as Record<
+    string,
+    { exportCount: number; signatureHash: string; entries: SignatureEntry[] }
+  >;
+  const entry = all[exportPath];
+  if (!entry) {
+    throw new Error(`signature snapshot missing ${exportPath}`);
+  }
+  return entry;
+}
+
+/** 与 scripts/smoke-agent-public-signatures.mjs 相同的种类判定，保证 hash 口径一致。 */
+function runtimeKind(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  if (typeof value === 'function') {
+    return /^class\s/u.test(Function.prototype.toString.call(value)) ? 'class' : 'function';
+  }
+  return typeof value;
+}
+
+let publicEntryProgram: ts.Program | undefined;
+
+/** 只为公开入口建一次 Program；getExportsOfModule 只做绑定与解析，不做全量类型检查。 */
+function publicEntryChecker(): { program: ts.Program; checker: ts.TypeChecker } {
+  if (!publicEntryProgram) {
+    publicEntryProgram = ts.createProgram(
+      Object.values(PUBLIC_ENTRY_SOURCES).map((relative) => path.join(REPO_ROOT, relative)),
+      {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.NodeNext,
+        moduleResolution: ts.ModuleResolutionKind.NodeNext,
+        strict: true,
+        noEmit: true,
+        skipLibCheck: true,
+        types: [],
+      }
+    );
+  }
+  return { program: publicEntryProgram, checker: publicEntryProgram.getTypeChecker() };
+}
+
+function hasDeprecatedTag(declaration: ts.Declaration): boolean {
+  if (ts.getJSDocDeprecatedTag(declaration)) {
+    return true;
+  }
+  // `export const X = ...` 的 JSDoc 挂在 VariableStatement 上。
+  return (
+    ts.isVariableDeclaration(declaration) &&
+    ts.isVariableStatement(declaration.parent.parent) &&
+    ts.getJSDocDeprecatedTag(declaration.parent.parent) !== undefined
+  );
+}
+
+/**
+ * 沿 re-export 别名链找第一个带 @deprecated 的声明，返回其所在文件（仓库相对路径）；
+ * 与 TypeScript 的语义一致：入口上的 export specifier 或最终声明任一处标注都会让使用方看到废弃。
+ */
+function deprecationSite(checker: ts.TypeChecker, symbol: ts.Symbol): string | null {
+  const seen = new Set<ts.Symbol>();
+  let current: ts.Symbol | undefined = symbol;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    for (const declaration of current.declarations ?? []) {
+      if (hasDeprecatedTag(declaration)) {
+        return path
+          .relative(REPO_ROOT, declaration.getSourceFile().fileName)
+          .split(path.sep)
+          .join('/');
+      }
+    }
+    if ((current.flags & ts.SymbolFlags.Alias) === 0) {
+      break;
+    }
+    current = checker.getImmediateAliasedSymbol(current);
+  }
+  return null;
+}
+
+function deprecatedExportsOf(entry: PublicEntry): Map<string, string> {
+  const { program, checker } = publicEntryChecker();
+  const sourceFile = program.getSourceFile(path.join(REPO_ROOT, PUBLIC_ENTRY_SOURCES[entry]));
+  if (!sourceFile) {
+    throw new Error(`entry source missing: ${entry}`);
+  }
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) {
+    throw new Error(`entry module symbol missing: ${entry}`);
+  }
+  const out = new Map<string, string>();
+  for (const symbol of checker.getExportsOfModule(moduleSymbol)) {
+    const site = deprecationSite(checker, symbol);
+    if (site) {
+      out.set(symbol.name, site);
+    }
+  }
+  return out;
+}
+
+function exportNamesOf(entry: PublicEntry): Set<string> {
+  const { program, checker } = publicEntryChecker();
+  const sourceFile = program.getSourceFile(path.join(REPO_ROOT, PUBLIC_ENTRY_SOURCES[entry]));
+  const moduleSymbol = sourceFile ? checker.getSymbolAtLocation(sourceFile) : undefined;
+  if (!moduleSymbol) {
+    throw new Error(`entry module symbol missing: ${entry}`);
+  }
+  return new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.name));
+}
+
+function memberNameOf(member: ts.Node): string | undefined {
+  const name = (member as { name?: ts.PropertyName }).name;
+  if (!name) {
+    return undefined;
+  }
+  return ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isPrivateIdentifier(name)
+    ? name.text
+    : undefined;
+}
+
+/** 容器（class / interface）中带 @deprecated 的成员名；同名重载合并计算。 */
+function deprecatedMembersIn(sourceFile: ts.SourceFile, containerName: string): string[] {
+  const out = new Set<string>();
+  let found = false;
+  for (const statement of sourceFile.statements) {
+    if (
+      (ts.isInterfaceDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      statement.name?.text === containerName
+    ) {
+      found = true;
+      for (const member of statement.members) {
+        const name = memberNameOf(member);
+        if (name && ts.getJSDocDeprecatedTag(member)) {
+          out.add(name);
+        }
+      }
+    }
+  }
+  if (!found) {
+    throw new Error(`container ${containerName} not found in ${sourceFile.fileName}`);
+  }
+  return [...out].sort();
+}
+
+/** 顶层声明不能被整体废弃（文件头注释里的 @deprecated 字样会被解析成紧随其后声明的标签）。 */
+function deprecatedTopLevelStatements(sourceFile: ts.SourceFile): string[] {
+  const names: string[] = [];
+  for (const statement of sourceFile.statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.getJSDocDeprecatedTag(statement) || ts.getJSDocDeprecatedTag(declaration)) {
+          names.push(declaration.name.getText(sourceFile));
+        }
+      }
+    } else if (ts.getJSDocDeprecatedTag(statement)) {
+      names.push(memberNameOf(statement) ?? ts.SyntaxKind[statement.kind]);
+    }
+  }
+  return names;
+}
+
+describe('public surface deprecations pending decision 2 (L6-P25)', () => {
+  it('keeps the context/memory/prompts runtime names, kinds and hashes equal to the frozen snapshot', async () => {
+    const modules: Record<(typeof NARROWED_SUBPATHS)[number], Record<string, unknown>> = {
+      './context': await import('../src/agent/context/index.js'),
+      './memory': await import('../src/agent/memory/index.js'),
+      './prompts': prompts,
+    };
+    for (const exportPath of NARROWED_SUBPATHS) {
+      const moduleExports = modules[exportPath];
+      const entries = Object.keys(moduleExports)
+        .sort()
+        .map((name) => ({ name, kind: runtimeKind(moduleExports[name]) }));
+      const expected = snapshotEntries(exportPath);
+      // 快照文件里的 entries 不保证按名排序（历史上有手工插入），hash 由 smoke 按排序后的实际值计算。
+      const expectedSorted = [...expected.entries].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+      );
+      expect({ exportPath, entries }).toEqual({ exportPath, entries: expectedSorted });
+      expect(entries).toHaveLength(expected.exportCount);
+      expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+        expected.signatureHash
+      );
+    }
+  });
+
+  it('records every deprecated runtime binding in the snapshot with its frozen kind', () => {
+    const record = readDeprecationRecord();
+    expect(record.description).toMatch(/②/);
+    expect(record.removalPrecondition).toMatch(/零引用/);
+    expect(record.bindings.length).toBeGreaterThan(0);
+    for (const binding of record.bindings) {
+      for (const exportPath of binding.exports) {
+        expect({
+          exportPath,
+          binding: binding.name,
+          entries: snapshotEntries(exportPath).entries,
+        }).toEqual({
+          exportPath,
+          binding: binding.name,
+          entries: expect.arrayContaining([{ name: binding.name, kind: binding.kind }]),
+        });
+      }
+    }
+  });
+
+  it('marks exactly the recorded bindings and types deprecated on the public entries', () => {
+    const record = readDeprecationRecord();
+    const recorded = [...record.bindings, ...record.types];
+    for (const exportPath of NARROWED_SUBPATHS) {
+      const actual = deprecatedExportsOf(exportPath);
+      const expected = new Map(
+        recorded
+          .filter((entry) => entry.exports.includes(exportPath))
+          .map((entry) => [entry.name, entry.deprecatedAt] as const)
+      );
+      expect({ exportPath, deprecated: [...actual].sort() }).toEqual({
+        exportPath,
+        deprecated: [...expected].sort(),
+      });
+    }
+    // 根入口还聚合了 ai/tools 等其它层（其中已有与本包无关的废弃导出），只比较来自
+    // context/memory 子路径的名字。
+    const scoped = new Set([...exportNamesOf('./context'), ...exportNamesOf('./memory')]);
+    const rootDeprecated = [...deprecatedExportsOf('.')].filter(([name]) => scoped.has(name));
+    const rootExpected = recorded
+      .filter((entry) => entry.exports.includes('.'))
+      .map((entry) => [entry.name, entry.deprecatedAt] as const);
+    expect(rootDeprecated.sort()).toEqual([...rootExpected].sort());
+  });
+
+  it('marks exactly the recorded members deprecated and never a whole top-level declaration', () => {
+    const record = readDeprecationRecord();
+    const sources = new Set<string>();
+    for (const entry of record.members) {
+      const file = path.join(REPO_ROOT, entry.source);
+      const sourceFile = ts.createSourceFile(
+        file,
+        readFileSync(file, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true
+      );
+      expect({
+        owner: entry.owner,
+        deprecated: deprecatedMembersIn(sourceFile, entry.owner),
+      }).toEqual({ owner: entry.owner, deprecated: [...entry.members].sort() });
+      sources.add(entry.source);
+    }
+    for (const source of sources) {
+      const file = path.join(REPO_ROOT, source);
+      const sourceFile = ts.createSourceFile(
+        file,
+        readFileSync(file, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true
+      );
+      expect({ source, deprecatedTopLevel: deprecatedTopLevelStatements(sourceFile) }).toEqual({
+        source,
+        deprecatedTopLevel: [],
+      });
+    }
+  });
+
+  it('exports SessionStore data types from the memory subpath as types only (C66)', () => {
+    const diagnostics = typecheckRouterContractProbes({
+      'memory-session-store-types.probe.ts': `
+import type {
+  DimensionDigest,
+  DimensionReportInput,
+  Finding,
+  SessionStore,
+  TierReflection,
+} from '../src/agent/memory/index.js';
+import type { DimensionDigest as RootDigest, Finding as RootFinding } from '../src/index.js';
+
+declare const store: SessionStore;
+const finding: Finding = { finding: 'uses the shared session store', importance: 7 };
+const digest: DimensionDigest = { summary: 'digest', keyFindings: [finding], gaps: [] };
+const reflection: TierReflection = {
+  tierIndex: 0,
+  completedDimensions: ['api'],
+  topFindings: [finding],
+  crossDimensionPatterns: [],
+  suggestionsForNextTier: [],
+};
+const report: DimensionReportInput = { analysisText: 'analysis', findings: [finding], digest };
+store.addDimensionDigest('api', digest);
+store.addTierReflection(0, reflection);
+store.storeDimensionReport('api', report);
+const rootDigest: RootDigest = digest;
+const rootFinding: RootFinding = finding;
+export { rootDigest, rootFinding };
+`,
+    });
+    expect(diagnostics['memory-session-store-types.probe.ts']).toEqual([]);
   });
 });

@@ -61,6 +61,11 @@ interface MemoryPromptSnapshot {
 export interface MemoryCoordinatorConfig {
   persistentMemory?: PersistentMemoryLike | null;
   sessionStore?: SessionStore | null;
+  /**
+   * 对话日志端口，只供 onConversationUpdated 自动摘要使用。
+   * @deprecated src 与宿主构造 MemoryCoordinator 时都不注入；自动摘要端口无生产消费者，
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   conversationLog?: ConversationStoreLike | null;
   mode?: 'user' | 'bootstrap';
   totalMemoryBudget?: number;
@@ -77,6 +82,11 @@ export interface StaticMemoryOptions extends MemoryReadOptions {
 
 /** 维度 scope 配置 */
 export interface DimensionScopeConfig {
+  /**
+   * 轻量模式：透传给 ActiveContext（跳过观察滑动窗口与 buildContext 输出）。
+   * @deprecated src 与宿主调用 createDimensionScope 都不传，生产恒为 false；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   lightweight?: boolean;
   maxRecentRounds?: number;
 }
@@ -146,6 +156,11 @@ function errorMessage(err: unknown): string {
 }
 
 export class MemoryCoordinator {
+  /**
+   * 最近一次静态装配（buildStaticMemoryPrompt / buildMemoryPrompt）剩余的预算，仅作观测。
+   * @deprecated 无生产读取方，也不决定任何 scope 的配额（配额以各 scope 的预算快照为准）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   _lastSurplus = 0;
   // ── Config ──
   #mode: 'user' | 'bootstrap';
@@ -204,8 +219,10 @@ export class MemoryCoordinator {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 配置总预算 (由 AgentRuntime.execute 入口调用)
+   * 按模型总上下文配置记忆总预算（约 12.5%）；model 参数未被使用。
    * @param options.totalContextBudget 模型总上下文 token 数
+   * @deprecated AgentRuntime 与宿主都不调用（记忆预算来自构造参数 totalMemoryBudget 与 allocateBudget）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   configure({ totalContextBudget, model }: { totalContextBudget?: number; model?: string } = {}) {
     if (totalContextBudget !== undefined) {
@@ -233,10 +250,18 @@ export class MemoryCoordinator {
     this.#promptBudgets.clear();
   }
 
+  /**
+   * 当前记忆 section 的 token 总预算。
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getTotalBudget() {
     return this.#totalBudget;
   }
 
+  /**
+   * 当前各层记忆的预算分配副本。
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getBudgetAllocation() {
     return { ...this.#budgetAllocation };
   }
@@ -244,6 +269,7 @@ export class MemoryCoordinator {
   /**
    * 获取消息缓冲区可用预算 (F2)
    * @param totalContextBudget 模型总上下文 token
+   * @deprecated 无生产调用方（消息预算由 BudgetController 管理）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getMessageBudget(
     totalContextBudget: number,
@@ -265,7 +291,7 @@ export class MemoryCoordinator {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 构建静态记忆 prompt (execute 入口调用一次)
+   * 构建静态记忆 prompt
    * 包含: PersistentMemory + SessionStore 上下文。不读取 ConversationLog：
    * 分配给 conversationLog 的份额只计入静态预算，未用部分作为 surplus 转给同 mode 的
    * 动态（工作记忆）prompt。
@@ -274,6 +300,9 @@ export class MemoryCoordinator {
    * @param [options.taskContext] 当前任务描述 (用于 relevance 打分)
    * @param [options.currentDimId] 当前维度 (用于 SessionStore 过滤)
    * @param [options.focusKeywords] 聚焦关键词
+   * @deprecated AgentRuntime 只调用 buildDynamicMemoryPrompt，src 与宿主都不调用本方法
+   *   （持久记忆由 insightAnalyst 经 readPersistentMemorySection 直接读取）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   async buildStaticMemoryPrompt(options: StaticMemoryOptions = {}): Promise<string> {
     return (await this.#assembleStaticPrompt(options, this.#totalBudget)).content;
@@ -365,7 +394,10 @@ export class MemoryCoordinator {
     }
   }
 
-  /** 合并构建完整记忆 prompt (便捷方法) */
+  /**
+   * 合并构建完整记忆 prompt (便捷方法)
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async buildMemoryPrompt(options: StaticMemoryOptions = {}): Promise<string> {
     const totalBudget = this.#totalBudget;
     const { content, snapshot } = await this.#assembleStaticPrompt(options, totalBudget);
@@ -480,6 +512,8 @@ export class MemoryCoordinator {
    *
    * @param prompt 用户输入
    * @param reply AI 回复
+   * @deprecated src 与宿主都不调用（对话记忆不经此写入 PersistentMemory）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   extractFromConversation(prompt: string, reply: string, source: 'user' | 'system') {
     // §7.6 step 4: 只写 PersistentMemory (不再双写 Memory.js)
@@ -594,6 +628,9 @@ export class MemoryCoordinator {
   /**
    * 完成维度: 蒸馏 + 存储到 SessionStore
    * @param [report] 附加报告数据
+   * @deprecated 无生产调用方：宿主每个维度只调用 createDimensionScope，维度报告由宿主直接写入
+   *   SessionStore，scope 从不在此释放。删除还是改由宿主接线释放 scope，随待决事项②决定；
+   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   completeDimension(scopeId: string, report?: DimensionReportInput) {
     this.#promptBudgets.delete(scopeId);
@@ -628,6 +665,7 @@ export class MemoryCoordinator {
    * 完成会话：只清空当前 scope 指针，不删除已建 scope，也不触发 Consolidator 固化
    * （固化由宿主另行调用 EpisodicConsolidator）。
    * @returns 恒为 { consolidated: 0 }；内部异常时返回 null 并记 warn
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   async completeSession(): Promise<{ consolidated: number } | null> {
     try {
@@ -725,12 +763,18 @@ export class MemoryCoordinator {
     }
   }
 
-  /** 获取 PersistentMemory */
+  /**
+   * 获取 PersistentMemory
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getPersistentMemory() {
     return this.#persistentMemory || null;
   }
 
-  /** 获取 ConversationLog / ConversationStore */
+  /**
+   * 获取 ConversationLog / ConversationStore
+   * @deprecated conversationLog 端口从未被注入，恒返回 null；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getConversationLog() {
     return this.#conversationLog || null;
   }
@@ -743,7 +787,10 @@ export class MemoryCoordinator {
   // 自动摘要 (F23)
   // ═══════════════════════════════════════════════════════════
 
-  /** 对话更新后触发自动摘要 */
+  /**
+   * 对话更新后触发自动摘要（≥12 条时调用 conversationLog.summarize）
+   * @deprecated 无调用方且 conversationLog 端口从未被注入；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async onConversationUpdated(conversationId: string, aiProvider: AiProviderLike | null) {
     if (!this.#conversationLog || !aiProvider) {
       return;
@@ -766,7 +813,10 @@ export class MemoryCoordinator {
   // 断点续传
   // ═══════════════════════════════════════════════════════════
 
-  /** 保存 checkpoint */
+  /**
+   * 保存 checkpoint（委托 SessionStore.saveCheckpoint，不传 WriteZone）
+   * @deprecated 无生产调用方（宿主断点续跑用自己的维度 checkpoint）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async checkpoint(projectRoot: string) {
     try {
       if (this.#sessionStore?.saveCheckpoint) {
@@ -777,7 +827,10 @@ export class MemoryCoordinator {
     }
   }
 
-  /** 恢复 checkpoint */
+  /**
+   * 恢复 checkpoint（委托 SessionStore.loadCheckpoint）
+   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async restore(projectRoot: string): Promise<boolean> {
     try {
       if (this.#sessionStore?.loadCheckpoint) {
@@ -794,6 +847,12 @@ export class MemoryCoordinator {
   // 清理
   // ═══════════════════════════════════════════════════════════
 
+  /**
+   * 释放全部 scope 与 SessionStore 引用。
+   * @deprecated 无生产调用方：宿主从不调用 dispose，会话级 coordinator 随运行结束被回收。
+   *   删除还是改由宿主在会话结束时接线调用，随待决事项②决定；删除前须附 src、测试、宿主生产与
+   *   宿主测试的零引用扫描。
+   */
   dispose() {
     this.#promptBudgets.clear();
     this._lastSurplus = 0;

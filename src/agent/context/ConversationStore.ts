@@ -8,7 +8,11 @@
  * - Token 预算: load 超限时只做截断——保留开头的 [对话摘要]（如有且放得下）与最新消息
  *   （最新一条本身超预算时按预算截断其内容），丢弃中间旧消息并在预算放得下时插入一条
  *   [上下文截断] 标记；不会自动生成摘要。
- *   摘要只在显式调用 summarize() 时生成（需要 AI Provider，当前无生产调用方）
+ *   摘要只在显式调用 summarize() 时生成（需要 AI Provider，当前无生产调用方，已标废弃）：
+ *   最近 4 条之外的待摘要消息从最新往前按整条装入 4000 字符提示预算，放不下的较早消息原样保留在
+ *   摘要之前并记 info；最新一条待摘要消息本身就超预算时不调用模型、不改写文件并记 warn
+ * - 公开面（L6-P25 / 待决事项②）：宿主生产只用 create / append / load；summarize、list、delete、
+ *   cleanup、estimateTokens 无生产消费者，已标废弃（deprecated 标签），随事项②“公开面收窄”批次处理
  * - 降级不中断: 持久化失败不影响核心功能，但每条降级路径都必须留下 warn/info 日志
  *   （读取失败、删除失败、索引不可解析、索引条目被过滤、索引写入失败），便于定位“历史为空”的原因
  * - 索引顺序 = 最近活跃优先（LRU）: create 与 append 都把条目移到头部；超过
@@ -47,6 +51,7 @@ interface ConversationEntry {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  /** 历史中是否含 summarize 写入的 [对话摘要] 消息（摘要前可能有原样保留的较早消息，不一定是首条） */
   hasSummary: boolean;
 }
 
@@ -64,6 +69,19 @@ interface AiProvider {
 const DEFAULT_TOKEN_BUDGET = 12000; // ~12K tokens 留给历史, 其余给系统提示词和当前消息
 const MAX_CONVERSATIONS = 100; // 索引最多保留 100 个对话
 const TITLE_MAX_CHARS = 60; // 标题取首条 user 消息的前 60 个字符
+const SUMMARY_MIN_MESSAGES = 6; // 少于 6 条不值得摘要
+const SUMMARY_KEEP_RECENT = 4; // 最近 4 条原样保留，不进入摘要
+const SUMMARY_PROMPT_CHAR_BUDGET = 4000; // 交给模型的待摘要消息块上限（字符，含行间换行）
+
+/** 待摘要消息在提示中的单行表示 */
+function summaryLine(message: ConversationMessage): string {
+  return `[${message.role}] ${message.content}`;
+}
+
+/** summarize 写入的摘要消息（system + `[对话摘要]` 前缀） */
+function isSummaryMessage(message: ConversationMessage): boolean {
+  return message.role === 'system' && message.content.startsWith('[对话摘要]');
+}
 
 /** 把 unknown 错误归一成可打印的 "Name: message"，避免 `(err as Error)` 强转 */
 function describeError(err: unknown): string {
@@ -223,6 +241,8 @@ export class ConversationStore {
   /**
    * 对话列表（最近活跃优先：create / append 都会把条目移到头部）
    * @param [opts.category] 按类别过滤
+   * @deprecated 无生产消费者（宿主只用 create / append / load）；随待决事项②“公开面收窄”删除，
+   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   list({ category, limit = 20 }: { category?: 'user' | 'system'; limit?: number } = {}) {
     const index = this.#loadIndex();
@@ -233,7 +253,11 @@ export class ConversationStore {
     return results.slice(0, limit);
   }
 
-  /** 删除对话 */
+  /**
+   * 删除对话（历史文件与索引条目）
+   * @deprecated 无生产消费者（宿主只用 create / append / load）；随待决事项②“公开面收窄”删除，
+   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   delete(conversationId: string) {
     this.#deleteConversationFile(conversationId);
     const index = this.#loadIndex();
@@ -243,10 +267,18 @@ export class ConversationStore {
 
   /**
    * 为对话生成压缩摘要（需要 AI）
-   * 将旧消息替换为一条 system 摘要消息
+   *
+   * 最近 4 条消息原样保留；其余“待摘要消息”从最新往前按整条装入 4000 字符的提示预算
+   * （不截断单条消息），装入的连续一段替换为一条 system 摘要消息。重写后的文件为
+   * [未进入提示的较早消息（原样）, 摘要, 最近 4 条]，保持时间顺序：
+   *   - 任何消息要么原样留在文件里，要么完整进入了摘要提示，不会未经摘要就被删除；
+   *   - 有较早消息因预算未进入提示时记 info（摘要条数 / 待摘要总数 / 原样保留条数）；
+   *   - 最新一条待摘要消息本身就超预算时无法摘要：不调用模型、不改写文件，记 warn 并返回 false。
    *
    * @param opts.aiProvider AI Provider 实例
    * @returns 是否成功压缩
+   * @deprecated 无生产调用方（MemoryCoordinator 的 conversationLog 自动摘要端口也未被注入）；
+   *   保留期间已修复数据丢失，随待决事项②“公开面收窄”决定去留，删除前须附零引用扫描。
    */
   async summarize(conversationId: string, { aiProvider }: { aiProvider: AiProvider }) {
     if (!aiProvider) {
@@ -266,18 +298,35 @@ export class ConversationStore {
 
       const messages = this.#parseMessages(raw);
 
-      if (messages.length < 6) {
+      if (messages.length < SUMMARY_MIN_MESSAGES) {
         return false; // 太短不需要压缩
       }
 
-      // 保留最近 4 条消息，压缩其余
-      const toSummarize = messages.slice(0, -4);
-      const toKeep = messages.slice(-4);
+      // 保留最近 4 条消息，其余为待摘要消息
+      const pending = messages.slice(0, -SUMMARY_KEEP_RECENT);
+      const toKeep = messages.slice(-SUMMARY_KEEP_RECENT);
+      const { retained, summarized } = this.#selectSummaryWindow(pending);
 
-      const summaryPrompt = `请用 2-3 句话总结以下对话的要点（保留关键决策、用户偏好、操作结果）：\n\n${toSummarize
-        .map((m) => `[${m.role}] ${m.content}`)
-        .join('\n')
-        .substring(0, 4000)}`;
+      if (summarized.length === 0) {
+        // 最新一条待摘要消息单条就超出提示预算：截断它会让未进入提示的部分随重写丢失，
+        // 因此放弃本次摘要，历史保持原样。
+        const newest = pending[pending.length - 1];
+        this.#log(
+          'warn',
+          `[ConversationStore] summary skipped for conversation ${conversationId}: newest pending message (${newest ? summaryLine(newest).length : 0} chars) exceeds the ${SUMMARY_PROMPT_CHAR_BUDGET}-char summary prompt budget; history left unchanged`
+        );
+        return false;
+      }
+      if (retained.length > 0) {
+        this.#log(
+          'info',
+          `[ConversationStore] summary prompt budget ${SUMMARY_PROMPT_CHAR_BUDGET} chars for conversation ${conversationId}: summarizing newest ${summarized.length} of ${pending.length} pending message(s); ${retained.length} older message(s) kept verbatim before the summary`
+        );
+      }
+
+      const summaryPrompt = `请用 2-3 句话总结以下对话的要点（保留关键决策、用户偏好、操作结果）：\n\n${summarized
+        .map(summaryLine)
+        .join('\n')}`;
 
       const summary = await aiProvider.chat(summaryPrompt, {
         temperature: 0.3,
@@ -297,8 +346,9 @@ export class ConversationStore {
         return false;
       }
 
-      // 重写对话文件: 摘要 + 最近消息
+      // 重写对话文件: 未进入提示的较早消息（原样） + 摘要 + 最近消息
       const newMessages = [
+        ...retained,
         { role: 'system', content: `[对话摘要] ${summary.trim()}`, ts: new Date().toISOString() },
         ...toKeep,
       ];
@@ -338,6 +388,8 @@ export class ConversationStore {
    * @param [opts.maxAgeDays=30] 超过此天数的对话将被删除
    * @param [opts.category] 只清理特定类别
    * @returns 清理结果 { deleted }：本次删除的对话数
+   * @deprecated 无生产消费者（容量由 create / append 的 LRU 淘汰负责）；随待决事项②“公开面收窄”删除，
+   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   cleanup({
     maxAgeDays = 30,
@@ -371,7 +423,11 @@ export class ConversationStore {
     return { deleted };
   }
 
-  /** 估算 token 数 — 委托给共享 tokenUtils（CJK 感知） */
+  /**
+   * 估算 token 数 — 委托给共享 tokenUtils（CJK 感知）
+   * @deprecated 无外部消费者，本类内部也直接用 tokenUtils.estimateTokens；随待决事项②“公开面收窄”删除，
+   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   estimateTokens(text: string) {
     return _estimateTokens(text);
   }
@@ -379,6 +435,30 @@ export class ConversationStore {
   // ═══════════════════════════════════════════════════════
   //  内部方法
   // ═══════════════════════════════════════════════════════
+
+  /**
+   * 选出本次进入摘要提示的待摘要消息（summarize 专用）
+   *
+   * 从最新一条往前逐条累加 `[role] content` 的长度（行间换行计 1），装不下下一条即停：
+   * 进入提示的是待摘要消息末尾连续的一段，前面的较早消息原样保留，从而保持时间顺序。
+   * 单条消息不截断——截断后被删掉的部分既不在提示里也不在文件里，就是数据丢失。
+   */
+  #selectSummaryWindow(pending: ConversationMessage[]): {
+    retained: ConversationMessage[];
+    summarized: ConversationMessage[];
+  } {
+    let used = 0;
+    let start = pending.length;
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const cost = summaryLine(pending[i]).length + (start < pending.length ? 1 : 0);
+      if (used + cost > SUMMARY_PROMPT_CHAR_BUDGET) {
+        break;
+      }
+      used += cost;
+      start = i;
+    }
+    return { retained: pending.slice(0, start), summarized: pending.slice(start) };
+  }
 
   /**
    * 将消息列表裁剪到 token 预算内
@@ -394,24 +474,20 @@ export class ConversationStore {
     if (messages.length === 0 || budget === 0) {
       return [];
     }
-    const counts = messages.map((message) => this.estimateTokens(message.content));
+    const counts = messages.map((message) => _estimateTokens(message.content));
     if (counts.reduce((sum, count) => sum + count, 0) <= budget) {
       return messages;
     }
     const marker = (dropped: number) =>
       `[上下文截断] 省略了 ${dropped} 条较早的消息以适应上下文窗口。`;
-    const markerTokens = this.estimateTokens(marker(messages.length));
+    const markerTokens = _estimateTokens(marker(messages.length));
     const reserve = markerTokens < budget / 2 ? markerTokens : 0;
     let remaining = budget - reserve;
     const result: ConversationMessage[] = [];
     const tail: ConversationMessage[] = [];
     let firstIndex = 0;
     // 摘要不能挤掉最近一条消息；不足时先保留最近内容，再用日志说明省略。
-    if (
-      messages[0].role === 'system' &&
-      messages[0].content.startsWith('[对话摘要]') &&
-      counts[0] + counts[counts.length - 1] <= remaining
-    ) {
+    if (isSummaryMessage(messages[0]) && counts[0] + counts[counts.length - 1] <= remaining) {
       result.push(messages[0]);
       remaining -= counts[0];
       firstIndex = 1;
@@ -543,7 +619,9 @@ export class ConversationStore {
         messageCount = history.length;
         const firstUser = history.find((m) => m.role === 'user');
         title = firstUser ? firstUser.content.substring(0, TITLE_MAX_CHARS) : '';
-        hasSummary = history[0].role === 'system' && history[0].content.startsWith('[对话摘要]');
+        // summarize 在预算放不下时会把较早消息原样保留在摘要之前，摘要不一定是首条，
+        // 因此按“历史中是否存在摘要消息”判定，与 summarize 写入的 hasSummary 保持一致。
+        hasSummary = history.some(isSummaryMessage);
       }
     } catch (err: unknown) {
       this.#log(

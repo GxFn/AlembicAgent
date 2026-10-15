@@ -1924,5 +1924,199 @@
         }
       ]
     }
+  },
+  "deprecatedPendingNarrowing": {
+    "description": "L6-P25（C63/C15/C48）：无生产消费者、已在公开面标 @deprecated 但尚未删除的符号登记。待决事项②“公开面收窄”未答复前只加废弃标注：上面的 stableExportSignatures（名字、运行时种类、signatureHash）保持不变；createGenerateStrategy 另依赖事项④。bindings 是签名快照内的运行时绑定，types 是纯类型导出，members 是公开类/构造参数类型上的成员。test/contract-surface.test.ts 校验本登记与源码 JSDoc 双向一致。",
+    "removalPrecondition": "随事项②收窄批次逐项删除；删除前须附 src、test、宿主生产代码与宿主测试的零引用扫描；名字与运行时种类在删除前保持冻结。删除后同步本文件 stableExportSignatures 与本登记。",
+    "bindings": [
+      {
+        "name": "SEARCH_TOOLS",
+        "kind": "object",
+        "exports": [
+          ".",
+          "./context"
+        ],
+        "deprecatedAt": "src/agent/context/index.ts"
+      },
+      {
+        "name": "createGenerateStrategy",
+        "kind": "function",
+        "exports": [
+          ".",
+          "./context"
+        ],
+        "deprecatedAt": "src/agent/context/index.ts"
+      },
+      {
+        "name": "extractHighPriorityFindings",
+        "kind": "function",
+        "exports": [
+          ".",
+          "./memory"
+        ],
+        "deprecatedAt": "src/agent/memory/index.ts"
+      },
+      {
+        "name": "ANALYST_TOOLS",
+        "kind": "array",
+        "exports": [
+          "./prompts"
+        ],
+        "deprecatedAt": "src/agent/prompts/insightAnalyst.ts"
+      },
+      {
+        "name": "EVOLVER_TOOLS",
+        "kind": "array",
+        "exports": [
+          "./prompts"
+        ],
+        "deprecatedAt": "src/agent/prompts/index.ts"
+      },
+      {
+        "name": "PRODUCER_TOOLS",
+        "kind": "array",
+        "exports": [
+          "./prompts"
+        ],
+        "deprecatedAt": "src/agent/prompts/insightProducer.ts"
+      },
+      {
+        "name": "buildProducerPrompt",
+        "kind": "function",
+        "exports": [
+          "./prompts"
+        ],
+        "deprecatedAt": "src/agent/prompts/insightProducer.ts"
+      }
+    ],
+    "types": [
+      {
+        "name": "DimensionFlushManifest",
+        "exports": [
+          ".",
+          "./memory"
+        ],
+        "deprecatedAt": "src/agent/memory/index.ts"
+      }
+    ],
+    "members": [
+      {
+        "owner": "ConversationStore",
+        "source": "src/agent/context/ConversationStore.ts",
+        "members": [
+          "cleanup",
+          "delete",
+          "estimateTokens",
+          "list",
+          "summarize"
+        ]
+      },
+      {
+        "owner": "PlanTracker",
+        "source": "src/agent/context/exploration/PlanTracker.ts",
+        "members": [
+          "getQualityMetrics"
+        ]
+      },
+      {
+        "owner": "ExplorationTracker",
+        "source": "src/agent/context/ExplorationTracker.ts",
+        "members": [
+          "getQualityMetrics"
+        ]
+      },
+      {
+        "owner": "BudgetInput",
+        "source": "src/agent/context/ExplorationTracker.ts",
+        "members": [
+          "signalBus"
+        ]
+      },
+      {
+        "owner": "ActiveContext",
+        "source": "src/agent/memory/ActiveContext.ts",
+        "members": [
+          "addAction",
+          "addObservation",
+          "fromJSON",
+          "getCurrentIteration",
+          "getHighPriorityFindings",
+          "getPlanHistory",
+          "getThoughts",
+          "observe",
+          "setPlan",
+          "updatePlan"
+        ]
+      },
+      {
+        "owner": "ActiveContextOptions",
+        "source": "src/agent/memory/ActiveContext.ts",
+        "members": [
+          "lightweight"
+        ]
+      },
+      {
+        "owner": "MemoryCoordinator",
+        "source": "src/agent/memory/MemoryCoordinator.ts",
+        "members": [
+          "_lastSurplus",
+          "buildMemoryPrompt",
+          "buildStaticMemoryPrompt",
+          "checkpoint",
+          "completeDimension",
+          "completeSession",
+          "configure",
+          "dispose",
+          "extractFromConversation",
+          "getBudgetAllocation",
+          "getConversationLog",
+          "getMessageBudget",
+          "getPersistentMemory",
+          "getTotalBudget",
+          "onConversationUpdated",
+          "restore"
+        ]
+      },
+      {
+        "owner": "MemoryCoordinatorConfig",
+        "source": "src/agent/memory/MemoryCoordinator.ts",
+        "members": [
+          "conversationLog"
+        ]
+      },
+      {
+        "owner": "DimensionScopeConfig",
+        "source": "src/agent/memory/MemoryCoordinator.ts",
+        "members": [
+          "lightweight"
+        ]
+      },
+      {
+        "owner": "SessionStore",
+        "source": "src/agent/memory/SessionStore.ts",
+        "members": [
+          "addEvidence",
+          "buildContextSnapshot",
+          "getDistilledForProducer",
+          "getEvidenceForFile",
+          "loadCheckpoint",
+          "saveCheckpoint"
+        ]
+      },
+      {
+        "owner": "PersistentMemory",
+        "source": "src/agent/memory/PersistentMemory.ts",
+        "members": [
+          "migrateFromLegacy"
+        ]
+      },
+      {
+        "owner": "MemoryConsolidator",
+        "source": "src/agent/memory/MemoryConsolidator.ts",
+        "members": [
+          "migrateFromLegacy"
+        ]
+      }
+    ]
   }
 }

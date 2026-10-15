@@ -349,6 +349,10 @@ export class SessionStore implements Disposable {
   // §2: Evidence Store
   // ═══════════════════════════════════════════════════════
 
+  /**
+   * 直接向证据库追加一条文件证据（不经维度报告）。
+   * @deprecated 生产中没有调用方（证据随 storeDimensionReport 的 findings 写入）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   addEvidence(filePath: string, evidence: Omit<Finding, 'timestamp' | 'reportDimId'>) {
     let evidenceList = this.#evidenceStore.get(filePath);
     if (!evidenceList) {
@@ -360,6 +364,10 @@ export class SessionStore implements Disposable {
     evidenceList.push({ ...owned, timestamp: Date.now() });
   }
 
+  /**
+   * 读取某个文件的全部证据副本。
+   * @deprecated 生产中没有调用方（检索走 searchEvidence）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getEvidenceForFile(filePath: string): Finding[] {
     return (this.#evidenceStore.get(filePath) || []).map(publicEvidence);
   }
@@ -682,7 +690,10 @@ export class SessionStore implements Disposable {
     return result;
   }
 
-  /** 兼容 DimensionContext.buildContextForDimension 返回格式 */
+  /**
+   * 前序维度 digest 与已提交候选的快照（旧 DimensionContext 返回格式）。
+   * @deprecated 生产中没有调用方（提示装配走 buildContextForDimension）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   buildContextSnapshot(currentDimId: string) {
     const previousDimensions: Record<string, DimensionDigest> = Object.create(null);
     for (const [dimId, report] of this.#dimensionReports) {
@@ -712,6 +723,7 @@ export class SessionStore implements Disposable {
    * 获取维度的蒸馏上下文 (供 Producer 使用)
    * @returns 维度蒸馏上下文 { keyFindings, toolCallSummary, referencedFiles } 的深拷贝；
    *   该维度尚无报告时返回 null
+   * @deprecated 生产中没有调用方（produce 阶段从分析产物取发现）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getDistilledForProducer(dimId: string) {
     const report = this.#dimensionReports.get(dimId);
@@ -826,6 +838,12 @@ export class SessionStore implements Disposable {
   // §9: 持久化 (断点续传)
   // ═══════════════════════════════════════════════════════
 
+  /**
+   * 把会话快照写到 .asd/bootstrap-checkpoint/session-store.json（有 WriteZone 时写到其 data 区）。
+   * @deprecated 生产中没有调用方（唯一调用方 MemoryCoordinator.checkpoint 也无人调用，且不传 WriteZone）；
+   *   注意与 loadCheckpoint 不对称：带 WriteZone 保存的文件 loadCheckpoint 只按 projectRoot 读取。
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async saveCheckpoint(projectRoot: string, wz?: WriteZone) {
     const relative = '.asd/bootstrap-checkpoint/session-store.json';
     const target = wz?.data(relative).absolute ?? path.join(projectRoot, relative);
@@ -883,6 +901,11 @@ export class SessionStore implements Disposable {
     }
   }
 
+  /**
+   * 从 projectRoot 下的检查点恢复（新格式优先，回退旧版 episodic-memory.json；超过 1 小时视为过期）。
+   * @deprecated 生产中没有调用方（唯一调用方 MemoryCoordinator.restore 也无人调用；宿主经 fromJSON 恢复）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async loadCheckpoint(projectRoot: string) {
     // Try new format first, then legacy
     const newPath = path.join(projectRoot, '.asd', 'bootstrap-checkpoint', 'session-store.json');

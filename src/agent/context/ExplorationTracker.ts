@@ -60,6 +60,12 @@ interface ResolveOptions {
 interface BudgetInput extends Partial<ExplorationBudget> {
   submitToolName?: string;
   pipelineType?: PipelineType;
+  /**
+   * 可选信号总线：阶段切换与退出时发 'exploration' 信号，仅作观测，不参与阶段路由。
+   * @deprecated src、宿主与测试构造 ExplorationTracker / 调用 resolve 时都不传，信号分支无人接线也无人验证；
+   *   BudgetInput 是公开类的构造参数类型，删除本字段随待决事项②“公开面收窄”处理，删除前须附 src、测试、
+   *   宿主生产与宿主测试的零引用扫描。
+   */
   signalBus?: SignalBus | null;
 }
 
@@ -680,7 +686,9 @@ export class ExplorationTracker {
 
   /**
    * 推理质量评分 — 委托 PlanTracker
-   * @returns }
+   * @returns PlanTracker.getQualityMetrics 的总分与分项
+   * @deprecated src、宿主与测试都不调用（PlanTracker.getQualityMetrics 同步废弃）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getQualityMetrics(trace: ExplorationTrace | null) {
     return this.#planTracker.getQualityMetrics(trace);

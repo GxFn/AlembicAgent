@@ -596,6 +596,11 @@ function readSearchMatchCount(payload: unknown): number | null {
 
 interface ActiveContextOptions {
   maxRecentRounds?: number;
+  /**
+   * 轻量模式：不维护观察滑动窗口，buildContext() 返回空串；Scratchpad 照常工作。
+   * @deprecated 唯一生产入口 MemoryCoordinator.createDimensionScope 的调用方（src 与宿主）都不传，
+   *   生产恒为 false；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   lightweight?: boolean;
 }
 
@@ -928,17 +933,27 @@ export class ActiveContext {
     }
   }
 
-  /** 兼容旧 RT API: 记录一次工具调用 (Action only) */
+  /**
+   * 兼容旧 RT API: 记录一次工具调用 (Action only)
+   * @deprecated 旧 ReasoningTrace 入口，生产统一走 recordToolCall；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   addAction(toolName: string, params: Record<string, unknown>) {
     this.#currentRound?.actions.push({ tool: toolName, params });
   }
 
-  /** 兼容旧 RT API: 记录一次工具结果的结构化观察 */
+  /**
+   * 兼容旧 RT API: 记录一次工具结果的结构化观察
+   * @deprecated 旧 ReasoningTrace 入口，生产统一走 recordToolCall；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   addObservation(toolName: string, meta: Record<string, unknown>) {
     this.#currentRound?.observations.push({ tool: toolName, ...meta });
   }
 
-  /** 兼容旧 WM API: 记录工具调用结果 (Observe, 仅 WM 滑动窗口) */
+  /**
+   * 兼容旧 WM API: 记录工具调用结果 (Observe, 仅 WM 滑动窗口)
+   * @deprecated 旧 WorkingMemory 入口，生产统一走 recordToolCall（其滑动窗口逻辑与本方法重复）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   observe(toolName: string, result: unknown, round: number) {
     if (this.#lightweight) {
       return;
@@ -1107,12 +1122,19 @@ export class ActiveContext {
     );
   }
 
-  /** 直接设置计划 (公开接口，供 ExplorationTracker 和测试使用) */
+  /**
+   * 直接设置计划（绕过 extractAndSetPlan 的授权与解析）
+   * @deprecated 生产中没有调用方（计划经 PlanTracker 的 expectPlan 授权、AgentRuntime 的 extractAndSetPlan 写入，仅测试直接调用）；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   setPlan(planText: string, iteration: number) {
     this.#setPlan(planText, iteration);
   }
 
-  /** 更新计划 (保留旧 plan 到 history) */
+  /**
+   * 更新计划 (保留旧 plan 到 history)
+   * @deprecated 生产中没有调用方（重规划走 extractAndSetPlan）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   updatePlan(replanText: string, iteration: number) {
     this.#updatePlan(replanText, iteration);
   }
@@ -1133,7 +1155,10 @@ export class ActiveContext {
     return this.#plan?.steps || [];
   }
 
-  /** 获取计划历史 (F7) */
+  /**
+   * 获取计划历史 (F7)
+   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getPlanHistory() {
     return structuredClone(this.#planHistory);
   }
@@ -1146,7 +1171,10 @@ export class ActiveContext {
     return structuredClone(this.#currentRound?.actions || []);
   }
 
-  /** 获取当前轮次的 iteration 编号 (F8) */
+  /**
+   * 获取当前轮次的 iteration 编号 (F8)
+   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   getCurrentIteration() {
     return this.#currentRound?.iteration || null;
   }
@@ -1276,7 +1304,8 @@ export class ActiveContext {
 
   /**
    * 获取所有有 Thought 的轮次
-   * @returns >}
+   * @returns `{ iteration, thought }[]`，按轮次顺序
+   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getThoughts() {
     return this.#rounds
@@ -1351,7 +1380,8 @@ export class ActiveContext {
 
   /**
    * 获取 scratchpad 中的高重要性发现
-   * @returns >}
+   * @returns importance ≥ minImportance 的发现深拷贝，按 importance 降序
+   * @deprecated 生产中没有调用方（分析产物 buildAnalysisArtifact 经 distill().keyFindings 读取发现）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getHighPriorityFindings(minImportance = 7) {
     return this.#scratchpad
@@ -1390,8 +1420,12 @@ export class ActiveContext {
   }
 
   /**
-   * 从 JSON 恢复 ActiveContext (断点续传)
+   * 从 toJSON() 的输出重建 ActiveContext（有损）
+   *
+   * 只恢复 rounds / scratchpad / totalObservations / plan / strictAnalysisContext；构造选项
+   * （maxRecentRounds、lightweight）、观察滑动窗口、压缩观察与计划历史都不恢复，输入也不做结构校验。
    * @param json toJSON() 的输出
+   * @deprecated 生产中没有断点续传调用方（仅测试使用）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   static fromJSON(json: ActiveContextJSON) {
     const ctx = new ActiveContext();

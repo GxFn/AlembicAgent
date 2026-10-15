@@ -3553,6 +3553,149 @@ describe('L4-P16 code.write protected path segments', () => {
     });
   });
 
+  // L4-P16c(1)：APFS 按 Unicode 大小写折叠比较文件名，`node_moduleſ`（U+017F 长 s）与 node_modules
+  // 是同一目录；只用 toLowerCase 比较会放行。JS realpathSync 保留请求拼写，resolved 视图同样漏判。
+  // 规则与文件系统无关：大小写敏感的文件系统上同样拒绝（偏严取舍），所以断言不依赖平台。
+  it.each([
+    'node_moduleſ/pkg/evil.js',
+    'NODE_MODULEſ/pkg/evil.js',
+    'packages/x/node_moduleſ/a.js',
+  ])('denies %s whose segment folds to node_modules under Unicode case folding', async (target) => {
+    await withWriteFixture(async (root) => {
+      await mkdir(join(root, 'node_modules/pkg'), { recursive: true });
+      await mkdir(join(root, 'packages/x/node_modules'), { recursive: true });
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await new ToolRouter().execute(writeCall(target, 'PWNED'), freshnessCtx(root));
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('protected path');
+      expect(result.error).toContain('dependency-directory');
+      const meta = result._meta as ProtectedWriteMeta | undefined;
+      expect(meta?.resultStatus).toBe('blocked');
+      expect(meta?.diagnosticWarnings?.[0]?.code).toBe('code_write_protected_path');
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain(`path=${target}`);
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('match=unicode-fold');
+      const logs = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('[code.write]'));
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain('match=unicode-fold');
+      expect(logs[0]).toContain('result=denied');
+      // 无论文件系统是否大小写不敏感，真实依赖目录与请求拼写的目录里都不能出现写入内容。
+      for (const candidate of [
+        'node_modules/pkg/evil.js',
+        'packages/x/node_modules/a.js',
+        target,
+      ]) {
+        await expect(readFile(join(root, candidate), 'utf8')).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      }
+    });
+  });
+
+  it('keeps an existing node_modules file when a read-then-write uses a Unicode-folded alias', async () => {
+    await withWriteFixture(async (root) => {
+      await mkdir(join(root, 'node_modules/pkg'), { recursive: true });
+      await writeFile(join(root, 'node_modules/pkg/index.js'), 'original');
+      const logger = Logger.getInstance();
+      vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(root, new DeltaCache(50));
+      // 读不受保护路径限制；即使在大小写不敏感的文件系统上读到了真实文件，随后的写也必须被拒。
+      await router.execute(
+        { tool: 'code', action: 'read', params: { path: 'node_moduleſ/pkg/index.js' } },
+        ctx
+      );
+      const result = await router.execute(writeCall('node_moduleſ/pkg/index.js', 'PWNED'), ctx);
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('dependency-directory');
+      expect(await readFile(join(root, 'node_modules/pkg/index.js'), 'utf8')).toBe('original');
+    });
+  });
+
+  // 折叠只能增加拒绝：ASCII 模板名照旧放行，含非 ASCII 字符的 .env.* 段按原拼写仍命中 env-file。
+  it('does not let Unicode folding turn a non-template .env.* spelling into an allowed template', async () => {
+    await withWriteFixture(async (root) => {
+      const logger = Logger.getInstance();
+      vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await new ToolRouter().execute(
+        writeCall('.env.ſample', 'SECRET=x'),
+        freshnessCtx(root)
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('env-file');
+    });
+  });
+
+  // L4-P16c(2)：46f25bc 起 resolveProjectPath 接受 symlink 项目根下的真实绝对路径。requested 视图
+  // 若仍相对词法根计算，会得到 `../<真实根各段>/...`，真实根路径里含受保护段时普通文件被误拒。
+  // requested 视图必须相对实际容纳请求的那个根（词法根优先，否则 realpath 根）计算。
+  it.each([
+    'node_modules',
+    '.git',
+    '.env.d',
+  ])('writes an ordinary file by absolute realpath when the real root sits under %s', async (segment) => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'agent-p16c-root-')));
+    try {
+      const realRoot = join(base, segment, 'proj');
+      await mkdir(join(realRoot, 'src'), { recursive: true });
+      await symlink(realRoot, join(base, 'link'));
+      const router = new ToolRouter();
+      const ctx = freshnessCtx(join(base, 'link'));
+
+      const absolute = await router.execute(
+        writeCall(join(realRoot, 'src/ok.ts'), 'export const ok = 1;\n'),
+        ctx
+      );
+      expect(absolute.error).toBeUndefined();
+      expect(absolute.ok).toBe(true);
+      expect(await readFile(join(realRoot, 'src/ok.ts'), 'utf8')).toBe('export const ok = 1;\n');
+
+      // 对照：相对路径本来就可写，修复前后一致。
+      const relative = await router.execute(
+        writeCall('src/ok2.ts', 'export const ok2 = 1;\n'),
+        ctx
+      );
+      expect(relative.ok).toBe(true);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('still denies a protected name requested by absolute realpath under a symlinked root', async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'agent-p16c-root-')));
+    try {
+      const realRoot = join(base, 'real', 'proj');
+      await mkdir(join(realRoot, 'config'), { recursive: true });
+      await writeFile(join(realRoot, 'config/secrets.txt'), 'API_TOKEN=fixture');
+      // `.env` 是指向普通文件的 symlink：resolved 视图是 config/secrets.txt，只能靠 requested 视图拦。
+      await symlink(join(realRoot, 'config/secrets.txt'), join(realRoot, '.env'));
+      await symlink(realRoot, join(base, 'link'));
+      const logger = Logger.getInstance();
+      vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+
+      const result = await new ToolRouter().execute(
+        writeCall(join(realRoot, '.env')),
+        freshnessCtx(join(base, 'link'))
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('Write denied: .env is a protected path');
+      const meta = result._meta as ProtectedWriteMeta | undefined;
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('path=.env;');
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('view=requested');
+      expect(meta?.diagnosticWarnings?.[0]?.message).toContain('rule=env-file');
+      expect(await readFile(join(realRoot, 'config/secrets.txt'), 'utf8')).toBe(
+        'API_TOKEN=fixture'
+      );
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it('surfaces the denial as a blocked envelope with the diagnostic through the host adapter', async () => {
     await withWriteFixture(async (root) => {
       const logger = Logger.getInstance();
@@ -3586,6 +3729,7 @@ describe('L4-P16 code.write protected path segments', () => {
     const description = TOOL_REGISTRY.code.actions.write.description;
     expect(description).toContain('any path segment');
     expect(description).toContain('case-insensitive');
+    expect(description).toContain('Unicode case folding');
     expect(description).toContain('.env.*');
     expect(description).toContain('.env.example');
     expect(description).toContain('.env.sample');

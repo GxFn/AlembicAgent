@@ -3,10 +3,10 @@
  *
  * 从旧 ProducerAgent.js 提取的纯领域逻辑:
  * - Producer System Prompt
- * - 工具白名单
+ * - 工具白名单（历史常量 PRODUCER_TOOLS，无消费者且与真实工具权限不一致，已标废弃）
  * - 预算常量
  * - Prompt 构建器：生产路径只用 v2 buildProducerPromptV2；v1 buildProducerPrompt 仅因公开面冻结
- *   保留，无生产调用方（也不渲染结构化发现与代码证据）
+ *   保留，无生产调用方（也不渲染结构化发现与代码证据），已标废弃并随待决事项②处理
  * - 代码上下文注入 (evidenceMap → prompt section)
  *
  * W6-d(A1)拆分:拒绝率门控 producerRejectionGateEvaluator(拆前 :655)及其
@@ -135,9 +135,15 @@ ${PRODUCER_SUBMIT_STYLE_ADVISORIES}
 - 先提交真实候选；sourceRef 不确定时保留已知真实路径，不要编造路径`;
 
 // ──────────────────────────────────────────────────────────────────
-// Producer 可用工具白名单 — 只做格式化和提交
+// Producer 工具名单（历史常量）
 // ──────────────────────────────────────────────────────────────────
 
+/**
+ * 早期的 Producer 工具白名单。
+ * @deprecated 无任何消费者，且与真实权限不一致：系统提示禁止 produce 阶段读代码（这里却含 code），
+ *   真实工具面由 tools/runtime/toolsets/GenerateProduce 的 allowedTools 决定。
+ *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+ */
 export const PRODUCER_TOOLS = ['code', 'knowledge', 'meta'];
 
 // ──────────────────────────────────────────────────────────────────
@@ -207,6 +213,8 @@ function describeKnowledgeTypeConstraint(allowedKnowledgeTypes: string[] | undef
  *
  * @param dimConfig { id, label, allowedKnowledgeTypes, outputType }
  * @param projectInfo { name }
+ * @deprecated 生产只用 buildProducerPromptV2；v1 不渲染结构化发现与代码证据，与系统提示
+ *   “唯一候选义务来自结构化发现”冲突。宿主只在测试中引用。随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
  */
 export function buildProducerPrompt(
   analysisReport: AnalysisReportLike,

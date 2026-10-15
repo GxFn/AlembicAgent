@@ -195,7 +195,10 @@ export class PersistentMemory {
   // Legacy Migration — 委托 MemoryConsolidator
   // ═══════════════════════════════════════════════════════════
 
-  /** 从旧版 Memory.js JSONL 文件迁移 */
+  /**
+   * 从旧版 Memory.js JSONL 文件迁移（委托 MemoryConsolidator，不传 WriteZone）
+   * @deprecated src、宿主与测试都不调用；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
   async migrateFromLegacy(projectRoot: string) {
     return this.#consolidator.migrateFromLegacy(projectRoot);
   }

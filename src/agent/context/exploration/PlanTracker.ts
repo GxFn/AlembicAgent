@@ -459,6 +459,8 @@ export class PlanTracker {
   /**
    * 推理质量评分
    * @returns 总分与分项
+   * @deprecated 唯一调用方 ExplorationTracker.getQualityMetrics 也无生产调用方；
+   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
   getQualityMetrics(trace: ExplorationTrace | null) {
     const stats: Record<string, number> = trace?.getStats?.() || {

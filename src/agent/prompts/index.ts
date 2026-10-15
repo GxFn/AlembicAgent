@@ -17,6 +17,15 @@ export {
 } from '../evaluation/index.js';
 export * from './insightAnalyst.js';
 export * from './insightEvolver.js';
+// L6-P25 / 待决事项②：EVOLVER_TOOLS 只在公开入口上标废弃（显式按名转出覆盖上一行 `export *` 的同名绑定，
+// 运行时名字与种类不变）。ANALYST_TOOLS / PRODUCER_TOOLS / buildProducerPrompt 的废弃标注在各自源文件。
+export {
+  /**
+   * @deprecated 无生产消费者且与真实工具面漂移（evolve 阶段另经 getGenerateStageTerminalTools 追加 terminal）；
+   *   宿主只在测试中引用。随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
+   */
+  EVOLVER_TOOLS,
+} from './insightEvolver.js';
 // C53: insightGate 按名 re-export 冻结的三个修复类提示构建器；同文件的内部 helper
 // (buildAnalyzeRetryPrompt，供 scan 管线与 insight 预设共用)不得经 `export *` 漏上公开名集。
 export {
