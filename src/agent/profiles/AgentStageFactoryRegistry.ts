@@ -69,18 +69,28 @@ export class AgentStageFactoryRegistry {
 
   private registerDefaults() {
     this.register('scanPipeline', ({ params }) => {
-      const task = params.task === 'summarize' ? 'summarize' : 'extract';
-      const taskConfig = SCAN_TASK_CONFIGS[task];
+      // 未知或缺失的 task 直接抛错（L8-C02），与 ScanAgentRun 的入口校验一致；此前任何非 summarize 的值
+      // （包括拼写错误的 'summarise'）都被静默当成 extract，且没有日志。内置 scan-extract / scan-summarize
+      // 定义由编译器的 defaultParamsForProfile 补齐 task，正常调用不会走到这里的拒绝分支。
+      const task = params.task;
+      if (typeof task !== 'string' || !Object.hasOwn(SCAN_TASK_CONFIGS, task)) {
+        throw new Error(
+          `Unknown scan task: "${String(task)}". Available: ${Object.keys(SCAN_TASK_CONFIGS).join(', ')}`
+        );
+      }
+      const scanTask = task as keyof typeof SCAN_TASK_CONFIGS;
+      const taskConfig = SCAN_TASK_CONFIGS[scanTask];
       const files = Array.isArray(params.files)
         ? (params.files as Array<{ name?: string; relativePath?: string; content?: string }>)
         : undefined;
       return buildScanPipelineStages({
-        task,
+        task: scanTask,
         producePrompt: taskConfig.producePrompt,
         analyzeCaps: ['code_analysis'],
         produceCaps: ['scan_production'],
         files,
-        analyzeMaxIter: task === 'summarize' ? 12 : 24,
+        // 与 ScanAgentRun 的 tracker 预算同源，见 SCAN_TASK_CONFIGS 注释。
+        analyzeMaxIter: taskConfig.analyzeMaxIterations,
       }) as Record<string, unknown>[];
     });
 

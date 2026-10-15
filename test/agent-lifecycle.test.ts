@@ -1836,6 +1836,8 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     ];
   }
 
+  // runtimeBuilder 是 mock，profile 只需能通过编译：用内置 preset 引用。显式但未注册的 profile id
+  // 会在编译期抛 Unknown agent profile（L8-P1），不再静默回退成 preset。
   function serviceFor(strategy: PipelineStrategy, runtime: { reactLoop: unknown }) {
     return new AgentService({
       runtimeBuilder: {
@@ -1867,7 +1869,7 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     });
 
     const result = await serviceFor(strategy, runtime).run({
-      profile: { id: 'timeout-terminal' },
+      profile: { preset: 'insight' },
       message: { content: 'mine' },
       context: { source: 'internal' },
     });
@@ -1934,7 +1936,7 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     });
 
     const result = await serviceFor(strategy, runtime).run({
-      profile: { id: 'timeout-recovered' },
+      profile: { preset: 'insight' },
       message: { content: 'mine' },
       context: { source: 'internal' },
     });
@@ -2198,7 +2200,7 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
       new PipelineStrategy({ stages: producerStages(retryPrompt) }),
       runtime
     ).run({
-      profile: { id: 'producer-timeout-recoverable' },
+      profile: { preset: 'insight' },
       message: { content: 'mine' },
       context: { source: 'internal' },
     });
@@ -2253,7 +2255,7 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
       new PipelineStrategy({ stages: producerStages(retryPrompt) }),
       runtime
     ).run({
-      profile: { id: 'producer-timeout-rejection-retry' },
+      profile: { preset: 'insight' },
       message: { content: 'mine' },
       context: { source: 'internal' },
     });

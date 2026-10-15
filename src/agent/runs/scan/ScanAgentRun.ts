@@ -8,6 +8,7 @@ import { projectScanRunResult, type ScanKnowledgeProjection } from './ScanRunPro
 
 interface ScanTaskConfig {
   fallback: (label: string) => Record<string, unknown>;
+  analyzeMaxIterations: number;
 }
 
 export interface ScanAgentFileInput {
@@ -55,7 +56,8 @@ export async function runScanAgentTask({
 
   const runLabel = label || 'code';
   const fileCache = toScanFileCache(files);
-  const analyzeMaxIter = task === 'summarize' ? 12 : 24;
+  // tracker 预算与 scanPipeline 的 analyze 阶段预算共用 SCAN_TASK_CONFIGS 中的同一上限，避免两处漂移。
+  const analyzeMaxIter = taskConfig.analyzeMaxIterations;
   const systemCtx = systemRunContextFactory.createSystemContext({
     budget: { maxIterations: analyzeMaxIter },
     trackerStrategy: 'analyst',

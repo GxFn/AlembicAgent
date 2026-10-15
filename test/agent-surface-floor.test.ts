@@ -20,6 +20,7 @@ import {
   getPreset,
   PRESETS,
 } from '../src/agent/profiles/index.js';
+import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import {
   collectEvolutionDecisionIds,
   projectEvolutionAuditResult,
@@ -3104,5 +3105,304 @@ describe('producer rejection gate counts prior produce attempts (L7-P18)', () =>
         .map((call) => String(call[0]))
         .some((line) => line.includes('[RejectionGate]') && line.includes('_priorAttempts_produce'))
     ).toBe(true);
+  });
+});
+
+/**
+ * L8-P1（L8-C02）：profile 注册、编译与阶段工厂对非法输入 fail-fast。
+ * 五类非法输入（未注册的显式 id、不支持的 policy 声明、非 JSON 值、不完整的 fanout、未知 scan task）
+ * 在注册/编译/装配期抛带 id、下标或键路径的 Error；“id 写成内置 preset 名”的兼容写法保留，
+ * 但必须留 warn 日志。Policy 实例与策略工厂函数继续放行。
+ */
+describe('profile compile and registration fail-fast (L8-P1)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function defaultCompiler(profiles?: ConstructorParameters<typeof AgentProfileRegistry>[0]) {
+    return new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry(profiles),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    });
+  }
+
+  function fixtureDefinition(
+    overrides: Partial<Parameters<AgentProfileRegistry['register']>[0]> = {}
+  ): Parameters<AgentProfileRegistry['register']>[0] {
+    return {
+      id: 'fixture-fail-fast',
+      title: 'Fixture Fail Fast',
+      serviceKind: 'system-analysis',
+      lifecycle: 'active',
+      basePreset: 'chat',
+      ...overrides,
+    };
+  }
+
+  function warnMessages(warn: ReturnType<typeof vi.spyOn>) {
+    return warn.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('rejects an explicit unregistered profile id at compile time', () => {
+    expect(() => defaultCompiler().compile({ id: 'generate-dimesion' })).toThrow(
+      'Unknown agent profile: "generate-dimesion"'
+    );
+  });
+
+  it('does not silently swap an unknown explicit id for the preset', () => {
+    expect(() =>
+      defaultCompiler().compile({ id: 'module-mining-dimenson', preset: 'insight' })
+    ).toThrow('Unknown agent profile: "module-mining-dimenson"');
+  });
+
+  it('keeps the id-as-preset-name compatibility path but logs the fallback', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const compiled = defaultCompiler().compile({ id: 'chat' });
+    expect(compiled).toMatchObject({ id: 'chat', basePreset: 'chat', serviceKind: 'conversation' });
+    const fallback = warnMessages(warn).filter((line) =>
+      line.includes('profile_id_preset_fallback')
+    );
+    expect(fallback).toHaveLength(1);
+    expect(fallback[0]).toContain('"chat"');
+
+    // 显式 preset 写法与已注册 id 都不是回退路径，不告警。
+    warn.mockClear();
+    expect(defaultCompiler().compile({ preset: 'chat' }).basePreset).toBe('chat');
+    expect(defaultCompiler().compile({ id: 'scan-extract' }).id).toBe('scan-extract');
+    expect(
+      warnMessages(warn).filter((line) => line.includes('profile_id_preset_fallback'))
+    ).toHaveLength(0);
+  });
+
+  it('rejects an id that names a preset when a different preset is also given', () => {
+    expect(() => defaultCompiler().compile({ id: 'chat', preset: 'insight' })).toThrow(
+      'Unknown agent profile: "chat"'
+    );
+  });
+
+  it.each([
+    [[{ type: 'quality_gate', minFileRefs: 2 }], 'at index 0: quality_gate'],
+    [[{ foo: 1 }], 'at index 0: missing'],
+    [[null], 'at index 0: missing'],
+    [[{ type: 'budget', maxIterations: 2 }, { type: 'quality' }], 'at index 1: quality'],
+  ])('rejects unsupported definition policy declarations %j', (policies, message) => {
+    const compiler = defaultCompiler([fixtureDefinition({ defaults: { policies } })]);
+    expect(() => compiler.compile({ id: 'fixture-fail-fast' })).toThrow(
+      `Unsupported agent policy declaration ${message}`
+    );
+  });
+
+  it('rejects unsupported override policy declarations with the declaration index', () => {
+    expect(() =>
+      defaultCompiler([]).compile({ basePreset: 'chat', policies: [{ type: 'quality_gate' }] })
+    ).toThrow('Unsupported agent policy declaration at index 0: quality_gate');
+    expect(() =>
+      defaultCompiler([]).compile({ basePreset: 'chat', policies: [{ foo: 1 }] })
+    ).toThrow('Unsupported agent policy declaration at index 0: missing');
+  });
+
+  it('keeps passing Policy instances and policy factory functions through overrides', () => {
+    const instance = new BlockingPolicy();
+    const factory = () => new BudgetPolicy({ maxIterations: 4 });
+    const compiled = defaultCompiler([]).compile({
+      basePreset: 'chat',
+      policies: [instance, factory, { type: 'budget', maxIterations: 3 }],
+    });
+    expect(compiled.policies?.[0]).toBe(instance);
+    expect(compiled.policies?.[1]).toBe(factory);
+    expect(compiled.policies?.[2]).toBeInstanceOf(BudgetPolicy);
+  });
+
+  it('rejects a RegExp in a registered safety declaration with its key path', () => {
+    const registry = new AgentProfileRegistry([]);
+    expect(() =>
+      registry.register(
+        fixtureDefinition({
+          defaults: { policies: [{ type: 'safety', commandBlacklist: [/custom-denied/] }] },
+        })
+      )
+    ).toThrow(/fixture-fail-fast.*defaults\.policies\[0\]\.commandBlacklist\[0\].*RegExp/);
+    expect(registry.get('fixture-fail-fast')).toBeNull();
+  });
+
+  it.each([
+    ['Date', { at: new Date(0) }, /defaults\.persona\.at.*Date/],
+    ['NaN', { budget: Number.NaN }, /defaults\.persona\.budget.*NaN/],
+    ['Infinity', { budget: Number.POSITIVE_INFINITY }, /defaults\.persona\.budget.*Infinity/],
+    ['class instance', { port: new BudgetPolicy({}) }, /defaults\.persona\.port.*BudgetPolicy/],
+    ['bigint', { budget: BigInt(10) }, /defaults\.persona\.budget.*bigint/],
+    [
+      'toJSON object',
+      { system: { toJSON: () => 'rewritten' } },
+      /defaults\.persona\.system.*toJSON/,
+    ],
+  ])('rejects a non-JSON %s value instead of silently rewriting it', (_label, persona, message) => {
+    expect(() =>
+      new AgentProfileRegistry([]).register(fixtureDefinition({ defaults: { persona } }))
+    ).toThrow(message);
+  });
+
+  it('keeps registering plain JSON definitions with optional undefined fields', () => {
+    const registry = new AgentProfileRegistry([]);
+    registry.register(
+      fixtureDefinition({
+        projection: undefined,
+        defaults: {
+          persona: { system: 'ok', nested: { list: [1, 'two', true, null] } },
+          memory: Object.assign(Object.create(null), { enabled: false }),
+        },
+      })
+    );
+    expect(registry.require('fixture-fail-fast').defaults).toEqual({
+      persona: { system: 'ok', nested: { list: [1, 'two', true, null] } },
+      memory: { enabled: false },
+    });
+  });
+
+  it('rejects a fanout strategy without an executable concurrency plan', () => {
+    const fanout = {
+      type: 'fanout' as const,
+      childProfile: 'generate-dimension',
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
+    };
+    expect(() =>
+      defaultCompiler([fixtureDefinition({ strategy: fanout })]).compile({
+        id: 'fixture-fail-fast',
+      })
+    ).toThrow(/fixture-fail-fast.*fanout.*concurrency/);
+    expect(() =>
+      defaultCompiler([
+        fixtureDefinition({
+          strategy: fanout,
+          concurrency: {
+            mode: 'none',
+            partitioner: fanout.partitioner,
+            childProfile: fanout.childProfile,
+            merge: fanout.merge,
+          },
+        }),
+      ]).compile({ id: 'fixture-fail-fast' })
+    ).toThrow(/fixture-fail-fast.*fanout.*mode "none"/);
+  });
+
+  it.each([
+    ['childProfile', { childProfile: 'other-child' }],
+    ['partitioner', { partitioner: 'projectContextModules' }],
+    ['merge', { merge: 'moduleMiningResults' }],
+    ['childProfile', { childProfile: undefined }],
+  ])('rejects a fanout whose %s disagrees with the concurrency plan', (field, patch) => {
+    const definition = fixtureDefinition({
+      strategy: {
+        type: 'fanout',
+        childProfile: 'generate-dimension',
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
+      },
+      concurrency: {
+        mode: 'tiered',
+        concurrency: 1,
+        childProfile: 'generate-dimension',
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
+        ...patch,
+      },
+    });
+    expect(() => defaultCompiler([definition]).compile({ id: 'fixture-fail-fast' })).toThrow(
+      new RegExp(`fixture-fail-fast.*${field}`)
+    );
+  });
+
+  it('still compiles the built-in fanout session profiles', () => {
+    const compiler = defaultCompiler();
+    for (const id of ['generate-session', 'module-mining-session']) {
+      const compiled = compiler.compile({ id });
+      expect(compiled.strategy).toBeUndefined();
+      expect(compiled.concurrency?.mode).toBe('tiered');
+    }
+  });
+
+  it.each([
+    [3.7, 3],
+    [1, 1],
+    [0, null],
+    [-2, null],
+    [Number.NaN, null],
+    ['4', null],
+  ])('projects params.concurrency=%s onto the fanout plan', (value, expected) => {
+    const compiled = defaultCompiler().compile(
+      { id: 'module-mining-session' },
+      { params: { concurrency: value } }
+    );
+    expect(compiled.concurrency?.concurrency).toEqual(
+      expected ?? { env: 'ALEMBIC_MODULE_MINING_CONCURRENCY', default: 2 }
+    );
+  });
+
+  it.each([
+    'summarise',
+    undefined,
+    'toString',
+  ])('rejects scan task %s in the stage factory', (task) => {
+    expect(() =>
+      new AgentStageFactoryRegistry().build('scanPipeline', { params: { task } })
+    ).toThrow(`Unknown scan task: "${String(task)}"`);
+    expect(() =>
+      defaultCompiler().compile({ id: 'scan-extract' }, { params: { task: task ?? 'summarise' } })
+    ).toThrow('Unknown scan task');
+  });
+
+  it('reads the analyze iteration cap from SCAN_TASK_CONFIGS in the factory and ScanAgentRun', async () => {
+    const configs = SCAN_TASK_CONFIGS as Record<string, { analyzeMaxIterations?: number }>;
+    expect(configs.extract?.analyzeMaxIterations).toBe(24);
+    expect(configs.summarize?.analyzeMaxIterations).toBe(12);
+    const before = { ...configs };
+    const original = {
+      extract: configs.extract?.analyzeMaxIterations,
+      summarize: configs.summarize?.analyzeMaxIterations,
+    };
+    try {
+      // 改写共享配置后两处必须同时读到新值，证明不是两份恰好相等的常量。
+      (configs.extract as { analyzeMaxIterations?: number }).analyzeMaxIterations = 31;
+      (configs.summarize as { analyzeMaxIterations?: number }).analyzeMaxIterations = 7;
+      for (const [task, expected] of [
+        ['extract', 31],
+        ['summarize', 7],
+      ] as const) {
+        const analyze = new AgentStageFactoryRegistry()
+          .build('scanPipeline', { params: { task } })
+          .find((stage) => stage.name === 'analyze');
+        expect((analyze?.budget as { maxIterations?: number }).maxIterations).toBe(expected);
+
+        const factory = new SystemRunContextFactory();
+        const createSystemContext = vi.spyOn(factory, 'createSystemContext');
+        const run = vi.fn(
+          async (input: AgentRunInput): Promise<AgentRunResult> => ({
+            runId: 'scan-cap',
+            profileId: input.profile.id ?? 'unknown',
+            reply: '{}',
+            status: 'success',
+            toolCalls: [],
+            usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+            diagnostics: null,
+          })
+        );
+        await runScanAgentTask({
+          agentService: { run } as unknown as AgentService,
+          systemRunContextFactory: factory,
+          label: 'cap',
+          task,
+        });
+        expect(createSystemContext.mock.calls[0]?.[0]?.budget).toEqual({
+          maxIterations: expected,
+        });
+      }
+    } finally {
+      (configs.extract as { analyzeMaxIterations?: number }).analyzeMaxIterations =
+        original.extract;
+      (configs.summarize as { analyzeMaxIterations?: number }).analyzeMaxIterations =
+        original.summarize;
+      expect(Object.keys(configs)).toEqual(Object.keys(before));
+    }
   });
 });

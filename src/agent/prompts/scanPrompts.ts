@@ -38,6 +38,10 @@ const SCAN_SUBMIT_CONTRACT = [
  * 两种 task 均为工具驱动 (knowledge)，Recipe 格式与冷启动 knowledge 对齐:
  * - extract: 多文件 target 扫描 → 多个 Recipe
  * - summarize: 单文件/代码片段 → 1~2 个 Recipe
+ *
+ * analyzeMaxIterations 是 Analyze 阶段迭代上限的单一来源（L8-C02）：scanPipeline 阶段工厂用它写
+ * analyze 阶段预算，ScanAgentRun 用它写 systemRunContext 的 tracker 预算。两处此前各自硬编码 12/24，
+ * 只改一处就会让 tracker 预算与阶段预算错位（tracker 提前进入总结阶段）。
  */
 export const SCAN_TASK_CONFIGS = {
   // ─── extract: Recipe 提取（工具驱动，与冷启动 knowledge 字段对齐） ─────
@@ -85,6 +89,8 @@ ${SCAN_SUBMIT_CONTRACT}
 
 ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
+    // 多文件扫描需要更多分析轮次。
+    analyzeMaxIterations: 24,
   },
 
   // ─── summarize: 代码摘要（工具驱动，与 extract 管线对齐） ──────
@@ -123,5 +129,7 @@ ${SCAN_SUBMIT_CONTRACT}
 
 ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
     fallback: (label: string) => ({ targetName: label, extracted: 0, recipes: [] }),
+    // 单文件/片段摘要只需较少分析轮次。
+    analyzeMaxIterations: 12,
   },
 };
