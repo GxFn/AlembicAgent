@@ -117,7 +117,13 @@ export interface CompactionConfig {
    * getToolResultQuota 使用独立的固定阶梯（0.5/0.7/0.85/0.95）。保留五元组形状只是为了不改公开类型。
    */
   thresholds?: [number, number, number, number, number];
-  /** Whether to enable L4 LLM-based summary (scan pipelines may disable) */
+  /**
+   * L4 LLM 摘要开关的初始值（缺省 false）。只是初值，不是运行时权威：L4 的唯一执行开关是
+   * BudgetController 的 enableL4Compaction（缺省读 ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1'），
+   * BudgetController 构造时经 syncL4CompactionSwitch 把它同步到窗口，覆盖这里的值。
+   * 开关关闭时 needsL4Compaction 恒为 false，compactL4 短路返回 l4_disabled。
+   * 字段保留以免改公开类型；删除与否随公开面收窄（事项②）决定。
+   */
   enableL4LLM?: boolean;
 }
 
@@ -158,7 +164,11 @@ export class ContextWindow {
   #collapseThreshold = -1;
   /** 5-layer compaction thresholds */
   #thresholds: [number, number, number, number, number];
-  /** Whether L4 LLM summary is enabled */
+  /**
+   * L4 LLM 摘要开关：构造时取 CompactionConfig.enableL4LLM 初值，运行时由 BudgetController
+   * 经 syncL4CompactionSwitch 同步为它的 enableL4Compaction（唯一权威）。
+   * needsL4Compaction 与 compactL4 都读这一个值。
+   */
   #enableL4LLM: boolean;
   /** Session-level budget pressure (0-1). Affects getToolResultQuota(). */
   #sessionPressure = 0;
@@ -239,6 +249,10 @@ export class ContextWindow {
    * 按 ModelRegistry.resolve 查询（别名先归一）；缺失或为 'auto' 时按 findByApiModelId 查询；
    * 注册表未命中才回退 MODEL_CONTEXT_WINDOWS 正则表，最后是 32k 保守默认。
    *
+   * 诊断日志：四条路径（env=auto 按 apiModelId、按 provider 命中注册表、正则回退、保守默认）都写
+   * debug 轨迹 token_budget_source；正则回退另记 info、保守默认另记 warn（token_budget_fallback），
+   * 均写出 providerHint、lookup、模型名、所选路径与最终预算。
+   *
    * @param modelName 模型名称，如 'gemini-3-flash-preview', 'gpt-5.4-mini'
    * @param [opts] - isSystem 为 true 时给予更高预算；provider 为调用方已知的 provider 身份
    * @returns 建议的 token 预算
@@ -255,9 +269,10 @@ export class ContextWindow {
     // 诊断用：source=registry|regex|default 表示窗口取自哪里；lookup 表示注册表按哪种键查询。
     let source: 'registry' | 'regex' | 'default' = 'default';
     let lookup: 'provider' | 'apiModelId' | 'none' = 'none';
+    // provider 提示：调用方显式传入优先（SystemRunContextFactory 传运行时 AiProvider.name），其次环境变量。
+    const providerHint = (provider || process.env.ALEMBIC_AI_PROVIDER || '').trim();
     if (modelName) {
       const registry = getModelRegistry();
-      const providerHint = (provider || process.env.ALEMBIC_AI_PROVIDER || '').trim();
       // 'auto' 是部署选择而非 ProviderId；缺失或为 auto 时按裸 apiModelId 查注册表
       // （内置表保证 apiModelId 全局唯一，不会命中别家模型）。具体 provider 提示仍是权威：
       // 先经注册表归一别名再按 provider 查，未命中不跨 provider 猜测，直接回退正则表。
@@ -296,15 +311,39 @@ export class ContextWindow {
     }
 
     // 预算来源诊断：区分注册表命中、正则降级与保守默认，便于追溯“预算偏大/偏小”的根因。
-    // 模型名来自配置/环境，只写截断并去掉控制字符后的值，避免伪造日志行。
+    // 模型名与 provider 提示来自配置/环境，只写截断并去掉控制字符后的值，避免伪造日志行。
     const modelLabel = modelName ? modelName.slice(0, 64).replace(/[^\w.:/-]/g, '?') : '(empty)';
+    const providerLabel = providerHint
+      ? providerHint.slice(0, 32).replace(/[^\w.:/-]/g, '?')
+      : '(none)';
+    const detail = `providerHint=${providerLabel} lookup=${lookup} model=${modelLabel} contextWindow=${contextSize} system=${isSystem} budget=${budget}`;
+    // 四条路径都留 debug 轨迹（env=auto 时 lookup=apiModelId、providerHint=auto 可见）。
     observeSafely(
       () =>
         Logger.getInstance().debug(
-          `[ContextWindow] token_budget_source source=${source} lookup=${lookup} model=${modelLabel} contextWindow=${contextSize} system=${isSystem} budget=${budget}`
+          `[ContextWindow] token_budget_source source=${source} ${detail}`
         ),
       () => undefined
     );
+    // 降级路径另记可见日志：正则表是与 ModelRegistry 重复维护的估算表（info）；
+    // 保守默认 32000 说明模型名为空或两张表都不认识，预算可能明显偏离真实窗口（warn）。
+    if (source === 'regex') {
+      observeSafely(
+        () =>
+          Logger.getInstance().info(
+            `[ContextWindow] token_budget_fallback path=regex ${detail}; ModelRegistry has no entry for this provider/model, context window estimated from MODEL_CONTEXT_WINDOWS`
+          ),
+        () => undefined
+      );
+    } else if (source === 'default') {
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            `[ContextWindow] token_budget_fallback path=default ${detail}; ${modelName ? 'no ModelRegistry entry and no MODEL_CONTEXT_WINDOWS pattern matched' : 'model name is empty'}, using the conservative 32000 context window`
+          ),
+        () => undefined
+      );
+    }
 
     return budget;
   }
@@ -315,7 +354,29 @@ export class ContextWindow {
     this.#logger = Logger.getInstance();
     this.#thresholds = compactionConfig?.thresholds ?? DEFAULT_THRESHOLDS;
     // L4 仍保留为显式能力；在 note_finding 证据链稳定前，运行时默认不自动触发。
+    // 这里只是初值：运行时 BudgetController 构造时会用 enableL4Compaction 覆盖（见 syncL4CompactionSwitch）。
     this.#enableL4LLM = compactionConfig?.enableL4LLM ?? false;
+  }
+
+  /**
+   * 同步 L4 执行开关 — 由 BudgetController 在构造时调用，把它的 enableL4Compaction
+   * （显式配置优先，缺省读 ALEMBIC_AGENT_ENABLE_L4_COMPACTION）写入窗口，使窗口阈值判定
+   * （needsL4Compaction）与 compactL4 短路和控制器的执行权读同一个开关。
+   * 窗口跨阶段复用，每个新 loop 的控制器都会重新同步；值真正变化时记一条 info，
+   * 写明旧值→新值与来源，便于追溯“构造参数被运行时开关覆盖”。
+   *
+   * @param enabled 运行时 L4 开关
+   * @param source 开关来源说明（如 "BudgetController env ALEMBIC_AGENT_ENABLE_L4_COMPACTION"）
+   */
+  syncL4CompactionSwitch(enabled: boolean, source: string): void {
+    const previous = this.#enableL4LLM;
+    this.#enableL4LLM = enabled;
+    if (previous !== enabled) {
+      this.#log(
+        'info',
+        `[ContextWindow] L4 switch synced: enableL4LLM ${previous}->${enabled} (source=${source}); needsL4Compaction and compactL4 now follow this value`
+      );
+    }
   }
 
   // ─── 消息添加 API ──────────────────────────────────────
@@ -431,15 +492,21 @@ export class ContextWindow {
    * 使用率按投影视图计算：L3 折叠后投影低于阈值时本方法是 no-op，
    * 直到新增轮次把投影重新推过阈值才会再次折叠。
    *
+   * session 压力的作用范围（有意为之）：入口判断用 max(投影用量, sessionPressure × 0.8)，
+   * 所以会话预算紧张时即使投影不高也会启动一个压缩周期（至少执行 L1，截断旧的大工具结果）；
+   * L1 之后的逐级升级只看投影用量，单靠 session 压力不会推进到 L2 合并或 L3 折叠。
+   * 若要让 session 压力推动更强压缩，需要逐级改用融合用量——会改变宿主可见的压缩强度，
+   * 须先跑 mining-e2e 回归。BudgetController 预检日志会写出本方法实际返回的等级。
+   *
    * @returns 压缩结果 { level, removed }：level 为本次执行到的最高层级（0 表示用量未达 L1
    *   阈值或消息不超过 4 条）；removed 为各层累计处理条数——L1 截断的工具结果数 + L2 合并的
    *   消息数，L3 只移动投影边界、不计数
    */
   compactIfNeeded() {
     const [, t1, t2, t3] = this.#thresholds;
-    // 融合 session 压力: 当 session 预算紧张时，即使 per-call usage 不高，
-    // 也主动压缩以减少每轮 input token，延缓 session 累计增长。
+    // 融合 session 压力只用于入口判断：会话预算紧张时即使投影用量不高也启动压缩周期（至少 L1）。
     // 乘以 0.8 避免 session 一进入 70% 就立刻触发 L1。
+    // 下面 L1→L2、L2→L3 的升级判断改读纯投影用量，session 压力不参与（见方法注释）。
     let usage = Math.max(this.getTokenUsageRatio(), this.#sessionPressure * 0.8);
 
     if (usage < t1 || this.#messages.length <= 4) {
@@ -541,6 +608,7 @@ export class ContextWindow {
   /**
    * Check if L4 compaction is needed (async LLM summary).
    * Should be called by AgentRuntime after compactIfNeeded() when usage is still high.
+   * 开关由 BudgetController 经 syncL4CompactionSwitch 同步；关闭时恒为 false。
    */
   needsL4Compaction(): boolean {
     const [, , , , t4] = this.#thresholds;
@@ -552,6 +620,7 @@ export class ContextWindow {
    *
    * 用结构化运行记忆替换旧协议历史；近期消息先进入 memory package。
    * 生成期间若上下文变化，旧摘要失效，不能覆盖新消息或新阶段。
+   * L4 开关关闭时短路，返回 { level: 4, removed: 0, failed: true, validationMissing: ['l4_disabled'] }。
    */
   async compactL4(
     aiProvider: {
@@ -572,6 +641,17 @@ export class ContextWindow {
     cancelled?: boolean;
     validationMissing?: string[];
   }> {
+    // 开关短路：L4 唯一执行开关由 BudgetController 同步（syncL4CompactionSwitch）。关闭时不调用
+    // provider、不改写历史，返回 failed + validationMissing=['l4_disabled'] 让直接调用方知道摘要没有
+    // 生成及原因；BudgetController 把该标记归为“跳过”，不计 L4 失败、不冷却、不硬停。
+    if (!this.#enableL4LLM) {
+      this.#log(
+        'warn',
+        `[ContextWindow] L4 compact skipped: L4 switch is off (enableL4LLM=false; runtime authority is BudgetController enableL4Compaction / ALEMBIC_AGENT_ENABLE_L4_COMPACTION); messages=${this.#messages.length}, history unchanged`
+      );
+      return { level: 4, removed: 0, failed: true, validationMissing: [L4_DISABLED_MARKER] };
+    }
+
     const oldLen = this.#messages.length;
     if (oldLen <= 1) {
       return { level: 4, removed: 0 };
@@ -1202,6 +1282,12 @@ export class ContextWindow {
 // 历史压缩并同步处理续接、工具结果元数据只留布尔 persistedSubmission、token 估算与阶段预算默认值同一口径。
 
 const RUNTIME_NUDGE_KIND = 'runtime_nudge';
+/**
+ * compactL4 因 L4 开关关闭而短路时写入 validationMissing 的标记；BudgetController 据此把结果归为跳过。
+ * 仅供仓内模块引用，context 入口（index.ts）按名导出、不包含它，不改公开面。
+ */
+export const L4_DISABLED_MARKER = 'l4_disabled';
+
 /** L4 记忆摘要的 metadata.kind；compactL4 成功后写入 index 1。 */
 const L4_MEMORY_SUMMARY_KIND = 'l4_memory_summary';
 

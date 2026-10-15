@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildL4MemoryPackage,
   ContextWindow,
@@ -14,13 +14,19 @@ import { toSdkPrompt } from '../src/ai/transport/sdkProtocol.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
+/**
+ * 直接调用 compactL4 的用例需要打开 L4 开关：开关关闭时 compactL4 短路返回 l4_disabled（L6-P15 C05）。
+ * 运行时开关由 BudgetController 同步，这里按直接调用方的方式用构造参数打开。
+ */
+const L4_ON = { enableL4LLM: true } as const;
+
 describe('ContextWindow L4 compaction transcript safety', () => {
   it.each([
     'append',
     'reset',
     'overlap',
   ])('does not overwrite newer context after L4 %s', async (change) => {
-    const window = new ContextWindow();
+    const window = new ContextWindow(24_000, L4_ON);
     window.appendUserMessage('initial goal');
     window.appendUserMessage('old observation');
     const entered = Promise.withResolvers<void>();
@@ -234,7 +240,7 @@ describe('ContextWindow L4 compaction transcript safety', () => {
   });
 
   it('builds L4 summary input from a structured memory package, not raw tool messages', async () => {
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendAssistantWithToolCalls(null, [
       { id: 'old-call', name: 'code', args: { action: 'read' } },
@@ -267,7 +273,7 @@ describe('ContextWindow L4 compaction transcript safety', () => {
   });
 
   it('projects assistant tool calls as package text before summary', async () => {
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
     contextWindow.appendAssistantWithToolCalls(null, [
@@ -295,7 +301,7 @@ describe('ContextWindow L4 compaction transcript safety', () => {
   });
 
   it('rejects L4 summaries that drop phase or evidence refs', async () => {
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
     const aiProvider = {
@@ -330,7 +336,7 @@ describe('ContextWindow L4 compaction transcript safety', () => {
   });
 
   it('discards in-flight L4 compaction results after abort', async () => {
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
     const abortController = new AbortController();
@@ -713,7 +719,7 @@ describe('L4 memory package validation and rendering', () => {
       '## Unresolved Questions\n- none'
     );
 
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
     let instructions = '';
@@ -802,7 +808,7 @@ describe('L4 memory package validation and rendering', () => {
     });
 
     const warn = vi.spyOn(Logger.getInstance(), 'warn');
-    const contextWindow = new ContextWindow(10_000);
+    const contextWindow = new ContextWindow(10_000, L4_ON);
     contextWindow.appendUserMessage('initial prompt');
     contextWindow.appendUserMessage('older context to compact');
     const result = await contextWindow.compactL4(
@@ -842,7 +848,7 @@ function deferred<T>() {
   return Promise.withResolvers<T>();
 }
 function withCreated(history: string) {
-  const context = new ContextWindow(48_000, { thresholds: [0, 0, 0, 0, 100] });
+  const context = new ContextWindow(48_000, { thresholds: [0, 0, 0, 0, 100], enableL4LLM: true });
   context.appendUserMessage('initial request');
   context.appendAssistantWithToolCalls(null, [
     { id: 'created-call', name: 'knowledge', args: { action: 'submit', title: 'confirmed-title' } },
@@ -856,7 +862,7 @@ describe('context compaction receipt boundaries', () => {
     'raw-view',
     'cancel',
   ])('retains current history and paid usage for L4 %s', async (change) => {
-    const context = new ContextWindow();
+    const context = new ContextWindow(24_000, L4_ON);
     context.appendUserMessage('goal');
     context.appendUserMessage('old observation');
     const entered = deferred<void>();
@@ -1010,7 +1016,7 @@ describe('context compaction receipt boundaries', () => {
   });
 
   it('does not turn a completed L4 replacement into zero-usage failure when logging fails', async () => {
-    const context = new ContextWindow();
+    const context = new ContextWindow(24_000, L4_ON);
     context.appendUserMessage('goal');
     context.appendUserMessage('observation');
     context.appendAssistantText('response');
@@ -1281,7 +1287,7 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
     '\n\n[evidence] E-12=src/agent/runtime/AgentRuntime.ts:10-80; E-13=src/agent/context/ContextWindow.ts:1-50';
 
   async function windowWithL4Summary(): Promise<ContextWindow> {
-    const window = new ContextWindow(48_000);
+    const window = new ContextWindow(48_000, L4_ON);
     window.appendUserMessage('produce goal');
     window.appendAssistantWithToolCalls(null, [
       { id: 'early', name: 'code', args: { action: 'read' } },
@@ -1422,7 +1428,7 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
   });
 
   it('C03 reports cancelled when the provider rejects because the abort signal fired', async () => {
-    const window = new ContextWindow(10_000);
+    const window = new ContextWindow(10_000, L4_ON);
     window.appendUserMessage('initial prompt');
     window.appendUserMessage('older context to compact');
     const before = structuredClone(window.toMessages());
@@ -1451,7 +1457,7 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
   });
 
   it('C03 still reports a plain provider failure without cancelled', async () => {
-    const window = new ContextWindow(10_000);
+    const window = new ContextWindow(10_000, L4_ON);
     window.appendUserMessage('initial prompt');
     window.appendUserMessage('older context to compact');
     const result = await window.compactL4(
@@ -1534,5 +1540,178 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
         String(message).includes('file content head+tail fell back to char-level snip')
       )
     ).toBe(true);
+  });
+});
+
+/**
+ * L6-P15：压缩信号、L4 开关与预算解析。
+ * - C04：session 压力只启动压缩周期（入口融合用量，至少 L1），L2/L3 仍按投影用量升级——锁定该行为；
+ * - C05：L4 唯一执行开关由 BudgetController 同步（syncL4CompactionSwitch），开关关闭时 compactL4
+ *   短路并留 warn，不调用 provider、不改写历史；
+ * - C06：resolveTokenBudget 在 env=auto、registry 命中、正则回退、默认值四条路径上的结果与日志：
+ *   注册表命中只有 debug 轨迹，正则回退记 info，保守默认记 warn，均写出 providerHint、模型与路径。
+ */
+describe('compaction signals, L4 switch and token budget resolution (L6-P15)', () => {
+  /** 构造投影接近预算的小窗口：needsL4Compaction 在开关打开时为 true。 */
+  function saturatedWindow(compactionConfig?: { enableL4LLM?: boolean }): ContextWindow {
+    const window = new ContextWindow(1_000, compactionConfig);
+    window.appendUserMessage('initial analyze prompt');
+    for (let index = 0; index < 4; index++) {
+      window.appendAssistantWithToolCalls(null, [
+        { id: `call-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      window.appendToolResult(`call-${index}`, 'code', `r${index}:${'x'.repeat(1900)}`);
+    }
+    window.compactIfNeeded();
+    return window;
+  }
+
+  function loggedLines(spy: ReturnType<typeof vi.spyOn>, needle: string): string[] {
+    return spy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes(needle));
+  }
+
+  it('C04 session pressure alone starts a cycle at L1 but does not escalate to L2/L3', () => {
+    const window = new ContextWindow(100_000);
+    window.appendUserMessage('analyze prompt');
+    for (let index = 0; index < 4; index++) {
+      window.appendAssistantWithToolCalls(null, [
+        { id: `call-${index}`, name: 'code', args: { action: 'read', index } },
+      ]);
+      window.appendToolResult(`call-${index}`, 'code', `short result ${index}`);
+    }
+    window.appendAssistantText('first note');
+    window.appendAssistantText('second note');
+    const messageCount = window.toMessages().length;
+    expect(window.getTokenUsageRatio()).toBeLessThan(0.05);
+
+    // 融合用量 = max(投影 <0.05, 1 × 0.8) = 0.8，已越过 t2=0.70；但 L1 之后只看投影用量，
+    // 所以 L2 合并（会把两条相邻 assistant 文本合成一条）和 L3 折叠都不会发生。
+    window.setSessionPressure(1);
+    expect(window.compactIfNeeded()).toEqual({ level: 1, removed: 0 });
+    expect(window.toMessages()).toHaveLength(messageCount);
+    expect(window.toProjectedMessages()).toHaveLength(messageCount);
+  });
+
+  it('C05 compactL4 short-circuits with an l4_disabled marker while the L4 switch is off', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const window = new ContextWindow(10_000);
+    window.appendUserMessage('initial prompt');
+    window.appendUserMessage('older context to compact');
+    const before = structuredClone(window.toMessages());
+    const chatWithTools = vi.fn(async () => ({ text: 'summary' }));
+
+    const result = await window.compactL4({ chatWithTools });
+
+    expect(result).toEqual({
+      level: 4,
+      removed: 0,
+      failed: true,
+      validationMissing: ['l4_disabled'],
+    });
+    expect(chatWithTools).not.toHaveBeenCalled();
+    expect(window.toMessages()).toEqual(before);
+    expect(loggedLines(warn, 'L4 compact skipped: L4 switch is off')).toHaveLength(1);
+  });
+
+  it('C05 syncL4CompactionSwitch overrides CompactionConfig.enableL4LLM and logs only real changes', async () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const configuredOn = saturatedWindow({ enableL4LLM: true });
+    expect(configuredOn.needsL4Compaction()).toBe(true);
+
+    configuredOn.syncL4CompactionSwitch(false, 'unit-test');
+    expect(configuredOn.needsL4Compaction()).toBe(false);
+    configuredOn.syncL4CompactionSwitch(false, 'unit-test');
+    const switchLines = loggedLines(info, 'L4 switch synced');
+    expect(switchLines).toHaveLength(1);
+    expect(switchLines[0]).toContain('enableL4LLM true->false');
+    expect(switchLines[0]).toContain('source=unit-test');
+
+    const configuredOff = saturatedWindow();
+    expect(configuredOff.needsL4Compaction()).toBe(false);
+    configuredOff.syncL4CompactionSwitch(true, 'unit-test');
+    expect(configuredOff.needsL4Compaction()).toBe(true);
+    const chatWithTools = vi.fn(async () => ({ text: 'compacted summary' }));
+    const result = await configuredOff.compactL4({ chatWithTools });
+    expect(chatWithTools).toHaveBeenCalledTimes(1);
+    expect(result.failed).not.toBe(true);
+    expect(result.removed).toBeGreaterThan(0);
+  });
+
+  describe('C06 resolveTokenBudget paths', () => {
+    let debug: ReturnType<typeof vi.spyOn>;
+    let info: ReturnType<typeof vi.spyOn>;
+    let warn: ReturnType<typeof vi.spyOn>;
+
+    function fallbackLines(): string[] {
+      return [
+        ...loggedLines(info, 'token_budget_fallback'),
+        ...loggedLines(warn, 'token_budget_fallback'),
+      ];
+    }
+
+    beforeEach(() => {
+      vi.stubEnv('ALEMBIC_AI_PROVIDER', undefined);
+      debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+      info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+      warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('env=auto resolves through the registry by apiModelId and only leaves the debug trace', () => {
+      vi.stubEnv('ALEMBIC_AI_PROVIDER', 'auto');
+      expect(ContextWindow.resolveTokenBudget('gemini-3-flash-preview', { isSystem: true })).toBe(
+        48_000
+      );
+      const [trace] = loggedLines(debug, 'token_budget_source');
+      expect(trace).toContain('source=registry');
+      expect(trace).toContain('lookup=apiModelId');
+      expect(trace).toContain('providerHint=auto');
+      expect(fallbackLines()).toEqual([]);
+    });
+
+    it('a provider-scoped registry hit only leaves the debug trace', () => {
+      expect(
+        ContextWindow.resolveTokenBudget('gemini-3-flash-preview', { provider: 'google' })
+      ).toBe(36_000);
+      const [trace] = loggedLines(debug, 'token_budget_source');
+      expect(trace).toContain('source=registry');
+      expect(trace).toContain('lookup=provider');
+      expect(trace).toContain('providerHint=google');
+      expect(fallbackLines()).toEqual([]);
+    });
+
+    it('the regex fallback logs info with providerHint, model and the chosen path', () => {
+      // gpt-4-0613 未登记：注册表落空 → 正则表 8_192 → 微窗口按 0.75 取整。
+      expect(
+        ContextWindow.resolveTokenBudget('gpt-4-0613', { isSystem: true, provider: 'openai' })
+      ).toBe(6_144);
+      const lines = loggedLines(info, 'token_budget_fallback');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('path=regex');
+      expect(lines[0]).toContain('providerHint=openai');
+      expect(lines[0]).toContain('lookup=provider');
+      expect(lines[0]).toContain('model=gpt-4-0613');
+      expect(lines[0]).toContain('contextWindow=8192');
+      expect(loggedLines(warn, 'token_budget_fallback')).toEqual([]);
+    });
+
+    it('the conservative default warns for an unmatched or empty model name', () => {
+      expect(ContextWindow.resolveTokenBudget('zzz-unlisted-model', { isSystem: true })).toBe(
+        14_000
+      );
+      expect(ContextWindow.resolveTokenBudget('')).toBe(12_000);
+      const lines = loggedLines(warn, 'token_budget_fallback');
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain('path=default');
+      expect(lines[0]).toContain('model=zzz-unlisted-model');
+      expect(lines[0]).toContain('providerHint=(none)');
+      expect(lines[0]).toContain('contextWindow=32000');
+      expect(lines[1]).toContain('path=default');
+      expect(lines[1]).toContain('model=(empty)');
+      expect(loggedLines(info, 'token_budget_fallback')).toEqual([]);
+    });
   });
 });

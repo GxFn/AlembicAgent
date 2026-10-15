@@ -27,7 +27,7 @@
  * @module BudgetController
  */
 
-import type { ContextWindow } from '../context/ContextWindow.js';
+import { type ContextWindow, L4_DISABLED_MARKER } from '../context/ContextWindow.js';
 import type { ExplorationTracker } from '../context/ExplorationTracker.js';
 import type { L4MemoryPackageInput } from '../context/l4MemoryPackage.js';
 
@@ -73,7 +73,12 @@ export interface BudgetControllerConfig {
   logger: BudgetLogger;
   /** Structured package source for L4 memory compaction */
   l4MemoryPackageProvider?: () => L4MemoryPackageInput;
-  /** 临时止血开关：L4 仍保留实现，但默认不在运行中自动触发。 */
+  /**
+   * L4 唯一执行开关（临时止血：L4 仍保留实现，但默认不在运行中自动触发）。
+   * 显式配置优先，缺省读 ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1'。构造时经
+   * ContextWindow.syncL4CompactionSwitch 同步到窗口，覆盖窗口的 CompactionConfig.enableL4LLM 初值，
+   * 让窗口阈值判定（needsL4Compaction）、compactL4 短路与本类的请求门读同一个开关。
+   */
   enableL4Compaction?: boolean;
   /** Abort signal used to discard in-flight L4 compaction results */
   abortSignal?: AbortSignal | null;
@@ -210,6 +215,16 @@ export class BudgetController {
     this.#enableL4Compaction =
       config.enableL4Compaction ?? process.env.ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1';
     this.#abortSignal = config.abortSignal ?? null;
+    // L4 开关收敛（C05）：本类的 enableL4Compaction 是唯一权威，构造时同步给共享窗口。
+    // 窗口跨阶段复用，每个 loop 新建的控制器都会重新同步；值变化时由窗口记 info（含来源）。
+    if (this.#contextWindow) {
+      this.#contextWindow.syncL4CompactionSwitch(
+        this.#enableL4Compaction,
+        config.enableL4Compaction === undefined
+          ? 'BudgetController env ALEMBIC_AGENT_ENABLE_L4_COMPACTION'
+          : 'BudgetController config.enableL4Compaction'
+      );
+    }
   }
 
   /* ═══════════════════════════════════════════════════════
@@ -296,11 +311,20 @@ export class BudgetController {
     // 终止由 maxIterations / timeout / ExitController 负责
     const isAggressive = ratio > AGGRESSIVE_COMPRESS_THRESHOLD;
     const label = isAggressive ? '激进压缩' : '压缩';
-    this.#logger.info(
-      `[BudgetController] ⚠ session 预检: stage ${usedInputTokens} used + ~${estimated} est = ${projected}/${this.#maxSessionInputTokens} (${(ratio * 100).toFixed(1)}%) → ${label} (run total ${this.#cumulativeUsage.input}, stage baseline ${this.#baselineUsage.input})`
-    );
 
     const compaction = this.#runExtraCompaction();
+
+    // 日志写出 compactIfNeeded 实际返回的等级（C04）：session 压力只负责启动压缩周期（至少 L1），
+    // L2/L3 仍按窗口投影用量升级，所以“激进压缩”标签不代表实际执行了 L2/L3。
+    let levelNote = 'session pressure starts the cycle, L2/L3 follow projected usage';
+    if (!this.#contextWindow) {
+      levelNote = 'no context window, nothing to compact';
+    } else if (compaction.level === 0) {
+      levelNote = 'window below L1 threshold or too few messages';
+    }
+    this.#logger.info(
+      `[BudgetController] ⚠ session 预检: stage ${usedInputTokens} used + ~${estimated} est = ${projected}/${this.#maxSessionInputTokens} (${(ratio * 100).toFixed(1)}%) → ${label} actual=L${compaction.level} removed=${compaction.removed} (${levelNote}; run total ${this.#cumulativeUsage.input}, stage baseline ${this.#baselineUsage.input})`
+    );
 
     // >90%: 标记 L4 pending 以触发 LLM-based 摘要压缩，释放更多空间
     if (isAggressive && this.#contextWindow && !this.#pendingL4) {
@@ -376,6 +400,16 @@ export class BudgetController {
           abortSignal: this.#abortSignal,
         }
       );
+      // 开关不同步（C05）：本控制器只在自身开关打开时挂起 L4，且构造时已同步给窗口；
+      // 若窗口仍短路返回 l4_disabled，说明另一个控制器（显式配置不同）在本 loop 构造后改写了
+      // 共享窗口的开关。这是配置冲突而非摘要失败：不计失败次数、不冷却、不硬停、不计入压缩统计，
+      // 按“跳过”返回 level 0 并记 warn。
+      if (l4Result.failed && l4Result.validationMissing?.includes(L4_DISABLED_MARKER)) {
+        this.#logger.warn(
+          '[BudgetController] L4 compaction skipped: L4 switch is off on the context window although this controller enabled it (switch re-synced by another BudgetController sharing the window); not counted as an L4 failure'
+        );
+        return { level: 0, removed: 0, reason: L4_DISABLED_MARKER };
+      }
       if (l4Result.cancelled) {
         this.#l4RetryCooldownChecks = 1;
       } else if (l4Result.failed) {
@@ -653,12 +687,8 @@ export class BudgetController {
       return { level: 0, removed: 0 };
     }
     const cw = this.#contextWindow;
+    // 实际等级与处理条数由 checkBeforeLLMCall 的预检日志统一写出，这里不再单独记一行。
     const extraCompact = cw.compactIfNeeded();
-    if (extraCompact.level > 0) {
-      this.#logger.info(
-        `[BudgetController] session budget pressure → extra compact L${extraCompact.level}, removed ${extraCompact.removed}`
-      );
-    }
     if (cw.needsL4Compaction()) {
       this.#requestL4IfReady('context window threshold');
     }
