@@ -2,14 +2,18 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import Logger from '@alembic/core/logging';
 import ts from 'typescript';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExplorationTracker } from '../src/agent/context/ExplorationTracker.js';
+import type { ExplorationStrategy } from '../src/agent/context/exploration/ExplorationStrategies.js';
+import { NUDGE_DIRECTIVE_TEXTS } from '../src/agent/context/exploration/NudgeGenerator.js';
 import { NudgeGenerator, PlanTracker } from '../src/agent/context/index.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
-import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
+import type { LoopContext } from '../src/agent/runtime/index.js';
 import {
+  AgentRuntime,
   createToolPipeline,
   DiagnosticsCollector,
   recordRepairOnlyGate,
@@ -1850,5 +1854,259 @@ describe('developer process event projection', () => {
       '连续多轮没有新信息或有效新提交，引导 Agent 收敛：停止重复探索，输出总结或只提交剩余候选。'
     );
     expect(event.metadata).toMatchObject({ semanticKind: 'convergence-nudge' });
+  });
+});
+
+/**
+ * L6-P17（C13/C11/C63）：NudgeGenerator 收敛证据门槛、停滞反思间隔、PRODUCE 收敛按管线出文本、
+ * bootstrap 一次性标志延迟置位，以及 AgentRuntime 文本轮 digest nudge 复用同一份终结指令。
+ */
+type P17NudgeState = Parameters<NudgeGenerator['generate']>[0];
+
+function p17NudgeState(input: {
+  pipelineType: P17NudgeState['pipelineType'];
+  phase: string;
+  iteration: number;
+  metrics?: Partial<P17NudgeState['metrics']>;
+  maxIterations?: number;
+  enableReflection?: boolean;
+  reflectionInterval?: number;
+}): P17NudgeState {
+  return {
+    phase: input.phase,
+    metrics: {
+      uniqueFiles: new Set<string>(),
+      uniquePatterns: new Set<string>(),
+      uniqueQueries: new Set<string>(),
+      totalToolCalls: 0,
+      evidenceToolCallCount: 0,
+      submitCount: 0,
+      memoryFindingCount: 0,
+      roundsSinceNewInfo: 0,
+      roundsSinceSubmit: 0,
+      iteration: input.iteration,
+      searchRoundsInPhase: 0,
+      phaseRounds: 1,
+      consecutiveIdleRounds: 0,
+      ...input.metrics,
+    },
+    budget: {
+      maxIterations: input.maxIterations ?? 40,
+      searchBudget: 18,
+      searchBudgetGrace: 10,
+      maxSubmits: 10,
+      softSubmitLimit: 8,
+      idleRoundsToExit: 3,
+    },
+    strategy: {
+      name: input.pipelineType,
+      enableReflection: input.enableReflection ?? false,
+      reflectionInterval: input.reflectionInterval ?? 5,
+      enablePlanning: false,
+    },
+    gracefulExitRound: null,
+    submitToolName: 'knowledge',
+    pipelineType: input.pipelineType,
+    isTerminalPhase: false,
+  };
+}
+
+const p17ReflectionTrace = {
+  getRecentSummary: () => ({ thoughts: ['看过鉴权入口'], roundCount: 3, newInfoRatio: 0 }),
+  getStats: () => ({ totalActions: 3 }),
+};
+
+function p17DebugMessages(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls.map(([message]) => String(message));
+}
+
+describe('L6-P17 convergence evidence gate and stale reflection spacing (C13)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('withholds the analyst convergence nudge with no code evidence (ev=0, iteration=10, stale=3)', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const generator = new NudgeGenerator();
+    const starved = generator.generate(
+      p17NudgeState({
+        pipelineType: 'analyst',
+        phase: 'EXPLORE',
+        iteration: 10,
+        metrics: { roundsSinceNewInfo: 3 },
+      }),
+      null
+    );
+    expect(starved?.type).not.toBe('convergence');
+    expect(starved?.text ?? '').not.toContain('充分探索');
+    const withheld = p17DebugMessages(debug).filter((m) =>
+      m.includes('convergence nudge withheld')
+    );
+    expect(withheld).toHaveLength(1);
+    expect(withheld[0]).toContain('evidenceToolCalls=0');
+    expect(withheld[0]).toContain('findings=0');
+
+    // 门槛没有消耗一次性标志：取得真实代码证据后仍能收到一次收敛提示。
+    const grounded = generator.generate(
+      p17NudgeState({
+        pipelineType: 'analyst',
+        phase: 'EXPLORE',
+        iteration: 11,
+        metrics: {
+          roundsSinceNewInfo: 3,
+          evidenceToolCallCount: 2,
+          uniqueFiles: new Set(['src/auth.ts']),
+        },
+      }),
+      null
+    );
+    expect(grounded?.type).toBe('convergence');
+    expect(grounded?.text).toContain('充分探索');
+  });
+
+  it('only claims "已充分探索" once real files were read', () => {
+    const findingsOnly = new NudgeGenerator().generate(
+      p17NudgeState({
+        pipelineType: 'analyst',
+        phase: 'VERIFY',
+        iteration: 10,
+        metrics: { roundsSinceNewInfo: 3, evidenceToolCallCount: 1, memoryFindingCount: 1 },
+      }),
+      null
+    );
+    expect(findingsOnly?.type).toBe('convergence');
+    expect(findingsOnly?.text).not.toContain('充分探索');
+    expect(findingsOnly?.text).toContain('没有发现新信息');
+  });
+
+  it('spaces analyst stale reflections by the reflection interval instead of repeating every round', () => {
+    const generator = new NudgeGenerator();
+    const kinds: Array<string | null> = [];
+    for (let iteration = 4; iteration <= 9; iteration++) {
+      const nudge = generator.generate(
+        p17NudgeState({
+          pipelineType: 'analyst',
+          phase: 'VERIFY',
+          iteration,
+          enableReflection: true,
+          reflectionInterval: 5,
+          metrics: {
+            roundsSinceNewInfo: iteration - 2,
+            evidenceToolCallCount: 4,
+            memoryFindingCount: 1,
+          },
+        }),
+        p17ReflectionTrace
+      );
+      kinds.push(nudge ? (nudge.text.includes('停滞反思') ? 'stale' : 'periodic') : null);
+    }
+    expect(kinds).toEqual(['stale', 'periodic', null, null, null, null]);
+  });
+});
+
+describe('L6-P17 PRODUCE convergence contract and bootstrap one-shot flags (C11/C63)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('asks producer and scan PRODUCE convergence for a Markdown production summary', () => {
+    for (const pipelineType of ['producer', 'scan'] as const) {
+      const nudge = new NudgeGenerator().generate(
+        p17NudgeState({
+          pipelineType,
+          phase: 'PRODUCE',
+          iteration: 10,
+          metrics: { roundsSinceSubmit: 3, submitCount: 2 },
+        }),
+        null
+      );
+      expect(nudge?.type).toBe('convergence');
+      expect(nudge?.text).toContain('生产总结（Markdown 格式）');
+      expect(nudge?.text).toContain('未提交原因');
+      expect(nudge?.text).not.toContain('JSON');
+    }
+    const bootstrap = new NudgeGenerator().generate(
+      p17NudgeState({
+        pipelineType: 'bootstrap',
+        phase: 'PRODUCE',
+        iteration: 10,
+        metrics: { roundsSinceSubmit: 3, submitCount: 2 },
+      }),
+      null
+    );
+    expect(bootstrap?.type).toBe('convergence');
+    expect(bootstrap?.text).toContain('dimensionDigest');
+  });
+
+  it('keeps the bootstrap budget warning pending when the TTL limiter drops it and logs the suppression', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const generator = new NudgeGenerator();
+    const at = (iteration: number) =>
+      generator.generate(
+        p17NudgeState({
+          pipelineType: 'bootstrap',
+          phase: 'EXPLORE',
+          iteration,
+          maxIterations: 8,
+          enableReflection: true,
+          reflectionInterval: 5,
+        }),
+        p17ReflectionTrace
+      );
+    expect(at(5)?.type).toBe('reflection');
+    // 第 6 轮满足 75% 预算警告，但距上一条 bootstrap nudge 不足 TTL，被限流丢弃。
+    expect(at(6)).toBeNull();
+    // 修复前一次性标志已在丢弃前置位，预算警告永久丢失。
+    expect(at(7)?.type).toBe('budget_warning');
+    const suppressed = p17DebugMessages(debug).filter((m) =>
+      m.includes('bootstrap nudge suppressed')
+    );
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]).toContain('reason=ttl');
+    expect(suppressed[0]).toContain('type=budget_warning');
+  });
+});
+
+describe('L6-P17 AgentRuntime digest nudge reuses the terminal directive (C11)', () => {
+  it('injects the NudgeGenerator SUMMARIZE directive when a text round metrics-transitions an analyst', async () => {
+    // 两阶段探针：任何一轮 endRound 都触发 RECORD→SUMMARIZE，使文本轮走 metricsTransitionedToTerminal 分支。
+    const strategy: ExplorationStrategy = {
+      name: 'analyst',
+      phases: ['RECORD', 'SUMMARIZE'],
+      transitions: { 'RECORD→SUMMARIZE': { onMetrics: () => true } },
+      getToolChoice: () => 'none',
+      enableReflection: false,
+      reflectionInterval: 0,
+      enablePlanning: false,
+      replanInterval: 0,
+    };
+    const tracker = new ExplorationTracker(strategy, { maxIterations: 6, pipelineType: 'analyst' });
+    const usage = { inputTokens: 2, outputTokens: 1 };
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({ text: '阶段性结论：模块 A 负责鉴权。', functionCalls: [], usage })
+      .mockResolvedValue({ text: '## 分析报告\n模块 A 负责鉴权。', functionCalls: [], usage });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute: vi.fn() } as never,
+      container: { get: () => undefined } as never,
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+
+    await runtime.reactLoop('analyze', {
+      source: 'system',
+      context: { pipelinePhase: 'analyze' },
+      tracker: tracker as never,
+      budgetOverride: { maxIterations: 6, timeoutMs: 60_000 },
+    });
+
+    expect(chatWithTools.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const digestRequest = JSON.stringify(chatWithTools.mock.calls[1]);
+    expect(digestRequest).toContain(NUDGE_DIRECTIVE_TEXTS.analystSummarizeLead);
+    expect(digestRequest).toContain('核心「已确认」章节只能来自已记录的 note_finding');
+    // 旧的 AgentRuntime 内联第三份副本不再出现。
+    expect(digestRequest).not.toContain('未调用 note_finding 的信号只能放入');
   });
 });

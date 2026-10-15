@@ -11,6 +11,7 @@ import {
   targetMemoryFindingCount,
   targetProducerSubmitCount,
 } from '../src/agent/context/exploration/ExplorationStrategies.js';
+import { NUDGE_DIRECTIVE_TEXTS } from '../src/agent/context/exploration/NudgeGenerator.js';
 import { PlanTracker } from '../src/agent/context/exploration/PlanTracker.js';
 import { ExplorationTracker } from '../src/agent/context/index.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
@@ -1497,5 +1498,198 @@ describe('PlanTracker trace port (L6-P16 C19)', () => {
     expect(planTrackerSource).not.toMatch(/\bActiveTrace\b/);
     expect(explorationTrackerSource).not.toMatch(/\bActiveTrace\b/);
     expect(explorationTrackerSource).not.toMatch(/trace as \w+/);
+  });
+});
+
+/**
+ * L6-P17（C12/C11）：analyst RECORD 配额不可达出口与终结 nudge 单源。
+ *
+ * - C12：VERIFY→RECORD 按原始发现数放行，RECORD→SUMMARIZE 按已核实配额收口；证据台账没有任何文件条目时
+ *   新发现永远是 unverified，已核实配额不可达。出口条件（用户决定）：ledgerDistinctFiles===0 且原始发现数
+ *   达到目标时收口，并由 Tracker 记 warn（target/effective/memoryFindingCount）。
+ * - C11：文本轮触发的终结转换必须拿到 NudgeGenerator 的同一份终结指令（严格版），而不是 Tracker 内联副本。
+ */
+function p17RecordMetrics(overrides: Record<string, number> = {}) {
+  return {
+    consecutiveIdleRounds: 0,
+    evidenceToolCallCount: 6,
+    iteration: 12,
+    memoryFindingCount: 3,
+    verifiedFindingCount: 0,
+    depthSlottedFindingCount: 0,
+    verifiedDepthSlottedFindingCount: 0,
+    phaseRounds: 1,
+    roundsSinceNewInfo: 0,
+    roundsSinceSubmit: 0,
+    searchRoundsInPhase: 0,
+    submitCount: 0,
+    totalToolCalls: 9,
+    ledgerDistinctFiles: 0,
+    ...overrides,
+  };
+}
+
+function p17RecordFinding(
+  t: ExplorationTracker,
+  index: number,
+  options: { verified?: boolean; depthSlot?: boolean } = {}
+) {
+  t.recordToolCall(
+    'note_finding',
+    {
+      finding: `finding ${index}`,
+      evidenceRefs: [`E-${index}`],
+      importance: options.depthSlot ? 8 : 5,
+      ...(options.depthSlot ? { designIntent: `why ${index}` } : {}),
+    },
+    {
+      recorded: true,
+      target: 'activeContext',
+      ...(options.verified === undefined ? {} : { verified: options.verified }),
+    }
+  );
+}
+
+/** SCAN→EXPLORE，记录两次证据调用后靠空闲轮推进到 VERIFY。 */
+function p17DriveToVerify(t: ExplorationTracker, evidenceTool: 'code' | 'graph') {
+  t.tick();
+  t.endRound({});
+  expect(t.phase).toBe('EXPLORE');
+  t.tick();
+  for (const target of ['src/a.ts', 'src/b.ts']) {
+    if (evidenceTool === 'code') {
+      t.recordToolCall('code', { action: 'read', params: { path: target } }, `body of ${target}`);
+    } else {
+      t.recordToolCall('graph', { action: 'query', params: { entity: target } }, `graph ${target}`);
+    }
+  }
+  t.endRound({ hasNewInfo: true, toolNames: [evidenceTool] });
+  for (let i = 0; i < 4 && t.phase === 'EXPLORE'; i++) {
+    t.tick();
+    t.endRound({});
+  }
+  expect(t.phase).toBe('VERIFY');
+}
+
+describe('L6-P17 analyst RECORD quota exit (C12)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('exits RECORD when the ledger has no file entries and raw findings reach the target', () => {
+    const rule = STRATEGY_ANALYST.transitions['RECORD→SUMMARIZE'];
+    const degraded = p17RecordMetrics();
+    expect(targetMemoryFindingCount(degraded)).toBe(3);
+    expect(effectiveMemoryFindingCount(degraded)).toBe(0);
+    expect(rule.onMetrics(degraded)).toBe(true);
+    expect(rule.onTextResponse(degraded)).toBe(true);
+    // 原始发现数未达目标：不提前收口。
+    expect(rule.onMetrics(p17RecordMetrics({ memoryFindingCount: 2 }))).toBe(false);
+    // 台账有文件条目：已核实配额可达，仍按已核实口径收口（下限 3 不变）。
+    expect(rule.onMetrics(p17RecordMetrics({ ledgerDistinctFiles: 2 }))).toBe(false);
+    // 无台账运行（字段缺席）不走该出口。
+    const { ledgerDistinctFiles: _absent, ...withoutLedger } = p17RecordMetrics();
+    expect(rule.onMetrics(withoutLedger)).toBe(false);
+  });
+
+  it('moves a degraded-ledger analyst tracker from RECORD to SUMMARIZE and warns with the quota numbers', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    t.noteLedgerStats({ distinctFiles: 0 });
+    p17DriveToVerify(t, 'graph');
+
+    // VERIFY：3 条 handler 判为未核实的发现，VERIFY→RECORD 按原始发现数放行。
+    t.tick();
+    for (let i = 1; i <= 3; i++) {
+      p17RecordFinding(t, i, { verified: false });
+    }
+    t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
+    expect(t.phase).toBe('RECORD');
+    // RECORD hint 同时显示已核实数，模型能看出未核实发现不计配额。
+    expect(t.getPhaseContext()).toContain('已核实 0 条');
+
+    // RECORD：台账无文件条目，新发现仍未核实；修复前 effective=0<3，RECORD 空转到 maxIterations。
+    t.tick();
+    p17RecordFinding(t, 4, { verified: false });
+    const transition = t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
+    expect(t.phase).toBe('SUMMARIZE');
+    expect(transition?.text).toContain(NUDGE_DIRECTIVE_TEXTS.analystSummarizeLead);
+
+    const quotaWarnings = warn.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('quota unreachable'));
+    expect(quotaWarnings).toHaveLength(1);
+    expect(quotaWarnings[0]).toContain('target=3');
+    expect(quotaWarnings[0]).toContain('effective=0');
+    expect(quotaWarnings[0]).toContain('memoryFindingCount=4');
+    expect(quotaWarnings[0]).toContain('ledgerDistinctFiles=0');
+  });
+
+  it('does not warn when RECORD reaches its verified quota normally', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    t.noteLedgerStats({ distinctFiles: 2 });
+    p17DriveToVerify(t, 'code');
+    t.tick();
+    for (let i = 1; i <= 3; i++) {
+      p17RecordFinding(t, i, { verified: true });
+    }
+    t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
+    expect(t.phase).toBe('RECORD');
+    t.tick();
+    p17RecordFinding(t, 4, { verified: true });
+    t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
+    expect(t.phase).toBe('SUMMARIZE');
+    expect(
+      warn.mock.calls.map(([message]) => String(message)).filter((m) => m.includes('quota'))
+    ).toEqual([]);
+  });
+});
+
+describe('L6-P17 terminal nudge single source (C11)', () => {
+  it('gives the strict analyst terminal directive when a VERIFY text round hops through RECORD to SUMMARIZE', () => {
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    p17DriveToVerify(t, 'code');
+
+    // VERIFY 工具轮：2 条带深度槽的已核实发现（计 1.5 条），原始数 2<3，本轮不转换。
+    t.tick();
+    p17RecordFinding(t, 1, { depthSlot: true });
+    p17RecordFinding(t, 2, { depthSlot: true });
+    t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
+    expect(t.phase).toBe('VERIFY');
+
+    // 文本轮：endRound 的 metrics 规则 VERIFY→RECORD，随后 onTextResponse 的文本规则 RECORD→SUMMARIZE。
+    t.tick();
+    t.endRound({});
+    expect(t.phase).toBe('RECORD');
+    const result = t.onTextResponse('阶段性结论：模块 A 负责鉴权。');
+    expect(t.phase).toBe('SUMMARIZE');
+    expect(result.needsDigestNudge).toBe(true);
+    expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.analystSummarizeLead);
+    expect(result.nudge).toContain('核心「已确认」章节只能来自已记录的 note_finding');
+    expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.startReportStopTools);
+    expect(result.nudge).not.toContain('至少涵盖 3 个核心发现');
+  });
+
+  it('gives the producer text-triggered terminal transition the same Markdown production summary contract', () => {
+    const t = new ExplorationTracker(STRATEGY_PRODUCER, {
+      maxIterations: 12,
+      softSubmitLimit: 1,
+      targetSubmits: 0,
+    });
+    t.tick();
+    t.recordToolCall(
+      'knowledge',
+      { action: 'submit', params: {} },
+      { status: 'created', id: 'candidate-1', lifecycle: 'pending' }
+    );
+    t.endRound({ hasNewInfo: true, submitCount: 1, toolNames: ['knowledge'] });
+    expect(t.phase).toBe('PRODUCE');
+    t.tick();
+    t.endRound({});
+    const result = t.onTextResponse('先说明一下进展');
+    expect(t.phase).toBe('SUMMARIZE');
+    expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.producerSummarizeLead);
+    expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.producerSummaryNoNewTopics);
   });
 });

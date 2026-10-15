@@ -7,16 +7,21 @@
  * 优先级 (高→低):
  *   1. force_exit — 轮次耗尽（经 ExplorationTracker 不可达：gracefulExitRound 只在转入终结阶段时设置，
  *      而 getNudge 在终结阶段直接返回 null；分支保留为公开兼容面，直接调用 generate 时仍会生效。
- *      生产中轮次耗尽的收尾文本来自 ExplorationTracker 终结 nudge 与 runtime/forcedSummary）
- *   2. convergence — 信息饱和
+ *      生产中轮次耗尽的收尾文本来自 buildTransitionNudge 的终结指令与 runtime/forcedSummary）
+ *   2. convergence — 信息饱和（analyst 非 PRODUCE 阶段需先有真实代码证据或已记录发现，见 L6-P17 C13）
  *   3. budget_warning — 75% 预算消耗
- *   4. reflection — 周期反思 / 停滞反思
+ *   4. reflection — 周期反思 / 停滞反思（停滞反思与上一条反思至少间隔 reflectionInterval 轮）
  *   5. (planning — 由 PlanTracker 处理)
  *
  * 设计原则:
  *   - 有状态，每次运行一个实例：类内持有一次性标志（convergence / budget_warning 各最多一次）
  *     与 bootstrap 限流计数（条数上限 + 最小间隔轮次）；不要跨 tracker 或跨运行复用同一实例，
- *     否则一次性 nudge 会被上一次运行的标志吞掉（ExplorationTracker 构造时各自 new 一个）
+ *     否则一次性 nudge 会被上一次运行的标志吞掉（ExplorationTracker 构造时各自 new 一个）。
+ *     一次性标志只在 nudge 真正发出（#emitNudge 返回非空）后置位；被 bootstrap 限流丢弃时标志
+ *     保持未消耗、下轮重试，并留 debug 诊断（L6-P17 C63）
+ *   - 终结阶段（SUMMARIZE）指令单源：buildTransitionNudge 是唯一生成点；ExplorationTracker 的
+ *     文本轮终结分支、AgentRuntime 文本轮 digest nudge 都复用它（经 endRound / onTextResponse 返回），
+ *     不再各写一份副本（L6-P17 C11）
  *   - 接受 state 快照，无循环依赖
  *   - Nudge 文本内联（未来可外置为 i18n JSON 模板）；收尾/强制退出/防复制类固定指令句
  *     统一登记在 NUDGE_DIRECTIVE_TEXTS，finalAnswer 按同一份原句识别模型回显
@@ -24,6 +29,8 @@
  * @module NudgeGenerator
  */
 
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type {
   ExplorationBudget,
   ExplorationTrace,
@@ -117,6 +124,12 @@ export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
   bootstrapRemainingTasksNote:
     '> 如果所有信号都已覆盖，remainingTasks 留空数组 `[]`。如果有未来得及处理的信号，请在此标记，系统会在下次运行时续传。',
 
+  // ── PRODUCE 阶段 convergence nudge（producer / scan 管线） ──
+  // L6-P17（C11）：与 SUMMARIZE 的 Markdown 生产总结契约一致，并要求写明未提交原因，
+  // 使收尾文本能命中 ExplorationTracker 的 producer 完成判定（“生产总结”+“无未提交”）。
+  produceConvergenceSummary:
+    '如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出生产总结（Markdown 格式），写明已提交候选数量与未提交原因；没有遗漏时写明“无未提交”。',
+
   // ── 强制退出 nudge（#generateForceExit） ──
   forceExitStopToolsReport: '你必须**立即停止工具调用**，在回复中输出你的**分析总结报告**。',
   forceExitStartSummary: '**现在开始输出分析总结，不要再进行新的搜索或阅读。**',
@@ -130,21 +143,31 @@ export const NUDGE_DIRECTIVE_TEXTS = Object.freeze({
     '请在回复中直接输出 dimensionDigest JSON 总结（用 ```json 包裹），不要再调用任何工具。',
   forceExitRemainingTasksNote: '> remainingTasks: 列出未来得及处理的信号。已覆盖则留空 `[]`。',
   forceExitNoCopyJson: '⛔ 严禁在回复中复制本条指令文字，只输出 JSON。',
-
-  // ── ExplorationTracker.onTextResponse 终结 nudge ──
-  trackerAnalystReportLead:
-    '请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式，包含具体文件路径、类名和代码模式，至少涵盖 3 个核心发现。',
-  trackerStartReport: '**现在开始输出你的分析报告。**',
-  trackerNoCopyAnalysis: '⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。',
-  trackerProducerSummaryLead:
-    '请**停止调用工具**，直接输出候选生产总结。说明已提交候选数量、被拒绝或跳过的原因，以及是否还有需要 Analyst 补证的输入缺口。',
-  trackerNoCopySummary: '⚠️ 严禁在回复中复制本条指令文字，只输出你自己的总结。',
-  trackerDigestLead: '请在回复中直接输出 dimensionDigest JSON 总结（用 ```json 包裹）：',
-  trackerRemainingTasksNote: '> 如果所有信号都已覆盖，remainingTasks 留空数组 `[]`。',
+  // L6-P17（C11）：ExplorationTracker.onTextResponse 的终结 nudge 与 AgentRuntime 的 digest nudge
+  // 已改为复用 buildTransitionNudge 的 SUMMARIZE 指令，原先登记的 tracker* 副本原句不再注入，已移除。
 } as const);
 
 /** 文件内简写：注入侧按名引用指令原句 */
 const DIRECTIVE = NUDGE_DIRECTIVE_TEXTS;
+
+/**
+ * analyst 非 PRODUCE 阶段发 convergence 的证据门槛（L6-P17 C13）。
+ *
+ * 与 STRATEGY_ANALYST 的 VERIFY toolChoice 门槛同口径（证据调用 ≥2 或已有发现）：证据不足时
+ * toolChoice 仍是 required，ExplorationTracker.onTextResponse 也会以“没有真实代码证据”拒收文本，
+ * 此时再说“已充分探索、开始总结”只会给出自相矛盾的控制消息，诱导模型编造发现。
+ */
+function hasAnalystConvergenceEvidence(m: FullExplorationMetrics) {
+  return m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0;
+}
+
+/** 诊断日志统一走 observeSafely：日志通道失败不能升级为 nudge 生成失败。 */
+function logNudgeDiagnostic(message: string) {
+  observeSafely(
+    () => Logger.getInstance().debug(message),
+    () => undefined
+  );
+}
 
 export class NudgeGenerator {
   // ── 一次性 flags（生命周期内最多触发一次的 nudge） ──
@@ -152,6 +175,8 @@ export class NudgeGenerator {
   #budgetWarningInjected = false;
   #bootstrapNudgeCount = 0;
   #lastBootstrapNudgeIteration = -Infinity;
+  /** 上一条真正发出的反思（周期或停滞）所在轮次；停滞反思据此做间隔抑制 */
+  #lastReflectionIteration = -Infinity;
 
   /**
    * 生成本轮的 Nudge（每轮最多一条）
@@ -179,32 +204,36 @@ export class NudgeGenerator {
     }
 
     // 2. 收敛引导（信息饱和 — 仅非终结阶段）
+    const isProducePhase = state.phase === 'PRODUCE';
     if (
       !isTerminalPhase &&
       !this.#convergenceNudged &&
-      (state.phase === 'PRODUCE' ? m.roundsSinceSubmit : m.roundsSinceNewInfo) >=
+      (isProducePhase ? m.roundsSinceSubmit : m.roundsSinceNewInfo) >=
         DEFAULT_CONVERGENCE_STALE_THRESHOLD &&
       m.iteration >= DEFAULT_MIN_EXPLORE_ITERS
     ) {
-      this.#convergenceNudged = true;
-      if (state.phase === 'PRODUCE') {
-        return this.#emitNudge(state, {
-          type: 'convergence',
-          text:
-            `Producer 阶段已连续 ${m.roundsSinceSubmit} 轮没有有效新提交。` +
-            `如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出总结 JSON；` +
-            `否则只调用 ${state.submitToolName} 提交尚未提交且不重复的候选。\n` +
-            DIRECTIVE.noCopyBehavior,
-        });
+      if (!isProducePhase && pipelineType === 'analyst' && !hasAnalystConvergenceEvidence(m)) {
+        // C13：零/不足代码证据时不发收敛提示（用户决定），一次性标志不消耗，取得证据后仍可发一次；
+        // 本轮继续向下评估预算警告与反思。
+        logNudgeDiagnostic(
+          `[NudgeGenerator] convergence nudge withheld: analyst has insufficient code evidence ` +
+            `(evidenceToolCalls=${m.evidenceToolCallCount}, findings=${m.memoryFindingCount}, ` +
+            `staleRounds=${m.roundsSinceNewInfo}, iteration=${m.iteration}, phase=${state.phase}) — ` +
+            `toolChoice stays required; falling through to budget/reflection checks`
+        );
+      } else {
+        const convergence = this.#emitNudge(
+          state,
+          isProducePhase
+            ? this.#buildProduceConvergence(state)
+            : this.#buildExploreConvergence(state)
+        );
+        // C63：只有真正发出才消耗一次性标志；bootstrap 限流丢弃时下轮重试。
+        if (convergence) {
+          this.#convergenceNudged = true;
+        }
+        return convergence;
       }
-      return this.#emitNudge(state, {
-        type: 'convergence',
-        text:
-          `你已经充分探索了项目代码（${m.uniqueFiles.size} 个文件，${m.uniquePatterns.size} 次不同搜索，${m.uniqueQueries.size} 次结构化查询）。` +
-          `最近 ${m.roundsSinceNewInfo} 轮没有发现新信息，建议开始撰写分析总结。\n` +
-          `如果你确信还有重要方面未覆盖，可以继续探索（剩余 ${b.maxIterations - m.iteration} 轮）；否则请直接输出你的分析发现。\n` +
-          DIRECTIVE.noCopyBehavior,
-      });
     }
 
     // 3. 预算警告（75% 消耗，无条件，一次性）
@@ -213,21 +242,29 @@ export class NudgeGenerator {
       !this.#budgetWarningInjected &&
       m.iteration >= Math.floor(b.maxIterations * 0.75)
     ) {
-      this.#budgetWarningInjected = true;
-      return this.#emitNudge(state, {
+      const budgetWarning = this.#emitNudge(state, {
         type: 'budget_warning',
         text:
           `📌 进度提醒：你已使用 ${m.iteration}/${b.maxIterations} 轮次（${Math.round((m.iteration / b.maxIterations) * 100)}%）。` +
           `请确保核心方面已覆盖，开始准备总结。剩余 ${b.maxIterations - m.iteration} 轮，优先填补最重要的分析空白。\n` +
           DIRECTIVE.noCopyBehavior,
       });
+      // C63：同上，限流丢弃时不消耗一次性标志。
+      if (budgetWarning) {
+        this.#budgetWarningInjected = true;
+      }
+      return budgetWarning;
     }
 
     // 4. 反思（周期性 + 停滞）
     if (strategy.enableReflection) {
       const reflectionNudge = this.#checkReflection(state, trace);
       if (reflectionNudge) {
-        return this.#emitNudge(state, reflectionNudge);
+        const reflection = this.#emitNudge(state, reflectionNudge);
+        if (reflection) {
+          this.#lastReflectionIteration = m.iteration;
+        }
+        return reflection;
       }
     }
 
@@ -329,6 +366,59 @@ export class NudgeGenerator {
 
   // ─── 内部方法 ──────────────────────────────────
 
+  /**
+   * PRODUCE 阶段的 convergence 文本按管线生成（L6-P17 C11）：producer / scan 与 SUMMARIZE 一致要求
+   * Markdown 生产总结并写明未提交原因；只有 bootstrap 保留 dimensionDigest JSON 契约。
+   */
+  #buildProduceConvergence(state: NudgeState) {
+    const { metrics: m, pipelineType, submitToolName } = state;
+    const lead = `Producer 阶段已连续 ${m.roundsSinceSubmit} 轮没有有效新提交。`;
+    const otherwise = `否则只调用 ${submitToolName} 提交尚未提交且不重复的候选。`;
+    if (pipelineType === 'bootstrap') {
+      return {
+        type: 'convergence',
+        text:
+          `${lead}如果已达到提交上限或没有新的非重复候选，请停止继续读取/搜索，直接输出 dimensionDigest JSON 总结；` +
+          `${otherwise}\n${DIRECTIVE.noCopyBehavior}`,
+      };
+    }
+    // 固定指令句独占一行，模型整行回显时 cleanFinalAnswer 能按登记原句识别并清除。
+    return {
+      type: 'convergence',
+      text: `${lead}\n${DIRECTIVE.produceConvergenceSummary}\n${otherwise}\n${DIRECTIVE.noCopyBehavior}`,
+    };
+  }
+
+  /**
+   * 非 PRODUCE 阶段的 convergence 文本（L6-P17 C13）：只有真正读到过文件（uniqueFiles>0）才说
+   * “已充分探索”；否则只陈述停滞事实，并要求先核实关键文件再总结。
+   */
+  #buildExploreConvergence(state: NudgeState) {
+    const { metrics: m, budget: b } = state;
+    const remaining = b.maxIterations - m.iteration;
+    if (m.uniqueFiles.size > 0) {
+      return {
+        type: 'convergence',
+        text:
+          `你已经充分探索了项目代码（${m.uniqueFiles.size} 个文件，${m.uniquePatterns.size} 次不同搜索，${m.uniqueQueries.size} 次结构化查询）。` +
+          `最近 ${m.roundsSinceNewInfo} 轮没有发现新信息，建议开始撰写分析总结。\n` +
+          `如果你确信还有重要方面未覆盖，可以继续探索（剩余 ${remaining} 轮）；否则请直接输出你的分析发现。\n` +
+          DIRECTIVE.noCopyBehavior,
+      };
+    }
+    return {
+      type: 'convergence',
+      text:
+        `最近 ${m.roundsSinceNewInfo} 轮没有发现新信息，但目前还没有读取到任何具体文件（${m.uniquePatterns.size} 次不同搜索，${m.uniqueQueries.size} 次结构化查询）。` +
+        `请先用 code({ action: "read" }) 核实已有发现所依据的关键文件，核实后再开始撰写分析总结（剩余 ${remaining} 轮）。\n` +
+        DIRECTIVE.noCopyBehavior,
+    };
+  }
+
+  /**
+   * bootstrap 常规 nudge 限流（条数上限 + 最小间隔 + PRODUCE 只放行 convergence）。
+   * 丢弃时返回 null 并记 debug 诊断；调用方据返回值决定是否消耗一次性标志（L6-P17 C63）。
+   */
   #emitNudge<T extends { type: string; text: string }>(state: NudgeState, nudge: T): T | null {
     if (state.pipelineType !== 'bootstrap') {
       return nudge;
@@ -336,17 +426,28 @@ export class NudgeGenerator {
     if (nudge.type === 'force_exit') {
       return nudge;
     }
+    const iteration = state.metrics.iteration;
+    let suppressReason: 'produce' | 'budget' | 'ttl' | null = null;
     if (state.phase === 'PRODUCE' && nudge.type !== 'convergence') {
-      return null;
+      suppressReason = 'produce';
+    } else if (this.#bootstrapNudgeCount >= BOOTSTRAP_NUDGE_BUDGET) {
+      suppressReason = 'budget';
+    } else if (iteration - this.#lastBootstrapNudgeIteration < BOOTSTRAP_NUDGE_TTL_ROUNDS) {
+      suppressReason = 'ttl';
     }
-    if (this.#bootstrapNudgeCount >= BOOTSTRAP_NUDGE_BUDGET) {
-      return null;
-    }
-    if (state.metrics.iteration - this.#lastBootstrapNudgeIteration < BOOTSTRAP_NUDGE_TTL_ROUNDS) {
+    if (suppressReason) {
+      const lastEmitted = Number.isFinite(this.#lastBootstrapNudgeIteration)
+        ? String(this.#lastBootstrapNudgeIteration)
+        : 'none';
+      logNudgeDiagnostic(
+        `[NudgeGenerator] bootstrap nudge suppressed: reason=${suppressReason}, type=${nudge.type}, ` +
+          `phase=${state.phase}, iteration=${iteration}, emitted=${this.#bootstrapNudgeCount}/${BOOTSTRAP_NUDGE_BUDGET}, ` +
+          `lastEmittedIteration=${lastEmitted}, ttlRounds=${BOOTSTRAP_NUDGE_TTL_ROUNDS} — one-shot flag kept for retry`
+      );
       return null;
     }
     this.#bootstrapNudgeCount++;
-    this.#lastBootstrapNudgeIteration = state.metrics.iteration;
+    this.#lastBootstrapNudgeIteration = iteration;
     return nudge;
   }
 
@@ -427,9 +528,19 @@ export class NudgeGenerator {
     const interval = strategy.reflectionInterval || DEFAULT_REFLECTION_INTERVAL;
 
     const periodicTrigger = m.iteration > 1 && interval > 0 && m.iteration % interval === 0;
-    const staleTrigger =
+    const staleCondition =
       m.roundsSinceNewInfo >= DEFAULT_STALE_THRESHOLD &&
       m.iteration >= MIN_ITERS_FOR_STALE_REFLECTION;
+    // C13：停滞反思与上一条反思至少间隔 interval 轮，否则同一停滞状态会每轮叠加一条反思。
+    const roundsSinceReflection = m.iteration - this.#lastReflectionIteration;
+    const staleTrigger = staleCondition && roundsSinceReflection >= interval;
+    if (staleCondition && !staleTrigger) {
+      logNudgeDiagnostic(
+        `[NudgeGenerator] stale reflection suppressed: lastReflectionIteration=${this.#lastReflectionIteration}, ` +
+          `iteration=${m.iteration}, interval=${interval}, staleRounds=${m.roundsSinceNewInfo}, phase=${phase} — ` +
+          (periodicTrigger ? 'periodic reflection fires instead' : 'no reflection this round')
+      );
+    }
 
     if (!periodicTrigger && !staleTrigger) {
       return null;
@@ -539,8 +650,20 @@ export class NudgeGenerator {
         return `当前处于证据验证阶段：只读取已定位的关键路径，或校验既有符号/调用关系；不要泛搜索、不要重新打开探索面。${unverifiedHint}`;
       }
 
-      case 'RECORD':
-        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${targetMemoryFindingCount(m)} 条核心发现，当前进度 ${effectiveMemoryFindingCount(m)}（已记 ${m.memoryFindingCount} 条，含深度槽 ${m.depthSlottedFindingCount ?? 0} 条计 1.5）。importance ≥7 必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs），内容须与证据一致。`;
+      case 'RECORD': {
+        // C12：同时显示已核实数——配额只认已核实发现，模型需要看出未核实发现不计入进度。
+        const verifiedCount = Math.min(
+          m.verifiedFindingCount ?? m.memoryFindingCount,
+          m.memoryFindingCount
+        );
+        const target = targetMemoryFindingCount(m);
+        // 台账无文件条目时已核实配额不可达，策略按原始发现数收口（见 ExplorationStrategies 的配额出口）。
+        const unreachableHint =
+          m.ledgerDistinctFiles === 0
+            ? `证据台账没有文件条目，发现无法核实：记满 ${target} 条后即进入总结。`
+            : '';
+        return `当前处于结构化记录阶段：不要输出正文，只调用 note_finding({ finding, evidenceRefs, importance })，evidenceRefs 引用工具返回 [evidence] 标注的条目 id；按当前证据量需记录 ${target} 条核心发现，当前进度 ${effectiveMemoryFindingCount(m)}（已记 ${m.memoryFindingCount} 条，其中已核实 ${verifiedCount} 条——未核实发现不计配额；含深度槽 ${m.depthSlottedFindingCount ?? 0} 条计 1.5）。${unreachableHint}importance ≥7 必须至少填一个深度槽（designIntent/boundaries/failureModes/tradeoffs），内容须与证据一致。`;
+      }
 
       default:
         return null;

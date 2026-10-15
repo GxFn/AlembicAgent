@@ -37,11 +37,13 @@ import type {
 } from './exploration/ExplorationStrategies.js';
 import {
   createGenerateStrategy,
+  effectiveMemoryFindingCount,
   STRATEGY_ANALYST,
   STRATEGY_PRODUCER,
+  targetMemoryFindingCount,
   targetProducerSubmitCount,
 } from './exploration/ExplorationStrategies.js';
-import { NUDGE_DIRECTIVE_TEXTS, NudgeGenerator } from './exploration/NudgeGenerator.js';
+import { NudgeGenerator } from './exploration/NudgeGenerator.js';
 import { PlanTracker } from './exploration/PlanTracker.js';
 import { isSearchAction, SignalDetector } from './exploration/SignalDetector.js';
 
@@ -494,28 +496,16 @@ export class ExplorationTracker {
     }
 
     if (isTerminal && transitioned) {
-      const submitCount = m.submitCount;
-
       // Scan 管线: 所有结果在 toolCalls 中，无需文本总结
       if (this.#pipelineType === 'scan') {
         return { isFinalAnswer: true, needsDigestNudge: false, shouldContinue: false, nudge: null };
       }
 
-      // Analyst 管线: Markdown 分析报告
-      // Bootstrap 管线: dimensionDigest JSON
-      // 固定指令句取自 NUDGE_DIRECTIVE_TEXTS：cleanFinalAnswer 按同一份原句识别并清除模型回显，
-      // 这里改写文字必须改常量表，不能内联新句子，否则回显会残留在最终答复里。
-      const nudge =
-        this.#pipelineType === 'analyst'
-          ? `${NUDGE_DIRECTIVE_TEXTS.trackerAnalystReportLead}\n\n` +
-            `${NUDGE_DIRECTIVE_TEXTS.trackerStartReport}\n` +
-            NUDGE_DIRECTIVE_TEXTS.trackerNoCopyAnalysis
-          : this.#pipelineType === 'producer'
-            ? `${NUDGE_DIRECTIVE_TEXTS.trackerProducerSummaryLead}\n` +
-              NUDGE_DIRECTIVE_TEXTS.trackerNoCopySummary
-            : `${NUDGE_DIRECTIVE_TEXTS.trackerDigestLead}\n` +
-              `\`\`\`json\n{"dimensionDigest":{"summary":"分析总结(100-200字)","candidateCount":${submitCount},"keyFindings":["关键发现"],"crossRefs":{},"gaps":["未覆盖方面"],"remainingTasks":[{"signal":"未处理的信号/主题","reason":"未完成原因","priority":"high|medium|low","searchHints":["建议搜索词"]}]}}\n\`\`\`\n${NUDGE_DIRECTIVE_TEXTS.trackerRemainingTasksNote}\n` +
-              NUDGE_DIRECTIVE_TEXTS.noCopyJson;
+      // L6-P17（C11）：终结指令单源——与 metrics 转换（endRound）同一生成器、同一份按 pipelineType
+      // 区分的 SUMMARIZE 指令（analyst 严格版：核心章节只能来自已记录 note_finding；producer 不得从
+      // Analyst 摘要新增主题；bootstrap 为 dimensionDigest JSON）。此前这里内联了一份已漂移的弱版副本，
+      // 同一阶段因触发路径不同得到不同的产出约束。
+      const nudge = this.#nudgeGenerator.buildTransitionNudge(this.#buildNudgeState());
       return {
         isFinalAnswer: false,
         needsDigestNudge: true,
@@ -715,6 +705,7 @@ export class ExplorationTracker {
     const condition = typeof rule === 'function' ? rule : rule.onMetrics;
     if (condition?.(this.#metrics, this.#budget)) {
       this.#transitionTo(nextPhase);
+      this.#noteRecordQuotaExit(transKey, 'metrics');
     }
   }
 
@@ -743,9 +734,33 @@ export class ExplorationTracker {
 
     if (shouldTransition) {
       this.#transitionTo(nextPhase);
+      this.#noteRecordQuotaExit(transKey, 'text');
       return true;
     }
     return false;
+  }
+
+  /**
+   * L6-P17（C12）：RECORD→SUMMARIZE 由规则放行但已核实配额仍未达标，说明走的是“配额不可达”出口
+   * （证据台账无文件条目，发现无法核实，见 ExplorationStrategies 的 isRecordQuotaUnreachable）。
+   * 这是降级收口：记 warn 留下 target/effective/原始发现数，供排查维度证据为何全部无文件归属。
+   * maxIterations / forceTerminal 的强制终结不经过规则，不在此记录。
+   */
+  #noteRecordQuotaExit(transKey: string, trigger: 'metrics' | 'text') {
+    if (transKey !== 'RECORD→SUMMARIZE') {
+      return;
+    }
+    const m = this.#metrics;
+    const target = targetMemoryFindingCount(m);
+    const effective = effectiveMemoryFindingCount(m);
+    if (effective >= target) {
+      return;
+    }
+    this.#logger.warn(
+      `[ExplorationTracker] RECORD quota unreachable: ledger has no file entries — RECORD→SUMMARIZE via raw-finding exit ` +
+        `(trigger=${trigger}, target=${target}, effective=${effective}, memoryFindingCount=${m.memoryFindingCount}, ` +
+        `verified=${m.verifiedFindingCount ?? 0}, ledgerDistinctFiles=${m.ledgerDistinctFiles ?? 'absent'}, iter=${m.iteration})`
+    );
   }
 
   #transitionTo(newPhase: string) {

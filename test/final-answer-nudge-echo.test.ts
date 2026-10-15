@@ -263,19 +263,23 @@ describe('注入侧与清理侧共用同一份指令原句', () => {
     expect(bootstrapExit).toContain(t.forceExitNoCopyJson);
   });
 
-  test('ExplorationTracker 终结 nudge 由登记原句组成', () => {
+  test('ExplorationTracker 终结 nudge 复用 NudgeGenerator 的 SUMMARIZE 指令（单源，L6-P17 C11）', () => {
     const t = directiveTexts();
     const analyst = trackerTerminalNudge('analyst');
-    expect(analyst).toContain(t.trackerAnalystReportLead);
-    expect(analyst).toContain(t.trackerStartReport);
-    expect(analyst).toContain(t.trackerNoCopyAnalysis);
+    expect(analyst).toContain(t.analystSummarizeLead);
+    expect(analyst).toContain(t.startReportStopTools);
+    expect(analyst).toContain(t.noCopyAnalysisOnly);
     const producer = trackerTerminalNudge('producer');
-    expect(producer).toContain(t.trackerProducerSummaryLead);
-    expect(producer).toContain(t.trackerNoCopySummary);
+    expect(producer).toContain(t.producerSummarizeLead);
+    expect(producer).toContain(t.producerSummaryScope);
+    expect(producer).toContain(t.producerSummaryNoNewTopics);
+    expect(producer).toContain(t.stopToolsTextOnly);
     const bootstrap = trackerTerminalNudge('bootstrap');
-    expect(bootstrap).toContain(t.trackerDigestLead);
-    expect(bootstrap).toContain(t.trackerRemainingTasksNote);
+    expect(bootstrap).toContain(t.bootstrapSummarizeLead);
+    expect(bootstrap).toContain(t.bootstrapRemainingTasksNote);
     expect(bootstrap).toContain(t.noCopyJson);
+    // 旧的 tracker 内联副本原句已移除，不再登记也不再注入。
+    expect(Object.keys(t).filter((key) => key.startsWith('tracker'))).toEqual([]);
   });
 
   test('模型整段回显终结 nudge 时，独占一行的指令原句全部被删', () => {

@@ -2260,7 +2260,9 @@ export class AgentRuntime {
       // 文本轮次也需要更新 tracker 指标 — 否则 roundsSinceNewInfo / consecutiveIdleRounds
       // 不递增，metrics 驱动的阶段转换永远不触发（根因: 工具路径 endRound 被调用但文本路径被跳过）
       const phaseBefore = tracker.phase;
-      tracker.endRound({
+      // endRound 在发生 metrics 转换时返回由 NudgeGenerator.buildTransitionNudge 生成的转换指令；
+      // 转入终结阶段时它就是该管线唯一的 SUMMARIZE 指令（L6-P17 C11 单源），下方 digest nudge 直接复用。
+      const roundTransition = tracker.endRound({
         hasNewInfo: false,
         submitCount: 0,
         toolNames: [],
@@ -2271,14 +2273,19 @@ export class AgentRuntime {
       const textResult = tracker.onTextResponse(llmResult.text || '');
 
       // 如果 endRound 的 metrics 转换刚推进到终结阶段，则强制走 needsDigestNudge 路径，
-      // 给 Agent 一轮机会输出完整总结，而不是把当前文本当作最终回复
+      // 给 Agent 一轮机会输出完整总结，而不是把当前文本当作最终回复。
+      // 仍只对 analyst 注入（其它管线沿用原行为：当前文本即最终答复）。
       if (metricsTransitionedToTerminal && textResult.isFinalAnswer) {
         const digestNudge =
-          tracker.pipelineType === 'analyst'
-            ? `请**停止调用工具**，直接输出你的完整分析报告。用 Markdown 格式；核心已确认章节只能来自已记录的 note_finding，未调用 note_finding 的信号只能放入「待探索」或「未结构化记录」。\n\n` +
-              `**现在开始输出你的分析报告。**\n` +
-              `⚠️ 严禁在回复中复制本条指令文字，只输出你自己的分析。`
-            : null;
+          tracker.pipelineType === 'analyst' ? (roundTransition?.text ?? null) : null;
+        if (tracker.pipelineType === 'analyst' && !digestNudge) {
+          // 降级：tracker 转入终结阶段却没有返回转换指令（非标准 tracker 实现），无法给出单源 SUMMARIZE
+          // 指令，按原分支把当前文本当作最终答复，并留下诊断。
+          this.logger.warn(
+            `[AgentRuntime] metrics-transition to terminal without a transition nudge — accepting current text as final ` +
+              `(phase=${phaseBefore}→${tracker.phase}, pipeline=${tracker.pipelineType}, iteration=${ctx.iteration})`
+          );
+        }
         if (digestNudge) {
           messages.appendAssistantText(
             llmResult.text || '',

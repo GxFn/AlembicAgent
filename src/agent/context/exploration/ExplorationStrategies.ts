@@ -139,6 +139,36 @@ export function effectiveMemoryFindingCount(
   return base + 0.5 * slotted;
 }
 
+/**
+ * L6-P17（C12）：RECORD 已核实配额不可达出口。
+ *
+ * 证据台账存在但没有任何文件条目（ledgerDistinctFiles===0，例如证据全部来自 graph.query、
+ * terminal.exec 等无文件归属的条目）时，note_finding 的引用永远判为未核实，已核实配额
+ * （effectiveMemoryFindingCount 只认 verified）永远到不了 targetMemoryFindingCount 的下限 3；
+ * RECORD 只暴露 note_finding 与只读 evidence 工具，也无法再采到带文件的证据，若不收口就会在
+ * toolChoice=required 下空转到 maxIterations。此时以原始发现数达到目标作为收口条件（用户决定选
+ * “无文件台账”，不采用“连续 N 轮无新核实”，后者会在核实较慢的正常运行中误收口）。
+ *
+ * 只认 number 0：字段缺席=无台账运行，配额本就回退旧口径，不走该出口。触发时由 ExplorationTracker
+ * 记 warn（target/effective/memoryFindingCount）。不导出：本模块经 context/index 的 export * 公开，
+ * 新增导出会改变冻结的公开面。
+ */
+function isRecordQuotaUnreachable(
+  m: Pick<
+    ExplorationMetrics,
+    'memoryFindingCount' | 'evidenceToolCallCount' | 'ledgerDistinctFiles'
+  >
+) {
+  return m.ledgerDistinctFiles === 0 && m.memoryFindingCount >= targetMemoryFindingCount(m);
+}
+
+/** RECORD→SUMMARIZE 收口：已核实配额达标，或配额不可达出口成立（见 isRecordQuotaUnreachable）。 */
+function hasMetRecordQuota(m: ExplorationMetrics) {
+  return (
+    effectiveMemoryFindingCount(m) >= targetMemoryFindingCount(m) || isRecordQuotaUnreachable(m)
+  );
+}
+
 export function targetProducerSubmitCount(
   b: Pick<ExplorationBudget, 'maxSubmits' | 'targetSubmits'>
 ) {
@@ -250,7 +280,10 @@ export function createGenerateStrategy(isSkillOnly = false) {
  *   - EXPLORE→VERIFY 的文本转换必须已有代码证据，避免纯自然语言分析空转
  *   - EXPLORE→VERIFY 新增 consecutiveIdleRounds 检测（LLM 连续无工具调用=分析完成）
  *   - VERIFY→RECORD 阈值从 80% 降至 75%，已记录 3 条发现后可提前收束；VERIFY 只允许证据校验类工具调用
- *   - RECORD 是 required note_finding-only 补记录阶段，至少 3 条 note_finding 后进入 SUMMARIZE
+ *   - RECORD 是 required note_finding-only 补记录阶段：已核实加权配额（effectiveMemoryFindingCount，
+ *     只认引用带文件区间的发现，深度槽计 1.5）达到 targetMemoryFindingCount（下限 3）后进入 SUMMARIZE；
+ *     证据台账无文件条目时配额不可达，原始发现数达到目标即收口（L6-P17 C12，见 isRecordQuotaUnreachable）
+ *   - 注意口径差：VERIFY→RECORD 仍按原始 memoryFindingCount 放行，RECORD→SUMMARIZE 按已核实配额收口
  */
 export const STRATEGY_ANALYST = {
   name: 'analyst',
@@ -282,10 +315,8 @@ export const STRATEGY_ANALYST = {
         m.evidenceToolCallCount >= 2 || m.memoryFindingCount > 0,
     },
     'RECORD→SUMMARIZE': {
-      onMetrics: (m: ExplorationMetrics) =>
-        effectiveMemoryFindingCount(m) >= targetMemoryFindingCount(m),
-      onTextResponse: (m: ExplorationMetrics) =>
-        effectiveMemoryFindingCount(m) >= targetMemoryFindingCount(m),
+      onMetrics: (m: ExplorationMetrics) => hasMetRecordQuota(m),
+      onTextResponse: (m: ExplorationMetrics) => hasMetRecordQuota(m),
     },
   },
   getToolChoice: (phase: ExplorationPhase, m: ExplorationMetrics, b: ExplorationBudget) => {
