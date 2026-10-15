@@ -462,16 +462,42 @@ export class AgentRuntime {
 
       completedResult = result;
       // ── Policy: 执行后校验 ──
-      const afterCheck = this.policies.validateAfter(
-        result as import('../policies/index.js').PolicyResult
-      );
-      if (!afterCheck.ok) {
-        this.logger.warn(`[AgentRuntime] Quality check: ${afterCheck.reason}`);
-        result.qualityWarning = afterCheck.reason;
+      // I43(L5-P44)：取消或超时的运行不做执行后质量校验。此时 reply 是取消占位文案或截断回执，
+      // 对它做长度/文件引用/工具调用数检查只会产生与真实质量无关的 quality_warning，并掩盖真正的
+      // 停止原因；改记 quality_check_skipped 诊断与日志，写明触发信号。完整跑完的运行照常校验。
+      const qualitySkip = resolveQualityCheckSkip(cancelled, result);
+      if (qualitySkip) {
+        const replyLength = typeof result.reply === 'string' ? result.reply.length : 0;
+        observeSafely(
+          () =>
+            this.logger.info(
+              `[AgentRuntime] post-run quality check skipped: reason=${qualitySkip.reason}, trigger=${qualitySkip.trigger}`,
+              {
+                runtimeId: this.id,
+                reason: qualitySkip.reason,
+                trigger: qualitySkip.trigger,
+                replyLength,
+                toolCalls: result.toolCalls?.length ?? 0,
+              }
+            ),
+          () => undefined
+        );
         diagnostics.warn({
-          code: 'quality_warning',
-          message: afterCheck.reason || 'Policy quality check failed',
+          code: 'quality_check_skipped',
+          message: `Post-run policy quality check skipped: run ${qualitySkip.reason} (trigger=${qualitySkip.trigger}); the reply (${replyLength} chars) is a stop placeholder or truncated receipt, so no quality_warning is evaluated`,
         });
+      } else {
+        const afterCheck = this.policies.validateAfter(
+          result as import('../policies/index.js').PolicyResult
+        );
+        if (!afterCheck.ok) {
+          this.logger.warn(`[AgentRuntime] Quality check: ${afterCheck.reason}`);
+          result.qualityWarning = afterCheck.reason;
+          diagnostics.warn({
+            code: 'quality_warning',
+            message: afterCheck.reason || 'Policy quality check failed',
+          });
+        }
       }
 
       // 状态完成
@@ -3123,6 +3149,49 @@ function lookupRegisteredModelDef(modelRef: string): ModelDef | undefined {
     return registry.resolve(modelRef.slice(0, separator), modelRef.slice(separator + 1));
   }
   return registry.findByApiModelId(modelRef);
+}
+
+/** 执行后质量校验被跳过的原因与触发信号（I43 / L5-P44），只进诊断与日志，不新增公开字段。 */
+interface QualityCheckSkip {
+  reason: 'cancelled' | 'timed_out';
+  trigger:
+    | 'runtime_abort_signal'
+    | 'result.aborted'
+    | 'result.outcome'
+    | 'phases._pipelineOutcome'
+    | 'result.timedOut';
+}
+
+/**
+ * 判定本次运行是否应跳过 Policy.validateAfter（I43 / L5-P44）。
+ *
+ * - 取消：运行边界的 abort（父 signal 或公开 abort()，此时 reply 已改写为取消占位文案）；
+ *   或策略自报取消——单阶段回执的 aborted、管线结果 outcome / phases._pipelineOutcome.outcome
+ *   为 'aborted'（例如某阶段自己的取消信号触发、父 signal 未中止的 stage_aborted 路径）。
+ * - 超时：策略结果自报 timedOut（阶段最终回执超时；管线只在最终回执超时时置位，成功重试不计）。
+ * 运行级硬超时（runOperation 返回 timeout）在上游直接抛出带快照的超时错误，不会走到校验。
+ * 其余结局（completed / failed / abandoned / degraded）仍照常校验，保持既有告警口径。
+ */
+function resolveQualityCheckSkip(
+  runtimeCancelled: boolean,
+  result: AgentResult
+): QualityCheckSkip | null {
+  if (runtimeCancelled) {
+    return { reason: 'cancelled', trigger: 'runtime_abort_signal' };
+  }
+  if (result.aborted === true) {
+    return { reason: 'cancelled', trigger: 'result.aborted' };
+  }
+  if (result.outcome === 'aborted') {
+    return { reason: 'cancelled', trigger: 'result.outcome' };
+  }
+  if (asRecord(result.phases?._pipelineOutcome).outcome === 'aborted') {
+    return { reason: 'cancelled', trigger: 'phases._pipelineOutcome' };
+  }
+  if (result.timedOut === true) {
+    return { reason: 'timed_out', trigger: 'result.timedOut' };
+  }
+  return null;
 }
 
 function readPositiveBudgetNumber(value: unknown): number | null {

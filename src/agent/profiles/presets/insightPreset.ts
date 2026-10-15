@@ -4,13 +4,12 @@
  * analyze/quality_gate/produce/rejection_gate 再复制覆盖;数组下标顺序只决定
  * 直接以本 preset 运行时的执行顺序,不被工厂依赖。
  */
-import { DIMENSION_COMPLETION_FLOOR } from '@alembic/core/knowledge';
 import {
   insightGateEvaluator,
   producerRejectionGateEvaluator,
   readEvolutionGateArtifact,
 } from '../../evaluation/gateEvaluators.js';
-import { BudgetPolicy, QualityGatePolicy } from '../../policies/index.js';
+import { BudgetPolicy } from '../../policies/index.js';
 import {
   ANALYST_BUDGET,
   ANALYST_SYSTEM_PROMPT,
@@ -193,15 +192,12 @@ export const INSIGHT_PRESET = {
         // 不负责终止（终止靠 maxIterations / 超时），PipelineStrategy 的重试判定读同一口径。
         // 阶段预算里的 maxSessionTokens 目前没有执行者（BudgetController 不消费），去留待事项②。
       }),
-    (config?: PolicyFactoryConfig) =>
-      new QualityGatePolicy({
-        // C-3(2026-07-02 统一重构)：默认阈值改用 Core DIMENSION_COMPLETION_FLOOR 单源
-        // (与宿主 dimension_complete evidence gate 同一组数字)。minToolCalls 是
-        // pipeline 专属维度(宿主无工具循环),保持本地。
-        minEvidenceLength: config?.minEvidenceLength ?? DIMENSION_COMPLETION_FLOOR.minAnalysisChars,
-        minFileRefs: config?.minFileRefs ?? DIMENSION_COMPLETION_FLOOR.minFileRefs,
-        minToolCalls: config?.minToolCalls ?? 3,
-      }),
+    // I43(L5-P44)：不再挂运行级 QualityGatePolicy。它在运行结束后评估的是最后主阶段 produce 的
+    // 提交汇报而不是分析正文，且与管线门的文件引用口径不同，同一文本会得出不同结论；分析质量由
+    // 上面 quality_gate 阶段的 insightGateEvaluator 判定，这是 insight 运行唯一的质量门。
+    // 因此 insight 运行不再产生运行级 quality_warning，观察质量请看管线门结果(_pipelineOutcome 与
+    // quality_gate 诊断)。legacy 参数 minEvidenceLength / minFileRefs / minToolCalls 对本预设不再生效；
+    // QualityGatePolicy 类仍保留导出，调用方可显式注入。
   ],
   persona: {
     role: 'analyst',

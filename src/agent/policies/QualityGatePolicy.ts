@@ -8,6 +8,13 @@ export interface QualityGatePolicyOptions {
   customValidator?: (result: PolicyResult) => { ok: boolean; reason?: string };
 }
 
+/**
+ * 运行级阈值质量策略：运行结束后由 AgentRuntime 调用 validateAfter，未通过只记 quality_warning，不改运行结论。
+ *
+ * I43(L5-P44)：内置预设不再安装本策略(insight 运行以管线 quality_gate 为唯一质量门)；类与 toGateConfig
+ * 仍保留导出，去留随待决事项②决定。AgentRuntime 对取消或超时的运行跳过 validateAfter
+ * (记 quality_check_skipped 诊断)，本策略不会再对取消占位文案报质量不足。
+ */
 export class QualityGatePolicy extends Policy {
   #minEvidenceLength;
   #minFileRefs;
