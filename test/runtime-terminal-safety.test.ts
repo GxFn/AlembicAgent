@@ -3326,6 +3326,215 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       warn.mockRestore();
     }
   });
+
+  // ─── L4-P12c 审计补修 ────────────────────────────────────────────────────────────────────
+  // (1) 压缩器按 UTF-16 字符计预算（tokenBudget*4），router 按 shared 口径计 token（码点 > 0x2e80 每字
+  //     0.5）：含 CJK 的输出按字符预算压缩后仍超 4000 token，被 router 再截一次，压缩器标记被切掉。
+  // (2) degraded / terminal_output_compressed 曾按原始长度判定：与预算无关的解析器摘要只因原始输出大
+  //     就被标成有损，同样的摘要在小输出上又不标。
+
+  /** 互不相同的行：`<prefix>-00001 ` 后接 ascii 个 'x' 与 cjk 个汉字，避免重复行折叠改变长度。 */
+  function mixedLines(prefix: string, totalChars: number, ascii: number, cjk: number): string {
+    const lines: string[] = [];
+    let length = 0;
+    for (let index = 0; length < totalChars; index++) {
+      const line = `${prefix}-${String(index).padStart(5, '0')} ${'x'.repeat(ascii)}${'汉'.repeat(cjk)}`;
+      lines.push(line);
+      length += line.length + 1;
+    }
+    return lines.join('\n');
+  }
+
+  it.each([
+    { label: 'pure CJK lines', stdout: () => mixedLines('构建', 30_000, 0, 48) },
+    {
+      label: 'ASCII lines carrying a few CJK characters',
+      stdout: () => mixedLines('build', 30_000, 43, 5),
+    },
+    {
+      label: 'CJK output within the character budget but over the token budget',
+      stdout: () => mixedLines('构建', 12_000, 0, 48),
+    },
+  ])('keeps the compressor as the only cut for non-ASCII output under the host 8000 budget: $label', async ({
+    stdout,
+  }) => {
+    const stderr = ['STDERR-HEAD failure summary', uniqueLines('stderr', 1_200), 'STDERR-END'].join(
+      '\n'
+    );
+    const result = await runTerminalExec(
+      'cat build.log',
+      hostContext(async () => ({ stdout: stdout(), stderr, exitCode: 0 }))
+    );
+
+    expect(result.ok).toBe(true);
+    const text = String(result.data);
+    expect(text).not.toMatch(ROUTER_NOTICE_RE);
+    expect(occurrences(text, COMPRESSOR_MARKER)).toBe(1);
+    expect(text).toContain('[stderr]\nSTDERR-HEAD failure summary');
+    expect(text.endsWith('STDERR-END')).toBe(true);
+    const tokens = estimateTokens(text);
+    expect(tokens).toBeLessThanOrEqual(4000);
+    // 收敛要贴近上限：不能为了避开 router 而把预算一刀砍半。
+    expect(tokens).toBeGreaterThan(3600);
+    const codes = result._meta?.diagnosticWarnings?.map((warning) => warning.code) ?? [];
+    expect(codes).not.toContain('tool_output_truncated');
+    expect(codes).toContain('terminal_output_compressed');
+    expect(result._meta?.degraded).toBe(true);
+    expect(result._meta?.resultStatus).toBeUndefined();
+    // 诊断写明收缩后的压缩预算与压缩次数，只含计数，不含输出原文。
+    const compressed = result._meta?.diagnosticWarnings?.find(
+      (warning) => warning.code === 'terminal_output_compressed'
+    );
+    expect(compressed?.message).toMatch(
+      /hostBudget=8000 actionLimit=4000 reserve=0\); compressorTokenBudget=\d+ attempts=[2-4];/
+    );
+    expect(compressed?.message).not.toMatch(/(构建|build)-00000/);
+  });
+
+  it('hands the cut to the router with a warning when the compressor ignores the budget', async () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const budgets: Array<number | undefined> = [];
+      const stdout = mixedLines('构建', 12_000, 0, 48);
+      const result = await runTerminalExec(
+        'cat build.log',
+        hostContext(async () => ({ stdout, stderr: '', exitCode: 0 }), {
+          compressor: {
+            compress: (raw, opts) => {
+              budgets.push(opts.tokenBudget);
+              return raw;
+            },
+          },
+        })
+      );
+
+      // 一次不限预算的参照调用 + 至多 4 次收缩重压，之后交给 router。
+      expect(budgets[0]).toBe(Number.POSITIVE_INFINITY);
+      expect(budgets).toHaveLength(5);
+      const bounded = budgets.slice(1) as number[];
+      expect(bounded[0]).toBe(4000);
+      for (let index = 1; index < bounded.length; index++) {
+        expect(bounded[index]).toBeLessThan(bounded[index - 1] as number);
+      }
+      const text = String(result.data);
+      expect(text).toMatch(ROUTER_NOTICE_RE);
+      expect(estimateTokens(text)).toBeLessThanOrEqual(4000);
+      const codes = result._meta?.diagnosticWarnings?.map((warning) => warning.code) ?? [];
+      expect(codes).toEqual(['tool_output_truncated']);
+      expect(result._meta?.degraded).toBe(true);
+      const lines = warn.mock.calls.map((args) => String(args[0]));
+      const line = lines.find((entry) => entry.includes('still exceeds token budget'));
+      expect(line).toMatch(/attempts=4; .*path=router-enforces/);
+      expect(lines.join('\n')).not.toContain('构建-00000');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('treats a non-string result from a budgeted compression as a compressor failure', async () => {
+    const stdout = uniqueLines('log', 30_000);
+    const result = await runTerminalExec(
+      'cat build.log',
+      hostContext(async () => ({ stdout, stderr: '', exitCode: 0 }), {
+        compressor: {
+          compress: (raw, opts) =>
+            opts.tokenBudget === Number.POSITIVE_INFINITY ? raw : (null as unknown as string),
+        },
+      })
+    );
+    expect(result._meta?.fallbackUsed).toBe(true);
+    expect(result._meta?.diagnosticWarnings).toContainEqual(
+      expect.objectContaining({
+        code: 'terminal_compressor_failed',
+        message: 'compressor returned null; returned ANSI-stripped raw output',
+      })
+    );
+    expect(String(result.data)).toMatch(ROUTER_NOTICE_RE);
+  });
+
+  /** vitest 全通过输出：每个文件一行，末尾是 Test Files / Tests 计数行。 */
+  function vitestPassOutput(totalChars: number): string {
+    const lines: string[] = [];
+    let length = 0;
+    let files = 0;
+    while (length < totalChars) {
+      const line = ` ✓ test/unit-${String(files).padStart(5, '0')}.test.ts (3 tests) 12ms`;
+      lines.push(line);
+      length += line.length + 1;
+      files++;
+    }
+    lines.push(
+      '',
+      ` Test Files  ${files} passed (${files})`,
+      `      Tests  ${files * 3} passed (${files * 3})`
+    );
+    return lines.join('\n');
+  }
+
+  it.each([
+    { label: 'small', totalChars: 2_400 },
+    { label: 'large', totalChars: 30_000 },
+  ])('does not flag a budget-independent parser summary as degraded: $label vitest run', async ({
+    totalChars,
+  }) => {
+    const stdout = vitestPassOutput(totalChars);
+    const result = await runTerminalExec(
+      'npm test',
+      hostContext(async () => ({ stdout, stderr: '', exitCode: 0 }))
+    );
+
+    const text = String(result.data);
+    expect(text.startsWith('[summarized by test-output; raw ')).toBe(true);
+    expect(text.length).toBeLessThan(200);
+    expect(result._meta?.degraded).toBeUndefined();
+    expect(result._meta?.diagnosticWarnings).toBeUndefined();
+  });
+
+  /** 互不相同文件的统一 diff，每个文件一个 1 删 1 增的 hunk。 */
+  function unifiedDiff(totalChars: number): string {
+    const parts: string[] = [];
+    let length = 0;
+    for (let index = 0; length < totalChars; index++) {
+      const file = `src/module-${String(index).padStart(5, '0')}.ts`;
+      const part = [
+        `diff --git a/${file} b/${file}`,
+        'index 1111111..2222222 100644',
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        '@@ -1,2 +1,2 @@',
+        `-export const value${index} = 1;`,
+        `+export const value${index} = 2;`,
+        ' export default {};',
+      ].join('\n');
+      parts.push(part);
+      length += part.length + 1;
+    }
+    return parts.join('\n');
+  }
+
+  it('still flags a summary that only the budget forced (git diff over budget)', async () => {
+    const small = await runTerminalExec(
+      'git diff',
+      hostContext(async () => ({ stdout: unifiedDiff(2_000), stderr: '', exitCode: 0 }))
+    );
+    expect(String(small.data).startsWith('diff --git a/')).toBe(true);
+    expect(small._meta?.degraded).toBeUndefined();
+    expect(small._meta?.diagnosticWarnings).toBeUndefined();
+
+    const large = await runTerminalExec(
+      'git diff',
+      hostContext(async () => ({ stdout: unifiedDiff(30_000), stderr: '', exitCode: 0 }))
+    );
+    expect(String(large.data).startsWith('[summarized by git-diff; raw ')).toBe(true);
+    expect(large._meta?.degraded).toBe(true);
+    const compressed = large._meta?.diagnosticWarnings?.find(
+      (warning) => warning.code === 'terminal_output_compressed'
+    );
+    expect(compressed?.message).toMatch(/hostBudget=8000 actionLimit=4000 reserve=0/);
+    expect(compressed?.message).not.toContain('module-00000');
+  });
 });
 
 // ─── L4-P15 terminal.exec 之后失效 code.search 缓存（I05：U12-F2）─────────────────────────

@@ -511,11 +511,12 @@ function truncationNotice(omittedChars: number, maxTokens: number): string {
  *   只保留说明，让下游仍能识别截断，并经 Logger.warn 报告该降级。
  * 非字符串结果（如 code.search 的结构化 matches）由 handler 自行按同一口径投影，这里不处理。
  *
- * 与 terminal.exec 的分工（L4-P12 / I11）：terminal handler 已按 min(ctx.tokenBudget, maxOutputTokens)
- * 扣除前后缀后交给 OutputCompressor，压缩器的头尾截断是实际生效的那次；这里只兜底（压缩器缺失或失败、
- * 非 ASCII 输出按字符预算压缩后估算仍超限）。这里不改用 compressor/strip 的 truncateOutput：它按
- * UTF-16 字符计预算、标记格式不同，而本函数的说明格式被 ActiveContext / EvidenceCollector 按正则识别，
- * 且按 Unicode 字符切分本身已不会留下孤立代理半字。
+ * 与 terminal.exec 的分工（L4-P12 / I11，L4-P12c）：terminal handler 已按 min(ctx.tokenBudget, maxOutputTokens)
+ * 扣除前后缀后交给 OutputCompressor，并按本函数同一 shared 口径校验压缩结果：含 CJK 等字符的输出按字符
+ * 预算压缩后仍超限时，按比例收缩预算重压（terminal.ts fitCompressorOutput），压缩器的头尾截断是实际
+ * 生效的那次。这里只兜底：压缩器缺失或失败，或收缩到上限次数仍超限（压缩器不按预算收缩）。
+ * 这里不改用 compressor/strip 的 truncateOutput：它按 UTF-16 字符计预算、标记格式不同，而本函数的
+ * 说明格式被 ActiveContext / EvidenceCollector 按正则识别，且按 Unicode 字符切分本身已不会留下孤立代理半字。
  */
 function enforceOutputLimit(result: ToolResult, maxTokens: number, call: ParsedToolCall): void {
   if (typeof result.data !== 'string') {

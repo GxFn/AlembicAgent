@@ -7,11 +7,16 @@
  * 执行流程: cwd 校验 → timeout 归一 → 危险命令预检 → capability allowlist（注入时）
  *           → 执行器 fail-closed 判定 → Seatbelt 沙箱执行（执行器结果归一）→ OutputCompressor 压缩
  *
- * 输出预算（L4-P12 / I11）: 交给 compressor 的预算是 min(ctx.tokenBudget, exec.maxOutputTokens)
+ * 输出预算（L4-P12 / I11，L4-P12c）: 交给 compressor 的预算是 min(ctx.tokenBudget, exec.maxOutputTokens)
  *           再扣除 '[exit N]' 前缀与 '[unsandboxed:...]' 诊断后缀的估算 token，让压缩器成为实际生效的
- *           那次截断（尾部的测试摘要与 [stderr] 段由它的头尾策略保留）。按 action.maxOutputTokens 的
- *           router.enforceOutputLimit 在本 handler 返回后仍会执行，但只是兜底：压缩器缺失或抛错、
- *           或非 ASCII 输出按字符预算压缩后估算 token 仍超限时才会再截一次。
+ *           那次截断（尾部的测试摘要与 [stderr] 段由它的头尾策略保留）。压缩器按 UTF-16 字符计预算
+ *           （OutputCompressor: maxChars = tokenBudget*4），而 router 按 shared 口径计 token（CJK 每字 0.5），
+ *           所以压缩结果再按 shared 口径校验，超出时按比例收缩交给压缩器的预算重压（fitCompressorOutput），
+ *           含中文的输出也只被压缩器截一次。按 action.maxOutputTokens 的 router.enforceOutputLimit 在本
+ *           handler 返回后仍会执行，但只是兜底：压缩器缺失、抛错，或收缩到上限次数仍超限时才会再截一次。
+ *
+ * 有损标记（L4-P12c）: 只有预算真的改变了压缩器的输出（与不限预算的参照视图不同）才标 degraded 并追加
+ *           terminal_output_compressed；与预算无关的解析器摘要（npm test 等）无论原始输出多大都不标。
  *
  * 审计（L4-P12 / I35）: 每条路径都以稳定分类码写入审计 error（invalid:/blocked:/blocked-allowlist:/
  *           exit:/interrupted:/executor-threw:），只含规则 id 与状态码，不含命令原文或拦截原因文本。
@@ -77,8 +82,13 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 120000;
 /** ctx.tokenBudget 缺失/非法时交给压缩器的默认预算，沿用旧的 `|| 4000` 口径。 */
 const DEFAULT_COMPRESSOR_TOKEN_BUDGET = 4000;
-/** OutputCompressor 的预算口径：maxChars = tokenBudget * 4（ASCII 下与 shared token 估算一致）。 */
-const COMPRESSOR_CHARS_PER_TOKEN = 4;
+/**
+ * 求参照视图时交给压缩器的预算：Infinity 表示“不限”（与 resolveHostTokenBudget、shared
+ * truncateToTokenBudget 对 Infinity 的口径一致），压缩器据此给出不受预算改写的视图。
+ */
+const UNBOUNDED_COMPRESSOR_BUDGET = Number.POSITIVE_INFINITY;
+/** 按 shared 口径收敛压缩结果时最多压缩几次（含首次）；仍超限时交给 router 兜底截断。 */
+const MAX_COMPRESSOR_FIT_ATTEMPTS = 4;
 /** 审计分类码与日志里只允许出现的受限字符集（规则 id、状态码、错误类名）。 */
 const SAFE_TOKEN_RE = /^[\w.-]{1,64}$/u;
 
@@ -865,7 +875,8 @@ interface CompressorBudget {
  * 计算压缩器预算（L4-P12 / I11），与 code.search 的 min(ctx.tokenBudget, action.maxOutputTokens) 同一写法。
  * 旧实现只把 ctx.tokenBudget 交给压缩器：宿主 8000 时压缩器按 32000 字符截断，router 再按 4000 token
  * 截一次，压缩器保留的尾部（测试摘要、[stderr] 段）大多被切掉。前缀/后缀按 shared 估算向上取整，
- * 各段估算之和不小于整体估算，所以压缩结果只要不超过 tokens，拼上前后缀后 ASCII 输出不会触发 router。
+ * 各段估算之和不小于整体估算，所以压缩结果只要按同一口径不超过 tokens（由 fitCompressorOutput 校验
+ * 并收敛，含 CJK 的输出也一样），拼上前后缀后就不会触发 router。
  * handler 被直接调用（没有 registry 视图）时 actionLimit 缺失，只按宿主预算压缩，与旧行为一致。
  */
 function resolveCompressorBudget(ctx: ToolContext, framing: string): CompressorBudget {
@@ -913,7 +924,10 @@ function resolveHostTokenBudget(value: unknown): number {
 
 interface CompressionOutcome {
   text: string;
-  /** 原始输出超出压缩预算：模型看到的是摘要/折叠/截断后的有损视图。 */
+  /**
+   * 预算改变了压缩器的输出：与不限预算的参照视图不同（截断、超预算折叠、git diff 超预算改摘要），
+   * 模型看到的是被预算裁掉一部分的有损视图。与预算无关的解析器摘要不算（L4-P12c）。
+   */
   degraded: boolean;
   /** 压缩器抛错或返回非字符串，退回了去 ANSI 的原始输出。 */
   fallbackUsed: boolean;
@@ -921,12 +935,17 @@ interface CompressionOutcome {
 }
 
 /**
- * 压缩终端输出。三条路径：
- * - 压缩器正常返回：原始输出（去 ANSI 后）超出字符预算时，结果必然是有损视图，标 degraded 并追加
- *   terminal_output_compressed（只含计数与预算拆解），替代原本由 router 截断给出的 degraded 信号；
- * - 压缩器抛错或返回非字符串：退回去 ANSI 的原始输出，标 fallbackUsed、追加 terminal_compressor_failed
- *   并记 warn（只含错误类名，不含消息与输出原文）；超限部分由 router 兜底截断；
+ * 压缩终端输出。四条路径：
+ * - 参照视图放得下：先按不限预算取压缩器的参照视图（generic 去 ANSI 原文、解析器摘要、git diff 原文），
+ *   它按 shared 口径不超过预算时原样返回，不标 degraded——这时按预算压缩的结果与它逐字相同；
+ * - 参照视图超预算：按预算压缩并按 shared 口径收敛（fitCompressorOutput），结果与参照视图不同时标
+ *   degraded 并追加 terminal_output_compressed（只含计数与预算拆解），替代原本由 router 截断给出的
+ *   degraded 信号；收敛失败时同样带上该诊断并注明由 router 兜底；
+ * - 压缩器抛错或返回非字符串（任一次调用）：退回去 ANSI 的原始输出，标 fallbackUsed、追加
+ *   terminal_compressor_failed 并记 warn（只含错误类名，不含消息与输出原文）；超限部分由 router 兜底截断；
  * - 没有注入压缩器：直接去 ANSI，超限部分由 router 兜底截断（旧行为）。
+ * 判定 degraded 用“与参照视图是否相同”而不是原始长度（L4-P12c）：test/lint/grep 等解析器无论预算多大
+ * 都给同一种摘要，按原始长度判定会让同一摘要只因原始输出大小不同而带不同的标记。
  */
 async function compressOutput(
   raw: string,
@@ -935,39 +954,39 @@ async function compressOutput(
   budget: CompressorBudget
 ): Promise<CompressionOutcome> {
   const plain = stripAnsi(raw);
-  if (!raw || !ctx.compressor) {
+  const compressor = ctx.compressor;
+  if (!raw || !compressor) {
     return { text: plain, degraded: false, fallbackUsed: false, warnings: [] };
   }
 
   let failure: string;
   try {
-    const result: unknown = await Promise.resolve(
-      ctx.compressor.compress(raw, { command, tokenBudget: budget.tokens })
+    const reference: unknown = await Promise.resolve(
+      compressor.compress(raw, { command, tokenBudget: UNBOUNDED_COMPRESSOR_BUDGET })
     );
-    if (typeof result === 'string') {
-      const budgetChars = budget.tokens * COMPRESSOR_CHARS_PER_TOKEN;
-      if (plain.length <= budgetChars) {
-        return { text: result, degraded: false, fallbackUsed: false, warnings: [] };
+    if (typeof reference !== 'string') {
+      failure = `compressor returned ${describeType(reference)}`;
+    } else {
+      const referenceTokens = estimateTokens(reference);
+      if (referenceTokens <= budget.tokens) {
+        return { text: reference, degraded: false, fallbackUsed: false, warnings: [] };
       }
-      return {
-        text: result,
-        degraded: true,
-        fallbackUsed: false,
-        warnings: [
-          {
-            code: 'terminal_output_compressed',
-            message:
-              `rawChars=${plain.length} exceeded compressor budget ${budgetChars} chars ` +
-              `(tokenBudget=${budget.tokens}: hostBudget=${budget.hostBudget} ` +
-              `actionLimit=${budget.actionLimit ?? 'none'} reserve=${budget.reserve}); ` +
-              `compressedChars=${result.length}`,
-            stage: 'terminal.exec',
-            tool: 'terminal',
-          },
-        ],
-      };
+      const fit = await fitCompressorOutput(compressor, raw, command, budget.tokens);
+      if (fit.kind === 'invalid') {
+        failure = `compressor returned ${describeType(fit.result)}`;
+      } else if (fit.text === reference) {
+        // 压缩器无视了预算（只可能是宿主注入的其他实现）：没有发生预算导致的改写，不标 degraded；
+        // 超限部分由 router 截断并给出它自己的 degraded 与 tool_output_truncated。
+        return { text: fit.text, degraded: false, fallbackUsed: false, warnings: [] };
+      } else {
+        return {
+          text: fit.text,
+          degraded: true,
+          fallbackUsed: false,
+          warnings: [compressedWarning(plain, referenceTokens, budget, fit)],
+        };
+      }
     }
-    failure = `compressor returned ${describeType(result)}`;
   } catch (err: unknown) {
     failure = `compressor threw ${errorNameOf(err)}`;
   }
@@ -988,5 +1007,104 @@ async function compressOutput(
     warnings: [
       { code: 'terminal_compressor_failed', message, stage: 'terminal.exec', tool: 'terminal' },
     ],
+  };
+}
+
+/** fitCompressorOutput 的结果：invalid 表示某次调用返回了非字符串（交给调用方按压缩器失败处理）。 */
+type CompressorFit =
+  | {
+      kind: 'fitted' | 'over-budget';
+      text: string;
+      /** 最后一次交给压缩器的 tokenBudget。 */
+      compressorBudget: number;
+      /** 压缩次数（不含参照调用）。 */
+      attempts: number;
+      /** text 按 shared 口径的估算 token。 */
+      tokens: number;
+    }
+  | { kind: 'invalid'; result: unknown };
+
+/**
+ * 让压缩结果按 shared 口径落在 tokens 以内（L4-P12c）。
+ * 压缩器按 UTF-16 字符计预算（maxChars = tokenBudget*4），ASCII 下与 shared 口径一致，首次就放得下；
+ * 码点 > 0x2e80 的字符（CJK 等）每字 0.5 token，按字符预算截完仍可能超出。这时按超出比例收缩下一次
+ * 交给压缩器的预算重压，而不是在这里再截一刀：截断仍只由压缩器做一次，头尾策略与标记都是它的。
+ * 预算严格递减，最多 MAX_COMPRESSOR_FIT_ATTEMPTS 次；仍超限（压缩器不按预算收缩，或预算已缩到 1）时
+ * 记 warn 并返回最后一次结果，由 router 按 maxOutputTokens 兜底截断。日志只含计数与预算，不含输出原文。
+ */
+async function fitCompressorOutput(
+  compressor: NonNullable<ToolContext['compressor']>,
+  raw: string,
+  command: string,
+  tokens: number
+): Promise<CompressorFit> {
+  let compressorBudget = tokens;
+  for (let attempts = 1; ; attempts++) {
+    const result: unknown = await Promise.resolve(
+      compressor.compress(raw, { command, tokenBudget: compressorBudget })
+    );
+    if (typeof result !== 'string') {
+      return { kind: 'invalid', result };
+    }
+    const resultTokens = estimateTokens(result);
+    if (resultTokens <= tokens) {
+      return { kind: 'fitted', text: result, compressorBudget, attempts, tokens: resultTokens };
+    }
+    // 按超出比例收缩；比例取整后可能不变（超出很少时），至少减 1 保证严格递减、有限步结束。
+    const next = Math.min(
+      compressorBudget - 1,
+      Math.floor((compressorBudget * tokens) / resultTokens)
+    );
+    if (attempts >= MAX_COMPRESSOR_FIT_ATTEMPTS || next < 1) {
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            `[terminal.exec] compressor output still exceeds token budget; attempts=${attempts}; ` +
+              `compressorBudget=${compressorBudget}; outputTokens=${resultTokens}; tokenBudget=${tokens}; ` +
+              'path=router-enforces'
+          ),
+        () => undefined
+      );
+      return {
+        kind: 'over-budget',
+        text: result,
+        compressorBudget,
+        attempts,
+        tokens: resultTokens,
+      };
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().debug(
+          `[terminal.exec] compressor output exceeds token budget; attempt=${attempts}; ` +
+            `compressorBudget=${compressorBudget}; outputTokens=${resultTokens}; tokenBudget=${tokens}; ` +
+            `path=refit; nextBudget=${next}`
+        ),
+      () => undefined
+    );
+    compressorBudget = next;
+  }
+}
+
+/**
+ * terminal_output_compressed：参照视图超出预算、压缩器按预算改写了输出。只含计数与预算拆解，
+ * 不含命令或输出原文；compressorTokenBudget/attempts 说明是否为 CJK 等输出收缩过预算。
+ */
+function compressedWarning(
+  plain: string,
+  referenceTokens: number,
+  budget: CompressorBudget,
+  fit: Extract<CompressorFit, { kind: 'fitted' | 'over-budget' }>
+): ToolDiagnosticWarning {
+  return {
+    code: 'terminal_output_compressed',
+    message:
+      `rawChars=${plain.length} uncompressedViewTokens=${referenceTokens} exceeded token budget ` +
+      `${budget.tokens} (hostBudget=${budget.hostBudget} actionLimit=${budget.actionLimit ?? 'none'} ` +
+      `reserve=${budget.reserve}); compressorTokenBudget=${fit.compressorBudget} attempts=${fit.attempts}; ` +
+      `compressedChars=${fit.text.length} compressedTokens=${fit.tokens}` +
+      (fit.kind === 'over-budget' ? '; still over budget, router enforces the action limit' : ''),
+    stage: 'terminal.exec',
+    tool: 'terminal',
   };
 }
