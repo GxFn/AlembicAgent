@@ -653,6 +653,18 @@ function fail(code: string): never {
   throw new Error(code);
 }
 
+/**
+ * 本副本输出裸 64 位 hex；`sha256:` 前缀由调用点（createFrozenJudgeModelLoadReceiptV1 的
+ * receiptHash）自行拼接，并在 sortCanonical 中额外丢弃值为 undefined 的键（与 JSON.stringify
+ * 的省略结果等价）。
+ *
+ * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
+ * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
+ * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
+ * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
+ * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
+ * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
+ */
 function hashCanonical(value: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(sortCanonical(value)))

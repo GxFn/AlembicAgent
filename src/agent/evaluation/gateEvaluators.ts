@@ -348,6 +348,42 @@ export interface EvolutionGateArtifact {
 /** 进化门在管线里的阶段名；下游按名取产物，不依赖它是不是「最近一个门」。 */
 export const EVOLUTION_GATE_STAGE = 'evolution_gate';
 
+/** decayedRecipes 别名回退的诊断消息；宿主日志过滤以此指认仍在写旧字段的调用方。 */
+const DECAYED_RECIPES_ALIAS_LOG_MESSAGE = '[EvolutionGate] legacy decayedRecipes alias used';
+
+/**
+ * 解析进化门的期望 Recipe 集合：existingRecipes 优先，缺省时回退旧字段 decayedRecipes。
+ *
+ * 兼容登记（L7-P27/C49）：
+ * - 消费方：目前 Agent、宿主、Core 均无 decayedRecipes 写入方，只有测试钉住该回退；
+ * - 原因：旧宿主曾以 decayedRecipes 传入待进化 Recipe；
+ * - 移除条件：待决定③确认只支持当前单一宿主后，删除类型字段、本回退与对应测试断言；
+ * - 清理触发：决定③答复；本诊断日志若在真实运行中出现，说明仍有隐藏写入方，需先迁移它。
+ * existingRecipes 只要给出（哪怕是空数组）就不回退，与原 `??` 语义一致。
+ */
+function resolveEvolutionRecipes(strategyContext: {
+  existingRecipes?: Array<{ id: string }>;
+  decayedRecipes?: Array<{ id: string }>;
+}): Array<{ id: string }> {
+  if (strategyContext.existingRecipes != null) {
+    return strategyContext.existingRecipes;
+  }
+  if (strategyContext.decayedRecipes != null) {
+    const recipes = strategyContext.decayedRecipes;
+    observeSafely(
+      () =>
+        logger().warn(DECAYED_RECIPES_ALIAS_LOG_MESSAGE, {
+          reasonCode: 'evolution-gate-decayed-recipes-alias',
+          recipeCount: recipes.length,
+          resolution: 'fallback-to-decayedRecipes',
+        }),
+      () => undefined
+    );
+    return recipes;
+  }
+  return [];
+}
+
 /**
  * Evolution Gate 评估器 — 面向 PipelineStrategy gate.evaluator
  *
@@ -358,7 +394,7 @@ export const EVOLUTION_GATE_STAGE = 'evolution_gate';
  *
  * 如果还有未处理的 Recipe，返回 retry 要求补充决策。
  *
- * 兼容旧字段: 优先读 existingRecipes，回退 decayedRecipes。
+ * 兼容旧字段: 优先读 existingRecipes，回退 decayedRecipes（兼容登记见 resolveEvolutionRecipes）。
  */
 export function evolutionGateEvaluator(
   source: { toolCalls?: EvolutionToolCallRecord[] } | null | undefined,
@@ -368,11 +404,9 @@ export function evolutionGateEvaluator(
     decayedRecipes?: Array<{ id: string }>;
   } = {}
 ) {
-  const totalRecipes = (strategyContext.existingRecipes ?? strategyContext.decayedRecipes ?? [])
-    .length;
-  const expectedIds = (strategyContext.existingRecipes ?? strategyContext.decayedRecipes ?? []).map(
-    (r) => r.id
-  );
+  const recipes = resolveEvolutionRecipes(strategyContext);
+  const totalRecipes = recipes.length;
+  const expectedIds = recipes.map((r) => r.id);
   // 门配置了 useCumulativeToolCalls：这里看到的是进化阶段全部尝试的累计回执，
   // 所以三类计数覆盖补写轮，而不是只有最后一次尝试。
   const decisions = collectEvolutionDecisions(source?.toolCalls || [], expectedIds);

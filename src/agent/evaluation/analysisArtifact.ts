@@ -535,6 +535,40 @@ function countSnippets(collector: EvidenceCollector): number {
   return total;
 }
 
+/** 严格上下文混入 legacy 工件的告警消息；宿主日志过滤以此定位该组合（L7-P27/C45）。 */
+const STRICT_CONTEXT_LEGACY_MIX_LOG_MESSAGE =
+  '[AnalysisArtifact] strict analysis context passed through a legacy (non-cold-start) artifact';
+
+/**
+ * 告警“有 strictAnalysisContext 但未开启 strictColdStart”的组合（L7-P27/C45）。
+ *
+ * 只有 strictColdStart=true 时，严格路径才与 legacy reply / tool trace / note_finding / 锚点
+ * 补读隔离；未开启时，ActiveContext（典型是 fromJSON 恢复的严格上下文）带出的严格投影会和
+ * legacy 派生的 findings、工具轨迹、补读片段一起透传进同一个工件，下游无法区分两种证据面。
+ * 是否删除 strictColdStart 选项与透传取决于待决定④，在那之前不改公开参数、不改透传行为，
+ * 只把混合组合与各 legacy 来源的计数打出来，供判定是否存在真实生产调用方。
+ */
+function reportStrictContextLegacyMix(fields: {
+  readonly dimensionId: string;
+  readonly contextHash: string;
+  readonly memoryFindingCount: number;
+  readonly derivedFindingCount: number;
+  readonly legacyToolCallCount: number;
+  readonly postHocLiveReadCount: number;
+}): void {
+  observeSafely(
+    () =>
+      logger().warn(STRICT_CONTEXT_LEGACY_MIX_LOG_MESSAGE, {
+        reasonCode: 'strict-context-without-strict-cold-start',
+        strictColdStart: false,
+        ...fields,
+        // 选择路径：保持透传（行为不变），由决定④收口为删除或抛错。
+        resolution: 'pass-through-mixed',
+      }),
+    () => undefined
+  );
+}
+
 /**
  * 从 Analyst 执行结果构建 AnalysisArtifact (v2 增强版)
  *
@@ -549,6 +583,9 @@ function countSnippets(collector: EvidenceCollector): number {
  * @param dimensionId 维度 ID
  * @param [projectGraph] ProjectGraph 实例
  * @param [activeContext] ActiveContext 实例
+ * @param [opts] projectRoot 启用锚点补读；strictColdStart=true 时只透传 Core 严格投影、隔离全部
+ *   legacy 来源（缺严格上下文抛 STRICT_ANALYSIS_CONTEXT_REQUIRED）。有严格上下文却未开启时行为
+ *   不变但会告警（C45，去留待决定④）。
  */
 export function buildAnalysisArtifact(
   analystResult: AnalystResult,
@@ -669,6 +706,17 @@ export function buildAnalysisArtifact(
     memoryFindingCount,
     derivedFindingCount,
   });
+
+  if (strictAnalysisContext && !opts.strictColdStart) {
+    reportStrictContextLegacyMix({
+      dimensionId,
+      contextHash: strictAnalysisContext.contextHash,
+      memoryFindingCount,
+      derivedFindingCount,
+      legacyToolCallCount: toolCalls.length,
+      postHocLiveReadCount,
+    });
+  }
 
   return {
     // Layer 1: Core

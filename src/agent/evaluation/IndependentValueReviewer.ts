@@ -41,6 +41,15 @@ export interface FrozenEvidenceEntryV1 {
   readonly evidenceEntryId: string;
   readonly relativePath: string;
   readonly blobHash: string;
+  /**
+   * `content` 的 SHA-256 摘要，格式为裸 64 位小写 hex，不带 `sha256:` 前缀。
+   *
+   * 注意与 Core EvidenceEntry 台账的 `sha256:<hex>` 格式不同：从台账转入时调用方必须先剥掉
+   * 前缀（宿主 StrictAnalysisRuntime 现行做法）。输入契约不放宽（L7-P27/C40 用户决定）：带
+   * `sha256:` 前缀（大小写不敏感）的值由 createFrozenEvidenceProjection 按
+   * STRICT_REVIEW_EVIDENCE_CONTENT_HASH_FORMAT_INVALID 拒绝，而不是误报 CONTENT_HASH_MISMATCH；
+   * 裸 hex 与内容不一致仍报 STRICT_REVIEW_EVIDENCE_CONTENT_HASH_MISMATCH。
+   */
   readonly contentHash: string;
   readonly startLine: number;
   readonly endLine: number;
@@ -146,6 +155,59 @@ const REVIEW_EVIDENCE_PROJECTION_CODES: StrictEvidenceProjectionErrorCodesV1 = {
   idDuplicate: 'STRICT_REVIEW_EVIDENCE_ID_DUPLICATE',
 };
 
+/** contentHash 带 Core 台账前缀时的专用错误码（C40）；与内容不一致的 MISMATCH 码区分。 */
+const CONTENT_HASH_FORMAT_INVALID_CODE = 'STRICT_REVIEW_EVIDENCE_CONTENT_HASH_FORMAT_INVALID';
+
+/** 格式拒绝的诊断消息，宿主日志过滤以此定位“台账格式哈希未剥前缀”的调用方。 */
+const CONTENT_HASH_FORMAT_LOG_MESSAGE =
+  '[IndependentValueReviewer] frozen evidence contentHash format invalid';
+
+/** Core EvidenceEntry 台账的算法前缀；大小写不敏感，只识别 sha256 这一种台账格式。 */
+const LEDGER_CONTENT_HASH_PREFIX_PATTERN = /^sha256:/iu;
+
+/**
+ * 在规范化之前识别 Core 台账格式（`sha256:<hex>`）的 contentHash 并按专用码拒绝。
+ *
+ * 不放宽输入（不在此剥前缀归一）：冻结投影的 projectionHash 由逐字节的条目参与计算，归一会
+ * 让“同一证据两种写法”进入同一回执，属于公开输入契约变化，用户已决定不做。这里只把原本
+ * 会被误报为 CONTENT_HASH_MISMATCH 的输入改成可定位的格式错误；裸 hex 的全部既有行为不变。
+ *
+ * 优先级：本检查在逐条规范化之前对全部条目执行，所以同一输入若还有别的缺陷（行范围非法等），
+ * 先报格式错误。缺 evidenceEntryId 或 contentHash 不是字符串的条目跳过本检查，仍由规范化步骤
+ * 按既有 *_REQUIRED 码拒绝，避免格式错误信息里出现无法定位的条目。
+ */
+function assertBareContentHashFormat(entries: readonly FrozenEvidenceEntryV1[]): void {
+  for (const entry of entries) {
+    if (
+      typeof entry.contentHash !== 'string' ||
+      typeof entry.evidenceEntryId !== 'string' ||
+      entry.evidenceEntryId.trim().length === 0
+    ) {
+      continue;
+    }
+    const prefix = LEDGER_CONTENT_HASH_PREFIX_PATTERN.exec(entry.contentHash)?.[0];
+    if (!prefix) {
+      continue;
+    }
+    observeSafely(
+      () =>
+        logger().warn(CONTENT_HASH_FORMAT_LOG_MESSAGE, {
+          reasonCode: CONTENT_HASH_FORMAT_INVALID_CODE,
+          evidenceEntryId: entry.evidenceEntryId,
+          relativePath: entry.relativePath,
+          observedPrefix: prefix,
+          expectedFormat: 'bare-64-lowercase-hex',
+          resolution: 'reject',
+        }),
+      () => undefined
+    );
+    fail(
+      CONTENT_HASH_FORMAT_INVALID_CODE,
+      `${entry.evidenceEntryId} contentHash must be bare 64-char lowercase hex without the "${prefix}" prefix`
+    );
+  }
+}
+
 export function createFrozenEvidenceProjection(input: {
   readonly sourceRevisionVectorHash: string;
   readonly entries: readonly Omit<FrozenEvidenceEntryV1, never>[];
@@ -155,6 +217,7 @@ export function createFrozenEvidenceProjection(input: {
   if (input.entries.length === 0) {
     fail('STRICT_REVIEW_EVIDENCE_REQUIRED');
   }
+  assertBareContentHashFormat(input.entries);
   // 规范化、en 固定排序与哈希和 Producer lineage 复核共用同一实现，保证这里冻结的
   // projectionHash 在 createStrictProducerLineageReceiptV1 中逐字节复核通过。
   const { semantic, projectionHash } = canonicalizeStrictEvidenceProjection(
@@ -613,6 +676,16 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * 本副本输出裸 64 位 hex（decisionHash 等评审侧回执使用）。
+ *
+ * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
+ * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
+ * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
+ * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
+ * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
+ * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
+ */
 function hashCanonical(value: unknown): string {
   return sha256(JSON.stringify(sortCanonical(value)));
 }

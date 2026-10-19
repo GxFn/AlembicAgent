@@ -494,6 +494,16 @@ function frozenJudgeReply(prompt: string): LLMResult {
   };
 }
 
+/**
+ * 本副本直接输出带 `sha256:` 前缀的哈希，fixture 报告与 golden 记录按此前缀格式比对。
+ *
+ * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
+ * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
+ * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
+ * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
+ * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
+ * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
+ */
 function hashCanonical(value: unknown): string {
   return `sha256:${sha256(JSON.stringify(sortCanonical(value)))}`;
 }
