@@ -1129,6 +1129,93 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
     ]);
   });
 
+  it('expires authorization when the grant round reports tool calls that recorded no action (blocked by tool:execute:before)', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    // 第 9 轮：重规划 nudge 授权，模型只返回工具调用，但调用全部被 tool:execute:before 钩子阻断：
+    // 运行时跳过工具管道（不会 recordToolCall），只在关闭轮次前写入 roundSummary
+    context.startRound(9);
+    context.expectPlan();
+    context.setRoundSummary({
+      newInfoCount: 0,
+      totalCalls: 1,
+      submits: 0,
+      cumulativeFiles: 0,
+      cumulativePatterns: 0,
+    });
+    context.endRound();
+
+    // 第 10 轮：反思 nudge 的陈述句编号回答不能借用悬挂的授权
+    context.startRound(10);
+    context.setThought(REFLECTION);
+    expect(context.extractAndSetPlan(REFLECTION, 10)).toBe(false);
+
+    expect(planDescriptions(context).join('|')).toContain('FooService');
+    expect(planDescriptions(context).join('|')).not.toContain('最重要的发现');
+    expect(context.getPlanHistory()).toHaveLength(0);
+    const messages = debugMessages(debug);
+    expect(
+      messages.some(
+        (m) =>
+          m.includes('plan authorization expired at end of iteration 9') &&
+          m.includes('1 tool call(s) without recorded action')
+      )
+    ).toBe(true);
+    expect(messages.some((m) => m.includes('plan authorization kept'))).toBe(false);
+    expect(
+      messages.some((m) => m.includes('plan update rejected without authorization at iteration 10'))
+    ).toBe(true);
+  });
+
+  it('expires a carried authorization in a later round whose tool calls are all blocked', () => {
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    // 第 9 轮授权后 LLM 失败重试：没有任何模型响应，授权保留到下一轮
+    context.startRound(9);
+    context.expectPlan();
+    context.endRound();
+
+    // 第 10 轮：模型的工具调用全部被阻断 —— 这是对授权的响应，授权在本轮结束时过期
+    context.startRound(10);
+    context.setRoundSummary({ totalCalls: 2 });
+    context.endRound();
+
+    context.startRound(11);
+    context.setThought(REFLECTION);
+    expect(context.extractAndSetPlan(REFLECTION, 11)).toBe(false);
+    expect(planDescriptions(context).join('|')).toContain('FooService');
+  });
+
+  it('keeps authorization when the round summary reports no tool calls or was written before the grant', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const context = new ActiveContext();
+    expect(context.extractAndSetPlan(PLAN, 1)).toBe(true);
+
+    // 对照：授权之前已写入的摘要、或 totalCalls 为 0 的摘要都不算模型对授权的响应
+    context.startRound(9);
+    context.setRoundSummary({ totalCalls: 3 });
+    context.expectPlan();
+    context.endRound();
+
+    context.startRound(10);
+    context.setRoundSummary({ totalCalls: 0 });
+    context.endRound();
+
+    context.startRound(11);
+    context.setThought(REPLAN);
+    expect(context.extractAndSetPlan(REPLAN, 11)).toBe(true);
+    expect(planDescriptions(context)).toEqual([
+      '直接提交 FooService 相关候选',
+      '输出 dimensionDigest 收尾',
+    ]);
+    const messages = debugMessages(debug);
+    expect(messages.filter((m) => m.includes('plan authorization kept'))).toHaveLength(2);
+    expect(messages.some((m) => m.includes('plan authorization expired'))).toBe(false);
+  });
+
   it('does not leak a pending authorization across clear()', () => {
     const context = new ActiveContext();
     context.setPlan(PLAN, 1);

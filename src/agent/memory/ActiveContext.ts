@@ -749,6 +749,8 @@ interface Plan {
  * 悬挂到若干轮之后，被反思 nudge 的陈述句编号回答借用来覆盖计划：
  *   - extractAndSetPlan 入口一次性消费，无论这次文本能否解析出计划；
  *   - 授权轮里模型只返回工具调用（运行时不调用 extractAndSetPlan）时，在 endRound 过期；
+ *     工具调用全部被 tool:execute:before 钩子阻断时运行时跳过工具管道、不写 actions，
+ *     只在关闭轮次前写入 roundSummary（totalCalls>0），同样视为模型已响应；
  *   - 该轮完全没有模型响应（LLM 失败后重试）时保留到下一轮，重试的回答仍可更新计划。
  * 授权只存在于内存，不进入 toJSON 快照；clear() 一并清除。
  */
@@ -756,9 +758,10 @@ interface PlanAuthorization {
   /** 授权发出时的活动轮次；在轮次之外授权时为 null，只靠一次性消费约束 */
   round: Round | null;
   iteration: number | null;
-  /** 授权发出时该轮已有的动作数与思考文本，用来只统计授权之后的模型响应 */
+  /** 授权发出时该轮已有的动作数、思考文本与轮次摘要，用来只统计授权之后的模型响应 */
   actionsAtGrant: number;
   thoughtAtGrant: string | null;
+  roundSummaryAtGrant: RoundSummary | null;
 }
 
 /** 计划文本解析被拒绝的原因（只用于诊断日志） */
@@ -1195,6 +1198,7 @@ export class ActiveContext {
       iteration: round?.iteration ?? null,
       actionsAtGrant: round?.actions.length ?? 0,
       thoughtAtGrant: round?.thought ?? null,
+      roundSummaryAtGrant: round?.roundSummary ?? null,
     };
     this.#debugPlan(
       round
@@ -2157,6 +2161,11 @@ export class ActiveContext {
   /**
    * 轮次结束时结算计划授权：授权后模型已经响应（工具调用或文本）却没有消费授权，说明这次响应
    * 不是计划，授权就此过期；该轮没有任何模型响应（LLM 失败重试）时保留给下一次响应。
+   *
+   * 工具调用响应有两个信号：已记录的 actions（经工具管道的 traceRecord 写入），以及授权之后
+   * 写入且 totalCalls>0 的 roundSummary。后者覆盖调用全部被 tool:execute:before 钩子阻断、
+   * 运行时跳过工具管道而不写 actions 的轮次；LLM 失败/重试/提前退出的轮次不会写 roundSummary，
+   * 因此不会被误判为已响应。
    */
   #settlePlanAuthorizationAtRoundEnd(round: Round) {
     const authorization = this.#planAuthorization;
@@ -2166,14 +2175,32 @@ export class ActiveContext {
     const isGrantRound = authorization.round === round;
     const baselineActions = isGrantRound ? authorization.actionsAtGrant : 0;
     const baselineThought = isGrantRound ? authorization.thoughtAtGrant : null;
+    const baselineSummary = isGrantRound ? authorization.roundSummaryAtGrant : null;
     const newActions = round.actions.length - baselineActions;
     const respondedWithText = round.thought !== null && round.thought !== baselineThought;
-    if (newActions > 0 || respondedWithText) {
+    // 授权之前已存在的摘要不算对授权的响应（与 actions/thought 的基线语义一致）
+    const summaryCalls =
+      round.roundSummary !== null && round.roundSummary !== baselineSummary
+        ? round.roundSummary.totalCalls
+        : undefined;
+    const unrecordedToolCalls =
+      typeof summaryCalls === 'number' && summaryCalls > 0 ? summaryCalls : 0;
+    if (newActions > 0 || respondedWithText || unrecordedToolCalls > 0) {
       this.#planAuthorization = null;
+      let response: string;
+      if (newActions > 0) {
+        response = `${newActions} tool action(s)`;
+      } else if (respondedWithText) {
+        response = 'text';
+      } else {
+        response =
+          `${unrecordedToolCalls} tool call(s) without recorded action ` +
+          '(e.g. blocked by tool:execute:before)';
+      }
       this.#debugPlan(
         `plan authorization expired at end of iteration ${round.iteration} ` +
           `(granted at iteration ${authorization.iteration ?? 'n/a'}): model responded with ` +
-          `${newActions > 0 ? `${newActions} tool action(s)` : 'text'} and no plan was extracted; ` +
+          `${response} and no plan was extracted; ` +
           'later list responses are treated as unauthorized'
       );
       return;
