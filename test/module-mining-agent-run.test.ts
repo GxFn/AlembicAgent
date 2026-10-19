@@ -1,4 +1,5 @@
 import { buildCanonicalCoverageLedgerModuleId } from '@alembic/core/host-agent-workflows';
+import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BUILTIN_PROFILES } from '../src/agent/profiles/definitions/index.js';
 import { SCOPED_MODULE_MINING_PROFILES } from '../src/agent/profiles/definitions/module-mining/ScopedModuleMiningProfile.js';
@@ -100,11 +101,12 @@ describe('runModuleMining', () => {
       expect(execution.metadata.dimension).toBeUndefined();
       expect(execution.metadata.dimensionId).toBeUndefined();
       expect(execution.metadata.dimId).toBeUndefined();
+      // L8-C04：宿主 budget 只作为提示字段经 promptContext 到达 child，不进入 runtime budgetOverride。
       expect(execution.metadata.context).toMatchObject({
         budget,
         ownedFiles: expect.any(Array),
       });
-      expect(execution.options?.budgetOverride).toBe(budget);
+      expect(execution.options?.budgetOverride).toBeUndefined();
       expect(execution.options?.sharedState).toBeUndefined();
     }
   });
@@ -161,7 +163,9 @@ describe('runModuleMining', () => {
     expect(executions).toHaveLength(0);
   });
 
-  it('applies scaleCap before child creation while preserving full per-child budget', async () => {
+  // L8-C04（方案 a）：宿主 budget 不约束 child。child 是 pipeline 策略，真正生效的是各阶段
+  // budget 与按模块规模算出的 strategyContext._computedBudget；宿主 budget 只作为提示字段到达 child。
+  it('applies scaleCap before child creation and hands the host budget to children only as a prompt hint', async () => {
     const executions: RuntimeExecution[] = [];
     const budget = { analystTokens: 12_000, totalRecipeBudget: 8 };
 
@@ -183,11 +187,120 @@ describe('runModuleMining', () => {
       'module-1',
       'module-2',
     ]);
-    expect(executions.map((execution) => execution.options?.budgetOverride)).toEqual([
+    for (const execution of executions) {
+      // 宿主 budget 不进入 child runtime 的 budgetOverride（旧测试只断言了这里的透传，形成假保证）。
+      expect(execution.options?.budgetOverride).toBeUndefined();
+      // 提示通道：promptContext.budget 原样到达 child。
+      expect((execution.metadata.context as Record<string, unknown>).budget).toBe(budget);
+      // child 实际预算来源：按模块规模计算的 _computedBudget，与宿主 budget 无关。
+      const strategyContext = (execution.options?.strategyContext ?? {}) as Record<string, unknown>;
+      const computedBudget = strategyContext._computedBudget as Record<string, unknown> | undefined;
+      expect(typeof computedBudget?.maxIterations).toBe('number');
+      expect(computedBudget).not.toHaveProperty('totalRecipeBudget');
+      expect(computedBudget).not.toHaveProperty('analystTokens');
+    }
+  });
+});
+
+describe('runModuleMining host budget semantics (L8-C04)', () => {
+  const threeModules = [
+    { moduleId: 'core', moduleName: 'Core', ownedFiles: ['src/core.ts'] },
+    { moduleId: 'ui', moduleName: 'UI', ownedFiles: ['src/ui.ts'] },
+    { moduleId: 'cli', moduleName: 'CLI', ownedFiles: ['src/cli.ts'] },
+  ];
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function hostBudgetWarnings(warn: { mock: { calls: unknown[][] } }) {
+    return warn.mock.calls.filter((call) => String(call[0]).includes('host budget not enforced'));
+  }
+
+  it('keeps the host budget out of execution and records one host budget not enforced diagnostic', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const budget = { contentMaxLines: 120, maxFiles: 40 };
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput) => {
+      calls.push(input);
+      return successRunResult();
+    });
+
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts: { project: 'rescan' },
       budget,
-      budget,
-      budget,
-    ]);
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.execution).not.toHaveProperty('budgetOverride');
+    // 提示通道保持不变。
+    expect(calls[0]?.params?.budget).toBe(budget);
+    expect(calls[0]?.context.promptContext?.budget).toBe(budget);
+
+    const warnings = hostBudgetWarnings(warn);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.[1]).toMatchObject({
+      ignoredFields: ['contentMaxLines', 'maxFiles'],
+      moduleCount: 3,
+      hintChannels: ['params.budget', 'promptContext.budget'],
+    });
+  });
+
+  it('records the diagnostic once per run, not once per child, on the real fan-out path', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const executions: RuntimeExecution[] = [];
+
+    await runModuleMining({
+      agentService: createService(executions),
+      modules: threeModules,
+      projectFacts: { project: 'plan' },
+      budget: { totalRecipeBudget: 6 },
+    });
+
+    expect(executions).toHaveLength(3);
+    for (const execution of executions) {
+      expect(execution.options?.budgetOverride).toBeUndefined();
+    }
+    const warnings = hostBudgetWarnings(warn);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.[1]).toMatchObject({ ignoredFields: ['totalRecipeBudget'] });
+  });
+
+  it('records no host budget diagnostic when the host passes no budget', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput) => {
+      calls.push(input);
+      return successRunResult();
+    });
+
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts: { project: 'no-budget' },
+    });
+
+    expect(calls[0]?.params).not.toHaveProperty('budget');
+    expect(calls[0]?.execution).not.toHaveProperty('budgetOverride');
+    expect(hostBudgetWarnings(warn)).toHaveLength(0);
+  });
+
+  it('does not record the diagnostic when module input is rejected before any run', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const run = vi.fn(async () => successRunResult());
+
+    await expect(
+      runModuleMining({
+        agentService: { run },
+        modules: [],
+        projectFacts: {},
+        budget: { totalRecipeBudget: 1 },
+      })
+    ).rejects.toThrow(/at least one ProjectContext module/u);
+    expect(run).not.toHaveBeenCalled();
+    expect(hostBudgetWarnings(warn)).toHaveLength(0);
   });
 });
 
@@ -354,6 +467,7 @@ describe('runModuleMining cancellation and deadline signals', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   it('starts no child and fails with an aborted partial result when the signal is already aborted', async () => {
@@ -471,7 +585,9 @@ describe('runModuleMining cancellation and deadline signals', () => {
     expect(executions[0]?.options?.timeoutMs).toBe(45_000);
   });
 
-  it('keeps the parent execution exactly as before when no signal is passed', async () => {
+  // L8-C04 起宿主 budget 不再进入 execution；不传信号时父 execution 恒为空对象，键形状不变。
+  it('keeps the parent execution empty with a stable input shape when no signal is passed', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const budget = { analystTokens: 9000, totalRecipeBudget: 6 };
     const calls: AgentRunInput[] = [];
     const run = vi.fn(async (input: AgentRunInput) => {
@@ -491,8 +607,7 @@ describe('runModuleMining cancellation and deadline signals', () => {
       projectFacts: { project: 'regression-no-budget' },
     });
 
-    expect(calls[0]?.execution).toEqual({ budgetOverride: budget });
-    expect(Object.keys(calls[0]?.execution ?? {})).toEqual(['budgetOverride']);
+    expect(calls[0]?.execution).toEqual({});
     expect(calls[1]?.execution).toEqual({});
     expect(Object.keys(calls[0] ?? {})).toEqual([
       'profile',
@@ -505,6 +620,7 @@ describe('runModuleMining cancellation and deadline signals', () => {
   });
 
   it('merges the three signals into the parent execution without leaking them into params', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const budget = { totalRecipeBudget: 2 };
     const controller = new AbortController();
     const shouldAbort = () => false;
@@ -524,12 +640,13 @@ describe('runModuleMining cancellation and deadline signals', () => {
       timeoutMs: 30_000,
     });
 
+    // 宿主 budget 只在 params/promptContext（L8-C04），execution 只含三个信号。
     expect(calls[0]?.execution).toEqual({
-      budgetOverride: budget,
       abortSignal: controller.signal,
       shouldAbort,
       timeoutMs: 30_000,
     });
+    expect(calls[0]?.params?.budget).toBe(budget);
     expect(calls[0]?.execution?.abortSignal).toBe(controller.signal);
     expect(calls[0]?.execution?.shouldAbort).toBe(shouldAbort);
     expect(calls[0]?.params).not.toHaveProperty('abortSignal');
@@ -540,7 +657,7 @@ describe('runModuleMining cancellation and deadline signals', () => {
 
 // L8-C18：module-mining-session 总是走协调器，父 run 从不进入模型循环，child content 也不继承父
 // content。父 message.content 只保留简短任务描述；projectFacts/budget 不再序列化进 content，
-// 但仍必须经 params / promptContext / execution 原样传给 partitioner 与 child。
+// 但仍必须经 params / promptContext 原样传给 partitioner 与 child（budget 不进 execution，见 L8-C04）。
 describe('runModuleMining parent message content (L8-C18)', () => {
   const threeModules = [
     { moduleId: 'core', moduleName: 'Core', ownedFiles: ['src/core.ts'] },
@@ -582,12 +699,12 @@ describe('runModuleMining parent message content (L8-C18)', () => {
     expect(content).not.toContain('完整 analyst budget');
     expect(content.length).toBeLessThan(400);
 
-    // projectFacts / budget 的传递通道保持不变。
+    // projectFacts / budget 的提示通道保持不变；budget 不作为 runtime budgetOverride（L8-C04）。
     expect(parent?.params?.projectFacts).toBe(projectFacts);
     expect(parent?.params?.budget).toBe(budget);
     expect(parent?.context.promptContext?.projectFacts).toBe(projectFacts);
     expect(parent?.context.promptContext?.budget).toBe(budget);
-    expect(parent?.execution?.budgetOverride).toBe(budget);
+    expect(parent?.execution).not.toHaveProperty('budgetOverride');
     expect(parent?.message.metadata).toEqual({
       task: 'module-mining',
       generationStage: 'moduleMining',
