@@ -346,3 +346,157 @@ describe('code.outline availability follows the outlineFile port (I16)', () => {
     expect(reasonFor(snapshot)).toBe('outlineFile is unavailable');
   });
 });
+
+describe('outline port shape violations and defaulted fields are logged (I16 audit C031/C032)', () => {
+  const outlineWarnings = (warn: ReturnType<typeof vi.spyOn>) =>
+    warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes('[code.outline]'));
+
+  it('warns once when outlineFile returns a non-array shape and still reports no-definitions', async () => {
+    const root = await project('shape-object');
+    for (const [label, value] of [
+      ['object', { definitions: DEFINITIONS }],
+      ['string', 'oops'],
+    ] as const) {
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await outline(
+        portContext(root, { outlineFile: vi.fn(async () => value) }),
+        {}
+      );
+      expect(result.ok, label).toBe(false);
+      expect(result.error, label).toContain('returned no definitions');
+      const lines = outlineWarnings(warn);
+      expect(lines, label).toHaveLength(1);
+      expect(lines[0], label).toContain('port=outlineFile');
+      expect(lines[0], label).toContain('non-array');
+      expect(lines[0], label).toContain('treating as no-definitions');
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('does not warn for the legal "no definitions" results null, undefined and []', async () => {
+    const root = await project('shape-legal');
+    for (const value of [null, undefined, []]) {
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await outline(
+        portContext(root, { outlineFile: vi.fn(async () => value) }),
+        {}
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('returned no definitions');
+      expect(outlineWarnings(warn), JSON.stringify(value)).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('warns for a legacy analyzer whose definitions value is not an array, but not when it is absent', async () => {
+    const root = await project('shape-legacy');
+    for (const [label, value, expectWarn] of [
+      ['definitions-string', { definitions: 'x' }, true],
+      ['primitive', 'oops', true],
+      ['no-definitions-key', {}, false],
+      ['null-result', null, false],
+    ] as const) {
+      const logger = Logger.getInstance();
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const result = await outline(
+        {
+          projectRoot: root,
+          tokenBudget: 5000,
+          astAnalyzer: { analyzeFile: vi.fn(async () => value) },
+        },
+        {}
+      );
+      expect(result.ok, label).toBe(false);
+      expect(result.error, label).toContain('returned no definitions');
+      const lines = outlineWarnings(warn);
+      if (expectWarn) {
+        expect(lines, label).toHaveLength(1);
+        expect(lines[0], label).toContain('port=legacy-astAnalyzer');
+        expect(lines[0], label).toContain('non-array');
+      } else {
+        expect(lines, label).toEqual([]);
+      }
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps code.read on head-tail with reason no-definitions and the same shape warning', async () => {
+    const root = await project('shape-read');
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const ctx = portContext(root, {
+      outlineFile: vi.fn(async () => ({ definitions: DEFINITIONS })),
+    });
+    const batch = await new ToolRouter().execute(
+      { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
+      ctx
+    );
+    const files = (batch.data as { files: Array<Record<string, unknown>> }).files;
+    expect(files[0]).toMatchObject({ outlineSource: 'head-tail', outlineReason: 'no-definitions' });
+    const lines = outlineWarnings(warn);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('port=outlineFile');
+    expect(lines[0]).toContain('non-array');
+  });
+
+  it('logs invalid optional fields that fall back to defaults without changing the outline', async () => {
+    const root = await project('defaulted');
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const ctx = portContext(root, {
+      outlineFile: vi.fn(async () => [
+        { name: 'Widget', kind: 'class', startLine: 1, endLine: 400, depth: 0 },
+        { name: 'nestedStr', kind: 'method', startLine: 10, endLine: 50, depth: '1' },
+        { name: 'endBefore', kind: 'method', startLine: 60, endLine: 2, depth: 1 },
+        { name: 'emptySig', kind: 'function', startLine: 500, signature: '   ', depth: -1 },
+      ]),
+    });
+    const result = await outline(ctx, { maxDepth: 1 });
+    expect(result.ok).toBe(true);
+    const text = String(result.data);
+    // 合同语义不变：不合法 depth 按缺省 0（顶层）参与 maxDepth 过滤，不合法 endLine/signature 按缺省展示。
+    expect(text).toContain('filter maxDepth=1: showing 3 of 4 definitions');
+    expect(text).toContain('nestedStr [10-50]');
+    expect(text).toContain('emptySig [500]');
+    expect(text).not.toContain('endBefore');
+    const lines = outlineWarnings(warn);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('port=outlineFile');
+    expect(lines[0]).toContain('defaulted');
+    expect(lines[0]).toContain('endLine=1');
+    expect(lines[0]).toContain('signature=1');
+    expect(lines[0]).toContain('depth=2');
+    expect(lines[0]).toContain('of 4 definitions');
+
+    const unfiltered = String((await outline(ctx, {})).data);
+    expect(unfiltered).toContain('  endBefore [60]');
+  });
+
+  it('does not log defaulted fields when every optional field is valid or absent', async () => {
+    const root = await project('defaulted-clean');
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const result = await outline(
+      portContext(root, {
+        outlineFile: vi.fn(async () => [
+          ...DEFINITIONS,
+          {
+            name: 'nulls',
+            kind: 'function',
+            startLine: 450,
+            endLine: null,
+            signature: null,
+            depth: null,
+          },
+        ]),
+      }),
+      {}
+    );
+    expect(result.ok).toBe(true);
+    expect(outlineWarnings(warn)).toEqual([]);
+  });
+});

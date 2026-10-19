@@ -1851,26 +1851,79 @@ function resolveOutlinePort(
     port: 'legacy-astAnalyzer',
     run: async () => {
       // 兼容转译：旧鸭子类型返回 { definitions }，这里取出数组交给统一的逐条校验。
+      // null/undefined 结果或缺省的 definitions 是合法的“无定义”；原始值结果（字符串、数字等）
+      // 原样交出，由 normalizeOutlineDefinitions 判为形状违约并记 warn，不在这里静默吞成 null。
       const result = await analyzeFile.call(legacy, absPath);
-      if (result === null || typeof result !== 'object') {
+      if (result === null || result === undefined) {
         return null;
+      }
+      if (typeof result !== 'object') {
+        return result;
       }
       return (result as { definitions?: unknown }).definitions ?? null;
     },
   };
 }
 
+/** 可选字段“给了但不合法、已按缺省处理”的逐字段计数（只统计保留下来的条目）。 */
+interface OutlineDefaultedCounts {
+  endLine: number;
+  signature: number;
+  depth: number;
+}
+
 /**
- * 端口返回值是宿主数据，进入大纲前逐条校验（I16）：非数组按“无定义”处理；name/kind 非空字符串、
- * startLine 正整数的条目才保留；可选字段不合法时按缺省处理（endLine 早于 startLine 视同缺省）。
+ * 端口返回值的归一结果（I16 审计 C031/C032）：
+ * - none：null/undefined，kernel 契约中的合法“无定义”；
+ * - shape-violation：既不是数组也不是 null/undefined（例如旧 { definitions } 形状或字符串），
+ *   属于宿主契约违约，调用方记 warn 后仍按 no-definitions 归类；
+ * - list：逐条校验后的定义，附带被丢弃条数与按缺省处理的可选字段计数。
  */
-function normalizeOutlineDefinitions(
-  raw: unknown
-): { definitions: OutlineDefinition[]; dropped: number } | null {
+type NormalizedOutlineDefinitions =
+  | { kind: 'none' }
+  | { kind: 'shape-violation'; shape: string }
+  | {
+      kind: 'list';
+      definitions: OutlineDefinition[];
+      dropped: number;
+      defaulted: OutlineDefaultedCounts;
+    };
+
+/** 形状违约日志里的简短形状描述；宿主对象读键失败时退回 'object (keys unreadable)'，不抛出。 */
+function describeOutlineShape(raw: unknown): string {
+  if (typeof raw !== 'object' || raw === null) {
+    return typeof raw;
+  }
+  try {
+    const keys = Object.keys(raw);
+    const shown = keys.slice(0, 5).join(',');
+    return `object with keys [${shown}${keys.length > 5 ? ',...' : ''}]`;
+  } catch (err: unknown) {
+    void err;
+    return 'object (keys unreadable)';
+  }
+}
+
+/** 可选字段是否“给了值”：undefined/null 视同未给（合法缺省），不计入 defaulted。 */
+function isProvided(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
+/**
+ * 端口返回值是宿主数据，进入大纲前逐条校验（I16）：null/undefined 是合法“无定义”；其他非数组
+ * 是宿主契约违约，返回 shape-violation 由调用方记 warn 后按“无定义”处理；name/kind 非空字符串、
+ * startLine 正整数的条目才保留；可选字段不合法时按缺省处理（endLine 早于 startLine 视同缺省），
+ * 并按字段计数交给调用方记 warn。
+ */
+function normalizeOutlineDefinitions(raw: unknown): NormalizedOutlineDefinitions {
+  if (raw === null || raw === undefined) {
+    return { kind: 'none' };
+  }
   if (!Array.isArray(raw)) {
-    return null;
+    return { kind: 'shape-violation', shape: describeOutlineShape(raw) };
   }
   const definitions: OutlineDefinition[] = [];
+  const defaulted: OutlineDefaultedCounts = { endLine: 0, signature: 0, depth: 0 };
   let dropped = 0;
   for (const entry of raw) {
     if (entry === null || typeof entry !== 'object') {
@@ -1891,18 +1944,30 @@ function normalizeOutlineDefinitions(
       dropped++;
       continue;
     }
+    const validEndLine =
+      typeof endLine === 'number' && Number.isSafeInteger(endLine) && endLine >= startLine;
+    const validSignature = typeof signature === 'string' && signature.trim() !== '';
+    const validDepth = typeof depth === 'number' && Number.isSafeInteger(depth) && depth >= 0;
+    // 缺省化本身是 kernel 契约允许的行为；这里只计数“给了但不合法”的字段，供调用方记诊断。
+    if (!validEndLine && isProvided(endLine)) {
+      defaulted.endLine++;
+    }
+    if (!validSignature && isProvided(signature)) {
+      defaulted.signature++;
+    }
+    if (!validDepth && isProvided(depth)) {
+      defaulted.depth++;
+    }
     definitions.push({
       name,
       kind,
       startLine,
-      ...(typeof endLine === 'number' && Number.isSafeInteger(endLine) && endLine >= startLine
-        ? { endLine }
-        : {}),
-      ...(typeof signature === 'string' && signature.trim() !== '' ? { signature } : {}),
-      ...(typeof depth === 'number' && Number.isSafeInteger(depth) && depth >= 0 ? { depth } : {}),
+      ...(validEndLine ? { endLine } : {}),
+      ...(validSignature ? { signature } : {}),
+      ...(validDepth ? { depth } : {}),
     });
   }
-  return { definitions, dropped };
+  return { kind: 'list', definitions, dropped, defaulted };
 }
 
 function outlineFilterLabel(filter: OutlineFilter): string {
@@ -1958,7 +2023,26 @@ async function buildAstOutline(
     };
   }
   const normalized = normalizeOutlineDefinitions(raw);
-  if (normalized && normalized.dropped > 0) {
+  if (normalized.kind === 'shape-violation') {
+    // 宿主契约违约（整体不是数组，例如旧 { definitions } 形状）：归类仍按 P36 决策记 no-definitions，
+    // 但记 warn 带端口与形状，避免和合法的 null/[]“无定义”在结果与日志上无法区分。
+    const contract =
+      resolvedPort.port === 'outlineFile'
+        ? 'host adapter must return OutlineDefinition[] | null'
+        : 'legacy analyzeFile must resolve { definitions?: OutlineDefinition[] }';
+    const message =
+      `[code.outline] path=${relPath}; port=${resolvedPort.port} returned non-array outline data ` +
+      `(${normalized.shape}); treating as no-definitions (${contract})`;
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+    return { kind: 'unavailable', reason: 'no-definitions' };
+  }
+  if (normalized.kind === 'none') {
+    return { kind: 'unavailable', reason: 'no-definitions' };
+  }
+  if (normalized.dropped > 0) {
     // 宿主适配器给出了不合格条目：属于宿主侧缺陷，记 warn 并带计数，合格条目照常展示。
     const message =
       `[code.outline] path=${relPath}; port=${resolvedPort.port} dropped=${normalized.dropped} of ` +
@@ -1969,7 +2053,22 @@ async function buildAstOutline(
       () => undefined
     );
   }
-  if (!normalized || normalized.definitions.length === 0) {
+  const { defaulted } = normalized;
+  if (defaulted.endLine + defaulted.signature + defaulted.depth > 0) {
+    // 可选字段不合法时按缺省处理（kernel 契约）：展示与过滤语义不变，但这是宿主侧缺陷的降级路径，
+    // 记 warn 并按字段计数；depth 缺省为 0，会让该条目在 maxDepth 过滤里按顶层保留。
+    const message =
+      `[code.outline] path=${relPath}; port=${resolvedPort.port} defaulted invalid optional fields ` +
+      `endLine=${defaulted.endLine} signature=${defaulted.signature} depth=${defaulted.depth} ` +
+      `of ${normalized.definitions.length} definitions (endLine must be an integer >= startLine, ` +
+      'signature a non-blank string, depth a non-negative integer; invalid depth falls back to ' +
+      'top-level for maxDepth filtering)';
+    observeSafely(
+      () => Logger.getInstance().warn(message),
+      () => undefined
+    );
+  }
+  if (normalized.definitions.length === 0) {
     return { kind: 'unavailable', reason: 'no-definitions' };
   }
   const definitions = normalized.definitions;

@@ -113,7 +113,7 @@ export interface ToolResult {
 /**
  * AST 大纲中的一条声明，由宿主的 {@link ToolContext.outlineFile} 适配 Core 摘要后给出。
  * 宿主数据进入 handler 前会逐条校验：name/kind 非空字符串、startLine 正整数，否则丢弃并记日志；
- * 可选字段不合法时按缺省处理。
+ * 可选字段不合法时按缺省处理并按字段计数记日志。
  */
 export interface OutlineDefinition {
   name: string;
@@ -190,14 +190,16 @@ export interface ToolContext {
   proposalGateway?: unknown;
 
   /**
-   * AST 大纲端口（L4-P36 / I16，待决事项⑤已定：Agent 声明端口、宿主适配）。code.outline 与
-   * >500 行 code.read 的骨架优先经由这里取得（下方 astAnalyzer 只是缺省时的已弃用兼容入口）；
-   * availability 只按本端口广告 code.outline。
+   * AST 大纲端口（L4-P36 / I16）。全局待决事项⑤（严格契约库归属）仍未答复；本端口按用户批准的
+   * L4-P36 推荐方向（Agent 声明端口、宿主适配）先落地 Agent 侧，宿主 outlineFile 适配待总控跨仓派发。
+   * code.outline 与 >500 行 code.read 的骨架优先经由这里取得（下方 astAnalyzer 只是缺省时的已弃用
+   * 兼容入口）；availability 只按本端口广告 code.outline。
    *
    * - absPath 是已通过项目根校验的绝对路径，relPath 是项目相对路径（用于按扩展名映射语言与日志）；
    * - 宿主负责读源码、按扩展名映射 lang、调用 Core analyzeFile(source, lang)，再把类/方法等适配成
    *   OutlineDefinition[]；Core 不为此新增端口，Agent 也不猜测 Core 摘要的形状；
    * - 语言不支持或文件没有可列出的声明返回 null 或空数组（handler 记为 no-definitions）；
+   *   返回其他非数组值属于契约违约，handler 记 warn（带端口与形状）后同样按 no-definitions 归类；
    *   解析异常直接抛错（handler 记为 analyzer-error 并带错误类名），不要吞成 null。
    */
   outlineFile?: (absPath: string, relPath: string) => Promise<OutlineDefinition[] | null>;
@@ -208,7 +210,7 @@ export interface ToolContext {
    * 不再据此广告 code.outline；handler 只在 outlineFile 缺省时把它当兼容入口调用并记日志。
    * 消费者：仍按旧鸭子类型注入的宿主/测试夹具（唯一生产宿主 ToolContextFactory 透传 tryGet 结果，
    * 实际恒为 undefined）。移除条件：宿主改为注册 outlineFile 并停止透传本字段后，删除本字段与
-   * code handler 的 legacy-astAnalyzer 分支（类型收窄随待决事项⑤的后续收尾，由 AlembicAgent 负责）。
+   * code handler 的 legacy-astAnalyzer 分支（类型收窄待全局待决事项⑤答复后收尾，由 AlembicAgent 负责）。
    */
   astAnalyzer?: unknown;
 
