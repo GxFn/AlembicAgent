@@ -282,10 +282,13 @@ export function buildRecordRepairPrompt({
     emptyGrounded: '- （无已读取接地的文件；只能引用下方已有发现与证据摘要中的台账来源）',
     emptyLegacy: '- （无显式文件清单，请只使用分析正文中出现的文件路径）',
   });
-  // 只有区分了接地的新工件才渲染「仅提及」段；旧工件不引用不存在的段落。
-  const mentionedOnlyRule = fileSets.legacyUngrounded
-    ? ''
-    : '\n- 「仅提及、未读取」的路径只是正文提及或搜索命中，不是证据，不得作为发现的来源';
+  // 规则只引用实际渲染的段：「仅提及」段只在新工件且确有仅提及路径时渲染(renderPromptFileSections)。
+  // 旧工件没有该段；新工件引用全部接地时该段也被省略——两种情形都不出这条规则，避免悬空引用。
+  // 无 evidenceMap 时「正文中仅提及的路径不可作为来源」仍由 noEvidenceMapNote 兜底。
+  const mentionedOnlyRule =
+    fileSets.legacyUngrounded || fileSets.mentionedOnly.length === 0
+      ? ''
+      : '\n- 「仅提及、未读取」的路径只是正文提及或搜索命中，不是证据，不得作为发现的来源';
   // 无 evidenceMap(V1 报告)时：区分了接地的工件不能再让模型「用正文里的路径」——正文含仅提及路径；
   // 旧工件保持原口径。
   const noEvidenceMapNote = fileSets.legacyUngrounded
@@ -353,9 +356,13 @@ export function buildSummaryRewritePrompt(options: {
   });
   // 硬性规则里的文件清单名与实际渲染的段落一致：新工件=已读取接地的文件，旧工件=引用文件。
   const fileListName = fileSets.legacyUngrounded ? '引用文件' : '已读取接地的文件';
+  // 新工件的接地规则同样只点名实际渲染的段：有仅提及路径时连同「仅提及、未读取」清单一起约束；
+  // 引用全部接地时该段不渲染，规则只约束上一稿正文里的未接地路径(正文仍可能含提及/搜索命中路径)。
+  const ungroundedSources =
+    fileSets.mentionedOnly.length > 0 ? '上一稿正文或「仅提及、未读取」清单里' : '上一稿正文里';
   const groundingRule = fileSets.legacyUngrounded
     ? ''
-    : '\n- 上一稿正文或「仅提及、未读取」清单里出现、但不在「已读取接地的文件」清单中的路径不得作为 (来源: …)';
+    : `\n- ${ungroundedSources}出现、但不在「已读取接地的文件」清单中的路径不得作为 (来源: …)`;
   const prevText = String(record.analysisText || '').slice(0, 2000);
 
   return `QualityGate 判定你的探索证据已经达标（${findings.length} 条已验证发现），唯一不通过的是分析写作本身。

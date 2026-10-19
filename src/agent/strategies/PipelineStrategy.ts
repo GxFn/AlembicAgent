@@ -1670,48 +1670,114 @@ export class PipelineStrategy extends Strategy {
     return record.recorded === true && record.target === 'activeContext';
   }
 
+  /**
+   * record_repair 微阶段的证据路径：经 context.recordRepairEvidencePaths / sharedState 进入 provider 可见的
+   * evidenceContext(recordRepairEvidencePaths 行，并入 deterministicEvidenceRefs「证据已存在」提示)
+   * 与 PCV repair.evidencePaths。
+   *
+   * C54(P21r3)：与 insightGate 修复提示同一可引用口径——
+   * - 工件带 groundedFiles 数组 → 只投影接地集合 G = groundedFiles ∪ 有 codeSnippets 的 evidenceMap 文件。
+   *   referencedFiles 里的仅提及路径、无片段的 evidenceMap 文件、findings.evidence 里抽出的未接地路径
+   *   一律不再进入(提示把它们列为「禁止引用」，这里再列成证据路径会给模型互相矛盾的信号)。
+   *   findings 抽出的路径只有命中 G 才保留，而命中者已在 G 中，因此接地分支直接返回 G；
+   *   G 为空时也不回退 referencedFiles(与提示的 no-grounded 口径一致)。
+   * - 无 groundedFiles 数组(宿主旧工件，无法区分提及与接地) → 保留旧口径：referencedFiles ∪ evidenceMap
+   *   全部 key ∪ findings 路径，并打 legacy 回退日志。
+   * 两条路径都打 info 日志，口径与 insightGate 的 path=grounded/legacy-referenced-files 对齐。
+   */
   #extractRecordRepairEvidencePaths(artifact: unknown) {
-    const paths = new Set<string>();
     const record = artifact as
       | {
           referencedFiles?: unknown;
+          groundedFiles?: unknown;
           evidenceMap?: unknown;
           findings?: Array<{ evidence?: unknown }>;
         }
       | null
       | undefined;
-    if (Array.isArray(record?.referencedFiles)) {
-      for (const path of record.referencedFiles) {
+    const referenced = this.#collectTrimmedPaths(
+      Array.isArray(record?.referencedFiles) ? record.referencedFiles : []
+    );
+    const evidenceEntries = this.#recordRepairEvidenceMapEntries(record?.evidenceMap);
+    const findingPaths = this.#recordRepairFindingPaths(record?.findings);
+
+    if (Array.isArray(record?.groundedFiles)) {
+      const grounded = new Set(this.#collectTrimmedPaths(record.groundedFiles));
+      for (const [path, entry] of evidenceEntries) {
+        const snippets = (entry as { codeSnippets?: unknown } | null | undefined)?.codeSnippets;
+        if (Array.isArray(snippets) && snippets.length > 0) {
+          grounded.add(path);
+        }
+      }
+      // 只为诊断计数：旧口径会投影、但因未接地被丢弃的路径。
+      const dropped = new Set(
+        [...referenced, ...evidenceEntries.map(([path]) => path), ...findingPaths].filter(
+          (path) => !grounded.has(path)
+        )
+      );
+      _pipelineLogger().info(
+        `[PipelineStrategy] record_repair evidence paths: projecting grounded files only ` +
+          `(path=${grounded.size > 0 ? 'grounded' : 'no-grounded'}; grounded=${grounded.size}; ` +
+          `droppedUngrounded=${dropped.size}; referenced=${referenced.length})`
+      );
+      return [...grounded];
+    }
+
+    _pipelineLogger().info(
+      `[PipelineStrategy] record_repair evidence paths: legacy artifact without groundedFiles, ` +
+        `falling back to referencedFiles (path=legacy-referenced-files; referenced=${referenced.length}; ` +
+        `evidenceMapKeys=${evidenceEntries.length}; findingPaths=${findingPaths.length})`
+    );
+    return [...new Set([...referenced, ...evidenceEntries.map(([path]) => path), ...findingPaths])];
+  }
+
+  /** 字符串路径去空白后去空；非字符串项丢弃。 */
+  #collectTrimmedPaths(values: unknown[]) {
+    const paths: string[] = [];
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim()) {
+        paths.push(value.trim());
+      }
+    }
+    return paths;
+  }
+
+  /** evidenceMap 兼容 Map(真实工件)与普通对象(序列化/宿主旧形态)两种形态，统一成 [路径, 条目]。 */
+  #recordRepairEvidenceMapEntries(evidenceMap: unknown): Array<[string, unknown]> {
+    const entries: Array<[string, unknown]> = [];
+    if (evidenceMap instanceof Map) {
+      for (const [path, entry] of evidenceMap.entries()) {
         if (typeof path === 'string' && path.trim()) {
-          paths.add(path.trim());
+          entries.push([path.trim(), entry]);
+        }
+      }
+    } else if (evidenceMap && typeof evidenceMap === 'object') {
+      for (const [path, entry] of Object.entries(evidenceMap)) {
+        if (path.trim()) {
+          entries.push([path.trim(), entry]);
         }
       }
     }
-    if (record?.evidenceMap instanceof Map) {
-      for (const path of record.evidenceMap.keys()) {
-        if (typeof path === 'string' && path.trim()) {
-          paths.add(path.trim());
-        }
-      }
-    } else if (record?.evidenceMap && typeof record.evidenceMap === 'object') {
-      for (const path of Object.keys(record.evidenceMap)) {
-        paths.add(path);
-      }
-    }
-    if (Array.isArray(record?.findings)) {
-      for (const finding of record.findings) {
+    return entries;
+  }
+
+  /** findings.evidence(字符串或字符串数组)里正则抽出的文件路径。 */
+  #recordRepairFindingPaths(findings: Array<{ evidence?: unknown }> | undefined) {
+    const paths: string[] = [];
+    if (Array.isArray(findings)) {
+      for (const finding of findings) {
         const evidence =
-          typeof finding.evidence === 'string'
+          typeof finding?.evidence === 'string'
             ? finding.evidence
-            : Array.isArray(finding.evidence)
+            : Array.isArray(finding?.evidence)
               ? finding.evidence.join(', ')
               : '';
         for (const match of evidence.match(/[\w/.-]+\.[A-Za-z0-9]+/g) || []) {
-          paths.add(match);
+          paths.push(match);
         }
       }
     }
-    return [...paths];
+    return paths;
   }
 
   #ensureGateActiveContext(

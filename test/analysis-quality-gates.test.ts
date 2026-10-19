@@ -29,7 +29,14 @@ import {
   buildRetryPrompt,
   buildSummaryRewritePrompt,
 } from '../src/agent/prompts/insightGate.js';
+import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import {
+  buildLlmInputAssembly,
+  createMessageAdapter,
+  LoopContext,
+} from '../src/agent/runtime/index.js';
 import { SystemRunContextFactory } from '../src/agent/service/SystemRunContextFactory.js';
+import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 
 const PASS = { pass: true } as const;
@@ -463,6 +470,31 @@ describe('修复类提示只把已读取接地的文件列为可引用来源 (C5
     expect(prompts.repair).not.toContain('「仅提及、未读取」的路径');
   });
 
+  it('新工件引用全部接地(无仅提及路径)时两份提示的规则不引用未渲染的「仅提及」段 (P21r3)', () => {
+    const artifact = {
+      analysisText: '结论见 src/a.ts:1。',
+      findings: [],
+      referencedFiles: ['src/a.ts'],
+      groundedFiles: ['src/a.ts'],
+    };
+    const prompts = renderBoth(artifact);
+    for (const prompt of Object.values(prompts)) {
+      expect(sectionAfter(prompt, GROUNDED_HEADER)).toBe('- src/a.ts');
+      expect(prompt).not.toContain(MENTIONED_HEADER);
+      expect(prompt).not.toContain('「仅提及、未读取」');
+    }
+    // 上一稿正文仍可能含未接地路径：rewrite 的约束不能随「仅提及」段一起消失，只去掉对该段的引用。
+    expect(prompts.rewrite).toContain(
+      '上一稿正文里出现、但不在「已读取接地的文件」清单中的路径不得作为 (来源: …)'
+    );
+    // 对照：有仅提及路径时段落与规则同时出现。
+    const control = renderBoth(groundedArtifact());
+    for (const prompt of Object.values(control)) {
+      expect(prompt).toContain(MENTIONED_HEADER);
+      expect(prompt).toContain('「仅提及、未读取」');
+    }
+  });
+
   it('来源口径分叉(接地/无接地/旧工件回退)与深度缺口分支都留下可追查的观测日志', () => {
     const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
     try {
@@ -807,5 +839,171 @@ describe('派生 findings 接地与评分口径 (L7-P16/C07)', () => {
     } as Parameters<typeof buildQualityScores>[2];
     const findings = [{ finding: 'A', evidence: 'src/a.ts', importance: 6 }];
     expect(buildQualityScores('text', findings, evidence).scores.evidenceScore).toBe(70);
+  });
+});
+
+describe('record_repair 证据路径只投影接地文件 (P21r3/C54)', () => {
+  const GROUNDED_SNIPPET = { startLine: 1, endLine: 3, content: '1|const ready = true;' };
+
+  /** 驱动真实 PipelineStrategy 走到 record_repair 微阶段，截获该阶段的 reactLoop 入参。 */
+  async function captureRecordRepairStage(artifact: Record<string, unknown>) {
+    let captured: { prompt: string; opts: Record<string, unknown> } | null = null;
+    const runtime = {
+      id: 'record-repair-evidence-paths',
+      async reactLoop(prompt: string, opts: Record<string, unknown>) {
+        const context = (opts.context || {}) as Record<string, unknown>;
+        if (context.pipelinePhase === 'quality_gate_record_repair') {
+          captured = { prompt, opts };
+        }
+        return {
+          reply: 'stage output long enough to be a reply',
+          toolCalls: [],
+          tokenUsage: { input: 1, output: 1 },
+          iterations: 1,
+        };
+      },
+    };
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({
+        action: 'record_repair',
+        pass: false,
+        reason: 'missing note_finding records',
+        artifact,
+      })
+      .mockReturnValue({ action: 'pass', pass: true });
+    await new PipelineStrategy({
+      stages: [{ name: 'analyze' }, { name: 'quality_gate', gate: { evaluator } }],
+    }).execute(runtime, new AgentMessage({ content: 'analyze module' }));
+    expect(captured, 'record_repair micro-stage did not run').not.toBeNull();
+    return captured as unknown as { prompt: string; opts: Record<string, unknown> };
+  }
+
+  /** 把截获的阶段入参交给真实 LLM 输入装配，取 provider 可见的 evidenceContext 段。 */
+  function assembleEvidenceContext(stage: { prompt: string; opts: Record<string, unknown> }) {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage(stage.prompt);
+    const systemPrompt = String(stage.opts.systemPromptOverride || '');
+    const ctx = new LoopContext({
+      allowedToolIds: ['memory', 'evidence'],
+      baseSystemPrompt: systemPrompt,
+      budget: { maxIterations: 3 },
+      capabilities: [],
+      context: stage.opts.context as Record<string, unknown>,
+      sharedState: stage.opts.sharedState as Record<string, unknown>,
+      messages,
+      prompt: stage.prompt,
+      source: 'system',
+      toolSchemas: [],
+    });
+    const assembly = buildLlmInputAssembly({
+      ctx,
+      dynamicContext: null,
+      effectiveToolChoice: 'auto',
+      messages: messages.toMessages(),
+      modelRef: 'unit-model',
+      requestedToolChoice: 'auto',
+      systemPrompt,
+      tools: [],
+    });
+    const section = assembly.sections.find((item) => item.id === 'evidenceContext');
+    const lines = String(section?.content || '').split('\n');
+    return {
+      stageProfile: assembly.stageProfile,
+      providerVisible: section?.providerVisible,
+      pathsLine: lines.find((line) => line.startsWith('recordRepairEvidencePaths:')) || '',
+      refsLine: lines.find((line) => line.startsWith('deterministicEvidenceRefs:')) || '',
+    };
+  }
+
+  it.each([
+    [
+      'plain-object evidenceMap',
+      { 'src/ghost.ts': { codeSnippets: [] }, 'src/good.ts': { codeSnippets: [GROUNDED_SNIPPET] } },
+    ],
+    [
+      'Map evidenceMap',
+      new Map<string, unknown>([
+        ['src/ghost.ts', { filePath: 'src/ghost.ts', codeSnippets: [], summary: 'search hit' }],
+        ['src/good.ts', { filePath: 'src/good.ts', codeSnippets: [GROUNDED_SNIPPET] }],
+      ]),
+    ],
+  ])('仅提及路径不进入 record_repair 的证据路径与 deterministicEvidenceRefs (%s)', async (_label, evidenceMap) => {
+    const stage = await captureRecordRepairStage({
+      analysisText: '结论来自 src/ghost.ts:3，读取确认见 src/good.ts:1。',
+      referencedFiles: ['src/good.ts', 'src/ghost.ts'],
+      groundedFiles: ['src/good.ts'],
+      findings: [{ finding: '提及而未读取', evidence: 'src/ghost.ts:3', importance: 6 }],
+      evidenceMap,
+    });
+    const context = stage.opts.context as Record<string, unknown>;
+    const sharedState = stage.opts.sharedState as Record<string, unknown>;
+    expect(context.recordRepairEvidencePaths).toEqual(['src/good.ts']);
+    expect(sharedState._recordRepairEvidencePaths).toEqual(['src/good.ts']);
+    // 同一轮模型输入里，提示把 ghost 列为禁止引用；证据上下文不得再把它列为证据路径。
+    expect(stage.prompt).toContain('仅提及、未读取（禁止作为引用）:\n- src/ghost.ts');
+
+    const evidence = assembleEvidenceContext(stage);
+    expect(evidence.stageProfile).toBe('record');
+    expect(evidence.providerVisible).toBe(true);
+    expect(evidence.pathsLine).toContain('src/good.ts');
+    expect(evidence.pathsLine).not.toContain('src/ghost.ts');
+    expect(evidence.refsLine).toContain('src/good.ts');
+    expect(evidence.refsLine).not.toContain('src/ghost.ts');
+  });
+
+  it('有片段的 evidenceMap 文件即使不在 groundedFiles 里也算接地；groundedFiles 为空数组时不回退 referencedFiles', async () => {
+    const withSnippetOnly = await captureRecordRepairStage({
+      referencedFiles: ['src/good.ts', 'src/ghost.ts', 'src/extra.ts'],
+      groundedFiles: ['src/good.ts'],
+      evidenceMap: new Map<string, unknown>([
+        ['src/extra.ts', { filePath: 'src/extra.ts', codeSnippets: [GROUNDED_SNIPPET] }],
+      ]),
+    });
+    expect(
+      (withSnippetOnly.opts.context as Record<string, unknown>).recordRepairEvidencePaths
+    ).toEqual(['src/good.ts', 'src/extra.ts']);
+
+    const noGrounded = await captureRecordRepairStage({
+      referencedFiles: ['src/ghost.ts'],
+      groundedFiles: [],
+      findings: [{ finding: '提及而未读取', evidence: 'src/ghost.ts:3', importance: 6 }],
+    });
+    expect((noGrounded.opts.context as Record<string, unknown>).recordRepairEvidencePaths).toEqual(
+      []
+    );
+    expect(assembleEvidenceContext(noGrounded).pathsLine).toBe('');
+  });
+
+  it('旧工件(无 groundedFiles)保留 referencedFiles 回退并打 legacy 诊断日志；新工件打 grounded 日志', async () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    try {
+      const legacy = await captureRecordRepairStage({
+        referencedFiles: ['lib/legacy.ts', 'lib/other.ts'],
+        findings: [{ finding: '旧发现', evidence: 'lib/finding.ts:4', importance: 6 }],
+      });
+      expect((legacy.opts.context as Record<string, unknown>).recordRepairEvidencePaths).toEqual([
+        'lib/legacy.ts',
+        'lib/other.ts',
+        'lib/finding.ts',
+      ]);
+      await captureRecordRepairStage({
+        referencedFiles: ['src/good.ts', 'src/ghost.ts'],
+        groundedFiles: ['src/good.ts'],
+      });
+      const lines = info.mock.calls.map(([message]) => String(message));
+      expect(lines).toContainEqual(
+        expect.stringMatching(
+          /\[PipelineStrategy\] record_repair evidence paths: legacy artifact without groundedFiles, falling back to referencedFiles .*path=legacy-referenced-files; referenced=2/
+        )
+      );
+      expect(lines).toContainEqual(
+        expect.stringMatching(
+          /\[PipelineStrategy\] record_repair evidence paths: .*path=grounded; grounded=1; droppedUngrounded=1/
+        )
+      );
+    } finally {
+      info.mockRestore();
+    }
   });
 });
