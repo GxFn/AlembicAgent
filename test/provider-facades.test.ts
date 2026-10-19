@@ -1,5 +1,5 @@
 import Logger from '@alembic/core/logging';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AiProvider } from '../src/ai/AiProvider.js';
 import type { ChatContext } from '../src/ai/contracts.js';
 import type { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
@@ -461,10 +461,45 @@ describe('DeepSeekProvider V4 tool calls', () => {
   });
 });
 
+/** openai Transport 解析代理时读取的全部环境变量（provider 专属 ＞ ALEMBIC_AI_PROXY ＞ 标准变量）。 */
+const PROBE_TEST_PROXY_ENV_VARS = [
+  'ALEMBIC_OPENAI_PROXY_HTTPS',
+  'ALEMBIC_OPENAI_PROXY_HTTP',
+  'ALEMBIC_AI_PROXY',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+] as const;
+
 describe('AiProvider.probe deadline, retry budget and usage source', () => {
+  /**
+   * 预热 probe Gateway 的模块图，让本组用例不依赖执行顺序。
+   * 内置 provider 的 probe 先武装期限，再经 #getProbeGateway 动态 import('./gateway/LLMGateway.js')；
+   * 冷加载是真实 I/O，vi.advanceTimersByTimeAsync 推进不了它。若前面没有用例加载过该模块
+   * （-t 过滤、it.only、挪动或打乱顺序），fake timers 下的期限会先于 Gateway 就绪而“到期”，
+   * 用例在断言时 probe 仍挂在 import 上，并把悬挂的 probe 泄漏给后续用例的 fetch 桩。
+   * 每条用例在切换 fake timers 之前（真实计时器下）先加载同一模块；已缓存时只是一次廉价命中，
+   * 也能抵御同文件里将来出现的 vi.resetModules()。
+   *
+   * 同一条链上还有第二个冷加载点：环境里配置了代理变量时，Transport 会先动态 import('undici')
+   * 构造 ProxyAgent 再发 fetch，单独运行本组时同样卡在 fake timers 推进不到的真实 I/O 上。
+   * 本组只验证期限、重试与用量来源，与代理路由无关，因此把 openai 可读到的代理变量全部置空，
+   * 固定走宿主默认的直连路径（代理路由由 transport-proxy 测试覆盖）。
+   */
+  beforeEach(async () => {
+    for (const name of PROBE_TEST_PROXY_ENV_VARS) {
+      vi.stubEnv(name, '');
+    }
+    await import('../src/ai/gateway/LLMGateway.js');
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
