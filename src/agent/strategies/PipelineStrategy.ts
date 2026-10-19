@@ -11,7 +11,9 @@
  *                               会话输入预算压制时转 degraded_budget_exhausted（终态）；次数耗尽记
  *                               retryExhausted + abandonInfo(retry_exhausted)，再按 skipOnFail 决定是否继续；
  *                               回退目标是 producer 阶段时，先把它即将被覆盖的回执工具调用并入
- *                               phaseResults._priorAttempts_<stage>（C08），拒绝率门在重试轮按各次尝试合计判断
+ *                               phaseResults._priorAttempts_<stage>（C08），拒绝率门在重试轮按各次尝试合计判断；
+ *                               该 producer 的 hardSubmitCap 已被各次尝试的持久化提交用满时跳过重试，记
+ *                               diagnostics.warn(producer_retry_skipped_cap_exhausted) 后 'continue'（C030）
  *   - record_repair          → 跑记录补写微阶段后重评（非终态）；上限 gate.maxRecordRepairRetries；
  *                               仍不通过转 degraded_no_findings（终态）
  *   - summary_rewrite         → 跑零工具重写微阶段后重评（非终态）；上限 gate.maxSummaryRewriteRetries；
@@ -360,6 +362,58 @@ function readHardSubmitCap(budget: StageBudget | undefined): number | null | 'in
 }
 
 /**
+ * C030(L5-P29r3)：重试轮(门重试 / 零工具 fast-retry)还能持久化多少提交。hardSubmitCap 是整个 produce
+ * 阶段所有尝试合计的硬配额，不只约束首轮：#resolveStageTracker 每次尝试都按本轮预算新建 tracker，
+ * submitCount 从 0 起算，tracker 自己无法跨尝试累计，所以由管线按已持久化回执算出剩余配额再写进本轮预算。
+ *   - uncapped：阶段未声明 cap(bootstrap 冷启动，capState=null)或 cap 非法('invalid')，重试预算原样使用；
+ *   - capped：remaining=cap-已持久化数 ≥ 1，本轮 maxSubmits 收紧到 remaining；
+ *   - exhausted：已用满(remaining=0)。0 不能交给 tracker——它只在 endRound 判转换，首轮仍会放行提交；
+ *     门重试在 #processGate 里直接跳过，fast-retry 不重跑。
+ */
+type ProducerRetrySubmitAllowance =
+  | { kind: 'uncapped'; capState: null | 'invalid' }
+  | { kind: 'capped'; cap: number; persisted: number; remaining: number }
+  | { kind: 'exhausted'; cap: number; persisted: number };
+
+/** 预算里声明的提交上限：有限正数取整；缺省/0/非法视为未声明(由剩余配额补齐)。 */
+function readDeclaredSubmitLimit(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  const limit = Math.floor(value);
+  return limit > 0 ? limit : null;
+}
+
+/**
+ * C030：把剩余配额落到重试轮预算上。retryBudget 的其余字段(maxIterations/temperature/timeoutMs)原样沿用，
+ * 不注入 targetSubmits、不放大时间——重试轮只修被拒条目，不是第二次覆盖。maxSubmits 未声明时补成 remaining；
+ * 已声明时取 min(声明值, remaining)：硬配额优先，否则阶段无 retryBudget 时沿用的 stage.budget(工厂已把
+ * maxSubmits 写成 cap)会让整个阶段最多持久化 2×cap。softSubmitLimit 同样不超过最终 maxSubmits。
+ * hardSubmitCap 随预算带上，与首轮预算口径一致，便于定位。
+ */
+function withProducerRetrySubmitCap(
+  stage: PipelineStage,
+  budget: StageBudget | undefined,
+  allowance: Extract<ProducerRetrySubmitAllowance, { kind: 'capped' }>,
+  path: 'gate_retry' | 'fast_retry'
+): StageBudget {
+  const declaredMax = readDeclaredSubmitLimit(budget?.maxSubmits);
+  const declaredSoft = readDeclaredSubmitLimit(budget?.softSubmitLimit);
+  const maxSubmits =
+    declaredMax !== null ? Math.min(declaredMax, allowance.remaining) : allowance.remaining;
+  const softSubmitLimit = declaredSoft !== null ? Math.min(declaredSoft, maxSubmits) : maxSubmits;
+  _pipelineLogger().info(
+    `[PipelineStrategy] Stage "${stage.name}" retry submit cap applied — path=${path}, hardSubmitCap=${allowance.cap}, persistedSubmits=${allowance.persisted}, remaining=${allowance.remaining}, declaredMaxSubmits=${budget?.maxSubmits ?? 'default'} → maxSubmits=${maxSubmits}, softSubmitLimit=${softSubmitLimit} (targetSubmits not injected, timeoutMs=${budget?.timeoutMs ?? '∞'} unchanged)`
+  );
+  return {
+    ...(budget || {}),
+    maxSubmits,
+    softSubmitLimit,
+    hardSubmitCap: allowance.cap,
+  };
+}
+
+/**
  * produce 阶段的覆盖率预算：按 quality_gate 的结构化 findings 数决定提交目标/上限/时间。
  * analysisArtifact 由 #resolveStageGateArtifact 按门名从 quality_gate 读取(I37)；读不到时为 null，
  * findings 计 0，预算原样返回(不放大)——读取失败的诊断已由调用方记录。
@@ -369,9 +423,9 @@ function readHardSubmitCap(budget: StageBudget | undefined): number | null | 'in
  *     preset/stageBuilders 把 retryBudget 声明为"缩减预算"(5 轮/300s 等)，重试 prompt 只修被拒条目；
  *     放大会把 300s 拉到 1800s 并让 tracker 以 targetSubmits=findings 催促提交全部条目。首轮已经
  *     按覆盖率放大过一次，重试不是第二次覆盖；与 fast-retry 直接用 retryBudget 的口径一致。
- *     按决策"沿用声明的 retryBudget"，这里不把 stage.budget 的 hardSubmitCap 补进 retryBudget：
- *     重试轮的提交上限由 retryBudget 自身(未声明时是 tracker 默认值)决定，日志报告阶段声明的 cap
- *     以便定位。
+ *     这里只负责"不放大"；阶段声明了 hardSubmitCap 时，重试轮的提交上限由 #executeStage 在本函数之后
+ *     按剩余配额收紧(C030，见 withProducerRetrySubmitCap)——cap 约束整个阶段所有尝试的合计，不只首轮。
+ *     日志报告阶段声明的 cap 以便定位。
  *   - hardSubmitCap(增量重扫)：配额是计划层硬上限——targetSubmits=min(findings, cap)、maxSubmits=cap，
  *     tracker 在第 cap 次持久化提交后转 SUMMARIZE，完成文本不再被催促。
  *   - 无 cap(bootstrap 冷启动)：保留 H3(2026-07-02 数量专项)放大——静态 10 会把丰富维度硬顶
@@ -946,9 +1000,27 @@ export class PipelineStrategy extends Strategy {
             }
             return 'break';
           }
-          // C08(L7-P18)：重跑 producer 会以第二轮回执覆盖 phaseResults[produce]，首轮已落库的候选
-          // 随之从门的视野里消失；先把本轮回执并入 _priorAttempts_<stage>，供裁决它的拒绝率门按合计判断。
           if (this.#isProducerStage(retryTargetStage)) {
+            // C030(L5-P29r3)：hardSubmitCap 已被各次尝试的持久化提交用满时，重跑 producer 拿不到任何
+            // 提交额度(重试 prompt 只会催促重提被拒条目)。在这里跳过，而不是把 0 交给 tracker。
+            const receipt = phaseResults[retryTargetStage.name] as StageResult | undefined;
+            const allowance = this.#producerRetrySubmitAllowance(
+              retryTargetStage,
+              ctx,
+              receipt?.toolCalls
+            );
+            if (allowance.kind === 'exhausted') {
+              return this.#skipProducerRetryCapExhausted(
+                stage,
+                retryTargetStage,
+                allowance,
+                gateResult.reason,
+                timedOutSource,
+                ctx
+              );
+            }
+            // C08(L7-P18)：重跑 producer 会以第二轮回执覆盖 phaseResults[produce]，首轮已落库的候选
+            // 随之从门的视野里消失；先把本轮回执并入 _priorAttempts_<stage>，供裁决它的拒绝率门按合计判断。
             this.#preservePriorProducerAttempt(retryTargetStage, stage, ctx);
           }
           phaseResults._retryContext = {
@@ -1084,6 +1156,119 @@ export class PipelineStrategy extends Strategy {
         persistedKnowledgeSubmits: persistedSubmits,
       }
     );
+  }
+
+  /**
+   * C030(L5-P29r3)：produce 阶段跨尝试的已持久化提交数，判据是 isPersistedSubmission(与 tracker 的
+   * submitCount 同一口径)。来源：_priorAttempts_<stage>.toolCalls(已被覆盖的尝试) 加 latestToolCalls
+   * (即将被覆盖或刚结束的那次尝试)。门判 retry 后 #preservePriorProducerAttempt 已把最近回执并入 prior，
+   * 二者共享同一批调用对象，按对象身份去重，避免同一提交计两次；prior 尚未写入(门侧预检)时同样完整。
+   */
+  #countPersistedProducerSubmits(
+    stageName: string,
+    ctx: PipelineContext,
+    latestToolCalls: unknown
+  ): number {
+    const prior = ctx.phaseResults[`_priorAttempts_${stageName}`];
+    const priorToolCalls =
+      prior && typeof prior === 'object' && !Array.isArray(prior)
+        ? (prior as { toolCalls?: unknown }).toolCalls
+        : undefined;
+    const calls = new Set<unknown>([
+      ...(Array.isArray(priorToolCalls) ? priorToolCalls : []),
+      ...(Array.isArray(latestToolCalls) ? latestToolCalls : []),
+    ]);
+    let persisted = 0;
+    for (const call of calls) {
+      if (isPersistedSubmission(call)) {
+        persisted++;
+      }
+    }
+    return persisted;
+  }
+
+  /** C030：按阶段声明的 hardSubmitCap(stage.budget，工厂写入的 rescan 配额)算重试轮的提交余量。 */
+  #producerRetrySubmitAllowance(
+    stage: PipelineStage,
+    ctx: PipelineContext,
+    latestToolCalls: unknown
+  ): ProducerRetrySubmitAllowance {
+    const capState = readHardSubmitCap(stage.budget);
+    if (capState === null || capState === 'invalid') {
+      return { kind: 'uncapped', capState };
+    }
+    const persisted = this.#countPersistedProducerSubmits(stage.name, ctx, latestToolCalls);
+    const remaining = Math.max(0, capState - persisted);
+    return remaining > 0
+      ? { kind: 'capped', cap: capState, persisted, remaining }
+      : { kind: 'exhausted', cap: capState, persisted };
+  }
+
+  /**
+   * C030：把重试轮余量落到本轮预算。uncapped(无 cap)原样返回——bootstrap 冷启动的重试预算保持声明值；
+   * cap 非法时记 warn 后同样原样返回(首轮已按无配额处理，口径一致)。exhausted 只会由 fast-retry 前置判断
+   * 或 #processGate 的跳过拦下；若走到这里说明有新的重跑入口绕过了门侧检查，记 warn 便于定位。
+   */
+  #applyProducerRetrySubmitCap(
+    stage: PipelineStage,
+    budget: StageBudget | undefined,
+    allowance: ProducerRetrySubmitAllowance,
+    path: 'gate_retry' | 'fast_retry'
+  ): StageBudget | undefined {
+    if (allowance.kind === 'capped') {
+      return withProducerRetrySubmitCap(stage, budget, allowance, path);
+    }
+    if (allowance.kind === 'exhausted') {
+      _pipelineLogger().warn(
+        `[PipelineStrategy] Stage "${stage.name}" retry reached execution with hardSubmitCap exhausted (path=${path}, hardSubmitCap=${allowance.cap}, persistedSubmits=${allowance.persisted}, remaining=0) — no gate-side skip intercepted it; running with the declared budget (maxSubmits=${budget?.maxSubmits ?? 'default'})`
+      );
+      return budget;
+    }
+    if (allowance.capState === 'invalid') {
+      _pipelineLogger().warn(
+        `[PipelineStrategy] Stage "${stage.name}" retry ignores invalid hardSubmitCap=${String(stage.budget?.hardSubmitCap)} — declared retry budget used as-is (path=${path}, maxSubmits=${budget?.maxSubmits ?? 'default'})`
+      );
+    }
+    return budget;
+  }
+
+  /**
+   * C030：门判 retry 但 producer 的 hardSubmitCap 已用满——跳过重试，不再给提交额度。门的原始裁决
+   * (retry，已由 #storeGateResult 记入 gateFailures)保持不变；不设 abandonInfo，outcome 仍按其他事实
+   * 判定(通常为 completed)：配额用满即阶段目标已达成。门源阶段回执超时(I05)时重跑是唯一恢复路径，
+   * 被跳过即终态，与预算压制同一处理。
+   */
+  #skipProducerRetryCapExhausted(
+    gateStage: PipelineStage,
+    producerStage: PipelineStage,
+    allowance: Extract<ProducerRetrySubmitAllowance, { kind: 'exhausted' }>,
+    gateReason: string | undefined,
+    timedOutSource: string | null,
+    ctx: PipelineContext
+  ): 'continue' | 'break' {
+    const gateName = gateStage.name || 'gate';
+    const code = 'producer_retry_skipped_cap_exhausted';
+    const message =
+      `Gate "${gateName}" asked to retry producer stage "${producerStage.name}" but its hardSubmitCap is exhausted ` +
+      `(hardSubmitCap=${allowance.cap}, persistedSubmits=${allowance.persisted}, remaining=0); retry skipped, ` +
+      `no further submit allowance granted; gate reason=${gateReason || 'n/a'}`;
+    ctx.diagnostics.warn({ code, stage: gateName, message });
+    _pipelineLogger().warn(`[PipelineStrategy] ${code} at gate "${gateName}": ${message}`, {
+      code,
+      stage: gateName,
+      producer: producerStage.name,
+      hardSubmitCap: allowance.cap,
+      persistedSubmits: allowance.persisted,
+    });
+    if (timedOutSource !== null) {
+      this.#recordTimeoutTerminal(
+        ctx,
+        gateName,
+        `Stage "${timedOutSource}" final receipt timed out and the only recovery (re-running producer "${producerStage.name}") was skipped because its hardSubmitCap is exhausted; downstream stages skipped`
+      );
+      return 'break';
+    }
+    return 'continue';
   }
 
   /** skipOnFail 缺省/true 时非通过门 'break'；显式 false 才继续执行后续阶段。 */
@@ -1849,13 +2034,25 @@ export class PipelineStrategy extends Strategy {
     const strictProduction = Boolean(this.#strictProductionContext(ctx));
     // I37：本阶段 gateArtifact 只解析一次——覆盖率预算、首轮提示与 fast retry 重建共用，诊断不重复。
     const stageGateArtifact = this.#resolveStageGateArtifact(stage, ctx, strictProduction);
-    const effectiveBudget = withProducerCoverageBudget(
+    let effectiveBudget = withProducerCoverageBudget(
       stage,
       configuredBudget ? { ...configuredBudget } : undefined,
       stageGateArtifact,
       strictProduction,
       isRetry
     );
+    if (isRetry && !strictProduction && this.#isProducerStage(stage)) {
+      // C030(L5-P29r3)：门重试轮按 hardSubmitCap 剩余配额收紧提交上限。此时 phaseResults[stage] 仍是
+      // 即将被本轮覆盖的上一次回执；与 _priorAttempts_<stage> 合并计数(按身份去重)。与是否有 findings
+      // 无关——首轮没放大时预算同样来自声明值，重试轮同样会新建 tracker、从 0 计数。
+      const previousReceipt = phaseResults[stage.name] as StageResult | undefined;
+      effectiveBudget = this.#applyProducerRetrySubmitCap(
+        stage,
+        effectiveBudget,
+        this.#producerRetrySubmitAllowance(stage, ctx, previousReceipt?.toolCalls),
+        'gate_retry'
+      );
+    }
     const retryBudget = stage.retryBudget ? { ...stage.retryBudget } : undefined;
     delete phaseResults[`_was_retry_${stage.name}`];
     const ctxWin = (strategyContext.contextWindow || null) as StageContextWindow | null;
@@ -1965,25 +2162,39 @@ export class PipelineStrategy extends Strategy {
 
     let attempt = await executeAttempt(effectiveBudget, false);
     if (!strictProduction && !isRetry && retryBudget && attempt.canFastRetry) {
-      // I36：提示来源与 executeAttempt 的 fastRetry 分支同一判据——缓存的阶段提示非空则复用，
-      // 否则重建；阶段若声明了 retryPromptBuilder，这里明确记为 bypassed（它只服务门重试）。
-      const promptSource = stagePrompt ? 'stage_cached' : 'stage_rebuilt';
-      const retryPromptBuilderState = stage.retryPromptBuilder ? 'bypassed' : 'absent';
-      const fastRetryDetail =
-        `reason=stage_hard_timeout_zero_tools promptSource=${promptSource} ` +
-        `retryPromptBuilder=${retryPromptBuilderState} cachedPromptChars=${stagePrompt.length} ` +
-        `retryBudget.maxIterations=${retryBudget.maxIterations ?? '∞'} ` +
-        `retryBudget.timeoutMs=${retryBudget.timeoutMs ?? '∞'}`;
-      _pipelineLogger().info(
-        `[PipelineStrategy] Stage "${stage.name}" confirmed no tools — fast-retrying with retryBudget (${fastRetryDetail})`
-      );
-      ctx.diagnostics.warn({
-        code: 'pipeline_stage_fast_retry',
-        stage: stage.name,
-        message: `First attempt hit the hard timeout with zero tool calls; re-running once with the stage prompt plus a timeout notice (${fastRetryDetail}).`,
-      });
-      bus.publish(AgentEvents.PROGRESS, { type: 'pipeline_stage_fast_retry', stage: stage.name });
-      attempt = await executeAttempt(retryBudget, true);
+      // C030(L5-P29r3)：fast-retry 同样新建 tracker、从 0 计提交，必须按 hardSubmitCap 剩余配额收紧。首轮已
+      // 确认零工具调用，正常 remaining=cap；只有已有 _priorAttempts_ 用满配额时才 exhausted——不重跑，保留首轮回执。
+      const fastRetryAllowance = this.#isProducerStage(stage)
+        ? this.#producerRetrySubmitAllowance(stage, ctx, attempt.result.toolCalls)
+        : null;
+      if (fastRetryAllowance?.kind === 'exhausted') {
+        _pipelineLogger().warn(
+          `[PipelineStrategy] Stage "${stage.name}" fast retry skipped — hardSubmitCap exhausted (hardSubmitCap=${fastRetryAllowance.cap}, persistedSubmits=${fastRetryAllowance.persisted}, remaining=0); keeping the timed-out first attempt`
+        );
+      } else {
+        const fastRetryBudget = fastRetryAllowance
+          ? this.#applyProducerRetrySubmitCap(stage, retryBudget, fastRetryAllowance, 'fast_retry')
+          : retryBudget;
+        // I36：提示来源与 executeAttempt 的 fastRetry 分支同一判据——缓存的阶段提示非空则复用，
+        // 否则重建；阶段若声明了 retryPromptBuilder，这里明确记为 bypassed（它只服务门重试）。
+        const promptSource = stagePrompt ? 'stage_cached' : 'stage_rebuilt';
+        const retryPromptBuilderState = stage.retryPromptBuilder ? 'bypassed' : 'absent';
+        const fastRetryDetail =
+          `reason=stage_hard_timeout_zero_tools promptSource=${promptSource} ` +
+          `retryPromptBuilder=${retryPromptBuilderState} cachedPromptChars=${stagePrompt.length} ` +
+          `retryBudget.maxIterations=${retryBudget.maxIterations ?? '∞'} ` +
+          `retryBudget.timeoutMs=${retryBudget.timeoutMs ?? '∞'}`;
+        _pipelineLogger().info(
+          `[PipelineStrategy] Stage "${stage.name}" confirmed no tools — fast-retrying with retryBudget (${fastRetryDetail})`
+        );
+        ctx.diagnostics.warn({
+          code: 'pipeline_stage_fast_retry',
+          stage: stage.name,
+          message: `First attempt hit the hard timeout with zero tool calls; re-running once with the stage prompt plus a timeout notice (${fastRetryDetail}).`,
+        });
+        bus.publish(AgentEvents.PROGRESS, { type: 'pipeline_stage_fast_retry', stage: stage.name });
+        attempt = await executeAttempt(fastRetryBudget, true);
+      }
     }
     const stageResult = attempt.result;
     phaseResults[stage.name] = stageResult;

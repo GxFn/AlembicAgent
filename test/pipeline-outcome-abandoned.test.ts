@@ -1072,32 +1072,98 @@ describe('PipelineStrategy — produce 覆盖率预算：rescan 硬上限与重�
     expect(String(capLog?.[0])).toContain('timeoutMs=1080000');
   });
 
-  it('rescan + rejection_gate 判 retry：首轮按 cap=2 封顶，重试轮等于 preset retryBudget(300s/5 轮，无 targetSubmits)，skip 日志报告阶段声明的 cap', async () => {
+  // ─── C030(L5-P29r3)：hardSubmitCap 约束整个 produce 阶段(所有尝试合计)，不只首轮 ───
+  // 8a9ad89 只在首轮封顶：rejection_gate 重试与零工具 fast-retry 两轮用 preset retryBudget(无 maxSubmits)，
+  // 每轮新建 tracker 时 submitCount 归零、按缺省 maxSubmits=10 放行，整个阶段持久化数仍可超过 createBudget。
+  // 修复：重试轮在 retryBudget 上补齐/收紧 maxSubmits=softSubmitLimit=cap-已持久化数(不注入 targetSubmits、
+  // 不放大时间)；已满额时跳过门重试并留痕。
+
+  /** 已持久化的 knowledge.submit 回执(与 isPersistedSubmission 判据一致)。 */
+  function persistedSubmit(id: string) {
+    return {
+      tool: 'knowledge',
+      args: { action: 'submit', title: id },
+      result: { status: 'created', id, lifecycle: 'pending' },
+    };
+  }
+
+  /** 被拒绝的 knowledge.submit 回执(未入库，不占配额)。 */
+  function rejectedSubmit(id: string) {
+    return {
+      tool: 'knowledge',
+      args: { action: 'submit', title: id },
+      result: { status: 'rejected', reason: `missing evidence for ${id}` },
+    };
+  }
+
+  /** 按脚本逐次返回 produce 回执；其他阶段返回带一条非提交工具调用的普通回执。 */
+  function createScriptedProduceRuntime(
+    script: Array<{ toolCalls: Array<Record<string, unknown>>; timedOut?: boolean }>
+  ) {
+    const produceCalls: ProduceCapture[] = [];
+    const runtime = {
+      id: 'scripted-runtime',
+      async reactLoop(_prompt: string, opts?: Record<string, unknown>) {
+        const phase = (opts?.context as Record<string, unknown> | undefined)?.pipelinePhase;
+        if (phase === 'produce') {
+          const step = script[Math.min(produceCalls.length, script.length - 1)];
+          produceCalls.push({
+            budget: opts?.budgetOverride as Record<string, unknown> | undefined,
+            tracker: (opts?.tracker as ExplorationTracker | null | undefined) ?? null,
+          });
+          return {
+            reply: step.timedOut ? '' : 'produce output long enough to be a reply',
+            toolCalls: step.toolCalls,
+            tokenUsage: { input: 1, output: 1 },
+            iterations: 1,
+            ...(step.timedOut ? { timedOut: true } : {}),
+          };
+        }
+        return {
+          reply: 'stage output long enough to be a reply',
+          toolCalls: [{ tool: 'knowledge' }],
+          tokenUsage: { input: 1, output: 1 },
+          iterations: 1,
+        };
+      },
+    };
+    return { runtime, produceCalls };
+  }
+
+  function retryOnceThenPassGate() {
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({ action: 'retry', pass: false, reason: 'rejected > success' })
+      .mockReturnValue({ action: 'pass', pass: true });
+    return { stage: { name: 'rejection_gate', gate: { maxRetries: 1, evaluator } }, evaluator };
+  }
+
+  function seedAnalystTracker() {
+    return ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyst' },
+      { maxIterations: 4 }
+    );
+  }
+
+  it('rescan + rejection_gate 判 retry：首轮按 cap=2 封顶；首轮持久化 1 条、拒绝 2 条 → 重试轮 maxSubmits=1(retryBudget 其余原值、无 targetSubmits)，真实 tracker 第 1 次持久化后进入 SUMMARIZE', async () => {
     const infoLog = spyInfoLog();
-    const { runtime, produceCalls } = createCapturingRuntime();
-    const produce = buildRescanProduceStage(2);
-    let rejectionCalls = 0;
+    const { runtime, produceCalls } = createScriptedProduceRuntime([
+      { toolCalls: [persistedSubmit('p1'), rejectedSubmit('r1'), rejectedSubmit('r2')] },
+      { toolCalls: [persistedSubmit('p2')] },
+    ]);
+    const gate = retryOnceThenPassGate();
     const strategy = new PipelineStrategy({
       stages: [
-        { name: 'analyze' },
+        { name: 'analyze', promptBuilder: () => 'analyze', budget: { maxIterations: 1 } },
         qualityGateWithFindings(10),
-        produce,
-        {
-          name: 'rejection_gate',
-          gate: {
-            maxRetries: 1,
-            evaluator: () => {
-              rejectionCalls++;
-              return rejectionCalls === 1
-                ? { action: 'retry', pass: false, reason: 'rejected' }
-                : { action: 'pass', pass: true };
-            },
-          },
-        },
+        buildRescanProduceStage(2),
+        gate.stage,
       ],
     });
 
-    const result = await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }), {
+      strategyContext: { tracker: seedAnalystTracker(), source: 'system' },
+    });
 
     expect(result.outcome).toBe('completed');
     expect(produceCalls).toHaveLength(2);
@@ -1106,19 +1172,168 @@ describe('PipelineStrategy — produce 覆盖率预算：rescan 硬上限与重�
       targetSubmits: 2,
       hardSubmitCap: 2,
     });
-    // 重试轮严格等于 insight preset 声明的 retryBudget(缩减预算)：不放大、不注入 targetSubmits；
-    // 按决策"沿用声明的 retryBudget"，stage.budget 的 hardSubmitCap 也不补进重试预算。
-    expect(produceCalls[1].budget).toEqual({
+    // 重试轮：insight preset retryBudget 原值(不放大时间)，只补齐剩余配额；不注入 targetSubmits。
+    expect(produceCalls[1].budget).toMatchObject({
       maxIterations: 5,
       temperature: 0.3,
       timeoutMs: 300_000,
+      maxSubmits: 1,
+      softSubmitLimit: 1,
     });
+    expect(produceCalls[1].budget?.targetSubmits).toBeUndefined();
+    // 真实 producer tracker：重试轮第 1 次持久化提交后离开 PRODUCE(修复前要到第 10 次)。
+    const retryTracker = produceCalls[1].tracker;
+    expect(retryTracker?.strategyName).toBe('producer');
+    const retryAllowance = submitUntilLeavingProduce(retryTracker as ExplorationTracker, 16);
+    expect(retryAllowance).toBe(1);
+    // 首轮已持久化 1 条 + 重试轮放行 1 条，合计不超过 createBudget=2。
+    expect(1 + Number(retryAllowance)).toBeLessThanOrEqual(2);
+    // 覆盖率放大仍被跳过(日志报告阶段声明的 cap)。
     const skipLog = infoLog.mock.calls.find((c) =>
       /coverage amplification skipped/.test(String(c[0]))
     );
-    expect(skipLog).toBeDefined();
     expect(String(skipLog?.[0])).toContain('reuses declared retryBudget');
     expect(String(skipLog?.[0])).toContain('stageHardSubmitCap=2');
-    expect(String(skipLog?.[0])).toContain('timeoutMs=300000');
+    // 补齐分叉留痕：路径、cap、已持久化数、剩余与最终 maxSubmits。
+    const capLog = infoLog.mock.calls.find((c) => /retry submit cap applied/.test(String(c[0])));
+    expect(capLog).toBeDefined();
+    expect(String(capLog?.[0])).toContain('path=gate_retry');
+    expect(String(capLog?.[0])).toContain('hardSubmitCap=2');
+    expect(String(capLog?.[0])).toContain('persistedSubmits=1');
+    expect(String(capLog?.[0])).toContain('remaining=1');
+    expect(String(capLog?.[0])).toContain('maxSubmits=1');
+  });
+
+  it('rescan + rejection_gate 判 retry：首轮已持久化 2 条(满额)、拒绝 3 条 → 跳过门重试，outcome=completed，warn 日志与诊断 producer_retry_skipped_cap_exhausted', async () => {
+    spyInfoLog();
+    const warnLog = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const firstRound = [
+      persistedSubmit('p1'),
+      persistedSubmit('p2'),
+      rejectedSubmit('r1'),
+      rejectedSubmit('r2'),
+      rejectedSubmit('r3'),
+    ];
+    const { runtime, produceCalls } = createScriptedProduceRuntime([{ toolCalls: firstRound }]);
+    const gate = retryOnceThenPassGate();
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(10),
+        buildRescanProduceStage(2),
+        gate.stage,
+      ],
+    });
+
+    const result = await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(result.outcome).toBe('completed');
+    // 配额已用满：不再重跑 producer，门也不再重评。
+    expect(produceCalls).toHaveLength(1);
+    expect(gate.evaluator).toHaveBeenCalledTimes(1);
+    // 首轮回执原样保留(宿主按它计数)，也没有为不存在的重试保存 prior attempts。
+    expect((result.phases.produce as { toolCalls?: unknown[] }).toolCalls).toHaveLength(5);
+    expect(result.phases._priorAttempts_produce).toBeUndefined();
+    const skipWarn = warnLog.mock.calls.find((c) =>
+      String(c[0]).includes('producer_retry_skipped_cap_exhausted')
+    );
+    expect(skipWarn).toBeDefined();
+    expect(String(skipWarn?.[0])).toContain('hardSubmitCap=2');
+    expect(String(skipWarn?.[0])).toContain('persistedSubmits=2');
+    expect(String(skipWarn?.[0])).toContain('remaining=0');
+    const warnings = (result.diagnostics?.warnings ?? []) as Array<{
+      code: string;
+      stage?: string;
+      message: string;
+    }>;
+    const skipped = warnings.filter((w) => w.code === 'producer_retry_skipped_cap_exhausted');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].stage).toBe('rejection_gate');
+    expect(skipped[0].message).toContain('"produce"');
+  });
+
+  it('rescan + 首轮硬超时且零工具调用 → fast-retry 预算 maxSubmits=softSubmitLimit=2(=cap)，retryBudget 其余原值、无 targetSubmits', async () => {
+    const infoLog = spyInfoLog();
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, produceCalls } = createScriptedProduceRuntime([
+      { toolCalls: [], timedOut: true },
+      { toolCalls: [persistedSubmit('p1')] },
+    ]);
+    const strategy = new PipelineStrategy({
+      stages: [{ name: 'analyze' }, qualityGateWithFindings(10), buildRescanProduceStage(2)],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(produceCalls).toHaveLength(2);
+    expect(produceCalls[0].budget).toMatchObject({ maxSubmits: 2, hardSubmitCap: 2 });
+    expect(produceCalls[1].budget).toMatchObject({
+      maxIterations: 5,
+      temperature: 0.3,
+      timeoutMs: 300_000,
+      maxSubmits: 2,
+      softSubmitLimit: 2,
+    });
+    expect(produceCalls[1].budget?.targetSubmits).toBeUndefined();
+    const capLog = infoLog.mock.calls.find((c) => /retry submit cap applied/.test(String(c[0])));
+    expect(String(capLog?.[0])).toContain('path=fast_retry');
+    expect(String(capLog?.[0])).toContain('persistedSubmits=0');
+    expect(String(capLog?.[0])).toContain('remaining=2');
+  });
+
+  it('cap 场景下阶段无 retryBudget：重试沿用 stage.budget 但 maxSubmits 收紧到剩余配额(cap=3、首轮持久化 1 条 → 2)', async () => {
+    spyInfoLog();
+    const { runtime, produceCalls } = createScriptedProduceRuntime([
+      { toolCalls: [persistedSubmit('p1'), rejectedSubmit('r1'), rejectedSubmit('r2')] },
+      { toolCalls: [persistedSubmit('p2')] },
+    ]);
+    const gate = retryOnceThenPassGate();
+    const stageBudget = {
+      maxIterations: 24,
+      maxSubmits: 3,
+      softSubmitLimit: 3,
+      hardSubmitCap: 3,
+      timeoutMs: 900_000,
+    };
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(10),
+        { name: 'produce', budget: stageBudget },
+        gate.stage,
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'rescan' }));
+
+    expect(produceCalls).toHaveLength(2);
+    // 声明的 maxSubmits=3 大于剩余配额 2：硬配额优先，取二者较小值；其余字段保持 stage.budget 原值。
+    expect(produceCalls[1].budget).toEqual({ ...stageBudget, maxSubmits: 2, softSubmitLimit: 2 });
+  });
+
+  it('bootstrap 冷启动(无 cap)：fast-retry 预算严格等于声明的 retryBudget(不补 maxSubmits)', async () => {
+    spyInfoLog();
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, produceCalls } = createScriptedProduceRuntime([
+      { toolCalls: [], timedOut: true },
+      { toolCalls: [persistedSubmit('p1')] },
+    ]);
+    const retryBudget = { maxIterations: 5, temperature: 0.3, timeoutMs: 300_000 };
+    const strategy = new PipelineStrategy({
+      stages: [
+        { name: 'analyze' },
+        qualityGateWithFindings(10),
+        {
+          name: 'produce',
+          budget: { maxIterations: 24, maxSubmits: 10, softSubmitLimit: 10, timeoutMs: 900_000 },
+          retryBudget,
+        },
+      ],
+    });
+
+    await strategy.execute(runtime, new AgentMessage({ content: 'bootstrap' }));
+
+    expect(produceCalls).toHaveLength(2);
+    expect(produceCalls[1].budget).toEqual(retryBudget);
   });
 });
