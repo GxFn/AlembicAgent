@@ -145,8 +145,11 @@ async function handleExec(params: Record<string, unknown>, ctx: ToolContext): Pr
     );
   }
 
+  // 工作目录是否为项目根一并交给 allowlist：只读 allowlist 下 git 只在项目根运行（L4-P7d，allowlist-git-cwd）。
   const allowlistCheck = ctx.commandAllowlist
-    ? checkTerminalCommandAllowlist(command, ctx.commandAllowlist.bins)
+    ? checkTerminalCommandAllowlist(command, ctx.commandAllowlist.bins, {
+        cwdIsProjectRoot: cwdResult.atProjectRoot,
+      })
     : { safe: true as const };
   if (!allowlistCheck.safe) {
     return finish(
@@ -665,12 +668,14 @@ function combineOutput(stdout: string, stderr: string): string {
 function resolveTerminalCwd(
   rawCwd: unknown,
   projectRoot: string
-): { ok: true; cwd: string } | { ok: false; error: string } {
+): { ok: true; cwd: string; atProjectRoot: boolean } | { ok: false; error: string } {
   const root = path.resolve(projectRoot);
   // 未提供 cwd 时解析项目根自身；相对 cwd 按项目根解析、绝对 cwd 原样参与检查，与旧实现一致。
   const requested = typeof rawCwd === 'string' && rawCwd.length > 0 ? rawCwd : '.';
   try {
-    return { ok: true, cwd: resolveProjectPath(root, requested).absolute };
+    const resolved = resolveProjectPath(root, requested);
+    // relative 相对 realpath(root) 计算：'.'、'src/..'、根的 realpath 绝对路径都算项目根。
+    return { ok: true, cwd: resolved.absolute, atProjectRoot: resolved.relative === '' };
   } catch (err: unknown) {
     return {
       ok: false,

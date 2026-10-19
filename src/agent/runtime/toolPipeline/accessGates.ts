@@ -210,7 +210,10 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
         const allowlist = (capability as { commandAllowlist?: TerminalCommandAllowlist })
           .commandAllowlist;
         if (allowlist) {
-          const check = checkTerminalCommandAllowlist(params.command, allowlist.bins);
+          // 工作目录是否为项目根一并交给 allowlist：只读 allowlist 下 git 只在项目根运行（L4-P7d，allowlist-git-cwd）。
+          const check = checkTerminalCommandAllowlist(params.command, allowlist.bins, {
+            cwdIsProjectRoot: isTerminalCwdAtProjectRoot(params.cwd, ctx.runtime.projectRoot),
+          });
           if (!check.safe) {
             return { blocked: true, result: { error: `Command blocked: ${check.block.reason}` } };
           }
@@ -255,6 +258,23 @@ export const runtimeSafetyGate: ToolMiddleware<ToolExecContext> = {
     return undefined;
   },
 };
+
+/**
+ * 宿主调度前还没有 terminal handler 的 cwd 解析结果，这里按 handler 的同一口径做词法判断：非字符串或空串的
+ * cwd 即项目根，其余按项目根解析后与项目根比较。没有 projectRoot 时只有 '.' 这类写法算项目根。词法判断从严：
+ * 指向项目根的 symlink、项目根是 symlink 时回传的 realpath 都按“不在项目根”处理，只会让 git 多被拒绝
+ * （拒绝原因提示省略 cwd），不会放过真正的子目录。
+ */
+function isTerminalCwdAtProjectRoot(rawCwd: unknown, projectRoot: string | undefined): boolean {
+  if (typeof rawCwd !== 'string' || rawCwd.length === 0) {
+    return true;
+  }
+  if (!projectRoot) {
+    return path.normalize(rawCwd) === '.';
+  }
+  const root = path.resolve(projectRoot);
+  return path.resolve(root, rawCwd) === root;
+}
 
 /**
  * 组装交给运行时策略（PolicyEngine.validateToolCall）的参数（L5-P18 / I17）。

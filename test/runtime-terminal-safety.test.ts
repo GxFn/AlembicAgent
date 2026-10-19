@@ -20,6 +20,7 @@ import { estimateTokens } from '../src/shared/tokenUtils.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import { handle as handleTerminal } from '../src/tools/runtime/handlers/terminal.js';
 import {
+  __testingRetainedCodeExecutionRules,
   checkTerminalCommandAllowlist,
   checkTerminalCommandSafety,
 } from '../src/tools/runtime/handlers/terminalSafety.js';
@@ -46,6 +47,67 @@ function baseToolContext(overrides: Partial<ToolContext> = {}): ToolContext {
     tokenBudget: 4000,
     ...overrides,
   };
+}
+
+// L4-P7d（用户决定 2026-10-18）：宿主只读沙箱启用前，EVOLUTION_CODE_EXECUTION_ENABLED 关闭，下列 bin 的任何
+// 命令都以 allowlist-code-execution-disabled 拒绝。它们原有的运行器/透传/选项规则保留待开关恢复，
+// 所以既有用例同时断言两件事：生产判定（开关关闭），以及保留规则（开关恢复后）的原有结论。
+const CODE_EXECUTION_DISABLED_RULE = 'allowlist-code-execution-disabled';
+const CODE_EXECUTION_DISABLED_BINS = new Set([
+  'node',
+  'npm',
+  'pnpm',
+  'yarn',
+  'npx',
+  'vitest',
+  'jest',
+  'eslint',
+]);
+// 这些拒绝发生在识别命令名之前（shell 层变换与路径限定的命令名），规则 id 不受开关影响。
+const SHELL_LEVEL_ALLOWLIST_RULES = new Set([
+  'allowlist-shell-meta',
+  'allowlist-shell-whitespace',
+  'allowlist-shell-control-char',
+  'allowlist-unparseable-command',
+  'allowlist-shell-brace-expansion',
+  'allowlist-shell-comment',
+  'allowlist-shell-glob-option',
+  'allowlist-path-qualified-bin',
+]);
+
+/**
+ * expectedRetainedRule 是保留规则（开关恢复后）的结论，null 表示放行。生产判定由此推出：命令名是被禁用的 bin
+ * 且保留结论不是 shell 层拒绝时，生产必须以 allowlist-code-execution-disabled 拒绝；其余与保留结论一致。
+ */
+function expectAllowlistVerdict(
+  command: string,
+  bins: readonly string[],
+  expectedRetainedRule: string | null
+): void {
+  const retained = __testingRetainedCodeExecutionRules.check(command, bins);
+  if (expectedRetainedRule === null) {
+    expect(retained, `retained: ${command}`).toEqual({ safe: true });
+  } else {
+    expect(retained.safe, `retained: ${command}`).toBe(false);
+    if (!retained.safe) {
+      expect(retained.block.rule, `retained: ${command}`).toBe(expectedRetainedRule);
+      expect(retained.block.reason, `retained: ${command}`).not.toBe('');
+    }
+  }
+  const commandName = (command.split(/[ \t]+/)[0] ?? '').toLowerCase();
+  const gated =
+    CODE_EXECUTION_DISABLED_BINS.has(commandName) &&
+    !(expectedRetainedRule !== null && SHELL_LEVEL_ALLOWLIST_RULES.has(expectedRetainedRule));
+  const expectedProductionRule = gated ? CODE_EXECUTION_DISABLED_RULE : expectedRetainedRule;
+  const production = checkTerminalCommandAllowlist(command, bins);
+  if (expectedProductionRule === null) {
+    expect(production, `production: ${command}`).toEqual({ safe: true });
+  } else {
+    expect(production.safe, `production: ${command}`).toBe(false);
+    if (!production.safe) {
+      expect(production.block.rule, `production: ${command}`).toBe(expectedProductionRule);
+    }
+  }
 }
 
 async function runTerminalExec(
@@ -568,33 +630,32 @@ describe('runtime terminal.exec safety', () => {
     expect(calls).toEqual([{ command: 'pwd', cwd: projectRoot }]);
   });
 
-  it('allows Evolution read-only terminal commands through the capability allowlist', async () => {
+  it('allows Evolution read-only terminal commands through the capability allowlist and blocks npm test (L4-P7d)', async () => {
     const router = new ToolRouter({ capability: new Evolution().toDef() });
-    const commands = [
-      'git log -n3',
-      'rg Recipe src',
-      'npm test -- test/example.test.ts',
-      'tsc --noEmit',
-    ];
+    const commands = ['git log -n3', 'rg Recipe src', 'tsc --noEmit'];
+    // L4-P7d：npm test 会执行仓库代码，宿主只读沙箱启用前不再放行（原放行用例改为拒绝断言）。
+    const disabled = ['npm test -- test/example.test.ts'];
     const calls: string[] = [];
+    const context = baseToolContext({
+      sandboxExecutor: {
+        exec: async (seenCommand: string) => {
+          calls.push(seenCommand);
+          return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+        },
+      },
+    });
 
     for (const command of commands) {
-      const result = await runTerminalExec(
-        command,
-        baseToolContext({
-          sandboxExecutor: {
-            exec: async (seenCommand: string) => {
-              calls.push(seenCommand);
-              return { stdout: 'ok\n', stderr: '', exitCode: 0 };
-            },
-          },
-        }),
-        {},
-        router
-      );
+      const result = await runTerminalExec(command, context, {}, router);
 
       expect(result.ok).toBe(true);
       expect(result.data).toBe('ok');
+    }
+    for (const command of disabled) {
+      const result = await runTerminalExec(command, context, {}, router);
+
+      expect(result.ok, command).toBe(false);
+      expect(result.error, command).toContain(`(${CODE_EXECUTION_DISABLED_RULE})`);
     }
 
     expect(calls).toEqual(commands);
@@ -983,12 +1044,7 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
     // 未加引号的反斜杠在 sh 中是转义符，字面反斜杠分隔符要写成 '\\\\'。
     { command: 'scripts\\\\git log', rule: 'allowlist-path-qualified-bin' },
   ])('blocks $command with $rule', ({ command, rule }) => {
-    const result = checkTerminalCommandAllowlist(command, evolutionBins);
-    expect(result.safe).toBe(false);
-    if (!result.safe) {
-      expect(result.block.rule).toBe(rule);
-      expect(result.block.reason).not.toBe('');
-    }
+    expectAllowlistVerdict(command, evolutionBins, rule);
   });
 
   it.each([
@@ -1037,8 +1093,8 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
     'ls -la src',
     'head -n 20 src/index.ts',
     'wc -l src/index.ts',
-  ])('still allows read-only evidence command %s', (command) => {
-    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  ])('still allows read-only evidence command %s (retained rules; node/npm/vitest/jest/eslint disabled by L4-P7d)', (command) => {
+    expectAllowlistVerdict(command, evolutionBins, null);
   });
 
   it('blocks the bypass commands before the sandbox executor through the Evolution router', async () => {
@@ -1077,15 +1133,16 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
     }
   });
 
-  it('passes the allowed node --test forms through the Evolution router unchanged', async () => {
-    const commands = [
+  it('blocks the formerly allowed node --test forms before the sandbox executor while code execution is disabled (L4-P7d)', async () => {
+    // L4-P7d：这些 node --test 写法原本经 Evolution router 放行；宿主只读沙箱启用前改为拒绝，rg 仍放行。
+    const disabled = [
       'node --test test/a.test.mjs',
       'node --test --test-name-pattern foo',
       'node --test --test-only --test-reporter=spec test/a.test.mjs',
-      'rg -o Recipe src',
     ];
+    const allowed = ['rg -o Recipe src'];
     const calls: string[] = [];
-    for (const command of commands) {
+    for (const command of [...disabled, ...allowed]) {
       const result = await runTerminalExec(
         command,
         baseToolContext({
@@ -1099,9 +1156,14 @@ describe('Evolution read-only allowlist tightening (I30)', () => {
         {},
         new ToolRouter({ capability: new Evolution().toDef() })
       );
-      expect(result.ok, command).toBe(true);
+      if (disabled.includes(command)) {
+        expect(result.ok, command).toBe(false);
+        expect(result.error, command).toContain(`(${CODE_EXECUTION_DISABLED_RULE})`);
+      } else {
+        expect(result.ok, command).toBe(true);
+      }
     }
-    expect(calls).toEqual(commands);
+    expect(calls).toEqual(allowed);
   });
 });
 
@@ -1318,12 +1380,7 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
       rule: 'allowlist-shell-brace-expansion',
     },
   ])('blocks equivalent spelling $command with $rule', ({ command, rule }) => {
-    const result = checkTerminalCommandAllowlist(command, evolutionBins);
-    expect(result.safe, command).toBe(false);
-    if (!result.safe) {
-      expect(result.block.rule, command).toBe(rule);
-      expect(result.block.reason).not.toBe('');
-    }
+    expectAllowlistVerdict(command, evolutionBins, rule);
   });
 
   it.each([
@@ -1406,7 +1463,7 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
     "rg ''#todo src",
     'tsc\t--noEmit\t-p\ttsconfig.json',
   ])('still allows read-only command %s', (command) => {
-    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+    expectAllowlistVerdict(command, evolutionBins, null);
   });
 
   it('applies bin-specific short options only to their own bin when callers allowlist other bins', () => {
@@ -1425,16 +1482,24 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
   it('logs every allowlist rejection with its rule id and without the raw option value', () => {
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     try {
-      const result = checkTerminalCommandAllowlist(
-        'npm test --script-shell=./scripts/secret-token-123.sh',
-        evolutionBins
-      );
+      const command = 'npm test --script-shell=./scripts/secret-token-123.sh';
+      // L4-P7d：开关关闭时 npm 整条拒绝；保留规则（开关恢复后）仍是包管理器选项拒绝，两条日志都不回显原始值。
+      const result = checkTerminalCommandAllowlist(command, evolutionBins);
       expect(result.safe).toBe(false);
       expect(warn).toHaveBeenCalledTimes(1);
       const message = String(warn.mock.calls[0]?.[0]);
-      expect(message).toContain('allowlist-package-manager-option');
+      expect(message).toContain(CODE_EXECUTION_DISABLED_RULE);
       expect(message).toContain('bin=npm');
       expect(message).not.toContain('secret-token-123');
+
+      warn.mockClear();
+      const retained = __testingRetainedCodeExecutionRules.check(command, evolutionBins);
+      expect(retained.safe).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const retainedMessage = String(warn.mock.calls[0]?.[0]);
+      expect(retainedMessage).toContain('allowlist-package-manager-option');
+      expect(retainedMessage).toContain('bin=npm');
+      expect(retainedMessage).not.toContain('secret-token-123');
 
       warn.mockClear();
       expect(checkTerminalCommandAllowlist('git log -n3', evolutionBins)).toEqual({ safe: true });
@@ -1468,9 +1533,10 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
       const cases = [
         { command: 'tsc # --noEmit', rule: 'allowlist-shell-comment', bin: 'tsc' },
         { command: 'tsc a.ts b.ts --noEmit', rule: 'allowlist-shell-whitespace' },
+        // L4-P7d：node 整条拒绝（保留规则下是 allowlist-test-path，见 L4-P7d 的日志用例）。
         {
           command: 'node --test test/.?/scripts/release.mjs',
-          rule: 'allowlist-test-path',
+          rule: CODE_EXECUTION_DISABLED_RULE,
           bin: 'node',
         },
       ];
@@ -1542,11 +1608,7 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
     { command: 'vitest run --expect.custom=./x.mjs', rule: 'allowlist-vitest-option' },
     { command: 'npm test -- --sequence.sequencer=./x.mjs', rule: 'allowlist-runner-option' },
   ])('blocks rework-review equivalent spelling $command with $rule', ({ command, rule }) => {
-    const result = checkTerminalCommandAllowlist(command, evolutionBins);
-    expect(result.safe, command).toBe(false);
-    if (!result.safe) {
-      expect(result.block.rule, command).toBe(rule);
-    }
+    expectAllowlistVerdict(command, evolutionBins, rule);
   });
 
   it.each([
@@ -1565,7 +1627,7 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
     'vitest run --sequence.shuffle.files --sequence.hooks=list --sequence.setupFiles=list',
     'vitest run --expect.requireAssertions --expect.poll.timeout=100',
   ])('still allows plain read-only spelling %s', (command) => {
-    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+    expectAllowlistVerdict(command, evolutionBins, null);
   });
 
   it('treats GNU getopt_long abbreviations of sed --in-place as in-place edits', () => {
@@ -1630,9 +1692,12 @@ describe('Evolution read-only allowlist normalized option policies (L4-P7a)', ()
 // 引号/转义/空格与内联取值、包管理器透传形式，并给不该误伤的写法补放行对照。
 describe('Evolution read-only allowlist rework after third-round review (L4-P7b)', () => {
   const evolutionBins = new Evolution().commandAllowlist.bins;
+  // 返回保留规则（开关恢复后）的结论，并断言生产判定与之一致（被禁用的 bin 改为 code-execution-disabled）。
   const blockedRule = (command: string): string | null => {
-    const result = checkTerminalCommandAllowlist(command, evolutionBins);
-    return result.safe ? null : result.block.rule;
+    const retained = __testingRetainedCodeExecutionRules.check(command, evolutionBins);
+    const retainedRule = retained.safe ? null : retained.block.rule;
+    expectAllowlistVerdict(command, evolutionBins, retainedRule);
+    return retainedRule;
   };
 
   // (4) vitest 4.1.6 的 ReportersMap 没有 basic；未知名字会被 loadCustomReporterModule 当模块 import 执行。
@@ -1682,9 +1747,7 @@ describe('Evolution read-only allowlist rework after third-round review (L4-P7b)
         `npm test -- --reporter=${name}`,
         `npm test -- --reporter ${name}`,
       ]) {
-        expect(checkTerminalCommandAllowlist(command, evolutionBins), command).toEqual({
-          safe: true,
-        });
+        expectAllowlistVerdict(command, evolutionBins, null);
       }
     }
     for (const name of builtins.filter((builtin) => !readonlyReporters.includes(builtin))) {
@@ -1732,9 +1795,7 @@ describe('Evolution read-only allowlist rework after third-round review (L4-P7b)
       `eslint --format ${name} src`,
       `eslint --format=${name} src`,
     ]) {
-      expect(checkTerminalCommandAllowlist(command, evolutionBins), command).toEqual({
-        safe: true,
-      });
+      expectAllowlistVerdict(command, evolutionBins, null);
     }
   });
 
@@ -1838,7 +1899,7 @@ describe('Evolution read-only allowlist rework after third-round review (L4-P7b)
     'rg x*y src',
     'cat README*',
   ])('still allows the glob that cannot expand to an option in %s', (command) => {
-    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+    expectAllowlistVerdict(command, evolutionBins, null);
   });
 
   it.skipIf(process.platform === 'win32')(
@@ -1890,11 +1951,15 @@ describe('Evolution read-only allowlist rework after third-round review (L4-P7b)
   it('blocks the third-round bypasses before the sandbox executor and logs their rule ids', async () => {
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     try {
+      // L4-P7d：vitest/npm/eslint/node 整条拒绝；它们在保留规则下的结论由上面的表格用例锁住。
       const cases = [
-        { command: 'vitest run --reporter=basic', rule: 'allowlist-exec-like-arg' },
-        { command: 'npm test -- --reporter basic', rule: 'allowlist-exec-like-arg' },
-        { command: 'eslint --format ./scripts/evil.js src', rule: 'allowlist-exec-like-arg' },
-        { command: 'node --test test/"."?/scripts/release.mjs', rule: 'allowlist-test-path' },
+        { command: 'vitest run --reporter=basic', rule: CODE_EXECUTION_DISABLED_RULE },
+        { command: 'npm test -- --reporter basic', rule: CODE_EXECUTION_DISABLED_RULE },
+        { command: 'eslint --format ./scripts/evil.js src', rule: CODE_EXECUTION_DISABLED_RULE },
+        {
+          command: 'node --test test/"."?/scripts/release.mjs',
+          rule: CODE_EXECUTION_DISABLED_RULE,
+        },
         { command: 'tsc\t# --noEmit', rule: 'allowlist-shell-comment' },
         { command: 'rg Recipe *', rule: 'allowlist-shell-glob-option' },
         { command: 'tsc -p tsconfig.json\u0000 --noEmit', rule: 'allowlist-shell-control-char' },
@@ -1928,6 +1993,623 @@ describe('Evolution read-only allowlist rework after third-round review (L4-P7b)
       warn.mockRestore();
     }
   });
+});
+
+// L4-P7d（用户决定 2026-10-18）：只读 allowlist 已三次被审计找到绕过，在宿主按 intent 为 Evolution 启用
+// 只读沙箱之前，暂时把会执行仓库代码的命令（node、npm/pnpm/yarn、npx、vitest、jest、eslint）整体移出
+// Evolution 的可执行范围，统一以 allowlist-code-execution-disabled 拒绝；纯读命令、tsc --noEmit 与
+// biome check 继续放行。同包一并修日志回显原始参数与花括号误拦两处低严重度问题。
+describe('Evolution code execution disabled until the host read-only sandbox lands (L4-P7d)', () => {
+  const evolutionBins = new Evolution().commandAllowlist.bins;
+  const DISABLED_RULE = 'allowlist-code-execution-disabled';
+  const productionRule = (command: string): string | null => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    return result.safe ? null : result.block.rule;
+  };
+
+  it.each([
+    // 审计确认（高）：空格分隔取值里的未加引号通配符经 /bin/sh 展开成额外的测试文件并被执行。
+    'node --test --test-name-pattern scripts/* test/a.test.mjs',
+    // 审计确认（中）：透传的文件参数让 tsc 忽略 tsconfig 的 noEmit 并写出 JS。
+    'npm run typecheck -- test/a.test.ts',
+    'pnpm run typecheck -- test/a.test.ts',
+    'yarn run build:check -- test/a.test.ts',
+    // node 任何形式：直接运行脚本、--test 模式、eval、只查版本，以及大小写变体。
+    'node scripts/release.mjs',
+    'node scripts/release.mjs --test',
+    'node --test',
+    'node --test test/a.test.mjs',
+    'node --test --test-name-pattern=foo test/a.test.mjs',
+    'node --test --test-only --test-reporter=spec test/a.test.mjs',
+    'node -e 1',
+    'node --version',
+    'NODE --test test/a.test.mjs',
+    'Node --test',
+    // 引号/转义拼出的命令名在 sh 里同样是 node，按去引号后的词判定。
+    '"node" --test test/a.test.mjs',
+    "no''de --test",
+    'n\\ode --test',
+    '\\npm test',
+    // npx 下载或运行项目里安装的任意包。
+    'npx vitest run',
+    'npx eslint src',
+    'npx tsc --noEmit',
+    'NPX jest',
+    // eslint 加载 JS 配置（eslint.config.js 等）时就会执行仓库代码。
+    'eslint src',
+    'eslint . --max-warnings 0',
+    'eslint -f json src',
+    'eslint src --ext .ts --format json',
+    // 包管理器的 test/run 与透传：脚本内容不可见，运行的就是仓库代码。
+    'npm test',
+    'npm test -- test/a.test.ts',
+    'npm test --silent -- --reporter=dot',
+    'npm run lint',
+    'npm run lint:check -s',
+    'npm run test:unit -- test/a.test.ts',
+    'npm run build:check',
+    'pnpm test',
+    'pnpm test -- test/a.test.ts',
+    'yarn test -- --testNamePattern=foo',
+    'yarn run lint',
+    'npm install',
+    // 测试运行器本身。
+    'vitest run',
+    'vitest run test/a.test.ts --reporter=dot',
+    'vitest related src/a.ts --run',
+    'jest',
+    'jest --ci --json',
+    'jest -t parses',
+  ])('rejects %s with allowlist-code-execution-disabled', (command) => {
+    const result = checkTerminalCommandAllowlist(command, evolutionBins);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(DISABLED_RULE);
+      // 原因要让模型明白这是阶段性禁用，并给出可用的只读取证路径，避免换写法反复重试。
+      expect(result.block.reason, command).toContain(
+        '宿主只读沙箱启用前，Evolution 不运行会执行仓库代码的命令'
+      );
+      expect(result.block.reason, command).toContain('read-only sandbox');
+      expect(result.block.reason, command).toContain('code.read');
+    }
+  });
+
+  it.each([
+    // 不执行仓库代码的取证命令保持放行（写类参数黑名单不变）。
+    'git log -n3',
+    'git blame -L 1,20 src/index.ts',
+    'git diff --stat HEAD~1',
+    'git show HEAD --stat',
+    'git status --porcelain',
+    'git rev-parse HEAD',
+    'git ls-files src',
+    'rg Recipe src',
+    'grep -rn Recipe src',
+    'ls -la src',
+    'cat package.json',
+    'head -n 20 src/index.ts',
+    'tail -n 20 src/index.ts',
+    'wc -l src/index.ts',
+    "find . -name '*.ts' -type f",
+    'tsc --noEmit',
+    'tsc --noEmit -p tsconfig.json',
+    'biome check src',
+    'biome ci src',
+  ])('still allows the read-only evidence command %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it.each([
+    // 复查：剩余 bin 里能执行代码的入口仍被拒绝（git 全局选项、外部 diff/textconv、find -exec 动作）。
+    { command: 'git -c core.pager=./x.sh log', rule: 'allowlist-git-subcommand' },
+    { command: 'git -c core.fsmonitor=./x.sh status', rule: 'allowlist-git-subcommand' },
+    { command: 'git --exec-path=./scripts log', rule: 'allowlist-git-subcommand' },
+    { command: 'git -C .. log', rule: 'allowlist-git-subcommand' },
+    { command: 'git --paginate log', rule: 'allowlist-git-subcommand' },
+    { command: 'git log -p --ext-diff', rule: 'allowlist-exec-like-arg' },
+    { command: 'git diff --textconv HEAD', rule: 'allowlist-exec-like-arg' },
+    { command: 'git show --ext-diff HEAD', rule: 'allowlist-exec-like-arg' },
+    { command: 'find . -exec cat {} +', rule: 'allowlist-exec-like-arg' },
+    { command: 'find . -execdir cat {} +', rule: 'allowlist-exec-like-arg' },
+    { command: 'find . -okdir cat {} +', rule: 'allowlist-exec-like-arg' },
+    { command: 'rg --pre ./x.sh Recipe src', rule: 'allowlist-exec-like-arg' },
+    { command: 'tsc --noEmit @scripts/args.txt', rule: 'allowlist-tsc-response-file' },
+    { command: 'biome lsp-proxy', rule: 'allowlist-biome-command' },
+  ])('keeps rejecting code-running entry points of the remaining bins: $command', ({
+    command,
+    rule,
+  }) => {
+    expect(productionRule(command), command).toBe(rule);
+  });
+
+  it('blocks the disabled commands before the sandbox executor through the Evolution router', async () => {
+    const commands = [
+      'node --test --test-name-pattern scripts/* test/a.test.mjs',
+      'npm run typecheck -- test/a.test.ts',
+      'node --test test/a.test.mjs',
+      'npm test',
+      'npx vitest run',
+      'eslint src',
+      'vitest run',
+      'jest --ci',
+    ];
+    for (const command of commands) {
+      let executorCalls = 0;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        }),
+        {},
+        new ToolRouter({ capability: new Evolution().toDef() })
+      );
+      expect(result.ok, command).toBe(false);
+      expect(result.error, command).toContain(`(${DISABLED_RULE})`);
+      expect(executorCalls, command).toBe(0);
+    }
+  });
+
+  it('logs the code-execution rejection with its rule id and bin but without the raw arguments', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = checkTerminalCommandAllowlist(
+        'node --test --test-name-pattern secret-token-314 scripts/private-dir/a.test.mjs',
+        evolutionBins
+      );
+      expect(result.safe).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain(`rule=${DISABLED_RULE}`);
+      expect(message).toContain('bin=node');
+      expect(message).toMatch(/args=4\b/);
+      expect(message).not.toContain('secret-token-314');
+      expect(message).not.toContain('private-dir');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    // 拒绝原因可以保留模型自己给出的参数，但 warn 日志只留规则 id、bin 与参数的类别/长度。
+    {
+      command: '/Users/someone/secret-token-123/git log',
+      rule: 'allowlist-path-qualified-bin',
+      secrets: ['secret-token-123', '/Users/someone'],
+      bin: '[path-qualified]',
+    },
+    {
+      command: './scripts/secret-token-124/cat package.json',
+      rule: 'allowlist-path-qualified-bin',
+      secrets: ['secret-token-124', './scripts'],
+      bin: '[path-qualified]',
+    },
+    {
+      command: 'tsc --noEmit @/tmp/secret-token-456/args.txt',
+      rule: 'allowlist-tsc-response-file',
+      secrets: ['secret-token-456', '/tmp/'],
+      bin: 'tsc',
+    },
+    {
+      command: 'git ghp_SecretToken789 log',
+      rule: 'allowlist-git-subcommand',
+      secrets: ['secrettoken789', 'SecretToken789'],
+      bin: 'git',
+    },
+    {
+      command: 'ghp_SecretToken000 status',
+      rule: 'allowlist-denied-bin',
+      secrets: ['secrettoken000', 'SecretToken000'],
+      bin: '[unlisted]',
+    },
+    {
+      command: 'rg --hostname-bin=/Users/someone/secret-token-555.sh Recipe src',
+      rule: 'allowlist-exec-like-arg',
+      secrets: ['secret-token-555', '/Users/someone', 'hostname-bin'],
+      bin: 'rg',
+    },
+  ])('keeps raw arguments out of the warn log for $rule', ({ command, rule, secrets, bin }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = checkTerminalCommandAllowlist(command, evolutionBins);
+      expect(result.safe, command).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule, command).toBe(rule);
+      }
+      expect(warn, command).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message, command).toContain(`rule=${rule}`);
+      expect(message, command).toContain(`bin=${bin}`);
+      expect(message, command).toMatch(/args=\d+/);
+      expect(message, command).toMatch(/chars=\d+/);
+      expect(message, command).not.toContain('reason=');
+      for (const secret of secrets) {
+        expect(message, `${command} leaks ${secret}`).not.toContain(secret);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    // 保留规则（开关恢复后）的拒绝原因同样不进日志：测试路径、模块值都可能是绝对路径或像凭据的字符串。
+    {
+      command: 'node --test /Users/someone/secret-token-777/a.test.mjs',
+      rule: 'allowlist-test-path',
+      secrets: ['secret-token-777', '/Users/someone'],
+    },
+    {
+      command: 'npm test -- scripts/secret-token-778.mjs',
+      rule: 'allowlist-test-path',
+      secrets: ['secret-token-778'],
+    },
+    {
+      command: 'eslint --format ./scripts/secret-token-779.js src',
+      rule: 'allowlist-exec-like-arg',
+      secrets: ['secret-token-779'],
+    },
+    {
+      command: 'node --test --test-reporter=./secret-token-780.cjs',
+      rule: 'allowlist-node-option-value',
+      secrets: ['secret-token-780'],
+    },
+  ])('keeps raw arguments of the retained $rule out of the warn log', ({
+    command,
+    rule,
+    secrets,
+  }) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = __testingRetainedCodeExecutionRules.check(command, evolutionBins);
+      expect(result.safe, command).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule, command).toBe(rule);
+        // 返回给模型的原因仍可带它自己给出的参数。
+        expect(result.block.reason, command).toContain(secrets[0]);
+      }
+      expect(warn, command).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message, command).toContain(`rule=${rule}`);
+      for (const secret of secrets) {
+        expect(message, `${command} leaks ${secret}`).not.toContain(secret);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // 开关恢复前必须先修的两条已确认绕过（见 terminalSafety.ts 的 EVOLUTION_CODE_EXECUTION_ENABLED 注释）。
+  // 保留规则今天仍放行它们，所以用 it.fails 逐条记录：修好其中一条时对应用例会变红，届时去掉它的 .fails
+  // 并补上等价写法；两条都修好之后才考虑恢复开关。
+  it.fails('retained node --test rules still accept the unquoted glob in a space-separated pattern value (must fix before restoring)', () => {
+    const command = 'node --test --test-name-pattern scripts/* test/a.test.mjs';
+    expect(__testingRetainedCodeExecutionRules.check(command, evolutionBins).safe).toBe(false);
+  });
+
+  it.fails('retained package-script rules still pass file arguments through to typecheck (must fix before restoring)', () => {
+    const command = 'npm run typecheck -- test/a.test.ts';
+    expect(__testingRetainedCodeExecutionRules.check(command, evolutionBins).safe).toBe(false);
+  });
+
+  it('tells the Evolution model that test and lint commands are disabled', () => {
+    const evolution = new Evolution();
+    const prompt = evolution.promptFragment;
+    expect(prompt).toContain('宿主只读沙箱启用前，Evolution 不运行会执行仓库代码的命令');
+    expect(prompt).toContain('当前不能运行测试或 lint 脚本');
+    expect(prompt).toContain(DISABLED_RULE);
+    expect(prompt).toContain('不要尝试');
+    expect(prompt).toContain('tsc --noEmit');
+    expect(prompt).toContain('biome check');
+    expect(prompt).toContain('code.read');
+    // 旧提示把 npm test / vitest run / eslint 列为可用的取证命令，不能再出现。
+    expect(prompt).not.toMatch(/允许使用 terminal\.exec/);
+    expect(prompt).not.toMatch(/取证命令[^\n]*(?:npm test|vitest run|eslint)/);
+    expect(evolution.description).toContain('read-only evidence');
+    // bins 原样保留（开关恢复后不必改能力声明），实际拒绝由 terminalSafety 的开关决定。
+    expect(evolution.commandAllowlist.bins).toEqual(
+      expect.arrayContaining(['node', 'npm', 'pnpm', 'yarn', 'vitest', 'jest', 'eslint'])
+    );
+  });
+
+  it('still returns the model-supplied argument in the rejection reason', () => {
+    const result = checkTerminalCommandAllowlist(
+      '/Users/someone/secret-token-123/git log',
+      evolutionBins
+    );
+    expect(result.safe).toBe(false);
+    if (!result.safe) {
+      expect(result.block.reason).toContain('/Users/someone/secret-token-123/git');
+    }
+  });
+
+  it.each([
+    // sh 不会展开的花括号：git 的 reflog 选择器 @{…}、不含逗号或 '..' 的单项花括号、find 的 {}。
+    'git log HEAD@{1} -n1',
+    'git show stash@{0}',
+    'git diff HEAD@{1} HEAD',
+    'git log -n1 main@{upstream}',
+    'git log -n1 HEAD@{2.days.ago}',
+    'rg x{a}y src',
+    'rg {} src',
+    // 引号或反斜杠转义的逗号不触发展开。
+    'rg x{a\\,b}y src',
+    "rg x{'a,b'}y src",
+    'rg "x{a,b}y" src',
+  ])('allows the brace form that the host shell does not expand: %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it.each([
+    'rg x{a,b}y src',
+    'git log {1..3}',
+    'git show HEAD@{1,2}',
+    'git log HEAD@{a..c}',
+    'ls src/{a,b}',
+    'cat x{1..3}.ts',
+    'rg a{b{c,d}} src',
+    'rg a{b,{c}} src',
+    'rg --{pre,x}=sh Recipe src',
+    // 复查发现：bash 在层级 0、尚无逗号时跳过 '}'，后面的逗号与 '}' 仍构成一组。'--{glob=},pre=./x.sh}'
+    // 展开成 '--glob=}' 与 '--pre=./x.sh'（rg 对每个文件执行 ./x.sh），按“'{' 配最近的 '}'”判定会漏拒。
+    'rg --{glob=},pre=./x.sh} Recipe src',
+    'rg {a}b,c} src',
+    'git log --{x},output=y}',
+    'git show stash@{0},--output=x}',
+    'rg {{a,b} src',
+    'rg x{a}{b,c} src',
+    'git log HEAD@{1}..{2,3}',
+  ])('rejects the brace form that the host shell expands: %s', (command) => {
+    expect(productionRule(command), command).toBe('allowlist-shell-brace-expansion');
+  });
+
+  it.each([
+    // 层级 0 的 '}' 先于分隔符出现时不闭合；内层组在词尾前闭合后，外层仍无可配对的 '}'，bash 原样保留。
+    'git log HEAD@{1}..HEAD@{0}',
+    'git diff stash@{0}..stash@{1}',
+    'git log HEAD@{1}...HEAD@{2} -n3',
+    'git log HEAD@{1}..HEAD',
+    'rg {}x{} src',
+  ])('allows the reflog range the host shell does not expand: %s', (command) => {
+    expect(checkTerminalCommandAllowlist(command, evolutionBins)).toEqual({ safe: true });
+  });
+
+  it('fails closed with the brace rule when one word holds too many unquoted "{" to pair', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      // 64 个候选以内照常逐个配对（都不闭合 → 放行）；超过上限不再配对，直接拒绝并说明原因。
+      expect(checkTerminalCommandAllowlist(`rg ${'{'.repeat(64)} src`, evolutionBins)).toEqual({
+        safe: true,
+      });
+      const started = Date.now();
+      const result = checkTerminalCommandAllowlist(
+        `rg ${'{'.repeat(65)}${'x'.repeat(30_000)} src`,
+        evolutionBins
+      );
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(result.safe).toBe(false);
+      if (!result.safe) {
+        expect(result.block.rule).toBe('allowlist-shell-brace-expansion');
+        expect(result.block.reason).toContain('More than 64 unquoted "{"');
+      }
+      const message = String(warn.mock.calls.at(-1)?.[0]);
+      expect(message).toContain('rule=allowlist-shell-brace-expansion');
+      expect(message).not.toContain('xxxx');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects every word that the host bash brace-expands (seeded differential corpus)',
+    () => {
+      const runShell = (script: string) =>
+        execFileSync('/bin/sh', ['-c', script], { encoding: 'utf8', timeout: 20_000 });
+      // dash 等不做花括号展开的 sh 没有可对照的展开行为；本用例只在 bash（macOS 的 /bin/sh）上有意义。
+      if (runShell("printf '[%s]' {p,q}") === '[{p,q}]') {
+        return;
+      }
+      // 固定种子的线性同余序列，生成只含花括号、逗号、点等字符的词，保证每次运行同一语料。
+      let seed = 20261018;
+      const next = () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed;
+      };
+      // 花括号、逗号与点加权，让语料里有足够多会展开（以及形似展开却不展开）的词。不含数字：
+      // '{1..1111111}' 这类数字序列会展开出上百万个词；单字符的字母/符号序列最多几十项。
+      const alphabet = ['{', '{', '{', '}', '}', '}', ',', ',', '.', '.', 'a', 'b', '-', '@', '='];
+      const corpus = new Set<string>([
+        '--{glob=},pre=./x.sh}',
+        '{a}b,c}',
+        'HEAD@{1}..HEAD@{0}',
+        '{{a,b}',
+        'a}{b,c}',
+        '{a..c}',
+        '{a..}',
+      ]);
+      while (corpus.size < 600) {
+        const length = 3 + (next() % 10);
+        let word = '';
+        for (let index = 0; index < length; index++) {
+          word += alphabet[next() % alphabet.length];
+        }
+        corpus.add(word);
+      }
+      const words = [...corpus];
+      // 一次 sh 调用输出全部词：开启花括号展开与 set +B 关闭展开各跑一遍，逐行比较即可知道 bash 是否展开。
+      const script = words.map((word) => `printf '[%s]' ${word}; echo`).join('; ');
+      const expanded = runShell(script).split('\n');
+      const literal = runShell(`set +B; ${script}`).split('\n');
+      let expandingWords = 0;
+      for (const [index, word] of words.entries()) {
+        if (expanded[index] === literal[index]) {
+          continue;
+        }
+        expandingWords++;
+        expect(productionRule(`cat ${word}`), `bash expands ${word}`).toBe(
+          'allowlist-shell-brace-expansion'
+        );
+      }
+      // 语料里必须真的含有会展开的词，否则这条差分用例什么也没验证。
+      expect(expandingWords).toBeGreaterThan(40);
+    }
+  );
+
+  // 复查发现（L4-P7d 第 5 条“发现即补”）：git 的仓库发现从工作目录开始，项目里形似裸仓库的被跟踪目录会被当作
+  // git 目录，其 config 的 diff.external 让 git diff 执行仓库提供的程序。只读 allowlist 下 git 只在项目根运行。
+  it.each([
+    'git log -n3',
+    'git diff --no-index a.txt b.txt',
+    'git status',
+    'git show HEAD --stat',
+  ])('rejects %s outside the project root with allowlist-git-cwd', (command) => {
+    expect(productionRule(command), `${command} (no cwd context)`).toBeNull();
+    expect(
+      checkTerminalCommandAllowlist(command, evolutionBins, { cwdIsProjectRoot: true })
+    ).toEqual({ safe: true });
+    const result = checkTerminalCommandAllowlist(command, evolutionBins, {
+      cwdIsProjectRoot: false,
+    });
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe('allowlist-git-cwd');
+      expect(result.block.reason, command).toContain('omit cwd');
+    }
+  });
+
+  it.each([
+    'rg Recipe .',
+    'ls -la',
+    'cat package.json',
+    'tsc --noEmit',
+    'find . -name "*.ts"',
+  ])('keeps %s allowed in a subdirectory (only git discovers configuration from the working directory)', (command) => {
+    expect(
+      checkTerminalCommandAllowlist(command, evolutionBins, { cwdIsProjectRoot: false })
+    ).toEqual({ safe: true });
+  });
+
+  it('blocks git with a subdirectory cwd before the sandbox executor through the Evolution router', async () => {
+    mkdirSync(path.join(projectRoot, 'bare-shaped'), { recursive: true });
+    const calls: Array<{ command: string; cwd: unknown }> = [];
+    const context = baseToolContext({
+      sandboxExecutor: {
+        exec: async (command: string, opts: { cwd?: unknown }) => {
+          calls.push({ command, cwd: opts.cwd });
+          return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+        },
+      },
+    });
+    const router = new ToolRouter({ capability: new Evolution().toDef() });
+
+    const blocked = await runTerminalExec(
+      'git diff --no-index a.txt b.txt',
+      context,
+      { cwd: 'bare-shaped' },
+      router
+    );
+    expect(blocked.ok).toBe(false);
+    expect(blocked.error).toContain('(allowlist-git-cwd)');
+    expect(calls).toEqual([]);
+
+    // 项目根（省略 cwd、'.'、绕回根的相对路径、根的绝对路径）照常执行；其他只读命令在子目录照常执行。
+    for (const cwd of [undefined, '.', 'bare-shaped/..', projectRoot]) {
+      const result = await runTerminalExec(
+        'git log -n1',
+        context,
+        cwd === undefined ? {} : { cwd },
+        router
+      );
+      expect(result.ok, String(cwd)).toBe(true);
+    }
+    const rg = await runTerminalExec('rg Recipe .', context, { cwd: 'bare-shaped' }, router);
+    expect(rg.ok).toBe(true);
+    expect(calls.map((call) => call.cwd)).toEqual([
+      projectRoot,
+      projectRoot,
+      projectRoot,
+      projectRoot,
+      path.join(projectRoot, 'bare-shaped'),
+    ]);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'keeps repository-provided git config programs from running through a bare-shaped subdirectory',
+    async () => {
+      const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'agent-git-cwd-')));
+      try {
+        // 仓库内容里一个形似裸仓库的目录（git init --bare 生成的 HEAD/config/objects/refs 都能作为普通文件跟踪），
+        // 它的 config 把 diff.external 指向仓库自带的脚本。
+        execFileSync('git', ['init', '-q', '--bare', 'bare-shaped'], { cwd: root });
+        const hook = path.join(root, 'bare-shaped', 'hook.sh');
+        writeFileSync(hook, '#!/bin/sh\necho ran > "$(dirname "$0")/marker"\n', { mode: 0o755 });
+        execFileSync('git', [
+          'config',
+          '--file',
+          path.join(root, 'bare-shaped', 'config'),
+          'diff.external',
+          hook,
+        ]);
+        writeFileSync(path.join(root, 'a.txt'), 'a\n');
+        writeFileSync(path.join(root, 'b.txt'), 'b\n');
+        const marker = path.join(root, 'bare-shaped', 'marker');
+
+        // 对照：不经 allowlist 直接在该目录运行只读的 git diff，仓库提供的程序就会被执行。
+        try {
+          execFileSync('git', ['diff', '--no-index', '../a.txt', '../b.txt'], {
+            cwd: path.join(root, 'bare-shaped'),
+            stdio: 'ignore',
+          });
+        } catch (err: unknown) {
+          // 两个文件不同时 git diff 以 1 退出；这里只关心外部程序有没有运行。
+          expect(err).toBeInstanceOf(Error);
+        }
+        expect(existsSync(marker)).toBe(true);
+        rmSync(marker);
+
+        // 经 Evolution router 走真实执行（显式允许无沙箱的 plain exec）：子目录 cwd 在启动进程前被拒绝。
+        const router = new ToolRouter({ capability: new Evolution().toDef() });
+        const plainContext: ToolContext = {
+          projectRoot: root,
+          tokenBudget: 4000,
+          allowUnsandboxedTerminal: true,
+        };
+        const blocked = await runTerminalExec(
+          'git diff --no-index ../a.txt ../b.txt',
+          plainContext,
+          { cwd: 'bare-shaped' },
+          router
+        );
+        expect(blocked.ok).toBe(false);
+        expect(blocked.error).toContain('(allowlist-git-cwd)');
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'models the host /bin/sh brace expansion behind the relaxed brace rule',
+    () => {
+      // 差分对照：@{…}、单项花括号、转义或加引号的逗号在任何 sh 里都原样传给命令；
+      // 带逗号或 a..b 序列的形态在 bash（macOS 的 /bin/sh）里会展开成多个词。
+      const shellArgv = (rest: string) =>
+        execFileSync('/bin/sh', ['-c', `printf '[%s]' ${rest}`], { encoding: 'utf8' });
+      expect(shellArgv('HEAD@{1} stash@{0} x{a}y {} @{2.days.ago}')).toBe(
+        '[HEAD@{1}][stash@{0}][x{a}y][{}][@{2.days.ago}]'
+      );
+      expect(shellArgv("x{a\\,b}y x{'a,b'}y")).toBe('[x{a,b}y][x{a,b}y]');
+      if (shellArgv('{p,q}') !== '[{p,q}]') {
+        expect(shellArgv('x{a,b}y')).toBe('[xay][xby]');
+        expect(shellArgv('{1..3}')).toBe('[1][2][3]');
+        expect(shellArgv('a{b{c,d}}')).toBe('[a{bc}][a{bd}]');
+      }
+    }
+  );
 });
 
 // I31：危险命令黑名单的 wrapper 解包、find -exec 递归、命令替换切分，以及 sudo/su/dd/eval 的 token 级判定。

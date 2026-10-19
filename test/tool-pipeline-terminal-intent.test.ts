@@ -248,7 +248,8 @@ describe('terminal intent reaches the host executor on the production chain (L4-
     }));
     const { runtime, loopCtx } = makeProductionLikeRun({ capabilities: [new Evolution()], exec });
 
-    const outcome = await createToolPipeline().execute(terminalCall('npm test'), {
+    // L4-P7d：npm test 在宿主只读沙箱启用前被 allowlist 拒绝，这里换成仍放行的只读命令验证 intent 透传。
+    const outcome = await createToolPipeline().execute(terminalCall('tsc --noEmit'), {
       runtime,
       loopCtx,
       iteration: 1,
@@ -268,7 +269,8 @@ describe('terminal intent reaches the host executor on the production chain (L4-
     });
     const { runtime, loopCtx } = makeProductionLikeRun({ capabilities: [new Evolution()], exec });
 
-    const outcome = await createToolPipeline().execute(terminalCall('npm test'), {
+    // L4-P7d：同上，npm test 已被拒绝，换成仍放行的只读命令。
+    const outcome = await createToolPipeline().execute(terminalCall('tsc --noEmit'), {
       runtime,
       loopCtx,
       iteration: 1,
@@ -281,6 +283,67 @@ describe('terminal intent reaches the host executor on the production chain (L4-
       expect.objectContaining({ code: 'terminal_execution_failed' })
     );
     expect(calls[0]?.intent).toEqual({ network: 'none', filesystem: 'read-only' });
+  });
+
+  it('blocks code-running commands on the production chain before the host executor (L4-P7d)', async () => {
+    // 生产链路（Adapter 不带 capability）由 accessGates 按 loopCtx.capabilities 检查 allowlist：宿主只读沙箱
+    // 启用前，会执行仓库代码的命令在调度宿主之前就被拒绝，原因告诉模型改用只读命令与代码工具取证。
+    for (const command of [
+      'npm test',
+      'node --test test/a.test.mjs',
+      'npx vitest run',
+      'eslint src',
+    ]) {
+      const { exec } = capturingExecutor();
+      const { runtime, loopCtx } = makeProductionLikeRun({ capabilities: [new Evolution()], exec });
+      const outcome = await createToolPipeline().execute(terminalCall(command), {
+        runtime,
+        loopCtx,
+        iteration: 1,
+      });
+      expect(outcome.metadata.blocked, command).toBe(true);
+      expect(JSON.stringify(outcome), command).toContain('host read-only sandbox is enabled');
+      expect(exec, command).not.toHaveBeenCalled();
+    }
+  });
+
+  it('runs git only at the project root on the production chain (L4-P7d allowlist-git-cwd)', async () => {
+    // 生产链路的 accessGates 在 handler 解析 cwd 之前检查：子目录 cwd 的 git 在调度宿主前被拒绝（形似裸仓库的
+    // 目录会让 git 读取仓库提供的 config 并执行 diff.external 等程序），项目根与其他只读命令不受影响。
+    const terminalCallAt = (command: string, cwd: string) => ({
+      id: `call-${command}-${cwd}`,
+      name: 'terminal',
+      args: { action: 'exec', params: { command, cwd } },
+    });
+    for (const cwd of ['src', './src/', 'src/tools/..']) {
+      const { exec } = capturingExecutor();
+      const { runtime, loopCtx } = makeProductionLikeRun({ capabilities: [new Evolution()], exec });
+      const outcome = await createToolPipeline().execute(
+        terminalCallAt('git diff --no-index a.txt b.txt', cwd),
+        { runtime, loopCtx, iteration: 1 }
+      );
+      expect(outcome.metadata.blocked, cwd).toBe(true);
+      expect(JSON.stringify(outcome), cwd).toContain('git runs only at the project root');
+      expect(exec, cwd).not.toHaveBeenCalled();
+    }
+
+    const allowed: Array<{ command: string; cwd: string }> = [
+      { command: 'git log -n1', cwd: '.' },
+      { command: 'git log -n1', cwd: 'src/..' },
+      { command: 'git log -n1', cwd: process.cwd() },
+      { command: 'rg Recipe .', cwd: 'src' },
+    ];
+    for (const { command, cwd } of allowed) {
+      const { calls, exec } = capturingExecutor();
+      const { runtime, loopCtx } = makeProductionLikeRun({ capabilities: [new Evolution()], exec });
+      const outcome = await createToolPipeline().execute(terminalCallAt(command, cwd), {
+        runtime,
+        loopCtx,
+        iteration: 1,
+      });
+      expect(outcome.metadata.blocked, `${command} @ ${cwd}`).toBe(false);
+      expect(calls[0]?.command, `${command} @ ${cwd}`).toBe(command);
+    }
   });
 
   it('never reaches the executor when the capability allowlist denies the command or the loop is cancelled', async () => {

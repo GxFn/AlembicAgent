@@ -27,6 +27,9 @@
  *    取决于 shell，出现时“注释到行尾”与“'#' 是字面量”两种读法都检查，任一读法命中或无法切分即拦截。
  *    超过 MAX_TERMINAL_COMMAND_LENGTH 的命令不做切分，直接 fail-closed（同步检查不能长时间占住事件循环）。
  * 2. checkTerminalCommandAllowlist —— 只读能力（Evolution）的 bin 白名单与写类参数/子命令约束。
+ *    宿主只读沙箱启用前，会执行仓库代码的命令（node、npm/pnpm/yarn、npx、vitest、jest、eslint）由
+ *    EVOLUTION_CODE_EXECUTION_ENABLED 整体关闭（L4-P7d），以 allowlist-code-execution-disabled 拒绝；
+ *    调用方告知工作目录不在项目根时 git 以 allowlist-git-cwd 拒绝（见 TerminalAllowlistCallContext）。
  */
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
@@ -63,6 +66,46 @@ const READONLY_PACKAGE_SCRIPTS = new Set(['test', 'lint', 'build:check', 'typech
 const READONLY_BIOME_COMMANDS = new Set(['check', 'ci']);
 
 /*
+ * Evolution 代码执行开关（L4-P7d，用户决定 2026-10-18，负责方：AlembicAgent 窗口）
+ *
+ * 为什么关闭：只读 allowlist 是 Evolution 唯一的只读屏障——宿主 SandboxExecutorBridge 目前不读
+ * opts.intent，仍按固定的可写项目目录 profile 执行。测试运行器、包管理器脚本与 eslint 本身就会执行仓库代码，
+ * 静态参数检查已三次被审计找到绕过，最近一次确认的两条见下方“恢复前必须先修”。所以在宿主真正提供只读
+ * 文件系统之前，这类命令整体不运行，而不是继续追加参数规则。
+ *
+ * 关闭时拒绝（规则 allowlist-code-execution-disabled，不看参数）：
+ * - node 的任何形式（含 node --test、直接运行脚本、-e、--version）；
+ * - npm/pnpm/yarn 的全部子命令（只读 allowlist 原本只放行 test 与 run，二者连同 '--' 透传都会执行仓库脚本）；
+ * - npx（运行项目安装的或现下载的任意包）；
+ * - vitest、jest（加载并执行测试文件与配置）；
+ * - eslint（加载 eslint.config.js 等 JS 配置时就执行仓库代码）。
+ * 仍放行：git 只读子命令（只在项目根运行，见 TerminalAllowlistCallContext）、rg、grep、ls、cat、head、tail、
+ * wc、find（写类/执行类参数黑名单不变）、tsc --noEmit、biome check/ci —— 它们只读取文件，不加载仓库里的 JS。
+ *
+ * 恢复条件：宿主 SandboxExecutorBridge 按 intent 为 Evolution 启用只读文件系统并验收通过（L4-P38 / I47）。
+ * 恢复前必须先修掉两条已确认的绕过（规则代码保留在 checkNodeSubcommand 与 checkPackageManagerSubcommand /
+ * checkRunnerPassthrough，开关恢复后仍要用）：
+ * 1.（高）'node --test --test-name-pattern scripts/* test/a.test.mjs'：空格写法的需值选项把紧随的 token
+ *    当作值，但宿主 /bin/sh 先做路径名展开，未加引号的 scripts/* 展开成多个词，第一个成为 pattern 值，其余成为
+ *    --test 的位置参数被执行；
+ * 2.（中）'npm run typecheck -- test/a.test.ts'：透传的文件参数让 tsc 忽略 tsconfig（含 noEmit）并写出 JS。
+ * 恢复时把本常量改回 true，并把测试里按“已禁用”断言的用例改回放行断言。
+ */
+const EVOLUTION_CODE_EXECUTION_ENABLED: boolean = false;
+
+/** 开关关闭时整体拒绝的 bin：运行它们就会执行被分析仓库里的代码（见上）。 */
+const CODE_EXECUTING_BINS = new Set([
+  'node',
+  'npm',
+  'pnpm',
+  'yarn',
+  'npx',
+  'vitest',
+  'jest',
+  'eslint',
+]);
+
+/*
  * 只读 allowlist 的选项判定（L4-P07 → L4-P7a）
  *
  * 7ac8836 只按字面拼写比较黑名单，审计用同一 bin 的等价拼写全部绕过：tsc 的单横线长选项
@@ -83,12 +126,14 @@ const READONLY_BIOME_COMMANDS = new Set(['check', 'ci']);
  *    git blame --incremental、ls -fls、grep -i、rg -u 都是只读参数。
  * 4. 测试运行器（vitest/jest/node --test）与包管理器自身选项改为白名单；包管理器 '--' 之后交给
  *    运行器无关的透传规则：运行器未知，所以取 vitest/jest/node --test 以及 lint/typecheck 脚本的并集从严判定。
- * 5. 宿主经 '/bin/sh -c' 执行命令，shell 层变换会让真实 argv 偏离本检查看到的词：未加引号的花括号展开、
+ * 5. 宿主经 '/bin/sh -c' 执行命令，shell 层变换会让真实 argv 偏离本检查看到的词：未加引号的花括号展开
+ *    （按 bash 的配对规则判定：HEAD@{1}、x{a}y 原样保留，{a,b}、{1..3}、{a}b,c} 会展开，见 findBraceExpansion）、
  *    词首 '#' 注释（丢掉其后的词）、空格/制表符以外的空白（本检查切词、sh 不切）、NUL 等控制字符（NUL 截断
  *    交给 sh 的 C 字符串）、能展开成以 '-' 开头的文件名的未加引号 glob（仓库里名为 '--pre=sh' 的文件让
  *    'rg Recipe *' 多出一个执行选项），以及测试路径里以 '.' 开头的 glob 段（展开成 '..'）。
  *    这些写法一律拒绝，而不是尝试模拟 shell 展开结果。
  * 这些都只是静态 literal 检查；npm test 等命令仍会执行仓库自身代码，真正只读要靠宿主只读沙箱（L4-P38）。
+ * 在那之前这类命令由 EVOLUTION_CODE_EXECUTION_ENABLED 整体关闭，第 4 条的运行器/透传规则保留待恢复时使用。
  */
 
 /** 选项风险类别：写盘、加载/执行模型挑选的模块或可执行文件、开端口/起服务。类别决定拒绝规则 id。 */
@@ -3027,26 +3072,75 @@ function logSafetyDecision(message: string): void {
   Logger.getInstance().debug(`[terminalSafety] ${message}`);
 }
 
+/**
+ * 只读 allowlist 检查的调用上下文：调用方掌握命令工作目录时传入（terminal handler 与 agent 层 accessGates
+ * 都传）。只检查命令文本的调用方不传，此时不做依赖工作目录的检查。
+ */
+export interface TerminalAllowlistCallContext {
+  /**
+   * 命令工作目录是否就是项目根。为 false 时 git 被拒绝（allowlist-git-cwd，L4-P7d 复查发现）：项目里形似裸仓库
+   * 的目录（HEAD、config、objects/、refs/ 都能作为普通文件被跟踪）会被 git 当作仓库，工作目录落在其中时 git 读取
+   * 它的 config，diff.external、textconv 驱动等会让 git diff/log/show 执行仓库提供的程序（实测 git diff --no-index
+   * 即可触发）。项目根下 git 找到的是项目自己的 .git，不受仓库内容控制。
+   */
+  cwdIsProjectRoot?: boolean;
+}
+
 export function checkTerminalCommandAllowlist(
   command: string,
-  bins: readonly string[]
+  bins: readonly string[],
+  context: TerminalAllowlistCallContext = {}
 ): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
-  const { bin, result } = evaluateTerminalCommandAllowlist(command, bins);
-  if (!result.safe) {
-    // 每个拒绝分支都在这一处留日志：规则 id + bin + 原因。原因里 '=' 之后的选项值已被省略，只有被校验的
-    // reporter/formatter 这类模块名值会截断回显，便于定位；日志不回显整条命令（审计侧只记命令哈希），
-    // 避免把模型写进参数的凭据或路径带进诊断旁路。
-    logAllowlistBlock(bin, result.block);
+  return checkAllowlistWithPolicy(command, bins, EVOLUTION_CODE_EXECUTION_ENABLED, context);
+}
+
+/**
+ * 仅供测试（terminalSafety 不在任何公开出口里）：按“代码执行开关已恢复”的策略评估，让保留的运行器、
+ * 包管理器透传与 eslint/vitest/jest 规则在开关关闭期间仍有回归保护，恢复时不必重新验证一遍。
+ * 生产调用方只能用 checkTerminalCommandAllowlist；这里同样走拒绝日志，便于断言日志不回显原始参数。
+ */
+export const __testingRetainedCodeExecutionRules = {
+  check(
+    command: string,
+    bins: readonly string[],
+    context: TerminalAllowlistCallContext = {}
+  ): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
+    return checkAllowlistWithPolicy(command, bins, true, context);
+  },
+};
+
+function checkAllowlistWithPolicy(
+  command: string,
+  bins: readonly string[],
+  codeExecutionEnabled: boolean,
+  context: TerminalAllowlistCallContext
+): AllowlistResult {
+  const evaluation = evaluateTerminalCommandAllowlist(command, bins, codeExecutionEnabled, context);
+  if (!evaluation.result.safe) {
+    // 每个拒绝分支都在这一处留日志：规则 id + bin + 参数的类别与长度。原因（reason）里可能带模型给出的
+    // 原始参数（测试路径、路径限定的可执行文件、tsc 响应文件、git 子命令名、模块值……），只回给模型，不进日志；
+    // 日志也不回显整条命令（审计侧只记命令哈希），避免把模型写进参数的凭据或路径带进诊断旁路。
+    logAllowlistBlock(command, bins, evaluation);
   }
-  return result;
+  return evaluation.result;
 }
 
 type AllowlistResult = { safe: true } | { safe: false; block: TerminalSafetyBlock };
 
+interface AllowlistEvaluation {
+  /** 规范化后的命令名，或 '[unparsed]'、'[empty]'、'[path-qualified]' 占位；日志再按白名单脱敏。 */
+  bin: string;
+  /** 切分后命令名之后的参数；命令未能切分时缺省。只用于日志里的计数，不回显内容。 */
+  args?: readonly string[];
+  result: AllowlistResult;
+}
+
 function evaluateTerminalCommandAllowlist(
   command: string,
-  bins: readonly string[]
-): { bin: string; result: AllowlistResult } {
+  bins: readonly string[],
+  codeExecutionEnabled: boolean,
+  context: TerminalAllowlistCallContext
+): AllowlistEvaluation {
   if (containsShellMeta(command)) {
     return {
       bin: '[unparsed]',
@@ -3088,15 +3182,24 @@ function evaluateTerminalCommandAllowlist(
       result: readonlyBlock('allowlist-unparseable-command', words.error),
     };
   }
-  if (hasUnquotedBrace(command)) {
+  const [rawBin, ...args] = words.words;
+  // shell 层拒绝发生在识别命令名之前，bin 只用于日志（logAllowlistBlock 按白名单脱敏）。
+  const shellLevelBin = (rawBin ?? '[empty]').toLowerCase();
+  const braceExpansion = findBraceExpansion(command);
+  if (braceExpansion !== 'none') {
     // 宿主 /bin/sh（macOS 上是 bash）会做花括号展开：`--{hostname-bin=./x.sh,hyperlink-format=file}`
     // 在本检查看来是一个未知选项，执行时却展开成两个独立选项。静态 literal 检查无法跟踪展开结果，直接拒绝；
-    // 引号或反斜杠里的花括号不会展开，不受影响。
+    // 判定按 bash 的配对规则（见 findBraceExpansion）：HEAD@{1}、stash@{0}、x{a}y、{} 原样传给命令，不受影响，
+    // 而 '--{glob=},pre=./x.sh}' 这类先出现 '}' 再出现逗号的写法同样会展开，必须拒绝。
+    // 'too-complex' 是单词里候选 '{' 过多时的 fail-closed 短路（避免逐个配对占住事件循环），规则 id 相同、原因不同。
     return {
-      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      bin: shellLevelBin,
+      args,
       result: readonlyBlock(
         'allowlist-shell-brace-expansion',
-        'Unquoted brace expansion is blocked for read-only terminal.exec allowlists; quote literal braces'
+        braceExpansion === 'expands'
+          ? 'Unquoted brace expansion ({a,b}, {1..3} or an equivalent form such as {a}b,c}) is blocked for read-only terminal.exec allowlists; quote literal braces'
+          : `More than ${MAX_BRACE_CANDIDATES_PER_WORD} unquoted "{" in one word cannot be checked for brace expansion and is blocked for read-only terminal.exec allowlists; quote literal braces`
       ),
     };
   }
@@ -3105,7 +3208,8 @@ function evaluateTerminalCommandAllowlist(
     // 并写出 JS，'vitest # run' 实际进入 watch 模式，而静态解析仍会数到 --noEmit / run。
     // 引号内、反斜杠转义或位于词中的 '#'（'#'、\#todo、foo#bar、--grep=#1）是普通 literal，不受影响。
     return {
-      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      bin: shellLevelBin,
+      args,
       result: readonlyBlock(
         'allowlist-shell-comment',
         'Unquoted "#" at the start of a word starts a shell comment and is blocked for read-only terminal.exec allowlists; quote a literal "#"'
@@ -3118,7 +3222,8 @@ function evaluateTerminalCommandAllowlist(
     // 静态检查看到的只是 '*'，无法判定展开结果，所以凡是展开后可能以 '-' 开头的 glob 词一律拒绝；
     // 加引号交给工具自己的 glob（-g '*.ts'、node --test '**/*.test.mjs'），或加 './' 前缀（./*）即可放行。
     return {
-      bin: (words.words[0] ?? '[empty]').toLowerCase(),
+      bin: shellLevelBin,
+      args,
       result: readonlyBlock(
         'allowlist-shell-glob-option',
         'Unquoted glob that the host shell may expand into an option-like file name (a word starting with a glob character, or an option word with a glob before "=") is blocked for read-only terminal.exec allowlists; quote the pattern or prefix the path with "./"'
@@ -3126,37 +3231,65 @@ function evaluateTerminalCommandAllowlist(
     };
   }
 
-  const [rawBin, ...args] = words.words;
   if (rawBin !== undefined && /[\\/]/.test(rawBin)) {
     // 只允许裸命令名经 PATH 解析。被分析仓库自带的 scripts/git、bin/cat 之类同名脚本
     // （或先前被写入的文件）会顶替系统命令，绕过 git/node 等子命令的只读约束；
     // node_modules/.bin/<tool> 也一并拒绝，等价入口是 npm run <script> 或裸 <tool>。
+    // 原因里回显模型给出的路径（模型自己的输入）；日志只记占位 '[path-qualified]'，不写路径。
     return {
-      bin: rawBin,
+      bin: '[path-qualified]',
+      args,
       result: readonlyBlock(
         'allowlist-path-qualified-bin',
-        `Path-qualified executable is blocked for read-only terminal allowlists: ${rawBin}`
+        `Path-qualified executable is blocked for read-only terminal allowlists: ${truncateForReason(rawBin)}`
       ),
     };
   }
   const bin = (rawBin ?? '').toLowerCase();
+  if (!codeExecutionEnabled && CODE_EXECUTING_BINS.has(bin)) {
+    // L4-P7d 开关关闭：不看参数，整条拒绝（含 npx 这类本就不在 allowlist 里的同类入口），给模型一个统一、
+    // 不随写法变化的原因，避免换参数反复重试。放在 shell 层检查之后：那些拒绝与命令名无关，规则 id 不变。
+    return {
+      bin,
+      args,
+      result: readonlyBlock(
+        'allowlist-code-execution-disabled',
+        `Evolution does not run commands that execute repository code until the host read-only sandbox is enabled (宿主只读沙箱启用前，Evolution 不运行会执行仓库代码的命令): "${bin}" is disabled, including tests, package scripts and lint (node, npm/pnpm/yarn, npx, vitest, jest, eslint). Gather evidence with read-only commands (git log/blame/diff/show/status, rg, grep, ls, cat, head, tail, wc, find, tsc --noEmit, biome check) or with code.search / code.read; do not retry these commands in another form.`
+      ),
+    };
+  }
   const allowedBins = new Set(bins.map((item) => item.toLowerCase()));
   if (!bin || !allowedBins.has(bin)) {
     return {
       bin: bin || '[empty]',
+      args,
       result: readonlyBlock(
         'allowlist-denied-bin',
-        `Command "${bin || '[empty]'}" is not in the read-only terminal allowlist`
+        `Command "${truncateForReason(bin || '[empty]')}" is not in the read-only terminal allowlist`
+      ),
+    };
+  }
+
+  if (bin === 'git' && context.cwdIsProjectRoot === false) {
+    // 只有调用方明确告知“不在项目根”时拒绝（未传上下文的纯文本检查不适用）。git 的仓库发现从工作目录开始：
+    // 形似裸仓库的被跟踪目录会被当作 git 目录并读取其 config（diff.external 等执行仓库提供的程序），
+    // 选项与子命令检查都看不到这一层，所以只读 allowlist 下 git 一律在项目根运行，用路径参数限定范围。
+    return {
+      bin,
+      args,
+      result: readonlyBlock(
+        'allowlist-git-cwd',
+        'git runs only at the project root under read-only terminal.exec allowlists (a repository directory shaped like a bare git repository would make git load its config and run programs such as diff.external); omit cwd and limit the scope with a path argument, e.g. git log -- src/module'
       ),
     };
   }
 
   const deniedOption = findDeniedOption(bin, args);
   if (deniedOption) {
-    return { bin, result: deniedOptionBlock(bin, deniedOption) };
+    return { bin, args, result: deniedOptionBlock(bin, deniedOption) };
   }
 
-  return { bin, result: checkReadonlySubcommand(bin, args) };
+  return { bin, args, result: checkReadonlySubcommand(bin, args) };
 }
 
 export function containsShellMeta(value: string): boolean {
@@ -3168,9 +3301,127 @@ export function containsShellMeta(value: string): boolean {
 // （NBSP、\v、\f、U+2000 系列、全角空格、BOM 等）在 sh 里属于词的一部分。
 const NON_SHELL_BLANK_WHITESPACE = /[^\S \t]/;
 
-/** 只有不在引号内、未被反斜杠转义的 '{' 会触发 shell 花括号展开。 */
-function hasUnquotedBrace(command: string): boolean {
-  return someUnquotedChar(command, (char) => char === '{');
+/** 单个词里候选 '{' 的上限；超过即 fail-closed（32 KiB 命令逐个配对的平方开销不可接受）。 */
+const MAX_BRACE_CANDIDATES_PER_WORD = 64;
+
+/**
+ * 宿主 /bin/sh（macOS 上是 bash 3.2；dash 不做花括号展开，按 bash 从严）的花括号展开判定，逐条对应 bash
+ * braces.c 的 brace_gobbler：
+ * - 展开按词进行；只有未加引号、未被反斜杠转义的 '{'、'}'、','、'.' 参与（x{'a,b'}y、x{a\,b}y 原样保留）。
+ * - 词里每个这样的 '{' 都是候选（某个候选不成立时 bash 接着试后面的 '{'，所以嵌套在内层的也算）。
+ * - 候选从 '{' 之后向右扫描：内层 '{' 使层级加一、层级大于 0 时的 '}' 使层级减一；层级 0 的逗号或 '..'
+ *   记为分隔符；层级 0 的 '}' 只有在已经出现过分隔符时才闭合本组，否则被当作普通字符跳过。
+ *   所以 HEAD@{1}、stash@{0}、x{a}y、{}、HEAD@{1}..HEAD@{0} 都不展开（实测原样输出），而
+ *   '{a}b,c}' 展开成 'a}b' 与 'c'、'--{glob=},pre=./x.sh}' 展开成 '--glob=}' 与 '--pre=./x.sh'。
+ * - 从严之处（都只会多拒绝、不会漏拒绝）：'..' 后紧跟 '}'（{1..}）与非法序列（{a..bc}）bash 不展开，这里照样
+ *   算分隔符；词首 '{}' 后的特殊豁免（'{}a,b}' 不展开）不模拟。
+ * 逐个候选向右扫描最坏是平方复杂度，单词里候选超过 MAX_BRACE_CANDIDATES_PER_WORD 时直接返回 'too-complex'
+ * （fail-closed），调用方以同一规则拒绝并在原因里写明。
+ */
+function findBraceExpansion(command: string): 'none' | 'expands' | 'too-complex' {
+  for (const word of splitWordsForBraceScan(command)) {
+    let candidates = 0;
+    for (let index = 0; index < word.length; index++) {
+      if (!isActiveBraceChar(word[index], '{')) {
+        continue;
+      }
+      candidates++;
+      if (candidates > MAX_BRACE_CANDIDATES_PER_WORD) {
+        return 'too-complex';
+      }
+      if (braceGroupCloses(word, index + 1)) {
+        return 'expands';
+      }
+    }
+  }
+  return 'none';
+}
+
+/** 词里的一个原始字符；active 表示它不在引号内、未被转义，且本身不是引号或转义用的反斜杠。 */
+interface BraceScanChar {
+  char: string;
+  active: boolean;
+}
+
+function isActiveBraceChar(entry: BraceScanChar | undefined, char: string): boolean {
+  return entry?.active === true && entry.char === char;
+}
+
+/**
+ * 按 sh 的空格/制表符切词（其他空白、换行与 '$'、'`' 等已在更前面的检查里拒绝），保留每个原始字符，
+ * 使 '..' 的相邻判断与 bash 在原文上的判断一致（'.\.'、".'.'" 中间隔着转义符或引号，不算 '..'）。
+ */
+function splitWordsForBraceScan(command: string): BraceScanChar[][] {
+  const words: BraceScanChar[][] = [];
+  let current: BraceScanChar[] = [];
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const char of command) {
+    if (escaped) {
+      escaped = false;
+      current.push({ char, active: false });
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      // 单引号外的反斜杠转义下一个字符（双引号内同样跳过下一个字符，与 brace_gobbler 一致）。
+      escaped = true;
+      current.push({ char, active: false });
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      }
+      current.push({ char, active: false });
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current.push({ char, active: false });
+      continue;
+    }
+    if (char === ' ' || char === '\t') {
+      if (current.length > 0) {
+        words.push(current);
+        current = [];
+      }
+      continue;
+    }
+    current.push({ char, active: true });
+  }
+  if (current.length > 0) {
+    words.push(current);
+  }
+  return words;
+}
+
+/** 从候选 '{' 之后扫描到词尾，判断这一组是否按 bash 规则闭合（闭合即会展开）。 */
+function braceGroupCloses(word: readonly BraceScanChar[], from: number): boolean {
+  let level = 0;
+  let separators = 0;
+  for (let index = from; index < word.length; index++) {
+    const entry = word[index];
+    if (!entry.active) {
+      continue;
+    }
+    if (entry.char === '}' && level === 0 && separators > 0) {
+      return true;
+    }
+    if (entry.char === '{') {
+      level++;
+    } else if (entry.char === '}') {
+      // 层级 0、尚无分隔符的 '}' 不闭合也不改变层级，bash 把它当普通字符。
+      if (level > 0) {
+        level--;
+      }
+    } else if (
+      level === 0 &&
+      (entry.char === ',' || (entry.char === '.' && isActiveBraceChar(word[index + 1], '.')))
+    ) {
+      separators++;
+    }
+  }
+  return false;
 }
 
 /** 只有不在引号内、未被转义、且位于词首的 '#' 会开始 shell 注释；词中的 '#'（foo#bar、''#x）是普通字符。 */
@@ -4070,7 +4321,7 @@ function deniedOptionBlock(
   );
 }
 
-/** 原因与日志只保留选项名部分：'=' 之后的值可能是路径或凭据，不回显。 */
+/** 原因只保留选项名部分：'=' 之后的值可能是路径或凭据，不回显（拒绝日志本身不写原因）。 */
 function describeOptionToken(arg: string): string {
   const equalsIndex = arg.indexOf('=');
   return truncateForReason(equalsIndex < 0 ? arg : `${arg.slice(0, equalsIndex + 1)}…`);
@@ -4159,6 +4410,12 @@ function checkGitSubcommand(args: string[]) {
   );
 }
 
+/*
+ * 【L4-P7d 保留待恢复】EVOLUTION_CODE_EXECUTION_ENABLED 关闭期间 npm/pnpm/yarn 在进入这里之前就被拒绝；
+ * 本函数与 checkRunnerPassthrough 保留给开关恢复后使用。恢复前必须先修审计确认的（中）绕过：
+ * 'npm run typecheck -- test/a.test.ts' 的位置参数按测试文件规则放行，但 typecheck/build:check（以及
+ * lint）脚本里的 tsc 收到文件参数就忽略 tsconfig（含 noEmit）并写出 JS——非 test 脚本应拒绝位置参数透传。
+ */
 function checkPackageManagerSubcommand(bin: string, args: string[]): AllowlistResult {
   const first = args[0]?.toLowerCase();
   let scriptArgsStart = 1;
@@ -4380,6 +4637,13 @@ function checkJestArguments(args: string[]): AllowlistResult {
   return { safe: true };
 }
 
+/*
+ * 【L4-P7d 保留待恢复】EVOLUTION_CODE_EXECUTION_ENABLED 关闭期间 node 在进入这里之前就被拒绝；本函数保留给
+ * 开关恢复后使用。恢复前必须先修审计确认的（高）绕过：需值选项的空格写法把紧随的 token 当作值，但宿主
+ * /bin/sh 先做路径名展开——'node --test --test-name-pattern scripts/* test/a.test.mjs' 里未加引号的
+ * scripts/* 展开成多个词，第一个成为 pattern 值，其余成为 --test 的位置参数被执行。空格写法的值里出现
+ * 未加引号的 glob 字符时应拒绝（或要求这些选项用 '=' 内联取值）。
+ */
 function checkNodeSubcommand(args: string[]): AllowlistResult {
   // Node 24 实测：进入 --test 模式后，出现在测试路径之后、甚至 '--' 之后的 node 选项（如 --require）
   // 仍然生效，所以白名单必须覆盖 argv 里每一个以 '-' 开头的 token，而不只是前导选项段。
@@ -4576,13 +4840,48 @@ function readonlyBlock(rule: string, reason: string): { safe: false; block: Term
   return { safe: false, block: { rule, reason } };
 }
 
-function logAllowlistBlock(bin: string, block: TerminalSafetyBlock): void {
+/**
+ * 拒绝日志只记规则 id、脱敏后的 bin 与参数的类别/长度：reason 里可能带模型给出的路径、测试文件名、
+ * tsc 响应文件、git 子命令名或模块值（可能是绝对路径或像凭据的字符串），只回给模型，不进日志。
+ */
+function logAllowlistBlock(
+  command: string,
+  bins: readonly string[],
+  evaluation: AllowlistEvaluation
+): void {
+  if (evaluation.result.safe) {
+    return;
+  }
+  const { rule } = evaluation.result.block;
   // 日志失败不能改变放行/拒绝结论，也不能把观察失败升级为业务失败。
   observeSafely(
     () =>
       Logger.getInstance().warn(
-        `[terminalSafety] read-only allowlist blocked command: rule=${block.rule} bin=${bin} reason=${block.reason}`
+        `[terminalSafety] read-only allowlist blocked command: rule=${rule} bin=${logBinLabel(evaluation.bin, bins)} ${describeArgsForLog(evaluation.args)} chars=${command.length}`
       ),
     () => undefined
   );
+}
+
+/** evaluateTerminalCommandAllowlist 自己产生的 bin 占位；模型写的 '[x]' 这类词不在此列。 */
+const LOG_BIN_PLACEHOLDERS = new Set(['[unparsed]', '[empty]', '[path-qualified]']);
+
+/**
+ * 日志里的 bin：只有调用方 allowlist 里的名字与已知的代码执行类 bin 原样记录，'[unparsed]' 这类占位保留；
+ * 其余（模型写在命令位置的任意词，可能是路径或像凭据的字符串）记为 '[unlisted]'。
+ */
+function logBinLabel(bin: string, bins: readonly string[]): string {
+  if (LOG_BIN_PLACEHOLDERS.has(bin) || CODE_EXECUTING_BINS.has(bin)) {
+    return bin;
+  }
+  return bins.some((item) => item.toLowerCase() === bin) ? bin : '[unlisted]';
+}
+
+/** 参数只记数量与类别（选项/位置参数），不记内容；命令未能切分时只记占位。 */
+function describeArgsForLog(args: readonly string[] | undefined): string {
+  if (args === undefined) {
+    return 'args=[unparsed]';
+  }
+  const options = args.filter((arg) => arg.startsWith('-') && arg !== '-').length;
+  return `args=${args.length} options=${options} positionals=${args.length - options}`;
 }

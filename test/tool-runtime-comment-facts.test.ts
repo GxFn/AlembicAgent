@@ -217,8 +217,9 @@ describe('tools/runtime comments describe current facts (L4-P1)', () => {
     const adapter = codeOnly(readSource('src/tools/runtime/adapter/ToolRouterAdapter.ts'));
     expect(adapter).toMatch(/\.\.\.\(request\.runtime \? \{ runtime: request\.runtime \} : \{\}\)/);
     const terminal = codeOnly(readSource('src/tools/runtime/handlers/terminal.ts'));
+    // L4-P7d：第三个参数传入工作目录是否为项目根（只读 allowlist 下 git 只在项目根运行）。
     expect(terminal).toMatch(
-      /checkTerminalCommandAllowlist\(command, ctx\.commandAllowlist\.bins\)/
+      /checkTerminalCommandAllowlist\(command, ctx\.commandAllowlist\.bins, \{\s*cwdIsProjectRoot: cwdResult\.atProjectRoot,\s*\}\)/
     );
     expect(terminal).toMatch(/resolveTerminalIntent\(ctx\)/);
     expect(terminal).toMatch(/intent: ctx\.runtime\?\.terminalIntent/);

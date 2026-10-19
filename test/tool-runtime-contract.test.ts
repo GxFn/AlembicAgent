@@ -607,7 +607,10 @@ describe('tool runtime adapters and public contracts', () => {
     expect(terminalParams.properties?.action?.enum).toEqual(['exec']);
     expect(capability.promptFragment).toContain('git log');
     expect(capability.promptFragment).toContain('grep');
+    // L4-P7d：npm test 仍出现在提示里，但只作为宿主只读沙箱启用前被禁用的命令，不再列为可用取证命令。
     expect(capability.promptFragment).toContain('npm test');
+    expect(capability.promptFragment).toContain('allowlist-code-execution-disabled');
+    expect(capability.promptFragment).not.toMatch(/取证命令[^\n]*npm test/);
     expect(capability.promptFragment).toContain('不提交新知识');
     expect(capability.promptFragment).not.toContain('不使用终端工具');
   });
@@ -802,12 +805,26 @@ describe('tool runtime adapters and public contracts', () => {
       const router = evolutionRouter();
       const { calls, exec } = capturingExecutor(reply);
 
-      const result = await router.execute(terminalCall(router, 'npm test'), {
+      // L4-P7d（用户决定 2026-10-18）：宿主只读沙箱启用前，npm test 会执行仓库代码，Evolution 在调度宿主之前
+      // 就以 allowlist-code-execution-disabled 拒绝（原放行断言改为拒绝断言），执行器一次也不能被调用。
+      const disabled = await router.execute(terminalCall(router, 'npm test'), {
+        ...baseToolContext(),
+        sandboxExecutor: { exec },
+      });
+      expect(disabled.ok).toBe(false);
+      expect(disabled.error).toContain('(allowlist-code-execution-disabled)');
+      expect(disabled.error).toContain('host read-only sandbox is enabled');
+      expect(exec).not.toHaveBeenCalled();
+
+      // 同一失败路径上的 intent 透传仍要覆盖：换成仍放行、不执行仓库代码的只读命令。
+      const result = await router.execute(terminalCall(router, 'tsc --noEmit'), {
         ...baseToolContext(),
         sandboxExecutor: { exec },
       });
 
       expect(result._meta?.resultStatus).toBe(status);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe('tsc --noEmit');
       expect(calls[0].opts.intent).toEqual({ network: 'none', filesystem: 'read-only' });
     });
 
