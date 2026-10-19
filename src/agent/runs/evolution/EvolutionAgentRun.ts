@@ -200,7 +200,8 @@ export function projectEvolutionAuditResult({
 }
 
 /**
- * 公开兼容入口：返回已有成功决策的 Recipe ID 集合（expectedIds 非空时只含清单内 ID）。
+ * 内部 helper（不在任何公开子路径上，仓内由 runEvolutionAudit 与测试使用，L8-C13）：返回已有成功决策的
+ * Recipe ID 集合（expectedIds 非空时只含清单内 ID）。
  *
  * 与 evolutionGateEvaluator 共用 collectEvolutionDecisions 的按 Recipe 归并，runEvolutionAudit 的
  * 完整性判定也走这里，所以门控与完整性判定同一口径。注意 projectEvolutionAuditResult 的计数

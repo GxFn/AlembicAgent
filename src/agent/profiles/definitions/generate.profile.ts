@@ -1,5 +1,8 @@
 import type { AgentProfileDefinition } from '../../service/AgentRunContracts.js';
 
+// 字段语义（L8-C09 / L8-C11）：serviceKind / lifecycle / projection 只是描述性元数据，运行时不消费；
+// fanout 模板只是标记，编排由 AgentRunCoordinator 只读 concurrency 计划完成，模板的 childProfile /
+// partitioner / merge 必须与计划一致（编译期校验），不会被单独读取。
 export const GENERATE_PROFILES: AgentProfileDefinition[] = [
   {
     id: 'generate-session',

@@ -31,7 +31,12 @@ export interface StrategyMergeResult {
   [key: string]: unknown;
 }
 
-/** Declarative strategy configuration (resolved by resolveStrategy) */
+/**
+ * Declarative strategy configuration (resolved by resolveStrategy)
+ *
+ * type 只认运行时词汇 'single' / 'pipeline' / 'fan_out'（其余抛 Unknown strategy type）；profile 声明层的
+ * 'fanout' / 'preset' 模板词汇由 AgentProfileCompiler 先编译掉，不会走到这里（L8-C09）。
+ */
 export interface StrategyConfig {
   type: string;
   stages?: MinimalStage[];
@@ -39,6 +44,10 @@ export interface StrategyConfig {
   itemStrategy?: StrategyConfig;
   tiers?: Record<string, { concurrency: number }>;
   merge?: (...args: unknown[]) => StrategyMergeResult;
+  /**
+   * single / pipeline / fanOut 三个字段没有读取者（L8-C09）：resolveStrategy 只按 type 分派，
+   * fan_out 的子策略读 itemStrategy。仅为公开类型兼容保留，删除属于待决的公开面收窄（事项②）。
+   */
   single?: StrategyConfig;
   pipeline?: StrategyConfig;
   fanOut?: StrategyConfig;

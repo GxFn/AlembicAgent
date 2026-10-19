@@ -15,6 +15,7 @@ export const BUILTIN_PROFILES: AgentProfileDefinition[] = [
   ...PLAN_PROFILES,
   ...SCOPED_MODULE_MINING_PROFILES,
   ...TRANSLATION_PROFILES,
+  // signal-analysis 没有调用入口，但数组内容是公开值且宿主测试仍引用，移除随事项②的退役包（L8-C12）。
   ...SIGNAL_PROFILES,
   ...GENERATE_PROFILES,
 ];

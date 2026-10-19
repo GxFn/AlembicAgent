@@ -215,11 +215,15 @@ export const INSIGHT_PRESET = {
     // quality_gate 诊断)。legacy 参数 minEvidenceLength / minFileRefs / minToolCalls 对本预设不再生效；
     // QualityGatePolicy 类仍保留导出，调用方可显式注入。
   ],
+  // persona 与 profile/override 浅合并；运行时只读 description（无 systemPrompt 阶段的“# 角色”段），
+  // module-mining / generate 维度 profile 不覆盖它，合并结果就是这里的原值。
   persona: {
     role: 'analyst',
     description: '高级软件架构师 + 知识管理专家',
   },
+  // 描述性声明（L8-C11）：enabled 没有读取者，并不让 insight 运行“无状态”——scan/insight 的 note_finding
+  // 仍经运行上下文的 memoryCoordinator 写入记忆；不要据此去掉 memoryCoordinator。去留待事项②。
   memory: {
-    enabled: false, // 无状态 worker
+    enabled: false,
   },
 };

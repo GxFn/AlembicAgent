@@ -19,10 +19,14 @@ export const CHAT_PRESET = {
         timeoutMs: config?.timeoutMs ?? 120_000,
       }),
   ],
+  // persona 与 profile/override 浅合并；运行时只读 description（系统提示“# 角色”段），role 没有读取者。
   persona: {
     role: 'assistant',
     description: 'Alembic 知识管理助手',
   },
+  // memory 块只是描述性声明（L8-C11）：enabled / tiers 没有读取者；mode 经 SystemPromptBuilder 以
+  // memoryMode 传给能力的 buildContext，但内置能力都不读取。记忆是否参与由运行上下文的 memoryCoordinator
+  // 决定，改这里的值不会开关记忆。字段形状属于宿主可见的 PRESETS 值，去留待事项②。
   memory: {
     enabled: true,
     mode: 'user',

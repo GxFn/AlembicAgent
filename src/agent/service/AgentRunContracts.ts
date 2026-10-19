@@ -20,14 +20,29 @@ export interface AgentProfileOverride {
   id?: string;
   basePreset: BuiltinAgentPreset | string;
   skills?: string[];
+  /**
+   * 运行时策略配置，整体替换 preset 的 strategy，交给 resolveStrategy 解析。只接受运行时 StrategyConfig
+   * 词汇（'single' / 'pipeline' / 'fan_out'）；声明模板词汇 'preset' / 'fanout' 只在 AgentProfileDefinition
+   * 里有效，写在这里会在 runtime build 时以 Unknown strategy type 失败（L8-C09）。
+   */
   strategy?: Record<string, unknown>;
   policies?: unknown[];
+  /** 与 preset persona 浅合并；运行时只读 description（系统提示的“# 角色”段），其余键没有读取者（L8-C11）。 */
   persona?: Record<string, unknown>;
+  /**
+   * 与 preset memory 浅合并后交给运行时，但 enabled / tiers 没有读取者，mode 只以 memoryMode 传给能力的
+   * buildContext 且内置能力都不读取（L8-C11）。因此 { enabled: false } 不会关闭记忆注入：记忆是否参与
+   * 由运行上下文的 memoryCoordinator 决定。字段去留属于待决的公开面收窄（事项②）。
+   */
   memory?: Record<string, unknown>;
   actionSpace?: AgentActionSpace;
   params?: Record<string, unknown>;
 }
 
+/**
+ * profile 的描述性服务分类（L8-C11）：编译器只复制或按 preset 推导（serviceKindForPreset），
+ * 运行时不据此分支，不能当作行为开关。
+ */
 export type AgentServiceKind =
   | 'conversation'
   | 'system-analysis'
@@ -38,11 +53,19 @@ export type AgentServiceKind =
 export interface AgentProfileDefaults {
   skills?: string[];
   policies?: unknown[];
+  /** 同 AgentProfileOverride.persona：与 preset 浅合并，运行时只读 description。 */
   persona?: Record<string, unknown>;
+  /** 同 AgentProfileOverride.memory：描述性声明，{ enabled: false } 不关闭记忆注入。 */
   memory?: Record<string, unknown>;
   actionSpace?: AgentActionSpace;
 }
 
+/**
+ * profile 声明层的策略模板，由 AgentProfileCompiler.compileStrategy 编译成运行时 StrategyConfig。
+ * 'fanout' 模板只是标记：编译结果为空，真正的扇出由 AgentRunCoordinator 按 concurrency 计划执行，
+ * 协调器只读 concurrency 的 partitioner / childProfile / merge（L8-C09）。模板里的同名三个字段必须与
+ * concurrency 计划逐项一致（编译期校验），否则抛错；它们不会被单独读取。
+ */
 export type AgentStrategyTemplate =
   | { type: 'preset' }
   | { type: 'single' }
@@ -68,15 +91,25 @@ export interface AgentConcurrencyPlan {
 export interface AgentProfileDefinition {
   id: string;
   title: string;
+  /** 描述性元数据，运行时不消费（L8-C11）。 */
   serviceKind: AgentServiceKind;
+  /**
+   * 描述性生命周期标记（L8-C11）：不阻止编译、不改运行行为；为 'deprecated' 时编译器每次编译记一条
+   * profile_lifecycle_deprecated 告警，这是它唯一的读取者。
+   */
   lifecycle: 'active' | 'experimental' | 'deprecated';
   basePreset?: BuiltinAgentPreset | string;
   defaults?: AgentProfileDefaults;
   strategy?: AgentStrategyTemplate | Record<string, unknown>;
+  /** 描述性元数据，运行时不消费：结果投影由各 run helper 自己完成，不按此字段选择（L8-C11）。 */
   projection?: string;
   concurrency?: AgentConcurrencyPlan;
 }
 
+/**
+ * 仓内没有任何引用（编译产物是 CompiledAgentProfile），仅为公开类型兼容保留；
+ * 是否删除属于待决的公开面收窄（事项②，L8-C11）。
+ */
 export interface AgentProfile {
   id: string;
   title: string;
@@ -98,6 +131,10 @@ export interface CompiledAgentProfile {
   kind: 'compiled-agent-profile';
   id: string;
   title: string;
+  /**
+   * 以下 serviceKind / lifecycle / projection 只是从声明复制或推导的描述性元数据，运行时不读取
+   * （L8-C11）；override 与 preset 引用路径的 serviceKind 统一按 basePreset 推导，lifecycle 固定 'active'。
+   */
   serviceKind: AgentServiceKind;
   lifecycle: 'active' | 'experimental' | 'deprecated';
   basePreset: BuiltinAgentPreset | string;
@@ -105,6 +142,7 @@ export interface CompiledAgentProfile {
   strategy?: Record<string, unknown>;
   policies?: unknown[];
   persona?: Record<string, unknown>;
+  /** 描述性声明，见 AgentProfileOverride.memory：不会关闭记忆注入。 */
   memory?: Record<string, unknown>;
   actionSpace: AgentActionSpace;
   additionalTools: string[];
@@ -192,6 +230,10 @@ export interface AgentRunExecutionOptions {
 
 export interface AgentRunPresentationOptions {
   stream?: boolean;
+  /**
+   * 只写不读（L8-C11）：AgentService 只读 stream，结果形状恒为 AgentRunResult，各 run helper 自行投影；
+   * 设置该字段不会改变返回形状。去留属于待决的公开面收窄（事项②）。
+   */
   responseShape?: 'agent-result' | 'chat-reply' | 'system-task-result';
 }
 

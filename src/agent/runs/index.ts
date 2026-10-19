@@ -1,10 +1,8 @@
 export { projectEvolutionAuditResult, runEvolutionAudit } from './evolution/EvolutionAgentRun.js';
 export { runModuleMining } from './module-mining/ScopedModuleMiningAgentRun.js';
-export {
-  type PlanContextProjectionV1,
-  runPlanAgent,
-  runStrictPlanAgent,
-} from './plan/PlanAgentRun.js';
+// 严格 Plan 入口（runStrictPlanAgent / PlanContextProjectionV1）只经公开 ./runs 子路径（src/runs.ts）
+// 直接从 PlanAgentRun 导出；这里不再冗余再导出，本文件只服务 ./service 的 run helper 再导出（L8-C13）。
+export { runPlanAgent } from './plan/PlanAgentRun.js';
 export {
   projectRelationDiscoveryResult,
   runRelationDiscovery,

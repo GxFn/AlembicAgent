@@ -108,11 +108,15 @@ export class AgentProfileCompiler {
       persona: profileOverride.persona,
       memory: profileOverride.memory,
     });
+    const basePreset = String(profileOverride.basePreset);
     return {
       kind: 'compiled-agent-profile',
-      id: profileOverride.id || String(profileOverride.basePreset),
-      title: profileOverride.id || String(profileOverride.basePreset),
-      serviceKind: 'system-analysis',
+      id: profileOverride.id || basePreset,
+      title: profileOverride.id || basePreset,
+      // serviceKind 只是描述性分类（运行时不消费，见 AgentRunContracts）。override 路径与 preset 引用路径
+      // 共用 serviceKindForPreset（L8-C11）：此前这里写死 'system-analysis'，{ basePreset: 'chat' } 与
+      // { preset: 'chat' } 会得到不同分类；id 不参与推导。
+      serviceKind: serviceKindForPreset(basePreset),
       lifecycle: 'active',
       basePreset: profileOverride.basePreset,
       skills: profileOverride.skills,
@@ -149,6 +153,7 @@ export class AgentProfileCompiler {
   ): CompiledAgentProfile {
     const params = mergeParams(defaultParamsForProfile(definition.id), inputParams);
     assertFanoutConcurrencyPlan(definition);
+    warnDeprecatedLifecycle(definition);
     const actionSpace = resolveActionSpace(definition, params);
     const strategy = compileStrategy(definition.strategy, {
       params,
@@ -167,6 +172,8 @@ export class AgentProfileCompiler {
       kind: 'compiled-agent-profile',
       id: definition.id,
       title: definition.title,
+      // serviceKind / lifecycle / projection 原样复制，仅作描述性元数据：运行时不据此分支（L8-C11），
+      // 唯一的消费是上面 deprecated 的编译告警。
       serviceKind: definition.serviceKind,
       lifecycle: definition.lifecycle,
       basePreset: definition.basePreset || definition.id,
@@ -326,11 +333,42 @@ function additionalToolsFromActionSpace(actionSpace: AgentActionSpace) {
   return [...actionSpace.toolIds];
 }
 
+/** signal-analysis auto 特判授予的工具；两者在工具目录与宿主中都没有注册（L8-C12）。 */
+const SIGNAL_ANALYSIS_AUTO_TOOL_IDS = ['suggest_skills', 'create_skill'] as const;
+
 function resolveActionSpace(definition: AgentProfileDefinition, params: Record<string, unknown>) {
   if (definition.id === 'signal-analysis' && params.mode === 'auto') {
-    return { mode: 'listed' as const, toolIds: ['suggest_skills', 'create_skill'] };
+    // 按 id 硬编码的提权分支（L8-C12）：授予的两个工具不存在，仓内与宿主生产代码也没有运行 signal-analysis
+    // 的入口。它本应删除，但宿主测试仍断言 auto 模式得到这组 toolIds（宿主仍引用的项不在本仓单方面删除，
+    // 删除随事项②走宿主配合的退役包）。删除前保持取值不变，只在命中时告警，让调用方看见这是一次无效授权。
+    Logger.getInstance().warn(
+      `[AgentProfileCompiler] signal_analysis_auto_tools_unregistered: profile "${definition.id}" mode=auto ` +
+        `grants ${SIGNAL_ANALYSIS_AUTO_TOOL_IDS.join(', ')}, which are not registered tools; ` +
+        'the grant is kept unchanged until the signal-analysis profile is retired.',
+      {
+        profileId: definition.id,
+        mode: params.mode,
+        grantedToolIds: [...SIGNAL_ANALYSIS_AUTO_TOOL_IDS],
+      }
+    );
+    return { mode: 'listed' as const, toolIds: [...SIGNAL_ANALYSIS_AUTO_TOOL_IDS] };
   }
   return definition.defaults?.actionSpace || { mode: 'listed' as const, toolIds: [] };
+}
+
+/**
+ * lifecycle 为 deprecated 的声明在编译时告警（L8-C11）。lifecycle 本身仍是描述性元数据：不阻止编译、
+ * 不改运行行为，只让调用方在日志里看见自己在跑一个已废弃的 profile。每次编译告警一次。
+ */
+function warnDeprecatedLifecycle(definition: AgentProfileDefinition) {
+  if (definition.lifecycle !== 'deprecated') {
+    return;
+  }
+  Logger.getInstance().warn(
+    `[AgentProfileCompiler] profile_lifecycle_deprecated: agent profile "${definition.id}" is declared ` +
+      'lifecycle=deprecated; it still compiles and runs unchanged, migrate callers before it is removed.',
+    { profileId: definition.id, lifecycle: definition.lifecycle, basePreset: definition.basePreset }
+  );
 }
 
 function resolvePolicyDeclarations(
@@ -397,6 +435,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object';
 }
 
+/**
+ * preset 名到描述性 serviceKind 的唯一映射；preset 引用路径与 override 路径共用（L8-C11）。
+ * 结果只写进 CompiledAgentProfile 供观察，运行时不据此分支。
+ */
 function serviceKindForPreset(preset: string): CompiledAgentProfile['serviceKind'] {
   if (preset === 'chat') {
     return 'conversation';

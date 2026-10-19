@@ -97,10 +97,13 @@ export const EVOLUTION_PRESET = {
         timeoutMs: config?.timeoutMs ?? 180_000,
       }),
   ],
+  // persona 与 profile/override 浅合并；运行时只读 description（系统提示“# 角色”段）。
   persona: {
     role: 'analyst',
     description: '知识进化专家',
   },
+  // 描述性声明（L8-C11）：enabled 没有读取者，不会关闭记忆注入；记忆是否参与由运行上下文的
+  // memoryCoordinator 决定。去留待事项②。
   memory: {
     enabled: false,
   },

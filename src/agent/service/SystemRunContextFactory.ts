@@ -91,5 +91,3 @@ export class SystemRunContextFactory {
     return projectSystemRunContext(systemRunContext);
   }
 }
-
-export default SystemRunContextFactory;

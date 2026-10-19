@@ -137,6 +137,14 @@ export class AgentRunCoordinator {
   }
 }
 
+/**
+ * 按 concurrency 计划派发 child 并收集结果。编排只读 concurrency 的 mode / concurrency（partitioner、merge
+ * 已在 run 中解析）；profile 的 fanout 策略模板不参与（L8-C09）。实际取消语义：
+ *   - stop-new：tier 边界与每个 child 派发前检查停止事实，同 tier 中尚在排队的 child 与后续 tier 写 aborted 回执；
+ *   - 运行中的 child 不由协调器打断，但内置 partitioner 把父 execution（含 abortSignal）透传给 child，
+ *     由 child 自身运行时按信号收尾。
+ * abortPolicy 声明不改变上述调度，非 stop-new 的声明只记 warn（见 logUnimplementedAbortPolicy）。
+ */
 async function runChildren(
   childInputs: AgentRunInput[],
   concurrencyPlan: AgentConcurrencyPlan,
