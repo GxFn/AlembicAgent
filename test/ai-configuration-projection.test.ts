@@ -17,8 +17,9 @@ afterEach(() => {
 
 // L2-I12：aiConfigInfo 是声明投影，不是就绪判定。这里把投影语义钉住，
 // 说明宿主为什么不能用 `provider && provider !== 'none'` 推断“AI 已配置”：
-// provider 在未声明时恒为 'auto'，不存在 'none' 值；就绪应由 Core isAiEnvReady
-// 或宿主 AiRuntimeStatus 判定。该测试只做特征锁定，不改变任何行为。
+// provider 在未声明时为 'auto'，只有恰好声明 ALEMBIC_AI_PROVIDER=none 时才会回显 'none'；
+// 就绪应与运行时同源（autoDetectProvider / 宿主 getAiRuntimeStatus），不要用 Core isAiEnvReady，
+// 见 test/ai-configuration-readiness-guidance.test.ts。该测试只做特征锁定，不改变任何行为。
 describe('aiConfigInfo declaration projection (not readiness)', () => {
   it('reports provider "auto" with no key at all, so a non-empty provider never implies readiness', () => {
     const info = aiConfigInfo({});

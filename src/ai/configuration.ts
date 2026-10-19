@@ -409,16 +409,23 @@ export function embedProviderOptions(env: ConfigEnvironment = process.env) {
 /**
  * 保留同步 UI 配置投影，返回声明值与 key 存在性，不返回任何凭据。
  *
- * 声明投影，不代表就绪；就绪请用 Core isAiEnvReady / 宿主 AiRuntimeStatus。
- * - provider 只原样回显 ALEMBIC_AI_PROVIDER，未声明时为 'auto'；'none' 不是任何合法
- *   provider 身份，本函数不会自行产出它，因此 `provider && provider !== 'none'` 之类的
- *   判断实际恒为真，不能当作“AI 已配置”。
- * - provider 不做身份校验，也不做自动发现：声明了 key 型 provider 但缺 key 时照样回显；
- *   Agent 侧的实际选择由 detectProvider/createProvider 决定。
+ * 声明投影，不代表就绪。宿主只能经 AiFactory.getAiConfigInfo 拿到它（本函数不在任何导出
+ * 子路径上），那里的 JSDoc 同步了下面的就绪说明，改这里时要一起改。
+ * - provider 原样回显 ALEMBIC_AI_PROVIDER，未声明或为空串时为 'auto'；不做身份校验、
+ *   别名归一或自动发现，声明了 key 型 provider 但缺 key 时照样回显。
+ * - 因此 `provider && provider !== 'none'` 只在恰好声明 ALEMBIC_AI_PROVIDER=none 时为假
+ *   （'none' 不是合法 provider，运行时以 Unknown AI provider 拒绝，此时为假恰好成立）；
+ *   对 'auto'、别名、未知值、缺 key 或 key 为纯空白等其余声明都为真，不能当作“AI 已配置”。
  * - hasKey/keys 只统计四个 key 型 provider 的 key 是否存在（trim 后非空），
  *   ollama 这类无需 key 的 provider 不在其中，所以 hasKey 同样不是就绪信号。
- * 宿主 status/health 需要就绪结论时，应使用 Core isAiEnvReady(collectAiEnv(env))，
- * 或已初始化容器的 getAiRuntimeStatus；本投影只用于展示声明值。
+ *
+ * 就绪结论必须与运行时同源：宿主容器初始化经 autoDetectProvider → detectProvider 选择
+ * provider，返回 null 或抛错都表示 AI 不可用。宿主 status/health 应读已初始化容器的
+ * getAiRuntimeStatus（它反映的就是这次 autoDetectProvider 的结果）；没有容器的 CLI 路径
+ * 可直接调用公开的 autoDetectProvider()，把 null 与抛错都视为未就绪。
+ * 不要用 Core isAiEnvReady(collectAiEnv(env)) 代替：它不做自动发现、别名归一和 trim，
+ * 与运行时结论不等价——ALEMBIC_AI_PROVIDER 为 auto/none/gemini/未知值且无 key 时它报就绪，
+ * 只设 key、不声明 provider 时它报未就绪。
  */
 export function aiConfigInfo(env: ConfigEnvironment = process.env) {
   const hasKey = (id: ProviderId) => !!env[providerConfig(id).keyEnvVar]?.trim();

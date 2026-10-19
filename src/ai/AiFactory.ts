@@ -195,7 +195,17 @@ export function createEmbedProvider(): ReturnType<typeof createProvider> | null 
   return createProvider(options);
 }
 
-/** 同步 UI 投影不暴露 key 或 endpoint。 */
+/**
+ * 同步 UI 投影不暴露 key 或 endpoint；返回 process.env 的声明投影（见 configuration.ts 的
+ * aiConfigInfo），只用于展示声明值，不代表就绪。
+ * - provider 原样回显 ALEMBIC_AI_PROVIDER（未声明为 'auto'），`provider && provider !== 'none'`
+ *   只在恰好声明 ALEMBIC_AI_PROVIDER=none 时为假，其余声明（含 'auto'、缺 key）都为真，
+ *   不能当作“AI 已配置”；hasKey 也不覆盖 ollama 这类无需 key 的 provider。
+ * - 就绪结论与运行时同源：已初始化容器读 getAiRuntimeStatus；没有容器时调用本模块的
+ *   autoDetectProvider()，返回 null 或抛错都视为未就绪。
+ * - 不要用 Core isAiEnvReady(collectAiEnv(env)) 判定就绪：它不做自动发现、别名归一和 trim，
+ *   与 autoDetectProvider 结论不等价（auto/none/gemini 无 key 时报就绪，只设 key 时报未就绪）。
+ */
 export function getAiConfigInfo() {
   return aiConfigInfo();
 }
