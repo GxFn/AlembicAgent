@@ -1128,6 +1128,14 @@ describe('graph and plan host outcomes', () => {
         stage: `query(${type})`,
         message: `path=codeEntityGraph.${secondaryName}; reason=primary-returned-no-result`,
       }),
+      // 备用读取器都是旧宿主兼容入口：回退之外另记 legacy 痕迹，供待决事项③核对旧宿主。
+      expect.objectContaining({
+        code: 'GRAPH_QUERY_LEGACY_READER',
+        stage: `query(${type})`,
+        message: expect.stringContaining(
+          `path=codeEntityGraph.${secondaryName}; reason=legacy-host-port`
+        ),
+      }),
     ]);
   });
 
@@ -1190,6 +1198,11 @@ describe('graph and plan host outcomes', () => {
         code: 'GRAPH_QUERY_FALLBACK',
         stage: 'query(search)',
         message: 'path=codeEntityGraph.search; reason=primary-unavailable',
+      }),
+      expect.objectContaining({
+        code: 'GRAPH_QUERY_LEGACY_READER',
+        stage: 'query(search)',
+        message: expect.stringContaining('path=codeEntityGraph.search; reason=legacy-host-port'),
       }),
     ]);
   });

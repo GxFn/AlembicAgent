@@ -7,11 +7,14 @@ import {
   type GraphQueryType,
   ok,
   type ToolContext,
+  type ToolDiagnosticWarning,
   type ToolResult,
 } from '#tools/kernel/registry.js';
 
 interface GraphRead {
   source: string;
+  /** 来自 GRAPH_QUERY_HOST_READERS 的 legacy 标注：命中即记 GRAPH_QUERY_LEGACY_READER。 */
+  legacy: boolean;
   invoke: () => unknown;
 }
 
@@ -25,21 +28,27 @@ function reader(
   source: string,
   target: unknown,
   method: string,
-  args: unknown[] = []
+  args: unknown[] = [],
+  legacy = false
 ): GraphRead | undefined {
   if (!target || (typeof target !== 'object' && typeof target !== 'function')) {
     return undefined;
   }
   const operation: unknown = (target as Record<string, unknown>)[method];
   return typeof operation === 'function'
-    ? { source: `${source}.${method}`, invoke: () => Reflect.apply(operation, target, args) }
+    ? {
+        source: `${source}.${method}`,
+        legacy,
+        invoke: () => Reflect.apply(operation, target, args),
+      }
     : undefined;
 }
 
 /**
  * 读取路径、优先级与实参形状全部来自 kernel 的 GRAPH_QUERY_HOST_READERS（availability 共用同一张表）。
- * 表中 legacy 条目是旧宿主兼容入口：照常读取，命中时由 readGraph 记 GRAPH_QUERY_FALLBACK 并带出
- * path=codeEntityGraph.<method>，足以事后核对是否仍有旧宿主；消费者与移除条件（待决事项③）见该常量注释。
+ * 表中 legacy 条目是旧宿主兼容入口：照常读取，命中时 readGraph 一律记 GRAPH_QUERY_LEGACY_READER 并带出
+ * path=<port>.<method>（overrides/extensions 的唯一读取器位于下标 0，同样留痕），足以事后核对是否仍有
+ * 旧宿主；只有命中读取器下标大于 0 时才额外记 GRAPH_QUERY_FALLBACK。消费者与移除条件（待决事项③）见该常量注释。
  */
 function queryReaders(
   type: GraphQueryType,
@@ -48,7 +57,7 @@ function queryReaders(
   ctx: ToolContext
 ): Array<GraphRead | undefined> {
   return GRAPH_QUERY_HOST_READERS[type].map((spec) =>
-    reader(spec.port, ctx[spec.port], spec.method, spec.args(entity, limit))
+    reader(spec.port, ctx[spec.port], spec.method, spec.args(entity, limit), spec.legacy === true)
   );
 }
 
@@ -99,23 +108,33 @@ async function readGraph(
     return result;
   }
   const { value, selected } = outcome.value;
+  // fallbackUsed 只表示“越过了主读取器”（下标 > 0），与是否 legacy 无关，语义保持不变。
   const fallbackUsed = selected > 0;
+  const hit = readers[selected];
+  const diagnosticWarnings: ToolDiagnosticWarning[] = [];
+  if (fallbackUsed) {
+    diagnosticWarnings.push({
+      code: 'GRAPH_QUERY_FALLBACK',
+      tool: 'graph',
+      stage,
+      message: `path=${hit?.source}; reason=${readers[0] ? 'primary-returned-no-result' : 'primary-unavailable'}`,
+    });
+  }
+  if (hit?.legacy) {
+    // 旧宿主兼容读取器被实际调用（无论处在主位还是备用位）：单独留痕，供待决事项③核对旧宿主是否仍在。
+    // 只看最后实际调用的读取器；它返回空时也记录，因为“旧端口仍被接线并调用”本身就是要核对的事实。
+    diagnosticWarnings.push({
+      code: 'GRAPH_QUERY_LEGACY_READER',
+      tool: 'graph',
+      stage,
+      message: `path=${hit.source}; reason=legacy-host-port; result=${value === null ? 'empty' : 'value'}`,
+    });
+  }
   return ok(project(value), {
     // 结构化显示与估算属于 adapter；这里不能为了 stringify 而丢掉已读到的宿主事实。
     tokensEstimate: typeof value === 'string' ? estimateTokens(value) : 0,
     fallbackUsed,
-    ...(fallbackUsed
-      ? {
-          diagnosticWarnings: [
-            {
-              code: 'GRAPH_QUERY_FALLBACK',
-              tool: 'graph',
-              stage,
-              message: `path=${readers[selected]?.source}; reason=${readers[0] ? 'primary-returned-no-result' : 'primary-unavailable'}`,
-            },
-          ],
-        }
-      : {}),
+    ...(diagnosticWarnings.length > 0 ? { diagnosticWarnings } : {}),
   });
 }
 

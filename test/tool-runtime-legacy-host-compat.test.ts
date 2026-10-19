@@ -5,17 +5,23 @@
  * 1. graph.query 的“query type → 宿主方法”表是单一常量（GRAPH_QUERY_HOST_READERS），
  *    availability 快照与 graph handler 都从它派生，不再各自手抄一份方法名；
  * 2. 表里逐项标出旧宿主兼容入口（legacy），且恰好是唯一生产宿主不提供的那几项；
- * 3. noteFinding 字符串回执（旧宿主形态）的兼容转译带诊断，对象回执不受影响。
+ * 3. noteFinding 字符串回执（旧宿主形态）的兼容转译带诊断，对象回执不受影响；
+ * 4. graph 的 legacy 读取器命中（含下标 0 的 overrides/extensions 唯一读取器）一律记
+ *    GRAPH_QUERY_LEGACY_READER，下标 > 0 时另记 GRAPH_QUERY_FALLBACK；
+ * 5. knowledge.prime/detail 在 knowledgeRead 缺省时回落 knowledgeRepo 会记一条 info 日志，
+ *    search-only 回落仍只用 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
  *
  * 删除这些分支、收窄 MemoryCoordinatorLike 与 query type enum 依赖待决事项③，不在本包。
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { EvidenceLedgerLike } from '../src/tools/kernel/index.js';
 import { GRAPH_QUERY_HOST_READERS, type ToolContext } from '../src/tools/kernel/registry.js';
 import { describeToolAvailability } from '../src/tools/runtime/availability.js';
 import { handle as handleGraph } from '../src/tools/runtime/handlers/graph.js';
+import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 
@@ -150,6 +156,29 @@ describe('graph.query host method table is a single shared constant', () => {
       // 只有备用读取器在场时（索引 > 0）才是回退；主读取器直接命中不记回退。
       const index = EXPECTED_READERS[type].indexOf(reader);
       expect(result._meta?.fallbackUsed, `${type} fallback`).toBe(index > 0);
+      // legacy 读取器无论处在下标 0（overrides/extensions 唯一读取器）还是备用位，命中都要留
+      // GRAPH_QUERY_LEGACY_READER 痕迹并带出 path=<port>.<method>，供待决事项③事后核对旧宿主；
+      // 非 legacy 主读取器命中不记这条诊断。
+      const warnings = result._meta?.diagnosticWarnings ?? [];
+      const legacyWarnings = warnings.filter(
+        (warning) => warning.code === 'GRAPH_QUERY_LEGACY_READER'
+      );
+      if (reader.legacy) {
+        expect(legacyWarnings, `${type} legacy diagnostic`).toEqual([
+          expect.objectContaining({
+            tool: 'graph',
+            stage: `query(${type})`,
+            message: expect.stringContaining(`path=${port}.${method}`),
+          }),
+        ]);
+      } else {
+        expect(legacyWarnings, `${type} legacy diagnostic`).toEqual([]);
+      }
+      // 回退诊断与 legacy 诊断互相独立：下标 > 0 时额外记 GRAPH_QUERY_FALLBACK。
+      expect(
+        warnings.some((warning) => warning.code === 'GRAPH_QUERY_FALLBACK'),
+        `${type} fallback diagnostic`
+      ).toBe(index > 0);
     }
   });
 
@@ -182,6 +211,8 @@ describe('graph.query host method table is a single shared constant', () => {
       const result = await handleGraph('query', { type, entity: ENTITY }, ctx);
       expect(result.ok, type).toBe(true);
       expect(result._meta?.fallbackUsed, type).toBe(false);
+      // 生产形态不经过任何 legacy 读取器，不能留下旧宿主痕迹。
+      expect(result._meta?.diagnosticWarnings ?? [], type).toEqual([]);
     }
   });
 
@@ -285,5 +316,100 @@ describe('noteFinding legacy string receipt compatibility', () => {
     );
     expect(result.ok).toBe(true);
     expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+  });
+});
+
+describe('knowledge prime/detail legacy knowledgeRepo port is traced', () => {
+  const RECIPE = {
+    id: 'R-1',
+    title: 'Auth convention',
+    kind: 'rule',
+    doClause: 'Use AuthService.login',
+  };
+
+  function searchEngine() {
+    return {
+      search: vi.fn(async () => [{ id: RECIPE.id, title: RECIPE.title, score: 0.9 }]),
+    };
+  }
+
+  function readPort() {
+    return { getById: vi.fn(async (id: string) => (id === RECIPE.id ? { ...RECIPE } : null)) };
+  }
+
+  /** 只统计提到 knowledgeRepo 的 info 日志：旧端口回落的痕迹，不受其它 info 日志干扰。 */
+  function legacyRepoLogs(info: ReturnType<typeof vi.spyOn>): string[] {
+    return info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('knowledgeRepo'));
+  }
+
+  function spyInfo() {
+    return vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs once when prime reads details through the legacy knowledgeRepo port', async () => {
+    const info = spyInfo();
+    const repo = readPort();
+    const ctx: ToolContext = {
+      projectRoot: process.cwd(),
+      searchEngine: searchEngine(),
+      knowledgeRepo: repo,
+    };
+    const result = await handleKnowledge('prime', { taskGoal: 'goal' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(repo.getById).toHaveBeenCalledWith(RECIPE.id);
+    const logs = legacyRepoLogs(info);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('[knowledge.prime]');
+    expect(logs[0]).toContain('deprecated');
+    // 兼容回落只记日志，不改模型可见的 _meta：结果仍是完整知识包，不标 degraded。
+    expect(result._meta?.degraded).not.toBe(true);
+    expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+  });
+
+  it('logs once when detail reads through the legacy knowledgeRepo port', async () => {
+    const info = spyInfo();
+    const repo = readPort();
+    const ctx: ToolContext = { projectRoot: process.cwd(), knowledgeRepo: repo };
+    const result = await handleKnowledge('detail', { id: RECIPE.id }, ctx);
+    expect(result.ok).toBe(true);
+    expect(repo.getById).toHaveBeenCalledExactlyOnceWith(RECIPE.id);
+    const logs = legacyRepoLogs(info);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('[knowledge.detail]');
+    expect(logs[0]).toContain('deprecated');
+    expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+  });
+
+  it('does not log the legacy port when knowledgeRead is provided', async () => {
+    const info = spyInfo();
+    const read = readPort();
+    const ctx: ToolContext = {
+      projectRoot: process.cwd(),
+      searchEngine: searchEngine(),
+      knowledgeRead: read,
+    };
+    const prime = await handleKnowledge('prime', { taskGoal: 'goal' }, ctx);
+    const detail = await handleKnowledge('detail', { id: RECIPE.id }, ctx);
+    expect(prime.ok).toBe(true);
+    expect(detail.ok).toBe(true);
+    expect(read.getById).toHaveBeenCalledTimes(2);
+    expect(legacyRepoLogs(info)).toEqual([]);
+  });
+
+  it('keeps the search-only fallback on its own diagnostic without the legacy port log', async () => {
+    const info = spyInfo();
+    const ctx: ToolContext = { projectRoot: process.cwd(), searchEngine: searchEngine() };
+    const result = await handleKnowledge('prime', { taskGoal: 'goal' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(result._meta?.diagnosticWarnings?.map((warning) => warning.code)).toEqual([
+      'KNOWLEDGE_PRIME_SEARCH_ONLY',
+    ]);
+    expect(legacyRepoLogs(info)).toEqual([]);
   });
 });

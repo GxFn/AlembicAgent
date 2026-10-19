@@ -10,7 +10,7 @@ import {
   type ToolResult,
 } from '#tools/kernel/registry.js';
 import type { SearchEngineLike, SearchResult } from './contracts.js';
-import { abortedKnowledgeResult } from './operation.js';
+import { abortedKnowledgeResult, logKnowledgeFallback } from './operation.js';
 
 function isKnowledgeReadPort(port: unknown): port is KnowledgeReadPort {
   return (
@@ -33,6 +33,20 @@ function unavailableReadPort(action: string, port: 'knowledgeRead' | 'knowledgeR
     },
     error: `Knowledge read port not available for ${action} (${port}.getById)`,
   };
+}
+
+/**
+ * knowledgeRead 缺省（undefined）而改用旧 knowledgeRepo.getById 读取详情时留一条 info 日志。
+ * 这是旧宿主兼容入口（已弃用，待决事项③未答复，暂不删除）：只记日志、不改 _meta，避免模型可见输出变化；
+ * 日志写清触发条件与选择路径，供待决事项③事后核对是否仍有宿主走这条回落。
+ * 仅在旧端口确实可读时调用：两个端口都缺的 search-only 回落另有 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
+ * 经 logKnowledgeFallback 输出：日志实现抛错不会阻断或改写真实读取。
+ */
+function noteLegacyRepoPort(action: 'prime' | 'detail', input: string): void {
+  logKnowledgeFallback(
+    'info',
+    `[knowledge.${action}] reading via legacy knowledgeRepo.getById port (compat, deprecated; trigger=knowledgeRead not provided; ${input})`
+  );
 }
 
 function isSearchEngine(port: unknown): port is SearchEngineLike {
@@ -253,6 +267,9 @@ export async function handlePrime(
   if (!canRead && (port === 'knowledgeRead' || repo != null)) {
     return unavailableReadPort('prime', port);
   }
+  if (canRead && port === 'knowledgeRepo') {
+    noteLegacyRepoPort('prime', `limit=${limit}`);
+  }
 
   try {
     const query = [taskGoal, ...keywords].join(' ');
@@ -400,6 +417,9 @@ export async function handleDetail(
   const repo = ctx[port];
   if (!isKnowledgeReadPort(repo)) {
     return unavailableReadPort('detail', port);
+  }
+  if (port === 'knowledgeRepo') {
+    noteLegacyRepoPort('detail', `id=${id}`);
   }
 
   try {
