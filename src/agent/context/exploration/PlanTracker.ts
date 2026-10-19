@@ -1,3 +1,5 @@
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import { readToolObservation } from '../../utils/toolOutcomes.js';
 /**
  * PlanTracker — 探索计划跟踪器
@@ -9,7 +11,9 @@ import { readToolObservation } from '../../utils/toolOutcomes.js';
  *   - 偏差 replan 只由“连续 3 轮计划外探索动作”触发；计划未完成度交给周期触发，不再算作偏差；
  *   - deviationScore 是“自上次计划起计划外探索动作占比”的诊断值，不参与触发；
  *   - 只有成功的探索类动作（code/graph/terminal 取证动作）参与匹配与偏离统计，
- *     note_finding/knowledge 等记录类动作与失败动作既不完成步骤，也不算偏离。
+ *     note_finding/knowledge 等记录类动作与失败动作既不完成步骤，也不算偏离；
+ *   - 计划外只指“既不能完成未完成步骤、也不是续做已完成步骤”的探索动作；未完成的只剩总结类
+ *     步骤（工具动作按设计不能完成）时，未命中的探索动作不算偏离，连击保持不变（L6-P16r3 C015）。
  *
  * @module PlanTracker
  */
@@ -76,8 +80,9 @@ interface ReplanSuppression {
 
 /** updatePlanProgress 对本轮动作的评估摘要，供调用方记录被跳过动作的诊断 */
 interface PlanRoundEvaluation {
-  /** 参与匹配与偏离统计的成功探索动作数 */
+  /** 参与匹配与偏离统计的成功探索动作数（= matchedActions + unplannedActions） */
   countedActions: number;
+  /** 落在计划内的探索动作：完成了未完成步骤，或续做已完成步骤（后者不再改变步骤状态） */
   matchedActions: number;
   unplannedActions: number;
   /** ok===false 的失败动作：不完成步骤、不算偏离 */
@@ -111,7 +116,7 @@ const EXPLORATION_ACTIONS = new Map<string, ReadonlySet<string>>([
   ['terminal', new Set(['exec'])],
 ]);
 
-/** 步骤描述里形如 a/b.ext 或 name.ext 的候选文件目标（再经 isFileTarget 过滤技术名与缩写） */
+/** 步骤描述里形如 a/b.ext 或 name.ext 的候选文件目标（再经 extractFileTargets 过滤技术名与缩写） */
 const FILE_TARGET_CANDIDATE_RE = /[\w@.-]+(?:\/[\w@.-]+)*\.[A-Za-z][\w-]*(?:\.[\w-]+)*/g;
 
 /**
@@ -172,8 +177,33 @@ const SOURCE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
   'gql',
 ]);
 
-/** Node.js / Vue.js / Express.js 这类首字母大写、不带路径的 X.js 是技术名而非文件 */
-const TECH_NAME_JS_RE = /^[A-Z][A-Za-z0-9]*\.js$/;
+/**
+ * 不带路径时视作技术名而非文件的 X.js：首字母大写（技术名的惯用写法），且按小写比较在本清单内。
+ * 只看“首字母大写 + .js”的形状会把 React 组件 App.js / Header.js 也当技术名，read 的文件目标硬门槛
+ * 随之失效（L6-P16r3 C016），因此改为显式清单；小写 node.js 这类写法维持原口径仍当文件目标。
+ * 只收录不太可能同时是同名源码文件的框架/运行时名；Chart.js、Video.js 这类也常见于组件文件名的歧义名
+ * 不收录——误当文件只会让步骤更难被自动完成，误当技术名则会让读无关文件完成该步骤。
+ */
+const JS_TECH_NAMES: ReadonlySet<string> = new Set([
+  'node.js',
+  'vue.js',
+  'react.js',
+  'angular.js',
+  'express.js',
+  'next.js',
+  'nuxt.js',
+  'nest.js',
+  'ember.js',
+  'backbone.js',
+  'knockout.js',
+  'meteor.js',
+  'three.js',
+  'd3.js',
+  'koa.js',
+  'hapi.js',
+  'preact.js',
+  'alpine.js',
+]);
 
 /**
  * 总结/汇报类步骤：由 SUMMARIZE 阶段的文本产出完成，语义回退不允许任何工具动作替它打勾
@@ -193,8 +223,29 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
       /继承|类名|类图|类关系|类层次|子类|父类|基类|图谱|调用|关系|依赖|\b(?:hierarch(?:y|ies)|class(?:es)?|graph|call(?:s|ers?|ees?)?)\b/,
   },
   { tool: 'code', action: 'read', pattern: /阅读|深入|查看|文件|\bread(?:s|ing)?\b/ },
+  // outline 是单文件取证（文件骨架），与 read 共用阅读类词；不含“结构/概览”，避免完成项目级概览步骤。
+  {
+    tool: 'code',
+    action: 'outline',
+    pattern: /大纲|阅读|深入|查看|文件|\b(?:outlines?|read(?:s|ing)?)\b/,
+  },
   { tool: 'code', action: 'search', pattern: /搜索|查找|\bsearch(?:es|ing)?\b/ },
+  // terminal.exec 只完成“运行/执行命令”类步骤；不收“测试/脚本”，避免完成“阅读测试文件”这类阅读步骤。
+  {
+    tool: 'terminal',
+    action: 'exec',
+    pattern:
+      /运行|执行|命令|终端|\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\b/,
+  },
 ];
+
+/** 诊断日志统一走 observeSafely：日志通道失败不能升级为计划进度更新失败。 */
+function logPlanDiagnostic(message: string) {
+  observeSafely(
+    () => Logger.getInstance().debug(message),
+    () => undefined
+  );
+}
 
 export class PlanTracker {
   /** 等待 AI 输出 replan */
@@ -202,6 +253,8 @@ export class PlanTracker {
   #replanCount = 0;
   /** 自上次计划起命中计划的探索动作数（deviationScore 的分母之一；不进入公开 progress 形状） */
   #matchedActions = 0;
+  /** 已记录过“技术名被排除出文件目标”诊断的步骤：同一步骤只记一次，避免每轮重复刷日志 */
+  #techNameLoggedSteps = new WeakSet<PlanStep>();
   /** 计划进度 */
   #planProgress: PlanProgress = {
     coveredSteps: 0,
@@ -394,8 +447,10 @@ export class PlanTracker {
       return null;
     }
 
-    let matchedThisRound = 0;
+    let completedThisRound = 0;
+    let continuedThisRound = 0;
     let unplannedThisRound = 0;
+    let exhaustedHeldThisRound = 0;
     let skippedFailedActions = 0;
     let skippedNonExplorationActions = 0;
 
@@ -411,22 +466,44 @@ export class PlanTracker {
         skippedNonExplorationActions++;
         continue;
       }
+      // 同一轮内前面的动作可能刚完成步骤，因此每个动作都重新按当前状态划分未完成/已完成步骤。
+      const openSteps = steps.filter((step) => step.status !== 'done');
       const matchedStep = this.#findMatchingStep(
-        steps,
+        openSteps,
         action,
         observation.params,
         observation.action
       );
       if (matchedStep) {
         matchedStep.status = 'done';
-        matchedThisRound++;
-      } else {
-        unplannedThisRound++;
+        completedThisRound++;
+        continue;
       }
+      // 续做：动作按同样规则落在已完成步骤上（如“深入阅读 3-5 个典型实现文件”读第 2、3 个文件），
+      // 是在执行计划而不是偏离；不改步骤状态，但和完成步骤一样让偏离连击归零。
+      const continuedStep = this.#findMatchingStep(
+        steps.filter((step) => step.status === 'done'),
+        action,
+        observation.params,
+        observation.action
+      );
+      if (continuedStep) {
+        continuedThisRound++;
+        continue;
+      }
+      // 计划已耗尽：未完成的只剩总结类步骤（任何工具动作按设计都不能完成），模型在 toolChoice=required
+      // 下被迫继续探索不算偏离；与只有记录/失败动作的轮次同口径，不计入统计、连击保持不变。
+      if (openSteps.every((step) => isSummaryStep(step.description))) {
+        exhaustedHeldThisRound++;
+        continue;
+      }
+      unplannedThisRound++;
     }
 
+    const matchedThisRound = completedThisRound + continuedThisRound;
     const countedActions = matchedThisRound + unplannedThisRound;
-    // 本轮没有任何可计探索动作（只记录发现或只有失败调用）时保持连击不变：既不算偏离，也不算回到计划。
+    // 本轮没有任何可计探索动作（只记录发现、只有失败调用，或计划耗尽后只剩总结步时的探索）时
+    // 保持连击不变：既不算偏离，也不算回到计划。
     const streakHeld = countedActions === 0;
     if (!streakHeld) {
       this.#matchedActions += matchedThisRound;
@@ -444,6 +521,23 @@ export class PlanTracker {
     // 诊断占比保留两位小数：它会以 planProgress 进入模型输入，过长的浮点只浪费 token。
     this.#planProgress.deviationScore =
       sample > 0 ? Math.round((this.#planProgress.unplannedActions / sample) * 100) / 100 : 0;
+
+    if (continuedThisRound > 0 || exhaustedHeldThisRound > 0) {
+      // 续做与“计划耗尽只剩总结步”都是不改步骤状态、也不算偏离的分叉路径，记下口径便于回放偏差判断。
+      const openSummarySteps = steps
+        .filter((step) => step.status !== 'done')
+        .map((step) => step.description);
+      logPlanDiagnostic(
+        `[PlanTracker] plan progress classified on-plan exploration without new step: ` +
+          `continued=${continuedThisRound} action(s) on done steps (counted as on-plan, streak reset), ` +
+          `exhaustedHeld=${exhaustedHeldThisRound} action(s)` +
+          (exhaustedHeldThisRound > 0
+            ? ` (plan exhausted except summary step(s) [${openSummarySteps.join(' | ')}]; not counted, streak held)`
+            : '') +
+          `; completed=${completedThisRound}, unplanned=${unplannedThisRound}, ` +
+          `consecutiveOffPlan=${this.#planProgress.consecutiveOffPlan}`
+      );
+    }
 
     return {
       countedActions,
@@ -555,11 +649,13 @@ export class PlanTracker {
   }
 
   /**
-   * 模糊匹配: 将一次成功的探索动作匹配到 plan 步骤
+   * 模糊匹配: 将一次成功的探索动作匹配到给定的一组 plan 步骤（调用方先传未完成步骤，再传已完成步骤判定续做）
    *
-   * 匹配顺序：参数（或 read 成功路径）点名了步骤文件目标的步骤优先；随后按显式关键词、
-   * 工具类别语义回退依次尝试。read 的文件目标是硬门槛（读另一个文件不能完成指定文件步骤），
-   * 非 read 工具的文件目标只是软信号（只调整优先级，不点名也不排除）。
+   * 匹配顺序：参数（或 read 成功路径）点名了步骤文件目标的步骤优先；随后依次尝试显式关键词、
+   * 文件目标命中、工具类别语义回退。read/outline 是单文件取证，文件目标是硬门槛（读或看另一个文件的
+   * 大纲不能完成指定文件步骤）；其它工具的文件目标是软信号：不排除步骤，但参数以路径边界点名了步骤
+   * 文件目标时直接算命中（L6-P16r3 C017：code.search 限定在该文件上不能被记为计划外）。
+   * 总结/汇报类步骤只能由显式关键词命中，文件目标命中与语义回退都跳过它。
    */
   #findMatchingStep(
     steps: PlanStep[],
@@ -567,38 +663,42 @@ export class PlanTracker {
     params: Record<string, unknown>,
     actionName: string
   ): PlanStep | null {
+    if (steps.length === 0) {
+      return null;
+    }
     const toolName = action.tool;
     const argsStr = JSON.stringify(params).toLowerCase();
     const isRead = toolName === 'code' && actionName === 'read';
+    const isFileScoped = isRead || (toolName === 'code' && actionName === 'outline');
 
-    let readPaths: string[] = [];
-    if (isRead) {
+    let scopedPaths: string[] = [];
+    if (isFileScoped) {
+      // read 优先使用回执里真正读到的文件；outline 只有请求参数里的单个 path（失败动作已在调用方跳过）。
       const paths: unknown[] =
-        action.successfulReadPaths ??
+        (isRead ? action.successfulReadPaths : undefined) ??
         (Array.isArray(params.filePaths) ? params.filePaths : [params.path ?? params.filePath]);
-      readPaths = paths
+      scopedPaths = paths
         .filter((value): value is string => typeof value === 'string')
         .map((value) => value.replaceAll('\\', '/').replace(/^\.\//, ''));
       // 回执表明一个文件都没读到（整批失败）：不能完成任何步骤。
-      if (action.successfulReadPaths && readPaths.length === 0) {
+      if (isRead && action.successfulReadPaths && scopedPaths.length === 0) {
         return null;
       }
     }
 
     // monorepo 后缀放宽与现有 exact-path 语义冲突，暂不放宽：带 '/' 的目标必须精确相等。
     const targetHit = (target: string) =>
-      isRead
-        ? readPaths.some(
+      isFileScoped
+        ? scopedPaths.some(
             (file) => file === target || (!target.includes('/') && file.endsWith(`/${target}`))
           )
-        : argsStr.includes(target.toLowerCase());
+        : mentionsFileTarget(argsStr, target);
 
-    const candidates = steps
-      .filter((step) => step.status !== 'done')
-      .map((step) => {
-        const targets = extractFileTargets(step.description);
-        return { step, targets, hit: targets.some(targetHit) };
-      });
+    const candidates = steps.map((step) => {
+      const { targets, techNames } = extractFileTargets(step.description);
+      this.#noteTechNameExclusion(step, techNames);
+      return { step, targets, hit: targets.some(targetHit) };
+    });
     // 命中文件目标的步骤优先尝试（稳定排序，保持计划原顺序）。
     const ordered = [
       ...candidates.filter((candidate) => candidate.hit),
@@ -606,7 +706,7 @@ export class PlanTracker {
     ];
 
     for (const { step, targets, hit } of ordered) {
-      if (isRead && targets.length > 0 && !hit) {
+      if (isFileScoped && targets.length > 0 && !hit) {
         continue;
       }
 
@@ -615,18 +715,35 @@ export class PlanTracker {
         return step;
       }
 
-      // 总结/汇报类步骤不参与语义回退，只能由显式关键词命中。
+      // 总结/汇报类步骤不参与文件目标命中与语义回退，只能由显式关键词命中。
       if (isSummaryStep(step.description)) {
         continue;
       }
 
-      // 策略 2: 工具类型 → 步骤描述的语义匹配
+      // 策略 2: 动作点名了步骤的文件目标——显式命中，不再依赖步骤措辞与工具类别是否对得上。
+      if (hit) {
+        return step;
+      }
+
+      // 策略 3: 工具类型 → 步骤描述的语义匹配
       if (matchesStepSemantics(toolName, actionName, step.description.toLowerCase())) {
         return step;
       }
     }
 
     return null;
+  }
+
+  /** 技术名被排除出文件目标会让 read/outline 的硬门槛不作用于它：每个步骤记一次 debug 诊断。 */
+  #noteTechNameExclusion(step: PlanStep, techNames: string[]) {
+    if (techNames.length === 0 || this.#techNameLoggedSteps.has(step)) {
+      return;
+    }
+    this.#techNameLoggedSteps.add(step);
+    logPlanDiagnostic(
+      `[PlanTracker] plan step "${step.description}" excludes technology name(s) ` +
+        `${techNames.join(', ')} from file targets; read/outline hard gate does not apply to them`
+    );
   }
 }
 
@@ -636,21 +753,42 @@ function isExplorationAction(tool: string, action: string): boolean {
   return EXPLORATION_ACTIONS.get(tool)?.has(action) === true;
 }
 
-/** 抽取步骤描述中的明确文件目标：含 '/' 的路径，或扩展名在白名单内且不是 X.js 技术名的文件名。 */
-function extractFileTargets(description: string): string[] {
-  const candidates = description.match(FILE_TARGET_CANDIDATE_RE) || [];
-  return candidates.filter(isFileTarget);
+/**
+ * 抽取步骤描述中的明确文件目标：含 '/' 的路径，或扩展名在白名单内且不是 X.js 技术名的文件名；
+ * 被当作技术名排除的 token 一并返回，供调用方记录诊断。
+ */
+function extractFileTargets(description: string): { targets: string[]; techNames: string[] } {
+  const targets: string[] = [];
+  const techNames: string[] = [];
+  for (const token of description.match(FILE_TARGET_CANDIDATE_RE) || []) {
+    if (token.includes('/')) {
+      targets.push(token);
+      continue;
+    }
+    const extension = token.slice(token.lastIndexOf('.') + 1).toLowerCase();
+    if (!SOURCE_FILE_EXTENSIONS.has(extension)) {
+      continue;
+    }
+    if (isJsTechName(token)) {
+      techNames.push(token);
+      continue;
+    }
+    targets.push(token);
+  }
+  return { targets, techNames };
 }
 
-function isFileTarget(token: string): boolean {
-  if (token.includes('/')) {
-    return true;
-  }
-  const extension = token.slice(token.lastIndexOf('.') + 1).toLowerCase();
-  if (!SOURCE_FILE_EXTENSIONS.has(extension)) {
-    return false;
-  }
-  return !TECH_NAME_JS_RE.test(token);
+function isJsTechName(token: string): boolean {
+  return /^[A-Z]/.test(token) && JS_TECH_NAMES.has(token.toLowerCase());
+}
+
+/**
+ * 非单文件动作的文件目标命中：目标须以路径边界出现在参数文本里（前面不是文件名字符，后面不再接
+ * 文件名字符或扩展名），避免 src/oauth.ts 命中 auth.ts、auth.tsx 命中 auth.ts。
+ */
+function mentionsFileTarget(argsStr: string, target: string): boolean {
+  const needle = target.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\w@.-])${needle}(?![\\w@-]|\\.\\w)`).test(argsStr);
 }
 
 function isSummaryStep(description: string): boolean {
