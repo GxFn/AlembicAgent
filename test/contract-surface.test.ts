@@ -409,8 +409,49 @@ describe('tool router contract seam (L3-C09)', () => {
       resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: withoutExecute } }))
     ).toBeNull();
     expect(warn).toHaveBeenCalledOnce();
-    expect(String(warn.mock.calls[0]?.[0])).toMatch(/execute is not a function/);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('invalidMembers=execute;');
     expect(String(warn.mock.calls[0]?.[0])).toContain('callId=fixture-call');
+  });
+
+  it('rejects and warns about optional explain/executeChildCall members that are not functions', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    // explain/executeChildCall 可选但不放开形状：给了就必须是函数，否则调用方先判存在再调用会抛 TypeError。
+    const execute = vi.fn(async () => blockedEnvelope());
+    const bogus = { execute, explain: 42, executeChildCall: 'nope' };
+    expect(
+      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: bogus } }))
+    ).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain('invalidMembers=explain,executeChildCall;');
+    expect(message).toContain(
+      'memberTypes=execute:function,explain:number,executeChildCall:string'
+    );
+    expect(message).toContain('callId=fixture-call');
+    expect(message).not.toMatch(/execute is not a function/);
+    expect(execute).not.toHaveBeenCalled();
+
+    // 只有一个可选成员不合法时，也只点名那一个。
+    warn.mockClear();
+    const nullChildCall = { execute, executeChildCall: null };
+    expect(
+      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: nullChildCall } }))
+    ).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toContain('invalidMembers=executeChildCall;');
+  });
+
+  it('still resolves an execute-only router whose optional members are explicitly undefined', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const minimal = {
+      execute: async () => blockedEnvelope(),
+      explain: undefined,
+      executeChildCall: undefined,
+    };
+    expect(
+      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: minimal } }))
+    ).toBe(minimal);
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 
