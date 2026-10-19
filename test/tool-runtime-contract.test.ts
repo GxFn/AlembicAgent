@@ -2484,6 +2484,30 @@ describe('L4-P13 code.search multi-pattern completeness and count semantics', ()
 // 同一夹具再交给真实 rg 对照，钉住宿主可见的命中集合、partial 状态与诊断。
 type SearchEnvelope = Awaited<ReturnType<ToolRouterAdapter['execute']>>;
 
+/** 用指定引擎搜 needle：fallback 用 PATH='' 制造 rg 缺席，rg 走真实 ripgrep（环境没有时自动回退）。 */
+async function searchNeedle(
+  root: string,
+  params: Record<string, unknown>,
+  engine: 'fallback' | 'rg'
+): Promise<SearchEnvelope> {
+  vi.unstubAllEnvs();
+  vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
+  if (engine === 'fallback') {
+    vi.stubEnv('PATH', '');
+  }
+  const router = new ToolRouterAdapter({
+    contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
+  });
+  return router.execute(
+    searchRequest({ patterns: ['needle'], maxResults: 50, contextLines: 0, ...params })
+  );
+}
+
+function hitFiles(result: SearchEnvelope): string[] {
+  const data = result.structuredContent as SearchData | null;
+  return [...new Set((data?.matches ?? []).map((match) => match.file))].sort();
+}
+
 describe('L4-P14 code.search fallback semantics without ripgrep', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -2517,29 +2541,6 @@ describe('L4-P14 code.search fallback semantics without ripgrep', () => {
       await writeFile(join(root, file), 'needle\n');
     }
     return root;
-  }
-
-  async function searchNeedle(
-    root: string,
-    params: Record<string, unknown>,
-    engine: 'fallback' | 'rg'
-  ): Promise<SearchEnvelope> {
-    vi.unstubAllEnvs();
-    vi.stubEnv('RIPGREP_CONFIG_PATH', undefined);
-    if (engine === 'fallback') {
-      vi.stubEnv('PATH', '');
-    }
-    const router = new ToolRouterAdapter({
-      contextFactory: { create: () => ({ projectRoot: root, tokenBudget: 100_000 }) },
-    });
-    return router.execute(
-      searchRequest({ patterns: ['needle'], maxResults: 50, contextLines: 0, ...params })
-    );
-  }
-
-  function hitFiles(result: SearchEnvelope): string[] {
-    const data = result.structuredContent as SearchData | null;
-    return [...new Set((data?.matches ?? []).map((match) => match.file))].sort();
   }
 
   it.each([
@@ -2767,6 +2768,239 @@ describe('L4-P14 code.search fallback semantics without ripgrep', () => {
     expect(result.diagnostics?.warnings ?? []).toContainEqual(
       expect.objectContaining({ code: 'code_search_fallback_glob_unsupported' })
     );
+  });
+});
+
+// ─── L4-P14c 审计补修：点开头路径、大小写与没应用的 .gitignore 重新纳入行 ───────────────────
+// 来源：module-review-2026-10-01 对 fbb1abc（L4-P14）的审计。path.posix.matchesGlob 的通配符不匹配以 .
+// 开头的段（dot:false），在 macOS 上还大小写不敏感；rg 的白名单 --glob 优先于隐藏规则，glob 与 .gitignore
+// 都大小写敏感。于是 'src/**' 漏掉 src/.storybook/、'!*.md' 排除 README.MD、.gitignore 的 '*.log' 屏蔽
+// Build.LOG，全部报告为完整成功；跳过的 .gitignore '!' 行同样静默漏搜。P14 的夹具只有一个两个引擎都会
+// 跳过的隐藏目录、没有大小写变体，所以 rg 对照看不出分歧。这里的夹具专门放进这些分歧点：每个用例都给出
+// 显式期望（由 ripgrep 15 实测得到），环境有 rg 时再用真实 rg 对照同一期望。
+describe('L4-P14c code.search fallback parity for dot-prefixed names, case and skipped re-includes', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** 夹具：带空 .git 目录（rg 与 fallback 都认定为 git 仓库），可选根 .gitignore。 */
+  async function makeParityProject(
+    prefix: string,
+    files: Record<string, string>,
+    gitignore?: string
+  ): Promise<string> {
+    const root = await mkdtemp(join(baseRoot, prefix));
+    await mkdir(join(root, '.git'));
+    if (gitignore !== undefined) {
+      await writeFile(join(root, '.gitignore'), gitignore);
+    }
+    for (const [file, content] of Object.entries(files)) {
+      await mkdir(join(root, file, '..'), { recursive: true });
+      await writeFile(join(root, file), content);
+    }
+    return root;
+  }
+
+  /** fallback 必须给出与 rg 相同的命中集合，并且是完整成功（不是 partial、不拒绝 glob）。 */
+  async function expectCompleteParity(
+    root: string,
+    glob: string | undefined,
+    expected: string[]
+  ): Promise<void> {
+    const params = glob === undefined ? {} : { glob };
+    const fallback = await searchNeedle(root, params, 'fallback');
+    expect(fallback.ok).toBe(true);
+    expect(fallback.status).toBe('success');
+    expect(fallback.diagnostics?.fallbackUsed).toBe(true);
+    expect(fallback.diagnostics?.degraded).toBe(false);
+    expect(fallback.diagnostics?.warnings ?? []).not.toContainEqual(
+      expect.objectContaining({ code: 'code_search_fallback_glob_unsupported' })
+    );
+    expect(hitFiles(fallback)).toEqual(expected);
+    expect((fallback.structuredContent as SearchData).incomplete).toBeUndefined();
+    const rg = await searchNeedle(root, params, 'rg');
+    if (rg.diagnostics?.fallbackUsed !== true) {
+      expect(hitFiles(rg)).toEqual(expected);
+    }
+  }
+
+  const NEEDLE = 'needle\n';
+
+  it('finds the only hit inside a hidden directory under a whitelist glob instead of reporting a complete zero', async () => {
+    const root = await makeParityProject('p14c-storybook-', {
+      'src/.storybook/main.ts': NEEDLE,
+      'src/index.ts': 'other\n',
+    });
+    const fallback = await searchNeedle(root, { glob: 'src/**' }, 'fallback');
+    expect(fallback.ok).toBe(true);
+    expect(fallback.status).toBe('success');
+    const data = fallback.structuredContent as SearchData;
+    expect(data.total).toBe(1);
+    expect(data.matches).toEqual([{ file: 'src/.storybook/main.ts', line: 1, content: 'needle' }]);
+  });
+
+  it.each([
+    ['src/**', ['src/.hidden.ts', 'src/.storybook/main.ts', 'src/a/x.ts', 'src/index.ts']],
+    ['*.js', ['.eslintrc.js', 'app.js']],
+    ['**/*.ts', ['src/.hidden.ts', 'src/a/x.ts', 'src/index.ts']],
+    ['*.{js,ts}', ['.eslintrc.js', 'app.js', 'src/.hidden.ts', 'src/a/x.ts', 'src/index.ts']],
+    // 只匹配目录内容、不匹配隐藏目录本身的 glob：rg 照样按隐藏规则剪掉 src/.storybook，两边都是 0 命中。
+    ['**/.storybook/**', []],
+    ['!*.js', ['src/a/x.ts', 'src/index.ts']],
+    [undefined, ['app.js', 'src/a/x.ts', 'src/index.ts']],
+  ] as Array<
+    [string | undefined, string[]]
+  >)('lets glob %s whitelist dot-prefixed names like ripgrep', async (glob, expected) => {
+    const root = await makeParityProject('p14c-dot-', {
+      '.eslintrc.js': NEEDLE,
+      'app.js': NEEDLE,
+      'src/index.ts': NEEDLE,
+      'src/.hidden.ts': NEEDLE,
+      'src/.storybook/main.ts': NEEDLE,
+      'src/a/x.ts': NEEDLE,
+      '.config/tool.ts': NEEDLE,
+    });
+    await expectCompleteParity(root, glob, expected);
+  });
+
+  it.each([
+    ['!*.md', ['Build.LOG', 'README.MD', 'app.js']],
+    ['*.md', ['notes.md']],
+    ['*.LOG', ['Build.LOG']],
+    [undefined, ['Build.LOG', 'README.MD', 'app.js', 'notes.md']],
+  ] as Array<
+    [string | undefined, string[]]
+  >)('matches glob %s and .gitignore rules case-sensitively like ripgrep', async (glob, expected) => {
+    const root = await makeParityProject(
+      'p14c-case-',
+      {
+        'Build.LOG': NEEDLE,
+        'trace.log': NEEDLE,
+        'README.MD': NEEDLE,
+        'notes.md': NEEDLE,
+        'app.js': NEEDLE,
+      },
+      '*.log\n'
+    );
+    await expectCompleteParity(root, glob, expected);
+  });
+
+  it.each([
+    ['{a,{b,c}}.ts', ['a.ts', 'b.ts', 'c.ts', 'src/a.ts']],
+    ['q{,.x}', ['q.x']],
+    ['/src[!x]a.ts', ['src/a.ts']],
+    ['src[!x]a.ts', ['src/a.ts']],
+    ['/src?a.ts', ['srcxa.ts']],
+    ['a,b.ts', ['a,b.ts']],
+    ['x]y.ts', ['x]y.ts']],
+    ['[]a].ts', ['a.ts', 'src/a.ts']],
+    ['[-a].ts', ['-.ts', 'a.ts', 'src/a.ts']],
+    ['a**.ts', ['a,b.ts', 'a.ts', 'ab.ts', 'src/a.ts']],
+    ['?.ts', ['-.ts', 'a.ts', 'b.ts', 'c.ts', 'e.ts', 'src/a.ts']],
+    [
+      '**',
+      [
+        '-.ts',
+        'a,b.ts',
+        'a.ts',
+        'ab.ts',
+        'b.ts',
+        'c.ts',
+        'e.ts',
+        'q',
+        'q.x',
+        'src/a.ts',
+        'srcxa.ts',
+        'x]y.ts',
+        '\u00e9.ts',
+      ],
+    ],
+  ] as Array<
+    [string, string[]]
+  >)('evaluates glob %s with ripgrep globset grammar', async (glob, expected) => {
+    const root = await makeParityProject('p14c-grammar-', {
+      'a.ts': NEEDLE,
+      'b.ts': NEEDLE,
+      'c.ts': NEEDLE,
+      'ab.ts': NEEDLE,
+      '-.ts': NEEDLE,
+      'a,b.ts': NEEDLE,
+      'x]y.ts': NEEDLE,
+      q: NEEDLE,
+      'q.x': NEEDLE,
+      'src/a.ts': NEEDLE,
+      'srcxa.ts': NEEDLE,
+      'e.ts': NEEDLE,
+      // rg 的 globset 按字节匹配：? 只吃一个字节，两字节的 é 不能被 ?.ts 匹配。
+      '\u00e9.ts': NEEDLE,
+    });
+    await expectCompleteParity(root, glob, expected);
+  });
+
+  it.each([
+    'src/{a,**}/x.ts',
+    '*.{ts',
+    '[ab.ts',
+    'a}b.ts',
+    '[b-a].ts',
+  ])('rejects glob %s that the fallback cannot evaluate like ripgrep', async (glob) => {
+    const root = await makeParityProject('p14c-reject-', {
+      'src/a/x.ts': NEEDLE,
+      'a.ts': NEEDLE,
+      'a}b.ts': NEEDLE,
+    });
+    const result = await searchNeedle(root, { glob }, 'fallback');
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe('error');
+    expect(result.text).toContain('cannot evaluate glob');
+    expect(result.diagnostics?.fallbackUsed).toBe(true);
+    expect(result.diagnostics?.warnings ?? []).toContainEqual(
+      expect.objectContaining({ code: 'code_search_fallback_glob_unsupported' })
+    );
+  });
+
+  it('reports a .gitignore re-include line it cannot apply instead of a complete zero', async () => {
+    // 第二行是 `!\#keep.log`：rg 把它当作重新纳入字面量 #keep.log；fallback 不支持反斜杠，只能跳过。
+    const root = await makeParityProject(
+      'p14c-reinclude-',
+      { '#keep.log': NEEDLE, 'a.ts': 'other\n' },
+      '*.log\n!\\#keep.log\n'
+    );
+    const fallback = await searchNeedle(root, {}, 'fallback');
+    expect(fallback.status).toBe('partial');
+    expect(fallback.diagnostics?.degraded).toBe(true);
+    const warnings = fallback.diagnostics?.warnings ?? [];
+    const unsupported = warnings.find((w) => w.code === 'code_search_fallback_glob_unsupported');
+    expect(unsupported?.message).toContain('re-include');
+    expect(unsupported?.message).toContain('#keep.log');
+    const incomplete = warnings.find((w) => w.code === 'code_search_incomplete');
+    expect(incomplete?.message).toContain('"needle"');
+    expect(incomplete?.message).toContain('re-include');
+    const rg = await searchNeedle(root, {}, 'rg');
+    if (rg.diagnostics?.fallbackUsed !== true) {
+      expect(hitFiles(rg)).toEqual(['#keep.log']);
+    }
+  });
+
+  it('keeps a skipped .gitignore ignore line as a complete superset search', async () => {
+    // `\#drop.ts` 是忽略行：跳过它只会多搜（rg 会忽略 #drop.ts），不能把结果标成 partial。
+    const root = await makeParityProject(
+      'p14c-skip-ignore-',
+      { '#drop.ts': NEEDLE, 'a.ts': NEEDLE },
+      '\\#drop.ts\n'
+    );
+    const fallback = await searchNeedle(root, {}, 'fallback');
+    expect(fallback.ok).toBe(true);
+    expect(fallback.status).toBe('success');
+    expect(fallback.diagnostics?.degraded).toBe(false);
+    expect(fallback.diagnostics?.warnings ?? []).not.toContainEqual(
+      expect.objectContaining({ code: 'code_search_fallback_glob_unsupported' })
+    );
+    expect(hitFiles(fallback)).toEqual(['#drop.ts', 'a.ts']);
+    const rg = await searchNeedle(root, {}, 'rg');
+    if (rg.diagnostics?.fallbackUsed !== true) {
+      expect(hitFiles(fallback)).toEqual(expect.arrayContaining(hitFiles(rg)));
+    }
   });
 });
 
