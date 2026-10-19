@@ -1845,6 +1845,69 @@ describe('tool result ordinary output', () => {
     expect(none.diagnosticSummary.redactedFieldCount).toBe(0);
   });
 
+  it('removes caller-supplied names without a normalized form by their raw key (L3-C02)', () => {
+    // 纯符号、emoji、'__'、'a..b' 规范化后出现空段，无法按规范化名字比较；它们必须退回
+    // “按原始键名 / 原始点号路径精确删除”的原语义并写入 redactedFields，不能被静默保留。
+    const secret = 'synthetic-raw-key-secret';
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = {
+      '🔑': `${secret}-1`,
+      __: `${secret}-2`,
+      'a..b': `${secret}-3`,
+      nested: { '🔑': `${secret}-4`, ___: 'kept underscores' },
+      meta: { '!!!': `${secret}-5`, kept: true },
+      rows: [{ '!!!': `${secret}-6`, id: 1 }],
+      other: { meta: { '!!!': 'kept off-root path' } },
+      kept: 1,
+    };
+    envelope.text = JSON.stringify(envelope.structuredContent);
+
+    const custom = projectToolResultOrdinaryOutput(envelope, {
+      forbiddenFields: ['🔑', '__', 'a..b', 'meta.!!!', 'rows.!!!'],
+    });
+    const defaults = projectToolResultOrdinaryOutput(envelope);
+
+    // 不含点号的名字：任意深度按原始键名全等删除；含点号的路径：从根起按原始键名拼路径
+    // （数组下标不入路径），不在根路径上的同名键保留。
+    const expected = {
+      nested: { ___: 'kept underscores' },
+      meta: { kept: true },
+      rows: [{ id: 1 }],
+      other: { meta: { '!!!': 'kept off-root path' } },
+      kept: 1,
+    };
+    expect(custom.structuredContent).toEqual(expected);
+    expect(JSON.parse(custom.text)).toEqual(expected);
+    expect(JSON.stringify(custom)).not.toContain(secret);
+    expect(custom.diagnosticSummary.redactedFields).toEqual([
+      '__',
+      'a..b',
+      'meta.!!!',
+      'nested.🔑',
+      'rows.!!!',
+      '🔑',
+    ]);
+    expect(custom.diagnosticSummary.redactedFieldCount).toBe(6);
+    // 回归保护：默认 D23 规则不认识这些键名，按默认参数调用时全部保留。
+    expect(defaults.structuredContent).toEqual(envelope.structuredContent);
+    expect(defaults.diagnosticSummary.redactedFieldCount).toBe(0);
+  });
+
+  it('does not count raw-key forbidden fields as omitted when the display budget runs out', () => {
+    // 预算耗尽后的省略计数只算本应展示的键；按原始键名删除的字段与其它 D23 删除一样不计入。
+    const original: Record<string, unknown> = {};
+    for (let index = 0; index < 4200; index++) {
+      original[`field${index}`] = index;
+    }
+    const envelope = createEnvelopeForStatus('success');
+    envelope.structuredContent = { ...original, '🔑': 'synthetic-raw-key-after-budget' };
+
+    const projected = projectToolResultOrdinaryOutput(envelope, { forbiddenFields: ['🔑'] });
+
+    expectRemainingFieldMarker(projected.structuredContent, original);
+    expect(JSON.stringify(projected)).not.toContain('synthetic-raw-key-after-budget');
+  });
+
   it('never echoes a value that was folded into a removed private key name', () => {
     // 键名里拼进值（等号、冒号、空格、点号写法）时，删除后也不能经 redactedFields 原样带出。
     const secret = 'synthetic-keyname-secret';

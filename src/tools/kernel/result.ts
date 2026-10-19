@@ -119,6 +119,18 @@ interface ForbiddenFieldMatcher {
   readonly customRootPaths: ReadonlySet<string>;
   /** 点号路径的最大段数；对象链超过它后不再追踪，避免深层结构反复拼路径。 */
   readonly maxRootPathSegments: number;
+  /**
+   * 规范化后出现空段、且不含点号的调用方字段（纯符号、emoji、"__"）：没有可比较的规范化
+   * 形态，退回 L3-P07 之前的原语义——任意深度、按原始键名全等匹配。
+   */
+  readonly rawExactNames: ReadonlySet<string>;
+  /**
+   * 规范化后出现空段、且含点号的调用方字段（"a..b"、"meta.!!!"）：退回原语义——从根起把
+   * 原始键名用点号拼接（数组下标不入路径）后全等匹配；键名自身含点号时也按拼接结果比较。
+   */
+  readonly rawRootPaths: ReadonlySet<string>;
+  /** rawRootPaths 按点号拆开后的最大段数；更深的对象链不可能命中，不再拼路径。 */
+  readonly maxRawRootPathSegments: number;
   /** 没有任何规则（规范化入口）：逐键判定直接短路，不为每个键做名字规范化。 */
   readonly matchesNothing: boolean;
 }
@@ -128,12 +140,22 @@ function compileForbiddenFields(fields: readonly string[]): ForbiddenFieldMatche
   const exactNames = new Set<string>();
   const legacyRootPaths = new Set<string>();
   const customRootPaths = new Set<string>();
+  const rawExactNames = new Set<string>();
+  const rawRootPaths = new Set<string>();
   for (const field of fields) {
     const segments = normalizedKeySegments(field);
     const dotted = segments.join('.');
     const whole = normalizeFieldName(field);
     if (segments.some((segment) => segment.length === 0)) {
-      // 规范化后为空的段（例如纯符号或 "a..b"）无法安全比较；跳过而不是匹配所有键。
+      // 规范化后出现空段（纯符号、emoji、"__"、"a..b"）：规范化比较会让空段匹配到无关键，
+      // 也不能直接丢弃（L3-P7r3：丢弃会把调用方要求删除的键静默保留）。这里退回 L3-P07
+      // 之前的原语义，按原始键名或原始点号路径精确删除；命中照常写入 redactedFields，
+      // 所以这不是降级路径，删除本身就是可见诊断。D23 默认列表与私有子集都不会走到这里。
+      if (field.includes('.')) {
+        rawRootPaths.add(field);
+      } else {
+        rawExactNames.add(field);
+      }
       continue;
     }
     if (LEGACY_ROOT_FIELD_TOKENS.has(dotted)) {
@@ -157,11 +179,16 @@ function compileForbiddenFields(fields: readonly string[]): ForbiddenFieldMatche
     legacyRootPaths,
     customRootPaths,
     maxRootPathSegments: Math.max(0, ...rootPathLengths),
+    rawExactNames,
+    rawRootPaths,
+    maxRawRootPathSegments: Math.max(0, ...[...rawRootPaths].map((path) => path.split('.').length)),
     matchesNothing:
       privateTokens.size === 0 &&
       exactNames.size === 0 &&
       legacyRootPaths.size === 0 &&
-      customRootPaths.size === 0,
+      customRootPaths.size === 0 &&
+      rawExactNames.size === 0 &&
+      rawRootPaths.size === 0,
   };
 }
 
@@ -208,10 +235,23 @@ function matchForbiddenField(
   matcher: ForbiddenFieldMatcher,
   key: string,
   objectPath: ObjectPathState | null,
-  ancestorTail: string
+  ancestorTail: string,
+  rawPath: readonly string[]
 ): ForbiddenFieldMatch {
   if (matcher.matchesNothing) {
     return null;
+  }
+  // 规范化后出现空段的调用方字段按原始键名比较（见 compileForbiddenFields）。拼接后的路径
+  // 至少有 rawPath.length + 1 段，所以对象链已不短于最长规则段数时不可能命中，不再拼接。
+  if (matcher.rawExactNames.has(key)) {
+    return 'listed';
+  }
+  if (
+    matcher.rawRootPaths.size > 0 &&
+    rawPath.length < matcher.maxRawRootPathSegments &&
+    matcher.rawRootPaths.has([...rawPath, key].join('.'))
+  ) {
+    return 'listed';
   }
   const normalized = normalizeFieldName(key);
   if (normalized.length > 0) {
@@ -879,7 +919,9 @@ function sanitizeOrdinaryNode(
       const key = keys[index] as string;
       const childPath = array ? path : [...path, key];
       // D23：数组元素没有键名；对象键先于读取属性判定，accessor 形式的私有字段也不会被执行。
-      const forbidden = array ? null : matchForbiddenField(matcher, key, objectPath, ancestorTail);
+      const forbidden = array
+        ? null
+        : matchForbiddenField(matcher, key, objectPath, ancestorTail, path);
       if (forbidden !== null) {
         state.redactedFields.push([...path, reportedRedactedKey(key, forbidden)].join('.'));
         continue;
@@ -928,7 +970,7 @@ function sanitizeOrdinaryNode(
       ? value.length - handled
       : exhaustedAt < 0
         ? 0
-        : countDisplayableKeys(keys, exhaustedAt, objectPath, ancestorTail, matcher);
+        : countDisplayableKeys(keys, exhaustedAt, path, objectPath, ancestorTail, matcher);
     if (omitted > 0) {
       state.warningCodes.add('TOOL_RESULT_DISPLAY_LIMIT');
       if (handled === 0) {
@@ -991,13 +1033,15 @@ function defineDataEntry(out: Record<string, unknown> | unknown[], key: string, 
 function countDisplayableKeys(
   keys: readonly string[],
   from: number,
+  rawPath: readonly string[],
   objectPath: ObjectPathState | null,
   ancestorTail: string,
   matcher: ForbiddenFieldMatcher
 ): number {
   let count = 0;
   for (let index = from; index < keys.length; index++) {
-    if (matchForbiddenField(matcher, keys[index] as string, objectPath, ancestorTail) === null) {
+    const key = keys[index] as string;
+    if (matchForbiddenField(matcher, key, objectPath, ancestorTail, rawPath) === null) {
       count++;
     }
   }
