@@ -7,7 +7,7 @@ import {
   taskQualityAudit,
 } from '../src/agent/tasks/index.js';
 import type { ToolResultEnvelope, ToolResultStatus } from '../src/tools/kernel/index.js';
-import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
+import { getActionNames, getToolNames, ToolRouterAdapter } from '../src/tools/runtime/index.js';
 
 /** 真实任务调用真实adapter；未迁移的旧工具名/参数不能被解释成检查通过。 */
 function routedTaskContext(services: Record<string, unknown> = {}) {
@@ -396,5 +396,31 @@ describe('task successful result projections', () => {
       violationCount: 1,
       suggestions: [{ violation: 'no any', suggestion: 'use unknown' }],
     });
+  });
+});
+
+/*
+ * L8-P16 退役原因守护：4 个 DAG 任务依赖的工具在唯一注册表中不存在，所以它们在生产上必然经
+ * invokeTaskTool fail-closed（上面的真实 router 用例覆盖了失败路径）。退役决策要求不补别名、不做
+ * 假实现；若有人把这些名字注册成工具或动作，这里失败，提醒先回到退役决策而不是悄悄“修好”。
+ */
+describe('retired DAG task tools (L8-P16)', () => {
+  it.each([
+    { task: 'taskCheckAndSubmit', tool: 'check_duplicate' },
+    { task: 'taskFullEnrich', tool: 'enrich_candidate' },
+    { task: 'taskQualityAudit', tool: 'quality_score' },
+    { task: 'taskGuardFullScan', tool: 'guard_check_code' },
+  ])('keeps $tool absent from the runtime registry so $task stays fail-closed without an alias', ({
+    tool,
+  }) => {
+    const toolNames = getToolNames();
+    expect(toolNames.length).toBeGreaterThan(0);
+    expect(toolNames).not.toContain(tool);
+    for (const name of toolNames) {
+      expect({ name, actions: getActionNames(name) }).toEqual({
+        name,
+        actions: expect.not.arrayContaining([tool]),
+      });
+    }
   });
 });

@@ -3,6 +3,19 @@
  *
  * These handlers are not chat runtime logic. They orchestrate direct ToolRouter
  * calls and, for relation discovery, delegate to AgentService.run().
+ *
+ * 退役路线（L8-P16 / L8-C10，用户已批准整体退役 ./tasks 子路径）：
+ * - 查重提交、批量补全、质量审计、Guard 全量扫描 4 个任务依赖的 check_duplicate、enrich_candidate、
+ *   quality_score、guard_check_code 在 Agent 唯一工具注册表（src/tools/runtime/registry.ts）、宿主与
+ *   Core 中都不存在，生产调用必然经 invokeTaskTool fail-closed 抛错；没有替代入口，重接线等于新造工具。
+ * - taskDiscoverAllRelations 只是 runRelationDiscovery 的薄包装，替代入口是 `@alembic/agent/service`
+ *   的 runRelationDiscovery（宿主 lib/http/routes/recipes.ts 已直接使用）。
+ * - L8-C20（guard_full_scan 缺 code 以成功值返回 {error}）与 L8-C21（读取宿主私有 _aiProviderManager
+ *   的 Mock 跳过分支）随退役删除，不单独修复。
+ * - 删除顺序：宿主先移除 lib/http/routes/ai.ts 的 DAG_TASK_HANDLERS 条目、GET /agent/capabilities 的
+ *   tasks 广告与 test/unit/AgentTaskHandlers.test.ts；之后 Agent 再删本子路径导出，并同步
+ *   config/agent-public-api-signatures.json、config/agent-public-api-boundary.json 与 contract-surface。
+ * 在那之前本文件只加废弃标注：保持 fail-closed，不补工具别名，不做假实现，公开名字与种类不变。
  */
 
 import Logger from '@alembic/core/logging';
@@ -14,11 +27,23 @@ import {
 } from '#tools/kernel/index.js';
 import { type AgentService, runRelationDiscovery } from '../service/index.js';
 
+/**
+ * 任务处理函数可选使用的 AI 端口（查重判定、Guard 修复建议）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface TaskAiProvider {
   chat(prompt: string, opts?: Record<string, unknown>): Promise<string>;
   chatWithStructuredOutput(prompt: string, opts?: Record<string, unknown>): Promise<unknown>;
 }
 
+/**
+ * 宿主为 DAG 任务注入的执行上下文（宿主 ai.ts 内联构造，未按名导入本类型）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface TaskContext {
   invokeToolEnvelope(
     toolName: string,
@@ -35,18 +60,36 @@ export interface TaskContext {
   signal?: AbortSignal;
 }
 
+/**
+ * 查重提交任务的候选输入。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface CandidateInput {
   title?: string;
   code?: string;
   [key: string]: unknown;
 }
 
+/**
+ * 查重工具返回的相似条目。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface DuplicateEntry {
   title?: string;
   similarity: number;
   [key: string]: unknown;
 }
 
+/**
+ * 批量补全与质量审计读取的知识条目。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface KnowledgeItem {
   id: string;
   title?: string;
@@ -59,6 +102,12 @@ export interface KnowledgeItem {
   [key: string]: unknown;
 }
 
+/**
+ * 宿主容器中 knowledgeService 的最小读取端口。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface KnowledgeServiceLike {
   list(
     filter: Record<string, unknown>,
@@ -66,6 +115,12 @@ export interface KnowledgeServiceLike {
   ): Promise<{ items?: KnowledgeItem[]; data?: KnowledgeItem[] }>;
 }
 
+/**
+ * Guard 扫描工具返回的单条违规。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：只服务于本文件的 DAG 任务处理函数，没有替代
+ *   类型；删除须等宿主移除 /agent/task 的 DAG 条目之后（删除顺序见文件头）。
+ */
 export interface GuardViolation {
   severity?: string;
   message?: string;
@@ -90,6 +145,13 @@ interface GuardCheckResult {
   violations?: GuardViolation[];
 }
 
+/**
+ * 提交前查重任务（宿主 /agent/task 的 check_and_submit）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16 / L8-C10）：依赖的 check_duplicate 工具在 Agent 工具
+ *   注册表、宿主与 Core 中都不存在，生产调用必然 fail-closed 抛错；没有替代入口，不补别名、不做假实现。
+ *   删除须等宿主移除 /agent/task 的 DAG 条目与 capabilities 广告之后（删除顺序见文件头）。
+ */
 export async function taskCheckAndSubmit(
   context: TaskContext,
   { candidate, projectRoot }: { candidate: CandidateInput; projectRoot?: string }
@@ -149,6 +211,14 @@ ${highSim.map((s: DuplicateEntry) => `- ${s.title} (相似度: ${s.similarity})`
   };
 }
 
+/**
+ * 批量关系发现任务（宿主 /agent/task 的 discover_all_relations）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16）：本函数只是薄包装，替代入口是
+ *   `@alembic/agent/service` 的 runRelationDiscovery（宿主 recipes.ts 已直接使用）。读取宿主私有
+ *   _aiProviderManager 的 Mock 跳过分支（L8-C21）随退役删除，不单独修复；删除须等宿主移除
+ *   /agent/task 的 DAG 条目与 capabilities 广告之后（删除顺序见文件头）。
+ */
 export async function taskDiscoverAllRelations(context: TaskContext, { batchSize = 20 } = {}) {
   const { container } = context;
   const agentService = container.get('agentService') as AgentService;
@@ -163,6 +233,13 @@ export async function taskDiscoverAllRelations(context: TaskContext, { batchSize
   return runRelationDiscovery({ agentService, batchSize, abortSignal: context.signal });
 }
 
+/**
+ * 批量语义补全任务（宿主 /agent/task 的 full_enrich）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16 / L8-C10）：依赖的 enrich_candidate 工具在 Agent 工具
+ *   注册表、宿主与 Core 中都不存在，生产调用必然 fail-closed 抛错；没有替代入口，不补别名、不做假实现。
+ *   删除须等宿主移除 /agent/task 的 DAG 条目与 capabilities 广告之后（删除顺序见文件头）。
+ */
 export async function taskFullEnrich(
   context: TaskContext,
   { status = 'pending', maxCount = 50 } = {}
@@ -193,6 +270,13 @@ export async function taskFullEnrich(
   });
 }
 
+/**
+ * 批量质量审计任务（宿主 /agent/task 的 quality_audit）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16 / L8-C10）：依赖的 quality_score 工具在 Agent 工具
+ *   注册表、宿主与 Core 中都不存在，生产调用必然 fail-closed 抛错；没有替代入口，不补别名、不做假实现。
+ *   删除须等宿主移除 /agent/task 的 DAG 条目与 capabilities 广告之后（删除顺序见文件头）。
+ */
 export async function taskQualityAudit(
   context: TaskContext,
   { threshold = 0.6, maxCount = 100 } = {}
@@ -251,6 +335,14 @@ export async function taskQualityAudit(
   };
 }
 
+/**
+ * Guard 全量扫描任务（宿主 /agent/task 的 guard_full_scan）。
+ *
+ * @deprecated 随 ./tasks 子路径整体退役（L8-P16 / L8-C10）：依赖的 guard_check_code 工具在 Agent 工具
+ *   注册表、宿主与 Core 中都不存在，生产调用必然 fail-closed 抛错；没有替代入口，不补别名、不做假实现。
+ *   缺 code 时以成功值返回 {error} 的分支（L8-C20）随退役删除，不单独改为抛错；删除须等宿主移除
+ *   /agent/task 的 DAG 条目与 capabilities 广告之后（删除顺序见文件头）。
+ */
 export async function taskGuardFullScan(
   context: TaskContext,
   { code, language, filePath }: { code?: string; language?: string; filePath?: string } = {}

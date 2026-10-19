@@ -1456,3 +1456,134 @@ export { rootDigest, rootFinding };
     expect(diagnostics['memory-session-store-types.probe.ts']).toEqual([]);
   });
 });
+
+/* ── L8-P16：./tasks 子路径退役路线（L8-C10；L8-C20、L8-C21 随退役取消） ──────────────────────
+ * 用户决策：整体退役 ./tasks 子路径，执行顺序为宿主先移除 ai.ts 的 DAG 条目、capabilities 广告与
+ * AgentTaskHandlers 单测，Agent 再删导出并同步签名冻结文件。待决事项②③与宿主改动之前本轮只加
+ * 废弃标注，不删除、不补别名、不做假实现。这里锁住：
+ *   - 子路径全部导出（运行时绑定与纯类型）都带废弃标注，标注都落在 AgentTaskHandlers.ts；
+ *   - 运行时名字、种类与 signatureHash 仍等于签名快照（本轮没有删除，也没有新增别名）；
+ *   - 每个任务函数的废弃说明写明退役原因（缺失的工具名）或替代入口 runRelationDiscovery，
+ *     且所写替代入口确实是 service 子路径上的函数。
+ */
+
+const TASKS_ENTRY_SOURCE = 'src/agent/tasks/index.ts';
+const TASKS_HANDLER_SOURCE = 'src/agent/tasks/AgentTaskHandlers.ts';
+
+/** 4 个死任务各自依赖、但在注册表/宿主/Core 中都不存在的工具名，即退役原因。 */
+const RETIRED_TASK_MISSING_TOOLS = {
+  taskCheckAndSubmit: 'check_duplicate',
+  taskFullEnrich: 'enrich_candidate',
+  taskQualityAudit: 'quality_score',
+  taskGuardFullScan: 'guard_check_code',
+} as const;
+
+let tasksEntryProgram: ts.Program | undefined;
+
+/** ./tasks 入口单独建 Program，避免改动 L6-P25 共享 Program 的根文件集合。 */
+function tasksEntryChecker(): { checker: ts.TypeChecker; moduleSymbol: ts.Symbol } {
+  if (!tasksEntryProgram) {
+    tasksEntryProgram = ts.createProgram([path.join(REPO_ROOT, TASKS_ENTRY_SOURCE)], {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+      types: [],
+    });
+  }
+  const checker = tasksEntryProgram.getTypeChecker();
+  const sourceFile = tasksEntryProgram.getSourceFile(path.join(REPO_ROOT, TASKS_ENTRY_SOURCE));
+  const moduleSymbol = sourceFile ? checker.getSymbolAtLocation(sourceFile) : undefined;
+  if (!moduleSymbol) {
+    throw new Error(`entry module symbol missing: ${TASKS_ENTRY_SOURCE}`);
+  }
+  return { checker, moduleSymbol };
+}
+
+/** 沿 re-export 别名链取第一个 @deprecated 标签的说明文字；没有标签时返回 null。 */
+function tasksDeprecationText(checker: ts.TypeChecker, symbol: ts.Symbol): string | null {
+  const seen = new Set<ts.Symbol>();
+  let current: ts.Symbol | undefined = symbol;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    for (const declaration of current.declarations ?? []) {
+      const tag = ts.getJSDocDeprecatedTag(declaration);
+      if (tag) {
+        return ts.getTextOfJSDocComment(tag.comment) ?? '';
+      }
+    }
+    if ((current.flags & ts.SymbolFlags.Alias) === 0) {
+      break;
+    }
+    current = checker.getImmediateAliasedSymbol(current);
+  }
+  return null;
+}
+
+describe('tasks subpath retirement route (L8-P16)', () => {
+  it('marks every ./tasks export deprecated at its AgentTaskHandlers declaration', () => {
+    const { checker, moduleSymbol } = tasksEntryChecker();
+    const exported = checker.getExportsOfModule(moduleSymbol);
+    // 5 个运行时任务函数 + 7 个纯类型导出；数量变化说明子路径公开面被改动，须先回到退役决策。
+    expect(exported.map((symbol) => symbol.name).sort()).toEqual([
+      'CandidateInput',
+      'DuplicateEntry',
+      'GuardViolation',
+      'KnowledgeItem',
+      'KnowledgeServiceLike',
+      'TaskAiProvider',
+      'TaskContext',
+      'taskCheckAndSubmit',
+      'taskDiscoverAllRelations',
+      'taskFullEnrich',
+      'taskGuardFullScan',
+      'taskQualityAudit',
+    ]);
+    const sites = exported
+      .map((symbol) => [symbol.name, deprecationSite(checker, symbol)] as const)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    expect(sites).toEqual(sites.map(([name]) => [name, TASKS_HANDLER_SOURCE] as const));
+  });
+
+  it('keeps the ./tasks runtime names, kinds and hash frozen while retirement waits for the host', () => {
+    const entries = Object.keys(tasks)
+      .sort()
+      .map((name) => ({ name, kind: runtimeKind((tasks as Record<string, unknown>)[name]) }));
+    const expected = snapshotEntries('./tasks');
+    expect(entries).toEqual(expected.entries);
+    expect(entries).toHaveLength(expected.exportCount);
+    expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+      expected.signatureHash
+    );
+  });
+
+  it('names the retirement reason or the runRelationDiscovery replacement in each task deprecation', () => {
+    const { checker, moduleSymbol } = tasksEntryChecker();
+    const texts = new Map(
+      checker
+        .getExportsOfModule(moduleSymbol)
+        .map((symbol) => [symbol.name, tasksDeprecationText(checker, symbol)] as const)
+    );
+    for (const [name, text] of texts) {
+      expect({ name, mentionsPackage: text?.includes('L8-P16') ?? false }).toEqual({
+        name,
+        mentionsPackage: true,
+      });
+    }
+    for (const [task, missingTool] of Object.entries(RETIRED_TASK_MISSING_TOOLS)) {
+      const text = texts.get(task) ?? '';
+      expect({ task, text }).toEqual({
+        task,
+        text: expect.stringContaining(missingTool),
+      });
+      expect({ task, text }).toEqual({ task, text: expect.stringContaining('没有替代入口') });
+    }
+    const relationText = texts.get('taskDiscoverAllRelations') ?? '';
+    expect(relationText).toContain('runRelationDiscovery');
+    expect(relationText).toContain('@alembic/agent/service');
+    // 所写替代入口必须真实存在于 service 子路径，避免废弃说明指向一个不存在的入口。
+    expect(typeof service.runRelationDiscovery).toBe('function');
+  });
+});
