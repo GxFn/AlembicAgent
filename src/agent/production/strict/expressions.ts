@@ -245,7 +245,10 @@ function normalizeStrictProducerProposals(
     }
   }
   // 提案顺序进入 authoredFingerprintHash 与 setHash（hashCanonical 不排数组）：按 expressionId 以
-  // 固定的 en 排序规则排列，不随进程默认区域变化；en/zh 环境下与历史顺序一致。
+  // 固定的 en 排序规则排列，不随进程默认区域变化。仅对 ASCII expressionId，en/zh 环境下
+  // 与历史顺序一致。expressionId 由模型撰写、不限 ASCII：含非 ASCII 字符（如中文）时，固定 en
+  // 之前在非 en 默认区域（如 zh_CN）进程中写下的提案顺序与 setHash、authoredFingerprintHash
+  // 无法再由原始模型输出重新派生；完整性复核按存储顺序重算，不受影响。码元序迁移见待决事项⑥。
   return [...input]
     .map((proposal) => ({
       expressionId: proposal.expressionId,

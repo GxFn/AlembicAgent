@@ -338,6 +338,112 @@ describe('strict array orders inside canonical hashes do not depend on the proce
   });
 });
 
+/**
+ * “与历史顺序一致”只对 ASCII 标识符成立（L7-P3 第三轮审计 C014）。
+ *
+ * expressionId 由模型撰写，提示词契约只写 `string; unique across the row`，入口校验也不限
+ * ASCII。固定 en 之前，比较器取进程默认区域：zh_CN 进程会把 `expression-错误处理` 排在
+ * `expression-result` 之前，en 排序规则相反。因此含非 ASCII 字符的 expressionId 在固定 en
+ * 前后得到不同的提案顺序与 setHash / authoredFingerprintHash。这里只记录影响面并守护注释
+ * 口径，不改排序规则，也不加 ASCII 校验（码元序迁移属于决定⑥）。
+ */
+describe('strict expression order comments stay accurate for non-ASCII ids', () => {
+  const EXPRESSIONS_FILE = 'agent/production/strict/expressions.ts';
+  const NON_ASCII_EXPRESSION_IDS = ['expression-错误处理', 'expression-result'] as const;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 连续的行注释合并为一个注释块，每个块注释整体为一个注释块。去掉注释记号后逐行首尾去空白、
+   * 直接拼接，避免中文短语（如“历史顺序”）被换行拆开后漏检。
+   */
+  function commentBlocks(source: string): string[] {
+    const normalize = (lines: readonly string[]) =>
+      lines
+        .map((line) =>
+          line
+            .trim()
+            .replace(/^(?:\/\/+|\/\*+|\*+\/?)/u, '')
+            .replace(/\*+\/$/u, '')
+            .trim()
+        )
+        .join('');
+    const blocks: string[] = [];
+    let lineBlock: string[] = [];
+    for (const line of source.split('\n')) {
+      if (line.trim().startsWith('//')) {
+        lineBlock.push(line);
+        continue;
+      }
+      if (lineBlock.length > 0) {
+        blocks.push(normalize(lineBlock));
+        lineBlock = [];
+      }
+    }
+    if (lineBlock.length > 0) {
+      blocks.push(normalize(lineBlock));
+    }
+    const blockComments = source.match(/\/\*[\s\S]*?\*\//gu) ?? [];
+    return [...blocks, ...blockComments.map((block) => normalize(block.split('\n')))];
+  }
+
+  it('qualifies every historical-order claim in expressions.ts with ASCII ids', () => {
+    const source = readFileSync(path.join(SRC_ROOT, EXPRESSIONS_FILE), 'utf8');
+    const claims = commentBlocks(source).filter((block) => /历史(?:顺序|结果)/u.test(block));
+
+    // 排序器注释必须继续说明与历史的关系；删掉注释同样让守护失败，而不是空转通过。
+    expect(claims.length, EXPRESSIONS_FILE).toBeGreaterThan(0);
+    for (const claim of claims) {
+      // 正向限定（“仅对 ASCII …”）与非 ASCII 影响说明都必须出现。
+      expect(claim, EXPRESSIONS_FILE).toMatch(/(?<!非\s?)ASCII/u);
+      expect(claim, EXPRESSIONS_FILE).toMatch(/非\s?ASCII/u);
+    }
+  });
+
+  it('orders non-ASCII expression ids by en collation, not the historical zh-CN default', () => {
+    const enOrder = [...NON_ASCII_EXPRESSION_IDS].sort((left, right) =>
+      left.localeCompare(right, 'en')
+    );
+    const zhOrder = [...NON_ASCII_EXPRESSION_IDS].sort(new Intl.Collator('zh-CN').compare);
+    // 影响面记录：zh-CN 默认区域与 en 对这组 ID 的顺序相反，固定 en 前 zh_CN 进程写下的顺序不同。
+    expect(enOrder).toEqual(['expression-result', 'expression-错误处理']);
+    expect(zhOrder).toEqual(['expression-错误处理', 'expression-result']);
+
+    const { evidence: _evidence, ...lineageInputs } = createLineageInputs(['E-1']);
+    const lineage = createStrictProducerLineageReceiptV1({
+      ...lineageInputs,
+      evidence: createFrozenEvidenceProjection({
+        sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
+        entries: evidenceEntries(['E-1']),
+      }),
+    });
+    const input = {
+      lineage,
+      parentSet: null,
+      proposals: NON_ASCII_EXPRESSION_IDS.map((expressionId, index) => ({
+        expressionId,
+        kind: 'draft' as const,
+        authored: { ...AUTHORED, title: `${AUTHORED.title} ${index}` },
+      })),
+      zeroDisposition: null,
+      modelHash: 'producer-model-v1',
+      reasonHash: 'non-ascii-expression-order',
+    };
+    const baseline = createStrictProducerExpressionSetV1(input);
+    expect(baseline.proposals.map((proposal) => proposal.expressionId)).toEqual(enOrder);
+
+    simulateDefaultLocale('zh-CN');
+
+    const set = createStrictProducerExpressionSetV1(input);
+    expect(set.proposals.map((proposal) => proposal.expressionId)).toEqual(enOrder);
+    expect(set.proposals.map((proposal) => proposal.expressionId)).not.toEqual(zhOrder);
+    expect(set.authoredFingerprintHash).toBe(baseline.authoredFingerprintHash);
+    expect(set.setHash).toBe(baseline.setHash);
+  });
+});
+
 const AUTHORED = {
   title: 'Preserve typed Result envelopes',
   kind: 'rule',
