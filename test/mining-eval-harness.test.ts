@@ -5,7 +5,8 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 // @ts-expect-error — .mjs 脚本库无类型声明；单测直测其运行时行为。
 import {
   candidateCitedFiles,
@@ -31,6 +32,7 @@ import {
   verifyJudgeCitations,
 } from '../src/agent/evaluation/MiningJudge.js';
 import {
+  assertStrictFixtureGoldenProviderV1,
   createStrictProductionSourceFixtureRuntimeV1,
   FrozenStrictProductionEvaluationProviderV1,
 } from '../src/agent/evaluation/StrictProductionFixtureEvaluation.js';
@@ -830,5 +832,217 @@ describe('mining-judge — 单行来源与跳过/解析诊断(L7-P24)', () => {
       expect(source).toContain('onDiagnostic');
       expect(source).toContain('formatJudgeDiagnostic(diagnostic)');
     }
+  });
+});
+
+/* ── L7-P26：冻结 fixture runtime 只接受冻结 provider（C18） ────────────────────────────────
+ * 冻结 runtime port 的候选由源码标记预先决定，与模型无关；真实 provider 跑进来时 Analyst 回复不是
+ * FrozenStrictStageReplyV1，旧实现以未编码的 SyntaxError 拒绝，负例 fixture 却按 candidateCount=0
+ * 记为 passed 并带上真实 provider 身份。这里锁住三道闸：runtime 入口拒绝非冻结 provider；
+ * 冻结回复解析失败转成带阶段码的 REPLY_INVALID；eval-mining 在解析真实 provider 之前预检 golden。 */
+describe('strict fixture runtime — 冻结 provider 闸(L7-P26)', () => {
+  const singleFileRoot = join(
+    process.cwd(),
+    'test/fixtures/strict-production/projects/alembic-workspace-single-file'
+  );
+  const singleFileFixture = {
+    id: 'single-file-value',
+    project: 'AlembicWorkspace',
+    expectedDisposition: 'single-file-value' as const,
+    sourceFiles: [
+      {
+        path: 'src/agent/production/StrictProductionStages.ts',
+        originRelativePath: 'AlembicAgent/src/agent/production/StrictProductionStages.ts',
+        sha256: '49c91bb161198c850d45a166680a83d92b6280962ab20cbe43c0e6ad1e2fcfd1',
+      },
+    ],
+  };
+
+  function frozenRuntime() {
+    return createStrictProductionSourceFixtureRuntimeV1({
+      fixture: singleFileFixture,
+      projectRoot: singleFileRoot,
+      provider: new FrozenStrictProductionEvaluationProviderV1(),
+    });
+  }
+
+  function captureError(run: () => unknown): Error {
+    try {
+      run();
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        return err;
+      }
+      throw new Error(`expected an Error instance, got ${typeof err}`);
+    }
+    throw new Error('expected the call to throw');
+  }
+
+  it('rejects a non-frozen provider at the runtime entry before reading fixture bytes', () => {
+    const realProvider = {
+      name: 'deepseek',
+      model: 'deepseek-chat',
+      chatWithTools: async () => ({ text: 'Here is my analysis', functionCalls: [] }),
+    } as unknown as FrozenStrictProductionEvaluationProviderV1;
+    // projectRoot 不存在：若入口没有先拒绝 provider，这里会先报 ENOENT 而不是 provider 码。
+    const error = captureError(() =>
+      createStrictProductionSourceFixtureRuntimeV1({
+        fixture: singleFileFixture,
+        projectRoot: join(tmpdir(), 'strict-fixture-provider-gate-missing-root'),
+        provider: realProvider,
+      })
+    );
+    expect(error.message).toMatch(/^STRICT_FIXTURE_PROVIDER_NOT_FROZEN:/u);
+    expect(error.message).toContain('provider=deepseek');
+    expect(error.message).toContain('model=deepseek-chat');
+  });
+
+  it('rejects a duck-typed provider that only impersonates the frozen identity', () => {
+    const impersonator = {
+      name: 'frozen-fixture',
+      model: 'strict-production-fixture-v1',
+      networkRequestCount: 0,
+      apiKeyReadCount: 0,
+      chatWithTools: async () => ({ text: '{}', functionCalls: [] }),
+    } as unknown as FrozenStrictProductionEvaluationProviderV1;
+    expect(() =>
+      createStrictProductionSourceFixtureRuntimeV1({
+        fixture: singleFileFixture,
+        projectRoot: singleFileRoot,
+        provider: impersonator,
+      })
+    ).toThrow(/^STRICT_FIXTURE_PROVIDER_NOT_FROZEN:/u);
+    expect(() =>
+      createStrictProductionSourceFixtureRuntimeV1({
+        fixture: singleFileFixture,
+        projectRoot: singleFileRoot,
+        provider: null as unknown as FrozenStrictProductionEvaluationProviderV1,
+      })
+    ).toThrow(/^STRICT_FIXTURE_PROVIDER_NOT_FROZEN:.*provider=<missing>/u);
+  });
+
+  it('codes a non-JSON analyst reply as STRICT_FIXTURE_ANALYST_REPLY_INVALID instead of a raw SyntaxError', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const evaluation = frozenRuntime();
+      const error = captureError(() =>
+        evaluation.runtimePort.validateAnalystResult(
+          { reply: 'Here is my analysis of the strict stage factory.' },
+          evaluation.runtimePort.readAnalysisEpoch()
+        )
+      );
+      expect(error).not.toBeInstanceOf(SyntaxError);
+      expect(error.message).toMatch(/^STRICT_FIXTURE_ANALYST_REPLY_INVALID:not-json/u);
+      expect(error.cause).toBeInstanceOf(SyntaxError);
+      const lines = warn.mock.calls.map((call) => String(call[0]));
+      expect(
+        lines.some(
+          (line) =>
+            line.includes('[StrictFixtureEvaluation]') &&
+            line.includes('phase=analyst') &&
+            line.includes('reason=not-json') &&
+            line.includes('code=STRICT_FIXTURE_ANALYST_REPLY_INVALID')
+        )
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    'null',
+    '[1]',
+    '"text"',
+    '42',
+  ])('codes a JSON non-object analyst reply %s as REPLY_INVALID', (reply) => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const evaluation = frozenRuntime();
+      expect(() =>
+        evaluation.runtimePort.validateAnalystResult(
+          { reply },
+          evaluation.runtimePort.readAnalysisEpoch()
+        )
+      ).toThrow(/^STRICT_FIXTURE_ANALYST_REPLY_INVALID:not-object/u);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('codes a non-JSON producer reply as STRICT_FIXTURE_PRODUCER_REPLY_INVALID and captures no candidate', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const provider = new FrozenStrictProductionEvaluationProviderV1();
+      const evaluation = createStrictProductionSourceFixtureRuntimeV1({
+        fixture: singleFileFixture,
+        projectRoot: singleFileRoot,
+        provider,
+      });
+      const analyst = await provider.chatWithTools(
+        `strict cold-start Analyst\n${readFileSync(join(singleFileRoot, singleFileFixture.sourceFiles[0].path), 'utf8')}`
+      );
+      evaluation.runtimePort.validateAnalystResult(
+        { reply: analyst.text },
+        evaluation.runtimePort.readAnalysisEpoch()
+      );
+      const error = captureError(() =>
+        evaluation.runtimePort.reviewProducerResult({ reply: 'I produced one rule.' })
+      );
+      expect(error.message).toMatch(/^STRICT_FIXTURE_PRODUCER_REPLY_INVALID:not-json/u);
+      expect(evaluation.capturedCandidates).toHaveLength(0);
+      // 形状正确但阶段不符仍走原有 REPLY_INVALID，并带出原因码。
+      expect(() => evaluation.runtimePort.reviewProducerResult({ reply: analyst.text })).toThrow(
+        /^STRICT_FIXTURE_PRODUCER_REPLY_INVALID:shape-mismatch/u
+      );
+      expect(evaluation.capturedCandidates).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('requires the frozen provider for every golden that carries expectedDisposition cases', () => {
+    const strictGolden = JSON.parse(
+      readFileSync(join(process.cwd(), 'test/fixtures/strict-production/golden.json'), 'utf8')
+    ) as { cases: unknown[] };
+    for (const requestedProvider of [undefined, true, 'deepseek', 'ollama']) {
+      const error = captureError(() =>
+        assertStrictFixtureGoldenProviderV1({ cases: strictGolden.cases, requestedProvider })
+      );
+      expect(error.message).toMatch(/^STRICT_FIXTURE_PROVIDER_NOT_FROZEN:/u);
+      expect(error.message).toContain('alembic-workspace-single-file-value');
+      expect(error.message).toContain('bilidili-three-file-generic');
+    }
+    expect(() =>
+      assertStrictFixtureGoldenProviderV1({
+        cases: strictGolden.cases,
+        requestedProvider: 'frozen-fixture',
+      })
+    ).not.toThrow();
+
+    // 普通挖掘 golden 不含 expectedDisposition：真实 provider 仍可评估。
+    const miningGolden = JSON.parse(
+      readFileSync(join(process.cwd(), 'test/fixtures/mining-eval/golden.json'), 'utf8')
+    ) as { fixtures?: unknown[]; cases?: unknown[] };
+    expect(() =>
+      assertStrictFixtureGoldenProviderV1({
+        cases: miningGolden.fixtures ?? miningGolden.cases ?? [],
+        requestedProvider: 'deepseek',
+      })
+    ).not.toThrow();
+    expect(() =>
+      assertStrictFixtureGoldenProviderV1({ cases: [], requestedProvider: undefined })
+    ).not.toThrow();
+  });
+
+  it('eval-mining preflights strict golden cases before resolving any real provider or running a fixture', () => {
+    const source = readFileSync(join(process.cwd(), 'scripts/eval-mining.mjs'), 'utf8');
+    const preflight = source.indexOf('assertStrictFixtureGoldenProviderV1({');
+    expect(preflight).toBeGreaterThan(-1);
+    expect(source.indexOf('autoDetectProvider()')).toBeGreaterThan(preflight);
+    expect(source.indexOf('createProvider({')).toBeGreaterThan(preflight);
+    expect(source.indexOf('for (const fixture of goldenCases)')).toBeGreaterThan(preflight);
+    const preflightBlock = source.slice(preflight, source.indexOf('autoDetectProvider()'));
+    expect(preflightBlock).toContain('process.exit(1)');
+    expect(preflightBlock).toContain('--provider frozen-fixture');
   });
 });

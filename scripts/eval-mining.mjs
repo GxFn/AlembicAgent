@@ -15,6 +15,11 @@
  *   npm run eval:mining -- --provider deepseek --judge-provider ollama
  *   npm run eval:mining -- --provider deepseek --model deepseek-chat   # 评指定模型档(G-D:非仅 autoDetect 默认档)
  *   npm run eval:mining -- --budget-tokens 500000 --out <dir>
+ *   npm run eval:mining -- --golden test/fixtures/strict-production/golden.json --provider frozen-fixture
+ *
+ * 严格 golden(case 带 expectedDisposition)走冻结 strict runtime：候选由源码标记决定、与模型无关，
+ * 因此只接受 --provider frozen-fixture；其它 provider(含未传 --provider 时的自动探测)在启动前报错退出，
+ * 避免把与模型无关的负例结果写进带真实 provider 身份的回执。
  *
  * key 来源：ALEMBIC_DEEPSEEK_API_KEY(或 autoDetectProvider 支持的其它 env)；ollama 免 key。
  */
@@ -81,13 +86,24 @@ const { runScopedModuleMining } = await import(
 );
 const { assertFrozenJudgeModelLoadReceiptV1, createFrozenJudgeModelLoadReceiptV1, judgeCandidate } =
   await import(path.join(repoRoot, 'dist/agent/evaluation/MiningJudge.js'));
-const { FrozenStrictProductionEvaluationProviderV1, createStrictProductionSourceFixtureRuntimeV1 } =
-  await import(path.join(repoRoot, 'dist/agent/evaluation/StrictProductionFixtureEvaluation.js'));
+const {
+  FrozenStrictProductionEvaluationProviderV1,
+  assertStrictFixtureGoldenProviderV1,
+  createStrictProductionSourceFixtureRuntimeV1,
+} = await import(path.join(repoRoot, 'dist/agent/evaluation/StrictProductionFixtureEvaluation.js'));
+// dist 早于严格 golden 预检落地时导出缺失：单独报“需重建”，不让下面的预检把 TypeError 误报成 provider 不符。
+if (typeof assertStrictFixtureGoldenProviderV1 !== 'function') {
+  console.error(
+    '[eval:mining] dist/agent/evaluation/StrictProductionFixtureEvaluation.js is stale (missing assertStrictFixtureGoldenProviderV1) — run `npm run build` first.'
+  );
+  process.exit(1);
+}
 
 const args = parseArgs(process.argv.slice(2));
 const goldenPath = path.resolve(repoRoot, args.golden || 'test/fixtures/mining-eval/golden.json');
 const goldenBytes = readFileSync(goldenPath);
 const golden = JSON.parse(goldenBytes.toString('utf8'));
+const goldenCases = golden.fixtures || golden.cases || [];
 const budgetTokens = Number(args['budget-tokens'] || 2_000_000);
 const startedAt =
   typeof args['frozen-started-at'] === 'string'
@@ -108,6 +124,17 @@ if (typeof args.model === 'string' && typeof args.provider !== 'string') {
 }
 if (typeof args['judge-model'] === 'string' && typeof args['judge-provider'] !== 'string') {
   console.error('[eval:mining] --judge-model requires an explicit --judge-provider.');
+  process.exit(1);
+}
+// 严格 golden 预检：必须在解析任何真实 provider(createProvider/autoDetectProvider 可能读 key、
+// 缺 key 时抛错)和跑任何 fixture 之前完成，否则真实模型会跑进冻结 runtime，负例空洞通过且回执
+// 带真实 provider 身份。判定与 runFixture 注入冻结 runtime 的条件一致(expectedDisposition 为真值)。
+try {
+  assertStrictFixtureGoldenProviderV1({ cases: goldenCases, requestedProvider: args.provider });
+} catch (err) {
+  console.error(
+    `[eval:mining] ${err instanceof Error ? err.message : String(err)} — golden ${path.relative(repoRoot, goldenPath)} 含 expectedDisposition 的严格 case 只在冻结 strict runtime 上评估，请显式传 --provider frozen-fixture；真实模型评估严格 golden 需要另行设计非冻结 runtime port。`
+  );
   process.exit(1);
 }
 const provider =
@@ -179,7 +206,7 @@ const notes = [
 let usedTokens = 0;
 
 try {
-  for (const fixture of golden.fixtures || golden.cases || []) {
+  for (const fixture of goldenCases) {
     if (usedTokens >= budgetTokens) {
       notes.push(
         `budget-tokens 用尽(${usedTokens}/${budgetTokens})，fixture "${fixture.id}" 及之后被跳过。`
