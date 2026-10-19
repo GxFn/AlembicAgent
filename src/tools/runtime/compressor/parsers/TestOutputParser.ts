@@ -47,6 +47,12 @@ const MAX_FAILURE_DETAIL_LINES = 3;
  * 避免把捕获日志里的 'ERROR    root:...' 当成失败。
  */
 const PYTEST_FAILURE_LINE_RE = /^(FAILED|ERROR) (\S.*?)(?: - (.*))?$/;
+/**
+ * short test summary 段标题；-rN（或 addopts 配置）关掉 short summary 时整段不存在。
+ * 该段以下一条 '=' 分隔行（最终计数行）结束。
+ */
+const PYTEST_SHORT_SUMMARY_HEADER_RE = /^=+ short test summary info =+$/;
+const PYTEST_SECTION_RULE_RE = /^=+(?:\s|$)/;
 
 const FAIL_BLOCK_RE =
   /(?:FAIL|✕|✗|×|FAILED)\s+(.+?)(?:\n|\r\n)([\s\S]*?)(?=\n(?:FAIL|✕|✗|×|FAILED|Tests:|Test Suites:|$))/g;
@@ -79,10 +85,26 @@ function extractFailures(raw: string): FailureInfo[] {
   return failures;
 }
 
-/** 逐行读取 pytest short test summary；每条 FAILED/ERROR 都保留（同一节点的 call 失败与 teardown 错误分别计数）。 */
+/**
+ * 逐行读取 pytest short test summary；每条 FAILED/ERROR 都保留（同一节点的 call 失败与 teardown 错误分别计数）。
+ * 只读最后一个 'short test summary info' 段：FAILURES 段里的 Captured stdout/log 会把用户打印的文本
+ * 原样、不缩进地输出，以 'FAILED '/'ERROR ' 开头的打印行不是失败名。没有该段（-rN）时返回空列表，
+ * 由 parseStrict 的“failed>0 却无失败名”守卫交回原文。
+ */
 function extractPytestFailures(raw: string): FailureInfo[] {
   const failures: FailureInfo[] = [];
-  for (const line of raw.split('\n')) {
+  const lines = raw.split('\n');
+  // 取最后一个标题：真正的 short summary 紧挨最终计数行，捕获输出里伪造的同名标题只会出现在它之前。
+  const headerIndex = lines.findLastIndex((line) =>
+    PYTEST_SHORT_SUMMARY_HEADER_RE.test(line.trimEnd())
+  );
+  if (headerIndex < 0) {
+    return failures;
+  }
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (PYTEST_SECTION_RULE_RE.test(line)) {
+      break;
+    }
     const m = PYTEST_FAILURE_LINE_RE.exec(line.trimEnd());
     if (m) {
       failures.push({

@@ -27,9 +27,15 @@ const IGNORED_DIRS = new Set([
   '.vscode',
 ]);
 
-/** ls -l 的权限列（含 macOS 扩展属性 '@'、ACL '+'、SELinux '.' 标记）。 */
-const LS_LONG_FORMAT_RE = /^[-dlcbpsD][rwxsStT-]{9}[@+.]?\s/;
-const LS_TOTAL_RE = /^total \d+$/;
+/**
+ * ls -l 的权限列（含 macOS 扩展属性 '@'、ACL '+'、SELinux '.' 标记）。
+ * -i 在权限列前加 inode、-s 加块数（GNU -h/--si 时是 '4.0K'、'12k' 这类带单位的大小），两者可同时出现，
+ * 所以权限列前最多允许两个数字列；只认行首权限列会让 `ls -ls src/*.ts` 这类没有 total 行的输出
+ * 进 find 分支，整行被按 '/' 切成伪造的目录。
+ */
+const LS_LONG_FORMAT_RE = /^(?:\d+(?:[.,]\d+)?[kKMGTPEZY]?\s+){0,2}[-dlcbpsD][rwxsStT-]{9}[@+.]?\s/;
+/** 'total N'；GNU -h/--si 下带单位（'total 48K'、'total 1,2M'）。 */
+const LS_TOTAL_RE = /^total \d+(?:[.,]\d+)?[kKMGTPEZY]?$/;
 
 interface TreeNode {
   name: string;

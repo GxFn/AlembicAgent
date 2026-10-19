@@ -242,6 +242,52 @@ describe('test failure details in stdout', () => {
     expect((await terminalOutput('pytest', stdout)).text).toContain(stdout);
   });
 
+  /** 失败用例在 Captured stdout 里原样打印、不加缩进的一行；它不是 short summary 行。 */
+  const pytestWithCapturedLine = (captured: string, shortSummary: string[]) =>
+    [
+      '============================= test session starts ==============================',
+      'collected 3 items',
+      '',
+      'test_net.py .F.                                                          [100%]',
+      '',
+      '=================================== FAILURES ===================================',
+      '____________________________________ test_x ____________________________________',
+      '',
+      '    def test_x():',
+      `        print(${JSON.stringify(captured)})`,
+      '>       assert 0',
+      'E       assert 0',
+      '',
+      'test_net.py:5: AssertionError',
+      '----------------------------- Captured stdout call -----------------------------',
+      captured,
+      ...shortSummary,
+      '========================= 1 failed, 2 passed in 0.10s ==========================',
+    ].join('\n');
+
+  // -rN（或 addopts 配置）关掉 short summary 后，打印行条数恰好等于 failed 也不能顶替真正的失败名。
+  it.each([
+    [
+      'the audit reproduction',
+      '=== FAILURES ===\n____ test_x ____\nE   assert 0\n----- Captured stdout call -----\nFAILED to connect - retrying\n===== 1 failed, 2 passed in 0.10s =====',
+    ],
+    ['a captured FAILED print', pytestWithCapturedLine('FAILED to connect - retrying', [])],
+    ['a captured ERROR print', pytestWithCapturedLine('ERROR could not reach host', [])],
+  ])('does not take %s for a failure name when the short summary is off', async (_label, stdout) => {
+    expect(parseTestOutput(stdout)).toBeNull();
+    expect((await terminalOutput('pytest -rN', stdout)).text).toContain(stdout);
+  });
+
+  it('reads pytest failure names only from the short test summary section', () => {
+    const stdout = pytestWithCapturedLine('FAILED to connect - retrying', [
+      '=========================== short test summary info ============================',
+      'FAILED test_net.py::test_x - assert 0',
+    ]);
+    expect(parseTestOutput(stdout)).toBe(
+      'Tests: 2 passed, 1 failed, 3 total\n\n[failures]\nFAIL test_net.py::test_x: assert 0'
+    );
+  });
+
   const MOCHA_SPEC = [
     '',
     '',
@@ -398,6 +444,206 @@ describe('lint output from real formatters', () => {
     );
   });
 
+  /**
+   * 真实 ESLint 9.39.4 + typescript-eslint 8.59.3 的 stylish 输出（路径换成占位根目录，其余逐字节一致）。
+   * @typescript-eslint/no-empty-object-type 的消息用 '\n' 拼成多行：续行不缩进，规则 id 只跟在最后一条续行后面；
+   * stylish 的消息列宽取整条多行消息的长度，所以同一张表里其它行的规则列被补到很远。
+   */
+  const EMPTY_OBJECT_MESSAGE = [
+    'The `{}` ("empty object") type allows any non-nullish value, including literals like `0` and `""`.',
+    "- If that's what you want, disable this lint rule with an inline comment or configure the 'allowObjectTypes' rule option.",
+    '- If you want a type meaning "any object", you probably want `object` instead.',
+    '- If you want a type meaning "any value", you probably want `unknown` instead',
+  ].join('\n');
+  const padMessage = (message: string) => message.padEnd(EMPTY_OBJECT_MESSAGE.length);
+  const ESLINT_MULTILINE = [
+    '',
+    '/repo/src/a.ts',
+    `  1:17  error    ${EMPTY_OBJECT_MESSAGE}  @typescript-eslint/no-empty-object-type`,
+    `  2:1   error    ${padMessage('Unexpected var, use let or const instead')}  no-var`,
+    `  3:1   warning  ${padMessage('Unexpected console statement')}  no-console`,
+    '',
+    '/repo/src/b.ts',
+    `  1:1   error  ${padMessage('Unexpected var, use let or const instead')}  no-var`,
+    `  2:17  error  ${EMPTY_OBJECT_MESSAGE}  @typescript-eslint/no-empty-object-type`,
+    '',
+    '✖ 5 problems (4 errors, 1 warning)',
+    '  2 errors and 0 warnings potentially fixable with the `--fix` option.',
+    '',
+    '',
+  ].join('\n');
+
+  it('keeps multi-line ESLint messages, their rule ids and later issues under the real file', async () => {
+    const emptyObject = `${EMPTY_OBJECT_MESSAGE.split('\n').join(' ')} (@typescript-eslint/no-empty-object-type)`;
+    expect((await terminalOutput('eslint src', ESLINT_MULTILINE)).text).toBe(
+      summarized(
+        'lint-output',
+        ESLINT_MULTILINE,
+        [
+          '4 errors, 1 warnings',
+          '',
+          'Top issues:',
+          `  /repo/src/a.ts:1: ${emptyObject}`,
+          '  /repo/src/a.ts:2: Unexpected var, use let or const instead (no-var)',
+          '  /repo/src/a.ts:3: Unexpected console statement (no-console)',
+          '  /repo/src/b.ts:1: Unexpected var, use let or const instead (no-var)',
+          `  /repo/src/b.ts:2: ${emptyObject}`,
+        ].join('\n')
+      )
+    );
+  });
+
+  it('never turns a message continuation line into a file header', () => {
+    const summary = parseLintOutput(ESLINT_MULTILINE) ?? '';
+    const files = summary
+      .split('\n')
+      .filter((line) => /^ {2}\S.*:\d+: /.test(line))
+      .map((line) => line.trim().replace(/:\d+: .*$/, ''));
+    expect(new Set(files)).toEqual(new Set(['/repo/src/a.ts', '/repo/src/b.ts']));
+  });
+
+  /**
+   * 真实 ESLint 9.39.4 + eslint-plugin-react-hooks 7.1.1（flat recommended，外加 no-var）的 stylish 输出，
+   * 路径换成占位根目录，其余逐字节一致。React Compiler 规则的消息由几个段落和一段 code frame 组成：
+   * 段落之间有空行，空行后的续行有的不缩进（说明段落），有的以 '>' 开头（code frame 的标记行）；
+   * 规则 id 只跟在 code frame 最后一行后面。“空行之后的不缩进行”因此不一定是文件头。
+   */
+  const SET_STATE_IN_EFFECT_MESSAGE = [
+    'Error: Calling setState synchronously within an effect can trigger cascading renders',
+    '',
+    'Effects are intended to synchronize state between React and external systems such as manually updating the DOM, state management libraries, or other platform APIs. In general, the body of an effect should do one or both of the following:',
+    '* Update external systems with the latest state from React.',
+    '* Subscribe for updates from some external system, calling setState in a callback function when external state changes.',
+    '',
+    'Calling setState synchronously within an effect body causes cascading renders that can hurt performance, and is not recommended. (https://react.dev/learn/you-might-not-need-an-effect).',
+    '',
+    '  4 |   const r = useRef(0);',
+    '  5 |   useEffect(() => {',
+    '> 6 |     setV(1);',
+    '    |     ^^^^ Avoid calling setState() directly within an effect',
+    '  7 |   }, []);',
+    '  8 |   const x = r.current;',
+    '  9 |   var unused = 1;',
+  ].join('\n');
+  const REFS_MESSAGE = [
+    'Error: Cannot access refs during render',
+    '',
+    'React refs are values that are not needed for rendering. Refs should only be accessed outside of render, such as in event handlers or effects. Accessing a ref value (the `current` property) during render can cause your component not to update as expected (https://react.dev/reference/react/useRef).',
+    '',
+    '   6 |     setV(1);',
+    '   7 |   }, []);',
+    '>  8 |   const x = r.current;',
+    '     |             ^^^^^^^^^ Cannot access ref value during render',
+    '   9 |   var unused = 1;',
+    '  10 |   return <div>{v}{x}</div>;',
+    '  11 | }',
+  ].join('\n');
+  const UNEXPECTED_VAR = 'Unexpected var, use let or const instead';
+  // stylish 的消息列宽取同一张表里最长的整条消息（含换行），规则列补在每条消息最后一行之后。
+  const REACT_MESSAGE_WIDTH = Math.max(
+    SET_STATE_IN_EFFECT_MESSAGE.length,
+    REFS_MESSAGE.length,
+    UNEXPECTED_VAR.length
+  );
+  const padReactMessage = (message: string) => message.padEnd(REACT_MESSAGE_WIDTH);
+  const ESLINT_REACT_COMPILER = [
+    '',
+    '/repo/src/A.jsx',
+    `  6:5   error  ${padReactMessage(SET_STATE_IN_EFFECT_MESSAGE)}  react-hooks/set-state-in-effect`,
+    `  8:13  error  ${padReactMessage(REFS_MESSAGE)}  react-hooks/refs`,
+    `  9:3   error  ${padReactMessage(UNEXPECTED_VAR)}  no-var`,
+    '',
+    '/repo/src/B.jsx',
+    `  1:1  error  ${UNEXPECTED_VAR}  no-var`,
+    '',
+    '✖ 4 problems (4 errors, 0 warnings)',
+    '  2 errors and 0 warnings potentially fixable with the `--fix` option.',
+    '',
+    '',
+  ].join('\n');
+  /** 摘要里每条问题渲染成一行：消息的非空行去掉首尾空白后用空格连接，规则 id 来自消息最后一行。 */
+  const flattenStylishMessage = (message: string, rule: string) =>
+    `${message
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join(' ')} (${rule})`;
+
+  it('keeps blank-line separated React Compiler messages and their rule ids under the real file', async () => {
+    expect((await terminalOutput('eslint src', ESLINT_REACT_COMPILER)).text).toBe(
+      summarized(
+        'lint-output',
+        ESLINT_REACT_COMPILER,
+        [
+          '4 errors, 0 warnings',
+          '',
+          'Top issues:',
+          `  /repo/src/A.jsx:6: ${flattenStylishMessage(SET_STATE_IN_EFFECT_MESSAGE, 'react-hooks/set-state-in-effect')}`,
+          `  /repo/src/A.jsx:8: ${flattenStylishMessage(REFS_MESSAGE, 'react-hooks/refs')}`,
+          `  /repo/src/A.jsx:9: ${UNEXPECTED_VAR} (no-var)`,
+          `  /repo/src/B.jsx:1: ${UNEXPECTED_VAR} (no-var)`,
+        ].join('\n')
+      )
+    );
+  });
+
+  it('never takes a message paragraph or code frame line after a blank line as a file name', () => {
+    const summary = parseLintOutput(ESLINT_REACT_COMPILER) ?? '';
+    const entries = summary
+      .split('\n')
+      .map((line) => /^ {2}(\S.*?):(\d+): /.exec(line))
+      .filter((match): match is RegExpExecArray => match !== null)
+      .map((match) => [match[1], match[2]]);
+    expect(entries.filter(([file]) => /^>|\|/.test(file))).toEqual([]);
+    expect(entries).toEqual([
+      ['/repo/src/A.jsx', '6'],
+      ['/repo/src/A.jsx', '8'],
+      ['/repo/src/A.jsx', '9'],
+      ['/repo/src/B.jsx', '1'],
+    ]);
+  });
+
+  // 消息最后一段落在空行之后、又紧挨下一条问题行时，它和文件头的位置完全相同；
+  // 规则列（两个以上空格加规则 id）和“不是 ESLint 打印的文件路径”说明它是消息续行。
+  it('keeps a trailing message paragraph with its rule column instead of reading it as a file header', () => {
+    const stdout = [
+      '',
+      '/repo/src/a.js',
+      '  1:1  error  First line of a multi-paragraph message',
+      '',
+      'See the rule documentation for details.  custom/multi-paragraph',
+      `  2:1  error  ${UNEXPECTED_VAR}                  no-var`,
+      '',
+      '✖ 2 problems (2 errors, 0 warnings)',
+    ].join('\n');
+    expect(parseLintOutput(stdout)).toBe(
+      [
+        '2 errors, 0 warnings',
+        '',
+        'Top issues:',
+        '  /repo/src/a.js:1: First line of a multi-paragraph message See the rule documentation for details. (custom/multi-paragraph)',
+        `  /repo/src/a.js:2: ${UNEXPECTED_VAR} (no-var)`,
+      ].join('\n')
+    );
+  });
+
+  // ESLint 结果的 filePath 只有两种：lintFiles 的绝对路径，以及 lintText 不带文件名时的 '<text>'。
+  it.each([
+    ['stdin without a file name', '<text>'],
+    ['a Windows absolute path', 'C:\\repo\\src\\a.js'],
+  ])('reads %s as an ESLint stylish file header', (_label, header) => {
+    const stdout = [
+      '',
+      header,
+      `  1:1  error  ${UNEXPECTED_VAR}  no-var`,
+      '',
+      '✖ 1 problem (1 error, 0 warnings)',
+    ].join('\n');
+    expect(parseLintOutput(stdout)).toBe(
+      `1 errors, 0 warnings\n\nTop issues:\n  ${header}:1: ${UNEXPECTED_VAR} (no-var)`
+    );
+  });
+
   it('keeps a rule-less ESLint parsing error under its file', () => {
     const stdout = [
       '',
@@ -423,6 +669,20 @@ describe('lint output from real formatters', () => {
     [
       'an issue line outside any file block',
       '  1:1  error  Unexpected var  no-var\n\n✖ 1 problem (1 error, 0 warnings)',
+    ],
+    // ESLint stylish 只打印绝对路径或 '<text>'；相对路径的“文件头”与不带规则列的消息段落无法区分。
+    [
+      'a relative file header that ESLint stylish never prints',
+      '\nsrc/a.js\n  1:1  error  Unexpected var  no-var\n\n✖ 1 problem (1 error, 0 warnings)',
+    ],
+    [
+      'a later line that is neither a file path nor a message line with a rule column',
+      '\n/repo/src/a.js\n  1:1  error  Unexpected var  no-var\n\nsrc/b.js\n  1:1  error  Unexpected var  no-var\n\n✖ 2 problems (2 errors, 0 warnings)',
+    ],
+    // stylish 表格内部只有多行消息里才有空行；空行后没经过文件头就直接出现问题行，归属无法确认。
+    [
+      'an issue line right after a blank line inside a file block',
+      '\n/repo/src/a.js\n  1:1  error  Unexpected var  no-var\n\n  2:1  error  Unexpected var  no-var\n\n✖ 2 problems (2 errors, 0 warnings)',
     ],
   ])('keeps raw ESLint output for %s', async (_label, stdout) => {
     expect(parseLintOutput(stdout)).toBeNull();
@@ -493,6 +753,33 @@ describe('directory output structure', () => {
     [
       'ls -laR',
       '.:\ntotal 8\n-rw-r--r--  1 user  staff  12 Jan  1 12:00 a.ts\n\n./src:\ntotal 8\nlrwxr-xr-x  1 user  staff  9 Jan  1 12:00 link -> ../a.ts',
+    ],
+    // -s 在权限列前加块数、-i 加 inode，两者可同时出现；以文件或 glob 作参数时没有 'total' 行
+    // （真实 macOS 输出，用户名与日期换成占位）。
+    [
+      'ls -ls src/*.ts',
+      '8 -rw-r--r--@ 1 user  staff  51 Jan  1 12:00 src/a.ts\n8 -rw-r--r--@ 1 user  staff  35 Jan  1 12:00 src/b.ts',
+    ],
+    [
+      'ls -li src/*.ts',
+      '366322221 -rw-r--r--@ 1 user  staff  51 Jan  1 12:00 src/a.ts\n366322222 -rw-r--r--@ 1 user  staff  35 Jan  1 12:00 src/b.ts',
+    ],
+    [
+      'ls -lis src/*.ts',
+      '366322221 8 -rw-r--r--@ 1 user  staff  51 Jan  1 12:00 src/a.ts\n366322222 8 -rw-r--r--@ 1 user  staff  35 Jan  1 12:00 src/b.ts',
+    ],
+    [
+      'ls -lsdp lib src',
+      '0 drwxr-xr-x  3 user  staff  96 Jan  1 12:00 lib/\n0 drwxr-xr-x  3 user  staff  96 Jan  1 12:00 src/',
+    ],
+    // GNU -h：块数列与 total 行都带单位。
+    [
+      'ls -lsh src/*.ts',
+      '4.0K -rw-r--r-- 1 user user 51 Jan  1 12:00 src/a.ts\n4.0K -rw-r--r-- 1 user user 35 Jan  1 12:00 src/b.ts',
+    ],
+    [
+      'ls -lshp',
+      'total 48K\n4.0K drwxr-xr-x 3 user user 4.0K Jan  1 12:00 lib/\n4.0K drwxr-xr-x 3 user user 4.0K Jan  1 12:00 src/',
     ],
   ])('keeps %s long-format output in its original order', async (command, stdout) => {
     expect(parseTreeOutput(stdout)).toBeNull();
