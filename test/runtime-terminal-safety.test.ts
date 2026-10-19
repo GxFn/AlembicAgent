@@ -2036,7 +2036,8 @@ describe('terminal.exec dangerous-command blacklist: wrappers, find -exec and su
     { command: 'find . -exec sh -c \'rm -r -f "$1"\' _ {} \\;', rule: RM },
     { command: 'find -L . -exec sudo ls {} +', rule: DENIED },
     { command: 'gfind . -exec rm -r -f {} +', rule: RM },
-    { command: 'xargs find . -exec rm -r -f {} +', rule: RM },
+    // L4-P8c：find 作为 xargs 目标时输入项可组成 -exec 动作，整体 fail-closed，先于 rm 判定。
+    { command: 'xargs find . -exec rm -r -f {} +', rule: DYNAMIC },
     { command: 'find . -exec find . -exec rm -r -f {} \\; \\;', rule: RM },
     { command: 'find . -exec {} \\;', rule: DYNAMIC },
     // 命令替换：未加引号与双引号内的反引号、双引号内的 $(...)、嵌套与算术展开里的替换。
@@ -2234,7 +2235,7 @@ describe('terminal.exec dangerous-command blacklist: wrappers, find -exec and su
     'grep -rn eval src',
     'rg -n "eval " src',
     'git log -S killall',
-    "git commit -m 'drop sudo usage'",
+    // L4-P8c：git commit 不是只读取证命令，正则兜底命中后不再放行，改列在 L4-P8c 的拦截表里。
     'echo "sudo reboot"',
     // wrapper 解包后只检查目标命令，目标命令的参数仍按普通参数处理。
     'timeout 10 rg -n sudo src',
@@ -2253,7 +2254,7 @@ describe('terminal.exec dangerous-command blacklist: wrappers, find -exec and su
     "bash -lc 'git status'",
     // find/xargs 的 {} 作为 shell 位置参数只是文件名；规格内的长选项前缀按 GNU 语义解析。
     'find . -exec sh -c \'grep -n sudo "$1"\' _ {} \\;',
-    "xargs -I{} sh -c 'echo {}'",
+    // L4-P8c：xargs 的目标是 shell 时一律拒绝（命令串里的 {} 换成输入项），改列在 L4-P8c 的拦截表里。
     'timeout --sig KILL 5 git log --grep su',
     // 命令替换体本身无害时外层照常放行。
     'echo `date`',
@@ -2406,6 +2407,468 @@ describe('terminal.exec dangerous-command blacklist: wrappers, find -exec and su
       expect(result.ok, command).toBe(true);
     }
     expect(calls).toEqual(commands);
+  });
+});
+
+/**
+ * L4-P8c：对 876766f（L4-P8）的审计补修，三条主张与总控设计要求：
+ * (1) xargs 会把运行时输入项追加到目标命令或替换进 {}：目标是 shell/解释器、wrapper 链没有静态目标、
+ *     或目标是 find 时，真正执行的程序来自输入，fail-closed；shell -c 的命令串缺失或含运行时值同样 fail-closed。
+ * (2) 命令位置与 wrapper 结构里的参数展开（$E、"$@"、${E}）与命令替换一样 fail-closed；并恢复对原始命令串的
+ *     DENIED_BINS/eval 词边界正则兜底，命中后只有 token 判定确认它是只读取证命令的参数时才放行（记诊断）。
+ * (3) '&>' 的 POSIX 读法按段线性切分；命令长度设上限，超限 fail-closed 并诊断。
+ * 替身命令只做规则判定，不会被执行。
+ */
+describe('terminal.exec dangerous-command blacklist audit follow-up (L4-P8c)', () => {
+  const DYNAMIC = 'shell-dynamic-command';
+  const DENIED = 'shell-denied-bin';
+  const PRIV = 'shell-privilege-escalation';
+  const DESTRUCTIVE = 'shell-destructive-bin';
+  const EVAL = 'shell-eval';
+  const TOO_LONG = 'shell-command-too-long';
+
+  it.each([
+    // (1) 审计复现：xargs 把输入项交给 shell -c（-I{} 替换、-0/默认追加、wrapper 套 xargs、-a 文件）。
+    { command: "echo 'sudo reboot' | xargs -I{} sh -c {}", rule: DYNAMIC },
+    { command: "printf 'sudo reboot' | xargs -0 bash -c", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs sh -c", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | timeout 5 xargs -0 sh -c", rule: DYNAMIC },
+    { command: 'xargs -0 -a payload.txt sh -c', rule: DYNAMIC },
+    { command: "printf 'rm -r -f build' | xargs -0 sh -c", rule: DYNAMIC },
+    { command: 'xargs sh -c', rule: DYNAMIC },
+    { command: 'xargs bash -c', rule: DYNAMIC },
+    { command: "xargs -I{} sh -c 'echo {}'", rule: DYNAMIC },
+    // 复查构造：解释器目标、wrapper 嵌套后的 shell、路径与 g 前缀。
+    { command: 'xargs node -e', rule: DYNAMIC },
+    { command: 'xargs -0 python3 -c', rule: DYNAMIC },
+    { command: 'xargs python3.12 -c', rule: DYNAMIC },
+    { command: 'xargs perl -e', rule: DYNAMIC },
+    { command: "xargs awk '{ print }'", rule: DYNAMIC },
+    { command: 'xargs -n1 /usr/bin/env bash', rule: DYNAMIC },
+    { command: 'xargs timeout 5 nice -n 1 sh -c', rule: DYNAMIC },
+    { command: 'xargs busybox sh -c', rule: DYNAMIC },
+    { command: 'gxargs -0 zsh -c', rule: DYNAMIC },
+    { command: 'xargs source', rule: DYNAMIC },
+    // wrapper 链没有静态目标（缺目标、缺选项值、只有赋值）：追加的输入项就是被执行的命令。
+    { command: "echo 'sudo reboot' | xargs timeout 5", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs env", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs env -i A=1", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs nice -n", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs command", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs nohup", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs xargs", rule: DYNAMIC },
+    { command: "echo 'sudo reboot' | xargs env -S", rule: DYNAMIC },
+    // find 的表达式（-exec 动作）可以来自输入项。
+    { command: "echo '-exec sudo reboot ;' | xargs find .", rule: DYNAMIC },
+    { command: 'xargs -I{} find . -exec sh -c {} \\;', rule: DYNAMIC },
+    // shell -c 的命令串缺失、是 {} 占位（find 换成文件名）或含参数展开：程序文本来自运行时值。
+    { command: 'find . -exec sh -c {} \\;', rule: DYNAMIC },
+    { command: "find . -name '*.ts' -exec sh -c 'wc -l {}' \\;", rule: DYNAMIC },
+    { command: 'sh -c', rule: DYNAMIC },
+    { command: 'bash -e -c', rule: DYNAMIC },
+    { command: 'sh -c "echo $X"', rule: DYNAMIC },
+    { command: 'bash -lc "git log $ARGS"', rule: DYNAMIC },
+    { command: 'fish --command "$CMD"', rule: DYNAMIC },
+    // bash 逐字母解析选项簇：带值字母之后的 c 仍然生效，命令串在被消耗的值之后。
+    { command: 'bash -oc errexit "echo $X"', rule: DYNAMIC },
+    { command: 'find . -exec bash -oc errexit {} \\;', rule: DYNAMIC },
+    { command: 'bash -c -o pipefail "echo $X"', rule: DYNAMIC },
+    // (2) 审计复现：命令位置与 wrapper 结构里展开为空的前缀。
+    { command: '$E sudo reboot', rule: DYNAMIC },
+    { command: 'timeout 5 $E sudo reboot', rule: DYNAMIC },
+    { command: '"$@" eval ls', rule: DYNAMIC },
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: shell 参数展开字面量，不是模板串。
+    { command: '${E} killall node', rule: DYNAMIC },
+    { command: 'timeout 5 $E rm -r -f build', rule: DYNAMIC },
+    { command: 'nice $E rm -r -f build', rule: DYNAMIC },
+    { command: 'xargs $E rm -r -f', rule: DYNAMIC },
+    { command: 'find . -exec $E rm -r -f {} +', rule: DYNAMIC },
+    // 复查构造：其它特殊参数、引号、换行与复合命令里的前缀、wrapper 的选项值与操作数、函数体。
+    { command: 'env $E sudo reboot', rule: DYNAMIC },
+    { command: 'command "$@" sudo reboot', rule: DYNAMIC },
+    { command: 'exec $* sudo reboot', rule: DYNAMIC },
+    { command: 'echo ready; $1 dd if=a of=b', rule: DYNAMIC },
+    { command: 'echo ready\n"$E"sudo reboot', rule: DYNAMIC },
+    { command: '{ $E halt; }', rule: DYNAMIC },
+    { command: 'if true; then $E shutdown now; fi', rule: DYNAMIC },
+    { command: 'f() { $1 reboot; }; f sudo', rule: DYNAMIC },
+    { command: 'timeout $T rm -r -f build', rule: DYNAMIC },
+    { command: 'nice -n $N sudo reboot', rule: DYNAMIC },
+    { command: '$\\\nE sudo reboot', rule: DYNAMIC },
+    // (2) 正则兜底：token 判定放行、但命中词不能确认为只读取证命令参数的形态。
+    { command: "git commit -m 'drop sudo usage'", rule: PRIV },
+    { command: "GIT_EXTERNAL_DIFF='sudo reboot' git diff", rule: DESTRUCTIVE },
+    { command: "git -c core.pager='sudo reboot' log", rule: DESTRUCTIVE },
+    { command: 'rg --pre sudo pattern src', rule: PRIV },
+    { command: 'ssh localhost sudo reboot', rule: PRIV },
+    { command: 'caffeinate sudo reboot', rule: PRIV },
+    { command: 'script -q /dev/null sudo reboot', rule: PRIV },
+    { command: 'python3 -c \'import os; os.system("sudo reboot")\'', rule: PRIV },
+    { command: 'awk \'BEGIN{system("sudo reboot")}\'', rule: PRIV },
+    { command: 'perl -e \'system("dd if=/dev/zero of=x")\'', rule: DESTRUCTIVE },
+    { command: 'node -e \'require("child_process").execSync("eval ls")\'', rule: EVAL },
+    { command: 'timeout -s sudo 5 ls', rule: PRIV },
+    { command: "env -S 'rg sudo'", rule: PRIV },
+    { command: "alias x='sudo reboot'\nx", rule: DESTRUCTIVE },
+    { command: 'MKFS.EXT4 /dev/disk9 || true', rule: DENIED },
+    // (3) '&>' 的 POSIX 读法逐段切分后，最后一段的命令仍在命令位置。
+    { command: `ls ${'&>/dev/null x '.repeat(50)}&>/dev/null sudo reboot`, rule: DENIED },
+    { command: 'ls &>/dev/null x &>/dev/null rm -r -f build', rule: 'shell-rm-recursive-force' },
+  ])('blocks $command with $rule', ({ command, rule }) => {
+    const result = checkTerminalCommandSafety(command);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(rule);
+      expect(result.block.reason).not.toBe('');
+    }
+  });
+
+  it.each([
+    // (1) 不误拦：xargs 的目标是只读程序、默认 echo、查询，或替换串只出现在非 shell 命令的参数里。
+    'xargs',
+    'xargs -0',
+    'git ls-files | xargs rg -n TODO',
+    "find . -name '*.ts' -print0 | xargs -0 wc -l",
+    'xargs -I{} cp {} out/',
+    'xargs command -v',
+    'find . -exec sh -c \'grep -n sudo "$1"\' _ {} \\;',
+    "find . -name '*.sh' -exec bash {} \\;",
+    'bash -o pipefail -c "npm test"',
+    'zsh -c -- "git status"',
+    // (2) 不误拦：参数位置的参数展开、赋值前缀里的展开。
+    'echo $HOME',
+    'rg -n "$PATTERN" src',
+    'FOO=$HOME node --test fixture.test.js',
+    'git log -n "$N" --oneline',
+    // (2) 正则兜底命中，但 token 判定确认是只读取证命令的参数（含 wrapper、find -exec、shell 命令串、替换体、查询）。
+    'rg -n sudo src',
+    'git log --grep su',
+    'ls dd',
+    'command -v sudo',
+    'which sudo',
+    'find . -name sudo -type f',
+    'grep -rnw "su" src',
+    'rg -n "killall|reboot" src',
+    'git log --oneline --grep "eval" -- src',
+    'echo "eval is blocked"',
+    'printf "%s\\n" sudo',
+    'type sudo',
+    // eval 只在其后带参数时才算命中（沿用 L4-P8 之前的口径），脚本名/测试名里的 eval 不误拦。
+    'npm run eval',
+    'vitest run eval',
+    'node scripts/run.js eval',
+    'git ls-files | xargs rg -n sudo',
+    'rg -n sudo src | head -n 5',
+    'echo "$(rg -n sudo src)"',
+    "sh -c 'grep -rn sudo src'",
+    'timeout 10 rg -n sudo src',
+    "find . -name '*.ts' -exec grep -l sudo {} +",
+    'rg -n sudo src # find sudo usage',
+    '# check eval usage\nrg -n eval src',
+    // 词边界：更长的单词与路径片段不算命中。
+    'cat ./docs/sudo',
+    'rg -n sudoers src',
+    'npm run lint:su-check',
+    'ls ./dd.txt',
+    // (3) 普通 '&>' 用法。
+    'ls &>/dev/null',
+    'npm test &>/dev/null',
+  ])('allows %s', (command) => {
+    expect(checkTerminalCommandSafety(command), command).toEqual({ safe: true });
+  });
+
+  it('fails closed on commands longer than the inspection limit without lexing them', () => {
+    // 审计复现：168KB 的 '&>' 命令此前要同步阻塞约 3 秒且最终放行。
+    const command = `ls ${'&>/dev/null x '.repeat(12_000)}`;
+    const started = performance.now();
+    const result = checkTerminalCommandSafety(command);
+    const elapsed = performance.now() - started;
+    expect(result).toMatchObject({ safe: false, block: { rule: TOO_LONG } });
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('keeps commands near the limit fast even with many &> redirections', () => {
+    const filler = '&>/dev/null x '.repeat(2_200);
+    expect(filler.length).toBeLessThan(32_768);
+    const started = performance.now();
+    expect(checkTerminalCommandSafety(`ls ${filler}`)).toEqual({ safe: true });
+    expect(checkTerminalCommandSafety(`rg -n sudo ${filler}`)).toEqual({ safe: true });
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeLessThan(400);
+  });
+
+  it('emits diagnostics for the new fail-closed and fallback branches without the command text', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      expect(checkTerminalCommandSafety('rg -n sudo src')).toEqual({ safe: true });
+      expect(checkTerminalCommandSafety("git -c core.pager='sudo reboot' log").safe).toBe(false);
+      expect(checkTerminalCommandSafety('$E sudo reboot').safe).toBe(false);
+      expect(checkTerminalCommandSafety("echo 'sudo reboot' | xargs sh -c").safe).toBe(false);
+      expect(checkTerminalCommandSafety("echo 'sudo reboot' | xargs env").safe).toBe(false);
+      expect(checkTerminalCommandSafety('sh -c "echo $X"').safe).toBe(false);
+      expect(checkTerminalCommandSafety(`ls ${'x '.repeat(20_000)}`).safe).toBe(false);
+      const messages = debug.mock.calls.map((call) => String(call[0]));
+      expect(messages).toContainEqual(
+        expect.stringContaining('confirmed as arguments of read-only evidence commands (rg)')
+      );
+      expect(messages).toContainEqual(
+        expect.stringContaining('denied-name fallback matched reboot')
+      );
+      expect(messages).toContainEqual(expect.stringContaining('parameter expansion'));
+      expect(messages).toContainEqual(
+        expect.stringContaining('xargs target sh receives run-time input')
+      );
+      expect(messages).toContainEqual(
+        expect.stringContaining('xargs target has no static command')
+      );
+      expect(messages).toContainEqual(
+        expect.stringContaining('sh command string is supplied at run time')
+      );
+      expect(messages).toContainEqual(expect.stringContaining('exceeds the 32768-character'));
+      const joined = messages.join('\n');
+      expect(joined).not.toContain('core.pager');
+      expect(joined).not.toContain('sudo reboot');
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it('blocks the audited bypasses before the sandbox executor and still runs evidence commands', async () => {
+    const blocked = [
+      "echo 'sudo reboot' | xargs -I{} sh -c {}",
+      "printf 'sudo reboot' | xargs -0 bash -c",
+      '$E sudo reboot',
+      '"$@" eval ls',
+      `ls ${'&>/dev/null x '.repeat(12_000)}`,
+    ];
+    for (const command of blocked) {
+      let executorCalls = 0;
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        })
+      );
+      expect(result.ok, command.slice(0, 80)).toBe(false);
+      expect(result.error, command.slice(0, 80)).toContain('Command blocked');
+      expect(executorCalls, command.slice(0, 80)).toBe(0);
+    }
+    const allowed = ['rg -n sudo src', 'command -v sudo', 'git ls-files | xargs rg -n sudo'];
+    const calls: string[] = [];
+    for (const command of allowed) {
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async (seen: string) => {
+              calls.push(seen);
+              return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+            },
+          },
+        })
+      );
+      expect(result.ok, command).toBe(true);
+    }
+    expect(calls).toEqual(allowed);
+  });
+
+  /*
+   * L4-P8c 返工（复查阻塞意见）：
+   * - xargs 目标的检查曾对同一批起点再解包一次，嵌套 xargs 每层翻倍（16 层约 2^16 倍），
+   *   上限内的长命令同步阻塞十几秒后放行；
+   * - xargs 之下不在 EXEC_WRAPPERS 里的 wrapper（caffeinate、flock、script、chrt、taskset）把输入项交给 shell；
+   * - 正则兜底把 echo/printf 等取证命令的参数放行，但它们的输出经管道、进程替换、coproc、命令替换或写出的文件
+   *   交给了会执行它的命令（876766f 之前的正则会拦）。
+   */
+  it.each([
+    // 复查复现：未知 wrapper 夹在 xargs 与 shell 之间。
+    "printf 'sudo reboot' | xargs -0 caffeinate -i sh -c",
+    "echo 'sudo reboot' | xargs -I{} caffeinate -i sh -c {}",
+    "echo 'sudo reboot' | xargs flock /tmp/l sh -c",
+    "echo 'sudo reboot' | xargs script -q /dev/null sh -c",
+    "echo 'sudo reboot' | xargs chrt 0 sh -c",
+    "echo 'sudo reboot' | xargs taskset 1 bash -c",
+    // 复查构造：路径形式、已知 wrapper 套未知 wrapper、解释器、运行时值、find 与嵌套 xargs。
+    'xargs caffeinate -i /bin/sh -c',
+    'xargs timeout 5 caffeinate -i python3 -c',
+    'xargs flock /tmp/l node -e',
+    'xargs caffeinate -i "$SH" -c',
+    'xargs caffeinate $(command -v sh) -c',
+    'xargs caffeinate find .',
+    'xargs xargs caffeinate sh -c',
+    // 程序名藏在 env -S 串或选项值里，或未知 wrapper 之后是没有静态目标的已知 wrapper。
+    "xargs caffeinate env -S 'sh -c'",
+    'xargs script -q --command=sh /dev/null',
+    'xargs caffeinate -i timeout 5',
+    'xargs caffeinate ./node_modules/.bin/tsx',
+  ])('blocks xargs input handed to an interpreter behind an unknown wrapper: %s', (command) => {
+    const result = checkTerminalCommandSafety(command);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(DYNAMIC);
+    }
+  });
+
+  it.each([
+    // 取证命令的输出经管道交给会执行它的命令（未知 wrapper、解释器、xargs 的非取证目标）。
+    { command: "echo 'sudo reboot' | xargs caffeinate", rule: PRIV },
+    { command: "printf 'sudo reboot' | caffeinate -i sh", rule: PRIV },
+    { command: "echo 'sudo reboot' | python3", rule: PRIV },
+    { command: "echo 'eval ls' | caffeinate sh", rule: EVAL },
+    { command: 'command -v sudo | xargs caffeinate', rule: PRIV },
+    { command: "sh -c 'echo sudo reboot' | caffeinate sh", rule: PRIV },
+    { command: 'rg -n sudo src | sed -n 1p | caffeinate sh', rule: PRIV },
+    // 管道的各种写法：命令组、子 shell、|&、管道后换行、管道接入命令组。
+    { command: "{ echo 'sudo reboot'; } | caffeinate sh", rule: PRIV },
+    { command: "( echo 'sudo reboot' ) | caffeinate sh", rule: PRIV },
+    { command: "echo 'sudo reboot' |& caffeinate sh", rule: PRIV },
+    { command: "echo 'sudo reboot' |\n caffeinate sh", rule: PRIV },
+    { command: "echo 'sudo reboot' | { true; caffeinate sh; }", rule: PRIV },
+    // 进程替换与 coproc。
+    { command: "caffeinate sh <(echo 'sudo reboot')", rule: PRIV },
+    { command: "echo 'sudo reboot' > >(caffeinate sh)", rule: PRIV },
+    { command: "coproc caffeinate -i sh; echo 'sudo reboot' >&3", rule: PRIV },
+    // 同一条命令里先写文件再交给会执行它的命令。
+    { command: "echo 'sudo reboot' > x.sh && caffeinate sh x.sh", rule: PRIV },
+    { command: "echo 'sudo reboot' | tee x.sh; caffeinate sh x.sh", rule: PRIV },
+    // 命令替换的输出成为未知程序的参数：按承载它的外层词判定，而不是一律放行替换体。
+    { command: 'caffeinate $(echo sudo) ls', rule: PRIV },
+    { command: 'caffeinate "`echo sudo`" ls', rule: PRIV },
+    // bash 的 printf -v 把输出写进变量：不是打印，随后的命令可以执行它。
+    { command: 'printf -v x \'sudo reboot\'; caffeinate sh -c "$x"', rule: PRIV },
+  ])('blocks evidence output that flows into an executing command: $command', ({
+    command,
+    rule,
+  }) => {
+    const result = checkTerminalCommandSafety(command);
+    expect(result.safe, command).toBe(false);
+    if (!result.safe) {
+      expect(result.block.rule, command).toBe(rule);
+    }
+  });
+
+  it.each([
+    // 取证输出交给不执行输入的文本过滤器、xargs 的取证目标、文件或进程替换里的取证命令。
+    'rg -n sudo src | sort | uniq -c',
+    'rg -l eval src | xargs wc -l',
+    'git log --grep su | head -n 5; npm test',
+    'rg -n sudo src 2>&1 | tail -n 20',
+    'rg -n sudo src > hits.txt',
+    'rg -n sudo src | tee hits.txt',
+    'diff <(rg -n sudo a) <(rg -n sudo b)',
+    'echo "$(rg -n sudo src)" | head -n 1',
+    // xargs 之下取证目标的参数、未知目标里不像程序的词（目录、sed 脚本、'.'）。
+    "find . -name '*.py' -print0 | xargs -0 grep -n python",
+    'git ls-files | xargs grep -ln node',
+    'xargs -I{} cp {} source/',
+    'xargs -I{} mv {} .',
+    "rg -l foo | xargs sed -i 's/foo/python/'",
+    'xargs -0 rm -f',
+    'git ls-files -z | xargs -0 npx prettier --check',
+    'xargs -I{} cp {} build/time.log',
+    "rg -l x | xargs sed -i 's/bash -c/sh -c/g'",
+  ])('still allows inert evidence flows: %s', (command) => {
+    expect(checkTerminalCommandSafety(command), command).toEqual({ safe: true });
+  });
+
+  it('keeps nested xargs chains linear in the nesting depth', () => {
+    // 复查复现：16 层 xargs 链用 ';' 重复 280 次（约 27.7K 字符，低于长度上限），此前同步占用约 9-21 秒。
+    const chain = Array(280)
+      .fill(`${'xargs '.repeat(16)}ls`)
+      .join(';');
+    expect(chain.length).toBeLessThan(32_768);
+    // 同形链带正则兜底命中：兜底的 token 归属走同一条解包。
+    const withHit = Array(240)
+      .fill(`${'xargs '.repeat(16)}rg -n sudo`)
+      .join(';');
+    expect(withHit.length).toBeLessThan(32_768);
+    const started = performance.now();
+    expect(checkTerminalCommandSafety(chain)).toEqual({ safe: true });
+    expect(checkTerminalCommandSafety(withHit)).toEqual({ safe: true });
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  it('logs the rework fail-closed branches without the command text', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      expect(checkTerminalCommandSafety("echo 'sudo reboot' | xargs flock /tmp/l sh -c").safe).toBe(
+        false
+      );
+      expect(checkTerminalCommandSafety("printf 'sudo reboot' | caffeinate -i sh").safe).toBe(
+        false
+      );
+      expect(checkTerminalCommandSafety('rg -n sudo src | head -n 5')).toEqual({ safe: true });
+      const messages = debug.mock.calls.map((call) => String(call[0]));
+      expect(messages).toContainEqual(
+        expect.stringContaining('xargs target flock names sh in its arguments')
+      );
+      expect(messages).toContainEqual(
+        expect.stringContaining(
+          'its output reaches caffeinate, which is not a known inert consumer'
+        )
+      );
+      expect(messages).toContainEqual(
+        expect.stringContaining('confirmed as arguments of read-only evidence commands (rg)')
+      );
+      expect(messages.join('\n')).not.toContain('sudo reboot');
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it('blocks the rework reproductions before the sandbox executor', async () => {
+    const blocked = [
+      "printf 'sudo reboot' | xargs -0 caffeinate -i sh -c",
+      "echo 'sudo reboot' | xargs -I{} caffeinate -i sh -c {}",
+      "echo 'sudo reboot' | xargs caffeinate",
+      Array(280)
+        .fill(`${'xargs '.repeat(16)}sh -c`)
+        .join(';'),
+    ];
+    for (const command of blocked) {
+      let executorCalls = 0;
+      const started = performance.now();
+      const result = await runTerminalExec(
+        command,
+        baseToolContext({
+          sandboxExecutor: {
+            exec: async () => {
+              executorCalls++;
+              return { stdout: 'should-not-run', stderr: '', exitCode: 0 };
+            },
+          },
+        })
+      );
+      expect(performance.now() - started, command.slice(0, 80)).toBeLessThan(2_000);
+      expect(result.ok, command.slice(0, 80)).toBe(false);
+      expect(result.error, command.slice(0, 80)).toContain('Command blocked');
+      expect(executorCalls, command.slice(0, 80)).toBe(0);
+    }
+    // 复查经 ToolRouter.execute 测到 15.1 秒后才调用执行器的放行链：现在应很快到达执行器。
+    const chain = Array(280)
+      .fill(`${'xargs '.repeat(16)}ls`)
+      .join(';');
+    let executorCalls = 0;
+    const started = performance.now();
+    const result = await runTerminalExec(
+      chain,
+      baseToolContext({
+        sandboxExecutor: {
+          exec: async () => {
+            executorCalls++;
+            return { stdout: 'ok\n', stderr: '', exitCode: 0 };
+          },
+        },
+      })
+    );
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(result.ok).toBe(true);
+    expect(executorCalls).toBe(1);
   });
 });
 

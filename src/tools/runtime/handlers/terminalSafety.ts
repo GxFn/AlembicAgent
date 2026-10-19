@@ -3,17 +3,29 @@
  *
  * 1. checkTerminalCommandSafety —— 危险命令黑名单。它是启发式纵深防御，不是写边界：
  *    真正限制写入范围的是宿主注入的 sandbox profile（project-write 沙箱）；rm -r、find -delete、
- *    git clean 等删除按设计不归这里拦截。检查只看命令的静态 literal：命令位置（含已知执行 wrapper、
- *    引导命令的保留字、shell 命令串、find -exec 动作、命令替换体）上的 DENIED_BINS、eval 与 rm 递归强删。
- *    变量/参数展开、别名、脚本文件内容、node -e/python -c/awk system() 这类解释器内代码、
- *    不在 EXEC_WRAPPERS 里的 wrapper 都不求值，属于已知盲区。
+ *    git clean 等删除按设计不归这里拦截。DENIED_BINS 与 eval 走双重判定，任一命中即拒绝（L4-P8c）：
+ *    (a) 不依赖词法器的兜底：对每一层命令串的原始文本做词边界正则匹配（名字前是行首、空白、; | & ( ) 或
+ *        反引号，可带一个引号），命中后只有 token 判定确认它是只读取证命令（rg/grep/git log 等）的参数、
+ *        查询类 wrapper 的操作数、注释，或已在嵌套层单独检查过的 shell 命令串时才放行并记诊断；命令替换体里
+ *        的命中按承载替换的外层词判定，放行的命中词还要求其输出（管道、进程替换、coproc、同一命令里写出的
+ *        文件）只流向惰性程序，不流向会执行它的命令；
+ *    (b) token 级判定：命令位置（含已知执行 wrapper、引导命令的保留字、shell 命令串、find -exec 动作、
+ *        命令替换体）上的 DENIED_BINS、eval 与 rm 递归强删。
+ *    别名、脚本文件内容、node -e/python -c/awk system() 这类解释器内代码、不在 EXEC_WRAPPERS 里的 wrapper
+ *    都不求值，属于 (b) 的已知盲区，其中字面出现的 DENIED_BINS/eval 由 (a) 兜底。
  *    命令替换的输出决定执行身份、wrapper 结构、rm 选项、shell 命令串或 find 表达式时静态无法判定，
- *    一律 fail-closed；shell（及 source/.）从 stdin 或运行时描述符读程序（管道、进程替换、/dev/stdin）
- *    而不是 here-string 时同样 fail-closed。词法上无法可靠切分的结构（任意层级的 heredoc '<<'/'<<-'、
+ *    一律 fail-closed；参数展开（$VAR、"$@"、${VAR}）出现在命令位置、wrapper 结构或 -c 命令串里时同样
+ *    fail-closed（展开为空或多个词会改变执行身份与切分）。shell（及 source/.）从 stdin 或运行时描述符读程序
+ *    （管道、进程替换、/dev/stdin）而不是 here-string 时、-c 命令串缺失或是 find/xargs 占位时、xargs 的目标
+ *    是 shell/解释器/find 或没有静态目标（输入项成为命令）时、xargs 的非取证目标的参数里出现解释器/find/执行
+ *    wrapper 的名字或运行时值（目标可能是 caffeinate、flock 这类未知 wrapper）时同样 fail-closed。
+ *    xargs 的目标每层只解包一次，嵌套 xargs 的检查成本与层数成线性。
+ *    词法上无法可靠切分的结构（任意层级的 heredoc '<<'/'<<-'、
  *    未闭合的替换、替换内的 case/注释、带嵌套引号或替换的 ${...}）同样 fail-closed。续行（反斜杠+换行）
  *    在切词前删除，'$\<换行>(' 与 '<\<换行><' 分别按 '$(' 与 '<<' 处理；'2>x cmd' 的 2 是描述符不是命令；
- *    '&>' 在 POSIX sh 里是 '&' 加 '>'，两种读法都检查。词首 '#' 注释是否生效取决于 shell，
- *    出现时“注释到行尾”与“'#' 是字面量”两种读法都检查，任一读法命中或无法切分即拦截。
+ *    '&>' 在 POSIX sh 里是 '&' 加 '>'，两种读法都检查（POSIX 读法按 '&>' 线性切段）。词首 '#' 注释是否生效
+ *    取决于 shell，出现时“注释到行尾”与“'#' 是字面量”两种读法都检查，任一读法命中或无法切分即拦截。
+ *    超过 MAX_TERMINAL_COMMAND_LENGTH 的命令不做切分，直接 fail-closed（同步检查不能长时间占住事件循环）。
  * 2. checkTerminalCommandAllowlist —— 只读能力（Evolution）的 bin 白名单与写类参数/子命令约束。
  */
 import path from 'node:path';
@@ -800,14 +812,19 @@ const MAX_UNWRAP_DEPTH = 16;
 const MAX_COMMAND_CANDIDATES = 32;
 /** 单个 wrapper 选项解析允许访问的参数位置数。 */
 const MAX_WRAPPER_PARSE_STATES = 64;
+/**
+ * 危险命令检查接受的最长命令（字符数）。检查全程同步执行，切词、wrapper 解包与 '&>' 双读法都随长度增长；
+ * 正常的取证/构建命令远短于此，超限直接 fail-closed，而不是让一条超长命令占住事件循环。
+ */
+const MAX_TERMINAL_COMMAND_LENGTH = 32_768;
 
 /**
- * 正则预检只保留 token 化无法表达的模式：
+ * 正则预检只保留 token 化无法表达、且命中即拒绝的模式：
  * - rm 合并旗标（rm -rf）出现在任意位置，包括解释器代码与引号内（awk/perl/python 里的 system 调用）；
  * - curl/wget 输出经管道交给 shell；
  * - fork bomb 函数定义。
- * sudo/su/dd 等 DENIED_BINS 与 eval 只在命令位置才有执行身份，交给 token 级检查：
- * 'rg -n sudo src'、'git log --grep su'、'ls dd' 这类取证命令不应被当成提权或破坏命令。
+ * sudo/su/dd 等 DENIED_BINS 与 eval 的词边界正则（DENIED_NAME_PATTERN）不在这里：它命中后还要用 token
+ * 判定排除 'rg -n sudo src'、'git log --grep su'、'ls dd' 这类取证命令，见 checkDeniedNameFallback。
  */
 export function detectDangerousShellPayload(payload: string): TerminalSafetyBlock | null {
   const checks: Array<{ rule: string; reason: string; pattern: RegExp }> = [
@@ -840,6 +857,16 @@ export function detectDangerousShellPayload(payload: string): TerminalSafetyBloc
 export function checkTerminalCommandSafety(
   command: string
 ): { safe: true } | { safe: false; block: TerminalSafetyBlock } {
+  if (command.length > MAX_TERMINAL_COMMAND_LENGTH) {
+    // 只记录长度，不记录命令本身。超限命令不切词也不跑正则，直接拒绝。
+    logSafetyDecision(
+      `command length ${command.length} exceeds the ${MAX_TERMINAL_COMMAND_LENGTH}-character inspection limit; failing closed`
+    );
+    return readonlyBlock(
+      'shell-command-too-long',
+      `Command longer than ${MAX_TERMINAL_COMMAND_LENGTH} characters cannot be inspected in terminal.exec`
+    );
+  }
   return inspectLiteralShellCommand(command, 0);
 }
 
@@ -862,7 +889,7 @@ function inspectLiteralShellCommand(command: string, depth: number): SafetyVerdi
       return nested;
     }
   }
-  // 这里只检查静态 literal 形态，不求值变量/别名/脚本。实际隔离仍由宿主 sandbox 提供。
+  // (b) token 级判定：这里只检查静态 literal 形态，不求值变量/别名/脚本。实际隔离仍由宿主 sandbox 提供。
   // 仅命令位置及已知 wrapper 链有执行身份；cat ./docs/sudo 等普通参数不是可执行文件。
   for (const tokens of readings.flatMap((reading) => reading.commands)) {
     for (const { words, hereStrings } of commandWordReadings(tokens)) {
@@ -872,24 +899,38 @@ function inspectLiteralShellCommand(command: string, depth: number): SafetyVerdi
       }
     }
   }
-  return { safe: true };
+  // (a) 正则兜底放在 (b) 之后：两者任一命中都拒绝，(b) 先命中时报告它更精确的规则。
+  return checkDeniedNameFallback(command, readings, depth);
 }
 
 /**
  * 一条命令 token 序列的全部词表读法。bash/zsh 把 '&>' 读成 stdout+stderr 重定向；POSIX sh（dash 等）
  * 把它读成后台运算符 '&' 加 '>'，'ls &>/dev/null sudo reboot' 在那里以重定向开头另起一条命令
- * sudo reboot。两种读法都检查：第一种是整条命令，第二种是每个 '&>' 目标之后的剩余 token。
+ * sudo reboot。两种读法都检查：第一种是整条命令；第二种按每个 '&>' 把 token 切成互不重叠的段
+ * （'&>' 的目标是下一段的重定向目标，不是命令词）。同一个 shell 对所有 '&>' 的解释一致，
+ * 所以逐段切分就是完整的 POSIX 读法，总工作量与 token 数成线性（此前每个 '&>' 都复制并重查剩余全部 token）。
  */
 function commandWordReadings(
-  tokens: ShellWord[]
+  tokens: ShellWord[],
+  log = true
 ): Array<{ words: ShellWord[]; hereStrings: ShellWord[] }> {
   const readings = [collectCommandWords(tokens)];
+  let segmentStart = 0;
+  let split = false;
   for (let index = 0; index < tokens.length; index++) {
     if (tokens[index].redirection && tokens[index].value.startsWith('&')) {
+      split = true;
+      readings.push(collectCommandWords(tokens.slice(segmentStart, index)));
+      segmentStart = index + 2;
+      index++;
+    }
+  }
+  if (split) {
+    readings.push(collectCommandWords(tokens.slice(segmentStart)));
+    if (log) {
       logSafetyDecision(
-        "'&>' found; also inspecting the POSIX reading where '&' ends the command and the rest starts a new one"
+        "'&>' found; also inspecting the POSIX reading where each '&' ends a command and the rest starts a new one"
       );
-      readings.push(collectCommandWords(tokens.slice(index + 2)));
     }
   }
   return readings;
@@ -921,6 +962,10 @@ function collectCommandWords(tokens: ShellWord[]): {
 interface ShellReading {
   commands: ShellWord[][];
   substitutions: string[];
+  /** commands[k] 之后的分隔符，供正则兜底找出管道下游的命令。 */
+  separators: readonly string[];
+  /** 这一读法是否把词首 '#' 当注释（注释内容不产生词）。 */
+  commentsApplied: boolean;
 }
 
 /**
@@ -937,7 +982,7 @@ function lexShellReadings(command: string): ShellReading[] | { block: TerminalSa
     return { block: { rule: 'shell-unparseable-command', reason: literal.error } };
   }
   if (!literal.sawCommentStart) {
-    return [literal];
+    return [{ ...literal, commentsApplied: false }];
   }
   const commented = parseSimpleShellWords(command, true, { comments: true });
   if (!commented.ok) {
@@ -954,7 +999,653 @@ function lexShellReadings(command: string): ShellReading[] | { block: TerminalSa
   logSafetyDecision(
     'word-start # found; inspecting both the comment and the literal-# readings of the command'
   );
-  return [literal, commented];
+  return [
+    { ...literal, commentsApplied: false },
+    { ...commented, commentsApplied: true },
+  ];
+}
+
+/*
+ * (a) DENIED_BINS/eval 的词边界正则兜底（L4-P8c）
+ *
+ * token 级判定曾被连续绕过（heredoc、注释、参数展开前缀、xargs 运行时参数），所以对每一层命令串的原始文本
+ * 再做一次不依赖词法器的匹配：名字前是行首、空白、; | & ( ) 或反引号（'$(' 由 '(' 覆盖，wrapper 名之后
+ * 由空白覆盖），可带一个引号；名字后是行尾、空白、运算符、反引号或重定向符。eval 沿用 L4-P8 之前的口径，
+ * 只在其后还跟着参数时才算命中（单独的 eval 什么也不执行，'npm run eval' 不该被拦）。'=sudo'、'/sudo'、
+ * 'sudoers' 这类不在命令位置形态的写法不算命中。
+ * 为了不回到 I31 的误拦（'rg -n sudo src'），命中后用 token 判定逐个确认，全部确认才放行并记诊断：
+ * - 命中词是只读取证命令（EVIDENCE_COMMAND_BINS，且没有执行/写盘类选项、git 只认只读子命令）的参数，
+ *   包括 wrapper 解包后的目标与 find -exec 动作里的命令；
+ * - 命中词是查询类 wrapper（command -v、--help）的操作数，整条命令不执行任何目标；
+ * - 命中落在注释读法的注释里，或落在 shell/source/trap 的参数（含交给 shell 的 here-string）里：
+ *   这些文本已作为独立命令串在嵌套层递归检查，嵌套层同样跑本兜底；
+ * - 命中落在命令替换体里时，替换体同样在嵌套层递归检查，而替换的输出成为外层词，所以还要按外层词
+ *   判定（L4-P8c 返工：'caffeinate $(echo sudo) ls' 的外层词是未知程序的参数）。
+ * 放行之外还要看输出去向（explainOutputFlow，L4-P8c 返工）：命中所在命令的输出经管道、进程替换、coproc
+ * 或同一命令里写出的文件交给非惰性程序时拒绝（'echo "sudo reboot" | xargs caffeinate'）。
+ * 其余位置（命令名、wrapper 选项值、赋值前缀、env -S 串、重定向目标、非取证命令的参数）一律拒绝。
+ * 任一解读（'&>' 两种读法、注释两种读法、规格外选项的多个候选）里无法确认都拒绝。
+ */
+const DENIED_NAME_PATTERN = new RegExp(
+  `(?:^|[\\s;&|()\`])["']?(?:(${[...DENIED_BINS]
+    .map((name) => (name === 'mkfs' ? 'mkfs(?:\\.[\\w-]+)?' : name))
+    .join('|')})["']?(?=$|[\\s;&|()\`<>])|(eval)["']?(?=[ \\t]+[^\\s;&|()<>#]))`,
+  'dgi'
+);
+
+/**
+ * 正则兜底放行所需的只读取证命令：只读取或打印、从不把参数当命令执行的程序。是否带写盘/执行类选项
+ * （rg --pre、find -delete、git --ext-diff）沿用只读 allowlist 的选项表，git 只认只读子命令。
+ */
+const EVIDENCE_COMMAND_BINS = new Set([
+  'rg',
+  'grep',
+  'egrep',
+  'fgrep',
+  'git',
+  'ls',
+  'cat',
+  'head',
+  'tail',
+  'wc',
+  'echo',
+  'printf',
+  'find',
+  'which',
+  'type',
+  'file',
+  'stat',
+]);
+
+/**
+ * 一次只读取证调用：bin 在 EVIDENCE_COMMAND_BINS 里，没有写盘/执行类选项，git 只认只读子命令。
+ * bash 的 'printf -v VAR' 把输出写进变量而不是打印（随后 'caffeinate sh -c "$VAR"' 就执行了它），不算取证。
+ */
+function isEvidenceInvocation(bin: string, args: readonly ShellWord[]): boolean {
+  if (!EVIDENCE_COMMAND_BINS.has(bin)) {
+    return false;
+  }
+  if (bin === 'printf' && args[0]?.value.startsWith('-v')) {
+    return false;
+  }
+  const values = args.map((word) => word.value);
+  return findDeniedOption(bin, values) === null && checkReadonlySubcommand(bin, values).safe;
+}
+
+interface DeniedNameHit {
+  name: string;
+  /** 名字在命令串里的起点。 */
+  index: number;
+  block: TerminalSafetyBlock;
+}
+
+function findDeniedNameHits(command: string): DeniedNameHit[] {
+  const hits: DeniedNameHit[] = [];
+  for (const match of command.matchAll(DENIED_NAME_PATTERN)) {
+    // 第 1 组是 DENIED_BINS，第 2 组是带参数的 eval；两组互斥。
+    const group = match[1] === undefined ? 2 : 1;
+    const index = match.indices?.[group]?.[0];
+    const name = match[group];
+    if (index === undefined || name === undefined) {
+      continue;
+    }
+    hits.push({ name: normalizeBinName(name), index, block: deniedNameBlock(name) });
+  }
+  return hits;
+}
+
+function deniedNameBlock(name: string): TerminalSafetyBlock {
+  const bin = normalizeBinName(name);
+  if (bin === 'eval') {
+    return { rule: 'shell-eval', reason: 'eval is blocked in terminal.exec' };
+  }
+  if (bin === 'sudo' || bin === 'su') {
+    return {
+      rule: 'shell-privilege-escalation',
+      reason: 'Privilege escalation commands are blocked in terminal.exec',
+    };
+  }
+  return {
+    rule: 'shell-destructive-bin',
+    reason: 'Destructive system executables are blocked in terminal.exec',
+  };
+}
+
+/** 一个词在某种解读下能否放行：blocker 为空表示可放行，bins 是确认它时用到的取证命令。 */
+interface WordAttribution {
+  blocker?: string;
+  bins: string[];
+}
+
+const UNATTRIBUTED =
+  'it is not an argument of a resolved command (wrapper option value, assignment prefix, env -S string or redirection target)';
+
+function mergeAttribution(
+  target: Map<number, WordAttribution>,
+  start: number,
+  entry: WordAttribution
+): void {
+  const existing = target.get(start);
+  if (!existing) {
+    target.set(start, { blocker: entry.blocker, bins: [...entry.bins] });
+    return;
+  }
+  existing.blocker ??= entry.blocker;
+  existing.bins.push(...entry.bins);
+}
+
+function checkDeniedNameFallback(
+  command: string,
+  readings: readonly ShellReading[],
+  depth: number
+): SafetyVerdict {
+  const hits = findDeniedNameHits(command);
+  if (hits.length === 0) {
+    return { safe: true };
+  }
+  const contexts = readings.map(
+    (reading): FallbackContext => ({
+      reading,
+      words: indexReadingWords(reading),
+      attributions: new Map<ShellWord[], Map<number, WordAttribution>>(),
+    })
+  );
+  const evidenceBins = new Set<string>();
+  for (const hit of hits) {
+    for (const context of contexts) {
+      const blocker = explainHit(hit, context, depth, evidenceBins);
+      if (blocker) {
+        // 只记录被禁程序名与归类原因，不记录命令文本。
+        logSafetyDecision(
+          `denied-name fallback matched ${hit.name} but ${blocker}; failing closed`
+        );
+        return { safe: false, block: hit.block };
+      }
+    }
+  }
+  const names = [...new Set(hits.map((hit) => hit.name))].join(', ');
+  const bins = [...evidenceBins].map(truncateForReason).join(', ');
+  const detail = bins
+    ? `arguments of read-only evidence commands (${bins}) or other inert positions`
+    : 'query operands, comments or nested code inspected separately';
+  logSafetyDecision(
+    `denied-name fallback matched ${names}; token analysis confirmed as ${detail}; allowing`
+  );
+  return { safe: true };
+}
+
+interface LocatedWord {
+  tokens: ShellWord[];
+  word: ShellWord;
+}
+
+/** 读法里全部带偏移的词（含重定向目标），按起点升序（词法器按顺序产出）。 */
+function indexReadingWords(reading: ShellReading): LocatedWord[] {
+  const located: LocatedWord[] = [];
+  for (const tokens of reading.commands) {
+    for (const word of tokens) {
+      if (!word.redirection && word.start !== undefined) {
+        located.push({ tokens, word });
+      }
+    }
+  }
+  return located;
+}
+
+function findWordAt(words: readonly LocatedWord[], offset: number): LocatedWord | null {
+  let low = 0;
+  let high = words.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const { word } = words[middle];
+    if ((word.end ?? 0) <= offset) {
+      low = middle + 1;
+    } else if ((word.start ?? 0) > offset) {
+      high = middle - 1;
+    } else {
+      return words[middle];
+    }
+  }
+  return null;
+}
+
+interface FallbackContext {
+  reading: ShellReading;
+  words: LocatedWord[];
+  attributions: Map<ShellWord[], Map<number, WordAttribution>>;
+  /** 惰性计算的输出去向（管道、进程替换、coproc、写文件）；出现可放行的命中时才计算。 */
+  flow?: ReadingFlow;
+}
+
+/**
+ * 返回命中在这一读法里无法确认的原因；可以放行时返回 null。
+ * 命中落在命令替换体里时不再一律放行（L4-P8c 返工）：替换体的输出会成为外层词，'caffeinate $(echo sudo) ls'
+ * 里外层词是未知程序的参数。替换体本身已按独立命令串递归检查，这里再按承载替换的外层词判定——外层词
+ * 的区间覆盖整个替换体，findWordAt 找到的就是它。
+ */
+function explainHit(
+  hit: DeniedNameHit,
+  context: FallbackContext,
+  depth: number,
+  evidenceBins: Set<string>
+): string | null {
+  const { reading } = context;
+  const located = findWordAt(context.words, hit.index);
+  if (!located) {
+    // 注释读法里注释内容不产生词：命中落在注释里，这一读法不会执行它。
+    return reading.commentsApplied ? null : 'the match is not inside a command word';
+  }
+  if (located.word.start === undefined) {
+    return UNATTRIBUTED;
+  }
+  let attribution = context.attributions.get(located.tokens);
+  if (!attribution) {
+    attribution = attributeTokenList(located.tokens, depth);
+    context.attributions.set(located.tokens, attribution);
+  }
+  const entry = attribution.get(located.word.start);
+  if (!entry) {
+    return UNATTRIBUTED;
+  }
+  if (entry.blocker) {
+    return entry.blocker;
+  }
+  const flowBlocker = explainOutputFlow(context, located.tokens);
+  if (flowBlocker) {
+    return flowBlocker;
+  }
+  for (const bin of entry.bins) {
+    evidenceBins.add(bin);
+  }
+  return null;
+}
+
+/*
+ * 放行的前提是命中词只是数据：取证命令的参数、查询操作数、交给 shell 的命令串都会出现在输出里
+ * （echo/printf 原样打印，rg -r、git log --format、command -v 也能打印参数），输出再交给会执行它的命令时
+ * 就不是数据了（L4-P8c 返工）：'echo "sudo reboot" | xargs caffeinate'、'printf "sudo reboot" | caffeinate -i sh'、
+ * 'caffeinate sh <(echo "sudo reboot")'、'echo "sudo reboot" > x.sh && caffeinate sh x.sh'。
+ * 所以在同一读法里检查输出的去向，消费者必须都是惰性程序（文本过滤器、取证命令、xargs 的取证目标）：
+ * - 管道（|、|&，可跨换行与子 shell 边界）下游的命令；
+ * - 出现进程替换（<(...)、>(...)）、coproc 或管道接入命令组/子 shell 时，数据流向无法按段确定，读法里每条命令；
+ * - 命中所在命令或其管道下游把输出写进文件（重定向、tee 的文件操作数）时，同一读法里每条命令
+ *   （文件可能被随后的命令当脚本执行；跨 terminal.exec 调用的文件仍是脚本内容盲区）。
+ * 这是读法级的保守近似：同一条命令里另有不相关的管道时也会参与判定。
+ */
+interface ReadingFlow {
+  /** 进程替换、coproc 或管道接入命令组：读法里每条命令都按消费者处理。 */
+  allConsume: boolean;
+  /** 管道下游命令里的非惰性者，按出现顺序。 */
+  nonInertConsumers: NonInertCommand[];
+  /** 管道下游是否有命令写文件。 */
+  consumersWriteFile: boolean;
+  /** 读法里全部命令中的非惰性者；只在需要“每条命令”时才计算。 */
+  nonInertCommands?: NonInertCommand[];
+  /** 每条命令的惰性判定与写文件判定缓存：每条命令只解包一次，总工作量与命令数成线性。 */
+  verdicts: Map<ShellWord[], string | null>;
+  writers: Map<ShellWord[], boolean>;
+}
+
+interface NonInertCommand {
+  tokens: ShellWord[];
+  /** 诊断用的程序名（不含参数）。 */
+  name: string;
+}
+
+// 管道接入这些复合命令时，其后续命令同样读这条管道（'| { true; sh; }'、'| while read l; do ...; done'）。
+const PIPE_GROUP_OPENERS = new Set(['{', 'while', 'until', 'if', 'for', 'case', 'select']);
+
+/**
+ * 不执行输入、也不把参数当命令执行的文本过滤器。sort 的 --compress-program 会执行程序，单独排除；
+ * sed（e 命令、s///e）、awk（system()、print | "cmd"）、less/more（! 命令）都可能执行内容，不在这里。
+ * 复合命令的结束保留字只在“读法里每条命令”模式下出现，按惰性处理。
+ */
+const INERT_CONSUMER_BINS = new Set([
+  'sort',
+  'uniq',
+  'cut',
+  'tr',
+  'nl',
+  'column',
+  'tee',
+  'jq',
+  'diff',
+  'comm',
+  'fold',
+  'fmt',
+  'rev',
+  'tac',
+  'paste',
+  'expand',
+  'unexpand',
+  'od',
+  'xxd',
+  'hexdump',
+  'base64',
+  'md5',
+  'md5sum',
+  'shasum',
+  'sha1sum',
+  'sha256sum',
+  'sha512sum',
+  'cksum',
+  'true',
+  'false',
+  'cd',
+  'pwd',
+  '}',
+  'fi',
+  'done',
+  'esac',
+]);
+
+// 不落盘的输出目标：空设备与标准流。'>&2'、'>&-' 这类描述符复制/关闭在 writesFile 里单独识别。
+const NON_FILE_OUTPUT_TARGET = /^\/dev\/(?:null|stdout|stderr|tty|fd\/[0-2])$/;
+
+function explainOutputFlow(context: FallbackContext, holder: ShellWord[]): string | null {
+  context.flow ??= analyzeReadingFlow(context.reading);
+  const { flow } = context;
+  const writes = flow.consumersWriteFile || cachedWritesFile(flow, holder);
+  let offenders: readonly NonInertCommand[] = flow.nonInertConsumers;
+  let via = 'a pipe';
+  if (flow.allConsume || writes) {
+    flow.nonInertCommands ??= collectNonInertCommands(flow, context.reading.commands);
+    offenders = flow.nonInertCommands;
+    via = flow.allConsume
+      ? 'a process substitution, coproc or piped command group'
+      : 'a file written in the same command';
+  }
+  // 命中所在命令自身已由归属判定确认（取证命令、查询或已递归检查的 shell 命令串），跳过它；
+  // 它在列表里至多出现一次，所以这里至多看两项。
+  const offender = offenders.find((entry) => entry.tokens !== holder);
+  return offender
+    ? `its output reaches ${offender.name}, which is not a known inert consumer (via ${via})`
+    : null;
+}
+
+function collectNonInertCommands(
+  flow: ReadingFlow,
+  commands: readonly ShellWord[][]
+): NonInertCommand[] {
+  const offenders: NonInertCommand[] = [];
+  for (const tokens of commands) {
+    let name = flow.verdicts.get(tokens);
+    if (name === undefined) {
+      name = explainConsumer(tokens);
+      flow.verdicts.set(tokens, name);
+    }
+    if (name) {
+      offenders.push({ tokens, name });
+    }
+  }
+  return offenders;
+}
+
+function cachedWritesFile(flow: ReadingFlow, tokens: ShellWord[]): boolean {
+  let writes = flow.writers.get(tokens);
+  if (writes === undefined) {
+    writes = writesFile(tokens);
+    flow.writers.set(tokens, writes);
+  }
+  return writes;
+}
+
+/** 读法里的管道下游命令，以及是否出现了无法按段确定流向的结构。 */
+function analyzeReadingFlow(reading: ShellReading): ReadingFlow {
+  const consumers: ShellWord[][] = [];
+  let allConsume = false;
+  let pending = '';
+  reading.commands.forEach((tokens, index) => {
+    if (tokens.length > 0) {
+      // 两条非空命令之间的分隔符序列：'||' 是逻辑或，其余出现 '|' 即管道（'|&'、'|\n'、')|'、'|('）。
+      const pipe = pending.replaceAll('||', '');
+      const pipeAt = pipe.lastIndexOf('|');
+      const first = tokens.find((token) => !token.redirection)?.value ?? '';
+      if (pipeAt >= 0) {
+        consumers.push(tokens);
+        if (pipe.slice(pipeAt).includes('(') || PIPE_GROUP_OPENERS.has(first)) {
+          allConsume = true;
+        }
+      }
+      if (normalizeBinName(first) === 'coproc' || hasDanglingRedirection(tokens)) {
+        allConsume = true;
+      }
+      pending = '';
+    }
+    pending += reading.separators[index] ?? '';
+  });
+  if (allConsume) {
+    logSafetyDecision(
+      'process substitution, coproc or piped command group found; treating every command in the reading as an output consumer'
+    );
+  }
+  const flow: ReadingFlow = {
+    allConsume,
+    nonInertConsumers: [],
+    consumersWriteFile: false,
+    verdicts: new Map(),
+    writers: new Map(),
+  };
+  flow.nonInertConsumers = collectNonInertCommands(flow, consumers);
+  flow.consumersWriteFile = consumers.some((tokens) => cachedWritesFile(flow, tokens));
+  return flow;
+}
+
+/** 重定向运算符后面没有目标词：进程替换 '<(...)'/'>(...)' 的括号被切成了新命令（或运算符缺目标）。 */
+function hasDanglingRedirection(tokens: readonly ShellWord[]): boolean {
+  return tokens.some(
+    (token, index) =>
+      token.redirection === true &&
+      (tokens[index + 1] === undefined || tokens[index + 1].redirection === true)
+  );
+}
+
+/** 命令是否把输出写进文件：输出重定向到普通文件，或 tee 的文件操作数。 */
+function writesFile(tokens: readonly ShellWord[]): boolean {
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (!token.redirection || !token.value.includes('>')) {
+      continue;
+    }
+    const target = tokens[index + 1];
+    if (!target || target.redirection) {
+      return true;
+    }
+    if (token.value.endsWith('&') && /^(?:\d+|-)$/.test(target.value)) {
+      continue;
+    }
+    if (!NON_FILE_OUTPUT_TARGET.test(target.value)) {
+      return true;
+    }
+  }
+  for (const { words } of commandWordReadings([...tokens], false)) {
+    const unwrapped = unwrapLiteralCommand(words, 0);
+    if ('block' in unwrapped) {
+      // token 级判定 (b) 已对每条命令解包并在这里先行拒绝；保守起见按写文件处理。
+      return true;
+    }
+    for (const [head, ...args] of unwrapped.candidates) {
+      if (
+        head &&
+        normalizeBinName(head.value) === 'tee' &&
+        args.some((arg) => !arg.value.startsWith('-') && !NON_FILE_OUTPUT_TARGET.test(arg.value))
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * 一条命令作为输出消费者是否惰性：解开已知 wrapper（含 xargs）后每个候选目标都是惰性程序时返回 null，
+ * 否则返回第一个非惰性程序名（诊断用，只含程序名）。无法解包（运行时值、歧义）按非惰性处理。
+ */
+function explainConsumer(tokens: ShellWord[]): string | null {
+  for (const { words } of commandWordReadings(tokens, false)) {
+    if (words.length === 0) {
+      continue;
+    }
+    const unwrapped = unwrapLiteralCommand(words, 0);
+    if ('block' in unwrapped) {
+      return 'a command whose wrapper structure cannot be resolved';
+    }
+    for (const [head, ...args] of unwrapped.candidates) {
+      if (!head) {
+        // 只有赋值，或 xargs 自身没有目标（运行 echo）：不执行任何程序。
+        continue;
+      }
+      const bin = normalizeBinName(head.value);
+      if (INERT_CONSUMER_BINS.has(bin)) {
+        if (bin === 'sort' && args.some((arg) => arg.value.startsWith('--compress'))) {
+          return 'sort --compress-program';
+        }
+        continue;
+      }
+      if (bin !== 'find' && isEvidenceInvocation(bin, args)) {
+        continue;
+      }
+      return truncateForReason(bin);
+    }
+  }
+  return null;
+}
+
+/** 一条命令 token 序列在 bash 与 POSIX 两种 '&>' 读法下每个词的放行判定（合取）。 */
+function attributeTokenList(tokens: ShellWord[], depth: number): Map<number, WordAttribution> {
+  const combined = new Map<number, WordAttribution>();
+  for (const variant of commandWordReadings(tokens, false)) {
+    const roles = attributeWords(variant.words, variant.hereStrings, depth);
+    for (const word of [...variant.words, ...variant.hereStrings]) {
+      if (word.start !== undefined) {
+        mergeAttribution(
+          combined,
+          word.start,
+          roles.get(word.start) ?? { blocker: UNATTRIBUTED, bins: [] }
+        );
+      }
+    }
+  }
+  return combined;
+}
+
+/**
+ * 一组命令词（不经 shell 直接执行）在全部解包候选下每个词的放行判定。词必须在每个候选里都出现且角色
+ * 可放行；在某个候选里没出现（被 wrapper 选项、赋值前缀或 env -S 消耗）也不放行。
+ */
+function attributeWords(
+  words: ShellWord[],
+  hereStrings: readonly ShellWord[],
+  depth: number
+): Map<number, WordAttribution> {
+  const result = new Map<number, WordAttribution>();
+  const all = [...words, ...hereStrings];
+  const blockAll = (blocker: string) => {
+    for (const word of all) {
+      if (word.start !== undefined) {
+        result.set(word.start, { blocker, bins: [] });
+      }
+    }
+    return result;
+  };
+  if (depth >= MAX_INSPECTION_DEPTH) {
+    return blockAll('the nesting limit was reached');
+  }
+  const unwrapped = unwrapLiteralCommand(words, 0);
+  if ('block' in unwrapped) {
+    return blockAll('the wrapper structure cannot be resolved');
+  }
+  if (unwrapped.candidates.length === 0) {
+    // 只有查询类 wrapper（command -v、--help）会让候选为空：不执行任何目标，其余词只是被打印的操作数。
+    for (const word of all) {
+      if (word.start !== undefined) {
+        result.set(word.start, { bins: [] });
+      }
+    }
+    return result;
+  }
+  const perCandidate = unwrapped.candidates.map((candidate) =>
+    attributeCandidate(candidate, hereStrings, depth)
+  );
+  const keys = new Set(perCandidate.flatMap((roles) => [...roles.keys()]));
+  for (const key of keys) {
+    const merged: WordAttribution = { bins: [] };
+    for (const roles of perCandidate) {
+      const entry = roles.get(key);
+      if (!entry) {
+        merged.blocker ??= UNATTRIBUTED;
+        continue;
+      }
+      merged.blocker ??= entry.blocker;
+      merged.bins.push(...entry.bins);
+    }
+    result.set(key, merged);
+  }
+  return result;
+}
+
+function attributeCandidate(
+  candidate: ShellWord[],
+  hereStrings: readonly ShellWord[],
+  depth: number
+): Map<number, WordAttribution> {
+  const roles = new Map<number, WordAttribution>();
+  const [head, ...args] = candidate;
+  if (!head) {
+    return roles;
+  }
+  const set = (word: ShellWord, entry: WordAttribution) => {
+    if (word.start !== undefined) {
+      mergeAttribution(roles, word.start, entry);
+    }
+  };
+  set(head, { blocker: 'it is in command position', bins: [] });
+  if (head.value.startsWith('#')) {
+    // 词首 '#' 开头的“命令”只出现在注释不生效的读法里（'# check eval usage'）：那里它是一个不存在的
+    // 程序名，其参数不会被执行；注释读法里这些词根本不存在。
+    for (const arg of args) {
+      set(arg, { bins: [] });
+    }
+    return roles;
+  }
+  const bin = normalizeBinName(head.value);
+  if (SHELL_BINS.has(bin) || bin === 'source' || bin === '.' || bin === 'trap') {
+    // inspectShellCodeArguments 已把这些参数（及交给 shell/source 的 here-string）按命令串递归检查，
+    // 嵌套层同样跑本兜底；这里不重复判定。
+    for (const arg of args) {
+      set(arg, { bins: [] });
+    }
+    if (bin !== 'trap') {
+      for (const hereString of hereStrings) {
+        set(hereString, { bins: [] });
+      }
+    }
+    return roles;
+  }
+  let own = args;
+  if (bin === 'find') {
+    // find -exec 动作里的词归属动作命令本身（rg/grep 的参数可放行，find 自身的表达式按 find 判定）。
+    const split = splitFindExecSegments(args);
+    own = split.own;
+    for (const segment of split.segments) {
+      const nested = attributeWords(markExecPlaceholders(segment, ['{}']), hereStrings, depth + 1);
+      for (const word of segment) {
+        if (word.start !== undefined) {
+          set(word, nested.get(word.start) ?? { blocker: UNATTRIBUTED, bins: [] });
+        }
+      }
+    }
+  }
+  const entry: WordAttribution = isEvidenceInvocation(bin, own)
+    ? { bins: [bin] }
+    : {
+        blocker: `it is an argument of ${truncateForReason(bin)}, which is not a read-only evidence command in this form`,
+        bins: [],
+      };
+  for (const word of own) {
+    set(word, entry);
+  }
+  return roles;
 }
 
 /** 递归检查一段命令串（shell -c 载荷、命令替换体、trap 动作），带嵌套上限。 */
@@ -1022,6 +1713,50 @@ const SHELL_BINS = new Set([
   'tcsh',
 ]);
 const FIND_EXEC_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+
+/**
+ * 把参数当代码执行的程序：shell、source/.、eval 与常见脚本解释器。xargs 把运行时输入项交给它们时，
+ * 输入项就是 -c 命令串、-e 代码或脚本，静态无法检查（L4-P8c）。带版本号的名字（python3.12、ruby3.3）
+ * 由 VERSIONED_INTERPRETER 覆盖。
+ */
+const CODE_INTERPRETER_BINS = new Set([
+  ...SHELL_BINS,
+  'source',
+  '.',
+  'eval',
+  'node',
+  'nodejs',
+  'deno',
+  'bun',
+  'tsx',
+  'ts-node',
+  'python',
+  'pypy',
+  'ruby',
+  'perl',
+  'php',
+  'lua',
+  'luajit',
+  'tclsh',
+  'wish',
+  'expect',
+  'osascript',
+  'awk',
+  'gawk',
+  'mawk',
+  'nawk',
+  'rscript',
+  'julia',
+  'pwsh',
+  'powershell',
+  'groovy',
+  'jshell',
+]);
+const VERSIONED_INTERPRETER = /^(?:python|pypy|ruby|perl|php|lua|node|tclsh|wish)[\d.]+$/;
+
+function isCodeInterpreterBin(bin: string): boolean {
+  return CODE_INTERPRETER_BINS.has(bin) || VERSIONED_INTERPRETER.test(bin);
+}
 
 /** 对解包后的目标命令做命令位置判定；unwrapLiteralCommand 已保证头部不是运行时才确定的词。 */
 function inspectResolvedCommand(
@@ -1128,7 +1863,8 @@ function inspectShellCodeArguments(
     if (arg.dynamic === 'command-substitution') {
       return dynamicArgument;
     }
-    // find/xargs 的 {} 占位只替换成文件名或输入项，命令串的静态部分照常检查。
+    // find/xargs 的 {} 占位与参数展开在这里按静态文本递归检查（它们也可能只是位置参数，如 sh -c '...' _ {}）；
+    // 真正的 -c 命令串本身是占位、参数展开或缺失时，由 checkShellProgramSource fail-closed。
     const value = arg.value;
     if (optionsEnded || value.length < 2 || !/^[-+]/.test(value)) {
       payloads.push(value);
@@ -1195,6 +1931,8 @@ const STDIN_SCRIPT_PATH = /(?:^|\/)dev\/(?:stdin|fd(?:\/\d+)?)$|(?:^|\/)proc\/[^
 
 type ShellProgramSource =
   | { kind: 'command-string' }
+  /** -c 命令串缺失（只能由 xargs 等在运行时追加）或本身是占位/参数展开/命令替换：程序文本运行时才确定。 */
+  | { kind: 'runtime-command-string'; detail: string }
   | { kind: 'query' }
   | { kind: 'script'; path: string }
   | { kind: 'stdin' };
@@ -1218,6 +1956,16 @@ function checkShellProgramSource(
     bin === 'source' || bin === '.' ? sourcedScriptSource(args) : shellProgramSource(bin, args);
   if (source.kind === 'command-string' || source.kind === 'query') {
     return { safe: true };
+  }
+  if (source.kind === 'runtime-command-string') {
+    // 'xargs sh -c'、'find . -exec sh -c {} \;'、'sh -c "echo $X"'：程序文本由输入项、文件名或变量值拼成。
+    logSafetyDecision(
+      `${bin} command string is supplied at run time (${source.detail}); failing closed`
+    );
+    return readonlyBlock(
+      'shell-dynamic-command',
+      `${bin} -c command string is missing or holds a run-time value (find/xargs placeholder, parameter expansion or command substitution) and cannot be inspected statically`
+    );
   }
   if (source.kind === 'script' && !STDIN_SCRIPT_PATH.test(path.posix.normalize(source.path))) {
     return { safe: true };
@@ -1251,7 +1999,8 @@ function shellProgramSource(bin: string, args: ShellWord[]): ShellProgramSource 
       }
       if (name.length > 0 && 'command'.startsWith(name) && !forcedStdin) {
         // fish --command（getopt_long 接受前缀）。已出现 -s 时不再当命令串，按 stdin 处理。
-        return { kind: 'command-string' };
+        // '=' 写法的命令串在选项词自身里，否则是下一个词。
+        return commandStringSource(equalsIndex >= 0 ? [args[index]] : [args[index + 1]]);
       }
       if (
         equalsIndex < 0 &&
@@ -1264,11 +2013,13 @@ function shellProgramSource(bin: string, args: ShellWord[]): ShellProgramSource 
     }
     if (/^[-+]./.test(value)) {
       const letters = value.slice(1);
+      if (value.startsWith('-') && letters.includes('c')) {
+        // bash 逐字母解析选项簇，带值字母（-o）之后的 c 仍然生效（'bash -oc errexit "$X"' 执行 $X），
+        // 所以簇里任意位置出现 c 都按 -c 处理；把它当命令串只会让判定更严（脚本路径本就是已知盲区）。
+        return clusterCommandStringSource(args, index, letters, valueLetters);
+      }
       for (let position = 0; position < letters.length; position++) {
         const letter = letters[position];
-        if (letter === 'c' && value.startsWith('-')) {
-          return { kind: 'command-string' };
-        }
         if (letter === 's') {
           // -s：即使给了操作数也从 stdin 读程序，操作数只是位置参数。
           forcedStdin = true;
@@ -1285,6 +2036,86 @@ function shellProgramSource(bin: string, args: ShellWord[]): ShellProgramSource 
     return forcedStdin ? { kind: 'stdin' } : { kind: 'script', path: value };
   }
   return { kind: 'stdin' };
+}
+
+/**
+ * -c 命令串的来源判定。sources 是可能承载命令串的词（undefined 表示该位置不存在）：
+ * - 一个都不存在：单独的 'sh -c' 会报错，能执行任何东西的唯一途径是 xargs 等在运行时追加命令串；
+ * - 任一是运行时值（find/xargs 的 {} 占位、参数展开、命令替换）：程序文本运行时才确定，'echo $X' 里的
+ *   $X 可以带 ';' 拼出第二条命令，与命令替换同样 fail-closed。
+ */
+function commandStringSource(sources: ReadonlyArray<ShellWord | undefined>): ShellProgramSource {
+  const present = sources.filter((word): word is ShellWord => word !== undefined);
+  if (present.length === 0) {
+    return { kind: 'runtime-command-string', detail: 'no command string operand' };
+  }
+  const dynamic = present.find((word) => word.dynamic !== undefined);
+  if (dynamic?.dynamic) {
+    return {
+      kind: 'runtime-command-string',
+      detail: `command string is a ${dynamicLabel(dynamic.dynamic)}`,
+    };
+  }
+  return { kind: 'command-string' };
+}
+
+/**
+ * 含 c 的选项簇的命令串候选，全部交给 commandStringSource 判定：
+ * - fish/zsh 的粘连写法（-c'cmd'）：c 之后的簇内剩余字符就是命令串，即选项词自身；
+ * - bash 的写法：命令串是其后第一个非选项参数，但簇里每个带值字母（-oc errexit）先按顺序消耗一个参数。
+ *   不同 shell 对簇的解析不同，所以“不跳过”到“跳过全部带值字母的值”的每种切分都作为候选。
+ */
+function clusterCommandStringSource(
+  args: ShellWord[],
+  index: number,
+  letters: string,
+  valueLetters: ReadonlySet<string>
+): ShellProgramSource {
+  const candidates: Array<ShellWord | undefined> = [];
+  if (letters.indexOf('c') < letters.length - 1) {
+    candidates.push(args[index]);
+  }
+  const consumed = Math.min([...letters].filter((letter) => valueLetters.has(letter)).length, 4);
+  for (let skip = 0; skip <= consumed; skip++) {
+    const operand = findCommandStringOperand(args, index + 1 + skip, valueLetters);
+    candidates.push(operand >= 0 ? args[operand] : undefined);
+  }
+  return commandStringSource(candidates);
+}
+
+/** -c 之后第一个非选项参数的下标（跳过带值选项的值，'--'/'-' 结束选项）；不存在返回 -1。 */
+function findCommandStringOperand(
+  args: ShellWord[],
+  start: number,
+  valueLetters: ReadonlySet<string>
+): number {
+  for (let index = start; index < args.length; index++) {
+    const value = args[index].value;
+    if (value === '--' || value === '-') {
+      return index + 1 < args.length ? index + 1 : -1;
+    }
+    if (value.startsWith('--')) {
+      const name = value.slice(2);
+      if (
+        !name.includes('=') &&
+        name.length > 0 &&
+        SHELL_VALUE_LONG_OPTIONS.some((option) => option.startsWith(name))
+      ) {
+        index++;
+      }
+      continue;
+    }
+    if (/^[-+]./.test(value)) {
+      const letters = value.slice(1);
+      const valueLetter = [...letters].findIndex((letter) => valueLetters.has(letter));
+      if (valueLetter === letters.length - 1) {
+        index++;
+      }
+      continue;
+    }
+    return index;
+  }
+  return -1;
 }
 
 /** source/. 的脚本操作数；bash 5.3 起 source 支持 -p PATH，其余实现没有选项。缺操作数按 stdin 处理。 */
@@ -1323,8 +2154,29 @@ function inspectFindActions(
       'find expression produced by command substitution cannot be inspected statically'
     );
   }
+  for (const segment of splitFindExecSegments(args).segments) {
+    const nested = inspectNestedCommandWords(
+      markExecPlaceholders(segment, ['{}']),
+      depth,
+      hereStrings
+    );
+    if (!nested.safe) {
+      return nested;
+    }
+  }
+  return { safe: true };
+}
+
+/**
+ * 把 find 的参数切成 find 自身的表达式词（own，不含动作关键字与终止符）和各个 -exec/-execdir/-ok/-okdir
+ * 动作的命令词段。终止符是 ';'（命令行里写成 \; 或 ';'）或紧跟在 {} 之后的 '+'；缺终止符时取到末尾。
+ */
+function splitFindExecSegments(args: ShellWord[]): { own: ShellWord[]; segments: ShellWord[][] } {
+  const own: ShellWord[] = [];
+  const segments: ShellWord[][] = [];
   for (let index = 0; index < args.length; index++) {
     if (!FIND_EXEC_ACTIONS.has(args[index].value)) {
+      own.push(args[index]);
       continue;
     }
     const segment: ShellWord[] = [];
@@ -1336,17 +2188,10 @@ function inspectFindActions(
       }
       segment.push(args[end]);
     }
-    const nested = inspectNestedCommandWords(
-      markExecPlaceholders(segment, ['{}']),
-      depth,
-      hereStrings
-    );
-    if (!nested.safe) {
-      return nested;
-    }
+    segments.push(segment);
     index = end;
   }
-  return { safe: true };
+  return { own, segments };
 }
 
 // GNU coreutils/findutils 在 macOS（Homebrew）上以 g 前缀安装，与无前缀名是同一个程序。
@@ -1683,11 +2528,159 @@ function unwrapLiteralCommand(input: ShellWord[], depth: number): UnwrapResult {
     if ('block' in parsed) {
       return parsed;
     }
+    if (bin === 'xargs') {
+      // xargs 没有 split 类选项（rewrites 恒为空）；目标逐个起点只解包一次并就地检查。
+      return unwrapXargsTargets(input, parsed.starts, parsed.replaceTokens, depth);
+    }
     // env -S 拆出的参数从 env 自身的选项解析继续（GNU env 会重新扫描拆分后的参数表）。
     const rewritten = parsed.rewrites.map((rest) => [word, ...rest]);
     return collectUnwrapCandidates(input, parsed.starts, parsed.replaceTokens, rewritten, depth);
   }
   return { candidates: [input.slice(index)] };
+}
+
+/**
+ * xargs 的目标解包：每个起点只调用一次 unwrapLiteralCommand，并直接检查它返回的候选（L4-P8c 返工）。
+ * 此前先由 collectUnwrapCandidates 解包、再对同一批起点二次解包做 xargs 检查，嵌套 xargs 每层翻倍，
+ * 16 层就是 2^16 倍，上限内的长命令能同步占住事件循环十几秒；现在总工作量与嵌套层数成线性。
+ * 起点越过参数表末尾表示 xargs 自身没有目标命令：它运行 echo，输入项只是被打印，返回空目标放行。
+ */
+function unwrapXargsTargets(
+  input: ShellWord[],
+  starts: readonly number[],
+  replaceTokens: readonly string[],
+  depth: number
+): UnwrapResult {
+  const candidates: ShellWord[][] = [];
+  for (const start of starts) {
+    if (start >= input.length) {
+      candidates.push([]);
+      continue;
+    }
+    const nested = unwrapLiteralCommand(
+      markExecPlaceholders(input.slice(start), replaceTokens),
+      depth + 1
+    );
+    if ('block' in nested) {
+      return nested;
+    }
+    for (const candidate of nested.candidates) {
+      const block = checkXargsTarget(candidate);
+      if (block) {
+        return { block };
+      }
+    }
+    candidates.push(...nested.candidates);
+    if (candidates.length > MAX_COMMAND_CANDIDATES) {
+      return {
+        block: {
+          rule: 'shell-wrapper-ambiguous',
+          reason: 'Wrapper options are too ambiguous to inspect the wrapped command statically',
+        },
+      };
+    }
+  }
+  return { candidates };
+}
+
+// 解释器名里的 shell 内建（source、.、eval）不是可执行文件，未知 wrapper 无法 exec 它们；
+// 而 '.'、'source' 作为参数通常是目录（cp {} .、mv {} source/），参数扫描不把它们当程序。
+const XARGS_ARGUMENT_SCAN_SKIP = new Set(['.', 'source', 'eval']);
+
+/**
+ * xargs 把运行时输入项追加到目标命令末尾（-I/-J/-i 时替换进替换串），目标命令的静态 argv 只是一部分。
+ * 以下情形真正执行的程序来自输入，静态无法检查，fail-closed：
+ * - 目标解包后是 shell/解释器（sh -c、bash、node -e、python3 -c、awk 等）：输入项成为命令串、脚本或代码；
+ * - 目标的 wrapper 链没有静态目标（xargs timeout 5、xargs env A=1、xargs nice -n、xargs xargs）：
+ *   输入项本身就是被执行的命令；
+ * - 目标是 find：输入项可以组成 -exec 动作（echo '-exec cmd ;' | xargs find .）；
+ * - 目标不是只读取证命令，而它的静态 argv 里有像程序名的 shell/解释器/find，或有参数展开/命令替换：
+ *   目标可能是 EXEC_WRAPPERS 之外的执行 wrapper（caffeinate -i sh -c、flock /tmp/l sh -c、
+ *   script -q /dev/null sh -c、chrt 0 sh -c、taskset 1 sh -c），输入项照样成为 shell 的命令串（L4-P8c 返工）。
+ *   选项词、目录与 sed 脚本这类不可能被 exec 的写法不当成程序名（见 programNamedInArgument）。
+ * xargs 自身没有目标命令时运行 echo，放行。取证命令（rg、grep、wc 等）的参数只是数据；其余目标的参数注入
+ * （rg --pre 由取证判定排除、git -c）属于“程序解释自身参数”的已知盲区，与静态写出时相同。
+ */
+function checkXargsTarget(candidate: ShellWord[]): TerminalSafetyBlock | null {
+  const head = candidate[0];
+  if (!head) {
+    logSafetyDecision(
+      'xargs target has no static command; run-time input items become the executed program; failing closed'
+    );
+    return {
+      rule: 'shell-dynamic-command',
+      reason:
+        'xargs appends run-time input items to a wrapper without a static target command, so the executed program cannot be inspected statically',
+    };
+  }
+  const bin = normalizeBinName(head.value);
+  if (isCodeInterpreterBin(bin) || bin === 'find') {
+    const label = truncateForReason(bin);
+    logSafetyDecision(
+      `xargs target ${label} receives run-time input items as code or as its expression; failing closed`
+    );
+    return {
+      rule: 'shell-dynamic-command',
+      reason: `xargs passes run-time input items to ${label}, which runs them as code or actions that cannot be inspected statically`,
+    };
+  }
+  const args = candidate.slice(1);
+  if (isEvidenceInvocation(bin, args)) {
+    return null;
+  }
+  const label = truncateForReason(bin);
+  for (const arg of args) {
+    if (arg.dynamic === 'parameter-expansion' || arg.dynamic === 'command-substitution') {
+      logSafetyDecision(
+        `xargs target ${label} carries a ${dynamicLabel(arg.dynamic)} that may name the program it runs; failing closed`
+      );
+      return {
+        rule: 'shell-dynamic-command',
+        reason: `xargs target ${label} is not a read-only evidence command and carries a run-time value (parameter expansion or command substitution) that may name an interpreter for the input items`,
+      };
+    }
+    const named = programNamedInArgument(arg.value);
+    if (named) {
+      const argLabel = truncateForReason(named);
+      logSafetyDecision(
+        `xargs target ${label} names ${argLabel} in its arguments and may be an exec wrapper outside the known list; failing closed`
+      );
+      return {
+        rule: 'shell-dynamic-command',
+        reason: `xargs target ${label} is not a read-only evidence command and its arguments name ${argLabel}, so it may run the input items as code that cannot be inspected statically`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * 参数词里像“会执行输入项的程序名”的片段：shell/解释器、find 与已知执行 wrapper（env -S 'sh -c'、
+ * timeout 5 这类没有静态目标的 wrapper 同样会执行输入项）。按空白与 '=' 切片，覆盖 'sh -c' 这种被引号
+ * 合成一个词的 env -S 串与 --shell=sh 这种选项值。以 '-' 开头的片段是选项；以 '/' 结尾的词是目录或
+ * sed 脚本（s/x/python/）；含 '/' 却不是绝对路径或 ./、../ 开头的片段（sed 的 's/bash'）不是常见的程序写法，
+ * 都跳过。
+ */
+function programNamedInArgument(value: string): string | null {
+  if (value.endsWith('/')) {
+    return null;
+  }
+  for (const piece of value.split(/[\s=]+/)) {
+    if (piece === '' || piece.startsWith('-')) {
+      continue;
+    }
+    if (piece.includes('/') && !/^(?:\/|\.\.?\/)/.test(piece)) {
+      continue;
+    }
+    const name = normalizeBinName(piece);
+    if (XARGS_ARGUMENT_SCAN_SKIP.has(name)) {
+      continue;
+    }
+    if (isCodeInterpreterBin(name) || name === 'find' || EXEC_WRAPPERS.has(name)) {
+      return name;
+    }
+  }
+  return null;
 }
 
 function collectUnwrapCandidates(
@@ -1733,14 +2726,36 @@ function markExecPlaceholders(words: ShellWord[], tokens: readonly string[]): Sh
   );
 }
 
+const DYNAMIC_COMMAND_REASONS: Readonly<Record<NonNullable<ShellWord['dynamic']>, string>> = {
+  'exec-placeholder':
+    'Command position is filled by a find/xargs placeholder at run time and cannot be inspected statically',
+  'parameter-expansion':
+    'Command name or wrapper argument is a parameter expansion ($VAR, "$@" or the braced form) whose run-time value (possibly empty or several words) cannot be inspected statically',
+  'command-substitution':
+    'Command name or wrapper argument produced by command substitution cannot be inspected statically',
+};
+
+function dynamicLabel(kind: NonNullable<ShellWord['dynamic']>): string {
+  switch (kind) {
+    case 'exec-placeholder':
+      return 'find/xargs placeholder';
+    case 'parameter-expansion':
+      return 'parameter expansion';
+    case 'command-substitution':
+      return 'command substitution';
+  }
+}
+
+/**
+ * 命令位置或 wrapper 结构（选项、操作数、目标命令）上的运行时值：'$E sudo reboot' 里 $E 展开为空时
+ * sudo 才是命令，未加引号时还可能展开成多个词，切分随之改变。命令替换、参数展开与 find/xargs 占位一视同仁。
+ */
 function dynamicCommandBlock(word: ShellWord): TerminalSafetyBlock {
-  return {
-    rule: 'shell-dynamic-command',
-    reason:
-      word.dynamic === 'exec-placeholder'
-        ? 'Command position is filled by a find/xargs placeholder at run time and cannot be inspected statically'
-        : 'Command name or wrapper argument produced by command substitution cannot be inspected statically',
-  };
+  const kind = word.dynamic ?? 'command-substitution';
+  logSafetyDecision(
+    `command position or wrapper structure holds a ${dynamicLabel(kind)}; failing closed`
+  );
+  return { rule: 'shell-dynamic-command', reason: DYNAMIC_COMMAND_REASONS[kind] };
 }
 
 interface WrapperParse {
@@ -1825,8 +2840,9 @@ function stepWrapperArgument(
 ): WrapperStep {
   const word = words[index];
   if (!word) {
-    // 没有目标命令（如单独的 'timeout 5'）：wrapper 自身报错或不执行任何程序。
-    return { kind: 'continue', next: [] };
+    // 没有目标命令（如单独的 'timeout 5'）：wrapper 自身报错或不执行任何程序。返回空目标（而不是“无目标”），
+    // 与查询类选项区分开：xargs 会把输入项追加到这里，空目标在 xargs 之下就是“输入项成为命令”。
+    return { kind: 'command', start: index };
   }
   if (word.dynamic) {
     // 未加引号的替换还可能展开成多个词，选项、操作数与目标命令的切分都随之改变。
@@ -1938,8 +2954,8 @@ function takeOptionValue(
   if (optionValue === undefined) {
     const next = words[index + 1];
     if (!next) {
-      // 缺值：wrapper 报错退出，不执行任何程序。
-      return { kind: 'continue', next: [] };
+      // 缺值：wrapper 报错退出，不执行任何程序。同样返回空目标：xargs 之下输入项会补上值与目标命令。
+      return { kind: 'command', start: index + 1 };
     }
     if (next.dynamic) {
       return { kind: 'block', block: dynamicCommandBlock(next) };
@@ -2262,12 +3278,17 @@ interface ShellWord {
   /** 去引号、解转义后的静态文本；命令替换的位置以 SUBSTITUTION_MARK 占位。 */
   value: string;
   /**
-   * 运行时才确定的部分：'command-substitution' 是反引号或 $(...) 的输出；
+   * 运行时才确定的部分：'command-substitution' 是反引号或 $(...) 的输出；'parameter-expansion' 是
+   * $VAR、$1、"$@"、${VAR} 等参数展开（可能为空，未加引号时还会再切词）；
    * 'exec-placeholder' 是 find -exec / xargs -I 运行时替换成文件名或输入项的占位串。
+   * 一个词同时含命令替换与参数展开时记为命令替换（两者在命令位置都 fail-closed）。
    */
-  dynamic?: 'command-substitution' | 'exec-placeholder';
+  dynamic?: 'command-substitution' | 'parameter-expansion' | 'exec-placeholder';
   /** 重定向运算符；其后一个词是重定向目标而不是命令参数。 */
   redirection?: true;
+  /** 切分命令模式下词在原始命令串里的区间 [start, end)；正则兜底据此把命中映射回词。 */
+  start?: number;
+  end?: number;
 }
 
 type ShellLexResult =
@@ -2276,6 +3297,11 @@ type ShellLexResult =
       words: string[];
       commands: ShellWord[][];
       substitutions: string[];
+      /**
+       * 切分命令模式下 commands[k] 之后的分隔符（; & | ( ) 换行），separators.length === commands.length - 1。
+       * 正则兜底据此找出管道下游的命令（'||' 是两个 '|' 之间夹一条空命令）。
+       */
+      separators: string[];
       /** 切分命令模式下是否遇到过词首未加引号的 '#'（注释是否生效会改变后续切分）。 */
       sawCommentStart: boolean;
     }
@@ -2304,6 +3330,8 @@ const DOUBLE_QUOTE_ESCAPABLE = new Set(['$', '`', '"', '\\']);
 const MAX_SCAN_NESTING = 32;
 // 未加引号的普通词字符：保留字（case）只有在整个词都由这些字符组成时才生效。
 const PLAIN_WORD_CHAR = /[^\s;&|()<>'"`\\$]/;
+// '$' 之后开始参数展开的字符：变量名、位置参数与特殊参数（@ * # ? $ ! -）。单引号内不展开。
+const PARAMETER_EXPANSION_START = /[A-Za-z0-9_@*#?$!-]/;
 
 /**
  * 静态 shell 词法器。splitCommands=false（只读 allowlist、env -S）只拆词；splitCommands=true
@@ -2320,32 +3348,58 @@ function parseSimpleShellWords(
 ): ShellLexResult {
   const input = command.trim();
   if (!input) {
-    return { ok: true, words: [], commands: [], substitutions: [], sawCommentStart: false };
+    return {
+      ok: true,
+      words: [],
+      commands: [],
+      substitutions: [],
+      separators: [],
+      sawCommentStart: false,
+    };
   }
+  // input 是去掉首尾空白后的串；加上 base 才是原始命令串里的偏移（正则兜底按原始串定位命中）。
+  const base = command.length - command.trimStart().length;
 
   const words: string[] = [];
   const commands: ShellWord[][] = [[]];
   const substitutions: string[] = [];
+  const separators: string[] = [];
   let current = '';
   let hasWord = false;
   let substituted = false;
+  let expanded = false;
+  let wordStart = 0;
   let sawCommentStart = false;
   let quote: '"' | "'" | null = null;
-  const flushWord = () => {
+  const flushWord = (end: number) => {
     if (hasWord) {
       words.push(current);
-      commands[commands.length - 1].push(
-        substituted ? { value: current, dynamic: 'command-substitution' } : { value: current }
-      );
+      const word: ShellWord = { value: current };
+      if (substituted) {
+        word.dynamic = 'command-substitution';
+      } else if (expanded) {
+        word.dynamic = 'parameter-expansion';
+      }
+      if (splitCommands) {
+        // 只有切分命令模式的偏移才属于原始命令串；env -S 拆分串的偏移另有坐标系，不记录。
+        word.start = base + wordStart;
+        word.end = base + end;
+      }
+      commands[commands.length - 1].push(word);
       current = '';
       hasWord = false;
       substituted = false;
+      expanded = false;
     }
   };
   const fail = (error: string): ShellLexResult => ({ ok: false, error });
 
   for (let i = 0; i < input.length; i++) {
     const char = input[i];
+    if (!hasWord) {
+      // 词从第一个让 hasWord 变真的字符开始；空白、运算符与续行不会让它变真，下一轮再记。
+      wordStart = i;
+    }
     if (quote === "'") {
       if (char === "'") {
         quote = null;
@@ -2404,9 +3458,10 @@ function parseSimpleShellWords(
             'Parameter expansion with nested quoting or substitution cannot be inspected statically'
           );
         }
-        // 参数展开不求值（静态 literal 边界），去掉续行后原样保留在词里。
+        // 参数展开不求值（静态 literal 边界），去掉续行后原样保留在词里；整个词标记为运行时值。
         current += `$${input.slice(nextIndex, end + 1)}`;
         hasWord = true;
+        expanded = true;
         i = end;
         continue;
       }
@@ -2427,6 +3482,11 @@ function parseSimpleShellWords(
         hasWord = true;
         i = nextIndex;
         continue;
+      }
+      if (next !== undefined && PARAMETER_EXPANSION_START.test(next)) {
+        // $NAME、$1、"$@"、$* 等：值运行时才确定。'$' 与名字照常留在词值里，整个词标记为运行时值，
+        // 命令位置与 wrapper 结构上遇到它时和命令替换一样 fail-closed。
+        expanded = true;
       }
     }
     if (quote === '"') {
@@ -2469,8 +3529,9 @@ function parseSimpleShellWords(
       if (fdPrefix) {
         current = '';
         hasWord = false;
+        expanded = false;
       } else {
-        flushWord();
+        flushWord(i);
       }
       let operator = char;
       // 运算符字符之间的续行同样先被删掉：'<\<换行><' 就是 '<<'。
@@ -2493,13 +3554,14 @@ function parseSimpleShellWords(
       continue;
     }
     if (splitCommands && /[\r\n;&|()]/.test(char)) {
-      flushWord();
+      flushWord(i);
       words.push(char);
+      separators.push(char);
       commands.push([]);
       continue;
     }
     if (/\s/.test(char)) {
-      flushWord();
+      flushWord(i);
       continue;
     }
     current += char;
@@ -2509,8 +3571,8 @@ function parseSimpleShellWords(
   if (quote) {
     return fail(UNPARSEABLE_LITERALS);
   }
-  flushWord();
-  return { ok: true, words, commands, substitutions, sawCommentStart };
+  flushWord(input.length);
+  return { ok: true, words, commands, substitutions, separators, sawCommentStart };
 }
 
 /**
