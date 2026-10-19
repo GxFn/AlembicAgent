@@ -2134,24 +2134,7 @@ export class AgentRuntime {
         toolNames: roundToolNames,
       });
       if (transitionNudge) {
-        messages.appendUserNudge(transitionNudge.text);
-        ctx.diagnostics?.recordNudge({ type: transitionNudge.type });
-        this.logger.info(
-          `[AgentRuntime] 📝 injected ${transitionNudge.type} nudge (${tracker.phase})`
-        );
-        this.#emitProcessProgress(
-          buildSemanticNudgeProcessEvent(ctx, transitionNudge, {
-            phase: tracker.phase,
-            semanticKind: 'transition-nudge',
-          })
-        );
-        const _dimT = ctx.sharedState?._dimensionMeta?.id || '';
-        if (process.env.ALEMBIC_MCP_MODE !== '1') {
-          process.stderr.write(
-            `\n\x1b[35m━━━ Transition Nudge [${transitionNudge.type}] phase=${tracker.phase}${_dimT ? ` dim=${_dimT}` : ''} ━━━\x1b[0m\n`
-          );
-          process.stderr.write(`\x1b[33m${redactDeveloperText(transitionNudge.text)}\x1b[0m\n\n`);
-        }
+        this.#injectTransitionNudge(ctx, transitionNudge, '');
       }
     }
 
@@ -2185,6 +2168,37 @@ export class AgentRuntime {
 
     this.#safeTransition('continue');
     return false; // 继续循环
+  }
+
+  /**
+   * 注入 tracker.endRound 返回的阶段转换 nudge（工具轮与文本轮共用，L6-P18 C10）。
+   * 两条路径用同一套消息注入、诊断计数、进度事件与开发者 stderr 输出；logSuffix 只追加到 info 日志，
+   * 用于区分文本轮补发（工具轮传空串，日志与修复前一致）。
+   */
+  #injectTransitionNudge(
+    ctx: LoopContext,
+    transitionNudge: { type: string; text: string },
+    logSuffix: string
+  ) {
+    const phase = ctx.tracker?.phase;
+    ctx.messages.appendUserNudge(transitionNudge.text);
+    ctx.diagnostics?.recordNudge({ type: transitionNudge.type });
+    this.logger.info(
+      `[AgentRuntime] 📝 injected ${transitionNudge.type} nudge (${phase})${logSuffix}`
+    );
+    this.#emitProcessProgress(
+      buildSemanticNudgeProcessEvent(ctx, transitionNudge, {
+        phase,
+        semanticKind: 'transition-nudge',
+      })
+    );
+    const _dimT = ctx.sharedState?._dimensionMeta?.id || '';
+    if (process.env.ALEMBIC_MCP_MODE !== '1') {
+      process.stderr.write(
+        `\n\x1b[35m━━━ Transition Nudge [${transitionNudge.type}] phase=${phase}${_dimT ? ` dim=${_dimT}` : ''} ━━━\x1b[0m\n`
+      );
+      process.stderr.write(`\x1b[33m${redactDeveloperText(transitionNudge.text)}\x1b[0m\n\n`);
+    }
   }
 
   /**
@@ -2348,6 +2362,24 @@ export class AgentRuntime {
           llmResult.reasoningContent,
           llmResult.continuation
         );
+        // L6-P18（C10）：本轮 endRound 的 metrics 规则已转入非终结阶段（终结转换由上面的 digest 分支处理），
+        // tracker 同轮不再二次转换。onTextResponse 给了阶段专属 nudge 时以它为准（与修复前一致）；没给时补发
+        // endRound 的转换 nudge——修复前它在文本路径被直接丢弃，模型进入 VERIFY 却收不到“只校验已发现证据、
+        // 确认后 note_finding”的指令。两种分叉都留 info 日志。
+        const roundTransitionNudge =
+          roundTransition && !metricsTransitionedToTerminal ? roundTransition : null;
+        if (roundTransitionNudge && textResult.nudge) {
+          this.logger.info(
+            `[AgentRuntime] text round: endRound ${roundTransitionNudge.type} nudge (${phaseBefore} → ${tracker.phase}) ` +
+              `superseded by the phase-specific text nudge (pipeline=${tracker.pipelineType}, iteration=${ctx.iteration})`
+          );
+        } else if (roundTransitionNudge) {
+          this.#injectTransitionNudge(
+            ctx,
+            roundTransitionNudge,
+            ` — text round metrics transition ${phaseBefore} → ${tracker.phase}, no phase-specific text nudge`
+          );
+        }
         if (textResult.nudge) {
           messages.appendUserNudge(textResult.nudge);
           ctx.diagnostics?.recordNudge({ type: 'continue' });

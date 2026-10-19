@@ -1647,7 +1647,7 @@ describe('L6-P17 analyst RECORD quota exit (C12)', () => {
 });
 
 describe('L6-P17 terminal nudge single source (C11)', () => {
-  it('gives the strict analyst terminal directive when a VERIFY text round hops through RECORD to SUMMARIZE', () => {
+  it('gives the strict analyst terminal directive when VERIFY text rounds move through RECORD to SUMMARIZE', () => {
     const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
     p17DriveToVerify(t, 'code');
 
@@ -1658,10 +1658,17 @@ describe('L6-P17 terminal nudge single source (C11)', () => {
     t.endRound({ hasNewInfo: true, toolNames: ['note_finding'] });
     expect(t.phase).toBe('VERIFY');
 
-    // 文本轮：endRound 的 metrics 规则 VERIFY→RECORD，随后 onTextResponse 的文本规则 RECORD→SUMMARIZE。
+    // 文本轮：endRound 的 metrics 规则 VERIFY→RECORD。L6-P18（C10）后同一轮的 onTextResponse
+    // 不再按文本规则继续 RECORD→SUMMARIZE（一轮最多转换一次，RECORD 不会零轮被跳过）。
     t.tick();
     t.endRound({});
     expect(t.phase).toBe('RECORD');
+    const sameRound = t.onTextResponse('阶段性结论：模块 A 负责鉴权。');
+    expect(t.phase).toBe('RECORD');
+    expect(sameRound.needsDigestNudge).toBe(false);
+
+    // 下一轮文本规则 RECORD→SUMMARIZE 触发：终结指令来自 NudgeGenerator 的同一份严格版。
+    t.tick();
     const result = t.onTextResponse('阶段性结论：模块 A 负责鉴权。');
     expect(t.phase).toBe('SUMMARIZE');
     expect(result.needsDigestNudge).toBe(true);
@@ -1691,5 +1698,225 @@ describe('L6-P17 terminal nudge single source (C11)', () => {
     expect(t.phase).toBe('SUMMARIZE');
     expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.producerSummarizeLead);
     expect(result.nudge).toContain(NUDGE_DIRECTIVE_TEXTS.producerSummaryNoNewTopics);
+  });
+});
+
+/**
+ * L6-P18（C10/C14/C15/C63）：文本轮阶段转换、rollbackTick、skipped 轮与未知策略名。
+ *
+ * - C10：AgentRuntime 文本轮先 endRound 再 onTextResponse；同一轮（同一 tick）最多转换一次，
+ *   不能 endRound 刚进 VERIFY 又被文本规则推到 RECORD；文本触发的非终结转换要带转换 nudge。
+ * - C14：同一 tick 内发生过阶段转换（maxIterations 强制终结 / forceTerminal）时，rollbackTick
+ *   不能把已归零的 phaseRounds 再减成 -1。
+ * - C15：endRound({ skipped: true }) 早返回前也要清掉本轮搜索标记，否则泄漏到下一轮。
+ * - C63（本地部分）：resolve 收到未知 strategy 名回退 bootstrap 生成策略时记 warn。
+ */
+function p18LogMessages(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls.map(([message]) => String(message));
+}
+
+/** analyst：SCAN→EXPLORE 后每轮一次带新信息的 code read，推进到指定轮次且保持 EXPLORE。 */
+function p18ExploreWithEvidenceUntil(t: ExplorationTracker, iteration: number) {
+  t.tick();
+  t.endRound({});
+  expect(t.phase).toBe('EXPLORE');
+  while (t.iteration < iteration) {
+    t.tick();
+    t.recordToolCall(
+      'code',
+      { action: 'read', params: { path: `src/f${t.iteration}.ts` } },
+      `body of src/f${t.iteration}.ts`
+    );
+    t.endRound({ hasNewInfo: true, toolNames: ['code'] });
+    expect(t.phase).toBe('EXPLORE');
+  }
+}
+
+const P18_VERIFY_NUDGE_MARK = '现在进入证据验证阶段';
+
+describe('L6-P18 text-round phase transitions (C10)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('stays in VERIFY when a ≥40% no-new-info tool round is followed by a text round', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    // 40% 轮次线 = floor(20*0.4) = 8。
+    p18ExploreWithEvidenceUntil(t, 8);
+
+    // 第 9 轮：工具轮但没有新信息（roundsSinceNewInfo=1），尚不满足 EXPLORE→VERIFY。
+    t.tick();
+    t.recordToolCall('code', { action: 'read', params: { path: 'src/f2.ts' } }, 'body again');
+    t.endRound({ hasNewInfo: false, toolNames: ['code'] });
+    expect(t.phase).toBe('EXPLORE');
+
+    // 第 10 轮文本轮：endRound 的 metrics 规则（≥40% 且 2 轮无新信息）EXPLORE→VERIFY，并返回 VERIFY 转换提示。
+    t.tick();
+    const transition = t.endRound({ hasNewInfo: false, submitCount: 0, toolNames: [] });
+    expect(t.phase).toBe('VERIFY');
+    expect(transition?.type).toBe('phase_transition');
+    expect(transition?.text).toContain(P18_VERIFY_NUDGE_MARK);
+
+    // 同轮 onTextResponse 不得再按 VERIFY→RECORD 文本规则（证据≥2）跳过 VERIFY。
+    const result = t.onTextResponse('阶段性分析：模块 A 负责鉴权。');
+    expect(t.phase).toBe('VERIFY');
+    expect(result.isFinalAnswer).toBe(false);
+    expect(result.shouldContinue).toBe(true);
+    // VERIFY 证据已足时阶段分支没有专属 nudge；AgentRuntime 文本路径补发上面 endRound 的转换提示。
+    expect(result.nudge).toBeNull();
+
+    const skipped = p18LogMessages(info).filter((m) => m.includes('already transitioned'));
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toContain('EXPLORE → VERIFY');
+  });
+
+  it('does not skip VERIFY across two consecutive text rounds', () => {
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    t.tick();
+    t.endRound({});
+    t.tick();
+    for (const path of ['src/a.ts', 'src/b.ts']) {
+      t.recordToolCall('code', { action: 'read', params: { path } }, `body of ${path}`);
+    }
+    t.endRound({ hasNewInfo: true, toolNames: ['code'] });
+    expect(t.phase).toBe('EXPLORE');
+
+    const phases: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      t.tick();
+      t.endRound({});
+      t.onTextResponse('阶段性分析：模块 A 负责鉴权。');
+      phases.push(t.phase);
+    }
+    // 第 1 个文本轮仍在 EXPLORE；第 2 个文本轮 consecutiveIdleRounds=2 进入 VERIFY 并停留；第 3 个才进 RECORD。
+    expect(phases).toEqual(['EXPLORE', 'VERIFY', 'RECORD']);
+  });
+
+  it('gives an EXPLORE→VERIFY text-triggered transition the VERIFY transition nudge', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 10 });
+    // 40% 轮次线 = 4；第 5 轮文本轮 endRound 不转换（只有 1 轮无新信息），由文本规则推进到 VERIFY。
+    p18ExploreWithEvidenceUntil(t, 4);
+    t.tick();
+    expect(t.endRound({})).toBeNull();
+    expect(t.phase).toBe('EXPLORE');
+
+    const result = t.onTextResponse('阶段性分析：模块 A 负责鉴权。');
+    expect(t.phase).toBe('VERIFY');
+    expect(result.isFinalAnswer).toBe(false);
+    expect(result.shouldContinue).toBe(true);
+    expect(result.nudge).toContain(P18_VERIFY_NUDGE_MARK);
+    expect(result.nudge).toContain('note_finding');
+
+    const fallback = p18LogMessages(info).filter((m) => m.includes('text-triggered transition'));
+    expect(fallback).toHaveLength(1);
+    expect(fallback[0]).toContain('EXPLORE → VERIFY');
+  });
+});
+
+describe('L6-P18 rollbackTick after a same-tick phase transition (C14)', () => {
+  it('keeps phaseRounds at 0 when maxIterations forced the terminal phase in the rolled-back tick', () => {
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 2 });
+    t.tick();
+    t.endRound({});
+    expect(t.phase).toBe('EXPLORE');
+
+    // 第 2 轮：shouldExit 因 maxIterations 强制转入 SUMMARIZE（phaseRounds 归零），随后 AI 调用失败回退。
+    t.tick();
+    expect(t.shouldExit()).toBe(false);
+    expect(t.phase).toBe('SUMMARIZE');
+    t.rollbackTick();
+    expect(t.getMetrics()).toMatchObject({ phase: 'SUMMARIZE', phaseRounds: 0, iteration: 1 });
+
+    // 下一轮重新计数，终结阶段 grace 从 1 开始而不是 0。
+    t.tick();
+    expect(t.getMetrics().phaseRounds).toBe(1);
+  });
+
+  it('keeps phaseRounds at 0 when forceTerminal ran in the rolled-back tick', () => {
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    t.tick();
+    t.endRound({});
+    t.tick();
+    t.forceTerminal('session token budget nearly exhausted');
+    expect(t.phase).toBe('SUMMARIZE');
+    t.rollbackTick();
+    expect(t.getMetrics()).toMatchObject({ phase: 'SUMMARIZE', phaseRounds: 0, iteration: 1 });
+  });
+
+  it('still undoes the phase round when the rolled-back tick did not transition', () => {
+    const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
+    t.tick();
+    t.endRound({});
+    expect(t.phase).toBe('EXPLORE');
+    t.tick();
+    expect(t.getMetrics()).toMatchObject({ phaseRounds: 1, iteration: 2 });
+    t.rollbackTick();
+    expect(t.getMetrics()).toMatchObject({ phase: 'EXPLORE', phaseRounds: 0, iteration: 1 });
+  });
+});
+
+describe('L6-P18 skipped rounds and unknown strategy names (C15/C63)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** 探针策略：一轮搜索即转换，用来观察 searchRoundsInPhase 是否被跨轮多计。 */
+  const searchProbeStrategy: ExplorationStrategy = {
+    name: 'p18-search-probe',
+    phases: ['EXPLORE', 'SUMMARIZE'],
+    transitions: { 'EXPLORE→SUMMARIZE': { onMetrics: (m) => m.searchRoundsInPhase >= 1 } },
+    getToolChoice: () => 'auto',
+    enableReflection: false,
+    reflectionInterval: 0,
+    enablePlanning: false,
+    replanInterval: 0,
+  };
+
+  it('does not leak the search flag of a skipped round into the next round', () => {
+    const t = new ExplorationTracker(searchProbeStrategy, { maxIterations: 10 });
+    t.tick();
+    t.recordToolCall(
+      'code',
+      { action: 'search', params: { pattern: 'Repository' } },
+      'src/a.ts:1: class Repository'
+    );
+    expect(t.endRound({ skipped: true })).toBeNull();
+
+    // 下一轮没有搜索：修复前上一轮残留的搜索标记让 searchRoundsInPhase=1 并触发转换。
+    t.tick();
+    t.recordToolCall('code', { action: 'read', params: { path: 'src/a.ts' } }, 'body of src/a.ts');
+    t.endRound({ hasNewInfo: true, toolNames: ['code'] });
+    expect(t.phase).toBe('EXPLORE');
+
+    // 对照：真实的搜索轮仍按轮计数。
+    t.tick();
+    t.recordToolCall(
+      'code',
+      { action: 'search', params: { pattern: 'Manager' } },
+      'src/b.ts:3: class Manager'
+    );
+    t.endRound({ hasNewInfo: true, toolNames: ['code'] });
+    expect(t.phase).toBe('SUMMARIZE');
+  });
+
+  it('warns when resolve falls back to the bootstrap strategy for an unknown strategy name', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const tracker = ExplorationTracker.resolve(
+      { source: 'system', strategy: 'analyze' },
+      { maxIterations: 6 }
+    );
+    expect(tracker?.strategyName).toBe('bootstrap');
+    const fallbacks = p18LogMessages(warn).filter((m) => m.includes('unknown strategy'));
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]).toContain('"analyze"');
+    expect(fallbacks[0]).toContain('bootstrap');
+
+    warn.mockClear();
+    for (const strategy of ['analyst', 'producer', 'bootstrap', undefined]) {
+      ExplorationTracker.resolve({ source: 'system', strategy }, { maxIterations: 6 });
+    }
+    expect(p18LogMessages(warn).filter((m) => m.includes('unknown strategy'))).toEqual([]);
   });
 });

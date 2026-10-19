@@ -469,6 +469,8 @@ export class ExitController {
    *   - Runtime 在 analyze 阶段先执行 grounding guard（enforcement='guard'）：阻断轮追加 nudge、
    *     回退轮次并继续，达到连续阻断上限后降级放行；本方法不建模这一步。
    *   - Runtime 的 nudge 直接追加到消息流并记录诊断/进度事件；本方法只把 nudge 放进返回值。
+   *   - 本轮 endRound 的 metrics 规则转入非终结阶段、而 textResult.nudge 为空时，Runtime 补发 endRound
+   *     返回的转换 nudge（L6-P18 C10）；本方法拿不到 endRound 的返回值，不建模这一步。
    */
   checkAfterTextResponse(
     textResult: {

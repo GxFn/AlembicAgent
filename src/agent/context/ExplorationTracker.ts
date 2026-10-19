@@ -122,6 +122,17 @@ export class ExplorationTracker {
   #justTransitioned = false;
   /** 转换前的旧阶段 */
   #transitionFromPhase: string | null = null;
+  /**
+   * 自上次 tick 起（同一轮内）是否已发生阶段转换（L6-P18 C10/C14）。
+   *
+   * 与 #justTransitioned 分工不同，不能复用：#justTransitioned 是“待生成转换 nudge”的一次性消费标志，
+   * endRound / onTextResponse / shouldExit / forceTerminal 转换后都会立即清掉它；本标志只在 #transitionTo
+   * 置位、只由 tick 清零，回答“这一轮是否已经转换过”：
+   *   - onTextResponse 据此跳过同轮第二次转换（文本轮先 endRound 后 onTextResponse，避免 endRound 刚进
+   *     VERIFY 又被文本规则推到 RECORD，VERIFY 零轮被跳过）；
+   *   - rollbackTick 据此不再递减已被 #transitionTo 归零的 phaseRounds（否则变成 -1）。
+   */
+  #transitionedSinceTick = false;
 
   // ── Graceful exit 控制 ──
   /** 进入 graceful exit 的轮次 */
@@ -197,6 +208,17 @@ export class ExplorationTracker {
     } else {
       const isSkillOnly = dimensionMeta?.outputType === 'skill';
       resolvedStrategy = createGenerateStrategy(isSkillOnly);
+      // L6-P18（C63 本地部分）：未传 strategy 或显式 'bootstrap' 是 bootstrap 生成策略的既定入口；
+      // 其他取值（如拼错的 'analyze'、'scan'）同样落到这里，运行时会按 EXPLORE/PRODUCE/SUMMARIZE 走并在
+      // 终结阶段要求 dimensionDigest JSON，与调用方预期的 analyst/producer 完全不同。保持回退行为不变，
+      // 但留 warn 写明传入值与回退目标，便于定位调用方笔误。
+      if (strategyName !== undefined && strategyName !== null && strategyName !== 'bootstrap') {
+        Logger.getInstance().warn(
+          `[ExplorationTracker] resolve: unknown strategy ${formatStrategyName(strategyName)} — ` +
+            `falling back to bootstrap generate strategy (phases=${resolvedStrategy.phases.join('→')}, ` +
+            `skillOnly=${isSkillOnly}); known strategies: analyst, producer, bootstrap`
+        );
+      }
     }
 
     return new ExplorationTracker(resolvedStrategy, budget);
@@ -210,13 +232,24 @@ export class ExplorationTracker {
     this.#metrics.phaseRounds++;
     this.#ticked = true;
     this.#justTransitioned = false;
+    this.#transitionedSinceTick = false;
   }
 
   /** 撤销 tick（AI 调用失败或空响应时，不计入迭代） */
   rollbackTick() {
     if (this.#ticked) {
       this.#metrics.iteration--;
-      this.#metrics.phaseRounds--;
+      if (this.#transitionedSinceTick) {
+        // L6-P18（C14）：本 tick 内已发生阶段转换（如 shouldExit 因 maxIterations 强制终结、forceTerminal），
+        // #transitionTo 已把 phaseRounds 归零、新阶段尚未计过轮；再递减会变成 -1，使终结 grace（>=3）多给一轮
+        // 且 getMetrics 对外暴露负数。只撤销迭代计数，阶段转换本身不回退。
+        this.#logger.info(
+          `[ExplorationTracker] rollbackTick: phase changed within this tick (${this.#transitionFromPhase ?? 'unknown'} → ${this.#phase}), ` +
+            `keeping phaseRounds=${this.#metrics.phaseRounds} (iteration rolled back to ${this.#metrics.iteration})`
+        );
+      } else {
+        this.#metrics.phaseRounds--;
+      }
       this.#ticked = false;
     }
   }
@@ -434,6 +467,19 @@ export class ExplorationTracker {
     this.#ticked = false;
 
     if (skipped) {
+      // L6-P18（C15）：跳过轮不计任何轮次级指标，但 recordToolCall 可能已为本轮置了搜索标记；
+      // 早返回前必须同样清掉，否则标记泄漏到下一轮，使 searchRoundsInPhase 多计一次并提前触发
+      // searchBudget 相关的阶段转换。
+      const discardedSearchFlag = this.#currentRoundHasSearch;
+      this.#currentRoundHasSearch = false;
+      observeSafely(
+        () =>
+          this.#logger.debug(
+            `[ExplorationTracker] endRound skipped at iteration ${this.#metrics.iteration} (phase=${this.#phase}): ` +
+              `round metrics and transitions not evaluated, search flag ${discardedSearchFlag ? 'discarded' : 'was clear'}`
+          ),
+        () => undefined
+      );
       return null;
     }
 
@@ -489,8 +535,20 @@ export class ExplorationTracker {
    * @returns }
    */
   onTextResponse(text = '') {
-    const m = this.#metrics;
-    const transitioned = this.#checkTextTransition();
+    let transitioned = false;
+    if (this.#transitionedSinceTick) {
+      // L6-P18（C10）：一轮最多一次阶段转换。文本轮里 AgentRuntime 先 endRound 再调本方法；endRound 的
+      // metrics 规则若刚把阶段推进（如 EXPLORE→VERIFY），这里再按文本规则推进（VERIFY→RECORD）会让新阶段
+      // 零轮被跳过、其转换指令也随之作废。跳过本轮文本规则，下一轮再按新阶段的规则判定；endRound 返回的
+      // 转换 nudge 由调用方在本方法未给出阶段专属 nudge 时补发。
+      this.#logger.info(
+        `[ExplorationTracker] text response: phase already transitioned this round ` +
+          `(${this.#transitionFromPhase ?? 'unknown'} → ${this.#phase}, iter=${this.#metrics.iteration}) — ` +
+          `skipping text-rule transition until next round`
+      );
+    } else {
+      transitioned = this.#checkTextTransition();
+    }
     if (transitioned) {
       this.#justTransitioned = false;
     }
@@ -520,7 +578,29 @@ export class ExplorationTracker {
       };
     }
 
-    // 非终结阶段收到文本
+    // 非终结阶段收到文本：先按阶段分支取专属 nudge
+    const result = this.#textResponseInPhase(text);
+    if (transitioned && !result.isFinalAnswer && result.nudge === null) {
+      // L6-P18（C10 / U34-F2）：本方法刚按文本规则转入非终结阶段（如 analyst EXPLORE→VERIFY），但新阶段分支
+      // 没有专属 nudge（VERIFY 证据已足、EXPLORE 已有证据、scan 的 PRODUCE 等）。转换标记已在上面清掉，
+      // 调用方拿不到其它转换指令；回退到与 endRound 同源的 buildTransitionNudge，否则模型收不到
+      // “进入证据验证、不要泛搜索、确认后 note_finding”之类的阶段指令。
+      const nudge = this.#nudgeGenerator.buildTransitionNudge(this.#buildNudgeState());
+      this.#logger.info(
+        `[ExplorationTracker] text-triggered transition ${this.#transitionFromPhase ?? 'unknown'} → ${this.#phase} ` +
+          `has no phase-specific nudge — falling back to transition nudge (iter=${this.#metrics.iteration}, pipeline=${this.#pipelineType})`
+      );
+      return { ...result, nudge };
+    }
+    return result;
+  }
+
+  /**
+   * 非终结阶段收到文本时按当前阶段给出的处理结果与专属 nudge（无专属 nudge 时 nudge=null）。
+   * 由 onTextResponse 调用；文本触发转换后的 nudge 回退在调用方处理。
+   */
+  #textResponseInPhase(text: string) {
+    const m = this.#metrics;
     if (this.#phase === 'EXPLORE' && m.evidenceToolCallCount === 0) {
       return {
         isFinalAnswer: false,
@@ -785,6 +865,7 @@ export class ExplorationTracker {
     this.#metrics.roundsSinceSubmit = 0;
     this.#metrics.consecutiveIdleRounds = 0;
     this.#justTransitioned = true;
+    this.#transitionedSinceTick = true;
     this.#logger.info(
       `[ExplorationTracker] ${oldPhase} → ${newPhase} (iter=${this.#metrics.iteration}, submits=${this.#metrics.submitCount}, ` +
         `dwellMs=${dwellMs}, files=${this.#metrics.uniqueFiles.size}, patterns=${this.#metrics.uniquePatterns.size}, ` +
@@ -848,6 +929,14 @@ function isProducerCompletionText(text: string) {
       normalized
     );
   return hasCompletion && hasNoRemaining;
+}
+
+/** 未知 strategy 名的日志表示：字符串带引号（能看出空串与空白），其它类型标明类型。 */
+function formatStrategyName(value: unknown): string {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  return `${String(value)} (${typeof value})`;
 }
 
 function isEvidenceToolCall(toolName: string, args: Record<string, unknown>): boolean {
