@@ -34,14 +34,18 @@ const SEARCH_LIMIT_MAX = 8;
 
 /**
  * 引用解析失败的归类：
- * - unknown-ref：格式不合法或基础 id 不在台账（调用方沿用各自的“无法解析”文案与近期条目提示）；
- * - subrange-out-of-range：基础 id 存在，但子区间超出条目的行区间（常见于 range 条目误用相对行号）；
- * - subrange-truncated-tail：子区间在条目行区间内，但落在台账单条上限截断后的不可取尾部。
+ * - unknown-ref：格式不合法（连 `E-n@...` 的基础 id 都提不出）或基础 id 不在台账（调用方沿用各自的
+ *   “无法解析”文案与近期条目提示）；
+ * - subrange-out-of-range：基础 id 存在，但子区间超出条目的行区间（常见于 range 条目误用相对行号，
+ *   以及按 0 起行号书写的 `E-n@0-k`）；
+ * - subrange-truncated-tail：子区间在条目行区间内，但落在台账单条上限截断后的不可取尾部；
+ * - subrange-malformed：基础 id 存在，但子区间写法不合法（起止颠倒、只写单个行号、数字间含空格）。
  */
 export type EvidenceRefFailureKind =
   | 'unknown-ref'
   | 'subrange-out-of-range'
-  | 'subrange-truncated-tail';
+  | 'subrange-truncated-tail'
+  | 'subrange-malformed';
 
 export interface EvidenceRefFailure {
   readonly kind: EvidenceRefFailureKind;
@@ -152,6 +156,84 @@ function logRefClassification(fields: {
   );
 }
 
+function outOfRangeDetail(
+  ref: string,
+  view: EvidenceLineView,
+  availability: string,
+  startNote = ''
+): string {
+  return `子区间越界: "${ref}" 超出条目 ${view.id} 的行区间 ${formatInterval(view.declared)}${startNote}。可用区间 ${availability}。子区间坐标: ${EVIDENCE_SUBRANGE_COORDINATE_NOTE}。`;
+}
+
+/**
+ * 宽松提取 `E-n@start[-end]` 的基础 id 与数字（容忍空格、缺终点）。只在 Core parseEvidenceRef
+ * 已判非法时使用，目的仅是“用基础 id 再查台账”，不放宽台账自身的取回语法。
+ */
+const LENIENT_SUBRANGE_REF_RE = /^\s*(E-\d+)\s*@\s*(\d+)(?:\s*-\s*(\d+))?\s*$/;
+
+/**
+ * Core parseEvidenceRef 判非法的引用（C059）：Core 对 start<1、end<start 直接返回 null，台账因此连基础 id
+ * 都不查。若宽松提取出的基础 id 在台账里，就不能再报“无法解析 / 不在证据台账”——模型会把有效证据当
+ * 无效 id 放弃（I21 原症状）。归类规则：
+ * - 起点 0（start<1 且起止不颠倒）：两种坐标系下都落在行区间外，按子区间越界报，并注明行号从 1 起；
+ * - 含空格、只写单个行号、起止颠倒：语法错误，单独一类文案，写明合法写法；
+ * 两类都附可用区间。提不出基础 id 或基础 id 不在台账时仍返回 unknown-ref。
+ */
+function classifyMalformedRef(
+  ledger: EvidenceLedgerLike,
+  ref: string,
+  surface: string
+): EvidenceRefFailure {
+  const match = LENIENT_SUBRANGE_REF_RE.exec(ref);
+  const baseId = match?.[1];
+  if (!match || !baseId || match[2] === undefined) {
+    logRefClassification({ surface, ref, kind: 'unknown-ref', reason: 'malformed-ref' });
+    return { kind: 'unknown-ref', detail: null };
+  }
+  const base = ledger.get(baseId);
+  if (!base) {
+    logRefClassification({ surface, ref, kind: 'unknown-ref', reason: 'id-not-in-ledger' });
+    return { kind: 'unknown-ref', detail: null };
+  }
+
+  const view = resolveLineView(ledger, base);
+  const availability = describeAvailability(view);
+  const start = Number(match[2]);
+  const end = match[3] === undefined ? null : Number(match[3]);
+  // 判定顺序：先语法（空格 / 单行号 / 颠倒），再起点 0；同时命中时按语法报，语法文案已含 1≤start 的约束
+  let syntaxReason: string | null = null;
+  if (/\s/.test(ref.trim())) {
+    syntaxReason = 'malformed-subrange-whitespace';
+  } else if (end === null) {
+    syntaxReason = 'malformed-subrange-single-line';
+  } else if (end < start) {
+    syntaxReason = 'malformed-subrange-reversed';
+  } else if (start >= 1) {
+    // Core 现行规则下不可达（非空格、两端齐全、不颠倒、起点≥1 必能解析）；Core 规则若收紧，
+    // 仍按语法错误给出合法写法，并在 reason 上标明未识别的拒绝原因以便复核
+    syntaxReason = 'malformed-subrange-unrecognized';
+  }
+
+  if (syntaxReason) {
+    logRefClassification({ surface, ref, kind: 'subrange-malformed', reason: syntaxReason, view });
+    return {
+      kind: 'subrange-malformed',
+      detail: `子区间语法错误: "${ref}" 不是合法的子区间写法，需写成 ${view.id}@start-end（数字间不含空格，且 1≤start≤end）。可用区间 ${availability}。子区间坐标: ${EVIDENCE_SUBRANGE_COORDINATE_NOTE}。`,
+    };
+  }
+  logRefClassification({
+    surface,
+    ref,
+    kind: 'subrange-out-of-range',
+    reason: 'malformed-subrange-start-zero',
+    view,
+  });
+  return {
+    kind: 'subrange-out-of-range',
+    detail: outOfRangeDetail(ref, view, availability, '（行号从 1 起，不存在第 0 行）'),
+  };
+}
+
 /**
  * 对 `ledger.get(ref)` 已返回 null 的引用做失败归类（evidence.get / note_finding / knowledge.submit 共用）。
  *
@@ -165,8 +247,7 @@ export function classifyUnresolvedEvidenceRef(
 ): EvidenceRefFailure {
   const parsed = parseEvidenceRef(ref);
   if (!parsed) {
-    logRefClassification({ surface, ref, kind: 'unknown-ref', reason: 'malformed-ref' });
-    return { kind: 'unknown-ref', detail: null };
+    return classifyMalformedRef(ledger, ref, surface);
   }
   const requested = parsed.range;
   const base = ledger.get(parsed.id);
@@ -207,7 +288,7 @@ export function classifyUnresolvedEvidenceRef(
     });
     return {
       kind: 'subrange-out-of-range',
-      detail: `子区间越界: "${ref}" 超出条目 ${view.id} 的行区间 ${formatInterval(view.declared)}。可用区间 ${availability}。子区间坐标: ${EVIDENCE_SUBRANGE_COORDINATE_NOTE}。`,
+      detail: outOfRangeDetail(ref, view, availability),
     };
   }
   logRefClassification({

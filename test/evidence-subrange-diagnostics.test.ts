@@ -120,6 +120,33 @@ async function getError(ledger: EvidenceLedgerStore, ref: string): Promise<strin
   return String(result.error);
 }
 
+async function noteFindingError(ledger: EvidenceLedgerStore, ref: string): Promise<string> {
+  const result = await handleMemory(
+    'note_finding',
+    { finding: 'f', evidenceRefs: [ref] },
+    memoryCtx(ledger)
+  );
+  expect(result.ok).toBe(false);
+  return String(result.error);
+}
+
+function submitError(ledger: EvidenceLedgerStore, ref: string, projectRoot: string): string {
+  const result = expandEvidenceRefsForSubmit(
+    { title: 'T', reasoning: { evidenceRefs: [ref] } },
+    { ledger, projectRoot }
+  );
+  expect(result.ok).toBe(false);
+  return result.ok ? '' : result.error;
+}
+
+/**
+ * C025：文案各自嵌入了不同的 ref，直接比较整串时“各不相同”恒成立（修复前三条都是“无法解析 <ref>”也会通过）。
+ * 先把各自的 ref 换成同一占位符再比较，断言才真正区分失败类别。
+ */
+function stripRef(message: string, ref: string): string {
+  return message.split(ref).join('<ref>');
+}
+
 describe('evidence.get 子区间失败归类', () => {
   test('range 条目误用条目内相对行号：报子区间越界并写明文件行号可用区间', async () => {
     const ledger = seedLedger();
@@ -190,10 +217,17 @@ describe('evidence.get 子区间失败归类', () => {
   test('三种失败文案各不相同，越界与截断尾部两类都带可用区间', async () => {
     const ledger = seedLedger();
     const captured = capturedLineCount(ledger, 'E-3');
+    const tailRef = `E-3@${captured + 1}-${captured + 1}`;
     const outOfRange = await getError(ledger, 'E-2@120-200');
-    const tail = await getError(ledger, `E-3@${captured + 1}-${captured + 1}`);
+    const tail = await getError(ledger, tailRef);
     const unknown = await getError(ledger, 'E-99');
-    expect(new Set([outOfRange, tail, unknown]).size).toBe(3);
+    expect(
+      new Set([
+        stripRef(outOfRange, 'E-2@120-200'),
+        stripRef(tail, tailRef),
+        stripRef(unknown, 'E-99'),
+      ]).size
+    ).toBe(3);
     expect(outOfRange).toContain('可用区间');
     expect(tail).toContain('可用区间');
     expect(unknown).not.toContain('可用区间');
@@ -333,18 +367,10 @@ describe('note_finding 与 knowledge.submit 同类文案', () => {
   test('note_finding：越界、截断尾部、未知 id 三种拒绝文案不同，前两者带可用区间', async () => {
     const ledger = seedLedger();
     const captured = capturedLineCount(ledger, 'E-3');
-    const reject = async (ref: string) => {
-      const result = await handleMemory(
-        'note_finding',
-        { finding: 'f', evidenceRefs: [ref] },
-        memoryCtx(ledger)
-      );
-      expect(result.ok).toBe(false);
-      return String(result.error);
-    };
-    const outOfRange = await reject('E-2@120-200');
-    const tail = await reject(`E-3@${captured + 1}-${captured + 1}`);
-    const unknown = await reject('E-99');
+    const tailRef = `E-3@${captured + 1}-${captured + 1}`;
+    const outOfRange = await noteFindingError(ledger, 'E-2@120-200');
+    const tail = await noteFindingError(ledger, tailRef);
+    const unknown = await noteFindingError(ledger, 'E-99');
     expect(outOfRange).toContain('evidenceRefs');
     expect(outOfRange).toContain('子区间越界');
     expect(outOfRange).toContain('200-450');
@@ -353,7 +379,13 @@ describe('note_finding 与 knowledge.submit 同类文案', () => {
     expect(unknown).toContain('无法解析');
     expect(outOfRange).not.toContain('无法解析');
     expect(tail).not.toContain('无法解析');
-    expect(new Set([outOfRange, tail, unknown]).size).toBe(3);
+    expect(
+      new Set([
+        stripRef(outOfRange, 'E-2@120-200'),
+        stripRef(tail, tailRef),
+        stripRef(unknown, 'E-99'),
+      ]).size
+    ).toBe(3);
   });
 
   test('note_finding 缺 evidenceRefs 的提示写明子区间坐标系', async () => {
@@ -368,17 +400,10 @@ describe('note_finding 与 knowledge.submit 同类文案', () => {
     fs.mkdirSync(path.join(projectRoot, 'lib'), { recursive: true });
     const ledger = seedLedger();
     const captured = capturedLineCount(ledger, 'E-3');
-    const reject = (ref: string) => {
-      const result = expandEvidenceRefsForSubmit(
-        { title: 'T', reasoning: { evidenceRefs: [ref] } },
-        { ledger, projectRoot }
-      );
-      expect(result.ok).toBe(false);
-      return result.ok ? '' : result.error;
-    };
-    const outOfRange = reject('E-2@120-200');
-    const tail = reject(`E-3@${captured + 1}-${captured + 1}`);
-    const unknown = reject('E-99');
+    const tailRef = `E-3@${captured + 1}-${captured + 1}`;
+    const outOfRange = submitError(ledger, 'E-2@120-200', projectRoot);
+    const tail = submitError(ledger, tailRef, projectRoot);
+    const unknown = submitError(ledger, 'E-99', projectRoot);
     expect(outOfRange).toContain('reasoning.evidenceRefs');
     expect(outOfRange).toContain('子区间越界');
     expect(outOfRange).toContain('200-450');
@@ -387,7 +412,119 @@ describe('note_finding 与 knowledge.submit 同类文案', () => {
     expect(unknown).toContain('无法解析');
     expect(outOfRange).not.toContain('无法解析');
     expect(tail).not.toContain('无法解析');
-    expect(new Set([outOfRange, tail, unknown]).size).toBe(3);
+    expect(
+      new Set([
+        stripRef(outOfRange, 'E-2@120-200'),
+        stripRef(tail, tailRef),
+        stripRef(unknown, 'E-99'),
+      ]).size
+    ).toBe(3);
+  });
+});
+
+/**
+ * C059：基础 id 存在、但子区间被 Core parseEvidenceRef 判为非法（起点 0、起止颠倒、单个行号、含空格）时，
+ * 三个入口不能再报“无法解析 / 不在证据台账”——那会让模型以为证据 id 无效而放弃（I21 原症状）。
+ * 起点 0 在两种坐标系下都落在行区间之外，按子区间越界报；其余是语法错误，单独一类文案；
+ * 两类都附可用区间。基础 id 不存在时仍走“无法解析”。
+ */
+describe('基础 id 存在但子区间语法非法', () => {
+  async function surfaceErrors(
+    ledger: EvidenceLedgerStore,
+    ref: string
+  ): Promise<{ get: string; note: string; submit: string }> {
+    const projectRoot = createTempProject('evidence-subrange-malformed-');
+    return {
+      get: await getError(ledger, ref),
+      note: await noteFindingError(ledger, ref),
+      submit: submitError(ledger, ref, projectRoot),
+    };
+  }
+
+  test.each([
+    ['E-2@0-5', '200-450', '文件行号'],
+    ['E-2@0-300', '200-450', '文件行号'],
+    ['E-1@0-2', '1-3', '条目内 1 起行号'],
+  ])('起点为 0 的 %s：三个入口都报子区间越界并写明可用区间 %s', async (ref, interval, coordinate) => {
+    const ledger = seedLedger();
+    const errors = await surfaceErrors(ledger, ref);
+    for (const error of [errors.get, errors.note, errors.submit]) {
+      expect(error).toContain('子区间越界');
+      expect(error).toContain(`"${ref}"`);
+      expect(error).toContain(`可用区间 ${interval}`);
+      expect(error).toContain(coordinate);
+      expect(error).toContain('行号从 1 起');
+      expect(error).not.toContain('无法解析');
+      expect(error).not.toContain('不在证据台账');
+    }
+    expect(errors.note).toContain('evidenceRefs');
+    expect(errors.submit).toContain('reasoning.evidenceRefs');
+  });
+
+  test.each([
+    ['E-2@450-200'],
+    ['E-2@201-200'],
+    ['E-2@210'],
+    ['E-2@ 200-210'],
+  ])('语法非法的 %s：三个入口都报子区间语法错误并附可用区间', async (ref) => {
+    const ledger = seedLedger();
+    const errors = await surfaceErrors(ledger, ref);
+    for (const error of [errors.get, errors.note, errors.submit]) {
+      expect(error).toContain('子区间语法错误');
+      expect(error).toContain('E-2@start-end');
+      expect(error).toContain('1≤start≤end');
+      expect(error).toContain('可用区间 200-450');
+      expect(error).not.toContain('无法解析');
+      expect(error).not.toContain('不在证据台账');
+      expect(error).not.toContain('子区间越界');
+    }
+  });
+
+  test('对照：基础 id 不存在的 E-9@1-2 与 E-9@0-5 仍报无法解析', async () => {
+    const ledger = seedLedger();
+    for (const ref of ['E-9@1-2', 'E-9@0-5', 'E-9@5-1']) {
+      const errors = await surfaceErrors(ledger, ref);
+      for (const error of [errors.get, errors.note, errors.submit]) {
+        expect(error).toContain('无法解析');
+        expect(error).not.toContain('子区间越界');
+        expect(error).not.toContain('子区间语法错误');
+      }
+      expect(errors.note).toContain('不在证据台账');
+    }
+  });
+
+  test('越界、语法错误、未知 id 文案在去掉 ref 后仍各不相同', async () => {
+    const ledger = seedLedger();
+    const startZero = await getError(ledger, 'E-2@0-5');
+    const reversed = await getError(ledger, 'E-2@450-200');
+    const unknown = await getError(ledger, 'E-9@0-5');
+    expect(
+      new Set([
+        stripRef(startZero, 'E-2@0-5'),
+        stripRef(reversed, 'E-2@450-200'),
+        stripRef(unknown, 'E-9@0-5'),
+      ]).size
+    ).toBe(3);
+  });
+
+  test('非法子区间的归类输出诊断日志（reason 区分起点 0 与语法错误）', async () => {
+    const ledger = seedLedger();
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    await getError(ledger, 'E-2@0-5');
+    await getError(ledger, 'E-2@450-200');
+    await getError(ledger, 'E-2@210');
+    await getError(ledger, 'E-9@0-5');
+    const messages = info.mock.calls.map((call) => String(call[0]));
+    const lineFor = (ref: string) =>
+      messages.find((message) => message.includes(`ref=${JSON.stringify(ref)}`));
+    expect(lineFor('E-2@0-5')).toContain('kind=subrange-out-of-range');
+    expect(lineFor('E-2@0-5')).toContain('reason=malformed-subrange-start-zero');
+    expect(lineFor('E-2@0-5')).toContain('declared=200-450');
+    expect(lineFor('E-2@450-200')).toContain('kind=subrange-malformed');
+    expect(lineFor('E-2@450-200')).toContain('reason=malformed-subrange-reversed');
+    expect(lineFor('E-2@210')).toContain('reason=malformed-subrange-single-line');
+    expect(lineFor('E-9@0-5')).toContain('kind=unknown-ref');
+    expect(lineFor('E-9@0-5')).toContain('reason=id-not-in-ledger');
   });
 });
 
