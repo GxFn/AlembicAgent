@@ -28,6 +28,12 @@ export interface RunScanAgentTaskOptions extends SystemTaskRunSignals {
   lang?: string | null;
   comprehensive?: boolean;
   source?: AgentRunSource;
+  /**
+   * 未持久化回退告警（L8-C08 方案 a）：扫描没有拿到 knowledge.submit 的 created 回执、
+   * 只能返回任务 fallback 时（0 次 submit、submit 被拒或失败，含中止/超时），以一个 Error 通知一次，
+   * message 含 label、task、runStatus、persistenceOutcome，不含 provider 回复正文；
+   * 有 created 回执时不调用。回调抛错只被隔离，不会让扫描 reject。
+   */
   onParseError?: (err: unknown) => void;
 }
 
@@ -105,10 +111,14 @@ export function toScanFileCache(files?: ScanAgentFileInput[] | null): FileCacheE
   }
   return files.map((file, index) => {
     const name = file.name || file.relativePath || `file-${index + 1}`;
+    // per-file language 透传给预加载文件清单（L8-C08）。宿主是 JS 调用方，先按字符串归一化；
+    // 未声明、非字符串或空白时不写该键，保持与旧版相同的条目形状。
+    const language = typeof file.language === 'string' ? file.language.trim() : '';
     return {
       relativePath: file.relativePath || name,
       name,
       content: file.content || '',
+      ...(language ? { language } : {}),
     };
   });
 }

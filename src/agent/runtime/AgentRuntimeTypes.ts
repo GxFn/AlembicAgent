@@ -197,6 +197,11 @@ export interface FileCacheEntry {
   relativePath: string;
   content?: string;
   name?: string;
+  /**
+   * 宿主声明的文件语言（如 /summarize 的 files[].language）。可选：缺省时不写入该键；
+   * SystemPromptBuilder 渲染预加载文件清单时会把它附在行数后面，模型不必从文件名猜语言。
+   */
+  language?: string;
 }
 
 /**
