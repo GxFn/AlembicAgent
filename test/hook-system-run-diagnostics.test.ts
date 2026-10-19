@@ -136,6 +136,45 @@ describe('hook handler failures reach the run AgentDiagnostics', () => {
     expect(warnings.every((warning) => warning.tool === undefined)).toBe(true);
   });
 
+  it('records llm:call:after, both agent:iteration:after branches and agent:finalize through runtime wiring', async () => {
+    vi.spyOn(Logger, 'warn').mockImplementation(() => {});
+    const { runtime, execute } = toolRuntime();
+    // 夹具第一轮返回工具调用、第二轮返回纯文本，因此两处 agent:iteration:after 分支
+    // （工具轮 / 纯文本轮）与两次 llm:call:after 都会经过 AgentRuntime 的真实分发点。
+    // 钩子按 payload 抛出不同文案，用来区分每条 warning 来自哪一个分发点：
+    // 任何一处分发漏传本 loop 的 diagnostics sink，对应 warning 就会缺失。
+    runtime.hookSystem.on('llm:call:after', (payload) => {
+      throw new Error(`llm after observer failed (toolCalls=${payload.hasToolCalls})`);
+    });
+    runtime.hookSystem.on('agent:iteration:after', (payload) => {
+      throw new Error(
+        payload.hadToolCalls
+          ? 'iteration after observer failed on tool branch'
+          : 'iteration after observer failed on text branch'
+      );
+    });
+    runtime.hookSystem.on('agent:finalize', () => {
+      throw new Error('finalize observer failed');
+    });
+
+    const result = await runtime.reactLoop('fixture', {
+      budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
+    });
+
+    // 观察钩子失败只隔离不阻断：工具照常执行，最终回复不变。
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.reply).toBe('done');
+    const warnings = hookWarnings(result.diagnostics?.warnings);
+    expect(warnings.map((warning) => warning.message)).toEqual([
+      expect.stringMatching(/llm:call:after.*toolCalls=true/),
+      expect.stringMatching(/agent:iteration:after.*on tool branch/),
+      expect.stringMatching(/llm:call:after.*toolCalls=false/),
+      expect.stringMatching(/agent:iteration:after.*on text branch/),
+      expect.stringMatching(/agent:finalize.*finalize observer failed/),
+    ]);
+    expect(warnings.every((warning) => warning.tool === undefined)).toBe(true);
+  });
+
   it('keeps a healthy run free of hook_handler_failed warnings', async () => {
     const { runtime } = toolRuntime();
     runtime.hookSystem.on('tool:execute:before', () => true);
