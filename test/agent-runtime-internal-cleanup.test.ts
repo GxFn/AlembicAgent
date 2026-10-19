@@ -2,6 +2,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
+import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as loopLedger from '../src/agent/evidence/loopLedger.js';
 import {
@@ -10,6 +11,7 @@ import {
   HookSystem,
   type RuntimeConfig,
 } from '../src/agent/runtime/index.js';
+import { ContextWindowAdapter, SimpleArrayAdapter } from '../src/agent/runtime/MessageAdapter.js';
 import * as strategiesBarrel from '../src/agent/strategies/index.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { AiProvider } from '../src/ai/AiProvider.js';
@@ -25,6 +27,10 @@ import { Capability } from '../src/tools/runtime/toolsets/Capability.js';
  * 证据台账回退 jobId 用 `run-${Date.now()}`，同毫秒构建的两个 runtime 会写进同一目录；
  * hookSystem 通过未声明字段强转读取；strategies barrel 残留无人默认导入的默认导出对象；
  * PipelineRuntime.logger 无读取者；'off' | 'guard' 在多处重写而已有 GroundingEnforcement。
+ *
+ * L5-P2r3 补修：回退 jobId 在宿主固定公开 RuntimeConfig.id 时也必须按实例唯一（C056）；
+ * Capability 公开基类与生命周期文档要写明步骤钩子不由运行循环驱动（C024）；
+ * 守护用例的断言与标题一致，源码守护按 TypeScript 语法树判断而不是按文本正则（C057）。
  */
 
 // 只包一层 spy 记录 AgentRuntime 交给台账打开器的回退 jobId，真实打开逻辑保持接线。
@@ -45,6 +51,69 @@ function walkSource(dir: string, acc: string[] = []): string[] {
     }
   }
   return acc;
+}
+
+/**
+ * 统计源码里“恰好重写了 GroundingEnforcement 字面量联合”的类型节点数。
+ *
+ * 按 TypeScript 语法树判断而不是文本正则：注释、字符串和更大的无关联合（如 'off' | 'guard' | 'strict'）
+ * 都不算；别名、属性、参数里的二元联合都算，额外的 undefined / null 成员也视为同一重写。
+ */
+function countGroundingLiteralUnions(fileName: string, text: string): number {
+  // 廉价预筛：两个字面量都不出现的文件不可能命中，省去解析整个 src 的开销。
+  if (!text.includes('off') || !text.includes('guard')) {
+    return 0;
+  }
+  const sourceFile = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true);
+  let count = 0;
+  const visit = (node: ts.Node): void => {
+    if (ts.isUnionTypeNode(node)) {
+      const literals = new Set<string>();
+      let onlyLiteralsAndNullish = true;
+      for (const member of node.types) {
+        if (ts.isLiteralTypeNode(member) && ts.isStringLiteral(member.literal)) {
+          literals.add(member.literal.text);
+        } else if (
+          member.kind !== ts.SyntaxKind.UndefinedKeyword &&
+          !(ts.isLiteralTypeNode(member) && member.literal.kind === ts.SyntaxKind.NullKeyword)
+        ) {
+          onlyLiteralsAndNullish = false;
+        }
+      }
+      if (
+        onlyLiteralsAndNullish &&
+        literals.size === 2 &&
+        literals.has('off') &&
+        literals.has('guard')
+      ) {
+        count += 1;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return count;
+}
+
+/**
+ * PipelineRuntime 接口是否声明了 logger 成员。按语法树读成员名：readonly、可选、方法写法都算，
+ * 注释和其他接口里的同名成员不算。
+ */
+function pipelineRuntimeDeclaresLogger(text: string): boolean {
+  const sourceFile = ts.createSourceFile('contracts.ts', text, ts.ScriptTarget.Latest, true);
+  const runtimeInterface = sourceFile.statements.find(
+    (statement): statement is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(statement) && statement.name.text === 'PipelineRuntime'
+  );
+  if (!runtimeInterface) {
+    throw new Error('PipelineRuntime interface not found');
+  }
+  return runtimeInterface.members.some(
+    (member) =>
+      member.name !== undefined &&
+      (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) &&
+      member.name.text === 'logger'
+  );
 }
 
 function minimalRuntimeConfig(overrides: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -134,15 +203,75 @@ describe('agent runtime evidence ledger fallback job id', () => {
       const jobIds = vi
         .mocked(loopLedger.openLoopEvidence)
         .mock.calls.map(([options]) => options.defaultJobId);
-      expect(jobIds).toEqual([`run-${first.id}`, `run-${second.id}`]);
+      expect(jobIds).toHaveLength(2);
+      // 回退 jobId 以 runtime id 为前缀（日志可定位），后缀是按实例生成的随机片段。
+      expect(jobIds[0]?.startsWith(`run-${first.id}-`)).toBe(true);
+      expect(jobIds[1]?.startsWith(`run-${second.id}-`)).toBe(true);
       expect(new Set(jobIds).size).toBe(2);
       // 回退路径必须可定位：日志写明回退 jobId、runtime 与维度。
       const fallbackLogs = info.mock.calls
         .map((call) => call.map((part) => JSON.stringify(part)).join(' '))
         .filter((line) => line.includes('runtime-scoped fallback job id'));
       expect(fallbackLogs).toHaveLength(2);
-      expect(fallbackLogs[0]).toContain(`run-${first.id}`);
+      expect(fallbackLogs[0]).toContain(String(jobIds[0]));
       expect(fallbackLogs[0]).toContain('fallback-dimension');
+    } finally {
+      rmSync(dataRoot, { force: true, recursive: true });
+    }
+  });
+
+  it('gives each runtime its own fallback ledger even when the host passes the same stable id', async () => {
+    const dataRoot = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-stable-id-'));
+    try {
+      const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+      // 公开 RuntimeConfig.id 允许宿主传固定值；只传 id、不传 jobId 与 _bootstrapSessionId 时，
+      // 两次独立运行既不能落进同一台账目录，也不能 hydrate 上一次运行写下的证据。
+      const first = new AgentRuntime(minimalRuntimeConfig({ dataRoot, id: 'host-agent' }));
+      await first.reactLoop('open ledger', {
+        source: 'system',
+        sharedState: { _dimensionMeta: { id: 'dim-a' } },
+        budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+      });
+      const firstStore = vi.mocked(loopLedger.openLoopEvidence).mock.results[0]?.value as
+        | ReturnType<typeof loopLedger.openLoopEvidence>
+        | undefined;
+      expect(firstStore).toBeTruthy();
+      firstStore?.append({
+        tool: 'code.read',
+        callId: 'c1',
+        file: 'a.ts',
+        content: 'export const a = 1;',
+      });
+      expect(firstStore?.stats().entries).toBe(1);
+
+      const second = new AgentRuntime(minimalRuntimeConfig({ dataRoot, id: 'host-agent' }));
+      await second.reactLoop('open ledger', {
+        source: 'system',
+        sharedState: { _dimensionMeta: { id: 'dim-a' } },
+        budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+      });
+      const secondStore = vi.mocked(loopLedger.openLoopEvidence).mock.results[1]?.value as
+        | ReturnType<typeof loopLedger.openLoopEvidence>
+        | undefined;
+
+      const jobIds = vi
+        .mocked(loopLedger.openLoopEvidence)
+        .mock.calls.map(([options]) => options.defaultJobId);
+      expect(first.id).toBe('host-agent');
+      expect(second.id).toBe('host-agent');
+      // 关键断言在前：第二次运行看不到第一次运行的证据，且台账目录不同。
+      expect(secondStore?.stats().entries).toBe(0);
+      expect(secondStore?.filePath).not.toBe(firstStore?.filePath);
+      expect(jobIds[0]).not.toBe(jobIds[1]);
+      expect(jobIds[0]?.startsWith('run-host-agent-')).toBe(true);
+      expect(jobIds[1]?.startsWith('run-host-agent-')).toBe(true);
+      // 两次回退各记一次日志，分别写明自己的回退 jobId。
+      const fallbackLogs = info.mock.calls
+        .map((call) => call.map((part) => JSON.stringify(part)).join(' '))
+        .filter((line) => line.includes('runtime-scoped fallback job id'));
+      expect(fallbackLogs).toHaveLength(2);
+      expect(fallbackLogs[1]).toContain(String(jobIds[1]));
+      expect(fallbackLogs[1]).toContain('host-agent');
     } finally {
       rmSync(dataRoot, { force: true, recursive: true });
     }
@@ -172,31 +301,58 @@ describe('agent runtime evidence ledger fallback job id', () => {
   });
 });
 
+/** 一次真实工具轮（meta 工具）后以文本收尾的 runtime 夹具；capabilities 由用例决定。 */
+function buildToolRoundRuntime(capabilities: Capability[]) {
+  const catalog = new RuntimeCapabilityCatalog();
+  const execute = vi.fn(async (): Promise<ToolResultEnvelope> => successEnvelope());
+  const provider = new AiProvider({ model: 'fixture' });
+  vi.spyOn(provider, 'chatWithTools')
+    .mockResolvedValueOnce({
+      text: null,
+      functionCalls: [{ id: 'call', name: 'meta', args: { action: 'tools', params: {} } }],
+    })
+    .mockResolvedValue({ text: 'done', functionCalls: [] });
+  const runtime = new AgentRuntime({
+    aiProvider: provider,
+    toolRegistry: new UnifiedToolCatalog(),
+    container: { get: () => catalog },
+    additionalTools: ['meta'],
+    capabilities,
+    toolRouter: {
+      execute,
+      executeChildCall: execute,
+      explain: async () => ({ allowed: true, stage: 'execute' }),
+    },
+    strategy: new SingleStrategy(),
+  });
+  return { runtime, execute };
+}
+
+/** 读取类成员上方 JSDoc 的原文；没有 JSDoc 时返回空串。 */
+function memberJsDoc(sourceFile: ts.SourceFile, className: string, memberName: string): string {
+  const owner = sourceFile.statements.find(
+    (statement): statement is ts.ClassDeclaration =>
+      ts.isClassDeclaration(statement) && statement.name?.text === className
+  );
+  const member = owner?.members.find(
+    (candidate) =>
+      ts.isMethodDeclaration(candidate) &&
+      ts.isIdentifier(candidate.name) &&
+      candidate.name.text === memberName
+  );
+  if (!member) {
+    throw new Error(`${className}.${memberName} not found`);
+  }
+  return ts
+    .getJSDocCommentsAndTags(member)
+    .map((node) => node.getText(sourceFile))
+    .join('\n');
+}
+
 describe('agent runtime capability step hooks', () => {
-  it('does not drive the empty Capability step hooks or copy history for them across a tool round', async () => {
-    const catalog = new RuntimeCapabilityCatalog();
-    const execute = vi.fn(async (): Promise<ToolResultEnvelope> => successEnvelope());
-    const provider = new AiProvider({ model: 'fixture' });
-    vi.spyOn(provider, 'chatWithTools')
-      .mockResolvedValueOnce({
-        text: null,
-        functionCalls: [{ id: 'call', name: 'meta', args: { action: 'tools', params: {} } }],
-      })
-      .mockResolvedValue({ text: 'done', functionCalls: [] });
+  it('does not drive the empty Capability step hooks across a tool round', async () => {
     const probe = new StepHookProbe();
-    const runtime = new AgentRuntime({
-      aiProvider: provider,
-      toolRegistry: new UnifiedToolCatalog(),
-      container: { get: () => catalog },
-      additionalTools: ['meta'],
-      capabilities: [probe],
-      toolRouter: {
-        execute,
-        executeChildCall: execute,
-        explain: async () => ({ allowed: true, stage: 'execute' }),
-      },
-      strategy: new SingleStrategy(),
-    });
+    const { runtime, execute } = buildToolRoundRuntime([probe]);
 
     const result = await runtime.reactLoop('fixture', {
       budgetOverride: { maxIterations: 3, timeoutMs: 1_000 },
@@ -207,6 +363,62 @@ describe('agent runtime capability step hooks', () => {
     expect(result.reply).toBe('done');
     expect(probe.before).not.toHaveBeenCalled();
     expect(probe.after).not.toHaveBeenCalled();
+  });
+
+  it('does not copy message history per capability across a tool round', async () => {
+    // 旧实现每轮为每个能力调用 ctx.messages.toMessages() 复制整份历史。对照同一夹具在
+    // capabilities=[] 与 [probe] 下的历史快照次数：只要按能力复制历史（即使不再调用钩子），两者就不相等。
+    const countHistoryCopies = async (capabilities: Capability[]) => {
+      const simple = vi.spyOn(SimpleArrayAdapter.prototype, 'toMessages');
+      const windowed = vi.spyOn(ContextWindowAdapter.prototype, 'toMessages');
+      try {
+        const { runtime, execute } = buildToolRoundRuntime(capabilities);
+        const result = await runtime.reactLoop('fixture', {
+          budgetOverride: { maxIterations: 3, timeoutMs: 1_000 },
+        });
+        expect(execute).toHaveBeenCalledOnce();
+        expect(result.reply).toBe('done');
+        return simple.mock.calls.length + windowed.mock.calls.length;
+      } finally {
+        simple.mockRestore();
+        windowed.mockRestore();
+      }
+    };
+
+    const baseline = await countHistoryCopies([]);
+    const withProbes = await countHistoryCopies([new StepHookProbe(), new StepHookProbe()]);
+
+    // baseline > 0 证明 spy 挂在本次运行实际使用的消息适配器上，而不是空转。
+    expect(baseline).toBeGreaterThan(0);
+    expect(withProbes).toBe(baseline);
+  });
+
+  it('documents on the public Capability base class that the run loop never calls the step hooks', () => {
+    const file = path.join(srcRoot, 'tools', 'runtime', 'toolsets', 'Capability.ts');
+    const sourceFile = ts.createSourceFile(
+      file,
+      readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true
+    );
+    for (const hook of ['onBeforeStep', 'onAfterStep']) {
+      const doc = memberJsDoc(sourceFile, 'Capability', hook);
+      // Capability 是公开导出：覆盖钩子的宿主子类必须能从基类契约上看到“不会被调用”，并拿到替代入口。
+      expect({ hook, notCalled: doc.includes('运行循环不调用此钩子') }).toEqual({
+        hook,
+        notCalled: true,
+      });
+      expect({ hook, replacement: doc.includes('agent:iteration:') }).toEqual({
+        hook,
+        replacement: true,
+      });
+    }
+  });
+
+  it('does not describe the step hooks as driven by the run loop in the lifecycle docs', () => {
+    const doc = readFileSync(path.join(process.cwd(), 'docs', 'execution-lifecycle.md'), 'utf8');
+    expect(doc).not.toContain('Capability `onAfterStep` 前关闭');
+    expect(doc).toContain('步骤钩子不由运行循环驱动');
   });
 });
 
@@ -240,18 +452,53 @@ describe('agent strategy and contract hygiene', () => {
       path.join(srcRoot, 'agent', 'strategies', 'pipeline', 'contracts.ts'),
       'utf8'
     );
-    const runtimeInterface = contracts.match(/export interface PipelineRuntime \{[\s\S]*?\n\}/u);
-    expect(runtimeInterface?.[0]).toBeTruthy();
-    expect(runtimeInterface?.[0]).not.toMatch(/^\s*logger\??:/mu);
+    expect(pipelineRuntimeDeclaresLogger(contracts)).toBe(false);
+  });
+
+  it('detects a logger member on PipelineRuntime in any declaration form', () => {
+    // 守护的判定本身也要可信：readonly、可选与方法写法都算声明；同名注释或其他接口不算。
+    const cases: Array<[string, boolean]> = [
+      ['export interface PipelineRuntime {\n  id: string;\n  logger?: unknown;\n}\n', true],
+      [
+        'export interface PipelineRuntime {\n  id: string;\n  readonly logger?: unknown;\n}\n',
+        true,
+      ],
+      ['export interface PipelineRuntime {\n  id: string;\n  logger(): void;\n}\n', true],
+      [
+        'export interface PipelineRuntime {\n  id: string;\n  // logger: removed\n}\nexport interface Other {\n  logger: unknown;\n}\n',
+        false,
+      ],
+    ];
+    for (const [text, declared] of cases) {
+      expect({ text, declared: pipelineRuntimeDeclaresLogger(text) }).toEqual({ text, declared });
+    }
   });
 
   it('declares the grounding enforcement literal union only once', () => {
     const declarations = walkSource(srcRoot)
-      .filter((filePath) =>
-        /'off'\s*\|\s*'guard'|'guard'\s*\|\s*'off'/u.test(readFileSync(filePath, 'utf8'))
-      )
-      .map((filePath) => path.relative(process.cwd(), filePath).split(path.sep).join('/'));
+      .map((filePath) => ({
+        file: path.relative(process.cwd(), filePath).split(path.sep).join('/'),
+        count: countGroundingLiteralUnions(filePath, readFileSync(filePath, 'utf8')),
+      }))
+      .filter(({ count }) => count > 0);
 
-    expect(declarations).toEqual(['src/agent/runtime/AgentRuntimeTypes.ts']);
+    expect(declarations).toEqual([{ file: 'src/agent/runtime/AgentRuntimeTypes.ts', count: 1 }]);
+  });
+
+  it('counts only exact off/guard literal unions as grounding enforcement re-declarations', () => {
+    // 更大的无关联合、注释与字符串里的同样字面量不算重写；属性、参数、别名里的二元联合都算。
+    const cases: Array<[string, number]> = [
+      ["export type UnrelatedMode = 'off' | 'guard' | 'strict';\n", 0],
+      ["// mode: 'off' | 'guard'\n/** 'guard' | 'off' */\nconst note = \"'off' | 'guard'\";\n", 0],
+      ["type X = 'guard' | 'off';\n", 1],
+      ["interface Y {\n  groundingEnforcement?: 'off' | 'guard';\n}\n", 1],
+      ["function f(mode: 'off' | 'guard' | undefined) {\n  return mode;\n}\n", 1],
+    ];
+    for (const [text, count] of cases) {
+      expect({ text, count: countGroundingLiteralUnions('fixture.ts', text) }).toEqual({
+        text,
+        count,
+      });
+    }
   });
 });

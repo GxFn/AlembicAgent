@@ -29,7 +29,7 @@ EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和�
 
 诊断计数只接受有限非负数，非法输入或累加溢出产生 `diagnostics_invalid_count`，保留合法字段与已有总量。合并聚合计数不按数值大小循环。诊断快照复制公开条目，宿主修改快照不会反写收集器。
 
-每个已开始的 trace 轮次关闭一次。正常工具轮仍在 Capability `onAfterStep` 前关闭，文本分支保留原时序；提前退出、空响应重试与异常由循环 `finally` 补关。补关失败只做观察诊断，不掩盖原错误；异常路径不推进 Tracker、不补发成功 Hook，也不调用最终摘要。
+每个已开始的 trace 轮次关闭一次。正常工具轮在本轮工具回执处理完、步骤摘要交给运行时状态机之前关闭，文本分支保留原时序；提前退出、空响应重试与异常由循环 `finally` 补关。补关失败只做观察诊断，不掩盖原错误；异常路径不推进 Tracker、不补发成功 Hook，也不调用最终摘要。Capability 的 `onBeforeStep` / `onAfterStep` 步骤钩子不由运行循环驱动，子类覆盖不会生效；宿主需要逐轮观察时订阅 `agent:iteration:before` / `agent:iteration:after` Hook。
 
 无 Tracker 的循环同样执行 `maxIterations`；模型反复返回被禁止的工具调用，也不能绕过轮数上限。真实取消和期限优先于轮数耗尽。空响应和服务错误的重试等待响应同一 `AbortSignal`。
 

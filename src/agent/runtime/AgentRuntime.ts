@@ -213,7 +213,7 @@ export class AgentRuntime {
   logger: Pick<Console, 'info' | 'warn'>;
   #projectRoot;
   #dataRoot;
-  /** 证据台账目录键（Wave A E2）：宿主 jobId 或按实例生成的稳定回退 `run-<runtime id>`；同实例多次 reactLoop 共享 */
+  /** 证据台账目录键（Wave A E2）：宿主 jobId 或按实例生成的回退 `run-<runtime id>-<随机片段>`；同实例多次 reactLoop 共享 */
   #evidenceJobId: string;
   /** 证据台账目录键是否来自 runtime 回退（宿主未传 jobId）；只用于回退路径诊断。 */
   #evidenceJobIdIsFallback: boolean;
@@ -276,11 +276,13 @@ export class AgentRuntime {
     this.bus = AgentEventBus.getInstance();
     this.#projectRoot = config.projectRoot || process.cwd();
     this.#dataRoot = config.dataRoot || this.#projectRoot;
-    // 回退 jobId 绑定 runtime 实例 id（默认含随机 UUID 片段），而不是毫秒时间戳：
-    // 同一毫秒并发构建的两个 runtime 不会落进同一个 <dataRoot>/.asd/evidence-ledger/<jobId>/ 目录；
-    // 同一实例多次 reactLoop 仍共享同一回退目录。宿主 jobId 与 sharedState._bootstrapSessionId 优先。
+    // 回退 jobId 按 runtime 实例生成：`run-<runtime id>-<构造时随机 UUID 片段>`，而不是毫秒时间戳。
+    // 随机片段与 config.id 无关——宿主经公开 RuntimeConfig.id 传入固定 id 时，不同实例（跨进程、跨时间）
+    // 也不会落进同一个 <dataRoot>/.asd/evidence-ledger/<jobId>/ 目录、hydrate 上一次运行的证据；
+    // 保留 runtime id 前缀让回退日志仍可定位。同一实例多次 reactLoop 仍共享同一回退目录。
+    // 宿主 jobId 与 sharedState._bootstrapSessionId 优先，不走回退。
     this.#evidenceJobIdIsFallback = !config.jobId;
-    this.#evidenceJobId = config.jobId || `run-${this.id}`;
+    this.#evidenceJobId = config.jobId || `run-${this.id}-${randomUUID().slice(0, 8)}`;
     this.#additionalTools = config.additionalTools || [];
     this.#modelRef =
       config.modelRef ||

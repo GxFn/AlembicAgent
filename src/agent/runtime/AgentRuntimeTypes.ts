@@ -229,7 +229,11 @@ export interface RuntimeConfig {
   lang?: string | null;
   projectRoot?: string;
   dataRoot?: string;
-  /** 证据台账目录键（Wave A E2）：<dataRoot>/.asd/evidence-ledger/<jobId>/；宿主传 bootstrap jobId，缺省按 runtime 实例生成稳定回退 id（`run-<runtime id>`） */
+  /**
+   * 证据台账目录键（Wave A E2）：<dataRoot>/.asd/evidence-ledger/<jobId>/；宿主传 bootstrap jobId。
+   * 缺省时按 runtime 实例生成回退 id（`run-<runtime id>-<随机片段>`）：即使宿主传入固定 `id`，
+   * 不同实例也各用一个目录、互不 hydrate；跨实例共享台账必须显式传同一个 jobId。
+   */
   jobId?: string;
   additionalTools?: string[];
   /** 模型引用 (provider:model)，用于日志 / trace / 工具裁剪；不设则从 aiProvider 推导 */
