@@ -1,6 +1,6 @@
 import { SCAN_TASK_CONFIGS } from '../../prompts/scanPrompts.js';
 import type { FileCacheEntry } from '../../runtime/AgentRuntimeTypes.js';
-import type { AgentRunInput, AgentRunSource } from '../../service/AgentRunContracts.js';
+import type { AgentRunSource } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import type { SystemRunContextFactory } from '../../service/SystemRunContextFactory.js';
 import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
@@ -80,10 +80,11 @@ export async function runScanAgentTask({
         runtimeSource: 'system',
         lang: lang || null,
         fileCache,
-        systemRunContext:
-          systemCtx.systemRunContext as AgentRunInput['context']['systemRunContext'],
+        // createSystemContext 返回 SystemRunContextProjection：systemRunContext 与 scopeId 带具体类型，
+        // 字段改名或不再写入时这里直接编译失败，而不是把 undefined 传进运行上下文丢失维度 scope。
+        systemRunContext: systemCtx.systemRunContext,
         strategyContext: systemCtx,
-        promptContext: { dimensionScopeId: systemCtx.scopeId as string },
+        promptContext: { dimensionScopeId: systemCtx.scopeId },
       },
       signals: { abortSignal, shouldAbort, timeoutMs },
     })

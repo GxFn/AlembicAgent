@@ -9,6 +9,7 @@ import {
 } from '../profiles/AgentProfileCompiler.js';
 import { getPreset } from '../profiles/presets/index.js';
 import { AgentRuntime } from '../runtime/AgentRuntime.js';
+import type { RuntimeConfig } from '../runtime/AgentRuntimeTypes.js';
 import type { Strategy } from '../strategies/index.js';
 import type {
   AgentProfileOverride,
@@ -21,6 +22,13 @@ import type {
 interface ToolRegistryLike {
   getRouter?(): ToolRouterContract | null;
 }
+
+/**
+ * AgentRuntime 构造契约里 aiProvider / toolRegistry 的类型，直接取自 RuntimeConfig，与运行时契约同源：
+ * RuntimeConfig 改动时这里跟着变，不再像 `as never` 那样可以冒充任意目标类型。
+ */
+type RuntimeAiProvider = RuntimeConfig['aiProvider'];
+type RuntimeToolRegistry = RuntimeConfig['toolRegistry'];
 
 interface AgentRuntimeBuilderOptions {
   container: Record<string, unknown>;
@@ -103,10 +111,17 @@ export class AgentRuntimeBuilder {
       () => this.#logger.debug('[AgentRuntimeBuilder] building runtime', { presetName }),
       () => undefined
     );
+    // 宿主注入边界：builder 的公开选项按宿主 DI 实际注入的形状声明（aiProvider 为 unknown，宿主传
+    // `singletons.aiProvider || null`；toolRegistry 只要求可选 getRouter），而 RuntimeConfig 要求完整的
+    // AiProvider / UnifiedToolCatalog 类类型。AgentRuntime 构造期只读 aiProvider.name/model（推导 modelRef）
+    // 与 toolRegistry.getRouter?.()，运行期再调 aiProvider.chatWithTools 等方法。把 builder 选项或
+    // RuntimeConfig 收窄成结构类型都会改变公开类型（宿主与测试按部分形状注入），属于公开面收窄，不在本处做；
+    // 这里也不加运行时校验，避免改变既有错误行为。因此保留这一处静态断言，但目标类型对齐 RuntimeConfig：
+    // toolRegistry 的断言仍受 ToolRegistryLike 与 UnifiedToolCatalog 的可比性检查约束。
     return new AgentRuntime({
       presetName,
-      aiProvider: this.#aiProvider as never,
-      toolRegistry: this.#toolRegistry as never,
+      aiProvider: this.#aiProvider as RuntimeAiProvider,
+      toolRegistry: this.#toolRegistry as RuntimeToolRegistry,
       toolRouter:
         (this.#toolRouter as ToolRouterContract) || this.#toolRegistry.getRouter?.() || null,
       container: this.#container,
@@ -124,7 +139,8 @@ export class AgentRuntimeBuilder {
     });
   }
 
-  // 能力实例跨运行复用，这里只传与运行无关的配置；记忆协调器按每次运行经上下文进入循环。
+  // 每次 build 都经 CapabilityRegistry.create 新建全部 capability 实例，不跨运行复用；这里只注入与运行
+  // 无关的构造配置，per-run 状态（如记忆协调器）经运行上下文进入循环，不要把 per-run 缓存放进 capability。
   // soulPath 只有 Conversation 消费，其他能力忽略该键；为 null 时 Conversation 走默认路径并留诊断。
   #getCapabilityOpts() {
     return {

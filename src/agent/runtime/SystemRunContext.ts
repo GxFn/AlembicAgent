@@ -42,6 +42,16 @@ export interface SystemRunContext extends Record<string, unknown> {
   pipelineType?: PipelineType;
 }
 
+/**
+ * projectSystemRunContext 的返回形状：SystemRunContext 的全部字段展平在顶层，另带指回原上下文的
+ * systemRunContext。调用方（如 ScanAgentRun）据此直接读取 systemRunContext / scopeId，不再强转；
+ * 字段改名时编译器能在调用方报错。仍继承 Record<string, unknown> 索引签名，可整体作为
+ * strategyContext 传递。只描述既有运行时投影，不新增字段；runtime 公开入口不导出本类型名。
+ */
+export interface SystemRunContextProjection extends SystemRunContext {
+  systemRunContext: SystemRunContext;
+}
+
 export interface BuildSystemRunContextOptions {
   memoryCoordinator: MemoryCoordinator;
   scopeId: string;
@@ -123,7 +133,10 @@ export function isSystemRunContext(value: unknown): value is SystemRunContext {
   );
 }
 
-export function projectSystemRunContext(context: SystemRunContext): Record<string, unknown> {
+export function projectSystemRunContext(context: SystemRunContext): SystemRunContextProjection {
+  // stripUndefined 只剔除值为 undefined 的键：这里的必填字段（scopeId/trace/activeContext/
+  // memoryCoordinator/sharedState/source/systemRunContext）都来自已构造的 SystemRunContext，
+  // 不会是 undefined，可选字段缺失与接口的可选声明一致，因此按投影接口返回。
   return stripUndefined({
     ...context,
     systemRunContext: context,
@@ -141,7 +154,7 @@ export function projectSystemRunContext(context: SystemRunContext): Record<strin
     scopeId: context.scopeId,
     submitToolName: context.submitToolName,
     pipelineType: context.pipelineType,
-  });
+  }) as SystemRunContextProjection;
 }
 
 export function expandSystemRunContext(input: Record<string, unknown>): Record<string, unknown> {

@@ -61,12 +61,19 @@ function requireProducerAnalysisArtifact(value: unknown): ProducerAnalysisArtifa
 //
 // v3.0 重设计: PipelineStrategy 增强版
 //   - 每个 stage 有 systemPrompt + promptBuilder (替代通用 Capability prompt)
-//   - Quality Gate 使用自定义 evaluator (三态: pass/retry/degrade)
-//   - Rejection Gate 监控 Producer 拒绝率
+//   - quality_gate 用 insightGateEvaluator：返回 pass，或门给出的 analysis_retry / record_repair /
+//     summary_rewrite / degrade（门未给动作时退回 retry）。各动作怎么处理（重跑、补写/重写微阶段、
+//     PipelineStrategy 内部合成的 degraded_budget_exhausted / degraded_no_findings 等终态）以
+//     PipelineStrategy 文件头「门动作表」与 #processGate 为准，这里不复述
+//   - rejection_gate 用 producerRejectionGateEvaluator 监控 Producer 拒绝率（pass / retry）
 //   - promptBuilder 通过 strategyContext 获取运行时数据 (dimConfig/sessionStore/...)
 //
-// bootstrap-dimension profile 通过 AgentStageFactoryRegistry 按需覆盖
-// onToolCall 由 orchestrator 按维度注入 (闭包引用 ActiveContext)
+// 维度级 profile generate-dimension / module-mining-dimension 不直接展开本数组：它们声明
+// AgentStageFactoryRegistry 的 generateDimensionPipeline 工厂，由工厂按阶段名取出这里的阶段再复制覆盖
+// （动态 analyze 预算、终端工具、rescan 提交配额等；严格生产链路改用另一组阶段）。
+// 阶段对象不声明 onToolCall：工具调用观察者是 runtime 级 onToolCall，由宿主经 AgentRunInput 的
+// execution.onToolCall 传入（AgentService → AgentRuntimeBuilder → AgentRuntime）；PipelineStrategy 只在
+// 阶段显式声明 stage.onToolCall 时才用它覆盖 runtime 级钩子，仓内内置阶段目前都不声明。
 
 export const INSIGHT_PRESET = {
   name: '洞察',
@@ -121,7 +128,7 @@ export const INSIGHT_PRESET = {
           _origPrompt: string,
           prev: Record<string, unknown>
         ) => buildAnalyzeRetryPrompt(retryCtx, prev),
-        // onToolCall: 由 orchestrator 按维度注入
+        // 不声明阶段级 onToolCall：工具调用观察沿用 runtime 级 execution.onToolCall（见上方说明）。
       },
 
       // ── Phase 2: Quality Gate ──

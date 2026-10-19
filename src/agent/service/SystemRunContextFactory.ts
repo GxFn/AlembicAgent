@@ -6,6 +6,7 @@ import {
   createSystemRunContext,
   projectSystemRunContext,
   type SystemRunContext,
+  type SystemRunContextProjection,
 } from '../runtime/SystemRunContext.js';
 
 export interface BuildSystemContextOptions {
@@ -49,12 +50,18 @@ export class SystemRunContextFactory {
     return undefined;
   }
 
+  /**
+   * 为一次系统运行（如 scan）新建独立的记忆协调器、维度 scope、ContextWindow 与 tracker，并返回投影。
+   *
+   * @returns SystemRunContextProjection：SystemRunContext 字段展平在顶层（scopeId 为 `scan:<label>`），
+   *   另带指回原上下文的 systemRunContext；调用方可直接作为 strategyContext 传递。
+   */
   createSystemContext({
     budget,
     trackerStrategy = 'analyst',
     label = 'default',
     lang,
-  }: BuildSystemContextOptions = {}) {
+  }: BuildSystemContextOptions = {}): SystemRunContextProjection {
     const memoryCoordinator = new MemoryCoordinator({ mode: 'bootstrap' });
     const scopeId = `scan:${label}`;
     const activeContext = memoryCoordinator.createDimensionScope(scopeId);
@@ -80,7 +87,7 @@ export class SystemRunContextFactory {
     return projectSystemRunContext(systemRunContext);
   }
 
-  project(systemRunContext: SystemRunContext) {
+  project(systemRunContext: SystemRunContext): SystemRunContextProjection {
     return projectSystemRunContext(systemRunContext);
   }
 }

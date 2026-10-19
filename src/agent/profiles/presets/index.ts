@@ -5,8 +5,10 @@
  * (Capability+Strategy+Policy 命名组合,含工厂/闭包,受 AgentProfileRegistry 的声明快照
  * 序列化门约束不可内联进 profile);profile 是可序列化声明层,经 basePreset 回指到
  * 这里展开。PRESETS/getPreset/resolveStrategy 符号与三 preset id
- * ('chat'/'insight'/'evolution')是冻结面(主体 HTTP 投影 ai.ts:716+
- * process events preset 字段消费)。
+ * ('chat'/'insight'/'evolution')是冻结面:宿主 HTTP 路由 GET /api/v1/ai/agent/capabilities
+ * 把 PRESETS 投影为 name/description/capabilities/strategy.type;宿主
+ * buildGenerateAgentProgressProcessEvents 把进度事件的 preset 字段写进 process event metadata。
+ * 宿主引用只记符号与路由名,不记文件行号(行号随宿主改动漂移)。
  */
 import { FanOutStrategy, SingleStrategy, type Strategy } from '../../strategies/index.js';
 import { PipelineStrategy } from '../../strategies/PipelineStrategy.js';
@@ -65,8 +67,11 @@ export function resolveStrategy(strategyConfig: StrategyConfig | null | undefine
 /**
  * 获取 Preset 并展开为可用配置
  *
+ * @param presetName 内置 preset id('chat'/'insight'/'evolution');未知 id 抛错并列出可用值
  * @param [overrides] 覆盖 preset 中的特定字段
- * @returns }
+ * @returns 本次调用独立的配置快照(cloneRuntimeConfig 复制数据容器、保留函数与实例身份):
+ *   capabilities/policies/strategy 取 overrides 或 preset,persona/memory 浅合并,
+ *   另附 strategyInstance(由合并后的 strategy 经 resolveStrategy 新建的 Strategy 实例)
  */
 export function getPreset(presetName: string, overrides: Record<string, unknown> = {}) {
   const preset = Object.hasOwn(PRESETS, presetName)
