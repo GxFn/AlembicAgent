@@ -979,6 +979,8 @@ export class ActiveContext {
     const round = this.#currentRound?.iteration || 0;
 
     // ── RT 部分: Action + Observation ──
+    // 回执读取与观察元数据各自兜底（见 #readActionReceipt/#buildObservationMetaSafely），
+    // 与下方摘要三层降级一起保证直连宿主交来的抛错 getter 不会从 recordToolCall 冒出。
     const observedCall = {
       tool: toolName,
       args,
@@ -988,12 +990,9 @@ export class ActiveContext {
     this.#currentRound?.actions.push({
       tool: toolName,
       params: args,
-      ok: readToolObservation(observedCall).ok,
-      ...(toolName === 'code' && args.action === 'read'
-        ? { successfulReadPaths: successfulReadPaths(observedCall) }
-        : {}),
+      ...this.#readActionReceipt(toolName, args, observedCall, round),
     });
-    const observationMeta = ActiveContext.buildObservationMeta(toolName, args, result, isNew);
+    const observationMeta = this.#buildObservationMetaSafely(toolName, args, result, isNew, round);
     this.#currentRound?.observations.push({ tool: toolName, ...observationMeta });
 
     // ── WM 部分: 滑动窗口压缩 (非轻量模式) ──
@@ -1746,6 +1745,64 @@ export class ActiveContext {
         () => undefined
       );
       return lastResortCompress(payload, reason);
+    }
+  }
+
+  /**
+   * RT 动作回执：readToolObservation/successfulReadPaths 直接读取结果的 ok/error/status/files 等字段，
+   * 而且发生在任何压缩兜底之前。生产经 runtimeBridge 交来的是 kernel 归一后的信封，碰不到抛错 getter；
+   * 只有绕过适配器直连 recordToolCall 的宿主才可能交来这种结果。读不出回执就无法证明调用成功，
+   * 所以保守记为 ok=false、没有成功读取路径（不能让计划进度把文件当成已读），并留下可定位的降级记录。
+   */
+  #readActionReceipt(
+    toolName: string,
+    args: Record<string, unknown>,
+    observedCall: unknown,
+    round: number
+  ): Pick<RoundAction, 'ok' | 'successfulReadPaths'> {
+    const isCodeRead = toolName === 'code' && args.action === 'read';
+    try {
+      return {
+        ok: readToolObservation(observedCall).ok,
+        ...(isCodeRead ? { successfulReadPaths: successfulReadPaths(observedCall) } : {}),
+      };
+    } catch (err: unknown) {
+      const reason = describeError(err);
+      observeSafely(
+        () =>
+          this.#logger.warn(
+            `[ActiveContext] tool receipt unreadable tool=${toolName} round=${round} codeRead=${isCodeRead} reason=${reason}; fallback=action-ok-false`
+          ),
+        () => undefined
+      );
+      return { ok: false, ...(isCodeRead ? { successfulReadPaths: [] } : {}) };
+    }
+  }
+
+  /**
+   * 观察元数据会读少量载荷字段（如 code.search 的 total）。载荷 getter 抛错时退回与
+   * buildObservationMeta 初值相同的 unknown 元数据（保留 isNew），并记录降级；
+   * 静态方法本身的行为不变，兜底只加在 recordToolCall 这条实例路径上。
+   */
+  #buildObservationMetaSafely(
+    toolName: string,
+    args: Record<string, unknown>,
+    result: unknown,
+    isNew: boolean,
+    round: number
+  ): ReturnType<typeof ActiveContext.buildObservationMeta> {
+    try {
+      return ActiveContext.buildObservationMeta(toolName, args, result, isNew);
+    } catch (err: unknown) {
+      const reason = describeError(err);
+      observeSafely(
+        () =>
+          this.#logger.warn(
+            `[ActiveContext] observation meta failed tool=${toolName} round=${round} reason=${reason}; fallback=meta-unknown`
+          ),
+        () => undefined
+      );
+      return { gotNewInfo: isNew, resultType: 'unknown', keyFacts: [], resultSize: 0 };
     }
   }
 

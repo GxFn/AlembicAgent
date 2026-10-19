@@ -503,6 +503,114 @@ describe('ActiveContext envelope-aware observation compression (L6-P10)', () => 
     expect(context.buildContext(4000)).toContain('[unserializable object keys=status');
   });
 
+  it.each([
+    'status',
+    'ok',
+    'error',
+  ])('never throws from recordToolCall when a direct host receipt %s getter throws and records the action as not ok', (key) => {
+    // 回执的 ok/error/status 由 readToolObservation 在任何压缩兜底之前读取（RT 动作记录段）。
+    // 宿主直连 recordToolCall 时这些 getter 抛错不能冒出；读不到回执就不能证明成功，动作记为 ok=false。
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const receipt: Record<string, unknown> = {};
+    Object.defineProperty(receipt, key, {
+      enumerable: true,
+      get() {
+        throw new Error(`${key} exploded`);
+      },
+    });
+
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(1);
+    expect(() =>
+      context.recordToolCall('terminal', { command: 'pwd' }, receipt, true)
+    ).not.toThrow();
+    expect(context.getCurrentRoundActions()).toEqual([
+      { tool: 'terminal', params: { command: 'pwd' }, ok: false },
+    ]);
+    context.endRound();
+
+    // 观察元数据只读 args，不受回执 getter 影响，照常按工具分支记录。
+    expect(context.toJSON().rounds[0].observations).toEqual([
+      expect.objectContaining({ tool: 'terminal', resultType: 'terminal', gotNewInfo: true }),
+    ]);
+    expect(context.distill().toolCallSummary).toEqual([
+      `[terminal] [unserializable object keys=${key}: ${key} exploded]`,
+    ]);
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    const fallback = messages.find((message) => message.includes('fallback=action-ok-false'));
+    expect(fallback).toContain('tool=terminal');
+    expect(fallback).toContain('round=1');
+    expect(fallback).toContain(`reason=${key} exploded`);
+  });
+
+  it('records an unreadable code.read receipt as not ok with no successful read paths', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    // files 本身可读且看似成功，但整体 ok 读不出：不能把 src/a.ts 记成已读，否则计划进度会误判。
+    const receipt: Record<string, unknown> = {
+      files: [{ path: 'src/a.ts', ok: true, content: 'const a = 1;' }],
+    };
+    Object.defineProperty(receipt, 'ok', {
+      enumerable: true,
+      get() {
+        throw new Error('ok exploded');
+      },
+    });
+
+    const context = new ActiveContext({ maxRecentRounds: 3 });
+    context.startRound(4);
+    expect(() =>
+      context.recordToolCall('code', { action: 'read', path: 'src/a.ts' }, receipt, true)
+    ).not.toThrow();
+    expect(context.getCurrentRoundActions()).toEqual([
+      {
+        tool: 'code',
+        params: { action: 'read', path: 'src/a.ts' },
+        ok: false,
+        successfulReadPaths: [],
+      },
+    ]);
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    const fallback = messages.find((message) => message.includes('fallback=action-ok-false'));
+    expect(fallback).toContain('tool=code');
+    expect(fallback).toContain('round=4');
+    expect(fallback).toContain('reason=ok exploded');
+  });
+
+  it('never throws from recordToolCall when observation meta cannot read the payload and falls back to an unknown meta', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    // 回执字段 ok/error/status 都可读，只有搜索计数 total 的 getter 抛错：抛点在 buildObservationMeta。
+    const projection: Record<string, unknown> = { matches: [] };
+    Object.defineProperty(projection, 'total', {
+      enumerable: true,
+      get() {
+        throw new Error('total exploded');
+      },
+    });
+
+    const context = new ActiveContext({ maxRecentRounds: 0 });
+    context.startRound(2);
+    expect(() =>
+      context.recordToolCall('code', { action: 'search', pattern: 'needle' }, projection, true)
+    ).not.toThrow();
+    expect(context.getCurrentRoundActions()).toEqual([
+      { tool: 'code', params: { action: 'search', pattern: 'needle' }, ok: true },
+    ]);
+    context.endRound();
+
+    expect(context.toJSON().rounds[0].observations).toEqual([
+      { tool: 'code', gotNewInfo: true, resultType: 'unknown', keyFacts: [], resultSize: 0 },
+    ]);
+    expect(context.distill().toolCallSummary).toEqual([
+      '[code] [unserializable object keys=matches,total: total exploded]',
+    ]);
+    const messages = warn.mock.calls.map((call) => String(call[0]));
+    const fallback = messages.find((message) => message.includes('fallback=meta-unknown'));
+    expect(fallback).toContain('observation meta failed');
+    expect(fallback).toContain('tool=code');
+    expect(fallback).toContain('round=2');
+    expect(fallback).toContain('reason=total exploded');
+  });
+
   it('builds observation meta without serializing the full result and reads search counts from the payload', () => {
     const stringify = vi.spyOn(JSON, 'stringify');
     const searchEnvelope = envelope({
