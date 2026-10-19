@@ -34,13 +34,14 @@ import { runScanAgentTask } from '../src/agent/runs/scan/ScanAgentRun.js';
 import { runTranslationJson } from '../src/agent/runs/translation/TranslationAgentRun.js';
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
-import type { ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
+import type { ReactLoopOpts, ToolCallEntry } from '../src/agent/runtime/AgentRuntimeTypes.js';
 import type {
   AgentRunInput,
   AgentRunResult,
   AgentRunStatus,
   CompiledAgentProfile,
 } from '../src/agent/service/AgentRunContracts.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
 import { AgentRunCoordinator, SystemRunContextFactory } from '../src/agent/service/index.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
@@ -936,6 +937,253 @@ describe('relation-discovery run deadline covers its stage windows (L8-P02)', ()
     expect(outcome.ok ? outcome.value.relations : String(outcome.error)).toEqual([
       { from: 'A', to: 'B', type: 'depends_on' },
     ]);
+  });
+});
+
+describe('evolution-audit scale budget reaches the evolve stage (L8-P03)', () => {
+  // PipelineStrategy 的 executeAttempt 给每次阶段尝试 stage.budget.timeoutMs + 60s forced-summary 缓冲；
+  // evolution_gate 判 retry 时回到 evolve 重跑，一次审计最多 1 + gate.maxRetries 次 evolve 尝试。
+  const STAGE_ATTEMPT_GRACE_MS = 60_000;
+
+  type EvolutionAuditStage = {
+    name: string;
+    budget?: Record<string, unknown> & { maxIterations: number; timeoutMs: number };
+    gate?: Record<string, unknown> & { maxRetries: number };
+    [key: string]: unknown;
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function auditRecipes(count: number) {
+    return Array.from({ length: count }, (_, index) => ({
+      id: `recipe-${index}`,
+      title: `Recipe ${index}`,
+      trigger: `@recipe-${index}`,
+    }));
+  }
+
+  function requireStage(stages: EvolutionAuditStage[], name: string) {
+    const stage = stages.find((candidate) => candidate.name === name);
+    if (!stage) {
+      throw new Error(`evolution-audit must compile a "${name}" stage`);
+    }
+    return stage;
+  }
+
+  function compileEvolutionAudit(recipeCount: number) {
+    const compiled = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry(),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    }).compile({ id: 'evolution-audit', params: { recipes: auditRecipes(recipeCount) } });
+    const budget = compiled.policies?.find((policy) => policy instanceof BudgetPolicy);
+    if (!(budget instanceof BudgetPolicy)) {
+      throw new Error('evolution-audit must compile a BudgetPolicy');
+    }
+    const strategy = compiled.strategy as
+      | { type: string; stages: EvolutionAuditStage[] }
+      | undefined;
+    if (strategy?.type !== 'pipeline') {
+      throw new Error(
+        `evolution-audit must compile its own pipeline strategy, got ${JSON.stringify(strategy?.type ?? null)}`
+      );
+    }
+    const evolve = requireStage(strategy.stages, 'evolve');
+    const gate = requireStage(strategy.stages, 'evolution_gate');
+    return { compiled, budget, strategy, evolve, gate };
+  }
+
+  it.each([
+    { recipes: 0, maxIterations: 10, stageTimeoutMs: 180_000, runTimeoutMs: 720_000 },
+    { recipes: 5, maxIterations: 30, stageTimeoutMs: 230_000, runTimeoutMs: 870_000 },
+    { recipes: 30, maxIterations: 120, stageTimeoutMs: 480_000, runTimeoutMs: 1_620_000 },
+    { recipes: 60, maxIterations: 120, stageTimeoutMs: 600_000, runTimeoutMs: 1_980_000 },
+  ])('scales the evolve stage budget and the run deadline for $recipes recipes', (expected) => {
+    const { budget, strategy, evolve, gate } = compileEvolutionAudit(expected.recipes);
+
+    expect(strategy.stages.map((stage) => stage.name)).toEqual(['evolve', 'evolution_gate']);
+    expect(evolve.budget).toMatchObject({
+      maxIterations: expected.maxIterations,
+      timeoutMs: expected.stageTimeoutMs,
+    });
+    expect(gate.gate?.maxRetries).toBe(2);
+    // 迭代上限与整次期限来自同一个决定点：policy 预算与阶段预算一致，policy 不会先于阶段截断。
+    expect(budget.maxIterations).toBe(expected.maxIterations);
+    expect(budget.timeoutMs).toBe(expected.runTimeoutMs);
+  });
+
+  it('keeps the run deadline no shorter than every evolve attempt the gate may request', () => {
+    const iterationsByScale: number[] = [];
+    for (const recipeCount of [0, 1, 5, 12, 30, 42, 60, 200]) {
+      const { budget, evolve, gate } = compileEvolutionAudit(recipeCount);
+      const stageTimeoutMs = evolve.budget?.timeoutMs ?? 0;
+      const maxRetries = gate.gate?.maxRetries ?? Number.POSITIVE_INFINITY;
+      expect(stageTimeoutMs).toBeGreaterThan(0);
+      expect(stageTimeoutMs).toBeLessThanOrEqual(600_000);
+      expect(budget.timeoutMs).toBeGreaterThanOrEqual(
+        (1 + maxRetries) * (stageTimeoutMs + STAGE_ATTEMPT_GRACE_MS)
+      );
+      expect(evolve.budget?.maxIterations).toBeLessThanOrEqual(budget.maxIterations);
+      iterationsByScale.push(evolve.budget?.maxIterations ?? 0);
+    }
+    // 规模预算真的随 recipe 数变化（此前恒为 preset 的 20 轮）。
+    expect(iterationsByScale.slice(0, 5)).toEqual([10, 14, 30, 58, 120]);
+  });
+
+  it('keeps every non-scale evolve and gate field from the evolution preset', () => {
+    const { evolve, gate } = compileEvolutionAudit(5);
+    const presetStages = PRESETS.evolution.strategy.stages as EvolutionAuditStage[];
+    const presetEvolve = requireStage(presetStages, 'evolve');
+    const presetGate = requireStage(presetStages, 'evolution_gate');
+
+    expect(evolve.budget).toEqual({
+      ...presetEvolve.budget,
+      maxIterations: 30,
+      timeoutMs: 230_000,
+    });
+    expect(evolve.systemPrompt).toBe(presetEvolve.systemPrompt);
+    expect(evolve.promptBuilder).toBe(presetEvolve.promptBuilder);
+    expect(evolve.retryPromptBuilder).toBe(presetEvolve.retryPromptBuilder);
+    expect(evolve.decisionOnlyOnRetry).toBe(true);
+    expect(evolve.capabilities).toEqual(presetEvolve.capabilities);
+    expect(gate.gate).toEqual({ ...presetGate.gate, maxRetries: 2 });
+    expect(gate.gate?.evaluator).toBe(evolutionGateEvaluator);
+  });
+
+  it('leaves the shared evolution preset and the generate-dimension evolve stage at their original values', () => {
+    const presetStages = PRESETS.evolution.strategy.stages as EvolutionAuditStage[];
+    const presetEvolve = requireStage(presetStages, 'evolve');
+    const presetGate = requireStage(presetStages, 'evolution_gate');
+    const evolveBudgetBefore = { ...presetEvolve.budget };
+    const gateRetriesBefore = presetGate.gate?.maxRetries;
+
+    compileEvolutionAudit(60);
+
+    expect(presetEvolve.budget).toEqual(evolveBudgetBefore);
+    expect(presetEvolve.budget).toMatchObject({ maxIterations: 20, timeoutMs: 180_000 });
+    expect(presetGate.gate?.maxRetries).toBe(gateRetriesBefore);
+
+    const generated = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: {
+        needsCandidates: true,
+        hasExistingRecipes: true,
+        prescreenDone: false,
+        recipes: auditRecipes(60),
+      },
+      context: {},
+    }) as EvolutionAuditStage[];
+    expect(requireStage(generated, 'evolve').budget).toEqual(presetEvolve.budget);
+    expect(requireStage(generated, 'evolution_gate').gate?.maxRetries).toBe(gateRetriesBefore);
+  });
+
+  function auditServiceRecordingEvolveBudgets(decisionsByAttempt: Array<string[]>): {
+    service: AgentService;
+    evolveBudgets: Array<Record<string, unknown> | undefined>;
+    runBudgets: Array<Record<string, unknown> | null>;
+  } {
+    const evolveBudgets: Array<Record<string, unknown> | undefined> = [];
+    const runBudgets: Array<Record<string, unknown> | null> = [];
+    vi.spyOn(AgentRuntime.prototype, 'reactLoop').mockImplementation(async function (
+      this: AgentRuntime,
+      _prompt: string,
+      opts: ReactLoopOpts = {}
+    ) {
+      const phase = opts.context?.pipelinePhase;
+      let toolCalls: ToolCallEntry[] = [];
+      if (phase === 'evolve') {
+        evolveBudgets.push(opts.budgetOverride ? { ...opts.budgetOverride } : undefined);
+        runBudgets.push(
+          (this.policies.getBudget() as Record<string, unknown> | null | undefined) ?? null
+        );
+        const ids = decisionsByAttempt[evolveBudgets.length - 1] ?? [];
+        toolCalls = ids.map((id) => ({
+          tool: 'knowledge',
+          args: { action: 'manage', params: { id, operation: 'skip_evolution', reason: 'ok' } },
+          result: { outcome: 'verified' },
+          durationMs: 0,
+        })) as ToolCallEntry[];
+      }
+      return {
+        reply: toolCalls.length > 0 ? 'decisions submitted' : 'no decisions',
+        toolCalls,
+        iterations: 1,
+        tokenUsage: { input: 1, output: 1 },
+      } as never;
+    });
+    const service = new AgentService({
+      runtimeBuilder: new AgentRuntimeBuilder({
+        aiProvider: { name: 'evolution-budget', model: 'fixture', chatWithTools: vi.fn() } as never,
+        container: {},
+        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) } as never,
+        projectRoot,
+        dataRoot: projectRoot,
+      }),
+    });
+    return { service, evolveBudgets, runBudgets };
+  }
+
+  const auditOverview = { primaryLang: 'ts', fileCount: 1, modules: ['core'] };
+
+  it('passes the scaled budget to the evolve loop through AgentService and PipelineStrategy', async () => {
+    const recipes = auditRecipes(5);
+    const { service, evolveBudgets, runBudgets } = auditServiceRecordingEvolveBudgets([
+      recipes.map((recipe) => recipe.id),
+    ]);
+
+    const audit = await runEvolutionAudit({
+      agentService: service,
+      recipes,
+      projectOverview: auditOverview,
+    });
+
+    expect(audit.skipped).toBe(5);
+    expect(evolveBudgets).toHaveLength(1);
+    expect(evolveBudgets[0]).toMatchObject({ maxIterations: 30, timeoutMs: 230_000 });
+    expect(runBudgets[0]).toMatchObject({ maxIterations: 30, timeoutMs: 870_000 });
+  });
+
+  it('keeps the scaled budget on the decision-only retry that completes a partial first attempt', async () => {
+    const recipes = auditRecipes(5);
+    const ids = recipes.map((recipe) => recipe.id);
+    const { service, evolveBudgets } = auditServiceRecordingEvolveBudgets([
+      ids.slice(0, 3),
+      ids.slice(3),
+    ]);
+
+    const audit = await runEvolutionAudit({
+      agentService: service,
+      recipes,
+      projectOverview: auditOverview,
+    });
+
+    expect(audit.skipped).toBe(5);
+    expect(evolveBudgets).toHaveLength(2);
+    for (const budget of evolveBudgets) {
+      expect(budget).toMatchObject({ maxIterations: 30, timeoutMs: 230_000 });
+    }
+  });
+
+  it('stops after the reachable gate retries and reports the incomplete audit', async () => {
+    const { service, evolveBudgets, runBudgets } = auditServiceRecordingEvolveBudgets([]);
+
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: auditRecipes(30),
+        projectOverview: auditOverview,
+      })
+    ).rejects.toThrow('Evolution audit incomplete: decisions 0/30');
+
+    // 1 次首轮 + 2 次 gate 重试；每次都拿到规模化预算，三次窗口之和不超过整次期限。
+    expect(evolveBudgets).toHaveLength(3);
+    for (const budget of evolveBudgets) {
+      expect(budget).toMatchObject({ maxIterations: 120, timeoutMs: 480_000 });
+    }
+    expect(runBudgets[0]).toMatchObject({ maxIterations: 120, timeoutMs: 1_620_000 });
+    expect(evolveBudgets.length * (480_000 + STAGE_ATTEMPT_GRACE_MS)).toBeLessThanOrEqual(
+      1_620_000
+    );
   });
 });
 

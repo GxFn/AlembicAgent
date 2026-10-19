@@ -12,6 +12,7 @@ import type {
 } from '../service/AgentRunContracts.js';
 import { AgentProfileRegistry } from './AgentProfileRegistry.js';
 import { AgentStageFactoryRegistry } from './AgentStageFactoryRegistry.js';
+import { evolutionAuditPolicyDeclarations } from './definitions/evolution.profile.js';
 import { PRESETS } from './presets/index.js';
 
 interface AgentProfileCompilerOptions {
@@ -337,16 +338,10 @@ function resolvePolicyDeclarations(
   params: Record<string, unknown>
 ) {
   if (definition.id === 'evolution-audit') {
-    const recipes = Array.isArray(params.recipes) ? params.recipes : [];
-    return [
-      {
-        type: 'budget',
-        maxIterations: Math.min(recipes.length * 4 + 10, 120),
-        maxTokens: 8192,
-        temperature: 0.3,
-        timeoutMs: 600_000,
-      },
-    ];
+    // 规模公式不在这里重复（L8-P03）：evolutionAuditPipeline 阶段工厂与本处都从
+    // resolveEvolutionAuditScaleBudget 取值，BudgetPolicy 的 maxIterations 与 evolve 阶段一致，
+    // timeoutMs 覆盖首轮加全部 gate 重试的阶段窗口。
+    return evolutionAuditPolicyDeclarations(params);
   }
   return definition.defaults?.policies;
 }

@@ -3,6 +3,7 @@ import {
   getGenerateStageTerminalTools,
   resolveGenerateTerminalToolset,
 } from '@alembic/core/host-agent-workflows';
+import Logger from '@alembic/core/logging';
 import { EVOLUTION_GATE_STAGE } from '../evaluation/gateEvaluators.js';
 // W6-d(A1):两个 stage builder 已从 prompts/scanPrompts 迁往 evaluation/stageBuilders
 import {
@@ -10,6 +11,7 @@ import {
   buildScanPipelineStages,
 } from '../evaluation/stageBuilders.js';
 import { buildStrictProductionPipelineStagesV1 } from '../production/StrictProductionStages.js';
+import { resolveEvolutionAuditScaleBudget } from '../profiles/definitions/evolution.profile.js';
 import { cloneRuntimeConfig, PRESETS } from '../profiles/presets/index.js';
 import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
 
@@ -95,6 +97,63 @@ export class AgentStageFactoryRegistry {
     });
 
     this.register('relationsPipeline', () => buildRelationsPipelineStages());
+
+    // evolution-audit 专用管线（L8-P03 / C03）：按名取 evolution preset 的 evolve 与 evolution_gate，
+    // 把 resolveEvolutionAuditScaleBudget 的规模预算合并进本次装配的副本。PipelineStrategy 先取
+    // stage.budget，policy 预算轮不到，所以规模化的 maxIterations / timeoutMs 必须写在阶段上；
+    // gate.maxRetries 同步下调，使首轮加全部重试的阶段窗口落在编译器写入的整次期限内。
+    // 只替换这两个字段，其余阶段字段（提示、检索/提交预算、decisionOnlyOnRetry、门评估器）保持 preset
+    // 原样；preset 对象本身不被改写，generateDimensionPipeline 复用的 evolve / evolution_gate 维持原值。
+    this.register('evolutionAuditPipeline', ({ params }) => {
+      const scale = resolveEvolutionAuditScaleBudget(params);
+      const evolutionStages = PRESETS.evolution.strategy.stages;
+      const presetEvolve = requirePresetStage(evolutionStages, 'evolution', 'evolve');
+      const presetEvolutionGate = requirePresetStage(
+        evolutionStages,
+        'evolution',
+        EVOLUTION_GATE_STAGE
+      );
+      const presetEvolveBudget = (presetEvolve.budget as Record<string, unknown> | undefined) || {};
+      const presetGate = (presetEvolutionGate.gate as Record<string, unknown> | undefined) || {};
+      const recipesInput = params.recipes;
+      if (recipesInput !== undefined && !Array.isArray(recipesInput)) {
+        // 降级路径：recipes 不是数组时按 0 条计，只得到最小预算；记下输入类型便于追查调用方。
+        Logger.getInstance().warn(
+          `[AgentStageFactoryRegistry] evolution_audit_recipes_invalid: params.recipes is ${typeof recipesInput}, ` +
+            'not an array; scale budget falls back to 0 recipes',
+          { recipesType: typeof recipesInput }
+        );
+      }
+      Logger.getInstance().info(
+        `[AgentStageFactoryRegistry] evolution_audit_scale_budget: recipes=${scale.recipeCount} → ` +
+          `evolve.maxIterations=${presetEvolveBudget.maxIterations ?? 'unset'}→${scale.maxIterations}, ` +
+          `evolve.timeoutMs=${presetEvolveBudget.timeoutMs ?? 'unset'}→${scale.stageTimeoutMs}, ` +
+          `${EVOLUTION_GATE_STAGE}.maxRetries=${presetGate.maxRetries ?? 'unset'}→${scale.gateMaxRetries}, ` +
+          `runTimeoutMs=${scale.runTimeoutMs}`,
+        {
+          recipeCount: scale.recipeCount,
+          maxIterations: scale.maxIterations,
+          stageTimeoutMs: scale.stageTimeoutMs,
+          gateMaxRetries: scale.gateMaxRetries,
+          runTimeoutMs: scale.runTimeoutMs,
+        }
+      );
+      return [
+        {
+          ...presetEvolve,
+          budget: {
+            ...presetEvolveBudget,
+            maxIterations: scale.maxIterations,
+            timeoutMs: scale.stageTimeoutMs,
+          },
+        },
+        {
+          ...presetEvolutionGate,
+          gate: { ...presetGate, maxRetries: scale.gateMaxRetries },
+        },
+      ] as Record<string, unknown>[];
+    });
+
     this.register('generateDimensionPipeline', ({ params, context }) => {
       const strategyContext = context?.strategyContext as Record<string, unknown> | undefined;
       const strictProduction = strategyContext?.strictProduction;

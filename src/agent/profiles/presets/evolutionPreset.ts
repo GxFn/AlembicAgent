@@ -57,6 +57,10 @@ export const EVOLUTION_PRESET = {
     maxRetries: 1,
     stages: [
       // ── Phase 1: Evolver ──
+      // 本阶段预算是 generateDimensionPipeline（冷启动/重扫维度前置进化）复用的原值，不随 recipe 数伸缩；
+      // evolution-audit 由 evolutionAuditPipeline 在装配副本上改写 maxIterations / timeoutMs
+      // （见 definitions/evolution.profile.ts 的 resolveEvolutionAuditScaleBudget，L8-P03），这里不要
+      // 为全量审计放大，否则会同时放大维度管线的进化预算。
       {
         name: 'evolve',
         capabilities: ['evolution_analysis'],
@@ -77,6 +81,8 @@ export const EVOLUTION_PRESET = {
         gate: {
           evaluator: evolutionGateEvaluator,
           useCumulativeToolCalls: true,
+          // generateDimensionPipeline 复用的原值；evolution-audit 的门由 evolutionAuditPipeline 下调为 2 次，
+          // 并让整次期限覆盖 1 + 2 次 evolve 窗口（L8-P03）。
           maxRetries: 8,
         },
       },
