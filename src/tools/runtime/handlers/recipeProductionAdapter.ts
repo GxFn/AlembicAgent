@@ -93,9 +93,16 @@ function stringArray(value: unknown): string[] {
 
 /**
  * 去重后排序的结果写进 retrievalProfile.provenance（evidenceRefs / sourceFieldRefs），Core 的
- * profileHash / documentSetHash 依赖这个顺序。排序规则固定为 en，不随进程默认区域变化：
- * 英文、中文环境下与历史顺序一致，其他区域（如 hu、da、sv）也得到同一顺序。是否改为码元序
- * 及已持久化哈希的迁移另行决定。
+ * profileHash / documentSetHash 依赖这个顺序。排序规则固定为 en，不随进程默认区域变化，
+ * 任何区域都得到同一顺序。与固定之前（按进程默认区域排序）的历史顺序相比：
+ *   - 英文环境：完全一致；
+ *   - 中文环境（zh、zh-CN、zh-Hans-CN、zh-TW）：只对不含汉字的引用（如纯 ASCII 路径与字段名）
+ *     一致。引用含汉字时（evidenceRefs 是项目相对路径，目录或文件名可以是中文），zh 把汉字排在
+ *     拉丁字母之前且汉字之间按拼音排，en 把汉字排在拉丁字母之后且不按拼音，所以中文默认区域
+ *     进程里撰写过这类配方，重新撰写后顺序可能改变，profileHash / documentSetHash 也随之改变；
+ *   - 部分区域（如 hu、da、lt）对某些 ASCII 组合（cs/cz、aa/z、y/iz 等）的历史顺序本就与 en
+ *     不同，含这些组合的配方重新撰写后同样会改变。
+ * 是否改为码元序、以及已持久化哈希如何迁移，属于待决事项⑥；在那之前不改这里的排序规则。
  */
 function distinctSorted(values: string[]): string[] {
   return [...new Set(values.map(text).filter(Boolean))].sort((left, right) =>

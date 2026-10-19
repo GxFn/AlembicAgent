@@ -1612,7 +1612,22 @@ describe('agent history rewrites and native continuation', () => {
     expect(dropped[0]).not.toContain('batch_reasoning');
   });
 
-  it('sends a compacted Gemini round as unsigned history without repeated continuation warnings', async () => {
+  /**
+   * L2-P18 锚点 (3)“Gemini 场景不再重复告警”只对 continuation_filtered 这一族成立（AUD-sweep-c 审计补记）：
+   * 被压缩的一轮按无签名历史发送后，Gemini 3 模型上 @ai-sdk/google 会为无 thoughtSignature 的
+   * functionCall 注入 skip_thought_signature_validator 哨兵并给出 warning type=other，sdkResponse
+   * 把每条 SDK warning 都记成一条 warn，所以每个后续请求仍有一条 warn；gemini-2.5 不注入哨兵，
+   * 没有这条告警。这里断言完整的 warn 流而不是只筛一族：Gemini 3 的这条残留被如实钉住
+   * （每个后续请求恰好一条），其余任何 warn 都不允许出现。应答夹具带齐 usageMetadata，
+   * 避免 usage_unreported 这类夹具噪声混进 warn 流。
+   */
+  it.each([
+    { model: 'gemini-3-flash-preview', sentinelWarnPerRequest: true },
+    { model: 'gemini-2.5-flash', sentinelWarnPerRequest: false },
+  ])('sends a compacted $model round as unsigned history; only the Gemini 3 SDK sentinel warning repeats per request', async ({
+    model,
+    sentinelWarnPerRequest,
+  }) => {
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
     const parts = [
@@ -1634,14 +1649,11 @@ describe('agent history rewrites and native continuation', () => {
               finishReason: 'STOP',
             },
           ],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
         });
       })
     );
-    const provider = new GoogleGeminiProvider({
-      apiKey: 'test-key',
-      model: 'gemini-3-flash-preview',
-      maxRetries: 0,
-    });
+    const provider = new GoogleGeminiProvider({ apiKey: 'test-key', model, maxRetries: 0 });
     const toolSchemas = [{ name: 'knowledge', parameters: { type: 'object' } }];
     const window = new ContextWindow(48_000);
     window.appendUserMessage('submit the candidate');
@@ -1657,7 +1669,8 @@ describe('agent history rewrites and native continuation', () => {
       first.continuation
     );
     window.appendToolResult('g1', 'knowledge', 'submitted');
-    for (const followUp of ['continue', 'continue again']) {
+    const followUps = ['continue', 'continue again'];
+    for (const followUp of followUps) {
       await provider.chatWithTools('', {
         messages: [
           ...window.toProjectedMessages(),
@@ -1666,21 +1679,33 @@ describe('agent history rewrites and native continuation', () => {
         toolSchemas,
       });
     }
+    expect(bodies).toHaveLength(1 + followUps.length);
     for (const body of bodies.slice(1)) {
-      const model = body.contents.find((message) => message.role === 'model');
+      const modelMessage = body.contents.find((message) => message.role === 'model');
+      const sentParts = JSON.stringify(modelMessage?.parts);
       // 签名绑定捕获时的原投影；参数被改写后原签名不得随历史发送。
-      expect(JSON.stringify(model?.parts)).not.toMatch(/sig_thinking|sig_call/);
-      expect(JSON.stringify(model?.parts)).toContain('providerHistoryCompacted');
+      expect(sentParts).not.toMatch(/sig_thinking|sig_call/);
+      expect(sentParts).toContain('providerHistoryCompacted');
+      // 哨兵是 SDK 在发送前注入的：只有 Gemini 3 的请求体里带它。
+      expect(sentParts.includes('skip_thought_signature_validator')).toBe(sentinelWarnPerRequest);
     }
     const warnings = logLines(warn);
     expect(warnings.filter((line) => line.includes('continuation_filtered'))).toEqual([]);
+    const sentinelWarnings = warnings.filter((line) =>
+      line.startsWith(`[ai-sdk] provider=google model=${model} warning=other `)
+    );
+    expect(sentinelWarnings).toHaveLength(sentinelWarnPerRequest ? followUps.length : 0);
     const dropped = [...warnings, ...logLines(info)].filter((line) =>
       line.includes('continuation_dropped')
     );
+    // 除一次性的 continuation_dropped 与上面钉住的哨兵告警外，warn 流必须为空。
+    expect(
+      warnings.filter((line) => !sentinelWarnings.includes(line) && !dropped.includes(line))
+    ).toEqual([]);
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toContain('reason=compacted_args');
     expect(dropped[0]).toContain('provider=google');
-    expect(dropped[0]).toContain('model=gemini-3-flash-preview');
+    expect(dropped[0]).toContain(`model=${model}`);
     expect(dropped[0]).toContain('g1');
     expect(dropped[0]).not.toMatch(/sig_thinking|sig_call|private reasoning/);
   });

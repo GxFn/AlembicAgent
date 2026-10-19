@@ -69,6 +69,9 @@ const DELTA_NO_VISIBLE_CHANGES = '[no visible changes]';
  *   - >500 行无范围读取：AST 大纲以 `File has N lines. Showing outline. …` 结尾，
  *     无 AST 时退回头尾预览，首行 `// <path> — N lines (showing head + tail)`；
  *   - maxLines 范围读：末尾 `... [N lines omitted; …]`，N 是展示末行之后的行数，标记行本身不是源码；
+ *     handler 总以 `\n... [` 把它写成独立的最后一行（readSingleFile 的 suffix），而每一行源码都带
+ *     `42|` 行号前缀，所以只有“换行后紧跟 `... [`”才是这个标记。源码行恰好以同一段字面量结尾时
+ *     （如文档里引用了这段提示），它前面是 `3|…` 而不是换行，不能被当成范围读的省略后缀；
  *   - Router 按 maxOutputTokens 的头尾截断：中间插入 `... [N chars truncated, exceeded M token limit] ...`，
  *     标记前后的内容不连续，标记之后的首行可能只是半行。
  */
@@ -76,8 +79,9 @@ const READ_DELTA_HEADER_RE = /^\[delta: (\d+) hunk\(s\)\]/;
 const READ_HEAD_TAIL_HEADER_RE = /^\/\/ .+ — (\d+) lines \(showing head \+ tail\)/;
 const READ_OUTLINE_FOOTER_RE =
   /\nFile has (\d+) lines\. Showing outline\. Use startLine\/endLine to read specific sections\.\s*$/;
+/** 前导换行是必需的：它把匹配锚定在行首，见上方 maxLines 一条。 */
 const READ_OMITTED_SUFFIX_RE =
-  /\n?\.\.\. \[(\d+) lines omitted; use startLine\/endLine for more\]\s*$/;
+  /\n\.\.\. \[(\d+) lines omitted; use startLine\/endLine for more\]\s*$/;
 const READ_ROUTER_TRUNCATION_RE =
   /\n\n\.\.\. \[\d+ chars truncated, exceeded \d+ token limit\] \.\.\.\n\n/;
 /** handler 给每个源码行加的行号前缀 `42|`；全文读与范围读的每一行都带它。 */
@@ -188,9 +192,15 @@ const TOOL_COMPRESS_STRATEGIES = {
     return defaultCompress(result);
   },
 
-  graph(result: unknown) {
+  graph(result: unknown, call: CompressCall) {
     if (typeof result !== 'object' || result === null) {
       return String(result).substring(0, 600);
+    }
+    // graph.overview 的投影是宿主概览本身（或空图时的 { message }），没有查询包装：
+    // 必须先于查询分支识别，否则会一路落到类模板写成“类 ?”并丢掉全部概览事实。
+    // 失败回执（ok=false）的载荷是错误文本，不走这里。
+    if (call.ok && stringFrom(call.params.action) === 'overview' && !Array.isArray(result)) {
+      return summarizeGraphOverview(result as Record<string, unknown>);
     }
     const outer = result as Record<string, unknown>;
     // graph handler 的投影是 { type, entity, result } 或 { type, entity, message }：
@@ -198,8 +208,9 @@ const TOOL_COMPRESS_STRATEGIES = {
     const body = outer.result;
     const entity = stringFrom(outer.entity);
     const type = stringFrom(outer.type);
-    if (body == null && typeof outer.message === 'string' && entity) {
-      return `图谱 ${type || 'query'} ${entity}: ${outer.message}`;
+    if (body == null && typeof outer.message === 'string') {
+      // handler 的查询投影一定带 entity；没有实体的裸 message 只会来自宿主直连，同样是回答而不是“类 ?”。
+      return `图谱 ${type || 'query'}${entity ? ` ${entity}` : ''}: ${outer.message}`;
     }
     const label = `图谱 ${type || 'query'} ${entity || '?'}`;
 
@@ -243,7 +254,19 @@ const TOOL_COMPRESS_STRATEGIES = {
     }
 
     // class/protocol query: 有 className 等
-    const lines = [`类 ${(r.className as string) || (r.protocolName as string) || entity || '?'}`];
+    const className = stringFrom(r.className) || stringFrom(r.protocolName);
+    if (!className && !(type && GRAPH_ENTITY_QUERY_TYPES.has(type))) {
+      // 既不是 class/protocol 查询，也没有类名：形状未被任何分支识别（宿主直连或宿主形状漂移）。
+      // 类模板只能写出实体名，结果事实会丢失，所以留下诊断以便对齐宿主形状，而不是静默降级。
+      observeSafely(
+        () =>
+          Logger.getInstance().warn(
+            `[ActiveContext] graph summary fell back to class template: type=${type || '-'} entity=${entity || '-'} action=${stringFrom(call.params.action) || '-'}; unrecognized answer shape keys=${Object.keys(r).slice(0, 8).join(',')}`
+          ),
+        () => undefined
+      );
+    }
+    const lines = [`类 ${className || entity || '?'}`];
     if (r.superClass) {
       lines.push(`  继承: ${r.superClass}`);
     }
@@ -457,6 +480,59 @@ function summarizeGraphLists(label: string, lists: Array<[string, unknown[]]>): 
   const leading = lists.find(([, items]) => items.length > 0)?.[1] ?? [];
   return [
     header,
+    ...leading.slice(0, GRAPH_LEADING_ITEMS).map((item) => `  ${describeGraphItem(item)}`),
+  ].join('\n');
+}
+
+/**
+ * graph.overview 摘要。handler 原样返回宿主概览，空图时投影为 { message }，两者都没有
+ * { type, entity, result } 包装：
+ *   - 主仓宿主 GraphOverview：modules / moduleDependencies 是结果数组，unownedFiles 是数值，
+ *     truncated 标记结果被截断，graphRefs 只是引用（不计数），index 是索引状态对象（不展开）；
+ *   - 旧宿主或 Core 形态：totalFiles / totalClasses 等数值统计加 topLevelModules 之类数组。
+ * 结果数组逐个计数、数值统计原样列出，前几项取自第一个非空数组。一项都认不出时退回 JSON
+ * 截断并留下诊断，不能套用类模板。
+ */
+function summarizeGraphOverview(overview: Record<string, unknown>): string {
+  const label = '图谱 overview';
+  const entries = Object.entries(overview);
+  const lists = entries.filter(
+    (entry): entry is [string, unknown[]] =>
+      Array.isArray(entry[1]) && !GRAPH_AUXILIARY_LIST_KEYS.has(entry[0])
+  );
+  const numbers = entries.filter(
+    (entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1])
+  );
+  const message = stringFrom(overview.message);
+  if (lists.length === 0 && numbers.length === 0) {
+    if (message) {
+      return `${label}: ${message}`;
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          `[ActiveContext] graph overview summary fell back to JSON truncation: no result arrays, numeric facts or message; keys=${Object.keys(overview).slice(0, 8).join(',')}`
+        ),
+      () => undefined
+    );
+    return `${label}: ${defaultCompress(overview, 300)}`;
+  }
+  const segments: string[] = [];
+  if (lists.length > 0) {
+    segments.push(lists.map(([key, items]) => `${key} ${items.length} 条`).join('、'));
+  }
+  if (numbers.length > 0) {
+    segments.push(numbers.map(([key, value]) => `${key} ${value}`).join('、'));
+  }
+  if (overview.truncated === true) {
+    segments.push('结果已截断');
+  }
+  if (message) {
+    segments.push(message);
+  }
+  const leading = lists.find(([, items]) => items.length > 0)?.[1] ?? [];
+  return [
+    `${label}: ${segments.join('；')}`,
     ...leading.slice(0, GRAPH_LEADING_ITEMS).map((item) => `  ${describeGraphItem(item)}`),
   ].join('\n');
 }

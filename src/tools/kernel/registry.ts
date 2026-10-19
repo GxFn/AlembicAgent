@@ -68,10 +68,16 @@ export interface ParsedToolCall {
  * 显式 resultStatus 优先，消费方判定结果时以 resultStatus 为准（adapter 归一后即信封的
  * status），不应只看 ok。ok:true 可以与非 success 状态并存：例如 terminal 非零退出码返回
  * ok:true 加 resultStatus:'error'，code 搜索在取消或超时前已有匹配时返回 ok:true 加
- * 'timeout'/'aborted'/'partial'。缺省 resultStatus 时，adapter 才按 ok 归一为 success/error。
+ * 'timeout'/'aborted'/'partial'。缺省 resultStatus 时，adapter（ToolRouterAdapter）才按 ok 归一：
+ * ok:true 归一为 'success'；ok:false 归一为 'error'，唯一例外是调用请求的 abortSignal 在路由执行
+ * 返回时已触发，此时归一为 'aborted'（handler 被取消打断却没写状态，不能记成普通失败）。显式
+ * resultStatus 不受取消信号影响，ok:true 也不会因取消改成 'aborted'。
  */
 export interface ToolResultMeta {
-  /** producer/路由层确认的结果状态，优先于旧 ok 标记；缺省时 adapter 才按 ok 归一化。 */
+  /**
+   * producer/路由层确认的结果状态，优先于旧 ok 标记；缺省时 adapter 才按 ok 归一化
+   * （ok:false 且 abortSignal 已触发时为 'aborted'，否则为 'error'）。
+   */
   resultStatus?: ToolResultStatus;
   cached: boolean;
   compression?: { parser: string; ratio: number };

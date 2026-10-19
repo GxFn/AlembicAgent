@@ -462,12 +462,21 @@ export class ToolRouterAdapter implements ToolRouterContract {
     };
     // 先保留 handler 的执行真值，再单独做 JSON 安全化。宿主已写成功后的循环/BigInt/
     // getter 等不能使 JSON.stringify 抛出并落入 execute 的失败分支，更不能重试写入。
-    // 规范化（L3-P06）只处理循环、accessor、toJSON、BigInt、Date、原型，不删除任何字段，
-    // 也不施加 4096 显示节点预算：宿主 /agent/tool 拿到的是完整数据，status 仍是 handler
-    // 真值（不降为 partial）。显示预算只留给 projectToolResultOrdinaryOutput/presentToolResult，
-    // 模型路径另有 limitToolResult 字符配额。
+    // 规范化（L3-P06，kernel/result.ts 的 normalizeToolResultContent）不执行 D23 禁用字段，也不
+    // 施加 4096 显示节点预算：普通 JSON 数据字段无论多少都原样保留，status 仍是 handler 真值
+    // （不降为 partial）。但它会改写下列不能安全序列化的形态，除标准 Date 外都带警告码进入
+    // 下方诊断：
+    //   - 循环引用、accessor 属性、BigInt/symbol/function 值、NaN/Infinity：键保留，值换成
+    //     `[unavailable: circular reference]`、`[unavailable: accessor]` 或
+    //     `[unavailable: non-JSON value]`；
+    //   - 值为函数的自有 toJSON 键被删除（可执行的序列化钩子不保留）；
+    //   - Date 转 ISO 字符串；类实例等非普通原型转为只含自有可枚举数据的普通对象；
+    //   - 嵌套超过 MAX_NESTING_DEPTH（64 层）的容器整体换成 `[unavailable: display limit]`，
+    //     其下的字段不再输出（栈安全护栏，TOOL_RESULT_DISPLAY_LIMIT）。
+    // 宿主 /agent/tool 拿到的就是这份规范化数据。显示预算只留给
+    // projectToolResultOrdinaryOutput/presentToolResult，模型路径另有 limitToolResult 字符配额。
     // D23 普通输出禁用字段不在这里执行（L3-C02 决策）：本信封就是宿主 /agent/tool 的响应体，
-    // 宿主 HTTP 出口不执行 D23（cross-repo 决定），所以这里不删除任何字段。D23 的执行点在
+    // 宿主 HTTP 出口不执行 D23（cross-repo 决定），所以这里不按 D23 删除任何字段。D23 的执行点在
     // 下游：秘密/私有字段由 runtimeBridge（模型历史、返回值）与 AgentTaskHandlers（任务输出、
     // AI 提示、错误）在使用前对 structuredContent 与 JSON text 一并清理（任意深度、按规范化
     // 名字），旧信封顶层字段只由普通输出投影 projectToolResultOrdinaryOutput（runtimeBridge 与

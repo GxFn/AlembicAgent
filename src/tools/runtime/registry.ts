@@ -5,7 +5,8 @@
  * 所有工具 metadata、action 参数 schema、handler 函数在此声明式定义。
  *
  * 新增工具/action 不是“只在此文件加一行”：下列位置按动作名硬编码，不会自动跟随本表，
- * 漏改时新动作会在宿主缺服务时不被收窄、被阶段策略拦下或落到 handler 的 Unknown action 分支。
+ * 漏改时新动作会在宿主缺服务时不被收窄、被阶段策略拦下、落到 handler 的 Unknown action 分支，
+ * 或者结果不进证据台账、不计入探索指标。
  *   - 本文件：ToolSpec.actions 里声明 params schema 与 handler 接线（handleXxx('<action>', ...)）；
  *   - handlers/<tool>.ts：handle() 的 switch 分发要认这个动作名；
  *   - availability.ts：describeToolAvailability 按动作/分支映射宿主服务方法，决定缺服务时是否收窄；
@@ -22,7 +23,14 @@
  *     evidence.*）进不可信表，只有 Agent 自写结果才逐个动作进可信表（L4-P05/L4-P5c）。
  *     漏登记时成功结果按不可信处理并打 tool_trust_unclassified_action 告警，
  *     test/tool-runtime-contract.test.ts 的 L4-P5c 用例遍历本表逐个核对分类；
+ *   - agent/evidence/EvidenceCapture.ts：resolveEvidenceAction 只把 Core 契约 EVIDENCE_TOOL_IDS
+ *     （@alembic/core/knowledge，跨仓常量，ProductionEvidenceLedgerAuthority 按同一白名单校验）
+ *     里的 `<tool>.<action>` 落入证据台账。新增读证据类动作须先在 AlembicCore 扩这张白名单，
+ *     否则它的结果不进台账，note_finding 与 submit 都无法引用；
+ *   - agent/context/ExplorationTracker.ts 的 isEvidenceToolCall（evidenceToolCallCount）与
+ *     agent/context/exploration/SignalDetector.ts 的 isSearchAction：按动作名分类探索指标；
  *   - test/：可用性、schema 投影、阶段策略与 handler 的对应用例。
+ * 以上是已核对的按动作名硬编码位置，不保证穷尽：新增动作时仍应按动作名全文检索 src/。
  */
 
 import { DEPTH_DIMENSIONS } from '@alembic/core/knowledge';
