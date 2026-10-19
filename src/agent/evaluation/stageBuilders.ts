@@ -133,6 +133,8 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
     },
     systemPrompt: ANALYST_SYSTEM_PROMPT,
     // C53: 与 insight 预设共用 insightGate 的内部构建器；保留原参数标注，阶段对象的推断类型不变。
+    // L8-C05(I36)：只服务门重试(quality_gate 判 analysis_retry 写入 _retryContext 后)；本阶段未声明
+    // retryBudget，不进入 fast retry。
     retryPromptBuilder: (
       retryCtx: { reason?: string },
       _origPrompt: string,
@@ -181,12 +183,18 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
     promptBuilder: (ctx: ProducerPromptContext) => {
       return buildScanProducerPrompt(ctx, files, task);
     },
-    // retry 配置 (拒绝率过高时缩减预算)
+    // retry 配置 (拒绝率过高时缩减预算)。retryBudget 同时开启 PipelineStrategy 的 fast retry
+    // (首轮硬超时且确认零工具调用时用它同阶段重跑一次)。
     retryBudget: {
       maxIterations: isSummarize ? 3 : 5,
       temperature: 0.3,
       timeoutMs: isSummarize ? 60_000 : 120_000,
     },
+    // L8-C05(I36)：retryPromptBuilder 只服务门重试——PipelineStrategy 仅在 rejection_gate 判 retry、
+    // phaseResults._retryContext 存在时调用它，按上一轮 prev.produce 的被拒提交生成修复清单。fast retry
+    // 不调用它：重跑前 ContextWindow 被清空，管线复用上面 promptBuilder 已构建的完整阶段提示(quality_gate
+    // 产物的 findings/代码证据)再追加超时提示段，并记 pipeline_stage_fast_retry 诊断；否则模型只会看到
+    // 「你的 0 个提交被拒绝了」。这里因此不承载阶段任务上下文。
     retryPromptBuilder: (
       retryCtx: { reason?: string },
       _origPrompt: string,

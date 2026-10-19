@@ -123,6 +123,8 @@ export const INSIGHT_PRESET = {
             }
           ),
         // C53: 与 scan 管线共用 insightGate 的内部构建器，两条管线的 analyze 重试提示不再分叉。
+        // L8-C05(I36)：同样只服务门重试(quality_gate 判 analysis_retry 写入 _retryContext 后)。本阶段未声明
+        // retryBudget，不进入 fast retry；宿主若补上 retryBudget，fast retry 也只复用 promptBuilder 的阶段提示。
         retryPromptBuilder: (
           retryCtx: { reason?: string },
           _origPrompt: string,
@@ -164,7 +166,14 @@ export const INSIGHT_PRESET = {
             ctx.existingDimensionTitles as Parameters<typeof buildProducerPromptV2>[7]
           ),
         // 拒绝率过高时: 缩减预算 + 特定修复 prompt (对齐旧 ProducerAgent 的 rejection retry)
+        // retryBudget 被两条重跑路径共用：rejection_gate 判 retry 的门重试，以及 PipelineStrategy 的
+        // fast retry(首轮硬超时且确认零工具调用；声明 retryBudget 即开启)。
         retryBudget: { maxIterations: 5, temperature: 0.3, timeoutMs: PRODUCER_RETRY_TIMEOUT_MS },
+        // L8-C05(I36)：retryPromptBuilder 只服务门重试——PipelineStrategy 仅在 phaseResults._retryContext
+        // 存在(rejection_gate 判 retry)时调用它，此时 prev.produce 是上一轮回执，修复清单的被拒数才有意义。
+        // fast retry 不调用它：重跑前 ContextWindow 被清空，管线复用上面 promptBuilder 已构建的完整阶段提示
+        // (quality_gate 产物、维度配置、项目信息)再追加超时提示段，并记 pipeline_stage_fast_retry 诊断。
+        // 因此这里只生成拒绝修复清单，不需要也不应承载 findings 等阶段任务上下文；不要把它当超时重试提示改造。
         retryPromptBuilder: (
           retryCtx: { reason?: string },
           _origPrompt: string,
