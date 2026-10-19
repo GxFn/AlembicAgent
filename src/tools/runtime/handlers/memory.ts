@@ -120,7 +120,9 @@ async function handleNoteFinding(
   }
 
   const importance = Math.min(10, Math.max(1, (params.importance as number) || 5));
-  const round = resolveFindingRound(ctx);
+  const { round, warning: roundWarning } = resolveFindingRound(ctx);
+  // 轮次回落诊断（见 resolveFindingRound）：只并入两个写入成功分支，不标 degraded。
+  const roundWarnings: ToolDiagnosticWarning[] = roundWarning ? [roundWarning] : [];
 
   if (!ctx.memoryCoordinator) {
     return fail('memory.note_finding requires an active MemoryCoordinator and ActiveContext');
@@ -224,16 +226,18 @@ async function handleNoteFinding(
           stage: 'memory.note_finding',
           tool: 'memory',
         },
+        ...roundWarnings,
         ...receiptWarnings,
       ],
     });
   }
 
   // M3：verified 随结果外露——tracker 据此计 verifiedFindingCount（配额只认核实过的发现）
-  // 兼容转译只加诊断、不标 degraded：回执内容已完整转交，降级与否由上面的台账分支决定。
+  // 兼容转译与轮次回落只加诊断、不标 degraded：回执内容已完整转交，降级与否由上面的台账分支决定。
+  const ledgeredWarnings = [...roundWarnings, ...receiptWarnings];
   return ok(
     verified === undefined ? result : { ...result, verified },
-    receiptWarnings.length > 0 ? { diagnosticWarnings: receiptWarnings } : undefined
+    ledgeredWarnings.length > 0 ? { diagnosticWarnings: ledgeredWarnings } : undefined
   );
 }
 
@@ -242,12 +246,33 @@ async function handleNoteFinding(
  * ctx.runtime.iteration。不再读 schema 未声明、模型可控的 params.round（曾使轮次恒为 0，或被模型编造）。
  * 非 runtime 表面（宿主直调、没有 agent loop）没有轮次，记 0，与 runtimeBridge 对缺省 iteration
  * 取 0 的口径一致；这不是降级，ActiveContext 只用 round 标注发现先后。
+ *
+ * L4-P21r3 / C058：iteration “有值但非法”（NaN、负数、小数、Infinity，或宿主越过类型传入的非数字）
+ * 同样回落为 0，但这条回落必须可追溯：返回 MEMORY_FINDING_ROUND_INVALID 诊断，回显原值类型与取值，
+ * 由调用方并入结果 diagnosticWarnings。与缺省口径一致，这条诊断不标 degraded。
+ * 当前 AgentRuntime 路径（runtimeBridge 的 `loopCtx.iteration || 0`）恒为非负整数，只有宿主经公开
+ * ToolRouterAdapter 或直调 handler 才会走到这里。
  */
-function resolveFindingRound(ctx: ToolContext): number {
-  const iteration = ctx.runtime?.iteration;
-  return typeof iteration === 'number' && Number.isInteger(iteration) && iteration >= 0
-    ? iteration
-    : 0;
+function resolveFindingRound(ctx: ToolContext): {
+  round: number;
+  warning?: ToolDiagnosticWarning;
+} {
+  const iteration: unknown = ctx.runtime?.iteration;
+  if (iteration === undefined) {
+    return { round: 0 };
+  }
+  if (typeof iteration === 'number' && Number.isInteger(iteration) && iteration >= 0) {
+    return { round: iteration };
+  }
+  return {
+    round: 0,
+    warning: {
+      code: 'MEMORY_FINDING_ROUND_INVALID',
+      message: `runtime.iteration is not a non-negative integer (typeof=${typeof iteration}; value=${String(iteration)}); finding round fell back to 0 (path=round-fallback-zero)`,
+      stage: 'memory.note_finding',
+      tool: 'memory',
+    },
+  };
 }
 
 /** 诊断里回显的旧回执预览上限：足够辨认来源，又不把宿主的长文本整段灌进诊断。 */

@@ -3925,6 +3925,77 @@ describe('memory handler degraded diagnostics and finding rounds (L4-P21)', () =
     });
     expect(coordinator.noteFinding.mock.calls[1]?.[3]).toBe(0);
   });
+
+  // L4-P21r3 / C058：宿主经公开 ToolRouterAdapter 或直调 handler 时，runtime.iteration 可能“有值但非法”。
+  // 轮次仍回落为 0（只用于标注先后，不算降级），但回落必须留下 MEMORY_FINDING_ROUND_INVALID 诊断。
+  it.each([
+    ['NaN', Number.NaN],
+    ['-1', -1],
+    ['2.5', 2.5],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ])('falls back to round 0 with MEMORY_FINDING_ROUND_INVALID when runtime.iteration is %s', async (label, iteration) => {
+    const coordinator = recordingCoordinator();
+    const params = { finding: 'AuthService owns tokens', evidenceRefs: ['E-1'] };
+
+    const result = await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: coordinator,
+      runtime: { iteration, evidenceLedger: fileLedger() },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(coordinator.noteFinding.mock.calls[0]?.[3]).toBe(0);
+    expect(codesOf(result)).toEqual(['MEMORY_FINDING_ROUND_INVALID']);
+    expect(result._meta?.degraded).not.toBe(true);
+    const warning = result._meta?.diagnosticWarnings?.[0];
+    expect(warning).toMatchObject({ tool: 'memory', stage: 'memory.note_finding' });
+    // 诊断回显原值与类型，事后能看出是哪种非法值触发了回落。
+    expect(warning?.message).toContain('typeof=number');
+    expect(warning?.message).toContain(`value=${label}`);
+  });
+
+  it('keeps the invalid-round diagnostic next to MEMORY_FINDING_UNVERIFIED_NO_LEDGER on the no-ledger branch', async () => {
+    const coordinator = recordingCoordinator();
+    const params = { finding: 'AuthService owns tokens', evidenceRefs: ['E-1'] };
+
+    const result = await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: coordinator,
+      runtime: { iteration: -1 },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(coordinator.noteFinding.mock.calls[0]?.[3]).toBe(0);
+    // 无台账本身是降级；轮次回落只附加诊断，不改变 degraded 的来源。
+    expect(result._meta?.degraded).toBe(true);
+    expect(codesOf(result)).toEqual([
+      'MEMORY_FINDING_UNVERIFIED_NO_LEDGER',
+      'MEMORY_FINDING_ROUND_INVALID',
+    ]);
+  });
+
+  it('emits no round diagnostic for a valid or absent runtime.iteration', async () => {
+    const params = { finding: 'AuthService owns tokens', evidenceRefs: ['E-1'] };
+
+    const valid = recordingCoordinator();
+    const withIteration = await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: valid,
+      runtime: { iteration: 7, evidenceLedger: fileLedger() },
+    });
+    expect(valid.noteFinding.mock.calls[0]?.[3]).toBe(7);
+    expect(codesOf(withIteration)).toEqual([]);
+
+    // 缺省 iteration 是注释已覆盖的非 runtime 表面：记 0，不发诊断。
+    const absent = recordingCoordinator();
+    const withoutIteration = await handleMemory('note_finding', params, {
+      ...baseToolContext(),
+      memoryCoordinator: absent,
+      runtime: { evidenceLedger: fileLedger() },
+    });
+    expect(absent.noteFinding.mock.calls[0]?.[3]).toBe(0);
+    expect(codesOf(withoutIteration)).toEqual([]);
+  });
 });
 
 describe('L4-P16 code.write protected path segments', () => {
