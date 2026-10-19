@@ -2858,6 +2858,170 @@ describe('coordination cancellation check racing and classification', () => {
     expect(runChild).not.toHaveBeenCalled();
   });
 
+  // C051：child 的懒构造挂起期间兄弟 child 登记了探针失败，该 child 恢复后的 child-post-lazy 检查
+  // 必须先看 failures、直接按 prior-failure 跳过，不能再调用已坏的宿主 hook（也不能再多记一条重复失败）。
+  // parallel c=2：a pre(1)、b pre(2)、b post-lazy(3) 抛错；tiered c=2：tier(1)、a pre(2)、b pre(3)、b post-lazy(4) 抛错。
+  it.each([
+    { mode: 'parallel', failingCall: 3 },
+    { mode: 'tiered', failingCall: 4 },
+  ] as const)('does not call a $mode predicate again after a sibling failure while a lazy child is pending (C051)', async ({
+    mode,
+    failingCall,
+  }) => {
+    const gate = coordinationLatch<void>();
+    let calls = 0;
+    const shouldAbort = vi.fn((): boolean => {
+      calls++;
+      if (calls >= failingCall) {
+        // 失败登记（同步 catch 链）完成后才放行 a 的懒构造：a 恢复时 failures 已非空。
+        setTimeout(() => gate.resolve(), 0);
+        throw new Error('predicate broken');
+      }
+      return false;
+    });
+    const input = baseRunInput([{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }]);
+    input.execution = { shouldAbort };
+    input.context.childInputFactories = {
+      a: async ({ plannedInput }) => {
+        await gate.promise;
+        return plannedInput;
+      },
+    };
+    const onChildResult = vi.fn();
+    input.context.coordination = { onChildResult };
+    const runChild = vi.fn(async (child: AgentRunInput) => childResult(child));
+    const tieredProfile = coordinationProfile();
+    const profile: CompiledAgentProfile =
+      mode === 'parallel'
+        ? parallelCoordinationProfile(2)
+        : {
+            ...tieredProfile,
+            concurrency: {
+              mode: 'tiered',
+              concurrency: 2,
+              partitioner: 'generateSessionDimensions',
+              merge: 'generateSessionResults',
+              childProfile: 'child-profile',
+            },
+          };
+    const infoSpy = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    let error: unknown;
+    try {
+      error = await new AgentRunCoordinator().run(input, profile, runChild).then(
+        () => null,
+        (err: unknown) => err
+      );
+      // 短路留痕：a 的 post-lazy 检查因 b 已失败而跳过，日志写明检查点、失败数且未调用宿主 hook。
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'cancellation check short-circuited profile=parent-profile child=a checkpoint=child-post-lazy'
+        ),
+        expect.objectContaining({
+          childId: 'a',
+          checkpoint: 'child-post-lazy',
+          failureCount: 1,
+          hookConsulted: false,
+          reason: 'prior-failure',
+        })
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: predicate broken',
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ runId: 'a:aborted', status: 'aborted' }),
+            expect.objectContaining({ runId: 'b:aborted', status: 'aborted' }),
+            expect.objectContaining({ runId: 'c:aborted', status: 'aborted' }),
+            expect.objectContaining({ runId: 'd:aborted', status: 'aborted' }),
+          ],
+        },
+      },
+    });
+    expect((error as { coordinationFailures: unknown[] }).coordinationFailures).toEqual([
+      { hook: 'shouldAbort', childId: 'b', message: 'predicate broken' },
+    ]);
+    expect(shouldAbort).toHaveBeenCalledTimes(failingCall);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(onChildResult).not.toHaveBeenCalled();
+  });
+
+  // C050：内置 partitioner 把父 execution 原样透传给 child，child 自身的首次检查（AgentService preflight）
+  // 紧跟在 child-post-lazy 之后，是对同一谓词的重复调用。派发时首次检查复用 post-lazy 的结论、不再调用
+  // 宿主 hook；之后的检查（如嵌套 fan-out 的孙级协调）仍委托宿主 hook。宿主可见的 childInput 不变。
+  it('answers the dispatched child first inherited check from the post-lazy check and delegates later ones (C050)', async () => {
+    let hostCalls = 0;
+    const shouldAbort = vi.fn(() => {
+      hostCalls++;
+      return false;
+    });
+    const input = baseRunInput([{ id: 'a' }]);
+    input.execution = { shouldAbort };
+    const seen: Array<{ first: unknown; second: unknown; hostCallsOnFirstCheck: number }> = [];
+    const runChild = vi.fn(async (child: AgentRunInput) => {
+      const beforeFirst = hostCalls;
+      const first = await child.execution?.shouldAbort?.();
+      const hostCallsOnFirstCheck = hostCalls - beforeFirst;
+      const second = await child.execution?.shouldAbort?.();
+      seen.push({ first, second, hostCallsOnFirstCheck });
+      return childResult(child);
+    });
+    const onChildResult = vi.fn();
+    input.context.coordination = { onChildResult };
+    const infoSpy = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    let result: AgentRunResult | null;
+    try {
+      result = await new AgentRunCoordinator().run(input, parallelCoordinationProfile(1), runChild);
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'inherited cancellation check answered profile=parent-profile child=a checkpoint=child-dispatch'
+        ),
+        expect.objectContaining({
+          childId: 'a',
+          checkpoint: 'child-dispatch',
+          answeredFrom: 'child-post-lazy',
+          hookConsulted: false,
+          result: false,
+        })
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+    expect(result?.status).toBe('success');
+    // pre-dispatch + post-lazy 两次，child 首次检查不调用宿主，第二次委托宿主。
+    expect(shouldAbort).toHaveBeenCalledTimes(3);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual({ first: false, second: false, hostCallsOnFirstCheck: 0 });
+    // 派发副本不改写宿主对象：父 execution 与宿主回执里的 childInput 仍持有原谓词。
+    expect(input.execution.shouldAbort).toBe(shouldAbort);
+    expect(onChildResult.mock.calls[0]?.[0].childInput.execution?.shouldAbort).toBe(shouldAbort);
+  });
+
+  it('leaves a distinct predicate supplied by a lazy factory to the child own check (C050)', async () => {
+    const parentShouldAbort = vi.fn(() => false);
+    const factoryShouldAbort = vi.fn(() => false);
+    const input = baseRunInput([{ id: 'a' }]);
+    input.execution = { shouldAbort: parentShouldAbort };
+    input.context.childInputFactories = {
+      a: ({ plannedInput }) => ({
+        ...plannedInput,
+        execution: { shouldAbort: factoryShouldAbort },
+      }),
+    };
+    const dispatched: AgentRunInput[] = [];
+    const runChild = vi.fn(async (child: AgentRunInput) => {
+      dispatched.push(child);
+      return childResult(child);
+    });
+    await new AgentRunCoordinator().run(input, parallelCoordinationProfile(1), runChild);
+    expect(dispatched[0]?.execution?.shouldAbort).toBe(factoryShouldAbort);
+    expect(parentShouldAbort).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     'timeout',
     'aborted',

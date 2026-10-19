@@ -2868,6 +2868,14 @@ describe('service cancellation and snapshot ownership', () => {
             childProfile: 'fan-child',
           },
         },
+        // child 必须可编译，否则 child 会以 Unknown agent profile 报 error，掩盖谓词故障的归类。
+        {
+          id: 'fan-child',
+          title: 'Fan Child',
+          serviceKind: 'system-analysis',
+          lifecycle: 'active',
+          basePreset: 'chat',
+        },
       ]),
       stageFactoryRegistry: new AgentStageFactoryRegistry(),
     });
@@ -2927,6 +2935,63 @@ describe('service cancellation and snapshot ownership', () => {
     });
     expect(shouldAbort).toHaveBeenCalledTimes(1);
     expect(build).not.toHaveBeenCalled();
+  });
+  // C050：内置 partitioner 让 child 继承父级 shouldAbort。child 自身的 AgentService preflight 紧跟在
+  // 协调器 child-post-lazy 检查之后，是重复调用；它抛错曾落进 runChild 的 catch 变成该维度的 error 回执，
+  // parallel 父 run 正常返回 status=error（I19 原症状）。同一谓词故障必须一律抛协调错误，宿主不收 error 回执。
+  it.each([
+    { failure: 'only the third call', failsAt: (call: number) => call === 3 },
+    { failure: 'every call from the third', failsAt: (call: number) => call >= 3 },
+  ])('a coordinated parallel run raises the coordination error when the inherited predicate fails on $failure', async ({
+    failsAt,
+  }) => {
+    const { service, build, coordinatedInput } = coordinatedService('parallel');
+    let calls = 0;
+    const shouldAbort = vi.fn(() => {
+      calls++;
+      if (failsAt(calls)) {
+        throw new Error('predicate broken');
+      }
+      return false;
+    });
+    const receipts: string[] = [];
+    const input = coordinatedInput({ shouldAbort });
+    input.context.coordination = {
+      onChildResult: ({ childInput, result }) => {
+        receipts.push(`${childInput.params?.dimId}:${result.status}`);
+      },
+    };
+    const error = await service.run(input).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      message: 'Agent coordination consumption failed: predicate broken',
+      coordinationFailures: [{ hook: 'shouldAbort', childId: 'b', message: 'predicate broken' }],
+      partialResult: {
+        status: 'error',
+        phases: {
+          childResults: [
+            expect.objectContaining({ status: 'success' }),
+            expect.objectContaining({ status: 'aborted', runId: 'b:aborted' }),
+          ],
+        },
+      },
+    });
+    // a：pre-dispatch + post-lazy 两次（child preflight 不再重复调用）；b：pre-dispatch 抛错后不再调用。
+    expect(shouldAbort).toHaveBeenCalledTimes(3);
+    expect(build).toHaveBeenCalledTimes(1);
+    expect(receipts).toEqual(['a:success']);
+  });
+  it('a coordinated parallel run still lets each dispatched child run after two inherited checks', async () => {
+    const { service, build, coordinatedInput } = coordinatedService('parallel');
+    const shouldAbort = vi.fn(() => false);
+    const result = await service.run(coordinatedInput({ shouldAbort }));
+    expect(result.status).toBe('success');
+    expect(build).toHaveBeenCalledTimes(2);
+    // 每个 child：pre-dispatch + post-lazy；child preflight 复用 post-lazy 结论。
+    expect(shouldAbort).toHaveBeenCalledTimes(4);
   });
   it('two real runtimes throwing the same Error keep their own confirmed receipts', async () => {
     const shared = new Error('shared post-execution policy error');

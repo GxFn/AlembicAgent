@@ -259,6 +259,68 @@ async function runChildren(
       { profileId: profile.id, ...child, reason }
     );
   };
+  /**
+   * child 级取消检查短路的 info 诊断。定位信息只在日志通道内求值：读计划输入失败只丢这条日志，
+   * 不能把短路结论改判成探针故障或 child error。
+   */
+  const logChildCheckShortCircuit = (
+    planned: AgentRunInput,
+    index: number,
+    event: string,
+    details: Record<string, string | number | boolean>
+  ) => {
+    observeSafely(
+      () => {
+        const child = describeChild(planned, index);
+        const suffix = Object.entries(details)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(' ');
+        return Logger.getInstance().info(
+          `${LOG_PREFIX} ${event} profile=${profile.id} child=${child.childId} ${suffix}`,
+          { profileId: profile.id, ...child, ...details }
+        );
+      },
+      () => undefined
+    );
+  };
+  /**
+   * C050：内置 partitioner（及原样展开父 execution 的懒构造工厂）让 child 继承父级 shouldAbort。
+   * child 的首次检查（非协调 child 的 AgentService preflight，或嵌套协调的首个检查）紧跟在
+   * child-post-lazy 之后，是对同一谓词的重复调用；它抛错会落进 runChild 的 catch，把同一个谓词故障
+   * 变成该 child 的 error 回执（parallel 父 run 正常返回 status=error，即 I19 原症状）。
+   * 因此派发给 runChild 的副本把继承来的谓词换成包装：首次检查直接复用 post-lazy 的结论（false，
+   * 否则不会走到派发），不调用宿主 hook；之后的检查原样委托宿主 hook，保留嵌套 fan-out 对孙级的
+   * stop-new 取消能力（直接剥掉谓词会丢失这一层）。
+   * 只替换与父级同一引用的谓词：宿主工厂另给的不同谓词不动，仍由 child 自身检查，其故障按
+   * runChild 异常归为 child error（I19 修法的边界）。返回的是派发副本，records/onChildResult
+   * 仍使用原 childInput，宿主可见输入与父 execution 对象都不被改写。
+   */
+  const createDispatchInput = (
+    childInput: AgentRunInput,
+    planned: AgentRunInput,
+    index: number
+  ): AgentRunInput => {
+    const inherited = parentInput.execution?.shouldAbort;
+    const execution = childInput.execution;
+    if (!inherited || !execution || execution.shouldAbort !== inherited) {
+      return childInput;
+    }
+    let firstCheckAnswered = false;
+    const shouldAbort = (): boolean | Promise<boolean> => {
+      if (firstCheckAnswered) {
+        return inherited();
+      }
+      firstCheckAnswered = true;
+      logChildCheckShortCircuit(planned, index, 'inherited cancellation check answered', {
+        checkpoint: 'child-dispatch',
+        answeredFrom: 'child-post-lazy',
+        hookConsulted: false,
+        result: false,
+      });
+      return false;
+    };
+    return { ...childInput, execution: { ...execution, shouldAbort } };
+  };
   const settleChild = async (
     index: number,
     forcedStop?: CoordinationStopReason
@@ -274,13 +336,30 @@ async function runChildren(
     let childStop: CoordinationStopReason | null = null;
     /**
      * child 级取消检查。探针抛错不是该 child 的执行失败：单独捕获并 fail('shouldAbort')，
-     * 该 child 写 aborted 回执，后续 child 因 failures>0 按 prior-failure 跳过、不再调用坏 hook，
-     * 父 run 与 tier 级检查、AgentService preflight 一致地抛协调错误（附 partialResult）。
-     * 懒构造与 runChild 的异常不经过这里，仍由外层 catch 归为该 child 的 error 结果。
+     * 该 child 写 aborted 回执，父 run 与 tier 级检查、AgentService preflight 一致地抛协调错误（附 partialResult）。
+     * 失败登记之后开始的检查（含懒构造挂起期间兄弟已失败、恢复后的 child-post-lazy）先看 failures，
+     * 直接按 prior-failure 跳过、不再调用坏 hook（C051）。不在此保证内的只有并发固有情形：
+     * 同批在途 child 在任何失败登记之前已发出的首次调用，它们各自结算、可能各记一条失败。
+     * 懒构造与 runChild 的异常不经过这里，仍由外层 catch 归为该 child 的 error 结果；
+     * 继承父级谓词的 child 首次检查由 createDispatchInput 复用 post-lazy 结论，不会在 runChild 中重复调用它。
      */
     const checkChildStop = async (
       checkpoint: 'child-pre-dispatch' | 'child-post-lazy'
     ): Promise<CoordinationStopReason | null> => {
+      if (failures.length > 0) {
+        // 已有失败：停止派发已成定局，再问宿主 hook 只会重复调用可能已坏的探针并多记重复失败。
+        // abortSignal 是同步读、不调用宿主代码，仍优先标注，保持“用户取消”与“失败连带”的区分。
+        const reason: CoordinationStopReason = parentInput.execution?.abortSignal?.aborted
+          ? 'abortSignal'
+          : 'prior-failure';
+        logChildCheckShortCircuit(planned, index, 'cancellation check short-circuited', {
+          checkpoint,
+          failureCount: failures.length,
+          hookConsulted: false,
+          reason,
+        });
+        return reason;
+      }
       try {
         // 定位信息惰性求值且只在日志通道内读取：读计划输入失败不能被误记成探针故障。
         const reason = await resolveAbortReason(parentInput, () => ({
@@ -323,13 +402,17 @@ async function runChildren(
             logChildSkipped(planned, index, stop);
           } else {
             started = true;
-            result = await runChild(childInput);
+            // 派发副本只替换继承来的父级谓词（见 createDispatchInput）；记录与宿主回调仍用 childInput。
+            result = await runChild(createDispatchInput(childInput, planned, index));
           }
         }
       } catch (err: unknown) {
         result = createChildErrorResult(identity, err);
         // pre-dispatch：懒构造抛错（含工厂产物校验失败），child 从未运行；run：child 执行本身抛错。
-        // 两者都降级为 error 结果；取消探针抛错已在 checkChildStop 中归为协调失败，不会走到这里。
+        // 两者都降级为 error 结果。协调器自己的两次取消检查抛错已在 checkChildStop 中归为协调失败；
+        // 继承父级谓词的 child 首次检查由派发副本复用 post-lazy 结论、不再调用宿主 hook。
+        // 仍会走到这里的谓词故障只有两类：宿主工厂另给的不同谓词，以及嵌套协调中后续检查的故障
+        // （由嵌套协调器自己归为它的协调错误后抛出），二者都按 runChild 异常归为该 child 的 error。
         logCoordination(
           'warn',
           `child degraded to error result profile=${profile.id} child=${resolveChildLogId(planned, index)} stage=${started ? 'run' : 'pre-dispatch'}`,
