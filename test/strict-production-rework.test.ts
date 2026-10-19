@@ -588,6 +588,98 @@ describe('R07 strict Producer actual model input boundary', () => {
       })
     ).toMatchObject({ cardinality: 1, version: 1 });
   });
+
+  /**
+   * C046：draft 契约是“省略 matchingRepresentativeId”（StrictProductionPrompts 输出契约），宿主
+   * parseProducerOutput 只做 as 断言。draft 携带的任何值（含非字符串）都不得进入 proposals、
+   * authoredFingerprintHash 与 setHash，丢弃时记录 warn 诊断；merge/duplicate 的代表 ID 原样保留。
+   */
+  describe('draft matchingRepresentativeId projection (C046)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it.each([
+      ['a number', 5, 'number'],
+      ['an object', { a: 1 }, 'object'],
+      ['a boolean', true, 'boolean'],
+      ['a string', 'x', 'string'],
+    ] as const)('drops %s representative from a draft and keeps the set hashes', (_label, value, valueType) => {
+      const baseline = createSetWith({ expressionId: 'expression-1', kind: 'draft', authored });
+      const warn = vi.spyOn(Logger.getInstance(), 'warn');
+      const set = createSetWith({
+        expressionId: 'expression-1',
+        kind: 'draft',
+        authored,
+        matchingRepresentativeId: value,
+      });
+      expect(Object.hasOwn(set.proposals[0] ?? {}, 'matchingRepresentativeId')).toBe(false);
+      expect(set.authoredFingerprintHash).toBe(baseline.authoredFingerprintHash);
+      expect(set.setHash).toBe(baseline.setHash);
+      expect(warn).toHaveBeenCalledWith(
+        '[StrictProducer] draft matchingRepresentativeId dropped',
+        expect.objectContaining({
+          expressionId: 'expression-1',
+          valueType,
+          reason: 'draft-must-not-carry-representative',
+          selectedPath: 'drop-field',
+        })
+      );
+    });
+
+    it.each([
+      ['null', null],
+      ['an empty string', ''],
+    ] as const)('drops %s representative from a draft without a warning', (_label, value) => {
+      const baseline = createSetWith({ expressionId: 'expression-1', kind: 'draft', authored });
+      const warn = vi.spyOn(Logger.getInstance(), 'warn');
+      const set = createSetWith({
+        expressionId: 'expression-1',
+        kind: 'draft',
+        authored,
+        matchingRepresentativeId: value,
+      });
+      expect(Object.hasOwn(set.proposals[0] ?? {}, 'matchingRepresentativeId')).toBe(false);
+      expect(set.setHash).toBe(baseline.setHash);
+      expect(warn).not.toHaveBeenCalledWith(
+        '[StrictProducer] draft matchingRepresentativeId dropped',
+        expect.anything()
+      );
+    });
+
+    it.each([
+      'merge',
+      'duplicate',
+    ] as const)('keeps the %s representative verbatim in the sealed set', (kind) => {
+      const warn = vi.spyOn(Logger.getInstance(), 'warn');
+      const set = createSetWith({
+        expressionId: 'expression-1',
+        kind,
+        matchingRepresentativeId: 'representative-1',
+        authored,
+      });
+      expect(set.proposals[0]?.matchingRepresentativeId).toBe('representative-1');
+      // 与修复前的投影口径逐字节一致：合法 merge/duplicate 的 authoredFingerprintHash 不变。
+      expect(set.authoredFingerprintHash).toBe(
+        hashCanonical({
+          proposals: [
+            {
+              expressionId: 'expression-1',
+              kind,
+              authored,
+              matchingRepresentativeId: 'representative-1',
+              authoredFingerprint: set.proposals[0]?.authoredFingerprint,
+            },
+          ],
+          zeroDisposition: null,
+        })
+      );
+      expect(warn).not.toHaveBeenCalledWith(
+        '[StrictProducer] draft matchingRepresentativeId dropped',
+        expect.anything()
+      );
+    });
+  });
 });
 
 /**
@@ -958,6 +1050,98 @@ describe('strict Analyst and Producer model input shape guards', () => {
     expect(() => createStrictProducerExpressionSetV1(null as never)).toThrow(
       /^STRICT_PRODUCER_INPUT_SHAPE_INVALID: input$/u
     );
+  });
+});
+
+/**
+ * C044：与 C24 处置行同根——假设行与 counterqueryApplicability 也是模型提案，Core 构造器用展开
+ * 保留未声明字段。Agent 在交给 Core 前只投影契约字段，模型附加的 notes 等自由文本不改变
+ * epochHash，也不流入 producerEligibleHypotheses 与 lineage。
+ */
+describe('strict Analyst hypothesis and applicability rows project to contract fields (C044)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('drops model extras on induction hypotheses before they reach the epoch hash', () => {
+    const { epochInput } = createSingleHypothesisEpochFixture();
+    const baseline = validateStrictAnalystEpochV1(epochInput);
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const [induction] = epochInput.inductionInputs;
+    const [hypothesis] = induction?.hypotheses ?? [];
+    const withNotes = validateStrictAnalystEpochV1({
+      ...epochInput,
+      inductionInputs: [
+        { ...induction, hypotheses: [{ ...hypothesis, notes: 'model commentary' }] },
+      ],
+    } as never);
+    expect(withNotes.epochHash).toBe(baseline.epochHash);
+    expect(Object.hasOwn(withNotes.inductions[0]?.hypotheses[0] ?? {}, 'notes')).toBe(false);
+    expect(Object.hasOwn(withNotes.producerEligibleHypotheses[0] ?? {}, 'notes')).toBe(false);
+    expect(() => assertStrictAnalystEpochIntegrity(withNotes)).not.toThrow();
+    expect(info).toHaveBeenCalledWith(
+      '[StrictAnalyst] induction hypotheses projected to contract fields',
+      expect.objectContaining({
+        reason: 'model-output-outside-hypothesis-contract',
+        selectedPath: 'project-contract-fields',
+        droppedFields: ['notes'],
+        hypothesisIds: ['hypothesis-handler'],
+      })
+    );
+  });
+
+  it('drops model extras on counterquery applicability before Core seals the falsification', () => {
+    const { epochInput } = createSingleHypothesisEpochFixture();
+    const baseline = validateStrictAnalystEpochV1(epochInput);
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const [falsification] = epochInput.falsificationInputs;
+    const withNotes = validateStrictAnalystEpochV1({
+      ...epochInput,
+      falsificationInputs: [
+        {
+          ...falsification,
+          counterqueryApplicability: {
+            ...falsification?.counterqueryApplicability,
+            notes: 'model commentary',
+          },
+        },
+      ],
+    } as never);
+    expect(withNotes.epochHash).toBe(baseline.epochHash);
+    expect(
+      Object.hasOwn(withNotes.falsifications[0]?.counterqueryApplicability ?? {}, 'notes')
+    ).toBe(false);
+    expect(() => assertStrictAnalystEpochIntegrity(withNotes)).not.toThrow();
+    expect(info).toHaveBeenCalledWith(
+      '[StrictAnalyst] counterquery applicability projected to contract fields',
+      expect.objectContaining({
+        reason: 'model-output-outside-applicability-contract',
+        selectedPath: 'project-contract-fields',
+        droppedFields: ['notes'],
+        hypothesisIds: ['hypothesis-handler'],
+      })
+    );
+  });
+
+  it('keeps contract-shaped hypotheses and applicability verbatim without logging', () => {
+    const { epochInput } = createSingleHypothesisEpochFixture();
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const epoch = validateStrictAnalystEpochV1(epochInput);
+    const [induction] = epochInput.inductionInputs;
+    const [falsification] = epochInput.falsificationInputs;
+    // 契约形状的行投影前后逐字节相同，所以合法输入的 epochHash 与修复前一致。
+    expect(epoch.inductions[0]?.hypotheses).toEqual(induction?.hypotheses);
+    expect(epoch.falsifications[0]?.counterqueryApplicability).toEqual({
+      ...falsification?.counterqueryApplicability,
+      reviewerReceiptId: falsification?.dispositionReview.reviewReceiptId,
+    });
+    expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+    for (const message of [
+      '[StrictAnalyst] induction hypotheses projected to contract fields',
+      '[StrictAnalyst] counterquery applicability projected to contract fields',
+    ]) {
+      expect(info).not.toHaveBeenCalledWith(message, expect.anything());
+    }
   });
 });
 

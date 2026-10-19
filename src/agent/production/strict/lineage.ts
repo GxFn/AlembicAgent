@@ -458,7 +458,8 @@ const MAX_SEMANTIC_REPAIR_DEPTH = 2;
 /**
  * 跨进程复核因果修复节点（C32）。nodeHash 只证明“内容与外层 hash 一致”，调用者可以改写字段后
  * 重算 nodeHash 自证；因此还要按 createCausalRepairNodeV1 的派生规则逐项复核：
- * - stage 必须属于公开枚举（analyst/producer/reviewer；后两者当前无产出方，保留为公开类型）；
+ * - stage 必须属于公开枚举（analyst/producer/reviewer；当前仅 producer 有产出方，见 expressions.ts
+ *   createStrictProducerExpressionSetV1；analyst/reviewer 当前无产出方，保留为公开类型）；
  * - rootIds 非空，rootIds/parentNodeIds 必须是 normalizeIds 的规范形（创建时就以该形态写入）；
  * - 深度与前驱一致：无前驱即深度 0，有前驱即深度 ≥1，且不超过创建时的修复上限；
  * - 必填 hash 字段与创建时同码校验；

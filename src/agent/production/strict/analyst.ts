@@ -376,12 +376,14 @@ function createStrictInductions(
     }
     clustersByMechanism.set(cluster.mechanismKey, cluster);
   }
-  const receipts = input.inductionInputs.map((induction) => {
+  const projectedHypotheses = projectStrictInductionHypotheses(input.inductionInputs);
+  const receipts = input.inductionInputs.map((induction, inductionIndex) => {
     const cluster = clustersByMechanism.get(induction.mechanismKey);
     if (!cluster) {
       fail('STRICT_ANALYST_INDUCTION_CLUSTER_UNKNOWN', induction.mechanismKey);
     }
-    for (const hypothesis of induction.hypotheses) {
+    const hypotheses = projectedHypotheses[inductionIndex];
+    for (const hypothesis of hypotheses) {
       assertFactsWithinPopulation(
         hypothesis.premiseFactIds,
         facts,
@@ -398,7 +400,7 @@ function createStrictInductions(
       clusterId: cluster.clusterId,
       observationIds: cluster.observationIds,
       mode: induction.mode,
-      hypotheses: induction.hypotheses,
+      hypotheses,
       currentAnalysisFixpointHash: input.currentAnalysisFixpointHash,
       ...(induction.zeroHypothesisReason
         ? { zeroHypothesisReason: induction.zeroHypothesisReason }
@@ -441,7 +443,8 @@ function createStrictFalsifications(
   const externallyEnrolled = new Set(
     normalizeIds(input.enrolledObligationIds, 'enrolledObligationIds')
   );
-  const receipts = input.falsificationInputs.map((candidate) => {
+  const projectedApplicability = projectStrictCounterqueryApplicability(input.falsificationInputs);
+  const receipts = input.falsificationInputs.map((candidate, candidateIndex) => {
     if (!hypotheses.has(candidate.hypothesisId)) {
       fail('STRICT_ANALYST_FALSIFICATION_HYPOTHESIS_UNKNOWN', candidate.hypothesisId);
     }
@@ -460,7 +463,7 @@ function createStrictFalsifications(
     return createFalsificationReceiptV1({
       ...candidate,
       counterqueryApplicability: {
-        ...candidate.counterqueryApplicability,
+        ...projectedApplicability[candidateIndex],
         reviewerReceiptId: candidate.dispositionReview.reviewReceiptId,
       },
       currentAnalysisFixpointHash: input.currentAnalysisFixpointHash,
@@ -650,6 +653,140 @@ function projectStrictHypothesisDispositions(
     );
   }
   return projected;
+}
+
+/** Core HypothesisV1 声明的全部字段；其余键都是模型附加内容。 */
+const HYPOTHESIS_CONTRACT_FIELDS: ReadonlySet<string> = new Set([
+  'hypothesisId',
+  'statement',
+  'premiseFactIds',
+]);
+
+/**
+ * 模型提交的 counterqueryApplicability 提案字段；reviewerReceiptId 由宿主封印回执派生，
+ * 模型携带时已在 rejectLegacySemanticAuthority 中失败关闭，走不到投影。
+ */
+const COUNTERQUERY_APPLICABILITY_CONTRACT_FIELDS: ReadonlySet<string> = new Set([
+  'status',
+  'reasonCode',
+]);
+
+type StrictCounterqueryApplicabilityProposalV1 =
+  StrictFalsificationInputV1['counterqueryApplicability'];
+
+/**
+ * 假设行只投影 HypothesisV1 契约字段后才交给 Core（C044，与 C24 处置行同根）。Core
+ * normalizeInductionHypotheses 用展开保留全部键，未投影时模型附加的 notes 等自由文本会进入
+ * induction receiptHash、epochHash，并经 producerEligibleHypotheses 流入 lineage 的
+ * hypothesisHash；重建复用回执里的假设，额外键还会被原样带回从而“自证”通过。
+ * 合法行（只含契约字段）投影前后逐字节相同，哈希不变；投影在所有 Core 调用之前完成，丢字段时
+ * 先记一条 info 诊断（只记键名与假设 ID，不记内容），诊断不参与裁决。
+ * 形状（hypotheses 为对象数组、premiseFactIds 为数组）已由 assertStrictAnalystInputShape 保证；
+ * 字段值语义仍交给 assertFactsWithinPopulation 与 Core 构造器裁决。
+ */
+function projectStrictInductionHypotheses(
+  inductions: readonly StrictInductionInputV1[]
+): HypothesisV1[][] {
+  const droppedFields = new Set<string>();
+  const affectedHypothesisIds = new Set<string>();
+  const projected = inductions.map((induction) =>
+    induction.hypotheses.map((hypothesis): HypothesisV1 => {
+      if (collectNonContractFields(hypothesis, HYPOTHESIS_CONTRACT_FIELDS, droppedFields)) {
+        affectedHypothesisIds.add(String(hypothesis.hypothesisId));
+      }
+      return {
+        hypothesisId: hypothesis.hypothesisId,
+        statement: hypothesis.statement,
+        premiseFactIds: hypothesis.premiseFactIds,
+      };
+    })
+  );
+  logStrictContractProjection(
+    '[StrictAnalyst] induction hypotheses projected to contract fields',
+    'model-output-outside-hypothesis-contract',
+    droppedFields,
+    affectedHypothesisIds,
+    'epoch-hash-and-lineage-cover-hypothesis-contract-fields-only'
+  );
+  return projected;
+}
+
+/**
+ * counterqueryApplicability 只投影 {status, reasonCode} 后再追加宿主派生的 reviewerReceiptId
+ * （C044）。Core createFalsificationReceiptV1 展开保留全部键并写进 receiptHash，而审查回执的
+ * proposedDispositionHash 只覆盖 status/reasonCode，所以模型附加键既不受审查约束、又会改变
+ * epochHash。投影后合法输入逐字节不变；丢字段时记 info 诊断，诊断不参与裁决。
+ * 对象形状已由 assertStrictAnalystInputShape 保证；字段值仍由 Core validateFalsificationApplicability 裁决。
+ */
+function projectStrictCounterqueryApplicability(
+  falsifications: readonly StrictFalsificationInputV1[]
+): StrictCounterqueryApplicabilityProposalV1[] {
+  const droppedFields = new Set<string>();
+  const affectedHypothesisIds = new Set<string>();
+  const projected = falsifications.map(
+    (falsification): StrictCounterqueryApplicabilityProposalV1 => {
+      const applicability = falsification.counterqueryApplicability;
+      if (
+        collectNonContractFields(
+          applicability,
+          COUNTERQUERY_APPLICABILITY_CONTRACT_FIELDS,
+          droppedFields
+        )
+      ) {
+        affectedHypothesisIds.add(String(falsification.hypothesisId));
+      }
+      return { status: applicability.status, reasonCode: applicability.reasonCode };
+    }
+  );
+  logStrictContractProjection(
+    '[StrictAnalyst] counterquery applicability projected to contract fields',
+    'model-output-outside-applicability-contract',
+    droppedFields,
+    affectedHypothesisIds,
+    'falsification-receipt-hash-covers-applicability-contract-fields-only'
+  );
+  return projected;
+}
+
+/** 把 row 中不属于契约的键记入 droppedFields；返回该行是否含契约外的键。 */
+function collectNonContractFields(
+  row: object,
+  contractFields: ReadonlySet<string>,
+  droppedFields: Set<string>
+): boolean {
+  let dropped = false;
+  for (const key of Object.keys(row)) {
+    if (!contractFields.has(key)) {
+      droppedFields.add(key);
+      dropped = true;
+    }
+  }
+  return dropped;
+}
+
+/** 契约字段投影的诊断：只在确有字段被丢弃时记录；observeSafely 吞掉观察器异常，不影响投影结果。 */
+function logStrictContractProjection(
+  message: string,
+  reason: string,
+  droppedFields: ReadonlySet<string>,
+  affectedHypothesisIds: ReadonlySet<string>,
+  followUpCheck: string
+): void {
+  if (droppedFields.size === 0) {
+    return;
+  }
+  observeSafely(
+    () =>
+      Logger.getInstance().info(message, {
+        component: 'validateStrictAnalystEpochV1',
+        reason,
+        selectedPath: 'project-contract-fields',
+        droppedFields: [...droppedFields].sort(),
+        hypothesisIds: [...affectedHypothesisIds].sort(),
+        followUpCheck,
+      }),
+    () => undefined
+  );
 }
 
 export interface CreateStrictAnalysisFixpointInputV1 {

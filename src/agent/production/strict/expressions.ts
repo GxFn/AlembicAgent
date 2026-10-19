@@ -1,4 +1,5 @@
 /** Producer表达集、前驱绑定与终态回执封印；不授予持久化权限。 */
+import Logger from '@alembic/core/logging';
 import {
   assertKnowledgeDispositionReviewV1,
   type HypothesisExpressionRowV1,
@@ -7,6 +8,7 @@ import {
   type KnowledgeDispositionReviewV1,
   validateHypothesisExpressionSetReceiptV1,
 } from '@alembic/core/production';
+import { observeSafely } from '#shared/observers.js';
 import type { ProducerEligibleHypothesisV1 } from './analyst.js';
 import {
   assertCausalRepairNodeIntegrity,
@@ -248,15 +250,46 @@ function normalizeStrictProducerProposals(
       expressionId: proposal.expressionId,
       kind: proposal.kind,
       authored: proposal.authored,
-      ...(proposal.matchingRepresentativeId
-        ? { matchingRepresentativeId: proposal.matchingRepresentativeId }
-        : {}),
+      ...projectStrictRepresentative(proposal),
       authoredFingerprint: hashCoreCanonical({
         schemaVersion: 1,
         authored: proposal.authored,
       }),
     }))
     .sort((left, right) => left.expressionId.localeCompare(right.expressionId, 'en'));
+}
+
+/**
+ * matchingRepresentativeId 只投影契约字段（C046，沿用 C24 的投影口径）：
+ * - merge/duplicate：上游已校验为非空白字符串，原样保留，合法输入的哈希不变；
+ * - draft：契约是“省略”（StrictProductionPrompts 输出契约），宿主 parseProducerOutput 只做 as
+ *   断言，模型可能回传数字、对象等任意值。一律不投影，避免不合契约的值进入 proposals、
+ *   authoredFingerprintHash 与 setHash 并打破公开类型。null/空串/缺省本来就不投影，静默处理；
+ *   其他值丢弃时记 warn 诊断（不记录原值，只记类型），诊断不参与裁决。
+ */
+function projectStrictRepresentative(proposal: StrictProducerProposalInputV1): {
+  readonly matchingRepresentativeId?: string;
+} {
+  const representative: unknown = proposal.matchingRepresentativeId;
+  if (proposal.kind !== 'draft') {
+    return typeof representative === 'string' ? { matchingRepresentativeId: representative } : {};
+  }
+  if (representative !== undefined && representative !== null && representative !== '') {
+    // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，投影结果不因诊断失败而改变。
+    observeSafely(
+      () =>
+        Logger.getInstance().warn('[StrictProducer] draft matchingRepresentativeId dropped', {
+          component: 'createStrictProducerExpressionSetV1',
+          reason: 'draft-must-not-carry-representative',
+          selectedPath: 'drop-field',
+          expressionId: proposal.expressionId,
+          valueType: Array.isArray(representative) ? 'array' : typeof representative,
+          followUpCheck: 'set-hash-excludes-draft-representative',
+        }),
+      () => undefined
+    );
+  }
+  return {};
 }
 
 /**
