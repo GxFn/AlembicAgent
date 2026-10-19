@@ -1187,6 +1187,236 @@ describe('evolution-audit scale budget reaches the evolve stage (L8-P03)', () =>
   });
 });
 
+// L8-P08 / L8-C17：runEvolutionAudit 的完整性判定必须与 evolutionGateEvaluator 同一口径——期望集合是
+// 去重后的 Recipe ID，pending 只列真正未决策的 ID；strategyContext 的键名必须是门控读取的那个，
+// 否则门控看不到期望 ID 而不 retry，本函数却抛 incomplete。这里用 mock AgentService 钉住主路径。
+describe('runEvolutionAudit completeness matches the evolution gate (L8-P08)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const overview = { primaryLang: 'ts', fileCount: 1, modules: ['core'] };
+  const recipe = (id: string) => ({ id, title: `Recipe ${id}`, trigger: `@${id}` });
+  const skip = (id: string): ToolCallEntry => ({
+    tool: 'knowledge',
+    args: { action: 'manage', params: { id, operation: 'skip_evolution', reason: 'still valid' } },
+    result: { outcome: 'verified' },
+    durationMs: 0,
+  });
+
+  function auditService(toolCalls: ToolCallEntry[], status: AgentRunStatus = 'success') {
+    const calls: AgentRunInput[] = [];
+    const result: AgentRunResult = {
+      runId: 'evolution-audit-fixture',
+      profileId: 'evolution-audit',
+      reply: 'decisions submitted',
+      status,
+      toolCalls,
+      usage: { inputTokens: 1, outputTokens: 1, iterations: 2, durationMs: 1 },
+      diagnostics: null,
+    };
+    const run = vi.fn(async (input: AgentRunInput): Promise<AgentRunResult> => {
+      calls.push(input);
+      return result;
+    });
+    return { calls, run, result, service: { run } as unknown as AgentService };
+  }
+
+  function strategyContextOf(input: AgentRunInput | undefined): Record<string, unknown> {
+    const strategyContext = input?.context?.strategyContext;
+    expect(strategyContext).toBeDefined();
+    return strategyContext ?? {};
+  }
+
+  function captureAuditWarnings() {
+    const warnings: Array<{ message: string; meta: Record<string, unknown> }> = [];
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(((
+      message: unknown,
+      meta?: unknown
+    ) => {
+      warnings.push({
+        message: String(message),
+        meta: meta && typeof meta === 'object' ? (meta as Record<string, unknown>) : {},
+      });
+    }) as never);
+    return () => warnings.filter((entry) => entry.message.includes('[EvolutionAudit]'));
+  }
+
+  it('returns an empty audit without starting a run when there are no recipes', async () => {
+    const { run, service } = auditService([]);
+
+    await expect(
+      runEvolutionAudit({ agentService: service, recipes: [], projectOverview: overview })
+    ).resolves.toEqual({
+      proposed: 0,
+      deprecated: 0,
+      skipped: 0,
+      toolCalls: 0,
+      iterations: 0,
+      reply: '',
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('returns the projected audit when every recipe has a decision', async () => {
+    const { service } = auditService([skip('r1'), skip('r2')]);
+
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: [recipe('r1'), recipe('r2')],
+        projectOverview: overview,
+      })
+    ).resolves.toEqual({
+      proposed: 0,
+      deprecated: 0,
+      skipped: 2,
+      toolCalls: 2,
+      iterations: 2,
+      reply: 'decisions submitted',
+    });
+  });
+
+  it('throws runFailure with the pending ids and the partial result when decisions are missing', async () => {
+    const toolCalls = [skip('r1'), skip('r2')];
+    const { calls, result, service } = auditService(toolCalls);
+    const recipes = [recipe('r1'), recipe('r2'), recipe('r3')];
+
+    const failure = await runEvolutionAudit({
+      agentService: service,
+      recipes,
+      projectOverview: overview,
+    }).then(
+      () => null,
+      (err: unknown) => err
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).toMatchObject({
+      message: 'Evolution audit incomplete: decisions 2/3; pending=r3',
+      partialResult: result,
+      cause: result,
+    });
+    // 同一份 strategyContext 交给门控，门控给出的 pendingIds 必须与本函数报告的一致。
+    expect(evolutionGateEvaluator({ toolCalls }, null, strategyContextOf(calls[0]))).toMatchObject({
+      action: 'retry',
+      artifact: { pendingIds: ['r3'] },
+    });
+  });
+
+  it('accepts duplicated recipe ids once every unique id is decided, as the gate does', async () => {
+    const warnings = captureAuditWarnings();
+    const toolCalls = [skip('r1')];
+    const { calls, service } = auditService(toolCalls);
+
+    const audit = await runEvolutionAudit({
+      agentService: service,
+      recipes: [recipe('r1'), recipe('r1')],
+      projectOverview: overview,
+    });
+
+    expect(audit.skipped).toBe(1);
+    expect(evolutionGateEvaluator({ toolCalls }, null, strategyContextOf(calls[0])).action).toBe(
+      'pass'
+    );
+    expect(warnings()).toEqual([
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          reasonCode: 'evolution-audit-duplicate-recipe-ids',
+          duplicateIds: ['r1'],
+          recipeCount: 2,
+          uniqueRecipeCount: 1,
+        }),
+      }),
+    ]);
+  });
+
+  it('reports pending ids against the deduplicated expected set when duplicates are undecided', async () => {
+    const warnings = captureAuditWarnings();
+    const { service } = auditService([skip('r1')]);
+
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: [recipe('r1'), recipe('r1'), recipe('r2'), recipe('r2')],
+        projectOverview: overview,
+      })
+    ).rejects.toThrow('Evolution audit incomplete: decisions 1/2; pending=r2');
+    // 重复 ID 的诊断与 run 成败无关：审计失败时也要留下它，便于定位上游候选契约漂移。
+    expect(warnings().map((entry) => entry.meta.duplicateIds)).toEqual([['r1', 'r2']]);
+  });
+
+  it('does not emit the duplicate diagnostic for unique recipe ids', async () => {
+    const warnings = captureAuditWarnings();
+    const { service } = auditService([skip('r1'), skip('r2')]);
+
+    await runEvolutionAudit({
+      agentService: service,
+      recipes: [recipe('r1'), recipe('r2')],
+      projectOverview: overview,
+    });
+
+    expect(warnings()).toEqual([]);
+  });
+
+  it('passes proposalSource to the tools through strategyContext.sharedState', async () => {
+    const withSource = auditService([skip('r1')]);
+    await runEvolutionAudit({
+      agentService: withSource.service,
+      recipes: [recipe('r1')],
+      projectOverview: overview,
+      proposalSource: 'rescan-evolution',
+    });
+    expect(strategyContextOf(withSource.calls[0]).sharedState).toEqual({
+      evolutionProposalSource: 'rescan-evolution',
+    });
+
+    const withoutSource = auditService([skip('r1')]);
+    await runEvolutionAudit({
+      agentService: withoutSource.service,
+      recipes: [recipe('r1')],
+      projectOverview: overview,
+    });
+    expect(strategyContextOf(withoutSource.calls[0]).sharedState).toEqual({});
+  });
+
+  it('hands the gate its expected recipes under the existingRecipes key', async () => {
+    const { calls, service } = auditService([skip('r1'), skip('r2')]);
+    const recipes = [recipe('r1'), recipe('r2')];
+
+    await runEvolutionAudit({ agentService: service, recipes, projectOverview: overview });
+
+    const strategyContext = strategyContextOf(calls[0]);
+    expect(strategyContext.existingRecipes).toBe(recipes);
+    expect(strategyContext).not.toHaveProperty('decayedRecipes');
+    // 门控只从 existingRecipes 读期望集合：没有回执时必须把两个 ID 都列为待决。
+    expect(evolutionGateEvaluator({ toolCalls: [] }, null, strategyContext)).toMatchObject({
+      action: 'retry',
+      artifact: { totalRecipes: 2, pendingIds: ['r1', 'r2'] },
+    });
+  });
+
+  it.each([
+    'error',
+    'timeout',
+    'blocked',
+    'aborted',
+  ] as const)('throws runFailure for a %s run even when decisions are complete', async (status) => {
+    const { result, service } = auditService([skip('r1')], status);
+
+    await expect(
+      runEvolutionAudit({
+        agentService: service,
+        recipes: [recipe('r1')],
+        projectOverview: overview,
+      })
+    ).rejects.toMatchObject({
+      message: `Evolution audit failed with status ${status}: decisions submitted`,
+      partialResult: result,
+    });
+  });
+});
+
 function coordinationProfile(): CompiledAgentProfile {
   return {
     kind: 'compiled-agent-profile',

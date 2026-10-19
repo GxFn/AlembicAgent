@@ -1,4 +1,6 @@
 import type { EvolutionCandidateReason } from '@alembic/core/evolution';
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { AuditHint, ExistingRecipeForEvolution } from '../../prompts/insightEvolver.js';
 import type { ToolCallEntry } from '../../runtime/AgentRuntimeTypes.js';
 import type { AgentService } from '../../service/AgentService.js';
@@ -74,6 +76,11 @@ export async function runEvolutionAudit({
     return { proposed: 0, deprecated: 0, skipped: 0, toolCalls: 0, iterations: 0, reply: '' };
   }
 
+  // 完整性口径与 evolutionGateEvaluator 一致（L8-C17）：门控按期望 ID 逐个判 pending，
+  // 所以下方的分母与 pending 都基于去重后的 ID，而不是可能含重复的 recipes.length。
+  // 在 run 之前计算，使重复 ID 的诊断与本次 run 的成败无关。
+  const expectedIds = uniqueAuditRecipeIds(recipes);
+
   const sharedState: Record<string, unknown> = {};
   if (proposalSource) {
     sharedState.evolutionProposalSource = proposalSource;
@@ -118,18 +125,53 @@ export async function runEvolutionAudit({
     toolCalls: result.toolCalls,
     iterations: result.usage.iterations,
   });
-  const decisionIds = collectEvolutionDecisionIds(
-    result.toolCalls,
-    recipes.map((r) => r.id)
-  );
-  if (decisionIds.size < recipes.length) {
-    const pending = recipes.map((r) => r.id).filter((id) => !decisionIds.has(id));
+  const decisionIds = collectEvolutionDecisionIds(result.toolCalls, expectedIds);
+  const pending = expectedIds.filter((id) => !decisionIds.has(id));
+  if (pending.length > 0) {
     throw runFailure(
       result,
-      `Evolution audit incomplete: decisions ${decisionIds.size}/${recipes.length}; pending=${pending.join(', ')}`
+      `Evolution audit incomplete: decisions ${decisionIds.size}/${expectedIds.length}; pending=${pending.join(', ')}`
     );
   }
   return audit;
+}
+
+/**
+ * 审计的期望 Recipe ID 集合（按首次出现顺序去重）。
+ *
+ * 当前唯一生产宿主的候选已在 Core RecipeImpactPlanner 按 recipeId 合并，正常不会出现重复；
+ * 一旦出现，说明调用方的候选契约漂移了。这里不拒绝也不改写送给 Agent 的 recipes（门控同样
+ * 按 ID 判完成，重复项不需要第二次决策），只在完整性判定上去重，并留下可定位的诊断。
+ */
+function uniqueAuditRecipeIds(recipes: readonly EvolutionAuditRecipe[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const { id } of recipes) {
+    if (seen.has(id)) {
+      duplicates.add(id);
+    } else {
+      seen.add(id);
+    }
+  }
+  if (duplicates.size > 0) {
+    const duplicateIds = [...duplicates];
+    // 诊断通道失败不能把一次已完成的审计升级为失败，所以经 observeSafely 隔离。
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          `[EvolutionAudit] duplicate recipe ids in audit input; completeness is judged on unique ids (duplicates=${duplicateIds.join(', ')}, recipes=${recipes.length}, unique=${seen.size})`,
+          {
+            reasonCode: 'evolution-audit-duplicate-recipe-ids',
+            duplicateIds,
+            recipeCount: recipes.length,
+            uniqueRecipeCount: seen.size,
+            resolution: 'dedupe-expected-ids',
+          }
+        ),
+      () => undefined
+    );
+  }
+  return [...seen];
 }
 
 export function projectEvolutionAuditResult({
@@ -157,7 +199,13 @@ export function projectEvolutionAuditResult({
   };
 }
 
-/** 公开兼容入口；Gate 与结果投影共享同一业务结果判定。 */
+/**
+ * 公开兼容入口：返回已有成功决策的 Recipe ID 集合（expectedIds 非空时只含清单内 ID）。
+ *
+ * 与 evolutionGateEvaluator 共用 collectEvolutionDecisions 的按 Recipe 归并，runEvolutionAudit 的
+ * 完整性判定也走这里，所以门控与完整性判定同一口径。注意 projectEvolutionAuditResult 的计数
+ * 只共享单条回执的解析（evolutionOutcome），仍按单次工具调用计数，并不走这份归并。
+ */
 export function collectEvolutionDecisionIds(
   toolCalls: ToolCallEntry[],
   expectedIds: string[] = []
