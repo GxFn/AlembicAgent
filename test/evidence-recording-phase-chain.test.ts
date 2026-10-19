@@ -1,4 +1,7 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { createCanonicalSourceIdentity } from '@alembic/core';
+import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
   analysisQualityGate,
@@ -25,7 +28,16 @@ import {
   recordPcvInputAssembly,
   recordPcvToolResult,
 } from '../src/agent/runtime/PcvNodeEvidenceRecorder.js';
+import type {
+  ToolMetadata,
+  ToolPipelineContext,
+} from '../src/agent/runtime/toolPipeline/contracts.js';
+import { executeRuntimeToolCall } from '../src/agent/runtime/toolPipeline/runtimeBridge.js';
+import { createToolReceipt } from '../src/agent/runtime/toolReceipt.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
+import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
+import { DeltaCache } from '../src/tools/runtime/cache/DeltaCache.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { createTempProject } from './helpers/tempProject.js';
 
@@ -1123,6 +1135,145 @@ describe('PCV evidence detail corrections (I28)', () => {
     expect(summary.sourceRefDiagnostics).toEqual([]);
   });
 
+  /**
+   * C052：经真实路由（ToolRouterAdapter + executeRuntimeToolCall）产出信封与返回值，再按 AgentRuntime
+   * 的同一口径（createToolReceipt → readToolObservation(receipt).ok）得到 toolSucceeded 并记录 PCV 证据。
+   */
+  async function recordRoutedRead(
+    root: string,
+    params: Record<string, unknown>,
+    options: { abortSignal?: AbortSignal; deltaCache?: DeltaCache } = {}
+  ) {
+    const ctx = createLoop();
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({
+          projectRoot: root,
+          tokenBudget: 8000,
+          ...(options.deltaCache ? { deltaCache: options.deltaCache } : {}),
+        }),
+      },
+    });
+    const pipelineContext = {
+      runtime: {
+        id: 'pcv-read-runtime',
+        presetName: 'pcv-read',
+        policies: {},
+        toolRouter: adapter,
+      },
+      loopCtx: {
+        allowedToolIds: ['code'],
+        allowedToolActions: {},
+        iteration: 1,
+        ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+      },
+      iteration: 1,
+    } as unknown as ToolPipelineContext;
+    const call = { id: 'read-batch', name: 'code', args: { action: 'read', params } };
+    const metadata: ToolMetadata = { cacheHit: false, blocked: false, isNew: false, durationMs: 0 };
+    const result = await executeRuntimeToolCall(call, pipelineContext, metadata);
+    const toolSucceeded = readToolObservation(createToolReceipt(call, result, metadata)).ok;
+    recordPcvToolResult(ctx.pcvNodeEvidence, call, result, metadata.envelope, { toolSucceeded });
+    return { toolSucceeded, summary: buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence) };
+  }
+
+  it('links only the members a partially failed code.read batch really read (C052)', async () => {
+    const root = createTempProject('pcv-partial-read-');
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    writeFileSync(path.join(root, 'src', 'real.ts'), 'export const real = 1;');
+
+    const { toolSucceeded, summary } = await recordRoutedRead(root, {
+      filePaths: ['src/real.ts', 'src/ghost.ts'],
+    });
+
+    // 批量读取至少一个成员成功时整体回执仍是成功；失败成员不能借整体成功混进节点 sourceRefs。
+    expect(toolSucceeded).toBe(true);
+    expect(summary.sourceRefs).toEqual(['src/real.ts']);
+    expect(summary.sourceRefs.some((ref) => path.isAbsolute(ref))).toBe(false);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: 'src/ghost.ts', reason: 'failed-tool-call', status: 'missing' },
+    ]);
+    expect(summary.missingLinkReasons).not.toContain('missing-source-refs');
+  });
+
+  it('keeps aborted and failed batch members out of sourceRefs even when the call is reported successful', () => {
+    // 被审提交上的取消形状：批量回执整体 ok，未读成员写成 Read aborted；外部调用方也可能只按整体成功传入。
+    const ctx = createLoop();
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      {
+        id: 'read-cancelled',
+        name: 'code',
+        args: { action: 'read', params: { filePaths: ['src/one.ts', 'src/two.ts'] } },
+      },
+      {
+        mode: 'batch',
+        files: [
+          { ok: true, path: 'src/one.ts', content: "import { two } from './lib/two-helper.ts';" },
+          { ok: false, path: 'src/two.ts', error: 'Read aborted' },
+        ],
+      },
+      undefined,
+      { toolSucceeded: true }
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    // 成功成员正文里的引用照常链接（与单文件读取同一口径），未读成员只留 failed-tool-call 审计诊断。
+    expect(summary.sourceRefs).toEqual(['src/one.ts', './lib/two-helper.ts']);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: 'src/two.ts', reason: 'failed-tool-call', status: 'missing' },
+    ]);
+
+    const legacy = createLoop();
+    recordPcvToolResult(
+      legacy.pcvNodeEvidence,
+      {
+        id: 'read-legacy-batch',
+        name: 'code',
+        args: { action: 'read', params: { filePaths: ['src/one.ts', 'src/gone.ts'] } },
+      },
+      {
+        batchResults: {
+          'src/one.ts': { ok: true, content: 'export const one = 1;' },
+          // 报错文本里的路径（真实运行中是宿主绝对路径）不能被提取进 sourceRefs。
+          'src/gone.ts': { ok: false, error: 'Cannot read file: ENOENT open lib/gone-copy.ts' },
+        },
+      },
+      undefined,
+      { toolSucceeded: true }
+    );
+    const legacySummary = buildPcvNodeEvidenceSummary(legacy.pcvNodeEvidence);
+    expect(legacySummary.sourceRefs).toEqual(['src/one.ts']);
+    expect(legacySummary.sourceRefDiagnostics).toEqual([
+      { input: 'src/gone.ts', reason: 'failed-tool-call', status: 'missing' },
+    ]);
+  });
+
+  it('keeps a batch cancelled mid-read failed and out of sourceRefs (C052 cancel regression)', async () => {
+    const root = createTempProject('pcv-cancel-read-');
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    writeFileSync(path.join(root, 'src', 'one.ts'), 'export const one = 1;');
+    writeFileSync(path.join(root, 'src', 'two.ts'), 'export const two = 2;');
+    const controller = new AbortController();
+    // 第一个成员读完（指纹比较）后立即取消：第二个成员不会被读取。
+    class AbortAfterFirstRead extends DeltaCache {
+      override check(filePath: string, content: string) {
+        const checked = super.check(filePath, content);
+        controller.abort();
+        return checked;
+      }
+    }
+
+    const { toolSucceeded, summary } = await recordRoutedRead(
+      root,
+      { filePaths: ['src/one.ts', 'src/two.ts'] },
+      { abortSignal: controller.signal, deltaCache: new AbortAfterFirstRead() }
+    );
+
+    expect(toolSucceeded).toBe(false);
+    expect(summary.sourceRefs).toEqual([]);
+    expect(summary.missingLinkReasons).toContain('missing-source-refs');
+  });
+
   it('keeps a failed note_finding reference on the rejected finding only', () => {
     const ctx = createLoop();
     recordPcvToolResult(
@@ -1193,6 +1344,103 @@ describe('PCV evidence detail corrections (I28)', () => {
       gate: { pass: true, action: 'pass' },
     });
     expect(guarded.groundingEnforcement).toBe('guard');
+  });
+
+  /** C053：只看本记录器的两条降级/兼容日志，其它模块的日志不影响断言。 */
+  function pcvLogCalls(spy: { mock: { calls: unknown[][] } }, code: string): string[] {
+    return spy.mock.calls
+      .map((args) => args[0])
+      .filter(
+        (message): message is string =>
+          typeof message === 'string' && message.startsWith(`[PcvNodeEvidence] ${code}`)
+      );
+  }
+
+  it('logs the failed check and input shape when source evidence falls back (C053)', () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const quality = buildPcvQualityGateEvidence({
+        source: { pcvNodeEvidence: { schemaVersion: 1, nodeId: 'x', ledgerRefs: 'oops' } },
+        artifact: { referencedFiles: ['src/widget.ts'] },
+        dimId: 'probe',
+        gate: { pass: true, action: 'pass' },
+      });
+      expect(quality.missingLinkReasons).toContain('invalid-source-pcv-evidence');
+      const messages = pcvLogCalls(warn, 'pcv_quality_gate_invalid_source_evidence');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain('dimId=probe');
+      // 首个未通过的检查项：schemaVersion/nodeId 合法，chainNodeId 缺失。
+      expect(messages[0]).toContain('failedCheck=chainNodeId');
+      expect(messages[0]).toContain('inputType=object');
+      expect(messages[0]).toContain('keys=[schemaVersion,nodeId,ledgerRefs]');
+      expect(messages[0]).toContain('schemaVersion=1');
+      expect(messages[0]).toContain('nodeId=x');
+
+      warn.mockClear();
+      const ctx = createLoop();
+      buildPcvQualityGateEvidence({
+        source: { pcvNodeEvidence: { ...ctx.buildResult().pcvNodeEvidence, ledgerRefs: 'oops' } },
+        artifact: { referencedFiles: ['src/widget.ts'] },
+        dimId: 'probe',
+        gate: { pass: true, action: 'pass' },
+      });
+      const fieldMessages = pcvLogCalls(warn, 'pcv_quality_gate_invalid_source_evidence');
+      expect(fieldMessages).toHaveLength(1);
+      expect(fieldMessages[0]).toContain('failedCheck=ledgerRefs');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs the legacy groundingEnforcement default and keeps off (C053)', () => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const ctx = createLoop();
+      const { groundingEnforcement: _omitted, ...legacy } = ctx.buildResult().pcvNodeEvidence;
+      const quality = buildPcvQualityGateEvidence({
+        source: { pcvNodeEvidence: legacy },
+        artifact: { referencedFiles: ['src/widget.ts'] },
+        gate: { pass: true, action: 'pass' },
+      });
+      expect(quality.groundingEnforcement).toBe('off');
+      const messages = pcvLogCalls(info, 'pcv_legacy_summary_grounding_enforcement_defaulted');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain(`nodeId=${legacy.nodeId}`);
+      expect(messages[0]).toContain('defaulted=off');
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('does not log either C053 path for absent or complete source evidence', () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const ctx = createLoop();
+      for (const source of [{}, { pcvNodeEvidence: ctx.buildResult().pcvNodeEvidence }]) {
+        buildPcvQualityGateEvidence({
+          source,
+          artifact: { referencedFiles: ['src/widget.ts'] },
+          dimId: 'probe',
+          gate: { pass: true, action: 'pass' },
+        });
+      }
+      for (const spy of [warn, info]) {
+        expect(pcvLogCalls(spy, 'pcv_quality_gate_invalid_source_evidence')).toEqual([]);
+        expect(pcvLogCalls(spy, 'pcv_legacy_summary_grounding_enforcement_defaulted')).toEqual([]);
+      }
+    } finally {
+      warn.mockRestore();
+      info.mockRestore();
+    }
   });
 
   it('does not carry a stale observation-ledger stats snapshot', () => {

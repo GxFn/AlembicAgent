@@ -3,6 +3,11 @@ import Logger from '@alembic/core/logging';
 import { resolveModelQuirks } from '#ai/registry/ModelQuirks.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type { EvidenceLedgerStore } from '../evidence/EvidenceLedgerStore.js';
+import {
+  failedReadPaths,
+  readToolObservation,
+  successfulReadPaths,
+} from '../utils/toolOutcomes.js';
 import type { GroundingEnforcement } from './AgentRuntimeTypes.js';
 import type { LLMInputAssembly } from './LLMInputAssembly.js';
 import type { LoopContext } from './LoopContext.js';
@@ -593,7 +598,14 @@ export function recordPcvToolResult(
   // 没有 envelope 时以 result.error 是否存在判定，与下方 note_finding 的接受判定共用同一口径。
   const toolSucceeded =
     options.toolSucceeded ?? (envelope ? envelope.ok : resultRecord.error === undefined);
-  if (toolSucceeded) {
+  // C052：批量 code.read 只要有一个成员成功，整体回执就是成功；失败/取消成员仍在 args 与回执文本里
+  // （含 ENOENT 报错中的宿主绝对路径）。“读到了什么”与 analysisArtifact / ActiveContext 等共用
+  // toolOutcomes 的成员级口径，这里只在确有失败成员时改走成员级记录，其余调用的提取方式不变。
+  const readReceipt = { tool: call.name, args: call.args, result, envelope };
+  const failedReadMembers = toolSucceeded ? failedReadPaths(readReceipt) : [];
+  if (toolSucceeded && failedReadMembers.length > 0) {
+    recordPartialReadSourceRefs(evidence, readReceipt, failedReadMembers);
+  } else if (toolSucceeded) {
     const sourceRefs = normalizeSourceRefsForEvidence(
       evidence,
       extractSourceRefsFromValue([
@@ -796,6 +808,8 @@ function createQualityGateEvidenceBase(
     // PcvNodeEvidenceProcessMetadata，或被宿主重组/截断过的旧摘要）。此时不再克隆它（会抛 TypeError
     // 让整个 quality_gate 阶段失败），改用 fallback 证据，并留下持久原因供审计定位来源证据被丢弃。
     fallback.missingLinkReasons.push('invalid-source-pcv-evidence');
+    // C053：持久原因不带失败字段与输入形状，同时写一条降级日志补上触发条件与关键输入。
+    reportInvalidSourcePcvEvidence(candidate, dimId, fallback.nodeId);
   }
   return fallback;
 }
@@ -1182,32 +1196,101 @@ function createFallbackQualityGateEvidence(
  * groundingEnforcement 缺省视为 AP-4 之前的旧摘要（clone 时补 'off'），出现时必须是合法取值。
  */
 function isPcvNodeEvidenceSummary(value: unknown): value is PcvNodeEvidenceSummary {
+  return findPcvNodeEvidenceSummaryDefect(value) === null;
+}
+
+/**
+ * C053：结构守卫的逐项检查，按固定顺序返回首个未通过的检查项名（全部通过返回 null）。
+ * isPcvNodeEvidenceSummary 是它的布尔包装；invalid-source 降级日志用它点名失败字段。仅模块内使用。
+ */
+function findPcvNodeEvidenceSummaryDefect(value: unknown): string | null {
   if (!isJsonRecord(value)) {
-    return false;
+    return 'not-an-object';
   }
-  if (
-    value.schemaVersion !== 1 ||
-    typeof value.nodeId !== 'string' ||
-    typeof value.chainNodeId !== 'string' ||
-    !isJsonRecord(value.correlation) ||
-    !isJsonRecord(value.stageIdentity) ||
-    !Array.isArray(value.sourceRefs) ||
-    !isOptionalArray(value.missingLinkReasons) ||
-    !isOptionalArray(value.sourceRefDiagnostics) ||
-    !(
-      value.groundingEnforcement === undefined || isGroundingEnforcement(value.groundingEnforcement)
-    )
-  ) {
-    return false;
-  }
-  return (
-    hasValidFindingRefs(value.findingRefs) &&
-    hasValidLedgerRefs(value.ledgerRefs) &&
-    hasValidRepair(value.repair) &&
-    hasValidGroundingLedger(value.groundingLedger) &&
-    hasValidInputAssembly(value.inputAssembly) &&
-    hasValidQualityGate(value.qualityGate)
+  const record = value;
+  const checks: ReadonlyArray<readonly [string, () => boolean]> = [
+    ['schemaVersion', () => record.schemaVersion === 1],
+    ['nodeId', () => typeof record.nodeId === 'string'],
+    ['chainNodeId', () => typeof record.chainNodeId === 'string'],
+    ['correlation', () => isJsonRecord(record.correlation)],
+    ['stageIdentity', () => isJsonRecord(record.stageIdentity)],
+    ['sourceRefs', () => Array.isArray(record.sourceRefs)],
+    ['missingLinkReasons', () => isOptionalArray(record.missingLinkReasons)],
+    ['sourceRefDiagnostics', () => isOptionalArray(record.sourceRefDiagnostics)],
+    [
+      'groundingEnforcement',
+      () =>
+        record.groundingEnforcement === undefined ||
+        isGroundingEnforcement(record.groundingEnforcement),
+    ],
+    ['findingRefs', () => hasValidFindingRefs(record.findingRefs)],
+    ['ledgerRefs', () => hasValidLedgerRefs(record.ledgerRefs)],
+    ['repair', () => hasValidRepair(record.repair)],
+    ['groundingLedger', () => hasValidGroundingLedger(record.groundingLedger)],
+    ['inputAssembly', () => hasValidInputAssembly(record.inputAssembly)],
+    ['qualityGate', () => hasValidQualityGate(record.qualityGate)],
+  ];
+  return checks.find(([, check]) => !check())?.[0] ?? null;
+}
+
+/** invalid-source 降级日志最多列出的候选顶层键数、单个键名与标识取值的展示长度；只记形状，不记证据正文。 */
+const MAX_REPORTED_INVALID_SOURCE_KEYS = 12;
+const MAX_REPORTED_INVALID_SOURCE_KEY_CHARS = 40;
+const MAX_REPORTED_INVALID_SOURCE_VALUE_CHARS = 80;
+
+/**
+ * C053：质量门 source 证据未通过结构守卫、降级为 fallback 证据时的日志。missingLinkReasons 里的
+ * invalid-source-pcv-evidence 只说明“发生了降级”；这里补上触发条件（首个未通过的检查项）与关键输入
+ * （类型、顶层键、schemaVersion、nodeId），以及选择的路径（fallback 节点）。质量门没有运行诊断出口，
+ * 与截断诊断的退路一致，直接写 Core Logger。
+ */
+function reportInvalidSourcePcvEvidence(
+  candidate: unknown,
+  dimId: string | null,
+  fallbackNodeId: string
+): void {
+  const failedCheck = findPcvNodeEvidenceSummaryDefect(candidate) ?? 'unknown';
+  const inputType = Array.isArray(candidate) ? 'array' : typeof candidate;
+  const record = isJsonRecord(candidate) ? candidate : null;
+  const keys = record ? Object.keys(record) : [];
+  const reportedKeys = keys
+    .slice(0, MAX_REPORTED_INVALID_SOURCE_KEYS)
+    .map((key) => limitText(key, MAX_REPORTED_INVALID_SOURCE_KEY_CHARS));
+  const omittedKeyCount = keys.length - reportedKeys.length;
+  const keyList = `[${reportedKeys.join(',')}${omittedKeyCount > 0 ? `,+${omittedKeyCount} more` : ''}]`;
+  const schemaVersion = describeReportedSourceValue(record?.schemaVersion);
+  const nodeId = describeReportedSourceValue(record?.nodeId);
+  Logger.getInstance().warn(
+    `[PcvNodeEvidence] pcv_quality_gate_invalid_source_evidence: source.pcvNodeEvidence failed the ` +
+      `summary shape guard (dimId=${dimId ?? 'none'} failedCheck=${failedCheck} inputType=${inputType} ` +
+      `keys=${keyList} schemaVersion=${schemaVersion} nodeId=${nodeId}); quality gate continues with ` +
+      `fallback node ${fallbackNodeId} and missingLinkReasons invalid-source-pcv-evidence`,
+    {
+      path: 'invalid-source-pcv-evidence',
+      dimId,
+      failedCheck,
+      inputType,
+      inputKeys: reportedKeys,
+      inputKeyCount: keys.length,
+      schemaVersion,
+      nodeId,
+      fallbackNodeId,
+    }
   );
+}
+
+/** 日志里的标识取值：缺省记 missing，标量按值截断，其它只记类型。 */
+function describeReportedSourceValue(value: unknown): string {
+  if (value === undefined) {
+    return 'missing';
+  }
+  if (typeof value === 'string') {
+    return limitText(value, MAX_REPORTED_INVALID_SOURCE_VALUE_CHARS);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
+    return String(value);
+  }
+  return `<${Array.isArray(value) ? 'array' : typeof value}>`;
 }
 
 function hasValidFindingRefs(value: unknown): boolean {
@@ -1378,6 +1461,51 @@ function recordFailedCallSourceRefs(
       status: 'missing',
     });
   }
+}
+
+/**
+ * C052：整体成功但含失败/取消成员的批量 code.read。节点 sourceRefs 只并入：
+ * - successfulReadPaths 认定真实读到的成员路径（与 analysisArtifact、ActiveContext、SignalDetector 同源）；
+ * - 成功成员条目本身（正文里的 import 等引用，与单文件成功读取同一口径）。
+ * call.args（含失败成员的请求路径）、envelope.text（渲染了失败成员的报错）与失败成员条目都不提取；
+ * 失败成员只以其成员路径记 failed-tool-call 诊断（触发条件与关键输入），报错文本里的路径不记录，
+ * 与整体失败调用的处理口径一致。
+ */
+function recordPartialReadSourceRefs(
+  evidence: PcvNodeEvidenceSummary,
+  readReceipt: JsonRecord,
+  failedMembers: ReadonlyArray<{ path: string; reason: string }>
+): void {
+  const sourceRefs = normalizeSourceRefsForEvidence(
+    evidence,
+    extractSourceRefsFromValue([
+      successfulReadPaths(readReceipt),
+      successfulReadMemberEntries(readReceipt),
+    ])
+  );
+  addSourceRefs(evidence, sourceRefs);
+  recordFailedCallSourceRefs(
+    evidence,
+    extractSourceRefsFromValue(failedMembers.map((member) => member.path))
+  );
+}
+
+/**
+ * 批量 code.read 中成功成员的条目，成员判定与 toolOutcomes.successfulReadPaths 相同
+ * （files 数组按成员自身 ok/error/status，旧形状 batchResults 以键为路径）。
+ * 不看整体 ok：调用方已按 toolSucceeded 进入本分支，成员级过滤只负责剔除失败成员。
+ */
+function successfulReadMemberEntries(readReceipt: JsonRecord): unknown[] {
+  const payload = readToolObservation(readReceipt).result;
+  if (Array.isArray(payload.files)) {
+    return payload.files.filter((file) => readToolObservation({ result: file }).ok);
+  }
+  if (isJsonRecord(payload.batchResults)) {
+    return Object.entries(payload.batchResults)
+      .filter(([, member]) => readToolObservation({ result: member }).ok)
+      .map(([file, member]) => ({ path: file, member }));
+  }
+  return [];
 }
 
 function addSourceRefs(evidence: PcvNodeEvidenceSummary, refs: string[]): void {
@@ -1943,11 +2071,15 @@ function asQualityReport(value: unknown): {
 }
 
 function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary {
+  if (evidence.groundingEnforcement === undefined) {
+    reportLegacyGroundingEnforcementDefault(evidence);
+  }
   const cloned = {
     ...evidence,
     correlation: { ...evidence.correlation },
     // I28：AP-4 之前的旧摘要没有 groundingEnforcement；缺省取值与 LoopContext 的默认一致，
-    // 即 observe-only 'off'（非法取值已被 isPcvNodeEvidenceSummary 拒绝，走 invalid-source-pcv-evidence）。
+    // 即 observe-only 'off'（非法取值已被 isPcvNodeEvidenceSummary 拒绝，走 invalid-source-pcv-evidence）；
+    // 补默认值时已由上方 reportLegacyGroundingEnforcementDefault 记录兼容转译（C053）。
     groundingEnforcement: evidence.groundingEnforcement ?? 'off',
     findingRefs: {
       accepted: evidence.findingRefs.accepted.map((finding) => ({
@@ -2021,6 +2153,21 @@ function cloneEvidence(evidence: PcvNodeEvidenceSummary): PcvNodeEvidenceSummary
     });
   }
   return cloned;
+}
+
+/**
+ * C053：AP-4 之前的旧摘要没有 groundingEnforcement，cloneEvidence 按兼容规则补 'off'。这是一次兼容转译，
+ * 记录触发条件（字段缺省）、关键输入（nodeId）与结果（补上的取值）。补齐后的克隆带有该字段，
+ * 同一条摘要链路的后续克隆不会重复记录；运行期证据总由 LoopContext 赋值，不会走到这里。
+ */
+function reportLegacyGroundingEnforcementDefault(evidence: PcvNodeEvidenceSummary): void {
+  const nodeId = limitText(String(evidence.nodeId), MAX_REPORTED_INVALID_SOURCE_VALUE_CHARS);
+  Logger.getInstance().info(
+    `[PcvNodeEvidence] pcv_legacy_summary_grounding_enforcement_defaulted: PCV summary has no ` +
+      `groundingEnforcement (pre-AP-4 shape); nodeId=${nodeId} defaulted=off (observe-only, same as the ` +
+      `LoopContext default)`,
+    { path: 'legacy-grounding-enforcement-default', nodeId, defaulted: 'off' }
+  );
 }
 
 function shortHash(value: unknown): string {
