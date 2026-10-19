@@ -2010,6 +2010,87 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     expect(terminal[0].message).toContain('skipOnFail=false');
   });
 
+  // C027(L5-P33r3)：评估器直接返回的 degraded_* 不是 #processGate 的终态分支('degrade' 才是)，
+  // 此前在超时分支被当成「degrade 族」原样放行，落到兜底非通过分支后 skipOnFail=false 时 'continue'，
+  // produce 在超时的 analyze 回执上照跑且不写 pipeline_timeout_terminal。现在与 reject 同属终态。
+  it.each([
+    'degraded_no_findings',
+    'degraded_budget_exhausted',
+  ])('评估器直接返回 %s 落在超时源阶段上：即使 skipOnFail=false 也终止，不继续 produce，写 pipeline_timeout_terminal', async (action) => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const evaluator = vi.fn(() => ({ action, pass: false, reason: 'evaluator degraded' }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1, skipOnFail: false }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(evaluator).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe('failed');
+    expect(result.timedOut).toBe(true);
+    expect(result.phases.produce).toBeUndefined();
+    // 门回执与 gateFailures 记评估器原始裁决一次；abandonInfo 按 first-wins 保留首个 degrade 类动作。
+    expect(result.phases.quality_gate).toMatchObject({ pass: false, action });
+    expect(result.diagnostics?.gateFailures).toEqual([
+      expect.objectContaining({ stage: 'quality_gate', action }),
+    ]);
+    expect(result.phases._pipelineOutcome).toMatchObject({
+      outcome: 'failed',
+      stage: 'quality_gate',
+      action,
+    });
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].stage).toBe('quality_gate');
+    expect(terminal[0].message).toContain('analyze');
+    expect(terminal[0].message).toContain(action);
+    expect(terminal[0].message).toContain('skipOnFail=false does not override a terminal timeout');
+    // 走超时终态，而不是兜底非通过分支(那里 skipOnFail=false 会继续下游)。
+    expect(
+      warningsOf(result.diagnostics).some(
+        (warning) => warning.code === 'pipeline_gate_non_pass_terminated'
+      )
+    ).toBe(false);
+  });
+
+  it('评估器直接返回 degraded_no_findings 且 skipOnFail 缺省 → 同样写 pipeline_timeout_terminal 终态', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const evaluator = vi.fn(() => ({
+      action: 'degraded_no_findings',
+      pass: false,
+      reason: 'evaluator degraded',
+    }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1 }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.phases.produce).toBeUndefined();
+    const terminal = timeoutTerminalWarnings(result.diagnostics);
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].stage).toBe('quality_gate');
+    expect(terminal[0].message).toContain('degraded_no_findings');
+    expect(terminal[0].message).not.toContain('skipOnFail=false');
+  });
+
+  it('对照：评估器返回 degrade 落在超时源阶段上仍原样走 degrade 终态(ctx.degraded=true)，不写 pipeline_timeout_terminal', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime();
+    const evaluator = vi.fn(() => ({ action: 'degrade', pass: false, reason: 'degrade' }));
+    const result = await new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1, skipOnFail: false }),
+    }).execute(runtime, new AgentMessage({ content: 'mine' }));
+
+    expect(phases).toEqual(['analyze']);
+    expect(result.outcome).toBe('failed');
+    expect(result.degraded).toBe(true);
+    expect(result.phases.produce).toBeUndefined();
+    expect(result.phases.quality_gate).toMatchObject({ action: 'degrade' });
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
+  });
+
   it('重跑被会话输入预算压制 → degraded_budget_exhausted 终态，同时写 pipeline_timeout_terminal', async () => {
     vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const { runtime, phases } = timeoutRuntime({ recoverOnRetry: true, analyzeInputTokens: 95 });

@@ -31,8 +31,11 @@
  *                               timedOut；门 pass 更不会改回执），改走 analysis_retry 整段重跑——
  *                               这是最终回执规则唯一承认的恢复路径（重跑成功会覆盖回执）
  *   - analysis_retry / retry  → 原样进入重试分支；额度用尽、被会话输入预算压制时都是终态 'break'
- *   - degrade 族 / aborted    → 原样（本就终态）
- *   - reject 及其他非通过动作 → 终态 'break'（skipOnFail=false 也不继续：超时回执无可继续之物）
+ *   - degrade / aborted       → 原样（#processGate 里本就终态 'break'）
+ *   - reject、评估器直接返回的 degraded_* 及其他非通过动作
+ *                             → 终态 'break'（skipOnFail=false 也不继续：超时回执无可继续之物）。
+ *                               degraded_* 在 #processGate 里没有终态分支、会落到兜底非通过分支，
+ *                               因此不能按「degrade 族」原样放行（C027）
  *   每条终态都写 diagnostics.warn(pipeline_timeout_terminal) + warn 日志 + abandonInfo(action=
  *   timeout_terminal)。执行阶段最终回执超时而下一阶段不是裁决它的门时，主循环直接 'break'，
  *   避免 produce 在超时的 analyze 上白跑并持久化候选（宿主按 timedOutStages 判 timeout、计 0 候选）。
@@ -1408,8 +1411,11 @@ export class PipelineStrategy extends Strategy {
    * I05：源阶段最终回执超时时裁决门动作(文件头「源阶段最终回执超时」动作表)。纯判定，不写状态：
    *   - rewritten：pass/summary_rewrite/record_repair 改写为 analysis_retry(保留 artifact 供重试
    *     prompt，原始动作写进 reason)；
-   *   - passthrough：analysis_retry/retry、degrade 族、aborted 原样交给既有分支；
-   *   - terminal：reject 等其他非通过动作——既不能重跑也无可继续之物(不看 skipOnFail)。
+   *   - passthrough：analysis_retry/retry、degrade、aborted 原样交给既有分支(degrade 与 aborted
+   *     在 #processGate 里本就终态 'break')；
+   *   - terminal：reject、评估器直接返回的 degraded_* 等其他非通过动作——既不能重跑也无可继续之物
+   *     (不看 skipOnFail)。degraded_* 在 #processGate 里没有终态分支，放行会落到兜底非通过分支，
+   *     skipOnFail=false 时继续执行下游(C027)。
    * 严格链：strict analysis_retry 只接受评估器签发的 transition，管线无权合成，因此
    * pass/summary_rewrite/record_repair 直接 terminal；其余动作 passthrough 走既有 strict 分支
    * (带 transition 的 analysis_retry 仍可重跑，非通过仍 fail-closed)。
@@ -1447,11 +1453,16 @@ export class PipelineStrategy extends Strategy {
         gateResult: { ...gateResult, action: 'analysis_retry', pass: false, reason },
       };
     }
+    // C027(L5-P33r3)：只有 'degrade' 原样放行——#processGate 对它置 ctx.degraded 并 'break'。
+    // 评估器直接返回的 degraded_*(degraded_no_findings / degraded_budget_exhausted 等)在 #processGate
+    // 里没有专属分支，会落到兜底非通过分支，skipOnFail=false 时 'continue'，让 produce 在超时回执上
+    // 白跑；因此它们与 reject 同属下面的 terminal(不看 skipOnFail)。管线内部合成的 degraded_* 不经
+    // 这里(合成后直接 break)。严格链仍整体 passthrough，交既有 fail-closed 分支。
     if (
       action === 'analysis_retry' ||
       action === 'retry' ||
       action === 'aborted' ||
-      isDegradeGateAction(action) ||
+      action === 'degrade' ||
       strict
     ) {
       return { kind: 'passthrough' };
