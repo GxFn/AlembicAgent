@@ -3012,6 +3012,225 @@ describe('service cancellation and snapshot ownership', () => {
   });
 });
 
+// L8-C15：AgentService 运行边界。runtime 构建/装配与 profile 编译失败必须留下失败日志（保持 reject 语义）；
+// 异步 shouldAbort 预检耗时要从 runtime 期限中扣除；协调器在 canCoordinate 为真时返回空值不得静默回落到单 runtime。
+describe('service run boundary failure logs, deadline accounting and coordinator guard (L8-C15)', () => {
+  const input: AgentRunInput = {
+    profile: { preset: 'chat' },
+    message: { content: 'run' },
+    context: { source: 'internal' },
+  };
+  function warnMessages(warn: ReturnType<typeof vi.spyOn>) {
+    return warn.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('a throwing runtimeBuilder.build still rejects run() and logs runtime build failed with trace', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const failure = new Error('Unknown capability: missing');
+    const service = new AgentService({
+      runtimeBuilder: {
+        build: () => {
+          throw failure;
+        },
+      },
+    });
+    const error = await service.run(input).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBe(failure);
+    const call = warn.mock.calls.find((entry) => String(entry[0]).includes('runtime build failed'));
+    expect(call?.[0]).toContain('[AgentService] runtime build failed');
+    expect(call?.[1]).toMatchObject({
+      profileId: 'chat',
+      source: 'internal',
+      buildStep: 'build',
+      error: 'Unknown capability: missing',
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it('a throwing setFileCache rejects run() without executing and logs the failing build step', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const execute = vi.fn(async () => ({ reply: 'must not run' }));
+    const service = new AgentService({
+      runtimeBuilder: {
+        build: () => ({
+          id: 'fixture',
+          execute,
+          setFileCache: () => {
+            throw new Error('file cache rejected');
+          },
+        }),
+      },
+    });
+    await expect(
+      service.run({ ...input, context: { source: 'internal', fileCache: [] } })
+    ).rejects.toThrow('file cache rejected');
+    expect(execute).not.toHaveBeenCalled();
+    const call = warn.mock.calls.find((entry) => String(entry[0]).includes('runtime build failed'));
+    expect(call?.[1]).toMatchObject({ buildStep: 'file-cache', error: 'file cache rejected' });
+  });
+
+  it('a non-Error build failure is rethrown as an Error instance carrying the original cause', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const service = new AgentService({
+      runtimeBuilder: {
+        build: () => {
+          // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖宿主 builder 违约时包成 Error 的分支。
+          throw 'raw build failure';
+        },
+      },
+    });
+    const error = await service.run(input).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ message: 'raw build failure', cause: 'raw build failure' });
+  });
+
+  it('a throwing profile compile rejects run() and logs profile compile failed', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const compiler = new AgentProfileCompiler({
+      profileRegistry: new AgentProfileRegistry([]),
+      stageFactoryRegistry: new AgentStageFactoryRegistry(),
+    });
+    const failure = new Error('compile exploded');
+    vi.spyOn(compiler, 'compile').mockImplementation(() => {
+      throw failure;
+    });
+    const build = vi.fn();
+    const service = new AgentService({ runtimeBuilder: { build }, profileCompiler: compiler });
+    const error = await service.run(input).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBe(failure);
+    expect(build).not.toHaveBeenCalled();
+    const call = warn.mock.calls.find((entry) =>
+      String(entry[0]).includes('profile compile failed')
+    );
+    expect(call?.[0]).toContain('[AgentService] profile compile failed');
+    expect(call?.[1]).toMatchObject({
+      profileId: 'chat',
+      source: 'internal',
+      error: 'compile exploded',
+    });
+  });
+
+  it('an async shouldAbort preflight spends the runtime deadline instead of extending it', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const execute = vi.fn(async (_message: unknown, _opts?: Record<string, unknown>) => ({
+      reply: 'done',
+    }));
+    const pending = new AgentService({
+      runtimeBuilder: { build: () => ({ id: 'fixture', execute }) },
+    }).run({
+      ...input,
+      execution: {
+        timeoutMs: 1000,
+        shouldAbort: () =>
+          new Promise<boolean>((resolve) => {
+            setTimeout(() => resolve(false), 300);
+          }),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    const result = await pending;
+    expect(result.status).toBe('success');
+    expect(execute).toHaveBeenCalledOnce();
+    const runtimeTimeout = execute.mock.calls[0]?.[1]?.timeoutMs;
+    expect(typeof runtimeTimeout).toBe('number');
+    expect(runtimeTimeout).toBeLessThanOrEqual(700);
+    expect(runtimeTimeout).toBeGreaterThanOrEqual(1);
+  });
+
+  it('a preflight that exhausts the deadline before resolving takes the preflight timeout branch', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const build = vi.fn(() => ({ id: 'fixture', execute: vi.fn(async () => ({ reply: 'late' })) }));
+    const result = await new AgentService({ runtimeBuilder: { build } }).run({
+      ...input,
+      execution: {
+        timeoutMs: 1000,
+        // 同步阻塞型探针：计时器在探针返回前无法触发，runOperation 仍判 ok；剩余预算靠服务层核算。
+        shouldAbort: () => {
+          vi.setSystemTime(Date.now() + 1500);
+          return false;
+        },
+      },
+    });
+    expect(result.status).toBe('timeout');
+    expect(build).not.toHaveBeenCalled();
+    expect(result.diagnostics?.timedOutStages).toEqual(['service-preflight']);
+    const warning = result.diagnostics?.warnings.find(
+      (entry) => entry.code === 'run_timeout_before_execution'
+    );
+    expect(warning?.message).toMatch(/preflightMs=\d+/);
+  });
+
+  it('a run without a preflight check forwards the caller deadline unchanged', async () => {
+    const execute = vi.fn(async (_message: unknown, _opts?: Record<string, unknown>) => ({
+      reply: 'done',
+    }));
+    await new AgentService({ runtimeBuilder: { build: () => ({ id: 'fixture', execute }) } }).run({
+      ...input,
+      execution: { timeoutMs: 1000 },
+    });
+    expect(execute.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: 1000 });
+  });
+
+  it('a coordinator that returns no result for a coordinatable profile rejects without building a runtime', async () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    class EmptyCoordinator extends AgentRunCoordinator {
+      override canCoordinate() {
+        return true;
+      }
+      override async run() {
+        return null;
+      }
+    }
+    const build = vi.fn(() => ({ id: 'fixture', execute: vi.fn(async () => ({ reply: 'ran' })) }));
+    const service = new AgentService({
+      runtimeBuilder: { build },
+      runCoordinator: new EmptyCoordinator(),
+    });
+    const error = await service.run(input).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      'Agent coordinator returned no result for profile "chat"'
+    );
+    expect(build).not.toHaveBeenCalled();
+    expect(warnMessages(warn)).toContainEqual(
+      expect.stringContaining('[AgentService] coordinated run returned no result')
+    );
+  });
+
+  it.each([
+    ['http-chat', 'user'],
+    ['http-stream', 'user'],
+    ['mcp', 'system'],
+    ['bootstrap', 'system'],
+    ['system-workflow', 'system'],
+    ['internal', 'system'],
+  ] as const)('maps context source %s to runtime source %s', async (source, expected) => {
+    const execute = vi.fn(async (_message: unknown, _opts?: Record<string, unknown>) => ({
+      reply: 'done',
+    }));
+    await new AgentService({ runtimeBuilder: { build: () => ({ id: 'fixture', execute }) } }).run({
+      ...input,
+      context: { source },
+    });
+    expect(execute.mock.calls[0]?.[1]).toMatchObject({ source: expected });
+  });
+});
+
 describe('AgentRuntime state transitions observability and reset (I39)', () => {
   function textHarness() {
     const chat = vi.fn(async () => ({ text: 'done', functionCalls: [] }));

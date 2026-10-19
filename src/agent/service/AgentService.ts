@@ -52,54 +52,71 @@ export class AgentService {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     validateRunInput(input);
-    const compiledProfile = this.#profileCompiler.compile(input.profile, {
-      params: input.params,
-      context: input.context,
-    });
+    const compiledProfile = this.#compileProfile(input);
     const trace = describeRun(input, compiledProfile.id);
     const startedAt = Date.now();
     this.#log('info', `[AgentService] run start ${formatRunTrace(trace)}`, trace);
     if (this.#runCoordinator.canCoordinate(compiledProfile)) {
+      let coordinated: AgentRunResult | null | undefined;
       try {
         this.#log('info', `[AgentService] coordinated run start ${formatRunTrace(trace)}`, {
           ...trace,
           concurrencyMode: compiledProfile.concurrency?.mode || null,
         });
-        const coordinated = await this.#runCoordinator.run(input, compiledProfile, (childInput) =>
+        coordinated = await this.#runCoordinator.run(input, compiledProfile, (childInput) =>
           this.run(childInput)
         );
-        if (coordinated) {
-          this.#log('info', `[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
-            ...trace,
-            durationMs: Date.now() - startedAt,
-            status: coordinated.status,
-            toolCallCount: coordinated.toolCalls.length,
-          });
-          return coordinated;
-        }
       } catch (err: unknown) {
         this.#log('warn', `[AgentService] coordinated run failed ${formatRunTrace(trace)}`, {
           ...trace,
           durationMs: Date.now() - startedAt,
           error: err instanceof Error ? err.message : String(err),
         });
-        throw err instanceof Error ? err : new Error(String(err));
+        throw toError(err);
       }
+      if (!coordinated) {
+        // 不可达防御（L8-C15）：canCoordinate 与 AgentRunCoordinator.run 返回 null 的条件互补，
+        // 内置 merger 也不会返回空值。走到这里说明协调器实现或注入的 merger 违反契约；
+        // 不能静默回落到单 runtime（会用父消息再跑一次模型且无 child），按明确错误 reject。
+        this.#log(
+          'warn',
+          `[AgentService] coordinated run returned no result ${formatRunTrace(trace)}`,
+          {
+            ...trace,
+            durationMs: Date.now() - startedAt,
+            concurrencyMode: compiledProfile.concurrency?.mode || null,
+            coordinatedResult: coordinated === null ? 'null' : typeof coordinated,
+            fallback: 'none-rejected',
+          }
+        );
+        throw new Error(`Agent coordinator returned no result for profile "${compiledProfile.id}"`);
+      }
+      this.#log('info', `[AgentService] coordinated run complete ${formatRunTrace(trace)}`, {
+        ...trace,
+        durationMs: Date.now() - startedAt,
+        status: coordinated.status,
+        toolCallCount: coordinated.toolCalls.length,
+      });
+      return coordinated;
     }
     let preflightStatus: 'aborted' | 'timeout' | null = input.execution?.abortSignal?.aborted
       ? 'aborted'
       : null;
+    // 预检归因只用于日志，区分“探针自身超时/被取消/返回 true”与“探针返回后期限已被耗尽”。
+    let preflightReason: string | null = preflightStatus ? 'signal-aborted-before-check' : null;
+    const requestedTimeoutMs = input.execution?.timeoutMs;
+    const deadlineMs = isPositiveFiniteTimeout(requestedTimeoutMs) ? requestedTimeoutMs : undefined;
+    // 只有真正执行了 shouldAbort 预检时才计时并扣减期限；没有预检的 run 原样转交调用方期限。
+    let preflightMs: number | null = null;
     const shouldAbort = input.execution?.shouldAbort;
     if (!preflightStatus && shouldAbort) {
-      const timeout = input.execution?.timeoutMs;
+      const preflightStartedAt = Date.now();
       // 开工检查可以异步，但等待也必须响应本次signal和显式期限；不增加运行中轮询。
       const check = await runOperation(() => shouldAbort(), {
         abortSignal: input.execution?.abortSignal,
-        timeoutMs:
-          typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
-            ? timeout
-            : undefined,
+        timeoutMs: deadlineMs,
       });
+      preflightMs = Math.max(0, Date.now() - preflightStartedAt);
       if (check.status === 'error') {
         const error =
           check.error instanceof Error
@@ -108,17 +125,25 @@ export class AgentService {
         this.#log('warn', `[AgentService] cancellation check failed ${formatRunTrace(trace)}`, {
           ...trace,
           error: error.message,
+          preflightMs,
         });
         throw error;
       }
       if (check.status === 'timeout') {
         preflightStatus = 'timeout';
+        preflightReason = 'check-timeout';
       } else if (
         check.status === 'aborted' ||
         (check.status === 'ok' && check.value === true) ||
         input.execution?.abortSignal?.aborted
       ) {
         preflightStatus = 'aborted';
+        preflightReason = check.status === 'ok' && check.value === true ? 'check-true' : 'aborted';
+      } else if (deadlineMs !== undefined && preflightMs >= deadlineMs) {
+        // 同步阻塞或计时器来不及触发的探针会以 ok 返回，但调用方声明的期限已经花完：
+        // 不再给 runtime 一份新期限（那会让单次 run 接近 2×timeoutMs），按预检超时收口。
+        preflightStatus = 'timeout';
+        preflightReason = 'deadline-exhausted';
       }
     }
     if (preflightStatus) {
@@ -131,12 +156,17 @@ export class AgentService {
       }
       diagnostics.warn({
         code: `run_${preflightStatus}_before_execution`,
-        message: `AgentService did not start runtime work after preflight ${preflightStatus}`,
+        message: `AgentService did not start runtime work after preflight ${preflightStatus} (preflightMs=${preflightMs ?? 0})`,
       });
       this.#log(
         'info',
         `[AgentService] run ${preflightStatus} before execution ${formatRunTrace(trace)}`,
-        trace
+        {
+          ...trace,
+          preflightReason,
+          preflightMs,
+          requestedTimeoutMs: requestedTimeoutMs ?? null,
+        }
       );
       return {
         runId: randomUUID(),
@@ -153,23 +183,23 @@ export class AgentService {
         diagnostics: diagnostics.toJSON(),
       };
     }
-    const runtime = this.#runtimeBuilder.build(compiledProfile, {
-      lang: input.context.lang || null,
-      onProgress: input.execution?.onProgress || null,
-      onToolCall: input.execution?.onToolCall || null,
-    });
-    if (input.context.fileCache !== undefined) {
-      runtime.setFileCache?.(input.context.fileCache);
-    }
-    const message = buildAgentMessage(input);
+    // 传给 runtime 的是剩余预算：预检已花掉的时间从调用方期限中扣除，下限 1ms（耗尽已在上面走超时分支）。
+    const runtimeTimeoutMs =
+      preflightMs !== null && deadlineMs !== undefined
+        ? Math.max(1, deadlineMs - preflightMs)
+        : requestedTimeoutMs;
+    const { runtime, message } = this.#prepareRuntime(input, compiledProfile, trace, startedAt);
     try {
       // 冷启动监控依赖这里把“维度 child run 已进入 AgentRuntime”明确打出来。
       // 仅靠 GenerateTaskManager 的 filling 状态看不出是在排队、模型请求中还是已失败待收口。
       this.#log('info', `[AgentService] runtime execute start ${formatRunTrace(trace)}`, {
         ...trace,
         runtimeSource: input.context.runtimeSource || runtimeSourceFor(input.context.source),
+        preflightMs,
+        requestedTimeoutMs: requestedTimeoutMs ?? null,
+        runtimeTimeoutMs: runtimeTimeoutMs ?? null,
       });
-      const result = await runtime.execute(message, buildRuntimeOptions(input));
+      const result = await runtime.execute(message, buildRuntimeOptions(input, runtimeTimeoutMs));
       const status = inferRunStatus(result);
       this.#log('info', `[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
@@ -227,6 +257,68 @@ export class AgentService {
     }
   }
 
+  /**
+   * profile 编译失败此前在 'run start' 之前直接 reject，日志里什么都没有。
+   * 这里补一条失败日志（trace 用调用方请求的 profile 标识，因为编译产物不存在），然后原样重抛，
+   * 保持 reject 语义不变。
+   */
+  #compileProfile(input: AgentRunInput): CompiledAgentProfile {
+    const compileStartedAt = Date.now();
+    try {
+      return this.#profileCompiler.compile(input.profile, {
+        params: input.params,
+        context: input.context,
+      });
+    } catch (err: unknown) {
+      const trace = describeRun(input, requestedProfileId(input.profile));
+      this.#log('warn', `[AgentService] profile compile failed ${formatRunTrace(trace)}`, {
+        ...trace,
+        durationMs: Date.now() - compileStartedAt,
+        error: err instanceof Error ? err.message : String(err),
+        errorName: err instanceof Error ? err.name : typeof err,
+      });
+      throw toError(err);
+    }
+  }
+
+  /**
+   * runtime 构建、fileCache 注入和消息组装位于 execute 的 try 之外：这三步失败属于“运行未能开始”，
+   * 沿用既有 reject 语义（不改成 status=error 结果，那是宿主可见变更），但必须留下
+   * 'runtime build failed' 日志，否则冷启动监控只看到 'run start' 会把该维度当成仍在运行。
+   * buildStep 标出失败发生在哪一步。
+   */
+  #prepareRuntime(
+    input: AgentRunInput,
+    compiledProfile: CompiledAgentProfile,
+    trace: Record<string, unknown>,
+    startedAt: number
+  ): { runtime: AgentRuntimeLike; message: AgentMessage } {
+    let buildStep: 'build' | 'file-cache' | 'message' = 'build';
+    try {
+      const runtime = this.#runtimeBuilder.build(compiledProfile, {
+        lang: input.context.lang || null,
+        onProgress: input.execution?.onProgress || null,
+        onToolCall: input.execution?.onToolCall || null,
+      });
+      if (input.context.fileCache !== undefined) {
+        buildStep = 'file-cache';
+        runtime.setFileCache?.(input.context.fileCache);
+      }
+      buildStep = 'message';
+      const message = buildAgentMessage(input);
+      return { runtime, message };
+    } catch (err: unknown) {
+      this.#log('warn', `[AgentService] runtime build failed ${formatRunTrace(trace)}`, {
+        ...trace,
+        buildStep,
+        durationMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+        errorName: err instanceof Error ? err.name : typeof err,
+      });
+      throw toError(err);
+    }
+  }
+
   #log(level: 'info' | 'warn', message: string, metadata: Record<string, unknown>): void {
     observeSafely(
       () => this.#logger[level](message, metadata),
@@ -270,7 +362,11 @@ function buildAgentMessage(input: AgentRunInput) {
   });
 }
 
-function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
+/** runtimeTimeoutMs 是扣除预检耗时后的剩余期限；没有预检时等于调用方原值。 */
+function buildRuntimeOptions(
+  input: AgentRunInput,
+  runtimeTimeoutMs: number | undefined
+): AgentRuntimeRunOptions {
   const systemRunContext = input.context.systemRunContext;
   const projectedScopeId =
     systemRunContext?.scopeId ||
@@ -278,7 +374,7 @@ function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
       ? input.context.sharedState._dimensionScopeId
       : undefined);
   return {
-    timeoutMs: input.execution?.timeoutMs,
+    timeoutMs: runtimeTimeoutMs,
     abortSignal: input.execution?.abortSignal,
     diagnostics: input.execution?.diagnostics,
     strategyContext: input.context.strategyContext,
@@ -298,14 +394,32 @@ function buildRuntimeOptions(input: AgentRunInput): AgentRuntimeRunOptions {
   };
 }
 
+/** 只有 HTTP 用户会话算 'user'；mcp、bootstrap、system-workflow、internal 都按系统运行。 */
 function runtimeSourceFor(source: AgentRunInput['context']['source']): AgentRuntimeSource {
   if (source === 'http-chat' || source === 'http-stream') {
     return 'user';
   }
-  if (source === 'mcp' || source === 'bootstrap' || source === 'system-workflow') {
-    return 'system';
-  }
   return 'system';
+}
+
+function isPositiveFiniteTimeout(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+/** 编译失败时没有编译产物，trace 用调用方请求的 id / preset / basePreset 标识。 */
+function requestedProfileId(profile: AgentRunInput['profile']): string {
+  const record = getRecord(profile);
+  return (
+    stringValue(record.id) ||
+    stringValue(record.preset) ||
+    stringValue(record.basePreset) ||
+    'unknown'
+  );
+}
+
+/** Error 实例原样返回（保持调用方可见的错误身份）；非 Error 抛出值包成 Error 并保留 cause。 */
+function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err), { cause: err });
 }
 
 function stripProfileSelectionMetadata(metadata: Record<string, unknown>) {
