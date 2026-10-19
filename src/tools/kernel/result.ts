@@ -524,9 +524,18 @@ const UNCHANGED_CARRIER = Object.freeze({
  *   扫描时若遇到 toJSON、accessor、非普通原型（类实例、数组/Date 子类）或超深容器，原对象
  *   在下游 JSON.stringify 时可能重新带出私有字段，所以同样改用 JSON 安全副本；循环、NaN、
  *   BigInt 这类不含键的形态不触发改写。
- * - structuredContent 为字符串、以及 envelope.text：整段是 JSON 对象/数组时，它就是同一
- *   结果的另一份载体，按同一规则清理后重新序列化；不是 JSON 的字符串（源码、终端输出、
- *   普通错误文本）是不透明内容，原样保留。字段值里嵌套的 JSON 字符串同样视为内容，不解析。
+ * - structuredContent 为字符串：handler 交出的就是一段内容（终端 stdout、文件正文、宿主转发的
+ *   原文），不是结构化字段，不解析也不改写（L3-P7c 审计补修）。JSON 形态的终端输出里，键名
+ *   往往只是数据（依赖包名、文件路径、符号名），按私有 token 删除会丢掉有用数据并重排输出；
+ *   超过嵌套护栏的深层 JSON 也不能因“无法逐键确认”被换成占位。与它全等的 envelope.text
+ *   （ToolRouterAdapter 对字符串结果把 text 设为同一字符串）是同一段内容，同样原样保留。
+ * - 其余 envelope.text（对象结果的 JSON 渲染、纯文本信封、与字符串内容不同的另写摘要）：
+ *   整段是 JSON 对象/数组时，它是结构化结果的另一份载体，按同一规则清理后重新序列化；不是
+ *   JSON 的文本（普通错误文本等）原样保留。字段值里嵌套的 JSON 字符串同样视为内容，不解析。
+ *
+ * 字符串内容原样保留不是降级或跳过：它与“非 JSON 文本原样保留”是同一条内容分类规则，每次
+ * 终端调用都会走到，因此不写诊断；字符串内容是否含密钥由 trust.containsSecrets 的语义约束
+ * （当前没有检测步骤），不属于 D23 字段规则。
  *
  * 没有任何改写时返回同一信封对象（保留调用方依赖的对象身份）；有改写时返回浅拷贝，
  * 宿主传入的原信封与原数据不被修改。
@@ -538,7 +547,12 @@ function redactToolResultPrivateFields(
     return { envelope, redactedFields: [], warningCodes: [] };
   }
   const structured = redactPrivateStructuredCarrier(envelope.structuredContent);
-  const text = redactPrivateJsonTextCarrier(envelope.text);
+  // 只有与字符串内容逐字相同的 text 才是同一段不透明内容；另写的 JSON 摘要仍按载体清理。
+  const textIsOpaqueContent =
+    typeof envelope.structuredContent === 'string' && envelope.text === envelope.structuredContent;
+  const text = textIsOpaqueContent
+    ? UNCHANGED_CARRIER
+    : redactPrivateJsonTextCarrier(envelope.text);
   if (!structured.changed && !text.changed) {
     return { envelope, redactedFields: [], warningCodes: [] };
   }
@@ -554,11 +568,9 @@ function redactToolResultPrivateFields(
 }
 
 function redactPrivateStructuredCarrier(value: unknown): RedactedCarrier {
-  if (typeof value === 'string') {
-    return redactPrivateJsonTextCarrier(value);
-  }
   if (value === null || typeof value !== 'object') {
-    // 纯量没有键；function/symbol/bigint 不会进入 JSON 载体，保持原值。
+    // 字符串是不透明内容（见 redactToolResultPrivateFields），即使整段是 JSON 也不解析；
+    // 其余纯量没有键；function/symbol/bigint 不会进入 JSON 载体。都保持原值。
     return UNCHANGED_CARRIER;
   }
   const sanitized = sanitizeOrdinaryValue(value, PRIVATE_FIELD_MATCHER, Number.POSITIVE_INFINITY);

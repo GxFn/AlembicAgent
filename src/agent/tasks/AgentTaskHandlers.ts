@@ -526,8 +526,9 @@ function isGuardCheckResult(value: unknown): value is GuardCheckResult {
 }
 
 /**
- * 传入的信封已经过 redactTaskToolEnvelope：structuredContent 已删除 D23 秘密/私有字段，
- * 业务字段（违规 message 等）原样保留；纯文本信封走默认普通输出投影。
+ * 传入的信封已经过 redactTaskToolEnvelope：对象/数组 structuredContent 已删除 D23 秘密/私有
+ * 字段，业务字段（违规 message 等）原样保留；字符串 structuredContent 是不透明内容，原样返回
+ * （L3-P7c，不解析也不改写）；纯文本信封走默认普通输出投影。
  */
 function projectTaskToolEnvelope(envelope: ToolResultEnvelope): unknown {
   if (envelope.structuredContent !== undefined) {

@@ -312,27 +312,32 @@ describe('runtime bridge D23 private fields on the structured path', () => {
     expectNoSecretValues(serializedDiagnostics);
   });
 
-  it('redacts a top-level JSON string result in both carriers', async () => {
+  it('keeps a top-level string result verbatim in both carriers (L3-P7c)', async () => {
+    // 字符串结果是 handler 交出的一段内容（终端 stdout、文件正文），不是结构化字段：即使整段
+    // 是 JSON 也不解析、不改写，与它全等的 text 同样原样保留（审计补修 c5f0406）。
+    const diagnostics = new DiagnosticsCollector();
     const metadata = freshMetadata();
     const payload = JSON.stringify({
       id: 'receipt-fixture',
-      nested: { apiKey: 'fixture-api-key-value', kept: 'kept value' },
+      nested: { apiKey: 'printed content', kept: 'kept value' },
     });
 
     const result = await executeRuntimeToolCall(
       knowledgeDetailCall(),
-      bridgeContext(adapterRouter({ knowledgeRead: { getById: async () => payload } }), null, [
-        'knowledge',
-      ]),
+      bridgeContext(
+        adapterRouter({ knowledgeRead: { getById: async () => payload } }),
+        diagnostics,
+        ['knowledge']
+      ),
       metadata
     );
 
-    expectNoSecretValues(modelVisibleCarriers(result, metadata));
-    expect(typeof result).toBe('string');
-    expect(JSON.parse(String(result))).toEqual({
-      id: 'receipt-fixture',
-      nested: { kept: 'kept value' },
-    });
+    expect(result).toBe(payload);
+    expect(metadata.envelope?.structuredContent).toBe(payload);
+    expect(metadata.envelope?.text).toBe(payload);
+    expect(diagnostics.toJSON().warnings.map((warning) => warning.code)).not.toContain(
+      'TOOL_RESULT_PRIVATE_FIELDS_REDACTED'
+    );
   });
 
   it('keeps the root business message of a real memory result', async () => {

@@ -25,9 +25,10 @@ const BLOCKING_ENVELOPE_STATUSES = new Set<ToolResultStatus>([
 ]);
 
 /**
- * 返回值投影。传入的必须是已经过 redactModelBoundEnvelope 的信封：structuredContent 已删除
- * D23 秘密/私有字段（任意深度），业务字段（含根 message）原样保留；纯文本信封再走默认
- * 普通输出投影（秘密字段任意深度 + 旧信封字段只在根路径）。
+ * 返回值投影。传入的必须是已经过 redactModelBoundEnvelope 的信封：对象/数组 structuredContent
+ * 已删除 D23 秘密/私有字段（任意深度），业务字段（含根 message）原样保留；字符串
+ * structuredContent（终端 stdout、文件正文）是不透明内容，原样返回（L3-P7c）；纯文本信封再走
+ * 默认普通输出投影（秘密字段任意深度 + 旧信封字段只在根路径）。
  */
 function projectPipelineToolResult(envelope: ToolResultEnvelope): unknown {
   if (envelope.structuredContent !== undefined) {
@@ -43,8 +44,10 @@ const MAX_REPORTED_PRIVATE_FIELD_PATH_LENGTH = 120;
 /**
  * D23 真实出口（L3-C02/L3-P07）。模型历史读 metadata.envelope.text（projectToolReceipt），
  * 记忆、证据、观察者与 PCV 读返回值和 envelope.structuredContent，所以必须在写入 metadata
- * 之前清理整份信封，只清理返回值挡不住私有字段。宿主 /agent/tool 不经过本函数，规范信封
- * 原样保留在 ToolRouterAdapter 的响应里（宿主 HTTP 出口不执行 D23）。
+ * 之前清理信封的两份载体（structuredContent 与 text），只清理返回值挡不住私有字段。字符串
+ * 结果（终端 stdout 等）与和它全等的 text 是不透明内容，不解析也不改写（L3-P7c），因此
+ * JSON 形态的命令输出原样到达模型。宿主 /agent/tool 不经过本函数，规范信封原样保留在
+ * ToolRouterAdapter 的响应里（宿主 HTTP 出口不执行 D23）。
  *
  * 没有私有字段时返回同一信封对象；有改写时写诊断（无诊断收集器时降级到 runtime.logger），
  * 只记字段路径与警告码，不记字段值。

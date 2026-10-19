@@ -17,6 +17,7 @@ import {
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
+import { toolResultInternals } from '../src/tools/kernel/index.js';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { type ToolContext, ToolRouterAdapter } from '../src/tools/runtime/index.js';
 
@@ -2391,5 +2392,100 @@ describe('tool result ordinary output', () => {
     ]) {
       expect(isToolResultEnvelope({ ...envelope, diagnostics })).toBe(false);
     }
+  });
+});
+
+/**
+ * L3-P7c（审计补修 c5f0406）：D23 私有字段清理的载体划分。字符串 structuredContent（终端
+ * 输出、文件正文、宿主转发的原文）是不透明内容，与它全等的 text 是同一段内容，都不解析、
+ * 不改写；对象/数组 structuredContent 及其 JSON text 渲染、纯文本信封的 JSON text 才是
+ * 结构化载体，继续按私有字段规则清理。
+ */
+describe('D23 private-field redaction carriers', () => {
+  function envelopeWith(structuredContent: unknown, text: string): ToolResultEnvelope {
+    const envelope: ToolResultEnvelope = { ...createEnvelopeForStatus('success'), text };
+    if (structuredContent === undefined) {
+      delete envelope.structuredContent;
+    } else {
+      envelope.structuredContent = structuredContent;
+    }
+    return envelope;
+  }
+
+  it('keeps a string structuredContent and its identical text as opaque content', () => {
+    const output = JSON.stringify({
+      dependencies: { 'express-api-key-auth': '^1.0.0' },
+      symbols: { APIKeyManager: 'class', ThreadIdentifier: 'struct' },
+      thread: { idle: true },
+      apiKey: 'printed by a command, not a structured result field',
+    });
+    const envelope = envelopeWith(output, output);
+
+    const redaction = toolResultInternals.redactPrivateFields(envelope);
+
+    expect(redaction.envelope).toBe(envelope);
+    expect(redaction.redactedFields).toEqual([]);
+    expect(redaction.warningCodes).toEqual([]);
+  });
+
+  it('does not hollow a deeply nested string result that has no private field', () => {
+    let output = JSON.stringify({ leaf: 'ok' });
+    for (let depth = 0; depth < 70; depth++) {
+      output = `{"child":${output}}`;
+    }
+    const envelope = envelopeWith(output, output);
+
+    const redaction = toolResultInternals.redactPrivateFields(envelope);
+
+    expect(redaction.envelope).toBe(envelope);
+    expect(redaction.envelope.text).toBe(output);
+  });
+
+  it('still cleans a separate JSON text that accompanies a string structuredContent', () => {
+    // 只有与字符串内容全等的 text 才是同一段不透明内容；另写的 JSON 摘要仍是结构化载体。
+    const envelope = envelopeWith(
+      'plain command output',
+      JSON.stringify({ summary: 'kept summary', threadId: 'synthetic-thread-value' })
+    );
+
+    const redaction = toolResultInternals.redactPrivateFields(envelope);
+
+    expect(redaction.envelope.structuredContent).toBe('plain command output');
+    expect(redaction.envelope.text).not.toContain('synthetic-thread-value');
+    expect(redaction.envelope.text).toContain('kept summary');
+    expect(redaction.redactedFields).toEqual(['threadId']);
+  });
+
+  it('keeps cleaning object results and their JSON text rendering', () => {
+    const structured = {
+      id: 'kept-id',
+      apiKey: 'synthetic-api-key-value',
+      nested: { thread: { id: 'synthetic-thread-value', title: 'kept title' } },
+    };
+    const envelope = envelopeWith(structured, JSON.stringify(structured, null, 2));
+
+    const redaction = toolResultInternals.redactPrivateFields(envelope);
+
+    expect(redaction.envelope.structuredContent).toEqual({
+      id: 'kept-id',
+      nested: { thread: { title: 'kept title' } },
+    });
+    expect(JSON.parse(redaction.envelope.text)).toEqual(redaction.envelope.structuredContent);
+    expect(redaction.redactedFields).toEqual(['apiKey', 'nested.thread.id']);
+    // 宿主原数据不被改写。
+    expect(structured.apiKey).toBe('synthetic-api-key-value');
+  });
+
+  it('keeps cleaning the JSON text of a text-only envelope', () => {
+    const envelope = envelopeWith(
+      undefined,
+      '{"error":{"code":403,"message":"permission denied","threadId":"synthetic-thread-value"}}'
+    );
+
+    const redaction = toolResultInternals.redactPrivateFields(envelope);
+
+    expect(redaction.envelope.text).toContain('permission denied');
+    expect(redaction.envelope.text).not.toContain('synthetic-thread-value');
+    expect(redaction.redactedFields).toEqual(['error.threadId']);
   });
 });

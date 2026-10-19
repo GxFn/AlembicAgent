@@ -130,7 +130,9 @@ export const AGENT_INTERFACE_FORBIDDEN_ORDINARY_OUTPUT_FIELDS =
  *   复数与前缀写法）匹配，嵌套对象路径（{thread:{id}}、{provider:{api:{key}}}）与扁平写法
  *   视为同一字段。只看字段名，不解析字段值里的文本或 JSON 字符串。
  *   它同时约束结构化结果：runtimeBridge 在写入模型历史前、AgentTaskHandlers 在任务使用前，
- *   都会清理 structuredContent 与 JSON 形式的 text，并在有删除时写诊断/告警。
+ *   都会清理对象/数组 structuredContent 与 JSON 形式的 text（对象结果的 JSON 渲染、纯文本
+ *   信封），并在有删除时写诊断/告警。字符串 structuredContent（终端输出、文件正文）以及与它
+ *   全等的 text 是不透明内容，不属于结构化字段，不解析也不改写（L3-P7c）。
  * - 旧信封顶层字段（success、errorCode、message、data.result）：只在根路径匹配，只由普通输出
  *   投影（projectToolResultOrdinaryOutput / presentToolResult）执行；嵌套 error.message 与工具
  *   业务字段 message 保留，模型路径上的结构化结果不删除它们。
