@@ -1335,14 +1335,25 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
     expect(result.afterMessageCount).toBe(projected.length);
     expect(
       info.mock.calls.some(([message]) =>
-        String(message).includes('1 runtime memory summary message(s) pinned')
+        String(message).includes(
+          '1 runtime memory summary message(s) pinned ahead of the collapsed marker'
+        )
       )
     ).toBe(true);
+    // 正常折叠路径：compactionLog 同样写出 "钉在折叠 marker 之前"，且不会误报 "投影不变"。
+    const compactionLog = window.getCompactionLog();
+    expect(
+      compactionLog.some((entry) =>
+        entry.includes('1 runtime memory summary message(s) pinned ahead of the collapsed marker')
+      )
+    ).toBe(true);
+    expect(compactionLog.some((entry) => entry.includes('projection unchanged'))).toBe(false);
   });
 
   it('C01 keeps the L4 memory summary when it is the only message before the collapse boundary', async () => {
     const window = await windowWithL4Summary();
     appendRounds(window, 2);
+    const info = vi.spyOn(Logger.getInstance(), 'info');
     const result = window.compactForProviderInputBudget({
       maxProjectedMessages: 3,
       maxProjectedTokens: 100_000,
@@ -1356,6 +1367,25 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
     // 边界前只有被钉住的摘要：折叠不能让投影多出一条 "[Collapsed: 0 …]"。
     expect(projected).toHaveLength(window.toMessages().length);
     expect(JSON.stringify(projected)).not.toContain('[Collapsed:');
+    // C041：这里实际走的是"投影原样返回"的短路，L3 诊断必须如实区分这条路径，
+    // 不能再写"钉在折叠 marker 之前"（根本没有插入折叠 marker）。
+    const infoLines = info.mock.calls.map(([message]) => String(message));
+    const compactionLog = window.getCompactionLog();
+    expect(infoLines.some((line) => line.includes('ahead of the collapsed marker'))).toBe(false);
+    expect(compactionLog.some((entry) => entry.includes('ahead of the collapsed marker'))).toBe(
+      false
+    );
+    const unchangedLog = infoLines.filter(
+      (line) => line.includes('L3 collapse') && line.includes('projection unchanged')
+    );
+    expect(unchangedLog).toHaveLength(1);
+    expect(unchangedLog[0]).toContain('1 runtime memory summary message(s)');
+    expect(unchangedLog[0]).toContain('nothing to fold');
+    expect(
+      compactionLog.filter(
+        (entry) => entry.startsWith('L3-collapse:') && entry.includes('projection unchanged')
+      )
+    ).toHaveLength(1);
   });
 
   it('C02 keeps the complete [evidence] tail when L1 snips an old tool result, idempotently', () => {
@@ -1540,6 +1570,55 @@ describe('compaction keeps runtime memory and evidence (L6-P14)', () => {
         String(message).includes('file content head+tail fell back to char-level snip')
       )
     ).toBe(true);
+  });
+
+  // C040：降级不能只看"首行"。空行/短首行之后紧跟一条超长行时，按整行切 head 只收到首行、
+  // tail 收不到任何整行，正文与结尾一起丢失——与 C08 报告的症状相同，必须同样退化为字符级首+尾。
+  it.each([
+    {
+      label: 'a blank first line',
+      content: `\n${'m'.repeat(5000)}TAIL_LINE_END`,
+      bodySnippet: 'mmmmmmmmmm',
+      oversizedLine: 'line 2 of 2 (5013 chars)',
+    },
+    {
+      label: 'a license line before one minified line',
+      content: `/*! lib v1 | MIT */\n!function(e){${'var a=1;'.repeat(625)}}(TAIL_LINE_END);`,
+      bodySnippet: '!function(e){var a=1;',
+      oversizedLine: 'line 2 of 2 (5030 chars)',
+    },
+  ])('C08 degrades an oversized line after $label to char-level head+tail with a diagnostic', ({
+    content,
+    bodySnippet,
+    oversizedLine,
+  }) => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const out = limitToolResult('code', { content }, { maxChars: 600 });
+    const parsed = JSON.parse(out) as { content: string };
+    expect(parsed.content).toContain(bodySnippet);
+    expect(parsed.content).toContain('TAIL_LINE_END');
+    expect(parsed.content).toContain('tool-result snip');
+    expect(parsed.content.length).toBeLessThanOrEqual(600);
+    const fallbackLines = info.mock.calls
+      .map(([message]) => String(message))
+      .filter((line) => line.includes('file content head+tail fell back to char-level snip'));
+    expect(fallbackLines).toHaveLength(1);
+    expect(fallbackLines[0]).toContain(oversizedLine);
+    expect(fallbackLines[0]).toContain('head budget 480');
+  });
+
+  it('C08 keeps the whole-line head+tail cut when no single line exceeds the head budget', () => {
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    const lines = Array.from({ length: 60 }, (_, index) => `line ${index} ${'z'.repeat(20)}`);
+    const out = limitToolResult('code', { content: lines.join('\n') }, { maxChars: 600 });
+    const parsed = JSON.parse(out) as { content: string };
+    // 普通多行内容仍按整行切（A-1b 的刻意设计）：头尾都是完整行，marker 为 file content truncated。
+    expect(parsed.content.startsWith('line 0 ')).toBe(true);
+    expect(parsed.content).toContain('file content truncated');
+    expect(parsed.content.endsWith(`line 59 ${'z'.repeat(20)}\n`)).toBe(true);
+    expect(
+      info.mock.calls.some(([message]) => String(message).includes('fell back to char-level snip'))
+    ).toBe(false);
   });
 });
 

@@ -932,11 +932,20 @@ export class ContextWindow {
     this.#extractCompactedSubmits(1, keepFrom);
     this.#collapseThreshold = keepFrom;
     // 折叠区里的 L4 记忆摘要由 toProjectedMessages 原样钉住，这里只记录数量供诊断。
-    const pinnedMemory = this.#messages.slice(1, keepFrom).filter(isPinnedRuntimeMemory).length;
-    const pinnedNote =
-      pinnedMemory > 0
-        ? `, ${pinnedMemory} runtime memory summary message(s) pinned ahead of the collapsed marker`
-        : '';
+    // 分叉诊断：若边界前除了被钉住的摘要再无可折叠消息，toProjectedMessages 会短路返回原始消息、
+    // 不插入折叠 marker；该短路在 estimateTokens 热路径上，不能在那里打日志，所以在设阈值这一处
+    // 如实区分两条路径——"钉在折叠 marker 之前"（真正折叠）与"无可折叠、投影不变"（短路）。
+    const collapsedRegion = this.#messages.slice(1, keepFrom);
+    const pinnedMemory = collapsedRegion.filter(isPinnedRuntimeMemory).length;
+    const foldable = collapsedRegion.length - pinnedMemory;
+    let pinnedNote = '';
+    if (pinnedMemory > 0 && foldable === 0) {
+      pinnedNote =
+        `, only ${pinnedMemory} runtime memory summary message(s) before threshold, ` +
+        'nothing to fold, projection unchanged (no collapsed marker)';
+    } else if (pinnedMemory > 0) {
+      pinnedNote = `, ${pinnedMemory} runtime memory summary message(s) pinned ahead of the collapsed marker`;
+    }
     this.#compactionLog.push(`L3-collapse: threshold set at index ${keepFrom}${pinnedNote}`);
     this.#log(
       'info',
@@ -1850,19 +1859,26 @@ function limitFileContent(result: unknown, maxChars: number) {
     const tailBudget = Math.floor(maxChars * 0.15);
     const lines = limited.content.split('\n');
     let head = '';
-    for (const line of lines) {
+    // 记下让 head 循环停下的那一行；content 长度已超过 maxChars（> headBudget），循环必然会停在某一行。
+    let breakIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       if (head.length + line.length + 1 > headBudget) {
+        breakIndex = i;
         break;
       }
       head += `${line}\n`;
     }
-    if (head === '') {
-      // 降级：首行就超过头部预算（压缩 JS/JSON 等单行超长内容），按整行切会让正文全丢、只剩 marker。
-      // 退化为字符级首+尾截断，保住开头与结尾；整行切分的可读性在这种输入下本就不存在。
-      const firstLineLength = lines[0]?.length ?? 0;
+    const breakLineLength = breakIndex >= 0 ? lines[breakIndex].length : 0;
+    if (breakIndex >= 0 && breakLineLength + 1 > headBudget) {
+      // 降级：让 head 停下的那一行本身就超过头部预算（压缩 JS/JSON 等单行超长内容，前面可能还有
+      // 空行、license 头或 'use strict' 之类的短行）。按整行切时这一行既进不了 head 也进不了 tail，
+      // 正文与结尾全丢、只剩 marker；退化为字符级首+尾截断，保住开头与结尾。"首行就超长"
+      // (head 为空) 是这一条件的特例。普通多行内容（停下的行本身放得下）仍按整行切，保持 A-1b 设计。
       logContextDiagnostic(
         `[ContextWindow] limitFileContent: file content head+tail fell back to char-level snip ` +
-          `(first line ${firstLineLength} chars > head budget ${headBudget}, ` +
+          `(oversized line ${breakIndex + 1} of ${lines.length} (${breakLineLength} chars) > ` +
+          `head budget ${headBudget}, whole-line cut would keep only ${head.length} head chars, ` +
           `total ${limited.content.length} chars, maxChars ${maxChars})`
       );
       limited.content = snipHeadTail(limited.content, maxChars, LIMIT_SNIP_MARKER_TAG);
