@@ -579,9 +579,10 @@ export class MemoryStore {
    * @param type 过滤 type (null=全部)
    * @param limit 返回条数
    * @param options.candidateWindow 参与比较的最近更新行数，默认 50（见 getCandidates）
-   * @param options.tokenCache 调用方持有的分词缓存（key 为小写正文）。一次 consolidate 内
+   * @param options.tokenCache 调用方持有的分词缓存（key 为小写正文，值为 Core 分词结果）。一次 consolidate 内
    *   每条候选都要与最多 MEMORY_STORE_MAX_MEMORIES 行比较，缓存避免同一正文被反复分词；
    *   key 是正文本身，行被 UPDATE / MERGE 改写后自然换 key，不会读到旧分词。
+   *   Core 覆盖范围外文字的补充 token 存在与该缓存同生命周期的伴随缓存里，不改变这里的值语义。
    * @returns 带 similarity 和 related_memories_raw 字段的 raw rows
    */
   findSimilar(
@@ -590,27 +591,36 @@ export class MemoryStore {
     limit: number,
     options: { candidateWindow?: number; tokenCache?: Map<string, Set<string>> } = {}
   ): MemoryRow[] {
-    const { candidateWindow, tokenCache } = options;
+    const { candidateWindow } = options;
+    // 未传缓存时用只活在本次查询内的临时缓存：查询文本的分词与补充 token 只算一次，而不是每个候选行各算一次。
+    const tokenCache = options.tokenCache ?? new Map<string, Set<string>>();
     const candidates = this.getCandidates(type, candidateWindow);
     const lowerContent = content.toLowerCase();
     const contentTokens = MemoryStore.#tokensFor(lowerContent, tokenCache);
+    const augment = (lower: string, coreTokens: Set<string>) =>
+      MemoryStore.#augmentedTokensFor(lower, coreTokens, tokenCache);
 
     let exactFallbacks = 0;
     let exactMatches = 0;
+    let supplementedComparisons = 0;
     const scored = candidates
       .map((row) => {
         const lowerRow = (row.content || '').toLowerCase();
-        const { score, exactFallback } = MemoryStore.#scoreSimilarity(
+        const { score, exactFallback, supplemented } = MemoryStore.#scoreSimilarity(
           contentTokens,
           lowerContent,
           MemoryStore.#tokensFor(lowerRow, tokenCache),
-          lowerRow
+          lowerRow,
+          augment
         );
         if (exactFallback) {
           exactFallbacks++;
           if (score > 0) {
             exactMatches++;
           }
+        }
+        if (supplemented) {
+          supplementedComparisons++;
         }
         return { ...row, similarity: score, related_memories_raw: row.related_memories };
       })
@@ -624,21 +634,31 @@ export class MemoryStore {
         `[MemoryStore] findSimilar exact-match fallback: ${exactFallbacks}/${candidates.length} candidates had no comparable tokens on either side (matched=${exactMatches}, type=${type ?? '*'})`
       );
     }
+    if (supplementedComparisons > 0) {
+      // 同样一次查询汇总一条，只记比较次数与 type，不记正文。
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] findSimilar scored ${supplementedComparisons}/${candidates.length} candidates with script-supplement tokens: text outside Core tokenizer coverage was added to Jaccard (type=${type ?? '*'})`
+      );
+    }
 
     return scored.slice(0, limit);
   }
 
   /**
    * 计算两段文本的相似度 (Jaccard + 子串匹配)
+   * @param tokensA lowerA 的 Core 分词结果（tokenizeForSimilarity）
+   * @param lowerA 已小写的文本 A
    * @returns 0.0-1.0
    */
   static computeSimilarity(tokensA: Set<string>, lowerA: string, contentB: string): number {
     const lowerB = (contentB || '').toLowerCase();
-    const { score, exactFallback } = MemoryStore.#scoreSimilarity(
+    const { score, exactFallback, supplemented } = MemoryStore.#scoreSimilarity(
       tokensA,
       lowerA,
       tokenizeForSimilarity(lowerB),
-      lowerB
+      lowerB,
+      (lower, coreTokens) => MemoryStore.#augmentedTokensFor(lower, coreTokens, undefined)
     );
     if (exactFallback) {
       logMemoryStore(
@@ -646,19 +666,30 @@ export class MemoryStore {
         `[MemoryStore] computeSimilarity exact-match fallback: neither side has comparable tokens (score=${score})`
       );
     }
+    if (supplemented) {
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] computeSimilarity scored with script-supplement tokens: text outside Core tokenizer coverage was added to Jaccard (score=${score})`
+      );
+    }
     return score;
   }
 
   /**
-   * 相似度打分核心。exactFallback 标记“双方都没有可比 token、退化为精确比较”的分支，
-   * 由调用方决定如何记诊断（单次调用记一条，批量查询汇总记一条）。
+   * 相似度打分核心。exactFallback 标记“双方都没有可比 token、退化为精确比较”的分支；
+   * supplemented 标记 Jaccard 分支用到了 Core 覆盖范围外文字的补充 token。
+   * 两者都由调用方决定如何记诊断（单次调用记一条，批量查询汇总记一条）。
+   *
+   * 分支判定（是否精确比较、是否一侧为空）只看 Core 分词，与 C30 修复时的语义一致；
+   * 补充 token 只进入双方都有 Core token 时的 Jaccard 计算。
    */
   static #scoreSimilarity(
     tokensA: Set<string>,
     lowerA: string,
     tokensB: Set<string>,
-    lowerB: string
-  ): { score: number; exactFallback: boolean } {
+    lowerB: string,
+    augment: (lower: string, coreTokens: Set<string>) => Set<string>
+  ): { score: number; exactFallback: boolean; supplemented: boolean } {
     if (tokensA.size === 0 && tokensB.size === 0) {
       // Core 分词只保留拉丁字母、数字与 CJK 字符，西里尔文、韩文、假名、纯符号文本两侧都没有 token，
       // Jaccard 无从计算。旧实现在这里返回 1.0，任意两段此类文本都被判为重复，新记忆被静默丢弃（C30）。
@@ -666,15 +697,54 @@ export class MemoryStore {
       // 完全相同仍判为重复，其余一律视为不相似。
       const exact =
         MemoryStore.#normalizeForExactMatch(lowerA) === MemoryStore.#normalizeForExactMatch(lowerB);
-      return { score: exact ? 1 : 0, exactFallback: true };
+      return { score: exact ? 1 : 0, exactFallback: true, supplemented: false };
     }
     if (tokensA.size === 0 || tokensB.size === 0) {
-      return { score: 0, exactFallback: false };
+      return { score: 0, exactFallback: false, supplemented: false };
     }
 
-    const jaccard = jaccardSimilarity(tokensA, tokensB);
+    // 双方都有 Core token 时，Core token 可能只是共同的拉丁标识符或数字（如两段无关俄文都提到 Zustand、80），
+    // 只用它们算 Jaccard 会得到 1.0 并把新记忆当作 UPDATE 丢弃（C30 第三轮审计 C008）。
+    // 这里把 Core 丢掉的文字补回 token 集合再算；纯 a-z/0-9/CJK 文本补充集为空，得分与修复前完全一致。
+    const augmentedA = augment(lowerA, tokensA);
+    const augmentedB = augment(lowerB, tokensB);
+    const supplemented = augmentedA !== tokensA || augmentedB !== tokensB;
+    const jaccard = jaccardSimilarity(augmentedA, augmentedB);
     const containsBonus = lowerA.includes(lowerB) || lowerB.includes(lowerA) ? 0.3 : 0;
-    return { score: Math.min(1.0, jaccard + containsBonus), exactFallback: false };
+    return { score: Math.min(1.0, jaccard + containsBonus), exactFallback: false, supplemented };
+  }
+
+  /**
+   * Core token 与补充 token 的并集；文本没有 Core 覆盖范围外的字母或数字时直接返回 coreTokens 本身（不复制），
+   * 调用方据此用引用比较判断是否发生了补充。传入 cache 时按小写正文复用合并结果。
+   */
+  static #augmentedTokensFor(
+    lower: string,
+    coreTokens: Set<string>,
+    cache: Map<string, Set<string>> | undefined
+  ): Set<string> {
+    let augmentedCache: Map<string, Set<string>> | undefined;
+    if (cache) {
+      augmentedCache = augmentedTokenCaches.get(cache);
+      if (!augmentedCache) {
+        augmentedCache = new Map<string, Set<string>>();
+        augmentedTokenCaches.set(cache, augmentedCache);
+      }
+      const cached = augmentedCache.get(lower);
+      if (cached) {
+        return cached;
+      }
+    }
+    const supplement = uncoveredScriptTokens(lower);
+    let augmented = coreTokens;
+    if (supplement.size > 0) {
+      augmented = new Set(coreTokens);
+      for (const token of supplement) {
+        augmented.add(token);
+      }
+    }
+    augmentedCache?.set(lower, augmented);
+    return augmented;
   }
 
   static #normalizeForExactMatch(lower: string): string {
@@ -878,6 +948,53 @@ export function assertMemoryStoreSchemaShape(db: SqliteDatabase): void {
       `MemoryStore schema tripwire: ${MEMORY_STORE_SEMANTIC_TABLE} missing columns: ${missing.join(', ')}`
     );
   }
+}
+
+/**
+ * Core tokenizeForSimilarity 只保留 a-z、0-9 与 CJK 统一表意字符（\u4e00-\u9fff、\u3400-\u4dbf），
+ * 其余字母和数字（西里尔文、韩文、假名、阿拉伯文、天城文、带变音符的拉丁字母、非 ASCII 数字等）都被当作分隔符丢掉。
+ * 这个模式匹配“Core 覆盖范围外的字母或数字”：第一段是不属于 a-z / CJK 的 \p{L}，第二段是不属于 0-9 的 \p{N}。
+ * 覆盖范围必须与 Core 分词保持一致；若 Core 将来扩大覆盖，这里只会多补一些重复 token，不影响正确性。
+ */
+const CORE_UNCOVERED_LETTER_OR_NUMBER = /[^\P{L}a-z\u3400-\u4dbf\u4e00-\u9fff]|[^\P{N}0-9]/u;
+
+/** 补充分词的“词”：字母、组合附加符（天城文元音符号、NFD 残留的变音符）与数字的连续片段。 */
+const SUPPLEMENT_WORD = /[\p{L}\p{M}\p{N}]+/gu;
+
+/**
+ * 每个调用方 tokenCache 对应一份“Core token ∪ 补充 token”的伴随缓存，随调用方缓存一起被回收；
+ * 调用方缓存本身仍只存 Core 分词结果，公开参数的值语义不变。
+ */
+const augmentedTokenCaches = new WeakMap<Map<string, Set<string>>, Map<string, Set<string>>>();
+
+/**
+ * 为 Core 覆盖范围外的文字补 token（C30 第三轮审计 C008）。
+ * 只处理含覆盖范围外字母或数字的词：补词本身（≥2 个码点时）和按码点切的字符 bigram，与 Core 的 word + bigram 规则对齐。
+ * 先做 NFC，保证同一句话的 NFD / NFC 形式（如西里尔 й、韩文音节）得到相同 token。
+ * 纯 a-z/0-9/CJK 文本走快速路径返回空集，相似度与修复前完全一致。
+ */
+function uncoveredScriptTokens(lower: string): Set<string> {
+  const tokens = new Set<string>();
+  const normalized = lower.toLowerCase().normalize('NFC');
+  if (!CORE_UNCOVERED_LETTER_OR_NUMBER.test(normalized)) {
+    return tokens;
+  }
+  for (const match of normalized.matchAll(SUPPLEMENT_WORD)) {
+    const word = match[0];
+    if (!CORE_UNCOVERED_LETTER_OR_NUMBER.test(word)) {
+      // 纯拉丁 / 数字 / CJK 的词已由 Core 分词覆盖，不重复补。
+      continue;
+    }
+    // 按码点切分，避免把扩展平面字符（代理对）切成半个字符。
+    const codePoints = Array.from(word);
+    if (codePoints.length >= 2) {
+      tokens.add(word);
+    }
+    for (let i = 0; i + 1 < codePoints.length; i++) {
+      tokens.add(codePoints[i] + codePoints[i + 1]);
+    }
+  }
+  return tokens;
 }
 
 /**

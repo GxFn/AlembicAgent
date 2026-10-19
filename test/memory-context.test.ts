@@ -437,6 +437,74 @@ describe('MemoryStore dedupe similarity, candidate window and maintenance (L6-P3
     }
   });
 
+  it('keeps unrelated Cyrillic memories that share only a Latin identifier as separate rows', () => {
+    // Core 分词丢掉西里尔文后两条只剩共同的 “zustand”，旧实现相似度为 1.0，第二条被当作 UPDATE 静默丢弃。
+    const first = 'используй Zustand для глобального состояния';
+    const second = 'никогда не храни токены в Zustand';
+    const db = new Database(':memory:');
+    try {
+      const store = new MemoryStore(db);
+      const consolidator = new MemoryConsolidator(store);
+      const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+      const stats = consolidator.consolidate([
+        { type: 'preference', content: first, importance: 6 },
+        { type: 'preference', content: second, importance: 6 },
+      ]);
+      expect(stats).toMatchObject({ added: 2, updated: 0, merged: 0 });
+      expect(
+        store
+          .getAllActive()
+          .map((row) => row.content)
+          .sort()
+      ).toEqual([first, second].sort());
+      // findSimilar 每次查询汇总一条补充 token 诊断，只带计数与 type，不带正文。
+      const supplementLogs = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('findSimilar scored'));
+      expect(supplementLogs).toEqual([
+        '[MemoryStore] findSimilar scored 1/1 candidates with script-supplement tokens: text outside Core tokenizer coverage was added to Jaccard (type=preference)',
+      ]);
+      debug.mockRestore();
+
+      // 只差大小写与空白的复述仍判为 UPDATE。
+      expect(
+        consolidator.consolidate([
+          {
+            type: 'preference',
+            content: '  Используй ZUSTAND для глобального  состояния',
+            importance: 8,
+          },
+        ])
+      ).toMatchObject({ added: 0, updated: 1, merged: 0 });
+      expect(store.size()).toBe(2);
+      expect(store.getAllActive().find((row) => row.content === first)).toMatchObject({
+        importance: 8,
+      });
+    } finally {
+      db.close();
+    }
+
+    const appendDb = new Database(':memory:');
+    try {
+      const store = new MemoryStore(appendDb);
+      const retriever = new MemoryRetriever(store);
+      retriever.append({ type: 'fact', content: 'тесты пишем на Vitest', importance: 5 });
+      retriever.append({
+        type: 'fact',
+        content: 'Vitest запускать только локально',
+        importance: 5,
+      });
+      expect(
+        store
+          .getAllActive()
+          .map((row) => row.content)
+          .sort()
+      ).toEqual(['Vitest запускать только локально', 'тесты пишем на Vitest'].sort());
+    } finally {
+      appendDb.close();
+    }
+  });
+
   it('consolidates a restatement of the earliest memory as UPDATE after 60 newer unrelated memories', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const db = new Database(':memory:');
