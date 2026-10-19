@@ -274,3 +274,51 @@ describe('AgentRunCoordinator abortPolicy — unimplemented declarations', () =>
     expect(statuses).toEqual({ a: 'success', b: 'aborted', c: 'aborted' });
   });
 });
+
+describe('AgentRunCoordinator abortPolicy — non-primitive declarations (C019)', () => {
+  // JS 宿主可以绕过 TS 联合类型直接传入预编译 profile（AgentProfileCompiler 对 compiled-agent-profile 原样返回），
+  // abortPolicy 因此可能是无法转成原始值的对象。诊断文案的文本化不能抛错，否则整次协调在派发任何 child 前失败。
+  it.each([
+    ['null-prototype object', () => Object.create(null) as object],
+    [
+      'object whose toString throws',
+      () => ({
+        toString(): string {
+          throw new Error('boom');
+        },
+      }),
+    ],
+  ] as const)('%s only records the warn diagnostic and dispatches every child', async (_label, makeDeclared) => {
+    const calls = spyLogs();
+    const declared = makeDeclared();
+    const ran: string[] = [];
+    const result = await new AgentRunCoordinator().run(
+      runInput(undefined),
+      profile(plan('tiered', declared as unknown as AgentConcurrencyPlan['abortPolicy'])),
+      async (child) => {
+        ran.push(String(child.params?.dimId));
+        return childResult(child);
+      }
+    );
+    // 调度不受声明值影响：没有取消请求时三个维度全部派发并成功。
+    expect(ran).toEqual(['a', 'b', 'c']);
+    expect(result?.status).toBe('success');
+    const diagnostics = abortPolicyDiagnostics(calls);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toEqual(
+      expect.objectContaining({
+        level: 'warn',
+        message: expect.stringContaining(
+          'profile=parent-profile declared=[non-primitive:object] effective=stop-new'
+        ),
+        meta: expect.objectContaining({
+          profileId: 'parent-profile',
+          mode: 'tiered',
+          effectiveAbortPolicy: 'stop-new',
+        }),
+      })
+    );
+    // metadata 保留原始声明值（只交给 Logger，在 observeSafely 隔离内消费）。
+    expect(diagnostics[0]?.meta.declaredAbortPolicy).toBe(declared);
+  });
+});

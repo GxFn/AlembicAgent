@@ -698,7 +698,7 @@ function logUnimplementedAbortPolicy(
   const effective = 'stop-new';
   logCoordination(
     'warn',
-    `abortPolicy not implemented, scheduling as stop-new profile=${profile.id} declared=${String(declared)} effective=${effective}`,
+    `abortPolicy not implemented, scheduling as stop-new profile=${profile.id} declared=${describeDeclaredAbortPolicy(declared)} effective=${effective}`,
     {
       profileId: profile.id,
       mode: concurrencyPlan.mode,
@@ -706,6 +706,25 @@ function logUnimplementedAbortPolicy(
       effectiveAbortPolicy: effective,
     }
   );
+}
+
+/**
+ * 诊断文案里的 declared 文本化（C019）。文案模板串在进入 logCoordination / observeSafely 之前就已求值，
+ * 所以这里必须保证不抛错：JS 宿主绕过类型传入的对象（null 原型对象、toString 会抛错的对象、Proxy 等）
+ * 若交给 String() 会在派发任何 child 之前让整次协调失败。
+ * 对象与函数一律输出固定占位 `[non-primitive:<typeof>]`，不调用其 toString/valueOf/Symbol.toPrimitive，
+ * typeof 不会触发任何用户代码（含 Proxy trap），因此这条降级路径无需 try/catch；
+ * 原始值（含 symbol，显式 String() 转换 symbol 不会抛错）照常转字符串。原始值仍保留在 metadata 的
+ * declaredAbortPolicy 中，由 Logger 在 observeSafely 隔离内消费。
+ */
+function describeDeclaredAbortPolicy(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
+    return `[non-primitive:${typeof value}]`;
+  }
+  return String(value);
 }
 
 /** 与 AgentService preflight 相同的期限归一：只有有限正数才构成检查期限，否则不限时（只与 signal 竞速）。 */
