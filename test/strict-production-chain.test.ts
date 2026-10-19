@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import Logger from '@alembic/core/logging';
+import { hashStrictPlanIntentV1 } from '@alembic/core/plans';
 import {
   canonicalizeKnowledgeClustersV1,
   canonicalizeObservationPopulationV1,
@@ -7,6 +9,7 @@ import {
   createFinalExpandedMiningScheduleReceiptV1,
   hashKnowledgeClusterV1,
 } from '@alembic/core/production';
+import { canonicalJsonStringify } from '@alembic/core/project-context-foundation';
 import { describe, expect, it, vi } from 'vitest';
 import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
@@ -188,18 +191,25 @@ describe('strict Plan cognition', () => {
   });
 
   it('rejects a third semantic repair instead of silently retrying', async () => {
+    let count = 0;
     const agentService = {
-      run: async (_input: AgentRunInput) => result(JSON.stringify(strictIntent)),
+      run: async (_input: AgentRunInput) => {
+        count++;
+        return result(JSON.stringify(strictIntent));
+      },
     };
+    // L8-C06：只有白名单内、模型改写能影响的 cognition 校验码才消耗修复预算；这里用白名单码
+    // 稳定拒绝，确认初始调用 + 两次修复后显式以 PLAN_SEMANTIC_REPAIR_LIMIT 终止并保留原码。
     await expect(
       runStrictPlanAgent({
         agentService,
         contextProjection: planContext(),
         validateReceipt: () => {
-          throw new Error('PLAN_REVISE');
+          throw new Error('PLAN_QUESTION_INCOMPLETE: q-root');
         },
       })
-    ).rejects.toThrow(/PLAN_SEMANTIC_REPAIR_LIMIT/u);
+    ).rejects.toThrow(/^PLAN_SEMANTIC_REPAIR_LIMIT: PLAN_QUESTION_INCOMPLETE: q-root$/u);
+    expect(count).toBe(3);
   });
 });
 
@@ -1183,10 +1193,41 @@ describe('strict Plan local semantic validation', () => {
     });
     expect(calls).toHaveLength(2);
     expect(receipt.lineage.repairs).toHaveLength(1);
-    expect(receipt.lineage.repairs[0].reason).toContain('PLAN_UNKNOWN_FROZEN_QUERY');
+    // L8-C06：本地冻结查询拒绝必须定位到违规 action（下标、questionId 与越界的冻结 ID），
+    // 修复轮才能定向修改，而不是只拿到一个裸错误码。
+    expect(receipt.lineage.repairs[0].reason).toBe(
+      'PLAN_UNKNOWN_FROZEN_QUERY: plannedNextActions[0] questionId="q-root" capabilityId="not-in-frozen-catalog" (not frozen) queryFamilyId="syntax-patterns"'
+    );
     expect(receipt.lineage.repairs[0].parentInvocationId).toBe(
       receipt.lineage.initial.invocationId
     );
+    expect(calls[1]?.message.content).toContain('not-in-frozen-catalog');
+  });
+
+  it('locates every action that leaves the frozen query catalog', async () => {
+    const baseAction = strictIntent.plannedNextActions[0];
+    const invalid = {
+      ...strictIntent,
+      plannedNextActions: [
+        baseAction,
+        { ...baseAction, order: 2, queryFamilyId: 'unfrozen-family' },
+        { ...baseAction, order: 3, questionId: undefined, capabilityId: undefined },
+      ],
+    };
+    let validations = 0;
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+        agentService: { run: async () => result(JSON.stringify(invalid)) },
+        validateReceipt: () => {
+          validations++;
+        },
+      })
+    ).rejects.toThrow(
+      'PLAN_SEMANTIC_REPAIR_LIMIT: PLAN_UNKNOWN_FROZEN_QUERY: plannedNextActions[1] questionId="q-root" capabilityId="facts.syntax" queryFamilyId="unfrozen-family" (not frozen); plannedNextActions[2] questionId=null capabilityId=null (not frozen) queryFamilyId="syntax-patterns"'
+    );
+    // 本地冻结查询校验在宿主校验之前短路，宿主校验器不会收到越界 intent。
+    expect(validations).toBe(0);
   });
   it('does not retry a failed provider as semantic plan repair', async () => {
     let count = 0;
@@ -1321,10 +1362,624 @@ describe('strict Plan error carriers and repair cap', () => {
           },
         },
         validateReceipt: () => {
-          throw new Error('PLAN_REVISE');
+          throw new Error('PLAN_ACTION_SCOPE_MISMATCH: q-root');
         },
       })
-    ).rejects.toThrow('PLAN_SEMANTIC_REPAIR_LIMIT: PLAN_REVISE');
+    ).rejects.toThrow('PLAN_SEMANTIC_REPAIR_LIMIT: PLAN_ACTION_SCOPE_MISMATCH: q-root');
     expect(count).toBe(1);
+  });
+});
+
+/**
+ * Core coldStartProductionPlan.ts 中全部 PLAN_* 码的分类（L8-C06 漂移守护）。
+ * 可修复：只取决于模型输出 intent 的 cognition 校验码，重采样有机会修好。
+ * 确定性：取决于宿主事实、配置、策略或 Agent 构造的 receipt/lineage，重试只会以同样方式失败。
+ * Core 新增或改名 PLAN_* 码时，下方守护用例先失败，迫使同步更新 PlanAgentRun 的白名单。
+ */
+const CORE_MODEL_REPAIRABLE_PLAN_CODES = [
+  'PLAN_ACTION_INCOMPLETE',
+  'PLAN_ACTION_SCOPE_MISMATCH',
+  'PLAN_ACTION_UNKNOWN_QUESTION',
+  'PLAN_BUDGET_OUT_OF_BOUNDS',
+  'PLAN_DECOMPOSITION_MISSING',
+  'PLAN_QUERY_CAPABILITY_SCALE_MISMATCH',
+  'PLAN_QUESTION_CYCLE',
+  'PLAN_QUESTION_DUPLICATE',
+  'PLAN_QUESTION_INCOMPLETE',
+  'PLAN_QUESTION_INVALID',
+  'PLAN_QUESTION_UNSCHEDULED',
+  'PLAN_REQUIRED_LENS_STARVED',
+  'PLAN_REQUIRED_LENS_UNSCHEDULED',
+  'PLAN_SYNTHESIS_PREREQUISITES_INVALID',
+  'PLAN_UNKNOWN_ANALYSIS_SCALE',
+  'PLAN_UNKNOWN_ANATOMY_LENS',
+  'PLAN_UNKNOWN_CAPABILITY',
+  'PLAN_UNKNOWN_QUERY_FAMILY',
+  'PLAN_UNKNOWN_SUBJECT',
+  'PLAN_UNKNOWN_SUBQUESTION',
+];
+const CORE_DETERMINISTIC_PLAN_CODES = [
+  'PLAN_CELL_UNIVERSE_CONSERVATION',
+  'PLAN_COGNITION_INVALID',
+  'PLAN_COGNITION_NOT_ACCEPTED',
+  'PLAN_COGNITION_STALE',
+  'PLAN_FACT_DUPLICATE',
+  'PLAN_FACT_MISSING',
+  'PLAN_LINEAGE_BROKEN',
+  'PLAN_LINEAGE_OUTPUT_MISMATCH',
+  'PLAN_POLICY_UNSUPPORTED',
+  'PLAN_ROLE_VOCABULARY_INVALID',
+  'PLAN_ROLE_VOCABULARY_MISSING',
+  'PLAN_SCALE_UNSUPPORTED',
+  'PLAN_SEMANTIC_REPAIR_LIMIT',
+  'PLAN_STAGE_UNSUPPORTED',
+];
+
+function sha256Prefixed(text: string): string {
+  return `sha256:${createHash('sha256').update(text).digest('hex')}`;
+}
+
+function mockStrictPlanLogger() {
+  const info = vi.fn();
+  const warn = vi.fn();
+  const getInstance = vi.spyOn(Logger, 'getInstance').mockReturnValue({ info, warn } as never);
+  return { info, warn, restore: () => getInstance.mockRestore() };
+}
+
+// L8-C06：严格 Plan 修复链只对白名单 PLAN_* 与结构非法输出重试（同一预算），修复轮携带父输出。
+describe('strict Plan repair eligibility and parent output', () => {
+  const validReply = JSON.stringify(strictIntent);
+  const truncatedReply = validReply.slice(0, Math.floor(validReply.length / 2));
+
+  function scriptedService(replies: readonly string[], calls: AgentRunInput[]) {
+    return {
+      async run(input: AgentRunInput) {
+        calls.push(input);
+        return result(replies[Math.min(calls.length, replies.length) - 1] ?? '');
+      },
+    };
+  }
+
+  it('rethrows a deterministic PLAN_SCALE_UNSUPPORTED rejection after one call without relabeling', async () => {
+    const logger = mockStrictPlanLogger();
+    const calls: AgentRunInput[] = [];
+    const scaleError = new Error(
+      'PLAN_SCALE_UNSUPPORTED: complete module/cell universe exceeds strict-v2 wire'
+    );
+    try {
+      await expect(
+        runStrictPlanAgent({
+          contextProjection: planContext(),
+          agentService: scriptedService([validReply], calls),
+          validateReceipt: () => {
+            throw scaleError;
+          },
+        })
+      ).rejects.toBe(scaleError);
+      expect(calls).toHaveLength(1);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn.mock.calls[0]?.[1]).toMatchObject({
+        reasonCode: 'strict-plan-repair-ineligible',
+        failureCode: 'PLAN_SCALE_UNSUPPORTED',
+        semanticRepairAttempt: 0,
+        resolution: 'rethrow-original',
+      });
+      expect(logger.info).not.toHaveBeenCalled();
+    } finally {
+      logger.restore();
+    }
+  });
+
+  it('treats a truncated JSON reply as a structural repair inside the same budget', async () => {
+    const logger = mockStrictPlanLogger();
+    const calls: AgentRunInput[] = [];
+    try {
+      const receipt = await runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: scriptedService([truncatedReply, validReply], calls),
+        validateReceipt: () => undefined,
+      });
+      expect(calls).toHaveLength(2);
+      expect(receipt.lineage.repairs).toHaveLength(1);
+      const [repair] = receipt.lineage.repairs;
+      expect(repair?.reason).toMatch(/^STRICT_PLAN_INTENT_JSON_INVALID: /u);
+      expect(repair?.parentInvocationId).toBe(receipt.lineage.initial.invocationId);
+      // 结构非法的父调用没有 intent：outputHash 记录原始回复字节，最终输出仍绑定 intent 哈希。
+      expect(receipt.lineage.initial.outputHash).toBe(sha256Prefixed(truncatedReply));
+      expect(repair?.outputHash).toBe(hashStrictPlanIntentV1(receipt.intent));
+      expect(repair?.inputHash).toBe(
+        createHash('sha256')
+          .update(calls[1]?.message.content ?? '')
+          .digest('hex')
+      );
+      const repairPrompt = calls[1]?.message.content ?? '';
+      expect(repairPrompt).toContain('因果结构修复');
+      expect(repairPrompt).toContain(truncatedReply);
+      expect(repairPrompt).toContain(receipt.lineage.initial.outputHash);
+      expect(calls[1]?.message.metadata).toMatchObject({ semanticRepairAttempt: 1 });
+      expect(logger.info).toHaveBeenCalledTimes(1);
+      expect(logger.info.mock.calls[0]?.[1]).toMatchObject({
+        reasonCode: 'strict-plan-repair-scheduled',
+        repairKind: 'structural',
+        failureCode: 'STRICT_PLAN_INTENT_JSON_INVALID',
+        semanticRepairAttempt: 0,
+        remainingRepairs: 1,
+      });
+    } finally {
+      logger.restore();
+    }
+  });
+
+  it('names the failing field when the intent shape is invalid and repairs it', async () => {
+    const calls: AgentRunInput[] = [];
+    const { budgetStrategy: _omitted, ...withoutBudget } = strictIntent;
+    const receipt = await runStrictPlanAgent({
+      contextProjection: planContext(),
+      agentService: scriptedService([JSON.stringify(withoutBudget), validReply], calls),
+      validateReceipt: () => undefined,
+    });
+    expect(calls).toHaveLength(2);
+    expect(receipt.lineage.repairs[0]?.reason).toBe(
+      'STRICT_PLAN_INTENT_SHAPE_INVALID: budgetStrategy.schemaVersion missing'
+    );
+  });
+
+  it('carries the rejected parent intent as canonical JSON into the semantic repair prompt', async () => {
+    const calls: AgentRunInput[] = [];
+    const marker = 'UNIQUE_PARENT_OUTPUT_MARKER_L8_C06';
+    const parentIntent = {
+      ...strictIntent,
+      plannedNextActions: strictIntent.plannedNextActions.map((action) => ({
+        ...action,
+        reason: marker,
+      })),
+    };
+    let validations = 0;
+    const receipt = await runStrictPlanAgent({
+      contextProjection: planContext(),
+      agentService: scriptedService([JSON.stringify(parentIntent), validReply], calls),
+      validateReceipt: () => {
+        validations++;
+        if (validations === 1) {
+          throw new Error('PLAN_REQUIRED_LENS_UNSCHEDULED: scope:workspace/structure-and-boundary');
+        }
+      },
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.message.content).not.toContain(marker);
+    const repairPrompt = calls[1]?.message.content ?? '';
+    expect(repairPrompt).toContain('因果语义修复');
+    expect(repairPrompt).toContain(canonicalJsonStringify(parentIntent));
+    expect(repairPrompt).toContain(receipt.lineage.initial.outputHash);
+    expect(repairPrompt).toContain('最小修改');
+    expect(receipt.lineage.initial.outputHash).toBe(hashStrictPlanIntentV1(parentIntent));
+    expect(receipt.lineage.repairs[0]?.reason).toBe(
+      'PLAN_REQUIRED_LENS_UNSCHEDULED: scope:workspace/structure-and-boundary'
+    );
+  });
+
+  it('chains a structural repair and a semantic repair into one causal lineage', async () => {
+    const calls: AgentRunInput[] = [];
+    let validations = 0;
+    const receipt = await runStrictPlanAgent({
+      contextProjection: planContext(),
+      agentService: scriptedService([truncatedReply, validReply, validReply], calls),
+      validateReceipt: () => {
+        validations++;
+        if (validations === 1) {
+          throw new Error('PLAN_QUESTION_INCOMPLETE: q-root');
+        }
+      },
+    });
+    expect(calls).toHaveLength(3);
+    const [structural, semantic] = receipt.lineage.repairs;
+    expect(structural?.parentInvocationId).toBe(receipt.lineage.initial.invocationId);
+    expect(structural?.reason).toMatch(/^STRICT_PLAN_INTENT_JSON_INVALID: /u);
+    expect(semantic?.parentInvocationId).toBe(structural?.invocationId);
+    expect(semantic?.reason).toBe('PLAN_QUESTION_INCOMPLETE: q-root');
+    // 第二轮修复的父输出是第一次修复产出的合法 intent，而不是最初被截断的回复。
+    expect(calls[2]?.message.content).toContain(canonicalJsonStringify(strictIntent));
+    expect(calls[2]?.message.content).not.toContain(truncatedReply);
+  });
+
+  it('still caps structural plus semantic repairs at two in total', async () => {
+    const logger = mockStrictPlanLogger();
+    const calls: AgentRunInput[] = [];
+    try {
+      const failure = await runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: scriptedService([truncatedReply, validReply, truncatedReply], calls),
+        validateReceipt: () => {
+          throw new Error('PLAN_QUESTION_INCOMPLETE: q-root');
+        },
+      }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(calls).toHaveLength(3);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(
+        /^PLAN_SEMANTIC_REPAIR_LIMIT: STRICT_PLAN_INTENT_JSON_INVALID: /u
+      );
+      expect((failure as Error).cause).toBeInstanceOf(Error);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn.mock.calls[0]?.[1]).toMatchObject({
+        reasonCode: 'strict-plan-repair-exhausted',
+        repairKind: 'structural',
+        failureCode: 'STRICT_PLAN_INTENT_JSON_INVALID',
+        semanticRepairAttempt: 2,
+        semanticRepairLimit: 2,
+      });
+    } finally {
+      logger.restore();
+    }
+  });
+
+  it('fails a structural rejection immediately when the repair budget is zero', async () => {
+    const calls: AgentRunInput[] = [];
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+        agentService: scriptedService([''], calls),
+        validateReceipt: () => undefined,
+      })
+    ).rejects.toThrow(/^PLAN_SEMANTIC_REPAIR_LIMIT: STRICT_PLAN_EMPTY_REPLY$/u);
+    expect(calls).toHaveLength(1);
+  });
+
+  // L8-C06 返工：Core hashStrictPlanIntentV1 → normalizeStrictPlanIntent 会深读 projectProfile、scale、
+  // 每个问题的字符串数组、action.tool 等字段。这些形状错误以前以裸 TypeError 在第一次调用后直接失败
+  // （无错误码、无 lineage、无诊断），现在必须归为 STRICT_PLAN_INTENT_SHAPE_INVALID，进入同一修复预算。
+  const [baseAction] = strictIntent.plannedNextActions;
+  const [baseQuestion] = strictIntent.investigationDecomposition.questions;
+  const { projectProfile: _omittedProfile, ...withoutProjectProfile } = strictIntent;
+  const { scale: _omittedScale, ...withoutScale } = strictIntent;
+  const { subquestionIds: _omittedSubquestions, ...questionWithoutSubquestions } = baseQuestion;
+  const { tool: _omittedTool, ...actionWithoutTool } = baseAction;
+  const deepShapeCases = [
+    {
+      name: 'missing projectProfile',
+      reply: JSON.stringify(withoutProjectProfile),
+      detail: 'projectProfile must be an object',
+    },
+    {
+      name: 'missing scale',
+      reply: JSON.stringify(withoutScale),
+      detail: 'scale must be an object',
+    },
+    {
+      name: 'question without subquestionIds',
+      reply: JSON.stringify({
+        ...strictIntent,
+        investigationDecomposition: {
+          ...strictIntent.investigationDecomposition,
+          questions: [questionWithoutSubquestions],
+        },
+      }),
+      detail: 'investigationDecomposition.questions[0].subquestionIds must be an array of strings',
+    },
+    {
+      name: 'questions given as an object',
+      reply: JSON.stringify({
+        ...strictIntent,
+        investigationDecomposition: {
+          ...strictIntent.investigationDecomposition,
+          questions: { 'q-root': baseQuestion },
+        },
+      }),
+      detail: 'investigationDecomposition.questions must be an array',
+    },
+    {
+      name: 'second action without tool',
+      reply: JSON.stringify({
+        ...strictIntent,
+        plannedNextActions: [baseAction, { ...actionWithoutTool }],
+      }),
+      detail: 'plannedNextActions[1].tool must be a string',
+    },
+    {
+      name: 'non-finite number',
+      reply: validReply.replace('"totalRecipeBudget":0', '"totalRecipeBudget":1e999'),
+      detail: 'scale.totalRecipeBudget',
+    },
+  ];
+
+  it.each(
+    deepShapeCases
+  )('repairs a deep shape error ($name) as STRICT_PLAN_INTENT_SHAPE_INVALID inside the same budget', async ({
+    reply,
+    detail,
+  }) => {
+    expect(reply).not.toBe(validReply);
+    const logger = mockStrictPlanLogger();
+    const calls: AgentRunInput[] = [];
+    let validations = 0;
+    try {
+      const receipt = await runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: scriptedService([reply, validReply], calls),
+        validateReceipt: () => {
+          validations++;
+        },
+      });
+      expect(calls).toHaveLength(2);
+      // 形状非法的 intent 不进入宿主校验器，只有修复后的合法 intent 被校验一次。
+      expect(validations).toBe(1);
+      expect(receipt.lineage.repairs).toHaveLength(1);
+      const [repair] = receipt.lineage.repairs;
+      expect(repair?.reason).toMatch(/^STRICT_PLAN_INTENT_SHAPE_INVALID: /u);
+      expect(repair?.reason).toContain(detail);
+      expect(repair?.parentInvocationId).toBe(receipt.lineage.initial.invocationId);
+      // 形状非法的父调用 outputHash 取自原始回复；最终调用仍绑定最终 intent 的 Core 哈希。
+      expect(receipt.lineage.initial.outputHash).toBe(sha256Prefixed(reply));
+      expect(repair?.outputHash).toBe(hashStrictPlanIntentV1(receipt.intent));
+      const repairPrompt = calls[1]?.message.content ?? '';
+      expect(repairPrompt).toContain('因果结构修复');
+      expect(repairPrompt).toContain(reply);
+      const scheduled = logger.info.mock.calls
+        .map((call) => call[1] as Record<string, unknown> | undefined)
+        .filter((data) => data?.reasonCode === 'strict-plan-repair-scheduled');
+      expect(scheduled).toHaveLength(1);
+      expect(scheduled[0]).toMatchObject({
+        repairKind: 'structural',
+        failureCode: 'STRICT_PLAN_INTENT_SHAPE_INVALID',
+        semanticRepairAttempt: 0,
+        remainingRepairs: 1,
+      });
+    } finally {
+      logger.restore();
+    }
+  });
+
+  it('keeps the Core canonicalization exception as the cause of a non-finite shape rejection', async () => {
+    const logger = mockStrictPlanLogger();
+    const calls: AgentRunInput[] = [];
+    const reply = validReply.replace('"totalRecipeBudget":0', '"totalRecipeBudget":1e999');
+    try {
+      const failure = await runStrictPlanAgent({
+        contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+        agentService: scriptedService([reply], calls),
+        validateReceipt: () => undefined,
+      }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(calls).toHaveLength(1);
+      expect(failure).toBeInstanceOf(Error);
+      const limit = failure as Error;
+      expect(limit.message).toBe(
+        'PLAN_SEMANTIC_REPAIR_LIMIT: STRICT_PLAN_INTENT_SHAPE_INVALID: intent is not canonical JSON (Canonical JSON does not accept non-finite numbers.); non-finite numbers at scale.totalRecipeBudget'
+      );
+      const shape = limit.cause as Error;
+      expect(shape).toBeInstanceOf(Error);
+      expect(shape.message).toMatch(/^STRICT_PLAN_INTENT_SHAPE_INVALID: /u);
+      // 原始 Core 异常保留为 cause，便于区分形状缺口与 Core 规范化规则变化。
+      expect(shape.cause).toBeInstanceOf(TypeError);
+      const canonicalizationLog = logger.warn.mock.calls
+        .map((call) => call[1] as Record<string, unknown> | undefined)
+        .find((data) => data?.reasonCode === 'strict-plan-intent-canonicalization-failed');
+      expect(canonicalizationLog).toMatchObject({
+        resolution: 'structural-rejection',
+        nonFinitePaths: ['scale.totalRecipeBudget'],
+      });
+      expect(
+        logger.warn.mock.calls.some(
+          (call) =>
+            (call[1] as Record<string, unknown> | undefined)?.reasonCode ===
+            'strict-plan-repair-exhausted'
+        )
+      ).toBe(true);
+    } finally {
+      logger.restore();
+    }
+  });
+
+  it('exhausts the shared budget when every reply keeps the same deep shape error', async () => {
+    const calls: AgentRunInput[] = [];
+    const reply = JSON.stringify(withoutProjectProfile);
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: scriptedService([reply], calls),
+        validateReceipt: () => undefined,
+      })
+    ).rejects.toThrow(
+      /^PLAN_SEMANTIC_REPAIR_LIMIT: STRICT_PLAN_INTENT_SHAPE_INVALID: projectProfile must be an object$/u
+    );
+    expect(calls).toHaveLength(3);
+  });
+
+  it('lists every deep shape problem in one rejection, capped for prompt size', async () => {
+    const calls: AgentRunInput[] = [];
+    const brokenQuestions = Array.from({ length: 30 }, (_, index) => ({
+      ...questionWithoutSubquestions,
+      questionId: `q-${index}`,
+    }));
+    const reply = JSON.stringify({
+      ...withoutScale,
+      investigationDecomposition: {
+        ...strictIntent.investigationDecomposition,
+        questions: brokenQuestions,
+      },
+    });
+    const failure = await runStrictPlanAgent({
+      contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+      agentService: scriptedService([reply], calls),
+      validateReceipt: () => undefined,
+    }).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(calls).toHaveLength(1);
+    const message = (failure as Error).message;
+    expect(message).toMatch(
+      /^PLAN_SEMANTIC_REPAIR_LIMIT: STRICT_PLAN_INTENT_SHAPE_INVALID: scale must be an object; investigationDecomposition\.questions\[0\]\.subquestionIds must be an array of strings; /u
+    );
+    // 31 个问题（scale + 30 个缺失 subquestionIds 的问题）只列前 20 个，其余汇总为计数。
+    expect(message).toContain('investigationDecomposition.questions[18].subquestionIds');
+    expect(message).not.toContain('investigationDecomposition.questions[19].subquestionIds');
+    expect(message).toMatch(/; \(\+11 more\)$/u);
+  });
+
+  it('never lets a wrong-typed intent field escape Core canonicalization as a raw TypeError', async () => {
+    // 守护本地形状检查与 Core normalizeStrictPlanIntent 的同步：对基准 intent 的每个字段路径逐一
+    // 删除或替换成错误类型，结果只能是成功，或带 STRICT_PLAN_* / PLAN_* 码的显式拒绝。
+    // 基准里每类数组放两项且排序键相同，确保 Core 排序比较器（tool/questionId/modulePath 等）被执行。
+    const secondQuestion = { ...baseQuestion, questionId: 'q-leaf' };
+    const fuzzBase = {
+      ...strictIntent,
+      projectProfile: {
+        ...strictIntent.projectProfile,
+        secondaryLanguages: ['ts'],
+        frameworks: ['node'],
+        architectureHints: ['monorepo'],
+      },
+      dimensions: [...strictIntent.dimensions, { ...strictIntent.dimensions[0] }],
+      moduleBindings: [
+        {
+          modulePath: 'src/a',
+          moduleId: 'a',
+          dimensions: ['architecture'],
+          targetRecipes: 1,
+          priority: 1,
+        },
+        {
+          modulePath: 'src/a',
+          moduleId: 'a',
+          dimensions: ['architecture'],
+          targetRecipes: 1,
+          priority: 1,
+        },
+      ],
+      plannedNextActions: [baseAction, { ...baseAction, reason: 'second pass' }],
+      evidenceRefs: [
+        ...strictIntent.evidenceRefs,
+        { kind: 'project-context' as const, ref: 'artifact:pcf', detail: 'dup' },
+      ],
+      investigationDecomposition: {
+        ...strictIntent.investigationDecomposition,
+        questions: [baseQuestion, secondQuestion],
+      },
+      synthesisPrerequisiteCellIds: { 'a::architecture': ['a::x', 'a::y'] },
+    };
+    const wrongValues: readonly unknown[] = [undefined, null, 7, 'x', { k: 1 }, [1]];
+    const paths: (string | number)[][] = [];
+    const walk = (value: unknown, path: (string | number)[]) => {
+      if (path.length > 0) {
+        paths.push(path);
+      }
+      if (Array.isArray(value)) {
+        for (const [index, item] of value.entries()) {
+          walk(item, [...path, index]);
+        }
+      } else if (value && typeof value === 'object') {
+        for (const [key, item] of Object.entries(value)) {
+          walk(item, [...path, key]);
+        }
+      }
+    };
+    walk(fuzzBase, []);
+    expect(paths.length).toBeGreaterThan(100);
+
+    const logger = mockStrictPlanLogger();
+    const escaped: string[] = [];
+    try {
+      for (const path of paths) {
+        for (const wrong of wrongValues) {
+          const mutated = structuredClone(fuzzBase) as Record<string | number, unknown>;
+          let parent = mutated;
+          for (const key of path.slice(0, -1)) {
+            parent = parent[key] as Record<string | number, unknown>;
+          }
+          const leaf = path[path.length - 1];
+          if (wrong === undefined) {
+            delete parent[leaf];
+          } else {
+            parent[leaf] = wrong;
+          }
+          const outcome = await runStrictPlanAgent({
+            contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+            agentService: { run: async () => result(JSON.stringify(mutated)) },
+            validateReceipt: () => undefined,
+          }).then(
+            () => null,
+            (err: unknown) => err
+          );
+          if (outcome === null) {
+            continue;
+          }
+          const message = outcome instanceof Error ? outcome.message : String(outcome);
+          if (
+            outcome instanceof TypeError ||
+            !/^PLAN_SEMANTIC_REPAIR_LIMIT: (STRICT_PLAN_|PLAN_)[A-Z_]+/u.test(message)
+          ) {
+            escaped.push(`${path.join('.')}=${JSON.stringify(wrong) ?? 'deleted'}: ${message}`);
+          }
+        }
+      }
+      // 扫描不注入非有限数字，所以 Core 规范化兜底分支一次都不应触发：触发说明 Core 新读取了
+      // 本地形状检查没覆盖的字段，需要补齐检查（兜底只保证不逃逸，不提供定位信息）。
+      const backstopHits = logger.warn.mock.calls.filter(
+        (call) =>
+          (call[1] as Record<string, unknown> | undefined)?.reasonCode ===
+          'strict-plan-intent-canonicalization-failed'
+      );
+      expect(backstopHits.map((call) => call[0])).toEqual([]);
+    } finally {
+      logger.restore();
+    }
+    expect(escaped).toEqual([]);
+  });
+
+  it('classifies every Core PLAN_* code and repairs only the model-fixable ones', async () => {
+    const coreSource = readFileSync(
+      new URL(
+        '../node_modules/@alembic/core/dist/service/plan/intent/coldStartProductionPlan.js',
+        import.meta.url
+      ),
+      'utf8'
+    );
+    const coreCodes = [
+      ...new Set([...coreSource.matchAll(/['"](PLAN_[A-Z0-9_]+)['"]/gu)].map((match) => match[1])),
+    ].sort();
+    expect(coreCodes).toEqual(
+      [...CORE_MODEL_REPAIRABLE_PLAN_CODES, ...CORE_DETERMINISTIC_PLAN_CODES].sort()
+    );
+    const logger = mockStrictPlanLogger();
+    try {
+      for (const code of coreCodes) {
+        const calls: AgentRunInput[] = [];
+        const rejection = new Error(`${code}: drift-guard`);
+        let validations = 0;
+        const outcome = await runStrictPlanAgent({
+          contextProjection: planContext(),
+          agentService: scriptedService([validReply], calls),
+          validateReceipt: () => {
+            validations++;
+            if (validations === 1) {
+              throw rejection;
+            }
+          },
+        }).then(
+          (receipt) => ({ receipt, error: null }),
+          (err: unknown) => ({ receipt: null, error: err })
+        );
+        if (CORE_MODEL_REPAIRABLE_PLAN_CODES.includes(code)) {
+          expect({ code, calls: calls.length, repaired: outcome.receipt !== null }).toEqual({
+            code,
+            calls: 2,
+            repaired: true,
+          });
+        } else {
+          expect({ code, calls: calls.length, sameError: outcome.error === rejection }).toEqual({
+            code,
+            calls: 1,
+            sameError: true,
+          });
+        }
+      }
+    } finally {
+      logger.restore();
+    }
   });
 });

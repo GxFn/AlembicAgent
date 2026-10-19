@@ -466,6 +466,65 @@ describe('plan helpers cancellation and deadline signals', () => {
     }
   });
 
+  it('forwards the same signals to a structural repair after a truncated strict reply', async () => {
+    const calls: AgentRunInput[] = [];
+    const controller = new AbortController();
+    const shouldAbort = vi.fn(() => false);
+    const validReply = JSON.stringify(minimalStrictIntent);
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        // 第一次回复被截断（结构非法），按 L8-C06 进入同一修复预算的结构修复。
+        return agentRunResult(calls.length === 1 ? validReply.slice(0, 40) : validReply);
+      },
+    };
+
+    const receipt = await runStrictPlanAgent({
+      agentService,
+      contextProjection: strictContext,
+      validateReceipt: () => undefined,
+      abortSignal: controller.signal,
+      shouldAbort,
+      timeoutMs: 15_000,
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(receipt.lineage.repairs[0]?.reason).toMatch(/^STRICT_PLAN_INTENT_JSON_INVALID: /u);
+    for (const call of calls) {
+      expect(call.execution).toEqual({
+        toolChoiceOverride: 'none',
+        abortSignal: controller.signal,
+        shouldAbort,
+        timeoutMs: 15_000,
+      });
+    }
+  });
+
+  it('stops a structural repair that is aborted mid-flight as STRICT_PLAN_RUN_FAILED', async () => {
+    const calls: AgentRunInput[] = [];
+    const agentService = {
+      run: async (input: AgentRunInput) => {
+        calls.push(input);
+        return calls.length === 1
+          ? agentRunResult('{"generationStage":"coldStart",')
+          : agentRunResult('Agent run aborted by host', 'aborted');
+      },
+    };
+
+    await expect(
+      runStrictPlanAgent({
+        agentService,
+        contextProjection: strictContext,
+        validateReceipt: () => undefined,
+      })
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/^STRICT_PLAN_RUN_FAILED: aborted/u),
+      partialResult: { status: 'aborted' },
+    });
+    // 取消不进入修复：结构修复轮被中止后不再消耗剩余预算。
+    expect(calls).toHaveLength(2);
+  });
+
   it('surfaces an aborted strict plan attempt as STRICT_PLAN_RUN_FAILED without repairing', async () => {
     const calls: AgentRunInput[] = [];
     const controller = new AbortController();
