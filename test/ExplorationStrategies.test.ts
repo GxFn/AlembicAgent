@@ -25,8 +25,9 @@ import {
 import { SCAN_TASK_CONFIGS } from '../src/agent/prompts/scanPrompts.js';
 import type { AgentRuntime, LoopContext } from '../src/agent/runtime/index.js';
 import { createToolPipeline, DiagnosticsCollector } from '../src/agent/runtime/index.js';
-import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
+import type { ToolCallRequest, ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import type { ToolContext } from '../src/tools/kernel/registry.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -914,13 +915,22 @@ it('preserves the analyst verification phase before recording and summary', () =
 /**
  * L5-P17（I07）：阶段门放行的动作必须同时被能力白名单和真实 handler 接受，阻断文案也不能
  * 推荐会被下一道门或 handler 拒绝的调用，否则模型按文案重试只会白耗一轮预算。
+ *
+ * 默认路由来者不拒，只能证明“门没拦”；要证明“handler 真能接收”，传 hostToolContext 改用
+ * 生产形态的真实 ToolRouterAdapter（不带 capability，与宿主 AgentModule 一致），宿主端口由
+ * hostToolContext 打桩，dispatched 仍记录通过全部门、交给路由的调用。
  */
 function phaseGateFixture(input: {
   allowedToolIds: string[];
   tracker: { pipelineType: string; phase: string };
+  hostToolContext?: ToolContext;
 }) {
   const diagnostics = new DiagnosticsCollector();
   const dispatched: string[] = [];
+  const hostToolContext = input.hostToolContext;
+  const realRouter = hostToolContext
+    ? new ToolRouterAdapter({ contextFactory: { create: () => hostToolContext } })
+    : null;
   const runtime = {
     id: 'phase-gate-alignment',
     presetName: 'test',
@@ -933,8 +943,11 @@ function phaseGateFixture(input: {
     policies: { get: () => null },
     toolRegistry: { getManifest: () => null },
     toolRouter: {
-      async execute(request: { toolId: string; args: Record<string, unknown> }) {
+      async execute(request: ToolCallRequest) {
         dispatched.push(`${request.toolId}.${String(request.args?.action ?? '')}`);
+        if (realRouter) {
+          return realRouter.execute(request);
+        }
         return {
           ok: true,
           status: 'success',
@@ -1040,7 +1053,13 @@ describe('phase gates stay aligned with handlers and capability allowlists', () 
       label: 'entity outside nested params',
       args: { action: 'query', entity: 'Alpha', params: { type: 'callers' } },
     },
-  ])('blocks analyst VERIFY graph.query with $label because the graph handler requires entity', async ({
+    {
+      // router.parseToolCall 只把 args.params 交给 handler，平铺在顶层的 type/entity 会被丢弃，
+      // 真实路由对这种调用返回 TOOL_CALL_INVALID；门在调度前就拦下。
+      label: 'flat entity',
+      args: { action: 'query', type: 'callers', entity: 'Alpha' },
+    },
+  ])('blocks analyst VERIFY graph.query with $label because it lacks a nested non-blank params.entity', async ({
     args,
   }) => {
     const { context, diagnostics, dispatched } = phaseGateFixture({
@@ -1055,28 +1074,83 @@ describe('phase gates stay aligned with handlers and capability allowlists', () 
     expect(dispatched).toEqual([]);
     const error = blockedError(output.result);
     expect(error).toContain('Analyst VERIFY is evidence-only');
-    expect(error).toContain('with entity');
+    // 推荐写法必须是 handler 真正读取的嵌套 params.entity，模型照文案重试才不会再被拒。
+    expect(error).toContain('with params.entity');
     expect(error).not.toContain('entity/path');
     expect(diagnostics.toJSON().blockedTools).toMatchObject([{ tool: 'graph' }]);
+  });
+
+  it('allows a focused analyst VERIFY graph.query with nested params.entity', async () => {
+    const { context, dispatched } = phaseGateFixture({
+      allowedToolIds: ['code', 'graph', 'memory', 'evidence'],
+      tracker: { pipelineType: 'analyst', phase: 'VERIFY' },
+    });
+    const output = await createToolPipeline().execute(
+      {
+        id: 'verify-graph',
+        name: 'graph',
+        args: { action: 'query', params: { type: 'callers', entity: 'Alpha' } },
+      },
+      context
+    );
+    expect(output.metadata.blocked).toBe(false);
+    expect(dispatched).toEqual(['graph.query']);
   });
 
   it.each([
     {
       label: 'nested params.entity',
       args: { action: 'query', params: { type: 'callers', entity: 'Alpha' } },
+      blocked: false,
+      hostCalls: [['Alpha', 20]],
     },
-    { label: 'flat entity', args: { action: 'query', type: 'callers', entity: 'Alpha' } },
-  ])('allows a focused analyst VERIFY graph.query with $label', async ({ args }) => {
-    const { context, dispatched } = phaseGateFixture({
+    {
+      label: 'flat entity',
+      args: { action: 'query', type: 'callers', entity: 'Alpha' },
+      blocked: true,
+      hostCalls: [],
+    },
+    {
+      // handler 只做非空检查，纯空白 entity 会被发往宿主；门比 handler 更严，调度前就拦下。
+      label: 'blank nested entity',
+      args: { action: 'query', params: { type: 'callers', entity: '   ' } },
+      blocked: true,
+      hostCalls: [],
+    },
+  ])('keeps analyst VERIFY graph.query with $label aligned with the real router and graph handler', async ({
+    args,
+    blocked,
+    hostCalls,
+  }) => {
+    const getCallers = vi.fn((entity: string, limit: number) => [
+      { caller: `${entity}Caller`, limit },
+    ]);
+    const { context, diagnostics, dispatched } = phaseGateFixture({
       allowedToolIds: ['code', 'graph', 'memory', 'evidence'],
       tracker: { pipelineType: 'analyst', phase: 'VERIFY' },
+      hostToolContext: {
+        projectRoot: process.cwd(),
+        tokenBudget: 8000,
+        projectGraph: { getCallers },
+      },
     });
     const output = await createToolPipeline().execute(
-      { id: 'verify-graph', name: 'graph', args },
+      { id: 'verify-graph-real-router', name: 'graph', args },
       context
     );
-    expect(output.metadata.blocked).toBe(false);
-    expect(dispatched).toEqual(['graph.query']);
+    expect(output.metadata.blocked).toBe(blocked);
+    expect(getCallers.mock.calls).toEqual(hostCalls);
+    if (blocked) {
+      // 门拦截：不进入路由，阻断原因进 diagnostics.blockedTools。
+      expect(dispatched).toEqual([]);
+      expect(blockedError(output.result)).toContain('Analyst VERIFY is evidence-only');
+      expect(diagnostics.toJSON().blockedTools).toMatchObject([{ tool: 'graph' }]);
+    } else {
+      // 门放行的形态必须真被路由与 handler 接收：宿主端口实际被调用，且路由结果是成功。
+      expect(dispatched).toEqual(['graph.query']);
+      expect(output.metadata.envelope?.ok).toBe(true);
+      expect(diagnostics.toJSON().blockedTools ?? []).toEqual([]);
+    }
   });
 });
 

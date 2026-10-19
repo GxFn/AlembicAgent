@@ -1,7 +1,6 @@
 /** 场景动作约束：Evolution、record-only（record repair 与 Analyst RECORD）、Analyst VERIFY 与 Producer；不拥有路由与记账。 */
 import {
   getToolAction,
-  getToolParams,
   isDirectNoteFindingCall,
   type RecordOnlyStageTrigger,
   resolveRecordOnlyStageTrigger,
@@ -66,10 +65,23 @@ const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
 ]);
 
 /**
- * 聚焦实体判定与 graph handler 对齐：handler 只从 params.entity 读取非空字符串，
+ * 取 graph.query 真正会交给 handler 的嵌套参数对象。
+ *
+ * router.parseToolCall 只把 args.params（缺省 {}）交给 handler，顶层平铺的 type/entity 会被丢弃，
+ * 真实路由对平铺调用返回 TOOL_CALL_INVALID。所以这里不用 getToolParams 的扁平回退视角：
+ * 嵌套 params 缺失或不是对象时返回 undefined，由调用方阻断，免得门放行一个必被路由拒绝的调用。
+ */
+function nestedGraphParams(call: ToolCall): Record<string, unknown> | undefined {
+  const nested = call.args?.params;
+  return nested && typeof nested === 'object' && !Array.isArray(nested)
+    ? (nested as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * 聚焦实体判定与 graph handler 对齐：handler 只从嵌套 params.entity 读取字符串，
  * symbol/name/path 不是 graph.query 的入参，门放行它们只会让 handler 返回 requires entity。
- * getToolParams 在没有嵌套 params 时返回扁平 args，所以扁平 call.args.entity 也由这里覆盖；
- * 嵌套 params 之外另挂的 entity 到不了 handler，不算聚焦实体。
+ * handler 只做非空检查；门要求非空白 entity，比 handler 更严，以免把纯空白实体发往宿主。
  */
 function hasFocusedGraphEntity(params: Record<string, unknown>): boolean {
   return typeof params.entity === 'string' && params.entity.trim().length > 0;
@@ -145,7 +157,6 @@ export const analystVerifyOnlyGate = {
     }
 
     const action = getToolAction(call);
-    const params = getToolParams(call);
 
     if (call.name === 'code' && ANALYST_VERIFY_CODE_ACTIONS.has(action)) {
       return undefined;
@@ -163,18 +174,25 @@ export const analystVerifyOnlyGate = {
     }
 
     if (call.name === 'graph' && action === 'query') {
-      const queryType = String(params.type ?? call.args?.type ?? '');
-      if (ANALYST_VERIFY_GRAPH_QUERY_TYPES.has(queryType) && hasFocusedGraphEntity(params)) {
+      // type 与 entity 都只认嵌套 params（不回退顶层 call.args.type）：平铺写法到不了 handler，
+      // 落到下方统一阻断，模型拿到的是指向 params.entity 的阶段门文案而不是路由的参数错误。
+      const graphParams = nestedGraphParams(call);
+      const queryType = String(graphParams?.type ?? '');
+      if (
+        graphParams &&
+        ANALYST_VERIFY_GRAPH_QUERY_TYPES.has(queryType) &&
+        hasFocusedGraphEntity(graphParams)
+      ) {
         return undefined;
       }
     }
 
-    // 阻断原因（含 graph 缺少 entity）由执行引擎统一写入 diagnostics.blockedTools。
+    // 阻断原因（含 graph 缺少嵌套 params.entity、平铺参数）由执行引擎统一写入 diagnostics.blockedTools。
     return {
       blocked: true,
       result: {
         error:
-          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with entity), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
+          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with params.entity), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
       },
     };
   },
