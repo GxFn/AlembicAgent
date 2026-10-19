@@ -54,7 +54,12 @@ interface CompressCall {
  */
 const DELTA_UNCHANGED_PLACEHOLDER = '[unchanged since last read]';
 
-/** DeltaCache 指纹变化但逐行比较没有差异时的占位文本（computeSimpleDiff 的空 diff）。 */
+/**
+ * 历史占位文本：L4-P6（7524a77）之前 DeltaCache 的 computeSimpleDiff 在逐行比较无差异时返回它。
+ * 该函数已随 L4-P6 删除，当前 DeltaCache 不再产生此文本：内容相同先命中 unchanged，内容不同至少有
+ * 一个 hunk 或回退 full。下方 summarizeSingleFileRead 的匹配分支因此在仓库内没有生产方（不可达），
+ * 只是保留的识别，不代表 DeltaCache 仍有“无可见差异”这一模式。
+ */
 const DELTA_NO_VISIBLE_CHANGES = '[no visible changes]';
 
 /**

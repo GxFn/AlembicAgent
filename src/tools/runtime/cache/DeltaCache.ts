@@ -3,7 +3,8 @@
  *
  * 文件读取增量缓存。同一会话中再次读取已读文件时:
  *   - 内容未变且此前完整可见 → 返回 "[unchanged since last read]"
- *   - 内容有变且此前完整可见 → 返回行级紧凑 diff；diff 不小于全文时回退 full 并刷新可见基线
+ *   - 内容有变且此前完整可见 → 返回行级紧凑 diff；拼好的 diff 文本不小于全文（字符数或共同 token
+ *     估算）、或变更行数不少于全文行数时回退 full 并刷新可见基线
  *   - 首次读取或此前只登记了指纹 → 返回 full 并成为可见基线
  *
  * 指纹（md5 hex）只在本模块计算：check() 自算，set() 可省略 hash 由缓存自算，写前新鲜度门
@@ -15,6 +16,7 @@
 import { createHash } from 'node:crypto';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import { estimateTokens } from '#shared/tokenUtils.js';
 
 export interface DeltaCacheEntry {
   hash: string;
@@ -96,7 +98,8 @@ export class DeltaCache {
   /**
    * 智能读取: 根据缓存状态决定返回全文 / unchanged / diff
    * 缓存未命中或旧内容不可见时返回 full；不以指纹存在推断全文已被展示。
-   * delta 不比全文小（行数或字符数）时回退 full：调用方 full 分支自带行号，模型可直接定位。
+   * 返回的 delta 文本（含 hunk 头、-/+ 前缀与换行）按字符数或共同 token 估算不比全文小、或变更行数
+   * 不少于全文行数时回退 full：调用方 full 分支自带行号，模型可直接定位。
    */
   check(path: string, currentContent: string): DeltaReadResult {
     const currentHash = contentFingerprint(currentContent);
@@ -114,7 +117,7 @@ export class DeltaCache {
       // 无论回退与否，本次返回的都是当前完整版本：直接写可见基线，下一次以它为比较起点。
       this.#rememberVisible(path, currentHash, currentContent, lineCount);
       if (plan.selected === 'full' || plan.algorithm === 'positional') {
-        reportDeltaPlan(path, plan, currentContent.length, lineCount);
+        reportDeltaPlan(path, plan, lineCount);
       }
       if (plan.selected === 'full') {
         return { mode: 'full', content: currentContent, lineCount };
@@ -171,21 +174,39 @@ function countLines(content: string): number {
 
 type LineOp = { kind: 'equal' | 'delete' | 'insert'; line: string };
 
+/**
+ * 回退 full 的触发条件，可同时成立：
+ *   - lines：变更行数不少于全文行数，逐行 -/+ 不如带行号的全文好定位；
+ *   - chars：拼好的 delta 文本字符数不小于全文；
+ *   - tokens：delta 文本按共同 token 估算（shared/tokenUtils，Router 的 maxOutputTokens 截断也用它）
+ *     不小于全文。中文行每字 0.5、ASCII 每字 0.25，删掉长中文行时字符更少的 delta 也可能更贵。
+ */
+type DeltaFallbackTrigger = 'lines' | 'chars' | 'tokens';
+
 interface LineDeltaPlan {
   selected: 'delta' | 'full';
   /** lcs：前后缀裁剪后对中段求最长公共子序列；positional：中段超出 LCS 预算时逐位置配对。 */
   algorithm: 'lcs' | 'positional';
+  /** selected=delta 时是要返回的 delta 文本；回退 full 时为 ''。 */
   text: string;
   hunks: number;
   changedLines: number;
-  changedChars: number;
+  /** 回退触发条件；为空表示 delta 在行数、字符、token 三把尺子上都严格小于全文。 */
+  triggers: DeltaFallbackTrigger[];
+  /** 拼好的完整 delta 文本（首行 + 全部 hunk）的字符数与 token 估算，回退时也照实记录。 */
+  deltaChars: number;
+  deltaTokens: number;
+  fullChars: number;
+  fullTokens: number;
   lcsCells: number;
 }
 
 /**
  * 行级 diff 计划。先裁掉公共前后缀（单处插入/删除/修改在这里就收敛为最小中段），
  * 中段在预算内用 LCS 求真实增删，超出预算降级为逐位置配对。
- * 变更行数不少于全文行数、或变更行字符数不少于全文字符数时选 full：此时 delta 不比全文省。
+ * 回退判据量的是真正会返回的 delta 文本：'[delta: K hunk(s)]' 首行、每个 hunk 的 '@@ line N @@' 头、
+ * 每行 '- '/'+ ' 前缀与换行、hunk 间空行全部计入；只比变更行原始字符会漏掉这些格式开销，
+ * 零散单行编辑的 delta 比全文还长仍被当作 delta 返回（审计 L4-P6c）。
  */
 function planLineDelta(oldContent: string, newContent: string): LineDeltaPlan {
   const oldLines = oldContent.split('\n');
@@ -215,7 +236,6 @@ function planLineDelta(oldContent: string, newContent: string): LineDeltaPlan {
   const deleted: string[] = [];
   const inserted: string[] = [];
   let changedLines = 0;
-  let changedChars = 0;
   // hunk 头沿用 "@@ line N @@"，N 是变更在当前文件中的起始行号（1 基）。
   let newIndex = prefix;
   let hunkStart = -1;
@@ -239,7 +259,6 @@ function planLineDelta(oldContent: string, newContent: string): LineDeltaPlan {
       hunkStart = newIndex + 1;
     }
     changedLines++;
-    changedChars += op.line.length;
     if (op.kind === 'delete') {
       deleted.push(op.line);
     } else {
@@ -249,14 +268,32 @@ function planLineDelta(oldContent: string, newContent: string): LineDeltaPlan {
   }
   closeHunk();
 
-  const notSmaller = changedLines >= newLines.length || changedChars >= newContent.length;
+  // 先拼出完整 delta 文本再量：判据与模型实际收到的内容是同一个字符串。
+  const text = `[delta: ${hunks.length} hunk(s)]\n${hunks.join('\n\n')}`;
+  const deltaTokens = estimateTokens(text);
+  const fullTokens = estimateTokens(newContent);
+  const triggers: DeltaFallbackTrigger[] = [];
+  if (changedLines >= newLines.length) {
+    triggers.push('lines');
+  }
+  if (text.length >= newContent.length) {
+    triggers.push('chars');
+  }
+  if (deltaTokens >= fullTokens) {
+    triggers.push('tokens');
+  }
+  const selected = triggers.length > 0 ? 'full' : 'delta';
   return {
-    selected: notSmaller ? 'full' : 'delta',
+    selected,
     algorithm,
-    text: notSmaller ? '' : `[delta: ${hunks.length} hunk(s)]\n${hunks.join('\n\n')}`,
+    text: selected === 'full' ? '' : text,
     hunks: hunks.length,
     changedLines,
-    changedChars,
+    triggers,
+    deltaChars: text.length,
+    deltaTokens,
+    fullChars: newContent.length,
+    fullTokens,
     lcsCells,
   };
 }
@@ -323,20 +360,19 @@ function positionalEditScript(oldLines: string[], newLines: string[]): LineOp[] 
 }
 
 /**
- * 回退 full 与逐位置降级都要可观测：只记录路径、选择、原因与计数，不记录文件内容。
+ * 回退 full 与逐位置降级都要可观测：只记录路径、选择、原因、触发条件与计数，不记录文件内容。
+ * trigger 列出决定回退的条件（lines/chars/tokens，逗号分隔），delta 被选中时为 none。
  * 日志失败不能影响读取结果。
  */
-function reportDeltaPlan(
-  path: string,
-  plan: LineDeltaPlan,
-  fullChars: number,
-  fullLines: number
-): void {
+function reportDeltaPlan(path: string, plan: LineDeltaPlan, fullLines: number): void {
   const reason = plan.selected === 'full' ? 'delta_not_smaller' : 'lcs_budget_exceeded';
+  const trigger = plan.triggers.length > 0 ? plan.triggers.join(',') : 'none';
   const message =
     `[DeltaCache] path=${path}; selected=${plan.selected}; reason=${reason}; ` +
-    `diff=${plan.algorithm}; hunks=${plan.hunks}; changedLines=${plan.changedLines}; ` +
-    `fullLines=${fullLines}; changedChars=${plan.changedChars}; fullChars=${fullChars}; ` +
+    `trigger=${trigger}; diff=${plan.algorithm}; hunks=${plan.hunks}; ` +
+    `changedLines=${plan.changedLines}; fullLines=${fullLines}; ` +
+    `deltaChars=${plan.deltaChars}; fullChars=${plan.fullChars}; ` +
+    `deltaTokens=${plan.deltaTokens}; fullTokens=${plan.fullTokens}; ` +
     `lcsCells=${plan.lcsCells}; lcsBudget=${MAX_LCS_CELLS}`;
   observeSafely(
     () => Logger.getInstance().info(message),

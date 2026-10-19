@@ -297,14 +297,21 @@ describe('ActiveContext summaries of production payload shapes (L6-P10a)', () =>
   it('labels a delta-cache re-read after a modification as an incremental change', async () => {
     const root = makeProject();
     const file = path.join(root, 'src', 'seven.ts');
-    writeFileSync(file, ['a', 'b', 'c', 'd', 'e', 'f', 'g'].join('\n'));
+    // L4-P6c：delta 文本（首行、hunk 头、-/+ 前缀都计入）不比全文小时 DeltaCache 回退 full，
+    // 单字符行的小文件改一行会走 full；用常规长度的源码行让增量重读仍返回 delta。
+    const line = (name: string, value: string): string =>
+      `export const ${name} = '${value} value';`;
+    const names = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+    writeFileSync(file, names.map((name) => line(name, name)).join('\n'));
     const bridge = createBridge(root, { deltaCache: new DeltaCache() });
     const args = readArgs({ path: 'src/seven.ts' });
     const first = await bridge('code', args);
-    writeFileSync(file, ['a', 'b', 'X', 'd', 'e', 'f', 'g'].join('\n'));
+    writeFileSync(file, names.map((name) => line(name, name === 'c' ? 'X' : name)).join('\n'));
     const second = await bridge('code', args);
     // 生产重读的载荷是 diff 文本，不是源码：它的 4 行不是文件行数。
-    expect(second.structuredContent).toBe('[delta: 1 hunk(s)]\n@@ line 3 @@\n- c\n+ X');
+    expect(second.structuredContent).toBe(
+      `[delta: 1 hunk(s)]\n@@ line 3 @@\n- ${line('c', 'c')}\n+ ${line('c', 'X')}`
+    );
 
     const context = new ActiveContext({ maxRecentRounds: 0 });
     context.startRound(1);

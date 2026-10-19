@@ -886,11 +886,16 @@ describe('tool runtime adapters and public contracts', () => {
 
   it('exports generic delta and search cache contracts', () => {
     const deltaCache = new DeltaCache(1);
-    // L4-P06：delta 不小于全文时回退 full，两行文件改一行（2 行 delta 对 2 行全文）不再是 delta；
-    // 用 4 行文件钉住公开 delta 模式仍可达。
-    const first = deltaCache.check('a.ts', 'one\ntwo\nthree\nfour');
-    const unchanged = deltaCache.check('a.ts', 'one\ntwo\nthree\nfour');
-    const changed = deltaCache.check('a.ts', 'one\nTWO\nthree\nfour');
+    // L4-P06 / L4-P6c：delta 文本（含 '[delta: K hunk(s)]' 首行、hunk 头与 -/+ 前缀）不比全文小时回退
+    // full，短行小文件改一行的 delta 比全文还长，不再是 delta；用 8 行常规长度源码钉住公开 delta 模式仍可达。
+    const source = Array.from(
+      { length: 8 },
+      (_, index) => `export const value${index} = ${index};`
+    );
+    const edited = source.map((line, index) => (index === 1 ? 'export const value1 = 100;' : line));
+    const first = deltaCache.check('a.ts', source.join('\n'));
+    const unchanged = deltaCache.check('a.ts', source.join('\n'));
+    const changed = deltaCache.check('a.ts', edited.join('\n'));
 
     expect(first.mode).toBe('full');
     expect(unchanged.mode).toBe('unchanged');
@@ -1818,6 +1823,8 @@ describe('L4-P06 DeltaCache delta fallback, fingerprint-only entries and fingerp
     expect(logs[0]).toContain('selected=delta');
     expect(logs[0]).toContain('diff=positional');
     expect(logs[0]).toContain('reason=lcs_budget_exceeded');
+    // L4-P6c：降级配对后仍选中 delta 时没有回退条件成立。
+    expect(logs[0]).toContain('trigger=none');
     expect(logs[1]).toContain('selected=full');
     expect(logs[1]).toContain('diff=positional');
     expect(logs[1]).toContain('reason=delta_not_smaller');
@@ -1944,6 +1951,237 @@ describe('L4-P06 DeltaCache delta fallback, fingerprint-only entries and fingerp
       }
       expect(logs[0]).toContain('result=fresh');
       expect(logs[1]).toContain('result=stale');
+    });
+  });
+
+  // ─── L4-P6c 审计补修：回退判据量的是拼好的 delta 文本 ──────────────────────────────
+  // 来源：module-review-2026-10-01 audit round 2（L4-P6 / P06）。7524a77 的回退判据只比变更行数与
+  // 变更行原始字符数，漏算 '- '/'+ ' 前缀、换行、每个 hunk 的 '@@ line N @@' 头、hunk 间空行与首行
+  // '[delta: K hunk(s)]'，零散单行编辑的 delta 比全文还长仍以 mode 'delta' 返回，code.read 重读再次被
+  // 5000 token 动作配额截断（I04 症状）。钉住：判据量的是真正返回的 delta 文本（字符数与共同 token
+  // 估算两把尺子）；行数、字符、token 三个触发条件各有一个只靠它单独决定回退的用例，并写进诊断日志。
+  describe('L4-P6c fallback measures the rendered delta text', () => {
+    const fixedWidth = (prefix: string, index: number): string =>
+      `${prefix}${String(index).padStart(3, '0')} = 1;`.padEnd(35, '.');
+    const scatteredEdit = (): { original: string; edited: string } => {
+      const lines = Array.from({ length: 500 }, (_, index) => fixedWidth('const v', index));
+      const edited = lines.map((line, index) =>
+        index % 2 === 1 && index <= 497 ? fixedWidth('const w', index) : line
+      );
+      return { original: lines.join('\n'), edited: edited.join('\n') };
+    };
+    const field = (line: string, name: string): string | undefined =>
+      new RegExp(`(?:^|; )${name}=([^;]*)`).exec(line)?.[1];
+
+    it('falls back to full when scattered single-line edits make the delta text larger than the file', () => {
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      const { original, edited } = scatteredEdit();
+      expect(original.split('\n').every((line) => line.length === 35)).toBe(true);
+      const cache = new DeltaCache();
+      cache.check('s.ts', original);
+      expect(cache.check('s.ts', edited)).toEqual({
+        mode: 'full',
+        content: edited,
+        lineCount: 500,
+      });
+      expect(cache.get('s.ts')).toMatchObject({
+        hash: md5(edited),
+        content: edited,
+        visible: true,
+      });
+      const logs = taggedLogs(info, '[DeltaCache]');
+      expect(logs).toHaveLength(1);
+      expect(field(logs[0], 'selected')).toBe('full');
+      expect(field(logs[0], 'reason')).toBe('delta_not_smaller');
+      // 变更行 498 < 全文 500 行：只有按 delta 文本量出的字符/token 条件成立。
+      expect(field(logs[0], 'trigger')).toBe('chars,tokens');
+      expect(field(logs[0], 'hunks')).toBe('249');
+      expect(field(logs[0], 'changedLines')).toBe('498');
+      expect(Number(field(logs[0], 'deltaChars'))).toBeGreaterThan(edited.length);
+      expect(field(logs[0], 'fullChars')).toBe(String(edited.length));
+      expect(Number(field(logs[0], 'deltaTokens'))).toBeGreaterThan(estimateSharedTokens(edited));
+      expect(field(logs[0], 'fullTokens')).toBe(String(estimateSharedTokens(edited)));
+    });
+
+    it('falls back to full for a tiny file whose hunk header outweighs the file', () => {
+      const cache = new DeltaCache();
+      cache.check('f', 'a\n\n\n\n');
+      expect(cache.check('f', 'b\n\n\n\n')).toEqual({
+        mode: 'full',
+        content: 'b\n\n\n\n',
+        lineCount: 5,
+      });
+    });
+
+    it('decides on characters alone when few lines change but the delta text is not shorter', () => {
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      // 全文以中文为主（每字 0.5 token），删掉的是长 ASCII 行（每字 0.25 token）：
+      // delta 字符数不小于全文，但 token 估算更小，变更行 10 < 25。
+      const cjk = Array.from({ length: 20 }, (_, index) => `${'中文注释'.repeat(10)}${index}`);
+      const before = [...Array.from({ length: 5 }, (_, i) => `${'a'.repeat(199)}${i}`), ...cjk];
+      const after = [...Array.from({ length: 5 }, (_, i) => `x${i}`), ...cjk].join('\n');
+      const cache = new DeltaCache();
+      cache.check('c.ts', before.join('\n'));
+      expect(cache.check('c.ts', after)).toEqual({ mode: 'full', content: after, lineCount: 25 });
+      const logs = taggedLogs(info, '[DeltaCache]');
+      expect(logs).toHaveLength(1);
+      expect(field(logs[0], 'trigger')).toBe('chars');
+      expect(field(logs[0], 'changedLines')).toBe('10');
+      expect(Number(field(logs[0], 'deltaChars'))).toBeGreaterThanOrEqual(after.length);
+      expect(Number(field(logs[0], 'deltaTokens'))).toBeLessThan(estimateSharedTokens(after));
+    });
+
+    it('decides on estimated tokens alone when the delta is shorter but costs more tokens', () => {
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      // 删掉的是长中文注释行、换成短 ASCII 行：delta 字符数更少，但按共同 token 估算不比全文省，
+      // Router 的 maxOutputTokens 截断用的正是这把尺子。
+      const ascii = Array.from({ length: 40 }, (_, index) =>
+        `export const n${String(index).padStart(2, '0')} = 0;`.padEnd(60, ' ')
+      );
+      const before = [
+        ...Array.from({ length: 10 }, (_, index) => `${'旧的中文说明'.repeat(20)}${index}`),
+        ...ascii.slice(10),
+      ];
+      const after = ascii.join('\n');
+      const cache = new DeltaCache();
+      cache.check('t.ts', before.join('\n'));
+      expect(cache.check('t.ts', after)).toEqual({ mode: 'full', content: after, lineCount: 40 });
+      const logs = taggedLogs(info, '[DeltaCache]');
+      expect(logs).toHaveLength(1);
+      expect(field(logs[0], 'trigger')).toBe('tokens');
+      expect(field(logs[0], 'changedLines')).toBe('20');
+      expect(Number(field(logs[0], 'deltaChars'))).toBeLessThan(after.length);
+      expect(Number(field(logs[0], 'deltaTokens'))).toBeGreaterThanOrEqual(
+        estimateSharedTokens(after)
+      );
+    });
+
+    it('decides on the changed line count alone, at an exactly equal count, even when the delta text is shorter', () => {
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      // 删掉 10 个空行：delta 只有几百字符，但变更行数（10）恰好等于全文行数（10），“不少于”成立，
+      // 带行号的全文更易定位。
+      const long = Array.from({ length: 10 }, (_, index) => `${'k'.repeat(99)}${index}`);
+      const before = long.flatMap((line) => [line, '']);
+      const after = long.join('\n');
+      const cache = new DeltaCache();
+      cache.check('l.ts', before.join('\n'));
+      expect(cache.check('l.ts', after)).toEqual({ mode: 'full', content: after, lineCount: 10 });
+      const logs = taggedLogs(info, '[DeltaCache]');
+      expect(logs).toHaveLength(1);
+      expect(field(logs[0], 'trigger')).toBe('lines');
+      expect(field(logs[0], 'changedLines')).toBe('10');
+      expect(field(logs[0], 'fullLines')).toBe('10');
+      expect(Number(field(logs[0], 'deltaChars'))).toBeLessThan(after.length);
+      expect(Number(field(logs[0], 'deltaTokens'))).toBeLessThan(estimateSharedTokens(after));
+    });
+
+    it('treats a delta exactly as long, or exactly as many tokens, as the file as not smaller', () => {
+      const logger = Logger.getInstance();
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+      // 单 hunk（首行删一行、插 'x'）的 delta 文本格式由上面的用例钉住，这里据此把被删行调到恰好等长。
+      const deltaFor = (removed: string): string =>
+        `[delta: 1 hunk(s)]\n@@ line 1 @@\n- ${removed}\n+ x`;
+      const cjk = '中文注释'.repeat(25);
+      const charsTail = [cjk, 'z1', 'z2'];
+      const charsAfter = ['x', ...charsTail].join('\n');
+      const padding = 'y'.repeat(charsAfter.length - deltaFor('').length);
+      expect(deltaFor(padding).length).toBe(charsAfter.length);
+      const charsCache = new DeltaCache();
+      charsCache.check('eq-chars.ts', [padding, ...charsTail].join('\n'));
+      expect(charsCache.check('eq-chars.ts', charsAfter).mode).toBe('full');
+
+      // token 等值：被删行是中文（每字 0.5），全文是 ASCII（每字 0.25），字符数更少而 token 估算相等。
+      const tokensTail = Array.from({ length: 3 }, (_, index) => `${'q'.repeat(131)}${index}`);
+      const tokensAfter = ['x', ...tokensTail].join('\n');
+      const fullTokens = estimateSharedTokens(tokensAfter);
+      const removedCjk = Array.from({ length: 400 }, (_, size) => '中'.repeat(size + 1)).find(
+        (candidate) => estimateSharedTokens(deltaFor(candidate)) === fullTokens
+      );
+      expect(removedCjk).toBeDefined();
+      expect(deltaFor(removedCjk ?? '').length).toBeLessThan(tokensAfter.length);
+      const tokensCache = new DeltaCache();
+      tokensCache.check('eq-tokens.ts', [removedCjk ?? '', ...tokensTail].join('\n'));
+      expect(tokensCache.check('eq-tokens.ts', tokensAfter).mode).toBe('full');
+
+      const logs = taggedLogs(info, '[DeltaCache]');
+      expect(logs).toHaveLength(2);
+      expect(field(logs[0], 'trigger')).toBe('chars');
+      expect(field(logs[0], 'deltaChars')).toBe(field(logs[0], 'fullChars'));
+      expect(field(logs[1], 'trigger')).toBe('tokens');
+      expect(field(logs[1], 'deltaTokens')).toBe(field(logs[1], 'fullTokens'));
+    });
+
+    it('never returns a delta that is not strictly smaller than the file across seeded random edits', () => {
+      // 固定种子的线性同余发生器：可复现；词表含空行、短行、长行与中文行，覆盖格式开销占比高的小文件。
+      let seed = 0x2f6c;
+      const next = (limit: number): number => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed % limit;
+      };
+      const vocabulary = [
+        '',
+        'a',
+        'b',
+        '}',
+        'return x;',
+        '中文行',
+        'const value = compute(1, 2, 3);',
+      ];
+      const randomLine = (): string => vocabulary[next(vocabulary.length)] ?? '';
+      let deltas = 0;
+      for (let round = 0; round < 400; round++) {
+        const lines = Array.from({ length: 1 + next(30) }, randomLine);
+        const edited = [...lines];
+        const edits = 1 + next(4);
+        for (let e = 0; e < edits; e++) {
+          const at = next(edited.length + 1);
+          const kind = next(3);
+          if (kind === 0) {
+            edited.splice(at, 0, randomLine());
+          } else if (kind === 1 && edited.length > 1) {
+            edited.splice(Math.min(at, edited.length - 1), 1);
+          } else {
+            edited[Math.min(at, edited.length - 1)] = randomLine();
+          }
+        }
+        const cache = new DeltaCache();
+        cache.check('r.ts', lines.join('\n'));
+        const current = edited.join('\n');
+        const result = cache.check('r.ts', current);
+        if (result.mode === 'delta') {
+          deltas++;
+          expect(result.content.length).toBeLessThan(current.length);
+          expect(estimateSharedTokens(result.content)).toBeLessThan(estimateSharedTokens(current));
+        }
+      }
+      // 守住用例本身：样本里确实出现过 delta，断言不是空转。
+      expect(deltas).toBeGreaterThan(0);
+    });
+
+    it('keeps a code.read re-read after scattered edits inside the action limit', async () => {
+      await withWriteFixture(async (root) => {
+        const { original, edited } = scatteredEdit();
+        await writeFile(join(root, 'src/a.ts'), original, 'utf-8');
+        const cache = new DeltaCache(50);
+        const ctx = freshnessCtx(root, cache);
+        const router = new ToolRouter();
+        const first = await router.execute(readA, ctx);
+        expect(first.ok).toBe(true);
+        expect(first._meta?.diagnosticWarnings ?? []).toEqual([]);
+        await writeFile(join(root, 'src/a.ts'), edited, 'utf-8');
+        const again = await router.execute(readA, ctx);
+        expect(again.ok).toBe(true);
+        expect(String(again.data)).not.toMatch(/^\[delta:/);
+        expect(again._meta?.diagnosticWarnings ?? []).toEqual([]);
+        expect(cache.get('src/a.ts')).toMatchObject({ hash: md5(edited), visible: true });
+        // 回退结果就是带行号的全文：与新缓存首读同一文件逐字一致。
+        const fresh = await router.execute(readA, freshnessCtx(root, new DeltaCache(50)));
+        expect(again.data).toBe(fresh.data);
+      });
     });
   });
 });
