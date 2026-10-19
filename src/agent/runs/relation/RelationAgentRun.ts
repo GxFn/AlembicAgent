@@ -1,5 +1,11 @@
+import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
+import {
+  type JsonObjectParseOutcome,
+  parseJsonObjectWithDiagnostics,
+} from '../../utils/jsonReply.js';
 import { runFailure } from '../result.js';
 import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
 
@@ -48,12 +54,18 @@ export function projectRelationDiscoveryResult(result: AgentRunResult): Relation
     );
   }
   const phases = result.phases as Record<string, { reply?: string }> | undefined;
-  const synthesizeReply = phases?.synthesize?.reply || result.reply;
-  const value = parseJsonResponse(synthesizeReply, { analyzed: 0, relations: [] });
-  const parsed =
-    value && typeof value === 'object' && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : {};
+  const synthesizeReply = phases?.synthesize?.reply;
+  const replySource = synthesizeReply ? 'synthesize-phase' : 'run-reply';
+  const outcome = parseJsonObjectWithDiagnostics(synthesizeReply || result.reply);
+  // 解析失败仍回退为 0 条关系（L8-P10 决策：不改为 runFailure，宿主后台任务状态不翻转），
+  // 但必须留下 usedFallback/parseError 诊断和 warn，运维才能区分“确实没有关系”和“解析失败”。
+  const usedFallback = outcome.value === null;
+  if (usedFallback) {
+    reportRelationParseFallback(outcome, replySource);
+  } else if (outcome.recoveredFrom !== undefined) {
+    reportRelationParseRecovery(outcome, replySource);
+  }
+  const parsed = outcome.value ?? {};
   const relations = Array.isArray(parsed.relations) ? parsed.relations.filter(isRelation) : [];
   return {
     analyzed:
@@ -71,30 +83,56 @@ export function projectRelationDiscoveryResult(result: AgentRunResult): Relation
       invalidRelationCount: Array.isArray(parsed.relations)
         ? parsed.relations.length - relations.length
         : 0,
+      usedFallback,
+      ...(outcome.parseError !== undefined ? { parseError: outcome.parseError } : {}),
     },
   };
 }
 
-function parseJsonResponse(
-  text: string | null | undefined,
-  fallback: RelationDiscoveryResult
-): unknown {
-  if (!text) {
-    return fallback;
-  }
-  try {
-    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlockMatch) {
-      return JSON.parse(codeBlockMatch[1].trim());
-    }
-    const objMatch = text.match(/(\{[\s\S]*\})/);
-    if (objMatch) {
-      return JSON.parse(objMatch[1].trim());
-    }
-    return JSON.parse(text.trim());
-  } catch {
-    return fallback;
-  }
+/** 回退诊断：只记录回复来源、长度、策略与错误类别，不记录回复正文（可能含项目代码片段）。 */
+function reportRelationParseFallback(
+  outcome: JsonObjectParseOutcome,
+  replySource: 'synthesize-phase' | 'run-reply'
+): void {
+  const parseError = outcome.parseError ?? 'unknown';
+  // 日志通道失败不能把已经确定的回退结果升级为投影失败，所以经 observeSafely 隔离。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[RelationDiscovery] reply is not a JSON object; falling back to 0 relations (source=${replySource}, replyLength=${outcome.replyLength}, strategy=${outcome.strategy}, parseError=${parseError})`,
+        {
+          reasonCode: 'relation-discovery-json-fallback',
+          replySource,
+          replyLength: outcome.replyLength,
+          strategy: outcome.strategy,
+          parseError,
+          resolution: 'fallback-zero-relations',
+        }
+      ),
+    () => undefined
+  );
+}
+
+/** 级联回退命中（前序策略失败、后续策略取得对象）：结果可用，只记 info 便于回查模型输出格式漂移。 */
+function reportRelationParseRecovery(
+  outcome: JsonObjectParseOutcome,
+  replySource: 'synthesize-phase' | 'run-reply'
+): void {
+  observeSafely(
+    () =>
+      Logger.getInstance().info(
+        `[RelationDiscovery] reply JSON recovered by parser fallback (source=${replySource}, replyLength=${outcome.replyLength}, strategy=${outcome.strategy}, recoveredFrom=${outcome.recoveredFrom})`,
+        {
+          reasonCode: 'relation-discovery-json-recovered',
+          replySource,
+          replyLength: outcome.replyLength,
+          strategy: outcome.strategy,
+          recoveredFrom: outcome.recoveredFrom,
+          resolution: 'use-recovered-object',
+        }
+      ),
+    () => undefined
+  );
 }
 
 function isRelation(value: unknown): value is RelationDiscoveryResult['relations'][number] {

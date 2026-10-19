@@ -3124,19 +3124,29 @@ describe('run projection outcomes', () => {
     ).toBe(1);
   });
   it('retains translation fallback when the optional parse observer throws', async () => {
-    const service = {
-      run: vi.fn(async () => ({ ...runResult(), reply: 'not-json' })),
-    } as unknown as AgentService;
-    await expect(
-      runTranslationJson({
-        agentService: service,
-        summary: '原文',
-        usageGuide: '用法',
-        onParseError: () => {
-          throw new Error('observer failed');
-        },
-      })
-    ).resolves.toEqual({ summaryEn: '原文', usageGuideEn: '用法' });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const service = {
+        run: vi.fn(async () => ({ ...runResult(), reply: 'not-json' })),
+      } as unknown as AgentService;
+      // L8-P10：整体回退现在带 error 让宿主可见；观察者抛错仍不得把回退升级为 reject（R08-RUN-5）。
+      await expect(
+        runTranslationJson({
+          agentService: service,
+          summary: '原文',
+          usageGuide: '用法',
+          onParseError: () => {
+            throw new Error('observer failed');
+          },
+        })
+      ).resolves.toEqual({
+        summaryEn: '原文',
+        usageGuideEn: '用法',
+        error: expect.stringContaining('translation_fallback: unparseable reply'),
+      });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -4001,5 +4011,286 @@ describe('profile compile and registration fail-fast (L8-P1)', () => {
         original.summarize;
       expect(Object.keys(configs)).toEqual(Object.keys(before));
     }
+  });
+});
+
+// ─── L8-P10 / L8-C07：关系发现与翻译的 JSON 回退必须可见 ───
+// 关系发现解析失败仍回退为 0 条（不改为 runFailure，宿主任务状态不翻转），但 diagnostics 带
+// usedFallback/parseError，并有一条不含回复正文的 warn；翻译区分完全解析、部分字段回退与整体回退，
+// 后两种设置 error（宿主 /translate 据此附带 warning）并经 observeSafely 通知 onParseError。
+describe('relation and translation JSON fallback diagnostics (L8-P10)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function silenceWarn() {
+    return vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+  }
+  function warnLines(warn: ReturnType<typeof silenceWarn>, tag: string) {
+    return warn.mock.calls.filter((call) => String(call[0]).includes(tag));
+  }
+  function successRun(reply: string, phases?: Record<string, unknown>): AgentRunResult {
+    return {
+      runId: 'l8-p10',
+      profileId: 'fixture',
+      reply,
+      status: 'success',
+      ...(phases ? { phases } : {}),
+      toolCalls: [],
+      usage: { inputTokens: 1, outputTokens: 1, iterations: 1, durationMs: 1 },
+      diagnostics: null,
+    };
+  }
+  function translationService(result: AgentRunResult) {
+    return { run: vi.fn(async () => result) } as unknown as AgentService;
+  }
+
+  describe('relation discovery', () => {
+    it.each([
+      {
+        label: 'prose with several invalid brace groups',
+        reply: '分析说明 {analyzed: 2} 以及 {relations: [A -> B]} 结论在此 SECRET-BODY',
+      },
+      {
+        label: 'a truncated JSON object',
+        reply: '{"analyzed":2,"relations":[{"from":"SECRET-BODY","to":"B","type":"uses"}',
+      },
+    ])('marks the 0-relation fallback for $label and warns without the reply body', ({ reply }) => {
+      const warn = silenceWarn();
+      const projected = projectRelationDiscoveryResult(successRun(reply));
+      expect(projected).toMatchObject({ analyzed: 0, relations: [] });
+      expect(projected.diagnostics).toMatchObject({
+        usedFallback: true,
+        parseError: expect.any(String),
+      });
+      expect(JSON.stringify(projected.diagnostics)).not.toContain('SECRET-BODY');
+      const lines = warnLines(warn, '[RelationDiscovery]');
+      expect(lines).toHaveLength(1);
+      const [message, meta] = lines[0] ?? [];
+      expect(String(message)).toContain(`replyLength=${reply.length}`);
+      expect(String(message)).toContain('strategy=none');
+      expect(meta).toMatchObject({
+        reasonCode: 'relation-discovery-json-fallback',
+        replyLength: reply.length,
+        replySource: 'run-reply',
+        resolution: 'fallback-zero-relations',
+      });
+      expect(JSON.stringify(lines[0])).not.toContain('SECRET-BODY');
+    });
+
+    it('extracts relations from the first balanced object even with trailing braces', () => {
+      const warn = silenceWarn();
+      const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+      const projected = projectRelationDiscoveryResult(
+        successRun(
+          '结果如下：{"analyzed":2,"relations":[{"from":"A","to":"B","type":"uses"}]} 备注 {无}'
+        )
+      );
+      expect(projected).toMatchObject({
+        analyzed: 2,
+        relations: [{ from: 'A', to: 'B', type: 'uses' }],
+      });
+      expect(projected.diagnostics).toMatchObject({ usedFallback: false });
+      expect(projected.diagnostics).not.toHaveProperty('parseError');
+      expect(warnLines(warn, '[RelationDiscovery]')).toHaveLength(0);
+      // 级联回退命中（全文解析失败后由括号配平取得结果）记 info，不含回复正文。
+      const recovery = info.mock.calls.filter((call) =>
+        String(call[0]).includes('[RelationDiscovery]')
+      );
+      expect(recovery).toHaveLength(1);
+      expect(recovery[0]?.[1]).toMatchObject({
+        reasonCode: 'relation-discovery-json-recovered',
+        strategy: 'balanced-object',
+        recoveredFrom: 'full-text=SyntaxError',
+      });
+      expect(JSON.stringify(recovery[0])).not.toContain('analyzed');
+    });
+
+    it('does not log anything for a clean JSON reply', () => {
+      const warn = silenceWarn();
+      const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+      expect(
+        projectRelationDiscoveryResult(successRun('{"analyzed":0,"relations":[]}')).diagnostics
+      ).toMatchObject({ usedFallback: false });
+      expect(warnLines(warn, '[RelationDiscovery]')).toHaveLength(0);
+      expect(
+        info.mock.calls.filter((call) => String(call[0]).includes('[RelationDiscovery]'))
+      ).toHaveLength(0);
+    });
+
+    it('reports the synthesize phase as the reply source of a fallback', () => {
+      const warn = silenceWarn();
+      const projected = projectRelationDiscoveryResult(
+        successRun('{"analyzed":1,"relations":[]}', { synthesize: { reply: 'no json here' } })
+      );
+      expect(projected.diagnostics).toMatchObject({
+        usedFallback: true,
+        parseError: 'full-text=SyntaxError; balanced-object=no_open_brace',
+      });
+      expect(warnLines(warn, '[RelationDiscovery]')[0]?.[1]).toMatchObject({
+        replySource: 'synthesize-phase',
+        replyLength: 'no json here'.length,
+      });
+    });
+
+    it('keeps the fallback result when the logger itself fails', () => {
+      vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {
+        throw new Error('logger unavailable');
+      });
+      expect(projectRelationDiscoveryResult(successRun('not json'))).toMatchObject({
+        analyzed: 0,
+        relations: [],
+        diagnostics: { usedFallback: true },
+      });
+    });
+  });
+
+  describe('translation', () => {
+    it('reports both missing fields when the reply uses different key names', async () => {
+      const warn = silenceWarn();
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(successRun('{"summary_en":"Summary"}')),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({
+        summaryEn: '原文',
+        usageGuideEn: '用法',
+        error: 'translation_fallback: missing summaryEn, usageGuideEn',
+      });
+      expect(onParseError).toHaveBeenCalledTimes(1);
+      expect(onParseError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+      expect(String((onParseError.mock.calls[0]?.[0] as Error).message)).toContain(
+        'missing summaryEn'
+      );
+      expect(warnLines(warn, '[TranslationJson]')).toHaveLength(1);
+    });
+
+    it('keeps the translated field and reports only the missing one', async () => {
+      const warn = silenceWarn();
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(successRun('{"summaryEn":"Summary"}')),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({
+        summaryEn: 'Summary',
+        usageGuideEn: '用法',
+        error: 'translation_fallback: missing usageGuideEn',
+      });
+      expect(onParseError).toHaveBeenCalledTimes(1);
+      const lines = warnLines(warn, '[TranslationJson]');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]?.[1]).toMatchObject({
+        reasonCode: 'translation-json-partial-fallback',
+        missingFields: ['usageGuideEn'],
+        strategy: 'full-text',
+      });
+      expect(JSON.stringify(lines[0])).not.toContain('Summary');
+    });
+
+    it.each([
+      { reply: '', parseError: 'empty_reply' },
+      { reply: 'null', parseError: 'full-text=not_object:null; balanced-object=no_open_brace' },
+    ])('falls back as a whole for the reply $reply', async ({ reply, parseError }) => {
+      const warn = silenceWarn();
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(successRun(reply)),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({
+        summaryEn: '原文',
+        usageGuideEn: '用法',
+        error: `translation_fallback: unparseable reply (${parseError})`,
+      });
+      expect(onParseError).toHaveBeenCalledTimes(1);
+      expect(warnLines(warn, '[TranslationJson]')[0]?.[1]).toMatchObject({
+        reasonCode: 'translation-json-whole-fallback',
+        replyLength: reply.length,
+        parseError,
+      });
+    });
+
+    it('parses a fenced reply without error or observer calls', async () => {
+      const warn = silenceWarn();
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(
+          successRun('```json\n{"summaryEn":"Summary","usageGuideEn":"Usage"}\n```')
+        ),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({ summaryEn: 'Summary', usageGuideEn: 'Usage' });
+      expect(onParseError).not.toHaveBeenCalled();
+      expect(warnLines(warn, '[TranslationJson]')).toHaveLength(0);
+    });
+
+    it('logs a cascade recovery as info and still treats the translation as complete', async () => {
+      const warn = silenceWarn();
+      const info = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(
+          successRun('Here you go: {"summaryEn":"Summary","usageGuideEn":"Usage"} done')
+        ),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({ summaryEn: 'Summary', usageGuideEn: 'Usage' });
+      expect(onParseError).not.toHaveBeenCalled();
+      expect(warnLines(warn, '[TranslationJson]')).toHaveLength(0);
+      const recovery = info.mock.calls.filter((call) =>
+        String(call[0]).includes('[TranslationJson]')
+      );
+      expect(recovery).toHaveLength(1);
+      expect(recovery[0]?.[1]).toMatchObject({
+        reasonCode: 'translation-json-recovered',
+        strategy: 'balanced-object',
+        recoveredFrom: 'full-text=SyntaxError',
+      });
+      expect(JSON.stringify(recovery[0])).not.toContain('Summary');
+    });
+
+    it('does not require a field whose source text was empty', async () => {
+      const warn = silenceWarn();
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService(successRun('{"summaryEn":"Summary"}')),
+        summary: '原文',
+        onParseError,
+      });
+      expect(result).toEqual({ summaryEn: 'Summary', usageGuideEn: '' });
+      expect(onParseError).not.toHaveBeenCalled();
+      expect(warnLines(warn, '[TranslationJson]')).toHaveLength(0);
+    });
+
+    it('keeps the existing non-success behavior without calling the parse observer', async () => {
+      const onParseError = vi.fn();
+      const result = await runTranslationJson({
+        agentService: translationService({
+          ...successRun('provider failed'),
+          status: 'error',
+        }),
+        summary: '原文',
+        usageGuide: '用法',
+        onParseError,
+      });
+      expect(result).toEqual({
+        summaryEn: '原文',
+        usageGuideEn: '用法',
+        error: 'provider failed',
+      });
+      expect(onParseError).not.toHaveBeenCalled();
+    });
   });
 });
