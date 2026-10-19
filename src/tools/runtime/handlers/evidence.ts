@@ -6,17 +6,27 @@
  *
  * 查已采证据不是探索：RECORD/VERIFY/produce 相均可用，为引用修正与 verbatim 取回
  * 提供自救通道（真机事故的结构性缺口之一：producer 被拒后无粮草可修）。
- * 只读、零文件系统访问；台账缺席（非维度运行）时显式失败而非静默空结果。
+ * 只读：从不写台账；台账缺席（非维度运行）时显式失败而非静默空结果。
  *
  * 子区间坐标（I21）：`E-n@start-end` 的行号随条目而定——带 range 的条目（code.read 等
  * 文件区间采集）用文件行号，必须落在 range 内；无 range 的条目（search 分组、terminal 等）
  * 用条目内容内 1 起行号。台账对“id 存在但子区间取不到”和“id 不存在”都返回 null，
  * 这里在失败路径上再做一次归类，避免模型把有效证据当成无效 id 放弃。
+ *
+ * 原文回读（脱敏阶段 2 方案 C，D4）：台账落盘内容是脱敏后的文本，模型照抄进 coreCode 会过不了
+ * fs 逐字校验。对带 range、来源不是 secret-bearing 的 code.read 条目（含 `E-n@a-b` 子区间），
+ * get 在项目根内解析路径、只读一次文件缓冲区、在同一份缓冲区上判 freshness：fresh 时返回原文
+ * 切片并标 `verbatim: true`；stale、读取失败或不允许回读时返回存储内容，附
+ * `redaction: {markers, lines}` 标注与“需要逐字代码请对 file:range 调用 code.read”提示。
+ * 回读只发生在读路径上：evidence.get 不是证据工具，结果不会被采集回台账；它的结果进入开发者
+ * 事件时仍经 processEvents 脱敏。模型本来就经 code.read 看过同一份原文，没有新增暴露。
  */
 
+import { readFileSync } from 'node:fs';
 import { parseEvidenceRef } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import { resolveProjectPath } from '#shared/projectPath.js';
 import type { EvidenceLedgerLike } from '#tools/kernel/context.js';
 import { fail, ok, type ToolContext, type ToolResult } from '#tools/kernel/registry.js';
 
@@ -343,6 +353,218 @@ function cappedNotice(
   return `${head}, e.g. "${entry.id}@${nextStart}-${nextEnd}"]`;
 }
 
+/**
+ * 台账脱敏标记的封闭词表（设计 4.6：标记文字不换）：`[redacted]`、`[redacted-private-key]`、
+ * `[redacted-api-key]`、`[redacted-google-api-key]`、`[redacted-token]`、`[redacted-nested-value]`、
+ * 阶段 1 的 `[redacted-unaligned]`。tools 层不能依赖 agent/utils/Redaction，这里按词表形态识别；
+ * 文件原文里本来就有的同形字面量也会被计入，只用于标注与诊断，不参与任何放行判定。
+ */
+const REDACTION_MARKER_SOURCE = String.raw`\[(redacted(?:-[a-z]+)*)\]`;
+/** 标注里最多列出的行号个数；markers 仍是全量计数 */
+const REDACTION_MARKER_LINES_MAX = 50;
+
+export interface RedactionMarkerSummary {
+  /** 标记总数 */
+  readonly markers: number;
+  /** 含标记的行号（按 firstLine 起算的坐标系），最多 REDACTION_MARKER_LINES_MAX 个 */
+  readonly lines: readonly number[];
+  /** 按标记种类计数，例如 { redacted: 2, 'redacted-private-key': 1 }；只含词表名，不含正文 */
+  readonly kinds: Readonly<Record<string, number>>;
+}
+
+/**
+ * 统计文本里的脱敏标记。evidence.get 的 redaction 标注、recipeProductionAdapter 的
+ * copied-redacted-evidence 诊断与循环台账的变换诊断共用这一份识别规则。
+ */
+export function summarizeRedactionMarkers(text: string, firstLine = 1): RedactionMarkerSummary {
+  const lines: number[] = [];
+  const kinds: Record<string, number> = {};
+  let markers = 0;
+  text.split('\n').forEach((line, index) => {
+    // 每行新建正则：全局正则带 lastIndex 状态，不能做成模块级共享对象
+    const found = [...line.matchAll(new RegExp(REDACTION_MARKER_SOURCE, 'g'))];
+    if (found.length === 0) {
+      return;
+    }
+    markers += found.length;
+    for (const match of found) {
+      const kind = match[1] ?? 'redacted';
+      kinds[kind] = (kinds[kind] ?? 0) + 1;
+    }
+    if (lines.length < REDACTION_MARKER_LINES_MAX) {
+      lines.push(firstLine + index);
+    }
+  });
+  return { markers, lines, kinds };
+}
+
+/**
+ * 台账的可选来源分类能力。分类表在 agent 层（src/agent/evidence/evidenceFileClass.ts），tools 层按
+ * config/layer-contract.json 不能运行时依赖 agent，公开端口 EvidenceLedgerLike 也不加字段，所以
+ * 由台账实现（EvidenceLedgerStore.classifyEvidenceSource）代答。不提供该能力的台账一律不回读原文。
+ */
+interface EvidenceSourceClassifier {
+  classifyEvidenceSource(source: { readonly tool?: string; readonly file?: string }): unknown;
+}
+
+function hasSourceClassifier(
+  ledger: EvidenceLedgerLike
+): ledger is EvidenceLedgerLike & EvidenceSourceClassifier {
+  return typeof Reflect.get(ledger, 'classifyEvidenceSource') === 'function';
+}
+
+/**
+ * 允许回读原文的来源类别（白名单）。secret-bearing、terminal、无法识别的返回值一律不回读：
+ * 分类表改名或扩展时宁可少回读，也不能静默放行。
+ */
+function isReadbackSourceClass(value: unknown): boolean {
+  return value === 'source' || value === 'config';
+}
+
+/** 回读没有发生（返回存储内容）的原因；进入诊断日志并决定提示文案。 */
+type ReadbackFallbackReason =
+  | 'ledger-cannot-classify'
+  | 'secret-bearing'
+  | 'source-class-not-readable'
+  | 'no-project-root'
+  | 'outside-project-root'
+  | 'unreadable'
+  | 'stale'
+  | 'freshness-unknown';
+
+type VerbatimReadback =
+  /** 条目不在回读范围内（非 code.read、无 file 或无 range）：返回形状与阶段 2 之前完全相同 */
+  | { readonly kind: 'not-applicable' }
+  | { readonly kind: 'verbatim'; readonly content: string }
+  | { readonly kind: 'stored'; readonly reason: ReadbackFallbackReason };
+
+type EntryWithRange = EvidenceEntryLike & {
+  readonly file: string;
+  readonly range: { readonly start: number; readonly end: number };
+};
+
+function isAccessDenied(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith('Access denied');
+}
+
+function describeReadError(err: unknown): string {
+  if (err instanceof Error) {
+    return 'code' in err && typeof err.code === 'string' ? err.code : err.name;
+  }
+  return typeof err;
+}
+
+/**
+ * 回读决策诊断：verbatim 记 debug；降级为存储内容时记 info（缺项目根是测试/非宿主上下文，记 debug）。
+ * 只记条目坐标、请求区间、原因与错误码，绝不记原文或存储内容。
+ */
+function logReadback(
+  entry: EntryWithRange,
+  outcome: 'verbatim' | 'stored',
+  reason: string,
+  detail = ''
+): void {
+  const message = `[evidence] verbatim readback ${outcome} entry=${entry.id} requested=${entry.range.start}-${entry.range.end} file=${JSON.stringify(entry.file)} reason=${reason}${detail ? ` ${detail}` : ''}`;
+  observeSafely(
+    () => {
+      const logger = Logger.getInstance();
+      if (outcome === 'verbatim' || reason === 'no-project-root') {
+        logger.debug(message);
+      } else {
+        logger.info(message);
+      }
+    },
+    () => undefined
+  );
+}
+
+/**
+ * 方案 C 的原文回读。顺序固定为：来源分类（声明路径）→ 项目根内解析（越界拒绝）→ 来源分类
+ * （解析后的真实路径，挡住指向凭据文件的 symlink）→ 只读一次文件缓冲区 → 在同一份解码文本上
+ * 判 freshness 并切片。前三步都不读文件内容；判定与返回用的是同一份字节，读取前后的并发改写
+ * 只会让结论变成 stale，不会把两份字节混在一起。
+ */
+function resolveVerbatimReadback(
+  ledger: EvidenceLedgerLike,
+  ref: string,
+  entry: EvidenceEntryLike,
+  projectRoot: unknown
+): VerbatimReadback {
+  if (entry.tool !== 'code.read' || !entry.file || !entry.range) {
+    return { kind: 'not-applicable' };
+  }
+  const target: EntryWithRange = { ...entry, file: entry.file, range: entry.range };
+  const fallback = (reason: ReadbackFallbackReason, detail = ''): VerbatimReadback => {
+    logReadback(target, 'stored', reason, detail);
+    return { kind: 'stored', reason };
+  };
+  if (!hasSourceClassifier(ledger)) {
+    return fallback('ledger-cannot-classify');
+  }
+  const declaredClass = ledger.classifyEvidenceSource({ tool: entry.tool, file: target.file });
+  if (!isReadbackSourceClass(declaredClass)) {
+    return fallback(
+      declaredClass === 'secret-bearing' ? 'secret-bearing' : 'source-class-not-readable',
+      `class=${String(declaredClass)} path=declared`
+    );
+  }
+  if (typeof projectRoot !== 'string' || projectRoot.length === 0) {
+    return fallback('no-project-root');
+  }
+  let resolved: { absolute: string; relative: string };
+  try {
+    resolved = resolveProjectPath(projectRoot, target.file);
+  } catch (err: unknown) {
+    return isAccessDenied(err)
+      ? fallback('outside-project-root')
+      : fallback('unreadable', `step=resolve error=${describeReadError(err)}`);
+  }
+  const resolvedClass = ledger.classifyEvidenceSource({
+    tool: entry.tool,
+    file: resolved.relative,
+  });
+  if (!isReadbackSourceClass(resolvedClass)) {
+    return fallback(
+      resolvedClass === 'secret-bearing' ? 'secret-bearing' : 'source-class-not-readable',
+      `class=${String(resolvedClass)} path=resolved`
+    );
+  }
+  let text: string;
+  try {
+    // 唯一一次读取：freshness 判定与返回切片都基于这份缓冲区解码出的同一个字符串
+    text = readFileSync(resolved.absolute).toString('utf8');
+  } catch (err: unknown) {
+    return fallback('unreadable', `step=read error=${describeReadError(err)}`);
+  }
+  const freshness = ledger.checkFreshness(ref, text);
+  if (freshness !== 'fresh') {
+    return fallback(freshness === 'stale' ? 'stale' : 'freshness-unknown');
+  }
+  const lines = text.split('\n');
+  if (target.range.start < 1 || target.range.end > lines.length) {
+    // 台账判 fresh 时基础区间必在文件内；子区间又落在基础区间内。走到这里说明台账实现与本假设不一致。
+    return fallback('stale', 'detail=range-outside-buffer');
+  }
+  logReadback(target, 'verbatim', 'fresh');
+  return {
+    kind: 'verbatim',
+    content: lines.slice(target.range.start - 1, target.range.end).join('\n'),
+  };
+}
+
+/** 未回读时给模型的提示：说明返回的是存储内容，以及如何拿到逐字代码。 */
+function readbackHint(entry: EntryWithRange, reason: ReadbackFallbackReason): string {
+  const location = `${entry.file}:${entry.range.start}-${entry.range.end}`;
+  switch (reason) {
+    case 'secret-bearing':
+      return `${entry.file} 属于凭据类文件，evidence.get 不回读原文；这里是脱敏后的台账存储内容，不能当作逐字代码使用。`;
+    case 'stale':
+      return `条目采集后 ${entry.file} 已变更，这里是采集时的台账存储内容（可能含脱敏标记），不是当前源码；需要逐字代码请对 ${location} 调用 code.read。`;
+    default:
+      return `这里是台账存储内容（可能含脱敏标记），未能回读 ${entry.file} 原文；需要逐字代码请对 ${location} 调用 code.read。`;
+  }
+}
+
 export async function handle(
   action: string,
   params: Record<string, unknown>,
@@ -372,11 +594,25 @@ export async function handle(
         `evidence.get 无法解析 "${ref}"（只能引用 [evidence] 标注过的条目 id）。近期条目: ${recent || '(台账为空)'}`
       );
     }
-    const lines = entry.content.split('\n');
+    const readback = resolveVerbatimReadback(ledger, ref, entry, ctx.projectRoot);
+    const shown = readback.kind === 'verbatim' ? readback.content : entry.content;
+    const lines = shown.split('\n');
     const capped = lines.length > EVIDENCE_GET_MAX_LINES;
     const content = capped
       ? `${lines.slice(0, EVIDENCE_GET_MAX_LINES - 1).join('\n')}\n${cappedNotice(ledger, entry, parseEvidenceRef(ref)?.range)}`
-      : entry.content;
+      : shown;
+    let readbackFields: Record<string, unknown> = {};
+    if (readback.kind === 'verbatim') {
+      readbackFields = { verbatim: true };
+    } else if (readback.kind === 'stored' && entry.file && entry.range) {
+      // 标注按条目坐标（文件行号）列出含标记的行，统计完整条目内容而不只是截到预算内的部分
+      const summary = summarizeRedactionMarkers(entry.content, entry.range.start);
+      readbackFields = {
+        verbatim: false,
+        redaction: { markers: summary.markers, lines: summary.lines },
+        hint: readbackHint({ ...entry, file: entry.file, range: entry.range }, readback.reason),
+      };
+    }
     return ok({
       id: entry.id,
       ...(entry.file ? { file: entry.file } : {}),
@@ -384,6 +620,7 @@ export async function handle(
       lineCount: lines.length,
       capped,
       content,
+      ...readbackFields,
     });
   }
 

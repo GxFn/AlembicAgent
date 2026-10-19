@@ -5,6 +5,8 @@ import {
   RECIPE_RETRIEVAL_PROFILE_SCHEMA_VERSION,
 } from '@alembic/core';
 import Logger from '@alembic/core/logging';
+import { observeSafely } from '#shared/observers.js';
+import { summarizeRedactionMarkers } from './evidence.js';
 import {
   parseBoundedSourceRef,
   readSourceRange,
@@ -235,6 +237,37 @@ function buildRetrievalProfile(
 }
 
 /**
+ * coreCode 被拒且含台账脱敏标记时的归因诊断（脱敏阶段 2，原因 copied-redacted-evidence）。
+ *
+ * 证据台账落盘的是脱敏文本；模型若把 evidence.get 返回的存储内容（stale、不可读或凭据类文件时
+ * 才会返回存储内容）照抄进 coreCode，fs 逐字包含校验必然失配。codeEvidence.reason 的枚举
+ * （absent / bounded-match / unbounded-or-unrelated）随 knowledge.submit 回执交给模型与宿主，
+ * 这里不扩充枚举、不改回执，只写 warn：触发条件（标记数与种类）、比对结论、重试路径；不含片段正文。
+ * 文件原文本来就含同形字面量、且片段与证据匹配时不会走到这里（只在未接受时调用）。
+ */
+function reportCopiedRedactedEvidence(
+  rawItem: Record<string, unknown>,
+  requestedCoreCode: string,
+  codeFitsBudget: boolean
+): void {
+  const markers = summarizeRedactionMarkers(requestedCoreCode);
+  if (markers.markers === 0) {
+    return;
+  }
+  const kinds = Object.entries(markers.kinds)
+    .map(([kind, count]) => `${kind}×${count}`)
+    .join(',');
+  // 诊断通道失败不能改变 prepare 的裁决结果
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[knowledge.submit] recipe production adapter rejected coreCode for "${text(rawItem.title)}": reason=copied-redacted-evidence markers=${markers.markers} kinds=${kinds} lines=${splitLogicalLines(requestedCoreCode).length} budget=${codeFitsBudget ? 'within' : 'exceeded'} result=unbounded-or-unrelated; the evidence ledger stores redacted text, so a snippet copied from stored evidence cannot match the source. Retry: re-fetch the snippet with evidence.get (returns the verbatim source with verbatim:true while the entry is fresh) or call code.read on the file:range, then resubmit coreCode copied from that output.`
+      ),
+    () => undefined
+  );
+}
+
+/**
  * Convert the Agent-authored profile draft into Core's public wire contract. Profile
  * provenance accepts valid project-local bounded evidence (including documentation)
  * independently from coreCode, while code admission additionally requires a
@@ -243,8 +276,9 @@ function buildRetrievalProfile(
  *
  * provenance.evidenceRefs 写每条可读引用的声明原文（与事实 provenanceRefs 逐字对齐），
  * codeEvidence.provenanceRef 写规范形式；被排除的引用连同原因进入 profileEvidence.rejected，
- * 由调用方（authoring）按提交语境记录 warn。本函数自己只记一种 debug：coreCode 含 CRLF、
- * 按 LF 归一后再与证据比对的兼容转译。
+ * 由调用方（authoring）按提交语境记录 warn。本函数自己记两种诊断：coreCode 含 CRLF、按 LF
+ * 归一后再与证据比对的兼容转译（debug）；coreCode 含台账脱敏标记且未能匹配证据时的
+ * copied-redacted-evidence 归因与重试提示（warn，见 reportCopiedRedactedEvidence）。
  */
 export function prepareRecipeProductionItem(
   rawItem: Record<string, unknown>,
@@ -282,6 +316,9 @@ export function prepareRecipeProductionItem(
     Logger.getInstance().debug(
       `[knowledge.submit] recipe production adapter normalized CRLF line endings in coreCode for bounded snippet matching for "${text(rawItem.title)}": lines=${splitLogicalLines(requestedCoreCode).length}, result=${codeAccepted ? `bounded-match (${matchingEvidence?.canonicalRef ?? ''})` : 'unbounded-or-unrelated'}; stored coreCode keeps its submitted line endings`
     );
+  }
+  if (requestedCoreCode && !codeAccepted) {
+    reportCopiedRedactedEvidence(rawItem, requestedCoreCode, codeFitsBudget);
   }
   const item: CreateRecipeItem = {
     ...(rawItem as CreateRecipeItem),

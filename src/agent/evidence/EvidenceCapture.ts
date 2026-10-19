@@ -6,6 +6,11 @@
  * 结构缺席时回退 envelope 文本——那仍是模型所见的 verbatim，不发明内容。
  * 标注格式 `[evidence] E-1=lib/a.ts:10-14; E-2=package.json` 追加于模型可见文本尾部，
  * 模型从第一眼即以条目 ID 认知证据（E3 的 evidenceRefs 引用契约由此闭环）。
+ *
+ * 脱敏阶段 2（方案 C）在本循环路径上的两处补充（宿主 capture facet 不经过这里，行为不变）：
+ * - secret-bearing 文件（evidenceFileClass 分类表）的条目丢弃 range：不参与 freshness、
+ *   evidence.get 不回读原文，子区间按条目内行号；
+ * - 落盘内容被脱敏或截断时发出限流的变换诊断（条目 id、file、tool、长度、标记种类，不含正文）。
  */
 import {
   type EvidenceEntry,
@@ -15,9 +20,11 @@ import {
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import { summarizeRedactionMarkers } from '#tools/runtime/handlers/evidence.js';
 import { readToolObservation } from '../utils/toolOutcomes.js';
 import { parseNumberedReadDisplay } from './EvidenceCollector.js';
 import type { EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
+import { classifyEvidenceSource, explainEvidenceFileClass } from './evidenceFileClass.js';
 
 /** 空读诊断里列出的成员样本上限：越界批量读可能涉及很多文件，debug 行只列前几个避免刷屏。 */
 const EMPTY_READ_LOG_SAMPLE = 5;
@@ -403,6 +410,125 @@ export class EvidenceCaptureError extends Error {
   }
 }
 
+/**
+ * 方案 C 路由：secret-bearing 文件的条目丢弃 range（设计 4.5 节“脱敏，丢弃 range，不回读”）。
+ *
+ * 只按可信元数据分类：code.read 的路径已在项目根内解析，code.search 是匹配文件；terminal 条目的
+ * file 是命令 token 的词法猜测，分类表把它一律视为终端（也从不带 range）。丢弃 range 后条目不参与
+ * freshness（恒 unknown）、[evidence] 标注只给文件名、evidence.get 不回读原文。内容本身照常经
+ * 台账脱敏。每次丢弃都记 info，写明命中的分类规则与被丢弃的区间。
+ */
+function routeSecretBearingDraft(draft: EvidenceEntryDraft): EvidenceEntryDraft {
+  if (!draft.file || !draft.range) {
+    return draft;
+  }
+  if (classifyEvidenceSource({ tool: draft.tool, file: draft.file }) !== 'secret-bearing') {
+    return draft;
+  }
+  const rules = explainEvidenceFileClass(draft.file).matchedRuleIds.join(',');
+  const message =
+    `[EvidenceCapture] secret-bearing file recorded without range: tool=${draft.tool} ` +
+    `callId=${draft.callId} file=${JSON.stringify(draft.file)} rules=${rules} ` +
+    `droppedRange=${draft.range.start}-${draft.range.end}; freshness stays unknown and ` +
+    'evidence.get will not read the file back';
+  observeSafely(
+    () => Logger.getInstance().info(message),
+    () => undefined
+  );
+  return {
+    tool: draft.tool,
+    callId: draft.callId,
+    file: draft.file,
+    content: draft.content,
+  };
+}
+
+/** 单次采集调用里逐条输出变换诊断的上限；超出部分汇总成一条，避免大批量读刷屏。 */
+const LOOP_TRANSFORMATION_DETAIL_LIMIT = 3;
+/** 汇总诊断里列出的条目 id 样本数 */
+const LOOP_TRANSFORMATION_SAMPLE_IDS = 5;
+
+/**
+ * 循环路径的落盘变换诊断（P-02：此前只有 capture facet 有变换诊断）。
+ *
+ * 循环台账把脱敏与截断视为设计内行为，所以记 info 而非 warn；内容只在被变换时才复算一次管线
+ * （describeContentTransformation，与 append 同一把尺）。限流在单次采集调用内：前
+ * LOOP_TRANSFORMATION_DETAIL_LIMIT 条逐条记录，其余在 flush 时汇总计数与 id 样本。
+ * 诊断只含条目 id、tool、callId、file、range、原长度、存储长度、变换类型与标记种类计数，
+ * 不含原文或存储内容；诊断通道自身失败被吞掉，不影响已完成的 append。
+ */
+function createLoopTransformationReporter(
+  ledger: EvidenceLedgerStore,
+  call: EvidenceCaptureCall,
+  tool: EvidenceToolId
+) {
+  let reported = 0;
+  const suppressed: string[] = [];
+  return {
+    observe(draft: EvidenceEntryDraft, entry: EvidenceEntry): void {
+      if (entry.content === draft.content) {
+        return;
+      }
+      if (reported >= LOOP_TRANSFORMATION_DETAIL_LIMIT) {
+        suppressed.push(entry.id);
+        return;
+      }
+      reported += 1;
+      observeSafely(
+        () => {
+          const transformation = ledger.describeContentTransformation(draft.content, {
+            tool: draft.tool,
+            ...(draft.file ? { file: draft.file } : {}),
+            ...(draft.range ? { range: draft.range } : {}),
+          });
+          const transformations: string[] = [];
+          if (transformation.redacted) {
+            transformations.push('redacted');
+          }
+          if (transformation.truncated) {
+            transformations.push('truncated');
+          }
+          if (transformations.length === 0) {
+            // 内容确实变了却无法归类：管线与描述口径漂移，显式暴露而不是静默归零
+            transformations.push('unknown');
+          }
+          Logger.getInstance().info('[EvidenceCapture] loop ledger persisted transformed content', {
+            evidenceId: entry.id,
+            tool: entry.tool,
+            callId: entry.callId,
+            ...(entry.file ? { file: entry.file } : {}),
+            ...(entry.range ? { range: `${entry.range.start}-${entry.range.end}` } : {}),
+            originalLength: transformation.originalLength,
+            storedLength: transformation.storedLength,
+            transformations,
+            markerKinds: summarizeRedactionMarkers(entry.content).kinds,
+          });
+        },
+        () => undefined
+      );
+    },
+    flush(): void {
+      if (suppressed.length === 0) {
+        return;
+      }
+      observeSafely(
+        () =>
+          Logger.getInstance().info(
+            '[EvidenceCapture] loop ledger transformation diagnostics rate-limited',
+            {
+              tool,
+              callId: call.id,
+              reported,
+              suppressed: suppressed.length,
+              sampleEvidenceIds: suppressed.slice(0, LOOP_TRANSFORMATION_SAMPLE_IDS),
+            }
+          ),
+        () => undefined
+      );
+    },
+  };
+}
+
 /** 采集入口：非证据工具/失败返回→空数组（零行为）；成功→逐条落账并返回条目 */
 export function captureEvidenceFromEnvelope(
   ledger: EvidenceLedgerStore,
@@ -417,12 +543,18 @@ export function captureEvidenceFromEnvelope(
     return [];
   }
   const entries: EvidenceEntry[] = [];
+  const transformations = createLoopTransformationReporter(ledger, call, tool);
   try {
-    for (const draft of normalizeDrafts(tool, call, envelope)) {
-      entries.push(ledger.append(draft));
+    for (const normalized of normalizeDrafts(tool, call, envelope)) {
+      const draft = routeSecretBearingDraft(normalized);
+      const entry = ledger.append(draft);
+      entries.push(entry);
+      transformations.observe(draft, entry);
     }
   } catch (err: unknown) {
     throw new EvidenceCaptureError(err, entries);
+  } finally {
+    transformations.flush();
   }
   return entries;
 }

@@ -16,10 +16,17 @@
  *   裸 hex 与任意错哈希同样按 authority 污染丢弃（生产打开即 fail closed，不存在兼容保留）；
  * - 追加前若文件末字节不是换行（上次短写留下残行），先补一个换行再写，新条目自成一行，
  *   残行仍由 hydrate 记为 line-N:json 供 strict/生产闸门 fail closed。
+ * - 进程内原文摘要（脱敏阶段 2 方案 C）：带 file+range 的条目在 append 时额外记录
+ *   HMAC-SHA256(实例密钥, 原文切片)。密钥由 crypto.randomBytes 生成，只活在本实例内存，不落盘、
+ *   不进模块级状态；checkFreshness 有摘要时按原文比对（消除脱敏造成的假 fresh 盲区，规则变化也
+ *   不再让同一进程内的条目误判 stale），没有摘要（seed、跨进程续跑、其它实例写入）时退回脱敏哈希。
+ * - 静态加固（D7）：台账目录 0700、文件 0600，evidence-ledger/ 下写内容为 `*` 的自忽略 .gitignore；
+ *   打开已有旧台账时尝试把权限收紧到同一标准。加固失败只记 warn，不阻断读写。
  */
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   existsSync,
   fstatSync,
@@ -29,6 +36,7 @@ import {
   readFileSync,
   readSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
@@ -42,6 +50,25 @@ import {
 } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import {
+  classifyEvidenceSource as classifyEvidenceSourceByTable,
+  type EvidenceSourceClass,
+} from './evidenceFileClass.js';
+
+/**
+ * 传给 redactor 的条目来源上下文（取自草稿或条目自身的可信元数据）。
+ *
+ * 阶段 2 只透传：生产 redactor（redactDeveloperText）是单参函数，忽略它；阶段 4 的按来源追加规则
+ * （T3）据此区分 terminal、secret-bearing 等来源。上下文只能让遮蔽更多，不能用来放行。
+ */
+export interface EvidenceRedactionContext {
+  readonly tool?: EvidenceToolId;
+  readonly file?: string;
+  readonly range?: EvidenceRange;
+}
+
+/** 单参的旧 redactor `(text) => string` 仍可直接赋值。 */
+export type EvidenceRedactor = (text: string, context?: EvidenceRedactionContext) => string;
 
 export interface EvidenceLedgerStoreOptions {
   dataRoot: string;
@@ -49,8 +76,40 @@ export interface EvidenceLedgerStoreOptions {
   sessionId: string;
   dimensionId: string;
   /** 落盘前脱敏；缺省恒等（生产接线必须注入 redactDeveloperText） */
-  redactor?: (text: string) => string;
+  redactor?: EvidenceRedactor;
 }
+
+/**
+ * append 的内部选项。刻意不放进 EvidenceEntryDraft：草稿经 capture facet 公开，
+ * CAPTURE_ALLOWED_FIELDS 白名单会拒绝多余字段，Core EvidenceEntry 也不加字段。
+ */
+export interface EvidenceAppendOptions {
+  /**
+   * draft.content 是否就是文件原文切片（默认 true）。seed 复制的是兄弟台账已落盘的脱敏/截断内容，
+   * 不是原文，必须传 false：否则原文摘要会记成“脱敏文本的摘要”，checkFreshness 会把未改动的
+   * 文件永久判 stale。
+   */
+  readonly contentIsSourceSlice?: boolean;
+}
+
+/** checkFreshness 采用的比对依据，进入诊断日志。 */
+type FreshnessBasis = 'source-digest' | 'redacted-hash';
+
+/** 进程内原文摘要记录：绑定条目的落盘身份，条目被外部改写后摘要自动作废（退回脱敏哈希）。 */
+interface SourceDigestRecord {
+  readonly digest: string;
+  readonly contentHash: string;
+  readonly file: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+/** D7：台账目录与文件的目标权限（只收紧 group/other 位，不放宽）。 */
+const LEDGER_DIRECTORY_MODE = 0o700;
+const LEDGER_FILE_MODE = 0o600;
+/** 自忽略 .gitignore：`*` 同时忽略目录内全部内容和它自己，应对 `.asd/` 未必被 gitignore 的项目。 */
+const LEDGER_GITIGNORE_NAME = '.gitignore';
+const LEDGER_GITIGNORE_CONTENT = '*\n';
 
 export interface EvidenceEntryDraft {
   tool: EvidenceToolId;
@@ -66,7 +125,8 @@ export const EVIDENCE_TRUNCATION_MARKER = '…[evidence truncated at entry cap]'
  * 落盘管线对单条 content 的变换事实（脱敏 / 上限截断）。
  *
  * 只描述、不改变管线：production capture facet 用它向宿主发出“落盘内容不等于原文”的
- * 诊断，循环路径（AgentRuntime 直接 append）把脱敏与截断视为设计内行为，不消费它。
+ * warn 诊断；循环路径（EvidenceCapture 直接 append）把脱敏与截断视为设计内行为，用它发出
+ * 限流的 info 诊断（条目 id、file、tool、长度与标记种类，不含正文）。
  */
 export interface EvidenceContentTransformation {
   /** redactor 改写了内容（凭据形态字面量被替换） */
@@ -148,11 +208,19 @@ function sliceEntry(entry: EvidenceEntry, requested: EvidenceRange): EvidenceEnt
 
 export class EvidenceLedgerStore {
   readonly filePath: string;
+  readonly #ledgerRoot: string;
   readonly #sessionId: string;
   readonly #dimensionId: string;
-  readonly #redactor: (text: string) => string;
+  readonly #redactor: EvidenceRedactor;
   readonly #entries = new Map<string, EvidenceEntry>();
   readonly #hydrateIntegrityIssues: string[] = [];
+  /**
+   * 原文摘要的 HMAC 密钥：实例状态，构造时随机生成，永不写盘、不出实例。随机密钥让摘要即使
+   * 出现在内存转储里也无法离线比对猜测原文，也保证不同实例（不同进程）的摘要互不通用。
+   */
+  readonly #sourceDigestKey = randomBytes(32);
+  /** 条目 id → 原文摘要；只记录本实例 append 的带 file+range 条目 */
+  readonly #sourceDigests = new Map<string, SourceDigestRecord>();
   #seq = 0;
   #dirReady = false;
   #diskRevision = 'missing';
@@ -162,20 +230,19 @@ export class EvidenceLedgerStore {
     this.#sessionId = options.sessionId;
     this.#dimensionId = options.dimensionId;
     this.#redactor = options.redactor ?? ((text) => text);
-    this.filePath = join(
-      options.dataRoot,
-      '.asd',
-      'evidence-ledger',
-      options.jobId,
-      `${options.dimensionId}.jsonl`
-    );
+    this.#ledgerRoot = join(options.dataRoot, '.asd', 'evidence-ledger');
+    this.filePath = join(this.#ledgerRoot, options.jobId, `${options.dimensionId}.jsonl`);
     this.#hydrate();
+    if (this.#diskRevision !== 'missing') {
+      // D7：打开加固之前写下的旧台账时把权限收紧到新标准并补 .gitignore；失败只记 warn。
+      this.#hardenStorage('opened');
+    }
   }
 
   /** 采集侧唯一写入口（E2 在工具结果收口处调用）；返回带 id 的完整条目 */
-  append(draft: EvidenceEntryDraft): EvidenceEntry {
+  append(draft: EvidenceEntryDraft, options: EvidenceAppendOptions = {}): EvidenceEntry {
     this.#refresh();
-    const capped = this.#redactAndCap(draft.content);
+    const capped = this.#redactAndCap(draft.content, redactionContextOf(draft));
     const entry: EvidenceEntry = {
       id: makeEvidenceId(this.#seq + 1),
       sessionId: this.#sessionId,
@@ -193,6 +260,7 @@ export class EvidenceLedgerStore {
     // durable append 成功后才消耗 ID；写失败的下次调用先刷新磁盘以发现残行。
     this.#seq += 1;
     this.#entries.set(frozen.id, frozen);
+    this.#recordSourceDigest(frozen, draft, options);
     this.#diskRevision = 'refresh-required';
     try {
       this.#diskRevision = this.#readDiskRevision();
@@ -233,10 +301,14 @@ export class EvidenceLedgerStore {
   }
 
   /**
-   * E5 新鲜度终检：对底层条目按「同区间重切 + 同截断 + 同脱敏」重算哈希与采集时比对。
-   * 只有 file+range 条目可复核（read 类采集）；search 分组/terminal 等无法重构切片 →
-   * 'unknown'（提交侧放行，最终仍由门禁的 fs verbatim 校验兜底）。区间越界（文件变短）
-   * 直接 'stale'。
+   * E5 新鲜度终检。只有 file+range 条目可复核（read 类采集）；search 分组/terminal 等无法重构切片 →
+   * 'unknown'（提交侧放行，最终仍由门禁的 fs verbatim 校验兜底）。区间越界（文件变短）直接 'stale'。
+   *
+   * 比对依据分两条路径，每次都记 debug 诊断说明走了哪条：
+   * - source-digest：本实例 append 时记录了原文摘要 → HMAC(当前原文切片) 与摘要比对。被脱敏改写
+   *   的字节对这条路径可见，不再有假 fresh；脱敏规则变化也不影响结论。
+   * - redacted-hash：没有摘要（seed 进来的条目、跨进程续跑 hydrate 的条目、其它实例写入的条目）
+   *   → 沿用现有「同区间重切 + 同截断 + 同脱敏」重算哈希与采集时比对，行为与阶段 2 之前相同。
    */
   checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown' {
     this.#refresh();
@@ -248,12 +320,38 @@ export class EvidenceLedgerStore {
     if (!entry || !entry.file || !entry.range) {
       return 'unknown';
     }
+    const digest = this.#usableSourceDigest(entry);
+    const basis: FreshnessBasis = digest.record ? 'source-digest' : 'redacted-hash';
     const lines = currentFileContent.split('\n');
     if (entry.range.end > lines.length) {
+      this.#logFreshness(entry, basis, 'stale', 'range-beyond-current-file');
       return 'stale';
     }
     const slice = lines.slice(entry.range.start - 1, entry.range.end).join('\n');
-    return hashEvidenceContent(this.#redactAndCap(slice)) === entry.contentHash ? 'fresh' : 'stale';
+    let verdict: 'fresh' | 'stale';
+    if (digest.record) {
+      verdict = this.#sourceDigest(slice) === digest.record.digest ? 'fresh' : 'stale';
+    } else {
+      const recomputed = hashEvidenceContent(this.#redactAndCap(slice, redactionContextOf(entry)));
+      verdict = recomputed === entry.contentHash ? 'fresh' : 'stale';
+    }
+    this.#logFreshness(entry, basis, verdict, digest.reason);
+    return verdict;
+  }
+
+  /**
+   * 条目来源分类（方案 C 的回读闸门）：terminal / no-file / secret-bearing / source / config。
+   *
+   * 分类表在 agent 层（evidenceFileClass.ts），tools 层的 evidence.get 按 config/layer-contract.json
+   * 不能运行时依赖 agent，公开端口 EvidenceLedgerLike 也不新增字段，所以由台账实例代为回答：
+   * handler 在读文件之前分别用条目声明的路径和项目根内解析后的真实路径询问，secret-bearing 一律
+   * 不回读；不提供本方法的台账实现由 handler 按失败即关处理。纯函数委托，不读文件、不改状态。
+   */
+  classifyEvidenceSource(source: {
+    readonly tool?: string;
+    readonly file?: string;
+  }): EvidenceSourceClass {
+    return classifyEvidenceSourceByTable(source);
   }
 
   /**
@@ -261,10 +359,13 @@ export class EvidenceLedgerStore {
    *
    * 与 append 使用同一把尺（同一 redactor、同一上限），所以对同一 content 的结论与
    * 实际落盘一致；调用方应只在 append 返回内容不等于原文时调用，避免对未变换内容重复
-   * 跑一遍脱敏正则。
+   * 跑一遍脱敏正则。context 应与 append 时的草稿元数据一致（缺省等同未知来源）。
    */
-  describeContentTransformation(content: string): EvidenceContentTransformation {
-    const transformed = this.#transform(content);
+  describeContentTransformation(
+    content: string,
+    context?: EvidenceRedactionContext
+  ): EvidenceContentTransformation {
+    const transformed = this.#transform(content, context);
     return Object.freeze({
       redacted: transformed.redacted,
       truncated: transformed.truncated,
@@ -273,21 +374,24 @@ export class EvidenceLedgerStore {
     });
   }
 
-  /** 落盘内容统一管线：脱敏→上限截断（append 与 checkFreshness 共用同一把尺） */
-  #redactAndCap(content: string): string {
-    return this.#transform(content).stored;
+  /** 落盘内容统一管线：脱敏→上限截断（append 与 checkFreshness 的脱敏哈希路径共用同一把尺） */
+  #redactAndCap(content: string, context?: EvidenceRedactionContext): string {
+    return this.#transform(content, context).stored;
   }
 
   /**
    * 管线单源：脱敏后若超上限则保头截断并附显式标记。redacted/truncated 两个事实与
    * stored 一起返回，保证 describeContentTransformation 与实际写入不会各算各的。
    */
-  #transform(content: string): {
+  #transform(
+    content: string,
+    context?: EvidenceRedactionContext
+  ): {
     readonly stored: string;
     readonly redacted: boolean;
     readonly truncated: boolean;
   } {
-    const redacted = this.#redactor(content);
+    const redacted = this.#redactor(content, context);
     const truncated = redacted.length > EVIDENCE_ENTRY_MAX_CHARS;
     const stored = truncated
       ? `${redacted.slice(0, EVIDENCE_ENTRY_MAX_CHARS - EVIDENCE_TRUNCATION_MARKER.length - 1)}\n${EVIDENCE_TRUNCATION_MARKER}`
@@ -470,11 +574,187 @@ export class EvidenceLedgerStore {
 
   #writeLine(entry: EvidenceEntry): void {
     if (!this.#dirReady) {
-      mkdirSync(dirname(this.filePath), { recursive: true });
+      // .asd 由宿主与 Agent 多方共用，这里只保证存在、不改它的权限；evidence-ledger 及以下目录
+      // 新建即 0700（mode 受 umask 只减不增）。已存在的旧目录由 #hardenStorage 收紧。
+      mkdirSync(dirname(this.#ledgerRoot), { recursive: true });
+      mkdirSync(dirname(this.filePath), { recursive: true, mode: LEDGER_DIRECTORY_MODE });
+      this.#hardenStorage('created');
       this.#dirReady = true;
     }
     this.#terminatePartialTail(entry.id);
-    appendFileSync(this.filePath, `${stableStringifyEntry(entry)}\n`, 'utf8');
+    // mode 只在文件新建时生效；已存在的旧文件在打开时已尝试收紧。
+    appendFileSync(this.filePath, `${stableStringifyEntry(entry)}\n`, {
+      encoding: 'utf8',
+      mode: LEDGER_FILE_MODE,
+    });
+  }
+
+  /**
+   * 记录原文摘要。只对本实例 append、带 file+range、且草稿内容就是原文切片的条目记录；
+   * seed（contentIsSourceSlice=false）跳过，checkFreshness 对它退回脱敏哈希。摘要只在内存里。
+   */
+  #recordSourceDigest(
+    entry: EvidenceEntry,
+    draft: EvidenceEntryDraft,
+    options: EvidenceAppendOptions
+  ): void {
+    if (!entry.file || !entry.range || options.contentIsSourceSlice === false) {
+      return;
+    }
+    this.#sourceDigests.set(entry.id, {
+      digest: this.#sourceDigest(draft.content),
+      contentHash: entry.contentHash,
+      file: entry.file,
+      start: entry.range.start,
+      end: entry.range.end,
+    });
+  }
+
+  /**
+   * 取可用的原文摘要。摘要绑定条目的落盘身份（contentHash、file、range）：同一 id 的磁盘行若被
+   * 外部改写（hydrate 会另记 history-changed），旧摘要不再代表该条目，按没有摘要处理。
+   */
+  #usableSourceDigest(entry: EvidenceEntry): {
+    readonly record: SourceDigestRecord | null;
+    readonly reason: string;
+  } {
+    const record = this.#sourceDigests.get(entry.id);
+    if (!record) {
+      // seed 条目、跨进程 hydrate 的条目、其它实例写入的条目都没有本实例的摘要
+      return { record: null, reason: 'no-source-digest' };
+    }
+    if (
+      record.contentHash !== entry.contentHash ||
+      record.file !== entry.file ||
+      record.start !== entry.range?.start ||
+      record.end !== entry.range?.end
+    ) {
+      return { record: null, reason: 'source-digest-entry-mismatch' };
+    }
+    return { record, reason: 'source-digest-recorded' };
+  }
+
+  #sourceDigest(sourceSlice: string): string {
+    return createHmac('sha256', this.#sourceDigestKey).update(sourceSlice, 'utf8').digest('hex');
+  }
+
+  /** freshness 诊断：只记条目坐标、比对依据与结论，不含原文、存储内容或摘要值。 */
+  #logFreshness(
+    entry: EvidenceEntry,
+    basis: FreshnessBasis,
+    verdict: 'fresh' | 'stale',
+    reason: string
+  ): void {
+    observeSafely(
+      () =>
+        Logger.getInstance().debug(`[EvidenceLedger] freshness checked via ${basis}`, {
+          evidenceId: entry.id,
+          tool: entry.tool,
+          file: entry.file,
+          range: entry.range ? `${entry.range.start}-${entry.range.end}` : undefined,
+          basis,
+          reason,
+          verdict,
+        }),
+      () => undefined
+    );
+  }
+
+  /**
+   * D7 静态加固：收紧台账文件与目录权限，补自忽略 .gitignore。
+   *
+   * origin=created：首次写入前目录刚建好（新目录已是 0700），这里补 .gitignore 并收紧可能早已
+   * 存在的 evidence-ledger 根目录；origin=opened：构造时发现已有台账文件，按新标准收紧旧的
+   * 0644/0755。任何失败只记 warn、不抛出：权限加固不能让已经存在的证据变得不可读或不可追加。
+   */
+  #hardenStorage(origin: 'created' | 'opened'): void {
+    if (process.platform !== 'win32') {
+      // Windows 没有 POSIX 权限位（chmod 只切换只读），跳过收紧，只写 .gitignore。
+      if (origin === 'opened') {
+        this.#tightenMode(this.filePath, LEDGER_FILE_MODE, 'ledger-file', origin);
+      }
+      this.#tightenMode(dirname(this.filePath), LEDGER_DIRECTORY_MODE, 'job-directory', origin);
+      this.#tightenMode(this.#ledgerRoot, LEDGER_DIRECTORY_MODE, 'ledger-root', origin);
+    }
+    this.#ensureSelfIgnoringGitignore();
+  }
+
+  /** 只去掉超出目标的权限位（group/other），已经更严的权限保持不动，避免无谓 chmod。 */
+  #tightenMode(target: string, mode: number, kind: string, origin: string): void {
+    let current: number;
+    try {
+      current = statSync(target).mode & 0o777;
+    } catch (err: unknown) {
+      this.#warnHardening('could not tighten ledger storage permissions; continuing', {
+        target,
+        kind,
+        origin,
+        step: 'stat',
+        error: describeError(err),
+      });
+      return;
+    }
+    if ((current & ~mode) === 0) {
+      return;
+    }
+    try {
+      chmodSync(target, mode);
+    } catch (err: unknown) {
+      this.#warnHardening('could not tighten ledger storage permissions; continuing', {
+        target,
+        kind,
+        origin,
+        step: 'chmod',
+        fromMode: formatMode(current),
+        toMode: formatMode(mode),
+        error: describeError(err),
+      });
+      return;
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().info('[EvidenceLedger] tightened ledger storage permissions', {
+          target,
+          kind,
+          origin,
+          fromMode: formatMode(current),
+          toMode: formatMode(mode),
+        }),
+      () => undefined
+    );
+  }
+
+  /** evidence-ledger/.gitignore 内容为 `*`；已存在（含运维自写的内容）则不覆盖。 */
+  #ensureSelfIgnoringGitignore(): void {
+    const target = join(this.#ledgerRoot, LEDGER_GITIGNORE_NAME);
+    try {
+      writeFileSync(target, LEDGER_GITIGNORE_CONTENT, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: LEDGER_FILE_MODE,
+      });
+    } catch (err: unknown) {
+      if (hasErrorCode(err, 'EEXIST')) {
+        return;
+      }
+      this.#warnHardening('could not write self-ignoring .gitignore; continuing', {
+        target,
+        error: describeError(err),
+      });
+      return;
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().info('[EvidenceLedger] wrote self-ignoring .gitignore', { target }),
+      () => undefined
+    );
+  }
+
+  #warnHardening(message: string, fields: Record<string, unknown>): void {
+    observeSafely(
+      () => Logger.getInstance().warn(`[EvidenceLedger] ${message}`, fields),
+      () => undefined
+    );
   }
 
   /**
@@ -543,6 +823,33 @@ function cloneEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
   };
 }
 
+/** 从草稿或条目取 redactor 上下文；冻结副本，redactor 不能借它改写条目元数据。 */
+function redactionContextOf(source: {
+  readonly tool: EvidenceToolId;
+  readonly file?: string;
+  readonly range?: EvidenceRange;
+}): EvidenceRedactionContext {
+  return Object.freeze({
+    tool: source.tool,
+    ...(source.file ? { file: source.file } : {}),
+    ...(source.range
+      ? { range: Object.freeze({ start: source.range.start, end: source.range.end }) }
+      : {}),
+  });
+}
+
+function describeError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function hasErrorCode(err: unknown, code: string): boolean {
+  return err instanceof Error && 'code' in err && err.code === code;
+}
+
+function formatMode(mode: number): string {
+  return `0${mode.toString(8).padStart(3, '0')}`;
+}
+
 function freezeEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
   const frozen = cloneEvidenceEntry(entry);
   if (frozen.range) {
@@ -556,6 +863,7 @@ function freezeEvidenceEntry(entry: EvidenceEntry): EvidenceEntry {
  * 合成维度由此获得全部维度的证据视野（get/search/note_finding/展开全链复用，零新类）。
  * 条目经 append 重编号（E-1..E-n 连续 id 空间，parseEvidenceRef 语法不变）、重脱敏重截断
  * （内容已是脱敏后形态，二次处理幂等）；callId 带来源维度前缀保留溯源。
+ * seed 内容不是原文切片，append 时不记录原文摘要，这些条目的 freshness 退回脱敏哈希（与现状相同）。
  * 任何单文件读取失败只跳过该文件（合成宁可少证据不可断跑）。
  */
 export function seedLedgerFromJobSiblings(
@@ -598,13 +906,16 @@ export function seedLedgerFromJobSiblings(
       });
       const entries = source.listStrictSnapshotEntries();
       for (const entry of entries) {
-        store.append({
-          tool: entry.tool,
-          callId: `seed:${sourceDim}:${entry.id}`,
-          ...(entry.file ? { file: entry.file } : {}),
-          ...(entry.range ? { range: entry.range } : {}),
-          content: entry.content,
-        });
+        store.append(
+          {
+            tool: entry.tool,
+            callId: `seed:${sourceDim}:${entry.id}`,
+            ...(entry.file ? { file: entry.file } : {}),
+            ...(entry.range ? { range: entry.range } : {}),
+            content: entry.content,
+          },
+          { contentIsSourceSlice: false }
+        );
         seeded += 1;
       }
     } catch (err: unknown) {
