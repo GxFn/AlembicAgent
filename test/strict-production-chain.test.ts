@@ -1205,3 +1205,126 @@ describe('strict Plan local semantic validation', () => {
     expect(count).toBe(1);
   });
 });
+
+// L8-C19：严格 Plan 的错误载体必须让宿主看得到真实进度并只收到 Error 实例；修复上限越界显式拒绝。
+describe('strict Plan error carriers and repair cap', () => {
+  it('fails PLAN_TOOL_FORBIDDEN with partialResult and the executed tool names', async () => {
+    let count = 0;
+    const toolRun: AgentRunResult = {
+      ...result(JSON.stringify(strictIntent)),
+      toolCalls: [
+        { tool: 'write_file', args: { path: 'a.ts' }, result: { ok: true }, durationMs: 3 },
+        { tool: 'write_file', args: { path: 'b.ts' }, result: { ok: true }, durationMs: 2 },
+        { tool: 'shell.exec', args: { cmd: 'echo' }, result: 'ok', durationMs: 1 },
+      ],
+    };
+    const failure = await runStrictPlanAgent({
+      contextProjection: planContext(),
+      agentService: {
+        async run() {
+          count++;
+          return toolRun;
+        },
+      },
+      validateReceipt: () => undefined,
+    }).then(
+      () => null,
+      (err: unknown) => err
+    );
+    expect(failure).toBeInstanceOf(Error);
+    const error = failure as Error & { partialResult?: AgentRunResult };
+    expect(error.message).toBe('PLAN_TOOL_FORBIDDEN: write_file, shell.exec');
+    expect(error.partialResult).toBe(toolRun);
+    expect(error.cause).toBe(toolRun);
+    // 工具违规不是语义缺口，不能消耗因果修复预算重试。
+    expect(count).toBe(1);
+  });
+
+  it('normalizes a non-Error host validator rejection into an Error instance without repair', async () => {
+    const warn = vi.fn();
+    const getInstance = vi.spyOn(Logger, 'getInstance').mockReturnValue({ warn } as never);
+    let count = 0;
+    try {
+      const failure = await runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: {
+          async run() {
+            count++;
+            return result(JSON.stringify(strictIntent));
+          },
+        },
+        validateReceipt: () => {
+          // 宿主校验器违反约定抛出字符串；调用方仍必须收到 Error 实例。
+          // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖宿主校验器违约时包成 Error 的分支。
+          throw 'host validator exploded';
+        },
+      }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe('host validator exploded');
+      expect((failure as Error).cause).toBe('host validator exploded');
+      expect(count).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[1]).toMatchObject({
+        reasonCode: 'strict-plan-non-error-rejection-normalized',
+        rejectionType: 'string',
+        semanticRepairAttempt: 0,
+        resolution: 'rethrow-as-error',
+      });
+    } finally {
+      getInstance.mockRestore();
+    }
+  });
+
+  it('keeps rethrowing a non-PLAN host Error instance unchanged', async () => {
+    const hostError = new Error('host compile failure');
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: planContext(),
+        agentService: { run: async () => result(JSON.stringify(strictIntent)) },
+        validateReceipt: () => {
+          throw hostError;
+        },
+      })
+    ).rejects.toBe(hostError);
+  });
+
+  it('rejects semanticRepairLimit above the strict cap of 2 before any model call', async () => {
+    let count = 0;
+    const context = planContext();
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: { ...context, hardCaps: { semanticRepairLimit: 3 } },
+        agentService: {
+          async run() {
+            count++;
+            return result(JSON.stringify(strictIntent));
+          },
+        },
+        validateReceipt: () => undefined,
+      })
+    ).rejects.toThrow(/^STRICT_PLAN_CONTEXT_INVALID: semanticRepairLimit=3 exceeds strict cap 2$/u);
+    expect(count).toBe(0);
+  });
+
+  it('still honours a semanticRepairLimit below the cap', async () => {
+    let count = 0;
+    await expect(
+      runStrictPlanAgent({
+        contextProjection: { ...planContext(), hardCaps: { semanticRepairLimit: 0 } },
+        agentService: {
+          async run() {
+            count++;
+            return result(JSON.stringify(strictIntent));
+          },
+        },
+        validateReceipt: () => {
+          throw new Error('PLAN_REVISE');
+        },
+      })
+    ).rejects.toThrow('PLAN_SEMANTIC_REPAIR_LIMIT: PLAN_REVISE');
+    expect(count).toBe(1);
+  });
+});

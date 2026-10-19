@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import Logger from '@alembic/core/logging';
 import {
   assertPlanSelectionStageRequirements,
   hashStrictPlanIntentV1,
@@ -8,6 +9,8 @@ import {
   type PlanStageId,
   type StrictPlanIntentV1,
 } from '@alembic/core/plans';
+import { observeSafely } from '../../../shared/observers.js';
+import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import { runFailure } from '../result.js';
 import { buildSystemTaskRunInput, type SystemTaskRunSignals } from '../systemTaskRunInput.js';
@@ -28,6 +31,12 @@ export interface PlanContextProjectionV1 {
     readonly semanticRepairLimit: number;
   };
 }
+
+/**
+ * 严格 Plan 因果语义修复的硬上限，与 Core coldStartProductionPlan 的字面量 2 对齐（L8-C19）。
+ * 宿主传入更大的值时显式拒绝，不再静默截断成 2，避免宿主误以为多给的修复预算生效了。
+ */
+const STRICT_PLAN_SEMANTIC_REPAIR_CAP = 2;
 
 /**
  * abortSignal / shouldAbort / timeoutMs：宿主可选的取消与期限信号（L8-C01）。每次认知调用（含因果
@@ -52,7 +61,8 @@ export async function runStrictPlanAgent({
   timeoutMs,
 }: RunStrictPlanAgentInput): Promise<PlanCognitionReceiptV1> {
   validateStrictPlanContext(contextProjection);
-  const semanticRepairLimit = Math.min(contextProjection.hardCaps.semanticRepairLimit, 2);
+  // 上限已在 validateStrictPlanContext 中校验为 0..STRICT_PLAN_SEMANTIC_REPAIR_CAP，这里直接使用宿主值。
+  const semanticRepairLimit = contextProjection.hardCaps.semanticRepairLimit;
   let initial: PlanCognitionInvocationV1 | null = null;
   const repairs: PlanCognitionInvocationV1[] = [];
   let repairReason: string | null = null;
@@ -91,7 +101,9 @@ export async function runStrictPlanAgent({
       );
     }
     if (result.toolCalls.length > 0) {
-      throw new Error('PLAN_TOOL_FORBIDDEN');
+      // provider 无视 toolChoice=none 执行了工具：这是违规而非语义缺口，不进入修复预算；
+      // 用 runFailure 携带 partialResult/cause，让宿主能检查哪些（可能有副作用的）工具已执行。
+      throw runFailure(result, `PLAN_TOOL_FORBIDDEN: ${describeToolCallNames(result.toolCalls)}`);
     }
     const intent = parseStrictPlanIntent(result.reply, contextProjection);
     const outputHash = hashStrictPlanIntentV1(intent);
@@ -139,7 +151,9 @@ export async function runStrictPlanAgent({
     } catch (error: unknown) {
       repairReason = error instanceof Error ? error.message : String(error);
       if (!/^PLAN_[A-Z0-9_]+/u.test(repairReason)) {
-        throw error;
+        // 非 PLAN_ 拒绝不是可修复的语义缺口，直接交还宿主；宿主校验器抛出非 Error 值时
+        // 归一化成 Error（保留原值为 cause），保证调用方只收到 Error 实例。
+        throw normalizeHostRejection(error, attempt);
       }
       if (attempt >= semanticRepairLimit) {
         throw new Error(`PLAN_SEMANTIC_REPAIR_LIMIT: ${repairReason}`);
@@ -349,6 +363,34 @@ function validateFrozenPlanQueries(
   }
 }
 
+/** 去重后的工具名列表，供 PLAN_TOOL_FORBIDDEN 消息定位违规调用；完整调用仍在 partialResult 中。 */
+function describeToolCallNames(toolCalls: AgentRunResult['toolCalls']): string {
+  const names = [...new Set(toolCalls.map((call) => call.tool || call.name || '<unnamed>'))];
+  return names.join(', ');
+}
+
+function normalizeHostRejection(error: unknown, attempt: number): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  const rejectionType = error === null ? 'null' : typeof error;
+  // 兼容转译路径：宿主违反“只抛 Error 实例”的约定，记录类型与尝试序号便于回查宿主校验器。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        `[StrictPlan] host validateReceipt rejected with a non-Error value; rethrowing as Error (type=${rejectionType}, attempt=${attempt})`,
+        {
+          reasonCode: 'strict-plan-non-error-rejection-normalized',
+          rejectionType,
+          semanticRepairAttempt: attempt,
+          resolution: 'rethrow-as-error',
+        }
+      ),
+    () => undefined
+  );
+  return new Error(String(error), { cause: error });
+}
+
 function validateStrictPlanContext(context: PlanContextProjectionV1): void {
   if (
     context.schemaVersion !== 1 ||
@@ -364,6 +406,11 @@ function validateStrictPlanContext(context: PlanContextProjectionV1): void {
     context.hardCaps.semanticRepairLimit < 0
   ) {
     throw new Error('STRICT_PLAN_CONTEXT_INVALID');
+  }
+  if (context.hardCaps.semanticRepairLimit > STRICT_PLAN_SEMANTIC_REPAIR_CAP) {
+    throw new Error(
+      `STRICT_PLAN_CONTEXT_INVALID: semanticRepairLimit=${context.hardCaps.semanticRepairLimit} exceeds strict cap ${STRICT_PLAN_SEMANTIC_REPAIR_CAP}`
+    );
   }
 }
 
