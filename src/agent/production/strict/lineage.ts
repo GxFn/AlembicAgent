@@ -74,9 +74,11 @@ export function createStrictProducerLineageReceiptV1(
   input: CreateStrictProducerLineageReceiptInputV1
 ): StrictProducerLineageReceiptV1 {
   assertStrictContextIntegrity(input.context);
-  // 重建会重跑 Analyst 结构校验（前提/反例事实属于 population，因果父假设属于本 epoch 且未被
-  // refuted/unknown），下面取出的 hypothesis 连同 causalParentHypothesisId 才进入 hypothesisHash 与
-  // knowledgeRootId；宿主外部权威（knownFactIds/enrolledObligationIds）不在复核范围内。
+  // 完整性复核先重跑 Analyst 结构校验（前提/反例事实属于 population，因果父假设属于本 epoch 且未被
+  // refuted/unknown），再要求存储内容本身哈希到 epochHash（C010）：下面直接从存储的派生字段
+  // producerEligibleHypotheses 取 hypothesis，只改该字段、不重算 epochHash 的 epoch 在此失败关闭，
+  // 取出的 hypothesis 连同 status、premiseFactIds 与 causalParentHypothesisId 与重建结果一致后才进入
+  // hypothesisHash 与 knowledgeRootId。宿主外部权威（knownFactIds/enrolledObligationIds）不在复核范围内。
   assertStrictAnalystEpochIntegrity(input.epoch);
   assertAnalysisFixpointIntegrity(input.analysisFixpoint);
   assertEvidenceProjectionIntegrity(input.evidence);

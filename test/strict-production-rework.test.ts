@@ -1675,6 +1675,10 @@ function resealEpoch(
 }
 
 describe('strict Analyst premise and counterexample facts stay within the population (C22)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   function withPremises(
     semantic: StrictSemanticFixture,
     knownFactIds: readonly string[],
@@ -1831,6 +1835,93 @@ describe('strict Analyst premise and counterexample facts stay within the popula
     expect(epoch.falsifications[0]?.verdict).toBe('refuted');
     expect(epoch.producerEligibleHypotheses).toEqual([]);
     expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+  });
+
+  // C042：重建拿不到宿主 knownFactIds，只能判断“是否属于 population”，因此无论该事实宿主是否执行过，
+  // 都必须与首次校验一样报 *_OUTSIDE_POPULATION，而不是带“宿主未执行”语义的 *_INVENTED。
+  it.each([
+    ['a host-known fact', 'fact-extra'],
+    ['a fact the host never executed', 'fact-ghost'],
+  ])('classifies %s outside the population as OUTSIDE_POPULATION when rebuilding a resealed premise', (_label, factId) => {
+    const { lineageInput, semantic } = createLineageFixture();
+    const { epoch } = lineageInput;
+    const tampered = resealEpoch(epoch, {
+      inductions: epoch.inductions.map((receipt) => ({
+        ...receipt,
+        hypotheses: receipt.hypotheses.map((hypothesis) => ({
+          ...hypothesis,
+          premiseFactIds: [factId, 'fact-handler'],
+        })),
+      })),
+    });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const outsidePopulation =
+      /^STRICT_ANALYST_HYPOTHESIS_FACT_OUTSIDE_POPULATION: hypothesis-handler$/u;
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(outsidePopulation);
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [tampered],
+      })
+    ).toThrow(outsidePopulation);
+    expect(() =>
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
+    ).toThrow(outsidePopulation);
+    expect(warn).toHaveBeenCalledWith(
+      '[StrictAnalyst] epoch rebuild classifies facts outside the population',
+      expect.objectContaining({
+        component: 'assertStrictAnalystEpochIntegrity',
+        reason: 'rebuild-without-host-fact-authority',
+        selectedPath: 'classify-as-outside-population',
+        factIds: [factId],
+      })
+    );
+  });
+
+  it('classifies a resealed counterexample fact outside the population as OUTSIDE_POPULATION at rebuild', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome: 'refuted' }],
+        [{ hypothesisId: 'hypothesis-handler', status: 'refuted' }]
+      )
+    );
+    const tampered = resealEpoch(epoch, {
+      falsifications: epoch.falsifications.map((receipt) => ({
+        ...receipt,
+        executions: receipt.executions.map((execution) => ({
+          ...execution,
+          counterexampleFactIds: ['fact-extra', 'fact-handler'],
+        })),
+      })),
+    });
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(
+      /^STRICT_ANALYST_COUNTEREXAMPLE_FACT_OUTSIDE_POPULATION: hypothesis-handler$/u
+    );
+  });
+
+  it('keeps a non-canonical premise id invented at rebuild, as the first validation does', () => {
+    const { lineageInput } = createLineageFixture();
+    const { epoch } = lineageInput;
+    // 带首尾空白的 ID 不是 normalizeIds 产出的规范形，宿主权威里不可能存在，两条路径都按杜撰拒绝。
+    const tampered = resealEpoch(epoch, {
+      inductions: epoch.inductions.map((receipt) => ({
+        ...receipt,
+        hypotheses: receipt.hypotheses.map((hypothesis) => ({
+          ...hypothesis,
+          premiseFactIds: [' fact-handler '],
+        })),
+      })),
+    });
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(
+      /^STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED: hypothesis-handler$/u
+    );
+    const semantic = createSingleHypothesisEpochFixture();
+    expect(() =>
+      validateStrictAnalystEpochV1(withPremises(semantic, ['fact-handler'], [' fact-handler ']))
+    ).toThrow(/^STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED: hypothesis-handler$/u);
   });
 });
 
@@ -2040,5 +2131,86 @@ describe('strict Analyst causal parent hypotheses stay inside the epoch (C23)', 
     expect(() =>
       createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
     ).toThrow(/^STRICT_ANALYST_CAUSAL_PARENT_UNKNOWN: hypothesis-handler$/u);
+  });
+});
+
+/**
+ * C010（C23 第三轮补修）：producerEligibleHypotheses 等派生字段不是重建的输入，只改它们、不重算
+ * epochHash 时重建出的 hash 与存储 hash 仍相等。完整性校验因此还要求存储内容本身哈希到 epochHash，
+ * 否则悬空父假设、翻转的 status 或 population 外的前提会经 lineage 进入 hypothesisHash。
+ */
+describe('strict Analyst epoch integrity binds stored derived fields to epochHash (C23)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  type EpochTamper = (epoch: StrictAnalystEpochV1) => StrictAnalystEpochV1;
+  const danglingParent: EpochTamper = (epoch) => ({
+    ...epoch,
+    producerEligibleHypotheses: epoch.producerEligibleHypotheses.map((row) => ({
+      ...row,
+      status: 'narrowed' as const,
+      causalParentHypothesisId: 'ghost-hypothesis',
+    })),
+  });
+  const premiseOutsidePopulation: EpochTamper = (epoch) => ({
+    ...epoch,
+    producerEligibleHypotheses: epoch.producerEligibleHypotheses.map((row) => ({
+      ...row,
+      premiseFactIds: ['fact-not-in-population'],
+    })),
+  });
+  // 跨进程：篡改后的 epoch 经 JSON 往返，模拟落盘或跨进程传输后读回。
+  const danglingParentAcrossProcess: EpochTamper = (epoch) =>
+    JSON.parse(JSON.stringify(danglingParent(epoch))) as StrictAnalystEpochV1;
+
+  it.each([
+    ['a dangling causal parent with a flipped status', danglingParent],
+    ['a premise fact outside the population', premiseOutsidePopulation],
+    ['a dangling causal parent copied across processes', danglingParentAcrossProcess],
+  ])('rejects producer-eligible rows rewritten with %s without resealing epochHash', (_label, tamper) => {
+    const { lineageInput, semantic } = createLineageFixture();
+    const tampered = tamper(lineageInput.epoch);
+    expect(tampered.epochHash).toBe(lineageInput.epoch.epochHash);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const mismatch = /^STRICT_PRODUCER_LINEAGE_EPOCH_HASH_MISMATCH$/u;
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(mismatch);
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [tampered],
+      })
+    ).toThrow(mismatch);
+    expect(() =>
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
+    ).toThrow(mismatch);
+    expect(warn).toHaveBeenCalledWith(
+      '[StrictAnalyst] epoch integrity mismatch',
+      expect.objectContaining({
+        component: 'assertStrictAnalystEpochIntegrity',
+        reason: 'epoch-content-not-bound-to-epoch-hash',
+        selectedPath: 'fail-closed',
+        failedChecks: ['stored-content-hash'],
+      })
+    );
+  });
+
+  it('keeps accepting an untouched epoch and its cross-process JSON copy', () => {
+    const { lineage, lineageInput, semantic } = createLineageFixture();
+    const copied = JSON.parse(JSON.stringify(lineageInput.epoch)) as StrictAnalystEpochV1;
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    expect(() => assertStrictAnalystEpochIntegrity(copied)).not.toThrow();
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [copied],
+      })
+    ).not.toThrow();
+    const rebuiltLineage = createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: copied });
+    expect(rebuiltLineage.hypothesisHash).toBe(lineage.hypothesisHash);
+    expect(rebuiltLineage.lineageHash).toBe(lineage.lineageHash);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

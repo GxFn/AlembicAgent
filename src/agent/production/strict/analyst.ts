@@ -310,10 +310,12 @@ function validateStrictPopulationAuthority(input: StrictAnalystEpochInputV1): {
 
 /**
  * 假设前提与反查反例的两层事实口径（C22）：
- * - knownFactIds：宿主权威（已执行的全部 factId），不在其中即模型杜撰，沿用 *_FACT_INVENTED；
+ * - knownFactIds：首次校验时是宿主权威（已执行的全部 factId），不在其中即模型杜撰，沿用
+ *   *_FACT_INVENTED；重建时没有宿主权威，取 population 事实与 epoch 自引规范形事实的并集
+ *   （见 rebuildStrictAnalystEpoch），只拦非规范元素；
  * - populationFactIds：canonical population 四类观测的 factId 并集，是 epoch 自身携带、重建时
- *   唯一能复算的事实集合。宿主已知但不在 population 的事实以 *_FACT_OUTSIDE_POPULATION 拒绝，
- *   保证首次校验与 rebuildStrictAnalystEpoch 的重建同口径，不再出现“首次通过、重建才报杜撰”。
+ *   唯一能复算的事实集合。不在 population 的规范形事实以 *_FACT_OUTSIDE_POPULATION 拒绝，
+ *   首次校验与重建同口径、同错误码，不再出现“首次通过、重建才报杜撰”或两条路径归类不一致。
  */
 interface StrictAnalystFactAuthority {
   readonly knownFactIds: ReadonlySet<string>;
@@ -337,7 +339,8 @@ function collectStrictPopulationFactIds(population: ObservationPopulationV1): Re
  * 先按宿主权威判“杜撰”，再按 population 判“越出 population”：population 事实已在
  * validateStrictPopulationAuthority 中确认是 knownFactIds 的子集，所以真正未执行的事实仍得到
  * 原有的 *_FACT_INVENTED 码，只有宿主已知但不属于 population 的事实才得到新码。
- * 非字符串元素在两个集合中都查不到，按杜撰拒绝。
+ * 非字符串元素在两个集合中都查不到，按杜撰拒绝。重建路径的 knownFactIds 已并入 epoch 自引的
+ * 规范形事实，invented 分支只剩非规范元素，population 外的事实统一落到 outsidePopulation 分支。
  */
 function assertFactsWithinPopulation(
   factIds: readonly string[],
@@ -566,7 +569,8 @@ const CAUSAL_PARENT_INELIGIBLE_STATUSES: ReadonlySet<StrictHypothesisDisposition
  *   输入类型变更，未采纳；
  * - 父假设为 refuted/unknown：STRICT_ANALYST_CAUSAL_PARENT_INELIGIBLE。
  * refuted/unknown 行若携带父 ID，同样按后四条校验（父 ID 同样进入 epochHash）。重建
- * （assertStrictAnalystEpochIntegrity）会重新执行本校验，改写父 ID 后重算 epochHash 无法自证。
+ * （assertStrictAnalystEpochIntegrity）会重新执行本校验，改写父 ID 后重算 epochHash 无法自证；
+ * 只改派生的 producerEligibleHypotheses、不重算 epochHash 时，由同一函数的存储内容哈希复核拦下。
  * 本层只拒绝自引用，不判定多跳环（h1→h2→h1）。
  */
 function assertStrictCausalParent(
@@ -845,11 +849,47 @@ export function createStrictAnalysisFixpointV1(
   return fixpoint;
 }
 
+/**
+ * epoch 完整性复核：fixpoint 与 Producer lineage 入口都先调用，跨进程收到的 epoch 只有三项全部
+ * 成立才放行，三项共用既有错误码，诊断里的 failedChecks 区分具体原因：
+ * - schemaVersion 为 1；
+ * - 重建 hash 等于存储 epochHash（rebuilt-epoch-hash）：重建只读 population、cluster set、
+ *   inductions、falsifications、review ledger 与 hypothesisDispositions，按首次校验的规则重新推导；
+ * - 存储内容（去掉 epochHash 后的全部字段）自身哈希到 epochHash（stored-content-hash，C010）。
+ *   producerEligibleHypotheses 等派生字段不是重建的输入，只改它们、不重算 epochHash 时上一项仍然
+ *   相等；本项把存储内容绑回 epochHash，否则悬空父假设、翻转的 status 或 population 外的前提会经
+ *   lineage 进入 hypothesisHash。
+ * 两项哈希都等于 epochHash，即存储内容与重建内容的规范 JSON 一致（跨进程 JSON 载荷下就是内容一致），
+ * 下游直接读取存储的派生字段才可信。先重建、后比哈希，保持重建内各结构错误码的既有报告顺序。
+ */
 export function assertStrictAnalystEpochIntegrity(epoch: StrictAnalystEpochV1): void {
   const rebuilt = rebuildStrictAnalystEpoch(epoch);
-  if (epoch.schemaVersion !== 1 || rebuilt.epochHash !== epoch.epochHash) {
-    fail('STRICT_PRODUCER_LINEAGE_EPOCH_HASH_MISMATCH');
+  const { epochHash: storedEpochHash, ...storedSemantic } = epoch;
+  const storedContentHash = hashCanonical(storedSemantic);
+  const failedChecks = [
+    ...(epoch.schemaVersion !== 1 ? ['schema-version'] : []),
+    ...(rebuilt.epochHash !== storedEpochHash ? ['rebuilt-epoch-hash'] : []),
+    ...(storedContentHash !== storedEpochHash ? ['stored-content-hash'] : []),
+  ];
+  if (failedChecks.length === 0) {
+    return;
   }
+  // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，失败关闭不因诊断失败而改变。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn('[StrictAnalyst] epoch integrity mismatch', {
+        component: 'assertStrictAnalystEpochIntegrity',
+        reason: 'epoch-content-not-bound-to-epoch-hash',
+        selectedPath: 'fail-closed',
+        failedChecks,
+        storedEpochHash,
+        rebuiltEpochHash: rebuilt.epochHash,
+        storedContentHash,
+        followUpCheck: 're-validate-epoch-from-host-authority-before-lineage',
+      }),
+    () => undefined
+  );
+  fail('STRICT_PRODUCER_LINEAGE_EPOCH_HASH_MISMATCH');
 }
 
 /**
@@ -859,13 +899,20 @@ export function assertStrictAnalystEpochIntegrity(epoch: StrictAnalystEpochV1): 
  *
  * 重建复核的范围只有结构一致性与 Core 构造器不变量，不复核宿主的外部权威：epoch 不携带
  * knownFactIds/enrolledObligationIds，只能从 epoch 自身推导——
- * - 已知事实取 population 事实全集。首次校验已要求前提与反例事实落在 population 内（C22），
- *   因此对合法 epoch 两次校验同口径；这里查的是“是否属于 population”，不是“宿主是否执行过”。
+ * - 已知事实取 population 事实全集，并上 epoch 自己引用的规范形前提/反例事实（C042）。重建
+ *   拿不到宿主集合，分不清“宿主执行过但不在 population”与“从未执行”，只能判断是否属于
+ *   population：并集让规范形事实都越过 invented 判断，population 外的统一报
+ *   *_FACT_OUTSIDE_POPULATION，与首次校验同码；非规范元素（非字符串、空串、带首尾空白）宿主
+ *   权威里不可能存在，两条路径都仍报 *_FACT_INVENTED。合法 epoch 的事实都在 population 内，
+ *   并集不改变重建结果与 epochHash。
  * - 已登记 obligation 取 executionReceipts 与 falsification 自带的 enrolledCounterqueryIds，
  *   STRICT_ANALYSIS_QUERY_UNENROLLED 在重建中必然通过，反查登记的真实性只由首次校验对宿主集合把关。
  */
 function rebuildStrictAnalystEpoch(epoch: StrictAnalystEpochV1): StrictAnalystEpochV1 {
-  const knownFactIds = collectStrictPopulationFactIds(epoch.population);
+  const populationFactIds = collectStrictPopulationFactIds(epoch.population);
+  const claimedFactIds = collectStrictEpochClaimedFactIds(epoch);
+  logRebuildFactsOutsidePopulation(populationFactIds, claimedFactIds);
+  const knownFactIds = new Set([...populationFactIds, ...claimedFactIds]);
   const enrolledObligationIds = new Set([
     ...epoch.executionReceipts.map((receipt) => receipt.obligationId),
     ...epoch.falsifications.flatMap((receipt) => receipt.enrolledCounterqueryIds),
@@ -885,6 +932,75 @@ function rebuildStrictAnalystEpoch(epoch: StrictAnalystEpochV1): StrictAnalystEp
     hypothesisDispositions: epoch.hypothesisDispositions,
     dispositionReviews: epoch.dispositionReviews,
   });
+}
+
+/**
+ * epoch 自己引用的前提与反例事实（C042），供重建并入已知事实集。只收规范形 ID：非空、无首尾空白的
+ * 字符串，即宿主 knownFactIds 经 normalizeIds 后可能出现的形态；其余元素不并入，按首次校验同样的
+ * 口径报 *_FACT_INVENTED。形状不对的容器在这里跳过，留给 assertStrictAnalystInputShape 报
+ * STRICT_ANALYST_INPUT_SHAPE_INVALID，避免在收集阶段抛出无码 TypeError。
+ */
+function collectStrictEpochClaimedFactIds(epoch: StrictAnalystEpochV1): ReadonlySet<string> {
+  const claimed = new Set<string>();
+  const collect = (values: unknown): void => {
+    if (!Array.isArray(values)) {
+      return;
+    }
+    for (const value of values) {
+      if (typeof value === 'string' && value.length > 0 && value.trim() === value) {
+        claimed.add(value);
+      }
+    }
+  };
+  for (const induction of plainRecordsOf(epoch.inductions)) {
+    for (const hypothesis of plainRecordsOf(induction.hypotheses)) {
+      collect(hypothesis.premiseFactIds);
+    }
+  }
+  for (const falsification of plainRecordsOf(epoch.falsifications)) {
+    for (const execution of plainRecordsOf(falsification.executions)) {
+      collect(execution.counterexampleFactIds);
+    }
+  }
+  return claimed;
+}
+
+function plainRecordsOf(value: unknown): readonly Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isPlainRecord) : [];
+}
+
+/**
+ * 重建发现 population 外的规范形事实时记录错误归类诊断（C042）：这些事实随后在
+ * assertFactsWithinPopulation 中以 *_FACT_OUTSIDE_POPULATION 失败关闭。重建没有宿主权威，诊断写明
+ * 无法区分“宿主执行过”与“从未执行”，需由持有宿主 knownFactIds 的首次校验区分；只记事实 ID。
+ * 合法 epoch 不会触发。
+ */
+function logRebuildFactsOutsidePopulation(
+  populationFactIds: ReadonlySet<string>,
+  claimedFactIds: ReadonlySet<string>
+): void {
+  const outsidePopulation = [...claimedFactIds]
+    .filter((factId) => !populationFactIds.has(factId))
+    .sort();
+  if (outsidePopulation.length === 0) {
+    return;
+  }
+  // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，失败关闭不因诊断失败而改变。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        '[StrictAnalyst] epoch rebuild classifies facts outside the population',
+        {
+          component: 'assertStrictAnalystEpochIntegrity',
+          reason: 'rebuild-without-host-fact-authority',
+          selectedPath: 'classify-as-outside-population',
+          factIds: outsidePopulation,
+          populationFactCount: populationFactIds.size,
+          followUpCheck: 'first-validation-with-host-knownFactIds-separates-invented-facts',
+        }
+      ),
+    () => undefined
+  );
 }
 
 function rebuildClusterInputs(epoch: StrictAnalystEpochV1): KnowledgeClusterInputV1[] {
