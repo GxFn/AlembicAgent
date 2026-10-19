@@ -2214,3 +2214,122 @@ describe('strict Analyst epoch integrity binds stored derived fields to epochHas
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * C028：反查执行回执是 Core/宿主权威。population 规范形不带 executionReceipts，提示里没有回执正文，
+ * 回执又必带 neverEmit 的 receiptHash，所以模型按契约只给 counterqueryId/obligationId/
+ * counterexampleFactIds；Agent 按 obligationId 从宿主覆盖过的 population.executionReceipts 绑定回执，
+ * 模型自带的回执一律丢弃（不同于权威时记 warn），找不到权威回执时以带类型的语义码失败关闭。
+ */
+describe('strict Analyst binds counterquery execution receipts from population authority (C028)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const OVERRIDE_MESSAGE =
+    '[StrictAnalyst] supplied counterquery execution receipts replaced by population authority';
+
+  type FalsificationRow = StrictAnalystEpochInputV1['falsificationInputs'][number];
+
+  /** 单假设被反查命中（refuted）的宿主封印输入：executions 带夹具的权威回执。 */
+  function createRefutedInput(semantic: StrictSemanticFixture): StrictAnalystEpochInputV1 {
+    return createMultiHypothesisEpochInput(
+      semantic,
+      [{ hypothesisId: 'hypothesis-handler', outcome: 'refuted' }],
+      [{ hypothesisId: 'hypothesis-handler', status: 'refuted' }]
+    );
+  }
+
+  /** 改写唯一一条 falsification 行的 executions；模型形状的行不满足公开类型，经 unknown 强转。 */
+  function withExecutions(
+    input: StrictAnalystEpochInputV1,
+    rewrite: (row: FalsificationRow) => Partial<Record<keyof FalsificationRow, unknown>>
+  ): StrictAnalystEpochInputV1 {
+    return {
+      ...input,
+      falsificationInputs: input.falsificationInputs.map((row) => ({ ...row, ...rewrite(row) })),
+    } as unknown as StrictAnalystEpochInputV1;
+  }
+
+  it('binds the population receipt to a contract-shaped required counterquery row without executionReceipt', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const sealed = createRefutedInput(semantic);
+    const baseline = validateStrictAnalystEpochV1(sealed);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    // 修复前：Core normalizeFalsificationExecutions 解引用 undefined 回执，抛无码 TypeError。
+    const epoch = validateStrictAnalystEpochV1(
+      withExecutions(sealed, (row) => ({
+        executions: row.executions.map(({ executionReceipt: _receipt, ...execution }) => execution),
+      }))
+    );
+    expect(epoch.falsifications[0]?.verdict).toBe('refuted');
+    expect(epoch.falsifications[0]?.executions[0]?.executionReceipt).toEqual(
+      semantic.executionReceipt
+    );
+    expect(epoch.epochHash).toBe(baseline.epochHash);
+    expect(() => assertStrictAnalystEpochIntegrity(epoch)).not.toThrow();
+    expect(warn).not.toHaveBeenCalledWith(OVERRIDE_MESSAGE, expect.anything());
+  });
+
+  it('discards a model-authored execution receipt and logs that the population receipt replaced it', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const sealed = createRefutedInput(semantic);
+    const baseline = validateStrictAnalystEpochV1(sealed);
+    // 模型遵守 neverEmit 时写不出 receiptHash：修复前 Core 报 FACT_QUERY_EXECUTION_RECEIPT_INVALID。
+    const { receiptHash: _receiptHash, ...withoutReceiptHash } = semantic.executionReceipt;
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const epoch = validateStrictAnalystEpochV1(
+      withExecutions(sealed, (row) => ({
+        executions: row.executions.map((execution) => ({
+          ...execution,
+          executionReceipt: withoutReceiptHash,
+        })),
+      }))
+    );
+    expect(epoch.epochHash).toBe(baseline.epochHash);
+    expect(warn).toHaveBeenCalledWith(
+      OVERRIDE_MESSAGE,
+      expect.objectContaining({
+        component: 'validateStrictAnalystEpochV1',
+        reason: 'execution-receipt-is-host-owned',
+        selectedPath: 'override-with-population-receipt',
+        hypothesisIds: ['hypothesis-handler'],
+        obligationIds: [semantic.executionReceipt.obligationId],
+      })
+    );
+  });
+
+  it('fails closed with a typed code when a counterquery obligation has no population receipt', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const sealed = createRefutedInput(semantic);
+    const ghost = 'fact:ghost-counterquery';
+    // 修复前：Core 解引用缺失的回执，抛无码 TypeError，G1 只能归为基础设施故障。
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...withExecutions(sealed, () => ({
+          enrolledCounterqueryIds: [ghost],
+          executions: [{ counterqueryId: ghost, obligationId: ghost, counterexampleFactIds: [] }],
+        })),
+        enrolledObligationIds: [...sealed.enrolledObligationIds, ghost],
+      })
+    ).toThrow(
+      /^STRICT_ANALYST_COUNTERQUERY_RECEIPT_MISSING: hypothesis-handler -> fact:ghost-counterquery$/u
+    );
+  });
+
+  it('rejects a counterqueryId that differs from its obligationId with a typed code', () => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const sealed = createRefutedInput(semantic);
+    // 修复前：交给 Core 报 FALSIFICATION_COUNTERQUERY_UNENROLLED，不是 STRICT_ 语义码。
+    expect(() =>
+      validateStrictAnalystEpochV1(
+        withExecutions(sealed, (row) => ({
+          executions: row.executions.map(({ executionReceipt: _receipt, ...execution }) => ({
+            ...execution,
+            counterqueryId: 'counterquery-alias',
+          })),
+        }))
+      )
+    ).toThrow(/^STRICT_ANALYST_COUNTERQUERY_ID_MISMATCH: hypothesis-handler$/u);
+  });
+});

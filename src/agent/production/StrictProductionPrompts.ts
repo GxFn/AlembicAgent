@@ -115,11 +115,19 @@ const INDUCTION_INPUT_SHAPE = {
   ),
 } satisfies Record<keyof StrictInductionInputV1, unknown>;
 
+/**
+ * 反查执行行（C028）：执行回执是 Core FactQueryExecutionReceiptV1，属于宿主执行权威。canonical
+ * population 不带 executionReceipts，提示里没有回执正文，回执又必带 neverEmit 的 receiptHash，
+ * 所以模型无法也不得抄写；validateStrictAnalystEpochV1 按 obligationId 从宿主覆盖过的
+ * population.executionReceipts 绑定回执，模型回传的值一律丢弃。Core 还要求 counterqueryId 与
+ * obligationId 相等，契约必须把这条规则写给模型。
+ */
 const COUNTERQUERY_EXECUTION_SHAPE = {
-  counterqueryId: 'string; the counterquery this execution answers',
+  counterqueryId: 'string; must equal obligationId',
   obligationId: 'obligationId of the enrolled counterquery that was executed',
-  executionReceipt:
-    'the Core FactQueryExecutionReceiptV1 of that obligation, copied verbatim from the current population executionReceipts; never composed or edited',
+  executionReceipt: hostOwned(
+    'The Core FactQueryExecutionReceiptV1 of this obligationId, bound from the host population execution receipts.'
+  ),
   counterexampleFactIds: ['factId emitted by that execution; may be empty'],
 } satisfies Record<keyof StrictFalsificationInputV1['executions'][number], unknown>;
 
@@ -245,7 +253,8 @@ const PRODUCER_NEVER_EMIT = [
  * 形状按宿主解析器（parseAnalystEnvelope / parseExpansion / parseProducerOutput）与本仓
  * validateStrictAnalystEpochV1 / createStrictProducerExpressionSetV1 的输入类型只读抄录：
  * - `shape` 是模型要返回的 JSON 骨架；字符串值描述取值规则，不是示例数据。
- * - `hostOwnedInputKeys` 由宿主用自身权威覆盖，模型不输出。
+ * - `hostOwnedInputKeys` 由宿主用自身权威覆盖，模型不输出；其中 executions[].executionReceipt 由
+ *   validateStrictAnalystEpochV1 按 obligationId 从宿主覆盖过的 population.executionReceipts 绑定。
  * - `hostSealedKeys` 由宿主经独立语义审查会话生成并在 Core 校验前注入。在第二步跨仓批次
  *   （输入类型拆为“模型处置提案”与“宿主封印审查”、宿主注入真实审查）落地前，宿主仍把模型
  *   JSON 直接送入校验，真实 provider 会在 G1/G2 失败关闭；这是已接受的中间态，不能通过让

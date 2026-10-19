@@ -86,8 +86,9 @@ export interface CreateStrictProducerExpressionSetInputV1 {
     readonly authored: FullAuthoredProjectionV1;
     /**
      * 宿主经独立语义审查会话生成并注入的 producer-non-draft 回执，不是模型输出。当前实现在
-     * 建集时即要求该回执（createStrictProducerZeroDisposition fail-closed），而宿主真实零审查
-     * 在 G2 之后才生成，所以跨仓第二步落地前真实 provider 的零处置会在 G2 失败关闭。
+     * 建集时即要求该回执：缺省时以 STRICT_PRODUCER_ZERO_REVIEW_REQUIRED 失败关闭（非对象时为
+     * STRICT_PRODUCER_INPUT_SHAPE_INVALID），而宿主真实零审查在 G2 之后才生成，所以跨仓第二步
+     * 落地前真实 provider 的零处置会在 G2 以 semantic-reject 失败关闭。
      */
     readonly dispositionReview: KnowledgeDispositionReviewV1;
   } | null;
@@ -326,6 +327,7 @@ function createStrictProducerZeroDisposition(
   }
   requireText(input.zeroDisposition.reasonCode, 'STRICT_PRODUCER_ZERO_REASON_REQUIRED');
   validateAuthoredProjection(input.zeroDisposition.authored);
+  assertStrictProducerZeroReviewSealed(input.zeroDisposition, input.lineage);
   assertKnowledgeDispositionReviewV1(input.zeroDisposition.dispositionReview);
   const review = input.zeroDisposition.dispositionReview;
   if (
@@ -354,6 +356,51 @@ function createStrictProducerZeroDisposition(
     dispositionReview: review,
     terminalFate: 'reviewed-non-draft',
   };
+}
+
+/**
+ * 零处置的 producer-non-draft 回执在交给 Core 断言之前先确认“已封印”（C029）。契约要求模型省略
+ * 该键，宿主真实零审查在 G2 之后才生成（跨仓第二步前），所以按契约回复的零处置必然缺回执；
+ * Core assertKnowledgeDispositionReviewV1 对 undefined 会解引用 review.producer 抛无码 TypeError，
+ * G2 因而把这条预期的过渡期失败关闭误归为 infrastructure（宿主接线/I/O 故障）。这里改为带类型的码：
+ * - 缺省或 null：STRICT_PRODUCER_ZERO_REVIEW_REQUIRED（宿主尚未封印），detail 为假设 ID；
+ * - 存在但不是对象（模型自写的字符串、数组等）：STRICT_PRODUCER_INPUT_SHAPE_INVALID。
+ * 两者都先记 warn 诊断（只记值类型，不记内容），诊断不参与裁决；对象形状的回执内容仍由 Core 断言。
+ */
+function assertStrictProducerZeroReviewSealed(
+  zeroDisposition: NonNullable<CreateStrictProducerExpressionSetInputV1['zeroDisposition']>,
+  lineage: StrictProducerLineageReceiptV1
+): void {
+  const review: unknown = zeroDisposition.dispositionReview;
+  if (isPlainRecord(review)) {
+    return;
+  }
+  const missing = review === undefined || review === null;
+  const hypothesisId = lineage.hypothesis.hypothesisId;
+  // 诊断只观察不裁决：observeSafely 吞掉日志观察器异常，失败关闭不因诊断失败而改变。
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        '[StrictProducer] zero disposition reached the producer without a sealed review',
+        {
+          component: 'createStrictProducerExpressionSetV1',
+          reason: missing
+            ? 'producer-non-draft-review-not-sealed'
+            : 'producer-non-draft-review-not-an-object',
+          selectedPath: 'fail-closed',
+          hypothesisId,
+          reviewType: review === null ? 'null' : Array.isArray(review) ? 'array' : typeof review,
+          followUpCheck: missing
+            ? 'host-must-seal-producer-non-draft-review-before-expression-set'
+            : 'model-must-omit-host-sealed-dispositionReview',
+        }
+      ),
+    () => undefined
+  );
+  if (missing) {
+    fail('STRICT_PRODUCER_ZERO_REVIEW_REQUIRED', hypothesisId);
+  }
+  fail(PRODUCER_INPUT_SHAPE_INVALID, 'zeroDisposition.dispositionReview');
 }
 
 export interface StrictExpressionTerminalResolutionV1

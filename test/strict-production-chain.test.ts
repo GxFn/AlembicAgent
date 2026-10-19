@@ -385,6 +385,9 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       })
     ).toThrow(/STRICT_ANALYSIS_SCHEDULE_ALREADY_FINAL/u);
 
+    // 与宿主 buildPopulation 同口径：population 覆盖完整扩展日程的全部执行回执，包括已登记的反查；
+    // 反查回执是 Analyst 绑定 executions[].executionReceipt 的唯一权威（C028）。
+    const executedReceipts = [receiptA, receiptB, outlierReceipt, counterReceipt];
     const populationInput = {
       populationId: 'population-1',
       revision: 1,
@@ -392,29 +395,17 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       sourceRevisionVectorHash: STRICT_SOURCE_REVISION,
       denominator: {
         kind: 'frozen-complete-subjects' as const,
-        expectedObservationIds: ['obs-a', 'obs-b', 'obs-outlier'],
-        expectedObligationIds: [
-          receiptA.obligationId,
-          receiptB.obligationId,
-          outlierReceipt.obligationId,
-        ],
-        executionReceiptHashes: [
-          receiptA.receiptHash,
-          receiptB.receiptHash,
-          outlierReceipt.receiptHash,
-        ],
-        outputHashes: [receiptA.outputHash, receiptB.outputHash, outlierReceipt.outputHash],
-        denominatorHashes: [
-          receiptA.denominatorHash,
-          receiptB.denominatorHash,
-          outlierReceipt.denominatorHash,
-        ],
+        expectedObservationIds: ['obs-a', 'obs-b', 'obs-outlier', 'obs-counter-no-pattern'],
+        expectedObligationIds: executedReceipts.map((receipt) => receipt.obligationId),
+        executionReceiptHashes: executedReceipts.map((receipt) => receipt.receiptHash),
+        outputHashes: executedReceipts.map((receipt) => receipt.outputHash),
+        denominatorHashes: executedReceipts.map((receipt) => receipt.denominatorHash),
         complete: true,
         truncated: false,
         continuation: null,
         omittedObservationIds: [],
       },
-      executionReceipts: [receiptA, receiptB, outlierReceipt],
+      executionReceipts: executedReceipts,
       observations: [
         {
           observationId: 'obs-a',
@@ -453,7 +444,17 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       duplicateObservations: [],
       excludedObservations: [],
       errorObservations: [],
-      inspectedNoPatternObservations: [],
+      inspectedNoPatternObservations: [
+        {
+          observationId: 'obs-counter-no-pattern',
+          obligationId: counterReceipt.obligationId,
+          canonicalSubjectRef: counterReceipt.canonicalSubjectRef,
+          parentSubjectRefs: ['repo:repo'],
+          executionReceiptHash: counterReceipt.receiptHash,
+          outputHash: counterReceipt.outputHash,
+          denominatorHash: counterReceipt.denominatorHash,
+        },
+      ],
     };
     const clusterInputs = [
       {
@@ -590,14 +591,15 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
     });
 
     expect(epoch.population.conservation).toEqual({
-      raw: 3,
+      raw: 4,
       accepted: 3,
       duplicate: 0,
       excluded: 0,
       error: 0,
-      inspectedNoPattern: 0,
+      inspectedNoPattern: 1,
       omitted: 0,
     });
+    expect(epoch.falsifications[0]?.executions[0]?.executionReceipt).toEqual(counterReceipt);
     expect(epoch.clusterSet.clusters).toHaveLength(2);
     expect(epoch.producerEligibleHypotheses.map((row) => row.hypothesisId)).toEqual([
       'hypothesis-1',

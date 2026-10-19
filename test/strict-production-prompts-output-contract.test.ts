@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { describe, expect, it, vi } from 'vitest';
 import { createFrozenEvidenceProjection } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import {
   type CreateStrictProducerExpressionSetInputV1,
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
+  createStrictAnalysisExpansionPortV1,
   createStrictAnalysisFixpointV1,
   createStrictProducerExpressionSetV1,
   createStrictProducerLineageReceiptV1,
@@ -20,6 +22,10 @@ import {
   buildStrictAnalystPrompt,
   buildStrictProducerPrompt,
 } from '../src/agent/production/StrictProductionPrompts.js';
+import {
+  buildStrictProductionPipelineStagesV1,
+  type StrictProductionRuntimePortV1,
+} from '../src/agent/production/StrictProductionStages.js';
 import {
   createSingleHypothesisEpochFixture,
   STRICT_SOURCE_REVISION,
@@ -115,13 +121,15 @@ const FALSIFICATION_INPUT_KEYS: Record<keyof StrictFalsificationInputV1, KeyOwne
   counterqueryApplicability: 'model',
   dispositionReview: 'host-sealed',
 };
+// executionReceipt 是 Core 执行回执，只能来自宿主 population 权威（C028）：提示里没有回执正文，
+// 回执又含 neverEmit 的 receiptHash，所以模型不能抄写，由 Agent 按 obligationId 从权威回执绑定。
 const COUNTERQUERY_EXECUTION_KEYS: Record<
   keyof StrictFalsificationInputV1['executions'][number],
   KeyOwner
 > = {
   counterqueryId: 'model',
   obligationId: 'model',
-  executionReceipt: 'model',
+  executionReceipt: 'host-owned',
   counterexampleFactIds: 'model',
 };
 const COUNTERQUERY_APPLICABILITY_KEYS: Record<
@@ -520,6 +528,21 @@ describe('strict Analyst prompt output contract', () => {
     expect(contract.epochSemantics).toContain('expansions: []');
   });
 
+  it('never asks the model to copy a Core execution receipt and states counterqueryId equals obligationId (C028)', () => {
+    const contract = readOutputContract(prompt);
+    const epoch = asRecord(asRecord(contract.shape, 'shape').epoch, 'shape.epoch');
+    const execution = firstRow(
+      firstRow(epoch.falsificationInputs, 'epoch.falsificationInputs').executions,
+      'epoch.falsificationInputs[0].executions'
+    );
+    // 回执正文不在提示里（population 规范形不含 executionReceipts），回执又必带 neverEmit 的
+    // receiptHash：契约只能把它标成宿主权威，由 Agent 绑定，而不是要求模型原样抄写。
+    expect(contract.hostOwnedInputKeys).toContain('executionReceipt');
+    expect(execution.executionReceipt).toEqual(expect.stringContaining('obligationId'));
+    expect(prompt).not.toContain('copied verbatim from the current population executionReceipts');
+    expect(execution.counterqueryId).toEqual(expect.stringContaining('must equal obligationId'));
+  });
+
   it('states that disposition reviews are host-injected proposals-only output, never model-authored', () => {
     expect(prompt).not.toContain(
       'must carry an independently bound Core KnowledgeDispositionReview receipt'
@@ -536,7 +559,9 @@ describe('strict Analyst prompt output contract', () => {
     expect(prompt).toContain('HOST-OWNED');
   });
 
-  it('accepts a proposal-only reply once the host seals the reviews and fails closed before that', () => {
+  // 这里不验证任何宿主封印逻辑（封印属于跨仓第二步）：只证明契约模型键 + 宿主键能组成合法输入，
+  // 以及缺封印段的纯提案在每种缺法下都以带类型的 STRICT_ 码失败关闭（C029）。
+  it('composes a valid input from contract model keys plus host keys and fails closed with typed codes without the sealed part', () => {
     const fixture = createSingleHypothesisEpochFixture();
     const {
       currentAnalysisFixpointHash,
@@ -570,9 +595,22 @@ describe('strict Analyst prompt output contract', () => {
         ...modelProposal,
         ...hostOwned,
       } as unknown as StrictAnalystEpochInputV1)
-    ).toThrow('STRICT_ANALYST_REVIEW_CONTEXT_HASH_INVALID');
+    ).toThrow(/^STRICT_ANALYST_REVIEW_CONTEXT_HASH_INVALID$/u);
+    // 只有 review context hash、缺行级审查（有无 ledger 都一样）：仍是带类型的语义码，不是 TypeError。
+    for (const ledger of [{}, { dispositionReviews: [] }, { dispositionReviews }]) {
+      expect(() =>
+        validateStrictAnalystEpochV1({
+          ...modelProposal,
+          ...hostOwned,
+          currentAnalysisFixpointHash,
+          ...ledger,
+        } as unknown as StrictAnalystEpochInputV1)
+      ).toThrow(
+        /^STRICT_ANALYST_INPUT_SHAPE_INVALID: falsificationInputs\[0\]\.dispositionReview$/u
+      );
+    }
 
-    // 宿主按提案的 hypothesisId 查找自己生成的审查并注入，再送校验：提案 + 封印段通过。
+    // 把夹具自己的审查按 hypothesisId 放回去（不是宿主封印逻辑，只是还原夹具）：模型键 + 宿主键可通过。
     const reviewsByHypothesis = new Map(
       fixture.epochInput.falsificationInputs.map((row) => [row.hypothesisId, row.dispositionReview])
     );
@@ -683,7 +721,8 @@ describe('strict Producer prompt output contract', () => {
     expect(set.zeroDisposition).toBeNull();
 
     // 零处置提案按契约不带 producer-non-draft 回执；跨仓第二步落地前建集时即要求回执，
-    // 所以宿主直接送入会 fail-closed，而不是把无审查的零处置封印。
+    // 所以宿主直接送入会以带类型的语义码 fail-closed（C029：不是 Core 解引用 undefined 的 TypeError），
+    // 而不是把无审查的零处置封印。
     const zeroRow = {
       hypothesisId: 'hypothesis-handler',
       proposals: [],
@@ -696,7 +735,90 @@ describe('strict Producer prompt output contract', () => {
         proposals: zeroRow.proposals,
         zeroDisposition: zeroRow.zeroDisposition,
       } as unknown as CreateStrictProducerExpressionSetInputV1)
-    ).toThrow();
+    ).toThrow(/^STRICT_PRODUCER_ZERO_REVIEW_REQUIRED: hypothesis-handler$/u);
+    // 回执位置上是模型自写的字符串或数组：形状错误，同样是带类型的语义码。
+    for (const dispositionReview of ['review-1', ['review-1']]) {
+      expect(() =>
+        createStrictProducerExpressionSetV1({
+          ...hostOwned,
+          proposals: [],
+          zeroDisposition: { ...zeroRow.zeroDisposition, dispositionReview },
+        } as unknown as CreateStrictProducerExpressionSetInputV1)
+      ).toThrow(/^STRICT_PRODUCER_INPUT_SHAPE_INVALID: zeroDisposition\.dispositionReview$/u);
+    }
+  });
+
+  it('reports an unsealed contract-shaped zero disposition at G2 as a semantic reject, not an infrastructure fault (C029)', async () => {
+    const lineage = createProducerLineageFixture();
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      // 端口按宿主 reviewStrictProducerResult 的口径：把模型零处置行原样交给真实建集函数。
+      const port: StrictProductionRuntimePortV1 = {
+        enabled: true,
+        analysisLimits: { maxEpochs: 3, maxObligations: 3 },
+        expansionPort: createStrictAnalysisExpansionPortV1({
+          baselineScheduleHash: 'schedule-baseline',
+          baselineObligationIds: ['base-1'],
+          knownFactFamilies: [],
+          knownSubjectRefs: [],
+          obligationCap: 1,
+        }),
+        readAnalysisEpoch: () => {
+          throw new Error('G2 must not read the analysis epoch');
+        },
+        buildProducerInput: () => ({}),
+        validateAnalystResult: () => {
+          throw new Error('G2 must not call the Analyst gate');
+        },
+        reviewProducerResult: (source) => {
+          const row = source as { readonly proposals: []; readonly zeroDisposition: unknown };
+          createStrictProducerExpressionSetV1({
+            lineage,
+            parentSet: null,
+            proposals: row.proposals,
+            zeroDisposition: row.zeroDisposition,
+            modelHash: 'producer-model-v1',
+            reasonHash: 'reason-initial-strict-authoring',
+          } as unknown as CreateStrictProducerExpressionSetInputV1);
+          return { action: 'pass', pass: true };
+        },
+      };
+      const evaluator = buildStrictProductionPipelineStagesV1()[3].gate?.evaluator;
+      if (!evaluator) {
+        throw new Error('strict independent review stage has no gate evaluator');
+      }
+      const result = await evaluator(
+        { proposals: [], zeroDisposition: { reasonCode: 'no-durable-expression', authored } },
+        {},
+        { strictProduction: port }
+      );
+      expect(result).toMatchObject({
+        action: 'reject',
+        pass: false,
+        artifact: {
+          gate: 'G2',
+          classification: 'semantic-reject',
+          errorName: 'Error',
+          errorCode: 'STRICT_PRODUCER_ZERO_REVIEW_REQUIRED',
+        },
+      });
+      expect(warn).toHaveBeenCalledWith(
+        '[StrictProducer] zero disposition reached the producer without a sealed review',
+        expect.objectContaining({
+          component: 'createStrictProducerExpressionSetV1',
+          reason: 'producer-non-draft-review-not-sealed',
+          selectedPath: 'fail-closed',
+          hypothesisId: 'hypothesis-handler',
+          reviewType: 'undefined',
+        })
+      );
+      expect(warn).toHaveBeenCalledWith(
+        '[StrictProductionStages] strict gate exception converted to reject',
+        expect.objectContaining({ gate: 'G2', followUpCheck: 'strict-gate-semantic-code' })
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('keeps the fixture provider role marker and the proposal-only floor/filler guards', () => {

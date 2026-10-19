@@ -57,6 +57,12 @@ export interface StrictHypothesisDispositionV1 {
 export interface StrictFalsificationInputV1 {
   readonly hypothesisId: string;
   readonly enrolledCounterqueryIds: readonly string[];
+  /**
+   * 模型只提交 counterqueryId（必须等于 obligationId）、obligationId 与 counterexampleFactIds；
+   * executionReceipt 是宿主执行权威，validateStrictAnalystEpochV1 按 obligationId 从宿主覆盖过的
+   * population.executionReceipts 绑定，调用方传入的值一律丢弃（C028）。公开类型仍要求该字段，
+   * 拆成可选属于跨仓第二步的输入类型拆分。
+   */
   readonly executions: readonly CounterqueryExecutionV1[];
   readonly counterqueryApplicability: Omit<
     FalsificationReceiptV1['counterqueryApplicability'],
@@ -75,6 +81,8 @@ export interface StrictFalsificationInputV1 {
  *   hypothesisDispositions 中除审查回执以外的字段，形状由 StrictProductionPrompts 的内部输出
  *   契约渲染给模型；
  * - 宿主权威：population、knownFactIds、enrolledObligationIds，宿主用自身记录覆盖模型回传；
+ *   falsificationInputs[].executions[].executionReceipt 由 validateStrictAnalystEpochV1 从
+ *   population.executionReceipts 按 obligationId 绑定；
  * - 宿主封印：currentAnalysisFixpointHash、各 dispositionReview 与 dispositionReviews，由宿主经
  *   独立语义审查会话生成后注入，模型不能也不得产出。
  * 类型尚未拆成“提案/封印”两段（已批准的跨仓第二步）；在此之前宿主在调用
@@ -160,7 +168,7 @@ export function validateStrictAnalystEpochV1(
   const clusterSet = createStrictClusterSet(input, population);
   const inductions = createStrictInductions(input, population, clusterSet, facts);
   const hypotheses = indexStrictHypotheses(inductions);
-  const falsifications = createStrictFalsifications(input, hypotheses, facts);
+  const falsifications = createStrictFalsifications(input, hypotheses, facts, executionReceipts);
   const dispositionReviews = validateDispositionReviewConservation(
     input,
     population.populationHash
@@ -441,12 +449,21 @@ function indexStrictHypotheses(
 function createStrictFalsifications(
   input: StrictAnalystEpochInputV1,
   hypotheses: ReadonlyMap<string, HypothesisV1>,
-  facts: StrictAnalystFactAuthority
+  facts: StrictAnalystFactAuthority,
+  executionReceipts: readonly FactQueryExecutionReceiptV1[]
 ): FalsificationReceiptV1[] {
   const externallyEnrolled = new Set(
     normalizeIds(input.enrolledObligationIds, 'enrolledObligationIds')
   );
   const projectedApplicability = projectStrictCounterqueryApplicability(input.falsificationInputs);
+  // Core canonicalizeObservationPopulationV1 已保证权威回执按 obligationId 唯一且自洽。
+  const receiptsByObligation = new Map(
+    executionReceipts.map((receipt) => [receipt.obligationId, receipt] as const)
+  );
+  const replacedReceipts: StrictReplacedExecutionReceipts = {
+    hypothesisIds: new Set(),
+    obligationIds: new Set(),
+  };
   const receipts = input.falsificationInputs.map((candidate, candidateIndex) => {
     if (!hypotheses.has(candidate.hypothesisId)) {
       fail('STRICT_ANALYST_FALSIFICATION_HYPOTHESIS_UNKNOWN', candidate.hypothesisId);
@@ -465,6 +482,11 @@ function createStrictFalsifications(
     );
     return createFalsificationReceiptV1({
       ...candidate,
+      executions: bindStrictCounterqueryExecutionReceipts(
+        candidate,
+        receiptsByObligation,
+        replacedReceipts
+      ),
       counterqueryApplicability: {
         ...projectedApplicability[candidateIndex],
         reviewerReceiptId: candidate.dispositionReview.reviewReceiptId,
@@ -472,12 +494,84 @@ function createStrictFalsifications(
       currentAnalysisFixpointHash: input.currentAnalysisFixpointHash,
     });
   });
+  logStrictReplacedExecutionReceipts(replacedReceipts);
   assertSameIds(
     receipts.map((receipt) => receipt.hypothesisId),
     [...hypotheses.keys()],
     'STRICT_ANALYST_FALSIFICATION_CONSERVATION'
   );
   return receipts;
+}
+
+/** 回传了与权威不同回执的反查行，供一次性汇总诊断；只记 ID，不记回执内容。 */
+interface StrictReplacedExecutionReceipts {
+  readonly hypothesisIds: Set<string>;
+  readonly obligationIds: Set<string>;
+}
+
+/**
+ * 反查执行回执的权威绑定（C028）。执行回执是宿主执行权威：宿主在调用前用自己的执行记录覆盖
+ * population.executionReceipts，而模型可见的 canonical population 不带回执正文，回执又必带
+ * neverEmit 的 receiptHash，所以模型只给 counterqueryId/obligationId/counterexampleFactIds，
+ * 这里按 obligationId 绑定权威回执：
+ * - counterqueryId 必须与 obligationId 原值相等（Core 同样要求），否则以
+ *   STRICT_ANALYST_COUNTERQUERY_ID_MISMATCH 提前拒绝，让 G1 归为语义拒绝而不是无前缀 Core 码；
+ * - obligationId 在权威回执中不存在：STRICT_ANALYST_COUNTERQUERY_RECEIPT_MISSING，取代 Core 解引用
+ *   undefined 回执的无码 TypeError；
+ * - 模型回传的 executionReceipt 一律丢弃：与权威规范 JSON 相同（重建路径、合规抄写）时静默，
+ *   不同或残缺（如遵守 neverEmit 而缺 receiptHash）时记入 replaced，由调用方汇总记 warn。
+ * 合法输入（回执缺省或等于权威）绑定后与原输入逐字节相同，falsification receiptHash 与 epochHash
+ * 不变。重建时权威是 epoch.executionReceipts，被改写的回执在这里被换回，重建哈希随之对不上而失败关闭。
+ * 行形状（对象、counterexampleFactIds 为数组）已由 assertStrictAnalystInputShape 保证；登记、去重与
+ * 反例事实绑定仍由 Core normalizeFalsificationExecutions 裁决。
+ */
+function bindStrictCounterqueryExecutionReceipts(
+  candidate: StrictFalsificationInputV1,
+  receiptsByObligation: ReadonlyMap<string, FactQueryExecutionReceiptV1>,
+  replaced: StrictReplacedExecutionReceipts
+): CounterqueryExecutionV1[] {
+  return candidate.executions.map((execution): CounterqueryExecutionV1 => {
+    const obligationId: unknown = execution.obligationId;
+    if (execution.counterqueryId !== obligationId) {
+      fail('STRICT_ANALYST_COUNTERQUERY_ID_MISMATCH', candidate.hypothesisId);
+    }
+    const receipt =
+      typeof obligationId === 'string' ? receiptsByObligation.get(obligationId) : undefined;
+    if (!receipt) {
+      fail(
+        'STRICT_ANALYST_COUNTERQUERY_RECEIPT_MISSING',
+        `${candidate.hypothesisId} -> ${typeof obligationId === 'string' ? obligationId : `<${typeof obligationId}>`}`
+      );
+    }
+    const supplied: unknown = execution.executionReceipt;
+    if (supplied !== undefined && hashCanonical(supplied) !== hashCanonical(receipt)) {
+      replaced.hypothesisIds.add(candidate.hypothesisId);
+      replaced.obligationIds.add(receipt.obligationId);
+    }
+    return { ...execution, executionReceipt: receipt };
+  });
+}
+
+/** 模型回传的执行回执被权威替换时的汇总诊断；observeSafely 吞掉观察器异常，不影响绑定结果。 */
+function logStrictReplacedExecutionReceipts(replaced: StrictReplacedExecutionReceipts): void {
+  if (replaced.obligationIds.size === 0) {
+    return;
+  }
+  observeSafely(
+    () =>
+      Logger.getInstance().warn(
+        '[StrictAnalyst] supplied counterquery execution receipts replaced by population authority',
+        {
+          component: 'validateStrictAnalystEpochV1',
+          reason: 'execution-receipt-is-host-owned',
+          selectedPath: 'override-with-population-receipt',
+          hypothesisIds: [...replaced.hypothesisIds].sort(),
+          obligationIds: [...replaced.obligationIds].sort(),
+          followUpCheck: 'model-must-omit-executionReceipt-per-output-contract',
+        }
+      ),
+    () => undefined
+  );
 }
 
 function resolveStrictHypothesisDispositions(
