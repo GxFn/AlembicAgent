@@ -3925,6 +3925,187 @@ describe('terminal.exec budget, audit classification and input normalization (L4
     ).toBe(false);
   });
 
+  // L4-P12r3（C071）：宿主回报的 diagnostics 不合法时仍按 sandboxed=true / fallbackUsed=false 回落，
+  // 回落值与模型可见文本不变，但必须留下 terminal_executor_result_normalized 诊断和一条 warn，
+  // 诊断只写字段名与类型，不回显宿主给出的取值。
+  it.each([
+    {
+      label: 'string booleans',
+      diagnostics: {
+        sandboxed: 'false',
+        fallbackUsed: 'true',
+        degradeReason: 'seatbelt_unavailable',
+      },
+      expectedText: 'ok',
+      fields: ['diagnostics.sandboxed=string', 'diagnostics.fallbackUsed=string'],
+      echoed: ['diagnostics.sandboxed=false', 'diagnostics.fallbackUsed=true'],
+    },
+    {
+      label: 'non-string degradeReason with a valid unsandboxed report',
+      diagnostics: { sandboxed: false, fallbackUsed: true, degradeReason: 42 },
+      expectedText:
+        'ok\n\n[unsandboxed:unknown] sandboxed=false fallbackUsed=true degradeReason=none',
+      fields: ['diagnostics.degradeReason=number'],
+      echoed: ['42'],
+    },
+    {
+      label: 'distinctive field values',
+      diagnostics: { sandboxed: 'HOST-SECRET-VALUE', fallbackUsed: false },
+      expectedText: 'ok',
+      fields: ['diagnostics.sandboxed=string'],
+      echoed: ['HOST-SECRET-VALUE'],
+    },
+    {
+      label: 'string diagnostics',
+      diagnostics: 'unsandboxed',
+      expectedText: 'ok',
+      fields: ['diagnostics=string'],
+      echoed: ['unsandboxed'],
+    },
+    {
+      label: 'null diagnostics',
+      diagnostics: null,
+      expectedText: 'ok',
+      fields: ['diagnostics=null'],
+      echoed: [],
+    },
+  ])('reports malformed executor diagnostics without changing the fallback: $label', async ({
+    diagnostics,
+    expectedText,
+    fields,
+    echoed,
+  }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => ({ stdout: 'ok', stderr: '', exitCode: 0, diagnostics }))
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe(expectedText);
+      const normalized = (result._meta?.diagnosticWarnings ?? []).filter(
+        (w) => w.code === 'terminal_executor_result_normalized'
+      );
+      expect(normalized).toHaveLength(1);
+      const message = normalized[0]?.message ?? '';
+      for (const field of fields) {
+        expect(message).toContain(field);
+      }
+      for (const value of echoed) {
+        expect(message).not.toContain(value);
+      }
+      expect(message).toContain(
+        'malformed diagnostics fields default to sandboxed=true fallbackUsed=false'
+      );
+      expect(message).not.toContain('stdout=');
+      expect(message).not.toContain('exitCode=');
+      const lines = warn.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('terminal_executor_result_normalized'));
+      expect(lines).toHaveLength(1);
+      for (const field of fields) {
+        expect(lines[0]).toContain(field);
+      }
+      for (const value of echoed) {
+        expect(lines[0]).not.toContain(value);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    { label: 'no diagnostics', reply: { stdout: 'ok', stderr: '', exitCode: 0 } },
+    {
+      label: 'valid sandboxed diagnostics',
+      reply: {
+        stdout: 'ok',
+        stderr: '',
+        exitCode: 0,
+        diagnostics: { sandboxed: true, fallbackUsed: false },
+      },
+    },
+    {
+      label: 'valid unsandboxed diagnostics',
+      reply: {
+        stdout: 'ok',
+        stderr: '',
+        exitCode: 0,
+        diagnostics: {
+          sandboxed: false,
+          fallbackUsed: true,
+          degradeReason: 'seatbelt_unavailable',
+        },
+      },
+    },
+    {
+      label: 'partial diagnostics with undefined fields',
+      reply: {
+        stdout: 'ok',
+        stderr: '',
+        exitCode: 0,
+        diagnostics: { sandboxed: true, degradeReason: undefined },
+      },
+    },
+  ])('keeps well-formed or absent executor diagnostics silent: $label', async ({ reply }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => reply)
+      );
+      expect(result.ok).toBe(true);
+      expect(
+        result._meta?.diagnosticWarnings?.some(
+          (w) => w.code === 'terminal_executor_result_normalized'
+        ) ?? false
+      ).toBe(false);
+      expect(
+        warn.mock.calls.some((args) =>
+          String(args[0]).includes('terminal_executor_result_normalized')
+        )
+      ).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('merges malformed diagnostics with other malformed executor fields in one warning', async () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => ({
+          stdout: 7,
+          stderr: '',
+          exitCode: 0,
+          diagnostics: { sandboxed: 'false', fallbackUsed: 'true' },
+        }))
+      );
+      const normalized = (result._meta?.diagnosticWarnings ?? []).filter(
+        (w) => w.code === 'terminal_executor_result_normalized'
+      );
+      expect(normalized).toHaveLength(1);
+      expect(normalized[0]?.message).toContain(
+        'stdout=number diagnostics.sandboxed=string diagnostics.fallbackUsed=string'
+      );
+      expect(normalized[0]?.message).toContain('missing output treated as empty');
+      expect(
+        warn.mock.calls.filter((args) =>
+          String(args[0]).includes('terminal_executor_result_normalized')
+        )
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('surfaces a compressor failure as a diagnostic and keeps the cleaned output', async () => {
     const warn = vi
       .spyOn(Logger.getInstance(), 'warn')

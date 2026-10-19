@@ -524,6 +524,9 @@ async function execInSandboxOrDirect(
 function normalizeExecutorResult(raw: unknown): TerminalExecutionResult {
   const sandboxFallback: TerminalExecutionDiagnostics = { sandboxed: true, fallbackUsed: false };
   const issues: string[] = [];
+  // diagnostics 的问题单独收集：它们的回落规则（取 sandboxFallback 的对应字段）与输出/退出码不同，
+  // 诊断消息要按实际发生的回落写说明，不能让只坏了 diagnostics 的结果读成“输出被清空、退出码记 1”。
+  const diagnosticIssues: string[] = [];
   let stdout = '';
   let stderr = '';
   let exitCode = 1;
@@ -544,16 +547,24 @@ function normalizeExecutorResult(raw: unknown): TerminalExecutionResult {
     } else {
       issues.push(`exitCode=${describeType(raw.exitCode)}`);
     }
-    diagnostics = normalizeTerminalDiagnostics(raw.diagnostics, sandboxFallback);
+    diagnostics = normalizeTerminalDiagnostics(raw.diagnostics, sandboxFallback, diagnosticIssues);
   } else {
     issues.push(`result=${describeType(raw)}`);
   }
-  if (issues.length === 0) {
+  if (issues.length === 0 && diagnosticIssues.length === 0) {
     return { stdout, stderr, exitCode, diagnostics, warnings: [] };
   }
+  const fallbackNotes = [
+    ...(issues.length > 0
+      ? ['missing output treated as empty, non-integer exitCode treated as 1']
+      : []),
+    ...(diagnosticIssues.length > 0
+      ? ['malformed diagnostics fields default to sandboxed=true fallbackUsed=false']
+      : []),
+  ];
   const message =
-    `sandbox executor returned malformed fields: ${issues.join(' ')}; ` +
-    'missing output treated as empty, non-integer exitCode treated as 1';
+    `sandbox executor returned malformed fields: ${[...issues, ...diagnosticIssues].join(' ')}; ` +
+    fallbackNotes.join('; ');
   observeSafely(
     () =>
       Logger.getInstance().warn(
@@ -779,13 +790,34 @@ function terminalDiagnosticSuffix(diagnostics: TerminalExecutionDiagnostics): st
   return `\n\n[unsandboxed:${reason}] ${formatTerminalDiagnostic(diagnostics)}`;
 }
 
-/** 宿主执行器回报的 diagnostics 逐字段校验；不是对象或字段类型不符时取 fallback 的对应值。 */
+/**
+ * 宿主执行器回报的 diagnostics 逐字段校验；不是对象或字段类型不符时取 fallback 的对应值。
+ * 回落值本身不变，但每次回落都把“字段名=类型”写进 issues（不回显取值），由调用方合进
+ * terminal_executor_result_normalized 诊断与 warn：宿主若把 sandboxed:false 写成字符串，
+ * 结果会被当成沙箱内执行，这条回落必须可见。
+ * undefined（整体缺失或字段缺失）视为宿主未报告，保持静默：旧宿主和多数执行器不回报 diagnostics。
+ */
 function normalizeTerminalDiagnostics(
   diagnostics: unknown,
-  fallback: TerminalExecutionDiagnostics
+  fallback: TerminalExecutionDiagnostics,
+  issues: string[]
 ): TerminalExecutionDiagnostics {
-  if (!isRecord(diagnostics)) {
+  if (diagnostics === undefined) {
     return fallback;
+  }
+  if (!isRecord(diagnostics)) {
+    issues.push(`diagnostics=${describeType(diagnostics)}`);
+    return fallback;
+  }
+  for (const [field, expected] of [
+    ['sandboxed', 'boolean'],
+    ['fallbackUsed', 'boolean'],
+    ['degradeReason', 'string'],
+  ] as const) {
+    const value = diagnostics[field];
+    if (value !== undefined && typeof value !== expected) {
+      issues.push(`diagnostics.${field}=${describeType(value)}`);
+    }
   }
   return {
     sandboxed:
