@@ -15,6 +15,11 @@
  */
 
 import { RECIPE_PRODUCTION_PROFILE_PROMPT } from '../../tools/runtime/recipeProductionContract.js';
+// L4-P30r3（I44 / C023）：证据自救说明的单一文本源在 scan_production 能力旁（与其 allowlist 同处维护）。
+// 扫描 Produce 阶段的 producePrompt 会作为 systemPromptOverride 整体替换 SystemPromptBuilder.build()，
+// 能力 promptFragment 送不到模型，所以必须在这里拼进两个 producePrompt。只导入、不再导出：本文件经
+// prompts/index.ts 的 export * 上公开名集，不能借道把该常量带上去。
+import { SCAN_EVIDENCE_RESCUE_PROMPT } from '../../tools/runtime/toolsets/ScanProduce.js';
 import {
   PRODUCER_SUBMIT_FIELD_CONTRACT,
   PRODUCER_SUBMIT_HARD_GATES,
@@ -74,7 +79,7 @@ content.markdown 字段必须是「项目特写」：
 
 ## 关键规则
 - 已确认结构化发现才是候选义务；不要从 Markdown 段落新增主题或按段凑数量
-- 本扫描阶段可用 code.read 读取已定位文件；不新增代码搜索、图谱或终端探索。evidence.get/search 只读已采证据台账、不算探索：提交被拒时用 evidence.search 查条目 id、evidence.get 取 verbatim 原文，修正 evidenceRefs 后重提
+- 本扫描阶段可用 code.read 读取已定位文件；不新增代码搜索、图谱或终端探索。证据台账只读取回不算探索，提交被拒时按下方「扫描生产证据自救通道」修正引用后重提
 - 台账在场时 params.reasoning.evidenceRefs 必填，使用真实 E-id；无台账按当前 schema 提供真实来源，禁止只写文件名
 - content.markdown 中的来源标注必须使用完整相对路径: (来源: Full/Path/FileName.ext:行号)
 - 如果分析提到了 3 个模式，就应该提交 3 个候选，不要合并
@@ -84,6 +89,8 @@ content.markdown 字段必须是「项目特写」：
 容错规则:
 - 证据不足时只用 code.read 补读 Analyst 已定位的文件；无法核实则列为 blocker，不编造来源，也不尝试路径变体。
 - 失败或未核实的发现不能变成已确认候选；保留已成功提交的实际回执。
+
+${SCAN_EVIDENCE_RESCUE_PROMPT}
 
 ${SCAN_SUBMIT_CONTRACT}
 
@@ -124,6 +131,8 @@ ${RECIPE_PRODUCTION_PROFILE_PROMPT}`,
 - 来源必须指向项目内真实文件并带行区间（reasoning.sources / (来源: …) 写 path:起行-止行）；找不到真实文件来源时不编造路径，列为 blocker
 - 必填字段以下方 knowledge.submit 字段合同为准（含 whenClause、dontClause、content.rationale）
 - content.markdown 应包含代码块，展示核心实现
+
+${SCAN_EVIDENCE_RESCUE_PROMPT}
 
 ${SCAN_SUBMIT_CONTRACT}
 

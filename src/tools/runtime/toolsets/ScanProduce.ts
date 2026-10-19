@@ -12,8 +12,15 @@ import { RuntimeCapability } from './RuntimeCapability.js';
  * 拒绝里会要求模型用 memory.recall、evidence.search 或 code.read 修正引用。这段说明与
  * allowedTools 必须指向同一组可调用动作；test/tool-runtime-contract.test.ts 的 L4-P30
  * 守护用例会从真实拒绝文本中提取 tool.action 并逐一核对本能力的 allowlist。
+ *
+ * 送达路径（L4-P30r3 / C023）：扫描 Produce 阶段恒带非空 systemPrompt（stageBuilders 的
+ * produce.systemPrompt），PipelineStrategy 把它作为 systemPromptOverride 交给 AgentRuntime，
+ * `override || SystemPromptBuilder.build()` 让下面的 promptFragment 在生产路径上整段不参与。
+ * 因此本常量是单一文本源：agent/prompts/scanPrompts.ts 把它拼进 extract 与 summarize 两个
+ * producePrompt，才真正送到模型；promptFragment 仍保留它，只服务不带 override 的 build() 路径。
+ * 只在模块内具名导出：toolsets/index.ts 与 tools/runtime/index.ts 按名只再导出类，不进入公开出口。
  */
-const SCAN_EVIDENCE_RESCUE_PROMPT = `## 扫描生产证据自救通道
+export const SCAN_EVIDENCE_RESCUE_PROMPT = `## 扫描生产证据自救通道
 - 提交被拒（EVIDENCE_REFS_REQUIRED / INSUFFICIENT_EVIDENCE / SOURCE_REF_NOT_FOUND）时：先 memory.recall 查看 findings 携带的 [E-x]，或用 evidence.search 按文件路径片段/关键词查已采条目 id，再以 reasoning.evidenceRefs 引用后重提；需要 verbatim 原文时用 evidence.get 取回（支持 "E-3@start-end" 子区间）。
 - EVIDENCE_STALE（引用条目采集后文件已变更）：对该已定位文件用 code.read 重读生成新条目，或用 evidence.search 找到更新的条目，再以新条目 id 提交。
 - evidence.get/search 只读已采证据台账，不算新探索，也不访问文件系统；不要借它们新增 findings 之外的主题。

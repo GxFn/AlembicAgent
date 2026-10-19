@@ -18,11 +18,16 @@ import { EvidenceCollector } from '../src/agent/evidence/EvidenceCollector.js';
 import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import type { SessionStore } from '../src/agent/memory/SessionStore.js';
+import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
+import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
+import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
+import { DiagnosticsCollector } from '../src/agent/runtime/index.js';
 import type {
   ToolMetadata,
   ToolPipelineContext,
 } from '../src/agent/runtime/toolPipeline/contracts.js';
 import { executeRuntimeToolCall } from '../src/agent/runtime/toolPipeline/runtimeBridge.js';
+import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import { estimateTokens as estimateSharedTokens } from '../src/shared/tokenUtils.js';
 import {
@@ -50,6 +55,7 @@ import {
   estimateTokens as estimateToolTokens,
   fail as failToolResult,
   ok as okToolResult,
+  RuntimeCapabilityCatalog,
   SearchCache,
   ToolRouter,
   ToolRouterAdapter,
@@ -4826,20 +4832,91 @@ describe('L4-P30 scan_production evidence self-rescue channel (I44)', () => {
     expect(strict.promptFragment).not.toContain('evidence');
   });
 
-  it('describes the read-only evidence self-rescue channel in the scan producer capability prompt', () => {
-    const capability = new ScanProduce();
-    const fragment = capability.promptFragment;
-    expect(fragment).toContain('evidence.search');
-    expect(fragment).toContain('evidence.get');
-    expect(fragment).toContain('EVIDENCE_STALE');
-    // 自动生成的权限清单与说明读同一份 allowlist。
-    expect(fragment).toContain('- **evidence**: get(');
-    // 能力提示自身点名的动作也必须可调用，避免说明与 allowlist 再次漂移。
-    const notAdmitted = mentionedToolActions(fragment).filter((ref) => {
+  // L4-P30r3（I44 / C023）：自救说明必须送达模型，而不是只写在能力 promptFragment 上。
+  // 扫描 Produce 阶段恒带非空 systemPrompt（stageBuilders produce.systemPrompt =
+  // SCAN_TASK_CONFIGS[task].producePrompt）；PipelineStrategy 把它作为 systemPromptOverride 交给
+  // AgentRuntime，`systemPromptOverride || promptBuilder.build(caps)` 使 SystemPromptBuilder.build()
+  // 整段不执行，ScanProduce.promptFragment 在这条生产路径上送不到模型。只断言 promptFragment 的旧用例
+  // 因此是自证，这里改从出厂阶段工厂取真实 produce 阶段，并经真实 PipelineStrategy + AgentRuntime 截获模型输入。
+  const RESCUE_HEADING = '## 扫描生产证据自救通道';
+
+  function shippedScanProduceStage(task: 'extract' | 'summarize'): Record<string, unknown> & {
+    name: string;
+  } {
+    const stages = new AgentStageFactoryRegistry().build('scanPipeline', {
+      params: { task },
+    }) as Array<Record<string, unknown> & { name: string }>;
+    const produce = stages.find((stage) => stage.name === 'produce');
+    if (!produce) {
+      throw new Error(`scanPipeline(${task}) has no produce stage`);
+    }
+    return produce;
+  }
+
+  it.each([
+    'extract',
+    'summarize',
+  ] as const)('delivers the evidence self-rescue channel in the shipped %s scan produce stage system prompt', (task) => {
+    const produce = shippedScanProduceStage(task);
+    expect(produce.capabilities).toEqual(['scan_production']);
+    const systemPrompt = produce.systemPrompt;
+    // 非空 systemPrompt 正是 override 生效、能力片段被整体替换的前提。
+    if (typeof systemPrompt !== 'string' || systemPrompt.trim().length === 0) {
+      throw new Error(`scanPipeline(${task}) produce stage lacks a systemPrompt`);
+    }
+    expect(systemPrompt).toContain(RESCUE_HEADING);
+    expect(systemPrompt).toContain('evidence.search');
+    expect(systemPrompt).toContain('evidence.get');
+    expect(systemPrompt).toContain('EVIDENCE_STALE');
+    // 说明只出现一次：不与能力片段或旧的单行说明重复拼接。
+    expect(systemPrompt.split(RESCUE_HEADING)).toHaveLength(2);
+    // 阶段提示点名的动作必须都在 scan_production 的 allowlist 内，避免说明与准入再次漂移。
+    const allowedTools = new ScanProduce().allowedTools;
+    const mentioned = mentionedToolActions(systemPrompt);
+    expect(mentioned).toEqual(
+      expect.arrayContaining(['code.read', 'evidence.get', 'evidence.search', 'memory.recall'])
+    );
+    const notAdmitted = mentioned.filter((ref) => {
       const [tool, action] = ref.split('.');
-      return !isToolActionAllowed(capability.allowedTools, tool, action);
+      return !isToolActionAllowed(allowedTools, tool, action);
     });
     expect(notAdmitted).toEqual([]);
+  });
+
+  it('hands the shipped scan produce stage prompt to the model through PipelineStrategy and AgentRuntime', async () => {
+    const logger = Logger.getInstance();
+    vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const produce = shippedScanProduceStage('summarize');
+    const chatWithTools = vi.fn(async () => ({ text: '没有已确认的结构化发现需要提交。' }));
+    const catalog = new RuntimeCapabilityCatalog();
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'mock', model: 'mock', chatWithTools } as never,
+      toolRegistry: catalog,
+      container: { get: () => catalog },
+      toolRouter: new ToolRouterAdapter({
+        contextFactory: { create: () => ({ projectRoot: baseRoot, tokenBudget: 4000 }) },
+      }),
+      capabilities: [],
+      strategy: { name: 'unused', execute: vi.fn() } as never,
+    });
+    const strategy = new PipelineStrategy({ stages: [produce] });
+
+    await strategy.execute(runtime, AgentMessage.internal('summarize lib/alpha.ts'), {
+      strategyContext: { diagnostics: new DiagnosticsCollector() },
+    });
+
+    expect(chatWithTools).toHaveBeenCalled();
+    const [, options] = chatWithTools.mock.calls[0] as unknown as [
+      string,
+      { systemPrompt: string },
+    ];
+    // 模型真正收到的系统提示以出厂阶段提示开头，并带自救说明（恰好一次）。
+    expect(options.systemPrompt.startsWith(String(produce.systemPrompt))).toBe(true);
+    expect(options.systemPrompt).toContain(RESCUE_HEADING);
+    expect(options.systemPrompt).toContain('evidence.search');
+    expect(options.systemPrompt).toContain('evidence.get');
+    expect(options.systemPrompt.split(RESCUE_HEADING)).toHaveLength(2);
   });
 });
 
