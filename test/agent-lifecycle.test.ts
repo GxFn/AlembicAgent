@@ -1159,7 +1159,10 @@ describe('Agent service lifecycle', () => {
       const result = await pending;
       expect(attempts).toBe(retry ? 2 : 1);
       expect(result.status).toBe(retry ? 'success' : 'timeout');
-      expect(result.diagnostics?.timedOutStages).toEqual(['produce']);
+      // L5-P33r3b：fast retry 覆盖了最终回执 → 出口把历史超时移到 recoveredTimedOutStages；
+      // 未重试时最终回执仍超时，timedOutStages 原样保留(宿主 producer 超时救回路径不变)。
+      expect(result.diagnostics?.timedOutStages).toEqual(retry ? [] : ['produce']);
+      expect(result.diagnostics?.recoveredTimedOutStages).toEqual(retry ? ['produce'] : undefined);
     } finally {
       vi.useRealTimers();
     }
@@ -1769,6 +1772,28 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     (diagnostics?.warnings ?? []) as Warning[];
   const timeoutTerminalWarnings = (diagnostics: { warnings?: unknown[] } | undefined) =>
     warningsOf(diagnostics).filter((warning) => warning.code === 'pipeline_timeout_terminal');
+  // ── 宿主判定的内联等价物(L5-P33r3b / C026)：只读对照 Alembic
+  // lib/recipe-pipeline/generate/execution/AgentRunProjections.ts，不 import 宿主代码。
+  // resolveGenerateDimensionRunIssue 的超时分支：status==='timeout'、cancelReason==='stage_timeout'
+  // 或 timedOutStages 非空 → runIssue=timeout；isRecoverableProducerTimeoutIssue 只在 timedOutStages
+  // 为空或含 'produce'、且 produce 回执里有持久化提交时救回。不救回时 DimensionResultConsumer
+  // 计 0 有效候选——这正是 I05 的端到端症状。
+  const RECOVERED_LOG = 'timeout_recovered_by_rerun';
+  const hostTimeoutIssue = (result: AgentRunResult) =>
+    result.status === 'timeout' ||
+    result.diagnostics?.efficiency?.cancelReason === 'stage_timeout' ||
+    (result.diagnostics?.timedOutStages?.length ?? 0) > 0;
+  const hostProducerTimeoutRecoverable = (result: AgentRunResult) => {
+    const timedOutStages = result.diagnostics?.timedOutStages ?? [];
+    const produce = (result.phases as Record<string, { toolCalls?: unknown[] }> | undefined)
+      ?.produce;
+    const successCount = (produce?.toolCalls ?? []).filter(isPersistedSubmission).length;
+    return (
+      hostTimeoutIssue(result) &&
+      successCount > 0 &&
+      (timedOutStages.length === 0 || timedOutStages.includes('produce'))
+    );
+  };
   const timedOutAnalyze = {
     reply: 'partial analysis text written before the 480s soft timeout',
     toolCalls: [{ tool: 'read', args: { path: 'src/a.ts' }, result: 'contents' }],
@@ -1777,8 +1802,17 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     timedOut: true,
   };
 
-  /** 按 pipelinePhase 回放：首轮 analyze 超时；recoverOnRetry 时重跑成功，否则每次都超时。 */
-  function timeoutRuntime(options: { recoverOnRetry?: boolean; analyzeInputTokens?: number } = {}) {
+  /**
+   * 按 pipelinePhase 回放：首轮 analyze 超时；recoverOnRetry 时重跑成功，否则每次都超时。
+   * produceOutput 覆盖 produce 阶段回执(用于放入持久化 knowledge.submit，复现宿主计数场景)。
+   */
+  function timeoutRuntime(
+    options: {
+      recoverOnRetry?: boolean;
+      analyzeInputTokens?: number;
+      produceOutput?: Record<string, unknown>;
+    } = {}
+  ) {
     const phases: string[] = [];
     let analyzeRuns = 0;
     const runtime = {
@@ -1798,6 +1832,9 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
             ...stageOutput('complete analysis after a full re-run'),
             toolCalls: [{ tool: 'read', args: { path: 'src/b.ts' }, result: 'contents' }],
           };
+        }
+        if (phase === 'produce' && options.produceOutput) {
+          return { ...stageOutput(`${phase} output`), ...options.produceOutput };
         }
         return stageOutput(`${phase} output`);
       }),
@@ -1893,9 +1930,11 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
       stage: 'quality_gate',
       action: 'timeout_terminal',
     });
-    // AgentService 不改：最终回执超时且未恢复 → timeout(与宿主 AgentRunProjections 判定一致)。
+    // 最终回执超时且未恢复 → timeout；出口不搬移(L5-P33r3b 只搬移已恢复的超时)，
+    // timedOutStages 原样保留，宿主 AgentRunProjections 同样判 timeout。
     expect(result.status).toBe('timeout');
     expect(result.diagnostics?.timedOutStages).toEqual(['analyze']);
+    expect(result.diagnostics?.recoveredTimedOutStages).toBeUndefined();
     const terminal = timeoutTerminalWarnings(result.diagnostics);
     expect(terminal).toHaveLength(1);
     expect(terminal[0].stage).toBe('quality_gate');
@@ -1962,8 +2001,10 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     expect(retryReasons).toHaveLength(1);
     expect(retryReasons[0]).toMatch(/timed out/i);
     expect(retryReasons[0]).toContain(action);
-    // 历史超时保留在 timedOutStages；最终回执已覆盖 → AgentService 判已恢复。
-    expect(result.diagnostics?.timedOutStages).toEqual(['analyze']);
+    // 最终回执已覆盖 → AgentService 判已恢复，并在出口把历史超时移到 recoveredTimedOutStages
+    // (L5-P33r3b)：timedOutStages 只剩未恢复的超时，宿主不再据此判 timeout。
+    expect(result.diagnostics?.timedOutStages).toEqual([]);
+    expect(result.diagnostics?.recoveredTimedOutStages).toEqual(['analyze']);
     expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
     expect(result.status).toBe('success');
     expect(result.reply).toBe('produce output');
@@ -2300,9 +2341,15 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     expect(resultPhases._pipelineOutcome.action).toBeUndefined();
     expect(result.diagnostics?.gateFailures ?? []).toEqual([]);
     expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
-    // AgentService 不改：最终回执超时 → timeout；宿主据 timedOutStages=['produce'] + 2 条持久化提交判可救回。
+    // 最终回执超时(未恢复) → timeout；出口不搬移：宿主据 timedOutStages=['produce'] + 2 条持久化
+    // 提交判可救回。cancelReason 与 timedOutStages 原样保留，不写 recoveredTimedOutStages。
     expect(result.status).toBe('timeout');
     expect(result.diagnostics?.timedOutStages).toEqual(['produce']);
+    expect(result.diagnostics?.recoveredTimedOutStages).toBeUndefined();
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('stage_timeout');
+    expect(hostTimeoutIssue(result)).toBe(true);
+    expect(hostProducerTimeoutRecoverable(result)).toBe(true);
+    expect(infoLog.mock.calls.some((call) => String(call[0]).includes(RECOVERED_LOG))).toBe(false);
     // 分叉留痕：日志能看出是 producer 超时、规则未套用、以及回执里的持久化提交数。
     expect(
       infoLog.mock.calls.some((call) => {
@@ -2357,8 +2404,11 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
     ]);
     expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(0);
     expect(resultPhases._pipelineOutcome).toMatchObject({ outcome: 'completed' });
-    // 历史超时保留在 timedOutStages；最终回执已被成功重跑覆盖 → AgentService 判已恢复。
-    expect(result.diagnostics?.timedOutStages).toEqual(['produce']);
+    // 最终回执已被成功重跑覆盖 → AgentService 判已恢复。出口按最终回执判定(不区分重跑机制)，
+    // 拒绝重试恢复的 produce 超时同样移到 recoveredTimedOutStages，宿主按正常完成计数。
+    expect(result.diagnostics?.timedOutStages).toEqual([]);
+    expect(result.diagnostics?.recoveredTimedOutStages).toEqual(['produce']);
+    expect(hostTimeoutIssue(result)).toBe(false);
     expect(result.status).toBe('success');
   });
 
@@ -2386,6 +2436,223 @@ describe('PipelineStrategy — 超时阶段救回语义统一(I05)', () => {
         return text.includes('producer stage') && text.includes('finalize');
       })
     ).toBe(true);
+  });
+
+  // ── L5-P33r3b(C026，用户决定 2026-10-19 “Agent 出口修”)：已由重跑恢复的超时不再作为宿主判定依据 ──
+  // 方案 A 让 analysis_retry 整段重跑成为唯一恢复路径，但 attempt/ExitController/merge 只追加
+  // timedOutStages 与 cancelReason='stage_timeout'。重跑成功、produce 持久化候选后 Agent 判 success，
+  // 宿主却因 timedOutStages=['analyze'] 判 timeout 且不可救回(不含 produce)，计 0 有效候选。
+  // 出口修：AgentService 在 recoveredTimeouts 成立时把历史超时移到 recoveredTimedOutStages(审计)，
+  // 清掉派生的 stage_timeout/abort_signal cancelReason，并记 timeout_recovered_by_rerun 日志。
+  it.each([
+    'pass',
+    'summary_rewrite',
+    'record_repair',
+  ])('门动作 %s → analysis_retry 重跑成功且 produce 持久化 2 条候选：出口 timedOutStages=[]、recoveredTimedOutStages=[analyze]、cancelReason 清除，宿主等价判定无 runIssue', async (action) => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime({
+      recoverOnRetry: true,
+      produceOutput: {
+        reply: 'producer summary',
+        toolCalls: [persistedSubmit('cand-1'), persistedSubmit('cand-2')],
+      },
+    });
+    const evaluator = vi
+      .fn()
+      .mockReturnValueOnce({
+        action,
+        pass: action === 'pass',
+        reason: action === 'pass' ? undefined : 'gate wants a cheap repair',
+        artifact: { findings: [{ finding: 'f1' }] },
+      })
+      .mockReturnValue({ action: 'pass', pass: true });
+    const strategy = new PipelineStrategy({
+      stages: insightLikeStages(evaluator, { maxRetries: 1 }),
+    });
+
+    const result = await serviceFor(strategy, runtime).run({
+      profile: { preset: 'insight' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    expect(phases).toEqual(['analyze', 'analyze', 'produce']);
+    const resultPhases = result.phases as Record<string, Record<string, unknown>>;
+    expect(resultPhases._pipelineOutcome).toEqual({ outcome: 'completed' });
+    expect(
+      (resultPhases.produce.toolCalls as unknown[]).filter(isPersistedSubmission)
+    ).toHaveLength(2);
+    expect(result.status).toBe('success');
+    expect(result.diagnostics?.timedOutStages).toEqual([]);
+    expect(result.diagnostics?.recoveredTimedOutStages).toEqual(['analyze']);
+    expect(['stage_timeout', 'abort_signal']).not.toContain(
+      result.diagnostics?.efficiency?.cancelReason
+    );
+    // 宿主等价判定：不再落入 timeout 分支，也就不需要 producer 超时救回，按正常完成计候选。
+    expect(hostTimeoutIssue(result)).toBe(false);
+    // 分叉留痕：日志能看出触发阶段、最终回执状态与被清除的 cancelReason。
+    const recoveredLog = infoLog.mock.calls.find((call) => String(call[0]).includes(RECOVERED_LOG));
+    expect(recoveredLog).toBeDefined();
+    expect(String(recoveredLog?.[0])).toContain('analyze');
+    expect(recoveredLog?.[1]).toMatchObject({
+      code: RECOVERED_LOG,
+      recoveredTimedOutStages: ['analyze'],
+      clearedCancelReason: 'stage_timeout',
+      finalReceipts: [expect.objectContaining({ stage: 'analyze', timedOut: false })],
+    });
+  });
+
+  it('对照一：重跑仍超时 → pipeline_timeout_terminal 终态，出口不搬移：timedOutStages=[analyze]、cancelReason=stage_timeout、无 recoveredTimedOutStages', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const { runtime, phases } = timeoutRuntime({ recoverOnRetry: false });
+    const evaluator = vi.fn(() => ({ action: 'pass', pass: true }));
+    const result = await serviceFor(
+      new PipelineStrategy({ stages: insightLikeStages(evaluator, { maxRetries: 1 }) }),
+      runtime
+    ).run({
+      profile: { preset: 'insight' },
+      message: { content: 'mine' },
+      context: { source: 'internal' },
+    });
+
+    expect(phases).toEqual(['analyze', 'analyze']);
+    expect((result.phases as Record<string, unknown>)._pipelineOutcome).toMatchObject({
+      outcome: 'failed',
+      action: 'timeout_terminal',
+    });
+    expect(timeoutTerminalWarnings(result.diagnostics)).toHaveLength(1);
+    expect(result.status).toBe('timeout');
+    expect(result.diagnostics?.timedOutStages).toEqual(['analyze']);
+    expect(result.diagnostics?.recoveredTimedOutStages).toBeUndefined();
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('stage_timeout');
+    expect(hostTimeoutIssue(result)).toBe(true);
+    expect(infoLog.mock.calls.some((call) => String(call[0]).includes(RECOVERED_LOG))).toBe(false);
+  });
+});
+
+// ─── L5-P33r3b：AgentService 出口的恢复超时搬移规则(直接 mock runtime 回执) ───
+// recoveredTimeouts 与 inferRunStatus 共用同一判定：outcome=completed，且每个超时阶段的最终回执
+// timedOut!==true、reply 非空。只有全部恢复才搬移；部分恢复、非管线 run、未完成管线都原样透传。
+describe('AgentService — 已恢复超时出口搬移(L5-P33r3b)', () => {
+  const RECOVERED_LOG_CODE = 'timeout_recovered_by_rerun';
+  function serviceReturning(result: Record<string, unknown>) {
+    return new AgentService({
+      runtimeBuilder: {
+        build: () => ({ id: 'recovered-timeout-exit', execute: async () => result as never }),
+      },
+    });
+  }
+  const runInput = {
+    profile: { preset: 'chat' },
+    message: { content: 'mine' },
+    context: { source: 'internal' as const },
+  };
+  function diagnosticsWith(timedOutStages: string[], cancelReason?: string) {
+    const base = new DiagnosticsCollector().toJSON();
+    return {
+      ...base,
+      timedOutStages,
+      efficiency: {
+        ...base.efficiency,
+        ...(cancelReason ? { cancelReason } : {}),
+      },
+    };
+  }
+
+  it.each([
+    'stage_timeout',
+    'abort_signal',
+  ])('全部恢复时清除派生 cancelReason=%s，且只改返回副本、不回写 runtime 的诊断对象', async (cancelReason) => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const diagnostics = diagnosticsWith(['analyze'], cancelReason);
+    const result = await serviceReturning({
+      reply: 'done',
+      phases: { analyze: { reply: 'final analysis' }, _pipelineOutcome: { outcome: 'completed' } },
+      diagnostics,
+    }).run(runInput);
+
+    expect(result.status).toBe('success');
+    expect(result.diagnostics?.timedOutStages).toEqual([]);
+    expect(result.diagnostics?.recoveredTimedOutStages).toEqual(['analyze']);
+    expect(result.diagnostics?.efficiency).not.toHaveProperty('cancelReason');
+    // runtime 持有的快照不变(宿主或策略可能复用该对象)。
+    expect(diagnostics.timedOutStages).toEqual(['analyze']);
+    expect(diagnostics.efficiency.cancelReason).toBe(cancelReason);
+    expect(diagnostics).not.toHaveProperty('recoveredTimedOutStages');
+  });
+
+  it('全部恢复但 cancelReason 不是超时派生(stage_aborted) → 搬移超时阶段，cancelReason 原样保留', async () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const result = await serviceReturning({
+      reply: 'done',
+      phases: { analyze: { reply: 'final analysis' }, _pipelineOutcome: { outcome: 'completed' } },
+      diagnostics: diagnosticsWith(['analyze'], 'stage_aborted'),
+    }).run(runInput);
+
+    // 状态口径不变：非超时 cancelReason 仍按既有规则归 error。
+    expect(result.status).toBe('error');
+    expect(result.diagnostics?.timedOutStages).toEqual([]);
+    expect(result.diagnostics?.recoveredTimedOutStages).toEqual(['analyze']);
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('stage_aborted');
+  });
+
+  it.each([
+    {
+      name: '部分恢复(produce 最终回执仍超时)',
+      phases: {
+        analyze: { reply: 'final analysis' },
+        produce: { reply: 'partial', timedOut: true },
+        _pipelineOutcome: { outcome: 'completed' },
+      },
+      timedOutStages: ['analyze', 'produce'],
+    },
+    {
+      name: '超时阶段最终回执为空文本',
+      phases: { analyze: { reply: '   ' }, _pipelineOutcome: { outcome: 'completed' } },
+      timedOutStages: ['analyze'],
+    },
+    {
+      name: '管线未完成(outcome=failed)',
+      phases: { analyze: { reply: 'final analysis' }, _pipelineOutcome: { outcome: 'failed' } },
+      timedOutStages: ['analyze'],
+    },
+    {
+      name: '非管线 run(没有 _pipelineOutcome)',
+      phases: undefined,
+      timedOutStages: ['react_loop'],
+    },
+  ])('$name → 不搬移：timedOutStages 与 cancelReason 原样透传、status=timeout', async ({
+    phases,
+    timedOutStages,
+  }) => {
+    const infoLog = vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const result = await serviceReturning({
+      reply: 'done',
+      phases,
+      diagnostics: diagnosticsWith(timedOutStages, 'stage_timeout'),
+    }).run(runInput);
+
+    expect(result.status).toBe('timeout');
+    expect(result.diagnostics?.timedOutStages).toEqual(timedOutStages);
+    expect(result.diagnostics?.recoveredTimedOutStages).toBeUndefined();
+    expect(result.diagnostics?.efficiency?.cancelReason).toBe('stage_timeout');
+    expect(infoLog.mock.calls.some((call) => String(call[0]).includes(RECOVERED_LOG_CODE))).toBe(
+      false
+    );
+  });
+
+  it('没有超时历史 → 诊断对象原样透传(不新增 recoveredTimedOutStages 键)', async () => {
+    const diagnostics = diagnosticsWith([]);
+    const result = await serviceReturning({
+      reply: 'done',
+      phases: { _pipelineOutcome: { outcome: 'completed' } },
+      diagnostics,
+    }).run(runInput);
+    expect(result.status).toBe('success');
+    expect(result.diagnostics).toBe(diagnostics);
+    expect(result.diagnostics).not.toHaveProperty('recoveredTimedOutStages');
   });
 });
 

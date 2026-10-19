@@ -12,6 +12,7 @@ import {
   readRuntimeFailureSnapshot,
 } from '../runtime/AgentExecutionTimeoutError.js';
 import { AgentMessage, Channel } from '../runtime/AgentMessage.js';
+import type { AgentDiagnostics } from '../runtime/AgentRuntimeTypes.js';
 import { DiagnosticsCollector } from '../runtime/DiagnosticsCollector.js';
 import type {
   AgentRunInput,
@@ -200,7 +201,9 @@ export class AgentService {
         runtimeTimeoutMs: runtimeTimeoutMs ?? null,
       });
       const result = await runtime.execute(message, buildRuntimeOptions(input, runtimeTimeoutMs));
-      const status = inferRunStatus(result);
+      const timeoutRecovery = resolveTimeoutRecovery(result);
+      const status = inferRunStatus(result, timeoutRecovery);
+      const diagnostics = this.#projectRecoveredTimeouts(result, timeoutRecovery, status, trace);
       this.#log('info', `[AgentService] runtime execute complete ${formatRunTrace(trace)}`, {
         ...trace,
         durationMs: Date.now() - startedAt,
@@ -223,7 +226,7 @@ export class AgentService {
           iterations: result.iterations || 0,
           durationMs: result.durationMs || 0,
         },
-        diagnostics: result.diagnostics || null,
+        diagnostics,
       };
     } catch (err: unknown) {
       // 快照只按 owner 读取：注入的包装 AgentRuntimeLike 不是登记者时读不到（failureSnapshot='none'）。
@@ -317,6 +320,66 @@ export class AgentService {
       });
       throw toError(err);
     }
+  }
+
+  /**
+   * L5-P33r3b（用户决定 2026-10-19，“Agent 出口修”）：已被重跑恢复的超时不再作为宿主判定依据。
+   *
+   * 背景：attempt.ts、AgentRuntime 的 ExitController 与 DiagnosticsCollector.merge 都只追加
+   * timedOutStages / cancelReason='stage_timeout'，没有移除路径；方案 A 下 analysis_retry 整段重跑
+   * 成功后 produce 照常持久化候选、inferRunStatus 判 success，但宿主 AgentRunProjections
+   * 只要 timedOutStages 非空（或 cancelReason=stage_timeout）就判 timeout，且只在含 'produce' 时
+   * 救回，于是计 0 有效候选。只有服务出口能一次覆盖全部追加来源，所以在这里收口。
+   *
+   * 规则：只在 recoveredTimeouts 成立（与 inferRunStatus 同一判定）时改写返回副本——
+   * timedOutStages 清空、原列表移到 recoveredTimedOutStages（保留审计），派生的
+   * stage_timeout / abort_signal cancelReason 清除，其他 cancelReason 原样保留。
+   * 未恢复的超时（含 producer 最终回执仍超时）原样透传，宿主照旧按 timedOutStages 含 produce 救回。
+   * 不回写 runtime 持有的诊断对象。
+   */
+  #projectRecoveredTimeouts(
+    result: Awaited<ReturnType<AgentRuntimeLike['execute']>>,
+    recovery: TimeoutRecovery,
+    status: AgentRunStatus,
+    trace: Record<string, unknown>
+  ): AgentDiagnostics | null {
+    const diagnostics = result.diagnostics;
+    if (!diagnostics || !recovery.recovered) {
+      return diagnostics || null;
+    }
+    const cancelReason = getDiagnosticsCancelReason(diagnostics);
+    const clearedCancelReason =
+      cancelReason && RECOVERED_TIMEOUT_CANCEL_REASONS.has(cancelReason) ? cancelReason : null;
+    // 已有审计记录（例如宿主再包一层 AgentService 的 runtime）与本次恢复的阶段合并去重。
+    const recoveredTimedOutStages = [
+      ...new Set([
+        ...readStringArray(diagnostics.recoveredTimedOutStages),
+        ...recovery.timedOutStages,
+      ]),
+    ];
+    const projected: AgentDiagnostics = {
+      ...diagnostics,
+      timedOutStages: [],
+      recoveredTimedOutStages,
+    };
+    if (clearedCancelReason && diagnostics.efficiency) {
+      const { cancelReason: _cleared, ...efficiency } = diagnostics.efficiency;
+      projected.efficiency = efficiency;
+    }
+    this.#log(
+      'info',
+      `[AgentService] ${TIMEOUT_RECOVERED_BY_RERUN} stages=${recovery.timedOutStages.join(',')} ${formatRunTrace(trace)}`,
+      {
+        ...trace,
+        code: TIMEOUT_RECOVERED_BY_RERUN,
+        status,
+        recoveredTimedOutStages,
+        clearedCancelReason,
+        retainedCancelReason: clearedCancelReason ? null : cancelReason,
+        finalReceipts: recovery.finalReceipts,
+      }
+    );
+    return projected;
   }
 
   #log(level: 'info' | 'warn', message: string, metadata: Record<string, unknown>): void {
@@ -437,24 +500,72 @@ function toChannel(source: AgentRunInput['context']['source']) {
   return Channel.HTTP;
 }
 
-function inferRunStatus(result: Awaited<ReturnType<AgentRuntimeLike['execute']>>): AgentRunStatus {
+/** 出口恢复超时搬移的日志代码（L5-P33r3b）。 */
+const TIMEOUT_RECOVERED_BY_RERUN = 'timeout_recovered_by_rerun';
+
+/** 超时派生的 cancelReason：超时全部恢复后它们不再代表终态，出口清除；其他取值原样保留。 */
+const RECOVERED_TIMEOUT_CANCEL_REASONS: ReadonlySet<string> = new Set([
+  'stage_timeout',
+  'abort_signal',
+]);
+
+/** 超时恢复判定结果，inferRunStatus 与出口搬移共用，保证两处口径一致。 */
+interface TimeoutRecovery {
+  /** 运行回执里的超时阶段（历史尝试记录，只追加）。 */
+  timedOutStages: string[];
+  /** 管线正常完成且每个超时阶段的最终回执都已恢复。 */
+  recovered: boolean;
+  /** 每个超时阶段最终回执的摘要，仅用于日志留痕。 */
+  finalReceipts: Array<{ stage: string; timedOut: boolean; replyChars: number }>;
+}
+
+/**
+ * timedOutStages 是历史尝试记录。只有每个超时阶段都有明确的最终成功输出（最终回执
+ * timedOut!==true 且 reply 非空），且管线 outcome=completed，才算已恢复；最终回执由
+ * analysis_retry 整段重跑、fast retry 或拒绝重试覆盖，出口不区分重跑机制。
+ */
+function resolveTimeoutRecovery(
+  result: Awaited<ReturnType<AgentRuntimeLike['execute']>>
+): TimeoutRecovery {
+  const outcome = getRecord(result.phases?._pipelineOutcome).outcome;
+  const timedOutStages = result.diagnostics?.timedOutStages || [];
+  // 管线未正常完成或没有超时历史时不读阶段回执（与改动前的短路求值一致；
+  // 写成 !(length > 0) 是为了自定义 runtime 回执形状异常时与旧判定同样短路）。
+  if (outcome !== 'completed' || !(timedOutStages.length > 0)) {
+    return { timedOutStages, recovered: false, finalReceipts: [] };
+  }
+  const finalReceipts = timedOutStages.map((stage) => {
+    const finalStage = getRecord(result.phases?.[stage]);
+    return {
+      stage,
+      timedOut: finalStage.timedOut === true,
+      replyChars: stringValue(finalStage.reply)?.trim().length ?? 0,
+    };
+  });
+  const recovered = finalReceipts.every((receipt) => !receipt.timedOut && receipt.replyChars > 0);
+  return { timedOutStages, recovered, finalReceipts };
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
+function inferRunStatus(
+  result: Awaited<ReturnType<AgentRuntimeLike['execute']>>,
+  recovery: TimeoutRecovery
+): AgentRunStatus {
   const cancellation = getDiagnosticsCancelReason(result.diagnostics);
   const outcome = getRecord(result.phases?._pipelineOutcome).outcome;
   if (outcome === 'aborted') {
     return 'aborted';
   }
-  const timedOutStages = result.diagnostics?.timedOutStages || [];
-  // timedOutStages 是历史尝试记录。只有每个超时阶段都有明确的最终成功输出，
-  // 且管线正常完成，才把旧超时及其派生 abort 当成已恢复；审计历史继续保留。
-  const recoveredTimeouts =
-    outcome === 'completed' &&
-    timedOutStages.length > 0 &&
-    timedOutStages.every((stage) => {
-      const finalStage = getRecord(result.phases?.[stage]);
-      return finalStage.timedOut !== true && Boolean(stringValue(finalStage.reply)?.trim());
-    });
+  const { timedOutStages, recovered: recoveredTimeouts } = recovery;
+  // 全部超时阶段已恢复时，旧超时及其派生 abort 不再决定状态；审计历史由出口移到
+  // recoveredTimedOutStages（见 #projectRecoveredTimeouts）。
   const terminalCancellation =
-    recoveredTimeouts && ['stage_timeout', 'abort_signal'].includes(cancellation || '')
+    recoveredTimeouts && RECOVERED_TIMEOUT_CANCEL_REASONS.has(cancellation || '')
       ? null
       : cancellation;
   if (

@@ -167,7 +167,19 @@ export interface AgentDiagnostics {
   degraded: boolean;
   fallbackUsed: boolean;
   warnings: AgentDiagnosticWarning[];
+  /**
+   * 未恢复的超时阶段：宿主（Alembic AgentRunProjections）只要它非空就判 timeout。
+   * 运行中各来源只追加；AgentService 出口在全部超时阶段都被重跑恢复时把它清空，
+   * 原列表移到 recoveredTimedOutStages。
+   */
   timedOutStages: string[];
+  /**
+   * 已被重跑恢复的超时阶段（L5-P33r3b，仅审计用，可选）。只由 AgentService 结果出口写入：
+   * 管线 outcome=completed 且每个超时阶段的最终回执 timedOut!==true、reply 非空时，
+   * 原 timedOutStages 整体移到这里。DiagnosticsCollector 不生成也不合并该字段；
+   * 没有已恢复超时时不出现此键。
+   */
+  recoveredTimedOutStages?: string[];
   blockedTools: Array<{ tool: string; reason: string }>;
   truncatedToolCalls: number;
   emptyResponses: number;
