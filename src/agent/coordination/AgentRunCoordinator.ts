@@ -1028,7 +1028,13 @@ function partitionProjectIndexScopedModules(
       `module-${index}`
   );
   assertUniqueFanOutUnitIds('projectContextModules', unitIds, profile);
-  return moduleRecords.map((moduleRecord, index) => {
+  // L8-C18：统计每个 child guide 的逐文件导航来源（contextMap 或逐行 ownedFiles），派发前记一条诊断。
+  const guideNavigation = {
+    contextMapModules: 0,
+    ownedFilesListedModules: 0,
+    omittedOwnedFileLines: 0,
+  };
+  const childInputs = moduleRecords.map((moduleRecord, index) => {
     const moduleId = unitIds[index];
     const moduleName =
       stringValue(moduleRecord.moduleName) ||
@@ -1054,6 +1060,14 @@ function partitionProjectIndexScopedModules(
       modulePath,
       ownedFiles,
     });
+    if (ownedFiles.length > 0) {
+      if (stringValue(moduleRecord.contextMap)) {
+        guideNavigation.contextMapModules += 1;
+        guideNavigation.omittedOwnedFileLines += ownedFiles.length;
+      } else {
+        guideNavigation.ownedFilesListedModules += 1;
+      }
+    }
     const strategyContext = stripUndefined({
       ...toRecord(input.context.strategyContext),
       ...toRecord(childContext.strategyContext),
@@ -1122,6 +1136,19 @@ function partitionProjectIndexScopedModules(
       presentation: input.presentation,
     };
   });
+  // 只记计数，不记路径（ownedFiles 可能是本机路径）。ownedFilesListed>0 说明有模块没经
+  // runScopedModuleMining 装配 contextMap（宿主直调 profile），其 guide 仍逐行列出全部 ownedFiles。
+  logCoordination(
+    'info',
+    `module guide file navigation profile=${profile.id} contextMap=${guideNavigation.contextMapModules} ownedFilesListed=${guideNavigation.ownedFilesListedModules}`,
+    {
+      profileId: profile.id,
+      partitioner: 'projectContextModules',
+      moduleCount: childInputs.length,
+      ...guideNavigation,
+    }
+  );
+  return childInputs;
 }
 
 /**
@@ -1292,14 +1319,15 @@ function buildScopedIndexModuleDimConfig(
   const focusKeywords = [moduleName, modulePath, ...dimensions, ...ownedFiles.slice(0, 8)].filter(
     (value): value is string => typeof value === 'string' && value.trim().length > 0
   );
+  // P1-B-1：run 入口静态装配的模块图谱(ModuleContextAssembler)——Analyst 首轮即见
+  // 目录骨架/兄弟模块/可选依赖,graph 调用退为精化手段(不再是骨架的唯一来源)。
+  const contextMap = stringValue(moduleRecord.contextMap);
   const guideParts = [
     `只分析 ProjectContext module "${moduleName}"。`,
     `moduleId: ${moduleId}`,
     modulePath ? `modulePath: ${modulePath}` : '',
-    ownedFiles.length > 0 ? `ownedFiles:\n${ownedFiles.map((file) => `- ${file}`).join('\n')}` : '',
-    // P1-B-1：run 入口静态装配的模块图谱(ModuleContextAssembler)——Analyst 首轮即见
-    // 目录骨架/兄弟模块/可选依赖,graph 调用退为精化手段(不再是骨架的唯一来源)。
-    stringValue(moduleRecord.contextMap) || '',
+    buildOwnedFilesGuideSection(ownedFiles, !!contextMap),
+    contextMap || '',
   ].filter(Boolean);
 
   return stripUndefined({
@@ -1314,6 +1342,24 @@ function buildScopedIndexModuleDimConfig(
       'fact',
     ],
   });
+}
+
+/**
+ * guide 里的 ownedFiles 段（L8-C18）。contextMap 存在时它是唯一的逐文件导航来源：
+ * ModuleContextAssembler 按目录分组、最多列 40 个文件，超出部分只给计数并提示按需 code.search。
+ * 旧版先在它前面逐行列出全部 ownedFiles（无上限），清单预算因此失效（单目录 300 文件的模块会先列
+ * 300 行再列 40 行）。现在只保留一行总数，让 Analyst 仍知道模块规模。
+ * contextMap 缺席（宿主直调 module-mining-session、未经 runScopedModuleMining 装配）时，ownedFiles
+ * 是唯一来源，保持旧版逐行列出；这条路径由 partitioner 的 navigation 诊断计入 ownedFilesListed。
+ */
+function buildOwnedFilesGuideSection(ownedFiles: string[], hasContextMap: boolean) {
+  if (ownedFiles.length === 0) {
+    return '';
+  }
+  if (hasContextMap) {
+    return `ownedFiles: 共 ${ownedFiles.length} 个文件；逐文件清单见下方模块图谱，未列出的按需 code.search 定位。`;
+  }
+  return `ownedFiles:\n${ownedFiles.map((file) => `- ${file}`).join('\n')}`;
 }
 
 function toProfileRef(value: unknown): AgentProfileRef | AgentProfileOverride | null {

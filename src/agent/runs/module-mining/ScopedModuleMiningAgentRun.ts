@@ -59,11 +59,7 @@ export async function runScopedModuleMining({
       }),
       message: {
         role: 'internal',
-        content: buildProjectIndexScopedModulePrompt({
-          modules: selectedModules,
-          projectFacts,
-          budget,
-        }),
+        content: buildProjectIndexScopedModulePrompt(selectedModules.length),
         metadata: {
           task: 'module-mining',
           generationStage: 'moduleMining',
@@ -198,23 +194,22 @@ function normalizeScopedIndexModule(moduleInput: ScopedMiningModule, index: numb
   });
 }
 
-function buildProjectIndexScopedModulePrompt({
-  modules,
-  projectFacts,
-  budget,
-}: {
-  modules: ScopedMiningModule[];
-  projectFacts: unknown;
-  budget?: Record<string, unknown>;
-}) {
+/**
+ * 父 run 的 message.content（L8-C18）。module-mining-session 配置了 concurrency，AgentService 总是
+ * 把父 run 交给 AgentRunCoordinator 按 params.modules 拆成 per-module child，父 run 自身不进入
+ * 模型循环；child 的 content 由 partitioner 另行构造（`Module mining: <moduleName>`），不继承这里
+ * 的文本。所以这里只保留简短的任务描述（阶段名 + 模块数）：满足 validateRunInput 的非空要求，
+ * 并让日志/trace 读得懂这是哪一类 run。
+ * projectFacts 与 budget 不再序列化进 content（旧版对完整 facts 做缩进 JSON，大项目可达数 MB 且
+ * 无人消费）；它们照旧经 params / promptContext / execution 传给 partitioner（projectInfo、
+ * strategyContext.projectFacts）与 child runtime。
+ */
+function buildProjectIndexScopedModulePrompt(moduleCount: number) {
   return [
-    '执行 moduleMining fan-out。父 run 只负责按 ProjectIndex scoped modules 拆分 child；每个 child 使用完整 analyst budget，不按 module 数拆分。',
+    '执行 moduleMining fan-out：父 run 只按 params.modules（ProjectIndex scoped modules）拆分 child，自身不调用模型。',
     'fan-out 来源必须是 params.modules / ProjectMap.modules；不要从 moduleSeeds、dimensions 或 ledger 推导模块。',
-    `Module count: ${modules.length}`,
-    'Budget:',
-    JSON.stringify(budget ?? {}, null, 2),
-    'Project facts:',
-    JSON.stringify(projectFacts, null, 2),
+    'generationStage: moduleMining',
+    `Module count: ${moduleCount}`,
   ].join('\n');
 }
 

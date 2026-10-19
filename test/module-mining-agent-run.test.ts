@@ -538,6 +538,83 @@ describe('runModuleMining cancellation and deadline signals', () => {
   });
 });
 
+// L8-C18：module-mining-session 总是走协调器，父 run 从不进入模型循环，child content 也不继承父
+// content。父 message.content 只保留简短任务描述；projectFacts/budget 不再序列化进 content，
+// 但仍必须经 params / promptContext / execution 原样传给 partitioner 与 child。
+describe('runModuleMining parent message content (L8-C18)', () => {
+  const threeModules = [
+    { moduleId: 'core', moduleName: 'Core', ownedFiles: ['src/core.ts'] },
+    { moduleId: 'ui', moduleName: 'UI', ownedFiles: ['src/ui.ts'] },
+    { moduleId: 'cli', moduleName: 'CLI', ownedFiles: ['src/cli.ts'] },
+  ];
+
+  it('keeps the parent content a short task description without serialized projectFacts or budget', async () => {
+    const projectFacts = {
+      project: 'redundancy',
+      marker: 'project-facts-sentinel-c18',
+      files: Array.from({ length: 50 }, (_, index) => `src/file-${index}.ts`),
+    };
+    const budget = { analystTokens: 7777, marker: 'budget-sentinel-c18' };
+    const calls: AgentRunInput[] = [];
+    const run = vi.fn(async (input: AgentRunInput) => {
+      calls.push(input);
+      return successRunResult();
+    });
+
+    await runModuleMining({
+      agentService: { run },
+      modules: threeModules,
+      projectFacts,
+      budget,
+    });
+
+    const parent = calls[0];
+    const content = parent?.message.content ?? '';
+    // validateRunInput 要求非空；内容只描述阶段与模块数。
+    expect(content.trim().length).toBeGreaterThan(0);
+    expect(content).toContain('moduleMining');
+    expect(content).toContain('Module count: 3');
+    expect(content).not.toContain('project-facts-sentinel-c18');
+    expect(content).not.toContain(JSON.stringify(projectFacts, null, 2));
+    expect(content).not.toContain('src/file-0.ts');
+    expect(content).not.toContain('budget-sentinel-c18');
+    // 旧文案声称“每个 child 使用完整 analyst budget”，与 child 预算的真实来源不符，一并移除。
+    expect(content).not.toContain('完整 analyst budget');
+    expect(content.length).toBeLessThan(400);
+
+    // projectFacts / budget 的传递通道保持不变。
+    expect(parent?.params?.projectFacts).toBe(projectFacts);
+    expect(parent?.params?.budget).toBe(budget);
+    expect(parent?.context.promptContext?.projectFacts).toBe(projectFacts);
+    expect(parent?.context.promptContext?.budget).toBe(budget);
+    expect(parent?.execution?.budgetOverride).toBe(budget);
+    expect(parent?.message.metadata).toEqual({
+      task: 'module-mining',
+      generationStage: 'moduleMining',
+      moduleCount: 3,
+    });
+  });
+
+  it('still hands projectFacts to every child through strategyContext while children keep their own content', async () => {
+    const executions: RuntimeExecution[] = [];
+    const projectFacts = { project: 'child-facts', marker: 'child-facts-sentinel-c18' };
+
+    await runModuleMining({
+      agentService: createService(executions),
+      modules: threeModules,
+      projectFacts,
+    });
+
+    expect(executions).toHaveLength(3);
+    for (const execution of executions) {
+      expect(execution.content).toMatch(/^Module mining: /u);
+      expect(execution.content).not.toContain('child-facts-sentinel-c18');
+      const strategyContext = (execution.options?.strategyContext ?? {}) as Record<string, unknown>;
+      expect(strategyContext.projectFacts).toBe(projectFacts);
+    }
+  });
+});
+
 function successRunResult(): AgentRunResult {
   return {
     runId: 'module-mining-parent',

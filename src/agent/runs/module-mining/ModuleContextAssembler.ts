@@ -97,7 +97,9 @@ export function buildModuleContextMap(
   const files = ownedFilesOf(module);
   const lines: string[] = ['【模块图谱(静态装配,导航用)】'];
 
-  // 1) 目录分组文件清单(封顶 MAX_LISTED_FILES,超出按目录汇总)
+  // 1) 目录分组文件清单(封顶 MAX_LISTED_FILES,超出按目录汇总)。
+  //    这是 child guide 唯一的逐文件导航来源(L8-C18)：coordinator 在 contextMap 存在时
+  //    只给 ownedFiles 总数,不再逐行重复全量清单,所以这里的封顶就是 guide 的清单预算。
   const byGroup = new Map<string, string[]>();
   const depth = commonDirectoryDepth(files);
   for (const file of files) {
