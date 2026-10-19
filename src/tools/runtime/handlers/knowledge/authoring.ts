@@ -524,8 +524,9 @@ export async function prepareSubmission(
   }
   if (gateViolations.length > 0) {
     const detail = formatRecipeAuthoringViolations(gateViolations);
-    // F4b 诊断反馈：按违规挑引用——行号类违规只列违规引用与文件实际行数，SNIPPET_MISMATCH 才从
-    // sourceRefs ∪ reasoning.sources 中展示一个真实 bounded range（L4-P22 / U18-F7）。
+    // F4b 诊断反馈：按违规挑引用——行号类违规只列违规引用与文件实际行数；只有 SNIPPET_MISMATCH
+    // 单独出现（没有行号类违规）时才从 sourceRefs ∪ reasoning.sources 中展示一个真实 bounded
+    // range，两者同时出现时片段可能来自违规引用，不借用其它引用的代码（L4-P22 / U18-F7）。
     // 提示不会修改候选，也不会把首个来源、无界范围或整文件自动提升为 coreCode。
     const snippetRepair = gateViolations.some((v) =>
       ['SNIPPET_MISMATCH', 'SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING'].includes(

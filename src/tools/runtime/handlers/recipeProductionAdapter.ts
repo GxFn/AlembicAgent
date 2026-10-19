@@ -4,6 +4,7 @@ import {
   computeRecipeSourceContentHash,
   RECIPE_RETRIEVAL_PROFILE_SCHEMA_VERSION,
 } from '@alembic/core';
+import Logger from '@alembic/core/logging';
 import {
   parseBoundedSourceRef,
   readSourceRange,
@@ -242,7 +243,8 @@ function buildRetrievalProfile(
  *
  * provenance.evidenceRefs 写每条可读引用的声明原文（与事实 provenanceRefs 逐字对齐），
  * codeEvidence.provenanceRef 写规范形式；被排除的引用连同原因进入 profileEvidence.rejected，
- * 本函数不打日志，由调用方（authoring）按提交语境记录。
+ * 由调用方（authoring）按提交语境记录 warn。本函数自己只记一种 debug：coreCode 含 CRLF、
+ * 按 LF 归一后再与证据比对的兼容转译。
  */
 export function prepareRecipeProductionItem(
   rawItem: Record<string, unknown>,
@@ -266,10 +268,21 @@ export function prepareRecipeProductionItem(
   const codeFitsBudget =
     requestedCoreCode.length <= MAX_CORE_CODE_CHARS &&
     splitLogicalLines(requestedCoreCode).length <= MAX_CORE_CODE_LINES;
+  // 片段比对与 sourceRange.splitLogicalLines 的 /\r?\n/ 切行语义对齐（L4-P22 / I25）：证据行已去掉
+  // 行尾 '\r' 并以 '\n' 连接，而 code.read 展示给模型的源码行保留 '\r'，模型照抄的多行 coreCode
+  // 会带 CRLF。只归一比对串，写回候选的 coreCode 保持提交原样（Core 门禁按去空白比对，冻结证据
+  // 保留原始字节）；行内孤立的 '\r' 不在切行语义内，两侧都原样保留。
+  const matchableCoreCode = requestedCoreCode.replace(/\r\n/g, '\n');
   const matchingEvidence = requestedCoreCode
-    ? codeEvidence.find((entry) => entry.content.includes(requestedCoreCode))
+    ? codeEvidence.find((entry) => entry.content.includes(matchableCoreCode))
     : undefined;
   const codeAccepted = !requestedCoreCode || (codeFitsBudget && matchingEvidence !== undefined);
+  if (matchableCoreCode !== requestedCoreCode) {
+    // 兼容转译留痕：触发条件（coreCode 含 CRLF）、选择路径（按 LF 比对）与比对结论；不含代码内容。
+    Logger.getInstance().debug(
+      `[knowledge.submit] recipe production adapter normalized CRLF line endings in coreCode for bounded snippet matching for "${text(rawItem.title)}": lines=${splitLogicalLines(requestedCoreCode).length}, result=${codeAccepted ? `bounded-match (${matchingEvidence?.canonicalRef ?? ''})` : 'unbounded-or-unrelated'}; stored coreCode keeps its submitted line endings`
+    );
+  }
   const item: CreateRecipeItem = {
     ...(rawItem as CreateRecipeItem),
     coreCode: codeAccepted ? requestedCoreCode : '',

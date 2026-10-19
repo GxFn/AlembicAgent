@@ -2863,6 +2863,108 @@ describe('L4-P22 bounded source reads share one implementation', () => {
     });
   });
 
+  test('a multi-line coreCode copied with CRLF line endings is a bounded match and keeps its bytes', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/crlf.ts'),
+      '// header\r\nconst a = 1;\r\nconst b = 2;\r\n// footer\r\n'
+    );
+    // code.read 按 '\n' 切行并保留 '\r'，模型照抄出的多行 coreCode 自然带 CRLF。
+    const coreCode = 'const a = 1;\r\nconst b = 2;';
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      const prepared = prepareRecipeProductionItem(
+        {
+          title: 'CRLF fixture',
+          coreCode,
+          reasoning: { sources: ['src/crlf.ts:2-3'] },
+          retrievalProfile: authoredProfile(),
+        },
+        projectRoot
+      );
+      expect(prepared.codeEvidence).toEqual({
+        accepted: true,
+        reason: 'bounded-match',
+        provenanceRef: 'src/crlf.ts:2-3',
+      });
+      // 只为比对归一换行；写回候选的 coreCode 保持提交原样。
+      expect(prepared.item.coreCode).toBe(coreCode);
+      expect(prepared.profileEvidence.rejected).toEqual([]);
+      // 兼容转译留痕：触发条件、比对结论与命中的规范引用，不含代码内容。
+      const messages = debug.mock.calls.map((call) => String(call[0]));
+      const normalized = messages.find((message) => message.includes('normalized CRLF'));
+      expect(normalized).toContain('CRLF fixture');
+      expect(normalized).toContain('bounded-match (src/crlf.ts:2-3)');
+      expect(normalized).not.toContain('const a = 1;');
+
+      // LF 形式的 coreCode 不经兼容转译，不留该诊断。
+      debug.mockClear();
+      prepareRecipeProductionItem(
+        {
+          coreCode: 'const a = 1;\nconst b = 2;',
+          reasoning: { sources: ['src/crlf.ts:2-3'] },
+          retrievalProfile: authoredProfile(),
+        },
+        projectRoot
+      );
+      expect(debug.mock.calls.some((call) => String(call[0]).includes('normalized CRLF'))).toBe(
+        false
+      );
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('a CRLF coreCode that matches no cited range is still removed after line-ending alignment', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/crlf.ts'),
+      '// header\r\nconst a = 1;\r\nconst b = 2;\r\n// footer\r\n'
+    );
+    const prepared = prepareRecipeProductionItem(
+      {
+        coreCode: 'const a = 1;\r\nconst z = 26;',
+        reasoning: { sources: ['src/crlf.ts:2-3'] },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+    expect(prepared.codeEvidence).toEqual({ accepted: false, reason: 'unbounded-or-unrelated' });
+    expect(prepared.item.coreCode).toBe('');
+  });
+
+  test('knowledge.submit keeps a CRLF coreCode cited from a CRLF file without counting it as unsafe', async () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/a.ts'),
+      "// header\r\nimport type { User } from './user.js';\r\nexport const count = 1;\r\n// footer\r\n"
+    );
+    const coreCode = "import type { User } from './user.js';\r\nexport const count = 1;";
+    const sharedState: Record<string, unknown> = {};
+    const fake = fakePort(readyReport);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = await handleKnowledge('submit', submitParams({ coreCode }), {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState },
+        sessionStore: null,
+      } as never);
+      expect(result.ok).toBe(true);
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0].input.items[0].coreCode).toBe(coreCode);
+      const messages = warn.mock.calls.map(([message]) => String(message));
+      expect(messages.some((message) => message.includes('unsafe coreCode removed'))).toBe(false);
+      const counters = sharedState._sessionCounters as
+        | { submitRepairStats?: Record<string, number> }
+        | undefined;
+      expect(counters?.submitRepairStats?.unsafe_core_code_removed).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test('path:N+1 of a newline-terminated file is out of range in both the gate and the adapter', () => {
     const projectRoot = makeProject();
     fs.writeFileSync(
@@ -3064,6 +3166,42 @@ describe('L4-P22 bounded source reads share one implementation', () => {
       expect(result.text).toContain('src/b.ts:900-910');
       expect(result.text).toContain('实际 5 行');
       expect(result.text).not.toContain("import type { User } from './user.js';");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('a snippet mismatch from the out-of-range ref never pastes code from an unrelated readable ref', async () => {
+    const projectRoot = makeProject();
+    // content.pattern 只出现在 b.ts，而 b.ts 的引用越界：门禁同时报越界与 SNIPPET_MISMATCH。
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/b.ts'),
+      'export function inc(n: number) {\n  return n + 1;\n}\n'
+    );
+    const fake = fakePort(readyReport);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const result = await submitThroughAdapter(
+        projectRoot,
+        fake.port,
+        submitParams({
+          sourceRefs: ['src/a.ts:1-2', 'src/b.ts:900-910'],
+          coreCode: '',
+          content: { ...submitParams().content, pattern: '  return n + 1;' },
+          reasoning: {
+            whyStandard: 'Fixture source claim.',
+            sources: ['src/a.ts:1-2', 'src/b.ts:900-910'],
+            confidence: 0.95,
+          },
+        })
+      );
+      expect(fake.calls).toHaveLength(0);
+      expect(result.text).toContain('SOURCE_REF_LINE_OUT_OF_RANGE');
+      expect(result.text).toContain('SNIPPET_MISMATCH');
+      expect(result.text).toContain('src/b.ts:900-910');
+      expect(result.text).toContain('实际 3 行');
+      expect(result.text).not.toContain("import type { User } from './user.js';");
+      expect(result.text).not.toContain('src/a.ts:1-2 的真实代码');
     } finally {
       warn.mockRestore();
     }

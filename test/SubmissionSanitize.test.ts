@@ -1110,15 +1110,41 @@ describe('L4-P22 F4b 修复提示按违规引用取片段', () => {
     expect(crlf).not.toContain('\r');
   });
 
-  test('SNIPPET_MISMATCH 与越界同时出现：片段取可读范围，越界引用另列行数', () => {
+  test('SNIPPET_MISMATCH 与越界同时出现：不借用其它引用的代码，只列违规路径与实际行数并留 debug', () => {
     const root = hintProject();
-    const hint = buildSnippetRepairHint(['src/b.ts:900-910', 'src/a.ts:2-3'], root, [
-      { code: 'SOURCE_REF_LINE_OUT_OF_RANGE', sourceRef: 'src/b.ts:900-910', path: 'src/b.ts' },
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      const hint = buildSnippetRepairHint(['src/b.ts:900-910', 'src/a.ts:2-3'], root, [
+        { code: 'SOURCE_REF_LINE_OUT_OF_RANGE', sourceRef: 'src/b.ts:900-910', path: 'src/b.ts' },
+        { code: 'SNIPPET_MISMATCH' },
+      ]);
+      expect(hint).not.toContain('export const a2');
+      expect(hint).not.toContain('src/a.ts:2-3');
+      expect(hint).toContain('src/b.ts:900-910');
+      expect(hint).toContain('实际 3 行');
+      const messages = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('[knowledge.submit]'));
+      expect(
+        messages.some(
+          (message) => message.includes('SNIPPET_MISMATCH') && message.includes('src/b.ts:900-910')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('SNIPPET_MISMATCH 与缺行号同时出现：同样不展示其它引用的代码', () => {
+    const root = hintProject();
+    const hint = buildSnippetRepairHint(['src/a.ts:2-3', 'src/b.ts'], root, [
+      { code: 'SOURCE_REF_LINE_MISSING', sourceRef: 'src/b.ts' },
       { code: 'SNIPPET_MISMATCH' },
     ]);
-    expect(hint).toContain('src/a.ts:2-3');
-    expect(hint).toContain('export const a2 = 2;');
-    expect(hint).toContain('src/b.ts:900-910');
+    expect(hint).not.toContain('export const a2');
+    expect(hint).not.toContain('src/a.ts:2-3');
+    expect(hint).toContain('src/b.ts');
     expect(hint).toContain('实际 3 行');
   });
 

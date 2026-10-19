@@ -140,9 +140,13 @@ export function normalizeBareSourceRefs(
  * F4b：代码/引用门禁拒绝时给出诊断提示，按门禁违规挑引用（L4-P22 / U18-F7）：
  *   - SOURCE_REF_LINE_OUT_OF_RANGE / SOURCE_REF_LINE_MISSING：只列违规引用本身与文件实际行数，
  *     不展示其它引用的代码；
- *   - SNIPPET_MISMATCH：门禁拿片段与所有已声明的有效范围比对，故从候选（sourceRefs ∪
- *     reasoning.sources，由 collectSnippetHintCandidates 收集）中取第一个可读范围展示真实代码。
- * violations 缺省表示调用方没有违规列表，按 SNIPPET_MISMATCH 语义只展示首个可读范围。
+ *   - 仅有 SNIPPET_MISMATCH（没有行号类违规）：门禁拿片段与所有已声明的有效范围比对，故从候选
+ *     （sourceRefs ∪ reasoning.sources，由 collectSnippetHintCandidates 收集）中取第一个可读范围
+ *     展示真实代码；
+ *   - SNIPPET_MISMATCH 与行号类违规同时出现：SNIPPET_MISMATCH 不带 sourceRef，片段很可能来自越界
+ *     或缺行号的那条引用（它不算有效范围），此时首个可读范围与片段来源无关，展示它会诱导模型粘贴
+ *     无关代码。违规引用本身没有可读范围，因此不展示任何代码，只列违规路径与文件实际行数。
+ * violations 缺省表示调用方没有违规列表，按单独 SNIPPET_MISMATCH 语义只展示首个可读范围。
  * 提示不会修改候选，也不把首个来源或整文件视为 coreCode 答案；无可展示内容时返回空串。
  */
 export function buildSnippetRepairHint(
@@ -154,11 +158,18 @@ export function buildSnippetRepairHint(
     return '';
   }
   const candidates = stringList(sourceRefs);
-  const wantsSnippet =
-    violations === undefined || violations.some((v) => v.code === 'SNIPPET_MISMATCH');
   const violatingRefs = (violations ?? []).filter(
     (v) => REF_LEVEL_HINT_CODES.has(v.code) && Boolean(v.sourceRef ?? v.path)
   );
+  const snippetMismatch =
+    violations === undefined || violations.some((v) => v.code === 'SNIPPET_MISMATCH');
+  const wantsSnippet = snippetMismatch && violatingRefs.length === 0;
+  if (snippetMismatch && !wantsSnippet) {
+    // 短路：片段不匹配与行号类违规同时出现时，不借用其它引用的代码（只能从违规引用取范围，而它不可读）。
+    Logger.getInstance().debug(
+      `[knowledge.submit] snippet repair hint skipped code display: SNIPPET_MISMATCH occurred together with line-grounding violation(s) on ${violatingRefs.map((v) => v.sourceRef ?? v.path).join(', ')}; listing violating ref(s) only`
+    );
+  }
   let hint = '';
   if (wantsSnippet) {
     const range = readFirstHintRange(candidates, projectRoot);
