@@ -1287,13 +1287,123 @@ describe('Agent Recipe production profile adapter', () => {
       expect(result.error).toContain('GRAPH_REF_INVALID');
       expect(fake.calls).toHaveLength(0);
       expect(counters.styleWaiverTotal).toBeUndefined();
+      // GRAPH_REF_INVALID 是硬违规但可由修复子调用改写措辞：拒绝发生在修复失败（非 JSON）之后，
+      // 不是跳过修复直接拒绝（C021/C022）。
+      expect(chat).toHaveBeenCalledTimes(1);
+      const notApplied = info.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes('style waiver not applied'));
+      expect(notApplied).toBeDefined();
+      expect(notApplied).toMatch(/hardViolations=[1-9]/u);
+      // 日志必须写出实际后续路径：先走修复子调用，修复后仍残留硬违规才拒绝。
+      expect(notApplied).not.toContain('regular rejection path');
+      expect(notApplied).toContain('auto style repair sub-call');
+      expect(notApplied).toContain('rejection if hard violations remain after repair');
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('logs the repair path, not a rejection, when a repairable hard violation with a justification is fixed by the repair sub-call', async () => {
+    const projectRoot = makeProject();
+    const fake = fakePort(readyReport);
+    const params = submitParams({ doClause: 'ImportType is needed for type-only dependencies.' });
+    const original = (params.content as { markdown: string }).markdown;
+    // 修复子调用改写 doClause 并删掉未背书的关系断言句，GRAPH_REF_INVALID 随之消失。
+    const chat = vi.fn(async () =>
+      JSON.stringify({
+        doClause: 'Use import type for every type-only dependency.',
+        markdown: original,
+      })
+    );
+    const counters: Record<string, unknown> = {};
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      const result = await handleKnowledge(
+        'submit',
+        {
+          ...params,
+          content: {
+            ...(params.content as object),
+            markdown: `${original}\n绕过调用方直接用值导入会产生运行时导入边。`,
+          },
+          waiverJustification: WAIVER_REASON,
+        },
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState: { _sessionCounters: counters }, aiProvider: { chat } },
+        } as never
+      );
+      expect(result.ok).toBe(true);
+      expect(chat).toHaveBeenCalledTimes(1);
+      expect(fake.calls).toHaveLength(1);
+      const stored = storedItem(fake);
+      expect((stored.content as { markdown: string }).markdown).not.toContain('调用方');
+      expect(stored.doClause).toBe('Use import type for every type-only dependency.');
+      expect(counters.styleWaiverTotal).toBeUndefined();
+      const messages = info.mock.calls.map(([message]) => String(message));
+      const notApplied = messages.find((message) => message.includes('style waiver not applied'));
+      expect(notApplied).toBeDefined();
+      expect(notApplied).toMatch(/hardViolations=1\b/u);
+      expect(notApplied).not.toContain('regular rejection path');
+      expect(notApplied).toContain('auto style repair sub-call');
+      expect(messages.some((message) => message.includes('style repair sub-call fixed'))).toBe(
+        true
+      );
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('logs the regular rejection path and skips the repair sub-call for a non-repairable hard violation with a justification', async () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(path.join(projectRoot, 'src/b.ts'), 'b1\nb2\nb3\nb4\nb5\n');
+    const fake = fakePort(readyReport);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const counters: Record<string, unknown> = {};
+    const logger = Logger.getInstance();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    try {
+      // 越界引用是证据类硬违规（事实问题，不在修复子调用范围）：与软违规并存时理由无效、直接拒绝。
+      const result = await handleKnowledge(
+        'submit',
+        {
+          ...submitParams({
+            doClause: 'ImportType is needed for type-only dependencies.',
+            sourceRefs: ['src/a.ts:2-3', 'src/b.ts:900-910'],
+            reasoning: {
+              whyStandard: 'Fixture source claim.',
+              sources: ['src/a.ts:2-3', 'src/b.ts:900-910'],
+              confidence: 0.95,
+            },
+          }),
+          waiverJustification: WAIVER_REASON,
+        },
+        {
+          projectRoot,
+          recipeGateway: fake.port,
+          runtime: { sharedState: { _sessionCounters: counters }, aiProvider: { chat } },
+        } as never
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('SOURCE_REF_LINE_OUT_OF_RANGE');
+      expect(fake.calls).toHaveLength(0);
+      expect(chat).not.toHaveBeenCalled();
+      expect(counters.styleWaiverTotal).toBeUndefined();
       const notApplied = info.mock.calls
         .map(([message]) => String(message))
         .find((message) => message.includes('style waiver not applied'));
       expect(notApplied).toBeDefined();
       expect(notApplied).toMatch(/hardViolations=[1-9]/u);
       expect(notApplied).toContain('regular rejection path');
+      expect(notApplied).not.toContain('auto style repair');
     } finally {
+      warn.mockRestore();
       info.mockRestore();
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }

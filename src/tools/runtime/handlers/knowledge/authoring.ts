@@ -436,12 +436,22 @@ export async function prepareSubmission(
       gateViolations = [];
     } else if (justification) {
       // 带了理由却未生效是静默分叉：可能是含硬违规、理由过短或会话额度已用尽。只记录 Core
-      // 判定的关键输入，不在此复刻判定；后续路径按是否残留硬违规分别是拒绝或修复+advisory。
+      // 判定的关键输入，不在此复刻判定。日志写出的后续路径必须与下方实际分支一致，分三种：
+      // ①含硬违规且全部可修复(如仅 GRAPH_REF_INVALID——Core 记为硬违规，但措辞可由修复子调用
+      //   改写)→ 先在每 title 预算内走修复子调用，修复后仍残留硬违规才拒绝；
+      // ②含硬违规且不可修复(证据类等事实问题)→ 跳过修复，直接走拒绝路径；
+      // ③全软违规 → 可修复时先走修复子调用(预算允许时)，剩余项降为不阻断的 advisory 入库。
       const hardCount = gateViolations.filter((v) => !isSoftAuthoringViolation(v.code)).length;
-      const nextPath =
-        hardCount > 0
-          ? 'regular rejection path (hard violations are never waivable)'
-          : 'auto style repair when its per-title budget allows, then non-blocking style advisories for what remains';
+      let nextPath: string;
+      if (hardCount === 0) {
+        nextPath =
+          'auto style repair when its per-title budget allows, then non-blocking style advisories for what remains';
+      } else if (isStyleRepairable(gateViolations)) {
+        nextPath =
+          'auto style repair sub-call when its per-title budget allows (hard violations are never waivable); rejection if hard violations remain after repair, otherwise non-blocking style advisories for soft leftovers';
+      } else {
+        nextPath = 'regular rejection path (hard violations are never waivable)';
+      }
       Logger.getInstance().info(
         `[knowledge.submit] style waiver not applied for "${String(item.title ?? '')}" (dim=${String(effectiveDimensionId ?? '')}): hardViolations=${hardCount}, justificationChars=${justification.length} (min ${STYLE_WAIVER_MIN_JUSTIFICATION}), sessionWaivers=${waiverTotal} (allowance ${STYLE_WAIVER_SESSION_LIMIT}); continuing with ${nextPath}`
       );
