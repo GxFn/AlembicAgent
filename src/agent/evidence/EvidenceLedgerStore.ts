@@ -22,6 +22,12 @@
  *   不再让同一进程内的条目误判 stale），没有摘要（seed、跨进程续跑、其它实例写入）时退回脱敏哈希。
  * - 静态加固（D7）：台账目录 0700、文件 0600，evidence-ledger/ 下写内容为 `*` 的自忽略 .gitignore；
  *   打开已有旧台账时尝试把权限收紧到同一标准。加固失败只记 warn，不阻断读写。
+ * - 内容 profile（脱敏阶段 3，L7-P11 方案 b）：缺省 redacted-evidence 即上面的全部现状；
+ *   verbatim-witness 是宿主严格链的逐字节见证通道，落在独立根目录
+ *   <dataRoot>/.asd/evidence-witness/<jobId>/<dimensionId>.jsonl（宿主以 runId 作 jobId），
+ *   不调用 redactor、不截断，contentHash = sha256(原文)；写盘前经 witnessGate 判定
+ *   （1 MiB 上限、UTF-8 往返、T1 子集闸门），不通过就抛错且不建目录、不写行、不消耗序号。
+ *   见证根目录沿用同一套 0700/0600 与自忽略 .gitignore。两个 profile 的文件互不读取。
  */
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import {
@@ -54,6 +60,28 @@ import {
   classifyEvidenceSource as classifyEvidenceSourceByTable,
   type EvidenceSourceClass,
 } from './evidenceFileClass.js';
+import {
+  describeWitnessRejection,
+  inspectWitnessContent,
+  WITNESS_GATE_POLICY_ID,
+  WITNESS_MAX_CONTENT_BYTES,
+} from './witnessGate.js';
+
+/**
+ * 台账内容 profile。
+ * - redacted-evidence（缺省）：循环证据与默认 capture 的现状——脱敏→8000 字符截断，
+ *   落在 .asd/evidence-ledger/；
+ * - verbatim-witness：宿主严格链的逐字节见证——不脱敏、不截断，落在 .asd/evidence-witness/，
+ *   写盘前由 witnessGate 判定是否允许写入（只拒绝，不改写）。
+ */
+export type EvidenceLedgerContentProfile = 'redacted-evidence' | 'verbatim-witness';
+
+/** 各 profile 在 <dataRoot>/.asd/ 下的根目录；见证与默认台账物理隔离，互不 hydrate。 */
+const LEDGER_DIRECTORY_BY_PROFILE: Readonly<Record<EvidenceLedgerContentProfile, string>> =
+  Object.freeze({
+    'redacted-evidence': 'evidence-ledger',
+    'verbatim-witness': 'evidence-witness',
+  });
 
 /**
  * 传给 redactor 的条目来源上下文（取自草稿或条目自身的可信元数据）。
@@ -75,8 +103,13 @@ export interface EvidenceLedgerStoreOptions {
   jobId: string;
   sessionId: string;
   dimensionId: string;
-  /** 落盘前脱敏；缺省恒等（生产接线必须注入 redactDeveloperText） */
+  /**
+   * 落盘前脱敏；缺省恒等（生产接线必须注入 redactDeveloperText）。
+   * verbatim-witness profile 不允许注入：见证通道上任何字节变换都会让宿主逐字节比对失败。
+   */
   redactor?: EvidenceRedactor;
+  /** 内容 profile，缺省 redacted-evidence（现状）。 */
+  contentProfile?: EvidenceLedgerContentProfile;
 }
 
 /**
@@ -212,6 +245,7 @@ export class EvidenceLedgerStore {
   readonly #sessionId: string;
   readonly #dimensionId: string;
   readonly #redactor: EvidenceRedactor;
+  readonly #contentProfile: EvidenceLedgerContentProfile;
   readonly #entries = new Map<string, EvidenceEntry>();
   readonly #hydrateIntegrityIssues: string[] = [];
   /**
@@ -227,10 +261,19 @@ export class EvidenceLedgerStore {
   #historyChanged = false;
 
   constructor(options: EvidenceLedgerStoreOptions) {
+    const contentProfile = options.contentProfile ?? 'redacted-evidence';
+    if (!Object.hasOwn(LEDGER_DIRECTORY_BY_PROFILE, contentProfile)) {
+      throw new Error('EVIDENCE_LEDGER_CONTENT_PROFILE_INVALID');
+    }
+    if (contentProfile === 'verbatim-witness' && options.redactor !== undefined) {
+      // 构造期失败即关：见证通道不能有任何脱敏入口，连“恒等 redactor”也不接受，避免接线漂移。
+      throw new Error('EVIDENCE_LEDGER_WITNESS_REDACTOR_FORBIDDEN');
+    }
+    this.#contentProfile = contentProfile;
     this.#sessionId = options.sessionId;
     this.#dimensionId = options.dimensionId;
     this.#redactor = options.redactor ?? ((text) => text);
-    this.#ledgerRoot = join(options.dataRoot, '.asd', 'evidence-ledger');
+    this.#ledgerRoot = join(options.dataRoot, '.asd', LEDGER_DIRECTORY_BY_PROFILE[contentProfile]);
     this.filePath = join(this.#ledgerRoot, options.jobId, `${options.dimensionId}.jsonl`);
     this.#hydrate();
     if (this.#diskRevision !== 'missing') {
@@ -241,6 +284,10 @@ export class EvidenceLedgerStore {
 
   /** 采集侧唯一写入口（E2 在工具结果收口处调用）；返回带 id 的完整条目 */
   append(draft: EvidenceEntryDraft, options: EvidenceAppendOptions = {}): EvidenceEntry {
+    if (this.#contentProfile === 'verbatim-witness') {
+      // 见证闸门在一切 I/O 之前：被拒绝的内容不建目录、不写行、不分配 E-n。
+      this.#assertWitnessAdmissible(draft);
+    }
     this.#refresh();
     const capped = this.#redactAndCap(draft.content, redactionContextOf(draft));
     const entry: EvidenceEntry = {
@@ -382,6 +429,8 @@ export class EvidenceLedgerStore {
   /**
    * 管线单源：脱敏后若超上限则保头截断并附显式标记。redacted/truncated 两个事实与
    * stored 一起返回，保证 describeContentTransformation 与实际写入不会各算各的。
+   * verbatim-witness profile 是恒等管线：不调用 redactor、不截断（大小由写盘前闸门把关），
+   * 所以 append、checkFreshness 的同尺重算与 describeContentTransformation 都按原文计算。
    */
   #transform(
     content: string,
@@ -391,12 +440,46 @@ export class EvidenceLedgerStore {
     readonly redacted: boolean;
     readonly truncated: boolean;
   } {
+    if (this.#contentProfile === 'verbatim-witness') {
+      return { stored: content, redacted: false, truncated: false };
+    }
     const redacted = this.#redactor(content, context);
     const truncated = redacted.length > EVIDENCE_ENTRY_MAX_CHARS;
     const stored = truncated
       ? `${redacted.slice(0, EVIDENCE_ENTRY_MAX_CHARS - EVIDENCE_TRUNCATION_MARKER.length - 1)}\n${EVIDENCE_TRUNCATION_MARKER}`
       : redacted;
     return { stored, redacted: redacted !== content, truncated };
+  }
+
+  /**
+   * 见证 profile 的写盘前判定（D5）：超过 1 MiB、UTF-8 往返不一致或有损解码痕迹、命中 T1 子集
+   * 闸门时抛带理由的 Error。理由与诊断只含原因、规则种类、规则 id、文件路径和字节数，不含正文。
+   * 只拒绝、不降级：见证通道没有“改成脱敏再写”的退路，否则宿主拿到的就不是原文。
+   */
+  #assertWitnessAdmissible(draft: EvidenceEntryDraft): void {
+    const rejection = inspectWitnessContent(draft.content);
+    if (!rejection) {
+      return;
+    }
+    observeSafely(
+      () =>
+        Logger.getInstance().warn(
+          '[EvidenceLedger] verbatim witness capture rejected before write; ledger unchanged',
+          {
+            tool: draft.tool,
+            callId: draft.callId,
+            ...(draft.file ? { file: draft.file } : {}),
+            reason: rejection.reason,
+            kind: rejection.kind,
+            ...(rejection.reason === 'SECRET_DETECTED' ? { ruleId: rejection.ruleId } : {}),
+            contentBytes: Buffer.byteLength(draft.content, 'utf8'),
+            maxContentBytes: WITNESS_MAX_CONTENT_BYTES,
+            witnessGatePolicyId: WITNESS_GATE_POLICY_ID,
+          }
+        ),
+      () => undefined
+    );
+    throw new Error(describeWitnessRejection(rejection, draft.file));
   }
 
   /** 按文件路径片段检索（E3 近似候选提示 / E5 producer 展开用），按采集序返回 */
@@ -724,7 +807,10 @@ export class EvidenceLedgerStore {
     );
   }
 
-  /** evidence-ledger/.gitignore 内容为 `*`；已存在（含运维自写的内容）则不覆盖。 */
+  /**
+   * 台账根目录（evidence-ledger/ 或见证 profile 的 evidence-witness/）下的 .gitignore 内容为 `*`；
+   * 已存在（含运维自写的内容）则不覆盖。
+   */
   #ensureSelfIgnoringGitignore(): void {
     const target = join(this.#ledgerRoot, LEDGER_GITIGNORE_NAME);
     try {

@@ -8,7 +8,12 @@ import { type EvidenceEntry, type EvidenceRange, isEvidenceToolId } from '@alemb
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
-import { type EvidenceEntryDraft, EvidenceLedgerStore } from './EvidenceLedgerStore.js';
+import {
+  type EvidenceEntryDraft,
+  type EvidenceLedgerContentProfile,
+  EvidenceLedgerStore,
+} from './EvidenceLedgerStore.js';
+import { WITNESS_GATE_POLICY_ID, WITNESS_MAX_CONTENT_BYTES } from './witnessGate.js';
 
 const AUTHORITY_KIND = 'alembic-agent-production-evidence-ledger-v1';
 const COORDINATE_MAX_LENGTH = 512;
@@ -31,6 +36,26 @@ export interface ProductionEvidenceLedgerCoordinatesV1 {
   readonly jobId: string;
   readonly sessionId: string;
   readonly dimensionId: string;
+  /**
+   * 内容 profile（脱敏阶段 3，L7-P11 方案 b；用户 2026-10-19 批准的公开类型增量，运行时绑定不变）。
+   * - 缺省或 'redacted-evidence'：现状。脱敏→8000 字符截断，落在 <dataRoot>/.asd/evidence-ledger/，
+   *   storeId 与 storeConfigHash 与引入本字段之前逐字节相同（宿主切换前续跑的严格会话不受影响）。
+   * - 'verbatim-witness'：宿主严格链的逐字节见证。落在 <dataRoot>/.asd/evidence-witness/<jobId>/，
+   *   不脱敏、不截断，contentHash = sha256(原文)；单文件超过 1 MiB、UTF-8 往返不一致（含有损解码
+   *   留下的 U+FFFD）、命中见证闸门（前缀 token、JWT、带正文的 PEM 私钥块）时，capture 在写盘前抛
+   *   `ALEMBIC_AGENT_EVIDENCE_WITNESS_REJECTED:<原因>:<规则种类> … file=<路径>`，台账不新增行。
+   *   storeId 与 storeConfigHash 都纳入 profile（后者另含上限与闸门策略 id），与默认 profile 不同。
+   */
+  readonly contentProfile?: 'redacted-evidence' | 'verbatim-witness';
+}
+
+/** 归一化后的坐标：profile 已解析为确定值，只在模块内使用。 */
+interface NormalizedProductionEvidenceLedgerCoordinates {
+  readonly dataRoot: string;
+  readonly jobId: string;
+  readonly sessionId: string;
+  readonly dimensionId: string;
+  readonly contentProfile: EvidenceLedgerContentProfile;
 }
 
 export interface ProductionEvidenceLedgerIdentityV1 {
@@ -75,17 +100,15 @@ const readFacetBindings = new WeakMap<ProductionEvidenceLedgerReadFacetV1, Autho
  * 打开 Agent 唯一的 production Evidence Ledger。
  *
  * capture/read 两个 facet 都闭包到同一真实 store 实例；重新以相同可信坐标调用会 hydrate
- * 同一 JSONL。调用方不能注入 adapter、redactor、store id 或 config hash。
+ * 同一 JSONL。调用方不能注入 adapter、redactor、store id 或 config hash，只能在两个固定的
+ * 内容 profile 之间选择（见 ProductionEvidenceLedgerCoordinatesV1.contentProfile）。
  */
 export function createProductionEvidenceLedgerAuthority(
   input: ProductionEvidenceLedgerCoordinatesV1
 ): ProductionEvidenceLedgerAuthorityV1 {
   const coordinates = normalizeCoordinates(input);
   const identity = createIdentity(coordinates);
-  const store = new EvidenceLedgerStore({
-    ...coordinates,
-    redactor: redactDeveloperText,
-  });
+  const store = openProfileStore(coordinates, identity);
   store.assertProductionAuthorityHealthy();
   const binding: AuthorityBinding = { identity, store };
   const capture = Object.freeze({
@@ -116,6 +139,40 @@ export function createProductionEvidenceLedgerAuthority(
   authorityBindings.set(authority, binding);
   readFacetBindings.set(read, binding);
   return authority;
+}
+
+/**
+ * 按 profile 打开真实 store。默认分支的构造参数与引入 profile 之前完全相同（固定注入
+ * redactDeveloperText）；见证分支不注入任何 redactor（store 会拒绝），并记一条 info 诊断，
+ * 让宿主日志能看出本次严格会话走的是逐字节见证通道及其上限、闸门策略。
+ */
+function openProfileStore(
+  coordinates: NormalizedProductionEvidenceLedgerCoordinates,
+  identity: ProductionEvidenceLedgerIdentityV1
+): EvidenceLedgerStore {
+  const location = {
+    dataRoot: coordinates.dataRoot,
+    jobId: coordinates.jobId,
+    sessionId: coordinates.sessionId,
+    dimensionId: coordinates.dimensionId,
+  };
+  if (coordinates.contentProfile !== 'verbatim-witness') {
+    return new EvidenceLedgerStore({ ...location, redactor: redactDeveloperText });
+  }
+  const store = new EvidenceLedgerStore({ ...location, contentProfile: 'verbatim-witness' });
+  observeSafely(
+    () =>
+      Logger.getInstance().info('[ProductionEvidenceLedger] opened verbatim witness profile', {
+        storeId: identity.storeId,
+        jobId: coordinates.jobId,
+        dimensionId: coordinates.dimensionId,
+        contentProfile: coordinates.contentProfile,
+        maxContentBytes: WITNESS_MAX_CONTENT_BYTES,
+        witnessGatePolicyId: WITNESS_GATE_POLICY_ID,
+      }),
+    () => undefined
+  );
+  return store;
 }
 
 /**
@@ -290,7 +347,7 @@ function validateCaptureRange(value: unknown, validationToken: object): Evidence
 
 function normalizeCoordinates(
   input: ProductionEvidenceLedgerCoordinatesV1
-): ProductionEvidenceLedgerCoordinatesV1 {
+): NormalizedProductionEvidenceLedgerCoordinates {
   if (!input || typeof input !== 'object') {
     throwCoordinateError('coordinates must be an object');
   }
@@ -326,13 +383,29 @@ function normalizeCoordinates(
     jobId: input.jobId,
     sessionId: input.sessionId,
     dimensionId: input.dimensionId,
+    contentProfile: normalizeContentProfile(input.contentProfile),
   });
 }
 
+/** 缺省（undefined）即默认 profile；其它任何值（含 null、拼错的字符串）都按坐标非法拒绝。 */
+function normalizeContentProfile(value: unknown): EvidenceLedgerContentProfile {
+  if (value === undefined || value === 'redacted-evidence') {
+    return 'redacted-evidence';
+  }
+  if (value === 'verbatim-witness') {
+    return value;
+  }
+  throwCoordinateError('contentProfile must be redacted-evidence or verbatim-witness');
+}
+
 function createIdentity(
-  coordinates: ProductionEvidenceLedgerCoordinatesV1
+  coordinates: NormalizedProductionEvidenceLedgerCoordinates
 ): ProductionEvidenceLedgerIdentityV1 {
   const storageRootHash = sha256(`storage-root\0${coordinates.dataRoot}`);
+  const persistence = 'append-only-jsonl-v1';
+  const witness = coordinates.contentProfile === 'verbatim-witness';
+  // 默认 profile 的存储语义与配置必须与引入 profile 之前逐字节相同（storeId / storeConfigHash 不变，
+  // D6：默认 profile 的轮换随宿主切换一次完成）；只有见证 profile 追加 profile 字段，得到新身份。
   const storeSemantic = {
     schemaVersion: 1,
     authorityKind: AUTHORITY_KIND,
@@ -340,17 +413,28 @@ function createIdentity(
     jobId: coordinates.jobId,
     sessionId: coordinates.sessionId,
     dimensionId: coordinates.dimensionId,
-    persistence: 'append-only-jsonl-v1',
-  } as const;
+    persistence,
+    ...(witness ? { contentProfile: 'verbatim-witness' } : {}),
+  };
   const storeId = `agent-evidence-ledger:${digestCanonical(storeSemantic)}`;
-  const storeConfigHash = sha256(
-    JSON.stringify({
-      authorityKind: AUTHORITY_KIND,
-      persistence: storeSemantic.persistence,
-      redaction: 'redact-developer-text-v1',
-      storeId,
-    })
-  );
+  const storeConfig = witness
+    ? {
+        authorityKind: AUTHORITY_KIND,
+        persistence,
+        contentProfile: 'verbatim-witness',
+        redaction: 'none',
+        truncation: 'none',
+        maxContentBytes: WITNESS_MAX_CONTENT_BYTES,
+        witnessGatePolicyId: WITNESS_GATE_POLICY_ID,
+        storeId,
+      }
+    : {
+        authorityKind: AUTHORITY_KIND,
+        persistence,
+        redaction: 'redact-developer-text-v1',
+        storeId,
+      };
+  const storeConfigHash = sha256(JSON.stringify(storeConfig));
   return Object.freeze({
     schemaVersion: 1,
     authorityKind: AUTHORITY_KIND,
@@ -359,7 +443,7 @@ function createIdentity(
     jobId: coordinates.jobId,
     sessionId: coordinates.sessionId,
     dimensionId: coordinates.dimensionId,
-    persistence: storeSemantic.persistence,
+    persistence,
   });
 }
 
