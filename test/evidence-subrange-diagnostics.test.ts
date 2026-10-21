@@ -10,6 +10,8 @@
  *   使用同一归类。
  * - registry 参数说明写明“range 条目用文件行号，无 range 条目用条目内 1 起行号”。
  * - 归类路径输出诊断日志。
+ * - C059 / L4-P18r4：基础 id 在台账但子区间写法非法时（含 `@` 之后连 start[-end] 都解析不出的写法）
+ *   按基础 id 再查台账，三个入口报子区间语法错误而不是“无法解析 / 不在证据台账”。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -525,6 +527,92 @@ describe('基础 id 存在但子区间语法非法', () => {
     expect(lineFor('E-2@210')).toContain('reason=malformed-subrange-single-line');
     expect(lineFor('E-9@0-5')).toContain('kind=unknown-ref');
     expect(lineFor('E-9@0-5')).toContain('reason=id-not-in-ledger');
+  });
+
+  /**
+   * L4-P18r4（C059 第四轮）：`@` 之后的内容连宽松语法 `start[-end]` 都解析不出（en-dash、em-dash、
+   * 缺起点/终点、`L` 前缀、尾随标点、冒号、波浪号、多段区间、全角数字、为空）时，基础 id 仍能从
+   * `E-n@` 前缀提出且在台账里。I21 修法原文是“含 '@' 时用基础 id 再查”，所以三个入口必须报子区间
+   * 语法错误并附可用区间，不能再报“无法解析 / 不在证据台账”（那正是模型放弃有效证据的原症状）。
+   */
+  test.each([
+    ['E-2@200–210'],
+    ['E-2@200—210'],
+    ['E-2@-5'],
+    ['E-2@5-'],
+    ['E-2@L200-L210'],
+    ['E-2@200-210.'],
+    ['E-2@200:210'],
+    ['E-2@200~210'],
+    ['E-2@200-210,220-230'],
+    ['E-2@２００-210'],
+    ['E-2@'],
+  ])('子区间写法解析不出的 %s：三个入口都报子区间语法错误并附可用区间', async (ref) => {
+    const ledger = seedLedger();
+    const errors = await surfaceErrors(ledger, ref);
+    for (const error of [errors.get, errors.note, errors.submit]) {
+      expect(error).toContain('子区间语法错误');
+      expect(error).toContain(`"${ref}"`);
+      expect(error).toContain('E-2@start-end');
+      expect(error).toContain('1≤start≤end');
+      expect(error).toContain('可用区间 200-450');
+      expect(error).toContain('文件行号');
+      expect(error).not.toContain('无法解析');
+      expect(error).not.toContain('不在证据台账');
+      expect(error).not.toContain('子区间越界');
+    }
+    expect(errors.note).toContain('evidenceRefs');
+    expect(errors.submit).toContain('reasoning.evidenceRefs');
+  });
+
+  test('无 range 条目的 E-1@1–2：报子区间语法错误并写明条目内 1 起行号区间', async () => {
+    const ledger = seedLedger();
+    const errors = await surfaceErrors(ledger, 'E-1@1–2');
+    for (const error of [errors.get, errors.note, errors.submit]) {
+      expect(error).toContain('子区间语法错误');
+      expect(error).toContain('E-1@start-end');
+      expect(error).toContain('可用区间 1-3');
+      expect(error).toContain('条目内 1 起行号');
+      expect(error).not.toContain('无法解析');
+      expect(error).not.toContain('不在证据台账');
+    }
+  });
+
+  test('对照：基础 id 不在台账、或连 E-n@ 前缀都提不出时仍报无法解析', async () => {
+    const ledger = seedLedger();
+    for (const ref of ['E-9@200–210', 'E-9@', 'E-@1-2', '@200-210', 'lib/a.ts@1-2']) {
+      const errors = await surfaceErrors(ledger, ref);
+      for (const error of [errors.get, errors.note, errors.submit]) {
+        expect(error).toContain('无法解析');
+        expect(error).not.toContain('子区间语法错误');
+        expect(error).not.toContain('子区间越界');
+      }
+      expect(errors.note).toContain('不在证据台账');
+    }
+  });
+
+  test('解析不出的子区间写法输出 reason=malformed-subrange-unrecognized；unknown-ref 的 reason 区分提不出 id 与 id 不在台账', async () => {
+    const ledger = seedLedger();
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+    await getError(ledger, 'E-2@200–210');
+    await getError(ledger, 'E-2@');
+    // 空格与解析失败同时出现：先报解析失败——去掉空格也写不对，whitespace 文案会误导模型只删空格
+    await getError(ledger, 'E-2@ 200–210');
+    await getError(ledger, 'E-9@200–210');
+    await getError(ledger, 'E-@1-2');
+    const messages = info.mock.calls.map((call) => String(call[0]));
+    const lineFor = (ref: string) =>
+      messages.find((message) => message.includes(`ref=${JSON.stringify(ref)}`));
+    expect(lineFor('E-2@200–210')).toContain('surface=evidence.get');
+    expect(lineFor('E-2@200–210')).toContain('kind=subrange-malformed');
+    expect(lineFor('E-2@200–210')).toContain('reason=malformed-subrange-unrecognized');
+    expect(lineFor('E-2@200–210')).toContain('declared=200-450');
+    expect(lineFor('E-2@')).toContain('reason=malformed-subrange-unrecognized');
+    expect(lineFor('E-2@ 200–210')).toContain('reason=malformed-subrange-unrecognized');
+    expect(lineFor('E-9@200–210')).toContain('kind=unknown-ref');
+    expect(lineFor('E-9@200–210')).toContain('reason=id-not-in-ledger');
+    expect(lineFor('E-@1-2')).toContain('kind=unknown-ref');
+    expect(lineFor('E-@1-2')).toContain('reason=malformed-ref');
   });
 });
 
