@@ -1868,12 +1868,15 @@ describe('strict Analyst premise and counterexample facts stay within the popula
     expect(() =>
       createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
     ).toThrow(outsidePopulation);
+    // 诊断在 *_FACT_OUTSIDE_POPULATION 失败关闭处记录，带实际抛出的错误码与假设 ID（L7-P5r4 (2)）。
     expect(warn).toHaveBeenCalledWith(
       '[StrictAnalyst] epoch rebuild classifies facts outside the population',
       expect.objectContaining({
         component: 'assertStrictAnalystEpochIntegrity',
         reason: 'rebuild-without-host-fact-authority',
         selectedPath: 'classify-as-outside-population',
+        code: 'STRICT_ANALYST_HYPOTHESIS_FACT_OUTSIDE_POPULATION',
+        hypothesisId: 'hypothesis-handler',
         factIds: [factId],
       })
     );
@@ -1897,8 +1900,18 @@ describe('strict Analyst premise and counterexample facts stay within the popula
         })),
       })),
     });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
     expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(
       /^STRICT_ANALYST_COUNTEREXAMPLE_FACT_OUTSIDE_POPULATION: hypothesis-handler$/u
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[StrictAnalyst] epoch rebuild classifies facts outside the population',
+      expect.objectContaining({
+        selectedPath: 'classify-as-outside-population',
+        code: 'STRICT_ANALYST_COUNTEREXAMPLE_FACT_OUTSIDE_POPULATION',
+        hypothesisId: 'hypothesis-handler',
+        factIds: ['fact-extra'],
+      })
     );
   });
 
@@ -1922,6 +1935,101 @@ describe('strict Analyst premise and counterexample facts stay within the popula
     expect(() =>
       validateStrictAnalystEpochV1(withPremises(semantic, ['fact-handler'], [' fact-handler ']))
     ).toThrow(/^STRICT_ANALYST_HYPOTHESIS_FACT_INVENTED: hypothesis-handler$/u);
+  });
+
+  // L7-P5r4 (1)：重建合成的 knownFactIds 只含规范形事实。population 观测里的非规范元素（带首尾空白）
+  // 不并入，与首次校验一样在 population 权威校验处报 STRICT_ANALYST_FACT_INVENTED: <observationId>，
+  // 而不是以 epoch 并不携带的 knownFactIds 字段报 STRICT_ID_SET_INVALID（并集经 trim 后出现重复）。
+  it.each([
+    ['a padded population factId whose canonical form the premise references', [' fact-handler ']],
+    [
+      'a population observation carrying both forms of one factId',
+      ['fact-handler', ' fact-handler '],
+    ],
+  ])('reports %s as invented at rebuild, as the first validation does', (_label, factIds) => {
+    const { lineageInput, semantic } = createLineageFixture();
+    const { epoch } = lineageInput;
+    const tampered = resealEpoch(epoch, {
+      population: {
+        ...epoch.population,
+        observations: epoch.population.observations.map((row) => ({ ...row, factIds })),
+      },
+    });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const invented = /^STRICT_ANALYST_FACT_INVENTED: observation-handler$/u;
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(invented);
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [tampered],
+      })
+    ).toThrow(invented);
+    expect(() =>
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
+    ).toThrow(invented);
+    // 首次校验参照：宿主 knownFactIds 是规范形集合，同一 population 篡改报同一错误码。
+    expect(() =>
+      validateStrictAnalystEpochV1({
+        ...semantic.epochInput,
+        population: {
+          ...semantic.epochInput.population,
+          observations: semantic.epochInput.population.observations.map((row) => ({
+            ...row,
+            factIds,
+          })),
+        },
+      })
+    ).toThrow(invented);
+    // 该事实就在 population 里（只是形态不规范），不得记成“population 外”的归类诊断。
+    expect(warn).not.toHaveBeenCalledWith(
+      '[StrictAnalyst] epoch rebuild classifies facts outside the population',
+      expect.anything()
+    );
+  });
+
+  // L7-P5r4 (2)：population 外事实的归类诊断只在 *_FACT_OUTSIDE_POPULATION 真的失败关闭时记录；
+  // 重建因更早的原因被拒时，日志不得宣称一条没有发生的归类路径（最终错误码也不同）。
+  it.each([
+    [
+      'an invalid review context hash',
+      (): Partial<StrictAnalystEpochV1> => ({ currentAnalysisFixpointHash: 'not-a-hash' }),
+      /^STRICT_ANALYST_REVIEW_CONTEXT_HASH_INVALID$/u,
+    ],
+    [
+      'missing execution receipts',
+      (): Partial<StrictAnalystEpochV1> => ({ executionReceipts: [] }),
+      /^STRICT_ANALYST_POPULATION_INCOMPLETE$/u,
+    ],
+  ])('does not log an outside-population classification when the rebuild is rejected earlier by %s', (_label, earlierFailure, code) => {
+    const { lineageInput, semantic } = createLineageFixture();
+    const { epoch } = lineageInput;
+    const tampered = resealEpoch(epoch, {
+      ...earlierFailure(),
+      inductions: epoch.inductions.map((receipt) => ({
+        ...receipt,
+        hypotheses: receipt.hypotheses.map((hypothesis) => ({
+          ...hypothesis,
+          premiseFactIds: ['fact-ghost', 'fact-handler'],
+        })),
+      })),
+    });
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(code);
+    expect(() =>
+      createStrictAnalysisFixpointV1({
+        finalExpandedSchedule: semantic.finalExpandedSchedule,
+        terminalObligations: semantic.terminalObligations,
+        epochs: [tampered],
+      })
+    ).toThrow(code);
+    expect(() =>
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered })
+    ).toThrow(code);
+    expect(warn).not.toHaveBeenCalledWith(
+      '[StrictAnalyst] epoch rebuild classifies facts outside the population',
+      expect.anything()
+    );
   });
 });
 
