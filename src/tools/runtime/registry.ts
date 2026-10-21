@@ -41,6 +41,7 @@ import type { ToolSelection } from '#tools/kernel/toolSchema.js';
 import { handle as handleCode, OUTLINE_FILTER_KINDS } from './handlers/code.js';
 import { handle as handleEvidence } from './handlers/evidence.js';
 import { handle as handleGraph } from './handlers/graph.js';
+import { REVIEW_QUEUE_DEFAULT_LIMIT, REVIEW_QUEUE_MAX_LIMIT } from './handlers/knowledge/input.js';
 import { handle as handleKnowledge } from './handlers/knowledge.js';
 import { handle as handleMemory } from './handlers/memory.js';
 import { handle as handleMeta } from './handlers/meta.js';
@@ -493,8 +494,7 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             type: 'integer',
             minimum: 1,
             maximum: Number.MAX_SAFE_INTEGER,
-            description:
-              'review-queue only: positive integer cap on entries returned (oldest-first)',
+            description: `review-queue only: positive integer cap on entries returned (oldest-first). Omitted: defaults to ${REVIEW_QUEUE_DEFAULT_LIMIT}. Values above ${REVIEW_QUEUE_MAX_LIMIT} are clamped to ${REVIEW_QUEUE_MAX_LIMIT}. When the pending queue exceeds the applied cap, the result is annotated in band (total/truncated/limit/message).`,
           },
         },
         required: ['operation'],

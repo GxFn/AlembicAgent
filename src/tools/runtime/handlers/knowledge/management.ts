@@ -15,7 +15,11 @@ import {
 import {
   numberValue,
   pickString,
+  REVIEW_QUEUE_DEFAULT_LIMIT,
+  REVIEW_QUEUE_MAX_LIMIT,
+  type ReviewQueueLimitPlan,
   recordValue,
+  resolveReviewQueueLimit,
   stringValue,
   validateManagementInput,
 } from './input.js';
@@ -243,6 +247,54 @@ async function handleActiveTransition(
   }
 }
 
+/**
+ * review-queue 结果投影（L3-P6d）：显式 limit 在上限内时结构与之前完全一致（{ queue, count }）；
+ * 缺省或超上限时 Core 已做无界读，这里按 plan.cap 切片。只有真的切掉了条目才新增带内字段
+ * （total/truncated/limit/requestedLimit/message），没切时仍是旧结构，调用方按 truncated 判断即可。
+ * status 一律保持 success（截断是契约内行为，不 degraded、不抬升 diagnosticWarnings）；
+ * 诊断只走日志：缺省截断记 debug（常规路径），超上限记 warn（调用方输入越过契约上限）。
+ */
+function projectReviewQueueResult<T>(
+  plan: ReviewQueueLimitPlan,
+  queue: T[]
+): Record<string, unknown> {
+  if (plan.mode === 'explicit') {
+    return { queue, count: queue.length };
+  }
+  const total = queue.length;
+  const truncated = total > plan.cap;
+  const kept = truncated ? queue.slice(0, plan.cap) : queue;
+  const detail = `${plan.mode === 'clamped' ? `requested=${plan.requestedLimit}` : 'limit omitted'}, default=${REVIEW_QUEUE_DEFAULT_LIMIT}, ceiling=${REVIEW_QUEUE_MAX_LIMIT}, total=${total}, returned=${kept.length}, truncated=${truncated}`;
+  if (plan.mode === 'clamped') {
+    // 超上限是调用方越过契约：无论是否真的切掉条目都告警，便于定位把超大 limit 当"全部"用的宿主。
+    logKnowledgeFallback(
+      'warn',
+      `[knowledge.manage] review-queue limit clamped to the ceiling (${detail}): Core read unbounded, result sliced locally${truncated ? ' and annotated in band (total/truncated/limit/requestedLimit/message)' : '; nothing was cut'}`
+    );
+  } else if (truncated) {
+    logKnowledgeFallback(
+      'debug',
+      `[knowledge.manage] review-queue default limit truncated the queue (${detail}): Core read unbounded, result sliced locally and annotated in band (total/truncated/limit/message)`
+    );
+  }
+  if (!truncated) {
+    return { queue, count: total };
+  }
+  const message =
+    plan.mode === 'clamped'
+      ? `Review queue truncated: returned the oldest ${kept.length} of ${total} pending entries because the requested limit ${plan.requestedLimit} exceeds the ceiling ${REVIEW_QUEUE_MAX_LIMIT}. Record review outcomes to drain the queue; the remaining entries become reachable as reviewed ones leave staging.`
+      : `Review queue truncated: returned the oldest ${kept.length} of ${total} pending entries (default limit ${REVIEW_QUEUE_DEFAULT_LIMIT}). Pass limit (up to ${REVIEW_QUEUE_MAX_LIMIT}) to fetch more in one call, or record review outcomes to drain the queue.`;
+  return {
+    queue: kept,
+    count: kept.length,
+    total,
+    truncated: true,
+    limit: plan.cap,
+    ...(plan.mode === 'clamped' ? { requestedLimit: plan.requestedLimit } : {}),
+    message,
+  };
+}
+
 export async function handleManage(
   params: Record<string, unknown>,
   ctx: ToolContext
@@ -266,10 +318,11 @@ export async function handleManage(
     if (!stagingManager || typeof stagingManager.listReviewQueue !== 'function') {
       return unavailableManagementPort(operation, 'stagingManager', 'listReviewQueue');
     }
-    const limit = params.limit as number | undefined;
+    // limit 已由 validateManagementInput 保证缺省或正安全整数；缺省/超上限的归一化规则见 input.ts。
+    const plan = resolveReviewQueueLimit(params.limit as number | undefined);
     try {
       // 这是只读端口；取消可结束等待，迟到数据不能再成为本次工具结果。
-      const read = await runOperation(() => stagingManager.listReviewQueue(limit), {
+      const read = await runOperation(() => stagingManager.listReviewQueue(plan.coreLimit), {
         abortSignal: ctx.abortSignal,
       });
       const aborted = abortedKnowledgeResult(ctx, 'manage(review-queue)');
@@ -284,7 +337,7 @@ export async function handleManage(
           false
         );
       }
-      return ok({ queue: read.value, count: read.value.length });
+      return ok(projectReviewQueueResult(plan, read.value));
     } catch (err: unknown) {
       return managementFailure(operation, undefined, err, false);
     }

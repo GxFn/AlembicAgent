@@ -2271,9 +2271,12 @@ describe('tool result ordinary output', () => {
     const envelope = await knowledgeResultBoundary(
       { stagingManager: { listReviewQueue, recordReview: async () => undefined } },
       'manage',
-      { operation: 'review-queue' }
+      // 显式 limit（≤ 上限 500）直通 Core，结果结构不变；缺省 limit 的默认 50 条与带内截断见
+      // knowledge-review-queue-limit.test.ts（L3-P6d）。本用例只验证 adapter 不再掏空超预算的宽结果。
+      { operation: 'review-queue', limit: 400 }
     );
     expect(listReviewQueue).toHaveBeenCalledOnce();
+    expect(listReviewQueue).toHaveBeenCalledWith(400);
     expect(envelope).toMatchObject({ ok: true, status: 'success' });
     const content = envelope.structuredContent as { queue: unknown[]; count: number };
     expect(content.count).toBe(400);

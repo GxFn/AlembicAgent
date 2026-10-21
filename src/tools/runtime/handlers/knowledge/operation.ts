@@ -48,10 +48,11 @@ export function completedMutationMeta(
 }
 
 /**
- * 知识操作的回落/代填观察日志。日志只是观察者：宿主日志实现抛错或返回 rejected Promise
+ * 知识操作的回落/代填/截断观察日志。日志只是观察者：宿主日志实现抛错或返回 rejected Promise
  * 都不能阻断或改写真实端口调用；调用方负责在 message 中写清触发条件、原值与选择路径。
+ * debug 供契约内的常规分叉使用（如 review-queue 缺省 limit 截断），info/warn 语义不变。
  */
-export function logKnowledgeFallback(level: 'info' | 'warn', message: string): void {
+export function logKnowledgeFallback(level: 'debug' | 'info' | 'warn', message: string): void {
   observeSafely(
     () => Logger.getInstance()[level](message),
     () => undefined

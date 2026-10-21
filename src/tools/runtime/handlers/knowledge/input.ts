@@ -87,6 +87,47 @@ export function validateManagementInput(params: Record<string, unknown>): string
   return null;
 }
 
+/**
+ * review-queue 条数策略（L3-P06 后续包，2026-10-20 用户决定：默认 limit 加带内诊断）。
+ * Core listReviewQueue 不传 limit 即无界，宿主 /agent/tool 直通时会把 staging 全部待复核条目塞进
+ * 一次响应。本函数只做纯归一化：不读端口、不切片、不打日志（本模块按 layer contract 不持有日志端口），
+ * 日志与带内标注由 management.ts 按 plan.mode 落实。
+ *
+ * - 缺省 → 取 REVIEW_QUEUE_DEFAULT_LIMIT 条。50 条足够宿主 LLM 一轮「断言 vs 源码」复核；队列最旧优先，
+ *   复核写回后自然排空，单次响应体积可控。
+ * - 显式且 ≤ REVIEW_QUEUE_MAX_LIMIT → 原样直通 Core（行为不变；validateManagementInput 已保证正安全整数）。
+ * - 显式 > 上限 → 按上限截断并带内标注。500 既挡住用超大 limit 绕开体积控制，也保留 400 条规模的
+ *   adapter 宽结果回归探针（L3-C01）可以显式整批取回。
+ * - 缺省与截断两条路径都让 Core 做无界读、再由 handler 本地切片：Core 的 limit 作用在「过滤已复核条目」
+ *   之前，直接传上限可能少返回而不自知；无界读是本包之前就有的成本，切片后才能给出准确的 total。
+ *   Core 没有 offset，取更多只能加大 limit（≤ 上限）或先复核写回让队列排空。
+ */
+export const REVIEW_QUEUE_DEFAULT_LIMIT = 50;
+export const REVIEW_QUEUE_MAX_LIMIT = 500;
+
+export type ReviewQueueLimitPlan =
+  /** 显式且在上限内：limit 直通 Core，结果不切片、不标注。 */
+  | { mode: 'explicit'; coreLimit: number }
+  /** 未传 limit：Core 无界读，handler 切到默认条数。 */
+  | { mode: 'default'; coreLimit: undefined; cap: number }
+  /** 显式超过上限：Core 无界读，handler 切到上限并带回原始请求值。 */
+  | { mode: 'clamped'; coreLimit: undefined; cap: number; requestedLimit: number };
+
+export function resolveReviewQueueLimit(limit: number | undefined): ReviewQueueLimitPlan {
+  if (limit === undefined) {
+    return { mode: 'default', coreLimit: undefined, cap: REVIEW_QUEUE_DEFAULT_LIMIT };
+  }
+  if (limit > REVIEW_QUEUE_MAX_LIMIT) {
+    return {
+      mode: 'clamped',
+      coreLimit: undefined,
+      cap: REVIEW_QUEUE_MAX_LIMIT,
+      requestedLimit: limit,
+    };
+  }
+  return { mode: 'explicit', coreLimit: limit };
+}
+
 export function pickString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }

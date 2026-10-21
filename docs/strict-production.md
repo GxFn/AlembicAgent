@@ -29,7 +29,7 @@ Core canonicalize/create/validate仍是确定性裁决入口。读取已保存�
 
 `knowledge.manage(update)`只允许声明的内容编辑字段。这个工具许可集合与当前Core KnowledgeService支持的内容字段对齐；生命周期、发布时间、复核状态、grace截止、统计和其他未声明字段均不能通过通用update写入。显式`undefined`也不能旁路字段检查。字段许可不替代Core服务的值对象校验、系统标签合并、retrieval profile验证或事务处理。
 
-管理ID必须是非空字符串；score要求显式有限数值，不假设额外计分范围；evolution confidence限定0..1，缺席时保留既有默认值，非法显式输入不能被默认值覆盖。review-queue limit是正安全整数。
+管理ID必须是非空字符串；score要求显式有限数值，不假设额外计分范围；evolution confidence限定0..1，缺席时保留既有默认值，非法显式输入不能被默认值覆盖。review-queue limit是正安全整数；缺席时默认取最旧的50条，显式值超过500按500截断，真正截断时结果带内标注`total`/`truncated`/`limit`/`message`（超上限时另带`requestedLimit`），status仍为success。
 
 readiness/review-queue是可取消读取；已经发出的Core管理写入继续等待真实回执。异常结果保留Core `code`、`details`及readiness信息；写入状态区分：
 
