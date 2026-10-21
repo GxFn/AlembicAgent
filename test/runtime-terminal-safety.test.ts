@@ -3928,6 +3928,14 @@ describe('terminal.exec budget, audit classification and input normalization (L4
   // L4-P12r3（C071）：宿主回报的 diagnostics 不合法时仍按 sandboxed=true / fallbackUsed=false 回落，
   // 回落值与模型可见文本不变，但必须留下 terminal_executor_result_normalized 诊断和一条 warn，
   // 诊断只写字段名与类型，不回显宿主给出的取值。
+  // L4-P12r4：回落是逐字段的（合法的 sandboxed/fallbackUsed 原样保留），所以回落说明必须逐条写实际回落的
+  // 字段，并以生效的沙箱状态收尾，不能固定写“默认 sandboxed=true fallbackUsed=false”——那会让只看 warn 的人
+  // 把一次未沙箱执行读成已回落到沙箱内。数组、Date、Map 这类非记录对象整体替换为回落值，必须留诊断与 warn，
+  // 不能再因三个字段都读到 undefined 而被当成“宿主未报告”静默吞掉。
+  const wholeFallbackNotes = [
+    'diagnostics replaced by fallback',
+    'effective sandboxed=true fallbackUsed=false',
+  ];
   it.each([
     {
       label: 'string booleans',
@@ -3939,6 +3947,12 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expectedText: 'ok',
       fields: ['diagnostics.sandboxed=string', 'diagnostics.fallbackUsed=string'],
       echoed: ['diagnostics.sandboxed=false', 'diagnostics.fallbackUsed=true'],
+      notes: [
+        'diagnostics.sandboxed treated as true',
+        'diagnostics.fallbackUsed treated as false',
+        'effective sandboxed=true fallbackUsed=false',
+      ],
+      misleading: ['diagnostics.degradeReason'],
     },
     {
       label: 'non-string degradeReason with a valid unsandboxed report',
@@ -3947,6 +3961,43 @@ describe('terminal.exec budget, audit classification and input normalization (L4
         'ok\n\n[unsandboxed:unknown] sandboxed=false fallbackUsed=true degradeReason=none',
       fields: ['diagnostics.degradeReason=number'],
       echoed: ['42'],
+      notes: ['diagnostics.degradeReason dropped', 'effective sandboxed=false fallbackUsed=true'],
+      misleading: [
+        'sandboxed=true',
+        'fallbackUsed=false',
+        'diagnostics.sandboxed',
+        'diagnostics.fallbackUsed',
+      ],
+    },
+    {
+      label: 'string fallbackUsed with a valid unsandboxed flag',
+      diagnostics: {
+        sandboxed: false,
+        fallbackUsed: 'true',
+        degradeReason: 'seatbelt_unavailable',
+      },
+      expectedText:
+        'ok\n\n[unsandboxed:seatbelt_unavailable] sandboxed=false fallbackUsed=false degradeReason=seatbelt_unavailable',
+      fields: ['diagnostics.fallbackUsed=string'],
+      echoed: ['diagnostics.fallbackUsed=true'],
+      notes: [
+        'diagnostics.fallbackUsed treated as false',
+        'effective sandboxed=false fallbackUsed=false',
+      ],
+      misleading: ['sandboxed=true', 'diagnostics.sandboxed', 'diagnostics.degradeReason'],
+    },
+    {
+      label: 'string sandboxed with a valid fallbackUsed flag',
+      diagnostics: { sandboxed: 'false', fallbackUsed: true },
+      expectedText:
+        'ok\n\n[unsandboxed:unknown] sandboxed=true fallbackUsed=true degradeReason=none',
+      fields: ['diagnostics.sandboxed=string'],
+      echoed: ['diagnostics.sandboxed=false'],
+      notes: [
+        'diagnostics.sandboxed treated as true',
+        'effective sandboxed=true fallbackUsed=true',
+      ],
+      misleading: ['fallbackUsed=false', 'diagnostics.fallbackUsed', 'diagnostics.degradeReason'],
     },
     {
       label: 'distinctive field values',
@@ -3954,6 +4005,11 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expectedText: 'ok',
       fields: ['diagnostics.sandboxed=string'],
       echoed: ['HOST-SECRET-VALUE'],
+      notes: [
+        'diagnostics.sandboxed treated as true',
+        'effective sandboxed=true fallbackUsed=false',
+      ],
+      misleading: ['diagnostics.fallbackUsed', 'diagnostics.degradeReason'],
     },
     {
       label: 'string diagnostics',
@@ -3961,6 +4017,8 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expectedText: 'ok',
       fields: ['diagnostics=string'],
       echoed: ['unsandboxed'],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed'],
     },
     {
       label: 'null diagnostics',
@@ -3968,12 +4026,52 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expectedText: 'ok',
       fields: ['diagnostics=null'],
       echoed: [],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed'],
+    },
+    {
+      label: 'empty array diagnostics',
+      diagnostics: [],
+      expectedText: 'ok',
+      fields: ['diagnostics=array'],
+      echoed: [],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
+    },
+    {
+      label: 'array diagnostics carrying a payload',
+      diagnostics: ['unsandboxed'],
+      expectedText: 'ok',
+      fields: ['diagnostics=array'],
+      echoed: ['unsandboxed'],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
+    },
+    {
+      label: 'Date diagnostics',
+      diagnostics: new Date(0),
+      expectedText: 'ok',
+      fields: ['diagnostics=date'],
+      echoed: ['1970'],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
+    },
+    {
+      label: 'Map diagnostics',
+      diagnostics: new Map([['sandboxed', false]]),
+      expectedText: 'ok',
+      fields: ['diagnostics=map'],
+      echoed: [],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
     },
   ])('reports malformed executor diagnostics without changing the fallback: $label', async ({
     diagnostics,
     expectedText,
     fields,
     echoed,
+    notes,
+    misleading,
   }) => {
     const warn = vi
       .spyOn(Logger.getInstance(), 'warn')
@@ -3990,27 +4088,29 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       );
       expect(normalized).toHaveLength(1);
       const message = normalized[0]?.message ?? '';
-      for (const field of fields) {
-        expect(message).toContain(field);
-      }
-      for (const value of echoed) {
-        expect(message).not.toContain(value);
-      }
-      expect(message).toContain(
-        'malformed diagnostics fields default to sandboxed=true fallbackUsed=false'
-      );
-      expect(message).not.toContain('stdout=');
-      expect(message).not.toContain('exitCode=');
       const lines = warn.mock.calls
         .map((args) => String(args[0]))
         .filter((line) => line.includes('terminal_executor_result_normalized'));
       expect(lines).toHaveLength(1);
-      for (const field of fields) {
-        expect(lines[0]).toContain(field);
+      // 诊断与 warn 两条通道都要能看出哪个字段坏了、回落成了什么、生效的沙箱状态是什么；
+      // 没坏的字段不能被点名，更不能带与实际状态相反的旧说法。
+      for (const text of [message, lines[0] ?? '']) {
+        for (const field of fields) {
+          expect(text).toContain(field);
+        }
+        for (const note of notes) {
+          expect(text).toContain(note);
+        }
+        for (const value of echoed) {
+          expect(text).not.toContain(value);
+        }
+        for (const value of misleading) {
+          expect(text).not.toContain(value);
+        }
+        expect(text).not.toContain('malformed diagnostics fields default to');
+        expect(text).not.toContain('stdout=');
       }
-      for (const value of echoed) {
-        expect(lines[0]).not.toContain(value);
-      }
+      expect(message).not.toContain('exitCode=');
     } finally {
       warn.mockRestore();
     }
@@ -4095,7 +4195,12 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       expect(normalized[0]?.message).toContain(
         'stdout=number diagnostics.sandboxed=string diagnostics.fallbackUsed=string'
       );
-      expect(normalized[0]?.message).toContain('missing output treated as empty');
+      // 输出问题与 diagnostics 问题各自的回落说明按顺序拼在同一条消息里，diagnostics 部分逐字段写。
+      expect(normalized[0]?.message).toContain(
+        'missing output treated as empty, non-integer exitCode treated as 1; ' +
+          'diagnostics.sandboxed treated as true; diagnostics.fallbackUsed treated as false; ' +
+          'effective sandboxed=true fallbackUsed=false'
+      );
       expect(
         warn.mock.calls.filter((args) =>
           String(args[0]).includes('terminal_executor_result_normalized')

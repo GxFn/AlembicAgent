@@ -519,14 +519,18 @@ async function execInSandboxOrDirect(
  * 归一宿主执行器的返回值：stdout/stderr 不是字符串时按空输出处理，exitCode 不是整数时按 1（失败）处理，
  * 返回值本身不是对象时三者都取兜底值。不把可疑的 '0' 之类取值猜成成功：执行结果无法确认时宁可报失败。
  * diagnostics 交给 normalizeTerminalDiagnostics 逐字段校验。任一字段被归一都追加
- * terminal_executor_result_normalized（只含字段名与类型），并记 warn。
+ * terminal_executor_result_normalized（只含字段名与类型），并记 warn；消息尾部的回落说明逐条写实际回落的
+ * 字段，并以生效的 sandboxed/fallbackUsed 收尾（L4-P12r4）。
  */
 function normalizeExecutorResult(raw: unknown): TerminalExecutionResult {
   const sandboxFallback: TerminalExecutionDiagnostics = { sandboxed: true, fallbackUsed: false };
   const issues: string[] = [];
-  // diagnostics 的问题单独收集：它们的回落规则（取 sandboxFallback 的对应字段）与输出/退出码不同，
-  // 诊断消息要按实际发生的回落写说明，不能让只坏了 diagnostics 的结果读成“输出被清空、退出码记 1”。
-  const diagnosticIssues: string[] = [];
+  // diagnostics 的问题单独收集：它们的回落规则（逐字段取 sandboxFallback 的对应字段，合法字段原样保留）
+  // 与输出/退出码不同，诊断消息要按实际发生的回落写说明：不能让只坏了 diagnostics 的结果读成“输出被清空、
+  // 退出码记 1”，也不能固定写“默认 sandboxed=true fallbackUsed=false”——那句话在逐字段回落时与实际状态
+  // 相反，会让只看 warn 的人把未沙箱执行读成已回落到沙箱内，说明由 normalizeTerminalDiagnostics 按字段给出。
+  let diagnosticIssues: string[] = [];
+  let diagnosticNotes: string[] = [];
   let stdout = '';
   let stderr = '';
   let exitCode = 1;
@@ -547,7 +551,10 @@ function normalizeExecutorResult(raw: unknown): TerminalExecutionResult {
     } else {
       issues.push(`exitCode=${describeType(raw.exitCode)}`);
     }
-    diagnostics = normalizeTerminalDiagnostics(raw.diagnostics, sandboxFallback, diagnosticIssues);
+    const normalizedDiagnostics = normalizeTerminalDiagnostics(raw.diagnostics, sandboxFallback);
+    diagnostics = normalizedDiagnostics.diagnostics;
+    diagnosticIssues = normalizedDiagnostics.issues;
+    diagnosticNotes = normalizedDiagnostics.notes;
   } else {
     issues.push(`result=${describeType(raw)}`);
   }
@@ -558,9 +565,7 @@ function normalizeExecutorResult(raw: unknown): TerminalExecutionResult {
     ...(issues.length > 0
       ? ['missing output treated as empty, non-integer exitCode treated as 1']
       : []),
-    ...(diagnosticIssues.length > 0
-      ? ['malformed diagnostics fields default to sandboxed=true fallbackUsed=false']
-      : []),
+    ...diagnosticNotes,
   ];
   const message =
     `sandbox executor returned malformed fields: ${[...issues, ...diagnosticIssues].join(' ')}; ` +
@@ -790,48 +795,120 @@ function terminalDiagnosticSuffix(diagnostics: TerminalExecutionDiagnostics): st
   return `\n\n[unsandboxed:${reason}] ${formatTerminalDiagnostic(diagnostics)}`;
 }
 
+/** normalizeTerminalDiagnostics 的产出：归一后的值、发现的字段问题与配套的回落说明。 */
+interface NormalizedTerminalDiagnostics {
+  diagnostics: TerminalExecutionDiagnostics;
+  /** 归一时发现的问题，只写“字段名=类型”，不回显取值；为空表示宿主回报合法或未回报。 */
+  issues: string[];
+  /** 与 issues 配套的回落说明：逐条写实际回落的字段及其取值，并以生效的沙箱状态收尾；issues 为空时也为空。 */
+  notes: string[];
+}
+
 /**
- * 宿主执行器回报的 diagnostics 逐字段校验；不是对象或字段类型不符时取 fallback 的对应值。
- * 回落值本身不变，但每次回落都把“字段名=类型”写进 issues（不回显取值），由调用方合进
- * terminal_executor_result_normalized 诊断与 warn：宿主若把 sandboxed:false 写成字符串，
- * 结果会被当成沙箱内执行，这条回落必须可见。
+ * 宿主执行器回报的 diagnostics 逐字段校验；不是记录对象或字段类型不符时取 fallback 的对应值。
+ * 回落值本身不变，但每次回落都把“字段名=类型”写进 issues（不回显取值），并在 notes 里写明该字段实际
+ * 回落成了什么、生效的 sandboxed/fallbackUsed 是什么，由调用方合进 terminal_executor_result_normalized
+ * 诊断与 warn：宿主若把 sandboxed:false 写成字符串，结果会被当成沙箱内执行，这条回落必须可见。
+ * 回落是逐字段的，合法字段原样保留，所以说明不能把没回落的字段也写成回落值——degradeReason 单独坏时
+ * 宿主合法回报的 sandboxed=false fallbackUsed=true 仍然生效，不能让 warn 读成已回落到沙箱内（L4-P12r4）。
  * undefined（整体缺失或字段缺失）视为宿主未报告，保持静默：旧宿主和多数执行器不回报 diagnostics。
+ * 数组、Date、Map 这类非记录对象上三个字段都读不到，不能按“字段缺失”静默：整体替换为 fallback 并留痕。
  */
 function normalizeTerminalDiagnostics(
   diagnostics: unknown,
-  fallback: TerminalExecutionDiagnostics,
-  issues: string[]
-): TerminalExecutionDiagnostics {
+  fallback: TerminalExecutionDiagnostics
+): NormalizedTerminalDiagnostics {
   if (diagnostics === undefined) {
-    return fallback;
+    return { diagnostics: fallback, issues: [], notes: [] };
   }
-  if (!isRecord(diagnostics)) {
-    issues.push(`diagnostics=${describeType(diagnostics)}`);
-    return fallback;
+  if (!isDiagnosticsRecord(diagnostics)) {
+    return {
+      diagnostics: fallback,
+      issues: [`diagnostics=${describeDiagnosticsType(diagnostics)}`],
+      notes: ['diagnostics replaced by fallback', describeEffectiveSandboxState(fallback)],
+    };
   }
-  for (const [field, expected] of [
-    ['sandboxed', 'boolean'],
-    ['fallbackUsed', 'boolean'],
-    ['degradeReason', 'string'],
+  const issues: string[] = [];
+  const notes: string[] = [];
+  const sandboxed =
+    typeof diagnostics.sandboxed === 'boolean' ? diagnostics.sandboxed : fallback.sandboxed;
+  const fallbackUsed =
+    typeof diagnostics.fallbackUsed === 'boolean'
+      ? diagnostics.fallbackUsed
+      : fallback.fallbackUsed;
+  for (const [field, expected, note] of [
+    ['sandboxed', 'boolean', `diagnostics.sandboxed treated as ${String(fallback.sandboxed)}`],
+    [
+      'fallbackUsed',
+      'boolean',
+      `diagnostics.fallbackUsed treated as ${String(fallback.fallbackUsed)}`,
+    ],
+    [
+      'degradeReason',
+      'string',
+      // fallback 当前不带 degradeReason，畸形的 degradeReason 实际上是被丢弃；带默认原因时写受限字符集的原因。
+      fallback.degradeReason
+        ? `diagnostics.degradeReason treated as ${safeToken(fallback.degradeReason)}`
+        : 'diagnostics.degradeReason dropped',
+    ],
   ] as const) {
     const value = diagnostics[field];
     if (value !== undefined && typeof value !== expected) {
       issues.push(`diagnostics.${field}=${describeType(value)}`);
+      notes.push(note);
     }
   }
+  if (issues.length > 0) {
+    notes.push(describeEffectiveSandboxState({ sandboxed, fallbackUsed }));
+  }
   return {
-    sandboxed:
-      typeof diagnostics.sandboxed === 'boolean' ? diagnostics.sandboxed : fallback.sandboxed,
-    fallbackUsed:
-      typeof diagnostics.fallbackUsed === 'boolean'
-        ? diagnostics.fallbackUsed
-        : fallback.fallbackUsed,
-    ...(typeof diagnostics.degradeReason === 'string'
-      ? { degradeReason: diagnostics.degradeReason }
-      : fallback.degradeReason
-        ? { degradeReason: fallback.degradeReason }
-        : {}),
+    diagnostics: {
+      sandboxed,
+      fallbackUsed,
+      ...(typeof diagnostics.degradeReason === 'string'
+        ? { degradeReason: diagnostics.degradeReason }
+        : fallback.degradeReason
+          ? { degradeReason: fallback.degradeReason }
+          : {}),
+    },
+    issues,
+    notes,
   };
+}
+
+/**
+ * diagnostics 只有是记录对象（普通对象、Object.create(null) 或带字段的类实例）时才逐字段读取。
+ * 数组、Date、Map、RegExp 这类内建对象 typeof 也是 'object'，但三个字段都读不到，不能被当成“字段缺失”静默；
+ * 用 Object.prototype.toString 的标签区分，跨 realm 的普通对象同样能通过。
+ */
+function isDiagnosticsRecord(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && objectTag(value) === 'Object';
+}
+
+/**
+ * 整体畸形的 diagnostics 的类型标签：数组单列为 array，其它对象取小写的 toString 标签（date、map……，
+ * 经 safeToken 限制字符集，宿主自定义的 Symbol.toStringTag 不会原样进日志），基础类型沿用 describeType。
+ */
+function describeDiagnosticsType(value: unknown): string {
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  if (isRecord(value)) {
+    return safeToken(objectTag(value).toLowerCase());
+  }
+  return describeType(value);
+}
+
+/** Object.prototype.toString 的标签名（Object、Array、Date、Map……）；宿主可用 Symbol.toStringTag 自定义，进日志前须经 safeToken。 */
+function objectTag(value: object): string {
+  return Object.prototype.toString.call(value).slice(8, -1);
+}
+
+/** 回落说明的收尾：归一后生效的沙箱状态。只含布尔值，不含宿主文本。 */
+function describeEffectiveSandboxState(
+  state: Pick<TerminalExecutionDiagnostics, 'sandboxed' | 'fallbackUsed'>
+): string {
+  return `effective sandboxed=${String(state.sandboxed)} fallbackUsed=${String(state.fallbackUsed)}`;
 }
 
 function formatTerminalDiagnostic(diagnostics: TerminalExecutionDiagnostics): string {
