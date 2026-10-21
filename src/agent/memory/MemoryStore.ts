@@ -582,7 +582,9 @@ export class MemoryStore {
    * @param options.tokenCache 调用方持有的分词缓存（key 为小写正文，值为 Core 分词结果）。一次 consolidate 内
    *   每条候选都要与最多 MEMORY_STORE_MAX_MEMORIES 行比较，缓存避免同一正文被反复分词；
    *   key 是正文本身，行被 UPDATE / MERGE 改写后自然换 key，不会读到旧分词。
-   *   Core 覆盖范围外文字的补充 token 存在与该缓存同生命周期的伴随缓存里，不改变这里的值语义。
+   *   Core 覆盖范围外文字的补充 token 结果以这里存的 Core 分词 Set 为键弱引用挂载（见 scriptProfilesByCoreTokens），
+   *   不改变这里的值语义；调用方 clear() / delete() 丢掉 Set 后，伴随结果随之失效并可回收，
+   *   长期复用并定期 clear 同一个 Map 的调用方不会积累旧条目。
    * @returns 带 similarity 和 related_memories_raw 字段的 raw rows
    */
   findSimilar(
@@ -597,32 +599,37 @@ export class MemoryStore {
     const candidates = this.getCandidates(type, candidateWindow);
     const lowerContent = content.toLowerCase();
     const contentTokens = MemoryStore.#tokensFor(lowerContent, tokenCache);
-    const augment = (lower: string, coreTokens: Set<string>) =>
-      MemoryStore.#augmentedTokensFor(lower, coreTokens, tokenCache);
 
     let exactFallbacks = 0;
     let exactMatches = 0;
     let supplementedComparisons = 0;
+    let wordLevelLowered = 0;
+    let coreDisjointCapped = 0;
     const scored = candidates
       .map((row) => {
         const lowerRow = (row.content || '').toLowerCase();
-        const { score, exactFallback, supplemented } = MemoryStore.#scoreSimilarity(
+        const outcome = MemoryStore.#scoreSimilarity(
           contentTokens,
           lowerContent,
           MemoryStore.#tokensFor(lowerRow, tokenCache),
-          lowerRow,
-          augment
+          lowerRow
         );
-        if (exactFallback) {
+        if (outcome.exactFallback) {
           exactFallbacks++;
-          if (score > 0) {
+          if (outcome.score > 0) {
             exactMatches++;
           }
         }
-        if (supplemented) {
+        if (outcome.supplemented) {
           supplementedComparisons++;
         }
-        return { ...row, similarity: score, related_memories_raw: row.related_memories };
+        if (outcome.wordLevelLowered) {
+          wordLevelLowered++;
+        }
+        if (outcome.coreDisjointCapped) {
+          coreDisjointCapped++;
+        }
+        return { ...row, similarity: outcome.score, related_memories_raw: row.related_memories };
       })
       .filter((r) => r.similarity > 0.1)
       .sort((a, b) => b.similarity - a.similarity);
@@ -641,6 +648,20 @@ export class MemoryStore {
         `[MemoryStore] findSimilar scored ${supplementedComparisons}/${candidates.length} candidates with script-supplement tokens: text outside Core tokenizer coverage was added to Jaccard (type=${type ?? '*'})`
       );
     }
+    if (wordLevelLowered > 0) {
+      // 补充 token 路径里字符 bigram 分值被整词 Jaccard 压低的次数；只记计数与 type，不记正文。
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] findSimilar lowered ${wordLevelLowered}/${candidates.length} candidates to their whole-word Jaccard: character bigrams of shared identifiers outweighed differing words (type=${type ?? '*'})`
+      );
+    }
+    if (coreDisjointCapped > 0) {
+      // 与查询没有任何共同 Core 词、分值被封顶的候选数；只记计数、上限与 type，不记正文。
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] findSimilar capped ${coreDisjointCapped}/${candidates.length} candidates at ${DISJOINT_CORE_WORDS_SCORE_CAP}: no Core word (Latin identifier, number or CJK run) is shared with the query, so script-supplement tokens alone cannot mark a duplicate (type=${type ?? '*'})`
+      );
+    }
 
     return scored.slice(0, limit);
   }
@@ -653,23 +674,35 @@ export class MemoryStore {
    */
   static computeSimilarity(tokensA: Set<string>, lowerA: string, contentB: string): number {
     const lowerB = (contentB || '').toLowerCase();
-    const { score, exactFallback, supplemented } = MemoryStore.#scoreSimilarity(
+    const outcome = MemoryStore.#scoreSimilarity(
       tokensA,
       lowerA,
       tokenizeForSimilarity(lowerB),
-      lowerB,
-      (lower, coreTokens) => MemoryStore.#augmentedTokensFor(lower, coreTokens, undefined)
+      lowerB
     );
-    if (exactFallback) {
+    const { score } = outcome;
+    if (outcome.exactFallback) {
       logMemoryStore(
         'debug',
         `[MemoryStore] computeSimilarity exact-match fallback: neither side has comparable tokens (score=${score})`
       );
     }
-    if (supplemented) {
+    if (outcome.supplemented) {
       logMemoryStore(
         'debug',
         `[MemoryStore] computeSimilarity scored with script-supplement tokens: text outside Core tokenizer coverage was added to Jaccard (score=${score})`
+      );
+    }
+    if (outcome.wordLevelLowered) {
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] computeSimilarity lowered the score to the whole-word Jaccard: character bigrams of shared identifiers outweighed differing words (score=${score})`
+      );
+    }
+    if (outcome.coreDisjointCapped) {
+      logMemoryStore(
+        'debug',
+        `[MemoryStore] computeSimilarity capped the score at ${DISJOINT_CORE_WORDS_SCORE_CAP}: no Core word (Latin identifier, number or CJK run) is shared, so script-supplement tokens alone cannot mark a duplicate (score=${score})`
       );
     }
     return score;
@@ -677,8 +710,9 @@ export class MemoryStore {
 
   /**
    * 相似度打分核心。exactFallback 标记“双方都没有可比 token、退化为精确比较”的分支；
-   * supplemented 标记 Jaccard 分支用到了 Core 覆盖范围外文字的补充 token。
-   * 两者都由调用方决定如何记诊断（单次调用记一条，批量查询汇总记一条）。
+   * supplemented 标记 Jaccard 分支用到了 Core 覆盖范围外文字的补充 token；
+   * wordLevelLowered / coreDisjointCapped 标记补充 token 路径里的两道限制是否生效（见下）。
+   * 四者都由调用方决定如何记诊断（单次调用记一条，批量查询汇总记一条）。
    *
    * 分支判定（是否精确比较、是否一侧为空）只看 Core 分词，与 C30 修复时的语义一致；
    * 补充 token 只进入双方都有 Core token 时的 Jaccard 计算。
@@ -687,9 +721,8 @@ export class MemoryStore {
     tokensA: Set<string>,
     lowerA: string,
     tokensB: Set<string>,
-    lowerB: string,
-    augment: (lower: string, coreTokens: Set<string>) => Set<string>
-  ): { score: number; exactFallback: boolean; supplemented: boolean } {
+    lowerB: string
+  ): SimilarityOutcome {
     if (tokensA.size === 0 && tokensB.size === 0) {
       // Core 分词只保留拉丁字母、数字与 CJK 字符，西里尔文、韩文、假名、纯符号文本两侧都没有 token，
       // Jaccard 无从计算。旧实现在这里返回 1.0，任意两段此类文本都被判为重复，新记忆被静默丢弃（C30）。
@@ -697,45 +730,80 @@ export class MemoryStore {
       // 完全相同仍判为重复，其余一律视为不相似。
       const exact =
         MemoryStore.#normalizeForExactMatch(lowerA) === MemoryStore.#normalizeForExactMatch(lowerB);
-      return { score: exact ? 1 : 0, exactFallback: true, supplemented: false };
+      return {
+        score: exact ? 1 : 0,
+        exactFallback: true,
+        supplemented: false,
+        wordLevelLowered: false,
+        coreDisjointCapped: false,
+      };
     }
     if (tokensA.size === 0 || tokensB.size === 0) {
-      return { score: 0, exactFallback: false, supplemented: false };
+      return {
+        score: 0,
+        exactFallback: false,
+        supplemented: false,
+        wordLevelLowered: false,
+        coreDisjointCapped: false,
+      };
     }
 
     // 双方都有 Core token 时，Core token 可能只是共同的拉丁标识符或数字（如两段无关俄文都提到 Zustand、80），
     // 只用它们算 Jaccard 会得到 1.0 并把新记忆当作 UPDATE 丢弃（C30 第三轮审计 C008）。
     // 这里把 Core 丢掉的文字补回 token 集合再算；纯 a-z/0-9/CJK 文本补充集为空，得分与修复前完全一致。
-    const augmentedA = augment(lowerA, tokensA);
-    const augmentedB = augment(lowerB, tokensB);
-    const supplemented = augmentedA !== tokensA || augmentedB !== tokensB;
-    const jaccard = jaccardSimilarity(augmentedA, augmentedB);
+    const profileA = MemoryStore.#scriptProfileFor(lowerA, tokensA);
+    const profileB = MemoryStore.#scriptProfileFor(lowerB, tokensB);
+    const supplemented = profileA.supplemented || profileB.supplemented;
+    let jaccard = jaccardSimilarity(profileA.augmented, profileB.augmented);
+    let wordLevelLowered = false;
+    if (supplemented) {
+      // 第四轮审计（C30 / C008 补修）：补充 token 路径里，共同的长拉丁标识符贡献 word + bigram 共十几个 token，
+      // 而一个只差的词（韩文单音节否定词 안、俄文一个词）只占一两个 token，字符层 Jaccard 仍 ≥ 0.85。
+      // 所以再按整词算一次 Jaccard，取两者较小值：两句只有在字符层和词层都接近时才算重复。
+      // 只在双方都能切出至少两个词时生效——无空格书写系统（日文、泰文）整句就是一个词，整词 Jaccard 没有意义，
+      // 继续只用字符层分值。英文 / CJK 文本不进入补充 token 路径，分值与此前完全一致。
+      const wordsA = wholeWordsOf(profileA);
+      const wordsB = wholeWordsOf(profileB);
+      if (wordsA.size >= 2 && wordsB.size >= 2) {
+        const wordJaccard = jaccardSimilarity(wordsA, wordsB);
+        if (wordJaccard < jaccard) {
+          jaccard = wordJaccard;
+          wordLevelLowered = true;
+        }
+      }
+    }
     const containsBonus = lowerA.includes(lowerB) || lowerB.includes(lowerA) ? 0.3 : 0;
-    return { score: Math.min(1.0, jaccard + containsBonus), exactFallback: false, supplemented };
+    let score = Math.min(1.0, jaccard + containsBonus);
+    let coreDisjointCapped = false;
+    if (
+      supplemented &&
+      score > DISJOINT_CORE_WORDS_SCORE_CAP &&
+      !setsIntersect(coreWordsOf(profileA), coreWordsOf(profileB))
+    ) {
+      // 用户决定（2026-10-21）：核心标识符不同就不算重复。两句只在拉丁标识符或数字上不同的非拉丁文本
+      // （俄文 Zustand / Redux、端口 8080 / 3000、Vitest / Jest）补充 token 后非拉丁部分完全重合，
+      // 分值会升到 0.78–0.91，第二条被当作 UPDATE 丢弃或被 MERGE 拼成一行。
+      // 双方没有任何共同的 Core 词时，把分值封顶在 MERGE 门槛之下，两条记忆都保留；
+      // Core 词有交集（同一标识符的复述、加长、NFD 形式）时不封顶，仍按上面的分值判重。
+      score = DISJOINT_CORE_WORDS_SCORE_CAP;
+      coreDisjointCapped = true;
+    }
+    return { score, exactFallback: false, supplemented, wordLevelLowered, coreDisjointCapped };
   }
 
   /**
-   * Core token 与补充 token 的并集；文本没有 Core 覆盖范围外的字母或数字时直接返回 coreTokens 本身（不复制），
-   * 调用方据此用引用比较判断是否发生了补充。传入 cache 时按小写正文复用合并结果。
+   * 一段正文在补充 token 路径里需要的全部派生数据，以它的 Core 分词 Set 为键弱引用记忆（见 scriptProfilesByCoreTokens）。
+   * 命中条件是同一个 Set 对象且正文相同：调用方缓存 clear() / delete() 后 #tokensFor 会生成新 Set，自然重算；
+   * 同一个 Set 被错误地配给另一段正文时也会重算，而不是复用错的结果。
+   * 文本没有 Core 覆盖范围外的字母或数字时 augmented 就是 coreTokens 本身（不复制）。
    */
-  static #augmentedTokensFor(
-    lower: string,
-    coreTokens: Set<string>,
-    cache: Map<string, Set<string>> | undefined
-  ): Set<string> {
-    let augmentedCache: Map<string, Set<string>> | undefined;
-    if (cache) {
-      augmentedCache = augmentedTokenCaches.get(cache);
-      if (!augmentedCache) {
-        augmentedCache = new Map<string, Set<string>>();
-        augmentedTokenCaches.set(cache, augmentedCache);
-      }
-      const cached = augmentedCache.get(lower);
-      if (cached) {
-        return cached;
-      }
+  static #scriptProfileFor(lower: string, coreTokens: Set<string>): ScriptTokenProfile {
+    const memoized = scriptProfilesByCoreTokens.get(coreTokens);
+    if (memoized && memoized.lower === lower) {
+      return memoized;
     }
-    const supplement = uncoveredScriptTokens(lower);
+    const normalized = lower.toLowerCase().normalize('NFC');
+    const supplement = uncoveredScriptTokens(normalized);
     let augmented = coreTokens;
     if (supplement.size > 0) {
       augmented = new Set(coreTokens);
@@ -743,8 +811,16 @@ export class MemoryStore {
         augmented.add(token);
       }
     }
-    augmentedCache?.set(lower, augmented);
-    return augmented;
+    const profile: ScriptTokenProfile = {
+      lower,
+      normalized,
+      augmented,
+      supplemented: supplement.size > 0,
+      words: null,
+      coreWords: null,
+    };
+    scriptProfilesByCoreTokens.set(coreTokens, profile);
+    return profile;
   }
 
   static #normalizeForExactMatch(lower: string): string {
@@ -962,20 +1038,68 @@ const CORE_UNCOVERED_LETTER_OR_NUMBER = /[^\P{L}a-z\u3400-\u4dbf\u4e00-\u9fff]|[
 const SUPPLEMENT_WORD = /[\p{L}\p{M}\p{N}]+/gu;
 
 /**
- * 每个调用方 tokenCache 对应一份“Core token ∪ 补充 token”的伴随缓存，随调用方缓存一起被回收；
+ * Core 分词会作为整词保留的片段：a-z、0-9 与 CJK 字符的连续段，且至少 2 个字符
+ * （单字符片段在 Core 里既不成词也不产生 bigram）。字符类必须与 CORE_UNCOVERED_LETTER_OR_NUMBER 互补、
+ * 与 Core tokenizeForSimilarity 保持一致。
+ */
+const CORE_WORD = /[a-z0-9\u3400-\u4dbf\u4e00-\u9fff]{2,}/gu;
+
+/**
+ * 双方没有任何共同 Core 词时，补充 token 路径能给出的相似度上限（用户决定 2026-10-21：核心标识符不同就不算重复）。
+ * 必须低于 MemoryConsolidator 的 SIMILARITY_MERGE（0.6）与 MemoryConsolidator / MemoryRetriever 的
+ * SIMILARITY_UPDATE（0.85）：只差拉丁标识符或数字的非拉丁句子既不能被 UPDATE 吞掉，也不能被 MERGE 拼成一行；
+ * 同时高于 findSimilar 的 0.1 过滤线，检索仍把它们当作相关候选返回。只对补充 token 路径生效。
+ */
+const DISJOINT_CORE_WORDS_SCORE_CAP = 0.5;
+
+/** #scoreSimilarity 的结果与它走过的分支；诊断由调用方按单次 / 汇总方式记录。 */
+interface SimilarityOutcome {
+  score: number;
+  /** 双方都没有 Core token，退化为归一化后的精确比较。 */
+  exactFallback: boolean;
+  /** Jaccard 用到了 Core 覆盖范围外文字的补充 token。 */
+  supplemented: boolean;
+  /** 补充 token 路径里整词 Jaccard 低于字符层 Jaccard，分值被压到整词值。 */
+  wordLevelLowered: boolean;
+  /** 补充 token 路径里双方没有共同 Core 词，分值被封顶在 DISJOINT_CORE_WORDS_SCORE_CAP。 */
+  coreDisjointCapped: boolean;
+}
+
+/** 补充 token 路径里一段正文的派生数据；words / coreWords 只在需要时计算一次。 */
+interface ScriptTokenProfile {
+  /** 命中校验用：与 Core 分词 Set 对应的小写正文。 */
+  lower: string;
+  /** 再次小写并 NFC 后的正文，补充分词、整词与 Core 词都从它切出。 */
+  normalized: string;
+  /** Core token ∪ 补充 token；补充集为空时就是 Core 分词 Set 本身。 */
+  augmented: Set<string>;
+  /** 是否补了 Core 覆盖范围外的 token。 */
+  supplemented: boolean;
+  /** 整词集合（SUPPLEMENT_WORD 切分，含拉丁 / 数字 / CJK 片段），用于整词 Jaccard。 */
+  words: Set<string> | null;
+  /** Core 词集合（CORE_WORD），用于判断双方是否共享任何拉丁标识符、数字或 CJK 片段。 */
+  coreWords: Set<string> | null;
+}
+
+/**
+ * 补充 token 派生数据以 Core 分词 Set 对象为键弱引用保存。
+ * 调用方 tokenCache 里存的就是这些 Set：clear() / delete() 丢掉 Set 后条目随之不可达并被回收，
+ * 不会像以调用方 Map 为键的伴随缓存那样在 clear() 后继续持有旧条目、把新 Set 误判为“补了 token”。
  * 调用方缓存本身仍只存 Core 分词结果，公开参数的值语义不变。
  */
-const augmentedTokenCaches = new WeakMap<Map<string, Set<string>>, Map<string, Set<string>>>();
+const scriptProfilesByCoreTokens = new WeakMap<Set<string>, ScriptTokenProfile>();
 
 /**
  * 为 Core 覆盖范围外的文字补 token（C30 第三轮审计 C008）。
- * 只处理含覆盖范围外字母或数字的词：补词本身（≥2 个码点时）和按码点切的字符 bigram，与 Core 的 word + bigram 规则对齐。
- * 先做 NFC，保证同一句话的 NFD / NFC 形式（如西里尔 й、韩文音节）得到相同 token。
+ * 只处理含覆盖范围外字母或数字的词：补词本身和按码点切的字符 bigram。
+ * 词本身不设长度下限（第四轮审计）：韩文单音节词在 NFC 下只有 1 个码点（안、못、꼭、씀、써、다 …），
+ * 否定词 안 也在其中；若像 Core 对单字符那样丢掉，两条只共享一个拉丁标识符、其余都是单音节词的韩文记忆
+ * 仍会得 1.0 并把正反两句判成同一条。
+ * 入参须已小写并 NFC，保证同一句话的 NFD / NFC 形式（如西里尔 й、韩文音节）得到相同 token。
  * 纯 a-z/0-9/CJK 文本走快速路径返回空集，相似度与修复前完全一致。
  */
-function uncoveredScriptTokens(lower: string): Set<string> {
+function uncoveredScriptTokens(normalized: string): Set<string> {
   const tokens = new Set<string>();
-  const normalized = lower.toLowerCase().normalize('NFC');
   if (!CORE_UNCOVERED_LETTER_OR_NUMBER.test(normalized)) {
     return tokens;
   }
@@ -985,16 +1109,49 @@ function uncoveredScriptTokens(lower: string): Set<string> {
       // 纯拉丁 / 数字 / CJK 的词已由 Core 分词覆盖，不重复补。
       continue;
     }
-    // 按码点切分，避免把扩展平面字符（代理对）切成半个字符。
+    tokens.add(word);
+    // 按码点切分，避免把扩展平面字符（代理对）切成半个字符；单码点词没有 bigram，只有上面的词本身。
     const codePoints = Array.from(word);
-    if (codePoints.length >= 2) {
-      tokens.add(word);
-    }
     for (let i = 0; i + 1 < codePoints.length; i++) {
       tokens.add(codePoints[i] + codePoints[i + 1]);
     }
   }
   return tokens;
+}
+
+/** 整词集合，按需计算并缓存在 profile 上。 */
+function wholeWordsOf(profile: ScriptTokenProfile): Set<string> {
+  if (!profile.words) {
+    const words = new Set<string>();
+    for (const match of profile.normalized.matchAll(SUPPLEMENT_WORD)) {
+      words.add(match[0]);
+    }
+    profile.words = words;
+  }
+  return profile.words;
+}
+
+/** Core 词集合，按需计算并缓存在 profile 上。 */
+function coreWordsOf(profile: ScriptTokenProfile): Set<string> {
+  if (!profile.coreWords) {
+    const words = new Set<string>();
+    for (const match of profile.normalized.matchAll(CORE_WORD)) {
+      words.add(match[0]);
+    }
+    profile.coreWords = words;
+  }
+  return profile.coreWords;
+}
+
+function setsIntersect(a: Set<string>, b: Set<string>): boolean {
+  const smaller = a.size <= b.size ? a : b;
+  const larger = a.size <= b.size ? b : a;
+  for (const item of smaller) {
+    if (larger.has(item)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
