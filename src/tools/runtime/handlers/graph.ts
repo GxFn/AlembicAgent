@@ -13,9 +13,38 @@ import {
 
 interface GraphRead {
   source: string;
-  /** 来自 GRAPH_QUERY_HOST_READERS 的 legacy 标注：命中即记 GRAPH_QUERY_LEGACY_READER。 */
+  /**
+   * 来自 GRAPH_QUERY_HOST_READERS 的 legacy 标注：被实际调用即记 GRAPH_QUERY_LEGACY_READER，
+   * 返回值、返回空、抛错、读取中被取消都留痕（见 legacyReaderWarnings）。
+   */
   legacy: boolean;
   invoke: () => unknown;
+}
+
+/** 一次读取器调用的终态：成功路径为 value/empty，非 ok 路径沿用 runOperation 的状态名。 */
+type GraphReadResult = 'value' | 'empty' | 'error' | 'aborted' | 'timeout';
+
+/**
+ * legacy 读取器被实际调用即留痕，不论本次调用以值、空、抛错还是取消收场：待决事项③要核对的是
+ * “旧端口仍被接线并调用”这一事实，只在成功路径留痕会让抛错的调用不可归因。只看最后一次实际调用的
+ * 读取器；非 legacy 读取器不记。result 写明终态，供事后区分旧端口是正常服务还是已经失效。
+ */
+function legacyReaderWarnings(
+  hit: GraphRead | undefined,
+  stage: string,
+  result: GraphReadResult
+): ToolDiagnosticWarning[] {
+  if (!hit?.legacy) {
+    return [];
+  }
+  return [
+    {
+      code: 'GRAPH_QUERY_LEGACY_READER',
+      tool: 'graph',
+      stage,
+      message: `path=${hit.source}; reason=legacy-host-port; result=${result}`,
+    },
+  ];
 }
 
 /** query type 合法性只认共享读取表的自有键；不在本文件另抄一份类型清单。 */
@@ -46,9 +75,10 @@ function reader(
 
 /**
  * 读取路径、优先级与实参形状全部来自 kernel 的 GRAPH_QUERY_HOST_READERS（availability 共用同一张表）。
- * 表中 legacy 条目是旧宿主兼容入口：照常读取，命中时 readGraph 一律记 GRAPH_QUERY_LEGACY_READER 并带出
- * path=<port>.<method>（overrides/extensions 的唯一读取器位于下标 0，同样留痕），足以事后核对是否仍有
- * 旧宿主；只有命中读取器下标大于 0 时才额外记 GRAPH_QUERY_FALLBACK。消费者与移除条件（待决事项③）见该常量注释。
+ * 表中 legacy 条目是旧宿主兼容入口：照常读取，被实际调用时 readGraph 一律记 GRAPH_QUERY_LEGACY_READER 并带出
+ * path=<port>.<method>（overrides/extensions 的唯一读取器位于下标 0，同样留痕；抛错或读取中被取消的调用
+ * 也留痕），足以事后核对是否仍有旧宿主；只有成功读取的命中读取器下标大于 0 时才额外记 GRAPH_QUERY_FALLBACK。
+ * 消费者与移除条件（待决事项③）见该常量注释。
  */
 function queryReaders(
   type: GraphQueryType,
@@ -70,47 +100,62 @@ async function readGraph(
   if (!readers.some(Boolean)) {
     return fail(`Graph ${stage} host method is not available`);
   }
+  // 最后一次实际调用的读取器下标，放在 runOperation 闭包之外：读取器抛错或读取被取消时 outcome 不再携带
+  // 闭包返回值，失败分支仍要据此归因到具体端口并给 legacy 读取器留痕。循环先查信号再调用读取器，取消后不会
+  // 再进入新的读取器，所以 outcome 结束后它不会再变。
+  let invoked: number | undefined;
   // 只读端口未必支持底层取消；只结束等待，并在进入备用端口前重查信号。
   const outcome = await runOperation(
     async (signal) => {
-      let selected = 0;
       for (const [index, read] of readers.entries()) {
         if (signal.aborted) {
-          return { value: null, selected };
+          return null;
         }
         if (!read) {
           continue;
         }
-        selected = index;
+        invoked = index;
         const value = await read.invoke();
         if (value !== undefined && value !== null) {
-          return { value, selected };
+          return value;
         }
       }
-      return { value: null, selected };
+      return null;
     },
     { abortSignal: ctx.abortSignal }
   );
+  // 尚未调用任何读取器（取消先于首次读取）时不归因，避免给从未被调用的 legacy 端口留假痕迹。
+  const hit = invoked === undefined ? undefined : readers[invoked];
   if (outcome.status !== 'ok') {
     const reason =
       outcome.error instanceof Error
         ? outcome.error.message
         : String(outcome.error ?? outcome.status);
-    const result = fail(`Graph ${stage} ${outcome.status}: ${reason}`);
-    if (outcome.status === 'aborted' || outcome.status === 'timeout') {
+    // 抛错/取消同样是“旧端口被接线并调用”的事实：文案带出 path 以区分主读取器与旧端口抛错，legacy 读取器
+    // 照常记 GRAPH_QUERY_LEGACY_READER（result=<status>）。GRAPH_QUERY_FALLBACK/fallbackUsed 只描述
+    // “结果经备用路径得到”，没有结果时不记，语义保持不变。
+    const diagnosticWarnings = legacyReaderWarnings(hit, stage, outcome.status);
+    const result = fail(
+      `Graph ${stage} ${outcome.status}: ${reason}${hit ? ` (path=${hit.source})` : ''}`
+    );
+    const interrupted = outcome.status === 'aborted' || outcome.status === 'timeout';
+    if (interrupted || diagnosticWarnings.length > 0) {
       result._meta = {
-        resultStatus: outcome.status,
+        // 普通读取错误不写 resultStatus：仍由 adapter 按 ok 归一（返回时取消信号已触发则归一为 aborted）。
+        ...(interrupted ? { resultStatus: outcome.status } : {}),
         cached: false,
         durationMs: 0,
         tokensEstimate: 0,
+        ...(diagnosticWarnings.length > 0 ? { diagnosticWarnings } : {}),
       };
     }
     return result;
   }
-  const { value, selected } = outcome.value;
+  const value = outcome.value;
+  // 成功路径至少调用过一个读取器（取消先于首次读取时 runOperation 不会以 ok 结束）；?? 0 只为类型收口。
+  const selected = invoked ?? 0;
   // fallbackUsed 只表示“越过了主读取器”（下标 > 0），与是否 legacy 无关，语义保持不变。
   const fallbackUsed = selected > 0;
-  const hit = readers[selected];
   const diagnosticWarnings: ToolDiagnosticWarning[] = [];
   if (fallbackUsed) {
     diagnosticWarnings.push({
@@ -120,16 +165,9 @@ async function readGraph(
       message: `path=${hit?.source}; reason=${readers[0] ? 'primary-returned-no-result' : 'primary-unavailable'}`,
     });
   }
-  if (hit?.legacy) {
-    // 旧宿主兼容读取器被实际调用（无论处在主位还是备用位）：单独留痕，供待决事项③核对旧宿主是否仍在。
-    // 只看最后实际调用的读取器；它返回空时也记录，因为“旧端口仍被接线并调用”本身就是要核对的事实。
-    diagnosticWarnings.push({
-      code: 'GRAPH_QUERY_LEGACY_READER',
-      tool: 'graph',
-      stage,
-      message: `path=${hit.source}; reason=legacy-host-port; result=${value === null ? 'empty' : 'value'}`,
-    });
-  }
+  // 旧宿主兼容读取器被实际调用（无论处在主位还是备用位）：单独留痕，供待决事项③核对旧宿主是否仍在。
+  // 它返回空时也记录，因为“旧端口仍被接线并调用”本身就是要核对的事实。
+  diagnosticWarnings.push(...legacyReaderWarnings(hit, stage, value === null ? 'empty' : 'value'));
   return ok(project(value), {
     // 结构化显示与估算属于 adapter；这里不能为了 stringify 而丢掉已读到的宿主事实。
     tokensEstimate: typeof value === 'string' ? estimateTokens(value) : 0,

@@ -6,8 +6,9 @@
  *    availability 快照与 graph handler 都从它派生，不再各自手抄一份方法名；
  * 2. 表里逐项标出旧宿主兼容入口（legacy），且恰好是唯一生产宿主不提供的那几项；
  * 3. noteFinding 字符串回执（旧宿主形态）的兼容转译带诊断，对象回执不受影响；
- * 4. graph 的 legacy 读取器命中（含下标 0 的 overrides/extensions 唯一读取器）一律记
- *    GRAPH_QUERY_LEGACY_READER，下标 > 0 时另记 GRAPH_QUERY_FALLBACK；
+ * 4. graph 的 legacy 读取器被实际调用（含下标 0 的 overrides/extensions 唯一读取器）一律记
+ *    GRAPH_QUERY_LEGACY_READER：返回值、返回空、抛错、读取中被取消都留痕（result=value|empty|
+ *    error|aborted），失败文案另带 path=<port>.<method>；下标 > 0 的成功读取另记 GRAPH_QUERY_FALLBACK；
  * 5. knowledge.prime/detail 在 knowledgeRead 缺省时回落 knowledgeRepo 会记一条 info 日志，
  *    search-only 回落仍只用 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
  *
@@ -18,11 +19,16 @@ import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { EvidenceLedgerLike } from '../src/tools/kernel/index.js';
-import { GRAPH_QUERY_HOST_READERS, type ToolContext } from '../src/tools/kernel/registry.js';
+import {
+  GRAPH_QUERY_HOST_READERS,
+  type ToolContext,
+  type ToolResult,
+} from '../src/tools/kernel/registry.js';
 import { describeToolAvailability } from '../src/tools/runtime/availability.js';
 import { handle as handleGraph } from '../src/tools/runtime/handlers/graph.js';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
+import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
 import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 
 type GraphPort = 'projectGraph' | 'codeEntityGraph';
@@ -233,6 +239,187 @@ describe('graph.query host method table is a single shared constant', () => {
       expect(literals, rel).toEqual([]);
       expect(source, rel).not.toMatch(/ctx\.codeEntityGraph/);
     }
+  });
+});
+
+/**
+ * I23 第四轮补修（L4-P34r4）：legacy 读取器被实际调用但抛错或读取中被取消时同样要留痕。
+ * 此前 readGraph 的非 ok 分支直接 fail，既无 GRAPH_QUERY_LEGACY_READER 也无 path，待决事项③在
+ * 抛错场景下无法核对“旧端口仍被接线并调用”；错误文案也分不清抛错的是主读取器还是旧端口。
+ */
+describe('graph legacy reader trace survives a throwing or canceled read', () => {
+  const projectRoot = process.cwd();
+
+  function graphLegacyWarnings(result: ToolResult) {
+    return (result._meta?.diagnosticWarnings ?? []).filter(
+      (warning) => warning.code === 'GRAPH_QUERY_LEGACY_READER'
+    );
+  }
+
+  function throwing(message: string): () => never {
+    return () => {
+      throw new Error(message);
+    };
+  }
+
+  it.each([
+    { type: 'overrides', method: 'getMethodOverrides' },
+    { type: 'extensions', method: 'getCategoryMap' },
+  ])('records the index-0 legacy $type reader when it throws', async ({ type, method }) => {
+    const ctx: ToolContext = { projectRoot, projectGraph: { [method]: throwing('boom') } };
+    const result = await handleGraph('query', { type, entity: ENTITY }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain(`Graph query(${type}) error: boom`);
+    expect(result.error).toContain(`path=projectGraph.${method}`);
+    expect(graphLegacyWarnings(result)).toEqual([
+      {
+        code: 'GRAPH_QUERY_LEGACY_READER',
+        tool: 'graph',
+        stage: `query(${type})`,
+        message: `path=projectGraph.${method}; reason=legacy-host-port; result=error`,
+      },
+    ]);
+    // 普通读取错误不写 resultStatus：仍由 adapter 按 ok 归一（返回时取消信号已触发则归一为 aborted）。
+    expect(result._meta?.resultStatus).toBeUndefined();
+    expect(result._meta?.fallbackUsed).not.toBe(true);
+  });
+
+  it('records the legacy reader when its promise rejects', async () => {
+    const ctx: ToolContext = {
+      projectRoot,
+      projectGraph: { getMethodOverrides: () => Promise.reject(new Error('boom-async')) },
+    };
+    const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe(
+      'Graph query(overrides) error: boom-async (path=projectGraph.getMethodOverrides)'
+    );
+    expect(graphLegacyWarnings(result)).toEqual([
+      expect.objectContaining({
+        message: 'path=projectGraph.getMethodOverrides; reason=legacy-host-port; result=error',
+      }),
+    ]);
+  });
+
+  it('attributes a throwing secondary legacy reader by path after the primary returned nothing', async () => {
+    const getClassInfo = vi.fn(() => null);
+    const ctx: ToolContext = {
+      projectRoot,
+      projectGraph: { getClassInfo },
+      codeEntityGraph: { queryEntity: throwing('legacy-boom') },
+    };
+    const result = await handleGraph('query', { type: 'class', entity: ENTITY }, ctx);
+    expect(result.ok).toBe(false);
+    expect(getClassInfo).toHaveBeenCalledExactlyOnceWith(ENTITY);
+    expect(result.error).toBe(
+      'Graph query(class) error: legacy-boom (path=codeEntityGraph.queryEntity)'
+    );
+    expect(graphLegacyWarnings(result)).toEqual([
+      expect.objectContaining({
+        tool: 'graph',
+        stage: 'query(class)',
+        message: 'path=codeEntityGraph.queryEntity; reason=legacy-host-port; result=error',
+      }),
+    ]);
+    // 没有产出结果就谈不上“经备用路径得到结果”：fallbackUsed 仍只在成功路径为 true。
+    expect(result._meta?.fallbackUsed).not.toBe(true);
+  });
+
+  it('names the throwing primary reader without a legacy trace and never reaches the legacy port', async () => {
+    const queryEntity = vi.fn();
+    const ctx: ToolContext = {
+      projectRoot,
+      projectGraph: { getClassInfo: throwing('primary-boom') },
+      codeEntityGraph: { queryEntity },
+    };
+    const result = await handleGraph('query', { type: 'class', entity: ENTITY }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe(
+      'Graph query(class) error: primary-boom (path=projectGraph.getClassInfo)'
+    );
+    // 主读取器抛错即终止，不进入备用端口；非 legacy 读取器抛错不留旧宿主痕迹。
+    expect(queryEntity).not.toHaveBeenCalled();
+    expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+    expect(result._meta?.resultStatus).toBeUndefined();
+  });
+
+  it('records the legacy reader that was in flight when the read was canceled', async () => {
+    const controller = new AbortController();
+    let finish!: (value: null) => void;
+    const pending = new Promise<null>((resolve) => {
+      finish = resolve;
+    });
+    const getMethodOverrides = vi.fn(() => {
+      // 读取进行中宿主取消：runOperation 先定终态为 aborted，不合作的读取器稍后才结束。
+      controller.abort();
+      return pending;
+    });
+    const ctx: ToolContext = {
+      projectRoot,
+      projectGraph: { getMethodOverrides },
+      abortSignal: controller.signal,
+    };
+    const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+    finish(null);
+    expect(result.ok).toBe(false);
+    expect(result._meta?.resultStatus).toBe('aborted');
+    expect(result.error).toContain('Graph query(overrides) aborted');
+    expect(result.error).toContain('path=projectGraph.getMethodOverrides');
+    expect(graphLegacyWarnings(result)).toEqual([
+      expect.objectContaining({
+        stage: 'query(overrides)',
+        message: 'path=projectGraph.getMethodOverrides; reason=legacy-host-port; result=aborted',
+      }),
+    ]);
+  });
+
+  it('adds no trace when the cancel arrives before any reader is invoked', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const getMethodOverrides = vi.fn(() => ({ via: 'projectGraph.getMethodOverrides' }));
+    const ctx: ToolContext = {
+      projectRoot,
+      projectGraph: { getMethodOverrides },
+      abortSignal: controller.signal,
+    };
+    const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result._meta?.resultStatus).toBe('aborted');
+    expect(getMethodOverrides).not.toHaveBeenCalled();
+    // 从未被调用的 legacy 端口不能留假痕迹，也没有可归因的 path。
+    expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+    expect(result.error).not.toContain('path=');
+  });
+
+  it('lifts the throwing legacy reader trace onto the adapter envelope diagnostics', async () => {
+    const adapter = new ToolRouterAdapter({
+      contextFactory: {
+        create: () => ({
+          projectRoot,
+          tokenBudget: 4000,
+          projectGraph: { getMethodOverrides: throwing('boom') },
+        }),
+      },
+    });
+    const envelope = await adapter.execute({
+      toolId: 'graph',
+      args: { action: 'query', params: { type: 'overrides', entity: ENTITY } },
+      surface: 'runtime',
+      actor: { role: 'agent' },
+      source: { kind: 'runtime' },
+    });
+    expect(envelope).toMatchObject({ ok: false, status: 'error' });
+    expect(envelope.text).toContain('Graph query(overrides) error: boom');
+    expect(envelope.text).toContain('path=projectGraph.getMethodOverrides');
+    expect(envelope.diagnostics.fallbackUsed).toBe(false);
+    expect(envelope.diagnostics.warnings).toEqual([
+      expect.objectContaining({
+        code: 'GRAPH_QUERY_LEGACY_READER',
+        tool: 'graph',
+        stage: 'query(overrides)',
+        message: 'path=projectGraph.getMethodOverrides; reason=legacy-host-port; result=error',
+      }),
+    ]);
   });
 });
 
