@@ -534,9 +534,11 @@ export async function prepareSubmission(
   }
   if (gateViolations.length > 0) {
     const detail = formatRecipeAuthoringViolations(gateViolations);
-    // F4b 诊断反馈：按违规挑引用——行号类违规只列违规引用与文件实际行数；只有 SNIPPET_MISMATCH
-    // 单独出现（没有行号类违规）时才从 sourceRefs ∪ reasoning.sources 中展示一个真实 bounded
-    // range，两者同时出现时片段可能来自违规引用，不借用其它引用的代码（L4-P22 / U18-F7）。
+    // F4b 诊断反馈：按违规挑引用——引用级违规（行号类：越界/缺行号；路径类：不存在/根外）只列违规
+    // 引用、原因与文件实际行数；只有 SNIPPET_MISMATCH 单独出现（没有引用级违规）时才从 sourceRefs ∪
+    // reasoning.sources 中展示一个真实 bounded range，两者同时出现时片段可能来自违规引用，不借用其它
+    // 引用的代码（L4-P22 / U18-F7；路径类组合见 L4-P22br4）。单独的 NOT_FOUND / INVALID 不触发本提示：
+    // Core 违规文案与下方 E5/E6 台账候选提示已覆盖，这里只在片段比对或行号接地失败时补充。
     // 提示不会修改候选，也不会把首个来源、无界范围或整文件自动提升为 coreCode。
     const snippetRepair = gateViolations.some((v) =>
       ['SNIPPET_MISMATCH', 'SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING'].includes(

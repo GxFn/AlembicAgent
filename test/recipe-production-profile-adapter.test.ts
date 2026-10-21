@@ -2973,7 +2973,7 @@ describe('L4-P22 bounded source reads share one implementation', () => {
     });
   });
 
-  test('a multi-line coreCode copied with CRLF line endings is a bounded match and keeps its bytes', () => {
+  test('a multi-line coreCode copied with CRLF line endings is a bounded match and is written back LF-normalized', () => {
     const projectRoot = makeProject();
     fs.writeFileSync(
       path.join(projectRoot, 'src/crlf.ts'),
@@ -2998,14 +2998,18 @@ describe('L4-P22 bounded source reads share one implementation', () => {
         reason: 'bounded-match',
         provenanceRef: 'src/crlf.ts:2-3',
       });
-      // 只为比对归一换行；写回候选的 coreCode 保持提交原样。
-      expect(prepared.item.coreCode).toBe(coreCode);
+      // 比对与写回都按 LF（L4-P22br4 / I25）：Core 的 .md 真相源不能往返 '\r'（KnowledgeFileWriter
+      // 只转义 '\n'，parseKnowledgeMarkdown 遇 '\r' 不去引号），写回原始 CRLF 字节会在宿主 syncAll 时
+      // 把 DB 里的 coreCode 覆盖成乱码。
+      expect(prepared.item.coreCode).toBe('const a = 1;\nconst b = 2;');
+      expect(prepared.item.coreCode).not.toContain('\r');
       expect(prepared.profileEvidence.rejected).toEqual([]);
-      // 兼容转译留痕：触发条件、比对结论与命中的规范引用，不含代码内容。
+      // 兼容转译留痕：触发条件、比对结论、命中的规范引用与写回口径，不含代码内容。
       const messages = debug.mock.calls.map((call) => String(call[0]));
       const normalized = messages.find((message) => message.includes('normalized CRLF'));
       expect(normalized).toContain('CRLF fixture');
       expect(normalized).toContain('bounded-match (src/crlf.ts:2-3)');
+      expect(normalized).toContain('written back LF-normalized');
       expect(normalized).not.toContain('const a = 1;');
 
       // LF 形式的 coreCode 不经兼容转译，不留该诊断。
@@ -3026,6 +3030,77 @@ describe('L4-P22 bounded source reads share one implementation', () => {
     }
   });
 
+  test('a matched CRLF coreCode round-trips through Core markdown persistence once written back LF-normalized', () => {
+    const projectRoot = makeProject();
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/crlf.ts'),
+      '// header\r\nconst a = 1;\r\n\r\nconst b = 2;\r\n// footer\r\n'
+    );
+    const prepared = prepareRecipeProductionItem(
+      {
+        title: 'CRLF round trip',
+        coreCode: 'const a = 1;\r\n\r\nconst b = 2;',
+        reasoning: { sources: ['src/crlf.ts:2-4'] },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+    expect(prepared.codeEvidence).toEqual({
+      accepted: true,
+      reason: 'bounded-match',
+      provenanceRef: 'src/crlf.ts:2-4',
+    });
+    expect(prepared.item.coreCode).toBe('const a = 1;\n\nconst b = 2;');
+    // 宿主每次 UI 启动都用 syncAll 把 .md 重新 parse 回 DB（.md 是唯一数据源）：写回的 coreCode 必须能经
+    // Core 的文件写入器与解析器逐字往返，否则 DB 里的 coreCode 会被覆盖成带引号与字面 \n 的整串。
+    pathGuard.configure({ projectRoot, knowledgeBaseDir: 'Alembic' });
+    const persistedPath = new KnowledgeFileWriter(projectRoot).persist(
+      KnowledgeEntry.fromJSON({
+        id: 'crlf-round-trip',
+        title: 'CRLF round trip',
+        lifecycle: 'pending',
+        coreCode: prepared.item.coreCode,
+        content: { markdown: 'x' },
+      })
+    );
+    expect(persistedPath).toBeTruthy();
+    const parsed = parseKnowledgeMarkdown(fs.readFileSync(String(persistedPath), 'utf8'));
+    expect(parsed.coreCode).toBe(prepared.item.coreCode);
+    expect(parsed.coreCode).toBe('const a = 1;\n\nconst b = 2;');
+  });
+
+  test('a CRLF coreCode is budgeted by its LF-normalized length, not by the extra carriage returns', () => {
+    const projectRoot = makeProject();
+    // 100 行 × 119 字符：LF 形式 11999 字符（预算 12000 内），CRLF 形式 12098 字符。预算必须按写回的
+    // LF 串计，否则同一段代码在 LF 文件里能过、在 CRLF 文件里被清空（L4-P22br4 审计线索）。
+    const wide = Array.from(
+      { length: 100 },
+      (_, i) => `// ${String(i + 1).padStart(3, '0')}${'w'.repeat(113)}`
+    );
+    expect(wide.every((line) => line.length === 119)).toBe(true);
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/wide.ts'),
+      `// header\r\n${wide.join('\r\n')}\r\n// footer\r\n`
+    );
+    const coreCode = wide.join('\r\n');
+    expect(coreCode).toHaveLength(12_098);
+    const prepared = prepareRecipeProductionItem(
+      {
+        coreCode,
+        reasoning: { sources: ['src/wide.ts:2-101'] },
+        retrievalProfile: authoredProfile(),
+      },
+      projectRoot
+    );
+    expect(prepared.codeEvidence).toEqual({
+      accepted: true,
+      reason: 'bounded-match',
+      provenanceRef: 'src/wide.ts:2-101',
+    });
+    expect(prepared.item.coreCode).toBe(wide.join('\n'));
+    expect(prepared.item.coreCode).toHaveLength(11_999);
+  });
+
   test('a CRLF coreCode that matches no cited range is still removed after line-ending alignment', () => {
     const projectRoot = makeProject();
     fs.writeFileSync(
@@ -3044,7 +3119,7 @@ describe('L4-P22 bounded source reads share one implementation', () => {
     expect(prepared.item.coreCode).toBe('');
   });
 
-  test('knowledge.submit keeps a CRLF coreCode cited from a CRLF file without counting it as unsafe', async () => {
+  test('knowledge.submit keeps a CRLF coreCode cited from a CRLF file, sending it LF-normalized to the gateway', async () => {
     const projectRoot = makeProject();
     fs.writeFileSync(
       path.join(projectRoot, 'src/a.ts'),
@@ -3063,7 +3138,11 @@ describe('L4-P22 bounded source reads share one implementation', () => {
       } as never);
       expect(result.ok).toBe(true);
       expect(fake.calls).toHaveLength(1);
-      expect(fake.calls[0].input.items[0].coreCode).toBe(coreCode);
+      // 真实入口把 coreCode 交给 Core gateway port 前已归一为 LF：Core 的 .md 真相源不能往返 '\r'。
+      expect(fake.calls[0].input.items[0].coreCode).toBe(
+        "import type { User } from './user.js';\nexport const count = 1;"
+      );
+      expect(String(fake.calls[0].input.items[0].coreCode)).not.toContain('\r');
       const messages = warn.mock.calls.map(([message]) => String(message));
       expect(messages.some((message) => message.includes('unsafe coreCode removed'))).toBe(false);
       const counters = sharedState._sessionCounters as
@@ -3314,6 +3393,49 @@ describe('L4-P22 bounded source reads share one implementation', () => {
       expect(result.text).not.toContain('src/a.ts:1-2 的真实代码');
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  test('a snippet mismatch beside a missing or out-of-root ref never pastes code from an unrelated readable ref', async () => {
+    const projectRoot = makeProject();
+    // content.pattern 只出现在 src/b.ts；提交却把它引到不存在的多仓前缀路径或 ../ 兄弟仓路径：门禁判
+    // SOURCE_REF_NOT_FOUND / SOURCE_REF_INVALID（该引用不算有效范围）并同时报 SNIPPET_MISMATCH，片段来源
+    // 与首个可读范围 src/a.ts:1-2 无关，修复提示不得借用它的代码（L4-P22br4 / U18-F7 同类）。
+    fs.writeFileSync(
+      path.join(projectRoot, 'src/b.ts'),
+      'export function inc(n: number) {\n  return n + 1;\n}\n'
+    );
+    for (const [badRef, code] of [
+      ['lib/b.ts:1-3', 'SOURCE_REF_NOT_FOUND'],
+      ['../outside/b.ts:1-3', 'SOURCE_REF_INVALID'],
+    ] as const) {
+      const fake = fakePort(readyReport);
+      const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+      try {
+        const result = await submitThroughAdapter(
+          projectRoot,
+          fake.port,
+          submitParams({
+            sourceRefs: ['src/a.ts:1-2', badRef],
+            coreCode: '',
+            content: { ...submitParams().content, pattern: '  return n + 1;' },
+            reasoning: {
+              whyStandard: 'Fixture source claim.',
+              sources: ['src/a.ts:1-2', badRef],
+              confidence: 0.95,
+            },
+          })
+        );
+        expect(fake.calls).toHaveLength(0);
+        expect(result.text).toContain(code);
+        expect(result.text).toContain('SNIPPET_MISMATCH');
+        expect(result.text).not.toContain("import type { User } from './user.js';");
+        expect(result.text).not.toContain('src/a.ts:1-2 的真实代码');
+        // 提示只列违规引用本身（声明原文）。
+        expect(result.text).toContain(badRef);
+      } finally {
+        warn.mockRestore();
+      }
     }
   });
 

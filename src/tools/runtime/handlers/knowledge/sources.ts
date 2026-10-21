@@ -14,8 +14,18 @@ const SNIPPET_REPAIR_MAX_LINES = 12;
 /** F4b 只关心违规码与定位字段；与 Core RecipeAuthoringViolation 结构兼容。 */
 export type SnippetHintViolation = Pick<RecipeAuthoringViolation, 'code' | 'sourceRef' | 'path'>;
 
-/** 行号类违规：违规对象带 sourceRef，指向门禁判定为不可用的那一条引用。 */
-const REF_LEVEL_HINT_CODES = new Set(['SOURCE_REF_LINE_OUT_OF_RANGE', 'SOURCE_REF_LINE_MISSING']);
+/**
+ * 引用级违规：违规对象带 sourceRef/path，指向门禁判定为不可用的那一条引用——行号类（越界、缺行号）
+ * 与路径类（文件不存在、根外或非法路径）。这些引用都不进门禁的有效范围集合，SNIPPET_MISMATCH 与
+ * 它们同时出现时片段很可能就来自这条引用（多仓前缀陷阱、../ 兄弟仓路径是现实来源），不能借用别的
+ * 引用的代码（L4-P22 / U18-F7；路径类两码由 L4-P22br4 补入）。
+ */
+const REF_LEVEL_HINT_CODES = new Set([
+  'SOURCE_REF_LINE_OUT_OF_RANGE',
+  'SOURCE_REF_LINE_MISSING',
+  'SOURCE_REF_NOT_FOUND',
+  'SOURCE_REF_INVALID',
+]);
 
 function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -71,8 +81,9 @@ function readFirstHintRange(
 }
 
 /**
- * 描述一条行号类违规引用：只给路径与文件实际行数，不展示任何代码（越界/缺行号的引用本身
- * 没有可展示的真实范围，换展示别的引用会诱导模型粘贴无关片段）。
+ * 描述一条引用级违规引用：只给路径、拒绝原因与文件实际行数，不展示任何代码（越界/缺行号/不存在/
+ * 根外的引用本身没有可展示的真实范围，换展示别的引用会诱导模型粘贴无关片段）。按当前重新读取的
+ * 结论描述而不是复述门禁违规码：文件若在门禁判定后变化，只报告当前读取结论。
  */
 function describeViolatingRef(violation: SnippetHintViolation, projectRoot: string): string {
   const ref = violation.sourceRef ?? violation.path ?? '';
@@ -83,13 +94,28 @@ function describeViolatingRef(violation: SnippetHintViolation, projectRoot: stri
       : `${ref} 缺少行号且文件不可读（${file.reason}）`;
   }
   const range = readBoundedSourceRange(projectRoot, ref);
-  if (!range.ok && range.reason === 'line-out-of-range' && range.lineCount !== undefined) {
-    return `${ref} 超出文件范围（${range.relative ?? ref} 实际 ${range.lineCount} 行）`;
+  if (range.ok) {
+    // 门禁判不可用、此处却读到：文件在两次读取之间变化（或路径在门禁判定后才出现），只报告当前结论。
+    return `${ref} 行号范围在门禁判定后已变化（${range.relative} 当前 ${range.lineCount} 行）`;
   }
-  // 门禁判越界、此处却读到或因别的原因读不到：文件在两次读取之间变化，只报告当前读取结论。
-  return range.ok
-    ? `${ref} 行号范围在门禁判定后已变化（${range.relative} 当前 ${range.lineCount} 行）`
-    : `${ref} 无法读取（${range.reason}）`;
+  switch (range.reason) {
+    case 'line-out-of-range':
+      return range.lineCount !== undefined
+        ? `${ref} 超出文件范围（${range.relative ?? ref} 实际 ${range.lineCount} 行）`
+        : `${ref} 超出文件范围（${range.detail}）`;
+    case 'not-found':
+      // 多仓前缀陷阱：路径写成了别的仓库或子包的相对路径，本项目内不存在。
+      return `${ref} 文件不存在（请核对本项目的仓库相对路径；多仓前缀与 ../ 兄弟仓路径都不在本项目内）`;
+    case 'path-invalid':
+    case 'outside-root':
+    case 'symlink-escape':
+      return `${ref} 不在项目根内（${range.reason}），只能引用本项目内的仓库相对路径`;
+    case 'format':
+      return `${ref} 不是 path:N 或 path:N-M 形式`;
+    default:
+      // read-error（EACCES、竞态删除）等：只报原因，不猜范围。
+      return `${ref} 无法读取（${range.reason}）`;
+  }
 }
 
 /**
@@ -138,14 +164,15 @@ export function normalizeBareSourceRefs(
 
 /**
  * F4b：代码/引用门禁拒绝时给出诊断提示，按门禁违规挑引用（L4-P22 / U18-F7）：
- *   - SOURCE_REF_LINE_OUT_OF_RANGE / SOURCE_REF_LINE_MISSING：只列违规引用本身与文件实际行数，
+ *   - 引用级违规（行号类 SOURCE_REF_LINE_OUT_OF_RANGE / SOURCE_REF_LINE_MISSING，路径类
+ *     SOURCE_REF_NOT_FOUND / SOURCE_REF_INVALID）：只列违规引用本身、拒绝原因与文件实际行数，
  *     不展示其它引用的代码；
- *   - 仅有 SNIPPET_MISMATCH（没有行号类违规）：门禁拿片段与所有已声明的有效范围比对，故从候选
+ *   - 仅有 SNIPPET_MISMATCH（没有引用级违规）：门禁拿片段与所有已声明的有效范围比对，故从候选
  *     （sourceRefs ∪ reasoning.sources，由 collectSnippetHintCandidates 收集）中取第一个可读范围
  *     展示真实代码；
- *   - SNIPPET_MISMATCH 与行号类违规同时出现：SNIPPET_MISMATCH 不带 sourceRef，片段很可能来自越界
- *     或缺行号的那条引用（它不算有效范围），此时首个可读范围与片段来源无关，展示它会诱导模型粘贴
- *     无关代码。违规引用本身没有可读范围，因此不展示任何代码，只列违规路径与文件实际行数。
+ *   - SNIPPET_MISMATCH 与引用级违规同时出现：SNIPPET_MISMATCH 不带 sourceRef，片段很可能来自越界、
+ *     缺行号、不存在或根外的那条引用（它不算有效范围），此时首个可读范围与片段来源无关，展示它会
+ *     诱导模型粘贴无关代码。违规引用本身没有可读范围，因此不展示任何代码，只列违规路径与原因。
  * violations 缺省表示调用方没有违规列表，按单独 SNIPPET_MISMATCH 语义只展示首个可读范围。
  * 提示不会修改候选，也不把首个来源或整文件视为 coreCode 答案；无可展示内容时返回空串。
  */
@@ -165,9 +192,9 @@ export function buildSnippetRepairHint(
     violations === undefined || violations.some((v) => v.code === 'SNIPPET_MISMATCH');
   const wantsSnippet = snippetMismatch && violatingRefs.length === 0;
   if (snippetMismatch && !wantsSnippet) {
-    // 短路：片段不匹配与行号类违规同时出现时，不借用其它引用的代码（只能从违规引用取范围，而它不可读）。
+    // 短路：片段不匹配与引用级违规同时出现时，不借用其它引用的代码（只能从违规引用取范围，而它不可读）。
     Logger.getInstance().debug(
-      `[knowledge.submit] snippet repair hint skipped code display: SNIPPET_MISMATCH occurred together with line-grounding violation(s) on ${violatingRefs.map((v) => v.sourceRef ?? v.path).join(', ')}; listing violating ref(s) only`
+      `[knowledge.submit] snippet repair hint skipped code display: SNIPPET_MISMATCH occurred together with ref-level grounding violation(s) ${violatingRefs.map((v) => `${v.code} on ${v.sourceRef ?? v.path}`).join(', ')}; listing violating ref(s) only`
     );
   }
   let hint = '';
@@ -187,7 +214,7 @@ export function buildSnippetRepairHint(
         `[knowledge.submit] snippet repair hint lists ${notes.length} violating ref(s) without code: ${violatingRefs.map((v) => v.sourceRef ?? v.path).join(', ')}`
       );
     }
-    hint += ` 📎 修复提示：以下引用未通过行号接地：${notes.join('；')}。请先 code.read 确认真实行号，再改写为 path:start-end 重提。`;
+    hint += ` 📎 修复提示：以下引用未通过来源接地：${notes.join('；')}。请先 code.read 确认真实路径与行号，再改写为本项目内的 path:start-end 重提。`;
   }
   return hint;
 }

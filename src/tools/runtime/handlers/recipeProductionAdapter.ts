@@ -277,7 +277,7 @@ function reportCopiedRedactedEvidence(
  * provenance.evidenceRefs 写每条可读引用的声明原文（与事实 provenanceRefs 逐字对齐），
  * codeEvidence.provenanceRef 写规范形式；被排除的引用连同原因进入 profileEvidence.rejected，
  * 由调用方（authoring）按提交语境记录 warn。本函数自己记两种诊断：coreCode 含 CRLF、按 LF
- * 归一后再与证据比对的兼容转译（debug）；coreCode 含台账脱敏标记且未能匹配证据时的
+ * 归一后再与证据比对并按 LF 写回的兼容转译（debug）；coreCode 含台账脱敏标记且未能匹配证据时的
  * copied-redacted-evidence 归因与重试提示（warn，见 reportCopiedRedactedEvidence）。
  */
 export function prepareRecipeProductionItem(
@@ -298,23 +298,29 @@ export function prepareRecipeProductionItem(
   }
   const codeEvidence = profileEvidence.filter((entry) => !entry.documentation && !entry.wholeFile);
 
-  // coreCode 预算按同一切行语义计行：CRLF 与末尾换行不影响行数。
-  const codeFitsBudget =
-    requestedCoreCode.length <= MAX_CORE_CODE_CHARS &&
-    splitLogicalLines(requestedCoreCode).length <= MAX_CORE_CODE_LINES;
   // 片段比对与 sourceRange.splitLogicalLines 的 /\r?\n/ 切行语义对齐（L4-P22 / I25）：证据行已去掉
   // 行尾 '\r' 并以 '\n' 连接，而 code.read 展示给模型的源码行保留 '\r'，模型照抄的多行 coreCode
-  // 会带 CRLF。只归一比对串，写回候选的 coreCode 保持提交原样（Core 门禁按去空白比对，冻结证据
-  // 保留原始字节）；行内孤立的 '\r' 不在切行语义内，两侧都原样保留。
+  // 会带 CRLF。比对串与写回候选的 coreCode 都用 LF 归一后的串（L4-P22br4）：Core 的 .md 真相源不能
+  // 往返 '\r'——KnowledgeFileWriter 序列化只转义 '\n'，parseKnowledgeMarkdown 遇到裸 '\r' 不去引号，
+  // 宿主每次 UI 启动的 syncAll（.md→DB）会把 DB 里的 coreCode 覆盖成带引号与字面 \n 的整串。Core 门禁
+  // 按去空白比对、FsSourceRefResolver 按 /\r?\n/ 切行，没有 Core 消费方要求 coreCode 保留 CRLF
+  // （“冻结证据字节”指 StrictFactExecution 的源文件，与 coreCode 无关）。行内孤立的 '\r' 不在切行
+  // 语义内，两侧都原样保留（Core 侧的转义/解析修复另行处理）。
   const matchableCoreCode = requestedCoreCode.replace(/\r\n/g, '\n');
+  // coreCode 预算按写回的 LF 串计：字符数不再把每行多出的 '\r' 算进去（同一段代码在 LF 与 CRLF
+  // 文件里的结论一致），行数按同一切行语义计（CRLF 与末尾换行不影响行数）。
+  const codeFitsBudget =
+    matchableCoreCode.length <= MAX_CORE_CODE_CHARS &&
+    splitLogicalLines(matchableCoreCode).length <= MAX_CORE_CODE_LINES;
   const matchingEvidence = requestedCoreCode
     ? codeEvidence.find((entry) => entry.content.includes(matchableCoreCode))
     : undefined;
   const codeAccepted = !requestedCoreCode || (codeFitsBudget && matchingEvidence !== undefined);
   if (matchableCoreCode !== requestedCoreCode) {
-    // 兼容转译留痕：触发条件（coreCode 含 CRLF）、选择路径（按 LF 比对）与比对结论；不含代码内容。
+    // 兼容转译留痕：触发条件（coreCode 含 CRLF）、选择路径（按 LF 比对与写回）、预算口径与比对结论；
+    // 不含代码内容。
     Logger.getInstance().debug(
-      `[knowledge.submit] recipe production adapter normalized CRLF line endings in coreCode for bounded snippet matching for "${text(rawItem.title)}": lines=${splitLogicalLines(requestedCoreCode).length}, result=${codeAccepted ? `bounded-match (${matchingEvidence?.canonicalRef ?? ''})` : 'unbounded-or-unrelated'}; stored coreCode keeps its submitted line endings`
+      `[knowledge.submit] recipe production adapter normalized CRLF line endings in coreCode for bounded snippet matching for "${text(rawItem.title)}": lines=${splitLogicalLines(matchableCoreCode).length}, chars=${matchableCoreCode.length} (submitted ${requestedCoreCode.length}), result=${codeAccepted ? `bounded-match (${matchingEvidence?.canonicalRef ?? ''})` : 'unbounded-or-unrelated'}; stored coreCode is written back LF-normalized because Core's markdown truth source cannot round-trip '\\r'`
     );
   }
   if (requestedCoreCode && !codeAccepted) {
@@ -322,7 +328,8 @@ export function prepareRecipeProductionItem(
   }
   const item: CreateRecipeItem = {
     ...(rawItem as CreateRecipeItem),
-    coreCode: codeAccepted ? requestedCoreCode : '',
+    // 命中时写回 LF 归一后的串（见上）；未命中或超预算时清空，不让不安全片段进入候选。
+    coreCode: codeAccepted ? matchableCoreCode : '',
     retrievalProfile: null,
   };
   if (authoredProfile) {

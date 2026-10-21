@@ -1148,6 +1148,46 @@ describe('L4-P22 F4b 修复提示按违规引用取片段', () => {
     expect(hint).toContain('实际 3 行');
   });
 
+  test('SNIPPET_MISMATCH 与 SOURCE_REF_NOT_FOUND 同时出现：不借用其它引用的代码，只列不存在的引用并留 debug', () => {
+    const root = hintProject();
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
+    try {
+      // 多仓前缀陷阱：片段来自不存在于本项目的 lib/b.ts，首个可读范围 src/a.ts:1-2 与片段来源无关。
+      const hint = buildSnippetRepairHint(['src/a.ts:1-2', 'lib/b.ts:1-3'], root, [
+        { code: 'SOURCE_REF_NOT_FOUND', sourceRef: 'lib/b.ts:1-3', path: 'lib/b.ts' },
+        { code: 'SNIPPET_MISMATCH' },
+      ]);
+      expect(hint).not.toContain('export const a1');
+      expect(hint).not.toContain('src/a.ts:1-2');
+      expect(hint).toContain('lib/b.ts:1-3');
+      expect(hint).toContain('文件不存在');
+      const messages = debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('[knowledge.submit]'));
+      expect(
+        messages.some(
+          (message) => message.includes('SNIPPET_MISMATCH') && message.includes('lib/b.ts:1-3')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('SNIPPET_MISMATCH 与 SOURCE_REF_INVALID 同时出现：同样不展示其它引用的代码，只列根外引用', () => {
+    const root = hintProject();
+    // ../ 兄弟仓路径：门禁判 path-invalid，引用带 sourceRef 而不带 path。
+    const hint = buildSnippetRepairHint(['src/a.ts:1-2', '../outside/b.ts:1-3'], root, [
+      { code: 'SOURCE_REF_INVALID', sourceRef: '../outside/b.ts:1-3' },
+      { code: 'SNIPPET_MISMATCH' },
+    ]);
+    expect(hint).not.toContain('export const a1');
+    expect(hint).not.toContain('src/a.ts:1-2');
+    expect(hint).toContain('../outside/b.ts:1-3');
+    expect(hint).toContain('不在项目根内');
+  });
+
   test('候选集合取 sourceRefs ∪ reasoning.sources，去重并保持声明顺序', () => {
     expect(
       collectSnippetHintCandidates({
