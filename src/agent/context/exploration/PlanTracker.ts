@@ -13,7 +13,9 @@ import { readToolObservation } from '../../utils/toolOutcomes.js';
  *   - 只有成功的探索类动作（code/graph/terminal 取证动作）参与匹配与偏离统计，
  *     note_finding/knowledge 等记录类动作与失败动作既不完成步骤，也不算偏离；
  *   - 计划外只指“既不能完成未完成步骤、也不是续做已完成步骤”的探索动作；未完成的只剩总结类
- *     步骤（工具动作按设计不能完成）时，未命中的探索动作不算偏离，连击保持不变（L6-P16r3 C015）。
+ *     步骤（工具动作按设计不能完成）时，未命中的探索动作不算偏离，连击保持不变（L6-P16r3 C015）；
+ *     这条保持只在还有未完成步骤时成立——计划全部完成后不能续做的探索动作仍是计划外，偏差 replan
+ *     照常触发（L6-P16r4）。
  *
  * @module PlanTracker
  */
@@ -230,12 +232,19 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
     pattern: /大纲|阅读|深入|查看|文件|\b(?:outlines?|read(?:s|ing)?)\b/,
   },
   { tool: 'code', action: 'search', pattern: /搜索|查找|\bsearch(?:es|ing)?\b/ },
-  // terminal.exec 只完成“运行/执行命令”类步骤；不收“测试/脚本”，避免完成“阅读测试文件”这类阅读步骤。
+  // terminal.exec 只完成“运行/执行命令”类步骤。中文没有词边界：“运行/执行”只有作为动词直接带命令宾语
+  // （拉丁字母命令名或路径如 npm/git/./scripts/x.sh，或测试、检查（带修饰语）、单测、用例、脚本、构建、
+  // 编译、打包、安装、命令、示例这类命令对象）时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”这类
+  // 名词修饰用法不命中（L6-P16r4）。terminal 不是单文件取证动作，文件目标只是软信号，不设边界时
+  // git status / ls 会把“阅读 src/x.ts 理解执行流程”标成完成；若那是最后一个可由工具完成的步骤，
+  // 之后的真实偏离还会被“计划耗尽”保持吞掉，周期回顾再把从没读过的文件列为已完成。
+  // 不收单独的“测试/脚本”，避免完成“阅读测试文件”这类阅读步骤；“运行检查”这类无修饰语的宾语不命中，
+  // 是宁可少完成也不误完成的保守取舍（计划进度只是建议性信号，未命中只会计入计划外）。
   {
     tool: 'terminal',
     action: 'exec',
     pattern:
-      /运行|执行|命令|终端|\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\b/,
+      /(?<!可)(?:运行|执行)\s*[`'"“「]?\s*(?:[a-z.~$]|\/|(?:单元|集成|端到端|回归|冒烟)?测试|(?:类型|静态|代码)检查|单测|用例|脚本|构建|编译|打包|安装|命令|示例|样例)|命令|终端|\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\b/,
   },
 ];
 
@@ -451,6 +460,8 @@ export class PlanTracker {
     let continuedThisRound = 0;
     let unplannedThisRound = 0;
     let exhaustedHeldThisRound = 0;
+    /** 计划全部完成后仍未命中任何步骤的探索动作：计入计划外，单独记诊断以区别于“只剩总结步”的保持 */
+    let completedPlanOffPlanThisRound = 0;
     let skippedFailedActions = 0;
     let skippedNonExplorationActions = 0;
 
@@ -493,9 +504,15 @@ export class PlanTracker {
       }
       // 计划已耗尽：未完成的只剩总结类步骤（任何工具动作按设计都不能完成），模型在 toolChoice=required
       // 下被迫继续探索不算偏离；与只有记录/失败动作的轮次同口径，不计入统计、连击保持不变。
-      if (openSteps.every((step) => isSummaryStep(step.description))) {
+      // 必须还有未完成步骤：every 对空集恒真，否则计划全部完成后的探索也会被当成耗尽保持，偏差 replan
+      // 在该计划的生命周期内永远不再触发（L6-P16r4）。
+      if (openSteps.length > 0 && openSteps.every((step) => isSummaryStep(step.description))) {
         exhaustedHeldThisRound++;
         continue;
+      }
+      if (openSteps.length === 0) {
+        // 计划全部完成后既不能完成、也不能续做任何步骤的探索：按文件头的计划外定义计入偏离。
+        completedPlanOffPlanThisRound++;
       }
       unplannedThisRound++;
     }
@@ -535,6 +552,15 @@ export class PlanTracker {
             ? ` (plan exhausted except summary step(s) [${openSummarySteps.join(' | ')}]; not counted, streak held)`
             : '') +
           `; completed=${completedThisRound}, unplanned=${unplannedThisRound}, ` +
+          `consecutiveOffPlan=${this.#planProgress.consecutiveOffPlan}`
+      );
+    }
+    if (completedPlanOffPlanThisRound > 0) {
+      // 计划做完后继续探索不是“耗尽保持”：计入计划外并推进偏离连击，让偏差 replan 把模型引向提交/总结。
+      logPlanDiagnostic(
+        `[PlanTracker] plan progress counted off-plan exploration after plan completion: ` +
+          `all ${steps.length} step(s) done, ${completedPlanOffPlanThisRound} action(s) neither completed ` +
+          `nor continued a step; counted as unplanned (streak not held), unplanned=${unplannedThisRound}, ` +
           `consecutiveOffPlan=${this.#planProgress.consecutiveOffPlan}`
       );
     }

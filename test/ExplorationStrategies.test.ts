@@ -1759,6 +1759,226 @@ describe('PlanTracker skipped actions are observable (L6-P16 C17)', () => {
   });
 });
 
+/**
+ * L6-P16r4：对 0ed0a4c（L6-P16r3）的第四轮审计补修，两处相对父提交的回归：
+ *   - terminal.exec 语义规则的中文“运行/执行”没有词边界，“运行时”“执行流程”也命中。terminal 不是单文件
+ *     取证动作，文件目标只是软信号，所以任意无关终端命令（git status / ls）都能把带明确文件目标的阅读步骤
+ *     标成完成；若它是最后一个可由工具完成的步骤，之后的真实偏离会被“计划耗尽”保持吞掉，周期回顾还会把
+ *     从没读过的文件列为“✅ 已完成”。
+ *   - “计划耗尽”判定 openSteps.every(isSummaryStep) 对空集恒真，把“只剩总结步”悄悄扩大成“计划全部完成”：
+ *     计划做完后偏差 replan 永远不再触发（bootstrap 紧凑计划没有总结步，收不到“不要重新搜索”的纠偏），
+ *     诊断日志还打印 “summary step(s) []”。
+ */
+describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const exec = (command: string): PlanCall => [
+    'terminal',
+    { action: 'exec', params: { command } },
+    { exitCode: 0, stdout: 'ok', stderr: '' },
+  ];
+  const read = (path: string): PlanCall => [
+    'code',
+    { action: 'read', params: { path } },
+    'export const value = 1;',
+  ];
+
+  it('does not let an unrelated terminal command complete a reading step that mentions 执行流程', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [exec('git status')]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it.each([
+    ['深入阅读运行时上下文装配逻辑', 'ls'],
+    ['阅读 src/runtime/AgentRuntime.ts 了解运行时入口', 'pwd'],
+    ['深入阅读 3-5 个典型实现文件，确认执行细节', 'git status'],
+    ['查看可执行脚本的加载方式', 'git status'],
+  ])('keeps the reading step "%s" pending after terminal.exec %s', (step, command) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec(command)]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it('keeps the production flat terminal parameter shape out of reading steps too', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [
+      [
+        'terminal',
+        { action: 'exec', command: 'git status' },
+        { exitCode: 0, stdout: '', stderr: '' },
+      ],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+  });
+
+  it('completes the command step, not the 运行时 search step, when the plan has both', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 搜索运行时配置加载逻辑\n2. 运行 npm test 确认测试状态', 1);
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'done']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it.each([
+    '运行测试套件验证当前行为',
+    '执行构建命令检查产物',
+    '运行 `npm run lint` 检查代码规范',
+    '运行单元测试确认修复',
+    '执行类型检查',
+    '运行 ./scripts/check.sh 校验输出',
+    '用命令行查看 git 状态',
+    'Run the test suite to confirm the baseline',
+  ])('still lets terminal.exec complete the command step "%s"', (step) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it('reports the deviation instead of listing an unread file as done after git log and off-plan reads', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 获取项目概览和目录结构',
+        '2. 阅读 src/runtime/AgentRuntime.ts 理解主循环执行流程',
+        '3. 搜索错误处理和重试模式',
+        '4. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'structure', params: {} }, { tree: ['src'] }],
+    ]);
+    runPlanRound(plans, trace, 3, [exec('git log -5 --oneline')]);
+    // 无关的 git log 从没读过 AgentRuntime.ts，不能把第 2 步标成完成。
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+    runPlanRound(plans, trace, 4, [
+      ['code', { action: 'search', params: { pattern: 'retry' } }, { total: 0, matches: [] }],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'done', 'pending']);
+    for (const [iteration, file] of [
+      [5, 'src/a.ts'],
+      [6, 'src/b.ts'],
+    ] as const) {
+      runPlanRound(plans, trace, iteration, [read(file)]);
+      expect(plans.checkPlanning(planCheckState(iteration + 1), trace)).toBeNull();
+    }
+    runPlanRound(plans, trace, 7, [read('src/c.ts')]);
+    // 第 2 步仍可由工具完成：连续 3 轮读无关文件是真实偏离，不能被“计划耗尽”保持吞掉。
+    expect(plans.progress).toMatchObject({ unplannedActions: 4, consecutiveOffPlan: 3 });
+    const nudge = plans.checkPlanning(planCheckState(8), trace)?.text ?? '';
+    expect(nudge).toContain('📋 计划偏差检查');
+    expect(nudge).toContain('连续 3 轮偏离');
+    expect(nudge).toContain('⏳ 未完成 (2/4)');
+    expect(nudge.indexOf('阅读 src/runtime/AgentRuntime.ts')).toBeGreaterThan(
+      nudge.indexOf('⏳ 未完成')
+    );
+  });
+
+  it('counts exploration after every plan step is done as off-plan, not as a vacuous plan exhaustion', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    runPlanRound(plans, trace, 2, [read('src/a.ts')]);
+    runPlanRound(plans, trace, 3, [read('src/b.ts')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'done']);
+    for (const [iteration, file] of [
+      [4, 'src/x4.ts'],
+      [5, 'src/x5.ts'],
+      [6, 'src/x6.ts'],
+    ] as const) {
+      trace.startRound(iteration);
+      trace.recordToolCall(...read(file), true);
+      // 计划全部完成后读无关文件既不能完成、也不能续做任何步骤：是计划外动作，不是“只剩总结步”的耗尽保持。
+      expect(plans.updatePlanProgress(trace)).toMatchObject({
+        countedActions: 1,
+        unplannedActions: 1,
+        streakHeld: false,
+        consecutiveOffPlan: iteration - 3,
+      });
+    }
+    expect(plans.progress).toMatchObject({
+      coveredSteps: 2,
+      totalSteps: 2,
+      unplannedActions: 3,
+      consecutiveOffPlan: 3,
+      deviationScore: 0.6,
+    });
+    expect(plans.checkPlanning(planCheckState(7), trace)?.text).toContain('连续 3 轮偏离');
+  });
+
+  it('still sends the bootstrap deviation nudge once a compact plan without a summary step is finished', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    runPlanRound(plans, trace, 2, [read('src/a.ts')]);
+    runPlanRound(plans, trace, 3, [read('src/b.ts')]);
+    for (const [iteration, file] of [
+      [4, 'src/x4.ts'],
+      [5, 'src/x5.ts'],
+      [6, 'src/x6.ts'],
+    ] as const) {
+      runPlanRound(plans, trace, iteration, [read(file)]);
+    }
+    const nudge = plans.checkPlanning(
+      planCheckState(7, { pipelineType: 'bootstrap', maxIterations: 30 }),
+      trace
+    );
+    expect(nudge?.text).toContain('📋 计划偏差检查：剩余 23 轮');
+    expect(nudge?.text).toContain('已进入提交/总结方向时不要重新搜索');
+  });
+
+  it('logs off-plan exploration after plan completion without the empty summary-step list', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    runPlanRound(plans, trace, 2, [read('src/a.ts'), read('src/b.ts')]);
+    runPlanRound(plans, trace, 3, [read('src/x.ts')]);
+    const messages = debug.mock.calls.map(([message]) => String(message));
+    expect(messages.filter((message) => message.includes('summary step(s) []'))).toEqual([]);
+    const completedLogs = messages.filter((message) =>
+      message.includes('off-plan exploration after plan completion')
+    );
+    expect(completedLogs).toHaveLength(1);
+    expect(completedLogs[0]).toContain('all 2 step(s) done');
+    expect(completedLogs[0]).toContain('consecutiveOffPlan=1');
+  });
+
+  it('keeps holding the streak while a summary step is the only open step', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 总结分析发现', 1);
+    runPlanRound(plans, trace, 2, [read('src/a.ts')]);
+    for (const iteration of [3, 4, 5]) {
+      trace.startRound(iteration);
+      trace.recordToolCall(...read(`src/x${iteration}.ts`), true);
+      expect(plans.updatePlanProgress(trace)).toMatchObject({
+        countedActions: 0,
+        streakHeld: true,
+        consecutiveOffPlan: 0,
+      });
+    }
+    expect(plans.checkPlanning(planCheckState(6), trace)).toBeNull();
+  });
+});
+
 describe('PlanTracker trace port (L6-P16 C19)', () => {
   it('drives PlanTracker through the public ExplorationTrace port, honouring failed reads', () => {
     const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];
