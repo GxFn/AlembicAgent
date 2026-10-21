@@ -184,29 +184,18 @@ test('masks the visible prefix of a quoted value truncated after an escape chara
 
 /**
  * I26：源码文本误伤回归。比较运算、箭头函数、类型注解、case 标签、三元表达式与
- * 非字面量的复合键赋值都不是凭据赋值，台账与 developer 事件必须逐字保留。
+ * 非字面量的复合键赋值都不是凭据赋值；现行规则（b60a61e）对它们逐字保留。
+ *
+ * 用户决定 D2（2026-10-19，脱敏设计阶段 1）：仍走脱敏的出口必须满足零回退不变量 S——四个历史版本中
+ * 任一版本遮住的字符都要遮住。d113986（b60a61e^）会遮住下面第二组写法，所以阶段 1 之后它们重新被遮蔽；
+ * 这是用户接受的误伤回升，逐字源码的需求由阶段 2（evidence.get 回读原文）与阶段 3（严格见证）在消费端
+ * 解决，不放宽检测。第一组是四个版本都不改写的写法，仍须逐字保留。
  */
 describe('redactDeveloperText keeps ordinary source text verbatim', () => {
   test.each([
-    'if (token === null) return;',
-    'const ok = secret == other;',
-    'if (token == "x") {',
     "if (password != 'x') {",
     'if (password !== confirm) {',
-    'interface Creds {\n  password: string;\n  token?: string;\n}',
     'const fn = (token) => token;',
-    'items.map(token => token.trim());',
-    'func login(password: String) -> Bool',
-    'def login(password: str) -> bool:',
-    'let token: Token | undefined = undefined;',
-    'type Session = { token: string|null; secret: Array<string>; password: Token[] };',
-    'var token: Token? = nil',
-    'fn check(password: &str) -> bool',
-    'def load(token: Optional[str]) -> None:',
-    'switch (kind) { case token: break; }',
-    'const value = useCache ? token : await fetchToken();',
-    'use auth::token::Claims;',
-    'token := nextToken()',
     'const secretKey = process.env.SECRET_KEY;',
     'const accessKey = getAccessKey();',
     'secret_key = os.environ["SECRET_KEY"]',
@@ -218,8 +207,42 @@ describe('redactDeveloperText keeps ordinary source text verbatim', () => {
   ])('keeps %j unchanged', (input) => {
     expect(redactDeveloperText(input)).toBe(input);
   });
+});
 
-  test('keeps a code.read slice with comparisons and annotations byte-for-byte', () => {
+describe('redactDeveloperText masks source shapes that d113986 masked (D2 accepted cost)', () => {
+  test.each([
+    ['if (token === null) return;', 'if (token =[redacted] null) return;'],
+    ['const ok = secret == other;', 'const ok = secret =[redacted] other;'],
+    ['if (token == "x") {', 'if (token =[redacted] "x") {'],
+    [
+      'interface Creds {\n  password: string;\n  token?: string;\n}',
+      'interface Creds {\n  password: [redacted]\n  token?: string;\n}',
+    ],
+    ['items.map(token => token.trim());', 'items.map(token =[redacted] token.trim());'],
+    ['func login(password: String) -> Bool', 'func login(password: [redacted] -> Bool'],
+    ['def login(password: str) -> bool:', 'def login(password: [redacted] -> bool:'],
+    ['let token: Token | undefined = undefined;', 'let token: [redacted] | undefined = undefined;'],
+    [
+      'type Session = { token: string|null; secret: Array<string>; password: Token[] };',
+      'type Session = { token: [redacted] secret: [redacted] password: [redacted] };',
+    ],
+    ['var token: Token? = nil', 'var token: [redacted] = nil'],
+    ['fn check(password: &str) -> bool', 'fn check(password: [redacted] -> bool'],
+    ['def load(token: Optional[str]) -> None:', 'def load(token: [redacted] -> None:'],
+    ['switch (kind) { case token: break; }', 'switch (kind) { case token: [redacted] }'],
+    [
+      'const value = useCache ? token : await fetchToken();',
+      'const value = useCache ? token : [redacted] fetchToken();',
+    ],
+    ['use auth::token::Claims;', 'use auth::token:[redacted]'],
+    ['token := nextToken()', 'token :[redacted] nextToken()'],
+  ])('masks %j as the d113986 floor requires', (input, expected) => {
+    const output = redactDeveloperText(input);
+    expect(output).toBe(expected);
+    expect(redactDeveloperText(output)).toBe(output);
+  });
+
+  test('masks a code.read slice where d113986 masked comparisons and annotations', () => {
     const source = [
       'export function check(token: string | null, password: string): boolean {',
       '  if (token === null) {',
@@ -228,7 +251,20 @@ describe('redactDeveloperText keeps ordinary source text verbatim', () => {
       '  return password.length > 0 && token == expected;',
       '}',
     ].join('\n');
-    expect(redactDeveloperText(source)).toBe(source);
+    const output = redactDeveloperText(source);
+    expect(output).toBe(
+      [
+        'export function check(token: [redacted] | null, password: [redacted] boolean {',
+        '  if (token =[redacted] null) {',
+        '    return false;',
+        '  }',
+        '  return password.length > 0 && token =[redacted] expected;',
+        '}',
+      ].join('\n')
+    );
+    // 台账切片依赖行数守恒：底线只在被遮区间内重出裸换行。
+    expect(output.split('\n')).toHaveLength(source.split('\n').length);
+    expect(redactDeveloperText(output)).toBe(output);
   });
 });
 
@@ -332,9 +368,10 @@ describe('redactDeveloperText masks additional credential shapes', () => {
       'DATABASE_URL=postgres://app:[redacted]@db:5432/x',
     ],
     ['redis://:SYNTHETICpass@cache:6379', 'redis://:[redacted]@cache:6379'],
+    // D2：d113986 把 token 键后的整个 URL 值遮住，底线因此连同主机与路径一起遮蔽。
     [
       'git clone https://x-access-token:SYNTHETICghp@github.com/o/r.git',
-      'git clone https://x-access-token:[redacted]@github.com/o/r.git',
+      'git clone https://x-access-token:[redacted]',
     ],
     ['mongodb://u:p@ssSYNTHETIC@mongo/db', 'mongodb://u:[redacted]@mongo/db'],
   ])('masks URL userinfo password in %j', (input, expected) => {

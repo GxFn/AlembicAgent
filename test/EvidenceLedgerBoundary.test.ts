@@ -1,6 +1,7 @@
 /**
  * 证据台账 PCV 边界测试（Wave A E1，用户约束 2026-07-04）：
- * PCV 是测试辅助——主线证据模块（src/agent/evidence/**、utils/Redaction）不得 import
+ * PCV 是测试辅助——主线证据模块（src/agent/evidence/**、utils/Redaction 及其内部模块
+ * utils/redaction/**）不得 import
  * 任何 Pcv* 文件；台账只借鉴其 callId↔sourceRefs 链路概念。此测试是结构守卫，
  * 防止后续迭代把观察层文件重新渗入主线（R-2 解耦方向的第一道钉）。
  */
@@ -28,12 +29,18 @@ function listTsFiles(dir: string): string[] {
 }
 
 describe('EvidenceLedger PCV 边界（主线零 Pcv 依赖）', () => {
-  test('src/agent/evidence/** 与 utils/Redaction.ts 不含任何 Pcv 引用', () => {
+  test('src/agent/evidence/**、utils/Redaction.ts 与 utils/redaction/** 不含任何 Pcv 引用', () => {
+    // 脱敏阶段 1 把底线拆进 utils/redaction/（冻结基线、对齐、补遮），它们同属台账哈希规范，边界一并守住。
+    const redactionModules = listTsFiles(path.join(repoRoot, 'src/agent/utils/redaction'));
+    expect(redactionModules.map((file) => path.basename(file)).sort()).toEqual(
+      expect.arrayContaining(['frozenBaselines.ts', 'hiddenSpans.ts', 'legacyFloor.ts'])
+    );
     const files = [
       ...listTsFiles(path.join(repoRoot, 'src/agent/evidence')),
       path.join(repoRoot, 'src/agent/utils/Redaction.ts'),
+      ...redactionModules,
     ];
-    expect(files.length).toBeGreaterThanOrEqual(2);
+    expect(files.length).toBeGreaterThanOrEqual(5);
     for (const file of files) {
       const text = fs.readFileSync(file, 'utf8');
       expect(text.includes('Pcv'), `${path.relative(repoRoot, file)} 不得引用 Pcv*`).toBe(false);

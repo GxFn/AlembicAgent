@@ -5,10 +5,15 @@
  * 本函数事实上是证据台账哈希规范的一部分：EvidenceLedgerStore 落盘与 checkFreshness 重算都经过这里。
  * 规则变更后，升级时在途 job 中受影响的旧条目会被判 stale（EVIDENCE_STALE 提示重采），不会丢数据。
  *
- * 误伤边界：源码比较（== / === / !=）、箭头函数（=>）、作用域符（::）、类型注解、case 标签与三元
- * 表达式都不是凭据赋值，必须逐字保留；否则 code.read 证据被改写后经 evidence.get 回到模型，
- * 写进 Recipe 的片段会在下游逐字校验中被拒。
+ * 阶段 1 零回退底线（设计 redaction-design-2026-10-19，用户决定 D1/D2/D3）：redactDeveloperText 是门面，
+ * 先用现行规则 redactWithCurrentRules 渲染（下方规则代码不改），再由 redaction/legacyFloor.ts 保证
+ * main 上四个历史版本（246055e、1b394ce、d113986、b60a61e）中任一版本遮住的非换行字符都仍被遮住。
+ * 因此现行规则为减少误伤而放行的写法（比较运算、箭头函数、类型注解、case 标签、三元表达式等），只要
+ * 历史版本遮过，在这里仍会被遮住（D2 接受的阶段 1 代价）；需要逐字源码的消费者由阶段 2、3 改走回读或
+ * 见证通道，而不是放宽这里的检测。
  */
+
+import { applyLegacyFloor, type FloorReport } from './redaction/legacyFloor.js';
 
 /** 以这些关键字结尾的键沿用历史覆盖面：GITHUB_TOKEN、client_secret、x-api-key 等前缀形态都算。 */
 const SECRET_KEY_SOURCE = 'api[_-]?key|token|secret|password|authorization';
@@ -136,7 +141,25 @@ interface BareAssignment {
   following: string;
 }
 
+/** 开发者文本脱敏（签名不变）：现行规则主渲染 + 四个历史版本并集底线，迭代到不动点。 */
 export function redactDeveloperText(text: string): string {
+  return applyLegacyFloor(text, redactWithCurrentRules).text;
+}
+
+/**
+ * 内部纯函数：返回脱敏文本与底线报告。报告只含计数与事件种类（补遮、整段补遮、失败即关的
+ * [redacted-unaligned] 行、不动点触顶等），不含任何正文，供有日志通道的调用方记录诊断。
+ * 不从任何 index 转出。
+ */
+export function redactDeveloperTextWithReport(text: string): {
+  text: string;
+  report: FloorReport;
+} {
+  return applyLegacyFloor(text, redactWithCurrentRules);
+}
+
+/** 现行规则（与 b60a61e 相同）。阶段 4 冻结为 v3 之前，规则只在这里演进，标记词表由测试锁定。 */
+function redactWithCurrentRules(text: string): string {
   return redactText(text, 0);
 }
 

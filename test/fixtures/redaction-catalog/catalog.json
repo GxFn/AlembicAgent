@@ -1,0 +1,882 @@
+{
+  "description": "脱敏阶段 1 回归语料：失败模式目录 151 例（ID 与 failures.md 第 4、5 节一致）与 3.2 节新发现。全部是合成值（SYNTHETIC / Synthetic 标记），不是真实凭据。expect 只是目录原始分类；阶段 1 门禁是对四个历史版本零回退（assertNoLegacyRegression），不是 expect。",
+  "catalog": [
+    {
+      "id": "L01a",
+      "expect": "mask",
+      "input": "password=!SYNTHETIC2wsx"
+    },
+    {
+      "id": "L01b",
+      "expect": "mask",
+      "input": "DB_PASSWORD=!SYNTHETIC2wsx"
+    },
+    {
+      "id": "L01c",
+      "expect": "mask",
+      "input": "export API_TOKEN=|SYNTHETICpipe9"
+    },
+    {
+      "id": "L01d",
+      "expect": "mask",
+      "input": "password = <SYNTHETIC9>"
+    },
+    {
+      "id": "L02a",
+      "expect": "mask",
+      "input": "password: SYNTHETIC2?"
+    },
+    {
+      "id": "L02b",
+      "expect": "mask",
+      "input": "password: abc|SYNTHETIC123"
+    },
+    {
+      "id": "L02c",
+      "expect": "mask",
+      "input": "token: SYNTHETIC0<1"
+    },
+    {
+      "id": "L02d",
+      "expect": "mask",
+      "input": "password: ?xSYNTHETIC"
+    },
+    {
+      "id": "L02e",
+      "expect": "mask",
+      "input": "secret: &SYNTHETIC123"
+    },
+    {
+      "id": "L02f",
+      "expect": "mask",
+      "input": "password: Data"
+    },
+    {
+      "id": "L02g",
+      "expect": "mask",
+      "input": "password: SyntheticPw|null"
+    },
+    {
+      "id": "L02h",
+      "expect": "mask",
+      "input": "password: SyntheticPw&str"
+    },
+    {
+      "id": "L02i",
+      "expect": "mask",
+      "input": "password: SyntheticPw[1]"
+    },
+    {
+      "id": "L03a",
+      "expect": "mask",
+      "input": "db.default {\n  user: admin\n  password: SyntheticHorseBatteryStaple\n}"
+    },
+    {
+      "id": "L03b",
+      "expect": "mask",
+      "input": "# Database settings (see docs\ndatabase:\n  password: SyntheticWelcome"
+    },
+    {
+      "id": "L03c",
+      "expect": "mask",
+      "input": "INFO Loaded config {\n  host: db\n  password: SyntheticWelcome\n}"
+    },
+    {
+      "id": "L03d",
+      "expect": "mask",
+      "input": "connect(host: db, password: SyntheticWelcome)"
+    },
+    {
+      "id": "L03e",
+      "expect": "mask",
+      "input": "private password: SyntheticWelcome"
+    },
+    {
+      "id": "L03f",
+      "expect": "mask",
+      "input": "interface P { re: \"{\"; }\n  password: SyntheticWelcome"
+    },
+    {
+      "id": "L03g",
+      "expect": "mask",
+      "input": "def f(x=\"(\"):\n    password: SyntheticWelcome"
+    },
+    {
+      "id": "L03h",
+      "expect": "mask",
+      "input": "interface eth0 {\n  password: SyntheticWelcome\n}"
+    },
+    {
+      "id": "L03i",
+      "expect": "mask",
+      "input": "class Pet {\n  password: SyntheticWelcome;\n}"
+    },
+    {
+      "id": "L03j",
+      "expect": "mask",
+      "input": "type Password = SyntheticWelcome"
+    },
+    {
+      "id": "L04a",
+      "expect": "mask",
+      "input": "PASSWORD=super"
+    },
+    {
+      "id": "L04b",
+      "expect": "mask",
+      "input": "API_TOKEN=this"
+    },
+    {
+      "id": "L04c",
+      "expect": "mask",
+      "input": "PASSWORD=this.is.SyntheticSecret"
+    },
+    {
+      "id": "L04d",
+      "expect": "mask",
+      "input": "password: this.isSyntheticSecret"
+    },
+    {
+      "id": "L04e",
+      "expect": "mask",
+      "input": "const password = SYNTHETIChunter2"
+    },
+    {
+      "id": "L04g",
+      "expect": "mask",
+      "input": "const password = SYNhunter2"
+    },
+    {
+      "id": "L04f",
+      "expect": "mask",
+      "input": "let password = Pa$$SYNTHETIC"
+    },
+    {
+      "id": "L05a",
+      "expect": "mask",
+      "input": "postgres://app:$SYNTHETICPW@db/app"
+    },
+    {
+      "id": "L05b",
+      "expect": "mask",
+      "input": "postgres://app:{SyntheticSecret}@db/app"
+    },
+    {
+      "id": "L05c",
+      "expect": "mask",
+      "input": "DATABASE_URL: postgresql://postgres:${DB_PASS:-SyntheticDefault5}@db:5432/app"
+    },
+    {
+      "id": "L12f",
+      "expect": "mask",
+      "input": "postgres://u:${pw??SyntheticDefault6}@db/app"
+    },
+    {
+      "id": "L06a",
+      "expect": "mask",
+      "input": "docker run -e DB_PASSWORD==SYNTHETICdocker app"
+    },
+    {
+      "id": "L06b",
+      "expect": "mask",
+      "input": "(PASSWORD==SYNTHETICx1)"
+    },
+    {
+      "id": "L06c",
+      "expect": "mask",
+      "input": "https://h/?token==SYNTHETICx2"
+    },
+    {
+      "id": "L06d",
+      "expect": "mask",
+      "input": "cmd;PASSWORD==SYNTHETICx3"
+    },
+    {
+      "id": "L07a",
+      "expect": "mask",
+      "input": "// -----BEGIN PRIVATE KEY-----\n// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n// SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07b",
+      "expect": "mask",
+      "input": "     1\t-----BEGIN PRIVATE KEY-----\n     2\tMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n     3\tSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n... (output truncated)"
+    },
+    {
+      "id": "L07c",
+      "expect": "mask",
+      "input": "// Example key: -----BEGIN PRIVATE KEY-----\n// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n// SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07d",
+      "expect": "mask",
+      "input": "+// key: -----BEGIN PRIVATE KEY-----\n+// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n+// SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07e",
+      "expect": "mask",
+      "input": "1|-----BEGIN PRIVATE KEY-----\n2|MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n3|SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n4|-----END PRIVATE KEY-----"
+    },
+    {
+      "id": "L07f",
+      "expect": "mask",
+      "input": "key.pem:1:-----BEGIN PRIVATE KEY-----\nkey.pem:2:MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nkey.pem:3:SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07g",
+      "expect": "mask",
+      "input": "/* -----BEGIN PRIVATE KEY-----\n * MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n * SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07h",
+      "expect": "mask",
+      "input": "41|// testKey: -----BEGIN PRIVATE KEY-----\n42|// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n43|// SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    },
+    {
+      "id": "L07i",
+      "expect": "mask",
+      "input": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n... [120 lines omitted] ...\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n-----END PRIVATE KEY-----"
+    },
+    {
+      "id": "L08a",
+      "expect": "mask",
+      "input": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n"
+    },
+    {
+      "id": "L08b",
+      "expect": "mask",
+      "input": "INFO key: -----BEGIN PRIVATE KEY-----\nINFO MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nINFO SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nINFO SYNTHfrag12..."
+    },
+    {
+      "id": "L08c",
+      "expect": "mask",
+      "input": "-----BEGIN RSA PRIVATE KEY----- dump\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nSYNTHfrag12 [truncated]"
+    },
+    {
+      "id": "L08d",
+      "expect": "mask",
+      "input": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEISYNTH\n... [truncated]"
+    },
+    {
+      "id": "L08e",
+      "expect": "mask",
+      "input": "-----BEGIN PRIVATE KEY----- SYNTHXSECRETQ9"
+    },
+    {
+      "id": "L08f",
+      "expect": "mask",
+      "input": "-----BEGIN PRIVATE KEY----- header\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\nSYNTHAg==\","
+    },
+    {
+      "id": "L09a",
+      "expect": "mask",
+      "input": "KEY = (\n    \"-----BEGIN PRIVATE KEY-----\\n\"\n    \"MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\\n\"\n    \"SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\n\"\n)"
+    },
+    {
+      "id": "L09b",
+      "expect": "mask",
+      "input": "[\"-----BEGIN PRIVATE KEY-----\", \"MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\", \"SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\", \"-----END PRIVATE KEY-----\"]"
+    },
+    {
+      "id": "L10a",
+      "expect": "mask",
+      "input": "{\"token\": [`a]`, \"SYNTHETICb\"]};"
+    },
+    {
+      "id": "L10b",
+      "expect": "mask",
+      "input": "{\"api_key\": [# don't (rotate}\n  \"SYNTHETICk1\"\n]}"
+    },
+    {
+      "id": "L11a",
+      "expect": "mask",
+      "input": "echo SECRET_KEY: SyntheticWelcome\nfoo"
+    },
+    {
+      "id": "L12a",
+      "expect": "mask",
+      "input": "PASSWORD := SYNTHETIChunter2"
+    },
+    {
+      "id": "L12b",
+      "expect": "mask",
+      "input": "'password' => 'SYNTHETICruby'"
+    },
+    {
+      "id": "L12c",
+      "expect": "mask",
+      "input": "PASSWORD==\"SYNTHETICq\""
+    },
+    {
+      "id": "L12d",
+      "expect": "mask",
+      "input": "password=${DB_PASS}SYNTHETICtail"
+    },
+    {
+      "id": "L12e",
+      "expect": "mask",
+      "input": "password::SYNTHETICx"
+    },
+    {
+      "id": "M01a",
+      "expect": "keep",
+      "input": "# Strip the -----BEGIN PRIVATE KEY----- header\ndef strip(pem):\n    return pem"
+    },
+    {
+      "id": "M01b",
+      "expect": "keep",
+      "input": "// Matches -----BEGIN PRIVATE KEY----- blocks\nconst PEM_RE = /x/;"
+    },
+    {
+      "id": "M01c",
+      "expect": "keep",
+      "input": "\"\"\"Load a -----BEGIN RSA PRIVATE KEY----- file\n\n    Returns the key object\n    \"\"\""
+    },
+    {
+      "id": "M01d",
+      "expect": "keep",
+      "input": "// Strip everything after -----BEGIN PRIVATE KEY-----\nstripPrivateKeyBody(text);"
+    },
+    {
+      "id": "M01e",
+      "expect": "keep",
+      "input": "// Strip the -----BEGIN PRIVATE KEY----- header\nfunction stripPemHeaderAndFooter(pem) {"
+    },
+    {
+      "id": "M01f",
+      "expect": "keep",
+      "input": "# -----BEGIN PRIVATE KEY-----\n# SeeAlsoParsePrivateKeyPem\ndef strip(pem):"
+    },
+    {
+      "id": "M01g",
+      "expect": "keep",
+      "input": "// -----BEGIN PRIVATE KEY----- PKCS8PrivateKeyInfo\nnext();"
+    },
+    {
+      "id": "M02a",
+      "expect": "mask",
+      "input": "// -----BEGIN PRIVATE KEY-----\n// MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\n// SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n// -----END PRIVATE KEY-----"
+    },
+    {
+      "id": "M03a",
+      "expect": "keep",
+      "input": "const url = `postgres://${user}:${password}@${host}/db`;"
+    },
+    {
+      "id": "M03b",
+      "expect": "keep",
+      "input": "url = f\"postgresql://{user}:{password}@{host}:{port}/{db}\""
+    },
+    {
+      "id": "M03c",
+      "expect": "keep",
+      "input": "DSN=\"mysql://$DB_USER:$DB_PASS@localhost/app\""
+    },
+    {
+      "id": "M03d",
+      "expect": "keep",
+      "input": "type U = `mongodb://${string}:${string}@${string}:${number}`;"
+    },
+    {
+      "id": "M03e",
+      "expect": "keep",
+      "input": "DSN=mysql://$db_user:$db_pass@localhost/app"
+    },
+    {
+      "id": "M03f",
+      "expect": "keep",
+      "input": "url: \"redis://:${{secrets.REDIS_PW}}@cache:6379\""
+    },
+    {
+      "id": "M04a",
+      "expect": "keep",
+      "input": "const token = typeof value === 'string' ? value : null;"
+    },
+    {
+      "id": "M04b",
+      "expect": "keep",
+      "input": "headers: { Authorization: `Bearer ${this.apiKey}` },"
+    },
+    {
+      "id": "M04c",
+      "expect": "keep",
+      "input": "  apiKey: this.apiKey,"
+    },
+    {
+      "id": "M04d",
+      "expect": "keep",
+      "input": "let token = getToken();"
+    },
+    {
+      "id": "M04e",
+      "expect": "keep",
+      "input": "token = token.strip()"
+    },
+    {
+      "id": "M04f",
+      "expect": "keep",
+      "input": "PGPASSWORD=$DB_PASS psql -h db"
+    },
+    {
+      "id": "M04g",
+      "expect": "keep",
+      "input": "PASSWORD=${DB_PASSWORD}"
+    },
+    {
+      "id": "M05a",
+      "expect": "keep",
+      "input": "interface Auth {\n  token: Token;\n  apiKey: ApiKey;\n  password: Password;\n}"
+    },
+    {
+      "id": "M05b",
+      "expect": "keep",
+      "input": "  token: Token;\n  apiKey: ApiKey;"
+    },
+    {
+      "id": "M05c",
+      "expect": "keep",
+      "input": "class Settings(BaseModel):\n    api_key: Optional[str] = None"
+    },
+    {
+      "id": "M05d",
+      "expect": "keep",
+      "input": "    secret: Dict[str, str]"
+    },
+    {
+      "id": "M05e",
+      "expect": "keep",
+      "input": "  authorizationToken: z.ZodOptional<z.ZodString>;"
+    },
+    {
+      "id": "M05f",
+      "expect": "keep",
+      "input": "  readonly operatorToken: Token<SyntaxKind.X>;"
+    },
+    {
+      "id": "M05g",
+      "expect": "keep",
+      "input": "  $withAuth(token: Exclude<HTTPQueryOptions<true, true>['fetchOptions'], undefined>): this;"
+    },
+    {
+      "id": "M05h",
+      "expect": "keep",
+      "input": "export type F = (token: FindByType<Token, Name>) => void;"
+    },
+    {
+      "id": "M05i",
+      "expect": "keep",
+      "input": "  token: result[idx] || match,"
+    },
+    {
+      "id": "M05j",
+      "expect": "keep",
+      "input": "  createQuestion(questionToken: QuestionToken | undefined): void;"
+    },
+    {
+      "id": "M05k",
+      "expect": "keep",
+      "input": "interface K {\n  token: Token | undefined;\n}"
+    },
+    {
+      "id": "M06a",
+      "expect": "keep",
+      "input": "type GlobToken =\n  | { kind: 'literal'; char: string }\n  | { kind: 'any' };"
+    },
+    {
+      "id": "M06b",
+      "expect": "keep",
+      "input": "MasterUserPassword: !Ref DBPassword"
+    },
+    {
+      "id": "M06c",
+      "expect": "keep",
+      "input": "const token = <Token>value;"
+    },
+    {
+      "id": "M06d",
+      "expect": "keep",
+      "input": "password: !Sub '{{resolve:secretsmanager:db}}'"
+    },
+    {
+      "id": "M07a",
+      "expect": "keep",
+      "input": "    if token==None:"
+    },
+    {
+      "id": "M07b",
+      "expect": "keep",
+      "input": "return token===undefined;"
+    },
+    {
+      "id": "M07c",
+      "expect": "keep",
+      "input": "const f = token=>token.trim();"
+    },
+    {
+      "id": "M07d",
+      "expect": "keep",
+      "input": "if(\"password\"===e.type)x()"
+    },
+    {
+      "id": "M08a",
+      "expect": "keep",
+      "input": "      secretKeyRef:\n        name: aws\n        key: secret"
+    },
+    {
+      "id": "M08b",
+      "expect": "keep",
+      "input": "interface K {\n  privateKey: CryptoKey\n}"
+    },
+    {
+      "id": "M08c",
+      "expect": "keep",
+      "input": "const PRIVATE_KEY_FILE = 'signing-key.pk8';"
+    },
+    {
+      "id": "M08d",
+      "expect": "keep",
+      "input": "const SECRET_KEY_SOURCE = 'api[_-]?key|token|secret|password|authorization';"
+    },
+    {
+      "id": "M09a",
+      "expect": "keep",
+      "input": "const pw = password ? password : 'fallback';"
+    },
+    {
+      "id": "M09b",
+      "expect": "keep",
+      "input": "pw = prompt('Password: ')\nprint(pw)\n"
+    },
+    {
+      "id": "M10a",
+      "expect": "mask",
+      "input": "{\n  \"password\": {\n    // don't commit\n    \"value\": \"SYNTHETICv\"\n  }\n}\nconst after = 1;\nconsole.log(after);"
+    },
+    {
+      "id": "M11a",
+      "expect": "keep",
+      "input": "let token: Token = try decoder.decode(Token.self, from: data)"
+    },
+    {
+      "id": "M11b",
+      "expect": "keep",
+      "input": "var token: Token = Token()"
+    },
+    {
+      "id": "M11c",
+      "expect": "keep",
+      "input": "token: Token = field(default_factory=Token)"
+    },
+    {
+      "id": "M12a",
+      "expect": "keep",
+      "input": "def f(password:\tstr):"
+    },
+    {
+      "id": "V1-1",
+      "expect": "mask",
+      "input": "| staging | password: SyntheticPw | rotated |"
+    },
+    {
+      "id": "V1-2",
+      "expect": "mask",
+      "input": "Is the staging password: SYNTHETICpw?"
+    },
+    {
+      "id": "V1-3",
+      "expect": "mask",
+      "input": "api_key: <SYNTHETICkey>"
+    },
+    {
+      "id": "V1-4",
+      "expect": "mask",
+      "input": "password: Synthetic.Horse?"
+    },
+    {
+      "id": "V1-5",
+      "expect": "mask",
+      "input": "password: SyntheticPw|None"
+    },
+    {
+      "id": "V1-6",
+      "expect": "mask",
+      "input": "PASSWORD=self.SyntheticSecret"
+    },
+    {
+      "id": "V2-1",
+      "expect": "mask",
+      "input": "[boot] loaded AWS_SECRET_ACCESS_KEY: SyntheticSecretValue from vault"
+    },
+    {
+      "id": "V2-2",
+      "expect": "mask",
+      "input": "secret_key = SyntheticSecretValue ; rotated 2026-10"
+    },
+    {
+      "id": "V2-3",
+      "expect": "mask",
+      "input": "creds: {secret_key: SyntheticSecretValue, region: eu}"
+    },
+    {
+      "id": "V2-4",
+      "expect": "mask",
+      "input": "case password: SYNTHETICcase"
+    },
+    {
+      "id": "V2-5",
+      "expect": "mask",
+      "input": "login ok ? password : SYNTHETICtern"
+    },
+    {
+      "id": "V2-6",
+      "expect": "mask",
+      "input": "interface ge-0/0/0 {\n    password: SyntheticWelcome\n}"
+    },
+    {
+      "id": "V1-7",
+      "expect": "keep",
+      "input": "client = OpenAI(api_key=api_key, base_url=url)"
+    },
+    {
+      "id": "V1-8",
+      "expect": "keep",
+      "input": "SELECT user_id FROM sessions WHERE token = :token"
+    },
+    {
+      "id": "V1-9",
+      "expect": "keep",
+      "input": "const { apiKey: key } = options;"
+    },
+    {
+      "id": "V1-10",
+      "expect": "keep",
+      "input": "login(user: user, password: password)"
+    },
+    {
+      "id": "V1-11",
+      "expect": "keep",
+      "input": "class GrantType(str, Enum):\n    PASSWORD = \"password\"\n    REFRESH_TOKEN = \"refresh_token\""
+    },
+    {
+      "id": "V3-1",
+      "expect": "keep",
+      "input": "// Attach the Bearer token to every request"
+    },
+    {
+      "id": "V3-2",
+      "expect": "keep",
+      "input": "on:\n  workflow_call:\n    secrets:\n      npm_token:\n        required: true"
+    },
+    {
+      "id": "V3-3",
+      "expect": "mask",
+      "input": "my %cfg = (api_key=>SYNTHETICperl);"
+    },
+    {
+      "id": "V3-4",
+      "expect": "keep",
+      "input": "password:\nusername: bob"
+    },
+    {
+      "id": "V3-5",
+      "expect": "keep",
+      "input": "npm run task-orchestrator-build"
+    },
+    {
+      "id": "V3-6",
+      "expect": "keep",
+      "input": "See docs/risk-assessment-report.md"
+    },
+    {
+      "id": "V4-1",
+      "expect": "keep",
+      "input": "The file starts with -----BEGIN PRIVATE KEY-----\nand ends with the END marker."
+    },
+    {
+      "id": "V4-2",
+      "expect": "keep",
+      "input": "ERROR invalid key: -----BEGIN PRIVATE KEY----- expected 64 bytes got 0"
+    },
+    {
+      "id": "V4-3",
+      "expect": "mask",
+      "input": "<Key>-----BEGIN PRIVATE KEY-----&#13;\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA&#13;\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&#13;\n-----END PRIVATE KEY-----</Key>"
+    },
+    {
+      "id": "V4-4",
+      "expect": "mask",
+      "input": "{\"content\":\"-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG\\/9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\n"
+    },
+    {
+      "id": "V4-5",
+      "expect": "mask",
+      "input": "tls.pem=-----BEGIN PRIVATE KEY-----\\\n    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\\\n    SYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\\n    -----END PRIVATE KEY-----"
+    },
+    {
+      "id": "V5-1",
+      "expect": "mask",
+      "input": "level=warn msg=\"retry with token: \" token=\"SYNTHETICtok\""
+    },
+    {
+      "id": "V5-2",
+      "expect": "keep",
+      "input": "printf(\"Password: %s\\n\", pw);"
+    },
+    {
+      "id": "V5-3",
+      "expect": "mask",
+      "input": "{\"apiKey\": [ /* it's rotated */ \"SYNTHETICk\" ],\n \"region\": \"us\"}\nnext();"
+    },
+    {
+      "id": "V5-4",
+      "expect": "keep",
+      "input": "interface A {\n  token: string\n}"
+    },
+    {
+      "id": "V5-5",
+      "expect": "keep",
+      "input": "label = \"API token:\"; value = compute()"
+    },
+    {
+      "id": "V6-1",
+      "expect": "mask",
+      "input": "mysql -u root --password SYNTHETICcli db"
+    },
+    {
+      "id": "V6-2",
+      "expect": "mask",
+      "input": "Driver={ODBC Driver 18};Server=db;Uid=sa;Pwd=SYNTHETICpwd;"
+    },
+    {
+      "id": "V6-3",
+      "expect": "mask",
+      "input": "machine api.example.com login bot password SYNTHETICnetrc"
+    },
+    {
+      "id": "V6-4",
+      "expect": "mask",
+      "input": "curl -u admin:SYNTHETICcurl https://api.example.com"
+    }
+  ],
+  "newFindings": [
+    {
+      "id": "N-L13a",
+      "input": "password=Pa(ss)word1SYNTHETIC",
+      "note": "L-13 值字符类遇括号截断",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L13b",
+      "input": "DB_PASSWORD=abcSYNTHETIC;xyz123SYNTHETIC",
+      "note": "L-13 分号截断",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L13c",
+      "input": "PASSWORD=${DB_PASS:-SYNTHETICdefault}",
+      "note": "L-13 shell 默认值",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L13d",
+      "input": "token=a[1]bcdefghSYNTHETIC",
+      "note": "L-13 方括号",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L13e",
+      "input": "password: Hunter[1]SYNTHETIC",
+      "note": "L-13 冒号形式",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L14a",
+      "input": "password=postgres://admin:SYNTHETICpw@db.example.com/SYNTHETICdb",
+      "note": "L-14 DSN 尾段",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L14b",
+      "input": "DATABASE_PASSWORD: mysql://root:SYNTHETICpw@10.0.0.5:3306/SYNTHETICx",
+      "note": "L-14 冒号形式",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L15a",
+      "input": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEASYNTHETICSYNTHETICSYNTHETICSYNTHETICSYNTHETICaaaa\npassword: SYNTHETICleak",
+      "note": "L-15 截断 PEM 吞掉下一行键名",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L15b",
+      "input": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEASYNTHETICSYNTHETICSYNTHETICSYNTHETICSYNTHETICaaaa\napi_key: SYNTHETICleak",
+      "note": "L-15 api_key",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L01",
+      "input": "JWT_SECRET=!SYNTHETICpw",
+      "note": "审计确认的 .env 泄漏",
+      "expect": "mask"
+    },
+    {
+      "id": "N-L06",
+      "input": "DB_PASSWORD==SYNTHETICpw",
+      "note": "L-06",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SAS1",
+      "input": "AZURE_SAS_TOKEN=https://acct.blob.core.windows.net/c/f.txt?sv=2022-11-02&sp=r&sig=SYNTHETICsig0%2Babc%3D",
+      "note": "SAS URL 整值",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SAS2",
+      "input": "SAS_TOKEN=https://reader:SYNTHETICpw@acct.blob.core.windows.net/c?sv=2022&sig=SYNTHETICsig1%2Bxyz",
+      "note": "带 userinfo 的 SAS URL，HEAD 先遮口令后露出 sig 尾段",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SAS3",
+      "input": "export AZURE_STORAGE_SAS_TOKEN=\"?sv=2022-11-02&ss=b&sig=SYNTHETICsig2%2Fq\"",
+      "note": "引号 SAS",
+      "expect": "mask"
+    },
+    {
+      "id": "N-RENDER1",
+      "input": "{\"stdout\":\"JWT_SECRET=-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\n-----END PRIVATE KEY-----\\nDB_PASSWORD=!SYNTHETICpw\"}",
+      "note": "同一载体：JWT_SECRET 的值是 PEM 私钥，另有 DB_PASSWORD=!…",
+      "expect": "mask"
+    },
+    {
+      "id": "N-RENDER2",
+      "input": "{\"stdout\":\"SAS_TOKEN=https://reader:SYNTHETICpw@acct.blob.core.windows.net/c?sig=SYNTHETICsig3%2Bxyz\",\"env\":\"DB_PASSWORD=!SYNTHETICpw4\"}",
+      "note": "同一载体：SAS 签名与运算符开头口令",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SERIAL1",
+      "input": "password=postgres://u:SYNTHETIC@host/SYNTHETICdb",
+      "note": "HEAD 后串接旧 BARE：标记阻断旧规则起点",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SERIAL2",
+      "input": "secret: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "note": "旧规则先跑会遮掉 BEGIN，使 PEM 规则失去起点",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SERIAL3",
+      "input": "token: -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHETICPEMONEAAAAAAAAAAAAAAAAA\nSYNTHETICPEMTWOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n-----END PRIVATE KEY-----",
+      "note": "结构化 P1 反例：带 END 的同形",
+      "expect": "mask"
+    },
+    {
+      "id": "N-SERIAL4",
+      "input": "DATABASE_URL_PASSWORD=redis://:SYNTHETICpw@cache:6379/SYNTHETIC0",
+      "note": "URL/DSN 形态的串行回退",
+      "expect": "mask"
+    }
+  ]
+}
