@@ -1,11 +1,12 @@
 /**
- * 脱敏阶段 1 零回退底线（设计 redaction-design-2026-10-19 第 6 节“测试要求”1、4 与门禁口径）。
+ * 脱敏零回退底线（设计 redaction-design-2026-10-19 第 6 节“测试要求”1、4 与门禁口径；阶段 4 起运行时底线是
+ * 追踪重放，本文件的对齐路径用例以 applyAlignmentFloor 覆盖回退实现）。
  *
  * - 回归语料：失败模式目录 151 例与 3.2 节新发现，各跑裸文本与 {"stdout":…} 载体两种形态，全部交给攻击夹具
  *   assertNoLegacyRegression 按精确 oracle 判定（对四个历史版本零回退、幂等、裸换行守恒、标记词表封闭）。
- * - 证明义务：冻结副本与 git blob 逐字节、逐输出一致（黄金摘要）；标记词表锁定；对齐器变异体全部被精确
- *   oracle 杀死；追踪重放作为独立位置 oracle（超集必须包含重放得到的被遮位置）。
- * - 失败即关路径：骨架兜底、不动点触顶、报告只含计数与种类。
+ * - 证明义务：四个冻结副本（含阶段 4 冻结的 v3）与 git blob 逐字节、逐输出一致（黄金摘要）；标记词表锁定；
+ *   对齐器变异体全部被精确 oracle 杀死；追踪重放作为独立位置 oracle（超集必须包含重放得到的被遮位置）。
+ * - 失败即关路径：对齐路径的骨架兜底与不动点触顶、报告只含计数与种类。
  * 样本全部是合成值（SYNTHETIC / Synthetic），不是真实凭据。
  */
 import { createHash } from 'node:crypto';
@@ -20,6 +21,7 @@ import {
 import {
   redactAt1b394ce,
   redactAt246055e,
+  redactAtB60a61e,
   redactAtD113986,
 } from '../src/agent/utils/redaction/frozenBaselines.js';
 import {
@@ -29,13 +31,14 @@ import {
   lexMarkers,
   REDACTION_MARKERS,
 } from '../src/agent/utils/redaction/hiddenSpans.js';
-import { applyLegacyFloor, MAX_FLOOR_ROUNDS } from '../src/agent/utils/redaction/legacyFloor.js';
+import { applyAlignmentFloor, MAX_FLOOR_ROUNDS } from '../src/agent/utils/redaction/legacyFloor.js';
 import { redactDeveloperText as fixtureAt1b394ce } from './fixtures/redaction-baselines/redaction-at-1b394ce.js';
 import { redactDeveloperText as fixtureAt246055e } from './fixtures/redaction-baselines/redaction-at-246055e.js';
 import { redactDeveloperText as fixtureAtB60a61e } from './fixtures/redaction-baselines/redaction-at-b60a61e.js';
 import { redactDeveloperText as fixtureAtD113986 } from './fixtures/redaction-baselines/redaction-at-d113986.js';
 import {
   assertNoLegacyRegression,
+  checkNoLegacyRegression,
   exemptPositions,
 } from './fixtures/redaction-catalog/legacyRegressionOracle.js';
 import {
@@ -183,10 +186,11 @@ const BLOB_IDS: Record<BaselineRevision, string> = {
  * 输出 sha256。语料变化时用 fixture 重新计算；冻结副本必须给出相同摘要。
  */
 const GOLDEN_DIGESTS: Record<BaselineRevision, string> = {
-  '246055e': 'c3aedbc1522d1923ab7d2acd775411bc27fe56ee9ea6ba2ce49ce2570044665c',
-  '1b394ce': '5eb5bd03844bdcf773d0c58e5646624de2166757b4099ae6580154177aa8861c',
-  d113986: 'c695acfad5fc153080fbdfae1dca562311d126e6c1c15e1a99b9182e6fa2a551',
-  b60a61e: '707a7cf34493615384284739c3ad0b571af6fbd601594bb447487e98fefd56ab',
+  // 2026-10-21 阶段 4a 把 d0462bf 复查记录的载体家族（N-RQ1..3）与 M-12（N-M12a）加入 newFindings 后重算。
+  '246055e': 'cb43b636a4b6ffaaea175f1c7299161b386a048525aafd8b098dfbe6ad4d42e7',
+  '1b394ce': '424ee316b207cb540986c17f14393afdbab6f0a48c7b728985f2425d4c10e841',
+  d113986: '8b12bb7623519716da7629e51a587faf6188480942b43658dc2e0115dd7e863a',
+  b60a61e: '145b58113a19c7dc1904be31c2ad386375f8344b158f43fa63b63c02b234d10e',
 };
 
 function fixtureSource(revision: BaselineRevision): Buffer {
@@ -220,6 +224,8 @@ describe('proof obligations: frozen copies, golden digests and the marker vocabu
     ['246055e', 'redactAt246055e'],
     ['1b394ce', 'redactAt1b394ce'],
     ['d113986', 'redactAtD113986'],
+    // v3 整段放在 namespace B60a61e 内（与 v2 的模块级标识符同名），块内文本仍与 blob 逐字节相同。
+    ['b60a61e', 'redactAtB60a61e'],
   ] as const)('frozenBaselines.ts embeds blob %s verbatim, renaming only the export', (revision, name) => {
     const frozen = readFileSync(
       path.join(repoRoot, 'src/agent/utils/redaction/frozenBaselines.ts'),
@@ -238,11 +244,15 @@ describe('proof obligations: frozen copies, golden digests and the marker vocabu
     ['246055e', redactAt246055e, fixtureAt246055e],
     ['1b394ce', redactAt1b394ce, fixtureAt1b394ce],
     ['d113986', redactAtD113986, fixtureAtD113986],
-    ['b60a61e', null, fixtureAtB60a61e],
+    ['b60a61e', redactAtB60a61e, fixtureAtB60a61e],
   ] as const)('golden digest of %s matches the git blob behaviour', (revision, frozen, fixture) => {
     expect(outputDigest(fixture)).toBe(GOLDEN_DIGESTS[revision]);
-    if (frozen !== null) {
-      expect(outputDigest(frozen)).toBe(GOLDEN_DIGESTS[revision]);
+    expect(outputDigest(frozen)).toBe(GOLDEN_DIGESTS[revision]);
+  });
+
+  test('the frozen v3 is byte-identical in behaviour to the HEAD blob on every corpus row', () => {
+    for (const { input } of corpusRows) {
+      expect(redactAtB60a61e(input)).toBe(fixtureAtB60a61e(input));
     }
   });
 
@@ -263,6 +273,8 @@ describe('proof obligations: frozen copies, golden digests and the marker vocabu
       'src/agent/utils/redaction/frozenBaselines.ts',
       'src/agent/utils/redaction/hiddenSpans.ts',
       'src/agent/utils/redaction/legacyFloor.ts',
+      'src/agent/utils/redaction/trackedReplay.ts',
+      'src/agent/utils/redaction/render.ts',
       ...Object.keys(BLOB_IDS).map(
         (revision) => `test/fixtures/redaction-baselines/redaction-at-${revision}.ts`
       ),
@@ -343,8 +355,25 @@ const BATTERY: BatteryItem[] = [
   replayItem('ambiguous piece', '1b394ce', '"token": "z x token=" x token=BBBBBBBB x', false),
   // 首段文本在被遮值里重复：去掉锚定会让子集变小（精度回归）。
   replayItem('repeated anchored prefix', '246055e', 'token=token=AAAAAAAA', true),
-  // 合成段吸收的转义换行是原文保留的：不修剪就会把它算成“一定被遮”。
-  replayItem('absorbed escape newline', 'b60a61e', '{"stdout":"password=abcdefgh\\nfoo"}', false),
+  // 合成段吸收的转义换行是原文保留的：不修剪就会把它算成“一定被遮”。这里的 \n 是裸文本里的两个字符
+  // （不在可解析的 JSON 字面量内），所以它不是结构位置，仍按内容判定。
+  replayItem('absorbed escape newline', 'b60a61e', 'password="abcdefgh"\\nfoo', false),
+  // 载体内的转义换行按 D3 阶段 4 子项视为结构（信息等价），健全对齐器在它上面也不得违规。
+  replayItem('carrier escape newline', 'b60a61e', '{"stdout":"password=abcdefgh\\nfoo"}', false),
+  // 复查意见 1：被遮值的末字符是 n，后面是版本重出的转义换行记号 \n。按字符做最长公共后缀会把记号的 n
+  // 与值的 n 当成同一位置，超集漏掉这个 n；修剪必须按整个记号进行。
+  replayItem(
+    'value ending in n before a re-emitted escape newline',
+    'd113986',
+    '{"stdout":"password=\\"abcdefgh\\nxn\\" rest"}',
+    false
+  ),
+  replayItem(
+    'value ending in a literal backslash-n before a re-emitted escape newline',
+    'd113986',
+    '{"stdout":"password=\\"abcdefgh\\\\n\\nxn\\" rest"}',
+    false
+  ),
   replayItem('json number value', 'b60a61e', '{"password": 123456789, "normal": 7}', true),
   // 构造项：保留段字节被改写（模拟不在守卫内的重编码），放不回去时必须整行算作可能被遮。
   constructedItem(
@@ -404,6 +433,86 @@ describe('aligner mutation testing against the exact oracle', () => {
   });
 });
 
+describe('R-Q boundary trimming is token-based (review item 1)', () => {
+  // 载体内多行引号值：末字符为 n、末尾为字面 \n、或两者与裸换行组合。历史版本在值后重出的转义换行记号 \n
+  // 以 n 结尾，按字符修剪会把它与值的末字符 n 对到同一位置，测试期对齐自检报 superset misses；按记号修剪后归零。
+  const keys = ['GITHUB_TOKEN', 'token', 'password', 'api_key'];
+  const separators = [':', '=', ': ', ':\n'];
+  const bodies = [
+    'SYNTHETICabc\nxn',
+    'SYNTHETICabc\nqn\n',
+    'SYNTHETICabn',
+    'SYNTHETICabc\\n',
+    'SYNTHETICabc\\n\n',
+    'SYNTHETICabc\\n\nxn',
+    'SYNTHETICabc\n\\n',
+    'SYNTHETICabr\n',
+  ];
+  const suffixes = [' rest', '\nnext', '"other"'];
+  const wraps = [
+    (text: string) => JSON.stringify({ stdout: text }),
+    (text: string) => JSON.stringify([text]),
+    (text: string) => JSON.stringify({ message: JSON.stringify({ stdout: text }) }),
+    (text: string) => text,
+  ];
+  const family: string[] = [];
+  for (const key of keys) {
+    for (const separator of separators) {
+      for (const body of bodies) {
+        for (const suffix of suffixes) {
+          for (const wrap of wraps) {
+            family.push(wrap(`${key}${separator}"${body}"${suffix}`));
+          }
+        }
+      }
+    }
+  }
+
+  test('the family has zero aligner violations, exposures and structural violations', () => {
+    const problems: string[] = [];
+    for (const input of family) {
+      const report = checkNoLegacyRegression(input);
+      problems.push(
+        ...report.exposures.map(
+          (exposure) => `${exposure.oracle} ${exposure.baseline}@${exposure.position}`
+        ),
+        ...report.alignerViolations,
+        ...report.structuralViolations
+      );
+    }
+    expect(family.length).toBeGreaterThan(1_000);
+    expect(problems.slice(0, 10)).toEqual([]);
+  });
+
+  test('the superset of each early version keeps the trailing n of the masked value', () => {
+    let checked = 0;
+    for (const input of family) {
+      const exempt = exemptPositions(input);
+      for (const revision of ['246055e', '1b394ce', 'd113986'] as const) {
+        const truth = exactHidden(revision, input);
+        const superset = hiddenSuperset(input, fixtureFor(revision)(input), {
+          reencodes: revision === 'd113986',
+        }).marks;
+        for (let index = 0; index < input.length; index++) {
+          if (truth[index] === 1 && exempt[index] === 0) {
+            checked++;
+            expect(superset[index], `${revision} ${JSON.stringify(input)} @${index}`).toBe(1);
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(10_000);
+  });
+
+  test('the alignment fallback path still masks the family and conserves newlines', () => {
+    for (const input of family.filter((_, index) => index % 7 === 0)) {
+      const { text } = applyAlignmentFloor(input);
+      expect(text).not.toMatch(/SYNTHETIC/);
+      expect(text.replace(/[^\r\n]/g, '')).toBe(input.replace(/[^\r\n]/g, ''));
+    }
+  });
+});
+
 describe('tracked replay as an independent position oracle', () => {
   test('the superset of each early version contains every replayed hidden position', () => {
     let checked = 0;
@@ -460,32 +569,45 @@ describe('fail-closed paths and the diagnostic report', () => {
     expect(report).toMatchObject({ rounds: 1, fixpointReached: true, residualChars: 0, kinds: [] });
   });
 
-  test('a current-rules output that breaks newline conservation falls back to the line skeleton', () => {
+  test('alignment path: a current-rules output that breaks newline conservation falls back to the line skeleton', () => {
     const input = 'line one\nJWT_SECRET=!SYNTHETICpw\n\nlast';
     // 构造的“现行规则”只在含合成秘密时多吐一个换行（不守恒），骨架兜底之后即收敛。
-    const { text, report } = applyLegacyFloor(input, (value) =>
+    const { text, report } = applyAlignmentFloor(input, (value) =>
       value.includes('SYNTHETIC') ? `${value}\n` : value
     );
     expect(text).toBe('[redacted-unaligned]\n[redacted-unaligned]\n\n[redacted-unaligned]');
     expect(report.skeletonFallbacks).toBeGreaterThan(0);
     expect(report.kinds).toContain('skeleton-fallback');
+    expect(report.kinds).toContain('alignment-fallback');
   });
 
-  test('a never-settling current-rules output stops at the round cap and says so', () => {
-    const { report } = applyLegacyFloor('plain', (value) => `${value}.`);
+  test('alignment path: a never-settling current-rules output stops at the round cap and says so', () => {
+    const { report } = applyAlignmentFloor('plain', (value) => `${value}.`);
     expect(report.rounds).toBe(MAX_FLOOR_ROUNDS);
     expect(report.fixpointReached).toBe(false);
     expect(report.kinds).toContain('fixpoint-cap');
   });
 
-  test('a line the current rules re-encoded from a non-canonical carrier is masked whole', () => {
+  test('alignment path: a line the current rules re-encoded from a non-canonical carrier is masked whole', () => {
+    const input = JSON.stringify({ stdout: 'x' }).replace(
+      '"x"',
+      '"\\u0041 JWT_SECRET=!SYNTHETICpw password=Pa(ss)word1SYNTHETIC"'
+    );
+    const { text, report } = applyAlignmentFloor(input);
+    expect(text).not.toContain('SYNTHETIC');
+    expect(report.kinds).toEqual(expect.arrayContaining(['guarded-line']));
+  });
+
+  test('tracked replay keeps a non-canonical carrier byte-exact outside the masked spans', () => {
+    // 阶段 1 的对齐路径只能把这一行整行补遮；追踪重放知道 \u0041 解码后仍是可见字符，只遮住历史版本遮住的值。
     const input = JSON.stringify({ stdout: 'x' }).replace(
       '"x"',
       '"\\u0041 JWT_SECRET=!SYNTHETICpw password=Pa(ss)word1SYNTHETIC"'
     );
     const { text, report } = redactDeveloperTextWithReport(input);
-    expect(text).not.toContain('SYNTHETIC');
-    expect(report.kinds).toEqual(expect.arrayContaining(['guarded-line']));
+    expect(text).toBe('{"stdout":"\\u0041 JWT_SECRET=[redacted] password=[redacted]"}');
+    expect(report.kinds).not.toContain('guarded-line');
+    expect(report.replayMismatches).toBe(0);
     assertNoLegacyRegression(input);
   });
 });

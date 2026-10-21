@@ -805,9 +805,110 @@ export function groupOuterRange(plan: LinePlan, group: GapGroup): [number, numbe
 }
 
 /**
+ * 吸收字符串切成的记号：一个引号（可带整串反斜杠）、一个转义换行（整串反斜杠加 n/r）或一个裸换行。
+ * 词法与 T_ABS 的 pre/quote/tail 分组一致。
+ */
+function absorbedTokens(absorbed: string): string[] {
+  const tokens: string[] = [];
+  let index = 0;
+  while (index < absorbed.length) {
+    const char = absorbed[index];
+    if (char === '\\') {
+      let cursor = index;
+      while (absorbed[cursor] === '\\') {
+        cursor++;
+      }
+      const next = absorbed[cursor];
+      const end = isQuoteChar(next) || next === 'n' || next === 'r' ? cursor + 1 : cursor;
+      tokens.push(absorbed.slice(index, end));
+      index = end;
+      continue;
+    }
+    tokens.push(char ?? '');
+    index++;
+  }
+  return tokens;
+}
+
+/** x 中从 from 开始、不越过 limit 的一个可吸收记号；不是记号时为 null。反斜杠串取最长，记号边界因此唯一。 */
+function absorbableTokenAt(x: string, from: number, limit: number): string | null {
+  const char = x[from];
+  if (from >= limit || char === undefined) {
+    return null;
+  }
+  if (char === '\n' || char === '\r' || isQuoteChar(char)) {
+    return char;
+  }
+  if (char !== '\\') {
+    return null;
+  }
+  let cursor = from;
+  while (cursor < limit && x[cursor] === '\\') {
+    cursor++;
+  }
+  const next = x[cursor];
+  if (cursor < limit && (isQuoteChar(next) || next === 'n' || next === 'r')) {
+    return x.slice(from, cursor + 1);
+  }
+  return null;
+}
+
+/** x 中结束于 to、不早于 lowerBound 的一个可吸收记号；不是记号时为 null。反斜杠串向前取最长。 */
+function absorbableTokenEndingAt(x: string, lowerBound: number, to: number): string | null {
+  const last = x[to - 1];
+  if (to <= lowerBound || last === undefined) {
+    return null;
+  }
+  if (last === '\n' || last === '\r') {
+    return last;
+  }
+  if (!isQuoteChar(last) && last !== 'n' && last !== 'r') {
+    return null;
+  }
+  let start = to - 1;
+  while (start - 1 >= lowerBound && x[start - 1] === '\\') {
+    start--;
+  }
+  if (isQuoteChar(last)) {
+    return x.slice(start, to);
+  }
+  // n/r 只有带反斜杠才是转义换行记号；裸露的 n/r 是值的末字符，不能与记号对到同一位置。
+  return start < to - 1 ? x.slice(start, to) : null;
+}
+
+/**
+ * 边界修剪 R-Q 的记号版（复查意见 1）：吸收字符串从左（右）边界起整记号与 x 相同的长度。按字符比较会把
+ * 转义换行记号 \n 的末字符 n 与被遮值的末字符 n 当成同一位置，超集漏掉那个 n；按记号比较时，x 里的反斜杠串
+ * 取最长，所以 \n 不会与 \\n 或裸露的 n 对上。
+ */
+function tokenPrefixLength(absorbed: string, x: string, from: number, limit: number): number {
+  let cursor = from;
+  for (const token of absorbedTokens(absorbed)) {
+    if (absorbableTokenAt(x, cursor, limit) !== token) {
+      break;
+    }
+    cursor += token.length;
+  }
+  return cursor - from;
+}
+
+function tokenSuffixLength(absorbed: string, x: string, lowerBound: number, to: number): number {
+  let cursor = to;
+  const tokens = absorbedTokens(absorbed);
+  for (let index = tokens.length - 1; index >= 0; index--) {
+    const token = tokens[index] ?? '';
+    if (absorbableTokenEndingAt(x, lowerBound, cursor) !== token) {
+      break;
+    }
+    cursor -= token.length;
+  }
+  return to - cursor;
+}
+
+/**
  * 超集里的一个缺口区间，含边界修剪 R-Q：贴着放置唯一的保留段（或行界）时，合成段吸收的引号、转义换行
- * 若与 x 在同一边界上的字符相同，就算“同一位置可见”（信息等价），从区间中扣除。不修剪会让被多算的闭引号
- * 经不动点放大（UNTERMINATED 一直吞到文末）。
+ * 若与 x 在同一边界上的记号相同，就算“同一位置可见”（信息等价），从区间中扣除。不修剪会让被多算的闭引号
+ * 经不动点放大（UNTERMINATED 一直吞到文末）。修剪按整个记号进行，见 tokenPrefixLength。
  */
 export function groupSupersetRange(
   x: string,
@@ -819,10 +920,10 @@ export function groupSupersetRange(
   let left = bounds.outerLeft;
   let right = bounds.outerRight;
   if (bounds.leftExact && group.leftAbsorbed.length > 0) {
-    left += lcpAt(group.leftAbsorbed, x, left, right);
+    left += tokenPrefixLength(group.leftAbsorbed, x, left, right);
   }
   if (bounds.rightExact && group.rightAbsorbed.length > 0) {
-    right -= lcsAt(group.rightAbsorbed, x, left, right);
+    right -= tokenSuffixLength(group.rightAbsorbed, x, left, right);
   }
   return [left, Math.max(left, right)];
 }

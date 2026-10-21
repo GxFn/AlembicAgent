@@ -877,6 +877,30 @@
       "input": "DATABASE_URL_PASSWORD=redis://:SYNTHETICpw@cache:6379/SYNTHETIC0",
       "note": "URL/DSN 形态的串行回退",
       "expect": "mask"
+    },
+    {
+      "id": "N-RQ1",
+      "input": "{\"stdout\":\"GITHUB_TOKEN:\\\"SYNTHETICabc\\n\\\"other\\\"\"}",
+      "note": "d0462bf 复查记录：载体内值后的转义换行，阶段 1 对齐超集漏掉它（R-Q 修剪与 D3 严格口径互斥）；阶段 4 视为结构",
+      "expect": "mask"
+    },
+    {
+      "id": "N-RQ2",
+      "input": "{\"message\":\"{\\\"stdout\\\":\\\"GITHUB_TOKEN:\\\\\\\"SYNTHETICabc\\\\n\\\\\\\"other\\\\\\\"\\\"}\"}",
+      "note": "同上，双层载体",
+      "expect": "mask"
+    },
+    {
+      "id": "N-RQ3",
+      "input": "[\"x GITHUB_TOKEN:\\\"SYNTHETICabc\\n\"]",
+      "note": "同上，数组载体，值在字面量末尾",
+      "expect": "mask"
+    },
+    {
+      "id": "N-M12a",
+      "input": "{\"password\":\"SYNTHETIC line1\\nSYNTHETIC line2\\nSYNTHETIC line3\"}",
+      "note": "M-12：载体吞掉转义换行；阶段 4 放回，只暴露换行个数",
+      "expect": "mask"
     }
   ]
 }

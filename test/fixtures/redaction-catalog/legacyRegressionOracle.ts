@@ -1,18 +1,20 @@
 /**
  * 复查攻击夹具 assertNoLegacyRegression(input)：把任意输入交给四个历史版本与新实现，按精确 oracle 机械判定
- * 是否违反不变量 S（任一历史版本遮住的非换行字符，新输出必须遮住）。设计第 6 节“门禁与复查口径”。
+ * 是否违反不变量 S（任一历史版本遮住的非结构字符，新输出必须遮住）。设计第 6 节“门禁与复查口径”。
  *
  * 判定互相独立的四层：
- * 1. 追踪重放（trackedReplay.ts）：四个版本各自的精确被遮位置；新输出的逐字符来源由底线的逐轮记录与
- *    现行规则的追踪重放组合得到。二者相交即为露出。不使用底线里的对齐算法。
+ * 1. 追踪重放（本目录 trackedReplay.ts，逐字符来源数组的独立实现，不是运行时用的分段实现）：四个版本各自的
+ *    精确被遮位置；新输出的逐字符来源由运行时渲染器的来源表给出。二者相交即为露出。
  * 2. 唯一字符：输入里只出现一次的字符，某版本输出里没有它即被遮；新输出里出现就是露出（输入含 \u 转义时
  *    跳过，因为解码后可能生成同一字符）。
  * 3. 哨兵：输入中的 SYNTH… / Synth… 片段，任一版本输出里不含它时，新输出也不得含它。
  * 4. 结构：幂等、裸换行序列守恒、新写出的标记都在封闭词表内、生产入口与夹具入口输出一致。
- * 另外报告对齐器的自检（超集 ⊇ 精确被遮、子集 ⊆ 精确被遮），用于定位实现缺陷。
+ * 另外报告两类自检：对齐器（超集 ⊇ 精确被遮、子集 ⊆ 精确被遮；阶段 4 起对齐只是测试期对照与回退路径）
+ * 与运行时分段重放（必须与本目录的逐字符重放给出相同的被遮位置），用于定位实现缺陷。
  *
- * 信息等价的豁免（设计 4.2 节“遮住”的口径）：裸换行（D3）、引号字符及转义引号的反斜杠、输入里原本就有的
- * 标记文字。JSON 转义换行（\n 两个字符）不豁免，按内容严格判定（D3 阶段 1）。
+ * 信息等价的豁免（设计 4.2 节“遮住”的口径）：结构位置（裸换行，以及可解析 JSON 字面量内解码后是换行的转义
+ * 序列，D3 阶段 4 子项——只暴露换行个数）、引号字符及转义引号的反斜杠、输入里原本就有的标记文字。这一口径
+ * 与运行时 trackedReplay.structurePositions 相同，由测试钉住。
  */
 import { redactDeveloperText } from '../../../src/agent/utils/Redaction.js';
 import {
@@ -20,14 +22,16 @@ import {
   hiddenSuperset,
   REDACTION_MARKERS,
 } from '../../../src/agent/utils/redaction/hiddenSpans.js';
-import { applyLegacyFloorWithTrace } from '../../../src/agent/utils/redaction/legacyFloor.js';
+import { applyRedactionFloorWithProvenance } from '../../../src/agent/utils/redaction/legacyFloor.js';
+import {
+  exactHidden as runtimeExactHidden,
+  structurePositions,
+} from '../../../src/agent/utils/redaction/trackedReplay.js';
 import {
   BASELINE_REVISIONS,
   type BaselineRevision,
   exactHidden,
   frozenRedact,
-  replayTracked,
-  type Tracked,
 } from './trackedReplay.js';
 
 export interface Exposure {
@@ -57,7 +61,7 @@ function isNewline(char: string | undefined): boolean {
 
 /** 信息等价、不计入 S 的输入位置。 */
 export function exemptPositions(x: string): Uint8Array {
-  const exempt = new Uint8Array(x.length);
+  const exempt = structurePositions(x);
   for (let index = 0; index < x.length; index++) {
     const char = x[index];
     if (isNewline(char) || char === '"' || char === "'") {
@@ -84,43 +88,19 @@ export function exemptPositions(x: string): Uint8Array {
   return exempt;
 }
 
-/** 把新输出的每个字符追溯到输入位置：组合底线的逐轮记录与现行规则（b60a61e）的追踪重放。 */
-function traceOutput(x: string): { output: string; provenance: Tracked; rounds: number } {
-  const result = applyLegacyFloorWithTrace(x, (text) => frozenRedact('b60a61e', text));
-  let current: Tracked = {
-    text: x,
-    start: Int32Array.from({ length: x.length }, (_, index) => index),
-    end: Int32Array.from({ length: x.length }, (_, index) => index + 1),
-  };
-  for (const round of result.trace) {
-    if (round.input !== current.text) {
-      throw new Error('oracle: floor trace does not chain round inputs');
-    }
-    const replayed = replayTracked('b60a61e', current);
-    if (replayed.text !== round.current) {
-      throw new Error('oracle: current-rules replay differs from the traced current output');
-    }
-    const start = new Int32Array(round.output.length);
-    const end = new Int32Array(round.output.length);
-    for (let index = 0; index < round.output.length; index++) {
-      const from = round.outputFromCurrent[index] ?? -1;
-      if (from < 0) {
-        start[index] = -1;
-        end[index] = -1;
-        continue;
-      }
-      if (round.current[from] !== round.output[index]) {
-        throw new Error('oracle: traced output character does not match its recorded source');
-      }
-      start[index] = replayed.start[from] ?? -1;
-      end[index] = replayed.end[from] ?? -1;
-    }
-    current = { text: round.output, start, end };
+/** 新输出的逐字符来源：运行时渲染器在每一轮都记录输出字符取自哪个输入位置，跨轮组合后得到到原始输入的映射。 */
+function traceOutput(x: string): { output: string; origin: Int32Array; rounds: number } {
+  const result = applyRedactionFloorWithProvenance(x);
+  if (result.origin.length !== result.text.length) {
+    throw new Error('oracle: provenance length does not match the output');
   }
-  if (current.text !== result.text) {
-    throw new Error('oracle: traced final text differs from the floor result');
+  for (let index = 0; index < result.text.length; index++) {
+    const from = result.origin[index] ?? -1;
+    if (from >= 0 && x[from] !== result.text[index]) {
+      throw new Error('oracle: output character does not match its recorded source');
+    }
   }
-  return { output: result.text, provenance: current, rounds: result.report.rounds };
+  return { output: result.text, origin: result.origin, rounds: result.report.rounds };
 }
 
 function newlineSkeleton(text: string): string {
@@ -132,18 +112,17 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
   const exposures: Exposure[] = [];
   const alignerViolations: string[] = [];
   const structuralViolations: string[] = [];
-  const { output, provenance, rounds } = traceOutput(input);
+  const { output, origin, rounds } = traceOutput(input);
   const production = redactDeveloperText(input);
   if (production !== output) {
     structuralViolations.push('production entry and traced floor disagree');
   }
 
   const visible = new Uint8Array(input.length);
-  for (let index = 0; index < provenance.text.length; index++) {
-    const start = provenance.start[index] ?? -1;
-    const end = provenance.end[index] ?? -1;
-    for (let cursor = Math.max(0, start); cursor < end && cursor < input.length; cursor++) {
-      visible[cursor] = 1;
+  for (let index = 0; index < origin.length; index++) {
+    const from = origin[index] ?? -1;
+    if (from >= 0 && from < input.length) {
+      visible[from] = 1;
     }
   }
   const exempt = exemptPositions(input);
@@ -152,6 +131,18 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
     const baselineOutput = frozenRedact(revision, input);
     outputs.set(revision, baselineOutput);
     const hidden = exactHidden(revision, input);
+    // 运行时的分段重放必须与本目录的逐字符重放给出完全相同的被遮位置（两套独立实现互为对照）。
+    const runtimeHidden = runtimeExactHidden(revision, input);
+    if (runtimeHidden === null) {
+      alignerViolations.push(`runtime replay of ${revision} failed its self-check`);
+    } else {
+      for (let index = 0; index < input.length; index++) {
+        if (runtimeHidden[index] !== hidden[index]) {
+          alignerViolations.push(`runtime replay of ${revision} disagrees at ${index}`);
+          break;
+        }
+      }
+    }
     for (let index = 0; index < input.length; index++) {
       if (hidden[index] === 1 && visible[index] === 1 && exempt[index] !== 1) {
         exposures.push({
@@ -226,7 +217,7 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
     structuralViolations.push('bare newline sequence changed');
   }
   for (const match of output.matchAll(/\[redacted[^\]\s]*\]/g)) {
-    const synthetic = (provenance.start[match.index] ?? -1) < 0;
+    const synthetic = (origin[match.index] ?? -1) < 0;
     if (synthetic && !REDACTION_MARKERS.includes(match[0])) {
       structuralViolations.push(`marker outside the closed vocabulary: ${match[0]}`);
     }
