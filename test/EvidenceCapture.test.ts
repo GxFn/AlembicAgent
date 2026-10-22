@@ -54,16 +54,29 @@ describe('EvidenceCapture（E2 采集即落盘）', () => {
     expect(resolveEvidenceAction({ name: 'code', args: {}, id: 'c5' })).toBeNull();
   });
 
-  test('code.read 结构化归一：每文件一条，range 取请求区间', () => {
+  test('code.read 结构化归一：每文件一条，range 取 N| 显示解析出的坐标', () => {
     const ledger = makeLedger();
+    // 真实 handler 形态（L7-P12 / C58）：range 模式成员带 mode 与 `N|` 行号前缀，台账剥前缀存原文。
     const entries = captureEvidenceFromEnvelope(
       ledger,
       { name: 'code', args: { action: 'read', startLine: 5, endLine: 7 }, id: 'call_r' },
       makeEnvelope({
         structuredContent: {
           files: [
-            { path: 'lib/a.ts', content: 'L5\nL6\nL7' },
-            { path: 'lib/b.ts', content: 'B5\nB6\nB7' },
+            {
+              path: 'lib/a.ts',
+              content: '5|L5\n6|L6\n7|L7',
+              mode: 'range',
+              startLine: 5,
+              endLine: 7,
+            },
+            {
+              path: 'lib/b.ts',
+              content: '5|B5\n6|B6\n7|B7',
+              mode: 'range',
+              startLine: 5,
+              endLine: 7,
+            },
           ],
         },
       })
@@ -1015,6 +1028,87 @@ describe('L7-P13 C10 共享严格展示剥离器（Capture 口径）', () => {
     expect(entries[0]?.range).toEqual({ start: 1, end: 3 });
     expect(entries[0]?.content).toBe(rawFile);
     expect(ledger.checkFreshness(entries[0]?.id ?? '', rawFile)).toBe('fresh');
+  });
+});
+
+// ─── L7-P12 / C58（决定③）：删除“无 mode 批量成员按请求区间推断 range”的兼容分支 ───
+// 生产 code.read 的成员 mode 必填（ReadSingleSuccess.mode），无 mode 只可能来自未知 handler。
+// 这类成员的内容若不是 N| 连续行号展示，就无法核对它与请求区间的对应关系；此前借请求区间配坐标，
+// 会让未剥离的展示形态带上 range（重现 run-13 EVIDENCE_STALE 的入口）。现在统一降级 file-only。
+// 无 mode 但 N| 可解析的成员仍按解析坐标落 range（与 EvidenceCollector 共用规则，不是推断）。
+describe('L7-P12 C58 无 mode 成员不按请求区间推断 range', () => {
+  function debugMessages(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map((args) => String(args[0]));
+  }
+
+  test.each([
+    { shape: '顶层 args', args: { action: 'read', startLine: 5, endLine: 7 } },
+    {
+      shape: 'args.params',
+      args: { action: 'read', params: { filePaths: ['lib/a.ts'], startLine: 5, endLine: 7 } },
+    },
+  ])('批量 code.read 带请求区间（$shape）、成员无 mode 且为纯文本：range 为 undefined、内容不变并记 debug', ({
+    args,
+  }) => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const ledger = makeLedger();
+      const entries = captureEvidenceFromEnvelope(
+        ledger,
+        { name: 'code', args, id: 'modeless-plain' },
+        makeEnvelope({
+          text: 'batch',
+          structuredContent: { files: [{ path: 'lib/a.ts', content: 'L5\nL6\nL7' }] },
+        })
+      );
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.file).toBe('lib/a.ts');
+      expect(entries[0]?.range).toBeUndefined();
+      expect(entries[0]?.content).toBe('L5\nL6\nL7');
+      // 标注只给文件名，不再出现借来的 :5-7 坐标
+      expect(appendEvidenceAnnotation('t', entries)).toBe('t\n\n[evidence] E-1=lib/a.ts');
+      // 降级是有意的分叉：留下 path、callId 与“未按请求区间推断”的诊断痕迹
+      expect(
+        debugMessages(debug).some(
+          (m) =>
+            m.includes('mode-less read member recorded file-only') &&
+            m.includes('lib/a.ts') &&
+            m.includes('modeless-plain')
+        )
+      ).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  test('无 mode 但 N| 连续可解析的成员仍按解析坐标落 range、存原文（保留的 mode === "" 解析分支）', () => {
+    const ledger = makeLedger();
+    const entries = captureEvidenceFromEnvelope(
+      ledger,
+      {
+        name: 'code',
+        args: { action: 'read', params: { filePaths: ['lib/a.ts'], startLine: 1, endLine: 99 } },
+        id: 'modeless-numbered',
+      },
+      makeEnvelope({
+        text: 'batch',
+        structuredContent: { files: [{ path: 'lib/a.ts', content: '5|L5\n6|L6\n7|L7' }] },
+      })
+    );
+    expect(entries).toHaveLength(1);
+    // 坐标来自 N| 展示本身，与请求区间 1-99 无关
+    expect(entries[0]?.range).toEqual({ start: 5, end: 7 });
+    expect(entries[0]?.content).toBe('L5\nL6\nL7');
+  });
+
+  test('源码守护：请求区间推断与只为它服务的辅助函数不再存在', () => {
+    const source = fs.readFileSync(
+      path.join(import.meta.dirname, '../src/agent/evidence/EvidenceCapture.ts'),
+      'utf8'
+    );
+    expect(source).not.toMatch(/\bextractRequestedRange\b/);
+    expect(source).not.toMatch(/\bfirstFiniteInt\b/);
+    expect(source).not.toMatch(/\brequestedRange\b/);
   });
 });
 

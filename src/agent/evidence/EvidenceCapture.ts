@@ -69,29 +69,6 @@ export function resolveEvidenceAction(call: EvidenceCaptureCall): EvidenceToolId
   return isEvidenceToolId(composite) ? composite : null;
 }
 
-function firstFiniteInt(...candidates: unknown[]): number | null {
-  for (const candidate of candidates) {
-    if (typeof candidate === 'number' && Number.isInteger(candidate)) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-/** read 调用的请求区间（startLine/endLine 或 start/end）；无合法区间返回 undefined */
-function extractRequestedRange(args: Record<string, unknown>): EvidenceRange | undefined {
-  const params =
-    args.params && typeof args.params === 'object'
-      ? (args.params as Record<string, unknown>)
-      : args;
-  const start = firstFiniteInt(params.startLine, params.start);
-  const end = firstFiniteInt(params.endLine, params.end);
-  if (start !== null && end !== null && start >= 1 && end >= start) {
-    return { start, end };
-  }
-  return undefined;
-}
-
 interface FileItem {
   path: string;
   content: string;
@@ -182,7 +159,9 @@ function asMatchList(value: unknown): MatchItem[] {
 
 /**
  * 把一次成功的证据类工具返回归一化为台账草稿：
- * - code.read：每文件一条，range 取请求区间（content 行号语义与之对齐）；
+ * - code.read：每文件一条，range 取 `N|` 显示前缀解析出的连续行号坐标（与 EvidenceCollector 同规则），
+ *   不按请求区间推断；不可解析、截断或派生视图（outline/delta/unchanged、未知 handler 的无 mode
+ *   成员）诚实降级 file-only（L7-P12 / C58）；
  * - code.search：按文件分组每组一条，行号内嵌 `<line>: <content>` 自描述——命中非连续，
  *   刻意不设 range（range 语义是连续区间，误设会让子区间切片错位）；
  * - 其它证据工具（outline/structure/graph/terminal）：单条，结构化结果确定性序列化，
@@ -202,7 +181,6 @@ function normalizeDrafts(
   if (tool === 'code.read') {
     const files = asFileList(data?.files);
     if (Array.isArray(data?.files)) {
-      const requestedRange = extractRequestedRange(call.args);
       const drafts: EvidenceEntryDraft[] = [];
       const emptyMembers: string[] = [];
       for (const file of files) {
@@ -226,8 +204,10 @@ function normalizeDrafts(
         }
         const mode = file.mode ?? '';
         // outlineSource 与 mode==='outline' 同义（AST 大纲或头尾预览）：两者任一出现都按派生视图处理，
-        // 不取内容坐标、也不借用请求区间——头尾预览的 N| 行首尾不连续，落 range 会让 freshness 误判。
+        // 不取内容坐标——头尾预览的 N| 行首尾不连续，落 range 会让 freshness 误判。
         const derivedOutline = file.outlineSource !== undefined;
+        // mode === ''（成员无 mode）只在 N| 展示可解析时取解析坐标：这是与 EvidenceCollector 共用的
+        // 解析规则，坐标来自内容本身，不是推断。
         if (
           raw !== null &&
           !derivedOutline &&
@@ -242,21 +222,22 @@ function normalizeDrafts(
           });
           continue;
         }
+        // L7-P12 / C58（决定③）：生产 code.read 成员 mode 必填，无 mode 只可能来自未知 handler。
+        // 此前这类成员在内容不可解析时借请求区间（args 的 startLine/endLine）配 range，会给未剥离的
+        // 展示形态配上坐标，重现 run-13 EVIDENCE_STALE；现在与派生视图一样降级 file-only，记 debug。
+        // 走到这里的无 mode 非大纲成员必然 raw === null（可解析的已在上一分支落 range）；
+        // 截断展示另有 stripReadDisplayDecorations 的 truncated 诊断。
+        if (!mode && !derivedOutline) {
+          logEvidenceSkip(
+            `[EvidenceCapture] mode-less read member recorded file-only: tool=${tool} ` +
+              `callId=${call.id} shape=batch path=${file.path} reason=display-not-parseable ` +
+              'requestedRangeInference=removed'
+          );
+        }
         drafts.push({
           tool,
           callId: call.id,
           file: file.path,
-          ...(!mode && !derivedOutline && requestedRange
-            ? {
-                range: {
-                  start: requestedRange.start,
-                  end: Math.min(
-                    requestedRange.end,
-                    requestedRange.start + file.content.split('\n').length - 1
-                  ),
-                },
-              }
-            : {}),
           content: file.content,
         });
       }
@@ -276,7 +257,8 @@ function normalizeDrafts(
     // P1-A F3：单 path read 返回纯文本(无 structuredContent.files)——此前落入通用兜底，
     // 而兜底只查 call.args.path(真实调用形态是 args.params.path)→ 落成无 file 条目 →
     // note_finding 判 unverified、不计配额,产出被无声折价。这里按批量同规格处理：
-    // 剥显示前缀存 verbatim(freshness 同尺)、file 取请求 path、range 取请求区间或全文行数。
+    // 剥显示前缀存 verbatim(freshness 同尺)、file 取请求 path、range 取 N| 显示解析出的坐标
+    // (不按请求区间推断；不可解析的派生视图降级 file-only)。
     const singleParams = (call.args?.params ?? call.args) as Record<string, unknown> | undefined;
     const singlePath = typeof singleParams?.path === 'string' ? singleParams.path : undefined;
     if (singlePath) {
