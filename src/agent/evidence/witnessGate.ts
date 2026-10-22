@@ -124,8 +124,10 @@ function isJwtCandidateConfirmed(_text: string, match: RegExpMatchArray): boolea
 
 // ── PEM 私钥块：BEGIN … PRIVATE KEY 之后（跳过空行与 RFC 1421/OpenPGP 头行）的第一行必须是正文 ──
 /**
- * 只看 BEGIN 标记之后这么多字符：足够容纳头行、空行与带缩进/拼接载体的第一行正文；
- * 有界窗口让“满文件重复 BEGIN 标记”这类输入的总开销保持线性（标记数 × 窗口）。
+ * 多行 / 转义换行形态只看 BEGIN 标记之后这么多字符：足够容纳头行、空行与带缩进/拼接载体的第一行
+ * 正文；有界窗口让“满文件重复 BEGIN 标记”这类输入的总开销保持线性（标记数 × 窗口）。
+ * 单行形态的正文可以远超窗口（RSA-2048/4096 约 1600–3200 字符），由不受窗口限制的
+ * hasSingleLinePemBody 判定，不依赖这个窗口。
  */
 const PEM_LOOKAHEAD_CHARS = 1024;
 /** BEGIN 之后最多跳过的空行 / 头行数；超过仍没有正文就不算私钥块。 */
@@ -144,9 +146,9 @@ const PEM_LEADING_CARRIER = /^(?:\s|\/\/+(?=\s)|[#*;>'"`,+([{-]|[bBrRuUfF]{1,2}(
 const PEM_TRAILING_CARRIER = /(?:\s|[\\'"`,;+)\]}])+$/;
 
 /**
- * 单行形态：BEGIN 与 END 落在同一行（换行被替换成空格的环境变量 / JSON 值）。
- * 只看 END 标记之前的片段，按空白切成 token，任一 token 去掉载体后是正文行即命中；
- * 片段为空或只有 `[\s\S]*?` 一类正则 / 普通单词时不命中（标记本身不是私钥）。
+ * 按行判定时窗口内某一行就到了 END：只看 END 标记之前的片段，按空白切成 token，任一 token
+ * 去掉载体后是正文行即命中；片段为空或只有 `[\s\S]*?` 一类正则 / 普通单词时不命中（标记本身
+ * 不是私钥）。END 落在窗口外的长单行由 hasSingleLinePemBody 判定。
  */
 function hasInlinePemBody(segmentBeforeEnd: string): boolean {
   for (const token of segmentBeforeEnd.split(/\s+/)) {
@@ -158,8 +160,171 @@ function hasInlinePemBody(segmentBeforeEnd: string): boolean {
   return false;
 }
 
+// ── 单行形态（换行被替换成空白）：BEGIN 同一物理行上紧跟的连续 base64 段，不依赖固定窗口 ──
+/**
+ * 单行形态的正文阈值：第一段（与多行形态“第一条正文行”同一口径）去掉载体后是不少于 16 个字符的
+ * base64，或者“按列切开的 base64 正文”形态的连续短段累计不少于 64 个字符（覆盖被切成很短的段）。
+ *
+ * 累计口径不能只看字符集：英文单词全由 base64 字符组成，BEGIN 后面一句不带标点的普通英文
+ * （约 13 个单词）就能凑够 64。所以累计只收同时满足下面两条的段序列，任一不满足即判为非正文：
+ * - 等宽：除末段外各段与第一段同宽，末段不长于第一段；出现更短的段或带 = 填充的段后，
+ *   后面再跟段就不是按列切开的正文；
+ * - 字符混合：累计的段里同时出现大写、小写，以及数字或 + /。随机 base64 的 64 个字符缺任一类的
+ *   概率不到百万分之二；纯小写单词缺大写，首字母大写的单词一般缺数字和 + /。
+ */
+const PEM_INLINE_CUMULATIVE_MIN_CHARS = 64;
+/** 一段 base64（长度不限，可带 = 填充）；单段是否够长另由 PEM_BODY_LINE 判断。 */
+const PEM_BODY_SEGMENT = /^[A-Za-z0-9+/]+={0,2}$/;
+/** 累计口径的字符混合判定（各自只扫一遍段，线性）。 */
+const PEM_SEGMENT_UPPER = /[A-Z]/;
+const PEM_SEGMENT_LOWER = /[a-z]/;
+const PEM_SEGMENT_DIGIT_OR_SYMBOL = /[0-9+/]/;
+/** 单行形态里的 RFC 1421 / OpenPGP 头名（`Proc-Type:` 一类），后面紧跟一个值段。 */
+const PEM_HEADER_TOKEN = /^(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset|MessageID):$/;
+/**
+ * 粘性扫描：同一行内的水平空白（不含换行类字符）与一个非空白段。粘性匹配只从当前位置向前走，
+ * 不在别处重试，所以单行扫描的开销与扫过的字符数成正比。函数同步执行，每次使用前重设 lastIndex。
+ */
+const PEM_INLINE_GAP = /[^\S\r\n\u2028\u2029]+/y;
+const PEM_INLINE_TOKEN = /\S+/y;
+/**
+ * 段首载体：与 PEM_LEADING_CARRIER 同一集合（段内没有空白，`\s` 与 `// ` 两支在段内不会成立），
+ * 但 `+` 只在不紧贴 base64 字符时才算拼接符。`+` 本身也是 base64 字符，以 `+` 开头的正文段
+ * 被剥短一个字符会让累计口径的等宽判定失真。
+ */
+const PEM_SEGMENT_LEADING_CARRIER =
+  /^(?:[#*;>'"`,([{-]|\+(?![A-Za-z0-9+/])|[bBrRuUfF]{1,2}(?=["'`]))+/;
+/** 段尾载体字符：与 PEM_TRAILING_CARRIER 同一集合；`+` 另按是否紧贴 base64 字符判断。 */
+const PEM_TRAILING_CARRIER_CHARS = new Set(['\\', "'", '"', '`', ',', ';', ')', ']', '}']);
+const PEM_BASE64_CHAR = /^[A-Za-z0-9+/]$/;
+/** 正文段至少含一个字母或数字；全是 `+` `/` 的段（`++`、`//`、分隔线）不是正文。 */
+const PEM_SEGMENT_ALPHANUMERIC = /[A-Za-z0-9]/;
+
+/**
+ * 去掉一个段两端的载体。段首用以 ^ 锚定的 PEM_SEGMENT_LEADING_CARRIER（只尝试一次，线性）；
+ * 段尾手写从右往左剥：PEM_TRAILING_CARRIER 没有锚定起点，在“中间是一长串载体、末尾不是载体”的
+ * 段上会在每个起点重试，段长不受窗口限制时开销是平方级。
+ * `+` 紧贴 base64 字符时按正文字符保留（`P0Z+`、`/+ab` 一类正文段），否则按拼接符剥掉（`'…'+`）。
+ */
+function stripPemSegmentCarriers(token: string): string {
+  const withoutLeading = token.replace(PEM_SEGMENT_LEADING_CARRIER, '');
+  let end = withoutLeading.length;
+  while (end > 0) {
+    const last = withoutLeading.charAt(end - 1);
+    const isCarrier =
+      PEM_TRAILING_CARRIER_CHARS.has(last) ||
+      (last === '+' && !PEM_BASE64_CHAR.test(withoutLeading.charAt(end - 2)));
+    if (!isCarrier) {
+      break;
+    }
+    end -= 1;
+  }
+  return withoutLeading.slice(0, end);
+}
+
+/**
+ * 单行形态判定：从 BEGIN 标记末尾开始，在同一物理行内按空白切段，不看固定窗口，也不跨行：
+ * - 只含载体的段（引号、拼接用的 +、逗号等）透明跳过；
+ * - 头名段（`Proc-Type:` 等）连同其后一个值段一起跳过，至多 PEM_MAX_SKIPPED_LINES 个；
+ * - 其余段去掉载体后必须整段是 base64，否则停止：BEGIN 后面接的是普通文本或代码；
+ * - 第一段不少于 16 个字符即判为正文（与按行判定的“第一条正文行”同一口径；已知误拒面：
+ *   BEGIN 后同一行第一个不少于 16 个字符的 base64 字符集单词或标识符也会命中）；
+ * - 否则按累计口径：等宽、字符混合的连续段累计不少于 64 个字符判为正文，宽度不齐即停止；
+ * - 含 `-----` 的段（END 或下一个标记）只计其前缀，然后停止。
+ * 扫描在行尾、非 base64 段、宽度不齐的段或下一个标记处停下，相邻标记的扫描区间不重叠，
+ * 总开销与输入长度线性。
+ */
+function hasSingleLinePemBody(text: string, start: number): boolean {
+  let cumulative = 0;
+  let segments = 0;
+  let skippedHeaders = 0;
+  let skipHeaderValue = false;
+  // 累计口径的状态：第一段宽度、是否已出现末段（更短或带填充），以及三类字符是否出现过。
+  let runWidth = 0;
+  let runClosed = false;
+  let sawUpper = false;
+  let sawLower = false;
+  let sawDigitOrSymbol = false;
+  let position = start;
+  while (position < text.length) {
+    PEM_INLINE_GAP.lastIndex = position;
+    if (PEM_INLINE_GAP.test(text)) {
+      position = PEM_INLINE_GAP.lastIndex;
+    }
+    PEM_INLINE_TOKEN.lastIndex = position;
+    const token = PEM_INLINE_TOKEN.exec(text);
+    if (!token) {
+      // 到了行尾（换行类字符）或文本末尾：同一行内没有凑够正文。
+      return false;
+    }
+    position = PEM_INLINE_TOKEN.lastIndex;
+    const markerAt = token[0].indexOf('-----');
+    const segment = stripPemSegmentCarriers(markerAt >= 0 ? token[0].slice(0, markerAt) : token[0]);
+    if (segment.length > 0) {
+      if (skipHeaderValue) {
+        skipHeaderValue = false;
+      } else if (segments === 0 && PEM_HEADER_TOKEN.test(segment)) {
+        skippedHeaders += 1;
+        if (skippedHeaders > PEM_MAX_SKIPPED_LINES) {
+          return false;
+        }
+        skipHeaderValue = true;
+      } else if (!PEM_BODY_SEGMENT.test(segment) || !PEM_SEGMENT_ALPHANUMERIC.test(segment)) {
+        // 不是 base64 段，或整段只有 `+` `/`：BEGIN 后面接的是普通文本、代码或分隔符。
+        return false;
+      } else {
+        if (segments === 0 && PEM_BODY_LINE.test(segment)) {
+          return true;
+        }
+        if (segments === 0) {
+          runWidth = segment.length;
+        } else if (runClosed || segment.length > runWidth) {
+          // 宽度不齐：末段之后又有段，或后一段比第一段宽。按列切开的正文不会这样，
+          // 这是 BEGIN 后接的普通单词序列，判为非正文。
+          return false;
+        }
+        const padding = segment.endsWith('==') ? 2 : segment.endsWith('=') ? 1 : 0;
+        if (segment.length < runWidth || padding > 0) {
+          // 更短或带 = 填充的段只能是末段。
+          runClosed = true;
+        }
+        segments += 1;
+        sawUpper = sawUpper || PEM_SEGMENT_UPPER.test(segment);
+        sawLower = sawLower || PEM_SEGMENT_LOWER.test(segment);
+        sawDigitOrSymbol = sawDigitOrSymbol || PEM_SEGMENT_DIGIT_OR_SYMBOL.test(segment);
+        // 累计只算 base64 字符，不算 = 填充。
+        cumulative += segment.length - padding;
+        if (
+          cumulative >= PEM_INLINE_CUMULATIVE_MIN_CHARS &&
+          sawUpper &&
+          sawLower &&
+          sawDigitOrSymbol
+        ) {
+          return true;
+        }
+      }
+    }
+    if (markerAt >= 0) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * 带正文的 PEM 私钥块：单行形态（不受窗口限制）或按行判定的多行 / 转义换行形态，任一成立即命中。
+ * 两条判定都只决定拒绝与否，从不改写内容；单行判定只会扩大拒绝面。
+ */
 function hasPemPrivateKeyBody(text: string, match: RegExpMatchArray): boolean {
   const start = (match.index ?? 0) + match[0].length;
+  return hasSingleLinePemBody(text, start) || hasLineFormPemBody(text, start);
+}
+
+/**
+ * 多行 / 转义换行形态：BEGIN 之后（跳过空行与头行）的第一条非空行必须是正文。只看 BEGIN 之后
+ * PEM_LOOKAHEAD_CHARS 个字符，足够容纳头行与第一条正文行；单行形态由 hasSingleLinePemBody 负责。
+ */
+function hasLineFormPemBody(text: string, start: number): boolean {
   const window = text
     .slice(start, start + PEM_LOOKAHEAD_CHARS)
     .replace(PEM_ESCAPED_LINE_BREAK, '\n');
@@ -190,6 +355,20 @@ const pemBegin = (label: string) => ['-----BEGIN', `${label}PRIVATE KEY-----`].j
 const pemEnd = (label: string) => ['-----END', `${label}PRIVATE KEY-----`].join(' ');
 const pemBody = synthetic(64, 'SYNTHETICbase64+/');
 const pemTail = synthetic(24, 'SYNTHETIC/');
+
+/** 合成正文按 64 列切段；长度取真实密钥的量级，内容只是 SYNTHETIC 循环串，不是任何真实密钥。 */
+function syntheticPemSegments(totalChars: number, lineWidth = 64): string[] {
+  const body = synthetic(totalChars, 'SYNTHETICbase64+/');
+  const segments: string[] = [];
+  for (let offset = 0; offset < body.length; offset += lineWidth) {
+    segments.push(body.slice(offset, offset + lineWidth));
+  }
+  return segments;
+}
+/** RSA-2048 PKCS#1 约 1592 字符、RSA-4096 PKCS#8 约 3168 字符、EC P-256 约 164 字符。 */
+const rsa2048Segments = syntheticPemSegments(1592);
+const rsa4096Segments = syntheticPemSegments(3168);
+const ecP256Segments = syntheticPemSegments(164);
 const jwtHeader = base64UrlJson({ alg: 'HS256', typ: 'JWT' });
 const jwtPayload = base64UrlJson({ sub: 'SYNTHETIC', iat: 0 });
 
@@ -355,6 +534,19 @@ const RULE_TABLE: readonly WitnessGateRule[] = [
       // 单行形态：换行被替换成空格的环境变量 / JSON 值。
       [pemBegin(''), pemBody, pemTail, pemEnd('')].join(' '),
       `PRIVATE_KEY="${[pemBegin('RSA '), pemBody, pemEnd('RSA ')].join(' ')}"`,
+      // 真实长度的单行形态：正文远超按行判定的 1024 字符窗口（RED-P3a2）。
+      [pemBegin('RSA '), ...rsa2048Segments, pemEnd('RSA ')].join(' '),
+      `PRIVATE_KEY="${[pemBegin(''), ...rsa4096Segments, pemEnd('')].join(' ')}"`,
+      [
+        pemBegin('RSA '),
+        'Proc-Type: 4,ENCRYPTED',
+        'DEK-Info: AES-128-CBC,SYNTHETIC0123456789',
+        '',
+        ...rsa2048Segments,
+        pemEnd('RSA '),
+      ].join(' '),
+      // END 被截掉的单行值。
+      [pemBegin('EC '), ...ecP256Segments].join(' '),
     ],
     negativeExamples: [
       `// ${pemBegin('')}\nexport const next = 1;`,
@@ -369,6 +561,15 @@ const RULE_TABLE: readonly WitnessGateRule[] = [
       [pemBegin(''), pemEnd('')].join('\n'),
       [['-----BEGIN', 'PUBLIC KEY-----'].join(' '), pemBody].join('\n'),
       [['-----BEGIN', 'CERTIFICATE-----'].join(' '), pemBody].join('\n'),
+      // 单行里 BEGIN 后接普通文本：长度超过窗口也不命中；第一段过短、累计不足 64 也不命中。
+      `// ${pemBegin('')} marker: ${'the parser reads lines until the end marker. '.repeat(30)}`,
+      `const banner = '${pemBegin('')}'; ${'export const filler = 1; '.repeat(60)}`,
+      `// ${pemBegin('')} followed by base64EncodedKeyMaterial lines`,
+      // BEGIN 后接不带标点、字母不少于 64 的英文句子：单词宽度不齐，不按累计口径计入正文。
+      `// ${pemBegin('RSA ')} header is what OpenSSL writes for PKCS1 keys while PKCS8 keys use another header`,
+      `# ${pemBegin('')} is followed by the key material which we never log or store in plain form anywhere ${pemEnd('')}`,
+      `${pemBegin('RSA ')} Proc-Type: 4,ENCRYPTED`,
+      [['-----BEGIN', 'PUBLIC KEY-----'].join(' '), ...rsa2048Segments].join(' '),
     ],
   },
 ];

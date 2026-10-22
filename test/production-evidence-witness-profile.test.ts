@@ -125,6 +125,18 @@ const syntheticPemBodyLine = synthetic(64, 'SYNTHETICbase64+/');
 const syntheticPem = [pemBegin, syntheticPemBodyLine, synthetic(24, 'SYNTHETIC/'), pemEnd].join(
   '\n'
 );
+/**
+ * 真实长度（RSA-2048 PKCS#1 量级：24 段 64 字符 + 56 字符尾段）的单行形态：换行被替换成空格，
+ * 正文远超 BEGIN 之后 1024 字符（RED-P3a2）。每段都是合成值，不是真实密钥。
+ */
+const syntheticRsaSegments = Array.from({ length: 25 }, (_, index) =>
+  synthetic(index === 24 ? 56 : 64, `SYNTHETIC${String(index % 10)}rsa+/`)
+);
+const syntheticSingleLineRsaPem = [
+  ['-----BEGIN', 'RSA PRIVATE KEY-----'].join(' '),
+  ...syntheticRsaSegments,
+  ['-----END', 'RSA PRIVATE KEY-----'].join(' '),
+].join(' ');
 
 /**
  * 9,000+ 字符的见证 fixture：apiKey / password 字面量、URL userinfo（默认脱敏会改写，但都不在见证
@@ -277,6 +289,14 @@ describe('verbatim witness profile rejects before writing', () => {
       kind: 'pem-private-key',
       rule: 'pem-private-key-block',
       forbiddenInDiagnostics: syntheticPemBodyLine,
+    },
+    {
+      name: 'a real-length RSA private key whose newlines were replaced by spaces',
+      content: `${filler}PRIVATE_KEY="${syntheticSingleLineRsaPem}"\n`,
+      reason: 'SECRET_DETECTED',
+      kind: 'pem-private-key',
+      rule: 'pem-private-key-block',
+      forbiddenInDiagnostics: syntheticRsaSegments[0] ?? syntheticSingleLineRsaPem,
     },
     {
       name: 'content one byte over 1 MiB',
@@ -714,6 +734,7 @@ describe('witness gate rules (T1 subset data)', () => {
       'src/agent/evidence/EvidenceLedgerStore.ts',
       'src/agent/evidence/ProductionEvidenceLedgerAuthority.ts',
       'test/production-evidence-witness-profile.test.ts',
+      'test/witness-gate-rules.test.ts',
     ]) {
       const text = fs.readFileSync(path.join(REPO_ROOT, relative), 'utf8');
       expect(inspectWitnessContent(text), relative).toBeNull();
