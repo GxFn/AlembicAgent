@@ -134,6 +134,125 @@ const NEGATION_PATTERNS_EN =
 const NEGATION_STRIP_ZH = new RegExp(NEGATION_PATTERNS_ZH.source, 'g');
 const NEGATION_STRIP_EN = new RegExp(NEGATION_PATTERNS_EN.source, 'gi');
 
+// ─── 韩文否定标记（L6-P3r5，用户决定 2026-10-21 第 2 条）──────────
+//
+// 相似度只能把“只差一个否定词”的正反两句压到 n/(n+1)：共享词 ≥ 6 个或否定写在句尾（“… 안 함”，
+// 肯定句是否定句的子串、再加 containsBonus）时仍 ≥ 0.85，否定句被 UPDATE 丢弃或被 MERGE 拼成一行。
+// 根因是极性判断只认中英文，所以这里补韩文的语法否定：短形 안 / 못、长形 -지 않- / -지 못-、
+// 禁止形 -지 마- / -지 말-。所有模式都在 NFC 正文上匹配（NFD 下音节被拆成字母，안 不再是一个字符）。
+// 词汇性否定（금지、중단、폐기 等，对应中文的 禁止 / 停止）不在本次范围内，未识别。
+
+/** 含韩文字母（音节、兼容字母或 NFD 拆出的字母）才走韩文否定识别；英文、中文文本原样处理，行为不变。 */
+const KOREAN_SCRIPT = /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]/u;
+
+/**
+ * 短形否定的候选：独立词 안 / 못（左右都不是字母数字；JS 的 \b 不认韩文）后隔空白接一个韩文词。
+ * 名词 안（“里面”）也能写成独立词（방 안 온도、컨테이너 안 설정 파일），所以候选还要再看后接的词，
+ * 见 koreanShortNegationAdverbs。带助词的 안에 / 안에서、以 안 开头的词（안전、안드로이드）本来就不是独立词。
+ */
+const KOREAN_SHORT_NEGATION_CANDIDATE =
+  /(?<![\p{L}\p{N}])(?:안|못)\s+([\uac00-\ud7a3]+)(?![\p{L}\p{M}\p{N}])/gu;
+
+/**
+ * 短形否定后接词的谓词词尾（取最后一个音节）：-다、-요、-죠、해 / 돼 / 써 / 줘 / 봐 这类连用形，
+ * 以及名词化的 함 / 됨 / 씀。名词 안 后面接的是名词或带助词的名词（온도를、설정），不以这些音节结尾。
+ */
+const KOREAN_PREDICATE_FINAL_SYLLABLES = new Set([
+  '다',
+  '요',
+  '죠',
+  '해',
+  '돼',
+  '써',
+  '줘',
+  '봐',
+  '함',
+  '됨',
+  '씀',
+]);
+
+/** 分句结束：文末、换行或标点。后接词落在分句末尾时（笔记体“… 안 저장”“사용 안 함”）也按谓词处理。 */
+const KOREAN_CLAUSE_END = /^[^\S\r\n]*(?:$|[\r\n.,;:!?。，；：！？…)\]」』"'~·])/u;
+
+/** 长形否定 -지 않- / -지 못-（저장하지 않는다、사용하지 못한다）；않 只作否定辅助用言出现。 */
+const KOREAN_LONG_NEGATION = /(?<=[\uac00-\ud7a3])지\s*(?:않|못)[\uac00-\ud7a3]*/u;
+
+/**
+ * 禁止形 -지 마- / -지 말-（저장하지 마세요、남기지 말 것）。后接音节限定在固定词尾内，
+ * 避免把 관광지 마을、연구지 마감 这类“以 지 结尾的名词 + 마 开头的名词”误判为否定。
+ */
+const KOREAN_PROHIBITIVE =
+  /(?<=[\uac00-\ud7a3])지\s*(?:마세요|마십시오|마라|마요|맙시다|말아요|말아|말고|말기|말라|말자|마|말)(?![\p{L}\p{M}\p{N}])/u;
+
+/** 短形否定连写成一个词（사용 안함、설치 안해）。只认整词，편안함、불안해 这类词内的 안함 / 안해 不算。 */
+const KOREAN_ATTACHED_NEGATION =
+  /(?<![\p{L}\p{N}])(?:안(?:함|해|됨|돼|씀|써)|못(?:함|해|씀|써))(?![\p{L}\p{M}\p{N}])/u;
+
+const KOREAN_LONG_NEGATION_STRIP = new RegExp(KOREAN_LONG_NEGATION.source, 'gu');
+const KOREAN_PROHIBITIVE_STRIP = new RegExp(KOREAN_PROHIBITIVE.source, 'gu');
+const KOREAN_ATTACHED_NEGATION_STRIP = new RegExp(KOREAN_ATTACHED_NEGATION.source, 'gu');
+
+/** 单个韩文音节：韩文单音节词（씀、꼭、에）是有意义的主题词，不能像英文 a / I 那样按长度丢掉。 */
+const HANGUL_SINGLE_SYLLABLE = /^[\uac00-\ud7a3]$/u;
+
+/**
+ * 正文里作为否定副词使用的独立 안 / 못 的位置（入参须已 NFC）。
+ * 后接词以谓词词尾结束，或后接词就是分句最后一个词，才算否定；否则按名词 안 / 못（“里面”“钉子”）处理。
+ */
+function koreanShortNegationAdverbs(nfc: string): number[] {
+  const positions: number[] = [];
+  for (const match of nfc.matchAll(KOREAN_SHORT_NEGATION_CANDIDATE)) {
+    const next = match[1];
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (
+      KOREAN_PREDICATE_FINAL_SYLLABLES.has(next.charAt(next.length - 1)) ||
+      KOREAN_CLAUSE_END.test(nfc.slice(end))
+    ) {
+      positions.push(start);
+    }
+  }
+  return positions;
+}
+
+/**
+ * 正文是否含韩文否定标记（短形 안 / 못、长形 -지 않- / -지 못-、禁止形 -지 마- / -지 말-、连写的 안함 等）。
+ * 供 MemoryConsolidator 的矛盾判定与 MemoryRetriever.append 的去重共用；不经 memory/index.ts 导出，不属于公开面。
+ * 不识别中文、英文否定（那两类由 NEGATION_PATTERNS_ZH / EN 负责）。
+ */
+export function hasKoreanNegation(text: string): boolean {
+  if (!text || !KOREAN_SCRIPT.test(text)) {
+    return false;
+  }
+  const nfc = text.normalize('NFC');
+  return (
+    KOREAN_LONG_NEGATION.test(nfc) ||
+    KOREAN_PROHIBITIVE.test(nfc) ||
+    KOREAN_ATTACHED_NEGATION.test(nfc) ||
+    koreanShortNegationAdverbs(nfc).length > 0
+  );
+}
+
+/**
+ * 计算主题交集前剥离韩文否定标记：短形只去掉副词 안 / 못（谓词保留，与肯定句对齐），
+ * 长形 / 禁止形 / 连写形去掉整个否定辅助词。含韩文的文本统一 NFC，两侧主题词口径一致；不含韩文时原样返回。
+ */
+function stripKoreanNegation(text: string): string {
+  if (!KOREAN_SCRIPT.test(text)) {
+    return text;
+  }
+  const nfc = text.normalize('NFC');
+  // 안 / 못 都是 BMP 单码元，等长替换成空格后下标不变；先改短形，再做长度会变的整段替换。
+  let stripped = nfc;
+  for (const position of koreanShortNegationAdverbs(nfc)) {
+    stripped = `${stripped.slice(0, position)} ${stripped.slice(position + 1)}`;
+  }
+  return stripped
+    .replace(KOREAN_LONG_NEGATION_STRIP, ' ')
+    .replace(KOREAN_PROHIBITIVE_STRIP, ' ')
+    .replace(KOREAN_ATTACHED_NEGATION_STRIP, ' ');
+}
+
 /** 共享主题词最少个数 */
 const MIN_TOPIC_OVERLAP_WORDS = 2;
 
@@ -466,12 +585,17 @@ export class MemoryConsolidator {
       : 'below-gate';
   }
 
+  /** 否定极性：中文、英文模式，加上韩文否定标记（L6-P3r5）；韩文判定对不含韩文的文本恒为 false。 */
   static #hasNegation(text: string): boolean {
-    return NEGATION_PATTERNS_ZH.test(text) || NEGATION_PATTERNS_EN.test(text);
+    return (
+      NEGATION_PATTERNS_ZH.test(text) || NEGATION_PATTERNS_EN.test(text) || hasKoreanNegation(text)
+    );
   }
 
   static #stripNegation(text: string): string {
-    return text.replace(NEGATION_STRIP_ZH, ' ').replace(NEGATION_STRIP_EN, ' ');
+    return stripKoreanNegation(
+      text.replace(NEGATION_STRIP_ZH, ' ').replace(NEGATION_STRIP_EN, ' ')
+    );
   }
 
   /**
@@ -722,7 +846,12 @@ export class MemoryConsolidator {
     return parts.length > 0 ? ` (${parts.join(', ')})` : '';
   }
 
-  /** 提取主题词 (去停用词 + 短词) */
+  /**
+   * 提取主题词 (去停用词 + 短词)。
+   * 单字符词按长度丢掉（英文 a / I），但韩文单音节词（씀、꼭）保留：'pnpm 씀' 与 'pnpm 안 씀' 去掉否定副词后
+   * 只剩 pnpm 一个长词，达不到 MIN_TOPIC_OVERLAP_WORDS，正反两句会落到 below-gate 并被 MERGE 拼成一行（L6-P3r5）。
+   * 英文、中文文本不含单个韩文音节，主题词与此前完全一致。
+   */
   static #extractTopicWords(text: string): Set<string> {
     if (!text) {
       return new Set();
@@ -731,7 +860,7 @@ export class MemoryConsolidator {
     const tokens = text
       .toLowerCase()
       .split(/[\s,;:!?。，；：！？\-_/\\|()[\]{}'"<>·、]+/)
-      .filter((t) => t.length >= 2);
+      .filter((t) => t.length >= 2 || HANGUL_SINGLE_SYLLABLE.test(t));
 
     const stopWords = new Set([
       '我们',

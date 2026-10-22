@@ -11,8 +11,11 @@
  * @module MemoryRetriever
  */
 
+import Logger from '@alembic/core/logging';
 import { cosineSimilarity } from '@alembic/core/search';
+import { observeSafely } from '#shared/observers.js';
 import { estimateTokens } from '#shared/tokenUtils.js';
+import { hasKoreanNegation } from './MemoryConsolidator.js';
 import type { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
 import type { MemoryPromptOptions } from './MemoryPrompt.js';
 import {
@@ -47,6 +50,9 @@ const HEAT_SATURATION_ACCESS_COUNT = 15;
 
 /** 相似度阈值 (用于 append 去重) */
 const SIMILARITY_UPDATE = 0.85;
+
+/** append 去重查看的候选数：跳过极性相反的近似行后，仍能命中同极性的复述（L6-P3r5）。 */
+const APPEND_DEDUP_CANDIDATES = 3;
 
 /** 召回记忆陈旧度阈值（天）。CG-1：>7 天加软前缀；≤7 天不加任何前缀（零噪声）。 */
 const STALE_MEMORY_DAYS = 7;
@@ -340,14 +346,37 @@ export class MemoryRetriever {
 
     // 去重: 检查是否已有高相似度记忆。
     // 候选窗口覆盖容量内全部活跃行：默认的“最近 50 行”会让超过 50 条后的旧同义记忆被重复写入（C29）。
-    const similar = this.#store.findSimilar(content, entry.type ?? null, 1, {
+    // 取前 APPEND_DEDUP_CANDIDATES 个候选而不是只看第一名：排第一的可能是极性相反的那一句，
+    // 这时仍要能与排在后面、同极性的复述去重。
+    const similar = this.#store.findSimilar(content, entry.type ?? null, APPEND_DEDUP_CANDIDATES, {
       candidateWindow: MEMORY_STORE_MAX_MEMORIES,
     });
-    if (similar.length > 0 && (similar[0].similarity ?? 0) >= SIMILARITY_UPDATE) {
-      if (entry.importance !== undefined && entry.importance > (similar[0].importance ?? 5)) {
-        this.#store.update(similar[0].id, { importance: entry.importance });
+    // 极性判断（L6-P3r5，用户决定 2026-10-21 第 2 条）：只差否定词 안 的韩文正反两句相似度仍可 ≥ 0.85，
+    // 按 UPDATE 跳过会静默丢掉后到的一句。append 没有矛盾替换语义，极性相反就不算重复、照常写入。
+    // 本包只授权韩文否定；英文、中文正反两句在 append 里的去重行为保持不变。
+    const negated = hasKoreanNegation(content);
+    let oppositePolarity = 0;
+    const duplicate = similar.find((row) => {
+      if ((row.similarity ?? 0) < SIMILARITY_UPDATE) {
+        return false;
       }
-      this.#store.touchAccess(similar[0].id);
+      if (hasKoreanNegation(row.content) !== negated) {
+        oppositePolarity++;
+        return false;
+      }
+      return true;
+    });
+    if (oppositePolarity > 0) {
+      // 只记计数、门槛、结果与 type，不记正文。
+      logMemoryRetriever(
+        `[MemoryRetriever] append skipped ${oppositePolarity} near-duplicate candidate(s) at similarity >= ${SIMILARITY_UPDATE} because their Korean negation polarity is opposite (outcome=${duplicate ? 'deduped-against-same-polarity-row' : 'written-as-new-row'}, type=${entry.type ?? '*'})`
+      );
+    }
+    if (duplicate) {
+      if (entry.importance !== undefined && entry.importance > (duplicate.importance ?? 5)) {
+        this.#store.update(duplicate.id, { importance: entry.importance });
+      }
+      this.#store.touchAccess(duplicate.id);
       return;
     }
 
@@ -579,4 +608,17 @@ export class MemoryRetriever {
         .map((t) => t.toLowerCase())
     );
   }
+}
+
+/**
+ * MemoryRetriever 没有注入 logger（构造签名保持不变），append 去重的分叉诊断走 Core Logger 的 debug 通道；
+ * 日志通道自身失败不能升级为写入失败，所以经 observeSafely 隔离。
+ */
+function logMemoryRetriever(message: string): void {
+  observeSafely(
+    () => {
+      Logger.getInstance().debug(message);
+    },
+    () => undefined
+  );
 }

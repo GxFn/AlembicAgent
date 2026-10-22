@@ -240,12 +240,15 @@ describe('MemoryStore.computeSimilarity after the fourth-round audit (L6-P3r4)',
   });
 
   // 韩文单音节词（NFC 下单码点：안、못、꼭、씀、써、다 …）在第三轮修复里不产生任何 token，
-  // 两条只共享一个拉丁标识符、其余都是单音节词的韩文记忆相似度仍为 1.0；否定词 안 的正反两句被判为同一条。
+  // 两条只共享一个拉丁标识符、其余都是单音节词的韩文记忆相似度仍为 1.0。
+  // 注意：分值本身拉不开只差一个否定词的长句（整词 Jaccard 为 n/(n+1)，句尾“… 안 함”再加 containsBonus），
+  // 所以“正反两句不得判为同一条”由 MemoryConsolidator / MemoryRetriever.append 的极性判定保证（L6-P3r5），
+  // 端到端用例在 test/memory-store-script-dedup.test.ts；这里只锁定短句的分值不再是 1.0。
   it.each([
     ['pnpm', 'pnpm 꼭 씀', 'pnpm 안 씀'],
     ['Zustand', 'Zustand 꼭 써', 'Zustand 안 써'],
     ['localStorage', '토큰은 localStorage 에 저장', '토큰은 localStorage 에 안 저장'],
-  ])('does not treat Korean statements negated by the single syllable 안 around %s as duplicates', (_label, a, b) => {
+  ])('scores short Korean statements negated by the single syllable 안 around %s below the UPDATE threshold', (_label, a, b) => {
     const score = similarity(a, b);
     expect(score).toBeLessThan(SIMILARITY_UPDATE);
     expect(similarity(b, a)).toBeCloseTo(score, 10);
@@ -284,5 +287,40 @@ describe('MemoryStore.computeSimilarity after the fourth-round audit (L6-P3r4)',
     messages = debug.mock.calls.map((call) => String(call[0]));
     expect(messages.some((message) => message.includes('no Core word'))).toBe(false);
     expect(messages.some((message) => message.includes('whole-word Jaccard'))).toBe(false);
+  });
+});
+
+describe('MemoryStore.computeSimilarity Core-word cap under NFD input (L6-P3r5)', () => {
+  // 第五轮审计：L6-P3r4 的封顶判断从 NFC 正文切 Core 词，Core token 却来自未归一化的原串。
+  // NFD 的 'für' 在原串里切出 Core token 'fu'，在 NFC 正文里却切不出任何 ≥2 字符的片段；
+  // 双方 Core 词都为空被当成“没有共同 Core 词”，完全相同的 NFD 文本被封顶到 0.5，两次写入多出一行。
+  it.each([
+    ['für ок', 'für ок'],
+    ['tôi là gì đó', 'tôi là gì đó'],
+    ['für', 'für'],
+  ])('still treats the identical NFD text %s as a duplicate', (text) => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const nfd = text.normalize('NFD');
+    expect(tokenizeForSimilarity(nfd.toLowerCase()).size).toBeGreaterThan(0);
+    expect(similarity(nfd, nfd)).toBe(1);
+    expect(debug.mock.calls.some((call) => String(call[0]).includes('no Core word'))).toBe(false);
+  });
+
+  it('does not cap the same accented identifier written in NFD on one side and NFC on the other', () => {
+    // Core 词同时取原串与 NFC 两种切法：'café' 的 NFD 原串切出 cafe、NFC 切出 caf，
+    // 同一标识符的两种写法仍算共享 Core 词，分值与 L6-P3r4 相同，不因本次修复新增封顶。
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const text = 'café ресторан';
+    expect(similarity(text.normalize('NFD'), text)).toBeGreaterThan(0.5);
+    expect(debug.mock.calls.some((call) => String(call[0]).includes('no Core word'))).toBe(false);
+  });
+
+  it('still caps NFD statements whose Core identifiers differ', () => {
+    // 封顶本身不变：NFD 输入里只差拉丁标识符的两句俄文仍低于 MERGE 门槛。
+    const score = similarity(
+      'тесты пишем на Vitest локально'.normalize('NFD'),
+      'тесты пишем на Jest локально'.normalize('NFD')
+    );
+    expect(score).toBeLessThan(0.6);
   });
 });

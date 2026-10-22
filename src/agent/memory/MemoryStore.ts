@@ -775,18 +775,21 @@ export class MemoryStore {
     const containsBonus = lowerA.includes(lowerB) || lowerB.includes(lowerA) ? 0.3 : 0;
     let score = Math.min(1.0, jaccard + containsBonus);
     let coreDisjointCapped = false;
-    if (
-      supplemented &&
-      score > DISJOINT_CORE_WORDS_SCORE_CAP &&
-      !setsIntersect(coreWordsOf(profileA), coreWordsOf(profileB))
-    ) {
+    if (supplemented && score > DISJOINT_CORE_WORDS_SCORE_CAP) {
+      const coreWordsA = coreWordsOf(profileA);
+      const coreWordsB = coreWordsOf(profileB);
       // 用户决定（2026-10-21）：核心标识符不同就不算重复。两句只在拉丁标识符或数字上不同的非拉丁文本
       // （俄文 Zustand / Redux、端口 8080 / 3000、Vitest / Jest）补充 token 后非拉丁部分完全重合，
       // 分值会升到 0.78–0.91，第二条被当作 UPDATE 丢弃或被 MERGE 拼成一行。
       // 双方没有任何共同的 Core 词时，把分值封顶在 MERGE 门槛之下，两条记忆都保留；
       // Core 词有交集（同一标识符的复述、加长、NFD 形式）时不封顶，仍按上面的分值判重。
-      score = DISJOINT_CORE_WORDS_SCORE_CAP;
-      coreDisjointCapped = true;
+      // 双方 Core 词都为空时没有“不同的标识符”可言，也不封顶（L6-P3r5：NFD 'für ок' 曾因此被封顶到 0.5）。
+      // Core 词取自与 Core token 相同的原串（见 coreWordsOf），在双方 Core token 都非空的这条分支里不会两侧皆空，
+      // 这一条只防调用方传入的 tokensA 与 lowerA 不同源。
+      if ((coreWordsA.size > 0 || coreWordsB.size > 0) && !setsIntersect(coreWordsA, coreWordsB)) {
+        score = DISJOINT_CORE_WORDS_SCORE_CAP;
+        coreDisjointCapped = true;
+      }
     }
     return { score, exactFallback: false, supplemented, wordLevelLowered, coreDisjointCapped };
   }
@@ -1069,7 +1072,7 @@ interface SimilarityOutcome {
 interface ScriptTokenProfile {
   /** 命中校验用：与 Core 分词 Set 对应的小写正文。 */
   lower: string;
-  /** 再次小写并 NFC 后的正文，补充分词、整词与 Core 词都从它切出。 */
+  /** 再次小写并 NFC 后的正文，补充分词与整词从它切出；Core 词由原串与它两种切法合并（见 coreWordsOf）。 */
   normalized: string;
   /** Core token ∪ 补充 token；补充集为空时就是 Core 分词 Set 本身。 */
   augmented: Set<string>;
@@ -1077,7 +1080,7 @@ interface ScriptTokenProfile {
   supplemented: boolean;
   /** 整词集合（SUPPLEMENT_WORD 切分，含拉丁 / 数字 / CJK 片段），用于整词 Jaccard。 */
   words: Set<string> | null;
-  /** Core 词集合（CORE_WORD），用于判断双方是否共享任何拉丁标识符、数字或 CJK 片段。 */
+  /** Core 词集合（CORE_WORD，原串 ∪ NFC 正文），用于判断双方是否共享任何拉丁标识符、数字或 CJK 片段。 */
   coreWords: Set<string> | null;
 }
 
@@ -1131,10 +1134,20 @@ function wholeWordsOf(profile: ScriptTokenProfile): Set<string> {
   return profile.words;
 }
 
-/** Core 词集合，按需计算并缓存在 profile 上。 */
+/**
+ * Core 词集合，按需计算并缓存在 profile 上。
+ * 先从未归一化的原串切（与 Core tokenizeForSimilarity 的输入同源：它对原串再小写一次后切词），
+ * 保证“Core token 非空”时 Core 词也非空——L6-P3r4 只从 NFC 正文切，NFD 的 'für' 在原串里有 Core token 'fu'、
+ * 在 NFC 里却切不出任何 ≥2 字符的片段，完全相同的 NFD 文本因“没有共同 Core 词”被封顶到 0.5（L6-P3r5）。
+ * 再并入 NFC 正文切出的词：同一个带变音符的标识符一侧写成 NFD（原串切出 cafe）、另一侧写成 NFC（切出 caf）时
+ * 仍算共享 Core 词，不因本次改动新增封顶。纯 NFC 文本两种切法结果相同。
+ */
 function coreWordsOf(profile: ScriptTokenProfile): Set<string> {
   if (!profile.coreWords) {
     const words = new Set<string>();
+    for (const match of profile.lower.toLowerCase().matchAll(CORE_WORD)) {
+      words.add(match[0]);
+    }
     for (const match of profile.normalized.matchAll(CORE_WORD)) {
       words.add(match[0]);
     }
