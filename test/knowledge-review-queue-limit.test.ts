@@ -1,16 +1,24 @@
 /**
  * L3-P6d（L3-P06 后续包，2026-10-20 用户决定）：knowledge.manage(review-queue) 是无上界查询，
  * 宿主 /agent/tool 直通且未传 limit 时会返回 staging 全部待复核条目。本用例固定三条规则：
- * 1. 未传 limit → 只返回默认条数（最旧优先），结果带内标注 total/truncated/limit/message，并记 debug 诊断；
+ * 1. 未传 limit → 只返回默认条数（按 stagingDeadline 升序选取），结果带内标注 total/truncated/limit/message，
+ *    并记 debug 诊断；
  * 2. 显式 limit（≤ 上限）→ 原样直通 Core，结果结构与之前完全一致；
  * 3. 显式 limit 超过上限 → 按上限截断、带内标注 requestedLimit，并记 warn 诊断。
  * 三条路径都保持 status=success（不 degraded、无 diagnosticWarnings），取消/失败语义不变。
+ *
+ * L3-P6e（第五轮审计补修）：Core 无界读不带 ORDER BY，返回 SQLite 物理行序，所以「最旧 N 条」的说法
+ * 不成立；同时缺省截断提示把调用方引向「先取 limit 条再剔除已复核条目」的显式路径。下方第二组用例用
+ * 忠实复刻 Core 语义的端口（无界读=物理行序；显式 limit=createdAt 升序取前 limit 条后才剔除已复核）
+ * 固定修复后的行为：缺省/超上限路径本地按 stagingDeadline 排序后切片，提示改为「复核写回后再取」。
  */
+import { readFileSync } from 'node:fs';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { handle as handleKnowledge } from '../src/tools/runtime/handlers/knowledge.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/index.js';
+import { TOOL_REGISTRY } from '../src/tools/runtime/registry.js';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
@@ -32,7 +40,10 @@ function makeQueue(size: number) {
   return Array.from({ length: size }, (_, index) => reviewQueueItem(index));
 }
 
-/** 模拟 Core 语义：传了 limit 就只返回最旧的 limit 条，不传则无界返回。 */
+/**
+ * 简化端口：传了 limit 就只返回前 limit 条，不传则无界返回。makeQueue 的下标顺序同时就是 deadline 升序，
+ * 所以它不能暴露「物理行序 ≠ 时间顺序」的问题——那类断言见下方 L3-P6e 组的 coreFaithfulPort。
+ */
 function coreLikeList(queue: ReturnType<typeof makeQueue>) {
   return vi.fn(async (limit?: number) => (limit === undefined ? queue : queue.slice(0, limit)));
 }
@@ -95,8 +106,7 @@ describe('knowledge.manage(review-queue) default limit and in-band truncation (L
       message: expect.stringContaining(`${DEFAULT_LIMIT} of 60`),
     });
     const data = result.data as ReviewQueueData;
-    expect(data.message).toContain('limit');
-    expect(data.message).toContain(String(MAX_LIMIT));
+    expect(data.message).toContain(`default limit ${DEFAULT_LIMIT}`);
     // status 保持 success：不 degraded，也不抬升 diagnosticWarnings。
     expect(result._meta?.resultStatus).toBeUndefined();
     expect(result._meta?.degraded).toBeUndefined();
@@ -324,5 +334,256 @@ describe('knowledge.manage(review-queue) default limit and in-band truncation (L
       release?.(makeQueue(60));
       await pending;
     }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  L3-P6e：按 Core 真实语义固定排序与提示文案                         */
+/* ------------------------------------------------------------------ */
+
+interface FakeStagingEntry {
+  id: string;
+  createdAt: number;
+  stagingDeadline: number;
+}
+
+const FAKE_BASE_TIME = 1_700_000_000_000;
+const FAKE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** 第 index 个条目：index 越小 createdAt 越早、deadline 越早；id 补零便于按字典序核对。 */
+function fakeEntry(index: number): FakeStagingEntry {
+  const createdAt = FAKE_BASE_TIME + index * 1000;
+  return {
+    id: `entry-${String(index).padStart(3, '0')}`,
+    createdAt,
+    stagingDeadline: createdAt + FAKE_GRACE_MS,
+  };
+}
+
+function fakeEntries(size: number): FakeStagingEntry[] {
+  return Array.from({ length: size }, (_, index) => fakeEntry(index));
+}
+
+/** 新库同步重建：rowid 顺序跟文件 readdir（按 slug 字典序）走，与 createdAt 无关。 */
+function lexicalFileOrder(entries: FakeStagingEntry[]): FakeStagingEntry[] {
+  return [...entries].sort((left, right) => {
+    const a = String(Number(left.id.slice('entry-'.length)));
+    const b = String(Number(right.id.slice('entry-'.length)));
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+function idsOf(queue: unknown[]): string[] {
+  return queue.map((item) => String((item as { id: unknown }).id));
+}
+
+/**
+ * 忠实复刻 Core 语义的端口（KnowledgeRepositoryImpl.findAllByLifecycles + StagingManager.listReviewQueue）：
+ * - 不传 limit：无 ORDER BY，按物理行序（physicalOrder）返回；
+ * - 传 limit：createdAt 升序取前 limit 条，之后才剔除已有 pass/fail 结论的条目；
+ * - recordReview 只登记结论，条目留在 staging，下一次无界读会把它剔除。
+ * 队列项与 Core StagingReviewQueueItem 同形，不含 createdAt。
+ */
+function coreFaithfulPort(physicalOrder: FakeStagingEntry[]) {
+  const reviewed = new Set<string>();
+  const toItem = (entry: FakeStagingEntry) => ({
+    id: entry.id,
+    title: `Staged ${entry.id}`,
+    whenClause: 'When reviewing staged knowledge',
+    doClause: 'Use the shared fixture port',
+    dontClause: 'Do not bypass the port',
+    coreCode: '',
+    sources: [] as string[],
+    stagingDeadline: entry.stagingDeadline,
+  });
+  const listReviewQueue = vi.fn(async (limit?: number) => {
+    const rows =
+      limit === undefined
+        ? [...physicalOrder]
+        : [...physicalOrder].sort((a, b) => a.createdAt - b.createdAt).slice(0, limit);
+    return rows.filter((entry) => !reviewed.has(entry.id)).map(toItem);
+  });
+  const recordReview = vi.fn(async (id: string) => {
+    if (!physicalOrder.some((entry) => entry.id === id)) {
+      return false;
+    }
+    reviewed.add(id);
+    return true;
+  });
+  return { listReviewQueue, recordReview };
+}
+
+function faithfulContext(port: ReturnType<typeof coreFaithfulPort>): ToolContext {
+  return { projectRoot: process.cwd(), tokenBudget: 8000, stagingManager: port };
+}
+
+describe('knowledge.manage(review-queue) ordering and drain hint against Core semantics (L3-P6e)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['reverse insertion order', (entries: FakeStagingEntry[]) => [...entries].reverse()],
+    ['lexical file-name order after a sync rebuild', lexicalFileOrder],
+  ])('returns the earliest-deadline entries on the default path when Core returns %s', async (_label, order) => {
+    const entries = fakeEntries(60);
+    const port = coreFaithfulPort(order(entries));
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(port)
+    );
+
+    expect(result.ok).toBe(true);
+    expect(port.listReviewQueue).toHaveBeenCalledWith(undefined);
+    const data = result.data as ReviewQueueData;
+    // Core 无界读的物理行序不可信：本地按 stagingDeadline 升序排序后才切片。
+    expect(idsOf(data.queue)).toEqual(entries.slice(0, DEFAULT_LIMIT).map((entry) => entry.id));
+    expect(data).toMatchObject({
+      count: DEFAULT_LIMIT,
+      total: 60,
+      truncated: true,
+      limit: DEFAULT_LIMIT,
+    });
+    // 带内说法必须与实际选取规则一致：不再声称「oldest」，而是按 staging deadline 最早选取。
+    expect(data.message).not.toMatch(/oldest/i);
+    expect(data.message).toContain('earliest staging deadlines');
+    expect(String(logs.debug.mock.calls[0]?.[0])).toContain('stagingDeadline');
+  });
+
+  it('sorts entries without a staging deadline after every dated entry', async () => {
+    // Core 对缺失 deadline 记 0；checkAndPromote 对 deadline=0 永远 waiting，不会自动晋级，排在最后。
+    const dated = fakeEntries(55).map((entry, index) =>
+      index < 10 ? { ...entry, stagingDeadline: 0 } : entry
+    );
+    const port = coreFaithfulPort(dated);
+    spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(port)
+    );
+
+    const data = result.data as ReviewQueueData;
+    expect(idsOf(data.queue)).toEqual([
+      ...dated.slice(10).map((entry) => entry.id),
+      'entry-000',
+      'entry-001',
+      'entry-002',
+      'entry-003',
+      'entry-004',
+    ]);
+    expect(data).toMatchObject({ count: DEFAULT_LIMIT, total: 55, truncated: true });
+  });
+
+  it('orders the clamped path by staging deadline and words its hint without the leave-staging claim', async () => {
+    const entries = fakeEntries(MAX_LIMIT + 150);
+    const port = coreFaithfulPort([...entries].reverse());
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue', limit: 1000 },
+      faithfulContext(port)
+    );
+
+    const data = result.data as ReviewQueueData;
+    expect(idsOf(data.queue)).toEqual(entries.slice(0, MAX_LIMIT).map((entry) => entry.id));
+    expect(data).toMatchObject({
+      count: MAX_LIMIT,
+      total: MAX_LIMIT + 150,
+      truncated: true,
+      limit: MAX_LIMIT,
+      requestedLimit: 1000,
+    });
+    expect(data.message).not.toMatch(/oldest/i);
+    // 已复核条目在 grace 期内仍留在 staging，但下一次无界读就会被剔除——不需要等它们离开 staging。
+    expect(data.message).not.toContain('leave staging');
+    expect(data.message).toContain("operation 'review'");
+    expect(data.message).toContain('call review-queue again');
+    expect(String(logs.warn.mock.calls[0]?.[0])).toContain('stagingDeadline');
+  });
+
+  it('points the default truncation hint at a drain path that actually returns the next entries', async () => {
+    const entries = fakeEntries(120);
+    const port = coreFaithfulPort([...entries].reverse());
+    spyLogs();
+    const ctx = faithfulContext(port);
+    const reviewAll = async (queue: unknown[]) => {
+      for (const id of idsOf(queue)) {
+        const review = await handleKnowledge(
+          'manage',
+          { operation: 'review', id, outcome: 'pass' },
+          ctx
+        );
+        expect(review.ok).toBe(true);
+      }
+    };
+
+    const first = (await handleKnowledge('manage', { operation: 'review-queue' }, ctx))
+      .data as ReviewQueueData;
+    expect(first).toMatchObject({ count: DEFAULT_LIMIT, total: 120, truncated: true });
+    // 不再建议「传 limit（≤500）一次取更多」：显式 limit 由 Core 先取后剔除已复核条目，可能少返回且无 total。
+    expect(first.message).not.toMatch(/pass limit/i);
+    expect(first.message).not.toContain(`up to ${MAX_LIMIT}`);
+    expect(first.message).not.toContain('fetch more in one call');
+    expect(first.message).toContain("operation 'review'");
+    expect(first.message).toContain('call review-queue again without limit');
+
+    // 照提示做：写回复核结论后不带 limit 再取，拿到的正是下一批待复核条目。
+    await reviewAll(first.queue);
+    const second = (await handleKnowledge('manage', { operation: 'review-queue' }, ctx))
+      .data as ReviewQueueData;
+    expect(idsOf(second.queue)).toEqual(entries.slice(50, 100).map((entry) => entry.id));
+    expect(second).toMatchObject({ count: DEFAULT_LIMIT, total: 70, truncated: true });
+
+    await reviewAll(second.queue);
+    const third = (await handleKnowledge('manage', { operation: 'review-queue' }, ctx))
+      .data as ReviewQueueData;
+    expect(third).toEqual({
+      queue: expect.any(Array),
+      count: 20,
+    });
+    expect(idsOf(third.queue)).toEqual(entries.slice(100).map((entry) => entry.id));
+  });
+
+  it('keeps the explicit-limit path unchanged even when Core under-returns after reviews', async () => {
+    // 用户决定（第 14 问）：显式 limit 行为不变。这里只把已知的少返回现象钉住，文档如实描述它。
+    const entries = fakeEntries(70);
+    const port = coreFaithfulPort(entries);
+    for (const entry of entries.slice(0, 50)) {
+      await port.recordReview(entry.id);
+    }
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue', limit: 50 },
+      faithfulContext(port)
+    );
+
+    expect(port.listReviewQueue).toHaveBeenCalledWith(50);
+    expect(result.data).toEqual({ queue: [], count: 0 });
+    expect(logs.debug).not.toHaveBeenCalled();
+    expect(logs.warn).not.toHaveBeenCalled();
+  });
+
+  it('describes the selection rules truthfully in the schema and the strict-production doc', () => {
+    const limitSchema = TOOL_REGISTRY.knowledge?.actions.manage?.params.properties?.limit;
+    const description = String(limitSchema?.description);
+    expect(description).not.toMatch(/oldest/i);
+    expect(description).toContain('stagingDeadline');
+    // 显式路径：Core 先取后剔除，可能少返回，且没有带内 total/truncated。
+    expect(description).toContain('before excluding reviewed ones');
+    expect(description).toContain('no total/truncated');
+
+    const doc = readFileSync(new URL('../docs/strict-production.md', import.meta.url), 'utf8');
+    const paragraph = doc.split('\n').find((line) => line.includes('review-queue limit')) ?? '';
+    expect(paragraph).not.toContain('最旧');
+    expect(paragraph).toContain('stagingDeadline');
+    expect(paragraph).toContain('先取后剔除');
   });
 });

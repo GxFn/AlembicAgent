@@ -248,11 +248,52 @@ async function handleActiveTransition(
 }
 
 /**
- * review-queue 结果投影（L3-P6d）：显式 limit 在上限内时结构与之前完全一致（{ queue, count }）；
- * 缺省或超上限时 Core 已做无界读，这里按 plan.cap 切片。只有真的切掉了条目才新增带内字段
- * （total/truncated/limit/requestedLimit/message），没切时仍是旧结构，调用方按 truncated 判断即可。
+ * 缺省/超上限路径的本地排序（L3-P6e，第五轮审计补修）。
+ * Core 无界读（findAllByLifecycles 未传 limit）不带 ORDER BY，返回 SQLite 物理行序（rowid）；新库经
+ * KnowledgeSyncService 重建时 rowid 跟文件 readdir 顺序走，与时间无关，直接切片会漏掉最先到期的条目。
+ * 队列项（Core StagingReviewQueueItem）不含 createdAt，只带 stagingDeadline，所以按它升序排：
+ * 复核结论缺失的条目到期照常晋级，最先到期的条目最该先交给宿主复核。
+ * deadline 缺失（Core 记 0）或非法的条目排最后——checkAndPromote 对 deadline=0 永远 waiting，不会自动晋级。
+ * 同 deadline 按 id 字典序（不用 localeCompare，避免随运行环境 locale 变化），结果不随物理行序抖动。
+ * 返回新数组，不改 Core 端口返回的原数组。
+ */
+function orderByStagingDeadline<T>(queue: readonly T[]): { ordered: T[]; undated: number } {
+  let undated = 0;
+  const keyed = queue.map((item) => {
+    const record = recordValue(item);
+    const raw = numberValue(record?.stagingDeadline);
+    const dated = raw !== undefined && raw > 0;
+    if (!dated) {
+      undated += 1;
+    }
+    return {
+      item,
+      deadline: dated ? raw : Number.POSITIVE_INFINITY,
+      id: typeof record?.id === 'string' ? record.id : '',
+    };
+  });
+  keyed.sort((left, right) => {
+    // 两个 Infinity 相减是 NaN，所以逐级比较而不是做减法。
+    if (left.deadline !== right.deadline) {
+      return left.deadline < right.deadline ? -1 : 1;
+    }
+    if (left.id !== right.id) {
+      return left.id < right.id ? -1 : 1;
+    }
+    return 0;
+  });
+  return { ordered: keyed.map((entry) => entry.item), undated };
+}
+
+/**
+ * review-queue 结果投影（L3-P6d，L3-P6e 修正排序与提示）：显式 limit 在上限内时结构与顺序都与之前一致
+ * （{ queue, count }，Core 原样返回）；缺省或超上限时 Core 已做无界读，这里先按 stagingDeadline 排序再按
+ * plan.cap 切片。只有真的切掉了条目才新增带内字段（total/truncated/limit/requestedLimit/message），
+ * 没切时仍是旧结构，调用方按 truncated 判断即可。
  * status 一律保持 success（截断是契约内行为，不 degraded、不抬升 diagnosticWarnings）；
  * 诊断只走日志：缺省截断记 debug（常规路径），超上限记 warn（调用方输入越过契约上限）。
+ * 带内提示只推荐「写回复核结论后再取」：已复核条目在 grace 期内仍留在 staging，但下一次无界读就会被
+ * 剔除，所以这条路一定能拿到下一批；显式 limit 由 Core 先取后剔除，可能少返回且不带 total，不作为取更多的做法。
  */
 function projectReviewQueueResult<T>(
   plan: ReviewQueueLimitPlan,
@@ -261,29 +302,32 @@ function projectReviewQueueResult<T>(
   if (plan.mode === 'explicit') {
     return { queue, count: queue.length };
   }
-  const total = queue.length;
+  const { ordered, undated } = orderByStagingDeadline(queue);
+  const total = ordered.length;
   const truncated = total > plan.cap;
-  const kept = truncated ? queue.slice(0, plan.cap) : queue;
-  const detail = `${plan.mode === 'clamped' ? `requested=${plan.requestedLimit}` : 'limit omitted'}, default=${REVIEW_QUEUE_DEFAULT_LIMIT}, ceiling=${REVIEW_QUEUE_MAX_LIMIT}, total=${total}, returned=${kept.length}, truncated=${truncated}`;
+  const kept = truncated ? ordered.slice(0, plan.cap) : ordered;
+  const detail = `${plan.mode === 'clamped' ? `requested=${plan.requestedLimit}` : 'limit omitted'}, default=${REVIEW_QUEUE_DEFAULT_LIMIT}, ceiling=${REVIEW_QUEUE_MAX_LIMIT}, total=${total}, returned=${kept.length}, truncated=${truncated}, order=stagingDeadline asc, undated=${undated}`;
   if (plan.mode === 'clamped') {
     // 超上限是调用方越过契约：无论是否真的切掉条目都告警，便于定位把超大 limit 当"全部"用的宿主。
     logKnowledgeFallback(
       'warn',
-      `[knowledge.manage] review-queue limit clamped to the ceiling (${detail}): Core read unbounded, result sliced locally${truncated ? ' and annotated in band (total/truncated/limit/requestedLimit/message)' : '; nothing was cut'}`
+      `[knowledge.manage] review-queue limit clamped to the ceiling (${detail}): Core read unbounded, result ordered by stagingDeadline and sliced locally${truncated ? ' and annotated in band (total/truncated/limit/requestedLimit/message)' : '; nothing was cut'}`
     );
   } else if (truncated) {
     logKnowledgeFallback(
       'debug',
-      `[knowledge.manage] review-queue default limit truncated the queue (${detail}): Core read unbounded, result sliced locally and annotated in band (total/truncated/limit/message)`
+      `[knowledge.manage] review-queue default limit truncated the queue (${detail}): Core read unbounded, result ordered by stagingDeadline, sliced locally and annotated in band (total/truncated/limit/message)`
     );
   }
   if (!truncated) {
-    return { queue, count: total };
+    return { queue: ordered, count: total };
   }
+  const drainHint =
+    "Record review outcomes for these entries with operation 'review', then call review-queue again";
   const message =
     plan.mode === 'clamped'
-      ? `Review queue truncated: returned the oldest ${kept.length} of ${total} pending entries because the requested limit ${plan.requestedLimit} exceeds the ceiling ${REVIEW_QUEUE_MAX_LIMIT}. Record review outcomes to drain the queue; the remaining entries become reachable as reviewed ones leave staging.`
-      : `Review queue truncated: returned the oldest ${kept.length} of ${total} pending entries (default limit ${REVIEW_QUEUE_DEFAULT_LIMIT}). Pass limit (up to ${REVIEW_QUEUE_MAX_LIMIT}) to fetch more in one call, or record review outcomes to drain the queue.`;
+      ? `Review queue truncated: returned the ${kept.length} of ${total} pending entries with the earliest staging deadlines (entries without a deadline sort last) because the requested limit ${plan.requestedLimit} exceeds the ceiling ${REVIEW_QUEUE_MAX_LIMIT}. ${drainHint}: reviewed entries drop out of the queue, so the next call returns the next pending ones.`
+      : `Review queue truncated: returned the ${kept.length} of ${total} pending entries with the earliest staging deadlines (default limit ${REVIEW_QUEUE_DEFAULT_LIMIT}; entries without a deadline sort last). ${drainHint} without limit: reviewed entries drop out of the queue, so the next call returns the next pending ones. An explicit limit is not a paging tool: Core applies it before excluding reviewed entries, so it can return fewer and carries no total.`;
   return {
     queue: kept,
     count: kept.length,

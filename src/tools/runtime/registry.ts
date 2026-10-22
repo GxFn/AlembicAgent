@@ -494,7 +494,7 @@ const KNOWLEDGE_SPEC: ToolSpec = {
             type: 'integer',
             minimum: 1,
             maximum: Number.MAX_SAFE_INTEGER,
-            description: `review-queue only: positive integer cap on entries returned (oldest-first). Omitted: defaults to ${REVIEW_QUEUE_DEFAULT_LIMIT}. Values above ${REVIEW_QUEUE_MAX_LIMIT} are clamped to ${REVIEW_QUEUE_MAX_LIMIT}. When the pending queue exceeds the applied cap, the result is annotated in band (total/truncated/limit/message).`,
+            description: `review-queue only: positive integer cap on entries returned. Omitted: all pending entries are ordered by stagingDeadline ascending (entries without a deadline last) and the first ${REVIEW_QUEUE_DEFAULT_LIMIT} are returned; values above ${REVIEW_QUEUE_MAX_LIMIT} are clamped to ${REVIEW_QUEUE_MAX_LIMIT} the same way. On these two paths a cut result is annotated in band (total/truncated/limit/message, plus requestedLimit when clamped); to get the next entries, record review outcomes and call again without limit. An explicit value up to ${REVIEW_QUEUE_MAX_LIMIT} is passed to Core unchanged: Core takes that many staging entries by createdAt before excluding reviewed ones, so it can return fewer (even none) while unreviewed entries remain, with no total/truncated.`,
           },
         },
         required: ['operation'],
