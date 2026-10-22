@@ -8,7 +8,9 @@
  * 3. noteFinding 字符串回执（旧宿主形态）的兼容转译带诊断，对象回执不受影响；
  * 4. graph 的 legacy 读取器被实际调用（含下标 0 的 overrides/extensions 唯一读取器）一律记
  *    GRAPH_QUERY_LEGACY_READER：返回值、返回空、抛错、读取中被取消都留痕（result=value|empty|
- *    error|aborted），失败文案另带 path=<port>.<method>；下标 > 0 的成功读取另记 GRAPH_QUERY_FALLBACK；
+ *    error|aborted），失败文案另带 path=<port>.<method>；拒绝值无法字符串化时（无原型对象、message
+ *    getter 抛错的 Error、已撤销的 Proxy）文案降级为 [unprintable error value: …] 并另记
+ *    GRAPH_QUERY_UNPRINTABLE_ERROR，痕迹与 path 照常保留；下标 > 0 的成功读取另记 GRAPH_QUERY_FALLBACK；
  * 5. knowledge.prime/detail 在 knowledgeRead 缺省时回落 knowledgeRepo 会记一条 info 日志，
  *    search-only 回落仍只用 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
  *
@@ -389,6 +391,213 @@ describe('graph legacy reader trace survives a throwing or canceled read', () =>
     // 从未被调用的 legacy 端口不能留假痕迹，也没有可归因的 path。
     expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
     expect(result.error).not.toContain('path=');
+  });
+
+  describe('rejection values that cannot be stringified', () => {
+    // 宿主或测试替身可能以无法字符串化的值拒绝：字符串化本身抛错时，旧实现在留痕之前就落进 handle()
+    // 外层 catch，只剩 'Graph query failed: …'，既没有 path 也没有 GRAPH_QUERY_LEGACY_READER。
+    function unprintableValues(): Array<{ label: string; make: () => unknown }> {
+      return [
+        { label: 'a null-prototype object', make: () => Object.create(null) },
+        {
+          label: 'an Error whose message getter throws',
+          make: () => {
+            const error = new Error('hidden');
+            Object.defineProperty(error, 'message', {
+              get() {
+                throw new Error('getter');
+              },
+            });
+            return error;
+          },
+        },
+        {
+          label: 'an Error whose message getter throws a null-prototype object',
+          make: () => {
+            const error = new Error('hidden');
+            Object.defineProperty(error, 'message', {
+              get() {
+                throw Object.create(null);
+              },
+            });
+            return error;
+          },
+        },
+        {
+          label: 'a revoked Proxy',
+          make: () => {
+            const { proxy, revoke } = Proxy.revocable({}, {});
+            revoke();
+            return proxy;
+          },
+        },
+      ];
+    }
+
+    const UNPRINTABLE = /\[unprintable error value: [^\]]+\]/;
+
+    function unprintableWarnings(result: ToolResult) {
+      return (result._meta?.diagnosticWarnings ?? []).filter(
+        (warning) => warning.code === 'GRAPH_QUERY_UNPRINTABLE_ERROR'
+      );
+    }
+
+    it.each(
+      unprintableValues()
+    )('keeps path and the legacy trace when the index-0 legacy reader rejects with $label', async ({
+      make,
+    }) => {
+      const ctx: ToolContext = {
+        projectRoot,
+        projectGraph: { getMethodOverrides: () => Promise.reject(make()) },
+      };
+      const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+      expect(result.ok).toBe(false);
+      expect(result.error).not.toContain('Graph query failed');
+      expect(result.error).toMatch(/^Graph query\(overrides\) error: /);
+      expect(result.error).toMatch(UNPRINTABLE);
+      expect(result.error).toMatch(/ \(path=projectGraph\.getMethodOverrides\)$/);
+      expect(graphLegacyWarnings(result)).toEqual([
+        {
+          code: 'GRAPH_QUERY_LEGACY_READER',
+          tool: 'graph',
+          stage: 'query(overrides)',
+          message: 'path=projectGraph.getMethodOverrides; reason=legacy-host-port; result=error',
+        },
+      ]);
+      expect(result._meta?.resultStatus).toBeUndefined();
+      // 降级为占位文案这一分叉单独记一条诊断，带出端口、终态与字符串化失败原因。
+      const degraded = unprintableWarnings(result);
+      expect(degraded).toHaveLength(1);
+      expect(degraded[0]).toMatchObject({ tool: 'graph', stage: 'query(overrides)' });
+      expect(degraded[0]?.message).toMatch(
+        /^path=projectGraph\.getMethodOverrides; reason=unprintable-error-value; status=error; stringifyError=.+$/
+      );
+    });
+
+    it('attributes a secondary legacy reader that throws an Error with a throwing message getter', async () => {
+      const [, withThrowingGetter] = unprintableValues();
+      const getClassInfo = vi.fn(() => null);
+      const ctx: ToolContext = {
+        projectRoot,
+        projectGraph: { getClassInfo },
+        codeEntityGraph: {
+          queryEntity: () => {
+            throw withThrowingGetter?.make();
+          },
+        },
+      };
+      const result = await handleGraph('query', { type: 'class', entity: ENTITY }, ctx);
+      expect(result.ok).toBe(false);
+      expect(getClassInfo).toHaveBeenCalledExactlyOnceWith(ENTITY);
+      expect(result.error).toBe(
+        'Graph query(class) error: [unprintable error value: getter] (path=codeEntityGraph.queryEntity)'
+      );
+      expect(result._meta?.diagnosticWarnings).toEqual([
+        {
+          code: 'GRAPH_QUERY_LEGACY_READER',
+          tool: 'graph',
+          stage: 'query(class)',
+          message: 'path=codeEntityGraph.queryEntity; reason=legacy-host-port; result=error',
+        },
+        {
+          code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
+          tool: 'graph',
+          stage: 'query(class)',
+          message:
+            'path=codeEntityGraph.queryEntity; reason=unprintable-error-value; status=error; stringifyError=getter',
+        },
+      ]);
+      expect(result._meta?.fallbackUsed).not.toBe(true);
+    });
+
+    it('stringifies an Error whose message is a Symbol instead of escaping to the outer catch', async () => {
+      const error = new Error('hidden');
+      Object.defineProperty(error, 'message', { value: Symbol('sym-boom') });
+      const ctx: ToolContext = {
+        projectRoot,
+        projectGraph: { getMethodOverrides: () => Promise.reject(error) },
+      };
+      const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+      expect(result.error).toBe(
+        'Graph query(overrides) error: Symbol(sym-boom) (path=projectGraph.getMethodOverrides)'
+      );
+      expect(graphLegacyWarnings(result)).toHaveLength(1);
+      // 能转成文本的值不走降级分支，不记 unprintable 诊断。
+      expect(unprintableWarnings(result)).toEqual([]);
+    });
+
+    it('keeps ordinary Error and string rejections off the unprintable path', async () => {
+      for (const rejection of [new Error('boom'), 'str-boom']) {
+        const ctx: ToolContext = {
+          projectRoot,
+          projectGraph: { getMethodOverrides: () => Promise.reject(rejection) },
+        };
+        const result = await handleGraph('query', { type: 'overrides', entity: ENTITY }, ctx);
+        expect(result.error).toBe(
+          `Graph query(overrides) error: ${rejection instanceof Error ? rejection.message : rejection} (path=projectGraph.getMethodOverrides)`
+        );
+        expect(graphLegacyWarnings(result)).toHaveLength(1);
+        expect(unprintableWarnings(result)).toEqual([]);
+      }
+    });
+
+    it('names a non-legacy primary reader rejecting with an unprintable value without a legacy trace', async () => {
+      const queryEntity = vi.fn();
+      const ctx: ToolContext = {
+        projectRoot,
+        projectGraph: { getClassInfo: () => Promise.reject(Object.create(null)) },
+        codeEntityGraph: { queryEntity },
+      };
+      const result = await handleGraph('query', { type: 'class', entity: ENTITY }, ctx);
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(UNPRINTABLE);
+      expect(result.error).toMatch(/ \(path=projectGraph\.getClassInfo\)$/);
+      expect(queryEntity).not.toHaveBeenCalled();
+      // 非 legacy 读取器不留旧宿主痕迹，只记降级诊断；普通读取错误仍不写 resultStatus。
+      expect(graphLegacyWarnings(result)).toEqual([]);
+      expect(unprintableWarnings(result)).toEqual([
+        expect.objectContaining({
+          stage: 'query(class)',
+          message: expect.stringMatching(
+            /^path=projectGraph\.getClassInfo; reason=unprintable-error-value; status=error; /
+          ),
+        }),
+      ]);
+      expect(result._meta?.resultStatus).toBeUndefined();
+    });
+
+    it('lifts the legacy trace onto the adapter envelope for a null-prototype rejection', async () => {
+      const adapter = new ToolRouterAdapter({
+        contextFactory: {
+          create: () => ({
+            projectRoot,
+            tokenBudget: 4000,
+            projectGraph: { getMethodOverrides: () => Promise.reject(Object.create(null)) },
+          }),
+        },
+      });
+      const envelope = await adapter.execute({
+        toolId: 'graph',
+        args: { action: 'query', params: { type: 'overrides', entity: ENTITY } },
+        surface: 'runtime',
+        actor: { role: 'agent' },
+        source: { kind: 'runtime' },
+      });
+      expect(envelope).toMatchObject({ ok: false, status: 'error' });
+      expect(envelope.text).toMatch(UNPRINTABLE);
+      expect(envelope.text).toContain('path=projectGraph.getMethodOverrides');
+      expect(envelope.diagnostics.warnings).toEqual([
+        expect.objectContaining({
+          code: 'GRAPH_QUERY_LEGACY_READER',
+          message: 'path=projectGraph.getMethodOverrides; reason=legacy-host-port; result=error',
+        }),
+        expect.objectContaining({
+          code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
+          stage: 'query(overrides)',
+        }),
+      ]);
+    });
   });
 
   it('lifts the throwing legacy reader trace onto the adapter envelope diagnostics', async () => {

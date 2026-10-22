@@ -15,7 +15,7 @@ interface GraphRead {
   source: string;
   /**
    * 来自 GRAPH_QUERY_HOST_READERS 的 legacy 标注：被实际调用即记 GRAPH_QUERY_LEGACY_READER，
-   * 返回值、返回空、抛错、读取中被取消都留痕（见 legacyReaderWarnings）。
+   * 返回值、返回空、抛错（含以无法字符串化的值拒绝）、读取中被取消都留痕（见 legacyReaderWarnings）。
    */
   legacy: boolean;
   invoke: () => unknown;
@@ -45,6 +45,33 @@ function legacyReaderWarnings(
       message: `path=${hit.source}; reason=legacy-host-port; result=${result}`,
     },
   ];
+}
+
+/**
+ * 把读取失败的原因转成纯文本，任何输入都不抛错。宿主或测试替身可能以无法字符串化的值拒绝或抛出：
+ * 无原型对象、message getter 会抛错的 Error、已撤销的 Proxy（连 instanceof 都会抛）。字符串化一旦抛错，
+ * 异常会越过留痕直接落进 handle() 外层 catch，path 与 GRAPH_QUERY_LEGACY_READER 全部丢失，所以这里
+ * 降级为占位文案 `[unprintable error value: <字符串化失败原因>]`，并把失败原因单独交给调用方记诊断。
+ * 能转成文本的值一律用 String() 收成字符串：原先已能正常出文案的值文案不变；message 为 Symbol 的 Error
+ * 原先在拼接文案时抛错，现在得到 `Symbol(...)` 文本。
+ */
+function describeReadFailure(
+  error: unknown,
+  status: Exclude<GraphReadResult, 'value' | 'empty'>
+): { text: string; unprintable?: string } {
+  try {
+    return { text: error instanceof Error ? String(error.message) : String(error ?? status) };
+  } catch (err: unknown) {
+    let cause: string;
+    try {
+      cause = err instanceof Error ? String(err.message) : String(err);
+    } catch (nested: unknown) {
+      // 字符串化失败的原因本身也无法字符串化（例如 getter 抛出无原型对象）：只给固定标记，不再递归。
+      void nested;
+      cause = 'unknown';
+    }
+    return { text: `[unprintable error value: ${cause}]`, unprintable: cause };
+  }
 }
 
 /** query type 合法性只认共享读取表的自有键；不在本文件另抄一份类型清单。 */
@@ -127,17 +154,27 @@ async function readGraph(
   // 尚未调用任何读取器（取消先于首次读取）时不归因，避免给从未被调用的 legacy 端口留假痕迹。
   const hit = invoked === undefined ? undefined : readers[invoked];
   if (outcome.status !== 'ok') {
-    const reason =
-      outcome.error instanceof Error
-        ? outcome.error.message
-        : String(outcome.error ?? outcome.status);
     // 抛错/取消同样是“旧端口被接线并调用”的事实：文案带出 path 以区分主读取器与旧端口抛错，legacy 读取器
     // 照常记 GRAPH_QUERY_LEGACY_READER（result=<status>）。GRAPH_QUERY_FALLBACK/fallbackUsed 只描述
-    // “结果经备用路径得到”，没有结果时不记，语义保持不变。
+    // “结果经备用路径得到”，没有结果时不记，语义保持不变。留痕与 path 先于原因文案生成，且原因文案经
+    // describeReadFailure 收口为不抛错的纯文本：拒绝值无法字符串化时也不会越过留痕落进外层 catch。
     const diagnosticWarnings = legacyReaderWarnings(hit, stage, outcome.status);
-    const result = fail(
-      `Graph ${stage} ${outcome.status}: ${reason}${hit ? ` (path=${hit.source})` : ''}`
-    );
+    const pathSuffix = hit ? ` (path=${hit.source})` : '';
+    const reason = describeReadFailure(outcome.error, outcome.status);
+    if (reason.unprintable !== undefined) {
+      // 降级分叉：原拒绝值无法转成文本，失败文案改用占位。另记 GRAPH_QUERY_UNPRINTABLE_ERROR，走与 legacy
+      // 痕迹相同的 _meta.diagnosticWarnings 通道（adapter 会抬到 envelope 诊断），供事后核对是哪个端口给出了
+      // 这种值；只含端口、终态与字符串化失败原因，不含拒绝值本身。它与是否 legacy 无关，非 legacy 读取器同样记。
+      diagnosticWarnings.push({
+        code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
+        tool: 'graph',
+        stage,
+        message:
+          `path=${hit?.source ?? 'none'}; reason=unprintable-error-value; ` +
+          `status=${outcome.status}; stringifyError=${reason.unprintable}`,
+      });
+    }
+    const result = fail(`Graph ${stage} ${outcome.status}: ${reason.text}${pathSuffix}`);
     const interrupted = outcome.status === 'aborted' || outcome.status === 'timeout';
     if (interrupted || diagnosticWarnings.length > 0) {
       result._meta = {
