@@ -11,6 +11,10 @@
  * 不成立；同时缺省截断提示把调用方引向「先取 limit 条再剔除已复核条目」的显式路径。下方第二组用例用
  * 忠实复刻 Core 语义的端口（无界读=物理行序；显式 limit=createdAt 升序取前 limit 条后才剔除已复核）
  * 固定修复后的行为：缺省/超上限路径本地按 stagingDeadline 排序后切片，提示改为「复核写回后再取」。
+ *
+ * L3-P6f（第六轮审计补修，只补测试）：L3-P6e 的用例里 deadline 两两不同、无 deadline 条目的物理行序恰好
+ * 就是 id 序，V8 的稳定排序让「有没有同 deadline 按 id 打破并列」得到同样结果；负 deadline 与日志里的
+ * undated=N 计数也没有断言。第三组用例让物理行序与 id 序相反、引入负 deadline，并精确断言 undated 计数。
  */
 import { readFileSync } from 'node:fs';
 import Logger from '@alembic/core/logging';
@@ -585,5 +589,196 @@ describe('knowledge.manage(review-queue) ordering and drain hint against Core se
     expect(paragraph).not.toContain('最旧');
     expect(paragraph).toContain('stagingDeadline');
     expect(paragraph).toContain('先取后剔除');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  L3-P6f：并列打破、负 deadline 与 undated 计数的守护               */
+/* ------------------------------------------------------------------ */
+
+const TIE_DEADLINE = FAKE_BASE_TIME + FAKE_GRACE_MS;
+
+/** 指定 id 与 deadline 的条目；createdAt 只影响显式 limit 路径，这里给确定值即可。 */
+function entryWith(id: string, stagingDeadline: number, createdAtOffset = 0): FakeStagingEntry {
+  return { id, createdAt: FAKE_BASE_TIME + createdAtOffset, stagingDeadline };
+}
+
+/** 从诊断行里取出 undated=N 的 N；没有该字段时返回 undefined，避免子串匹配把 13 误认成 1。 */
+function undatedCountOf(line: string): number | undefined {
+  const match = /\bundated=(\d+)\b/.exec(line);
+  return match ? Number(match[1]) : undefined;
+}
+
+describe('knowledge.manage(review-queue) tie-break, negative deadlines and undated count (L3-P6f)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('breaks equal staging deadlines by code-unit id order instead of physical row order', async () => {
+    // 物理行序故意打乱且与 id 序不同。同 deadline 的条目必须按 id 的 UTF-16 码元序排（不用 localeCompare：
+    // 大写在小写之前，'entry-10' 在 'entry-9' 之前），否则结果会随 Core 物理行序或运行环境 locale 变化。
+    // 'z-earliest' 的 deadline 更早，证明 id 只用来打破并列，不压过 deadline。
+    const physical = [
+      entryWith('b', TIE_DEADLINE),
+      entryWith('entry-9', TIE_DEADLINE),
+      entryWith('B', TIE_DEADLINE),
+      entryWith('z-earliest', TIE_DEADLINE - 1),
+      entryWith('a', TIE_DEADLINE),
+      entryWith('entry-10', TIE_DEADLINE),
+      entryWith('A', TIE_DEADLINE),
+    ];
+    const port = coreFaithfulPort(physical);
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(port)
+    );
+
+    expect(result.ok).toBe(true);
+    // 未截断：仍是旧结构 { queue, count }，但缺省路径同样按 deadline + id 排过序。
+    expect(result.data).toEqual({ queue: expect.any(Array), count: physical.length });
+    expect(idsOf((result.data as ReviewQueueData).queue)).toEqual([
+      'z-earliest',
+      'A',
+      'B',
+      'a',
+      'b',
+      'entry-10',
+      'entry-9',
+    ]);
+    expect(logs.debug).not.toHaveBeenCalled();
+    expect(logs.warn).not.toHaveBeenCalled();
+  });
+
+  it('breaks ties by id inside a truncated default slice, for dated groups and for the undated tail', async () => {
+    // 0..44 三条一组共享 deadline，45..54 没有 deadline（Core 记 0）。物理行序整体倒序：如果只靠稳定排序
+    // 保留物理行序，每组内会倒过来，切片尾部也会选到 id 最大的无 deadline 条目。
+    const entries = Array.from({ length: 55 }, (_, index) =>
+      entryWith(
+        `entry-${String(index).padStart(3, '0')}`,
+        index < 45 ? TIE_DEADLINE + Math.floor(index / 3) * 1000 : 0,
+        index * 1000
+      )
+    );
+    const port = coreFaithfulPort([...entries].reverse());
+    spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(port)
+    );
+
+    const data = result.data as ReviewQueueData;
+    expect(idsOf(data.queue)).toEqual(entries.slice(0, DEFAULT_LIMIT).map((entry) => entry.id));
+    expect(data).toMatchObject({
+      count: DEFAULT_LIMIT,
+      total: 55,
+      truncated: true,
+      limit: DEFAULT_LIMIT,
+    });
+  });
+
+  it('treats negative staging deadlines as undated: they sort after every dated entry and tie with zero by id', async () => {
+    // numberValue 只滤掉非有限数，负数会进入 dated 判定；只有 > 0 才算真实 deadline。负值（损坏数据）与 0
+    // 一样排在所有有 deadline 的条目之后，并在其间按 id 排序，而不是因为数值最小被排到最前。
+    const dated = Array.from({ length: 48 }, (_, index) =>
+      entryWith(
+        `dated-${String(index).padStart(3, '0')}`,
+        TIE_DEADLINE + index * 1000,
+        index * 1000
+      )
+    );
+    const undated = [
+      entryWith('undated-c', -1),
+      entryWith('undated-a', 0),
+      entryWith('undated-d', -FAKE_BASE_TIME),
+      entryWith('undated-b', -5),
+    ];
+    const port = coreFaithfulPort([...undated, ...[...dated].reverse()]);
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(port)
+    );
+
+    const data = result.data as ReviewQueueData;
+    expect(idsOf(data.queue)).toEqual([
+      ...dated.map((entry) => entry.id),
+      'undated-a',
+      'undated-b',
+    ]);
+    expect(data).toMatchObject({ count: DEFAULT_LIMIT, total: 52, truncated: true });
+    // 负 deadline 与 0 都计入 undated。
+    expect(logs.debug).toHaveBeenCalledTimes(1);
+    expect(undatedCountOf(String(logs.debug.mock.calls[0]?.[0]))).toBe(4);
+  });
+
+  it('logs the exact undated count on the default-path debug line', async () => {
+    // 60 条中 10 条 deadline=0、3 条为负数，共 13 条无 deadline；全部有 deadline 时计数为 0。
+    const mixed = fakeEntries(60).map((entry, index) => {
+      if (index < 10) {
+        return { ...entry, stagingDeadline: 0 };
+      }
+      if (index < 13) {
+        return { ...entry, stagingDeadline: -(index + 1) };
+      }
+      return entry;
+    });
+    const mixedLogs = spyLogs();
+    await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(coreFaithfulPort(mixed))
+    );
+    expect(mixedLogs.debug).toHaveBeenCalledTimes(1);
+    expect(undatedCountOf(String(mixedLogs.debug.mock.calls[0]?.[0]))).toBe(13);
+    vi.restoreAllMocks();
+
+    const datedLogs = spyLogs();
+    await handleKnowledge(
+      'manage',
+      { operation: 'review-queue' },
+      faithfulContext(coreFaithfulPort(fakeEntries(60)))
+    );
+    expect(datedLogs.debug).toHaveBeenCalledTimes(1);
+    expect(undatedCountOf(String(datedLogs.debug.mock.calls[0]?.[0]))).toBe(0);
+  });
+
+  it('logs the exact undated count on the clamped-path warn line, including when nothing was cut', async () => {
+    // 超上限路径无论是否真的切掉条目都告警；5 条里 1 条 deadline=0、1 条为负数，计数应为 2。
+    const entries = fakeEntries(5).map((entry, index) => {
+      if (index === 1) {
+        return { ...entry, stagingDeadline: 0 };
+      }
+      if (index === 3) {
+        return { ...entry, stagingDeadline: -10 };
+      }
+      return entry;
+    });
+    const logs = spyLogs();
+
+    const result = await handleKnowledge(
+      'manage',
+      { operation: 'review-queue', limit: 1000 },
+      faithfulContext(coreFaithfulPort(entries))
+    );
+
+    expect(idsOf((result.data as ReviewQueueData).queue)).toEqual([
+      'entry-000',
+      'entry-002',
+      'entry-004',
+      'entry-001',
+      'entry-003',
+    ]);
+    expect(logs.warn).toHaveBeenCalledTimes(1);
+    const line = String(logs.warn.mock.calls[0]?.[0]);
+    expect(line).toContain('truncated=false');
+    expect(undatedCountOf(line)).toBe(2);
+    expect(logs.debug).not.toHaveBeenCalled();
   });
 });
