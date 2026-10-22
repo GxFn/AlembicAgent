@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { runInNewContext } from 'node:vm';
 import Logger from '@alembic/core/logging';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
@@ -4303,6 +4304,215 @@ describe('terminal.exec budget, audit classification and input normalization (L4
           String(args[0]).includes('terminal_executor_result_normalized')
         )
       ).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // L4-P12r6：标签 getter 抛出的值本身也可能读不出类名：Error 的 name getter 抛错，或 getPrototypeOf trap 抛错的
+  // Proxy（求 instanceof 会触发 trap）。r5 在 catch 里直接取错误类名，第二个异常一路冒到 handle 的 catch，
+  // exit 0 的执行被改判为 terminal_execution_failed / executor-threw，宿主异常消息原样进了模型可见文本。
+  // 读不出类名时整体回落并记 unreadable-tag:unknown，不回显任何异常消息，审计仍记成功。
+  function errorWithThrowingName(): Error {
+    const err = new Error('inner HOST-SECRET-VALUE');
+    Object.defineProperty(err, 'name', {
+      get(): string {
+        throw new Error('name boom HOST-SECRET-VALUE');
+      },
+    });
+    return err;
+  }
+  function proxyWithThrowingPrototype(): Error {
+    return new Proxy(new Error('proxied HOST-SECRET-VALUE'), {
+      getPrototypeOf(): object | null {
+        throw new Error('proto boom HOST-SECRET-VALUE');
+      },
+    });
+  }
+  it.each([
+    { label: 'an Error whose name getter throws', thrown: errorWithThrowingName },
+    { label: 'a Proxy whose getPrototypeOf trap throws', thrown: proxyWithThrowingPrototype },
+  ])('falls back wholesale when the toStringTag getter throws $label', async ({ thrown }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    const audits: ToolAuditEntry[] = [];
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(
+          async () => ({
+            stdout: 'ok',
+            stderr: '',
+            exitCode: 0,
+            diagnostics: {
+              get [Symbol.toStringTag](): string {
+                throw thrown();
+              },
+            },
+          }),
+          {
+            runtime: { terminalIntent: { network: 'none' } },
+            auditSink: { log: (entry) => audits.push(entry) },
+          }
+        )
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+      const warnings = result._meta?.diagnosticWarnings ?? [];
+      expect(warnings.map((w) => w.code)).toEqual(['terminal_executor_result_normalized']);
+      const lines = warn.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('terminal_executor_result_normalized'));
+      expect(lines).toHaveLength(1);
+      for (const text of [warnings[0]?.message ?? '', lines[0] ?? '']) {
+        expect(text).toContain('diagnostics=unreadable-tag:unknown');
+        expect(text).toContain('diagnostics replaced by fallback');
+        expect(text).toContain('effective sandboxed=true fallbackUsed=false');
+        expect(text).not.toContain('boom');
+        expect(text).not.toContain('HOST-SECRET-VALUE');
+      }
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({ action: 'terminal.exec', result: 'success' });
+      expect(audits[0]).not.toHaveProperty('error');
+      expect(JSON.stringify(audits)).not.toContain('HOST-SECRET-VALUE');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // L4-P12r6：三个诊断字段一个都读不到、标签为 Object 的普通对象（含 Object.create(null)、不改标签的类实例、
+  // 跨 realm 的普通对象）按“宿主未报告”静默：既不整体回落，也不出 terminal_executor_result_normalized。
+  class HostDiagnosticsWithoutFields {
+    note = 'unrelated host field';
+  }
+  it.each([
+    { label: 'empty object literal', diagnostics: {} as object },
+    { label: 'null-prototype object', diagnostics: Object.create(null) as object },
+    {
+      label: 'class instance without a custom tag',
+      diagnostics: new HostDiagnosticsWithoutFields() as object,
+    },
+    { label: 'cross-realm empty object', diagnostics: runInNewContext('({})') as object },
+  ])('keeps fieldless plain-object diagnostics silent: $label', async ({ diagnostics }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => ({ stdout: 'ok', stderr: '', exitCode: 0, diagnostics }))
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+      expect(result._meta?.fallbackUsed).not.toBe(true);
+      expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+      expect(
+        warn.mock.calls.some((args) =>
+          String(args[0]).includes('terminal_executor_result_normalized')
+        )
+      ).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // L4-P12r6：三个诊断字段各只读一次，判定与取值基于同一份读数。宿主 getter 前后读数不一致时，
+  // 重复读取会让判定看到一个值、取值拿到另一个值（例如合法的 sandboxed:false 被后续读数改判为回落）。
+  type FieldReader = (readCount: number) => unknown;
+  const constantRead =
+    (value: unknown): FieldReader =>
+    () =>
+      value;
+  const firstReadThen =
+    (first: unknown, later: unknown): FieldReader =>
+    (readCount) =>
+      readCount === 1 ? first : later;
+  function countingDiagnostics(fields: {
+    sandboxed: FieldReader;
+    fallbackUsed: FieldReader;
+    degradeReason: FieldReader;
+  }) {
+    const reads = { sandboxed: 0, fallbackUsed: 0, degradeReason: 0 };
+    const diagnostics = {
+      get sandboxed(): unknown {
+        reads.sandboxed += 1;
+        return fields.sandboxed(reads.sandboxed);
+      },
+      get fallbackUsed(): unknown {
+        reads.fallbackUsed += 1;
+        return fields.fallbackUsed(reads.fallbackUsed);
+      },
+      get degradeReason(): unknown {
+        reads.degradeReason += 1;
+        return fields.degradeReason(reads.degradeReason);
+      },
+    };
+    return { reads, diagnostics };
+  }
+  it.each([
+    {
+      label: 'well-formed unsandboxed report',
+      fields: {
+        sandboxed: constantRead(false),
+        fallbackUsed: constantRead(true),
+        degradeReason: constantRead('seatbelt_unavailable'),
+      },
+      expectedText: unsandboxedSeatbeltText,
+      normalized: false,
+    },
+    {
+      label: 'malformed fields',
+      fields: {
+        sandboxed: constantRead('false'),
+        fallbackUsed: constantRead('true'),
+        degradeReason: constantRead(42),
+      },
+      expectedText: 'ok',
+      normalized: true,
+    },
+    {
+      label: 'getters whose later reads disagree with the first read',
+      fields: {
+        sandboxed: firstReadThen(false, 'false'),
+        fallbackUsed: firstReadThen(true, 'true'),
+        degradeReason: firstReadThen('seatbelt_unavailable', 99),
+      },
+      expectedText: unsandboxedSeatbeltText,
+      normalized: false,
+    },
+    {
+      label: 'getters that report nothing',
+      fields: {
+        sandboxed: constantRead(undefined),
+        fallbackUsed: constantRead(undefined),
+        degradeReason: constantRead(undefined),
+      },
+      expectedText: 'ok',
+      normalized: false,
+    },
+  ])('reads each executor diagnostics field exactly once: $label', async ({
+    fields,
+    expectedText,
+    normalized,
+  }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const { reads, diagnostics } = countingDiagnostics(fields);
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => ({ stdout: 'ok', stderr: '', exitCode: 0, diagnostics }))
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe(expectedText);
+      expect(reads).toEqual({ sandboxed: 1, fallbackUsed: 1, degradeReason: 1 });
+      expect(
+        (result._meta?.diagnosticWarnings ?? []).some(
+          (w) => w.code === 'terminal_executor_result_normalized'
+        )
+      ).toBe(normalized);
     } finally {
       warn.mockRestore();
     }

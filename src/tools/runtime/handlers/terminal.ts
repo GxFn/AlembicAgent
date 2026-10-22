@@ -909,7 +909,7 @@ function wholeDiagnosticsFallback(
  * （date、map……，经 safeToken 限制字符集，宿主自定义的 Symbol.toStringTag 不会原样进日志）。
  * 标签可由宿主经 Symbol.toStringTag getter 提供，getter 抛错时记 unreadable-tag:<错误类名> 整体回落：这是宿主
  * diagnostics 的形状问题，不能冒泡成 executor-threw，把一次正常返回的执行改判为失败；异常消息可能夹带宿主文本，
- * 只记类名。
+ * 只记类名，类名本身读不出时记 unknown（见 unreadableTagErrorName）。
  */
 function describeFieldlessDiagnostics(value: object): string | undefined {
   let tag: string;
@@ -919,9 +919,26 @@ function describeFieldlessDiagnostics(value: object): string | undefined {
     }
     tag = Object.prototype.toString.call(value).slice(8, -1);
   } catch (err: unknown) {
-    return `unreadable-tag:${errorNameOf(err)}`;
+    return `unreadable-tag:${unreadableTagErrorName(err)}`;
   }
   return tag === 'Object' ? undefined : safeToken(tag.toLowerCase());
+}
+
+/**
+ * 标签 getter 抛出的值同样来自宿主，取它的类名本身也可能抛错：errorNameOf 求 instanceof 会触发 Proxy 的
+ * getPrototypeOf trap，读 name 会触发 getter（L4-P12r6）。第二个异常若冒出去，会经 normalizeExecutorResult
+ * 冒到 handle 的 catch，把 exit 0 的执行改判为 terminal_execution_failed / executor-threw，并把宿主异常消息
+ * 原样写进模型可见文本。这里只降级类名为 unknown，不取任何消息；整体回落本身仍由调用方的
+ * terminal_executor_result_normalized 诊断与 warn 留痕（diagnostics=unreadable-tag:unknown）。
+ */
+function unreadableTagErrorName(err: unknown): string {
+  try {
+    return errorNameOf(err);
+  } catch (nameErr: unknown) {
+    // 第二个异常同样只可能来自宿主对象，不读它的任何内容；丢弃它是有意为之，类名记为 unknown。
+    void nameErr;
+    return 'unknown';
+  }
 }
 
 /** 回落说明的收尾：归一后生效的沙箱状态。只含布尔值，不含宿主文本。 */
