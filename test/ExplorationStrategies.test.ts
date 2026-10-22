@@ -2090,6 +2090,181 @@ describe('PlanTracker terminal rule Latin objects (L6-P16r5)', () => {
   });
 });
 
+/**
+ * L6-P16r6：terminal 语义回退的根治。r3–r5 每轮都在收紧“运行/执行”后的措辞匹配，每轮复查都能再举出新的
+ * 命中写法（“执行 git hooks”“运行 Node 18”、英文分支命中 src/cli/commands.ts 这类路径片段与“run loop”散文、
+ * 裸“命令/终端”子串）。根治改为文件目标门槛：步骤描述里有明确文件目标（与 read/outline 硬门槛同一口径）时，
+ * terminal 的语义回退一律不能完成或续做它；只有点名该文件的动作（read/outline，或参数以路径边界点名该文件的
+ * 动作）才算命中。“运行/执行”直接带出的命令行里的脚本路径是要执行的对象，不是要阅读的目标，不受门槛约束。
+ */
+describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const exec = (command: string): PlanCall => [
+    'terminal',
+    { action: 'exec', params: { command } },
+    { exitCode: 0, stdout: 'ok', stderr: '' },
+  ];
+  const read = (path: string): PlanCall => [
+    'code',
+    { action: 'read', params: { path } },
+    'export const value = 1;',
+  ];
+
+  it.each([
+    // r5 复查确认的四种“白名单命令名 + ASCII 名词/版本号”写法。
+    ['阅读 src/hooks/index.ts 理解执行 git hooks 的流程', 'ls'],
+    ['阅读 src/runtime/version.ts 了解运行 Node 18 时的差异', 'git status'],
+    ['阅读 src/container/lifecycle.ts 理解运行 docker container 的生命周期', 'git status'],
+    ['阅读 src/build/targets.ts 理解执行 make 目标的依赖', 'ls'],
+    // 英文分支命中路径片段与散文。
+    ['阅读 src/cli/commands.ts 的参数解析', 'ls'],
+    ['阅读 src/runner/run.ts 的调度入口', 'git status'],
+    ['阅读 src/agent/loop.ts 理解 run loop 的退出条件', 'git status'],
+    ['Read src/runner/run.ts to understand the scheduler', 'ls -la'],
+    ['Read src/shell/env.ts to see how the environment is assembled', 'git log -5'],
+    // 裸“命令/终端”子串。
+    ['阅读命令行解析模块 src/cli.ts', 'ls'],
+    ['阅读终端渲染组件 src/ui/terminal-view.tsx', 'git status'],
+    // 同一文件既被阅读又被执行：阅读出现在前，仍按阅读目标处理。
+    ['阅读 src/cli.ts 后执行 node src/cli.ts --help 观察输出', 'ls'],
+    // 英文散文整段是 ASCII：被执行对象区段不能延伸到后面真正要读的文件。
+    ['Read how we run git hooks in src/hooks/index.ts', 'ls'],
+    // 命令参数里的文件不是被执行对象（被执行的是 git），仍受门槛约束。
+    ['执行 git log src/auth.ts 查看修改历史', 'ls'],
+  ])('keeps the file-target step "%s" pending after terminal.exec %s', (step, command) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec(command)]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it('does not count an unrelated terminal command as continuing a done file-target step', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/cli/commands.ts 的参数解析\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [read('src/cli/commands.ts')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    runPlanRound(plans, trace, 3, [exec('ls')]);
+    // ls 从没碰过 commands.ts：不是续做已完成的阅读步骤，而是计划外动作。
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it.each([
+    ['阅读 src/hooks/index.ts 理解执行 git hooks 的流程', 'ls'],
+    ['阅读 src/runner/run.ts 的调度入口', 'git status'],
+    ['阅读命令行解析模块 src/cli.ts', 'git log -5 --oneline'],
+  ])('reports the deviation instead of listing "%s" as done after %s and off-plan reads', (step, command) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 获取项目概览和目录结构',
+        `2. ${step}`,
+        '3. 搜索错误处理和重试模式',
+        '4. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'structure', params: {} }, { tree: ['src'] }],
+    ]);
+    runPlanRound(plans, trace, 3, [exec(command)]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'pending', 'pending']);
+    runPlanRound(plans, trace, 4, [
+      ['code', { action: 'search', params: { pattern: 'retry' } }, { total: 0, matches: [] }],
+    ]);
+    for (const [iteration, file] of [
+      [5, 'src/a.ts'],
+      [6, 'src/b.ts'],
+    ] as const) {
+      runPlanRound(plans, trace, iteration, [read(file)]);
+      expect(plans.checkPlanning(planCheckState(iteration + 1), trace)).toBeNull();
+    }
+    runPlanRound(plans, trace, 7, [read('src/c.ts')]);
+    // 第 2 步仍待读取：连续 3 轮读无关文件是真实偏离，不能被“计划耗尽”保持吞掉。
+    expect(plans.progress).toMatchObject({ unplannedActions: 4, consecutiveOffPlan: 3 });
+    const nudge = plans.checkPlanning(planCheckState(8), trace)?.text ?? '';
+    expect(nudge).toContain('连续 3 轮偏离');
+    expect(nudge).toContain('⏳ 未完成 (2/4)');
+    expect(nudge.indexOf(step)).toBeGreaterThan(nudge.indexOf('⏳ 未完成'));
+  });
+
+  it.each([
+    '运行单元测试',
+    '执行 npm test',
+    '查看 git 状态',
+    '运行 ./scripts/check.sh 校验输出',
+    '执行 scripts/release.sh 生成发布包',
+    '运行 node scripts/check.mjs 校验输出',
+    'Run ./scripts/check.sh to verify the output',
+  ])('still lets terminal.exec complete the command step "%s" without a file to inspect', (step) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it('completes the command step behind a gated file-target step in the same plan', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/cli/commands.ts 的参数解析\n2. 运行单元测试确认基线', 1);
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'done']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it('keeps a step whose command also inspects another file behind the gate', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      '1. 运行 ./scripts/check.sh 并阅读 src/report.ts 的输出格式\n2. 阅读 src/server.ts',
+      1
+    );
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+  });
+
+  it('still counts a terminal command that names the step file at a path boundary', () => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读命令行解析模块 src/cli.ts\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [exec('sed -n 1,80p src/cli.ts')]);
+    // 点名文件是显式命中，不是语义回退。
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+    const gitLog = new PlanTracker();
+    const gitTrace = new ActiveContext();
+    gitTrace.setPlan('1. 执行 git log src/auth.ts 查看修改历史\n2. 阅读 src/server.ts', 1);
+    runPlanRound(gitLog, gitTrace, 2, [exec('git log -5 -- src/auth.ts')]);
+    expect(stepStatuses(gitTrace)).toEqual(['done', 'pending']);
+  });
+
+  it('logs the gated terminal semantic fallback at debug with the step and its file targets', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读 src/hooks/index.ts 理解执行 git hooks 的流程\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [exec('ls')]);
+    const gateLogs = debug.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('file-target gate'));
+    expect(gateLogs).toHaveLength(1);
+    expect(gateLogs[0]).toContain('terminal.exec');
+    expect(gateLogs[0]).toContain('阅读 src/hooks/index.ts 理解执行 git hooks 的流程');
+    expect(gateLogs[0]).toContain('[src/hooks/index.ts]');
+    expect(gateLogs[0]).toContain('pending');
+    // 命令本身可能带敏感参数，诊断里只写工具与动作名，不写原始命令。
+    expect(gateLogs[0]).not.toContain('"ls"');
+  });
+});
+
 describe('PlanTracker trace port (L6-P16 C19)', () => {
   it('drives PlanTracker through the public ExplorationTrace port, honouring failed reads', () => {
     const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];

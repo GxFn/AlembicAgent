@@ -15,7 +15,11 @@ import { readToolObservation } from '../../utils/toolOutcomes.js';
  *   - 计划外只指“既不能完成未完成步骤、也不是续做已完成步骤”的探索动作；未完成的只剩总结类
  *     步骤（工具动作按设计不能完成）时，未命中的探索动作不算偏离，连击保持不变（L6-P16r3 C015）；
  *     这条保持只在还有未完成步骤时成立——计划全部完成后不能续做的探索动作仍是计划外，偏差 replan
- *     照常触发（L6-P16r4）。
+ *     照常触发（L6-P16r4）；
+ *   - terminal.exec 的语义回退不能完成、也不能续做带明确文件目标的步骤（文件目标口径与 read/outline 的
+ *     硬门槛相同；“运行/执行”直接带出的被执行脚本是执行对象，不算）。这类步骤只能由读/看该文件、
+ *     参数以路径边界点名该文件、或参数含步骤显式关键词的动作命中，无关终端命令（ls、git status）
+ *     一律计入计划外（L6-P16r6）。
  *
  * @module PlanTracker
  */
@@ -254,9 +258,11 @@ const STANDALONE_COMMAND_NAMES = [
 ];
 
 /**
- * 同时常作语言/运行时/产品名词的命令名：只有后面紧跟 ASCII 参数（子命令、选项、路径）时才算命令宾语。
- * 否则“执行 git 操作”“运行 Node 服务”“运行 Swift 并发任务”这类名词用法也会让 git status / ls
- * 完成带文件目标的阅读步骤（L6-P16r5）。“运行 Python 脚本”这类无参数写法随之不再命中，属保守取舍。
+ * 同时常作语言/运行时/产品名词的命令名：后面紧跟任意 ASCII 词就按参数处理、算命令宾语——不只是子命令、
+ * 选项、路径，“执行 git hooks”“运行 Node 18”“运行 docker container”里的名词和版本号也算。这条只滤掉
+ * 命令名后不带 ASCII 词的名词用法（“执行 git 操作”“运行 Node 服务”“运行 Swift 并发任务”，L6-P16r5），
+ * 并不判定步骤是不是命令步骤；“运行 Python 脚本”这类无参数写法随之不再命中，属保守取舍。
+ * 带文件目标的阅读步骤不靠这里的措辞保护，而由 #findMatchingStep 的 terminal 文件目标门槛挡住（L6-P16r6）。
  */
 const ARGUMENT_COMMAND_NAMES = [
   'git',
@@ -298,8 +304,8 @@ function commandNameAlternation(names: readonly string[]): string {
  * terminal.exec 规则里“运行/执行”后的拉丁宾语（在小写化描述上匹配）。只收四种形状：
  *   - 显式执行路径或变量：./x、../x、~/x、$VAR、${VAR}；
  *   - shell 脚本文件（可带相对目录）：scripts/release.sh、check.sh；
- *   - STANDALONE_COMMAND_NAMES 里的命令名（后面不再接文件名字符）；
- *   - ARGUMENT_COMMAND_NAMES 里的命令名且紧跟 ASCII 参数（git log、node scripts/x.mjs）。
+ *   - STANDALONE_COMMAND_NAMES 里的命令名（后面不再接文件名字符；“执行 make 目标”这类名词用法也会命中）；
+ *   - ARGUMENT_COMMAND_NAMES 里的命令名且紧跟任意 ASCII 词（git log、node scripts/x.mjs，也包括 git hooks）。
  * r4 的 `[a-z.~$]` 只看首字符，小写后任何拉丁词（sql/http/electron/reducer/pipeline/tool）都当命令名；
  * `\/` 又让“执行/重试流程”这种斜杠并列命中。两者都删掉，不再收裸的 /x 绝对路径（计划步骤几乎不写
  * 绝对路径，误把斜杠并列当路径的代价更大）。
@@ -309,6 +315,23 @@ const TERMINAL_LATIN_COMMAND_OBJECT =
   '|(?:[\\w.-]+\\/)*[\\w.-]+\\.(?:sh|bash|zsh|ps1|bat|cmd)(?![\\w-])' +
   `|(?:${commandNameAlternation(STANDALONE_COMMAND_NAMES)})(?![\\w-]|\\.\\w)` +
   `|(?:${commandNameAlternation(ARGUMENT_COMMAND_NAMES)})[ \\t]+[\\w./~$-]`;
+
+/**
+ * 步骤描述里由“运行/执行”（或英文 run/exec 动词）直接带出的“被执行对象”（第 1 捕获组）：宾语必须先满足
+ * TERMINAL_LATIN_COMMAND_OBJECT，区段只延伸到该宾语所在的 ASCII token 结束——执行路径/脚本文件本身
+ * （./scripts/check.sh、scripts/release.sh），或 ARGUMENT_COMMAND_NAMES 命令名带的第一个参数
+ * （node scripts/check.mjs、bash scripts/release.sh 的脚本）。落在区段里的文件目标是步骤要执行的对象，
+ * 不是要阅读的目标，terminal 文件目标门槛不把它们算进去。
+ * 不再向后吞后续参数：英文散文整段都是 ASCII，“run git hooks in src/hooks/index.ts”若按命令行延伸，
+ * 会把真正要读的文件也当成命令参数放行；“执行 git log src/a.ts”里的 src/a.ts 也不是被执行对象，
+ * 仍受门槛约束（点名该文件的命令仍可经显式命中完成）。
+ * 在原始描述上按 i 标志匹配（不先转小写），保证捕获组下标与 FILE_TARGET_CANDIDATE_RE 的下标对齐。
+ */
+const EXECUTED_OBJECT_SPAN_RE = new RegExp(
+  `(?:(?<!可)(?:运行|执行)|\\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?)\\b)\\s*[\`'"“「]?\\s*` +
+    `((?:${TERMINAL_LATIN_COMMAND_OBJECT})[!-~]*)`,
+  'gi'
+);
 
 /**
  * 语义回退：工具类别 → 步骤描述关键词。英文用词边界（避免 thread→read、recall→call、
@@ -329,21 +352,27 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
     pattern: /大纲|阅读|深入|查看|文件|\b(?:outlines?|read(?:s|ing)?)\b/,
   },
   { tool: 'code', action: 'search', pattern: /搜索|查找|\bsearch(?:es|ing)?\b/ },
-  // terminal.exec 只完成“运行/执行命令”类步骤。中文没有词边界：“运行/执行”只有作为动词直接带命令宾语
-  // （TERMINAL_LATIN_COMMAND_OBJECT 收的拉丁命令名或执行路径，或测试、检查（带修饰语）、单测、用例、脚本、
-  // 构建、编译、打包、安装、命令、示例这类命令对象）时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”
-  // 这类名词修饰用法（L6-P16r4），以及“执行 SQL 查询”“执行 tool 调用”这类拉丁非命令宾语、“执行/重试”
-  // 这类斜杠并列（L6-P16r5）都不命中。terminal 不是单文件取证动作，文件目标只是软信号，不设边界时
-  // git status / ls 会把“阅读 src/x.ts 理解执行流程”标成完成；若那是最后一个可由工具完成的步骤，
-  // 之后的真实偏离还会被“计划耗尽”保持吞掉，周期回顾再把从没读过的文件列为已完成。
+  // terminal.exec 的近似规则，只用来识别“运行/执行命令、运行测试、查看 git 状态”类步骤：
+  //   - 中文没有词边界：“运行/执行”只有作为动词直接带命令宾语（TERMINAL_LATIN_COMMAND_OBJECT 收的拉丁命令名
+  //     或执行路径，或测试、检查（带修饰语）、单测、用例、脚本、构建、编译、打包、安装、命令、示例这类命令对象）
+  //     时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”（L6-P16r4）、“执行 SQL 查询”这类名单外拉丁宾语
+  //     与“执行/重试”斜杠并列（L6-P16r5）不命中；
+  //   - “git 状态”“git 工作区状态”“git status”命中（查看工作区状态）；
+  //   - 已知仍会过宽命中：白名单命令名 + 任意 ASCII 词（“执行 git hooks”“运行 Node 18”“执行 make 目标”）、
+  //     英文分支命中路径片段与散文（src/cli/commands.ts、src/runner/run.ts、“run loop”）、裸“命令/终端”子串
+  //     （“命令行解析模块”）。
+  // r3–r5 每轮收紧这里的措辞，复查都能再举出新的命中写法，所以措辞不再承担保护阅读步骤的职责：带明确文件
+  // 目标的步骤由 #findMatchingStep 的 terminal 文件目标门槛挡住，语义回退一律不能完成或续做它（L6-P16r6）。
+  // 这条规则的过宽命中因此只会落在没有文件目标的步骤上；计划进度只是建议性信号，不作门禁。
   // 不收单独的“测试/脚本”，避免完成“阅读测试文件”这类阅读步骤；“运行检查”这类无修饰语的宾语不命中，
-  // 是宁可少完成也不误完成的保守取舍（计划进度只是建议性信号，未命中只会计入计划外）。
+  // 是宁可少完成也不误完成的保守取舍（未命中只会计入计划外）。
   {
     tool: 'terminal',
     action: 'exec',
     pattern: new RegExp(
       `(?<!可)(?:运行|执行)\\s*[\`'"“「]?\\s*(?:${TERMINAL_LATIN_COMMAND_OBJECT}|` +
         '(?:单元|集成|端到端|回归|冒烟)?测试|(?:类型|静态|代码)检查|单测|用例|脚本|构建|编译|打包|安装|命令|示例|样例)' +
+        '|\\bgit\\s*(?:工作区|仓库)?\\s*(?:状态|status\\b)' +
         '|命令|终端|\\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\\b'
     ),
   },
@@ -782,6 +811,8 @@ export class PlanTracker {
    * 文件目标命中、工具类别语义回退。read/outline 是单文件取证，文件目标是硬门槛（读或看另一个文件的
    * 大纲不能完成指定文件步骤）；其它工具的文件目标是软信号：不排除步骤，但参数以路径边界点名了步骤
    * 文件目标时直接算命中（L6-P16r3 C017：code.search 限定在该文件上不能被记为计划外）。
+   * terminal.exec 例外：步骤有待检视的文件目标时，它的语义回退不生效（L6-P16r6 文件目标门槛），
+   * 只能经关键词或点名文件命中。
    * 总结/汇报类步骤只能由显式关键词命中，文件目标命中与语义回退都跳过它。
    */
   #findMatchingStep(
@@ -832,6 +863,15 @@ export class PlanTracker {
       ...candidates.filter((candidate) => !candidate.hit),
     ];
 
+    // 被 terminal 文件目标门槛拦下的语义命中：本次匹配结束时统一记一条诊断（含最终落到哪个步骤）。
+    const gated: Array<{ step: PlanStep; targets: string[] }> = [];
+    const finish = (matched: PlanStep | null) => {
+      if (gated.length > 0) {
+        this.#noteTerminalFileTargetGate(`${toolName}.${actionName}`, gated, matched);
+      }
+      return matched;
+    };
+
     for (const { step, targets, hit } of ordered) {
       if (isFileScoped && targets.length > 0 && !hit) {
         continue;
@@ -839,7 +879,7 @@ export class PlanTracker {
 
       // 策略 1: 关键词匹配
       if (step.keywords?.some((kw) => argsStr.includes(kw.toLowerCase()))) {
-        return step;
+        return finish(step);
       }
 
       // 总结/汇报类步骤不参与文件目标命中与语义回退，只能由显式关键词命中。
@@ -849,16 +889,43 @@ export class PlanTracker {
 
       // 策略 2: 动作点名了步骤的文件目标——显式命中，不再依赖步骤措辞与工具类别是否对得上。
       if (hit) {
-        return step;
+        return finish(step);
       }
 
       // 策略 3: 工具类型 → 步骤描述的语义匹配
       if (matchesStepSemantics(toolName, actionName, step.description.toLowerCase())) {
-        return step;
+        // terminal 文件目标门槛（L6-P16r6）：terminal 不是单文件取证动作，措辞再收紧也挡不住“执行 git hooks”
+        // “src/cli/commands.ts”这类命中，曾让 ls / git status 把从没读过的文件步骤标成完成，后果链是
+        // “计划耗尽”保持吞掉之后的真实偏离、周期回顾把没读过的文件列为已完成。因此步骤有待检视的文件目标时
+        // 语义回退一律不算命中（完成与续做同口径），只看下一个步骤；点名该文件的命令已在策略 2 命中。
+        const inspectionTargets =
+          toolName === 'terminal' ? inspectionFileTargets(step.description) : [];
+        if (inspectionTargets.length === 0) {
+          return finish(step);
+        }
+        gated.push({ step, targets: inspectionTargets });
       }
     }
 
-    return null;
+    return finish(null);
+  }
+
+  /** terminal 语义回退被文件目标门槛拦下是改变匹配结果的分叉路径：记 debug 诊断便于回放偏离判断。 */
+  #noteTerminalFileTargetGate(
+    actionLabel: string,
+    gated: Array<{ step: PlanStep; targets: string[] }>,
+    matched: PlanStep | null
+  ) {
+    // 只写工具与动作名，不写原始命令：命令参数可能带凭据或用户路径。
+    const blocked = gated
+      .map(({ step, targets }) => `"${step.description}" [${targets.join(', ')}] (${step.status})`)
+      .join('; ');
+    logPlanDiagnostic(
+      `[PlanTracker] ${actionLabel} semantic fallback blocked by file-target gate on ` +
+        `${gated.length} step(s): ${blocked}; only reading/outlining the file, an action naming it ` +
+        `at a path boundary, or an explicit step keyword can complete or continue such a step; ` +
+        (matched ? `matched step "${matched.description}" instead` : 'no step matched this action')
+    );
   }
 
   /** 技术名被排除出文件目标会让 read/outline 的硬门槛不作用于它：每个步骤记一次 debug 诊断。 */
@@ -888,21 +955,55 @@ function extractFileTargets(description: string): { targets: string[]; techNames
   const targets: string[] = [];
   const techNames: string[] = [];
   for (const token of description.match(FILE_TARGET_CANDIDATE_RE) || []) {
-    if (token.includes('/')) {
+    const kind = classifyFileTargetCandidate(token);
+    if (kind === 'file') {
       targets.push(token);
-      continue;
-    }
-    const extension = token.slice(token.lastIndexOf('.') + 1).toLowerCase();
-    if (!SOURCE_FILE_EXTENSIONS.has(extension)) {
-      continue;
-    }
-    if (isJsTechName(token)) {
+    } else if (kind === 'tech') {
       techNames.push(token);
-      continue;
     }
-    targets.push(token);
   }
   return { targets, techNames };
+}
+
+/**
+ * 候选 token 的归类（extractFileTargets 与 terminal 文件目标门槛共用同一口径）：含 '/' 的路径，或扩展名
+ * 在白名单内且不是 X.js 技术名的文件名，是文件目标；X.js 技术名单独归类供诊断；其余不是文件目标。
+ */
+function classifyFileTargetCandidate(token: string): 'file' | 'tech' | 'other' {
+  if (token.includes('/')) {
+    return 'file';
+  }
+  const extension = token.slice(token.lastIndexOf('.') + 1).toLowerCase();
+  if (!SOURCE_FILE_EXTENSIONS.has(extension)) {
+    return 'other';
+  }
+  return isJsTechName(token) ? 'tech' : 'file';
+}
+
+/**
+ * terminal 文件目标门槛要看的“待检视文件目标”：extractFileTargets 口径的文件目标里，去掉落在
+ * “运行/执行”被执行对象区段（EXECUTED_OBJECT_SPAN_RE）内的出现——那是步骤要执行的脚本，不是要阅读的文件。
+ * 按出现位置判断：同一文件只要有一次出现在区段外（如“阅读 src/cli.ts 后执行 node src/cli.ts”），
+ * 仍算待检视目标，宁可少完成也不让无关命令完成阅读步骤。
+ */
+function inspectionFileTargets(description: string): string[] {
+  const spans = [...description.matchAll(EXECUTED_OBJECT_SPAN_RE)].map((match) => {
+    const executed = match[1] ?? '';
+    const start = (match.index ?? 0) + match[0].length - executed.length;
+    return { start, end: start + executed.length };
+  });
+  const targets: string[] = [];
+  for (const match of description.matchAll(FILE_TARGET_CANDIDATE_RE)) {
+    if (classifyFileTargetCandidate(match[0]) !== 'file') {
+      continue;
+    }
+    const index = match.index ?? 0;
+    if (spans.some((span) => index >= span.start && index < span.end)) {
+      continue;
+    }
+    targets.push(match[0]);
+  }
+  return targets;
 }
 
 function isJsTechName(token: string): boolean {
