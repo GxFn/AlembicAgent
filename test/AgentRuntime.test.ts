@@ -5,9 +5,11 @@ import { createCanonicalSourceIdentity } from '@alembic/core';
 import { describe, expect, it, vi } from 'vitest';
 import { ContextWindow } from '../src/agent/context/index.js';
 import { PolicyEngine, SafetyPolicy } from '../src/agent/policies/index.js';
+import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { produceForcedSummary } from '../src/agent/runtime/forcedSummary.js';
 import { DiagnosticsCollector, type ProgressEvent } from '../src/agent/runtime/index.js';
+import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { generateLightweightSchemas } from '../src/tools/runtime/registry.js';
@@ -41,6 +43,21 @@ function createSchemaCatalogContainer(schemas: Array<Record<string, unknown>>) {
               schemas.filter((schema) => ids?.includes(String(schema.name))),
           }
         : undefined,
+  };
+}
+
+/**
+ * 宿主真实注入形状：宿主 ProjectScopeAnalysis.buildProjectScopeSourceIdentityMap 的产物
+ * （ProjectScopeSourceIdentityMap v1）。
+ */
+function hostSourceIdentityMap(identities: ReadonlyArray<Record<string, unknown>>) {
+  return {
+    contract: 'ProjectScopeSourceIdentityMap',
+    contractVersion: 1,
+    entries: identities.map((identity) => ({ ...identity })),
+    preferredRef: 'qualifiedPath',
+    rejectPolicy: { missingPath: 'reject' },
+    sourceCount: identities.length,
   };
 }
 
@@ -1006,7 +1023,8 @@ describe('agent runtime forced summary suppression', () => {
       context: {
         dimensionId: 'architecture',
         pipelinePhase: 'analyze',
-        sourceIdentities,
+        // 宿主真实注入形状（ProjectScopeSourceIdentityMap v1），L5-P28 起记录器只认这一形状。
+        projectScopeSourceIdentityMap: hostSourceIdentityMap(sourceIdentities),
       },
       budgetOverride: { maxIterations: 2, timeoutMs: 1000 },
     });
@@ -1051,6 +1069,114 @@ describe('agent runtime forced summary suppression', () => {
         }),
       ]),
     });
+  });
+
+  // L5-P28：PipelineStrategy 不转发来源身份。宿主按 AgentRunInputBuilders 的形状把同一个 v1 映射写进
+  // message.metadata.context、strategyContext 与 strategyContext.sharedState；记录器经阶段 context 或
+  // sharedState 读到它即可规范化，两条通道各自独立成立。
+  it.each([
+    ['the full host injection shape', 'full'],
+    ['the sharedState channel alone', 'shared-state-only'],
+  ] as const)('normalizes PCV refs end to end through PipelineStrategy with %s', async (_label, mode) => {
+    const progress: ProgressEvent[] = [];
+    const identityMap = hostSourceIdentityMap([
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'Alembic',
+        projectScopeId: 'workspace',
+        sourcePath: 'bin/api-server.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicCore',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+      createCanonicalSourceIdentity({
+        folderDisplayName: 'AlembicPlugin',
+        projectScopeId: 'workspace',
+        sourcePath: 'index.ts',
+      }),
+    ]);
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [
+          {
+            id: 'finding-call-1',
+            name: 'note_finding',
+            args: {
+              evidence:
+                'Alembic/bin/api-server.ts:10 boots on Node.js; index.ts:3 is ambiguous across folders.',
+              finding: 'API server boot path verified',
+              importance: 8,
+            },
+          },
+        ],
+        usage: { inputTokens: 2, outputTokens: 1 },
+      })
+      .mockResolvedValueOnce({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const toolRouter = {
+      execute: vi.fn(async () =>
+        createToolEnvelope('memory', 'recorded Alembic/bin/api-server.ts:10 on Node.js', {
+          importance: 8,
+          message: 'recorded',
+          recorded: true,
+          target: 'activeContext',
+        })
+      ),
+    };
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: toolRouter as never,
+      container: createSchemaCatalogContainer([
+        { name: 'memory', description: 'Memory', parameters: { type: 'object' } },
+      ]) as never,
+      capabilities: [],
+      additionalTools: ['memory'],
+      strategy: new PipelineStrategy({
+        stages: [{ name: 'analyze', budget: { maxIterations: 2, timeoutMs: 1000 } }],
+      }),
+      onProgress: (event) => progress.push(event),
+    });
+    const sharedState = { _projectScopeSourceIdentityMap: identityMap };
+    const message =
+      mode === 'full'
+        ? AgentMessage.internal('analyze the api server', {
+            metadata: { context: { projectScopeSourceIdentityMap: identityMap } },
+          })
+        : AgentMessage.internal('analyze the api server');
+    const strategyContext =
+      mode === 'full'
+        ? { source: 'system', projectScopeSourceIdentityMap: identityMap, sharedState }
+        : { source: 'system', sharedState };
+
+    await runtime.execute(message, { strategyContext });
+
+    const toolEnd = progress
+      .map((event) => event.processEvent)
+      .find((event) => event?.title === 'Tool call completed: note_finding');
+    const pcvEvidence = toolEnd?.metadata?.pcvNodeEvidence as
+      | {
+          missingLinkReasons: string[];
+          sourceRefDiagnostics: Array<{ input: string; reason: string; status: string }>;
+          sourceRefs: string[];
+        }
+      | undefined;
+    expect(pcvEvidence?.sourceRefs).toEqual(['Alembic/bin/api-server.ts:10']);
+    expect(pcvEvidence?.sourceRefDiagnostics).toEqual(
+      expect.arrayContaining([
+        { input: 'Node.js', reason: 'not-found', status: 'missing' },
+        { input: 'index.ts:3', reason: 'ambiguous-basename', status: 'ambiguous' },
+      ])
+    );
+    expect(pcvEvidence?.missingLinkReasons).toEqual(
+      expect.arrayContaining(['unresolved-source-refs', 'ambiguous-source-refs'])
+    );
   });
 
   // AP-3：grounding enforcement 默认 off（PCV observe-only）；analyze 阻断现为显式 guard 行为。

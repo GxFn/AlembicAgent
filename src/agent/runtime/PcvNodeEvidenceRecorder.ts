@@ -231,6 +231,10 @@ interface QualityReportLike {
   totalScore?: unknown;
 }
 
+/**
+ * 宿主 ProjectScopeSourceIdentityMap v1 的一条 entry 在 Agent 侧的归一形状。字段与宿主 entry 一致；
+ * 规范化只用 qualifiedPath（输出）与 absolutePath（绝对路径索引），其余字段保留供诊断定位。
+ */
 interface PcvCanonicalSourceIdentity {
   absolutePath: string | null;
   folderDisplayName: string | null;
@@ -243,16 +247,46 @@ interface PcvCanonicalSourceIdentity {
 }
 
 interface PcvProjectScopeSourceRefIndex {
+  /** 同一绝对路径对应多个不同 qualifiedPath（例如嵌套目录各自登记）时无法唯一定位。 */
+  ambiguousAbsolutePaths: ReadonlySet<string>;
   ambiguousBasenames: ReadonlySet<string>;
+  byAbsolutePath: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
   byBasename: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
   byQualifiedPath: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
 }
 
 interface PcvNormalizedProjectScopeSourceRef {
   normalizedRef: string | null;
-  reason: 'ambiguous-basename' | 'not-found' | 'qualified-path' | 'unique-basename';
+  reason:
+    | 'absolute-path'
+    | 'ambiguous-absolute-path'
+    | 'ambiguous-basename'
+    | 'not-found'
+    | 'qualified-path'
+    | 'unique-basename';
   status: 'active' | 'ambiguous' | 'missing';
 }
+
+/**
+ * L5-P28：宿主来源身份契约的识别常量。契约由宿主 ProjectScopeAnalysis（buildProjectScopeSourceIdentityMap）
+ * 定义，宿主 AgentRunInputBuilders / DimensionRuntimeBuilder 把同一个对象写进 message.metadata.context、
+ * strategyContext 的 projectScopeSourceIdentityMap 与 sharedState 的 _projectScopeSourceIdentityMap。
+ * 本仓不依赖宿主包，只按契约名与版本识别；版本或契约不符时不建索引（见 resolvePcvSourceIdentityMap）。
+ */
+const PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT = 'ProjectScopeSourceIdentityMap';
+const PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION = 1;
+
+/** 宿主映射的一次解析结果：建出索引（可能跳过了个别畸形 entry），或整份拒绝并给出原因。 */
+type PcvSourceIdentityMapResolution =
+  | { index: PcvProjectScopeSourceRefIndex; skippedEntryCount: number; status: 'indexed' }
+  | { reason: string; status: 'rejected' };
+
+/**
+ * 以宿主映射对象为键缓存解析结果。宿主在一次冷启动里只建一次映射并在各维度、各阶段复用同一个对象，
+ * 每个节点证据（每次 reactLoop、每次质量门）都要挂索引，缓存避免对同一份 entries 反复建索引。
+ * 前提：映射是宿主产出的只读快照，宿主不会原地改写 entries；改写后的映射须是新对象才会重新解析。
+ */
+const PCV_SOURCE_IDENTITY_MAP_RESOLUTION = new WeakMap<object, PcvSourceIdentityMapResolution>();
 
 const FILE_REF_RE =
   /[\w/.-]+\.(?:go|mod|sum|py|pyi|java|kt|kts|js|jsx|ts|tsx|mjs|cjs|swift|m|h|c|cpp|cc|hpp|cs|rb|rs|sql|json|yaml|yml|toml|xml|html|css|scss|less|sh|md|txt|gradle|properties|proto|vue|svelte|graphql|cfg|conf|ini|env|lock|rst)(?::\d+(?:-\d+)?)?\b/gi;
@@ -271,7 +305,7 @@ const MAX_SOURCE_REF_DIAGNOSTICS = 64;
 const MAX_EVENT_SOURCE_REF_DIAGNOSTICS = 16;
 /** I27 聚合原因：存在未能解析到项目范围来源身份的引用（逐条明细见 sourceRefDiagnostics）。 */
 const UNRESOLVED_SOURCE_REFS_REASON = 'unresolved-source-refs';
-/** I27 聚合原因：存在按 basename 无法唯一定位的歧义引用。 */
+/** I27 聚合原因：存在按 basename（或登记在多个 qualifiedPath 下的绝对路径）无法唯一定位的歧义引用。 */
 const AMBIGUOUS_SOURCE_REFS_REASON = 'ambiguous-source-refs';
 /**
  * I27 截断计数原因的前缀，后接因上限被丢弃的不同诊断条数。PcvNodeEvidenceSummary 是公开导出类型，
@@ -400,7 +434,7 @@ export function createPcvNodeEvidence(ctx: LoopContext): PcvNodeEvidenceSummary 
     sink: ctx.diagnostics ?? null,
     truncationReported: false,
   });
-  attachPcvSourceRefIndex(evidence, ctx.context, ctx.sharedState);
+  attachPcvSourceRefIndex(evidence, { context: ctx.context, sharedState: ctx.sharedState });
   evidence.repair.evidencePaths = normalizeSourceRefsForEvidence(evidence, rawRepairEvidencePaths);
   probeObservationLedger(ctx, evidence);
   return evidence;
@@ -769,7 +803,9 @@ export function buildPcvQualityGateEvidence({
 }): PcvNodeEvidenceSummary {
   const artifactRecord = asRecord(artifact);
   const evidence = createQualityGateEvidenceBase(artifactRecord, dimId || null, source);
-  attachPcvSourceRefIndex(evidence, stageNodeContext, sharedState, artifactRecord, source);
+  // 质量门的“上下文”是 strategyContext（gateEvaluators 以 stageNodeContext 传入），与运行期节点读同一对通道；
+  // artifact 与 source 不再作为身份来源（L5-P28 删除的旧候选）。
+  attachPcvSourceRefIndex(evidence, { context: stageNodeContext, sharedState });
   const qualityGateIdentity = resolvePcvStageNodeIdentity({
     context: stageNodeContext || artifactRecord,
     pipelinePhase: 'quality_gate',
@@ -952,10 +988,11 @@ export function resolvePcvStageNodeIdentity({
   }
 
   // canonical stage identity 由上游编排方注入；Agent 只消费并贯穿，缺失时保留 fallback。
+  // 只认宿主实际写入的 pcvStageNodeMap / pcvChainNodes（及 sharedState 下划线通道）；L5-P28 删除了
+  // 无写入方的 context.stageNodeMap 候选。
   const mapCandidates = [
     context?.pcvStageNodeMap,
     context?.pcvChainNodes,
-    context?.stageNodeMap,
     sharedState?._pcvStageNodeMap,
     sharedState?._pcvChainNodes,
     sharedState?.pcvStageNodeMap,
@@ -1515,114 +1552,262 @@ function addSourceRefs(evidence: PcvNodeEvidenceSummary, refs: string[]): void {
   ]).slice(0, MAX_SOURCE_REFS);
 }
 
-function attachPcvSourceRefIndex(evidence: PcvNodeEvidenceSummary, ...sources: unknown[]): void {
+/**
+ * L5-P28：给节点证据挂项目范围来源身份索引。读取位置只有两处（宿主实际写入的通道）：
+ * - carriers.context 的 projectScopeSourceIdentityMap：运行期节点是 LoopContext.context
+ *   （PipelineStrategy 把宿主 message.metadata.context 原样展开进阶段 context），质量门是 strategyContext；
+ * - carriers.sharedState 的 _projectScopeSourceIdentityMap：PipelineStrategy 原样传递宿主 sharedState。
+ * 两处都由宿主写入同一个对象，PipelineStrategy 不做任何转发。没有映射的运行（无 ProjectScope 的会话、
+ * chat 等）不建索引，引用按原样记录，这是正常路径而非降级，因此不记诊断。
+ */
+function attachPcvSourceRefIndex(
+  evidence: PcvNodeEvidenceSummary,
+  carriers: { context?: unknown; sharedState?: unknown }
+): void {
   if (PCV_SOURCE_REF_INDEX.has(evidence)) {
     return;
   }
-  const index = resolvePcvSourceRefIndex(...sources);
+  const index = resolvePcvSourceRefIndex(evidence, carriers);
   if (index) {
     PCV_SOURCE_REF_INDEX.set(evidence, index);
   }
 }
 
-function resolvePcvSourceRefIndex(...sources: unknown[]): PcvProjectScopeSourceRefIndex | null {
-  for (const source of sources) {
-    const directIndex = findProjectScopeSourceRefIndex(source);
-    if (directIndex) {
-      return directIndex;
-    }
-  }
-
-  const identities = sources.flatMap((source) => collectCanonicalSourceIdentities(source));
-  return identities.length > 0 ? buildPcvProjectScopeSourceRefIndex(identities) : null;
-}
-
-function findProjectScopeSourceRefIndex(source: unknown): PcvProjectScopeSourceRefIndex | null {
-  const record = asRecord(source);
-  const candidates = [record.sourceRefIndex, record.projectScopeSourceRefIndex];
-  return candidates.find(isProjectScopeSourceRefIndex) ?? null;
-}
-
 /**
- * I27 已知缺口（待决事项③，本包不接线）：唯一生产宿主只注入 projectScopeSourceIdentityMap /
- * _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），下面这些候选键在生产中没有写入方，
- * 只有测试经 sourceIdentities / _sourceIdentities 注入；因此生产中来源身份索引为空、规范化走无索引分支。
- * 接线宿主真实形状（含相对/绝对路径解析）与删除这些别名随事项③的决定一并处理，决定前保持原样。
+ * 按 context → sharedState 的顺序取第一份通过契约校验的宿主映射。同一对象出现在两处只解析一次。
+ * 被拒绝的映射（契约名或版本不符、entries 不是数组、没有可用 entry）不建索引；本次解析无论最终是否
+ * 从后一个通道建出索引，都只上报一条 warn，写明每个被拒通道的原因与最终选择的路径。
+ * 映射可用但跳过了个别畸形 entry 时同样只记一条 warn，索引照常使用。
  */
-function collectCanonicalSourceIdentities(source: unknown): PcvCanonicalSourceIdentity[] {
-  const record = asRecord(source);
+function resolvePcvSourceRefIndex(
+  evidence: PcvNodeEvidenceSummary,
+  carriers: { context?: unknown; sharedState?: unknown }
+): PcvProjectScopeSourceRefIndex | null {
   const candidates = [
-    source,
-    record.sourceIdentities,
-    record.projectScopeSourceIdentities,
-    record.canonicalSourceIdentities,
-    record.sourceRefIdentities,
-    record._sourceIdentities,
-    asRecord(record.projectScope).sourceIdentities,
-    asRecord(record.projectScopeAnalysis).sourceIdentities,
-    asRecord(record.projectIntelligence).sourceIdentities,
+    {
+      channel: 'context.projectScopeSourceIdentityMap',
+      value: asRecord(carriers.context).projectScopeSourceIdentityMap,
+    },
+    {
+      channel: 'sharedState._projectScopeSourceIdentityMap',
+      value: asRecord(carriers.sharedState)._projectScopeSourceIdentityMap,
+    },
   ];
-  return candidates.flatMap((candidate) => {
-    if (!Array.isArray(candidate)) {
-      const identity = normalizeCanonicalSourceIdentity(candidate);
-      return identity ? [identity] : [];
+  const seen = new Set<unknown>();
+  const rejections: string[] = [];
+  for (const { channel, value } of candidates) {
+    if (value === undefined || value === null || seen.has(value)) {
+      continue;
     }
-    return candidate
-      .map((item) => normalizeCanonicalSourceIdentity(item))
-      .filter((item): item is PcvCanonicalSourceIdentity => Boolean(item));
+    seen.add(value);
+    const resolution = resolvePcvSourceIdentityMap(value);
+    if (resolution.status === 'rejected') {
+      rejections.push(`${channel}: ${resolution.reason}`);
+      continue;
+    }
+    if (rejections.length > 0) {
+      const skipped =
+        resolution.skippedEntryCount > 0
+          ? ` (skipped ${resolution.skippedEntryCount} entries without a string qualifiedPath)`
+          : '';
+      reportSourceIdentityMapRejected(evidence, rejections, `indexed from ${channel}${skipped}`);
+    } else if (resolution.skippedEntryCount > 0) {
+      reportPcvEvidenceWarning(evidence, {
+        code: 'pcv_source_identity_map_entries_skipped',
+        message:
+          `${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT} v${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION} ` +
+          `from ${channel} for PCV node ${evidence.nodeId}: skipped ${resolution.skippedEntryCount} ` +
+          `entries without a string qualifiedPath; the index uses the remaining entries`,
+      });
+    }
+    return resolution.index;
+  }
+  if (rejections.length > 0) {
+    reportSourceIdentityMapRejected(evidence, rejections, 'no source identity index built');
+  }
+  return null;
+}
+
+function reportSourceIdentityMapRejected(
+  evidence: PcvNodeEvidenceSummary,
+  rejections: readonly string[],
+  outcome: string
+): void {
+  reportPcvEvidenceWarning(evidence, {
+    code: 'pcv_source_identity_map_rejected',
+    message: limitText(
+      `rejected ${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT} for PCV node ${evidence.nodeId} ` +
+        `(expected contract=${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT}, ` +
+        `contractVersion=${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION}, entries array): ` +
+        `${rejections.join('; ')}; ${outcome}, source refs are recorded without project-scope normalization`,
+      600
+    ),
   });
 }
 
-function normalizeCanonicalSourceIdentity(value: unknown): PcvCanonicalSourceIdentity | null {
+/**
+ * 校验并索引一份宿主映射，结果按对象缓存（见 PCV_SOURCE_IDENTITY_MAP_RESOLUTION）。
+ * 非对象值无法作为 WeakMap 键，直接拒绝且不缓存。
+ */
+function resolvePcvSourceIdentityMap(value: unknown): PcvSourceIdentityMapResolution {
+  if (!isJsonRecord(value)) {
+    return { reason: `expected an object, got ${describeValueShape(value)}`, status: 'rejected' };
+  }
+  const cached = PCV_SOURCE_IDENTITY_MAP_RESOLUTION.get(value);
+  if (cached) {
+    return cached;
+  }
+  const resolution = buildPcvSourceIdentityMapResolution(value);
+  PCV_SOURCE_IDENTITY_MAP_RESOLUTION.set(value, resolution);
+  if (resolution.status === 'indexed') {
+    Logger.getInstance().debug(
+      `[PcvNodeEvidence] indexed ${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT} ` +
+        `v${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION}: ` +
+        `${resolution.index.byQualifiedPath.size} qualified paths, ` +
+        `${resolution.index.byAbsolutePath.size} absolute paths, ` +
+        `${resolution.index.ambiguousBasenames.size} ambiguous basenames, ` +
+        `${resolution.skippedEntryCount} skipped entries`
+    );
+  }
+  return resolution;
+}
+
+function buildPcvSourceIdentityMapResolution(map: JsonRecord): PcvSourceIdentityMapResolution {
+  if (map.contract !== PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT) {
+    return {
+      reason: `contract=${describeValueShape(map.contract)}`,
+      status: 'rejected',
+    };
+  }
+  if (map.contractVersion !== PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION) {
+    return {
+      reason: `contractVersion=${describeValueShape(map.contractVersion)}`,
+      status: 'rejected',
+    };
+  }
+  if (!Array.isArray(map.entries)) {
+    return { reason: `entries is ${describeValueShape(map.entries)}`, status: 'rejected' };
+  }
+  const identities: PcvCanonicalSourceIdentity[] = [];
+  let skippedEntryCount = 0;
+  for (const entry of map.entries) {
+    const identity = normalizeSourceIdentityMapEntry(entry);
+    if (identity) {
+      identities.push(identity);
+    } else {
+      skippedEntryCount += 1;
+    }
+  }
+  if (identities.length === 0) {
+    // 与宿主 normalizeProjectScopeSourceRefsForRuntime 一致：没有身份时不规范化，避免把全部引用判成缺失。
+    return {
+      reason: `entries has no usable identity (${skippedEntryCount} skipped)`,
+      status: 'rejected',
+    };
+  }
+  return {
+    index: buildPcvProjectScopeSourceRefIndex(identities),
+    skippedEntryCount,
+    status: 'indexed',
+  };
+}
+
+/** 宿主 entry 是扁平对象；qualifiedPath 必须是非空字符串，其余字段缺失或类型不符时按 null 处理。 */
+function normalizeSourceIdentityMapEntry(value: unknown): PcvCanonicalSourceIdentity | null {
   const record = asRecord(value);
-  const identityRecord =
-    Object.keys(asRecord(record.sourceIdentity)).length > 0
-      ? asRecord(record.sourceIdentity)
-      : record;
-  const qualifiedPath = stringValue(identityRecord.qualifiedPath);
+  const qualifiedPath = stringValue(record.qualifiedPath);
   if (!qualifiedPath) {
     return null;
   }
   return {
-    absolutePath: stringValue(identityRecord.absolutePath),
-    folderDisplayName: stringValue(identityRecord.folderDisplayName),
-    folderId: stringValue(identityRecord.folderId),
-    folderPath: stringValue(identityRecord.folderPath),
-    folderRelativeRoot: stringValue(identityRecord.folderRelativeRoot),
-    projectScopeId: stringValue(identityRecord.projectScopeId),
+    absolutePath: stringValue(record.absolutePath),
+    folderDisplayName: stringValue(record.folderDisplayName),
+    folderId: stringValue(record.folderId),
+    folderPath: stringValue(record.folderPath),
+    folderRelativeRoot: stringValue(record.folderRelativeRoot),
+    projectScopeId: stringValue(record.projectScopeId),
     qualifiedPath,
-    relativePath: stringValue(identityRecord.relativePath),
+    relativePath: stringValue(record.relativePath),
   };
+}
+
+function describeValueShape(value: unknown): string {
+  if (typeof value === 'string') {
+    return JSON.stringify(limitText(value, 60));
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
 }
 
 function buildPcvProjectScopeSourceRefIndex(
   identities: readonly PcvCanonicalSourceIdentity[]
 ): PcvProjectScopeSourceRefIndex {
   const byQualifiedPath = new Map<string, PcvCanonicalSourceIdentity>();
+  const absoluteBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
   const basenameBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
 
   for (const identity of identities) {
     byQualifiedPath.set(normalizePcvSourcePath(identity.qualifiedPath), identity);
+    if (identity.absolutePath) {
+      appendToBucket(absoluteBuckets, normalizePcvSourcePath(identity.absolutePath), identity);
+    }
     const basename = sourceRefBasename(identity.qualifiedPath);
     if (basename) {
-      basenameBuckets.set(basename, [...(basenameBuckets.get(basename) ?? []), identity]);
+      appendToBucket(basenameBuckets, basename, identity);
     }
   }
 
-  const byBasename = new Map<string, PcvCanonicalSourceIdentity>();
-  const ambiguousBasenames = new Set<string>();
-  for (const [basename, entries] of basenameBuckets) {
-    const distinctQualifiedPaths = new Set(entries.map((entry) => entry.qualifiedPath));
-    if (distinctQualifiedPaths.size === 1 && entries[0]) {
-      byBasename.set(basename, entries[0]);
-    } else {
-      ambiguousBasenames.add(basename);
+  const unique = (buckets: Map<string, PcvCanonicalSourceIdentity[]>) => {
+    const resolved = new Map<string, PcvCanonicalSourceIdentity>();
+    const ambiguous = new Set<string>();
+    for (const [key, entries] of buckets) {
+      const distinctQualifiedPaths = new Set(entries.map((entry) => entry.qualifiedPath));
+      if (distinctQualifiedPaths.size === 1 && entries[0]) {
+        resolved.set(key, entries[0]);
+      } else {
+        ambiguous.add(key);
+      }
     }
-  }
+    return { ambiguous, resolved };
+  };
+  const absolute = unique(absoluteBuckets);
+  const basename = unique(basenameBuckets);
 
-  return { ambiguousBasenames, byBasename, byQualifiedPath };
+  return {
+    ambiguousAbsolutePaths: absolute.ambiguous,
+    ambiguousBasenames: basename.ambiguous,
+    byAbsolutePath: absolute.resolved,
+    byBasename: basename.resolved,
+    byQualifiedPath,
+  };
 }
 
+function appendToBucket(
+  buckets: Map<string, PcvCanonicalSourceIdentity[]>,
+  key: string,
+  identity: PcvCanonicalSourceIdentity
+): void {
+  const bucket = buckets.get(key);
+  if (bucket) {
+    bucket.push(identity);
+  } else {
+    buckets.set(key, [identity]);
+  }
+}
+
+/**
+ * 引用规范化顺序：qualifiedPath 原样命中 → 宿主登记的绝对路径映射到 qualifiedPath（reason absolute-path，
+ * 绝对路径不再原样进入 sourceRefs）→ 不含目录的引用按唯一 basename 匹配。带目录的相对路径不做 Core 的
+ * 单目录相对回落：宿主 ProjectScopeAnalysis 的准入规则只接受 qualified 与 absolute，这里保持同一口径。
+ */
 function normalizePcvProjectScopeSourceRef(
   sourceRef: string,
   index: PcvProjectScopeSourceRefIndex
@@ -1633,6 +1818,18 @@ function normalizePcvProjectScopeSourceRef(
     return {
       normalizedRef: qualified.qualifiedPath,
       reason: 'qualified-path',
+      status: 'active',
+    };
+  }
+
+  if (index.ambiguousAbsolutePaths.has(normalized)) {
+    return { normalizedRef: null, reason: 'ambiguous-absolute-path', status: 'ambiguous' };
+  }
+  const absolute = index.byAbsolutePath.get(normalized);
+  if (absolute) {
+    return {
+      normalizedRef: absolute.qualifiedPath,
+      reason: 'absolute-path',
       status: 'active',
     };
   }
@@ -1899,32 +2096,37 @@ function reportPcvSourceRefDiagnostic(
   state: PcvSourceRefDiagnosticState,
   warning: { code: string; message: string }
 ): void {
-  if (state.sink) {
-    state.sink.warn({
+  emitPcvEvidenceWarning(evidence, state.sink, warning);
+}
+
+/**
+ * 不需要诊断侧表状态的上报（例如来源身份映射被拒）：只借用已有状态里的运行诊断出口，不为此新建状态，
+ * 避免提前从尚未定型的证据重建去重键。运行期证据在挂索引前已建好状态，质量门证据没有出口，退回 Logger。
+ */
+function reportPcvEvidenceWarning(
+  evidence: PcvNodeEvidenceSummary,
+  warning: { code: string; message: string }
+): void {
+  emitPcvEvidenceWarning(
+    evidence,
+    PCV_SOURCE_REF_DIAGNOSTIC_STATE.get(evidence)?.sink ?? null,
+    warning
+  );
+}
+
+function emitPcvEvidenceWarning(
+  evidence: PcvNodeEvidenceSummary,
+  sink: PcvDiagnosticSink | null,
+  warning: { code: string; message: string }
+): void {
+  if (sink) {
+    sink.warn({
       ...warning,
       stage: evidence.stageIdentity.pipelinePhase ?? undefined,
     });
     return;
   }
   Logger.getInstance().warn(`[PcvNodeEvidence] ${warning.code}: ${warning.message}`);
-}
-
-function isProjectScopeSourceRefIndex(value: unknown): value is PcvProjectScopeSourceRefIndex {
-  const record = value as Partial<PcvProjectScopeSourceRefIndex> | null;
-  return (
-    Boolean(record) &&
-    hasMapGet(record?.byQualifiedPath) &&
-    hasMapGet(record?.byBasename) &&
-    hasSetHas(record?.ambiguousBasenames)
-  );
-}
-
-function hasMapGet(value: unknown): value is Pick<ReadonlyMap<string, unknown>, 'get'> {
-  return typeof (value as { get?: unknown } | null)?.get === 'function';
-}
-
-function hasSetHas(value: unknown): value is Pick<ReadonlySet<string>, 'has'> {
-  return typeof (value as { has?: unknown } | null)?.has === 'function';
 }
 
 function upsertGroundingLedgerEntry(

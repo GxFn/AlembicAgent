@@ -2522,44 +2522,21 @@ export class PipelineStrategy extends Strategy {
       baseSharedState?._pcvChainNodes ??
       baseSharedState?.pcvChainNodes ??
       null;
-    // I27 已知缺口（待决事项③，本包不接线、不删除）：下面 stageNodeMap 的 3 个别名与 sourceIdentities 的
-    // 7 个别名在生产中都没有写入方。唯一宿主只注入 projectScopeSourceIdentityMap /
-    // _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），这里不识别，所以生产中
-    // sourceIdentities 恒为 null，下方的 _sourceIdentities 浅拷贝与上下文投影不生效，PCV 记录器拿不到来源身份；
-    // 只有测试经这些别名注入。接线宿主真实形状并删除别名随事项③的决定处理，决定前保持原样。
-    const stageNodeMap =
-      messageContext?.stageNodeMap ??
-      strategyContext.stageNodeMap ??
-      baseSharedState?.stageNodeMap ??
-      null;
-    const sourceIdentities =
-      messageContext?.sourceIdentities ??
-      messageContext?.projectScopeSourceIdentities ??
-      strategyContext.sourceIdentities ??
-      strategyContext.projectScopeSourceIdentities ??
-      baseSharedState?._sourceIdentities ??
-      baseSharedState?.sourceIdentities ??
-      baseSharedState?.projectScopeSourceIdentities ??
-      null;
+    // PCV 来源身份（L5-P28）不在这里转发：宿主把 ProjectScopeSourceIdentityMap v1 写进
+    // message.metadata.context 的 projectScopeSourceIdentityMap 与 sharedState 的 _projectScopeSourceIdentityMap，
+    // 前者随下方 messageContext 展开进入阶段 context，后者随 sharedState 原样（或浅拷贝）传入，记录器直接读取。
     const stageSharedState = decisionOnly
       ? {
           ...(baseSharedState || {}),
           _evolutionDecisionOnly: true,
-          ...(sourceIdentities !== null ? { _sourceIdentities: sourceIdentities } : {}),
         }
       : stage.recordRepairOnly
         ? {
             ...(baseSharedState || {}),
             _recordRepairOnly: true,
             _recordRepairEvidencePaths: stage.recordRepairEvidencePaths || [],
-            ...(sourceIdentities !== null ? { _sourceIdentities: sourceIdentities } : {}),
           }
-        : sourceIdentities !== null
-          ? {
-              ...(baseSharedState || {}),
-              _sourceIdentities: sourceIdentities,
-            }
-          : baseSharedState;
+        : baseSharedState;
 
     const summaryMode = this.#stageSummaryMode(stage);
     if (summaryMode) {
@@ -2579,8 +2556,6 @@ export class PipelineStrategy extends Strategy {
         ...(messageContext || {}),
         ...(pcvStageNodeMap !== null ? { pcvStageNodeMap } : {}),
         ...(pcvChainNodes !== null ? { pcvChainNodes } : {}),
-        ...(stageNodeMap !== null ? { stageNodeMap } : {}),
-        ...(sourceIdentities !== null ? { sourceIdentities } : {}),
         pipelinePhase: stage.name,
         previousPhases: phaseResults,
         evidenceStarters: strategyContext.evidenceStarters || null,

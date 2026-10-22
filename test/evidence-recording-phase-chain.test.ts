@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createCanonicalSourceIdentity } from '@alembic/core';
 import Logger from '@alembic/core/logging';
@@ -21,6 +22,7 @@ import {
   createToolPipeline,
   DiagnosticsCollector,
   LoopContext,
+  resolvePcvStageNodeIdentity,
 } from '../src/agent/runtime/index.js';
 import {
   buildPcvNodeEvidenceProcessMetadata,
@@ -43,6 +45,21 @@ import { createTempProject } from './helpers/tempProject.js';
 
 const MISSING_FINDINGS = 'Required note_finding calls are missing';
 const INSUFFICIENT_FINDINGS = 'At least 3 note_finding calls are required';
+
+/**
+ * 宿主真实注入形状：宿主 ProjectScopeAnalysis.buildProjectScopeSourceIdentityMap 的产物
+ * （ProjectScopeSourceIdentityMap v1）。L5-P28 之后 PCV 记录器只认这一形状，旧别名键不再生效。
+ */
+function hostSourceIdentityMap(identities: ReadonlyArray<Record<string, unknown>>) {
+  return {
+    contract: 'ProjectScopeSourceIdentityMap',
+    contractVersion: 1,
+    entries: identities.map((identity) => ({ ...identity })),
+    preferredRef: 'qualifiedPath',
+    rejectPolicy: { missingPath: 'reject' },
+    sourceCount: identities.length,
+  };
+}
 
 it('advertises the live finding reference contract and real snippet coordinates', () => {
   const prompt = buildRecordRepairPrompt({
@@ -458,7 +475,7 @@ describe('evidence recording quality gate actions', () => {
       },
       dimId: 'architecture',
       gate: { action: 'pass', pass: true },
-      sharedState: { _sourceIdentities: sourceIdentities },
+      sharedState: { _projectScopeSourceIdentityMap: hostSourceIdentityMap(sourceIdentities) },
       source: {},
       stageNodeContext: {
         pcvStageNodeMap: {
@@ -1501,8 +1518,9 @@ describe('PCV evidence detail corrections (I28)', () => {
   });
 });
 
-// I27：PCV 来源诊断上限先行。宿主真实形状 projectScopeSourceIdentityMap 的接线依赖待决事项③，
-// 这里仍经已识别的 sourceIdentities 通道注入身份索引，只验证诊断上限、去重计数、原因聚合与进程事件截断。
+// I27：PCV 来源诊断上限。L5-P28 起身份索引只经宿主真实形状 ProjectScopeSourceIdentityMap v1 注入
+// （运行期经 context.projectScopeSourceIdentityMap，质量门经 sharedState._projectScopeSourceIdentityMap），
+// 这里验证诊断上限、去重计数、原因聚合与进程事件截断。
 describe('PCV source ref diagnostics cap (I27)', () => {
   const sourceIdentities = [
     createCanonicalSourceIdentity({
@@ -1521,6 +1539,7 @@ describe('PCV source ref diagnostics cap (I27)', () => {
       sourcePath: 'index.ts',
     }),
   ];
+  const sourceIdentityMap = hostSourceIdentityMap(sourceIdentities);
 
   function createIndexedLoop(diagnostics = new DiagnosticsCollector()) {
     const messages = createMessageAdapter(null);
@@ -1534,7 +1553,11 @@ describe('PCV source ref diagnostics cap (I27)', () => {
       source: 'system',
       budget: { maxIterations: 1 },
       prompt: 'review code',
-      context: { pipelinePhase: 'analyze', dimensionId: 'probe', sourceIdentities },
+      context: {
+        pipelinePhase: 'analyze',
+        dimensionId: 'probe',
+        projectScopeSourceIdentityMap: sourceIdentityMap,
+      },
       diagnostics,
     });
   }
@@ -1664,7 +1687,7 @@ describe('PCV source ref diagnostics cap (I27)', () => {
       },
       dimId: 'probe',
       gate: { pass: true, action: 'pass' },
-      sharedState: { _sourceIdentities: sourceIdentities },
+      sharedState: { _projectScopeSourceIdentityMap: sourceIdentityMap },
     });
     expect(quality.sourceRefDiagnostics).toHaveLength(64);
     expect(quality.missingLinkReasons).toContain('dropped-source-ref-diagnostics:18');
@@ -1688,7 +1711,7 @@ describe('PCV source ref diagnostics cap (I27)', () => {
       artifact: { referencedFiles: ['Alembic/lib/bootstrap.ts'] },
       dimId: 'probe',
       gate: { pass: true, action: 'pass' },
-      sharedState: { _sourceIdentities: sourceIdentities },
+      sharedState: { _projectScopeSourceIdentityMap: sourceIdentityMap },
     });
     expect(quality.sourceRefDiagnostics).toHaveLength(64);
     expect(quality.sourceRefDiagnostics[63]?.input).toBe('external/63.ts');
@@ -1717,7 +1740,7 @@ describe('PCV source ref diagnostics cap (I27)', () => {
         artifact: { referencedFiles: ['Alembic/lib/bootstrap.ts'] },
         dimId: 'probe',
         gate: { pass: true, action: 'pass' },
-        sharedState: { _sourceIdentities: sourceIdentities },
+        sharedState: { _projectScopeSourceIdentityMap: sourceIdentityMap },
       });
     expect(build).not.toThrow();
     const quality = build();
@@ -1725,5 +1748,481 @@ describe('PCV source ref diagnostics cap (I27)', () => {
     expect(quality.sourceRefDiagnostics).toHaveLength(64);
     expect(quality.missingLinkReasons).toContain('dropped-source-ref-diagnostics:7');
     expect(quality.missingLinkReasons.every((reason) => typeof reason === 'string')).toBe(true);
+  });
+});
+
+// L5-P28 第二步：PCV 来源身份只读宿主契约 ProjectScopeSourceIdentityMap v1。
+// 运行期节点读 context.projectScopeSourceIdentityMap 与 sharedState._projectScopeSourceIdentityMap，
+// 质量门读 stageNodeContext（strategyContext）同名键与 sharedState；旧别名键与预建索引不再生效。
+describe('PCV ProjectScopeSourceIdentityMap wiring (L5-P28)', () => {
+  // 绝对路径按运行时临时目录拼出，不在测试里写死本机路径。
+  const scopeRoot = path.join(tmpdir(), 'pcv-project-scope');
+  const identities = [
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'Alembic',
+      folderPath: path.join(scopeRoot, 'Alembic'),
+      projectScopeId: 'workspace',
+      sourcePath: 'lib/bootstrap.ts',
+    }),
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'AlembicCore',
+      folderPath: path.join(scopeRoot, 'AlembicCore'),
+      projectScopeId: 'workspace',
+      sourcePath: 'index.ts',
+    }),
+    createCanonicalSourceIdentity({
+      folderDisplayName: 'AlembicPlugin',
+      folderPath: path.join(scopeRoot, 'AlembicPlugin'),
+      projectScopeId: 'workspace',
+      sourcePath: 'index.ts',
+    }),
+  ];
+  const bootstrapAbsolutePath = path.join(scopeRoot, 'Alembic', 'lib', 'bootstrap.ts');
+  const outsideAbsolutePath = path.join(scopeRoot, 'Elsewhere', 'outside.ts');
+
+  function createScopedLoop({
+    context = {},
+    sharedState = null,
+    diagnostics = new DiagnosticsCollector(),
+  }: {
+    context?: Record<string, unknown>;
+    sharedState?: Record<string, unknown> | null;
+    diagnostics?: DiagnosticsCollector;
+  } = {}) {
+    const messages = createMessageAdapter(null);
+    messages.appendUserMessage('review code');
+    return new LoopContext({
+      messages,
+      capabilities: [],
+      baseSystemPrompt: 'review',
+      allowedToolIds: ['code'],
+      toolSchemas: [],
+      source: 'system',
+      budget: { maxIterations: 1 },
+      prompt: 'review code',
+      context: { pipelinePhase: 'analyze', dimensionId: 'probe', ...context },
+      sharedState,
+      diagnostics,
+    });
+  }
+
+  function recordRead(ctx: LoopContext, readPath: string, content: string) {
+    recordPcvToolResult(
+      ctx.pcvNodeEvidence,
+      {
+        id: `read-${readPath}`,
+        name: 'code',
+        args: { action: 'read', params: { path: readPath } },
+      },
+      { content },
+      undefined,
+      { toolSucceeded: true }
+    );
+  }
+
+  const noisyContent =
+    'Alembic/lib/bootstrap.ts:12 wires the runtime on Node.js; the Vue.js shell and index.ts:4 are noise.';
+
+  function expectHostNormalization(summary: {
+    missingLinkReasons: string[];
+    sourceRefDiagnostics: Array<{ input: string; reason: string; status: string }>;
+    sourceRefs: string[];
+  }) {
+    expect([...summary.sourceRefs].sort()).toEqual([
+      'Alembic/lib/bootstrap.ts',
+      'Alembic/lib/bootstrap.ts:12',
+    ]);
+    expect(summary.sourceRefDiagnostics).toEqual(
+      expect.arrayContaining([
+        { input: 'Node.js', reason: 'not-found', status: 'missing' },
+        { input: 'Vue.js', reason: 'not-found', status: 'missing' },
+        { input: 'index.ts:4', reason: 'ambiguous-basename', status: 'ambiguous' },
+      ])
+    );
+    expect(summary.missingLinkReasons).toEqual(
+      expect.arrayContaining(['unresolved-source-refs', 'ambiguous-source-refs'])
+    );
+    expect(summary.missingLinkReasons).not.toContain('missing-source-refs');
+  }
+
+  function pcvWarnings(diagnostics: DiagnosticsCollector, code: string) {
+    return diagnostics.toJSON().warnings.filter((warning) => warning.code === code);
+  }
+
+  function pcvLoggerCalls(warn: { mock: { calls: unknown[][] } }, code: string): string[] {
+    return warn.mock.calls
+      .map((args) => args[0])
+      .filter(
+        (message): message is string =>
+          typeof message === 'string' && message.startsWith(`[PcvNodeEvidence] ${code}`)
+      );
+  }
+
+  it('moves Node.js-style false positives out of sourceRefs when the map arrives on context', () => {
+    const ctx = createScopedLoop({
+      context: { projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    expectHostNormalization(buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence));
+  });
+
+  it('reads the host sharedState channel _projectScopeSourceIdentityMap', () => {
+    const ctx = createScopedLoop({
+      sharedState: { _projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    expectHostNormalization(buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence));
+  });
+
+  it('reports missing-source-refs when every reference is unresolved', () => {
+    const ctx = createScopedLoop({
+      context: { projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    recordRead(ctx, 'vendor/missing/runtime.ts', 'Runs on Node.js with a Vue.js shell.');
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).toEqual([]);
+    expect(summary.missingLinkReasons).toEqual(
+      expect.arrayContaining(['missing-source-refs', 'unresolved-source-refs'])
+    );
+    expect(summary.sourceRefDiagnostics).toEqual(
+      expect.arrayContaining([
+        { input: 'vendor/missing/runtime.ts', reason: 'not-found', status: 'missing' },
+        { input: 'Node.js', reason: 'not-found', status: 'missing' },
+      ])
+    );
+  });
+
+  it('maps absolute paths to their qualified path and never keeps them verbatim', () => {
+    const ctx = createScopedLoop({
+      context: { projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    recordRead(
+      ctx,
+      bootstrapAbsolutePath,
+      `${bootstrapAbsolutePath}:30 calls into ${outsideAbsolutePath}:2`
+    );
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect([...summary.sourceRefs].sort()).toEqual([
+      'Alembic/lib/bootstrap.ts',
+      'Alembic/lib/bootstrap.ts:30',
+    ]);
+    expect(summary.sourceRefs.some((ref) => ref.startsWith(scopeRoot))).toBe(false);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: `${outsideAbsolutePath}:2`, reason: 'not-found', status: 'missing' },
+    ]);
+  });
+
+  it('does not fall back to folder-relative paths (no Core single-folder relative resolution)', () => {
+    const ctx = createScopedLoop({
+      context: { projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    recordRead(ctx, 'lib/bootstrap.ts', 'bootstrap.ts:3 is the unique basename');
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    // 带目录的相对路径不在 qualified 索引里，按宿主准入规则记 missing；唯一 basename 匹配保留。
+    expect(summary.sourceRefs).toEqual(['Alembic/lib/bootstrap.ts:3']);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: 'lib/bootstrap.ts', reason: 'not-found', status: 'missing' },
+    ]);
+  });
+
+  it('normalizes quality gate refs through both strategyContext and sharedState injection', () => {
+    const artifact = {
+      findings: [
+        {
+          evidence: 'Alembic/lib/bootstrap.ts:12 is verified; Node.js and index.ts:4 are noise.',
+          finding: 'Bootstrap source identity verified',
+          importance: 8,
+        },
+      ],
+      metadata: { memoryFindingCount: 1 },
+      referencedFiles: ['Alembic/lib/bootstrap.ts', bootstrapAbsolutePath, 'Vue.js', 'index.ts'],
+    };
+    const viaStrategyContext = buildPcvQualityGateEvidence({
+      artifact,
+      dimId: 'architecture',
+      gate: { action: 'pass', pass: true },
+      source: {},
+      stageNodeContext: { projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+    });
+    const viaSharedState = buildPcvQualityGateEvidence({
+      artifact,
+      dimId: 'architecture',
+      gate: { action: 'pass', pass: true },
+      sharedState: { _projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+      source: {},
+    });
+    for (const evidence of [viaStrategyContext, viaSharedState]) {
+      expect([...evidence.sourceRefs].sort()).toEqual([
+        'Alembic/lib/bootstrap.ts',
+        'Alembic/lib/bootstrap.ts:12',
+      ]);
+      expect(evidence.findingRefs.accepted[0]?.sourceRefs).toEqual(['Alembic/lib/bootstrap.ts:12']);
+      expect(evidence.sourceRefDiagnostics).toEqual(
+        expect.arrayContaining([
+          { input: 'Node.js', reason: 'not-found', status: 'missing' },
+          { input: 'Vue.js', reason: 'not-found', status: 'missing' },
+          { input: 'index.ts', reason: 'ambiguous-basename', status: 'ambiguous' },
+        ])
+      );
+      expect(evidence.missingLinkReasons).toEqual(
+        expect.arrayContaining(['unresolved-source-refs', 'ambiguous-source-refs'])
+      );
+      expect(evidence.missingLinkReasons).not.toContain('missing-source-refs');
+    }
+
+    const allUnresolved = buildPcvQualityGateEvidence({
+      artifact: { referencedFiles: ['Node.js', 'vendor/missing/a.ts'] },
+      dimId: 'architecture',
+      gate: { action: 'pass', pass: true },
+      sharedState: { _projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+      source: {},
+    });
+    expect(allUnresolved.sourceRefs).toEqual([]);
+    expect(allUnresolved.missingLinkReasons).toEqual(
+      expect.arrayContaining(['missing-source-refs', 'unresolved-source-refs'])
+    );
+  });
+
+  it.each([
+    ['an unsupported contractVersion', { contractVersion: 2 }],
+    ['a different contract name', { contract: 'ProjectScopeSourceIdentityList' }],
+    ['non-array entries', { entries: { 'Alembic/lib/bootstrap.ts': true } }],
+  ])('builds no index and warns exactly once for %s', (_label, override) => {
+    const rejected = { ...hostSourceIdentityMap(identities), ...override };
+    const diagnostics = new DiagnosticsCollector();
+    // 宿主把同一个对象同时写进 context 与 sharedState；拒绝诊断按一次解析只报一条。
+    const ctx = createScopedLoop({
+      context: { projectScopeSourceIdentityMap: rejected },
+      sharedState: { _projectScopeSourceIdentityMap: rejected },
+      diagnostics,
+    });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    // 未建索引：引用按原样保留（与没有 ProjectScope 的运行一致），不产生来源诊断。
+    expect(summary.sourceRefs).toEqual(expect.arrayContaining(['Node.js', 'index.ts:4']));
+    expect(summary.sourceRefDiagnostics).toEqual([]);
+    const warnings = pcvWarnings(diagnostics, 'pcv_source_identity_map_rejected');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain('ProjectScopeSourceIdentityMap');
+
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const gate = buildPcvQualityGateEvidence({
+        artifact: { referencedFiles: ['Node.js', 'Alembic/lib/bootstrap.ts'] },
+        dimId: 'architecture',
+        gate: { action: 'pass', pass: true },
+        sharedState: { _projectScopeSourceIdentityMap: rejected },
+        source: {},
+        stageNodeContext: { projectScopeSourceIdentityMap: rejected },
+      });
+      expect(gate.sourceRefs).toEqual(expect.arrayContaining(['Node.js']));
+      expect(pcvLoggerCalls(warn, 'pcv_source_identity_map_rejected')).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('ignores the retired alias keys and pre-built index candidates', () => {
+    const aliasPayload = {
+      _sourceIdentities: identities,
+      canonicalSourceIdentities: identities,
+      projectIntelligence: { sourceIdentities: identities },
+      projectScope: { sourceIdentities: identities },
+      projectScopeAnalysis: { sourceIdentities: identities },
+      projectScopeSourceIdentities: identities,
+      projectScopeSourceRefIndex: {
+        ambiguousBasenames: new Set<string>(),
+        byBasename: new Map(),
+        byQualifiedPath: new Map(),
+      },
+      sourceIdentities: identities.map((sourceIdentity) => ({ sourceIdentity })),
+      sourceRefIdentities: identities,
+      sourceRefIndex: {
+        ambiguousBasenames: new Set<string>(),
+        byBasename: new Map(),
+        byQualifiedPath: new Map(),
+      },
+    };
+    const diagnostics = new DiagnosticsCollector();
+    const ctx = createScopedLoop({ context: aliasPayload, sharedState: aliasPayload, diagnostics });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).toEqual(expect.arrayContaining(['Node.js', 'Vue.js', 'index.ts:4']));
+    expect(summary.sourceRefDiagnostics).toEqual([]);
+    expect(diagnostics.toJSON().warnings).toEqual([]);
+
+    const gate = buildPcvQualityGateEvidence({
+      artifact: { ...aliasPayload, referencedFiles: ['Node.js', 'Alembic/lib/bootstrap.ts'] },
+      dimId: 'architecture',
+      gate: { action: 'pass', pass: true },
+      sharedState: aliasPayload,
+      source: aliasPayload,
+      stageNodeContext: aliasPayload,
+    });
+    expect(gate.sourceRefs).toEqual(expect.arrayContaining(['Node.js']));
+    expect(gate.sourceRefDiagnostics).toEqual([]);
+  });
+
+  it('falls through to the sharedState map when the context map is rejected and warns once', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const ctx = createScopedLoop({
+      context: {
+        projectScopeSourceIdentityMap: { ...hostSourceIdentityMap(identities), contractVersion: 2 },
+      },
+      sharedState: { _projectScopeSourceIdentityMap: hostSourceIdentityMap(identities) },
+      diagnostics,
+    });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    expectHostNormalization(buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence));
+    const warnings = pcvWarnings(diagnostics, 'pcv_source_identity_map_rejected');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain(
+      'context.projectScopeSourceIdentityMap: contractVersion=2'
+    );
+    expect(warnings[0]?.message).toContain(
+      'indexed from sharedState._projectScopeSourceIdentityMap'
+    );
+  });
+
+  it('skips malformed entries, keeps the rest of the index and warns once', () => {
+    const diagnostics = new DiagnosticsCollector();
+    const map = hostSourceIdentityMap(identities);
+    const ctx = createScopedLoop({
+      context: {
+        projectScopeSourceIdentityMap: {
+          ...map,
+          entries: [...map.entries, null, { qualifiedPath: 42 }, 'Alembic/lib/other.ts'],
+        },
+      },
+      diagnostics,
+    });
+    recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+    expectHostNormalization(buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence));
+    const warnings = pcvWarnings(diagnostics, 'pcv_source_identity_map_entries_skipped');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toContain('skipped 3 entries');
+    expect(pcvWarnings(diagnostics, 'pcv_source_identity_map_rejected')).toEqual([]);
+  });
+
+  it('records an absolute path registered under two qualified paths as ambiguous', () => {
+    const sharedAbsolutePath = path.join(scopeRoot, 'Alembic', 'packages', 'shared', 'index.ts');
+    const ctx = createScopedLoop({
+      context: {
+        projectScopeSourceIdentityMap: hostSourceIdentityMap([
+          { absolutePath: sharedAbsolutePath, qualifiedPath: 'Alembic/packages/shared/index.ts' },
+          { absolutePath: sharedAbsolutePath, qualifiedPath: 'Shared/index.ts' },
+          ...identities,
+        ]),
+      },
+    });
+    recordRead(ctx, sharedAbsolutePath, 'export {};');
+    const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+    expect(summary.sourceRefs).toEqual([]);
+    expect(summary.sourceRefDiagnostics).toEqual([
+      { input: sharedAbsolutePath, reason: 'ambiguous-absolute-path', status: 'ambiguous' },
+    ]);
+    expect(summary.missingLinkReasons).toEqual(
+      expect.arrayContaining(['ambiguous-source-refs', 'missing-source-refs'])
+    );
+  });
+
+  it('indexes one host map object once across node evidences (WeakMap cache)', () => {
+    const debug = vi
+      .spyOn(Logger.getInstance(), 'debug')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const map = hostSourceIdentityMap(identities);
+      for (let run = 0; run < 3; run++) {
+        const ctx = createScopedLoop({
+          context: { projectScopeSourceIdentityMap: map },
+          sharedState: { _projectScopeSourceIdentityMap: map },
+        });
+        recordRead(ctx, 'Alembic/lib/bootstrap.ts', noisyContent);
+        expectHostNormalization(buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence));
+      }
+      buildPcvQualityGateEvidence({
+        artifact: { referencedFiles: ['Alembic/lib/bootstrap.ts'] },
+        dimId: 'architecture',
+        gate: { action: 'pass', pass: true },
+        sharedState: { _projectScopeSourceIdentityMap: map },
+        source: {},
+        stageNodeContext: { projectScopeSourceIdentityMap: map },
+      });
+      const indexedLogs = debug.mock.calls
+        .map((args) => args[0])
+        .filter(
+          (message) =>
+            typeof message === 'string' &&
+            message.startsWith('[PcvNodeEvidence] indexed ProjectScopeSourceIdentityMap')
+        );
+      expect(indexedLogs).toHaveLength(1);
+      expect(indexedLogs[0]).toContain('3 qualified paths');
+      expect(indexedLogs[0]).toContain('3 absolute paths');
+      expect(indexedLogs[0]).toContain('1 ambiguous basenames');
+    } finally {
+      debug.mockRestore();
+    }
+  });
+
+  it('no longer resolves stage node identity from the retired stageNodeMap alias', () => {
+    const stageNodeMap = {
+      analyze: { chainNodeId: 'pcvm:chain:analyze', pcvNodeId: 'pcvm:analyze' },
+    };
+    expect(
+      resolvePcvStageNodeIdentity({ context: { stageNodeMap }, pipelinePhase: 'analyze' })
+    ).toBeNull();
+    expect(
+      resolvePcvStageNodeIdentity({
+        context: { pcvStageNodeMap: stageNodeMap },
+        pipelinePhase: 'analyze',
+      })
+    ).toEqual({ chainNodeId: 'pcvm:chain:analyze', nodeId: 'pcvm:analyze' });
+    expect(
+      resolvePcvStageNodeIdentity({
+        sharedState: { _pcvChainNodes: stageNodeMap },
+        pipelinePhase: 'analyze',
+      })
+    ).toEqual({ chainNodeId: 'pcvm:chain:analyze', nodeId: 'pcvm:analyze' });
+  });
+
+  it('PipelineStrategy no longer projects the retired identity and stage-map aliases', async () => {
+    const sharedState: Record<string, unknown> = {
+      _dimensionScopeId: 'dim-agent',
+      sourceIdentities: identities,
+      projectScopeSourceIdentities: identities,
+      stageNodeMap: { analyze: 'pcvm:analyze' },
+    };
+    const strategyContext: Record<string, unknown> = {
+      source: 'system',
+      diagnostics: new DiagnosticsCollector(),
+      sharedState,
+      sourceIdentities: identities,
+      projectScopeSourceIdentities: identities,
+      stageNodeMap: { analyze: 'pcvm:analyze' },
+    };
+    const seen: Array<{ context: Record<string, unknown>; sharedState: unknown }> = [];
+    const runtime = {
+      id: 'alias-projection-runtime',
+      logger: { info: () => undefined },
+      reactLoop: vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+        seen.push({
+          context: opts.context as Record<string, unknown>,
+          sharedState: opts.sharedState,
+        });
+        return { reply: 'done', toolCalls: [], tokenUsage: { input: 1, output: 1 }, iterations: 1 };
+      }),
+    };
+    const strategy = new PipelineStrategy({ stages: [{ name: 'analyze', capabilities: [] }] });
+    await strategy.execute(runtime, AgentMessage.internal('analyze'), { strategyContext });
+
+    expect(seen).toHaveLength(1);
+    const [stage] = seen;
+    expect(stage?.context).not.toHaveProperty('sourceIdentities');
+    expect(stage?.context).not.toHaveProperty('stageNodeMap');
+    // 普通阶段原样传递宿主 sharedState，不再浅拷贝出 _sourceIdentities。
+    expect(stage?.sharedState).toBe(sharedState);
+    expect(stage?.sharedState).not.toHaveProperty('_sourceIdentities');
   });
 });

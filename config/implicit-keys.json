@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "description": "下划线隐式键登记表。sharedState / strategyContext / phaseResults 是多个模块和宿主共同读写的无类型容器，这些键没有编译期约束；本表给每个键一个归属：位于哪个容器、由谁写入、用途是什么。scripts/lint-implicit-keys.mjs 逐次校验：src/ 中出现的下划线键必须登记，登记的键必须仍在使用，writers 含 agent 当且仅当 src/ 中存在写入点，无人写入的通道必须用 unwiredReason 说明保留原因。宿主侧写入无法在本仓校验，按 hostScanDate 当日对宿主源码的只读扫描登记。",
-  "hostScanDate": "2026-10-01",
+  "hostScanDate": "2026-10-22",
   "containers": {
     "sharedState": "一次运行/一个维度内跨阶段共享的可变状态（宿主创建，经 SystemRunContext 或 strategyContext.sharedState 传入）",
     "strategyContext": "宿主注入给 Strategy 的运行上下文（AgentRunInput.context.strategyContext）",
@@ -91,6 +91,11 @@
       "purpose": "重复调用缓存的项目快照标识（别名）。",
       "unwiredReason": "重复调用缓存没有快照提供方，缓存因此从不生效。它唯一有意义的适用范围是图谱查询，去留随图谱接线与公开面收窄一并决定。"
     },
+    "_projectScopeSourceIdentityMap": {
+      "container": "sharedState",
+      "writers": ["host"],
+      "purpose": "宿主来源身份契约 ProjectScopeSourceIdentityMap v1（{contract, contractVersion, entries}）。宿主 AgentRunInputBuilders / DimensionRuntimeBuilder 写入 sharedState，同一对象也写在 message.metadata.context 与 strategyContext 的 projectScopeSourceIdentityMap；PipelineStrategy 原样传递 sharedState，不转发；PCV 记录器（运行期节点与质量门）读取，校验 contract 与 contractVersion===1 后按 qualifiedPath、absolutePath 与唯一 basename 规范化 sourceRefs（L5-P28）。"
+    },
     "_projectSnapshotId": {
       "container": "sharedState",
       "writers": [],
@@ -121,11 +126,6 @@
       "container": "sharedState",
       "writers": ["agent"],
       "purpose": "会话计数盒（修复层命中、waiver、拒绝止损）。PipelineStrategy 预建；knowledge 处理器写入计数，管线收尾投影读取。"
-    },
-    "_sourceIdentities": {
-      "container": "sharedState",
-      "writers": ["agent"],
-      "purpose": "规范来源身份。PipelineStrategy 从多个别名解析后写入阶段 sharedState；PCV 记录器读取。上游未接线（I27，待决事项③）：PipelineStrategy 读取的 7 个别名在宿主侧没有写入方，唯一宿主只注入 projectScopeSourceIdentityMap / _projectScopeSourceIdentityMap（{contract, contractVersion, entries}），本仓不识别，所以生产中本通道从不被写入值，PCV 来源规范化不生效，只有测试经别名注入。保留到事项③决定：接线宿主真实形状并删除其余别名，或确定由宿主事后归一化并删除 Agent 侧索引与别名。本通道有 agent 写入点，lint 不允许在有写入方的通道上登记 unwiredReason，因此上游未接线的原因记在这里。"
     },
     "_strictAnalysisLoopReceipt": {
       "container": "phaseResults",
