@@ -9,6 +9,7 @@ import {
   EVOLVER_SYSTEM_PROMPT,
   type EvolutionContext,
 } from '../../prompts/insightEvolver.js';
+import type { ForcedSummaryMode } from '../../runtime/forcedSummary.js';
 import type { PolicyFactoryConfig } from './types.js';
 
 function buildEvolutionRetryPrompt(
@@ -64,6 +65,10 @@ export const EVOLUTION_PRESET = {
       {
         name: 'evolve',
         capabilities: ['evolution_analysis'],
+        // L5-P26（W1-03）：evolution-audit 主路径没有 tracker，原推断（含 decisionOnlyOnRetry 补写轮）为
+        // dimension-digest；补写轮是最后一个主阶段，必须产出非空 reply，不能声明 none。
+        // generateDimensionPipeline 复用本阶段时在副本上改为 analyst-report（那条路径有宿主 analyst tracker）。
+        summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
         budget: {
           ...EVOLVER_BUDGET,
           temperature: 0.3,

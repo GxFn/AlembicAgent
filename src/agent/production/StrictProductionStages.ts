@@ -1,5 +1,6 @@
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
+import type { ForcedSummaryMode } from '../runtime/forcedSummary.js';
 import {
   createStrictAnalysisEpochSnapshotV1,
   type StrictAnalysisEpochSnapshotV1,
@@ -51,6 +52,8 @@ export function buildStrictProductionPipelineStagesV1() {
       capabilities: [],
       additionalTools: [],
       disableTracker: true,
+      // L5-P26（W1-03）：严格阶段没有 tracker，原推断为 dimension-digest（与 Runtime 无 tracker 分支一致）。
+      summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
       toolChoiceOverride: 'none',
       // 提示只由端口快照与 StrictProductionPrompts 的内部输出契约渲染，宿主 run message 不转发
       // （ctx.message 有意不读），所以模型可见的输出形状必须在契约常量中完整给出。审查回执
@@ -88,6 +91,7 @@ export function buildStrictProductionPipelineStagesV1() {
       capabilities: [],
       additionalTools: [],
       disableTracker: true,
+      summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
       toolChoiceOverride: 'none',
       // 同上：Producer 只输出 expressionSets 提案；零处置的 producer-non-draft 回执由宿主封印，
       // 不由模型携带。

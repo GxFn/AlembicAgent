@@ -10,12 +10,13 @@ import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcome
  *   - producer-summary: Markdown 候选生产总结 (与 NudgeGenerator 的 producer 收尾 nudge 同一契约)
  *   - dimension-digest: dimensionDigest JSON (供维度编排消费)
  *   - user:             人类可读的 Markdown 结构化总结 (前端 AI Chat 展示)
- *   - none:             不产出摘要，返回空 reply (无 tracker 的系统微阶段)
+ *   - none:             不产出摘要，返回空 reply (summary_rewrite / record_repair 修复微阶段声明)
  *
- * 过渡期边界：summaryMode 是可选的调用方显式声明（AgentRuntime.#finalize 按 tracker.pipelineType
- * 与阶段标记选择后传入）；不传时保持旧推断（source + tracker.pipelineType，system 无 tracker 默认
- * dimension-digest，producer 也落在 digest），保证直接调用方行为不变。待阶段策略对象（待决事项④）
- * 落地后由它提供 summaryMode，届时再删除推断。
+ * 契约来源（L5-P26 W1-03，事项④已答复）：summaryMode 是必填的调用方声明。AgentRuntime.#finalize
+ * 按阶段声明（PipelineStage.summaryMode，经 runLoop context 转发）或其保留的无阶段/无 tracker 分支
+ * 选定后传入；本模块不再按 source + tracker.pipelineType 推断。缺失或非法时显式抛错且不调用模型——
+ * 静默选中某个契约会让宿主拿到错误形状的摘要（例如 producer 得到 digest JSON）。
+ * source 只用于日志与默认温度，tracker 只用于日志与轮数。
  *
  * @module forcedSummary
  */
@@ -56,12 +57,6 @@ interface ToolCallRecord {
   name?: string;
 }
 
-/** Token usage accumulator */
-interface TokenUsage {
-  input: number;
-  output: number;
-}
-
 /**
  * 强制摘要输出契约。仅供 agent 内部模块共享（runtime 公开子路径只再导出 produceForcedSummary），
  * 不是公开类型绑定。
@@ -86,32 +81,25 @@ export function isForcedSummaryMode(value: unknown): value is ForcedSummaryMode 
   return typeof value === 'string' && FORCED_SUMMARY_MODES.has(value);
 }
 
-/** Options for {@link produceForcedSummary} */
+/**
+ * Options for {@link produceForcedSummary}。
+ * 摘要只读有界工具回执视图、不重放累积上下文；本次用量经返回值 tokenUsage 交给调用方统一累计，
+ * 因此不接收上下文窗口或调用方累加器（I49 的 contextWindow / tokenUsage 兼容输入已随②删除）。
+ */
 interface ForcedSummaryOpts {
   abortSignal?: AbortSignal;
   aiProvider: AiProvider;
+  /** 运行来源（'system' | 'user' 等）：只进日志并决定未显式给出 temperature 时的默认温度，不参与契约选择。 */
   source?: string;
   toolCalls?: ToolCallRecord[];
+  /** 只读 iteration（提示里的轮数）与 pipelineType（日志），不参与契约选择。 */
   tracker?: { iteration?: number; pipelineType?: string };
-  /**
-   * @deprecated 兼容输入，函数不读取：摘要只用有界工具回执视图，不重放累积上下文。
-   * AgentRuntime 已停止传入（I49）；随待决事项②“公开面收窄”删除。
-   */
-  contextWindow?: unknown;
   prompt: string;
-  /**
-   * @deprecated 兼容输入，函数不读取也不改写：本次摘要用量经返回值 tokenUsage 交给调用方统一累计。
-   * AgentRuntime 已停止传入（I49）；随待决事项②“公开面收窄”删除。
-   */
-  tokenUsage?: TokenUsage;
   systemPrompt?: string;
   maxTokens?: number;
   temperature?: number;
-  /**
-   * 调用方显式指定的摘要契约（可选，向后兼容的类型扩展）。不传或取值非法时按
-   * source + tracker.pipelineType 旧规则推断。
-   */
-  summaryMode?: ForcedSummaryMode;
+  /** 必填的摘要契约；缺失或不是 ForcedSummaryMode 时抛 FORCED_SUMMARY_MODE_INVALID，且不调用模型。 */
+  summaryMode: ForcedSummaryMode;
 }
 
 /** 兜底原因：模型调用抛错，或模型返回空文本（含清理后为空）。 */
@@ -133,43 +121,33 @@ export function describeDeclaredMode(value: unknown): string {
 }
 
 /**
- * 解析本次摘要契约。显式声明优先；否则按旧规则推断（system+analyst → analyst-report，
- * 其余 system → dimension-digest，非 system → user），推断规则保持不变以兼容直接调用方。
+ * 校验调用方声明的摘要契约（L5-P26 W2a）。不再有 source + tracker 推断兜底：缺失或非法即错误归类为
+ * FORCED_SUMMARY_MODE_INVALID，记 error 日志后抛出，调用方在模型请求之前就能定位漏传的声明。
  */
-function resolveSummaryMode(
+function requireSummaryMode(
   summaryMode: unknown,
-  isSystem: boolean,
+  source: string | undefined,
   pipelineType: string
-): { mode: ForcedSummaryMode; origin: 'explicit' | 'inferred' } {
-  if (summaryMode !== undefined) {
-    if (isForcedSummaryMode(summaryMode)) {
-      return { mode: summaryMode, origin: 'explicit' };
-    }
-    // 降级：非法声明不能静默选中某个契约，记录后回到旧推断。
-    logger().warn(
-      `[ForcedSummary] ignoring invalid summaryMode=${describeDeclaredMode(summaryMode)} — falling back to inferred mode (source system=${isSystem}, pipeline=${pipelineType})`
-    );
+): ForcedSummaryMode {
+  if (isForcedSummaryMode(summaryMode)) {
+    return summaryMode;
   }
-  if (isSystem && pipelineType === 'analyst') {
-    return { mode: 'analyst-report', origin: 'inferred' };
-  }
-  if (isSystem) {
-    return { mode: 'dimension-digest', origin: 'inferred' };
-  }
-  return { mode: 'user', origin: 'inferred' };
+  const detail =
+    summaryMode === undefined ? 'missing' : `invalid=${describeDeclaredMode(summaryMode)}`;
+  const message = `FORCED_SUMMARY_MODE_INVALID: summaryMode ${detail} (source=${source ?? 'unset'}, pipeline=${pipelineType}); no model request was made`;
+  logger().error(`[ForcedSummary] ${message}`);
+  throw new Error(message);
 }
 
 /**
  * 生成强制摘要
  *
  * @param opts.aiProvider LLM 提供商
- * @param [opts.source] 'user' | 'system'
+ * @param [opts.source] 'user' | 'system'：只进日志并决定默认温度
  * @param opts.toolCalls 工具调用记录
- * @param [opts.tracker] ExplorationTracker 实例
- * @param [opts.contextWindow] 已废弃的兼容输入，不读取；摘要使用独立的有界观察视图
+ * @param [opts.tracker] ExplorationTracker 实例：只读轮数与 pipelineType（日志）
  * @param opts.prompt 原始用户 prompt
- * @param [opts.tokenUsage] 已废弃的兼容输入，不读取也不改写；用量经返回值交给调用方统一累计
- * @param [opts.summaryMode] 显式摘要契约；不传时按 source + tracker.pipelineType 推断
+ * @param opts.summaryMode 必填摘要契约；缺失或非法时抛 FORCED_SUMMARY_MODE_INVALID 且不调用模型
  * @returns `{ reply, tokenUsage, degraded }`：reply 为摘要正文（none 模式为空串，取消时为停止文案），
  *   tokenUsage 为本次摘要调用的用量（input/output/reasoning/cacheHit），degraded 表示模型失败或
  *   返回空文本后改用了按模式选择形状的兜底文本
@@ -195,14 +173,16 @@ export async function produceForcedSummary({
   });
   const isSystem = source === 'system';
   const iterations = tracker?.iteration || 0;
-  const pipelineType = tracker?.pipelineType || (isSystem ? 'bootstrap' : 'user');
-  const { mode, origin } = resolveSummaryMode(requestedMode, isSystem, pipelineType);
+  // 仅用于日志：tracker 缺失时标 'none'，不再按 source 猜 bootstrap/user。
+  const pipelineType = tracker?.pipelineType || 'none';
+  // 先校验声明再看取消：漏传 summaryMode 是调用方错误，不能被“已取消”的停止回执掩盖。
+  const mode = requireSummaryMode(requestedMode, source, pipelineType);
   const resultTokenUsage = { input: 0, output: 0, reasoning: 0, cacheHit: 0 };
 
   // none：调用方声明本阶段不产出摘要（系统微阶段），不发模型请求、不合成兜底文本。
   if (mode === 'none') {
     logger().info(
-      `[ForcedSummary] skipped — summaryMode=none (${origin}), no model request, empty reply (source=${source}, ${toolCalls.length} calls)`
+      `[ForcedSummary] skipped — summaryMode=none, no model request, empty reply (source=${source}, ${toolCalls.length} calls)`
     );
     return { reply: '', tokenUsage: resultTokenUsage, degraded: false };
   }
@@ -219,7 +199,7 @@ export async function produceForcedSummary({
   let degraded = false;
 
   logger().info(
-    `[ForcedSummary] ⚠ producing forced summary (${iterations} iters, ${toolCalls.length} calls, source=${source}, pipeline=${pipelineType}, mode=${mode}/${origin})`
+    `[ForcedSummary] ⚠ producing forced summary (${iterations} iters, ${toolCalls.length} calls, source=${source}, pipeline=${pipelineType}, mode=${mode})`
   );
 
   const candidateCount = toolCalls.filter(isPersistedSubmission).length;
@@ -244,7 +224,7 @@ export async function produceForcedSummary({
     let systemPrompt: string;
 
     if (mode === 'analyst-report') {
-      // Analyst 管线 (source=system): Markdown 分析报告 — 与 NudgeGenerator.buildTransitionNudge 对齐
+      // analyst-report（analyze 阶段声明）: Markdown 分析报告 — 与 NudgeGenerator.buildTransitionNudge 对齐
       summaryPrompt = `你刚才通过 ${toolCalls.length} 次工具调用分析了项目代码。
 
 ${receiptBlock}
@@ -271,7 +251,7 @@ ${receiptBlock}`;
       systemPrompt =
         '你是候选生产总结助手。请用纯 Markdown 格式输出候选生产总结，不要输出 dimensionDigest 或其他 JSON 格式，不要调用工具。';
     } else if (mode === 'dimension-digest') {
-      // Bootstrap 管线 (source=system): dimensionDigest JSON
+      // dimension-digest（scan/relations/严格链/evolution-audit 声明，或系统源无 tracker 默认）: dimensionDigest JSON
       summaryPrompt = `你已完成 ${iterations} 轮工具调用（共 ${toolCalls.length} 次），提交了 ${candidateCount} 个候选。
 ${submitSummary ? `已提交候选:\n${submitSummary}\n` : ''}
 **必须**输出 dimensionDigest JSON（用 \`\`\`json 包裹）：
@@ -294,7 +274,7 @@ ${submitSummary ? `已提交候选:\n${submitSummary}\n` : ''}
 ${receiptBlock}`;
       systemPrompt = '直接输出 dimensionDigest JSON 总结，不要调用工具。';
     } else {
-      // user 源: Markdown 结构化总结
+      // user（非系统源对话）: Markdown 结构化总结
       const userQuestion = prompt ? `用户的原始问题：「${prompt.slice(0, 500)}」\n\n` : '';
       summaryPrompt = `${userQuestion}你刚才通过 ${toolCalls.length} 次工具调用分析了项目代码。
 
@@ -321,6 +301,7 @@ ${receiptBlock}
       messages: [],
       toolChoice: 'none',
       systemPrompt,
+      // 未显式给温度时沿用既有按来源的默认值（系统 0.3、对话 0.5）；这是采样参数，不参与契约选择。
       temperature: temperature ?? (isSystem ? 0.3 : 0.5),
       maxTokens,
     });
@@ -453,9 +434,3 @@ function buildToolContextForUserSummary(toolCalls: ToolCallRecord[]) {
   }
   return sections.join('\n\n') || '（工具调用记录为空）';
 }
-
-/**
- * @deprecated 默认导出没有消费者（runtime 公开子路径与仓库内都只用命名导出 produceForcedSummary）；
- * 请改用命名导入。随待决事项②“公开面收窄”删除。
- */
-export default produceForcedSummary;

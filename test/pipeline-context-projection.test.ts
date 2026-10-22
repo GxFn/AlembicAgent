@@ -215,3 +215,35 @@ describe('AgentService pipeline context projection', () => {
     }
   });
 });
+
+/**
+ * L5-P48（W1-03）：删除 BuildSystemRunContextOptions.allowDistinctActiveContext。trace 只是 activeContext
+ * 的别名，两者指向不同对象一律在构造时抛错；旧 JS 调用方仍传该选项也不能放行。
+ */
+describe('createSystemRunContext trace/activeContext identity', () => {
+  it('throws when trace and activeContext differ, even if the removed opt-out is still passed', () => {
+    const memoryCoordinator = new MemoryCoordinator({ mode: 'bootstrap' });
+    const activeContext = memoryCoordinator.createDimensionScope('fixture:a');
+    const otherScope = memoryCoordinator.createDimensionScope('fixture:b');
+    const base = { memoryCoordinator, scopeId: 'fixture:a', activeContext, trace: otherScope };
+    expect(() => createSystemRunContext(base)).toThrow('must refer to the same scope');
+    expect(() =>
+      createSystemRunContext({ ...base, allowDistinctActiveContext: true } as never)
+    ).toThrow('must refer to the same scope');
+  });
+
+  it('keeps trace as an alias of activeContext when it is omitted or identical', () => {
+    const memoryCoordinator = new MemoryCoordinator({ mode: 'bootstrap' });
+    const activeContext = memoryCoordinator.createDimensionScope('fixture:a');
+    for (const trace of [undefined, activeContext]) {
+      const context = createSystemRunContext({
+        memoryCoordinator,
+        scopeId: 'fixture:a',
+        activeContext,
+        ...(trace ? { trace } : {}),
+      });
+      expect(context.trace).toBe(activeContext);
+      expect(context.activeContext).toBe(activeContext);
+    }
+  });
+});

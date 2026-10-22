@@ -23,6 +23,7 @@ import {
 } from '../../prompts/insightProducer.js';
 import { buildProducerRetryPrompt } from '../../prompts/producerRetry.js';
 import type { DiagnosticsCollector } from '../../runtime/DiagnosticsCollector.js';
+import type { ForcedSummaryMode } from '../../runtime/forcedSummary.js';
 import type { PolicyFactoryConfig } from './types.js';
 
 const PRODUCER_TIMEOUT_MS = 900_000;
@@ -88,6 +89,9 @@ export const INSIGHT_PRESET = {
       {
         name: 'analyze',
         capabilities: ['code_analysis'],
+        // L5-P26（W1-03）：强制摘要契约由阶段声明，等于原主路径（宿主 analyst tracker）推断。
+        // 无 tracker 的旁路不转发本声明（PipelineStrategy），保持 dimension-digest 旧值。
+        summaryMode: 'analyst-report' satisfies ForcedSummaryMode,
         budget: {
           maxIterations: ANALYST_BUDGET.maxIterations,
           temperature: 0.4,
@@ -146,6 +150,8 @@ export const INSIGHT_PRESET = {
       {
         name: 'produce',
         capabilities: ['knowledge_production'],
+        // L5-P26（W1-03）：与 NudgeGenerator producer 收尾同一 Markdown 契约，等于原主路径（producer tracker）推断。
+        summaryMode: 'producer-summary' satisfies ForcedSummaryMode,
         // 透传完整 PRODUCER_BUDGET (searchBudget/maxSubmits/softSubmitLimit/idleRoundsToExit)
         // 供 ExplorationTracker 精确控制 PRODUCE→SUMMARIZE 转换时机
         // DeepSeek Pro 在真实项目候选生产阶段可能很慢；候选已提交前不要过早截断。

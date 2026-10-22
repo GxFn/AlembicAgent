@@ -5,7 +5,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { limitToolResult } from '../src/agent/context/ContextWindow.js';
 import { BudgetPolicy, PolicyEngine } from '../src/agent/policies/index.js';
@@ -184,27 +183,14 @@ describe('receipt projection of a guard-rejected envelope', () => {
   });
 });
 
-describe('MessageAdapter.formatToolResult with a guard-rejected envelope', () => {
-  it('formats envelope.text and logs a TOOL_ENVELOPE_SHAPE_REJECTED warning', async () => {
-    const envelope = await negativeDurationEnvelope();
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+// L5-P48（W1-03）：MessageAdapter.formatToolResult / getToolResultQuota 无调用方，随②收窄删除。
+// 守卫失败信封的唯一生效路径是上面的 projectToolReceipt（AgentRuntime 工具结果进入历史前调用），
+// 适配器上不再保留一条不会失效已读视图的平行裁剪实现。
+describe('message adapters no longer carry a parallel receipt formatter', () => {
+  it('has no formatToolResult/getToolResultQuota on the shipped adapters', () => {
     const adapter = new SimpleArrayAdapter();
-    const text = adapter.formatToolResult('knowledge', envelope);
-    expect(text).toBe(limitToolResult('knowledge', envelope.text, adapter.getToolResultQuota()));
-    expect(text).not.toContain('"callId"');
-    const messages = warn.mock.calls.map((call) => String(call[0]));
-    expect(messages.some((message) => message.includes('TOOL_ENVELOPE_SHAPE_REJECTED'))).toBe(true);
-    expect(messages.some((message) => message.includes('knowledge'))).toBe(true);
-  });
-
-  it('leaves ordinary tool results untouched and silent', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const adapter = new SimpleArrayAdapter();
-    const result = { matches: [], total: 0 };
-    expect(adapter.formatToolResult('graph', result)).toBe(
-      limitToolResult('graph', result, adapter.getToolResultQuota())
-    );
-    expect(warn).not.toHaveBeenCalled();
+    expect('formatToolResult' in adapter).toBe(false);
+    expect('getToolResultQuota' in adapter).toBe(false);
   });
 });
 

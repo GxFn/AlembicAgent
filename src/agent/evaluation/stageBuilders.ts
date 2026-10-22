@@ -6,6 +6,7 @@ import { buildAnalyzeRetryPrompt } from '../prompts/insightGate.js';
 import { buildCodeContextSection } from '../prompts/insightProducer.js';
 import { buildProducerFindingsSection } from '../prompts/producerFindings.js';
 import { buildProducerRetryPrompt } from '../prompts/producerRetry.js';
+import type { ForcedSummaryMode } from '../runtime/forcedSummary.js';
 import { insightGateEvaluator, producerRejectionGateEvaluator } from './gateEvaluators.js';
 
 // ── Local Type Definitions ──
@@ -125,6 +126,8 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
   const analyzeStage = {
     name: 'analyze',
     capabilities: analyzeCaps,
+    // L5-P26（W1-03）：ScanAgentRun 以 analyst tracker 运行本阶段，原推断为 analyst-report。
+    summaryMode: 'analyst-report' satisfies ForcedSummaryMode,
     budget: {
       maxIterations: analyzeMaxIter,
       maxTokens: 8192,
@@ -166,6 +169,8 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
     name: 'produce',
     submitToolName: 'knowledge', // 透传给 ExplorationTracker nudge 文本
     pipelineType: 'scan' as const, // 统一场景判别标识
+    // L5-P26（W1-03）：scan tracker 原推断为 dimension-digest；#finalize 对 scan 先行短路，不发摘要请求。
+    summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
     capabilities: produceCaps,
     budget: {
       maxIterations: isSummarize ? 12 : 24,
@@ -453,6 +458,8 @@ export function buildRelationsPipelineStages({
     {
       name: 'explore',
       capabilities: exploreCaps,
+      // L5-P26（W1-03）：RelationAgentRun 不传 tracker，原推断为 dimension-digest（与 Runtime 无 tracker 分支一致）。
+      summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
       budget: {
         maxIterations: exploreMaxIter,
         maxTokens: 8192,
@@ -464,6 +471,7 @@ export function buildRelationsPipelineStages({
     {
       name: 'synthesize',
       capabilities: [],
+      summaryMode: 'dimension-digest' satisfies ForcedSummaryMode,
       budget: {
         maxIterations: 4,
         maxTokens: 8192,

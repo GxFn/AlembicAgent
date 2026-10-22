@@ -14,6 +14,7 @@ import { buildStrictProductionPipelineStagesV1 } from '../production/StrictProdu
 import { resolveEvolutionAuditScaleBudget } from '../profiles/definitions/evolution.profile.js';
 import { cloneRuntimeConfig, PRESETS } from '../profiles/presets/index.js';
 import { SCAN_TASK_CONFIGS } from '../prompts/scanPrompts.js';
+import type { ForcedSummaryMode } from '../runtime/forcedSummary.js';
 
 export type AgentStageFactoryInput = {
   params: Record<string, unknown>;
@@ -271,6 +272,10 @@ export class AgentStageFactoryRegistry {
         return [
           {
             ...presetEvolve,
+            // L5-P26（W1-03）：维度前置进化在宿主 analyst tracker 下运行（首轮取宿主 tracker、补写轮新建
+            // analyst tracker），原推断为 analyst-report；preset 原值 dimension-digest 属于无 tracker 的
+            // evolution-audit 主路径，这里只改本次装配的副本。
+            summaryMode: 'analyst-report' satisfies ForcedSummaryMode,
             additionalTools: getGenerateStageTerminalTools(presetEvolve.name, terminalCapability),
             promptBuilder: (ctx: Record<string, unknown>) =>
               presetEvolve.promptBuilder?.(withTerminalPromptContext(ctx)),

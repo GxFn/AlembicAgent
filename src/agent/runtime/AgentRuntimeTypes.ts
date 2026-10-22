@@ -9,6 +9,7 @@ import type { LlmContinuation } from '#ai/contracts.js';
  */
 
 import type { ToolResultEnvelope, ToolRouterContract } from '#tools/kernel/index.js';
+import type { LLMResultType } from './LLMResultType.js';
 
 /** Tool call entry recorded during execution */
 export interface ToolCallEntry {
@@ -31,7 +32,11 @@ export interface FunctionCall {
 
 /** chatWithTools result from the AI provider */
 export interface LLMResult {
-  type?: string;
+  /**
+   * 控制流标记：只有 CONTINUE（回到循环顶部重试）。provider 结果不带该字段；
+   * 收窄后返回其他取值在编译期报错（L5-P48，原 string 让 `{ type: 'fatal' }` 也能通过）。
+   */
+  type?: typeof LLMResultType.CONTINUE;
   text?: string | null;
   functionCalls?: FunctionCall[] | null;
   usage?: {

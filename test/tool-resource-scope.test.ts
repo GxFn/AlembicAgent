@@ -841,25 +841,45 @@ describe('runtime-owned tool resource lifecycle', () => {
     expect(callsBefore).toHaveLength(2);
   });
 
-  // 守卫 ContextWindowAdapter 的旧 duck-typed 窗口兼容分支（登记见 MessageAdapter.ts 的 #legacyReadView）。
-  // 这是该分支唯一的入口；待决事项③确认只接受真实 ContextWindow 后，与分支同一提交删除本用例。
-  it('keeps old context windows usable while disabling unsafe delta reuse', async () => {
-    const window = new ContextWindow();
-    const legacyWindow = new Proxy(window, {
+  // ③“单宿主假设”答复后（2026-10-20）删除旧 duck-typed 窗口兼容分支：没有合法 readViewRevision 的
+  // 非标准窗口无法证明压缩后仍保留工具全文，构造 ContextWindowAdapter 即失败关闭，不再降级为“每次换视图”。
+  const legacyWindowOf = (revision: unknown) =>
+    new Proxy(new ContextWindow(), {
       get: (target, name) => {
         if (name === 'readViewRevision') {
-          return undefined;
+          return revision;
         }
         const value = Reflect.get(target, name, target);
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
+
+  it.each([
+    ['missing', undefined],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['string', '3'],
+  ] as const)('rejects a context window with a %s read-view revision at construction', (_label, revision) => {
+    const error = vi.spyOn(Logger.getInstance(), 'error').mockImplementation(() => undefined);
+    expect(() => new ContextWindowAdapter(legacyWindowOf(revision) as never)).toThrow(
+      /CONTEXT_WINDOW_READ_VIEW_REVISION_INVALID/
+    );
+    expect(() => createMessageAdapter(legacyWindowOf(revision) as never)).toThrow(
+      /CONTEXT_WINDOW_READ_VIEW_REVISION_INVALID/
+    );
+    const lines = error.mock.calls.map(([entry]) => String(entry));
+    expect(lines.some((line) => line.includes('CONTEXT_WINDOW_READ_VIEW_REVISION_INVALID'))).toBe(
+      true
+    );
+  });
+
+  it('rejects reactLoop with the construction error before any tool request', async () => {
+    vi.spyOn(Logger.getInstance(), 'error').mockImplementation(() => undefined);
     const { runtime, requests } = runtimeHarness([readCall('a'), readCall('b'), { text: 'done' }]);
-    await runtime.reactLoop('legacy', { contextWindow: legacyWindow });
-    const scopes = requests.map((request) => request.runtime?.resourceScope);
-    expect(scopes).toHaveLength(2);
-    expect(Number.isSafeInteger(scopes[0]?.revision)).toBe(true);
-    expect(scopes[1]?.revision).toBeGreaterThan(scopes[0]?.revision ?? -1);
+    await expect(
+      runtime.reactLoop('legacy', { contextWindow: legacyWindowOf(undefined) as never })
+    ).rejects.toThrow(/CONTEXT_WINDOW_READ_VIEW_REVISION_INVALID/);
+    expect(requests).toHaveLength(0);
   });
 });
 

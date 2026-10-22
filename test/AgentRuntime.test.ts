@@ -1524,6 +1524,8 @@ async function capture(toolCalls: Parameters<typeof produceForcedSummary>[0]['to
     prompt: 'Report observed facts',
     source: 'system',
     tracker: { pipelineType: 'analyst' },
+    // L5-P26（W1-03）：summaryMode 必填，tracker 只进日志与轮数，不再推断契约。
+    summaryMode: 'analyst-report',
   });
   return { input: JSON.stringify(chat.mock.calls[0]), result };
 }
@@ -1708,7 +1710,8 @@ describe('I06 record-only stage keeps its final round recordable', () => {
   type CapturedLlmCall = { toolChoice: unknown; tools: string[]; messages: string };
 
   // 复刻 PipelineStrategy#runRecordRepairStage 传给 runLoop 的选项：maxIterations=3、tracker=null、
-  // sharedState/context 同时带 recordRepairOnly、toolChoiceOverride='auto'、source=system。
+  // sharedState/context 同时带 recordRepairOnly、context 末位带阶段声明 summaryMode='none'（W1-03）、
+  // toolChoiceOverride='auto'、source=system。
   function createRecordRepairRuntime() {
     const calls: CapturedLlmCall[] = [];
     const chatWithTools = vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
@@ -1776,6 +1779,7 @@ describe('I06 record-only stage keeps its final round recordable', () => {
         recordRepairOnly: true,
         recordRepairEvidencePaths: [],
         pipelinePhase: 'quality_gate_record_repair',
+        summaryMode: 'none',
       },
       source: 'system',
       tracker: null,
@@ -1798,8 +1802,8 @@ describe('I06 record-only stage keeps its final round recordable', () => {
     const warningCodes = (result.diagnostics?.warnings ?? []).map((warning) => warning.code);
     expect(warningCodes).not.toContain('tool_choice_violation');
     expect(loopCalls[2]?.messages).toContain('requestedToolChoice: auto');
-    // 不再有循环内 toolChoice=none 的强制摘要轮；I11（L5-P26）起 record_repair 是无 tracker 的
-    // 系统微阶段，finalize 也不再追加收尾摘要，reply 为空并记 forced_summary_suppressed。
+    // 不再有循环内 toolChoice=none 的强制摘要轮；I11（L5-P26）起 record_repair 微阶段声明
+    // summaryMode=none，finalize 也不再追加收尾摘要，reply 为空并记 forced_summary_suppressed。
     expect(calls.filter((call) => call.tools.length === 0)).toHaveLength(0);
     expect(calls).toHaveLength(3);
     expect(result.reply).toBe('');
@@ -1816,7 +1820,11 @@ describe('I06 record-only stage keeps its final round recordable', () => {
       additionalToolsOverride: ['memory', 'evidence'],
       budgetOverride: { maxIterations: 3, maxTokens: 2048, temperature: 0.2, timeoutMs: 90_000 },
       sharedState: { _recordRepairOnly: true },
-      context: { recordRepairOnly: true, pipelinePhase: 'quality_gate_record_repair' },
+      context: {
+        recordRepairOnly: true,
+        pipelinePhase: 'quality_gate_record_repair',
+        summaryMode: 'none',
+      },
       source: 'system',
       tracker: null,
       toolChoiceOverride: 'auto',

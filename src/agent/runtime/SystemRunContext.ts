@@ -25,8 +25,8 @@ export interface SystemRunContext extends Record<string, unknown> {
   contextWindow?: ContextWindow | null;
   tracker?: ExplorationTracker | null;
   /**
-   * activeContext 的别名：经 createSystemRunContext 构造时二者是同一对象
-   * （仅已废弃的 allowDistinctActiveContext 能放行不同对象）。字段去留随待决事项②决定。
+   * activeContext 的别名：经 createSystemRunContext 构造时二者恒为同一对象（不同即构造期抛错，
+   * L5-P48 已删除放行选项）。字段本身仍被宿主投影与 PipelineStrategy 读取，去留另行决定。
    */
   trace: ActiveContext | null;
   activeContext: ActiveContext | null;
@@ -69,11 +69,6 @@ export interface BuildSystemRunContextOptions {
   submitToolName?: string;
   pipelineType?: PipelineType;
   dimensionMeta?: SystemRunDimensionMeta;
-  /**
-   * @deprecated 无调用方（仓库内与宿主均未使用）。不设时 trace 必须与 activeContext 同一对象，
-   * 两字段事实上互为别名；设为 true 会让二者语义分叉且无测试覆盖。随待决事项②“公开面收窄”删除。
-   */
-  allowDistinctActiveContext?: boolean;
   extraFields?: Record<string, unknown>;
 }
 
@@ -92,8 +87,10 @@ export function createSystemRunContext(options: BuildSystemRunContextOptions): S
     throw new Error(`SystemRunContext requires an ActiveContext for scope "${options.scopeId}"`);
   }
 
+  // trace 只是 activeContext 的别名。L5-P48 删除了“允许二者指向不同对象”的放行选项（四处零引用）：
+  // 两者不同一律失败关闭——旧 JS 调用方即使仍传该键也会被忽略并在这里抛错，不会得到语义分叉的上下文。
   const trace = options.trace ?? activeContext;
-  if (trace !== activeContext && !options.allowDistinctActiveContext) {
+  if (trace !== activeContext) {
     throw new Error('SystemRunContext trace and activeContext must refer to the same scope');
   }
 

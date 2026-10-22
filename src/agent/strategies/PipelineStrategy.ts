@@ -96,7 +96,11 @@ import { buildRecordRepairPrompt, buildSummaryRewritePrompt } from '../prompts/i
 import { AgentEventBus, AgentEvents } from '../runtime/AgentEventBus.js';
 import type { AgentMessage } from '../runtime/AgentMessage.js';
 import { DiagnosticsCollector, isDegradeGateAction } from '../runtime/DiagnosticsCollector.js';
-import type { ForcedSummaryMode } from '../runtime/forcedSummary.js';
+import {
+  describeDeclaredMode,
+  type ForcedSummaryMode,
+  isForcedSummaryMode,
+} from '../runtime/forcedSummary.js';
 import { expandSystemRunContext } from '../runtime/SystemRunContext.js';
 import { isPersistedSubmission } from '../utils/toolOutcomes.js';
 import { runStageAttempt, type StageAttemptScope } from './pipeline/attempt.js';
@@ -187,6 +191,13 @@ interface PipelineStage {
   /** 管线类型标识 — 传递至 ExplorationTracker 用于统一场景判别 */
   pipelineType?: PipelineType;
   source?: string;
+  /**
+   * 本阶段强制摘要契约（L5-P26 W1-03，事项④“由阶段提供 summaryMode”）。仓内阶段（insight/evolution
+   * 预设、scan/relations 构造器、严格链、生成工厂产物、两个修复微阶段）都显式声明，取值等于删除前
+   * Runtime 在主路径上的推断。#runPreparedStage 只在有 tracker 的尝试中转发（'none' 总是转发），
+   * 见 #summaryModeForAttempt。未声明不抛错：宿主自定义阶段（含宿主 PipelineStrategy.test）照常运行。
+   */
+  summaryMode?: ForcedSummaryMode;
   [key: string]: unknown;
 }
 
@@ -246,22 +257,6 @@ function producerStructuredFindingTarget(artifact: unknown): number {
  * producer 按这个名字从 phaseResults 读取，而不是读「最近一个带产物的门」。
  */
 const ANALYSIS_GATE_STAGE = 'quality_gate';
-
-/**
- * I11（L5-P26）：本类自己构造的修复微阶段 → 强制摘要模式。
- *
- * summary_rewrite / record_repair 微阶段没有 tracker，正文要么只用于写回 analyze（rewrite），
- * 要么无消费方（repair）；它们无文本退出时不能再由 Runtime 按旧推断补一份 dimensionDigest 兜底，
- * 否则 rewrite 的兜底 JSON 会被当作可用文本覆盖 analyze 正文、绕过 analysis_retry。
- * 过渡实现：阶段策略对象（待决事项④）落地前不在阶段配置上新增公开字段，而是私有登记
- * #runRecordRepairStage / #runSummaryRewriteStage 构造的阶段对象；#runPreparedStage 据此在
- * runLoop context 中显式传 summaryMode，AgentRuntime.#finalize 优先采用该显式声明。
- *
- * 只登记这两个微阶段：它们由门内联调用，不会成为 lastMainStageName，reply 不进入管线最终 reply。
- * 进化补写轮（decisionOnlyOnRetry 的重试）不是微阶段——它是被门跳回重跑的主阶段，reply 就是
- * 管线最终 reply，AgentService.inferRunStatus 以空 reply 判 error，所以不在此登记、保持原推断。
- */
-const MICRO_STAGE_SUMMARY_MODES = new WeakMap<PipelineStage, ForcedSummaryMode>();
 
 /** 按门名读取分析产物的结果：status 区分「门没跑 / 门没留产物 / 产物形状不符」，供诊断定位。 */
 type AnalysisGateArtifactRead =
@@ -1769,6 +1764,8 @@ export class PipelineStrategy extends Strategy {
       },
       disableTracker: true,
       recordRepairOnly: true,
+      // I11：补写微阶段由门内联调用，正文无消费方；无文本退出时不产出摘要（不再由 Runtime 补 digest 兜底）。
+      summaryMode: 'none',
       toolChoiceOverride: 'auto',
       recordRepairEvidencePaths: this.#extractRecordRepairEvidencePaths(gateResult.artifact),
       systemPrompt:
@@ -1780,8 +1777,6 @@ export class PipelineStrategy extends Strategy {
           minFindings,
         }),
     };
-
-    MICRO_STAGE_SUMMARY_MODES.set(repairStage, 'none');
 
     try {
       return await this.#executeStage(runtime, message, repairStage, ctx, bus);
@@ -1823,6 +1818,9 @@ export class PipelineStrategy extends Strategy {
         maxSessionTokens: 30_000,
       },
       disableTracker: true,
+      // I11：重写正文只用于写回 analyze；无文本退出返回空 reply，调用方据此转 analysis_retry，
+      // 不会把兜底 dimensionDigest JSON 当成分析正文覆盖 analyze。
+      summaryMode: 'none',
       systemPrompt:
         'You are in a summary-rewrite stage. Do not explore or call tools. Rewrite the analysis text using only the verified findings provided in the prompt.',
       promptBuilder: () =>
@@ -1831,8 +1829,6 @@ export class PipelineStrategy extends Strategy {
           artifact: gateResult.artifact as Record<string, unknown> | null,
         }),
     };
-
-    MICRO_STAGE_SUMMARY_MODES.set(rewriteStage, 'none');
 
     try {
       return await this.#executeStage(runtime, message, rewriteStage, ctx, bus);
@@ -2538,17 +2534,9 @@ export class PipelineStrategy extends Strategy {
           }
         : baseSharedState;
 
-    const summaryMode = this.#stageSummaryMode(stage);
-    if (summaryMode) {
-      _pipelineLogger().debug(
-        `[PipelineStrategy] Stage "${stage.name}" declares summaryMode=${summaryMode} (repair micro-stage)`
-      );
-    } else if (decisionOnly) {
-      // 进化补写轮刻意不声明：它是最后一个主阶段，无文本退出时须由 Runtime 原推断产出非空 reply。
-      _pipelineLogger().debug(
-        `[PipelineStrategy] Stage "${stage.name}" evolution decision-only retry — no summaryMode declared, runtime keeps inferred forced summary so the final pipeline reply stays non-empty`
-      );
-    }
+    // 进化补写轮（decisionOnly）沿用 evolve 的阶段声明（预设与生成工厂里都不是 none）：evolution-audit
+    // 中它是最后一个主阶段，无文本退出时仍须产出非空 reply（AgentService.inferRunStatus 以空 reply 判 error）。
+    const summaryMode = this.#summaryModeForAttempt(stage, stageTracker, decisionOnly);
 
     return scope.runLoop(stagePrompt, {
       history: message.history,
@@ -2567,7 +2555,8 @@ export class PipelineStrategy extends Strategy {
             }
           : {}),
         ...(dimensionScopeId ? { dimensionScopeId } : {}),
-        // 显式摘要契约放在最后，覆盖宿主消息上下文里的同名键：微阶段的“不产出摘要”不能被改写。
+        // 阶段摘要声明放在 context 末位，覆盖宿主消息上下文里的同名键：阶段契约（含微阶段的“不产出
+        // 摘要”）不能被宿主上下文改写。不转发时宿主键原样透传，与声明化之前一致。
         ...(summaryMode ? { summaryMode } : {}),
       },
       capabilityOverride: stage.capabilities,
@@ -2585,12 +2574,45 @@ export class PipelineStrategy extends Strategy {
   }
 
   /**
-   * 本阶段需显式声明的强制摘要模式（I11）；null 表示不声明，由 AgentRuntime 按 tracker/阶段标记选择。
-   * 只有本类构造的 summary_rewrite / record_repair 微阶段 → 'none'。进化补写轮（decisionOnlyOnRetry
-   * 的重试）不声明：其 reply 是管线最终 reply，必须由原推断产出非空摘要（见 MICRO_STAGE_SUMMARY_MODES）。
+   * 本次尝试转发给 Runtime 的强制摘要声明（L5-P26 W1-03）；null 表示不转发。
+   *   - 未声明：不抛错（宿主自定义阶段与宿主 PipelineStrategy.test 依赖），记 info 诊断；Runtime 有
+   *     tracker 时走缺失声明路径（记 forced_summary_mode_undeclared），无 tracker 时走保留分支；
+   *   - 声明非法（JS/工厂产物绕过类型）：记 warn，不转发，按未声明处理；
+   *   - 'none'（修复微阶段）：总是转发——微阶段都关闭 tracker，Runtime 不再有别的途径得知“不产出摘要”；
+   *   - 其余声明只在本次尝试有 tracker 时转发。无 tracker 的尝试（严格链、relations、evolution-audit 主路径，
+   *     以及未传 tracker 的 generate/insight/module-mining 旁路）交给 Runtime 保留的无 tracker 推断分支
+   *     （总控裁定 2026-10-21 第 1、6 项：旁路保持现状，不让 analyst-report/producer-summary 声明改变它们
+   *     的 dimension-digest 产出）。这些主路径阶段的声明值与保留分支结果相同，由对等表测试锁定。
    */
-  #stageSummaryMode(stage: PipelineStage): ForcedSummaryMode | null {
-    return MICRO_STAGE_SUMMARY_MODES.get(stage) ?? null;
+  #summaryModeForAttempt(
+    stage: PipelineStage,
+    stageTracker: ExplorationTracker | null,
+    decisionOnly: boolean
+  ): ForcedSummaryMode | null {
+    const declared: unknown = stage.summaryMode;
+    const attempt = decisionOnly ? ' (decision-only retry)' : '';
+    if (declared === undefined) {
+      _pipelineLogger().info(
+        `[PipelineStrategy] Stage "${stage.name}"${attempt} declares no summaryMode — nothing forwarded; runtime selects by tracker presence (undeclared-stage path with a tracker, kept no-tracker branch otherwise; tracker=${stageTracker ? 'present' : 'none'})`
+      );
+      return null;
+    }
+    if (!isForcedSummaryMode(declared)) {
+      _pipelineLogger().warn(
+        `[PipelineStrategy] Stage "${stage.name}"${attempt} has invalid summaryMode=${describeDeclaredMode(declared)} — not forwarded, treated as undeclared`
+      );
+      return null;
+    }
+    if (declared === 'none' || stageTracker) {
+      _pipelineLogger().debug(
+        `[PipelineStrategy] Stage "${stage.name}"${attempt} forwards summaryMode=${declared} (tracker=${stageTracker ? 'present' : 'none'})`
+      );
+      return declared;
+    }
+    _pipelineLogger().info(
+      `[PipelineStrategy] Stage "${stage.name}"${attempt} summaryMode=${declared} not forwarded — no tracker for this attempt, runtime keeps its no-tracker inference (controller ruling 2026-10-21)`
+    );
+    return null;
   }
 
   /** 质量门控评估 (向后兼容: 阈值模式) */

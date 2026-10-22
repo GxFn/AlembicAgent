@@ -1501,7 +1501,7 @@ export class AgentRuntime {
           ctx.tracker?.rollbackTick?.();
         }
         this.logger.warn(`[AgentRuntime] empty response — ${decision.detail}`);
-        return (await this.#waitForRetry(ctx, 1500)) ? (continueResult() as LLMResult) : null;
+        return (await this.#waitForRetry(ctx, 1500)) ? continueResult() : null;
       }
       this.logger.warn(`[AgentRuntime] empty response — ${decision?.detail || 'retry exhausted'}`);
       return null;
@@ -1536,7 +1536,7 @@ export class AgentRuntime {
         ctx.lastReply = cleanFinalAnswer(llmResult.text);
         return null; // 退出
       }
-      return continueResult() as LLMResult;
+      return continueResult();
     }
 
     return llmResult;
@@ -1777,7 +1777,7 @@ export class AgentRuntime {
       return null;
     }
 
-    return (await this.#waitForRetry(ctx, 2000)) ? (continueResult() as LLMResult) : null;
+    return (await this.#waitForRetry(ctx, 2000)) ? continueResult() : null;
   }
 
   /** 等待属于本次循环，取消后不再占用重试期限，也不启动下一次模型请求。 */
@@ -2499,17 +2499,19 @@ export class AgentRuntime {
   }
 
   /**
-   * 强制摘要契约选择（I11 / L5-P26）。优先级：
-   *   1. 调用方显式声明 context.summaryMode（PipelineStrategy 只为自身构造的 summary_rewrite /
-   *      record_repair 微阶段传 'none'；待决事项④的阶段策略对象落地后由它提供）——非法值记 warn 后忽略；
-   *   2. 非 system 源 → user（旧推断不变）；
-   *   3. 有 tracker → 按 tracker.pipelineType：analyst → analyst-report、producer → producer-summary、
-   *      其余（bootstrap）→ dimension-digest（scan 在 #finalize 中先行短路）；
-   *   4. 无 tracker 的 record_repair 微阶段标记（recordRepairOnly）→ none：该微阶段由门内联调用，
-   *      只负责 note_finding 补写，正文不进入管线最终 reply；
-   *   5. 其余无 tracker 的 system 源保持旧推断 dimension-digest（严格链、进化首轮与补写轮等待④统一）。
-   *      进化补写轮（sharedState._evolutionDecisionOnly）刻意不映射为 none：它是进化管线最后一个主阶段，
-   *      reply 就是管线最终 reply，AgentService.inferRunStatus 以空 reply 判 error，必须产出非空摘要。
+   * 强制摘要契约选择（I11 / L5-P26，W1-03 阶段声明化后）。优先级：
+   *   1. 调用方显式声明 context.summaryMode：PipelineStrategy 把阶段声明（PipelineStage.summaryMode）
+   *      放在 runLoop context 末位转发——有 tracker 的阶段尝试转发阶段声明，summary_rewrite /
+   *      record_repair 微阶段总是转发 'none'。非法值记 warn 后忽略；
+   *   2. 【保留，总控裁定 2026-10-21 第 1 项】非 system 源 → user。无阶段运行（SingleStrategy 的
+   *      chat/plan/translation/signal）没有阶段声明，改动会让对话强制退出的产出形态变化，答复未覆盖；
+   *   3. 有 tracker 却没有合法声明 → 缺失声明路径（显式定义，见 #undeclaredStageSummaryMode）。
+   *      tracker 只由 PipelineStrategy 的阶段尝试传入，仓内阶段都已声明，走到这里说明阶段配置漏声明；
+   *   4. 【保留，总控裁定第 1、6 项】无 tracker 的 system 源 → dimension-digest。覆盖无阶段的系统运行
+   *      （如 mcp chat 强制退出拿到 dimensionDigest JSON）与无 tracker 的阶段尝试：严格链、relations、
+   *      evolution-audit（含进化补写轮）的主路径，以及未传 tracker 的 generate/insight/module-mining 旁路。
+   *      PipelineStrategy 在无 tracker 时不转发非 none 声明，这些旁路保持删除前的旧值。
+   * 已删除（改由阶段声明提供）：tracker.pipelineType 映射、recordRepairOnly 映射、_evolutionDecisionOnly 分支。
    * trigger 只用于日志与诊断，说明选择依据。
    */
   #resolveForcedSummaryMode(ctx: LoopContext): { mode: ForcedSummaryMode; trigger: string } {
@@ -2519,41 +2521,40 @@ export class AgentRuntime {
         return { mode: declared, trigger: 'context.summaryMode' };
       }
       this.logger.warn(
-        `[AgentRuntime] finalize: ignoring invalid context.summaryMode=${describeDeclaredMode(declared)} — selecting by tracker/stage markers`
+        `[AgentRuntime] finalize: ignoring invalid context.summaryMode=${describeDeclaredMode(declared)} — selecting by source/tracker presence`
       );
     }
     if (!ctx.isSystem) {
       return { mode: 'user', trigger: `source=${ctx.source || 'user'}` };
     }
-    const tracker = ctx.tracker;
-    if (tracker) {
-      const pipelineType = tracker.pipelineType;
-      if (pipelineType === 'analyst') {
-        return { mode: 'analyst-report', trigger: 'tracker.pipelineType=analyst' };
-      }
-      if (pipelineType === 'producer') {
-        return { mode: 'producer-summary', trigger: 'tracker.pipelineType=producer' };
-      }
-      return {
-        mode: 'dimension-digest',
-        trigger: `tracker.pipelineType=${pipelineType || 'unknown'}`,
-      };
-    }
-    if (ctx.sharedState?._recordRepairOnly === true) {
-      return { mode: 'none', trigger: 'sharedState._recordRepairOnly' };
-    }
-    if (ctx.context?.recordRepairOnly === true) {
-      return { mode: 'none', trigger: 'context.recordRepairOnly' };
-    }
-    if (ctx.sharedState?._evolutionDecisionOnly === true) {
-      // 进化补写轮走原推断（见上方第 5 条）；trigger 单独标出，日志里能区分补写轮与普通系统源。
-      return {
-        mode: 'dimension-digest',
-        trigger:
-          'legacy-default(system, no tracker; evolution decision-only retry keeps inference)',
-      };
+    if (ctx.tracker) {
+      return this.#undeclaredStageSummaryMode(ctx);
     }
     return { mode: 'dimension-digest', trigger: 'legacy-default(system, no tracker)' };
+  }
+
+  /**
+   * 缺失声明路径：系统源、有 tracker（即 PipelineStrategy 的阶段尝试）却没有合法 summaryMode。
+   * 不再按 tracker.pipelineType 猜契约，也不静默回落——固定选 dimension-digest（与系统源无 tracker 的
+   * 保留默认同一形状，宿主 parseDimensionDigest 可解析），并记 warn 日志与 forced_summary_mode_undeclared
+   * 诊断，写明阶段名与 tracker.pipelineType，便于定位漏声明的阶段配置。
+   */
+  #undeclaredStageSummaryMode(ctx: LoopContext): { mode: ForcedSummaryMode; trigger: string } {
+    const pipelineType =
+      typeof ctx.tracker?.pipelineType === 'string' ? ctx.tracker.pipelineType : 'unknown';
+    const phase =
+      typeof ctx.context?.pipelinePhase === 'string' ? ctx.context.pipelinePhase : 'unknown';
+    const mode: ForcedSummaryMode = 'dimension-digest';
+    const detail = `stage=${phase}, tracker.pipelineType=${pipelineType}`;
+    this.logger.warn(
+      `[AgentRuntime] finalize: summaryMode undeclared for a tracked stage run (${detail}) — using explicit undeclared-stage path mode=${mode}; declare PipelineStage.summaryMode`
+    );
+    ctx.diagnostics?.warn({
+      code: 'forced_summary_mode_undeclared',
+      ...(phase === 'unknown' ? {} : { stage: phase }),
+      message: `Tracked stage run declares no valid summaryMode (stage=${phase}, pipelineType=${pipelineType}); a forced summary, if requested, uses the undeclared-stage path (${mode}) instead of tracker inference`,
+    });
+    return { mode, trigger: `undeclared-stage(${detail})` };
   }
 
   /** 循环退出后处理 — 强制摘要 + 构建返回值 */
@@ -2565,7 +2566,7 @@ export class AgentRuntime {
       const suppression = this.#getForcedSummarySuppression(ctx);
       const summaryMode = this.#resolveForcedSummaryMode(ctx);
       if (summaryMode.mode === 'none') {
-        // I11：无 tracker 的系统微阶段（只有 summary_rewrite / record_repair）不产出摘要，
+        // I11：声明 none 的阶段（PipelineStrategy 的 summary_rewrite / record_repair 微阶段）不产出摘要，
         // 任何无文本退出（含被抑制的停止）都返回空 reply——PipelineStrategy 据此走
         // “重写无可用文本 → analysis_retry”，不会把兜底 JSON 或停止文案当作分析正文写回。
         // 停止原因保留在诊断里，不进入 reply。
@@ -2592,9 +2593,8 @@ export class AgentRuntime {
         this.logger.info(
           `[AgentRuntime] finalize: forced summary mode=${summaryMode.mode} (trigger=${summaryMode.trigger})`
         );
-        // I49：不再传 contextWindow / tokenUsage 两个已废弃的兼容输入——摘要只读有界工具回执，
-        // 不重放累积上下文；用量由下面按返回值统一记入 BudgetController 与本 loop，
-        // 不经调用方累加器（此前传入的 this.tokenUsage 从未被函数读取或改写）。
+        // 摘要只读有界工具回执、不重放累积上下文，所以不传上下文窗口（I49 的兼容输入已删除）；用量由
+        // 下面按返回值统一记入 BudgetController 与本 loop。summaryMode 必填，由上面的选择逻辑给出。
         const forcedResult = await produceForcedSummary({
           aiProvider: this.aiProvider,
           source: ctx.source,
