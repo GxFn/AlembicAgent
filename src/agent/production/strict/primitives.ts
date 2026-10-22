@@ -54,6 +54,18 @@ export function fail(code: string, detail?: string): never {
   throw new Error(detail ? `${code}: ${detail}` : code);
 }
 
+/**
+ * 仓内自用规范哈希（裸 64 位 hex），Agent 内部回执编码只有这一份实现：production/strict 的
+ * epoch/lineage/expression 等哈希，evaluation 的 IndependentValueReviewer decisionHash、
+ * MiningJudge receiptHash、StrictProductionFixtureEvaluation 报告哈希，以及 runs/plan 的
+ * PlanAgentRun receiptId 都从这里取值；`sha256:`、`plan-cognition-receipt-` 等前缀由各调用点
+ * 自行拼接。本文件不在任何公开子路径中。
+ *
+ * 事项⑥已答复（2026-10-20）：本轮只收敛副本、不改排序。上述四个模块原先各有一份逐字节等价的
+ * 私有副本，W1-10 收敛到这里；收敛前录制的 golden 由 test/strict-canonical-golden.test.ts 钉住，
+ * test/strict-canonical-locale.test.ts 只允许本文件定义排序器。
+ * 值为 undefined 的对象成员与 JSON.stringify 一样被省略，数组中的 undefined 写成 null。
+ */
 export function hashCanonical(value: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(sortCanonical(value)))
@@ -105,7 +117,7 @@ function sortCoreCanonical(value: unknown): unknown {
 /**
  * 仓内自用哈希的键排序。已有持久化的 epoch/lineage/expression 哈希依赖 localeCompare 的
  * 顺序（与码元序不同，例如 `clusters` 排在 `clusterSetHash` 之前），改成码元序会让旧数据
- * 校验失败，需要配套的数据迁移决定，因此顺序保持不变。
+ * 校验失败，需要配套的数据迁移决定，因此顺序保持不变（事项⑥已答复：本轮不改排序）。
  *
  * 排序规则固定为 en：英文、中文环境下与不带参数的历史结果完全相同，同时不再随进程默认
  * 区域变化（匈牙利语、丹麦语等区域对 ASCII 标识符的排序不同）。

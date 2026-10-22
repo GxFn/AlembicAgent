@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { resolveProjectPath } from '../../shared/projectPath.js';
+import { hashCanonical } from '../production/strict/primitives.js';
 
 export interface MiningJudgeEvidenceSliceV1 {
   readonly file: string;
@@ -609,6 +609,9 @@ export function createFrozenJudgeModelLoadReceiptV1(
     maxTokens: input.maxTokens,
     implementationModuleSha256: input.implementationModuleSha256,
   };
+  // receiptHash = `sha256:` + 仓内唯一规范哈希的裸 hex（primitives.hashCanonical）。原私有副本在排序前
+  // 显式丢弃值为 undefined 的键，共享实现保留该键再由 JSON.stringify 省略，序列化字节相同；W1-10 按
+  // 事项⑥（只收敛副本、不改排序）收敛，逐字节等价由 test/strict-canonical-golden.test.ts 钉住。
   return freeze({ ...semantic, receiptHash: `sha256:${hashCanonical(semantic)}` });
 }
 
@@ -651,40 +654,6 @@ function requireText(value: unknown, code: string): string {
 
 function fail(code: string): never {
   throw new Error(code);
-}
-
-/**
- * 本副本输出裸 64 位 hex；`sha256:` 前缀由调用点（createFrozenJudgeModelLoadReceiptV1 的
- * receiptHash）自行拼接，并在 sortCanonical 中额外丢弃值为 undefined 的键（与 JSON.stringify
- * 的省略结果等价）。
- *
- * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
- * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
- * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
- * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
- * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
- * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
- */
-function hashCanonical(value: unknown): string {
-  return createHash('sha256')
-    .update(JSON.stringify(sortCanonical(value)))
-    .digest('hex');
-}
-
-function sortCanonical(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortCanonical);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([, child]) => child !== undefined)
-      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
-      .sort(([left], [right]) => left.localeCompare(right, 'en'))
-      .map(([key, child]) => [key, sortCanonical(child)])
-  );
 }
 
 function freeze<T>(value: T): T {

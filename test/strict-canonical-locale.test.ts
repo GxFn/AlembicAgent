@@ -33,8 +33,9 @@ import {
  * 背景：epoch / lineage / expression 等回执哈希在序列化前用 localeCompare 排键。不带
  * locale 参数时它取进程默认区域：英文、中文环境顺序一致，但匈牙利语、丹麦语、立陶宛语等
  * 环境对 ASCII 标识符的排序不同（`cs` 排在 `cz` 之后、`aa` 排在 `z` 之后），同一份内容会
- * 算出不同的哈希。现在五份键排序都固定为 en 排序规则：英文、中文环境下的结果与历史哈希
- * 完全相同，其他区域下也得到同一个值。改成码元序会改变已持久化的哈希，不在本次范围内。
+ * 算出不同的哈希。仓内唯一的键排序（primitives.ts 的 sortCanonical，原先五份副本已收敛到这里）
+ * 固定为 en 排序规则：英文、中文环境下的结果与历史哈希完全相同，其他区域下也得到同一个值。
+ * 改成码元序会改变已持久化的哈希，事项⑥已答复本轮不改排序。
  */
 
 const SRC_ROOT = fileURLToPath(new URL('../src', import.meta.url));
@@ -91,18 +92,16 @@ describe('agent-internal canonical hashes do not depend on the process locale', 
     );
   });
 
-  it('pins the collation in every canonical key sorter', () => {
-    // 五份 sortCanonical 各属一份回执编码合同，彼此不能互换，因此逐份检查而不是合并实现。
+  it('pins the collation in the single canonical key sorter', () => {
+    // W1-10（事项⑥已答复：只收敛副本、不改排序）：原先五份副本已收敛为 primitives.ts 这一份，
+    // IVR、MiningJudge、StrictProductionFixtureEvaluation、PlanAgentRun 改为导入它并各自保留前缀；
+    // 逐字节等价由 test/strict-canonical-golden.test.ts 钉住。任何文件重新定义排序器都在这里失败。
     const sorters = sourceFiles(SRC_ROOT)
       .map((file) => ({ file: path.relative(SRC_ROOT, file), source: readFileSync(file, 'utf8') }))
       .filter(({ source }) => /function sortCanonical\(/u.test(source));
 
     expect(sorters.map(({ file }) => file).sort()).toEqual([
-      'agent/evaluation/IndependentValueReviewer.ts',
-      'agent/evaluation/MiningJudge.ts',
-      'agent/evaluation/StrictProductionFixtureEvaluation.ts',
       'agent/production/strict/primitives.ts',
-      'agent/runs/plan/PlanAgentRun.ts',
     ]);
     for (const { file, source } of sorters) {
       const body = source.slice(source.indexOf('function sortCanonical('));

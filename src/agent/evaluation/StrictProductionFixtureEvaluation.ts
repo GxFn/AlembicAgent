@@ -11,6 +11,7 @@ import {
   createStrictAnalysisGateOutcomeV1,
 } from '../production/StrictProductionPipeline.js';
 import type { StrictProductionRuntimePortV1 } from '../production/StrictProductionStages.js';
+import { hashCanonical } from '../production/strict/primitives.js';
 import type { LLMResult } from '../runtime/AgentRuntimeTypes.js';
 
 // 惰性取 Logger 单例：模块导入期不做任何工作，与 evaluation 目录其他模块同一写法。
@@ -188,13 +189,16 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     throw new Error('STRICT_FIXTURE_EXPECTED_DISPOSITION_MISMATCH');
   }
   const sourceManifest = loadedSources.map(({ content: _content, ...source }) => source);
-  const sourceRevisionVectorHash = hashCanonical(sourceManifest);
+  const sourceRevisionVectorHash = fixtureReportHash(sourceManifest);
   const candidate =
     sourceDisposition === 'single-file-value'
       ? buildValueCandidate(input.fixture, loadedSources)
       : null;
   const capturedCandidates: StrictProductionEvaluationCandidateV1[] = [];
-  const baselineScheduleHash = hashCanonical({ fixture: input.fixture.id, schedule: 'baseline' });
+  const baselineScheduleHash = fixtureReportHash({
+    fixture: input.fixture.id,
+    schedule: 'baseline',
+  });
   const factQueryObligationIds = sourceManifest.map((source) => `inspect:${source.sha256}`);
   const expansionPort = createStrictAnalysisExpansionPortV1({
     baselineScheduleHash,
@@ -214,35 +218,45 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
   const context = createStrictAnalysisContextProjectionV1({
     runId: `fixture-run-${input.fixture.id}`,
     journalId: `fixture-journal-${input.fixture.id}`,
-    manifestHash: hashCanonical({ fixture: input.fixture.id, sourceManifest, providerIdentity }),
-    planCognitionHash: hashCanonical({
+    manifestHash: fixtureReportHash({
+      fixture: input.fixture.id,
+      sourceManifest,
+      providerIdentity,
+    }),
+    planCognitionHash: fixtureReportHash({
       fixture: input.fixture.id,
       phase: 'plan-cognition',
       providerIdentity,
     }),
-    planHash: hashCanonical({ fixture: input.fixture.id, phase: 'plan' }),
-    requiredUniverseHash: hashCanonical(sourceManifest.map((source) => source.path)),
+    planHash: fixtureReportHash({ fixture: input.fixture.id, phase: 'plan' }),
+    requiredUniverseHash: fixtureReportHash(sourceManifest.map((source) => source.path)),
     baselineScheduleHash,
     expansionHeadHash: null,
-    currentExpandedScheduleHash: hashCanonical({ fixture: input.fixture.id, schedule: 'current' }),
+    currentExpandedScheduleHash: fixtureReportHash({
+      fixture: input.fixture.id,
+      schedule: 'current',
+    }),
     finalExpandedScheduleHash,
-    analysisFixpointHash: hashCanonical({ fixture: input.fixture.id, fixpoint: sourceManifest }),
+    analysisFixpointHash: fixtureReportHash({
+      fixture: input.fixture.id,
+      fixpoint: sourceManifest,
+    }),
     privateCorpusRevision: null,
     hypothesisExpressionSetHash: null,
-    lensBindingsHash: hashCanonical({ lens: 'structure-and-boundary', sourceManifest }),
-    sourceArtifactHash: hashCanonical({ fixture: input.fixture.id, sourceManifest }),
+    lensBindingsHash: fixtureReportHash({ lens: 'structure-and-boundary', sourceManifest }),
+    sourceArtifactHash: fixtureReportHash({ fixture: input.fixture.id, sourceManifest }),
     sourceRevisionVectorHash,
     questionIds: [`fixture-question-${input.fixture.id}`],
     factQueryObligationIds,
     analysisUnitIds: sourceManifest.map((source) => `unit:${source.sha256}`),
     factIds: sourceManifest.map((source) => `fact:${source.sha256}`),
     witnessIds: sourceManifest.map((source) => `witness:${source.sha256}`),
-    populationHashes: [hashCanonical(sourceManifest)],
-    clusterSetHashes: [hashCanonical({ clusters: sourceManifest })],
-    inductionReceiptHashes: candidate ? [hashCanonical({ induction: candidate.title })] : [],
-    hypothesisIds: candidate ? [hashCanonical({ hypothesis: candidate.doClause })] : [],
-    falsificationReceiptHashes: candidate ? [hashCanonical({ falsification: 'survived' })] : [],
-    dispositionReviewIds: [hashCanonical({ disposition: input.fixture.expectedDisposition })],
+    populationHashes: [fixtureReportHash(sourceManifest)],
+    clusterSetHashes: [fixtureReportHash({ clusters: sourceManifest })],
+    inductionReceiptHashes: candidate ? [fixtureReportHash({ induction: candidate.title })] : [],
+    hypothesisIds: candidate ? [fixtureReportHash({ hypothesis: candidate.doClause })] : [],
+    falsificationReceiptHashes: candidate ? [fixtureReportHash({ falsification: 'survived' })] : [],
+    dispositionReviewIds: [fixtureReportHash({ disposition: input.fixture.expectedDisposition })],
     evidenceEntryIds: loadedSources.map((source) => source.evidenceEntryId),
     derivedFindingCount: 0,
   });
@@ -503,34 +517,17 @@ function frozenJudgeReply(prompt: string): LLMResult {
 }
 
 /**
- * 本副本直接输出带 `sha256:` 前缀的哈希，fixture 报告与 golden 记录按此前缀格式比对。
+ * fixture 报告哈希：`sha256:` 前缀 + 仓内唯一规范哈希的裸 hex（primitives.hashCanonical）。fixture
+ * 报告与 golden 记录按此前缀格式比对，所以前缀留在本模块拼接，规范化与排序不在这里重复实现。
  *
- * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
- * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
- * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
- * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
- * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
- * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
+ * 原先本模块有一份私有 sortCanonical/hashCanonical 副本；W1-10 按事项⑥（只收敛副本、不改排序）
+ * 收敛到 primitives，逐字节等价由 test/strict-canonical-golden.test.ts 对两个严格 golden case
+ * 的全部报告哈希钉住。
  */
-function hashCanonical(value: unknown): string {
-  return `sha256:${sha256(JSON.stringify(sortCanonical(value)))}`;
+function fixtureReportHash(value: unknown): string {
+  return `sha256:${hashCanonical(value)}`;
 }
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function sortCanonical(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortCanonical);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
-      .sort(([left], [right]) => left.localeCompare(right, 'en'))
-      .map(([key, child]) => [key, sortCanonical(child)])
-  );
 }

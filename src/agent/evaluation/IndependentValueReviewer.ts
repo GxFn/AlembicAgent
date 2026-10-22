@@ -6,6 +6,7 @@ import {
   canonicalizeStrictEvidenceProjection,
   type StrictEvidenceProjectionErrorCodesV1,
 } from '../production/strict/lineage.js';
+import { hashCanonical } from '../production/strict/primitives.js';
 
 export type { JudgeCalibrationRecordV1 } from './MiningJudge.js';
 export { computeJudgeCalibration } from './MiningJudge.js';
@@ -444,6 +445,9 @@ export class IndependentValueReviewer {
       calibrationReceiptHash: input.calibrationReceiptHash,
       sourceRevisionVectorHash: input.evidence.sourceRevisionVectorHash,
     };
+    // decisionHash 是裸 64 位 hex，直接取仓内唯一的规范哈希（primitives.hashCanonical）。原先这里有
+    // 一份私有副本，W1-10 按事项⑥（只收敛副本、不改排序）收敛；逐字节等价由
+    // test/strict-canonical-golden.test.ts 钉住，宿主回放与历史回执不受影响。
     return freeze({ ...semantic, decisionHash: hashCanonical(semantic) });
   }
 }
@@ -674,35 +678,6 @@ function fail(code: string, detail?: string): never {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-/**
- * 本副本输出裸 64 位 hex（decisionHash 等评审侧回执使用）。
- *
- * 规范哈希副本登记（L7-P27/C46）：仓内共五份 sortCanonical/hashCanonical，分别在
- * IndependentValueReviewer、MiningJudge、StrictProductionFixtureEvaluation、
- * production/strict/primitives 与 runs/plan/PlanAgentRun；各自是一份独立回执编码合同，
- * 键排序统一固定为 en 排序规则，由 test/strict-canonical-locale.test.ts 逐份钉住。
- * 收敛为 agent 内部共享工具（不进公开子路径）与改用码元序都待决定⑥：在那之前不得单独
- * 修改任何一份的排序规则或输出形状，否则冻结回执会被误判篡改、golden 报告哈希漂移。
- */
-function hashCanonical(value: unknown): string {
-  return sha256(JSON.stringify(sortCanonical(value)));
-}
-
-function sortCanonical(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortCanonical);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
-      .sort(([left], [right]) => left.localeCompare(right, 'en'))
-      .map(([key, child]) => [key, sortCanonical(child)])
-  );
 }
 
 function freeze<T>(value: T): T {

@@ -11,6 +11,7 @@ import {
 } from '@alembic/core/plans';
 import { canonicalJsonStringify } from '@alembic/core/project-context-foundation';
 import { observeSafely } from '../../../shared/observers.js';
+import { hashCanonical } from '../../production/strict/primitives.js';
 import type { AgentRunResult } from '../../service/AgentRunContracts.js';
 import type { AgentService } from '../../service/AgentService.js';
 import { runFailure } from '../result.js';
@@ -50,7 +51,8 @@ const STRICT_PLAN_SEMANTIC_REPAIR_CAP = 2;
  * PLAN_COGNITION_*、PLAN_STAGE_UNSUPPORTED、PLAN_LINEAGE_*、PLAN_SEMANTIC_REPAIR_LIMIT、
  * PLAN_CELL_UNIVERSE_CONSERVATION），重新采样只会以同样方式失败，因此原样抛出、不消耗修复预算。
  *
- * 过渡归属：待决事项⑤（严格契约库归属）若定为 Core 归属，改为引用 Core 导出的集合并删除本常量。
+ * 归属：按事项⑤（2026-10-20 已答复）可修复码暂留 Agent；若以后改为 Core 导出，再切换为引用 Core
+ * 导出的集合并删除本常量。
  * 漂移守护：test/strict-production-chain.test.ts 读取 Core 实现中的全部 PLAN_* 码并要求逐一分类，
  * Core 新增或改名校验码时先在那里失败。
  */
@@ -257,6 +259,9 @@ export async function runStrictPlanAgent({
         },
         validatorVerdict: 'accepted' as const,
       };
+      // receiptId = `plan-cognition-receipt-` + 仓内唯一规范哈希的裸 hex（primitives.hashCanonical）。
+      // 原先本文件有一份私有副本，W1-10 按事项⑥（只收敛副本、不改排序）收敛；逐字节等价由
+      // test/strict-canonical-golden.test.ts 钉住。
       const receipt: PlanCognitionReceiptV1 = {
         ...semantic,
         receiptId: `plan-cognition-receipt-${hashCanonical(semantic)}`,
@@ -911,25 +916,6 @@ function validateStrictPlanContext(context: PlanContextProjectionV1): void {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function hashCanonical(value: unknown): string {
-  return hashText(JSON.stringify(sortCanonical(value)));
-}
-
-function sortCanonical(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortCanonical);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      // 固定 en 排序规则：与历史哈希逐字节一致，且不随进程默认区域变化。
-      .sort(([left], [right]) => left.localeCompare(right, 'en'))
-      .map(([key, child]) => [key, sortCanonical(child)])
-  );
 }
 
 interface ProjectContextModuleCandidate {
