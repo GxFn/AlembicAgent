@@ -988,11 +988,34 @@ export function createStrictAnalysisFixpointV1(
  *   lineage 进入 hypothesisHash。
  * 两项哈希都等于 epochHash，即存储内容与重建内容的规范 JSON（hashCanonical）一致。这是哈希级绑定，
  * 不逐值比较：非有限数在规范 JSON 里写成 null（差异已在 primitives.ts 的镜像注释登记），所以跨进程
- * JSON 文本在合法值为 null 的位置写入 1e400 之类的数，解析成 Infinity 后仍能通过。已核对能这样通过
- * 的只有 clustered 处置行里合法为 null 的字段，重建与下游都不读取它们（重建只读非 clustered 行，Core
- * fixpoint 只读 status 与 clusterSetHash）；lineage 读取的 producerEligibleHypotheses 行没有合法为
- * null 的字段，替换其任一字段都会改变规范 JSON 而被拒。在此边界内，下游直接读取存储的派生字段才
- * 可信。先重建、后比哈希，保持重建内各结构错误码的既有报告顺序。
+ * JSON 文本在合法值为 null 的位置写入 1e400 之类的数，解析成 Infinity 后可能仍能通过。下面列出已知
+ * 能这样通过本复核与 createStrictAnalysisFixpointV1、且 epochHash 与 fixpointHash 不变（假设可进入
+ * lineage 时 lineageHash 也不变）的位置。这是按现有测试夹具（单假设的 not-required、带已执行反查
+ * 的 survived 与 refuted、未执行反查的 unknown，以及多假设 narrowed；unknown 的 epoch 本身过不了
+ * fixpoint，只核对了本复核）逐个替换 null 叶子核对的结果，未穷举证明：没有覆盖 discarded /
+ * unresolved 处置行等其他形态，不能据此断言别处都会被拒。
+ * - clusterSet.dispositions 里 clustered 行合法为 null 的字段（reasonCode、reviewerReceiptId、owner、
+ *   resumePoint）：重建只读非 clustered 行，Core fixpoint 只读 status 与 clusterSetHash。
+ * - 带已执行反查（refuted，或 required 且无反例的 survived）的 falsifications[].executions[] 里的
+ *   executionReceipt.continuation 与 executionReceipt.fileExecutions[].continuation：重建会读取存储的
+ *   executions 行，但 bindStrictCounterqueryExecutionReceipts 用 hashCanonical 比较存储回执与
+ *   epoch.executionReceipts 里的权威回执，Infinity 坍缩成 null 后两者相等，不记 replaced 诊断，随后
+ *   一律换成权威回执再交给 Core，Core 看不到 Infinity。存储的 verdict 仍是 survived / refuted；其中
+ *   executionReceipt.continuation 为 Infinity 时，按 Core isCompleteCounterqueryExecution（要求回执
+ *   continuation === null）重判存储的执行行会得到不完整，存储内容自相矛盾却能通过（该谓词不看
+ *   fileExecutions[].continuation）。按本仓库 src 内的 grep 核对（宿主仓库不在核对范围内），除上面的
+ *   重建绑定外，其余读取方都不读存储执行行里的回执：重建合成已知事实时取 counterexampleFactIds，
+ *   createStrictAnalysisFixpointV1 从 falsification 读 receiptHash 与 currentAnalysisFixpointHash，
+ *   lineage 读 hypothesisId、receiptHash、dispositionReviewReceiptId 与 currentAnalysisFixpointHash。
+ * 同一批夹具里其余合法为 null 的叶子写入 1e400 后都被拒，这是已核对的对照：顶层 executionReceipts
+ * 原样交给 Core，其 continuation 与 fileExecutions[].continuation 由 Core 规范 JSON 抛 TypeError；
+ * population.parentPopulationHash、population.denominator.continuation 与 inductions[] 的
+ * zeroHypothesisReason、zeroHypothesisReviewReceiptId 在重建中失败关闭（其中有 Core 的无前缀错误码
+ * 与无码 TypeError）。lineage 读取的 producerEligibleHypotheses 行按类型没有合法为 null 的字段
+ * （causalParentHypothesisId 是缺省而不是 null），替换其任一字段都会改变规范 JSON 而被拒。
+ * 下游直接读取存储的派生字段，在上述已核对的范围内可信；新的读取方要读存储内容里合法为 null 的
+ * 字段，须先核对该位置是否在可通过之列，或自行逐值校验。先重建、后比哈希，保持重建内各结构错误码
+ * 的既有报告顺序。
  */
 export function assertStrictAnalystEpochIntegrity(epoch: StrictAnalystEpochV1): void {
   const rebuilt = rebuildStrictAnalystEpoch(epoch);

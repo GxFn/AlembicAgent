@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import Logger from '@alembic/core/logging';
 import {
   createAnalysisReviewContextHashV1,
@@ -64,9 +65,19 @@ function evidenceEntry(evidenceEntryId: string, content = HANDLER_CONTENT, start
   };
 }
 
-function createLineageFixture(evidenceEntries = [evidenceEntry('E-1')]) {
+/**
+ * 单假设 epoch 的 Producer lineage 夹具。epochInputOf 可在同一 review context 上换一份 epoch 输入
+ * （例如带已执行反查的 survived），context 的 dispositionReviewIds 随 epoch 自身的审查回执取值；
+ * 缺省时与原夹具逐字节相同。
+ */
+function createLineageFixture(
+  evidenceEntries = [evidenceEntry('E-1')],
+  epochInputOf: (
+    semantic: ReturnType<typeof createSingleHypothesisEpochFixture>
+  ) => StrictAnalystEpochInputV1 = (semantic) => semantic.epochInput
+) {
   const semantic = createSingleHypothesisEpochFixture();
-  const epoch = validateStrictAnalystEpochV1(semantic.epochInput);
+  const epoch = validateStrictAnalystEpochV1(epochInputOf(semantic));
   const analysisFixpoint = createStrictAnalysisFixpointV1({
     finalExpandedSchedule: semantic.finalExpandedSchedule,
     terminalObligations: semantic.terminalObligations,
@@ -99,7 +110,7 @@ function createLineageFixture(evidenceEntries = [evidenceEntry('E-1')]) {
     inductionReceiptHashes: epoch.inductions.map((receipt) => receipt.receiptHash),
     hypothesisIds: ['hypothesis-handler'],
     falsificationReceiptHashes: epoch.falsifications.map((receipt) => receipt.receiptHash),
-    dispositionReviewIds: [semantic.dispositionReview.reviewReceiptId],
+    dispositionReviewIds: epoch.dispositionReviews.map((review) => review.reviewReceiptId),
     evidenceEntryIds: evidenceEntries.map((entry) => entry.evidenceEntryId),
     derivedFindingCount: 0,
   });
@@ -1571,12 +1582,13 @@ describe('strict lineage, expression receipt and Analyst disposition fail-closed
 });
 
 type StrictSemanticFixture = ReturnType<typeof createSingleHypothesisEpochFixture>;
-type StrictFalsificationOutcome = 'not-required' | 'refuted' | 'unknown';
+type StrictFalsificationOutcome = 'not-required' | 'refuted' | 'survived' | 'unknown';
 
 /**
  * 在单假设夹具的同一 review context 上为任意假设生成宿主封印的 falsification 输入：
  * - not-required：不登记反查，verdict 为 not-required（与夹具原有假设相同）；
  * - refuted：以 handler 执行收据作反查并命中 population 内的 fact-handler；
+ * - survived：以 handler 执行收据作反查（required）但没有反例，verdict 为 survived；
  * - unknown：登记 handler 反查但不执行，verdict 为 unknown。
  * cluster set 不随假设数量变化，因此夹具的 currentAnalysisFixpointHash 仍可直接用于 fixpoint。
  */
@@ -1588,13 +1600,13 @@ function createFalsificationFor(
   const receipt = semantic.executionReceipt;
   const enrolledCounterqueryIds = outcome === 'not-required' ? [] : [receipt.obligationId];
   const executions =
-    outcome === 'refuted'
+    outcome === 'refuted' || outcome === 'survived'
       ? [
           {
             counterqueryId: receipt.obligationId,
             obligationId: receipt.obligationId,
             executionReceipt: receipt,
-            counterexampleFactIds: ['fact-handler'],
+            counterexampleFactIds: outcome === 'refuted' ? ['fact-handler'] : [],
           },
         ]
       : [];
@@ -2439,5 +2451,323 @@ describe('strict Analyst binds counterquery execution receipts from population a
         }))
       )
     ).toThrow(/^STRICT_ANALYST_COUNTERQUERY_ID_MISMATCH: hypothesis-handler$/u);
+  });
+});
+
+/**
+ * L7-P5r5（第五轮审计）：assertStrictAnalystEpochIntegrity 是哈希级绑定，非有限数在 hashCanonical
+ * 里坍缩成 null，跨进程 JSON 文本在合法值为 null 的位置写入 1e400 后仍可能通过。注释登记的“已知
+ * 可通过位置”必须如实：除 clustered 处置行外，已执行反查的 falsifications[].executions[] 里
+ * executionReceipt.continuation 与 executionReceipt.fileExecutions[].continuation 同样能通过完整性复核、
+ * fixpoint 与 lineage。本组只钉住现状与注释口径（列出已知位置、写明未穷举证明、不写排他断言），
+ * 不改校验行为；以后若收紧了某个位置，这里会失败，提示同步改注释。
+ */
+describe('strict Analyst epoch integrity documents known non-finite pass-through positions (L7-P5r5)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  type JsonPath = readonly (string | number)[];
+  const NON_FINITE_SENTINEL = '__strict_non_finite_sentinel__';
+  const EXECUTION_RECEIPT_CONTINUATION: JsonPath = [
+    'falsifications',
+    0,
+    'executions',
+    0,
+    'executionReceipt',
+    'continuation',
+  ];
+  const FILE_EXECUTION_CONTINUATION: JsonPath = [
+    'falsifications',
+    0,
+    'executions',
+    0,
+    'executionReceipt',
+    'fileExecutions',
+    0,
+    'continuation',
+  ];
+
+  function jsonChild(parent: unknown, key: string | number): unknown {
+    if (typeof parent !== 'object' || parent === null) {
+      throw new Error(`TEST_JSON_PATH_MISSING: ${String(key)}`);
+    }
+    return Reflect.get(parent, key);
+  }
+
+  function readJsonPath(root: unknown, path: JsonPath): unknown {
+    return path.reduce<unknown>((parent, key) => jsonChild(parent, key), root);
+  }
+
+  /**
+   * 模拟跨进程 JSON 文本：把 path 处合法为 null 的叶子写成字面量 1e400，再经 JSON.parse 读回
+   * （得到 Infinity）。path 指向的不是 null 时直接报错，避免夹具漂移后测试空转。
+   */
+  function withJsonNonFiniteAt(epoch: StrictAnalystEpochV1, path: JsonPath): StrictAnalystEpochV1 {
+    const copy: unknown = JSON.parse(JSON.stringify(epoch));
+    const leaf = path[path.length - 1];
+    const parent = readJsonPath(copy, path.slice(0, -1));
+    if (
+      leaf === undefined ||
+      typeof parent !== 'object' ||
+      parent === null ||
+      Reflect.get(parent, leaf) !== null
+    ) {
+      throw new Error(`TEST_NON_FINITE_PATH_NOT_NULL: ${path.join('.')}`);
+    }
+    Reflect.set(parent, leaf, NON_FINITE_SENTINEL);
+    return JSON.parse(
+      JSON.stringify(copy).replace(`"${NON_FINITE_SENTINEL}"`, '1e400')
+    ) as StrictAnalystEpochV1;
+  }
+
+  function fixpointOf(semantic: StrictSemanticFixture, epoch: StrictAnalystEpochV1) {
+    return createStrictAnalysisFixpointV1({
+      finalExpandedSchedule: semantic.finalExpandedSchedule,
+      terminalObligations: semantic.terminalObligations,
+      epochs: [epoch],
+    });
+  }
+
+  /** assertStrictAnalystEpochIntegrity 的 JSDoc，去掉注释记号后逐行拼接，避免短语被换行拆开漏检。 */
+  function integrityDocComment(): string {
+    const source = readFileSync(
+      new URL('../src/agent/production/strict/analyst.ts', import.meta.url),
+      'utf8'
+    );
+    const end = source.indexOf('export function assertStrictAnalystEpochIntegrity(');
+    const start = source.lastIndexOf('/**', end);
+    expect(end, 'assertStrictAnalystEpochIntegrity declaration').toBeGreaterThan(0);
+    expect(start, 'assertStrictAnalystEpochIntegrity JSDoc').toBeGreaterThan(0);
+    return source
+      .slice(start, end)
+      .split('\n')
+      .map((line) =>
+        line
+          .trim()
+          .replace(/^(?:\/\*+|\*+\/?)/u, '')
+          .replace(/\*+\/$/u, '')
+          .trim()
+      )
+      .join('');
+  }
+
+  it.each([
+    ['survived', 'executionReceipt.continuation', EXECUTION_RECEIPT_CONTINUATION],
+    ['survived', 'executionReceipt.fileExecutions[].continuation', FILE_EXECUTION_CONTINUATION],
+    ['refuted', 'executionReceipt.continuation', EXECUTION_RECEIPT_CONTINUATION],
+    ['refuted', 'executionReceipt.fileExecutions[].continuation', FILE_EXECUTION_CONTINUATION],
+  ] as const)('passes a %s epoch whose stored counterquery %s was written as 1e400 across processes', (outcome, _label, path) => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome }],
+        [{ hypothesisId: 'hypothesis-handler', status: outcome }]
+      )
+    );
+    expect(epoch.falsifications[0]?.verdict).toBe(outcome);
+    const baselineFixpoint = fixpointOf(semantic, epoch);
+    const tampered = withJsonNonFiniteAt(epoch, path);
+    expect(readJsonPath(tampered, path)).toBe(Number.POSITIVE_INFINITY);
+    expect(tampered.epochHash).toBe(epoch.epochHash);
+    // 存储的 verdict 不变。回执级 continuation 为 Infinity 时，按 Core isCompleteCounterqueryExecution
+    // （要求回执 continuation === null）重判存储的执行行已不完整，存储内容自相矛盾却仍能通过；
+    // fileExecutions 级不进入该谓词。注释如实登记，不改行为。
+    expect(tampered.falsifications[0]?.verdict).toBe(outcome);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).not.toThrow();
+    expect(fixpointOf(semantic, tampered).fixpointHash).toBe(baselineFixpoint.fixpointHash);
+    // 重建用 hashCanonical 比较存储回执与权威回执，Infinity 坍缩成 null 后相等，replaced 诊断不触发。
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['executionReceipt.continuation', EXECUTION_RECEIPT_CONTINUATION],
+    ['executionReceipt.fileExecutions[].continuation', FILE_EXECUTION_CONTINUATION],
+  ] as const)('keeps the Producer lineage of a survived epoch whose stored counterquery %s was written as 1e400', (_label, path) => {
+    const { lineage, lineageInput } = createLineageFixture([evidenceEntry('E-1')], (semantic) =>
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome: 'survived' }],
+        [{ hypothesisId: 'hypothesis-handler', status: 'survived' }]
+      )
+    );
+    expect(lineageInput.epoch.falsifications[0]?.executions).toHaveLength(1);
+    const tampered = withJsonNonFiniteAt(lineageInput.epoch, path);
+    expect(readJsonPath(tampered, path)).toBe(Number.POSITIVE_INFINITY);
+    const rebuilt = createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered });
+    expect(rebuilt.hypothesisHash).toBe(lineage.hypothesisHash);
+    expect(rebuilt.lineageHash).toBe(lineage.lineageHash);
+  });
+
+  it.each([
+    'reasonCode',
+    'reviewerReceiptId',
+    'owner',
+    'resumePoint',
+  ] as const)('passes a clustered disposition row whose null %s was written as 1e400', (field) => {
+    const { lineage, lineageInput, semantic } = createLineageFixture();
+    const { epoch } = lineageInput;
+    expect(epoch.clusterSet.dispositions[0]?.status).toBe('clustered');
+    const path: JsonPath = ['clusterSet', 'dispositions', 0, field];
+    const tampered = withJsonNonFiniteAt(epoch, path);
+    expect(readJsonPath(tampered, path)).toBe(Number.POSITIVE_INFINITY);
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).not.toThrow();
+    expect(fixpointOf(semantic, tampered).fixpointHash).toBe(
+      fixpointOf(semantic, epoch).fixpointHash
+    );
+    expect(
+      createStrictProducerLineageReceiptV1({ ...lineageInput, epoch: tampered }).lineageHash
+    ).toBe(lineage.lineageHash);
+  });
+
+  // 对照：顶层 executionReceipts 原样交给 Core，同一字段写入非有限数由 Core 规范 JSON 拒绝。
+  it.each([
+    ['continuation', ['executionReceipts', 0, 'continuation']],
+    [
+      'fileExecutions[].continuation',
+      ['executionReceipts', 0, 'fileExecutions', 0, 'continuation'],
+    ],
+  ] as const)('rejects a top-level execution receipt whose %s was written as 1e400', (_label, path) => {
+    const semantic = createSingleHypothesisEpochFixture();
+    const epoch = validateStrictAnalystEpochV1(
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome: 'survived' }],
+        [{ hypothesisId: 'hypothesis-handler', status: 'survived' }]
+      )
+    );
+    const tampered = withJsonNonFiniteAt(epoch, path);
+    expect(() => assertStrictAnalystEpochIntegrity(tampered)).toThrow(
+      /Canonical JSON does not accept non-finite numbers/u
+    );
+  });
+
+  /** 收集 epoch 里所有值为 null 的叶子路径（数组下标按数字记），供逐个替换核对。 */
+  function nullLeafPaths(value: unknown, path: JsonPath = []): JsonPath[] {
+    if (value === null) {
+      return [path];
+    }
+    if (Array.isArray(value)) {
+      return value.flatMap((item, index) => nullLeafPaths(item, [...path, index]));
+    }
+    if (typeof value === 'object') {
+      return Object.entries(value).flatMap(([key, item]) => nullLeafPaths(item, [...path, key]));
+    }
+    return [];
+  }
+
+  const CLUSTERED_ROW_PASS_THROUGH = [
+    'clusterSet.dispositions.0.reasonCode',
+    'clusterSet.dispositions.0.reviewerReceiptId',
+    'clusterSet.dispositions.0.owner',
+    'clusterSet.dispositions.0.resumePoint',
+  ];
+  const STORED_EXECUTION_PASS_THROUGH = [
+    'falsifications.0.executions.0.executionReceipt.continuation',
+    'falsifications.0.executions.0.executionReceipt.fileExecutions.0.continuation',
+  ];
+  const DOCUMENTED_REJECTED_NULL_LEAVES = [
+    'executionReceipts.0.continuation',
+    'executionReceipts.0.fileExecutions.0.continuation',
+    'inductions.0.zeroHypothesisReason',
+    'inductions.0.zeroHypothesisReviewReceiptId',
+    'population.denominator.continuation',
+    'population.parentPopulationHash',
+  ];
+  type EpochInputBuilder = (semantic: StrictSemanticFixture) => StrictAnalystEpochInputV1;
+  const singleOutcome =
+    (outcome: 'survived' | 'refuted' | 'unknown'): EpochInputBuilder =>
+    (semantic) =>
+      createMultiHypothesisEpochInput(
+        semantic,
+        [{ hypothesisId: 'hypothesis-handler', outcome }],
+        [{ hypothesisId: 'hypothesis-handler', status: outcome }]
+      );
+  const narrowedChain: EpochInputBuilder = (semantic) =>
+    createMultiHypothesisEpochInput(
+      semantic,
+      [
+        { hypothesisId: 'hypothesis-handler', outcome: 'not-required' },
+        { hypothesisId: 'hypothesis-middle', outcome: 'not-required' },
+        { hypothesisId: 'hypothesis-root', outcome: 'not-required' },
+      ],
+      [
+        {
+          hypothesisId: 'hypothesis-handler',
+          status: 'narrowed',
+          causalParentHypothesisId: 'hypothesis-middle',
+        },
+        {
+          hypothesisId: 'hypothesis-middle',
+          status: 'narrowed',
+          causalParentHypothesisId: 'hypothesis-root',
+        },
+        { hypothesisId: 'hypothesis-root', status: 'survived' },
+      ]
+    );
+
+  // 注释写的是“按现有测试夹具逐个替换 null 叶子核对的结果”：这里对注释列出的夹具形态逐个替换全部
+  // null 叶子，钉住可通过集合与被拒集合恰好是注释登记的两组。夹具或校验变化导致集合变化时本用例
+  // 失败，提示同步改注释；它只覆盖这些夹具形态，不是穷举证明。
+  it.each<readonly [string, EpochInputBuilder, readonly string[]]>([
+    ['single not-required', (semantic) => semantic.epochInput, CLUSTERED_ROW_PASS_THROUGH],
+    [
+      'survived with an executed counterquery',
+      singleOutcome('survived'),
+      [...CLUSTERED_ROW_PASS_THROUGH, ...STORED_EXECUTION_PASS_THROUGH],
+    ],
+    [
+      'refuted with an executed counterquery',
+      singleOutcome('refuted'),
+      [...CLUSTERED_ROW_PASS_THROUGH, ...STORED_EXECUTION_PASS_THROUGH],
+    ],
+    [
+      'unknown without an executed counterquery',
+      singleOutcome('unknown'),
+      CLUSTERED_ROW_PASS_THROUGH,
+    ],
+    ['multi-hypothesis narrowed chain', narrowedChain, CLUSTERED_ROW_PASS_THROUGH],
+  ])('enumerates every null leaf of the %s fixture and matches the documented pass-through set', (_label, build, expectedPassing) => {
+    const epoch = validateStrictAnalystEpochV1(build(createSingleHypothesisEpochFixture()));
+    const passing: string[] = [];
+    const rejected: string[] = [];
+    for (const path of nullLeafPaths(epoch)) {
+      const tampered = withJsonNonFiniteAt(epoch, path);
+      let integrityPassed = true;
+      try {
+        assertStrictAnalystEpochIntegrity(tampered);
+      } catch (err: unknown) {
+        integrityPassed = false;
+        expect(err).toBeInstanceOf(Error);
+      }
+      (integrityPassed ? passing : rejected).push(path.join('.'));
+    }
+    expect(passing.sort()).toEqual([...expectedPassing].sort());
+    expect(rejected.sort()).toEqual([...DOCUMENTED_REJECTED_NULL_LEAVES].sort());
+  });
+
+  it('lists the known pass-through positions in the integrity comment without an exclusive claim', () => {
+    const comment = integrityDocComment();
+    const nonFiniteNoteStart = comment.indexOf('非有限数');
+    expect(nonFiniteNoteStart, 'non-finite note').toBeGreaterThan(-1);
+    const nonFiniteNote = comment.slice(nonFiniteNoteStart);
+    // 已知能通过的位置都要登记，并明确不是穷举证明。
+    expect(nonFiniteNote).toContain('未穷举证明');
+    expect(nonFiniteNote).toContain('clustered');
+    expect(nonFiniteNote).toContain('executionReceipt.continuation');
+    expect(nonFiniteNote).toContain('executionReceipt.fileExecutions[].continuation');
+    // 枚举用例钉住的被拒对照也要在注释里登记，注释与枚举结果同步。
+    for (const rejectedLeaf of [
+      'parentPopulationHash',
+      'denominator.continuation',
+      'zeroHypothesisReason',
+      'zeroHypothesisReviewReceiptId',
+    ]) {
+      expect(nonFiniteNote).toContain(rejectedLeaf);
+    }
+    // 第五轮审计确认的缺陷：“已核对能这样通过的只有 clustered 处置行……”是不成立的排他断言。
+    expect(nonFiniteNote).not.toMatch(/只有|仅有|唯一/u);
   });
 });
