@@ -357,10 +357,12 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
   //     或执行路径，或测试、检查（带修饰语）、单测、用例、脚本、构建、编译、打包、安装、命令、示例这类命令对象）
   //     时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”（L6-P16r4）、“执行 SQL 查询”这类名单外拉丁宾语
   //     与“执行/重试”斜杠并列（L6-P16r5）不命中；
-  //   - “git 状态”“git 工作区状态”“git status”命中（查看工作区状态）；
+  //   - git 状态分支只在查看动作（查看/检查/确认/看看、check/show/view）直接带出 git 状态时命中：“查看 git 状态”
+  //     “检查 git 仓库状态”“check git status”命中；“理解 git 状态机实现”“分析 git 仓库状态同步流程”“阅读 git 状态
+  //     管理逻辑”“Read how the parser handles git status output”这类讲 git 状态实现的步骤不命中（L6-P16r7）；
   //   - 已知仍会过宽命中：白名单命令名 + 任意 ASCII 词（“执行 git hooks”“运行 Node 18”“执行 make 目标”）、
   //     英文分支命中路径片段与散文（src/cli/commands.ts、src/runner/run.ts、“run loop”）、裸“命令/终端”子串
-  //     （“命令行解析模块”）。
+  //     （“命令行解析模块”）、查看动作 + git 状态后接实现类名词（“查看 git 状态机实现”）。
   // r3–r5 每轮收紧这里的措辞，复查都能再举出新的命中写法，所以措辞不再承担保护阅读步骤的职责：带明确文件
   // 目标的步骤由 #findMatchingStep 的 terminal 文件目标门槛挡住，语义回退一律不能完成或续做它（L6-P16r6）。
   // 这条规则的过宽命中因此只会落在没有文件目标的步骤上；计划进度只是建议性信号，不作门禁。
@@ -372,7 +374,8 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
     pattern: new RegExp(
       `(?<!可)(?:运行|执行)\\s*[\`'"“「]?\\s*(?:${TERMINAL_LATIN_COMMAND_OBJECT}|` +
         '(?:单元|集成|端到端|回归|冒烟)?测试|(?:类型|静态|代码)检查|单测|用例|脚本|构建|编译|打包|安装|命令|示例|样例)' +
-        '|\\bgit\\s*(?:工作区|仓库)?\\s*(?:状态|status\\b)' +
+        '|(?:查看|检查|确认|看看|\\b(?:check(?:s|ing)?|show(?:s|ing)?|view(?:s|ing)?)\\s)' +
+        '\\s*git\\s*(?:工作区|仓库)?\\s*(?:状态|status\\b)' +
         '|命令|终端|\\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\\b'
     ),
   },
@@ -901,6 +904,10 @@ export class PlanTracker {
         const inspectionTargets =
           toolName === 'terminal' ? inspectionFileTargets(step.description) : [];
         if (inspectionTargets.length === 0) {
+          if (toolName === 'terminal' && targets.length > 0) {
+            // 执行对象豁免：文件目标全部是“运行/执行”被执行的脚本，门槛不作用，语义回退照常完成或续做。
+            this.#noteTerminalExecutedObjectExemption(`${toolName}.${actionName}`, step, targets);
+          }
           return finish(step);
         }
         gated.push({ step, targets: inspectionTargets });
@@ -925,6 +932,22 @@ export class PlanTracker {
         `${gated.length} step(s): ${blocked}; only reading/outlining the file, an action naming it ` +
         `at a path boundary, or an explicit step keyword can complete or continue such a step; ` +
         (matched ? `matched step "${matched.description}" instead` : 'no step matched this action')
+    );
+  }
+
+  /**
+   * terminal 语义回退因“文件目标全部是被执行对象”而豁免门槛、直接完成或续做步骤，是改变匹配结果的分叉路径：
+   * 与门槛拦截同口径记 debug 诊断（L6-P16r7），回放偏离判断时能看出步骤是经豁免完成的。
+   */
+  #noteTerminalExecutedObjectExemption(actionLabel: string, step: PlanStep, targets: string[]) {
+    // 只写工具与动作名，不写原始命令：命令参数可能带凭据或用户路径。
+    const outcome =
+      step.status === 'done' ? 'counted as continuing the done step' : 'completing the step';
+    logPlanDiagnostic(
+      `[PlanTracker] ${actionLabel} semantic fallback took the executed-object exemption on ` +
+        `"${step.description}" [${targets.join(', ')}] (${step.status}): every file target is the ` +
+        `object of a run/exec verb, so no file is left to inspect and the terminal gate does not apply; ` +
+        outcome
     );
   }
 

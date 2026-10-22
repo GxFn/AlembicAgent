@@ -2265,6 +2265,126 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   });
 });
 
+/**
+ * L6-P16r7：r6 复查的两条收尾。
+ *   1. terminal 规则里的 git 状态分支没有锚定查看动作，任意终端命令都能完成“理解 git 状态机实现”这类
+ *      不带文件目标、也不是查看状态的步骤，后果链与 r5 相同（误完成 → 真实偏离被吞 → 回顾把没做的步骤列为已完成）；
+ *      只有“查看/检查/确认/看看/check/show/view”直接带出 git 状态时才算查看状态步骤。
+ *   2. 文件目标全部是“运行/执行”被执行对象时，门槛豁免让语义回退直接完成步骤，这条分叉路径要有 debug 诊断。
+ */
+describe('PlanTracker terminal git-status anchor and executed-object exemption (L6-P16r7)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const exec = (command: string): PlanCall => [
+    'terminal',
+    { action: 'exec', params: { command } },
+    { exitCode: 0, stdout: 'ok', stderr: '' },
+  ];
+  const read = (path: string): PlanCall => [
+    'code',
+    { action: 'read', params: { path } },
+    'export const value = 1;',
+  ];
+
+  it.each([
+    '理解 git 状态机实现',
+    '分析 git 仓库状态同步流程',
+    '阅读 git 状态管理逻辑',
+    'Read how the parser handles git status output',
+  ])('keeps the non-viewing git status step "%s" pending after terminal.exec ls', (step) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec('ls')]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it.each([
+    '查看 git 状态',
+    '检查 git 仓库状态',
+    'check git status',
+  ])('still lets terminal.exec complete the viewing step "%s"', (step) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec('ls')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it('reports the deviation instead of listing "理解 git 状态机实现" as done after ls and off-plan reads', () => {
+    const step = '理解 git 状态机实现';
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 获取项目概览和目录结构',
+        `2. ${step}`,
+        '3. 搜索错误处理和重试模式',
+        '4. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'structure', params: {} }, { tree: ['src'] }],
+    ]);
+    runPlanRound(plans, trace, 3, [exec('ls')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'pending', 'pending']);
+    runPlanRound(plans, trace, 4, [
+      ['code', { action: 'search', params: { pattern: 'retry' } }, { total: 0, matches: [] }],
+    ]);
+    for (const [iteration, file] of [
+      [5, 'src/a.ts'],
+      [6, 'src/b.ts'],
+    ] as const) {
+      runPlanRound(plans, trace, iteration, [read(file)]);
+      expect(plans.checkPlanning(planCheckState(iteration + 1), trace)).toBeNull();
+    }
+    runPlanRound(plans, trace, 7, [read('src/c.ts')]);
+    // 第 2 步从没做过：连续 3 轮读无关文件是真实偏离，不能被“计划耗尽”保持吞掉。
+    expect(plans.progress).toMatchObject({ unplannedActions: 4, consecutiveOffPlan: 3 });
+    const nudge = plans.checkPlanning(planCheckState(8), trace)?.text ?? '';
+    expect(nudge).toContain('📋 计划偏差检查');
+    expect(nudge).toContain('⏳ 未完成 (2/4)');
+    expect(nudge.indexOf(step)).toBeGreaterThan(nudge.indexOf('⏳ 未完成'));
+  });
+
+  it('logs the executed-object exemption at debug when terminal.exec completes such a step', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const exemptionLogs = () =>
+      debug.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes('executed-object exemption'));
+
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan('1. 阅读并运行 scripts/check.sh 理解检查逻辑\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plans, trace, 2, [exec('ls')]);
+    // 匹配行为不变（豁免仍让语义回退完成步骤），只是这条分叉路径现在可回放。
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    const logs = exemptionLogs();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('terminal.exec');
+    expect(logs[0]).toContain('阅读并运行 scripts/check.sh 理解检查逻辑');
+    expect(logs[0]).toContain('[scripts/check.sh]');
+    expect(logs[0]).toContain('pending');
+    // 与门槛诊断同口径：只写工具与动作名，不写原始命令。
+    expect(logs[0]).not.toContain('"ls"');
+
+    // 对照：没有文件目标的命令步骤不走豁免路径，不记这条诊断。
+    debug.mockClear();
+    const plain = new PlanTracker();
+    const plainTrace = new ActiveContext();
+    plainTrace.setPlan('1. 运行单元测试\n2. 阅读 src/server.ts', 1);
+    runPlanRound(plain, plainTrace, 2, [exec('ls')]);
+    expect(stepStatuses(plainTrace)).toEqual(['done', 'pending']);
+    expect(exemptionLogs()).toEqual([]);
+  });
+});
+
 describe('PlanTracker trace port (L6-P16 C19)', () => {
   it('drives PlanTracker through the public ExplorationTrace port, honouring failed reads', () => {
     const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];
