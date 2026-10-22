@@ -11,6 +11,8 @@
  *    error|aborted），失败文案另带 path=<port>.<method>；拒绝值无法字符串化时（无原型对象、message
  *    getter 抛错的 Error、已撤销的 Proxy）文案降级为 [unprintable error value: …] 并另记
  *    GRAPH_QUERY_UNPRINTABLE_ERROR，痕迹与 path 照常保留；下标 > 0 的成功读取另记 GRAPH_QUERY_FALLBACK；
+ *    graph.overview 共用同一非 ok 分支，失败文案同样带 path=projectGraph.getOverview 与降级诊断
+ *    （getOverview 不是 legacy 读取器，不记 GRAPH_QUERY_LEGACY_READER）；
  * 5. knowledge.prime/detail 在 knowledgeRead 缺省时回落 knowledgeRepo 会记一条 info 日志，
  *    search-only 回落仍只用 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
  *
@@ -393,55 +395,56 @@ describe('graph legacy reader trace survives a throwing or canceled read', () =>
     expect(result.error).not.toContain('path=');
   });
 
+  // 宿主或测试替身可能以无法字符串化的值拒绝：字符串化本身抛错时，旧实现在留痕之前就落进 handle()
+  // 外层 catch，只剩 'Graph <stage> failed: …'，既没有 path 也没有 GRAPH_QUERY_LEGACY_READER。
+  // 这组拒绝值同时供 query 与 overview 两条读取路径的用例使用（两者共用 readGraph 的非 ok 分支）。
+  function unprintableValues(): Array<{ label: string; make: () => unknown }> {
+    return [
+      { label: 'a null-prototype object', make: () => Object.create(null) },
+      {
+        label: 'an Error whose message getter throws',
+        make: () => {
+          const error = new Error('hidden');
+          Object.defineProperty(error, 'message', {
+            get() {
+              throw new Error('getter');
+            },
+          });
+          return error;
+        },
+      },
+      {
+        label: 'an Error whose message getter throws a null-prototype object',
+        make: () => {
+          const error = new Error('hidden');
+          Object.defineProperty(error, 'message', {
+            get() {
+              throw Object.create(null);
+            },
+          });
+          return error;
+        },
+      },
+      {
+        label: 'a revoked Proxy',
+        make: () => {
+          const { proxy, revoke } = Proxy.revocable({}, {});
+          revoke();
+          return proxy;
+        },
+      },
+    ];
+  }
+
+  const UNPRINTABLE = /\[unprintable error value: [^\]]+\]/;
+
+  function unprintableWarnings(result: ToolResult) {
+    return (result._meta?.diagnosticWarnings ?? []).filter(
+      (warning) => warning.code === 'GRAPH_QUERY_UNPRINTABLE_ERROR'
+    );
+  }
+
   describe('rejection values that cannot be stringified', () => {
-    // 宿主或测试替身可能以无法字符串化的值拒绝：字符串化本身抛错时，旧实现在留痕之前就落进 handle()
-    // 外层 catch，只剩 'Graph query failed: …'，既没有 path 也没有 GRAPH_QUERY_LEGACY_READER。
-    function unprintableValues(): Array<{ label: string; make: () => unknown }> {
-      return [
-        { label: 'a null-prototype object', make: () => Object.create(null) },
-        {
-          label: 'an Error whose message getter throws',
-          make: () => {
-            const error = new Error('hidden');
-            Object.defineProperty(error, 'message', {
-              get() {
-                throw new Error('getter');
-              },
-            });
-            return error;
-          },
-        },
-        {
-          label: 'an Error whose message getter throws a null-prototype object',
-          make: () => {
-            const error = new Error('hidden');
-            Object.defineProperty(error, 'message', {
-              get() {
-                throw Object.create(null);
-              },
-            });
-            return error;
-          },
-        },
-        {
-          label: 'a revoked Proxy',
-          make: () => {
-            const { proxy, revoke } = Proxy.revocable({}, {});
-            revoke();
-            return proxy;
-          },
-        },
-      ];
-    }
-
-    const UNPRINTABLE = /\[unprintable error value: [^\]]+\]/;
-
-    function unprintableWarnings(result: ToolResult) {
-      return (result._meta?.diagnosticWarnings ?? []).filter(
-        (warning) => warning.code === 'GRAPH_QUERY_UNPRINTABLE_ERROR'
-      );
-    }
-
     it.each(
       unprintableValues()
     )('keeps path and the legacy trace when the index-0 legacy reader rejects with $label', async ({
@@ -595,6 +598,145 @@ describe('graph legacy reader trace survives a throwing or canceled read', () =>
         expect.objectContaining({
           code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
           stage: 'query(overrides)',
+        }),
+      ]);
+    });
+  });
+
+  /**
+   * I23 第六轮补修（L4-P34r6）：graph.overview 与 query 走同一个 readGraph 非 ok 分支（stage='overview'，
+   * 唯一读取器 projectGraph.getOverview）。父提交上 overview 以无法字符串化的值拒绝时只剩
+   * 'Graph overview failed: …'，既无 path 也无诊断；这里按 query 的口径钉住失败结果：文案为
+   * 'Graph overview <status>: <原因> (path=projectGraph.getOverview)'，降级占位另记
+   * GRAPH_QUERY_UNPRINTABLE_ERROR（stage=overview）。getOverview 是生产宿主端口而非 legacy 读取器，
+   * 与 query 的非 legacy 主读取器同一口径：失败时不记 GRAPH_QUERY_LEGACY_READER。
+   */
+  describe('graph.overview failure shares the query failure contract', () => {
+    function overviewContext(getOverview: () => unknown, abortSignal?: AbortSignal): ToolContext {
+      return {
+        projectRoot,
+        projectGraph: { getOverview },
+        ...(abortSignal ? { abortSignal } : {}),
+      };
+    }
+
+    it.each(
+      unprintableValues()
+    )('keeps the reader path and degraded diagnostic when getOverview rejects with $label', async ({
+      make,
+    }) => {
+      const result = await handleGraph(
+        'overview',
+        {},
+        overviewContext(() => Promise.reject(make()))
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).not.toContain('Graph overview failed');
+      expect(result.error).toMatch(/^Graph overview error: /);
+      expect(result.error).toMatch(UNPRINTABLE);
+      expect(result.error).toMatch(/ \(path=projectGraph\.getOverview\)$/);
+      // 非 legacy 读取器：不留旧宿主痕迹，只记降级诊断；普通读取错误不写 resultStatus。
+      expect(graphLegacyWarnings(result)).toEqual([]);
+      const degraded = unprintableWarnings(result);
+      expect(degraded).toHaveLength(1);
+      expect(degraded[0]).toMatchObject({ tool: 'graph', stage: 'overview' });
+      expect(degraded[0]?.message).toMatch(
+        /^path=projectGraph\.getOverview; reason=unprintable-error-value; status=error; stringifyError=.+$/
+      );
+      expect(result._meta?.resultStatus).toBeUndefined();
+      expect(result._meta?.fallbackUsed).not.toBe(true);
+    });
+
+    it('pins the full overview failure text and diagnostics for a throwing message getter', async () => {
+      const [, withThrowingGetter] = unprintableValues();
+      const result = await handleGraph(
+        'overview',
+        {},
+        overviewContext(() => {
+          throw withThrowingGetter?.make();
+        })
+      );
+      expect(result.error).toBe(
+        'Graph overview error: [unprintable error value: getter] (path=projectGraph.getOverview)'
+      );
+      expect(result._meta?.diagnosticWarnings).toEqual([
+        {
+          code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
+          tool: 'graph',
+          stage: 'overview',
+          message:
+            'path=projectGraph.getOverview; reason=unprintable-error-value; status=error; stringifyError=getter',
+        },
+      ]);
+    });
+
+    it('keeps ordinary overview failures on the plain path without any diagnostic', async () => {
+      for (const rejection of [new Error('boom'), 'str-boom']) {
+        const result = await handleGraph(
+          'overview',
+          {},
+          overviewContext(() => Promise.reject(rejection))
+        );
+        expect(result.error).toBe(
+          `Graph overview error: ${rejection instanceof Error ? rejection.message : rejection} (path=projectGraph.getOverview)`
+        );
+        // 能转成文本的值不走降级分支；getOverview 不是 legacy 读取器，也不留旧宿主痕迹。
+        expect(result._meta?.diagnosticWarnings ?? []).toEqual([]);
+      }
+    });
+
+    it('names getOverview when the overview read is canceled in flight', async () => {
+      const controller = new AbortController();
+      let finish!: (value: null) => void;
+      const pending = new Promise<null>((resolve) => {
+        finish = resolve;
+      });
+      const result = await handleGraph(
+        'overview',
+        {},
+        overviewContext(() => {
+          // 读取进行中宿主取消：runOperation 先定终态为 aborted，不合作的读取器稍后才结束。
+          controller.abort();
+          return pending;
+        }, controller.signal)
+      );
+      finish(null);
+      expect(result.ok).toBe(false);
+      expect(result._meta?.resultStatus).toBe('aborted');
+      expect(result.error).toMatch(/^Graph overview aborted: /);
+      expect(result.error).toMatch(/ \(path=projectGraph\.getOverview\)$/);
+      expect(graphLegacyWarnings(result)).toEqual([]);
+    });
+
+    it('lifts the overview degraded diagnostic onto the adapter envelope', async () => {
+      const adapter = new ToolRouterAdapter({
+        contextFactory: {
+          create: () => ({
+            projectRoot,
+            tokenBudget: 4000,
+            projectGraph: { getOverview: () => Promise.reject(Object.create(null)) },
+          }),
+        },
+      });
+      const envelope = await adapter.execute({
+        toolId: 'graph',
+        args: { action: 'overview' },
+        surface: 'runtime',
+        actor: { role: 'agent' },
+        source: { kind: 'runtime' },
+      });
+      expect(envelope).toMatchObject({ ok: false, status: 'error' });
+      expect(envelope.text).not.toContain('Graph overview failed');
+      expect(envelope.text).toMatch(UNPRINTABLE);
+      expect(envelope.text).toContain('path=projectGraph.getOverview');
+      expect(envelope.diagnostics.warnings).toEqual([
+        expect.objectContaining({
+          code: 'GRAPH_QUERY_UNPRINTABLE_ERROR',
+          tool: 'graph',
+          stage: 'overview',
+          message: expect.stringMatching(
+            /^path=projectGraph\.getOverview; reason=unprintable-error-value; status=error; /
+          ),
         }),
       ]);
     });

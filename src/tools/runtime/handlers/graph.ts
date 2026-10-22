@@ -220,6 +220,11 @@ export async function handle(
 ): Promise<ToolResult> {
   try {
     if (action === 'overview') {
+      // overview 与 query 共用 readGraph 的非 ok 分支（stage='overview'），失败口径与 query 一致：文案为
+      // 'Graph overview <status>: <原因> (path=projectGraph.getOverview)'；拒绝值无法字符串化时降级为占位文案
+      // 并另记 GRAPH_QUERY_UNPRINTABLE_ERROR（stage=overview，诊断码沿用 query 前缀，不另起一套）。
+      // getOverview 是生产宿主端口而非 legacy 读取器，失败时不记 GRAPH_QUERY_LEGACY_READER。
+      // 守护见 test/tool-runtime-legacy-host-compat.test.ts 的 overview 失败用例。
       return await readGraph(
         [reader('projectGraph', ctx.projectGraph, 'getOverview')],
         ctx,
