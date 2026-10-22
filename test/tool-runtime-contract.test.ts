@@ -4878,7 +4878,9 @@ describe('L4-P30 scan_production evidence self-rescue channel (I44)', () => {
     expect(cancelled.status).toBe('aborted');
   });
 
-  it('keeps the scan_production opening limited to read-only evidence actions and strict mode tool-less', async () => {
+  // 严格链的无工具边界只由阶段配置表达（决定④，审阅包 L4-P35）：ScanProduce 不再有严格构造选项，
+  // 对应断言移到 strict-production-chain 的 buildStrictProductionPipelineStagesV1 阶段配置用例。
+  it('keeps the scan_production opening limited to read-only evidence actions', async () => {
     const { adapter, capability } = await scanProduceFixture();
 
     expect(capability.allowedTools).toEqual({
@@ -4897,10 +4899,6 @@ describe('L4-P30 scan_production evidence self-rescue channel (I44)', () => {
         `"${toolId}.${action}" not allowed in capability "scan_production"`
       );
     }
-
-    const strict = new ScanProduce({ strictColdStart: true });
-    expect(strict.allowedTools).toEqual({});
-    expect(strict.promptFragment).not.toContain('evidence');
   });
 
   // L4-P30r3（I44 / C023）：自救说明必须送达模型，而不是只写在能力 promptFragment 上。

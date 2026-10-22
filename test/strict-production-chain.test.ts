@@ -11,7 +11,6 @@ import {
 } from '@alembic/core/production';
 import { canonicalJsonStringify } from '@alembic/core/project-context-foundation';
 import { describe, expect, it, vi } from 'vitest';
-import { buildAnalysisArtifact } from '../src/agent/evaluation/analysisArtifact.js';
 import {
   buildIndependentReviewPrompt,
   computeJudgeCalibration,
@@ -19,7 +18,6 @@ import {
   IndependentValueReviewer,
 } from '../src/agent/evaluation/IndependentValueReviewer.js';
 import { InvestigatedEmptyReviewer } from '../src/agent/evaluation/InvestigatedEmptyReviewer.js';
-import { ActiveContext } from '../src/agent/memory/ActiveContext.js';
 import {
   createStrictAnalysisContextProjectionV1,
   createStrictAnalysisEpochSnapshotV1,
@@ -32,6 +30,7 @@ import {
   buildStrictAnalystPrompt,
   buildStrictProducerPrompt,
 } from '../src/agent/production/StrictProductionPrompts.js';
+import { buildStrictProductionPipelineStagesV1 } from '../src/agent/production/StrictProductionStages.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import {
   type PlanContextProjectionV1,
@@ -40,8 +39,6 @@ import {
 import type { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import type { AgentRunInput, AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
-import { GenerateProduce } from '../src/tools/runtime/toolsets/GenerateProduce.js';
-import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
 import {
   createExecutionReceipt,
   createReview,
@@ -213,14 +210,38 @@ describe('strict Plan cognition', () => {
   });
 });
 
-const strictStaticSchedulePort = createStrictAnalysisExpansionPortV1({
+/**
+ * L7-P09：按宿主应采用的方式封口——先用 Core createFinalExpandedMiningScheduleReceiptV1 基于端口已登记
+ * 的扩展回执预览最终日程 hash，再以 seal(expectedHash) 提交。无参 seal 只作为兼容路径留在
+ * strict-analysis-loop-seal-diagnostics 中覆盖，这里不再使用。
+ */
+function sealWithPreviewedHash(
+  port: ReturnType<typeof createStrictAnalysisExpansionPortV1>,
+  input: {
+    readonly baselineScheduleHash: string;
+    readonly baselineObligationIds: readonly string[];
+  }
+) {
+  const previewed = createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash: input.baselineScheduleHash,
+    baselineObligationIds: input.baselineObligationIds,
+    expansionReceipts: port.receipts,
+  });
+  return port.seal(previewed.finalExpandedScheduleHash);
+}
+
+const strictStaticScheduleInput = {
   baselineScheduleHash: 'schedule-1',
   baselineObligationIds: ['base-1', 'counter-1'],
   knownFactFamilies: [],
   knownSubjectRefs: [],
   obligationCap: 2,
-});
-const strictFinalSchedule = strictStaticSchedulePort.seal();
+};
+const strictStaticSchedulePort = createStrictAnalysisExpansionPortV1(strictStaticScheduleInput);
+const strictFinalSchedule = sealWithPreviewedHash(
+  strictStaticSchedulePort,
+  strictStaticScheduleInput
+);
 
 const strictContext = createStrictAnalysisContextProjectionV1({
   runId: 'run-1',
@@ -296,28 +317,9 @@ function strictRuntimePort() {
   };
 }
 
-describe('strict context and analysis artifact', () => {
-  it('round-trips the entire whitelist and forbids Markdown/live-read derivation', () => {
-    const activeContext = new ActiveContext();
-    activeContext.bindStrictAnalysisContext(strictContext);
-    activeContext.noteKeyFinding('legacy scratchpad must not leak', 'src/live.ts:1', 10);
-    const restored = ActiveContext.fromJSON(activeContext.toJSON());
-    expect(restored.distill().strictAnalysisContext).toEqual(strictContext);
-
-    const artifact = buildAnalysisArtifact(
-      { reply: '## invented\nsource.ts:1', toolCalls: [] },
-      'architecture',
-      null,
-      restored,
-      { projectRoot: '/must-not-be-read', strictColdStart: true }
-    );
-    expect(artifact.findings).toEqual([]);
-    expect(artifact.strictAnalysisContext).toEqual(strictContext);
-    expect(artifact.metadata.memoryFindingCount).toBe(0);
-    expect(artifact.metadata.derivedFindingCount).toBe(0);
-    expect(artifact.metadata.postHocLiveReadCount).toBe(0);
-  });
-
+// 严格上下文投影不再经 ActiveContext / buildAnalysisArtifact 往返（审阅包 L6-P27 / L7-P27 C45）：
+// 收口后的行为（旧字段被忽略、工件不透传、无混入告警）由 strict-production-chain-closure 覆盖。
+describe('strict context projection', () => {
   it('drops non-whitelisted context fields instead of serializing a second evidence store', () => {
     const { schemaVersion: _schemaVersion, contextHash: _contextHash, ...input } = strictContext;
     const rebuilt = createStrictAnalysisContextProjectionV1({
@@ -341,7 +343,7 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       emittedFactIds: [],
       disposition: 'inspected-no-pattern',
     });
-    const port = createStrictAnalysisExpansionPortV1({
+    const portInput: Parameters<typeof createStrictAnalysisExpansionPortV1>[0] = {
       baselineScheduleHash: `sha256:${'a'.repeat(64)}`,
       baselineObligationIds: [
         receiptA.obligationId,
@@ -358,7 +360,8 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
         counterReceipt.canonicalSubjectRef,
       ],
       obligationCap: 4,
-    });
+    };
+    const port = createStrictAnalysisExpansionPortV1(portInput);
     port.enroll({
       obligationId: counterReceipt.obligationId,
       purpose: 'counterexample',
@@ -372,7 +375,8 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
     expect(() => port.assertExecutionAllowed('not-enrolled')).toThrow(
       /STRICT_ANALYSIS_QUERY_UNENROLLED/u
     );
-    port.seal();
+    const finalSchedule = sealWithPreviewedHash(port, portInput);
+    expect(port.finalSchedule).toBe(finalSchedule);
     expect(() =>
       port.enroll({
         obligationId: 'late-query',
@@ -485,7 +489,7 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       })),
     ];
     const currentAnalysisFixpointHash = createAnalysisReviewContextHashV1({
-      finalExpandedScheduleHash: port.seal().finalExpandedScheduleHash,
+      finalExpandedScheduleHash: finalSchedule.finalExpandedScheduleHash,
       terminalObligations,
       populationHashes: [population.populationHash],
       clusterSetHashes: [clusterSet.clusterSetHash],
@@ -510,7 +514,7 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
         zeroHypothesisReason: 'insufficient-evidence',
       },
       executionReceipts: [outlierReceipt],
-      finalExpandedSchedule: port.seal(),
+      finalExpandedSchedule: finalSchedule,
       terminalObligations,
     });
     const execution = {
@@ -544,13 +548,13 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
         },
       },
       executionReceipts: [counterReceipt],
-      finalExpandedSchedule: port.seal(),
+      finalExpandedSchedule: finalSchedule,
       terminalObligations,
     });
     const epoch = validateStrictAnalystEpochV1({
       currentAnalysisFixpointHash,
       knownFactIds: ['fact-a', 'fact-b', 'fact-outlier'],
-      enrolledObligationIds: port.seal().obligationIds,
+      enrolledObligationIds: finalSchedule.obligationIds,
       population: populationInput,
       clusterInputs,
       nonClusteredDispositions: [],
@@ -605,11 +609,11 @@ describe('strict Analyst expansion, clustering, induction, and falsification', (
       'hypothesis-1',
     ]);
     const fixpoint = createStrictAnalysisFixpointV1({
-      finalExpandedSchedule: port.seal(),
+      finalExpandedSchedule: finalSchedule,
       terminalObligations,
       epochs: [epoch],
     });
-    expect(fixpoint.finalExpandedScheduleHash).toBe(port.seal().finalExpandedScheduleHash);
+    expect(fixpoint.finalExpandedScheduleHash).toBe(finalSchedule.finalExpandedScheduleHash);
   });
 });
 
@@ -628,8 +632,31 @@ const authored = {
 
 describe('strict Producer and causal repair', () => {
   it('keeps strict Producer proposal-only and removes every floor/filler tool path', () => {
-    expect(new GenerateProduce({ strictColdStart: true }).allowedTools).toEqual({});
-    expect(new ScanProduce({ strictColdStart: true }).allowedTools).toEqual({});
+    // 决定④（审阅包 L4-P35）：严格链的无工具边界只由阶段配置表达，不再由能力类的构造选项表达。
+    const strictStages = buildStrictProductionPipelineStagesV1();
+    for (const name of ['analyze', 'produce']) {
+      const stage = strictStages.find((candidate) => candidate.name === name);
+      expect(stage).toMatchObject({
+        capabilities: [],
+        additionalTools: [],
+        toolChoiceOverride: 'none',
+      });
+    }
+    // 生产入口：generateDimensionPipeline 在 strictProduction.enabled=true 时取到的就是同一组阶段。
+    const registryStages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true },
+      context: { strategyContext: { strictProduction: { enabled: true } } },
+    });
+    expect(registryStages.map((stage) => stage.name)).toEqual(
+      strictStages.map((stage) => stage.name)
+    );
+    for (const name of ['analyze', 'produce']) {
+      expect(registryStages.find((stage) => stage.name === name)).toMatchObject({
+        capabilities: [],
+        additionalTools: [],
+        toolChoiceOverride: 'none',
+      });
+    }
     const expressionSet = {
       hypothesis: { hypothesisId: 'hypothesis-1' },
       proposals: [{ expressionId: 'expression-1', kind: 'draft', authored }],

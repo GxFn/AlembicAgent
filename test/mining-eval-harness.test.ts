@@ -36,6 +36,7 @@ import {
   createStrictProductionSourceFixtureRuntimeV1,
   FrozenStrictProductionEvaluationProviderV1,
 } from '../src/agent/evaluation/StrictProductionFixtureEvaluation.js';
+import { buildStrictProductionPipelineStagesV1 } from '../src/agent/production/StrictProductionStages.js';
 
 const tempRoots: string[] = [];
 
@@ -1044,5 +1045,59 @@ describe('strict fixture runtime — 冻结 provider 闸(L7-P26)', () => {
     const preflightBlock = source.slice(preflight, source.indexOf('autoDetectProvider()'));
     expect(preflightBlock).toContain('process.exit(1)');
     expect(preflightBlock).toContain('--provider frozen-fixture');
+  });
+
+  /* L7-P09（W1-01）：fixture runtime 不再在创建时无参 seal。它用 Core
+   * createFinalExpandedMiningScheduleReceiptV1 预览最终日程 hash 写进上下文，封口交给 G1 门的
+   * seal(expectedHash)——与严格门“通过后才按预期 hash 封口”的生产语义一致，也不再触发
+   * no-argument-seal 兼容诊断。 */
+  it('previews the final schedule hash instead of sealing at creation and lets G1 seal with it', async () => {
+    const info = vi
+      .spyOn(Logger.getInstance(), 'info')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const provider = new FrozenStrictProductionEvaluationProviderV1();
+      const evaluation = createStrictProductionSourceFixtureRuntimeV1({
+        fixture: singleFileFixture,
+        projectRoot: singleFileRoot,
+        provider,
+      });
+      const { expansionPort } = evaluation.runtimePort;
+      expect(expansionPort.finalSchedule).toBeNull();
+      const previewedHash =
+        evaluation.runtimePort.readAnalysisEpoch().context.finalExpandedScheduleHash;
+      expect(previewedHash).toEqual(expect.any(String));
+
+      const analyst = await provider.chatWithTools(
+        `strict cold-start Analyst\n${readFileSync(join(singleFileRoot, singleFileFixture.sourceFiles[0].path), 'utf8')}`
+      );
+      const g1 = buildStrictProductionPipelineStagesV1().find(
+        (stage) => stage.name === 'analyst_fixpoint_gate'
+      );
+      if (!g1?.gate) {
+        throw new Error('TEST_STRICT_G1_STAGE_MISSING');
+      }
+      const result = await g1.gate.evaluator(
+        { reply: analyst.text },
+        {},
+        { strictProduction: evaluation.runtimePort }
+      );
+      expect(result).toMatchObject({ action: 'pass', pass: true });
+      // 门按预览 hash 封口：日程与上下文声明的最终 hash 一致，封口只发生这一次。
+      expect(expansionPort.finalSchedule?.finalExpandedScheduleHash).toBe(previewedHash);
+
+      // Logger.info 的元数据是第二个参数；按 unknown 读取，不依赖 winston 重载签名的元组类型。
+      const noArgumentSeals = info.mock.calls.filter((call) => {
+        const meta: unknown = (call as readonly unknown[])[1];
+        return (
+          !!meta &&
+          typeof meta === 'object' &&
+          (meta as { compatibility?: unknown }).compatibility === 'no-argument-seal'
+        );
+      });
+      expect(noArgumentSeals).toEqual([]);
+    } finally {
+      info.mockRestore();
+    }
   });
 });

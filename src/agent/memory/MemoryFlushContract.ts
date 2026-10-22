@@ -5,7 +5,6 @@
  * 确保 distill() 的结果在 ActiveContext.clear() 之前完整提取。
  */
 
-import type { StrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
 import type { Finding } from './SessionStore.js';
 
 // ──────────────────────────────────────────────────────────────────
@@ -43,8 +42,8 @@ export interface DistilledContext {
   } | null;
   totalObservations: number;
   compressedCount: number;
-  /** 严格冷启动只投影 Core 不可变收据/ID；不是可变证据副本。 */
-  strictAnalysisContext?: StrictAnalysisContextProjectionV1;
+  // 严格冷启动的分析上下文投影不属于 distill 结果（审阅包 L6-P27）：严格链由宿主编排、由阶段配置
+  // 表达，memory 层不再承载严格投影，也不再反向依赖 production 层的类型。
 }
 
 // ──────────────────────────────────────────────────────────────────

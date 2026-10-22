@@ -25,10 +25,6 @@ import { observeSafely } from '#shared/observers.js';
 import { estimateTokens } from '#shared/tokenUtils.js';
 import { isToolResultEnvelope, type ToolResultEnvelope } from '#tools/kernel/index.js';
 import {
-  createStrictAnalysisContextProjectionV1,
-  type StrictAnalysisContextProjectionV1,
-} from '../production/StrictProductionPipeline.js';
-import {
   failedReadPaths,
   readToolObservation,
   successfulReadPaths,
@@ -840,7 +836,6 @@ interface ActiveContextJSON {
   scratchpad?: ScratchpadEntry[];
   totalObservations?: number;
   plan?: Plan;
-  strictAnalysisContext?: StrictAnalysisContextProjectionV1;
 }
 
 const OBSERVATION_LEDGER_CATEGORIES: ObservationLedgerCategory[] = [
@@ -887,9 +882,6 @@ export class ActiveContext {
   #planHistory: Plan[] = [];
   /** 下一次模型响应可覆盖已有计划的授权 (由 PlanTracker 经 expectPlan 设置；见 PlanAuthorization) */
   #planAuthorization: PlanAuthorization | null = null;
-
-  // ── 严格生产链：只保存 Core 证据台账/PC-F 收据的不可变语义投影 ──
-  #strictAnalysisContext: StrictAnalysisContextProjectionV1 | null = null;
 
   // ── 配置 ──
   /** 保留最近 N 轮原始观察 */
@@ -1363,23 +1355,7 @@ export class ActiveContext {
       plan: this.getPlan(),
       totalObservations: this.#totalObservations,
       compressedCount: this.#compressedObservations.length,
-      ...(this.#strictAnalysisContext
-        ? { strictAnalysisContext: this.#strictAnalysisContext }
-        : {}),
     };
-  }
-
-  /** 绑定并重新校验严格上下文，防止序列化恢复时注入未哈希字段。 */
-  bindStrictAnalysisContext(context: StrictAnalysisContextProjectionV1): void {
-    const { schemaVersion, contextHash, ...input } = context;
-    if (schemaVersion !== 1) {
-      throw new Error('STRICT_CONTEXT_SCHEMA_UNSUPPORTED');
-    }
-    const normalized = createStrictAnalysisContextProjectionV1(input);
-    if (normalized.contextHash !== contextHash) {
-      throw new Error('STRICT_CONTEXT_HASH_MISMATCH');
-    }
-    this.#strictAnalysisContext = normalized;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1486,9 +1462,6 @@ export class ActiveContext {
       scratchpad: structuredClone(this.#scratchpad),
       compressedObservations: this.#compressedObservations.length,
       totalObservations: this.#totalObservations,
-      ...(this.#strictAnalysisContext
-        ? { strictAnalysisContext: this.#strictAnalysisContext }
-        : {}),
       ...(this.#plan
         ? {
             plan: {
@@ -1506,8 +1479,10 @@ export class ActiveContext {
   /**
    * 从 toJSON() 的输出重建 ActiveContext（有损）
    *
-   * 只恢复 rounds / scratchpad / totalObservations / plan / strictAnalysisContext；构造选项
+   * 只恢复 rounds / scratchpad / totalObservations / plan；构造选项
    * （maxRecentRounds、lightweight）、观察滑动窗口、压缩观察与计划历史都不恢复，输入也不做结构校验。
+   * 旧快照里的严格分析上下文投影不再读取（审阅包 L6-P27：严格链由宿主编排、由阶段配置表达，
+   * ActiveContext 不再承载它），与其它未知字段一样被忽略，不会再因投影 hash 校验失败而抛错。
    * @param json toJSON() 的输出
    * @deprecated 生产中没有断点续传调用方（仅测试使用）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
@@ -1530,9 +1505,6 @@ export class ActiveContext {
         lastUpdatedAtIteration: json.plan.lastUpdatedAtIteration,
       };
     }
-    if (json.strictAnalysisContext) {
-      ctx.bindStrictAnalysisContext(json.strictAnalysisContext);
-    }
     return ctx;
   }
 
@@ -1548,7 +1520,6 @@ export class ActiveContext {
     // 悬挂的计划授权属于被清空的会话，不能泄漏给之后重新建立的计划
     this.#planAuthorization = null;
     this.#totalObservations = 0;
-    this.#strictAnalysisContext = null;
   }
 
   // ═══════════════════════════════════════════════════════

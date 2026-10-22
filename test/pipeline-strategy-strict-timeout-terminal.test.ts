@@ -16,6 +16,7 @@
  *    produce(strict-producer-v1), independent_review_gate(G2)]。
  */
 import Logger from '@alembic/core/logging';
+import { createFinalExpandedMiningScheduleReceiptV1 } from '@alembic/core/production';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createStrictAnalysisContextProjectionV1,
@@ -27,14 +28,23 @@ import {
 import { AgentMessage } from '../src/agent/runtime/AgentMessage.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 
-const expansionPort = createStrictAnalysisExpansionPortV1({
+const expansionPortInput = {
   baselineScheduleHash: 'schedule-1',
   baselineObligationIds: ['base-1', 'counter-1'],
   knownFactFamilies: [],
   knownSubjectRefs: [],
   obligationCap: 2,
-});
-const finalSchedule = expansionPort.seal();
+};
+const expansionPort = createStrictAnalysisExpansionPortV1(expansionPortInput);
+// L7-P09：先用 Core 预览最终日程 hash，再以 seal(expectedHash) 封口；无参 seal 只由
+// strict-analysis-loop-seal-diagnostics 作为兼容路径覆盖。
+const finalSchedule = expansionPort.seal(
+  createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash: expansionPortInput.baselineScheduleHash,
+    baselineObligationIds: expansionPortInput.baselineObligationIds,
+    expansionReceipts: expansionPort.receipts,
+  }).finalExpandedScheduleHash
+);
 
 const strictContext = createStrictAnalysisContextProjectionV1({
   runId: 'run-1',

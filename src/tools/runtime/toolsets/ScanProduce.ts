@@ -1,5 +1,9 @@
 /**
  * 增量扫描.生产 — Agent 将扫描发现转化为知识候选。
+ *
+ * 严格冷启动不经过本能力（决定④，L4-P35）：严格链由 buildStrictProductionPipelineStagesV1 的
+ * capabilities:[]、additionalTools:[]、toolChoiceOverride:'none' 表达无工具。本类因此没有构造选项与
+ * 严格分支，仍传旧严格冷启动开关的 JS 调用方得到的就是下面这套完整扫描生产工具集。
  */
 
 import { RuntimeCapability } from './RuntimeCapability.js';
@@ -27,13 +31,6 @@ export const SCAN_EVIDENCE_RESCUE_PROMPT = `## 扫描生产证据自救通道
 - 台账不在场（非维度运行）时 evidence 动作不可用，按 reasoning.sources 提交真实 file:line。`;
 
 export class ScanProduce extends RuntimeCapability {
-  readonly #strictColdStart: boolean;
-
-  constructor(options: { readonly strictColdStart?: boolean } = {}) {
-    super();
-    this.#strictColdStart = options.strictColdStart === true;
-  }
-
   get name() {
     return 'scan_production';
   }
@@ -42,9 +39,6 @@ export class ScanProduce extends RuntimeCapability {
   }
 
   get allowedTools(): Record<string, string[]> {
-    if (this.#strictColdStart) {
-      return {};
-    }
     return {
       code: ['read'],
       knowledge: ['submit'],
@@ -58,8 +52,6 @@ export class ScanProduce extends RuntimeCapability {
   }
 
   get promptFragment() {
-    return this.#strictColdStart
-      ? '## Strict scan proposal authoring\nAuthor typed proposals only; no tools, persistence, fact queries, or self-review.'
-      : `${SCAN_EVIDENCE_RESCUE_PROMPT}\n\n${super.promptFragment}`;
+    return `${SCAN_EVIDENCE_RESCUE_PROMPT}\n\n${super.promptFragment}`;
   }
 }

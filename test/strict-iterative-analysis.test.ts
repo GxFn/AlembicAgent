@@ -112,20 +112,44 @@ function nextContext(
   });
 }
 
+/**
+ * L7-P09：按宿主应采用的方式封口——先用 Core 纯构造器基于端口已登记的扩展回执预览最终日程 hash，
+ * 再以 seal(expectedHash) 提交。无参 seal 只作为兼容路径由 strict-analysis-loop-seal-diagnostics 覆盖。
+ */
+function sealWithPreviewedHash(
+  port: ReturnType<typeof createStrictAnalysisExpansionPortV1>,
+  input: {
+    readonly baselineScheduleHash: string;
+    readonly baselineObligationIds: readonly string[];
+  }
+) {
+  const previewed = createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash: input.baselineScheduleHash,
+    baselineObligationIds: input.baselineObligationIds,
+    expansionReceipts: port.receipts,
+  });
+  return port.seal(previewed.finalExpandedScheduleHash);
+}
+
 function sealFixpointEpoch(
   observedEpoch: StrictAnalysisEpochSnapshotV1,
-  expansionPort: ReturnType<typeof createStrictAnalysisExpansionPortV1>
+  expansionPort: ReturnType<typeof createStrictAnalysisExpansionPortV1>,
+  baselineObligationIds: readonly string[]
 ): StrictAnalysisEpochSnapshotV1 {
   const {
     schemaVersion: _schemaVersion,
     contextHash: _contextHash,
     ...contextInput
   } = observedEpoch.context;
+  const finalSchedule = sealWithPreviewedHash(expansionPort, {
+    baselineScheduleHash: observedEpoch.context.baselineScheduleHash,
+    baselineObligationIds,
+  });
   return createStrictAnalysisEpochSnapshotV1({
     epoch: observedEpoch.epoch,
     context: createStrictAnalysisContextProjectionV1({
       ...contextInput,
-      finalExpandedScheduleHash: expansionPort.seal().finalExpandedScheduleHash,
+      finalExpandedScheduleHash: finalSchedule.finalExpandedScheduleHash,
       analysisFixpointHash: `analysis-fixpoint-${observedEpoch.epoch}`,
     }),
     populations: observedEpoch.populations,
@@ -231,7 +255,8 @@ describe('strict iterative Analyst epochs', () => {
     expect(prompts).toHaveLength(1);
   });
 
-  it('checks an expected schedule hash before committing seal and keeps the no-argument contract', () => {
+  // 无参 seal 的兼容契约与诊断由 strict-analysis-loop-seal-diagnostics 覆盖；这里按预览 hash 封口。
+  it('checks an expected schedule hash before committing seal and caches the sealed schedule', () => {
     const port = createStrictAnalysisExpansionPortV1({
       baselineScheduleHash: 'schedule-baseline',
       baselineObligationIds: ['base-1'],
@@ -243,7 +268,10 @@ describe('strict iterative Analyst epochs', () => {
       'STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH'
     );
     expect(port.finalSchedule).toBeNull();
-    const sealed = port.seal();
+    const sealed = sealWithPreviewedHash(port, {
+      baselineScheduleHash: 'schedule-baseline',
+      baselineObligationIds: ['base-1'],
+    });
     expect(port.seal(sealed.finalExpandedScheduleHash)).toBe(sealed);
     expect(() => port.seal('mismatched-schedule')).toThrow(
       'STRICT_ANALYSIS_FIXPOINT_SCHEDULE_MISMATCH'
@@ -401,7 +429,10 @@ describe('strict iterative Analyst epochs', () => {
           epoch: observedEpoch.epoch,
           context: createStrictAnalysisContextProjectionV1({
             ...contextInput,
-            finalExpandedScheduleHash: expansionPort.seal().finalExpandedScheduleHash,
+            finalExpandedScheduleHash: sealWithPreviewedHash(expansionPort, {
+              baselineScheduleHash: 'schedule-baseline',
+              baselineObligationIds: ['base-1'],
+            }).finalExpandedScheduleHash,
             analysisFixpointHash: 'analysis-fixpoint-2',
           }),
           populations: observedEpoch.populations,
@@ -528,7 +559,7 @@ describe('strict iterative Analyst epochs', () => {
               executedObligationIds: ['counter-1'],
             });
           }
-          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort, ['base-1']);
           return createStrictAnalysisGateOutcomeV1({
             action: 'pass',
             reasonCode: 'shadow-obligation-was-not-detected',
@@ -625,7 +656,7 @@ describe('strict iterative Analyst epochs', () => {
               executedObligationIds: ['counter-1'],
             });
           }
-          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort, ['base-1']);
           return createStrictAnalysisGateOutcomeV1({
             action: 'pass',
             reasonCode: 'unenrolled-shadow-was-not-detected',
@@ -715,7 +746,7 @@ describe('strict iterative Analyst epochs', () => {
               executedObligationIds: ['counter-1'],
             });
           }
-          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort);
+          currentEpoch = sealFixpointEpoch(observedEpoch, expansionPort, ['base-1', 'pending-1']);
           return createStrictAnalysisGateOutcomeV1({
             action: 'pass',
             reasonCode: 'parallel-terminal-mutation-was-not-detected',

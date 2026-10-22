@@ -1,4 +1,5 @@
 import Logger from '@alembic/core/logging';
+import { createFinalExpandedMiningScheduleReceiptV1 } from '@alembic/core/production';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createStrictAnalysisContextProjectionV1,
@@ -90,14 +91,30 @@ function createEpoch(
   });
 }
 
+const EXPANSION_BASELINE = {
+  baselineScheduleHash: 'schedule-baseline',
+  baselineObligationIds: ['base-1'],
+} as const;
+
 function createExpansionPort() {
   return createStrictAnalysisExpansionPortV1({
-    baselineScheduleHash: 'schedule-baseline',
-    baselineObligationIds: ['base-1'],
+    ...EXPANSION_BASELINE,
     knownFactFamilies: [],
     knownSubjectRefs: [],
     obligationCap: 1,
   });
+}
+
+/**
+ * L7-P09：先用 Core 纯构造器基于端口已登记的扩展回执预览最终日程 hash，再以 seal(expectedHash) 封口；
+ * 无参 seal 只作为兼容路径由 strict-analysis-loop-seal-diagnostics 覆盖。
+ */
+function sealWithPreviewedHash(port: ReturnType<typeof createExpansionPort>) {
+  const previewed = createFinalExpandedMiningScheduleReceiptV1({
+    ...EXPANSION_BASELINE,
+    expansionReceipts: port.receipts,
+  });
+  return port.seal(previewed.finalExpandedScheduleHash);
 }
 
 function buildPort(
@@ -504,7 +521,7 @@ describe('strict stage fail-closed branches through gate evaluators (C29)', () =
     await withWarnSpy(async () => {
       const epoch = createEpoch();
       const expansionPort = createExpansionPort();
-      const sealed = expansionPort.seal();
+      const sealed = sealWithPreviewedHash(expansionPort);
       const port = buildPort({
         expansionPort,
         readAnalysisEpoch: () => epoch,

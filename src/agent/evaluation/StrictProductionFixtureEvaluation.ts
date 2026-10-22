@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Logger from '@alembic/core/logging';
+import { createFinalExpandedMiningScheduleReceiptV1 } from '@alembic/core/production';
 import { observeSafely } from '#shared/observers.js';
 import {
   createStrictAnalysisContextProjectionV1,
@@ -202,7 +203,14 @@ export function createStrictProductionSourceFixtureRuntimeV1(input: {
     knownSubjectRefs: [],
     obligationCap: Math.max(1, factQueryObligationIds.length),
   });
-  const finalExpandedScheduleHash = expansionPort.seal().finalExpandedScheduleHash;
+  // L7-P09：只预览最终日程 hash，不在创建时封口。与 expansion port 的 seal() 同一 Core 函数、同一
+  // 输入（fixture 没有扩展登记，回执为空），得到的 hash 写进上下文；真正的封口由 G1 门在 pass 校验
+  // 之后以 seal(expectedHash) 完成，走带预期 hash 核对的生产路径，不再触发无参 seal 的兼容诊断。
+  const finalExpandedScheduleHash = createFinalExpandedMiningScheduleReceiptV1({
+    baselineScheduleHash,
+    baselineObligationIds: factQueryObligationIds,
+    expansionReceipts: expansionPort.receipts,
+  }).finalExpandedScheduleHash;
   const context = createStrictAnalysisContextProjectionV1({
     runId: `fixture-run-${input.fixture.id}`,
     journalId: `fixture-journal-${input.fixture.id}`,

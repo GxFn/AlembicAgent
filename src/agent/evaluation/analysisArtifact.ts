@@ -1,5 +1,6 @@
 /** 分析报告与工件装配：规范化工具事实、保留文本引用、补齐受限源码锚点并计算质量分。
- * 严格生产仅接收 Core authority 投影；legacy 工具记录不生成第二份严格证据。 */
+ * 只服务 legacy（insight/scan）分析门；严格冷启动由阶段配置与宿主编排承担，不经过本模块
+ * （审阅包 L6-P27 / L7-P27 C45：工件不再接收或透传严格分析上下文投影）。 */
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,7 +13,6 @@ import {
   type SnippetRangeReader,
   type ToolCall,
 } from '../evidence/EvidenceCollector.js';
-import type { StrictAnalysisContextProjectionV1 } from '../production/StrictProductionPipeline.js';
 import { readToolObservation, successfulReadPaths } from '../utils/toolOutcomes.js';
 import { buildQualityScores, type NormalizedFinding } from './qualityGates.js';
 
@@ -43,7 +43,6 @@ export interface ActiveContextLike {
   distill(): {
     keyFindings: RawFinding[];
     toolCallSummary: unknown[];
-    strictAnalysisContext?: StrictAnalysisContextProjectionV1;
   };
 }
 
@@ -535,40 +534,6 @@ function countSnippets(collector: EvidenceCollector): number {
   return total;
 }
 
-/** 严格上下文混入 legacy 工件的告警消息；宿主日志过滤以此定位该组合（L7-P27/C45）。 */
-const STRICT_CONTEXT_LEGACY_MIX_LOG_MESSAGE =
-  '[AnalysisArtifact] strict analysis context passed through a legacy (non-cold-start) artifact';
-
-/**
- * 告警“有 strictAnalysisContext 但未开启 strictColdStart”的组合（L7-P27/C45）。
- *
- * 只有 strictColdStart=true 时，严格路径才与 legacy reply / tool trace / note_finding / 锚点
- * 补读隔离；未开启时，ActiveContext（典型是 fromJSON 恢复的严格上下文）带出的严格投影会和
- * legacy 派生的 findings、工具轨迹、补读片段一起透传进同一个工件，下游无法区分两种证据面。
- * 是否删除 strictColdStart 选项与透传取决于待决定④，在那之前不改公开参数、不改透传行为，
- * 只把混合组合与各 legacy 来源的计数打出来，供判定是否存在真实生产调用方。
- */
-function reportStrictContextLegacyMix(fields: {
-  readonly dimensionId: string;
-  readonly contextHash: string;
-  readonly memoryFindingCount: number;
-  readonly derivedFindingCount: number;
-  readonly legacyToolCallCount: number;
-  readonly postHocLiveReadCount: number;
-}): void {
-  observeSafely(
-    () =>
-      logger().warn(STRICT_CONTEXT_LEGACY_MIX_LOG_MESSAGE, {
-        reasonCode: 'strict-context-without-strict-cold-start',
-        strictColdStart: false,
-        ...fields,
-        // 选择路径：保持透传（行为不变），由决定④收口为删除或抛错。
-        resolution: 'pass-through-mixed',
-      }),
-    () => undefined
-  );
-}
-
 /**
  * 从 Analyst 执行结果构建 AnalysisArtifact (v2 增强版)
  *
@@ -583,50 +548,39 @@ function reportStrictContextLegacyMix(fields: {
  * @param dimensionId 维度 ID
  * @param [projectGraph] ProjectGraph 实例
  * @param [activeContext] ActiveContext 实例
- * @param [opts] projectRoot 启用锚点补读；strictColdStart=true 时只透传 Core 严格投影、隔离全部
- *   legacy 来源（缺严格上下文抛 STRICT_ANALYSIS_CONTEXT_REQUIRED）。有严格上下文却未开启时行为
- *   不变但会告警（C45，去留待决定④）。
+ * @param [opts] projectRoot 启用锚点补读（缺省时不读盘）。严格冷启动不经过本函数（审阅包
+ *   L6-P27 / L7-P27 C45：严格链由阶段配置 capabilities:[] 与宿主编排表达）；opts 不再接收
+ *   严格冷启动开关，ActiveContext 蒸馏结果里也不再有严格投影可透传。无类型检查的 JS 调用方
+ *   若仍传入旧开关，该字段不会被读取，得到的就是普通 legacy 工件。
  */
 export function buildAnalysisArtifact(
   analystResult: AnalystResult,
   dimensionId: string,
   projectGraph: ProjectGraphLike | null = null,
   activeContext: ActiveContextLike | null = null,
-  opts: { projectRoot?: string; strictColdStart?: boolean } = {}
+  opts: { projectRoot?: string } = {}
 ) {
-  // 严格路径的语义只来自 Core 投影；legacy reply/tool trace 不得变成第二证据面。
-  const toolCalls = opts.strictColdStart ? [] : analystResult.toolCalls || [];
+  const toolCalls = analystResult.toolCalls || [];
 
   const collector = collectToolEvidence(toolCalls, dimensionId);
-  const baseReport = buildReportFromEvidence(
-    opts.strictColdStart ? { ...analystResult, reply: '', toolCalls: [] } : analystResult,
-    dimensionId,
-    projectGraph,
-    collector
-  );
+  const baseReport = buildReportFromEvidence(analystResult, dimensionId, projectGraph, collector);
 
   const distilled = activeContext?.distill() || { keyFindings: [], toolCallSummary: [] };
-  const strictAnalysisContext = distilled.strictAnalysisContext;
-  if (opts.strictColdStart && !strictAnalysisContext) {
-    throw new Error('STRICT_ANALYSIS_CONTEXT_REQUIRED');
-  }
-  const memoryFindingCount = opts.strictColdStart ? 0 : distilled.keyFindings.length;
+  const memoryFindingCount = distilled.keyFindings.length;
   let derivedFindingCount = 0;
-  let findings = opts.strictColdStart
-    ? []
-    : distilled.keyFindings.map((f: RawFinding) => ({
-        finding: f.finding,
-        evidence:
-          typeof f.evidence === 'string'
-            ? f.evidence
-            : Array.isArray(f.evidence)
-              ? f.evidence.join(', ')
-              : f.evidence
-                ? String(f.evidence)
-                : '',
-        importance: f.importance,
-      }));
-  if (!opts.strictColdStart && findings.length === 0) {
+  let findings = distilled.keyFindings.map((f: RawFinding) => ({
+    finding: f.finding,
+    evidence:
+      typeof f.evidence === 'string'
+        ? f.evidence
+        : Array.isArray(f.evidence)
+          ? f.evidence.join(', ')
+          : f.evidence
+            ? String(f.evidence)
+            : '',
+    importance: f.importance,
+  }));
+  if (findings.length === 0) {
     // 降级路径（没有 note_finding）：只按派生前接地集合派生（L7-P16/C07）。referencedFiles 含正文提及，
     // 而小节正文来自同一段文本，拿它过滤恒真；接地集合 = baseReport.groundedFiles 并上此刻 evidenceMap
     // 中有片段的 key（两者同源于同一 collector，并集只防两处投影将来分叉）。必须在下方锚点补读之前取，
@@ -651,7 +605,7 @@ export function buildAnalysisArtifact(
   // R1 锚点驱动证据补齐：findings 引用的 path:line 锚点若不在已采片段覆盖内（典型：全文读
   // 只留头 30 行窗口，锚点在窗口外），从磁盘补读精确片段——每条发现都有可照抄的逐字证据。
   let postHocLiveReadCount = 0;
-  if (!opts.strictColdStart && opts.projectRoot) {
+  if (opts.projectRoot) {
     const beforeSnippets = countSnippets(collector);
     const beforeDiagnostics = collector.diagnostics();
     const { reader, misses } = createFsSnippetRangeReader(opts.projectRoot);
@@ -707,17 +661,6 @@ export function buildAnalysisArtifact(
     derivedFindingCount,
   });
 
-  if (strictAnalysisContext && !opts.strictColdStart) {
-    reportStrictContextLegacyMix({
-      dimensionId,
-      contextHash: strictAnalysisContext.contextHash,
-      memoryFindingCount,
-      derivedFindingCount,
-      legacyToolCallCount: toolCalls.length,
-      postHocLiveReadCount,
-    });
-  }
-
   return {
     // Layer 1: Core
     analysisText: baseReport.analysisText,
@@ -747,8 +690,6 @@ export function buildAnalysisArtifact(
       derivedFindingCount,
       postHocLiveReadCount,
     },
-
-    ...(strictAnalysisContext ? { strictAnalysisContext } : {}),
 
     // v1 backward compat
     searchQueries: baseReport.searchQueries,
