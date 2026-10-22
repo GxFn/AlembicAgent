@@ -813,6 +813,9 @@ interface NormalizedTerminalDiagnostics {
  * 宿主合法回报的 sandboxed=false fallbackUsed=true 仍然生效，不能让 warn 读成已回落到沙箱内（L4-P12r4）。
  * undefined（整体缺失或字段缺失）视为宿主未报告，保持静默：旧宿主和多数执行器不回报 diagnostics。
  * 数组、Date、Map 这类非记录对象上三个字段都读不到，不能按“字段缺失”静默：整体替换为 fallback 并留痕。
+ * 是否整体回落只看三个字段是否一个都读不到，不看对象标签（L4-P12r5）：宿主可用 Symbol.toStringTag 改写标签，
+ * 带合法字段的类实例、Error 或数组若按标签整体回落，宿主回报的未沙箱执行会被读成 sandboxed=true，
+ * 模型可见的 [unsandboxed:…] 后缀与 terminal_sandbox_fallback 一并消失，错误偏向不安全一侧。
  */
 function normalizeTerminalDiagnostics(
   diagnostics: unknown,
@@ -821,21 +824,33 @@ function normalizeTerminalDiagnostics(
   if (diagnostics === undefined) {
     return { diagnostics: fallback, issues: [], notes: [] };
   }
-  if (!isDiagnosticsRecord(diagnostics)) {
-    return {
-      diagnostics: fallback,
-      issues: [`diagnostics=${describeDiagnosticsType(diagnostics)}`],
-      notes: ['diagnostics replaced by fallback', describeEffectiveSandboxState(fallback)],
-    };
+  if (!isRecord(diagnostics)) {
+    return wholeDiagnosticsFallback(describeType(diagnostics), fallback);
+  }
+  // 三个字段各只读一次：宿主对象可能带 getter，重复读取可能前后不一致；判定与取值必须基于同一份读数。
+  const reported = {
+    sandboxed: diagnostics.sandboxed,
+    fallbackUsed: diagnostics.fallbackUsed,
+    degradeReason: diagnostics.degradeReason,
+  };
+  if (
+    reported.sandboxed === undefined &&
+    reported.fallbackUsed === undefined &&
+    reported.degradeReason === undefined
+  ) {
+    // 一个字段都读不到时才用标签区分：普通对象（含 Object.create(null)、不改标签的类实例）按“宿主未报告”
+    // 静默，数组、Date、Map 或自定义标签的对象整体回落并留痕。只要读得到任一字段就走下面的逐字段校验。
+    const nonRecordKind = describeFieldlessDiagnostics(diagnostics);
+    if (nonRecordKind !== undefined) {
+      return wholeDiagnosticsFallback(nonRecordKind, fallback);
+    }
   }
   const issues: string[] = [];
   const notes: string[] = [];
   const sandboxed =
-    typeof diagnostics.sandboxed === 'boolean' ? diagnostics.sandboxed : fallback.sandboxed;
+    typeof reported.sandboxed === 'boolean' ? reported.sandboxed : fallback.sandboxed;
   const fallbackUsed =
-    typeof diagnostics.fallbackUsed === 'boolean'
-      ? diagnostics.fallbackUsed
-      : fallback.fallbackUsed;
+    typeof reported.fallbackUsed === 'boolean' ? reported.fallbackUsed : fallback.fallbackUsed;
   for (const [field, expected, note] of [
     ['sandboxed', 'boolean', `diagnostics.sandboxed treated as ${String(fallback.sandboxed)}`],
     [
@@ -852,7 +867,7 @@ function normalizeTerminalDiagnostics(
         : 'diagnostics.degradeReason dropped',
     ],
   ] as const) {
-    const value = diagnostics[field];
+    const value = reported[field];
     if (value !== undefined && typeof value !== expected) {
       issues.push(`diagnostics.${field}=${describeType(value)}`);
       notes.push(note);
@@ -865,8 +880,8 @@ function normalizeTerminalDiagnostics(
     diagnostics: {
       sandboxed,
       fallbackUsed,
-      ...(typeof diagnostics.degradeReason === 'string'
-        ? { degradeReason: diagnostics.degradeReason }
+      ...(typeof reported.degradeReason === 'string'
+        ? { degradeReason: reported.degradeReason }
         : fallback.degradeReason
           ? { degradeReason: fallback.degradeReason }
           : {}),
@@ -876,32 +891,37 @@ function normalizeTerminalDiagnostics(
   };
 }
 
-/**
- * diagnostics 只有是记录对象（普通对象、Object.create(null) 或带字段的类实例）时才逐字段读取。
- * 数组、Date、Map、RegExp 这类内建对象 typeof 也是 'object'，但三个字段都读不到，不能被当成“字段缺失”静默；
- * 用 Object.prototype.toString 的标签区分，跨 realm 的普通对象同样能通过。
- */
-function isDiagnosticsRecord(value: unknown): value is Record<string, unknown> {
-  return isRecord(value) && objectTag(value) === 'Object';
+/** diagnostics 整体替换为 fallback：issues 只写类型标记，notes 写明整体回落与生效的沙箱状态。 */
+function wholeDiagnosticsFallback(
+  kind: string,
+  fallback: TerminalExecutionDiagnostics
+): NormalizedTerminalDiagnostics {
+  return {
+    diagnostics: fallback,
+    issues: [`diagnostics=${kind}`],
+    notes: ['diagnostics replaced by fallback', describeEffectiveSandboxState(fallback)],
+  };
 }
 
 /**
- * 整体畸形的 diagnostics 的类型标签：数组单列为 array，其它对象取小写的 toString 标签（date、map……，
- * 经 safeToken 限制字符集，宿主自定义的 Symbol.toStringTag 不会原样进日志），基础类型沿用 describeType。
+ * 三个诊断字段都读不到的对象，判断它是不是非记录对象：普通对象（Object.prototype.toString 标签为 Object，
+ * 跨 realm 的普通对象同样如此）返回 undefined，按“宿主未报告”静默；数组记 array，其它取小写标签
+ * （date、map……，经 safeToken 限制字符集，宿主自定义的 Symbol.toStringTag 不会原样进日志）。
+ * 标签可由宿主经 Symbol.toStringTag getter 提供，getter 抛错时记 unreadable-tag:<错误类名> 整体回落：这是宿主
+ * diagnostics 的形状问题，不能冒泡成 executor-threw，把一次正常返回的执行改判为失败；异常消息可能夹带宿主文本，
+ * 只记类名。
  */
-function describeDiagnosticsType(value: unknown): string {
-  if (Array.isArray(value)) {
-    return 'array';
+function describeFieldlessDiagnostics(value: object): string | undefined {
+  let tag: string;
+  try {
+    if (Array.isArray(value)) {
+      return 'array';
+    }
+    tag = Object.prototype.toString.call(value).slice(8, -1);
+  } catch (err: unknown) {
+    return `unreadable-tag:${errorNameOf(err)}`;
   }
-  if (isRecord(value)) {
-    return safeToken(objectTag(value).toLowerCase());
-  }
-  return describeType(value);
-}
-
-/** Object.prototype.toString 的标签名（Object、Array、Date、Map……）；宿主可用 Symbol.toStringTag 自定义，进日志前须经 safeToken。 */
-function objectTag(value: object): string {
-  return Object.prototype.toString.call(value).slice(8, -1);
+  return tag === 'Object' ? undefined : safeToken(tag.toLowerCase());
 }
 
 /** 回落说明的收尾：归一后生效的沙箱状态。只含布尔值，不含宿主文本。 */

@@ -4065,6 +4065,51 @@ describe('terminal.exec budget, audit classification and input normalization (L4
       notes: wholeFallbackNotes,
       misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
     },
+    // L4-P12r5：整体回落只针对三个诊断字段一个都读不到的非普通对象；标签由宿主经 Symbol.toStringTag 自定义时
+    // 照样整体回落并留痕。标签 getter 抛错时读不到标签，同样整体回落，诊断只写 unreadable-tag 与错误类名，
+    // 不回显异常消息，也不能把这次 exit 0 的执行改判为执行失败。
+    {
+      label: 'tagged object without any diagnostics field',
+      diagnostics: { [Symbol.toStringTag]: 'SandboxDiagnostics' },
+      expectedText: 'ok',
+      fields: ['diagnostics=sandboxdiagnostics'],
+      echoed: [],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
+    },
+    {
+      label: 'throwing toStringTag getter without any diagnostics field',
+      diagnostics: {
+        get [Symbol.toStringTag](): string {
+          throw new Error('tag boom HOST-SECRET-VALUE');
+        },
+      },
+      expectedText: 'ok',
+      fields: ['diagnostics=unreadable-tag:Error'],
+      echoed: ['tag boom', 'HOST-SECRET-VALUE'],
+      notes: wholeFallbackNotes,
+      misleading: ['diagnostics.sandboxed', 'diagnostics=object'],
+    },
+    // 带字段的非普通对象按字段读取：只有真正畸形的字段回落，不能整体回落成 sandboxed=true。
+    {
+      label: 'tagged object with one malformed field',
+      diagnostics: { [Symbol.toStringTag]: 'Diagnostics', sandboxed: false, fallbackUsed: 'true' },
+      expectedText:
+        'ok\n\n[unsandboxed:unknown] sandboxed=false fallbackUsed=false degradeReason=none',
+      fields: ['diagnostics.fallbackUsed=string'],
+      echoed: ['diagnostics.fallbackUsed=true'],
+      notes: [
+        'diagnostics.fallbackUsed treated as false',
+        'effective sandboxed=false fallbackUsed=false',
+      ],
+      misleading: [
+        'diagnostics=diagnostics',
+        'diagnostics replaced by fallback',
+        'sandboxed=true',
+        'diagnostics.sandboxed',
+        'diagnostics.degradeReason',
+      ],
+    },
   ])('reports malformed executor diagnostics without changing the fallback: $label', async ({
     diagnostics,
     expectedText,
@@ -4164,6 +4209,95 @@ describe('terminal.exec budget, audit classification and input normalization (L4
           (w) => w.code === 'terminal_executor_result_normalized'
         ) ?? false
       ).toBe(false);
+      expect(
+        warn.mock.calls.some((args) =>
+          String(args[0]).includes('terminal_executor_result_normalized')
+        )
+      ).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // L4-P12r5：r4 只按 Object.prototype.toString 标签判定记录对象，而宿主可用 Symbol.toStringTag 改写标签，
+  // 于是字段全部合法的带标签类实例、自带标签的对象、带字段的 Error 都被整体回落成 sandboxed=true
+  // fallbackUsed=false：宿主回报的未沙箱执行被读成沙箱内执行，[unsandboxed:…] 后缀、_meta.fallbackUsed、
+  // terminal_sandbox_fallback 与 terminal_intent_not_enforced 全部消失（偏向不安全一侧）。只要三个诊断字段读得到
+  // 任一个就按字段读取，与 r3 的结果一致；标签 getter 抛错也不能把 exit 0 的执行改判为 terminal_execution_failed。
+  class TaggedSandboxDiagnostics {
+    sandboxed = false;
+    fallbackUsed = true;
+    degradeReason = 'seatbelt_unavailable';
+    get [Symbol.toStringTag](): string {
+      return 'SandboxDiagnostics';
+    }
+  }
+  const unsandboxedSeatbeltText =
+    'ok\n\n[unsandboxed:seatbelt_unavailable] sandboxed=false fallbackUsed=true degradeReason=seatbelt_unavailable';
+  it.each([
+    {
+      label: 'class instance with a custom toStringTag',
+      diagnostics: new TaggedSandboxDiagnostics(),
+      expectedText: unsandboxedSeatbeltText,
+    },
+    {
+      label: 'object literal with an own toStringTag',
+      diagnostics: {
+        sandboxed: false,
+        fallbackUsed: true,
+        degradeReason: 'seatbelt_unavailable',
+        [Symbol.toStringTag]: 'Diagnostics',
+      },
+      expectedText: unsandboxedSeatbeltText,
+    },
+    {
+      label: 'Error carrying diagnostics fields',
+      diagnostics: Object.assign(new Error('e'), { sandboxed: false, fallbackUsed: true }),
+      expectedText:
+        'ok\n\n[unsandboxed:unknown] sandboxed=false fallbackUsed=true degradeReason=none',
+    },
+    {
+      label: 'array carrying diagnostics fields',
+      diagnostics: Object.assign([], {
+        sandboxed: false,
+        fallbackUsed: true,
+        degradeReason: 'seatbelt_unavailable',
+      }),
+      expectedText: unsandboxedSeatbeltText,
+    },
+    {
+      label: 'object whose toStringTag getter throws',
+      diagnostics: {
+        sandboxed: false,
+        fallbackUsed: true,
+        degradeReason: 'seatbelt_unavailable',
+        get [Symbol.toStringTag](): string {
+          throw new Error('tag boom');
+        },
+      },
+      expectedText: unsandboxedSeatbeltText,
+    },
+  ])('honours valid diagnostics fields on non-plain objects: $label', async ({
+    diagnostics,
+    expectedText,
+  }) => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(async () => ({ stdout: 'ok', stderr: '', exitCode: 0, diagnostics }), {
+          runtime: { terminalIntent: { network: 'none' } },
+        })
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe(expectedText);
+      expect(result._meta?.fallbackUsed).toBe(true);
+      expect((result._meta?.diagnosticWarnings ?? []).map((w) => w.code)).toEqual([
+        'terminal_sandbox_fallback',
+        'terminal_intent_not_enforced',
+      ]);
       expect(
         warn.mock.calls.some((args) =>
           String(args[0]).includes('terminal_executor_result_normalized')
