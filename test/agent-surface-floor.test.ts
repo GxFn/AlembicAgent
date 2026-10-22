@@ -488,33 +488,6 @@ describe('evolution gate receipt contracts', () => {
     },
     { label: 'verified skip', call: manage('recipe-1', 'skip_evolution', { outcome: 'verified' }) },
     {
-      label: 'legacy proposal',
-      call: {
-        tool: 'propose_evolution',
-        args: { recipeId: 'recipe-1' },
-        result: { status: 'evolution_proposed' },
-        durationMs: 0,
-      },
-    },
-    {
-      label: 'legacy deprecation',
-      call: {
-        tool: 'confirm_deprecation',
-        args: { recipeId: 'recipe-1' },
-        result: { status: 'deprecated' },
-        durationMs: 0,
-      },
-    },
-    {
-      label: 'legacy verified skip',
-      call: {
-        tool: 'skip_evolution',
-        args: { recipeId: 'recipe-1' },
-        result: { status: 'evolution_skipped' },
-        durationMs: 0,
-      },
-    },
-    {
       label: 'persisted replacement',
       call: {
         tool: 'knowledge',
@@ -557,7 +530,7 @@ describe('evolution gate receipt contracts', () => {
     });
   });
 
-  // I51：status 兼容回退只属于无生产者的旧工具名；knowledge.manage 回执的事实只有 Core outcome。
+  // I51 / 审阅包 L5-P49b：进化回执只认 knowledge.manage 与 Core outcome，status 兼容转译与旧工具名表已删除。
   // 生产 handler 总会同时写 status 与 outcome，缺 outcome 的 manage 回执只可能来自外部 toolCalls，
   // 此时必须无结论并留下可定位的诊断，而不是把 evolution_skipped（重复提案）记成“验证仍有效”。
   const captureToolOutcomeLogs = () => {
@@ -616,6 +589,9 @@ describe('evolution gate receipt contracts', () => {
       const diagnostics = logs.diagnostics();
       expect(diagnostics.length).toBeGreaterThan(0);
       for (const entry of diagnostics) {
+        // 旧工具名兼容路径已删除，诊断文案不得再声称 status 兼容“限于旧工具名”。
+        expect(entry.message).toContain('knowledge.manage receipt has no Core outcome');
+        expect(entry.message).not.toMatch(/legacy/i);
         expect(entry).toMatchObject({
           level: 'warn',
           meta: {
@@ -634,36 +610,39 @@ describe('evolution gate receipt contracts', () => {
     }
   });
 
-  it('keeps the status compatibility translation for legacy evolution tool names only', () => {
+  // 审阅包 L5-P49b：旧进化工具名（propose_evolution / confirm_deprecation / skip_evolution）在 registry、
+  // 宿主与 Core 都没有生产者，兼容表已删除。外部构造的旧名回执不再是进化决策：无论只带 status 还是
+  // 带 Core outcome，都按与其他无关工具调用相同的方式忽略——门禁 retry、审计计数为 0，且不再有专门诊断。
+  it.each([
+    { tool: 'propose_evolution', result: { status: 'evolution_proposed' } },
+    { tool: 'propose_evolution', result: { outcome: 'proposal-created' } },
+    { tool: 'confirm_deprecation', result: { status: 'deprecated' } },
+    { tool: 'confirm_deprecation', result: { outcome: 'immediately-executed' } },
+    { tool: 'skip_evolution', result: { status: 'evolution_skipped' } },
+    { tool: 'skip_evolution', result: { outcome: 'verified' } },
+  ])('does not count a retired legacy $tool receipt as an evolution decision ($result)', ({
+    tool,
+    result,
+  }) => {
     const logs = captureToolOutcomeLogs();
     try {
-      const legacySkip = {
-        tool: 'skip_evolution',
-        args: { recipeId: 'recipe-1' },
-        result: { status: 'evolution_skipped' },
-        durationMs: 0,
-      };
-      expect(collectEvolutionDecisionIds([legacySkip], ['recipe-1'])).toEqual(
-        new Set(['recipe-1'])
-      );
+      const calls = [{ tool, args: { id: 'recipe-1' }, result, durationMs: 0 }];
+      expect(collectEvolutionDecisionIds(calls, expectedIds)).toEqual(new Set());
+      expect(evolutionGateEvaluator({ toolCalls: calls }, null, context)).toMatchObject({
+        action: 'retry',
+        artifact: {
+          processed: 0,
+          totalRecipes: 3,
+          pendingIds: expectedIds,
+          evolved: 0,
+          deprecated: 0,
+          skipped: 0,
+        },
+      });
       expect(
-        projectEvolutionAuditResult({ reply: '', toolCalls: [legacySkip], iterations: 1 })
-      ).toMatchObject({ proposed: 0, deprecated: 0, skipped: 1 });
-      const diagnostics = logs.diagnostics();
-      expect(diagnostics.length).toBeGreaterThan(0);
-      for (const entry of diagnostics) {
-        expect(entry).toMatchObject({
-          level: 'info',
-          meta: {
-            path: 'legacy-tool-status',
-            tool: 'skip_evolution',
-            operation: 'skip_evolution',
-            target: 'recipe-1',
-            status: 'evolution_skipped',
-            outcome: 'verified',
-          },
-        });
-      }
+        projectEvolutionAuditResult({ reply: '', toolCalls: calls, iterations: 1 })
+      ).toMatchObject({ proposed: 0, deprecated: 0, skipped: 0 });
+      expect(logs.diagnostics()).toEqual([]);
     } finally {
       logs.restore();
     }
