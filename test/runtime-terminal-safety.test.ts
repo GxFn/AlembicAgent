@@ -4381,6 +4381,170 @@ describe('terminal.exec budget, audit classification and input normalization (L4
     }
   });
 
+  // L4-P12r7：Error 的 name 可以不是字符串。r6 的 safeToken 只用正则 test 检查（test 内部强转一次）就把原值
+  // 原样返回，随后 `unreadable-tag:${...}` 在 try 外再强转一次：宿主对象第一次强转返回 'Error' 通过检查，
+  // 第二次强转抛错就冒到 handle 的 catch，把 exit 0 改判为 terminal_execution_failed 并回显宿主异常消息；
+  // 第二次返回非法字符文本则绕过受限字符集进了诊断与 warn。错误类名只接受 string，非字符串一律记 unknown，
+  // 判定只基于读出的那一份本地值，不对宿主对象做任何强转。
+  interface NameCoercionProbe {
+    thrown: () => Error;
+    coercions: () => number;
+  }
+  /** Error 的 name getter 返回 nameValue(attempt) 构造的对象；attempt 从 1 开始计宿主对象被强转的次数。 */
+  function errorWithCoercingName(nameValue: (attempt: () => number) => object): NameCoercionProbe {
+    let count = 0;
+    const attempt = (): number => {
+      count += 1;
+      return count;
+    };
+    const name = nameValue(attempt);
+    return {
+      thrown: () => {
+        const err = new Error('inner HOST-SECRET-VALUE');
+        Object.defineProperty(err, 'name', {
+          get(): object {
+            return name;
+          },
+        });
+        return err;
+      },
+      coercions: () => count,
+    };
+  }
+  const nameCoercionCases: Array<{ label: string; probe: () => NameCoercionProbe }> = [
+    {
+      label: 'toString that returns Error first and throws an Error on the second coercion',
+      probe: () =>
+        errorWithCoercingName((attempt) => ({
+          toString(): string {
+            if (attempt() === 1) {
+              return 'Error';
+            }
+            throw new Error('second boom HOST-SECRET-VALUE');
+          },
+        })),
+    },
+    {
+      label:
+        'Symbol.toPrimitive that returns Error first and throws a string on the second coercion',
+      probe: () =>
+        errorWithCoercingName((attempt) => ({
+          [Symbol.toPrimitive](): string {
+            if (attempt() === 1) {
+              return 'Error';
+            }
+            // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，模拟宿主对象第二次强转时违约抛出字符串。
+            throw 'prim boom HOST-SECRET-VALUE';
+          },
+        })),
+    },
+    {
+      label: 'toString that returns Error first and host text with spaces on the second coercion',
+      probe: () =>
+        errorWithCoercingName((attempt) => ({
+          toString(): string {
+            return attempt() === 1 ? 'Error' : 'HOST SECRET-VALUE leaked text';
+          },
+        })),
+    },
+  ];
+  it.each(
+    nameCoercionCases
+  )('falls back wholesale without coercing a non-string error name: $label', async ({ probe }) => {
+    const { thrown, coercions } = probe();
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    const audits: ToolAuditEntry[] = [];
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        hostContext(
+          async () => ({
+            stdout: 'ok',
+            stderr: '',
+            exitCode: 0,
+            diagnostics: {
+              get [Symbol.toStringTag](): string {
+                throw thrown();
+              },
+            },
+          }),
+          {
+            runtime: { terminalIntent: { network: 'none' } },
+            auditSink: { log: (entry) => audits.push(entry) },
+          }
+        )
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+      const warnings = result._meta?.diagnosticWarnings ?? [];
+      expect(warnings.map((w) => w.code)).toEqual(['terminal_executor_result_normalized']);
+      const lines = warn.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('terminal_executor_result_normalized'));
+      expect(lines).toHaveLength(1);
+      for (const text of [warnings[0]?.message ?? '', lines[0] ?? '']) {
+        expect(text).toContain('diagnostics=unreadable-tag:unknown');
+        expect(text).toContain('diagnostics replaced by fallback');
+        expect(text).toContain('effective sandboxed=true fallbackUsed=false');
+        expect(text).not.toContain('boom');
+        expect(text).not.toContain('HOST-SECRET-VALUE');
+        expect(text).not.toContain('leaked text');
+      }
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({ action: 'terminal.exec', result: 'success' });
+      expect(audits[0]).not.toHaveProperty('error');
+      expect(JSON.stringify(audits)).not.toContain('HOST-SECRET-VALUE');
+      // 非字符串的类名不做任何强转：判定只看读出的那一份值的 typeof。
+      expect(coercions()).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // L4-P12r7：同一 errorNameOf 也给压缩器失败诊断取类名；类名不是字符串时同样记 unknown，
+  // 不能因第二次强转抛错把 exit 0 的执行改判为失败，也不能让宿主文本绕过受限字符集。
+  it.each(
+    nameCoercionCases
+  )('names a compressor failure unknown without coercing a non-string error name: $label', async ({
+    probe,
+  }) => {
+    const { thrown, coercions } = probe();
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    try {
+      const result = await runTerminalExec(
+        'npm test',
+        baseToolContext({
+          compressor: {
+            compress: () => {
+              throw thrown();
+            },
+          },
+          sandboxExecutor: { exec: async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }) },
+        })
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toBe('ok');
+      expect(result._meta?.diagnosticWarnings).toContainEqual({
+        code: 'terminal_compressor_failed',
+        message: 'compressor threw unknown; returned ANSI-stripped raw output',
+        stage: 'terminal.exec',
+        tool: 'terminal',
+      });
+      const lines = warn.mock.calls.map((args) => String(args[0])).join('\n');
+      expect(lines).toContain('terminal_compressor_failed compressor threw unknown');
+      expect(lines).not.toContain('boom');
+      expect(lines).not.toContain('HOST-SECRET-VALUE');
+      expect(lines).not.toContain('leaked text');
+      expect(coercions()).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   // L4-P12r6：三个诊断字段一个都读不到、标签为 Object 的普通对象（含 Object.create(null)、不改标签的类实例、
   // 跨 realm 的普通对象）按“宿主未报告”静默：既不整体回落，也不出 terminal_executor_result_normalized。
   class HostDiagnosticsWithoutFields {

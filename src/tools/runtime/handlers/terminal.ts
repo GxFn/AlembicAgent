@@ -617,14 +617,28 @@ function describeType(value: unknown): string {
   return value === null ? 'null' : typeof value;
 }
 
-/** 受限字符集之外的取值（可能夹带命令或输出片段）一律写成 unknown。 */
-function safeToken(value: string): string {
-  return SAFE_TOKEN_RE.test(value) ? value : 'unknown';
+/**
+ * 受限字符集之外的取值（可能夹带命令或输出片段）一律写成 unknown。
+ * 只接受 string（L4-P12r7）：RegExp.prototype.test 会先把参数强转成字符串再匹配，宿主对象可以让第一次强转
+ * 返回合法 token 通过检查、调用方拼接时的第二次强转抛错或返回任意文本；先确认 typeof 再匹配，返回的永远是
+ * 通过检查的那份本地字符串，调用方之后的任何拼接都不会再触碰宿主对象。
+ */
+function safeToken(value: unknown): string {
+  return typeof value === 'string' && SAFE_TOKEN_RE.test(value) ? value : 'unknown';
 }
 
-/** 只取错误类名（受限字符集），不取异常消息——消息可能拼进了命令或输出原文。 */
+/**
+ * 只取错误类名（受限字符集），不取异常消息——消息可能拼进了命令或输出原文。
+ * Error 的 name 由宿主控制、不保证是字符串（L4-P12r7）：只读一次到本地，非字符串一律按读不出处理记 unknown，
+ * 不对它做任何强转（强转本身可能抛错或前后不一致）。这里的 unknown 是既有回落取值，各调用方的诊断与日志
+ * （unreadable-tag:unknown、compressor threw unknown、executor-threw:unknown、error=unknown）照常留痕。
+ */
 function errorNameOf(err: unknown): string {
-  return safeToken(err instanceof Error ? err.name : describeType(err));
+  if (!(err instanceof Error)) {
+    return safeToken(describeType(err));
+  }
+  const name: unknown = err.name;
+  return safeToken(name);
 }
 
 /** 只按 exec 方法存在性认定执行器；与 availability.ts 的 hasMethod(sandboxExecutor, 'exec') 对齐。 */
@@ -930,6 +944,8 @@ function describeFieldlessDiagnostics(value: object): string | undefined {
  * 冒到 handle 的 catch，把 exit 0 的执行改判为 terminal_execution_failed / executor-threw，并把宿主异常消息
  * 原样写进模型可见文本。这里只降级类名为 unknown，不取任何消息；整体回落本身仍由调用方的
  * terminal_executor_result_normalized 诊断与 warn 留痕（diagnostics=unreadable-tag:unknown）。
+ * name 读得出但不是字符串时由 errorNameOf 直接记 unknown，返回值是本地字符串，调用方拼接时不会再强转宿主
+ * 对象（L4-P12r7）。
  */
 function unreadableTagErrorName(err: unknown): string {
   try {
