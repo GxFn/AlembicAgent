@@ -1979,6 +1979,117 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   });
 });
 
+/**
+ * L6-P16r5：对 81df730（L6-P16r4）的第五轮审计补修。r4 的宾语边界 `[a-z.~$]` 与 `\/` 在描述转小写后
+ * 接受任何拉丁字母开头的词与“执行/xx”斜杠并列，所以“执行 SQL 查询”“执行 HTTP 请求”“运行 Electron
+ * 主进程”“执行 reducer”“执行 tool 调用”“执行/重试流程”仍让 git status / ls 把带明确文件目标的阅读步骤
+ * 标成完成，后果链（耗尽保持吞掉真实偏离、回顾把没读过的文件列为已完成）原样复现。拉丁宾语只收显式
+ * 命令名（有歧义的语言/运行时名须带参数）与相对执行路径、shell 脚本文件。
+ */
+describe('PlanTracker terminal rule Latin objects (L6-P16r5)', () => {
+  const exec = (command: string): PlanCall => [
+    'terminal',
+    { action: 'exec', params: { command } },
+    { exitCode: 0, stdout: 'ok', stderr: '' },
+  ];
+  const read = (path: string): PlanCall => [
+    'code',
+    { action: 'read', params: { path } },
+    'export const value = 1;',
+  ];
+
+  it.each([
+    ['阅读 src/db/query.ts 了解如何执行 SQL 查询', 'git status'],
+    ['阅读 src/api/client.ts 理解执行 HTTP 请求的重试逻辑', 'ls'],
+    ['阅读 src/main/index.ts 理解运行 Electron 主进程的入口', 'git status'],
+    ['阅读 src/store/index.ts 了解 dispatch 后如何执行 reducer', 'git status'],
+    ['阅读 src/scheduler.ts 理解任务执行 pipeline', 'git log -5'],
+    ['阅读 src/agent/AgentRuntime.ts 了解如何执行 tool 调用', 'ls -la'],
+    ['阅读 src/worker.ts 理解任务执行/重试流程', 'git status'],
+    ['阅读 src/worker.ts 理解任务执行 / 重试流程', 'git status'],
+    ['阅读 src/worker.ts 理解任务执行/retry 流程', 'git status'],
+    // 命令名被当名词用（后面没有参数）也不是命令步骤。
+    ['阅读 src/vcs/git.ts 了解如何执行 git 操作', 'ls'],
+    ['阅读 src/server/main.ts 理解如何运行 Node 服务', 'pwd'],
+    ['阅读 src/runtime/tasks.swift 理解运行 Swift 并发任务', 'git status'],
+  ])('keeps the reading step "%s" pending after terminal.exec %s', (step, command) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec(command)]);
+    expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+  });
+
+  it.each([
+    '运行 npm test 确认测试状态',
+    '执行 git log 查看最近提交',
+    '运行 `npm run lint` 检查代码规范',
+    '运行 ./scripts/check.sh 校验输出',
+    '运行 pytest 确认用例通过',
+    '运行 Vitest 回归用例',
+    '执行 make 生成产物',
+    '运行 tsc --noEmit 校验类型',
+    '运行 node scripts/check.mjs 校验输出',
+    '执行 git status 查看工作区',
+    '执行 scripts/release.sh 生成发布包',
+    '运行 ~/bin/check-env 校验环境',
+    '执行 $SHELL -lc 打印环境',
+    '运行 python3 -m pytest 确认修复',
+  ])('still lets terminal.exec complete the Latin command step "%s"', (step) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    runPlanRound(plans, trace, 2, [exec('npm test')]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
+  });
+
+  it.each([
+    ['阅读 src/agent/AgentRuntime.ts 了解如何执行 tool 调用', 'git log -5 --oneline'],
+    ['阅读 src/api/client.ts 理解执行 HTTP 请求的重试逻辑', 'ls -la'],
+    ['阅读 src/worker.ts 理解任务执行/重试流程', 'git status'],
+  ])('reports the deviation instead of listing "%s" as done after %s and off-plan reads', (step, command) => {
+    const plans = new PlanTracker();
+    const trace = new ActiveContext();
+    trace.setPlan(
+      [
+        '1. 获取项目概览和目录结构',
+        `2. ${step}`,
+        '3. 搜索错误处理和重试模式',
+        '4. 总结分析发现',
+      ].join('\n'),
+      1
+    );
+    runPlanRound(plans, trace, 2, [
+      ['code', { action: 'structure', params: {} }, { tree: ['src'] }],
+    ]);
+    runPlanRound(plans, trace, 3, [exec(command)]);
+    // 无关终端命令从没读过第 2 步的文件，不能把它标成完成。
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'pending', 'pending']);
+    expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
+    runPlanRound(plans, trace, 4, [
+      ['code', { action: 'search', params: { pattern: 'retry' } }, { total: 0, matches: [] }],
+    ]);
+    expect(stepStatuses(trace)).toEqual(['done', 'pending', 'done', 'pending']);
+    for (const [iteration, file] of [
+      [5, 'src/a.ts'],
+      [6, 'src/b.ts'],
+    ] as const) {
+      runPlanRound(plans, trace, iteration, [read(file)]);
+      expect(plans.checkPlanning(planCheckState(iteration + 1), trace)).toBeNull();
+    }
+    runPlanRound(plans, trace, 7, [read('src/c.ts')]);
+    // 第 2 步仍可由工具完成：连续 3 轮读无关文件是真实偏离，不能被“计划耗尽”保持吞掉。
+    expect(plans.progress).toMatchObject({ unplannedActions: 4, consecutiveOffPlan: 3 });
+    const nudge = plans.checkPlanning(planCheckState(8), trace)?.text ?? '';
+    expect(nudge).toContain('📋 计划偏差检查');
+    expect(nudge).toContain('连续 3 轮偏离');
+    expect(nudge).toContain('⏳ 未完成 (2/4)');
+    expect(nudge.indexOf(step)).toBeGreaterThan(nudge.indexOf('⏳ 未完成'));
+  });
+});
+
 describe('PlanTracker trace port (L6-P16 C19)', () => {
   it('drives PlanTracker through the public ExplorationTrace port, honouring failed reads', () => {
     const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];

@@ -214,6 +214,103 @@ const JS_TECH_NAMES: ReadonlySet<string> = new Set([
 const SUMMARY_STEP_RE = /总结|汇总|归纳|报告|\bsummar(?:y|ies|ize|ise|izing|ising)\b|\breport\b/;
 
 /**
+ * “运行/执行”后不带参数也算命令宾语的 CLI 名（小写比较）：在中文计划措辞里几乎只当命令出现，
+ * 如“运行 pytest 确认”“执行 make”。
+ */
+const STANDALONE_COMMAND_NAMES = [
+  'npm',
+  'npx',
+  'pnpm',
+  'pnpx',
+  'yarn',
+  'bunx',
+  'tsc',
+  'ts-node',
+  'vitest',
+  'jest',
+  'mocha',
+  'pytest',
+  'eslint',
+  'biome',
+  'prettier',
+  'cargo',
+  'mvn',
+  'gradle',
+  'gradlew',
+  'xcodebuild',
+  'xcrun',
+  'kubectl',
+  'dotnet',
+  'make',
+  'cmake',
+  'pip',
+  'pip3',
+  'ls',
+  'pwd',
+  'grep',
+  'rg',
+  'curl',
+  'wget',
+];
+
+/**
+ * 同时常作语言/运行时/产品名词的命令名：只有后面紧跟 ASCII 参数（子命令、选项、路径）时才算命令宾语。
+ * 否则“执行 git 操作”“运行 Node 服务”“运行 Swift 并发任务”这类名词用法也会让 git status / ls
+ * 完成带文件目标的阅读步骤（L6-P16r5）。“运行 Python 脚本”这类无参数写法随之不再命中，属保守取舍。
+ */
+const ARGUMENT_COMMAND_NAMES = [
+  'git',
+  'gh',
+  'node',
+  'deno',
+  'bun',
+  'tsx',
+  'python',
+  'python3',
+  'ruby',
+  'gem',
+  'bundle',
+  'rake',
+  'php',
+  'composer',
+  'java',
+  'go',
+  'swift',
+  'docker',
+  'sh',
+  'bash',
+  'zsh',
+  'flutter',
+  'dart',
+  'uv',
+  'poetry',
+];
+
+/** 命令名转成正则分支：按长度降序（python3 先于 python），并按字面转义 '-'、'.' 等字符。 */
+function commandNameAlternation(names: readonly string[]): string {
+  return [...names]
+    .sort((a, b) => b.length - a.length)
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
+}
+
+/**
+ * terminal.exec 规则里“运行/执行”后的拉丁宾语（在小写化描述上匹配）。只收四种形状：
+ *   - 显式执行路径或变量：./x、../x、~/x、$VAR、${VAR}；
+ *   - shell 脚本文件（可带相对目录）：scripts/release.sh、check.sh；
+ *   - STANDALONE_COMMAND_NAMES 里的命令名（后面不再接文件名字符）；
+ *   - ARGUMENT_COMMAND_NAMES 里的命令名且紧跟 ASCII 参数（git log、node scripts/x.mjs）。
+ * r4 的 `[a-z.~$]` 只看首字符，小写后任何拉丁词（sql/http/electron/reducer/pipeline/tool）都当命令名；
+ * `\/` 又让“执行/重试流程”这种斜杠并列命中。两者都删掉，不再收裸的 /x 绝对路径（计划步骤几乎不写
+ * 绝对路径，误把斜杠并列当路径的代价更大）。
+ */
+const TERMINAL_LATIN_COMMAND_OBJECT =
+  '(?:\\.{1,2}\\/|~\\/)[\\w.-]|\\$\\{?[a-z_]' +
+  '|(?:[\\w.-]+\\/)*[\\w.-]+\\.(?:sh|bash|zsh|ps1|bat|cmd)(?![\\w-])' +
+  `|(?:${commandNameAlternation(STANDALONE_COMMAND_NAMES)})(?![\\w-]|\\.\\w)` +
+  `|(?:${commandNameAlternation(ARGUMENT_COMMAND_NAMES)})[ \\t]+[\\w./~$-]`;
+
+/**
  * 语义回退：工具类别 → 步骤描述关键词。英文用词边界（避免 thread→read、recall→call、
  * classify→class），中文不用单字“类”（避免“类型”“分类”命中 graph），search 不再含泛化的“分析”。
  */
@@ -233,9 +330,10 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
   },
   { tool: 'code', action: 'search', pattern: /搜索|查找|\bsearch(?:es|ing)?\b/ },
   // terminal.exec 只完成“运行/执行命令”类步骤。中文没有词边界：“运行/执行”只有作为动词直接带命令宾语
-  // （拉丁字母命令名或路径如 npm/git/./scripts/x.sh，或测试、检查（带修饰语）、单测、用例、脚本、构建、
-  // 编译、打包、安装、命令、示例这类命令对象）时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”这类
-  // 名词修饰用法不命中（L6-P16r4）。terminal 不是单文件取证动作，文件目标只是软信号，不设边界时
+  // （TERMINAL_LATIN_COMMAND_OBJECT 收的拉丁命令名或执行路径，或测试、检查（带修饰语）、单测、用例、脚本、
+  // 构建、编译、打包、安装、命令、示例这类命令对象）时才命中；“运行时”“执行流程/细节/逻辑”“可执行脚本”
+  // 这类名词修饰用法（L6-P16r4），以及“执行 SQL 查询”“执行 tool 调用”这类拉丁非命令宾语、“执行/重试”
+  // 这类斜杠并列（L6-P16r5）都不命中。terminal 不是单文件取证动作，文件目标只是软信号，不设边界时
   // git status / ls 会把“阅读 src/x.ts 理解执行流程”标成完成；若那是最后一个可由工具完成的步骤，
   // 之后的真实偏离还会被“计划耗尽”保持吞掉，周期回顾再把从没读过的文件列为已完成。
   // 不收单独的“测试/脚本”，避免完成“阅读测试文件”这类阅读步骤；“运行检查”这类无修饰语的宾语不命中，
@@ -243,8 +341,11 @@ const SEMANTIC_STEP_RULES: ReadonlyArray<{ tool: string; action?: string; patter
   {
     tool: 'terminal',
     action: 'exec',
-    pattern:
-      /(?<!可)(?:运行|执行)\s*[`'"“「]?\s*(?:[a-z.~$]|\/|(?:单元|集成|端到端|回归|冒烟)?测试|(?:类型|静态|代码)检查|单测|用例|脚本|构建|编译|打包|安装|命令|示例|样例)|命令|终端|\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\b/,
+    pattern: new RegExp(
+      `(?<!可)(?:运行|执行)\\s*[\`'"“「]?\\s*(?:${TERMINAL_LATIN_COMMAND_OBJECT}|` +
+        '(?:单元|集成|端到端|回归|冒烟)?测试|(?:类型|静态|代码)检查|单测|用例|脚本|构建|编译|打包|安装|命令|示例|样例)' +
+        '|命令|终端|\\b(?:run(?:s|ning)?|exec(?:ut(?:e[sd]?|ing))?|commands?|shell|terminal)\\b'
+    ),
   },
 ];
 
