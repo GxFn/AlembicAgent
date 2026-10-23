@@ -17,13 +17,38 @@
  * 不再并入，检测器只在它真正多遮的地方改变输出；底线没遮住的 v0/v1 级联触发前缀（关键字 + 分隔符）不并入
  * 检测区间，不动点轮里的级联遮蔽照常发生，所以不变量 A 在门面层（多轮之后）也成立。后续包（4c–4e）只往
  * 默认检测器表里追加。门面签名与调用点不变，不从任何 index 转出。
+ *
+ * 按来源追加（阶段 4e，T3）：redactDeveloperText 是未知来源（开发者事件、诊断、stderr 共 16 个调用点）；
+ * 证据台账经 redactDeveloperTextInContext 带上条目来源（tool/file），在未知来源底线（含 T1 默认检测器）之上追加
+ * T3 规则（redaction/sourcePolicy.ts）。两条入口共用 unknownSourceFloorOptions，所以任何来源下的遮蔽都 ⊇ 未知
+ * 来源下的遮蔽（不变量 A）；source、config、no-file 来源没有 T3 规则，输出与 redactDeveloperText 逐字相同。
  */
 
-import { applyRedactionFloor, type FloorReport } from './redaction/legacyFloor.js';
+import {
+  applyRedactionFloor,
+  type FloorReport,
+  type RedactionFloorOptions,
+} from './redaction/legacyFloor.js';
+import {
+  applySourcePolicyFloor,
+  applySourcePolicyFloorWithProvenance,
+  type RedactionSourceContext,
+  type SourcePolicyProvenanceResult,
+  type SourcePolicyResult,
+} from './redaction/sourcePolicy.js';
+
+/**
+ * 未知来源的底线选项：redactDeveloperText 与按来源入口共用的唯一一处。空选项即 legacyFloor 的默认检测器表
+ * DEFAULT_FLOOR_DETECTORS（阶段 4b 的 T1；与来源无关的检测器 4c–4d 只往默认表追加），按来源入口原样继承、
+ * 不替换它，所以不变量 A 的比较对象一致。
+ */
+function unknownSourceFloorOptions(): RedactionFloorOptions {
+  return {};
+}
 
 /** 开发者文本脱敏（签名不变）：四个历史版本的追踪重放底线 ∪ T1 检测器区间 + 按位置渲染，迭代到不动点。 */
 export function redactDeveloperText(text: string): string {
-  return applyRedactionFloor(text).text;
+  return applyRedactionFloor(text, unknownSourceFloorOptions()).text;
 }
 
 /**
@@ -36,5 +61,32 @@ export function redactDeveloperTextWithReport(text: string): {
   text: string;
   report: FloorReport;
 } {
-  return applyRedactionFloor(text);
+  return applyRedactionFloor(text, unknownSourceFloorOptions());
+}
+
+/**
+ * 台账内容脱敏（内部，供 ProductionEvidenceLedgerAuthority 注入默认 profile）：未知来源底线之上按条目来源追加 T3。
+ * context 缺省或来源没有 T3 规则时与 redactDeveloperText 逐字相同。不从任何 index 转出。
+ */
+export function redactDeveloperTextInContext(
+  text: string,
+  context?: RedactionSourceContext
+): string {
+  return applySourcePolicyFloor(text, context, unknownSourceFloorOptions()).text;
+}
+
+/** 同 redactDeveloperTextInContext，另返回底线报告与来源策略报告（只含计数与种类，不含正文）。 */
+export function redactDeveloperTextInContextWithReport(
+  text: string,
+  context?: RedactionSourceContext
+): SourcePolicyResult {
+  return applySourcePolicyFloor(text, context, unknownSourceFloorOptions());
+}
+
+/** 测试期 oracle 用：同上，另返回最终输出到原始输入的逐字符来源。 */
+export function redactDeveloperTextInContextWithProvenance(
+  text: string,
+  context?: RedactionSourceContext
+): SourcePolicyProvenanceResult {
+  return applySourcePolicyFloorWithProvenance(text, context, unknownSourceFloorOptions());
 }

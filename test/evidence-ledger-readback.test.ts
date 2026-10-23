@@ -28,7 +28,7 @@ import {
   resolveProductionEvidenceLedgerStore,
 } from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
 import { projectToolEndEvent } from '../src/agent/runtime/processEvents.js';
-import { redactDeveloperText } from '../src/agent/utils/Redaction.js';
+import { redactDeveloperText, redactDeveloperTextInContext } from '../src/agent/utils/Redaction.js';
 import { handle as handleEvidence } from '../src/tools/runtime/handlers/evidence.js';
 import { prepareRecipeProductionItem } from '../src/tools/runtime/handlers/recipeProductionAdapter.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -670,9 +670,15 @@ describe('测试要求 6：宿主 capture facet 行为不变', () => {
       content: envText,
     });
     expect(entry.range).toEqual({ start: 1, end: 2 });
-    expect(entry.content).toBe(redactDeveloperText(envText));
+    // 阶段 4e 起台账管线带条目来源上下文（T3 按来源追加）：secret-bearing 文件的每个取值都遮，
+    // 所以期望值从“未知来源底线”改为“同一来源上下文的底线”；它只会比未知来源遮得更多（不变量 A）。
+    // 本用例原本钉住的两件事不变：capture 不丢 range，内容与哈希来自台账的同一条管线。
+    const context = { tool: 'code.read', file: '.env', range: { start: 1, end: 2 } } as const;
+    expect(entry.content).toBe(redactDeveloperTextInContext(envText, context));
+    expect(entry.content).toBe('DB_PASSWORD=[redacted]\nPORT=[redacted]');
+    expect(redactDeveloperText(envText)).toBe('DB_PASSWORD=[redacted]\nPORT=8080');
     expect(entry.contentHash).toBe(
-      `sha256:${createHash('sha256').update(redactDeveloperText(envText)).digest('hex')}`
+      `sha256:${createHash('sha256').update(redactDeveloperTextInContext(envText, context)).digest('hex')}`
     );
     expect(authority.read.get('E-1')).toEqual(entry);
     expect(authority.identity.storeConfigHash).toBe(
@@ -896,5 +902,101 @@ describe('测试要求 7：I26 意图在消费者层重新断言', () => {
     );
     expect(event.content?.text).toBeDefined();
     expect(event.content?.text).not.toContain('SYNTHETICsecretvalue0123');
+  });
+});
+
+describe('阶段 4e：T3 只在带来源的台账条目上生效，开发者事件通道不变', () => {
+  const TERMINAL_OUTPUT = [
+    'PORT=8080',
+    'MY_SERVICE_PASS_HINT=SYNTHETIChint42',
+    '> Authorization: Token SYNTHETICtok0042',
+  ].join('\n');
+
+  function captureTerminal(ledger: EvidenceLedgerStore, text: string, callId = 'terminal-env') {
+    return captureEvidenceFromEnvelope(
+      ledger,
+      { id: callId, name: 'terminal', args: { action: 'exec', params: { command: 'env' } } },
+      { ok: true, text }
+    );
+  }
+
+  test('terminal 条目经循环采集按终端规则遮住敏感键与认证头，evidence.get 返回存储内容不回读', async () => {
+    const root = createTempProject('readback-terminal-t3-');
+    const ledger = openLoopLedger(root);
+    const [entry] = captureTerminal(ledger, TERMINAL_OUTPUT);
+    expect(entry?.tool).toBe('terminal.exec');
+    expect(entry?.content).toBe(
+      'PORT=8080\nMY_SERVICE_PASS_HINT=[redacted]\n> Authorization: [redacted]'
+    );
+    expect(fs.readFileSync(ledger.filePath, 'utf8')).not.toContain('SYNTHETIC');
+    const data = await evidenceGet(ledger, 'E-1', root);
+    expect(data.content).toBe(entry?.content);
+    expect(data.verbatim).not.toBe(true);
+  });
+
+  test('开发者事件通道仍用未知来源底线：同一段终端输出的事件文本与 redactDeveloperText 一致', () => {
+    const event = projectToolEndEvent(
+      {
+        id: 'call-terminal',
+        name: 'terminal',
+        args: { action: 'exec', params: { command: 'env' } },
+      },
+      { durationMs: 1, cacheHit: false, cacheMiss: false },
+      TERMINAL_OUTPUT,
+      true,
+      'runtime'
+    );
+    expect(event.content?.text).toBe(redactDeveloperText(TERMINAL_OUTPUT));
+    expect(redactDeveloperText(TERMINAL_OUTPUT)).not.toBe(
+      redactDeveloperTextInContext(TERMINAL_OUTPUT, { tool: 'terminal.exec' })
+    );
+  });
+
+  test('.env 经循环 code.read 入账：丢弃 range，按 secret-bearing 规则遮住全部取值、保留键名', () => {
+    const root = createTempProject('readback-env-t3-');
+    const envText = 'PORT=8080\nDB_HOST=db.internal\nAPI_TOKEN=SYNTHETICenvtok99\n';
+    writeProjectFile(root, '.env', envText);
+    const ledger = openLoopLedger(root);
+    const [entry] = captureRead(ledger, '.env', envText, { start: 1, end: 3 });
+    expect(entry?.range).toBeUndefined();
+    expect(entry?.content).toBe('PORT=[redacted]\nDB_HOST=[redacted]\nAPI_TOKEN=[redacted]');
+  });
+
+  test('源码条目没有 T3 规则：内容与未知来源底线逐字相同，回读与 freshness 行为不变', async () => {
+    const root = createTempProject('readback-source-t3-');
+    const source = 'export const PORT = 8080;\nexport const MY_PASS_HINT="SYNTHETIChint";\n';
+    writeProjectFile(root, 'src/settings.ts', source);
+    const ledger = openLoopLedger(root);
+    const [entry] = captureRead(ledger, 'src/settings.ts', source, { start: 1, end: 2 });
+    expect(entry?.content).toBe(redactDeveloperText(sourceLines(source).join('\n')));
+    expect(ledger.checkFreshness('E-1', source)).toBe('fresh');
+    const data = await evidenceGet(ledger, 'E-1', root);
+    expect(data.verbatim).toBe(true);
+  });
+
+  test('seed 复制带来源的已脱敏条目时再脱敏一次不改变内容（幂等）', () => {
+    const root = createTempProject('readback-seed-t3-');
+    const sibling = openLoopLedger(root);
+    const [terminal] = captureTerminal(sibling, TERMINAL_OUTPUT);
+    const envText = 'PORT=8080\nAPI_TOKEN=SYNTHETICenvtok99\n';
+    writeProjectFile(root, '.env', envText);
+    const [env] = captureRead(sibling, '.env', envText);
+    const synthesis = resolveProductionEvidenceLedgerStore(
+      createProductionEvidenceLedgerAuthority({
+        dataRoot: root,
+        jobId: COORDINATES.jobId,
+        sessionId: 'sess_synthesis',
+        dimensionId: 'agent-guidelines',
+      })
+    );
+    expect(
+      seedLedgerFromJobSiblings(synthesis, {
+        dataRoot: root,
+        jobId: COORDINATES.jobId,
+        selfDimensionId: 'agent-guidelines',
+      })
+    ).toBe(2);
+    expect(synthesis.get('E-1')?.content).toBe(terminal?.content);
+    expect(synthesis.get('E-2')?.content).toBe(env?.content);
   });
 });

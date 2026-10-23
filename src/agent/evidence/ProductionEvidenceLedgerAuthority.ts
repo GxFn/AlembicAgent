@@ -7,11 +7,12 @@ import {
 import { type EvidenceEntry, type EvidenceRange, isEvidenceToolId } from '@alembic/core/knowledge';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
-import { redactDeveloperText } from '../utils/Redaction.js';
+import { redactDeveloperTextInContextWithReport } from '../utils/Redaction.js';
 import {
   type EvidenceEntryDraft,
   type EvidenceLedgerContentProfile,
   EvidenceLedgerStore,
+  type EvidenceRedactionContext,
 } from './EvidenceLedgerStore.js';
 import { WITNESS_GATE_POLICY_ID, WITNESS_MAX_CONTENT_BYTES } from './witnessGate.js';
 
@@ -142,9 +143,48 @@ export function createProductionEvidenceLedgerAuthority(
 }
 
 /**
- * 按 profile 打开真实 store。默认分支的构造参数与引入 profile 之前完全相同（固定注入
- * redactDeveloperText）；见证分支不注入任何 redactor（store 会拒绝），并记一条 info 诊断，
- * 让宿主日志能看出本次严格会话走的是逐字节见证通道及其上限、闸门策略。
+ * 默认 profile 的台账 redactor（脱敏阶段 4e）：在未知来源底线（与 redactDeveloperText 同一组选项）之上按条目
+ * 来源追加 T3（terminal、secret-bearing；source、config、no-file 没有 T3 规则，输出与 redactDeveloperText 逐字
+ * 相同）。上下文由 EvidenceLedgerStore#transform 从草稿或条目的可信元数据推出，append、checkFreshness 的脱敏
+ * 哈希重算与 describeContentTransformation 用的是同一把尺。
+ *
+ * T3 真正追加了遮蔽（merged 路径）或扫描器走了有界启发式的跳过（skips 非空）时记一条 debug 诊断：工具、文件、
+ * 来源类别、路径、各规则命中数、跳过种类与次数、新增遮住的字符数与种子字符数，不含原文或脱敏后的内容。
+ * 诊断通道失败只能被吞掉，不影响返回值。
+ */
+function redactLedgerContent(text: string, context?: EvidenceRedactionContext): string {
+  const result = redactDeveloperTextInContextWithReport(text, context);
+  const source = result.source;
+  if (source.path === 'merged' || Object.keys(source.skips).length > 0) {
+    observeSafely(
+      () =>
+        Logger.getInstance().debug(
+          source.path === 'merged'
+            ? '[ProductionEvidenceLedger] source policy appended redaction'
+            : '[ProductionEvidenceLedger] source policy scanner skipped a bounded heuristic',
+          {
+            ...(context?.tool ? { tool: context.tool } : {}),
+            ...(context?.file ? { file: context.file } : {}),
+            sourceClass: source.sourceClass,
+            path: source.path,
+            ruleHits: source.ruleHits,
+            skips: source.skips,
+            sourceChars: source.sourceChars,
+            seedChars: source.seedChars,
+            floorKinds: result.report.kinds,
+          }
+        ),
+      () => undefined
+    );
+  }
+  return result.text;
+}
+
+/**
+ * 按 profile 打开真实 store。默认分支固定注入带来源上下文的台账 redactor（redactLedgerContent；
+ * storeId、storeConfigHash 与存储路径不变，D6 规定默认 profile 的轮换随宿主切换一次完成）；见证分支不注入
+ * 任何 redactor（store 会拒绝），并记一条 info 诊断，让宿主日志能看出本次严格会话走的是逐字节见证通道及其
+ * 上限、闸门策略。
  */
 function openProfileStore(
   coordinates: NormalizedProductionEvidenceLedgerCoordinates,
@@ -157,7 +197,7 @@ function openProfileStore(
     dimensionId: coordinates.dimensionId,
   };
   if (coordinates.contentProfile !== 'verbatim-witness') {
-    return new EvidenceLedgerStore({ ...location, redactor: redactDeveloperText });
+    return new EvidenceLedgerStore({ ...location, redactor: redactLedgerContent });
   }
   const store = new EvidenceLedgerStore({ ...location, contentProfile: 'verbatim-witness' });
   observeSafely(
@@ -195,7 +235,12 @@ function reportCaptureContentTransformation(
   }
   observeSafely(
     () => {
-      const transformation = store.describeContentTransformation(draft.content);
+      // 与 append 同一把尺：带上同一来源上下文，T3 只追加的改写才会被归类为 redacted 而不是 unknown。
+      const transformation = store.describeContentTransformation(draft.content, {
+        tool: draft.tool,
+        ...(draft.file ? { file: draft.file } : {}),
+        ...(draft.range ? { range: draft.range } : {}),
+      });
       const transformations: string[] = [];
       if (transformation.redacted) {
         transformations.push('redacted');

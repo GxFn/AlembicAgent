@@ -22,6 +22,10 @@
  * - 不动点触顶时 S 仍成立，只是不保证幂等，报告里标记 fixpoint-cap。
  * 这些路径都写进 FloorReport（只含计数与种类，不含正文），由有日志通道的调用方记录。
  *
+ * 重放共享（阶段 4e）：调用方可以传入按次新建的 replayShare，让同一次调用里在同一原文上的多遍底线共享第一轮的
+ * 版本重放与版本部分的汇总（位掩码、缺口、失配行、标记核心、结构分析；按来源的合并路径用它，各遍只复制位掩码再
+ * 并入自己的检测器区间）。复用的结果与重新计算逐位相同，输出与报告都不变。
+ *
  * 阶段 1 的对齐路径 applyAlignmentFloor 保留为回退实现（设计：性能不达标时退回对齐 H⁺ 加非规范载体守卫）
  * 与测试期的独立对照：现行规则输出 y3 作主渲染，三个早期版本经 hiddenSpans 黑盒对齐得到超集，残差补遮，
  * 后置条件自检，不动点。它不再被门面调用；换行口径与追踪重放一致（结构位置见 trackedReplay.structurePositions）。
@@ -64,6 +68,7 @@ import {
   type ReplayResult,
   replayTracked,
   type Segment,
+  type StructureAnalysis,
   type Tracked,
 } from './trackedReplay.js';
 
@@ -786,6 +791,69 @@ export interface RedactionFloorOptions {
     source: Tracked,
     frozen: string
   ) => ReplayResult | null;
+  /**
+   * 同一次调用内的重放共享（见 createFloorReplayShare）。只在某一轮的原文正是共享对象的原文时读写；
+   * 带 replayOverride 时不读不写。
+   */
+  replayShare?: FloorReplayShare;
+  /**
+   * 按来源追加的检测器（阶段 4e，只由 sourcePolicy.ts 的合并路径传入；门面与测试缺省为空）：与 detectors 一样在
+   * 每轮原文上计算、并入同一轮（不串接），排在 detectors 之后；区别只在于不按 v0/v1 级联触发前缀切开区间。
+   * 理由：保留触发前缀是为了让“有检测器 ⊇ 无检测器”在门面的多轮不动点上成立；按来源路径的 ⊇ 由种子（未知来源
+   * 最终遮住的输入位置）在第一轮直接并入来构造性地保证，种子若被切掉触发前缀，就要依赖后续轮次的级联重新遮住，
+   * 构造性丢失。T3 区间同理：secret-bearing 的取值里出现 `token:` 一类写法时整段遮住，不留关键字。
+   */
+  sourceDetectors?: readonly FloorDetector[];
+}
+
+/**
+ * 某个版本在某段原文上的重放结果：冻结输出、追踪重放与缺口（都只取决于版本与原文）。被遮位置由
+ * markHiddenByTracked 从 result.tracked 直接写进位掩码（不再分配整篇的可见表）。
+ */
+export interface RevisionReplay {
+  readonly frozen: string;
+  /** frozen 与原文相同（该版本没有改动文本）时为 null：没有遮住任何内容，不重放。 */
+  readonly result: ReplayResult | null;
+  /** 自检通过时的缺口（只读，渲染按版本优先级复用）。 */
+  readonly gaps: readonly Gap[] | null;
+}
+
+/**
+ * 一次调用内跨多遍底线共享的第一轮重放（阶段 4e）。按来源的合并路径在同一原文上先后跑两遍底线：未知来源一遍
+ * （种子与快路径判定要它的逐字符来源），带 T3 区间与种子的一遍；两遍第一轮四个版本的冻结输出、追踪重放、被遮
+ * 位置与缺口只取决于这段原文，完全相同，第二遍直接复用，省掉一整轮重放（合并路径的主要开销）。
+ * 只缓存创建时给定原文上的结果，其它轮次的文本照常计算；由调用方每次调用新建、随调用结束丢弃，不是模块级状态。
+ * 复用的结果与重新计算逐位相同，报告计数（含自检失配）照常按轮累加，所以共享与否输出和报告都不变。
+ */
+export interface FloorReplayShare {
+  readonly text: string;
+  readonly replays: Map<BaselineRevision, RevisionReplay>;
+  /**
+   * 同一原文上第一轮“版本部分”的汇总（见 FloorRoundBase）：第一遍算出后写入，后续各遍只复制位掩码再并入各自的
+   * 检测器区间，不再逐版本合并可见表、重算标记核心与结构分析。随共享对象按次新建、随调用结束丢弃。
+   */
+  base?: FloorRoundBase;
+}
+
+/**
+ * 某段原文上四个版本部分的汇总，只取决于原文与版本（与检测器无关）：版本位掩码、按优先级排列的缺口、自检失配的
+ * 行与次数、原文里已有的完整标记；结构分析在第一次需要渲染时求出并缓存。全部只读使用：位掩码由使用方复制后
+ * 再并入检测器区间，失配次数在每一遍按原顺序计入报告，所以复用与重算的输出和报告逐位相同。
+ */
+export interface FloorRoundBase {
+  readonly bits: Uint8Array;
+  readonly gapSets: readonly GapSet[];
+  readonly cores: ReadonlyArray<[number, number]>;
+  readonly unaligned: ReadonlySet<number>;
+  readonly maskAll: boolean;
+  readonly anyHidden: boolean;
+  /** 自检失配的版本数（每个计一次 replay-mismatch）。 */
+  readonly mismatches: number;
+  structure: StructureAnalysis | null;
+}
+
+export function createFloorReplayShare(text: string): FloorReplayShare {
+  return { text, replays: new Map() };
 }
 
 export interface ProvenanceResult extends FloorResult {
@@ -966,13 +1034,16 @@ function normalizeDetectorSpan(
  * 逐字相同（检测器只在它真正多遮的地方改变输出）。底线没遮住的级联触发前缀位置（cascadeTriggerMarks）不并入：
  * 区间被它们切成几段，各段分别作为缺口；只剩触发前缀可并的区间按底线已覆盖处理。诊断事件与命中计数写进报告
  * （不含正文）。
+ * keepTriggers 为 false 时（按来源的 sourceDetectors）不保留触发前缀：区间按原样并入，只做“底线已覆盖”与
+ * “落在已有标记内”两种精确跳过（理由见 RedactionFloorOptions.sourceDetectors）。
  */
 function applyDetectors(
   x: string,
   detectors: readonly FloorDetector[],
   bits: Uint8Array,
   cores: ReadonlyArray<[number, number]>,
-  report: FloorReport
+  report: FloorReport,
+  keepTriggers: boolean
 ): { gaps: Gap[]; anyHidden: boolean } {
   const length = x.length;
   const gaps: Gap[] = [];
@@ -987,9 +1058,9 @@ function applyDetectors(
   };
   let coreMask: Uint8Array | null = null;
   let triggers: Uint8Array | null = null;
-  // 位置 index 是否要并入：底线没遮住、且不是保留的级联触发前缀。触发前缀表第一次需要时才计算（一遍正则）。
+  // 位置 index 是否保留可见：底线没遮住、且是保留的级联触发前缀。触发前缀表第一次需要时才计算（一遍正则）。
   const keepVisible = (index: number): boolean => {
-    if ((bits[index] & 15) !== 0) {
+    if (!keepTriggers || (bits[index] & 15) !== 0) {
       return false;
     }
     triggers ??= cascadeTriggerMarks(x);
@@ -1156,43 +1227,67 @@ export function markHiddenByTracked(
   return any;
 }
 
-/** 单轮：四个版本的追踪重放（带自检）并集、检测器区间、原子标记扩展、按位置渲染、失败即关。 */
-function replayFloorOnce(
+/** 某个版本在原文 x 上的冻结输出与追踪重放（带自检），以及由它派生的缺口。 */
+function replayRevision(
+  revision: BaselineRevision,
   x: string,
-  report: FloorReport,
+  options: RedactionFloorOptions
+): RevisionReplay {
+  const frozen = frozenRedact(revision, x);
+  if (frozen === x) {
+    return { frozen, result: null, gaps: null };
+  }
+  const source = originTracked(x);
+  const result =
+    options.replayOverride?.(revision, source, frozen) ?? replayTracked(revision, source, frozen);
+  const tracked = result.tracked;
+  return {
+    frozen,
+    result,
+    gaps: tracked !== null && result.verified ? gapsFromTracked(tracked, x.length) : null,
+  };
+}
+
+/**
+ * 一轮里的版本部分：四个版本的追踪重放（带自检）位置并集、缺口、自检失配的行（失败即关）与原文里已有的标记。
+ * replays 非空时逐版本读写共享的重放结果（同一原文上的多遍只算一次）。报告计数不在这里改动，由调用方按
+ * mismatches 计入。
+ */
+function versionRoundBase(
+  x: string,
   options: RedactionFloorOptions,
-  wantOrigin: boolean
-): ReplayRound {
-  const detectors = options.detectors ?? DEFAULT_FLOOR_DETECTORS;
+  replays: Map<BaselineRevision, RevisionReplay> | null
+): FloorRoundBase {
   const length = x.length;
-  // bits[i]：遮住位置 i 的版本位掩码（检测器用最高位）；hidden 由它派生。
+  // bits[i]：遮住位置 i 的版本位掩码（低 4 位，检测器用更高的位，由使用方在复制件上并入）。
   const bits = new Uint8Array(length);
   const gapSets: GapSet[] = [];
-  const cores = markerCores(x);
   const unaligned = new Set<number>();
   let maskAll = false;
   let anyHidden = false;
+  let mismatches = 0;
   for (const revision of REPLAY_PRIORITY) {
-    const frozen = frozenRedact(revision, x);
-    if (frozen === x) {
+    let replay = replays?.get(revision);
+    if (replay === undefined) {
+      replay = replayRevision(revision, x, options);
+      replays?.set(revision, replay);
+    }
+    const { frozen, result } = replay;
+    if (result === null) {
       // 该版本没有改动文本：没有遮住任何内容。跳过是精确的，不是放行。
       continue;
     }
-    const source = originTracked(x);
-    const result =
-      options.replayOverride?.(revision, source, frozen) ?? replayTracked(revision, source, frozen);
     if (result.tracked !== null) {
       if (markHiddenByTracked(result.tracked, length, bits, REVISION_BIT[revision])) {
         anyHidden = true;
       }
-      if (result.verified) {
-        gapSets.push({ revision, gaps: gapsFromTracked(result.tracked, length) });
-      }
+    }
+    if (replay.gaps !== null) {
+      gapSets.push({ revision, gaps: replay.gaps });
     }
     if (!result.verified) {
       // 自检失败：重放位置不可信（仍并入，只会多遮），受影响的行整行失败即关。
-      report.replayMismatches++;
-      note(report, 'replay-mismatch');
+      mismatches++;
       const lines = mismatchLines(x, frozen, result.tracked === null ? null : result.tracked.text);
       if (lines === ALL_LINES) {
         maskAll = true;
@@ -1203,18 +1298,79 @@ function replayFloorOnce(
       }
     }
   }
-  const detected = applyDetectors(x, detectors, bits, cores, report);
+  return {
+    bits,
+    gapSets,
+    cores: markerCores(x),
+    unaligned,
+    maskAll,
+    anyHidden,
+    mismatches,
+    structure: null,
+  };
+}
+
+/** 单轮：四个版本的追踪重放（带自检）并集、检测器区间、原子标记扩展、按位置渲染、失败即关。 */
+function replayFloorOnce(
+  x: string,
+  report: FloorReport,
+  options: RedactionFloorOptions,
+  wantOrigin: boolean
+): ReplayRound {
+  const detectors = options.detectors ?? DEFAULT_FLOOR_DETECTORS;
+  const length = x.length;
+  // 共享只在本轮原文正是共享对象的原文时生效（同一字符串引用时比较是 O(1)）；测试替换重放时不读不写，
+  // 免得替换结果混进缓存或被缓存遮住。
+  const share =
+    options.replayShare !== undefined &&
+    options.replayOverride === undefined &&
+    options.replayShare.text === x
+      ? options.replayShare
+      : null;
+  let base = share?.base;
+  if (base === undefined) {
+    base = versionRoundBase(x, options, share?.replays ?? null);
+    if (share !== null) {
+      share.base = base;
+    }
+  }
+  // 自检失配按版本逐个计入报告（与逐版本重算时同序：失配记在检测器区间之前）。
+  for (let count = 0; count < base.mismatches; count++) {
+    report.replayMismatches++;
+    note(report, 'replay-mismatch');
+  }
+  // bits[i]：遮住位置 i 的版本位掩码（检测器用位 16）；hidden 由它派生。共享的汇总只读：复制一份再并入检测器；
+  // 不共享时汇总是本轮新建的局部对象，直接就地并入（门面路径不多一次整篇复制）。
+  const bits = share !== null ? base.bits.slice() : base.bits;
+  const { cores, unaligned, maskAll } = base;
+  let anyHidden = base.anyHidden;
+  const detected = applyDetectors(x, detectors, bits, cores, report, true);
   if (detected.anyHidden) {
     anyHidden = true;
   }
-  if (detected.gaps.length > 0) {
-    // 检测器缺口排在全部历史版本之后（最低优先级）：只有历史版本铺不满的区间才会用到检测器的标记。
-    gapSets.push({ revision: 'detector', gaps: detected.gaps });
+  // 按来源追加的检测器（T3 区间与 A 的种子）在默认检测器之后并入，不按级联触发前缀切开（见 sourceDetectors）。
+  const sourced =
+    options.sourceDetectors !== undefined && options.sourceDetectors.length > 0
+      ? applyDetectors(x, options.sourceDetectors, bits, cores, report, false)
+      : null;
+  if (sourced?.anyHidden) {
+    anyHidden = true;
   }
+  const detectorGaps =
+    sourced === null || sourced.gaps.length === 0
+      ? detected.gaps
+      : [...detected.gaps, ...sourced.gaps];
+  // 检测器缺口排在全部历史版本之后（最低优先级）：只有历史版本铺不满的区间才会用到检测器的标记。共享汇总里的
+  // 缺口表只读，有检测器缺口时另建一份再追加。
+  const gapSets: readonly GapSet[] =
+    detectorGaps.length > 0
+      ? [...base.gapSets, { revision: 'detector', gaps: detectorGaps }]
+      : base.gapSets;
   if (!anyHidden && !maskAll && unaligned.size === 0) {
     return { changed: false, text: x, origin: null };
   }
-  const structure = analyzeStructure(x);
+  base.structure ??= analyzeStructure(x);
+  const structure = base.structure;
   const structureMarks = structure.marks;
   const coreMarks = new Uint8Array(length);
   for (const [start, end] of cores) {

@@ -512,11 +512,15 @@ test('production ledger stores fully masked tool output while preserving freshne
     null,
     2
   );
+  // 脱敏阶段 4e：`.env.example` 属于 secret-bearing（证据文件分类表，模板从严），台账按来源追加 T3 后连
+  // `normal: 7` 也会被遮，JSON 不再可解析。本用例要钉住的是底线遮蔽与 freshness，所以主体改用 config 类文件名，
+  // secret-bearing 的形态在下面单独断言。
+  const range = { start: 1, end: source.split('\n').length };
   const entry = authority.capture.capture({
     tool: 'code.read',
     callId: 'fixture',
-    file: '.env.example',
-    range: { start: 1, end: source.split('\n').length },
+    file: 'fixtures/tool-output.json',
+    range,
     content: source,
   });
   const store = resolveProductionEvidenceLedgerStore(authority);
@@ -525,6 +529,17 @@ test('production ledger stores fully masked tool output while preserving freshne
   expect(JSON.parse(persisted.content)).toEqual({ stdout: 'password="[redacted]"', normal: 7 });
   expect(entry.content).toBe(persisted.content);
   expect(store.checkFreshness(entry.id, source)).toBe('fresh');
+
+  const secretBearing = authority.capture.capture({
+    tool: 'code.read',
+    callId: 'fixture-secret-bearing',
+    file: '.env.example',
+    range,
+    content: source,
+  });
+  expect(secretBearing.content).not.toContain('SYNTHETIC');
+  expect(secretBearing.content).toBe('{\n  "stdout": "[redacted]",\n  "normal": [redacted]\n}');
+  expect(store.checkFreshness(secretBearing.id, source)).toBe('fresh');
 });
 
 describe('EvidenceLedgerStore partial tail repair', () => {

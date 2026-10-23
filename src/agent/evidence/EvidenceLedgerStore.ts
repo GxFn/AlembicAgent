@@ -86,8 +86,11 @@ const LEDGER_DIRECTORY_BY_PROFILE: Readonly<Record<EvidenceLedgerContentProfile,
 /**
  * 传给 redactor 的条目来源上下文（取自草稿或条目自身的可信元数据）。
  *
- * 阶段 2 只透传：生产 redactor（redactDeveloperText）是单参函数，忽略它；阶段 4 的按来源追加规则
- * （T3）据此区分 terminal、secret-bearing 等来源。上下文只能让遮蔽更多，不能用来放行。
+ * 阶段 2 只透传；阶段 4e 起默认 profile 的生产 redactor（ProductionEvidenceLedgerAuthority 注入的
+ * redactLedgerContent → redactDeveloperTextInContext）据此按来源追加 T3：terminal、secret-bearing 有追加规则，
+ * source、config、no-file 与缺省上下文等同未知来源（与 redactDeveloperText 逐字相同）。上下文只能让遮蔽更多，
+ * 不能用来放行（不变量 A）。append、checkFreshness 的脱敏哈希重算与 describeContentTransformation 必须传
+ * 同一份上下文，否则同一条目会按不同的尺计算。
  */
 export interface EvidenceRedactionContext {
   readonly tool?: EvidenceToolId;

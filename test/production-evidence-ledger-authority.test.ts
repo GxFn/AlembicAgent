@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   appendFileSync,
   existsSync,
@@ -16,6 +17,7 @@ import {
   hashEvidenceContent,
 } from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { resolveProductionEvidenceLedgerStore } from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
+import { redactDeveloperText } from '../src/agent/utils/Redaction.js';
 import { createProductionEvidenceLedgerAuthority } from '../src/production.js';
 
 const temporaryRoots = new Set<string>();
@@ -657,6 +659,187 @@ describe('production Evidence Ledger capture content-transformation diagnostics'
     expect(authority.read.get('E-1')).toEqual(entry);
     expect(authority.read.strictSnapshot().entries).toEqual([entry]);
     expect(readPersistedLines(root)).toHaveLength(1);
+  });
+});
+
+/**
+ * 脱敏阶段 4e：默认 profile 注入带来源上下文的 redactor（T3 按来源追加）。见证 profile 仍不注入任何
+ * redactor；默认 profile 的 storeId / storeConfigHash 公式不变（D6）；EvidenceEntryDraft 不加字段。
+ */
+describe('production Evidence Ledger source-aware redaction (stage 4e, T3)', () => {
+  const coordinates = () => ({
+    dataRoot: createRoot(),
+    jobId: 'job:source-policy',
+    sessionId: 'session:source-policy',
+    dimensionId: 'dimension:source-policy',
+  });
+  const envText = 'PORT=8080\nDB_HOST=db.internal\nMY_SERVICE_PASS_HINT=SYNTHETIChint42';
+
+  it('masks every value of a secret-bearing capture and sensitive env keys of a terminal capture, but keeps source captures on the unknown-source floor', () => {
+    const authority = createProductionEvidenceLedgerAuthority(coordinates());
+    const secretBearing = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:source-policy:env',
+      file: 'deploy/.env',
+      range: { start: 1, end: 3 },
+      content: envText,
+    });
+    const terminal = authority.capture.capture({
+      tool: 'terminal.exec',
+      callId: 'call:source-policy:terminal',
+      content: envText,
+    });
+    const source = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:source-policy:source',
+      file: 'src/settings.ts',
+      content: envText,
+    });
+
+    expect(secretBearing.content).toBe(
+      'PORT=[redacted]\nDB_HOST=[redacted]\nMY_SERVICE_PASS_HINT=[redacted]'
+    );
+    expect(secretBearing.range).toEqual({ start: 1, end: 3 });
+    expect(terminal.content).toBe(
+      'PORT=8080\nDB_HOST=db.internal\nMY_SERVICE_PASS_HINT=[redacted]'
+    );
+    // 源码来源没有 T3 规则：与开发者事件同一把尺（未知来源底线），落盘内容不变。
+    expect(source.content).toBe(redactDeveloperText(envText));
+    expect(source.content).toBe(envText);
+    for (const entry of [secretBearing, terminal, source]) {
+      expect(entry.contentHash).toBe(hashEvidenceContent(entry.content));
+      expect(authority.read.get(entry.id)).toEqual(entry);
+    }
+  });
+
+  it('keeps the default profile identity formula and storeConfigHash unchanged (D6)', () => {
+    const root = coordinates();
+    const authority = createProductionEvidenceLedgerAuthority(root);
+    const storageRootHash = `sha256:${createHash('sha256')
+      .update(`storage-root\0${path.resolve(root.dataRoot)}`)
+      .digest('hex')}`;
+    const storeId = `agent-evidence-ledger:${createHash('sha256')
+      .update(
+        JSON.stringify({
+          schemaVersion: 1,
+          authorityKind: authority.identity.authorityKind,
+          storageRootHash,
+          jobId: root.jobId,
+          sessionId: root.sessionId,
+          dimensionId: root.dimensionId,
+          persistence: 'append-only-jsonl-v1',
+        })
+      )
+      .digest('hex')}`;
+    expect(authority.identity.storeId).toBe(storeId);
+    expect(authority.identity.storeConfigHash).toBe(
+      `sha256:${createHash('sha256')
+        .update(
+          JSON.stringify({
+            authorityKind: authority.identity.authorityKind,
+            persistence: 'append-only-jsonl-v1',
+            redaction: 'redact-developer-text-v1',
+            storeId,
+          })
+        )
+        .digest('hex')}`
+    );
+  });
+
+  it('leaves the verbatim witness profile without any redactor: terminal and secret-bearing captures stay byte-exact', () => {
+    const authority = createProductionEvidenceLedgerAuthority({
+      ...coordinates(),
+      contentProfile: 'verbatim-witness',
+    });
+    const terminal = authority.capture.capture({
+      tool: 'terminal.exec',
+      callId: 'call:witness:terminal',
+      content: envText,
+    });
+    const secretBearing = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:witness:env',
+      file: 'deploy/.env',
+      content: envText,
+    });
+    expect(terminal.content).toBe(envText);
+    expect(secretBearing.content).toBe(envText);
+    expect(secretBearing.contentHash).toBe(
+      `sha256:${createHash('sha256').update(envText).digest('hex')}`
+    );
+  });
+
+  it('classifies a T3-only rewrite as redacted in the capture diagnostic (same source context as the append)', () => {
+    const warn = vi
+      .spyOn(Logger.getInstance(), 'warn')
+      .mockImplementation(() => Logger.getInstance());
+    const authority = createProductionEvidenceLedgerAuthority(coordinates());
+    const content = 'PORT=8080\nREGION=eu-west-1';
+    // 未知来源底线不改写这段文本：只有 secret-bearing 的 T3 规则会遮。
+    expect(redactDeveloperText(content)).toBe(content);
+
+    const entry = authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:source-policy:diag',
+      file: 'deploy/.env.production',
+      content,
+    });
+
+    expect(entry.content).toBe('PORT=[redacted]\nREGION=[redacted]');
+    const calls = warn.mock.calls.filter((call) =>
+      String(call[0]).includes('[ProductionEvidenceLedger]')
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[1]).toMatchObject({
+      evidenceId: entry.id,
+      file: 'deploy/.env.production',
+      originalLength: content.length,
+      storedLength: entry.content.length,
+      transformations: ['redacted'],
+    });
+    expect(JSON.stringify(calls)).not.toContain('eu-west-1');
+  });
+
+  it('logs the source-policy contribution at debug level with counts only', () => {
+    const debug = vi
+      .spyOn(Logger.getInstance(), 'debug')
+      .mockImplementation(() => Logger.getInstance());
+    const authority = createProductionEvidenceLedgerAuthority(coordinates());
+    authority.capture.capture({
+      tool: 'terminal.exec',
+      callId: 'call:source-policy:debug',
+      content: 'MY_SERVICE_PASS_HINT=SYNTHETIChint42',
+    });
+    const calls = debug.mock.calls.filter((call) =>
+      String(call[0]).includes('source policy appended redaction')
+    );
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[0]?.[1]).toMatchObject({
+      tool: 'terminal.exec',
+      sourceClass: 'terminal',
+      path: 'merged',
+      ruleHits: { 'terminal-env-sensitive-key': 1 },
+    });
+    expect(JSON.stringify(calls)).not.toContain('SYNTHETIC');
+  });
+
+  it('keeps freshness consistent across processes for secret-bearing captures that carry a range', () => {
+    const root = coordinates();
+    const authority = createProductionEvidenceLedgerAuthority(root);
+    authority.capture.capture({
+      tool: 'code.read',
+      callId: 'call:source-policy:fresh',
+      file: 'deploy/.env',
+      range: { start: 1, end: 3 },
+      content: envText,
+    });
+    // 新实例没有进程内原文摘要，走“同区间重切 + 同一把（带来源）尺”的脱敏哈希路径。
+    const reopened = resolveProductionEvidenceLedgerStore(
+      createProductionEvidenceLedgerAuthority(root)
+    );
+    // 同一把尺：落盘时与重算时都带同一来源上下文，未改动的文件判 fresh，键名改动判 stale。
+    expect(reopened.checkFreshness('E-1', `${envText}\n`)).toBe('fresh');
+    expect(reopened.checkFreshness('E-1', envText.replace('DB_HOST', 'DB_NAME'))).toBe('stale');
   });
 });
 
