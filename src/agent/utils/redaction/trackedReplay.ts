@@ -14,9 +14,12 @@
  * [redacted-unaligned] 并计入 FloorReport。重放过程中的内部不一致（解码/编码对不上、分组缺失）同样只走
  * 这条失败即关路径，不抛到调用方。
  *
- * 结构字符（D3 及其阶段 4 子项）：裸 \r、\n 视为结构；可解析的 JSON 字符串字面量内、解码后是换行的转义
- * 序列（\n、\r、\u000a、\u000d，按载体递归到 MAX_ENCODED_DEPTH）也视为结构。structurePositions 给出这些
- * 位置，底线对它们不作遮蔽要求，渲染器在被遮区间内按原顺序放回它们——只暴露换行个数，不暴露任何字符。
+ * 结构字符（D3 及其阶段 4 子项）：裸 \r、\n 视为结构；JSON 载体字面量内、解码后是换行的转义序列（\n、\r、
+ * \u000a、\u000d，按载体递归到 MAX_ENCODED_DEPTH）也视为结构。“JSON 载体字面量”只指真正的 JSON 文档里的字符串
+ * 字面量（RED-P4a2，总控决定的安全收紧）：整段文本可解析为 JSON 文档，或某一整行可解析为 JSON 对象或数组（例如
+ * 后面跟着 [evidence] 标注的 {"stdout":…} 工具结果载体）；载体字符串值解码后的文本按同一规则逐层判断。纯文本里的
+ * 双引号串（shell export、源码字符串字面量）不是载体，其中的 \n 两个字符按内容处理。structurePositions 给出
+ * 这些位置，底线对它们不作遮蔽要求，渲染器在被遮区间内按原顺序放回它们——只暴露换行个数，不暴露任何字符。
  * 这一口径同时约束 hiddenSpans 的对齐 oracle（测试期）与本模块（运行时），由测试钉住。
  *
  * 表示：Tracked 用分段而不是逐字符数组记录来源（copy 段：输出连续区间一一对应输入连续区间；range 段：
@@ -1078,6 +1081,11 @@ export interface StructureToken {
   start: number;
   end: number;
   newline: '\n' | '\r';
+  /**
+   * 换行所在的载体层级：0 = x 里的裸换行；d ≥ 1 = 第 d 层解码后才出现的换行（第 1 层载体字面量里的 \n、\u000a，
+   * 第 2 层的 \\n、\\u000a、\\\u006e……）。渲染器按层级做多重集差（RED-P4a2 第 1 项）：同一层级的换行才相抵。
+   */
+  level: number;
 }
 
 export interface StructureAnalysis {
@@ -1088,7 +1096,8 @@ export interface StructureAnalysis {
 }
 
 /**
- * 结构位置（D3 与阶段 4 子项）：裸 \r、\n，以及可解析 JSON 字符串字面量内解码后是换行的转义序列（按载体递归）。
+ * 结构位置（D3 与阶段 4 子项）：裸 \r、\n，以及 JSON 载体字面量内解码后是换行的转义序列（按载体递归）。载体字面量
+ * 只取自可解析为 JSON 文档的整段文本或整行（见 jsonDocumentRanges）；纯文本里的双引号串不是载体。
  * 底线对这些位置不作遮蔽要求；渲染器在被遮区间内按原顺序放回它们——只暴露换行个数，不暴露任何字符。
  */
 export function analyzeStructure(x: string): StructureAnalysis {
@@ -1129,31 +1138,89 @@ function collectStructure(
       if (low >= 0) {
         const end = Math.min(high, marks.length);
         marks.fill(1, low, end);
-        tokens.push({ start: low, end, newline: code === 10 ? '\n' : '\r' });
+        tokens.push({ start: low, end, newline: code === 10 ? '\n' : '\r', level: depth });
       }
     }
   }
   if (depth >= MAX_ENCODED_DEPTH) {
     return;
   }
-  const scanner = new RegExp(JSON_STRING, 'g');
-  for (let match = scanner.exec(text); match !== null; match = scanner.exec(text)) {
-    const literal = match[0];
-    // 只有含 \n、\r、\u 转义的字面量才可能在解码后出现换行（深层载体的换行也经这些转义编码）。
-    if (!/\\[nru]/.test(literal)) {
-      continue;
+  for (const [from, to] of jsonDocumentRanges(text)) {
+    // 在一个合法 JSON 文档内从文档起点顺序扫描，正则恰好切出它的字符串记号（文档里引号只出现在字符串内）。
+    const scanner = new RegExp(JSON_STRING, 'g');
+    scanner.lastIndex = from;
+    for (let match = scanner.exec(text); match !== null; match = scanner.exec(text)) {
+      const literal = match[0];
+      if (match.index + literal.length > to) {
+        break;
+      }
+      // 只有含 \n、\r、\u 转义的字面量才可能在解码后出现换行（深层载体的换行也经这些转义编码）。
+      if (!/\\[nru]/.test(literal)) {
+        continue;
+      }
+      try {
+        JSON.parse(literal);
+      } catch (err: unknown) {
+        void err;
+        continue;
+      }
+      collectStructure(
+        decodeLiteral(level, match.index, match.index + literal.length),
+        marks,
+        tokens,
+        depth + 1
+      );
     }
-    try {
-      JSON.parse(literal);
-    } catch (err: unknown) {
-      void err;
-      continue;
-    }
-    collectStructure(
-      decodeLiteral(level, match.index, match.index + literal.length),
-      marks,
-      tokens,
-      depth + 1
-    );
   }
+}
+
+/** JSON.parse 接受的文档前导空白之后，是否以对象、数组或字符串开头（只有这三种文档可能含字符串字面量）。 */
+const DOCUMENT_START = /^[ \t\r\n]*[{["]/;
+/** 单独一行作为载体时只认对象或数组：一行里单独的双引号串（源码里的字符串字面量、美化数组的末项）不是载体。 */
+const LINE_DOCUMENT_START = /^[ \t]*[{[]/;
+
+function parsesAsJsonDocument(text: string, start: RegExp): boolean {
+  if (!start.test(text)) {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return true;
+  } catch (err: unknown) {
+    // 解析失败只说明这段文本不是 JSON 文档，按纯文本处理（其中的转义换行是内容）；不是错误路径。
+    void err;
+    return false;
+  }
+}
+
+/**
+ * text 里可解析为 JSON 文档的区间 [from, to)（RED-P4a2：D3 阶段 4 子项只在真正的 JSON 载体里放回转义换行）。
+ * 整段可解析时就是整段（含美化输出的多行文档与根字符串）；否则取各自整行可解析为对象或数组的行——JSON.stringify
+ * 写出的紧凑载体都在一行内，例如后面跟着 [evidence] 标注的 {"stdout":…}。其他文本（shell export、源码里的字符串
+ * 字面量、单独一行的双引号串、带行号前缀的证据切片）都不是载体。
+ */
+function jsonDocumentRanges(text: string): Array<[number, number]> {
+  if (parsesAsJsonDocument(text, DOCUMENT_START)) {
+    return [[0, text.length]];
+  }
+  const ranges: Array<[number, number]> = [];
+  if (text.indexOf('\n') < 0 && text.indexOf('\r') < 0) {
+    // 单行文本：整段解析已经失败，这一行也不是文档。
+    return ranges;
+  }
+  let lineStart = 0;
+  for (let index = 0; index <= text.length; index++) {
+    const code = index < text.length ? text.charCodeAt(index) : 10;
+    if (code !== 10 && code !== 13) {
+      continue;
+    }
+    if (
+      index > lineStart &&
+      parsesAsJsonDocument(text.slice(lineStart, index), LINE_DOCUMENT_START)
+    ) {
+      ranges.push([lineStart, index]);
+    }
+    lineStart = index + 1;
+  }
+  return ranges;
 }

@@ -450,3 +450,81 @@ export function carrierSandwiches(): Array<{ name: string; input: string }> {
   }
   return cases;
 }
+
+/**
+ * 同一缺口混合两种换行形态（RED-P4a2 第 1 项）：敏感键下的容器或跨行引号值里，既有裸换行，又有可解析字面量里的
+ * 转义换行（\n、\r\n、\u000a）；放进整篇 JSON 文档（紧凑或美化）、非文档文本里的容器、带 [evidence] 标注与 NN:
+ * 前缀的证据切片、跨行的 shell export，以及工具结果载体里。判据：渲染从不退回整篇骨架，裸换行序列守恒、幂等，
+ * 并通过攻击夹具。固定种子，可复现。
+ */
+const MIXED_KEYS: readonly string[] = [
+  'password',
+  'secret',
+  'token',
+  'api_key',
+  'private_key',
+  'client_secret',
+  'authorization',
+];
+
+const MIXED_ESCAPES: readonly string[] = ['\\n', '\\r\\n', '\\u000a', '\\n\\n'];
+
+/** 敏感值：可跨行的容器或引号值；E 是转义换行，B 是裸换行，S 是合成秘密片段。 */
+const MIXED_VALUES: ReadonlyArray<(e: string, b: string, s: string) => string> = [
+  (e, b, s) => `["${s}a${e}b",${b}"c"]`,
+  (e, b, s) => `{"x": "${s}p${e}q",${b} "y": 2}`,
+  (e, b, s) => `{${b}    "note": "${s}a${e}b"${b}  }`,
+  (e, b, s) =>
+    `[${b} "-----BEGIN PRIVATE KEY-----${e}MIIEvQIBADANBgkqhkiG9w0B${s}${e}-----END PRIVATE KEY-----${e}"${b}]`,
+  (e, b, s) => `{"a": ["${s}${e}", {"b": "${e}${s}"}],${b}"c": [1,${b}2]}`,
+  (e, b, s) => `[${b}"${s}x${e}y",${b}"${s}z${e}"${b}]`,
+];
+
+const MIXED_WRAPS: ReadonlyArray<(key: string, value: string, b: string) => string> = [
+  (key, value) => `{"${key}": ${value}}`,
+  (key, value, b) => `{${b}  "${key}": ${value},${b}  "normal": 7${b}}`,
+  (key, value, b) => `line0${b}{"${key}": ${value}}${b}line3 ok`,
+  (key, value, b) => {
+    const body = `{${b}"${key}": ${value}${b}}`.split(b);
+    const numbered = body.map((line, index) => `${12 + index}: ${line}`).join(b);
+    return `[evidence] E-1=config/app.json:12-${11 + body.length}${b}${numbered}`;
+  },
+  (key, value, b) => `export API_TOKEN='{${b}  "${key}": ${value}${b}}'${b}echo done`,
+  (key, value, b) => `a: 1${b}{"${key}": ${value}}${b}z: 3`,
+  (key, value, b) => JSON.stringify({ stdout: `line0${b}{"${key}": ${value}}${b}line3 ok` }),
+  (key, value, b) =>
+    `${JSON.stringify({ stdout: `{"${key}": ${value}}` })}${b}${b}[evidence] E-1=src/a.ts:1-3`,
+];
+
+export function mixedNewlineGapInputs(count: number, seed: number): string[] {
+  const random = seededRandom(seed);
+  const inputs: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const escaped = pick(random, MIXED_ESCAPES);
+    const bare = random() < 0.2 ? '\r\n' : '\n';
+    const secret = `SYNTHmix${index}`;
+    const value = pick(random, MIXED_VALUES)(escaped, bare, secret);
+    inputs.push(pick(random, MIXED_WRAPS)(pick(random, MIXED_KEYS), value, bare));
+  }
+  return inputs;
+}
+
+/**
+ * 链式字面标记与引号交替（第五轮审计第 4 条，d0462bf 上 8 轮触顶、不幂等）：'Token=' 后接 k 段
+ * '[redacted]SYNTHc<i>' 加交替的引号对，再接 'end'。覆盖段数 1–12、不同键、两种引号顺序与两层载体。
+ */
+export function chainedMarkerInputs(): string[] {
+  const inputs: string[] = [];
+  for (const key of ['Token=', 'password: ', 'secret=', 'api_key=']) {
+    for (const quotes of ['"\'', '\'"']) {
+      for (let segments = 1; segments <= 12; segments++) {
+        const body = `${key}${Array.from({ length: segments }, (_, index) => `[redacted]SYNTHc${index}${quotes}`).join('')}end`;
+        inputs.push(body, JSON.stringify({ stdout: body }));
+        if (segments % 4 === 0) {
+          inputs.push(JSON.stringify({ message: JSON.stringify({ stdout: body }) }));
+        }
+      }
+    }
+  }
+  return inputs;
+}

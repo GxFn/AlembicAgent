@@ -8,13 +8,20 @@
  * 2. 唯一字符：输入里只出现一次的字符，某版本输出里没有它即被遮；新输出里出现就是露出（输入含 \u 转义时
  *    跳过，因为解码后可能生成同一字符）。
  * 3. 哨兵：输入中的 SYNTH… / Synth… 片段，任一版本输出里不含它时，新输出也不得含它。
- * 4. 结构：幂等、裸换行序列守恒、新写出的标记都在封闭词表内、生产入口与夹具入口输出一致。
+ * 4. 结构：幂等、裸换行序列守恒、新写出的标记都在封闭词表内、生产入口与夹具入口输出一致、渲染没有退回整篇
+ *    骨架（RED-P4a2：正常规则下 renderSkeletons 恒为 0）。
  * 另外报告两类自检：对齐器（超集 ⊇ 精确被遮、子集 ⊆ 精确被遮；阶段 4 起对齐只是测试期对照与回退路径）
  * 与运行时分段重放（必须与本目录的逐字符重放给出相同的被遮位置），用于定位实现缺陷。
  *
- * 信息等价的豁免（设计 4.2 节“遮住”的口径）：结构位置（裸换行，以及可解析 JSON 字面量内解码后是换行的转义
- * 序列，D3 阶段 4 子项——只暴露换行个数）、引号字符及转义引号的反斜杠、输入里原本就有的标记文字。这一口径
- * 与运行时 trackedReplay.structurePositions 相同，由测试钉住。
+ * 信息等价的豁免（设计 4.2 节“遮住”的口径）：
+ * - 结构位置：裸换行，以及 JSON 载体字面量内解码后是换行的转义序列（D3 阶段 4 子项——只暴露换行个数）。载体只指
+ *   真正的 JSON 文档（整段或整行可解析，RED-P4a2 第 2 项）；纯文本里双引号串的 \n 是内容。口径与运行时
+ *   trackedReplay.structurePositions 相同，由测试对照独立参照钉住。
+ * - 值边界上的定界引号记号（RED-P4a2 第 3 项，设计 4.2“分隔用的引号在同一位置可见”）：紧贴引号的奇数长度反斜杠串
+ *   连同引号是一个记号（该引号的转义）；偶数长度的反斜杠串是内容，引号单独成记号。某个基线把记号两侧紧邻的字符都
+ *   遮住时（相邻的引号记号连成一簇，看簇两侧最近的非引号字符），它是值内部的引号（例如 "ab\"cd\"ef" 里的 \"），
+ *   按内容判定。逐基线判定时用该基线的精确被遮位置；不指定基线时，对任一基线是值内部的记号都不豁免。
+ * - 输入里原本就有的标记文字。
  */
 import { redactDeveloperText } from '../../../src/agent/utils/Redaction.js';
 import {
@@ -49,6 +56,10 @@ export interface LegacyRegressionReport {
   alignerViolations: string[];
   structuralViolations: string[];
   rounds: number;
+  /** 渲染换行不守恒、整篇退回骨架的次数（RED-P4a2：正常规则下必须为 0）。 */
+  renderSkeletons: number;
+  /** 证明义务 4（H⁺ ⊇ 追踪重放位置）实际逐位核对过的（早期版本 × 位置）数，防止对齐器自检空转。 */
+  supersetChecks: number;
 }
 
 const CORE_PATTERN =
@@ -59,28 +70,27 @@ function isNewline(char: string | undefined): boolean {
   return char === '\n' || char === '\r';
 }
 
-/** 信息等价、不计入 S 的输入位置。 */
-export function exemptPositions(x: string): Uint8Array {
+/**
+ * 引号记号 [start, end)（与渲染器同一口径的独立实现）：紧贴引号的奇数长度反斜杠串连同引号是一个记号；偶数长度的
+ * 反斜杠串是内容（每一对是一个转义的反斜杠），引号单独成记号；不紧贴引号的反斜杠串不是记号。
+ */
+export function quoteTokens(x: string): Array<[number, number]> {
+  const tokens: Array<[number, number]> = [];
+  for (const match of x.matchAll(/(\\*)(["'])/g)) {
+    const run = match[1]?.length ?? 0;
+    const quote = match.index + run;
+    tokens.push(run % 2 === 1 ? [match.index, quote + 1] : [quote, quote + 1]);
+  }
+  return tokens;
+}
+
+/** 与基线无关的豁免：结构位置（裸换行、JSON 载体字面量里的转义换行）与输入里原有的标记文字。 */
+function structuralExemptions(x: string): Uint8Array {
   const exempt = structurePositions(x);
   for (let index = 0; index < x.length; index++) {
-    const char = x[index];
-    if (isNewline(char) || char === '"' || char === "'") {
+    if (isNewline(x[index])) {
       exempt[index] = 1;
     }
-  }
-  // 紧贴引号的一串反斜杠是该引号的转义，与引号一起视为结构。
-  for (let index = 0; index < x.length; index++) {
-    if (x[index] !== '\\') {
-      continue;
-    }
-    let end = index;
-    while (x[end] === '\\') {
-      end++;
-    }
-    if (x[end] === '"' || x[end] === "'") {
-      exempt.fill(1, index, end);
-    }
-    index = end - 1;
   }
   for (const match of x.matchAll(CORE_PATTERN)) {
     exempt.fill(1, match.index, match.index + match[0].length);
@@ -88,8 +98,59 @@ export function exemptPositions(x: string): Uint8Array {
   return exempt;
 }
 
+/**
+ * 把值边界上的定界引号记号并入 exempt。相邻的引号记号连成一簇，簇两侧最近的非引号字符都被 masks 中同一个
+ * 基线遮住时，簇里的记号是值内部的引号，按内容判定（载体重编码合成的外层引号不算值内容：内层值的闭引号 \"
+ * 紧贴载体字面量的闭引号 " 时，看的是再外侧的字符）。
+ */
+function addBoundaryQuotes(
+  x: string,
+  exempt: Uint8Array,
+  masks: readonly Uint8Array[],
+  tokens: ReadonlyArray<[number, number]>
+): void {
+  const inToken = new Uint8Array(x.length);
+  for (const [start, end] of tokens) {
+    inToken.fill(1, start, end);
+  }
+  for (const [start, end] of tokens) {
+    let left = start - 1;
+    while (left >= 0 && inToken[left] === 1) {
+      left--;
+    }
+    let right = end;
+    while (right < x.length && inToken[right] === 1) {
+      right++;
+    }
+    const interior =
+      left >= 0 && right < x.length && masks.some((mask) => mask[left] === 1 && mask[right] === 1);
+    if (!interior) {
+      exempt.fill(1, start, end);
+    }
+  }
+}
+
+/**
+ * 信息等价、不计入 S 的输入位置。hidden 是某个基线的精确被遮位置时，按该基线判定引号记号是否在值边界上；省略时
+ * 按四个基线判定，只要对任一基线是值内部的引号记号就不豁免（与渲染器“任一版本把两侧都遮住就不原样输出”相同）。
+ */
+export function exemptPositions(x: string, hidden?: Uint8Array): Uint8Array {
+  const exempt = structuralExemptions(x);
+  const masks =
+    hidden === undefined
+      ? BASELINE_REVISIONS.map((revision) => exactHidden(revision, x))
+      : [hidden];
+  addBoundaryQuotes(x, exempt, masks, quoteTokens(x));
+  return exempt;
+}
+
 /** 新输出的逐字符来源：运行时渲染器在每一轮都记录输出字符取自哪个输入位置，跨轮组合后得到到原始输入的映射。 */
-function traceOutput(x: string): { output: string; origin: Int32Array; rounds: number } {
+function traceOutput(x: string): {
+  output: string;
+  origin: Int32Array;
+  rounds: number;
+  renderSkeletons: number;
+} {
   const result = applyRedactionFloorWithProvenance(x);
   if (result.origin.length !== result.text.length) {
     throw new Error('oracle: provenance length does not match the output');
@@ -100,7 +161,12 @@ function traceOutput(x: string): { output: string; origin: Int32Array; rounds: n
       throw new Error('oracle: output character does not match its recorded source');
     }
   }
-  return { output: result.text, origin: result.origin, rounds: result.report.rounds };
+  return {
+    output: result.text,
+    origin: result.origin,
+    rounds: result.report.rounds,
+    renderSkeletons: result.report.renderSkeletons,
+  };
 }
 
 function newlineSkeleton(text: string): string {
@@ -112,7 +178,8 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
   const exposures: Exposure[] = [];
   const alignerViolations: string[] = [];
   const structuralViolations: string[] = [];
-  const { output, origin, rounds } = traceOutput(input);
+  const { output, origin, rounds, renderSkeletons } = traceOutput(input);
+  let supersetChecks = 0;
   const production = redactDeveloperText(input);
   if (production !== output) {
     structuralViolations.push('production entry and traced floor disagree');
@@ -125,12 +192,16 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
       visible[from] = 1;
     }
   }
-  const exempt = exemptPositions(input);
   const outputs = new Map<BaselineRevision, string>();
+  const structural = structuralExemptions(input);
+  const tokens = quoteTokens(input);
   for (const revision of BASELINE_REVISIONS) {
     const baselineOutput = frozenRedact(revision, input);
     outputs.set(revision, baselineOutput);
     const hidden = exactHidden(revision, input);
+    // 逐基线的豁免：引号记号是否在值边界上，按这个基线自己的被遮位置判定（同 exemptPositions(input, hidden)）。
+    const exempt = structural.slice();
+    addBoundaryQuotes(input, exempt, [hidden], tokens);
     // 运行时的分段重放必须与本目录的逐字符重放给出完全相同的被遮位置（两套独立实现互为对照）。
     const runtimeHidden = runtimeExactHidden(revision, input);
     if (runtimeHidden === null) {
@@ -166,8 +237,11 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
         reencodes: revision === 'd113986',
       }).marks;
       for (let index = 0; index < input.length; index++) {
-        if (hidden[index] === 1 && superset[index] !== 1 && exempt[index] !== 1) {
-          alignerViolations.push(`superset misses ${revision}@${index}`);
+        if (hidden[index] === 1 && exempt[index] !== 1) {
+          supersetChecks++;
+          if (superset[index] !== 1) {
+            alignerViolations.push(`superset misses ${revision}@${index}`);
+          }
         }
       }
     }
@@ -222,11 +296,23 @@ export function checkNoLegacyRegression(input: string): LegacyRegressionReport {
       structuralViolations.push(`marker outside the closed vocabulary: ${match[0]}`);
     }
   }
-  return { input, output, exposures, alignerViolations, structuralViolations, rounds };
+  if (renderSkeletons > 0) {
+    structuralViolations.push(`render skeleton fallback (${renderSkeletons})`);
+  }
+  return {
+    input,
+    output,
+    exposures,
+    alignerViolations,
+    structuralViolations,
+    rounds,
+    renderSkeletons,
+    supersetChecks,
+  };
 }
 
 /**
- * 攻击夹具：违反 S（任何 oracle 报出露出）、幂等、换行守恒或标记词表时抛 Error，附可复现的细节。
+ * 攻击夹具：违反 S（任何 oracle 报出露出）、幂等、换行守恒、标记词表或渲染退回骨架时抛 Error，附可复现的细节。
  * 对齐器自检违规同样抛出：它们是底线实现缺陷的前兆，即使这一输入恰好没有露出。
  */
 export function assertNoLegacyRegression(input: string): LegacyRegressionReport {

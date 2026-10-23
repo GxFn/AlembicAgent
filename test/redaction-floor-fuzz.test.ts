@@ -4,9 +4,14 @@
  *
  * - 对抗模糊 40,000 例：同一 JSON 载体内的多键值三明治、\u 与 \/ 重编码、字面 [redacted]、双层载体、
  *   带行前缀与省略标记的 PEM、URL userinfo 与 SAS 签名尾段。每例用哨兵 oracle 对四个历史版本零回退，
- *   并检查幂等、裸换行守恒、新写出的标记都在封闭词表内；每 20 例另交给攻击夹具按精确 oracle 判定。
+ *   并检查幂等、裸换行守恒、新写出的标记都在封闭词表内；全部 40,000 例都交给攻击夹具按精确 oracle 判定
+ *   （RED-P4a2 第 4 项：不再抽样；本机 8 块合计约 45–65 s，控制在 90 s 内，每块超时 120 s），包括证明义务 4
+ *   （H⁺ ⊇ 追踪重放位置）与渲染不退回骨架。
+ * - 链式字面标记与引号交替（第五轮审计第 4 条）：不动点不触顶、两轮内收敛、幂等，并通过攻击夹具。
+ * - 同一缺口混合两种换行形态（RED-P4a2 第 1 项）：渲染从不退回整篇骨架；整篇是 JSON 文档时逐层解码后的换行总数
+ *   守恒。
  * - 载体三明治 3,300 例：只有现行规则遮住的值与只有早期版本遮住的值放进同一个载体（同一字面量、兄弟字段、
- *   数组、双层载体），全部按精确 oracle 判定。
+ *   数组、双层载体），全部按精确 oracle 判定（含渲染不退回骨架）。
  * - 凭据语法生成器 G 50,000 例（阶段 4b：T1 的写法维度）：秘密 × 写法 × 载体 × 行前缀 × 截断位置。判据只来自
  *   生成器元数据：秘密的任何不短于 4 字符的片段都不得出现在输出里；四个历史版本遮住的非结构字符必须落在 G 声明的
  *   凭据位置上，否则报“G 缺维度”并判失败（输入里有 G 不知道的凭据写法）。另检查裸换行守恒，每 5 例查幂等，
@@ -14,7 +19,10 @@
  * 样本全部是合成值。
  */
 import { describe, expect, test } from 'vitest';
-import { redactDeveloperText } from '../src/agent/utils/Redaction.js';
+import {
+  redactDeveloperText,
+  redactDeveloperTextWithReport,
+} from '../src/agent/utils/Redaction.js';
 import { REDACTION_MARKERS } from '../src/agent/utils/redaction/hiddenSpans.js';
 import {
   CARRIERS,
@@ -28,9 +36,12 @@ import {
 import {
   adversarialInputs,
   carrierSandwiches,
+  chainedMarkerInputs,
   HEAD_ONLY_SHAPES,
+  mixedNewlineGapInputs,
 } from './fixtures/redaction-catalog/fuzzCorpus.js';
 import {
+  assertNoLegacyRegression,
   checkNoLegacyRegression,
   exemptPositions,
 } from './fixtures/redaction-catalog/legacyRegressionOracle.js';
@@ -48,8 +59,11 @@ function newlineSkeleton(text: string): string {
   return text.replace(/[^\r\n]/g, '');
 }
 
+let supersetChecks = 0;
+
 function fullOracleProblems(input: string): string[] {
   const report = checkNoLegacyRegression(input);
+  supersetChecks += report.supersetChecks;
   return [
     ...report.exposures.map(
       (exposure) =>
@@ -93,17 +107,18 @@ describe('adversarial fuzz (fixed seed)', () => {
           problems.push(`marker outside the vocabulary ${match[0]}`);
         }
       }
-      if (index % 20 === 0) {
-        fullOracleCount++;
-        problems.push(...fullOracleProblems(input));
-      }
+      // 全量精确 oracle（RED-P4a2 第 4 项）：露出、对齐器自检（证明义务 4）、运行时重放对照、结构与骨架。
+      fullOracleCount++;
+      problems.push(...fullOracleProblems(input));
     }
     expect(problems.slice(0, 10)).toEqual([]);
   }, 120_000);
 
-  test('ran the full adversarial corpus', () => {
+  test('ran the full adversarial corpus through the exact oracle', () => {
     expect(adversarialCount).toBe(ADVERSARIAL_TOTAL);
-    expect(fullOracleCount).toBe(ADVERSARIAL_TOTAL / 20);
+    expect(fullOracleCount).toBe(ADVERSARIAL_TOTAL);
+    // 证明义务 4 不空转：超集确实逐位核对过大量被早期版本遮住的位置。
+    expect(supersetChecks).toBeGreaterThan(ADVERSARIAL_TOTAL * 10);
     // 语料确实包含载体、重编码与字面标记，避免生成器退化。
     expect(
       inputs.filter((input) => input.startsWith('{') || input.startsWith('[')).length
@@ -111,6 +126,118 @@ describe('adversarial fuzz (fixed seed)', () => {
     expect(inputs.filter((input) => /\\u00|\\\//.test(input)).length).toBeGreaterThan(1_000);
     expect(inputs.filter((input) => input.includes('[redacted')).length).toBeGreaterThan(1_000);
   });
+});
+
+describe('chained literal markers with alternating quotes (fixpoint and idempotence)', () => {
+  test('every chain converges within two rounds, is idempotent and passes the attack fixture', () => {
+    const problems: string[] = [];
+    const inputs = chainedMarkerInputs();
+    for (const input of inputs) {
+      const { text, report } = redactDeveloperTextWithReport(input);
+      if (!report.fixpointReached || report.kinds.includes('fixpoint-cap')) {
+        problems.push(`fixpoint not reached (${report.rounds} rounds): ${JSON.stringify(input)}`);
+      }
+      if (report.rounds > 2) {
+        problems.push(`needed ${report.rounds} rounds: ${JSON.stringify(input)}`);
+      }
+      if (redactDeveloperText(text) !== text) {
+        problems.push(`not idempotent: ${JSON.stringify(input)}`);
+      }
+      problems.push(...fullOracleProblems(input));
+    }
+    expect(inputs.length).toBeGreaterThan(200);
+    expect(problems.slice(0, 10)).toEqual([]);
+  }, 120_000);
+
+  test('the audited ten-segment chain is the fixed point after two rounds', () => {
+    const input = `Token=${Array.from({ length: 10 }, (_, index) => `[redacted]SYNTHc${index}"'`).join('')}end`;
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(report.fixpointReached).toBe(true);
+    expect(report.rounds).toBeLessThanOrEqual(2);
+    expect(redactDeveloperText(text)).toBe(text);
+    expect(report.kinds).not.toContain('fixpoint-cap');
+    assertNoLegacyRegression(input);
+  });
+});
+
+/**
+ * 整篇是 JSON 文档时，逐层解码（字符串值本身也是 JSON 文档时继续解码）后全部字符串值里的换行总数；不是 JSON
+ * 文档时返回 null。
+ */
+function decodedNewlines(text: string): number | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err: unknown) {
+    void err;
+    return null;
+  }
+  let total = 0;
+  const walk = (value: unknown): void => {
+    if (typeof value === 'string') {
+      total += (value.match(/[\r\n]/g) ?? []).length;
+      if (/^\s*[{[]/.test(value)) {
+        try {
+          walk(JSON.parse(value));
+          // 内层文档的换行已经算在外层字符串里（它们就是外层的转义换行）；内层字符串值里的换行另计。
+        } catch (err: unknown) {
+          void err;
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        walk(item);
+      }
+      return;
+    }
+    if (value !== null && typeof value === 'object') {
+      for (const item of Object.values(value)) {
+        walk(item);
+      }
+    }
+  };
+  walk(parsed);
+  return total;
+}
+
+describe('mixed newline forms in one gap (RED-P4a2 item 1)', () => {
+  const inputs = mixedNewlineGapInputs(3_000, SEED);
+
+  test('never falls back to the document skeleton and passes the attack fixture', () => {
+    const problems: string[] = [];
+    let restored = 0;
+    let carriers = 0;
+    for (const input of inputs) {
+      const { text, report } = redactDeveloperTextWithReport(input);
+      restored += report.restoredTokens;
+      if (report.renderSkeletons !== 0 || text.includes('[redacted-unaligned]')) {
+        problems.push(`render skeleton: ${JSON.stringify(input)} -> ${JSON.stringify(text)}`);
+      }
+      if (newlineSkeleton(text) !== newlineSkeleton(input)) {
+        problems.push(`newline sequence changed: ${JSON.stringify(input)}`);
+      }
+      if (redactDeveloperText(text) !== text) {
+        problems.push(`not idempotent: ${JSON.stringify(input)}`);
+      }
+      const decodedBefore = decodedNewlines(input);
+      if (decodedBefore !== null) {
+        carriers++;
+        // 整篇是 JSON 文档时：输出仍是合法 JSON，逐层解码后的换行总数守恒（放回的转义换行按层级对上）。
+        if (decodedNewlines(text) !== decodedBefore) {
+          problems.push(
+            `decoded newlines changed: ${JSON.stringify(input)} -> ${JSON.stringify(text)}`
+          );
+        }
+      }
+      problems.push(...fullOracleProblems(input));
+    }
+    expect(problems.slice(0, 10)).toEqual([]);
+    // 语料确实覆盖了需要放回转义换行的载体形态，不只是纯文本。
+    expect(restored).toBeGreaterThan(100);
+    expect(carriers).toBeGreaterThan(500);
+  }, 120_000);
 });
 
 describe('carrier sandwiches: current-rules-only and legacy-only values in one carrier', () => {
@@ -139,10 +266,10 @@ describe('carrier sandwiches: current-rules-only and legacy-only values in one c
  * 不在 G 声明的凭据位置上。返回描述（空数组表示 G 的维度模型完整）。
  */
 function missingDimensions(entry: GrammarCase): string[] {
-  const exempt = exemptPositions(entry.input);
   const problems: string[] = [];
   for (const revision of BASELINE_REVISIONS) {
     const hidden = exactHidden(revision, entry.input);
+    const exempt = exemptPositions(entry.input, hidden);
     for (let index = 0; index < entry.input.length; index++) {
       if (hidden[index] !== 1 || exempt[index] === 1) {
         continue;

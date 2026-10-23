@@ -5,22 +5,30 @@
  * 与合成文本拼成，所以不可能把别的版本已经遮住的输入字节重新写出（按来源分流原型的渲染泄漏）。
  *
  * 被遮区间（相邻被遮位置连成的最长区间）按下面的顺序处理：
- * 1. 区间里含有输入原有的完整标记、且没有任何“内容”位置（其余只有结构记号、引号及其转义反斜杠）时原样
+ * 1. 区间里含有输入原有的完整标记、且没有任何“内容”位置（其余只有结构记号、值边界上的定界引号记号）时原样
  *    输出：这些位置在不变量 S 的口径里都是信息等价的，原样输出也保证幂等（原子标记：被遮区间触到输入里
  *    原有的完整标记时，调用方已把整个标记并入区间）。
  * 2. 用各版本的缺口（每个缺口的合成文本都只由标记、引号、换行组成）加信息等价字符的原样步精确铺满区间：
  *    每个位置先按版本优先级试缺口（现行规则 v3 优先，再依次 v2、v1、v0，最后是检测器缺口——合成文本就是检测
  *    规则的标记，例如前缀 token 的 [redacted-api-key]；历史版本也遮住的区间因此与上一包逐字相同，只有底线没遮
  *    到的区间才用检测器的标记），都不行时才原样输出一个信息等价
- *    记号（结构记号、原有标记、引号、紧贴引号的反斜杠串）。这样常见写法的输出与 HEAD 逐字相同（例如 JSON
+ *    记号（结构记号、原有标记、值边界上的定界引号记号）。这样常见写法的输出与 HEAD 逐字相同（例如 JSON
  *    数值位置的 "[redacted]"，引号是合成的），早期版本吃进去的转义引号反斜杠也不会被吞掉，载体 JSON 保持合法
  *    （复查意见 3）。只有引号或结构、没有标记的区间（例如空引号值 password='' 的闭引号）同样先试缺口：历史
  *    版本在这里写过 '[redacted]'，沿用它才不会把“值为空”暴露出来。
+ *    引号记号（RED-P4a2 第 3 项，与 oracle 的 exemptPositions 同一口径）：紧贴引号的奇数长度反斜杠串连同引号
+ *    是一个记号（该引号的转义）；偶数长度的反斜杠串是内容（转义的反斜杠），引号单独成记号。只有值边界上的定界
+ *    引号记号信息等价：相邻的引号记号连成一簇，某个历史版本把簇两侧最近的非引号字符都遮住时，簇里的记号是那个
+ *    值内部的引号（例如 "ab\"cd\"ef" 里的 \"），按内容处理，不原样输出。转义单元（最后一个反斜杠加它转义的
+ *    引号）不被切开：部分被遮时整体扩进被遮区间，缺口吞掉了反斜杠时不单独写出引号（见 expandEscapedQuotes），
+ *    否则会留下没有转义的引号、载体 JSON 失效。
  *    缺口里的换行结构若比合成文本多（历史版本吞掉了 JSON 字面量里的转义换行，M-12），把缺的那些按原顺序放回
- *    第一个标记之后——只暴露换行个数（D3 阶段 4 子项）。多重集差按解码后的换行字符比较：x 里的 \u000a 与
- *    版本重新写出的 \n 是同一个换行，不会多放一次（复查意见 2）。
- * 3. 否则写新标记 [redacted]：保留区间首尾的分隔引号，区间内的结构记号（裸换行、可解析字面量里的转义换行）
- *    按原顺序放回，其余字符一律不出现。不做等长占位。
+ *    第一个标记之后——只暴露换行个数（D3 阶段 4 子项）。多重集差按形态分开计数（RED-P4a2 第 1 项）：裸换行只与
+ *    合成文本里的裸换行相抵，转义换行只与合成文本里同一转义层级的转义换行相抵，所以合成文本重出的裸换行不会
+ *    被转义记号抵掉、再把真正的裸换行多放一次；同一层级内按解码后的换行字符比较：x 里的 \u000a 与版本重新写出
+ *    的 \n 是同一个换行，不会多放一次（复查意见 2）。
+ * 3. 否则写新标记 [redacted]：保留区间首尾的定界引号记号，区间内的结构记号（裸换行、JSON 载体字面量里的转义
+ *    换行）按原顺序放回，其余字符一律不出现。不做等长占位。
  * 标记文字沿用封闭词表，不新增形态。本模块是纯函数，不持有模块级可变状态。
  */
 import type { BaselineRevision, Gap, StructureAnalysis, StructureToken } from './trackedReplay.js';
@@ -146,6 +154,29 @@ function isQuote(char: string | undefined): boolean {
   return char === '"' || char === "'";
 }
 
+/**
+ * 转义引号的最小单元（紧贴引号的最后一个反斜杠加引号，且反斜杠串是奇数长度，RED-P4a2 第 3 项）被部分遮住时扩到
+ * 整个单元。只会多遮；它是值边界上的定界引号记号的一部分时在被遮区间内原样放回，可见信息不变。这样缺口与区间的
+ * 边界不会把转义反斜杠和它转义的引号切开：早期版本的裸值字符类吃进了 \" 的反斜杠、引号留在区间外时，只用那个
+ * 缺口铺排会留下没有转义的引号，载体 JSON 失效（复查意见 3 的同一类问题）。串里前面成对的反斜杠各自是完整的转义
+ * （载体里是内层的反斜杠），缺口可以在它们之间结束，不扩展；偶数长度的反斜杠串是内容，也不扩展。
+ */
+export function expandEscapedQuotes(x: string, hidden: Uint8Array): void {
+  for (let at = x.indexOf('\\'); at >= 0; ) {
+    let cursor = at;
+    while (x[cursor] === '\\') {
+      cursor++;
+    }
+    if (isQuote(x[cursor]) && (cursor - at) % 2 === 1) {
+      if (hidden[cursor - 1] === 1 || hidden[cursor] === 1) {
+        hidden[cursor - 1] = 1;
+        hidden[cursor] = 1;
+      }
+    }
+    at = x.indexOf('\\', cursor);
+  }
+}
+
 type NewlineChar = '\n' | '\r';
 
 interface SynthShape {
@@ -154,6 +185,23 @@ interface SynthShape {
   firstCoreEnd: number;
   /** 合成文本里的换行记号，已归一到解码后的换行字符（裸换行或整串反斜杠加 n/r）。 */
   tokens: NewlineChar[];
+  /**
+   * 与 tokens 一一对应的载体层级（口径同 StructureToken.level）：0 = 裸换行；k 个反斜杠加 n/r 是第 1 + log2(k) 层
+   * 的换行（JSON.stringify 每编码一层反斜杠翻倍：\n、\\n、\\\\n）；k 不是 2 的幂时记 -1，不与任何记号相抵。
+   * 多重集差只在同一层级内相抵（RED-P4a2 第 1 项）。
+   */
+  levels: number[];
+}
+
+/** k 个反斜杠加 n/r 的转义换行所在的载体层级：k = 2^(d-1) 时是第 d 层；其他 k 返回 -1（不与任何记号相抵）。 */
+function escapeLevel(backslashes: number): number {
+  let level = 1;
+  for (let run = 1; run <= backslashes; run *= 2, level++) {
+    if (run === backslashes) {
+      return level;
+    }
+  }
+  return -1;
 }
 
 /**
@@ -162,6 +210,7 @@ interface SynthShape {
  */
 export function analyzeSynth(synth: string): SynthShape {
   const tokens: NewlineChar[] = [];
+  const levels: number[] = [];
   let firstCoreEnd = -1;
   let index = 0;
   while (index < synth.length) {
@@ -176,6 +225,7 @@ export function analyzeSynth(synth: string): SynthShape {
     }
     if (char === '\n' || char === '\r') {
       tokens.push(char);
+      levels.push(0);
       index++;
       continue;
     }
@@ -195,13 +245,14 @@ export function analyzeSynth(synth: string): SynthShape {
       }
       if (next === 'n' || next === 'r') {
         tokens.push(next === 'n' ? '\n' : '\r');
+        levels.push(escapeLevel(cursor - index));
         index = cursor + 1;
         continue;
       }
     }
-    return { pure: false, firstCoreEnd, tokens };
+    return { pure: false, firstCoreEnd, tokens, levels };
   }
-  return { pure: true, firstCoreEnd, tokens };
+  return { pure: true, firstCoreEnd, tokens, levels };
 }
 
 /** 第一个 start ≥ position 的记号下标（记号按 start 升序）。 */
@@ -236,29 +287,26 @@ function structureTokensIn(
   return inside;
 }
 
-/** 合成文本缺少的换行记号：按解码后的换行字符做多重集之差，保持区间内的原顺序。 */
-function missingTokens(
-  runTokens: readonly StructureToken[],
-  synthTokens: readonly NewlineChar[]
-): StructureToken[] {
-  let lineFeeds = 0;
-  let carriageReturns = 0;
-  for (const token of synthTokens) {
-    if (token === '\n') {
-      lineFeeds++;
-    } else {
-      carriageReturns++;
-    }
+/**
+ * 合成文本缺少的换行记号：按（载体层级，解码后的换行字符）分槽做多重集之差，保持区间内的原顺序（RED-P4a2
+ * 第 1 项）。裸换行只与合成文本里的裸换行相抵，转义换行只与同一层级的转义换行相抵：合成文本重出的裸换行不能被
+ * 转义记号先用掉（否则真正的裸换行会被当成缺失再放回一次，裸换行多出一个，整篇退回骨架）；载体里同理，版本重出
+ * 的第 1 层换行（\n）也不能被第 2 层的转义记号（\\n）抵掉，否则解码后的行数多出一行。同一层级内仍按解码后的字符
+ * 比较（\u000a 与 \n 是同一个换行，复查意见 2）；记号的层级由结构分析按载体递归给出，不看转义序列的写法。
+ */
+function missingTokens(runTokens: readonly StructureToken[], shape: SynthShape): StructureToken[] {
+  const available = new Map<string, number>();
+  const slotOf = (level: number, newline: NewlineChar): string => `${level}${newline}`;
+  for (const [index, newline] of shape.tokens.entries()) {
+    const slot = slotOf(shape.levels[index] ?? 0, newline);
+    available.set(slot, (available.get(slot) ?? 0) + 1);
   }
   const missing: StructureToken[] = [];
   for (const token of runTokens) {
-    if (token.newline === '\n') {
-      if (lineFeeds > 0) {
-        lineFeeds--;
-        continue;
-      }
-    } else if (carriageReturns > 0) {
-      carriageReturns--;
+    const slot = slotOf(token.level, token.newline);
+    const count = available.get(slot) ?? 0;
+    if (count > 0) {
+      available.set(slot, count - 1);
       continue;
     }
     missing.push(token);
@@ -439,64 +487,88 @@ function containsCore(inCore: Uint8Array, start: number, end: number): boolean {
 }
 
 /**
- * 从 at 开始的信息等价记号长度（截到 end）：结构记号（整个转义序列）、输入原有的完整标记、引号、紧贴引号的
- * 反斜杠串（引号可以在区间之外：反斜杠是那个引号的转义，与引号一起视为结构）。0 表示 at 是内容位置。
- * 口径与 test/fixtures/redaction-catalog/legacyRegressionOracle.ts 的 exemptPositions 相同。
+ * x 的引号记号（RED-P4a2 第 3 项）：tokenStart[i] 是包含位置 i 的引号记号起点 +1（0 = 不属于任何引号记号），
+ * tokenEnd[i] 是它的终点。紧贴引号的奇数长度反斜杠串连同引号是一个记号（该引号的转义，深层载体里的 \\\" 同样
+ * 是）；偶数长度的反斜杠串是内容（每一对是一个转义的反斜杠），引号单独成记号；不紧贴引号的反斜杠串是内容。
+ * 反斜杠串按整串取奇偶，所以缺口在串中间结束时，剩下的那段也按整串判定。
+ * 相邻的引号记号连成一簇（例如内层值的闭引号 \" 紧贴载体字面量的闭引号 "）：clusterStart[i]、clusterEnd[i] 是
+ * 包含位置 i 的那一簇的区间，簇两侧最近的非引号字符决定簇里的记号是否在值内部。一遍线性扫描，只在第一次需要时建。
  */
-function exemptTokenLength(
-  x: string,
-  inCore: Uint8Array,
-  tokens: readonly StructureToken[],
-  tokenAtStart: Int32Array | null,
-  at: number,
-  end: number
-): number {
-  // tokenAtStart 存 记号下标+1，0 表示该位置不是记号起点。
-  const tokenIndex = tokenAtStart === null ? -1 : (tokenAtStart[at] ?? 0) - 1;
-  if (tokenIndex >= 0) {
-    return Math.min(tokens[tokenIndex]?.end ?? at, end) - at;
-  }
-  if (inCore[at] === 1) {
-    let cursor = at;
-    while (cursor < end && inCore[cursor] === 1) {
-      cursor++;
+interface QuoteTokens {
+  tokenStart: Int32Array;
+  tokenEnd: Int32Array;
+  clusterStart: Int32Array;
+  clusterEnd: Int32Array;
+}
+
+function lexQuoteTokens(x: string): QuoteTokens {
+  const tokenStart = new Int32Array(x.length);
+  const tokenEnd = new Int32Array(x.length);
+  const clusterStart = new Int32Array(x.length);
+  const clusterEnd = new Int32Array(x.length);
+  const mark = (start: number, end: number): void => {
+    for (let index = start; index < end; index++) {
+      tokenStart[index] = start + 1;
+      tokenEnd[index] = end;
     }
-    return cursor - at;
-  }
-  const char = x[at];
-  if (isQuote(char)) {
-    return 1;
-  }
-  if (char === '\\') {
-    let cursor = at;
+  };
+  let index = 0;
+  while (index < x.length) {
+    const char = x[index];
+    if (isQuote(char)) {
+      mark(index, index + 1);
+      index++;
+      continue;
+    }
+    if (char !== '\\') {
+      index++;
+      continue;
+    }
+    let cursor = index;
     while (x[cursor] === '\\') {
       cursor++;
     }
     if (isQuote(x[cursor])) {
-      return Math.min(cursor + 1, end) - at;
+      if ((cursor - index) % 2 === 1) {
+        mark(index, cursor + 1);
+      } else {
+        mark(cursor, cursor + 1);
+      }
+      index = cursor + 1;
+      continue;
     }
+    index = cursor;
   }
-  return 0;
+  for (let from = 0; from < x.length; ) {
+    if (tokenStart[from] === 0) {
+      from++;
+      continue;
+    }
+    let to = from;
+    while (to < x.length && (tokenStart[to] ?? 0) > 0) {
+      to++;
+    }
+    clusterStart.fill(from, from, to);
+    clusterEnd.fill(to, from, to);
+    from = to;
+  }
+  return { tokenStart, tokenEnd, clusterStart, clusterEnd };
 }
 
-/** 区间首尾的分隔引号（可带转义反斜杠）长度。 */
-function leadingQuoteLength(x: string, start: number, end: number): number {
-  let cursor = start;
-  while (cursor < end && x[cursor] === '\\') {
-    cursor++;
-  }
-  return cursor < end && isQuote(x[cursor]) ? cursor + 1 - start : 0;
+/** 区间首尾的定界引号记号长度（记号必须完整地从区间起点开始 / 在区间终点结束）。 */
+function leadingQuoteLength(quotes: QuoteTokens, start: number, end: number): number {
+  const tokenStart = (quotes.tokenStart[start] ?? 0) - 1;
+  const tokenEnd = quotes.tokenEnd[start] ?? 0;
+  return tokenStart === start && tokenEnd <= end ? tokenEnd - start : 0;
 }
 
-function trailingQuoteLength(x: string, start: number, end: number): number {
-  if (end <= start || !isQuote(x[end - 1])) {
+function trailingQuoteLength(quotes: QuoteTokens, start: number, end: number): number {
+  if (end <= start) {
     return 0;
   }
-  let cursor = end - 1;
-  while (cursor - 1 >= start && x[cursor - 1] === '\\') {
-    cursor--;
-  }
-  return end - cursor;
+  const tokenStart = (quotes.tokenStart[end - 1] ?? 0) - 1;
+  const tokenEnd = quotes.tokenEnd[end - 1] ?? 0;
+  return tokenStart >= start && tokenEnd === end ? end - tokenStart : 0;
 }
 
 class Output {
@@ -566,6 +638,7 @@ export function renderByPositions(
   }
   const tokens = structure.tokens;
   expandStructureTokens(hidden, tokens);
+  expandEscapedQuotes(x, hidden);
   let tokenAtStart: Int32Array | null = null;
   if (tokens.length > 0) {
     tokenAtStart = new Int32Array(x.length + 1);
@@ -574,8 +647,94 @@ export function renderByPositions(
     }
   }
   const structureMarks = structure.marks;
-  const exemptAt = (at: number, end: number): number =>
-    exemptTokenLength(x, inCore, tokens, tokenAtStart, at, end);
+  // 引号记号与各历史版本的遮蔽位置只在第一次遇到引号或反斜杠时才建（多数被遮区间不含它们）。
+  let quotes: QuoteTokens | null = null;
+  const quoteTokens = (): QuoteTokens => {
+    quotes ??= lexQuoteTokens(x);
+    return quotes;
+  };
+  // baselineMasks[i] 的第 k 位：第 k 个历史版本缺口集遮住了位置 i（缺口就是该版本的被遮区间）。检测器缺口不计入：
+  // “值内部”是相对历史版本的遮蔽而言的（不变量 S 的口径），与 oracle 的 exemptPositions 一致。
+  let baselineMasks: Uint8Array | null = null;
+  const baselineMaskOf = (): Uint8Array => {
+    if (baselineMasks !== null) {
+      return baselineMasks;
+    }
+    const masks = new Uint8Array(x.length);
+    let bit = 1;
+    for (const set of gapSets) {
+      if (set.revision === 'detector') {
+        continue;
+      }
+      for (const gap of set.gaps) {
+        const from = Math.max(0, gap.start);
+        const to = Math.min(x.length, gap.end);
+        for (let index = from; index < to; index++) {
+          masks[index] = (masks[index] ?? 0) | bit;
+        }
+      }
+      bit = (bit << 1) & 0xff;
+    }
+    baselineMasks = masks;
+    return masks;
+  };
+  // 值内部的引号记号：同一个历史版本把它所在引号簇两侧最近的非引号字符都遮住了（例如 "ab\"cd\"ef" 里的 \"）。
+  // 它按内容处理，不能原样输出；值边界上的定界引号至少有一侧是该版本可见的字符（或文本边界）。跳过相邻的引号
+  // 记号，是因为载体重编码会合成外层字面量的引号：内层值的闭引号 \" 紧贴的载体闭引号 " 在该版本里也算被遮。
+  const isInteriorQuote = (lexicon: QuoteTokens, at: number): boolean => {
+    const left = (lexicon.clusterStart[at] ?? 0) - 1;
+    const right = lexicon.clusterEnd[at] ?? x.length;
+    if (left < 0 || right >= x.length) {
+      return false;
+    }
+    const masks = baselineMaskOf();
+    return ((masks[left] ?? 0) & (masks[right] ?? 0)) !== 0;
+  };
+  /**
+   * 从 at 开始的信息等价记号长度（截到 end）：结构记号（整个转义序列）、输入原有的完整标记、值边界上的定界引号
+   * 记号（引号可以在区间之外：奇数长度的反斜杠串是那个引号的转义，与引号一起视为结构）。0 表示 at 是内容位置。
+   * 口径与 test/fixtures/redaction-catalog/legacyRegressionOracle.ts 的 exemptPositions 相同。
+   */
+  const exemptAt = (at: number, end: number): number => {
+    // tokenAtStart 存 记号下标+1，0 表示该位置不是记号起点。
+    const tokenIndex = tokenAtStart === null ? -1 : (tokenAtStart[at] ?? 0) - 1;
+    if (tokenIndex >= 0) {
+      return Math.min(tokens[tokenIndex]?.end ?? at, end) - at;
+    }
+    if (inCore[at] === 1) {
+      let cursor = at;
+      while (cursor < end && inCore[cursor] === 1) {
+        cursor++;
+      }
+      return cursor - at;
+    }
+    const char = x[at];
+    if (!isQuote(char) && char !== '\\') {
+      return 0;
+    }
+    const lexicon = quoteTokens();
+    const quoteStart = (lexicon.tokenStart[at] ?? 0) - 1;
+    if (quoteStart < 0) {
+      // 不转义引号的反斜杠串（偶数长度、或后面不是引号）是内容。
+      return 0;
+    }
+    const quoteEnd = lexicon.tokenEnd[at] ?? at;
+    if (isInteriorQuote(lexicon, at)) {
+      return 0;
+    }
+    if (char === '\\' && (quoteEnd - 1 - at) % 2 === 0) {
+      // 缺口在奇数长度反斜杠串的奇数位置结束：剩下的反斜杠是偶数个，原样写出后引号就不再被转义。只允许从成对
+      // 转义的边界（剩余奇数个）起原样步。
+      return 0;
+    }
+    if (isQuote(char) && quoteStart < at && hidden[at - 1] === 1) {
+      // 转义这个引号的反斜杠是被遮的，已经被前一个缺口的合成文本吞掉（转义单元已整体扩进被遮区间，见
+      // expandEscapedQuotes）：单独写出引号会留下没有转义的引号，载体 JSON 随之失效（复查意见 3 的同一类问题）。
+      // 不从引号起原样步，让铺排回溯到别的缺口，或走新标记路径（它整体保留区间末尾的定界引号记号）。
+      return 0;
+    }
+    return Math.min(quoteEnd, end) - at;
+  };
   // 原样步不跨过输入原有的标记：含内容的区间触到标记时，标记随区间一起被同一个标记取代（原子标记），
   // 不单独重出，否则 password=SYNTHETIChead[redacted] 会渲染成两个相邻标记。
   const verbatimStepAt = (at: number, end: number): number =>
@@ -634,7 +793,7 @@ export function renderByPositions(
           output.synth(gap.synth);
           continue;
         }
-        const missing = missingTokens(structureTokensIn(tokens, gap.start, gap.end), shape.tokens);
+        const missing = missingTokens(structureTokensIn(tokens, gap.start, gap.end), shape);
         if (missing.length === 0) {
           output.synth(gap.synth);
           continue;
@@ -651,8 +810,15 @@ export function renderByPositions(
       continue;
     }
     stats.fallbackRuns++;
-    const lead = leadingQuoteLength(x, start, end);
-    const trail = lead >= end - start ? 0 : trailingQuoteLength(x, start + lead, end);
+    // 新标记路径只保留区间首尾的定界引号记号（记号完整地落在区间边界上，且按簇判定不在值内部）；偶数长度反斜杠串
+    // 里的反斜杠是内容，不随引号保留。
+    const lexicon = quoteTokens();
+    const lead =
+      start < end && !isInteriorQuote(lexicon, start) ? leadingQuoteLength(lexicon, start, end) : 0;
+    const trail =
+      lead >= end - start || isInteriorQuote(lexicon, end - 1)
+        ? 0
+        : trailingQuoteLength(lexicon, start + lead, end);
     output.keep(x, start, start + lead);
     output.synth(NEW_MARKER);
     for (const token of structureTokensIn(tokens, start + lead, end - trail)) {

@@ -17,20 +17,68 @@ import {
   redactDeveloperTextWithReport,
 } from '../src/agent/utils/Redaction.js';
 import { REDACTION_MARKERS } from '../src/agent/utils/redaction/hiddenSpans.js';
-import { applyAlignmentFloor } from '../src/agent/utils/redaction/legacyFloor.js';
+import {
+  applyAlignmentFloor,
+  applyRedactionFloorWithProvenance,
+} from '../src/agent/utils/redaction/legacyFloor.js';
 import {
   analyzeSynth,
   expandAtomicMarkers,
+  expandEscapedQuotes,
   type GapSet,
   markerCores,
   renderByPositions,
 } from '../src/agent/utils/redaction/render.js';
-import { analyzeStructure } from '../src/agent/utils/redaction/trackedReplay.js';
+import {
+  analyzeStructure,
+  structurePositions,
+} from '../src/agent/utils/redaction/trackedReplay.js';
 import { redactDeveloperText as fixtureAtB60a61e } from './fixtures/redaction-baselines/redaction-at-b60a61e.js';
-import { assertNoLegacyRegression } from './fixtures/redaction-catalog/legacyRegressionOracle.js';
+import {
+  assertNoLegacyRegression,
+  exemptPositions,
+} from './fixtures/redaction-catalog/legacyRegressionOracle.js';
+import {
+  BASELINE_REVISIONS,
+  exactHidden as fixtureExactHidden,
+} from './fixtures/redaction-catalog/trackedReplay.js';
 
 function newlineSkeleton(text: string): string {
   return text.replace(/[^\r\n]/g, '');
+}
+
+/**
+ * 严格口径的露出（RED-P4a2 第 3 项）：只豁免结构位置（裸换行、JSON 载体字面量里的转义换行）与输入原有的
+ * 标记，引号与反斜杠一律按内容判定。被某个基线精确遮住、却在新输出里以原样出现的位置都报出来。
+ */
+function strictExposures(input: string): string[] {
+  const { origin } = applyRedactionFloorWithProvenance(input);
+  const visible = new Uint8Array(input.length);
+  for (const from of origin) {
+    if (from >= 0) {
+      visible[from] = 1;
+    }
+  }
+  const structure = structurePositions(input);
+  const inCore = new Uint8Array(input.length);
+  for (const [start, end] of markerCores(input)) {
+    inCore.fill(1, start, end);
+  }
+  const exposures: string[] = [];
+  for (const revision of BASELINE_REVISIONS) {
+    const hidden = fixtureExactHidden(revision, input);
+    for (let index = 0; index < input.length; index++) {
+      if (
+        hidden[index] === 1 &&
+        visible[index] === 1 &&
+        structure[index] !== 1 &&
+        inCore[index] !== 1
+      ) {
+        exposures.push(`${revision}@${index}:${JSON.stringify(input[index])}`);
+      }
+    }
+  }
+  return exposures;
 }
 
 function hiddenFor(x: string, ranges: Array<[number, number]>): Uint8Array {
@@ -168,13 +216,14 @@ describe('D3 stage-4 sub-item: escaped newlines inside parsable JSON literals ar
     assertNoLegacyRegression(input);
   });
 
-  test('a double-quoted value is itself a parsable literal, so its escaped newline is put back', () => {
-    // 历史版本也把它当作载体递归处理；按统一口径这个 \n 是结构，只暴露换行个数。
+  test('a double-quoted value in plain text is not a JSON carrier, so its escaped newline stays masked', () => {
+    // RED-P4a2 第 2 项（总控决定，安全收紧）：纯文本里的双引号串不是 JSON 载体字面量，其中的 \n 两个字符按内容
+    // 处理、不放回。dbc078f 起把任何可解析的双引号串都当作载体，输出曾是 password="[redacted]\n"。
     const input = 'password="SYNTHETICa\\nSYNTHETICb"';
-    const output = redactDeveloperText(input);
-    expect(output).toBe('password="[redacted]\\n"');
-    expect(output).not.toContain('SYNTHETIC');
-    expect(redactDeveloperText(output)).toBe(output);
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(text).toBe('password="[redacted]"');
+    expect(report.restoredTokens).toBe(0);
+    expect(redactDeveloperText(text)).toBe(text);
     assertNoLegacyRegression(input);
   });
 
@@ -383,5 +432,287 @@ describe('requirement 9: evidence annotations and code.search prefixes are not d
         expect(output.split('\n')[index]?.startsWith(prefix)).toBe(true);
       }
     }
+  });
+});
+
+describe('RED-P4a2 item 1: the newline put-back counts bare and escaped newlines separately', () => {
+  // 第五轮审计（high）：缺口里同时有裸换行与可解析字面量里的转义换行、版本的合成文本只重出了裸换行时，按解码后
+  // 字符做的多重集差让转义记号先抵掉合成文本里的裸换行，真正的裸换行被当成缺失又放回一次，裸换行多出一个，
+  // 整篇退成 [redacted-unaligned] 骨架（无关行、[evidence] 标注与 NN: 前缀一起没了）。
+  const cases: Array<[string, string, string]> = [
+    [
+      'pretty JSON document, sensitive key over an array with an escaped newline',
+      '{"password": ["a\\nb",\n"c"]}',
+      // 整篇是 JSON 文档：字面量里的转义换行是 D3 结构，按原形态放回第一个标记之后；裸换行仍是版本重出的那一个。
+      '{"password": "[redacted]\\n"\n}',
+    ],
+    [
+      '[evidence] annotation with NN: prefixes',
+      '[evidence] E-1=config/app.json:12-16\n12: {\n13:   "secret": {\n14:     "note": "a\\nb"\n15:   }\n16: }',
+      '[evidence] E-1=config/app.json:12-16\n12: {\n13:   "secret": "[redacted]"\n\n\n16: }',
+    ],
+    [
+      'shell export of a pretty JSON service account across lines',
+      'export API_TOKEN=\'{\n  "type": "service_account",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSYNTHpemA\\nSYNTHpemB\\n-----END PRIVATE KEY-----\\n",\n  "client_email": "x@y"\n}\'\necho done',
+      "export API_TOKEN='[redacted]\n\n\n\n'\necho done",
+    ],
+    [
+      'unrelated lines around the container',
+      'line0\n{"password": ["a\\nb",\n"c"]}\nline3 ok',
+      'line0\n{"password": "[redacted]"\n}\nline3 ok',
+    ],
+    [
+      'nested object with an escaped newline between unrelated lines',
+      'a: 1\n{"token": {"x": "p\\nq",\n "y": 2}}\nz: 3',
+      'a: 1\n{"token": "[redacted]"\n}\nz: 3',
+    ],
+  ];
+
+  test.each(cases)('%s renders without the skeleton fallback', (_name, input, expected) => {
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(text).toBe(expected);
+    expect(report.renderSkeletons).toBe(0);
+    expect(report.kinds).not.toContain('render-skeleton');
+    expect(newlineSkeleton(text)).toBe(newlineSkeleton(input));
+    expect(text).not.toContain('[redacted-unaligned]');
+    expect(redactDeveloperText(text)).toBe(text);
+    assertNoLegacyRegression(input);
+  });
+
+  test('the evidence annotation, the NN: prefixes and the unrelated lines are kept verbatim', () => {
+    const input = cases[1]?.[1] ?? '';
+    const lines = redactDeveloperText(input).split('\n');
+    expect(lines[0]).toBe('[evidence] E-1=config/app.json:12-16');
+    expect(lines[1]).toBe('12: {');
+    expect(lines[2]?.startsWith('13: ')).toBe(true);
+    expect(lines[5]).toBe('16: }');
+    expect(redactDeveloperText(cases[2]?.[1] ?? '').endsWith('\necho done')).toBe(true);
+    const around = redactDeveloperText(cases[3]?.[1] ?? '').split('\n');
+    expect(around[0]).toBe('line0');
+    expect(around[3]).toBe('line3 ok');
+  });
+
+  test('renderByPositions restores the missing escaped token and keeps the bare one matched', () => {
+    // 缺口 [13,26) 里先有转义换行 @16、再有裸换行 @21；合成文本只重出一个裸换行。
+    const x = '{"password": ["a\\nb",\n"c"]}';
+    const hidden = hiddenFor(x, [[13, 26]]);
+    const gapSets: GapSet[] = [
+      { revision: 'b60a61e', gaps: [{ start: 13, end: 26, synth: '"[redacted]"\n' }] },
+    ];
+    const result = renderByPositions(x, hidden, analyzeStructure(x), gapSets);
+    expect(result.text).toBe('{"password": "[redacted]\\n"\n}');
+    expect(result.stats.restoredTokens).toBe(1);
+    expect(newlineSkeleton(result.text)).toBe(newlineSkeleton(x));
+  });
+
+  test('a synthetic escaped newline is not consumed by a bare one in the gap, and vice versa', () => {
+    // 合成文本只有转义换行，缺口里有一个转义、一个裸换行：转义的对上，缺的是裸换行，放回裸换行。
+    const x = '{"password": ["a\\nb",\n"c"]}';
+    const hidden = hiddenFor(x, [[13, 26]]);
+    const escapedOnly: GapSet[] = [
+      { revision: 'b60a61e', gaps: [{ start: 13, end: 26, synth: '"[redacted]\\n"' }] },
+    ];
+    const result = renderByPositions(x, hidden, analyzeStructure(x), escapedOnly);
+    expect(result.text).toBe('{"password": "[redacted]\n\\n"}');
+    expect(result.stats.restoredTokens).toBe(1);
+    expect(newlineSkeleton(result.text)).toBe(newlineSkeleton(x));
+    expect(analyzeSynth('"[redacted]"\n').levels).toEqual([0]);
+    expect(analyzeSynth('"[redacted]\\n"\\r\r').levels).toEqual([1, 1, 0]);
+    expect(analyzeSynth('\\"[redacted]\\"\\\\n').levels).toEqual([2]);
+  });
+
+  test('inside a carrier, a deeper escaped newline does not consume a newline the version re-emitted', () => {
+    // 载体里同理：版本把容器里的第 1 层换行（载体层 \n）原样重出；第 2 层的转义换行（载体层 \\n）是另一层级，
+    // 不能与之相抵，否则解码后的 stdout 多出一行、真正缺的第 2 层换行又没放回。
+    const stdout = '{\n  "api_key": [\n    "SYNTHa\\nb",\n    "c"\n  ]\n}';
+    const input = JSON.stringify({ stdout });
+    const { text, report } = redactDeveloperTextWithReport(input);
+    const decoded = (JSON.parse(text) as { stdout: string }).stdout;
+    expect(decoded.split('\n')).toHaveLength(stdout.split('\n').length);
+    expect((JSON.parse(decoded) as { api_key: string }).api_key).toBe('[redacted]\n');
+    expect(report.renderSkeletons).toBe(0);
+    expect(redactDeveloperText(text)).toBe(text);
+    assertNoLegacyRegression(input);
+  });
+
+  test('a pretty-printed JSON document with an escaped newline under a sensitive object keeps both forms', () => {
+    const input = '{\n  "secret": {\n    "note": "a\\nb"\n  }\n}';
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(report.renderSkeletons).toBe(0);
+    expect(newlineSkeleton(text)).toBe(newlineSkeleton(input));
+    expect(redactDeveloperText(text)).toBe(text);
+    assertNoLegacyRegression(input);
+  });
+});
+
+describe('RED-P4a2 item 2: escaped newlines are put back only inside real JSON carrier literals', () => {
+  test.each([
+    ['export DB_PASSWORD="SYNTHabc\\ndef"', 'export DB_PASSWORD="[redacted]"'],
+    ['password = "SYNTH\\nA\\nB"; // source', 'password = "[redacted]"; // source'],
+  ])('a plain-text double-quoted string keeps its \\n as content: %j', (input, expected) => {
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(text).toBe(expected);
+    expect(report.restoredTokens).toBe(0);
+    expect([...structurePositions(input)].every((flag) => flag === 0)).toBe(true);
+    // 收紧后 oracle 也把这些位置按内容判定：豁免里不再有 \n 两个字符。
+    const exempt = exemptPositions(input);
+    const at = input.indexOf('\\n');
+    expect([exempt[at], exempt[at + 1]]).toEqual([0, 0]);
+    expect(redactDeveloperText(text)).toBe(text);
+    assertNoLegacyRegression(input);
+  });
+
+  test('the same plain-text lines inside a tool-result carrier still keep the inner \\n masked', () => {
+    // 载体字符串值里的文本是纯文本：其中双引号串的 \n（载体层是 \\n 三个字符）不是换行，按内容处理。
+    for (const [line, expected] of [
+      ['export DB_PASSWORD="SYNTHabc\\ndef"', 'export DB_PASSWORD="[redacted]"'],
+      ['password = "SYNTH\\nA\\nB"; // source', 'password = "[redacted]"; // source'],
+    ] as const) {
+      const input = JSON.stringify({ stdout: line });
+      const { text, report } = redactDeveloperTextWithReport(input);
+      expect((JSON.parse(text) as { stdout: string }).stdout).toBe(expected);
+      expect(report.restoredTokens).toBe(0);
+      assertNoLegacyRegression(input);
+    }
+  });
+
+  test('a compact carrier line followed by an evidence annotation is still a JSON carrier', () => {
+    // 整段不是 JSON 文档，但这一行本身是：工具结果载体字符串值里的转义换行仍按 D3 放回。
+    const carrier = JSON.stringify({ password: 'SYNTHETIC a\nSYNTHETIC b' });
+    const input = `${carrier}\n\n[evidence] E-1=src/a.ts:1-3`;
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(text).toBe('{"password":"[redacted]\\n"}\n\n[evidence] E-1=src/a.ts:1-3');
+    expect(report.restoredTokens).toBe(1);
+    assertNoLegacyRegression(input);
+  });
+});
+
+describe('RED-P4a2 item 3: odd backslash runs escape a quote, and only value-boundary quotes are exempt', () => {
+  test('an even backslash run before a quote is content and is no longer exposed', () => {
+    // 第五轮审计（low）：v0/v1 遮住了值末尾的两个反斜杠，dbc078f 起按“紧贴引号的反斜杠串都是转义”原样写出。
+    const input = 'pass_token=sk-proj-SYNTHETIC123456789\\\\" x';
+    const output = redactDeveloperText(input);
+    expect(output).toBe('pass_token=[redacted]" x');
+    expect(output).not.toContain('\\');
+    expect(strictExposures(input)).toEqual([]);
+    const exempt = exemptPositions(input);
+    expect([exempt[37], exempt[38], exempt[39]]).toEqual([0, 0, 1]);
+    assertNoLegacyRegression(input);
+  });
+
+  test('escaped quotes inside a value are content; the delimiting quotes stay exempt', () => {
+    const json = '{"password": "ab\\"cd\\"ef"}';
+    const jsonExempt = exemptPositions(json);
+    expect([16, 17, 20, 21].map((index) => jsonExempt[index])).toEqual([0, 0, 0, 0]);
+    expect([jsonExempt[13], jsonExempt[24]]).toEqual([1, 1]);
+    const text = 'password: "ab\\"cd\\"ef" x';
+    const textExempt = exemptPositions(text);
+    expect([13, 14, 17, 18].map((index) => textExempt[index])).toEqual([0, 0, 0, 0]);
+    expect(textExempt[10]).toBe(1);
+    // 按基线算的豁免：v3 遮住的值内部转义引号同样不豁免。
+    const v3 = fixtureExactHidden('b60a61e', json);
+    expect([16, 17].map((index) => exemptPositions(json, v3)[index])).toEqual([0, 0]);
+    for (const input of [json, text]) {
+      expect(strictExposures(input)).toEqual([]);
+      assertNoLegacyRegression(input);
+    }
+  });
+
+  test('the renderer does not output an interior escaped quote verbatim between two gaps', () => {
+    // 构造：v3 只遮 ab 与 cd"ef（两段缺口），v0 遮整个值；中间的 \" 两侧都被 v0 遮住，是值内部的转义引号，
+    // 不能用原样步写出，只能退回 v0 的缺口。
+    const x = 'password: "ab\\"cd\\"ef" x';
+    const hidden = hiddenFor(x, [[11, 22]]);
+    const gapSets: GapSet[] = [
+      {
+        revision: 'b60a61e',
+        gaps: [
+          { start: 11, end: 13, synth: '[redacted]' },
+          { start: 15, end: 22, synth: '[redacted]"' },
+        ],
+      },
+      { revision: '246055e', gaps: [{ start: 11, end: 22, synth: '[redacted]"' }] },
+    ];
+    const result = renderByPositions(x, hidden, analyzeStructure(x), gapSets, true);
+    expect(result.text).toBe('password: "[redacted]" x');
+    const origin = [...(result.origin ?? new Int32Array(0))];
+    expect(origin).not.toContain(13);
+    expect(origin).not.toContain(14);
+  });
+
+  test('a boundary escaped quote after a bare value is still output verbatim (the carrier stays valid)', () => {
+    const input = '{"stdout":"password=SYNTHETIC\\"quoted\\""}';
+    const output = redactDeveloperText(input);
+    expect(output).toBe('{"stdout":"password=[redacted]\\"quoted\\""}');
+    expect(() => JSON.parse(output)).not.toThrow();
+  });
+
+  test('an escaping backslash swallowed by an early version stays with its quote, so the carrier stays valid JSON', () => {
+    // 转义单元（奇数长度反斜杠串的最后一个反斜杠加引号）不再被缺口切开：v0 的裸值字符类吃进了内层闭引号 \" 的
+    // 反斜杠，dbc078f 只用它的缺口铺排，留下没有转义的引号，双层载体不再是合法 JSON。
+    const input = JSON.stringify({
+      message: JSON.stringify({ stdout: 'token:SYNTHETIC6q1688Z?' }),
+    });
+    const output = redactDeveloperText(input);
+    expect(output).toBe('{"message":"{\\"stdout\\":\\"token:[redacted]\\"}"}');
+    const inner = (JSON.parse(output) as { message: string }).message;
+    expect(JSON.parse(inner)).toEqual({ stdout: 'token:[redacted]' });
+    expect(redactDeveloperText(output)).toBe(output);
+    assertNoLegacyRegression(input);
+  });
+
+  test('a C string literal keeps its \\n as content in plain text and inside a carrier, which stays valid JSON', () => {
+    const line = 'printf("Password: %s\\n", pw);';
+    expect(redactDeveloperText(line)).toBe('printf("Password: [redacted]", pw);');
+    const carrier = JSON.stringify({ stdout: line });
+    const output = redactDeveloperText(carrier);
+    expect((JSON.parse(output) as { stdout: string }).stdout).toBe(
+      'printf("Password: [redacted]", pw);'
+    );
+    expect(redactDeveloperText(output)).toBe(output);
+    assertNoLegacyRegression(line);
+    assertNoLegacyRegression(carrier);
+  });
+
+  test('expandEscapedQuotes grows only a partly hidden escape unit (last backslash plus quote)', () => {
+    const grown = (x: string, ranges: Array<[number, number]>): number[] => {
+      const hidden = hiddenFor(x, ranges);
+      expandEscapedQuotes(x, hidden);
+      return [...hidden];
+    };
+    // 单个反斜杠被遮、引号可见：整个转义单元一起被遮。
+    expect(grown('v\\"x', [[0, 2]])).toEqual([1, 1, 1, 0]);
+    // 引号被遮、反斜杠可见：同样扩到反斜杠。
+    expect(grown('v\\"x', [[2, 3]])).toEqual([0, 1, 1, 0]);
+    // 偶数长度的反斜杠串是内容，不是转义单元，不扩展。
+    expect(grown('v\\\\"x', [[0, 3]])).toEqual([1, 1, 1, 0, 0]);
+    // 奇数长度串里前面成对的反斜杠是完整的转义，缺口在它们之后结束时不扩展。
+    expect(grown('v\\\\\\"x', [[0, 3]])).toEqual([1, 1, 1, 0, 0, 0]);
+  });
+
+  test('a grid of values with interior escaped quotes never exposes them', () => {
+    const keys = ['password', 'api_key', 'token', 'GITHUB_TOKEN'];
+    const separators = ['=', ': ', '="', ': "', '":"', '": "'];
+    const values = ['ab\\"cd\\"ef', 'SYNTH\\"x', 'p\\\\\\"q\\"r', "a'b\\'c", 'x\\"\\"y'];
+    const wraps = [
+      (body: string) => body,
+      (body: string) => `${body}" tail`,
+      (body: string) => JSON.stringify({ stdout: body }),
+      (body: string) => JSON.stringify({ message: JSON.stringify({ stdout: body }) }),
+      (body: string) => `{"${body}"}`,
+    ];
+    let checked = 0;
+    for (const key of keys) {
+      for (const separator of separators) {
+        for (const value of values) {
+          for (const wrap of wraps) {
+            const input = wrap(`${key}${separator}${value}`);
+            checked++;
+            assertNoLegacyRegression(input);
+          }
+        }
+      }
+    }
+    expect(checked).toBe(keys.length * separators.length * values.length * wraps.length);
   });
 });

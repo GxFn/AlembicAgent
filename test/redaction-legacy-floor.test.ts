@@ -7,6 +7,7 @@
  * - 证明义务：四个冻结副本（含阶段 4 冻结的 v3）与 git blob 逐字节、逐输出一致（黄金摘要）；标记词表锁定；
  *   对齐器变异体全部被精确 oracle 杀死；追踪重放作为独立位置 oracle（超集必须包含重放得到的被遮位置）。
  * - 失败即关路径：对齐路径的骨架兜底与不动点触顶、报告只含计数与种类。
+ * - 防回退（RED-P4a2 第 5 项）：d0462bf 上载体内转义引号值的换行露出（HEAD 按 D3 放回）保持关闭。
  * 样本全部是合成值（SYNTHETIC / Synthetic），不是真实凭据。
  */
 import { createHash } from 'node:crypto';
@@ -151,9 +152,9 @@ describe('regression corpus: failure catalog and new findings (raw and carrier f
         replayTracked('b60a61e', originTracked(entry.input)),
         entry.input.length
       );
-      const exempt = exemptPositions(entry.input);
       for (const revision of ['246055e', '1b394ce', 'd113986'] as const) {
         const legacy = exactHidden(revision, entry.input);
+        const exempt = exemptPositions(entry.input, legacy);
         if (
           legacy.some(
             (hidden, index) => hidden === 1 && current[index] === 0 && exempt[index] === 0
@@ -393,7 +394,7 @@ const BATTERY: BatteryItem[] = [
 ];
 
 function batteryViolations(item: BatteryItem, mutation?: AlignerMutation): string[] {
-  const exempt = exemptPositions(item.x);
+  const exempt = exemptPositions(item.x, item.truth);
   const superset = hiddenSuperset(item.x, item.y, { reencodes: item.reencodes, mutation }).marks;
   const subset = hiddenSubset(item.x, item.y, { reencodes: item.reencodes, mutation }).marks;
   const violations: string[] = [];
@@ -487,9 +488,9 @@ describe('R-Q boundary trimming is token-based (review item 1)', () => {
   test('the superset of each early version keeps the trailing n of the masked value', () => {
     let checked = 0;
     for (const input of family) {
-      const exempt = exemptPositions(input);
       for (const revision of ['246055e', '1b394ce', 'd113986'] as const) {
         const truth = exactHidden(revision, input);
+        const exempt = exemptPositions(input, truth);
         const superset = hiddenSuperset(input, fixtureFor(revision)(input), {
           reencodes: revision === 'd113986',
         }).marks;
@@ -517,9 +518,9 @@ describe('tracked replay as an independent position oracle', () => {
   test('the superset of each early version contains every replayed hidden position', () => {
     let checked = 0;
     for (const { input } of corpusRows) {
-      const exempt = exemptPositions(input);
       for (const revision of ['246055e', '1b394ce', 'd113986'] as const) {
         const truth = exactHidden(revision, input);
+        const exempt = exemptPositions(input, truth);
         const superset = hiddenSuperset(input, fixtureFor(revision)(input), {
           reencodes: revision === 'd113986',
         }).marks;
@@ -536,8 +537,8 @@ describe('tracked replay as an independent position oracle', () => {
 
   test('the subset of the current rules never claims a replayed visible position', () => {
     for (const { input } of corpusRows) {
-      const exempt = exemptPositions(input);
       const truth = exactHidden('b60a61e', input);
+      const exempt = exemptPositions(input, truth);
       const subset = hiddenSubset(input, fixtureAtB60a61e(input), { reencodes: true }).marks;
       for (let index = 0; index < input.length; index++) {
         if (subset[index] === 1 && exempt[index] === 0) {
@@ -545,6 +546,48 @@ describe('tracked replay as an independent position oracle', () => {
         }
       }
     }
+  });
+});
+
+describe('RED-P4a2 item 5: the d0462bf carrier newline exposure stays closed', () => {
+  // 第五轮审计第 3 条：d0462bf 的 R-Q 修剪把载体里引号值末尾的转义换行（与 d113986 重出的 \n 逐字相同）扣出
+  // 超集，补遮漏掉它，replay 相对 d113986 报出 @128、@129；多行值以 n 结尾时还会露出秘密的末字母。HEAD 起该
+  // 转义换行在 JSON 载体里是 D3 结构（按原形态放回），修剪按整个记号进行，这些输入必须一直零露出、零对齐违规。
+  const body = `MIIEowIBAAKCAQEA${'SYNTHAQ'.repeat(6)}abcd`;
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${body}\n`;
+  test.each([
+    [
+      'password value ending in an escaped newline',
+      JSON.stringify({ stdout: `${pem}password: "SYNTHrq1\n"` }),
+    ],
+    [
+      'api_key value with two escaped newlines',
+      JSON.stringify({ stdout: `${pem}api_key: "SYNTHrq1\n\n"` }),
+    ],
+    [
+      'double carrier',
+      JSON.stringify({ message: JSON.stringify({ stdout: `${pem}password: "SYNTHrq1\n"` }) }),
+    ],
+    [
+      'multi-line value whose last letter is n',
+      JSON.stringify({ stdout: `${pem}password: "SYNTH\nxqzn"` }),
+    ],
+    ['single-quoted value with CRLF', JSON.stringify({ stdout: `${pem}password: 'SYNTHrq1\r\n'` })],
+  ])('%s: no exposure and no aligner violation', (_name, input) => {
+    const report = assertNoLegacyRegression(input);
+    expect(report.exposures).toEqual([]);
+    expect(report.alignerViolations).toEqual([]);
+    expect(report.output).not.toMatch(/SYNTH/);
+  });
+
+  test('the exact audited input renders like HEAD and keeps the escaped newline as structure', () => {
+    const input = JSON.stringify({ stdout: `${pem}password: "SYNTHrq1\n"` });
+    const { text, report } = redactDeveloperTextWithReport(input);
+    expect(text).toBe(
+      '{"stdout":"-----BEGIN RSA PRIVATE KEY-----\\n[redacted-private-key]\\n: \\"[redacted]\\n\\""}'
+    );
+    expect(report.renderSkeletons).toBe(0);
+    expect((JSON.parse(text) as { stdout: string }).stdout.endsWith('[redacted]\n"')).toBe(true);
   });
 });
 

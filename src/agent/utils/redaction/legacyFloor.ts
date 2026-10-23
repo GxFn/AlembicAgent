@@ -18,7 +18,8 @@
  * - 某版本的重放文本与冻结原版输出不同（或重放内部不一致）时，该版本的位置整体不可信：冻结版本改动过的行
  *   （输入 vs 冻结输出不同）与重放文本不同的行都整行替换为 [redacted-unaligned]；无法按行定位（换行数对不上）
  *   时每个非空行都替换。重放给出的位置仍并入 Floor，只会多遮。
- * - 渲染结果的换行数与输入不同（只会由错误的重放或缺口引起）时无法按行定位，整篇退回输入的换行骨架。
+ * - 渲染结果的换行数与输入不同（只会由错误的重放或缺口引起：渲染放回换行时按裸换行与转义换行分开计数，
+ *   RED-P4a2）时无法按行定位，整篇退回输入的换行骨架。
  * - 不动点触顶时 S 仍成立，只是不保证幂等，报告里标记 fixpoint-cap。
  * 这些路径都写进 FloorReport（只含计数与种类，不含正文），由有日志通道的调用方记录。
  *
@@ -179,7 +180,10 @@ export interface FloorReport {
   replayMismatches: number;
   /** 因自检失败而整行替换为 [redacted-unaligned] 的行数。 */
   replayMismatchLines: number;
-  /** 渲染结果换行数与输入不同、整篇退回输入换行骨架的次数（正常规则下恒为 0）。 */
+  /**
+   * 渲染结果换行数与输入不同、整篇退回输入换行骨架的次数（正常规则下恒为 0：放回换行按形态分开计数，由
+   * 全部语料与“同一缺口混合两种换行”生成器上的断言钉住，RED-P4a2）。
+   */
   renderSkeletons: number;
   /** 渲染：只含结构、引号、原有标记而原样输出的区间数。 */
   verbatimRuns: number;
@@ -1446,8 +1450,9 @@ function replayFloorOnce(
   let text = rendered.text;
   let origin = rendered.origin;
   if (countLines(text) !== countLines(x)) {
-    // 渲染只放回输入里的换行，合成文本里的裸换行又只能来自通过自检的重放；换行数仍对不上说明某个缺口或
-    // 重放写出了多余或缺失的换行，按行定位已不可能，整篇退回输入的换行骨架（每个非空行 [redacted-unaligned]）。
+    // 渲染只放回输入里的换行（裸换行与转义换行各自做多重集差），合成文本里的裸换行又只能来自通过自检的重放；
+    // 换行数仍对不上说明某个缺口或重放写出了多余或缺失的换行，按行定位已不可能，整篇退回输入的换行骨架（每个
+    // 非空行 [redacted-unaligned]），计入 renderSkeletons 与 render-skeleton。
     report.renderSkeletons++;
     note(report, 'render-skeleton');
     const fallback = skeleton(x);

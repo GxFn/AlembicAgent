@@ -19,6 +19,7 @@
  * 本模块是纯函数，不持有模块级可变状态；所有正则在调用时构造。词法扫描用 indexOf 实现（与下方 T_ABS、T_SUB
  * 正则逐 token 等价，由属性测试锁定），避免可选前缀让正则在每个位置都重试。
  */
+import { structurePositions } from './trackedReplay.js';
 
 /** 封闭标记词表（设计 4.6 节、附录 C）。[redacted-unaligned] 是阶段 1 唯一新增的失败即关标记。 */
 export const REDACTION_MARKERS: readonly string[] = [
@@ -830,8 +831,41 @@ function absorbedTokens(absorbed: string): string[] {
   return tokens;
 }
 
-/** x 中从 from 开始、不越过 limit 的一个可吸收记号；不是记号时为 null。反斜杠串取最长，记号边界因此唯一。 */
-function absorbableTokenAt(x: string, from: number, limit: number): string | null {
+/** 结构位置（trackedReplay.structurePositions，与 x 等长）的惰性读取：只有修剪碰到转义换行记号时才求一次。 */
+export type StructureMarks = () => Uint8Array;
+
+/** x 中 [from, to) 全部是结构位置（JSON 载体字面量里的转义换行记号）。 */
+function allStructure(structure: StructureMarks, from: number, to: number): boolean {
+  const marks = structure();
+  for (let index = from; index < to; index++) {
+    if (marks[index] !== 1) {
+      return false;
+    }
+  }
+  return to > from;
+}
+
+/** 包含 position 的反斜杠串在 x 中的起点（向左取最长，不受修剪下界限制：奇偶按整串计算）。 */
+function backslashRunStart(x: string, position: number): number {
+  let start = position;
+  while (start - 1 >= 0 && x[start - 1] === '\\') {
+    start--;
+  }
+  return start;
+}
+
+/**
+ * x 中从 from 开始、不越过 limit 的一个可吸收记号；不是记号时为 null。反斜杠串取最长，记号边界因此唯一。
+ * 只有信息等价的记号才能修剪（RED-P4a2，与 oracle 的 exemptPositions 同一口径）：引号记号的反斜杠串按整串
+ * 取奇偶，偶数长度时反斜杠是内容，不构成可修剪的记号；转义换行只在它是结构位置（JSON 载体字面量里）时才是
+ * 记号，纯文本里的 \n 两个字符是内容。裸换行与不带反斜杠的引号照旧。
+ */
+function absorbableTokenAt(
+  x: string,
+  from: number,
+  limit: number,
+  structure: StructureMarks
+): string | null {
   const char = x[from];
   if (from >= limit || char === undefined) {
     return null;
@@ -847,14 +881,25 @@ function absorbableTokenAt(x: string, from: number, limit: number): string | nul
     cursor++;
   }
   const next = x[cursor];
-  if (cursor < limit && (isQuoteChar(next) || next === 'n' || next === 'r')) {
+  if (cursor >= limit) {
+    return null;
+  }
+  if (isQuoteChar(next)) {
+    return (cursor - backslashRunStart(x, from)) % 2 === 1 ? x.slice(from, cursor + 1) : null;
+  }
+  if ((next === 'n' || next === 'r') && allStructure(structure, from, cursor + 1)) {
     return x.slice(from, cursor + 1);
   }
   return null;
 }
 
 /** x 中结束于 to、不早于 lowerBound 的一个可吸收记号；不是记号时为 null。反斜杠串向前取最长。 */
-function absorbableTokenEndingAt(x: string, lowerBound: number, to: number): string | null {
+function absorbableTokenEndingAt(
+  x: string,
+  lowerBound: number,
+  to: number,
+  structure: StructureMarks
+): string | null {
   const last = x[to - 1];
   if (to <= lowerBound || last === undefined) {
     return null;
@@ -870,10 +915,16 @@ function absorbableTokenEndingAt(x: string, lowerBound: number, to: number): str
     start--;
   }
   if (isQuoteChar(last)) {
-    return x.slice(start, to);
+    // 引号前的反斜杠串按整串取奇偶：偶数长度时反斜杠是内容，记号只有引号本身；奇数长度的串必须整串落在
+    // 修剪范围内，否则不修剪（宁多勿少）。
+    const fullStart = backslashRunStart(x, to - 1);
+    if ((to - 1 - fullStart) % 2 === 0) {
+      return last;
+    }
+    return fullStart >= lowerBound ? x.slice(fullStart, to) : null;
   }
-  // n/r 只有带反斜杠才是转义换行记号；裸露的 n/r 是值的末字符，不能与记号对到同一位置。
-  return start < to - 1 ? x.slice(start, to) : null;
+  // n/r 只有带反斜杠才是转义换行记号；裸露的 n/r 是值的末字符，不能与记号对到同一位置。转义换行还必须是结构位置。
+  return start < to - 1 && allStructure(structure, start, to) ? x.slice(start, to) : null;
 }
 
 /**
@@ -881,10 +932,16 @@ function absorbableTokenEndingAt(x: string, lowerBound: number, to: number): str
  * 转义换行记号 \n 的末字符 n 与被遮值的末字符 n 当成同一位置，超集漏掉那个 n；按记号比较时，x 里的反斜杠串
  * 取最长，所以 \n 不会与 \\n 或裸露的 n 对上。
  */
-function tokenPrefixLength(absorbed: string, x: string, from: number, limit: number): number {
+function tokenPrefixLength(
+  absorbed: string,
+  x: string,
+  from: number,
+  limit: number,
+  structure: StructureMarks
+): number {
   let cursor = from;
   for (const token of absorbedTokens(absorbed)) {
-    if (absorbableTokenAt(x, cursor, limit) !== token) {
+    if (absorbableTokenAt(x, cursor, limit, structure) !== token) {
       break;
     }
     cursor += token.length;
@@ -892,12 +949,18 @@ function tokenPrefixLength(absorbed: string, x: string, from: number, limit: num
   return cursor - from;
 }
 
-function tokenSuffixLength(absorbed: string, x: string, lowerBound: number, to: number): number {
+function tokenSuffixLength(
+  absorbed: string,
+  x: string,
+  lowerBound: number,
+  to: number,
+  structure: StructureMarks
+): number {
   let cursor = to;
   const tokens = absorbedTokens(absorbed);
   for (let index = tokens.length - 1; index >= 0; index--) {
     const token = tokens[index] ?? '';
-    if (absorbableTokenEndingAt(x, lowerBound, cursor) !== token) {
+    if (absorbableTokenEndingAt(x, lowerBound, cursor, structure) !== token) {
       break;
     }
     cursor -= token.length;
@@ -908,24 +971,36 @@ function tokenSuffixLength(absorbed: string, x: string, lowerBound: number, to: 
 /**
  * 超集里的一个缺口区间，含边界修剪 R-Q：贴着放置唯一的保留段（或行界）时，合成段吸收的引号、转义换行
  * 若与 x 在同一边界上的记号相同，就算“同一位置可见”（信息等价），从区间中扣除。不修剪会让被多算的闭引号
- * 经不动点放大（UNTERMINATED 一直吞到文末）。修剪按整个记号进行，见 tokenPrefixLength。
+ * 经不动点放大（UNTERMINATED 一直吞到文末）。修剪按整个记号进行，见 tokenPrefixLength；只修剪信息等价的
+ * 记号（定界引号、裸换行、JSON 载体字面量里的转义换行），structure 缺省时现算 x 的结构位置。
  */
 export function groupSupersetRange(
   x: string,
   plan: LinePlan,
   group: GapGroup,
-  mutation?: AlignerMutation
+  mutation?: AlignerMutation,
+  structure?: StructureMarks
 ): [number, number] {
+  const marksOf = structure ?? lazyStructure(x);
   const bounds = groupBounds(plan, group, mutation);
   let left = bounds.outerLeft;
   let right = bounds.outerRight;
   if (bounds.leftExact && group.leftAbsorbed.length > 0) {
-    left += tokenPrefixLength(group.leftAbsorbed, x, left, right);
+    left += tokenPrefixLength(group.leftAbsorbed, x, left, right, marksOf);
   }
   if (bounds.rightExact && group.rightAbsorbed.length > 0) {
-    right -= tokenSuffixLength(group.rightAbsorbed, x, left, right);
+    right -= tokenSuffixLength(group.rightAbsorbed, x, left, right, marksOf);
   }
   return [left, Math.max(left, right)];
+}
+
+/** x 的结构位置，第一次读取时才计算（每次调用新建，不是模块级缓存）。 */
+function lazyStructure(x: string): StructureMarks {
+  let marks: Uint8Array | null = null;
+  return () => {
+    marks ??= structurePositions(x);
+    return marks;
+  };
 }
 
 /**
@@ -1006,6 +1081,8 @@ export function supersetFromAlignment(
   const marks = new Uint8Array(x.length);
   const stats = emptyStats();
   stats.newlineMismatch = alignment.mode === 'whole' ? 1 : 0;
+  // 同一次求超集的所有缺口共用一份惰性结构位置（只有修剪碰到转义换行记号时才计算）。
+  const structure = lazyStructure(x);
   for (const plan of alignment.plans) {
     if (plan.identical) {
       continue;
@@ -1024,7 +1101,7 @@ export function supersetFromAlignment(
     }
     stats.ambiguousPieces += countAmbiguous(plan);
     for (const group of plan.groups) {
-      const [start, end] = groupSupersetRange(x, plan, group, options.mutation);
+      const [start, end] = groupSupersetRange(x, plan, group, options.mutation, structure);
       markRange(marks, start, end);
     }
   }

@@ -2,7 +2,8 @@
  * 脱敏阶段 1 底线的性质与精确 oracle（设计第 6 节测试要求 2、3、5）。固定种子，全部可复现。
  *
  * - 语法网格（12 键 × 10 分隔符 × 25 值形态 × 16 上下文 = 48,000 例）：哨兵 oracle 对四个历史版本零回退，
- *   并检查幂等、裸换行序列守恒；抽样检查确定性。
+ *   并检查幂等、裸换行序列守恒、渲染不退回整篇骨架（RED-P4a2 第 1 项）、载体上下文的输出仍是合法 JSON（第 3 项：
+ *   转义单元不被缺口切开）；抽样检查确定性。
  * - 唯一字符精确 oracle（10,800 例，每例 8 个互不相同的 CJK 字符 × 4 个基线 ≥ 30 万次检查）：某字符被基线
  *   遮住当且仅当它不出现在基线输出里；被遮的字符不得出现在新输出里（0 漏判）。同时逐字符核对对齐器：
  *   早期版本的超集不得漏判，现行规则的子集不得误判。
@@ -57,6 +58,16 @@ function newlineSkeleton(text: string): string {
   return text.replace(/[^\r\n]/g, '');
 }
 
+function parsesAsJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch (err: unknown) {
+    void err;
+    return false;
+  }
+}
+
 /** 哨兵 oracle：任一基线输出里不含的 SYNTH… 片段，新输出也不得含。返回违规描述。 */
 function sentinelViolations(input: string, output: string): string[] {
   const violations: string[] = [];
@@ -83,9 +94,17 @@ describe('grammar grid: zero regression, idempotence and newline conservation', 
     'context $name (3,000 inputs)',
     ({ index }) => {
       const violations: string[] = [];
+      const carrierContext = GRID_CONTEXTS[index]?.name.endsWith('carrier') === true;
       for (const [position, { input, secret }] of grammarGridFor(index).entries()) {
         gridInputs++;
-        const output = redactDeveloperText(input);
+        const { text: output, report } = redactDeveloperTextWithReport(input);
+        if (report.renderSkeletons !== 0) {
+          violations.push(`render skeleton: ${JSON.stringify(input)}`);
+        }
+        if (carrierContext && !parsesAsJson(output)) {
+          // RED-P4a2 第 3 项：转义单元不被缺口切开，载体输出保持合法 JSON。
+          violations.push(`carrier output is not valid JSON: ${JSON.stringify(input)}`);
+        }
         sentinelChecks += BASELINE_REVISIONS.length;
         violations.push(...sentinelViolations(input, output));
         if (redactDeveloperText(output) !== output) {
@@ -128,7 +147,10 @@ describe('unique-character exact oracle', () => {
     ({ chunk }) => {
       const violations: string[] = [];
       for (const { input, uniques } of cases.slice(chunk * size, (chunk + 1) * size)) {
-        const output = redactDeveloperText(input);
+        const { text: output, report } = redactDeveloperTextWithReport(input);
+        if (report.renderSkeletons !== 0) {
+          violations.push(`render skeleton: ${JSON.stringify(input)}`);
+        }
         const outputs = new Map<BaselineRevision, string>(
           BASELINE_REVISIONS.map((revision) => [revision, frozenRedact(revision, input)])
         );

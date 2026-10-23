@@ -5,9 +5,9 @@
  *   （test/fixtures/redaction-catalog/trackedReplay.ts）在全部语料与矩阵上给出相同的被遮位置，自检失配为 0。
  * - 自检失败即关：重放文本与冻结原版输出不同、或重放内部不一致时，受影响的行整行替换为 [redacted-unaligned]
  *   并计入 FloorReport；换行数对不上时退回每个非空行。
- * - 结构位置（D3 阶段 4 子项）：裸换行、可解析 JSON 字面量内解码后是换行的转义序列（按载体递归）；裸文本里的
- *   字面 \n 两个字符不是结构。该口径同时约束测试期的对齐 oracle，复查记录里的 GITHUB_TOKEN 载体家族不再报
- *   superset misses。
+ * - 结构位置（D3 阶段 4 子项）：裸换行、JSON 载体字面量内解码后是换行的转义序列（按载体递归）；载体只指整段或
+ *   整行可解析的 JSON 文档（RED-P4a2 第 2 项），裸文本与纯文本双引号串里的字面 \n 两个字符不是结构。该口径同时
+ *   约束测试期的对齐 oracle，复查记录里的 GITHUB_TOKEN 载体家族不再报 superset misses。
  * - 缺口：每个版本的合成文本与它遮住的输入区间；分段来源表的解码/编码往返。
  * 样本全部是合成值。
  */
@@ -152,6 +152,8 @@ describe('tracked replay equivalence (requirement 6): zero mismatch on every cor
       expect(report.replayMismatches).toBe(0);
       expect(report.replayMismatchLines).toBe(0);
       expect(report.impureSynths).toBe(0);
+      // RED-P4a2 第 1 项：通过自检的重放与正确的缺口下，渲染不会退回整篇骨架。
+      expect(report.renderSkeletons, JSON.stringify(input)).toBe(0);
     }
   });
 });
@@ -320,6 +322,39 @@ describe('structure positions (D3 and its stage-4 sub-item)', () => {
     expect([...structurePositions('"a\\nb')]).toEqual([0, 0, 0, 0, 0]);
   });
 
+  test('only real JSON carriers count: plain-text double-quoted strings keep their \\n as content', () => {
+    // RED-P4a2 第 2 项（总控决定）：shell export、源码字符串字面量里的 \n 两个字符是内容，不是换行结构。
+    for (const input of [
+      'export DB_PASSWORD="SYNTHabc\\ndef"',
+      'password = "SYNTH\\nA\\nB"; // source',
+      'password="SYNTHETICa\\nSYNTHETICb"',
+      'line0\n{"password": ["a\\nb",\n"c"]}\nline3 ok',
+      '12: {"note": "a\\nb"}',
+    ]) {
+      const marks = structurePositions(input);
+      const at = input.indexOf('\\n');
+      expect([marks[at], marks[at + 1]], JSON.stringify(input)).toEqual([0, 0]);
+    }
+    // 载体字符串值解码后是纯文本时，其中双引号串的 \n（载体层是 \\n 三个字符）同样是内容。
+    const carrier = JSON.stringify({ stdout: 'export DB_PASSWORD="SYNTHabc\\ndef"' });
+    const inner = carrier.indexOf('\\\\n');
+    expect([...structurePositions(carrier).slice(inner, inner + 3)]).toEqual([0, 0, 0]);
+  });
+
+  test('a whole document, a pretty-printed document and a compact carrier line are carriers', () => {
+    const pretty = '{\n  "secret": {\n    "note": "a\\nb"\n  }\n}';
+    const prettyAt = pretty.indexOf('\\n');
+    expect([...structurePositions(pretty).slice(prettyAt, prettyAt + 2)]).toEqual([1, 1]);
+    // 整段不是 JSON 文档，但第一行是：这一行的字面量是载体（工具结果后接 [evidence] 标注）。
+    const annotated = `${JSON.stringify({ stdout: 'a\nb' })}\n\n[evidence] E-1=src/a.ts:1-3`;
+    const annotatedAt = annotated.indexOf('\\n');
+    expect([...structurePositions(annotated).slice(annotatedAt, annotatedAt + 2)]).toEqual([1, 1]);
+    // 根字符串文档同样是载体。
+    const rootString = JSON.stringify('line one\nline two');
+    const rootAt = rootString.indexOf('\\n');
+    expect([...structurePositions(rootString).slice(rootAt, rootAt + 2)]).toEqual([1, 1]);
+  });
+
   test('the runtime structure criterion matches an independent reference on every corpus', () => {
     // 独立参照（不复用运行时的分段来源表）：按“可解析 JSON 字面量内解码后是换行的转义序列”逐层展开。
     // 复查意见 5：原来的用例（结构位置 ⊆ 豁免位置）在 exemptPositions 以 structurePositions 起步后恒真。
@@ -355,8 +390,41 @@ const REFERENCE_ESCAPES: Readonly<Record<string, string>> = {
 };
 
 /**
- * 结构位置的独立参照实现：裸换行，以及可解析 JSON 字符串字面量（按载体递归，最多 8 层）内解码后是换行的
- * 转义序列在顶层输入里占据的位置。逐字符维护来源区间，不使用运行时的 Tracked 分段表。
+ * 独立参照里的“JSON 文档”判定：整段可解析（任意根），或（整段不可解析时）各自整行可解析为对象或数组的行，
+ * 返回 [from, to)。
+ */
+function referenceDocuments(text: string): Array<[number, number]> {
+  const parses = (candidate: string, roots: RegExp): boolean => {
+    if (!roots.test(candidate)) {
+      return false;
+    }
+    try {
+      JSON.parse(candidate);
+      return true;
+    } catch (err: unknown) {
+      void err;
+      return false;
+    }
+  };
+  if (parses(text, /^\s*[{["]/)) {
+    return [[0, text.length]];
+  }
+  const documents: Array<[number, number]> = [];
+  let start = 0;
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    const at = text.indexOf(line, start);
+    if (line.length > 0 && parses(line, /^[ \t]*[{[]/)) {
+      documents.push([at, at + line.length]);
+    }
+    start = at + line.length;
+  }
+  return documents;
+}
+
+/**
+ * 结构位置的独立参照实现：裸换行，以及 JSON 载体字面量（整段或整行可解析的 JSON 文档里的字符串字面量，按载体
+ * 递归，最多 8 层）内解码后是换行的转义序列在顶层输入里占据的位置。逐字符维护来源区间，不使用运行时的 Tracked
+ * 分段表。
  */
 function referenceStructure(x: string): Uint8Array {
   const marks = new Uint8Array(x.length);
@@ -371,45 +439,53 @@ function referenceStructure(x: string): Uint8Array {
     if (depth >= 8) {
       return;
     }
-    const literal = /"(?:\\[\s\S]|[^"\\])*"/g;
-    for (let match = literal.exec(text); match !== null; match = literal.exec(text)) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(match[0]);
-      } catch (err: unknown) {
-        void err;
-        continue;
-      }
-      if (typeof parsed !== 'string') {
-        continue;
-      }
-      const inner: string[] = [];
-      const innerMap: SourceMap = [];
-      const end = match.index + match[0].length - 1;
-      let cursor = match.index + 1;
-      while (cursor < end) {
-        if (text[cursor] !== '\\') {
-          inner.push(text[cursor] ?? '');
-          innerMap.push(map[cursor] ?? [0, 0]);
-          cursor++;
+    for (const [from, to] of referenceDocuments(text)) {
+      const documentText = text.slice(from, to);
+      const literal = /"(?:\\[\s\S]|[^"\\])*"/g;
+      for (
+        let match = literal.exec(documentText);
+        match !== null;
+        match = literal.exec(documentText)
+      ) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch (err: unknown) {
+          void err;
           continue;
         }
-        const escapeChar = text[cursor + 1] ?? '';
-        const length = escapeChar === 'u' ? 6 : 2;
-        inner.push(
-          escapeChar === 'u'
-            ? String.fromCharCode(Number.parseInt(text.slice(cursor + 2, cursor + 6), 16))
-            : (REFERENCE_ESCAPES[escapeChar] ?? escapeChar)
-        );
-        const ranges = map.slice(cursor, cursor + length);
-        innerMap.push([
-          Math.min(...ranges.map((range) => range[0])),
-          Math.max(...ranges.map((range) => range[1])),
-        ]);
-        cursor += length;
+        if (typeof parsed !== 'string') {
+          continue;
+        }
+        const inner: string[] = [];
+        const innerMap: SourceMap = [];
+        const literalStart = from + match.index;
+        const end = literalStart + match[0].length - 1;
+        let cursor = literalStart + 1;
+        while (cursor < end) {
+          if (text[cursor] !== '\\') {
+            inner.push(text[cursor] ?? '');
+            innerMap.push(map[cursor] ?? [0, 0]);
+            cursor++;
+            continue;
+          }
+          const escapeChar = text[cursor + 1] ?? '';
+          const length = escapeChar === 'u' ? 6 : 2;
+          inner.push(
+            escapeChar === 'u'
+              ? String.fromCharCode(Number.parseInt(text.slice(cursor + 2, cursor + 6), 16))
+              : (REFERENCE_ESCAPES[escapeChar] ?? escapeChar)
+          );
+          const ranges = map.slice(cursor, cursor + length);
+          innerMap.push([
+            Math.min(...ranges.map((range) => range[0])),
+            Math.max(...ranges.map((range) => range[1])),
+          ]);
+          cursor += length;
+        }
+        expect(inner.join('')).toBe(parsed);
+        walk(inner.join(''), innerMap, depth + 1);
       }
-      expect(inner.join('')).toBe(parsed);
-      walk(inner.join(''), innerMap, depth + 1);
     }
   };
   walk(
@@ -486,7 +562,7 @@ describe('alignment oracle agrees with the replay under the unified newline crit
         const superset = hiddenSuperset(input, frozenRedact(revision, input), {
           reencodes: revision === 'd113986',
         }).marks;
-        const exempt = exemptPositions(input);
+        const exempt = exemptPositions(input, truth);
         for (let index = 0; index < input.length; index++) {
           if (truth[index] === 1 && exempt[index] === 0 && structure[index] === 0) {
             checked++;
