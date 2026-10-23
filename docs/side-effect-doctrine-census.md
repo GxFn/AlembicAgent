@@ -39,7 +39,7 @@ documented null-slot lifecycle; the HookSystem counter exemption remains.
 | --- | --- | --- | --- |
 | S1 | `ModelRegistry` lazy module singleton (`let _instance` + `getModelRegistry()`) | `src/ai/registry/ModelRegistry.ts:127-134` | BLESSED — named in the AD0 whitelist draft as "ModelRegistry (Agent)"; AD4 confirms. Lazy init, no import-time work. |
 | S2 | `LLMGateway` lazy module singleton (`let _gateway` + `getLLMGateway(config?)` + `resetLLMGateway()`) | `src/ai/gateway/LLMGateway.ts:459-479` | BLESSED — public `./ai` API; explicit reset hook; documented config-rebuild semantics (explicit config rebuilds the instance). Container-managing would change the public API (STOP class). |
-| S3 | `AgentEventBus` lazy class singleton (`static #instance`, `getInstance()`, `resetInstance()` clears listeners/subscriptions) | `src/agent/runtime/AgentEventBus.ts:47-79` | BLESSED — cross-strategy broadcast seam on the public runtime surface; reset hook present; `setMaxListeners(100)` declared. |
+| S3 | `AgentEventBus` lazy class singleton (`static #instance`, `getInstance()`, `resetInstance()` removes all listeners) | `src/agent/runtime/AgentEventBus.ts:47-72` | BLESSED — cross-strategy broadcast seam on the public runtime surface; reset hook present; `setMaxListeners(100)` declared. |
 
 Of the four singletons named by the AD4 design, only `ModelRegistry` lives in
 this repo. `Logger` (`@alembic/core/logging`), `pathGuard`
@@ -58,7 +58,7 @@ consumers, both with paired clear on dispose
 | --- | --- | --- | --- |
 | M1 | `proxyDispatcherCache` Map (undici proxy dispatchers) | `src/ai/transport/LLMTransport.ts:28-29` | BLESSED as managed cache — lifecycle policy already implemented: cap `MAX_PROXY_DISPATCHER_CACHE_SIZE = 8`, close/destroy on eviction, null-caching of failed init; rationale documented in-file (socket/keep-alive reuse in the resident daemon). |
 | M2 | `parsers[]` + `parsersLoaded` lazy-init flag | `src/tools/v2/compressor/OutputCompressor.ts:21-22` | BLESSED as lazy-init state — write-once idempotent loader explicitly designed to avoid import-time parser loading. |
-| M3 | `_hookCounter` monotonic id counter | `src/agent/runtime/HookSystem.ts:96` | BLESSED — uniqueness-only counter; all behavioral hook state is instance-scoped (`#hooks`, `#hookErrors`). |
+| M3 | `_hookCounter` monotonic id counter | `src/agent/runtime/HookSystem.ts:104` | BLESSED — uniqueness-only counter; all behavioral hook state is instance-scoped (`#hooks`, `#hookErrors`). |
 | M4 | Declarative constant tables: `TOOL_REGISTRY` spec table, `VALID_*`/`IGNORED_DIRS`/`BLOCKED_BINS`/`NON_CACHEABLE*`/`RETRYABLE_NETWORK_CODES` Sets, frozen defaults | `src/tools/v2/registry.ts`, various (census grep 2026-06-12) | HEALTHY per AD0 ("frozen constant Sets are fine") — constant data, never mutated after module init. No action. |
 
 ## 3. Import-time work
@@ -73,7 +73,7 @@ consumers, both with paired clear on dispose
 | I6 | `const execAsync = promisify(exec)` and `Object.freeze(...)` defaults | `src/tools/v2/handlers/terminal.ts:19`, `src/agent/memory/SessionStore.ts:45` | HEALTHY — pure wrapper construction. |
 
 Constructor-scoped `Logger.getInstance()` acquisitions (e.g.
-`src/agent/runtime/AgentEventBus.ts:60`, memory/context stores) are
+`src/agent/runtime/AgentEventBus.ts:55`, memory/context stores) are
 construction-time effects through the blessed Core singleton — compliant with
 the doctrine as written; the injected-port end state for Logger is Core-leg /
 future-wave scope.
@@ -83,8 +83,8 @@ future-wave scope.
 | Id | Item | Site | Finding |
 | --- | --- | --- | --- |
 | L1 | `child.stdout.on('data')`, `child.on('close'/'error')` | `src/tools/v2/handlers/code.ts:186,197,217` | HEALTHY — per-spawn listeners scoped to the child process lifetime; no leak surface. |
-| L2 | `registerDefaultHooks` bridges (3 × `hookSystem.on`) | `src/agent/runtime/HookSystem.ts:307,320,333` | HEALTHY — `HookSystem` is per-`AgentRuntime` instance (`src/agent/runtime/AgentRuntime.ts:205`), `on()` returns an unsubscribe, and all hook state dies with the runtime instance; no module-scope HookSystem exists. |
-| L3 | `AgentEventBus` subscriptions | — | HEALTHY in-repo — zero Agent-internal persistent `.on(`/`.subscribe(` sites found (strategies only publish); `resetInstance()` removes all listeners; host-side subscriptions are host-owned lifecycles. |
+| L2 | `registerDefaultHooks` bridges (2 × `hookSystem.on`, `llm:call:before`/`llm:call:after`; the dead exit-hook bridge was removed with the never-dispatched hook events in L5-P41) | `src/agent/runtime/HookSystem.ts:362,375` | HEALTHY — `HookSystem` is per-`AgentRuntime` instance (`src/agent/runtime/AgentRuntime.ts:340`), `on()` returns an unsubscribe, and all hook state dies with the runtime instance; no module-scope HookSystem exists. |
+| L3 | `AgentEventBus` listeners | `src/agent/strategies/pipeline/attempt.ts:83,127` | HEALTHY in-repo — `subscribe()`/`request()` and their subscription and pending-reply maps were removed in L5-P41, so listeners exist only as inherited EventEmitter `on`/`off` registrations; the only Agent-internal site is the pipeline attempt's paired `on`/`off` of `TOOL_CALL_START` (strategies otherwise only publish); `resetInstance()` removes all listeners; host-side subscriptions are host-owned lifecycles. |
 | L4 | timer registrations | `src/agent/forge/TemporaryToolRegistry.ts:255`, `src/agent/memory/SessionStore.ts:200` | HEALTHY — both `timerRegistry.setInterval` sites have paired `timerRegistry.clear` on dispose (`:242`, `:871`). |
 
 Zero missing-disposal sites found; AD4 item (4) is satisfied by this census

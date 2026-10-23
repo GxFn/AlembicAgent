@@ -22,7 +22,7 @@
       "file": "src/agent/runtime/AgentEventBus.ts",
       "accessor": "AgentEventBus.getInstance() / resetInstance()",
       "owner": "AlembicAgent window",
-      "reason": "Cross-strategy broadcast seam on the public runtime surface; resetInstance() removes all listeners and clears subscription state; max-listener bound declared (100). Agent-internal code only publishes; persistent subscriptions are host-owned lifecycles."
+      "reason": "Cross-strategy broadcast seam on the public runtime surface; resetInstance() removes all listeners (subscribe()/request() and their subscription and pending-reply state were removed in L5-P41, so EventEmitter listeners are the only per-instance state besides the event count); max-listener bound declared (100). Agent-internal code only publishes, apart from the pipeline attempt's paired on/off; persistent subscriptions are host-owned lifecycles."
     }
   ],
   "managedModuleState": [

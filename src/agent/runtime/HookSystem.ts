@@ -2,7 +2,8 @@
  * HookSystem — 可阻断的执行钩子与兼容事件桥接
  *
  * AgentRuntime 拥有调用时机；本模块负责注册、优先级、工具执行前阻断和错误诊断。
- * AgentEventBus 仍负责广播与请求回执，ToolExecutionPipeline 仍负责工具准入、执行和结果观察。
+ * AgentEventBus 仍负责广播（只经 publish 分发给监听器），ToolExecutionPipeline 仍负责工具准入、
+ * 执行和结果观察。
  *
  * 设计原则：
  *   - 类型安全：每个 HookEvent 有明确的 payload 类型
@@ -24,31 +25,19 @@ import type { AgentDiagnosticWarning, AgentProgressProcessEvent } from './AgentR
 // ── Hook Events ──
 
 /**
- * 公开钩子事件。
+ * 公开钩子事件：只列 AgentRuntime 实际分发的 7 个事件（agent:iteration:*、agent:finalize、
+ * tool:execute:*、llm:call:*）。
  *
- * 契约漂移登记（L5-P41 / I30，待决事项②）：`agent:exit`、`context:compact:before`、
- * `context:compact:after`、`exploration:phase_transition`、`exploration:budget_warning`
- * 这 5 个事件**当前运行时未发出**——AgentRuntime 只分发 agent:iteration:*、llm:call:*、
- * tool:execute:* 与 agent:finalize。订阅它们类型检查能通过，但处理器永远不会被调用。
- * ②决定前保留类型以免外部订阅方在类型层断裂；②确认收窄则删除，确认接线则在退出、压缩与
- * 阶段转换处补发。
+ * L5-P41 / I30 收窄（待决事项②按删除路线答复）：此前声明却从不分发的退出、上下文压缩与探索
+ * 阶段/预算事件已从类型与 payload 表中删除，订阅方不再能注册一个永远不会被调用的处理器。
+ * 压缩事实见 AgentDiagnostics.efficiency 的压缩计数；新增事件必须同时有真实分发点。
  */
 export type HookEvent =
   | 'agent:iteration:before'
   | 'agent:iteration:after'
-  /** 当前运行时未发出（待决事项②）；registerDefaultHooks 的 step:completed 桥接因此不会触发。 */
-  | 'agent:exit'
   | 'agent:finalize'
   | 'tool:execute:before'
   | 'tool:execute:after'
-  /** 当前运行时未发出（待决事项②）；压缩事实见 AgentDiagnostics.efficiency 的压缩计数。 */
-  | 'context:compact:before'
-  /** 当前运行时未发出（待决事项②）。 */
-  | 'context:compact:after'
-  /** 当前运行时未发出（待决事项②）。 */
-  | 'exploration:phase_transition'
-  /** 当前运行时未发出（待决事项②）。 */
-  | 'exploration:budget_warning'
   | 'llm:call:before'
   | 'llm:call:after';
 
@@ -57,8 +46,6 @@ export type HookEvent =
 export interface HookPayloadMap {
   'agent:iteration:before': { iteration: number; phase?: string };
   'agent:iteration:after': { iteration: number; hadToolCalls: boolean; hadText: boolean };
-  /** 当前运行时未发出（待决事项②）。 */
-  'agent:exit': { reason: string; iteration: number; detail?: string };
   'agent:finalize': { reply: string; iterations: number; toolCallCount: number };
   'tool:execute:before': {
     toolId: string;
@@ -73,11 +60,6 @@ export interface HookPayloadMap {
     callId: string;
     processEvent?: AgentProgressProcessEvent;
   };
-  /** 以下 4 个 payload 对应的事件当前运行时未发出（待决事项②）。 */
-  'context:compact:before': { level: number; usage: number };
-  'context:compact:after': { level: number; removed: number; usage: number };
-  'exploration:phase_transition': { from: string; to: string; iteration: number };
-  'exploration:budget_warning': { used: number; total: number; iteration: number };
   'llm:call:before': {
     iteration: number;
     toolChoice: string;
@@ -403,19 +385,8 @@ export function registerDefaultHooks(
     );
   });
 
-  // 当前是死桥接（待决事项②）：运行时从不分发 agent:exit，AgentEvents.STEP_COMPLETED 因此不会出现。
-  // ②确认收窄则连同 agent:exit 一并删除；确认接线则在退出路径补发 agent:exit 后此处自然生效。
-  hookSystem.on('agent:exit', (p) => {
-    bus.publish(
-      AgentEvents.STEP_COMPLETED,
-      {
-        reason: p.reason,
-        iteration: p.iteration,
-        detail: p.detail,
-      },
-      { source: agentId }
-    );
-  });
+  // L5-P41：原先的“退出事件 → 步骤完成”桥接是死代码（运行时从不分发退出钩子），已随事件一并删除；
+  // 默认桥接因此恰好是上面两个 llm:call 钩子。
 
   // tool:execute:before/after are NOT bridged to AgentEventBus here
   // because AgentRuntime.#processToolCalls already publishes

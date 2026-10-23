@@ -23,7 +23,7 @@ Runtime 内部按状态所有权分工，公开包入口保持不变：
 
 `shared/observers.ts` 只负责旁路观察者的同步异常与 PromiseLike 拒绝隔离，由调用方决定诊断内容。AI 管理、JSON 恢复日志、runtime 进度和工具结果通知使用同一辅助入口。通知失败不能抹掉结果、重放工具或阻断后续监听者；诊断通道自身失败也不递归报告。权限判断仍由可等待、可返回 false 的执行前 Hook 完成。
 
-EventBus 的 `publish` 使用监听快照隔离各个通道，保留 `once` 和监听器的 `this`；直接调用继承的 `emit` 仍遵守 Node 原有语义。request/reply 同步发布请求、按 correlationId 接受响应，等待期限复用 `runOperation`；reset 清理尚未完成的请求。Hook 同样使用分发快照，退订不会跳过后续阻断器；`once` 的领取状态在并发分发间共享。
+EventBus 的 `publish` 只分发给 EventEmitter 监听器（先事件名监听，再 `*` 通配），使用监听快照隔离各个通道，保留 `once` 和监听器的 `this`；直接调用继承的 `emit` 仍遵守 Node 原有语义。订阅统一用继承的 `on`/`off`；`subscribe` 与 request/reply 没有生产或宿主消费者，已删除，信封中的 `target`/`correlationId` 只随事件携带，总线不据此投递或应答。`getStats()` 只返回 `totalEvents`；reset 移除旧实例的全部监听器。Hook 同样使用分发快照，退订不会跳过后续阻断器；`once` 的领取状态在并发分发间共享。公开 Hook 事件只含运行时实际分发的 `agent:iteration:*`、`agent:finalize`、`tool:execute:*` 与 `llm:call:*`，默认桥接只把 `llm:call:*` 转发到 EventBus。
 
 开发者事件、终端 Nudge 输出、Hook 错误和新采集的生产台账共用 `utils/Redaction.ts` 处理已知凭据形态与敏感键纯量。引号内的多词值、数字值和嵌套 JSON 字符串均在对应表示层脱敏；未修改的 JSON 片段保持原始格式，换行数量保留。编码嵌套超过八层时返回可见的 `[redacted-nested-value]` 标记。送给模型的原始消息、业务工具回执和 LLM 最终回复保持原值，正常的数字 token 用量仍可观测，包括 `cacheWriteTokens`。台账 freshness 对输入使用同一脱敏规则；规则更新不改写已有台账，旧规则产物可能需要重新采集，也不声称识别所有未知凭据格式。
 

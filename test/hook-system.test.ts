@@ -20,11 +20,11 @@ import { cases, runtimeFixture, usage } from './helpers/developerRedaction.js';
 afterEach(() => vi.restoreAllMocks());
 
 describe('AgentEventBus subscriptions', () => {
-  it('delivers metadata to topic and wildcard listeners and honors unsubscribe', () => {
+  it('delivers metadata to topic and wildcard listeners and honors off', () => {
     const bus = new AgentEventBus();
     const topic = vi.fn();
     const wildcard = vi.fn();
-    const unsubscribe = bus.subscribe(AgentEvents.AGENT_CREATED, topic);
+    bus.on(AgentEvents.AGENT_CREATED, topic);
     bus.on('*', wildcard);
     bus.publish(AgentEvents.AGENT_CREATED, { agentId: 'fixture' }, { source: 'factory' });
     expect(topic).toHaveBeenCalledOnce();
@@ -34,7 +34,7 @@ describe('AgentEventBus subscriptions', () => {
       payload: { agentId: 'fixture' },
       timestamp: expect.any(Number),
     });
-    unsubscribe();
+    bus.off(AgentEvents.AGENT_CREATED, topic);
     bus.publish(AgentEvents.AGENT_CREATED);
     expect(topic).toHaveBeenCalledOnce();
     expect(wildcard).toHaveBeenCalledTimes(2);
@@ -45,17 +45,16 @@ describe('AgentEventBus subscriptions', () => {
   it.each([
     { channel: 'topic', mode: 'sync' },
     { channel: 'wildcard', mode: 'sync' },
-    { channel: 'subscription', mode: 'sync' },
     { channel: 'topic', mode: 'async' },
     { channel: 'wildcard', mode: 'async' },
-    { channel: 'subscription', mode: 'async' },
-  ])('isolates a $mode $channel observer and still delivers to later subscribers', async ({
+  ])('isolates a $mode $channel observer and still delivers to later listeners', async ({
     channel,
     mode,
   }) => {
     const bus = new AgentEventBus();
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => {});
-    const later = vi.fn();
+    const laterTopic = vi.fn();
+    const laterWildcard = vi.fn();
     const failure = new Error('fixture observer failure');
     // 测试持有拒绝 promise，RED 也不会污染进程；断言 bus 必须独立报告该拒绝。
     const rejection = Promise.reject(failure);
@@ -66,15 +65,14 @@ describe('AgentEventBus subscriptions', () => {
       }
       return rejection;
     };
-    if (channel === 'subscription') {
-      bus.subscribe('fixture', observer);
-    } else {
-      bus.on(channel === 'wildcard' ? '*' : 'fixture', observer);
-    }
-    bus.subscribe('fixture', later);
+    bus.on(channel === 'wildcard' ? '*' : 'fixture', observer);
+    // 后注册的同通道与另一通道监听器都必须照常收到事件。
+    bus.on('fixture', laterTopic);
+    bus.on('*', laterWildcard);
     expect(() => bus.publish('fixture')).not.toThrow();
     await Promise.resolve();
-    expect(later).toHaveBeenCalledOnce();
+    expect(laterTopic).toHaveBeenCalledOnce();
+    expect(laterWildcard).toHaveBeenCalledOnce();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('fixture observer failure'));
   });
 
@@ -89,19 +87,13 @@ describe('AgentEventBus subscriptions', () => {
       expect(this).toBe(bus);
       calls.push('once');
     });
-    bus.on('*', () => calls.push('wildcard'));
-    bus.subscribe('fixture', () => calls.push('subscription'));
+    bus.on('*', function (this: AgentEventBus) {
+      expect(this).toBe(bus);
+      calls.push('wildcard');
+    });
     bus.publish('fixture');
     bus.publish('fixture');
-    expect(calls).toEqual([
-      'once',
-      'topic',
-      'wildcard',
-      'subscription',
-      'topic',
-      'wildcard',
-      'subscription',
-    ]);
+    expect(calls).toEqual(['once', 'topic', 'wildcard', 'topic', 'wildcard']);
   });
 
   it('uses one listener snapshot when observers subscribe or unsubscribe during publish', () => {
@@ -109,132 +101,41 @@ describe('AgentEventBus subscriptions', () => {
     const calls: string[] = [];
     bus.once('fixture', () => {
       bus.on('*', () => calls.push('new-wildcard'));
-      bus.subscribe('fixture', () => calls.push('new-subscription'));
+      bus.on('fixture', () => calls.push('new-topic'));
     });
-    let unsubscribe = () => {};
-    unsubscribe = bus.subscribe('fixture', () => {
+    const selfUnsubscribe = () => {
       calls.push('self-unsubscribe');
-      unsubscribe();
-    });
-    bus.subscribe('fixture', () => calls.push('later'));
+      bus.off('fixture', selfUnsubscribe);
+    };
+    bus.on('fixture', selfUnsubscribe);
+    bus.on('fixture', () => calls.push('later'));
     bus.publish('fixture');
     expect(calls).toEqual(['self-unsubscribe', 'later']);
     calls.length = 0;
     bus.publish('fixture');
-    expect(calls).toEqual(['new-wildcard', 'later', 'new-subscription']);
+    expect(calls).toEqual(['later', 'new-topic', 'new-wildcard']);
   });
 
-  it('resets singleton subscriptions and generic listeners without reusing the old instance', () => {
+  it('resets singleton listeners without reusing the old instance', () => {
     AgentEventBus.resetInstance();
     try {
       const previous = AgentEventBus.getInstance();
       const listener = vi.fn();
-      previous.subscribe('fixture', listener);
+      previous.on('fixture', listener);
       previous.on('*', listener);
       expect(AgentEventBus.getInstance()).toBe(previous);
-      expect(previous.getStats().subscriptionTopics).toBe(1);
+      expect(previous.eventNames()).toEqual(['fixture', '*']);
       AgentEventBus.resetInstance();
       previous.publish('fixture');
       expect(listener).not.toHaveBeenCalled();
-      expect(AgentEventBus.getInstance()).not.toBe(previous);
-      expect(AgentEventBus.getInstance().getStats().subscriptionTopics).toBe(0);
+      expect(previous.eventNames()).toEqual([]);
+      const next = AgentEventBus.getInstance();
+      expect(next).not.toBe(previous);
+      expect(next.eventNames()).toEqual([]);
+      expect(next.getStats()).toEqual({ totalEvents: 0 });
     } finally {
       AgentEventBus.resetInstance();
     }
-  });
-});
-
-describe('AgentEventBus request/reply', () => {
-  it.each([
-    2_147_483_648,
-    Infinity,
-  ])('keeps a %s ms request alive until its reply without timer overflow', async (timeout) => {
-    vi.useFakeTimers();
-    const bus = new AgentEventBus();
-    let correlationId: string | undefined;
-    bus.subscribe('request', (event) => {
-      correlationId = String(event.correlationId);
-    });
-    const outcomes: string[] = [];
-    const pending = bus.request('request', {}, { timeout }).then(
-      (value) => {
-        outcomes.push('reply');
-        return value;
-      },
-      (error: unknown) => {
-        outcomes.push('failure');
-        return Promise.reject(error);
-      }
-    );
-    void pending.catch(() => undefined);
-    try {
-      // request 的同步发布时序属于现有合同，生命周期 helper 不能把它推迟到下一轮。
-      expect(correlationId).toEqual(expect.any(String));
-      await vi.advanceTimersByTimeAsync(10);
-      expect(outcomes).toEqual([]);
-      expect(bus.getStats().pendingReplies).toBe(1);
-      bus.publish('response', { value: 'answer' }, { correlationId });
-      await expect(pending).resolves.toMatchObject({ payload: { value: 'answer' } });
-      expect(bus.getStats().pendingReplies).toBe(0);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.clearAllTimers();
-      vi.useRealTimers();
-    }
-  });
-
-  it('releases request state and its timer when publication itself fails', async () => {
-    vi.useFakeTimers();
-    const bus = new AgentEventBus();
-    vi.spyOn(bus, 'publish').mockImplementation(() => {
-      throw new Error('fixture dispatch failure');
-    });
-    try {
-      await expect(bus.request('request', {}, { timeout: 1000 })).rejects.toThrow(
-        'fixture dispatch failure'
-      );
-      expect(bus.getStats().pendingReplies).toBe(0);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.clearAllTimers();
-      vi.useRealTimers();
-    }
-  });
-
-  it('cancels pending singleton requests and clears their timers on reset', async () => {
-    AgentEventBus.resetInstance();
-    vi.useFakeTimers();
-    const bus = AgentEventBus.getInstance();
-    const settled = bus.request('request', {}, { timeout: 1000 }).catch((error: unknown) => error);
-    try {
-      expect(bus.getStats().pendingReplies).toBe(1);
-      AgentEventBus.resetInstance();
-      expect(bus.getStats().pendingReplies).toBe(0);
-      // 允许异步生命周期在同一轮清理，不推进尚未到期的请求期限。
-      await vi.advanceTimersByTimeAsync(0);
-      expect(vi.getTimerCount()).toBe(0);
-      await expect(settled).resolves.toMatchObject({ message: expect.stringContaining('reset') });
-    } finally {
-      AgentEventBus.resetInstance();
-      vi.clearAllTimers();
-      vi.useRealTimers();
-    }
-  });
-
-  it('times out when nobody replies instead of accepting its own request', async () => {
-    const bus = new AgentEventBus();
-    await expect(bus.request('request', {}, { timeout: 5 })).rejects.toThrow(/timeout/);
-    expect(bus.getStats().pendingReplies).toBe(0);
-  });
-  it('resolves only a matching reply event', async () => {
-    const bus = new AgentEventBus();
-    bus.subscribe('request', (event) => {
-      bus.publish('response', { value: 'answer' }, { correlationId: String(event.correlationId) });
-    });
-    await expect(bus.request('request', {}, { timeout: 100 })).resolves.toMatchObject({
-      type: 'response',
-      payload: { value: 'answer' },
-    });
   });
 });
 
