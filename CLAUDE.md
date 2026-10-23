@@ -160,8 +160,10 @@ Before returning a `TargetResultEnvelope` or handoff, this child window must sel
 不再存在。
 
 - 工具契约只有一份：`src/tools/kernel/`（result envelope、decision、request、router
-  contract、call context、handler、registry 类型等）。所有消费方从这里导入，工具系统
-  内不再有 V1/V2 之分。
+  contract、call context、registry 类型等）。所有消费方从这里导入，工具系统
+  内不再有 V1/V2 之分。kernel 的 legacy handler 层（`handler.ts`）与 routing
+  service-contract 接缝（`routing.ts`）已于 2026-10-22 随 W2a-02（`9e6e62a`）删除，
+  工具执行只经 `ToolRouterContract.execute`。
 - 运行时实现位于 `src/tools/runtime/`（registry、router、handlers、adapter、cache、
   compressor、toolsets），能力目录位于 `src/tools/catalog/`。`ToolRouterAdapter`
   （`src/tools/runtime/adapter/`）把 `ToolRouter` 适配到 kernel 的 `ToolRouterContract`。
