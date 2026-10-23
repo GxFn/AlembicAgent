@@ -1107,7 +1107,8 @@ function hasReadRange(range: ReadRange): boolean {
 
 /**
  * >500 行文件 AST 大纲不可用的原因（I17）：
- * - analyzer-missing：宿主没有绑定 outlineFile 端口（也没有旧 astAnalyzer 兼容入口；当前生产宿主的主路径）；
+ * - analyzer-missing：宿主没有绑定 outlineFile 端口（当前生产宿主的主路径；旧 astAnalyzer 字段已停读，
+ *   只注入它的宿主同样落在这里）；
  * - no-definitions：analyzer 返回空结果（语言不支持或文件没有可列出的声明）；
  * - analyzer-error：analyzer 抛错，错误类名与消息进入诊断与日志，不再被吞成“不可用”。
  */
@@ -1821,50 +1822,6 @@ type AstOutlineOutcome =
   | { kind: 'unavailable'; reason: 'analyzer-missing' | 'no-definitions' }
   | { kind: 'error'; reason: 'analyzer-error'; errorName: string; errorMessage: string };
 
-/**
- * 本次调用实际使用的大纲来源（I16）：
- * - outlineFile：kernel 声明、宿主绑定的端口（宿主读源码并调用 Core analyzeFile(source, lang) 后适配）；
- * - legacy-astAnalyzer：已弃用的 analyzeFile(absPath) => { definitions } 鸭子类型，只在端口缺省时兼容调用，
- *   availability 不据此广告 code.outline；移除条件见 kernel ToolContext.astAnalyzer 的说明。
- */
-type OutlinePortName = 'outlineFile' | 'legacy-astAnalyzer';
-
-function resolveOutlinePort(
-  absPath: string,
-  relPath: string,
-  ctx: ToolContext
-): { port: OutlinePortName; run: () => Promise<unknown> } | null {
-  const outlineFile = ctx.outlineFile;
-  if (typeof outlineFile === 'function') {
-    return { port: 'outlineFile', run: async () => outlineFile(absPath, relPath) };
-  }
-  const legacy = ctx.astAnalyzer;
-  if (
-    legacy === null ||
-    (typeof legacy !== 'object' && typeof legacy !== 'function') ||
-    typeof (legacy as { analyzeFile?: unknown }).analyzeFile !== 'function'
-  ) {
-    return null;
-  }
-  const analyzeFile = (legacy as { analyzeFile: (filePath: string) => unknown }).analyzeFile;
-  return {
-    port: 'legacy-astAnalyzer',
-    run: async () => {
-      // 兼容转译：旧鸭子类型返回 { definitions }，这里取出数组交给统一的逐条校验。
-      // null/undefined 结果或缺省的 definitions 是合法的“无定义”；原始值结果（字符串、数字等）
-      // 原样交出，由 normalizeOutlineDefinitions 判为形状违约并记 warn，不在这里静默吞成 null。
-      const result = await analyzeFile.call(legacy, absPath);
-      if (result === null || result === undefined) {
-        return null;
-      }
-      if (typeof result !== 'object') {
-        return result;
-      }
-      return (result as { definitions?: unknown }).definitions ?? null;
-    },
-  };
-}
-
 /** 可选字段“给了但不合法、已按缺省处理”的逐字段计数（只统计保留下来的条目）。 */
 interface OutlineDefaultedCounts {
   endLine: number;
@@ -1987,7 +1944,9 @@ function matchesOutlineFilter(def: OutlineDefinition, filter: OutlineFilter): bo
 }
 
 /**
- * 通过宿主绑定的 outlineFile 端口（或已弃用的 astAnalyzer 兼容入口）生成文件骨架。
+ * 通过宿主绑定的 outlineFile 端口生成文件骨架（I16）：宿主读源码并调用 Core analyzeFile(source, lang)
+ * 后适配成 OutlineDefinition[]。旧 astAnalyzer.analyzeFile(absPath) 鸭子类型的兼容调用已按待决事项⑤答复
+ * 删除（W1-05），端口缺省即 analyzer-missing。
  * lineCount 由 code.read 传入（已按 splitSourceLines 计数）；code.outline 不传时按需读取一次。
  * filter 只由 code.outline 传入；过滤后为空时仍返回大纲（kind:'outline'），正文说明过滤掉了多少条。
  */
@@ -1998,21 +1957,14 @@ async function buildAstOutline(
   knownLineCount?: number,
   filter?: OutlineFilter
 ): Promise<AstOutlineOutcome> {
-  const resolvedPort = resolveOutlinePort(absPath, relPath, ctx);
-  if (!resolvedPort) {
+  const outlineFile = ctx.outlineFile;
+  if (typeof outlineFile !== 'function') {
     return { kind: 'unavailable', reason: 'analyzer-missing' };
-  }
-  if (resolvedPort.port === 'legacy-astAnalyzer') {
-    const message = `[code.outline] path=${relPath}; port=legacy-astAnalyzer (deprecated analyzeFile(absPath) duck type; bind ToolContext.outlineFile instead)`;
-    observeSafely(
-      () => Logger.getInstance().debug(message),
-      () => undefined
-    );
   }
 
   let raw: unknown;
   try {
-    raw = await resolvedPort.run();
+    raw = await outlineFile(absPath, relPath);
   } catch (err: unknown) {
     // analyzer 抛错：保留错误类名与消息，由调用方写进诊断并记 warn，不再伪装成“不可用”。
     return {
@@ -2026,13 +1978,9 @@ async function buildAstOutline(
   if (normalized.kind === 'shape-violation') {
     // 宿主契约违约（整体不是数组，例如旧 { definitions } 形状）：归类仍按 P36 决策记 no-definitions，
     // 但记 warn 带端口与形状，避免和合法的 null/[]“无定义”在结果与日志上无法区分。
-    const contract =
-      resolvedPort.port === 'outlineFile'
-        ? 'host adapter must return OutlineDefinition[] | null'
-        : 'legacy analyzeFile must resolve { definitions?: OutlineDefinition[] }';
     const message =
-      `[code.outline] path=${relPath}; port=${resolvedPort.port} returned non-array outline data ` +
-      `(${normalized.shape}); treating as no-definitions (${contract})`;
+      `[code.outline] path=${relPath}; port=outlineFile returned non-array outline data ` +
+      `(${normalized.shape}); treating as no-definitions (host adapter must return OutlineDefinition[] | null)`;
     observeSafely(
       () => Logger.getInstance().warn(message),
       () => undefined
@@ -2045,7 +1993,7 @@ async function buildAstOutline(
   if (normalized.dropped > 0) {
     // 宿主适配器给出了不合格条目：属于宿主侧缺陷，记 warn 并带计数，合格条目照常展示。
     const message =
-      `[code.outline] path=${relPath}; port=${resolvedPort.port} dropped=${normalized.dropped} of ` +
+      `[code.outline] path=${relPath}; port=outlineFile dropped=${normalized.dropped} of ` +
       `${normalized.dropped + normalized.definitions.length} malformed definitions ` +
       '(need non-empty name/kind and a positive integer startLine)';
     observeSafely(
@@ -2058,7 +2006,7 @@ async function buildAstOutline(
     // 可选字段不合法时按缺省处理（kernel 契约）：展示与过滤语义不变，但这是宿主侧缺陷的降级路径，
     // 记 warn 并按字段计数；depth 缺省为 0，会让该条目在 maxDepth 过滤里按顶层保留。
     const message =
-      `[code.outline] path=${relPath}; port=${resolvedPort.port} defaulted invalid optional fields ` +
+      `[code.outline] path=${relPath}; port=outlineFile defaulted invalid optional fields ` +
       `endLine=${defaulted.endLine} signature=${defaulted.signature} depth=${defaulted.depth} ` +
       `of ${normalized.definitions.length} definitions (endLine must be an integer >= startLine, ` +
       'signature a non-blank string, depth a non-negative integer; invalid depth falls back to ' +

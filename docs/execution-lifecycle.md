@@ -126,7 +126,7 @@ Core 已确认创建后，结果保留 `status: created`、`id`、`candidateId`�
 
 Core 当前的 `createOrStage`、`publish` 端口不接收 signal；已开始的调用要等待真实回执，取消不代表回滚。发布前的 readiness 等待可以取消，进入 publish 后则保留 Core 的实际结果。
 
-题目提交、风格修复、waiver 和拒绝统计使用稳定 `_sessionCounters`。已有顶层 `_submitTitleAttempts` 按原引用接入，预算不重置；合法的 `constructor`、`__proto__` 标题使用自有字典项计数。
+题目提交、风格修复、waiver 和拒绝统计使用稳定 `_sessionCounters`。按标题的提交尝试次数只记在盒内 `_submitTitleAttempts`；`sharedState` 顶层的同名旧别名不再读取或回写，残留值不参与同题止损；合法的 `constructor`、`__proto__` 标题使用自有字典项计数。
 
 ## 验证入口
 

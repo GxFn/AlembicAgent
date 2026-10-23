@@ -357,7 +357,8 @@ interface RescanContextLike {
  * @param [episodicMemory] SessionStore 实例 (v4.0 增强上下文)
  * @param [semanticMemory] PersistentMemory 实例 (v4.1 历史记忆)
  * @param [_codeEntityGraph] 已停用的参数位（原 §9 代码实体图谱端口）。只为保持后续位置参数不移位而保留，
- *   任何传入值都不会被读取或调用；宿主的 codeEntityGraph 只作为 graph 工具端口注入工具上下文。
+ *   任何传入值都不会被读取或调用；宿主的 codeEntityGraph 只作为 graph 工具端口注入工具上下文，
+ *   graph handler 只读它的 impactAnalysis（graph.query type=impact；旧宿主读取器已随 W1-05 删除）。
  * @param [rescanContext] Rescan 已有知识上下文 (增量扫描时注入)
  * @param [panorama] 全景上下文 — 模块角色/层级/耦合/空白区 (Phase 1.8)
  * @param [evidenceStarters] Phase 1-4 证据启发 — 维度级分析起点

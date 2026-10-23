@@ -158,8 +158,9 @@ export interface ToolContext {
   projectGraph?: unknown;
 
   /**
-   * 代码实体图谱。唯一生产宿主只提供 impactAnalysis；queryEntity/queryCallGraph/search 是
-   * GRAPH_QUERY_HOST_READERS 中标为 legacy 的旧宿主兼容入口（已弃用，移除条件见该常量）。
+   * 代码实体图谱。graph handler 只经 GRAPH_QUERY_HOST_READERS 读取它的 impactAnalysis（graph.query
+   * type=impact），与唯一生产宿主的 ProjectGraphPorts 一致；旧宿主的实体查询、调用图与搜索方法已按
+   * 待决事项③答复删除，即使注入也不会被读取或广告。
    */
   codeEntityGraph?: unknown;
 
@@ -169,7 +170,10 @@ export interface ToolContext {
   /** 知识提交网关 — knowledge handler 内部 cast 为 RecipeGatewayLike */
   recipeGateway?: unknown;
 
-  /** 显式知识读取端口；提供后即不再回落 knowledgeRepo。 */
+  /**
+   * 显式知识读取端口。knowledge.prime 只认它（缺省且也没有 knowledgeRepo 时做 search-only）；
+   * knowledge.detail 提供它后即不再回落 knowledgeRepo。
+   */
   knowledgeRead?: KnowledgeReadPort;
 
   /** 显式知识管理端口；缺少具体方法必须报告不可用，不回落原始仓储。 */
@@ -177,9 +181,11 @@ export interface ToolContext {
 
   /**
    * 旧宿主兼容入口；仅对应的显式端口未提供时使用，不能冒充 Core 管理服务。
-   * knowledge.prime/detail 在 knowledgeRead 缺省时回落到这里，两者都缺时 prime 只做 search-only
-   * （带 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断）。唯一生产宿主通过 knowledgeRead 提供详情、不注入本字段；
-   * 待决事项③确认单宿主后，prime 改为强制要求 knowledgeRead。
+   * knowledge.detail 在 knowledgeRead 缺省时回落到这里，knowledge.manage 在 knowledgeManagement 缺省时
+   * 回落到这里（这两处回落不在 W1-05 范围内）。knowledge.prime 按待决事项③答复只认 knowledgeRead：
+   * 只注入本字段时 prime 报 KNOWLEDGE_READ_PORT_UNAVAILABLE 且不调用它；两者都缺时 prime 只做
+   * search-only（带 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断，去留属 W2b）。唯一生产宿主通过 knowledgeRead
+   * 提供详情、不注入本字段。
    */
   knowledgeRepo?: unknown;
 
@@ -190,10 +196,10 @@ export interface ToolContext {
   proposalGateway?: unknown;
 
   /**
-   * AST 大纲端口（L4-P36 / I16）。全局待决事项⑤（严格契约库归属）仍未答复；本端口按用户批准的
-   * L4-P36 推荐方向（Agent 声明端口、宿主适配）先落地 Agent 侧，宿主 outlineFile 适配待总控跨仓派发。
-   * code.outline 与 >500 行 code.read 的骨架优先经由这里取得（下方 astAnalyzer 只是缺省时的已弃用
-   * 兼容入口）；availability 只按本端口广告 code.outline。
+   * AST 大纲端口（L4-P36 / I16）。全局待决事项⑤已答复（2026-10-20，按推荐：Agent 声明端口、宿主适配，
+   * Core 不新增端口）；宿主 outlineFile 适配待总控跨仓派发。code.outline 与 >500 行 code.read 的骨架
+   * 只经由这里取得；未绑定时 code.outline 报不可用、code.read 降为头尾预览（带 code_read_outline_fallback
+   * 诊断）。availability 只按本端口广告 code.outline。
    *
    * - absPath 是已通过项目根校验的绝对路径，relPath 是项目相对路径（用于按扩展名映射语言与日志）；
    * - 宿主负责读源码、按扩展名映射 lang、调用 Core analyzeFile(source, lang)，再把类/方法等适配成
@@ -205,12 +211,12 @@ export interface ToolContext {
   outlineFile?: (absPath: string, relPath: string) => Promise<OutlineDefinition[] | null>;
 
   /**
-   * 已弃用的 AST 分析器鸭子类型 analyzeFile(absPath) => Promise<{ definitions }>（I16）。
-   * 它与 Core analyzeFile(source, lang) 的真实签名不一致，生产宿主也从未注册，所以 availability
-   * 不再据此广告 code.outline；handler 只在 outlineFile 缺省时把它当兼容入口调用并记日志。
-   * 消费者：仍按旧鸭子类型注入的宿主/测试夹具（唯一生产宿主 ToolContextFactory 透传 tryGet 结果，
-   * 实际恒为 undefined）。移除条件：宿主改为注册 outlineFile 并停止透传本字段后，删除本字段与
-   * code handler 的 legacy-astAnalyzer 分支（类型收窄待全局待决事项⑤答复后收尾，由 AlembicAgent 负责）。
+   * 已弃用、已停读的 AST 分析器字段（I16）。旧鸭子类型 analyzeFile(absPath) 与 Core
+   * analyzeFile(source, lang) 的真实签名不一致，生产宿主也从未注册；按待决事项⑤答复，code handler
+   * 已删除对它的兼容调用（W1-05），availability 也不据此广告 code.outline，注入任何值都不会被读取。
+   * 字段只为类型兼容保留：唯一生产宿主 ToolContextFactory 仍透传 tryGet('astAnalyzer') 的结果（生产中
+   * 恒为 undefined）。删除条件：宿主停止透传本字段（并改为注册 outlineFile）后，在 W2c 删除本字段，
+   * 由 AlembicAgent 负责。
    */
   astAnalyzer?: unknown;
 
@@ -428,95 +434,50 @@ export type GraphQueryType =
   | 'hierarchy'
   | 'callers'
   | 'callees'
-  | 'overrides'
-  | 'extensions'
   | 'impact'
   | 'search';
 
-/** 某个 query type 的一条宿主读取路径。 */
+/** 某个 query type 唯一的宿主读取路径。 */
 export interface GraphQueryHostReader {
   readonly port: GraphHostPort;
   readonly method: string;
   /** 按 (entity, limit) 组装宿主方法实参；实参形状属于宿主端口契约，不随 handler 改写。 */
   readonly args: (entity: string, limit: number) => unknown[];
-  /** 旧宿主兼容入口（已弃用 deprecated）：唯一生产宿主不提供该方法，见下方常量的移除条件。 */
-  readonly legacy?: true;
 }
 
-function graphReaders(...readers: GraphQueryHostReader[]): readonly GraphQueryHostReader[] {
-  return Object.freeze(readers.map((reader) => Object.freeze(reader)));
+function graphReader(reader: GraphQueryHostReader): GraphQueryHostReader {
+  return Object.freeze(reader);
 }
 
 const entityOnly = (entity: string): unknown[] => [entity];
 const entityAndLimit = (entity: string, limit: number): unknown[] => [entity, limit];
 
 /**
- * graph.query 的“query type → 宿主方法”单一来源，数组顺序即读取优先级：handler 依次读取，
- * 前一条缺失或返回空时才进入下一条，并记 GRAPH_QUERY_FALLBACK；availability 只要任一条的方法在场
- * 就广告该分支。此前 graph handler 与 availability 各抄一份方法名，需要手工同步。
+ * graph.query 的“query type → 宿主方法”单一来源：每个 type 恰好一个读取器，graph handler 只调它，
+ * 缺失即报端口不可用，没有备用读取器，也就没有回退；availability 按同一条判定是否广告该分支。
+ * 此前 graph handler 与 availability 各抄一份方法名，需要手工同步。
  * test/tool-runtime-legacy-host-compat.test.ts 守护本表与 runtime registry 枚举一致、两处消费方都从这里派生。
  *
- * legacy 条目是旧宿主兼容入口（待决事项③未答复，暂不删除，只标注）：
- * - 消费者：未迁移到 ProjectGraphPorts 形态的旧宿主与测试替身（tool-system、tool-availability 等测试的
- *   全接线替身）。唯一生产宿主 ../Alembic 的 ProjectGraphPorts 只提供 getOverview/getClassInfo/
- *   getProtocolInfo/getClassHierarchy/getCallers/getCallees/searchEntities 与 impactAnalysis，所以
- *   availability 在生产中隐藏 overrides/extensions，class/callers/callees/search 只走主读取器。
- * - 移除条件：待决事项③确认 ../Alembic 是唯一宿主后，删除全部 legacy 条目，并把只剩 legacy 读取器的
- *   overrides/extensions 从本表、GraphQueryType 与 runtime registry 枚举一并去掉（模型可见 schema 收窄），
- *   同步改写依赖旧端口的测试替身。
+ * 表中读取器全部来自唯一生产宿主 ../Alembic 的 ProjectGraphPorts（projectGraph 的
+ * getClassInfo/getProtocolInfo/getClassHierarchy/getCallers/getCallees/searchEntities 与 codeEntityGraph
+ * 的 impactAnalysis）。待决事项③（2026-10-20 答复：../Alembic 是唯一宿主）落地后已删除旧宿主兼容读取器
+ * （codeEntityGraph.queryEntity/queryCallGraph/search 备用位，以及只有旧读取器的 overrides/extensions），
+ * 同时删除 GRAPH_QUERY_LEGACY_READER/GRAPH_QUERY_FALLBACK 两个诊断码；新增 query type 须先有宿主端口。
  */
-export const GRAPH_QUERY_HOST_READERS: Readonly<
-  Record<GraphQueryType, readonly GraphQueryHostReader[]>
-> = Object.freeze({
-  class: graphReaders(
-    { port: 'projectGraph', method: 'getClassInfo', args: entityOnly },
-    {
+export const GRAPH_QUERY_HOST_READERS: Readonly<Record<GraphQueryType, GraphQueryHostReader>> =
+  Object.freeze({
+    class: graphReader({ port: 'projectGraph', method: 'getClassInfo', args: entityOnly }),
+    protocol: graphReader({ port: 'projectGraph', method: 'getProtocolInfo', args: entityOnly }),
+    hierarchy: graphReader({ port: 'projectGraph', method: 'getClassHierarchy', args: entityOnly }),
+    callers: graphReader({ port: 'projectGraph', method: 'getCallers', args: entityAndLimit }),
+    callees: graphReader({ port: 'projectGraph', method: 'getCallees', args: entityAndLimit }),
+    impact: graphReader({
       port: 'codeEntityGraph',
-      method: 'queryEntity',
-      args: (entity) => [entity, 'class'],
-      legacy: true,
-    }
-  ),
-  protocol: graphReaders({ port: 'projectGraph', method: 'getProtocolInfo', args: entityOnly }),
-  hierarchy: graphReaders({ port: 'projectGraph', method: 'getClassHierarchy', args: entityOnly }),
-  callers: graphReaders(
-    { port: 'projectGraph', method: 'getCallers', args: entityAndLimit },
-    {
-      port: 'codeEntityGraph',
-      method: 'queryCallGraph',
-      args: (entity, limit) => [entity, 'callers', limit],
-      legacy: true,
-    }
-  ),
-  callees: graphReaders(
-    { port: 'projectGraph', method: 'getCallees', args: entityAndLimit },
-    {
-      port: 'codeEntityGraph',
-      method: 'queryCallGraph',
-      args: (entity, limit) => [entity, 'callees', limit],
-      legacy: true,
-    }
-  ),
-  overrides: graphReaders({
-    port: 'projectGraph',
-    method: 'getMethodOverrides',
-    args: entityOnly,
-    legacy: true,
-  }),
-  extensions: graphReaders({
-    port: 'projectGraph',
-    method: 'getCategoryMap',
-    args: entityOnly,
-    legacy: true,
-  }),
-  impact: graphReaders({ port: 'codeEntityGraph', method: 'impactAnalysis', args: entityAndLimit }),
-  // 与 class/callers/callees 一致：项目图优先。生产宿主的实体图只有 impactAnalysis，若实体图在前，
-  // 每次 search 都会被诊断为 primary-unavailable 回退。
-  search: graphReaders(
-    { port: 'projectGraph', method: 'searchEntities', args: entityAndLimit },
-    { port: 'codeEntityGraph', method: 'search', args: entityAndLimit, legacy: true }
-  ),
-});
+      method: 'impactAnalysis',
+      args: entityAndLimit,
+    }),
+    search: graphReader({ port: 'projectGraph', method: 'searchEntities', args: entityAndLimit }),
+  });
 
 /* ------------------------------------------------------------------ */
 /*  DI 接口 (Lightweight)                                              */

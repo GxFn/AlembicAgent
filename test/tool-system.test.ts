@@ -1093,50 +1093,38 @@ describe('graph and plan host outcomes', () => {
     'callers',
     'callees',
     'search',
-  ] as const)('awaits the primary %s query before using its fallback', async (type) => {
+  ] as const)('awaits the %s reader and reports its empty answer without any fallback', async (type) => {
     const primaryName = {
       class: 'getClassInfo',
       callers: 'getCallers',
       callees: 'getCallees',
       search: 'searchEntities',
     }[type];
-    const secondaryName = {
+    // W1-05：实体图的旧宿主读取器已删除，即使注入也不再作为备用位被调用。
+    const retiredName = {
       class: 'queryEntity',
       callers: 'queryCallGraph',
       callees: 'queryCallGraph',
       search: 'search',
     }[type];
-    const fallback = vi.fn(async () => ({ name: 'Fixture', found: true }));
+    const primary = vi.fn(async () => null);
+    const retired = vi.fn(async () => ({ name: 'Fixture', found: true }));
     const result = await execute(
       {
-        // search 与 class/call graph 一致：项目图优先，实体图只是旧宿主形态的备用端口。
-        projectGraph: { [primaryName]: async () => null },
-        codeEntityGraph: { [secondaryName]: fallback },
+        projectGraph: { [primaryName]: primary },
+        codeEntityGraph: { [retiredName]: retired },
       },
       'graph',
       { action: 'query', params: { type, entity: 'Fixture' } }
     );
-    expect(fallback).toHaveBeenCalledOnce();
+    expect(primary).toHaveBeenCalledOnce();
+    expect(retired).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: true,
-      structuredContent: { result: { found: true } },
-      diagnostics: { fallbackUsed: true },
+      structuredContent: { type, entity: 'Fixture', message: 'No results found' },
+      diagnostics: { fallbackUsed: false },
     });
-    expect(result.diagnostics.warnings).toEqual([
-      expect.objectContaining({
-        code: 'GRAPH_QUERY_FALLBACK',
-        stage: `query(${type})`,
-        message: `path=codeEntityGraph.${secondaryName}; reason=primary-returned-no-result`,
-      }),
-      // 备用读取器都是旧宿主兼容入口：回退之外另记 legacy 痕迹，供待决事项③核对旧宿主。
-      expect.objectContaining({
-        code: 'GRAPH_QUERY_LEGACY_READER',
-        stage: `query(${type})`,
-        message: expect.stringContaining(
-          `path=codeEntityGraph.${secondaryName}; reason=legacy-host-port`
-        ),
-      }),
-    ]);
+    expect(result.diagnostics.warnings).toEqual([]);
   });
 
   it('reads graph search from the project graph without a fallback on the production host shape', async () => {
@@ -1161,16 +1149,16 @@ describe('graph and plan host outcomes', () => {
     expect(result.diagnostics.warnings).toEqual([]);
   });
 
-  it('prefers the project graph search over the legacy entity graph search when both are wired', async () => {
+  it('reads graph search from the project graph and never from the retired entity graph search', async () => {
     const searchEntities = vi.fn(() => ({ results: [{ name: 'FromProjectGraph' }] }));
-    const legacySearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
+    const retiredSearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
     const result = await execute(
-      { projectGraph: { searchEntities }, codeEntityGraph: { search: legacySearch } },
+      { projectGraph: { searchEntities }, codeEntityGraph: { search: retiredSearch } },
       'graph',
       { action: 'query', params: { type: 'search', entity: 'Fixture' } }
     );
     expect(searchEntities).toHaveBeenCalledOnce();
-    expect(legacySearch).not.toHaveBeenCalled();
+    expect(retiredSearch).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       ok: true,
       structuredContent: { result: { results: [{ name: 'FromProjectGraph' }] } },
@@ -1179,32 +1167,19 @@ describe('graph and plan host outcomes', () => {
     expect(result.diagnostics.warnings).toEqual([]);
   });
 
-  it('keeps the legacy entity graph search reachable and reports it as a fallback', async () => {
-    // 旧宿主备用端口暂不删除（留待单宿主假设决定）；只有它可用时仍可查询，并如实标记主端口缺失。
-    const legacySearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
+  it('reports search as unavailable when only the retired entity graph search is wired', async () => {
+    // W1-05：旧宿主备用端口已删除；只有它在场时 search 如实报端口不可用，不再经它查询。
+    const retiredSearch = vi.fn(() => ({ results: [{ name: 'FromEntityGraph' }] }));
     const result = await execute(
-      { projectGraph: {}, codeEntityGraph: { search: legacySearch } },
+      { projectGraph: {}, codeEntityGraph: { search: retiredSearch } },
       'graph',
       { action: 'query', params: { type: 'search', entity: 'Fixture' } }
     );
-    expect(legacySearch).toHaveBeenCalledExactlyOnceWith('Fixture', 20);
-    expect(result).toMatchObject({
-      ok: true,
-      structuredContent: { result: { results: [{ name: 'FromEntityGraph' }] } },
-      diagnostics: { fallbackUsed: true },
-    });
-    expect(result.diagnostics.warnings).toEqual([
-      expect.objectContaining({
-        code: 'GRAPH_QUERY_FALLBACK',
-        stage: 'query(search)',
-        message: 'path=codeEntityGraph.search; reason=primary-unavailable',
-      }),
-      expect.objectContaining({
-        code: 'GRAPH_QUERY_LEGACY_READER',
-        stage: 'query(search)',
-        message: expect.stringContaining('path=codeEntityGraph.search; reason=legacy-host-port'),
-      }),
-    ]);
+    expect(retiredSearch).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, status: 'error' });
+    expect(result.text).toContain('Graph query(search) host method is not available');
+    expect(result.diagnostics.fallbackUsed).toBe(false);
+    expect(result.diagnostics.warnings).toEqual([]);
   });
 
   it('distinguishes an unavailable graph method from a valid empty query', async () => {
@@ -1215,7 +1190,7 @@ describe('graph and plan host outcomes', () => {
     ).toBe(true);
   });
 
-  it('finishes a canceled uncooperative read without starting a later fallback', async () => {
+  it('finishes a canceled uncooperative read without reaching the retired legacy port', async () => {
     const controller = new AbortController();
     let start!: () => void;
     const entered = new Promise<void>((resolve) => {
@@ -1225,7 +1200,7 @@ describe('graph and plan host outcomes', () => {
     const pending = new Promise<null>((resolve) => {
       finish = resolve;
     });
-    const fallback = vi.fn(() => ({ found: true }));
+    const retired = vi.fn(() => ({ found: true }));
     const result = execute(
       {
         projectGraph: {
@@ -1234,7 +1209,7 @@ describe('graph and plan host outcomes', () => {
             return pending;
           },
         },
-        codeEntityGraph: { queryEntity: fallback },
+        codeEntityGraph: { queryEntity: retired },
       },
       'graph',
       { action: 'query', params: { type: 'class', entity: 'Fixture' } },
@@ -1256,7 +1231,7 @@ describe('graph and plan host outcomes', () => {
       finish(null);
       await result;
     }
-    expect(fallback).not.toHaveBeenCalled();
+    expect(retired).not.toHaveBeenCalled();
   });
 
   it('reports whether a plan was actually persisted to its optional session store', async () => {

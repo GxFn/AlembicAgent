@@ -1477,7 +1477,8 @@ describe('Agent Recipe production profile adapter', () => {
     expect(base).not.toHaveProperty('_submitTitleAttempts');
     for (const projection of projections) {
       expect(projection._sessionCounters).toBe(counters);
-      expect(projection._submitTitleAttempts).toBe(counters._submitTitleAttempts);
+      // W1-05：计数只在盒内，顶层同名别名不再被回写。
+      expect(projection).not.toHaveProperty('_submitTitleAttempts');
     }
   });
 
@@ -1486,12 +1487,11 @@ describe('Agent Recipe production profile adapter', () => {
     '__proto__',
   ])('counts the prototype-shaped title %s using its own session entries', async (title) => {
     const projectRoot = makeProject();
-    // 覆盖旧宿主普通字典；不能只让新建的 null-prototype 字典正确。
+    // 覆盖盒内预建的普通字典；不能只让新建的 null-prototype 字典正确。
+    const titleAttempts: Record<string, number> = {};
     const sharedState = {
-      _submitTitleAttempts: {},
-      _sessionCounters: { _styleRepairAttempts: {} },
+      _sessionCounters: { _submitTitleAttempts: titleAttempts, _styleRepairAttempts: {} },
     };
-    const legacyAttempts = sharedState._submitTitleAttempts;
     const chat = vi.fn(async () => 'not repair JSON');
     const fake = fakePort(readyReport);
     const submit = () =>
@@ -1512,30 +1512,58 @@ describe('Agent Recipe production profile adapter', () => {
     expect(fourth.error).toContain('已尝试 3 次');
     expect(fake.calls).toHaveLength(3);
     expect(chat).toHaveBeenCalledTimes(2);
-    expect(Object.hasOwn(sharedState._submitTitleAttempts, title)).toBe(true);
+    expect(Object.hasOwn(titleAttempts, title)).toBe(true);
     expect(Object.hasOwn(sharedState._sessionCounters._styleRepairAttempts, title)).toBe(true);
-    expect(sharedState._submitTitleAttempts).toBe(legacyAttempts);
-    expect((sharedState._sessionCounters as Record<string, unknown>)._submitTitleAttempts).toBe(
-      legacyAttempts
-    );
+    expect(sharedState._sessionCounters._submitTitleAttempts).toBe(titleAttempts);
+    expect(sharedState).not.toHaveProperty('_submitTitleAttempts');
   });
 
-  // I23（待决事项③未答复）：顶层别名是旧宿主兼容通道，暂不删除；被接入计数盒时必须留日志，
-  // 事后据此核对是否真有宿主预写顶层字典。盒内已有字典（生产形态）时不走兼容通道、不记日志。
-  test.each([
-    { shape: 'legacy top-level dictionary only', boxed: false, expectedLogs: 1 },
-    { shape: 'session counter box already owns the dictionary', boxed: true, expectedLogs: 0 },
-  ])('logs the legacy _submitTitleAttempts alias adoption only for the $shape shape', async ({
-    boxed,
-    expectedLogs,
-  }) => {
+  // I23（W1-05，待决事项③答复后）：sharedState 顶层 _submitTitleAttempts 别名已删除。顶层残留的计数
+  // 不再被接入计数盒、不触发同题硬止损，也不被回写或记兼容日志；计数只属于 _sessionCounters 盒。
+  test('ignores a top-level _submitTitleAttempts dictionary for the hard stop-loss', async () => {
     const projectRoot = makeProject();
-    const attempts: Record<string, number> = {};
-    const sharedState: Record<string, unknown> = boxed
-      ? { _sessionCounters: { _submitTitleAttempts: attempts } }
-      : { _submitTitleAttempts: attempts, _sessionCounters: {} };
+    const params = submitParams({ doClause: 'ImportType is needed for type-only dependencies.' });
+    const title = String((params as { title?: unknown }).title ?? '').trim();
+    // 顶层残留已到止损阈值；若仍按别名接入，本次提交会被硬止损拒绝。
+    const topLevel: Record<string, number> = { [title]: 3 };
+    const sharedState: Record<string, unknown> = {
+      _submitTitleAttempts: topLevel,
+      _sessionCounters: {},
+    };
     const logger = Logger.getInstance();
     const info = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const chat = vi.fn(async () => 'not repair JSON');
+    const fake = fakePort(readyReport);
+    try {
+      const result = await handleKnowledge('submit', params, {
+        projectRoot,
+        recipeGateway: fake.port,
+        runtime: { sharedState, aiProvider: { chat } },
+      } as never);
+      expect(title).not.toBe('');
+      expect(result.ok).toBe(true);
+      expect(result.error ?? '').not.toContain('已尝试');
+      expect(fake.calls).toHaveLength(1);
+      // 盒内新建自己的字典并只计这一次；顶层字典原样保留，不被接入、递增或回写。
+      const box = sharedState._sessionCounters as Record<string, unknown>;
+      expect(box._submitTitleAttempts).not.toBe(topLevel);
+      expect(box._submitTitleAttempts).toEqual({ [title]: 1 });
+      expect(sharedState._submitTitleAttempts).toBe(topLevel);
+      expect(topLevel).toEqual({ [title]: 3 });
+      expect(
+        info.mock.calls
+          .map(([message]) => String(message))
+          .filter((message) => message.includes('_submitTitleAttempts'))
+      ).toEqual([]);
+    } finally {
+      info.mockRestore();
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps the title attempt count only inside the session counter box', async () => {
+    const projectRoot = makeProject();
+    const sharedState: Record<string, unknown> = { _sessionCounters: {} };
     const chat = vi.fn(async () => 'not repair JSON');
     const fake = fakePort(readyReport);
     try {
@@ -1550,19 +1578,11 @@ describe('Agent Recipe production profile adapter', () => {
           } as never
         );
       }
-      const adoptions = info.mock.calls
-        .map(([message]) => String(message))
-        .filter((message) => message.includes('legacy top-level sharedState._submitTitleAttempts'));
-      expect(adoptions).toHaveLength(expectedLogs);
-      if (expectedLogs > 0) {
-        expect(adoptions[0]).toContain('compat alias');
-      }
-      // 计数语义不变：两种形态都共用同一份字典并累计两次尝试。
       const box = sharedState._sessionCounters as Record<string, unknown>;
-      expect(box._submitTitleAttempts).toBe(attempts);
-      expect(Object.values(attempts)).toEqual([2]);
+      expect(Object.values(box._submitTitleAttempts as Record<string, number>)).toEqual([2]);
+      // 提交后顶层没有该键：agent 不再回写兼容别名。
+      expect(Object.hasOwn(sharedState, '_submitTitleAttempts')).toBe(false);
     } finally {
-      info.mockRestore();
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   });

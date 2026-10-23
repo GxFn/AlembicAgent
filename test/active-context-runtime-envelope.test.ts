@@ -9,7 +9,11 @@ import type {
 } from '../src/agent/runtime/toolPipeline/contracts.js';
 import { executeRuntimeToolCall } from '../src/agent/runtime/toolPipeline/runtimeBridge.js';
 import { estimateTokens } from '../src/shared/tokenUtils.js';
-import { isToolResultEnvelope, type ToolResultEnvelope } from '../src/tools/kernel/index.js';
+import {
+  isToolResultEnvelope,
+  type ToolContext,
+  type ToolResultEnvelope,
+} from '../src/tools/kernel/index.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import { DeltaCache } from '../src/tools/runtime/cache/DeltaCache.js';
 import { createTempProject } from './helpers/tempProject.js';
@@ -48,7 +52,7 @@ interface BridgeOptions {
   graph?: unknown;
   codeEntityGraph?: unknown;
   deltaCache?: DeltaCache;
-  astAnalyzer?: unknown;
+  outlineFile?: ToolContext['outlineFile'];
 }
 
 /** 同一个适配器服务一组调用：DeltaCache 等跨调用状态与生产会话一致。 */
@@ -61,7 +65,7 @@ function createBridge(root: string, options: BridgeOptions = {}) {
         projectGraph: options.graph ?? projectGraph,
         ...(options.codeEntityGraph ? { codeEntityGraph: options.codeEntityGraph } : {}),
         ...(options.deltaCache ? { deltaCache: options.deltaCache } : {}),
-        ...(options.astAnalyzer ? { astAnalyzer: options.astAnalyzer } : {}),
+        ...(options.outlineFile ? { outlineFile: options.outlineFile } : {}),
       }),
     },
   });
@@ -264,22 +268,19 @@ describe('ActiveContext summaries of production payload shapes (L6-P10a)', () =>
     writeFileSync(path.join(root, 'src', 'big.ts'), source.join('\n'));
     const args = readArgs({ path: 'src/big.ts' });
 
-    // 宿主没有 AST 分析器：handler 退回头尾预览（约 52 行展示内容）。
+    // 宿主没有绑定 AST 大纲端口：handler 退回头尾预览（约 52 行展示内容）。
     const preview = await createBridge(root)('code', args);
     expect(preview.ok).toBe(true);
     expect(String(preview.structuredContent)).toMatch(
       /^\/\/ src\/big\.ts — 800 lines \(showing head \+ tail\)/
     );
-    // 宿主注入 AST 分析器：handler 返回大纲，总行数只出现在结尾标记里。
-    const astAnalyzer = {
-      analyzeFile: async () => ({
-        definitions: [
-          { name: 'v0', kind: 'variable', startLine: 1, endLine: 1, depth: 0 },
-          { name: 'v799', kind: 'variable', startLine: 800, endLine: 800, depth: 0 },
-        ],
-      }),
-    };
-    const outline = await createBridge(root, { astAnalyzer })('code', args);
+    // 宿主绑定 outlineFile 端口（W1-05：旧 astAnalyzer 鸭子类型已停读）：handler 返回大纲，
+    // 总行数只出现在结尾标记里。
+    const outlineFile = async () => [
+      { name: 'v0', kind: 'variable', startLine: 1, endLine: 1, depth: 0 },
+      { name: 'v799', kind: 'variable', startLine: 800, endLine: 800, depth: 0 },
+    ];
+    const outline = await createBridge(root, { outlineFile })('code', args);
     expect(outline.ok).toBe(true);
     expect(String(outline.structuredContent)).toMatch(/File has 800 lines\. Showing outline\./);
 

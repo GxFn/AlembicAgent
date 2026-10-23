@@ -52,7 +52,7 @@ readiness/review-queue是可取消读取；已经发出的Core管理写入继续
 
 Agent优先使用对应显式端口。只有该字段为`undefined`时才使用旧`knowledgeRepo`兼容入口；显式对象缺方法或运行时误注入`null`都不能回落原始仓储。缺能力返回`KNOWLEDGE_READ_PORT_UNAVAILABLE`或`KNOWLEDGE_MANAGEMENT_PORT_UNAVAILABLE`，带所选port和method。旧字段保留给尚未迁移的宿主；各宿主完成迁移并通过消费扫描与真实入口回归后，才能另行评估退役。
 
-`knowledge.prime`在完全未提供读取端口时仍可只返回搜索摘要。提供的端口必须有可调用的`getById`；详情增强抛错时保留搜索结果并标记降级诊断，不调用旧仓储掩盖错误。`knowledge.detail`的读取失败和未找到仍是明确失败。
+`knowledge.prime`只认`knowledgeRead`：只注入旧`knowledgeRepo`时返回`KNOWLEDGE_READ_PORT_UNAVAILABLE`且不调用它；两者都未提供时仍可只返回搜索摘要。提供的`knowledgeRead`必须有可调用的`getById`；详情增强抛错时保留搜索结果并标记降级诊断，不调用旧仓储掩盖错误。`knowledge.detail`的读取失败和未找到仍是明确失败。
 
 宿主adapter应把读取映射到Core读取入口并转成DTO；内容更新/拒绝调用已配置的KnowledgeService，可信用户/会话上下文由宿主绑定。管理方法正常resolve表示该次调用已完成，失败须reject；validate返回值原样投影。评分和验证须连接真正拥有该能力的服务，不能按方法名猜测替代操作。原始repository的`findById`与端口`getById`不同，repository的`update`也不等价于受控服务更新。Agent不生成替代数据库或虚构缺失实现。
 

@@ -8,7 +8,8 @@
  *   - 系统提示删去 codeEntityGraph（保留 panorama / projectInfo / sessionStore）；
  *   - buildAnalystPrompt 第 6 个参数位置保留、类型放宽为 unknown，传入任何值都不调用、不注入；
  *   - §6 之前的 prompt-build-aborted 取消短路诊断保留。
- * graph 工具的 codeEntityGraph 端口（kernel registry 的 graph.query 读取表）不受影响。
+ * graph 工具的 codeEntityGraph 端口（kernel registry 的 graph.query 读取表）不受影响；W1-05 起它在读取表中
+ * 只承担 impact 一条读取路径（生产宿主形态的 impactAnalysis），旧宿主读取器已删除。
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
@@ -66,12 +67,11 @@ describe('insight analyst without the §9 code entity graph section (W1-04 / C56
   });
 
   it('ignores the host graph tool port passed into the prompt builder', async () => {
-    const toolPort = { queryEntity: vi.fn(), impactAnalysis: vi.fn(), search: vi.fn() };
+    // 生产宿主形态的实体图端口只有 impactAnalysis（W1-05 起读取表只读这一条）。
+    const toolPort = { impactAnalysis: vi.fn() };
     const { prompt, diagnostics } = await build(toolPort);
 
-    expect(toolPort.queryEntity).not.toHaveBeenCalled();
     expect(toolPort.impactAnalysis).not.toHaveBeenCalled();
-    expect(toolPort.search).not.toHaveBeenCalled();
     expect(prompt).not.toContain(GRAPH_HINT);
     expect(diagnostics).toEqual([]);
   });
@@ -101,10 +101,10 @@ describe('insight analyst without the §9 code entity graph section (W1-04 / C56
   });
 
   it('keeps the graph tool codeEntityGraph host port intact', () => {
-    const ports = Object.values(GRAPH_QUERY_HOST_READERS).flatMap((readers) =>
-      readers.map((reader) => reader.port)
-    );
-    expect(ports).toContain('codeEntityGraph');
+    expect(GRAPH_QUERY_HOST_READERS.impact).toMatchObject({
+      port: 'codeEntityGraph',
+      method: 'impactAnalysis',
+    });
   });
 
   it('reports the prompt-build abort short-circuit before session context', async () => {

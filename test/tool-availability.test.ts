@@ -831,16 +831,10 @@ function fullyWiredContext(): ToolAvailabilityContext {
       getClassHierarchy: method,
       getCallers: method,
       getCallees: method,
-      getMethodOverrides: method,
-      getCategoryMap: method,
       searchEntities: method,
     },
-    codeEntityGraph: {
-      queryEntity: method,
-      queryCallGraph: method,
-      impactAnalysis: method,
-      search: method,
-    },
+    // W1-05：graph.query 每个 type 只有一个生产宿主读取器；实体图只读 impactAnalysis。
+    codeEntityGraph: { impactAnalysis: method },
     knowledgeRead: { getById: method } as unknown as ToolContext['knowledgeRead'],
     knowledgeManagement: { update: method, reject: method, score: method, validate: method },
     searchEngine: { search: method },

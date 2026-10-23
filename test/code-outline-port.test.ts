@@ -3,9 +3,11 @@
  *
  * - kernel 的 ToolContext.outlineFile(absPath, relPath) 是宿主绑定的 AST 大纲端口（宿主读源码、映射语言、
  *   调 Core analyzeFile 后适配成 OutlineDefinition[]）；availability 只按这个端口广告 code.outline。
- * - 旧 astAnalyzer.analyzeFile(absPath) 鸭子类型只作为已弃用兼容入口在 handler 内服务，不再被广告。
+ * - 旧 astAnalyzer.analyzeFile(absPath) 鸭子类型按待决事项⑤答复停读（W1-05 / L4-P36）：handler 不再调用，
+ *   availability 不广告；只注入它的宿主 code.outline 报不可用，>500 行 code.read 降为头尾预览。
  * - code.outline 的 kinds / maxDepth 真正生效，过滤后为空时返回带说明的空大纲。
  */
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -121,7 +123,7 @@ describe('outlineFile port (I16)', () => {
     expect(text).not.toContain('filter');
   });
 
-  it('prefers outlineFile over the deprecated astAnalyzer duck type', async () => {
+  it('reads only outlineFile even when a retired astAnalyzer is also injected', async () => {
     const root = await project('prefer');
     const legacy = vi.fn(async () => ({ definitions: [] }));
     const ctx = portContext(root, { astAnalyzer: { analyzeFile: legacy } });
@@ -195,19 +197,58 @@ describe('outlineFile port (I16)', () => {
     expect(allBad.error).toContain('returned no definitions');
   });
 
-  it('still serves the deprecated astAnalyzer duck type with a compatibility log', async () => {
-    const root = await project('legacy');
+  it('no longer serves the retired astAnalyzer duck type', async () => {
+    const root = await project('retired');
     const logger = Logger.getInstance();
     const debug = vi.spyOn(logger, 'debug').mockImplementation(() => logger);
-    const legacy = vi.fn(async () => ({ definitions: DEFINITIONS }));
-    const result = await outline(
-      { projectRoot: root, tokenBudget: 5000, astAnalyzer: { analyzeFile: legacy } },
-      {}
+    const analyzeFile = vi.fn(async () => ({ definitions: DEFINITIONS }));
+    const ctx = { projectRoot: root, tokenBudget: 5000, astAnalyzer: { analyzeFile } };
+
+    // code.outline：端口缺失即 analyzer-missing，不再经旧鸭子类型取骨架。
+    const result = await outline(ctx, {});
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe(
+      'Cannot generate outline for src/big.ts — AST analyzer not available (the host has not bound the outlineFile port)'
     );
-    expect(result.ok).toBe(true);
-    expect(legacy).toHaveBeenCalledWith(join(root, 'src/big.ts'));
+
+    // code.read：>500 行退回头尾预览，并带 analyzer-missing 的降级诊断。
+    const read = await new ToolRouter().execute(
+      { tool: 'code', action: 'read', params: { path: 'src/big.ts' } },
+      ctx
+    );
+    expect(read.ok).toBe(true);
+    expect(String(read.data)).toContain('showing head + tail');
+    expect(read._meta?.degraded).toBe(true);
+    expect(read._meta?.fallbackUsed).toBe(true);
+    const fallback = read._meta?.diagnosticWarnings?.find(
+      (warning) => warning.code === 'code_read_outline_fallback'
+    );
+    expect(fallback?.message).toContain('reason=analyzer-missing');
+
+    const batch = await new ToolRouter().execute(
+      { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
+      ctx
+    );
+    const files = (batch.data as { files: Array<Record<string, unknown>> }).files;
+    expect(files[0]).toMatchObject({
+      outlineSource: 'head-tail',
+      outlineReason: 'analyzer-missing',
+    });
+
+    expect(analyzeFile).not.toHaveBeenCalled();
     const logs = debug.mock.calls.map((call) => String(call[0]));
-    expect(logs.some((line) => line.includes('legacy-astAnalyzer'))).toBe(true);
+    expect(logs.filter((line) => line.includes('legacy-astAnalyzer'))).toEqual([]);
+  });
+
+  it('removes the legacy astAnalyzer branch from the code handler source', () => {
+    const source = readFileSync(
+      new URL('../src/tools/runtime/handlers/code.ts', import.meta.url),
+      'utf8'
+    );
+    for (const retired of ['legacy-astAnalyzer', 'OutlinePortName', 'resolveOutlinePort']) {
+      expect({ retired, present: source.includes(retired) }).toEqual({ retired, present: false });
+    }
+    expect(source).not.toMatch(/ctx\.astAnalyzer/);
   });
 });
 
@@ -329,15 +370,14 @@ describe('code.outline availability follows the outlineFile port (I16)', () => {
     expect(reasonFor(snapshot)).toBeUndefined();
   });
 
-  it('does not advertise code.outline on the deprecated astAnalyzer duck type alone', () => {
+  it('does not advertise code.outline on the retired astAnalyzer duck type alone', () => {
     const snapshot = ToolRouter.describeAvailability({
       astAnalyzer: { analyzeFile: async () => null },
     });
     expect(snapshot.actions.code).not.toContain('outline');
     expect(snapshot.actions.code).toContain('read');
-    const reason = reasonFor(snapshot);
-    expect(reason).toContain('outlineFile is unavailable');
-    expect(reason).toContain('legacy astAnalyzer.analyzeFile');
+    // 旧字段已停读：原因与什么都没绑定时相同，不再单独点名旧鸭子类型。
+    expect(reasonFor(snapshot)).toBe('outlineFile is unavailable');
   });
 
   it('names the missing outlineFile port when nothing is bound', () => {
@@ -388,38 +428,6 @@ describe('outline port shape violations and defaulted fields are logged (I16 aud
       expect(result.ok).toBe(false);
       expect(result.error).toContain('returned no definitions');
       expect(outlineWarnings(warn), JSON.stringify(value)).toEqual([]);
-      vi.restoreAllMocks();
-    }
-  });
-
-  it('warns for a legacy analyzer whose definitions value is not an array, but not when it is absent', async () => {
-    const root = await project('shape-legacy');
-    for (const [label, value, expectWarn] of [
-      ['definitions-string', { definitions: 'x' }, true],
-      ['primitive', 'oops', true],
-      ['no-definitions-key', {}, false],
-      ['null-result', null, false],
-    ] as const) {
-      const logger = Logger.getInstance();
-      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
-      const result = await outline(
-        {
-          projectRoot: root,
-          tokenBudget: 5000,
-          astAnalyzer: { analyzeFile: vi.fn(async () => value) },
-        },
-        {}
-      );
-      expect(result.ok, label).toBe(false);
-      expect(result.error, label).toContain('returned no definitions');
-      const lines = outlineWarnings(warn);
-      if (expectWarn) {
-        expect(lines, label).toHaveLength(1);
-        expect(lines[0], label).toContain('port=legacy-astAnalyzer');
-        expect(lines[0], label).toContain('non-array');
-      } else {
-        expect(lines, label).toEqual([]);
-      }
       vi.restoreAllMocks();
     }
   });

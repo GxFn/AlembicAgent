@@ -73,38 +73,30 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
   };
 
   // read 的 AST 是可选增强（缺端口时退回头尾预览），outline 则必须有宿主绑定的 outlineFile 端口；
-  // 不误删可降级的文件读取。I16：只按 kernel 的 outlineFile 端口判定。旧 astAnalyzer.analyzeFile
-  // 鸭子类型只能证明“有这个方法名”，证明不了签名——按 Core analyzeFile(source, lang) 接线时它
-  // 会被判为可用却恒失败——所以即使在场也不广告，原因里点名这一跳过，便于宿主排查。
-  check(
-    'code',
-    'outline',
-    typeof ctx.outlineFile === 'function',
-    hasMethod(ctx.astAnalyzer, 'analyzeFile')
-      ? 'outlineFile is unavailable; legacy astAnalyzer.analyzeFile is bound but not advertised (its signature cannot be verified)'
-      : 'outlineFile is unavailable'
-  );
+  // 不误删可降级的文件读取。I16：只按 kernel 的 outlineFile 端口判定。旧 astAnalyzer 字段已按待决
+  // 事项⑤答复停读（code handler 不再调用它），在场与否都不影响判定，原因统一为端口缺失。
+  check('code', 'outline', typeof ctx.outlineFile === 'function', 'outlineFile is unavailable');
   check(
     'graph',
     'overview',
     hasMethod(ctx.projectGraph, 'getOverview'),
     'projectGraph.getOverview is unavailable'
   );
-  // graph.query 的 type 分支与 graph handler 共用 GRAPH_QUERY_HOST_READERS：任一读取器的方法在场即可用，
-  // 不再在这里手抄方法名。legacy 条目（旧宿主兼容入口，已弃用）照常参与判定，唯一生产宿主不提供它们，
-  // 所以生产快照会收窄掉 overrides/extensions；删除这些条目等待决事项③，消费者与移除条件见该常量。
+  // graph.query 的 type 分支与 graph handler 共用 GRAPH_QUERY_HOST_READERS：每个 type 唯一的读取器方法
+  // 在场即可用，不再在这里手抄方法名。旧宿主兼容读取器已删除，只注入旧方法的宿主不会被广告任何分支。
   branches(
     'graph',
     'query',
     'type',
     Object.fromEntries(
-      Object.entries(GRAPH_QUERY_HOST_READERS).map(([type, readers]) => [
+      Object.entries(GRAPH_QUERY_HOST_READERS).map(([type, reader]) => [
         type,
-        readers.some((reader) => hasMethod(ctx[reader.port], reader.method)),
+        hasMethod(ctx[reader.port], reader.method),
       ])
     )
   );
 
+  // detail 与 manage 仍保留 knowledgeRepo 回落（不在 W1-05 范围），与各自 handler 一致；prime 不用 canRead。
   const reader = ctx.knowledgeRead !== undefined ? ctx.knowledgeRead : ctx.knowledgeRepo;
   const manager =
     ctx.knowledgeManagement !== undefined ? ctx.knowledgeManagement : ctx.knowledgeRepo;
@@ -130,15 +122,17 @@ export function describeToolAvailability(ctx: ToolAvailabilityContext): ToolAvai
     // 未声明 supportedKinds：沿用“全部 kind 可用”的旧语义，不写 parameters 收窄，也不推分支条目。
     initialize('knowledge');
   }
-  // prime 的“未注入任何读取端口也可用”是 search-only 旧宿主兼容分支（已弃用，handler 侧带
-  // KNOWLEDGE_PRIME_SEARCH_ONLY 诊断）。待决事项③确认单宿主后改为要求 knowledgeRead，与 handler 同步收窄。
+  // prime 只认 knowledgeRead（待决事项③答复，与 handler 同步）：knowledgeRepo 不再是 prime 的读取端口，
+  // 只注入它的宿主不广告 prime（handler 侧报 KNOWLEDGE_READ_PORT_UNAVAILABLE）。“未注入任何读取端口也可用”
+  // 是 search-only 分支（handler 侧带 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断），去留属 W2b，这里保持不变。
   check(
     'knowledge',
     'prime',
     canSearch &&
       (kinds === null || kinds.includes('all')) &&
-      (canRead || (ctx.knowledgeRead === undefined && ctx.knowledgeRepo == null)),
-    'knowledge.prime requires all-kind search and a valid reader when one is supplied'
+      (hasMethod(ctx.knowledgeRead, 'getById') ||
+        (ctx.knowledgeRead === undefined && ctx.knowledgeRepo == null)),
+    'knowledge.prime requires all-kind search and knowledgeRead.getById (knowledgeRepo is not accepted)'
   );
   check('knowledge', 'detail', canRead, 'knowledgeRead.getById is unavailable');
   check(

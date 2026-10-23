@@ -35,7 +35,7 @@ export type SubmitRepairStatKey = (typeof SUBMIT_REPAIR_STAT_KEYS)[number];
  * 这里约束的是本仓写入形状与键名。
  */
 export interface SessionCounters {
-  /** H1 同题硬止损：按标题的提交尝试次数（旧宿主顶层 sharedState._submitTitleAttempts 为兼容别名）。 */
+  /** H1 同题硬止损：按标题的提交尝试次数，只存在于本盒；sharedState 顶层同名别名已删除（W1-05）。 */
   _submitTitleAttempts?: Record<string, number>;
   /** E7-R：按标题的风格修复子调用次数（每题上限 2）。 */
   _styleRepairAttempts?: Record<string, number>;

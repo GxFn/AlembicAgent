@@ -5294,12 +5294,11 @@ describe('L4-P17 code.read/structure degraded, partial and boundary results', ()
       const root = await largeFileProject('throws');
       const logger = Logger.getInstance();
       const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
-      const astAnalyzer = {
-        analyzeFile: async () => {
-          throw new TypeError('parser crashed');
-        },
+      // W1-05：夹具走 kernel outlineFile 端口（旧 astAnalyzer 鸭子类型已停读）。
+      const outlineFile = async (): Promise<never> => {
+        throw new TypeError('parser crashed');
       };
-      const envelope = await adapterFor(root, { astAnalyzer }).execute(
+      const envelope = await adapterFor(root, { outlineFile }).execute(
         readRequestP17({ path: 'src/big.ts' })
       );
       expect(envelope.ok).toBe(true);
@@ -5315,7 +5314,7 @@ describe('L4-P17 code.read/structure degraded, partial and boundary results', ()
 
       const outline = await new ToolRouter().execute(
         { tool: 'code', action: 'outline', params: { path: 'src/big.ts' } },
-        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+        { projectRoot: root, tokenBudget: 5000, outlineFile }
       );
       expect(outline.ok).toBe(false);
       expect(outline.error).toContain('AST analyzer threw TypeError');
@@ -5324,10 +5323,10 @@ describe('L4-P17 code.read/structure degraded, partial and boundary results', ()
 
     it('reports an analyzer without definitions as no-definitions', async () => {
       const root = await largeFileProject('empty-defs');
-      const astAnalyzer = { analyzeFile: async () => ({ definitions: [] }) };
+      const outlineFile = async () => [];
       const result = await new ToolRouter().execute(
         { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
-        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+        { projectRoot: root, tokenBudget: 5000, outlineFile }
       );
       const data = result.data as P17BatchData;
       expect(data.files[0]).toMatchObject({
@@ -5341,14 +5340,12 @@ describe('L4-P17 code.read/structure degraded, partial and boundary results', ()
 
     it('marks a real AST outline as outlineSource ast without fallback diagnostics', async () => {
       const root = await largeFileProject('ast');
-      const astAnalyzer = {
-        analyzeFile: async () => ({
-          definitions: [{ name: 'v1', kind: 'variable', startLine: 1, endLine: 1, depth: 0 }],
-        }),
-      };
+      const outlineFile = async () => [
+        { name: 'v1', kind: 'variable', startLine: 1, endLine: 1, depth: 0 },
+      ];
       const batch = await new ToolRouter().execute(
         { tool: 'code', action: 'read', params: { filePaths: ['src/big.ts'] } },
-        { projectRoot: root, tokenBudget: 5000, astAnalyzer }
+        { projectRoot: root, tokenBudget: 5000, outlineFile }
       );
       const file = (batch.data as P17BatchData).files[0];
       expect(file).toMatchObject({ mode: 'outline', outlineSource: 'ast' });
@@ -5358,7 +5355,7 @@ describe('L4-P17 code.read/structure degraded, partial and boundary results', ()
       expect(batch._meta?.degraded).toBeUndefined();
       expect(codes(batch._meta?.diagnosticWarnings)).not.toContain('code_read_outline_fallback');
 
-      const single = await adapterFor(root, { astAnalyzer }).execute(
+      const single = await adapterFor(root, { outlineFile }).execute(
         readRequestP17({ path: 'src/big.ts' })
       );
       expect(String(single.structuredContent)).toContain('File has 1200 lines. Showing outline.');

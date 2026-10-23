@@ -36,13 +36,12 @@ function unavailableReadPort(action: string, port: 'knowledgeRead' | 'knowledgeR
 }
 
 /**
- * knowledgeRead 缺省（undefined）而改用旧 knowledgeRepo.getById 读取详情时留一条 info 日志。
- * 这是旧宿主兼容入口（已弃用，待决事项③未答复，暂不删除）：只记日志、不改 _meta，避免模型可见输出变化；
- * 日志写清触发条件与选择路径，供待决事项③事后核对是否仍有宿主走这条回落。
- * 仅在旧端口确实可读时调用：两个端口都缺的 search-only 回落另有 KNOWLEDGE_PRIME_SEARCH_ONLY 诊断。
+ * knowledge.detail 在 knowledgeRead 缺省（undefined）而改用旧 knowledgeRepo.getById 读取详情时留一条 info 日志。
+ * 这是旧宿主兼容入口（已弃用；detail 的回落不在 W1-05 范围，暂不删除）：只记日志、不改 _meta，避免模型
+ * 可见输出变化；日志写清触发条件与选择路径，供事后核对是否仍有宿主走这条回落。prime 已不再回落 knowledgeRepo。
  * 经 logKnowledgeFallback 输出：日志实现抛错不会阻断或改写真实读取。
  */
-function noteLegacyRepoPort(action: 'prime' | 'detail', input: string): void {
+function noteLegacyRepoPort(action: 'detail', input: string): void {
   logKnowledgeFallback(
     'info',
     `[knowledge.${action}] reading via legacy knowledgeRepo.getById port (compat, deprecated; trigger=knowledgeRead not provided; ${input})`
@@ -256,19 +255,21 @@ export async function handlePrime(
   if (!isSearchEngine(engine)) {
     return fail('Search engine not available');
   }
-  // knowledgeRead 缺省时回落 knowledgeRepo、两者都缺时 search-only，都是旧宿主兼容入口（已弃用，
-  // 待决事项③未答复，暂不删除）。消费者：未注入 knowledgeRead 的旧宿主与测试替身；唯一生产宿主通过
-  // knowledgeRead 提供详情、从不注入 knowledgeRepo。移除条件：待决事项③确认单宿主后，prime 强制要求
-  // knowledgeRead，缺失时直接返回 KNOWLEDGE_READ_PORT_UNAVAILABLE，删除 knowledgeRepo 回落与 search-only 分支。
-  const port = ctx.knowledgeRead !== undefined ? 'knowledgeRead' : 'knowledgeRepo';
-  const repo = ctx[port];
-  const canRead = isKnowledgeReadPort(repo);
-  // 未注入读取能力时保留 search-only prime；已注入但缺方法时不能伪装成可用端口。
-  if (!canRead && (port === 'knowledgeRead' || repo != null)) {
-    return unavailableReadPort('prime', port);
-  }
-  if (canRead && port === 'knowledgeRepo') {
-    noteLegacyRepoPort('prime', `limit=${limit}`);
+  // prime 只认 knowledgeRead（待决事项③答复：../Alembic 是唯一宿主，它通过 knowledgeRead 提供详情、从不注入
+  // knowledgeRepo）。旧 knowledgeRepo.getById 回落已删除（W1-05）：只注入 knowledgeRepo 的宿主直接报
+  // KNOWLEDGE_READ_PORT_UNAVAILABLE，不调用它，也不退回 search-only 冒充可用。两个端口都缺时的 search-only
+  // 分支去留属 W2b（派发行 D2），这里保持不变。
+  const readPort = ctx.knowledgeRead;
+  const canRead = isKnowledgeReadPort(readPort);
+  if (!canRead && (readPort !== undefined || ctx.knowledgeRepo != null)) {
+    if (readPort === undefined) {
+      // 短路分叉：宿主只注入了旧 knowledgeRepo。记 warn 写明触发条件与选择路径，便于宿主改接 knowledgeRead。
+      logKnowledgeFallback(
+        'warn',
+        `[knowledge.prime] knowledgeRepo is not a prime read port (retired compat fallback); trigger=knowledgeRead not provided; result=KNOWLEDGE_READ_PORT_UNAVAILABLE; limit=${limit}`
+      );
+    }
+    return unavailableReadPort('prime', 'knowledgeRead');
   }
 
   try {
@@ -295,10 +296,10 @@ export async function handlePrime(
     const diagnosticWarnings: ToolDiagnosticWarning[] = [];
     if (!canRead) {
       // search-only 回落：宿主既没有 knowledgeRead，也没有 knowledgeRepo（上面已排除“注入了但缺
-      // getById”的情形）。结果只剩搜索摘要，没有 trigger/doClause/dontClause/sources，属于能力
-      // 降级，必须标 degraded 并给出诊断，不能让模型以为拿到了完整知识包。
+      // getById”与“只注入 knowledgeRepo”的情形）。结果只剩搜索摘要，没有 trigger/doClause/dontClause/
+      // sources，属于能力降级，必须标 degraded 并给出诊断，不能让模型以为拿到了完整知识包。
       // 消费者：未注入知识读取能力的宿主与测试替身；当前生产宿主通过 knowledgeRead 提供详情。
-      // 移除条件：待决事项③确认单宿主并强制要求 knowledgeRead 后，本分支改为直接报端口不可用。
+      // 去留属 W2b（派发行 D2），W1-05 不改本分支与诊断文案。
       diagnosticWarnings.push({
         code: 'KNOWLEDGE_PRIME_SEARCH_ONLY',
         message:
@@ -311,7 +312,7 @@ export async function handlePrime(
       let detail: Record<string, unknown> | null = null;
       if (canRead) {
         try {
-          const detailRead = await runOperation(() => repo.getById(hit.id), {
+          const detailRead = await runOperation(() => readPort.getById(hit.id), {
             abortSignal: ctx.abortSignal,
           });
           if (detailRead.status !== 'ok') {

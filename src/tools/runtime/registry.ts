@@ -527,27 +527,16 @@ const GRAPH_SPEC: ToolSpec = {
     query: {
       summary: 'Query code entities and relationships',
       description:
-        'Query AST graph for class info, hierarchy, callers/callees, overrides, extensions, impact analysis, or search.',
+        'Query AST graph for class info, hierarchy, callers/callees, impact analysis, or search.',
       params: {
         type: 'object',
         properties: {
           type: {
             type: 'string',
-            // 与 kernel GRAPH_QUERY_HOST_READERS 的键逐项同序（守护测试见文件头）。overrides/extensions
-            // 只有旧宿主兼容读取器（getMethodOverrides/getCategoryMap，已弃用），唯一生产宿主不提供，
-            // availability 在生产中会把它们从快照里收窄掉；待决事项③确认单宿主后从本枚举删除
-            // （模型可见 schema 收窄），决定前保持不变。
-            enum: [
-              'class',
-              'protocol',
-              'hierarchy',
-              'callers',
-              'callees',
-              'overrides',
-              'extensions',
-              'impact',
-              'search',
-            ],
+            // 与 kernel GRAPH_QUERY_HOST_READERS 的键逐项同序（守护测试见文件头）。只有旧宿主兼容读取器的
+            // 方法覆写与扩展两种 type 已按待决事项③答复删除（模型可见 schema 收窄，W1-05）：持久化提示或
+            // 回放里的旧取值会在参数校验处成为参数错误。
+            enum: ['class', 'protocol', 'hierarchy', 'callers', 'callees', 'impact', 'search'],
           },
           entity: {
             type: 'string',

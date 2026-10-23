@@ -21,7 +21,7 @@ import { CapabilityRegistry } from '../src/tools/runtime/toolsets/CapabilityRegi
 
 const NOTICE_HEADING = '## 本次运行不可用的工具';
 
-/** 只接 AST 分析器；图谱按参数决定是否接线。其余宿主服务与本用例无关。 */
+/** 只接 AST 大纲端口；图谱按参数决定是否接线。其余宿主服务与本用例无关。 */
 function hostServices(graph: 'none' | 'partial' | 'full'): ToolAvailabilityContext {
   const projectGraph =
     graph === 'none'
@@ -35,15 +35,13 @@ function hostServices(graph: 'none' | 'partial' | 'full'): ToolAvailabilityConte
             getClassHierarchy: () => [],
             getCallers: () => [],
             getCallees: () => [],
-            getMethodOverrides: () => [],
-            getCategoryMap: () => ({}),
             searchEntities: () => [],
           };
-  const codeEntityGraph =
-    graph === 'full' ? { impactAnalysis: () => ({}), search: () => [] } : undefined;
+  // W1-05：生产宿主形态，实体图只提供 impactAnalysis；大纲走 kernel outlineFile 端口。
+  const codeEntityGraph = graph === 'full' ? { impactAnalysis: () => ({}) } : undefined;
   return {
     projectRoot: process.cwd(),
-    astAnalyzer: { analyzeFile: () => null },
+    outlineFile: async () => null,
     projectGraph,
     ...(codeEntityGraph ? { codeEntityGraph } : {}),
     sessionStoreAvailable: true,
@@ -232,7 +230,7 @@ describe('SystemPromptBuilder.injectToolAvailability', () => {
         { tool: 'graph', action: 'overview', reason: 'projectGraph.getOverview is unavailable' },
         { tool: 'graph', action: 'query', operation: 'class', reason: 'no bound host capability' },
         { tool: 'graph', action: 'query', reason: 'graph.query has no available type branch' },
-        { tool: 'code', action: 'outline', reason: 'astAnalyzer.analyzeFile is unavailable' },
+        { tool: 'code', action: 'outline', reason: 'outlineFile is unavailable' },
         { tool: 'knowledge', action: 'manage', operation: 'publish', reason: 'no publisher' },
         { tool: 'knowledge', action: 'manage', operation: 'approve', reason: 'no publisher' },
       ],

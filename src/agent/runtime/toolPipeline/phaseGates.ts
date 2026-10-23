@@ -53,14 +53,16 @@ const ANALYST_VERIFY_MEMORY_ACTIONS = new Set(['note_finding', 'recall', 'get_pr
 /** E4：证据台账只读 action——查已采证据不是探索，RECORD/VERIFY 相放行 */
 const EVIDENCE_READ_ACTIONS = new Set(['get', 'search']);
 
+/**
+ * VERIFY 放行的聚焦型 graph.query type（search 是泛搜索，不放行）。只列 graph.query 枚举里真实存在的
+ * type：只有旧宿主读取器的方法覆写/扩展两种已随 W1-05 删除，放行它们只会让模型白耗一轮参数错误。
+ */
 const ANALYST_VERIFY_GRAPH_QUERY_TYPES = new Set([
   'class',
   'protocol',
   'hierarchy',
   'callers',
   'callees',
-  'overrides',
-  'extensions',
   'impact',
 ]);
 
@@ -192,7 +194,7 @@ export const analystVerifyOnlyGate = {
       blocked: true,
       result: {
         error:
-          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|overrides|extensions|impact with params.entity), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
+          'Analyst VERIFY is evidence-only. Use code.read/code.outline, focused graph.query(class|protocol|hierarchy|callers|callees|impact with params.entity), or note_finding / memory.recall / memory.get_previous_evidence; broad search, terminal, knowledge, and unrelated writes are disabled.',
       },
     };
   },
