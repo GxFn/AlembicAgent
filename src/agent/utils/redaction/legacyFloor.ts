@@ -6,7 +6,11 @@
  *
  * 阶段 4 的运行时路径 applyRedactionFloor（默认）：
  *   Floor = ∪ 追踪重放位置(v0..v3)（trackedReplay.ts，带运行时自检：重放文本 === 冻结原版输出）
- *   M = Floor ∪ 检测器区间（挂点 detectors：后续包 4b–4e 在同一轮原文上计算区间后并入，禁止串接；本包为空）
+ *   M = Floor ∪ 检测器区间（挂点 detectors：在同一轮原文上计算区间后并入，禁止串接；阶段 4b 起默认是
+ *       detectors.ts 的 T1 高置信格式层，带各自的标记，作为最低优先级的缺口交给渲染器；底线已遮住全部位置的
+ *       区间不并入，所以检测器没有多遮任何位置时输出与无检测器时逐字相同；底线没遮住的级联触发前缀——v0/v1
+ *       的“关键字 + 分隔符”——不并入检测区间，下一轮的级联遮蔽因此照常发生，不变量 A 在门面层（不动点多轮）
+ *       也成立）
  *   渲染一次（render.ts，只依据原文与位置）→ 不动点（≤ MAX_FLOOR_ROUNDS 轮）。
  * 每轮只会遮得更多，所以每轮都满足 S；不动点处幂等。
  *
@@ -22,6 +26,12 @@
  * 与测试期的独立对照：现行规则输出 y3 作主渲染，三个早期版本经 hiddenSpans 黑盒对齐得到超集，残差补遮，
  * 后置条件自检，不动点。它不再被门面调用；换行口径与追踪重放一致（结构位置见 trackedReplay.structurePositions）。
  */
+import {
+  type DetectorEventKind,
+  type DetectorMarker,
+  type DetectorSink,
+  detectT1Spans,
+} from './detectors.js';
 import {
   redactAt1b394ce,
   redactAt246055e,
@@ -48,12 +58,13 @@ import {
   analyzeStructure,
   type BaselineRevision,
   frozenRedact,
+  type Gap,
   gapsFromTracked,
   originTracked,
   type ReplayResult,
   replayTracked,
+  type Segment,
   type Tracked,
-  visibleFromTracked,
 } from './trackedReplay.js';
 
 export type CurrentRules = (text: string) => string;
@@ -97,6 +108,18 @@ export type FloorEventKind =
   | 'replay-skeleton'
   | 'render-skeleton'
   | 'detector-span'
+  | 'detector-rejected'
+  | 'detector-reference-skip'
+  | 'detector-unbalanced-fallback'
+  | 'detector-truncated'
+  | 'detector-window-exceeded'
+  | 'detector-carrier-quote'
+  | 'detector-unclosed-quote'
+  | 'detector-unclosed-group'
+  | 'detector-glued-header'
+  | 'detector-trigger-kept'
+  | 'detector-already-masked'
+  | 'detector-floor-covered'
   | 'tiled-run'
   | 'fallback-run'
   | 'marker-verbatim'
@@ -133,8 +156,20 @@ export interface FloorReport {
   floorChars: number;
   /** 各版本遮住的内容字符数（各轮累计；同一字符可被多个版本计入）。 */
   hiddenByBaseline: Record<BaselineRevision, number>;
-  /** 检测器挂点并入的字符数（本包没有检测器，恒为 0）。 */
+  /** 检测器挂点并入、且底线没有遮住的字符数（各轮累计）。 */
   detectorChars: number;
+  /** 检测器给出的区间个数（各轮累计；含底线已覆盖而跳过的区间，不含已是标记而跳过的区间）。 */
+  detectorSpans: number;
+  /** 各检测规则给出的区间个数，键为规则 id（口径同 detectorSpans；只含计数，不含正文）。 */
+  detectorHits: Record<string, number>;
+  /**
+   * 检测器的诊断事件计数（各轮累计）：候选被否决、纯引用占位被跳过、URL 花括号失配退回不配平扫描、
+   * 按截断形态命中、有界窗口触顶、Cookie 引号判为载体引号、引号到行尾未闭合、认证头未闭合的 ${ 组被丢弃、
+   * 凭据串在紧贴头名处截断、保留底线级联触发前缀（区间里不并入的那部分）、区间完全落在已有标记上而跳过、
+   * 底线已遮住区间全部位置而跳过、预过滤短路（整条规则没有运行；只计数，不进 kinds）。见 detectors.ts 的
+   * DetectorEventKind。
+   */
+  detectorEvents: Record<DetectorEventKind, number>;
   /** 追踪重放自检失败的次数（版本 × 轮次）。 */
   replayMismatches: number;
   /** 因自检失败而整行替换为 [redacted-unaligned] 的行数。 */
@@ -178,6 +213,23 @@ function emptyReport(): FloorReport {
     floorChars: 0,
     hiddenByBaseline: { '246055e': 0, '1b394ce': 0, d113986: 0, b60a61e: 0 },
     detectorChars: 0,
+    detectorSpans: 0,
+    detectorHits: {},
+    detectorEvents: {
+      rejected: 0,
+      'reference-skip': 0,
+      'unbalanced-fallback': 0,
+      truncated: 0,
+      'window-exceeded': 0,
+      'carrier-quote': 0,
+      'unclosed-quote': 0,
+      'unclosed-group': 0,
+      'glued-header': 0,
+      'trigger-kept': 0,
+      'already-masked': 0,
+      'floor-covered': 0,
+      'prefilter-skip': 0,
+    },
     replayMismatches: 0,
     replayMismatchLines: 0,
     renderSkeletons: 0,
@@ -693,13 +745,37 @@ function runAlignmentFloor(
 // =============================================================================================
 
 /**
- * 检测器挂点（阶段 4b–4e）：在当前轮的原文上计算要遮住的区间 [start, end)，与 Floor 取并集。
- * 检测器之间、检测器与底线之间都不串接（不在别的检测器输出上继续匹配），所以组合是单调的（不变量 A）。
- * 本包不实现任何检测器。
+ * 检测器给出的一个区间：[start, end) 在当前轮原文上；marker 是该区间用的标记（封闭词表），缺省时由渲染器按
+ * 历史缺口或通用标记 [redacted] 处理；ruleId 只用于报告计数。
  */
-export type FloorDetector = (text: string) => ReadonlyArray<readonly [number, number]>;
+export interface FloorDetectorSpan {
+  readonly start: number;
+  readonly end: number;
+  readonly marker?: DetectorMarker;
+  readonly ruleId?: string;
+}
+
+/**
+ * 检测器挂点（阶段 4b–4e）：在当前轮的原文上计算要遮住的区间，与 Floor 取并集。
+ * 检测器之间、检测器与底线之间都不串接（不在别的检测器输出上继续匹配），所以组合是单调的（不变量 A）。
+ * 返回值可以是 [start, end] 元组（不指定标记），也可以是带标记的区间；sink 接收检测器的诊断计数事件。
+ */
+export type FloorDetector = (
+  text: string,
+  sink?: DetectorSink
+) => ReadonlyArray<readonly [number, number] | FloorDetectorSpan>;
+
+/**
+ * 默认检测器表（生产门面使用）：阶段 4b 的 T1 高置信格式层。后续包（4c–4e）只往这里追加。
+ * 模块级只读：冻结的非空数组，不是可变状态。
+ */
+export const DEFAULT_FLOOR_DETECTORS: readonly FloorDetector[] = Object.freeze([detectT1Spans]);
 
 export interface RedactionFloorOptions {
+  /**
+   * 检测器表；缺省为 DEFAULT_FLOOR_DETECTORS。显式传入（含空数组）时替换默认表：只供测试度量“无检测器的底线”
+   * 与验证挂点本身，生产门面（Redaction.ts）不传。
+   */
   detectors?: readonly FloorDetector[];
   /**
    * 测试接缝：替换某个版本的追踪重放实现，用来验证自检失败即关的路径（生产调用不传）。
@@ -730,12 +806,14 @@ interface ReplayRound {
 }
 
 function countLines(text: string): number {
+  // 按字符数 \n 与 \r（不合并 \r\n），与逐字符扫描等价；indexOf 走引擎的快速字符搜索，载体里只有转义换行的
+  // 长单行文本不必逐字符走一遍。
   let count = 1;
-  for (let index = 0; index < text.length; index++) {
-    const code = text.charCodeAt(index);
-    if (code === 10 || code === 13) {
-      count++;
-    }
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) {
+    count++;
+  }
+  for (let at = text.indexOf('\r'); at >= 0; at = text.indexOf('\r', at + 1)) {
+    count++;
   }
   return count;
 }
@@ -829,6 +907,255 @@ const REVISION_BIT: Readonly<Record<BaselineRevision, number>> = {
   '246055e': 8,
 };
 
+/**
+ * 检测器事件种类 → 报告里的事件种类。预过滤短路是每次调用的常规快路径（像 rounds 一样只计数），不进 kinds：
+ * 干净文本的报告 kinds 仍为空，kinds 只列出改变或解释输出的事件。
+ */
+const DETECTOR_EVENT_KINDS: Readonly<
+  Record<Exclude<DetectorEventKind, 'prefilter-skip'>, FloorEventKind>
+> = {
+  rejected: 'detector-rejected',
+  'reference-skip': 'detector-reference-skip',
+  'unbalanced-fallback': 'detector-unbalanced-fallback',
+  truncated: 'detector-truncated',
+  'window-exceeded': 'detector-window-exceeded',
+  'carrier-quote': 'detector-carrier-quote',
+  'unclosed-quote': 'detector-unclosed-quote',
+  'unclosed-group': 'detector-unclosed-group',
+  'glued-header': 'detector-glued-header',
+  'trigger-kept': 'detector-trigger-kept',
+  'already-masked': 'detector-already-masked',
+  'floor-covered': 'detector-floor-covered',
+};
+
+/**
+ * v0/v1 的关键字级联触发前缀：（可带引号的）关键字 + 可选闭引号 + 空白 + 分隔符 + 空白 + 值的开引号。v0（246055e）
+ * 与 v1（1b394ce）的键值规则对任何位置的关键字生效，值的字符类包含标记的全部字符，所以上一轮写出的 [redacted]
+ * 加上其后的短值在下一轮会凑够 8 个字符被继续遮住（不动点级联）。检测区间若吞掉底线没遮住的触发前缀，下一轮
+ * 就看不到关键字，级联遮蔽丢失，有检测器的输出反而少遮（复查反例：前缀 token 正文贪婪吸收紧贴的 token 关键字，
+ * {SYNTH 露出）。关键字表与分隔符取自冻结的 v0/v1 规则源码（frozenBaselines.ts），不能放宽。
+ */
+const CASCADE_TRIGGER =
+  /["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?/gi;
+
+/** 本轮原文上全部级联触发前缀的位置（1 = 属于某个触发前缀）。只在有检测区间需要并入时才计算。 */
+function cascadeTriggerMarks(x: string): Uint8Array {
+  const marks = new Uint8Array(x.length);
+  const scanner = new RegExp(CASCADE_TRIGGER.source, CASCADE_TRIGGER.flags);
+  for (let match = scanner.exec(x); match !== null; match = scanner.exec(x)) {
+    marks.fill(1, match.index, match.index + match[0].length);
+    if (match[0].length === 0) {
+      scanner.lastIndex++;
+    }
+  }
+  return marks;
+}
+
+function normalizeDetectorSpan(
+  raw: readonly [number, number] | FloorDetectorSpan
+): FloorDetectorSpan {
+  if ('start' in raw) {
+    return raw;
+  }
+  return { start: raw[0], end: raw[1] };
+}
+
+/**
+ * 运行检测器并把区间并入 bits（检测器位 16），带标记的区间作为检测器缺口返回（渲染器在全部历史版本缺口之后
+ * 才试它们）。底线已遮住全部位置的区间不增加遮蔽位置，也不并入缺口：遮蔽位置与缺口集合都和无检测器时相同，渲染
+ * 逐字相同（检测器只在它真正多遮的地方改变输出）。底线没遮住的级联触发前缀位置（cascadeTriggerMarks）不并入：
+ * 区间被它们切成几段，各段分别作为缺口；只剩触发前缀可并的区间按底线已覆盖处理。诊断事件与命中计数写进报告
+ * （不含正文）。
+ */
+function applyDetectors(
+  x: string,
+  detectors: readonly FloorDetector[],
+  bits: Uint8Array,
+  cores: ReadonlyArray<[number, number]>,
+  report: FloorReport
+): { gaps: Gap[]; anyHidden: boolean } {
+  const length = x.length;
+  const gaps: Gap[] = [];
+  let anyHidden = false;
+  const sink: DetectorSink = {
+    event(kind) {
+      // kinds 去重且按首次出现排序：只在该种事件第一次计数时登记（不动点轮里同种事件可能有上万次）。
+      if (report.detectorEvents[kind]++ === 0 && kind !== 'prefilter-skip') {
+        note(report, DETECTOR_EVENT_KINDS[kind]);
+      }
+    },
+  };
+  let coreMask: Uint8Array | null = null;
+  let triggers: Uint8Array | null = null;
+  // 位置 index 是否要并入：底线没遮住、且不是保留的级联触发前缀。触发前缀表第一次需要时才计算（一遍正则）。
+  const keepVisible = (index: number): boolean => {
+    if ((bits[index] & 15) !== 0) {
+      return false;
+    }
+    triggers ??= cascadeTriggerMarks(x);
+    return triggers[index] === 1;
+  };
+  for (const detector of detectors) {
+    for (const raw of detector(x, sink)) {
+      const span = normalizeDetectorSpan(raw);
+      const ruleId = span.ruleId ?? 'detector';
+      const from = Math.max(0, span.start);
+      const to = Math.min(length, span.end);
+      if (to <= from) {
+        continue;
+      }
+      if (cores.length > 0) {
+        if (coreMask === null) {
+          coreMask = new Uint8Array(length);
+          for (const [start, end] of cores) {
+            coreMask.fill(1, start, end);
+          }
+        }
+        let insideMarker = true;
+        for (let index = from; index < to; index++) {
+          if (coreMask[index] !== 1) {
+            insideMarker = false;
+            break;
+          }
+        }
+        if (insideMarker) {
+          // 区间完全落在输入里原有的完整标记上（由多个标记拼成；恰好一个标记的区间 detectT1Spans 已跳过）：
+          // 标记只会原样渲染，遮它不改变输出，却会让不动点轮多做一次结构分析与渲染。精确跳过并计数。
+          sink.event('already-masked', ruleId);
+          continue;
+        }
+      }
+      report.detectorSpans++;
+      if (span.ruleId !== undefined) {
+        report.detectorHits[span.ruleId] = (report.detectorHits[span.ruleId] ?? 0) + 1;
+      }
+      // 只看四个历史版本的位（低 4 位）：被别的检测区间遮住不算底线覆盖，那个区间的缺口仍要并入。
+      let beyondFloor = false;
+      let keptTrigger = false;
+      for (let index = from; index < to; index++) {
+        if ((bits[index] & 15) === 0) {
+          if (!keepVisible(index)) {
+            beyondFloor = true;
+            break;
+          }
+          keptTrigger = true;
+        }
+      }
+      if (!beyondFloor) {
+        // 底线已遮住区间的全部位置（或只剩保留的触发前缀）：检测器不增加遮蔽位置。不置检测器位、不并入缺口，
+        // 遮蔽位置与缺口集合都和无检测器时相同，渲染逐字相同；只计数（例如对抗输入里每行已被 v3 遮住的 URL 口令）。
+        if (keptTrigger) {
+          sink.event('trigger-kept', ruleId);
+        }
+        sink.event('floor-covered', ruleId);
+        continue;
+      }
+      // 并入：逐位置位，遇到保留的触发前缀就把区间切开，各段分别作为缺口。
+      let runStart = -1;
+      keptTrigger = false;
+      for (let index = from; index < to; index++) {
+        if (keepVisible(index)) {
+          keptTrigger = true;
+          if (runStart >= 0 && span.marker !== undefined) {
+            gaps.push({ start: runStart, end: index, synth: span.marker });
+          }
+          runStart = -1;
+          continue;
+        }
+        if (bits[index] === 0) {
+          report.detectorChars++;
+        }
+        bits[index] |= 16;
+        if (runStart < 0) {
+          runStart = index;
+        }
+      }
+      if (runStart >= 0 && span.marker !== undefined) {
+        gaps.push({ start: runStart, end: to, synth: span.marker });
+      }
+      if (keptTrigger) {
+        sink.event('trigger-kept', ruleId);
+      }
+      anyHidden = true;
+      note(report, 'detector-span');
+    }
+  }
+  return { gaps, anyHidden };
+}
+
+/** 分段在 x 里的来源起点（截到 0 以上）；不取自 x 的分段（合成文本）返回 -1。 */
+function sourceStart(segment: Segment): number {
+  return segment.src < 0 ? -1 : Math.max(0, segment.src);
+}
+
+/** 分段在 x 里的来源终点（截到 length 以内）。只对 sourceStart ≥ 0 的分段有意义。 */
+function sourceEnd(segment: Segment, length: number): number {
+  return Math.min(length, segment.range ? segment.srcEnd : segment.src + segment.len);
+}
+
+/**
+ * 把某个版本遮住的位置（没有任何输出字符取自它的位置，即各分段来源区间之并在 [0, length) 里的补集）并入 bits。
+ * 与 visibleFromTracked(tracked, length) 后逐位取反完全等价，但不分配整篇的可见数组、只写被遮的位置：来源区间
+ * 按起点有序时（重放分段的常态）一遍扫过求补集；先单独核对一遍是否有序，无序时把区间按起点排序后再求补集，
+ * 不会因为提前写入而多遮。两条路径算出的都是同一个精确补集（不是降级或回退，所以不记诊断事件）；随机分段上与
+ * visibleFromTracked 的逐位等价由 test/redaction-floor-properties.test.ts 校验。返回是否有被遮位置。
+ */
+export function markHiddenByTracked(
+  tracked: Tracked,
+  length: number,
+  bits: Uint8Array,
+  bit: number
+): boolean {
+  const segments = tracked.segments;
+  let sorted = true;
+  let lastStart = -1;
+  for (const segment of segments) {
+    const start = sourceStart(segment);
+    if (start < 0 || sourceEnd(segment, length) <= start) {
+      continue;
+    }
+    if (start < lastStart) {
+      sorted = false;
+      break;
+    }
+    lastStart = start;
+  }
+  const ordered = sorted
+    ? segments
+    : segments
+        .filter((segment) => {
+          const start = sourceStart(segment);
+          return start >= 0 && sourceEnd(segment, length) > start;
+        })
+        .sort((left, right) => sourceStart(left) - sourceStart(right));
+  let any = false;
+  let cursor = 0;
+  for (const segment of ordered) {
+    const start = sourceStart(segment);
+    const end = start < 0 ? start : sourceEnd(segment, length);
+    if (end <= start) {
+      continue;
+    }
+    if (start > cursor) {
+      for (let index = cursor; index < start; index++) {
+        bits[index] |= bit;
+      }
+      any = true;
+    }
+    if (end > cursor) {
+      cursor = end;
+    }
+  }
+  // 补集的尾段 [cursor, length)。
+  if (cursor < length) {
+    for (let index = cursor; index < length; index++) {
+      bits[index] |= bit;
+    }
+    any = true;
+  }
+  return any;
+}
+
 /** 单轮：四个版本的追踪重放（带自检）并集、检测器区间、原子标记扩展、按位置渲染、失败即关。 */
 function replayFloorOnce(
   x: string,
@@ -836,7 +1163,7 @@ function replayFloorOnce(
   options: RedactionFloorOptions,
   wantOrigin: boolean
 ): ReplayRound {
-  const detectors = options.detectors ?? [];
+  const detectors = options.detectors ?? DEFAULT_FLOOR_DETECTORS;
   const length = x.length;
   // bits[i]：遮住位置 i 的版本位掩码（检测器用最高位）；hidden 由它派生。
   const bits = new Uint8Array(length);
@@ -855,13 +1182,8 @@ function replayFloorOnce(
     const result =
       options.replayOverride?.(revision, source, frozen) ?? replayTracked(revision, source, frozen);
     if (result.tracked !== null) {
-      const visible = visibleFromTracked(result.tracked, length);
-      const bit = REVISION_BIT[revision];
-      for (let index = 0; index < length; index++) {
-        if (visible[index] === 0) {
-          bits[index] |= bit;
-          anyHidden = true;
-        }
+      if (markHiddenByTracked(result.tracked, length, bits, REVISION_BIT[revision])) {
+        anyHidden = true;
       }
       if (result.verified) {
         gapSets.push({ revision, gaps: gapsFromTracked(result.tracked, length) });
@@ -881,21 +1203,13 @@ function replayFloorOnce(
       }
     }
   }
-  for (const detector of detectors) {
-    for (const [start, end] of detector(x)) {
-      const from = Math.max(0, start);
-      const to = Math.min(length, end);
-      for (let index = from; index < to; index++) {
-        if (bits[index] === 0) {
-          report.detectorChars++;
-        }
-        bits[index] |= 16;
-        anyHidden = true;
-      }
-      if (to > from) {
-        note(report, 'detector-span');
-      }
-    }
+  const detected = applyDetectors(x, detectors, bits, cores, report);
+  if (detected.anyHidden) {
+    anyHidden = true;
+  }
+  if (detected.gaps.length > 0) {
+    // 检测器缺口排在全部历史版本之后（最低优先级）：只有历史版本铺不满的区间才会用到检测器的标记。
+    gapSets.push({ revision: 'detector', gaps: detected.gaps });
   }
   if (!anyHidden && !maskAll && unaligned.size === 0) {
     return { changed: false, text: x, origin: null };
@@ -921,8 +1235,13 @@ function replayFloorOnce(
     if (structureMarks[index] === 1 || coreMarks[index] === 1) {
       continue;
     }
+    const baselineMask = mask & 15;
+    if (baselineMask === 0) {
+      // 只被检测器遮住：已计入 detectorChars，不算底线字符，也不是残差（残差指只有早期版本遮住的字符）。
+      continue;
+    }
     floorChars++;
-    const legacyOnly = (mask & 1) === 0;
+    const legacyOnly = (baselineMask & 1) === 0;
     if (legacyOnly) {
       residualChars++;
     }
@@ -947,7 +1266,7 @@ function replayFloorOnce(
     note(report, 'residual-patched');
   }
   expandAtomicMarkers(hidden, cores);
-  const rendered = renderByPositions(x, hidden, structure, gapSets, wantOrigin);
+  const rendered = renderByPositions(x, hidden, structure, gapSets, wantOrigin, cores);
   report.verbatimRuns += rendered.stats.verbatimRuns;
   report.tiledRuns += rendered.stats.tiledRuns;
   report.fallbackRuns += rendered.stats.fallbackRuns;

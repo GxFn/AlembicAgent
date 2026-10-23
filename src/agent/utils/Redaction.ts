@@ -11,21 +11,26 @@
  * 遮蔽位置之并，运行时自检）→ redaction/render.ts 按位置渲染一次 → 不动点。任一历史版本遮住的非结构字符
  * 在这里仍被遮住，所以现行规则为减少误伤而放行的写法（比较运算、箭头函数、类型注解、case 标签、三元
  * 表达式等）只要历史版本遮过，输出里仍会被遮（D2 接受的代价）；需要逐字源码的消费者由阶段 2、3 改走回读
- * 或见证通道，而不是放宽这里的检测。后续检测器（阶段 4b–4e）通过 legacyFloor 的检测器挂点在原文上追加区间，
- * 与 Floor 取并集，不串接。
+ * 或见证通道，而不是放宽这里的检测。检测器通过 legacyFloor 的检测器挂点在原文上追加区间，与 Floor 取并集，
+ * 不串接：阶段 4b 起默认挂上 redaction/detectors.ts 的 T1 高置信格式层（带固定前缀的 token、JWT、认证头与
+ * Cookie、URL userinfo 口令段、Azure SAS 签名），只会多遮（不变量 A），标记沿用封闭词表；底线已遮住的区间
+ * 不再并入，检测器只在它真正多遮的地方改变输出；底线没遮住的 v0/v1 级联触发前缀（关键字 + 分隔符）不并入
+ * 检测区间，不动点轮里的级联遮蔽照常发生，所以不变量 A 在门面层（多轮之后）也成立。后续包（4c–4e）只往
+ * 默认检测器表里追加。门面签名与调用点不变，不从任何 index 转出。
  */
 
 import { applyRedactionFloor, type FloorReport } from './redaction/legacyFloor.js';
 
-/** 开发者文本脱敏（签名不变）：四个历史版本的追踪重放底线 + 按位置渲染，迭代到不动点。 */
+/** 开发者文本脱敏（签名不变）：四个历史版本的追踪重放底线 ∪ T1 检测器区间 + 按位置渲染，迭代到不动点。 */
 export function redactDeveloperText(text: string): string {
   return applyRedactionFloor(text).text;
 }
 
 /**
  * 内部纯函数：返回脱敏文本与底线报告。报告只含计数与事件种类（各版本遮住的字符数、缺口复用与新标记的区间数、
- * 放回的换行记号数、自检失败即关的 [redacted-unaligned] 行、不动点触顶等），不含任何正文，供有日志通道的
- * 调用方记录诊断。不从任何 index 转出。
+ * 放回的换行记号数、自检失败即关的 [redacted-unaligned] 行、不动点触顶、各检测规则的命中数与否决、引用跳过、
+ * 花括号失配回退、截断命中、已遮与底线已覆盖的跳过等），不含任何正文，供有日志通道的调用方记录诊断。不从任何
+ * index 转出。
  */
 export function redactDeveloperTextWithReport(text: string): {
   text: string;

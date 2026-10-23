@@ -1,15 +1,17 @@
 /**
  * 脱敏阶段 4 的按位置渲染（设计 redaction-design-2026-10-19 第 4.6 节）。
  *
- * 输入只有原文 x 与遮蔽位置集合（追踪重放给出的四个版本位置之并，后续包的检测器区间也并入这里），输出只由
- * 原文里未被遮的字符与合成文本拼成，所以不可能把别的版本已经遮住的输入字节重新写出（按来源分流原型的渲染泄漏）。
+ * 输入只有原文 x 与遮蔽位置集合（追踪重放给出的四个版本位置之并 ∪ 检测器区间），输出只由原文里未被遮的字符
+ * 与合成文本拼成，所以不可能把别的版本已经遮住的输入字节重新写出（按来源分流原型的渲染泄漏）。
  *
  * 被遮区间（相邻被遮位置连成的最长区间）按下面的顺序处理：
  * 1. 区间里含有输入原有的完整标记、且没有任何“内容”位置（其余只有结构记号、引号及其转义反斜杠）时原样
  *    输出：这些位置在不变量 S 的口径里都是信息等价的，原样输出也保证幂等（原子标记：被遮区间触到输入里
  *    原有的完整标记时，调用方已把整个标记并入区间）。
  * 2. 用各版本的缺口（每个缺口的合成文本都只由标记、引号、换行组成）加信息等价字符的原样步精确铺满区间：
- *    每个位置先按版本优先级试缺口（现行规则 v3 优先，再依次 v2、v1、v0），都不行时才原样输出一个信息等价
+ *    每个位置先按版本优先级试缺口（现行规则 v3 优先，再依次 v2、v1、v0，最后是检测器缺口——合成文本就是检测
+ *    规则的标记，例如前缀 token 的 [redacted-api-key]；历史版本也遮住的区间因此与上一包逐字相同，只有底线没遮
+ *    到的区间才用检测器的标记），都不行时才原样输出一个信息等价
  *    记号（结构记号、原有标记、引号、紧贴引号的反斜杠串）。这样常见写法的输出与 HEAD 逐字相同（例如 JSON
  *    数值位置的 "[redacted]"，引号是合成的），早期版本吃进去的转义引号反斜杠也不会被吞掉，载体 JSON 保持合法
  *    （复查意见 3）。只有引号或结构、没有标记的区间（例如空引号值 password='' 的闭引号）同样先试缺口：历史
@@ -23,11 +25,15 @@
  */
 import type { BaselineRevision, Gap, StructureAnalysis, StructureToken } from './trackedReplay.js';
 
-/** 新写标记只用最通用的一个；更具体的标记只会经缺口复用（历史版本自己写出的）出现。 */
+/** 新写标记只用最通用的一个；更具体的标记只会经缺口复用出现（历史版本自己写出的，或检测规则指定的）。 */
 const NEW_MARKER = '[redacted]';
 
+/**
+ * 一组可复用的缺口：四个历史版本各一组（合成文本是版本自己写出的替换文本），检测器一组（revision='detector'，
+ * 合成文本是检测规则的标记）。调用方按优先级排列：v3、v2、v1、v0，检测器最后。
+ */
 export interface GapSet {
-  revision: BaselineRevision;
+  revision: BaselineRevision | 'detector';
   gaps: readonly Gap[];
 }
 
@@ -265,16 +271,38 @@ interface Candidate {
   shape: SynthShape;
 }
 
-/** 每个起点上可用的缺口，按版本优先级（调用方传入的 gapSets 顺序）排列。合成文本的形态按文本记忆化。 */
+/**
+ * 每个起点上可用的缺口，按版本优先级（调用方传入的 gapSets 顺序）排列。用按位置下标的单链表保存（head[p] 是起点
+ * p 上第一个候选，next[i] 是同一起点上的下一个），不为每个起点分配数组；下标都存 slot+1，0 表示没有，新分配的
+ * 类型数组本来就是 0，不必整篇预填 -1。合成文本的形态按文本记忆化。
+ */
+interface CandidateIndex {
+  head: Int32Array;
+  next: Int32Array;
+  gaps: Gap[];
+  shapes: SynthShape[];
+}
+
 function candidatesByStart(
+  length: number,
   gapSets: readonly GapSet[],
   stats: RenderStats
-): Map<number, Candidate[]> {
-  const byStart = new Map<number, Candidate[]>();
-  const shapes = new Map<string, SynthShape>();
+): CandidateIndex {
+  let total = 0;
   for (const { gaps } of gapSets) {
-    for (const gap of gaps) {
-      if (gap.end <= gap.start) {
+    total += gaps.length;
+  }
+  const head = new Int32Array(length + 1);
+  const next = new Int32Array(total);
+  const gapsOut: Gap[] = [];
+  const shapesOut: SynthShape[] = [];
+  const shapes = new Map<string, SynthShape>();
+  // 逆序遍历（优先级最低的缺口集、集内最后一个缺口先处理）并插到表头，遍历链表时恰好是 gapSets 的原顺序。
+  for (let setIndex = gapSets.length - 1; setIndex >= 0; setIndex--) {
+    const gaps = gapSets[setIndex]?.gaps ?? [];
+    for (let gapIndex = gaps.length - 1; gapIndex >= 0; gapIndex--) {
+      const gap = gaps[gapIndex];
+      if (gap === undefined || gap.end <= gap.start) {
         continue;
       }
       let shape = shapes.get(gap.synth);
@@ -286,15 +314,24 @@ function candidatesByStart(
         stats.impureSynths++;
         continue;
       }
-      const list = byStart.get(gap.start);
-      if (list === undefined) {
-        byStart.set(gap.start, [{ gap, shape }]);
-      } else {
-        list.push({ gap, shape });
+      if (gap.start < 0 || gap.start > length) {
+        // 起点在 x 之外的缺口不会被任何区间查到（与按起点查表的旧实现一致），不入表。
+        continue;
       }
+      const slot = gapsOut.length;
+      gapsOut.push(gap);
+      shapesOut.push(shape);
+      next[slot] = head[gap.start] ?? 0;
+      head[gap.start] = slot + 1;
     }
   }
-  return byStart;
+  return { head, next, gaps: gapsOut, shapes: shapesOut };
+}
+
+function candidateAt(index: CandidateIndex, slot: number): Candidate | null {
+  const gap = index.gaps[slot];
+  const shape = index.shapes[slot];
+  return gap === undefined || shape === undefined ? null : { gap, shape };
 }
 
 /** 铺满区间的一步：沿用某个版本的缺口，或原样输出一个信息等价记号。 */
@@ -304,20 +341,49 @@ function isVerbatim(step: Step): step is { verbatimStart: number; verbatimEnd: n
   return 'verbatimStart' in step;
 }
 
+interface TileFrame {
+  at: number;
+  /** 下一个要试的候选（链表下标；-1 = 缺口都试过了）。 */
+  cursor: number;
+  /** 原样步是否已经试过。 */
+  verbatimTried: boolean;
+}
+
 /**
  * 用缺口与原样步精确铺满 [start, end)：显式栈的深度优先，每个位置先按优先级试缺口，再试原样步；失败的位置
- * 记忆化（dead 由调用方复用，失败时清空）。常见情形是单个缺口恰好等于区间，第一步即命中。exemptAt 给出某
- * 位置上信息等价记号的长度（0 = 内容字符，不能原样输出）。
+ * 记忆化（dead 由调用方复用，失败时清空）。常见情形是单个缺口恰好等于区间，第一步即命中（快路径，结果与深度
+ * 优先的第一步相同，只是不分配栈）。exemptAt 给出某位置上信息等价记号的长度（0 = 内容字符，不能原样输出）。
  */
 function tile(
-  byStart: Map<number, Candidate[]>,
-  exemptAt: (position: number) => number,
+  index: CandidateIndex,
+  exemptAt: (position: number, end: number) => number,
   start: number,
   end: number,
   dead: Set<number>
 ): Step[] | null {
+  if (!dead.has(start)) {
+    // 快路径：深度优先在起点上选的是第一个不越过区间末尾的缺口；它恰好铺满区间时直接返回同一结果。
+    for (let slot = (index.head[start] ?? 0) - 1; slot >= 0; slot = (index.next[slot] ?? 0) - 1) {
+      const gapEnd = index.gaps[slot]?.end ?? Number.POSITIVE_INFINITY;
+      if (gapEnd > end) {
+        continue;
+      }
+      if (gapEnd === end) {
+        const only = candidateAt(index, slot);
+        if (only !== null) {
+          return [only];
+        }
+      }
+      break;
+    }
+  }
+  const frameAt = (at: number): TileFrame => ({
+    at,
+    cursor: dead.has(at) ? -1 : (index.head[at] ?? 0) - 1,
+    verbatimTried: false,
+  });
   const chosen: Step[] = [];
-  const stack: Array<{ at: number; next: number }> = [{ at: start, next: 0 }];
+  const stack: TileFrame[] = [frameAt(start)];
   for (;;) {
     const frame = stack[stack.length - 1];
     if (frame === undefined) {
@@ -327,26 +393,27 @@ function tile(
     if (frame.at === end) {
       return chosen;
     }
-    const candidates = dead.has(frame.at) ? [] : (byStart.get(frame.at) ?? []);
     let advanced = false;
-    while (!advanced && frame.next <= candidates.length) {
-      const index = frame.next++;
-      const candidate = candidates[index];
-      if (candidate !== undefined) {
-        if (candidate.gap.end > end) {
-          continue;
-        }
-        chosen.push(candidate);
-        stack.push({ at: candidate.gap.end, next: 0 });
-        advanced = true;
-        break;
+    while (frame.cursor >= 0) {
+      const slot = frame.cursor;
+      frame.cursor = (index.next[slot] ?? 0) - 1;
+      const candidate = candidateAt(index, slot);
+      if (candidate === null || candidate.gap.end > end) {
+        continue;
       }
+      chosen.push(candidate);
+      stack.push(frameAt(candidate.gap.end));
+      advanced = true;
+      break;
+    }
+    if (!advanced && !frame.verbatimTried) {
       // 缺口都试过了：最后一个选择是原样输出一个信息等价记号（截到区间末尾）。
-      const step = dead.has(frame.at) ? 0 : exemptAt(frame.at);
+      frame.verbatimTried = true;
+      const step = dead.has(frame.at) ? 0 : exemptAt(frame.at, end);
       if (step > 0) {
         const to = Math.min(end, frame.at + step);
         chosen.push({ verbatimStart: frame.at, verbatimEnd: to });
-        stack.push({ at: to, next: 0 });
+        stack.push(frameAt(to));
         advanced = true;
       }
     }
@@ -384,7 +451,8 @@ function exemptTokenLength(
   at: number,
   end: number
 ): number {
-  const tokenIndex = tokenAtStart === null ? -1 : (tokenAtStart[at] ?? -1);
+  // tokenAtStart 存 记号下标+1，0 表示该位置不是记号起点。
+  const tokenIndex = tokenAtStart === null ? -1 : (tokenAtStart[at] ?? 0) - 1;
   if (tokenIndex >= 0) {
     return Math.min(tokens[tokenIndex]?.end ?? at, end) - at;
   }
@@ -464,29 +532,34 @@ class Output {
   }
 }
 
-/** 结构位置的前缀和：O(1) 判断某区间里有没有结构字符。 */
-function structurePrefix(structure: Uint8Array): Int32Array {
-  const prefix = new Int32Array(structure.length + 1);
-  for (let index = 0; index < structure.length; index++) {
-    prefix[index + 1] = (prefix[index] ?? 0) + (structure[index] === 1 ? 1 : 0);
+/**
+ * [start, end) 里有没有结构字符。只对铺满区间所选的缺口调用，这些缺口互不重叠且都在被遮区间内，所以总开销
+ * 不超过被遮字符数（线性），不必为整篇分配前缀和数组。
+ */
+function hasStructureIn(marks: Uint8Array, start: number, end: number): boolean {
+  for (let index = start; index < end; index++) {
+    if (marks[index] === 1) {
+      return true;
+    }
   }
-  return prefix;
+  return false;
 }
 
 /**
  * 按位置渲染。hidden 是与 x 等长的遮蔽位置（调用方已做原子标记扩展；本函数再把被部分遮住的结构记号就地扩展
- * 为整体，只会多遮），structure 是 analyzeStructure(x)，gapSets 按版本优先级排列（v3 在前）。
+ * 为整体，只会多遮），structure 是 analyzeStructure(x)，gapSets 按版本优先级排列（v3 在前）。cores 是调用方
+ * 已算好的 markerCores(x)（同一个 x；缺省时在这里计算），省掉一遍全文扫描。
  */
 export function renderByPositions(
   x: string,
   hidden: Uint8Array,
   structure: StructureAnalysis,
   gapSets: readonly GapSet[],
-  wantOrigin = false
+  wantOrigin = false,
+  cores: ReadonlyArray<readonly [number, number]> = markerCores(x)
 ): RenderResult {
   const stats = emptyRenderStats();
   const output = new Output(wantOrigin);
-  const cores = markerCores(x);
   const inCore = new Uint8Array(x.length);
   for (const [start, end] of cores) {
     inCore.fill(1, start, end);
@@ -495,16 +568,20 @@ export function renderByPositions(
   expandStructureTokens(hidden, tokens);
   let tokenAtStart: Int32Array | null = null;
   if (tokens.length > 0) {
-    tokenAtStart = new Int32Array(x.length + 1).fill(-1);
+    tokenAtStart = new Int32Array(x.length + 1);
     for (const [index, token] of tokens.entries()) {
-      tokenAtStart[token.start] = index;
+      tokenAtStart[token.start] = index + 1;
     }
   }
-  const prefix = structurePrefix(structure.marks);
-  const hasStructure = (start: number, end: number): boolean =>
-    (prefix[end] ?? 0) - (prefix[start] ?? 0) > 0;
+  const structureMarks = structure.marks;
+  const exemptAt = (at: number, end: number): number =>
+    exemptTokenLength(x, inCore, tokens, tokenAtStart, at, end);
+  // 原样步不跨过输入原有的标记：含内容的区间触到标记时，标记随区间一起被同一个标记取代（原子标记），
+  // 不单独重出，否则 password=SYNTHETIChead[redacted] 会渲染成两个相邻标记。
+  const verbatimStepAt = (at: number, end: number): number =>
+    inCore[at] === 1 ? 0 : exemptAt(at, end);
   const dead = new Set<number>();
-  let byStart: Map<number, Candidate[]> | null = null;
+  let byStart: CandidateIndex | null = null;
   let index = 0;
   while (index < x.length) {
     if (hidden[index] !== 1) {
@@ -522,14 +599,9 @@ export function renderByPositions(
     }
     const start = index;
     index = end;
-    const exemptAt = (at: number): number =>
-      exemptTokenLength(x, inCore, tokens, tokenAtStart, at, end);
-    // 原样步不跨过输入原有的标记：含内容的区间触到标记时，标记随区间一起被同一个标记取代（原子标记），
-    // 不单独重出，否则 password=SYNTHETIChead[redacted] 会渲染成两个相邻标记。
-    const verbatimStepAt = (at: number): number => (inCore[at] === 1 ? 0 : exemptAt(at));
     let content = false;
     for (let at = start; at < end; ) {
-      const step = exemptAt(at);
+      const step = exemptAt(at, end);
       if (step === 0) {
         content = true;
         break;
@@ -542,7 +614,7 @@ export function renderByPositions(
       continue;
     }
     if (byStart === null) {
-      byStart = candidatesByStart(gapSets, stats);
+      byStart = candidatesByStart(x.length, gapSets, stats);
     }
     const tiled = tile(byStart, verbatimStepAt, start, end, dead);
     if (tiled !== null) {
@@ -557,7 +629,7 @@ export function renderByPositions(
           continue;
         }
         const { gap, shape } = step;
-        if (!hasStructure(gap.start, gap.end)) {
+        if (!hasStructureIn(structureMarks, gap.start, gap.end)) {
           // 缺口里没有结构字符：合成文本原样沿用（它自带的换行记号是版本自己写出的）。
           output.synth(gap.synth);
           continue;
