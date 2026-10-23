@@ -193,6 +193,8 @@ function reportBridgeFailure(
  * runtimeSafetyGate 完成）、sessionToolCalls（每次调用对全部历史做 O(n) 重映射）与 currentRound
  * （与 iteration 重复）在 src/tools、宿主与 Core 中都没有读取者，已不再投影；
  * ToolRuntimeCallContext 上对应的可选字段是否收窄依赖待决事项②，这里不改类型。
+ * 旧的 cache 投影（把 memoryCoordinator 当作工具结果缓存端口）随缓存层删除（W1-04，决定①），
+ * 宿主请求不再带 cache 键；memoryCoordinator 本身仍按原字段投影。
  */
 function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): ToolCallRequest {
   const { runtime, loopCtx } = context;
@@ -223,10 +225,6 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       resourceScope: loopCtx.resourceScope,
       presetName: runtime.presetName,
       iteration: loopCtx.iteration || 0,
-      // 当前无消费者：src/tools、宿主与 Core 都不读取 runtime.cache，宿主侧没有第二层结果缓存；
-      // 把 memoryCoordinator 放在这里只是旧投影的残留。字段去留随待决事项①（SessionStore
-      // 工具缓存去留）一起决定，决定前保持原样投影，不改变宿主收到的请求形状。
-      cache: loopCtx.memoryCoordinator || null,
       diagnostics: loopCtx.diagnostics || null,
       safetyPolicy,
       fileCache: runtime.fileCache,

@@ -1,24 +1,22 @@
 /**
- * SessionStore — Bootstrap 会话级存储 (合并 EpisodicMemory + ToolResultCache)
+ * SessionStore — Bootstrap 会话级存储 (源自 EpisodicMemory)
  *
- * 内部子系统:
- *   1. DimensionReports — 跨维度分析报告 + 结构化证据 + 交叉引用 (from EpisodicMemory)
- *   2. ReadOnlyCache — 只读工具结果缓存 (from ToolResultCache, 排除副作用工具 B3 fix)
- *      生产中没有写入者也没有读取者 (C64)，详见 §8；去留待决事项①。
+ * 内部子系统: DimensionReports — 跨维度分析报告 + 结构化证据 + 交叉引用 + Tier 反思。
+ *
+ * 只读工具结果缓存已删除（W1-04，审阅包 L6-P26 / C64，按决定①的 2026-10-20 答复）：它在生产中
+ * 没有写入者也没有读取者，重复调用去重由 Agent 工具管道的 duplicateCache 承担。缓存 Map、
+ * get/set 别名、TTL、显式清理定时器（cleanupIntervalMs/ttlMs）随之删除；getStats().cache 在过渡期
+ * 固定为全零对象（见 getStats）。
  *
  * 替代关系:
  *   EpisodicMemory.js → 全部维度报告/证据/反思逻辑
- *   ToolResultCache.js → LRU 缓存逻辑 (仅只读工具)
  *
  * 新增能力 (vs 原模块):
  *   - getDistilledForProducer(dimId): Producer 专用蒸馏上下文 (B2 fix)
- *   - 仅缓存 code.read/search，副作用工具不能进入缓存 (B3 fix)
  *   - buildContextForDimension 增强: 消费 workingMemoryDistilled (B1 fix, 已在 EpisodicMemory 修复)
- *   - 统一的 getStats(): 合并维度 + 缓存统计
+ *   - 统一的 getStats(): 维度统计 (+ 过渡期全零的 cache 子对象)
  *
- * 生命周期: 与 Bootstrap 会话一致。
- * 缓存过期: 默认惰性清扫 (读取时按 TTL 判定、写入前顺带淘汰)，不注册后台定时器；
- *   只有显式传入 cleanupIntervalMs>0 才注册 'SessionStore/cleanup' interval (见 SessionStoreConfig)。
+ * 生命周期: 与 Bootstrap 会话一致；不注册任何后台定时器，宿主在会话结束时调用 dispose() 释放数据。
  * 持久化: 通过 saveCheckpoint / loadCheckpoint 实现断点续传。
  *
  * @module SessionStore
@@ -28,11 +26,9 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Disposable } from '@alembic/core/events';
-import { timerRegistry } from '@alembic/core/events';
 import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
-import { stableStringify } from '#shared/serialization.js';
 import { estimateTokens, truncateToTokenBudget } from '#shared/tokenUtils.js';
 import type { SessionStoreNormalization, SessionStoreSerialized } from './SessionStoreSchema.js';
 import {
@@ -41,18 +37,37 @@ import {
   validateSessionStoreShape,
 } from './SessionStoreSchema.js';
 
-// ── 类型定义 ──
+/** getStats().cache 的形状；字段名沿用已删除的只读工具缓存统计，宿主按这些名字打印日志。 */
+interface SessionStoreCacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  hitRate: string;
+  searchCacheSize: number;
+  fileCacheSize: number;
+}
 
-/** 缓存上限：Agent runtime 自有策略，避免消费 Core shared/constants 内部路径。 */
-const SESSION_CACHE_DEFAULTS = Object.freeze({
-  maxFileEntries: 200,
-  maxSearchEntries: 500,
-  defaultTtlMs: 30 * 60 * 1000,
+/** 随只读工具缓存删除而失效的构造参数键；传入时只记 debug 日志，不再有任何效果。 */
+const RETIRED_CONFIG_KEYS = ['ttlMs', 'cleanupIntervalMs'] as const;
+
+/**
+ * getStats().cache 的过渡期固定值（W1-04 删除只读工具缓存后保留的返回形状）。
+ *
+ * 消费者：宿主 Alembic lib/recipe-pipeline/generate/execution/consumers/SessionResultConsumer.ts:78
+ *   以 `if (emStats.cache)` 判空后打印 hitRate/searchCacheSize/fileCacheSize。缓存删除前这些值在生产中
+ *   本来就恒为零（缓存从无写入者），所以固定全零不改变宿主日志内容。
+ * 删除触发条件：派发行 D11 的宿主提交（删除 SessionResultConsumer 的 cache 统计分支）验收落地后，
+ *   删除 getStats().cache 字段与本常量（公开返回形状收窄，归 W2c）。
+ * 负责人：AlembicAgent 窗口。
+ */
+const RETIRED_TOOL_CACHE_STATS: Readonly<SessionStoreCacheStats> = Object.freeze({
+  hits: 0,
+  misses: 0,
+  evictions: 0,
+  hitRate: '0%',
+  searchCacheSize: 0,
+  fileCacheSize: 0,
 });
-
-const MAX_FILE_CACHE = SESSION_CACHE_DEFAULTS.maxFileEntries;
-const MAX_SEARCH_CACHE = SESSION_CACHE_DEFAULTS.maxSearchEntries;
-const DEFAULT_TTL_MS = SESSION_CACHE_DEFAULTS.defaultTtlMs;
 
 // ── 类型定义 ──
 
@@ -142,30 +157,14 @@ export interface DimensionReportInput {
   digest?: DimensionDigest | null;
 }
 
-/** 缓存条目 */
-interface SearchCacheEntry {
-  result: unknown;
-  cachedAt: number;
-  hitCount: number;
-}
-
-/** SessionStore 构造选项 */
+/**
+ * SessionStore 构造选项。
+ *
+ * 旧的 ttlMs / cleanupIntervalMs 已随只读工具缓存删除（W1-04）：本类不再注册任何定时器，
+ * 旧调用方若仍经索引签名传入这两个键，构造时被忽略（不进入 projectContext，也没有任何效果）。
+ */
 export interface SessionStoreConfig {
   projectContext?: Record<string, unknown>;
-  /** 只读缓存条目 TTL (毫秒)，<=0 表示永不过期；默认 30 分钟。 */
-  ttlMs?: number;
-  /**
-   * 主动清扫间隔 (毫秒)。默认 (undefined 或 <=0) 不注册任何定时器：过期条目在 getCachedResult
-   * 读取时按 TTL 判定、在 cacheToolResult 写入前顺带清扫 (惰性清扫)。
-   *
-   * 默认惰性的原因 (C41)：Core 全局 timerRegistry 只 unref 不自动移除条目，宿主 (长驻 daemon /
-   * api-server) 每次 generate 都新建 SessionStore 却从不 dispose；构造期注册的 interval 闭包会把
-   * 每个实例 (含全部维度报告与证据) 永久钉在注册表里，泄漏随作业次数线性增长。
-   *
-   * 显式传入 >0 才向 timerRegistry 注册 'SessionStore/cleanup' interval；该闭包只经 WeakRef 持有
-   * 实例，实例被 GC 后下一次触发即自注销。正常释放路径仍是调用 dispose()。
-   */
-  cleanupIntervalMs?: number;
   /** 项目名 (便捷传入, 会合并到 projectContext) */
   projectName?: string;
   primaryLang?: string;
@@ -183,13 +182,6 @@ interface SessionContextBlock {
   text: string;
 }
 
-/** 工具参数 */
-interface ToolArgs {
-  pattern?: string;
-  filePath?: string;
-  [key: string]: unknown;
-}
-
 // ═══════════════════════════════════════════════════════════
 export class SessionStore implements Disposable {
   // ── 子系统 1: DimensionReports (from EpisodicMemory) ──
@@ -202,14 +194,6 @@ export class SessionStore implements Disposable {
   #submittedCandidates = new Map<string, CandidateSummary[]>();
   #projectContext: Record<string, unknown>;
 
-  // ── 子系统 2: ReadOnlyCache (from ToolResultCache) ──
-  #searchCache = new Map<string, SearchCacheEntry>();
-  #fileCache = new Map<string, SearchCacheEntry>();
-  /** 只读缓存的命中 / 未命中 / 淘汰计数，经 getStats().cache 暴露，clearCache() 归零 */
-  #cacheStats = { hits: 0, misses: 0, evictions: 0 };
-  #ttlMs;
-  #cleanupTimer: ReturnType<typeof setInterval> | null = null;
-
   #logger: ReturnType<typeof Logger.getInstance>;
 
   constructor(config: SessionStoreConfig = {}) {
@@ -221,14 +205,17 @@ export class SessionStore implements Disposable {
       ),
       ...(config.projectContext || {}),
     });
-    this.#ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
     this.#logger = Logger.getInstance();
 
-    // 默认惰性清扫，不注册全局定时器 (原因见 SessionStoreConfig.cleanupIntervalMs)。
-    // 只有调用方显式开启主动清扫且 TTL 有效时才注册；TTL<=0 时没有可过期条目，timer 无意义。
-    const cleanupInterval = config.cleanupIntervalMs ?? 0;
-    if (this.#ttlMs > 0 && cleanupInterval > 0) {
-      this.#cleanupTimer = this.#registerCleanupTimer(cleanupInterval);
+    // 旧调用方仍可能经索引签名传入已删除的缓存键：不注册定时器、不进入 projectContext，
+    // 只留一条 debug 日志说明被忽略的键与原因，便于定位尚未迁移的调用点。
+    const retiredKeys = RETIRED_CONFIG_KEYS.filter((key) => config[key] !== undefined);
+    if (retiredKeys.length > 0) {
+      this.#log(
+        'debug',
+        `[SessionStore] ignored retired config key(s) ${retiredKeys.join(', ')}: ` +
+          'the read-only tool cache and its cleanup timer were removed (W1-04); no timer registered'
+      );
     }
   }
 
@@ -739,103 +726,7 @@ export class SessionStore implements Disposable {
   }
 
   // ═══════════════════════════════════════════════════════
-  // §8: 只读缓存 (from ToolResultCache, B3 fix)
-  //
-  // 生产不可达 (C64)：缓存链路随 Agent 工具管道的重复调用去重 (duplicateCache) 演进失去了写入者——
-  //   - 写入：唯一生产写入路径 observationRecord → MemoryCoordinator.recordObservation 已移出默认工具
-  //     管道 (L5-P47)，旧链路有信封时又总以 cacheHit=true 调用而跳过写入；
-  //   - 读取：MemoryCoordinator.getCachedResult 代理与 kernel ToolResultCacheProvider 端口都没有调用方，
-  //     宿主也不直接调用本节方法或 get/set 别名。
-  // 因此生产中缓存恒空，getStats().cache 恒为零命中 (宿主 SessionResultConsumer 只读它打印统计)。
-  // 另注意：read 命中返回改写后的 {content, path, cached: true}，与工具原始结果形状不同。
-  // 删除 (连同别名、cacheStats、可选清扫 timer、Coordinator 代理与 kernel 契约，属公开面变更) 还是在
-  // ToolRouter 读路径接线并统一返回形状，取决于待决事项①；决定前不改缓存本体与公开签名。
-  // ═══════════════════════════════════════════════════════
-
-  /** 只复用同一完整请求；路径、范围和搜索选项都参与缓存键。 */
-  getCachedResult(toolName: string, args: ToolArgs): unknown | null {
-    if (toolName !== 'code') {
-      return null;
-    }
-    const params = normalizeCacheArgs(args);
-    const cache =
-      toolName === 'code' && params.action === 'search'
-        ? this.#searchCache
-        : toolName === 'code' && params.action === 'read'
-          ? this.#fileCache
-          : null;
-    const key = stableStringify(params);
-    const entry = cache?.get(key);
-    if (entry) {
-      if (this.#ttlMs > 0 && Date.now() - entry.cachedAt > this.#ttlMs) {
-        cache?.delete(key);
-        this.#cacheStats.evictions++;
-      } else {
-        entry.hitCount++;
-        this.#cacheStats.hits++;
-        cache?.delete(key);
-        cache?.set(key, entry);
-        return entry.result;
-      }
-    }
-    this.#cacheStats.misses++;
-    return null;
-  }
-
-  cacheToolResult(toolName: string, args: ToolArgs, result: unknown) {
-    if (toolName !== 'code') {
-      return;
-    }
-    const params = normalizeCacheArgs(args);
-    const record =
-      result && typeof result === 'object' ? (result as Record<string, unknown>) : null;
-    if (record?.ok === false || record?.error !== undefined) {
-      return;
-    }
-    let cache: Map<string, SearchCacheEntry>;
-    let value: unknown;
-    let limit: number;
-    if (params.action === 'search') {
-      cache = this.#searchCache;
-      value = result;
-      limit = MAX_SEARCH_CACHE;
-    } else if (params.action === 'read' && typeof params.path === 'string') {
-      const content = record ? record.content : typeof result === 'string' ? result : null;
-      if (typeof content !== 'string') {
-        return;
-      }
-      cache = this.#fileCache;
-      value = { content, path: params.path, cached: true };
-      limit = MAX_FILE_CACHE;
-    } else {
-      return;
-    }
-    // 惰性清扫：没有后台 timer 时过期条目在这里顺带淘汰 (读取路径由 getCachedResult 按 TTL 判定)。
-    // 两个缓存上限很小 (200 / 500)，O(n) 扫描成本可忽略；TTL<=0 时 #evictExpired 直接返回。
-    this.#evictExpired();
-    const key = stableStringify(params);
-    cache.delete(key);
-    cache.set(key, { result: value, cachedAt: Date.now(), hitCount: 0 });
-    if (cache.size > limit) {
-      const oldest = cache.keys().next().value;
-      if (oldest !== undefined) {
-        cache.delete(oldest);
-      }
-    }
-  }
-
-  /** 兼容 ToolResultCache.get()；Agent src 与宿主均无调用方 (C64)，去留随事项①。 */
-  get(toolName: string, args: ToolArgs): unknown | null {
-    return this.getCachedResult(toolName, args);
-  }
-
-  /** 兼容 ToolResultCache.set()；Agent src 与宿主均无调用方 (C64)，去留随事项①。 */
-  set(toolName: string, args: ToolArgs, result: unknown) {
-    this.cacheToolResult(toolName, args, result);
-  }
-
-  // ═══════════════════════════════════════════════════════
-  // §9: 持久化 (断点续传)
+  // §8: 持久化 (断点续传)
   // ═══════════════════════════════════════════════════════
 
   /**
@@ -957,7 +848,7 @@ export class SessionStore implements Disposable {
   }
 
   // ═══════════════════════════════════════════════════════
-  // §10: 序列化
+  // §9: 序列化
   // ═══════════════════════════════════════════════════════
 
   toJSON(): SessionStoreSerialized {
@@ -1064,12 +955,10 @@ export class SessionStore implements Disposable {
     this.#crossReferences = snapshot.crossReferences;
     this.#tierReflections = snapshot.tierReflections;
     this.#projectContext = snapshot.projectContext;
-    this.#searchCache.clear();
-    this.#fileCache.clear();
   }
 
   // ═══════════════════════════════════════════════════════
-  // §11: 统计 + 查询
+  // §10: 统计 + 查询
   // ═══════════════════════════════════════════════════════
 
   /** 获取所有已引用文件 (去重, F10) */
@@ -1084,8 +973,9 @@ export class SessionStore implements Disposable {
   }
 
   /**
-   * 获取统计数据 (合并维度 + 缓存统计, F12)。
-   * cache 子对象在生产中恒为零 (缓存无写入者，见 §8 / C64)；字段属公开返回形状，去留随事项①。
+   * 获取统计数据 (维度统计, F12)。
+   * cache 子对象是只读工具缓存删除后的过渡形状，固定为全零（消费者、删除触发条件与负责人见
+   * RETIRED_TOOL_CACHE_STATS）；每次返回新副本，调用方改写不影响下一次统计。
    */
   getStats() {
     const totalFindings = [...this.#dimensionReports.values()].reduce(
@@ -1100,7 +990,6 @@ export class SessionStore implements Disposable {
       (sum, arr) => sum + arr.length,
       0
     );
-    const { hits, misses } = this.#cacheStats;
     return {
       completedDimensions: this.#dimensionReports.size,
       totalFindings,
@@ -1109,38 +998,24 @@ export class SessionStore implements Disposable {
       crossReferences: this.#crossReferences.length,
       tierReflections: this.#tierReflections.length,
       referencedFiles: this.getAllReferencedFiles().size,
-      cache: {
-        ...this.#cacheStats,
-        hitRate: hits + misses > 0 ? `${((hits / (hits + misses)) * 100).toFixed(1)}%` : '0%',
-        searchCacheSize: this.#searchCache.size,
-        fileCacheSize: this.#fileCache.size,
-      },
+      cache: { ...RETIRED_TOOL_CACHE_STATS },
     };
   }
 
   // ═══════════════════════════════════════════════════════
-  // §12: 清理
+  // §11: 清理
   // ═══════════════════════════════════════════════════════
 
-  /** 清空所有缓存 */
-  clearCache() {
-    this.#searchCache.clear();
-    this.#fileCache.clear();
-    this.#cacheStats = { hits: 0, misses: 0, evictions: 0 };
-  }
-
-  /** 销毁实例，释放定时器 */
+  /**
+   * 销毁实例：清空维度报告、证据、交叉引用、反思与已提交候选。幂等。
+   * 宿主在会话结束时调用（L6-P28），实现 Core Disposable；本类不持有定时器或其它外部资源。
+   */
   dispose() {
-    this.clearCache();
     this.#dimensionReports.clear();
     this.#evidenceStore.clear();
     this.#crossReferences.length = 0;
     this.#tierReflections.length = 0;
     this.#submittedCandidates.clear();
-    if (this.#cleanupTimer) {
-      timerRegistry.clear(this.#cleanupTimer);
-      this.#cleanupTimer = null;
-    }
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1254,87 +1129,9 @@ export class SessionStore implements Disposable {
       .slice(0, limit)
       .map(({ _score, ...rest }) => rest);
   }
-
-  /**
-   * 注册显式主动清扫 timer (仅 cleanupIntervalMs>0 时调用)。
-   *
-   * 闭包只经 WeakRef 持有实例：宿主若从不 dispose，实例仍可被 GC，不会因为 Core timerRegistry
-   * 的 interval 闭包而永久存活。实例被回收后，下一次触发发现 deref 失败即自注销并打 debug 诊断，
-   * 保证注册表条目不随 generate 次数累积。正常释放路径仍是 dispose() → timerRegistry.clear。
-   */
-  #registerCleanupTimer(intervalMs: number): ReturnType<typeof setInterval> {
-    const ref = new WeakRef(this);
-    // logger 是 Core 单例，不是本实例；闭包中不得直接引用 this，否则 WeakRef 失去意义。
-    const logger = this.#logger;
-    const handle = timerRegistry.setInterval(
-      () => {
-        const store = ref.deref();
-        if (store) {
-          store.#evictExpired();
-          return;
-        }
-        // 实例已被回收却无人 dispose：timer 成为孤儿，自行注销并留下可追溯的诊断痕迹。
-        timerRegistry.clear(handle);
-        logger.debug(
-          `[SessionStore] cleanup timer released: store garbage-collected without dispose() (intervalMs=${intervalMs})`
-        );
-      },
-      intervalMs,
-      'SessionStore/cleanup'
-    );
-    logger.debug(
-      `[SessionStore] explicit cleanup timer registered (intervalMs=${intervalMs}, ttlMs=${this.#ttlMs})`
-    );
-    return handle;
-  }
-
-  /**
-   * 清理过期缓存条目 (F13)。
-   * 惰性路径由 cacheToolResult 写入前调用；显式 timer 路径由 #registerCleanupTimer 的闭包调用。
-   */
-  #evictExpired() {
-    if (this.#ttlMs <= 0) {
-      return;
-    }
-    const now = Date.now();
-    let evicted = 0;
-    for (const [key, entry] of this.#searchCache) {
-      if (now - entry.cachedAt > this.#ttlMs) {
-        this.#searchCache.delete(key);
-        evicted++;
-      }
-    }
-    for (const [key, entry] of this.#fileCache) {
-      if (now - entry.cachedAt > this.#ttlMs) {
-        this.#fileCache.delete(key);
-        evicted++;
-      }
-    }
-    if (evicted > 0) {
-      this.#cacheStats.evictions += evicted;
-      this.#logger.debug(`[SessionStore] evicted ${evicted} expired cache entries`);
-    }
-  }
 }
 
 export default SessionStore;
-
-function normalizeCacheArgs(args: ToolArgs): Record<string, unknown> {
-  const { params, ...outer } = args;
-  const normalized = {
-    ...outer,
-    ...(params && typeof params === 'object' && !Array.isArray(params) ? params : {}),
-  } as Record<string, unknown>;
-  // 与路由一致：顶层 action 决定操作，参数不能把副作用操作转换成只读缓存。
-  if (outer.action !== undefined) {
-    normalized.action = outer.action;
-  }
-  if (normalized.path === undefined && typeof normalized.filePath === 'string') {
-    normalized.path = normalized.filePath;
-    delete normalized.filePath;
-  }
-  return normalized;
-}
 
 /** ledger 引用先展开路径；旧纯 file:line 仍按既有入口接受。 */
 function evidenceFilePaths(evidence: string): string[] {

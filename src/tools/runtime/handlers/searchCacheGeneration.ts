@@ -13,7 +13,7 @@
  * - code.write：真正开始写盘时推进（写失败也可能已经改过磁盘）；
  * - terminal.exec：执行器被调用之后推进，无论成功、非零退出、强杀、超时还是抛错（进程可能已部分写盘）；
  *   被安全规则、allowlist、缺沙箱或 cwd 越界拦截、进程从未启动的不推进。
- * 按 mtime 或 TTL 失效属于待决事项①，这里不实现。
+ * 按 mtime 或 TTL 失效：按①答复（2026-10-20）不引入。
  */
 
 import Logger from '@alembic/core/logging';

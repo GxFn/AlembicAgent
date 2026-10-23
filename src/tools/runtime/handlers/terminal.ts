@@ -42,7 +42,7 @@
  *           search cache invalidated 日志。成功、非零退出、137 强杀、超时、执行器抛错一律推进：进程可能
  *           已经（部分）写盘，allowlist 里的 npm/vitest/eslint 也会写格式化结果、产物或缓存文件，按命令
  *           判断“只读”不可靠。参数无效、安全规则、allowlist、缺沙箱、cwd 越界在调用执行器之前就返回，
- *           不推进。不做 mtime/TTL 失效（待决事项①）。
+ *           不推进。不做 mtime/TTL 失效（按①答复（2026-10-20）不引入）。
  */
 
 import { exec } from 'node:child_process';

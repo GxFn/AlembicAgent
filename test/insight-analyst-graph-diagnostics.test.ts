@@ -1,23 +1,26 @@
 /**
- * Analyst 代码实体图谱段（§9）与 abort 短路的诊断（模块审阅 L6-P26 / C56）。
+ * Analyst 代码实体图谱段（§9）删除后的回归（W1-04：审阅包 L6-P26 / C56，决定①）。
  *
  * 背景：generateContextForAgent 在 Agent、Core、宿主中都没有实现，宿主只把 codeEntityGraph 作为
- * graph 工具端口传入，所以 §9 在生产中不可达。§9 删除还是接线取决于待决事项①；决定之前本轮只补诊断，
- * 不删除段落、不改系统提示、不改函数签名：
- *   - 图谱读取抛错不再被静默吞掉；
- *   - 端口缺少 generateContextForAgent、或返回非字符串时报告 invalid，且不把它注入提示；
- *   - 因取消跳过 §9、以及 §6 之前的 abort 短路都留下 aborted 诊断。
- * 生产形状（不传图谱端口）必须保持零诊断，避免每个维度都向 DiagnosticsCollector 灌噪声。
+ * graph 工具端口注入工具上下文，所以 §9 在生产中从未渲染；系统提示却要求模型“优先使用注入的
+ * codeEntityGraph”，指向一个不存在的注入源。按决定①删除：
+ *   - §9 代码块、CodeEntityGraphLike 与 reportCodeEntityGraphRead 删除；
+ *   - 系统提示删去 codeEntityGraph（保留 panorama / projectInfo / sessionStore）；
+ *   - buildAnalystPrompt 第 6 个参数位置保留、类型放宽为 unknown，传入任何值都不调用、不注入；
+ *   - §6 之前的 prompt-build-aborted 取消短路诊断保留。
+ * graph 工具的 codeEntityGraph 端口（kernel registry 的 graph.query 读取表）不受影响。
  */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import type { MemoryReadDiagnostic } from '../src/agent/memory/MemoryReadPolicy.js';
-import { buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
+import { ANALYST_SYSTEM_PROMPT, buildAnalystPrompt } from '../src/agent/prompts/insightAnalyst.js';
+import { GRAPH_QUERY_HOST_READERS } from '../src/tools/kernel/registry.js';
 
-type GraphArg = Parameters<typeof buildAnalystPrompt>[5];
 type SemanticArg = Parameters<typeof buildAnalystPrompt>[4];
 
 const DIM = { id: 'architecture', label: 'Architecture' };
 const PROJECT = { name: 'FixtureProject', lang: 'typescript', fileCount: 2 };
+const GRAPH_HINT = 'graph({ action: "query" }) 工具可以查询更详细的继承链';
 
 async function build(
   graph: unknown,
@@ -30,7 +33,7 @@ async function build(
     null,
     null,
     options.semanticMemory ?? null,
-    graph as GraphArg,
+    graph,
     null,
     null,
     null,
@@ -44,107 +47,64 @@ async function build(
   return { prompt, diagnostics };
 }
 
-function graphDiagnostics(diagnostics: MemoryReadDiagnostic[]): MemoryReadDiagnostic[] {
-  return diagnostics.filter((d) => d.reason.startsWith('code-entity-graph'));
-}
-
-describe('insight analyst §9 code entity graph diagnostics (C56)', () => {
-  it('stays silent in the production shape where no graph port is injected', async () => {
+describe('insight analyst without the §9 code entity graph section (W1-04 / C56)', () => {
+  it('stays silent and graph-free in the production shape where no graph port is injected', async () => {
     const { prompt, diagnostics } = await build(undefined);
 
     expect(diagnostics).toEqual([]);
-    expect(prompt).not.toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
+    expect(prompt).not.toContain(GRAPH_HINT);
   });
 
-  it('injects a string graph context with its follow-up hint and no diagnostics', async () => {
+  it('ignores a legacy graph context port: never calls it and never injects its output', async () => {
     const generateContextForAgent = vi.fn(async () => '## Code Entity Graph\nGraphCtxMarker');
     const { prompt, diagnostics } = await build({ generateContextForAgent });
 
-    expect(generateContextForAgent).toHaveBeenCalledWith({ maxEntities: 20, maxEdges: 40 });
-    expect(prompt).toContain('GraphCtxMarker');
-    expect(prompt).toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
-    expect(graphDiagnostics(diagnostics)).toEqual([]);
+    expect(generateContextForAgent).not.toHaveBeenCalled();
+    expect(prompt).not.toContain('GraphCtxMarker');
+    expect(prompt).not.toContain(GRAPH_HINT);
+    expect(diagnostics.filter((d) => d.reason.startsWith('code-entity-graph'))).toEqual([]);
   });
 
-  it('reports a thrown graph read as an error instead of swallowing it', async () => {
-    const { prompt, diagnostics } = await build({
-      generateContextForAgent: async () => {
-        throw new RangeError('graph store unavailable');
-      },
-    });
-
-    expect(graphDiagnostics(diagnostics)).toEqual([
-      { phase: 'session', status: 'error', reason: 'code-entity-graph-error:RangeError' },
-    ]);
-    // 诊断只带错误名，不带 provider 原始消息，避免观测链泄漏图谱内容。
-    expect(JSON.stringify(diagnostics)).not.toContain('graph store unavailable');
-    expect(prompt).not.toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
-  });
-
-  it('reports a synchronous throw from the port as an error', async () => {
-    const { diagnostics } = await build({
-      generateContextForAgent: () => {
-        throw new Error('sync failure');
-      },
-    });
-
-    expect(graphDiagnostics(diagnostics)).toEqual([
-      { phase: 'session', status: 'error', reason: 'code-entity-graph-error:Error' },
-    ]);
-  });
-
-  it('reports a graph tool port without generateContextForAgent as invalid', async () => {
-    // 宿主真实的 codeEntityGraph 是 graph 工具端口（queryEntity / impactAnalysis / search），没有本方法；
-    // 误传进提示构建器时过去是 TypeError 被吞掉，现在要能定位到端口形状不符。
+  it('ignores the host graph tool port passed into the prompt builder', async () => {
     const toolPort = { queryEntity: vi.fn(), impactAnalysis: vi.fn(), search: vi.fn() };
     const { prompt, diagnostics } = await build(toolPort);
 
-    expect(graphDiagnostics(diagnostics)).toEqual([
-      { phase: 'session', status: 'invalid', reason: 'code-entity-graph-port-invalid' },
-    ]);
     expect(toolPort.queryEntity).not.toHaveBeenCalled();
-    expect(prompt).not.toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
+    expect(toolPort.impactAnalysis).not.toHaveBeenCalled();
+    expect(toolPort.search).not.toHaveBeenCalled();
+    expect(prompt).not.toContain(GRAPH_HINT);
+    expect(diagnostics).toEqual([]);
   });
 
-  it('reports a non-string graph result as invalid and does not inject it', async () => {
-    const { prompt, diagnostics } = await build({
-      generateContextForAgent: async () => ({ entities: [] }) as unknown as string,
-    });
-
-    expect(graphDiagnostics(diagnostics)).toEqual([
-      { phase: 'session', status: 'invalid', reason: 'code-entity-graph-result-invalid' },
-    ]);
-    expect(prompt).not.toContain('[object Object]');
-    expect(prompt).not.toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
-  });
-
-  it('treats a null graph result as "no context" without diagnostics', async () => {
-    const { prompt, diagnostics } = await build({ generateContextForAgent: async () => null });
-
-    expect(graphDiagnostics(diagnostics)).toEqual([]);
-    expect(prompt).not.toContain('graph({ action: "query" }) 工具可以查询更详细的继承链');
-  });
-
-  it('reports the graph section skipped when the run aborts during earlier memory reads', async () => {
-    const controller = new AbortController();
-    const generateContextForAgent = vi.fn(async () => 'GraphCtxMarker');
-    const semanticMemory = {
-      toPromptSection: () => {
-        // 在 §8 持久记忆读取期间取消：§9 读取前看到 aborted，必须跳过并留诊断。
-        controller.abort();
-        return 'semantic';
-      },
-    };
-    const { prompt, diagnostics } = await build(
-      { generateContextForAgent },
-      { abortSignal: controller.signal, semanticMemory }
+  it('no longer tells the model to prefer an injected codeEntityGraph', () => {
+    expect(ANALYST_SYSTEM_PROMPT).not.toContain('codeEntityGraph');
+    expect(ANALYST_SYSTEM_PROMPT).toContain(
+      '优先使用注入的 panorama / projectInfo / sessionStore，再用工具验证关键事实'
     );
+  });
 
-    expect(generateContextForAgent).not.toHaveBeenCalled();
-    expect(prompt).not.toContain('GraphCtxMarker');
-    expect(graphDiagnostics(diagnostics)).toEqual([
-      { phase: 'session', status: 'aborted', reason: 'code-entity-graph-aborted' },
-    ]);
+  it('removes the §9 port type and its diagnostic helper from the source', () => {
+    const source = readFileSync(
+      new URL('../src/agent/prompts/insightAnalyst.ts', import.meta.url),
+      'utf8'
+    );
+    for (const retired of [
+      'CodeEntityGraphLike',
+      'reportCodeEntityGraphRead',
+      'generateContextForAgent',
+      'code-entity-graph',
+    ]) {
+      expect({ retired, present: source.includes(retired) }).toEqual({ retired, present: false });
+    }
+    // 参数位保留：第 6 个参数仍然存在，类型放宽为 unknown。
+    expect(source).toMatch(/\n\s+_codeEntityGraph: unknown,\n/);
+  });
+
+  it('keeps the graph tool codeEntityGraph host port intact', () => {
+    const ports = Object.values(GRAPH_QUERY_HOST_READERS).flatMap((readers) =>
+      readers.map((reader) => reader.port)
+    );
+    expect(ports).toContain('codeEntityGraph');
   });
 
   it('reports the prompt-build abort short-circuit before session context', async () => {

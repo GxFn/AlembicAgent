@@ -642,7 +642,8 @@ export class AgentRuntime {
    *   - contextWindow → 三级递进压缩 + 动态工具结果限额
    *   - tracker → ExplorationTracker 阶段管理 + Nudge + Graceful exit
    *   - trace → ActiveContext 推理链记录
-   *   - memoryCoordinator → 缓存/动态提示/观察记录
+   *   - memoryCoordinator → 动态记忆提示 + note_finding/证据检索工具端口
+   *     （工具结果缓存与观察记录已随 W1-04 删除）
    *   - sharedState → 提交去重 { submittedTitles, submittedPatterns }
    *   - source → 'user' | 'system' (影响错误恢复 + 强制摘要行为)
    *

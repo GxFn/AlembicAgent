@@ -1,13 +1,13 @@
 /**
- * L5-P47 / I45 回归：工具管道死链收窄（只做不依赖待决事项①②的部分）。
+ * L5-P47 / I45 回归：工具管道死链收窄；W1-04（审阅包 L6-P26，兼 L5-P47、L3-P08 cache 端口）后续。
  *
- * 1. observationRecord 在生产中是空操作：宿主路由总带信封，中间件以 cacheHit=true 调用
- *    MemoryCoordinator.recordObservation，不会写 SessionStore；无信封路径（门拦截、宿主抛错、
- *    发起前取消）都带 error，SessionStore 拒收。因此默认装配不再包含它；公开导出与
- *    SessionStore 工具缓存的去留等待事项②①，这里只锁定“仍可显式装配”。
+ * 1. observationRecord 在生产中是空操作（宿主路由总带信封，中间件以 cacheHit=true 调用
+ *    MemoryCoordinator.recordObservation，不写 SessionStore），L5-P47 先把它移出默认装配；
+ *    按决定①删除缓存层后，实现、ToolExecutionPipeline 再导出与 ./runtime 导出一并删除，
+ *    MemoryCoordinator.recordObservation 也已不存在。
  * 2. runtimeBridge 不再投影无人读取的 policyValidator / sessionToolCalls / currentRound，
  *    kernel/handler.ts 的 contextFromToolCall 也不再映射 _sessionToolCalls / _currentRound。
- *    cache 字段依决定①暂留（只加注释），这里断言它仍在请求里。
+ *    无消费者的 cache 端口（ToolRuntimeCallContext.cache）随缓存层删除，宿主请求不再带 cache 键。
  *
  * 全部按生产形态构造：真实 createToolPipeline + 不带 capability 的真实 ToolRouterAdapter，
  * 宿主 contextFactory 记录它实际收到的 ToolCallRequest。
@@ -19,11 +19,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import type { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
-import { createToolPipeline as createToolPipelineFromRuntimeIndex } from '../src/agent/runtime/index.js';
+import * as runtimeIndex from '../src/agent/runtime/index.js';
 import type { LoopContext } from '../src/agent/runtime/LoopContext.js';
+import * as toolExecutionPipelineModule from '../src/agent/runtime/ToolExecutionPipeline.js';
 import {
   createToolPipeline,
-  observationRecord,
   ToolExecutionPipeline,
 } from '../src/agent/runtime/ToolExecutionPipeline.js';
 import type { ToolCallContext, ToolCallRequest } from '../src/tools/kernel/index.js';
@@ -123,7 +123,7 @@ afterEach(() => {
 });
 
 describe('default tool pipeline assembly (L5-P47 / I45)', () => {
-  it('assembles the documented order without the no-op observationRecord', () => {
+  it('assembles the documented order without an observation middleware', () => {
     const use = vi.spyOn(ToolExecutionPipeline.prototype, 'use');
     createToolPipeline();
     const names = use.mock.calls.map(([middleware]) => middleware.name);
@@ -133,12 +133,18 @@ describe('default tool pipeline assembly (L5-P47 / I45)', () => {
 
   it('keeps the runtime subpath factory identical to the facade factory', () => {
     // 公开面收窄（事项②）未决：runtime 子路径仍只建议使用 createToolPipeline 组装同等安全的管道。
-    expect(createToolPipelineFromRuntimeIndex).toBe(createToolPipeline);
+    expect(runtimeIndex.createToolPipeline).toBe(createToolPipeline);
   });
 
-  it('no longer reports tool observations to MemoryCoordinator from the default pipeline', async () => {
+  it('no longer exports observationRecord from the runtime subpath or the pipeline facade (W1-04)', () => {
+    expect('observationRecord' in runtimeIndex).toBe(false);
+    expect('observationRecord' in toolExecutionPipelineModule).toBe(false);
+    // 唯一的写入端口也随缓存层删除；默认管道没有任何 memory 观察者。
+    expect('recordObservation' in MemoryCoordinator.prototype).toBe(false);
+  });
+
+  it('runs the default observers on the routed envelope without touching MemoryCoordinator', async () => {
     const memory = new MemoryCoordinator();
-    const recordObservation = vi.spyOn(memory, 'recordObservation');
     try {
       const { runtime, loopCtx, exec, trace, tracker } = makeProductionLikeRun({
         memoryCoordinator: memory,
@@ -150,7 +156,6 @@ describe('default tool pipeline assembly (L5-P47 / I45)', () => {
       });
       expect(outcome.metadata.envelope?.ok).toBe(true);
       expect(exec).toHaveBeenCalledOnce();
-      expect(recordObservation).not.toHaveBeenCalled();
       // 其余观察者仍消费同一个信封。
       expect(tracker.recordToolCall).toHaveBeenCalledOnce();
       expect(trace.recordToolCall).toHaveBeenCalledWith(
@@ -163,31 +168,10 @@ describe('default tool pipeline assembly (L5-P47 / I45)', () => {
       memory.dispose();
     }
   });
-
-  it('still runs observationRecord when a caller assembles it explicitly (export kept until decision ②)', async () => {
-    const memory = new MemoryCoordinator();
-    const recordObservation = vi.spyOn(memory, 'recordObservation');
-    try {
-      const { runtime, loopCtx } = makeProductionLikeRun({ memoryCoordinator: memory });
-      const outcome = await new ToolExecutionPipeline()
-        .use(observationRecord)
-        .execute(terminalCall('git status'), { runtime, loopCtx, iteration: 3 });
-      // 带信封时以 cacheHit=true 调用：这正是它在生产中不写 SessionStore 的原因。
-      expect(recordObservation).toHaveBeenCalledWith(
-        'terminal',
-        expect.anything(),
-        outcome.metadata.envelope,
-        3,
-        true
-      );
-    } finally {
-      memory.dispose();
-    }
-  });
 });
 
 describe('runtime bridge request projection (L5-P47 / I45)', () => {
-  it('does not project unread policyValidator, sessionToolCalls or currentRound to the host', async () => {
+  it('does not project unread policyValidator, sessionToolCalls, currentRound or cache to the host', async () => {
     const memory = new MemoryCoordinator();
     try {
       const { runtime, loopCtx, requests, toolCalls, diagnostics } = makeProductionLikeRun({
@@ -208,10 +192,11 @@ describe('runtime bridge request projection (L5-P47 / I45)', () => {
       expect('currentRound' in projected).toBe(false);
       // 历史调用不再在每次工具调用时被整体重映射。
       expect(map).not.toHaveBeenCalled();
-      // 仍在使用的字段保持原样；cache 依决定①暂留（当前无消费者，只加注释）。
+      // 无消费者的 cache 端口随缓存层删除（W1-04，决定①）：宿主请求不再带 cache 键。
+      expect('cache' in projected).toBe(false);
+      // 仍在使用的字段保持原样。
       expect(projected.iteration).toBe(3);
       expect(projected.memoryCoordinator).toBe(memory);
-      expect(projected.cache).toBe(memory);
       expect(projected.diagnostics).toBe(diagnostics);
     } finally {
       memory.dispose();

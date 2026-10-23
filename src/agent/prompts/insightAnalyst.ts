@@ -105,43 +105,13 @@ export interface AnalystMemoryOptions extends MemoryReadOptions {
   totalMemoryBudget?: number;
 }
 
-/**
- * CodeEntityGraph 最小接口（§9 图谱段专用）。
- *
- * 生产不可达（C56）：generateContextForAgent 在 Agent、Core、宿主中都没有实现；宿主只把 codeEntityGraph
- * 作为 graph 工具端口（queryEntity / impactAnalysis / search，见 tools/kernel/registry.ts）注入工具上下文，
- * 不经 strategyContext 传给本构建器，所以 insightPreset 取到的 ctx.codeEntityGraph 恒为 undefined。
- * §9 删除（保留参数位）还是接线（readMemoryValue 共享 deadline/abort）取决于待决事项①，决定前只补诊断。
- */
-interface CodeEntityGraphLike {
-  generateContextForAgent(opts: {
-    maxEntities: number;
-    maxEdges: number;
-  }): Promise<string | null> | string | null;
-}
-
-/**
- * §9 图谱段的诊断出口。
- *
- * MemoryReadDiagnostic.phase 是 buildAnalystPrompt 公开回调参数里的封闭枚举，新增 'graph' 属于公开面变更
- * （待事项②），所以这里复用 'session'：§9 与 §6 同属 Analyst 首轮注入的会话上下文。来源由
- * 'code-entity-graph' 前缀的 reason 区分，日志行与 DiagnosticsCollector 消息都可据此过滤。
- */
-function reportCodeEntityGraphRead(
-  options: MemoryReadOptions,
-  status: 'aborted' | 'error' | 'invalid',
-  reason: string
-): void {
-  reportMemoryRead(options, { phase: 'session', status, reason: `code-entity-graph-${reason}` });
-}
-
 // ──────────────────────────────────────────────────────────────────
 // System Prompt — Analyst 专用 (~100 tokens)
 // ──────────────────────────────────────────────────────────────────
 
-// 「优先使用注入的 … codeEntityGraph …」一句指向 §9 图谱段，而 §9 在生产中不可达（见
-// CodeEntityGraphLike），提示里实际不会出现图谱上下文（C56）。删除这处引用还是接线 §9 取决于待决事项①，
-// 决定前不改提示文本，避免在事项未答复时改变模型输入；按①定案时与 §9 一起处理。
+// 注入源清单只列真实会出现在首轮提示里的上下文。旧版还列了 codeEntityGraph，指向从未渲染的 §9 图谱段
+// （C56）；按决定①（2026-10-20 答复）删除 §9 时一并去掉，模型不再被引导去找不存在的注入图谱，
+// 图谱事实改由 graph 工具查询。
 export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在深度分析一个真实项目的某个维度。
 
 ## 执行计划
@@ -160,7 +130,7 @@ export const ANALYST_SYSTEM_PROMPT = `你是一位高级软件架构师，正在
 - 每一轮都必须产生新证据；全景数据和已有上下文只能作为线索，不能替代至少一次 code/graph 证据工具调用
 - 没有调用过 code({ action: "structure" }) / code({ action: "search" }) / graph({ action: "query" }) / code({ action: "read" }) 之前，禁止输出最终分析
 - 不要重复搜索相同关键词或读取相同文件（系统会返回缓存并扣轮次）
-- 优先使用注入的 panorama / projectInfo / codeEntityGraph / sessionStore，再用工具验证关键事实
+- 优先使用注入的 panorama / projectInfo / sessionStore，再用工具验证关键事实
 - **note_finding 是硬性质量依据**: 一旦在扫描、探索或验证阶段确认核心发现，允许并且应该立即调用 note_finding({ finding, evidenceRefs, importance })；最终至少提交 3 条结构化发现；如果证据面覆盖多个模式/实践，应记录所有已确认的高价值发现，不因数量超过 6 条而停止，缺失或不足会导致 QualityGate retry
 - **单一事实源**: Producer 只消费 note_finding 结构化发现。最终 Markdown 只能总结已记录的 note_finding，不得新增未结构化记录的模式家族、候选主题或可提交发现。
 - **证据必须落到代码，文档只是线索**: 协作/设计/总结类 markdown（如 wakeflow-ledger、Design、docs 下的 *.md）是二手描述，只能用来导航，不能作为知识证据——note_finding 的 evidenceRefs 台账锚点与最终 (来源: …) 必须指向真实源码/配置文件（.ts/.js/.json/.yaml 等）的具体行。看到 .md 里的架构结论时，回到它描述的真实代码文件验证并引用代码行；抄文档结论而不读代码等同编造。
@@ -367,7 +337,7 @@ interface RescanContextLike {
 /**
  * 构建 Analyst Prompt
  *
- * 12 段结构:
+ * 11 段结构:
  *   §1 任务描述
  *   §2 维度指引
  *   §3 SOP (分析步骤 + 常见错误)
@@ -376,7 +346,7 @@ interface RescanContextLike {
  *   §6 前序维度上下文 (SessionStore / DimensionContext)
  *   §7 Tier Reflection 洞察
  *   §8 历史语义记忆 (Tier 3)
- *   §9 代码实体图谱 (Phase E；生产不可达，去留待事项①，见 CodeEntityGraphLike)
+ *   （原 §9 代码实体图谱段已按决定①删除：生产中从未渲染，图谱事实由 graph 工具查询）
  *   §ES 分析起点证据 (Phase 1-4 Evidence Starters)
  *   §M1 全景上下文 (Panorama Phase 1.8)
  *   §10 Rescan 已有知识上下文
@@ -386,7 +356,8 @@ interface RescanContextLike {
  * @param [dimensionContext] DimensionContext 实例 (跨维度上下文)
  * @param [episodicMemory] SessionStore 实例 (v4.0 增强上下文)
  * @param [semanticMemory] PersistentMemory 实例 (v4.1 历史记忆)
- * @param [codeEntityGraph] CodeEntityGraph 实例 (Phase E 代码实体图谱；参数位保留，生产恒不传，见 CodeEntityGraphLike)
+ * @param [_codeEntityGraph] 已停用的参数位（原 §9 代码实体图谱端口）。只为保持后续位置参数不移位而保留，
+ *   任何传入值都不会被读取或调用；宿主的 codeEntityGraph 只作为 graph 工具端口注入工具上下文。
  * @param [rescanContext] Rescan 已有知识上下文 (增量扫描时注入)
  * @param [panorama] 全景上下文 — 模块角色/层级/耦合/空白区 (Phase 1.8)
  * @param [evidenceStarters] Phase 1-4 证据启发 — 维度级分析起点
@@ -398,7 +369,7 @@ export async function buildAnalystPrompt(
   dimensionContext: DimensionContextLike | null | undefined,
   episodicMemory: EpisodicMemoryLike | null | undefined,
   semanticMemory: SemanticMemoryLike | null | undefined,
-  codeEntityGraph: CodeEntityGraphLike | null | undefined,
+  _codeEntityGraph: unknown,
   rescanContext?: RescanContextLike | null,
   panorama?: PanoramaContextLike | null,
   evidenceStarters?: Record<string, EvidenceStarterEntry> | null,
@@ -500,7 +471,7 @@ note_finding({ finding: "发现描述", evidenceRefs: ["E-1"], importance: 8 })
   const historyParts: string[] = [];
   try {
     if (memoryOptions.abortSignal?.aborted) {
-      // 取消短路：运行已取消时不再读取任何上下文端口（会话、持久记忆、图谱），只返回 §1–§5 的部分提示。
+      // 取消短路：运行已取消时不再读取任何上下文端口（会话、持久记忆），只返回 §1–§5 的部分提示。
       // 留一条 aborted 诊断，让“提示缺少记忆段”可以追溯到取消而不是读取失败（C56）。
       reportMemoryRead(memoryOptions, {
         phase: 'session',
@@ -597,44 +568,6 @@ note_finding({ finding: "发现描述", evidenceRefs: ["E-1"], importance: 8 })
   });
   if (semanticSection.content) {
     parts.push(semanticSection.content);
-  }
-
-  // §9: 代码实体图谱 (Phase E)
-  // 生产不可达：宿主不向构建器传图谱端口（见 CodeEntityGraphLike），未传时静默跳过，不发诊断，
-  // 否则每个维度都会向 DiagnosticsCollector 灌一条无意义告警。§9 删除或接线待事项①；决定前只补诊断，
-  // 图谱失败仍不阻断提示构建（非关键段），但每条跳过路径都要能从诊断里看出原因。
-  // 读取本身尚未套 readMemoryValue 的 deadline/abort 竞速，属于“接线”分支的改动，随事项①处理。
-  if (codeEntityGraph) {
-    if (memoryOptions.abortSignal?.aborted) {
-      // §8 持久记忆读取期间运行被取消：不再发起图谱读取。
-      reportCodeEntityGraphRead(memoryOptions, 'aborted', 'aborted');
-    } else if (typeof codeEntityGraph.generateContextForAgent !== 'function') {
-      // 端口形状不符（例如误把 graph 工具端口传进来）：过去是 TypeError 被吞掉，现在报告 invalid 后跳过。
-      reportCodeEntityGraphRead(memoryOptions, 'invalid', 'port-invalid');
-    } else {
-      try {
-        const graphCtx: unknown = await codeEntityGraph.generateContextForAgent({
-          maxEntities: 20,
-          maxEdges: 40,
-        });
-        if (typeof graphCtx === 'string') {
-          if (graphCtx) {
-            parts.push(graphCtx);
-            parts.push('使用 graph({ action: "query" }) 工具可以查询更详细的继承链、影响分析等。');
-          }
-        } else if (graphCtx !== null && graphCtx !== undefined) {
-          // 宿主输出先验证再进提示：非字符串会被 join 成 "[object Object]" 之类的噪声，跳过并报告。
-          reportCodeEntityGraphRead(memoryOptions, 'invalid', 'result-invalid');
-        }
-      } catch (err: unknown) {
-        // 图谱是非关键段：失败只跳过本段。诊断只带错误名，不带原始消息，避免观测链泄漏图谱内容。
-        reportCodeEntityGraphRead(
-          memoryOptions,
-          'error',
-          `error:${err instanceof Error ? err.name : 'unknown'}`
-        );
-      }
-    }
   }
 
   // §ES: 分析起点证据 (Phase 1-4 Evidence Starters)

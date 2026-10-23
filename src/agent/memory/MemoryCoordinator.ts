@@ -2,7 +2,7 @@
  * MemoryCoordinator — 记忆系统统一协调器
  *
  * 设计原则 (CoALA / MemGPT / Generative Agents / Mem0):
- *   - 协调而非唯一入口: 本类装配运行时记忆 prompt、管理维度 scope 与 SessionStore 缓存；
+ *   - 协调而非唯一入口: 本类装配运行时记忆 prompt、管理维度 scope 并代理 SessionStore 证据检索；
  *     并非所有记忆读写都经此路由（例如 insightAnalyst 直接经 readPersistentMemorySection
  *     读取 PersistentMemory，持久记忆的去重/合并/冲突解决在 MemoryConsolidator 内完成）
  *   - Budget-Aware Injection: 记忆注入受统一 token 预算管控
@@ -413,40 +413,6 @@ export class MemoryCoordinator {
   // ═══════════════════════════════════════════════════════════
 
   /**
-   * 记录工具调用观察：只把非缓存命中的工具结果写入 SessionStore 缓存；
-   * ActiveContext 的轮次/观察记录由 trace.recordToolCall() 负责，不在此处写入。
-   *
-   * 生产中没有调用方（C64）：唯一调用方 observationRecord 已移出默认工具管道（L5-P47），且它在有
-   * 信封时总以 cacheHit=true 调用、这里跳过写入，所以 SessionStore 只读缓存从未被写入。缓存删除还是
-   * 在 ToolRouter 读路径接线取决于待决事项①，决定前保留本方法与“cacheHit 跳过写入”的语义。
-   * @param round 当前迭代轮次
-   * @param [cacheHit=false] 本次是否缓存命中
-   */
-  recordObservation(
-    toolName: string,
-    args: Record<string, unknown>,
-    result: unknown,
-    round: number,
-    cacheHit = false
-  ) {
-    try {
-      // ActiveContext 的数据记录由 trace.recordToolCall() 处理，
-      // 此处只处理缓存写入。
-
-      // 委托给 SessionStore 缓存
-      if (!cacheHit && this.#sessionStore) {
-        this.#sessionStore.cacheToolResult(toolName, args, result);
-      }
-    } catch (err: unknown) {
-      // 观察写入是旁路：失败不影响工具结果，只告警并带上工具名，便于定位是哪类结果写缓存出错。
-      this.#log(
-        'warn',
-        `[MemoryCoordinator] recordObservation error: tool=${toolName}; ${errorMessage(err)}`
-      );
-    }
-  }
-
-  /**
    * 记录关键发现 (从 note_finding handler 调用)
    * @param importance 1-10
    * @param [scopeId] 显式指定 scope (并行安全)；缺省时只有单 scope 才回退到当前 scope，
@@ -565,41 +531,8 @@ export class MemoryCoordinator {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // 缓存代理 (委托到 SessionStore / legacy ToolResultCache)
-  //
-  // 生产不可达（C64）：Agent src 与宿主都不调用这两个代理；runtimeBridge 把本协调器投影到
-  // ToolRuntimeCallContext.cache（kernel ToolResultCacheProvider），但 router/handler 从不读取该端口。
-  // 重复调用去重由 Agent 工具管道的 duplicateCache 承担。代理、SessionStore 缓存与 kernel getCachedResult
-  // 契约删除还是接线取决于待决事项①（删除属公开面变更，另随事项②批次）；决定前保留，只补错误诊断。
-  // ═══════════════════════════════════════════════════════════
-
-  /** 获取缓存的工具结果；读取出错按未命中处理（返回 null）并告警。 */
-  getCachedResult(toolName: string, args: Record<string, unknown>): unknown | null {
-    try {
-      return this.#sessionStore?.getCachedResult(toolName, args) ?? null;
-    } catch (err: unknown) {
-      // 降级为未命中：调用方会走真实工具执行，结果正确性不受影响，只损失一次复用。
-      this.#log(
-        'warn',
-        `[MemoryCoordinator] getCachedResult failed, treated as miss: tool=${toolName}; ${errorMessage(err)}`
-      );
-      return null;
-    }
-  }
-
-  /** 缓存工具结果；写入出错不抛，只告警。 */
-  cacheToolResult(toolName: string, args: Record<string, unknown>, result: unknown) {
-    try {
-      this.#sessionStore?.cacheToolResult(toolName, args, result);
-    } catch (err: unknown) {
-      // 缓存写入是旁路：跳过本次写入，工具结果已交付，不向调用方传播。
-      this.#log(
-        'warn',
-        `[MemoryCoordinator] cacheToolResult failed, write skipped: tool=${toolName}; ${errorMessage(err)}`
-      );
-    }
-  }
+  // 工具结果缓存代理与 recordObservation 已删除（W1-04，审阅包 L6-P26 / C64，决定①）：SessionStore
+  // 只读工具缓存在生产中从无写入者，重复调用去重由 Agent 工具管道的 duplicateCache 承担。
 
   // ═══════════════════════════════════════════════════════════
   // 维度生命周期

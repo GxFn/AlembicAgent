@@ -153,8 +153,9 @@ export {
 // 工具管道公开面收窄登记（L5-P47 / I45，待决事项②未答复前只登记、不改导出）：
 // 这里只再导出部分默认中间件，缺 toolArgumentBoundsGate、runtimeSafetyGate、producerSubmitOnlyGate、
 // evidenceCapture，用这些构件自行组装的管道比默认管道宽松；需要同等安全的管道时只用
-// createToolPipeline()。observationRecord、progressEmitter、eventBusPublisher 不在默认装配且宿主零引用。
+// createToolPipeline()。progressEmitter、eventBusPublisher 不在默认装配且宿主零引用。
 // ②确认收窄后只保留 createToolPipeline 与类型并同步 config/agent-public-api-signatures.json。
+// observationRecord 已随缓存层删除（W1-04，决定①）撤回，签名快照 ./runtime 69→68。
 export {
   allowlistGate,
   analystVerifyOnlyGate,
@@ -162,7 +163,6 @@ export {
   deterministicDuplicateGuard,
   eventBusPublisher,
   evolutionDecisionGate,
-  observationRecord,
   progressEmitter,
   recordRepairOnlyGate,
   submitDedup,

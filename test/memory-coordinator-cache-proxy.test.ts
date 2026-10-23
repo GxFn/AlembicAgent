@@ -1,100 +1,156 @@
 /**
- * MemoryCoordinator 工具缓存代理与观察写入的错误诊断（模块审阅 L6-P26 / C64）。
+ * 缓存层删除的结构守护（W1-04：审阅包 L6-P26，兼 L5-P47、L3-P08 cache 端口）。
  *
- * 背景：SessionStore 只读工具缓存在生产中没有写入者（observationRecord 已移出默认工具管道，
- * 路由也不读取 ToolRuntimeCallContext.cache），缓存删除还是接线取决于待决事项①。决定之前不改缓存
- * 本体与公开面，只把代理里静默吞错的 catch 改为 catch (err: unknown) + 告警，并保持
- * 「出错返回 null、写入失败不抛」的既有语义。
+ * 背景（C64）：SessionStore 只读工具缓存在生产中没有写入者也没有读取者——observationRecord 已移出
+ * 默认工具管道且有信封时总以 cacheHit=true 跳过写入，MemoryCoordinator 的缓存代理与 kernel
+ * ToolResultCacheProvider 端口没有调用方。按决定①（2026-10-20 答复）整体删除：
+ *   - SessionStore 的 getCachedResult/cacheToolResult/get/set/clearCache 与缓存 Map、TTL、清理定时器；
+ *   - MemoryCoordinator 的 getCachedResult/cacheToolResult 代理与 recordObservation；
+ *   - kernel 的 ToolResultCacheProvider 与 ToolRuntimeCallContext.cache；
+ *   - SessionStoreConfig 的 ttlMs/cleanupIntervalMs。
+ * vitest 不做类型检查，所以类型成员的删除用 TypeScript AST 断言锁定，运行时成员用原型断言锁定。
  *
- * 本文件只依赖 MemoryCoordinator、SessionStore 与 Core Logger，不依赖 better-sqlite3。
+ * 本文件只依赖 MemoryCoordinator、SessionStore 与 TypeScript compiler API，不依赖 better-sqlite3。
  */
-import Logger from '@alembic/core/logging';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
+import { describe, expect, it } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
 
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-function setup() {
-  const store = new SessionStore();
-  const coordinator = new MemoryCoordinator({ sessionStore: store });
-  const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-  const warnings = () => warn.mock.calls.map((call) => String(call[0]));
-  return { store, coordinator, warnings };
+function readSource(relativePath: string): string {
+  return readFileSync(new URL(`../${relativePath}`, import.meta.url), 'utf8');
 }
 
-describe('MemoryCoordinator cache proxy diagnostics (C64)', () => {
-  it('still delegates reads and writes to the SessionStore cache without warnings', () => {
-    const { coordinator, warnings } = setup();
+function parse(relativePath: string): ts.SourceFile {
+  return ts.createSourceFile(
+    relativePath,
+    readSource(relativePath),
+    ts.ScriptTarget.ES2022,
+    true,
+    ts.ScriptKind.TS
+  );
+}
 
-    coordinator.cacheToolResult('code', { action: 'read', path: 'src/a.ts' }, { content: 'A' });
+/** 顶层 interface / class 的成员名；找不到容器时抛错，避免守护因改名静默空转。 */
+function memberNames(sourceFile: ts.SourceFile, containerName: string): string[] {
+  for (const statement of sourceFile.statements) {
+    if (
+      (ts.isInterfaceDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      statement.name?.text === containerName
+    ) {
+      return statement.members
+        .map((member) => {
+          const name = (member as { name?: ts.PropertyName }).name;
+          if (!name) {
+            return undefined;
+          }
+          return ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isPrivateIdentifier(name)
+            ? name.text
+            : undefined;
+        })
+        .filter((name): name is string => typeof name === 'string');
+    }
+  }
+  throw new Error(`container ${containerName} not found in ${sourceFile.fileName}`);
+}
 
-    // 读命中返回的是 SessionStore 改写后的形状；去留与形状统一都等待事项①。
-    expect(coordinator.getCachedResult('code', { action: 'read', path: 'src/a.ts' })).toEqual({
-      content: 'A',
-      path: 'src/a.ts',
-      cached: true,
-    });
-    expect(coordinator.getCachedResult('code', { action: 'read', path: 'src/b.ts' })).toBeNull();
-    expect(warnings()).toEqual([]);
+function topLevelNames(sourceFile: ts.SourceFile): string[] {
+  const names: string[] = [];
+  for (const statement of sourceFile.statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        names.push(declaration.name.getText(sourceFile));
+      }
+    } else if (
+      (ts.isInterfaceDeclaration(statement) ||
+        ts.isClassDeclaration(statement) ||
+        ts.isFunctionDeclaration(statement) ||
+        ts.isTypeAliasDeclaration(statement)) &&
+      statement.name
+    ) {
+      names.push(statement.name.text);
+    }
+  }
+  return names;
+}
+
+describe('cache layer removal structure guard (W1-04 / L6-P26)', () => {
+  it('removes the read-only tool cache members from the SessionStore prototype', () => {
+    for (const member of ['getCachedResult', 'cacheToolResult', 'get', 'set', 'clearCache']) {
+      expect({ member, present: member in SessionStore.prototype }).toEqual({
+        member,
+        present: false,
+      });
+    }
+    // dispose 与 Disposable 实现保留：宿主在会话结束时 dispose SessionStore（L6-P28）。
+    expect(typeof SessionStore.prototype.dispose).toBe('function');
   });
 
-  it('returns null and warns when the SessionStore read throws', () => {
-    const { store, coordinator, warnings } = setup();
-    vi.spyOn(store, 'getCachedResult').mockImplementation(() => {
-      throw new Error('cache read exploded');
-    });
-
-    expect(coordinator.getCachedResult('code', { action: 'read', path: 'src/a.ts' })).toBeNull();
-
-    const messages = warnings().filter((m) => m.includes('getCachedResult'));
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain('tool=code');
-    expect(messages[0]).toContain('cache read exploded');
+  it('removes the cache proxies and recordObservation from the MemoryCoordinator prototype', () => {
+    for (const member of ['getCachedResult', 'cacheToolResult', 'recordObservation']) {
+      expect({ member, present: member in MemoryCoordinator.prototype }).toEqual({
+        member,
+        present: false,
+      });
+    }
   });
 
-  it('does not throw and warns when the SessionStore write throws', () => {
-    const { store, coordinator, warnings } = setup();
-    vi.spyOn(store, 'cacheToolResult').mockImplementation(() => {
-      throw new Error('cache write exploded');
-    });
-
-    expect(() =>
-      coordinator.cacheToolResult('code', { action: 'search', pattern: 'x' }, { ok: true })
-    ).not.toThrow();
-
-    const messages = warnings().filter((m) => m.includes('cacheToolResult'));
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain('tool=code');
-    expect(messages[0]).toContain('cache write exploded');
+  it('leaves no cache maps, TTL sweeper or cleanup timer in the SessionStore source', () => {
+    const source = parse('src/agent/memory/SessionStore.ts');
+    const text = source.getFullText();
+    const classMembers = memberNames(source, 'SessionStore');
+    for (const retired of ['#searchCache', '#fileCache', '#cleanupTimer', 'getCachedResult']) {
+      expect({ retired, present: classMembers.includes(retired) }).toEqual({
+        retired,
+        present: false,
+      });
+    }
+    for (const retired of [
+      '#searchCache',
+      '#fileCache',
+      '#cacheStats',
+      '#ttlMs',
+      '#cleanupTimer',
+      '#registerCleanupTimer',
+      '#evictExpired',
+      'normalizeCacheArgs',
+      'timerRegistry',
+      'SessionStore/cleanup',
+      'stableStringify',
+    ]) {
+      expect({ retired, present: text.includes(retired) }).toEqual({ retired, present: false });
+    }
+    expect(topLevelNames(source)).not.toEqual(
+      expect.arrayContaining(['SearchCacheEntry', 'ToolArgs', 'SESSION_CACHE_DEFAULTS'])
+    );
+    // implements Disposable 保留。
+    expect(text).toMatch(/export class SessionStore implements Disposable/);
   });
 
-  it('names the tool in the recordObservation failure warning', () => {
-    const { store, coordinator, warnings } = setup();
-    vi.spyOn(store, 'cacheToolResult').mockImplementation(() => {
-      throw new Error('observation write exploded');
-    });
-
-    expect(() =>
-      coordinator.recordObservation('code', { action: 'read', path: 'src/a.ts' }, 'A', 1, false)
-    ).not.toThrow();
-
-    const messages = warnings().filter((m) => m.includes('recordObservation'));
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain('tool=code');
-    expect(messages[0]).toContain('observation write exploded');
+  it('drops ttlMs and cleanupIntervalMs from SessionStoreConfig (AST)', () => {
+    const members = memberNames(parse('src/agent/memory/SessionStore.ts'), 'SessionStoreConfig');
+    expect(members).not.toContain('ttlMs');
+    expect(members).not.toContain('cleanupIntervalMs');
+    expect(members).toEqual(
+      expect.arrayContaining([
+        'projectContext',
+        'projectName',
+        'primaryLang',
+        'fileCount',
+        'modules',
+      ])
+    );
   });
 
-  it('skips the cache write when the caller marks the result as a cache hit', () => {
-    const { store, coordinator, warnings } = setup();
-    const write = vi.spyOn(store, 'cacheToolResult');
-
-    // 旧 observationRecord 有信封时总以 cacheHit=true 调用，这就是生产中缓存从无写入的原因。
-    coordinator.recordObservation('code', { action: 'read', path: 'src/a.ts' }, 'A', 1, true);
-
-    expect(write).not.toHaveBeenCalled();
-    expect(warnings()).toEqual([]);
+  it('drops ToolResultCacheProvider and ToolRuntimeCallContext.cache from the kernel contract (AST)', () => {
+    const context = parse('src/tools/kernel/context.ts');
+    expect(topLevelNames(context)).not.toContain('ToolResultCacheProvider');
+    const runtimeMembers = memberNames(context, 'ToolRuntimeCallContext');
+    expect(runtimeMembers).not.toContain('cache');
+    // 仍在使用的端口保留：诊断收集器、memoryCoordinator 与证据台账。
+    expect(runtimeMembers).toEqual(
+      expect.arrayContaining(['diagnostics', 'memoryCoordinator', 'evidenceLedger'])
+    );
   });
 });

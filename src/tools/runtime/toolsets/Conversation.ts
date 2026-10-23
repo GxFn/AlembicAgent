@@ -100,8 +100,8 @@ function loadSoulContent(optionPath: unknown): string | null {
 /**
  * 对话能力只提供工具集与静态上下文（生产契约、SOUL、项目概况）。
  *
- * 它不持有记忆协调器：记忆注入与工具观察缓存由运行循环按「本次运行」的协调器负责
- * （buildDynamicMemoryPrompt / recordObservation）。能力实例由 builder 跨运行复用，
+ * 它不持有记忆协调器：记忆注入由运行循环按「本次运行」的协调器负责（buildDynamicMemoryPrompt；
+ * 旧的工具观察缓存 recordObservation 已随缓存层删除，W1-04）。能力实例由 builder 跨运行复用，
  * 在这里持有协调器会让不同会话共用同一份记忆。
  */
 export class Conversation extends RuntimeCapability {

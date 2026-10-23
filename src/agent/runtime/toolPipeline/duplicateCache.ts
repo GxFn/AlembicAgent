@@ -1,7 +1,8 @@
 /** 只读 snapshot 结果的准入与复用；失败结果、可变状态读取和副作用调用不能进入缓存。 */
 import { stableStringify } from '#shared/serialization.js';
 import type { ToolResultEnvelope } from '#tools/kernel/index.js';
-import type { ToolCapabilityManifest } from '#tools/kernel/manifest.js';
+import type { ToolAction } from '#tools/kernel/registry.js';
+import { TOOL_REGISTRY } from '#tools/runtime/registry.js';
 import { readToolObservation } from '../../utils/toolOutcomes.js';
 import { getToolAction } from './callNormalization.js';
 import type {
@@ -9,7 +10,6 @@ import type {
   ToolCall,
   ToolPipelineContext as ToolExecContext,
   ToolMetadata,
-  ToolRuntimePort,
 } from './contracts.js';
 
 interface CachedToolResult {
@@ -48,24 +48,35 @@ const SIDE_EFFECT_ACTIONS = new Set([
   'write',
 ]);
 
-function getToolManifest(runtime: ToolRuntimePort, toolId: string): ToolCapabilityManifest | null {
-  const registry = runtime.toolRegistry as {
-    getManifest?: (id: string) => ToolCapabilityManifest | null | undefined;
-  };
-  return registry.getManifest?.(toolId) ?? null;
+/**
+ * 缓存准入的声明来源：运行时工具注册表 TOOL_REGISTRY 中该动作的声明（L3-P09）。
+ *
+ * 旧实现经 runtime.toolRegistry.getManifest 查能力 manifest，但运行时工具不在那张目录里注册，
+ * 生产中恒查不到，判断形同虚设；ToolRouter 也只认 TOOL_REGISTRY，所以这里直接读同一份声明。
+ * 未知工具或未声明的动作返回 null，由调用方失败关闭（不缓存）。这类调用随后由路由以
+ * Unknown tool/action 结果拒绝并留下错误信封，准入这里不另发诊断，避免同一调用重复告警。
+ */
+function resolveRegistryAction(toolName: string, action: string): ToolAction | null {
+  const spec = Object.hasOwn(TOOL_REGISTRY, toolName) ? TOOL_REGISTRY[toolName] : undefined;
+  if (!spec || !action || !Object.hasOwn(spec.actions, action)) {
+    return null;
+  }
+  return spec.actions[action] ?? null;
 }
 
-function isReadLikeManifest(manifest: ToolCapabilityManifest | null): boolean {
-  if (!manifest) {
+/**
+ * 动作声明允许复用的条件：只读、非全局独占、显式声明了缓存策略且不为 'none'。
+ * 未声明 cache 与 ToolRouterAdapter 的信封缓存策略同口径按 'none' 处理（`?? 'none'`），
+ * 因此 meta.tools 这类没有缓存声明的只读动作不会因为准入来源切换而变为可缓存。
+ */
+function isCacheableRegistryAction(declaration: ToolAction | null): boolean {
+  if (!declaration) {
     return false;
   }
   return (
-    !manifest.risk.sideEffect &&
-    manifest.risk.writeScope === 'none' &&
-    manifest.risk.network === 'none' &&
-    manifest.risk.credentialAccess === 'none' &&
-    manifest.governance.policyProfile !== 'write' &&
-    manifest.governance.policyProfile !== 'admin'
+    declaration.risk === 'read-only' &&
+    declaration.concurrency !== 'exclusive' &&
+    (declaration.cache ?? 'none') !== 'none'
   );
 }
 
@@ -82,16 +93,11 @@ function isDeterministicDuplicateCandidate(call: ToolCall, ctx: ToolExecContext)
   ) {
     return false;
   }
-  const manifest = getToolManifest(ctx.runtime, call.name);
-  if (
-    !manifest ||
-    manifest.execution.concurrency === 'exclusive' ||
-    manifest.execution.cachePolicy === 'none' ||
-    !resolveProjectSnapshotId(ctx)
-  ) {
+  if (!isCacheableRegistryAction(resolveRegistryAction(call.name, action))) {
     return false;
   }
-  return isReadLikeManifest(manifest);
+  // 快照门禁：没有真实项目快照 id 时无法证明两次读取看到同一份项目状态，一律不复用。
+  return resolveProjectSnapshotId(ctx) !== null;
 }
 
 function getEfficiencyCache(ctx: ToolExecContext): Map<string, CachedToolResult> {
@@ -204,6 +210,8 @@ function buildCacheKey(call: ToolCall, ctx: ToolExecContext): string {
  *
  * The guard only reuses calls that are safe to replay within the same project snapshot and
  * execution strategy. Submit/mutate/side-effect tools never pass the eligibility check.
+ * 准入以 TOOL_REGISTRY 的动作声明为准（见 isCacheableRegistryAction），当前只有 graph.overview 与
+ * graph.query 合格；宿主没有提供项目快照 id 时整条守卫不生效。
  */
 export const deterministicDuplicateGuard = {
   name: 'deterministicDuplicateGuard',

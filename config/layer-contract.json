@@ -200,6 +200,7 @@
       ],
       "src/agent/runtime/toolPipeline/duplicateCache.ts": [
         "src/shared/serialization.ts",
+        "src/tools/runtime/registry.ts",
         "src/agent/utils/toolOutcomes.ts",
         "src/agent/runtime/toolPipeline/callNormalization.ts"
       ],

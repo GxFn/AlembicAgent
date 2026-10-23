@@ -1,6 +1,7 @@
 /**
  * 执行结果的观察链：证据先落账，再供 tracker、trace 消费；可选事件保持独立。
- * observationRecord（memory 观察）已移出默认装配（L5-P47 / I45），只在显式装配时运行。
+ * 旧的 observationRecord（把结果交给 MemoryCoordinator.recordObservation 写 SessionStore 工具缓存）
+ * 先于 L5-P47 / I45 移出默认装配，又随缓存层删除（W1-04，决定①）连同实现与公开导出一起删除。
  */
 import {
   appendEvidenceAnnotation,
@@ -22,9 +23,9 @@ function isSuccessfulToolObservation(call: ToolCall, result: unknown, meta: Tool
 /**
  * EvidenceCapture — 证据台账采集（Wave A E2）
  *
- * after（必须排在 trackerSignal/traceRecord 之前；显式装配 observationRecord 时也排在它之前）：
+ * after（必须排在 trackerSignal/traceRecord 之前）：
  * 证据类工具成功返回时自动落台账，并把 `[evidence] E-x=file:range` 标注追加进 envelope.text——
- * 模型看到的文本、推理链留痕（及显式装配时的记忆观察）一致，模型从第一眼即以条目 ID 认知证据。
+ * 模型看到的文本与推理链留痕一致，模型从第一眼即以条目 ID 认知证据。
  * loopCtx.evidenceLedger 缺席（非维度场景）时零行为；采集部分失败保留已确认标注，不能宣称零落账。
  */
 export const evidenceCapture = {
@@ -54,29 +55,6 @@ export const evidenceCapture = {
         message: `${call.name}: persisted=${entries.length}; ${err instanceof Error ? err.message : String(err)}`,
       });
     }
-  },
-};
-
-/**
- * ObservationRecord — MemoryCoordinator 观察记录（不在默认装配）
- *
- * after: 把工具结果交给 MemoryCoordinator.recordObservation，后者唯一的效果是写 SessionStore
- * 工具缓存。生产中这是空操作（L5-P47 / I45）：宿主路由总带信封，这里以 cacheHit=true 调用，
- * MemoryCoordinator 跳过写入；无信封的结果只来自门拦截、宿主抛错或发起前取消，都带 error，
- * SessionStore 拒收。因此 createToolPipeline 不再装配它。
- * 公开导出的去留依赖待决事项②，SessionStore 工具缓存的去留依赖事项①；决定前保留本实现，
- * 显式装配时行为与旧版一致。
- */
-export const observationRecord = {
-  name: 'observationRecord',
-  after(call: ToolCall, result: unknown, ctx: ToolExecContext, meta: ToolMetadata) {
-    ctx.loopCtx.memoryCoordinator?.recordObservation?.(
-      call.name,
-      call.args,
-      meta.envelope || result,
-      ctx.iteration,
-      meta.envelope ? true : meta.cacheHit
-    );
   },
 };
 

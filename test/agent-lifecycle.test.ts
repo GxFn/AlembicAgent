@@ -89,7 +89,7 @@ describe('Runtime operation boundary', () => {
     const close = vi.spyOn(trace, 'endRound').mockImplementation(() => {
       throw closeFailure;
     });
-    // 默认管道的 postprocessing 观察者（observationRecord 已移出默认装配，L5-P47 / I45）。
+    // 默认管道的 postprocessing 观察者（memory 观察已随缓存层删除，L5-P47 / I45 → W1-04）。
     vi.spyOn(trace, 'recordToolCall').mockImplementation(() => {
       throw primaryFailure;
     });
@@ -272,7 +272,8 @@ describe('Runtime operation boundary', () => {
     expect(execute).toHaveBeenCalledOnce();
   });
 
-  // memory 不再是默认 postprocessing 观察者：observationRecord 已移出默认装配（L5-P47 / I45）。
+  // memory 不是默认 postprocessing 观察者：observationRecord 先移出默认装配（L5-P47 / I45），
+  // 又随缓存层删除（W1-04），MemoryCoordinator.recordObservation 已不存在。
   it.each([
     'tracker',
     'trace',
@@ -288,7 +289,6 @@ describe('Runtime operation boundary', () => {
     if (!tracker) {
       throw new Error('Tracker fixture must resolve');
     }
-    const recordObservation = vi.spyOn(memory, 'recordObservation');
     const after =
       port === 'trace' ? vi.spyOn(trace, 'recordToolCall') : vi.spyOn(tracker, 'recordToolCall');
     after.mockImplementation(() => {
@@ -319,7 +319,7 @@ describe('Runtime operation boundary', () => {
       });
       expect(execute).toHaveBeenCalledOnce();
       expect(after).toHaveBeenCalledOnce();
-      expect(recordObservation).not.toHaveBeenCalled();
+      expect('recordObservation' in memory).toBe(false);
       expect(chat).toHaveBeenCalledOnce();
       expect(result.status).toBe('error');
       expect(result.reply).toBe(failure.message);
@@ -333,7 +333,6 @@ describe('Runtime operation boundary', () => {
       expect(runtime.toolCallHistory[0].envelope).toBe(await execute.mock.results[0].value);
     } finally {
       after.mockRestore();
-      recordObservation.mockRestore();
       memory.dispose();
       vi.useRealTimers();
     }

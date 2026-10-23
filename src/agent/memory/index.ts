@@ -3,7 +3,7 @@
  *
  * Phase 2: MemoryCoordinator + legacy module re-exports
  * Phase 3: ActiveContext (合并 WorkingMemory + ReasoningTrace)
- * Phase 4: SessionStore (合并 EpisodicMemory + ToolResultCache)
+ * Phase 4: SessionStore (源自 EpisodicMemory；原合并的 ToolResultCache 只读工具缓存已随 W1-04 删除)
  * Phase 5: PersistentMemory (统一的持久化语义记忆)
  * Phase 6: MemoryStore / MemoryRetriever / MemoryConsolidator (PersistentMemory 子模块拆分)
  */

@@ -1628,3 +1628,31 @@ describe('tasks subpath retirement route (L8-P16)', () => {
     expect(typeof service.runRelationDiscovery).toBe('function');
   });
 });
+
+describe('runtime subpath after the cache layer removal (W1-04 / L6-P26)', () => {
+  it('drops observationRecord from ./runtime and keeps names, kinds and hash equal to the snapshot', () => {
+    const exported = runtime as Record<string, unknown>;
+    expect('observationRecord' in exported).toBe(false);
+    const entries = Object.keys(exported)
+      .sort()
+      .map((name) => ({ name, kind: runtimeKind(exported[name]) }));
+    const expected = snapshotEntries('./runtime');
+    // 快照与实际导出逐项一致；只删除了 observationRecord 一个运行时绑定（69 → 68）。
+    expect(expected.exportCount).toBe(68);
+    expect(expected.entries.map((entry) => entry.name)).not.toContain('observationRecord');
+    expect(entries).toEqual(expected.entries);
+    expect(entries).toHaveLength(expected.exportCount);
+    expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+      expected.signatureHash
+    );
+  });
+
+  it('records 450 runtime bindings across the 15 stable package exports', () => {
+    const signatures = readRepoJson('config/agent-public-api-signatures.json');
+    const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
+    expect(Object.keys(all)).toHaveLength(15);
+    expect(signatures.packageExportCount).toBe(15);
+    const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
+    expect(total).toBe(450);
+  });
+});

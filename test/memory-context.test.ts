@@ -821,7 +821,7 @@ describe('MemoryConsolidator write-path correctness (L6-P4)', () => {
   it('keeps consistent findings from different dimensions that merely mention avoid', () => {
     const db = new Database(':memory:');
     const memory = new PersistentMemory(db);
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     try {
       session.storeDimensionReport('arch-layers', {
         findings: [
@@ -1339,7 +1339,7 @@ describe('MemoryConsolidator write-path correctness (L6-P4)', () => {
     const db = new Database(':memory:');
     const { messages, logger } = captureLogger();
     const memory = new PersistentMemory(db, { logger });
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     try {
       const { id } = memory.add({
         type: 'fact',
@@ -1427,7 +1427,7 @@ describe('MemoryCoordinator', () => {
     }
   });
   it('forwards task relevance and keeps session context when persistent memory fails', async () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     session.storeDimensionReport('previous', {
       analysisText: 'Session evidence remains available',
     });
@@ -1828,7 +1828,7 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
 
 describe('SessionStore', () => {
   it('ranks distilled findings using the same projection that is rendered', () => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     try {
       store.storeDimensionReport('old', { analysisText: 'decorative visual layout '.repeat(40) });
       store.storeDimensionReport('relevant', {
@@ -1844,7 +1844,7 @@ describe('SessionStore', () => {
     }
   });
   it('puts relevant dimension summaries before unrelated history within the budget', () => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     try {
       store.storeDimensionReport('old-unrelated', {
         analysisText: 'decorative visual layout '.repeat(40),
@@ -1864,7 +1864,7 @@ describe('SessionStore', () => {
     }
   });
   it.each([0, 1, 55])('fits real Chinese session context within %i tokens', (tokenBudget) => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     try {
       store.storeDimensionReport('previous', {
         analysisText: '上下文预算必须包括裁剪说明。'.repeat(50),
@@ -1887,61 +1887,8 @@ describe('SessionStore', () => {
   ])('rejects malformed nested session data before replacing state: %j', (snapshot) => {
     expect(() => SessionStore.fromJSON(snapshot)).toThrow('SessionStore schema');
   });
-  it('never lets nested action turn a write into a cached read', () => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
-    try {
-      store.cacheToolResult(
-        'code',
-        { action: 'write', params: { action: 'read', path: 'a.ts' } },
-        'write-result'
-      );
-      expect(store.getCachedResult('code', { action: 'read', path: 'a.ts' })).toBeNull();
-    } finally {
-      store.dispose();
-    }
-  });
-  it('keys cached reads and searches by the complete normalized request', () => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
-    try {
-      store.cacheToolResult(
-        'code',
-        { action: 'search', pattern: 'symbol', glob: 'src/a/**' },
-        { matches: ['a'] }
-      );
-      expect(
-        store.getCachedResult('code', { action: 'search', pattern: 'symbol', glob: 'src/b/**' })
-      ).toBeNull();
-      expect(
-        store.getCachedResult('code', {
-          action: 'search',
-          params: { glob: 'src/a/**', pattern: 'symbol' },
-        })
-      ).toEqual({ matches: ['a'] });
-      store.cacheToolResult(
-        'code',
-        { action: 'read', filePath: 'src/a.ts', startLine: 1, endLine: 3 },
-        { content: 'first' }
-      );
-      expect(
-        store.getCachedResult('code', {
-          action: 'read',
-          filePath: 'src/a.ts',
-          startLine: 10,
-          endLine: 12,
-        })
-      ).toBeNull();
-      expect(
-        store.getCachedResult('code', {
-          action: 'read',
-          params: { path: 'src/a.ts', startLine: 1, endLine: 3 },
-        })
-      ).toEqual({ content: 'first', path: 'src/a.ts', cached: true });
-    } finally {
-      store.dispose();
-    }
-  });
   it('rebuilds legacy evidence only when the persisted evidence field is absent', () => {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     store.storeDimensionReport('a', {
       findings: [{ finding: 'Legacy finding', evidence: 'src/a.ts:2', importance: 8 }],
     });
@@ -1962,7 +1909,7 @@ describe('SessionStore', () => {
   });
   it('preserves evidence through JSON and checkpoint round trips without merging old state', async () => {
     const root = makeTempRoot('session-evidence');
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     store.addEvidence('src/a.ts', {
       finding: 'Evidence survives restart',
       importance: 8,
@@ -1985,7 +1932,7 @@ describe('SessionStore', () => {
 
   it('rejects malformed checkpoints without partially replacing live state', async () => {
     const root = makeTempRoot('session-invalid');
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     store.addEvidence('src/a.ts', { finding: 'Keep existing evidence', importance: 8 });
     await store.saveCheckpoint(root);
     const before = store.toJSON();
@@ -2005,7 +1952,7 @@ describe('SessionStore', () => {
   });
   it('saves and restores bootstrap checkpoints while validating serialized shape', async () => {
     const root = makeTempRoot('session-store');
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
 
     store.storeDimensionReport('api', {
       analysisText: 'API boundary analysis',
@@ -2040,7 +1987,6 @@ describe('SessionStore', () => {
       subTopic: 'host',
       summary: 'Host calls agent contract.',
     });
-    store.cacheToolResult('code', { action: 'read', filePath: 'src/host.ts' }, { content: 'ok' });
 
     await store.saveCheckpoint(root);
     const checkpointPath = join(root, '.asd', 'bootstrap-checkpoint', 'session-store.json');
@@ -2056,7 +2002,7 @@ describe('SessionStore', () => {
       },
     });
 
-    const restored = new SessionStore({ cleanupIntervalMs: 0 });
+    const restored = new SessionStore();
 
     expect(await restored.loadCheckpoint(root)).toBe(true);
     expect(restored.getDimensionReport('api')).toMatchObject({
@@ -2070,6 +2016,18 @@ describe('SessionStore', () => {
       totalCandidates: 1,
       crossReferences: 1,
     });
+    // 只读工具缓存已删除（W1-04）：cache 统计在过渡期固定为全零，检查点往返后仍然成立。
+    const zeroCache = {
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      hitRate: '0%',
+      searchCacheSize: 0,
+      fileCacheSize: 0,
+    };
+    expect(store.getStats().cache).toEqual(zeroCache);
+    expect(restored.getStats().cache).toEqual(zeroCache);
+    expect(SessionStore.fromJSON(store.toJSON()).getStats().cache).toEqual(zeroCache);
     expect(() => SessionStore.fromJSON({ dimensionReports: [] })).toThrow(
       'SessionStore schema: dimensionReports must be a Record'
     );
@@ -2087,7 +2045,7 @@ describe('SessionStore dimension write contract', () => {
   }
 
   it('keeps an earlier digest and its crossRefs when a resumed report omits digest', () => {
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       // 宿主续跑顺序：先从 dimension checkpoint 恢复 digest，再存一份不带 digest 的报告恢复 analysisText。
       s.addDimensionDigest('a', { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } });
@@ -2118,7 +2076,7 @@ describe('SessionStore dimension write contract', () => {
   });
 
   it('clears the digest and its crossRefs only when a report passes digest: null', () => {
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       s.addDimensionDigest('a', { summary: 'DIGEST-A', crossRefs: { b: 'look at X' } });
       s.storeDimensionReport('a', { analysisText: 'fresh analysis', digest: null });
@@ -2141,7 +2099,7 @@ describe('SessionStore dimension write contract', () => {
 
   it('normalizes a malformed AI digest at addDimensionDigest with a located warning', () => {
     const warnings = captureWarnings();
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       s.storeDimensionReport('a', { analysisText: 'analysis of a' });
       s.addDimensionDigest('a', {
@@ -2175,7 +2133,7 @@ describe('SessionStore dimension write contract', () => {
 
   it('restores a digest for a dimension without a report when keyFindings is not an array', () => {
     const warnings = captureWarnings();
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       s.addDimensionDigest('fresh', {
         summary: 'S',
@@ -2221,7 +2179,7 @@ describe('SessionStore dimension write contract', () => {
     [['x']],
     [42],
   ])('rejects the unnormalizable digest %j with an Error before mutating state', (bad) => {
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       s.addDimensionDigest('a', { summary: 'kept', crossRefs: { b: 'kept reference' } });
       const before = s.toJSON();
@@ -2236,7 +2194,7 @@ describe('SessionStore dimension write contract', () => {
 
   it('normalizes a malformed tier reflection at addTierReflection and keeps it round-trippable', () => {
     const warnings = captureWarnings();
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
     try {
       s.addTierReflection(1, {
         completedDimensions: 'a',
@@ -2305,8 +2263,8 @@ describe('SessionStore dimension write contract', () => {
   it('refuses a type-corrupted checkpoint and reports non-Error load failures by value', async () => {
     const warnings = captureWarnings();
     const root = makeTempRoot('session-typed-checkpoint');
-    const s = new SessionStore({ cleanupIntervalMs: 0 });
-    const restored = new SessionStore({ cleanupIntervalMs: 0 });
+    const s = new SessionStore();
+    const restored = new SessionStore();
     try {
       s.storeDimensionReport('a', { analysisText: 'live state' });
       await s.saveCheckpoint(root);
@@ -3106,7 +3064,7 @@ afterEach(() => vi.restoreAllMocks());
 it('preserves prior bootstrap memory when a replacement INSERT fails', () => {
   const db = new Database(':memory:');
   const memory = new PersistentMemory(db);
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   try {
     const old = memory.add({
       content: 'Original bootstrap fact from previous successful generation',
@@ -3160,7 +3118,7 @@ it('preserves a committed consolidation receipt if final logger fails', () => {
   }
 });
 it('replaces old dimension evidence rather than accumulating both generations', () => {
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   try {
     store.storeDimensionReport('runtime', {
       findings: [{ finding: 'old conclusion', evidence: 'old.ts:1', importance: 5 }],
@@ -3179,7 +3137,7 @@ it('replaces old dimension evidence rather than accumulating both generations', 
   }
 });
 it('snapshot edits do not mutate the current session', () => {
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   try {
     store.storeDimensionReport('runtime', {
       findings: [{ finding: 'confirmed finding', evidence: 'a.ts:1', importance: 8 }],
@@ -3193,7 +3151,7 @@ it('snapshot edits do not mutate the current session', () => {
 });
 it('failed checkpoint write leaves the last valid checkpoint readable', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-probe-'));
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
   try {
     store.storeDimensionReport('runtime', { analysisText: 'last valid state' });
@@ -3235,6 +3193,7 @@ it('resolves contradictory candidates within the same incoming batch', () => {
   }
 });
 it('preserves Main bootstrap constructor metadata in the session snapshot', () => {
+  // cleanupIntervalMs 是随只读工具缓存删除的旧键（W1-04）：仍可被旧调用方传入，但只被忽略，不进入快照。
   const store = new SessionStore({
     cleanupIntervalMs: 0,
     projectName: 'fixture-project',
@@ -3249,6 +3208,7 @@ it('preserves Main bootstrap constructor metadata in the session snapshot', () =
       fileCount: 9,
       modules: ['runtime'],
     });
+    expect(store.toJSON().projectContext).not.toHaveProperty('cleanupIntervalMs');
   } finally {
     store.dispose();
   }
@@ -3315,7 +3275,7 @@ describe('conversation input and read boundary', () => {
 });
 
 it('migrates legacy ledger-label evidence indexes before replacing a restored report', () => {
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   try {
     store.storeDimensionReport('runtime', {
       findings: [
@@ -3344,7 +3304,7 @@ it.each([
   '__proto__',
   'constructor',
 ])('keeps %s as ordinary restored evidence and dimension keys', (key) => {
-  const store = new SessionStore({ cleanupIntervalMs: 0 });
+  const store = new SessionStore();
   try {
     store.storeDimensionReport(key, {
       findings: [{ finding: 'confirmed special file', evidence: `E-1=${key}:1-2`, importance: 8 }],
@@ -3375,7 +3335,7 @@ afterEach(() => {
 function fixture() {
   const db = new Database(':memory:');
   const memory = new PersistentMemory(db);
-  const session = new SessionStore({ cleanupIntervalMs: 0 });
+  const session = new SessionStore();
   memory.add({
     content: 'remember the user preference about monochrome editor appearance',
     source: 'user',
@@ -3483,7 +3443,7 @@ it('observer rejections after consolidation never erase the actual return', asyn
   }
 });
 it('bad report replacement must not remove the live report indexes', () => {
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   try {
     s.storeDimensionReport('runtime', {
       findings: [{ finding: 'confirmed current fact', evidence: 'old.ts:1', importance: 8 }],
@@ -3499,7 +3459,7 @@ it('bad report replacement must not remove the live report indexes', () => {
   }
 });
 it('producer projection cannot alter the owned working-memory report', () => {
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   try {
     s.storeDimensionReport('runtime', {
       referencedFiles: ['a.ts'],
@@ -3523,7 +3483,7 @@ it('producer projection cannot alter the owned working-memory report', () => {
   }
 });
 it('context snapshot cannot alter the stored digest or submitted candidates', () => {
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   try {
     s.storeDimensionReport('runtime', { digest: { summary: 'owned digest' } });
     s.addSubmittedCandidate('runtime', {
@@ -3541,7 +3501,7 @@ it('context snapshot cannot alter the stored digest or submitted candidates', ()
   }
 });
 it('new report generations retain unrelated and independent addEvidence data', () => {
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   try {
     s.addEvidence('independent.ts', {
       dimId: 'runtime',
@@ -3574,7 +3534,7 @@ it('new report generations retain unrelated and independent addEvidence data', (
   }
 });
 it('legacy snapshots infer report ownership without deleting distinct independent evidence', () => {
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   try {
     s.addEvidence('old.ts', { dimId: 'runtime', finding: 'independent appendix', importance: 6 });
     s.storeDimensionReport('runtime', {
@@ -3604,7 +3564,7 @@ it.each([
   'write-zone',
 ] as const)('checkpoint write failure preserves the previous snapshot using %s', async (mode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-cross-'));
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
   try {
     pathGuard.configure({ projectRoot: root, extraAllowPaths: [root] });
@@ -3638,7 +3598,7 @@ it.each([
 });
 it('checkpoint rename failure is visible and preserves the previous file', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-rename-'));
-  const s = new SessionStore({ cleanupIntervalMs: 0 });
+  const s = new SessionStore();
   const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
   try {
     s.storeDimensionReport('runtime', { analysisText: 'old' });

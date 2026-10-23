@@ -949,8 +949,8 @@
       ]
     },
     "./runtime": {
-      "exportCount": 69,
-      "signatureHash": "977b1b95fda6d2893389d70c104c125a00aa30a5e113c598b83809b3b5cd5d6a",
+      "exportCount": 68,
+      "signatureHash": "9995611ffe1332da577e34137e9f4c5ecc5e396d10ab2375e73e9e9cc01e4956",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -1159,10 +1159,6 @@
         {
           "name": "measurePromptText",
           "kind": "function"
-        },
-        {
-          "name": "observationRecord",
-          "kind": "object"
         },
         {
           "name": "produceForcedSummary",

@@ -36,7 +36,6 @@ import type {
 import { deterministicDuplicateGuard } from '../src/agent/runtime/toolPipeline/duplicateCache.js';
 import { executeRuntimeToolCall } from '../src/agent/runtime/toolPipeline/runtimeBridge.js';
 import type { ToolCallRequest, ToolResultEnvelope } from '../src/tools/kernel/index.js';
-import type { ToolCapabilityManifest } from '../src/tools/kernel/manifest.js';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -182,53 +181,15 @@ describe('ProviderToolChoicePolicy tracker probe failure', () => {
 
 // ─── duplicateCache ───────────────────────────────────────────
 
-function readOnlyManifest(id: string): ToolCapabilityManifest {
-  return {
-    id,
-    title: id,
-    kind: 'internal-tool',
-    description: 'Read-only graph query',
-    owner: 'agent',
-    lifecycle: 'active',
-    surfaces: ['runtime'],
-    inputSchema: { type: 'object', properties: {} },
-    risk: {
-      sideEffect: false,
-      dataAccess: 'project',
-      writeScope: 'none',
-      network: 'none',
-      credentialAccess: 'none',
-      requiresHumanConfirmation: 'never',
-      owaspTags: [],
-    },
-    execution: {
-      adapter: 'internal',
-      timeoutMs: 1000,
-      maxOutputBytes: 4096,
-      abortMode: 'cooperative',
-      cachePolicy: 'session',
-      concurrency: 'parallel-safe',
-      artifactMode: 'inline',
-    },
-    governance: {
-      policyProfile: 'read',
-      auditLevel: 'checkOnly',
-      approvalPolicy: 'auto',
-      allowedRoles: ['developer'],
-      allowInComposer: true,
-      allowInRemoteMcp: false,
-      allowInNonInteractive: true,
-    },
-    evals: { required: false, cases: [] },
-  } as ToolCapabilityManifest;
-}
-
+/**
+ * graph.query 在运行时工具注册表中声明为 read-only + session 缓存，准入直接读 TOOL_REGISTRY
+ * （W1-04 / L3-P09），不再需要注入 manifest。
+ */
 function cacheContext(diagnostics: DiagnosticsCollector, sharedState: Record<string, unknown>) {
   return {
     runtime: {
       id: 'cache-runtime',
       presetName: 'cache-preset',
-      toolRegistry: { getManifest: (id: string) => readOnlyManifest(id) },
     },
     loopCtx: {
       source: 'system',

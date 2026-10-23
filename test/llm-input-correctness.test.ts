@@ -517,16 +517,16 @@ function toolContext(root: string, deltaCache?: DeltaCache, tokenBudget = 4000):
 }
 
 describe('LLM input correctness fixture', () => {
-  it('awaits async graph context before assembling analyst prompts', async () => {
+  it('never awaits or injects a graph context port when assembling analyst prompts', async () => {
+    // W1-04（决定①）：§9 代码实体图谱段已删除，第 6 个参数只保留位置；传入的端口不被调用。
+    const generateContextForAgent = vi.fn(async () => '## Code Entity Graph\nAsync graph context');
     const prompt = await buildAnalystPrompt(
       { id: 'architecture', label: 'Architecture' },
       { name: 'FixtureProject', lang: 'typescript', fileCount: 2 },
       null,
       null,
       null,
-      {
-        generateContextForAgent: async () => '## Code Entity Graph\nAsync graph context',
-      },
+      { generateContextForAgent },
       null,
       null,
       null,
@@ -534,7 +534,8 @@ describe('LLM input correctness fixture', () => {
       null
     );
 
-    expect(prompt).toContain('Async graph context');
+    expect(generateContextForAgent).not.toHaveBeenCalled();
+    expect(prompt).not.toContain('Async graph context');
     expect(prompt).not.toContain('[object Promise]');
   });
 

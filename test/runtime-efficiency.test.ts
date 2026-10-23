@@ -369,9 +369,7 @@ describe('tool pipeline lifecycle', () => {
     const loopCtx = createLoopContext(new DiagnosticsCollector());
     loopCtx.evidenceLedger = ledger;
     // 这些观察端口只替代外部消费者；台账、默认工厂与 envelope 流转使用真实实现。
-    // observationRecord 已移出默认装配（L5-P47 / I45）：memory 观察端口不再被默认管道调用。
-    const recordObservation = vi.fn();
-    loopCtx.memoryCoordinator = { recordObservation } as never;
+    // 默认管道没有 memory 观察者（observationRecord 已随缓存层删除，W1-04）。
     loopCtx.tracker = {
       noteLedgerStats: () => {
         order.push('ledger');
@@ -399,7 +397,6 @@ describe('tool pipeline lifecycle', () => {
     );
     expect(result.metadata.envelope?.text).toContain('[evidence]');
     expect(order).toEqual(['ledger', 'tracker', 'trace']);
-    expect(recordObservation).not.toHaveBeenCalled();
   });
   it('awaits before hooks and invokes after hooks in registration order', async () => {
     const events: string[] = [];
@@ -728,7 +725,8 @@ describe('runtime efficiency diagnostics', () => {
     message,
   }) => {
     let attempts = 0;
-    const runtime = createRuntime(createManifest({ id: 'snapshot.lookup' }), async (request) => {
+    // 缓存准入读 TOOL_REGISTRY（W1-04 / L3-P09）：graph.query 是注册表里声明 read-only + session 的动作。
+    const runtime = createRuntime(createManifest({ id: 'graph' }), async (request) => {
       attempts++;
       // 外部宿主未必遵守只抛 Error 的规则，用拒绝值覆盖真正的输入边界。
       if (attempts === 1) {
@@ -737,8 +735,12 @@ describe('runtime efficiency diagnostics', () => {
       return createEnvelope(request, attempts);
     });
     const loopCtx = createLoopContext(new DiagnosticsCollector());
-    loopCtx.allowedToolIds = ['snapshot.lookup'];
-    const call = { id: 'snapshot-lookup', name: 'snapshot.lookup', args: { action: 'read' } };
+    loopCtx.allowedToolIds = ['graph'];
+    const call = {
+      id: 'graph-query',
+      name: 'graph',
+      args: { action: 'query', params: { type: 'class', entity: 'AgentRuntime' } },
+    };
     const pipeline = createToolPipeline();
     expect((await pipeline.execute(call, { runtime, loopCtx, iteration: 1 })).result).toEqual({
       error: message,
@@ -918,19 +920,20 @@ describe('runtime efficiency diagnostics', () => {
 
   it('short-circuits duplicate deterministic tool calls within a session snapshot', async () => {
     const diagnostics = new DiagnosticsCollector();
-    const manifest = createManifest({ id: 'snapshot.lookup' });
+    // 准入读 TOOL_REGISTRY 的 graph.query 声明（W1-04 / L3-P09），manifest 只是 createRuntime 的占位。
+    const manifest = createManifest({ id: 'graph' });
     let executeCount = 0;
     const runtime = createRuntime(manifest, async (request) => {
       executeCount++;
       return createEnvelope(request, executeCount);
     });
     const loopCtx = createLoopContext(diagnostics);
-    loopCtx.allowedToolIds = ['snapshot.lookup'];
+    loopCtx.allowedToolIds = ['graph'];
     const pipeline = createToolPipeline();
     const call = {
       id: 'tool-1',
-      name: 'snapshot.lookup',
-      args: { action: 'search', params: { patterns: ['AgentRuntime'] } },
+      name: 'graph',
+      args: { action: 'query', params: { type: 'search', entity: 'AgentRuntime' } },
     };
 
     const first = await pipeline.execute(call, { runtime, loopCtx, iteration: 1 });
