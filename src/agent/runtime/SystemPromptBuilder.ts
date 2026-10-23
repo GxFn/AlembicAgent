@@ -31,18 +31,15 @@ interface Persona {
   [key: string]: unknown;
 }
 
-/** Memory configuration */
-interface MemoryConfig {
-  mode?: string;
-  [key: string]: unknown;
-}
-
-/** SystemPromptBuilder constructor options */
+/**
+ * SystemPromptBuilder constructor options。
+ * 不再接受 memoryConfig（W2a-06 / L8-P17）：它只被转成 buildContext 的 memoryMode，而没有任何能力读取；
+ * 记忆提示由运行循环按本次运行的 memoryCoordinator 注入，不经系统提示构建器。
+ */
 interface SystemPromptBuilderOptions {
   persona?: Persona | null;
   fileCache?: FileCacheEntry[] | null;
   lang?: string | null;
-  memoryConfig?: MemoryConfig | null;
 }
 
 /** 本次循环的工具 schema 投影中，与提示相关的两项事实。 */
@@ -72,14 +69,10 @@ export class SystemPromptBuilder {
   /** 语言偏好 */
   #lang: string | null;
 
-  /** 记忆配置 */
-  #memoryConfig: MemoryConfig | null;
-
-  constructor({ persona, fileCache, lang, memoryConfig }: SystemPromptBuilderOptions = {}) {
+  constructor({ persona, fileCache, lang }: SystemPromptBuilderOptions = {}) {
     this.#persona = persona || null;
     this.#fileCache = fileCache || null;
     this.#lang = lang || null;
-    this.#memoryConfig = memoryConfig || null;
   }
 
   /** 更新文件缓存引用 (bootstrap 场景: allFiles 注入后更新) */
@@ -122,7 +115,6 @@ export class SystemPromptBuilder {
       const dynamicCtx = cap.buildContext({
         ...context,
         lang: this.#lang,
-        memoryMode: this.#memoryConfig?.mode,
       });
       if (dynamicCtx) {
         parts.push(dynamicCtx);

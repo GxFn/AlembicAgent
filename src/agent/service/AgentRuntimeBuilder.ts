@@ -125,7 +125,8 @@ export class AgentRuntimeBuilder {
       strategy: preset.strategyInstance as Strategy,
       policies: new PolicyEngine(resolvedPolicies),
       persona: preset.persona as Record<string, unknown> | undefined,
-      memory: preset.memory as Record<string, unknown> | undefined,
+      // preset/profile 的 memory 声明不再传给运行时（W2a-06 / L8-P17）：没有读取者；记忆由运行上下文的
+      // memoryCoordinator 决定（AgentService 经 RuntimeOptions 传入，不经 builder）。
       onProgress: options.onProgress || null,
       onToolCall: options.onToolCall || null,
       lang: options.lang || null,

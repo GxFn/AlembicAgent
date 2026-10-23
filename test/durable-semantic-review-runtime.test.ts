@@ -23,16 +23,15 @@ import {
 import { createProjectContextFileRef } from '@alembic/core/project-context';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DiagnosticsCollector } from '../src/agent/runtime/DiagnosticsCollector.js';
+// durable 语义评审运行时只经 ./production 公开（W2a-06 / L8-P17：./evaluation 的 11 个重复绑定已删除）。
 import {
   createDurableSemanticReviewRuntime,
+  createProductionEvidenceLedgerAuthority,
   type DurableSemanticReviewExecuteInputV1,
   DurableSemanticReviewRuntimeError,
+  type ProductionEvidenceLedgerAuthorityV1,
   type SemanticReviewWitnessAuthorityBundleV1,
   type SemanticReviewWitnessAuthorityLookupV1,
-} from '../src/evaluation.js';
-import {
-  createProductionEvidenceLedgerAuthority,
-  type ProductionEvidenceLedgerAuthorityV1,
 } from '../src/production.js';
 import {
   createExecutionReceipt,

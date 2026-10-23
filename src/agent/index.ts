@@ -42,9 +42,8 @@ export {
 // ── Infrastructure ──
 export { AgentPhase, AgentState } from './runtime/AgentState.js';
 export * from './service/index.js';
-// ── Strategies ──
+// ── Strategies ──（FanOutStrategy 已删除，W2a-06 / L5-P39：跨维度扇出只经 AgentRunCoordinator）
 export {
-  FanOutStrategy,
   SingleStrategy,
   Strategy,
 } from './strategies/index.js';

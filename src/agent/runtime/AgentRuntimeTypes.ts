@@ -249,7 +249,8 @@ export interface RuntimeConfig {
   strategy: import('../strategies/index.js').Strategy;
   policies?: import('../policies/index.js').PolicyEngine;
   persona?: Record<string, unknown>;
-  memory?: Record<string, unknown>;
+  // memory 字段已删除（W2a-06 / L8-P17）：此前它经 SystemPromptBuilder 以 memoryMode 传给能力的
+  // buildContext，但没有任何能力读取；记忆是否参与只由运行上下文的 memoryCoordinator 决定。
   onProgress?: ((event: ProgressEvent) => void) | null;
   onToolCall?: ToolCallHook | null;
   lang?: string | null;

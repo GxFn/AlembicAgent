@@ -10,7 +10,7 @@
  * buildGenerateAgentProgressProcessEvents 把进度事件的 preset 字段写进 process event metadata。
  * 宿主引用只记符号与路由名,不记文件行号(行号随宿主改动漂移)。
  */
-import { FanOutStrategy, SingleStrategy, type Strategy } from '../../strategies/index.js';
+import { SingleStrategy, type Strategy } from '../../strategies/index.js';
 import { PipelineStrategy } from '../../strategies/PipelineStrategy.js';
 import { CHAT_PRESET } from './chatPreset.js';
 import { EVOLUTION_PRESET } from './evolutionPreset.js';
@@ -31,7 +31,11 @@ export const PRESETS = Object.freeze({
 /**
  * 将 Preset 配置中的 strategy 声明式配置转换为实际 Strategy 实例
  *
- * @param strategyConfig { type: 'single'|'pipeline'|'fan_out', ...opts }
+ * 运行时词汇只有 'single' / 'pipeline'；缺省按 single。'fan_out' 随 FanOutStrategy 删除（W2a-06 /
+ * L5-P39，没有生产调用方），现在与其他未知词汇一样抛 Unknown strategy type——构建期显式失败，
+ * 不静默降级成 single。跨维度扇出只由 profile 的 concurrency 计划经 AgentRunCoordinator 执行。
+ *
+ * @param strategyConfig { type: 'single'|'pipeline', stages?, maxRetries? }
  */
 export function resolveStrategy(strategyConfig: StrategyConfig | null | undefined): Strategy {
   if (!strategyConfig) {
@@ -47,17 +51,6 @@ export function resolveStrategy(strategyConfig: StrategyConfig | null | undefine
         stages: strategyConfig.stages || [],
         maxRetries: strategyConfig.maxRetries,
       });
-
-    case 'fan_out': {
-      const itemStrategy: Strategy = strategyConfig.itemStrategy
-        ? resolveStrategy(strategyConfig.itemStrategy)
-        : new SingleStrategy();
-      return new FanOutStrategy({
-        itemStrategy,
-        tiers: strategyConfig.tiers,
-        merge: strategyConfig.merge,
-      });
-    }
 
     default:
       throw new Error(`Unknown strategy type: ${strategyConfig.type}`);

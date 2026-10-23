@@ -192,7 +192,7 @@ type RuntimePhaseEvent = 'start' | 'finish' | 'abort' | 'error';
 /**
  * 最小阶段转移表（L5-P46 取代 AgentState 状态机）。返回 null 表示该事件在当前阶段不被允许。
  *
- * - start：只从 idle 进入 executing。Pipeline/FanOut 多次调用 reactLoop 时，第 2+ 个阶段的 start
+ * - start：只从 idle 进入 executing。Pipeline 多次调用 reactLoop 时，第 2+ 个阶段的 start
  *   从 executing 出发属于预期的非法转移，由调用方按 debug 记录后跳过。
  * - finish：只从 executing 进入 completed。策略没有经 reactLoop 进入执行阶段时（例如只返回结果的
  *   替身策略），finish 从 idle 出发被跳过，结果保持 idle——与旧状态机的终值一致。
@@ -236,7 +236,6 @@ export class AgentRuntime {
   strategy;
   policies;
   persona;
-  memoryConfig;
   onProgress;
   lang;
   logger: Pick<Console, 'info' | 'warn'>;
@@ -312,7 +311,6 @@ export class AgentRuntime {
     this.strategy = config.strategy;
     this.policies = config.policies || new PolicyEngine([]);
     this.persona = config.persona || {};
-    this.memoryConfig = config.memory || {};
     this.onProgress = config.onProgress || null;
     this.onToolCall = config.onToolCall || null;
     this.lang = config.lang || null;
@@ -339,11 +337,12 @@ export class AgentRuntime {
     // 在 src、测试与宿主仓库中均无调用方（2026-10 扫描），已移除；外部订阅统一经 `runtime.hookSystem` getter。
     this.#hookSystem = new HookSystem();
     registerDefaultHooks(this.#hookSystem, this.id, this.bus);
+    // 记忆声明不再传给提示构建器（W2a-06 / L8-P17）：memoryMode 没有能力读取，删除后系统提示逐字节不变；
+    // 记忆注入由每次运行的 memoryCoordinator 负责。
     this.#promptBuilder = new SystemPromptBuilder({
       persona: this.persona,
       fileCache: this.#fileCache,
       lang: this.lang,
-      memoryConfig: this.memoryConfig,
     });
 
     this.bus.publish(
@@ -364,7 +363,7 @@ export class AgentRuntime {
    * 执行 Agent — 入口
    *
    * @param message 统一消息
-   * @param [opts] 策略特定选项 (如 FanOut 的 items)
+   * @param [opts] 策略特定选项（如 strategyContext、systemRunContext、abortSignal）
    */
   async execute(message: AgentMessage, opts: Record<string, unknown> = {}): Promise<AgentResult> {
     return this.#withToolResourceRun(() => this.#executeRun(message, opts));
@@ -2754,7 +2753,7 @@ export class AgentRuntime {
   /**
    * 推进私有阶段（L5-P46）。阶段只是执行过程的可观测投影，任何转移结果都不能中断执行。
    *
-   * 当前阶段不允许该事件时（例如 Pipeline/FanOut 第 2+ 个阶段的 'start' 从 executing 出发，
+   * 当前阶段不允许该事件时（例如 Pipeline 第 2+ 个阶段的 'start' 从 executing 出发，
    * 或替身策略未经 reactLoop 就 'finish'）跳过转移，按 debug 记录事件名与当前阶段，便于定位。
    * 不再有观察者：旧实现的 'transition'/'phase:*' 订阅与观察者异常分支随旧状态机一并移除。
    */

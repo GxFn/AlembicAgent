@@ -97,7 +97,7 @@ Service 的 metadata.context 与显式 promptContext 共用一次优先级规则
 
 `AgentRunCoordinator` 在启动子任务前确认 partitioner 和 merger。`onChildResult` / `onTierComplete` 可能负责持久化，异常仍拒绝父运行；错误附带 `partialResult` 和 `coordinationFailures`。已启动子任务结算后保留各自真实回执，尚未启动的任务停止派发。每个结果按计划索引保存，重复使用同一个输入对象也不会互相覆盖。取消阻止的 tier 不发送完成回调。
 
-`FanOutStrategy` 向子策略传递执行配置，每个 item 使用独立诊断，最后合并一次。子 Pipeline 只获得所需的 loop 与工具观察接口，不读取父 Runtime 的共享迭代计数；中断时无法观察的工具启动数继续报告未知。显式注入同一个 ContextWindow、Tracker 或 ActiveContext 时，item 串行使用这些可变资源，并记录诊断。跨维度需要独立 Runtime 的宿主流程继续使用 Coordinator。
+跨维度扇出只由 profile 的 concurrency 计划经 Coordinator 执行，运行时策略只有 single 与 pipeline（原 `FanOutStrategy` 与 `fan_out` 词汇已删除，写 `fan_out` 会在构建时报 Unknown strategy type）。profile 的 fanout 模板只是标记 `{ type: 'fanout' }`；计划必须声明 childProfile、partitioner 与 merge，缺任一项在编译期报错并给出 profile id 与字段名。取消语义固定为 stop-new：tier 边界与每个子任务派发前检查停止事实，运行中的子任务由自身按透传的取消信号收尾；计划上没有可声明的取消策略。
 
 ## 知识工具职责
 

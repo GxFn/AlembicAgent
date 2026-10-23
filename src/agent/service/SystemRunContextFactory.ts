@@ -5,7 +5,6 @@ import { MemoryCoordinator } from '../memory/MemoryCoordinator.js';
 import {
   createSystemRunContext,
   projectSystemRunContext,
-  type SystemRunContext,
   type SystemRunContextProjection,
 } from '../runtime/SystemRunContext.js';
 
@@ -87,7 +86,6 @@ export class SystemRunContextFactory {
     return projectSystemRunContext(systemRunContext);
   }
 
-  project(systemRunContext: SystemRunContext): SystemRunContextProjection {
-    return projectSystemRunContext(systemRunContext);
-  }
+  // project(systemRunContext) 已删除（W2a-06 / L8-P17）：它只是 projectSystemRunContext 的转发，宿主、
+  // 三仓与本仓都没有调用方；需要投影已有上下文的调用方直接使用 runtime 的 projectSystemRunContext。
 }

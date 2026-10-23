@@ -90,7 +90,7 @@ function neverAssertionsIn(source: string): string[] {
 }
 
 describe('system run context projection keeps concrete field types (U55-F10)', () => {
-  it('types systemRunContext / scopeId on createSystemContext, project and projectSystemRunContext', () => {
+  it('types systemRunContext / scopeId on createSystemContext and projectSystemRunContext', () => {
     const diagnostics = typecheckProbe(
       '__system-run-context-projection-probe.ts',
       [
@@ -103,13 +103,35 @@ describe('system run context projection keeps concrete field types (U55-F10)', (
         'const scopeId: string = projected.scopeId;',
         'const dimensionScopeId: string = projected.sharedState._dimensionScopeId;',
         'const projectedAgain: SystemRunContext = projectSystemRunContext(ctx).systemRunContext;',
-        'const viaProject: string = factory.project(ctx).scopeId;',
         // 投影仍要能整体作为 strategyContext（Record<string, unknown>）传递，不收窄消费方入口。
         'const asStrategyContext: Record<string, unknown> = projected;',
-        'export { run, scopeId, dimensionScopeId, projectedAgain, viaProject, asStrategyContext };',
+        'export { run, scopeId, dimensionScopeId, projectedAgain, asStrategyContext };',
       ].join('\n')
     );
     expect(diagnostics).toEqual([]);
+  }, 60_000);
+
+  it('removes the uncalled SystemRunContextFactory.project wrapper (W2a-06 / L8-P17)', async () => {
+    // project() 只是 projectSystemRunContext 的转发，宿主与三仓都没有调用方；调用方直接用后者。
+    const { SystemRunContextFactory } = await import(
+      '../src/agent/service/SystemRunContextFactory.js'
+    );
+    const factory = new SystemRunContextFactory();
+    expect((factory as unknown as Record<string, unknown>).project).toBeUndefined();
+    expect('project' in SystemRunContextFactory.prototype).toBe(false);
+    const diagnostics = typecheckProbe(
+      '__system-run-context-factory-project-probe.ts',
+      [
+        "import type { SystemRunContextFactory } from '../src/agent/service/SystemRunContextFactory.js';",
+        "import type { SystemRunContext } from '../src/agent/runtime/SystemRunContext.js';",
+        'declare const factory: SystemRunContextFactory;',
+        'declare const ctx: SystemRunContext;',
+        'export const viaProject = factory.project(ctx);',
+      ].join('\n')
+    );
+    expect(diagnostics).toEqual([
+      "Property 'project' does not exist on type 'SystemRunContextFactory'.",
+    ]);
   }, 60_000);
 
   it('ScanAgentRun reads the projection without casting systemRunContext or scopeId', () => {

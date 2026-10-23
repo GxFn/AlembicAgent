@@ -22,17 +22,19 @@ export interface AgentProfileOverride {
   skills?: string[];
   /**
    * 运行时策略配置，整体替换 preset 的 strategy，交给 resolveStrategy 解析。只接受运行时 StrategyConfig
-   * 词汇（'single' / 'pipeline' / 'fan_out'）；声明模板词汇 'preset' / 'fanout' 只在 AgentProfileDefinition
-   * 里有效，写在这里会在 runtime build 时以 Unknown strategy type 失败（L8-C09）。
+   * 词汇（'single' / 'pipeline'）；声明模板词汇 'preset' / 'fanout' 只在 AgentProfileDefinition 里有效，
+   * 运行时 'fan_out' 随 FanOutStrategy 删除（W2a-06 / L5-P39），写这些值都会在 runtime build 时以
+   * Unknown strategy type 失败（L8-C09）。
    */
   strategy?: Record<string, unknown>;
   policies?: unknown[];
   /** 与 preset persona 浅合并；运行时只读 description（系统提示的“# 角色”段），其余键没有读取者（L8-C11）。 */
   persona?: Record<string, unknown>;
   /**
-   * 与 preset memory 浅合并后交给运行时，但 enabled / tiers 没有读取者，mode 只以 memoryMode 传给能力的
-   * buildContext 且内置能力都不读取（L8-C11）。因此 { enabled: false } 不会关闭记忆注入：记忆是否参与
-   * 由运行上下文的 memoryCoordinator 决定。字段去留属于待决的公开面收窄（事项②）。
+   * 描述性声明（L8-C11）：与 preset memory 浅合并后只留在 getPreset 的配置快照里，不再交给运行时——
+   * RuntimeConfig.memory → SystemPromptBuilder → buildContext({ memoryMode }) 这条空传递已删除
+   * （W2a-06 / L8-P17），enabled / tiers / mode 都没有读取者。因此 { enabled: false } 不会关闭记忆注入：
+   * 记忆是否参与由运行上下文的 memoryCoordinator 决定。声明块本身待宿主测试移除 memory 键后再删除。
    */
   memory?: Record<string, unknown>;
   actionSpace?: AgentActionSpace;
@@ -62,30 +64,30 @@ export interface AgentProfileDefaults {
 
 /**
  * profile 声明层的策略模板，由 AgentProfileCompiler.compileStrategy 编译成运行时 StrategyConfig。
- * 'fanout' 模板只是标记：编译结果为空，真正的扇出由 AgentRunCoordinator 按 concurrency 计划执行，
- * 协调器只读 concurrency 的 partitioner / childProfile / merge（L8-C09）。模板里的同名三个字段必须与
- * concurrency 计划逐项一致（编译期校验），否则抛错；它们不会被单独读取。
+ * 'fanout' 模板只是标记（W2a-06 / L8-P17）：编译结果为空，真正的扇出由 AgentRunCoordinator 按
+ * concurrency 计划执行，child / 分区器 / 合并器只在计划里声明一次（编译期要求计划声明齐全，见
+ * AgentConcurrencyPlan）。旧模板上的 childProfile / partitioner / merge 已删除：它们从不被读取。
  */
 export type AgentStrategyTemplate =
   | { type: 'preset' }
   | { type: 'single' }
   | { type: 'pipeline'; factory: string; paramsSchema?: string }
-  | { type: 'fanout'; childProfile: string; partitioner: string; merge: string };
+  | { type: 'fanout' };
 
+/**
+ * fanout 协调计划。AgentRunCoordinator 只读 mode / concurrency / partitioner / childProfile / merge；
+ * fanout profile 的计划必须声明 partitioner / childProfile / merge，缺失时编译期抛错。
+ * 取消语义固定为 stop-new：tier 边界与每个 child 派发前检查 abortSignal / shouldAbort，已开始的 child
+ * 不被协调器打断（父 abortSignal 经 partitioner 透传给 child，由 child 自身收尾），尚未派发的 child
+ * （含同 tier 中排队的）记为 aborted。从未被读取的 abortPolicy 声明字段已删除（W2a-06 / L8-P17，
+ * L5-P37 的“收窄为 stop-new”被其覆盖）。
+ */
 export interface AgentConcurrencyPlan {
   mode: 'none' | 'tiered' | 'parallel';
   concurrency?: number | { env: string; default: number };
   partitioner?: string;
   childProfile?: string;
   merge?: string;
-  /**
-   * fan-out 协调的取消策略声明。AgentRunCoordinator 目前只实现 'stop-new'：
-   * 在 tier 边界和每个 child 派发前检查 abortSignal / shouldAbort，已开始的 child 不被协调器打断，
-   * 尚未派发的 child（含同 tier 中排队的）记为 aborted。
-   * 'cancel-running' 与 'finish-tier' 尚未实现：声明后协调器记一条 warn 诊断，并仍按 stop-new 调度。
-   * 枚举是否收窄属于待决的公开面决策，在此之前保留现有取值以免破坏外部按枚举赋值的调用方。
-   */
-  abortPolicy?: 'stop-new' | 'cancel-running' | 'finish-tier';
 }
 
 export interface AgentProfileDefinition {
@@ -104,22 +106,6 @@ export interface AgentProfileDefinition {
   /** 描述性元数据，运行时不消费：结果投影由各 run helper 自己完成，不按此字段选择（L8-C11）。 */
   projection?: string;
   concurrency?: AgentConcurrencyPlan;
-}
-
-/**
- * 仓内没有任何引用（编译产物是 CompiledAgentProfile），仅为公开类型兼容保留；
- * 是否删除属于待决的公开面收窄（事项②，L8-C11）。
- */
-export interface AgentProfile {
-  id: string;
-  title: string;
-  lifecycle: 'active' | 'experimental' | 'deprecated';
-  skills: string[];
-  strategy?: Record<string, unknown>;
-  policies?: unknown[];
-  persona?: Record<string, unknown>;
-  memory?: Record<string, unknown>;
-  actionSpace: AgentActionSpace;
 }
 
 export type AgentActionSpace =

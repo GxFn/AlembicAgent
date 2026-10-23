@@ -31,10 +31,9 @@ import type {
 } from '../src/agent/service/AgentRunContracts.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
-import { FanOutStrategy } from '../src/agent/strategies/FanOutStrategy.js';
 import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
-import { Strategy, type StrategyRuntime } from '../src/agent/strategies/Strategy.js';
+import type { StrategyRuntime } from '../src/agent/strategies/Strategy.js';
 import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
 import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
@@ -1284,103 +1283,125 @@ describe('Agent service lifecycle', () => {
   });
 });
 
-const items = [
-  { id: 'a', label: 'a', prompt: 'item-a' },
-  { id: 'b', label: 'b', prompt: 'item-b' },
-];
 const stageResult = {
   reply: 'done',
   toolCalls: [],
   tokenUsage: { input: 1, output: 1 },
   iterations: 1,
 };
-function fanoutRuntime(strategy: FanOutStrategy) {
-  const chatWithTools = vi.fn(async (prompt: string) => ({
-    text: `done:${prompt}`,
-    functionCalls: [],
-    usage: { inputTokens: 1, outputTokens: 1 },
-  }));
-  return {
-    chatWithTools,
-    runtime: new AgentRuntime({
+
+/**
+ * W2a-06（L5-P39）：FanOutStrategy 删除前，它的用例里经 FanOut 包装的 PipelineStrategy 行为在这里改为
+ * 直接调用 PipelineStrategy 覆盖（迭代计数、上游 strategyContext、systemRunContext 资源、真实 runtime 的
+ * 工具观察者、超时救回结局）。FanOut 自身的 item 调度、取消前不派发、子消息维度与诊断隔离随类删除；
+ * 跨维度扇出由 AgentRunCoordinator 覆盖（见下方 R05 用例与 agent-run-coordinator-* 测试）。
+ */
+describe('pipeline strategy behaviour previously covered through FanOutStrategy (W2a-06)', () => {
+  it('counts real loop iterations once when the runtime strategy is a pipeline', async () => {
+    const chatWithTools = vi.fn(async (prompt: string) => ({
+      text: `done:${prompt}`,
+      functionCalls: [],
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    const runtime = new AgentRuntime({
       aiProvider: { name: 'probe', model: 'probe', chatWithTools } as never,
       toolRegistry: { getManifest: () => null } as never,
       toolRouter: { execute: vi.fn() } as never,
       capabilities: [],
-      strategy,
-    }),
-  };
-}
-describe('fanout option and accounting isolation', () => {
-  it('counts real loop iterations once when itemStrategy is a pipeline', async () => {
-    const fixture = fanoutRuntime(
-      new FanOutStrategy({
-        itemStrategy: new PipelineStrategy({ stages: [{ name: 'analyze', capabilities: [] }] }),
-      })
-    );
-    const result = await fixture.runtime.execute(
-      new AgentMessage({ content: 'controlled fanout' }),
-      { items }
-    );
-    expect(fixture.chatWithTools).toHaveBeenCalledTimes(2);
-    expect(result.iterations).toBe(2);
-  });
-  it('retains explicitly supplied policy-independent execution options for SingleStrategy items', async () => {
-    const options: Record<string, unknown>[] = [];
-    const diagnostics = new DiagnosticsCollector();
-    const sharedState = { fixture: true };
-    const budgetOverride = { maxIterations: 2 };
-    await new FanOutStrategy().execute(
-      {
-        id: 'probe',
-        reactLoop: async (_prompt, opts) => {
-          options.push(opts || {});
-          return stageResult;
-        },
-      },
-      new AgentMessage({ content: 'controlled options' }),
-      { items: [items[0]], source: 'system', sharedState, budgetOverride, diagnostics }
-    );
-    expect(options[0]).toMatchObject({
-      source: 'system',
-      sharedState,
-      budgetOverride,
-      diagnostics,
+      strategy: new PipelineStrategy({ stages: [{ name: 'analyze', capabilities: [] }] }),
     });
+    const result = await runtime.execute(new AgentMessage({ content: 'controlled pipeline' }));
+    expect(chatWithTools).toHaveBeenCalledTimes(1);
+    expect(result.iterations).toBe(1);
   });
-  it('makes upstream strategy context available to nested pipeline prompt builders', async () => {
+
+  it('makes upstream strategy context available to pipeline prompt builders', async () => {
     const seen: unknown[] = [];
-    const strategy = new FanOutStrategy({
-      itemStrategy: new PipelineStrategy({
-        stages: [
-          {
-            name: 'analyze',
-            promptBuilder: (ctx) => {
-              seen.push(ctx.projectInfo);
-              return 'done';
-            },
+    const strategy = new PipelineStrategy({
+      stages: [
+        {
+          name: 'analyze',
+          promptBuilder: (ctx) => {
+            seen.push(ctx.projectInfo);
+            return 'done';
           },
-        ],
-      }),
+        },
+      ],
     });
     await strategy.execute(
       { id: 'probe', reactLoop: async () => stageResult },
-      new AgentMessage({ content: 'controlled nested options' }),
-      { items: [items[0]], strategyContext: { projectInfo: { name: 'known-project' } } }
+      new AgentMessage({ content: 'controlled pipeline options' }),
+      { strategyContext: { projectInfo: { name: 'known-project' } } }
     );
     expect(seen).toEqual([{ name: 'known-project' }]);
   });
-});
-it('does not start pre-cancelled fanout items', async () => {
-  const controller = new AbortController();
-  controller.abort();
-  const reactLoop = vi.fn(async () => stageResult);
-  await new FanOutStrategy().execute(
-    { id: 'fanout', reactLoop },
-    new AgentMessage({ content: 'cancelled' }),
-    { items, abortSignal: controller.signal }
-  );
-  expect(reactLoop).not.toHaveBeenCalled();
+
+  it('hands the contextWindow of a top-level SystemRunContext to the stage loop', async () => {
+    const sharedWindow = { resetForNewStage: vi.fn(), tokenCount: 0 };
+    const systemRunContext = {
+      scopeId: 'probe',
+      sharedState: { _dimensionScopeId: 'probe' },
+      memoryCoordinator: {},
+      contextWindow: sharedWindow,
+      trace: {},
+      activeContext: {},
+      source: 'system',
+    };
+    const observed: unknown[] = [];
+    await new PipelineStrategy({ stages: [{ name: 'analyze' }] }).execute(
+      {
+        id: 'probe',
+        reactLoop: async (_prompt: string, opts?: Record<string, unknown>) => {
+          observed.push(opts?.contextWindow);
+          return stageResult;
+        },
+      },
+      new AgentMessage({ content: 'controlled shared context' }),
+      { systemRunContext }
+    );
+    expect(observed).toEqual([sharedWindow]);
+  });
+
+  it('keeps the real runtime configured tool observer through pipeline stages', async () => {
+    const onToolCall = vi.fn();
+    const execute = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      toolId: 'meta',
+      callId: 'observed',
+      startedAt: new Date().toISOString(),
+      durationMs: 1,
+      text: 'confirmed',
+      structuredContent: { observed: true },
+    }));
+    const chatWithTools = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: null,
+        functionCalls: [{ id: 'observed', name: 'meta', args: { action: 'tools', params: {} } }],
+      })
+      .mockResolvedValue({
+        text: 'done',
+        functionCalls: [],
+        usage: { inputTokens: 1, outputTokens: 1 },
+      });
+    const runtime = new AgentRuntime({
+      aiProvider: { name: 'probe', model: 'probe', chatWithTools } as never,
+      toolRegistry: { getManifest: () => null } as never,
+      toolRouter: { execute } as never,
+      container: { get: () => new RuntimeCapabilityCatalog() },
+      capabilities: [],
+      additionalTools: ['meta'],
+      onToolCall,
+      strategy: new PipelineStrategy({
+        stages: [{ name: 'analyze', capabilities: [], additionalTools: ['meta'] }],
+      }),
+    });
+    const result = await runtime.execute(new AgentMessage({ content: 'observe tool' }));
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result.toolCalls).toHaveLength(1);
+    expect(onToolCall).toHaveBeenCalledOnce();
+  });
 });
 
 describe('AgentMessage.internal metadata merge order (I24)', () => {
@@ -1428,30 +1449,6 @@ describe('AgentMessage.internal metadata merge order (I24)', () => {
     expect(explicitUndefined.metadata.dimension).toBe('from-metadata');
     expect(explicitUndefined.metadata.phase).toBe('produce');
   });
-
-  it('hands fanout child messages a string metadata.dimension equal to the item id', async () => {
-    const seen: Record<string, unknown>[] = [];
-    class RecordingItemStrategy extends Strategy {
-      override get name() {
-        return 'recording-item';
-      }
-      override async execute(_runtime: StrategyRuntime, message: AgentMessage) {
-        seen.push(message.metadata);
-        return stageResult;
-      }
-    }
-    await new FanOutStrategy({ itemStrategy: new RecordingItemStrategy() }).execute(
-      { id: 'fanout', reactLoop: async () => stageResult },
-      new AgentMessage({
-        content: 'dimension probe',
-        metadata: { dimension: 'parent-dimension', lang: 'zh' },
-      }),
-      { items }
-    );
-    // AgentRunCoordinator.resolveDimensionId 与 AgentService 只接受字符串维度；子消息必须携带 item.id。
-    expect(seen.map((metadata) => metadata.dimension)).toEqual(['a', 'b']);
-    expect(seen[0]).toMatchObject({ lang: 'zh', parentAgentId: 'fanout' });
-  });
 });
 
 function deferred() {
@@ -1487,40 +1484,6 @@ const childResult = (child: AgentRunInput): AgentRunResult => ({
   diagnostics: null,
 });
 describe('R05 independent strategy rework cross review', () => {
-  it('serializes top-level SystemRunContext mutable resources', async () => {
-    const sharedWindow = { resetForNewStage: vi.fn(), tokenCount: 0 };
-    const systemRunContext = {
-      scopeId: 'probe',
-      sharedState: { _dimensionScopeId: 'probe' },
-      memoryCoordinator: {},
-      contextWindow: sharedWindow,
-      trace: {},
-      activeContext: {},
-      source: 'system',
-    };
-    let active = 0;
-    let peak = 0;
-    const observed: unknown[] = [];
-    const runtime = {
-      id: 'probe',
-      reactLoop: async (_prompt: string, opts?: Record<string, unknown>) => {
-        observed.push(opts?.contextWindow);
-        active++;
-        peak = Math.max(peak, active);
-        await new Promise((resolve) => setImmediate(resolve));
-        active--;
-        return stageResult;
-      },
-    };
-    await new FanOutStrategy({
-      itemStrategy: new PipelineStrategy({ stages: [{ name: 'analyze' }] }),
-    }).execute(runtime, new AgentMessage({ content: 'controlled shared context' }), {
-      items,
-      systemRunContext,
-    });
-    expect(observed).toEqual([sharedWindow, sharedWindow]);
-    expect(peak).toBe(1);
-  });
   it('does not announce completion of tiers that cancellation prevented from starting', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -1544,78 +1507,6 @@ describe('R05 independent strategy rework cross review', () => {
     expect(result?.status).toBe('aborted');
     expect(onChildResult).toHaveBeenCalledTimes(2);
     expect(onTierComplete).not.toHaveBeenCalled();
-  });
-  it('keeps the real runtime configured tool observer through nested pipeline items', async () => {
-    const onToolCall = vi.fn();
-    const execute = vi.fn(async () => ({
-      ok: true,
-      status: 'success',
-      toolId: 'meta',
-      callId: 'observed',
-      startedAt: new Date().toISOString(),
-      durationMs: 1,
-      text: 'confirmed',
-      structuredContent: { observed: true },
-    }));
-    const chatWithTools = vi
-      .fn()
-      .mockResolvedValueOnce({
-        text: null,
-        functionCalls: [{ id: 'observed', name: 'meta', args: { action: 'tools', params: {} } }],
-      })
-      .mockResolvedValue({
-        text: 'done',
-        functionCalls: [],
-        usage: { inputTokens: 1, outputTokens: 1 },
-      });
-    const runtime = new AgentRuntime({
-      aiProvider: { name: 'probe', model: 'probe', chatWithTools } as never,
-      toolRegistry: { getManifest: () => null } as never,
-      toolRouter: { execute } as never,
-      container: { get: () => new RuntimeCapabilityCatalog() },
-      capabilities: [],
-      additionalTools: ['meta'],
-      onToolCall,
-      strategy: new FanOutStrategy({
-        itemStrategy: new PipelineStrategy({
-          stages: [{ name: 'analyze', capabilities: [], additionalTools: ['meta'] }],
-        }),
-      }),
-    });
-    const result = await runtime.execute(new AgentMessage({ content: 'observe tool' }), {
-      items: [items[0]],
-    });
-    expect(execute).toHaveBeenCalledOnce();
-    expect(result.toolCalls).toHaveLength(1);
-    expect(onToolCall).toHaveBeenCalledOnce();
-  });
-  it('isolates each child diagnostic collector and merges additive usage once', async () => {
-    const parent = new DiagnosticsCollector();
-    parent.warn({ code: 'parent', message: 'parent seed' });
-    const collectors: DiagnosticsCollector[] = [];
-    const result = await new FanOutStrategy().execute(
-      {
-        id: 'probe',
-        reactLoop: async (_prompt, options) => {
-          const diagnostics = options?.diagnostics as DiagnosticsCollector;
-          collectors.push(diagnostics);
-          diagnostics.recordTokenUsage({ inputTokens: 3, outputTokens: 2 });
-          diagnostics.warn({ code: 'child', message: 'child observation' });
-          return {
-            ...stageResult,
-            tokenUsage: { input: 3, output: 2 },
-            diagnostics: diagnostics.toJSON(),
-          };
-        },
-      },
-      new AgentMessage({ content: 'diagnostics' }),
-      { items, diagnostics: parent }
-    );
-    expect(collectors[0]).not.toBe(parent);
-    expect(collectors[1]).not.toBe(parent);
-    expect(collectors[0]).not.toBe(collectors[1]);
-    expect(result.diagnostics.efficiency?.tokenUsage).toMatchObject({ input: 6, output: 4 });
-    expect(result.diagnostics.warnings.map((w) => w.code)).toEqual(['parent', 'child', 'child']);
   });
   it('waits for started children, preserves their facts, and never starts queued children after consumer failure', async () => {
     const bStarted = deferred();
@@ -1725,20 +1616,17 @@ describe('R05 result-control compatibility edges', () => {
   it.each([
     false,
     true,
-  ])('distinguishes terminal timeout from recovered timeout in fanout item summary: recovered=%s', async (recovered) => {
+  ])('distinguishes terminal timeout from recovered timeout in the pipeline outcome: recovered=%s', async (recovered) => {
+    // W2a-06：原经 FanOut item 摘要观察（failed/completed），这里直接读 PipelineStrategy 的结局。
     const reactLoop = vi
       .fn()
       .mockResolvedValueOnce({ ...stageResult, timedOut: true })
       .mockResolvedValue(stageResult);
-    const result = await new FanOutStrategy({
-      itemStrategy: new PipelineStrategy({
-        stages: [{ name: 'analyze', ...(recovered ? { retryBudget: { maxIterations: 1 } } : {}) }],
-      }),
-    }).execute({ id: 'probe', reactLoop }, new AgentMessage({ content: 'timeout accounting' }), {
-      items: [items[0]],
-    });
-    const results = result.itemResults as Array<{ status: string }>;
-    expect(results[0].status).toBe(recovered ? 'completed' : 'failed');
+    const result = await new PipelineStrategy({
+      stages: [{ name: 'analyze', ...(recovered ? { retryBudget: { maxIterations: 1 } } : {}) }],
+    }).execute({ id: 'probe', reactLoop }, new AgentMessage({ content: 'timeout accounting' }));
+    expect(reactLoop).toHaveBeenCalledTimes(recovered ? 2 : 1);
+    expect(result.outcome).toBe(recovered ? 'completed' : 'failed');
   });
 });
 

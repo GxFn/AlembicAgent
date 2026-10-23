@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import * as domain from '../src/agent/domain/index.js';
+import * as agentEntry from '../src/agent/index.js';
 import * as profiles from '../src/agent/profiles/index.js';
 import * as prompts from '../src/agent/prompts/index.js';
 import * as runtime from '../src/agent/runtime/index.js';
@@ -13,6 +14,7 @@ import * as toolPipelineObservations from '../src/agent/runtime/toolPipeline/obs
 import * as service from '../src/agent/service/index.js';
 import * as tasks from '../src/agent/tasks/index.js';
 import { PROVIDER_CONFIGS } from '../src/ai/registry/ProviderConfig.js';
+import * as evaluationEntry from '../src/evaluation.js';
 import * as agentRoot from '../src/index.js';
 import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
@@ -903,14 +905,13 @@ const STRICT_FACADES = {
       { name: 'validateStrictAnalystEpochV1', kind: 'function' },
     ],
   },
+  // W2a-06（L8-P17）：durable 语义评审运行时只经 ./production 公开，./evaluation 删除重复的 2 个运行时绑定。
   './evaluation': {
     import: './dist/evaluation.js',
     types: './dist/evaluation.d.ts',
     runtime: [
-      { name: 'DurableSemanticReviewRuntimeError', kind: 'class' },
       { name: 'IndependentValueReviewer', kind: 'class' },
       { name: 'InvestigatedEmptyReviewer', kind: 'class' },
-      { name: 'createDurableSemanticReviewRuntime', kind: 'function' },
       { name: 'createFrozenEvidenceProjection', kind: 'function' },
     ],
   },
@@ -1528,15 +1529,16 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     );
   });
 
-  it('records 431 runtime bindings across the 15 stable package exports', () => {
+  it('records 427 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
     expect(signatures.packageExportCount).toBe(15);
     const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
     // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）；
-    // W2a-03 从 `.` 与 `./tools/runtime` 各撤回 System、ScanAnalyze（435 → 431）。
-    expect(total).toBe(431);
+    // W2a-03 从 `.` 与 `./tools/runtime` 各撤回 System、ScanAnalyze（435 → 431）；
+    // W2a-06 撤回 `.`/`./agent` 的 FanOutStrategy 与 `./evaluation` 的两个 durable 运行时绑定（431 → 427）。
+    expect(total).toBe(427);
   });
 
   it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
@@ -1613,8 +1615,8 @@ describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L
     // 宿主只用 new UnifiedToolCatalog() 与 register：类本身仍在根出口上，种类不变。
     expect(runtimeKind(exported.UnifiedToolCatalog)).toBe('class');
     const expected = snapshotEntries('.');
-    // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）。
-    expect(expected.exportCount).toBe(150);
+    // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）；W2a-06 撤回 FanOutStrategy（150 → 149）。
+    expect(expected.exportCount).toBe(149);
     const snapshotNames = expected.entries.map((entry) => entry.name);
     for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
       expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
@@ -1780,7 +1782,8 @@ function sortedEntries(moduleExports: Record<string, unknown>): SignatureEntry[]
 describe('toolset and search cache narrowing (W2a-03 / L4-P33)', () => {
   it('withdraws System and ScanAnalyze from both entries and matches the snapshot', () => {
     const subpaths = [
-      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 150 },
+      // W2a-06 再撤回 FanOutStrategy（150 → 149）。
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 149 },
       {
         exportPath: './tools/runtime',
         moduleExports: toolsRuntime as Record<string, unknown>,
@@ -1906,5 +1909,162 @@ describe('toolset and search cache narrowing (W2a-03 / L4-P33)', () => {
     });
     expect(excess).toEqual(['SearchCacheEntry.createdAt']);
     expect(diagnostics['__w2a03-retained.probe.ts']).toEqual([]);
+  }, 120000);
+});
+
+/** W2a-06（审阅包 L5-P39 / L8-P17）从 `./evaluation` 删除的 11 个与 `./production` 重复的绑定。 */
+const WITHDRAWN_EVALUATION_DURABLE_BINDINGS = [
+  'DurableSemanticReviewRuntimeError',
+  'createDurableSemanticReviewRuntime',
+] as const;
+const WITHDRAWN_EVALUATION_DURABLE_TYPES = [
+  'DurableSemanticReviewExecuteInputV1',
+  'DurableSemanticReviewRuntimeBootstrapV1',
+  'DurableSemanticReviewRuntimeErrorCode',
+  'DurableSemanticReviewRuntimeV1',
+  'SemanticReviewProviderV1',
+  'SemanticReviewSigningKeyProviderV1',
+  'SemanticReviewWitnessAuthorityBundleV1',
+  'SemanticReviewWitnessAuthorityLookupV1',
+  'SemanticReviewWitnessAuthorityPortV1',
+] as const;
+
+describe('profile compilation and strategy declaration narrowing (W2a-06 / L8-P01, L5-P39, L8-P17, L5-P37)', () => {
+  it('withdraws FanOutStrategy from `.` and `./agent` and the durable runtime from `./evaluation`', () => {
+    const subpaths = [
+      {
+        exportPath: '.',
+        moduleExports: agentRoot as Record<string, unknown>,
+        count: 149,
+        withdrawn: ['FanOutStrategy'],
+      },
+      {
+        exportPath: './agent',
+        moduleExports: agentEntry as Record<string, unknown>,
+        count: 50,
+        withdrawn: ['FanOutStrategy'],
+      },
+      {
+        exportPath: './evaluation',
+        moduleExports: evaluationEntry as Record<string, unknown>,
+        count: 3,
+        withdrawn: [...WITHDRAWN_EVALUATION_DURABLE_BINDINGS],
+      },
+    ];
+    for (const { exportPath, moduleExports, count, withdrawn } of subpaths) {
+      const expected = snapshotEntries(exportPath);
+      expect({ exportPath, exportCount: expected.exportCount }).toEqual({
+        exportPath,
+        exportCount: count,
+      });
+      const snapshotNames = expected.entries.map((entry) => entry.name);
+      for (const name of withdrawn) {
+        expect({ exportPath, name, exported: name in moduleExports }).toEqual({
+          exportPath,
+          name,
+          exported: false,
+        });
+        expect({ exportPath, name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+          exportPath,
+          name,
+          inSnapshot: false,
+        });
+      }
+      const entries = sortedEntries(moduleExports);
+      const expectedSorted = [...expected.entries].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+      );
+      expect({ exportPath, entries }).toEqual({ exportPath, entries: expectedSorted });
+      expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+        expected.signatureHash
+      );
+    }
+    // 保留面：PipelineStrategy / SingleStrategy / Strategy 与 durable 运行时（经 ./production）不变。
+    expect(runtimeKind(agentEntry.PipelineStrategy)).toBe('class');
+    expect(runtimeKind(agentEntry.SingleStrategy)).toBe('class');
+    expect(runtimeKind(agentEntry.Strategy)).toBe('class');
+    const production = snapshotEntries('./production').entries.map((entry) => entry.name);
+    for (const name of WITHDRAWN_EVALUATION_DURABLE_BINDINGS) {
+      expect({ name, inProduction: production.includes(name) }).toEqual({
+        name,
+        inProduction: true,
+      });
+    }
+  });
+
+  it('narrows the removed types and fields (compiler probes)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，类型收窄一律用真实编译器判定（一次建 Program）。
+    const diagnostics = typecheckRouterContractProbes({
+      '__w2a06-removed-exports.probe.ts': [
+        "import type { AgentProfile as RootAgentProfile } from '../src/index.js';",
+        "import type { AgentProfile as AgentEntryAgentProfile } from '../src/agent/index.js';",
+        "import type { AgentProfile as ServiceAgentProfile } from '../src/agent/service/index.js';",
+        "import type { StrategyMergeResult } from '../src/agent/profiles/presets/types.js';",
+        "import type { FanOutItem, ItemResult } from '../src/agent/strategies/index.js';",
+        "import { FanOutStrategy as RootFanOut } from '../src/index.js';",
+        "import { FanOutStrategy as AgentFanOut } from '../src/agent/index.js';",
+        ...[...WITHDRAWN_EVALUATION_DURABLE_BINDINGS, ...WITHDRAWN_EVALUATION_DURABLE_TYPES].map(
+          (name) => `import type { ${name} } from '../src/evaluation.js';`
+        ),
+        'export type Removed = [RootAgentProfile, AgentEntryAgentProfile, ServiceAgentProfile,',
+        '  StrategyMergeResult, FanOutItem, ItemResult];',
+        'export const removedClasses = [RootFanOut, AgentFanOut];',
+        '',
+      ].join('\n'),
+      '__w2a06-narrowed-fields.probe.ts': [
+        "import type { AgentConcurrencyPlan, AgentStrategyTemplate } from '../src/agent/service/AgentRunContracts.js';",
+        "import type { StrategyConfig } from '../src/agent/profiles/presets/types.js';",
+        "import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';",
+        "import type { SystemPromptBuilder } from '../src/agent/runtime/SystemPromptBuilder.js';",
+        "type FanoutTemplate = Extract<AgentStrategyTemplate, { type: 'fanout' }>;",
+        'type PromptOptions = NonNullable<ConstructorParameters<typeof SystemPromptBuilder>[0]>;',
+        "export const fanoutTemplate: [Exclude<keyof FanoutTemplate, 'type'>] extends [never] ? 'marker-only' : 'has-fields' = 'marker-only';",
+        "export const abortPolicy: 'abortPolicy' extends keyof AgentConcurrencyPlan ? 'present' : 'absent' = 'absent';",
+        "export const runtimeMemory: 'memory' extends keyof RuntimeConfig ? 'present' : 'absent' = 'absent';",
+        "export const promptMemory: 'memoryConfig' extends keyof PromptOptions ? 'present' : 'absent' = 'absent';",
+        "type DeadStrategyKeys = 'itemStrategy' | 'tiers' | 'merge' | 'single' | 'pipeline' | 'fanOut';",
+        "export const strategyConfig: [Extract<keyof StrategyConfig, DeadStrategyKeys>] extends [never] ? 'narrowed' : 'dead-fields' = 'narrowed';",
+        '',
+      ].join('\n'),
+      // 正对照：保留的声明形状、运行时词汇与 ./evaluation 的 3 个运行时绑定照常可用。
+      '__w2a06-retained.probe.ts': [
+        "import type { AgentConcurrencyPlan, AgentStrategyTemplate, CompiledAgentProfile } from '../src/index.js';",
+        "import type { StrategyConfig } from '../src/agent/profiles/presets/types.js';",
+        "import { PipelineStrategy, SingleStrategy, Strategy } from '../src/agent/index.js';",
+        "import { createFrozenEvidenceProjection, IndependentValueReviewer, InvestigatedEmptyReviewer, type FrozenEvidenceProjectionV1, type ReviewerIdentityV1 } from '../src/evaluation.js';",
+        "import { createDurableSemanticReviewRuntime, DurableSemanticReviewRuntimeError, type SemanticReviewProviderV1 } from '../src/production.js';",
+        "export const marker: AgentStrategyTemplate = { type: 'fanout' };",
+        "export const pipelineTemplate: AgentStrategyTemplate = { type: 'pipeline', factory: 'scanPipeline' };",
+        "export const plan: AgentConcurrencyPlan = { mode: 'tiered', concurrency: { env: 'E', default: 2 },",
+        "  partitioner: 'generateSessionDimensions', childProfile: 'generate-dimension', merge: 'generateSessionResults' };",
+        "export const strategy: StrategyConfig = { type: 'pipeline', stages: [{ name: 'analyze' }], maxRetries: 1 };",
+        'export type Retained = [CompiledAgentProfile, FrozenEvidenceProjectionV1, ReviewerIdentityV1, SemanticReviewProviderV1];',
+        'export const runtime = [PipelineStrategy, SingleStrategy, Strategy, createFrozenEvidenceProjection,',
+        '  IndependentValueReviewer, InvestigatedEmptyReviewer, createDurableSemanticReviewRuntime,',
+        '  DurableSemanticReviewRuntimeError];',
+        '',
+      ].join('\n'),
+    });
+
+    const missingExports = diagnostics['__w2a06-removed-exports.probe.ts']
+      // 名字与现存导出相近时 TS 会改用 “has no exported member named 'X'. Did you mean …” 的措辞。
+      .map((message) => /has no exported member (?:named )?'([^']+)'/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingExports).toEqual(
+      [
+        'AgentProfile',
+        'AgentProfile',
+        'AgentProfile',
+        'FanOutItem',
+        'FanOutStrategy',
+        'FanOutStrategy',
+        'ItemResult',
+        'StrategyMergeResult',
+        ...WITHDRAWN_EVALUATION_DURABLE_BINDINGS,
+        ...WITHDRAWN_EVALUATION_DURABLE_TYPES,
+      ].sort()
+    );
+    expect(diagnostics['__w2a06-narrowed-fields.probe.ts']).toEqual([]);
+    expect(diagnostics['__w2a06-retained.probe.ts']).toEqual([]);
   }, 120000);
 });

@@ -1,8 +1,11 @@
 import type { AgentProfileDefinition } from '../../service/AgentRunContracts.js';
 
-// 字段语义（L8-C09 / L8-C11）：serviceKind / lifecycle / projection 只是描述性元数据，运行时不消费；
-// fanout 模板只是标记，编排由 AgentRunCoordinator 只读 concurrency 计划完成，模板的 childProfile /
-// partitioner / merge 必须与计划一致（编译期校验），不会被单独读取。
+// 字段语义（L8-C09 / L8-C11 / W2a-06 L8-P17）：serviceKind / lifecycle / projection 只是描述性元数据，
+// 运行时不消费；fanout 模板只是标记 { type: 'fanout' }，编排由 AgentRunCoordinator 只读 concurrency 计划
+// 完成，child / 分区器 / 合并器只在计划里声明一次（编译期要求计划声明齐全）。
+// 取消语义固定为 stop-new：tier 边界与每个 child 派发前检查停止事实，同 tier 中尚在排队的维度直接记
+// aborted，后续 tier 不再开始；协调器不打断进行中的 child，内置 partitioner 把父 execution（含
+// abortSignal）透传给 child，由 child 自身运行时按信号收尾。计划上已没有 abortPolicy 声明字段。
 export const GENERATE_PROFILES: AgentProfileDefinition[] = [
   {
     id: 'generate-session',
@@ -13,24 +16,13 @@ export const GENERATE_PROFILES: AgentProfileDefinition[] = [
     defaults: {
       actionSpace: { mode: 'none' },
     },
-    strategy: {
-      type: 'fanout',
-      childProfile: 'generate-dimension',
-      partitioner: 'generateSessionDimensions',
-      merge: 'generateSessionResults',
-    },
+    strategy: { type: 'fanout' },
     concurrency: {
       mode: 'tiered',
       concurrency: { env: 'ALEMBIC_BOOTSTRAP_CONCURRENCY', default: 2 },
       partitioner: 'generateSessionDimensions',
       childProfile: 'generate-dimension',
       merge: 'generateSessionResults',
-      // 取消语义如实声明为 stop-new（I20，方案 B）：AgentRunCoordinator 只实现 stop-new——
-      // tier 边界与每个 child 派发前检查停止事实，同 tier 中尚在排队的维度直接记 aborted，后续 tier 不再开始。
-      // 协调器不会主动打断进行中的 child；内置 partitioner 会把父 execution（含 abortSignal）透传给 child，
-      // 由 child 自身运行时按信号收尾。此前声明的 'finish-tier'（当前 tier 跑完再停）从未被实现，
-      // 改动前后运行时行为一致；声明其他值时协调器会记 warn 诊断并仍按 stop-new 执行。
-      abortPolicy: 'stop-new',
     },
     projection: 'agent-result',
   },

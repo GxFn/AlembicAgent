@@ -139,11 +139,11 @@ export class AgentRunCoordinator {
 
 /**
  * 按 concurrency 计划派发 child 并收集结果。编排只读 concurrency 的 mode / concurrency（partitioner、merge
- * 已在 run 中解析）；profile 的 fanout 策略模板不参与（L8-C09）。实际取消语义：
- *   - stop-new：tier 边界与每个 child 派发前检查停止事实，同 tier 中尚在排队的 child 与后续 tier 写 aborted 回执；
+ * 已在 run 中解析）；profile 的 fanout 策略模板只是标记，不参与（L8-C09）。取消语义固定为 stop-new：
+ *   - tier 边界与每个 child 派发前检查停止事实，同 tier 中尚在排队的 child 与后续 tier 写 aborted 回执；
  *   - 运行中的 child 不由协调器打断，但内置 partitioner 把父 execution（含 abortSignal）透传给 child，
  *     由 child 自身运行时按信号收尾。
- * abortPolicy 声明不改变上述调度，非 stop-new 的声明只记 warn（见 logUnimplementedAbortPolicy）。
+ * 计划上不再有可声明的取消策略：从未被读取的 abortPolicy 字段及其“声明未实现”warn 已删除（W2a-06 / L8-P17）。
  */
 async function runChildren(
   childInputs: AgentRunInput[],
@@ -168,7 +168,6 @@ async function runChildren(
       }
     );
   }
-  logUnimplementedAbortPolicy(concurrencyPlan, profile);
   const limit = createLimit(concurrency.value);
   const tiers = tiered ? groupByTier(childInputs) : [childInputs.map((_, index) => index)];
   // child → tierIndex 只用于日志定位；parallel 模式没有 tier 语义，不记录 tierIndex。
@@ -676,55 +675,6 @@ async function resolveAbortReason(
     return 'abortSignal';
   }
   return null;
-}
-
-/**
- * 协调器唯一实现的取消策略是 stop-new（I20）：tier 边界与每个 child 派发前（含懒构造之后）检查停止事实，
- * 已开始的 child 不由协调器打断，尚未派发的 child（含同 tier 中排队的）写 aborted 回执。
- * 声明 'cancel-running'（打断运行中 child）或 'finish-tier'（当前 tier 跑完再停）时，
- * 调度逻辑不据此分叉、仍按 stop-new 执行——这是一条降级路径，不能静默：每次协调记一条 warn，
- * 写明声明值与实际生效值，宿主据此发现 profile 声明与实际取消语义不符。
- * 只记诊断、不改调度，也不抛错：抛错会让已声明这些值的外部 profile 直接失败，属于行为变化。
- */
-function logUnimplementedAbortPolicy(
-  concurrencyPlan: AgentConcurrencyPlan,
-  profile: CompiledAgentProfile
-) {
-  // 运行时可能拿到 JSON 等非类型化来源的值，这里按 unknown 处理，任何非 stop-new 的声明都算未实现。
-  const declared: unknown = concurrencyPlan.abortPolicy;
-  if (declared === undefined || declared === 'stop-new') {
-    return;
-  }
-  const effective = 'stop-new';
-  logCoordination(
-    'warn',
-    `abortPolicy not implemented, scheduling as stop-new profile=${profile.id} declared=${describeDeclaredAbortPolicy(declared)} effective=${effective}`,
-    {
-      profileId: profile.id,
-      mode: concurrencyPlan.mode,
-      declaredAbortPolicy: declared,
-      effectiveAbortPolicy: effective,
-    }
-  );
-}
-
-/**
- * 诊断文案里的 declared 文本化（C019）。文案模板串在进入 logCoordination / observeSafely 之前就已求值，
- * 所以这里必须保证不抛错：JS 宿主绕过类型传入的对象（null 原型对象、toString 会抛错的对象、Proxy 等）
- * 若交给 String() 会在派发任何 child 之前让整次协调失败。
- * 对象与函数一律输出固定占位 `[non-primitive:<typeof>]`，不调用其 toString/valueOf/Symbol.toPrimitive，
- * typeof 不会触发任何用户代码（含 Proxy trap），因此这条降级路径无需 try/catch；
- * 原始值（含 symbol，显式 String() 转换 symbol 不会抛错）照常转字符串。原始值仍保留在 metadata 的
- * declaredAbortPolicy 中，由 Logger 在 observeSafely 隔离内消费。
- */
-function describeDeclaredAbortPolicy(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
-  }
-  if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
-    return `[non-primitive:${typeof value}]`;
-  }
-  return String(value);
 }
 
 /** 与 AgentService preflight 相同的期限归一：只有有限正数才构成检查期限，否则不限时（只与 signal 竞速）。 */

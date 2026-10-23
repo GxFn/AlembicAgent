@@ -256,7 +256,7 @@ describe('shared/concurrency input boundary', () => {
 });
 
 // 特征测试：锁定 createLimit 当前的调度契约（峰值、FIFO、失败释放槽位），
-// 防止 FanOut 等依赖方在任务失败后因槽位泄漏而挂起。
+// 防止 AgentRunCoordinator 等依赖方在任务失败后因槽位泄漏而挂起。
 describe('shared/concurrency scheduling contract', () => {
   it('never runs more tasks at once than the limit', async () => {
     const limit = createLimit(2);

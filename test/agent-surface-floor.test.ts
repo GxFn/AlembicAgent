@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -3863,8 +3865,8 @@ describe('producer rejection gate counts prior produce attempts (L7-P18)', () =>
 /**
  * L8-P1（L8-C02）：profile 注册、编译与阶段工厂对非法输入 fail-fast。
  * 五类非法输入（未注册的显式 id、不支持的 policy 声明、非 JSON 值、不完整的 fanout、未知 scan task）
- * 在注册/编译/装配期抛带 id、下标或键路径的 Error；“id 写成内置 preset 名”的兼容写法保留，
- * 但必须留 warn 日志。Policy 实例与策略工厂函数继续放行。
+ * 在注册/编译/装配期抛带 id、下标或键路径的 Error；“id 写成内置 preset 名”的兼容回落已删除
+ * （W2a-06 / L8-P01），preset 名只能经 { preset } 引用。Policy 实例与策略工厂函数继续放行。
  */
 describe('profile compile and registration fail-fast (L8-P1)', () => {
   afterEach(() => {
@@ -3907,23 +3909,38 @@ describe('profile compile and registration fail-fast (L8-P1)', () => {
     ).toThrow('Unknown agent profile: "module-mining-dimenson"');
   });
 
-  it('keeps the id-as-preset-name compatibility path but logs the fallback', () => {
+  it.each([
+    'chat',
+    'insight',
+    'evolution',
+  ])('rejects the built-in preset name %s passed as a profile id without a fallback warn', (id) => {
+    // W2a-06（L8-P01）：“id 写成 preset 名”的兼容回落删除后，未注册的显式 id 一律编译期抛错，
+    // 不再记 profile_id_preset_fallback 告警并按 preset 编译；调用方改用 { preset }。
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const compiled = defaultCompiler().compile({ id: 'chat' });
-    expect(compiled).toMatchObject({ id: 'chat', basePreset: 'chat', serviceKind: 'conversation' });
-    const fallback = warnMessages(warn).filter((line) =>
-      line.includes('profile_id_preset_fallback')
-    );
-    expect(fallback).toHaveLength(1);
-    expect(fallback[0]).toContain('"chat"');
-
-    // 显式 preset 写法与已注册 id 都不是回退路径，不告警。
-    warn.mockClear();
-    expect(defaultCompiler().compile({ preset: 'chat' }).basePreset).toBe('chat');
-    expect(defaultCompiler().compile({ id: 'scan-extract' }).id).toBe('scan-extract');
+    expect(() => defaultCompiler().compile({ id })).toThrow(`Unknown agent profile: "${id}"`);
     expect(
       warnMessages(warn).filter((line) => line.includes('profile_id_preset_fallback'))
-    ).toHaveLength(0);
+    ).toEqual([]);
+  });
+
+  it('keeps compiling the { preset } form and registered profile ids', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    expect(defaultCompiler().compile({ preset: 'chat' })).toMatchObject({
+      id: 'chat',
+      basePreset: 'chat',
+      serviceKind: 'conversation',
+    });
+    expect(defaultCompiler().compile({ id: 'scan-extract' }).id).toBe('scan-extract');
+    expect(warnMessages(warn)).toEqual([]);
+  });
+
+  it('drops the PRESETS lookup that only served the id-as-preset fallback', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'src', 'agent', 'profiles', 'AgentProfileCompiler.ts'),
+      'utf8'
+    );
+    expect(source).not.toContain('profile_id_preset_fallback');
+    expect(source).not.toMatch(/\bPRESETS\b/u);
   });
 
   it('rejects an id that names a preset when a different preset is also given', () => {
@@ -4012,12 +4029,7 @@ describe('profile compile and registration fail-fast (L8-P1)', () => {
   });
 
   it('rejects a fanout strategy without an executable concurrency plan', () => {
-    const fanout = {
-      type: 'fanout' as const,
-      childProfile: 'generate-dimension',
-      partitioner: 'generateSessionDimensions',
-      merge: 'generateSessionResults',
-    };
+    const fanout = { type: 'fanout' as const };
     expect(() =>
       defaultCompiler([fixtureDefinition({ strategy: fanout })]).compile({
         id: 'fixture-fail-fast',
@@ -4029,28 +4041,19 @@ describe('profile compile and registration fail-fast (L8-P1)', () => {
           strategy: fanout,
           concurrency: {
             mode: 'none',
-            partitioner: fanout.partitioner,
-            childProfile: fanout.childProfile,
-            merge: fanout.merge,
+            partitioner: 'generateSessionDimensions',
+            childProfile: 'generate-dimension',
+            merge: 'generateSessionResults',
           },
         }),
       ]).compile({ id: 'fixture-fail-fast' })
     ).toThrow(/fixture-fail-fast.*fanout.*mode "none"/);
   });
 
-  it.each([
-    ['childProfile', { childProfile: 'other-child' }],
-    ['partitioner', { partitioner: 'projectContextModules' }],
-    ['merge', { merge: 'moduleMiningResults' }],
-    ['childProfile', { childProfile: undefined }],
-  ])('rejects a fanout whose %s disagrees with the concurrency plan', (field, patch) => {
-    const definition = fixtureDefinition({
-      strategy: {
-        type: 'fanout',
-        childProfile: 'generate-dimension',
-        partitioner: 'generateSessionDimensions',
-        merge: 'generateSessionResults',
-      },
+  /** 只作标记的 fanout 模板 + 完整计划（W2a-06 / L8-P17）；patch 覆盖计划中的单个字段。 */
+  function markerFanoutDefinition(patch: Record<string, unknown> = {}) {
+    return fixtureDefinition({
+      strategy: { type: 'fanout' },
       concurrency: {
         mode: 'tiered',
         concurrency: 1,
@@ -4060,14 +4063,72 @@ describe('profile compile and registration fail-fast (L8-P1)', () => {
         ...patch,
       },
     });
-    expect(() => defaultCompiler([definition]).compile({ id: 'fixture-fail-fast' })).toThrow(
-      new RegExp(`fixture-fail-fast.*${field}`)
+  }
+
+  it('compiles a marker-only fanout template against a complete concurrency plan', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const compiled = defaultCompiler([markerFanoutDefinition()]).compile({
+      id: 'fixture-fail-fast',
+    });
+    expect(compiled.strategy).toBeUndefined();
+    expect(compiled.concurrency).toMatchObject({
+      mode: 'tiered',
+      childProfile: 'generate-dimension',
+      partitioner: 'generateSessionDimensions',
+      merge: 'generateSessionResults',
+    });
+    expect(warnMessages(warn)).toEqual([]);
+  });
+
+  it.each([
+    ['childProfile', { childProfile: undefined }],
+    ['partitioner', { partitioner: undefined }],
+    ['merge', { merge: undefined }],
+    ['merge', { merge: '' }],
+  ])('rejects a fanout concurrency plan that does not declare %s', (field, patch) => {
+    // 计划是扇出唯一的声明来源：缺字段时协调器会静默回退到内置 child 或默认 merge，所以编译期抛错，
+    // 消息带 profile id 与字段名，不能退化为静默回退。
+    expect(() =>
+      defaultCompiler([markerFanoutDefinition(patch)]).compile({ id: 'fixture-fail-fast' })
+    ).toThrow(
+      new RegExp(`Agent profile "fixture-fail-fast" fanout concurrency plan must declare ${field}`)
     );
+  });
+
+  it('ignores retired fanout template fields with a warn and keeps the plan authoritative', () => {
+    // JS 调用方仍可能按旧形状在模板里写 childProfile / partitioner / merge：它们不再有读取者，
+    // 编译时记一条 warn 写明被忽略的字段，扇出照常只按计划执行。
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const definition = fixtureDefinition({
+      strategy: { type: 'fanout', childProfile: 'other-child', merge: 'moduleMiningResults' },
+      concurrency: {
+        mode: 'tiered',
+        concurrency: 1,
+        childProfile: 'generate-dimension',
+        partitioner: 'generateSessionDimensions',
+        merge: 'generateSessionResults',
+      },
+    });
+    const compiled = defaultCompiler([definition]).compile({ id: 'fixture-fail-fast' });
+    expect(compiled.strategy).toBeUndefined();
+    expect(compiled.concurrency).toMatchObject({
+      childProfile: 'generate-dimension',
+      merge: 'generateSessionResults',
+    });
+    const ignored = warnMessages(warn).filter((line) =>
+      line.includes('fanout_template_fields_ignored')
+    );
+    expect(ignored).toHaveLength(1);
+    expect(ignored[0]).toContain('fixture-fail-fast');
+    expect(ignored[0]).toContain('childProfile');
+    expect(ignored[0]).toContain('merge');
   });
 
   it('still compiles the built-in fanout session profiles', () => {
     const compiler = defaultCompiler();
     for (const id of ['generate-session', 'module-mining-session']) {
+      const definition = new AgentProfileRegistry().require(id);
+      expect(definition.strategy).toEqual({ type: 'fanout' });
       const compiled = compiler.compile({ id });
       expect(compiled.strategy).toBeUndefined();
       expect(compiled.concurrency?.mode).toBe('tiered');

@@ -116,7 +116,8 @@ describe('CapabilityRegistry without system_interaction', () => {
       }
     }
     // 内置 chat preset 走同一条 build 解析链，确认移除注册不影响正常 profile。
-    expect(() => createBuilder().build({ id: 'chat' })).not.toThrow();
+    // preset 名必须经 { preset } 引用：“id 写成 preset 名”的兼容回落已删除（W2a-06 / L8-P01）。
+    expect(() => createBuilder().build({ preset: 'chat' })).not.toThrow();
   });
 
   it('deletes the System class file while scan_analyze stays registered (W2a-03)', () => {

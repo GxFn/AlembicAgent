@@ -69,8 +69,8 @@ function describeValueType(value: unknown) {
 /**
  * 合并 internal() 的 metadata：先展开 opts.metadata，再由显式且非 undefined 的选项覆盖。
  *
- * 旧顺序让 opts.metadata 覆盖显式字段：FanOutStrategy 子消息同时传 dimension: item.id 与
- * metadata.dimension: item，结果 metadata.dimension 变成整个 FanOutItem 对象，而
+ * 旧顺序让 opts.metadata 覆盖显式字段：已删除的 FanOutStrategy（W2a-06）子消息曾同时传 dimension: item.id
+ * 与 metadata.dimension: item，结果 metadata.dimension 变成整个 item 对象，而
  * AgentRunCoordinator.resolveDimensionId 与 AgentService 只接受字符串维度，维度归属因此丢失。
  * 显式值为 undefined（未传）时保留 metadata 中的同名值，避免“未传”抹掉调用方元数据。
  * 三个键先以 undefined 占位，保持与旧实现一致的键集合与顺序。

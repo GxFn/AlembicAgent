@@ -24,9 +24,9 @@ export const CHAT_PRESET = {
     role: 'assistant',
     description: 'Alembic 知识管理助手',
   },
-  // memory 块只是描述性声明（L8-C11）：enabled / tiers 没有读取者；mode 经 SystemPromptBuilder 以
-  // memoryMode 传给能力的 buildContext，但内置能力都不读取。记忆是否参与由运行上下文的 memoryCoordinator
-  // 决定，改这里的值不会开关记忆。字段形状属于宿主可见的 PRESETS 值，去留待事项②。
+  // memory 块只是描述性声明（L8-C11）：enabled / tiers / mode 都没有读取者，也不再传给运行时（W2a-06 删除了
+  // memoryMode 空传递）。记忆是否参与由运行上下文的 memoryCoordinator 决定，改这里的值不会开关记忆。
+  // 字段形状属于宿主可见的 PRESETS 值，待宿主测试移除 memory 键后再删除。
   memory: {
     enabled: true,
     mode: 'user',

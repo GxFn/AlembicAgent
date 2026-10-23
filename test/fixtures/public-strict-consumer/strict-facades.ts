@@ -96,6 +96,12 @@ export interface StrictFacadePrivateSurfaceAssertions {
   readonly fixtureProvider: typeof EvaluationFacade.FrozenStrictProductionEvaluationProviderV1;
   // @ts-expect-error Runtime implementation and Core mint gateway stay behind the trusted factory.
   readonly durableRuntimeImplementation: typeof EvaluationFacade.DurableSemanticReviewRuntime;
+  // @ts-expect-error The trusted durable review factory is published only by the production facade.
+  readonly evaluationDurableFactory: typeof EvaluationFacade.createDurableSemanticReviewRuntime;
+  // @ts-expect-error The durable review error class is published only by the production facade.
+  readonly evaluationDurableError: typeof EvaluationFacade.DurableSemanticReviewRuntimeError;
+  // @ts-expect-error Durable review port types are published only by the production facade.
+  readonly evaluationDurableProvider: EvaluationFacade.SemanticReviewProviderV1;
   // @ts-expect-error 私有 EvidenceLedgerStore 不能从 production facade 导出。
   readonly privateLedgerStore: typeof ProductionFacade.EvidenceLedgerStore;
 }

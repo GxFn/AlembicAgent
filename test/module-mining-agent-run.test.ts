@@ -38,13 +38,9 @@ describe('module mining profiles', () => {
     const session = BUILTIN_PROFILES.find((profile) => profile.id === 'module-mining-session');
     const child = BUILTIN_PROFILES.find((profile) => profile.id === 'module-mining-dimension');
 
+    // fanout 模板只作标记（W2a-06 / L8-P17）：child、分区器与合并器只在 concurrency 计划里声明一次。
+    expect(session?.strategy).toEqual({ type: 'fanout' });
     expect(session).toMatchObject({
-      strategy: {
-        type: 'fanout',
-        childProfile: 'module-mining-dimension',
-        partitioner: 'projectContextModules',
-        merge: 'moduleMiningResults',
-      },
       concurrency: {
         mode: 'tiered',
         partitioner: 'projectContextModules',

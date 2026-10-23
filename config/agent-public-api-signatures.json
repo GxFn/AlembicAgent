@@ -31,8 +31,8 @@
   "packageExportCount": 15,
   "stableExportSignatures": {
     ".": {
-      "exportCount": 150,
-      "signatureHash": "6038b941817e4c88499b296e291d9a4871486a291afa1e8cc1f158680b8831d6",
+      "exportCount": 149,
+      "signatureHash": "801dcf3d5afb17f9eab5155b4dd89617b54a7ddc589084439df6106fa678c12b",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -188,10 +188,6 @@
         },
         {
           "name": "ExplorationTracker",
-          "kind": "class"
-        },
-        {
-          "name": "FanOutStrategy",
           "kind": "class"
         },
         {
@@ -637,8 +633,8 @@
       ]
     },
     "./agent": {
-      "exportCount": 51,
-      "signatureHash": "8ca58cb3405afec85dea717366c317d414d5f0feaf3a23ee337e3742d79d27ae",
+      "exportCount": 50,
+      "signatureHash": "00318372c1294c7ab9f6980a650a1b7b23b37499bbf1282baf2726a8238a1522",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -734,10 +730,6 @@
         },
         {
           "name": "Conversation",
-          "kind": "class"
-        },
-        {
-          "name": "FanOutStrategy",
           "kind": "class"
         },
         {
@@ -1819,13 +1811,9 @@
       ]
     },
     "./evaluation": {
-      "exportCount": 5,
-      "signatureHash": "6bb0c8780de89647281426cfbfcde7c42a6b31bb435df38872b95a2d65ae9286",
+      "exportCount": 3,
+      "signatureHash": "d40a8d77d1d35bb931a3d5d29379c5a02b2ffd8bd424843e789a3f57a4a1b4e5",
       "entries": [
-        {
-          "name": "DurableSemanticReviewRuntimeError",
-          "kind": "class"
-        },
         {
           "name": "IndependentValueReviewer",
           "kind": "class"
@@ -1833,10 +1821,6 @@
         {
           "name": "InvestigatedEmptyReviewer",
           "kind": "class"
-        },
-        {
-          "name": "createDurableSemanticReviewRuntime",
-          "kind": "function"
         },
         {
           "name": "createFrozenEvidenceProjection",

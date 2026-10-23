@@ -13,7 +13,6 @@ import type {
 import { AgentProfileRegistry } from './AgentProfileRegistry.js';
 import { AgentStageFactoryRegistry } from './AgentStageFactoryRegistry.js';
 import { evolutionAuditPolicyDeclarations } from './definitions/evolution.profile.js';
-import { PRESETS } from './presets/index.js';
 
 interface AgentProfileCompilerOptions {
   profileRegistry: AgentProfileRegistry;
@@ -48,13 +47,11 @@ export class AgentProfileCompiler {
   }
 
   /**
-   * 解析 { id?, preset?, params? } 引用（L8-C02）：
+   * 解析 { id?, preset?, params? } 引用（L8-C02 / W2a-06 L8-P01）：
    *   - 显式 id 命中注册表：编译该声明，preset 字段不参与；
-   *   - 显式 id 未注册：fail-fast 抛 Unknown agent profile，不再静默换成 preset 默认管线——拼错的 id
-   *     （如 generate-dimesion）原来会拖到 runtime build 才以误导性的 Unknown preset 报错，
-   *     { 未知 id, preset } 会被静默换成裸 preset 跑完整管线；
-   *   - 兼容写法（事项③未决，暂保留）：id 恰好是内置 preset 名（如 { id: 'chat' }）且没有给出不同的
-   *     preset 时，按该 preset 编译并记 warn，调用方应改用 { preset }；
+   *   - 显式 id 未注册：一律 fail-fast 抛 Unknown agent profile。拼错的 id（如 generate-dimesion）不会
+   *     拖到 runtime build 才报错，{ 未知 id, preset } 也不会被静默换成裸 preset；内置 preset 名写成 id
+   *     （如 { id: 'chat' }）同样抛错——旧的“按 preset 编译并记 warn”兼容回落已删除，调用方改用 { preset }；
    *   - 只给 preset：先按注册表查同名声明，未命中再按 preset 编译（原有行为）。
    */
   #compileRef(profileRef: AgentProfileRef, options: CompileOptions): CompiledAgentProfile {
@@ -66,17 +63,6 @@ export class AgentProfileCompiler {
         return this.#compileDefinition(definition, params, options.context);
       }
       const requestedPreset = profileRef.preset ? String(profileRef.preset) : null;
-      if (
-        Object.hasOwn(PRESETS, explicitId) &&
-        (!requestedPreset || requestedPreset === explicitId)
-      ) {
-        Logger.getInstance().warn(
-          `[AgentProfileCompiler] profile_id_preset_fallback: profile id "${explicitId}" is not a registered agent profile; ` +
-            `compiling it as the built-in preset "${explicitId}". Pass { preset: "${explicitId}" } instead of an id.`,
-          { requestedId: explicitId, requestedPreset, resolvedPreset: explicitId }
-        );
-        return this.#compilePresetRef(explicitId, params);
-      }
       throw new Error(
         requestedPreset
           ? `Unknown agent profile: "${explicitId}" (preset "${requestedPreset}" is not used as a fallback for an explicit profile id)`
@@ -219,22 +205,25 @@ function compileStrategy(
   }
   if (isStrategyTemplate(strategy) && strategy.type === 'fanout') {
     // 扇出由 AgentRunCoordinator 按 concurrency 计划执行（AgentService.canCoordinate 只看 concurrency），
-    // 父 profile 自身不需要运行时策略，所以这里置空。计划是否完整、与模板是否一致已在
-    // assertFanoutConcurrencyPlan 中校验，走到这里的 fanout 一定能进入协调分支。
+    // 父 profile 自身不需要运行时策略，所以这里置空。fanout 模板只是标记，计划是否可执行、是否声明了
+    // childProfile / partitioner / merge 已在 assertFanoutConcurrencyPlan 中校验，走到这里一定能进入协调分支。
     return undefined;
   }
   return strategy as Record<string, unknown>;
 }
 
-/** fanout 模板与 concurrency 计划必须逐项一致的字段；协调器只读 concurrency 侧。 */
+/** fanout 的 concurrency 计划必须声明的字段；协调器只读计划侧（fanout 模板只作标记，W2a-06 / L8-P17）。 */
 const FANOUT_PLAN_FIELDS = ['childProfile', 'partitioner', 'merge'] as const;
 
 /**
- * fanout 声明的编译期校验（L8-C02）。fanout 模板本身被编译成 undefined，真正的扇出只由 concurrency 计划驱动：
+ * fanout 声明的编译期校验（L8-C02 / W2a-06 L8-P17）。fanout 模板只是标记 { type: 'fanout' }，编译成
+ * undefined；真正的扇出只由 concurrency 计划驱动，所以计划本身必须完整：
  *   - 缺 concurrency 或 mode 为 none 时，AgentService 不进协调分支，父 profile 会静默按 basePreset
  *     的默认完整管线执行（没有维度上下文、没有日志），所以必须在编译期抛错；
- *   - 模板与计划的 childProfile / partitioner / merge 不一致时，协调器以计划为准，模板字段成了误导性的
- *     死数据（计划缺字段时协调器还会回退到内置 child 或默认 merge），同样抛错，消息带 profile id 与字段名。
+ *   - 计划缺 childProfile / partitioner / merge（或为空串）时，协调器会静默回退到内置 child 或默认
+ *     merge，同样在编译期抛错，消息带 profile id 与字段名，不能退化为静默回退。
+ * 模板上已退役的 childProfile / partitioner / merge 不再有读取者：JS 调用方按旧形状写入时不抛错，
+ * 但记一条 warn 写明被忽略的字段与取值，扇出照常只按计划执行（见 warnIgnoredFanoutTemplateFields）。
  */
 function assertFanoutConcurrencyPlan(definition: AgentProfileDefinition) {
   const strategy = definition.strategy;
@@ -254,15 +243,44 @@ function assertFanoutConcurrencyPlan(definition: AgentProfileDefinition) {
         'use mode "tiered" or "parallel"'
     );
   }
-  const template = strategy as Record<string, unknown>;
   for (const field of FANOUT_PLAN_FIELDS) {
-    if (template[field] !== plan[field]) {
+    const value: unknown = plan[field];
+    if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
-        `Agent profile "${definition.id}" fanout ${field} mismatch: strategy declares ` +
-          `${JSON.stringify(template[field] ?? null)} but concurrency plan declares ${JSON.stringify(plan[field] ?? null)}`
+        `Agent profile "${definition.id}" fanout concurrency plan must declare ${field}; ` +
+          `got ${JSON.stringify(value ?? null)}`
       );
     }
   }
+  warnIgnoredFanoutTemplateFields(definition, strategy as Record<string, unknown>);
+}
+
+/**
+ * 旧形状的 fanout 模板（模板上仍带 childProfile / partitioner / merge）的诊断。这些字段已从公开类型删除，
+ * 协调器从不读取它们；这里不抛错（模板与计划一致的旧调用方仍可编译），但每次编译记一条 warn，
+ * 写明被忽略的字段、模板取值与计划取值，避免模板与计划不一致时被静默吞掉。
+ */
+function warnIgnoredFanoutTemplateFields(
+  definition: AgentProfileDefinition,
+  template: Record<string, unknown>
+) {
+  const ignored = Object.keys(template).filter((key) => key !== 'type');
+  if (ignored.length === 0) {
+    return;
+  }
+  const plan = (definition.concurrency ?? {}) as Record<string, unknown>;
+  Logger.getInstance().warn(
+    `[AgentProfileCompiler] fanout_template_fields_ignored: agent profile "${definition.id}" fanout template ` +
+      `declares ${ignored.join(', ')}; fanout templates are markers only and the concurrency plan is authoritative.`,
+    {
+      profileId: definition.id,
+      ignoredFields: ignored,
+      templateValues: Object.fromEntries(ignored.map((key) => [key, template[key]])),
+      planValues: Object.fromEntries(
+        FANOUT_PLAN_FIELDS.filter((key) => ignored.includes(key)).map((key) => [key, plan[key]])
+      ),
+    }
+  );
 }
 
 /**

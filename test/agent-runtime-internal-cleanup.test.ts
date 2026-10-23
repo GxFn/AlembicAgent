@@ -1,10 +1,12 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as loopLedger from '../src/agent/evidence/loopLedger.js';
+import { getPreset, resolveStrategy } from '../src/agent/profiles/presets/index.js';
 import {
   AgentRuntime,
   DiagnosticsCollector,
@@ -12,6 +14,8 @@ import {
   type RuntimeConfig,
 } from '../src/agent/runtime/index.js';
 import { ContextWindowAdapter, SimpleArrayAdapter } from '../src/agent/runtime/MessageAdapter.js';
+import { SystemPromptBuilder } from '../src/agent/runtime/SystemPromptBuilder.js';
+import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import * as strategiesBarrel from '../src/agent/strategies/index.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { AiProvider } from '../src/ai/AiProvider.js';
@@ -444,7 +448,8 @@ describe('agent strategy and contract hygiene', () => {
     expect(Object.keys(strategiesBarrel)).not.toContain('default');
     expect(strategiesBarrel.Strategy).toBeTypeOf('function');
     expect(strategiesBarrel.SingleStrategy).toBeTypeOf('function');
-    expect(strategiesBarrel.FanOutStrategy).toBeTypeOf('function');
+    // W2a-06（L5-P39）：FanOutStrategy 已删除，内部 barrel 不再导出它。
+    expect(Object.keys(strategiesBarrel).sort()).toEqual(['SingleStrategy', 'Strategy']);
   });
 
   it('does not declare an unread logger on the PipelineRuntime contract', () => {
@@ -500,5 +505,88 @@ describe('agent strategy and contract hygiene', () => {
         count,
       });
     }
+  });
+});
+
+/**
+ * W2a-06（审阅包 L5-P39 / L8-P17）：运行时策略与记忆声明的空传递收口。
+ *
+ * - FanOutStrategy 没有生产调用方，随 resolveStrategy 的 'fan_out' 分支一并删除；跨维度扇出只由 profile 的
+ *   concurrency 计划经 AgentRunCoordinator 执行。'fan_out' 现在与任何未知词汇一样在构建时抛错。
+ * - preset/profile 的 memory 声明此前经 RuntimeConfig.memory → AgentRuntime#memoryConfig →
+ *   SystemPromptBuilder → buildContext({ memoryMode }) 一路传下去，但没有任何能力读取 memoryMode。
+ *   这条空传递删除后系统提示必须逐字节不变；记忆是否参与仍由运行上下文的 memoryCoordinator 决定。
+ */
+describe('runtime strategy and memory pass-through retirement (W2a-06)', () => {
+  /** 删除前在 HEAD 录制的三个 preset 基础系统提示 sha256（lang 未设、无项目概况、无文件缓存）。 */
+  const PRESET_PROMPT_SHA256: Record<string, string> = {
+    chat: '0e6b532e0bb6b992f9ccbd1100d9c3955d5a2c49229f35bafeac4af42d6511e9',
+    insight: '0cc4776dcc2acf674cb87776f02f314946e177da51ae55cd35344a8c3a8641b4',
+    evolution: '9c2bc80817a6c3ae4256d24f96c13dfc9fb4a1163de7a44ff8d261d442c07533',
+  };
+
+  /** 经 AgentRuntimeBuilder 按 preset 构建真实 runtime，跑一轮直接以文本收尾的 reactLoop。 */
+  async function capturePresetPrompt(preset: string) {
+    const catalog = new RuntimeCapabilityCatalog();
+    const provider = new AiProvider({ model: 'fixture' });
+    vi.spyOn(provider, 'chatWithTools').mockResolvedValue({ text: 'done', functionCalls: [] });
+    const build = vi.spyOn(SystemPromptBuilder.prototype, 'build');
+    const runtime = new AgentRuntimeBuilder({
+      container: { get: () => catalog },
+      toolRegistry: new UnifiedToolCatalog(),
+      toolRouter: {
+        execute: vi.fn(),
+        explain: async () => ({ allowed: true, stage: 'execute' }),
+      },
+      aiProvider: provider,
+    }).build({ preset });
+    const buildContext = (runtime.capabilities as Capability[]).map((capability) =>
+      vi.spyOn(capability, 'buildContext')
+    );
+    const result = await runtime.reactLoop('fixture', {
+      budgetOverride: { maxIterations: 1, timeoutMs: 1_000 },
+    });
+    expect(result.reply).toBe('done');
+    expect(build).toHaveBeenCalledOnce();
+    const prompt = String(build.mock.results[0]?.value);
+    return {
+      runtime,
+      prompt,
+      sha256: createHash('sha256').update(prompt).digest('hex'),
+      contextArgs: buildContext.flatMap((spy) => spy.mock.calls.map(([context]) => context)),
+    };
+  }
+
+  it('deletes FanOutStrategy and rejects the fan_out runtime vocabulary at build time', () => {
+    expect(existsSync(path.join(srcRoot, 'agent', 'strategies', 'FanOutStrategy.ts'))).toBe(false);
+    expect(() => resolveStrategy({ type: 'fan_out' })).toThrow('Unknown strategy type: fan_out');
+    expect(() => getPreset('chat', { strategy: { type: 'fan_out' } })).toThrow(
+      'Unknown strategy type: fan_out'
+    );
+    // 保留的运行时词汇照常解析。
+    expect(resolveStrategy({ type: 'single' }).name).toBe('single');
+    expect(resolveStrategy({ type: 'pipeline', stages: [] }).name).toBe('pipeline');
+    expect(resolveStrategy(undefined).name).toBe('single');
+  });
+
+  it('does not keep a memoryConfig on the runtime', () => {
+    const runtime = new AgentRuntime(minimalRuntimeConfig());
+    expect('memoryConfig' in runtime).toBe(false);
+  });
+
+  it.each([
+    'chat',
+    'insight',
+    'evolution',
+  ])('builds the %s preset system prompt byte-identically without passing memoryMode to capabilities', async (preset) => {
+    const { runtime, sha256, contextArgs } = await capturePresetPrompt(preset);
+    expect('memoryConfig' in runtime).toBe(false);
+    // 每个能力的 buildContext 都被调用过（chat 有 conversation 能力，其余 preset 的能力列表可能为空）。
+    expect(contextArgs).toHaveLength((runtime.capabilities as Capability[]).length);
+    for (const context of contextArgs) {
+      // 用键集合判断：旧实现即使 preset 没有 mode 也会写入值为 undefined 的 memoryMode 键。
+      expect(Object.keys(context as Record<string, unknown>).sort()).toEqual(['lang']);
+    }
+    expect({ preset, sha256 }).toEqual({ preset, sha256: PRESET_PROMPT_SHA256[preset] });
   });
 });

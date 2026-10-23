@@ -17,7 +17,10 @@ const forbiddenSamples = Array.isArray(policy.forbiddenConsumerSpecifierSamples)
   : [];
 const requiredRuntimeBindings = {
   './runs': ['runStrictPlanAgent'],
+  // durable 语义评审运行时只经 ./production 公开（W2a-06 / L8-P17）；./evaluation 不再重复导出。
   './production': [
+    'DurableSemanticReviewRuntimeError',
+    'createDurableSemanticReviewRuntime',
     'createProductionEvidenceLedgerAuthority',
     'createStrictAnalysisContextProjectionV1',
     'createStrictAnalysisEpochSnapshotV1',
@@ -31,10 +34,8 @@ const requiredRuntimeBindings = {
     'validateStrictAnalystEpochV1',
   ],
   './evaluation': [
-    'DurableSemanticReviewRuntimeError',
     'IndependentValueReviewer',
     'InvestigatedEmptyReviewer',
-    'createDurableSemanticReviewRuntime',
     'createFrozenEvidenceProjection',
   ],
 };
