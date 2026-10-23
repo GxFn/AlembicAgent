@@ -8,10 +8,11 @@
  * - lifecycle、surfaces：CapabilityCatalog.list 过滤。宿主 HTTP 直通入口的守卫代码也读取
  *   surfaces（risk.sideEffect 只用于拒绝原因文案），但它查询的 capabilityCatalog 是
  *   RuntimeCapabilityCatalog，其 getManifest 恒返回 null，所以这条守卫目前不会命中。
- * - governance.allowInRemoteMcp、risk.sideEffect、governance.policyProfile：
- *   UnifiedToolCatalog 由 ToolDefinition 推导 surfaces 与 evals.required 时读取。
  *
  * 仅描述性的字段（Agent 与宿主都不读取，声明了也不会生效，需要的执行方必须自行实现）：
+ * - governance.allowInRemoteMcp/policyProfile：Agent 侧唯一读取方（UnifiedToolCatalog 由旧
+ *   ToolDefinition 推导 surfaces 与 evals.required 的定义层）已随 W2a-02（审阅包 L3-P09）删除，
+ *   现在没有读取方；risk.sideEffect 只剩上面宿主守卫的拒绝原因文案读取。
  * - execution.adapter/timeoutMs/maxOutputBytes/abortMode/artifactMode/concurrency/cachePolicy：
  *   没有任何执行器按它们加超时、取消、输出上限、并发或缓存。运行时工具的并发、缓存与输出 token
  *   上限来自 runtime/registry.ts 的 ToolAction 声明，不来自这里；duplicateCache 的复用准入也改读
@@ -20,8 +21,8 @@
  *   现在没有读取方。
  * - governance.approvalPolicy/allowedRoles/allowInComposer/allowInNonInteractive/
  *   gatewayAction/gatewayResource：没有审批、角色或网关门禁读取它们。
- * - governance.auditLevel：只被兼容方法 UnifiedToolCatalog.getInternalTool 复制进元数据，
- *   该方法没有生产调用方。
+ * - governance.auditLevel：唯一读取方（UnifiedToolCatalog 的旧 handler 元数据复制）已随 W2a-02
+ *   删除，现在没有读取方。
  * - risk.dataAccess/requiresHumanConfirmation/owaspTags：没有确认流程或策略读取它们。
  *
  * 宿主 dashboard 操作是否落实 timeoutMs/abortMode/approvalPolicy 属于宿主仓库的事项，

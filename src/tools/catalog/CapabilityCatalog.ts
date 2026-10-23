@@ -97,7 +97,12 @@ export class CapabilityCatalog implements ToolSchemaQueryPort {
     };
   }
 
-  /** 泛型目录保留原始 flat 参数结构；有 lazy 状态的子类只覆盖投影，不复制选择规则。 */
+  /**
+   * 泛型目录保留原始 flat 参数结构：只有显式 mode:'lightweight' 给名称加首行描述，其余（含
+   * AgentRuntime 使用的 mixed + firstRound:true）一律给完整 schema。目录不持有任何按实例的展开
+   * 状态，也不按模型改写 schema；UnifiedToolCatalog 的 lazy 覆盖已删除（W2a-02 / L3-P09），
+   * 所以子类直接继承本投影。子类若要改投影只能覆盖本方法，不复制 querySchemas 的选择规则。
+   */
   protected projectSchema(
     manifest: ToolCapabilityManifest,
     query: ToolSchemaQuery

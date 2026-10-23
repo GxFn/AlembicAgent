@@ -49,6 +49,7 @@ for (const required of [
   'dist/agent/memory/MemoryCoordinator.js',
   'dist/tools/runtime/adapter/ToolRouterAdapter.js',
   'dist/tools/runtime/adapter/RuntimeCapabilityCatalog.js',
+  'dist/tools/catalog/UnifiedToolCatalog.js',
   'dist/ai/AiFactory.js',
   'dist/agent/runs/module-mining/ScopedModuleMiningAgentRun.js',
   'dist/agent/evaluation/MiningJudge.js',
@@ -77,6 +78,9 @@ const { ToolRouterAdapter } = await import(
 );
 const { RuntimeCapabilityCatalog } = await import(
   path.join(repoRoot, 'dist/tools/runtime/adapter/RuntimeCapabilityCatalog.js')
+);
+const { UnifiedToolCatalog } = await import(
+  path.join(repoRoot, 'dist/tools/catalog/UnifiedToolCatalog.js')
 );
 const { createProvider, autoDetectProvider } = await import(
   path.join(repoRoot, 'dist/ai/AiFactory.js')
@@ -312,20 +316,22 @@ async function runFixture(fixture) {
       },
       projectRoot: fixtureRoot,
       dataRoot,
-      toolRegistry: {
-        getRouter: () =>
-          new ToolRouterAdapter({
-            contextFactory: {
-              create: (request) => ({
-                projectRoot: fixtureRoot,
-                tokenBudget: 8000,
-                recipeGateway: gateway,
-                memoryCoordinator: request.runtime?.memoryCoordinator ?? memoryCoordinator,
-                runtime: request.runtime,
-              }),
-            },
+      // 与生产宿主 AgentModule 一致：目录只做 manifest 存储端口，router 显式经 toolRouter 传入。
+      // W2a-02 起 AgentRuntime/AgentRuntimeBuilder 不再从目录取路由兜底，只挂在目录上的 router
+      // 会让第一次 builder.build() 抛 'AgentRuntime requires ToolRouter'。
+      toolRegistry: new UnifiedToolCatalog(),
+      toolRouter: new ToolRouterAdapter({
+        contextFactory: {
+          // 生产宿主 ToolContextFactory 的职责：服务注入 + request.runtime 透传(台账/维度元)。
+          create: (request) => ({
+            projectRoot: fixtureRoot,
+            tokenBudget: 8000,
+            recipeGateway: gateway,
+            memoryCoordinator: request.runtime?.memoryCoordinator ?? memoryCoordinator,
+            runtime: request.runtime,
           }),
-      },
+        },
+      }),
     }),
   });
 

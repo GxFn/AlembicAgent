@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 
 /**
  * SOUL 人格资源的归属接线钉子（L1-I4 / L1-P9，方案 A 的 Agent 侧部分）。
@@ -34,7 +35,8 @@ function conversationMessages(...spies: Array<{ mock: { calls: unknown[][] } }>)
 function builderWith(extra: Record<string, unknown>) {
   return new AgentRuntimeBuilder({
     container: {},
-    toolRegistry: { getRouter: () => ({ execute: async () => null }) as never },
+    toolRegistry: new UnifiedToolCatalog(),
+    toolRouter: { execute: async () => null },
     aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: async () => ({ text: '' }) },
     ...extra,
   });

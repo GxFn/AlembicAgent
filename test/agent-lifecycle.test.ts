@@ -36,6 +36,7 @@ import { PipelineStrategy } from '../src/agent/strategies/PipelineStrategy.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { Strategy, type StrategyRuntime } from '../src/agent/strategies/Strategy.js';
 import { isPersistedSubmission } from '../src/agent/utils/toolOutcomes.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 
 function harness(
@@ -2910,7 +2911,8 @@ describe('service compilation and confirmed runtime receipts', () => {
   function builder() {
     return new AgentRuntimeBuilder({
       container: {},
-      toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+      toolRegistry: new UnifiedToolCatalog(),
+      toolRouter: { execute: vi.fn() },
       aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: vi.fn() },
     });
   }

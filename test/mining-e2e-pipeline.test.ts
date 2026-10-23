@@ -30,6 +30,7 @@ import { createSystemRunContext } from '../src/agent/runtime/SystemRunContext.js
 import type { AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 
@@ -399,23 +400,23 @@ function assembleMiningRun(input: {
           },
       projectRoot: input.fixtureRoot,
       dataRoot,
-      toolRegistry: {
-        getRouter: () =>
-          new ToolRouterAdapter({
-            contextFactory: {
-              // 生产宿主的 ToolContextFactory 职责：服务注入 + request.runtime 透传(台账/维度元)。
-              create: (request) => ({
-                projectRoot: input.fixtureRoot,
-                tokenBudget: 8000,
-                recipeGateway: gateway,
-                memoryCoordinator:
-                  ((request as { runtime?: { memoryCoordinator?: unknown } }).runtime
-                    ?.memoryCoordinator as never) ?? (memoryCoordinator as never),
-                runtime: (request as { runtime?: never }).runtime,
-              }),
-            },
-          }) as never,
-      },
+      // 与生产宿主 AgentModule 一致：目录只做 manifest 存储，router 显式经 toolRouter 传入
+      // （W2a-02 起 builder 不再从 toolRegistry.getRouter 兜底取路由）。
+      toolRegistry: new UnifiedToolCatalog(),
+      toolRouter: new ToolRouterAdapter({
+        contextFactory: {
+          // 生产宿主的 ToolContextFactory 职责：服务注入 + request.runtime 透传(台账/维度元)。
+          create: (request) => ({
+            projectRoot: input.fixtureRoot,
+            tokenBudget: 8000,
+            recipeGateway: gateway,
+            memoryCoordinator:
+              ((request as { runtime?: { memoryCoordinator?: unknown } }).runtime
+                ?.memoryCoordinator as never) ?? (memoryCoordinator as never),
+            runtime: (request as { runtime?: never }).runtime,
+          }),
+        },
+      }),
     }),
   });
 

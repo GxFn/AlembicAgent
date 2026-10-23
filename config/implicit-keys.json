@@ -6,7 +6,7 @@
     "sharedState": "一次运行/一个维度内跨阶段共享的可变状态（宿主创建，经 SystemRunContext 或 strategyContext.sharedState 传入）",
     "strategyContext": "宿主注入给 Strategy 的运行上下文（AgentRunInput.context.strategyContext）",
     "phaseResults": "PipelineStrategy 的阶段结果表，最终以 AgentRunResult.phases 返回宿主",
-    "toolCallContext": "legacy 工具处理器上下文（tools/kernel/handler.ts 的 InternalToolHandlerContext）",
+    "toolCallContext": "legacy 工具处理器上下文；承载它的 tools/kernel/handler.ts 已随 W2a-02（审阅包 L3-P09）删除，当前没有登记键，容器名保留给 lint 的取值集合",
     "hostContainer": "宿主 DI 容器的内部字段，本仓越过端口直接读取"
   },
   "channels": {
@@ -27,8 +27,8 @@
     },
     "_bootstrapDedup": {
       "container": "sharedState",
-      "writers": ["agent", "host"],
-      "purpose": "冷启动去重器。宿主放入 sharedState，runtimeBridge 读出后经 legacy 工具上下文同名字段交给提交处理器。"
+      "writers": ["host"],
+      "purpose": "冷启动去重器。宿主放入 sharedState，runtimeBridge 读出后经 ToolCallRequest.runtime.bootstrapDedup 交给路由；原 legacy 工具上下文同名字段（Agent 侧唯一写入点）随 tools/kernel/handler.ts 删除（W2a-02）。"
     },
     "_bootstrapSessionId": {
       "container": "sharedState",
@@ -197,21 +197,13 @@
     }
   },
   "fields": {
-    "_currentRound": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：当前循环轮次。"
-    },
     "_fallbackFrom": {
       "owner": "src/ai/management/contracts.ts",
       "purpose": "provider 实例字段：自动回退时记录原 provider 名。"
     },
-    "_memoryCoordinator": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：记忆协调器。"
-    },
     "_meta": {
       "owner": "src/tools/kernel/registry.ts",
-      "purpose": "ToolResult 的结果元信息（状态、缓存、压缩、诊断），对模型不可见。"
+      "purpose": "ToolResult 的结果元信息（状态、缓存、降级与诊断），对模型不可见。"
     },
     "_note": {
       "owner": "src/agent/context/ContextWindow.ts",
@@ -224,10 +216,6 @@
     "_raw": {
       "owner": "src/agent/context/ContextWindow.ts",
       "purpose": "搜索结果无法解析时保留的原始文本字段。"
-    },
-    "_readCache": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolSharedState 字段：legacy 读取缓存。"
     },
     "_recency": {
       "owner": "src/agent/memory/MemoryRetriever.ts",
@@ -245,37 +233,9 @@
       "owner": "src/agent/memory/MemoryRetriever.ts",
       "purpose": "记忆检索综合得分，排序后剥离。"
     },
-    "_searchCache": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolSharedState 字段：legacy 搜索缓存。"
-    },
-    "_searchCallCount": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolSharedState 字段：legacy 搜索调用计数。"
-    },
-    "_sessionToolCalls": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：本会话工具调用记录。"
-    },
-    "_sharedState": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：透传运行时 sharedState。"
-    },
-    "_submittedPatterns": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：已提交模式集合。"
-    },
-    "_submittedTitles": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：已提交标题集合。"
-    },
     "_truncated": {
       "owner": "src/agent/context/ContextWindow.ts",
       "purpose": "搜索匹配项被裁剪的标记字段。"
-    },
-    "_validator": {
-      "owner": "src/tools/kernel/handler.ts",
-      "purpose": "InternalToolHandlerContext 字段：提交校验器。"
     }
   }
 }

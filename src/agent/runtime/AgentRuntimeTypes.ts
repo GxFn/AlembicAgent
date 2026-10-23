@@ -233,7 +233,16 @@ export interface RuntimeConfig {
   id?: string;
   presetName?: string;
   aiProvider: import('#ai/AiProvider.js').AiProvider;
-  toolRegistry: import('#tools/catalog/UnifiedToolCatalog.js').UnifiedToolCatalog;
+  /**
+   * 宿主的能力 manifest 存储，收窄为只读查询的最小端口（W2a-02 / L3-P09）：运行时既不从它取 router
+   * （只认 toolRouter 与容器里的 'toolRouter'），也不从它取模型 schema（来自容器里的
+   * capabilityCatalog），只把它作为 `runtime.toolRegistry` 原样持有。宿主的 UnifiedToolCatalog 与
+   * 生产 schema 目录 RuntimeCapabilityCatalog 都满足该端口。字段仍为必填。
+   */
+  toolRegistry: Pick<
+    import('#tools/catalog/CapabilityCatalog.js').CapabilityCatalog,
+    'has' | 'getManifest'
+  >;
   toolRouter?: ToolRouterContract | null;
   container?: Record<string, unknown> | null;
   capabilities?: import('../../tools/runtime/toolsets/Capability.js').Capability[];

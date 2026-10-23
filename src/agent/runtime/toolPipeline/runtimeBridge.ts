@@ -189,12 +189,14 @@ function reportBridgeFailure(
 }
 
 /**
- * 宿主请求投影。只投影有读取者的字段（L5-P47 / I45）：policyValidator（权限校验由 Agent 侧
- * runtimeSafetyGate 完成）、sessionToolCalls（每次调用对全部历史做 O(n) 重映射）与 currentRound
- * （与 iteration 重复）在 src/tools、宿主与 Core 中都没有读取者，已不再投影；
- * ToolRuntimeCallContext 上对应的可选字段是否收窄依赖待决事项②，这里不改类型。
+ * 宿主请求投影。只投影有读取者的字段（L5-P47 / I45；W2a-02 按读写对账收窄 ToolRuntimeCallContext）：
+ * - policyValidator（权限校验由 Agent 侧 runtimeSafetyGate 完成）、sessionToolCalls（每次调用对全部
+ *   历史做 O(n) 重映射）与 currentRound（与 iteration 重复）早已不投影，类型字段也已删除；
+ * - diagnostics 端口不进入宿主请求：逐调用诊断由 recordExecutedEnvelope 直接写 loopCtx.diagnostics；
+ * - fileCache、dataRoot、logger 在 src/tools、宿主 ToolContextFactory 与 Core 中都没有读取者，
+ *   随类型字段一起删除（宿主自己的 dataRoot 来自容器，不依赖这里）。
  * 旧的 cache 投影（把 memoryCoordinator 当作工具结果缓存端口）随缓存层删除（W1-04，决定①），
- * 宿主请求不再带 cache 键；memoryCoordinator 本身仍按原字段投影。
+ * 宿主请求不再带 cache 键；memoryCoordinator 本身仍按原字段投影（宿主 ToolContextFactory 读取）。
  */
 function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): ToolCallRequest {
   const { runtime, loopCtx } = context;
@@ -225,12 +227,8 @@ function buildRuntimeToolCallRequest(call: ToolCall, context: ToolExecContext): 
       resourceScope: loopCtx.resourceScope,
       presetName: runtime.presetName,
       iteration: loopCtx.iteration || 0,
-      diagnostics: loopCtx.diagnostics || null,
       safetyPolicy,
-      fileCache: runtime.fileCache,
-      dataRoot: runtime.dataRoot,
       lang: runtime.lang,
-      logger: runtime.logger || null,
       aiProvider: runtime.aiProvider || null,
       sharedState: loopCtx.sharedState || null,
       dimensionMeta: loopCtx.sharedState?._dimensionMeta || null,

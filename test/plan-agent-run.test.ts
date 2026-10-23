@@ -11,6 +11,7 @@ import {
 import type { AgentRunInput, AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { AgentService } from '../src/agent/service/AgentService.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 
 function agentRunResult(
   reply: string,
@@ -127,7 +128,8 @@ describe('runPlanAgent', () => {
       runtimeBuilder: new AgentRuntimeBuilder({
         aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
         container: {},
-        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+        toolRegistry: new UnifiedToolCatalog(),
+        toolRouter: { execute: vi.fn() },
       }),
     });
 
@@ -409,7 +411,8 @@ describe('plan helpers cancellation and deadline signals', () => {
       runtimeBuilder: new AgentRuntimeBuilder({
         aiProvider: { name: 'unit-test', model: 'unit', chatWithTools } as never,
         container: {},
-        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+        toolRegistry: new UnifiedToolCatalog(),
+        toolRouter: { execute: vi.fn() },
       }),
     });
     const controller = new AbortController();

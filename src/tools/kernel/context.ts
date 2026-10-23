@@ -1,12 +1,22 @@
 /**
  * Tool call context contract — surface/actor/source identity, runtime call
- * context, and the service-locator/service-contract seams shared by the router
- * and host adapters. Canonical home (formerly src/tools/core/ToolCallContext.ts).
+ * context, and the service-locator seam shared by the router and host adapters.
+ * Canonical home (formerly src/tools/core/ToolCallContext.ts).
+ *
+ * 收窄记录（W2a-02，审阅包 L3-P08 / L3-P10 / L5-P47，按事项②执行；路由契约的唯一实现仍是
+ * ToolRouterAdapter）：
+ * - 删除 ToolCallContext.serviceContracts 与 6 个 *ServiceContract 接缝类型：从未被赋值，
+ *   唯一读取方 kernel/routing.ts 同批删除。
+ * - ToolRuntimeCallContext 按读写对账删除没有读取方的字段：diagnostics 端口（逐调用诊断由
+ *   runtimeBridge 直接写入 loopCtx.diagnostics）、policyValidator、sessionToolCalls、currentRound、
+ *   validator、fileCache、dataRoot、logger。safetyPolicy、memoryCoordinator 等有宿主
+ *   ToolContextFactory 或 handler 读取的字段保留；ToolCallContext 顶层 dataRoot 保留。
+ * - ToolPolicyValidator / ToolPolicyDecision 在 policyValidator 删除后没有字段引用，但不在本批
+ *   批准清单内，按总控裁定保留为公开类型（观察项）。
  */
 
 import type { ToolDecisionResultStatus } from './decision.js';
 import type { TerminalCommandAllowlist } from './registry.js';
-import type { ToolResultEnvelope } from './result.js';
 import type { ToolActionAllowlist } from './toolSchema.js';
 
 export type ToolSurface = 'runtime' | 'http' | 'mcp' | 'dashboard' | 'composer' | 'system';
@@ -26,50 +36,6 @@ export interface ToolServiceLocator {
   get<T = unknown>(name: string): T;
 }
 
-export interface ToolRoutingServiceContract {
-  toolRouter?: unknown | null;
-}
-
-export interface ToolKnowledgeServiceContract {
-  getKnowledgeService(): unknown | null;
-  getSearchEngine(): unknown | null;
-  getKnowledgeGraphService(): unknown | null;
-}
-
-export interface ToolGuardServiceContract {
-  getGuardService(): unknown | null;
-  getGuardCheckEngine(): unknown | null;
-  getViolationsStore(): unknown | null;
-}
-
-export interface ToolLifecycleServiceContract {
-  getKnowledgeLifecycleService(): unknown | null;
-  getProposalRepository(): unknown | null;
-  getProposalGateway(): unknown | null;
-  getConsolidationAdvisor(): unknown | null;
-}
-
-export interface ToolInfraServiceContract {
-  getKnowledgeGraphService(): unknown | null;
-  getIndexingPipeline(): unknown | null;
-  getAuditLogger(): unknown | null;
-}
-
-export interface ToolQualityServiceContract {
-  getQualityScorer(): unknown | null;
-  getRecipeCandidateValidator(): unknown | null;
-  getFeedbackCollector(): unknown | null;
-}
-
-export interface ToolServiceContracts {
-  toolRouting?: ToolRoutingServiceContract;
-  knowledge?: ToolKnowledgeServiceContract;
-  guard?: ToolGuardServiceContract;
-  lifecycle?: ToolLifecycleServiceContract;
-  infra?: ToolInfraServiceContract;
-  quality?: ToolQualityServiceContract;
-}
-
 export interface ToolPolicyDecision {
   ok: boolean;
   reason?: string;
@@ -81,17 +47,6 @@ export interface ToolPolicyDecision {
 
 export interface ToolPolicyValidator {
   validateToolCall(toolName: string, args: Record<string, unknown>): ToolPolicyDecision;
-}
-
-export interface ToolDiagnosticsRecorder {
-  recordToolCallEnvelope(
-    envelope: ToolResultEnvelope,
-    context?: {
-      kind?: string;
-      surface?: ToolSurface;
-      source?: string;
-    }
-  ): void;
 }
 
 /**
@@ -167,37 +122,19 @@ export interface ToolRuntimeCallContext {
   iteration?: number;
   /** 证据台账（Wave A E3）；缺席=非维度场景，note_finding 降级为不校验直存 */
   evidenceLedger?: EvidenceLedgerLike | null;
-  /**
-   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：router、handler、宿主与 Core 都不读取，
-   * 工具权限校验在 Agent 侧 runtimeSafetyGate 完成。字段删除属于公开类型收窄，随待决事项②处理。
-   */
-  policyValidator?: ToolPolicyValidator | null;
-  diagnostics?: ToolDiagnosticsRecorder | null;
-  logger?: unknown;
   aiProvider?: unknown;
+  /** 宿主 ToolContextFactory 读取并转交为 ToolContext.safetyPolicy，供 handler 使用。 */
   safetyPolicy?: unknown;
-  fileCache?: unknown;
-  dataRoot?: string | null;
   lang?: string | null;
   sharedState?: Record<string, unknown> | null;
   dimensionMeta?: unknown;
   projectLanguage?: string | null;
-  validator?: unknown;
   submittedTitles?: Set<string> | null;
   submittedPatterns?: Set<string> | null;
   submittedTriggers?: Set<string> | null;
-  /**
-   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：没有读取者，旧投影每次调用都对全部
-   * 历史做 O(n) 重映射。字段删除属于公开类型收窄，随待决事项②处理。
-   */
-  sessionToolCalls?: Array<{ tool: string; params?: Record<string, unknown> }> | null;
   bootstrapDedup?: unknown;
+  /** 记忆协调器：宿主 ToolContextFactory 转交为 ToolContext.memoryCoordinator，可用性检查也读取它。 */
   memoryCoordinator?: unknown;
-  /**
-   * @deprecated Agent runtimeBridge 不再投影（L5-P47 / I45）：与 iteration 重复且没有读取者，
-   * 轮次请读 iteration。字段删除属于公开类型收窄，随待决事项②处理。
-   */
-  currentRound?: number;
   dimensionScopeId?: string | null;
 }
 
@@ -214,5 +151,4 @@ export interface ToolCallContext {
   projectRoot: string;
   dataRoot?: string | null;
   services: ToolServiceLocator;
-  serviceContracts?: ToolServiceContracts;
 }

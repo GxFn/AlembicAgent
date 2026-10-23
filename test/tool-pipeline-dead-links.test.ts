@@ -5,16 +5,17 @@
  *    MemoryCoordinator.recordObservation，不写 SessionStore），L5-P47 先把它移出默认装配；
  *    按决定①删除缓存层后，实现、ToolExecutionPipeline 再导出与 ./runtime 导出一并删除，
  *    MemoryCoordinator.recordObservation 也已不存在。
- * 2. runtimeBridge 不再投影无人读取的 policyValidator / sessionToolCalls / currentRound，
- *    kernel/handler.ts 的 contextFromToolCall 也不再映射 _sessionToolCalls / _currentRound。
+ * 2. runtimeBridge 不再投影无人读取的 policyValidator / sessionToolCalls / currentRound；
  *    无消费者的 cache 端口（ToolRuntimeCallContext.cache）随缓存层删除，宿主请求不再带 cache 键。
+ *    W2a-02（审阅包 L3-P08 / L5-P47）随后收窄 ToolRuntimeCallContext：diagnostics 端口与
+ *    fileCache / dataRoot / logger / validator 不再进入宿主请求，legacy handler 层（kernel/handler.ts）
+ *    整体删除；逐调用诊断仍由 runtimeBridge 直接写 loopCtx.diagnostics。
  *
  * 全部按生产形态构造：真实 createToolPipeline + 不带 capability 的真实 ToolRouterAdapter，
  * 宿主 contextFactory 记录它实际收到的 ToolCallRequest。
  */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import type { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
@@ -26,8 +27,7 @@ import {
   createToolPipeline,
   ToolExecutionPipeline,
 } from '../src/agent/runtime/ToolExecutionPipeline.js';
-import type { ToolCallContext, ToolCallRequest } from '../src/tools/kernel/index.js';
-import { contextFromToolCall } from '../src/tools/kernel/index.js';
+import type { ToolCallRequest } from '../src/tools/kernel/index.js';
 import { ToolRouterAdapter } from '../src/tools/runtime/adapter/ToolRouterAdapter.js';
 import type { ToolContext } from '../src/tools/runtime/index.js';
 import { Evolution } from '../src/tools/runtime/index.js';
@@ -194,48 +194,26 @@ describe('runtime bridge request projection (L5-P47 / I45)', () => {
       expect(map).not.toHaveBeenCalled();
       // 无消费者的 cache 端口随缓存层删除（W1-04，决定①）：宿主请求不再带 cache 键。
       expect('cache' in projected).toBe(false);
+      // W2a-02：diagnostics 端口与没有读取方的 fileCache / dataRoot / logger / validator 不再进入
+      // 宿主请求（宿主 ToolContextFactory 与 src/tools 都不读它们）。
+      for (const key of ['diagnostics', 'fileCache', 'dataRoot', 'logger', 'validator']) {
+        expect({ key, projected: key in projected }).toEqual({ key, projected: false });
+      }
       // 仍在使用的字段保持原样。
       expect(projected.iteration).toBe(3);
       expect(projected.memoryCoordinator).toBe(memory);
-      expect(projected.diagnostics).toBe(diagnostics);
+      expect(projected.agentId).toBe('dead-link-runtime');
+      // 逐调用诊断不经宿主请求，而由 runtimeBridge 直接写入本次循环的收集器。
+      expect(diagnostics.toJSON().toolCalls).toEqual([
+        expect.objectContaining({
+          tool: 'terminal',
+          callId: outcome.metadata.envelope?.callId,
+          status: 'success',
+          surface: 'runtime',
+        }),
+      ]);
     } finally {
       memory.dispose();
     }
-  });
-});
-
-describe('legacy handler context mapping (L5-P47 / I45)', () => {
-  function callContext(runtime: ToolCallContext['runtime']): ToolCallContext {
-    return {
-      callId: 'call-dead-link',
-      toolId: 'demo.echo',
-      surface: 'runtime',
-      actor: { role: 'developer', user: 'dead-link-user' },
-      source: { kind: 'runtime', name: 'dead-link-source' },
-      projectRoot: 'fixture-project-root',
-      services: { get: () => undefined as never },
-      runtime,
-    };
-  }
-
-  it('drops the unread _sessionToolCalls and _currentRound mappings but keeps live fields', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const coordinator = { id: 'memory-port' };
-    const context = contextFromToolCall(
-      callContext({
-        // 外部宿主仍可能按旧形状传入这两个字段；它们没有读取者，不再映射。
-        sessionToolCalls: [{ tool: 'code', params: { action: 'search' } }],
-        currentRound: 4,
-        memoryCoordinator: coordinator,
-        dimensionScopeId: 'scope-a',
-        projectLanguage: 'typescript',
-      })
-    );
-    expect('_sessionToolCalls' in context).toBe(false);
-    expect('_currentRound' in context).toBe(false);
-    expect(context._memoryCoordinator).toBe(coordinator);
-    expect(context._dimensionScopeId).toBe('scope-a');
-    expect(context._projectLanguage).toBe('typescript');
-    expect(warn).not.toHaveBeenCalled();
   });
 });

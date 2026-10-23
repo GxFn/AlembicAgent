@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 
 /**
  * 工具契约注释的事实守卫（L3-P05）。
@@ -35,6 +36,27 @@ function sourceFiles(): Array<{ file: string; text: string }> {
   }));
 }
 
+// 仓库内的 Node 脚本（eval:mining 等）直接用 dist 构造 AgentRuntimeBuilder，同样是运行时接线的消费方。
+// 它们不在 tsconfig 与 vitest 的执行范围内，只能靠源码守护发现旧接线。
+function scriptFiles(dir = path.join(repoRoot, 'scripts'), acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const filePath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      scriptFiles(filePath, acc);
+    } else if (/\.(mjs|cjs|js)$/.test(entry.name)) {
+      acc.push(filePath);
+    }
+  }
+  return acc;
+}
+
+function scriptSources(): Array<{ file: string; text: string }> {
+  return scriptFiles().map((filePath) => ({
+    file: path.relative(repoRoot, filePath).split(path.sep).join('/'),
+    text: readFileSync(filePath, 'utf8'),
+  }));
+}
+
 describe('tool contract comments describe current facts', () => {
   it('UnifiedToolCatalog header drops the GovernanceEngine/ToolRouter claims and token ratios', () => {
     const text = readSource('src/tools/catalog/UnifiedToolCatalog.ts');
@@ -43,18 +65,47 @@ describe('tool contract comments describe current facts', () => {
     expect(text).not.toMatch(/保持对\s*`?ToolRouter`?\s*的兼容/);
     // 未经测量的 token 节省比例不能写成事实。
     expect(text).not.toMatch(/~?\d+\s*-\s*\d+%/);
-    // toToolSchemasForModel 是新增的包装方法，不是父类方法的覆盖。
+    // 旧的 toToolSchemasForModel 包装已随按模型覆盖一起删除（W2a-02），不能回流“覆盖父类”的说法。
     expect(text).not.toContain("Override parent's toToolSchemas");
     expect(text).toContain('Dashboard/Skill manifest');
 
-    // 事实核对：runtime router 不依赖 catalog；setRouter 在 src 中没有调用方。
+    // 事实核对：runtime router 不依赖 catalog。
     const routerText = readSource('src/tools/runtime/router.ts');
     expect(routerText).not.toMatch(/\b(UnifiedToolCatalog|CapabilityCatalog)\b/);
-    const setRouterCallers = sourceFiles()
-      .filter(({ file }) => file !== 'src/tools/catalog/UnifiedToolCatalog.ts')
-      .filter(({ text: source }) => /\.setRouter\s*\(/.test(source))
+    // W2a-02（审阅包 L3-P09）：目录上的 router 绑定整体删除，AgentRuntime/AgentRuntimeBuilder 也不再
+    // 调用 getRouter 兜底；宿主一直显式传 toolRouter。AgentRuntime 只在缺 router 的错误信息里
+    // 判断旧目录是否仍挂着 getRouter（不调用），不算兜底。
+    const catalog = new UnifiedToolCatalog();
+    expect('setRouter' in catalog).toBe(false);
+    expect('getRouter' in catalog).toBe(false);
+    const routerFallbackCallers = sourceFiles()
+      .filter(({ text: source }) => /\.getRouter\?\.\(|\.(getRouter|setRouter)\s*\(/.test(source))
       .map(({ file }) => file);
-    expect(setRouterCallers).toEqual([]);
+    expect(routerFallbackCallers).toEqual([]);
+  });
+
+  it('repository scripts wire the tool router explicitly instead of hanging it on toolRegistry', () => {
+    // W2a-02 返工：scripts/eval-mining.mjs 曾用 `toolRegistry: { getRouter: () => router }` 接线，
+    // 兜底删除后它会在第一次 builder.build() 时抛 'AgentRuntime requires ToolRouter'。
+    // 脚本不进 tsc/vitest，这里按源码锁两件事：
+    // 1) 脚本里不再定义或调用 getRouter/setRouter（对象字面量属性、方法调用、可选调用都算）；
+    // 2) 构造 AgentRuntimeBuilder 的脚本必须显式传 toolRouter 选项。
+    const scripts = scriptSources();
+    expect(scripts.length).toBeGreaterThan(0);
+    const routerOnRegistry = scripts
+      .filter(({ text }) => /\b(?:getRouter|setRouter)\b\s*(?:\?\.\s*)?[:(]/.test(text))
+      .map(({ file }) => file);
+    expect(routerOnRegistry).toEqual([]);
+
+    const builderScripts = scripts.filter(({ text }) =>
+      /new\s+AgentRuntimeBuilder\s*\(/.test(text)
+    );
+    // eval-mining 是当前唯一构造 builder 的脚本；名单变化时同步核对新脚本的接线。
+    expect(builderScripts.map(({ file }) => file)).toEqual(['scripts/eval-mining.mjs']);
+    const missingToolRouter = builderScripts
+      .filter(({ text }) => !/\btoolRouter\s*:/.test(text))
+      .map(({ file }) => file);
+    expect(missingToolRouter).toEqual([]);
   });
 
   it('request.ts names ToolRouterAdapter as the only ToolRouterContract implementation', () => {

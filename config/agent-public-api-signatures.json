@@ -31,8 +31,8 @@
   "packageExportCount": 15,
   "stableExportSignatures": {
     ".": {
-      "exportCount": 157,
-      "signatureHash": "3203e92cd047ecf09681de010879442fe10c42ab6d978a1163d656745ec4563d",
+      "exportCount": 152,
+      "signatureHash": "335a0944281f755cf1c6e0cf3604cbf4e71fe6542e7b2262bc3e1a54e8ed6ddc",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -399,10 +399,6 @@
           "kind": "object"
         },
         {
-          "name": "allowToolDecision",
-          "kind": "function"
-        },
-        {
           "name": "assertMemoryStoreSchemaShape",
           "kind": "function"
         },
@@ -419,10 +415,6 @@
           "kind": "function"
         },
         {
-          "name": "contextFromToolCall",
-          "kind": "function"
-        },
-        {
           "name": "createEmbedProvider",
           "kind": "function"
         },
@@ -436,14 +428,6 @@
         },
         {
           "name": "createProvider",
-          "kind": "function"
-        },
-        {
-          "name": "createToolRoutingServiceContract",
-          "kind": "function"
-        },
-        {
-          "name": "denyToolDecision",
           "kind": "function"
         },
         {
@@ -596,10 +580,6 @@
         },
         {
           "name": "resolveStrategy",
-          "kind": "function"
-        },
-        {
-          "name": "resolveToolRouterFromContext",
           "kind": "function"
         },
         {

@@ -1,4 +1,4 @@
-import type { ToolDiagnosticsRecorder, ToolResultEnvelope } from '#tools/kernel/index.js';
+import type { ToolResultEnvelope } from '#tools/kernel/index.js';
 import type {
   AgentDiagnostics,
   AgentDiagnosticWarning,
@@ -125,7 +125,7 @@ function describeReceived(value: unknown): string {
   return typeof value;
 }
 
-export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
+export class DiagnosticsCollector {
   #diagnostics: AgentDiagnostics;
 
   constructor(seed?: Partial<AgentDiagnostics>) {
@@ -279,8 +279,9 @@ export class DiagnosticsCollector implements ToolDiagnosticsRecorder {
   /**
    * 逐调用轨迹（AgentDiagnostics.toolCalls）的生产写入方是 runtimeBridge 的 recordExecutedEnvelope：
    * 每个拿到路由信封的 runtime 调用都会经 loopCtx.diagnostics 写入这里，所以它不是空通道
-   * （L5-P47 / I45 核对；LightweightRouter 删除后的接线见 runtimeBridge）。ToolDiagnosticsRecorder
-   * 端口与 toolCalls 字段是否继续公开，随待决事项②决定。
+   * （L5-P47 / I45 核对；LightweightRouter 删除后的接线见 runtimeBridge）。原先把本收集器经
+   * ToolCallRequest.runtime 交给宿主的 diagnostics 端口没有读取方，已随 W2a-02（L3-P08）删除，
+   * 本方法与 toolCalls 字段保留。
    */
   recordToolCallEnvelope(
     envelope: ToolResultEnvelope,

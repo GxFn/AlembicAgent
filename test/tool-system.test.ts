@@ -6,14 +6,11 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   CapabilityCatalog,
-  contextFromToolCall,
   isToolResultEnvelope,
   presentToolResult,
   projectToolResultOrdinaryOutput,
   TOOL_RESULT_FORBIDDEN_ORDINARY_OUTPUT_FIELDS,
-  type ToolCallContext,
   type ToolCapabilityManifest,
-  type ToolDefinition,
   type ToolResultEnvelope,
   UnifiedToolCatalog,
 } from '../src/index.js';
@@ -209,6 +206,39 @@ describe('tool kernel contract', () => {
       .map(({ file }) => file)
       .sort();
 
+    expect(stragglers).toEqual([]);
+  });
+
+  // W2a-02（审阅包 L3-P09 / L3-P10）：legacy handler 层与 routing service-contract 接缝整体退役。
+  // handler.ts（contextFromToolCall、InternalToolHandler* 类型）与 routing.ts（两个路由 helper）
+  // 不再存在，kernel 桶与 tools 桶都不再转发它们，src 中也没有任何残留导入。
+  it('removes the legacy handler layer and the routing service-contract seam from the kernel', () => {
+    for (const rel of ['src/tools/kernel/handler.ts', 'src/tools/kernel/routing.ts']) {
+      expect({ rel, exists: existsSync(path.join(process.cwd(), rel)) }).toEqual({
+        rel,
+        exists: false,
+      });
+    }
+
+    // 只看代码（去掉注释）：注释里可以记录退役历史，但不能再有导入、再导出或引用。
+    const stripComments = (source: string) =>
+      source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
+    const stragglers = walkSource(path.join(process.cwd(), 'src'))
+      .map((filePath) => ({
+        file: path.relative(process.cwd(), filePath).split(path.sep).join('/'),
+        code: stripComments(readFileSync(filePath, 'utf8')),
+      }))
+      .filter(
+        ({ file, code }) =>
+          /kernel\/(handler|routing)\.js['"]/.test(code) ||
+          (file.startsWith('src/tools/kernel/') &&
+            /['"]\.\/(handler|routing)\.js['"]/.test(code)) ||
+          /\b(contextFromToolCall|createToolRoutingServiceContract|resolveToolRouterFromContext|InternalToolHandler\w*|InternalToolLogger|InternalToolSharedState|ToolServiceContracts|ToolDiagnosticsRecorder)\b/.test(
+            code
+          )
+      )
+      .map(({ file }) => file)
+      .sort();
     expect(stragglers).toEqual([]);
   });
 });
@@ -1303,55 +1333,100 @@ describe('graph and plan host outcomes', () => {
   });
 });
 
+/**
+ * W2a-02（审阅包 L3-P09）：UnifiedToolCatalog 收窄为纯 manifest 存储。router 绑定、ToolDefinition
+ * 注册与 handler 存取、按模型 schema 覆盖与实例级 lazy 展开全部删除；宿主只用的
+ * new UnifiedToolCatalog()、register 与继承来的 manifest 读取保持不变。
+ */
+const RETIRED_UNIFIED_CATALOG_MEMBERS = [
+  'setRouter',
+  'getRouter',
+  'registerDefinition',
+  'registerDefinitions',
+  'getDefinition',
+  'getHandler',
+  'getInternalTool',
+  'toToolSchemasForModel',
+  'definitionCount',
+  'listDefinitionIds',
+  'markExpanded',
+  'markExpandedAll',
+  'resetExpanded',
+  'expandedCount',
+  'toLightweightSchemas',
+  'toMixedSchemas',
+] as const;
+
 describe('UnifiedToolCatalog', () => {
-  it('projects tool schemas and preserves internal handler access', () => {
-    const definition: ToolDefinition = {
-      id: 'demo.echo',
-      title: 'Demo Echo',
-      description: 'Full echo schema',
-      kind: 'internal-tool',
-      inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
-      handler: async (args) => ({ echoed: args.value }),
-      risk: createManifest().risk,
-      governance: createManifest().governance,
-      execution: createManifest().execution,
-      modelOverrides: {
-        'gpt-*': {
-          description: 'Model-specific echo schema',
-          inputSchema: { type: 'object', properties: { compact: { type: 'boolean' } } },
-        },
-      },
-    };
-    const catalog = new UnifiedToolCatalog([definition]);
+  it('drops the router, definition/handler and lazy members from the prototype chain', () => {
+    const catalog = new UnifiedToolCatalog();
+    for (const member of RETIRED_UNIFIED_CATALOG_MEMBERS) {
+      expect({ member, present: member in catalog }).toEqual({ member, present: false });
+    }
+    // 不再覆盖父类投影：没有任何自有原型成员，schema 与 list 语义完全来自 CapabilityCatalog。
+    expect(Object.getOwnPropertyNames(UnifiedToolCatalog.prototype)).toEqual(['constructor']);
+  });
 
-    expect(catalog.getManifest('demo.echo')).toMatchObject({
-      id: 'demo.echo',
-      kind: 'internal-tool',
-    });
-    expect(catalog.getInternalTool('demo.echo')).toMatchObject({
-      name: 'demo.echo',
-      description: 'Full echo schema',
-    });
-    expect(catalog.toLightweightSchemas()[0]).toMatchObject({
-      name: 'demo.echo',
-      parameters: { type: 'object', properties: {} },
-    });
-
-    catalog.markExpanded('demo.echo');
-
-    expect(catalog.toMixedSchemas(null, 'gpt-5', false)[0]).toMatchObject({
-      description: 'Model-specific echo schema',
-      parameters: { type: 'object', properties: { compact: { type: 'boolean' } } },
-    });
-
+  it('keeps the host manifest store: empty construction, register, getManifest, list and unregister', () => {
+    const catalog = new UnifiedToolCatalog();
+    expect(catalog.size).toBe(0);
+    const manifest = createManifest();
+    catalog.register(manifest);
+    expect(catalog.size).toBe(1);
+    expect(catalog.has('demo.echo')).toBe(true);
+    expect(catalog.getManifest('demo.echo')).toBe(manifest);
+    expect(catalog.list().map(({ id }) => id)).toEqual(['demo.echo']);
+    expect(() => catalog.register(createManifest())).toThrow(/already registered/);
     expect(catalog.unregister('demo.echo')).toBe(true);
-    expect(catalog.getHandler('demo.echo')).toBeNull();
-    expect(catalog.expandedCount).toBe(0);
-    expect(() => catalog.registerDefinition(definition)).not.toThrow();
-    catalog.unregister('demo.echo');
-    catalog.register(createManifest());
-    expect(() => catalog.registerDefinition(definition)).toThrow();
-    expect(catalog.getHandler('demo.echo')).toBeNull();
+    expect(catalog.getManifest('demo.echo')).toBeNull();
+  });
+
+  it('projects full schemas for runtime mixed queries without instance-level lazy state', () => {
+    const catalog = new UnifiedToolCatalog();
+    catalog.register(createManifest({ description: 'Echo test input\nDetailed contract' }));
+    const full = {
+      name: 'demo.echo',
+      description: 'Echo test input\nDetailed contract',
+      parameters: { type: 'object', properties: { value: { type: 'string' } } },
+    };
+    // AgentRuntime 固定以 mode:'mixed' + firstRound:true 查询；去掉 lazy 层后 firstRound 不再影响结果。
+    expect(catalog.querySchemas({ mode: 'mixed', firstRound: true }).schemas).toEqual([full]);
+    expect(catalog.querySchemas({ mode: 'mixed', firstRound: false }).schemas).toEqual([full]);
+    expect(catalog.querySchemas({ mode: 'full', model: 'gpt-5' }).schemas).toEqual([full]);
+    // 显式 lightweight 是 CapabilityCatalog 自己的投影规则，保持不变。
+    expect(catalog.querySchemas({ mode: 'lightweight' }).schemas).toEqual([
+      {
+        name: 'demo.echo',
+        description: 'Echo test input',
+        parameters: { type: 'object', properties: {} },
+      },
+    ]);
+  });
+
+  it('ignores a legacy ToolDefinition array passed by JS callers and reports it', () => {
+    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    try {
+      const legacyDefinitions = [{ ...createManifest(), handler: () => undefined }];
+      // JS 调用方仍可能按旧签名传入定义数组：不能被父类当成 manifest 注册。
+      const Catalog = UnifiedToolCatalog as unknown as new (
+        ...args: unknown[]
+      ) => UnifiedToolCatalog;
+      const catalog = new Catalog(legacyDefinitions);
+      expect(catalog.size).toBe(0);
+      expect(catalog.getManifest('demo.echo')).toBeNull();
+      expect(warn).toHaveBeenCalledOnce();
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain('[UnifiedToolCatalog]');
+      expect(message).toContain('ignored 1 constructor argument(s)');
+      expect(message).toContain('array of 1');
+      expect(message).toContain('register(manifest)');
+
+      warn.mockClear();
+      new UnifiedToolCatalog();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -1421,89 +1496,6 @@ describe('CapabilityCatalog.list filters', () => {
       'cap.disabled-http',
     ]);
     expect(ids(catalog.list())).toEqual(['cap.active', 'cap.deprecated']);
-  });
-});
-
-/**
- * L3-C08（保留方案下的内部收敛）：contextFromToolCall 的 process.cwd() 回落必须打出可定位的 warn，
- * 返回值保持兼容（仍然回落到 cwd），不改公开函数的签名与结果。
- */
-describe('contextFromToolCall legacy handler context', () => {
-  function callContext(overrides: Partial<ToolCallContext> = {}): ToolCallContext {
-    return {
-      callId: 'call-ctx-1',
-      toolId: 'demo.echo',
-      surface: 'runtime',
-      actor: { role: 'developer', user: 'ctx-test-user' },
-      source: { kind: 'runtime', name: 'ctx-test-source' },
-      projectRoot: '',
-      services: { get: () => undefined as never },
-      ...overrides,
-    };
-  }
-
-  it('warns with tool, call and fallback fields when projectRoot is empty', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    try {
-      const context = contextFromToolCall(callContext());
-      // 兼容行为不变：仍然回落到进程 cwd。
-      expect(context.projectRoot).toBe(process.cwd());
-      expect(context.dataRoot).toBe(process.cwd());
-      expect(warn).toHaveBeenCalledTimes(1);
-      const message = String(warn.mock.calls[0]?.[0]);
-      expect(message).toContain('[contextFromToolCall]');
-      expect(message).toContain('process.cwd()');
-      expect(message).toContain('fields=projectRoot,dataRoot');
-      expect(message).toContain('tool=demo.echo');
-      expect(message).toContain('callId=call-ctx-1');
-      expect(message).toContain('source=ctx-test-source');
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it('reports only projectRoot when dataRoot is supplied by the request or the runtime', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    try {
-      const fromRequest = contextFromToolCall(callContext({ dataRoot: 'fixture-data-root' }));
-      expect(fromRequest.dataRoot).toBe('fixture-data-root');
-      const fromRuntime = contextFromToolCall(
-        callContext({ runtime: { dataRoot: 'fixture-runtime-data-root' } })
-      );
-      expect(fromRuntime.dataRoot).toBe('fixture-runtime-data-root');
-      expect(warn).toHaveBeenCalledTimes(2);
-      for (const [message] of warn.mock.calls) {
-        expect(String(message)).toContain('fields=projectRoot;');
-        expect(String(message)).not.toContain('dataRoot');
-      }
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it('does not warn when projectRoot is provided', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    try {
-      const context = contextFromToolCall(callContext({ projectRoot: 'fixture-project-root' }));
-      expect(context.projectRoot).toBe('fixture-project-root');
-      expect(context.dataRoot).toBe('fixture-project-root');
-      expect(warn).not.toHaveBeenCalled();
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it('keeps the compatibility registration in handler.ts true: no src caller and a recorded removal condition', () => {
-    const handlerFile = path.join('src', 'tools', 'kernel', 'handler.ts');
-    const text = readFileSync(path.join(process.cwd(), handlerFile), 'utf8');
-    expect(text).toContain('兼容层登记');
-    expect(text).toContain('移除条件');
-    // 事实核对：头注释声称 contextFromToolCall 在 src 中没有调用方；一旦出现调用方，需要同步改登记。
-    const callers = walkSource(path.join(process.cwd(), 'src'))
-      .filter((filePath) => path.relative(process.cwd(), filePath) !== handlerFile)
-      .filter((filePath) => /\bcontextFromToolCall\s*\(/.test(readFileSync(filePath, 'utf8')))
-      .map((filePath) => path.relative(process.cwd(), filePath));
-    expect(callers).toEqual([]);
   });
 });
 

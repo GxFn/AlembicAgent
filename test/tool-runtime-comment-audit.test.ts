@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { EVIDENCE_TOOL_IDS } from '@alembic/core/knowledge';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { isSearchAction } from '../src/agent/context/exploration/SignalDetector.js';
 import { resolveEvidenceAction } from '../src/agent/evidence/EvidenceCapture.js';
@@ -251,6 +252,36 @@ describe('ToolResultMeta comment states the full ok/resultStatus composition (L3
 
     expect(envelope.ok).toBe(ok);
     expect(envelope.status).toBe(expected);
+  });
+
+  // W2a-02（审阅包 L3-P13）：compression 既没有生产者也没有消费者，按决定从类型删除；
+  // tsconfig 只含 src、vitest 不做类型检查，所以用 TypeScript 解析器读取成员集合作为守护。
+  it('declares no compression member on ToolResultMeta', () => {
+    const file = path.join(repoRoot, 'src/tools/kernel/registry.ts');
+    const source = ts.createSourceFile(
+      file,
+      readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true
+    );
+    const declaration = source.statements.find(
+      (statement): statement is ts.InterfaceDeclaration =>
+        ts.isInterfaceDeclaration(statement) && statement.name.text === 'ToolResultMeta'
+    );
+    expect(declaration).toBeDefined();
+    const members = (declaration?.members ?? []).map((member) =>
+      member.name && ts.isIdentifier(member.name) ? member.name.text : '(computed)'
+    );
+    expect(members).not.toContain('compression');
+    expect(members).toEqual([
+      'resultStatus',
+      'cached',
+      'tokensEstimate',
+      'durationMs',
+      'degraded',
+      'fallbackUsed',
+      'diagnosticWarnings',
+    ]);
   });
 
   it('names the cancellation branch next to the "missing resultStatus" rule', () => {

@@ -4,12 +4,10 @@ import { AgentRuntime } from '../src/agent/runtime/AgentRuntime.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { CapabilityCatalog } from '../src/tools/catalog/CapabilityCatalog.js';
 import { queryToolSchemas } from '../src/tools/catalog/schemaQuery.js';
-import {
-  type ToolDefinition,
-  UnifiedToolCatalog,
-} from '../src/tools/catalog/UnifiedToolCatalog.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import type { ToolAvailabilitySnapshot } from '../src/tools/kernel/availability.js';
 import type { ToolRuntimeCallContext } from '../src/tools/kernel/context.js';
+import type { ToolCapabilityManifest } from '../src/tools/kernel/manifest.js';
 import type { ToolCallRequest } from '../src/tools/kernel/request.js';
 import type {
   ToolActionAllowlist,
@@ -313,14 +311,20 @@ describe('runtime schema query', () => {
   });
 });
 
-function genericDefinition(): ToolDefinition {
+/**
+ * 泛型目录用的 flat manifest。W2a-02（审阅包 L3-P09）删除了 UnifiedToolCatalog 的 ToolDefinition
+ * 注册与按模型覆盖（modelOverrides），泛型目录现在只按注册的 manifest 投影。
+ */
+function genericManifest(): ToolCapabilityManifest {
   return {
     id: 'demo.echo',
     title: 'Echo',
     description: 'Echo value\nDetailed contract',
     kind: 'internal-tool',
+    owner: 'fixture',
+    lifecycle: 'active',
+    surfaces: ['runtime'],
     inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
-    handler: async (args) => ({ echoed: args.value }),
     risk: {
       sideEffect: false,
       dataAccess: 'none',
@@ -348,92 +352,57 @@ function genericDefinition(): ToolDefinition {
       concurrency: 'parallel-safe',
       artifactMode: 'inline',
     },
-    modelOverrides: {
-      'fixture-*': {
-        description: 'Model-specific echo',
-        inputSchema: { type: 'object', properties: { compact: { type: 'boolean' } } },
-      },
-    },
+    evals: { required: false, cases: [] },
   };
 }
 
+function unifiedCatalogWith(...manifests: ToolCapabilityManifest[]): UnifiedToolCatalog {
+  const catalog = new UnifiedToolCatalog();
+  catalog.registerAll(manifests);
+  return catalog;
+}
+
 describe('generic schema query compatibility', () => {
-  it('keeps a legacy bare model ID containing a colon intact', () => {
-    const definition = genericDefinition();
-    definition.modelOverrides = {
-      latest: { description: 'unrelated suffix model' },
-      'qwen2:latest': { description: 'complete bare API model ID' },
-    };
-    const catalog = new UnifiedToolCatalog([definition]);
-    expect(catalog.toToolSchemasForModel(['demo.echo'], 'qwen2:latest')[0].description).toBe(
-      'complete bare API model ID'
+  it('passes a legacy bare model ID containing a colon intact to a legacy model port', () => {
+    // Agent 自己的目录不再按模型改写 schema；仍按模型投影的只有旧宿主目录，它拿到的必须是原样的裸 id。
+    const toToolSchemasForModel = vi.fn(() => [
+      { name: 'demo.echo', description: 'legacy host projection', parameters: { type: 'object' } },
+    ]);
+    const diagnostic = vi.fn();
+    const result = queryToolSchemas(
+      { toToolSchemasForModel },
+      { selection: ['demo.echo'], model: 'qwen2:latest', mode: 'full' },
+      diagnostic
     );
-    expect(catalog.toMixedSchemas(['demo.echo'], 'qwen2:latest', true)[0].description).toBe(
-      'complete bare API model ID'
-    );
+    expect(toToolSchemasForModel).toHaveBeenCalledWith(['demo.echo'], 'qwen2:latest');
+    expect(diagnostic).toHaveBeenCalledWith('toToolSchemasForModel');
+    expect(result.schemas.map(({ name }) => name)).toEqual(['demo.echo']);
   });
 
   it.each([
     'base',
-    'model-override',
-  ])('owns nested JSON schema data returned by a %s projection', (kind) => {
-    const definition = genericDefinition();
+    'unified',
+  ])('owns nested JSON schema data returned by a %s catalog projection', (kind) => {
     const schema = {
       type: 'object',
       required: ['value'],
       properties: { value: { type: 'string', enum: ['original'] } },
     };
-    definition.inputSchema = schema;
-    definition.modelOverrides = { 'fixture-*': { inputSchema: schema } };
-    const unified = new UnifiedToolCatalog([definition]);
+    const manifest = { ...genericManifest(), inputSchema: schema };
     const catalog =
-      kind === 'base'
-        ? new CapabilityCatalog([
-            {
-              ...definition,
-              owner: 'fixture',
-              lifecycle: 'active',
-              surfaces: ['runtime'],
-              evals: { required: false, cases: [] },
-            },
-          ])
-        : unified;
-    const query = {
-      selection: ['demo.echo'],
-      model: kind === 'model-override' ? 'fixture-model' : undefined,
-    };
+      kind === 'base' ? new CapabilityCatalog([manifest]) : unifiedCatalogWith(manifest);
+    const query = { selection: ['demo.echo'], model: 'fixture-model' };
     const expected = structuredClone(schema);
     const first = queryToolSchemas(catalog, query, () => {}).schemas[0].parameters as typeof schema;
     first.required.push('injected');
     first.properties.value.enum.push('injected');
     expect(queryToolSchemas(catalog, query, () => {}).schemas[0].parameters).toEqual(expected);
     expect(schema).toEqual(expected);
-    expect(unified.getDefinition('demo.echo')).toBe(definition);
-    expect(unified.getHandler('demo.echo')).toBe(definition.handler);
+    expect(catalog.getManifest('demo.echo')?.inputSchema).toBe(schema);
   });
 
-  it.each([
-    { provider: 'openai', model: 'gpt-4o', pattern: 'gpt-*' },
-    { provider: 'openai', model: 'gpt-4o', pattern: 'openai:gpt-*' },
-    { provider: 'ollama', model: 'qwen2:latest', pattern: 'qwen2:latest' },
-    { provider: 'ollama', model: 'qwen2:latest', pattern: 'ollama:qwen2:*' },
-  ])('applies $pattern through the real Runtime model reference', async ({
-    provider,
-    model,
-    pattern,
-  }) => {
-    const definition = genericDefinition();
-    definition.modelOverrides = {
-      [pattern]: {
-        description: 'matched override',
-        inputSchema: {
-          type: 'object',
-          required: ['compact'],
-          properties: { compact: { type: 'boolean' } },
-        },
-      },
-      '*': { description: 'later fallback must not hide the first match' },
-    };
+  it('sends the registered manifest schema unchanged through the real Runtime model reference', async () => {
+    // 按模型覆盖已删除（W2a-02）：无论 provider/model 是什么，泛型目录都给注册的完整 schema。
     class FlatCapability extends ReadCapability {
       get allowedTools(): unknown {
         return { 'demo.echo': ['invoke'] };
@@ -443,68 +412,53 @@ describe('generic schema query compatibility', () => {
       }
     }
     const { runtime, chatWithTools } = runtimeWith(
-      new UnifiedToolCatalog([definition]),
+      unifiedCatalogWith(genericManifest()),
       new FlatCapability(),
-      { name: provider, model }
+      { name: 'ollama', model: 'qwen2:latest' }
     );
     chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
-    await runtime.reactLoop('model override fixture');
+    await runtime.reactLoop('model reference fixture');
     expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual([
       {
         name: 'demo.echo',
-        description: 'matched override',
-        parameters: {
-          type: 'object',
-          required: ['compact'],
-          properties: { compact: { type: 'boolean' } },
-        },
+        description: 'Echo value\nDetailed contract',
+        parameters: { type: 'object', properties: { value: { type: 'string' } } },
       },
     ]);
   });
 
   it('keeps flat schemas and selected action words without inventing a builtin action envelope', () => {
-    const definition = genericDefinition();
-    const catalog = new CapabilityCatalog([
-      {
-        ...definition,
-        owner: 'fixture',
-        lifecycle: 'active',
-        surfaces: ['runtime'],
-        evals: { required: false, cases: [] },
-      },
-    ]);
+    const manifest = genericManifest();
+    const catalog = new CapabilityCatalog([manifest]);
     const result = catalog.querySchemas({
       selection: { 'demo.echo': ['custom', 'custom'], unknown: null },
     });
     expect(result.allowedTools).toEqual({ 'demo.echo': ['custom'] });
-    expect(result.schemas[0].parameters).toEqual(definition.inputSchema);
+    expect(result.schemas[0].parameters).toEqual(manifest.inputSchema);
     expect(catalog.querySchemas({ selection: [] }).schemas).toEqual([]);
     expect(catalog.querySchemas({ selection: { 'demo.echo': [] } }).allowedTools).toEqual({});
     expect(catalog.querySchemas({ selection: ['constructor'] }).schemas).toEqual([]);
   });
 
-  it('retains model override and first-round versus expanded lazy behavior', () => {
-    const catalog = new UnifiedToolCatalog([genericDefinition()]);
+  it('gives the same full schema for mixed queries with or without firstRound and trims only lightweight', () => {
+    // lazy 展开层已删除：泛型目录没有实例级展开状态，firstRound 不再改变 mixed 的结果。
+    const catalog = unifiedCatalogWith(genericManifest());
     const query = { selection: ['demo.echo'], model: 'fixture-model', mode: 'mixed' as const };
-    expect(catalog.querySchemas({ ...query, firstRound: true }).schemas[0]).toMatchObject({
-      description: 'Model-specific echo',
-      parameters: { properties: { compact: { type: 'boolean' } } },
-    });
-    expect(catalog.querySchemas(query).schemas[0]).toEqual({
+    const full = {
       name: 'demo.echo',
-      description: 'Echo value',
-      parameters: { type: 'object', properties: {} },
-    });
-    catalog.markExpanded('demo.echo');
-    expect(catalog.querySchemas(query).schemas).toEqual(
-      catalog.toMixedSchemas(['demo.echo'], 'fixture-model', false)
-    );
-    expect(catalog.querySchemas({ ...query, mode: 'full' }).schemas).toEqual(
-      catalog.toToolSchemasForModel(['demo.echo'], 'fixture-model')
-    );
-    expect(catalog.querySchemas({ ...query, mode: 'lightweight' }).schemas).toEqual(
-      catalog.toLightweightSchemas(['demo.echo'])
-    );
+      description: 'Echo value\nDetailed contract',
+      parameters: { type: 'object', properties: { value: { type: 'string' } } },
+    };
+    expect(catalog.querySchemas({ ...query, firstRound: true }).schemas).toEqual([full]);
+    expect(catalog.querySchemas(query).schemas).toEqual([full]);
+    expect(catalog.querySchemas({ ...query, mode: 'full' }).schemas).toEqual([full]);
+    expect(catalog.querySchemas({ ...query, mode: 'lightweight' }).schemas).toEqual([
+      {
+        name: 'demo.echo',
+        description: 'Echo value',
+        parameters: { type: 'object', properties: {} },
+      },
+    ]);
     expect(catalog.querySchemas({ selection: {} }).schemas).toEqual([]);
   });
 });
@@ -1249,19 +1203,21 @@ describe('runtime schema query port', () => {
 
 describe('runtime lazy schema state across runs', () => {
   // 两个都带必填参数 q 的通用工具：用来观察“未用过的工具”在第 2 次运行中是否丢失参数 schema。
-  function requiredQueryDefinition(id: string): ToolDefinition {
-    return {
-      ...genericDefinition(),
-      id,
-      title: id,
-      description: `${id} tool`,
-      inputSchema: {
-        type: 'object',
-        required: ['q'],
-        properties: { q: { type: 'string' } },
-      },
-      modelOverrides: {},
-    };
+  // W2a-02 后目录只做 manifest 存储（没有 lazy 层），跨运行回归改用 manifest 注册的目录。
+  function requiredQueryCatalog(): UnifiedToolCatalog {
+    return unifiedCatalogWith(
+      ...['tool_a', 'tool_b'].map((id) => ({
+        ...genericManifest(),
+        id,
+        title: id,
+        description: `${id} tool`,
+        inputSchema: {
+          type: 'object',
+          required: ['q'],
+          properties: { q: { type: 'string' } },
+        },
+      }))
+    );
   }
 
   class PairCapability extends ReadCapability {
@@ -1287,10 +1243,7 @@ describe('runtime lazy schema state across runs', () => {
   ];
 
   it('keeps complete schemas for unused tools when one catalog serves two runs', async () => {
-    const catalog = new UnifiedToolCatalog([
-      requiredQueryDefinition('tool_a'),
-      requiredQueryDefinition('tool_b'),
-    ]);
+    const catalog = requiredQueryCatalog();
     const query = vi.spyOn(catalog, 'querySchemas');
 
     const first = runtimeWith(catalog, new PairCapability());
@@ -1313,35 +1266,12 @@ describe('runtime lazy schema state across runs', () => {
     // 第 2 次运行里 tool_b 从未被调用过，仍须保留必填参数 q，而不是降级为空对象 schema。
     expect(second.chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(fullSchemas);
     expect(query.mock.calls.map(([request]) => request.firstRound)).toEqual([true, true]);
-    // 运行时不再把运行内用过的工具写回进程级目录单例。
-    expect(catalog.expandedCount).toBe(0);
-  });
-
-  it('requests complete schemas even when a host already marked catalog tools as expanded', async () => {
-    const catalog = new UnifiedToolCatalog([
-      requiredQueryDefinition('tool_a'),
-      requiredQueryDefinition('tool_b'),
-    ]);
-    // 宿主或其他调用方直接操作公开的 lazy 方法时，运行时也不能据此把未展开工具降级。
-    catalog.markExpanded('tool_a');
-    const query = vi.spyOn(catalog, 'querySchemas');
-    const { runtime, chatWithTools } = runtimeWith(catalog, new PairCapability());
-    chatWithTools.mockReset().mockResolvedValue({ text: 'done' });
-    await runtime.reactLoop('pre-expanded catalog');
-    expect(query).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[0]?.[0]).toMatchObject({ mode: 'mixed', firstRound: true });
-    expect(chatWithTools.mock.calls[0]?.[1].toolSchemas).toEqual(fullSchemas);
-    // 类方法语义不变：运行时没有重置或改写宿主自己登记的展开状态。
-    expect(catalog.expandedCount).toBe(1);
   });
 
   // 以下用例对应 L5 审阅 I15：pipeline 每个阶段在同一个 runtime 上各跑一次 reactLoop，
   // 每个循环只在 #initLoop 查询一次 schema；前一阶段用过的工具不能让后一阶段降级未用工具。
   it('keeps complete schemas in a later stage loop of the same runtime after an earlier loop used a tool', async () => {
-    const catalog = new UnifiedToolCatalog([
-      requiredQueryDefinition('tool_a'),
-      requiredQueryDefinition('tool_b'),
-    ]);
+    const catalog = requiredQueryCatalog();
     const query = vi.spyOn(catalog, 'querySchemas');
     const { runtime, execute, chatWithTools } = runtimeWith(catalog, new PairCapability());
     chatWithTools
@@ -1357,12 +1287,11 @@ describe('runtime lazy schema state across runs', () => {
     await runtime.reactLoop('stage 2 loop');
     // 第 2 个循环首轮：tool_b 从未被调用，也必须带着必填参数 q 发给 provider。
     expect(chatWithTools.mock.calls[secondLoopStart]?.[1].toolSchemas).toEqual(fullSchemas);
-    // 每个循环恰好查询一次，且都要完整 schema；运行时不向目录写展开状态。
+    // 每个循环恰好查询一次，且都要完整 schema。
     expect(query.mock.calls.map(([request]) => [request.mode, request.firstRound])).toEqual([
       ['mixed', true],
       ['mixed', true],
     ]);
-    expect(catalog.expandedCount).toBe(0);
   });
 
   it('leaves the production RuntimeCapabilityCatalog expansion state untouched and its output unchanged', async () => {

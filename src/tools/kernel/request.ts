@@ -6,11 +6,12 @@
  *   宿主没有第二个路由实现。
  * - 生产调用链只用到契约上的 execute 与 releaseScope；契约上的 explain、executeChildCall 在
  *   Agent 与宿主中都没有调用方（ToolRouterAdapter.executeChildCall 只是委托 execute；内部
- *   ToolRouter.explain 是另一个方法），因此已改为可选（L3-C09）：新的实现者只需实现 execute，
- *   kernel/routing.ts 的形状守卫也只要求 execute。ToolRouterAdapter 仍保留这两个方法。
- * - ToolCallRequest.governance 没有读取方，传入的 gatewayAction 等不会触发任何门禁；
- *   ToolExecutionAdapter 与 ToolExecutionPreviewRequest 没有实现者。宿主 dashboard 操作只
- *   使用 ToolExecutionRequest 的形状。
+ *   ToolRouter.explain 是另一个方法），因此是可选成员（L3-C09）：新的实现者只需实现 execute。
+ *   ToolRouterAdapter 仍保留这两个方法。
+ * - ToolExecutionRequest 是宿主 dashboard 操作在用的形状（宿主生产代码构造它），保留。
+ * - W2a-02（审阅包 L3-P10）按事项②删除了没有读取方或实现者的接缝：ToolCallRequest.governance
+ *   （传入的 gatewayAction 等从不触发门禁）、ToolExecutionAdapter 与 ToolExecutionPreviewRequest，
+ *   以及 kernel/routing.ts 的 service-contract 路由 helper。
  */
 
 import type {
@@ -21,8 +22,8 @@ import type {
   ToolScopeRelease,
   ToolSurface,
 } from './context.js';
-import type { ToolDecision, ToolExecutionPreview } from './decision.js';
-import type { CapabilityKind, ToolCapabilityManifest } from './manifest.js';
+import type { ToolDecision } from './decision.js';
+import type { ToolCapabilityManifest } from './manifest.js';
 import type { ToolResultEnvelope } from './result.js';
 
 export interface ToolCallRequest {
@@ -34,11 +35,6 @@ export interface ToolCallRequest {
   parentCallId?: string;
   abortSignal?: AbortSignal | null;
   runtime?: ToolRuntimeCallContext;
-  governance?: {
-    gatewayAction?: string | null;
-    gatewayResource?: string;
-    gatewayData?: Record<string, unknown>;
-  };
 }
 
 export interface ToolExecutionRequest {
@@ -46,18 +42,6 @@ export interface ToolExecutionRequest {
   args: Record<string, unknown>;
   context: ToolCallContext;
   decision: ToolDecision;
-}
-
-export interface ToolExecutionPreviewRequest {
-  manifest: ToolCapabilityManifest;
-  args: Record<string, unknown>;
-  projectRoot: string;
-}
-
-export interface ToolExecutionAdapter {
-  readonly kind: CapabilityKind;
-  preview?(request: ToolExecutionPreviewRequest): ToolExecutionPreview | null;
-  execute(request: ToolExecutionRequest): Promise<ToolResultEnvelope>;
 }
 
 export interface ToolRouterContract {

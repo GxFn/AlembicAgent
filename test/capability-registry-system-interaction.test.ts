@@ -7,6 +7,7 @@ import { AgentProfileRegistry } from '../src/agent/profiles/AgentProfileRegistry
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import { PRESETS } from '../src/agent/profiles/presets/index.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import { CapabilityRegistry } from '../src/tools/runtime/toolsets/CapabilityRegistry.js';
 
 /**
@@ -25,7 +26,8 @@ const RETIRED_CAPABILITY = 'system_interaction';
 function createBuilder() {
   return new AgentRuntimeBuilder({
     container: {},
-    toolRegistry: { getRouter: () => ({ execute: vi.fn() }) as never },
+    toolRegistry: new UnifiedToolCatalog(),
+    toolRouter: { execute: vi.fn() },
     aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: vi.fn() },
   });
 }

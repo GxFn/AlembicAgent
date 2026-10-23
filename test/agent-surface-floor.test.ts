@@ -52,6 +52,7 @@ import {
   taskDiscoverAllRelations,
   taskGuardFullScan,
 } from '../src/agent/tasks/index.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/index.js';
 
 const projectRoot = '/tmp/alembic-agent-surface-floor';
@@ -1094,7 +1095,8 @@ describe('evolution-audit scale budget reaches the evolve stage (L8-P03)', () =>
       runtimeBuilder: new AgentRuntimeBuilder({
         aiProvider: { name: 'evolution-budget', model: 'fixture', chatWithTools: vi.fn() } as never,
         container: {},
-        toolRegistry: { getRouter: () => ({ execute: vi.fn() }) } as never,
+        toolRegistry: new UnifiedToolCatalog(),
+        toolRouter: { execute: vi.fn() },
         projectRoot,
         dataRoot: projectRoot,
       }),

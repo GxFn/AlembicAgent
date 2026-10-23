@@ -228,7 +228,8 @@ export class AgentRuntime {
   presetName;
   bus;
   aiProvider;
-  toolRegistry;
+  /** 宿主的能力 manifest 存储端口（RuntimeConfig.toolRegistry）；运行时不从它取 router 或 schema。 */
+  toolRegistry: RuntimeConfig['toolRegistry'];
   toolRouter;
   container;
   capabilities;
@@ -283,16 +284,26 @@ export class AgentRuntime {
     this.presetName = config.presetName || 'custom';
     this.aiProvider = config.aiProvider;
     this.toolRegistry = config.toolRegistry;
+    // 路由只认两处来源：显式 RuntimeConfig.toolRouter 与宿主容器里的 'toolRouter'。
+    // 目录上的 getRouter 兜底已删除（W2a-02 / L3-P09）：UnifiedToolCatalog 不再持有 router，
+    // 生产宿主一直显式传 toolRouter，这条兜底在生产中恒为 null。
     const toolRouter =
       config.toolRouter ||
-      config.toolRegistry.getRouter?.() ||
       ((config.container as { get?: (name: string) => unknown } | null)?.get?.('toolRouter') as
         | RuntimeConfig['toolRouter']
         | undefined) ||
       null;
     if (!toolRouter) {
+      // 错误归类：旧调用方若仍把 router 挂在目录上，错误本身点名迁移方式；
+      // 这里只读取 getRouter 是否存在，从不调用它。
+      const registryOffersRouter =
+        typeof (config.toolRegistry as { getRouter?: unknown } | null | undefined)?.getRouter ===
+        'function';
       throw new Error(
-        'AgentRuntime requires ToolRouter. Runtime tool execution must use the unified router path.'
+        'AgentRuntime requires ToolRouter. Runtime tool execution must use the unified router path.' +
+          (registryOffersRouter
+            ? ' toolRegistry.getRouter is no longer consulted; pass the router as RuntimeConfig.toolRouter (AgentRuntimeBuilder option toolRouter) or register it as the container service toolRouter.'
+            : '')
       );
     }
     this.toolRouter = toolRouter;
@@ -2963,12 +2974,12 @@ export class AgentRuntime {
         // 2) capabilityCatalog 是跨运行共享的进程级实例，其展开状态从不重置，按它推导会让
         //    后续运行中未用过的工具被投影成空参数 schema（必填参数丢失且没有诊断）。
         // 因此每次运行都向目录要完整 schema，与实际的运行内行为一致。
-        // RuntimeCapabilityCatalog 本就忽略 firstRound；UnifiedToolCatalog 的 lazy 公开方法语义不变，
-        // 只是运行时不再读写它的实例级展开状态（是否改造成运行作用域属于待决事项）。
+        // RuntimeCapabilityCatalog 本就忽略 firstRound；UnifiedToolCatalog 的 lazy 层与按模型覆盖已删除
+        // （W2a-02 / L3-P09），它直接继承 CapabilityCatalog 的投影，同样不持有实例级展开状态。
         // 这里刻意保留 mode:'mixed' 而不改成 mode:'full'（两种写法都能拿到完整 schema）：
         // queryLegacySchemas 在 full 下会让同时提供两类方法的旧宿主改选 toToolSchemas*，
         // 旧端口的选择顺序随之变化；mixed + firstRound:true 保持 toMixedSchemas* 优先的既有顺序，
-        // 新端口（CapabilityCatalog/UnifiedToolCatalog）在 firstRound:true 下同样给完整投影。
+        // 新端口（CapabilityCatalog/UnifiedToolCatalog）对 mixed 本就给完整投影。
         // “每次运行”也包括 pipeline 各阶段：每个阶段在同一 runtime 上各跑一次 reactLoop，
         // 各自经 #initLoop 查询一次，前一阶段用过哪些工具不影响后一阶段的 schema。
         // 回归见 test/tool-schema-projection.test.ts 的 runtime lazy schema state across runs。

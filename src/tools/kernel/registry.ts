@@ -80,7 +80,8 @@ export interface ToolResultMeta {
    */
   resultStatus?: ToolResultStatus;
   cached: boolean;
-  compression?: { parser: string; ratio: number };
+  // compression（{ parser, ratio }）没有生产者也没有消费者，已随 W2a-02（审阅包 L3-P13）删除；
+  // 输出压缩是否降级经 degraded / fallbackUsed / diagnosticWarnings 观察。
   tokensEstimate: number;
   durationMs: number;
   /**

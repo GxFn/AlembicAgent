@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';
 import { findAlembicPackageRoot } from '../src/shared/packageAssets.js';
+import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
 import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
 
 /**
@@ -57,7 +58,8 @@ describe('conversation capability', () => {
     const { accessed, coordinator } = trackedCoordinator();
     const runtime = new AgentRuntimeBuilder({
       container: {},
-      toolRegistry: { getRouter: () => ({ execute: async () => null }) as never },
+      toolRegistry: new UnifiedToolCatalog(),
+      toolRouter: { execute: async () => null },
       aiProvider: { name: 'fixture', model: 'fixture', chatWithTools: async () => ({ text: '' }) },
       // 历史选项：现在被忽略，协调器只能经每次运行的上下文进入运行循环。
       ...({ memoryCoordinator: coordinator } as Record<string, unknown>),

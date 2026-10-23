@@ -24,7 +24,7 @@ Agent 剥除无法证明的 coreCode 后，继续交给 Core 检查保留的来�
 
 共享合同位于 `tools/kernel`：`manifest.ts` 定义能力元数据，`toolSchema.ts` 定义模型可见 schema 和查询合同，`request.ts` / `result.ts` 定义调用与回执。`catalog/CapabilityManifest.ts` 保留旧类型重导出；包的公开导入入口不变。`CapabilitySurface` 描述能力展示范围，`ToolSurface` 描述实际调用来源，两者继续保持各自的枚举。
 
-目录实现 `ToolSchemaQueryPort.querySchemas(query)`，一次返回 `{ schemas, allowedTools, unavailable? }`。Runtime 使用同一结果生成模型输入和阶段执行限制。`query` 包含 selection、model、可选 apiModelId、mode、firstRound 及当前 runtime 资源；泛型 `UnifiedToolCatalog` 保留模型覆盖和 lazy 行为，内置目录保留完整 action envelope。
+目录实现 `ToolSchemaQueryPort.querySchemas(query)`，一次返回 `{ schemas, allowedTools, unavailable? }`。Runtime 使用同一结果生成模型输入和阶段执行限制。`query` 包含 selection、model、可选 apiModelId、mode、firstRound 及当前 runtime 资源；泛型目录（`CapabilityCatalog` 与只做 manifest 存储的 `UnifiedToolCatalog`）只在显式 `mode: 'lightweight'` 时给轻量 schema，其余都给完整 flat schema，不按模型改写、也不持有实例级展开状态；内置目录保留完整 action envelope。`UnifiedToolCatalog` 的 router 绑定、ToolDefinition 注册、按模型覆盖与 lazy 方法已删除，宿主只用 `new UnifiedToolCatalog()` 与 `register(manifest)`，并把 router 显式作为 `toolRouter` 传给 `AgentRuntimeBuilder`（`toolRegistry` 不再提供 router）。
 
 | selection | 含义 |
 | --- | --- |
@@ -42,11 +42,11 @@ Runtime 收集多个 capability 时取权限并集，null/undefined 动作通配
 
 显式 `mode: full` 优先选择旧宿主可用的完整投影方法；仅有 mixed 方法时保留兼容结果，并记录 `legacy_mode_degraded`。默认和 mixed 查询保持原探测顺序。降级日志失败不改变结果，各条路径仍按调用前的 selection 收窄权限。
 
-查询前固定 selection 的自有快照，传给宿主的是独立副本；宿主或兼容通知修改入参不能扩大本次授权。 `schemaQuery.ts` 内部分别处理现代结果校验、旧方法选择，并共用最后的权限投影；两类目录的模型覆盖、lazy 状态和内置可用性仍由各自实现持有。查询端口保持同步：Promise 结果明确拒绝，并观察其迟到失败，避免未处理拒绝。兼容通知失败只记录 `legacy_diagnostic_failed`。泛型目录的 schema 参数投影也独立于注册定义；工具 handler 与活跃 runtime 资源保留原引用。
+查询前固定 selection 的自有快照，传给宿主的是独立副本；宿主或兼容通知修改入参不能扩大本次授权。 `schemaQuery.ts` 内部分别处理现代结果校验、旧方法选择，并共用最后的权限投影；旧宿主目录自带的模型覆盖或 lazy 状态与内置目录的可用性仍由各自实现持有。查询端口保持同步：Promise 结果明确拒绝，并观察其迟到失败，避免未处理拒绝。兼容通知失败只记录 `legacy_diagnostic_failed`。泛型目录的 schema 参数投影独立于注册的 manifest（调用方修改投影不会改写注册合同）；活跃 runtime 资源保留原引用。
 
 宿主返回的 schema 成员、name/parameters、有效动作值和不可用原因先读取为本地声明快照，再按原形状规则校验。稀疏数组按含有 undefined 条目拒绝，不静默丢弃；变化 getter 不能在校验后把禁用动作改成全开放或把对象参数换成字符串。仅在选中工具后展开其描述和扩展字段，函数 metadata 与活跃资源引用保留，不深克隆；旧宿主省略 description 的兼容行为不变。旧查询的 model/firstRound 使用进入接口时的声明快照；选中工具的扩展 getter 在本次投影时取值，不承诺延迟到后续消费者才读取。这不是完整 JSON Schema 语义验证。
 
-Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiModelId`，包括模型名自身的后续冒号。模型覆盖按原声明顺序匹配这两个明确名称。旧目录直接调用只按传入 model 字符串匹配，不擅自拆分 `qwen2:latest` 这类裸模型名；catalog 不持有另一份 provider 注册表。
+Runtime 保留传入的完整 modelRef，并显式提供首个冒号后的 `apiModelId`，包括模型名自身的后续冒号。自带模型覆盖的旧宿主目录可按这两个明确名称匹配；Agent 自己的目录不再按模型改写 schema。旧目录直接调用只拿到传入的 model 字符串，不擅自拆分 `qwen2:latest` 这类裸模型名；catalog 不持有另一份 provider 注册表。
 
 宿主可实现 `ToolContextFactoryContract.getAvailability(runtime?)`。它返回 `ToolAvailabilitySnapshot`：actions 是稀疏的工具动作约束，parameters 按 tool/action/参数名声明可用枚举。缺项不施加额外约束，显式空集禁用对应工具或动作。Main 复用实际服务装配进行方法检查，不调用 create/forRequest 分配运行状态，不执行 search/get/写入/sandbox 探测；已有 DI 仍可能正常解析惰性实例。
 
@@ -55,8 +55,6 @@ Runtime 在循环初始化时用同一次 schema 投影的 `unavailable` 生成�
 `ToolRouter.describeAvailability` 按实际端口方法描述 graph、outline、knowledge 管理分支和运行期 memory/evidence。prime 可以使用 search-only 路径；只有某些 manage 分支可用时保留这些分支。服务可用性不是 actor 权限，也不是 Core 对具体业务输入的批准。
 
 Adapter 的 explain、执行前检查、获得队列执行位置后的检查使用同一准入规则。 每次检查只消费本次固定并验证的动作/参数声明；快照不跨排队等待缓存，获得执行位置后仍读取最新宿主可用性和权限。排队期间撤销的能力不能继续执行；省略参数也要检查真实默认值。meta.tools 只查询当前有效 registry 视图，不修改全局注册表。
-
-公开的 `allowToolDecision` / `denyToolDecision` 保留原签名；显式 allowed、stage、reason 优先于 extras 中的同名字段，extras 只补充其余元数据。旧调用如果用冲突 extras 反转裁决，应改为调用对应的 allow/deny 入口；实际 Router 的权限检查链保持独立。
 
 完整权限合同必须是动作映射；字符串、混合类型数组、稀疏数组或显式 null 不能代替它。宿主参数约束必须是字符串枚举，不接受字符串的子串匹配。查询和执行共用校验，非法声明明确拒绝。可用性回调中触发的取消，在首次宿主 context 分配前和最终 handler 入口前重新检查。
 

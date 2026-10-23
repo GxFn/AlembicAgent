@@ -148,9 +148,9 @@ describe('cache layer removal structure guard (W1-04 / L6-P26)', () => {
     expect(topLevelNames(context)).not.toContain('ToolResultCacheProvider');
     const runtimeMembers = memberNames(context, 'ToolRuntimeCallContext');
     expect(runtimeMembers).not.toContain('cache');
-    // 仍在使用的端口保留：诊断收集器、memoryCoordinator 与证据台账。
-    expect(runtimeMembers).toEqual(
-      expect.arrayContaining(['diagnostics', 'memoryCoordinator', 'evidenceLedger'])
-    );
+    // 仍在使用的端口保留：memoryCoordinator 与证据台账。diagnostics 端口没有读取方，已随 W2a-02
+    // （审阅包 L3-P08）删除，逐调用诊断由 runtimeBridge 直接写 loopCtx.diagnostics。
+    expect(runtimeMembers).toEqual(expect.arrayContaining(['memoryCoordinator', 'evidenceLedger']));
+    expect(runtimeMembers).not.toContain('diagnostics');
   });
 });

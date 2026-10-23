@@ -18,21 +18,18 @@ import type {
   CompiledAgentProfile,
 } from './AgentRunContracts.js';
 
-/** Duck-typed tool registry — compatible with both ToolRegistry and UnifiedToolCatalog */
-interface ToolRegistryLike {
-  getRouter?(): ToolRouterContract | null;
-}
-
 /**
  * AgentRuntime 构造契约里 aiProvider / toolRegistry 的类型，直接取自 RuntimeConfig，与运行时契约同源：
  * RuntimeConfig 改动时这里跟着变，不再像 `as never` 那样可以冒充任意目标类型。
+ * toolRegistry 的 builder 选项与 RuntimeConfig 使用同一个最小端口（W2a-02 / L3-P09）：旧的
+ * duck-typed `getRouter?()` 形状已删除，builder 不再从目录取 router，因此也不再需要断言。
  */
 type RuntimeAiProvider = RuntimeConfig['aiProvider'];
 type RuntimeToolRegistry = RuntimeConfig['toolRegistry'];
 
 interface AgentRuntimeBuilderOptions {
   container: Record<string, unknown>;
-  toolRegistry: ToolRegistryLike;
+  toolRegistry: RuntimeToolRegistry;
   aiProvider: unknown;
   projectBriefing?: string | null;
   projectRoot?: string;
@@ -50,7 +47,7 @@ interface AgentRuntimeBuilderOptions {
 
 export class AgentRuntimeBuilder {
   #container: Record<string, unknown>;
-  #toolRegistry: ToolRegistryLike;
+  #toolRegistry: RuntimeToolRegistry;
   #aiProvider: unknown;
   #toolRouter: unknown;
   #logger = Logger.getInstance();
@@ -111,19 +108,18 @@ export class AgentRuntimeBuilder {
       () => this.#logger.debug('[AgentRuntimeBuilder] building runtime', { presetName }),
       () => undefined
     );
-    // 宿主注入边界：builder 的公开选项按宿主 DI 实际注入的形状声明（aiProvider 为 unknown，宿主传
-    // `singletons.aiProvider || null`；toolRegistry 只要求可选 getRouter），而 RuntimeConfig 要求完整的
-    // AiProvider / UnifiedToolCatalog 类类型。AgentRuntime 构造期只读 aiProvider.name/model（推导 modelRef）
-    // 与 toolRegistry.getRouter?.()，运行期再调 aiProvider.chatWithTools 等方法。把 builder 选项或
-    // RuntimeConfig 收窄成结构类型都会改变公开类型（宿主与测试按部分形状注入），属于公开面收窄，不在本处做；
-    // 这里也不加运行时校验，避免改变既有错误行为。因此保留这一处静态断言，但目标类型对齐 RuntimeConfig：
-    // toolRegistry 的断言仍受 ToolRegistryLike 与 UnifiedToolCatalog 的可比性检查约束。
+    // 宿主注入边界：builder 的 aiProvider 选项按宿主 DI 实际注入的形状声明（unknown，宿主传
+    // `singletons.aiProvider || null`），而 RuntimeConfig 要求完整的 AiProvider 类类型。AgentRuntime 构造期
+    // 只读 aiProvider.name/model（推导 modelRef），运行期再调 aiProvider.chatWithTools 等方法。收窄 builder
+    // 的 aiProvider 选项属于公开面收窄，不在本处做；这里也不加运行时校验，避免改变既有错误行为，因此保留
+    // aiProvider 这一处静态断言（目标类型对齐 RuntimeConfig）。toolRegistry 已与 RuntimeConfig 同型，无需断言。
+    // 路由只经 toolRouter 选项（或容器里的 'toolRouter'）传入：目录上的 getRouter 兜底已删除（W2a-02），
+    // 缺省时由 AgentRuntime 构造期抛 “AgentRuntime requires ToolRouter”。
     return new AgentRuntime({
       presetName,
       aiProvider: this.#aiProvider as RuntimeAiProvider,
-      toolRegistry: this.#toolRegistry as RuntimeToolRegistry,
-      toolRouter:
-        (this.#toolRouter as ToolRouterContract) || this.#toolRegistry.getRouter?.() || null,
+      toolRegistry: this.#toolRegistry,
+      toolRouter: (this.#toolRouter as ToolRouterContract | null) || null,
       container: this.#container,
       capabilities,
       strategy: preset.strategyInstance as Strategy,

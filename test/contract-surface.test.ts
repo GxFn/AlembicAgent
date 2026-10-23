@@ -2,9 +2,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Logger from '@alembic/core/logging';
 import ts from 'typescript';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import * as domain from '../src/agent/domain/index.js';
 import * as profiles from '../src/agent/profiles/index.js';
 import * as prompts from '../src/agent/prompts/index.js';
@@ -14,6 +13,7 @@ import * as toolPipelineObservations from '../src/agent/runtime/toolPipeline/obs
 import * as service from '../src/agent/service/index.js';
 import * as tasks from '../src/agent/tasks/index.js';
 import { PROVIDER_CONFIGS } from '../src/ai/registry/ProviderConfig.js';
+import * as agentRoot from '../src/index.js';
 import {
   AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES,
   AGENT_INTERFACE_CONTRACT_REQUIRED_ROWS,
@@ -23,47 +23,15 @@ import {
   ALEMBIC_AGENT_INTERFACE_CONTRACT,
   ALEMBIC_AGENT_RUNTIME_BOUNDARY,
   alembicAgentPackage,
-  allowToolDecision,
-  createToolRoutingServiceContract,
-  denyToolDecision,
   getAgentInterfaceContractBranch,
   getAgentInterfaceFailureTaxonomyEntry,
   projectToolResultOrdinaryOutput,
-  resolveToolRouterFromContext,
   supportsAgentRuntimeRoute,
-  type ToolCallContext,
   type ToolResultEnvelope,
-  ToolRouterAdapter,
-  type ToolRouterContract,
-  type ToolServiceContracts,
   validateAgentInterfaceContract,
 } from '../src/index.js';
 
 describe('explicit AlembicAgent contract subpaths', () => {
-  it('keeps explicit allow verdict and stage authoritative over conflicting extras', () => {
-    expect(
-      allowToolDecision('execute', { allowed: false, stage: 'discover', requestId: 'fixture' })
-    ).toEqual({ allowed: true, stage: 'execute', requestId: 'fixture' });
-  });
-
-  it('keeps explicit denial and reason authoritative while preserving confirmation metadata', () => {
-    expect(
-      denyToolDecision('approve', 'permission denied', {
-        allowed: true,
-        stage: 'execute',
-        reason: 'overridden',
-        requiresConfirmation: true,
-        resultStatus: 'needs-confirmation',
-      })
-    ).toEqual({
-      allowed: false,
-      stage: 'approve',
-      reason: 'permission denied',
-      requiresConfirmation: true,
-      resultStatus: 'needs-confirmation',
-    });
-  });
-
   it('exposes the service orchestration surface', () => {
     expect(typeof service.AgentService).toBe('function');
     expect(typeof service.AgentRuntimeBuilder).toBe('function');
@@ -279,23 +247,6 @@ function typecheckRouterContractProbes(probes: Record<string, string>): Record<s
   return result;
 }
 
-function routingContext(serviceContracts?: ToolServiceContracts): ToolCallContext {
-  return {
-    callId: 'fixture-call',
-    toolId: 'fixture-tool',
-    surface: 'runtime',
-    actor: { role: 'fixture' },
-    source: { kind: 'runtime', name: 'fixture' },
-    projectRoot: 'fixture-project',
-    services: {
-      get: () => {
-        throw new Error('fixture service locator is not used by routing resolution');
-      },
-    },
-    ...(serviceContracts ? { serviceContracts } : {}),
-  };
-}
-
 function blockedEnvelope(): ToolResultEnvelope {
   return {
     ok: false,
@@ -326,10 +277,8 @@ function blockedEnvelope(): ToolResultEnvelope {
 }
 
 describe('tool router contract seam (L3-C09)', () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
+  // routing service-contract 接缝（routing.ts 的两个 helper 与 serviceContracts）已在 W2a-02 删除；
+  // 这里只保留契约本身的形状探针：只实现 execute 的路由同样满足 ToolRouterContract。
   it('lets a router that only implements execute satisfy ToolRouterContract', () => {
     const diagnostics = typecheckRouterContractProbes({
       '__router-contract-execute-only.probe.ts': [
@@ -354,107 +303,6 @@ describe('tool router contract seam (L3-C09)', () => {
       "Type 'number' is not assignable to type '(request: ToolCallRequest) => Promise<ToolDecision>'.",
     ]);
   }, 60000);
-
-  it('resolves a routing service contract whose router only implements execute', async () => {
-    const execute = vi.fn(async () => blockedEnvelope());
-    const minimal: ToolRouterContract = { execute };
-    const resolved = resolveToolRouterFromContext(
-      routingContext({ toolRouting: createToolRoutingServiceContract(minimal) })
-    );
-    expect(resolved).toBe(minimal);
-    await resolved?.execute({
-      toolId: 'fixture-tool',
-      args: {},
-      surface: 'runtime',
-      actor: {},
-      source: { kind: 'runtime' },
-    });
-    expect(execute).toHaveBeenCalledOnce();
-  });
-
-  it('still resolves the full ToolRouterAdapter implementation', () => {
-    const adapter = new ToolRouterAdapter({
-      contextFactory: {
-        create: () => {
-          throw new Error('fixture context factory is not used by routing resolution');
-        },
-      },
-    });
-    expect(
-      resolveToolRouterFromContext(
-        routingContext({ toolRouting: createToolRoutingServiceContract(adapter) })
-      )
-    ).toBe(adapter);
-  });
-
-  it('returns null without a shape warning when no routing service contract is configured', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
-    expect(resolveToolRouterFromContext(routingContext())).toBeNull();
-    expect(
-      resolveToolRouterFromContext(
-        routingContext({ toolRouting: createToolRoutingServiceContract(null) })
-      )
-    ).toBeNull();
-    expect(warn).not.toHaveBeenCalled();
-    expect(debug).toHaveBeenCalledWith(expect.stringContaining('not configured'));
-  });
-
-  it('rejects and warns about a configured router value that lacks execute', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    // 旧的三方法守卫要求 explain/executeChildCall；现在只有 execute 是必需的执行入口。
-    const withoutExecute = {
-      explain: async () => ({ allowed: true, stage: 'execute' as const }),
-      executeChildCall: async () => blockedEnvelope(),
-    };
-    expect(
-      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: withoutExecute } }))
-    ).toBeNull();
-    expect(warn).toHaveBeenCalledOnce();
-    expect(String(warn.mock.calls[0]?.[0])).toContain('invalidMembers=execute;');
-    expect(String(warn.mock.calls[0]?.[0])).toContain('callId=fixture-call');
-  });
-
-  it('rejects and warns about optional explain/executeChildCall members that are not functions', async () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    // explain/executeChildCall 可选但不放开形状：给了就必须是函数，否则调用方先判存在再调用会抛 TypeError。
-    const execute = vi.fn(async () => blockedEnvelope());
-    const bogus = { execute, explain: 42, executeChildCall: 'nope' };
-    expect(
-      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: bogus } }))
-    ).toBeNull();
-    expect(warn).toHaveBeenCalledOnce();
-    const message = String(warn.mock.calls[0]?.[0]);
-    expect(message).toContain('invalidMembers=explain,executeChildCall;');
-    expect(message).toContain(
-      'memberTypes=execute:function,explain:number,executeChildCall:string'
-    );
-    expect(message).toContain('callId=fixture-call');
-    expect(message).not.toMatch(/execute is not a function/);
-    expect(execute).not.toHaveBeenCalled();
-
-    // 只有一个可选成员不合法时，也只点名那一个。
-    warn.mockClear();
-    const nullChildCall = { execute, executeChildCall: null };
-    expect(
-      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: nullChildCall } }))
-    ).toBeNull();
-    expect(warn).toHaveBeenCalledOnce();
-    expect(String(warn.mock.calls[0]?.[0])).toContain('invalidMembers=executeChildCall;');
-  });
-
-  it('still resolves an execute-only router whose optional members are explicitly undefined', () => {
-    const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const minimal = {
-      execute: async () => blockedEnvelope(),
-      explain: undefined,
-      executeChildCall: undefined,
-    };
-    expect(
-      resolveToolRouterFromContext(routingContext({ toolRouting: { toolRouter: minimal } }))
-    ).toBe(minimal);
-    expect(warn).not.toHaveBeenCalled();
-  });
 });
 
 describe('alembicAgentPackage', () => {
@@ -1679,13 +1527,14 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     );
   });
 
-  it('records 440 runtime bindings across the 15 stable package exports', () => {
+  it('records 435 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
     expect(signatures.packageExportCount).toBe(15);
     const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
-    expect(total).toBe(440);
+    // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）。
+    expect(total).toBe(435);
   });
 
   it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
@@ -1720,4 +1569,198 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     });
     expect(diagnostics['__tool-loop-port-probe__.ts']).toEqual([]);
   });
+});
+
+/** W2a-02（审阅包 L3-P09 / L3-P10）从根出口撤回的 5 个运行时绑定（`.` 157 → 152）。 */
+const WITHDRAWN_ROOT_KERNEL_BINDINGS = [
+  'allowToolDecision',
+  'contextFromToolCall',
+  'createToolRoutingServiceContract',
+  'denyToolDecision',
+  'resolveToolRouterFromContext',
+] as const;
+
+/** 同批删除的纯类型：只改变根出口 d.ts，不在运行时签名快照里。 */
+const WITHDRAWN_ROOT_KERNEL_TYPES = [
+  'InternalToolHandler',
+  'InternalToolHandlerContext',
+  'InternalToolHandlerEntry',
+  'InternalToolHandlerStore',
+  'InternalToolLogger',
+  'InternalToolSharedState',
+  'ToolDefinition',
+  'ToolDiagnosticsRecorder',
+  'ToolExecutionAdapter',
+  'ToolExecutionPreviewRequest',
+  'ToolGuardServiceContract',
+  'ToolHandler',
+  'ToolInfraServiceContract',
+  'ToolKnowledgeServiceContract',
+  'ToolLifecycleServiceContract',
+  'ToolQualityServiceContract',
+  'ToolRoutingServiceContract',
+  'ToolServiceContracts',
+] as const;
+
+describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L3-P09, L3-P08, L3-P10, L3-P13)', () => {
+  it('withdraws the five handler/routing/decision bindings from the root entry and matches the snapshot', () => {
+    const exported = agentRoot as Record<string, unknown>;
+    for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
+      expect({ name, exported: name in exported }).toEqual({ name, exported: false });
+    }
+    // 宿主只用 new UnifiedToolCatalog() 与 register：类本身仍在根出口上，种类不变。
+    expect(runtimeKind(exported.UnifiedToolCatalog)).toBe('class');
+    const expected = snapshotEntries('.');
+    expect(expected.exportCount).toBe(152);
+    const snapshotNames = expected.entries.map((entry) => entry.name);
+    for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
+      expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+        name,
+        inSnapshot: false,
+      });
+    }
+    const entries = Object.keys(exported)
+      .sort()
+      .map((name) => ({ name, kind: runtimeKind(exported[name]) }));
+    const expectedSorted = [...expected.entries].sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    );
+    expect(entries).toEqual(expectedSorted);
+    expect(entries).toHaveLength(expected.exportCount);
+    expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+      expected.signatureHash
+    );
+  });
+
+  it('narrows the kernel types, the runtime call context and the registry port (compiler probes)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，所有类型收窄都用真实编译器判定（一次建 Program）。
+    const removedNames = [...WITHDRAWN_ROOT_KERNEL_BINDINGS, ...WITHDRAWN_ROOT_KERNEL_TYPES];
+    const diagnostics = typecheckRouterContractProbes({
+      '__w2a02-removed-root-exports.probe.ts': removedNames
+        .map((name) => `import type { ${name} } from '../src/index.js';`)
+        .join('\n'),
+      // 正对照：保留的请求/裁决/上下文类型与 ToolPolicyValidator/ToolPolicyDecision（总控裁定不删）仍可导入。
+      '__w2a02-retained-root-exports.probe.ts': [
+        'import type {',
+        '  ToolCallContext, ToolCallRequest, ToolDecision, ToolExecutionPreview, ToolExecutionRequest,',
+        '  ToolPolicyDecision, ToolPolicyValidator, ToolRouterContract, ToolRuntimeCallContext,',
+        '  ToolServiceLocator,',
+        "} from '../src/index.js';",
+        "import { CapabilityCatalog, UnifiedToolCatalog } from '../src/index.js';",
+        'export type Retained = [ToolCallContext, ToolCallRequest, ToolDecision, ToolExecutionPreview,',
+        '  ToolExecutionRequest, ToolPolicyDecision, ToolPolicyValidator, ToolRouterContract,',
+        '  ToolRuntimeCallContext, ToolServiceLocator];',
+        'export const catalogs = [new CapabilityCatalog(), new UnifiedToolCatalog()];',
+        '',
+      ].join('\n'),
+      '__w2a02-excess-fields.probe.ts': [
+        "import type { ToolCallContext, ToolCallRequest, ToolRuntimeCallContext } from '../src/tools/kernel/index.js';",
+        'export const diagnostics: ToolRuntimeCallContext = { diagnostics: null };',
+        'export const policyValidator: ToolRuntimeCallContext = { policyValidator: null };',
+        'export const sessionToolCalls: ToolRuntimeCallContext = { sessionToolCalls: null };',
+        'export const currentRound: ToolRuntimeCallContext = { currentRound: 1 };',
+        'export const validator: ToolRuntimeCallContext = { validator: {} };',
+        'export const fileCache: ToolRuntimeCallContext = { fileCache: [] };',
+        "export const dataRoot: ToolRuntimeCallContext = { dataRoot: 'data' };",
+        'export const logger: ToolRuntimeCallContext = { logger: null };',
+        'export const governance: ToolCallRequest = {',
+        "  toolId: 't', args: {}, surface: 'runtime', actor: {}, source: { kind: 'runtime' },",
+        "  governance: { gatewayAction: 'dashboard:probe' },",
+        '};',
+        'export const serviceContracts: ToolCallContext = {',
+        "  callId: 'c', toolId: 't', surface: 'runtime', actor: {}, source: { kind: 'runtime' },",
+        "  projectRoot: 'p', services: { get: () => { throw new Error('probe'); } },",
+        '  serviceContracts: {},',
+        '};',
+        '',
+      ].join('\n'),
+      // 正对照：有宿主读取方的 runtime 字段（safetyPolicy、memoryCoordinator 等）与顶层 dataRoot 保留。
+      '__w2a02-retained-fields.probe.ts': [
+        "import type { ToolCallContext, ToolRuntimeCallContext } from '../src/tools/kernel/index.js';",
+        'export const kept: ToolRuntimeCallContext = {',
+        "  allowedTools: {}, agentId: 'a', resourceScope: { runId: 'r', viewId: 'v', revision: 0 },",
+        "  presetName: 'p', iteration: 1, evidenceLedger: null, aiProvider: null, safetyPolicy: null,",
+        '  lang: null, sharedState: null, dimensionMeta: null, projectLanguage: null,',
+        '  submittedTitles: null, submittedPatterns: null, submittedTriggers: null,',
+        '  bootstrapDedup: null, memoryCoordinator: null, dimensionScopeId: null,',
+        '};',
+        'export const context: ToolCallContext = {',
+        "  callId: 'c', toolId: 't', surface: 'runtime', actor: {}, source: { kind: 'runtime' },",
+        "  projectRoot: 'p', dataRoot: 'data', services: { get: () => { throw new Error('probe'); } },",
+        '};',
+        '',
+      ].join('\n'),
+      '__w2a02-member-sets.probe.ts': [
+        "import type { ToolResultMeta } from '../src/tools/kernel/registry.js';",
+        "import type { ToolRuntimePort } from '../src/agent/runtime/toolPipeline/contracts.js';",
+        'type MetaKeys = keyof ToolResultMeta;',
+        'type PortKeys = keyof ToolRuntimePort;',
+        "export const compression: 'compression' extends MetaKeys ? 'present' : 'absent' = 'absent';",
+        "export const portRegistry: 'toolRegistry' extends PortKeys ? 'picked' : 'narrowed' = 'narrowed';",
+        "export const portDataRoot: 'dataRoot' extends PortKeys ? 'picked' : 'narrowed' = 'narrowed';",
+        "export const portFileCache: 'fileCache' extends PortKeys ? 'picked' : 'narrowed' = 'narrowed';",
+        "export const portRouter: 'toolRouter' extends PortKeys ? 'picked' : 'missing' = 'picked';",
+        "export const portLogger: 'logger' extends PortKeys ? 'picked' : 'missing' = 'picked';",
+        '',
+      ].join('\n'),
+      // RuntimeConfig.toolRegistry 收窄为最小端口：两种目录实例都能传入，builder 选项与之同源。
+      '__w2a02-registry-port.probe.ts': [
+        "import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';",
+        "import { AgentRuntimeBuilder } from '../src/agent/service/AgentRuntimeBuilder.js';",
+        "import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';",
+        "import { RuntimeCapabilityCatalog } from '../src/tools/runtime/index.js';",
+        "type Port = RuntimeConfig['toolRegistry'];",
+        'export const unified: Port = new UnifiedToolCatalog();',
+        'export const runtimeCatalog: Port = new RuntimeCapabilityCatalog();',
+        'export const builder = new AgentRuntimeBuilder({',
+        '  container: {}, toolRegistry: new RuntimeCapabilityCatalog(), aiProvider: null,',
+        '});',
+        '',
+      ].join('\n'),
+      // 负对照：只挂 router 的旧目录形状不满足端口；构造器不再接受定义数组。
+      '__w2a02-registry-port-negative.probe.ts': [
+        "import type { RuntimeConfig } from '../src/agent/runtime/AgentRuntimeTypes.js';",
+        "import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';",
+        "export const legacy: RuntimeConfig['toolRegistry'] = { getRouter: () => null };",
+        'export const legacyCatalog = new UnifiedToolCatalog([]);',
+        '',
+      ].join('\n'),
+    });
+
+    const missingExports = diagnostics['__w2a02-removed-root-exports.probe.ts']
+      // 名字与现存导出相近时 TS 会改用 “has no exported member named 'X'. Did you mean …” 的措辞。
+      .map((message) => /has no exported member (?:named )?'([^']+)'/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingExports).toEqual([...removedNames].sort());
+    expect(diagnostics['__w2a02-retained-root-exports.probe.ts']).toEqual([]);
+
+    const excess = diagnostics['__w2a02-excess-fields.probe.ts']
+      .map((message) => {
+        const match = /'(\w+)' does not exist in type '(\w+)'/.exec(message);
+        return match ? `${match[2]}.${match[1]}` : message;
+      })
+      .sort();
+    expect(excess).toEqual(
+      [
+        'ToolCallContext.serviceContracts',
+        'ToolCallRequest.governance',
+        'ToolRuntimeCallContext.currentRound',
+        'ToolRuntimeCallContext.dataRoot',
+        'ToolRuntimeCallContext.diagnostics',
+        'ToolRuntimeCallContext.fileCache',
+        'ToolRuntimeCallContext.logger',
+        'ToolRuntimeCallContext.policyValidator',
+        'ToolRuntimeCallContext.sessionToolCalls',
+        'ToolRuntimeCallContext.validator',
+      ].sort()
+    );
+    expect(diagnostics['__w2a02-retained-fields.probe.ts']).toEqual([]);
+    expect(diagnostics['__w2a02-member-sets.probe.ts']).toEqual([]);
+    expect(diagnostics['__w2a02-registry-port.probe.ts']).toEqual([]);
+
+    const negative = diagnostics['__w2a02-registry-port-negative.probe.ts'];
+    expect(negative).toHaveLength(2);
+    expect(negative[0]).toContain('getRouter');
+    expect(negative[1]).toContain("parameter of type 'never'");
+  }, 120000);
 });

@@ -10,19 +10,20 @@ export interface ToolCall {
   id: string;
 }
 
-/** 仅暴露工具执行实际使用的 Runtime 端口，避免中间件依赖整个执行循环。 */
+/**
+ * 仅暴露工具执行实际使用的 Runtime 端口，避免中间件依赖整个执行循环。
+ * W2a-02 起不再 Pick dataRoot / fileCache（runtimeBridge 不再把它们投影进宿主请求）与
+ * toolRegistry（管道没有读取方：duplicateCache 的复用准入改读运行时 TOOL_REGISTRY 声明）。
+ */
 export type ToolRuntimePort = Pick<
   AgentRuntime,
   | 'id'
   | 'presetName'
   | 'projectRoot'
-  | 'dataRoot'
-  | 'fileCache'
   | 'lang'
   | 'logger'
   | 'aiProvider'
   | 'policies'
-  | 'toolRegistry'
   | 'toolRouter'
   | 'emitProgress'
   | 'bus'
