@@ -233,7 +233,8 @@ interface QualityReportLike {
 
 /**
  * 宿主 ProjectScopeSourceIdentityMap v1 的一条 entry 在 Agent 侧的归一形状。字段与宿主 entry 一致；
- * 规范化只用 qualifiedPath（输出）与 absolutePath（绝对路径索引），其余字段保留供诊断定位。
+ * 规范化用 qualifiedPath（输出）与 absolutePath（绝对路径索引），身份区分另用 folderId 与 relativePath
+ * （见 pcvDistinctSourceIdentityKey），其余字段保留供诊断定位。
  */
 interface PcvCanonicalSourceIdentity {
   absolutePath: string | null;
@@ -249,18 +250,33 @@ interface PcvCanonicalSourceIdentity {
 interface PcvProjectScopeSourceRefIndex {
   /** 同一绝对路径对应多个不同 qualifiedPath（例如嵌套目录各自登记）时无法唯一定位。 */
   ambiguousAbsolutePaths: ReadonlySet<string>;
+  /** 同一 basename 对应多个不同身份（含共享同一 qualifiedPath 的不同身份）时无法唯一定位。 */
   ambiguousBasenames: ReadonlySet<string>;
+  /**
+   * W1-02r1：被多个不同身份共享的 qualifiedPath → 共享它的不同身份数。显示名相同的文件夹
+   * （宿主 sameNameIdentities：apps/common 与 tools/common 显示名都是 common）会让不同文件落到同一
+   * qualifiedPath；这些路径不进 byQualifiedPath，命中即判 ambiguous-path（与宿主、Core 的口径一致）。
+   */
+  ambiguousQualifiedPaths: ReadonlyMap<string, number>;
   byAbsolutePath: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
   byBasename: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
+  /** 只含由唯一身份登记的 qualifiedPath；冲突的路径在 ambiguousQualifiedPaths。 */
   byQualifiedPath: ReadonlyMap<string, PcvCanonicalSourceIdentity>;
 }
 
 interface PcvNormalizedProjectScopeSourceRef {
+  /**
+   * W1-02r1：绝对路径命中唯一身份、但该身份的 qualifiedPath 被多个身份共享时给出，调用方据此记分叉日志。
+   * 这时 normalizedRef 是原样的绝对路径输入，不投影回有歧义的显示名路径。
+   */
+  conflictingQualifiedPath?: { identityCount: number; qualifiedPath: string };
   normalizedRef: string | null;
+  /** ambiguous-path 沿用 Core resolveProjectScopeSourceRef 的原因名，表示 qualifiedPath 被多个身份共享。 */
   reason:
     | 'absolute-path'
     | 'ambiguous-absolute-path'
     | 'ambiguous-basename'
+    | 'ambiguous-path'
     | 'not-found'
     | 'qualified-path'
     | 'unique-basename';
@@ -305,7 +321,10 @@ const MAX_SOURCE_REF_DIAGNOSTICS = 64;
 const MAX_EVENT_SOURCE_REF_DIAGNOSTICS = 16;
 /** I27 聚合原因：存在未能解析到项目范围来源身份的引用（逐条明细见 sourceRefDiagnostics）。 */
 const UNRESOLVED_SOURCE_REFS_REASON = 'unresolved-source-refs';
-/** I27 聚合原因：存在按 basename（或登记在多个 qualifiedPath 下的绝对路径）无法唯一定位的歧义引用。 */
+/**
+ * I27 聚合原因：存在无法唯一定位的歧义引用——按 basename、登记在多个 qualifiedPath 下的绝对路径，
+ * 或被多个身份共享的 qualifiedPath（W1-02r1）。
+ */
 const AMBIGUOUS_SOURCE_REFS_REASON = 'ambiguous-source-refs';
 /**
  * I27 截断计数原因的前缀，后接因上限被丢弃的不同诊断条数。PcvNodeEvidenceSummary 是公开导出类型，
@@ -314,6 +333,12 @@ const AMBIGUOUS_SOURCE_REFS_REASON = 'ambiguous-source-refs';
  */
 const DROPPED_SOURCE_REF_DIAGNOSTICS_REASON_PREFIX = 'dropped-source-ref-diagnostics:';
 const PCV_SOURCE_REF_INDEX = new WeakMap<PcvNodeEvidenceSummary, PcvProjectScopeSourceRefIndex>();
+/**
+ * W1-02r1：“qualifiedPath 冲突、保留绝对路径”分叉日志的去重表，以索引（即宿主映射）为键，值是已上报的
+ * 规范化绝对路径。同一引用会在记录、摘要克隆、进程事件里被反复规范化，按索引去重后每个绝对路径只记一条；
+ * 集合大小以映射里的 entry 数为上限。
+ */
+const PCV_KEPT_ABSOLUTE_PATH_REPORTS = new WeakMap<PcvProjectScopeSourceRefIndex, Set<string>>();
 
 /** 运行诊断出口：只取 LoopContext.diagnostics 的 warn，避免记录器依赖完整的 DiagnosticsCollector。 */
 type PcvDiagnosticSink = Pick<NonNullable<LoopContext['diagnostics']>, 'warn'>;
@@ -1664,6 +1689,7 @@ function resolvePcvSourceIdentityMap(value: unknown): PcvSourceIdentityMapResolu
       `[PcvNodeEvidence] indexed ${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT} ` +
         `v${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION}: ` +
         `${resolution.index.byQualifiedPath.size} qualified paths, ` +
+        `${resolution.index.ambiguousQualifiedPaths.size} ambiguous qualified paths, ` +
         `${resolution.index.byAbsolutePath.size} absolute paths, ` +
         `${resolution.index.ambiguousBasenames.size} ambiguous basenames, ` +
         `${resolution.skippedEntryCount} skipped entries`
@@ -1747,15 +1773,25 @@ function describeValueShape(value: unknown): string {
   return typeof value;
 }
 
+/**
+ * 建索引。三类桶共用同一个“不同身份”判定（pcvDistinctSourceIdentityKey = 身份键 + qualifiedPath）：
+ * - qualifiedPath 桶：同一路径下只有一个不同身份才进 byQualifiedPath；多个身份共享时记入
+ *   ambiguousQualifiedPaths，不再像 Map.set 那样让后登记的身份静默覆盖前一个（W1-02r1）。
+ *   同一桶内 qualifiedPath 相同，判定实际只看身份键。
+ * - 绝对路径桶：同一绝对路径的身份键相同，判定实际只看 qualifiedPath，即“登记在多个 qualifiedPath 下”
+ *   才判 ambiguous-absolute-path，行为与 W1-02 一致。
+ * - basename 桶：按不同身份计数而不是按不同 qualifiedPath 计数，两个身份共享同一 qualifiedPath 时
+ *   basename 同样判歧义；同一文件登记成多个 qualifiedPath（嵌套目录）仍算多个，保持 W1-02 的歧义判定。
+ */
 function buildPcvProjectScopeSourceRefIndex(
   identities: readonly PcvCanonicalSourceIdentity[]
 ): PcvProjectScopeSourceRefIndex {
-  const byQualifiedPath = new Map<string, PcvCanonicalSourceIdentity>();
+  const qualifiedBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
   const absoluteBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
   const basenameBuckets = new Map<string, PcvCanonicalSourceIdentity[]>();
 
   for (const identity of identities) {
-    byQualifiedPath.set(normalizePcvSourcePath(identity.qualifiedPath), identity);
+    appendToBucket(qualifiedBuckets, normalizePcvSourcePath(identity.qualifiedPath), identity);
     if (identity.absolutePath) {
       appendToBucket(absoluteBuckets, normalizePcvSourcePath(identity.absolutePath), identity);
     }
@@ -1767,27 +1803,45 @@ function buildPcvProjectScopeSourceRefIndex(
 
   const unique = (buckets: Map<string, PcvCanonicalSourceIdentity[]>) => {
     const resolved = new Map<string, PcvCanonicalSourceIdentity>();
-    const ambiguous = new Set<string>();
+    const ambiguous = new Map<string, number>();
     for (const [key, entries] of buckets) {
-      const distinctQualifiedPaths = new Set(entries.map((entry) => entry.qualifiedPath));
-      if (distinctQualifiedPaths.size === 1 && entries[0]) {
+      const distinctIdentities = new Set(entries.map(pcvDistinctSourceIdentityKey));
+      if (distinctIdentities.size === 1 && entries[0]) {
         resolved.set(key, entries[0]);
       } else {
-        ambiguous.add(key);
+        ambiguous.set(key, distinctIdentities.size);
       }
     }
     return { ambiguous, resolved };
   };
+  const qualified = unique(qualifiedBuckets);
   const absolute = unique(absoluteBuckets);
   const basename = unique(basenameBuckets);
 
   return {
-    ambiguousAbsolutePaths: absolute.ambiguous,
-    ambiguousBasenames: basename.ambiguous,
+    ambiguousAbsolutePaths: new Set(absolute.ambiguous.keys()),
+    ambiguousBasenames: new Set(basename.ambiguous.keys()),
+    ambiguousQualifiedPaths: qualified.ambiguous,
     byAbsolutePath: absolute.resolved,
     byBasename: basename.resolved,
-    byQualifiedPath,
+    byQualifiedPath: qualified.resolved,
   };
+}
+
+/**
+ * W1-02r1：区分“同一身份的重复 entry”与“不同身份”。有绝对路径时以绝对路径为准；缺绝对路径时以
+ * folderId 加 relativePath 区分。再拼上 qualifiedPath，使同一文件登记成多个 qualifiedPath 时仍算不同条目
+ * （绝对路径桶据此判 ambiguous-absolute-path）。字段都缺的 entry 只能按 qualifiedPath 区分。
+ */
+function pcvDistinctSourceIdentityKey(identity: PcvCanonicalSourceIdentity): string {
+  const identityKey = identity.absolutePath
+    ? ['absolute', normalizePcvSourcePath(identity.absolutePath)]
+    : [
+        'folder',
+        identity.folderId,
+        identity.relativePath === null ? null : normalizePcvSourcePath(identity.relativePath),
+      ];
+  return JSON.stringify([...identityKey, normalizePcvSourcePath(identity.qualifiedPath)]);
 }
 
 function appendToBucket(
@@ -1804,15 +1858,23 @@ function appendToBucket(
 }
 
 /**
- * 引用规范化顺序：qualifiedPath 原样命中 → 宿主登记的绝对路径映射到 qualifiedPath（reason absolute-path，
- * 绝对路径不再原样进入 sourceRefs）→ 不含目录的引用按唯一 basename 匹配。带目录的相对路径不做 Core 的
- * 单目录相对回落：宿主 ProjectScopeAnalysis 的准入规则只接受 qualified 与 absolute，这里保持同一口径。
+ * 引用规范化顺序：被多个身份共享的 qualifiedPath 判 ambiguous-path → qualifiedPath 原样命中 →
+ * 宿主登记的绝对路径（reason absolute-path）→ 不含目录的引用按唯一 basename 匹配。带目录的相对路径不做
+ * Core 的单目录相对回落：宿主 ProjectScopeAnalysis 的准入规则只接受 qualified 与 absolute，这里保持同一口径。
+ *
+ * 绝对路径的输出分两支（W1-02r1）：身份的 qualifiedPath 唯一时映射到 qualifiedPath（W1-02 的决定，绝对路径
+ * 不原样进入 sourceRefs）；qualifiedPath 被多个身份共享时原样保留绝对路径。后一支与宿主
+ * normalizeProjectScopeSourceRefsForRuntime、Core normalizeResolvedProjectScopeSourceRef 一致：显式绝对路径
+ * 不能再投影回有歧义的显示名路径，否则宿主会把 Agent 的输出判为 ambiguous-path 并丢弃。
  */
 function normalizePcvProjectScopeSourceRef(
   sourceRef: string,
   index: PcvProjectScopeSourceRefIndex
 ): PcvNormalizedProjectScopeSourceRef {
   const normalized = normalizePcvSourcePath(sourceRef);
+  if (index.ambiguousQualifiedPaths.has(normalized)) {
+    return { normalizedRef: null, reason: 'ambiguous-path', status: 'ambiguous' };
+  }
   const qualified = index.byQualifiedPath.get(normalized);
   if (qualified) {
     return {
@@ -1827,6 +1889,17 @@ function normalizePcvProjectScopeSourceRef(
   }
   const absolute = index.byAbsolutePath.get(normalized);
   if (absolute) {
+    const identityCount = index.ambiguousQualifiedPaths.get(
+      normalizePcvSourcePath(absolute.qualifiedPath)
+    );
+    if (identityCount !== undefined) {
+      return {
+        conflictingQualifiedPath: { identityCount, qualifiedPath: absolute.qualifiedPath },
+        normalizedRef: sourceRef,
+        reason: 'absolute-path',
+        status: 'active',
+      };
+    }
     return {
       normalizedRef: absolute.qualifiedPath,
       reason: 'absolute-path',
@@ -1882,6 +1955,10 @@ function normalizeSourceRefsForEvidence(
     }
     const normalized = normalizePcvProjectScopeSourceRef(parsed.path, index);
     if (normalized.status === 'active' && normalized.normalizedRef) {
+      if (normalized.conflictingQualifiedPath) {
+        reportAbsolutePathKept(evidence, index, parsed.path, normalized.conflictingQualifiedPath);
+      }
+      // 行号后缀与其他分支一致：保留下来的绝对路径同样原样拼回 `:行号`。
       normalizedRefs.push(`${normalized.normalizedRef}${parsed.lineSuffix}`);
       continue;
     }
@@ -1892,6 +1969,41 @@ function normalizeSourceRefsForEvidence(
     });
   }
   return uniqueStrings(normalizedRefs).slice(0, MAX_SOURCE_REFS);
+}
+
+/**
+ * W1-02r1 分叉日志：绝对路径命中唯一身份，但该身份的 qualifiedPath 被多个身份共享，于是不投影、原样保留
+ * 绝对路径（status active、reason absolute-path）。这是与宿主和 Core 对齐的正常路径而非降级，所以记 info
+ * 而不进 sourceRefDiagnostics（那里只放未解析与歧义引用，并会聚合成 missingLinkReasons）。
+ * 同一索引下同一绝对路径只记一条，见 PCV_KEPT_ABSOLUTE_PATH_REPORTS。
+ */
+function reportAbsolutePathKept(
+  evidence: PcvNodeEvidenceSummary,
+  index: PcvProjectScopeSourceRefIndex,
+  absolutePath: string,
+  conflict: { identityCount: number; qualifiedPath: string }
+): void {
+  let reported = PCV_KEPT_ABSOLUTE_PATH_REPORTS.get(index);
+  if (!reported) {
+    reported = new Set<string>();
+    PCV_KEPT_ABSOLUTE_PATH_REPORTS.set(index, reported);
+  }
+  const key = normalizePcvSourcePath(absolutePath);
+  if (reported.has(key)) {
+    return;
+  }
+  reported.add(key);
+  Logger.getInstance().info(
+    limitText(
+      `[PcvNodeEvidence] pcv_source_ref_absolute_path_kept: PCV node ${evidence.nodeId} kept ` +
+        `absolute source ref ${absolutePath} verbatim (status active, reason absolute-path) instead of ` +
+        `projecting it to qualifiedPath ${conflict.qualifiedPath}, which ` +
+        `${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT} v${PROJECT_SCOPE_SOURCE_IDENTITY_MAP_CONTRACT_VERSION} ` +
+        `shares across ${conflict.identityCount} identities (e.g. folders sharing a display name); ` +
+        `refs to that qualifiedPath are recorded as ambiguous-path`,
+      800
+    )
+  );
 }
 
 function normalizePcvEvidenceSourceRefs(evidence: PcvNodeEvidenceSummary): void {

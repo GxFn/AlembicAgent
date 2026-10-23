@@ -1,7 +1,12 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createCanonicalSourceIdentity } from '@alembic/core';
+import {
+  buildProjectScopeSourceRefIndex,
+  createCanonicalSourceIdentity,
+  createProjectDescriptor,
+  normalizeProjectScopeSourceRefs,
+} from '@alembic/core';
 import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -2224,5 +2229,218 @@ describe('PCV ProjectScopeSourceIdentityMap wiring (L5-P28)', () => {
     // 普通阶段原样传递宿主 sharedState，不再浅拷贝出 _sourceIdentities。
     expect(stage?.sharedState).toBe(sharedState);
     expect(stage?.sharedState).not.toHaveProperty('_sourceIdentities');
+  });
+
+  /**
+   * W1-02r1（U27-F2）：显示名相同的文件夹让两个不同身份共享同一 qualifiedPath。构造与宿主
+   * Alembic/test/unit/ProjectScopeAnalysis.test.ts 的 sameNameIdentities 一致：Core createProjectDescriptor
+   * 以 apps/common、tools/common 为 folders（显示名都是 common），再用 createCanonicalSourceIdentity 生成身份。
+   * 宿主与 Core 的口径：冲突的 qualified 路径判 ambiguous-path，唯一的绝对路径原样保留（不投影回歧义显示名）。
+   */
+  describe('same display name folders (W1-02r1, U27-F2)', () => {
+    const sameNameRoot = path.join(tmpdir(), 'pcv-same-name-scope');
+    const sameNameScope = createProjectDescriptor({
+      controlRoot: sameNameRoot,
+      dataRoot: path.join(sameNameRoot, '.ghost'),
+      folders: ['apps', 'tools'].map((parent) => ({
+        path: path.join(sameNameRoot, parent, 'common'),
+      })),
+    });
+    const sameNameIdentities = sameNameScope.folders.map((folder) =>
+      createCanonicalSourceIdentity({
+        folderDisplayName: folder.displayName,
+        folderId: folder.id,
+        folderPath: folder.path,
+        projectRoot: sameNameRoot,
+        projectScopeId: sameNameScope.projectScopeId,
+        sourcePath: 'lib/index.ts',
+      })
+    );
+    const appsAbsolutePath = path.join(sameNameRoot, 'apps', 'common', 'lib', 'index.ts');
+    const toolsAbsolutePath = path.join(sameNameRoot, 'tools', 'common', 'lib', 'index.ts');
+
+    function keptAbsolutePathLogs(info: { mock: { calls: unknown[][] } }): string[] {
+      return info.mock.calls
+        .map((args) => args[0])
+        .filter(
+          (message): message is string =>
+            typeof message === 'string' &&
+            message.startsWith('[PcvNodeEvidence] pcv_source_ref_absolute_path_kept')
+        );
+    }
+
+    it('builds the host sameNameIdentities shape (two identities, one qualified path)', () => {
+      expect(sameNameIdentities.map((identity) => identity.qualifiedPath)).toEqual([
+        'common/lib/index.ts',
+        'common/lib/index.ts',
+      ]);
+      expect(sameNameIdentities.map((identity) => identity.absolutePath)).toEqual([
+        appsAbsolutePath,
+        toolsAbsolutePath,
+      ]);
+    });
+
+    it('keeps a unique absolute path verbatim and marks the colliding qualified path and basename ambiguous', () => {
+      const info = vi
+        .spyOn(Logger.getInstance(), 'info')
+        .mockImplementation(() => Logger.getInstance());
+      try {
+        const map = hostSourceIdentityMap(sameNameIdentities);
+        const ctx = createScopedLoop({
+          context: { projectScopeSourceIdentityMap: map },
+          sharedState: { _projectScopeSourceIdentityMap: map },
+        });
+        recordRead(
+          ctx,
+          appsAbsolutePath,
+          `${appsAbsolutePath}:1 and common/lib/index.ts:2 and index.ts:3`
+        );
+        const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+        // 绝对路径原样留在 sourceRefs（宿主 PcvObservabilityLinkage 按 absolute-path 接受原输入）。
+        expect([...summary.sourceRefs].sort()).toEqual([appsAbsolutePath, `${appsAbsolutePath}:1`]);
+        expect(summary.sourceRefs.some((ref) => ref.startsWith('common/'))).toBe(false);
+        expect(summary.sourceRefDiagnostics).toEqual([
+          { input: 'common/lib/index.ts:2', reason: 'ambiguous-path', status: 'ambiguous' },
+          { input: 'index.ts:3', reason: 'ambiguous-basename', status: 'ambiguous' },
+        ]);
+        expect(summary.missingLinkReasons).toContain('ambiguous-source-refs');
+        expect(summary.missingLinkReasons).not.toContain('missing-source-refs');
+        expect(summary.missingLinkReasons).not.toContain('unresolved-source-refs');
+        // 分叉日志：qualifiedPath 冲突、保留绝对路径；同一索引同一绝对路径只记一条。
+        const kept = keptAbsolutePathLogs(info);
+        expect(kept).toHaveLength(1);
+        expect(kept[0]).toContain(appsAbsolutePath);
+        expect(kept[0]).toContain('common/lib/index.ts');
+        expect(kept[0]).toContain('2 identities');
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it('keeps the absolute path through the quality gate channels as well', () => {
+      const map = hostSourceIdentityMap(sameNameIdentities);
+      const gate = buildPcvQualityGateEvidence({
+        artifact: {
+          referencedFiles: [`${toolsAbsolutePath}:12`, 'common/lib/index.ts', 'index.ts'],
+        },
+        dimId: 'architecture',
+        gate: { action: 'pass', pass: true },
+        sharedState: { _projectScopeSourceIdentityMap: map },
+        source: {},
+        stageNodeContext: { projectScopeSourceIdentityMap: map },
+      });
+      expect(gate.sourceRefs).toEqual([`${toolsAbsolutePath}:12`]);
+      expect(gate.sourceRefDiagnostics).toEqual([
+        { input: 'common/lib/index.ts', reason: 'ambiguous-path', status: 'ambiguous' },
+        { input: 'index.ts', reason: 'ambiguous-basename', status: 'ambiguous' },
+      ]);
+      expect(gate.missingLinkReasons).toContain('ambiguous-source-refs');
+    });
+
+    it('tells identities apart by folderId and relativePath when absolutePath is missing', () => {
+      const ctx = createScopedLoop({
+        context: {
+          projectScopeSourceIdentityMap: hostSourceIdentityMap([
+            // 宿主去重前的重复 entry 是同一身份，不构成冲突。
+            { folderId: 'web', qualifiedPath: 'web/src/main.ts', relativePath: 'src/main.ts' },
+            { folderId: 'web', qualifiedPath: 'web/src/main.ts', relativePath: 'src/main.ts' },
+            // 两个不同 folderId 登记同一 qualifiedPath：没有绝对路径可区分，判冲突。
+            { folderId: 'apps-ui', qualifiedPath: 'ui/view.ts', relativePath: 'view.ts' },
+            { folderId: 'tools-ui', qualifiedPath: 'ui/view.ts', relativePath: 'view.ts' },
+          ]),
+        },
+      });
+      recordRead(ctx, 'web/src/main.ts', 'ui/view.ts:4 and main.ts:9 and view.ts:2');
+      const summary = buildPcvNodeEvidenceSummary(ctx.pcvNodeEvidence);
+      expect([...summary.sourceRefs].sort()).toEqual(['web/src/main.ts', 'web/src/main.ts:9']);
+      expect(summary.sourceRefDiagnostics).toEqual([
+        { input: 'ui/view.ts:4', reason: 'ambiguous-path', status: 'ambiguous' },
+        { input: 'view.ts:2', reason: 'ambiguous-basename', status: 'ambiguous' },
+      ]);
+    });
+
+    it('agrees with Core normalizeProjectScopeSourceRefs on qualified and absolute inputs', () => {
+      // 在同名文件夹之外再放一个显示名唯一的文件夹，以及一对嵌套文件夹（同一绝对路径登记在两个
+      // qualifiedPath 下），覆盖 active / ambiguous / missing 三种状态。basename 是 Agent 自有规则，不参与差分。
+      const identities = [
+        ...sameNameIdentities,
+        createCanonicalSourceIdentity({
+          folderDisplayName: 'web',
+          folderId: 'web',
+          folderPath: path.join(sameNameRoot, 'web'),
+          projectRoot: sameNameRoot,
+          projectScopeId: sameNameScope.projectScopeId,
+          sourcePath: 'src/main.ts',
+        }),
+        createCanonicalSourceIdentity({
+          folderDisplayName: 'pkg',
+          folderId: 'pkg',
+          folderPath: path.join(sameNameRoot, 'pkg'),
+          projectRoot: sameNameRoot,
+          projectScopeId: sameNameScope.projectScopeId,
+          sourcePath: 'sub/nested.ts',
+        }),
+        createCanonicalSourceIdentity({
+          folderDisplayName: 'sub',
+          folderId: 'pkg-sub',
+          folderPath: path.join(sameNameRoot, 'pkg', 'sub'),
+          projectRoot: sameNameRoot,
+          projectScopeId: sameNameScope.projectScopeId,
+          sourcePath: 'nested.ts',
+        }),
+      ];
+      const inputs = [
+        'common/lib/index.ts',
+        appsAbsolutePath,
+        toolsAbsolutePath,
+        'web/src/main.ts',
+        path.join(sameNameRoot, 'web', 'src', 'main.ts'),
+        'pkg/sub/nested.ts',
+        'sub/nested.ts',
+        path.join(sameNameRoot, 'pkg', 'sub', 'nested.ts'),
+        'web/src/missing.ts',
+        path.join(sameNameRoot, 'elsewhere', 'outside.ts'),
+      ];
+      const core = normalizeProjectScopeSourceRefs(
+        inputs,
+        buildProjectScopeSourceRefIndex(identities)
+      );
+      const coreStatuses = core.normalized.map((entry) => [entry.input, entry.status]);
+      const map = hostSourceIdentityMap(identities);
+      const agentStatuses = inputs.map((input) => {
+        const gate = buildPcvQualityGateEvidence({
+          artifact: { referencedFiles: [input] },
+          dimId: 'architecture',
+          gate: { action: 'pass', pass: true },
+          sharedState: { _projectScopeSourceIdentityMap: map },
+          source: {},
+          stageNodeContext: { projectScopeSourceIdentityMap: map },
+        });
+        const diagnostic = gate.sourceRefDiagnostics.find((entry) => entry.input === input);
+        if (diagnostic) {
+          return [input, diagnostic.status];
+        }
+        return [input, gate.sourceRefs.length === 1 ? 'active' : 'unrecorded'];
+      });
+      expect(agentStatuses).toEqual(coreStatuses);
+      // 状态覆盖面：三种状态都出现，差分不是在比较一组全 active 的输入。
+      expect(new Set(coreStatuses.map(([, status]) => status))).toEqual(
+        new Set(['active', 'ambiguous', 'missing'])
+      );
+      // qualifiedPath 冲突时 Agent 的输出与 Core 的 normalizedRef 相同（原样的绝对路径）。
+      for (const absolute of [appsAbsolutePath, toolsAbsolutePath]) {
+        const gate = buildPcvQualityGateEvidence({
+          artifact: { referencedFiles: [absolute] },
+          dimId: 'architecture',
+          gate: { action: 'pass', pass: true },
+          sharedState: { _projectScopeSourceIdentityMap: map },
+          source: {},
+          stageNodeContext: { projectScopeSourceIdentityMap: map },
+        });
+        expect(gate.sourceRefs).toEqual([
+          core.normalized.find((entry) => entry.input === absolute)?.normalizedRef,
+        ]);
+      }
+    });
   });
 });
