@@ -105,7 +105,7 @@ Core 已放入 created 列表并提供 id/lifecycle 的创建回执仍保留；�
 
 `DeltaCache.set` 记录磁盘版本指纹，用于写前新鲜度校验；它不声明全文已经展示。`check` 只有在完整输出有资格进入当前视图时建立增量基线。范围读、outline、batch/action 配额截断保留指纹但不建立全文可见性。读取视图重置后，修改已有文件需要重新读取。
 
-两种缓存容量必须是非负安全整数；非法值在构造时抛出 `RangeError`，0 继续表示禁用缓存。`SearchCache.makeKey` 使用 JSON 元组区分 pattern、glob 和 regex，避免分隔符碰撞；调用方应把返回值当作不透明键，不手写或解析其格式。升级时重新创建已有缓存实例；真实 code.search 自有的结构化键与写后失效机制保持不变。
+两种缓存容量必须是非负安全整数；非法值在构造时抛出 `RangeError`，0 继续表示禁用缓存。宿主对 `SearchCache` 只需要构造与 `clear()`；缓存键由 code.search 自己按项目根、缓存代数和各搜索参数结构化编码，pattern 或 glob 中的分隔符不会串成同一个键，宿主不构造、不解析键。`SearchCache.makeKey`、`has()` 与条目上的 `createdAt` 已删除（W2a-03），它们没有生产读取方。升级时重新创建已有缓存实例；真实 code.search 自有的结构化键与写后失效机制保持不变。
 
 ## 文件工具与输出
 

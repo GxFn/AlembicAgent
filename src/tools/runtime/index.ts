@@ -48,13 +48,12 @@ export {
 } from './registry.js';
 export type { RouterConfig } from './router.js';
 export { ToolRouter } from './router.js';
+// ScanAnalyze 与已删除的 System 不再公开（W2a-03 / L4-P33）；scan_analyze 仍由 CapabilityRegistry 按名解析。
 export {
   Conversation,
   Evolution,
   GenerateAnalyze,
   GenerateProduce,
   RuntimeCapability,
-  ScanAnalyze,
   ScanProduce,
-  System,
 } from './toolsets/index.js';

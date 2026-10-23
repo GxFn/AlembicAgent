@@ -4,6 +4,9 @@
  * ToolRouter — 工具调用的统一入口。
  *
  * 流程: 参数解析 → Schema 校验 → Capability 权限检查 → 并发控制 → Handler 分发 → 输出截断
+ *
+ * 模型可见的 schema 投影不在路由器上：旧的 getSchemas 没有生产调用方，已删除（W2a-03 / L4-P33），
+ * schema 与有效动作集统一由目录的 querySchemas（RuntimeCapabilityCatalog）一次产出。
  */
 
 import Logger from '@alembic/core/logging';
@@ -34,7 +37,7 @@ import {
 import { toolAdmissionFailure } from './admission.js';
 import { describeToolAvailability } from './availability.js';
 import { type ToolParameterSchemaFailureSink, validateToolParameters } from './parameters.js';
-import { generateLightweightSchemas, TOOL_REGISTRY } from './registry.js';
+import { TOOL_REGISTRY } from './registry.js';
 import { createToolRegistryView, readToolAvailability } from './selection.js';
 
 export interface RouterConfig {
@@ -372,15 +375,6 @@ export class ToolRouter {
         error: `Failed to parse tool arguments: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
-  }
-
-  /**
-   * 生成当前 capability 允许的轻量 schema 列表。
-   */
-  getSchemas(
-    ctx: Pick<ToolContext, 'runtime' | 'toolAvailability'> = {}
-  ): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
-    return generateLightweightSchemas(this.#selection(ctx), ctx.toolAvailability);
   }
 
   /**

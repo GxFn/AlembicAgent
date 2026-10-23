@@ -594,8 +594,11 @@ describe('tool runtime adapters and public contracts', () => {
   });
   it('projects Evolution terminal access with a read-only command allowlist', () => {
     const capability = new Evolution().toDef();
-    const router = new ToolRouter({ capability });
-    const schemas = router.getSchemas();
+    // ToolRouter#getSchemas 已删除（W2a-03 / L4-P33）：schema 投影只走目录的 querySchemas。
+    expect('getSchemas' in ToolRouter.prototype).toBe(false);
+    const { schemas } = new RuntimeCapabilityCatalog().querySchemas({
+      selection: capability.allowedTools,
+    });
     const terminal = schemas.find((schema) => schema.name === 'terminal');
     const terminalParams = terminal?.parameters as {
       properties?: { action?: { enum?: string[] } };
@@ -925,7 +928,8 @@ describe('tool runtime adapters and public contracts', () => {
     expect(changed.mode).toBe('delta');
 
     const searchCache = new SearchCache(1);
-    const key = SearchCache.makeKey('AgentRuntime', '*.ts');
+    // 键对 SearchCache 不透明；真实 code.search 自己构造结构化键（SearchCache.makeKey 已删除）。
+    const key = 'opaque-search-key';
     searchCache.set(key, { matches: 1 });
 
     expect(searchCache.get(key)).toEqual({ matches: 1 });
@@ -952,15 +956,58 @@ describe('tool runtime adapters and public contracts', () => {
     expect(delta.size).toBe(0);
   });
 
-  it('keeps search key components distinct even when pattern or glob contains a delimiter', () => {
-    const cache = new SearchCache();
-    const first = SearchCache.makeKey('a|b', 'c');
-    const second = SearchCache.makeKey('a', 'b|c');
-    cache.set(first, { source: 'first' });
-    expect(cache.get(second)).toBeUndefined();
-    expect(cache.get(first)).toEqual({ source: 'first' });
-    expect(SearchCache.makeKey('x')).toBe(SearchCache.makeKey('x', '', false));
-    expect(SearchCache.makeKey('x', '', true)).not.toBe(SearchCache.makeKey('x'));
+  it('narrows SearchCache to construction, get/set, clear and size (W2a-03 / L4-P33)', () => {
+    // 宿主只用构造与 clear；makeKey、has 无生产消费者，随公开面收窄删除。
+    expect('makeKey' in SearchCache).toBe(false);
+    expect('has' in SearchCache.prototype).toBe(false);
+    const cache = new SearchCache(2);
+    cache.set('first', { source: 'first' });
+    expect(cache.get('first')).toEqual({ source: 'first' });
+    expect(cache.size).toBe(1);
+    cache.clear();
+    expect(cache.size).toBe(0);
+    expect(cache.get('first')).toBeUndefined();
+  });
+
+  it('keeps code.search cache entries apart when a delimiter moves between pattern and glob', async () => {
+    await withWriteFixture(async (root) => {
+      const probe = new SearchCache();
+      const get = vi.spyOn(probe, 'get');
+      const router = new ToolRouter();
+      const firstCall = {
+        tool: 'code',
+        action: 'search',
+        params: { patterns: ['a|b'], glob: 'c', contextLines: 0 },
+      };
+      const secondCall = {
+        tool: 'code',
+        action: 'search',
+        params: { patterns: ['a'], glob: 'b|c', contextLines: 0 },
+      };
+      await router.execute(firstCall, { ...freshnessCtx(root), searchCache: probe });
+      await router.execute(secondCall, { ...freshnessCtx(root), searchCache: probe });
+      // 真实键由 code.search 独立编码各分量：分隔符在 pattern 与 glob 间移动不能串成同一个键。
+      const [firstKey, secondKey] = get.mock.calls.map(([key]) => key);
+      expect(typeof firstKey).toBe('string');
+      expect(typeof secondKey).toBe('string');
+      expect(firstKey).not.toBe(secondKey);
+
+      // 新缓存里只用哨兵条目占住第一个键（键含缓存代数，新实例从同一代数开始）：
+      // 第二个请求不能命中它，第一个请求则整次由缓存提供。
+      const seeded = new SearchCache();
+      seeded.set(firstKey, {
+        matches: [{ file: 'sentinel.ts', line: 1, content: 'sentinel' }],
+        total: 1,
+      });
+      const ctx = { ...freshnessCtx(root), searchCache: seeded };
+      const second = await router.execute(secondCall, ctx);
+      expect(second._meta?.cached).not.toBe(true);
+      expect(JSON.stringify(second.data ?? null)).not.toContain('sentinel');
+      const first = await router.execute(firstCall, ctx);
+      expect(first.ok).toBe(true);
+      expect(first._meta?.cached).toBe(true);
+      expect(JSON.stringify(first.data)).toContain('sentinel');
+    });
   });
 
   it('routes tool calls through generic router and adapter contracts', async () => {

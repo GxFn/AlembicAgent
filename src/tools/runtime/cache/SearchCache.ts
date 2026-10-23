@@ -2,11 +2,14 @@
  * @module tools/runtime/cache/SearchCache
  *
  * 搜索结果 LRU 缓存。避免同一会话中重复搜索相同 pattern。
+ *
+ * 公开面只保留构造、get/set、clear 与 size（W2a-03 / L4-P33）：键对缓存不透明，由 code.search
+ * 自己按 projectRoot、缓存代数与各搜索参数结构化编码；旧的 makeKey 与真实键维度不一致、has 与
+ * 条目上的 createdAt 都没有读取方，已删除。淘汰只按 LRU 顺序与容量，不按时间。
  */
 
 export interface SearchCacheEntry {
   result: unknown;
-  createdAt: number;
 }
 
 export class SearchCache {
@@ -21,11 +24,6 @@ export class SearchCache {
     this.#maxEntries = maxEntries;
   }
 
-  /** 实例内的不透明键；独立编码各分量，pattern/glob中的分隔符不能串成同一个搜索。 */
-  static makeKey(pattern: string, glob?: string, regex?: boolean): string {
-    return JSON.stringify([pattern, glob ?? '', Boolean(regex)]);
-  }
-
   get(key: string): unknown | undefined {
     const entry = this.#cache.get(key);
     if (!entry) {
@@ -38,17 +36,13 @@ export class SearchCache {
 
   set(key: string, result: unknown): void {
     this.#cache.delete(key);
-    this.#cache.set(key, { result, createdAt: Date.now() });
+    this.#cache.set(key, { result });
     if (this.#cache.size > this.#maxEntries) {
       const firstKey = this.#cache.keys().next().value;
       if (firstKey !== undefined) {
         this.#cache.delete(firstKey);
       }
     }
-  }
-
-  has(key: string): boolean {
-    return this.#cache.has(key);
   }
 
   clear(): void {

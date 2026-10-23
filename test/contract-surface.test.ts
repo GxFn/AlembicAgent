@@ -30,6 +30,7 @@ import {
   type ToolResultEnvelope,
   validateAgentInterfaceContract,
 } from '../src/index.js';
+import * as toolsRuntime from '../src/tools/runtime/index.js';
 
 describe('explicit AlembicAgent contract subpaths', () => {
   it('exposes the service orchestration surface', () => {
@@ -1527,14 +1528,15 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     );
   });
 
-  it('records 435 runtime bindings across the 15 stable package exports', () => {
+  it('records 431 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
     expect(signatures.packageExportCount).toBe(15);
     const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
-    // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）。
-    expect(total).toBe(435);
+    // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）；
+    // W2a-03 从 `.` 与 `./tools/runtime` 各撤回 System、ScanAnalyze（435 → 431）。
+    expect(total).toBe(431);
   });
 
   it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
@@ -1611,7 +1613,8 @@ describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L
     // 宿主只用 new UnifiedToolCatalog() 与 register：类本身仍在根出口上，种类不变。
     expect(runtimeKind(exported.UnifiedToolCatalog)).toBe('class');
     const expected = snapshotEntries('.');
-    expect(expected.exportCount).toBe(152);
+    // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）。
+    expect(expected.exportCount).toBe(150);
     const snapshotNames = expected.entries.map((entry) => entry.name);
     for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
       expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
@@ -1762,5 +1765,146 @@ describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L
     expect(negative).toHaveLength(2);
     expect(negative[0]).toContain('getRouter');
     expect(negative[1]).toContain("parameter of type 'never'");
+  }, 120000);
+});
+
+/** W2a-03（审阅包 L4-P33）从 `.` 与 `./tools/runtime` 撤回的两个能力类导出。 */
+const WITHDRAWN_TOOLSET_BINDINGS = ['ScanAnalyze', 'System'] as const;
+
+function sortedEntries(moduleExports: Record<string, unknown>): SignatureEntry[] {
+  return Object.keys(moduleExports)
+    .sort()
+    .map((name) => ({ name, kind: runtimeKind(moduleExports[name]) }));
+}
+
+describe('toolset and search cache narrowing (W2a-03 / L4-P33)', () => {
+  it('withdraws System and ScanAnalyze from both entries and matches the snapshot', () => {
+    const subpaths = [
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 150 },
+      {
+        exportPath: './tools/runtime',
+        moduleExports: toolsRuntime as Record<string, unknown>,
+        count: 29,
+      },
+    ] as const;
+    for (const { exportPath, moduleExports, count } of subpaths) {
+      for (const name of WITHDRAWN_TOOLSET_BINDINGS) {
+        expect({ exportPath, name, exported: name in moduleExports }).toEqual({
+          exportPath,
+          name,
+          exported: false,
+        });
+      }
+      // 其余能力类照常公开（ScanProduce 等不在本包范围内）。
+      expect(runtimeKind(moduleExports.ScanProduce)).toBe('class');
+      expect(runtimeKind(moduleExports.SearchCache)).toBe('class');
+      expect(runtimeKind(moduleExports.ToolRouter)).toBe('class');
+      const expected = snapshotEntries(exportPath);
+      expect({ exportPath, exportCount: expected.exportCount }).toEqual({
+        exportPath,
+        exportCount: count,
+      });
+      const snapshotNames = expected.entries.map((entry) => entry.name);
+      for (const name of WITHDRAWN_TOOLSET_BINDINGS) {
+        expect({ exportPath, name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+          exportPath,
+          name,
+          inSnapshot: false,
+        });
+      }
+      const entries = sortedEntries(moduleExports);
+      const expectedSorted = [...expected.entries].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+      );
+      expect({ exportPath, entries }).toEqual({ exportPath, entries: expectedSorted });
+      expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+        expected.signatureHash
+      );
+    }
+  });
+
+  it('removes getSchemas, makeKey, has and the mutable registry members at runtime', () => {
+    expect('getSchemas' in toolsRuntime.ToolRouter.prototype).toBe(false);
+    expect('makeKey' in toolsRuntime.SearchCache).toBe(false);
+    expect('has' in toolsRuntime.SearchCache.prototype).toBe(false);
+    const registry = agentRoot.CapabilityRegistry as unknown as Record<string, unknown>;
+    expect('_registry' in registry).toBe(false);
+    expect('register' in registry).toBe(false);
+    // 保留面：路由入口、缓存构造/读写/清理与能力解析不变。
+    for (const member of ['execute', 'explain', 'parseToolCall', 'getToolSpec']) {
+      expect({
+        member,
+        kind: typeof Reflect.get(toolsRuntime.ToolRouter.prototype, member),
+      }).toEqual({ member, kind: 'function' });
+    }
+    for (const member of ['get', 'set', 'clear']) {
+      expect({
+        member,
+        kind: typeof Reflect.get(toolsRuntime.SearchCache.prototype, member),
+      }).toEqual({ member, kind: 'function' });
+    }
+    expect(agentRoot.CapabilityRegistry.names).toContain('scan_analyze');
+  });
+
+  it('narrows the removed members and the SearchCacheEntry type (compiler probes)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，所以收窄用真实编译器判定。
+    const diagnostics = typecheckRouterContractProbes({
+      '__w2a03-removed-exports.probe.ts': [
+        "import type { ScanAnalyze as RootScanAnalyze, System as RootSystem } from '../src/index.js';",
+        "import type { ScanAnalyze, System } from '../src/tools/runtime/index.js';",
+        'export type Removed = [RootScanAnalyze, RootSystem, ScanAnalyze, System];',
+        '',
+      ].join('\n'),
+      '__w2a03-removed-members.probe.ts': [
+        "import { CapabilityRegistry } from '../src/agent/index.js';",
+        "import { SearchCache, ToolRouter } from '../src/tools/runtime/index.js';",
+        'export const schemas = new ToolRouter().getSchemas();',
+        "export const key = SearchCache.makeKey('pattern');",
+        "export const present = new SearchCache().has('key');",
+        'export const table = CapabilityRegistry._registry;',
+        "export const registered = CapabilityRegistry.register('custom', class {} as never);",
+        '',
+      ].join('\n'),
+      '__w2a03-cache-entry.probe.ts': [
+        "import type { SearchCacheEntry } from '../src/tools/runtime/index.js';",
+        'export const entry: SearchCacheEntry = { result: 1, createdAt: 0 };',
+        '',
+      ].join('\n'),
+      // 正对照：保留的构造、读写、能力解析与解构调用都能通过编译。
+      '__w2a03-retained.probe.ts': [
+        "import { CapabilityRegistry } from '../src/agent/index.js';",
+        "import type { SearchCacheEntry } from '../src/tools/runtime/index.js';",
+        "import { ScanProduce, SearchCache, ToolRouter } from '../src/tools/runtime/index.js';",
+        'const cache = new SearchCache(1);',
+        "cache.set('key', { matches: 1 });",
+        "export const cached: unknown = cache.get('key');",
+        'cache.clear();',
+        'export const size: number = cache.size;',
+        'export const entry: SearchCacheEntry = { result: 1 };',
+        "export const parsed = new ToolRouter().parseToolCall('meta', { action: 'tools' });",
+        'const { create } = CapabilityRegistry;',
+        "export const capability = create('scan_analyze');",
+        'export const names: string[] = CapabilityRegistry.names;',
+        'export const produce = new ScanProduce();',
+        '',
+      ].join('\n'),
+    });
+
+    const missingExports = diagnostics['__w2a03-removed-exports.probe.ts']
+      .map((message) => /has no exported member (?:named )?'([^']+)'/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingExports).toEqual(['ScanAnalyze', 'ScanAnalyze', 'System', 'System']);
+
+    const missingMembers = diagnostics['__w2a03-removed-members.probe.ts']
+      .map((message) => /Property '(\w+)' does not exist on type/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingMembers).toEqual(['_registry', 'getSchemas', 'has', 'makeKey', 'register']);
+
+    const excess = diagnostics['__w2a03-cache-entry.probe.ts'].map((message) => {
+      const match = /'(\w+)' does not exist in type '(\w+)'/.exec(message);
+      return match ? `${match[2]}.${match[1]}` : message;
+    });
+    expect(excess).toEqual(['SearchCacheEntry.createdAt']);
+    expect(diagnostics['__w2a03-retained.probe.ts']).toEqual([]);
   }, 120000);
 });

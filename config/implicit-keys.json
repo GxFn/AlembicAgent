@@ -221,10 +221,6 @@
       "owner": "src/agent/memory/MemoryRetriever.ts",
       "purpose": "记忆检索打分明细：时间新近度分量。"
     },
-    "_registry": {
-      "owner": "src/tools/runtime/toolsets/CapabilityRegistry.ts",
-      "purpose": "CapabilityRegistry 对象字面量上的内部注册表。"
-    },
     "_relevance": {
       "owner": "src/agent/memory/MemoryRetriever.ts",
       "purpose": "记忆检索打分明细：相关度分量。"

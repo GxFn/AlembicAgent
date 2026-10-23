@@ -12,11 +12,11 @@ type CapabilityConstructor = new (opts?: Record<string, unknown>) => Capability;
 /**
  * 已从注册表撤下、不能再按名解析的能力，以及撤下原因（L4-P33 / I06）。
  *
- * system_interaction（System 类）同时开放 code.write 与没有 commandAllowlist 的 terminal.exec；
+ * system_interaction 曾同时开放 code.write 与没有 commandAllowlist 的 terminal.exec；
  * 注册在这里时，任何 profile 只要在 skills 里写上这个名字，编译后的 runtimeOverrides.capabilities
  * 就会经 AgentRuntimeBuilder.build / AgentRuntime 阶段能力解析拿到写文件与不受限终端权限。
- * 宿主生产与测试代码都不引用这个名称，所以先撤下注册；System 类与 barrel 导出是否删除
- * 随待决事项②处理，这里不动公开导出。
+ * 宿主生产与测试代码都不引用这个名称，所以先撤下注册，随后按待决事项②（W2a-03）把
+ * 对应的 System 类与公开导出一并删除。
  *
  * 这张表只用于让误配 profile 的报错说明原因，不参与解析：撤下的名字一律按未知能力拒绝。
  */
@@ -27,21 +27,31 @@ const RETIRED_CAPABILITY_REASONS: ReadonlyMap<string, string> = new Map([
   ],
 ]);
 
-export const CapabilityRegistry = {
-  _registry: new Map<string, CapabilityConstructor>([
-    ['conversation', Conversation as CapabilityConstructor],
-    ['code_analysis', GenerateAnalyze as CapabilityConstructor],
-    ['knowledge_production', GenerateProduce as CapabilityConstructor],
-    ['scan_production', ScanProduce as CapabilityConstructor],
-    ['scan_analyze', ScanAnalyze as CapabilityConstructor],
-    // system_interaction 不再注册：见 RETIRED_CAPABILITY_REASONS。
-    ['evolution_analysis', Evolution as CapabilityConstructor],
-    // relations pipeline explore 阶段的只读能力（L7-P19）；不含 submit/terminal/memory 写入。
-    ['relation_exploration', RelationExploration as CapabilityConstructor],
-  ]),
+/**
+ * 按名解析的能力表（模块私有，W2a-03 / L4-P33）。
+ *
+ * 原先挂在 CapabilityRegistry 对象上的 `_registry` 与 `register` 是可变全局：任何模块都能
+ * 在运行期往表里塞入新能力或覆盖已有名字，绕过这里的准入说明。现在表是模块级常量，
+ * 只能通过修改本文件扩展；create/names 直接读这张表，不依赖 this，解构调用同样可用。
+ */
+const CAPABILITIES: ReadonlyMap<string, CapabilityConstructor> = new Map<
+  string,
+  CapabilityConstructor
+>([
+  ['conversation', Conversation as CapabilityConstructor],
+  ['code_analysis', GenerateAnalyze as CapabilityConstructor],
+  ['knowledge_production', GenerateProduce as CapabilityConstructor],
+  ['scan_production', ScanProduce as CapabilityConstructor],
+  ['scan_analyze', ScanAnalyze as CapabilityConstructor],
+  // system_interaction 不再注册：见 RETIRED_CAPABILITY_REASONS。
+  ['evolution_analysis', Evolution as CapabilityConstructor],
+  // relations pipeline explore 阶段的只读能力（L7-P19）；不含 submit/terminal/memory 写入。
+  ['relation_exploration', RelationExploration as CapabilityConstructor],
+]);
 
+export const CapabilityRegistry = {
   create(name: string, opts: Record<string, unknown> = {}): Capability {
-    const Cls = this._registry.get(name);
+    const Cls = CAPABILITIES.get(name);
     if (!Cls) {
       // 未注册的名字一律拒绝，不回退到任何默认能力；撤下的名字附带原因，方便定位误配的 profile。
       const retiredReason = RETIRED_CAPABILITY_REASONS.get(name);
@@ -54,11 +64,8 @@ export const CapabilityRegistry = {
     return new Cls(opts);
   },
 
-  register(name: string, cls: CapabilityConstructor) {
-    this._registry.set(name, cls);
-  },
-
+  /** 已注册的能力名；每次返回新数组，调用方改动返回值不会影响注册表。 */
   get names(): string[] {
-    return [...this._registry.keys()];
+    return [...CAPABILITIES.keys()];
   },
 };
