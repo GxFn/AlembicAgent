@@ -13,7 +13,7 @@
  *
  * supportsEmbedding()：继承基类的 true，含义是「embed 会真实调用已配置的兼容 embedding 端点」，
  * 不代表 DeepSeek 官方提供 embedding；模型注册表中 DeepSeek 模型的 embedding:false 描述的是
- * 官方模型能力，两者口径不同。是否改为仅在显式配置兼容端点时返回 true 属于待决事项③。
+ * 官方模型能力，两者口径不同。事项③已按推荐决定保持现状（L2-P21）：不改为仅在显式配置兼容端点时返回 true。
  */
 
 import Logger from '@alembic/core/logging';
@@ -37,11 +37,6 @@ export class DeepSeekProvider extends AiProvider {
     this._transportExtras = settings.transportExtras;
     this._maxConcurrencySource = settings.concurrencySource;
     this.logger = Logger.getInstance() as unknown as AiLogger;
-  }
-
-  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
-  get supportsNativeToolCalling() {
-    return true;
   }
 
   async chat(prompt: string, context: ChatContext = {}) {

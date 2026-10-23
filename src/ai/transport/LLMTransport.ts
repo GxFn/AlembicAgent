@@ -31,7 +31,6 @@ import {
   throwIfLlmCancelled,
 } from '../errors.js';
 import type { ProviderId } from '../registry/ModelDefs.js';
-import { parseSchemaOutput, prepareStructuredValidation } from '../shared/schemaValidation.js';
 
 // ─── 代理 dispatcher 缓存 ────────────────────────────────
 //
@@ -427,9 +426,13 @@ export abstract class LLMTransport {
     this.timeout = config.timeout ?? 120_000;
   }
 
+  /**
+   * Transport 唯一的生成入口。Transport 级 chat / chatStructured 已删除（L2-P22）：它们在仓内与宿主
+   * 都没有生产调用方，且各家语义已分叉（DeepSeek 剥离 tools，其余原样转发；无 schema 时直接 JSON.parse）。
+   * 文本对话取 `(await transport.chatWithTools(request)).text`；结构化输出与本地 schema 校验经
+   * LLMGateway.chatStructured（生产链路 AiProvider → LLMGateway → Transport）。
+   */
   abstract chatWithTools(request: TransportRequest): Promise<TransportResponse>;
-
-  abstract chat(request: TransportRequest): Promise<string>;
 
   /** 单次 embedding HTTP 尝试的上限；Gateway 据此把重试限定在未完成批次。 */
   get maxEmbeddingBatchSize(): number {
@@ -440,35 +443,6 @@ export abstract class LLMTransport {
   async embed(_texts: string[], opts: LlmCallOptions = {}): Promise<number[][]> {
     throwIfLlmCancelled(opts.abortSignal);
     return [];
-  }
-
-  /** 带 JSON 格式约束的 chat */
-  async chatStructured(request: TransportRequest): Promise<unknown> {
-    throwIfLlmCancelled(request.abortSignal);
-    const validate = prepareStructuredValidation(request.schema, (_level, message) =>
-      Logger.getInstance().warn(message)
-    );
-    if (!validate) {
-      return null;
-    }
-    const text = await this.chat({ ...request, responseFormat: 'json' });
-    if (!text) {
-      return null;
-    }
-    if (request.schema !== undefined) {
-      return parseSchemaOutput(text, validate, (_level, message) =>
-        Logger.getInstance().warn(message)
-      );
-    }
-    try {
-      const value: unknown = JSON.parse(text);
-      return validate(value) ? value : null;
-    } catch (err: unknown) {
-      Logger.getInstance().warn(
-        `[structured-output] parse_failed provider=${this.providerId} kind=${err instanceof SyntaxError ? 'invalid_json' : 'validation_error'}; result rejected`
-      );
-      return null;
-    }
   }
 
   // ─── Shared HTTP utilities ──────────────────────────────

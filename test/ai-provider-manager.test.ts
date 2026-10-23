@@ -47,7 +47,8 @@ describe('AiProviderManager usage ownership', () => {
       managedHook?.(usage);
     };
     initial._onTokenUsage = decorated;
-    manager.setEmbedProvider(initial);
+    // 重复绑定同一实例（切回自身）不能叠加 managed hook，也不能覆盖宿主装饰器。
+    manager.switchProvider(initial);
     manager.switchProvider(initial);
     const usage = { inputTokens: 2, outputTokens: 3, totalTokens: 5 };
     initial._onTokenUsage?.(usage);
@@ -115,27 +116,27 @@ describe('AiProviderManager usage ownership', () => {
     ]);
   });
 
-  it('tracks emitted embedding usage and does not stack hooks when providers are reused', () => {
+  // L2-P21：embedding 兼容槽已删除，独立 embedding 由宿主经 Core EmbeddingPort 管理；
+  // Manager 只为路由过的 provider 绑定计量，响应里的 model/source 仍优先于绑定时的身份快照。
+  it('tracks emitted embed usage of a routed provider and does not stack hooks when providers are reused', () => {
     const initial = provider('initial');
-    const embedding = provider('embedding');
     const original = vi.fn();
     initial._onTokenUsage = original;
     const manager = new AiProviderManager(initial);
     const record = vi.fn();
     manager.setTokenRecorder({ record });
-    manager.setEmbedProvider(embedding);
     const usage = { inputTokens: 2, outputTokens: 3, totalTokens: 5 };
     initial._onTokenUsage?.(usage);
-    embedding._onTokenUsage?.({ ...usage, source: 'embed', model: 'actual-embedding' });
+    initial._onTokenUsage?.({ ...usage, source: 'embed', model: 'actual-embedding' });
     manager.switchProvider(provider('next'));
     manager.switchProvider(initial);
     manager.setTokenRecorder({ record });
     initial._onTokenUsage?.(usage);
-    embedding._onTokenUsage?.({ ...usage, source: 'embed', model: 'actual-embedding' });
-    expect(original).toHaveBeenCalledTimes(2);
+    initial._onTokenUsage?.({ ...usage, source: 'embed', model: 'actual-embedding' });
+    expect(original).toHaveBeenCalledTimes(4);
     expect(record).toHaveBeenCalledTimes(4);
     expect(record.mock.calls[1][0]).toMatchObject({
-      provider: 'embedding',
+      provider: 'initial',
       model: 'actual-embedding',
       source: 'embed',
     });
@@ -172,23 +173,15 @@ describe('AiProviderManager usage ownership', () => {
 });
 
 describe('AiProviderManager routing lifecycle', () => {
-  it('keeps an explicitly configured embedding instance across LLM switches', () => {
-    const embedding = provider('fixed-qwen-embedding');
+  // L2-P21：_bindDiSync 回调收为单参数，只同步路由 provider；不再附带 embedding 兼容槽。
+  it('synchronizes only the routed provider through the single-argument DI hook', () => {
     const manager = new AiProviderManager(provider('first-llm'));
-    manager.setEmbedProvider(embedding);
     const sync = vi.fn();
     manager._bindDiSync(sync);
-    manager.switchProvider(provider('second-llm'));
-    expect(manager.embedProvider).toBe(embedding);
-    expect(manager.rawEmbedProvider).toBe(embedding);
-    expect(sync).toHaveBeenCalledWith(manager.provider, embedding);
-  });
-
-  it('leaves embedding unavailable when only an LLM provider is configured', () => {
-    const manager = new AiProviderManager(provider('llm-only'));
-    expect(manager.embedProvider).toBeNull();
-    manager.switchProvider(provider('another-llm'));
-    expect(manager.embedProvider).toBeNull();
+    const next = provider('second-llm');
+    manager.switchProvider(next);
+    expect(manager.provider).toBe(next);
+    expect(sync.mock.calls).toEqual([[next]]);
   });
 
   it('observes an asynchronous capability rejection and requires repair of the synchronous contract', async () => {
@@ -305,23 +298,17 @@ describe('AiProviderManager routing lifecycle', () => {
     const manager = new AiProviderManager(initial);
     const failures: string[] = [];
     manager.onSwitch(() => {
-      for (const change of [
-        () => manager.switchProvider(provider('nested')),
-        () => manager.setEmbedProvider(provider('nested-embedding')),
-      ]) {
-        try {
-          change();
-        } catch (err: unknown) {
-          failures.push((err as { code: string }).code);
-        }
+      try {
+        manager.switchProvider(provider('nested'));
+      } catch (err: unknown) {
+        failures.push((err as { code: string }).code);
       }
     });
     expect(manager.switchProvider(next).current.name).toBe('next');
     expect(manager.provider).toBe(next);
-    expect(manager.rawEmbedProvider).toBeNull();
-    expect(failures).toEqual(['AI_PROVIDER_SWITCH_IN_PROGRESS', 'AI_PROVIDER_SWITCH_IN_PROGRESS']);
-    manager.setEmbedProvider(provider('standalone-embedding'));
-    expect(manager.embedProvider?.name).toBe('standalone-embedding');
+    expect(failures).toEqual(['AI_PROVIDER_SWITCH_IN_PROGRESS']);
+    // 守卫在提交后释放：下一次切换照常生效。
+    expect(manager.switchProvider(provider('after-guard')).current.name).toBe('after-guard');
   });
 
   it.each([
@@ -329,20 +316,18 @@ describe('AiProviderManager routing lifecycle', () => {
     'invalidate',
   ] as const)('restores routing after %s fails without publishing a success event', (phase) => {
     const initial = provider('initial');
-    const embedding = provider('embedding');
     const next = provider('next');
     const originalUsage = vi.fn();
     next._onTokenUsage = originalUsage;
     const manager = new AiProviderManager(initial);
-    manager.setEmbedProvider(embedding);
     let hostProvider = initial;
-    let hostEmbedding: ManagedAiProvider | null = embedding;
+    const synced: ManagedAiProvider[] = [];
     let cached: object | null = { provider: initial };
     const events = vi.fn();
     manager.onSwitch(events);
-    manager._bindDiSync((p, e) => {
+    manager._bindDiSync((p) => {
       hostProvider = p;
-      hostEmbedding = e;
+      synced.push(p);
       if (phase === 'sync' && p === next) {
         throw new Error('fixture sync failure');
       }
@@ -356,9 +341,9 @@ describe('AiProviderManager routing lifecycle', () => {
 
     expect(() => manager.switchProvider(next)).toThrow();
     expect(manager.provider).toBe(initial);
-    expect(manager.rawEmbedProvider).toBe(embedding);
     expect(hostProvider).toBe(initial);
-    expect(hostEmbedding).toBe(embedding);
+    // 发布新路由后一次同步，失败补偿再以旧引用同步一次。
+    expect(synced).toEqual([next, initial]);
     expect(next._onTokenUsage).toBe(originalUsage);
     expect(events).not.toHaveBeenCalled();
     expect(manager.isReady).toBe(true);
@@ -391,14 +376,12 @@ describe('AiProviderManager routing lifecycle', () => {
     expect(manager.isReady).toBe(true);
   });
 
-  it('keeps the old provider and embedding when candidate preparation fails', () => {
+  it('keeps the old provider when candidate preparation fails', () => {
     const initial = provider('initial');
-    const embedding = provider('embedding');
     const next = provider('next');
     const originalUsage = vi.fn();
     next._onTokenUsage = originalUsage;
     const manager = new AiProviderManager(initial);
-    manager.setEmbedProvider(embedding);
     const sync = vi.fn();
     const clear = vi.fn(() => ['search']);
     const listener = vi.fn();
@@ -411,7 +394,6 @@ describe('AiProviderManager routing lifecycle', () => {
 
     expect(() => manager.switchProvider(next)).toThrow();
     expect(manager.provider).toBe(initial);
-    expect(manager.rawEmbedProvider).toBe(embedding);
     expect(next._onTokenUsage).toBe(originalUsage);
     expect(sync).not.toHaveBeenCalled();
     expect(clear).not.toHaveBeenCalled();

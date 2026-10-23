@@ -1,3 +1,4 @@
+import Logger from '@alembic/core/logging';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ClaudeProvider,
@@ -83,12 +84,75 @@ describe('AiFactory fallback selection', () => {
       }
     });
 
+    const info = vi.spyOn(Logger.getInstance(), 'info');
     const provider = await getProviderWithFallback();
     expect(probeFailure).toMatchObject({ status, code: 'LLM_API_ERROR' });
     expect((probeFailure as Error).message).not.toContain('fixture-private-region-detail');
     expect(provider?.name).toBe(providerName);
-    expect(provider?._fallbackFrom).toBe(providerName === 'openai' ? 'google' : undefined);
+    // L2-P21：fallback 来源不再写入 provider 实例的 _fallbackFrom 字段，只经诊断日志记录。
+    expect(provider ? Object.hasOwn(provider, '_fallbackFrom') : false).toBe(false);
+    const selected = info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('fallback_selected'));
+    expect(selected).toEqual(
+      providerName === 'openai'
+        ? [
+            '[AiFactory] fallback_selected provider=openai fallbackFrom=google reason=provider_restriction',
+          ]
+        : []
+    );
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  // L2-P21 W1：probe 解析为 false（例如空文本应答）表示主 provider 此刻不可用，进入已配置的
+  // fallback 链并记诊断；旧实现忽略 probe 返回值，带着不可用的主 provider 返回。
+  it('selects the configured fallback and records a diagnostic when the primary probe resolves false', async () => {
+    process.env.ALEMBIC_AI_PROVIDER = 'google';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'fixture-google';
+    process.env.ALEMBIC_OPENAI_API_KEY = 'fixture-openai';
+    const probe = vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockResolvedValue(false);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+    const info = vi.spyOn(Logger.getInstance(), 'info');
+
+    const provider = await getProviderWithFallback();
+
+    expect(probe).toHaveBeenCalledOnce();
+    expect(provider?.name).toBe('openai');
+    expect(
+      warn.mock.calls.map(([message]) => String(message)).filter((m) => m.includes('probe'))
+    ).toEqual([
+      '[AiFactory] primary_probe_unavailable provider=google result=false; selecting configured fallback',
+    ]);
+    expect(
+      info.mock.calls
+        .map(([message]) => String(message))
+        .filter((m) => m.includes('fallback_selected'))
+    ).toEqual([
+      '[AiFactory] fallback_selected provider=openai fallbackFrom=google reason=probe_unavailable',
+    ]);
+  });
+
+  it('keeps the primary provider when its probe resolves true', async () => {
+    process.env.ALEMBIC_AI_PROVIDER = 'google';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'fixture-google';
+    process.env.ALEMBIC_OPENAI_API_KEY = 'fixture-openai';
+    vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockResolvedValue(true);
+    await expect(getProviderWithFallback()).resolves.toMatchObject({ name: 'google' });
+  });
+
+  it('keeps the primary provider and warns when probe resolves false without any configured fallback', async () => {
+    process.env.ALEMBIC_AI_PROVIDER = 'google';
+    process.env.ALEMBIC_GOOGLE_API_KEY = 'fixture-google';
+    vi.spyOn(GoogleGeminiProvider.prototype, 'probe').mockResolvedValue(false);
+    const warn = vi.spyOn(Logger.getInstance(), 'warn');
+
+    await expect(getProviderWithFallback()).resolves.toMatchObject({ name: 'google' });
+    expect(warn.mock.calls.map(([message]) => String(message))).toEqual(
+      expect.arrayContaining([
+        '[AiFactory] primary_probe_unavailable provider=google result=false; selecting configured fallback',
+        '[AiFactory] No fallback providers available. Primary: google',
+      ])
+    );
   });
 
   it.each([

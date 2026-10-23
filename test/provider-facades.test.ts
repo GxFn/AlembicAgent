@@ -101,18 +101,14 @@ describe('AI provider facade lifecycle and configuration', () => {
     expect(new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 }).maxRetries).toBe(0);
   });
 
-  it.each([
-    'probe',
-    'summarize',
-  ] as const)('forwards cancellation through %s', async (operation) => {
+  it('forwards cancellation through probe', async () => {
     const fetchMock = mockFetch({}, { choices: [{ index: 0, message: { content: '{}' } }] });
     const controller = new AbortController();
     controller.abort(new Error('caller cancelled'));
     const provider = new OpenAiProvider({ apiKey: 'test-key', maxRetries: 0 });
-    const options = { abortSignal: controller.signal };
-    await expect(
-      operation === 'probe' ? provider.probe(options) : provider.summarize('code', options)
-    ).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(provider.probe({ abortSignal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -764,7 +760,9 @@ describe('provider degrade diagnostics', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('warns once when the default chatWithTools degrades to text-only chat', async () => {
+  // L2-P21（事项②按推荐批准）：AiProvider 不支持只实现 chat() 的外部子类。基类 chatWithTools
+  // 不再降级为纯文本 chat()（旧降级会静默丢弃工具声明与 role='tool' 消息），而是每次显式拒绝并记诊断。
+  it('rejects an un-overridden chatWithTools with must override and never calls chat()', async () => {
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const provider = new TextOnlyProvider();
     const opts = {
@@ -783,17 +781,39 @@ describe('provider degrade diagnostics', () => {
       ],
     };
 
-    const first = await provider.chatWithTools('inspect', opts);
-    const second = await provider.chatWithTools('inspect', opts);
-
-    // 降级结果语义不变（语义修正属于待决事项②），这里只锁定诊断。
-    expect(first).toEqual({ text: 'text-only answer', functionCalls: null });
-    expect(second).toEqual({ text: 'text-only answer', functionCalls: null });
-    const degradeWarnings = warn.mock.calls.filter(([message]) =>
-      String(message).includes('chatWithTools_text_degrade')
-    );
-    expect(degradeWarnings).toEqual([
-      ['[custom-text] chatWithTools_text_degrade tools=2 dropped_tool_messages=1'],
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const failure = await provider.chatWithTools('inspect', opts).catch((err: unknown) => err);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe('custom-text must override chatWithTools');
+    }
+    expect(provider.chatCalls).toEqual([]);
+    const diagnostics = warn.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('chatWithTools_not_overridden'));
+    expect(diagnostics).toEqual([
+      '[custom-text] chatWithTools_not_overridden tools=2 messages=3; rejected without calling chat()',
+      '[custom-text] chatWithTools_not_overridden tools=2 messages=3; rejected without calling chat()',
     ]);
+    // 旧降级诊断与旧降级结果都不应再出现。
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('chatWithTools_text_degrade');
+  });
+
+  it('rejects an un-overridden chatWithTools without options in the same way', async () => {
+    vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
+    const provider = new TextOnlyProvider();
+    await expect(provider.chatWithTools('inspect')).rejects.toThrow(
+      'custom-text must override chatWithTools'
+    );
+    expect(provider.chatCalls).toEqual([]);
+  });
+
+  it.each(
+    [OpenAiProvider, GoogleGeminiProvider, DeepSeekProvider, ClaudeProvider, OllamaProvider].map(
+      (Provider) => ({ name: Provider.name, Provider })
+    )
+  )('$name keeps its own native chatWithTools override', ({ Provider }) => {
+    // 5 个内置 provider 都必须覆写 chatWithTools（经 Gateway 走原生函数调用），不落到基类拒绝路径。
+    expect(Object.hasOwn(Provider.prototype, 'chatWithTools')).toBe(true);
+    expect(Provider.prototype.chatWithTools).not.toBe(AiProvider.prototype.chatWithTools);
   });
 });

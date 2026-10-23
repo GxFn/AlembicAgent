@@ -24,10 +24,6 @@ export class ClaudeTransport extends LLMTransport {
     });
   }
 
-  async chat(request: TransportRequest): Promise<string> {
-    return (await this.chatWithTools(request)).text || '';
-  }
-
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {
     this.requireApiKey('Claude');
     // 保留 none 时完全不声明工具的合同，不把禁用列表交给 SDK 再解释。

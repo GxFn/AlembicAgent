@@ -1,10 +1,7 @@
-/** AI 输入/输出的底层合同；不依赖 Provider、Gateway 或 Transport。 */
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
-/** Loose JSON record for external API responses (inherently untyped) */
-// biome-ignore lint: API responses are dynamic JSON
-export type ApiResponse = Record<string, any>;
-/* eslint-enable @typescript-eslint/no-explicit-any */
+/**
+ * AI 输入/输出的底层合同；不依赖 Provider、Gateway 或 Transport。
+ * 未归一的厂商响应体只在 transport 层出现，这里不提供宽松的响应类型（L2-P21 已删除）。
+ */
 
 /** AI provider 构造配置 */
 export interface AiProviderConfig {
@@ -175,21 +172,6 @@ export interface EmbeddingCapacityHint {
 // prompt builders) was deleted under the Train B DCR default-delete lineage: its
 // last caller, the Alembic resident alembic_enrich_candidates surface, was
 // removed in the pB1 DCR commit and a fresh five-repo scan found zero consumers.
-
-/** 文件内容条目（用于语言检测） */
-export interface FileContentEntry {
-  name?: string;
-  [key: string]: unknown;
-}
-
-/** 语言 profile */
-export interface LanguageProfile {
-  primaryLanguage: string;
-  role: string;
-  patternExamples: string;
-  extractionExamples: string;
-  categories: string;
-}
 
 /** Logger 接口 — 兼容 winston.Logger 实例 */
 export interface AiLogger {

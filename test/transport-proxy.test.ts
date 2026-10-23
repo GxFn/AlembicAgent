@@ -120,11 +120,13 @@ describe('LLMTransport proxy fetch wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const transport = new OpenAiTransport({ apiKey: 'k' });
-    const text = await transport.chat({
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 16,
-    });
+    const text = (
+      await transport.chatWithTools({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 16,
+      })
+    ).text;
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(capturedInit?.dispatcher).toBeDefined();
@@ -140,11 +142,13 @@ describe('LLMTransport proxy fetch wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const transport = new OpenAiTransport({ apiKey: 'k' });
-    const text = await transport.chat({
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 16,
-    });
+    const text = (
+      await transport.chatWithTools({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 16,
+      })
+    ).text;
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(capturedInit?.dispatcher).toBeUndefined();
@@ -167,10 +171,11 @@ describe('LLMTransport proxy fetch wiring', () => {
     const transport = new OpenAiTransport({ apiKey: 'k' });
     const request = { model: 'gpt-4o', messages: [{ role: 'user' as const, content: 'hi' }] };
 
-    expect(await Promise.all([transport.chat(request), transport.chat(request)])).toEqual([
-      'via-proxy',
-      'via-proxy',
+    const texts = await Promise.all([
+      transport.chatWithTools(request).then((result) => result.text),
+      transport.chatWithTools(request).then((result) => result.text),
     ]);
+    expect(texts).toEqual(['via-proxy', 'via-proxy']);
     expect(dispatchers[0]).toBeDefined();
     expect(dispatchers[1]).toBe(dispatchers[0]);
     expect(closedAtFetch).toEqual([false, false]);
@@ -232,7 +237,7 @@ describe('LLMTransport proxy fetch wiring', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
     const pending = Array.from({ length: 9 }, (_, index) =>
-      new FixedProxyTransport(index).chat({
+      new FixedProxyTransport(index).chatWithTools({
         model: 'gpt-4o',
         messages: [{ role: 'user', content: 'hi' }],
         ...(index === 0 ? { abortSignal: cancelled.signal } : {}),
@@ -288,7 +293,7 @@ describe('LLMTransport proxy fetch wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
     const transport = new FreshTransport({ apiKey: 'k' });
     const request = { model: 'gpt-4o', messages: [{ role: 'user' as const, content: 'hi' }] };
-    const pending = transport.chat(request).catch((error: unknown) => error);
+    const pending = transport.chatWithTools(request).catch((error: unknown) => error);
     try {
       await entered.promise;
       freshCache.clear();
@@ -298,7 +303,7 @@ describe('LLMTransport proxy fetch wiring', () => {
       expect(createDispatcher).not.toHaveBeenCalled();
       expect(fetchMock).not.toHaveBeenCalled();
 
-      expect(await transport.chat(request)).toBe('fresh request');
+      expect((await transport.chatWithTools(request)).text).toBe('fresh request');
       expect(createDispatcher).toHaveBeenCalledOnce();
       expect(fetchMock).toHaveBeenCalledOnce();
       expect(freshCache.size()).toBe(1);
@@ -375,8 +380,13 @@ describe('LLMTransport NO_PROXY and provider-level direct routing', () => {
     return calls;
   }
 
-  async function chatOnce(transport: OpenAiTransport): Promise<string> {
-    return transport.chat({ model: 'fixture-model', messages: [{ role: 'user', content: 'hi' }] });
+  // Transport 级 chat 已删除（L2-P22）：经 chatWithTools 走同一条 SDK→fetchWithProxy 链路，取其文本。
+  async function chatOnce(transport: OpenAiTransport): Promise<string | null> {
+    const result = await transport.chatWithTools({
+      model: 'fixture-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    return result.text;
   }
 
   function fetchDirect(transport: OpenAiTransport, url: string | URL | Request): Promise<Response> {

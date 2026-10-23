@@ -197,10 +197,6 @@
     }
   },
   "fields": {
-    "_fallbackFrom": {
-      "owner": "src/ai/management/contracts.ts",
-      "purpose": "provider 实例字段：自动回退时记录原 provider 名。"
-    },
     "_meta": {
       "owner": "src/tools/kernel/registry.ts",
       "purpose": "ToolResult 的结果元信息（状态、缓存、降级与诊断），对模型不可见。"

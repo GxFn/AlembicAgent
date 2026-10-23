@@ -38,11 +38,6 @@ export class OllamaProvider extends AiProvider {
     this.embedModel = settings.embedModel;
   }
 
-  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
-  get supportsNativeToolCalling() {
-    return true;
-  }
-
   async chat(prompt: string, context: ChatContext = {}) {
     return this._gatewayChat(prompt, context);
   }

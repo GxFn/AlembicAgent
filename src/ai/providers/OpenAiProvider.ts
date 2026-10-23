@@ -36,11 +36,6 @@ export class OpenAiProvider extends AiProvider {
     this.embedModel = settings.embedModel;
   }
 
-  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
-  get supportsNativeToolCalling() {
-    return true;
-  }
-
   // ─── 薄壳委托：协议与横切能力由 gateway + transport 承担 ───────────────
 
   async chat(prompt: string, context: ChatContext = {}): Promise<string> {

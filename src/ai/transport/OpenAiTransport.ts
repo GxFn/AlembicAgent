@@ -36,10 +36,6 @@ export class OpenAiTransport extends LLMTransport {
     });
   }
 
-  async chat(request: TransportRequest): Promise<string> {
-    return (await this.chatWithTools(request)).text || '';
-  }
-
   override get maxEmbeddingBatchSize(): number {
     // 显式兼容 embedding 也必须遵守固定版本 SDK 的单批容量；调度/重试仍由 Gateway 拥有。
     const limit = this.#client.embeddingModel(this.#embedModel).maxEmbeddingsPerCall;

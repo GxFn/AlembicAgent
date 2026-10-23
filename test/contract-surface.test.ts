@@ -13,6 +13,7 @@ import * as toolPipelineEntry from '../src/agent/runtime/ToolExecutionPipeline.j
 import * as toolPipelineObservations from '../src/agent/runtime/toolPipeline/observations.js';
 import * as service from '../src/agent/service/index.js';
 import * as tasks from '../src/agent/tasks/index.js';
+import * as aiEntry from '../src/ai/index.js';
 import { PROVIDER_CONFIGS } from '../src/ai/registry/ProviderConfig.js';
 import * as evaluationEntry from '../src/evaluation.js';
 import * as agentRoot from '../src/index.js';
@@ -173,11 +174,14 @@ describe('explicit AlembicAgent contract subpaths', () => {
       owner: 'agent-ai-boundary',
       forbiddenOwner: 'tool-system',
     });
+    // L2-P21 删除宽松的 ApiResponse 公开类型后，未归一的厂商响应体只在 transport 层出现；
+    // 清单字段结构不变，只更新访问点与说明。
     expect(responsibility.apiResponseBoundary).toMatchObject({
       owner: 'transport-private',
       forbiddenOwner: 'agent-runtime',
-      allowedAccessRefs: ['src/ai/AiProvider.ts'],
+      allowedAccessRefs: ['src/ai/transport/LLMTransport.ts', 'src/ai/transport/sdkProtocol.ts'],
     });
+    expect(responsibility.apiResponseBoundary.summary).not.toMatch(/ApiResponse typing/);
   });
 
   it('describes the frozen tool-v2 area as the single unified tool runtime', () => {
@@ -1529,7 +1533,7 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     );
   });
 
-  it('records 419 runtime bindings across the 15 stable package exports', () => {
+  it('records 415 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
@@ -1538,8 +1542,9 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）；
     // W2a-03 从 `.` 与 `./tools/runtime` 各撤回 System、ScanAnalyze（435 → 431）；
     // W2a-06 撤回 `.`/`./agent` 的 FanOutStrategy 与 `./evaluation` 的两个 durable 运行时绑定（431 → 427）；
-    // W2a-09 撤回 `.` 3 个、`./context` 2 个、`./memory` 1 个、`./prompts` 2 个上下文与提示绑定（427 → 419）。
-    expect(total).toBe(419);
+    // W2a-09 撤回 `.` 3 个、`./context` 2 个、`./memory` 1 个、`./prompts` 2 个上下文与提示绑定（427 → 419）；
+    // W2a-11 撤回 `.` 与 `./ai` 的 getLLMGateway、resetLLMGateway（419 → 415）。
+    expect(total).toBe(415);
   });
 
   it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
@@ -1617,8 +1622,9 @@ describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L
     expect(runtimeKind(exported.UnifiedToolCatalog)).toBe('class');
     const expected = snapshotEntries('.');
     // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）；W2a-06 撤回 FanOutStrategy（150 → 149）；
-    // W2a-09 撤回 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings（149 → 146）。
-    expect(expected.exportCount).toBe(146);
+    // W2a-09 撤回 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings（149 → 146）；
+    // W2a-11 撤回 getLLMGateway、resetLLMGateway（146 → 144）。
+    expect(expected.exportCount).toBe(144);
     const snapshotNames = expected.entries.map((entry) => entry.name);
     for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
       expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
@@ -1784,8 +1790,9 @@ function sortedEntries(moduleExports: Record<string, unknown>): SignatureEntry[]
 describe('toolset and search cache narrowing (W2a-03 / L4-P33)', () => {
   it('withdraws System and ScanAnalyze from both entries and matches the snapshot', () => {
     const subpaths = [
-      // W2a-06 再撤回 FanOutStrategy（150 → 149）；W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）。
-      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 146 },
+      // W2a-06 再撤回 FanOutStrategy（150 → 149）；W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）；
+      // W2a-11 再撤回 Gateway 单例的两个函数（146 → 144）。
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 144 },
       {
         exportPath: './tools/runtime',
         moduleExports: toolsRuntime as Record<string, unknown>,
@@ -1937,8 +1944,8 @@ describe('profile compilation and strategy declaration narrowing (W2a-06 / L8-P0
       {
         exportPath: '.',
         moduleExports: agentRoot as Record<string, unknown>,
-        // W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）。
-        count: 146,
+        // W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）；W2a-11 再撤回 Gateway 单例（146 → 144）。
+        count: 144,
         withdrawn: ['FanOutStrategy'],
       },
       {
@@ -2136,7 +2143,8 @@ describe('context, prompts and conversation store narrowing (W2a-09 / L6-P25, L6
     const contextEntry = (await import('../src/agent/context/index.js')) as Record<string, unknown>;
     const memoryEntry = (await import('../src/agent/memory/index.js')) as Record<string, unknown>;
     const subpaths = [
-      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 146 },
+      // W2a-11 再撤回 getLLMGateway、resetLLMGateway（146 → 144）。
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 144 },
       { exportPath: './context', moduleExports: contextEntry, count: 19 },
       { exportPath: './memory', moduleExports: memoryEntry, count: 13 },
       { exportPath: './prompts', moduleExports: prompts as Record<string, unknown>, count: 28 },
@@ -2298,5 +2306,174 @@ describe('context, prompts and conversation store narrowing (W2a-09 / L6-P25, L6
       "Object literal may only specify known properties, and 'signalBus' does not exist in type 'BudgetInput'.",
     ]);
     expect(diagnostics['__w2a09-retained.probe.ts']).toEqual([]);
+  }, 120000);
+});
+
+/* ── W2a-11：AI provider 与 transport 收窄（L2-P21、L2-P22） ──────────────────────────────────────
+ * 用户 2026-10-20 按推荐批准事项②③。删除的运行时绑定：`.`/`./ai` 的 getLLMGateway、resetLLMGateway
+ * （共享 Gateway 模块级单例）；纯类型 ApiResponse、FileContentEntry、LanguageProfile（`.`、`./ai`）；成员：
+ * AiProvider 与 5 个内置 provider 的 supportsNativeToolCalling，AiProvider 的 summarize、summarizeMaxTokens、
+ * _detectLanguageProfile、_fallbackFrom，LLMGateway 的 probe、resolveWithFallback、getModelDef，
+ * ManagedAiProvider 的 apiKey、_fallbackFrom，AiProviderManager 的 embedding 兼容槽（_bindDiSync 回调收为单参数），
+ * LLMTransport 与 4 个 transport 的 chat、chatStructured。签名：`.` 146→144、`./ai` 28→26，总数 419→415，出口 15。
+ */
+
+const WITHDRAWN_W2A11_BINDINGS = ['getLLMGateway', 'resetLLMGateway'] as const;
+
+describe('AI provider and transport narrowing (W2a-11 / L2-P21, L2-P22)', () => {
+  it('withdraws the Gateway singleton functions from `.` and `./ai` and matches the snapshot', () => {
+    const subpaths = [
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 144 },
+      { exportPath: './ai', moduleExports: aiEntry as Record<string, unknown>, count: 26 },
+    ] as const;
+    for (const { exportPath, moduleExports, count } of subpaths) {
+      const expected = snapshotEntries(exportPath);
+      expect({ exportPath, exportCount: expected.exportCount }).toEqual({
+        exportPath,
+        exportCount: count,
+      });
+      const snapshotNames = expected.entries.map((entry) => entry.name);
+      for (const name of WITHDRAWN_W2A11_BINDINGS) {
+        expect({ exportPath, name, exported: name in moduleExports }).toEqual({
+          exportPath,
+          name,
+          exported: false,
+        });
+        expect({ exportPath, name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+          exportPath,
+          name,
+          inSnapshot: false,
+        });
+      }
+      const entries = sortedEntries(moduleExports);
+      const expectedSorted = [...expected.entries].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+      );
+      expect({ exportPath, entries }).toEqual({ exportPath, entries: expectedSorted });
+      expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+        expected.signatureHash
+      );
+    }
+    // LLMGateway 类与宿主使用的 AI 入口照常公开，种类不变。
+    const ai = aiEntry as Record<string, unknown>;
+    expect(runtimeKind(ai.LLMGateway)).toBe('class');
+    expect(runtimeKind(ai.AiProviderManager)).toBe('class');
+    for (const name of [
+      'createProvider',
+      'getModelRegistry',
+      'autoDetectProvider',
+      'getAiConfigInfo',
+      'getProviderWithFallback',
+    ]) {
+      expect({ name, kind: runtimeKind(ai[name]) }).toEqual({ name, kind: 'function' });
+    }
+  });
+
+  it('narrows the removed types and members while keeping the retained AI surface (compiler probes)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，类型与成员收窄一律用真实编译器判定（一次建 Program）。
+    const providerClasses = [
+      'AiProvider',
+      'OpenAiProvider',
+      'ClaudeProvider',
+      'DeepSeekProvider',
+      'GoogleGeminiProvider',
+      'OllamaProvider',
+    ];
+    const transportClasses = [
+      'LLMTransport',
+      'OpenAiTransport',
+      'ClaudeTransport',
+      'DeepSeekTransport',
+      'GoogleTransport',
+    ];
+    const diagnostics = typecheckRouterContractProbes({
+      '__w2a11-removed-exports.probe.ts': [
+        "import { getLLMGateway as RootGet, resetLLMGateway as RootReset, type ApiResponse as RootApi, type FileContentEntry as RootFile, type LanguageProfile as RootLang } from '../src/index.js';",
+        "import { getLLMGateway as AiGet, resetLLMGateway as AiReset, type ApiResponse as AiApi, type FileContentEntry as AiFile, type LanguageProfile as AiLang } from '../src/ai/index.js';",
+        'export type Removed = [RootApi, RootFile, RootLang, AiApi, AiFile, AiLang];',
+        'export const removed = [RootGet, RootReset, AiGet, AiReset];',
+        '',
+      ].join('\n'),
+      '__w2a11-removed-members.probe.ts': [
+        `import type { ${[...providerClasses, ...transportClasses].join(', ')}, AiProviderManager, LLMGateway, ManagedAiProvider } from '../src/ai/index.js';`,
+        'type Absent<T, K extends PropertyKey> = [Extract<keyof T, K>] extends [never] ? true : false;',
+        `export const providers: [${providerClasses
+          .map(
+            (name) =>
+              `Absent<${name}, 'supportsNativeToolCalling' | 'summarize' | '_detectLanguageProfile' | '_fallbackFrom'>`
+          )
+          .join(', ')}] = [${providerClasses.map(() => 'true').join(', ')}];`,
+        `export const transports: [${transportClasses
+          .map((name) => `Absent<${name}, 'chat' | 'chatStructured'>`)
+          .join(', ')}] = [${transportClasses.map(() => 'true').join(', ')}];`,
+        "export const gateway: Absent<LLMGateway, 'probe' | 'resolveWithFallback' | 'getModelDef'> = true;",
+        "export const manager: Absent<AiProviderManager, 'embedProvider' | 'rawEmbedProvider' | 'setEmbedProvider'> = true;",
+        "export const managed: Absent<ManagedAiProvider, 'apiKey' | '_fallbackFrom'> = true;",
+        "type SyncHook = Parameters<AiProviderManager['_bindDiSync']>[0];",
+        "export const syncArity: Parameters<SyncHook>['length'] extends 1 ? 'single' : 'multi' = 'single';",
+        '',
+      ].join('\n'),
+      // 负对照：protected 的 summarizeMaxTokens 不在 keyof 里，只能经子类访问确认已删除；
+      // ManagedAiProvider 对象字面量再带 apiKey 应报多余属性，而不是被静默接受。
+      '__w2a11-negative.probe.ts': [
+        "import { AiProvider, type ManagedAiProvider } from '../src/ai/index.js';",
+        'export class SummaryBudgetProbe extends AiProvider {',
+        '  read(): number { return this.summarizeMaxTokens; }',
+        '}',
+        "export const managed: ManagedAiProvider = { name: 'probe', model: 'probe-model', apiKey: 'probe' };",
+        '',
+      ].join('\n'),
+      // 正对照：保留项（AiProvider.probe、chatWithStructuredOutput、supportsEmbedding、
+      // LLMGateway.chatStructured、AiProviderManager.isMock 与单参数 _bindDiSync、Transport.chatWithTools、
+      // ModelRegistry 查询 API、宿主使用的工厂入口）照常可用。
+      '__w2a11-retained.probe.ts': [
+        'import {',
+        '  type AiProvider, type AiProviderManager, type LLMGateway, type LLMTransport, type ManagedAiProvider,',
+        '  type ProviderInfo, PROVIDER_CONFIGS, autoDetectProvider, createProvider, getAiConfigInfo,',
+        '  getModelRegistry, getProviderWithFallback,',
+        "} from '../src/ai/index.js';",
+        'declare const provider: AiProvider;',
+        'export const probed: Promise<boolean> = provider.probe();',
+        "export const structured: Promise<unknown> = provider.chatWithStructuredOutput('p');",
+        'export const embedding: boolean = provider.supportsEmbedding();',
+        'declare const gateway: LLMGateway;',
+        "export const gatewayStructured: Promise<unknown> = gateway.chatStructured({ modelRef: 'openai:gpt-4o', prompt: 'p' });",
+        'declare const manager: AiProviderManager;',
+        'export const mock: boolean = manager.isMock;',
+        'manager._bindDiSync((next: ManagedAiProvider) => { void next; });',
+        'declare const transport: LLMTransport;',
+        "export const tools = transport.chatWithTools({ model: 'm', messages: [] });",
+        'const registry = getModelRegistry();',
+        "export const listed = [registry.listByProvider('openai'), registry.listActive(), registry.size];",
+        "export const infoMock: ProviderInfo['isMock'] = false;",
+        'export const host = [createProvider, PROVIDER_CONFIGS, autoDetectProvider, getAiConfigInfo, getProviderWithFallback];',
+        '',
+      ].join('\n'),
+    });
+
+    const missingExports = diagnostics['__w2a11-removed-exports.probe.ts']
+      // 名字与现存导出相近时 TS 会改用 “has no exported member named 'X'. Did you mean …” 的措辞。
+      .map((message) => /has no exported member (?:named )?'([^']+)'/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingExports).toEqual(
+      [
+        'ApiResponse',
+        'ApiResponse',
+        'FileContentEntry',
+        'FileContentEntry',
+        'LanguageProfile',
+        'LanguageProfile',
+        'getLLMGateway',
+        'getLLMGateway',
+        'resetLLMGateway',
+        'resetLLMGateway',
+      ].sort()
+    );
+    expect(diagnostics['__w2a11-removed-members.probe.ts']).toEqual([]);
+    expect(diagnostics['__w2a11-negative.probe.ts']).toEqual([
+      "Property 'summarizeMaxTokens' does not exist on type 'SummaryBudgetProbe'.",
+      "Object literal may only specify known properties, and 'apiKey' does not exist in type 'ManagedAiProvider'.",
+    ]);
+    expect(diagnostics['__w2a11-retained.probe.ts']).toEqual([]);
   }, 120000);
 });

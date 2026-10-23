@@ -2,6 +2,8 @@
  * AiProviderManager — 宿主可注入的 Provider 路由生命周期。
  * 准备生成模型 → 同步 LLM 路由/DI → 失效 LLM 依赖缓存 → 通知；失败仅补偿路由，不能还原缓存。
  * 用量绑定由独立 tracker 持有，旧请求完成时仍按其真实模型归档。
+ * Manager 只管理生成模型路由：独立 embedding 由宿主经 Core EmbeddingPort 装配，旧的 embedding
+ * 兼容槽及其读写入口已在 L2-P21 删除，DI 同步回调只收路由 provider。
  */
 
 import Logger from '@alembic/core/logging';
@@ -30,7 +32,6 @@ export type {
 
 export class AiProviderManager {
   #provider: ManagedAiProvider;
-  #embedProvider: ManagedAiProvider | null = null;
   #listeners = new Set<SwitchListener>();
   #logger = Logger.getInstance();
   #switching = false;
@@ -42,7 +43,7 @@ export class AiProviderManager {
   #clearDependents: (() => string[]) | null = null;
 
   /** DI 数据管道: 切换时同步 singletons 中的 provider 引用（供 DI 工厂函数读取） */
-  #syncToDi: ((provider: ManagedAiProvider, embed: ManagedAiProvider | null) => void) | null = null;
+  #syncToDi: ((provider: ManagedAiProvider) => void) | null = null;
 
   constructor(initialProvider: ManagedAiProvider) {
     this.#providerInfo(initialProvider);
@@ -57,16 +58,6 @@ export class AiProviderManager {
   /** 当前 AI Provider (只读) */
   get provider(): ManagedAiProvider {
     return this.#provider;
-  }
-
-  /** 独立显式配置；缺席时不把生成模型当作 embedding 服务。 */
-  get embedProvider(): ManagedAiProvider | null {
-    return this.#embedProvider;
-  }
-
-  /** 兼容旧读取入口，与 embedProvider 相同。 */
-  get rawEmbedProvider(): ManagedAiProvider | null {
-    return this.#embedProvider;
   }
 
   /** 是否处于 Mock 模式 */
@@ -129,7 +120,6 @@ export class AiProviderManager {
     this.#assertRoutingMutable();
     this.#switching = true;
     const previousProvider = this.#provider;
-    const previousEmbedding = this.#embedProvider;
     const previousRecovery = this.#recoveryRequired;
     // 本次操作使用固定 hooks；回调中重新绑定只影响下一次切换。
     const syncToDi = this.#syncToDi;
@@ -141,17 +131,14 @@ export class AiProviderManager {
     try {
       const previous = this.info;
       const current = this.#providerInfo(newProvider);
-      // 生成模型切换不选择、重建或清空独立 embedding。
-      const embedding = previousEmbedding;
       phase = 'wire';
       undoBindings.push(this.#usageTracker.bind(newProvider));
       this.#provider = newProvider;
-      this.#embedProvider = embedding;
       published = true;
       phase = 'sync';
       if (syncToDi) {
         syncAttempted = true;
-        this.#synchronous(syncToDi(newProvider, embedding), 'sync');
+        this.#synchronous(syncToDi(newProvider), 'sync');
       }
       phase = 'invalidate';
       const clearedSingletons = this.#synchronous(clearDependents?.(), 'invalidate') ?? [];
@@ -186,7 +173,6 @@ export class AiProviderManager {
     } catch (err: unknown) {
       const compensationErrors: unknown[] = [];
       this.#provider = previousProvider;
-      this.#embedProvider = previousEmbedding;
       for (const undo of undoBindings.reverse()) {
         try {
           undo();
@@ -196,7 +182,8 @@ export class AiProviderManager {
       }
       if (syncAttempted && syncToDi) {
         try {
-          this.#synchronous(syncToDi(previousProvider, previousEmbedding), 'compensate');
+          // 补偿只以旧路由 provider 重放一次 DI 同步；宿主回调须允许重复赋值同一引用。
+          this.#synchronous(syncToDi(previousProvider), 'compensate');
         } catch (restoreError: unknown) {
           compensationErrors.push(restoreError);
         }
@@ -273,21 +260,6 @@ export class AiProviderManager {
   }
 
   // ═══════════════════════════════════════════════════════
-  //  Embedding 管理
-  // ═══════════════════════════════════════════════════════
-
-  /** 兼容显式旧配置；新宿主的 embedding 由独立 Core port 管理，不参与 LLM 切换。 */
-  setEmbedProvider(ep: ManagedAiProvider | null): void {
-    this.#assertRoutingMutable();
-    if (ep) {
-      this.#providerInfo(ep);
-      this.#usageTracker.bind(ep);
-    }
-    this.#embedProvider = ep;
-    this.#diagnose('embedding_updated', { provider: ep?.name ?? null }, 'info');
-  }
-
-  // ═══════════════════════════════════════════════════════
   //  AOP: Token 追踪
   // ═══════════════════════════════════════════════════════
 
@@ -317,8 +289,11 @@ export class AiProviderManager {
     this.#clearDependents = fn;
   }
 
-  /** 注入同步 DI 赋值函数；失败补偿可能再次以旧引用调用，须可重复赋值。 */
-  _bindDiSync(fn: (provider: ManagedAiProvider, embed: ManagedAiProvider | null) => void): void {
+  /**
+   * 注入同步 DI 赋值函数；失败补偿可能再次以旧引用调用，须可重复赋值。
+   * 回调只接收路由 provider（L2-P21 收为单参数）；宿主 AiModule 的回调本就只用第一个参数，直接兼容。
+   */
+  _bindDiSync(fn: (provider: ManagedAiProvider) => void): void {
     this.#syncToDi = fn;
   }
 }

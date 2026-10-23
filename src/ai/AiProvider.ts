@@ -4,7 +4,6 @@
  */
 
 import Logger from '@alembic/core/logging';
-import { LanguageService } from '@alembic/core/shared';
 import { observeSafely } from '#shared/observers.js';
 import type {
   AiLogger,
@@ -14,8 +13,6 @@ import type {
   ChatWithToolsResult,
   EmbeddingCapacityHint,
   EmbeddingCapacityHintSource,
-  FileContentEntry,
-  LanguageProfile,
   LlmCallOptions,
   StructuredOutputOptions,
   TokenUsagePayload,
@@ -57,7 +54,6 @@ export class AiProvider {
   model: string;
   name: string;
   timeout: number;
-  _fallbackFrom?: string;
 
   /**
    * Token 用量回调 — 每次 API 调用后触发（包括 chat / chatWithStructuredOutput / chatWithTools）
@@ -73,9 +69,6 @@ export class AiProvider {
    * 熔断、并发闸门与主 Gateway 互相独立——探测失败不计入业务请求的熔断，也不占业务并发槽。
    */
   #probeGateway: LLMGateway | null = null;
-
-  /** 默认 chatWithTools 纯文本降级是否已告警（每实例一次）。 */
-  #textDegradeWarned = false;
 
   /**
    * Provider 特有的 transport 扩展配置（如 apiStyle / reasoningEffort / embedModel）。
@@ -130,27 +123,6 @@ export class AiProvider {
     );
   }
 
-  /** summarize 的 maxTokens 预算；子类可覆写（如 Gemini 用更大的 8192）。 */
-  protected get summarizeMaxTokens(): number {
-    return 4096;
-  }
-
-  /**
-   * 摘要 - 对代码生成结构化摘要 JSON {title, description, language, patterns, keyAPIs}。
-   * 实现对所有 provider 相同（仅 maxTokens 预算可经 summarizeMaxTokens 调整），
-   * 故收敛到基类，子类不再各自复制。
-   */
-  async summarize(code: string, opts: LlmCallOptions = {}): Promise<unknown> {
-    const prompt = `请对以下代码生成结构化摘要，返回 JSON 格式 {title, description, language, patterns: [], keyAPIs: []}:\n\n${code}`;
-    return (
-      (await this.chatWithStructuredOutput(prompt, {
-        temperature: 0.3,
-        maxTokens: this.summarizeMaxTokens,
-        abortSignal: opts.abortSignal,
-      })) || { title: '', description: '' }
-    );
-  }
-
   /** 向量嵌入 - 返回浮点数组 */
   async embed(text: string | string[], opts: LlmCallOptions = {}): Promise<number[] | number[][]> {
     throwIfLlmCancelled(opts.abortSignal);
@@ -167,7 +139,8 @@ export class AiProvider {
    *   Transport 的 runOperation 在信号触发时先确定终态，即使 fetch 不响应 abort 也按期返回。
    * - 直接继承基类、只实现 chat() 的自定义子类没有 Gateway 路由，仍走它自己的 chat()：
    *   重试与用量归子类自己管，期限只能经合成信号协作生效（子类忽略信号时无法强制中断）。
-   * - 失败一律带原因抛出（宿主会把 message 展示给用户），不像 Gateway.probe 那样吞成 false。
+   * - 失败一律带原因抛出（宿主会把 message 展示给用户），不吞成 false；只有连通但应答为空文本时返回 false，
+   *   AiFactory.getProviderWithFallback 据此改用已配置的 fallback provider。
    */
   async probe(opts: LlmCallOptions = {}) {
     const callerSignal = opts.abortSignal;
@@ -235,67 +208,44 @@ export class AiProvider {
   }
 
   /**
-   * 公开能力标记：本 Provider 的 chatWithTools 是否走原生结构化函数调用（非文本解析）。
-   * 当前没有运行时消费者：AgentRuntime 无条件调用 chatWithTools，不读取本 getter；
-   * 文本工具调用兼容解析只存在于 DeepSeekTransport。5 个内置 Provider 均覆写为 true，
-   * 基类默认 false 只对应下方的纯文本降级实现。getter 去留属于待决事项②。
-   */
-  get supportsNativeToolCalling(): boolean {
-    return false;
-  }
-
-  /**
    * 带工具声明的结构化对话 — 原生函数调用 API
    *
    * 5 个内置 Provider 全部覆写此方法，经 _gatewayChatWithTools → LLMGateway → *Transport
-   * 返回结构化 functionCalls。AgentRuntime 不做文本工具调用解析。
+   * 返回结构化 functionCalls。AgentRuntime 无条件调用本方法，不做文本工具调用解析
+   * （文本工具调用兼容只存在于 DeepSeekTransport）。
    *
-   * 默认实现只服务于直接继承基类、只实现 chat() 的自定义子类：降级为纯文本 chat()，
-   * 丢弃 toolSchemas / toolChoice 与 role='tool' 消息，不返回 functionCalls / usage，
-   * 并在每个实例首次降级时 warn `chatWithTools_text_degrade`。降级语义的修正属于待决事项②。
+   * AiProvider 不支持只实现 chat() 的外部子类（L2-P21，用户 2026-10-20 按推荐批准事项②）：
+   * 基类默认实现不再降级为纯文本 chat()——旧降级会静默丢弃 toolSchemas、toolChoice 与 role='tool'
+   * 消息，调用方拿到“模型没有调用工具”的假结果。现在每次调用都先记 warn 诊断
+   * `chatWithTools_not_overridden`（只含工具数与消息数，不含工具名、消息正文或 prompt），
+   * 再抛 `Error('<name> must override chatWithTools')`，且绝不调用 chat()。
+   * 该错误在任何 Gateway 之前抛出，不经过 ReliabilityController，因此不计入熔断，也不会被网关重试。
    *
    * 统一消息格式 (Provider-Agnostic):
    *   - { role: 'user', content: 'text' }
    *   - { role: 'assistant', content: 'text or null', toolCalls: [{id, name, args}] }
    *   - { role: 'tool', toolCallId: 'id', name: 'tool_name', content: 'result string' }
    *
-   * @param prompt 用户消息（内置 Provider 仅在 messages 为空时使用；默认降级实现总会追加它）
+   * @param prompt 用户消息（内置 Provider 仅在 messages 为空时使用）
    * @param opts.messages 统一格式消息历史
    * @param opts.toolSchemas [{name, description, parameters}]
    * @param opts.toolChoice 'auto' | 'required' | 'none'
    * @param [opts.systemPrompt] 系统指令
-   * @returns ChatWithToolsResult：{ text, functionCalls }；默认降级实现的 functionCalls 恒为 null
+   * @returns ChatWithToolsResult：{ text, functionCalls, usage? }（由子类覆写实现返回）
    */
   async chatWithTools(
     prompt: string,
     opts: ChatWithToolsOptions = {}
   ): Promise<ChatWithToolsResult> {
-    // 默认降级: 忽略 tools/toolChoice，走纯文本 chat()
-    const messages = (opts.messages || []) as UnifiedMessage[];
-    if (!this.#textDegradeWarned) {
-      this.#textDegradeWarned = true;
-      // 只记录计数，不记录工具名、消息正文或 prompt；每个实例只记一次，避免 Agent 循环刷屏。
-      const toolCount = Array.isArray(opts.toolSchemas) ? opts.toolSchemas.length : 0;
-      const droppedToolMessages = messages.filter((m) => m.role === 'tool').length;
-      this._log(
-        'warn',
-        `[${this.name}] chatWithTools_text_degrade tools=${toolCount} dropped_tool_messages=${droppedToolMessages}`
-      );
-    }
-    const history = messages
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content || '',
-      }));
-    const text = await this.chat(prompt, {
-      history,
-      systemPrompt: opts.systemPrompt,
-      temperature: opts.temperature,
-      maxTokens: opts.maxTokens,
-      abortSignal: opts.abortSignal,
-    });
-    return { text, functionCalls: null };
+    // prompt 只为保持公开签名：默认实现不读取任何内容，诊断只计数。
+    void prompt;
+    const toolCount = Array.isArray(opts.toolSchemas) ? opts.toolSchemas.length : 0;
+    const messageCount = Array.isArray(opts.messages) ? opts.messages.length : 0;
+    this._log(
+      'warn',
+      `[${this.name}] chatWithTools_not_overridden tools=${toolCount} messages=${messageCount}; rejected without calling chat()`
+    );
+    throw new Error(`${this.name} must override chatWithTools`);
   }
 
   /**
@@ -505,167 +455,6 @@ export class AiProvider {
       // 日志本身失败不能影响已完成的降级结果；这里只能尽力而为，无法再记录到同一个 logger。
       void err;
     }
-  }
-
-  /** 根据文件扩展名检测语言特征，返回提示词适配参数 */
-  _detectLanguageProfile(filesContent: FileContentEntry[]): LanguageProfile {
-    const extCounts: Record<string, number> = {};
-    for (const f of filesContent) {
-      const ext = (f.name || '').split('.').pop()?.toLowerCase() || '';
-      extCounts[ext] = (extCounts[ext] || 0) + 1;
-    }
-
-    // 使用 LanguageService 推断主语言
-    const primaryLang = LanguageService.detectPrimary(extCounts);
-    const dominant =
-      Object.entries(extCounts).sort((a, b) => (b[1] as number) - (a[1] as number))[0]?.[0] || '';
-
-    // iOS/macOS (Swift / Objective-C)
-    if (primaryLang === 'swift' || primaryLang === 'objectivec') {
-      return {
-        primaryLanguage: primaryLang,
-        role: 'Senior iOS/macOS Architect',
-        patternExamples:
-          'how to set up a ViewController, configure a TableView with delegate/datasource, build a login UI, handle network responses',
-        extractionExamples: `Examples of good extractions:
-- Complete \`init\` method with all tabBarItem/navigationItem configuration
-- Complete \`viewDidLoad\` with all setup calls
-- Complete \`setupUI\` method with subview creation and layout
-- Complete UITableViewDataSource implementation
-- Complete action handler method (e.g. loginButtonTapped)`,
-        categories: 'View | Service | Tool | Model | Network | Storage | UI | Utility',
-      };
-    }
-
-    // JavaScript / TypeScript
-    if (primaryLang === 'javascript' || primaryLang === 'typescript') {
-      return {
-        primaryLanguage: primaryLang,
-        role: 'Senior Software Engineer',
-        patternExamples:
-          'Express/Koa middleware, React component patterns, service class with dependency injection, data processing pipeline, error handling wrapper, factory/strategy patterns',
-        extractionExamples: `Examples of good extractions:
-- Complete class with constructor and key methods
-- Express route handler with validation and error handling
-- Utility function with edge case handling
-- React component with hooks and event handlers
-- Service method with retries and fallback logic`,
-        categories: 'Service | Utility | Middleware | Component | Model | Config | Handler | Route',
-      };
-    }
-
-    // Python
-    if (primaryLang === 'python') {
-      return {
-        primaryLanguage: 'python',
-        role: 'Senior Python Engineer',
-        patternExamples:
-          'Django/Flask views, data processing with pandas, async handlers, decorator patterns, class-based services',
-        extractionExamples: `Examples of good extractions:
-- Complete class with __init__ and key methods
-- Decorator factory function
-- API endpoint handler with request validation
-- Data processing pipeline function
-- Context manager implementation`,
-        categories: 'Service | Utility | Model | View | Handler | Middleware | Config | Pipeline',
-      };
-    }
-
-    // Go
-    if (primaryLang === 'go') {
-      return {
-        primaryLanguage: 'go',
-        role: 'Senior Go Engineer',
-        patternExamples:
-          'HTTP handler with middleware, goroutine patterns, interface implementations, struct methods with error handling',
-        extractionExamples: `Examples of good extractions:
-- Complete struct with constructor and methods
-- HTTP handler function with error propagation
-- Middleware function with context usage
-- Interface implementation with all required methods`,
-        categories: 'Service | Handler | Middleware | Model | Utility | Repository | Config',
-      };
-    }
-
-    // Kotlin / Java
-    if (primaryLang === 'kotlin' || primaryLang === 'java') {
-      return {
-        primaryLanguage: primaryLang,
-        role: 'Senior Android/Backend Engineer',
-        patternExamples:
-          'Activity/Fragment lifecycle, repository pattern, ViewModel with LiveData, Retrofit service, dependency injection setup',
-        extractionExamples: `Examples of good extractions:
-- Complete class with constructor and key methods
-- Repository with CRUD operations
-- ViewModel with state management
-- API service interface definition
-- Custom view with measurement and drawing`,
-        categories: 'View | Service | Repository | Model | Network | Storage | UI | Utility',
-      };
-    }
-
-    // Rust
-    if (primaryLang === 'rust') {
-      return {
-        primaryLanguage: 'rust',
-        role: 'Senior Rust Engineer',
-        patternExamples:
-          'trait implementations, error handling with Result, async functions, builder patterns, iterator chains',
-        extractionExamples: `Examples of good extractions:
-- Complete impl block with key methods
-- Trait implementation with all required methods
-- Error type definition with From implementations
-- Builder pattern struct and methods
-- Async function with proper error handling`,
-        categories: 'Service | Trait | Model | Handler | Utility | Config | Error | Pipeline',
-      };
-    }
-
-    // Vue
-    if (dominant === 'vue') {
-      return {
-        primaryLanguage: 'vue',
-        role: 'Senior Frontend Engineer',
-        patternExamples:
-          'Vue component with composition API, composable functions, Vuex/Pinia store modules, router guards',
-        extractionExamples: `Examples of good extractions:
-- Complete Vue component with setup/template
-- Composable function with reactive state
-- Store module with actions and getters
-- Custom directive implementation`,
-        categories: 'Component | Composable | Store | Directive | Service | Utility | Config',
-      };
-    }
-
-    // Ruby
-    if (primaryLang === 'ruby') {
-      return {
-        primaryLanguage: 'ruby',
-        role: 'Senior Ruby Engineer',
-        patternExamples:
-          'Rails controller actions, model concerns, service objects, background jobs, API serializers',
-        extractionExamples: `Examples of good extractions:
-- Complete controller with CRUD actions
-- Service object with call method
-- Model with validations and scopes
-- Concern module with included block`,
-        categories: 'Controller | Service | Model | Concern | Job | Serializer | Utility | Config',
-      };
-    }
-
-    // Default / mixed
-    return {
-      primaryLanguage: dominant || 'unknown',
-      role: 'Senior Software Engineer',
-      patternExamples:
-        'design patterns, service abstractions, data flow handling, error management, configuration setup',
-      extractionExamples: `Examples of good extractions:
-- Complete class/function with full implementation
-- Service method with error handling and retries
-- Configuration setup with all options
-- Data processing pipeline`,
-      categories: 'Service | Utility | Model | Handler | Config | Component | Pipeline',
-    };
   }
 
   // ─── 工具方法 ─────────────────────────────

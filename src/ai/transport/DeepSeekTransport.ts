@@ -86,12 +86,6 @@ export class DeepSeekTransport extends LLMTransport {
     });
   }
 
-  async chat(request: TransportRequest): Promise<string> {
-    return (
-      (await this.chatWithTools({ ...request, tools: undefined, toolChoice: 'none' })).text || ''
-    );
-  }
-
   async chatWithTools(request: TransportRequest): Promise<TransportResponse> {
     this.requireApiKey('DeepSeek');
     const v4Family = resolveDeepSeekV4Family(request.model);

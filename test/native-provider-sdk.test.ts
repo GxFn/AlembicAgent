@@ -1329,7 +1329,10 @@ describe('SDK error normalization diagnostics', () => {
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
 
     await expect(
-      transport.chat({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] })
+      transport.chatWithTools({
+        model: 'deepseek-chat',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
     ).rejects.toMatchObject({ code: 'LLM_INVALID_RESPONSE' });
     const [diagnostic] = diagnostics(warn);
     expect(diagnostic).toContain('provider=deepseek');

@@ -1,8 +1,15 @@
 import Logger from '@alembic/core/logging';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { getLLMGateway, LLMGateway, resetLLMGateway } from '../src/ai/gateway/LLMGateway.js';
+import { LLMGateway } from '../src/ai/gateway/LLMGateway.js';
+import { getModelRegistry } from '../src/ai/registry/ModelRegistry.js';
 import { ClaudeTransport } from '../src/ai/transport/ClaudeTransport.js';
-import { LLMTransport, type TransportRequest } from '../src/ai/transport/LLMTransport.js';
+import { DeepSeekTransport } from '../src/ai/transport/DeepSeekTransport.js';
+import { GoogleTransport } from '../src/ai/transport/GoogleTransport.js';
+import {
+  LLMTransport,
+  type TransportRequest,
+  type TransportResponse,
+} from '../src/ai/transport/LLMTransport.js';
 import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { jsonResponse } from './helpers/mockFetch.js';
 
@@ -55,6 +62,8 @@ describe('LLMGateway horizontal capabilities', () => {
   });
 
   // Main 不再维护第二套 SDK/transport 单测；保留原有独特合同到其实现仓库。
+  // getModelDef 已删除（L2-P21）：#resolveModel 的前缀、裸名与未注册回落路由改由实际选中的
+  // Transport 身份与发往它的 API model id 证明；各 Transport 的 chatWithTools 被截获，不发网络请求。
   it.each([
     ['openai:gpt-5.5', 'openai', 'gpt-5.5'],
     ['claude:claude-sonnet-4-6', 'claude', 'claude-sonnet-4-6'],
@@ -64,8 +73,36 @@ describe('LLMGateway horizontal capabilities', () => {
     ['claude-sonnet-4-6', 'claude', 'claude-sonnet-4-6'],
     ['openai:custom-model', 'openai', 'custom-model'],
     ['custom-unregistered', 'openai', 'custom-unregistered'],
-  ])('resolves %s without a network request', (modelRef, provider, apiModelId) => {
-    expect(new LLMGateway().getModelDef(modelRef)).toMatchObject({ provider, apiModelId });
+  ])('routes %s to the resolved transport without a network request', async (modelRef, provider, apiModelId) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const routed: Array<{ provider: string; model: string }> = [];
+    for (const Transport of [
+      OpenAiTransport,
+      ClaudeTransport,
+      DeepSeekTransport,
+      GoogleTransport,
+    ]) {
+      vi.spyOn(Transport.prototype, 'chatWithTools').mockImplementation(async function (
+        this: LLMTransport,
+        request: TransportRequest
+      ): Promise<TransportResponse> {
+        routed.push({ provider: this.providerId, model: request.model });
+        return { text: 'routed', functionCalls: null, usage: null };
+      });
+    }
+    const gateway = new LLMGateway({
+      providers: {
+        openai: { apiKey: 'fixture-key' },
+        claude: { apiKey: 'fixture-key' },
+        deepseek: { apiKey: 'fixture-key' },
+        google: { apiKey: 'fixture-key' },
+      },
+      maxRetries: 0,
+    });
+    expect(await gateway.chat({ modelRef, prompt: 'ping' })).toBe('routed');
+    expect(routed).toEqual([{ provider, model: apiModelId }]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -88,8 +125,9 @@ describe('LLMGateway horizontal capabilities', () => {
       maxRetries: 0,
     });
     expect(await gateway.chat({ modelRef, prompt: 'hello' })).toBe('done');
+    // 请求只发往 ollama 端点即证明裸名按注册表路由到 ollama，而不是按名称猜测的 openai。
     expect(requests).toEqual(['http://ollama.example.invalid/v1/chat/completions']);
-    expect(gateway.getModelDef(modelRef).provider).toBe('ollama');
+    expect(getModelRegistry().findByApiModelId(modelRef)?.provider).toBe('ollama');
   });
 
   it.each([
@@ -105,7 +143,7 @@ describe('LLMGateway horizontal capabilities', () => {
     const transport = new Transport({ apiKey: '' });
     expect(transport.providerId).toBe(provider);
     await expect(
-      transport.chat({ model, messages: [{ role: 'user', content: 'ping' }] })
+      transport.chatWithTools({ model, messages: [{ role: 'user', content: 'ping' }] })
     ).rejects.toThrow('API Key');
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -154,7 +192,10 @@ describe('LLMGateway horizontal capabilities', () => {
       providers: { openai: { apiKey: 'fixture-key' } },
       maxRetries: 0,
     });
-    const model = gateway.getModelDef('openai:gpt-5.5');
+    const model = getModelRegistry().get('openai:gpt-5.5');
+    if (!model) {
+      throw new Error('fixture model openai:gpt-5.5 is not registered');
+    }
     await gateway.chatWithTools({
       modelRef: model.id,
       messages: [{ role: 'user', content: 'hello' }],
@@ -166,18 +207,17 @@ describe('LLMGateway horizontal capabilities', () => {
     expect(body.max_completion_tokens).toBe(model.maxOutputTokens);
   });
 
-  it('stops provider fallback when the caller cancels the probe chain', async () => {
+  // Gateway.probe / resolveWithFallback 已删除（L2-P21）；取消不发请求的合同由 chat 直接守护。
+  it('rejects a cancelled chat before any request', async () => {
     stubFetch({ choices: [{ index: 0, message: { content: 'ok' } }] });
     const controller = new AbortController();
-    controller.abort(new Error('probe cancelled'));
+    controller.abort(new Error('chat cancelled'));
     const gateway = new LLMGateway({
       providers: { openai: { apiKey: 'test-key' } },
       maxRetries: 0,
     });
     await expect(
-      gateway.resolveWithFallback(['openai:gpt-4o', 'openai:gpt-4o-mini'], {
-        abortSignal: controller.signal,
-      })
+      gateway.chat({ modelRef: 'openai:gpt-4o', prompt: 'ping', abortSignal: controller.signal })
     ).rejects.toMatchObject({ name: 'AbortError' });
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -245,7 +285,6 @@ describe('LLMGateway horizontal capabilities', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    resetLLMGateway();
   });
 
   it('preserves provider-prefixed model ids after the first colon', async () => {
@@ -286,13 +325,6 @@ describe('LLMGateway horizontal capabilities', () => {
       maxTokens: 64,
     });
     expect(result).toEqual({ value: 42 });
-  });
-
-  it('rebuilds the singleton when a new config is provided', () => {
-    const g1 = getLLMGateway({ providers: { openai: { apiKey: 'a' } } });
-    const g2 = getLLMGateway({ providers: { openai: { apiKey: 'b' } } });
-    expect(g2).not.toBe(g1);
-    expect(getLLMGateway()).toBe(g2);
   });
 });
 
@@ -539,29 +571,17 @@ describe('LLMGateway parameter clamp diagnostics', () => {
   });
 });
 
+// Transport 级 chat / chatStructured 已删除（L2-P22）：子类只需实现 chatWithTools；结构化解析与本地
+// schema 校验由 LLMGateway.chatStructured 负责（见本文件 chatStructured 用例与 structured-output-validation）。
 describe('LLMTransport explicit legacy defaults', () => {
   class LocalTransport extends LLMTransport {
-    request?: TransportRequest;
     constructor(private readonly reply: string) {
       super('openai', { apiKey: '' });
-    }
-    async chat(request: TransportRequest) {
-      this.request = request;
-      return this.reply;
     }
     async chatWithTools() {
       return { text: this.reply, functionCalls: null, usage: null };
     }
   }
-
-  it.each([
-    { reply: '{"value":42}', expected: { value: 42 } },
-    { reply: 'invalid-json', expected: null },
-  ])('retains structured parsing for $reply', async ({ reply, expected }) => {
-    const transport = new LocalTransport(reply);
-    expect(await transport.chatStructured({ model: 'fixture', messages: [] })).toEqual(expected);
-    expect(transport.request?.responseFormat).toBe('json');
-  });
 
   it('retains the base transport explicit unsupported embedding result', async () => {
     expect(await new LocalTransport('').embed(['fixture'])).toEqual([]);

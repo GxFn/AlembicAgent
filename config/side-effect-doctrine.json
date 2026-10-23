@@ -11,13 +11,6 @@
       "reason": "Named in the AD0 whitelist draft as 'ModelRegistry (Agent)'; lazy module singleton over declarative model definitions, no import-time work, no reset needed (stateless lookup tables)."
     },
     {
-      "name": "LLMGateway",
-      "file": "src/ai/gateway/LLMGateway.ts",
-      "accessor": "getLLMGateway(config?) / resetLLMGateway()",
-      "owner": "AlembicAgent window",
-      "reason": "Public ./ai facade singleton with an explicit reset hook and documented config-rebuild semantics (explicit config rebuilds the instance so later configs are never silently ignored). Container-managing it would change the public API — a STOP-class behavior change outside this behavior-preserving leg."
-    },
-    {
       "name": "AgentEventBus",
       "file": "src/agent/runtime/AgentEventBus.ts",
       "accessor": "AgentEventBus.getInstance() / resetInstance()",

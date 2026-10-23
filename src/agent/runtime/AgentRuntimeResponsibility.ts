@@ -351,11 +351,13 @@ export const ALEMBIC_AGENT_RUNTIME_RESPONSIBILITY = Object.freeze({
     forbiddenOwner: 'tool-system',
     summary: 'ModelRegistry access stays behind AI gateway/context budget boundaries.',
   },
+  // L2-P21 删除了宽松的公开响应类型；未归一的厂商响应体只在 transport 层（显式兼容 HTTP 入口与
+  // SDK 结果转换）出现，对外只投影归一后的结果、用量与错误。清单字段结构保持不变。
   apiResponseBoundary: {
     owner: 'transport-private',
-    allowedAccessRefs: ['src/ai/AiProvider.ts'],
+    allowedAccessRefs: ['src/ai/transport/LLMTransport.ts', 'src/ai/transport/sdkProtocol.ts'],
     forbiddenOwner: 'agent-runtime',
     summary:
-      'Loose ApiResponse typing is transport/provider-private and must not leak into runtime contracts.',
+      'Untyped vendor response bodies stay inside the transport layer and are never exported; runtime and public contracts only see normalized results, usage and errors.',
   },
 } as const satisfies AgentRuntimeResponsibilityManifest);

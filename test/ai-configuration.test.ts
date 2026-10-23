@@ -346,7 +346,7 @@ describe('effective AI connection configuration', () => {
         prompt: 'ping',
       });
     } else {
-      await new OpenAiTransport(config, 'ollama').chat({
+      await new OpenAiTransport(config, 'ollama').chatWithTools({
         model: 'llama3',
         messages: [{ role: 'user', content: 'ping' }],
       });
@@ -384,7 +384,7 @@ describe('effective AI connection configuration', () => {
         prompt: 'ping',
       });
     } else {
-      await new GoogleTransport(config).chat({
+      await new GoogleTransport(config).chatWithTools({
         model: config.model,
         messages: [{ role: 'user', content: 'ping' }],
       });

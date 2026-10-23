@@ -95,7 +95,7 @@ describe('OpenAI SDK transport contract', () => {
       )
     );
     const error = await new OpenAiTransport({ apiKey: 'test-key' })
-      .chat({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hello' }] })
+      .chatWithTools({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hello' }] })
       .catch((err: unknown) => err);
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).not.toContain(privateMarker);

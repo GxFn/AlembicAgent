@@ -3,7 +3,7 @@
  *
  * 职责分工：
  *   - 本类：provider 身份、配置与默认值（经 configuration.resolveProviderSettings 解析），
- *     以及 Gemini 专属的 chat / summarize 输出上限 8192。
+ *     以及 Gemini 专属的 chat 输出上限 8192。
  *   - wire 协议：由 @ai-sdk/google 维护（contents、函数声明、原生 JSON Schema、
  *     thoughtSignature 回传等），GoogleTransport 只做本仓 DTO ↔ SDK 的边界转换。
  *   - 重试 / 熔断 / 并发闸门 / 用量上报：在 LLMGateway 的 ReliabilityController。
@@ -36,11 +36,6 @@ export class GoogleGeminiProvider extends AiProvider {
     this.logger = Logger.getInstance() as unknown as AiLogger;
   }
 
-  /** 公开能力标记：chatWithTools 走原生函数调用；当前无运行时读取方（见 AiProvider 同名 getter）。 */
-  get supportsNativeToolCalling() {
-    return true;
-  }
-
   async chat(prompt: string, context: ChatContext = {}) {
     // Gemini chat 默认 maxOutputTokens 8192（高于通用 4096），保持原实现上限。
     return this._gatewayChat(prompt, {
@@ -62,10 +57,5 @@ export class GoogleGeminiProvider extends AiProvider {
 
   async embed(text: string | string[], opts: LlmCallOptions = {}) {
     return this._gatewayEmbed(text, opts);
-  }
-
-  /** Gemini 处理更大的代码摘要预算。 */
-  protected get summarizeMaxTokens(): number {
-    return 8192;
   }
 }

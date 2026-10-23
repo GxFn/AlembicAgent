@@ -156,11 +156,14 @@ describe('ClaudeTransport Anthropic protocol translation', () => {
     mockClaudeFetch(capture);
     const transport = new ClaudeTransport({ apiKey: 'secret-key' });
 
-    const text = await transport.chat({
-      model: 'claude-sonnet-4-6',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 64,
-    });
+    // Transport 级 chat 已删除（L2-P22），文本取 chatWithTools 结果的 text。
+    const text = (
+      await transport.chatWithTools({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 64,
+      })
+    ).text;
 
     expect(text).toBe('ok');
     expect(capture.headers?.['x-api-key']).toBe('secret-key');
@@ -217,15 +220,17 @@ describe('ClaudeTransport structured output and error normalization', () => {
     });
     const transport = new ClaudeTransport({ apiKey: 'k' });
 
-    // chatStructured 是真实消费入口：它以 responseFormat='json' + schema 调 chat，再本地校验。
-    const value = await transport.chatStructured({
+    // Transport 级 chatStructured 已删除（L2-P22）：这里直接以 responseFormat='json' + schema 调
+    // chatWithTools 守护 wire 字段；本地 schema 校验改由 Gateway.chatStructured 覆盖（见下一用例）。
+    const result = await transport.chatWithTools({
       model,
       messages: [{ role: 'user', content: 'verdict?' }],
+      responseFormat: 'json',
       schema: verdictSchema,
       maxTokens: 128,
     });
 
-    expect(value).toEqual({ ok: true });
+    expect(JSON.parse(String(result.text))).toEqual({ ok: true });
     expect(sentOutputFormat(capture)).toMatchObject({
       type: 'json_schema',
       schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
@@ -234,6 +239,33 @@ describe('ClaudeTransport structured output and error normalization', () => {
     expect(sentToolNames(capture)).not.toContain('json');
     expect(capture.body?.tools).toBeUndefined();
     expect(capture.body?.tool_choice).toBeUndefined();
+  });
+
+  it.each([
+    { label: 'schema-conforming output', text: '{"ok":true}', expected: { ok: true } },
+    { label: 'schema mismatch', text: '{"ok":"yes"}', expected: null },
+  ])('validates Claude structured output locally through Gateway.chatStructured ($label)', async ({
+    text,
+    expected,
+  }) => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockClaudeFetch(capture, {
+      content: [{ type: 'text', text }],
+      usage: { input_tokens: 3, output_tokens: 2 },
+    });
+    const gateway = new LLMGateway({ providers: { claude: { apiKey: 'k' } }, maxRetries: 0 });
+
+    const value = await gateway.chatStructured({
+      modelRef: 'claude:claude-sonnet-4-6',
+      prompt: 'verdict?',
+      schema: verdictSchema,
+      maxTokens: 128,
+    });
+
+    expect(value).toEqual(expected);
+    // 生产链路（Gateway → ClaudeTransport.chatWithTools）同样声明原生 output_config.format，不追加 json 工具。
+    expect(sentOutputFormat(capture)).toMatchObject({ type: 'json_schema' });
+    expect(sentToolNames(capture)).not.toContain('json');
   });
 
   it('keeps caller tools untouched when json+schema is combined with tool declarations', async () => {
@@ -441,11 +473,13 @@ describe('GoogleTransport Gemini protocol translation', () => {
     mockGeminiFetch(capture);
     const transport = new GoogleTransport({ apiKey: 'gem-key' });
 
-    const text = await transport.chat({
-      model: 'gemini-2.5-flash',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 64,
-    });
+    const text = (
+      await transport.chatWithTools({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 64,
+      })
+    ).text;
 
     expect(text).toBe('ok');
     expect(capture.url).toContain('models/gemini-2.5-flash:generateContent');
@@ -756,13 +790,32 @@ describe('DeepSeekTransport tool transcript preflight', () => {
     const transport = new DeepSeekTransport({ apiKey: 'test-key' });
 
     await expect(
-      transport.chat({
+      transport.chatWithTools({
         model: 'deepseek-chat',
         messages: [{ role: 'user', content: 'hello' }],
         maxTokens: 64,
       })
     ).rejects.toBeInstanceOf(Error);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  // 旧 DeepSeekTransport.chat 会显式剥离 tools 并设 toolChoice='none'；该方法删除后（L2-P22），
+  // 生产文本链路 Gateway.chat 本身就不携带工具声明，这里守护 DeepSeek 请求里不出现 tools/tool_choice。
+  it('sends no tool declarations or tool_choice for a DeepSeek Gateway.chat text request', async () => {
+    const capture: { body?: Record<string, unknown> } = {};
+    mockDeepSeekFetch(capture);
+    const gateway = new LLMGateway({
+      providers: { deepseek: { apiKey: 'test-key' } },
+      maxRetries: 0,
+    });
+
+    await expect(
+      gateway.chat({ modelRef: 'deepseek:deepseek-v4-flash', prompt: 'hello', maxTokens: 64 })
+    ).resolves.toBe('ok');
+
+    expect(capture.body?.tools).toBeUndefined();
+    expect(capture.body?.tool_choice).toBeUndefined();
+    expect(sentMessages(capture)).toEqual([{ role: 'user', content: 'hello' }]);
   });
 });
 
@@ -1015,7 +1068,7 @@ describe('OpenAiTransport apiStyle=chat (default)', () => {
     const controller = new AbortController();
     controller.abort();
     await expect(
-      new OpenAiTransport({ apiKey: 'test-key' }).chat({
+      new OpenAiTransport({ apiKey: 'test-key' }).chatWithTools({
         model: 'gpt-4o',
         messages: [],
         abortSignal: controller.signal,
@@ -1039,7 +1092,7 @@ describe('OpenAiTransport apiStyle=chat (default)', () => {
       )
     );
     await expect(
-      new OpenAiTransport({ apiKey: 'test-key', timeout: 5 }).chat({
+      new OpenAiTransport({ apiKey: 'test-key', timeout: 5 }).chatWithTools({
         model: 'gpt-4o',
         messages: [],
       })
@@ -1053,11 +1106,13 @@ describe('OpenAiTransport apiStyle=chat (default)', () => {
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     });
     const transport = new OpenAiTransport({ apiKey: 'k' });
-    const text = await transport.chat({
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: 'hi' }],
-      maxTokens: 64,
-    });
+    const text = (
+      await transport.chatWithTools({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 64,
+      })
+    ).text;
     expect(capture.url).toContain('/chat/completions');
     expect(text).toBe('hello');
   });
@@ -1074,12 +1129,14 @@ describe('OpenAiTransport apiStyle=responses', () => {
       status: 'completed',
     });
     const transport = new OpenAiTransport({ apiKey: 'k', apiStyle: 'responses' });
-    const text = await transport.chat({
-      model: 'gpt-5.1',
-      messages: [{ role: 'user', content: 'mine this' }],
-      systemPrompt: 'be precise',
-      maxTokens: 128,
-    });
+    const text = (
+      await transport.chatWithTools({
+        model: 'gpt-5.1',
+        messages: [{ role: 'user', content: 'mine this' }],
+        systemPrompt: 'be precise',
+        maxTokens: 128,
+      })
+    ).text;
     expect(capture.url).toContain('/responses');
     expect(capture.body?.input).toBeDefined();
     expect(capture.body?.max_output_tokens).toBe(128);
@@ -1123,7 +1180,7 @@ describe('OpenAiTransport apiStyle=responses', () => {
     const capture: Capture = {};
     mockFetch(capture, { output: [responsesText('{"ok":true}')], status: 'completed' });
     const transport = new OpenAiTransport({ apiKey: 'k', apiStyle: 'responses' });
-    await transport.chat({
+    await transport.chatWithTools({
       model: 'gpt-5.1',
       messages: [{ role: 'user', content: 'json please' }],
       responseFormat: 'json',
@@ -1153,7 +1210,7 @@ describe('OpenAiTransport apiStyle=responses', () => {
       )
     );
     const transport = new OpenAiTransport({ apiKey: 'k', apiStyle: 'responses' });
-    const pending = transport.chat({
+    const pending = transport.chatWithTools({
       model: 'gpt-5.1',
       messages: [{ role: 'user', content: 'cancel this' }],
       maxTokens: 64,

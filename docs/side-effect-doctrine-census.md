@@ -35,10 +35,13 @@ documented null-slot lifecycle; the HookSystem counter exemption remains.
 
 ## 1. Module-scope singletons and registries
 
+S2 below is kept as a baseline record only: it was retired on 2026-10-23 and is no
+longer in the machine record's `blessedSingletons`.
+
 | Id | Item | Site | Disposition |
 | --- | --- | --- | --- |
 | S1 | `ModelRegistry` lazy module singleton (`let _instance` + `getModelRegistry()`) | `src/ai/registry/ModelRegistry.ts:127-134` | BLESSED — named in the AD0 whitelist draft as "ModelRegistry (Agent)"; AD4 confirms. Lazy init, no import-time work. |
-| S2 | `LLMGateway` lazy module singleton (`let _gateway` + `getLLMGateway(config?)` + `resetLLMGateway()`) | `src/ai/gateway/LLMGateway.ts:459-479` | BLESSED — public `./ai` API; explicit reset hook; documented config-rebuild semantics (explicit config rebuilds the instance). Container-managing would change the public API (STOP class). |
+| S2 | `LLMGateway` lazy module singleton (`let _gateway` + shared accessor + reset hook) | `src/ai/gateway/LLMGateway.ts:459-479` (baseline) | RETIRED 2026-10-23 (W2a-11 / L2-P21, user-approved decision ②) — the shared accessor and reset hook were removed from `.` and `./ai` together with the module-level slot; rebuilding the shared instance with a new config used to drop the old instance's circuit breaker and concurrency state. Each `AiProvider` owns its own `LLMGateway`; direct callers construct `new LLMGateway(config)`. The blessed-singleton row was removed from `config/side-effect-doctrine.json` in the same change. |
 | S3 | `AgentEventBus` lazy class singleton (`static #instance`, `getInstance()`, `resetInstance()` removes all listeners) | `src/agent/runtime/AgentEventBus.ts:47-72` | BLESSED — cross-strategy broadcast seam on the public runtime surface; reset hook present; `setMaxListeners(100)` declared. |
 
 Of the four singletons named by the AD4 design, only `ModelRegistry` lives in

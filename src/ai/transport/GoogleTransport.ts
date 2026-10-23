@@ -29,10 +29,6 @@ export class GoogleTransport extends LLMTransport {
     });
   }
 
-  async chat(request: TransportRequest): Promise<string> {
-    return (await this.chatWithTools(request)).text || '';
-  }
-
   override get maxEmbeddingBatchSize(): number {
     return 100;
   }

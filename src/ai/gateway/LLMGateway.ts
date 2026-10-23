@@ -297,50 +297,8 @@ export class LLMGateway {
     }
   }
 
-  /**
-   * 获取模型定义（供外部查询能力）
-   */
-  getModelDef(modelRef: string): ModelDef {
-    return this.#resolveModel(modelRef).modelDef;
-  }
-
-  /**
-   * 探测某模型是否可用（轻量 chat），用于 fallback 决策。
-   * 普通失败返回 false；取消必须终止探活链，不能继续请求下一模型。
-   */
-  async probe(modelRef: string, opts: LlmCallOptions = {}): Promise<boolean> {
-    try {
-      const text = await this.chat({
-        modelRef,
-        prompt: 'ping',
-        maxTokens: 16,
-        temperature: 0,
-        usageSource: 'probe',
-        abortSignal: opts.abortSignal,
-      });
-      return Boolean(text);
-    } catch (err: unknown) {
-      throwIfLlmCancelled(opts.abortSignal, err);
-      this.#log('warn', `[LLMGateway] probe(${modelRef}) failed: ${(err as Error).message}`);
-      return false;
-    }
-  }
-
-  /**
-   * 按候选模型链探活降级：返回第一个可用的 modelRef。
-   * 与 Provider 层 getProviderWithFallback 思路一致，但统一在网关侧完成。
-   */
-  async resolveWithFallback(
-    candidates: string[],
-    opts: LlmCallOptions = {}
-  ): Promise<string | null> {
-    for (const modelRef of candidates) {
-      if (await this.probe(modelRef, opts)) {
-        return modelRef;
-      }
-    }
-    return null;
-  }
+  // 模型定义查询请直接用 ModelRegistry（getModelRegistry）；探活与 fallback 只保留 Provider 层一套
+  // （AiProvider.probe 与 AiFactory.getProviderWithFallback），Gateway 不再提供平行入口（L2-P21）。
 
   // ─── Model Resolution ─────────────────────────────────
 
@@ -647,25 +605,5 @@ export class LLMGateway {
   }
 }
 
-// ─── Singleton ──────────────────────────────────────────
-
-let _gateway: LLMGateway | null = null;
-
-/**
- * 获取共享 LLMGateway 单例。
- *
- * 修复历史 bug：旧实现只在首次调用时应用 config，后续传入的 config 被静默忽略。
- * 现在只要显式传入 config，就重建实例以应用最新配置；不传则复用既有单例。
- */
-export function getLLMGateway(config?: GatewayConfig): LLMGateway {
-  if (config) {
-    _gateway = new LLMGateway(config);
-  } else if (!_gateway) {
-    _gateway = new LLMGateway();
-  }
-  return _gateway;
-}
-
-export function resetLLMGateway(): void {
-  _gateway = null;
-}
+// 不提供模块级共享单例（L2-P21）：带新配置重建单例会丢弃旧实例的熔断与并发状态。
+// 每个 AiProvider 持有自己的 Gateway；需要直接使用 Gateway 的调用方自行 new LLMGateway(config) 并管理其生命周期。

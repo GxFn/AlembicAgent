@@ -126,8 +126,12 @@ export function isGeoOrProviderError(err: unknown) {
 }
 
 /**
- * 获取 AI Provider，带自动 fallback：
- * 当主 provider 调用失败（地理限制等）时自动切换到备选 provider
+ * 获取 AI Provider，带自动 fallback（唯一的 provider 级 fallback 入口；Gateway 侧的探活与候选链已删除）：
+ * - 主 provider 的 probe() 解析为 true：保留主 provider；
+ * - probe() 解析为 false（例如空文本应答）：视为主 provider 此刻不可用，进入已配置的 fallback 链；
+ * - probe() 抛出 provider 级限制（地理限制、403 等，见 isGeoOrProviderError）：同样进入 fallback 链；
+ * - probe() 抛出暂时故障、取消或未分类错误：保留主 provider（不因节流或网络抖动切换厂商）。
+ * fallback 来源只经诊断日志记录（fallback_selected），不再写入 provider 实例字段。
  */
 export async function getProviderWithFallback() {
   const logger = Logger.getInstance();
@@ -137,12 +141,17 @@ export async function getProviderWithFallback() {
   }
 
   const currentProvider = primary.name;
+  let fallbackReason: 'probe_unavailable' | 'provider_restriction';
 
   try {
-    if (typeof primary.probe === 'function') {
-      await primary.probe();
+    if (await primary.probe()) {
+      return primary;
     }
-    return primary;
+    // 旧实现忽略 probe 的布尔结果，探测“连通但不可用”时仍返回主 provider（L2-P21 W1 修正）。
+    fallbackReason = 'probe_unavailable';
+    logger.warn(
+      `[AiFactory] primary_probe_unavailable provider=${currentProvider} result=false; selecting configured fallback`
+    );
   } catch (probeErr: unknown) {
     if (!isGeoOrProviderError(probeErr)) {
       logger.debug(
@@ -150,6 +159,7 @@ export async function getProviderWithFallback() {
       );
       return primary;
     }
+    fallbackReason = 'provider_restriction';
     logger.warn(
       `[AiFactory] Primary provider "${currentProvider}" has a provider restriction; selecting configured fallback`
     );
@@ -165,7 +175,10 @@ export async function getProviderWithFallback() {
     try {
       logger.info(`[AiFactory] Trying fallback provider: ${fbName}`);
       const fbProvider = createProvider({ provider: fbName, model: defaultModel(fbName) });
-      fbProvider._fallbackFrom = currentProvider;
+      // fallback 候选按配置顺序只构造、不再探活；选择结果与触发原因留在诊断里供宿主定位。
+      logger.info(
+        `[AiFactory] fallback_selected provider=${fbProvider.name} fallbackFrom=${currentProvider} reason=${fallbackReason}`
+      );
       return fbProvider;
     } catch (e: unknown) {
       logger.warn(

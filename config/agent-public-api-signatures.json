@@ -31,8 +31,8 @@
   "packageExportCount": 15,
   "stableExportSignatures": {
     ".": {
-      "exportCount": 146,
-      "signatureHash": "70abb9e97da8a661b0a62321bcad770c9b978961df0c50bdc09fd50697876b29",
+      "exportCount": 144,
+      "signatureHash": "fea9fcb67522b27578aa3909ae626270ef62508af708a606a23adcefcab61a2a",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -451,10 +451,6 @@
           "kind": "function"
         },
         {
-          "name": "getLLMGateway",
-          "kind": "function"
-        },
-        {
           "name": "getModelRegistry",
           "kind": "function"
         },
@@ -548,10 +544,6 @@
         },
         {
           "name": "renderL4MemoryPackage",
-          "kind": "function"
-        },
-        {
-          "name": "resetLLMGateway",
           "kind": "function"
         },
         {
@@ -1331,8 +1323,8 @@
       ]
     },
     "./ai": {
-      "exportCount": 28,
-      "signatureHash": "f02f8f3e1a64892c6ef42a413722b9f077ac7a9c076286567116ed112fadaf12",
+      "exportCount": 26,
+      "signatureHash": "3a01359ea920c9641b12c48d3179fe10d9d9ae5bf1382828596bb7ad52e6430d",
       "entries": [
         {
           "name": "AiProvider",
@@ -1423,10 +1415,6 @@
           "kind": "function"
         },
         {
-          "name": "getLLMGateway",
-          "kind": "function"
-        },
-        {
           "name": "getModelRegistry",
           "kind": "function"
         },
@@ -1440,10 +1428,6 @@
         },
         {
           "name": "isGeoOrProviderError",
-          "kind": "function"
-        },
-        {
-          "name": "resetLLMGateway",
           "kind": "function"
         }
       ]

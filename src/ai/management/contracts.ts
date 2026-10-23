@@ -3,14 +3,16 @@ import type { TokenUsagePayload } from '../contracts.js';
 
 export type { TokenUsagePayload } from '../contracts.js';
 
-/** AI Provider 最小接口（避免引入 AiProvider 具体类的循环依赖） */
+/**
+ * AI Provider 最小接口（避免引入 AiProvider 具体类的循环依赖）。
+ * 只含路由、计量与能力查询需要的字段；凭据与 fallback 来源字段不经此端口暴露（L2-P21 已删除），
+ * 避免后续调用方经管理端口读取 key。
+ */
 export interface ManagedAiProvider {
   name: string;
   model: string;
-  apiKey?: string;
   _onTokenUsage?: ((usage: TokenUsagePayload) => void) | null;
   supportsEmbedding?: () => boolean;
-  _fallbackFrom?: string;
 }
 
 /** Token 记录器最小接口（对应 TokenUsageStore.record） */

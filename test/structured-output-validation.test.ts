@@ -7,7 +7,6 @@ import {
   parseSchemaOutput,
   prepareStructuredValidation,
 } from '../src/ai/shared/schemaValidation.js';
-import { OpenAiTransport } from '../src/ai/transport/OpenAiTransport.js';
 import { mockJsonFetch } from './helpers/mockFetch.js';
 
 const config = { apiKey: 'test-key', model: 'gpt-4o', maxRetries: 0 };
@@ -31,16 +30,9 @@ const entries = [
         ...opts,
       }),
   },
-  {
-    name: 'transport',
-    call: (opts: StructuredOutputOptions) =>
-      new OpenAiTransport(config).chatStructured({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: 'json' }],
-        ...opts,
-      }),
-  },
 ];
+// Transport 级 chatStructured 已删除（L2-P22）：结构化入口只剩 Provider 与 Gateway，本地 schema 校验
+// 在 Gateway.chatStructured 与 AiProvider.chatWithStructuredOutput 两处覆盖，Transport 只经 chatWithTools 生成。
 
 function response(value: unknown) {
   return mockJsonFetch(
