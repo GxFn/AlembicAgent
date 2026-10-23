@@ -1253,10 +1253,8 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
     // 未完成度只交给周期触发：createdAtIteration=1 + replanInterval=8 → 第 9 轮才回顾计划。
     expect(plans.checkPlanning(planCheckState(8), trace)).toBeNull();
     expect(plans.checkPlanning(planCheckState(9), trace)?.text).toContain('📋 计划进度回顾');
-    // adherence 与 completion 不再恒等：全部动作都在计划内，adherence=100，completion=80。
-    const quality = plans.getQualityMetrics(trace);
-    expect(quality.breakdown.planAdherence).toBe(100);
-    expect(quality.breakdown.planCompletion).toBe(80);
+    // adherence 与 completion 两种口径独立：全部动作都在计划内（deviationScore=0，即 adherence 满分），
+    // 而步骤只完成 4/5。getQualityMetrics 已随 W2a-09 删除，这两个口径直接由上面的 progress 断言锁定。
   });
 
   it('fires a deviation replan only after three consecutive off-plan exploration rounds', () => {
@@ -1296,7 +1294,6 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
       unplannedActions: 0,
       consecutiveOffPlan: 0,
     });
-    expect(plans.getQualityMetrics(trace).breakdown.planAdherence).toBe(100);
   });
 
   // L6-P16r3 C016：首字母大写的真实 JS 文件（React 组件 App.js / Header.js）仍是 read 的硬门槛目标。
@@ -2849,5 +2846,30 @@ describe('L6-P18 skipped rounds and unknown strategy names (C15/C63)', () => {
       ExplorationTracker.resolve({ source: 'system', strategy }, { maxIterations: 6 });
     }
     expect(p18LogMessages(warn).filter((m) => m.includes('unknown strategy'))).toEqual([]);
+  });
+});
+
+// W2a-09 / L6-P25：BudgetInput.signalBus 与两处信号发送分支已删除。构造参数对象（经变量传入，绕开
+// 字面量多余属性检查）即使仍带 signalBus，阶段转换与退出也不再向它发送任何信号。
+describe('ExplorationTracker without the retired signal bus (W2a-09)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('never sends exploration signals to a signalBus left in the budget object', () => {
+    vi.spyOn(Logger.getInstance(), 'info').mockImplementation(() => undefined);
+    const send = vi.fn();
+    const budget = { maxIterations: 1, signalBus: { send } };
+    const tracker = new ExplorationTracker(STRATEGY_ANALYST, budget);
+    tracker.tick();
+    // 达到 maxIterations：强制转入终结阶段（旧实现在此发 ExplorationTracker.phase 信号）。
+    expect(tracker.shouldExit()).toBe(false);
+    expect(tracker.phase).toBe('SUMMARIZE');
+    for (let round = 0; round < 3; round++) {
+      tracker.tick();
+    }
+    // 终结阶段 grace 用尽后退出（旧实现在此发 ExplorationTracker.exit 信号）。
+    expect(tracker.shouldExit()).toBe(true);
+    expect(send).not.toHaveBeenCalled();
   });
 });

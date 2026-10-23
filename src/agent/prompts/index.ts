@@ -18,7 +18,7 @@ export {
 export * from './insightAnalyst.js';
 export * from './insightEvolver.js';
 // L6-P25 / 待决事项②：EVOLVER_TOOLS 只在公开入口上标废弃（显式按名转出覆盖上一行 `export *` 的同名绑定，
-// 运行时名字与种类不变）。ANALYST_TOOLS / PRODUCER_TOOLS / buildProducerPrompt 的废弃标注在各自源文件。
+// 运行时名字与种类不变），删除留给 W2b；v1 buildProducerPrompt 的废弃标注在 insightProducer.ts。
 export {
   /**
    * @deprecated 无生产消费者且与真实工具面漂移（evolve 阶段另经 getGenerateStageTerminalTools 追加 terminal）；

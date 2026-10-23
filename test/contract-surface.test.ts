@@ -1529,7 +1529,7 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     );
   });
 
-  it('records 427 runtime bindings across the 15 stable package exports', () => {
+  it('records 419 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
@@ -1537,8 +1537,9 @@ describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-
     const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
     // W2a-01 后为 440；W2a-02 从根出口再撤回 5 个 kernel 运行时绑定（440 → 435）；
     // W2a-03 从 `.` 与 `./tools/runtime` 各撤回 System、ScanAnalyze（435 → 431）；
-    // W2a-06 撤回 `.`/`./agent` 的 FanOutStrategy 与 `./evaluation` 的两个 durable 运行时绑定（431 → 427）。
-    expect(total).toBe(427);
+    // W2a-06 撤回 `.`/`./agent` 的 FanOutStrategy 与 `./evaluation` 的两个 durable 运行时绑定（431 → 427）；
+    // W2a-09 撤回 `.` 3 个、`./context` 2 个、`./memory` 1 个、`./prompts` 2 个上下文与提示绑定（427 → 419）。
+    expect(total).toBe(419);
   });
 
   it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
@@ -1615,8 +1616,9 @@ describe('tool catalog, kernel contract and handler layer retirement (W2a-02 / L
     // 宿主只用 new UnifiedToolCatalog() 与 register：类本身仍在根出口上，种类不变。
     expect(runtimeKind(exported.UnifiedToolCatalog)).toBe('class');
     const expected = snapshotEntries('.');
-    // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）；W2a-06 撤回 FanOutStrategy（150 → 149）。
-    expect(expected.exportCount).toBe(149);
+    // W2a-02 后为 152；W2a-03 再撤回 System、ScanAnalyze（152 → 150）；W2a-06 撤回 FanOutStrategy（150 → 149）；
+    // W2a-09 撤回 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings（149 → 146）。
+    expect(expected.exportCount).toBe(146);
     const snapshotNames = expected.entries.map((entry) => entry.name);
     for (const name of WITHDRAWN_ROOT_KERNEL_BINDINGS) {
       expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
@@ -1782,8 +1784,8 @@ function sortedEntries(moduleExports: Record<string, unknown>): SignatureEntry[]
 describe('toolset and search cache narrowing (W2a-03 / L4-P33)', () => {
   it('withdraws System and ScanAnalyze from both entries and matches the snapshot', () => {
     const subpaths = [
-      // W2a-06 再撤回 FanOutStrategy（150 → 149）。
-      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 149 },
+      // W2a-06 再撤回 FanOutStrategy（150 → 149）；W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）。
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 146 },
       {
         exportPath: './tools/runtime',
         moduleExports: toolsRuntime as Record<string, unknown>,
@@ -1935,7 +1937,8 @@ describe('profile compilation and strategy declaration narrowing (W2a-06 / L8-P0
       {
         exportPath: '.',
         moduleExports: agentRoot as Record<string, unknown>,
-        count: 149,
+        // W2a-09 再撤回 3 个上下文与记忆绑定（149 → 146）。
+        count: 146,
         withdrawn: ['FanOutStrategy'],
       },
       {
@@ -2066,5 +2069,234 @@ describe('profile compilation and strategy declaration narrowing (W2a-06 / L8-P0
     );
     expect(diagnostics['__w2a06-narrowed-fields.probe.ts']).toEqual([]);
     expect(diagnostics['__w2a06-retained.probe.ts']).toEqual([]);
+  }, 120000);
+});
+
+/* ── W2a-09：上下文、提示与对话存储公开面收窄（L6-P25 第一组、L6-P16 getQualityMetrics 耦合项） ──────
+ * 用户 2026-10-20 按推荐批准事项②“公开面收窄”。本包删除的运行时绑定：`.`/`./context` 的 SEARCH_TOOLS、
+ * createGenerateStrategy，`.`/`./memory` 的 extractHighPriorityFindings，`./prompts` 的 ANALYST_TOOLS、
+ * PRODUCER_TOOLS；纯类型 DimensionFlushManifest（`.`、`./memory`）；成员 ConversationStore 的
+ * list/delete/cleanup/estimateTokens/summarize、PlanTracker 与 ExplorationTracker 的 getQualityMetrics、
+ * BudgetInput.signalBus。createGenerateStrategy 的函数本体仍留在源文件，供 ExplorationTracker.resolve
+ * 的 bootstrap 回退使用，只是不再经 `./context` 公开。签名：`.` 149→146、`./context` 21→19、
+ * `./memory` 14→13、`./prompts` 30→28，总数 427→419，出口仍为 15。
+ */
+
+const WITHDRAWN_W2A09_BINDINGS = {
+  '.': ['SEARCH_TOOLS', 'createGenerateStrategy', 'extractHighPriorityFindings'],
+  './context': ['SEARCH_TOOLS', 'createGenerateStrategy'],
+  './memory': ['extractHighPriorityFindings'],
+  './prompts': ['ANALYST_TOOLS', 'PRODUCER_TOOLS'],
+} as const;
+
+/** `./context` 收窄后的完整名集（运行时绑定与纯类型）：除被删的两个名字外与收窄前逐一相同。 */
+const RETAINED_CONTEXT_EXPORT_NAMES = [
+  'ContextWindow',
+  'ConversationStore',
+  'DEFAULT_REFLECTION_INTERVAL',
+  'DEFAULT_REPLAN_INTERVAL',
+  'ExplorationBudget',
+  'ExplorationMetrics',
+  'ExplorationPhase',
+  'ExplorationStrategy',
+  'ExplorationTrace',
+  'ExplorationTracker',
+  'FullExplorationMetrics',
+  'L4MemoryPackage',
+  'L4MemoryPackageInput',
+  'NudgeGenerator',
+  'PipelineType',
+  'PlanTracker',
+  'STRATEGY_ANALYST',
+  'STRATEGY_PRODUCER',
+  'SignalDetector',
+  'TransitionEntry',
+  'TransitionRule',
+  'buildL4MemoryPackage',
+  'effectiveMemoryFindingCount',
+  'formatL4MemorySummary',
+  'isSearchAction',
+  'limitToolResult',
+  'renderL4MemoryPackage',
+  'targetMemoryFindingCount',
+  'targetProducerSubmitCount',
+  'validateL4Summary',
+] as const;
+
+const WITHDRAWN_CONVERSATION_STORE_MEMBERS = [
+  'cleanup',
+  'delete',
+  'estimateTokens',
+  'list',
+  'summarize',
+] as const;
+
+describe('context, prompts and conversation store narrowing (W2a-09 / L6-P25, L6-P16)', () => {
+  it('withdraws the bindings from `.`, `./context`, `./memory` and `./prompts` and matches the snapshot', async () => {
+    const contextEntry = (await import('../src/agent/context/index.js')) as Record<string, unknown>;
+    const memoryEntry = (await import('../src/agent/memory/index.js')) as Record<string, unknown>;
+    const subpaths = [
+      { exportPath: '.', moduleExports: agentRoot as Record<string, unknown>, count: 146 },
+      { exportPath: './context', moduleExports: contextEntry, count: 19 },
+      { exportPath: './memory', moduleExports: memoryEntry, count: 13 },
+      { exportPath: './prompts', moduleExports: prompts as Record<string, unknown>, count: 28 },
+    ] as const;
+    for (const { exportPath, moduleExports, count } of subpaths) {
+      const expected = snapshotEntries(exportPath);
+      expect({ exportPath, exportCount: expected.exportCount }).toEqual({
+        exportPath,
+        exportCount: count,
+      });
+      const snapshotNames = expected.entries.map((entry) => entry.name);
+      for (const name of WITHDRAWN_W2A09_BINDINGS[exportPath]) {
+        expect({ exportPath, name, exported: name in moduleExports }).toEqual({
+          exportPath,
+          name,
+          exported: false,
+        });
+        expect({ exportPath, name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+          exportPath,
+          name,
+          inSnapshot: false,
+        });
+      }
+      const entries = sortedEntries(moduleExports);
+      const expectedSorted = [...expected.entries].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+      );
+      expect({ exportPath, entries }).toEqual({ exportPath, entries: expectedSorted });
+      expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
+        expected.signatureHash
+      );
+    }
+    // 搜索轮次判定入口与 bootstrap 回退所在的追踪器照常公开，种类不变。
+    expect(runtimeKind(contextEntry.isSearchAction)).toBe('function');
+    expect(runtimeKind(contextEntry.ExplorationTracker)).toBe('class');
+    // `./context` 其余名字与类型（含 ExplorationStrategies 的全部类型）一个不少。
+    expect([...exportNamesOf('./context')].sort()).toEqual([...RETAINED_CONTEXT_EXPORT_NAMES]);
+  });
+
+  it('drops the withdrawn names and members from the deprecation registry', () => {
+    const record = readDeprecationRecord();
+    const bindings = record.bindings.map((binding) => binding.name);
+    for (const name of [
+      'SEARCH_TOOLS',
+      'createGenerateStrategy',
+      'extractHighPriorityFindings',
+      'ANALYST_TOOLS',
+      'PRODUCER_TOOLS',
+    ]) {
+      expect({ name, registered: bindings.includes(name) }).toEqual({ name, registered: false });
+    }
+    // EVOLVER_TOOLS 与 v1 buildProducerPrompt 属于 W2b（D5），仍留在登记中。
+    expect(bindings).toEqual(expect.arrayContaining(['EVOLVER_TOOLS', 'buildProducerPrompt']));
+    expect(record.types.map((type) => type.name)).not.toContain('DimensionFlushManifest');
+    const owners = record.members.map((entry) => entry.owner);
+    for (const owner of ['ConversationStore', 'PlanTracker', 'ExplorationTracker', 'BudgetInput']) {
+      expect({ owner, registered: owners.includes(owner) }).toEqual({ owner, registered: false });
+    }
+  });
+
+  it('removes the withdrawn tracker and conversation store members at runtime', async () => {
+    const { ConversationStore, ExplorationTracker, PlanTracker } = await import(
+      '../src/agent/context/index.js'
+    );
+    const storePrototype = ConversationStore.prototype as unknown as Record<string, unknown>;
+    for (const member of WITHDRAWN_CONVERSATION_STORE_MEMBERS) {
+      expect({ member, present: member in storePrototype }).toEqual({ member, present: false });
+    }
+    // 宿主只用 new / create / append / load，这些保持不变。
+    for (const member of ['create', 'append', 'load']) {
+      expect({ member, kind: typeof storePrototype[member] }).toEqual({ member, kind: 'function' });
+    }
+    expect('getQualityMetrics' in PlanTracker.prototype).toBe(false);
+    expect('getQualityMetrics' in ExplorationTracker.prototype).toBe(false);
+  });
+
+  it('narrows the removed exports, members and the signalBus budget field (compiler probes)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，类型收窄一律用真实编译器判定（一次建 Program）。
+    const diagnostics = typecheckRouterContractProbes({
+      '__w2a09-removed-exports.probe.ts': [
+        "import { SEARCH_TOOLS as ContextSearchTools, createGenerateStrategy as ContextGenerate } from '../src/agent/context/index.js';",
+        "import { SEARCH_TOOLS as RootSearchTools, createGenerateStrategy as RootGenerate, extractHighPriorityFindings as RootExtract, type DimensionFlushManifest as RootManifest } from '../src/index.js';",
+        "import { extractHighPriorityFindings as MemoryExtract, type DimensionFlushManifest as MemoryManifest } from '../src/agent/memory/index.js';",
+        "import { ANALYST_TOOLS, PRODUCER_TOOLS } from '../src/agent/prompts/index.js';",
+        'export type Removed = [RootManifest, MemoryManifest];',
+        'export const removed = [ContextSearchTools, ContextGenerate, RootSearchTools, RootGenerate,',
+        '  RootExtract, MemoryExtract, ANALYST_TOOLS, PRODUCER_TOOLS];',
+        '',
+      ].join('\n'),
+      '__w2a09-removed-members.probe.ts': [
+        "import type { ConversationStore, ExplorationTracker, PlanTracker } from '../src/agent/context/index.js';",
+        'type BudgetInput = ConstructorParameters<typeof ExplorationTracker>[1];',
+        `type RemovedStoreMembers = Extract<keyof ConversationStore, ${WITHDRAWN_CONVERSATION_STORE_MEMBERS.map((member) => `'${member}'`).join(' | ')}>;`,
+        "export const storeMembers: [RemovedStoreMembers] extends [never] ? 'narrowed' : 'present' = 'narrowed';",
+        "export const planQuality: 'getQualityMetrics' extends keyof PlanTracker ? 'present' : 'absent' = 'absent';",
+        "export const trackerQuality: 'getQualityMetrics' extends keyof ExplorationTracker ? 'present' : 'absent' = 'absent';",
+        "export const budgetSignalBus: 'signalBus' extends keyof BudgetInput ? 'present' : 'absent' = 'absent';",
+        '',
+      ].join('\n'),
+      // 构造参数对象字面量里再带 signalBus 应报多余属性，而不是被静默接受。
+      '__w2a09-signal-bus-excess.probe.ts': [
+        "import { ExplorationTracker, STRATEGY_ANALYST } from '../src/agent/context/index.js';",
+        'export const tracker = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 4, signalBus: null });',
+        '',
+      ].join('\n'),
+      // 正对照：`./context` 保留的运行时名字与全部类型、memory 的 DistilledContext、宿主使用的
+      // ConversationStore 入口与 W2b 才处理的 prompts 名字照常可用。
+      '__w2a09-retained.probe.ts': [
+        'import {',
+        '  ContextWindow, ConversationStore, DEFAULT_REFLECTION_INTERVAL, DEFAULT_REPLAN_INTERVAL,',
+        '  ExplorationTracker, NudgeGenerator, PlanTracker, STRATEGY_ANALYST, STRATEGY_PRODUCER, SignalDetector,',
+        '  buildL4MemoryPackage, effectiveMemoryFindingCount, formatL4MemorySummary, isSearchAction,',
+        '  limitToolResult, renderL4MemoryPackage, targetMemoryFindingCount, targetProducerSubmitCount,',
+        '  validateL4Summary, type ExplorationBudget, type ExplorationMetrics, type ExplorationPhase,',
+        '  type ExplorationStrategy, type ExplorationTrace, type FullExplorationMetrics, type L4MemoryPackage,',
+        '  type L4MemoryPackageInput, type PipelineType, type TransitionEntry, type TransitionRule,',
+        "} from '../src/agent/context/index.js';",
+        "import type { DistilledContext } from '../src/agent/memory/index.js';",
+        "import type { DistilledContext as RootDistilled, ExplorationStrategy as RootStrategy } from '../src/index.js';",
+        "import { ANALYST_BUDGET, EVOLVER_TOOLS, PRODUCER_BUDGET, buildProducerPrompt } from '../src/agent/prompts/index.js';",
+        'declare const store: ConversationStore;',
+        "const id: string = store.create({ category: 'user', title: 'probe' });",
+        "store.append(id, { role: 'user', content: 'probe' });",
+        'export const history: Array<{ role: string; content: string }> = store.load(id, { tokenBudget: 100 });',
+        "export const tracker = ExplorationTracker.resolve({ source: 'system', strategy: 'analyst' }, { maxIterations: 4 });",
+        "export const search: boolean = isSearchAction('code', { action: 'search' });",
+        'export type Retained = [ExplorationBudget, ExplorationMetrics, ExplorationPhase, ExplorationStrategy,',
+        '  ExplorationTrace, FullExplorationMetrics, L4MemoryPackage, L4MemoryPackageInput, PipelineType,',
+        '  TransitionEntry, TransitionRule, DistilledContext, RootDistilled, RootStrategy];',
+        'export const runtime = [ContextWindow, DEFAULT_REFLECTION_INTERVAL, DEFAULT_REPLAN_INTERVAL, NudgeGenerator,',
+        '  PlanTracker, STRATEGY_ANALYST, STRATEGY_PRODUCER, SignalDetector, buildL4MemoryPackage,',
+        '  effectiveMemoryFindingCount, formatL4MemorySummary, limitToolResult, renderL4MemoryPackage,',
+        '  targetMemoryFindingCount, targetProducerSubmitCount, validateL4Summary, ANALYST_BUDGET, EVOLVER_TOOLS,',
+        '  PRODUCER_BUDGET, buildProducerPrompt];',
+        '',
+      ].join('\n'),
+    });
+
+    const missingExports = diagnostics['__w2a09-removed-exports.probe.ts']
+      // 名字与现存导出相近时 TS 会改用 “has no exported member named 'X'. Did you mean …” 的措辞。
+      .map((message) => /has no exported member (?:named )?'([^']+)'/.exec(message)?.[1] ?? message)
+      .sort();
+    expect(missingExports).toEqual(
+      [
+        'ANALYST_TOOLS',
+        'DimensionFlushManifest',
+        'DimensionFlushManifest',
+        'PRODUCER_TOOLS',
+        'SEARCH_TOOLS',
+        'SEARCH_TOOLS',
+        'createGenerateStrategy',
+        'createGenerateStrategy',
+        'extractHighPriorityFindings',
+        'extractHighPriorityFindings',
+      ].sort()
+    );
+    expect(diagnostics['__w2a09-removed-members.probe.ts']).toEqual([]);
+    expect(diagnostics['__w2a09-signal-bus-excess.probe.ts']).toEqual([
+      "Object literal may only specify known properties, and 'signalBus' does not exist in type 'BudgetInput'.",
+    ]);
+    expect(diagnostics['__w2a09-retained.probe.ts']).toEqual([]);
   }, 120000);
 });

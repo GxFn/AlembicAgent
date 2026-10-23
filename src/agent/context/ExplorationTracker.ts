@@ -23,7 +23,6 @@ import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcome
  * @module ExplorationTracker
  */
 
-import type { SignalBus } from '@alembic/core/events';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { DEPTH_SLOT_KEYS } from '../../tools/runtime/registry.js';
@@ -60,13 +59,9 @@ interface ResolveOptions {
 interface BudgetInput extends Partial<ExplorationBudget> {
   submitToolName?: string;
   pipelineType?: PipelineType;
-  /**
-   * 可选信号总线：阶段切换与退出时发 'exploration' 信号，仅作观测，不参与阶段路由。
-   * @deprecated src、宿主与测试构造 ExplorationTracker / 调用 resolve 时都不传，信号分支无人接线也无人验证；
-   *   BudgetInput 是公开类的构造参数类型，删除本字段随待决事项②“公开面收窄”处理，删除前须附 src、测试、
-   *   宿主生产与宿主测试的零引用扫描。
-   */
-  signalBus?: SignalBus | null;
+  // W2a-09 / L6-P25：可选 signalBus 字段与阶段切换、退出时的 'exploration' 信号发送已删除——src、宿主与测试
+  // 构造追踪器时都不传，分支从未接线。阶段切换仍由 #transitionTo 记 info，退出原因由 ExitController 的
+  // tracker_exit 结果携带。
 }
 
 // ─── ExplorationTracker 主类 ─────────────────────────────
@@ -80,8 +75,6 @@ export class ExplorationTracker {
   #phase: string;
   /** 日志器 */
   #logger;
-  /** 信号总线（可选） */
-  #signalBus: SignalBus | null;
 
   // ── 子模块 ──
   #signalDetector;
@@ -175,7 +168,6 @@ export class ExplorationTracker {
           : 'bootstrap');
     this.#phase = strategy.phases[0];
     this.#logger = Logger.getInstance();
-    this.#signalBus = budget.signalBus ?? null;
 
     // 初始化子模块
     this.#signalDetector = new SignalDetector(this.#metrics);
@@ -268,17 +260,14 @@ export class ExplorationTracker {
   shouldExit() {
     // Scan 管线: SUMMARIZE 无消费方，直接退出
     if (this.#isTerminalPhase() && this.#pipelineType === 'scan') {
-      this.#emitExitSignal('scan_terminal');
       return true;
     }
     // 终结阶段 + 已给了 3 轮 grace → 退出
     if (this.#isTerminalPhase() && this.#metrics.phaseRounds >= 3) {
-      this.#emitExitSignal('grace_exhausted');
       return true;
     }
     // 硬上限兜底
     if (this.#metrics.iteration >= this.#budget.maxIterations + 2) {
-      this.#emitExitSignal('hard_limit');
       return true;
     }
     // 达到 maxIterations 但未在终结阶段 → 强制转入终结阶段
@@ -292,14 +281,6 @@ export class ExplorationTracker {
       return false;
     }
     return false;
-  }
-
-  #emitExitSignal(reason: string): void {
-    if (this.#signalBus) {
-      this.#signalBus.send('exploration', 'ExplorationTracker.exit', 0, {
-        metadata: { totalIterations: this.#metrics.iteration, reason },
-      });
-    }
   }
 
   /**
@@ -764,16 +745,6 @@ export class ExplorationTracker {
     }
   }
 
-  /**
-   * 推理质量评分 — 委托 PlanTracker
-   * @returns PlanTracker.getQualityMetrics 的总分与分项
-   * @deprecated src、宿主与测试都不调用（PlanTracker.getQualityMetrics 同步废弃）；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getQualityMetrics(trace: ExplorationTrace | null) {
-    return this.#planTracker.getQualityMetrics(trace);
-  }
-
   // ─── 阶段路由内部方法 ──────────────────────────────────
 
   #checkMetricsTransition() {
@@ -872,15 +843,6 @@ export class ExplorationTracker {
         // M1 收尾：深度槽观测面——findings/depthSlotted 是 CG-D 加权调参的唯一测量入口
         `findings=${this.#metrics.memoryFindingCount}, verified=${this.#metrics.verifiedFindingCount ?? 0}, depthSlotted=${this.#metrics.depthSlottedFindingCount ?? 0})`
     );
-
-    // Phase 3: 发射阶段转换信号
-    if (this.#signalBus) {
-      const terminalPhase = this.#getTerminalPhase();
-      const value = newPhase === terminalPhase ? 1.0 : 0.5;
-      this.#signalBus.send('exploration', 'ExplorationTracker.phase', value, {
-        metadata: { from: oldPhase, to: newPhase, iteration: this.#metrics.iteration },
-      });
-    }
   }
 
   #isTerminalPhase() {

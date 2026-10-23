@@ -18,21 +18,8 @@ export type {
 } from './MemoryCoordinator.js';
 export { MemoryCoordinator } from './MemoryCoordinator.js';
 export { MemoryEmbeddingStore } from './MemoryEmbeddingStore.js';
-export type {
-  /**
-   * @deprecated 无消费者：completeDimension 并不按此清单 flush，src 与宿主都不引用；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  DimensionFlushManifest,
-  DistilledContext,
-} from './MemoryFlushContract.js';
-export {
-  /**
-   * @deprecated 无消费者，且投影会丢掉 evidenceRefs；随待决事项②“公开面收窄”删除，
-   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  extractHighPriorityFindings,
-} from './MemoryFlushContract.js';
+// W2a-09 / L6-P25：DimensionFlushManifest 与 extractHighPriorityFindings 无消费者，已删除；只保留 distill 的返回类型。
+export type { DistilledContext } from './MemoryFlushContract.js';
 export { MemoryRetriever } from './MemoryRetriever.js';
 // PersistentMemory 子模块 — 内部拆分后的独立组件
 export {

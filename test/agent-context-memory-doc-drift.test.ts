@@ -134,6 +134,24 @@ describe('agent context/memory/prompts doc drift guard', () => {
     expect(header).toMatch(/tokenUtils\.estimateTokens/);
   });
 
+  it('describes ConversationStore without the members removed in W2a-09', () => {
+    // summarize / list / delete / cleanup / estimateTokens 已删除（L6-P25）：头注释不能再介绍它们或称其“已标废弃”，
+    // 但要写明本类不再生成摘要、旧版本写入的 [对话摘要] 仍会在 load 时保留。
+    const header = fileHeader('src/agent/context/ConversationStore.ts');
+    expect(header).not.toMatch(/summarize\(\)|已标废弃|cleanup|estimateTokens 无/);
+    expect(header).toMatch(/不再生成摘要/);
+    expect(header).toMatch(/\[对话摘要\]/);
+  });
+
+  it('drops the withdrawn tool-list constants from the prompts comments (W2a-09)', () => {
+    // ANALYST_TOOLS / PRODUCER_TOOLS 已删除；EVOLVER_TOOLS 与 v1 buildProducerPrompt 留给 W2b。
+    expect(readSource('src/agent/prompts/index.ts')).not.toMatch(/ANALYST_TOOLS|PRODUCER_TOOLS/);
+    expect(fileHeader('src/agent/prompts/insightProducer.ts')).not.toMatch(
+      /PRODUCER_TOOLS|工具白名单/
+    );
+    expect(fileHeader('src/agent/prompts/insightAnalyst.ts')).not.toMatch(/工具白名单/);
+  });
+
   it('describes NudgeGenerator as a stateful per-run instance with an unreachable force_exit via the tracker', () => {
     const header = fileHeader('src/agent/context/exploration/NudgeGenerator.ts');
     // 类内持有一次性标志与 bootstrap 限流计数，不能再宣称"无状态"。
@@ -149,8 +167,8 @@ describe('agent context/memory/prompts doc drift guard', () => {
     const source = readSource('src/agent/memory/ActiveContext.ts');
     const getStatsDoc = jsDocBefore(source, '  getStats() {');
     expect(getStatsDoc).not.toBe('');
-    // ExplorationTracker.getQualityMetrics 无生产调用方；真实消费者是反思 nudge、LLMInputAssembly 等。
-    expect(getStatsDoc).not.toMatch(/getQualityMetrics 使用/);
+    // PlanTracker / ExplorationTracker.getQualityMetrics 已随 W2a-09 删除；真实消费者是反思 nudge、LLMInputAssembly 等。
+    expect(getStatsDoc).not.toMatch(/getQualityMetrics/);
     expect(getStatsDoc).toMatch(/LLMInputAssembly/);
     // lightweight 只跳过滑动窗口与 buildContext，noteKeyFinding 仍写 Scratchpad。
     const lightweightLines = source

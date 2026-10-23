@@ -3,8 +3,7 @@
  *
  * 从旧 ProducerAgent.js 提取的纯领域逻辑:
  * - Producer System Prompt
- * - 工具白名单（历史常量 PRODUCER_TOOLS，无消费者且与真实工具权限不一致，已标废弃）
- * - 预算常量
+ * - 预算常量（produce 阶段的真实工具面由 tools/runtime/toolsets/GenerateProduce 的 allowedTools 决定）
  * - Prompt 构建器：生产路径只用 v2 buildProducerPromptV2；v1 buildProducerPrompt 仅因公开面冻结
  *   保留，无生产调用方（也不渲染结构化发现与代码证据），已标废弃并随待决事项②处理
  * - 代码上下文注入 (evidenceMap → prompt section)
@@ -133,18 +132,6 @@ ${PRODUCER_SUBMIT_STYLE_ADVISORIES}
 - 直接使用分析文本中已有的代码和描述来提交候选
 - 永远不要因为缺少额外文件读取而跳过知识点 — 分析文本已经包含足够信息
 - 先提交真实候选；sourceRef 不确定时保留已知真实路径，不要编造路径`;
-
-// ──────────────────────────────────────────────────────────────────
-// Producer 工具名单（历史常量）
-// ──────────────────────────────────────────────────────────────────
-
-/**
- * 早期的 Producer 工具白名单。
- * @deprecated 无任何消费者，且与真实权限不一致：系统提示禁止 produce 阶段读代码（这里却含 code），
- *   真实工具面由 tools/runtime/toolsets/GenerateProduce 的 allowedTools 决定。
- *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
- */
-export const PRODUCER_TOOLS = ['code', 'knowledge', 'meta'];
 
 // ──────────────────────────────────────────────────────────────────
 // Producer 预算

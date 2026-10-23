@@ -222,6 +222,10 @@ export interface ExplorationTrace {
 
 /**
  * Bootstrap 策略（有 submit 阶段）
+ *
+ * 仅供内部使用：W2a-09 / L6-P25 已把它从 `./context` 与根出口撤下（context/index.ts 按名转出本模块，
+ * 不含本函数）。唯一调用方是 ExplorationTracker.resolve——未传策略名、显式 'bootstrap' 或未知策略名时
+ * 回退到本策略（未知名另记 warn）。
  * @param isSkillOnly skill-only 维度跳过 PRODUCE 阶段
  * @returns 策略配置
  */

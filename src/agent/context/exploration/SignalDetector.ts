@@ -24,16 +24,13 @@ import { readToolObservation, successfulReadPaths } from '../../utils/toolOutcom
  * @module SignalDetector
  */
 
-// ─── 搜索工具白名单 ───────────────
+// ─── 搜索轮次判定 ───────────────
 
 /**
- * 历史公开常量：只按工具名粗分（code / graph 全部 action 都算），会把 code.read、
- * graph.overview 等非搜索 action 也计入。本仓内部不读取它——搜索轮次判定使用口径更窄的
- * isSearchAction（只认 code.search 与 graph.query）。保留仅因公开面冻结，不要用它判定搜索轮次。
+ * 判断是否为搜索 action：只认 code.search 与 graph.query。
+ * （W2a-09 / L6-P25 删除了按工具名粗分的历史常量 SEARCH_TOOLS——它把 code.read、graph.overview
+ * 等非搜索 action 也计入，且没有任何消费者；搜索轮次判定只以本函数为准。）
  */
-export const SEARCH_TOOLS = new Set(['code', 'graph']);
-
-/** 判断是否为搜索 action（更精确的搜索轮次判定） */
 export function isSearchAction(toolName: string, args: Record<string, unknown>): boolean {
   const action = (args?.action as string) || '';
   if (toolName === 'code') {

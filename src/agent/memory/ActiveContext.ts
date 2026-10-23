@@ -1408,7 +1408,6 @@ export class ActiveContext {
    * 轮次统计指标（轮数、思考/反思条数、工具调用与观察计数、耗时）。
    * 生产读取方: NudgeGenerator 反思 nudge 的累计工具调用数、LLMInputAssembly 的 traceStats 遥测、
    * PcvNodeEvidenceRecorder 的观察台账可读性探针，以及本类 distill() / toJSON() 的 stats 字段。
-   * PlanTracker / ExplorationTracker.getQualityMetrics 也会读取，但这两个方法当前无生产调用方。
    */
   getStats() {
     return {

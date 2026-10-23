@@ -31,8 +31,8 @@
   "packageExportCount": 15,
   "stableExportSignatures": {
     ".": {
-      "exportCount": 149,
-      "signatureHash": "801dcf3d5afb17f9eab5155b4dd89617b54a7ddc589084439df6106fa678c12b",
+      "exportCount": 146,
+      "signatureHash": "70abb9e97da8a661b0a62321bcad770c9b978961df0c50bdc09fd50697876b29",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -315,10 +315,6 @@
           "kind": "class"
         },
         {
-          "name": "SEARCH_TOOLS",
-          "kind": "object"
-        },
-        {
           "name": "STRATEGY_ANALYST",
           "kind": "object"
         },
@@ -407,10 +403,6 @@
           "kind": "function"
         },
         {
-          "name": "createGenerateStrategy",
-          "kind": "function"
-        },
-        {
           "name": "createMissingApiKeyError",
           "kind": "function"
         },
@@ -420,10 +412,6 @@
         },
         {
           "name": "estimateTokens",
-          "kind": "function"
-        },
-        {
-          "name": "extractHighPriorityFindings",
           "kind": "function"
         },
         {
@@ -1151,8 +1139,8 @@
       ]
     },
     "./prompts": {
-      "exportCount": 30,
-      "signatureHash": "d83031b7388e262c32e9b58995a31bfee797a98eb8c5bf152368f3abb7e6c3c9",
+      "exportCount": 28,
+      "signatureHash": "bd35e843500ac2f44fc9ea41a96246a939e857b28b058ddb9d3b0216efc37161",
       "entries": [
         {
           "name": "ANALYST_BUDGET",
@@ -1161,10 +1149,6 @@
         {
           "name": "ANALYST_SYSTEM_PROMPT",
           "kind": "string"
-        },
-        {
-          "name": "ANALYST_TOOLS",
-          "kind": "array"
         },
         {
           "name": "EVOLVER_BUDGET",
@@ -1185,10 +1169,6 @@
         {
           "name": "PRODUCER_SYSTEM_PROMPT",
           "kind": "string"
-        },
-        {
-          "name": "PRODUCER_TOOLS",
-          "kind": "array"
         },
         {
           "name": "SCAN_TASK_CONFIGS",
@@ -1591,8 +1571,8 @@
       ]
     },
     "./memory": {
-      "exportCount": 14,
-      "signatureHash": "1f1dacd0e846c9dcb41be7a4b278528ab45455b3802a76560ac0f4b06920b66f",
+      "exportCount": 13,
+      "signatureHash": "6f52f1345626fc87c19d28bc399b0bb87203325148d880ce61d5ecceac0cde6b",
       "entries": [
         {
           "name": "ActiveContext",
@@ -1643,18 +1623,14 @@
           "kind": "function"
         },
         {
-          "name": "extractHighPriorityFindings",
-          "kind": "function"
-        },
-        {
           "name": "validateSessionStoreShape",
           "kind": "function"
         }
       ]
     },
     "./context": {
-      "exportCount": 21,
-      "signatureHash": "e4a5b2e885a88e836c3c9ebecf601d87b06481b394f84634b828501380eb168a",
+      "exportCount": 19,
+      "signatureHash": "6cd83965ec2d23d0b9ebdaa20d28696b6f96719dd7423d09efb611bc8b6dae02",
       "entries": [
         {
           "name": "ContextWindow",
@@ -1685,10 +1661,6 @@
           "kind": "class"
         },
         {
-          "name": "SEARCH_TOOLS",
-          "kind": "object"
-        },
-        {
           "name": "STRATEGY_ANALYST",
           "kind": "object"
         },
@@ -1702,10 +1674,6 @@
         },
         {
           "name": "buildL4MemoryPackage",
-          "kind": "function"
-        },
-        {
-          "name": "createGenerateStrategy",
           "kind": "function"
         },
         {
@@ -1830,44 +1798,9 @@
     }
   },
   "deprecatedPendingNarrowing": {
-    "description": "L6-P25（C63/C15/C48）：无生产消费者、已在公开面标 @deprecated 但尚未删除的符号登记。待决事项②“公开面收窄”未答复前只加废弃标注：上面的 stableExportSignatures（名字、运行时种类、signatureHash）保持不变；createGenerateStrategy 另依赖事项④。bindings 是签名快照内的运行时绑定，types 是纯类型导出，members 是公开类/构造参数类型上的成员。test/contract-surface.test.ts 校验本登记与源码 JSDoc 双向一致。",
+    "description": "L6-P25（C63/C15/C48）：无生产消费者、已在公开面标 @deprecated 但尚未删除的符号登记。待决事项②“公开面收窄”未答复前只加废弃标注：上面的 stableExportSignatures（名字、运行时种类、signatureHash）保持不变；W2a-09 已删除 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings、ANALYST_TOOLS、PRODUCER_TOOLS、DimensionFlushManifest 及 ConversationStore/PlanTracker/ExplorationTracker/BudgetInput 的登记成员并移出本登记。bindings 是签名快照内的运行时绑定，types 是纯类型导出，members 是公开类/构造参数类型上的成员。test/contract-surface.test.ts 校验本登记与源码 JSDoc 双向一致。",
     "removalPrecondition": "随事项②收窄批次逐项删除；删除前须附 src、test、宿主生产代码与宿主测试的零引用扫描；名字与运行时种类在删除前保持冻结。删除后同步本文件 stableExportSignatures 与本登记。",
     "bindings": [
-      {
-        "name": "SEARCH_TOOLS",
-        "kind": "object",
-        "exports": [
-          ".",
-          "./context"
-        ],
-        "deprecatedAt": "src/agent/context/index.ts"
-      },
-      {
-        "name": "createGenerateStrategy",
-        "kind": "function",
-        "exports": [
-          ".",
-          "./context"
-        ],
-        "deprecatedAt": "src/agent/context/index.ts"
-      },
-      {
-        "name": "extractHighPriorityFindings",
-        "kind": "function",
-        "exports": [
-          ".",
-          "./memory"
-        ],
-        "deprecatedAt": "src/agent/memory/index.ts"
-      },
-      {
-        "name": "ANALYST_TOOLS",
-        "kind": "array",
-        "exports": [
-          "./prompts"
-        ],
-        "deprecatedAt": "src/agent/prompts/insightAnalyst.ts"
-      },
       {
         "name": "EVOLVER_TOOLS",
         "kind": "array",
@@ -1875,14 +1808,6 @@
           "./prompts"
         ],
         "deprecatedAt": "src/agent/prompts/index.ts"
-      },
-      {
-        "name": "PRODUCER_TOOLS",
-        "kind": "array",
-        "exports": [
-          "./prompts"
-        ],
-        "deprecatedAt": "src/agent/prompts/insightProducer.ts"
       },
       {
         "name": "buildProducerPrompt",
@@ -1893,49 +1818,8 @@
         "deprecatedAt": "src/agent/prompts/insightProducer.ts"
       }
     ],
-    "types": [
-      {
-        "name": "DimensionFlushManifest",
-        "exports": [
-          ".",
-          "./memory"
-        ],
-        "deprecatedAt": "src/agent/memory/index.ts"
-      }
-    ],
+    "types": [],
     "members": [
-      {
-        "owner": "ConversationStore",
-        "source": "src/agent/context/ConversationStore.ts",
-        "members": [
-          "cleanup",
-          "delete",
-          "estimateTokens",
-          "list",
-          "summarize"
-        ]
-      },
-      {
-        "owner": "PlanTracker",
-        "source": "src/agent/context/exploration/PlanTracker.ts",
-        "members": [
-          "getQualityMetrics"
-        ]
-      },
-      {
-        "owner": "ExplorationTracker",
-        "source": "src/agent/context/ExplorationTracker.ts",
-        "members": [
-          "getQualityMetrics"
-        ]
-      },
-      {
-        "owner": "BudgetInput",
-        "source": "src/agent/context/ExplorationTracker.ts",
-        "members": [
-          "signalBus"
-        ]
-      },
       {
         "owner": "ActiveContext",
         "source": "src/agent/memory/ActiveContext.ts",

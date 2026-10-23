@@ -2700,38 +2700,68 @@ describe('MemoryRetriever no-query ranking', () => {
   });
 });
 
+/** 对话索引条目在 index.json 中的形状（只列测试读取的字段）。 */
+interface ConversationIndexEntry {
+  id: string;
+  category: string;
+  title: string;
+  updatedAt: string;
+  messageCount: number;
+  hasSummary: boolean;
+}
+
+/**
+ * 直接读对话索引 JSON：list/delete/cleanup 已随 W2a-09（L6-P25）删除，索引顺序（最近活跃优先）与条目字段
+ * 改由索引文件本身观察；索引文件不存在时返回空数组。
+ */
+function readConversationIndex(conversationsDir: string): ConversationIndexEntry[] {
+  const indexPath = join(conversationsDir, 'index.json');
+  if (!existsSync(indexPath)) {
+    return [];
+  }
+  return JSON.parse(readFileSync(indexPath, 'utf8')) as ConversationIndexEntry[];
+}
+
 describe('ConversationStore', () => {
-  it('rejects conversation ids that escape the store for reads, appends and deletes', () => {
+  it('rejects conversation ids that escape the store for reads and appends', () => {
     const root = makeTempRoot('conversation-id-boundary');
     const store = new ConversationStore(root);
-    store.create();
+    const legit = store.create();
     const victim = join(root, 'victim.jsonl');
     const original = `${JSON.stringify({ role: 'user', content: 'outside conversation store' })}\n`;
     writeFileSync(victim, original);
-    expect(store.load('../../victim')).toEqual([]);
-    store.append('../../victim', { role: 'user', content: 'overwritten' });
-    store.delete('../../victim');
-    expect(readFileSync(victim, 'utf8')).toBe(original);
-  });
-
-  it('does not overwrite messages appended while a summary is being generated', async () => {
-    const root = makeTempRoot('conversation-summary-race');
-    const store = new ConversationStore(root);
-    const id = store.create();
-    for (let index = 0; index < 6; index++) {
-      store.append(id, { role: 'user', content: `message ${index}` });
+    const logger = Logger.getInstance();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const maliciousIds = [
+      '../../victim',
+      'nested/../../victim',
+      '..',
+      '.',
+      'back\\slash',
+      'nul\0id',
+      '',
+    ];
+    for (const maliciousId of maliciousIds) {
+      expect({ maliciousId, history: store.load(maliciousId) }).toEqual({
+        maliciousId,
+        history: [],
+      });
+      store.append(maliciousId, { role: 'user', content: 'overwritten' });
     }
-    const summarized = await store.summarize(id, {
-      aiProvider: {
-        chat: async () => {
-          store.append(id, { role: 'user', content: 'arrived during summary' });
-          return 'summary';
-        },
-      },
-    });
-    expect(summarized).toBe(false);
-    expect(store.load(id)).toHaveLength(7);
-    expect(store.load(id).at(-1)?.content).toBe('arrived during summary');
+    expect(readFileSync(victim, 'utf8')).toBe(original);
+    // 非法 id 在写文件前就被拒绝，也不会经“未登记 id 自动登记”混进索引。
+    expect(
+      readConversationIndex(join(root, '.asd', 'conversations')).map((entry) => entry.id)
+    ).toEqual([legit]);
+    // 两条降级路径都留痕：读取返回空历史、追加放弃写入，日志里写明原因。
+    const warnings = warn.mock.calls.map((call) => String(call[0]));
+    const rejected = (marker: string) =>
+      warnings.filter(
+        (message) => message.includes(marker) && message.includes('Invalid conversation id')
+      );
+    expect(rejected('history read failed')).toHaveLength(maliciousIds.length);
+    expect(rejected('append failed')).toHaveLength(maliciousIds.length);
   });
 
   it('persists conversation index and loads only valid JSONL messages within budget', () => {
@@ -2745,20 +2775,19 @@ describe('ConversationStore', () => {
       flag: 'a',
     });
 
-    expect(store.list({ category: 'user' })[0]).toMatchObject({
-      id: conversationId,
-      messageCount: 2,
-      title: 'remember the host boundary',
-    });
+    expect(readConversationIndex(join(root, '.asd', 'conversations'))).toMatchObject([
+      {
+        id: conversationId,
+        category: 'user',
+        messageCount: 2,
+        title: 'remember the host boundary',
+        hasSummary: false,
+      },
+    ]);
     expect(store.load(conversationId)).toEqual([
       { role: 'user', content: 'remember the host boundary' },
       { role: 'assistant', content: 'recorded' },
     ]);
-
-    store.delete(conversationId);
-
-    expect(store.list({ category: 'user' })).toEqual([]);
-    expect(store.load(conversationId)).toEqual([]);
   });
 });
 
@@ -2787,13 +2816,13 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
       older.push(store.create());
     }
     store.append(active, { role: 'assistant', content: 'still chatting' });
-    // 最近活跃的对话排在列表首位，而不是停留在创建顺序的尾部。
-    expect(store.list({ limit: 1 })[0]?.id).toBe(active);
+    // 最近活跃的对话排在索引首位，而不是停留在创建顺序的尾部。
+    expect(readConversationIndex(conversationsDir(root))[0]?.id).toBe(active);
     for (let index = 0; index < 50; index++) {
       store.create();
     }
 
-    const ids = store.list({ limit: 1000 }).map((entry) => entry.id);
+    const ids = readConversationIndex(conversationsDir(root)).map((entry) => entry.id);
     expect(ids).toHaveLength(100);
     expect(ids).toContain(active);
     expect(existsSync(join(conversationsDir(root), `${active}.jsonl`))).toBe(true);
@@ -2816,7 +2845,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     writeFileSync(join(conversationsDir(root), 'index.json'), '[{"id":"trunc');
     const logs = captureConversationLogs();
     const id = store.create();
-    expect(store.list()).toMatchObject([{ id }]);
+    expect(readConversationIndex(conversationsDir(root))).toMatchObject([{ id }]);
     expect(logs.warn().some((message) => message.includes('index unreadable'))).toBe(true);
   });
 
@@ -2838,7 +2867,11 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     );
     const store = new ConversationStore(root);
     const logs = captureConversationLogs();
-    expect(store.list().map((entry) => entry.id)).toEqual(['kept-entry']);
+    // create / append 读索引时都会过滤非法条目；经 append 触发，下一次保存即把它们移出索引。
+    store.append('kept-entry', { role: 'user', content: 'still here' });
+    expect(readConversationIndex(conversationsDir(root)).map((entry) => entry.id)).toEqual([
+      'kept-entry',
+    ]);
     expect(logs.warn().some((message) => message.includes('dropped 3 invalid index entr'))).toBe(
       true
     );
@@ -2868,7 +2901,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     writes.mockRestore();
 
     expect(readFileSync(indexPath, 'utf8')).toBe(before);
-    expect(store.list().map((entry) => entry.id)).toEqual([first]);
+    expect(readConversationIndex(conversationsDir(root)).map((entry) => entry.id)).toEqual([first]);
     expect(fs.readdirSync(conversationsDir(root)).filter((name) => name.endsWith('.tmp'))).toEqual(
       []
     );
@@ -2883,7 +2916,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     store.append('client-made-id', { role: 'user', content: question });
     store.append('client-made-id', { role: 'assistant', content: 'answer' });
 
-    expect(store.list()).toMatchObject([
+    expect(readConversationIndex(conversationsDir(root))).toMatchObject([
       {
         id: 'client-made-id',
         category: 'user',
@@ -2902,7 +2935,9 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     for (let index = 0; index < 100; index++) {
       store.create();
     }
-    expect(store.list({ limit: 1000 }).map((entry) => entry.id)).not.toContain('client-made-id');
+    expect(readConversationIndex(conversationsDir(root)).map((entry) => entry.id)).not.toContain(
+      'client-made-id'
+    );
     expect(existsSync(join(conversationsDir(root), 'client-made-id.jsonl'))).toBe(false);
   });
 
@@ -2918,7 +2953,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     );
     const store = new ConversationStore(root);
     store.append('orphan', { role: 'assistant', content: 'late reply' });
-    expect(store.list()).toMatchObject([
+    expect(readConversationIndex(conversationsDir(root))).toMatchObject([
       { id: 'orphan', category: 'user', title: 'orphan question', messageCount: 3 },
     ]);
   });
@@ -2934,7 +2969,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     } as never);
     const store = new ConversationStore(projectRoot, zone);
     store.append('zone-client-id', { role: 'user', content: 'zone question' });
-    expect(store.list()).toMatchObject([
+    expect(readConversationIndex(zone.runtime('conversations').absolute)).toMatchObject([
       { id: 'zone-client-id', title: 'zone question', messageCount: 1 },
     ]);
     expect(store.load('zone-client-id')).toEqual([{ role: 'user', content: 'zone question' }]);
@@ -2957,7 +2992,7 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     ).toBe(true);
   });
 
-  it('warns when a conversation history file cannot be deleted', () => {
+  it('warns when an evicted conversation history file cannot be deleted', () => {
     const root = makeTempRoot('conversation-delete-failure');
     const store = new ConversationStore(root);
     const id = store.create();
@@ -2965,11 +3000,23 @@ describe('ConversationStore persistence robustness (L6-P19)', () => {
     mkdirSync(blocked, { recursive: true });
     writeFileSync(join(blocked, 'keep'), 'x');
     const logs = captureConversationLogs();
-    store.delete(id);
-    expect(store.list()).toEqual([]);
+    // 公开的 delete 已删除；历史文件删除只剩 LRU 淘汰一条路径：100 个更新的对话让它成为最久未活跃条目。
+    for (let index = 0; index < 100; index++) {
+      store.create();
+    }
+    expect(readConversationIndex(conversationsDir(root)).map((entry) => entry.id)).not.toContain(
+      id
+    );
+    expect(
+      logs
+        .info()
+        .some((message) => message.includes('evicted conversation') && message.includes(id))
+    ).toBe(true);
+    // 删除失败不阻断索引更新，但文件残留必须留痕。
     expect(
       logs.warn().some((message) => message.includes(id) && message.includes('delete failed'))
     ).toBe(true);
+    expect(existsSync(join(blocked, 'keep'))).toBe(true);
   });
 });
 
@@ -3227,7 +3274,10 @@ describe('conversation input and read boundary', () => {
     const store = new ConversationStore(projectRoot, zone);
     const id = store.create();
     store.append(id, { role: 'user', content: 'data-zone fact' });
-    expect(store.list()[0]).toMatchObject({ id, messageCount: 1 });
+    expect(readConversationIndex(zone.runtime('conversations').absolute)[0]).toMatchObject({
+      id,
+      messageCount: 1,
+    });
     expect(store.load(id)).toEqual([{ role: 'user', content: 'data-zone fact' }]);
     expect(existsSync(join(projectRoot, '.asd/conversations'))).toBe(false);
   });
@@ -3247,13 +3297,13 @@ describe('conversation input and read boundary', () => {
       { role: 'assistant', content: 'valid last' },
     ]);
   });
-  it('recovers a malformed index shape without throwing from create/list', () => {
+  it('recovers a malformed index shape without throwing from create', () => {
     const root = makeTempRoot('conversation-index');
     const store = new ConversationStore(root);
     store.create();
     writeFileSync(join(root, '.asd/conversations/index.json'), '{"unexpected":true}');
     const id = store.create();
-    expect(store.list()).toMatchObject([{ id }]);
+    expect(readConversationIndex(join(root, '.asd/conversations'))).toMatchObject([{ id }]);
   });
   it.each([
     0, 1, 20, 60,
