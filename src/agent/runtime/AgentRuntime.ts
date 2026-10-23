@@ -22,6 +22,7 @@ import { isPersistedSubmission, readToolObservation } from '../utils/toolOutcome
  *   - AI 错误恢复: consecutiveAiErrors 2-strike → context reset → forced summary
  *   - 空响应重试: consecutiveEmptyResponses + rollback (system 场景)
  *   - 熔断器感知: gateway ReliabilityController 熔断 → chatWithTools 抛 CIRCUIT_OPEN → 合成摘要兜底
+ *   - provider 契约违约: 未覆写 chatWithTools 抛 PROVIDER_CONTRACT_VIOLATION → runtime_defect 一次即终止，不重试
  *   - 工具调用数量限制: MAX_TOOL_CALLS_PER_ITER = 8
  *   - 提交去重: submittedTitles / submittedPatterns
  *   - cleanFinalAnswer: 去除 nudge 噪声
@@ -184,6 +185,13 @@ interface LlmDispatchInput {
 const LLM_INPUT_ASSEMBLY_FAILED_CODE = 'llm_input_assembly_failed';
 /** I08：本地运行缺陷终止的 cancelReason；不与 provider_error / provider_circuit_open 混用。 */
 const RUNTIME_DEFECT_CANCEL_REASON = 'runtime_defect';
+/**
+ * W2a-11r1：AiProvider 基类 chatWithTools 未被覆写时附带的错误码。字面量与 src/ai/AiProvider.ts 一致
+ * （那边不导出常量，避免改变冻结的公开签名），与 'CIRCUIT_OPEN' 一样按字面量契约对齐。
+ */
+const PROVIDER_CONTRACT_VIOLATION_ERROR_CODE = 'PROVIDER_CONTRACT_VIOLATION';
+/** W2a-11r1：provider 集成缺陷的诊断码；与 ai_error 区分，宿主据此判断是集成缺陷而非上游暂时故障。 */
+const PROVIDER_CONTRACT_VIOLATION_CODE = 'provider_contract_violation';
 
 /** runtime 私有阶段（L5-P46）：与公开结果 `AgentResult.state.phase` 同一字面量联合。 */
 type RuntimePhase = AgentResult['state']['phase'];
@@ -1409,6 +1417,11 @@ export class AgentRuntime {
       ctx.consecutiveAiErrors = 0;
     } catch (aiErr: unknown) {
       const normalized = normalizeAiError(aiErr);
+      // W2a-11r1：按错误码（不按消息文本）识别 provider 契约违约——注入的 provider 没有覆写 chatWithTools，
+      // 重试必然再失败，不能进入下面的 2-strike / 2000ms 重试链路。调用方已取消时取消优先，仍走 #handleAiError。
+      if (normalized.code === PROVIDER_CONTRACT_VIOLATION_ERROR_CODE && !ctx.abortSignal?.aborted) {
+        return this.#handleProviderContractViolation(ctx, aiErr, llmTrace, llmStartedAt);
+      }
       this.logger.warn(`[AgentRuntime] LLM call failed ${formatLoopTrace(llmTrace)}`, {
         ...llmTrace,
         durationMs: Date.now() - llmStartedAt,
@@ -1706,10 +1719,52 @@ export class AgentRuntime {
   }
 
   /**
+   * provider 契约违约（W2a-11r1）— 注入的 provider 没有覆写 chatWithTools，AiProvider 基类以
+   * code=PROVIDER_CONTRACT_VIOLATION 拒绝。这是永久性集成缺陷，参照 #handleLlmInputAssemblyFailure 按运行缺陷终止：
+   *   - 不计入 consecutiveAiErrors、不记 ai_error、不进入 2-strike 重试与 2000ms 等待（同一 provider 重试必然再失败）；
+   *     该错误在任何 Gateway 之前抛出，本来就不计入 gateway 熔断；
+   *   - 诊断记 provider_contract_violation + cancelReason=runtime_defect 并标记 degraded，
+   *     #finalize 据 runtime_defect 抑制强制摘要（摘要请求同样调用 chatWithTools）；
+   *   - 回复写明是 provider 集成缺陷（未实现 chatWithTools），不再误导为“AI 服务暂时不可用，请稍后重试”。
+   * 诊断先于日志写入：即使宿主 logger 本身抛错，终态归类也已落盘。
+   */
+  #handleProviderContractViolation(
+    ctx: LoopContext,
+    providerErr: unknown,
+    llmTrace: Record<string, unknown>,
+    llmStartedAt: number
+  ): null {
+    const normalized = normalizeAiError(providerErr);
+    ctx.diagnostics?.warn({
+      code: PROVIDER_CONTRACT_VIOLATION_CODE,
+      message: `Provider integration defect (${normalized.message}): the injected provider does not implement chatWithTools; run terminated as ${RUNTIME_DEFECT_CANCEL_REASON} without retry`,
+    });
+    ctx.diagnostics?.recordCancelReason(RUNTIME_DEFECT_CANCEL_REASON);
+    ctx.diagnostics?.markDegraded();
+    this.logger.warn(
+      `[AgentRuntime] provider contract violation — runtime defect, chatWithTools not implemented, no retry ${formatLoopTrace(llmTrace)}: ${normalized.message}`,
+      {
+        ...llmTrace,
+        code: PROVIDER_CONTRACT_VIOLATION_CODE,
+        errorCode: normalized.code ?? null,
+        cancelReason: RUNTIME_DEFECT_CANCEL_REASON,
+        durationMs: Date.now() - llmStartedAt,
+        error: normalized.message,
+        consecutiveAiErrors: ctx.consecutiveAiErrors,
+      }
+    );
+    if (!ctx.isSystem) {
+      ctx.lastReply = `抱歉，AI provider 集成缺陷：当前注入的 provider 未实现 chatWithTools（${normalized.message}），本次请求已终止且未重试。这不是 AI 服务的暂时故障，请检查宿主注入的 provider 实现。`;
+    }
+    return null;
+  }
+
+  /**
    * AI 错误处理 — 熔断器感知 + 2-strike 策略
    *
    * 只接收 provider 调用（chatWithTools）抛出的异常；本地输入装配缺陷由
-   * #handleLlmInputAssemblyFailure 单独归类。provider 可能 reject 任意值（字符串、普通对象），
+   * #handleLlmInputAssemblyFailure、provider 契约违约（PROVIDER_CONTRACT_VIOLATION）由
+   * #handleProviderContractViolation 单独归类。provider 可能 reject 任意值（字符串、普通对象），
    * 入口先归一为 { message, code }，避免把 'undefined' 写进 ai_error 诊断或让熔断码判断失效。
    *
    * 本方法是 AI 错误退出的唯一生效判定（I34）：ExitController.checkAfterAiError 是未接线的平行方法，
@@ -2405,11 +2460,16 @@ export class AgentRuntime {
 
     // I08：本地输入装配缺陷终止的运行不再发强制摘要（摘要请求同样不会修复本地缺陷）；
     // 放在超时判定之前，避免超时分支把 runtime_defect 改写成 stage_timeout。
+    // W2a-11r1：provider 契约违约同样以 runtime_defect 终止，按诊断码给出对应的停止说明。
     if (cancelReason === RUNTIME_DEFECT_CANCEL_REASON) {
+      const providerContractDefect = diagnostics?.warnings.some(
+        (warning) => warning.code === PROVIDER_CONTRACT_VIOLATION_CODE
+      );
       return {
         code: RUNTIME_DEFECT_CANCEL_REASON,
-        message:
-          'LLM input assembly failed locally before provider dispatch; summary request suppressed',
+        message: providerContractDefect
+          ? 'Provider integration defect: the injected provider does not implement chatWithTools; summary request suppressed'
+          : 'LLM input assembly failed locally before provider dispatch; summary request suppressed',
       };
     }
 

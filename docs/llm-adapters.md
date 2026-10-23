@@ -11,7 +11,7 @@ OpenAI、Ollama、Google、Claude、DeepSeek 的生成协议均由固定版本�
 | Claude | Anthropic SDK 原生协议 | 继续明确声明不支持 |
 | DeepSeek | DeepSeek SDK 原生协议，保留 V4 策略和文本工具兼容 | SDK 无此接口；保留已有可配置 `/embeddings` 兼容端点并验证返回向量，不宣称官方 DeepSeek 服务支持 |
 
-调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。5 个内置 Provider 都覆写 `chatWithTools` 走原生函数调用；`AiProvider` 不支持只实现 `chat()` 的外部子类，基类 `chatWithTools` 记 `chatWithTools_not_overridden` 诊断后抛 `Error('<name> must override chatWithTools')`，不再静默降级为丢弃工具声明与工具结果的纯文本 `chat()`。Transport 只保留 `chatWithTools` 一个生成入口，Transport 级 `chat` / `chatStructured` 已删除：文本取 `(await transport.chatWithTools(request)).text`，结构化输出与本地 schema 校验经 `LLMGateway.chatStructured`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。显式 embedding 兼容调用的已完成批次保留在本次调用局部，后续批次失败不会重放它们。
+调用链为 `AiProvider → LLMGateway → Transport → 模型服务`。5 个内置 Provider 都覆写 `chatWithTools` 走原生函数调用；`AiProvider` 不支持只实现 `chat()` 的外部子类，基类 `chatWithTools` 记 `chatWithTools_not_overridden` 诊断后抛 `Error('<name> must override chatWithTools')`（`code=PROVIDER_CONTRACT_VIOLATION`；AgentRuntime 据此一次即以 `runtime_defect` 终止，不重试），不再静默降级为丢弃工具声明与工具结果的纯文本 `chat()`。Transport 只保留 `chatWithTools` 一个生成入口，Transport 级 `chat` / `chatStructured` 已删除：文本取 `(await transport.chatWithTools(request)).text`，结构化输出与本地 schema 校验经 `LLMGateway.chatStructured`。SDK 使用公开的 V4 单次模型接口 `doGenerate` / `doEmbed`；它不执行 Alembic 工具、不自动修复工具调用，也不负责网络重试。Gateway 继续管理并发、限流、熔断和重试，AgentRuntime 继续管理运行预算、阶段和工具权限。显式 embedding 兼容调用的已完成批次保留在本次调用局部，后续批次失败不会重放它们。
 
 `contracts.ts` 是工具调用字段和请求级 `TokenUsagePayload` 的共同定义。历史消息、Provider 与 Transport 共用工具调用结构；旧 `TransportFunctionCall` 名称仍可导入，Transport 的 `usage` 必填且可为 null，公开 Provider 结果仍允许省略。Gateway 保留逐字段的白名单投影与空值兼容。`sdkContext.ts` 负责 SDK 调用身份和续接摘要，protocol 与 continuation 都依赖这个叶子模块。
 
@@ -37,7 +37,7 @@ Provider、Gateway、直接 Transport 在创建时固定模型服务配置，惰
 
 Gateway 的裸模型名优先匹配 Registry 中的 API model ID，未注册名称才沿用厂商名称推断；显式 provider 前缀始终优先。请求参数直接使用 ParameterGuard 的输出，包括非法 effort 被替换后的模型默认值；受支持的数值参数拒绝非有限数，maxTokens 要求正安全整数。合法的范围裁剪和不支持参数的过滤行为保持不变。
 
-代理缓存按 URL 共享初始化；请求在等待初始化前取得借用，LRU 驱逐先放弃缓存所有权，最后一个请求释放后才关闭 dispatcher。清理时未完成的旧初始化不能复活缓存或让旧请求转为直连。SDK 与显式兼容 HTTP 入口共用安全错误投影，保留状态码和 Retry-After 秒/日期/毫秒值，普通错误不复制响应正文或 URL。Factory 按已知状态判断暂时失败与提供商限制，429、5xx、网络错误和取消不因错误文案出现 blocked 而切换厂商。`getProviderWithFallback()` 是唯一的 provider 级 fallback 入口：主 provider 的 `probe()` 解析为 `false`（例如空文本应答）或抛出提供商限制时，按配置顺序构造第一个可用的 fallback，并记 `fallback_selected` 诊断（含来源 provider 与 `probe_unavailable` / `provider_restriction` 原因）；fallback 来源不再写入 provider 实例字段。Gateway 不再提供 `probe` 或候选模型链探活。
+代理缓存按 URL 共享初始化；请求在等待初始化前取得借用，LRU 驱逐先放弃缓存所有权，最后一个请求释放后才关闭 dispatcher。清理时未完成的旧初始化不能复活缓存或让旧请求转为直连。SDK 与显式兼容 HTTP 入口共用安全错误投影，保留状态码和 Retry-After 秒/日期/毫秒值，普通错误不复制响应正文或 URL。Factory 按已知状态判断暂时失败与提供商限制，429、5xx、网络错误和取消不因错误文案出现 blocked 而切换厂商。`getProviderWithFallback()` 是唯一的 provider 级 fallback 入口：主 provider 的 `probe()` 解析为 `false`（成功返回却没有任何应答证据）或抛出提供商限制时，按配置顺序构造第一个可用的 fallback，并记 `fallback_selected` 诊断（含来源 provider 与 `probe_unavailable` / `provider_restriction` 原因），全部 fallback 构造失败而回到主 provider 时记汇总 `fallback_exhausted` 警告；fallback 来源不再写入 provider 实例字段。Gateway 不再提供 `probe` 或候选模型链探活。
 
 兼容默认仍保留：Facade 超时 300 秒，直接 Gateway/Transport 超时 120 秒；Facade 默认重试 3 次，Claude 默认 0 次；Google 默认并发 2（Facade 与直接构造 Gateway 一致，均按 provider 解析并尊重 `ALEMBIC_GEMINI_MAX_CONCURRENCY`），其余 provider 默认 4；直接构造 Gateway 时显式传入的 `maxConcurrency` 对所有 provider 生效。Ollama Facade 的默认地址为 `localhost:11434/v1`，直接 Gateway 的注册默认为 `127.0.0.1:11434/v1`。自动发现顺序仍为 Google→OpenAI→Claude→DeepSeek，错误回退候选顺序仍为 Google→OpenAI→DeepSeek→Claude。
 
@@ -96,7 +96,7 @@ const value = await provider.chatWithStructuredOutput('生成标题', {
 | `chat` / `chatWithTools` | 请求失败抛错；非法工具参数不会变成可执行的 `{}` | 抛 `AbortError` |
 | `chatWithStructuredOutput` | 解析或 schema 不符返回 `null`；请求失败仍抛错 | 抛 `AbortError` |
 | `embed` | 旧 facade 对普通失败返回 `[]`，保留上层检索降级；直接 transport 抛错 | 抛 `AbortError`，不降为空向量 |
-| `AiProvider.probe` | 请求错误抛错；空文本应答返回 `false`，`getProviderWithFallback` 据此改用 fallback | 抛 `AbortError` |
+| `AiProvider.probe` | 按连通性判定：成功返回且带应答证据（可见文本、工具调用、推理、已计费用量或预算截断）即为 `true`，thinking 模型只产出推理时同样可用；成功返回却无任何证据时返回 `false`，`getProviderWithFallback` 据此改用 fallback；鉴权、网络、期限等请求错误抛错 | 抛 `AbortError` |
 
 宿主必须逐级转发 signal。Provider 接受取消参数不代表 Core 搜索、批量 embedding 或所有后台 job 已自动获得父取消信号。不要用全局可变 signal 绑定共享 provider。
 

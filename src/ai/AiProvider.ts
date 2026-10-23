@@ -38,9 +38,65 @@ const PROBE_TIMEOUT_MS = 30_000;
 /** probe 专用 Gateway 的重试上限：探测只回答“此刻能否连通”，失败应立即带原因返回而不是退避重放。 */
 const PROBE_MAX_RETRIES = 0;
 
+/**
+ * probe 的输出预算（token）。判定不依赖可见文本（见 probeResponseEvidence），因此不为 thinking 模型放大预算，
+ * 也不在探针里关闭思考：各厂商关闭思考的参数不一（Gemini 3 只能降到最低档、不能完全关闭），
+ * 引入厂商特化参数只会让探针与业务请求的参数口径分叉；16 token 让探测成本保持最低。
+ */
+const PROBE_MAX_TOKENS = 16;
+
+/**
+ * finishReason 中表示“因输出预算截断”的厂商取值（小写比较）：
+ * Gemini MAX_TOKENS、Claude max_tokens、OpenAI/DeepSeek/Ollama length、Responses incomplete。
+ */
+const PROBE_TRUNCATION_FINISH_REASONS = new Set([
+  'length',
+  'max_tokens',
+  'max_output_tokens',
+  'incomplete',
+]);
+
+/**
+ * 基类 chatWithTools 拒绝时附带的错误码（W2a-11r1）。
+ * 字面量与 AgentRuntime 的分类常量必须一致；本仓不从这里导出常量（AiProvider.ts 经 `./ai` 整体再导出，
+ * 新增导出会改变冻结的公开签名），与 Gateway 的 'CIRCUIT_OPEN' 一样按字面量契约对齐。
+ */
+const PROVIDER_CONTRACT_VIOLATION_CODE = 'PROVIDER_CONTRACT_VIOLATION';
+
 /** 取消类错误（本仓 AbortError 归一化结果，或不合作子类原样抛出的 TimeoutError）。 */
 function isCancellationError(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError');
+}
+
+/**
+ * probe 应答证据（W2a-11r1）：一次成功返回的调用里能证明“模型确实应答过”的事实。
+ * probe 回答的是“此刻能否连通并通过鉴权”，不以可见文本是否为空判定——thinking/reasoning 模型在
+ * PROBE_MAX_TOKENS 内常常只产出推理（Gemini finishReason=MAX_TOKENS 且只有 thoughtsTokenCount，
+ * OpenAI/DeepSeek/Ollama 空 content 加 reasoning，Claude 只有 thinking 块），这些都是已计费的健康调用。
+ * 证据任一成立即判可用：可见文本、工具调用、推理内容、已上报的计费用量、因预算截断结束。
+ * 全部缺失（2xx 但无文本、无用量、非截断结束）时无法证明模型应答，probe 返回 false。
+ */
+function probeResponseEvidence(result: ChatWithToolsResult): string[] {
+  const evidence: string[] = [];
+  if (typeof result.text === 'string' && result.text.length > 0) {
+    evidence.push('visible_text');
+  }
+  if (Array.isArray(result.functionCalls) && result.functionCalls.length > 0) {
+    evidence.push('tool_calls');
+  }
+  if (typeof result.reasoningContent === 'string' && result.reasoningContent.length > 0) {
+    evidence.push('reasoning');
+  }
+  const usage = result.usage;
+  if (usage && (usage.inputTokens || 0) + (usage.outputTokens || 0) > 0) {
+    evidence.push('billed_usage');
+  }
+  const finishReason =
+    typeof result.finishReason === 'string' ? result.finishReason.toLowerCase() : '';
+  if (PROBE_TRUNCATION_FINISH_REASONS.has(finishReason)) {
+    evidence.push('truncated_finish');
+  }
+  return evidence;
 }
 
 export class AiProvider {
@@ -139,8 +195,15 @@ export class AiProvider {
    *   Transport 的 runOperation 在信号触发时先确定终态，即使 fetch 不响应 abort 也按期返回。
    * - 直接继承基类、只实现 chat() 的自定义子类没有 Gateway 路由，仍走它自己的 chat()：
    *   重试与用量归子类自己管，期限只能经合成信号协作生效（子类忽略信号时无法强制中断）。
-   * - 失败一律带原因抛出（宿主会把 message 展示给用户），不吞成 false；只有连通但应答为空文本时返回 false，
-   *   AiFactory.getProviderWithFallback 据此改用已配置的 fallback provider。
+   * - 判定口径（W2a-11r1）：probe 回答“此刻能否连通并通过鉴权”。内置 provider 经 probe Gateway 的
+   *   chatWithTools 拿到完整应答，只要带任一应答证据（见 probeResponseEvidence：可见文本、工具调用、推理、
+   *   已计费用量、预算截断）即判可用——thinking 模型在探针预算内只产出推理时不再被判为不可用；
+   *   可用但无可见文本时记 info `probe_reachable_without_visible_text`（只含证据名与计数，不含应答内容）。
+   *   成功返回却没有任何证据时记 warn `probe_no_response_evidence` 并返回 false。
+   *   自定义子类的 chat() 只暴露文本、没有用量与 finishReason，仍以非空文本为唯一证据，空文本返回 false
+   *   并记 warn `probe_empty_text`。
+   * - 失败一律带原因抛出（鉴权、网络、期限等；宿主会把 message 展示给用户），不吞成 false；
+   *   AiFactory.getProviderWithFallback 在 false 或 provider 级限制时改用已配置的 fallback provider。
    */
   async probe(opts: LlmCallOptions = {}) {
     const callerSignal = opts.abortSignal;
@@ -156,17 +219,50 @@ export class AiProvider {
       );
     }
     try {
-      const text = viaGateway
-        ? await (await this.#getProbeGateway()).chat({
-            modelRef: this._modelRef,
-            prompt: 'ping',
-            maxTokens: 16,
-            temperature: 0,
-            usageSource: 'probe',
-            abortSignal: signal,
-          })
-        : await this.chat('ping', { maxTokens: 16, temperature: 0, abortSignal: signal });
-      return !!text;
+      if (!viaGateway) {
+        const text = await this.chat('ping', {
+          maxTokens: PROBE_MAX_TOKENS,
+          temperature: 0,
+          abortSignal: signal,
+        });
+        if (text) {
+          return true;
+        }
+        this._log(
+          'warn',
+          `[${this.name}] probe_empty_text path=subclass_chat; subclass chat() exposes only text (no usage or finishReason evidence), probe resolved false`
+        );
+        return false;
+      }
+      // 直接取 Gateway.chatWithTools 的完整应答（Gateway.chat 只回文本，会丢掉用量与 finishReason 证据）；
+      // 请求形态与原 Gateway.chat('ping') 相同：单条 user 消息、不带工具、零重试、用量来源 probe。
+      const result = await (await this.#getProbeGateway()).chatWithTools({
+        modelRef: this._modelRef,
+        messages: [{ role: 'user', content: 'ping' }],
+        maxTokens: PROBE_MAX_TOKENS,
+        temperature: 0,
+        usageSource: 'probe',
+        abortSignal: signal,
+      });
+      const evidence = probeResponseEvidence(result);
+      const usageState = result.usage
+        ? `inputTokens=${result.usage.inputTokens ?? 0} outputTokens=${result.usage.outputTokens ?? 0} reasoningTokens=${result.usage.reasoningTokens ?? 0}`
+        : 'usage=unreported';
+      const finishReason = result.finishReason ?? 'unknown';
+      if (evidence.length === 0) {
+        this._log(
+          'warn',
+          `[${this.name}] probe_no_response_evidence finishReason=${finishReason} ${usageState}; successful call carried no text, tool call, reasoning, billed usage or truncated finish, probe resolved false`
+        );
+        return false;
+      }
+      if (!evidence.includes('visible_text')) {
+        this._log(
+          'info',
+          `[${this.name}] probe_reachable_without_visible_text evidence=${evidence.join(',')} finishReason=${finishReason} ${usageState}; judged available by connectivity, visible text not required`
+        );
+      }
+      return true;
     } catch (err: unknown) {
       // 只有“期限已到、调用方未取消、且失败本身是取消类错误”才归为期限失败；
       // 与期限竞速先到的真实错误（HTTP 状态、缺 key 等）原样抛出，保留更具体的原因。
@@ -218,8 +314,10 @@ export class AiProvider {
    * 基类默认实现不再降级为纯文本 chat()——旧降级会静默丢弃 toolSchemas、toolChoice 与 role='tool'
    * 消息，调用方拿到“模型没有调用工具”的假结果。现在每次调用都先记 warn 诊断
    * `chatWithTools_not_overridden`（只含工具数与消息数，不含工具名、消息正文或 prompt），
-   * 再抛 `Error('<name> must override chatWithTools')`，且绝不调用 chat()。
-   * 该错误在任何 Gateway 之前抛出，不经过 ReliabilityController，因此不计入熔断，也不会被网关重试。
+   * 再抛 `Error('<name> must override chatWithTools')`（附 code=PROVIDER_CONTRACT_VIOLATION），且绝不调用 chat()。
+   * 该错误在任何 Gateway 之前抛出，不经过 ReliabilityController，因此不计入熔断，也不会被网关重试；
+   * AgentRuntime 按该 code 把它归为运行时缺陷（W2a-11r1）：一次即终止、不进入 2-strike 重试与 2000ms 等待、
+   * cancelReason=runtime_defect，回复写明是 provider 集成缺陷而不是“AI 服务暂时不可用”。
    *
    * 统一消息格式 (Provider-Agnostic):
    *   - { role: 'user', content: 'text' }
@@ -245,7 +343,10 @@ export class AiProvider {
       'warn',
       `[${this.name}] chatWithTools_not_overridden tools=${toolCount} messages=${messageCount}; rejected without calling chat()`
     );
-    throw new Error(`${this.name} must override chatWithTools`);
+    // 永久性集成缺陷：code 让调用方按类型（而非消息文本）归类为不可重试的运行时缺陷。
+    throw Object.assign(new Error(`${this.name} must override chatWithTools`), {
+      code: PROVIDER_CONTRACT_VIOLATION_CODE,
+    });
   }
 
   /**

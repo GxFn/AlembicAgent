@@ -127,8 +127,9 @@ export function isGeoOrProviderError(err: unknown) {
 
 /**
  * 获取 AI Provider，带自动 fallback（唯一的 provider 级 fallback 入口；Gateway 侧的探活与候选链已删除）：
- * - 主 provider 的 probe() 解析为 true：保留主 provider；
- * - probe() 解析为 false（例如空文本应答）：视为主 provider 此刻不可用，进入已配置的 fallback 链；
+ * - 主 provider 的 probe() 解析为 true：保留主 provider。probe 按连通性判定（W2a-11r1）：一次成功返回、
+ *   带计费用量或预算截断等应答证据的调用即为可用，thinking 模型只产出推理、没有可见文本时同样保留主 provider；
+ * - probe() 解析为 false（成功返回却没有任何应答证据）：视为主 provider 此刻不可用，进入已配置的 fallback 链；
  * - probe() 抛出 provider 级限制（地理限制、403 等，见 isGeoOrProviderError）：同样进入 fallback 链；
  * - probe() 抛出暂时故障、取消或未分类错误：保留主 provider（不因节流或网络抖动切换厂商）。
  * fallback 来源只经诊断日志记录（fallback_selected），不再写入 provider 实例字段。
@@ -171,6 +172,8 @@ export async function getProviderWithFallback() {
     return primary;
   }
 
+  // 记录每个候选的失败类别（只取错误名，不取 message，避免把配置值或凭据片段写进日志）。
+  const failures: string[] = [];
   for (const fbName of fallbacks) {
     try {
       logger.info(`[AiFactory] Trying fallback provider: ${fbName}`);
@@ -181,12 +184,19 @@ export async function getProviderWithFallback() {
       );
       return fbProvider;
     } catch (e: unknown) {
+      const errorName = e instanceof Error ? e.name : 'unknown';
+      failures.push(`${fbName}:${errorName}`);
       logger.warn(
-        `[AiFactory] Fallback "${fbName}" creation failed (${e instanceof Error ? e.name : 'unknown'}); trying next configured provider`
+        `[AiFactory] Fallback "${fbName}" creation failed (${errorName}); trying next configured provider`
       );
     }
   }
 
+  // 全部 fallback 构造失败时回到已判定不可用（或受限）的主 provider：这是一条降级路径，
+  // 单条候选失败日志不足以说明最终结论，这里补一条汇总 warn（W2a-11r1），写明触发原因与每个候选的失败类别。
+  logger.warn(
+    `[AiFactory] fallback_exhausted primary=${currentProvider} reason=${fallbackReason} attempted=${fallbacks.join(',')} failures=${failures.join(',')}; all configured fallbacks failed to construct, retaining primary`
+  );
   return primary;
 }
 
