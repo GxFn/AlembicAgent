@@ -54,6 +54,7 @@ import {
 } from '../../tools/runtime/registry.js';
 import { Capability } from '../../tools/runtime/toolsets/Capability.js';
 import { CapabilityRegistry } from '../../tools/runtime/toolsets/CapabilityRegistry.js';
+import { EvidenceSourceDigestTable } from '../evidence/EvidenceLedgerStore.js';
 import { openLoopEvidence } from '../evidence/loopLedger.js';
 import { PolicyEngine } from '../policies/index.js';
 import { redactDeveloperText } from '../utils/Redaction.js';
@@ -245,6 +246,14 @@ export class AgentRuntime {
   #evidenceJobId: string;
   /** 证据台账目录键是否来自 runtime 回退（宿主未传 jobId）；只用于回退路径诊断。 */
   #evidenceJobIdIsFallback: boolean;
+  /**
+   * 证据台账原文摘要表（RED-P2b）：HMAC 密钥与原文摘要随本 runtime 实例存活，经 openLoopEvidence 交给
+   * 每次 reactLoop 新建的 store。#initLoop 每轮都新建 store，摘要若只属于 store，后一个 reactLoop（如
+   * PipelineStrategy 的 produce 阶段）回读前一轮入账的条目时只能退回脱敏哈希，被脱敏遮住的改动会判 fresh。
+   * 密钥构造时随机生成，不落盘、不是模块级状态；协调子 runtime 各自持有自己的表，跨 runtime/跨进程
+   * 的条目仍退回脱敏哈希并记诊断。
+   */
+  readonly #evidenceSourceDigests = new EvidenceSourceDigestTable();
   /** 文件缓存 (bootstrap 场景注入) */
   #fileCache: FileCacheEntry[] | null = null;
   /** 额外工具白名单 (调用方按需注入，不经 Capability) */
@@ -881,6 +890,7 @@ export class AgentRuntime {
       sessionId: this.id,
       sharedState: sharedState ?? null,
       logger: this.logger,
+      sourceDigests: this.#evidenceSourceDigests,
     });
     // 回退路径诊断：宿主未传 jobId，且台账实际落在 runtime 回退目录（即 sharedState 也未给
     // _bootstrapSessionId）时记录一次。直接比对打开结果的 job 目录，不复制 openLoopEvidence 的选择逻辑。

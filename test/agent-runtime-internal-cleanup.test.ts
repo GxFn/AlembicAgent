@@ -1,11 +1,23 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as loopLedger from '../src/agent/evidence/loopLedger.js';
+import {
+  createProductionEvidenceLedgerAuthority,
+  resolveProductionEvidenceLedgerStore,
+} from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
 import { getPreset, resolveStrategy } from '../src/agent/profiles/presets/index.js';
 import {
   AgentRuntime,
@@ -20,8 +32,10 @@ import * as strategiesBarrel from '../src/agent/strategies/index.js';
 import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 import { AiProvider } from '../src/ai/AiProvider.js';
 import { UnifiedToolCatalog } from '../src/tools/catalog/UnifiedToolCatalog.js';
+import type { ToolCallRequest } from '../src/tools/kernel/request.js';
 import type { ToolResultEnvelope } from '../src/tools/kernel/result.js';
 import { RuntimeCapabilityCatalog } from '../src/tools/runtime/adapter/RuntimeCapabilityCatalog.js';
+import { handle as handleEvidence } from '../src/tools/runtime/handlers/evidence.js';
 import { Capability } from '../src/tools/runtime/toolsets/Capability.js';
 
 /**
@@ -301,6 +315,231 @@ describe('agent runtime evidence ledger fallback job id', () => {
       expect(fallbackLogs).toEqual([]);
     } finally {
       rmSync(dataRoot, { force: true, recursive: true });
+    }
+  });
+});
+
+/**
+ * RED-P2b（第四轮审计 RED-P2 确认项）：原文摘要 freshness 跨 reactLoop 生效。
+ *
+ * #initLoop 每次 reactLoop 都经 openLoopEvidence 新建 store；HMAC 密钥与摘要表若仍是 store 实例状态，
+ * 第二个 reactLoop 的 store 对第一轮入账的条目没有摘要，退回脱敏哈希，被脱敏遮住的改动（P3 样本
+ * `def strip`→`def strap`）判 fresh，evidence.get 把改动后的原文当成已核实证据回读。修复后摘要表由
+ * AgentRuntime 实例持有并交给每次新建的 store；跨 runtime 实例仍按脱敏哈希比对并记诊断。
+ */
+describe('agent runtime evidence source digests across reactLoops (RED-P2b)', () => {
+  const PEM_FILE = 'tools/pem.py';
+  const PEM_BEFORE =
+    '# Strip the -----BEGIN PRIVATE KEY----- header\ndef strip(pem):\n    return pem\n';
+  const PEM_AFTER = PEM_BEFORE.replace('def strip', 'def strap');
+  const DIMENSION = { _dimensionMeta: { id: 'digest-dimension' } };
+
+  interface EvidenceReadback {
+    readonly verbatim?: boolean;
+    readonly content: string;
+  }
+
+  function sourceLines(text: string): string[] {
+    const lines = text.split('\n');
+    if (lines.length > 1 && text.endsWith('\n')) {
+      lines.pop();
+    }
+    return lines;
+  }
+
+  function envelopeFor(
+    toolId: string,
+    text: string,
+    structuredContent?: Record<string, unknown>
+  ): ToolResultEnvelope {
+    return {
+      ...successEnvelope(),
+      toolId,
+      text,
+      ...(structuredContent ? { structuredContent } : {}),
+    };
+  }
+
+  /**
+   * 真实 runtime 循环夹具：模型第一轮调用 code.read（证据经 evidenceCapture 管线入账），之后以文本收尾；
+   * evidence.get 走真实 handler，台账取自路由请求里 runtime 交出的本轮 evidenceLedger。
+   */
+  function buildDigestRuntime(projectRoot: string, config: Partial<RuntimeConfig> = {}) {
+    const catalog = new RuntimeCapabilityCatalog();
+    const readbacks: EvidenceReadback[] = [];
+    const execute = vi.fn(async (request: ToolCallRequest): Promise<ToolResultEnvelope> => {
+      const params = ((request.args as { params?: unknown }).params ?? {}) as Record<
+        string,
+        unknown
+      >;
+      if (request.toolId === 'code') {
+        const text = readFileSync(path.join(projectRoot, PEM_FILE), 'utf8');
+        const lines = sourceLines(text);
+        return envelopeFor('code', 'batch read', {
+          mode: 'batch',
+          files: [
+            {
+              ok: true,
+              path: PEM_FILE,
+              content: lines.map((line, index) => `${index + 1}|${line}`).join('\n'),
+              lineCount: lines.length,
+              mode: 'full',
+            },
+          ],
+        });
+      }
+      if (request.toolId === 'evidence') {
+        const result = await handleEvidence('get', params, {
+          projectRoot,
+          runtime: request.runtime,
+        } as unknown as Parameters<typeof handleEvidence>[2]);
+        expect(result.ok, String(result.error)).toBe(true);
+        readbacks.push(result.data as EvidenceReadback);
+        return envelopeFor('evidence', JSON.stringify(result.data));
+      }
+      throw new Error(`unexpected tool ${request.toolId}`);
+    });
+    const provider = new AiProvider({ model: 'fixture' });
+    const chat = vi.spyOn(provider, 'chatWithTools');
+    const runtime = new AgentRuntime({
+      aiProvider: provider,
+      toolRegistry: new UnifiedToolCatalog(),
+      container: { get: () => catalog },
+      additionalTools: ['code', 'evidence'],
+      capabilities: [],
+      toolRouter: {
+        execute,
+        executeChildCall: execute,
+        explain: async () => ({ allowed: true, stage: 'execute' }),
+      },
+      strategy: new SingleStrategy(),
+      projectRoot,
+      dataRoot: projectRoot,
+      ...config,
+    });
+    /** 一次 reactLoop：模型先发一个工具调用，再以文本收尾。 */
+    const loopWith = async (call: { id: string; name: string; args: Record<string, unknown> }) => {
+      chat
+        .mockResolvedValueOnce({ text: null, functionCalls: [call] })
+        .mockResolvedValueOnce({ text: 'done', functionCalls: [] });
+      const result = await runtime.reactLoop('fixture', {
+        source: 'system',
+        sharedState: { ...DIMENSION },
+        budgetOverride: { maxIterations: 3, timeoutMs: 5_000 },
+      });
+      expect(result.reply).toBe('done');
+    };
+    return {
+      runtime,
+      readbacks,
+      readPem: () =>
+        loopWith({
+          id: 'read-pem',
+          name: 'code',
+          args: { action: 'read', params: { filePaths: [PEM_FILE] } },
+        }),
+      getEvidence: (ref: string) =>
+        loopWith({ id: `get-${ref}`, name: 'evidence', args: { action: 'get', params: { ref } } }),
+    };
+  }
+
+  function openedStores() {
+    return vi
+      .mocked(loopLedger.openLoopEvidence)
+      .mock.results.map(
+        (result) => result.value as NonNullable<ReturnType<typeof loopLedger.openLoopEvidence>>
+      );
+  }
+
+  function freshnessLogs(debug: { mock: { calls: unknown[][] } }): string[] {
+    return debug.mock.calls
+      .map((call) => JSON.stringify(call))
+      .filter((line) => line.includes('[EvidenceLedger] freshness checked via'));
+  }
+
+  it('judges a masked edit stale when a later reactLoop of the same runtime reads the entry back', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-digest-'));
+    try {
+      mkdirSync(path.join(root, 'tools'), { recursive: true });
+      writeFileSync(path.join(root, PEM_FILE), PEM_BEFORE, 'utf8');
+      const fixture = buildDigestRuntime(root, { jobId: 'job-digest' });
+
+      // 第一轮 reactLoop：code.read 经 evidenceCapture 管线入账为带 range 的 E-1。
+      await fixture.readPem();
+      const [firstStore] = openedStores();
+      const entry = firstStore?.get('E-1');
+      expect(entry?.tool).toBe('code.read');
+      expect(entry?.range).toEqual({ start: 1, end: 3 });
+      // 前提：样本确实被脱敏改写过，`def strip` 落在被遮区间里（P3 假 fresh 的来源）。
+      expect(entry?.content).not.toContain('def strip');
+
+      // 两轮之间，只改被遮区间里的字节。
+      writeFileSync(path.join(root, PEM_FILE), PEM_AFTER, 'utf8');
+      const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+
+      // 第二轮 reactLoop：#initLoop 新建了另一个 store，evidence.get 必须判 stale，不回读改动后的原文。
+      await fixture.getEvidence('E-1');
+      const stores = openedStores();
+      expect(stores).toHaveLength(2);
+      expect(stores[1]).not.toBe(stores[0]);
+      expect(stores[1]?.filePath).toBe(stores[0]?.filePath);
+      expect(fixture.readbacks).toHaveLength(1);
+      expect(fixture.readbacks[0]?.verbatim).toBe(false);
+      expect(fixture.readbacks[0]?.content).toBe(entry?.content);
+      expect(fixture.readbacks[0]?.content).not.toContain('def strap');
+      expect(stores[1]?.checkFreshness('E-1', PEM_AFTER)).toBe('stale');
+      expect(stores[1]?.checkFreshness('E-1', PEM_BEFORE)).toBe('fresh');
+      // 判定依据是原文摘要（runtime 共享），诊断不含正文。
+      const logs = freshnessLogs(debug);
+      expect(logs.length).toBeGreaterThan(0);
+      for (const line of logs) {
+        expect(line).toContain('source-digest');
+        expect(line).not.toContain('redacted-hash');
+        expect(line).not.toContain('def str');
+      }
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it('keeps the redacted-hash comparison across runtime instances and logs why', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'alembic-agent-runtime-digest-cross-'));
+    try {
+      mkdirSync(path.join(root, 'tools'), { recursive: true });
+      writeFileSync(path.join(root, PEM_FILE), PEM_BEFORE, 'utf8');
+      // 两个 runtime 用同一 id 与 jobId：第二个实例 hydrate 第一个实例写下的台账（跨实例/跨进程续跑视角）。
+      const shared = { jobId: 'job-digest-cross', id: 'host-agent' };
+      const writer = buildDigestRuntime(root, shared);
+      await writer.readPem();
+      writeFileSync(path.join(root, PEM_FILE), PEM_AFTER, 'utf8');
+
+      // 独立 oracle：公开工厂打开的 store 不持有任何摘要，只能按脱敏哈希比对（现状，含已知盲区）。
+      const oracle = resolveProductionEvidenceLedgerStore(
+        createProductionEvidenceLedgerAuthority({
+          dataRoot: root,
+          jobId: shared.jobId,
+          sessionId: shared.id,
+          dimensionId: DIMENSION._dimensionMeta.id,
+        })
+      );
+      const expected = oracle.checkFreshness('E-1', PEM_AFTER);
+
+      const reader = buildDigestRuntime(root, shared);
+      const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+      await reader.getEvidence('E-1');
+      const readerStore = openedStores()[1];
+      expect(readerStore?.stats().entries).toBe(1);
+      expect(readerStore?.checkFreshness('E-1', PEM_AFTER)).toBe(expected);
+      expect(reader.readbacks[0]?.verbatim).toBe(expected === 'fresh');
+      const logs = freshnessLogs(debug);
+      expect(logs.length).toBeGreaterThan(0);
+      for (const line of logs) {
+        expect(line).toContain('redacted-hash');
+        expect(line).toContain('no-source-digest');
+        expect(line).not.toContain('def str');
+      }
+    } finally {
+      rmSync(root, { force: true, recursive: true });
     }
   });
 });

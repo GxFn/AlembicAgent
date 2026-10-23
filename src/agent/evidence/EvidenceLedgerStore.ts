@@ -17,9 +17,11 @@
  * - 追加前若文件末字节不是换行（上次短写留下残行），先补一个换行再写，新条目自成一行，
  *   残行仍由 hydrate 记为 line-N:json 供 strict/生产闸门 fail closed。
  * - 进程内原文摘要（脱敏阶段 2 方案 C）：带 file+range 的条目在 append 时额外记录
- *   HMAC-SHA256(实例密钥, 原文切片)。密钥由 crypto.randomBytes 生成，只活在本实例内存，不落盘、
- *   不进模块级状态；checkFreshness 有摘要时按原文比对（消除脱敏造成的假 fresh 盲区，规则变化也
- *   不再让同一进程内的条目误判 stale），没有摘要（seed、跨进程续跑、其它实例写入）时退回脱敏哈希。
+ *   HMAC-SHA256(表密钥, 原文切片)。密钥与摘要记录放在 EvidenceSourceDigestTable 里，只活在持有者内存，
+ *   不落盘、不进模块级状态；checkFreshness 有摘要时按原文比对（消除脱敏造成的假 fresh 盲区，规则变化
+ *   也不再让条目误判 stale），没有摘要（seed、跨进程续跑、其它 runtime 写入）时退回脱敏哈希。
+ *   表的寿命由持有者决定（RED-P2b）：未注入时 store 自建一张，只有本实例可见；AgentRuntime 在构造时建
+ *   一张并经 openLoopEvidence 交给每次 reactLoop 新建的 store，同一 runtime 的多次 reactLoop 共享摘要。
  * - 静态加固（D7）：台账目录 0700、文件 0600，evidence-ledger/ 下写内容为 `*` 的自忽略 .gitignore；
  *   打开已有旧台账时尝试把权限收紧到同一标准。加固失败只记 warn，不阻断读写。
  * - 内容 profile（脱敏阶段 3，L7-P11 方案 b）：缺省 redacted-evidence 即上面的全部现状；
@@ -113,6 +115,12 @@ export interface EvidenceLedgerStoreOptions {
   redactor?: EvidenceRedactor;
   /** 内容 profile，缺省 redacted-evidence（现状）。 */
   contentProfile?: EvidenceLedgerContentProfile;
+  /**
+   * 原文摘要表（内部接线，RED-P2b）。缺省时 store 自建一张、只有本实例可见；AgentRuntime 经
+   * openLoopEvidence 传入自己持有的表，让同一 runtime 的多次 reactLoop 共享摘要。公开工厂
+   * createProductionEvidenceLedgerAuthority 不接受这个选项，宿主无法注入。
+   */
+  sourceDigests?: EvidenceSourceDigestTable;
 }
 
 /**
@@ -131,13 +139,77 @@ export interface EvidenceAppendOptions {
 /** checkFreshness 采用的比对依据，进入诊断日志。 */
 type FreshnessBasis = 'source-digest' | 'redacted-hash';
 
-/** 进程内原文摘要记录：绑定条目的落盘身份，条目被外部改写后摘要自动作废（退回脱敏哈希）。 */
-interface SourceDigestRecord {
+/**
+ * 摘要表的来源，进入 freshness 与摘要作废诊断：shared=调用方注入（AgentRuntime 持有，跨 reactLoop 共享），
+ * instance=store 自建（只有本实例可见，阶段 2 的现状）。用来区分“没有摘要”是跨 runtime/跨进程的预期退回，
+ * 还是接线缺失导致的退回。
+ */
+type SourceDigestScope = 'shared' | 'instance';
+
+/**
+ * 进程内原文摘要记录：绑定条目的落盘身份（callId、capturedAt、contentHash、file、range），条目被外部
+ * 改写或同一 id 被重建后摘要自动作废（退回脱敏哈希）。共享表跨 store 使用时，这组绑定保证摘要只用于
+ * 记录它的那一条落盘条目。
+ */
+export interface EvidenceSourceDigestRecord {
   readonly digest: string;
+  readonly callId: string;
+  readonly capturedAt: number;
   readonly contentHash: string;
   readonly file: string;
   readonly start: number;
   readonly end: number;
+}
+
+/**
+ * 原文摘要表：HMAC 密钥 + 「台账文件 → 条目 id → 原文摘要记录」（脱敏阶段 2 方案 C；RED-P2b 起寿命与 store 解耦）。
+ *
+ * - 寿命由持有者决定。store 未注入时自建一张，只有本实例可见；AgentRuntime 在构造时建一张，经
+ *   openLoopEvidence 交给每次 reactLoop 新建的 store。#initLoop 每次都会新建 store，若摘要仍只是 store
+ *   实例状态，第二个 reactLoop（如 PipelineStrategy 的 produce 阶段）对前一轮入账的条目没有摘要，假 fresh
+ *   盲区仍在；共享这张表后同一 runtime 实例的所有 reactLoop 都按原文判定。
+ * - 密钥由 crypto.randomBytes 生成，只活在持有者内存，不落盘、不进模块级状态，也不经任何方法外露。
+ *   随机密钥让摘要即使出现在内存转储里也无法离线比对猜测原文；不同 runtime（协调子 runtime、其它进程）
+ *   各自持有自己的表，摘要互不通用，没有摘要的条目退回脱敏哈希。
+ * - 记录按台账文件路径分区：一张表可以同时服务多个维度或 job 的台账，同名 E-n 不会串到别的台账上。
+ * - 记录随持有者存活，规模与其生命周期内入账的带 range 条目数同阶（每条一个 hex 摘要加坐标）；
+ *   同一位置重新入账时覆盖或作废旧记录。
+ */
+export class EvidenceSourceDigestTable {
+  readonly #key = randomBytes(32);
+  readonly #byLedger = new Map<string, Map<string, EvidenceSourceDigestRecord>>();
+
+  /** HMAC-SHA256(表密钥, 原文切片) 的 hex。只返回摘要，密钥不出本表。 */
+  digest(sourceSlice: string): string {
+    return createHmac('sha256', this.#key).update(sourceSlice, 'utf8').digest('hex');
+  }
+
+  /** 记录（或覆盖）某台账某条目的原文摘要。 */
+  record(ledgerFile: string, entryId: string, record: EvidenceSourceDigestRecord): void {
+    let entries = this.#byLedger.get(ledgerFile);
+    if (!entries) {
+      entries = new Map();
+      this.#byLedger.set(ledgerFile, entries);
+    }
+    entries.set(entryId, Object.freeze({ ...record }));
+  }
+
+  /** 作废某台账某条目的摘要（该位置被不带原文的条目重新占用时）；返回是否真的删掉了旧记录。 */
+  forget(ledgerFile: string, entryId: string): boolean {
+    const entries = this.#byLedger.get(ledgerFile);
+    if (!entries?.delete(entryId)) {
+      return false;
+    }
+    if (entries.size === 0) {
+      this.#byLedger.delete(ledgerFile);
+    }
+    return true;
+  }
+
+  /** 取某台账某条目的摘要记录（冻结副本）；调用方仍须按条目落盘身份校验后才能使用。 */
+  lookup(ledgerFile: string, entryId: string): EvidenceSourceDigestRecord | undefined {
+    return this.#byLedger.get(ledgerFile)?.get(entryId);
+  }
 }
 
 /** D7：台账目录与文件的目标权限（只收紧 group/other 位，不放宽）。 */
@@ -252,12 +324,11 @@ export class EvidenceLedgerStore {
   readonly #entries = new Map<string, EvidenceEntry>();
   readonly #hydrateIntegrityIssues: string[] = [];
   /**
-   * 原文摘要的 HMAC 密钥：实例状态，构造时随机生成，永不写盘、不出实例。随机密钥让摘要即使
-   * 出现在内存转储里也无法离线比对猜测原文，也保证不同实例（不同进程）的摘要互不通用。
+   * 原文摘要表（含 HMAC 密钥）。注入时与持有者（AgentRuntime）共享，否则本实例自建；键为本台账文件路径，
+   * 只记录经 append 入账、带 file+range 且内容就是原文切片的条目。
    */
-  readonly #sourceDigestKey = randomBytes(32);
-  /** 条目 id → 原文摘要；只记录本实例 append 的带 file+range 条目 */
-  readonly #sourceDigests = new Map<string, SourceDigestRecord>();
+  readonly #sourceDigests: EvidenceSourceDigestTable;
+  readonly #sourceDigestScope: SourceDigestScope;
   #seq = 0;
   #dirReady = false;
   #diskRevision = 'missing';
@@ -276,6 +347,9 @@ export class EvidenceLedgerStore {
     this.#sessionId = options.sessionId;
     this.#dimensionId = options.dimensionId;
     this.#redactor = options.redactor ?? ((text) => text);
+    // 缺省自建：未经 runtime 接线的 store（宿主 capture facet、seed 来源、测试）保持阶段 2 的实例内语义。
+    this.#sourceDigestScope = options.sourceDigests ? 'shared' : 'instance';
+    this.#sourceDigests = options.sourceDigests ?? new EvidenceSourceDigestTable();
     this.#ledgerRoot = join(options.dataRoot, '.asd', LEDGER_DIRECTORY_BY_PROFILE[contentProfile]);
     this.filePath = join(this.#ledgerRoot, options.jobId, `${options.dimensionId}.jsonl`);
     this.#hydrate();
@@ -354,11 +428,12 @@ export class EvidenceLedgerStore {
    * E5 新鲜度终检。只有 file+range 条目可复核（read 类采集）；search 分组/terminal 等无法重构切片 →
    * 'unknown'（提交侧放行，最终仍由门禁的 fs verbatim 校验兜底）。区间越界（文件变短）直接 'stale'。
    *
-   * 比对依据分两条路径，每次都记 debug 诊断说明走了哪条：
-   * - source-digest：本实例 append 时记录了原文摘要 → HMAC(当前原文切片) 与摘要比对。被脱敏改写
-   *   的字节对这条路径可见，不再有假 fresh；脱敏规则变化也不影响结论。
-   * - redacted-hash：没有摘要（seed 进来的条目、跨进程续跑 hydrate 的条目、其它实例写入的条目）
-   *   → 沿用现有「同区间重切 + 同截断 + 同脱敏」重算哈希与采集时比对，行为与阶段 2 之前相同。
+   * 比对依据分两条路径，每次都记 debug 诊断说明走了哪条（含摘要表来源 shared/instance）：
+   * - source-digest：摘要表里有该条目的原文摘要（本实例 append，或共享同一张表的同一 runtime 的
+   *   前一个 reactLoop 的 store append）→ HMAC(当前原文切片) 与摘要比对。被脱敏改写的字节对这条路径
+   *   可见，不再有假 fresh；脱敏规则变化也不影响结论。
+   * - redacted-hash：没有摘要（seed 进来的条目、跨进程续跑 hydrate 的条目、其它 runtime 或未共享表的
+   *   实例写入的条目）→ 沿用现有「同区间重切 + 同截断 + 同脱敏」重算哈希与采集时比对，行为与阶段 2 之前相同。
    */
   checkFreshness(ref: string, currentFileContent: string): 'fresh' | 'stale' | 'unknown' {
     this.#refresh();
@@ -380,7 +455,7 @@ export class EvidenceLedgerStore {
     const slice = lines.slice(entry.range.start - 1, entry.range.end).join('\n');
     let verdict: 'fresh' | 'stale';
     if (digest.record) {
-      verdict = this.#sourceDigest(slice) === digest.record.digest ? 'fresh' : 'stale';
+      verdict = this.#sourceDigests.digest(slice) === digest.record.digest ? 'fresh' : 'stale';
     } else {
       const recomputed = hashEvidenceContent(this.#redactAndCap(slice, redactionContextOf(entry)));
       verdict = recomputed === entry.contentHash ? 'fresh' : 'stale';
@@ -676,8 +751,10 @@ export class EvidenceLedgerStore {
   }
 
   /**
-   * 记录原文摘要。只对本实例 append、带 file+range、且草稿内容就是原文切片的条目记录；
-   * seed（contentIsSourceSlice=false）跳过，checkFreshness 对它退回脱敏哈希。摘要只在内存里。
+   * 记录原文摘要。只对带 file+range、且草稿内容就是原文切片的条目记录；摘要只在内存里（摘要表）。
+   * seed（contentIsSourceSlice=false）与不带 file+range 的条目不记录，checkFreshness 对它们退回脱敏哈希；
+   * 共享表里同一台账同一 id 若残留旧记录（台账被外部删除后由本 runtime 重建），一并作废并记诊断，
+   * 不让旧摘要冒充新条目的原文。
    */
   #recordSourceDigest(
     entry: EvidenceEntry,
@@ -685,10 +762,28 @@ export class EvidenceLedgerStore {
     options: EvidenceAppendOptions
   ): void {
     if (!entry.file || !entry.range || options.contentIsSourceSlice === false) {
+      if (this.#sourceDigests.forget(this.filePath, entry.id)) {
+        observeSafely(
+          () =>
+            Logger.getInstance().debug('[EvidenceLedger] stale source digest discarded on append', {
+              evidenceId: entry.id,
+              tool: entry.tool,
+              file: entry.file,
+              sourceDigestScope: this.#sourceDigestScope,
+              reason:
+                options.contentIsSourceSlice === false
+                  ? 'content-not-source-slice'
+                  : 'no-file-range',
+            }),
+          () => undefined
+        );
+      }
       return;
     }
-    this.#sourceDigests.set(entry.id, {
-      digest: this.#sourceDigest(draft.content),
+    this.#sourceDigests.record(this.filePath, entry.id, {
+      digest: this.#sourceDigests.digest(draft.content),
+      callId: entry.callId,
+      capturedAt: entry.capturedAt,
       contentHash: entry.contentHash,
       file: entry.file,
       start: entry.range.start,
@@ -697,19 +792,22 @@ export class EvidenceLedgerStore {
   }
 
   /**
-   * 取可用的原文摘要。摘要绑定条目的落盘身份（contentHash、file、range）：同一 id 的磁盘行若被
-   * 外部改写（hydrate 会另记 history-changed），旧摘要不再代表该条目，按没有摘要处理。
+   * 取可用的原文摘要。摘要绑定条目的落盘身份（callId、capturedAt、contentHash、file、range）：同一 id
+   * 的磁盘行若被外部改写（hydrate 会另记 history-changed）或台账被删除后重建，旧摘要不再代表该条目，
+   * 按没有摘要处理。
    */
   #usableSourceDigest(entry: EvidenceEntry): {
-    readonly record: SourceDigestRecord | null;
+    readonly record: EvidenceSourceDigestRecord | null;
     readonly reason: string;
   } {
-    const record = this.#sourceDigests.get(entry.id);
+    const record = this.#sourceDigests.lookup(this.filePath, entry.id);
     if (!record) {
-      // seed 条目、跨进程 hydrate 的条目、其它实例写入的条目都没有本实例的摘要
+      // seed 条目、跨进程 hydrate 的条目、其它 runtime 或未共享摘要表的实例写入的条目都没有摘要
       return { record: null, reason: 'no-source-digest' };
     }
     if (
+      record.callId !== entry.callId ||
+      record.capturedAt !== entry.capturedAt ||
       record.contentHash !== entry.contentHash ||
       record.file !== entry.file ||
       record.start !== entry.range?.start ||
@@ -720,11 +818,7 @@ export class EvidenceLedgerStore {
     return { record, reason: 'source-digest-recorded' };
   }
 
-  #sourceDigest(sourceSlice: string): string {
-    return createHmac('sha256', this.#sourceDigestKey).update(sourceSlice, 'utf8').digest('hex');
-  }
-
-  /** freshness 诊断：只记条目坐标、比对依据与结论，不含原文、存储内容或摘要值。 */
+  /** freshness 诊断：只记条目坐标、比对依据、摘要表来源与结论，不含原文、存储内容或摘要值。 */
   #logFreshness(
     entry: EvidenceEntry,
     basis: FreshnessBasis,
@@ -740,6 +834,7 @@ export class EvidenceLedgerStore {
           range: entry.range ? `${entry.range.start}-${entry.range.end}` : undefined,
           basis,
           reason,
+          sourceDigestScope: this.#sourceDigestScope,
           verdict,
         }),
       () => undefined

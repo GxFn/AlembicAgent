@@ -21,10 +21,13 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { captureEvidenceFromEnvelope } from '../src/agent/evidence/EvidenceCapture.js';
 import {
   EvidenceLedgerStore,
+  EvidenceSourceDigestTable,
   seedLedgerFromJobSiblings,
 } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import { openLoopEvidence } from '../src/agent/evidence/loopLedger.js';
 import {
   createProductionEvidenceLedgerAuthority,
+  openProductionEvidenceLedgerAuthority,
   resolveProductionEvidenceLedgerStore,
 } from '../src/agent/evidence/ProductionEvidenceLedgerAuthority.js';
 import { projectToolEndEvent } from '../src/agent/runtime/processEvents.js';
@@ -422,6 +425,264 @@ describe('测试要求 2：进程内原文摘要消除假 fresh', () => {
       expect(line).not.toContain('this.apiKey');
       expect(line).not.toContain('application/json');
     }
+  });
+});
+
+/**
+ * RED-P2b：原文摘要表由 AgentRuntime 实例持有，经 openLoopEvidence 交给每次 reactLoop 新建的 store。
+ * 这里在台账层直接验证：同一张表的两个 store（同一 runtime 的两次 reactLoop）共享摘要；不同表（不同 runtime、
+ * 协调子 runtime、跨进程）不共享，退回脱敏哈希并在诊断里写明摘要表来源；公开工厂不能注入摘要表。
+ */
+describe('RED-P2b：原文摘要表跨 reactLoop 共享', () => {
+  const DIMENSION_STATE = { _dimensionMeta: { id: COORDINATES.dimensionId } };
+
+  /** 生产同款：AgentRuntime#initLoop 每次 reactLoop 都经 openLoopEvidence 新建 store。 */
+  function openRuntimeLoop(
+    dataRoot: string,
+    sourceDigests: EvidenceSourceDigestTable
+  ): EvidenceLedgerStore {
+    const store = openLoopEvidence({
+      dataRoot,
+      defaultJobId: COORDINATES.jobId,
+      sessionId: COORDINATES.sessionId,
+      sharedState: DIMENSION_STATE,
+      logger: { info: vi.fn(), warn: vi.fn() },
+      sourceDigests,
+    });
+    if (!store) {
+      throw new Error('loop ledger was not opened');
+    }
+    return store;
+  }
+
+  function freshnessLines(debug: { mock: { calls: unknown[][] } }): string[] {
+    return debug.mock.calls
+      .map((call) => JSON.stringify(call))
+      .filter((line) => line.includes('freshness checked via'));
+  }
+
+  test.each(
+    FALSE_FRESH_SAMPLES
+  )('$name：同一张表的下一个 reactLoop store 判 stale，并按原文回读', async ({
+    file,
+    before,
+    mutate,
+  }) => {
+    const root = createTempProject('readback-shared-digest-');
+    const absolute = writeProjectFile(root, file, before);
+    const digests = new EvidenceSourceDigestTable();
+    const firstLoop = openRuntimeLoop(root, digests);
+    const [entry] = captureRead(firstLoop, file, before);
+    expect(entry?.range).toBeDefined();
+    expect(entry?.content).not.toBe(sourceLines(before).join('\n'));
+
+    const secondLoop = openRuntimeLoop(root, digests);
+    expect(secondLoop).not.toBe(firstLoop);
+    expect(secondLoop.filePath).toBe(firstLoop.filePath);
+    // 未改动的文件：第二个 store 按原文摘要判 fresh 并逐字回读（摘要不是“脱敏文本的摘要”）。
+    expect(secondLoop.checkFreshness(entry?.id ?? '', before)).toBe('fresh');
+    const intact = await evidenceGet(secondLoop, entry?.id ?? '', root);
+    expect(intact.verbatim).toBe(true);
+    expect(intact.content).toBe(sourceLines(before).join('\n'));
+
+    const after = mutate(before);
+    fs.writeFileSync(absolute, after, 'utf8');
+    expect(secondLoop.checkFreshness(entry?.id ?? '', after)).toBe('stale');
+    const changed = await evidenceGet(secondLoop, entry?.id ?? '', root);
+    expect(changed.verbatim).toBe(false);
+    expect(changed.content).toBe(entry?.content);
+  });
+
+  test('不同摘要表（另一个 runtime）不共享：退回脱敏哈希，诊断写明 no-source-digest 与表来源', () => {
+    const root = createTempProject('readback-foreign-table-');
+    const sample = FALSE_FRESH_SAMPLES[0];
+    writeProjectFile(root, sample.file, sample.before);
+    const writer = openRuntimeLoop(root, new EvidenceSourceDigestTable());
+    const [entry] = captureRead(writer, sample.file, sample.before);
+    const after = sample.mutate(sample.before);
+
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const otherRuntime = openRuntimeLoop(root, new EvidenceSourceDigestTable());
+    expect(otherRuntime.checkFreshness(entry?.id ?? '', after)).toBe(
+      redactedHashVerdict(sample.before, after)
+    );
+    expect(writer.checkFreshness(entry?.id ?? '', after)).toBe('stale');
+    const [foreign, own] = freshnessLines(debug);
+    expect(foreign).toContain('redacted-hash');
+    expect(foreign).toContain('no-source-digest');
+    expect(foreign).toContain('"sourceDigestScope":"shared"');
+    expect(own).toContain('source-digest-recorded');
+    for (const line of [foreign, own]) {
+      expect(line).not.toContain('def str');
+    }
+  });
+
+  test('摘要表按台账文件分区：另一维度的同名 E-1 不借用本台账的摘要；无 range 条目不记摘要', () => {
+    const root = createTempProject('readback-shared-partition-');
+    const sample = FALSE_FRESH_SAMPLES[0];
+    writeProjectFile(root, sample.file, sample.before);
+    const digests = new EvidenceSourceDigestTable();
+    const own = openRuntimeLoop(root, digests);
+    captureRead(own, sample.file, sample.before);
+    own.append({ tool: 'terminal.exec', callId: 't1', content: 'out' });
+    expect(digests.lookup(own.filePath, 'E-1')).toBeDefined();
+    expect(digests.lookup(own.filePath, 'E-2')).toBeUndefined();
+
+    // 同一 runtime 的另一个维度台账：E-1 是 seed 来的同一段内容，不是原文切片。
+    const other = new EvidenceLedgerStore({
+      dataRoot: root,
+      jobId: COORDINATES.jobId,
+      sessionId: COORDINATES.sessionId,
+      dimensionId: 'other-dimension',
+      redactor: redactDeveloperText,
+      sourceDigests: digests,
+    });
+    const stored = own.get('E-1');
+    other.append(
+      {
+        tool: 'code.read',
+        callId: 'seed:ts-js-module:E-1',
+        file: sample.file,
+        ...(stored?.range ? { range: stored.range } : {}),
+        content: stored?.content ?? '',
+      },
+      { contentIsSourceSlice: false }
+    );
+    expect(other.filePath).not.toBe(own.filePath);
+    expect(digests.lookup(other.filePath, 'E-1')).toBeUndefined();
+    const after = sample.mutate(sample.before);
+    expect(own.checkFreshness('E-1', after)).toBe('stale');
+    expect(other.checkFreshness('E-1', after)).toBe(redactedHashVerdict(sample.before, after));
+    // 摘要值只在内存：两份 JSONL 都只有规范字段，不含任何 HMAC 值。
+    const recorded = digests.lookup(own.filePath, 'E-1')?.digest ?? '';
+    expect(recorded).toMatch(/^[0-9a-f]{64}$/);
+    for (const file of [own.filePath, other.filePath]) {
+      expect(fs.readFileSync(file, 'utf8')).not.toContain(recorded);
+    }
+  });
+
+  test('公开工厂不接受摘要表：多传的参数被忽略，store 只用自建的表', () => {
+    const root = createTempProject('readback-public-no-injection-');
+    const sample = FALSE_FRESH_SAMPLES[0];
+    writeProjectFile(root, sample.file, sample.before);
+    const digests = new EvidenceSourceDigestTable();
+    const internal = resolveProductionEvidenceLedgerStore(
+      openProductionEvidenceLedgerAuthority(
+        { dataRoot: root, ...COORDINATES },
+        { sourceDigests: digests }
+      )
+    );
+    const [entry] = captureRead(internal, sample.file, sample.before);
+    const after = sample.mutate(sample.before);
+
+    const viaPublic = resolveProductionEvidenceLedgerStore(
+      Reflect.apply(createProductionEvidenceLedgerAuthority, undefined, [
+        { dataRoot: root, ...COORDINATES },
+        { sourceDigests: digests },
+      ]) as ReturnType<typeof createProductionEvidenceLedgerAuthority>
+    );
+    expect(viaPublic.checkFreshness(entry?.id ?? '', after)).toBe(
+      redactedHashVerdict(sample.before, after)
+    );
+    // 内部入口与公开工厂的身份完全相同：摘要表不进入 storeId / storeConfigHash。
+    const publicIdentity = createProductionEvidenceLedgerAuthority({
+      dataRoot: root,
+      ...COORDINATES,
+    }).identity;
+    const internalIdentity = openProductionEvidenceLedgerAuthority(
+      { dataRoot: root, ...COORDINATES },
+      { sourceDigests: digests }
+    ).identity;
+    expect(internalIdentity).toEqual(publicIdentity);
+  });
+
+  test('seed 条目在共享表下仍没有摘要；同一位置的旧摘要被作废并记诊断', () => {
+    const root = createTempProject('readback-shared-seed-');
+    const sample = FALSE_FRESH_SAMPLES[0];
+    writeProjectFile(root, sample.file, sample.before);
+    const digests = new EvidenceSourceDigestTable();
+    // 兄弟维度在同一 runtime 里入账（摘要记在兄弟台账名下）。
+    const sibling = openRuntimeLoop(root, digests);
+    captureRead(sibling, sample.file, sample.before);
+
+    const openSynthesis = () =>
+      new EvidenceLedgerStore({
+        dataRoot: root,
+        jobId: COORDINATES.jobId,
+        sessionId: 'sess_synthesis',
+        dimensionId: 'agent-guidelines',
+        redactor: redactDeveloperText,
+        sourceDigests: digests,
+      });
+    const synthesis = openSynthesis();
+    // 先在合成台账的 E-1 位置放一条带原文摘要的条目，再删掉台账文件模拟外部清理后重建。
+    synthesis.append({
+      tool: 'code.read',
+      callId: 'pre-seed',
+      file: sample.file,
+      range: { start: 1, end: 3 },
+      content: sourceLines(sample.before).join('\n'),
+    });
+    expect(digests.lookup(synthesis.filePath, 'E-1')).toBeDefined();
+    fs.rmSync(synthesis.filePath);
+
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const rebuilt = openSynthesis();
+    expect(
+      seedLedgerFromJobSiblings(rebuilt, {
+        dataRoot: root,
+        jobId: COORDINATES.jobId,
+        selfDimensionId: 'agent-guidelines',
+      })
+    ).toBe(1);
+    expect(digests.lookup(rebuilt.filePath, 'E-1')).toBeUndefined();
+    const discarded = debug.mock.calls
+      .map((call) => JSON.stringify(call))
+      .find((line) => line.includes('stale source digest discarded on append'));
+    expect(discarded).toContain('content-not-source-slice');
+    expect(discarded).toContain('"evidenceId":"E-1"');
+
+    const after = sample.mutate(sample.before);
+    expect(rebuilt.checkFreshness('E-1', sample.before)).toBe('fresh');
+    expect(rebuilt.checkFreshness('E-1', after)).toBe(redactedHashVerdict(sample.before, after));
+    const lines = freshnessLines(debug);
+    expect(lines.at(-1)).toContain('redacted-hash');
+    expect(lines.at(-1)).toContain('no-source-digest');
+  });
+
+  test('共享表里的摘要绑定落盘身份：同一 id 被其它写入替换后不再使用旧摘要', () => {
+    const root = createTempProject('readback-shared-binding-');
+    const maskSynthetic = (text: string) => text.replace(/SYNTHETIC\w+/g, '[redacted]');
+    const digests = new EvidenceSourceDigestTable();
+    const open = () =>
+      new EvidenceLedgerStore({
+        dataRoot: root,
+        ...COORDINATES,
+        redactor: maskSynthetic,
+        sourceDigests: digests,
+      });
+    const before = 'const key = SYNTHETICbefore0123;';
+    const after = 'const key = SYNTHETICafter0123;';
+    const first = open();
+    const entry = first.append({
+      tool: 'code.read',
+      callId: 'c1',
+      file: 'src/key.ts',
+      range: { start: 1, end: 1 },
+      content: before,
+    });
+    expect(open().checkFreshness(entry.id, after)).toBe('stale');
+
+    // 外部改写：同一 E-1、同样的脱敏内容，但来自另一次采集（callId/capturedAt 不同）。
+    const replaced = { ...JSON.parse(fs.readFileSync(first.filePath, 'utf8').trim()) };
+    replaced.callId = 'foreign';
+    fs.writeFileSync(first.filePath, `${JSON.stringify(replaced)}\n`, 'utf8');
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    const reader = open();
+    expect(reader.checkFreshness(entry.id, after)).toBe('fresh');
+    const [line] = freshnessLines(debug);
+    expect(line).toContain('source-digest-entry-mismatch');
+    expect(line).toContain('redacted-hash');
   });
 });
 

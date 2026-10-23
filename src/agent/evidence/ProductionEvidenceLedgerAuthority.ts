@@ -13,6 +13,7 @@ import {
   type EvidenceLedgerContentProfile,
   EvidenceLedgerStore,
   type EvidenceRedactionContext,
+  type EvidenceSourceDigestTable,
 } from './EvidenceLedgerStore.js';
 import { WITNESS_GATE_POLICY_ID, WITNESS_MAX_CONTENT_BYTES } from './witnessGate.js';
 
@@ -98,18 +99,41 @@ const authorityBindings = new WeakMap<ProductionEvidenceLedgerAuthorityV1, Autho
 const readFacetBindings = new WeakMap<ProductionEvidenceLedgerReadFacetV1, AuthorityBinding>();
 
 /**
+ * Agent 私有的打开选项（RED-P2b），只由同仓模块（openLoopEvidence）传入；公开工厂不接受、也不透传它。
+ */
+export interface ProductionEvidenceLedgerInternalOpenOptions {
+  /**
+   * 原文摘要表：AgentRuntime 构造时生成并持有，传给每次 reactLoop 新建的 store，让同一 runtime 的多次
+   * reactLoop 共享 HMAC 原文摘要。缺省时 store 自建一张（只有该 store 可见，与公开工厂相同）。
+   * 摘要表只影响进程内 freshness 判定，不进入 storeId、storeConfigHash、落盘内容或 contentHash。
+   */
+  readonly sourceDigests?: EvidenceSourceDigestTable;
+}
+
+/**
  * 打开 Agent 唯一的 production Evidence Ledger。
  *
  * capture/read 两个 facet 都闭包到同一真实 store 实例；重新以相同可信坐标调用会 hydrate
- * 同一 JSONL。调用方不能注入 adapter、redactor、store id 或 config hash，只能在两个固定的
- * 内容 profile 之间选择（见 ProductionEvidenceLedgerCoordinatesV1.contentProfile）。
+ * 同一 JSONL。调用方不能注入 adapter、redactor、store id、config hash 或原文摘要表，只能在两个固定的
+ * 内容 profile 之间选择（见 ProductionEvidenceLedgerCoordinatesV1.contentProfile）。多传的参数一律忽略。
  */
 export function createProductionEvidenceLedgerAuthority(
   input: ProductionEvidenceLedgerCoordinatesV1
 ): ProductionEvidenceLedgerAuthorityV1 {
+  return openProductionEvidenceLedgerAuthority(input, {});
+}
+
+/**
+ * Agent 私有的打开入口：与公开工厂同一套坐标校验、身份、profile 与 fail-closed 闸门，额外接受
+ * 内部选项（原文摘要表）。不从 package facade（src/production.ts）转出。
+ */
+export function openProductionEvidenceLedgerAuthority(
+  input: ProductionEvidenceLedgerCoordinatesV1,
+  internal: ProductionEvidenceLedgerInternalOpenOptions
+): ProductionEvidenceLedgerAuthorityV1 {
   const coordinates = normalizeCoordinates(input);
   const identity = createIdentity(coordinates);
-  const store = openProfileStore(coordinates, identity);
+  const store = openProfileStore(coordinates, identity, internal.sourceDigests);
   store.assertProductionAuthorityHealthy();
   const binding: AuthorityBinding = { identity, store };
   const capture = Object.freeze({
@@ -184,17 +208,19 @@ function redactLedgerContent(text: string, context?: EvidenceRedactionContext): 
  * 按 profile 打开真实 store。默认分支固定注入带来源上下文的台账 redactor（redactLedgerContent；
  * storeId、storeConfigHash 与存储路径不变，D6 规定默认 profile 的轮换随宿主切换一次完成）；见证分支不注入
  * 任何 redactor（store 会拒绝），并记一条 info 诊断，让宿主日志能看出本次严格会话走的是逐字节见证通道及其
- * 上限、闸门策略。
+ * 上限、闸门策略。原文摘要表（仅内部入口传入）两个分支都原样交给 store：见证通道不脱敏，摘要与同尺重算结论一致。
  */
 function openProfileStore(
   coordinates: NormalizedProductionEvidenceLedgerCoordinates,
-  identity: ProductionEvidenceLedgerIdentityV1
+  identity: ProductionEvidenceLedgerIdentityV1,
+  sourceDigests: EvidenceSourceDigestTable | undefined
 ): EvidenceLedgerStore {
   const location = {
     dataRoot: coordinates.dataRoot,
     jobId: coordinates.jobId,
     sessionId: coordinates.sessionId,
     dimensionId: coordinates.dimensionId,
+    ...(sourceDigests ? { sourceDigests } : {}),
   };
   if (coordinates.contentProfile !== 'verbatim-witness') {
     return new EvidenceLedgerStore({ ...location, redactor: redactLedgerContent });

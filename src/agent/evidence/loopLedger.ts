@@ -1,8 +1,12 @@
 import { SYNTHESIS_DIM_IDS } from '@alembic/core/dimensions';
 import { observeSafely } from '#shared/observers.js';
-import { type EvidenceLedgerStore, seedLedgerFromJobSiblings } from './EvidenceLedgerStore.js';
 import {
-  createProductionEvidenceLedgerAuthority,
+  type EvidenceLedgerStore,
+  type EvidenceSourceDigestTable,
+  seedLedgerFromJobSiblings,
+} from './EvidenceLedgerStore.js';
+import {
+  openProductionEvidenceLedgerAuthority,
   resolveProductionEvidenceLedgerStore,
 } from './ProductionEvidenceLedgerAuthority.js';
 
@@ -10,6 +14,11 @@ import {
  * 每个循环只准备证据资源，不持有 Runtime 或循环状态。
  * 同一 bootstrap job 的各维度共享目录；无维度身份时才返回 null。
  * 坐标、持久化或 seed 的真实失败必须原样终止初始化，日志仅作旁路观察。
+ *
+ * 原文摘要表（RED-P2b）由调用方（AgentRuntime 实例）持有并原样交给本次新建的 store：每次 reactLoop 都会
+ * 新建 store，摘要若只是 store 实例状态，跨 reactLoop 回读的条目只能退回脱敏哈希（假 fresh 盲区仍在）。
+ * 这里不创建、不缓存摘要表，也不把它放进模块级状态。某个条目走原文摘要还是退回脱敏哈希，由 store 在每次
+ * checkFreshness 的诊断里写明（basis、reason、sourceDigestScope）。
  */
 export function openLoopEvidence(options: {
   dataRoot: string;
@@ -17,6 +26,7 @@ export function openLoopEvidence(options: {
   sessionId: string;
   sharedState: Record<string, unknown> | null;
   logger: Pick<Console, 'info' | 'warn'>;
+  sourceDigests: EvidenceSourceDigestTable;
 }): EvidenceLedgerStore | null {
   const shared = options.sharedState;
   const sharedSessionKey = shared?._bootstrapSessionId;
@@ -47,12 +57,15 @@ export function openLoopEvidence(options: {
     );
 
   try {
-    const authority = createProductionEvidenceLedgerAuthority({
-      dataRoot: options.dataRoot,
-      jobId,
-      sessionId: options.sessionId,
-      dimensionId,
-    });
+    const authority = openProductionEvidenceLedgerAuthority(
+      {
+        dataRoot: options.dataRoot,
+        jobId,
+        sessionId: options.sessionId,
+        dimensionId,
+      },
+      { sourceDigests: options.sourceDigests }
+    );
     const store = resolveProductionEvidenceLedgerStore(authority);
     // 仅合成维度空台账 seed 兄弟证据；后续循环 hydrate 到非空台账后不重复写入。
     // 合成维度集合以 Core 公开的 SYNTHESIS_DIM_IDS 为单源，Core 新增或改名合成维度时这里同步生效。
