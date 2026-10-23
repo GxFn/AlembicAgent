@@ -2888,8 +2888,9 @@ describe('Analyst budget tiers and rescan sections (C35)', () => {
       searchBudget: Math.round(iterations * 0.75),
       timeoutMs: Math.round((iterations / 24) * 480_000),
       maxSessionInputTokens: iterations * perRoundInput,
-      maxSessionTokens: Math.ceil(iterations * perRoundInput * 1.35),
     });
+    // W2a-07（L5-P08）：会话总量上限 maxSessionTokens 已删除。
+    expect('maxSessionTokens' in budget).toBe(false);
   });
 
   const rescanBase = {

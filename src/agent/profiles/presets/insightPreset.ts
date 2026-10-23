@@ -96,7 +96,6 @@ export const INSIGHT_PRESET = {
           maxIterations: ANALYST_BUDGET.maxIterations,
           temperature: 0.4,
           timeoutMs: 480_000,
-          maxSessionTokens: ANALYST_BUDGET.maxSessionTokens,
           maxSessionInputTokens: ANALYST_BUDGET.maxSessionInputTokens,
         },
         systemPrompt: ANALYST_SYSTEM_PROMPT,
@@ -208,11 +207,11 @@ export const INSIGHT_PRESET = {
         maxTokens: config?.maxTokens ?? 4096,
         temperature: config?.temperature ?? 0.3,
         timeoutMs: config?.timeoutMs ?? 3_600_000,
-        // 不在策略层设会话字段（maxSessionTokens / maxSessionInputTokens）：会话预算归阶段预算。
+        // 不在策略层设会话字段（maxSessionInputTokens）：会话预算归阶段预算。
         // analyze 阶段预算声明 maxSessionInputTokens（ANALYST_BUDGET 默认值，或 computeAnalystBudget
         // 动态计算、与 contextWindowBudget 对齐）；BudgetController 按阶段内消耗执行，但只触发压缩，
         // 不负责终止（终止靠 maxIterations / 超时），PipelineStrategy 的重试判定读同一口径。
-        // 阶段预算里的 maxSessionTokens 目前没有执行者（BudgetController 不消费），去留待事项②。
+        // 会话总量上限（阶段级与策略层的 maxSessionTokens）已随 W2a-07（L5-P08，②已答复）删除。
       }),
     // I43(L5-P44)：不再挂运行级 QualityGatePolicy。它在运行结束后评估的是最后主阶段 produce 的
     // 提交汇报而不是分析正文，且与管线门的文件引用口径不同，同一文本会得出不同结论；分析质量由

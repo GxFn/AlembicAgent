@@ -1008,7 +1008,6 @@ export class AgentRuntime {
     // 与 BudgetController.hasSessionBudget 读同一字段，口径一致，不受基线影响。
     ctx.budgetController = new BudgetController({
       maxSessionInputTokens: (budget.maxSessionInputTokens as number) || 0,
-      maxSessionTokens: budget.maxSessionTokens as number | undefined,
       cumulativeUsage: this.tokenUsage,
       contextWindow: contextWindow || null,
       tracker: (tracker || null) as

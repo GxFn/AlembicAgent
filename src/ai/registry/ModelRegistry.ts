@@ -2,8 +2,9 @@
  * ModelRegistry — 模型能力注册中心
  *
  * 集中保存各 LLM 模型的能力声明、参数约束与容量信息（内置表 + 运行时 register）。
- * 它还没有成为唯一事实源：ContextWindow 在注册表未命中时仍回退自有 MODEL_CONTEXT_WINDOWS
- * 正则表，ParameterGuard 只接收 Gateway 解析好的 ModelDef、不自己查询注册表。
+ * 它还没有成为唯一事实源：ContextWindow 在注册表未命中时仍回退 ContextWindow.ts 模块私有的
+ * MODEL_CONTEXT_WINDOWS 正则表（W2a-07 起不再是公开静态成员），ParameterGuard 只接收 Gateway
+ * 解析好的 ModelDef、不自己查询注册表。
  *
  * 当前真实消费方（按调用的 API 列出）:
  *   - LLMGateway: get / findByApiModelId / resolveOrCreate —— 把 modelRef 解析成 ModelDef，

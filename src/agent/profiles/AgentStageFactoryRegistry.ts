@@ -201,13 +201,10 @@ export class AgentStageFactoryRegistry {
       // produce/gate 各有自己的预算语义，不受影响)。
       const computedBudget = (context?.strategyContext as Record<string, unknown> | undefined)
         ?._computedBudget as Record<string, unknown> | null | undefined;
+      // 合并键不含 maxSessionTokens：会话总量上限已随 W2a-07（L5-P08）删除，computedBudget 里残留的
+      // 同名键（旧宿主或旧 dist 算出的预算）不再并入阶段预算。
       const dynamicAnalyzeBudget: Record<string, unknown> = {};
-      for (const key of [
-        'maxIterations',
-        'timeoutMs',
-        'maxSessionTokens',
-        'maxSessionInputTokens',
-      ]) {
+      for (const key of ['maxIterations', 'timeoutMs', 'maxSessionInputTokens']) {
         const value = computedBudget?.[key];
         if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
           dynamicAnalyzeBudget[key] = value;

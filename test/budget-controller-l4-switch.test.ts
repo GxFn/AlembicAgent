@@ -57,9 +57,16 @@ function createController(
   return controller;
 }
 
-/** 投影接近预算的小窗口：开关打开时 needsL4Compaction 为 true。 */
-function saturatedWindow(compactionConfig?: { enableL4LLM?: boolean }): ContextWindow {
-  const window = new ContextWindow(1_000, compactionConfig);
+/**
+ * 投影接近预算的小窗口：开关打开时 needsL4Compaction 为 true。
+ * W2a-07 删除了 CompactionConfig 的 L4 初值字段：窗口开关初始关闭，l4On 时按运行时同一入口
+ * syncL4CompactionSwitch 打开（模拟另一个控制器或直接调用方先把共享窗口打开）。
+ */
+function saturatedWindow(opts: { l4On?: boolean } = {}): ContextWindow {
+  const window = new ContextWindow(1_000);
+  if (opts.l4On) {
+    window.syncL4CompactionSwitch(true, 'unit-test');
+  }
   window.appendUserMessage('initial analyze prompt');
   for (let index = 0; index < 4; index++) {
     window.appendAssistantWithToolCalls(null, [
@@ -81,9 +88,9 @@ describe('BudgetController L4 switch authority (L6-P15 C05)', () => {
     expect(window.needsL4Compaction()).toBe(true);
   });
 
-  it('overrides a window configured with enableL4LLM=true when env leaves L4 off', async () => {
+  it('overrides a window whose L4 switch was turned on elsewhere when env leaves L4 off', async () => {
     vi.stubEnv('ALEMBIC_AGENT_ENABLE_L4_COMPACTION', undefined);
-    const window = saturatedWindow({ enableL4LLM: true });
+    const window = saturatedWindow({ l4On: true });
     expect(window.needsL4Compaction()).toBe(true);
 
     createController(window);
@@ -96,7 +103,7 @@ describe('BudgetController L4 switch authority (L6-P15 C05)', () => {
 
   it('lets an explicit enableL4Compaction config win over env and syncs it', () => {
     vi.stubEnv('ALEMBIC_AGENT_ENABLE_L4_COMPACTION', '1');
-    const window = saturatedWindow({ enableL4LLM: true });
+    const window = saturatedWindow({ l4On: true });
     createController(window, { enableL4Compaction: false });
     expect(window.needsL4Compaction()).toBe(false);
   });

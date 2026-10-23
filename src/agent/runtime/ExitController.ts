@@ -17,14 +17,15 @@
  *   新调用方按它们判定会放行 Runtime 会忽略的工具调用。改退出语义时只改内联路径才会生效。
  *   去留（I34）：审阅决定采纳方案 b——随待决事项②删除这三个方法以及 ExitSignal.nudge 与
  *   'graceful_exit' 动作，并由总控派发宿主删除依赖它们的单测；事项②落地前只保留并标注 @deprecated，
- *   不改签名、不删导出。ExitSignal.needsSummary 同样没有运行时消费者（见字段注释）。
+ *   不改签名、不删导出。没有运行时消费者的 ExitSignal.needsSummary 已随 W2a-07（L5-P09）删除：
+ *   是否发强制摘要只由 AgentRuntime.#finalize 决定（见 ExitSignal 注释）。
  *
  * 设计原则：
  *   - 每个检查点按固定顺序判定，返回结构化 ExitSignal 而非分散的 boolean/null
  *   - 保留 ExplorationTracker 的 phase/grace 语义（tick / shouldExit / forceTerminal 由本类触发）
  *   - 带 code 的策略拒绝只按结构化 code 分类（I03），reason 文本只用于展示：
- *       budget_session_tokens / budget_session_input_tokens → token_budget_exhausted（含一次 grace）
- *       budget_timeout → stage_timeout（与 P2 同语义，不要求摘要）
+ *       budget_session_input_tokens → token_budget_exhausted（含一次 grace）
+ *       budget_timeout → stage_timeout（与 P2 同语义，强制摘要由 Runtime 的超时抑制清单处理）
  *       其它 code → policy_stop
  *   - 无 code 的拒绝走兼容回退（code 是可选字段）：按改造前的 reason 判定（含 "token" →
  *     token_budget_exhausted，否则 policy_stop），每个策略每个 loop 发一次 policy_decision_without_code
@@ -71,15 +72,12 @@ export interface ExitSignal {
    * AgentRuntime.#shouldExit 把它与 'exit' 同样处理，只是防御性分支，已接线检查点从不返回它。
    */
   action: 'continue' | 'exit' | 'graceful_exit' | 'retry';
-  reason?: ExitReason;
   /**
-   * 描述性标记：这次退出在语义上是否期望补一份摘要。AgentRuntime 不读取本字段——
-   * 是否发强制摘要由 AgentRuntime.#finalize 决定：ctx.lastReply 为空时才考虑，再按
-   * #getForcedSummarySuppression（abort / 本地缺陷 / 超时等抑制清单）与摘要模式选择。
-   * 例如 stage_timeout 不发摘要是因为抑制清单命中超时，而不是因为本字段为 false；改这里的取值
-   * 不会改变运行时行为，只影响日志与测试断言（I34，字段去留随事项②）。
+   * 退出原因。信号不再携带“是否期望摘要”的描述性标记（needsSummary 已随 W2a-07 / L5-P09 删除，
+   * 它从未被 AgentRuntime 读取）：是否发强制摘要由 AgentRuntime.#finalize 决定——ctx.lastReply 为空时
+   * 才考虑，再按 #getForcedSummarySuppression（abort / 本地缺陷 / 超时等抑制清单）与摘要模式选择。
    */
-  needsSummary?: boolean;
+  reason?: ExitReason;
   /**
    * 只由未接线的 checkAfterTextResponse 填写，运行时没有消费者（I34，随事项②删除）：
    * digest / continue nudge 实际由 AgentRuntime.#processTextResponse 直接追加到消息流。
@@ -108,18 +106,18 @@ export interface ExitControllerConfig {
 
 const CONTINUE: ExitSignal = { action: 'continue' };
 
-/** 会话 token 预算类 code：命中时走 token_budget_exhausted（tracker 未终结时先给一次 grace）。 */
-const TOKEN_BUDGET_CODES: ReadonlySet<string> = new Set([
-  BUDGET_POLICY_CODES.sessionTokens,
-  BUDGET_POLICY_CODES.sessionInputTokens,
-]);
+/**
+ * 会话 token 预算类 code：命中时走 token_budget_exhausted（tracker 未终结时先给一次 grace）。
+ * W2a-07（L5-P08）：运行级总量上限与它的 budget_session_tokens code 已删除，只剩会话 input 预算；
+ * 仍带 budget_session_tokens 的自定义决策按“其它 code”归为 policy_stop，不再触发 grace。
+ */
+const TOKEN_BUDGET_CODES: ReadonlySet<string> = new Set([BUDGET_POLICY_CODES.sessionInputTokens]);
 
 /**
  * 由阶段预算接管的策略 code：阶段预算未声明对应上限时，createExitController 屏蔽这类拒绝。
  *
  * 只有会话 input 预算属于阶段一侧（阶段 budget.maxSessionInputTokens 由 BudgetController 执行）。
- * budget_session_tokens 不在其中：BudgetController 不执行 maxSessionTokens，屏蔽它会让该上限
- * 在全链路静默失效，所以策略层配置的总量上限照常生效（字段待事项②删除）。
+ * 策略层 maxSessionInputTokens 与本屏蔽包装是 W2a-07 明确保留的部分（阶段预算的压缩配置来源）。
  */
 const STAGE_OWNED_SESSION_CODES: ReadonlySet<string> = new Set([
   BUDGET_POLICY_CODES.sessionInputTokens,
@@ -217,7 +215,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'abort_signal',
-        needsSummary: false,
         detail: 'AbortSignal fired before iteration',
       };
     }
@@ -228,7 +225,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'stage_timeout',
-        needsSummary: false,
         detail: `${this.#effectiveTimeoutMs}ms exceeded (elapsed: ${elapsed}ms)`,
       };
     }
@@ -240,7 +236,6 @@ export class ExitController {
         return {
           action: 'exit',
           reason: 'tracker_exit',
-          needsSummary: true,
           detail: `phase=${this.#tracker.phase}, iter=${this.#tracker.iteration}, submits=${this.#tracker.totalSubmits}`,
         };
       }
@@ -251,7 +246,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'iteration_exhausted',
-        needsSummary: true,
         detail: `completed ${ctx.iteration - 1} rounds; maxIterations=${this.#maxIterations}`,
       };
     }
@@ -275,13 +269,12 @@ export class ExitController {
       let isTokenIssue: boolean;
       if (code !== undefined) {
         // 策略超时：工厂已把它并入 P2 的有效超时，正常不会走到这里；P2 与策略各自取一次 Date.now()，
-        // 同毫秒边界上可能只有策略先判超时。按 stage_timeout 收口（不要求摘要），与 P2 语义一致，
+        // 同毫秒边界上可能只有策略先判超时。按 stage_timeout 收口，与 P2 语义一致，
         // 让 AgentRuntime 记录 cancelReason/timedOutStages 并抑制强制摘要。
         if (code === BUDGET_POLICY_CODES.timeout) {
           return {
             action: 'exit',
             reason: 'stage_timeout',
-            needsSummary: false,
             detail: `${reasonStr || 'policy timeout exceeded'} (code=${code})`,
           };
         }
@@ -294,7 +287,7 @@ export class ExitController {
         //     （{ok:false, action:'stop', reason:'session token budget exceeded'}，不带 code），
         //     以及任何尚未迁移到结构化 code 的第三方/自定义策略。
         //   原因：PolicyDuringDecision.code 是可选字段，未迁移的决策不能因此被改判为 policy_stop。
-        //   移除条件：事项②落地且宿主迁移该单测（夹具带上 budget_session_tokens 等 code）后，删除本分支，
+        //   移除条件：事项②落地且宿主迁移该单测（夹具带上 budget_session_input_tokens code）后，删除本分支，
         //     无 code 的拒绝统一按 policy_stop 处理。
         //   负责方：AlembicAgent 窗口。
         // 只恢复分类，不恢复旧的 "session" 子串屏蔽：屏蔽仍只按 code（见 createStageOwnedBypassValidate）。
@@ -317,7 +310,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: isTokenIssue ? 'token_budget_exhausted' : 'policy_stop',
-        needsSummary: true,
         detail: reasonStr || 'Policy stopped the run',
       };
     }
@@ -357,7 +349,7 @@ export class ExitController {
     ctx: LoopContext
   ): ExitSignal {
     if (!llmResult) {
-      return { action: 'exit', reason: 'empty_response', needsSummary: true };
+      return { action: 'exit', reason: 'empty_response' };
     }
 
     const hasText = !!llmResult.text;
@@ -379,7 +371,6 @@ export class ExitController {
         return {
           action: 'exit',
           reason: 'empty_response_terminal',
-          needsSummary: true,
           detail: 'grace exhausted',
         };
       }
@@ -390,7 +381,7 @@ export class ExitController {
           detail: `retry ${ctx.consecutiveEmptyResponses + 1}/2`,
         };
       }
-      return { action: 'exit', reason: 'empty_response', needsSummary: true };
+      return { action: 'exit', reason: 'empty_response' };
     }
 
     return CONTINUE;
@@ -407,8 +398,8 @@ export class ExitController {
    *     “连续两次错误”会推迟到第三次才退出。
    *   - CIRCUIT_OPEN 与连续两次错误只返回信号；Runtime 还会记录 cancelReason
    *     （provider_circuit_open / provider_error）、在连续错误时 messages.resetToPromptOnly()，
-   *     并给非 system 会话写入“AI 服务暂时不可用”的 lastReply（#finalize 因此不再发强制摘要），
-   *     而本方法对连续错误恒返回 needsSummary:true。
+   *     并给非 system 会话写入“AI 服务暂时不可用”的 lastReply（#finalize 因此不再发强制摘要）；
+   *     本方法只返回 exit 信号，不涉及回复与摘要。
    *   - Runtime 在递增后回退 tracker 轮次（rollbackTick），重试前做可被 abort 打断的 2 秒等待；
    *     本方法只返回 retry，不涉及 tracker 与等待。
    */
@@ -429,7 +420,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'error_accumulated',
-        needsSummary: true,
         detail: `${ctx.consecutiveAiErrors} consecutive AI errors`,
       };
     }
@@ -448,7 +438,6 @@ export class ExitController {
       return {
         action: 'exit',
         reason: 'iteration_exhausted',
-        needsSummary: true,
         detail: `iteration ${ctx.iteration} >= maxIterations ${this.#maxIterations}`,
       };
     }

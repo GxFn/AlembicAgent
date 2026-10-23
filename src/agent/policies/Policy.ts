@@ -36,6 +36,13 @@ export interface PolicyResult {
   [key: string]: unknown;
 }
 
+/**
+ * 运行策略基类：只经 validateBefore / validateDuring / validateAfter 三个校验钩子参与运行。
+ *
+ * W2a-07（L5-P44，②已答复）：旧的 applyToConfig 配置改写链（Policy、子类与 PolicyEngine 各一处）已删除。
+ * 它在 src 与宿主中都没有调用方，SafetyPolicy 的实现还会把策略实例本身塞进配置，序列化后约束静默丢失。
+ * 需要预算数值的调用方读 PolicyEngine.getBudget()。
+ */
 export class Policy {
   get name(): string {
     throw new Error('Subclass must implement name');
@@ -51,9 +58,5 @@ export class Policy {
 
   validateAfter(_result: PolicyResult): { ok: boolean; reason?: string } {
     return { ok: true };
-  }
-
-  applyToConfig(config: Record<string, unknown>): Record<string, unknown> {
-    return config;
   }
 }

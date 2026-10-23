@@ -19,10 +19,10 @@
  *
  * 不在本类职责内（I03，避免“统一管理”的误读）:
  *   - 终止决策：会话预算只触发压缩；退出由 ExitController（maxIterations / 有效超时 / policy）负责。
- *   - maxSessionTokens（input+output 总量上限）与 tracker：配置里收下但不消费。阶段预算里的
- *     maxSessionTokens 目前没有执行者；策略层 BudgetPolicy.maxSessionTokens 由 ExitController 经
- *     validateDuring 按运行累计执行。两个配置字段属 runtime 公开类型，删除待公开面收窄（事项②）。
- *   - SessionBudgetSummary.forcedSummarize 恒为 false（本类从不触发强制摘要），同样待事项②处理。
+ *   - 会话总量（input+output）上限：W2a-07（L5-P08，②已答复）删除了阶段级与策略层的 maxSessionTokens，
+ *     本类与 ExitController 都不再有总量上限；会话预算只有本类执行的阶段内 input 预算。
+ *   - tracker：配置里收下但不消费。SessionBudgetSummary.forcedSummarize 恒为 false（本类从不触发强制摘要）。
+ *     两者属 runtime 公开类型；答复②未点名它们，按总控裁定（2026-10-21 第 7 节第 2 项）保留，不在 W2a-07 删除。
  *
  * @module BudgetController
  */
@@ -48,11 +48,6 @@ export interface BudgetControllerConfig {
    */
   maxSessionInputTokens: number;
   /**
-   * Session 级 total token 总限额 (input + output)。当前不被消费：构造函数不读取，本类只执行
-   * maxSessionInputTokens 的压缩触发。字段属 runtime 公开类型，删除待事项②。
-   */
-  maxSessionTokens?: number;
-  /**
    * AgentRuntime.tokenUsage 的引用（非拷贝！）。
    * 跨 pipeline stage 共享：analyze 写入的值，produce 可读到。
    * 构造时的值是本 loop 的会话预算基线；本 loop 的消耗仍累加写回该引用。
@@ -62,7 +57,8 @@ export interface BudgetControllerConfig {
   contextWindow: ContextWindow | null;
   /**
    * ExplorationTracker 引用。当前不被消费：本类不调用 forceTerminal、不做 SUMMARIZE 决策
-   * （token 超限的 grace 与 forceTerminal 由 ExitController 触发）。字段属 runtime 公开类型，删除待事项②。
+   * （token 超限的 grace 与 forceTerminal 由 ExitController 触发）。字段属 runtime 公开类型；答复②未点名，
+   * 按总控裁定保留（见模块头注释）。
    */
   tracker: ExplorationTracker | null;
   /** 基础系统提示词长度（用于 ContextWindow 估算） */
@@ -76,8 +72,9 @@ export interface BudgetControllerConfig {
   /**
    * L4 唯一执行开关（临时止血：L4 仍保留实现，但默认不在运行中自动触发）。
    * 显式配置优先，缺省读 ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1'。构造时经
-   * ContextWindow.syncL4CompactionSwitch 同步到窗口，覆盖窗口的 CompactionConfig.enableL4LLM 初值，
-   * 让窗口阈值判定（needsL4Compaction）、compactL4 短路与本类的请求门读同一个开关。
+   * ContextWindow.syncL4CompactionSwitch 同步到窗口（窗口的 L4 开关初始关闭，只由该同步设置；
+   * W2a-07 / L6-P15 删除了 CompactionConfig 里的初值字段），让窗口阈值判定（needsL4Compaction）、
+   * compactL4 短路与本类的请求门读同一个开关。
    */
   enableL4Compaction?: boolean;
   /** Abort signal used to discard in-flight L4 compaction results */
@@ -127,7 +124,7 @@ export interface SessionBudgetSummary {
   peakSessionUsageRatio: number;
   maxCompactionLevel: number;
   totalCompactedItems: number;
-  /** 恒为 false：BudgetController 从不触发强制摘要（见模块头注释）；字段属公开类型，删除待事项②。 */
+  /** 恒为 false：BudgetController 从不触发强制摘要（见模块头注释）；字段属公开类型，按总控裁定保留。 */
   forcedSummarize: boolean;
 }
 

@@ -171,36 +171,33 @@ export const ANALYST_TOOLS = ['code', 'graph', 'terminal', 'memory', 'meta'];
 const DEFAULT_ANALYST_ROUND_CONTEXT_BUDGET = 15_000;
 /** 每轮实际 input 占上下文预算的加权平均：早期轮次 ~40%，后期接近上限 ~70% */
 const ANALYST_AVG_INPUT_USAGE_RATIO = 0.6;
-/** 会话总量 = input × 1.35（output 约占 input 的 30-40%） */
-const ANALYST_SESSION_TOTAL_RATIO = 1.35;
 
 /**
- * 迭代数 → 会话 token 上限（静态兜底与 computeAnalystBudget 共用的唯一估算口径）。
+ * 迭代数 → 阶段会话 input 上限（静态兜底与 computeAnalystBudget 共用的唯一估算口径）。
+ *
+ * W2a-07（L5-P08，②已答复）：会话总量上限 maxSessionTokens 及其 input × 1.35 的总量比例已删除——
+ * 它在阶段预算里没有执行者（BudgetController 只执行阶段内 input 预算）。input 上限的数值与公式不变。
  * @param contextWindowBudget ContextWindow 的 tokenBudget；缺省或为 0 时按 15000 token/轮 估算
  */
-function analystSessionTokenCaps(
-  maxIter: number,
-  contextWindowBudget?: number
-): { maxSessionTokens: number; maxSessionInputTokens: number } {
+function analystSessionInputTokenCap(maxIter: number, contextWindowBudget?: number): number {
   const cwBudget = contextWindowBudget || DEFAULT_ANALYST_ROUND_CONTEXT_BUDGET;
   const avgInputPerRound = Math.ceil(cwBudget * ANALYST_AVG_INPUT_USAGE_RATIO);
-  const maxSessionInputTokens = maxIter * avgInputPerRound;
-  return {
-    maxSessionTokens: Math.ceil(maxSessionInputTokens * ANALYST_SESSION_TOTAL_RATIO),
-    maxSessionInputTokens,
-  };
+  return maxIter * avgInputPerRound;
 }
 
 /** 静态 Analyst 预算的 24 轮基线 */
 const ANALYST_BASELINE_ITERATIONS = 24;
-const ANALYST_BASELINE_SESSION = analystSessionTokenCaps(ANALYST_BASELINE_ITERATIONS);
+const ANALYST_BASELINE_SESSION_INPUT_TOKENS = analystSessionInputTokenCap(
+  ANALYST_BASELINE_ITERATIONS
+);
 
 /**
  * 默认 Analyst 预算（24 轮基线）。
  *
  * 宿主生产路径总是用 computeAnalystBudget 的结果覆盖（经 _computedBudget 合并进 analyze 阶段预算）；
- * 本常量只在没有动态预算时作为 insightPreset analyze 阶段的兜底。会话 token 上限与
+ * 本常量只在没有动态预算时作为 insightPreset analyze 阶段的兜底。会话 input 上限与
  * computeAnalystBudget(≤40 文件、未提供 contextWindowBudget) 同源（C57 统一口径）。
+ * W2a-07：键集合不再含 maxSessionTokens（会话总量上限已删除）。
  */
 export const ANALYST_BUDGET = {
   maxIterations: ANALYST_BASELINE_ITERATIONS,
@@ -210,15 +207,10 @@ export const ANALYST_BUDGET = {
   softSubmitLimit: 0,
   idleRoundsToExit: 2,
   /**
-   * Session-level total token cap (input + output).
-   * 24 轮 × ceil(15000 × 0.6) × 1.35 = 291,600；有动态预算时被 computeAnalystBudget 覆盖。
-   */
-  maxSessionTokens: ANALYST_BASELINE_SESSION.maxSessionTokens,
-  /**
-   * Session-level input token cap.
+   * 阶段会话 input token 上限（BudgetController 按阶段内消耗执行，只触发压缩）。
    * 24 轮 × ceil(15000 × 0.6) = 216,000；有动态预算时被 computeAnalystBudget 覆盖。
    */
-  maxSessionInputTokens: ANALYST_BASELINE_SESSION.maxSessionInputTokens,
+  maxSessionInputTokens: ANALYST_BASELINE_SESSION_INPUT_TOKENS,
 };
 
 /**
@@ -254,7 +246,7 @@ export function computeAnalystBudget(
     maxIter = 40;
   }
 
-  // Session token 预算: 基于 ContextWindow budget 动态计算
+  // 阶段会话 input 预算: 基于 ContextWindow budget 动态计算
   // 每轮 input token ≈ contextWindowBudget × avgUsageRatio
   return analystBudgetForIterations(maxIter, contextWindowBudget);
 }
@@ -288,19 +280,13 @@ function analystBudgetForIterations(
   maxIter: number,
   contextWindowBudget?: number
 ): typeof ANALYST_BUDGET & { timeoutMs: number } {
-  // Session token 预算: 每轮 input ≈ contextWindowBudget × 60%，与静态 ANALYST_BUDGET 同一口径
-  const { maxSessionTokens, maxSessionInputTokens } = analystSessionTokenCaps(
-    maxIter,
-    contextWindowBudget
-  );
-
+  // 阶段会话 input 预算: 每轮 input ≈ contextWindowBudget × 60%，与静态 ANALYST_BUDGET 同一口径
   return {
     ...ANALYST_BUDGET,
     maxIterations: maxIter,
     searchBudget: Math.round(maxIter * 0.75),
     timeoutMs: Math.round((maxIter / 24) * 480_000),
-    maxSessionTokens,
-    maxSessionInputTokens,
+    maxSessionInputTokens: analystSessionInputTokenCap(maxIter, contextWindowBudget),
   };
 }
 

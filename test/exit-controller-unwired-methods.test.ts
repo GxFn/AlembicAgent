@@ -8,8 +8,9 @@
  *
  * 本文件锁定三件事：
  *   1. 注释说真话：不再宣称这些方法“replaces #handleAiError / #processTextResponse”，每个方法都标明
- *      未接线（@deprecated）并写出与内联判定的语义差异；ExitSignal.needsSummary / nudge / action 的
- *      注释不再宣称被 #finalize 或消息流消费；AgentRuntime 的三处内联判定反向标注平行方法。
+ *      未接线（@deprecated）并写出与内联判定的语义差异；ExitSignal.nudge / action 的注释不再宣称被
+ *      消息流消费（没有消费者的 needsSummary 已随 W2a-07 / L5-P09 删除，摘要由 #finalize 决定）；
+ *      AgentRuntime 的三处内联判定反向标注平行方法。
  *   2. “未被 Runtime 使用”这一说法本身成立：src 中除定义外没有任何调用点。
  *      若将来有人把它们接线，这里会失败，提醒同步修改注释（或改走方案 a）。
  *   3. 注释里写出的语义差异是真实行为（特征测试，修注释前后都应通过）：
@@ -147,13 +148,14 @@ describe('ExitController 未接线方法：注释与实际接线一致（I34）'
     expect(violationDoc).toContain('无 tracker');
   });
 
-  it('ExitSignal 的 needsSummary / nudge / action 注释不再宣称有运行时消费者', () => {
+  it('ExitSignal 的 nudge / action 注释不再宣称有运行时消费者，needsSummary 字段已删除', () => {
     const source = readSource(EXIT_CONTROLLER_PATH);
 
-    const needsSummaryDoc = jsDocBefore(source, 'needsSummary\\?:');
-    expect(needsSummaryDoc).not.toMatch(/Whether #finalize should produce a forced summary/);
-    expect(needsSummaryDoc).toContain('AgentRuntime 不读取');
-    expect(needsSummaryDoc).toContain('#getForcedSummarySuppression');
+    // W2a-07（L5-P09）：needsSummary 从未被 AgentRuntime 读取，字段已删除；是否发强制摘要的说明移到 reason。
+    expect(source).not.toMatch(/needsSummary\?:/);
+    const reasonDoc = jsDocBefore(source, 'reason\\?: ExitReason');
+    expect(reasonDoc).toContain('AgentRuntime.#finalize');
+    expect(reasonDoc).toContain('#getForcedSummarySuppression');
 
     const nudgeDoc = jsDocBefore(source, 'nudge\\?:');
     expect(nudgeDoc).not.toMatch(/Text to inject into message stream/);
@@ -221,9 +223,13 @@ describe('ExitController 未接线方法：注释所写的语义差异是真实�
     const signal = controller.checkAfterAiError({ message: 'boom' }, ctx);
     expect(signal).toMatchObject({ action: 'retry', reason: 'error_accumulated' });
     expect(ctx.consecutiveAiErrors).toBe(1);
-    expect(
-      controller.checkAfterAiError({ message: 'boom' }, createLoopCtx({ consecutiveAiErrors: 2 }))
-    ).toMatchObject({ action: 'exit', reason: 'error_accumulated', needsSummary: true });
+    const exhausted = controller.checkAfterAiError(
+      { message: 'boom' },
+      createLoopCtx({ consecutiveAiErrors: 2 })
+    );
+    expect(exhausted).toMatchObject({ action: 'exit', reason: 'error_accumulated' });
+    // W2a-07（L5-P09）：信号不再携带 needsSummary。
+    expect(Object.hasOwn(exhausted, 'needsSummary')).toBe(false);
   });
 
   it('checkAfterTextResponse 不区分管线：metrics 转入终结阶段的终答一律返回 graceful_exit', () => {

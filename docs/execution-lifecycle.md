@@ -79,7 +79,7 @@ Service 的 metadata.context 与显式 promptContext 共用一次优先级规则
 
 非 strict 的快速重试仍受 `retryBudget` 和一次上限约束，只在宿主显式返回零工具超时，或 native 观察确认循环内没有工具开始时允许。宿主若携带 `partial`，其中已知工具活动、未知开始次数或读回要求均会否决重试；已有部分回执保留。未知执行历史的硬超时不据此重试。所有尝试的已知用量与迭代次数均累计；最终阶段结果描述最后一次尝试，最终回复取实际最后主阶段，避免被旧 repair 微阶段覆盖。
 
-质量门的拒绝、未知动作或相互矛盾的结果不能报告 `completed`。显式 `skipOnFail=false` 仍允许后续清理阶段执行，最终结果保留未通过事实。超时判断使用各阶段的最终回执，成功重试不被历史超时记录重新判为失败。`QualityGatePolicy.toGateConfig()` 负责将 Policy 的 `ok` 翻译为 Pipeline 的 `pass`；缺少拒绝原因不会把失败变成通过。多条 SafetyPolicy 按全部同意执行，`g`/`y` 正则的匹配游标不在调用间共享。
+质量门的拒绝、未知动作或相互矛盾的结果不能报告 `completed`。显式 `skipOnFail=false` 仍允许后续清理阶段执行，最终结果保留未通过事实。超时判断使用各阶段的最终回执，成功重试不被历史超时记录重新判为失败。Pipeline 门只读 GateConfig（`evaluator`，或阈值字段加返回 `pass` 的 `custom`）；运行级 `QualityGatePolicy` 不再提供到门配置的翻译（`toGateConfig` 已删除，类保留供显式注入），需要阈值门时直接声明 GateConfig。`custom` 返回 `pass: false` 时，缺少拒绝原因也不会把失败变成通过。多条 SafetyPolicy 按全部同意执行，`g`/`y` 正则的匹配游标不在调用间共享。
 
 ## 证据与评审边界
 

@@ -34,7 +34,8 @@ describe('bootstrapDimensionPipeline analyze budget wiring', () => {
     expect(analyze).toBeDefined();
     expect(analyze?.budget?.maxIterations).toBe(40);
     expect(analyze?.budget?.timeoutMs).toBe(800_000);
-    expect(analyze?.budget?.maxSessionTokens).toBe(777_600);
+    // W2a-07（L5-P08）：会话总量上限已删除，computedBudget 里残留的 maxSessionTokens 不再并入阶段预算。
+    expect(analyze?.budget && 'maxSessionTokens' in analyze.budget).toBe(false);
     expect(analyze?.budget?.maxSessionInputTokens).toBe(576_000);
     // searchBudget 是 tracker 语义不属于 stage budget，不应被合并进来。
     expect(analyze?.budget?.searchBudget).toBeUndefined();

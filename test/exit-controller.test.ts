@@ -13,8 +13,9 @@
  *     否则 policy_stop），每个策略每个 loop 发一次 policy_decision_without_code 诊断（只含策略名与 reason）；
  *     兼容回退不恢复旧的 "session" 子串屏蔽；
  *   - createExitController 只屏蔽阶段未声明 maxSessionInputTokens 时的 budget_session_input_tokens，
- *     屏蔽写 policy_session_limit_bypassed 诊断并继续评估后续策略；BudgetController 不执行的
- *     budget_session_tokens 不屏蔽；自定义策略的 "session expired" 不被吞；
+ *     屏蔽写 policy_session_limit_bypassed 诊断并继续评估后续策略；自定义策略的 "session expired" 不被吞；
+ *   - W2a-07（L5-P08 / L5-P09）：运行级总量上限 maxSessionTokens 与 budget_session_tokens code 已删除，
+ *     token 夹具改用 budget_session_input_tokens；ExitSignal 不再携带 needsSummary。
  *   - 有效超时取阶段超时与策略超时的较小正值，策略超时先到时命中 stage_timeout 分支。
  */
 import Logger from '@alembic/core/logging';
@@ -103,7 +104,7 @@ describe('ExitController.checkBeforeIteration 判定顺序', () => {
 
     const signal = controller.checkBeforeIteration(createLoopCtx(), NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'abort_signal', needsSummary: false });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'abort_signal' });
     expect(tracker.tick).not.toHaveBeenCalled();
     expect(tracker.shouldExit).not.toHaveBeenCalled();
     expect(validateDuring).not.toHaveBeenCalled();
@@ -121,14 +122,14 @@ describe('ExitController.checkBeforeIteration 判定顺序', () => {
 
     const signal = controller.checkBeforeIteration(createLoopCtx(), NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout', needsSummary: false });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout' });
     expect(signal.detail).toContain('1000ms exceeded');
     expect(tracker.tick).not.toHaveBeenCalled();
     expect(tracker.shouldExit).not.toHaveBeenCalled();
     expect(validateDuring).not.toHaveBeenCalled();
   });
 
-  it('未超时时 tracker.shouldExit 决定退出：先 tick 再判定，退出需要摘要且不再问 policy', () => {
+  it('未超时时 tracker.shouldExit 决定退出：先 tick 再判定，退出且不再问 policy', () => {
     const tracker = createFakeTracker({
       phase: 'RECORD',
       iteration: 7,
@@ -140,7 +141,7 @@ describe('ExitController.checkBeforeIteration 判定顺序', () => {
 
     const signal = controller.checkBeforeIteration(createLoopCtx(), NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'tracker_exit', needsSummary: true });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'tracker_exit' });
     expect(signal.detail).toBe('phase=RECORD, iter=7, submits=3');
     expect(tracker.tick).toHaveBeenCalledTimes(1);
     expect(validateDuring).not.toHaveBeenCalled();
@@ -152,7 +153,7 @@ describe('ExitController token 超限 grace', () => {
   const tokenStop: ValidateDuring = () => ({
     ok: false,
     reason: 'Budget: token limit exceeded',
-    code: 'budget_session_tokens',
+    code: 'budget_session_input_tokens',
   });
 
   it('只给一次 graceful 机会：首次 continue 并 forceTerminal，第二次直接 exit', () => {
@@ -169,7 +170,6 @@ describe('ExitController token 超限 grace', () => {
     expect(second).toMatchObject({
       action: 'exit',
       reason: 'token_budget_exhausted',
-      needsSummary: true,
       detail: 'Budget: token limit exceeded',
     });
     expect(tracker.forceTerminal).toHaveBeenCalledTimes(1);
@@ -193,7 +193,6 @@ describe('ExitController token 超限 grace', () => {
     expect(signal).toMatchObject({
       action: 'exit',
       reason: 'token_budget_exhausted',
-      needsSummary: true,
     });
   });
 
@@ -239,11 +238,8 @@ describe('ExitController.checkAfterLLM SUMMARIZE 空响应 grace', () => {
 
     expect(metricsRead).toHaveBeenCalled();
     expect(signal).toMatchObject({ action, reason: 'empty_response_terminal', detail });
-    if (action === 'exit') {
-      expect(signal.needsSummary).toBe(true);
-    } else {
-      expect(signal.needsSummary).toBeUndefined();
-    }
+    // W2a-07（L5-P09）：信号不再携带 needsSummary（它从未被 AgentRuntime 读取）。
+    expect(Object.hasOwn(signal, 'needsSummary')).toBe(false);
   });
 
   it('非终结阶段的空响应不走 SUMMARIZE grace：system 场景最多重试两次', () => {
@@ -261,16 +257,15 @@ describe('ExitController.checkAfterLLM SUMMARIZE 空响应 grace', () => {
         emptyResult,
         createLoopCtx({ isSystem: true, consecutiveEmptyResponses: 2 })
       )
-    ).toMatchObject({ action: 'exit', reason: 'empty_response', needsSummary: true });
+    ).toMatchObject({ action: 'exit', reason: 'empty_response' });
   });
 
-  it('llmResult 为 null 直接 exit 并要求摘要；有文本或工具调用则 continue', () => {
+  it('llmResult 为 null 直接 exit；有文本或工具调用则 continue', () => {
     const controller = createController({ tracker: createFakeTracker({ phase: 'SUMMARIZE' }) });
 
     expect(controller.checkAfterLLM(null, createLoopCtx())).toMatchObject({
       action: 'exit',
       reason: 'empty_response',
-      needsSummary: true,
     });
     expect(controller.checkAfterLLM({ text: 'done' }, createLoopCtx())).toEqual({
       action: 'continue',
@@ -292,11 +287,6 @@ describe('BudgetPolicy.validateDuring 结构化 code', () => {
       'budget_timeout',
       new BudgetPolicy({ timeoutMs: 1_000 }),
       { iteration: 0, startTime: Date.now() - 5_000 },
-    ],
-    [
-      'budget_session_tokens',
-      new BudgetPolicy({ maxSessionTokens: 1_000 }),
-      { iteration: 0, startTime: Date.now(), totalTokens: 1_400, totalInputTokens: 700 },
     ],
     [
       'budget_session_input_tokens',
@@ -340,13 +330,12 @@ describe('ExitController 按 code 分类策略拒绝', () => {
     expect(signal).toMatchObject({
       action: 'exit',
       reason: 'policy_stop',
-      needsSummary: true,
       detail: 'custom token refresh failed',
     });
     expect(tracker.forceTerminal).not.toHaveBeenCalled();
   });
 
-  it('budget_session_input_tokens 与 budget_session_tokens 同样走 token grace', () => {
+  it('budget_session_input_tokens 走 token grace', () => {
     const tracker = createFakeTracker();
     const controller = createController({
       tracker,
@@ -364,7 +353,7 @@ describe('ExitController 按 code 分类策略拒绝', () => {
     expect(tracker.forceTerminal).toHaveBeenCalledTimes(1);
   });
 
-  it('budget_timeout（阶段超时检查未先命中时）归为 stage_timeout，不要求摘要、不 forceTerminal', () => {
+  it('budget_timeout（阶段超时检查未先命中时）归为 stage_timeout，不 forceTerminal', () => {
     const tracker = createFakeTracker();
     const controller = createController({
       tracker,
@@ -378,7 +367,7 @@ describe('ExitController 按 code 分类策略拒绝', () => {
 
     const signal = controller.checkBeforeIteration(createLoopCtx(), NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout', needsSummary: false });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout' });
     expect(signal.detail).toContain('Budget: timeout (50ms) exceeded');
     expect(tracker.forceTerminal).not.toHaveBeenCalled();
   });
@@ -396,7 +385,6 @@ describe('ExitController 按 code 分类策略拒绝', () => {
     expect(controller.checkBeforeIteration(createLoopCtx(), NO_USAGE)).toMatchObject({
       action: 'exit',
       reason: 'policy_stop',
-      needsSummary: true,
     });
   });
 });
@@ -466,8 +454,8 @@ describe('createExitController 会话限额屏蔽（按 code）', () => {
     expect(bypassWarnings(diagnostics)).toHaveLength(0);
   });
 
-  it('只配策略层 maxSessionTokens（single，ctx.budget=getBudget）：累计 1400 时退出，不屏蔽', () => {
-    const engine = new PolicyEngine([new BudgetPolicy({ maxSessionTokens: 1_000 })]);
+  it('策略层残留的 maxSessionTokens（W2a-07 已删除）被忽略：累计 1400 时继续运行，不屏蔽也不告警', () => {
+    const engine = new PolicyEngine([new BudgetPolicy({ maxSessionTokens: 1_000 } as never)]);
     const { ctx, diagnostics } = createFactoryCtx({ budget: engine.getBudget() });
 
     const signal = createExitController(ctx, engine).checkBeforeIteration(ctx, {
@@ -475,12 +463,7 @@ describe('createExitController 会话限额屏蔽（按 code）', () => {
       output: 700,
     });
 
-    expect(signal).toMatchObject({
-      action: 'exit',
-      reason: 'token_budget_exhausted',
-      needsSummary: true,
-    });
-    expect(signal.detail).toContain('session token limit (1000)');
+    expect(signal).toEqual({ action: 'continue' });
     expect(bypassWarnings(diagnostics)).toHaveLength(0);
   });
 
@@ -612,7 +595,6 @@ describe('无 code 拒绝的兼容回退（宿主夹具与未迁移策略）', (
     expect(signal).toMatchObject({
       action: 'exit',
       reason: 'token_budget_exhausted',
-      needsSummary: true,
       detail: 'session token budget exceeded',
     });
     // 直接构造时没有 PolicyEngine 可归属，策略名记为 unknown；诊断只含策略名与 reason。
@@ -654,7 +636,7 @@ describe('无 code 拒绝的兼容回退（宿主夹具与未迁移策略）', (
 
     const signal = controller.checkBeforeIteration(ctx, NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'policy_stop', needsSummary: true });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'policy_stop' });
     expect(tracker.forceTerminal).not.toHaveBeenCalled();
     expect(codelessWarnings(diagnostics)).toEqual([
       { code: 'policy_decision_without_code', message: 'policy=unknown; reason=iteration limit' },
@@ -764,7 +746,7 @@ describe('有效超时 = 阶段超时与策略超时的较小正值', () => {
 
     const signal = createExitController(ctx, engine).checkBeforeIteration(ctx, NO_USAGE);
 
-    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout', needsSummary: false });
+    expect(signal).toMatchObject({ action: 'exit', reason: 'stage_timeout' });
     expect(signal.detail).toContain('50ms exceeded');
     expect(validateSpy).not.toHaveBeenCalled();
   });

@@ -1760,7 +1760,6 @@ export class PipelineStrategy extends Strategy {
         // 阶段内口径（I02）：BudgetController 以本 loop 构造时的运行累计为基线计量，
         // analyze 已用的 input 不计入这 12k。
         maxSessionInputTokens: 12_000,
-        maxSessionTokens: 16_000,
       },
       disableTracker: true,
       recordRepairOnly: true,
@@ -1815,7 +1814,6 @@ export class PipelineStrategy extends Strategy {
         temperature: 0.3,
         // 阶段内口径（I02）：同 record_repair，只计本微阶段自身的 input。
         maxSessionInputTokens: 24_000,
-        maxSessionTokens: 30_000,
       },
       disableTracker: true,
       // I11：重写正文只用于写回 analyze；无文本退出返回空 reply，调用方据此转 analysis_retry，

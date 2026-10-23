@@ -7,16 +7,18 @@ import { ANALYST_BUDGET, computeAnalystBudget } from '../src/agent/prompts/index
 // contextWindowBudget 时按 24 × 15000 × 0.6（216k input）估算，两处注释互相矛盾。
 // 统一后静态兜底与动态计算同源：insightPreset 的 analyze 阶段在没有 _computedBudget 时
 // 使用的会话预算，与宿主未提供上下文窗口时 computeAnalystBudget(≤40 文件) 的结果一致。
+// W2a-07（L5-P08，②已答复）：会话总量上限 maxSessionTokens（input × 1.35）已删除，键集合少一项；
+// 阶段会话 input 上限的数值与公式不变。
 
 describe('ANALYST_BUDGET static baseline (C57)', () => {
-  it('derives the session token caps from the same 24-round estimate as computeAnalystBudget', () => {
+  it('derives the session input cap from the same 24-round estimate as computeAnalystBudget', () => {
     const dynamicBaseline = computeAnalystBudget(0);
     expect(dynamicBaseline.maxIterations).toBe(ANALYST_BUDGET.maxIterations);
     expect(ANALYST_BUDGET.maxSessionInputTokens).toBe(dynamicBaseline.maxSessionInputTokens);
-    expect(ANALYST_BUDGET.maxSessionTokens).toBe(dynamicBaseline.maxSessionTokens);
-    // 24 轮 × ceil(15000 × 0.6) = 216k input；总量按 output ≈ input × 0.35 估算。
+    // 24 轮 × ceil(15000 × 0.6) = 216k input。
     expect(ANALYST_BUDGET.maxSessionInputTokens).toBe(216_000);
-    expect(ANALYST_BUDGET.maxSessionTokens).toBe(291_600);
+    expect('maxSessionTokens' in ANALYST_BUDGET).toBe(false);
+    expect('maxSessionTokens' in dynamicBaseline).toBe(false);
   });
 
   it('keeps the non-session fields and their names unchanged', () => {
@@ -27,7 +29,6 @@ describe('ANALYST_BUDGET static baseline (C57)', () => {
       'maxSubmits',
       'softSubmitLimit',
       'idleRoundsToExit',
-      'maxSessionTokens',
       'maxSessionInputTokens',
     ]);
     expect(ANALYST_BUDGET).toMatchObject({
@@ -40,10 +41,10 @@ describe('ANALYST_BUDGET static baseline (C57)', () => {
     });
   });
 
-  it('still scales the session caps with an explicit context window budget', () => {
+  it('still scales the session input cap with an explicit context window budget', () => {
     const scaled = computeAnalystBudget(0, 24_000);
     expect(scaled.maxSessionInputTokens).toBe(24 * Math.ceil(24_000 * 0.6));
-    expect(scaled.maxSessionTokens).toBe(Math.ceil(scaled.maxSessionInputTokens * 1.35));
+    expect('maxSessionTokens' in scaled).toBe(false);
   });
 
   it('uses the unified static caps as the insight analyze stage fallback without _computedBudget', () => {
@@ -54,6 +55,6 @@ describe('ANALYST_BUDGET static baseline (C57)', () => {
     }) as Array<{ name: string; budget?: Record<string, unknown> }>;
     const analyze = stages.find((stage) => stage.name === 'analyze');
     expect(analyze?.budget?.maxSessionInputTokens).toBe(216_000);
-    expect(analyze?.budget?.maxSessionTokens).toBe(291_600);
+    expect(analyze?.budget && 'maxSessionTokens' in analyze.budget).toBe(false);
   });
 });

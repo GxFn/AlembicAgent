@@ -109,7 +109,13 @@ interface ToolResultQuota {
  * - 或单独的 user/assistant 文本消息
  */
 
-/** Compaction configuration — per-pipeline overrides */
+/**
+ * Compaction configuration — per-pipeline overrides。
+ *
+ * W2a-07（L6-P15，②已答复）：L4 开关的初值字段已删除。窗口的 L4 开关初始关闭，唯一设置入口是
+ * syncL4CompactionSwitch——运行时由 BudgetController 构造时按 enableL4Compaction（缺省读
+ * ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1'）同步；配置里残留的旧字段不被读取。
+ */
 export interface CompactionConfig {
   /**
    * [L0, L1, L2, L3, L4] usage ratio thresholds。
@@ -117,14 +123,6 @@ export interface CompactionConfig {
    * getToolResultQuota 使用独立的固定阶梯（0.5/0.7/0.85/0.95）。保留五元组形状只是为了不改公开类型。
    */
   thresholds?: [number, number, number, number, number];
-  /**
-   * L4 LLM 摘要开关的初始值（缺省 false）。只是初值，不是运行时权威：L4 的唯一执行开关是
-   * BudgetController 的 enableL4Compaction（缺省读 ALEMBIC_AGENT_ENABLE_L4_COMPACTION === '1'），
-   * BudgetController 构造时经 syncL4CompactionSwitch 把它同步到窗口，覆盖这里的值。
-   * 开关关闭时 needsL4Compaction 恒为 false，compactL4 短路返回 l4_disabled。
-   * 字段保留以免改公开类型；删除与否随公开面收窄（事项②）决定。
-   */
-  enableL4LLM?: boolean;
 }
 
 export interface ProviderInputBudgetOptions {
@@ -146,6 +144,60 @@ export interface ProviderInputBudgetResult {
 
 const DEFAULT_THRESHOLDS: [number, number, number, number, number] = [0.4, 0.55, 0.7, 0.82, 0.92];
 
+/**
+ * 模型名 → 上下文窗口大小映射（token 数）。
+ * 键为正则模式，按优先级从上到下匹配。
+ * 值为模型的原始上下文窗口上限。
+ *
+ * 只是 resolveTokenBudget 在 ModelRegistry 未命中时的降级估算表（经本表得出窗口时记 info 日志
+ * token_budget_fallback path=regex）。
+ * W2a-07（L6-P15，②已答复）：由 ContextWindow 的公开静态成员改为模块私有常量，表内容与匹配顺序不变；
+ * 删除本表、改以 ModelRegistry 为唯一来源不在授权范围内。
+ */
+const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [RegExp, number]> = [
+  // ── Google Gemini ──
+  [/gemini-3/i, 1_048_576],
+  [/gemini-2\.5/i, 1_048_576],
+  [/gemini-2/i, 1_048_576],
+  [/gemini-1\.5/i, 1_048_576],
+  [/gemini-1\.0/i, 32_000],
+  [/gemini/i, 1_048_576],
+  // ── OpenAI ──
+  [/gpt-5\.5/i, 1_100_000],
+  [/gpt-5\.4-(?:mini|nano)/i, 400_000],
+  [/gpt-5\.4/i, 1_050_000],
+  [/gpt-5-(?:mini|nano)/i, 400_000],
+  [/gpt-5/i, 400_000],
+  [/gpt-4o/i, 128_000],
+  [/gpt-4-turbo/i, 128_000],
+  [/gpt-4-(?!turbo)/i, 8_192],
+  [/gpt-3\.5-turbo-16k/i, 16_384],
+  [/gpt-3\.5/i, 4_096],
+  [/o1|o3|o4/i, 200_000],
+  // ── Anthropic ──
+  [/claude-opus-4-7/i, 1_000_000],
+  [/claude-(?:opus|sonnet)-4[.-]6/i, 1_000_000],
+  [/claude-(?:opus|sonnet)-4[.-]5/i, 200_000],
+  [/claude-opus-4[.-]1/i, 200_000],
+  [/claude-haiku-4/i, 200_000],
+  [/claude-.*(?:sonnet|opus)-4/i, 200_000],
+  [/claude-3[.-]5/i, 200_000],
+  [/claude-3/i, 200_000],
+  [/claude/i, 200_000],
+  // ── DeepSeek ──
+  [/deepseek-v4/i, 1_000_000],
+  [/deepseek/i, 1_000_000],
+  // ── 本地 Ollama ──
+  [/llama3[.-]?[23]/i, 128_000],
+  [/llama3/i, 8_192],
+  [/llama/i, 4_096],
+  [/mistral/i, 32_000],
+  [/qwen/i, 128_000],
+  [/phi/i, 128_000],
+  // ── Mock（测试） ──
+  [/mock/i, 32_000],
+];
+
 export class ContextWindow {
   /** 统一格式消息 */
   #messages: ContextMessage[] = [];
@@ -165,11 +217,10 @@ export class ContextWindow {
   /** 5-layer compaction thresholds */
   #thresholds: [number, number, number, number, number];
   /**
-   * L4 LLM 摘要开关：构造时取 CompactionConfig.enableL4LLM 初值，运行时由 BudgetController
-   * 经 syncL4CompactionSwitch 同步为它的 enableL4Compaction（唯一权威）。
-   * needsL4Compaction 与 compactL4 都读这一个值。
+   * L4 LLM 摘要开关：构造时恒为 false（关闭），只由 syncL4CompactionSwitch 设置——运行时由
+   * BudgetController 同步为它的 enableL4Compaction（唯一权威）。needsL4Compaction 与 compactL4 都读这一个值。
    */
-  #enableL4LLM: boolean;
+  #l4CompactionEnabled = false;
   /** Session-level budget pressure (0-1). Affects getToolResultQuota(). */
   #sessionPressure = 0;
   #readViewRevision = 0;
@@ -185,55 +236,6 @@ export class ContextWindow {
       `[ContextWindow] read view invalidated: ${reason}, revision=${this.#readViewRevision}`
     );
   }
-
-  /**
-   * 模型名 → 上下文窗口大小映射（token 数）。
-   * 键为正则模式，按优先级从上到下匹配。
-   * 值为模型的原始上下文窗口上限。
-   */
-  static MODEL_CONTEXT_WINDOWS = [
-    // ── Google Gemini ──
-    [/gemini-3/i, 1_048_576],
-    [/gemini-2\.5/i, 1_048_576],
-    [/gemini-2/i, 1_048_576],
-    [/gemini-1\.5/i, 1_048_576],
-    [/gemini-1\.0/i, 32_000],
-    [/gemini/i, 1_048_576],
-    // ── OpenAI ──
-    [/gpt-5\.5/i, 1_100_000],
-    [/gpt-5\.4-(?:mini|nano)/i, 400_000],
-    [/gpt-5\.4/i, 1_050_000],
-    [/gpt-5-(?:mini|nano)/i, 400_000],
-    [/gpt-5/i, 400_000],
-    [/gpt-4o/i, 128_000],
-    [/gpt-4-turbo/i, 128_000],
-    [/gpt-4-(?!turbo)/i, 8_192],
-    [/gpt-3\.5-turbo-16k/i, 16_384],
-    [/gpt-3\.5/i, 4_096],
-    [/o1|o3|o4/i, 200_000],
-    // ── Anthropic ──
-    [/claude-opus-4-7/i, 1_000_000],
-    [/claude-(?:opus|sonnet)-4[.-]6/i, 1_000_000],
-    [/claude-(?:opus|sonnet)-4[.-]5/i, 200_000],
-    [/claude-opus-4[.-]1/i, 200_000],
-    [/claude-haiku-4/i, 200_000],
-    [/claude-.*(?:sonnet|opus)-4/i, 200_000],
-    [/claude-3[.-]5/i, 200_000],
-    [/claude-3/i, 200_000],
-    [/claude/i, 200_000],
-    // ── DeepSeek ──
-    [/deepseek-v4/i, 1_000_000],
-    [/deepseek/i, 1_000_000],
-    // ── 本地 Ollama ──
-    [/llama3[.-]?[23]/i, 128_000],
-    [/llama3/i, 8_192],
-    [/llama/i, 4_096],
-    [/mistral/i, 32_000],
-    [/qwen/i, 128_000],
-    [/phi/i, 128_000],
-    // ── Mock（测试） ──
-    [/mock/i, 32_000],
-  ];
 
   /**
    * 根据模型名称解析合适的 ContextWindow token 预算。
@@ -286,9 +288,9 @@ export class ContextWindow {
         source = 'registry';
       } else {
         // 降级路径：注册表未登记该模型时用正则表估算；正则也不匹配则保留 32k 保守默认。
-        for (const [pattern, size] of ContextWindow.MODEL_CONTEXT_WINDOWS) {
-          if ((pattern as RegExp).test(modelName)) {
-            contextSize = size as number;
+        for (const [pattern, size] of MODEL_CONTEXT_WINDOWS) {
+          if (pattern.test(modelName)) {
+            contextSize = size;
             source = 'regex';
             break;
           }
@@ -353,9 +355,8 @@ export class ContextWindow {
     this.#tokenBudget = tokenBudget;
     this.#logger = Logger.getInstance();
     this.#thresholds = compactionConfig?.thresholds ?? DEFAULT_THRESHOLDS;
-    // L4 仍保留为显式能力；在 note_finding 证据链稳定前，运行时默认不自动触发。
-    // 这里只是初值：运行时 BudgetController 构造时会用 enableL4Compaction 覆盖（见 syncL4CompactionSwitch）。
-    this.#enableL4LLM = compactionConfig?.enableL4LLM ?? false;
+    // L4 仍保留为显式能力；在 note_finding 证据链稳定前，运行时默认不自动触发：开关初始关闭（字段初值），
+    // 构造参数不再能打开它，只有 syncL4CompactionSwitch 可以（运行时由 BudgetController 调用）。
   }
 
   /**
@@ -369,12 +370,12 @@ export class ContextWindow {
    * @param source 开关来源说明（如 "BudgetController env ALEMBIC_AGENT_ENABLE_L4_COMPACTION"）
    */
   syncL4CompactionSwitch(enabled: boolean, source: string): void {
-    const previous = this.#enableL4LLM;
-    this.#enableL4LLM = enabled;
+    const previous = this.#l4CompactionEnabled;
+    this.#l4CompactionEnabled = enabled;
     if (previous !== enabled) {
       this.#log(
         'info',
-        `[ContextWindow] L4 switch synced: enableL4LLM ${previous}->${enabled} (source=${source}); needsL4Compaction and compactL4 now follow this value`
+        `[ContextWindow] L4 switch synced: l4CompactionEnabled ${previous}->${enabled} (source=${source}); needsL4Compaction and compactL4 now follow this value`
       );
     }
   }
@@ -612,7 +613,7 @@ export class ContextWindow {
    */
   needsL4Compaction(): boolean {
     const [, , , , t4] = this.#thresholds;
-    return this.#enableL4LLM && this.getTokenUsageRatio() >= t4;
+    return this.#l4CompactionEnabled && this.getTokenUsageRatio() >= t4;
   }
 
   /**
@@ -644,10 +645,10 @@ export class ContextWindow {
     // 开关短路：L4 唯一执行开关由 BudgetController 同步（syncL4CompactionSwitch）。关闭时不调用
     // provider、不改写历史，返回 failed + validationMissing=['l4_disabled'] 让直接调用方知道摘要没有
     // 生成及原因；BudgetController 把该标记归为“跳过”，不计 L4 失败、不冷却、不硬停。
-    if (!this.#enableL4LLM) {
+    if (!this.#l4CompactionEnabled) {
       this.#log(
         'warn',
-        `[ContextWindow] L4 compact skipped: L4 switch is off (enableL4LLM=false; runtime authority is BudgetController enableL4Compaction / ALEMBIC_AGENT_ENABLE_L4_COMPACTION); messages=${this.#messages.length}, history unchanged`
+        `[ContextWindow] L4 compact skipped: L4 switch is off (l4CompactionEnabled=false; starts off and is set only by syncL4CompactionSwitch; runtime authority is BudgetController enableL4Compaction / ALEMBIC_AGENT_ENABLE_L4_COMPACTION); messages=${this.#messages.length}, history unchanged`
       );
       return { level: 4, removed: 0, failed: true, validationMissing: [L4_DISABLED_MARKER] };
     }

@@ -319,13 +319,15 @@ describe('policy public contracts', () => {
     expect(policy.checkCommand('git status')).toEqual({ safe: true });
     expect(policy.checkCommand('ls -la src')).toEqual({ safe: true });
 
-    // 自定义黑名单与保留的 DANGEROUS_COMMANDS 仍叠加在 terminal 规则之上（去留待决事项②，两个静态属性保留）。
-    expect(Array.isArray(SafetyPolicy.DANGEROUS_COMMANDS)).toBe(true);
-    expect(Array.isArray(SafetyPolicy.SAFE_COMMANDS)).toBe(true);
-    expect(policy.checkCommand('chmod 777 build.sh')).toMatchObject({
-      safe: false,
-      reason: expect.stringContaining('dangerous pattern'),
-    });
+    // W2a-07（②已答复，不设废弃期）：两个公开静态属性 DANGEROUS_COMMANDS / SAFE_COMMANDS 已删除。
+    // 只由旧内置黑名单提供的 chmod 777 不再在策略层拦截；需要时由自定义黑名单显式声明，它仍叠加在
+    // terminal 规则之上。
+    expect('DANGEROUS_COMMANDS' in SafetyPolicy).toBe(false);
+    expect('SAFE_COMMANDS' in SafetyPolicy).toBe(false);
+    expect(policy.checkCommand('chmod 777 build.sh')).toEqual({ safe: true });
+    expect(
+      new SafetyPolicy({ commandBlacklist: [/\bchmod\s+777/] }).checkCommand('chmod 777 build.sh')
+    ).toMatchObject({ safe: false, reason: expect.stringContaining('dangerous pattern') });
     expect(
       new SafetyPolicy({ commandBlacklist: [/custom-denied/] }).checkCommand('custom-denied arg')
     ).toMatchObject({ safe: false, reason: expect.stringContaining('custom-denied') });
@@ -460,16 +462,8 @@ describe('policy public contracts', () => {
       ok: false,
       reason: 'custom rejection',
     });
-    expect(policy.toGateConfig()).toMatchObject({
-      minEvidenceLength: 5,
-      minFileRefs: 1,
-      minToolCalls: 2,
-      custom: expect.any(Function),
-    });
-    expect(policy.toGateConfig().custom?.({ reply: 'deny src/file.ts' })).toMatchObject({
-      pass: false,
-      reason: 'custom rejection',
-    });
+    // W2a-07（L5-P44）：到 Pipeline 门配置的翻译 toGateConfig 已删除；类保留供显式注入为运行级策略。
+    expect('toGateConfig' in policy).toBe(false);
   });
 });
 
@@ -1423,13 +1417,14 @@ function coordinationProfile(): CompiledAgentProfile {
 }
 
 describe('pipeline quality decision adapters', () => {
-  it('maps the quality policy validator to the pipeline pass contract', async () => {
-    const gate = new QualityGatePolicy({
+  // W2a-07（L5-P44）：QualityGatePolicy.toGateConfig 已删除，阈值门直接声明 GateConfig（legacy custom 门返回 pass）。
+  it('passes a plain threshold GateConfig whose legacy custom gate returns pass:true', async () => {
+    const gate = {
       minEvidenceLength: 0,
       minFileRefs: 0,
       minToolCalls: 0,
-      customValidator: () => ({ ok: true }),
-    }).toGateConfig();
+      custom: () => ({ pass: true }),
+    };
     const result = await new PipelineStrategy({
       maxRetries: 0,
       stages: [{ name: 'analyze' }, { name: 'quality', gate }],
@@ -1446,6 +1441,30 @@ describe('pipeline quality decision adapters', () => {
       new AgentMessage({ content: 'analyze' })
     );
     expect(result.outcome).toBe('completed');
+  });
+
+  it('does not promote a legacy custom gate returning pass:false (even without a reason) to completed', async () => {
+    const loop = vi.fn(async () => ({
+      reply: 'analysis',
+      toolCalls: [],
+      tokenUsage: { input: 0, output: 0 },
+      iterations: 1,
+    }));
+    const custom = vi.fn(() => ({ pass: false }));
+    const result = await new PipelineStrategy({
+      maxRetries: 0,
+      stages: [
+        { name: 'analyze' },
+        {
+          name: 'quality',
+          gate: { minEvidenceLength: 0, minFileRefs: 0, minToolCalls: 0, custom },
+        },
+        { name: 'produce' },
+      ],
+    }).execute({ id: 'pipeline', reactLoop: loop }, new AgentMessage({ content: 'analyze' }));
+    expect(custom).toHaveBeenCalledOnce();
+    expect(result.outcome).not.toBe('completed');
+    expect(loop).toHaveBeenCalledOnce();
   });
   it.each([
     { action: 'reject', pass: false },

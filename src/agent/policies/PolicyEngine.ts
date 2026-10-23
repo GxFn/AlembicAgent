@@ -58,14 +58,10 @@ export class PolicyEngine {
     return { ok: true };
   }
 
-  applyToConfig(config: Record<string, unknown>) {
-    let result = config;
-    for (const policy of this.#policies) {
-      result = policy.applyToConfig(result);
-    }
-    return result;
-  }
-
+  /**
+   * 首个 BudgetPolicy 的预算投影；没有预算策略时为 null。无 budgetOverride 的 loop 直接把它当作本 loop 预算。
+   * W2a-07（L5-P08）：投影不再含已删除的运行级总量上限 maxSessionTokens。
+   */
   getBudget() {
     const bp = this.get(BudgetPolicy);
     return bp
@@ -75,7 +71,6 @@ export class PolicyEngine {
           timeoutMs: bp.timeoutMs,
           temperature: bp.temperature,
           maxSessionInputTokens: bp.maxSessionInputTokens,
-          maxSessionTokens: bp.maxSessionTokens,
         }
       : null;
   }
@@ -122,7 +117,7 @@ function validateSafetyToolCall(
   if (toolName === 'terminal') {
     // 生产 terminal 只有 {action:'exec', params:{command}}；没有 params 对象时按平铺参数保守检查。
     // fileScope 不覆盖 terminal（见 SafetyPolicy 注释），这里只执行命令检查：checkCommand 先跑与
-    // terminal handler 同源的危险命令规则，再叠加 DANGEROUS_COMMANDS 与自定义黑名单；原因里带规则码。
+    // terminal handler 同源的危险命令规则，再叠加自定义 commandBlacklist；原因里带规则码。
     const terminalParams =
       args?.params && typeof args.params === 'object'
         ? (args.params as Record<string, unknown>)

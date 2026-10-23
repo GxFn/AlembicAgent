@@ -57,14 +57,16 @@ interface SharedState {
   [key: string]: unknown;
 }
 
-/** Budget configuration */
+/**
+ * Budget configuration。会话预算只有阶段内 input 口径的 maxSessionInputTokens（BudgetController 执行）；
+ * 运行级总量上限 maxSessionTokens 已随 W2a-07（L5-P08）删除，残留的同名键只经索引签名透传，无人读取。
+ */
 interface BudgetConfig {
   maxIterations?: number;
   timeoutMs?: number;
   maxTokens?: number;
   temperature?: number;
   maxSessionInputTokens?: number;
-  maxSessionTokens?: number;
   [key: string]: unknown;
 }
 

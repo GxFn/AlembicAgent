@@ -215,7 +215,7 @@ function analystMarkdown(): string {
  */
 class ScriptedMiningProvider {
   readonly name = 'mining-e2e-scripted';
-  // 模型名必须能被 ContextWindow.MODEL_CONTEXT_WINDOWS 正则识别——未知模型取保守小窗，
+  // 模型名必须能被 ContextWindow 模块私有的 MODEL_CONTEXT_WINDOWS 正则表识别——未知模型取保守小窗，
   // per-tool 结果配额会塌到 400 字下限，把工具返回(含台账标注)截成不可用(首跑真坑)。
   readonly model = 'deepseek-chat';
   behavior: 'healthy' | 'no-findings';

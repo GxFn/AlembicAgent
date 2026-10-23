@@ -9,7 +9,7 @@ export interface SafetyPolicyOptions {
    */
   fileScope?: string;
   allowedSenders?: string[];
-  /** 叠加在 terminal 同源危险规则与 DANGEROUS_COMMANDS 之上的自定义命令黑名单。 */
+  /** 叠加在 terminal 同源危险规则之上的自定义命令黑名单；需要额外拦截的命令（如 chmod 777）在这里显式声明。 */
   commandBlacklist?: RegExp[];
   /**
    * 声明“需要人工审批”的工具名。全链路目前没有审批、挂起或重放通道（真正的审批端口需要宿主配合），
@@ -23,8 +23,11 @@ export interface SafetyPolicyOptions {
  *
  * 终端命令检查（L5-P45 / I18）：checkCommand 先复用 tools 层 terminal handler 的同一条
  * checkTerminalCommandSafety（其第一步就是 detectDangerousShellPayload 正则预检，随后是命令位置上的
- * DENIED_BINS、eval 与 rm 递归强删 token 级检查），再叠加 DANGEROUS_COMMANDS 与自定义 commandBlacklist。
+ * DENIED_BINS、eval 与 rm 递归强删 token 级检查），再叠加自定义 commandBlacklist。
  * 这样策略层的结论永远不比 terminal handler 宽松，两份危险命令规则不再各自漂移。
+ * W2a-07（②已答复，不设废弃期）：旧的公开静态属性 DANGEROUS_COMMANDS 与 SAFE_COMMANDS 已删除。
+ * 前者的正则不区分命令位置（'rg -n sudo src'、'ls 2>/dev/null' 被误拦），其中 chmod 777 与重定向到 /dev/
+ * 两条只由它提供，删除后策略层不再拦截，需要时用 commandBlacklist 显式声明；后者从未参与任何检查。
  *
  * requireApprovalFor：没有人工审批通道，命中即硬拒绝，拒绝原因带规则码 safety-approval-unavailable。
  *
@@ -40,53 +43,6 @@ export interface SafetyPolicyOptions {
  *   code 的路径按项目根解析成绝对路径再交给 PolicyEngine。
  */
 export class SafetyPolicy extends Policy {
-  /**
-   * 旧的内置命令黑名单（公开静态属性）。rm 递归强删、curl|sh 以及命令位置上的 sudo、dd、mkfs、
-   * shutdown/reboot/halt、passwd、killall 已由 terminal 同源规则检查；这里的正则不区分命令位置
-   * （'rg -n sudo src' 也会命中），chmod 777、重定向到 /dev/ 等条目也只由这里提供。
-   * 删除或标注废弃属于公开面收窄，待决事项②决定前保留原值并继续叠加检查。
-   */
-  static DANGEROUS_COMMANDS = Object.freeze([
-    /\brm\s+-rf\s+[/~]/,
-    /\bsudo\b/,
-    /\bmkfs\b/,
-    /\bdd\s+if=/,
-    /\b(shutdown|reboot|halt)\b/,
-    />\s*\/dev\//,
-    /\bcurl\b.*\|\s*(bash|sh)/,
-    /\bchmod\s+777/,
-    /\bpasswd\b/,
-    /\bkillall\b/,
-  ]);
-
-  /**
-   * 公开静态属性，src、测试与宿主中都没有读取方，也不参与任何检查；真正生效的只读白名单是
-   * terminalSafety 的 checkTerminalCommandAllowlist。去留待决事项②，决定前保持原值。
-   */
-  static SAFE_COMMANDS = Object.freeze([
-    'ls',
-    'cat',
-    'head',
-    'tail',
-    'grep',
-    'find',
-    'wc',
-    'echo',
-    'pwd',
-    'date',
-    'which',
-    'file',
-    'stat',
-    'git log',
-    'git status',
-    'git diff',
-    'git branch',
-    'npm list',
-    'npm outdated',
-    'node -v',
-    'npm -v',
-  ]);
-
   #fileScope;
   #allowedSenders;
   #commandBlacklist;
@@ -101,7 +57,7 @@ export class SafetyPolicy extends Policy {
     super();
     this.#fileScope = fileScope || null;
     this.#allowedSenders = allowedSenders;
-    this.#commandBlacklist = [...SafetyPolicy.DANGEROUS_COMMANDS, ...commandBlacklist];
+    this.#commandBlacklist = [...commandBlacklist];
     this.#requireApprovalFor = requireApprovalFor;
   }
 
@@ -129,7 +85,7 @@ export class SafetyPolicy extends Policy {
         reason: `Blocked [${terminalVerdict.block.rule}]: ${terminalVerdict.block.reason}`,
       };
     }
-    // 第二层：DANGEROUS_COMMANDS（待决事项②前保留）与自定义 commandBlacklist。
+    // 第二层：调用方声明的自定义 commandBlacklist（旧的内置 DANGEROUS_COMMANDS 已删除，见类注释）。
     for (const pattern of this.#commandBlacklist) {
       // /g 与 /y 会修改 lastIndex；每次检查用独立 matcher，避免同一命令交替放行。
       if (new RegExp(pattern.source, pattern.flags).test(command)) {
@@ -158,13 +114,6 @@ export class SafetyPolicy extends Policy {
    */
   needsApproval(toolName: string) {
     return this.#requireApprovalFor.includes(toolName);
-  }
-
-  applyToConfig(config: Record<string, unknown>): Record<string, unknown> {
-    return {
-      ...config,
-      safetyPolicy: this,
-    };
   }
 }
 

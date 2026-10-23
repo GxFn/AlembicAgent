@@ -316,31 +316,45 @@ function compilePolicyDeclarations(policies: unknown[] | undefined) {
   });
 }
 
-/** 策略层会话字段：会话预算归阶段预算 + BudgetController，这两个字段待公开面收窄（事项②）时删除。 */
-const POLICY_SESSION_FIELDS = ['maxSessionTokens', 'maxSessionInputTokens'] as const;
+/**
+ * 已删除的策略层运行级总量上限字段名（W2a-07 / L5-P08）。它不再是 BudgetPolicyConfig 的成员，只在这里
+ * 以字符串读取声明对象，用于编译期告警；类型与 BudgetPolicy 中都不再有同名成员。
+ */
+const REMOVED_POLICY_SESSION_TOTAL_FIELD = 'maxSessionTokens';
 
 /**
- * 声明式 budget 策略带会话字段时编译期告警（I03）。字段与运行行为保持不变（删除属于事项②），
- * 告警只让调用方看见口径差异：
- *   - 两个字段都按整次运行累计判定，而 BudgetController 执行的阶段会话预算按阶段内消耗；
- *   - maxSessionInputTokens 的拒绝在阶段预算未声明 maxSessionInputTokens 的循环里被屏蔽
- *     （运行时写 policy_session_limit_bypassed 诊断）；
- *   - BudgetController 不执行 maxSessionTokens，策略层配置时由 BudgetPolicy 照常按运行累计停止。
- * 每个 budget 声明告警一次，不抛错、不改写配置。
+ * 声明式 budget 策略带会话字段时编译期告警（I03；W2a-07 / L5-P08 按②答复收窄后的口径）。
+ *   - maxSessionTokens：已删除。BudgetPolicy 不再读取它（构造器只解构已声明字段），声明了也不会按运行累计
+ *     总量停止运行；告警写明“已删除、被忽略”，让仍带旧字段的声明看见这一行为变化。
+ *   - maxSessionInputTokens：保留（它与屏蔽包装是阶段预算之外唯一的策略层会话配置）。告警只说明口径差异：
+ *     它按整次运行累计判定，而 BudgetController 执行的阶段会话预算按阶段内消耗；阶段预算未声明
+ *     maxSessionInputTokens 的循环里，其拒绝被屏蔽（运行时写 policy_session_limit_bypassed 诊断）。
+ * 每个 budget 声明最多告警一次（两个字段合并为一条），不抛错、不改写配置。日志码沿用
+ * policy_session_fields_deprecated，便于既有日志检索继续命中。
  */
 function warnPolicySessionFields(config: Record<string, unknown>) {
-  const present = POLICY_SESSION_FIELDS.filter((field) => config[field] !== undefined);
-  if (present.length === 0) {
+  const notes: string[] = [];
+  const removedTotal = config[REMOVED_POLICY_SESSION_TOTAL_FIELD];
+  if (removedTotal !== undefined) {
+    notes.push(
+      `${REMOVED_POLICY_SESSION_TOTAL_FIELD}=${String(removedTotal)} has been removed and is ignored: ` +
+        'BudgetPolicy no longer stops the run on cumulative total tokens; declare a stage budget ' +
+        'maxSessionInputTokens (executed in-stage by BudgetController) instead'
+    );
+  }
+  if (config.maxSessionInputTokens !== undefined) {
+    notes.push(
+      `maxSessionInputTokens=${String(config.maxSessionInputTokens)} is checked against run-level ` +
+        'cumulative input usage, while stage session budgets executed by BudgetController use in-stage ' +
+        'consumption; its rejections are bypassed in loops whose stage budget declares no ' +
+        'maxSessionInputTokens (diagnostic policy_session_limit_bypassed)'
+    );
+  }
+  if (notes.length === 0) {
     return;
   }
-  const declared = present.map((field) => `${field}=${String(config[field])}`).join(', ');
   Logger.getInstance().warn(
-    `[AgentProfileCompiler] policy_session_fields_deprecated: budget policy declares ${declared}. ` +
-      'Session budgets belong to stage budgets executed by BudgetController (in-stage consumption); ' +
-      'policy-level session fields are checked against run-level cumulative usage and are scheduled for removal. ' +
-      'maxSessionInputTokens rejections are bypassed in loops whose stage budget declares no maxSessionInputTokens ' +
-      '(diagnostic policy_session_limit_bypassed); maxSessionTokens is not executed by BudgetController and stays ' +
-      'enforced by BudgetPolicy at run level until removal.'
+    `[AgentProfileCompiler] policy_session_fields_deprecated: budget policy declares session fields. ${notes.join('; ')}.`
   );
 }
 
