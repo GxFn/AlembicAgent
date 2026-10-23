@@ -13,7 +13,7 @@ afterEach(() => vi.restoreAllMocks());
 const marker = 'SYNTHETIC_REPLY_MARKER_NOT_A_SECRET';
 
 /**
- * 只替换 strategy（外部执行体），真实 AgentRuntime 的 execute 边界、状态机、事件总线和诊断收集保持接线，
+ * 只替换 strategy（外部执行体），真实 AgentRuntime 的 execute 边界、阶段字段、事件总线和诊断收集保持接线，
  * 以验证 replyFn 回写失败被隔离在运行结论之外。
  */
 function runtimeWithStrategy(execute: (...args: never[]) => Promise<unknown>) {
@@ -64,9 +64,10 @@ describe('AgentRuntime replyFn delivery failure isolation', () => {
     // 回写失败只影响投递，不改判已完成的运行结论。
     expect(replyFn).toHaveBeenCalledWith('final answer');
     expect(result.reply).toBe('final answer');
-    // stub strategy 不走 reactLoop，阶段停在 idle；关键是没有被回写失败推进到 failed。
-    expect(runtime.state.phase).not.toBe('failed');
-    expect(result.state).toMatchObject({ phase: runtime.state.phase });
+    // stub strategy 不走 reactLoop，'finish' 从 idle 出发是被跳过的非法转移，阶段停在 idle；
+    // 关键是没有被回写失败推进到 failed。L5-P46：runtime 不再公开 state，改读结果里的 phase 快照。
+    expect(result.state.phase).not.toBe('failed');
+    expect(result.state).toEqual({ phase: 'idle' });
     expect(events.completed).toHaveBeenCalledOnce();
     expect(events.failed).not.toHaveBeenCalled();
     const warnings = replyWarnings(result.diagnostics?.warnings);

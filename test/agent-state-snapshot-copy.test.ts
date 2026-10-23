@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BudgetPolicy, PolicyEngine } from '../src/agent/policies/index.js';
 import { AgentEvents } from '../src/agent/runtime/AgentEventBus.js';
@@ -9,15 +11,18 @@ import { SingleStrategy } from '../src/agent/strategies/SingleStrategy.js';
 afterEach(() => vi.restoreAllMocks());
 
 /**
- * I40 / P46：AgentState.toJSON() 产出的快照必须与状态机内部存储脱钩。
+ * I40 / P46：快照必须与运行时内部状态脱钩。
  *
  * 旧实现 toJSON() 直接返回内部 #data / #history 引用，AgentRuntime 把它写进 result.state：
  * execute 返回后状态机上的任何转移（通配的 abort/error 在终态仍可匹配）都会把记录追加进
  * 已返回结果的 history，快照前后矛盾。fromJSON 同理直接持有调用方传入的 history 数组。
- * 本文件只覆盖拷贝语义；终态保护与公开面去留依赖全局事项②，不在这里断言。
+ *
+ * L5-P46（W1-06，事项②已答复）：AgentRuntime 不再持有 AgentState，改为私有最小 phase 字段，
+ * result.state 只含 { phase }。AgentState 类在 W2b（派发行 D3）删除前仍公开导出，
+ * 所以第一组用例继续守住它的拷贝语义；后两组覆盖 runtime 的 phase 快照与类型面。
  */
 
-/** 真实 SingleStrategy + 文本回复的 provider：走完整 start → plan_ready → finish 转移。 */
+/** 真实 SingleStrategy + 文本回复的 provider：走完整的 idle → executing → completed 阶段。 */
 function textRuntime() {
   const chatWithTools = vi.fn(async () => ({ text: 'done', functionCalls: [] }));
   return new AgentRuntime({
@@ -89,46 +94,117 @@ describe('AgentState snapshot copy semantics (I40)', () => {
   });
 });
 
-describe('AgentRuntime result.state stays a stable snapshot after execute (I40)', () => {
-  it('does not append to result.state.history when abort happens after execute returned', async () => {
+describe('AgentRuntime result.state is a phase-only snapshot after execute (I40 / L5-P46)', () => {
+  it('returns only { phase } and a later abort() does not rewrite the returned snapshot', async () => {
     const runtime = textRuntime();
     const result = await runtime.execute(new AgentMessage({ content: 'task' }));
     expect(result.reply).toBe('done');
-    expect(result.state?.phase).toBe('completed');
-    const recorded = result.state?.history?.length ?? 0;
-    expect(recorded).toBeGreaterThan(0);
+    // L5-P46：result.state 不再携带 data/history，只剩本次运行结束时的阶段。
+    expect(result.state).toEqual({ phase: 'completed' });
 
-    // 公开 abort()：没有活动执行时只记日志（P24/I39），不会转移。
+    // 公开 abort()：没有活动执行时只记日志（P24/I39），不转移、不改写已返回的结果。
     runtime.abort('late cancel');
-    // 直接对公开字段 runtime.state 发送通配 abort：内部状态机转到 aborted，
-    // 但已返回结果里的快照必须保持 completed 且 history 不被追加。
-    expect(runtime.state.send('abort', { reason: 'late cancel' })).toBe(true);
-    expect(runtime.state.phase).toBe('aborted');
-
-    expect(result.state?.phase).toBe('completed');
-    expect(result.state?.history).toHaveLength(recorded);
-    expect(result.state?.history?.at(-1)).toMatchObject({ phase: 'completed', event: 'finish' });
-    expect(result.state?.history?.some((entry) => entry.phase === 'aborted')).toBe(false);
+    expect(result.state).toEqual({ phase: 'completed' });
   });
 
-  it('keeps result.state intact when an AGENT_COMPLETED observer transitions the state', async () => {
+  it('keeps result.state intact when an AGENT_COMPLETED observer aborts the runtime', async () => {
     const runtime = textRuntime();
-    // AGENT_COMPLETED 在 result.state 写入之后发布：观察者此时触发的转移不能回写进本次结果。
+    // AGENT_COMPLETED 在 result.state 写入之后发布：观察者此时的 abort() 不能回写进本次结果。
     const onCompleted = (event: { payload?: { agentId?: string } }) => {
       if (event.payload?.agentId === runtime.id) {
-        runtime.state.send('error', { error: 'observer late error' });
+        runtime.abort('observer late abort');
       }
     };
     runtime.bus.on(AgentEvents.AGENT_COMPLETED, onCompleted);
     try {
       const result = await runtime.execute(new AgentMessage({ content: 'task' }));
-      expect(runtime.state.phase).toBe('failed');
-      expect(result.state?.phase).toBe('completed');
-      expect(result.state?.history?.at(-1)).toMatchObject({ phase: 'completed', event: 'finish' });
-      expect(result.state?.history?.some((entry) => entry.phase === 'failed')).toBe(false);
-      expect(result.state?.data).not.toHaveProperty('error');
+      expect(result.state).toEqual({ phase: 'completed' });
     } finally {
       runtime.bus.off(AgentEvents.AGENT_COMPLETED, onCompleted);
     }
+  });
+
+  it('hands out a fresh state object per result so mutating one cannot leak into the next run', async () => {
+    const runtime = textRuntime();
+    const first = await runtime.execute(new AgentMessage({ content: 'first' }));
+    (first.state as { phase: string }).phase = 'tampered';
+    const second = await runtime.execute(new AgentMessage({ content: 'second' }));
+    expect(second.state).toEqual({ phase: 'completed' });
+    expect(second.state).not.toBe(first.state);
+  });
+});
+
+/**
+ * L5-P46 类型面守护（AST 断言）：tsconfig 只包含 src/**，vitest 不做类型检查，所以类型收窄用源码 AST 固定。
+ * - AgentRuntime 不再导入 AgentState/AgentPhase，也不再声明实例成员 `state`：编译出的 d.ts 不会再引用 AgentState。
+ * - AgentResult.state 收窄为只含 `phase` 的类型字面量（不再是 Record<string, unknown>）。
+ * AgentState.ts 本身仍导出到 W2b（派发行 D3）删除，这里不断言它的去留。
+ */
+describe('AgentRuntime phase surface source guard (L5-P46)', () => {
+  const runtimeSourcePath = new URL('../src/agent/runtime/AgentRuntime.ts', import.meta.url);
+  const typesSourcePath = new URL('../src/agent/runtime/AgentRuntimeTypes.ts', import.meta.url);
+
+  function parse(url: URL) {
+    return ts.createSourceFile(
+      url.pathname,
+      readFileSync(url, 'utf8'),
+      ts.ScriptTarget.ES2022,
+      true,
+      ts.ScriptKind.TS
+    );
+  }
+
+  it('AgentRuntime neither imports AgentState nor declares a state member', () => {
+    const source = parse(runtimeSourcePath);
+    const importSpecifiers = source.statements
+      .filter(ts.isImportDeclaration)
+      .map((statement) => (statement.moduleSpecifier as ts.StringLiteral).text);
+    expect(importSpecifiers).not.toContain('./AgentState.js');
+    const identifiers = new Set<string>();
+    const visit = (node: ts.Node) => {
+      if (ts.isIdentifier(node)) {
+        identifiers.add(node.text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(identifiers.has('AgentState')).toBe(false);
+    expect(identifiers.has('AgentPhase')).toBe(false);
+
+    const runtimeClass = source.statements.find(
+      (statement): statement is ts.ClassDeclaration =>
+        ts.isClassDeclaration(statement) && statement.name?.text === 'AgentRuntime'
+    );
+    expect(runtimeClass).toBeDefined();
+    const memberNames = (runtimeClass?.members ?? [])
+      .map((member) => member.name)
+      .filter((name): name is ts.Identifier => name !== undefined && ts.isIdentifier(name))
+      .map((name) => name.text);
+    expect(memberNames).not.toContain('state');
+  });
+
+  it('AgentResult.state is narrowed to a type literal whose only member is phase', () => {
+    const source = parse(typesSourcePath);
+    const agentResult = source.statements.find(
+      (statement): statement is ts.InterfaceDeclaration =>
+        ts.isInterfaceDeclaration(statement) && statement.name.text === 'AgentResult'
+    );
+    expect(agentResult).toBeDefined();
+    const stateMember = agentResult?.members.find(
+      (member): member is ts.PropertySignature =>
+        ts.isPropertySignature(member) &&
+        ts.isIdentifier(member.name) &&
+        member.name.text === 'state'
+    );
+    expect(stateMember?.type).toBeDefined();
+    const stateType = stateMember?.type;
+    expect(stateType && ts.isTypeLiteralNode(stateType)).toBe(true);
+    const memberNames =
+      stateType && ts.isTypeLiteralNode(stateType)
+        ? stateType.members.map((member) =>
+            member.name && ts.isIdentifier(member.name) ? member.name.text : '<computed>'
+          )
+        : [];
+    expect(memberNames).toEqual(['phase']);
   });
 });

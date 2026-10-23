@@ -274,7 +274,13 @@ export interface AgentResult {
   durationMs: number;
   phases?: Record<string, unknown>;
   diagnostics?: AgentDiagnostics;
-  state: Record<string, unknown>;
+  /**
+   * 本次运行的阶段快照（L5-P46）。只含 phase：不再累积 data/history，也不再导出旧状态机对象。
+   * execute() 返回或绑定的结果只会是 idle（执行前被策略拒绝，或策略没有经 reactLoop 进入执行阶段）、
+   * completed、aborted 或 failed；executing 只是运行途中的内部阶段。每个结果持有独立的对象，
+   * 结果返回后 runtime 上的任何阶段变化都不会写回已返回的快照。
+   */
+  state: { phase: 'idle' | 'executing' | 'completed' | 'failed' | 'aborted' };
   qualityWarning?: string;
   [key: string]: unknown;
 }

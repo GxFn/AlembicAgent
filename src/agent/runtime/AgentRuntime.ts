@@ -79,7 +79,6 @@ import {
   type ToolCallHook,
   type ToolMetadata,
 } from './AgentRuntimeTypes.js';
-import { AgentPhase, AgentState } from './AgentState.js';
 import { evaluateAnalyzeTextGroundingGate } from './AnalyzeGroundingGuard.js';
 import { BudgetController } from './BudgetController.js';
 import { DiagnosticsCollector } from './DiagnosticsCollector.js';
@@ -185,6 +184,36 @@ const LLM_INPUT_ASSEMBLY_FAILED_CODE = 'llm_input_assembly_failed';
 /** I08：本地运行缺陷终止的 cancelReason；不与 provider_error / provider_circuit_open 混用。 */
 const RUNTIME_DEFECT_CANCEL_REASON = 'runtime_defect';
 
+/** runtime 私有阶段（L5-P46）：与公开结果 `AgentResult.state.phase` 同一字面量联合。 */
+type RuntimePhase = AgentResult['state']['phase'];
+/** 推动阶段的事件：execute/reactLoop 的入口、结论与中止/失败。 */
+type RuntimePhaseEvent = 'start' | 'finish' | 'abort' | 'error';
+
+/**
+ * 最小阶段转移表（L5-P46 取代 AgentState 状态机）。返回 null 表示该事件在当前阶段不被允许。
+ *
+ * - start：只从 idle 进入 executing。Pipeline/FanOut 多次调用 reactLoop 时，第 2+ 个阶段的 start
+ *   从 executing 出发属于预期的非法转移，由调用方按 debug 记录后跳过。
+ * - finish：只从 executing 进入 completed。策略没有经 reactLoop 进入执行阶段时（例如只返回结果的
+ *   替身策略），finish 从 idle 出发被跳过，结果保持 idle——与旧状态机的终值一致。
+ * - abort/error：任意阶段都可进入 aborted/failed（对应旧转移图的通配边）；它们只改私有字段，
+ *   已返回结果持有独立快照，不会被事后的转移改写（I40）。
+ * 旧状态机的 planning/reflecting 两个中间阶段与 plan_ready/step_done/continue 事件没有任何读取方，
+ * 而且不影响任何一次运行的终值，因此不再保留。
+ */
+function nextRuntimePhase(phase: RuntimePhase, event: RuntimePhaseEvent): RuntimePhase | null {
+  switch (event) {
+    case 'start':
+      return phase === 'idle' ? 'executing' : null;
+    case 'finish':
+      return phase === 'executing' ? 'completed' : null;
+    case 'abort':
+      return 'aborted';
+    case 'error':
+      return 'failed';
+  }
+}
+
 // 单个模块级 ALS 随 runtime 模块存活，避免每个短命 Agent 实例创建需 disable 的 ALS。
 // owner 校验使嵌套的另一个 runtime 有自己的 run，不会误继承父 runtime 的工具会话。
 const toolResourceRun = new AsyncLocalStorage<{
@@ -197,7 +226,6 @@ export class AgentRuntime {
   onToolCall: ToolCallHook | null;
   id;
   presetName;
-  state;
   bus;
   aiProvider;
   toolRegistry;
@@ -238,6 +266,11 @@ export class AgentRuntime {
   #providerInputLimits = new WeakMap<LoopContext, ProviderInputLimitResolution>();
   #executionAbortController: AbortController | null = null;
   #abortEventPublished = false;
+  /**
+   * 当前阶段（L5-P46）：私有字段，不再公开可订阅的状态机实例。只在 execute/reactLoop/abort 内按
+   * nextRuntimePhase 推进；结果里的 `state` 是它的独立快照 `{ phase }`。
+   */
+  #phase: RuntimePhase = 'idle';
 
   // ── 执行统计 ──
   iterationCount = 0;
@@ -302,8 +335,6 @@ export class AgentRuntime {
       memoryConfig: this.memoryConfig,
     });
 
-    this.state = this.#createInitialState();
-
     this.bus.publish(
       AgentEvents.AGENT_CREATED,
       {
@@ -357,8 +388,8 @@ export class AgentRuntime {
 
   async #executeRun(message: AgentMessage, opts: Record<string, unknown>): Promise<AgentResult> {
     this.#abortEventPublished = false;
-    // I39：状态机与计数器同为 per-run 状态，复用实例时先复位，避免上一次终态吞掉本次 start/finish。
-    this.#resetStateForRun();
+    // I39：阶段与计数器同为 per-run 状态，复用实例时先复位，避免上一次终态吞掉本次 start/finish。
+    this.#resetPhaseForRun();
     this.startTime = Date.now();
     this.iterationCount = 0;
     this.toolCallHistory = [];
@@ -390,7 +421,7 @@ export class AgentRuntime {
         iterations: 0,
         durationMs: 0,
         diagnostics: diagnostics.toJSON(),
-        state: this.state.toJSON(),
+        state: this.#phaseSnapshot(),
       };
     }
 
@@ -413,7 +444,7 @@ export class AgentRuntime {
       tokenUsage: { ...this.tokenUsage },
       iterations: this.iterationCount,
       durationMs: Date.now() - this.startTime,
-      state: this.state.toJSON(),
+      state: this.#phaseSnapshot(),
       diagnostics: diagnostics.toJSON(),
     });
 
@@ -502,10 +533,8 @@ export class AgentRuntime {
         }
       }
 
-      // 状态完成
-      this.#safeTransition(cancelled ? 'abort' : 'finish', {
-        reply: result.reply?.slice(0, 100),
-      });
+      // 阶段完成
+      this.#transitionPhase(cancelled ? 'abort' : 'finish');
 
       // 回复给原始渠道：运行结论（finish/abort）已在上面确定，回写只是投递，失败不改判结论。
       if (message.replyFn && result.reply) {
@@ -517,7 +546,7 @@ export class AgentRuntime {
         );
       }
 
-      result.state = this.state.toJSON();
+      result.state = this.#phaseSnapshot();
       result.durationMs = Date.now() - this.startTime;
       if (result.degraded) {
         diagnostics.markDegraded();
@@ -545,7 +574,7 @@ export class AgentRuntime {
     } catch (err: unknown) {
       const error =
         err instanceof Error ? err : new Error('Agent execution failed', { cause: err });
-      this.#safeTransition('error', { error: error.message });
+      this.#transitionPhase('error');
       // 只采用本 Runtime 抛出的硬超时快照；嵌套 Runtime 冒上来的超时错误按普通失败处理，
       // 用本边界自己的快照，既不把子运行的工具调用/用量当作自己的，也不原地改写子运行快照。
       const ownTimeoutSnapshot = readOwnedExecutionTimeoutSnapshot(this, error);
@@ -565,7 +594,7 @@ export class AgentRuntime {
         );
       }
       const partial = ownTimeoutSnapshot ?? completedResult ?? snapshot();
-      partial.state = this.state.toJSON();
+      partial.state = this.#phaseSnapshot();
       partial.durationMs = Date.now() - this.startTime;
       partial.diagnostics = diagnostics.toJSON();
       bindRuntimeFailureSnapshot(this, error, partial);
@@ -588,7 +617,7 @@ export class AgentRuntime {
   /**
    * replyFn 回写（I41/P42）。
    *
-   * 调用时机在状态机 finish/abort 之后、AGENT_COMPLETED/AGENT_ABORTED 发布之前：此时运行结论已经确定，
+   * 调用时机在阶段 finish/abort 之后、AGENT_COMPLETED/AGENT_ABORTED 发布之前：此时运行结论已经确定，
    * replyFn 只负责把回复投递回原始渠道。旧实现直接 await，replyFn 抛错会落入 execute 的 catch，
    * 把已完成的结果改判为 failed 并发布 AGENT_FAILED。这里隔离投递失败：记 reply_delivery_failed
    * 诊断（错误信息经脱敏，不记录回复正文）和 warn 日志，然后按原结论继续。
@@ -880,9 +909,8 @@ export class AgentRuntime {
       budget,
     });
 
-    // 状态转移
-    this.#safeTransition('start', { prompt: prompt.slice(0, 100) });
-    this.#safeTransition('plan_ready');
+    // 阶段转移：只有一次运行里的第一个 reactLoop 从 idle 进入 executing。
+    this.#transitionPhase('start');
 
     this.bus.publish(
       AgentEvents.AGENT_STARTED,
@@ -2153,15 +2181,8 @@ export class AgentRuntime {
       closeRound();
     }
 
-    // 本轮工具步骤摘要只交给状态机（Capability.onAfterStep 不再由运行循环驱动，见 #shouldExit 说明）。
-    const stepToolEntries = ctx.toolCalls.slice(-activeCalls.length);
-    const stepResult = {
-      type: 'tool_calls',
-      toolCalls: stepToolEntries,
-      iteration: ctx.iteration,
-    };
-
-    this.#safeTransition('step_done', stepResult);
+    // L5-P46：工具轮不再推进阶段。旧实现为状态机构造含 toolCalls 的 stepResult 并发送 step_done/continue，
+    // 它们没有读取方，也不影响任何运行的终值；阶段在整轮循环内保持 executing。
 
     // 所有强制摘要统一在 finalize 生成；此处只结束工具轮。
     // 摘要失败/空响应不能让已确认回执丢失，也不能触发第二次摘要请求。
@@ -2169,7 +2190,6 @@ export class AgentRuntime {
       return true;
     }
 
-    this.#safeTransition('continue');
     return false; // 继续循环
   }
 
@@ -2674,12 +2694,12 @@ export class AgentRuntime {
    * 只取消当前 execute() 的执行边界。没有活动执行时（尚未运行、已经结束，或只直接调用了
    * reactLoop 而未经 execute）没有可取消的对象：旧实现仍把状态机转到 aborted 并发布
    * AGENT_ABORTED，导致同一实例下一次成功执行的 start/finish 全被丢弃、结果报告 aborted（I39）。
-   * 现在这种调用只记日志，不转移状态、不发布事件。
+   * 现在这种调用只记日志（phase 取自私有阶段字段），不转移阶段、不发布事件。
    */
   abort(reason = 'User aborted') {
     const controller = this.#executionAbortController;
     if (!controller) {
-      const phase = this.state.phase;
+      const phase = this.#phase;
       const abortEventPublished = this.#abortEventPublished;
       observeSafely(
         () =>
@@ -2698,7 +2718,7 @@ export class AgentRuntime {
       return;
     }
     this.#abortEventPublished = true;
-    this.#safeTransition('abort', { reason });
+    this.#transitionPhase('abort');
     this.bus.publish(
       AgentEvents.AGENT_ABORTED,
       {
@@ -2745,100 +2765,58 @@ export class AgentRuntime {
 
   // ─── 私有方法 ────────────────────────────────
 
-  /** 构造 runtime 自有的状态机；初始数据只含实例身份，不带任何一次运行的 payload。 */
-  #createInitialState(): AgentState {
-    return new AgentState({
-      initialData: { runtimeId: this.id, preset: this.presetName },
-    });
+  /**
+   * 阶段快照（L5-P46）：每次返回新对象，只含 phase。
+   * 写进 result.state / partial.state 后，runtime 上任何后续阶段变化（例如结束后的 abort、
+   * AGENT_COMPLETED 观察者触发的中止）都不会改写已返回的结果（I40）。
+   */
+  #phaseSnapshot(): AgentResult['state'] {
+    return { phase: this.#phase };
   }
 
   /**
-   * 每次 execute() 开始时把状态机复位到 idle（I39）。
+   * 每次 execute() 开始时把阶段复位到 idle（I39 / L5-P24）。
    *
-   * 状态机只在构造时创建，而默认转移图没有回到 idle 的边：复用同一实例时，上一次的终态
-   * （completed/failed/aborted）或直接 reactLoop 留下的 executing/reflecting 会让本次的
-   * 'start'/'finish' 全部成为非法转移，result.state 报告上一次的阶段。AgentState 不提供
-   * reset，所以新建实例；新实例只保留构造时的初始数据，上一次的 prompt/reply/error 不混入本次结果。
-   *
-   * `runtime.state` 是公开字段，调用方可能已订阅 'transition'/'phase:*'：把旧实例上的监听器按
-   * 原顺序迁到新实例，once 订阅仍以 once 注册，避免复位后订阅被静默丢弃。
-   * phase 仍为 idle 说明从未发生转移（默认转移图回不到 idle），直接短路不做任何事。
-   * 已知边界：调用方若把 `state` 换成带自定义转移的 AgentState，复位后只保留默认转移图。
+   * 转移表没有回到 idle 的边：复用同一实例时，上一次的终态（completed/failed/aborted）或直接
+   * reactLoop 留下的 executing 会让本次的 'start'/'finish' 全部成为非法转移，结果报告上一次的阶段。
+   * 阶段已是 idle 说明上次运行没有推进过阶段，直接短路；否则复位并记 info，写明上一次的阶段，
+   * 以便区分“复用实例”与“首次运行”。
    */
-  #resetStateForRun() {
-    const previous = this.state;
-    if (previous.phase === AgentPhase.IDLE) {
+  #resetPhaseForRun() {
+    const previousPhase = this.#phase;
+    if (previousPhase === 'idle') {
       return;
     }
-    const next = this.#createInitialState();
-    next.setMaxListeners(previous.getMaxListeners());
-    let migratedListeners = 0;
-    for (const eventName of previous.eventNames()) {
-      for (const raw of previous.rawListeners(eventName)) {
-        // rawListeners 对 once 订阅返回 Node 的包装函数（带 .listener 指向原函数）；
-        // 包装函数绑定旧实例，直接迁移会在新实例上留下失效包装，因此取原函数重新 once 注册。
-        const original: unknown = Reflect.get(raw, 'listener');
-        if (typeof original === 'function') {
-          next.once(eventName, original as (...args: unknown[]) => void);
-        } else {
-          next.on(eventName, raw as (...args: unknown[]) => void);
-        }
-        migratedListeners++;
-      }
-    }
-    previous.removeAllListeners();
-    this.state = next;
-    const previousPhase = previous.phase;
+    this.#phase = 'idle';
     observeSafely(
       () =>
-        this.logger.info('[AgentRuntime] state reset to idle before execute', {
+        this.logger.info('[AgentRuntime] phase reset to idle before execute', {
           runtimeId: this.id,
           previousPhase,
-          migratedListeners,
         }),
       () => undefined
     );
   }
 
   /**
-   * 安全状态转移 — 状态机只是执行过程的可观测投影，任何转移结果都不能中断执行。
+   * 推进私有阶段（L5-P46）。阶段只是执行过程的可观测投影，任何转移结果都不能中断执行。
    *
-   * AgentState.send 遇到没有匹配的转移或 guard 拒绝时返回 false，并不抛错。Pipeline/FanOut
-   * 场景下 reactLoop() 被多次调用，第 2+ 个阶段的 'start'/'plan_ready' 从 executing/reflecting
-   * 出发就是这种预期的非法转移：按 debug 记录事件名与当前阶段后跳过，保证多阶段执行不中断。
-   *
-   * send 真正会抛出的是转移 action 或 'transition'/'phase:*' 观察者的异常：此时阶段已经切换，
-   * 记 warn（只记错误类型，不记观察者的错误内容）后继续执行，保持“观察者失败不影响业务结果”。
+   * 当前阶段不允许该事件时（例如 Pipeline/FanOut 第 2+ 个阶段的 'start' 从 executing 出发，
+   * 或替身策略未经 reactLoop 就 'finish'）跳过转移，按 debug 记录事件名与当前阶段，便于定位。
+   * 不再有观察者：旧实现的 'transition'/'phase:*' 订阅与观察者异常分支随旧状态机一并移除。
    */
-  #safeTransition(event: string, payload: Record<string, unknown> = {}) {
-    const fromPhase = this.state.phase;
-    let transitioned: boolean;
-    try {
-      transitioned = this.state.send(event, payload);
-    } catch (err: unknown) {
-      const toPhase = this.state.phase;
-      const errorType = err instanceof Error ? err.name : typeof err;
-      observeSafely(
-        () =>
-          this.logger.warn('[AgentRuntime] state transition observer failed; execution continues', {
-            runtimeId: this.id,
-            event,
-            fromPhase,
-            toPhase,
-            errorType,
-          }),
-        () => undefined
-      );
-      return;
-    }
-    if (!transitioned) {
-      this.#logDebug('[AgentRuntime] state transition skipped: not allowed from current phase', {
+  #transitionPhase(event: RuntimePhaseEvent) {
+    const fromPhase = this.#phase;
+    const next = nextRuntimePhase(fromPhase, event);
+    if (next === null) {
+      this.#logDebug('[AgentRuntime] phase transition skipped: not allowed from current phase', {
         runtimeId: this.id,
         event,
         phase: fromPhase,
-        availableEvents: this.state.availableEvents(),
       });
+      return;
     }
+    this.#phase = next;
   }
 
   /**
